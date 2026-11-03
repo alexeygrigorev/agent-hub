@@ -76,8 +76,17 @@ describe('scoped durable worker access',()=>{
    const res=await release(id);expect(res.status).toBe(403);expect(await res.json()).toEqual({error:'worker_claim_forbidden'});
   }
   expect((await release('agent-hub:src/'+peer)).status).toBe(403);
-  expect((await call('/api/bus/claims',undefined,worker.access_token)).status).toBe(403);
-  expect((await call('/api/bus/claims',{project:'agent-hub',scope:'x',holder:actor},worker.access_token)).status).toBe(403);
+  const listed=await call('/api/bus/claims',undefined,worker.access_token);
+  expect(listed.status).toBe(200);
+  const visible:any[]=await listed.json() as any[];
+  expect(visible.every(claim=>claim.project==='agent-hub')).toBe(true);
+  expect(visible.some(claim=>claim.id===wrongProject)).toBe(false);
+  const created=await call('/api/bus/claims',{project:'agent-hub',scope:'worker-created',holder:actor},worker.access_token);
+  expect(created.status,await created.clone().text()).toBe(200);
+  const createdId=(await created.json() as any).id;
+  expect((await call('/api/bus/claims',{project:'other-project',scope:'worker-created',holder:actor},worker.access_token)).status).toBe(403);
+  expect((await call('/api/bus/claims',{project:'agent-hub',scope:'foreign-holder',holder:'someone-else'},worker.access_token)).status).toBe(403);
+  expect((await release(createdId)).status).toBe(200);
   await runInDurableObject<Hub,any>(stub,(h:any)=>{
    for(const id of [own,bridged,byScope]) expect(h.sql.exec('SELECT released_at FROM claims WHERE id=?',id).toArray()[0].released_at).toBeTruthy();
    for(const id of [peer,old,wrongWorkspace,wrongProject,wrongHost,samePrefix,legacy]) expect(h.sql.exec('SELECT released_at FROM claims WHERE id=?',id).toArray()[0].released_at).toBeNull();
@@ -95,7 +104,7 @@ describe('scoped durable worker access',()=>{
   });
   expect((await api('/api/intake/tasks/'+task)).status).toBe(200);
   expect((await api('/api/intake/tasks/'+task.slice(0,8))).status).toBe(200);
-  expect((await api('/api/intake/tasks/'+other)).status).toBe(403);
+  expect((await api('/api/intake/tasks/'+other)).status).toBe(200); // same-project reads are within the worker grant
   for(const path of ['/api/quota?view=fleet','/api/quota?view=fleet&provider=codex&account=codex-orin']) {
    const res=await api(path);expect(res.status,await res.clone().text()).toBe(200);
    expect(await res.json()).toHaveProperty('pools');
@@ -159,32 +168,36 @@ describe('scoped durable worker access',()=>{
    for (const id of [other,blank,later]) h.sql.exec("INSERT INTO intake_triage_requests(task_id,request_key,session_id,state,requested_at) VALUES(?,?,?,'requested',?)",id,'triage-k',session,Date.now()-1000);
   });
   expect((await api('/api/intake/tasks/'+blank)).status).toBe(200);
-  expect((await api('/api/intake/tasks/'+blank.slice(0,8))).status).toBe(403); // exact ids only
-  expect((await api('/api/intake/tasks/'+third)).status).toBe(403);
+  expect((await api('/api/intake/tasks/'+blank.slice(0,8))).status).toBe(200); // project reads may resolve task prefixes
+  expect((await api('/api/intake/tasks/'+third)).status).toBe(200); // same project; no write grant
   // Existing AC is never replaced; missing AC may be filled, together with a project fix.
   expect((await api('/api/intake/tasks/'+other,{key:'t-over',expected_version:1,acceptance_criteria:'replaced'})).status).toBe(403);
   const ac=await api('/api/intake/tasks/'+blank,{key:'t-ac',expected_version:1,acceptance_criteria:'AC1 written by triage',project:'machine-management'});
   expect(ac.status,await ac.clone().text()).toBe(200);
   const v=(await ac.json() as any).task.version;
-  // A lost reply retried with the same key replays the saved receipt; a new key may not overwrite.
+  // Moving the task out of the worker's project ends access, including receipt replay.
   const replay=await api('/api/intake/tasks/'+blank,{key:'t-ac',expected_version:1,acceptance_criteria:'AC1 written by triage',project:'machine-management'});
-  expect(replay.status,await replay.clone().text()).toBe(200);
-  expect((await replay.json() as any).task.version).toBe(v);
+  expect(replay.status,await replay.clone().text()).toBe(403);
+  expect(await replay.json()).toEqual({error:'cross_intake_forbidden'});
   expect((await api('/api/intake/tasks/'+blank,{key:'t-ac2',expected_version:v,acceptance_criteria:'second fill'})).status).toBe(403);
   for (const bad of [{key:'t-st',expected_version:v,status:'done'},{key:'t-ti',expected_version:v,title:'renamed'},
     {key:'t-mix',expected_version:v,project:'aws-infra',status:'cancelled',reason:'x'}])
    expect((await api('/api/intake/tasks/'+blank,bad)).status).toBe(403);
   expect((await api('/api/intake/tasks/'+blank+'/events',{key:'t-dec',expected_version:v,event:{kind:'decision',text:'x'}})).status).toBe(403);
   expect((await api('/api/intake/tasks/'+third,{key:'t-3',expected_version:1,project:'aws-infra'})).status).toBe(403);
-  // The verdict note itself revokes access immediately, without waiting for the hourly ledger update.
-  const note=await api('/api/intake/tasks/'+blank+'/events',{key:'t-note',expected_version:v,event:{kind:'note',text:'TRIAGE ACTUAL — backlog triage (hourly, Claude Opus)'}});
+  // A verdict note on an in-project triage item revokes triage write access immediately;
+  // project read access remains available for this worker's project.
+  const note=await api('/api/intake/tasks/'+later+'/events',{key:'t-note',expected_version:1,event:{kind:'note',text:'TRIAGE ACTUAL — backlog triage (hourly, Claude Opus)'}});
   expect(note.status,await note.clone().text()).toBe(200);
-  expect((await api('/api/intake/tasks/'+blank)).status).toBe(403);
-  expect((await api('/api/intake/tasks/'+blank,{key:'t-after',expected_version:v+1,project:'relay'})).status).toBe(403);
   expect((await api('/api/intake/tasks/'+later)).status).toBe(200);
+  const afterVerdict=await api('/api/intake/tasks/'+later+'/events',{key:'t-after-verdict',expected_version:2,event:{kind:'note',text:'triage scope ended'}});
+  expect(afterVerdict.status).toBe(403);
+  expect((await api('/api/intake/tasks/'+blank,{key:'t-after',expected_version:v+1,project:'relay'})).status).toBe(403);
   // A reviewer whose session ended keeps no batch access.
   await runInDurableObject<Hub, any>(stub,(h:any)=>h.sql.exec("UPDATE session_control_sessions SET state='exited' WHERE id=?",session));
-  expect((await api('/api/intake/tasks/'+later)).status).toBe(403);
+  expect((await api('/api/intake/tasks/'+other)).status).toBe(200); // project read survives the triage grant
+  const endedWrite=await api('/api/intake/tasks/'+other+'/events',{key:'t-ended',expected_version:1,event:{kind:'note',text:'triage scope ended'}});
+  expect(endedWrite.status).toBe(403);
  }));
  it('reads only shared usage dimensions without granting other monitoring or writes',()=>setup(async({stub,worker,call}:any)=>{
   await runInDurableObject<Hub, any>(stub,(h:any)=>{
@@ -213,11 +226,11 @@ describe('scoped durable worker access',()=>{
    expect([403,404]).toContain((await call(path,undefined,worker.access_token)).status);
  }));
 
- it.each(['headless','interactive'])('%s reads only its intake and appends only notes/report/blocker, never decisions or close',(mode)=>setup(async({task,other,worker,call}:any)=>{
+ it.each(['headless','interactive'])('%s reads project intakes and appends only authorized notes/report/blocker, never decisions or close',(mode)=>setup(async({task,other,worker,call}:any)=>{
   const api=(p:string,b?:any)=>call(p,b,worker.access_token);
   expect((await api('/api/intake/tasks/'+task)).status).toBe(200);
   expect((await api('/api/intake/tasks/'+task+'/history')).status).toBe(200);
-  expect((await api('/api/intake/tasks/'+other)).status).toBe(403);
+  expect((await api('/api/intake/tasks/'+other)).status).toBe(200); // same-project reads are permitted
   expect((await api('/api/intake/tasks')).status).toBe(403);
   let version=1;
   for(const kind of ['note','report','blocker']) {
@@ -227,7 +240,10 @@ describe('scoped durable worker access',()=>{
   for(const kind of ['scope_decision','approval_decision','done_note','resolution']) expect((await api('/api/intake/tasks/'+task+'/events',{key:uuid(),expected_version:version,event:{kind,text:'forbidden'}})).status).toBe(403);
   expect((await api('/api/intake/tasks/'+task+'/close',{key:uuid(),expected_version:version})).status).toBe(403);
   expect((await api('/api/fleet/launches',{})).status).toBe(403);
-  expect((await api('/api/bus/claims')).status).toBe(403);
+  // Own-project work claims are allowed (test/worker-claims.test.ts); other bus routes are not.
+  expect((await api('/api/bus/claims')).status).toBe(200);
+  expect((await api('/api/bus/claims?project=dtc-website')).status).toBe(403);
+  expect((await api('/api/bus/activity')).status).toBe(403);
  }, mode));
  it.each(['headless','interactive'])('%s issuance refuses another host, a missing link, and an unbound running launch',(mode)=>setup(async({stub,id,call}:any)=>{
   const issue=()=>call('/api/fleet/launches/'+id+'/worker-credential',{});
@@ -252,7 +268,7 @@ describe('scoped durable worker access',()=>{
   const repaired=await issue(); expect(repaired.status,await repaired.clone().text()).toBe(200);
   const profile:any=await repaired.json(); expect(profile.worker_launch_id).toBe(id);
   expect((await call('/api/intake/tasks/'+task,undefined,profile.access_token)).status).toBe(200);
-  expect((await call('/api/intake/tasks/'+other,undefined,profile.access_token)).status).toBe(403);
+  expect((await call('/api/intake/tasks/'+other,undefined,profile.access_token)).status).toBe(200);
   for(const binding of [null, {native_id:uuid(),tag}, {native_id:native,tag:'hub-'+uuid()}]) {
    await runInDurableObject<Hub,any>(stub,(h:any)=>h.sql.exec('UPDATE session_control_sessions SET binding_json=? WHERE id=?',JSON.stringify(binding),session));
    expect((await issue()).status).toBe(409);
@@ -268,7 +284,7 @@ describe('scoped durable worker access',()=>{
   expect(refreshed.status,await refreshed.clone().text()).toBe(200);
   const pair:any=await refreshed.json();
   expect((await call('/api/intake/tasks/'+task,undefined,pair.access_token)).status).toBe(200);
-  expect((await call('/api/intake/tasks/'+other,undefined,pair.access_token)).status).toBe(403);
+  expect((await call('/api/intake/tasks/'+other,undefined,pair.access_token)).status).toBe(200);
   await runInDurableObject<Hub, any>(stub,(h:any)=>h.sql.exec('UPDATE worker_access SET expires_at=?',Date.now()-1));
   expect((await call('/api/intake/tasks/'+task,undefined,pair.access_token)).status).toBe(403);
  }));
@@ -373,16 +389,18 @@ describe('scoped durable worker access',()=>{
   await runInDurableObject<Hub,any>(stub,(h:any)=>h.sql.exec('UPDATE session_control_sessions SET parent_id=? WHERE id=?',uuid(),session));
   expect(await detail(await start({}))).toBe('child_depth');
  }));
- it('files follow-up intakes with provenance, reads/notes only its own creations, and names cross-intake denials (34d0271b)',()=>setup(async({stub,id,session,task,other,worker,call}:any)=>{
+ it('files project-scoped follow-ups, grants project reads and limits writes to authorized intakes (34d0271b)',()=>setup(async({stub,id,session,task,other,worker,call}:any)=>{
   const api=(p:string,b?:any)=>call(p,b,worker.access_token);
   const code=async(r:Response)=>((await r.json()) as any).error;
   const src={type:'unknown',reference:'test'};
   // Own intake: links/context are the same read view as show.
   for(const sfx of ['','/history','/links','/context']) expect((await api('/api/intake/tasks/'+task+sfx)).status).toBe(200);
-  const made=await api('/api/intake/tasks',{key:uuid(),project:'dataops',title:'follow-up',text:'blocker found',source:src});
+  const wrongProject=await api('/api/intake/tasks',{key:uuid(),project:'dataops',title:'follow-up',text:'blocker found',source:src});
+  expect(wrongProject.status).toBe(403);expect(await code(wrongProject)).toBe('worker_project_forbidden');
+  const made=await api('/api/intake/tasks',{key:uuid(),project:'agent-hub',title:'follow-up',text:'blocker found',source:src});
   expect(made.status,await made.clone().text()).toBe(200);
   const created:any=(await made.json() as any).task;
-  expect(created.project).toBe('dataops');
+  expect(created.project).toBe('agent-hub');
   expect(created.created_by).toMatchObject({kind:'worker_session',hub_session_id:session,fleet_launch_id:id,parent_intake_id:task});
   for(const sfx of ['','/history','/links','/context']) expect((await api('/api/intake/tasks/'+created.id+sfx)).status).toBe(200);
   let version=1;
@@ -403,7 +421,7 @@ describe('scoped durable worker access',()=>{
    expect(del.status).toBe(403);
   }
   for(const sfx of ['','/history','/links']) {
-   const res=await api('/api/intake/tasks/'+other+sfx);expect(res.status).toBe(403);expect(await code(res)).toBe('cross_intake_forbidden');
+   expect((await api('/api/intake/tasks/'+other+sfx)).status).toBe(200);
   }
   const noteOther=await api('/api/intake/tasks/'+other+'/events',{key:uuid(),expected_version:1,event:{kind:'note',text:'x',source:src}});
   expect(noteOther.status).toBe(403);expect(await code(noteOther)).toBe('cross_intake_forbidden');
@@ -421,7 +439,7 @@ describe('scoped durable worker access',()=>{
    expect(data.status).toBe('open');expect(data.acceptance_criteria??null).toBeNull();
    expect(JSON.parse(h.sql.exec('SELECT data FROM intake_tasks WHERE id=?',other).toArray()[0].data).status).toBe('open');
   });
-  // A different worker session never sees another session's creations.
+  // A different session on the same project may read project work but cannot write another session's follow-up.
   const id2=uuid(), session2=uuid(), now=new Date().toISOString();
   await runInDurableObject<Hub,any>(stub,(h:any)=>{
    h.sql.exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,created_at,updated_at) VALUES(?,'tester','human','s',?,'{}','worker-host','opencode','shared-muse','headless','/repo','task','starting',?,?)`,id2,'key-'+id2,now,now);
@@ -430,7 +448,9 @@ describe('scoped durable worker access',()=>{
   const issued=await call('/api/fleet/launches/'+id2+'/worker-credential',{});expect(issued.status).toBe(200);
   const worker2:any=await issued.json();
   const peek=await call('/api/intake/tasks/'+created.id,undefined,worker2.access_token);
-  expect(peek.status).toBe(403);expect(await code(peek)).toBe('cross_intake_forbidden');
+  expect(peek.status).toBe(200);
+  const foreignWrite=await call('/api/intake/tasks/'+created.id+'/events',{key:uuid(),expected_version:1,note:'not yours'},worker2.access_token);
+  expect(foreignWrite.status).toBe(403);expect(await code(foreignWrite)).toBe('cross_intake_forbidden');
   // Workers cannot author AC/verification (auto-pickup would turn it into launch
   // authority) or forge provenance; refused creates leave no ledger row.
   for(const extra of [{acceptance_criteria:'do things'},{verification:'required'},{created_by:{hub_session_id:session2}}]) {
@@ -482,7 +502,9 @@ describe('scoped durable worker access',()=>{
    expect((await api('/api/intake/tasks/'+id+'/events',{key:uuid(),expected_version:2,event:{kind:'decision',text:'no',source:src}})).status).toBe(403);
   }
   const untrusted=await api('/api/intake/tasks/'+other2);
-  expect(untrusted.status).toBe(403);expect(await code(untrusted)).toBe('cross_intake_forbidden');
+  expect(untrusted.status).toBe(200); // the unverified link grants no authority beyond project read
+  const untrustedWrite=await api('/api/intake/tasks/'+other2+'/events',{key:uuid(),expected_version:1,event:{kind:'note',text:'not linked',source:src}});
+  expect(untrustedWrite.status).toBe(403);expect(await code(untrustedWrite)).toBe('cross_intake_forbidden');
   // A one-time backfill rebuilds the index from existing open intakes.
   await runInDurableObject<Hub,any>(stub,(h:any)=>{
    h.sql.exec('DROP TABLE intake_session_links');h.intakeService.init();
@@ -501,5 +523,58 @@ describe('scoped durable worker access',()=>{
   });
   expect((await api('/api/intake/tasks/'+cont)).status).toBe(200);
   expect((await api('/api/intake/tasks/'+task)).status).toBe(200);
+ }));
+ it('resolves own and created intakes by unique short-id prefix (08658ee8 AC3)',()=>setup(async({stub,task,other,worker,call}:any)=>{
+  const api=(p:string,b?:any)=>call(p,b,worker.access_token);
+  const code=async(r:Response)=>((await r.json()) as any).error;
+  // Own intake by 8-char prefix reads like the full id.
+  for(const sfx of ['','/history','/links','/context']) expect((await api('/api/intake/tasks/'+task.slice(0,8)+sfx)).status).toBe(200);
+  // A worker-created intake is reachable by prefix too.
+  const src={type:'unknown',reference:'test'};
+  const made=await api('/api/intake/tasks',{key:uuid(),project:'agent-hub',title:'prefix follow-up',text:'prefix body',source:src});
+  expect(made.status,await made.clone().text()).toBe(200);
+  const created:any=(await made.json() as any).task;
+  expect((await api('/api/intake/tasks/'+created.id.slice(0,8))).status).toBe(200);
+  // A different-project intake's prefix stays forbidden with the cross-intake code.
+  await runInDurableObject<Hub,any>(stub,(h:any)=>{
+   const row=h.sql.exec('SELECT data FROM intake_tasks WHERE id=?',other).toArray()[0];
+   const data=JSON.parse(row.data);data.project='dataops';
+   h.sql.exec('UPDATE intake_tasks SET data=? WHERE id=?',JSON.stringify(data),other);
+  });
+  const cross=await api('/api/intake/tasks/'+other.slice(0,8));
+  expect(cross.status).toBe(403);expect(await code(cross)).toBe('cross_intake_forbidden');
+  // Unknown prefixes stay forbidden, never a 404 oracle.
+  const unknown=await api('/api/intake/tasks/00000000');
+  expect(unknown.status).toBe(403);expect(await code(unknown)).toBe('cross_intake_forbidden');
+ }));
+ it('lets a session token file and complete a project-scoped blocker follow-up only for its own intake',()=>setup(async({stub,task,session,other,worker,call}:any)=>{
+  const api=(p:string,b?:any)=>call(p,b,worker.access_token);
+  const key=uuid();
+  const blocked=await api('/api/intake/tasks/'+task+'/blocker',{key:'blocker-'+key,expected_version:1,title:'Install missing compiler',
+   text:'The project compiler is unavailable on this host.',acceptance_criteria:'The project compiles on a Hub-installed host.',blocker_key:key});
+  expect(blocked.status,await blocked.clone().text()).toBe(200);
+  const data:any=await blocked.json();
+  expect(data.task).toMatchObject({status:'blocked',blocked_by:[data.followup.id]});
+  expect(data.followup.project).toBe('agent-hub');
+  expect(data.followup.created_by).toMatchObject({kind:'worker_session',hub_session_id:session,parent_intake_id:task,blocker_followup:true});
+  await runInDurableObject<Hub,any>(stub,(h:any)=>{
+   const row=h.sql.exec('SELECT data FROM intake_tasks WHERE id=?',other).toArray()[0];
+   const taskData=JSON.parse(row.data);taskData.project='dataops';
+   h.sql.exec('UPDATE intake_tasks SET data=? WHERE id=?',JSON.stringify(taskData),other);
+  });
+  expect((await api('/api/intake/tasks/'+other)).status).toBe(403);
+  const cross=await api('/api/intake/tasks/'+other+'/blocker',{key:'cross-'+key,expected_version:1,title:'cross project',text:'x',acceptance_criteria:'x'});
+  expect(cross.status).toBe(403);
+  const done=await api('/api/intake/tasks/'+data.followup.id+'/events',{key:'done-'+key,expected_version:1,
+   event:{kind:'note',text:'DONE abc1234\nLive check: compiler on Hub host\nResult: passed',source:{type:'unknown'}}});
+  expect(done.status,await done.clone().text()).toBe(200);
+  const parent=await api('/api/intake/tasks/'+task);
+  expect((await parent.json() as any).task.blocked_by).toEqual([]);
+  await runInDurableObject<Hub,any>(stub,(h:any)=>h.sql.exec(`INSERT INTO intake_decomposition_sessions(session_id,task_id,project,created_at,child_count)
+   VALUES(?,?,?, ?,0)`,session,task,'agent-hub',Date.now()));
+  const child=await api('/api/intake/tasks',{key:'child-'+key,project:'agent-hub',title:'Build compiler package',text:'Add a compiler package.',source:{type:'unknown',reference:'test'},
+   acceptance_criteria:'The package builds on the Hub worker host.'});
+  expect(child.status,await child.clone().text()).toBe(200);
+  expect((await child.json() as any).task.created_by).toMatchObject({hub_session_id:session,decomposition_child:true});
  }));
 });

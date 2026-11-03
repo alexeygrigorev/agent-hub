@@ -120,6 +120,9 @@ def close_gate_refusal(body):
 def http_error(exc, method, payload):
     if exc.code == 409 and method == 'GET':
         return StaleSnapshot('Snapshot changed')
+    if exc.code == 410 and method == 'GET':
+        # Pinned listing token expired or was evicted; the walk restarts from page one.
+        return StaleSnapshot('Listing snapshot expired')
     # Never echo arbitrary error bodies, tokens, URLs or terminal controls.
     # The server only emits lowercase snake_case slugs; surface the exact
     # slug so auth/grant/capacity/field detail survives, collapse the rest.
@@ -151,6 +154,8 @@ def http_error(exc, method, payload):
                 detail += f'; max {limit} UTF-8 bytes'
     if code in ('invalid_limit', 'limit_out_of_range'):
         detail += '; limit must be a positive integer; min 1, max 100 (larger values clamp)'
+    if code == 'invalid_search':
+        detail += '; search must be 1-128 characters'
     if code == 'done_evidence_required':
         detail += '; append a DONE note with commit SHA or deploy run URL, Live check: command/URL, and Result: output before closing'
     if code == 'cancel_reason_required':
@@ -224,8 +229,30 @@ def add_commands(sub):
     commands = root.add_subparsers(dest='intake_cmd', required=True)
     from . import intake_stats
     intake_stats.options(commands.add_parser('stats', help='Timing and attempts for one intake'), individual=True)
+    depend = commands.add_parser('depend', help='Add a prerequisite; original work waits until it is DONE')
+    depend.add_argument('id')
+    depend.add_argument('--on', required=True)
+    depend.add_argument('--remove', action='store_true')
+    depend.add_argument('--key')
+    depend.add_argument('--version', type=int)
+    blocker = commands.add_parser('blocker', help='Create a follow-up with AC, link it and block the original atomically')
+    blocker.add_argument('id')
+    blocker.add_argument('--title', required=True)
+    blocker.add_argument('--text', required=True)
+    blocker.add_argument('--acceptance-criteria', required=True)
+    blocker.add_argument('--key', required=True)
+    blocker.add_argument('--version', type=int)
+    decompose = commands.add_parser('decompose', help='Queue a deep-tier agent to create child intakes and dependencies')
+    decompose.add_argument('id')
+    decompose.add_argument('--workspace')
+    decompose.add_argument('--key', required=True)
+    decompose.add_argument('--version', type=int)
     forgotten = commands.add_parser('forgotten', help='Open intakes forgotten by live sessions; includes queued restart reason')
     forgotten.add_argument('--project')
+    queue = commands.add_parser('queue', help='Autonomous intake queue (promoted first, then priority high > normal > low, then newest created_at)')
+    queue.add_argument('--project')
+    queue.add_argument('--cursor')
+    queue.add_argument('--limit', type=int)
     create = commands.add_parser('create', help='Capture verbatim UTF-8 text from file/stdin; missing provenance stays unknown')
     create.add_argument('--project', required=True)
     create.add_argument('--title', required=True)
@@ -248,6 +275,7 @@ def add_commands(sub):
     listing = commands.add_parser('list', help='List one page, or all matching tasks with --all')
     listing.add_argument('--status', default=None)
     listing.add_argument('--project')
+    listing.add_argument('--search', help='Server-side dedup filter: case-insensitive substring over title, project, original text and context (max 128 chars)')
     listing.add_argument('--after')
     listing.add_argument('--revision', type=int)
     listing.add_argument('--authorization-valid-until', type=int)
@@ -313,6 +341,7 @@ def add_commands(sub):
     assign.add_argument('id')
     assign.add_argument('--version', type=int, required=True)
     assign.add_argument('--key', required=True)
+    assign.add_argument('--force', action='store_true', help='Operator only: start despite unresolved dependencies')
     assign.add_argument('--workspace', required=True, help='Configured workspace label on the selected host')
     assign.add_argument('--engine', help='Requested engine label (existing model tiers still decide placement; requires --reason)')
     assign.add_argument('--reason', default=None, help='Explanation why this specific model/engine must be chosen (required when --engine is specified)')
@@ -409,31 +438,65 @@ def handoff(project=None, page_size=25):
 
 
 def list_all(params):
+    """Follow all pages of one pinned listing. The server pins the matching id
+    set behind list_token, so pages survive intake create/close churn; on the
+    rare expiry (410) the whole walk restarts, bounded like the handoff loop.
+    Servers without a token fall back to the revision-pinned walk."""
     if 'after' in params:
         raise IntakeInputError('--all cannot be combined with --after')
+    for _ in range(3):
+        try:
+            return _list_all_once(params)
+        except StaleSnapshot:
+            continue
+    raise IntakeInputError('Snapshot kept changing; retry the command')
+
+
+def _request_page(page_params, params):
+    """One GET with the oversized-response retry from the revision walk."""
+    while True:
+        try:
+            return request('GET', BASE + '/tasks?' + urlencode(page_params))
+        except IntakeResponseTooLarge:
+            current = min(page_params.get('limit', 25), 100)
+            if current <= 1:
+                raise
+            page_params['limit'] = max(1, current // 2)
+            params['limit'] = page_params['limit']
+
+
+def _list_all_once(params):
     items, seen, cursors = [], set(), set()
     first = None
+    token = None
+    after = None
     reduced = False
     for _ in range(10001):
-        while True:
-            try:
-                page = request('GET', BASE + '/tasks?' + urlencode(params))
-                break
-            except IntakeResponseTooLarge:
-                # Retry only an oversized GET, with the same cursor/revision.
-                # The limit strictly decreases, so there are at most 7 such
-                # reductions across the entire export; transport/auth/stale
-                # failures keep their existing fail-closed behavior.
-                current = min(params.get('limit', 25), 100)
-                if current <= 1:
-                    raise
-                params['limit'] = max(1, current // 2)
-                reduced = True
+        page_params = dict(params)
+        if token is not None:
+            page_params['list_token'] = token
+        elif first is None:
+            page_params['list_token'] = 'new'
+        if after:
+            page_params['after'] = after
+            if first.get('authorization_valid_until') is not None:
+                page_params['authorization_valid_until'] = first['authorization_valid_until']
+            if token is None:
+                # Tokenless fallback: the classic revision-pinned page walk.
+                page_params['revision'] = first['snapshot_version']
+        if 'limit' not in page_params:
+            page_params['limit'] = 100
+            params['limit'] = 100
+        before_limit = page_params.get('limit')
+        page = _request_page(page_params, params)
+        if page_params.get('limit') != before_limit:
+            reduced = True
         if first is None:
             first = page
-        elif (page['snapshot_version'] != first['snapshot_version'] or
-              page.get('authorization_valid_until') != first.get('authorization_valid_until') or
-              page['total'] != first['total']):
+            token = page.get('list_token')
+        elif token is None and (page['snapshot_version'] != first['snapshot_version'] or
+                                page.get('authorization_valid_until') != first.get('authorization_valid_until') or
+                                page['total'] != first['total']):
             raise StaleSnapshot('Snapshot changed')
         for task in page['items']:
             if task['id'] in seen:
@@ -442,18 +505,15 @@ def list_all(params):
             items.append(task)
         after = page['next']
         if not after:
-            if len(items) != first['total']:
+            if token is None and len(items) != first['total']:
                 raise IntakeInputError('Incomplete snapshot; retry the command')
             result = dict(first, items=items, next=None, total=len(items))
             if reduced:
-                result.update(effective_limit=page.get('effective_limit', min(params.get('limit', 25), 100)), page_size_reduced=True)
+                result.update(effective_limit=page.get('effective_limit', min(params.get('limit', 100), 100)), page_size_reduced=True)
             return result
         if after in cursors or not page['items']:
             raise IntakeInputError('Invalid snapshot cursor; retry the command')
         cursors.add(after)
-        params.update(after=after, revision=first['snapshot_version'])
-        if first.get('authorization_valid_until') is not None:
-            params['authorization_valid_until'] = first['authorization_valid_until']
     raise IntakeInputError('Snapshot page bound exceeded')
 
 
@@ -464,6 +524,9 @@ def execute(args):
     if command == 'forgotten':
         params = {'project': args.project} if args.project else {}
         return request('GET', BASE + '/forgotten' + ('?' + urlencode(params) if params else ''))
+    if command == 'queue':
+        params = {field: getattr(args, field) for field in ('project', 'cursor', 'limit') if getattr(args, field, None) is not None}
+        return request('GET', BASE + '/queue' + ('?' + urlencode(params) if params else ''))
     if command == 'create':
         valid_key(args.key)
         criteria = getattr(args, 'acceptance_criteria', None)
@@ -497,6 +560,13 @@ def execute(args):
         params = {'limit': args.limit if args.limit is not None else (100 if args.all else 25)}
         if args.status is not None:
             params['status'] = args.status
+        if args.search is not None:
+            search = args.search.strip()
+            if not search:
+                raise IntakeInputError('--search must be a non-empty filter (1-128 characters)')
+            if len(search) > 128:
+                raise IntakeInputError('--search exceeds 128 characters')
+            params['q'] = search
         if args.archived:
             params['archived'] = 'true'
         elif args.all:
@@ -554,6 +624,20 @@ def execute(args):
         return request('POST' if args.payload_file else 'GET', BASE + '/' + command,
                        json_file(args.payload_file) if args.payload_file else None)
     path = BASE + '/tasks/' + safe_id(args.id)
+    if command in ('depend', 'blocker', 'decompose'):
+        key = args.key or (command + '-' + uuid.uuid4().hex)
+        valid_key(key)
+        version = args.version
+        if version is None:
+            version = request('GET', path)['task']['version']
+        payload = {'key': key, 'expected_version': version}
+        if command == 'depend':
+            payload.update(on=safe_id(args.on), remove=args.remove)
+        elif command == 'blocker':
+            payload.update(title=args.title, text=args.text, acceptance_criteria=args.acceptance_criteria)
+        elif args.workspace:
+            payload['workspace'] = args.workspace
+        return request('POST', path + '/' + command, payload)
     if command in ('show', 'history', 'links', 'context'):
         if command == 'history' and getattr(args, 'archived', False):
             limit, after = getattr(args, 'limit', 100), getattr(args, 'after', None)
@@ -585,6 +669,8 @@ def execute(args):
         return cas_update(path + '/promote', payload, args.version is None, key, read_path=path)
     if command == 'assign':
         session = {'workspace': args.workspace}
+        if getattr(args, 'force', False):
+            session['force'] = True
         for field in ('engine', 'tier', 'machine', 'cwd'):
             if getattr(args, field, None):
                 session[field] = getattr(args, field)

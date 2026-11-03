@@ -24,7 +24,7 @@ export const WORKER_CREATE_LIMIT = 25;
  * by Hub session id or native id. Maintained by intake_task_projection triggers. */
 export const SESSION_LINKS_SCHEMA = `CREATE TABLE IF NOT EXISTS intake_session_links (
   session_key TEXT NOT NULL, task_id TEXT NOT NULL, authority TEXT NOT NULL, PRIMARY KEY(session_key, task_id))`;
-const TRUSTED_LINK = `json_extract(e.value,'$.kind')='link' AND json_extract(e.value,'$.authority') IN ('hub_launch_verified','host_census_verified')`;
+const TRUSTED_LINK = `e.type='object' AND json_extract(e.value,'$.kind')='link' AND json_extract(e.value,'$.authority') IN ('hub_launch_verified','host_census_verified')`;
 const linkRows = (id: string, from: string, filter = '1') => ['hub_session_id', 'native_id'].map(field =>
   `SELECT json_extract(e.value,'$.${field}'), ${id}, json_extract(e.value,'$.authority') FROM ${from}
    WHERE ${filter} AND ${TRUSTED_LINK} AND json_type(e.value,'$.${field}')='text'`).join(' UNION ');
@@ -56,7 +56,7 @@ export function initLinkRefs(sql: SqlStorage) {
   const exists = sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='intake_link_refs'").toArray().length > 0;
   sql.exec('CREATE TABLE IF NOT EXISTS intake_link_refs (ref TEXT NOT NULL, task_id TEXT NOT NULL, PRIMARY KEY(ref, task_id)) WITHOUT ROWID');
   const rows = (id: string, from: string) => ['hub_session_id', 'native_id'].map(field =>
-    `SELECT json_extract(e.value,'$.${field}'), ${id} FROM ${from} WHERE json_extract(e.value,'$.kind')='link' AND json_type(e.value,'$.${field}')='text'`).join(' UNION ');
+    `SELECT json_extract(e.value,'$.${field}'), ${id} FROM ${from} WHERE e.type='object' AND json_extract(e.value,'$.kind')='link' AND json_type(e.value,'$.${field}')='text'`).join(' UNION ');
   if (!exists) sql.exec(`INSERT INTO intake_link_refs(ref,task_id) ${rows('p.id', 'intake_task_projection p, json_each(p.links) e')} ON CONFLICT DO NOTHING`);
   for (const op of ['INSERT', 'UPDATE']) sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_link_refs_${op.toLowerCase()} AFTER ${op} ON intake_tasks BEGIN
     INSERT INTO intake_link_refs(ref,task_id) ${rows('NEW.id', "json_each(NEW.data,'$.history') e")} ON CONFLICT DO NOTHING; END`);
@@ -74,7 +74,7 @@ export function initProjectionLinkRefs(sql: SqlStorage) {
   const exists = sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='intake_projection_link_refs'").toArray().length > 0;
   sql.exec('CREATE TABLE IF NOT EXISTS intake_projection_link_refs (ref TEXT NOT NULL, task_id TEXT NOT NULL, PRIMARY KEY(ref, task_id)) WITHOUT ROWID');
   const rows = (id: string, from: string) => ['hub_session_id', 'native_id'].map(field =>
-    `SELECT json_extract(e.value,'$.${field}'), ${id} FROM ${from} WHERE json_type(e.value,'$.${field}')='text'`).join(' UNION ');
+    `SELECT json_extract(e.value,'$.${field}'), ${id} FROM ${from} WHERE e.type='object' AND json_type(e.value,'$.${field}')='text'`).join(' UNION ');
   if (!exists) sql.exec(`INSERT INTO intake_projection_link_refs(ref,task_id) ${rows('p.id', 'intake_task_projection p, json_each(p.links) e')} ON CONFLICT DO NOTHING`);
   for (const [op, when] of [['INSERT', 'WHEN json_valid(NEW.links)'], ['UPDATE OF links', 'WHEN NEW.links IS NOT OLD.links AND json_valid(NEW.links)']]) sql.exec(
     `CREATE TRIGGER IF NOT EXISTS intake_projection_link_refs_${op.split(' ')[0].toLowerCase()} AFTER ${op} ON intake_task_projection ${when} BEGIN
@@ -169,7 +169,19 @@ export function workerCreatedTargets(sql: SqlStorage, sessionId: string | null |
   return new Set(sql.exec('SELECT task_id FROM worker_created_intakes WHERE session_id=? ORDER BY task_id LIMIT ?', sessionId, WORKER_CREATE_LIMIT)
     .toArray().map((r: any) => r.task_id as string));
 }
-const INTAKE_TASK_PATH = /^\/api\/intake\/tasks\/([a-zA-Z0-9._:-]+)(\/history|\/events|\/links|\/context)?$/;
+const INTAKE_TASK_PATH = /^\/api\/intake\/tasks\/([a-zA-Z0-9._:-]+)(\/history|\/events|\/links|\/context|\/depend|\/blocker|\/decompose)?$/;
+/** Intake 08658ee8 AC3: unique short-id prefixes (>= 8 chars, like sessions)
+ * resolve to the full task id for the worker's own, created and linked intakes.
+ * Triage requests stay exact-id (intake d8d509d2), so the caller passes the raw
+ * reference there. Ambiguous or unknown prefixes stay unresolved. */
+export function resolveTaskRef(sql: SqlStorage, id: string): string | null {
+  if (!/^[a-zA-Z0-9._:-]{1,128}$/.test(id)) return null;
+  const exact: any = sql.exec('SELECT id FROM intake_tasks WHERE id=?', id).toArray()[0];
+  if (exact) return exact.id;
+  if (id.length < 8) return null;
+  const matches: any[] = sql.exec('SELECT id FROM intake_tasks WHERE substr(id,1,?)=? LIMIT 2', id.length, id).toArray();
+  return matches.length === 1 ? matches[0].id : null;
+}
 /** Denial code for a worker request outside its capability. Intake reads or
  * writes aimed at another intake say so explicitly instead of a generic 403. */
 export function workerDenialCode(sql: SqlStorage, request: Request, tokenId: string): string {
@@ -177,7 +189,8 @@ export function workerDenialCode(sql: SqlStorage, request: Request, tokenId: str
   if (path !== '/api/intake/tasks' && !path.startsWith('/api/intake/tasks/')) return 'worker_scope_forbidden';
   const worker = workerAccessContext(sql, tokenId);
   const id = /^\/api\/intake\/tasks\/([a-zA-Z0-9._:-]+)/.exec(path)?.[1];
-  if (worker && id && (id === worker.task_id || (id.length >= 8 && worker.task_id.startsWith(id)))) return 'worker_scope_forbidden';
+  const resolved = id ? resolveTaskRef(sql, id) : null;
+  if (worker && id && (resolved === worker.task_id || (id.length >= 8 && worker.task_id.startsWith(id)))) return 'worker_scope_forbidden';
   return 'cross_intake_forbidden';
 }
 export function workerRequestAllowed(sql: SqlStorage, request: Request, tokenId: string): boolean {
@@ -205,13 +218,30 @@ export function workerRequestAllowed(sql: SqlStorage, request: Request, tokenId:
   if (/^\/api\/bus\/claims\/[^/]+\/release$/.test(path)) return request.method === 'POST';
   const ownIntake = INTAKE_TASK_PATH.exec(path);
   if (ownIntake) {
-    const id = ownIntake[1];
-    // A triage reviewer may read, note and amend AC/project on its requested intakes.
-    if (id !== worker.task_id && triageTargets(sql, worker.session_id).has(id))
-      return request.method === 'GET' ? ownIntake[2] !== '/events' : request.method === 'POST' && (!ownIntake[2] || ownIntake[2] === '/events');
+    const requested = ownIntake[1];
+    // Intake 08658ee8 AC3: created and linked intakes are matched through the
+    // unique-prefix resolution, so workers can address them by short id too.
+    const id = resolveTaskRef(sql, requested) ?? requested;
+    // Every worker token is bounded to the project of its server-linked intake,
+    // including legacy created/linked/triage grants. Resolve prefixes fail-closed.
+    if (typeof worker.task_project !== 'string') return false;
+    let matches: any[] = [];
+    try {
+      matches = sql.exec('SELECT data FROM intake_tasks WHERE id=?', id).toArray() as any[];
+      if (!matches.length) matches = sql.exec('SELECT data FROM intake_tasks WHERE substr(id,1,?)=? ORDER BY id LIMIT 2', id.length, id).toArray() as any[];
+    } catch { return false; }
+    if (matches.length !== 1) return false;
+    let target: any;
+    try { target = JSON.parse(matches[0].data); } catch { return false; }
+    if (target?.project !== worker.task_project) return false;
+    // Triage requests remain exact-id scoped even though ordinary task refs accept prefixes.
+    if (requested !== worker.task_id && triageTargets(sql, worker.session_id).has(requested))
+      return request.method === 'GET' ? !['/events', '/depend', '/blocker', '/decompose'].includes(ownIntake[2] ?? '') : request.method === 'POST' && (!ownIntake[2] || ownIntake[2] === '/events');
     const own = id === worker.task_id || (id.length >= 8 && worker.task_id.startsWith(id));
-    if (!own && !workerCreatedTargets(sql, worker.session_id).has(id) && !workerLinkedTargets(sql, worker).has(id)) return false;
-    return request.method === 'GET' ? ownIntake[2] !== '/events' : request.method === 'POST' && ownIntake[2] === '/events';
+    const writeTarget = own || workerCreatedTargets(sql, worker.session_id).has(id) || workerLinkedTargets(sql, worker).has(id);
+    // Self-report: the session's own token may file a blocker follow-up, link prerequisites and request decomposition.
+    const write = ['/events', '/depend', '/blocker', '/decompose'].includes(ownIntake[2] ?? '');
+    return request.method === 'GET' ? !write : request.method === 'POST' && write && writeTarget;
   }
   if (path === '/api/sessions') return ['GET', 'POST'].includes(request.method);
   const link = /^\/api\/sessions\/([^/]{8,128})\/link$/.exec(path);
@@ -244,6 +274,9 @@ export function workerRequestAllowed(sql: SqlStorage, request: Request, tokenId:
     const child: any = sql.exec('SELECT actor,parent_id FROM session_control_sessions WHERE id=?',session[1]).toArray()[0];
     return !!child && child.actor === worker.actor && child.parent_id === worker.session_id;
   }
+  // Work claims: the route handler confines them to this intake's project and
+  // the worker's own holder (src/worker-claims.ts, intake 6022786b).
+  if (workerClaimRoute(path, request.method)) return true;
   return false;
 }
 
@@ -412,4 +445,10 @@ export class WorkerAccess {
         worker_launch_id:id,base_url:new URL(request.url).origin,worker_expires_at:expires});
     });
   }
+}
+
+/** Claim routes a worker may reach; src/worker-claims.ts confines them further. */
+export function workerClaimRoute(path: string, method: string): boolean {
+  if (path === '/api/bus/claims') return method === 'GET' || method === 'POST';
+  return method === 'POST' && /^\/api\/bus\/claims\/[^/]+\/release$/.test(path);
 }

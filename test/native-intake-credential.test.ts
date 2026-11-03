@@ -6,12 +6,13 @@ import type { Env } from '../src/env';
 
 // Intake-scoped credential of an observed native session (no Hub launch), e.g.
 // an aplexer drain brief: minted for a host-reported running session that has a
-// server-verified intake link, scope worker:own-intake only, revoked with the session.
+// server-verified intake link, grant project-scoped reads and own-intake writes,
+// revoked with the session.
 const uuid = () => crypto.randomUUID();
 
 async function setup(fn: (x: any) => Promise<void>) {
   const stub = (env as unknown as Env).HUB.get((env as unknown as Env).HUB.idFromName('native-' + uuid()));
-  const task = uuid(), other = uuid(), session = uuid(), native = uuid();
+  const task = uuid(), sibling = uuid(), foreign = uuid(), session = uuid(), native = uuid();
   const token = 'hubt_host_fixture_' + uuid(), hash = await sha256(token), now = new Date().toISOString();
   const otherToken = 'hubt_host_fixture_' + uuid(), otherHash = await sha256(otherToken);
   await runInDurableObject<Hub, any>(stub, async (h: any) => {
@@ -21,17 +22,19 @@ async function setup(fn: (x: any) => Promise<void>) {
         cred, tok, 'refresh-' + cred, 'family-' + cred, m, m, now, new Date(Date.now() + 3600000).toISOString());
       h.sql.exec('UPDATE machines SET credential_id=? WHERE id=?', cred, m);
     }
-    for (const t of [task, other]) h.sql.exec('INSERT INTO intake_tasks(id,data) VALUES(?,?)', t, JSON.stringify({ id: t, project: 'agent-hub', status: 'open', version: 1, created_at: Date.now(), updated_at: Date.now(), title: 'fixture', scope: null, history: [{ id: uuid(), kind: 'intake', text: 'fixture', authority: 'untrusted_task_data', actor: 'tester', captured_at: Date.now() }], acceptance_criteria: 'x' }));
+    for (const [t, project] of [[task, 'agent-hub'], [sibling, 'agent-hub'], [foreign, 'other-project']] as const) {
+      h.sql.exec('INSERT INTO intake_tasks(id,data) VALUES(?,?)', t, JSON.stringify({ id: t, project, status: 'open', version: 1, created_at: Date.now(), updated_at: Date.now(), title: 'fixture', scope: null, history: [{ id: uuid(), kind: 'intake', text: 'fixture', authority: 'untrusted_task_data', actor: 'tester', captured_at: Date.now() }], acceptance_criteria: 'x' }));
+    }
     h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at) VALUES(?,'tester',?,'{}','native-host','shell','interactive','running',?,?,?)`,
       session, 'session-' + session, JSON.stringify({ native_id: native, tag: 'drain-x', workspace: '/home/u/git/drain-x' }), now, now);
   });
   const call = (path: string, body?: any, bearer = token, method?: string) => stub.fetch('https://hub.test' + path, { method: method ?? (body === undefined ? 'GET' : 'POST'), headers: { Authorization: 'Bearer ' + bearer, 'Content-Type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
   const link = (taskId: string, key: string) => runInDurableObject<Hub, any>(stub, (h: any) => { h.sql.exec('INSERT INTO intake_session_links(session_key,task_id,authority) VALUES(?,?,?)', key, taskId, 'host_census_verified'); });
-  await fn({ stub, task, other, session, native, call, link, otherToken });
+  await fn({ stub, task, sibling, foreign, session, native, call, link, otherToken });
 }
 
 describe('native session intake credential', () => {
-  it('requires a verified link, then scopes the session to exactly its own intake', () => setup(async ({ stub, task, other, session, native, call, link, otherToken }: any) => {
+  it('requires a verified link, then scopes reads to its project and writes to its own intake', () => setup(async ({ stub, task, sibling, foreign, session, native, call, link, otherToken }: any) => {
     // No link: nothing listed, nothing minted. A START note or tag is not authority.
     expect(await (await call('/api/session-intake/credentials')).json()).toEqual({ sessions: [] });
     const refused = await call('/api/sessions/' + session + '/intake-credential', {});
@@ -73,7 +76,7 @@ describe('native session intake credential', () => {
       expect(JSON.parse(h.sql.exec('SELECT request_json FROM session_control_sessions WHERE id=?', targetSession).one().request_json).intake_task_id).toBe(task);
     });
     // The scoped credential cannot link a different intake or a same-host session from another workspace.
-    expect((await api('/api/sessions/' + targetSession + '/link', { key: 'wrong-task-' + uuid(), intake_task_id: other })).status).toBe(403);
+    expect((await api('/api/sessions/' + targetSession + '/link', { key: 'wrong-task-' + uuid(), intake_task_id: sibling })).status).toBe(403);
     const foreignSession = uuid();
     await runInDurableObject<Hub, any>(stub, (h: any) => {
       h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at)
@@ -91,11 +94,16 @@ describe('native session intake credential', () => {
     const version = body.task?.version ?? body.snapshot_version ?? 1;
     const note = await api('/api/intake/tasks/' + task + '/events', { key: uuid(), expected_version: version, event: { kind: 'note', text: 'DONE proof' } });
     expect(note.status, await note.clone().text()).toBe(200);
-    // Other intakes: no read, no append.
-    const cross = await api('/api/intake/tasks/' + other);
+    // Same-project siblings are readable, but not writable by this credential.
+    const siblingRead = await api('/api/intake/tasks/' + sibling);
+    expect(siblingRead.status).toBe(200);
+    const siblingWrite = await api('/api/intake/tasks/' + sibling + '/events', { key: uuid(), expected_version: 1, event: { kind: 'note', text: 'x' } });
+    expect(siblingWrite.status).toBe(403);
+    // A different project is outside the capability.
+    const cross = await api('/api/intake/tasks/' + foreign);
     expect(cross.status).toBe(403);
     expect(await cross.json()).toEqual({ error: 'cross_intake_forbidden' });
-    const crossWrite = await api('/api/intake/tasks/' + other + '/events', { key: uuid(), expected_version: 1, event: { kind: 'note', text: 'x' } });
+    const crossWrite = await api('/api/intake/tasks/' + foreign + '/events', { key: uuid(), expected_version: 1, event: { kind: 'note', text: 'x' } });
     expect(crossWrite.status).toBe(403);
     // Non-note kinds (e.g. decisions) stay forbidden on the own intake.
     const decision = await api('/api/intake/tasks/' + task + '/events', { key: uuid(), expected_version: version + 1, event: { kind: 'decision', text: 'no' } });

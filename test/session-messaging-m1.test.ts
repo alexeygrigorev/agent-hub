@@ -59,22 +59,32 @@ const send = (bus: BusService, key = crypto.randomUUID(), extra: any = {}) => bu
   { senderActor: 'agent:developer', toActor: 'session:' + SESSION, kind: 'note', body: 'M1 fixture', idempotencyKey: key, ...extra });
 
 describe('M1 ordering, states and deadlines', () => {
-  it('parses explicit address kinds and refuses ambiguous tag@machine with candidates', () => fixture(async ({ bus, sql }) => {
+  it('parses explicit address kinds and refuses ambiguous tag@machine with candidates', () => {
     expect(parseAddress('session:' + SESSION)).toEqual({ kind: 'session', sessionId: SESSION });
     expect(parseAddress('session:wrong')).toBeNull();
     expect(parseAddress('agent:developer')).toEqual({ kind: 'agent', name: 'developer' });
     expect(parseAddress('human:me')).toEqual({ kind: 'human', sub: 'me' });
     expect(parseAddress('human:admin-token:fixture')).toEqual({ kind: 'human', sub: 'admin-token:fixture' });
-    sql.exec(`INSERT INTO session_control_sessions (id, actor, request_key, request_json, machine_id, engine, mode, state, binding_json, created_at, updated_at)
-      SELECT '44444444-4444-4444-8444-444444444444', actor, 'duplicate', request_json, machine_id, engine, mode, state, binding_json, created_at, updated_at FROM session_control_sessions WHERE id = ?`, SESSION);
-    try { send(bus, 'ambiguous', { toActor: 'burn-tabo@Tabo' }); throw new Error('expected refusal'); }
+
+    // Keep this parsing/resolution unit test out of the cold Durable Object
+    // fixture: starting it can consume most of Vitest's 5s test budget on a
+    // busy CI worker. Other cases below exercise the full bus/DO path.
+    const sessions = [SESSION, '44444444-4444-4444-8444-444444444444'].map(id => ({
+      id, machine_id: 'tabo', binding_json: JSON.stringify({ tag: 'burn-tabo' }),
+    }));
+    const sql = {
+      exec(query: string) {
+        if (query.startsWith('SELECT id FROM machines')) return { toArray: () => [{ id: 'tabo' }] };
+        if (query.startsWith('SELECT id, machine_id, binding_json FROM session_control_sessions')) return { toArray: () => sessions };
+        throw new Error(`unexpected query: ${query}`);
+      },
+    } as any;
+    try { resolveRecipient(sql, 'burn-tabo@Tabo', Date.now()); throw new Error('expected refusal'); }
     catch (e: any) {
       expect(e.message).toBe('ambiguous_recipient');
       expect(e.candidates).toEqual(expect.arrayContaining(['session:' + SESSION, 'session:44444444-4444-4444-8444-444444444444']));
     }
-    sql.exec("UPDATE named_agents SET disabled_at = '2026-01-01' WHERE name = 'developer'");
-    expect(() => send(bus, 'disabled', { toActor: 'agent:developer' })).toThrow('unknown_recipient');
-  }));
+  });
 
   it('validates refs in UTF-8 bytes, deadlines and idempotent delivery options', () => fixture(async ({ bus, sql }) => {
     const ref = { kind: 'path', value: '/evidence/result.txt', machine: 'tabo', bytes: 1024 };
@@ -88,6 +98,11 @@ describe('M1 ordering, states and deadlines', () => {
     }
     expect(() => send(bus, 'deadline', { deliverByMs: 7 * 86400000 + 1 })).toThrow('invalid_deliver_by');
     expect(() => send(bus, 'body', { body: 'é'.repeat(8193) })).toThrow('body_too_large');
+  }));
+
+  it('rejects disabled named agents', () => fixture(async ({ bus, sql }) => {
+    sql.exec("UPDATE named_agents SET disabled_at = '2026-01-01' WHERE name = 'developer'");
+    expect(() => send(bus, 'disabled', { toActor: 'agent:developer' })).toThrow('unknown_recipient');
   }));
 
   it('aligns session-control send to exactly 16384 UTF-8 bytes', () => fixture(async ({ sc }) => {

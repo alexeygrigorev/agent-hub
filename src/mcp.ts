@@ -26,6 +26,17 @@ export async function boundedText(request: Request, limit = 32768): Promise<stri
   return new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(joined);
 }
 export async function handleMcp(request: Request, authenticate: (r: Request) => Promise<any>, dispatch: (r: Request) => Promise<Response>, recordUsage: (tool: string, kind: string) => void = () => {}) {
+  // The MCP edge must never throw: an uncaught Worker exception surfaces as
+  // Cloudflare 1101 with no JSON-RPC body (intake aefcc150). Any unexpected
+  // failure (auth, usage accounting, framing) becomes a structured -32603.
+  try {
+    return await handleMcpRequest(request, authenticate, dispatch, recordUsage);
+  } catch {
+    return json({ jsonrpc: '2.0', id: null, error: { code: -32603, message: 'Internal error' } });
+  }
+}
+
+async function handleMcpRequest(request: Request, authenticate: (r: Request) => Promise<any>, dispatch: (r: Request) => Promise<Response>, recordUsage: (tool: string, kind: string) => void = () => {}) {
   const url = new URL(request.url);
   const origin = request.headers.get('Origin');
   // No cookie authority: an MCP caller must explicitly present its bearer.

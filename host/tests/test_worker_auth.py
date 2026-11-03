@@ -137,6 +137,59 @@ class WorkerAuthTests(unittest.TestCase):
                     child.kill(); child.communicate(timeout=5)
             server.shutdown(); server.server_close(); thread.join(timeout=5)
 
+    def test_worker_hub_claims_and_release_refresh_expired_access_without_login(self):
+        """Intake 6022786b: an expired worker access token on `hub claims` /
+        `hub release` refreshes through the worker profile and retries; no
+        human `hub auth login` is needed."""
+        from agent_hub_host import private_fs
+        seen = []
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+            def _reply(self, code, payload):
+                data = json.dumps(payload).encode()
+                self.send_response(code); self.send_header('Content-Type', 'application/json')
+                self.end_headers(); self.wfile.write(data)
+            def _claims(self):
+                seen.append((self.command, self.path, self.headers.get('Authorization')))
+                if self.headers.get('Authorization') != 'Bearer hubt_rotated-test-only':
+                    return self._reply(401, {'error': 'unauthorized'})
+                return self._reply(200, [] if self.command == 'GET' else {'status': 'ok'})
+            def do_GET(self):
+                self._claims()
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers.get('Content-Length') or 0))
+                if self.path.startswith('/api/bus/claims'):
+                    return self._claims()
+                seen.append(('REFRESH', self.path, json.loads(body).get('refresh_token')))
+                self._reply(200, {'access_token': 'hubt_rotated-test-only', 'refresh_token': 'hubr_rotated-test-only'})
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        try:
+            thread.start()
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                profile = dict(worker_launch_id=OFFER, client_kind='agent',
+                               access_token='hubt_expired-test-only', refresh_token='hubr_initial-test-only',
+                               base_url='http://127.0.0.1:' + str(server.server_port))
+                path = root / '.local/hub-worker-auth' / (OFFER + '.json')
+                private_fs.atomic_write(path, json.dumps(profile).encode(), 32768)
+                env = dict(os.environ, APLEXER_TAG='task-hub-' + OFFER, APLEXER_WORKSPACE=tmp,
+                           PYTHONPATH=str(Path(__file__).resolve().parents[1]), HOME=str(root / 'managed'),
+                           XDG_CONFIG_HOME=str(root / 'managed/.config'))
+                env.pop('HUB_CONFIG_FILE', None)
+                code = ("from agent_hub_host import bus; assert bus.list_claims() == []; "
+                        "assert bus.release('01CLAIMTESTID') == {'status': 'ok'}")
+                child = subprocess.run([sys.executable, '-c', code], env=env, capture_output=True, text=True, timeout=30)
+                self.assertEqual(child.returncode, 0, child.stderr)
+                self.assertEqual([s for s in seen if s[0] == 'REFRESH'][0][2], 'hubr_initial-test-only')
+                self.assertEqual(len([s for s in seen if s[0] == 'REFRESH']), 1)
+                self.assertIn(('POST', '/api/bus/claims/01CLAIMTESTID/release', 'Bearer hubt_rotated-test-only'), seen)
+                self.assertEqual(json.loads(path.read_text())['refresh_token'], 'hubr_rotated-test-only')
+                self.assertFalse((root / 'managed/.config/agent-hub/cli.json').exists())
+        finally:
+            server.shutdown(); server.server_close(); thread.join(timeout=5)
+
     def test_revoked_worker_never_starts_human_or_host_device_pairing(self):
         from agent_hub_host import auth as cli_auth
         cfg=dict(worker_launch_id=OFFER,client_kind='agent',access_token='hubt_initial-test-only',

@@ -146,8 +146,9 @@ describe('central engine provisioning', () => {
     expect(sql.exec('SELECT * FROM fleet_routes').toArray()).toHaveLength(0);
     expect((await s.handle(req('/test-account', 'POST', {revision: first.revision}), host)).status).toBe(409);
   }));
-  it('rejects traversal, arbitrary packages, environment injection and OpenCode GLM routes', async () => fixture(async s => {
-    for (const data of [{ ...bundle, files: {'../escape': 'bad'} }, { ...bundle, env: { LD_PRELOAD: 'bad' } }, { ...bundle, provider: 'arbitrary' }, { ...bundle, provider: 'go', args: ['--model', 'glm'] }, { ...bundle, version: 'latest' }]) {
+  it('rejects traversal, arbitrary packages, environment injection, OpenCode GLM routes and hardcoded Codex effort', async () => fixture(async s => {
+    for (const data of [{ ...bundle, files: {'../escape': 'bad'} }, { ...bundle, env: { LD_PRELOAD: 'bad' } }, { ...bundle, provider: 'arbitrary' }, { ...bundle, provider: 'go', args: ['--model', 'glm'] }, { ...bundle, version: 'latest' },
+      { ...bundle, args: ['-c', 'model_reasoning_effort="high"'] }, { ...bundle, args: ['--effort', 'high'] }]) {
       expect((await s.handle(req('/test-account', 'PUT', data), admin)).status).toBe(400);
     }
   }));

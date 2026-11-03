@@ -230,7 +230,13 @@ describe('manual session-to-task linkage (27505f04 AC8)', () => {
     sc.reconcileHeldSessions(5, heldId);
     expect(rowOf(heldId).state).toBe('held');
     // A live successor session for the same task does supersede the held intent.
-    const successor = observed('running');
+    const successor = observed('running', { created_at_ms: AT + 1000 });
+    sql.exec('INSERT OR REPLACE INTO fleet_catalog_census(machine_id,observed_at,complete) VALUES(?,?,1)',
+      'host', new Date(AT + 10000).toISOString());
+    sql.exec(`INSERT OR REPLACE INTO fleet_sessions
+      (machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace,created_at_ms)
+      VALUES('host',?,?,'zcodex','running','idle',?,'/ext',?)`,
+      successor.native_id, successor.tag, new Date(AT + 10000).toISOString(), AT + 1000);
     sql.exec('UPDATE session_control_sessions SET request_json=? WHERE id=?',
       JSON.stringify({ intake_task_id: taskId, workspace: '/ext' }), successor.native_id);
     recordIntakeSessionLink(sql, rowOf(successor.native_id), AT + 30000);

@@ -77,6 +77,7 @@
       "argon",
       "argon-gemini",
       "astra",
+      "opus",
       "sonnet"
     ],
     "ask": [
@@ -92,6 +93,7 @@
       "argon",
       "argon-gemini",
       "astra",
+      "opus",
       "muse",
       "glm-flash",
       "glm-flash-zcodex",
@@ -99,8 +101,6 @@
     ],
     "daily": [
       "muse",
-      "argon",
-      "argon-gemini",
       "glm-flash",
       "glm-flash-zcodex",
       "sonnet",
@@ -140,15 +140,23 @@
       "provider": "codex",
       "engine": "codex",
       "profile": null,
-      "effort": "high"
+      "effort": "medium"
     },
     {
       "id": "argon",
-      "model": "gemini-4-argon-high",
+      "model": "gemini-4-argon-medium",
       "provider": "gemini",
       "engine": "antigravity",
       "profile": null,
-      "effort": "high"
+      "effort": "medium"
+    },
+    {
+      "id": "opus",
+      "model": "opus",
+      "provider": "claude",
+      "engine": "claude",
+      "profile": null,
+      "effort": "medium"
     },
     {
       "id": "luna",
@@ -216,11 +224,11 @@
     },
     {
       "id": "argon-gemini",
-      "model": "gemini-4-argon-high",
+      "model": "gemini-4-argon-medium",
       "provider": "gemini",
       "engine": "gemini",
       "profile": null,
-      "effort": "high"
+      "effort": "medium"
     },
     {
       "id": "beam-free",

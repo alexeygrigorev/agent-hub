@@ -393,6 +393,9 @@ export function createSqlIdentityValidator(sql: SqlStorage): IdentityValidator {
       project = row.project;
     }
 
+    // `agent:<name>` belongs to the message bus, not conversation membership.
+    if (project === 'agent') return null;
+
     // Require project-qualified canonical identity whenever project is present;
     // bare tag is used only for projectless agent registrations.
     const canonicalActor = project ? `${project}:${tag}` : tag;

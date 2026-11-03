@@ -210,6 +210,20 @@ function renderList(tasks, filterText) {
     const badges = document.createElement('div');
     badges.className = 'intake-item__badges';
     badges.append(statusBadge(t.control && t.control.status));
+    const priority = (t.control && t.control.priority) || t.priority || 'normal';
+    if (priority !== 'normal') {
+      const pBadge = document.createElement('span');
+      pBadge.className = `dk-badge ${priority === 'high' ? 'dk-badge--warning' : 'dk-badge--neutral'}`;
+      pBadge.textContent = `priority:${priority}`;
+      badges.append(pBadge);
+    }
+    const promotedAt = (t.control && t.control.promoted_at) ?? t.promoted_at ?? null;
+    if (promotedAt) {
+      const promoBadge = document.createElement('span');
+      promoBadge.className = 'dk-badge dk-badge--info';
+      promoBadge.textContent = 'promoted';
+      badges.append(promoBadge);
+    }
     const sessions = Array.isArray(t.assigned_sessions) ? t.assigned_sessions.length : 0;
     if (sessions) {
       const s = document.createElement('span');
@@ -671,6 +685,20 @@ function renderDetail(task) {
   if (badgesEl) {
     badgesEl.replaceChildren();
     badgesEl.append(statusBadge(control.status));
+    const priority = control.priority || task.priority || 'normal';
+    if (priority !== 'normal') {
+      const pBadge = document.createElement('span');
+      pBadge.className = `dk-badge ${priority === 'high' ? 'dk-badge--warning' : 'dk-badge--neutral'}`;
+      pBadge.textContent = `priority:${priority}`;
+      badgesEl.append(pBadge);
+    }
+    const promotedAt = control.promoted_at ?? task.promoted_at ?? null;
+    if (promotedAt) {
+      const promoBadge = document.createElement('span');
+      promoBadge.className = 'dk-badge dk-badge--info';
+      promoBadge.textContent = 'promoted';
+      badgesEl.append(promoBadge);
+    }
     if (control.continuation_state) {
       const c = document.createElement('span');
       c.className = 'dk-badge dk-badge--info dk-mono';
@@ -683,7 +711,14 @@ function renderDetail(task) {
     addMetaItem(metaEl, 'Task ID', task.id);
     addMetaItem(metaEl, 'Project', task.project || '-');
     addMetaItem(metaEl, 'Status', control.status || '-');
+    addMetaItem(metaEl, 'Priority', control.priority || task.priority || 'normal');
+    const promotedAt = control.promoted_at ?? task.promoted_at ?? null;
+    if (promotedAt) addMetaItem(metaEl, 'Promoted', fmtTime(promotedAt));
     addMetaItem(metaEl, 'Version', detailVersion === null ? '-' : String(detailVersion));
+    for (const dependency of (task.dependencies || [])) {
+      addMetaItem(metaEl, dependency.resolved ? 'Prerequisite DONE' : 'Blocked by',
+        `${dependency.title || dependency.id} · ${dependency.id}`, () => openTaskDetail(dependency.id));
+    }
     // Scope flag comes from the F2 project-scope registry when present;
     // older tasks carry no flag and the row is omitted (never invented).
     if (task.scope_flag !== undefined && task.scope_flag !== null) {
@@ -802,6 +837,8 @@ function renderDetail(task) {
   if (closeWrap) closeWrap.hidden = control.status === 'done';
   const statusSelect = byId('intake-status-select');
   if (statusSelect && control.status) statusSelect.value = control.status;
+  const prioritySelect = byId('intake-priority-select');
+  if (prioritySelect) prioritySelect.value = control.priority || task.priority || 'normal';
   if (actionStatus && actionStatus.dataset.sticky !== '1') actionStatus.textContent = '';
 }
 
@@ -966,6 +1003,97 @@ async function submitStatus(e) {
   }
 }
 
+async function submitPriority(e) {
+  e.preventDefault();
+  if (!selectedTaskId || detailVersion === null) return;
+  const select = byId('intake-priority-select');
+  const btn = byId('intake-priority-btn');
+  const actionStatus = byId('intake-action-status');
+  if (btn) btn.disabled = true;
+  if (actionStatus) { actionStatus.dataset.sticky = '1'; actionStatus.textContent = 'Saving priority…'; }
+  try {
+    await ensureCsrf();
+    await api(`/api/intake/tasks/${encodeURIComponent(selectedTaskId)}`, 'POST', {
+      key: reqKey('priority'),
+      expected_version: detailVersion,
+      priority: select?.value || 'normal'
+    });
+    if (actionStatus) actionStatus.textContent = 'Priority saved.';
+    await Promise.all([refreshTaskDetail(selectedTaskId), loadList().then(() => renderList(cachedTasks, byId('intake-filter')?.value || ''))]);
+  } catch (err) {
+    if (actionStatus) actionStatus.textContent = `Priority failed: ${err.message}`;
+  } finally {
+    if (btn) btn.disabled = false;
+    if (actionStatus) delete actionStatus.dataset.sticky;
+  }
+}
+
+async function promoteIntake() {
+  if (!selectedTaskId || detailVersion === null) return;
+  const btn = byId('intake-promote-btn');
+  const actionStatus = byId('intake-action-status');
+  if (btn) btn.disabled = true;
+  if (actionStatus) { actionStatus.dataset.sticky = '1'; actionStatus.textContent = 'Promoting to front…'; }
+  try {
+    await ensureCsrf();
+    await api(`/api/intake/tasks/${encodeURIComponent(selectedTaskId)}/promote`, 'POST', {
+      key: reqKey('promote'),
+      expected_version: detailVersion
+    });
+    if (actionStatus) actionStatus.textContent = 'Promoted to front of queue.';
+    await Promise.all([refreshTaskDetail(selectedTaskId), loadList().then(() => renderList(cachedTasks, byId('intake-filter')?.value || ''))]);
+  } catch (err) {
+    if (actionStatus) actionStatus.textContent = `Promote failed: ${err.message}`;
+  } finally {
+    if (btn) btn.disabled = false;
+    if (actionStatus) delete actionStatus.dataset.sticky;
+  }
+}
+
+async function submitCreate(e) {
+  e.preventDefault();
+  const project = (byId('intake-create-project')?.value || '').trim();
+  const title = (byId('intake-create-title')?.value || '').trim();
+  const priority = byId('intake-create-priority')?.value || 'normal';
+  const ac = (byId('intake-create-ac')?.value || '').trim();
+  const text = (byId('intake-create-text')?.value || '').trim();
+  const btn = byId('intake-create-btn');
+  const statusEl = byId('intake-status');
+  if (!project || !title || !text) {
+    if (statusEl) statusEl.textContent = 'Project, title, and request text are required to create a task.';
+    return;
+  }
+  if (btn) btn.disabled = true;
+  if (statusEl) statusEl.textContent = 'Creating task…';
+  try {
+    await ensureCsrf();
+    const payload = {
+      key: reqKey('create'),
+      project,
+      title,
+      text,
+      priority,
+      source: { type: 'unknown', reference: null, timestamp: null }
+    };
+    if (ac) payload.acceptance_criteria = ac;
+    const res = await api('/api/intake/tasks', 'POST', payload);
+    for (const id of ['intake-create-project', 'intake-create-title', 'intake-create-ac', 'intake-create-text']) {
+      const el = byId(id);
+      if (el) el.value = '';
+    }
+    const prioEl = byId('intake-create-priority');
+    if (prioEl) prioEl.value = 'normal';
+    const details = byId('intake-create-details');
+    if (details) details.open = false;
+    await loadList({ reset: true });
+    if (res && res.task && res.task.id) openTaskDetail(res.task.id);
+  } catch (err) {
+    if (statusEl) statusEl.textContent = `Create failed: ${err.message}`;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 async function decideApproval(decision) {
   if (!selectedTaskId || detailVersion === null || !pendingApprovalRef) return;
   const actionStatus = byId('intake-action-status');
@@ -1073,6 +1201,9 @@ function setupEvents() {
   });
   byId('intake-note-form')?.addEventListener('submit', submitNote);
   byId('intake-status-form')?.addEventListener('submit', submitStatus);
+  byId('intake-priority-form')?.addEventListener('submit', submitPriority);
+  byId('intake-promote-btn')?.addEventListener('click', promoteIntake);
+  byId('intake-create-form')?.addEventListener('submit', submitCreate);
   byId('intake-approve-btn')?.addEventListener('click', () => decideApproval('granted'));
   byId('intake-worktrees-refresh')?.addEventListener('click', refreshWorktrees);
   byId('intake-close-btn')?.addEventListener('click', () => closeIntake(false));

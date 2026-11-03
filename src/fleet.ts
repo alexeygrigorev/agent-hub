@@ -14,7 +14,7 @@ import { RoutingService } from './routing';
 import { ClaimAdmission, sameIntent, sameEditCaller, type EditAuthority, type AdmissionCaller } from './claim_admission';
 import { effectiveCheckin, effectiveRoutesAt } from './registry';
 import { commandChannelHealth } from './command-channel';
-import { taskTier, policy, modelDisabledByPolicy } from './model-routing';
+import { taskTier, policy, modelDisabledByPolicy, heavyModelEffortAllowed, deepModelAllowedForTier } from './model-routing';
 import { isUnmeteredProvider, quotaPositivelyBlocked, unmeteredObservation, QUOTA_SCHEMA_SQL, QUOTA_STALE_MS, LEGACY_ACCOUNT_LABELS, canonicalAccountLabel, canonicalHarness, canonicalQuotaProvider, dedupeAccountsByCanonical, ensureTbmQuotaSchema, legacyRouteKeyFor, snapshotRouteForAccount } from './quota';
 import { evaluateLaunchQuota } from './quota_admission';
 import { adoptObservedNativeSessions, promoteStartedOffers, reconcileUnboundFleetSessions } from './session_control';
@@ -87,6 +87,10 @@ const PROVIDERS = new Set(['codex', 'codex-orin', 'claude', 'grok', 'gemini', 'z
 /** Window and cap of the per-route failure count in plan() and the failures that do not count. */
 export const ROUTE_FAILURE_WINDOW_MS = 30 * 60_000;
 export const ROUTE_FAILURE_CAP = 8;
+/** Route circuit breaker: the last N launches of an (account, machine) route inside the window all failed
+ *  `launcher_command_failed` (engine never started) -> skip the route; it re-opens when the window passes. */
+export const ROUTE_QUARANTINE_WINDOW_MS = 10 * 60_000;
+export const ROUTE_QUARANTINE_FAILURES = 3;
 export const ROUTE_FAILURE_NEUTRAL_REASONS = new Set(['launcher_offer_expired', 'model_unsupported', 'launcher_memory_reserve', 'account_capacity', 'account_concurrency',
   'machine_capacity', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking', 'host_load_high', 'operator_stopped', 'stopped_by_operator', 'cancelled']);
 const ACTIVE = ACTIVE_LAUNCH_STATES_SQL;
@@ -762,7 +766,7 @@ export class FleetService {
     const found = this.observationProvenanceRaw(account, route, snapshot);
     if (!isUnmeteredProvider(account.provider)) return found;
     const now = snapshot?.now ?? this.now();
-    if (found && (found.quota?.status === 'ok' || quotaPositivelyBlocked(found.quota, now))) return found;
+    if (found && (found.quota?.status === 'ok' || quotaPositivelyBlocked(found.quota, now, account.provider))) return found;
     const at = new Date(now).toISOString();
     return { quota: unmeteredObservation(at), subscriptionObservedAt: at };
   }
@@ -1267,21 +1271,45 @@ export class FleetService {
     // window, and only count failures a route can be blamed for: capacity holds,
     // expired offers and model refusals say nothing about the account (they were
     // the reason every route read fail=8, the global cap of the old per-label count).
-    const recentFailuresByRoute = new Map<string, number>();
+    const recentFailuresByRoute = new Map<string, { n: number; launcher: string[] }>();
     const hostLaunchCounts = new Map<string, { pending: number; running: number }>();
-    const countRecentAccountFailures = (acct: string, machineId: string): number => {
+    const routeFailures = (acct: string, machineId: string): { n: number; launcher: string[] } => {
       const key = acct + ' ' + machineId;
       if (!recentFailuresByRoute.has(key)) {
         let n = 0;
+        let launcher: string[] = [];
         try {
           const sinceIso = new Date(this.now() - ROUTE_FAILURE_WINDOW_MS).toISOString();
           const skip = [...ROUTE_FAILURE_NEUTRAL_REASONS];
-          n = this.sql.exec(`SELECT 1 FROM fleet_launches WHERE account = ? AND machine_id = ? AND state = 'failed' AND exit_reason IS NOT NULL AND exit_reason NOT IN (${skip.map(() => '?').join(',')}) AND updated_at > ? LIMIT ${ROUTE_FAILURE_CAP}`,
-            acct, machineId, ...skip, sinceIso).toArray().length;
-        } catch { n = 0; }
-        recentFailuresByRoute.set(key, n);
+          const rows = this.sql.exec(`SELECT exit_reason, updated_at FROM fleet_launches WHERE account = ? AND machine_id = ? AND state = 'failed' AND exit_reason IS NOT NULL AND exit_reason NOT IN (${skip.map(() => '?').join(',')}) AND updated_at > ? ORDER BY updated_at DESC LIMIT ${ROUTE_FAILURE_CAP}`,
+            acct, machineId, ...skip, sinceIso).toArray() as any[];
+          n = rows.length;
+          launcher = rows.filter(r => r.exit_reason === 'launcher_command_failed').map(r => String(r.updated_at));
+        } catch { n = 0; launcher = []; }
+        recentFailuresByRoute.set(key, { n, launcher });
       }
       return recentFailuresByRoute.get(key)!;
+    };
+    const countRecentAccountFailures = (acct: string, machineId: string): number => routeFailures(acct, machineId).n;
+    // Reuses the per-route failure statement above (no extra SQL call per route). Only when it shows
+    // ROUTE_QUARANTINE_FAILURES launcher_command_failed rows inside the window does one more statement check that
+    // no other launch on the route is newer than the third of them (a start or other outcome re-opens the route).
+    const quarantineByRoute = new Map<string, boolean>();
+    const routeQuarantined = (acct: string, machineId: string): boolean => {
+      const key = acct + ' ' + machineId;
+      if (!quarantineByRoute.has(key)) {
+        let q = false;
+        try {
+          const cutoff = new Date(this.now() - ROUTE_QUARANTINE_WINDOW_MS).toISOString();
+          const inWindow = routeFailures(acct, machineId).launcher.filter(t => t > cutoff);
+          if (inWindow.length >= ROUTE_QUARANTINE_FAILURES) {
+            const third = inWindow[ROUTE_QUARANTINE_FAILURES - 1];
+            q = this.sql.exec(`SELECT 1 FROM fleet_launches WHERE account = ? AND machine_id = ? AND updated_at > ? AND NOT (state = 'failed' AND exit_reason = 'launcher_command_failed') LIMIT 1`, acct, machineId, third).toArray().length === 0;
+          }
+        } catch { q = false; }
+        quarantineByRoute.set(key, q);
+      }
+      return quarantineByRoute.get(key)!;
     };
     for (const route of this.sql.exec('SELECT * FROM fleet_routes ORDER BY machine_id, engine').toArray() as any[]) {
       if ((request.account && route.account !== request.account) || (request.machine && route.machine_id !== request.machine) || (request.engine && !overrideModels.length && route.engine !== request.engine)) continue;
@@ -1501,15 +1529,18 @@ export class FleetService {
       const family = canonicalQuotaProvider(definitions.get(route.account)?.provider as string);
       const tier = taskTier({ ...(input.tier != null ? { tier: input.tier } : {}), model: overrideModels[0]?.id });
       const members: string[] = (policy.tiers as any)[tier || policy.default_tier];
-      const pick = (anyTier: boolean) => policy.models.find(m => !modelDisabledByPolicy(m) &&
-        (m.id !== 'astra' || allowAstra) &&
-        !(input.effort === 'high' && (m.id === 'astra' || m.id === 'sol')) &&
+      const hasOverrideReason = typeof input.engine_override_reason === 'string' && input.engine_override_reason.trim().length > 0;
+      const explicitlyRequestedDeep = hasOverrideReason &&
+        (tier === 'deep' || overrideModels.length > 0 || Boolean(request.engine));
+      const pick = (anyTier: boolean) => policy.models.find(m => !modelDisabledByPolicy(m) && (m.id !== 'astra' || allowAstra) &&
+        deepModelAllowedForTier(m, tier, explicitlyRequestedDeep) &&
+        heavyModelEffortAllowed(m, input.effort ?? m.effort) &&
         (anyTier || members.includes(m.id)) && (!overrideModels.length || overrideModels.some(o => o.id === m.id)) && matchesModelRoute(m, route, family));
-      // Explicit model selectors and native engines named without a tier may
-      // resolve their model across tiers while preserving current model policy.
+      // Explicit model selectors and native engines may cross tiers only
+      // when the caller states why the deep model is required.
       const explicitModelFallback = overrideModels.length ? pick(true) : undefined;
       const configuredModel = pick(false) ?? explicitModelFallback ??
-        (input.tier == null && request.engine && !overrideModels.length ? pick(true) : undefined);
+        ((input.tier == null || tier === 'daily') && request.engine && hasOverrideReason && !overrideModels.length ? pick(true) : undefined);
       const model = configuredModel && input.effort !== undefined ? { ...configuredModel, effort: input.effort } : configuredModel;
       if (!model) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'model_unsupported' }); continue; }
       // Host adapter refusals are scoped to the exact route, mode and model
@@ -1554,6 +1585,13 @@ export class FleetService {
       const busyRatio = (hb.cpu_usage?.busy_cores ?? caps.cpu_count) / Math.max(1, caps.cpu_count || 1);
       const cpuLoad = Math.max(busyRatio, observedLoad);
       const isDegraded = Boolean(gateProjection && !gateRefusal);
+      // Circuit breaker (intake 0e1b61c9): a route whose last launches all died at the
+      // launcher before the engine produced work is skipped until the window passes, then
+      // one probe is let through. Evaluated here so routes already rejected above never pay for the lookup. An operator pinning account AND machine still probes it.
+      if (!(request.account && request.machine) && routeQuarantined(route.account, route.machine_id)) {
+        rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'route_quarantined' });
+        continue;
+      }
       const burn = request.mode === 'interactive' ? null : burnForecast(routeProv?.quota, this.now(), Number(account!.reserve_percent) || 0);
       const burn_weight = burnFactor(burn);
       const decide = (healthyAlt: boolean) => computeEngineDecision({ healthyAlternative: healthyAlt,
@@ -1837,7 +1875,7 @@ export class FleetService {
         try { bound = JSON.parse(row.request_json); } catch { continue; }
         if (!bound || typeof bound !== 'object') continue;
         const input: any = { mode: bound.mode || 'headless', workspace: bound.workspace, prompt: bound.prompt ?? '', idempotency_key: 'drain-' + row.id };
-        for (const key of ['machine', 'engine', 'account', 'tier', 'cwd', 'parent_id', 'summary', 'approved_action', 'access', 'with_goal', 'task_kind', 'project', 'needs']) {
+        for (const key of ['machine', 'engine', 'account', 'tier', 'effort', 'engine_override_reason', 'cwd', 'parent_id', 'summary', 'approved_action', 'access', 'with_goal', 'task_kind', 'project', 'needs']) {
           if (bound[key] !== undefined && bound[key] !== null) input[key] = bound[key];
         }
         // These columns survive updates to the currently displayed hold reason.
@@ -1986,6 +2024,19 @@ export class FleetService {
     const result = (value: any, status = 200) => ({ value, status });
     const caller = auth.caller;
     if (!caller || !(caller.isAdmin || (caller.kind === 'agent' && auth.scopes?.includes('fleet:launch')))) return result({ error: 'forbidden' }, 403);
+    if (input?.engine_override_reason !== undefined &&
+        (typeof input.engine_override_reason !== 'string' || input.engine_override_reason.length > 500)) {
+      return result({ error: 'invalid_launch_request', field: 'engine_override_reason' }, 400);
+    }
+    const deepTierRequested = taskTier({ tier: input?.tier }) === 'deep';
+    const deepModelIds: string[] = (policy.tiers as any).deep || [];
+    const deepModelRequested = typeof input?.engine === 'string' && policy.models.some(model =>
+      deepModelIds.includes(model.id) && [model.id, model.model].includes(input.engine));
+    if ((deepTierRequested || deepModelRequested) &&
+        (typeof input?.engine_override_reason !== 'string' || !input.engine_override_reason.trim())) {
+      return result({ error: 'deep_tier_reason_required', field: 'engine_override_reason',
+        detail: 'Explicit deep-tier or deep-model starts require an explanation why deep reasoning is needed.' }, 400);
+    }
     return this.transaction(() => {
       this.reconcileCapacity();
       // Give the retained waitlist a bounded turn before a new reservation;
@@ -1998,7 +2049,8 @@ export class FleetService {
       const parsed = this.admission.parseDeclaration(input?.access);
       if ('error' in parsed) return result({ error: parsed.error }, 400);
       if (parsed.access.mode === 'edit' && !input.approved_action?.trim()) return result({ error: 'approved_action_required' }, 400);
-      const bound = { ...plan.request, access: parsed.access };
+      const bound = { ...plan.request, access: parsed.access,
+        ...(input.engine_override_reason !== undefined ? { engine_override_reason: input.engine_override_reason } : {}) };
       // Bare-label alias admission: the normalized absolute is what the
       // host executes and always gates. When the operator additionally
       // configured a claim policy for the requested alias itself, that
@@ -2679,7 +2731,7 @@ export class FleetService {
             (s.progress !== undefined && (!object(s.progress, ['last_progress_at', 'headless', 'agent_alive', 'orphaned', 'cleanup', 'terminal_error', 'goal_status', 'sampled_at', 'last_cpu_at']) ||
               (s.progress.sampled_at !== undefined && (typeof s.progress.sampled_at !== 'string' || !fresh(s.progress.sampled_at, this.now() + 60000, 366 * 86400000))) ||
               (s.progress.goal_status !== undefined && !GOAL_STATUSES.includes(s.progress.goal_status)) ||
-              (s.progress.terminal_error !== undefined && (!((s.progress.terminal_error === 'codex_reconnect_failed' && s.engine === 'codex') || (['zcodex_agent_exited', 'zcodex_reconnect_failed'].includes(s.progress.terminal_error) && s.engine === 'zcodex')) || s.progress.headless !== false)) ||
+              (s.progress.terminal_error !== undefined && (!((s.progress.terminal_error === 'codex_reconnect_failed' && s.engine === 'codex') || (['zcodex_agent_exited', 'zcodex_reconnect_failed'].includes(s.progress.terminal_error) && s.engine === 'zcodex') || (s.progress.terminal_error === 'goal_rejected' && s.engine === 'claude')) || s.progress.headless !== false)) ||
               typeof s.progress.last_progress_at !== 'string' || !fresh(s.progress.last_progress_at, this.now() + 60000, 366 * 86400000) ||
               (s.progress.last_cpu_at !== undefined && (typeof s.progress.last_cpu_at !== 'string' || !fresh(s.progress.last_cpu_at, this.now() + 60000, 366 * 86400000))) ||
               typeof s.progress.headless !== 'boolean' || ![true, false, null].includes(s.progress.agent_alive) ||

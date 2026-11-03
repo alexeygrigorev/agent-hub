@@ -115,7 +115,21 @@ describe('forgotten intake watchdog', () => {
     const t = task('fresh', 60000), pending = task('pending');
     session(h,'failure',t,'failed'); session(h,'held',pending,'held');
     const w = new IntakeWatchdog(h.sql,h.intakeService,(f: any)=>f(),{},()=>NOW);w.init();
-    const p=w.project([t,pending]);expect(p[0]).toMatchObject({forgotten:true,reason:'only_failed_sessions'});expect(p[1].forgotten).toBe(false);
+    const p=w.project([t,pending]);expect(p[0]).toMatchObject({forgotten:true,reason:'session_ended_without_done_or_blocker_intake'});expect(p[1].forgotten).toBe(false);
+    expect(w.queue([t])[0]).toMatchObject({reason:'session_ended_without_done_or_blocker_intake'});
+  }));
+  it('does not flag a terminal session when it has current DONE evidence or a blocker follow-up', async () => fixture(h => {
+    const done = task('done-outcome', 60000), blocked = task('blocker-outcome', 60000);
+    done.history = [{ kind: 'note', text: 'DONE abc1234\nLive check: fixture\nResult: passed' }];
+    session(h, 'done-terminal', done, 'failed'); session(h, 'blocked-terminal', blocked, 'failed');
+    const blocker = { ...task('blocker-followup', 60000), created_by: { blocker_followup: true } };
+    h.sql.exec('INSERT INTO intake_tasks(id,data) VALUES(?,?)', blocker.id, JSON.stringify(blocker));
+    h.intakeService.dependencies.add(blocked.id, blocker.id, 'fixture');
+    const w = new IntakeWatchdog(h.sql, h.intakeService, (f: any)=>f(), {}, ()=>NOW); w.init();
+    expect(w.project([done, blocked])).toMatchObject([
+      { forgotten: true, reason: 'only_failed_sessions' },
+      { forgotten: false, reason: 'waiting_on_prereq', blocked_by: [blocker.id] },
+    ]);
   }));
   it('suppresses restart with fresh native work claim; stale evidence is unknown', async () => fixture(h => {
     const t = task();
@@ -381,6 +395,16 @@ describe('forgotten intake watchdog', () => {
     }},()=>now);w.init();await w.tick();now+=QUEUE_RETRY_BASE_MS;await w.tick();
     expect(inputs.map(i=>i.engine)).toEqual(['opencode','zcodex']);expect(inputs[0].key).not.toBe(inputs[1].key);
   }));
+  it('keeps a retry unpinned when the first policy-routed admission is refused', async () => fixture(async h => {
+    const t=task();let now=NOW;const inputs:any[]=[];
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{start:async input=>{
+      inputs.push(input);return {status:400,body:{error:'admission_refused'}};
+    }},()=>now);w.init();await w.tick();now+=QUEUE_RETRY_BASE_MS;await w.tick();
+    expect(inputs).toHaveLength(2);
+    expect(inputs[0]).not.toHaveProperty('engine');
+    expect(inputs[1]).not.toHaveProperty('engine');
+    expect(inputs[0].key).not.toBe(inputs[1].key);
+  }));
   it.each(['future-wake','different-incarnation'])('preserves %s instead of stopping it', async scenario => fixture(async h => {
     const t=task();const binding={native_id:'native',tag:'worker',workspace:'fixture',native_created_at_ms:NOW-3600000};
     session(h,'protected-native',t,'running',{machine:'fixture',binding});
@@ -490,7 +514,7 @@ describe('forgotten intake watchdog', () => {
     expect(notices.some(n=>n[0]==='intake_watchdog'&&n[2]?.includes('>30 min')&&n[2]?.includes('model_unsupported'))).toBe(true);
     // The bounded retry cap names the stuck cycle instead of looping forever;
     // the idle deadline itself is never reset by the repeating holds.
-    expect(w.project([t])[0]).toMatchObject({state:'escalated',reason:'only_failed_sessions'});
+    expect(w.project([t])[0]).toMatchObject({state:'escalated',reason:'session_ended_without_done_or_blocker_intake'});
     expect(w.project([t])[0].idle_ms).toBeGreaterThan(1800000);
   }));
   it('replays an already-recorded automatic stop after a future wake is added', async () => fixture(async h => {

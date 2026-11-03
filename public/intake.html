@@ -116,6 +116,33 @@
           </label>
           <button class="dk-button dk-button--secondary" type="button" id="intake-refresh">Refresh</button>
         </div>
+        <details class="dk-stack intake-create-details" id="intake-create-details">
+          <summary class="dk-button dk-button--secondary dk-button--sm">New task</summary>
+          <form class="dk-stack intake-create-form" id="intake-create-form">
+            <label class="dk-field">Project
+              <input type="text" id="intake-create-project" class="dk-input" placeholder="e.g. agent-hub" required>
+            </label>
+            <label class="dk-field">Title
+              <input type="text" id="intake-create-title" class="dk-input" placeholder="Task title" required>
+            </label>
+            <label class="dk-field">Priority
+              <select id="intake-create-priority" class="dk-select" aria-label="Task priority">
+                <option value="high">high</option>
+                <option value="normal" selected>normal</option>
+                <option value="low">low</option>
+              </select>
+            </label>
+            <label class="dk-field">Acceptance criteria
+              <textarea id="intake-create-ac" class="dk-textarea" rows="3" placeholder="Acceptance criteria (required before starting a worker)…"></textarea>
+            </label>
+            <label class="dk-field">Request text
+              <textarea id="intake-create-text" class="dk-textarea" rows="3" placeholder="Verbatim task description…" required></textarea>
+            </label>
+            <div class="session-send-form__foot">
+              <button class="dk-button dk-button--primary" type="submit" id="intake-create-btn">Create task</button>
+            </div>
+          </form>
+        </details>
         <div class="intake-pagebar" aria-live="polite">
           <p class="dk-muted" id="intake-page-scope">Current page · matching tasks are loaded in bounded pages.</p>
           <div class="intake-pagebar__actions">
@@ -181,6 +208,19 @@
           </label>
           <div class="session-send-form__foot">
             <button class="dk-button dk-button--secondary" type="submit" id="intake-status-btn">Save status</button>
+          </div>
+        </form>
+        <form class="dk-stack intake-priority-form" id="intake-priority-form">
+          <label class="dk-field">Priority
+            <select id="intake-priority-select" class="dk-select" aria-label="Priority">
+              <option value="high">high</option>
+              <option value="normal">normal</option>
+              <option value="low">low</option>
+            </select>
+          </label>
+          <div class="session-send-form__foot">
+            <button class="dk-button dk-button--secondary" type="submit" id="intake-priority-btn">Save priority</button>
+            <button class="dk-button dk-button--primary" type="button" id="intake-promote-btn">Promote to front</button>
           </div>
         </form>
         <div class="dk-stack" id="intake-worktrees-wrap" aria-label="Intake worktrees">

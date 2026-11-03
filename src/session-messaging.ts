@@ -49,8 +49,8 @@ export function initSessionMessaging(sql: SqlStorage): void {
   for (const [col, type] of [['delivery', 'TEXT'], ['state', 'TEXT'], ['state_reason', 'TEXT'], ['deliver_by', 'INTEGER'], ['to_session_id', 'TEXT'], ['from_session_id', 'TEXT'], ['recipient_seq', 'INTEGER'], ['ref_json', 'TEXT']] as const) {
     if (!cols.has(col)) sql.exec(`ALTER TABLE messages ADD COLUMN ${col} ${type}`);
   }
-  // Delegated named-agent access for MCP callers (§9): the hub-mcp connector
-  // keeps its human login; one row per (named agent, MCP client) grant.
+  // Compatibility metadata for pre-M6 CLI output. Authorization uses the
+  // credential-family list on named_agents, never this client-wide table.
   sql.exec('CREATE TABLE IF NOT EXISTS named_agent_delegates (agent TEXT NOT NULL, client TEXT NOT NULL, created_by TEXT, created_at TEXT, PRIMARY KEY(agent, client))');
   sql.exec('CREATE TABLE IF NOT EXISTS recipient_cursors (actor TEXT PRIMARY KEY, last_seq INTEGER NOT NULL)');
   // `agent` is a reserved registry project: its recipients are stable named
@@ -63,6 +63,14 @@ export function initSessionMessaging(sql: SqlStorage): void {
   sql.exec(`CREATE TRIGGER IF NOT EXISTS named_agent_registry_insert AFTER INSERT ON agents WHEN NEW.project = 'agent' BEGIN
     INSERT OR IGNORE INTO named_agents (name, display, created_by, created_at) VALUES (NEW.tag, NEW.tag, 'hub:registry', COALESCE(NEW.registered_at, ''));
     END`);
+  // The two long-lived coordinators keep stable addresses even when their
+  // headful sessions are replaced. Their current session is set on start.
+  const seededAt = new Date().toISOString();
+  for (const name of ['orchestrator-main', 'oncall']) {
+    // Named bus identities are intentionally separate from the general agent
+    // registry, which also feeds the conversation participant directory.
+    sql.exec("INSERT OR IGNORE INTO named_agents (name, display, created_by, created_at) VALUES (?, ?, 'hub:migration', ?)", name, name, seededAt);
+  }
   sql.exec('CREATE INDEX IF NOT EXISTS messages_recipient_seq ON messages(to_actor, recipient_seq)');
   sql.exec('CREATE INDEX IF NOT EXISTS messages_delivery_deadline ON messages(state, deliver_by)');
   // The per-alarm expiry sweep reads only pending session-addressed rows,
@@ -268,10 +276,13 @@ export function checkSendScoping(sql: SqlStorage, caller: { kind?: string; isAdm
 
 /** Text typed into the TUI: bounded, control characters stripped, with the
  * marker used for uncertain-delivery resolution and the reply instruction. */
-export function renderTui(msg: { id: string; from_actor: string; thread_id: string; body: string }): string {
+export function renderTui(msg: { id: string; from_actor: string; to_actor?: string; thread_id: string; body: string }): string {
   const clean = (s: string) => s.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
   const head = `⟦hub:${msg.id.slice(-8)}⟧ from ${clean(msg.from_actor)} (thread ${msg.thread_id}): `;
-  const tail = `\n[Reply: a message reply <this inbox message id> "text", or hub reply ${msg.id} --body "text"]`;
+  const reply = msg.to_actor?.startsWith(NAMED_AGENT_PROJECT + ':')
+    ? `hub msg reply ${msg.id} --as ${clean(msg.to_actor)} --body "text"`
+    : `hub reply ${msg.id} --body "text"`;
+  const tail = `\n[Reply: a message reply <this inbox message id> "text", or ${reply}]`;
   const enc = new TextEncoder();
   let body = clean(msg.body);
   const budget = TUI_RENDER_BYTES - enc.encode(head + tail).length - 64;
@@ -288,9 +299,18 @@ export function afterMessageInsert(sql: SqlStorage, msg: any, opts: { delivery?:
   const prior: any = sql.exec('SELECT last_seq FROM recipient_cursors WHERE actor = ?', msg.to_actor).toArray()[0];
   const seq = (prior ? Number(prior.last_seq) : 0) + 1;
   sql.exec('INSERT INTO recipient_cursors (actor, last_seq) VALUES (?, ?) ON CONFLICT(actor) DO UPDATE SET last_seq = excluded.last_seq', msg.to_actor, seq);
-  const sessionId = sessionIdOf(msg.to_actor);
-  const named = msg.from_actor.startsWith(NAMED_AGENT_PROJECT + ':') || msg.from_actor.startsWith('human:') || msg.from_actor === 'admin';
-  const delivery = opts.delivery ?? (sessionId && named ? 'tui' : 'inbox');
+  const directSessionId = sessionIdOf(msg.to_actor);
+  const forwardId = directSessionId ? null : namedForwardSession(sql, msg.to_actor);
+  let sessionId = directSessionId;
+  if (!sessionId && forwardId) {
+    try { ensureSessionIdentity(sql, forwardId, opts.now); sessionId = forwardId; }
+    catch { /* retain the stable named-agent inbox while its forward is offline */ }
+  }
+  const forwardedNamedAgent = Boolean(forwardId && sessionId);
+  const namedSender = msg.from_actor.startsWith(NAMED_AGENT_PROJECT + ':') || msg.from_actor.startsWith('human:') || msg.from_actor === 'admin';
+  // A forwarded coordinator always receives a TUI delivery; its stable inbox
+  // address remains unchanged so replies still thread to the named agent.
+  const delivery = forwardedNamedAgent ? 'tui' : (opts.delivery ?? (sessionId && namedSender ? 'tui' : 'inbox'));
   const deliverBy = opts.now + Math.min(opts.deliverByMs ?? DEFAULT_DELIVER_BY_MS, 7 * 24 * 3600 * 1000);
   sql.exec('UPDATE messages SET recipient_seq = ?, state = ?, delivery = ?, deliver_by = ?, to_session_id = ?, from_session_id = ? WHERE id = ?',
     seq, 'accepted', delivery, deliverBy, sessionId, sessionIdOf(msg.from_actor), msg.id);
@@ -313,7 +333,7 @@ export function afterMessageInsert(sql: SqlStorage, msg: any, opts: { delivery?:
 /** Enqueue the session-control command of kind `message` that carries a
  * message to its session's host (§5); one live command per message. */
 export function queueSessionDelivery(sql: SqlStorage, messageId: string, fromActor: string, sessionId: string, delivery: string, now: number): void {
-  const msg: any = sql.exec('SELECT id, from_actor, thread_id, body, ref_json, recipient_seq FROM messages WHERE id = ?', messageId).toArray()[0];
+  const msg: any = sql.exec('SELECT id, from_actor, to_actor, thread_id, body, ref_json, recipient_seq FROM messages WHERE id = ?', messageId).toArray()[0];
   if (!msg) return;
   const session: any = sql.exec('SELECT id, binding_json FROM session_control_sessions WHERE id = ?', sessionId).toArray()[0];
   const binding = (() => { try { return JSON.parse(session?.binding_json || 'null'); } catch { return null; } })();
@@ -473,17 +493,75 @@ export function readdressMessage(sql: SqlStorage, messageId: string, toActor: st
 
 const DELEGATE_CLIENT = /^[\x21-\x7e]{1,128}$/;
 
-/** Delegate grants for one named agent (§9), oldest first. */
-export function listDelegates(sql: SqlStorage, agentName: string): string[] {
-  return (sql.exec('SELECT client FROM named_agent_delegates WHERE agent = ? ORDER BY created_at, client', agentName).toArray() as any[]).map(r => String(r.client));
-}
-
-/** Grant (or revoke with remove) an MCP client's delegation for agent:<name>.
- * The named agent must exist in the registry. */
+/** Compatibility grant for all current live human credential families owned
+ * by an MCP client; future families still require an explicit new grant. */
 export function setDelegate(sql: SqlStorage, agentName: string, client: unknown, createdBy: string, now: number, remove = false): { agent: string; client: string; delegates: string[] } {
   if (typeof client !== 'string' || !DELEGATE_CLIENT.test(client)) throw new Error('invalid_client');
-  if (!sql.exec('SELECT 1 FROM agents WHERE project = ? AND tag = ?', NAMED_AGENT_PROJECT, agentName).toArray().length) throw new Error('unknown_agent');
+  const hasMcpGrants = sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mcp_grants'").toArray().length > 0;
+  const familyRows = hasMcpGrants ? sql.exec(`SELECT DISTINCT c.family_id FROM mcp_grants g JOIN credentials c ON c.family_id = g.family
+    WHERE g.client = ? AND g.expires > ? AND c.kind = 'human' AND c.revoked_at IS NULL AND c.expires_at > ?`,
+    client, now, new Date(now).toISOString()).toArray() as any[] : [];
+  const families = familyRows.map(row => String(row.family_id));
+  if (!families.length) throw new Error('no_live_credential_family');
+  updateNamedAgentDelegates(sql, agentName, families, remove);
+  // Keep the historical client row as display metadata only. Authorization
+  // always consults credential families in named_agents.delegates_json.
   if (remove) sql.exec('DELETE FROM named_agent_delegates WHERE agent = ? AND client = ?', agentName, client);
   else sql.exec('INSERT OR IGNORE INTO named_agent_delegates (agent, client, created_by, created_at) VALUES (?, ?, ?, ?)', agentName, client, createdBy.slice(0, 128), new Date(now).toISOString());
   return { agent: `${NAMED_AGENT_PROJECT}:${agentName}`, client, delegates: listDelegates(sql, agentName) };
+}
+
+function readDelegateFamilies(row: any): string[] {
+  try {
+    const values = JSON.parse(row?.delegates_json || '[]');
+    return Array.isArray(values) ? values.filter((value: unknown): value is string => typeof value === 'string' && value.length <= 256) : [];
+  } catch { return []; }
+}
+
+/** Explicit credential-family grants. MCP client ids are never authorization
+ * subjects because one OAuth client may own multiple human credential families. */
+export function listDelegates(sql: SqlStorage, agentName: string): string[] {
+  const row: any = sql.exec('SELECT delegates_json FROM named_agents WHERE name = ? AND disabled_at IS NULL', agentName).toArray()[0];
+  return readDelegateFamilies(row);
+}
+
+export function updateNamedAgentDelegates(sql: SqlStorage, agentName: string, families: string[], remove = false): string[] {
+  const row: any = sql.exec('SELECT delegates_json FROM named_agents WHERE name = ? AND disabled_at IS NULL', agentName).toArray()[0];
+  if (!row) throw new Error('unknown_agent');
+  const delegates = new Set(readDelegateFamilies(row));
+  for (const family of families) { if (remove) delegates.delete(family); else delegates.add(family); }
+  if (delegates.size > 100) throw new Error('too_many_delegates');
+  const result = [...delegates];
+  sql.exec('UPDATE named_agents SET delegates_json = ? WHERE name = ?', JSON.stringify(result), agentName);
+  return result;
+}
+
+/** A forwarded session is delegated only for as long as it remains the
+ * current forward target. Its credential family is minted asynchronously by
+ * the bound host after the session starts. */
+export function authorizedNamedAgent(sql: SqlStorage, actor: string, credentialFamily: string | undefined, now = Date.now()): boolean {
+  if (!credentialFamily || !actor.startsWith(NAMED_AGENT_PROJECT + ':')) return false;
+  const name = actor.slice(NAMED_AGENT_PROJECT.length + 1);
+  const row: any = sql.exec('SELECT delegates_json, forward_session_id FROM named_agents WHERE name = ? AND disabled_at IS NULL', name).toArray()[0];
+  if (!row) return false;
+  if (readDelegateFamilies(row).includes(credentialFamily)) return true;
+  if (!row.forward_session_id) return false;
+  const forwarded = sql.exec(`SELECT 1 FROM credentials WHERE family_id = ? AND registry_actor = ? AND kind = 'agent'
+    AND revoked_at IS NULL AND expires_at > ?`, credentialFamily, `${SESSION_PROJECT}:${row.forward_session_id}`, new Date(now).toISOString()).toArray();
+  return forwarded.length > 0;
+}
+
+export function namedForwardSession(sql: SqlStorage, actor: string): string | null {
+  if (!actor.startsWith(NAMED_AGENT_PROJECT + ':')) return null;
+  const name = actor.slice(NAMED_AGENT_PROJECT.length + 1);
+  const row: any = sql.exec('SELECT forward_session_id FROM named_agents WHERE name = ? AND disabled_at IS NULL', name).toArray()[0];
+  return row?.forward_session_id ?? null;
+}
+
+export function setNamedAgentForward(sql: SqlStorage, name: string, sessionId: string | null, now = Date.now()): string | null {
+  const exists = sql.exec('SELECT 1 FROM named_agents WHERE name = ? AND disabled_at IS NULL', name).toArray().length > 0;
+  if (!exists) throw new Error('unknown_agent');
+  if (sessionId !== null) ensureSessionIdentity(sql, sessionId, now);
+  sql.exec('UPDATE named_agents SET forward_session_id = ? WHERE name = ?', sessionId, name);
+  return sessionId;
 }

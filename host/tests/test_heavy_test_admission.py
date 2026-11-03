@@ -42,6 +42,9 @@ class AdmissionTests(unittest.TestCase):
         self.env = dict(os.environ, AGENT_HUB_HEAVY_TEST_DIR=str(self.root),
                         AGENT_HUB_HEAVY_TEST_SLOTS='1', AGENT_HUB_HEAVY_TEST_NORMAL_AGE_S='300', AGENT_HUB_HEAVY_TEST_WAIT_S='40',
                         AGENT_HUB_HEAVY_TEST_PRIORITY='normal')
+        # The full-suite retry wrapper pins one run id to its own ticket. These
+        # subprocess tests exercise independent tickets in a private pool.
+        self.env.pop('AGENT_HUB_HEAVY_TEST_RUN_ID', None)
         self.env.pop('AGENT_HUB_HEAVY_TEST_HOLDER_TOKEN', None)
         # The full-suite runner pins one run id so its separate discovery
         # phases share a FIFO ticket. These tests exercise fresh admissions
@@ -411,6 +414,7 @@ class RefusalTests(unittest.TestCase):
         self.env = dict(os.environ, AGENT_HUB_HEAVY_TEST_DIR=str(self.root),
                         AGENT_HUB_HEAVY_TEST_SLOTS='1', AGENT_HUB_HEAVY_TEST_WAIT_S='0')
         for name in ('CI', 'AGENT_HUB_HEAVY_TEST_HELD', 'AGENT_HUB_HEAVY_TEST_HOLDER_TOKEN',
+                     'AGENT_HUB_HEAVY_TEST_RUN_ID',
                      'AGENT_HUB_HEAVY_TEST_AUTO'):
             self.env.pop(name, None)
         self.bad_states = ['{invalid', json.dumps({'version': 99, 'next': 1, 'active': {}})]

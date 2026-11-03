@@ -103,6 +103,14 @@ jobs:
           NODE_OPTIONS: "--v8-pool-size=1"
         run: npx --no-install vitest run --configLoader runner --no-file-parallelism --maxWorkers 1 --disableConsoleIntercept
 
+      - name: Repeat session messaging tests for CI stability
+        if: github.event_name == 'pull_request'
+        env:
+          UV_THREADPOOL_SIZE: "1"
+          GOMAXPROCS: "1"
+          NODE_OPTIONS: "--v8-pool-size=1"
+        run: bash scripts/ci/repeat-session-messaging-m1.sh
+
       - name: Standalone browser and static checks
         env:
           DTC_AUTH_HOME: ${{ github.workspace }}/.deps/auth

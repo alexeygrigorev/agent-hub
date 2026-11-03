@@ -415,6 +415,7 @@ describe('queue priority and promotion (intake 68145244)',()=>{
       normal=prio('pos-normal','normal',300);
     const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[]} as any,(f:any)=>f(),{},()=>NOW);w.init();
     const rows=w.queue([normal,high,promoted]);
+    expect(rows.map(r=>r.id)).toEqual(['pos-promo','pos-high','pos-normal']);
     expect(rows.find(r=>r.id==='pos-promo')).toMatchObject({queue_position:1,priority:'low'});
     expect(rows.find(r=>r.id==='pos-high')?.queue_position).toBe(2);
     expect(rows.find(r=>r.id==='pos-normal')?.queue_position).toBe(3);

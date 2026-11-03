@@ -4,6 +4,58 @@ import { canonicalAccountLabel } from './quota';
 import { burnFactor, burnForecast, burnReleasesExplicitOnly, burnRules } from './burn';
 import { grokDemotion, netHeadroom, pacingFor, providerPreference, resetUrgency, routeScore, type ProviderPacing, type RouteScoreFactors } from './pacing';
 export { policy };
+const HEAVY_MODEL_IDS = new Set(['sol', 'astra', 'argon', 'argon-gemini', 'opus']);
+const FORBIDDEN_HEAVY_EFFORTS = new Set(['high', 'max', 'xhigh']);
+// These are the heavy deep-model selectors. Some deep-tier models (for
+// example Sonnet) are intentionally also eligible in daily.
+const DEEP_MODEL_IDS = new Set(['argon', 'argon-gemini', 'astra', 'opus']);
+const isGeminiArgonModelName = (value: unknown) =>
+  typeof value === 'string' && value.startsWith('gemini-4-argon-');
+
+function isNativeGeminiArgonModel(model: any): boolean {
+  if (typeof model === 'string') {
+    // OpenCode Go's contributor route is a separate daily model even though
+    // its provider model name shares the Gemini Argon prefix.
+    return isGeminiArgonModelName(model) && model !== 'gemini-4-argon-contributor';
+  }
+  // The OpenCode Go `gemini-4-argon-contributor` entry is a separate daily
+  // model, not the native Antigravity/Gemini Argon route.
+  if (model?.provider === 'go' || model?.engine === 'opencode') return false;
+  return isGeminiArgonModelName(model?.id) || isGeminiArgonModelName(model?.model);
+}
+
+export function isHeavyModel(model: any): boolean {
+  if (typeof model === 'string') {
+    const configured = policy.models.find(m => m.model === model);
+    return HEAVY_MODEL_IDS.has(model) || isNativeGeminiArgonModel(model) || Boolean(configured && HEAVY_MODEL_IDS.has(configured.id));
+  }
+  return HEAVY_MODEL_IDS.has(model?.id) || isNativeGeminiArgonModel(model);
+}
+
+export function heavyModelEffortAllowed(model: any, effort: unknown): boolean {
+  if (!isHeavyModel(model)) return true;
+  if (typeof effort !== 'string' || !effort.trim()) return false;
+  return !FORBIDDEN_HEAVY_EFFORTS.has(effort.trim().toLowerCase());
+}
+
+export function isDeepModel(model: any): boolean {
+  if (typeof model === 'string') {
+    const configured = policy.models.find(m => m.model === model);
+    return DEEP_MODEL_IDS.has(model) || isNativeGeminiArgonModel(model) || Boolean(configured && DEEP_MODEL_IDS.has(configured.id));
+  }
+  return DEEP_MODEL_IDS.has(model?.id) || isNativeGeminiArgonModel(model);
+}
+
+export function deepModelAllowedForTier(model: any, tier: unknown, explicitlyRequested: boolean): boolean {
+  if (!isDeepModel(model)) return true;
+  // Daily and deep are explicit-use tiers for these heavy model selectors;
+  // review may still contain a deliberately configured model such as Opus.
+  if (tier === 'daily' || tier === 'deep') return explicitlyRequested;
+  const id = typeof model === 'string' ? model : model?.id;
+  const members: unknown = (policy.tiers as any)[tier as string];
+  return (Array.isArray(members) && members.includes(id)) || explicitlyRequested;
+}
+
 /** Case-insensitive literal model-family matches, independent of provider. */
 export function modelDisabledByPolicy(model: any): boolean {
   const values = typeof model === 'string' ? [model] : [model?.id, model?.model];
@@ -36,7 +88,14 @@ export function modelCandidates(input: any, route: any, advertisement: any, quot
   const releaseTiers: string[] = (policy.rules as any).explicit_only_burn_release_tiers || [];
   const forecastFor = (provider: string) => burnForecast(quota, now, reserves[provider] ?? 0, rules);
   return policy.models.filter(m => {
-    if (!members.includes(m.id) || (input.model && ![m.id, m.model].includes(input.model))) return false;
+    const explicitlyPinned = typeof input.model === 'string' && [m.id, m.model].includes(input.model);
+    const hasReason = typeof input.engine_override_reason === 'string' && input.engine_override_reason.trim().length > 0;
+    const explicitlyRequestedWithReason = hasReason && (explicitlyPinned || tier === 'deep');
+    if ((!members.includes(m.id) && !explicitlyPinned) || (input.model && !explicitlyPinned)) return false;
+    // Deep models can cross into daily only as an explicit model pin. The
+    // /api/tasks caller also validates the rationale before queueing work.
+    if (!deepModelAllowedForTier(m, tier, explicitlyRequestedWithReason)) return false;
+    if (!heavyModelEffortAllowed(m, m.effort)) return false;
     if (modelDisabledByPolicy(m) || policy.rules.disabled_providers.includes(m.provider)) return false;
     if (unavailableEngines && unavailableEngines.has(m.engine)) return false;
     if (policy.rules.explicit_only_providers.includes(m.provider) && input.preferred_runner !== m.engine && ![m.id, m.model].includes(input.model)

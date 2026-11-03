@@ -243,7 +243,20 @@ class TestHumanStatusLogout(unittest.TestCase):
         config.save_host_config({"base_url": "https://hub.example.com",
                                  "access_token": "host-tok", "client_kind": "host"})
         st = human_auth.human_status()
-        self.assertEqual(st, {"logged_in": False})
+        self.assertEqual(st, {"logged_in": False, "state": "never_logged_in"})
+
+    def test_status_distinguishes_server_revocation_from_never_logged_in(self):
+        self._write_human()
+
+        def rejected_refresh(req, timeout=10.0, _token_exchange=None):
+            if req.full_url.endswith("/api/auth/me"):
+                raise urllib.error.HTTPError(req.full_url, 401, "unauthorized", {}, io.BytesIO(b""))
+            if req.full_url.endswith("/api/token/refresh"):
+                raise urllib.error.HTTPError(req.full_url, 400, "invalid_grant", {}, io.BytesIO(b'{"error":"invalid_grant"}'))
+            raise AssertionError(req.full_url)
+
+        with patch("agent_hub_host.api.safe_http_json", side_effect=rejected_refresh):
+            self.assertEqual(human_auth.human_status(), {"logged_in": False, "state": "revoked"})
 
     def test_status_returns_safe_identity(self):
         self._write_human()
@@ -283,6 +296,71 @@ class TestHumanStatusLogout(unittest.TestCase):
         self.assertEqual(human["refresh_token"], "h-ref-2")
         # Host untouched (still empty here).
         self.assertEqual(config.load_host_config(), {})
+
+    def _rotating_endpoint(self, calls):
+        used = set()
+
+        def fake_http(req, timeout=10.0, _token_exchange=None):
+            if req.full_url.endswith("/api/token/refresh"):
+                body = json.loads(req.data.decode())
+                calls.append(body["refresh_token"])
+                if body["refresh_token"] in used:
+                    # Server contract: replay revokes the whole family.
+                    raise urllib.error.HTTPError(req.full_url, 400, "x", {}, io.BytesIO(b"{}"))
+                used.add(body["refresh_token"])
+                data = {"access_token": "h-acc-%d" % len(calls), "refresh_token": "h-ref-%d" % len(calls)}
+                if _token_exchange is not None:
+                    _token_exchange.record(data)
+                return data
+            raise AssertionError(req.full_url)
+        return fake_http
+
+    def test_refresh_does_not_replay_token_rotated_by_another_process(self):
+        # Two CLI processes (loop + builder) both saw h-acc fail. The second
+        # must adopt the first one's rotation instead of replaying h-ref
+        # (replay = server revokes the human family; 2026-11-03 incident).
+        self._write_human()
+        calls = []
+        with patch("agent_hub_host.api.safe_http_json", side_effect=self._rotating_endpoint(calls)):
+            first = auth.refresh_token(expected_token="h-acc")
+            second = auth.refresh_token(expected_token="h-acc")
+        self.assertEqual(calls, ["h-ref"])
+        self.assertEqual(first, "h-acc-1")
+        self.assertEqual(second, "h-acc-1")
+        self.assertEqual(config.load_human_config()["refresh_token"], "h-ref-1")
+
+    def test_human_refresh_adopts_rotation_made_while_waiting_for_lock(self):
+        import contextlib
+        self._write_human()
+
+        @contextlib.contextmanager
+        def other_process_rotates_first():
+            self._write_human(access_token="h-acc-other", refresh_token="h-ref-other")
+            yield
+
+        with patch("agent_hub_host.auth.human_refresh_guard", other_process_rotates_first),                 patch("agent_hub_host.api.safe_http_json", side_effect=AssertionError("replayed refresh")):
+            self.assertEqual(human_auth.human_refresh(), "h-acc-other")
+
+    def test_single_file_mode_human_refresh_is_locked_and_not_replayed(self):
+        cfg_path = Path(self._temp_dir.name) / "loop-cli.json"
+        self._write_human()
+        cfg_path.write_bytes(config.get_human_config_path().read_bytes())
+        os.chmod(cfg_path, 0o600)
+        calls = []
+        with patch.dict(os.environ, {"HUB_CONFIG_FILE": str(cfg_path)}),                 patch("agent_hub_host.api.safe_http_json", side_effect=self._rotating_endpoint(calls)):
+            a = auth.refresh_token()
+            seen_before = json.loads(cfg_path.read_text())["access_token"]
+            b = auth.refresh_token(expected_token="h-acc")  # stale caller
+        self.assertEqual(calls, ["h-ref"])
+        self.assertEqual(a, b)
+        self.assertEqual(seen_before, a)
+        self.assertTrue(cfg_path.with_name("loop-cli.json.refresh.lock").exists())
+
+    def test_refresh_guard_propagates_body_exception(self):
+        self._write_human()
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            with auth.human_refresh_guard():
+                raise RuntimeError("boom")
 
     def test_logout_revokes_human_and_preserves_host(self):
         self._write_human()
@@ -366,8 +444,8 @@ class TestFreshCli(unittest.TestCase):
                 [sys.executable, "-m", "agent_hub_host", "auth", "status", "--json"],
                 capture_output=True, text=True, env=env, timeout=15,
             )
-            self.assertEqual(res.returncode, 0)
-            self.assertEqual(json.loads(res.stdout), {"logged_in": False})
+            self.assertEqual(res.returncode, 1)
+            self.assertEqual(json.loads(res.stdout), {"logged_in": False, "state": "never_logged_in"})
 
     def test_cli_help_lists_auth_and_version(self):
         with tempfile.TemporaryDirectory() as td:

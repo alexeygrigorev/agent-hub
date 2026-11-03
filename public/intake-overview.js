@@ -35,7 +35,13 @@
   updateUnmerged();
   setInterval(() => { if (!document.hidden) updateUnmerged(); }, 60000); // Intake 94186660: hidden tabs skip the 60s poll.
   const queue = document.getElementById('intake-queue');
-  let queueCursor = '', queueGeneration = 0;
+  let queueCursor = '', queueGeneration = 0, csrfToken = null;
+  async function ensureCsrf() {
+    if (csrfToken) return csrfToken;
+    const me = await fetch('/auth/me', {credentials: 'same-origin', cache: 'no-store'});
+    if (me.ok) csrfToken = (await me.json())?.csrf_token || null;
+    return csrfToken;
+  }
   async function updateQueue(cursor = queueCursor) {
     if (!queue) return;
     const generation = ++queueGeneration;
@@ -74,12 +80,15 @@
           promote.onclick = async () => {
             promote.disabled = true;
             try {
+              const csrf = await ensureCsrf();
+              const headers = {'Content-Type': 'application/json'};
+              if (csrf) headers['X-CSRF-Token'] = csrf;
               const shown = await fetch('/api/intake/tasks/' + encodeURIComponent(item.id), {credentials: 'same-origin', cache: 'no-store'});
               if (!shown.ok) throw new Error('unavailable');
               const version = (await shown.json())?.task?.control?.version;
               const response = await fetch('/api/intake/tasks/' + encodeURIComponent(item.id) + '/promote', {
                 method: 'POST', credentials: 'same-origin', cache: 'no-store',
-                headers: {'Content-Type': 'application/json'},
+                headers,
                 body: JSON.stringify({key: 'portal-promote-' + crypto.randomUUID(), expected_version: version}),
               });
               if (!response.ok) throw new Error('unavailable');

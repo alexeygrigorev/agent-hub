@@ -1,5 +1,9 @@
 """Trusted Hub launch rules, separate from the caller's unchanged brief."""
 
+import hashlib
+import re
+from pathlib import Path
+
 AWS_MAIN_TEMP_RULE = (
     "Never use the main-temp AWS profile or static key unless this brief cites "
     "Alexey's explicit approval for this exact job; if you need AWS access that "
@@ -12,7 +16,19 @@ CPU_LOAD_RULE = (
     "with a CPU cap (for example systemd-run --user --scope -p CPUQuota=200%) "
     "and a bounded duration, and every spawned load process must be cleaned up."
 )
-SESSION_PREAMBLE = "Hub session rules:\n" + AWS_MAIN_TEMP_RULE + "\n" + CPU_LOAD_RULE
+BLOCKER_RULE = (
+    "Never silently stop when blocked. Report through `hub intake blocker <original-id> "
+    "--title <follow-up> --text <diagnosis> --acceptance-criteria <verifiable-AC> --key <stable-key>`. "
+    "This creates and links a prerequisite and blocks the original; finish the follow-up, then "
+    "the Hub scheduler resumes the original. Use hub intake depend <id> --on <prerequisite-id> "
+    "for an existing blocker, or hub intake decompose <id> --key <stable-key> for a deep-tier "
+    "decomposition into child intakes with AC. Your short-lived session credential authorizes "
+    "intake creation and notes in the linked project; never print or copy tokens. "
+    "Append a DONE note only after all AC have evidence, including commit/deploy reference, "
+    "Live check: command and Result: output. Never close or delete intakes. "
+    "A session ending without DONE evidence or a linked blocker intake is flagged by Hub."
+)
+SESSION_PREAMBLE = "Hub session rules:\n" + AWS_MAIN_TEMP_RULE + "\n" + CPU_LOAD_RULE + "\n" + BLOCKER_RULE
 
 CAPACITY_RETRY_RULE = (
     "On a host capacity-gate refusal for a heavy step (capped-test-run exit 3 with "
@@ -118,3 +134,54 @@ WORKTREE_CLEANUP_FOOTER = (
 def compose_prompt(brief: str) -> str:
     """Prefix trusted rules without interpreting or rewriting the brief."""
     return SESSION_PREAMBLE + "\n\n" + brief + "\n\n" + WORKTREE_CLEANUP_FOOTER
+
+
+# Claude Code rejects a /goal condition longer than 4000 characters. Apply
+# this known cap to every goal-capable route as a conservative shared bound.
+GOAL_CHAR_LIMIT = 4000
+CONTAINER_HYGIENE_RULE = (
+    "Container hygiene: use docker run --rm for throwaway/test containers; label every "
+    "test container agent.session=<your Hub session id, or native session id registered "
+    "in Hub>. Install trap/finally cleanup before creation and clean up all resources you "
+    "create before session exit, including failed starts and docker create/compose tests. "
+    "Preserve other sessions and Coolify containers."
+)
+# Short goal sent instead of an over-limit brief. The full text is in the brief file.
+GOAL_BRIEF_POINTER = (
+    "Hub session rules and the full brief are in {path}. Read that file completely before "
+    "any other work and follow it exactly: it holds the session rules, the acceptance "
+    "criteria and the worktree cleanup rules."
+)
+# Engine rejection text, anchored to a complete line and optional known CLI
+# error markers so ordinary discussion of the limit cannot mark a session failed.
+GOAL_REJECTED_RE = re.compile(
+    r'(?m)^[ \t]*(?:(?:Error:|[✕✗✘×❌])[ \t]*)?'
+    r'Goal condition is limited to \d+ characters(?: \(got \d+\))?[ \t]*$'
+)
+
+
+def goal_brief_dir():
+    return Path.home() / ".local" / "state" / "agent-hub" / "goal-briefs"
+
+
+def _goal_char_count(text: str) -> int:
+    """Count UTF-16 code units, which is at least as strict as Python chars."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def launch_goal(wt_note: str, brief: str, offer_id: str, *, brief_dir=None) -> str:
+    """Return the `/goal` argument for a start. The full brief goes inline when it fits
+    the engine limit; otherwise it is written to a private file and the goal points at it.
+    Never truncates the brief."""
+    from . import private_fs
+    full = compose_prompt(brief) + "\n" + CONTAINER_HYGIENE_RULE
+    goal = "/goal " + wt_note + full
+    if _goal_char_count(goal) <= GOAL_CHAR_LIMIT:
+        return goal
+    name = hashlib.sha256(str(offer_id).encode()).hexdigest()[:32] + ".md"
+    path = Path(brief_dir or goal_brief_dir()) / name
+    private_fs.atomic_write(path, full.encode(), 512 * 1024)
+    goal = "/goal " + wt_note + GOAL_BRIEF_POINTER.format(path=path)
+    if _goal_char_count(goal) > GOAL_CHAR_LIMIT:
+        raise ValueError("goal_too_long: goal exceeds the engine limit even as a pointer")
+    return goal

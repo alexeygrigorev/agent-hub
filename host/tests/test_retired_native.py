@@ -24,6 +24,7 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from agent_hub_host import private_fs
@@ -399,6 +400,42 @@ class TestStopAndCleanupEndToEnd(unittest.TestCase):
                 patch("agent_hub_host.native_sessions.run_native", side_effect=AssertionError("native effect forbidden")):
             res = stop_session("aplexer", self.target)
         self.assertEqual(res.state, "stopped")
+
+    @patch("agent_hub_host.native_sessions._confirm_workload_exit", return_value=(True, "verified empty"))
+    @patch("agent_hub_host.native_sessions.run_native")
+    @patch("agent_hub_host.native_sessions.list_sessions")
+    def test_stop_session_live_native_in_subdirectory_uses_observed_workspace(
+        self, mock_list, mock_run, _mock_confirm
+    ):
+        from dataclasses import replace
+        sub = self.ws / "docs"
+        sub.mkdir()
+        before = NativeSession(
+            self.target.session_id, self.target.tag, str(sub), engine=self.target.engine,
+            phase="running", created_at_ms=self.target.created_at_ms,
+        )
+        after = replace(before, phase="exited", containment_empty=True)
+        mock_list.side_effect = [[before], [after]]
+        mock_run.return_value = SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+        res = stop_session("aplexer", self.target)
+
+        self.assertEqual(res.state, "stopped")
+        argv = mock_run.call_args.args[1]
+        self.assertEqual(argv[argv.index("--workspace") + 1], str(sub))
+
+    @patch("agent_hub_host.native_sessions.list_sessions")
+    def test_stop_session_live_native_outside_bound_workspace_still_refuses(self, mock_list):
+        outside = self.tmp / "elsewhere"
+        outside.mkdir()
+        row = NativeSession(
+            self.target.session_id, self.target.tag, str(outside), engine=self.target.engine,
+            phase="running", created_at_ms=self.target.created_at_ms,
+        )
+        mock_list.return_value = [row]
+        with patch("agent_hub_host.retired_native.list_sessions", return_value=[]):
+            with self.assertRaises(SessionControlError):
+                stop_session("aplexer", self.target)
 
     @patch("agent_hub_host.native_sessions.list_sessions")
     def test_stop_session_unrelated_workspace_or_tag_still_refused(self, mock_list):

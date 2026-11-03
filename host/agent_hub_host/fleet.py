@@ -18,7 +18,7 @@ import time
 from typing import Any, Optional
 
 from . import bus
-from .session_rules import SESSION_PREAMBLE, compose_prompt
+from .session_rules import SESSION_PREAMBLE, compose_prompt, launch_goal
 from .retired_native import launch_workspace_targets, verify_native_retirement, verify_retirement_in_targets
 
 LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
@@ -673,6 +673,41 @@ def resolve_max_agents(value):
     return value
 
 
+_HOST_RELEASE_DIR = re.compile(r"host-releases[^/\\]*[/\\][0-9a-f]{40}[/\\]host$")
+
+
+def pin_launcher_to_running_host(argv):
+    """Point launcher env pins at the host release that is running (intake 0e1b61c9).
+
+    A launcher argv written by hand or by an older sync carries
+    AGENT_HUB_HOST_PATH/PYTHONPATH entries for a past host release. The launcher
+    builds every managed-profile adapter (-c "...sys.path.insert(<that path>)...")
+    from AGENT_HUB_HOST_PATH, so after a release switch Hub-launched sessions ran
+    the old release's execute() against receipts it cannot read and died in
+    milliseconds with an empty stderr. Only paths that look like a pinned host
+    release are rewritten, and only when this process runs from one.
+    """
+    if not isinstance(argv, list):
+        return argv
+    from .launcher_env import host_path
+    here = host_path()
+    if not here or not _HOST_RELEASE_DIR.search(here):
+        return argv
+
+    def fix(path):
+        return here if _HOST_RELEASE_DIR.search(path) else path
+
+    out = []
+    for item in argv:
+        if isinstance(item, str) and item.startswith("AGENT_HUB_HOST_PATH="):
+            item = "AGENT_HUB_HOST_PATH=" + fix(item.split("=", 1)[1])
+        elif isinstance(item, str) and item.startswith("PYTHONPATH="):
+            parts = [fix(p) for p in item.split("=", 1)[1].split(os.pathsep)]
+            item = "PYTHONPATH=" + os.pathsep.join(dict.fromkeys(parts))
+        out.append(item)
+    return out
+
+
 def load_settings(path=None):
     """Explicit non-secret machine configuration, including several accounts per service."""
     default_path = path is None
@@ -738,6 +773,8 @@ def load_settings(path=None):
             raise ValueError("Invalid role_config setting")
         if isinstance(rc_cfg, str) and (not rc_cfg or "\0" in rc_cfg or len(rc_cfg) > 1024):
             raise ValueError("Invalid role_config path")
+    if isinstance(data.get("launcher"), dict):
+        data["launcher"] = dict(data["launcher"], argv=pin_launcher_to_running_host(data["launcher"].get("argv")))
     subs = data.get("subscriptions")
     if not isinstance(subs, list) or len(subs) > 128:
         raise ValueError("Invalid subscriptions list")
@@ -3439,7 +3476,7 @@ class Dispatcher:
                         else:
                             native_effort = 'xhigh' if selection['effort'] == 'max' else selection['effort']
                             launch += ['-c', 'model_reasoning_effort=' + json.dumps(native_effort)]
-                argv += ["--"] + launch + (['/goal ' + wt_note + compose_prompt(offer['prompt']) + '\nContainer hygiene: use docker run --rm for throwaway/test containers; label every test container agent.session=<your Hub session id, or native session id registered in Hub>. Install trap/finally cleanup before creation and clean up all resources you create before session exit, including failed starts and docker create/compose tests. Preserve other sessions and Coolify containers.'] if with_goal else [])
+                argv += ["--"] + launch + ([launch_goal(wt_note, offer['prompt'], offer_id)] if with_goal else [])
             prefix = sub.get("native_start_argv") or self.settings.get("native_start_argv")
             if prefix is not None:
                 prefix = validate_native_start_argv(prefix)

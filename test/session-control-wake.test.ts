@@ -330,7 +330,7 @@ describe('session scheduled wakes', () => {
       expect(hub.intakeWatchdog.project([task])[0].forgotten).toBe(false);
       sql.exec('INSERT OR REPLACE INTO fleet_catalog_seen(machine_id,observed_at) VALUES(?,?)', 'hetzner', new Date().toISOString());
       sql.exec("UPDATE fleet_sessions SET phase='exited',created_at_ms=? WHERE machine_id='hetzner' AND native_id=?", NATIVE_CREATED, NATIVE_ID);
-      expect(hub.intakeWatchdog.project([task])[0]).toMatchObject({ forgotten:true, reason:'missed_wake_terminal_session' });
+      expect(hub.intakeWatchdog.project([task])[0]).toMatchObject({ forgotten:true, reason:'session_ended_without_done_or_blocker_intake' });
       sql.exec('DELETE FROM fleet_catalog_seen');
       expect(hub.intakeWatchdog.project([task])[0]).toMatchObject({ forgotten:false, state:'unknown' });
       const status: any = new StatusService(sql, cb => cb(), new IntakeService(sql, cb => cb()));

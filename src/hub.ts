@@ -1,4 +1,5 @@
-import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES, RecipientError, ScopingRefusal, NAMED_AGENT_PROJECT, sessionsNeedingCredentials, mintSessionCredential, revokeEndedSessionCredentials, checkSendScoping, sessionIdOf, sessionRefreshAllowed, messagingSettings, updateMessagingSettings, messageEvent, setMessageState, expireSessionMessages, expireMessageEvents, readdressMessage, setDelegate, listDelegates } from './session-messaging';
+import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES, RecipientError, ScopingRefusal, NAMED_AGENT_PROJECT, sessionsNeedingCredentials, mintSessionCredential, revokeEndedSessionCredentials, checkSendScoping, sessionIdOf, sessionRefreshAllowed, messagingSettings, updateMessagingSettings, messageEvent, setMessageState, expireSessionMessages, expireMessageEvents, readdressMessage, setDelegate, authorizedNamedAgent, setNamedAgentForward } from './session-messaging';
+import { handleNamedAgentRequest } from './named-agents';
 import { IdleWorkService } from './idle-work';
 import { WorkerAccess, WORKER_SCOPE, workerDenialCode, workerRequestAllowed, workerRefreshContext } from './worker-access';
 import { DRIVER_SCOPE, driverAccessContext, driverRequestAllowed } from './driver-access';
@@ -11,6 +12,8 @@ import { IntakeVerifier } from './intake-verifier';
 import { AskLedger } from './asks';
 import { SessionAuditService, makeHeuristicDecider, makeLivenessNotify } from './session-audit';
 import { RepoRegistry } from './repos';
+// Work claims for renewable worker credentials (intake 6022786b).
+import { handleWorkerClaimRequest } from './worker-claims';
 import { hostReconcileFact, validReconcileNative } from './host-reconcile';
 import { IntakeService } from './intake';
 import { UI_HEADERS, tokenPage, authFailure, deviceEntry, deviceReview, deviceReviewHuman, deviceResult } from './ui-pages';
@@ -24,7 +27,7 @@ import { createSessionCookie, getSession, clearSessionCookie, createLoginCookie,
 import { isHumanCredentialAllowed as isHumanCredentialAllowedFn, validateHumanCredentialRecord } from './auth/human-credential';
 
 import { randomString, sha256, generateUserCode, base64url } from './auth/crypto';
-import { generateTokenPair, verifyBearerScope } from './auth/token';
+import { deriveHumanRefreshSuccessor, generateTokenPair, verifyBearerScope } from './auth/token';
 import { handleRegistryRoutes, handleWebSocketMessageRegistry, handleWebSocketCloseRegistry, updateHeartbeatMemoryOnly, updateHeartbeat } from './registry';
 import { BusService, BUS_SCHEMA_SQL, CallerContext, generateUlid } from './bus';
 import {
@@ -69,6 +72,7 @@ import { placementPressureSubjects } from './host-pressure';
 import { RowsMeter, ROWS_STATS_SCHEMA, normalizeRoute, rowsReadReport, rowsReadAlertThreshold, ROWS_READ_TARGET_PER_DAY } from './rows-meter';
 import { sampleAccountCapacityHistory } from './account-capacity-history';
 
+const HUMAN_REFRESH_REPLAY_GRACE_MS = 30_000;
 const IDLE_WORK_INTERVAL_MS = 5 * 60_000;
 const METER_FLUSH_INTERVAL_MS = 5 * 60_000;
 
@@ -188,6 +192,8 @@ export class Hub extends DurableObject {
     // constructed just below); intake records only the returned real id.
     this.intakeService = new IntakeService(this.sql, fn => this.ctx.storage.transactionSync(fn), {
       queue: tasks => ({ items: this.intakeWatchdog.queue(tasks), observed_at: Date.now(), watchdog: this.intakeWatchdog.status() }),
+      prerequisiteCreated: (prerequisiteId, parentId) => this.intakeWatchdog.prioritizePrerequisite(prerequisiteId, parentId),
+      parentsUnblocked: ids => this.intakeWatchdog.resumeParents(ids),
       forgotten: tasks => {
         const items = this.intakeWatchdog.project(tasks).filter(t => t.forgotten);
         return { items, forgotten_count: items.length, unmerged: this.intakeService.mergeGate.counts(), observed_at: Date.now(), watchdog: this.intakeWatchdog.status(), triage: this.intakeTriage.status(), verifier: this.intakeVerifier.status() };
@@ -711,7 +717,13 @@ export class Hub extends DurableObject {
 
     // R5 R2: server-owned enrollment authority migration.
     this.ensureColumns('device_pairings', { approved_seq: 'INTEGER' });
-    this.ensureColumns('credentials', { approval_seq: 'INTEGER' });
+    this.ensureColumns('credentials', {
+      approval_seq: 'INTEGER',
+      // Only non-null for a normally rotated human refresh token. This lets a
+      // short retry window distinguish a lost rotation response from logout,
+      // admin revocation, or a replay after the grace period.
+      refresh_rotated_at: 'TEXT',
+    });
 
     this.ensureColumns('jobs', {
       deadline_at: 'TEXT',
@@ -1186,6 +1198,9 @@ export class Hub extends DurableObject {
       }
       if (path === '/api/sessions' || path.startsWith('/api/sessions/') ||
           path === '/api/session-commands' || path.startsWith('/api/session-commands/')) {
+        const startInput = request.method === 'POST' && path === '/api/sessions'
+          ? await request.clone().json().catch(() => null) as any
+          : null;
         const result = await this.sessionControlService.handle(request, await this.sessionControlAuth(request));
         if (request.method === 'POST' && /\/(wakes?|ping|ping-clear)$/.test(path) && result.ok) {
           // Commit the durable wake before arming the existing alarm. Never postpone
@@ -1193,6 +1208,20 @@ export class Hub extends DurableObject {
           const current = await this.ctx.storage.getAlarm();
           const next = this.sessionControlService.nextWakeTime();
           if (next !== null && (current === null || next < current)) await this.ctx.storage.setAlarm(Math.max(Date.now() + 1, next));
+        }
+        if (request.method === 'POST' && path === '/api/sessions' && result.ok && typeof startInput?.name === 'string') {
+          const started: any = await result.clone().json().catch(() => null);
+          const sessionId = typeof started?.id === 'string' ? started.id : null;
+          const agentName = startInput.name;
+          if (sessionId && this.sql.exec('SELECT 1 FROM named_agents WHERE name = ? AND disabled_at IS NULL', agentName).toArray().length) {
+            try {
+              this.ctx.storage.transactionSync(() => setNamedAgentForward(this.sql, agentName, sessionId, Date.now()));
+            } catch {
+              // The session start already committed. Returning a retryable
+              // failure lets the idempotent start request apply the forward.
+              return Response.json({ error: 'named_agent_forward_update_failed', session_id: sessionId }, { status: 503 });
+            }
+          }
         }
         return result;
       }
@@ -2038,9 +2067,17 @@ export class Hub extends DurableObject {
 
       const refreshHash = await sha256(body.refresh_token);
 
+      // The raw predecessor token is never persisted. Human successors are a
+      // deterministic PRF keyed by the Hub session secret and bound to that
+      // token so retries recover the same pair without a stored token copy.
+      const predecessor = this.sql.exec('SELECT * FROM credentials WHERE refresh_hash = ?', refreshHash).toArray()[0] as any;
+      const humanSuccessor = predecessor?.kind === 'human'
+        ? await deriveHumanRefreshSuccessor(body.refresh_token, String(predecessor.id), this.env.SESSION_SECRET)
+        : null;
+
       // PRE-GENERATE values before any synchronous DB interaction to prevent partial state on await failures
-      const { accessToken, refreshToken, accessHash, refreshHash: newRefreshHash } = await generateTokenPair();
-      const newId = randomString(16);
+      const { accessToken, refreshToken, accessHash, refreshHash: newRefreshHash } = humanSuccessor ?? await generateTokenPair();
+      const newId = humanSuccessor?.credentialId ?? randomString(16);
       const now = new Date(Date.now()).toISOString();
 
       let errorResponse = null;
@@ -2069,9 +2106,34 @@ export class Hub extends DurableObject {
       if (!cred) {
         errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
       } else if (cred.revoked_at) {
-        // Replay or explicitly revoked! Revoke family.
-        this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL', now, cred.family_id);
-        errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
+        const rotatedAtMs = Date.parse(String(cred.refresh_rotated_at ?? ''));
+        const retryWithinGrace = cred.kind === 'human'
+          && humanSuccessor !== null
+          && Number.isFinite(rotatedAtMs)
+          && nowMs >= rotatedAtMs
+          && nowMs - rotatedAtMs <= HUMAN_REFRESH_REPLAY_GRACE_MS;
+        const successor = retryWithinGrace
+          ? this.sql.exec('SELECT * FROM credentials WHERE id = ? AND family_id = ?', newId, cred.family_id).toArray()[0] as any
+          : null;
+        if (successor
+          && successor.kind === 'human'
+          && !successor.revoked_at
+          && Number.isFinite(Date.parse(successor.expires_at))
+          && Date.parse(successor.expires_at) > nowMs
+          && successor.refresh_hash === newRefreshHash
+          && successor.token_hash === accessHash
+          && this.isHumanRefreshAllowed(successor)) {
+          // Return the already-issued pair. No extra generation is inserted,
+          // and the successor remains usable when a refresh response was lost.
+          scopesResponse = JSON.parse(successor.scopes).join(' ');
+          expiresAtResponse = successor.expires_at;
+          machineIdResponse = successor.machine_id ?? null;
+        } else {
+          // Replays outside grace and explicit revocations retain the existing
+          // fail-closed family behavior.
+          this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL', now, cred.family_id);
+          errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
+        }
       } else if (workerScoped && !worker) {
         errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
       } else if (driverScoped && !driver) {
@@ -2093,7 +2155,8 @@ export class Hub extends DurableObject {
         const role = worker || driver;
         const accessExpiresAt = role ? new Date(Math.min(nowMs + 3600000, role.expires_at)).toISOString()
           : sessionActor ? new Date(nowMs + 3600000).toISOString() : cred.expires_at;
-        const res = this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL', now, cred.id);
+        const rotatedAt = cred.kind === 'human' ? now : null;
+        const res = this.sql.exec('UPDATE credentials SET revoked_at = ?, refresh_rotated_at = ? WHERE id = ? AND revoked_at IS NULL', now, rotatedAt, cred.id);
         if (res.rowsWritten !== 1) {
           this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL', now, cred.family_id);
           errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
@@ -2201,6 +2264,13 @@ export class Hub extends DurableObject {
     if (auth.error) return auth.error;
     const json = (value: unknown, status = 200) => Response.json(value, { status, headers: { 'Cache-Control': 'private, no-store' } });
     if (!auth.caller?.isAdmin) return json({ error: 'forbidden' }, 403);
+    const namedAgentResponse = await handleNamedAgentRequest(
+      this.sql,
+      f => this.ctx.storage.transactionSync(f),
+      request,
+      auth.caller,
+    );
+    if (namedAgentResponse) return namedAgentResponse;
     const NAME = AGENT_NAME;
     if (path === '/api/agents' && request.method === 'GET') return json({ agents: this.sql.exec('SELECT tag, project, role, machine_id, registered_at, imported_from FROM agents ORDER BY tag, project').toArray() });
     if (path === '/api/agents' && request.method === 'POST') {
@@ -2222,10 +2292,7 @@ export class Hub extends DurableObject {
         return json({ status: 'registered', tag: b.tag, project, actor: project ? `${project}:${b.tag}` : b.tag }, 201);
       });
     }
-    // Named agents (docs/SESSION-MESSAGING.md §9, Alexey t1840u): a stable
-    // `agent:<name>` address with its own inbox and its own messaging-only
-    // credential, distinct from any human login. Re-issuing rotates: older
-    // credential families of that identity are revoked.
+    // Compatibility endpoint for named-agent profiles issued before `hub agents create`.
     const named = /^\/api\/agents\/named\/([A-Za-z0-9][A-Za-z0-9._-]{0,63})\/credential$/.exec(path);
     if (named && request.method === 'POST') {
       await safeJson(request);
@@ -2243,9 +2310,10 @@ export class Hub extends DurableObject {
         const expires = new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString();
         this.sql.exec(`INSERT INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at, registry_actor)
           VALUES (?, 'agent', ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)`, id, tokens.accessHash, tokens.refreshHash, id, actor, actor,
-          JSON.stringify(['bus:send', 'bus:read']), String(auth.caller?.actor || 'admin').slice(0, 128), now, expires, actor);
+          JSON.stringify(['msg:send', 'msg:read']), String(auth.caller?.actor || 'admin').slice(0, 128), now, expires, actor);
+        this.sql.exec('UPDATE named_agents SET credential_family = ? WHERE name = ?', id, name);
         // The only response carrying this credential; never logged.
-        return json({ actor, access_token: tokens.accessToken, refresh_token: tokens.refreshToken, expires_at: expires, scopes: ['bus:send', 'bus:read'] }, 201);
+        return json({ actor, access_token: tokens.accessToken, refresh_token: tokens.refreshToken, expires_at: expires, scopes: ['msg:send', 'msg:read'] }, 201);
       });
     }
     // Delegate grants (§9): which MCP client may act as agent:<name> with its
@@ -2253,15 +2321,17 @@ export class Hub extends DurableObject {
     const delegates = /^\/api\/agents\/named\/([A-Za-z0-9][A-Za-z0-9._-]{0,63})\/delegates$/.exec(path);
     if (delegates) {
       const name = delegates[1];
-      if (request.method === 'GET') return json({ agent: `${NAMED_AGENT_PROJECT}:${name}`, delegates: listDelegates(this.sql, name) });
+      const legacyClients = () => (this.sql.exec('SELECT client FROM named_agent_delegates WHERE agent = ? ORDER BY created_at, client', name).toArray() as any[]).map(row => String(row.client));
+      if (request.method === 'GET') return json({ agent: `${NAMED_AGENT_PROJECT}:${name}`, delegates: legacyClients() });
       if (request.method === 'POST') {
         const b = await safeJson(request);
         try {
           const result = this.ctx.storage.transactionSync(() => setDelegate(this.sql, name, b?.client, String(auth.caller?.actor ?? 'admin'), Date.now(), b?.remove === true));
-          return json(result, b?.remove === true ? 200 : 201);
+          return json({ ...result, delegates: legacyClients() }, b?.remove === true ? 200 : 201);
         } catch (e: any) {
           if (e.message === 'invalid_client') return json({ error: 'invalid_client' }, 400);
           if (e.message === 'unknown_agent') return json({ error: 'unknown_agent' }, 404);
+          if (e.message === 'no_live_credential_family') return json({ error: e.message }, 404);
           return json({ error: 'Internal Server Error' }, 500);
         }
       }
@@ -2929,41 +2999,33 @@ export class Hub extends DurableObject {
 
   private static readonly AS_ACTOR = /^agent:([A-Za-z0-9][A-Za-z0-9._-]{0,63})$/;
 
-  /**
-   * `as` delegation (docs/SESSION-MESSAGING.md §9): a caller may act as a
-   * named agent only when its credential family's MCP client is a registered
-   * delegate of that agent, or when it is the operator (admin, audited).
-   * The human actor and any host authority never carry over into the acting
-   * view, so every downstream bus check runs against the named agent alone.
-   */
-  private actingCallerFor(caller: any, as: unknown): { caller: any; delegated: boolean; client: string | null; error?: Response } {
-    if (as === undefined || as === null) return { caller, delegated: false, client: null };
-    if (typeof as !== 'string') return { caller, delegated: false, client: null, error: Response.json({ error: 'invalid_as' }, { status: 400 }) };
+  /** `as` delegation is bound to the caller's exact credential family. */
+  private actingCallerFor(caller: any, as: unknown): { caller: any; delegated: boolean; credentialFamily: string | null; error?: Response } {
+    if (as === undefined || as === null) return { caller, delegated: false, credentialFamily: null };
+    if (typeof as !== 'string') return { caller, delegated: false, credentialFamily: null, error: Response.json({ error: 'invalid_as' }, { status: 400 }) };
     const match = Hub.AS_ACTOR.exec(as);
-    if (!match) return { caller, delegated: false, client: null, error: Response.json({ error: 'invalid_as' }, { status: 400 }) };
-    if (caller.actor === as) return { caller, delegated: false, client: null };
+    if (!match) return { caller, delegated: false, credentialFamily: null, error: Response.json({ error: 'invalid_as' }, { status: 400 }) };
+    if (caller.actor === as) return { caller, delegated: false, credentialFamily: null };
     if (!this.sql.exec('SELECT 1 FROM agents WHERE project = ? AND tag = ?', NAMED_AGENT_PROJECT, match[1]).toArray().length) {
-      return { caller, delegated: false, client: null, error: Response.json({ error: 'unknown_recipient' }, { status: 404 }) };
+      return { caller, delegated: false, credentialFamily: null, error: Response.json({ error: 'unknown_recipient' }, { status: 404 }) };
     }
-    let client: string | null = null;
-    // mcp_grants exists only once an OAuth flow ran; before that no bearer
-    // has an MCP client, so the lookup is simply empty.
-    const hasGrants = this.sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mcp_grants'").toArray().length > 0;
-    if (caller.tokenId && hasGrants) {
-      const grant: any = this.sql.exec('SELECT g.client FROM credentials c JOIN mcp_grants g ON g.family = c.family_id WHERE c.id = ?', caller.tokenId).toArray()[0];
-      client = grant ? String(grant.client) : null;
+    const credential: any = caller.tokenId
+      ? this.sql.exec('SELECT family_id FROM credentials WHERE id = ? AND revoked_at IS NULL AND expires_at > ?', caller.tokenId, new Date().toISOString()).toArray()[0]
+      : null;
+    const credentialFamily = credential?.family_id == null ? null : String(credential.family_id);
+    if (!authorizedNamedAgent(this.sql, as, credentialFamily ?? undefined)) {
+      return { caller, delegated: false, credentialFamily, error: Response.json({ error: 'forbidden', reason: 'delegate_required' }, { status: 403 }) };
     }
-    const delegate = client !== null && this.sql.exec('SELECT 1 FROM named_agent_delegates WHERE agent = ? AND client = ?', match[1], client).toArray().length > 0;
-    if (!delegate && !caller.isAdmin) {
-      return { caller, delegated: false, client, error: Response.json({ error: 'forbidden', reason: 'delegate_required' }, { status: 403 }) };
-    }
-    return { caller: { ...caller, actor: as, isAdmin: false, machineId: undefined, kind: 'agent' as const }, delegated: true, client };
+    return { caller: { ...caller, actor: as, isAdmin: false, machineId: undefined, kind: 'agent' as const }, delegated: true, credentialFamily };
   }
 
   /** Audit trail for a delegated send (§9): `on_behalf_of` on the message. */
-  private auditDelegatedSend(caller: any, acting: { delegated: boolean; client: string | null }, messageId: string): void {
+  private auditDelegatedSend(caller: any, acting: { delegated: boolean; credentialFamily: string | null }, messageId: string): void {
     if (!acting.delegated) return;
-    messageEvent(this.sql, messageId, 'delegated', String(caller.actor ?? 'unknown'), null, Date.now(), { on_behalf_of: caller.actor ?? null, client: acting.client });
+    messageEvent(this.sql, messageId, 'delegated', String(caller.actor ?? 'unknown'), null, Date.now(), {
+      on_behalf_of: caller.actor ?? null,
+      credential_family: acting.credentialFamily,
+    });
   }
 
   private async handleBusRoutes(request: Request, path: string): Promise<Response | null> {
@@ -3282,10 +3344,14 @@ export class Hub extends DurableObject {
       if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET' } });
       const auth = await this.authenticateBusRequest(request);
       if (auth.error) return auth.error;
-      if (!auth.scopes?.includes('bus:read') && !auth.scopes?.includes('admin')) {
+      if (!auth.scopes?.includes('bus:read') && !auth.scopes?.includes('msg:read') && !auth.scopes?.includes('admin')) {
         return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
       }
       const caller = auth.caller!;
+      const credential: any = caller.tokenId
+        ? this.sql.exec('SELECT family_id FROM credentials WHERE id = ? AND revoked_at IS NULL AND expires_at > ?', caller.tokenId, new Date().toISOString()).toArray()[0]
+        : null;
+      const credentialFamily = credential?.family_id == null ? null : String(credential.family_id);
       let client: string | null = null;
       const hasGrants = this.sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mcp_grants'").toArray().length > 0;
       if (caller.tokenId && hasGrants) {
@@ -3300,9 +3366,8 @@ export class Hub extends DurableObject {
       let namedAgents: string[];
       if (caller.isAdmin) namedAgents = allNamed;
       else if (selfActor && allNamed.includes(selfActor)) namedAgents = [selfActor];
-      else if (client !== null) {
-        const granted = new Set((this.sql.exec('SELECT g.agent FROM named_agent_delegates g JOIN mcp_grants m ON m.client = g.client WHERE m.family = (SELECT family_id FROM credentials WHERE id = ?)', caller.tokenId).toArray() as any[]).map((r: any) => `${NAMED_AGENT_PROJECT}:${r.agent}`));
-        namedAgents = allNamed.filter(a => granted.has(a));
+      else if (credentialFamily !== null) {
+        namedAgents = allNamed.filter(actor => authorizedNamedAgent(this.sql, actor, credentialFamily));
       } else namedAgents = [];
       return Response.json({ actor: selfActor, kind: caller.kind ?? null, client, named_agents: namedAgents });
     }
@@ -3499,8 +3564,13 @@ export class Hub extends DurableObject {
     // POST & GET /api/bus/claims
     if (path === '/api/bus/claims') {
       if (request.method === 'POST') {
-        const auth = await this.authenticateBusRequest(request);
+        const auth = await this.sessionControlAuth(request);
         if (auth.error) return auth.error;
+        if (auth.scopes?.includes(WORKER_SCOPE)) {
+          const parsed = await this.parseSafeBusBody(request, new Set(['project', 'scope', 'holder', 'ttl_ms', 'lease_epoch']));
+          if (parsed.error) return parsed.error;
+          return handleWorkerClaimRequest(request, this.sql, this.busService, auth.caller!, parsed.data!);
+        }
         if (!auth.scopes?.includes('bus:send') && !auth.scopes?.includes('admin')) {
           return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
         }
@@ -3546,8 +3616,9 @@ export class Hub extends DurableObject {
       }
 
       if (request.method === 'GET') {
-        const auth = await this.authenticateBusRequest(request);
+        const auth = await this.sessionControlAuth(request);
         if (auth.error) return auth.error;
+        if (auth.scopes?.includes(WORKER_SCOPE)) return handleWorkerClaimRequest(request, this.sql, this.busService, auth.caller!, {});
         if (!auth.scopes?.includes('bus:read') && !auth.scopes?.includes('admin')) {
           return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
         }
@@ -3696,9 +3767,15 @@ export class Hub extends DurableObject {
     // POST /api/bus/claims/:target/release
     if (path.startsWith('/api/bus/claims/') && path.endsWith('/release')) {
       if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
-      const auth = await this.authenticateBusRequest(request);
+      const auth = await this.sessionControlAuth(request);
       if (auth.error) return auth.error;
-      if (!auth.scopes?.includes('bus:send') && !auth.scopes?.includes('admin') && !auth.scopes?.includes(WORKER_SCOPE)) {
+      if (auth.scopes?.includes(WORKER_SCOPE)) {
+        const parsed = await this.parseSafeBusBody(request, new Set(['lease_epoch']), true);
+        if (parsed.error) return parsed.error;
+        return handleWorkerClaimRequest(request, this.sql, this.busService, auth.caller!, parsed.data!,
+          nativeTarget => this.workerAccess.releaseClaim(auth.caller!, nativeTarget));
+      }
+      if (!auth.scopes?.includes('bus:send') && !auth.scopes?.includes('admin')) {
         return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
       }
 
@@ -3717,7 +3794,6 @@ export class Hub extends DurableObject {
       }
 
       try {
-        if (auth.scopes?.includes(WORKER_SCOPE)) return this.workerAccess.releaseClaim(auth.caller!, target);
         this.busService.releaseClaim(auth.caller!, target, Date.now(), leaseEpoch);
         return Response.json({ status: 'ok' });
       } catch (e: any) {

@@ -46,6 +46,7 @@ MICROMAMBA_SHA256 = {
     'osx-arm64': 'acef4eaab19ec2174ad5a449e5aad981ca326270db819502ff096a92fc31caa6',
 }
 ENGINES = ENGINE_PACKAGES
+LOOP_SERVICE_IDENTITIES = ('refill-loop', 'ready-slim', 'desktop-loop')
 
 
 def user_install_root():
@@ -56,6 +57,60 @@ def user_install_root():
 
 def root():
     return persistent_root()
+
+
+def loop_service_profile_path(config_root, label):
+    if label not in LOOP_SERVICE_IDENTITIES:
+        raise ValueError('Unknown Hub loop service identity')
+    return Path(config_root) / 'agent-hub' / 'services' / (label + '.json')
+
+
+def provision_loop_service_identities(base_url, config_root):
+    """Ensure each installed loop has an independent Hub human credential family.
+
+    The profiles are separate from both the interactive cli.json and the
+    fleet host.json. Device approval happens during install/bootstrap; each
+    consumer later selects only its own file through HUB_CONFIG_FILE.
+    """
+    from . import config, human_auth
+
+    previous_override = os.environ.get('HUB_CONFIG_FILE')
+    try:
+        for label in LOOP_SERVICE_IDENTITIES:
+            profile = loop_service_profile_path(config_root, label)
+            os.environ['HUB_CONFIG_FILE'] = str(profile)
+            cfg = config.load_human_config()
+            if cfg:
+                if not config.is_human_config(cfg):
+                    raise ValueError('Hub service profile is not a human credential: ' + label)
+                if cfg.get('base_url') and not config.same_origin(base_url, cfg['base_url']):
+                    raise ValueError('Hub service profile belongs to another Hub: ' + label)
+                if not cfg.get('refresh_token'):
+                    raise ValueError('Hub service profile is incomplete: ' + label)
+                try:
+                    status = human_auth.human_status()
+                except Exception:
+                    # A network or permission error is not permission to
+                    # replace an existing identity or silently continue.
+                    raise RuntimeError('Cannot verify Hub service identity: ' + label) from None
+                if status.get('logged_in'):
+                    continue
+                if status.get('state') not in ('revoked', 'expired'):
+                    raise RuntimeError('Hub service identity is unavailable: ' + label)
+
+            print('Provisioning Hub service identity: ' + label, flush=True)
+            human_auth.human_login(base_url, label)
+            provisioned = config.load_human_config()
+            if (not config.is_human_config(provisioned)
+                    or not config.same_origin(base_url, provisioned.get('base_url', ''))
+                    or not provisioned.get('access_token')
+                    or not provisioned.get('refresh_token')):
+                raise RuntimeError('Hub service identity was not saved correctly: ' + label)
+    finally:
+        if previous_override is None:
+            os.environ.pop('HUB_CONFIG_FILE', None)
+        else:
+            os.environ['HUB_CONFIG_FILE'] = previous_override
 
 
 def persistent_root():
@@ -937,6 +992,7 @@ def configure(base_url):
         auth.device_login(base_url, 'host', 'agent-hub-host', system.get_hostname(),
                           auth.HOST_SCOPES + ['repositories:read'])
     api.register_machine(base_url)
+    provision_loop_service_identities(base_url, config_root)
     settings = fleet.subscriptions_path()
     if not settings.exists():
         write_private(settings, json.dumps({'version': 1, 'subscriptions': [],

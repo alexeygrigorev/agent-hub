@@ -81,10 +81,12 @@ def test_configured_model_accepts_per_session_effort_override():
     assert configured_selection(selection, 'codex', 'codex')['effort'] == 'low'
     with pytest.raises(ValueError, match='model_unsupported'):
         configured_selection(dict(selection, effort='xhigh'), 'codex', 'codex')
-    # The host sees the selected effort but not whether it was a policy
-    # default or an explicit request. Hub routing rejects explicit high for
-    # Astra/Sol; the host still needs to accept the configured default.
-    assert configured_selection(dict(selection, effort='high'), 'codex', 'codex')['effort'] == 'high'
+    # Intake 8852ba59: astra defaults to medium; Hub routing rejects explicit
+    # high for Astra/Sol, so the host accepts the configured medium default
+    # (exact policy match) and the low override, but refuses high.
+    assert configured_selection(dict(selection, effort='medium'), 'codex', 'codex')['effort'] == 'medium'
+    with pytest.raises(ValueError, match='model_unsupported'):
+        configured_selection(dict(selection, effort='high'), 'codex', 'codex')
 
 
 def test_model_visible_in_list():
@@ -141,9 +143,25 @@ def test_interactive_unsupported_adapter_refused_before_claim(tmp_path):
 def test_claude_routes_are_sonnet_medium_never_haiku():
     config = json.loads((Path(__file__).resolve().parents[2] / 'config' / 'model-routing.json').read_text())
     claude = [m for m in config['models'] if m['engine'] == 'claude']
-    assert [(m['model'], m['effort']) for m in claude] == [('sonnet', 'medium')]
+    assert [(m['model'], m['effort']) for m in claude] == [('opus', 'medium'), ('sonnet', 'medium')]
     for ids in config['tiers'].values():
-        assert not [i for i in ids if 'haiku' in i or i == 'opus']
+        assert not [i for i in ids if 'haiku' in i]
+    assert 'opus' in config['tiers']['deep']
+    assert 'opus' not in config['tiers']['daily']
+
+
+def test_bundle_effort_policy_8852ba59():
+    """Intake 8852ba59 AC3: sol/astra/argon/opus default to medium, never high for sol/astra."""
+    config = json.loads((Path(__file__).resolve().parents[2] / 'config' / 'model-routing.json').read_text())
+    by_id = {m['id']: m for m in config['models']}
+    assert by_id['sol']['effort'] == 'medium'
+    assert by_id['astra']['effort'] == 'medium'
+    assert by_id['argon']['effort'] == 'medium'
+    assert by_id['argon-gemini']['effort'] == 'medium'
+    assert by_id['opus']['effort'] == 'medium'
+    assert by_id['luna']['effort'] == 'max'
+    for mid in ('sol', 'astra'):
+        assert by_id[mid]['effort'] != 'high'
 
 
 def test_sessions_table_shows_model_and_effort():

@@ -125,6 +125,14 @@ class AdmissionRefusalChannelTests(unittest.TestCase):
 class RetryWrapperTests(unittest.TestCase):
     """Real retry wrapper over the real admission gate (private slots)."""
 
+    def test_nested_capped_test_runner_is_refused_before_admission(self):
+        for command in ([str(CAPPED)], ["bash", str(CAPPED)]):
+            with self.subTest(command=command):
+                result = run(["bash", str(RETRY), "--", *command], env=os.environ.copy())
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("refusing nested scripts/capped-test-run.sh", result.stderr)
+                self.assertIn("deadlock", result.stderr)
+
     def test_real_exit_three_is_fail_exit_one_without_retry(self):
         with scratch() as temp:
             heavy = HeavyEnv(Path(temp))
@@ -308,6 +316,14 @@ class RetryWrapperTests(unittest.TestCase):
                        "fi\n"
                        "if [ \"${1:-}\" = scripts/local-dependencies.py ] || [ \"${1:-}\" = scripts/ci/scope_guard.py ]; then exit 0; fi\n"
                        "exec /usr/bin/python3 \"$@\"\n")
+            # The affected runner gates worktrees that predate the fixed
+            # admission (d8740aac). This fixture is a scratch scripts-only
+            # tree, so pretend the gate passes to exercise the capacity HOLD.
+            write_exec(bindir / "git",
+                       "#!/usr/bin/env bash\n"
+                       "if [ \"${1:-}\" = cat-file ]; then exit 0; fi\n"
+                       "if [ \"${1:-}\" = merge-base ]; then exit 0; fi\n"
+                       "exec /usr/bin/git \"$@\"\n")
 
             base = "feature with spaces; [special] $HOME $(touch injected)"
             env = heavy.env(PATH=f"{bindir}:{os.environ['PATH']}",

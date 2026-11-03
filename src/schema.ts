@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS credentials (
   expires_at TEXT NOT NULL,
   revoked_at TEXT,
   last_used_at TEXT,
+  refresh_rotated_at TEXT,
   approval_seq INTEGER -- R5 R2 enrollment authority inherited at issuance and preserved across refresh, NULL is pre-migration legacy
 );
 

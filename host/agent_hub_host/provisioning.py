@@ -97,11 +97,45 @@ def load_bundle(dest):
     return bundle
 
 
+def _profile_command_runs_this_release(label, path=None):
+    """False only when the aplexer profile for ``label`` pins another host release.
+
+    The profile command embeds the host release path (module_command). A release
+    from before the split receipt cannot read it: its validate() sees empty
+    files and every Hub-launched session dies before the engine starts with an
+    empty stderr (intake 0e1b61c9, antigravity, 2026-11-03). Unknown or
+    unreadable profile state is treated as current.
+    """
+    try:
+        path = Path(path) if path else profile_path()
+        text = path.read_text(encoding='utf-8')
+        section = re.search(r'(?ms)^\[profiles\.' + re.escape('hub-' + label) + r'\]\s*$(.*?)(?=^\[|\Z)', text)
+        if not section:
+            return True
+        command = re.search(r'(?m)^command\s*=\s*(\[.*\])\s*$', section.group(1))
+        if not command:
+            return True
+        here = str(Path(__file__).resolve().parents[1])
+        return any(repr(here) in part for part in json.loads(command.group(1)) if isinstance(part, str))
+    except (OSError, ValueError, TypeError):
+        return True
+
+
 def save_bundle(dest, bundle):
-    """Write credentials first; publish a secret-free receipt only after success."""
+    """Write credentials first; publish a secret-free receipt only after success.
+
+    While the label's aplexer profile still runs an older host release, keep the
+    legacy full receipt: that release cannot resolve ``credentials_file``. The
+    next sync, after profiles() re-pins the command, migrates it.
+    """
     dest = Path(dest)
     write_json(dest / CREDENTIALS_FILE, {'files': bundle['files'], 'env': bundle['env']})
-    write_json(dest / 'bundle.json', _split_receipt(bundle))
+    write_json(dest / 'bundle.json', _receipt_form(bundle))
+
+
+def _receipt_form(bundle):
+    """The receipt this host may publish now: split, unless an older release still runs the profile."""
+    return _split_receipt(bundle) if _profile_command_runs_this_release(bundle['label']) else bundle
 
 
 def _split_receipt(bundle):
@@ -1907,7 +1941,7 @@ def install(bundle, request=None):
         credentials.leased_refresh(bundle['label'], bundle, home, request or host_request)
         # A legacy receipt with identical content still migrates to the
         # secret-free form; unchanged split receipts are left untouched.
-        if receipt != bundle or raw != _split_receipt(bundle):
+        if receipt != bundle or raw != _receipt_form(bundle):
             save_bundle(dest, bundle)
         return
     pkg, binary, _ = PACKAGES[bundle['provider']]
@@ -2303,8 +2337,8 @@ def launcher_metadata(provider, bundle=None):
     elif provider == 'antigravity':
         return {
             'launcher_provider': 'antigravity',
-            'launcher_model': model or 'gemini-4-argon-high',
-            'launcher_effort': effort,
+            'launcher_model': model or 'gemini-4-argon-medium',
+            'launcher_effort': effort or 'medium',
         }
     return {}
 

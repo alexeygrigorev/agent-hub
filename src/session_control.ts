@@ -41,6 +41,7 @@ import { recordIntakeSessionLink, recordWorkerChildStart, IntakeSessionLinkError
 export const WORKER_CHILD_CONCURRENT = 4;
 export const WORKER_CHILD_PER_HOUR = 12;
 export const WORKER_CHILD_PER_INTAKE = 8;
+import { IntakeDependencies } from './intake-dependencies';
 import { ResourceManagement } from './resource-management';
 import { classifySessionStall, initSessionStalls, nativeObservationFresh, type NativeObservationCache, nativeProgress, sessionTerminalError, orphanFailure, stallThreshold, toolCallStallThreshold } from './session_stall';
 import {
@@ -1247,6 +1248,7 @@ export class SessionControlService {
     let modelReason: string | null = null;
     let memoryRejected: any[] = [];
     let holdReason: string | null = null;
+    let supersededBy: string | null = null;
     // Intake dcac7cd4 AC1: top-level needs-hold diagnosis from the stored
     // hold payload (why no routed host matches, which hosts advertise the
     // needs), surfaced alongside the per-route rejected[] entries.
@@ -1312,8 +1314,13 @@ export class SessionControlService {
       const holdInfo = this.readHoldInfo(row, request);
       if (holdInfo.rejected.length > 0) memoryRejected = holdInfo.rejected;
       if (holdInfo.reason && (row.state === 'refused' || row.state === 'held' || row.state === 'cancelled')) holdReason = holdInfo.reason;
+      if (row.state === 'cancelled' && typeof holdInfo.hold?.superseded_by === 'string') supersededBy = holdInfo.hold.superseded_by;
       needsHoldReason = holdInfo.needs_reason;
       needsMachines = holdInfo.needs_machines;
+    }
+    if (row.state === 'cancelled' && !supersededBy) {
+      const persistedHold = parsed(row.hold_json, null);
+      if (typeof persistedHold?.superseded_by === 'string') supersededBy = persistedHold.superseded_by;
     }
     const qualified_name = qualified_alias || (typeof request.name === 'string' ? request.name : row.id);
     // Scheduled wake: a pending future wake suspends stall/idle classification.
@@ -1360,6 +1367,7 @@ export class SessionControlService {
       ...(modelReason ? { reason: modelReason } : {}),
       ...(memoryRejected.length ? { reason: holdReason ?? memoryRejected[0]?.reason ?? 'placement_unknown', rejected: memoryRejected } : holdReason ? { reason: holdReason } : {}),
       ...(['refused', 'held'].includes(row.state) ? { reason: holdReason || memoryRejected[0]?.reason || 'placement_unknown', rejected: memoryRejected } : {}),
+      ...(supersededBy ? { superseded_by: supersededBy } : {}),
       ...(needsHoldReason ? { hold_reason: needsHoldReason, ...(needsMachines ? { needs_machines: needsMachines } : {}) } : {}),
       ...(offeredRoute ? { offered_route: offeredRoute } : {}),
       ...(launchError ? { reason: launchError.reason, message: launchError.message,
@@ -1679,6 +1687,7 @@ export class SessionControlService {
             continue;
           }
           let project: string | undefined = undefined;
+          let dependencyGateUnknown = false;
           if (typeof req.intake_task_id === 'string' && req.intake_task_id) {
             try {
               let taskRows: any[] = this.sql.exec('SELECT id, data FROM intake_tasks WHERE id = ?', req.intake_task_id).toArray();
@@ -1688,6 +1697,11 @@ export class SessionControlService {
               if (taskRows.length === 1) {
                 const task = parsed(taskRows[0].data, {});
                 project = typeof task?.project === 'string' ? task.project : undefined;
+                // Fail closed: an unreadable dependency graph keeps the hold parked, never starts it.
+                if (req.force !== true) {
+                  try { if (new IntakeDependencies(this.sql).view(taskRows[0].id).blocked_by.length) continue; }
+                  catch { dependencyGateUnknown = true; }
+                }
                 if (task?.status === 'done' || task?.status === 'cancelled') {
                   const at = this.at();
                   const closedHold = JSON.stringify({ error: 'intake_task_closed', reason: 'intake_task_closed', rejected: holdInfo.rejected });
@@ -1701,28 +1715,53 @@ export class SessionControlService {
                   if (['link', 'session'].includes(e?.kind) && typeof e?.hub_session_id === 'string' && e.hub_session_id &&
                       !seenLinks.has(e.hub_session_id)) { seenLinks.add(e.hub_session_id); linkIds.push(e.hub_session_id); }
                 }
-                // Supersession is live work replacing live work. A manual link
-                // of an already ended session (27505f04 AC8) sits later in the
-                // ledger than older links but names a terminal row, so it must
-                // never cancel a held intent that still waits for placement.
-                // Only a known-terminal row is historical; a missing row keeps
-                // the old fail-closed yield, and one indexed read covers the batch.
-                const terminalStates = ['stopped', 'finished', 'failed', 'refused', 'cancelled'];
-                const rowState = new Map<string, string>();
+                // A linked row supersedes a held intent only when it is known
+                // live and was created strictly later. Older links and missing
+                // rows are historical/unknown, not evidence that the held
+                // intent was replaced. Observed-native rows also need a fresh
+                // session observation; otherwise a stale shell record can
+                // cancel a start while the host has not seen it for hours.
+                const linkedRows = new Map<string, any>();
                 for (let i = 0; i < linkIds.length; i += 200) {
-                  for (const s of this.sql.exec('SELECT id, state FROM session_control_sessions WHERE id IN (SELECT value FROM json_each(?))',
-                    JSON.stringify(linkIds.slice(i, i + 200))).toArray() as any[]) rowState.set(String(s.id), String(s.state));
+                  for (const s of this.sql.exec(`SELECT id, state, created_at, updated_at, actor, engine, machine_id,
+                    fleet_launch_id, request_json, binding_json FROM session_control_sessions
+                    WHERE id IN (SELECT value FROM json_each(?))`, JSON.stringify(linkIds.slice(i, i + 200))).toArray() as any[]) {
+                    linkedRows.set(String(s.id), s);
+                  }
                 }
-                const newer = linkIds.filter(id => id !== row.id && !(rowState.get(id) && terminalStates.includes(rowState.get(id)!)));
-                let supersededBy: string | null = (linkIds.includes(row.id) && newer.length) ? newer[newer.length - 1] : null;
-                if (!supersededBy && isRecovery) {
-                  const siblings = this.sql.exec(
-                    "SELECT id, state, created_at FROM session_control_sessions WHERE id <> ? AND json_extract(CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END, '$.intake_task_id') = ? AND state IN ('queued','offered','starting','running','uncertain','held') ORDER BY created_at DESC, id DESC LIMIT 16",
-                    row.id, req.intake_task_id,
-                  ).toArray() as any[];
-                  const winningSibling = siblings.find(s => s.state !== 'held' || s.created_at > row.created_at || (s.created_at === row.created_at && s.id > row.id));
-                  if (winningSibling) supersededBy = String(winningSibling.id);
-                }
+                const heldCreatedAt = Date.parse(row.created_at);
+                const isLiveReplacement = (s: any): boolean => {
+                  if (!s || s.id === row.id) return false;
+                  if (!['queued', 'held', 'offered', 'starting', 'running', 'uncertain'].includes(String(s.state))) return false;
+                  const createdAt = Date.parse(String(s.created_at));
+                  if (!Number.isFinite(createdAt) || !Number.isFinite(heldCreatedAt) || createdAt <= heldCreatedAt) return false;
+                  const linkedRequest = parsed(s.request_json, {});
+                  const linkedBinding = parsed(s.binding_json, null);
+                  const observedNative = (s.actor === 'unknown' || linkedRequest.provenance === 'observed_native' ||
+                    linkedBinding?.provenance === 'observed_native') && !s.fleet_launch_id;
+                  if (observedNative) {
+                    try {
+                      if (typeof linkedBinding?.native_id !== 'string' || !s.machine_id) return false;
+                      const observed: any = this.sql.exec(`SELECT f.native_id, f.tag, f.engine, f.phase, f.workspace,
+                        f.created_at_ms, c.observed_at AS census_at, c.complete AS census_complete
+                        FROM fleet_sessions f LEFT JOIN fleet_catalog_census c ON c.machine_id = f.machine_id
+                        WHERE f.machine_id = ? AND f.native_id = ?`, s.machine_id, linkedBinding.native_id).toArray()[0];
+                      const censusAt = Date.parse(String(observed?.census_at ?? ''));
+                      if (!observed || observed.census_complete !== 1 || !Number.isFinite(censusAt) ||
+                          censusAt > now + 60000 || now - censusAt > 180000 ||
+                          !['starting', 'running'].includes(String(observed.phase))) return false;
+                      if ((linkedBinding.tag && observed.tag !== linkedBinding.tag) ||
+                          (linkedBinding.workspace && observed.workspace !== linkedBinding.workspace) ||
+                          (s.engine && observed.engine !== s.engine) ||
+                          (Number.isSafeInteger(linkedBinding.native_created_at_ms) &&
+                            observed.created_at_ms !== linkedBinding.native_created_at_ms)) return false;
+                    } catch { return false; }
+                  }
+                  return true;
+                };
+                const candidates = linkIds.map(id => linkedRows.get(id)).filter(isLiveReplacement)
+                  .sort((a: any, b: any) => Date.parse(String(b.created_at)) - Date.parse(String(a.created_at)) || String(b.id).localeCompare(String(a.id)));
+                let supersededBy: string | null = candidates.length ? String(candidates[0].id) : null;
                 if (supersededBy) {
                   const at = this.at();
                   const supersededHold = JSON.stringify({
@@ -1736,8 +1775,9 @@ export class SessionControlService {
                   continue;
                 }
               }
-            } catch {}
+            } catch { dependencyGateUnknown = true; }
           }
+          if (dependencyGateUnknown) continue;
           // Intake worktree rules from POST /api/sessions apply on re-placement:
           // a worktree another intake owns or that was removed never clears
           // (cancel); an intake's recorded host pins the re-placement.
@@ -2572,8 +2612,8 @@ export class SessionControlService {
       // null / blank intake_task_id means "missing" so the TBM gate can return
       // intake_task_id_required instead of a generic invalid_session_request.
       if (input.intake_task_id === null || input.intake_task_id === '') delete input.intake_task_id;
-      if (!obj(input, ['key', 'engine', 'engine_override_reason', 'tier', 'effort', 'machine', 'needs', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id', 'intake_task_id', 'with_goal', 'task_kind', 'intake_worktree', 'repo'])) {
-        const allowed = new Set(['key', 'engine', 'engine_override_reason', 'tier', 'effort', 'machine', 'needs', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id', 'intake_task_id', 'with_goal', 'task_kind', 'intake_worktree', 'repo']);
+      if (!obj(input, ['key', 'engine', 'engine_override_reason', 'tier', 'effort', 'machine', 'needs', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id', 'intake_task_id', 'with_goal', 'task_kind', 'intake_worktree', 'repo', 'force'])) {
+        const allowed = new Set(['key', 'engine', 'engine_override_reason', 'tier', 'effort', 'machine', 'needs', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id', 'intake_task_id', 'with_goal', 'task_kind', 'intake_worktree', 'repo', 'force']);
         const field = input && typeof input === 'object' && !Array.isArray(input)
           ? Object.keys(input).find(k => !allowed.has(k)) : undefined;
         return response({ error: 'invalid_session_request', ...(field ? { field, detail: 'unknown_field' } : { detail: 'invalid_object' }) }, 400);
@@ -2680,6 +2720,8 @@ export class SessionControlService {
       }
       if (driverScoped && (typeof input.intake_task_id !== 'string' || mode !== 'headless' ||
           input.engine !== undefined || input.machine !== undefined)) return response({ error: 'driver_scope_forbidden' }, 403);
+      if (input.force !== undefined && typeof input.force !== 'boolean') return response({ error: 'invalid_session_request', field: 'force' }, 400);
+      if (input.force === true && (!caller.isAdmin || !auth.scopes?.includes('admin'))) return response({ error: 'forbidden' }, 403);
       const worker = workerAccessContext(this.sql, caller.tokenId);
       if (worker) {
         const intake = input.intake_task_id;
@@ -2746,6 +2788,7 @@ export class SessionControlService {
         }
         const sessionType = mode === 'interactive' ? 'aplexer' : 'headless';
         const canonical = JSON.stringify({
+          ...(input.force === true ? { force: true } : {}),
           ...(input.task_kind !== undefined ? {task_kind:input.task_kind} : {}),
           ...(input.effort !== undefined ? {effort:input.effort} : {}),
           engine: input.engine ?? null, engine_override_reason: (input as any).engine_override_reason ?? null,
@@ -2830,6 +2873,11 @@ export class SessionControlService {
           }
           const ac = data ? data.acceptance_criteria : undefined;
           const taskStatus = data?.status;
+          // Fail closed: if the graph cannot be read the start is refused, never allowed.
+          let blockers: string[];
+          try { blockers = new IntakeDependencies(this.sql).view(row.id).blocked_by; }
+          catch { return response({ error: 'dependency_check_failed' }, 503); }
+          if (blockers.length && input.force !== true) return response({ error: 'intake_dependencies_unresolved', blocked_by: blockers }, 409);
           if (taskStatus === 'done' || taskStatus === 'cancelled') return response({ error: 'intake_task_closed' }, 409);
           if (typeof ac !== 'string' || !ac.trim()) return response({ error: 'acceptance_criteria_required' }, 400);
         }

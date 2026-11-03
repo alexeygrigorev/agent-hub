@@ -16,12 +16,14 @@ import { IntakeWorktrees, WorktreeError } from './intake-worktrees';
 import { externalSession } from './intake-external';
 import { MergeGate, MergeGateError, mergeGateTick, type MergeGateHooks } from './merge-gate';
 import { projectVisibleIntakeStats, readStatsSources, intakeStatsTable } from './intake-stats';
+import { IntakeDependencies } from './intake-dependencies';
 
 /** Context changes invalidate old completion claims; notes never grant launch authority. */
 export function currentHistory(task: Obj): Obj[] {
-  const history: Obj[] = task.history ?? [];
+  const history: Obj[] = readEvents(task);
   const boundary = history.reduce((n, e, i) =>
-    e.kind === 'update' && ['status', 'title', 'project', 'acceptance_criteria'].some(k => k in (e.changes ?? {})) ? i : n, -1);
+    ((e.kind === 'update' && ['status', 'title', 'project', 'acceptance_criteria'].some(k => k in (e.changes ?? {}))) ||
+      (e.kind === 'dependency' && ['added', 'prerequisite_reopened'].includes(e.action))) ? i : n, -1);
   return history.slice(boundary + 1);
 }
 function currentDoneNote(task: Obj): Obj | undefined {
@@ -54,7 +56,11 @@ export function intakeCompletionHoldReason(task: Obj): string | null {
  * creates the Hub session through the canonical session-control service with
  * the caller's own auth, so placement is never duplicated and session
  * identities are never invented here. Absent outside the Hub composition. */
-export type IntakeHooks = { queue?: (tasks: Obj[]) => Obj; forgotten?: (tasks: Obj[]) => Obj; startSession?: (input: Obj, auth: Auth) => Promise<{ status: number; body: any }> };
+export type IntakeHooks = { queue?: (tasks: Obj[]) => Obj; forgotten?: (tasks: Obj[]) => Obj; startSession?: (input: Obj, auth: Auth) => Promise<{ status: number; body: any }>;
+  /** A prerequisite was filed for a parent: rank it at the parent's priority or higher in the existing restart queue. */
+  prerequisiteCreated?: (prerequisiteId: string, parentId: string) => void;
+  /** Parents whose last prerequisite is DONE: re-enter the existing restart queue now. */
+  parentsUnblocked?: (parentIds: string[]) => void };
 /** Soft intake capacity (t1038u): no hard 507 refuse on task row count for create.
  * `tasks` remains only as a schema safety-net ceiling (very high). Open (non-terminal)
  * count > OPEN_INTAKE_WARN_THRESHOLD emits a warning requiring DONE evidence before close. */
@@ -64,6 +70,26 @@ export const INTAKE_LIMITS = { request: 32768, tasks: 10000, taskBytes: 131072, 
   // has a separate 256 MiB planning budget below the Free plan's 1 GB/DO.
   grants: 256, rules: 128, receipts: 8192, totalBytes: 128 * 1024 * 1024, page: 100 };
 export const INTAKE_RETAINED_WARN_BYTES = 256 * 1024 * 1024;
+/** Pinned listing sessions (intake 08658ee8 AC1): 15 minutes covers a slow
+ * walk over every open intake; concurrent sessions are bounded and the
+ * oldest is evicted first. Token use is bound to the creating caller. */
+const LISTING_LIMITS = { ttlMs: 15 * 60_000, concurrent: 16 };
+type Listing = { token: string; ids: string[]; rules: Obj[]; revision: number; created: number; expires: number; actor: string | null; admin: boolean };
+/** Intake 08658ee8 AC2: server-side dedup search. Case-insensitive substring
+ * over title, project, the original intake text and the bounded context fields. */
+function searchQuery(url: URL): string | null {
+  const raw = url.searchParams.get('q');
+  if (raw === null) return null;
+  const q = raw.trim().toLowerCase();
+  if (!q) return null;
+  if (q.length > 128) throw new IntakeError('invalid_search', 400, 'q');
+  return q;
+}
+function matchesQuery(task: Obj, q: string): boolean {
+  const intake = (task.history ?? []).find((e: Obj) => e.kind === 'intake');
+  return [task.title, task.project, intake?.text, task.current_state, task.next_step]
+    .some((value: any) => typeof value === 'string' && value.toLowerCase().includes(q));
+}
 const HOT_TASKS = "json_extract(data,'$.archived_at') IS NULL AND json_extract(data,'$.status') NOT IN ('done','cancelled')";
 const ROW_BYTES = 'length(CAST(data AS BLOB))+length(CAST(id AS BLOB))';
 /** SQL aggregates avoid loading retained response snapshots into Worker memory. */
@@ -103,6 +129,13 @@ export function activeAssignmentEventIds(task: Obj): Set<string> {
         typeof event.hub_session_id === 'string' && active.has(event.hub_session_id)) protectedIds.add(event.id);
   }
   return protectedIds;
+}
+/** Read-path history scan (intake aefcc150): legacy and service writers may
+ * leave non-object or partial entries in the stored array. Derived projections
+ * skip those instead of throwing; the raw history array is still returned
+ * verbatim in payload_data. Unknown kinds are preserved, never rejected. */
+function readEvents(task: Obj): Obj[] {
+  return Array.isArray(task?.history) ? task.history.filter((e: Obj) => e !== null && typeof e === 'object') : [];
 }
 /** Scoped worker denials keep their specific code; everything else stays generic (no oracle). */
 async function denialCode(error: Response): Promise<string> {
@@ -152,11 +185,11 @@ const encoded = (value: unknown) => new TextEncoder().encode(JSON.stringify(valu
 // the caller's transaction. Failed validation/service capacity checks write nothing.
 const pendingNoteArchives = new WeakMap<object, Obj[]>();
 function prepareIntakeHistory(task: Obj, reserveEvents = 0) {
-  const history: Obj[] = task.history ?? [];
+  const history: Obj[] = Array.isArray(task.history) ? task.history : [];
   const pressured = encoded(task) > INTAKE_LIMITS.taskBytes || history.length + reserveEvents > INTAKE_LIMITS.events;
   if (!pressured && !task._history_order) return;
   // Legacy malformed identities cannot be silently rewritten or reordered.
-  if (history.some(e => typeof e.id !== 'string') || new Set(history.map(e => e.id)).size !== history.length) return;
+  if (history.some(e => !e || typeof e !== 'object' || typeof e.id !== 'string') || new Set(history.map(e => e?.id)).size !== history.length) return;
   const previous = task._history_order ?? {};
   let next = task._history_next_seq ?? 0;
   const order: Obj = Object.create(null);
@@ -170,9 +203,9 @@ function prepareIntakeHistory(task: Obj, reserveEvents = 0) {
     // Completion claims and every structured event retain their live semantics;
     // when ordinary notes are exhausted and event count overflows, archive
     // worktree or superseded link events while keeping the latest link inline.
-    let index = history.findIndex((e, i) => i > 0 && e.kind === 'note' && !/^\s*(?:DONE\b|START(?:ED)?\b|ORIGINAL FINAL STATE\b|TRIAGE (?:ACTUAL|DONE|OBSOLETE|DUPLICATE)\b|VERIFICATION (?:FAILED|SKIPPED)\b)/im.test(e.text ?? ''));
+    let index = history.findIndex((e, i) => i > 0 && e !== null && typeof e === 'object' && e.kind === 'note' && !/^\s*(?:DONE\b|START(?:ED)?\b|ORIGINAL FINAL STATE\b|TRIAGE (?:ACTUAL|DONE|OBSOLETE|DUPLICATE)\b|VERIFICATION (?:FAILED|SKIPPED)\b)/im.test(e.text ?? ''));
     if (index < 0 && history.length + reserveEvents > INTAKE_LIMITS.events) {
-      index = history.findIndex((e, i) => i > 0 && (e.kind === 'worktree' || (e.kind === 'link' && history.slice(i + 1).some(later => later.kind === 'link'))));
+      index = history.findIndex((e, i) => i > 0 && e !== null && typeof e === 'object' && (e.kind === 'worktree' || (e.kind === 'link' && history.slice(i + 1).some(later => later !== null && typeof later === 'object' && later.kind === 'link'))));
     }
     if (index < 0) break;
     const event = history[index];
@@ -310,7 +343,7 @@ export function recordIntakeSessionLink(sql: SqlStorage, session: Obj, now: numb
   if (!rows.length && taskId.length >= 6) rows = sql.exec("SELECT data FROM intake_tasks WHERE id LIKE ? || '%' LIMIT 2", taskId).toArray();
   if (rows.length !== 1) return false; // pruned, missing or ambiguous historical task
   const task = JSON.parse(rows[0].data);
-  if (task.history.some((e: Obj) => ['link', 'session'].includes(e.kind) && e.hub_session_id === session.id)) return false;
+  if (task.history.some((e: Obj) => e !== null && typeof e === 'object' && ['link', 'session'].includes(e.kind) && e.hub_session_id === session.id)) return false;
   prepareIntakeHistory(task, 1);
   if (task.history.length >= INTAKE_LIMITS.events) throw new IntakeSessionLinkError('history_capacity');
   const binding = JSON.parse(session.binding_json || '{}');
@@ -361,11 +394,13 @@ export type IntakeCloseGate = (task: Obj, unverified: boolean) => { code: string
 export class IntakeService {
   public worktrees: IntakeWorktrees;
   public mergeGate: MergeGate;
+  public dependencies: IntakeDependencies;
   private closeGates: IntakeCloseGate[] = [];
   addCloseGate(gate: IntakeCloseGate) { this.closeGates.push(gate); }
   constructor(public sql: SqlStorage, private tx: Tx = <T>(fn: () => T) => fn(), private hooks: IntakeHooks = {}) {
     this.worktrees = new IntakeWorktrees(sql);
     this.mergeGate = new MergeGate(sql);
+    this.dependencies = new IntakeDependencies(sql);
     this.worktrees.listener = {
       record: (taskId, row) => this.mergeGate.noteWorktree(taskId, this.get('tasks', taskId)?.project ?? null, row as any),
       status: (taskId, status) => this.mergeGate.noteStatus(taskId, status),
@@ -375,6 +410,10 @@ export class IntakeService {
     this.tx(() => {
       this.worktrees.init();
       this.mergeGate.init();
+      this.dependencies.init();
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS intake_decomposition_sessions (
+        session_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, project TEXT NOT NULL,
+        created_at INTEGER NOT NULL, child_count INTEGER NOT NULL DEFAULT 0)`);
       this.sql.exec('CREATE TABLE IF NOT EXISTS intake_meta (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL)');
       this.sql.exec('INSERT OR IGNORE INTO intake_meta VALUES(1,0)');
       for (const table of ['tasks', 'grants', 'rules', 'receipts']) {
@@ -385,14 +424,16 @@ export class IntakeService {
       this.sql.exec('CREATE TABLE IF NOT EXISTS intake_task_projection(id TEXT PRIMARY KEY, data TEXT NOT NULL, links TEXT NOT NULL)');
       // Only events consumed by status/continuation enter this projection.
       // Notes and original audit bodies remain exclusively in the full ledger.
+      // Non-object entries (legacy/service writers) are skipped: json() on a
+      // bare scalar string is malformed JSON and would abort the write (aefcc150).
       const project = (prefix: string) => `json_set(json_remove(${prefix}data,'$.history'), '$.history',
         json((SELECT json_group_array(json(CASE WHEN json_extract(e.value,'$.kind')='intake' THEN
             json_object('kind','intake','text',CASE WHEN json_type(e.value,'$.text')='null' THEN NULL ELSE '' END,
               'transcription',json_extract(e.value,'$.transcription'), 'source',json_object('reference',json_extract(e.value,'$.source.reference')))
             ELSE e.value END)) FROM json_each(${prefix}data,'$.history') e
-          WHERE json_extract(e.value,'$.kind') IN ('intake','link','report','commit','followup','blocker','pending_approval','resolution','approval_decision')))),
+          WHERE e.type='object' AND json_extract(e.value,'$.kind') IN ('intake','link','report','commit','followup','blocker','pending_approval','resolution','approval_decision')))),
         (SELECT json_group_array(json(e.value)) FROM json_each(${prefix}data,'$.history') e
-         WHERE json_extract(e.value,'$.kind') IN ('link','report'))`;
+         WHERE e.type='object' AND json_extract(e.value,'$.kind') IN ('link','report'))`;
       if (!projectionExists) this.sql.exec(`INSERT INTO intake_task_projection SELECT id, ${project('')} FROM intake_tasks`);
       for (const op of ['INSERT', 'UPDATE']) this.sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_projection_${op.toLowerCase()} AFTER ${op} ON intake_tasks BEGIN
         INSERT INTO intake_task_projection(id,data,links) SELECT NEW.id, ${project('NEW.')}
@@ -426,7 +467,7 @@ export class IntakeService {
           const hot = table === 'tasks' ? `CASE WHEN json_extract(${c('data')},'$.archived_at') IS NULL AND json_extract(${c('data')},'$.status') NOT IN ('done','cancelled') THEN ${bytes} ELSE 0 END`
             : ['grants', 'rules'].includes(table) ? bytes : '0';
           const events = table === 'tasks' ? `COALESCE(length(CAST(json_extract(${c('data')},'$.history') AS BLOB)),0)` : '0';
-          const original = table === 'tasks' ? `(SELECT COALESCE(SUM(length(CAST(e.value AS BLOB))),0) FROM json_each(json_extract(${c('data')},'$.history')) e WHERE json_extract(e.value,'$.kind')='intake')` : '0';
+          const original = table === 'tasks' ? `(SELECT COALESCE(SUM(length(CAST(e.value AS BLOB))),0) FROM json_each(json_extract(${c('data')},'$.history')) e WHERE e.type='object' AND json_extract(e.value,'$.kind')='intake')` : '0';
           return [bytes, hot, events, original, '1'];
         };
         // Only the first migration reads old retained data. Subsequent cold
@@ -646,16 +687,20 @@ export class IntakeService {
     if (!binding || c.token_hash !== caller.tokenHash || binding.actor !== caller.actor) fail('forbidden', 403);
     const worker = workerAccessContext(this.sql, c.id);
     if (JSON.parse(c.scopes).includes(WORKER_SCOPE)) {
-      if (!worker || worker.actor !== binding.actor) fail('forbidden', 403);
+      if (!worker || worker.actor !== binding.actor || typeof worker.task_project !== 'string') fail('forbidden', 403);
       const triage = triageTargets(this.sql, worker.session_id);
       // Follow-up intakes this session filed; worker writes stay limited to note/report/blocker events.
       const created = workerCreatedTargets(this.sql, worker.session_id);
       // ...and intakes a server-verified link ties to this session (continuations).
       const linked = workerLinkedTargets(this.sql, worker);
+      const writeTargets = [...new Set([worker.task_id, ...triage, ...created, ...linked])]
+        .filter(target => this.get('tasks', target)?.project === worker.task_project && target !== worker.task_id);
       return { admin: false, worker: true, actor: binding.actor, identity: 'family:' + binding.family_id, caller, triage,
         worker_session_id: worker.session_id, worker_launch_id: worker.launch_id, worker_task_id: worker.task_id,
+        worker_project: worker.task_project,
         grants: [{ scope: 'task', target: worker.task_id, access: 'write', expires_at: worker.expires_at },
-          ...[...triage, ...created, ...linked].map(target => ({ scope: 'task', target, access: 'write', expires_at: worker.expires_at }))],
+          ...(typeof worker.task_project === 'string' ? [{ scope: 'project', target: worker.task_project, access: 'read', expires_at: worker.expires_at }] : []),
+          ...writeTargets.map(target => ({ scope: 'task', target, access: 'write', expires_at: worker.expires_at }))],
         valid_until: Math.min(Date.parse(c.expires_at), worker.expires_at) };
     }
     if (JSON.parse(c.scopes).includes(DRIVER_SCOPE)) {
@@ -711,8 +756,8 @@ export class IntakeService {
     return this.rows('rules').filter(r => r.project === null || tasks.some(t => t.project === r.project));
   }
   private unresolved(task: Obj): Obj[] {
-    const resolved = new Set(task.history.filter((e: Obj) => e.kind === 'resolution' || e.kind === 'approval_decision').map((e: Obj) => e.ref));
-    return task.history.filter((e: Obj) => ['followup', 'blocker', 'pending_approval'].includes(e.kind) && !resolved.has(e.id));
+    const resolved = new Set(readEvents(task).filter((e: Obj) => e.kind === 'resolution' || e.kind === 'approval_decision').map((e: Obj) => e.ref));
+    return readEvents(task).filter((e: Obj) => ['followup', 'blocker', 'pending_approval'].includes(e.kind) && !resolved.has(e.id));
   }
   /** Read-only lookup of a canonical Hub session row. The session-control
    * service owns these rows; intake never writes them. A missing table (older
@@ -730,8 +775,9 @@ export class IntakeService {
    * and keeps looking: a historical link never masks a live assignment, and
    * when only ended sessions remain the task is free for new work. */
   private activeAssignment(task: Obj): string | null {
-    for (let i = task.history.length - 1; i >= 0; i--) {
-      const e = task.history[i];
+    const events = readEvents(task);
+    for (let i = events.length - 1; i >= 0; i--) {
+      const e = events[i];
       if (e?.kind === 'link' && typeof e.hub_session_id === 'string' && SESSION_UUID.test(e.hub_session_id)) {
         const row = this.sessionRow(e.hub_session_id);
         // A missing row is unreadable custody: fail closed to unassigned, as before.
@@ -748,8 +794,10 @@ export class IntakeService {
    * not_visible marker (the link event itself already discloses the id). */
   private assignedSessions(task: Obj, p: Obj): Obj[] {
     const seen = new Set<string>(); const out: Obj[] = [];
-    for (let i = task.history.length - 1; i >= 0; i--) {
-      const e = task.history[i];
+    const events = readEvents(task);
+    for (let i = events.length - 1; i >= 0; i--) {
+      const e = events[i];
+      try {
       if (e?.kind === 'link' && e.evidence === 'external_live_verified' && e.native_id) {
         const key = 'external:' + e.host + '/' + e.native_id;
         if (!seen.has(key)) {
@@ -774,14 +822,23 @@ export class IntakeService {
         ...(row.state === 'held' ? { hold: e.assignment_hold ?? 'placement_pending' } : {}),
         engine: row.engine ?? null, mode: row.mode ?? null, fleet_launch_id: row.fleet_launch_id ?? null,
         binding, updated_at: row.updated_at ?? null, linkage: 'hub_session' });
+      } catch {
+        // One unreadable link entry (bad census row, corrupt JSON) must not
+        // 500 the whole history view (intake aefcc150): mark and continue.
+        out.push({ hub_session_id: typeof e?.hub_session_id === 'string' ? e.hub_session_id : null,
+          native_id: e?.native_id ?? null, linkage: 'unreadable_entry' });
+      }
     }
     return out;
   }
   private continuation(task: Obj): string {
+    const events = readEvents(task);
+    // Flag maintained by the graph writers and reconcile: no per-task SQL in list/status/handoff views.
+    if (task.dependency_blocked === true) return 'blocked';
     const pending = this.unresolved(task);
     if (task.status === 'pending_approval' || pending.some(e => e.kind === 'pending_approval')) return 'approval_blocked';
-    const pendingVoice = task.history.some((e: Obj, i: number) => e.kind === 'intake' && e.text === null &&
-      !task.history.slice(i + 1).some((later: Obj) => later.kind === 'intake' && later.transcription === 'provided' && later.source.reference === e.source.reference));
+    const pendingVoice = events.some((e: Obj, i: number) => e.kind === 'intake' && e.text === null &&
+      !events.slice(i + 1).some((later: Obj) => later.kind === 'intake' && later.transcription === 'provided' && later.source?.reference === e.source?.reference));
     if (task.uncertainty || pendingVoice) return 'uncertain';
     if (task.status === 'blocked' || pending.some(e => e.kind === 'blocker')) return 'blocked';
     if (task.status === 'in_progress') return 'active';
@@ -801,7 +858,7 @@ export class IntakeService {
       ...(status.stale_policy ? { stale_policy: true } : {}),
     };
   }
-  private taskView(task: Obj, p: Obj): Obj {
+  private taskView(task: Obj, p: Obj, graphs?: Map<string, any>): Obj {
     const { title, current_state, next_step, owner, uncertainty, acceptance_criteria, history, history_archive,
       _history_order, _history_next_seq, ...identity } = task;
     const latestArchivedSequence = history_archive?.count
@@ -810,7 +867,9 @@ export class IntakeService {
     const archiveView = history_archive ? { ...history_archive,
       ...(Number.isSafeInteger(latestArchivedSequence) ? { latest_sequence: latestArchivedSequence } : {}) } : undefined;
     const capacityWarning = taskCapacityWarning(task);
-    return { ...identity, control: { version: task.version, status: task.status, continuation_state: this.continuation(task),
+    const graph = { ...(graphs ?? this.dependencies.viewMany([task.id])).get(task.id)! };
+    graph.dependencies = graph.dependencies.map(({ project, ...d }: Obj) => project != null && this.allowed(p, { id: d.id, project }) ? d : { ...d, title: null, status: 'not_visible' });
+    return { ...identity, ...graph, control: { version: task.version, status: task.status, continuation_state: this.continuation(task),
       authority: 'hub_ledger_cas', execution_evidence: 'not_verified_by_intake' },
       ...(archiveView ? { history_archive: archiveView } : {}),
       ...(capacityWarning ? { capacity_warning: capacityWarning } : {}),
@@ -819,8 +878,13 @@ export class IntakeService {
       assigned_sessions: this.assignedSessions(task, p),
       worktrees: this.worktrees.list(task.id), close_gate: this.worktrees.gate(task.id), merge_state: this.mergeGate.get(task.id) };
   }
+  /** One batched dependency read for a page of tasks (never one query per task). */
+  private taskViews(tasks: Obj[], p: Obj): Obj[] {
+    const graphs = this.dependencies.viewMany(tasks.map(t => t.id));
+    return tasks.map(t => this.taskView(t, p, graphs));
+  }
   private view(task: Obj, p: Obj): Obj { return { ...this.taskView(task, p), operator_rules: this.rules([task]), data_notice: DATA_NOTICE }; }
-  private page(url: URL, items: Obj[], revision: number): Obj {
+  private pageLimit(url: URL): number {
     const rawLimit = url.searchParams.get('limit');
     let limit = 25;
     if (rawLimit !== null) {
@@ -829,6 +893,10 @@ export class IntakeService {
       if (requested < 1n) throw new IntakeError('limit_out_of_range', 400, 'limit');
       limit = Number(requested > BigInt(INTAKE_LIMITS.page) ? BigInt(INTAKE_LIMITS.page) : requested);
     }
+    return limit;
+  }
+  private page(url: URL, items: Obj[], revision: number): Obj {
+    const limit = this.pageLimit(url);
     const after = url.searchParams.get('after');
     if (after) credentialId(after);
     if (after && !url.searchParams.has('revision')) fail('revision_required');
@@ -837,11 +905,60 @@ export class IntakeService {
     const page = remaining.slice(0, limit);
     return { snapshot_version: revision, effective_limit: limit, items: page, next: remaining.length > limit ? page[page.length - 1].id : null, total: items.length };
   }
+  /** Intake 08658ee8 AC1: a listing token pins the matching id set (and operator
+   * rules) so paging through hundreds of intakes survives create/close churn
+   * instead of dying on the first stale_snapshot. Only ids are pinned — bounded
+   * memory — and each page re-checks authorization live. In-memory on the single
+   * Hub DO; a DO restart expires tokens and clients restart once on 410. */
+  private listings = new Map<string, Listing>();
+  private pruneListings(now = Date.now()) {
+    for (const [token, listing] of this.listings) if (listing.expires <= now) this.listings.delete(token);
+  }
+  private openListing(tasks: string[], rules: Obj[], revision: number, p: Obj): Listing {
+    this.pruneListings();
+    while (this.listings.size >= LISTING_LIMITS.concurrent) {
+      const oldest = [...this.listings.entries()].sort((a, b) => a[1].created - b[1].created)[0];
+      this.listings.delete(oldest[0]);
+    }
+    const now = Date.now();
+    const listing: Listing = { token: crypto.randomUUID(), ids: tasks, rules, revision, created: now, expires: now + LISTING_LIMITS.ttlMs, actor: typeof p.actor === 'string' ? p.actor : null, admin: !!p.admin };
+    this.listings.set(listing.token, listing);
+    return listing;
+  }
+  private listing(token: string, p: Obj): Listing {
+    this.pruneListings();
+    const listing = this.listings.get(token);
+    if (!listing || listing.expires <= Date.now() || listing.actor !== (typeof p.actor === 'string' ? p.actor : null) || listing.admin !== !!p.admin)
+      fail('list_token_expired', 410);
+    return listing!;
+  }
+  /** Serve one page from a pinned listing. Rows may have drifted, been archived
+   * or lost authorization since the pin; they are projected live and skipped
+   * when unauthorized or gone, while cursor positions ride the pinned ids. */
+  private pinnedPage(url: URL, listing: Listing, p: Obj): Obj {
+    const limit = this.pageLimit(url);
+    const after = url.searchParams.get('after');
+    if (after) credentialId(after);
+    const remaining = listing.ids.filter(id => !after || id > after);
+    const window = remaining.slice(0, limit);
+    const byId = new Map<string, Obj>();
+    for (let i = 0; i < window.length; i += 50) {
+      const chunk = window.slice(i, i + 50);
+      for (const row of this.sql.exec(`SELECT data FROM intake_tasks WHERE id IN (${chunk.map(() => '?').join(',')})`, ...chunk).toArray() as any[]) {
+        const task = JSON.parse(row.data); byId.set(task.id, task);
+      }
+    }
+    const page = window.map(id => byId.get(id)).filter((t): t is Obj => !!t && this.allowed(p, t));
+    return { snapshot_version: listing.revision, effective_limit: limit, items: page,
+      next: remaining.length > limit ? window[window.length - 1] : null, total: listing.ids.length };
+  }
   /** Full records are hydrated only after bounded metadata page selection. */
   private exportPage(url: URL, p: Obj, revision: number): Obj {
     if (url.searchParams.has('authorization_valid_until') && Number(url.searchParams.get('authorization_valid_until')) !== (p.valid_until ?? null)) fail('stale_snapshot', 409);
     if (!p.admin && url.searchParams.has('after') && !url.searchParams.has('authorization_valid_until')) fail('authorization_snapshot_required');
-    const page = this.page(url, [], revision); // shared limit/cursor/revision validation
+    const q = searchQuery(url);
+    const rawToken = url.searchParams.get('list_token');
+    if (rawToken !== null && rawToken !== 'new' && !/^[0-9a-f-]{36}$/.test(rawToken)) fail('invalid_list_token', 400);
     const status = url.searchParams.get('status'); const archived = url.searchParams.get('archived'); const all = url.searchParams.get('all');
     if (archived && archived !== 'true') fail('invalid_archived');
     if (all && all !== 'true') fail('invalid_all');
@@ -855,16 +972,88 @@ export class IntakeService {
     const filter: IntakeExportFilter = { project: url.searchParams.get('project'),
       statuses: openSet ? OPEN : status && status !== 'all' ? [status] : defaultOpen ? OPEN : null,
       archived: archived === 'true' ? 1 : defaultOpen ? 0 : null };
+    const rulesFor = (): Obj[] => this.rows('rules').filter(rule => rule.project === null ||
+      (typeof rule.project === 'string' && (filter.project === null || rule.project === filter.project) && intakeExportCounts(this.sql, p, rule.project).some(r => intakeExportMatches(r, filter))));
+    const warnFor = () => this.intakeOpenWarning(p);
+    // Intake 08658ee8 AC1: a pinned token walk skips the revision check, so
+    // create/close churn mid-walk cannot expire the cursor. Ids are pinned
+    // (bounded); bodies and authorization are re-read live per page.
+    if (rawToken !== null && rawToken !== 'new') {
+      const pinned = this.listing(rawToken, p);
+      const result = this.pinnedPage(url, pinned, p);
+      const warn = warnFor();
+      return { ...result, authorization_valid_until: p.valid_until ?? null,
+        items: result.items.map((t: Obj) => this.taskView(t, p)), operator_rules: pinned.rules, data_notice: DATA_NOTICE,
+        authorized_scope: p.admin ? 'operator_all' : 'explicit_grants_only',
+        completeness: 'The list_token pins the matching id set and operator rules; pages stay valid while intakes are created or closed, and item bodies are read live. Restart once on list_token_expired (410).',
+        list_token: pinned.token, list_expires_at: pinned.expires,
+        ...(p.admin ? { intake_storage_warning: this.storageWarning() } : {}), intake_policy: 'soft_unlimited_tasks_t1038u',
+        open_non_terminal_count: this.openNonTerminalCount(p), open_intake_warn_threshold: OPEN_INTAKE_WARN_THRESHOLD,
+        ...(warn ? { intake_open_warning: warn } : {}) };
+    }
+    // Full matching id set for a new pin or an explicit text search. Export
+    // ids keep the walk bounded; text matching hydrates bodies only when q is
+    // present (explicit dedup search, never the default list path).
+    const fullIds = (): string[] => {
+      const ids = intakeExportPageIds(this.sql, p, filter, null, INTAKE_LIMITS.tasks + 1).slice(0, INTAKE_LIMITS.tasks);
+      if (!q) return ids;
+      const out: string[] = [];
+      for (let i = 0; i < ids.length; i += 50) {
+        const chunk = ids.slice(i, i + 50);
+        const byId = new Map<string, Obj>();
+        for (const row of this.sql.exec(`SELECT data FROM intake_tasks WHERE id IN (${chunk.map(() => '?').join(',')})`, ...chunk).toArray() as any[]) {
+          const t = JSON.parse(row.data); byId.set(t.id, t);
+        }
+        for (const id of chunk) { const t = byId.get(id); if (t && matchesQuery(t, q)) out.push(id); }
+      }
+      return out;
+    };
+    if (rawToken === 'new') {
+      const ids = fullIds();
+      const pinned = this.openListing(ids, rulesFor(), revision, p);
+      const result = this.pinnedPage(url, pinned, p);
+      const warn = warnFor();
+      return { ...result, authorization_valid_until: p.valid_until ?? null,
+        items: result.items.map((t: Obj) => this.taskView(t, p)), operator_rules: pinned.rules, data_notice: DATA_NOTICE,
+        authorized_scope: p.admin ? 'operator_all' : 'explicit_grants_only',
+        completeness: 'The list_token pins the matching id set and operator rules; pages stay valid while intakes are created or closed, and item bodies are read live. Restart once on list_token_expired (410).',
+        list_token: pinned.token, list_expires_at: pinned.expires,
+        ...(p.admin ? { intake_storage_warning: this.storageWarning() } : {}), intake_policy: 'soft_unlimited_tasks_t1038u',
+        open_non_terminal_count: this.openNonTerminalCount(p), open_intake_warn_threshold: OPEN_INTAKE_WARN_THRESHOLD,
+        ...(warn ? { intake_open_warning: warn } : {}) };
+    }
+    if (q) {
+      // Revision-pinned search page (single-shot dedup without a token).
+      // For a churn-proof walk, start with list_token=new instead.
+      const ids = fullIds();
+      const tasks: Obj[] = [];
+      for (let i = 0; i < ids.length; i += 50) {
+        const chunk = ids.slice(i, i + 50);
+        for (const row of this.sql.exec(`SELECT data FROM intake_tasks WHERE id IN (${chunk.map(() => '?').join(',')})`, ...chunk).toArray() as any[]) {
+          const t = JSON.parse(row.data); if (this.allowed(p, t)) tasks.push(t);
+        }
+      }
+      tasks.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+      const result = this.page(url, tasks, revision);
+      const warn = warnFor();
+      return { ...result, authorization_valid_until: p.valid_until ?? null, items: result.items.map((t: Obj) => this.taskView(t, p)), operator_rules: rulesFor(), data_notice: DATA_NOTICE,
+        authorized_scope: p.admin ? 'operator_all' : 'explicit_grants_only',
+        completeness: 'All authorized matching records are included across pages at snapshot_version. Restart on stale_snapshot. For a churn-proof walk use list_token=new.',
+        ...(p.admin ? { intake_storage_warning: this.storageWarning() } : {}), intake_policy: 'soft_unlimited_tasks_t1038u',
+        open_non_terminal_count: this.openNonTerminalCount(p), open_intake_warn_threshold: OPEN_INTAKE_WARN_THRESHOLD,
+        ...(warn ? { intake_open_warning: warn } : {}) };
+    }
+    const page = this.page(url, [], revision); // shared limit/cursor/revision validation
     const total = intakeExportCounts(this.sql, p, filter.project).filter(r => intakeExportMatches(r, filter)).reduce((n, r) => n + Number(r.n), 0);
     const candidates = intakeExportPageIds(this.sql, p, filter, url.searchParams.get('after'), page.effective_limit + 1);
-    const items = candidates.slice(0, page.effective_limit).map(id => this.taskView(this.get('tasks', id)!, p));
+    const pageTasks = candidates.slice(0, page.effective_limit).map(id => this.get('tasks', id)!);
+    const items = this.taskViews(pageTasks, p);
     // Rules are capped at 128; check only their exact project counter keys.
-    const rules = this.rows('rules').filter(rule => rule.project === null ||
-      (typeof rule.project === 'string' && (filter.project === null || rule.project === filter.project) && intakeExportCounts(this.sql, p, rule.project).some(r => intakeExportMatches(r, filter))));
-    const warn = this.intakeOpenWarning(p);
+    const rules = rulesFor();
+    const warn = warnFor();
     return { ...page, total, items, next: candidates.length > page.effective_limit ? items[items.length-1].id : null,
       authorization_valid_until: p.valid_until ?? null, operator_rules: rules, data_notice: DATA_NOTICE,
-      authorized_scope: p.admin ? 'operator_all' : 'explicit_grants_only',
+      authorized_scope: p.admin ? 'operator_all' : p.worker ? 'worker_project' : 'explicit_grants_only',
       completeness: 'All authorized matching records are included across pages at snapshot_version. Restart on stale_snapshot.',
       ...(p.admin ? { intake_storage_warning: this.storageWarning() } : {}), intake_policy: 'soft_unlimited_tasks_t1038u',
       open_non_terminal_count: this.openNonTerminalCount(p), open_intake_warn_threshold: OPEN_INTAKE_WARN_THRESHOLD,
@@ -881,7 +1070,7 @@ export class IntakeService {
       .map(r => { const task = JSON.parse(r.data); const session = task.last_session_id ? this.sessionRow(task.last_session_id) : null;
         return { ...task, session: session ? (p.admin || session.actor === p.actor ? { id: session.id, state: session.state, updated_at: session.updated_at } : { id: session.id, linkage: 'not_visible' }) : null }; });
     return { snapshot_version: revision, as_of: Date.now(), freshness: 'transactional_current_read',
-      authorization_valid_until: p.valid_until ?? null, authorized_scope: p.admin ? 'operator_all' : 'explicit_grants_only',
+      authorization_valid_until: p.valid_until ?? null, authorized_scope: p.admin ? 'operator_all' : p.worker ? 'worker_project' : 'explicit_grants_only',
       total, counts, archived_count: archived, open_non_terminal_count: open, recent,
       status_authority: 'hub_ledger; session.state is canonical session control, not an acceptance claim', data_notice: DATA_NOTICE };
   }
@@ -1068,8 +1257,8 @@ export class IntakeService {
       else if (status && status !== 'all') tasks = tasks.filter(t => t.status === status);
       const result = this.page(url, tasks, revision);
       const warn = this.intakeOpenWarning(p);
-      return { ...result, authorization_valid_until: p.valid_until ?? null, items: result.items.map((t: Obj) => this.taskView(t, p)), operator_rules: this.rules(tasks),
-        data_notice: DATA_NOTICE, authorized_scope: p.admin ? 'operator_all' : 'explicit_grants_only',
+      return { ...result, authorization_valid_until: p.valid_until ?? null, items: this.taskViews(result.items, p), operator_rules: this.rules(tasks),
+        data_notice: DATA_NOTICE, authorized_scope: p.admin ? 'operator_all' : p.worker ? 'worker_project' : 'explicit_grants_only',
         completeness: 'All authorized matching records are included across pages at snapshot_version. Restart on stale_snapshot.',
         ...(p.admin ? { intake_storage_warning: this.storageWarning() } : {}),
         intake_policy: 'soft_unlimited_tasks_t1038u',
@@ -1121,7 +1310,7 @@ export class IntakeService {
       // Legacy service writers may append a structured event directly. Expose
       // its stable next sequence without mutating the ledger during a read.
       let next = task._history_next_seq ?? 0;
-      const inlineSequences = Object.fromEntries(task.history.map((event: Obj) => [event.id,
+      const inlineSequences = Object.fromEntries(readEvents(task).map((event: Obj) => [event.id,
         Object.hasOwn(task._history_order ?? {}, event.id) ? task._history_order[event.id] : next++]));
       return { snapshot_version: revision, task_id: task.id, task_version: task.version,
         items: page.map(row => ({ sequence: row.seq, event: JSON.parse(row.data) })),
@@ -1192,7 +1381,7 @@ export class IntakeService {
       fields = { rule_id: raw.rule_id, version: raw.version, source: source(raw.source) };
     } else if (kind === 'resolution' || kind === 'approval_decision') {
       keys(raw, ['kind', 'ref', 'text', 'source', ...(kind === 'approval_decision' ? ['decision'] : [])]);
-      const ref = task.history.find((e: Obj) => e.id === raw.ref);
+      const ref = readEvents(task).find((e: Obj) => e.id === raw.ref);
       if (!ref || !this.unresolved(task).some(e => e.id === raw.ref)) fail('unknown_obligation');
       if (kind === 'approval_decision') {
         this.operator(p); if (ref.kind !== 'pending_approval' || !['granted', 'denied', 'withdrawn'].includes(raw.decision)) fail('invalid_approval_decision');
@@ -1229,7 +1418,7 @@ export class IntakeService {
     } else if (kind === 'first_action' || kind === 'work_action') {
       keys(raw, ['kind', 'action_type', 'text', 'source', 'evidence_digest', 'native_session', 'host_id']);
       const isOwner = task.owner && task.owner === p.actor;
-      const isAssigned = task.history.some((e: Obj) => e.kind === 'assignment' && e.assignee === p.actor);
+      const isAssigned = readEvents(task).some((e: Obj) => e.kind === 'assignment' && e.assignee === p.actor);
       if (!p.admin && !isOwner && !isAssigned) fail('forbidden', 403);
       const action_type = raw.action_type ? str(raw.action_type, 64) : 'work_action';
       const text = str(raw.text, 8192, 'text');
@@ -1259,6 +1448,7 @@ export class IntakeService {
       const contributors = new Set<string>();
       if (Array.isArray(task.history)) {
         for (const item of task.history) {
+          if (!item || typeof item !== 'object') continue;
           if (item.kind === 'commit' && item.actor) contributors.add(item.actor);
           if (item.kind === 'report' && item.actor) contributors.add(item.actor);
           if ((item.kind === 'work_action' || item.kind === 'first_action') && item.actor) contributors.add(item.actor);
@@ -1292,7 +1482,7 @@ export class IntakeService {
       if (!/^[0-9a-f]{40}$/.test(source_sha)) fail('invalid_source_sha');
       const review_ref = str(raw.review_ref, 128);
 
-      const reviewEvent = task.history.find((e: Obj) =>
+      const reviewEvent = readEvents(task).find((e: Obj) =>
         e.kind === 'independent_review' && e.id === review_ref
       );
       if (!reviewEvent) fail('missing_independent_review', 409);
@@ -1302,6 +1492,7 @@ export class IntakeService {
       const reviewIndex = task.history.indexOf(reviewEvent);
       for (let j = reviewIndex + 1; j < task.history.length; j++) {
         const later = task.history[j];
+        if (!later || typeof later !== 'object') continue;
         if (later.kind === 'commit' && later.reference && later.reference.toLowerCase() !== source_sha) {
           fail('stale_reviewed_source', 409);
         }
@@ -1324,7 +1515,7 @@ export class IntakeService {
       const recipient = p.caller.actor;
       if (raw.recipient && raw.recipient !== recipient) fail('recipient_mismatch', 403);
 
-      const acceptedOutcome = task.history.slice().reverse().find((e: Obj) => e.kind === 'accepted_outcome' && e.verdict === 'accepted');
+      const acceptedOutcome = readEvents(task).slice().reverse().find((e: Obj) => e.kind === 'accepted_outcome' && e.verdict === 'accepted');
       if (!acceptedOutcome) fail('no_accepted_outcome', 409);
       if (raw.source_sha && raw.source_sha.toLowerCase() !== acceptedOutcome.source_sha.toLowerCase()) {
         fail('stale_outcome_source', 409);
@@ -1336,6 +1527,7 @@ export class IntakeService {
       const outcomeIndex = task.history.lastIndexOf(acceptedOutcome);
       for (let j = outcomeIndex + 1; j < task.history.length; j++) {
         const later = task.history[j];
+        if (!later || typeof later !== 'object') continue;
         if (later.kind === 'commit' && later.reference && later.reference.toLowerCase() !== acceptedOutcome.source_sha.toLowerCase()) {
           fail('stale_outcome_source', 409);
         }
@@ -1354,7 +1546,7 @@ export class IntakeService {
     } else if (kind === 'obligation') {
       keys(raw, ['kind', 'obligation_id', 'text', 'default_action', 'wait_s', 'deadline', 'source']);
       const obligationId = identifier(raw.obligation_id || crypto.randomUUID());
-      if (task.history.some((e: Obj) => e.kind === 'obligation' && e.obligation_id === obligationId)) {
+      if (readEvents(task).some((e: Obj) => e.kind === 'obligation' && e.obligation_id === obligationId)) {
         fail('duplicate_obligation_id', 409);
       }
       const text = str(raw.text, 8192, 'text');
@@ -1378,12 +1570,12 @@ export class IntakeService {
       };
     } else if (kind === 'obligation_response') {
       keys(raw, ['kind', 'ref', 'response_type', 'text', 'source']);
-      const ref = task.history.find((e: Obj) => e.obligation_id === raw.ref || e.id === raw.ref);
+      const ref = readEvents(task).find((e: Obj) => e.obligation_id === raw.ref || e.id === raw.ref);
       if (!ref) fail('unknown_obligation');
       const responseType = str(raw.response_type, 32);
       if (!['answer', 'proceed'].includes(responseType)) fail('invalid_response_type');
       const refId = ref.obligation_id || ref.id;
-      const priorResponses = task.history.filter((e: Obj) => e.kind === 'obligation_response' && e.ref === refId);
+      const priorResponses = readEvents(task).filter((e: Obj) => e.kind === 'obligation_response' && e.ref === refId);
       const hasAnswer = priorResponses.some((e: Obj) => e.response_type === 'answer');
       const hasProceeded = priorResponses.some((e: Obj) => e.response_type === 'proceed');
 
@@ -1486,8 +1678,142 @@ export class IntakeService {
       this.sql.exec('UPDATE intake_meta SET revision=revision+1 WHERE id=1');
     }
   }
+  /** Hold (or release) a parent according to its graph; only dependency-owned blocking is touched.
+   * Returns true when the parent was released to resume. Operator/approval holds stay intact. */
+  private applyGraph(task: Obj, actor: string, now: number, key?: string): boolean {
+    const blocked = this.dependencies.view(task.id).blocked_by.length > 0;
+    if (blocked) {
+      if (!task.dependency_blocked) {
+        task.dependency_previous_status = task.status; task.status = 'blocked'; task.dependency_blocked = true;
+        this.pushHistory(task, [{ kind: 'dependency', action: 'prerequisite_reopened' }], actor, now, key);
+      }
+      this.dependencies.markBlocked(task.id, now);
+      return false;
+    }
+    this.dependencies.clearBlocked(task.id);
+    if (!task.dependency_blocked) return false;
+    task.status = task.dependency_previous_status ?? 'open';
+    delete task.dependency_blocked; delete task.dependency_previous_status;
+    this.pushHistory(task, [{ kind: 'dependency', action: 'all_resolved', resume: 'queued' }], actor, now, key);
+    return true;
+  }
+  /** Parents of a task whose prerequisites may just have completed: reconcile only those (reverse-index probe, no scan). */
+  public reconcileParents(ids: string[], actor = 'hub:service:intake-dependencies'): string[] {
+    return this.tx(() => {
+      const released: string[] = [];
+      for (const id of ids) {
+        const task = this.get('tasks', id);
+        if (!task || task.archived_at || !OPEN.includes(task.status)) { this.dependencies.clearBlocked(id); continue; }
+        if (this.applyGraph(task, actor, Date.now())) released.push(task.id);
+      }
+      if (released.length) { this.sql.exec('UPDATE intake_meta SET revision=revision+1 WHERE id=1'); this.hooks.parentsUnblocked?.(released); }
+      return released;
+    });
+  }
+  /** Watchdog entry point: only parents currently held by their graph (indexed table), bounded. */
+  public reconcileDependencies(): string[] { return this.reconcileParents(this.dependencies.blockedParents(64)); }
+  private releaseDependentsOf(taskId: string) {
+    const parents = this.dependencies.dependentsOf(taskId);
+    if (parents.length) this.reconcileParents(parents);
+  }
+  private writeDependency(kind: 'depend' | 'blocker', task: Obj, b: Obj, p: Obj, now: number): Obj {
+    if (!OPEN.includes(task.status)) fail('intake_task_closed', 409);
+    this.expected(b, task.version);
+    let dependency: Obj;
+    let shared = false;
+    if (kind === 'blocker') {
+      keys(b, ['key', 'expected_version', 'title', 'text', 'acceptance_criteria', 'blocker_key']);
+      if (!hasAcceptanceCriteria(b)) fail('acceptance_criteria_required');
+      const blockerKey = b.blocker_key === undefined ? null : str(b.blocker_key, 160, 'blocker_key');
+      if (blockerKey !== null && !/^[A-Za-z0-9][A-Za-z0-9._:+-]{0,159}$/.test(blockerKey)) fail('invalid_blocker_key');
+      const existing = blockerKey ? this.dependencies.prerequisiteForBlocker(blockerKey) : null;
+      const reusable = existing ? this.get('tasks', existing) : undefined;
+      if (reusable && OPEN.includes(reusable.status) && !reusable.archived_at && reusable.project === task.project && reusable.id !== task.id) { dependency = reusable; shared = true; }
+      else {
+        dependency = this.createFollowup(task, b, p, now);
+        if (blockerKey) this.dependencies.rememberBlocker(blockerKey, dependency.id, now);
+      }
+    } else {
+      keys(b, ['key', 'expected_version', 'on', 'remove']);
+      if (b.remove !== undefined && typeof b.remove !== 'boolean') fail('invalid_field');
+      dependency = this.get('tasks', identifier(b.on))!;
+      const workerProjectLink = p.worker && dependency?.project === p.worker_project && dependency?.project === task.project;
+      if (!dependency || (!this.allowed(p, dependency, true) && !workerProjectLink) || dependency.project !== task.project) fail('not_found', 404);
+    }
+    if (b.remove === true) this.dependencies.remove(task.id, dependency.id);
+    else {
+      try { this.dependencies.add(task.id, dependency.id, p.actor); }
+      catch (e) { if (e instanceof Error && e.message === 'dependency_cycle') fail('dependency_cycle', 409); throw e; }
+    }
+    this.applyGraphForWrite(task, dependency, kind, shared, b, p, now);
+    if (kind === 'blocker' && !shared) this.hooks.prerequisiteCreated?.(dependency.id, task.id);
+    return { task: this.view(task, p), ...(kind === 'blocker' ? { followup: this.view(dependency, p), deduplicated: shared } : {}) };
+  }
+  private applyGraphForWrite(task: Obj, dependency: Obj, kind: string, shared: boolean, b: Obj, p: Obj, now: number) {
+    const graph = this.dependencies.view(task.id);
+    // Only dependency-owned blocking is cleared automatically; independent operator/approval holds stay.
+    if (graph.blocked_by.length) {
+      task.dependency_previous_status ??= task.status;
+      task.status = 'blocked'; task.dependency_blocked = true;
+      this.dependencies.markBlocked(task.id, now);
+    } else {
+      this.dependencies.clearBlocked(task.id);
+      if (task.dependency_blocked) {
+        task.status = task.dependency_previous_status ?? 'open';
+        delete task.dependency_blocked; delete task.dependency_previous_status;
+      }
+    }
+    this.pushHistory(task, [{ kind: 'dependency', dependency_id: dependency.id, action: b.remove === true ? 'removed' : 'added',
+      ...(kind === 'blocker' ? { blocker_report: b.text, ...(shared ? { shared_prerequisite: true } : {}) } : {}) }], p.actor, now, b.key);
+  }
+  /** Follow-up intake for a blocker, in the parent's project. A worker session may file it from its own
+   * project-scoped token; its AC is recorded with worker provenance and counted against the worker create cap. */
+  private createFollowup(parent: Obj, b: Obj, p: Obj, now: number): Obj {
+    const task: Obj = { id: crypto.randomUUID(), project: parent.project, title: str(b.title, 256, 'title'), status: 'open', version: 1,
+      created_at: now, updated_at: now, current_state: null, next_step: null, owner: null, uncertainty: null,
+      acceptance_criteria: acNullable(b.acceptance_criteria), history: [] };
+    if (p.worker) {
+      this.sql.exec(WORKER_CREATED_SCHEMA);
+      const count = (this.sql.exec('SELECT COUNT(*) AS n FROM worker_created_intakes WHERE session_id=?', p.worker_session_id).toArray()[0] as any).n;
+      if (count >= WORKER_CREATE_LIMIT) fail('worker_create_limit', 429);
+      task.created_by = { kind: 'worker_session', hub_session_id: p.worker_session_id, fleet_launch_id: p.worker_launch_id,
+        parent_intake_id: parent.id, actor: p.actor, captured_at: now, blocker_followup: true };
+      this.sql.exec('INSERT INTO worker_created_intakes(task_id,session_id,launch_id,parent_task_id,created_at) VALUES(?,?,?,?,?)',
+        task.id, p.worker_session_id, p.worker_launch_id, parent.id, now);
+    }
+    task.history.push(this.event({ kind: 'intake', text: b.text, source: { type: 'unknown' } }, task, p, now));
+    task.history[0].intake_key = b.key;
+    task.scope = scopeHint(task);
+    this.put('tasks', task);
+    return task;
+  }
+  /** Hub-owned blocker report (the watchdog files it when a held session hits its retry cap): same atomic
+   * create-or-share, link and block as the API, without a request. */
+  public serviceBlocker(parentId: string, input: { blocker_key: string; title: string; text: string; acceptance_criteria: string; actor: string },
+    now = Date.now()): { ok: true; followup_id: string; deduplicated: boolean } | { ok: false; error: string } {
+    try {
+      return this.tx(() => {
+        const task = this.get('tasks', parentId);
+        if (!task) return { ok: false as const, error: 'not_found' };
+        const admin = { admin: true, actor: input.actor, identity: 'service:' + input.actor, grants: [] as Obj[], worker: false };
+        const out: Obj = this.writeDependency('blocker', task, { key: 'blk-' + sha256Sync(parentId + ':' + input.blocker_key).slice(0, 24),
+          expected_version: task.version, title: input.title, text: input.text, acceptance_criteria: input.acceptance_criteria,
+          blocker_key: input.blocker_key }, admin, now);
+        this.sql.exec('UPDATE intake_meta SET revision=revision+1 WHERE id=1');
+        return { ok: true as const, followup_id: out.followup.id, deduplicated: out.deduplicated === true };
+      });
+    } catch (e) {
+      return { ok: false, error: e instanceof IntakeError ? e.code : 'blocker_failed' };
+    }
+  }
   private write(path: string, b: Obj, p: Obj): Obj {
     const now = Date.now();
+    const dependencyAction = /^\/tasks\/([A-Za-z0-9._:-]+)\/(depend|blocker)$/.exec(path);
+    if (dependencyAction) {
+      const task = this.get('tasks', dependencyAction[1]);
+      if (!task || !this.allowed(p, task, true)) fail('not_found', 404);
+      return this.writeDependency(dependencyAction[2] as 'depend' | 'blocker', task, b, p, now);
+    }
     if (path === '/tasks') {
       keys(b, ['key', 'project', 'title', 'text', 'source', 'transcription', 'acceptance_criteria', 'verification', 'priority']);
       const project = identifier(b.project);
@@ -1497,18 +1823,25 @@ export class IntakeService {
         priority: b.priority === undefined ? 'normal' : priorityValue(b.priority), promoted_at: null,
         ...(b.verification !== undefined ? { verification: verificationMode(b.verification) } : {}) };
       if (p.worker) {
-        // Intake 34d0271b: a worker may file follow-up intakes in any project.
-        // Provenance names the parent intake and the creating session. Open
-        // intakes with AC are auto-picked up (410caa75), so worker-authored AC
-        // would become launch authority: an operator adds AC/verification later.
-        if (b.acceptance_criteria != null || b.verification !== undefined) fail('worker_ac_forbidden', 403);
+        // A session token may file intakes only in its linked project's scope.
+        if (project !== p.worker_project) fail('worker_project_forbidden', 403);
+        const decomposition = this.sql.exec('SELECT child_count FROM intake_decomposition_sessions WHERE session_id=? AND task_id=? AND project=?',
+          p.worker_session_id, p.worker_task_id, project).toArray()[0] as any;
+        // Only a Hub-started deep decomposition session can author AC. Its
+        // session marker is recorded alongside the verified assignment link.
+        // Normal session-created intakes stay out of the autonomous launch pool.
+        if (b.acceptance_criteria != null && !decomposition) fail('worker_ac_forbidden', 403);
+        if (b.verification !== undefined) fail('worker_ac_forbidden', 403);
+        if (decomposition && !hasAcceptanceCriteria(task)) fail('worker_decomposition_ac_required', 400);
+        if (decomposition && Number(decomposition.child_count) >= 16) fail('worker_decomposition_limit', 429);
         this.sql.exec(WORKER_CREATED_SCHEMA);
         const count = (this.sql.exec('SELECT COUNT(*) AS n FROM worker_created_intakes WHERE session_id=?', p.worker_session_id).toArray()[0] as any).n;
         if (count >= WORKER_CREATE_LIMIT) fail('worker_create_limit', 429);
         task.created_by = { kind: 'worker_session', hub_session_id: p.worker_session_id, fleet_launch_id: p.worker_launch_id,
-          parent_intake_id: p.worker_task_id, actor: p.actor, captured_at: now };
+          parent_intake_id: p.worker_task_id, actor: p.actor, captured_at: now, ...(decomposition ? { decomposition_child: true } : {}) };
         this.sql.exec('INSERT INTO worker_created_intakes(task_id,session_id,launch_id,parent_task_id,created_at) VALUES(?,?,?,?,?)',
           task.id, p.worker_session_id, p.worker_launch_id, p.worker_task_id, now);
+        if (decomposition) this.sql.exec('UPDATE intake_decomposition_sessions SET child_count=child_count+1 WHERE session_id=? AND child_count<16', p.worker_session_id);
       } else if (!this.allowed(p, task, true)) fail('forbidden', 403);
       // t1038u: no hard task-row refuse on create; totalBytes/taskBytes/events still apply.
       // Soft warn when open count is high (surfaced on the response below).
@@ -1626,6 +1959,16 @@ export class IntakeService {
           : nullable(b[field], field === 'title' ? 256 : 8192);
         if (previous !== task[field]) changes[field] = task[field];
       }
+      // Explicit operator holds applied after linking outlive the graph-owned hold,
+      // including a blocked-to-blocked update that otherwise has no status delta.
+      if (task.dependency_blocked && 'status' in b) {
+        task.dependency_previous_status = task.status;
+        changes.status = task.status;
+      }
+      if ('project' in changes && this.sql.exec(`SELECT 1 FROM intake_dependencies d JOIN intake_tasks t
+        ON t.id=CASE WHEN d.task_id=? THEN d.dependency_id ELSE d.task_id END
+        WHERE (d.task_id=? OR d.dependency_id=?) AND json_extract(t.data,'$.project')<>? LIMIT 1`,
+        task.id, task.id, task.id, task.project).toArray().length) fail('dependency_project_conflict', 409);
       if (unverified && task.outcome === 'closed_unverified') { changes.outcome = 'closed_unverified'; changes.reason = task.lifecycle_reason; }
       // Post-DONE verification policy (d8d509d2 t1936u): required|skip|auto, default auto.
       if ('verification' in b) {
@@ -1676,13 +2019,15 @@ export class IntakeService {
    * session refuses a second assignment until that session leaves the active
    * set. The service-owned link verifies the Hub launch intent; native execution
    * remains separately observed through the session lifecycle. */
-  private async assign(taskId: string, raw: any, auth: Auth, json: (data: Obj, status?: number) => Response): Promise<Response> {
+  private async assign(taskId: string, raw: any, auth: Auth, json: (data: Obj, status?: number) => Response, decomposition = false): Promise<Response> {
     identifier(taskId);
     const b = object(raw);
     keys(b, ['key', 'expected_version', 'session', 'provenance', 'next_step', 'current_state', 'owner']);
     identifier(b.key);
     const session = object(b.session);
-    keys(session, ['engine', 'engine_override_reason', 'tier', 'machine', 'workspace', 'cwd', 'brief', 'access', 'mode', 'parent_id', 'with_goal']);
+    keys(session, ['engine', 'engine_override_reason', 'tier', 'machine', 'workspace', 'cwd', 'brief', 'access', 'mode', 'parent_id', 'with_goal', 'force']);
+    if (session.force !== undefined && typeof session.force !== 'boolean') fail('invalid_field');
+    if (session.force === true && !this.principal(auth).admin) fail('forbidden', 403);
     if (typeof session.workspace !== 'string' || !session.workspace) fail('invalid_field');
     const provenance = source(b.provenance);
     const fingerprint = canonical({ path: '/tasks/' + taskId + '/assign', payload: b });
@@ -1702,13 +2047,17 @@ export class IntakeService {
       const sessionKey = 'ia-' + sha256Sync(p.identity + ':' + taskId + ':' + b.key).slice(0, 24);
       let prior: any = null;
       try { prior = this.sql.exec('SELECT * FROM session_control_sessions WHERE actor=? AND request_key=?', p.actor, sessionKey).toArray()[0]; } catch { /* session service absent: assignment_unavailable below */ }
-      const ownLink = prior && task.history.find((e: Obj) => e.kind === 'link' && e.hub_session_id === prior.id && e.authority === 'hub_launch_verified');
+      const ownLink = prior && readEvents(task).find((e: Obj) => e.kind === 'link' && e.hub_session_id === prior.id && e.authority === 'hub_launch_verified');
       const version = previous?.started_version ?? task.version;
       const ownAdvance = !!ownLink && task.version === version + 1;
       this.expected(b, task.version - (ownAdvance ? 1 : 0));
       prepareIntakeHistory(task, ownLink ? 0 : 2);
       if (!ownLink && task.history.length >= INTAKE_LIMITS.events) fail('history_capacity', 507);
       if (!hasAcceptanceCriteria(task)) fail('acceptance_criteria_required', 400);
+      // Fail closed: if the graph cannot be read, the start is refused, never allowed.
+      let blockers: string[];
+      try { blockers = this.dependencies.view(task.id).blocked_by; } catch { throw new IntakeError('dependency_check_failed', 503); }
+      if (blockers.length && session.force !== true) throw new IntakeError('intake_dependencies_unresolved', 409, undefined, undefined, { blocked_by: blockers });
       const active = this.activeAssignment(task);
       if (active && active !== prior?.id) fail('active_assignment_exists', 409);
       // Persist the original assignment fingerprint before the async start.
@@ -1746,7 +2095,7 @@ export class IntakeService {
         if (previous.fingerprint !== fingerprint) fail('idempotency_conflict', 409);
         if (previous.response) return json(previous.response);
       }
-      const startLink = task.history.find((e: Obj) => e.kind === 'link' && e.hub_session_id === created.id && e.authority === 'hub_launch_verified');
+      const startLink = readEvents(task).find((e: Obj) => e.kind === 'link' && e.hub_session_id === created.id && e.authority === 'hub_launch_verified');
       // The canonical start committed our link. Only that one known version
       // advance belongs to this assignment; any concurrent edit still conflicts.
       this.expected(b, task.version - (startLink && task.version === pre.version + 1 ? 1 : 0));
@@ -1785,6 +2134,8 @@ export class IntakeService {
       this.put('tasks', task);
       const assigned = this.assignedSessions(task, fresh).find(s => s.hub_session_id === created.id) ??
         { hub_session_id: created.id, linkage: 'hub_session' };
+      if (decomposition) this.sql.exec(`INSERT INTO intake_decomposition_sessions(session_id,task_id,project,created_at,child_count)
+        VALUES(?,?,?,?,0) ON CONFLICT(session_id) DO NOTHING`, created.id, task.id, task.project, now);
       const response = { task: this.view(task, fresh), assigned_session: assigned,
         ...(created.state === 'held' ? { hold: created.hold ?? 'placement_pending', requested: created.requested } : {}),
         snapshot_version: this.revision() + 1, data_notice: DATA_NOTICE };
@@ -1936,6 +2287,7 @@ export class IntakeService {
       catch (e: any) { return { ok: false, error: e.code || 'storage_capacity' }; }
       this.put('tasks', task);
       this.sql.exec('UPDATE intake_meta SET revision=revision+1 WHERE id=1');
+      this.releaseDependentsOf(task.id);
       return { ok: true, task };
     });
   }
@@ -2027,6 +2379,15 @@ export class IntakeService {
       if (!['GET', 'POST'].includes(request.method)) return json({ error: 'method_not_allowed' }, 405);
       const payload = request.method === 'POST' ? await body(request) : null;
       const auth = await authenticate(); if (auth.error) return json({ error: await denialCode(auth.error) }, auth.error.status);
+      const decompose = request.method === 'POST' && /^\/api\/intake\/tasks\/([A-Za-z0-9._:-]+)\/decompose$/.exec(new URL(request.url).pathname);
+      if (decompose) {
+        const task = this.getAuthorizedTask(decompose[1], auth);
+        if (!task || !this.allowed(this.principal(auth), task, true)) fail('not_found', 404);
+        keys(payload!, ['key', 'expected_version', 'workspace']);
+        return await this.assign(task.id, { key: payload!.key, expected_version: payload!.expected_version,
+          provenance: { type: 'unknown' }, session: { workspace: payload!.workspace ?? task.project, tier: 'deep', mode: 'headless',
+            brief: `Decompose Hub intake ${task.id}. Read its full current AC and operator rules with hub intake show. Use deep reasoning to identify at most 16 bounded executable child intakes, each with concrete acceptance criteria. Create each child in project ${task.project} with hub intake create --project ${task.project} --title TITLE --text SUMMARY --acceptance-criteria 'CONCRETE AC' --key KEY. Link child prerequisites with hub intake depend CHILD --on PREREQUISITE and make the original depend on each child with hub intake depend ${task.id} --on CHILD. Preserve the original scope. Do not close or delete intakes. If blocked, run hub intake blocker with a follow-up title, text and acceptance criteria; never silently stop. Report child IDs and the dependency plan back to the original with hub intake append. A plan alone is not completion of the original.` } }, auth, json, true);
+      }
       const assignMatch = request.method === 'POST'
         ? /^\/tasks\/([A-Za-z0-9._:-]+)\/assign$/.exec(new URL(request.url).pathname.slice('/api/intake'.length))
         : null;
@@ -2045,7 +2406,8 @@ export class IntakeService {
           Object.keys(payload).every(k => ['key', 'expected_version', 'acceptance_criteria', 'project'].includes(k)) &&
           ('acceptance_criteria' in payload || 'project' in payload);
         const workerCreate = p.worker && path === '/tasks';
-        if (p.worker && !triageUpdate && !workerCreate && !/^\/tasks\/[^/]+\/merge-evidence$/.test(path)) {
+        const workerGraph = p.worker && /^\/tasks\/[^/]+\/(depend|blocker)$/.test(path);
+        if (p.worker && !triageUpdate && !workerCreate && !workerGraph && !/^\/tasks\/[^/]+\/merge-evidence$/.test(path)) {
           if (!/^\/tasks\/[^/]+\/events$/.test(path)) fail('forbidden', 403);
           const event = appendEvent(payload);
           if (!['note', 'report', 'blocker'].includes(event.kind)) fail('worker_event_forbidden', 403);
@@ -2054,7 +2416,7 @@ export class IntakeService {
           delete payload.text;
         }
         if (p.worker && /\/merge-evidence$/.test(path)) payload.event = undefined;
-        if (p.worker && !triageUpdate && !workerCreate && payload.event) payload.event = redactClaimData(payload.event);
+        if (p.worker && !triageUpdate && !workerCreate && !workerGraph && payload.event) payload.event = redactClaimData(payload.event);
         // Do not replay a private response after the caller loses its task/operator grant.
         if (path.startsWith('/rules') || path.startsWith('/grants')) this.operator(p);
         const taskMatch = /^\/tasks\/([^/]+)/.exec(path);
@@ -2069,7 +2431,9 @@ export class IntakeService {
         // Prune before any capacity check: a full receipts table must not
         // wedge every write forever, terminal payloads are archived and retained.
         this.prune(Date.now());
-        const response = { ...this.write(path, payload, p), snapshot_version: this.revision() + 1, data_notice: DATA_NOTICE };
+        const written = this.write(path, payload, p);
+        if (taskMatch) this.releaseDependentsOf(this.get('tasks', taskMatch[1])?.id ?? taskMatch[1]);
+        const response = { ...written, snapshot_version: this.revision() + 1, data_notice: DATA_NOTICE };
         this.sql.exec('UPDATE intake_meta SET revision=revision+1 WHERE id=1');
         this.put('receipts', { id, fingerprint, response, captured_at: Date.now() }); this.capacity();
         return json(response);

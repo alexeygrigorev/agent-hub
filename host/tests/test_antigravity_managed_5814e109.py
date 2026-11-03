@@ -93,8 +93,11 @@ def test_cli_import_sends_only_the_token_file_and_never_echoes_it(tmp_path, caps
 def test_requested_models_resolve_through_the_gemini_policy_family():
     from agent_hub_host.model_contract import policy_models
     policy = policy_models()
-    default = p.launcher_metadata('antigravity', {'args': []})['launcher_model']
-    assert p.managed_model_allowed('antigravity', default, policy)
-    assert p.managed_model_allowed('antigravity', 'gemini-4-argon-high', policy)
+    default = p.launcher_metadata('antigravity', {'args': []})
+    assert default['launcher_model'] == 'gemini-4-argon-medium'
+    assert default['launcher_effort'] == 'medium'
+    assert p.managed_model_allowed('antigravity', default['launcher_model'], policy)
+    assert p.managed_model_allowed('antigravity', 'gemini-4-argon-medium', policy)
+    assert not p.managed_model_allowed('antigravity', 'gemini-4-argon-high', policy)
     assert not p.managed_model_allowed('antigravity', 'opus', policy)
     assert not p.managed_model_allowed('antigravity', 'gemini-0-unknown', policy)
