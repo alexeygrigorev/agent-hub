@@ -69,9 +69,17 @@ export function nativeTerminalError(native: any): string | null {
         && p?.headless === false && ['zcodex_agent_exited', 'zcodex_reconnect_failed'].includes(p?.terminal_error)
         ? p.terminal_error : null;
     }
-    return ['running', 'starting', 'broken'].includes(native?.phase)
-      && native?.engine === 'codex' && p?.headless === false && p?.terminal_error === 'codex_reconnect_failed'
-      ? p.terminal_error : null;
+    if (native?.engine === 'codex') {
+      return ['running', 'starting', 'broken'].includes(native?.phase)
+        && p?.headless === false && p?.terminal_error === 'codex_reconnect_failed'
+        ? p.terminal_error : null;
+    }
+    if (native?.engine === 'claude') {
+      return ['running', 'starting', 'broken'].includes(native?.phase)
+        && p?.headless === false && p?.terminal_error === 'goal_rejected'
+        ? p.terminal_error : null;
+    }
+    return null;
   } catch { return null; }
 }
 
@@ -79,7 +87,8 @@ export function nativeTerminalError(native: any): string | null {
 export function sessionTerminalError(row: any, native: any): string | null {
   try {
     const binding = JSON.parse(row?.binding_json ?? 'null');
-    return row?.state === 'running' && row?.mode === 'interactive' && (row?.engine === 'codex' || row?.engine === 'zcodex')
+    return row?.state === 'running' && row?.mode === 'interactive'
+      && (row?.engine === 'codex' || row?.engine === 'zcodex' || row?.engine === 'claude')
       && native?.machine_id === row.machine_id && native?.native_id === binding?.native_id
       && native?.tag === binding?.tag && native?.workspace === binding?.workspace
       && Number.isInteger(binding?.native_created_at_ms) && binding.native_created_at_ms > 0

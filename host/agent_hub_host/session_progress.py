@@ -16,6 +16,8 @@ import re
 from pathlib import Path
 import time
 
+from .session_rules import GOAL_REJECTED_RE
+
 
 def event_ms(row):
     values = [row.get('reported_state_event_ms')]
@@ -94,7 +96,7 @@ class SessionProgress:
                             checked = r.get('screen_checked')
                             error = r.get('terminal_error')
                             if (type(checked) is int and 0 <= checked <= self.now_ms() + 60000
-                                    and error in (None, 'codex_reconnect_failed')):
+                                    and error in (None, 'codex_reconnect_failed', 'goal_rejected')):
                                 self.screen_checks[(r['id'], r['incarnation'])] = (checked, error)
                             if r.get('basis') != 'native_output_v2':
                                 self.samples[(r['id'], r['incarnation'])]['last'] = r['incarnation']
@@ -219,20 +221,36 @@ class SessionProgress:
         for row in ordered:
             key = (row.get('id'), row.get('created_at_ms'))
             progress = result.get(row.get('id'))
-            if (not self.screen or not progress or row.get('engine') != 'codex' or progress['headless']
-                    or (row.get('state') or row.get('phase')) in ('exited', 'dead', 'pruned', 'forgotten', 'stopped', 'unobserved', 'unknown')
-                    or now - self.samples[key]['last'] < 60000):
-                continue
+            command = row.get('command')
+            claude_goal = (row.get('engine') == 'claude' and isinstance(command, list)
+                           and any(isinstance(arg, str) and arg.startswith('/goal ')
+                                   for arg in command))
             checked, cached = self.screen_checks.get(key, (0, None))
+            if progress and cached and (not self.screen or now - checked < 60000):
+                if cached == 'goal_stalled':
+                    progress['goal_status'] = 'stalled'
+                else:
+                    progress['terminal_error'] = cached
+            if (not self.screen or not progress or row.get('engine') not in ('codex', 'claude') or progress['headless']
+                    or (row.get('engine') == 'claude' and not claude_goal)
+                    or (row.get('state') or row.get('phase')) in ('exited', 'dead', 'pruned', 'forgotten', 'stopped', 'unobserved', 'unknown')
+                    or (now - self.samples[key]['last'] < 60000
+                        and not (claude_goal and key not in self.screen_checks))):
+                continue
             if now - checked >= 60000:
                 if time.monotonic() >= budget:
                     continue
                 from .codex_interactive import reconnect_failure
                 try:
                     screen = self.screen(row)
-                    footer = '\n'.join(screen.splitlines()[-8:]) if isinstance(screen, str) else ''
-                    stalled_marker = re.search(r'Goal stalled\s*\(/goal resume\)\s*$', footer)
-                    cached = 'codex_reconnect_failed' if reconnect_failure(screen) else ('goal_stalled' if stalled_marker else None)
+                    if row.get('engine') == 'claude':
+                        rejected = isinstance(screen, str) and GOAL_REJECTED_RE.search(screen)
+                        cached = 'goal_rejected' if rejected else None
+                    else:
+                        footer = '\n'.join(screen.splitlines()[-8:]) if isinstance(screen, str) else ''
+                        stalled_marker = re.search(r'Goal stalled\s*\(/goal resume\)\s*$', footer)
+                        cached = ('codex_reconnect_failed' if reconnect_failure(screen)
+                                  else ('goal_stalled' if stalled_marker else None))
                 except Exception:
                     cached = None
                 self.screen_checks[key] = (now, cached)
