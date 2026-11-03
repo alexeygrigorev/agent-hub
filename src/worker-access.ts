@@ -170,6 +170,18 @@ export function workerCreatedTargets(sql: SqlStorage, sessionId: string | null |
     .toArray().map((r: any) => r.task_id as string));
 }
 const INTAKE_TASK_PATH = /^\/api\/intake\/tasks\/([a-zA-Z0-9._:-]+)(\/history|\/events|\/links|\/context)?$/;
+/** Intake 08658ee8 AC3: unique short-id prefixes (>= 8 chars, like sessions)
+ * resolve to the full task id for the worker's own, created and linked intakes.
+ * Triage requests stay exact-id (intake d8d509d2), so the caller passes the raw
+ * reference there. Ambiguous or unknown prefixes stay unresolved. */
+export function resolveTaskRef(sql: SqlStorage, id: string): string | null {
+  if (!/^[a-zA-Z0-9._:-]{1,128}$/.test(id)) return null;
+  const exact: any = sql.exec('SELECT id FROM intake_tasks WHERE id=?', id).toArray()[0];
+  if (exact) return exact.id;
+  if (id.length < 8) return null;
+  const matches: any[] = sql.exec('SELECT id FROM intake_tasks WHERE substr(id,1,?)=? LIMIT 2', id.length, id).toArray();
+  return matches.length === 1 ? matches[0].id : null;
+}
 /** Denial code for a worker request outside its capability. Intake reads or
  * writes aimed at another intake say so explicitly instead of a generic 403. */
 export function workerDenialCode(sql: SqlStorage, request: Request, tokenId: string): string {
@@ -177,7 +189,8 @@ export function workerDenialCode(sql: SqlStorage, request: Request, tokenId: str
   if (path !== '/api/intake/tasks' && !path.startsWith('/api/intake/tasks/')) return 'worker_scope_forbidden';
   const worker = workerAccessContext(sql, tokenId);
   const id = /^\/api\/intake\/tasks\/([a-zA-Z0-9._:-]+)/.exec(path)?.[1];
-  if (worker && id && (id === worker.task_id || (id.length >= 8 && worker.task_id.startsWith(id)))) return 'worker_scope_forbidden';
+  const resolved = id ? resolveTaskRef(sql, id) : null;
+  if (worker && id && (resolved === worker.task_id || (id.length >= 8 && worker.task_id.startsWith(id)))) return 'worker_scope_forbidden';
   return 'cross_intake_forbidden';
 }
 export function workerRequestAllowed(sql: SqlStorage, request: Request, tokenId: string): boolean {
@@ -205,10 +218,13 @@ export function workerRequestAllowed(sql: SqlStorage, request: Request, tokenId:
   if (/^\/api\/bus\/claims\/[^/]+\/release$/.test(path)) return request.method === 'POST';
   const ownIntake = INTAKE_TASK_PATH.exec(path);
   if (ownIntake) {
-    const id = ownIntake[1];
+    const requested = ownIntake[1];
     // A triage reviewer may read, note and amend AC/project on its requested intakes.
-    if (id !== worker.task_id && triageTargets(sql, worker.session_id).has(id))
+    if (requested !== worker.task_id && triageTargets(sql, worker.session_id).has(requested))
       return request.method === 'GET' ? ownIntake[2] !== '/events' : request.method === 'POST' && (!ownIntake[2] || ownIntake[2] === '/events');
+    // Intake 08658ee8 AC3: created and linked intakes are matched through the
+    // unique-prefix resolution, so workers can address them by short id too.
+    const id = resolveTaskRef(sql, requested) ?? requested;
     const own = id === worker.task_id || (id.length >= 8 && worker.task_id.startsWith(id));
     if (!own && !workerCreatedTargets(sql, worker.session_id).has(id) && !workerLinkedTargets(sql, worker).has(id)) return false;
     return request.method === 'GET' ? ownIntake[2] !== '/events' : request.method === 'POST' && ownIntake[2] === '/events';
