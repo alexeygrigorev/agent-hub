@@ -751,6 +751,10 @@ def acquire_journal_lock(lock):
             msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
 
 
+def _is_windows() -> bool:
+    return os.name == 'nt'
+
+
 def ensure_private_journal(journal) -> None:
     """Re-protect an inherited-DACL journal tree we own before first use.
 
@@ -762,7 +766,7 @@ def ensure_private_journal(journal) -> None:
     unrepairable journal keeps the previous fail-closed per-operation
     behavior, surfacing as the bounded commands_error log.
     """
-    if os.name != 'nt':
+    if not _is_windows():
         return
     try:
         from . import win32_fs
@@ -790,7 +794,12 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
         settings = fleet.load_settings(settings_path)
         native = settings.get('aplexer_bin', 'aplexer')
         ensure_runtime_bin_on_path()
-        binding = qualify_sender_binding(native, str(Path.cwd().resolve()))
+        # aplexer 0.1.23 on Windows mutates a live controller's observed
+        # workspace to %TEMP% seconds after startup (intake bf0863c4). Pinning
+        # sender_workspace to startup cwd causes qualify_sender_binding in
+        # host-receive to fail with native_sender_unbound once workspace drifts.
+        authorized_sender_ws = None if _is_windows() else str(Path.cwd().resolve())
+        binding = qualify_sender_binding(native, authorized_sender_ws)
         # M15d narrow plumbing: surface the trusted cleanup-root allowlist
         # size (no auto-delete daemon here; tree removal is explicit CLI only).
         roots = get_cleanup_roots(settings)
@@ -981,7 +990,8 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                     session_control.execute(SimpleNamespace(
                         sessions_cmd='host-receive', once=True, machine_id=cfg['machine_id'],
                         actor=None, credential_family=None, journal_dir=str(journal),
-                        aplexer_bin=native, limit=20, sender_workspace=binding.workspace,
+                        aplexer_bin=native, limit=20,
+                        sender_workspace=None if _is_windows() else binding.workspace,
                         # M15d narrow plumbing: HOST-config trusted cleanup roots
                         # arm the STOP-bundled owning-host tree step (never CLI
                         # paths). Invalid shapes fail that tree to uncertain;
