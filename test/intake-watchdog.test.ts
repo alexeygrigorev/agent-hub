@@ -333,8 +333,10 @@ describe('forgotten intake watchdog', () => {
     const text=w.digest(items);for(const value of ['<1d (1)','1–3d (1)','3–7d (1)','>7d (1)','[FORGOTTEN] day8'])expect(text).toContain(value);
   }));
   it('resolves delivered informational digests while retaining failed target retries', async () => fixture(async h => {
-    h.env={...h.env,HUB_ALERT_TO:'fixture-alerts'};
+    h.env={...h.env,HUB_ALERT_TO:'fixture-alerts',HUB_ALERT_WEBHOOK:''};
     h.sql.exec("INSERT OR IGNORE INTO agents(tag,project) VALUES('fixture-alerts',NULL)");
+    h.sql.exec("INSERT INTO credentials (id,kind,token_hash,family_id,subject,actor,scopes,created_by_sub,created_at,expires_at) VALUES ('fixture-reader','agent','fixture-hash','fixture-reader','fixture-alerts','fixture-alerts','[\"bus:read\"]','test',?,?)",new Date().toISOString(),new Date(Date.now()+3600000).toISOString());
+    h.busService.inbox({kind:'agent',actor:'fixture-alerts',tokenId:'fixture-reader'},'fixture-alerts');
     const delivered=h.livenessService.setAlert('intake_digest','fixture-delivered',{state:'attention',detail:'Synthetic daily digest'});
     await h.notifyAlert(delivered);
     const done=h.sql.exec('SELECT * FROM liveness_alerts WHERE id=?',delivered.id).one();

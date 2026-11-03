@@ -65,6 +65,20 @@ New Hub session prompts check for d8740aac before gating, honor the HOLD, and
 require a clean checkpoint plus head-coordinated non-forced rebase for an
 older worktree. No automatic or mass worktree rewrite is part of the release.
 
+Measured residual on RMTHZ, 2026-11-03 (~06:25Z, read-only ancestry scan of
+521 `agent-hub-wt-*` checkouts, nothing modified): 34 contain 366aff60
+(shared admission + reaper era), 74 more contain 0a353095 (priority-coercion
+era), 13 more contain d8740aac, and 400 predate d8740aac. Checkouts before
+0a353095 transiently refuse (exit 3, shared state untouched) while a foreign
+`release`-priority row is queued; the row clears when that ticket admits
+first, so no edit is required for this. Checkouts before 9f5ea5f2 ignore the
+live slots file (compiled default 2; live file read 4, zero processes
+exporting `AGENT_HUB_HEAVY_TEST_SLOTS`), so until they rebase they contend
+for fewer shared slots — skew, not corruption. The active host release
+(069dceb8) predates the shared module, so new-wrapper dispatch currently
+falls back to the worktree copy and the host reaper awaits the next Hub
+host-release rotation.
+
 `scripts/switch-host-release.py` refuses to write any drop-in unless the
 release verifies: it clones `--template` (normally the active drop-in),
 substitutes the full old release directory path with the new one (refusing

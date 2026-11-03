@@ -257,8 +257,10 @@ describe('generic accounts and launch placement', () => {
     sql.exec("UPDATE fleet_accounts SET provider='gemini' WHERE label='shared-codex'");
     const quota = { status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } } };
     // Duplicate model ids are forbidden: each engine alternative has its own
-    // policy id (argon for antigravity, argon-gemini for gemini).
+    // policy id (argon for antigravity, argon-gemini for gemini). Default
+    // routing uses medium effort for both supported models.
     const reason = 'This task explicitly requires the selected Gemini deep model.';
+    const expectedModel = { antigravity: 'gemini-4-argon-medium', gemini: 'gemini-4-argon-medium' } as const;
     for (const [engine, modelId] of [['antigravity', 'argon'], ['gemini', 'argon-gemini']] as const) {
       sql.exec("UPDATE fleet_routes SET engine=? WHERE machine_id='hetzner'", engine);
       sql.exec("UPDATE machines SET capabilities=? WHERE id='hetzner'", JSON.stringify({ engines: [engine], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8 }));
@@ -268,8 +270,8 @@ describe('generic accounts and launch placement', () => {
         expect(plain.selected, JSON.stringify(plain.rejected)).toBeNull();
         expect((plain.rejected ?? []).some(item => item.reason === 'model_unsupported')).toBe(true);
       }
-      expect(s.plan(intent({ engine: modelId, engine_override_reason: reason })).selected).toMatchObject({ machine: 'hetzner', engine, account: 'shared-codex', selection: { id: modelId, model: 'gemini-4-argon-medium', effort: 'medium' } });
-      expect(s.plan(intent({ tier: 'deep', engine, engine_override_reason: reason })).selected?.selection).toMatchObject({ id: modelId, model: 'gemini-4-argon-medium', effort: 'medium' });
+      expect(s.plan(intent({ engine: modelId, engine_override_reason: reason })).selected).toMatchObject({ machine: 'hetzner', engine, account: 'shared-codex', selection: { id: modelId, model: expectedModel[engine], effort: 'medium' } });
+      expect(s.plan(intent({ tier: 'deep', engine, engine_override_reason: reason })).selected?.selection).toMatchObject({ id: modelId, model: expectedModel[engine], effort: 'medium' });
       for (const effort of ['high', 'max'] as const) {
         const blocked = s.plan(intent({ machine: 'hetzner', engine: modelId, effort, engine_override_reason: reason }));
         expect(blocked.selected, `${engine}/${effort}`).toBeNull();

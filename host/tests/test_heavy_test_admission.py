@@ -769,6 +769,19 @@ class QueueCostTests(unittest.TestCase):
         state = self.module.Queue(root).load()
         self.assertEqual(state['active']['0']['priority'], 'normal')
 
+    def test_failed_queue_load_never_mutates_shared_state(self):
+        # Rollback safety: a reader that rejects a row (e.g. a pre-0a353095
+        # checkout meeting a foreign priority) must refuse its own admission
+        # without touching the shared file, so the queue self-clears when the
+        # foreign ticket is admitted instead of staying poisoned.
+        root = Path(tempfile.mkdtemp(dir=WRAPPER.parent.parent / '.local/tmp'))
+        before = json.dumps({'version': 1, 'next': 5, 'active': {
+            '0': {'sequence': 9, 'priority': 'normal', 'created': 1.0}}})
+        (root / 'fifo-state.json').write_text(before)
+        with self.assertRaises(ValueError):
+            self.module.Queue(root).load()
+        self.assertEqual((root / 'fifo-state.json').read_text(), before)
+
     def test_invalid_env_priority_default_is_coerced(self):
         root = Path(tempfile.mkdtemp(dir=WRAPPER.parent.parent / '.local/tmp'))
         env = dict(os.environ, AGENT_HUB_HEAVY_TEST_DIR=str(root), AGENT_HUB_HEAVY_TEST_PRIORITY='intake',

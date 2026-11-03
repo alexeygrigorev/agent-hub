@@ -24,10 +24,12 @@ export interface Env {
   // Optional existing GitHub App key and explicit repository allowlist (secret).
   HOST_REPO_ACCESS_POLICY?: string;
 
-  // Liveness and alerts (optional)
-  // Comma-separated inbox actors for alert delivery; defaults to ['grok-bot'] when unset.
+  // Liveness and alerts. HUB_ALERT_WEBHOOK defaults to the existing Dapier
+  // dev-mailbox webhook; its bearer credential is stored as a Worker secret.
+  // Additional bus actors require an active credential and inbox read loop.
   HUB_ALERT_TO?: string;
   HUB_ALERT_WEBHOOK?: string;
+  HUB_ALERT_WEBHOOK_TOKEN?: string;
   HUB_MACHINE_STALE_S?: string;
   HUB_MACHINE_OFFLINE_S?: string;
   HUB_AGENT_STALL_S?: string;
