@@ -58,4 +58,25 @@ describe('Hub-pinned host release', () => {
     expect(tabo.host_release).toMatchObject({ desired_sha: SHA, current_sha: SHA, state: 'refused', error: 'dirty_checkout' });
     expect(machines.machines.find((m: any) => m.id === 'hetzner').host_release).toBeNull();
   }));
+
+  // Intake c964dbd6 AC1: a failed Windows autostart registration surfaces a
+  // bounded, secret-free token next to autostart_state; free-form text is
+  // rejected and a recovery report clears the stored token.
+  it('stores and shows a bounded autostart failure reason', () => fixture(async r => {
+    await r.handle(req('/api/routing/host-release/tabo', { sha: SHA }, 'PUT'), admin);
+    expect((await r.handle(req('/api/routing/host-release/report', { current_sha: SHA, state: 'current', error: null, autostart_state: 'registration_failed', autostart_error: 'access_denied' }), host('tabo'))).status).toBe(200);
+    for (const bad of [
+      { current_sha: SHA, state: 'current', error: null, autostart_state: 'registration_failed', autostart_error: 'Access is denied (0x80070005)' },
+      { current_sha: SHA, state: 'current', error: null, autostart_state: 'registration_failed', autostart_error: '' },
+      { current_sha: SHA, state: 'current', error: null, autostart_state: 'pwned', autostart_error: null },
+      { current_sha: SHA, state: 'current', error: null, autostart_state: 'configured', autostart_error: 'C:\\Users\\alexe' },
+    ])
+      expect((await r.handle(req('/api/routing/host-release/report', bad), host('tabo'))).status).toBe(400);
+    let machines: any = await (await r.handle(req('/api/routing/machines'), admin)).json();
+    expect(machines.machines.find((m: any) => m.id === 'tabo').host_release).toMatchObject({ autostart_state: 'registration_failed', autostart_error: 'access_denied' });
+    // Recovery clears the token: the host always reports the error slot.
+    expect((await r.handle(req('/api/routing/host-release/report', { current_sha: SHA, state: 'current', error: null, autostart_state: 'configured', autostart_error: null }), host('tabo'))).status).toBe(200);
+    machines = await (await r.handle(req('/api/routing/machines'), admin)).json();
+    expect(machines.machines.find((m: any) => m.id === 'tabo').host_release).toMatchObject({ autostart_state: 'configured', autostart_error: null });
+  }));
 });

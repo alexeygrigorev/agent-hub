@@ -127,6 +127,18 @@ describe('cross-device session messaging', () => {
     expect(text).toContain('[truncated: hub msg show 01JD3K7QXYZABCDEFGHJKMNPQR]');
     expect(text).toContain('hub reply 01JD3K7QXYZABCDEFGHJKMNPQR --body');
   });
+
+  it('keeps a delivered-with-reason ack as state_reason (M4 AC2 tui_unverified_platform)', () => fixture(async ({ bus, sc, sql }) => {
+    const sent = bus.send(developer, { senderActor: 'agent:developer', toActor: 'session:' + SESSION, kind: 'note', body: 'ping', idempotencyKey: 'r1' });
+    const [offer] = await offers(sc);
+    const granted = await claim(sc, offer);
+    const done = await ack(sc, offer, granted.claim_token, 'delivered', { reason: 'tui_unverified_platform', proof: { native_message_id: 'env-9' } });
+    expect(await done.json()).toMatchObject({ state: 'acked' });
+    expect(sql.exec('SELECT state, state_reason FROM messages WHERE id = ?', sent.id).one()).toEqual({ state: 'delivered', state_reason: 'tui_unverified_platform' });
+    const status = bus.status(developer, sent.id);
+    expect(status.events.map((e: any) => e.event)).toContain('delivered');
+    expect(JSON.stringify(status.events)).toContain('tui_unverified_platform');
+  }));
 });
 
 describe('named agent credential', () => {

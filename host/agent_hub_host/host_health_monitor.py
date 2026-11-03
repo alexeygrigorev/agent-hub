@@ -27,7 +27,10 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from . import api, auth, config
+from . import api, config
+from .monitoring_common import resolve_config_path as _resolve_monitor_config_path
+from .monitoring_common import resolve_origin_and_token as _resolve_monitor_origin_and_token
+from .monitoring_common import utc_now_iso
 
 CONFIG_FILENAME = "host-health.json"
 DEFAULT_MIN_INTERVAL_S = 60
@@ -76,23 +79,11 @@ _ALLOWED_CONFIG_KEYS = frozenset({
 
 def resolve_config_path(explicit: str | None = None) -> str:
     """Resolve trusted host health config path. Explicit wins."""
-    if explicit:
-        return explicit
-    env = os.environ.get("HUB_HOST_HEALTH_CONFIG")
-    if env:
-        return env
-    cwd = os.getcwd()
-    for candidate in (
-        os.path.join(cwd, ".local", "session", CONFIG_FILENAME),
-        os.path.join(cwd, "journal", CONFIG_FILENAME),
-    ):
-        if os.path.isfile(candidate):
-            return candidate
-    return os.path.join(cwd, ".local", "session", CONFIG_FILENAME)
-
-
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return _resolve_monitor_config_path(
+        explicit,
+        env_var="HUB_HOST_HEALTH_CONFIG",
+        filename=CONFIG_FILENAME,
+    )
 
 
 def collect_load_averages(
@@ -1509,20 +1500,11 @@ def _resolve_origin_and_token(
     base_url: Optional[str] = None,
     token: Optional[str] = None,
 ) -> Tuple[str, str]:
-    cfg = config.load_config()
-    clean_base = (
-        base_url
-        or os.environ.get("HUB_URL")
-        or os.environ.get("HUB_BASE_URL")
-        or cfg.get("base_url")
-        or config.DEFAULT_BASE_URL
+    return _resolve_monitor_origin_and_token(
+        base_url,
+        token,
+        missing_token_message="Missing host access token for health monitoring",
     )
-    api.check_url(clean_base)
-    env_token = os.environ.get("HUB_TOKEN") or os.environ.get("HUB_JOB_TOKEN")
-    access_token = token or env_token or auth.get_access_token()
-    if not access_token:
-        raise ValueError("Missing host access token for health monitoring")
-    return clean_base.rstrip("/"), access_token
 
 
 def post_host_health_observation(

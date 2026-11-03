@@ -23,6 +23,7 @@ import json
 import hashlib
 import os
 import re
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -42,6 +43,35 @@ from .session_executor import _journal_path, _lock_held, _read_journal, _write_j
 
 RELAY_WINDOW_MS = 7 * 24 * 3600 * 1000
 MAX_RELAY_JOURNALS = 50
+
+# M4 AC2 (docs/SESSION-MESSAGING.md §5.4): hook readiness (waiting|idle) on
+# Windows is unverified until proven live for an engine. Until then a
+# delivery=tui request to a Windows session falls back to the durable inbox
+# copy with this reason — never a silent typing into an unknown state. The
+# operator enables an engine after the live proof with, e.g.,
+# ``AGENT_HUB_WINDOWS_TUI_ENGINES=codex,claude`` in the host environment.
+WINDOWS_TUI_UNVERIFIED_REASON = "tui_unverified_platform"
+WINDOWS_TUI_ENGINES_ENV = "AGENT_HUB_WINDOWS_TUI_ENGINES"
+
+
+def windows_tui_verified(engine: Optional[str], platform: Optional[str] = None) -> bool:
+    """Whether TUI injection is proven on this host for the target engine.
+
+    Linux hosts run the verified path. On Windows only engines explicitly
+    listed in ``AGENT_HUB_WINDOWS_TUI_ENGINES`` (comma-separated, set by the
+    operator after the live hook-readiness proof) may be typed into; every
+    other engine — including an unknown one — takes the inbox fallback.
+    ``platform`` is injectable for unit tests (production passes none, which
+    reads the real ``sys.platform``); never fake ``sys.platform`` itself —
+    filesystem helpers dispatch on it.
+    """
+    if (sys.platform if platform is None else platform) != "win32":
+        return True
+    if not isinstance(engine, str) or not engine.strip():
+        return False
+    verified = {p.strip().lower() for p in os.environ.get(WINDOWS_TUI_ENGINES_ENV, "").split(",")
+                if p.strip()}
+    return engine.strip().lower() in verified
 
 
 def _now_ms() -> int:
@@ -292,6 +322,12 @@ def handle_message_offer(offer: dict[str, Any], *, journal_dir: str, executable:
         envelope = record["envelope_id"]
         if delivery == "inbox":
             _finish_ack(journal_file, record, request, target, "delivered", "delivered", None, envelope)
+            return {"command_id": command_id, "state": "delivered"}
+        if not windows_tui_verified(target.engine):
+            # §5.4: hook readiness is unverified on Windows; retain the
+            # durable inbox copy and report why the TUI was skipped.
+            _finish_ack(journal_file, record, request, target, "delivered", "delivered",
+                        WINDOWS_TUI_UNVERIFIED_REASON, envelope)
             return {"command_id": command_id, "state": "delivered"}
         # Re-qualify after journaling the envelope and directly before TUI input.
         qualify_target(executable, target)

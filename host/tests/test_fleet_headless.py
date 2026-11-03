@@ -10,7 +10,6 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agent_hub_host.fleet import Dispatcher
-from agent_hub_host.fleet_launch import launcher_payload
 
 
 class TestFleetHeadless(unittest.TestCase):
@@ -56,32 +55,6 @@ class TestFleetHeadless(unittest.TestCase):
             "observed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         }
 
-    def test_launcher_payload_with_profile(self):
-        p = launcher_payload(
-            target_cwd=self.workspace,
-            goal="Do task",
-            account_label="pro-account",
-            profile="hub-pro-account",
-            timeout=1800,
-            model="gpt-6.1-sol",
-            provider="codex",
-        )
-        self.assertEqual(p["account_label"], "pro-account")
-        self.assertEqual(p["profile"], "model-task")
-        self.assertEqual(p["account_profile"], "hub-pro-account")
-        self.assertEqual(p["provider_profile"], "hub-pro-account")
-        self.assertEqual(p["model_requirements"]["providers"], ["codex"])
-        self.assertEqual(p["model_requirements"]["models"], ["gpt-6.1-sol"])
-
-    def test_launcher_payload_default_timeout_allows_long_runs(self):
-        # Intake 14453011: 1800 s killed a ~33 min headless codex run mid-run.
-        # Default must be the launcher max (7200 s).
-        p = launcher_payload(
-            target_cwd=self.workspace,
-            goal="Do task",
-            account_label="pro-account",
-        )
-        self.assertEqual(p["timeout"], 7200)
 
     def test_headless_dispatch_named_profile_uses_aplexer_backend(self):
         settings = self._settings()

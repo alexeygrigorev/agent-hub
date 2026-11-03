@@ -764,14 +764,10 @@ export class SessionControlService {
     const native_id = sessionKey.slice(sep + 1);
     if (!machine_id || !native_id) return null;
     try {
-      for (const sc of this.sql.exec('SELECT id, binding_json, fleet_launch_id FROM session_control_sessions WHERE machine_id = ?', machine_id).toArray() as any[]) {
-        try {
-          const binding = sc.binding_json ? JSON.parse(sc.binding_json) : null;
-          if (binding?.native_id === native_id) {
-            return { session_id: sc.id, fleet_launch_id: sc.fleet_launch_id ?? null };
-          }
-        } catch { /* corrupt binding: not this session */ }
-      }
+      // Intake 94186660: exact SQL predicate instead of a per-machine full
+      // scan with in-JS JSON.parse filtering.
+      const sc: any = this.sql.exec(`SELECT id, binding_json, fleet_launch_id FROM session_control_sessions WHERE machine_id = ? AND json_extract(binding_json, '$.native_id') = ? LIMIT 2`, machine_id, native_id).toArray()[0];
+      if (sc) return { session_id: sc.id, fleet_launch_id: sc.fleet_launch_id ?? null };
       const launch: any = this.sql.exec(
         'SELECT id FROM fleet_launches WHERE machine_id = ? AND native_id = ?', machine_id, native_id).toArray()[0];
       if (launch) return { session_id: null, fleet_launch_id: launch.id };
@@ -859,8 +855,11 @@ export class SessionControlService {
     }
     const fleet: any = this.sql.exec('SELECT phase,tag FROM fleet_sessions WHERE machine_id = ? AND native_id = ?', machineId, nativeId).toArray()[0];
     if (!fleet || !['running', 'starting'].includes(fleet.phase)) return false;
-    const rows: any[] = this.sql.exec('SELECT * FROM session_control_sessions WHERE machine_id = ? AND binding_json IS NOT NULL', machineId).toArray();
-    let sessions = rows.filter(row => JSON.parse(row.binding_json)?.native_id === nativeId);
+    // Intake 94186660: exact SQL predicate instead of a per-machine full
+    // scan with in-JS JSON.parse filtering (binding_json IS NOT NULL rows
+    // whose native_id differs are never read).
+    const rows: any[] = this.sql.exec(`SELECT * FROM session_control_sessions WHERE machine_id = ? AND json_extract(binding_json, '$.native_id') = ? LIMIT 2`, machineId, nativeId).toArray();
+    let sessions = rows;
     if (!sessions.length) {
       // Missing trees can prevent binding itself. Resolve reporting custody
       // from the exact host-observed canonical launch tag, without creating
@@ -3151,9 +3150,14 @@ export class SessionControlService {
         reconcileUnboundFleetSessions(this.sql, this.now());
         try { this.processDueWakes(); } catch {}
       });
-      const rows = (admin
-        ? this.sql.exec("SELECT * FROM session_control_sessions WHERE state = 'running' ORDER BY created_at, id").toArray()
-        : this.sql.exec("SELECT * FROM session_control_sessions WHERE state = 'running' AND actor = ? ORDER BY created_at, id", caller.actor).toArray()) as any[];
+      // Intake 94186660: running-only scan stays capped (take+1); the page
+      // reports truncation instead of growing with fleet history.
+      const WARN_LIMIT = 500;
+      const warnRows = (admin
+        ? this.sql.exec("SELECT * FROM session_control_sessions WHERE state = 'running' ORDER BY created_at, id LIMIT ?", WARN_LIMIT + 1).toArray()
+        : this.sql.exec("SELECT * FROM session_control_sessions WHERE state = 'running' AND actor = ? ORDER BY created_at, id LIMIT ?", caller.actor, WARN_LIMIT + 1).toArray()) as any[];
+      const warningsTruncated = warnRows.length > WARN_LIMIT;
+      const rows = warnRows.slice(0, WARN_LIMIT);
       const warnings = rows.filter(row => this.ownerOk(row, caller)).map(row => this.view(row, threshold)).filter(row => row.warning_active);
       let wake_alerts: any[] = [];
       try {
@@ -3161,7 +3165,9 @@ export class SessionControlService {
         const alerts = this.sql.exec("SELECT a.* FROM session_control_wake_alerts a JOIN session_control_wakes w ON w.id=a.wake_id WHERE w.state='missed' ORDER BY a.created_at DESC, a.id DESC LIMIT 100").toArray() as any[];
         wake_alerts = alerts.filter(a => ownedIds.has(a.session_id) || admin);
       } catch {}
-      return response({ warnings, wake_alerts });
+      // The page reports truncation only when the cap binds, keeping the
+      // common response byte-identical for existing readers.
+      return response(warningsTruncated ? { warnings, wake_alerts, truncated: true } : { warnings, wake_alerts });
     }
 
     if (path === '/api/sessions' && request.method === 'GET') {
@@ -4790,7 +4796,10 @@ export class SessionControlService {
     if (messageId) {
       const envelope = typeof input.proof?.native_message_id === 'string' ? input.proof.native_message_id.slice(0, 128) : undefined;
       const messageState = state === 'acked' ? 'delivered' : state === 'uncertain' ? 'uncertain' : state === 'transported' ? 'dispatched' : 'undeliverable';
-      setMessageState(this.sql, messageId, messageState, state === 'acked' ? null : reason, null, machine, now,
+      // M4 AC2: a delivered ack may carry a fallback reason (e.g.
+      // tui_unverified_platform). Keep it as state_reason so
+      // `hub msg status` shows why the TUI was skipped.
+      setMessageState(this.sql, messageId, messageState, reason, null, machine, now,
         { command_id: row.id, delivery: payload.delivery, ...(envelope ? { native_message_id: envelope } : {}) });
       if (input.outcome === 'refused' && reason === 'session_ended') {
         const msg: any = this.sql.exec('SELECT * FROM messages WHERE id = ?', messageId).toArray()[0];

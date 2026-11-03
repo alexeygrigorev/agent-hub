@@ -848,11 +848,12 @@ export class ResourceManagement {
     }
     for (const throttle of value.throttles ?? []) {
       // Reversible CPU-throttle receipts (intake f31b678f): the host only
-      // reports verified cpu.max writes on the session's own workload scope;
+      // reports apply writes and restore attempts on the session's own scope;
       // a throttle never stops anything, so intake-note failures must not
       // fail the whole report and unlike reaps there is no replay gate.
       if (!throttle || typeof throttle.id!=='string' || !/^[\w:-]{1,128}$/.test(throttle.id)
         || !['throttled','released'].includes(throttle.action)
+        || (throttle.reason!=null && (typeof throttle.reason!=='string' || !/^[a-z_]{1,40}$/.test(throttle.reason)))
         || (throttle.cap_cores!=null && (!finite(throttle.cap_cores) || throttle.cap_cores>10000))
         || (throttle.sustain_s!=null && (!finite(throttle.sustain_s) || throttle.sustain_s>100000))
         || (throttle.cpu_max!=null && (typeof throttle.cpu_max!=='string' || throttle.cpu_max.length>64))
@@ -866,9 +867,17 @@ export class ResourceManagement {
       if (prior) { if(prior.session_id!==tsession.session_id || prior.native_id!==tsession.native_id || prior.machine_id!==machine || prior.action!==throttle.action) throw new Error('throttle_conflict'); continue; }
       this.sql.exec('INSERT INTO resource_throttles VALUES(?,?,?,?,?,?,?,?,?,?,?)',throttle.id,tsession.session_id,machine,tsession.native_id,tsession.intake_id,throttle.action,throttle.cap_cores ?? null,throttle.sustain_s ?? null,throttle.cpu_max ?? null,throttle.outcome ?? null,throttle.at);
       if (tsession.intake_id) {
+        const reason = throttle.reason==='usage_below_cap' ? 'CPU usage fell below the 80% release threshold'
+          : throttle.reason==='session_protected' ? 'the session became protected'
+          : throttle.reason==='session_unmanaged' ? 'the session is no longer managed'
+          : throttle.reason==='session_finished' ? 'the session finished'
+          : throttle.reason==='restore_retry' ? 'a previous cgroup cpu.max restoration was unverified'
+          : 'CPU stayed above the configured cap for the sustain window';
         const text = throttle.action==='throttled'
-          ? `Resource watchdog throttled session ${tsession.session_id}: CPU stayed above ${throttle.cap_cores ?? 'the configured'} cores for at least ${throttle.sustain_s ?? 'the configured'}s; applied reversible cgroup cpu.max "${throttle.cpu_max ?? ''}" (previous "${throttle.prior_cpu_max ?? 'unknown'}"). No process was stopped; the throttle lifts automatically when usage drops.`
-          : `Resource watchdog lifted the CPU throttle on session ${tsession.session_id}: usage fell below the cap; cgroup cpu.max restore outcome: ${throttle.outcome ?? 'unknown'}${throttle.cpu_max ? ` (restored "${throttle.cpu_max}")` : ''}.`;
+          ? `Resource watchdog throttled session ${tsession.session_id}: ${reason}; cap ${throttle.cap_cores ?? 'the configured'} cores after ${throttle.sustain_s ?? 'the configured'}s; applied reversible cgroup cpu.max "${throttle.cpu_max ?? ''}" (previous "${throttle.prior_cpu_max ?? 'unknown'}"). No process was stopped.`
+          : throttle.outcome==='unverified'
+            ? `Resource watchdog could not lift the CPU throttle on session ${tsession.session_id}: ${reason}; restore outcome unverified. The cgroup throttle remains active and restoration will retry.`
+            : `Resource watchdog lifted the CPU throttle on session ${tsession.session_id}: ${reason}; cgroup cpu.max restore outcome: ${throttle.outcome ?? 'unknown'}${throttle.cpu_max ? ` (restored "${throttle.cpu_max}")` : ''}.`;
         try { this.note(tsession,throttle.id,text); }
         catch (error) { if (!(error instanceof Error && ['intake_required','intake_not_found','intake_capacity','intake_history_capacity'].includes(error.message))) throw error; }
       }
@@ -878,25 +887,25 @@ export class ResourceManagement {
   usage(filters: any = {}) {
     const clauses:string[]=[], args:string[]=[];
     for (const k of ['project','engine','kind']) if(filters[k]) { clauses.push(k+'=?');args.push(filters[k]); }
-    const latestThrottle=new Map<string,string>();
-    for (const r of this.sql.exec('SELECT machine_id,native_id,action FROM resource_throttles ORDER BY at DESC, rowid DESC LIMIT 1000').toArray() as any[]) {
+    const latestThrottle=new Map<string,boolean>();
+    for (const r of this.sql.exec('SELECT machine_id,native_id,action,outcome FROM resource_throttles ORDER BY at DESC, rowid DESC LIMIT 1000').toArray() as any[]) {
       const key=r.machine_id+':'+r.native_id;
-      if (!latestThrottle.has(key)) latestThrottle.set(key,r.action);
+      if (!latestThrottle.has(key)) latestThrottle.set(key,r.action==='throttled' || (r.action==='released' && r.outcome==='unverified'));
     }
-    return this.sql.exec('SELECT * FROM session_resource_usage'+(clauses.length?' WHERE '+clauses.join(' AND '):'')+' ORDER BY observed_at DESC LIMIT 500',...args).toArray().map((r:any)=>({...r,started_at:r.started_at || null,workspace:this.sql.exec('SELECT workspace FROM session_resource_metadata WHERE session_id=?',r.session_id).toArray()[0]?.workspace ?? null,p95_cpu_cores:this.sql.exec('SELECT p95_cpu_cores FROM session_cpu_usage WHERE session_id=?',r.session_id).toArray()[0]?.p95_cpu_cores ?? null,p50_rss_mb:this.sql.exec('SELECT p50_rss_mb FROM session_rss_median WHERE session_id=?',r.session_id).toArray()[0]?.p50_rss_mb ?? null,oom_kills:this.sql.exec('SELECT oom_kills FROM session_oom_kills WHERE session_id=?',r.session_id).toArray()[0]?.oom_kills ?? null,project_label:projectLabel(r.project),rss_flagged:r.peak_rss_mb>=this.config().rss_flag_gb*1024,token_join_key:r.machine_id+':'+r.native_id,cpu_throttled:latestThrottle.get(r.machine_id+':'+r.native_id)==='throttled'}));
+    return this.sql.exec('SELECT * FROM session_resource_usage'+(clauses.length?' WHERE '+clauses.join(' AND '):'')+' ORDER BY observed_at DESC LIMIT 500',...args).toArray().map((r:any)=>({...r,started_at:r.started_at || null,workspace:this.sql.exec('SELECT workspace FROM session_resource_metadata WHERE session_id=?',r.session_id).toArray()[0]?.workspace ?? null,p95_cpu_cores:this.sql.exec('SELECT p95_cpu_cores FROM session_cpu_usage WHERE session_id=?',r.session_id).toArray()[0]?.p95_cpu_cores ?? null,p50_rss_mb:this.sql.exec('SELECT p50_rss_mb FROM session_rss_median WHERE session_id=?',r.session_id).toArray()[0]?.p50_rss_mb ?? null,oom_kills:this.sql.exec('SELECT oom_kills FROM session_oom_kills WHERE session_id=?',r.session_id).toArray()[0]?.oom_kills ?? null,project_label:projectLabel(r.project),rss_flagged:r.peak_rss_mb>=this.config().rss_flag_gb*1024,token_join_key:r.machine_id+':'+r.native_id,cpu_throttled:latestThrottle.get(r.machine_id+':'+r.native_id)===true}));
   }
   reaps() { return this.sql.exec('SELECT * FROM resource_reaps ORDER BY at DESC LIMIT 100').toArray(); }
   throttles() {
     const rows=this.sql.exec('SELECT * FROM resource_throttles ORDER BY at DESC, rowid DESC LIMIT 100').toArray();
-    // Newest receipt per physical native decides the active flag, and only
-    // that single row may carry it: a released row is never ACTIVE even
-    // when a newer throttled row exists for the same native.
+    // Newest receipt per physical native decides the active flag. A failed
+    // restore remains active until a later verified release arrives.
     const latest=new Map<string,any>();
-    for (const r of this.sql.exec('SELECT id,machine_id,native_id,action FROM resource_throttles ORDER BY at DESC, rowid DESC LIMIT 1000').toArray() as any[]) {
+    for (const r of this.sql.exec('SELECT id,machine_id,native_id,action,outcome FROM resource_throttles ORDER BY at DESC, rowid DESC LIMIT 1000').toArray() as any[]) {
       const key=r.machine_id+':'+r.native_id;
       if (!latest.has(key)) latest.set(key,r);
     }
-    return rows.map((r:any)=>({...r,active:latest.get(r.machine_id+':'+r.native_id)?.id===r.id && r.action==='throttled'}));
+    return rows.map((r:any)=>({...r,active:latest.get(r.machine_id+':'+r.native_id)?.id===r.id
+      && (r.action==='throttled' || (r.action==='released' && r.outcome==='unverified'))}));
   }
   /** Per-machine headroom: measured CPU and memory, the fullness verdict, and how many more
    * typical tasks fit by the ledger's own p90 estimates. Never derived from load average. */

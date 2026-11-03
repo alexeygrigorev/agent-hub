@@ -124,7 +124,9 @@ def human_refresh() -> str:
     replay one rotating refresh token (the server revokes the family on replay)."""
     from .auth import human_refresh_guard
     seen = config.load_human_config().get("access_token")
-    with human_refresh_guard():
+    # This operation always refreshes cli.json, even when APLEXER identity
+    # makes the active profile resolve to a worker credential.
+    with human_refresh_guard(force_human=True):
         cfg = config.load_human_config()
         if seen and cfg.get("access_token") and cfg.get("access_token") != seen:
             return cfg["access_token"]  # another process already rotated

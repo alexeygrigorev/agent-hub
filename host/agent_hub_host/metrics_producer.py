@@ -43,6 +43,9 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from .monitoring_common import resolve_config_path as _resolve_monitor_config_path
+from .monitoring_common import utc_now_iso
+
 CONFIG_FILENAME = "metrics-producer.json"
 DEFAULT_MIN_INTERVAL_S = 300
 MIN_INTERVAL_FLOOR_S = 60
@@ -75,22 +78,11 @@ class MetricsProducerError(ValueError):
 
 def resolve_config_path(explicit: str | None = None) -> str:
     """Resolve the trusted producer config path. Explicit wins."""
-    if explicit:
-        return explicit
-    env = os.environ.get("HUB_METRICS_PRODUCER_CONFIG")
-    if env:
-        return env
-    cwd = os.getcwd()
-    for candidate in (os.path.join(cwd, ".local", "session", CONFIG_FILENAME),
-                      os.path.join(cwd, "journal", CONFIG_FILENAME)):
-        if os.path.isfile(candidate):
-            return candidate
-    return os.path.join(cwd, ".local", "session", CONFIG_FILENAME)
-
-
-def utc_now_iso() -> str:
-    from datetime import datetime, timezone
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return _resolve_monitor_config_path(
+        explicit,
+        env_var="HUB_METRICS_PRODUCER_CONFIG",
+        filename=CONFIG_FILENAME,
+    )
 
 
 def _is_abs_home(path: str) -> bool:

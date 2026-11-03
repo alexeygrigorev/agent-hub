@@ -93,33 +93,59 @@ def release_sha(package=None):
 
 
 def ensure_windows_autostart(root, run=subprocess.run):
-    """Upgrade the existing user supervisor task; never request elevation."""
+    """Upgrade the existing user supervisor task; never request elevation.
+
+    Returns (state, error): state is configured | wrapper_missing |
+    registration_failed (or (None, None) off Windows), error is None except
+    alongside registration_failed, when it is one of AUTOSTART_ERRORS.
+    """
     if sys.platform != 'win32':
-        return None
+        return None, None
     if root is None:
-        return _windows_package_autostart(run)
+        state = _windows_package_autostart(run)
+        return (state, None) if state != 'registration_failed' else (state, 'script_error')
     local = os.environ.get('LOCALAPPDATA')
     if not local:
-        return 'wrapper_missing'
+        return 'wrapper_missing', None
     runner = Path(local) / 'agent-hub' / 'run-session-host.ps1'
     script = Path(root) / 'scripts' / 'windows-host-autostart.ps1'
     if not runner.is_file() or not script.is_file():
-        return 'wrapper_missing'
+        return 'wrapper_missing', None
     marker = runner.parent / 'autostart-version.sha256'
     digest = hashlib.sha256(script.read_bytes()).hexdigest()
     try:
         if marker.read_text(encoding='ascii').strip() == digest:
-            return 'configured'
+            return 'configured', None
     except (OSError, UnicodeError):
         pass
     try:
-        code, _ = _run(run, ['powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', str(script), '-Runner', str(runner)], root, 90)
+        result = run(['powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', str(script), '-Runner', str(runner)], cwd=str(root), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                     stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace', timeout=90)
+        code = result.returncode
+        output = (result.stdout or '') + '\n' + (result.stderr or '')
         if code:
-            return 'registration_failed'
+            return 'registration_failed', _classify_autostart_output(output)
         marker.write_text(digest + '\n', encoding='ascii')
-        return 'configured'
+        return 'configured', None
     except (OSError, subprocess.SubprocessError):
-        return 'registration_failed'
+        return 'registration_failed', 'script_error'
+
+
+AUTOSTART_ERRORS = ('access_denied', 'logon_type_denied', 'task_exists_other_user', 'script_error')
+_AUTOSTART_ERROR_RE = re.compile(r'AUTOSTART_ERROR\s*[:=]\s*([A-Za-z0-9_]+)')
+
+
+def _classify_autostart_output(output):
+    """Map installer output to a bounded, secret-free failure token.
+
+    The installer prints AUTOSTART_ERROR=<token> on known failure paths;
+    anything else (unmarked exit, unexpected token) is script_error so the
+    Hub never stores free-form host text.
+    """
+    match = _AUTOSTART_ERROR_RE.search(output or '')
+    if match and match.group(1) in AUTOSTART_ERRORS:
+        return match.group(1)
+    return 'script_error'
 
 
 def _windows_package_autostart(run):
@@ -229,9 +255,13 @@ def step_once(request, *, root=None, run=subprocess.run, python=None, log=print)
     else:
         state, error, sha = apply(target, root, run=run, python=python)
     report = {'current_sha': sha, 'state': state, 'error': error}
-    autostart = ensure_windows_autostart(root, run)
-    if autostart is not None:
-        report['autostart_state'] = autostart
+    autostart_state, autostart_error = ensure_windows_autostart(root, run)
+    if autostart_state is not None:
+        report['autostart_state'] = autostart_state
+    # Always report the error slot (null on success) so a fixed machine
+    # clears a previously reported failure token on the Hub.
+    if autostart_state is not None:
+        report['autostart_error'] = autostart_error
     request('POST', '/api/fleet/routing/host-release/report', report)
     log(json.dumps({'event': 'host_release', 'state': state, 'error': error, 'sha': sha}), flush=True)
     return state == 'updated'

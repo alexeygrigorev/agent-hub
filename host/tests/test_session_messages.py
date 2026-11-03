@@ -195,3 +195,49 @@ def test_reply_from_another_session_is_not_relayed(env):
     subprocess.run([env["fake"], "message", "reply", envelope, "spoof", "--json"], capture_output=True, text=True,
                    timeout=20, env=dict(os.environ, APLEXER_SESSION_ID=other["id"]))
     assert sm.relay_replies(journal_dir=env["journal"], executable=env["fake"], request=hub) == []
+
+
+def tui_offer(env, rec, engine):
+    o = offer(env, rec)
+    o["engine"] = engine
+    return o
+
+
+def test_windows_unverified_tui_falls_back_to_inbox_with_reason(env, monkeypatch):
+    # M4 AC2 (docs/SESSION-MESSAGING.md §5.4): hook readiness unverified on
+    # Windows — the inbox copy stands, deliver never runs, and the ack carries
+    # tui_unverified_platform so Hub records it as state_reason.
+    rec = seed_session(env, engine="codex")
+    hub = FakeHub()
+    monkeypatch.setattr(sm, "windows_tui_verified", lambda engine: False)
+    monkeypatch.setenv("FAKE_DELIVER_BEHAVIOR", "crash")  # would fail if deliver ran
+    o = tui_offer(env, rec, "codex")
+    assert handle(env, hub, o)["state"] == "delivered"
+    [ack] = acks(hub)
+    assert ack["outcome"] == "delivered" and ack["reason"] == sm.WINDOWS_TUI_UNVERIFIED_REASON
+    assert ack["proof"] == {"native_message_id": [e for e in native_log(env) if e.get("kind") == "hub-message"][0]["id"]}
+    # A lost ack re-offered under a new claim replays the same fallback reason.
+    assert handle(env, hub, o) == {"command_id": o["command_id"], "state": "delivered", "replayed": True}
+    assert acks(hub)[-1]["reason"] == sm.WINDOWS_TUI_UNVERIFIED_REASON
+
+
+def test_windows_unknown_engine_falls_back_to_inbox(env, monkeypatch):
+    rec = seed_session(env)
+    hub = FakeHub()
+    monkeypatch.setattr(sm, "windows_tui_verified", lambda engine: False)
+    monkeypatch.setenv("FAKE_DELIVER_BEHAVIOR", "crash")
+    assert handle(env, hub, tui_offer(env, rec, None))["state"] == "delivered"
+    assert acks(hub)[-1]["reason"] == sm.WINDOWS_TUI_UNVERIFIED_REASON
+
+
+def test_windows_tui_verified_helper(monkeypatch):
+    assert sm.windows_tui_verified("codex") is True  # this host is not Windows
+    assert sm.windows_tui_verified("codex", platform="linux") is True
+    assert sm.windows_tui_verified("codex", platform="win32") is False
+    assert sm.windows_tui_verified(None, platform="win32") is False
+    monkeypatch.setenv(sm.WINDOWS_TUI_ENGINES_ENV, " Codex , CLAUDE ")
+    assert sm.windows_tui_verified("codex", platform="win32") is True
+    assert sm.windows_tui_verified("Claude", platform="win32") is True
+    assert sm.windows_tui_verified("shell", platform="win32") is False
+    monkeypatch.delenv(sm.WINDOWS_TUI_ENGINES_ENV)
+    assert sm.windows_tui_verified("codex", platform="win32") is False

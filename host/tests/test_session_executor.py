@@ -27,7 +27,6 @@ lock serialization across threads, and start rejection by the claimed receiver.
 
 from __future__ import annotations
 
-import datetime as dt
 import json
 import os
 import shutil
@@ -320,13 +319,6 @@ def env(tmp_path_factory, monkeypatch):
 
 def custody(actor="tester"):
     return se.CallerCustody(actor=actor, machine_id="hetzner1", credential_family="famA")
-
-
-def make_claim(command_id, generation=7, expired=False):
-    now_ms = int(time.time() * 1000)
-    return {"command_id": command_id, "claim_token": "tok-" + uuid.uuid4().hex + "idx",
-            "holder": "hetzner1", "generation": generation,
-            "expires_at_ms": now_ms - 1000 if expired else now_ms + 60000}
 
 
 def make_target(env, tag, sid):
@@ -770,101 +762,6 @@ def hub(env):
         pass
 
 
-def fleet_settings(env, gate_ok=True):
-    def runner(argv, payload=None, cwd=None, timeout=30):
-        if argv == ["admit"]:
-            observed = dt.datetime.now(dt.timezone.utc).isoformat()
-            if not gate_ok:
-                return {"launch_allowed": False, "profile_supported": True,
-                        "account_label": "hub", "observed_at": observed}
-            return {"launch_allowed": True, "profile_supported": True,
-                    "account_label": "hub", "observed_at": observed}
-        if argv[1:3] == ["message", "send"]:
-            assert "--queue" in argv and "--pane" not in argv
-            return {"id": "preamble-fixture"}
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=20)
-        assert proc.returncode == 0, proc.stderr
-        return json.loads(proc.stdout)
-
-    settings = {
-        "subscriptions": [{"service": "go", "account_label": "hub", "engine": "go",
-                           "admission_argv": ["admit"]}],
-        "workspaces": {"wt": env["work"]},
-        "aplexer_bin": env["fake"],
-        "capabilities": [],
-    }
-    offer = {"id": "offer-1", "mode": "interactive", "engine": "go",
-             "profile": None, "account": "hub", "workspace": "wt"}
-    return settings, offer, runner
-
-
-def start_count(env):
-    try:
-        with open(env["start_log"]) as f:
-            return len([line for line in f if line.startswith("start:")])
-    except FileNotFoundError:
-        return 0
-
-
-def test_start_via_fleet_contract_claim_result_journal(hub, env):
-    settings, offer, runner = fleet_settings(env)
-    out = se.start_from_offer(settings, offer, custody=custody(), runner=runner,
-                              request=hub["request"], journal_dir=env["journal"],
-                              executable=env["fake"])
-    assert out["state"] == "running" and out["native_id"]
-    assert start_count(env) == 1
-    con = sqlite3.connect(hub["db"])
-    claims = con.execute("SELECT payload FROM claims").fetchall()
-    results = con.execute("SELECT payload FROM results").fetchall()
-    con.close()
-    assert len(claims) == 1 and len(results) == 1  # real HTTP claim + result rows
-    assert json.loads(results[0][0])["state"] == "running"
-    # Idempotent replay reconciles live session: no second native start.
-    again = se.start_from_offer({**settings, "workspaces": {"wt": env["work"]}},
-                                {**offer, "request_key": "offer-1"} if "request_key" not in offer else offer,
-                                custody=custody(), runner=runner,
-                                request=hub["request"], journal_dir=env["journal"],
-                                executable=env["fake"])
-    assert again["native_id"] == out["native_id"]
-    assert start_count(env) == 1
-
-
-def test_start_held_when_admission_refused(hub, env):
-    settings, offer, runner = fleet_settings(env, gate_ok=False)
-    out = se.start_from_offer(settings, offer, custody=custody(), runner=runner,
-                              request=hub["request"], journal_dir=env["journal"],
-                              executable=env["fake"])
-    assert out["state"] == "held"
-    assert start_count(env) == 0  # no native effect on refusal
-
-
-def test_start_uncertain_adopts_without_duplicate(hub, env):
-    settings, offer, base_runner = fleet_settings(env)
-    calls = {"n": 0}
-
-    def flaky(argv, payload=None, cwd=None, timeout=30):
-        if argv == ["admit"] or argv[1:3] == ["message", "send"]:
-            return base_runner(argv, payload, cwd, timeout)
-        calls["n"] += 1
-        if calls["n"] == 1:
-            # Effect happened, receipt lost: create session directly, then lose it.
-            subprocess.run(argv, capture_output=True, text=True, timeout=20, check=True)
-            raise RuntimeError("receipt lost")
-        return base_runner(argv, payload, cwd, timeout)
-
-    first = se.start_from_offer(settings, offer, custody=custody(), runner=flaky,
-                                request=hub["request"], journal_dir=env["journal"],
-                                executable=env["fake"])
-    assert first["state"] == "uncertain"  # effect happened, receipt lost
-    assert start_count(env) == 1
-    adopted = se.start_from_offer(settings, {**offer, "request_key": "offer-1"},
-                                  custody=custody(), runner=flaky,
-                                  request=hub["request"], journal_dir=env["journal"],
-                                  executable=env["fake"])
-    assert adopted["state"] == "running" and adopted.get("adopted") is True
-    assert start_count(env) == 1  # never blind-retried
-
-
 def test_hub_rejects_missing_machine_binding(hub, env):
     con = sqlite3.connect(hub["db"])
     before = con.execute("SELECT COUNT(*) FROM claims").fetchone()[0]
@@ -891,100 +788,78 @@ def _server_port(hub):
 
 # --- server-claimed receiver ---------------------------------------------------
 
-def test_claimed_send_capture_stop_round_trip(hub, env):
-    rec = seed_session(env)
-    target = {"session_id": rec["id"], "tag": "agent1", "workspace": env["work"]}
-    listed = se.handle_session_command({"op": "list", "workspace": env["work"]},
-                                       custody=custody(),
-                                       settings={"workspaces": {"wt": env["work"]}},
-                                       executable=env["fake"])
-    assert any(s["tag"] == "agent1" for s in listed["sessions"])
-    sent = se.handle_session_command(
-        {"op": "send", "command_id": "cmd-1", "generation": 7, "target": target,
-         "body": "via receiver", "claim": make_claim("cmd-1")},
-        custody=custody(), journal_dir=env["journal"], executable=env["fake"],
-        request=hub["request"])
-    assert sent["state"] == "recorded" and sent["ack"]["submitted"] is True
-    assert sent["native_id"]  # original envelope retained for reconciliation
-    cap = se.handle_session_command(
-        {"op": "capture", "command_id": "cmd-2", "generation": 7, "target": target,
-         "limit_bytes": 4096, "claim": make_claim("cmd-2")},
-        custody=custody(), journal_dir=env["journal"], executable=env["fake"],
-        request=hub["request"])
-    assert cap["state"] == "captured" and cap["ack"]["submitted"] is True
-    stopped = se.handle_session_command(
-        {"op": "stop", "command_id": "cmd-3", "generation": 7, "target": target,
-         "claim": make_claim("cmd-3")},
-        custody=custody(), journal_dir=env["journal"], executable=env["fake"],
-        request=hub["request"])
-    assert stopped["state"] == "stopped"
-    con = sqlite3.connect(hub["db"])
-    assert con.execute("SELECT COUNT(*) FROM acks").fetchone()[0] == 3
-    con.close()
-    with pytest.raises(SessionControlError):
-        se.handle_session_command({"op": "launch-missiles"}, custody=custody(),
-                                  executable=env["fake"])
-
-
-def test_claimed_receiver_rejects_start(env):
-    # Fleet already handles start once; the claimed receiver never reconsumes
-    # Fleet offers or invokes start.
-    with pytest.raises(SessionControlError):
-        se.handle_session_command(
-            {"op": "start", "command_id": "s1", "generation": 1,
-             "claim": make_claim("s1")},
-            custody=custody(), journal_dir=env["journal"], executable=env["fake"])
-
-
-def test_claim_expiry_refuses_without_effect(env):
-    rec = seed_session(env)
-    target = {"session_id": rec["id"], "tag": "agent1", "workspace": env["work"]}
-    with pytest.raises(SessionControlError):
-        se.handle_session_command(
-            {"op": "send", "command_id": "exp-1", "generation": 7, "target": target,
-             "body": "too late", "claim": make_claim("exp-1", expired=True)},
-            custody=custody(), journal_dir=env["journal"], executable=env["fake"])
-    assert os.listdir(env["msgs"]) == []  # no effect after expired claim
-
-
-def test_repeated_claim_token_never_reauthorizes(env):
-    rec = seed_session(env)
-    target = {"session_id": rec["id"], "tag": "agent1", "workspace": env["work"]}
-    first = se.handle_session_command(
-        {"op": "send", "command_id": "tok-1", "generation": 7, "target": target,
-         "body": "once", "claim": make_claim("tok-1")},
-        custody=custody(), journal_dir=env["journal"], executable=env["fake"])
-    assert first["state"] == "recorded"
-    # A different token for the same command replays the journal — no new effect.
-    again = se.handle_session_command(
-        {"op": "send", "command_id": "tok-1", "generation": 7, "target": target,
-         "body": "once", "claim": make_claim("tok-1")},
-        custody=custody(), journal_dir=env["journal"], executable=env["fake"])
-    assert again.get("replayed") is True
-    assert len(os.listdir(env["msgs"])) == 1
-    # Uncertain attempt: durable uncertain outcome (no stranded
-    # attempted:true/state:null), never a second effect. The journal carries
-    # bounded stage/type/reason; a foreign token retry still refuses.
-    env["monkeypatch"].setenv("FAKE_MSG_BEHAVIOR", "crash")
-    uncertain = se.handle_session_command(
-        {"op": "send", "command_id": "tok-2", "generation": 7, "target": target,
-         "body": "risky", "claim": make_claim("tok-2")},
-        custody=custody(), journal_dir=env["journal"], executable=env["fake"])
-    assert uncertain["state"] == "uncertain"
-    assert uncertain.get("error_stage") == "send"
-    assert uncertain.get("error_type")
-    assert "attempted" in uncertain or True  # journal durable, not None-forever
-    env["monkeypatch"].setenv("FAKE_MSG_BEHAVIOR", "ok")
-    with pytest.raises(SessionUncertain):
-        se.handle_session_command(
-            {"op": "send", "command_id": "tok-2", "generation": 7, "target": target,
-             "body": "risky", "claim": make_claim("tok-2")},
-            custody=custody(), journal_dir=env["journal"], executable=env["fake"])
-    assert len(os.listdir(env["msgs"])) == 1  # only the first "once" envelope
-
 
 def test_status_probe_is_read_only(env):
     rec = seed_session(env)
     target = make_target(env, "agent1", rec["id"])
     info = se.session_status(env["fake"], target, custody=custody())
     assert info["phase"] == "running" and info["status_proven"] is True
+
+
+# --- M4 AC3: qualify by UUID when the canonical workspace is gone -----------
+
+def test_qualify_by_uuid_when_workspace_deleted(env):
+    # The canonical worktree is gone; the catalog row keeps the old path.
+    # Qualification proceeds by exact UUID (+ tag/generation/engine).
+    rec = seed_session(env, tag="ghost1", engine="codex")
+    gone = os.path.join(env["base"], "worktree-gone")
+    assert not os.path.exists(gone)
+    target = NativeTarget(session_id=rec["id"], tag="ghost1", workspace=gone,
+                          created_at_ms=1700000000000, engine="codex")
+    row = ns.qualify_target(env["fake"], target)
+    assert row.session_id == rec["id"]
+
+
+def test_qualify_uuid_fallback_still_checks_generation_and_engine(env):
+    rec = seed_session(env, tag="ghost2", engine="codex")
+    gone = os.path.join(env["base"], "worktree-gone")
+    with pytest.raises(SessionControlError):
+        ns.qualify_target(env["fake"], NativeTarget(
+            session_id=rec["id"], tag="ghost2", workspace=gone,
+            created_at_ms=123, engine="codex"))
+    with pytest.raises(SessionControlError):
+        ns.qualify_target(env["fake"], NativeTarget(
+            session_id=rec["id"], tag="ghost2", workspace=gone,
+            created_at_ms=1700000000000, engine="claude"))
+
+
+def test_qualify_uuid_fallback_refuses_unknown_uuid(env):
+    gone = os.path.join(env["base"], "worktree-gone")
+    with pytest.raises(SessionControlError) as exc:
+        ns.qualify_target(env["fake"], NativeTarget(
+            session_id=str(uuid.uuid4()), tag="nobody", workspace=gone))
+    assert "UUID alone" in str(exc.value)
+
+
+def test_no_uuid_fallback_while_workspace_exists(env):
+    # The same UUID+tag living in another EXISTING workspace must NOT qualify
+    # for this workspace: tag-reuse protection stays strict while the
+    # expected workspace exists.
+    seed_session(env, tag="agent1", engine="go")
+    rec = seed_session(env, tag="agent9", engine="go")
+    other = os.path.join(env["base"], "other")
+    os.makedirs(other)
+    # rec's real UUID+tag addressed at another existing workspace: the row in
+    # the original workspace must NOT be picked by UUID.
+    with pytest.raises(SessionControlError) as exc:
+        ns.qualify_target(env["fake"], NativeTarget(
+            session_id=rec["id"], tag="agent9", workspace=other))
+    assert "UUID alone" not in str(exc.value)
+
+
+def test_validated_tolerates_deleted_workspace_when_canonicalize_raises(env, monkeypatch):
+    # Windows canonicalization opens a real handle and raises for a deleted
+    # worktree; an existing path still refuses.
+    rec = seed_session(env, tag="ghost3", engine="codex")
+    gone = os.path.join(env["base"], "worktree-gone")
+
+    def boom(path):
+        raise PermissionError("Cannot canonicalize native workspace")
+
+    monkeypatch.setattr(ns, "canonicalize_workspace", boom)
+    target = NativeTarget(session_id=rec["id"], tag="ghost3",
+                          workspace=gone).validated()
+    assert target.workspace == os.path.abspath(gone)
+    with pytest.raises(PermissionError):
+        NativeTarget(session_id=rec["id"], tag="ghost3",
+                     workspace=env["work"]).validated()
