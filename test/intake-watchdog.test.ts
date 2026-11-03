@@ -504,7 +504,7 @@ describe('forgotten intake watchdog', () => {
     expect(notices.some(n=>n[0]==='intake_watchdog'&&n[2]?.includes('>30 min')&&n[2]?.includes('model_unsupported'))).toBe(true);
     // The bounded retry cap names the stuck cycle instead of looping forever;
     // the idle deadline itself is never reset by the repeating holds.
-    expect(w.project([t])[0]).toMatchObject({state:'escalated',reason:'only_failed_sessions'});
+    expect(w.project([t])[0]).toMatchObject({state:'escalated',reason:'session_ended_without_done_or_blocker_intake'});
     expect(w.project([t])[0].idle_ms).toBeGreaterThan(1800000);
   }));
   it('replays an already-recorded automatic stop after a future wake is added', async () => fixture(async h => {

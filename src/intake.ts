@@ -882,7 +882,8 @@ export class IntakeService {
       archived: archived === 'true' ? 1 : defaultOpen ? 0 : null };
     const total = intakeExportCounts(this.sql, p, filter.project).filter(r => intakeExportMatches(r, filter)).reduce((n, r) => n + Number(r.n), 0);
     const candidates = intakeExportPageIds(this.sql, p, filter, url.searchParams.get('after'), page.effective_limit + 1);
-    const items = candidates.slice(0, page.effective_limit).map(id => this.taskView(this.get('tasks', id)!, p));
+    const pageTasks = candidates.slice(0, page.effective_limit).map(id => this.get('tasks', id)!);
+    const items = this.taskViews(pageTasks, p);
     // Rules are capped at 128; check only their exact project counter keys.
     const rules = this.rows('rules').filter(rule => rule.project === null ||
       (typeof rule.project === 'string' && (filter.project === null || rule.project === filter.project) && intakeExportCounts(this.sql, p, rule.project).some(r => intakeExportMatches(r, filter))));

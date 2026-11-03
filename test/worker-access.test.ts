@@ -104,7 +104,7 @@ describe('scoped durable worker access',()=>{
   });
   expect((await api('/api/intake/tasks/'+task)).status).toBe(200);
   expect((await api('/api/intake/tasks/'+task.slice(0,8))).status).toBe(200);
-  expect((await api('/api/intake/tasks/'+other)).status).toBe(403);
+  expect((await api('/api/intake/tasks/'+other)).status).toBe(200); // same-project reads are within the worker grant
   for(const path of ['/api/quota?view=fleet','/api/quota?view=fleet&provider=codex&account=codex-orin']) {
    const res=await api(path);expect(res.status,await res.clone().text()).toBe(200);
    expect(await res.json()).toHaveProperty('pools');
@@ -168,8 +168,8 @@ describe('scoped durable worker access',()=>{
    for (const id of [other,blank,later]) h.sql.exec("INSERT INTO intake_triage_requests(task_id,request_key,session_id,state,requested_at) VALUES(?,?,?,'requested',?)",id,'triage-k',session,Date.now()-1000);
   });
   expect((await api('/api/intake/tasks/'+blank)).status).toBe(200);
-  expect((await api('/api/intake/tasks/'+blank.slice(0,8))).status).toBe(403); // exact ids only
-  expect((await api('/api/intake/tasks/'+third)).status).toBe(403);
+  expect((await api('/api/intake/tasks/'+blank.slice(0,8))).status).toBe(200); // project reads may resolve task prefixes
+  expect((await api('/api/intake/tasks/'+third)).status).toBe(200); // same project; no write grant
   // Existing AC is never replaced; missing AC may be filled, together with a project fix.
   expect((await api('/api/intake/tasks/'+other,{key:'t-over',expected_version:1,acceptance_criteria:'replaced'})).status).toBe(403);
   const ac=await api('/api/intake/tasks/'+blank,{key:'t-ac',expected_version:1,acceptance_criteria:'AC1 written by triage',project:'machine-management'});
@@ -222,11 +222,11 @@ describe('scoped durable worker access',()=>{
    expect([403,404]).toContain((await call(path,undefined,worker.access_token)).status);
  }));
 
- it.each(['headless','interactive'])('%s reads only its intake and appends only notes/report/blocker, never decisions or close',(mode)=>setup(async({task,other,worker,call}:any)=>{
+ it.each(['headless','interactive'])('%s reads project intakes and appends only authorized notes/report/blocker, never decisions or close',(mode)=>setup(async({task,other,worker,call}:any)=>{
   const api=(p:string,b?:any)=>call(p,b,worker.access_token);
   expect((await api('/api/intake/tasks/'+task)).status).toBe(200);
   expect((await api('/api/intake/tasks/'+task+'/history')).status).toBe(200);
-  expect((await api('/api/intake/tasks/'+other)).status).toBe(403);
+  expect((await api('/api/intake/tasks/'+other)).status).toBe(200); // same-project reads are permitted
   expect((await api('/api/intake/tasks')).status).toBe(403);
   let version=1;
   for(const kind of ['note','report','blocker']) {
@@ -264,7 +264,7 @@ describe('scoped durable worker access',()=>{
   const repaired=await issue(); expect(repaired.status,await repaired.clone().text()).toBe(200);
   const profile:any=await repaired.json(); expect(profile.worker_launch_id).toBe(id);
   expect((await call('/api/intake/tasks/'+task,undefined,profile.access_token)).status).toBe(200);
-  expect((await call('/api/intake/tasks/'+other,undefined,profile.access_token)).status).toBe(403);
+  expect((await call('/api/intake/tasks/'+other,undefined,profile.access_token)).status).toBe(200);
   for(const binding of [null, {native_id:uuid(),tag}, {native_id:native,tag:'hub-'+uuid()}]) {
    await runInDurableObject<Hub,any>(stub,(h:any)=>h.sql.exec('UPDATE session_control_sessions SET binding_json=? WHERE id=?',JSON.stringify(binding),session));
    expect((await issue()).status).toBe(409);
@@ -280,7 +280,7 @@ describe('scoped durable worker access',()=>{
   expect(refreshed.status,await refreshed.clone().text()).toBe(200);
   const pair:any=await refreshed.json();
   expect((await call('/api/intake/tasks/'+task,undefined,pair.access_token)).status).toBe(200);
-  expect((await call('/api/intake/tasks/'+other,undefined,pair.access_token)).status).toBe(403);
+  expect((await call('/api/intake/tasks/'+other,undefined,pair.access_token)).status).toBe(200);
   await runInDurableObject<Hub, any>(stub,(h:any)=>h.sql.exec('UPDATE worker_access SET expires_at=?',Date.now()-1));
   expect((await call('/api/intake/tasks/'+task,undefined,pair.access_token)).status).toBe(403);
  }));
@@ -498,7 +498,9 @@ describe('scoped durable worker access',()=>{
    expect((await api('/api/intake/tasks/'+id+'/events',{key:uuid(),expected_version:2,event:{kind:'decision',text:'no',source:src}})).status).toBe(403);
   }
   const untrusted=await api('/api/intake/tasks/'+other2);
-  expect(untrusted.status).toBe(403);expect(await code(untrusted)).toBe('cross_intake_forbidden');
+  expect(untrusted.status).toBe(200); // the unverified link grants no authority beyond project read
+  const untrustedWrite=await api('/api/intake/tasks/'+other2+'/events',{key:uuid(),expected_version:1,event:{kind:'note',text:'not linked',source:src}});
+  expect(untrustedWrite.status).toBe(403);expect(await code(untrustedWrite)).toBe('cross_intake_forbidden');
   // A one-time backfill rebuilds the index from existing open intakes.
   await runInDurableObject<Hub,any>(stub,(h:any)=>{
    h.sql.exec('DROP TABLE intake_session_links');h.intakeService.init();
@@ -518,7 +520,7 @@ describe('scoped durable worker access',()=>{
   expect((await api('/api/intake/tasks/'+cont)).status).toBe(200);
   expect((await api('/api/intake/tasks/'+task)).status).toBe(200);
  }));
- it('lets a session token file and complete a project-scoped blocker follow-up only for its own intake',()=>setup(async({task,session,other,worker,call}:any)=>{
+ it('lets a session token file and complete a project-scoped blocker follow-up only for its own intake',()=>setup(async({stub,task,session,other,worker,call}:any)=>{
   const api=(p:string,b?:any)=>call(p,b,worker.access_token);
   const key=uuid();
   const blocked=await api('/api/intake/tasks/'+task+'/blocker',{key:'blocker-'+key,expected_version:1,title:'Install missing compiler',
