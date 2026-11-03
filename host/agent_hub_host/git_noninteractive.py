@@ -169,10 +169,9 @@ def dead_proxy_finding(env: Optional[Mapping[str, str]] = None,
 
     Only loopback proxies are liveness-checked (a fast local TCP connect):
     a remote proxy may legitimately refuse our probe while serving git. A
-    loopback proxy with nothing listening is the observed Hub failure mode
-    (desktop HTTP(S)_PROXY with no listener): git to github fails and every
-    clone reports a bare ``repo_clone_failed``. The finding carries only a
-    sanitized host:port, never credentials. ``hosts`` lists the GitHub hosts
+    loopback proxy with nothing listening means git to github fails and every
+    clone would report a bare ``repo_clone_failed``. The finding carries only
+    a sanitized host:port, never credentials. ``hosts`` lists the GitHub hosts
     the attempted clone path needs (``gh`` also fetches release objects and
     the API); a proxy bypassed for all of them via NO_PROXY is left alone so
     an operator NO_PROXY workaround keeps working.

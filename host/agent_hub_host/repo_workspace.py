@@ -96,13 +96,12 @@ def ensure_repo_workspace(settings, label, *, home: Optional[str] = None,
     path.parent.mkdir(parents=True, exist_ok=True)
     slug = f"{owner}/{name}"
     gh = gh_bin if gh_bin is not None else git_noninteractive.find_gh()
-    # Preflight (intake hubfail-t2596u): a dead loopback proxy is the observed
-    # Hub failure mode (desktop HTTPS_PROXY with no listener). Name it as the
-    # reason instead of a bare clone failure; the message carries only a
-    # sanitized host:port, never credentials. gh auth is advisory here (public
-    # repos clone without it) and joins the failure tail below. A proxy
-    # bypassed for every needed GitHub host via NO_PROXY (the operator
-    # workaround for codex-vpn) is left alone; nothing here writes env.
+    # Preflight (intake hubfail-t2596u): a dead loopback proxy would fail every
+    # clone with a bare error. Name it as the reason instead of a bare clone
+    # failure; the message carries only a sanitized host:port, never
+    # credentials. gh auth is advisory here (public repos clone without it)
+    # and joins the failure tail below. A proxy bypassed for every needed
+    # GitHub host via NO_PROXY is left alone; nothing here writes env.
     wanted = ((git_noninteractive._GITHUB_SUFFIXES + git_noninteractive._GH_EXTRA_HOSTS)
               if gh else git_noninteractive._GITHUB_SUFFIXES)
     proxy_finding = git_noninteractive.dead_proxy_finding(hosts=wanted)
