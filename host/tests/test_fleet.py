@@ -265,6 +265,57 @@ class FleetTests(unittest.TestCase):
             self.assertEqual(start_argv[start_argv.index('--cpu-quota-us') + 1], '100000')
             self.assertEqual(start_argv[start_argv.index('--cpu-period-us') + 1], '100000')
 
+    def test_claude_interactive_dispatch_passes_selected_model_and_effort_to_engine_argv(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = settings(Path(tmp))
+            cfg['subscriptions'] = [{
+                'service': 'claude', 'account_label': 'shared-claude', 'plan': 'pro',
+                'engine': 'claude', 'profile': None, 'launcher_provider': 'claude',
+                'launcher_model': 'sonnet', 'launcher_effort': 'medium',
+                'admission_argv': ['maintained-gate'],
+            }]
+            cfg['launcher'] = {
+                'argv': ['maintained-launcher'], 'root': tmp,
+                'config_dir': str(Path(tmp) / 'config'),
+            }
+            selection = {'id': 'sonnet', 'model': 'sonnet', 'provider': 'claude',
+                         'engine': 'claude', 'effort': 'medium'}
+            req = offer(engine='claude', account='shared-claude', selection=selection)
+            calls = []
+
+            def runner(argv, **kwargs):
+                calls.append((argv, kwargs))
+                if argv == ['maintained-gate']:
+                    return {'launch_allowed': True, 'profile_supported': True,
+                            'account_label': 'shared-claude', 'observed_at': fleet.utcnow()}
+                if 'model-support' in argv:
+                    return {'supported': True, 'provider': 'claude', 'model': 'sonnet'}
+                if argv[:2] == ['aplexer', 'start']:
+                    return {'id': 'native-claude', 'cwd': tmp, 'workspace': tmp,
+                            'tag': 'hub-' + req['id'], 'engine': 'claude', 'profile': None,
+                            'phase': 'running',
+                            'command': ['claude', '--model', 'sonnet', '--effort', 'medium']}
+                return {}
+
+            dispatcher = fleet.Dispatcher(cfg, lambda *_args: {}, runner)
+            with patch('agent_hub_host.host_load.check_live_load'):
+                result = dispatcher.dispatch(req)
+
+            self.assertEqual(result['state'], 'running')
+            start_argv = next(argv for argv, _ in calls if argv[:2] == ['aplexer', 'start'])
+            command = start_argv[start_argv.index('--') + 1:]
+            self.assertEqual(command, [
+                'claude', '--model', 'sonnet', '--effort', 'medium',
+            ])
+
+    def test_claude_startup_argv_replaces_stale_route_flags_before_prompt(self):
+        result = fleet.claude_route_argv(
+            ['claude', '--model', 'opus', '--effort', 'high', '-p', 'synthetic prompt', '--effort=high'],
+            'sonnet', 'medium')
+        self.assertEqual(result, [
+            'claude', '--model', 'sonnet', '--effort', 'medium', '-p', 'synthetic prompt',
+        ])
+
     def test_unsupported_or_unknown_gate_never_claims_or_launches(self):
         with tempfile.TemporaryDirectory() as tmp:
             http = []

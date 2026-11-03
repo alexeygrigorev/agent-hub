@@ -7,7 +7,7 @@ import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
 
 describe('managed Claude placement (798f0f8c)', () => {
-  it('keeps daily Claude on Sonnet and routes reasoned deep starts to medium Opus across both hosts', async () => {
+  it('routes default and reasoned deep starts to Sonnet at medium across both hosts', async () => {
     const now = Date.now();
     const iso = (delta = 0) => new Date(now + delta).toISOString();
     const bindings = env as unknown as Env;
@@ -41,14 +41,23 @@ describe('managed Claude placement (798f0f8c)', () => {
           const plan = fleet.plan({ engine: 'claude', tier,
             ...(tier === 'deep' ? { engine_override_reason: 'This task requires deep reasoning.' } : {}),
             machine, mode: 'headless', workspace: 'demo', prompt: 'Return the proof marker' });
-          const expectedModel = tier === 'deep' ? 'opus' : 'sonnet';
           expect(plan.selected, JSON.stringify(plan.rejected)).toMatchObject({
             machine, engine: 'claude', account: 'hub-claude', profile: 'hub-hub-claude',
-            selection: { model: expectedModel, effort: 'medium', engine: 'claude', provider: 'claude' },
+            selection: { model: 'sonnet', effort: 'medium', engine: 'claude', provider: 'claude' },
           });
           expect(plan.selected?.mode).toBeUndefined();
           expect(plan.selected?.with_goal).toBeUndefined();
           expect(plan.rejected).not.toContainEqual(expect.objectContaining({ machine, reason: 'model_unsupported' }));
+        }
+
+        const defaultPlan = fleet.plan({ machine, mode: 'headless', workspace: 'demo', prompt: 'Return the proof marker' });
+        expect(defaultPlan.selected, JSON.stringify(defaultPlan.rejected)).toMatchObject({
+          machine, engine: 'claude', account: 'hub-claude', profile: 'hub-hub-claude',
+          selection: { model: 'sonnet', effort: 'medium', engine: 'claude', provider: 'claude' },
+        });
+        for (const effort of ['low', 'high', 'max']) {
+          const nonMediumPlan = fleet.plan({ machine, mode: 'headless', workspace: 'demo', effort });
+          expect(nonMediumPlan.selected ?? null, `${machine}/${effort}`).toBeNull();
         }
       }
 
@@ -81,7 +90,7 @@ describe('managed Claude placement (798f0f8c)', () => {
       const intent = { engine: 'claude', engine_override_reason: 'This task explicitly requires deep reasoning.', tier: 'deep', machine, mode: 'headless', workspace: 'demo', prompt: 'Return the proof marker' };
       const plan = fleet.plan(intent);
       expect(plan.selected, JSON.stringify(plan.rejected)).toMatchObject({
-        account: 'hub-claude', selection: { model: 'opus', effort: 'medium' },
+        account: 'hub-claude', selection: { model: 'sonnet', effort: 'medium' },
       });
       expect(plan.selected?.mode).toBeUndefined();
       expect(plan.request.mode).toBe('headless');
@@ -92,7 +101,10 @@ describe('managed Claude placement (798f0f8c)', () => {
       for (const tier of ['deep', 'review']) {
         for (const engine of [undefined, 'claude']) {
           const goal = fleet.plan({ ...intent, engine, tier, mode: 'interactive', with_goal: true });
-          expect(goal.selected, JSON.stringify(goal.rejected)).toMatchObject({ machine, engine: 'claude', account: 'shared-claude' });
+          expect(goal.selected, JSON.stringify(goal.rejected)).toMatchObject({
+            machine, engine: 'claude', account: 'shared-claude',
+            selection: { model: 'sonnet', effort: 'medium', engine: 'claude', provider: 'claude' },
+          });
           expect(goal.request.with_goal).toBe(true);
           expect(goal.rejected).not.toContainEqual(expect.objectContaining({ machine, account: 'shared-claude', reason: 'goal_unsupported' }));
         }

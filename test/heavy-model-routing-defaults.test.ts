@@ -3,9 +3,9 @@ import { deepModelAllowedForTier, heavyModelEffortAllowed, isDeepModel, isHeavyM
 
 // Intake abd728b2: heavy models stay at medium, and deep models stay out of daily.
 const NOW = Date.parse('2026-11-03T00:00:00Z');
-const HEAVY_MODEL_IDS = ['sol', 'astra', 'argon', 'argon-gemini', 'opus'];
+const HEAVY_MODEL_IDS = ['sol', 'astra', 'argon', 'argon-gemini'];
 const REQUIRED_HEAVY_MODEL_IDS = ['sol', 'astra', 'argon', 'argon-gemini'];
-const DEEP_MODEL_IDS = ['argon', 'argon-gemini', 'astra', 'opus'];
+const DEEP_MODEL_IDS = ['argon', 'argon-gemini', 'astra'];
 const GEMINI4_ARGON_MODELS = (policy.models as any[])
   .filter(model => String(model.model).startsWith('gemini-4-argon-'));
 const ARGON_ROUTE_IDS = (policy.models as any[])
@@ -40,6 +40,15 @@ describe('heavy model routing defaults', () => {
   const models = new Map((policy.models as any[]).map(model => [model.id, model]));
   const configuredDeepModelIds = DEEP_MODEL_IDS.filter(id => models.has(id));
 
+  it('pins Claude route effort to Sonnet medium even when a caller overrides effort', () => {
+    const sonnet = models.get('sonnet');
+    expect(sonnet).toBeDefined();
+    expect(heavyModelEffortAllowed(sonnet, 'medium')).toBe(true);
+    for (const effort of ['low', 'high', 'max', 'xhigh', undefined]) {
+      expect(heavyModelEffortAllowed(sonnet, effort), String(effort)).toBe(false);
+    }
+  });
+
   it('keeps every heavy model at medium effort and uses the non-high Argon model id', () => {
     for (const id of REQUIRED_HEAVY_MODEL_IDS) {
       const model = models.get(id);
@@ -60,8 +69,8 @@ describe('heavy model routing defaults', () => {
       const model = models.get(id);
       if (model) expect(model.effort, id).toBe('medium');
     }
-    // Opus is configured for deep/review only and must remain medium effort.
-    expect(models.get('opus')?.effort).toBe('medium');
+    // Claude Opus is not a configured route; Claude policy uses Sonnet only.
+    expect(models.has('opus')).toBe(false);
     expect(isHeavyModel('gemini-4-argon-high')).toBe(true);
     expect(heavyModelEffortAllowed('gemini-4-argon-high', 'high')).toBe(false);
     expect(isDeepModel('gemini-4-argon-medium')).toBe(true);
@@ -70,8 +79,8 @@ describe('heavy model routing defaults', () => {
     expect(isDeepModel('gpt-6-astra')).toBe(true);
     expect(isHeavyModel('gpt-6.1-sol')).toBe(true);
     expect(heavyModelEffortAllowed('gpt-6.1-sol', 'high')).toBe(false);
-    expect(isHeavyModel('opus')).toBe(true);
-    expect(isDeepModel('opus')).toBe(true);
+    expect(isHeavyModel('opus')).toBe(false);
+    expect(isDeepModel('opus')).toBe(false);
     expect(isHeavyModel('gemini-4-argon-contributor')).toBe(false);
     expect(isDeepModel('gemini-4-argon-contributor')).toBe(false);
     for (const model of policy.models as any[]) {

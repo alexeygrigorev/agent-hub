@@ -118,9 +118,9 @@ describe('generic accounts and launch placement', () => {
     for (const [label] of entries) {
       expect(fleet.accounts.find((a: any) => a.label === label)).toMatchObject({ placeable_slots: 8, placement_reasons: [] });
     }
-    const opusPlan = await (await s.handle(request('/plan', intent({ mode: 'headless', workspace: '/data/agents/project/worktrees/recovery', engine: 'opus', tier: 'deep', engine_override_reason: 'This task explicitly requires deep reasoning.' })), admin)).json() as any;
-    // The explicit Opus selector resolves to the newly configured medium model.
-    expect(opusPlan.selected?.selection).toMatchObject({ id: 'opus', model: 'opus', effort: 'medium' });
+    const claudePlan = await (await s.handle(request('/plan', intent({ mode: 'headless', workspace: '/data/agents/project/worktrees/recovery', engine: 'claude', tier: 'deep', engine_override_reason: 'This task explicitly requires deep reasoning.' })), admin)).json() as any;
+    // Deep Claude requests resolve to the configured Sonnet route at medium effort.
+    expect(claudePlan.selected?.selection).toMatchObject({ id: 'sonnet', model: 'sonnet', effort: 'medium' });
     const glmPlan = await (await s.handle(request('/plan', intent({ mode: 'headless', workspace: '/data/agents/project/worktrees/recovery', engine: 'glm-flash', tier: 'daily' })), admin)).json() as any;
     expect(glmPlan.selected?.engine, JSON.stringify(glmPlan.rejected)).toBe('zcodex');
     expect(glmPlan.rejected).toEqual([]);
