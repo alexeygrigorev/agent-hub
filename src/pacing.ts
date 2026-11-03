@@ -482,6 +482,8 @@ export interface EngineDecisionInput {
   nowMs: number;
   cpuLoad: number;
   pendingLaunches: number;
+  /** Running/uncertain sessions on the host: a bounded spread term on top of CPU telemetry. */
+  runningSessions?: number;
   familyLoad: number;
   accountActive: number;
   accountMaxConcurrency: number;
@@ -527,8 +529,43 @@ export interface EngineDecisionResult {
     available_slots: number;
     max_concurrency: number;
     recent_failures: number;
+    /** cpu busy ratio and in-flight launches that produced host_factor. */
+    host_cpu_load: number;
+    host_pending_launches: number;
+    host_running_sessions: number;
   };
+  /** 0-100 score relative to the best eligible candidate of the same plan (set by applyNormalizedScores). */
+  normalized_score: number | null;
 }
+
+/** Compact, readable score: fixed 4 decimals, exponent form below 1e-3 (0.0000 hid every loaded candidate). */
+export function formatScore(score: number): string {
+  return score === 0 ? '0' : score < 0.001 ? score.toExponential(2) : score.toFixed(4);
+}
+
+/**
+ * Normalize composite scores of one plan to 0-100 against the best candidate.
+ * Ordering is untouched (monotonic in the raw score); the raw score stays for ties
+ * and audit. Rewrites the reasons so every surface shows `norm=NN`.
+ */
+export function applyNormalizedScores(candidates: any[]): void {
+  const best = candidates.reduce((m, c) => Math.max(m, Number(c?.decision?.score ?? c?.score ?? 0)), 0);
+  for (const c of candidates) {
+    const d = c?.decision;
+    if (!d) continue;
+    const norm = best > 0 ? Math.round((Number(d.score) / best) * 1000) / 10 : 0;
+    d.normalized_score = norm;
+    const tag = ` norm=${norm}/100`;
+    const addTag = (r: unknown) => (typeof r === 'string' && !r.includes(' norm=') ? r.replace(' [rem=', tag + ' [rem=') : r);
+    d.reason = addTag(d.reason);
+    c.decision_reason = addTag(c.decision_reason);
+    if (c.selection) { c.selection.decision_reason = d.reason; c.selection.decision = d; }
+  }
+}
+
+/** Each running session on a host adds this much to the host load term, capped (spread without crushing busy hosts). */
+const HOST_RUNNING_WEIGHT = 0.05;
+const HOST_RUNNING_CAP = 0.5;
 
 export function computeEngineDecision(input: EngineDecisionInput): EngineDecisionResult {
   const unmeteredProviders = ((policy.rules as any).unmetered_providers as string[] | undefined) ?? [];
@@ -550,7 +587,10 @@ export function computeEngineDecision(input: EngineDecisionInput): EngineDecisio
   const loadFactor = slotHeadroom / ((1 + famActive) * (1 + 0.25 * acctActive));
   const failures = Math.max(0, input.recentAccountFailures || 0);
   const failureFactor = 1 / (1 + 0.5 * failures + (input.degraded ? 0.5 : 0));
-  const hostFactor = 1 / (1 + Math.max(0, input.cpuLoad) + Math.max(0, input.pendingLaunches));
+  const hostCpu = Math.max(0, input.cpuLoad);
+  const hostPending = Math.max(0, input.pendingLaunches);
+  const hostRunning = Math.min(HOST_RUNNING_CAP, HOST_RUNNING_WEIGHT * Math.max(0, input.runningSessions ?? 0));
+  const hostFactor = 1 / (1 + hostCpu + hostPending + hostRunning);
   const tbm = Number.isFinite(input.tbmWeight) && input.tbmWeight > 0 ? input.tbmWeight : 1;
   const fbFactor = fallbackFactor(fallbackModelIds().has(String(input.model?.id)), input.healthyAlternative === true);
   const rawScore = headroomFactor * burn.factor * pref * tierFit * loadFactor * failureFactor * hostFactor * tbm * fbFactor;
@@ -564,7 +604,7 @@ export function computeEngineDecision(input: EngineDecisionInput): EngineDecisio
   const overridePart = input.pinnedEngine && input.overrideReason
     ? ` override_reason=${JSON.stringify(input.overrideReason)}`
     : '';
-  const reason = `${mode}: ${input.engine}/${input.account ?? 'default'} (${modelLabel}) on ${input.machine} score=${score.toFixed(4)} [rem=${Math.round(remainingPct)}% ${winPart} ${ratioPart} status=${burn.burn_status} burn=${burn.factor.toFixed(2)}x${burn.expiry_factor > 1 ? `(pace ${burn.pace_factor.toFixed(2)}x expiry ${burn.expiry_factor.toFixed(2)}x unused ${burn.forecast?.projected_unused_percent ?? 0}%)` : ""} pref=${pref.toFixed(2)}x${fbFactor < 1 ? ` fallback=${fbFactor.toFixed(2)}x` : ''} tier=${input.tier}(${tierFit.toFixed(2)}x) load=acct:${acctActive}/${maxConc},fam:${famActive} fail=${failures}${overridePart}]`;
+  const reason = `${mode}: ${input.engine}/${input.account ?? 'default'} (${modelLabel}) on ${input.machine} score=${formatScore(score)} [rem=${Math.round(remainingPct)}% ${winPart} ${ratioPart} status=${burn.burn_status} burn=${burn.factor.toFixed(2)}x${burn.expiry_factor > 1 ? `(pace ${burn.pace_factor.toFixed(2)}x expiry ${burn.expiry_factor.toFixed(2)}x unused ${burn.forecast?.projected_unused_percent ?? 0}%)` : ""} pref=${pref.toFixed(2)}x${fbFactor < 1 ? ` fallback=${fbFactor.toFixed(2)}x` : ''} tier=${input.tier}(${tierFit.toFixed(2)}x) load=acct:${acctActive}/${maxConc},fam:${famActive}(${loadFactor.toFixed(2)}x) host=cpu:${hostCpu.toFixed(2)},pend:${hostPending},run:${Math.max(0, input.runningSessions ?? 0)}(${hostFactor.toFixed(2)}x) fail=${failures}(${failureFactor.toFixed(2)}x)${overridePart}]`;
   return {
     mode,
     score,
@@ -594,7 +634,11 @@ export function computeEngineDecision(input: EngineDecisionInput): EngineDecisio
       available_slots: availSlots,
       max_concurrency: maxConc,
       recent_failures: failures,
+      host_cpu_load: Math.round(hostCpu * 1000) / 1000,
+      host_pending_launches: hostPending,
+      host_running_sessions: Math.max(0, input.runningSessions ?? 0),
     },
+    normalized_score: null,
   };
 }
 /** `burn` (src/burn.ts) is the use-it-or-lose-it multiplier; absent stays neutral. */
