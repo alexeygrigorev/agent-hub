@@ -296,7 +296,7 @@ describe('forgotten intake watchdog', () => {
     const alertKinds=alerts.filter(a=>a[0]==='intake_queue').map(a=>a[1]);
     expect(alertKinds).toContain(t.id);
     now+=QUEUE_RETRY_BASE_MS;await w.tick();
-    expect(alerts.filter(a=>a[0]==='intake_queue'&&a[1]===t.id)).toHaveLength(1);
+    expect(alerts.filter(a=>a[0]==='intake_queue'&&a[1]===t.id&&String(a[2]).includes('hold_ttl_workspace_configuration_required'))).toHaveLength(1);
   }));
   it('rechecks a stale criteria escalation and surfaces the current blocker without bypassing admission', async () => fixture(async h => {
     const t=task('criteria-added-after-escalation');let starts=0;
