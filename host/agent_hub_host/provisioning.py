@@ -2799,7 +2799,8 @@ def execute():
                 # This adapter-only marker is consumed above and must never reach Codex.
                 extra_argv = [arg for arg in extra_argv if not arg.startswith('--hub-session-effort=')]
                 bundle_args = b['args']
-                if b['provider'] == 'codex' and not is_diagnostic:
+                _, caller_override = strip_codex_effort_args(extra_argv) if b['provider'] == 'codex' else (extra_argv, False)
+                if b['provider'] == 'codex' and not is_diagnostic and (effort_args or caller_override):
                     bundle_args, _ = strip_codex_effort_args(bundle_args)
                 # Keep explicit caller argv last so it can override routed/session policy.
                 argv = command + isolated_argv(b['provider'], bundle_args + bypass_flags + effort_args + extra_argv)
