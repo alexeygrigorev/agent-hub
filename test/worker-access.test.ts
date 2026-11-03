@@ -524,7 +524,7 @@ describe('scoped durable worker access',()=>{
   expect((await api('/api/intake/tasks/'+cont)).status).toBe(200);
   expect((await api('/api/intake/tasks/'+task)).status).toBe(200);
  }));
- it('resolves own and created intakes by unique short-id prefix (08658ee8 AC3)',()=>setup(async({task,other,worker,call}:any)=>{
+ it('resolves own and created intakes by unique short-id prefix (08658ee8 AC3)',()=>setup(async({stub,task,other,worker,call}:any)=>{
   const api=(p:string,b?:any)=>call(p,b,worker.access_token);
   const code=async(r:Response)=>((await r.json()) as any).error;
   // Own intake by 8-char prefix reads like the full id.
@@ -535,7 +535,12 @@ describe('scoped durable worker access',()=>{
   expect(made.status,await made.clone().text()).toBe(200);
   const created:any=(await made.json() as any).task;
   expect((await api('/api/intake/tasks/'+created.id.slice(0,8))).status).toBe(200);
-  // Another intake's prefix stays forbidden with the cross-intake code.
+  // A different-project intake's prefix stays forbidden with the cross-intake code.
+  await runInDurableObject<Hub,any>(stub,(h:any)=>{
+   const row=h.sql.exec('SELECT data FROM intake_tasks WHERE id=?',other).toArray()[0];
+   const data=JSON.parse(row.data);data.project='dataops';
+   h.sql.exec('UPDATE intake_tasks SET data=? WHERE id=?',JSON.stringify(data),other);
+  });
   const cross=await api('/api/intake/tasks/'+other.slice(0,8));
   expect(cross.status).toBe(403);expect(await code(cross)).toBe('cross_intake_forbidden');
   // Unknown prefixes stay forbidden, never a 404 oracle.
