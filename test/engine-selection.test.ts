@@ -98,15 +98,11 @@ describe('Hub engine-selection decision logic (intake 83d27f69)', () => {
 
       const plan: any = fleet.plan({ machine, mode: 'headless', workspace: 'agent-hub', prompt: 'implement task' });
       expect(plan.selected).toBeTruthy();
-      expect(plan.selected.engine).toBe('antigravity');
-      expect(plan.selected.account).toBe('hub-antigravity');
-      expect(plan.selected.decision_reason).toContain('auto: antigravity/hub-antigravity');
-      expect(plan.selected.decision_reason).toContain('rem=60%');
+      expect(plan.selected.engine).not.toBe('antigravity');
+      expect(plan.candidates.some((c: any) => c.engine === 'antigravity')).toBe(false);
 
       const claudeCand = plan.candidates.find((c: any) => c.engine === 'claude');
-      const agyCand = plan.candidates.find((c: any) => c.engine === 'antigravity');
       expect(claudeCand).toBeTruthy();
-      expect(agyCand.score).toBeGreaterThan(claudeCand.score * 10);
       expect(claudeCand.decision.factors.depleted).toBe(true);
       expect(claudeCand.selection).toMatchObject({ id: 'sonnet', model: 'sonnet', effort: 'medium' });
       expect(plan.candidates.filter((c: any) => c.engine === 'claude').every((c: any) =>
@@ -119,7 +115,7 @@ describe('Hub engine-selection decision logic (intake 83d27f69)', () => {
       const ordinaryAsk: any = fleet.plan({ machine, mode: 'headless', workspace: 'agent-hub', prompt: 'routine ask', tier: 'ask' });
       expect(ordinaryAsk.candidates.some((c: any) => c.selection?.id === 'astra')).toBe(false);
       const explicitDeep: any = fleet.plan({ machine, mode: 'headless', workspace: 'agent-hub', prompt: 'deep review', tier: 'deep', engine_override_reason: 'This task requires deep reasoning for the review.' });
-      expect(explicitDeep.candidates.some((c: any) => c.selection?.id === 'astra')).toBe(true);
+      expect(explicitDeep.candidates.some((c: any) => c.selection?.id === 'astra' && c.selection?.effort === 'medium')).toBe(true);
 
       // Luna is a config-driven fallback (rules.fallback_models): while a healthy
       // non-fallback route exists its score is down-weighted by rules.fallback_factor
@@ -132,8 +128,9 @@ describe('Hub engine-selection decision logic (intake 83d27f69)', () => {
       updateSub('zai-central', 'zai', 40);
       updateSub('shared-codex', 'codex', 95);
       const withHealthy: any = fleet.plan({ machine, mode: 'headless', workspace: 'agent-hub', prompt: 'ordinary start' });
-      for (const id of ['argon', 'muse', 'sonnet', 'luna'])
+      for (const id of ['muse', 'sonnet', 'luna'])
         expect(withHealthy.candidates.some((c: any) => c.selection?.id === id), id).toBe(true);
+      expect(withHealthy.candidates.some((c: any) => c.selection?.id === 'argon')).toBe(false);
       expect(withHealthy.candidates.some((c: any) =>
         c.engine === 'zcodex' && c.account === 'zai-central' && c.selection?.provider === 'zai')).toBe(true);
       const lunaHealthy = withHealthy.candidates.find((c: any) => c.selection?.id === 'luna');
@@ -145,7 +142,7 @@ describe('Hub engine-selection decision logic (intake 83d27f69)', () => {
       expect(withHealthy.candidates.filter((c: any) => c.selection?.id !== 'luna').every((c: any) => c.decision.factors.fallback_factor === 1)).toBe(true);
 
       // Current fleet shape (2026-11-02): claude 10%, zai 8%, muse 43%, codex 45%,
-      // antigravity 40%. Claude is depleted and must lose to every healthy engine;
+      // Antigravity is deep-only. Claude is depleted and must lose to every healthy daily engine;
       // healthy codex stays a real candidate (only the fallback factor applies).
       updateSub('hub-claude', 'claude', 10);
       updateSub('shared-claude', 'claude', 10);
@@ -158,7 +155,7 @@ describe('Hub engine-selection decision logic (intake 83d27f69)', () => {
       expect(current.selected.engine).not.toBe('claude');
       expect(best((c: any) => c.engine === 'claude')).toBeLessThan(best((c: any) => c.engine === 'codex'));
       expect(best((c: any) => c.engine === 'claude')).toBeLessThan(best((c: any) => c.engine === 'opencode'));
-      expect(best((c: any) => c.engine === 'claude')).toBeLessThan(best((c: any) => c.engine === 'antigravity'));
+      expect(current.candidates.some((c: any) => c.engine === 'antigravity')).toBe(false);
       expect(current.candidates.find((c: any) => c.engine === 'codex').decision.factors.fallback_factor).toBe((routingPolicy.rules as any).fallback_factor);
 
       // With no healthy non-fallback route left the fallback is not down-weighted
