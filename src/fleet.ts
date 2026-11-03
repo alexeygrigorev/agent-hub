@@ -325,6 +325,14 @@ export function isCapacityOnlyHold(rejected: unknown): rejected is { machine: st
   return capacity;
 }
 const HEADERS = { 'Cache-Control': 'private, no-store' };
+/** Intake 94186660: default/small page for the /api/fleet sessions list. */
+export const FLEET_SESSIONS_DEFAULT = 100;
+export const FLEET_SESSIONS_MAX = 500;
+const b64urlEncode = (s: string) => btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const b64urlDecode = (s: string) => {
+  const padded = s.replace(/-/g, '+').replace(/_/g, '/');
+  return atob(padded + '='.repeat((4 - (padded.length % 4)) % 4));
+};
 export function overflowMachine(machine: any, needs: string[]): boolean {
   return String(machine?.os ?? '').trim().toLowerCase() === 'windows' && !needs.includes('os:windows');
 }
@@ -760,6 +768,9 @@ export class FleetService {
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_updated ON fleet_launches(updated_at)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_memory_holds_retry ON fleet_memory_holds(retry_id)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_session_incarnation ON fleet_sessions(machine_id,tag,engine,account,profile,workspace,phase)');
+    // Intake 94186660: serves the /api/fleet sessions keyset page
+    // (ORDER BY machine_id, tag, native_id with a 3-part cursor).
+    this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_session_page ON fleet_sessions(machine_id,tag,native_id)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_route_account ON fleet_routes(account)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_queue_live_machines ON machines(last_checkin_at,id) WHERE drained=0 AND revoked_at IS NULL');
     this.sql.exec('CREATE INDEX IF NOT EXISTS routing_launch ON routing_jobs(launch_id)');
@@ -2348,9 +2359,40 @@ export class FleetService {
     }
     if (path === '/api/fleet' && request.method === 'GET') {
       if (!admin) return response({ error: 'forbidden' }, 403);
+      // Intake 94186660: paginated sessions + section allowlist.
+      // Sessions are keyset-paged over (machine_id, tag, native_id); the
+      // native_id tie-break keeps page boundaries exact when tags repeat on
+      // one machine (tags are not unique per machine). Defaults are a small
+      // page; full walks follow sessions_cursor_next until null.
+      const fleetParams = new URL(request.url).searchParams;
+      const KNOWN_SECTIONS = ['accounts', 'routes', 'machines', 'machine_aliases', 'agents', 'sessions', 'host_resources', 'resource_management', 'placement', 'subscriptions', 'launches'];
+      const sectionsRaw = fleetParams.get('sections');
+      const sections = sectionsRaw === null ? null
+        : new Set(sectionsRaw.split(',').map(s => s.trim()).filter(s => KNOWN_SECTIONS.includes(s)));
+      if (sections !== null && sections.size === 0) return response({ error: 'invalid_sections' }, 400);
+      const want = (s: string) => sections === null || sections.has(s);
+      const sessLimRaw = fleetParams.get('sessions_limit');
+      if (sessLimRaw !== null && !/^\d{1,4}$/.test(sessLimRaw)) return response({ error: 'invalid_sessions_limit' }, 400);
+      const sessLimit = sessLimRaw === null ? FLEET_SESSIONS_DEFAULT : Math.min(FLEET_SESSIONS_MAX, Math.max(1, Number(sessLimRaw)));
+      let sessCursor: [string, string, string] | null = null;
+      const sessCursorRaw = fleetParams.get('sessions_cursor');
+      if (sessCursorRaw) {
+        try {
+          const decoded = JSON.parse(b64urlDecode(sessCursorRaw));
+          if (!Array.isArray(decoded) || decoded.length !== 3 || decoded.some((v: any) => typeof v !== 'string' || v.length > 256 || /[\x00-\x1f\x7f]/.test(v))) throw new Error('bad cursor');
+          sessCursor = decoded as [string, string, string];
+        } catch { return response({ error: 'invalid_cursor' }, 400); }
+      }
+      // Change detection note (intake 94186660): no ETag/304 here. The only
+      // cheap global primitive (PRAGMA data_version) does not move on writes
+      // in the Workers/miniflare runtime, and a trigger-maintained revision
+      // would fire per row on the hot host-telemetry upserts (write
+      // amplification against 8081a05a/e8a22f4c). Revisit with the rows-read
+      // program if a trustworthy version appears.
       // Harness per (machine, account) for the subscriptions table: every
       // quota row exposes both the harness and the provider/account pair.
       const routeHarness = new Map<string, Set<string>>();
+      if (want('subscriptions')) {
       try {
         for (const r of this.sql.exec('SELECT machine_id, account, engine FROM fleet_routes').toArray() as any[]) {
           const key = String(r.machine_id) + ' ' + String(r.account);
@@ -2358,13 +2400,18 @@ export class FleetService {
           routeHarness.get(key)!.add(canonicalHarness(String(r.engine)));
         }
       } catch { /* harness reads as unknown below */ }
-      const controlIds = new Map<string, string>();      try {
+      }
+      const controlIds = new Map<string, string>();
+      if (want('launches')) {      try {
         for (const row of this.sql.exec('SELECT id, fleet_launch_id FROM session_control_sessions WHERE fleet_launch_id IN (SELECT id FROM fleet_launches ORDER BY created_at DESC LIMIT 200)').toArray() as any[]) controlIds.set(row.fleet_launch_id, row.id);
       } catch { /* optional session-control store */ }
+      }
       // Machine aliasing (mark, never delete): records sharing a normalized
       // hostname resolve to the live canonical host; sessions on a stale
       // alias resolve to the canonical host for display and liveness.
       let machineAliases: Record<string, string> = {};
+      const needAliases = want('machines') || want('machine_aliases') || want('sessions');
+      if (needAliases) {
       try {
         const aliasRows = this.sql.exec('SELECT id, hostname, drained, last_checkin_at FROM machines WHERE revoked_at IS NULL').toArray() as any[];
         const resolution = resolveMachineAliases(aliasRows.map((m: any) => {
@@ -2373,28 +2420,60 @@ export class FleetService {
         }));
         machineAliases = Object.fromEntries(resolution.aliasOf.entries());
       } catch { machineAliases = {}; }
-      const machines = this.sql.exec('SELECT id, name, hostname, last_checkin_at, drained FROM machines WHERE revoked_at IS NULL ORDER BY id').toArray().map((m: any) => {
+      }
+      const machines = want('machines') ? this.sql.exec('SELECT id, name, hostname, last_checkin_at, drained FROM machines WHERE revoked_at IS NULL ORDER BY id').toArray().map((m: any) => {
         const canonical = machineAliases[String(m.id)] ?? null;
         return { ...m, last_checkin_at: effectiveCheckin(m.id, m.last_checkin_at), alias_of: canonical, canonical_id: canonical ?? String(m.id) };
-      });
+      }) : [];
       // Intake 94186660: capabilities for the supports_goal flag come from
       // one machines read, not one query per route (N+1 on this page).
       let capsByMachine = new Map<string, any>();
+      if (want('routes')) {
       try {
         capsByMachine = new Map((this.sql.exec('SELECT id, capabilities FROM machines').toArray() as any[]).map(m => [String(m.id), parsed(m.capabilities)]));
       } catch { capsByMachine = new Map(); }
-      const sessions = projectAliasSessions(this.sql.exec('SELECT * FROM fleet_sessions ORDER BY machine_id, tag').toArray(), new Map(Object.entries(machineAliases)), this.now(), freshCatalogs(this.sql, this.now()));
-      const liveSessions = this.liveSessionsByAccount();
-      return response({ accounts: dedupeAccountsByCanonical(this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray() as any[]).map(a => { const s = this.accountStatus(a); return { ...s, sessions: liveSessions.get(s.label) ?? 0 }; }), routes: this.sql.exec('SELECT * FROM fleet_routes ORDER BY machine_id, engine').toArray().map(r => ({ ...r, supports_goal: (() => { const caps = capsByMachine.get(String(r.machine_id)); return Array.isArray(caps?.fleet_goal_routes) && caps.fleet_goal_routes.some((g: any) => g.engine === r.engine && g.account === r.account && (g.profile ?? null) === r.profile); })() })),
-        machines, machine_aliases: machineAliases,
-        agents: this.sql.exec('SELECT tag, project, role, machine_id, engine, session_id, health_state, health_at FROM agents').toArray(),
-        sessions,
-        host_resources: this.hostResources(),
-        resource_management: this.resources.overview(),
-        placement: this.placementOverview(),
-        subscriptions: this.sql.exec('SELECT * FROM fleet_subscriptions ORDER BY machine_id, service, account').toArray().map((s: any) => ({ machine_id: s.machine_id, account: canonicalAccountLabel(s.account), service: canonicalQuotaProvider(s.service), plan: s.plan, observed_at: s.observed_at, stale: !fresh(s.observed_at, this.now(), 1200000), quota: parsed(s.quota_json),
-          harness: [...(routeHarness.get(String(s.machine_id) + ' ' + String(s.account)) ?? [])].sort() })),
-        launches: this.sql.exec('SELECT * FROM fleet_launches ORDER BY created_at DESC LIMIT 200').toArray().map((row: any) => { const { request_json, request_key, claim_key, prompt, model_selection_json, ...view } = row; const selection = parsed(model_selection_json); return { ...view, rejected: ['queued','offered','failed'].includes(row.state) ? this.launchRejections(row) : [], model_id: selection?.id ?? null, model: selection?.model ?? null, decision_score: selection?.decision_score ?? null, decision_reason: selection?.decision_reason ?? null, hub_session_id: controlIds.get(row.id) ?? null, access: parsed(request_json).access?.mode || 'legacy_unspecified', admission_hold: ['offered', 'starting', 'running', 'uncertain'].includes(row.state) ? this.admission.heldReason(row) : null }; }) });
+      }
+      let sessions: any[] = [];
+      let sessionsTotal = 0;
+      let sessionsCursorNext: string | null = null;
+      let sessionsTruncated = false;
+      if (want('sessions')) {
+        const totalRow: any = this.sql.exec('SELECT COUNT(*) AS n FROM fleet_sessions').toArray()[0];
+        sessionsTotal = Number(totalRow?.n) || 0;
+        const take = sessLimit + 1;
+        const sessRows = (sessCursor
+          ? this.sql.exec('SELECT * FROM fleet_sessions WHERE (machine_id, tag, native_id) > (?, ?, ?) ORDER BY machine_id, tag, native_id LIMIT ?',
+              sessCursor[0], sessCursor[1], sessCursor[2], take)
+          : this.sql.exec('SELECT * FROM fleet_sessions ORDER BY machine_id, tag, native_id LIMIT ?', take)
+        ).toArray() as any[];
+        sessionsTruncated = sessRows.length > sessLimit;
+        const pageRows = sessRows.slice(0, sessLimit);
+        sessions = projectAliasSessions(pageRows, new Map(Object.entries(machineAliases)), this.now(), freshCatalogs(this.sql, this.now()));
+        if (sessionsTruncated && pageRows.length) {
+          const last = pageRows[pageRows.length - 1];
+          sessionsCursorNext = b64urlEncode(JSON.stringify([String(last.machine_id), String(last.tag), String(last.native_id)]));
+        }
+      }
+      const liveSessions = want('accounts') ? this.liveSessionsByAccount() : new Map<string, number>();
+      const out: any = {};
+      if (want('accounts')) out.accounts = dedupeAccountsByCanonical(this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray() as any[]).map(a => { const s = this.accountStatus(a); return { ...s, sessions: liveSessions.get(s.label) ?? 0 }; });
+      if (want('routes')) out.routes = this.sql.exec('SELECT * FROM fleet_routes ORDER BY machine_id, engine').toArray().map(r => ({ ...r, supports_goal: (() => { const caps = capsByMachine.get(String(r.machine_id)); return Array.isArray(caps?.fleet_goal_routes) && caps.fleet_goal_routes.some((g: any) => g.engine === r.engine && g.account === r.account && (g.profile ?? null) === r.profile); })() }));
+      if (want('machines')) out.machines = machines;
+      if (want('machine_aliases')) out.machine_aliases = machineAliases;
+      if (want('agents')) out.agents = this.sql.exec('SELECT tag, project, role, machine_id, engine, session_id, health_state, health_at FROM agents').toArray();
+      if (want('sessions')) {
+        out.sessions = sessions;
+        out.sessions_total = sessionsTotal;
+        out.sessions_cursor_next = sessionsCursorNext;
+        out.sessions_truncated = sessionsTruncated;
+      }
+      if (want('host_resources')) out.host_resources = this.hostResources();
+      if (want('resource_management')) out.resource_management = this.resources.overview();
+      if (want('placement')) out.placement = this.placementOverview();
+      if (want('subscriptions')) out.subscriptions = this.sql.exec('SELECT * FROM fleet_subscriptions ORDER BY machine_id, service, account').toArray().map((s: any) => ({ machine_id: s.machine_id, account: canonicalAccountLabel(s.account), service: canonicalQuotaProvider(s.service), plan: s.plan, observed_at: s.observed_at, stale: !fresh(s.observed_at, this.now(), 1200000), quota: parsed(s.quota_json),
+          harness: [...(routeHarness.get(String(s.machine_id) + ' ' + String(s.account)) ?? [])].sort() }));
+      if (want('launches')) out.launches = this.sql.exec('SELECT * FROM fleet_launches ORDER BY created_at DESC LIMIT 200').toArray().map((row: any) => { const { request_json, request_key, claim_key, prompt, model_selection_json, ...view } = row; const selection = parsed(model_selection_json); return { ...view, rejected: ['queued','offered','failed'].includes(row.state) ? this.launchRejections(row) : [], model_id: selection?.id ?? null, model: selection?.model ?? null, decision_score: selection?.decision_score ?? null, decision_reason: selection?.decision_reason ?? null, hub_session_id: controlIds.get(row.id) ?? null, access: parsed(request_json).access?.mode || 'legacy_unspecified', admission_hold: ['offered', 'starting', 'running', 'uncertain'].includes(row.state) ? this.admission.heldReason(row) : null }; });
+      return response(out);
     }
     const revokeMatch = /^\/api\/fleet\/machines\/([A-Za-z0-9_-]{1,64})\/revoke$/.exec(path);
     if (revokeMatch && request.method === 'POST') {
