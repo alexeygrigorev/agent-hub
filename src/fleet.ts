@@ -408,6 +408,23 @@ function validHostLoad(reason: string, value: any): boolean {
   return false;
 }
 function parsed(value: any, fallback: any = {}) { try { return JSON.parse(value || '{}'); } catch { return fallback; } }
+/** Intake-expression fragments for the worktree-owner contender read (36c4cf38):
+ * unaliased and textually identical to the fleet_worktree_owner_live index
+ * expression, so the exclusivity check visits only live rows of that intake
+ * on that machine instead of scanning retained history. */
+const contenderExpr = (field: string) =>
+  `json_extract(CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END,'$.${field}')`;
+/** Bounded exclusivity read: only emptiness is used, so LIMIT 2 suffices. The
+ * live-state list is the canonical live set; the review/cwd exclusion is
+ * exact in SQL (COALESCE keeps a NULL task_kind a contender). */
+export const WORKTREE_OWNER_CONTENDERS_SQL = `
+  SELECT id FROM session_control_sessions
+  WHERE machine_id = ? AND id != ? AND (? IS NULL OR id != ?)
+    AND ${contenderExpr('intake_task_id')} = ?
+    AND state IN ('queued','held','offered','starting','running','uncertain')
+    AND (COALESCE(${contenderExpr('task_kind')},'') != 'review' OR COALESCE(${contenderExpr('cwd')},'') != '')
+  LIMIT 2
+`;
 const NATIVE_AMOUNTS: Record<string, number> = { credits_remaining: 1e12, spend_used: 1e15, spend_limit: 1e15 };
 const NATIVE_UNITS = new Set(['percent', 'credits', 'usd_cents', 'requests', 'tokens']);
 const PROFILE_LABEL = /^[A-Za-z0-9][A-Za-z0-9_./-]{0,63}$/;
@@ -721,6 +738,14 @@ export class FleetService {
     this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_launch_failed_recent ON fleet_launches(machine_id,finished_at) WHERE state = 'failed' AND mode = 'headless' AND verification_status = 'unverified'");
     this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_launch_account_failed_recent ON fleet_launches(account,updated_at DESC) WHERE state = 'failed'");
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_native_state ON fleet_launches(machine_id,native_id,state)');
+    // Intake 36c4cf38: worktree-owner and worktree-guards attest unplaced
+    // (requeued, machine NULL) lock owners by linking the session's launch to
+    // an earlier attempt on the calling host. Retries preserve created_at but
+    // mutate request_key and copy request_json verbatim, so the link matches
+    // the small indexed (machine_id, created_at) pair and compares
+    // request_json in JS over a bounded candidate set — never as correlated
+    // request_json text equality in SQL (that degraded the prod DO).
+    this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_host_created ON fleet_launches(created_at,machine_id)');
     // Intake e8a22f4c: plan() and the choking watchdog look for these rare exit reasons on every poll;
     // partial indexes keep both lookups independent of the machine's retained launch history.
     this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_launch_model_unsupported ON fleet_launches(machine_id,engine,account) WHERE exit_reason = 'model_unsupported'");
@@ -2613,13 +2638,103 @@ export class FleetService {
       if (!host) return response({error:'forbidden'},403);
       if (!this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='session_control_sessions'").toArray().length)
         return response({error:'not_found'},404);
-      const row: any = this.sql.exec(`SELECT s.id,s.state,s.request_json,f.state AS launch_state
+      // Intake 36c4cf38: one PK row plus bounded indexed reads, never a
+      // correlated scan. A requeue (offer expiry, resource/model retry)
+      // clears the session machine but the retry launch preserves created_at
+      // and copies request_json verbatim, so an earlier attempt on the
+      // calling host keeps the checkout lock attestable. Without this link a
+      // later unplaced failure left that lock unattestable (404 here) and
+      // every same-intake restart was refused (dispatch_worktree_refused).
+      const row: any = this.sql.exec(`SELECT s.id,s.state,s.machine_id,s.binding_json,s.request_json,s.fleet_launch_id,
+          f.state AS launch_state,f.native_id AS launch_native,f.verification_status AS launch_verification,
+          f.request_json AS launch_request_json,f.created_at AS launch_created_at
         FROM session_control_sessions s LEFT JOIN fleet_launches f ON f.id=s.fleet_launch_id
-        WHERE s.id=? AND s.machine_id=?`,worktreeOwner[1],caller.machineId!).toArray()[0];
+        WHERE s.id=?`, worktreeOwner[1]).toArray()[0];
       if (!row) return response({error:'not_found'},404);
-      return response({session_id:row.id,intake_id:parsed(row.request_json).intake_task_id ?? null,
+      const binding = row.binding_json ? parsed(row.binding_json, null) : null;
+      // Same-request host attempts, attestable only for never-bound unplaced
+      // owners: bounded indexed (machine_id, created_at) read, exact
+      // request_json match decided in JS. Placed or bound owners never scan.
+      let linked: any[] = [];
+      if (!binding && row.machine_id === null && row.launch_request_json && row.launch_created_at) {
+        const candidates = this.sql.exec(`SELECT id, native_id, request_json, updated_at FROM fleet_launches
+          WHERE machine_id=? AND created_at=? LIMIT 25`,
+          caller.machineId!, row.launch_created_at).toArray() as any[];
+        linked = candidates.filter(c => c.request_json === row.launch_request_json);
+      }
+      if (row.machine_id !== caller.machineId! && !linked.length) return response({error:'not_found'},404);
+      const hostMachine = caller.machineId!;
+      const confirmedStop = row.state === 'stopped' && (() => {
+        try {
+          const receipts = this.sql.exec(`SELECT ack_json FROM session_control_commands
+            WHERE session_id=? AND kind='stop' AND state='acked' AND generation=?
+            ORDER BY updated_at DESC LIMIT 20`, row.id, binding?.generation ?? 0).toArray() as any[];
+          if (receipts.some(r => {
+            const ack = parsed(r.ack_json, {});
+            return ack.outcome === 'delivered' && ack.confirmed_exit === true &&
+              (binding ? ack.native?.native_id === binding.native_id && ack.native?.tag === binding.tag && ack.native?.workspace === binding.workspace
+                : ['unbound_uncertain_no_native_process', 'session_already_stopped'].includes(ack.reason) &&
+                  ack.native?.native_id === '00000000-0000-0000-0000-000000000000' &&
+                  ack.native?.tag === 'unbound' && ack.native?.workspace === '/');
+          })) return true;
+        } catch {}
+        // Intake 36c4cf38: same tuple check as confirmedStopRecorded in
+        // session_control.ts (guards layer); the two verdicts must agree.
+        if (binding?.retirement && typeof binding.retirement === 'object' &&
+            binding.retirement.native_id === binding.native_id &&
+            binding.retirement.tag === binding.tag &&
+            binding.retirement.workspace === binding.workspace &&
+            binding.retirement.created_at_ms === binding.native_created_at_ms) return true;
+        return Boolean(binding && row.launch_state === 'exited' && row.launch_verification === 'verified' && row.launch_native === binding.native_id);
+      })();
+      // The unbound launch-less stopped clause has no guards-layer twin
+      // (intake 1c8d915e keeps guards fail-closed there): fallbacks refuse
+      // what this primary path admits, never the reverse.
+      const launchTerminal = ['failed', 'exited', 'cancelled', 'expired', 'refused'].includes(row.launch_state) ||
+        confirmedStop || (!row.fleet_launch_id && row.state === 'stopped');
+      // All-launches spawned check: every same-request host attempt is
+      // examined, so a newer same-key launch with NULL native_id cannot hide
+      // an older spawned attempt (review P2). Each tag probe is indexed.
+      const priorAttemptSpawned = linked.some(c => (c.native_id !== null && c.native_id !== undefined && c.native_id !== '') ||
+        this.sql.exec(`SELECT 1 FROM fleet_sessions fs WHERE fs.machine_id=? AND fs.tag IN ('hub-' || ?, 'task-hub-' || ?)
+          AND fs.phase IN ('starting','running','broken','unknown','uncertain') LIMIT 1`,
+          caller.machineId!, c.id, c.id).toArray().length > 0);
+      const unstarted = !binding && !row.launch_native && !priorAttemptSpawned && launchTerminal;
+      const native: any = binding && typeof binding === 'object'
+        ? this.sql.exec('SELECT * FROM fleet_sessions WHERE machine_id=? AND native_id=?', hostMachine, binding.native_id).toArray()[0]
+        : null;
+      const nativeTerminal = unstarted || Boolean(binding && (
+        (native && native.created_at_ms === binding.native_created_at_ms && native.tag === binding.tag && native.workspace === binding.workspace &&
+          ['exited', 'dead', 'pruned', 'forgotten', 'unobserved'].includes(native.phase)) ||
+        (!native && confirmedStop)
+      ));
+      const intakeId = parsed(row.request_json).intake_task_id ?? null;
+      // Intake ccc50cca review-2 P1: bind the verdict to the requesting
+      // successor. A validated live same-intake requester keeps exclusivity;
+      // unknown/self/foreign/terminal requesters do not admit.
+      const requesterId = new URL(request.url).searchParams.get('requester');
+      let requesterExclusive = true;
+      if (requesterId !== null) {
+        if (!intakeId || !requesterId || requesterId === row.id) {
+          requesterExclusive = false;
+        } else {
+          const reqRow: any = this.sql.exec(`SELECT id, state, request_json FROM session_control_sessions
+            WHERE id = ? AND machine_id = ?`, requesterId, caller.machineId!).toArray()[0];
+          const reqIntake = parsed(reqRow?.request_json).intake_task_id ?? null;
+          if (!reqRow || reqIntake !== intakeId || ['stopped', 'finished', 'failed', 'refused', 'cancelled'].includes(reqRow.state)) {
+            requesterExclusive = false;
+          }
+        }
+      }
+      // Review-2 P1 exclusivity reads at most 2 narrow rows: only emptiness
+      // matters, and the predicates match the machine_state and
+      // intake_queue_session_task indexes (never a scan of retained
+      // history). The review/cwd exclusion is exact in SQL.
+      const otherContenders = intakeId ? (this.sql.exec(WORKTREE_OWNER_CONTENDERS_SQL,
+        caller.machineId!, row.id, requesterId, requesterId, intakeId).toArray() as any[]).length : 0;
+      return response({session_id:row.id,intake_id:intakeId,
         terminal:['stopped','finished','failed','refused','cancelled'].includes(row.state) &&
-          ['failed','exited','cancelled','expired','refused'].includes(row.launch_state)});
+          launchTerminal && nativeTerminal && requesterExclusive && otherContenders === 0});
     }
     if (path === '/api/fleet/offers' && request.method === 'GET') {
       if (!host) return response({ error: 'forbidden' }, 403);

@@ -6,6 +6,7 @@
  * Nothing here deletes automatically (auto-GC belongs to intake 1f1f1877). */
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { decodeRepoWorkspace } from './fleet';
+import { isIntakeTaskOpen } from './session_lifecycle_registry';
 
 type Obj = Record<string, any>;
 
@@ -380,11 +381,17 @@ export class IntakeWorktrees {
   hostCommands(machine: string): Obj[] {
     const now = this.now();
     this.queueMissingStatuses(machine, now);
-    const rows = this.sql.exec(`SELECT c.*, w.path, w.branch FROM intake_worktree_commands c JOIN intake_worktrees w ON w.id = c.worktree_id
+    const rows = this.sql.exec(`SELECT c.*, w.path, w.branch, w.session_ids FROM intake_worktree_commands c JOIN intake_worktrees w ON w.id = c.worktree_id
       WHERE c.machine = ? AND (c.state = 'queued' OR (c.state = 'claimed' AND c.claimed_at < ?)) ORDER BY c.created_at LIMIT 10`,
       machine, now - CLAIM_TIMEOUT_MS).toArray() as Obj[];
     for (const c of rows) this.sql.exec("UPDATE intake_worktree_commands SET state = 'claimed', claimed_at = ? WHERE id = ?", now, c.id);
-    return rows.map(c => ({ id: c.id, kind: c.kind, worktree_id: c.worktree_id, task_id: c.task_id, path: c.path, branch: c.branch ?? null }));
+    // Intake 36c4cf38 AC5: a clean, merged worktree whose intake carries
+    // qualifying DONE evidence and has no live session must be removable
+    // through the guarded host path even while the intake row is still open;
+    // without this flag the host refuses with "worktree locked" and the
+    // intake can never close. Unknown ledger state fails closed (locked).
+    return rows.map(c => ({ id: c.id, kind: c.kind, worktree_id: c.worktree_id, task_id: c.task_id, path: c.path, branch: c.branch ?? null,
+      ...(c.kind === 'remove' ? { unlock_hub_lock: !isIntakeTaskOpen(this.sql, c.task_id) && this.liveSessions(c).length === 0 } : {}) }));
   }
 
   /** Host result for one command. Returns history events for the task. */

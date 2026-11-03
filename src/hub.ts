@@ -313,6 +313,11 @@ export class Hub extends DurableObject {
       WHERE state IN ('running','uncertain') AND binding_json IS NOT NULL`);
     // Status attention reads only running sessions; avoid scanning retained prompts.
     this.sql.exec('CREATE INDEX IF NOT EXISTS session_control_state ON session_control_sessions(state)');
+    // Intake 36c4cf38: bounded exclusivity plan for the worktree-owner
+    // contender read (fleet.ts WORKTREE_OWNER_CONTENDERS_SQL), independent of
+    // planner whims: equality on (machine, intake) plus a live-state
+    // multi-seek visits only live rows of that intake on that machine.
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS fleet_worktree_owner_live ON session_control_sessions(machine_id, json_extract(CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END,'$.intake_task_id'), state)`);
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_native ON fleet_launches(machine_id,native_id)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS session_control_created ON session_control_sessions(created_at DESC,id DESC)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS session_control_actor_created ON session_control_sessions(actor,created_at DESC,id DESC)');

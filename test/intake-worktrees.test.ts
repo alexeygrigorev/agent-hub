@@ -365,6 +365,28 @@ describe('remove action', () => {
     expect(cmd).toMatchObject({ state: 'done', result: { outcome: 'refused' } });
   }));
 
+  it('marks remove commands unlockable only with DONE evidence and zero live sessions (36c4cf38 AC5)', async () => fixture(async c => {
+    const t = await createTask(c);
+    const live = seedLaunch(c, t.id, HOST, { cwd: WT });
+    await host(c, HOST, '/plan', { launch_id: live.launchId });
+    endSession(c, live.sessionId, 'stopped');
+    // Open intake without DONE evidence: the host must keep the Hub lock.
+    const rm = await intake(c, '/tasks/' + t.id + '/worktrees/remove', { key: 'rm-' + ++seq });
+    expect(rm.body.commands).toHaveLength(1);
+    const cmds = (await host(c, HOST, '/commands')).body.commands;
+    const cmd1 = cmds.find((x: any) => x.kind === 'remove');
+    expect(cmd1).toMatchObject({ kind: 'remove', unlock_hub_lock: false });
+    await host(c, HOST, '/commands/' + cmd1.id + '/result', { outcome: 'refused', reason: 'worktree locked', status: status() });
+    // DONE evidence plus zero live sessions: the guarded host remove may
+    // release the canonical Hub lock so the intake can close.
+    await doneNote(c, t.id);
+    const rm2 = await intake(c, '/tasks/' + t.id + '/worktrees/remove', { key: 'rm-' + ++seq });
+    expect(rm2.body.commands).toHaveLength(1);
+    const cmds2 = (await host(c, HOST, '/commands')).body.commands;
+    const cmd2 = cmds2.find((x: any) => x.kind === 'remove');
+    expect(cmd2).toMatchObject({ kind: 'remove', unlock_hub_lock: true });
+  }));
+
   it('dedupes pending commands, re-offers stale claims and rejects foreign result posts', async () => fixture(async c => {
     const t = await createTask(c);
     await register(c, t.id);

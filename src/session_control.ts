@@ -2074,6 +2074,35 @@ export class SessionControlService {
       for (let i = 0; i < values.length; i += 200) for (const row of select(where, JSON.stringify(values.slice(i, i + 200)))) byId.set(row.id, row);
     };
     load('s.id IN (SELECT value FROM json_each(?))', [...targets]);
+    // Intake 36c4cf38: explicitly targeted sessions left unplaced by a requeue
+    // (machine NULL, never bound) still own their checkout lock, and the
+    // host fallback paths address them by session_id. Admit them by PK plus
+    // a bounded indexed same-instant host-launch link (exact request_json
+    // match in JS over at most 25 rows) — never as a global machine-NULL
+    // scan and never by request_json text comparison in SQL.
+    if (sessionIds.length) {
+      const missing = sessionIds.filter(id => !byId.has(id)).slice(0, GUARD_MAX_IDS);
+      if (missing.length) {
+        const unplaced = this.sql.exec(`SELECT s.*, f.state AS guard_launch_state, f.native_id AS guard_launch_native,
+          f.request_json AS guard_launch_request_json, f.created_at AS guard_launch_created_at,
+          c.kind AS guard_owner_kind, p.session_id AS guard_explicit_protection
+          FROM session_control_sessions s LEFT JOIN fleet_launches f ON f.id=s.fleet_launch_id
+          LEFT JOIN credentials c ON c.id=s.owner_token_id LEFT JOIN session_control_protections p ON p.session_id=s.id
+          WHERE s.id IN (SELECT value FROM json_each(?)) AND s.machine_id IS NULL AND s.binding_json IS NULL AND s.fleet_launch_id IS NOT NULL`,
+          JSON.stringify(missing)).toArray() as any[];
+        for (const row of unplaced) {
+          if (!row.guard_launch_request_json || !row.guard_launch_created_at) continue;
+          const candidates = this.sql.exec(`SELECT id, request_json FROM fleet_launches WHERE machine_id=? AND created_at=? LIMIT 25`,
+            machineId, row.guard_launch_created_at).toArray() as any[];
+          if (!candidates.some(c => c.request_json === row.guard_launch_request_json)) continue;
+          // Normalized for the host gate below; guard_unplaced_owner marks
+          // the requeued shape for the spawned/tag attestation in the map.
+          // The id joins targets so the fact is returned, not just closured.
+          byId.set(row.id, { ...row, machine_id: machineId, guard_unplaced_owner: true });
+          targets.add(row.id);
+        }
+      }
+    }
     const natives = [...new Set([...byId.values()].map(row => parsed(row.binding_json, null)?.native_id).filter((v: any) => typeof v === 'string' && v))] as string[];
     const intakes = [...new Set([...byId.values()].map(row => parsed(row.request_json, {})?.intake_task_id).filter((v: any) => typeof v === 'string' && v))] as string[];
     // Closure: native aliases (expression index) and same-intake siblings.
@@ -2459,9 +2488,40 @@ export class SessionControlService {
       // One indexed read per call for receipt proof (null = unreadable: fail closed).
       const routed = this.routedLaunchIds(caller.machineId!, rows.map(row => row.fleet_launch_id).filter(Boolean));
       let sessions = rows.map(row => { // scope.rows already passed the per-request host gate
+        const hostRow = { ...row, machine_id: row.machine_id ?? caller.machineId };
         const binding = row.binding_json ? JSON.parse(row.binding_json) : null;
-        const unstarted = !binding && !row.guard_launch_native &&
-          (['failed', 'refused'].includes(row.guard_launch_state) || (row.state === 'stopped' && this.confirmedStopRecorded(row)));
+        // Intake 36c4cf38: attest never-bound unplaced owners via the same
+        // bounded indexed host-launch link as worktree-owner (exact
+        // request_json match in JS; all matching launches examined so a
+        // newer NULL-native row cannot hide an older spawned attempt).
+        let priorHostLaunch: any = null;
+        let priorAttemptSpawned = false;
+        if (!binding && (row as any).guard_unplaced_owner === true && row.guard_launch_request_json && row.guard_launch_created_at) {
+          const candidates = this.sql.exec(`SELECT id, native_id, request_json, updated_at FROM fleet_launches
+            WHERE machine_id = ? AND created_at = ? LIMIT 25`,
+            caller.machineId!, row.guard_launch_created_at).toArray() as any[];
+          const exact = candidates.filter(c => c.request_json === row.guard_launch_request_json);
+          if (exact.length) {
+            priorHostLaunch = exact.sort((a, b) => String(b.updated_at ?? '').localeCompare(String(a.updated_at ?? '')) || String(b.id).localeCompare(String(a.id)))[0];
+            priorAttemptSpawned = exact.some(c => (c.native_id !== null && c.native_id !== undefined && c.native_id !== '') ||
+              this.sql.exec(`SELECT 1 FROM fleet_sessions fs WHERE fs.machine_id = ? AND fs.tag IN ('hub-' || ?, 'task-hub-' || ?)
+                AND fs.phase IN ('starting','running','broken','unknown','uncertain') LIMIT 1`,
+                caller.machineId!, c.id, c.id).toArray().length > 0);
+          }
+        }
+        const confirmedStop = row.state === 'stopped' && this.confirmedStopRecorded(hostRow);
+        // Fail closed when the scope-time host link evaporated before the map
+        // ran: an unplaced owner with no same-request host attempt is never
+        // unstarted, however terminal its own launch row looks.
+        const unplacedNoLink = (row as any).guard_unplaced_owner === true && !priorHostLaunch;
+        const unstarted = !unplacedNoLink && !binding && !row.guard_launch_native && !priorAttemptSpawned &&
+          // Narrow launch list (intake 1c8d915e): an exited launch whose
+          // native id vanished may still have run a workload, so it is never
+          // "never started" here — exit proof comes from receipts, the
+          // retirement marker (via confirmedStop), or the routed-launch
+          // receipt. The wider fleet worktree-owner list may admit such an
+          // owner on the primary path; this layer stays fail-closed.
+          (['failed', 'refused'].includes(row.guard_launch_state) || confirmedStop);
         // Intake 1c8d915e: a finished headless native is retired from the
         // host catalog, so its census row can stop short of a terminal phase.
         // Fleet's own confirmed exit receipt for the exact native (the bound
@@ -2472,30 +2532,38 @@ export class SessionControlService {
         const receiptTerminal = !!receiptNative && row.guard_launch_native === receiptNative &&
           ['exited', 'failed'].includes(row.guard_launch_state) && !!routed && !routed.has(row.fleet_launch_id);
         const protectedSession = binding
-          ? guardRefs.get(`${row.machine_id}/${binding.native_id}`)?.protected_session !== false
+          ? guardRefs.get(`${hostRow.machine_id}/${binding.native_id}`)?.protected_session !== false
           : !((unstarted || receiptTerminal) && row.guard_owner_kind === 'agent' && !row.guard_explicit_protection);
         // This response fact is derived only from canonical lifecycle refs.
         // Missing refs are unknown and therefore human-owned for repair safety.
         const humanOwned = binding
-          ? guardRefs.get(`${row.machine_id}/${binding.native_id}`)?.human_owned !== false
+          ? guardRefs.get(`${hostRow.machine_id}/${binding.native_id}`)?.human_owned !== false
           : true;
-        const native: any = binding && this.sql.exec('SELECT * FROM fleet_sessions WHERE machine_id=? AND native_id=?', row.machine_id, binding.native_id).toArray()[0];
-        const nativeTerminal = unstarted || receiptTerminal || !!(native &&
-          native.created_at_ms === binding.native_created_at_ms && native.tag === binding.tag && native.workspace === binding.workspace &&
+        const native: any = binding && this.sql.exec('SELECT * FROM fleet_sessions WHERE machine_id=? AND native_id=?', hostRow.machine_id, binding.native_id).toArray()[0];
+        const nativeTerminal = unstarted || receiptTerminal || !!(binding && (
+          (native && native.created_at_ms === binding.native_created_at_ms && native.tag === binding.tag && native.workspace === binding.workspace &&
           // 'unobserved' is the census writer's positive absence verdict ("an
           // orphan no longer observed is not a live workload"): a native that
           // finished and was pruned (the dispatch-false-failure path) never
           // reports an explicit terminal phase, which would hold the AC1 lock
           // forever. 'uncertain' stays held — an unconfirmed terminal label.
-          ['exited', 'dead', 'pruned', 'forgotten', 'unobserved'].includes(native.phase));
+          ['exited', 'dead', 'pruned', 'forgotten', 'unobserved'].includes(native.phase)) ||
+          // Intake 36c4cf38: a confirmed stop with the native row already
+          // pruned is positive exit proof for the exact bound incarnation.
+          (!native && confirmedStop)
+        ));
         const adoptedLock = binding?.adoption_lock === true && typeof binding.adoption_intent_id === 'string' &&
           this.sql.exec("SELECT id FROM session_adoption_intents WHERE id=? AND machine_id=? AND native_id=? AND state='completed'",
-            binding.adoption_intent_id, row.machine_id, binding.native_id).toArray().length > 0;
-        return { session_id: row.id, session_state: row.state, intake_task_id: parsed(row.request_json, {}).intake_task_id ?? null, native_terminal: nativeTerminal, native_id: binding?.native_id ?? null,
+            binding.adoption_intent_id, hostRow.machine_id, binding.native_id).toArray().length > 0;
+        const reqObj = parsed(row.request_json, {});
+        const effectiveLaunchId = priorHostLaunch?.id ?? row.fleet_launch_id;
+        return { session_id: row.id, session_state: row.state, intake_task_id: reqObj.intake_task_id ?? null,
+          task_kind: reqObj.task_kind ?? null, requested_cwd: reqObj.cwd ?? null,
+          native_terminal: nativeTerminal, native_id: binding?.native_id ?? null,
           native_last_activity_at: native?.last_activity_at ?? null,
           lock_release_permitted: !protectedSession || (adoptedLock && !row.guard_explicit_protection),
           engine: row.engine, adoption_intent_id: binding?.adoption_intent_id ?? null,
-          tag: binding?.tag ?? ((row.mode === 'headless' ? 'task-hub-' : 'hub-') + row.fleet_launch_id),
+          tag: binding?.tag ?? ((row.mode === 'headless' ? 'task-hub-' : 'hub-') + effectiveLaunchId),
           workspace: binding?.workspace ?? null, native_created_at_ms: binding?.native_created_at_ms ?? null,
           terminal: ['stopped', 'finished', 'failed', 'refused', 'cancelled'].includes(row.state),
           linked_intake_open: worktreeIntakeProtected(this.sql, row, worktreeLinks), protected: protectedSession,
@@ -2510,7 +2578,10 @@ export class SessionControlService {
         return { ...fact, terminal: aliases.every(other => other.terminal),
           protected: aliases.some(other => other.protected),
           lock_release_permitted: aliases.every(other => other.lock_release_permitted) &&
-            (!fact.intake_task_id || sessions.filter(other => other.intake_task_id === fact.intake_task_id).every(other => other.terminal && other.native_terminal && other.lock_release_permitted)),
+            // Intake ccc50cca review-2 P1: read-only review sessions (no
+            // explicit cwd: they run in the main checkout) never hold a
+            // worktree lock, so they must not fence its release.
+            (!fact.intake_task_id || sessions.filter(other => other.intake_task_id === fact.intake_task_id && (other.task_kind !== 'review' || Boolean(other.requested_cwd))).every(other => other.terminal && other.native_terminal && other.lock_release_permitted)),
           linked_intake_open: aliases.some(other => other.linked_intake_open),
           human_owned: aliases.some(other => other.human_owned) };
       });
@@ -4751,6 +4822,16 @@ export class SessionControlService {
             ack.native?.native_id === '00000000-0000-0000-0000-000000000000' &&
             ack.native?.tag === 'unbound' && ack.native?.workspace === '/');
     })) return true;
+    // Intake 36c4cf38: a host-recorded retirement marker is exit proof for
+    // the exact bound incarnation (same tuple check as the fleet
+    // worktree-owner endpoint): the retirement endpoint validated the full
+    // native triple, created_at_ms, engine, generation, cause and timestamps
+    // before persisting it, and the native row may already be pruned.
+    if (binding?.retirement && typeof binding.retirement === 'object' &&
+        binding.retirement.native_id === binding.native_id &&
+        binding.retirement.tag === binding.tag &&
+        binding.retirement.workspace === binding.workspace &&
+        binding.retirement.created_at_ms === binding.native_created_at_ms) return true;
     if (!binding || !session.fleet_launch_id) return false;
     const launch: any = this.sql.exec('SELECT state, verification_status, native_id FROM fleet_launches WHERE id=? AND machine_id=?', session.fleet_launch_id, session.machine_id).toArray()[0];
     return launch?.state === 'exited' && launch.verification_status === 'verified' && launch.native_id === binding.native_id;
