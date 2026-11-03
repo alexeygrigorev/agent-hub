@@ -28,19 +28,21 @@ def stale_target(cfg, identity):
 
 
 class NativeProcess:
-    def __init__(self, returncode, stdout, stderr, *, body=b'', timeout=False):
+    def __init__(self, returncode, stdout, stderr, *, body=b'',
+                 stderr_body=b'private stderr fixture-secret', timeout=False):
         self.returncode = returncode
         self.pid = 700001
         self.stdout = stdout
         self.stderr = stderr
         self.body = body
+        self.stderr_body = stderr_body
         self.timeout = timeout
 
     def communicate(self, _payload, timeout):
         if self.timeout:
             raise subprocess.TimeoutExpired(['private-argv'], timeout, output=b'fixture-secret')
         self.stdout.write(self.body)
-        self.stderr.write(b'private stderr fixture-secret')
+        self.stderr.write(self.stderr_body)
         return None, None
 
     def kill(self):
@@ -85,6 +87,52 @@ def test_native_json_decode_failure_is_retryable_and_sanitized(tmp_path):
     assert caught.value.step == 'model_list'
     assert caught.value.failure == 'invalid_json'
     assert 'fixture-secret' not in str(caught.value)
+
+
+@pytest.mark.parametrize('metadata_label', ['unauthorized', 'not logged in'])
+def test_native_transient_stderr_does_not_turn_credential_metadata_into_auth_expiry(
+        tmp_path, metadata_label):
+    cfg = config(tmp_path)
+    Path(cfg['target_data']).mkdir()
+    calls = []
+    credentials = json.dumps([{
+        'id': 'device-login', 'integrationID': 'opencode', 'active': True,
+        'value': {'type': 'oauth', 'methodID': 'device', 'access': 'access-fixture',
+                  'refresh': 'refresh-fixture', 'metadata': {'label': metadata_label}},
+    }]).encode()
+
+    def spawn(_argv, *, stdout, stderr, **_kwargs):
+        calls.append(True)
+        return NativeProcess(17, stdout, stderr, body=credentials,
+                             stderr_body=b'SQLITE_BUSY: database is locked')
+
+    with patch.object(auth.subprocess, 'Popen', side_effect=spawn), \
+            patch.object(auth.time, 'sleep'):
+        with pytest.raises(auth.AuthCheckUnavailable) as caught:
+            auth._native(cfg, ['auth', 'export', 'opencode'], {})
+
+    assert len(calls) == 2
+    assert caught.value.step == 'auth_export'
+    assert caught.value.failure == 'nonzero_exit'
+    assert caught.value.exit_code == 17
+    assert 'engine_auth_expired' not in str(caught.value)
+    assert 'refresh-fixture' not in str(caught.value)
+
+
+def test_empty_successful_auth_export_is_unavailable_not_expired(tmp_path):
+    cfg = config(tmp_path)
+
+    with patch.object(auth, '_verified_recently', return_value=False), \
+            patch.object(auth, '_verification_identity', return_value=None), \
+            patch.object(auth.subprocess, 'Popen',
+                         side_effect=lambda _argv, *, stdout, stderr, **_kwargs:
+                         NativeProcess(0, stdout, stderr, body=b'')):
+        with pytest.raises(auth.AuthCheckUnavailable) as caught:
+            auth.prepare(cfg)
+
+    assert caught.value.step == 'auth_export'
+    assert caught.value.failure == 'invalid_response'
+    assert 'engine_auth_expired' not in str(caught.value)
 
 
 def test_native_timeout_records_only_step_and_timeout(tmp_path):

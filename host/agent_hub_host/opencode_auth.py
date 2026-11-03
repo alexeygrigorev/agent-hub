@@ -202,9 +202,10 @@ _MISSING_LOGIN = re.compile(
     r'|not logged in|not authenticated|authentication required', re.IGNORECASE)
 
 
-def _native_auth_rejection(raw):
+def _native_error_text(raw):
     # Native output may contain credential material. Inspect it only in memory;
-    # all outward errors below contain fixed step/failure labels only.
+    # for JSON, keep only structured error fields so credential metadata cannot
+    # be mistaken for an auth rejection or missing-login diagnostic.
     text = raw.decode('utf-8', 'ignore') if isinstance(raw, bytes) else str(raw)
     try:
         parsed = json.loads(text)
@@ -231,7 +232,15 @@ def _native_auth_rejection(raw):
 
         collect(parsed)
         text = ' '.join(safe)
-    return bool(_AUTH_REJECTION.search(text))
+    return text
+
+
+def _native_auth_rejection(raw):
+    return bool(_AUTH_REJECTION.search(_native_error_text(raw)))
+
+
+def _native_missing_login(raw):
+    return bool(_MISSING_LOGIN.search(_native_error_text(raw)))
 
 
 def _report_unavailable(exc):
@@ -314,20 +323,29 @@ def _native(cfg, args, env, payload=None):
             else:
                 error_raw = b''
         if not proc.returncode:
+            if step == 'auth_import':
+                return None
             try:
                 if not raw.strip():
-                    return [] if step == 'auth_export' else None
+                    raise AuthCheckUnavailable(step, 'invalid_response')
                 return json.loads(raw)
+            except AuthCheckUnavailable:
+                raise
             except (json.JSONDecodeError, UnicodeDecodeError):
                 raise AuthCheckUnavailable(step, 'invalid_json') from None
-        combined = raw + b'\n' + error_raw
-        if _native_auth_rejection(combined):
+        # Keep stdout and stderr separate while parsing. Concatenating a valid
+        # credential JSON document with a transient stderr message makes the
+        # combined bytes invalid JSON and can expose credential metadata to
+        # the fallback text classifier.
+        failure_text = '\n'.join(_native_error_text(part)
+                                  for part in (raw, error_raw) if part)
+        if _AUTH_REJECTION.search(failure_text):
             if step == 'auth_export':
                 raise AuthExpired('refresh_rejected', step=step, exit_code=proc.returncode) from None
             if step in {'auth_list', 'model_list'}:
                 raise _StaleTargetStore(step, 'auth_rejected', proc.returncode) from None
             raise AuthCheckUnavailable(step, 'auth_rejected', exit_code=proc.returncode) from None
-        if _MISSING_LOGIN.search(combined.decode('utf-8', 'ignore')):
+        if _MISSING_LOGIN.search(failure_text):
             if step == 'auth_export':
                 raise AuthExpired('missing_device_login', step=step, exit_code=proc.returncode) from None
             if step in {'auth_list', 'model_list'}:
@@ -478,7 +496,7 @@ def prepare(cfg, *, native=None):
                     if step in {'auth_list', 'model_list'}:
                         raise _StaleTargetStore(step, 'auth_rejected') from None
                     raise AuthCheckUnavailable(step, 'auth_rejected') from None
-                if _MISSING_LOGIN.search(str(exc)):
+                if _native_missing_login(str(exc)):
                     if step == 'auth_export':
                         raise AuthExpired('missing_device_login', step=step) from None
                     if step in {'auth_list', 'model_list'}:
