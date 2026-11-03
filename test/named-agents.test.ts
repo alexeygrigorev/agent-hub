@@ -90,6 +90,7 @@ describe('named agent lifecycle', () => {
   it('forwards stable coordinator messages to the current session and delegates only that session family', () => fixture(async ({ sql, call }) => {
     expect((await (await call('orchestrator-main')).json() as any).actor).toBe('agent:orchestrator-main');
     expect((await (await call('oncall')).json() as any).actor).toBe('agent:oncall');
+    expect(sql.exec("SELECT tag FROM agents WHERE project = 'agent'").toArray()).toEqual([]);
     const now = new Date().toISOString();
     for (const [id, key] of [[SESSION, 'forward-1'], [OTHER_SESSION, 'forward-2']]) {
       sql.exec(`INSERT INTO session_control_sessions (id, actor, request_key, request_json, engine, mode, state, created_at, updated_at)

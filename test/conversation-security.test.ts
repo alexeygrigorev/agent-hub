@@ -126,6 +126,10 @@ describe('Conversation Security Regressions (Cluster 1: F1, F3, F4)', () => {
         "INSERT INTO agents (tag, project, role, registered_at) VALUES ('valid-worker', 'projA', 'worker', ?)",
         nowIso,
       );
+      hub.sql.exec(
+        "INSERT INTO agents (tag, project, role, registered_at) VALUES ('oncall', 'agent', 'worker', ?)",
+        nowIso,
+      );
 
       // Human Alice creates a private group conversation
       const aliceCookie = await makeSignedCookie('alice', 'admin@fake.local');
@@ -210,6 +214,7 @@ describe('Conversation Security Regressions (Cluster 1: F1, F3, F4)', () => {
         'routing-client:bot1',
         'human',
         'projA:human',
+        'agent:oncall',
       ]) {
         const resolved =
           hub.conversationsService.identityValidator.resolveParticipant(
