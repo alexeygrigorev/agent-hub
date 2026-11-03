@@ -15,6 +15,8 @@ class ManagedEffortTests(unittest.TestCase):
             for model, explicit, session, expected in (
                 ('gpt-6.1-sol', [], [], 'medium'),
                 ('gpt-6-luna', [], [], 'xhigh'),
+                # Older/forward-compatible routes may be accepted without a unique policy effort.
+                ('custom-model', [], [], 'high'),
                 ('gpt-6.1-sol', [], ['--hub-session-effort=max'], 'xhigh'),
                 ('gpt-6.1-sol', ['-c', 'model_reasoning_effort="high"'], [], 'high'),
             ):
@@ -36,6 +38,7 @@ class ManagedEffortTests(unittest.TestCase):
                              patch.object(p, 'engine_environment', return_value={}), \
                              patch.object(p, 'engine_argv', return_value=['codex']), \
                              patch.object(p, 'hub_launch_gate', return_value=(True, 'ok')), \
+                             patch.object(p, 'managed_model_allowed', return_value=True), \
                              patch.object(p.sys, 'argv', ['execute', label, 'exec', '--model', model] + session + explicit + ['task']), \
                              patch.object(p.os, 'execve') as launch:
                             p.execute()
