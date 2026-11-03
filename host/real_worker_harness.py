@@ -588,7 +588,7 @@ def build_miniflare_script(
     mf_options = {
         "host": "127.0.0.1",
         "port": port,
-        "durableObjectsPersist": os.path.join(server_dir, "state"),
+        "resourcePersistencePath": os.path.join(server_dir, "state"),
         "workers": [worker_opts],
     }
     miniflare_pkg = json.dumps(os.path.join(repo_root, "node_modules", "miniflare"))

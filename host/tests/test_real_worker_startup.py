@@ -53,6 +53,15 @@ class TestRealWorkerStartupHarness(unittest.TestCase):
         self.assertIsInstance(port, int)
         self.assertGreater(port, 1024)
 
+    def test_miniflare_config_persists_resources_between_processes(self):
+        script = build_miniflare_script(self.repo_root, self.tmp_dir, "/bundle.js", 8787)
+        options_start = script.index("const opts=") + len("const opts=")
+        options_end = script.index("; const mf=", options_start)
+        options = json.loads(script[options_start:options_end])
+
+        self.assertEqual(options["resourcePersistencePath"], os.path.join(self.tmp_dir, "state"))
+        self.assertNotIn("durableObjectsPersist", options)
+
     def test_resolve_node_binary(self):
         node_bin = resolve_node_binary()
         self.assertTrue(os.path.exists(node_bin))
