@@ -628,6 +628,9 @@ describe('phantom account reservations', () => {
     expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', launch.id).one().state).toBe('running');
 
     sql.exec("UPDATE fleet_sessions SET phase='running' WHERE native_id='gone'");
+    // Simulate the production phase-update path, which patches the catalog and
+    // invalidates this machine's in-memory census snapshot with notePhase.
+    f.resources.notePhase('hetzner', 'gone', 'running', iso());
     const terminalHistory = Array.from({ length: 500 }, (_, i) => ({
       native_id: `history-${i}`, tag: `history-${i}`, engine: 'codex', phase: 'failed',
       agent_state: null, workspace: '/repo', profile: null, account: null,

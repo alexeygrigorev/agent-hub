@@ -639,7 +639,7 @@ export class FleetService {
   private emptyOffers = new Map<string, { stamp: string; at: number; value: any }>();
   /** Last semantic host catalog and live native set. Exact repeated polls
    * return before SQL; the set is also the bounded vanished-session source. */
-  private censusSnapshots = new Map<string, { fingerprint: string; live: Set<string>; writeStamp: string | null }>();
+  private censusSnapshots = new Map<string, { fingerprint: string; live: Set<string> }>();
   // Last intake linkage revision the census late-link pass ran at, per machine (intake e8a22f4c).
   private linkRevisions = new Map<string, string>();
   private candidateCache = new Map<string, { revision: string; at: number; value: any[] }>();
@@ -3005,8 +3005,7 @@ export class FleetService {
       const machineId = caller.machineId!;
       const fingerprint = censusFingerprint(data.sessions, censusComplete);
       const priorSnapshot = this.censusSnapshots.get(machineId);
-      const cacheValid = !!this.writes && !!priorSnapshot && priorSnapshot.writeStamp === this.writes.stamp('fleet_sessions');
-      if (cacheValid && priorSnapshot?.fingerprint === fingerprint && !this.maintenanceDirty) {
+      if (priorSnapshot?.fingerprint === fingerprint && !this.maintenanceDirty) {
         this.observedCatalog?.refreshProgress(machineId, data.sessions.map((session: any) => ({
           native_id: session.native_id, progress_json: session.progress ? JSON.stringify(session.progress) : null,
         })));
@@ -3032,7 +3031,7 @@ export class FleetService {
         const existing = new Map<string, any>();
         for (const r of this.byChunks(reportedIds, (marks) => `SELECT * FROM fleet_sessions WHERE machine_id = ? AND native_id IN (${marks})`, caller.machineId!)) existing.set(r.native_id, r);
         const reportedSet = new Set(reportedIds);
-        const priorLive = cacheValid && priorSnapshot ? new Set(priorSnapshot.live) : new Set((this.sql.exec(
+        const priorLive = priorSnapshot ? new Set(priorSnapshot.live) : new Set((this.sql.exec(
           "SELECT native_id FROM fleet_sessions WHERE machine_id = ? AND phase IN ('starting','running','broken','unknown','uncertain')", machineId
         ).toArray() as any[]).map(r => String(r.native_id)));
         const liveUnreported = [...priorLive].filter(id => !reportedSet.has(id));
@@ -3222,7 +3221,7 @@ export class FleetService {
         this.sql.exec('INSERT OR IGNORE INTO fleet_catalog_seen VALUES (?,?)', machineId, censusObservedAt);
         noteCatalogReport(this.sql, machineId, censusComplete, censusNow);
         if (this.censusSnapshots.size >= 64) this.censusSnapshots.clear();
-        this.censusSnapshots.set(machineId, { fingerprint, live: liveAfter, writeStamp: this.writes?.stamp('fleet_sessions') ?? null });
+        this.censusSnapshots.set(machineId, { fingerprint, live: liveAfter });
         return response({ status: 'reported', written });
       });
     }

@@ -115,7 +115,7 @@ probes too.
 | `alarm:expire_messages` | due expiries only | 20 rows | 0 (indexed due scan, empty) |
 | `alarm:jobs_alarms` | due jobs only | 100 rows | ~0 (no due alarms) |
 | `alarm:webhooks` | pending deliveries only | 50 rows | 0 (empty pump) |
-| `meter:flush` + hourly budget check | every 5 min flush; check once per hour | one ring upsert per active scope; summary reads indexed current-hour slots | ~300 rows/day at 12 active scopes plus up to 24 hourly summaries |
+| `meter:flush` + hourly budget check | every 5 min flush; check once per hour | one ring upsert per active scope plus the total row; indexed two-hour summary | Conservative envelope ~4.4k rows/day at 12 active scopes: 13 × 288 ring rows plus at most 26 rows × 24 hourly checks |
 | `alarm:host_history` | due sample only | O(1) history revision and bounded upsert | 0 when no host fact changed |
 | `alarm:tbm` | quota/session/outcome writes | one write-stamp check; bounded 4,096-row replay after a real change | 0 without a relevant write |
 | `tick:session_audit` | 30-min audit cadence | `SESSIONS*40` on the 150-session fixture; pending/outcome branches are indexed | 0 with no active sessions or outstanding actions; audit evidence follows session events |
@@ -143,9 +143,11 @@ stress-fixture pass at 12k. The quiet-fleet daily estimate assumes no active
 sessions, open intakes, outstanding actions, or due work; it is a design
 estimate, not a post-deploy measurement.
 
-Quiet-fleet design estimate: low hundreds of rows/day (meter ring + hourly
-checks + first-reads after genuine events), inside the ~5,000/day guideline;
-the 20,000/day alert (`GET /api/metrics/rows-read`, `do_rows_read_budget`
+With 12 active meter scopes, the conservative meter envelope is about 4.4k
+rows/day (counting one read for each ring upsert plus the two-hour indexed
+summary). Other quiet-fleet scheduled jobs add close to zero without active
+sessions, open intakes, outstanding actions, or due work. The 20,000/day
+alert (`GET /api/metrics/rows-read`, `do_rows_read_budget`
 liveness alert, deduped to one notification per open alert + hourly refresh)
 stays silent at these levels. Noisy-fleet cost is proportional to real
 placements, launches, credential mints and session transitions, not to poll
