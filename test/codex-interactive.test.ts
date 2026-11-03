@@ -65,6 +65,55 @@ it('reports a dead Codex TUI as failed while retaining lifecycle and capacity un
   });
 });
 
+it('surfaces an unregistered Codex goal as failed and retains the live lifecycle', async () => {
+  const bindings = env as unknown as Env;
+  const stub = bindings.HUB.get(bindings.HUB.idFromName('codex-goal-registration-' + crypto.randomUUID()));
+  await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
+    const now = Date.parse('2026-11-03T12:00:00Z'), at = new Date(now).toISOString();
+    const tx = <T>(cb: () => T) => state.storage.transactionSync(cb);
+    const service = new SessionControlService(hub.sql, tx, () => now); service.init();
+    const fleet = new FleetService(hub.sql, tx, () => now); fleet.init();
+    const sessionId = '44444444-4444-4444-8444-444444444444';
+    const launchId = '55555555-5555-4555-8555-555555555555';
+    const nativeId = '66666666-6666-4666-8666-666666666666';
+    const machineId = 'test-host', createdAt = now - 120000;
+    hub.sql.exec('INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at) VALUES (?, ?, ?, ?, ?)', machineId, machineId, machineId, at, at);
+    hub.sql.exec(`INSERT INTO fleet_launches (id, actor, requester_kind, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, created_at, updated_at)
+      VALUES (?, 'test-admin', 'human', 'goal', 'goal-key', ?, ?, 'codex', 'shared-codex', NULL, 'interactive', '/test', 'Fix the goal', 'starting', ?, ?)`,
+      launchId, JSON.stringify({ with_goal: true, mode: 'interactive', brief: 'Fix the goal' }), machineId, at, at);
+    hub.sql.exec(`INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, engine, mode, state, binding_json, created_at, updated_at)
+      VALUES (?, 'test-admin', 'session-key', ?, ?, ?, 'codex', 'interactive', 'running', ?, ?, ?)`,
+      sessionId, JSON.stringify({ with_goal: true, brief: 'Fix the goal' }), launchId, machineId,
+      JSON.stringify({ native_id: nativeId, tag: 'hub-goal', workspace: '/test', native_created_at_ms: createdAt }), at, at);
+
+    const host = { caller: { machineId, kind: 'host', actor: 'machine:' + machineId }, scopes: ['host'] };
+    const observed = await fleet.handle(new Request('https://hub.test/api/fleet/sessions', {
+      method: 'PUT', body: JSON.stringify({ sessions: [{ native_id: nativeId, tag: 'hub-goal', workspace: '/test',
+        engine: 'codex', phase: 'running', agent_state: 'idle', profile: null, account: 'shared-codex',
+        created_at_ms: createdAt, last_activity_at: at,
+        progress: { last_progress_at: at, sampled_at: at, headless: false, agent_alive: null,
+          orphaned: false, cleanup: 'none', goal_status: 'unregistered' } }] }),
+    }), host);
+    expect(observed.status).toBe(200);
+
+    const diagnostic = { reason: 'goal_registration_failed',
+      message: 'Codex did not register the requested goal in its thread goal store within 60 seconds.',
+      error_type: 'GoalRegistrationError', stage: 'dispatch_interactive' };
+    const receipt = await fleet.handle(new Request(`https://hub.test/api/fleet/launches/${launchId}/result`, {
+      method: 'POST', body: JSON.stringify({ state: 'running', native_id: nativeId, diagnostic }),
+    }), host);
+    expect(receipt.status).toBe(200);
+
+    const shown = await (await service.handle(new Request('https://hub.test/api/sessions/' + sessionId),
+      { caller: { isAdmin: true, kind: 'human', actor: 'test-admin' }, scopes: ['admin'] })).json();
+    expect(shown).toMatchObject({ state: 'failed', goal_status: 'unregistered', stalled: false,
+      failure_reason: 'goal_registration_failed', lifecycle_state: 'running', cleanup_pending: true });
+    expect(hub.sql.exec('SELECT state FROM session_control_sessions WHERE id = ?', sessionId).one().state).toBe('running');
+    expect(JSON.parse(String(hub.sql.exec('SELECT launch_error_json FROM fleet_launches WHERE id = ?', launchId).one().launch_error_json)))
+      .toMatchObject({ reason: 'goal_registration_failed', stage: 'dispatch_interactive' });
+  });
+});
+
 it('fails a Claude session whose /goal was rejected fast, never reporting it as running', async () => {
   const bindings = env as unknown as Env;
   const stub = bindings.HUB.get(bindings.HUB.idFromName('claude-goal-rejected-' + crypto.randomUUID()));

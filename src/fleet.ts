@@ -3465,7 +3465,7 @@ export class FleetService {
         // a sanitized tail alongside exit_code; all bounded, no control chars.
         const diagnostic = data.diagnostic;
         if (diagnostic !== undefined && (!object(diagnostic, ['reason', 'message', 'error_type', 'exit_code', 'signal', 'wall_time_ms', 'tail', 'stage', 'cpu', 'command', 'stdout_tail', 'stderr_tail']) ||
-            typeof diagnostic.reason !== 'string' || !/^(?:(?:launcher|engine)_[a-z_]{1,64}|cpu_headroom|cpu_pressure|memory_pressure|host_oom|host_runtime_choking)$/.test(diagnostic.reason) ||
+            typeof diagnostic.reason !== 'string' || !/^(?:(?:launcher|engine)_[a-z_]{1,64}|cpu_headroom|cpu_pressure|memory_pressure|host_oom|host_runtime_choking|goal_registration_failed)$/.test(diagnostic.reason) ||
             typeof diagnostic.message !== 'string' || diagnostic.message.length > 300 || /[\x00-\x1f\x7f]/.test(diagnostic.message) ||
             typeof diagnostic.error_type !== 'string' || !/^[A-Za-z]{1,64}$/.test(diagnostic.error_type) ||
             !['launcher_run', 'dispatch_headless', 'dispatch_interactive', 'dispatch_route', 'runtime'].includes(diagnostic.stage) ||
@@ -3475,6 +3475,11 @@ export class FleetService {
             (diagnostic.tail !== undefined && (typeof diagnostic.tail !== 'string' || diagnostic.tail.length > 1024 || /[\x00-\x1f\x7f]/.test(diagnostic.tail))) ||
             (diagnostic.cpu !== undefined && !sanitizeCpuAdmission(diagnostic.cpu)) ||
             !sanitizeCommandFields(diagnostic))) return response({ error: 'invalid_launch_diagnostic' }, 400);
+        if (diagnostic?.reason === 'goal_registration_failed' &&
+            (row.mode !== 'interactive' || !['codex', 'zcodex'].includes(row.engine) ||
+             parsed(row.request_json, {})?.with_goal !== true || !['running', 'failed'].includes(data.state))) {
+          return response({ error: 'invalid_goal_registration_failure' }, 400);
+        }
         if (diagnostic) {
           diagnostic.message = redactExitText(diagnostic.message).slice(0, 300);
           if (diagnostic.tail !== undefined) diagnostic.tail = redactExitText(diagnostic.tail).slice(0, 1024);

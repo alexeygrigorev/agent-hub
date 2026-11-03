@@ -804,11 +804,28 @@ and engine routes advertise `supports_goal`; Codex, Codex/Orin and ZCodex
 support goals, while other engines report false. Existing disabled-provider,
 quota, resource and profile checks still apply.
 
-The host starts the trusted local engine command with one literal `/goal …`
-argument. It never runs goal text in a shell. Managed accounts keep their
-own profile and protected launch wrapper. Unmanaged routes need a trusted
-`startup_argv`. Ordinary interactive starts still open an empty prompt and
-may use automatic placement without a machine pin.
+For Codex and ZCodex, the host starts the trusted local engine command without
+goal text, waits for the exact native session, sends `/goal …` through the
+guarded `aplexer message deliver` path, then reads that rollout's thread id in
+`<CODEX_HOME>/goals_<n>.sqlite` (`thread_goals`). It reports success only after
+the exact thread row appears, with a 60-second bound and no duplicate send on
+an ambiguous delivery. This covers unmanaged trusted-argv Codex and ZCodex
+starts as well as managed Codex starts. The intake reported that ZCodex goals
+had failed on every launch since 2026-10-27 and some Codex launches failed;
+both previously passed `/goal …` as initial-prompt argv text. Claude keeps its
+existing startup-argument path. Goal text never runs in a shell.
+
+If the exact goal row is not registered by the deadline, the host tries one
+qualified stop of that launch and reports `goal_registration_failed`. A
+confirmed stop is a failed launch receipt. If stop is uncertain, Fleet retains
+the native lifecycle and capacity, while `hub sessions show` projects the
+session as failed with `failure_reason=goal_registration_failed` and
+`cleanup_pending=true`; it is never left silently running with
+`goal_status=unregistered`. Engines without goal support are refused with a
+clear error before native start. Managed accounts keep their own profile and
+protected launch wrapper. Unmanaged routes need a trusted `startup_argv`.
+Ordinary interactive starts still open an empty prompt and may use automatic
+placement without a machine pin.
 
 ### Long-running CLI warnings
 

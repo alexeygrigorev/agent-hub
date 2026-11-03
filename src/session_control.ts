@@ -1366,6 +1366,13 @@ export class SessionControlService {
         }
       } catch {} // Fleet is optional in isolated session-control installations.
     }
+    // A Codex-family goal launch whose bounded native-store verification
+    // failed stays lifecycle-running until its process exits, so capacity is
+    // retained. Project the persisted host receipt as failed immediately and
+    // expose cleanup_pending when exact stop was not confirmed.
+    const goalRegistrationFailed = request.with_goal === true && row.mode === 'interactive' &&
+      ['codex', 'zcodex'].includes(row.engine) && launchError?.reason === 'goal_registration_failed';
+    const visibleFailure = goalRegistrationFailed ? 'goal_registration_failed' : terminalError;
     if ((row.state === 'refused' || row.state === 'held' || row.state === 'queued' || row.state === 'cancelled') && memoryRejected.length === 0) {
       const holdInfo = this.readHoldInfo(row, request);
       if (holdInfo.rejected.length > 0) memoryRejected = holdInfo.rejected;
@@ -1394,17 +1401,18 @@ export class SessionControlService {
     const waitingActive = !!waiting_until && row.state === 'running' && Date.parse(waiting_until) > this.now();
     return {
       ...(threshold === null ? {} : this.warningView(row, threshold)),
-      id: row.id, state: terminalError ? 'failed' :
+      id: row.id, state: visibleFailure ? 'failed' :
         waitingActive ? 'waiting_until' :
         row.mode === 'headless' && launchError?.reason === 'engine_tool_permission_refused' ? 'failed' :
         row.mode === 'headless' && row.state === 'stopped' && orphanFailure(native) ? 'failed' :
         row.mode === 'headless' && row.state === 'running' && ['exited', 'dead'].includes(native?.phase) ? 'failed' :
         idleOpen ? 'idle_with_open_ac' : row.state === 'running' && stall.stalled ? 'stalled' : row.state,
       intake_id: intake?.id || request.intake_task_id || null, goal_status: goalStatus,
-      idle_with_open_ac: idleOpen && !waitingActive, missed_wake: wake.missed,
-      stalled: waitingActive ? false : (row.state === 'running' && !terminalError && stall.stalled),
-      stall_reason: waitingActive ? 'waiting_until' : (terminalError ?? (orphanFailure(native) ? 'agent_exited_children_running' : stall.reason)), stalled_since: waitingActive ? null : stall.since,
-      ...(terminalError ? { failure_reason: terminalError, cleanup_pending: true } : {}),
+      idle_with_open_ac: idleOpen && !waitingActive && !goalRegistrationFailed, missed_wake: wake.missed,
+      stalled: waitingActive ? false : (row.state === 'running' && !visibleFailure && stall.stalled),
+      stall_reason: waitingActive ? 'waiting_until' : (visibleFailure ?? (orphanFailure(native) ? 'agent_exited_children_running' : stall.reason)), stalled_since: waitingActive ? null : stall.since,
+      ...(visibleFailure ? { failure_reason: visibleFailure,
+        cleanup_pending: goalRegistrationFailed ? row.state === 'running' : true } : {}),
       stall_threshold: stallThreshold(this.options.env), tool_call_stall_threshold: toolCallStallThreshold(this.options.env), lifecycle_state: row.state,
       ...(row.mode === 'headless' && launchError?.reason === 'engine_tool_permission_refused' ? { cleanup_pending: !['failed', 'stopped'].includes(row.state) } : {}),
       machine: row.machine_id ?? null, engine: row.engine ?? null,
