@@ -1275,7 +1275,7 @@ export class SessionControlService {
     const longRunning = row.state === 'running' && runtime > threshold;
     return {
       runtime, idle_for: idleFor, last_activity_at: new Date(lastActivity).toISOString(),
-      long_running: longRunning, activity_state: idleFor > stallThreshold(this.options.env) ? 'idle' : 'active',
+      long_running: longRunning, activity_state: row.state === 'running' && !['stopped', 'dead', 'exited', 'failed'].includes(native?.phase) && idleFor <= stallThreshold(this.options.env) ? 'active' : 'idle',
       warning_threshold: threshold, warning_snoozed_until: snooze?.until_at ?? null,
       warning_active: longRunning && !(snooze && Date.parse(snooze.until_at) > now),
       intake_id: intakeId,

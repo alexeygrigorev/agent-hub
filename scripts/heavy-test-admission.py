@@ -16,6 +16,11 @@ import sys
 import time
 from datetime import datetime, timezone
 
+try:
+    import pwd
+except ImportError:  # pragma: no cover - this script is Unix-only today
+    pwd = None
+
 # Priority classes, lowest privilege first (intake 1293b560 AC3).
 # 'final' is a pre-push verification lane: it jumps queued normal tickets
 # younger than NORMAL_AGE_S. 'release' is the orchestrator-main
@@ -98,14 +103,49 @@ REAP_INTERVAL_S = 60
 ADMISSION_PROTOCOL_VERSION = 1
 
 
+def release_account_home():
+    if pwd is not None:
+        try:
+            account_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        except (KeyError, OSError, AttributeError):
+            account_home = None
+        if account_home is not None and account_home.is_absolute():
+            return account_home
+    try:
+        fallback = Path.home()
+    except RuntimeError:
+        return None
+    return fallback if fallback.is_absolute() else None
+
+
 def active_release_roots():
-    roots = {
-        Path.home() / '.local/share/agent-hub/host-releases',
-        Path.home() / '.local/share/agent-hub/host-releases-orch',
-    }
+    # An explicit root is authoritative. This keeps private releases isolated
+    # and prevents a second passwd-derived root from widening the override.
     configured = os.environ.get('AGENT_HUB_HOST_RELEASES_DIR')
+    test_isolated = 'HUB_TEST_GUARD_HOME' in os.environ
     if configured:
-        roots.add(Path(configured).expanduser())
+        root = Path(configured)
+        if configured == '~' or configured.startswith('~/'):
+            home = Path.home() if test_isolated else release_account_home()
+            if home is None:
+                return set()
+            root = home / configured[2:]
+        else:
+            root = root.expanduser()
+        return {root.resolve()}
+
+    # Host tests pass this guard to subprocesses while HOME points at a
+    # disposable directory. Do not let service discovery escape that sandbox.
+    if test_isolated:
+        return set()
+
+    account_home = release_account_home()
+    if account_home is None:
+        return set()
+    roots = (
+        account_home / '.local/share/agent-hub/host-releases',
+        account_home / '.local/share/agent-hub/host-releases-orch',
+    )
     return {root.resolve() for root in roots}
 
 
@@ -130,6 +170,16 @@ def active_release_module():
                 or not executable.is_file()
                 or not re.fullmatch(r'[0-9a-f]{40}', release.name)):
             return None
+        repository = Path(__file__).resolve().parents[1]
+        ancestor = subprocess.run(
+            ['git', '-C', str(repository), 'merge-base', '--is-ancestor',
+             'd8740aaca3944a295680177a40148bb00accea78', release.name],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=10, check=False)
+        if ancestor.returncode == 1:
+            return None
+        if ancestor.returncode != 0:
+            raise RuntimeError('cannot verify active host release revision')
         verifier = release / 'scripts' / 'verify-host-release.py'
         if not verifier.is_file() or verifier.is_symlink():
             raise RuntimeError('active host release verifier is missing')
@@ -147,16 +197,6 @@ def active_release_module():
             raise RuntimeError('active host release manifest is unreadable') from error
         if not isinstance(manifest, dict) or manifest.get('release_rev') != release.name:
             raise RuntimeError('active host release revision mismatch')
-        repository = Path(__file__).resolve().parents[1]
-        ancestor = subprocess.run(
-            ['git', '-C', str(repository), 'merge-base', '--is-ancestor',
-             'd8740aaca3944a295680177a40148bb00accea78', release.name],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            timeout=10, check=False)
-        if ancestor.returncode == 1:
-            return None
-        if ancestor.returncode != 0:
-            raise RuntimeError('cannot verify active host release revision')
         module = release / module_rel
         if not module.is_file() or module.is_symlink():
             return None

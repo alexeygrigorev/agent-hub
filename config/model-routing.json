@@ -98,6 +98,7 @@
       "sonnet"
     ],
     "daily": [
+      "luna",
       "muse",
       "glm-flash",
       "glm-flash-zcodex",
@@ -124,7 +125,6 @@
       "qwen3-8-flash",
       "qwen3-8-max",
       "step-5-preview",
-      "luna",
       "sol"
     ],
     "quick": [

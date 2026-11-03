@@ -41,9 +41,15 @@ describe('CLI long-running warning projection and durable snooze', () => {
       sql.exec('UPDATE fleet_sessions SET last_activity_at = ?', new Date(clock.now).toISOString());
       expect(await json(s, '/' + id)).toMatchObject({ idle_for: 0, activity_state: 'active' });
       expect((await json(s, '/' + id + '?threshold=14400')).long_running).toBe(false);
+      sql.exec("UPDATE fleet_sessions SET phase = 'stopped'");
+      expect((await json(s, '/' + id)).activity_state).toBe('idle');
+      sql.exec("UPDATE fleet_sessions SET phase = 'running'");
       sql.exec("UPDATE session_control_sessions SET state = 'stopped'");
       expect((await json(s, '/warnings')).warnings).toEqual([]);
       expect((await json(s, '/' + id)).long_running).toBe(false);
+      expect((await json(s, '/' + id)).activity_state).toBe('idle');
+      sql.exec("UPDATE session_control_sessions SET state = 'dead'");
+      expect((await json(s, '/' + id)).activity_state).toBe('idle');
     });
   });
   it('persists actor/time/until, hides until expiry, never creates stop commands or deletes a session', async () => {
