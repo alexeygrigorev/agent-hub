@@ -11,6 +11,7 @@ const fixture = (fn: (h: any) => void | Promise<void>) => inDO((env as any).HUB.
 // contract now: a write-maintained light summary feeds selection/counts, and
 // full projected bodies are read back only for the bounded id selection.
 const LEGACY_UNBOUNDED = 'SELECT data FROM intake_task_projection';
+const LEGACY_UNBOUNDED_TASKS = 'SELECT data FROM intake_tasks ORDER BY id';
 
 async function cookieFor(): Promise<{ cookie: string; csrf: string }> {
   const csrf = 'csrf-3bd2521a';
@@ -84,6 +85,23 @@ it('status reads stay bounded to the capped selection and keep their output shap
   const granted = h.intakeService.statusTaskSummaries({ admin: false, grants: [{ scope: 'task', target: 't0000', access: 'read' }] } as any);
   expect(granted.map((t: any) => t.id)).toEqual(['t0000']);
   expect(granted[0]).toEqual({ id: 't0000', project: 'bounded', status: 'open', title: 'Task 0', updated_at: now, created_at: now - 86400000, version: 3 });
+
+  // Intake writes (prune before write) also use intake_status_summary and
+  // never scan all intake_tasks bodies.
+  queries.length = 0;
+  for (let w = 0; w < 3; w++) {
+    const ev = await h.fetch(new Request('https://hub.test/api/intake/tasks/t0000/events', {
+      method: 'POST',
+      headers: { Cookie: cookie, 'x-csrf-token': csrf, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: `prune-bounded-${w}`, expected_version: 3 + w, note: { text: `note ${w}` } }),
+    }));
+    expect(ev.status).toBe(200);
+  }
+  for (const q of queries) {
+    expect(q.includes(LEGACY_UNBOUNDED)).toBe(false);
+    expect(q.includes(LEGACY_UNBOUNDED_TASKS)).toBe(false);
+  }
+  expect(Number(h.sql.exec("SELECT COUNT(*) AS n FROM intake_status_summary WHERE archived_at IS NULL AND status IN ('done','cancelled')").one().n)).toBe(0);
 
   // Loose wall-time fence: the bounded path must stay far below the legacy
   // multi-second projection (generous headroom keeps CI variance out).

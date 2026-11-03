@@ -455,6 +455,7 @@ export class IntakeService {
       // intake_storage_totals). Value columns are affinity-less so each stored
       // value keeps the exact JSON type of the source field.
       this.sql.exec('CREATE TABLE IF NOT EXISTS intake_status_summary (id TEXT PRIMARY KEY, project, status, title, updated_at, created_at, archived_at, version) WITHOUT ROWID');
+      this.sql.exec("CREATE INDEX IF NOT EXISTS intake_status_summary_unarchived_terminal ON intake_status_summary(id) WHERE archived_at IS NULL AND status NOT IN ('open','in_progress','blocked','pending_approval')");
       const summaryValues = (p: string) => `json_extract(${p}data,'$.project'),json_extract(${p}data,'$.status'),json_extract(${p}data,'$.title'),json_extract(${p}data,'$.updated_at'),json_extract(${p}data,'$.created_at'),json_extract(${p}data,'$.archived_at'),json_extract(${p}data,'$.version')`;
       const summaryUpsert = (p: string) => `INSERT INTO intake_status_summary(id,project,status,title,updated_at,created_at,archived_at,version) VALUES(${p}id,${summaryValues(p)})
         ON CONFLICT(id) DO UPDATE SET project=excluded.project,status=excluded.status,title=excluded.title,updated_at=excluded.updated_at,created_at=excluded.created_at,archived_at=excluded.archived_at,version=excluded.version`;
@@ -647,7 +648,14 @@ export class IntakeService {
   }
   /** Retain terminal payloads and replay receipts forever. No data expiration. */
   private prune(now: number) {
-    for (const task of this.rows('tasks').filter(t => !t.archived_at && !OPEN.includes(t.status)).slice(0, 256)) {
+    // Bounded via intake_status_summary (intake 3bd2521a): never scan and
+    // JSON.parse every intake_tasks row on every intake write/create.
+    const ids = this.sql.exec(
+      "SELECT id FROM intake_status_summary WHERE archived_at IS NULL AND status NOT IN ('open','in_progress','blocked','pending_approval') ORDER BY id LIMIT 256"
+    ).toArray().map((r: any) => String(r.id));
+    for (const id of ids) {
+      const task = this.get('tasks', id);
+      if (!task || task.archived_at || OPEN.includes(task.status)) continue;
       task.archived_at = now;
       task.lifecycle_actor = 'hub:archive'; task.lifecycle_reason = 'archive existing terminal intake; payload retained';
       this.put('tasks', task);
