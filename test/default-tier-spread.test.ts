@@ -226,6 +226,13 @@ describe('weighted random auto-start (intake 9647e6d5)', () => {
     expect(drawAutoStart([top, { score: 1 }], { engine: 'codex' }, [], {}, () => 0.99)).toBe(top);
   });
 
+  it('excludes depleted routes from the weighted draw even when they have a positive score', () => {
+    const healthy = { engine: 'codex', decision: { score: 1, factors: { depleted: false } } };
+    const depleted = { engine: 'claude', decision: { score: 100, factors: { depleted: true } } };
+    expect(drawAutoStart([healthy, depleted], {}, [], {}, () => 0.9999)).toBe(healthy);
+    expect((depleted as any).draw_probability).toBe(0);
+  });
+
   it('spreads fully unpinned starts weighted by headroom with no fixed order', async () => {
     const now = Date.now();
     const iso = (d = 0) => new Date(now + d).toISOString();
@@ -259,7 +266,9 @@ describe('weighted random auto-start (intake 9647e6d5)', () => {
       const sub = (account: string, service: string, quota: string) => hub.sql.exec(
         'INSERT INTO fleet_subscriptions (machine_id,account,service,plan,observed_at,quota_json) VALUES (?,?,?,?,?,?)', machine, account, service, null, iso(), quota);
       sub('shared-codex', 'codex', metered(iso(), 60, now));
-      sub('shared-claude', 'claude', metered(iso(), 27, now));
+      // 35% keeps Claude above the configured 30% low-headroom floor; the
+      // separate depleted-route test proves below-floor routes get no draw.
+      sub('shared-claude', 'claude', metered(iso(), 35, now));
       sub('zai-central', 'zai', metered(iso(), 31, now));
       // The probes for the unmetered engines fail on the host, as observed live.
       sub('hub-antigravity', 'gemini', broken(iso()));
@@ -295,7 +304,7 @@ describe('weighted random auto-start (intake 9647e6d5)', () => {
       // Every engine with headroom gets starts; nothing stacks on one winner.
       expect([...counts.keys()].sort()).toEqual(['antigravity', 'claude', 'codex', 'opencode', 'zcodex']);
       for (const [, n] of counts) expect(n).toBeGreaterThanOrEqual(20);
-      // Weighting follows quota headroom: 60% codex outdraws 27% claude.
+      // Weighting follows quota headroom: 60% codex outdraws 35% claude.
       expect(counts.get('codex')!).toBeGreaterThan(counts.get('claude')!);
       // Luna never takes every start (the t2555u complaint).
       expect(counts.get('codex')).toBeLessThan(400);
