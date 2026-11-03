@@ -58,4 +58,4 @@ async function refresh() {
     document.querySelector('.engine-page').append(vSection);
   } catch { /* versions are best-effort beside the account list */ }
 }
-(async () => {try {const me=await call('/auth/me'); csrf=me.csrf_token; await refresh(); setInterval(() => refresh().catch(() => {status.textContent='Refresh failed.';}),5000);} catch {status.textContent='Sign in as a Hub administrator to manage accounts.';}})();
+(async () => {try {const me=await call('/auth/me'); csrf=me.csrf_token; await refresh(); let busy=false; setInterval(async () => { if (document.hidden || busy) return; busy=true; try { await refresh(); } catch {status.textContent='Refresh failed.';} busy=false; },5000);} catch {status.textContent='Sign in as a Hub administrator to manage accounts.';}})();

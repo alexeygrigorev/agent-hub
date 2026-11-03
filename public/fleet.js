@@ -492,4 +492,4 @@ byId('sign-out').addEventListener('click', async () => {
     csrf = null; location.assign('/auth/login');
   } catch { byId('status').textContent = 'Sign-out could not be confirmed. Try again.'; byId('sign-out').disabled = false; }
 });
-refresh(); setInterval(refresh, 30000);
+refresh(); setInterval(() => { if (!document.hidden) refresh(); }, 30000);

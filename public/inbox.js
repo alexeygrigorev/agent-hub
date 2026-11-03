@@ -249,7 +249,8 @@
       byId('inbox-list').scrollTop = state.listScroll || 0;
     });
     byId('inbox-reply-form').addEventListener('submit', sendReply);
-    state.timer = setInterval(refresh, 15000);
+    // Intake 94186660: hidden tabs skip the poll and slow responses never pile up.
+    state.timer = setInterval(() => { if (!document.hidden && !state.refreshing) { state.refreshing = true; refresh().finally(() => { state.refreshing = false; }); } }, 15000);
   }
 
   addEventListener('DOMContentLoaded', boot);

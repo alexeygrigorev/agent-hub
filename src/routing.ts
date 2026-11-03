@@ -143,8 +143,19 @@ export class RoutingService {
       }
       const live = this.fleet.admission.evaluate(principal, input.workspace, parsed.access, 'reserve', { authority });
       if (!live.ok) return;
-      for (const ad of this.sql.exec('SELECT * FROM routing_machines').toArray() as any[]) {
-        const machine: any = this.sql.exec('SELECT * FROM machines WHERE id = ?', ad.machine_id).toArray()[0];
+      // Intake 94186660: one batched machines read per dispatch pass, not one
+      // query per advertised route (N+1 on every queue drain).
+      const ads = this.sql.exec('SELECT * FROM routing_machines').toArray() as any[];
+      const machineById = new Map<string, any>();
+      {
+        const ids = [...new Set(ads.map(a => a.machine_id))];
+        for (let i = 0; i < ids.length; i += 50) {
+          const chunk = ids.slice(i, i + 50);
+          for (const m of this.sql.exec(`SELECT * FROM machines WHERE id IN (${chunk.map(() => '?').join(',')})`, ...chunk).toArray() as any[]) machineById.set(m.id, m);
+        }
+      }
+      for (const ad of ads) {
+        const machine: any = machineById.get(ad.machine_id);
         const seen = Date.parse(effectiveCheckin(ad.machine_id, machine?.last_checkin_at) || '');
         if (!machine || this.now() - Date.parse(ad.observed_at) > 180000 || !Number.isFinite(seen) || this.now() - seen > 180000 || !input.needs.every((n: string) => JSON.parse(ad.needs_json).includes(n))) continue;
         const unavailableEngines = blockedEngines(unavailableRows, ad.machine_id, 'headless', this.now());
