@@ -4,6 +4,9 @@ import sys
 
 def main():
     if sys.argv[1:3] == ['intake', 'summary']:
+        from .summary_fast import try_fast_summary
+        if try_fast_summary():
+            return
         from .intake import summary_main
         summary_main()
     else:

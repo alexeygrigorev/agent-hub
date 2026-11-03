@@ -24,7 +24,12 @@ never isolated. Idempotent: the first isolate() in a process wins.
 import atexit
 import os
 import sys
-import tempfile
+
+
+def _temporary_directory(prefix):
+    """tempfile is imported lazily: production CLI startup never needs it."""
+    import tempfile
+    return tempfile.TemporaryDirectory(prefix=prefix)
 
 GUARD_HOME_ENV = "HUB_TEST_GUARD_HOME"
 GUARD_USER_HOME_ENV = "HUB_TEST_GUARD_USER_HOME"
@@ -85,7 +90,7 @@ def isolate():
         os.environ[GUARD_APPDATA_ENV] = appdata
     # Environment mocks must not erase the protection armed by this bootstrap.
     _remember_guard_environment()
-    owner = tempfile.TemporaryDirectory(prefix="hub-tests-home-")
+    owner = _temporary_directory(prefix="hub-tests-home-")
     atexit.register(owner.cleanup)
     home = owner.name
     os.environ["HOME"] = home
