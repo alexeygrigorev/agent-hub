@@ -86,6 +86,6 @@ PYTHON_WHEELS = {'click': {'requires_dist': ['colorama; platform_system == "Wind
 # Maintained Agent Quota Launcher (public alexeygrigorev/agent-quota-launcher),
 # the headless fleet-mode backend. Immutable release named by its source SHA;
 # the GitHub commit archive is pinned by content, not by its mutable URL alone.
-LAUNCHER_RELEASE = {'sha': 'dc228c20fea5de46be807f96b43abfa948ab4e85',
-                    'url': 'https://codeload.github.com/alexeygrigorev/agent-quota-launcher/zip/dc228c20fea5de46be807f96b43abfa948ab4e85',
-                    'sha256': 'fcb2222e1e3bee05dc9eebdb9a30ca21733b813238899ab0a222404a5593c0df'}
+LAUNCHER_RELEASE = {'sha': '958f47b582c47bb1558bd539fdbe242bd45d855a',
+                    'url': 'https://codeload.github.com/alexeygrigorev/agent-quota-launcher/zip/958f47b582c47bb1558bd539fdbe242bd45d855a',
+                    'sha256': 'ee88b882dc5800b4c1825af65a4f8e55eb1122a3323cc38da01ba1723639a071'}
