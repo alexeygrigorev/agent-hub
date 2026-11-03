@@ -226,12 +226,15 @@ describe('resource management',()=>{
     expect(r.headroom('host')).toMatchObject({reserved_mb:0,floor_mb:4096});
   });
  }));
- it('gates Hub admission on fresh host load, swap pressure, and the reserved session cap',async()=>fixture(async(r,sql)=>{
+ it('gates Hub admission on swap pressure and the reserved session cap while reporting fresh host load as context',async()=>fixture(async(r,sql)=>{
   r.configure({cpu_load_factor:2,swap_max_used_percent:80,host_max_sessions:24});
   const heartbeat=JSON.parse(String(sql.exec("SELECT last_heartbeat FROM machines WHERE id='host'").one().last_heartbeat));
   heartbeat.load=[25,20,10];heartbeat.swap_used_percent=0;
   sql.exec("UPDATE machines SET last_heartbeat=?,last_checkin_at=? WHERE id='host'",JSON.stringify(heartbeat),iso());
-  expect(r.cpuHeadroom('host')).toMatchObject({reason:'host_load_high',admitted:false,host_load1:25,host_load_limit:24});
+  // Load average stays advisory-only at Hub placement (the host-side 2x-core
+  // gate enforces it, and a host refusal propagates as a durable per-retry
+  // hold); the measurement is reported, never a refusal.
+  expect(r.cpuHeadroom('host')).toMatchObject({reason:null,admitted:true,host_load1:25,host_load_limit:24});
   heartbeat.load=[1,1,1];heartbeat.swap_used_percent=81;
   sql.exec("UPDATE machines SET last_heartbeat=?,last_checkin_at=? WHERE id='host'",JSON.stringify(heartbeat),iso());
   expect(r.cpuHeadroom('host')).toMatchObject({reason:'memory_pressure',admitted:false,swap_used_percent:81});

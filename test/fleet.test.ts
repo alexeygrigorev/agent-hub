@@ -812,7 +812,7 @@ describe('generic accounts and launch placement', () => {
     expect((await s.handle(request('/launches/' + claimed.id + '/reject', receipt), host('hetzner'))).status).toBe(409);
     expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', claimed.id).one().state).toBe('starting');
   }));
-  it('applies fresh host load admission after upgrading legacy hold rows', async () => fixture(async (s, sql) => {
+  it('upgrades legacy hold rows and keeps fresh host load advisory with context', async () => fixture(async (s, sql) => {
     sql.exec('ALTER TABLE fleet_memory_holds DROP COLUMN host_load_machine');
     sql.exec('ALTER TABLE fleet_memory_holds DROP COLUMN host_load_factor');
     sql.exec('ALTER TABLE fleet_memory_holds DROP COLUMN host_load_trigger');
@@ -824,10 +824,9 @@ describe('generic accounts and launch placement', () => {
     const heartbeat = JSON.parse(String(sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', 'hetzner').one().last_heartbeat));
     heartbeat.load = [17, 100, 100];
     sql.exec('UPDATE machines SET last_heartbeat = ?, last_checkin_at = ? WHERE id = ?', JSON.stringify(heartbeat), iso(), 'hetzner');
-    expect(s.plan(intent({ machine: 'hetzner' })).selected).toBeNull();
-    expect(s.plan(intent({ machine: 'hetzner' })).rejected).toContainEqual(expect.objectContaining({ machine: 'hetzner', reason: 'host_load_high', load_limit: 16 }));
-    heartbeat.load = [16, 100, 100];
-    sql.exec('UPDATE machines SET last_heartbeat = ?, last_checkin_at = ? WHERE id = ?', JSON.stringify(heartbeat), iso(), 'hetzner');
+    // Fresh load above 2x cores stays advisory at placement: the host-side
+    // gate (host_load.py) enforces load, and a host refusal propagates as a
+    // durable per-retry hold. Placement reports the measurement as context.
     expect(s.plan(intent({ machine: 'hetzner' })).selected?.machine).toBe('hetzner');
     expect(isCapacityOnlyHold([{reason:'host_load_high'}])).toBe(true);
     expect(PLACEMENT_PRESSURE_REASONS.has('host_load_high')).toBe(true);
@@ -1460,16 +1459,17 @@ describe('bare workspace labels resolve under advertised absolute roots', () => 
   }));
 });
 
-describe('host admission respects per-host load budgets', () => {
-  it('moves an over-budget launch to another host while keeping account capacity fleet-wide', async () => fixture(async (s, sql) => {
+describe('host admission respects per-host pressure budgets', () => {
+  it('moves a swap-pressured launch to another host while keeping account capacity fleet-wide', async () => fixture(async (s, sql) => {
     await configure(s, true);
     const goalRoutes = [{ engine: 'codex', account: 'shared-codex', profile: null }];
     for (const machine of ['hetzner', 'win35']) {
       sql.exec("UPDATE machines SET capabilities = ?, last_heartbeat = json_set(last_heartbeat, '$.load', json(?)) WHERE id = ?",
         JSON.stringify({ engines: ['codex', 'claude'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8, fleet_goal_routes: goalRoutes }), '[1]', machine);
     }
-    sql.exec("UPDATE machines SET last_heartbeat = json_set(last_heartbeat, '$.load', json('[20]')) WHERE id = 'hetzner'");
-    sql.exec("UPDATE machines SET last_heartbeat = json_set(last_heartbeat, '$.load', json('[3]')) WHERE id = 'win35'");
+    // Load average is advisory-only at placement; swap pressure gates it.
+    sql.exec("UPDATE machines SET last_heartbeat = json_set(last_heartbeat, '$.swap_used_percent', 90) WHERE id = 'hetzner'");
+    sql.exec("UPDATE machines SET last_heartbeat = json_set(last_heartbeat, '$.swap_used_percent', 0) WHERE id = 'win35'");
     await s.handle(request('/subscriptions', { subscriptions: [{ service: 'codex', account: 'shared-codex', plan: 'pro', quota: {
       status: 'ok', observed_at: iso(), details: { limit_reached: false },
       windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } },
@@ -1477,7 +1477,7 @@ describe('host admission respects per-host load budgets', () => {
 
     const plan = s.plan(intent({ mode: 'interactive', with_goal: true, tier: 'deep', engine_override_reason: 'This goal requires deep reasoning.' }));
     expect(plan.selected?.machine).toBe('win35');
-    expect(plan.rejected).toContainEqual(expect.objectContaining({ machine: 'hetzner', reason: 'host_load_high', load_limit: 16 }));
+    expect(plan.rejected).toContainEqual(expect.objectContaining({ machine: 'hetzner', reason: 'memory_pressure', cpu: expect.objectContaining({ swap_used_percent: 90 }) }));
     expect(s.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label = 'shared-codex'").one()).max_concurrency).toBe(1);
   }));
 
