@@ -721,9 +721,17 @@ export class ResourceManagement {
     // The watchdog response is served per host poll (and per session-progress
     // poll on the host); the canonical stamp plus the watchdog-only authority
     // sources gate the whole computation. Exactly-as-fresh: any write to a
-    // source table changes the stamp and rebuilds.
+    // source table changes the stamp and rebuilds. Activity timestamps are a
+    // write-through overlay so census-only progress remains fresh without
+    // rebuilding the much larger authority projection.
     if (this.watchdogSessions && machine) {
-      return this.watchdogSessions.get(machine, () => this.sessionsUncached(machine));
+      const sessions = this.watchdogSessions.get(machine, () => this.sessionsUncached(machine));
+      if (!this.observed) return sessions;
+      const activity = this.observed.activity(machine);
+      return sessions.map(session => {
+        const lastActivity = activity.get(JSON.stringify([session.machine_id, session.native_id])) ?? null;
+        return lastActivity === session.last_activity_at ? session : { ...session, last_activity_at: lastActivity };
+      });
     }
     return this.sessionsUncached(machine);
   }

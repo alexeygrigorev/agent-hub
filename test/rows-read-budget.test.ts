@@ -137,6 +137,14 @@ describe('per-step rows-read budgets', () => {
     // read ~34); restore the 12000 ceiling per intake b1d66970 AC2.
     expect(total).toBeLessThan(SESSIONS * 80);
   }));
+
+  it('the Hub session audit uses the write-through native catalog, not a full table scan', () => withHub(async hub => {
+    hub.observedCatalog.reset();
+    await hub.meter.run('tick:session_audit', () => hub.sessionAudit.tick('manual'));
+    const nativeReads = hub.meter.statementTop(1500).filter(row => row.scope === 'tick:session_audit' && /\bfleet_sessions\b/i.test(row.sql));
+    expect(nativeReads.length).toBeGreaterThan(0);
+    expect(nativeReads.every(row => /FROM fleet_sessions WHERE machine_id = \?/i.test(row.sql))).toBe(true);
+  }));
 });
 
 describe('rows-read budget alert', () => {
