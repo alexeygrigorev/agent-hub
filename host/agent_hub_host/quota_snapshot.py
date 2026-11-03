@@ -49,6 +49,20 @@ MAX_RAW_STDERR_BYTES = 16 * 1024  # 16 KiB
 DEFAULT_COLLECT_INTERVAL = 600.0  # 600 seconds (10 minutes)
 STALE_AGE_THRESHOLD = 1200.0  # 1200 seconds (20 minutes)
 
+# Fixed probe reason codes (intake fae60b8a): our own probes report failures
+# as short slugs (native_claude_auth_failed, native_claude_rate_limited,
+# ...). Forward exactly those so quota reads carry a concrete reason instead
+# of a bare "unavailable". Anything else -- provider bodies, traces, HTTP
+# dumps -- still collapses to "unavailable".
+PROBE_ERROR_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+
+
+def sanitize_probe_error(value: Any) -> str:
+    """Forward a fixed probe reason code; free-form text stays 'unavailable'."""
+    if isinstance(value, str) and PROBE_ERROR_RE.fullmatch(value):
+        return value
+    return "unavailable"
+
 
 class QuotaError(ValueError):
     """Base exception for quota collection and validation errors."""
@@ -401,7 +415,7 @@ def sanitize_provider(
 
     if raw_status == "error" or has_raw_error or is_stale_or_invalid or any_window_error:
         status = "error"
-        error = "unavailable"
+        error = sanitize_probe_error(raw_prov.get("error"))
         if not (has_prov_obs or has_det_obs):
             observed_at = None
     elif raw_status == "ok":
@@ -411,7 +425,7 @@ def sanitize_provider(
             observed_at = format_iso_utc(current_time)
     else:
         status = "unknown"
-        error = "unavailable"
+        error = sanitize_probe_error(raw_prov.get("error"))
         if not (has_prov_obs or has_det_obs):
             observed_at = None
 

@@ -32,7 +32,7 @@ class RepoProvisionTests(unittest.TestCase):
                 return process
             try:
                 with patch.object(fleet.subprocess, 'Popen', side_effect=spawn):
-                    with self.assertRaisesRegex(ValueError, '^repo_clone_failed$'):
+                    with self.assertRaisesRegex(ValueError, '^repo_clone_failed: clone command timed out$'):
                         fleet._run_repo_clone_command([sys.executable, '-c', parent, str(marker)], timeout=2)
                 self.assertTrue(marker.exists(), 'child must start before the timeout')
                 self.assertIsNotNone(processes[0].returncode)
@@ -60,10 +60,17 @@ class RepoProvisionTests(unittest.TestCase):
         process = SimpleNamespace(wait=lambda **kwargs: 0)
         with patch.object(fleet.subprocess, 'Popen', return_value=process) as spawn:
             self.assertEqual(fleet._run_repo_clone_command(['gh', 'repo', 'clone'], timeout=1).returncode, 0)
-            spawn.assert_called_once_with(['gh', 'repo', 'clone'], stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            spawn.assert_called_once()
+            self.assertEqual(spawn.call_args.args[0], ['gh', 'repo', 'clone'])
+            kwargs = spawn.call_args.kwargs
+            self.assertIs(kwargs['stdin'], subprocess.DEVNULL)
+            self.assertTrue(kwargs['start_new_session'])
+            # Clone output goes to a bounded temp sink, never an inherited
+            # pipe (intake fae60b8a); only a scrubbed line reaches the journal.
+            self.assertIsNot(kwargs['stdout'], subprocess.DEVNULL)
+            self.assertIs(kwargs['stderr'], kwargs['stdout'])
         with patch.object(fleet.subprocess, 'Popen', side_effect=OSError('private command error')):
-            with self.assertRaisesRegex(ValueError, '^repo_clone_failed$'):
+            with self.assertRaisesRegex(ValueError, '^repo_clone_failed: clone command failed$'):
                 fleet._run_repo_clone_command(['gh'], timeout=1)
 
     def test_layout_uses_first_writable_explicit_root_and_honors_disabled_cloning(self):

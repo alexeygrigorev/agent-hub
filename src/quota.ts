@@ -50,6 +50,13 @@ export const WINDOW_NAME_REGEX = /^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$/;
 export const NATIVE_UNITS = new Set<string>(["percent", "credits", "usd_cents", "requests", "tokens"]);
 export const PROFILE_LABEL_REGEX = /^[A-Za-z0-9][A-Za-z0-9_./-]{0,63}$/;
 export const COLLECTOR_VERSION_REGEX = /^[A-Za-z0-9][A-Za-z0-9_.+/-]{0,63}$/;
+// Fixed probe reason codes (intake fae60b8a): host probes report failures as
+// short slugs (native_claude_auth_failed, ...). Anything else -- provider
+// bodies, traces, HTTP dumps -- is rejected and the route stays "unavailable".
+export const PROBE_ERROR_REGEX = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
+export function isProbeError(value: unknown): value is string {
+  return typeof value === "string" && (value === "unavailable" || PROBE_ERROR_REGEX.test(value));
+}
 export const MAX_CREDITS_VALUE = 1e12;
 export const MAX_SPEND_VALUE = 1e15;
 
@@ -396,7 +403,8 @@ export interface QuotaRouteDetailsDTO {
 
 export interface QuotaRouteDTO {
   status: "ok" | "error" | "unknown";
-  error: "unavailable" | null;
+  /** Fixed probe reason code (or legacy "unavailable"); null only on ok. */
+  error: string | null;
   observed_at: string | null;
   details: QuotaRouteDetailsDTO;
   windows: Record<string, QuotaWindowDTO>;
@@ -410,7 +418,8 @@ export interface QuotaSnapshotDTO {
   host_id: string;
   stale?: boolean;
   status: "ok" | "error" | "unknown" | "stale";
-  error: "unavailable" | null;
+  /** Fixed probe reason code (or legacy "unavailable"); null only on ok. */
+  error: string | null;
   routes: Record<string, QuotaRouteDTO>;
 }
 
@@ -534,6 +543,15 @@ function observationUnavailable(quota: any): boolean {
   return windowMinPercent(quota) === null;
 }
 
+// Concrete probe reason for pool display (intake fae60b8a): when the shown
+// observation failed with a fixed probe code (not bare "unavailable"), name
+// it so `hub quota` shows why instead of a bare state.
+function probeSuffix(quota: any): string {
+  const code = quota && typeof quota === "object" ? (quota as any).error : null;
+  if (typeof code === "string" && code !== "unavailable" && isProbeError(code)) return ` probe=${code}`;
+  return "";
+}
+
 function parseNativeAmount(val: unknown, cap: number): { ok: boolean; value: number | null } {
   if (val === null || val === undefined) return { ok: true, value: null };
   if (typeof val === "boolean" || typeof val !== "number" || !Number.isFinite(val) || val < 0 || val > cap) {
@@ -605,7 +623,7 @@ export interface ValidationResult {
     captured_at_ms: number;
     host_id: string;
     status: "ok" | "error" | "unknown";
-    error: "unavailable" | null;
+    error: string | null;
     routes: Record<string, QuotaRouteDTO>;
   };
 }
@@ -672,7 +690,7 @@ export function validateQuotaSnapshotPayload(
     return { ok: false, status: 400, error: "invalid_status" };
   }
 
-  if (raw.error !== null && raw.error !== "unavailable") {
+  if (raw.error !== null && !isProbeError(raw.error)) {
     return { ok: false, status: 400, error: "invalid_error" };
   }
 
@@ -712,7 +730,7 @@ export function validateQuotaSnapshotPayload(
       return { ok: false, status: 400, error: "invalid_route_status" };
     }
 
-    if (routeVal.error !== null && routeVal.error !== "unavailable") {
+    if (routeVal.error !== null && !isProbeError(routeVal.error)) {
       return { ok: false, status: 400, error: "invalid_route_error" };
     }
 
@@ -876,15 +894,17 @@ export function validateQuotaSnapshotPayload(
     const isNativeStale = detailsStale === true;
     const isRouteUnavailable =
       routeVal.status === "error" ||
-      routeVal.error === "unavailable" ||
+      routeVal.error != null ||
       isNativeStale ||
       hasExplicitWindowError;
 
     const finalRouteStatus: "ok" | "error" | "unknown" = isRouteUnavailable
       ? "error"
       : routeVal.status;
-    const finalRouteError: "unavailable" | null = isRouteUnavailable
-      ? "unavailable"
+    // Preserve the concrete probe reason; synthesize "unavailable" only when
+    // the route failed without naming one (intake fae60b8a).
+    const finalRouteError: string | null = isRouteUnavailable
+      ? (typeof routeVal.error === "string" ? routeVal.error : "unavailable")
       : routeVal.error;
 
     const sanitizedDetails: QuotaRouteDetailsDTO = {
@@ -948,8 +968,10 @@ export function validateQuotaSnapshotPayload(
   }
 
   const finalTopStatus: "ok" | "error" | "unknown" = raw.status;
-  const finalTopError: "unavailable" | null =
-    finalTopStatus === "error" ? "unavailable" : raw.error;
+  const finalTopError: string | null =
+    finalTopStatus === "error"
+      ? (typeof raw.error === "string" ? raw.error : "unavailable")
+      : raw.error;
 
   return {
     ok: true,
@@ -1278,7 +1300,7 @@ export class QuotaStore {
       effectiveAgeMs < 0 ||
       effectiveAgeMs >= QUOTA_STALE_MS;
 
-    const isTopUnavailable = isStale || row.status !== "ok" || row.error === "unavailable";
+    const isTopUnavailable = isStale || row.status !== "ok" || row.error != null;
 
     if (isTopUnavailable) {
       const degradedRoutes: Record<string, QuotaRouteDTO> = {};
@@ -1627,7 +1649,7 @@ export class QuotaStore {
         ? `disabled: ${canonProv}/${canonAcct}`
         : state === "exhausted"
         ? `excluded: ${canonProv}/${canonAcct} quota_exhausted`
-        : `${canonProv}/${canonAcct} score=${decisionScore.toFixed(4)} [rem=${remaining !== null ? `${Math.round(remaining)}%` : 'unmetered'} win=${burn.windows_summary} ratio=${burn.ratio !== null ? burn.ratio.toFixed(2) : 'unmetered'} status=${effBurnStatus} burn=${burn.factor.toFixed(2)}x pref=${pref.toFixed(2)}x]`;
+        : `${canonProv}/${canonAcct} score=${decisionScore.toFixed(4)} [rem=${remaining !== null ? `${Math.round(remaining)}%` : 'unmetered'} win=${burn.windows_summary} ratio=${burn.ratio !== null ? burn.ratio.toFixed(2) : 'unmetered'} status=${effBurnStatus} burn=${burn.factor.toFixed(2)}x pref=${pref.toFixed(2)}x]${probeSuffix(displayObs?.quota)}`;
       pools.push({
         provider: canonProv,
         account: canonAcct,

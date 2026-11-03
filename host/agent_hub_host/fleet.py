@@ -691,26 +691,81 @@ def verify_repo_origin(checkout: Path, origin_url: str) -> None:
         raise ValueError('repo_origin_mismatch')
 
 
+# Bounded clone-output evidence (intake fae60b8a): gh/git stderr must reach
+# the journal's repo_clone_failed diagnostic instead of dying in /dev/null.
+CLONE_OUTPUT_LIMIT = 16384
+CLONE_DETAIL_LIMIT = 200
+
+
+def _scrub_clone_text(text: str) -> str:
+    """Redact secrets and paths from bounded clone output (never fail)."""
+    try:
+        from .log_redaction import redact_log
+        text = redact_log(text)
+    except Exception:
+        pass
+    text = re.sub(r'\S*[/\\]\S*', '[path]', text)
+    return ''.join(ch if 32 <= ord(ch) < 127 else ' ' for ch in text)
+
+
+def _short_clone_detail(chunks, code) -> str:
+    """First scrubbed non-empty clone-output line, or a bare exit fallback.
+
+    Never empty: a failure record must name the real git error, never a
+    bare exit code alone.
+    """
+    for chunk in chunks:
+        if not chunk:
+            continue
+        text = chunk.decode('utf-8', 'replace') if isinstance(chunk, (bytes, bytearray)) else str(chunk)
+        for line in text.splitlines():
+            clean = _scrub_clone_text(line).strip()
+            if clean:
+                return clean[:CLONE_DETAIL_LIMIT]
+    if type(code) is int:
+        return 'exit %d' % code
+    return 'clone command failed'
+
+
 def _run_repo_clone_command(argv, *, timeout):
-    """Bound gh and its Git/credential-helper descendants as one owned group."""
+    """Bound gh and its Git/credential-helper descendants as one owned group.
+
+    Clone output is captured to a bounded temp file, never a pipe: gh
+    progress can exceed pipe buffers while this caller only waits. The
+    caller scrubs a short detail from it so a repo_clone_failed journal
+    record carries the real git stderr (intake fae60b8a) instead of dying
+    in /dev/null. Native CLI output may contain credential material, so
+    only the scrubbed first line ever leaves this module.
+    """
     import signal
+    import tempfile
     try:
-        process = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        sink = tempfile.TemporaryFile(prefix='hub-clone-', suffix='.log')
     except OSError as exc:
-        raise ValueError('repo_clone_failed') from exc
-    try:
-        return subprocess.CompletedProcess(argv, process.wait(timeout=timeout))
-    except BaseException as exc:
-        # Kill the whole owned group before the caller removes staging data.
+        raise ValueError('repo_clone_failed: clone output unavailable') from exc
+    with sink:
         try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.wait()
-        if isinstance(exc, subprocess.TimeoutExpired):
-            raise ValueError('repo_clone_failed') from exc
-        raise
+            process = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
+                stdout=sink, stderr=sink, start_new_session=True)
+        except OSError as exc:
+            raise ValueError('repo_clone_failed: clone command failed') from exc
+        try:
+            code = process.wait(timeout=timeout)
+        except BaseException as exc:
+            # Kill the whole owned group before the caller removes staging data.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+            if isinstance(exc, subprocess.TimeoutExpired):
+                raise ValueError('repo_clone_failed: clone command timed out') from exc
+            raise
+        sink.seek(0)
+        output = sink.read(CLONE_OUTPUT_LIMIT + 1)
+        if len(output) > CLONE_OUTPUT_LIMIT:
+            output = output[:CLONE_OUTPUT_LIMIT]
+        return subprocess.CompletedProcess(argv, code, output, b'')
 
 
 def guarded_repo_clone(settings, repo: str, origin_url: str, target_dir: str,
@@ -784,7 +839,12 @@ def guarded_repo_clone(settings, repo: str, origin_url: str, target_dir: str,
                     _GH_AUTH_CACHE = None
                 if not gh_auth_ok():
                     raise ValueError('host_gh_auth_unavailable')
-                raise ValueError('repo_clone_failed')
+                # Intake fae60b8a: carry the real git stderr, never a bare
+                # exit code. Mocks may return only a returncode; the helper
+                # still falls back to a named exit, never an empty detail.
+                raise ValueError('repo_clone_failed: ' + _short_clone_detail(
+                    [getattr(result, 'stderr', b''), getattr(result, 'stdout', b'')],
+                    result.returncode))
             # flock serializes Hub writers; refuse any external writer's destination.
             if target.exists() or target.is_symlink():
                 raise ValueError('repo_clone_target_exists')

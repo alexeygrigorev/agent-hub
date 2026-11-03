@@ -759,6 +759,42 @@ describe('Quota API (/api/quota) & QuotaStore Contract Suite (Offline Fixtures O
     });
   });
 
+  it('preserves fixed probe reason codes on routes and rejects free-form error text', async () => {
+    // Intake fae60b8a AC3: quota reads carry a concrete reason
+    // (native_claude_auth_failed, ...) instead of a bare "unavailable".
+    // Only fixed code grammar survives; provider bodies stay rejected.
+    const tNow = 1760430000000;
+    const probeHost = await pairAndRegisterHost('quota-host-probe-code', 'probe.local');
+    await runInDurableObject(stub, async (instance: Hub) => {
+      instance.quotaStore.setClock(() => tNow);
+      try {
+        const snap: any = buildValidSnapshot(probeHost.machineId, new Date(tNow - 1000).toISOString());
+        snap.routes.codex.status = 'error';
+        snap.routes.codex.error = 'native_claude_auth_failed';
+        const res = instance.quotaStore.putSnapshot(probeHost.machineId, snap, tNow);
+        expect(res.ok).toBe(true);
+        const stored = instance.sql.exec('SELECT routes_json FROM host_quota_snapshots WHERE host_id = ?', probeHost.machineId).toArray()[0] as any;
+        expect(JSON.parse(stored.routes_json).codex.error).toBe('native_claude_auth_failed');
+
+        for (const bad of ['has spaces', 'semi;colon', 'x'.repeat(65), '', 42]) {
+          const badSnap: any = buildValidSnapshot(probeHost.machineId, new Date(tNow - 500).toISOString());
+          badSnap.routes.codex.status = 'error';
+          badSnap.routes.codex.error = bad;
+          expect(instance.quotaStore.putSnapshot(probeHost.machineId, badSnap, tNow + 1000).ok).toBe(false);
+        }
+
+        const legacy: any = buildValidSnapshot(probeHost.machineId, new Date(tNow - 500).toISOString());
+        legacy.routes.codex.status = 'error';
+        legacy.routes.codex.error = 'unavailable';
+        expect(instance.quotaStore.putSnapshot(probeHost.machineId, legacy, tNow + 2000).ok).toBe(true);
+        const storedLegacy = instance.sql.exec('SELECT routes_json FROM host_quota_snapshots WHERE host_id = ?', probeHost.machineId).toArray()[0] as any;
+        expect(JSON.parse(storedLegacy.routes_json).codex.error).toBe('unavailable');
+      } finally {
+        instance.quotaStore.setClock(undefined);
+      }
+    });
+  });
+
   it('enforces data-driven window names regex, 32-window limit, native details.stale, and window error fail-closed propagation', async () => {
     const tBase = 1760425000000;
 
