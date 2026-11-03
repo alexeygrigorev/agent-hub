@@ -169,7 +169,7 @@ export function workerCreatedTargets(sql: SqlStorage, sessionId: string | null |
   return new Set(sql.exec('SELECT task_id FROM worker_created_intakes WHERE session_id=? ORDER BY task_id LIMIT ?', sessionId, WORKER_CREATE_LIMIT)
     .toArray().map((r: any) => r.task_id as string));
 }
-const INTAKE_TASK_PATH = /^\/api\/intake\/tasks\/([a-zA-Z0-9._:-]+)(\/history|\/events|\/links|\/context)?$/;
+const INTAKE_TASK_PATH = /^\/api\/intake\/tasks\/([a-zA-Z0-9._:-]+)(\/history|\/events|\/links|\/context|\/depend|\/blocker|\/decompose)?$/;
 /** Denial code for a worker request outside its capability. Intake reads or
  * writes aimed at another intake say so explicitly instead of a generic 403. */
 export function workerDenialCode(sql: SqlStorage, request: Request, tokenId: string): string {
@@ -206,12 +206,26 @@ export function workerRequestAllowed(sql: SqlStorage, request: Request, tokenId:
   const ownIntake = INTAKE_TASK_PATH.exec(path);
   if (ownIntake) {
     const id = ownIntake[1];
+    // Every worker token is bounded to the project of its server-linked intake,
+    // including legacy created/linked/triage grants. Resolve prefixes fail-closed.
+    if (typeof worker.task_project !== 'string') return false;
+    let matches: any[] = [];
+    try {
+      matches = sql.exec('SELECT data FROM intake_tasks WHERE id=?', id).toArray() as any[];
+      if (!matches.length) matches = sql.exec('SELECT data FROM intake_tasks WHERE substr(id,1,?)=? ORDER BY id LIMIT 2', id.length, id).toArray() as any[];
+    } catch { return false; }
+    if (matches.length !== 1) return false;
+    let target: any;
+    try { target = JSON.parse(matches[0].data); } catch { return false; }
+    if (target?.project !== worker.task_project) return false;
     // A triage reviewer may read, note and amend AC/project on its requested intakes.
     if (id !== worker.task_id && triageTargets(sql, worker.session_id).has(id))
-      return request.method === 'GET' ? ownIntake[2] !== '/events' : request.method === 'POST' && (!ownIntake[2] || ownIntake[2] === '/events');
+      return request.method === 'GET' ? !['/events', '/depend', '/blocker', '/decompose'].includes(ownIntake[2] ?? '') : request.method === 'POST' && (!ownIntake[2] || ownIntake[2] === '/events');
     const own = id === worker.task_id || (id.length >= 8 && worker.task_id.startsWith(id));
-    if (!own && !workerCreatedTargets(sql, worker.session_id).has(id) && !workerLinkedTargets(sql, worker).has(id)) return false;
-    return request.method === 'GET' ? ownIntake[2] !== '/events' : request.method === 'POST' && ownIntake[2] === '/events';
+    const writeTarget = own || workerCreatedTargets(sql, worker.session_id).has(id) || workerLinkedTargets(sql, worker).has(id);
+    // Self-report: the session's own token may file a blocker follow-up, link prerequisites and request decomposition.
+    const write = ['/events', '/depend', '/blocker', '/decompose'].includes(ownIntake[2] ?? '');
+    return request.method === 'GET' ? !write : request.method === 'POST' && write && writeTarget;
   }
   if (path === '/api/sessions') return ['GET', 'POST'].includes(request.method);
   const link = /^\/api\/sessions\/([^/]{8,128})\/link$/.exec(path);

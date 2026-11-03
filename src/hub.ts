@@ -190,6 +190,8 @@ export class Hub extends DurableObject {
     // constructed just below); intake records only the returned real id.
     this.intakeService = new IntakeService(this.sql, fn => this.ctx.storage.transactionSync(fn), {
       queue: tasks => ({ items: this.intakeWatchdog.queue(tasks), observed_at: Date.now(), watchdog: this.intakeWatchdog.status() }),
+      prerequisiteCreated: (prerequisiteId, parentId) => this.intakeWatchdog.prioritizePrerequisite(prerequisiteId, parentId),
+      parentsUnblocked: ids => this.intakeWatchdog.resumeParents(ids),
       forgotten: tasks => {
         const items = this.intakeWatchdog.project(tasks).filter(t => t.forgotten);
         return { items, forgotten_count: items.length, unmerged: this.intakeService.mergeGate.counts(), observed_at: Date.now(), watchdog: this.intakeWatchdog.status(), triage: this.intakeTriage.status(), verifier: this.intakeVerifier.status() };

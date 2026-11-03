@@ -385,16 +385,18 @@ describe('scoped durable worker access',()=>{
   await runInDurableObject<Hub,any>(stub,(h:any)=>h.sql.exec('UPDATE session_control_sessions SET parent_id=? WHERE id=?',uuid(),session));
   expect(await detail(await start({}))).toBe('child_depth');
  }));
- it('files follow-up intakes with provenance, reads/notes only its own creations, and names cross-intake denials (34d0271b)',()=>setup(async({stub,id,session,task,other,worker,call}:any)=>{
+ it('files project-scoped follow-ups, grants project reads and limits writes to authorized intakes (34d0271b)',()=>setup(async({stub,id,session,task,other,worker,call}:any)=>{
   const api=(p:string,b?:any)=>call(p,b,worker.access_token);
   const code=async(r:Response)=>((await r.json()) as any).error;
   const src={type:'unknown',reference:'test'};
   // Own intake: links/context are the same read view as show.
   for(const sfx of ['','/history','/links','/context']) expect((await api('/api/intake/tasks/'+task+sfx)).status).toBe(200);
-  const made=await api('/api/intake/tasks',{key:uuid(),project:'dataops',title:'follow-up',text:'blocker found',source:src});
+  const wrongProject=await api('/api/intake/tasks',{key:uuid(),project:'dataops',title:'follow-up',text:'blocker found',source:src});
+  expect(wrongProject.status).toBe(403);expect(await code(wrongProject)).toBe('worker_project_forbidden');
+  const made=await api('/api/intake/tasks',{key:uuid(),project:'agent-hub',title:'follow-up',text:'blocker found',source:src});
   expect(made.status,await made.clone().text()).toBe(200);
   const created:any=(await made.json() as any).task;
-  expect(created.project).toBe('dataops');
+  expect(created.project).toBe('agent-hub');
   expect(created.created_by).toMatchObject({kind:'worker_session',hub_session_id:session,fleet_launch_id:id,parent_intake_id:task});
   for(const sfx of ['','/history','/links','/context']) expect((await api('/api/intake/tasks/'+created.id+sfx)).status).toBe(200);
   let version=1;
@@ -415,7 +417,7 @@ describe('scoped durable worker access',()=>{
    expect(del.status).toBe(403);
   }
   for(const sfx of ['','/history','/links']) {
-   const res=await api('/api/intake/tasks/'+other+sfx);expect(res.status).toBe(403);expect(await code(res)).toBe('cross_intake_forbidden');
+   expect((await api('/api/intake/tasks/'+other+sfx)).status).toBe(200);
   }
   const noteOther=await api('/api/intake/tasks/'+other+'/events',{key:uuid(),expected_version:1,event:{kind:'note',text:'x',source:src}});
   expect(noteOther.status).toBe(403);expect(await code(noteOther)).toBe('cross_intake_forbidden');
@@ -433,7 +435,7 @@ describe('scoped durable worker access',()=>{
    expect(data.status).toBe('open');expect(data.acceptance_criteria??null).toBeNull();
    expect(JSON.parse(h.sql.exec('SELECT data FROM intake_tasks WHERE id=?',other).toArray()[0].data).status).toBe('open');
   });
-  // A different worker session never sees another session's creations.
+  // A different session on the same project may read project work but cannot write another session's follow-up.
   const id2=uuid(), session2=uuid(), now=new Date().toISOString();
   await runInDurableObject<Hub,any>(stub,(h:any)=>{
    h.sql.exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,created_at,updated_at) VALUES(?,'tester','human','s',?,'{}','worker-host','opencode','shared-muse','headless','/repo','task','starting',?,?)`,id2,'key-'+id2,now,now);
@@ -442,7 +444,9 @@ describe('scoped durable worker access',()=>{
   const issued=await call('/api/fleet/launches/'+id2+'/worker-credential',{});expect(issued.status).toBe(200);
   const worker2:any=await issued.json();
   const peek=await call('/api/intake/tasks/'+created.id,undefined,worker2.access_token);
-  expect(peek.status).toBe(403);expect(await code(peek)).toBe('cross_intake_forbidden');
+  expect(peek.status).toBe(200);
+  const foreignWrite=await call('/api/intake/tasks/'+created.id+'/events',{key:uuid(),expected_version:1,note:'not yours'},worker2.access_token);
+  expect(foreignWrite.status).toBe(403);expect(await code(foreignWrite)).toBe('cross_intake_forbidden');
   // Workers cannot author AC/verification (auto-pickup would turn it into launch
   // authority) or forge provenance; refused creates leave no ledger row.
   for(const extra of [{acceptance_criteria:'do things'},{verification:'required'},{created_by:{hub_session_id:session2}}]) {
@@ -513,5 +517,35 @@ describe('scoped durable worker access',()=>{
   });
   expect((await api('/api/intake/tasks/'+cont)).status).toBe(200);
   expect((await api('/api/intake/tasks/'+task)).status).toBe(200);
+ }));
+ it('lets a session token file and complete a project-scoped blocker follow-up only for its own intake',()=>setup(async({task,session,other,worker,call}:any)=>{
+  const api=(p:string,b?:any)=>call(p,b,worker.access_token);
+  const key=uuid();
+  const blocked=await api('/api/intake/tasks/'+task+'/blocker',{key:'blocker-'+key,expected_version:1,title:'Install missing compiler',
+   text:'The project compiler is unavailable on this host.',acceptance_criteria:'The project compiles on a Hub-installed host.',blocker_key:key});
+  expect(blocked.status,await blocked.clone().text()).toBe(200);
+  const data:any=await blocked.json();
+  expect(data.task).toMatchObject({status:'blocked',blocked_by:[data.followup.id]});
+  expect(data.followup.project).toBe('agent-hub');
+  expect(data.followup.created_by).toMatchObject({kind:'worker_session',hub_session_id:session,parent_intake_id:task,blocker_followup:true});
+  await runInDurableObject<Hub,any>(stub,(h:any)=>{
+   const row=h.sql.exec('SELECT data FROM intake_tasks WHERE id=?',other).toArray()[0];
+   const taskData=JSON.parse(row.data);taskData.project='dataops';
+   h.sql.exec('UPDATE intake_tasks SET data=? WHERE id=?',JSON.stringify(taskData),other);
+  });
+  expect((await api('/api/intake/tasks/'+other)).status).toBe(403);
+  const cross=await api('/api/intake/tasks/'+other+'/blocker',{key:'cross-'+key,expected_version:1,title:'cross project',text:'x',acceptance_criteria:'x'});
+  expect(cross.status).toBe(403);
+  const done=await api('/api/intake/tasks/'+data.followup.id+'/events',{key:'done-'+key,expected_version:1,
+   event:{kind:'note',text:'DONE abc1234\nLive check: compiler on Hub host\nResult: passed',source:{type:'unknown'}}});
+  expect(done.status,await done.clone().text()).toBe(200);
+  const parent=await api('/api/intake/tasks/'+task);
+  expect((await parent.json() as any).task.blocked_by).toEqual([]);
+  await runInDurableObject<Hub,any>(stub,(h:any)=>h.sql.exec(`INSERT INTO intake_decomposition_sessions(session_id,task_id,project,created_at,child_count)
+   VALUES(?,?,?, ?,0)`,session,task,'agent-hub',Date.now()));
+  const child=await api('/api/intake/tasks',{key:'child-'+key,project:'agent-hub',title:'Build compiler package',text:'Add a compiler package.',
+   acceptance_criteria:'The package builds on the Hub worker host.'});
+  expect(child.status,await child.clone().text()).toBe(200);
+  expect((await child.json() as any).task.created_by).toMatchObject({hub_session_id:session,decomposition_child:true});
  }));
 });

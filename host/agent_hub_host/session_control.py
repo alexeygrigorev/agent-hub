@@ -567,6 +567,7 @@ def add_commands(sub):
                        help='Label filter (repeatable, e.g. --needs os:windows --needs arch:arm64); eligible machines must satisfy all needs, else held with rejected[] reason needs_unmet')
     start.add_argument('--workspace', default=None, help='Configured workspace label or absolute path on the target host (omit with --repo)')
     start.add_argument('--repo', default=None, help='Repository owner/name; the placed host (any OS) clones its own fresh work tree from origin/main, so no host path is needed')
+    start.add_argument('--force', action='store_true', help='Operator only: start despite unresolved intake dependencies')
     start.add_argument('--task-kind', choices=['implement','review','ask','goal'], help='Task kind for measured resource placement and session statistics')
     start.add_argument('--tier', choices=TIERS, help='deep/daily/quick task tier; --tier deep requires --reason')
     start.add_argument('--effort', choices=['low', 'medium', 'high', 'max'], help='Per-session model reasoning effort')
@@ -1019,6 +1020,8 @@ def _execute(args):
             payload['needs'] = list(needs)
         if getattr(args, 'task_kind', None) is not None:
             payload['task_kind'] = args.task_kind
+        if getattr(args, 'force', False):
+            payload['force'] = True
         if getattr(args, 'intake_task_id', None):
             val = str(args.intake_task_id).strip()
             m = re.search(r'/intake/([A-Za-z0-9._:-]{6,128})', val)

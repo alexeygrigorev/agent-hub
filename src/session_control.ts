@@ -41,6 +41,7 @@ import { recordIntakeSessionLink, recordWorkerChildStart, IntakeSessionLinkError
 export const WORKER_CHILD_CONCURRENT = 4;
 export const WORKER_CHILD_PER_HOUR = 12;
 export const WORKER_CHILD_PER_INTAKE = 8;
+import { IntakeDependencies } from './intake-dependencies';
 import { ResourceManagement } from './resource-management';
 import { classifySessionStall, initSessionStalls, nativeObservationFresh, type NativeObservationCache, nativeProgress, sessionTerminalError, orphanFailure, stallThreshold, toolCallStallThreshold } from './session_stall';
 import {
@@ -1679,6 +1680,7 @@ export class SessionControlService {
             continue;
           }
           let project: string | undefined = undefined;
+          let dependencyGateUnknown = false;
           if (typeof req.intake_task_id === 'string' && req.intake_task_id) {
             try {
               let taskRows: any[] = this.sql.exec('SELECT id, data FROM intake_tasks WHERE id = ?', req.intake_task_id).toArray();
@@ -1688,6 +1690,11 @@ export class SessionControlService {
               if (taskRows.length === 1) {
                 const task = parsed(taskRows[0].data, {});
                 project = typeof task?.project === 'string' ? task.project : undefined;
+                // Fail closed: an unreadable dependency graph keeps the hold parked, never starts it.
+                if (req.force !== true) {
+                  try { if (new IntakeDependencies(this.sql).view(taskRows[0].id).blocked_by.length) continue; }
+                  catch { dependencyGateUnknown = true; }
+                }
                 if (task?.status === 'done' || task?.status === 'cancelled') {
                   const at = this.at();
                   const closedHold = JSON.stringify({ error: 'intake_task_closed', reason: 'intake_task_closed', rejected: holdInfo.rejected });
@@ -1736,8 +1743,9 @@ export class SessionControlService {
                   continue;
                 }
               }
-            } catch {}
+            } catch { dependencyGateUnknown = true; }
           }
+          if (dependencyGateUnknown) continue;
           // Intake worktree rules from POST /api/sessions apply on re-placement:
           // a worktree another intake owns or that was removed never clears
           // (cancel); an intake's recorded host pins the re-placement.
@@ -2572,8 +2580,8 @@ export class SessionControlService {
       // null / blank intake_task_id means "missing" so the TBM gate can return
       // intake_task_id_required instead of a generic invalid_session_request.
       if (input.intake_task_id === null || input.intake_task_id === '') delete input.intake_task_id;
-      if (!obj(input, ['key', 'engine', 'engine_override_reason', 'tier', 'effort', 'machine', 'needs', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id', 'intake_task_id', 'with_goal', 'task_kind', 'intake_worktree', 'repo'])) {
-        const allowed = new Set(['key', 'engine', 'engine_override_reason', 'tier', 'effort', 'machine', 'needs', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id', 'intake_task_id', 'with_goal', 'task_kind', 'intake_worktree', 'repo']);
+      if (!obj(input, ['key', 'engine', 'engine_override_reason', 'tier', 'effort', 'machine', 'needs', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id', 'intake_task_id', 'with_goal', 'task_kind', 'intake_worktree', 'repo', 'force'])) {
+        const allowed = new Set(['key', 'engine', 'engine_override_reason', 'tier', 'effort', 'machine', 'needs', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id', 'intake_task_id', 'with_goal', 'task_kind', 'intake_worktree', 'repo', 'force']);
         const field = input && typeof input === 'object' && !Array.isArray(input)
           ? Object.keys(input).find(k => !allowed.has(k)) : undefined;
         return response({ error: 'invalid_session_request', ...(field ? { field, detail: 'unknown_field' } : { detail: 'invalid_object' }) }, 400);
@@ -2680,6 +2688,8 @@ export class SessionControlService {
       }
       if (driverScoped && (typeof input.intake_task_id !== 'string' || mode !== 'headless' ||
           input.engine !== undefined || input.machine !== undefined)) return response({ error: 'driver_scope_forbidden' }, 403);
+      if (input.force !== undefined && typeof input.force !== 'boolean') return response({ error: 'invalid_session_request', field: 'force' }, 400);
+      if (input.force === true && (!caller.isAdmin || !auth.scopes?.includes('admin'))) return response({ error: 'forbidden' }, 403);
       const worker = workerAccessContext(this.sql, caller.tokenId);
       if (worker) {
         const intake = input.intake_task_id;
@@ -2746,6 +2756,7 @@ export class SessionControlService {
         }
         const sessionType = mode === 'interactive' ? 'aplexer' : 'headless';
         const canonical = JSON.stringify({
+          ...(input.force === true ? { force: true } : {}),
           ...(input.task_kind !== undefined ? {task_kind:input.task_kind} : {}),
           ...(input.effort !== undefined ? {effort:input.effort} : {}),
           engine: input.engine ?? null, engine_override_reason: (input as any).engine_override_reason ?? null,
@@ -2830,6 +2841,11 @@ export class SessionControlService {
           }
           const ac = data ? data.acceptance_criteria : undefined;
           const taskStatus = data?.status;
+          // Fail closed: if the graph cannot be read the start is refused, never allowed.
+          let blockers: string[];
+          try { blockers = new IntakeDependencies(this.sql).view(row.id).blocked_by; }
+          catch { return response({ error: 'dependency_check_failed' }, 503); }
+          if (blockers.length && input.force !== true) return response({ error: 'intake_dependencies_unresolved', blocked_by: blockers }, 409);
           if (taskStatus === 'done' || taskStatus === 'cancelled') return response({ error: 'intake_task_closed' }, 409);
           if (typeof ac !== 'string' || !ac.trim()) return response({ error: 'acceptance_criteria_required' }, 400);
         }
