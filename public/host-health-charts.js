@@ -14,12 +14,11 @@
     const all = data.series || [];
     const name = id => (data.machines || []).find(m => m.id === id)?.name || id;
     const hosts = [...new Set(all.map(s => s.machine_id).filter(Boolean))];
-    const previous = hostPicker.value;
-    if (!machine) {
-      hostPicker.replaceChildren(Object.assign(el('option', 'All hosts'), { value: '' }));
-      for (const id of hosts) hostPicker.append(Object.assign(el('option', name(id)), { value: id }));
-      hostPicker.value = previous;
-    }
+    const previous = machine || hostPicker.value;
+    hostPicker.replaceChildren(Object.assign(el('option', 'All hosts'), { value: '' }));
+    for (const id of hosts) hostPicker.append(Object.assign(el('option', name(id)), { value: id }));
+    machine = hosts.includes(previous) ? previous : '';
+    hostPicker.value = machine;
     const make = (title, rows, unit) => plots.append(HubMetricsCharts.timeSeries(title, rows.map(s => ({ reference: s.reference, label: s.label || `${s.machine_id ? s.machine_id + ' · ' : ''}${s.entity} · ${s.metric}`, points: s.points })), start, end, unit));
     const hostIds = machine ? [machine] : hosts;
     for (const id of hostIds) {
@@ -88,5 +87,6 @@
       return load();
     },
     clear() { generation++; lastData = null; if (plots) plots.replaceChildren(); if (status) status.textContent = 'Sign in to view resource history.'; },
+    selectMachine(id) { machine = id || ''; if (fetchApi) return load(); },
   };
 })();

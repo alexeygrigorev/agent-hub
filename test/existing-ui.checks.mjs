@@ -13,6 +13,9 @@ for(const [path,hash] of Object.entries(lock.files))assert.equal(createHash('sha
 const paths=[
   'public/index.html',
   'public/fleet.css','public/fleet.html','public/fleet.js',
+  'public/machines.css','public/machines.html','public/machines.js',
+  'public/quota.css','public/quota.html','public/quota.js',
+  'public/settings.css','public/settings.html','public/settings.js',
   'public/metrics.css','public/metrics.html','public/metrics.js',
   'public/sessions.css','public/sessions.html','public/sessions.js',
   'public/auth.css','public/auth.js'

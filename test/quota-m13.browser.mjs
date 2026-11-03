@@ -61,7 +61,7 @@ try {
   const capturedAt = new Date(Date.now() - 5000).toISOString();
   const snap = {
     schema_version: '1.1', collector_version: 'quota_snapshot/1.1', captured_at: capturedAt, host_id: 'ui-machine', status: 'ok', error: null,
-    routes: { codex: { status: 'ok', error: null, observed_at: capturedAt, details: { limit_reached: false }, windows: { '7d': { percent_remaining: 80, reset_at: new Date(Date.now() + 86400000).toISOString(), present: true, rolling: false, credits_remaining: 12.5, spend_used: null, spend_limit: null, unit: 'credits', profile: null } } } },
+    routes: { codex: { status: 'ok', error: null, observed_at: capturedAt, details: { limit_reached: false, banked_resets: [{ expires_at: new Date(Date.now() + 28 * 86400000).toISOString(), available: true, label: 'Full reset' }] }, windows: { '5h': { percent_remaining: null, reset_at: null, present: false, rolling: false, credits_remaining: null, spend_used: null, spend_limit: null, unit: null, profile: null }, '7d': { percent_remaining: 80, reset_at: new Date(Date.now() + 86400000).toISOString(), present: true, rolling: false, credits_remaining: 12.5, spend_used: null, spend_limit: null, unit: 'credits', profile: null } } } },
   };
   assert.equal((await api('/api/quota', 'POST', snap, tokens['ui-machine'])).status, 200);
 
@@ -86,6 +86,44 @@ try {
   assert.equal(filtered.pools.length, 1);
   assert.equal(filtered.pools[0].remaining_percent, 60);
   checks.push('Filtered quota view agrees with the fleet view on host, units and freshness');
+
+  // Seed multi-provider snapshot (5h, 7d, monthly, banked resets, and unavailable/error account)
+  // while preserving q-pool so browser renders verify full provider-usage hierarchy.
+  const win = (pct, resetMs, extra = {}) => ({
+    percent_remaining: pct,
+    reset_at: resetMs == null ? null : new Date(Date.now() + resetMs).toISOString(),
+    present: pct !== null,
+    rolling: false,
+    credits_remaining: null,
+    spend_used: null,
+    spend_limit: null,
+    unit: null,
+    profile: null,
+    ...extra,
+  });
+  const multiCapturedAt = new Date(Date.now() - 2000).toISOString();
+  const multiSnap = {
+    schema_version: '1.1', collector_version: 'quota_snapshot/1.1', captured_at: multiCapturedAt, host_id: 'ui-machine', status: 'ok', error: null,
+    routes: {
+      claude: { status: 'ok', error: null, observed_at: multiCapturedAt, details: { limit_reached: true }, windows: { '5h': win(100, null, { rolling: true }), '7d': win(0, (2 * 24 + 6) * 3600000) } },
+      codex: { ...snap.routes.codex, observed_at: multiCapturedAt },
+      'codex-orin': { status: 'error', error: 'unavailable', observed_at: multiCapturedAt, details: { limit_reached: false }, windows: {} },
+      copilot: { status: 'ok', error: null, observed_at: multiCapturedAt, details: { limit_reached: false }, windows: { monthly: win(95, (27 * 24 + 15) * 3600000) } },
+      gemini: { status: 'ok', error: null, observed_at: multiCapturedAt, details: { limit_reached: false }, windows: { '5h': win(76, 52 * 60000, { rolling: true }), '7d': win(22, (3 * 24 + 14) * 3600000) } },
+      go: { status: 'ok', error: null, observed_at: multiCapturedAt, details: { limit_reached: false }, windows: { '5h': win(92, (2 * 60 + 47) * 60000, { rolling: true }), '7d': win(75, (5 * 24 + 15) * 3600000), monthly: win(36, (18 * 24 + 22) * 3600000) } },
+      grok: { status: 'ok', error: null, observed_at: multiCapturedAt, details: { limit_reached: false }, windows: { '7d': win(16, (3 * 24 + 11) * 3600000) } },
+      zai: {
+        status: 'ok', error: null, observed_at: multiCapturedAt,
+        details: {
+          limit_reached: false,
+          banked_resets: [1, 2, 3].map(i => ({ expires_at: new Date(Date.now() + (49 * 24 + 7 + i) * 3600000).toISOString(), available: true, label: `Reset ${i}` })),
+        },
+        windows: { '5h': win(100, null, { rolling: true }), '7d': win(3, (3 * 24 + 23) * 3600000) },
+      },
+    },
+  };
+  assert.equal((await api('/api/quota', 'POST', multiSnap, tokens['ui-machine'])).status, 200);
+
   browser = await launchBrowser({ args: ['--single-process', '--in-process-gpu', '--disable-gpu', '--disable-dev-shm-usage', '--no-sandbox', '--js-flags=--thread-pool-size=1', '--num-raster-threads=1', '--disable-threaded-animation', '--disable-threaded-scrolling'] });
   const context = await browser.newContext(), page = await context.newPage(); page.setDefaultTimeout(15000);
   const errors = []; page.on('pageerror', () => errors.push('browser script error'));
@@ -98,16 +136,24 @@ try {
   const capture = async name => { await page.evaluate(() => document.fonts.ready); await safe(); await page.screenshot({ path: resolve(out, name + '.png'), fullPage: true }); shots.push(name + '.png'); };
   for (const theme of ['light', 'dark']) for (const width of [1440, 390]) {
     await context.clearCookies(); await page.setViewportSize({ width, height: 900 }); await cookie(human.cookie);
-    await page.goto(base + '/fleet.html');
-    // Set the theme on the fleet origin, then reload so the shell reads it at load.
+    await page.goto(base + '/fleet.html#quota');
+    await page.waitForURL(base + '/quota.html');
+    // Set the theme on the quota origin, then reload so the shell reads it at load.
     await page.evaluate(t => localStorage.setItem('dakit-theme', t), theme);
     await page.reload(); await page.getByText('Authenticated · updated', { exact: false }).waitFor();
     assert.equal(await page.evaluate(() => document.documentElement.dataset.theme), theme);
     const quotaText = await page.locator('#quota').textContent();
     assert.ok(quotaText.includes('q-pool'), 'pool account rendered');
     assert.ok(quotaText.includes('fresh'), 'fresh state rendered');
-    assert.ok(quotaText.includes('60%'), 'conservative remaining rendered');
-    assert.ok(quotaText.includes('12.5 credits'), 'native units rendered');
+    assert.ok(quotaText.includes('60%'), `conservative per-window remaining rendered: ${quotaText}`);
+    assert.ok(quotaText.includes('12.5 credits'), 'native units remain available in details');
+    assert.ok(quotaText.includes('1 reset available'), 'reported reset availability rendered');
+    assert.ok(quotaText.includes('3 resets available'), 'multi-grant reset availability rendered');
+    assert.ok(quotaText.includes('codex-orin') && quotaText.includes('error'), 'unavailable provider account error state rendered');
+    assert.equal(await page.locator('#quota .quota-provider').first().locator('.quota-provider__reset').first().textContent(), '', '100% rolling 5h window without reset_at leaves reset cell empty');
+    assert.equal(await page.locator('#quota .quota-provider').nth(1).locator('.quota-provider__row').count(), 0, 'error provider without present windows shows message instead of empty bars');
+    assert.equal(await page.locator('#quota .quota-provider').nth(2).locator('.quota-provider__row').count(), 1, 'absent 5h window is not rendered on q-pool');
+    assert.equal(await page.locator('#quota .quota-meter__fill[role="progressbar"]').count(), 12, 'readable quota bars rendered across 5h/7d/monthly windows');
     assert.ok(quotaText.includes('Coverage:'), 'honest coverage rendered');
     await page.locator('#quota').scrollIntoViewIfNeeded();
     await capture(`quota-${width}-${theme}`);
