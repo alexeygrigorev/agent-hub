@@ -108,6 +108,7 @@ const SLIM_REQUEST = `CASE WHEN json_valid(request_json) THEN json_object('intak
 const NATIVE_KEY = `CASE WHEN json_valid(binding_json) THEN CASE WHEN json_type(binding_json, '$.native_id') = 'text'
   THEN json_extract(binding_json, '$.native_id') END END`;
 export class ResourceManagement {
+  private resourceSettingsMigrationChecked = false;
   private catalogReady = false;
   private catalogStructureRevision:string|null=null;
   private catalogRawRows=new Map<string,any[]>();
@@ -160,6 +161,25 @@ export class ResourceManagement {
           AFTER ${op} ON ${table} WHEN ${relevant} BEGIN UPDATE resource_history_revision SET revision=lower(hex(randomblob(16))) WHERE id=1; END`);
       }
     }
+    this.migrateResourceSettings();
+  }
+  private migrateResourceSettings() {
+    if (this.resourceSettingsMigrationChecked) return;
+    this.resourceSettingsMigrationChecked = true;
+    const row = this.sql.exec('SELECT data FROM resource_settings WHERE id=1').toArray()[0] as any;
+    if (!row) return;
+    const stored = parse(row.data);
+    const version = Number.isSafeInteger(stored[RESOURCE_SETTINGS_VERSION_KEY]) ? stored[RESOURCE_SETTINGS_VERSION_KEY] : 0;
+    if (version >= RESOURCE_SETTINGS_VERSION) return;
+    delete stored[RESOURCE_SETTINGS_VERSION_KEY];
+    const config = resourceConfig(stored);
+    // Existing Durable Objects have a persisted 3% default, which would
+    // otherwise mask the new shipped default forever. Migrate that legacy
+    // default once; later explicit configure() calls are versioned and kept.
+    if (stored.memory_floor_pct === LEGACY_MEMORY_FLOOR_PCT && defaults.memory_floor_pct < LEGACY_MEMORY_FLOOR_PCT) {
+      config.memory_floor_pct = defaults.memory_floor_pct;
+    }
+    this.sql.exec('UPDATE resource_settings SET data=? WHERE id=1', JSON.stringify({ ...config, [RESOURCE_SETTINGS_VERSION_KEY]: RESOURCE_SETTINGS_VERSION }));
   }
   private refreshHistory() {
     if (this.historyScope) return;
@@ -199,21 +219,10 @@ export class ResourceManagement {
     return { ...config, memory_floor_mb: effectiveFloorMb(config, parse(m?.last_heartbeat).mem_total_mb) };
   }
   config(): ResourceConfig {
-    const row = this.readRows('SELECT data FROM resource_settings WHERE id=1')[0];
-    const stored = parse(row?.data);
-    const version = Number.isSafeInteger(stored[RESOURCE_SETTINGS_VERSION_KEY]) ? stored[RESOURCE_SETTINGS_VERSION_KEY] : 0;
-    const { [RESOURCE_SETTINGS_VERSION_KEY]: _version, ...values } = stored;
-    const config = resourceConfig(values);
-    if (row && version < RESOURCE_SETTINGS_VERSION) {
-      // Existing Durable Objects have a persisted 3% default, which would
-      // otherwise mask the new shipped default forever. Migrate that legacy
-      // default once; later explicit configure() calls are versioned and kept.
-      if (values.memory_floor_pct === LEGACY_MEMORY_FLOOR_PCT && defaults.memory_floor_pct < LEGACY_MEMORY_FLOOR_PCT) {
-        config.memory_floor_pct = defaults.memory_floor_pct;
-      }
-      this.sql.exec('UPDATE resource_settings SET data=? WHERE id=1', JSON.stringify({ ...config, [RESOURCE_SETTINGS_VERSION_KEY]: RESOURCE_SETTINGS_VERSION }));
-    }
-    return config;
+    this.migrateResourceSettings();
+    const stored = parse(this.readRows('SELECT data FROM resource_settings WHERE id=1')[0]?.data);
+    delete stored[RESOURCE_SETTINGS_VERSION_KEY];
+    return resourceConfig(stored);
   }
   configure(value: any) {
     const config = resourceConfig(value);
