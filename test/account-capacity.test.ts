@@ -43,6 +43,91 @@ async function configure(s: FleetService, shared = false) {
 }
 
 describe('phantom account reservations', () => {
+  it('clears a copied capacity refusal when an offer is claimed for a new attempt', () => fixture(async (f, sql) => {
+    await configure(f);
+    const launch: any = await (await f.handle(request('/launches', intent({ machine: 'hetzner', mode: 'headless', tier: 'quick', access: { mode: 'read' } })), admin)).json();
+    const refusal = {
+      reason: 'launcher_memory_reserve',
+      message: 'Host memory headroom after launcher reservations is below the configured floor.',
+      error_type: 'ValueError', stage: 'dispatch_headless', exit_code: 1,
+    };
+    sql.exec('UPDATE fleet_launches SET launch_error_json=? WHERE id=?', JSON.stringify(refusal), launch.id);
+    const selection = JSON.parse(sql.exec('SELECT model_selection_json FROM fleet_launches WHERE id=?', launch.id).one().model_selection_json);
+    const claimed = await f.handle(request('/launches/' + launch.id + '/claim', {
+      gate_allowed: true, profile_supported: true, observed_at: iso(), account: 'shared-codex', model: selection.model,
+    }), host('hetzner'));
+    expect(claimed.status).toBe(200);
+    expect(sql.exec('SELECT state,launch_error_json FROM fleet_launches WHERE id=?', launch.id).one()).toMatchObject({
+      state: 'starting', launch_error_json: null,
+    });
+    expect(reconcileAccountCapacity(sql, now)).toEqual([]);
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id=?', launch.id).one().state).toBe('starting');
+  }));
+
+  it('settles exact unbound launcher refusals while retaining ambiguous and unknown starts', () => fixture(async (f, sql) => {
+    await configure(f);
+    sql.exec("UPDATE fleet_accounts SET max_concurrency = 4 WHERE label = 'shared-codex'");
+    const makeUncertain = async () => {
+      const launch: any = await (await f.handle(request('/launches', intent({ machine: 'hetzner', mode: 'headless' })), admin)).json();
+      return launch.id as string;
+    };
+    const refusal = {
+      reason: 'launcher_memory_reserve',
+      message: 'Host memory headroom after launcher reservations is below the configured floor.',
+      error_type: 'ValueError', stage: 'dispatch_headless', exit_code: 1,
+    };
+    const neverBound = await makeUncertain();
+    const boundButUnobserved = await makeUncertain();
+    const matchingNative = await makeUncertain();
+    const ambiguousFailure = await makeUncertain();
+    const ambiguous = {
+      reason: 'launcher_command_failed',
+      message: 'The launcher command failed with exit code 1; unrecognized output withheld.',
+      error_type: 'RuntimeError', stage: 'dispatch_headless', exit_code: 1,
+    };
+    // Install all candidate receipts together so the normal maintenance path
+    // on the next launch cannot settle the first exact refusal mid-fixture.
+    for (const id of [neverBound, boundButUnobserved, matchingNative]) {
+      sql.exec("UPDATE fleet_launches SET state='uncertain', native_id=NULL, launcher_task_id=NULL, launch_error_json=? WHERE id=?",
+        JSON.stringify(refusal), id);
+    }
+    sql.exec("UPDATE fleet_launches SET state='uncertain', native_id=NULL, launcher_task_id=NULL, launch_error_json=? WHERE id=?",
+      JSON.stringify(ambiguous), ambiguousFailure);
+
+    const control = new SessionControlService(sql, cb => cb(), () => now); control.init();
+    const addControl = (id: string, bindingJson: string | null) => sql.exec(
+      "INSERT INTO session_control_sessions (id,actor,request_key,request_json,fleet_launch_id,machine_id,engine,mode,state,binding_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+      'control-' + id, 'test-admin', 'control-' + id, '{}', id, 'hetzner', 'codex', 'headless', 'uncertain', bindingJson, iso(), iso());
+    addControl(neverBound, null);
+    addControl(boundButUnobserved, JSON.stringify({ native_id: 'still-bound-native', native_created_at_ms: now }));
+    sql.exec("INSERT INTO fleet_sessions (machine_id,native_id,tag,engine,phase,observed_at,workspace,account,created_at_ms) VALUES ('hetzner','still-catalog-native','task-hub-' || ?,'codex','running',?,'demo','shared-codex',?)",
+      matchingNative, iso(), now);
+
+    const capacity = () => f.accountStatus(
+      sql.exec("SELECT * FROM fleet_accounts WHERE label='shared-codex'").one(), f.queueCapacitySnapshot(now));
+    // On current main, active concurrency derives from observed live
+    // sessions (eca41f28): the launch whose managed tag has a live native row
+    // counts once via that observed native, not as a launch reservation.
+    expect(capacity()).toMatchObject({ active: 4, reserved: 3, observed_sessions: 1, available_slots: 0 });
+
+    const expected = [{ id: neverBound, before: 'uncertain', after: 'failed', reason: 'launcher_memory_reserve' }];
+    expect(reconcileAccountCapacity(sql, now, false)).toEqual(expected);
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id=?', neverBound).one().state).toBe('uncertain');
+    expect(reconcileAccountCapacity(sql, now)).toEqual(expected);
+
+    expect(capacity()).toMatchObject({ active: 3, reserved: 2, observed_sessions: 1, available_slots: 1 });
+    expect(sql.exec('SELECT state,exit_reason,verification_status FROM fleet_launches WHERE id=?', neverBound).one()).toMatchObject({
+      state: 'failed', exit_reason: 'launcher_memory_reserve', verification_status: 'not_started',
+    });
+    expect(sql.exec('SELECT state,binding_json FROM session_control_sessions WHERE fleet_launch_id=?', neverBound).one()).toMatchObject({
+      state: 'failed', binding_json: null,
+    });
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id=?', boundButUnobserved).one().state).toBe('uncertain');
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id=?', matchingNative).one().state).toBe('uncertain');
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id=?', ambiguousFailure).one().state).toBe('uncertain');
+    expect(sql.exec('SELECT state FROM session_control_sessions WHERE fleet_launch_id=?', boundButUnobserved).one().state).toBe('uncertain');
+  }));
+
   it('preserves legacy duplicate cwd and direct native identity capacity rules', () => fixture(async(f,sql)=>{
     await configure(f);
     const launch:any=await (await f.handle(request('/launches',intent({machine:'hetzner',mode:'headless'})),admin)).json();
