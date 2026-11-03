@@ -26,14 +26,12 @@ import plistlib
 import uuid
 import tomllib
 import stat
-from .bootstrap_pins import NODE_SHA256, APLEXER_SHA256, ANTIGRAVITY_RELEASES, ENGINE_PACKAGES, PYTHON_WHEELS, LAUNCHER_RELEASE
+from .bootstrap_pins import (NODE_SHA256, APLEXER_SHA256, APLEXER_VERSION,
+                             APLEXER_MACOS_VERSION, ANTIGRAVITY_RELEASES,
+                             ENGINE_PACKAGES, PYTHON_WHEELS, LAUNCHER_RELEASE)
 
 
 NODE_VERSION = '22.23.4'
-APLEXER_VERSION = '0.1.23'
-# v0.1.23 omits the previously published macOS assets. Keep each native
-# binary and Python client on the same published release for that platform.
-APLEXER_MACOS_VERSION = '0.1.22'
 GIT_VERSION = '2.56.0.4'
 GIT_SHA256 = {
     'x64': 'b1f3e52216e2ed6882d1bebfd4d3fdf319bec40d2edbbf9fd26ec4fd3fce7ed1',
@@ -344,6 +342,20 @@ def aplexer_version():
     return APLEXER_MACOS_VERSION if sys.platform == 'darwin' else APLEXER_VERSION
 
 
+def aplexer_client_release_asset():
+    """Return the immutable client wheel URL and checksum for this host."""
+    version = aplexer_version()
+    if sys.platform == 'win32':
+        platform_tag = 'win_amd64' if architecture() == 'x64' else 'win_arm64'
+    elif sys.platform == 'darwin':
+        platform_tag = 'macosx_11_0_' + ('x86_64' if architecture() == 'x64' else 'arm64')
+    else:
+        platform_tag = 'manylinux_2_28_' + ('x86_64' if architecture() == 'x64' else 'aarch64')
+    asset = f'aplexer_client-{version}-cp311-abi3-{platform_tag}.whl'
+    url = f'https://github.com/PocketShell-io/aplexer/releases/download/v{version}/{asset}'
+    return url, APLEXER_SHA256[version][asset]
+
+
 def ensure_aplexer(install_root):
     binary_dir = install_root / 'bin'
     suffix = '.exe' if sys.platform == 'win32' else ''
@@ -521,16 +533,7 @@ def install_package(archive, install_root, uv):
     for name in ('quse', 'click', 'colorama'):
         wheel = next(iter(PYTHON_WHEELS[name]['wheels'].values()))
         requirements.append(wheel['url'] + ' --hash=sha256:' + wheel['sha256'])
-    if sys.platform == 'darwin':
-        cpu = 'x86_64' if architecture() == 'x64' else 'arm64'
-        name = 'aplexer_client-' + aplexer_version() + '-cp311-abi3-macosx_11_0_' + cpu + '.whl'
-        url = 'https://github.com/PocketShell-io/aplexer/releases/download/v' + aplexer_version() + '/' + name
-        checksum = APLEXER_SHA256[aplexer_version()][name]
-    else:
-        suffix = ('win_amd64.whl' if sys.platform == 'win32' else
-                  'manylinux_2_28_' + ('x86_64' if architecture() == 'x64' else 'aarch64') + '.whl')
-        wheel = next(w for n, w in PYTHON_WHEELS['aplexer-client']['wheels'].items() if n.endswith(suffix))
-        url, checksum = wheel['url'], wheel['sha256']
+    url, checksum = aplexer_client_release_asset()
     requirements.append(url + ' --hash=sha256:' + checksum)
     (install_root / 'tmp').mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=install_root / 'tmp') as tmp:
