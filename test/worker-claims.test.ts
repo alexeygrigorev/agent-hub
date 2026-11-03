@@ -62,23 +62,28 @@ describe('worker credential work claims', () => {
     const { stub, session, api } = await setup();
     const tag = 'worker-native-test';
     const holder = formatNativeActor('worker-host', tag, session);
-    let owned = '', otherIncarnation = '';
+    let owned = '', ownedScope = '', otherIncarnation = '';
     await runInDurableObject<Hub, any>(stub, (h: any) => {
       h.sql.exec('UPDATE session_control_sessions SET binding_json=? WHERE id=?',
         JSON.stringify({ native_id: session, tag, workspace: '/repo' }), session);
       owned = uuid();
+      ownedScope = uuid();
       otherIncarnation = uuid();
       const now = Date.now();
       const insert = "INSERT INTO claims(id,project,scope,holder,created_at,expires_at,worktree,claim_source,native_claim_id,native_session_id) VALUES(?,?,?,?,?,?,?,'native','fixture-native',?)";
       h.sql.exec(insert, owned, 'agent-hub', 'native/owned', holder, now, now + 60000, '/repo', session);
+      h.sql.exec(insert, ownedScope, 'agent-hub', 'native/owned-scope', holder, now, now + 60000, '/repo', session);
       h.sql.exec(insert, otherIncarnation, 'agent-hub', 'native/other-incarnation',
         formatNativeActor('worker-host', tag, uuid()), now, now + 60000, '/repo', session);
     });
 
     expect((await api('/api/bus/claims/' + otherIncarnation + '/release', {})).status).toBe(403);
+    expect((await api('/api/bus/claims/' + encodeURIComponent('agent-hub:native/other-incarnation') + '/release', {})).status).toBe(403);
     expect((await api('/api/bus/claims/' + owned + '/release', {})).status).toBe(200);
+    expect((await api('/api/bus/claims/' + encodeURIComponent('agent-hub:native/owned-scope') + '/release', {})).status).toBe(200);
     await runInDurableObject<Hub, any>(stub, (h: any) => {
       expect(h.sql.exec('SELECT released_at FROM claims WHERE id=?', owned).one().released_at).not.toBeNull();
+      expect(h.sql.exec('SELECT released_at FROM claims WHERE id=?', ownedScope).one().released_at).not.toBeNull();
       expect(h.sql.exec('SELECT released_at FROM claims WHERE id=?', otherIncarnation).one().released_at).toBeNull();
     });
   });
