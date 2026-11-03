@@ -2036,8 +2036,8 @@ export class FleetService {
       // Give the retained waitlist a bounded turn before a new reservation;
       // within each circular slice, older rows are considered first.
       try { this.drainCapacityQueue(); } catch { /* best-effort */ }
-      // Intake 9647e6d5: real (non-preview) auto-starts draw by final decision
-      // score; previews, recommend and rebalance stay deterministic.
+      // Intake 9647e6d5: real (non-preview) auto-starts draw by remaining
+      // quota headroom; previews, recommend and rebalance stay deterministic.
       const plan = this.plan(input, undefined, preview ? undefined : Math.random);
       if ('error' in plan) return result(plan, plan.error === 'model_disabled_by_policy' ? 409 : 400);
       const parsed = this.admission.parseDeclaration(input?.access);
