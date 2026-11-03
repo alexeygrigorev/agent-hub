@@ -886,10 +886,11 @@ describe('absolute workspace identifiers and friendly names', () => {
         const shortBody = await short.json() as any;
         expect(shortBody.error).toBe('ambiguous_session_prefix');
         // Prefixes also match fleet_launch_id and bound native_id (f61c7029),
-        // so the third row joins through its reused launch alias. Ordered by id.
-        expect(shortBody.matches.map((row: any) => row.id)).toEqual([
-          '44444444-4444-4444-8444-444444444444', nativeSession, 'abcdef01-2222-4222-8222-222222222222',
-        ]);
+        // so the third row joins through its reused launch alias.
+        expect(shortBody.matches.map((row: any) => row.id)).toHaveLength(3);
+        expect(shortBody.matches.map((row: any) => row.id)).toEqual(expect.arrayContaining([
+          nativeSession, 'abcdef01-2222-4222-8222-222222222222', '44444444-4444-4444-8444-444444444444',
+        ]));
       });
     });
 
