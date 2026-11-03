@@ -109,7 +109,8 @@ unknown-status command is retried after five minutes. This also covers
 worktrees registered before this behavior was deployed; no manual refresh is
 needed just to populate `status_at`. The host agent polls each cycle:
 
-- `GET /api/worktree-host/commands` returns `{commands: [{id, kind, worktree_id, task_id, path, branch}]}`
+- `GET /api/worktree-host/commands` returns `{commands: [{id, kind, worktree_id, task_id, path, branch, unlock_hub_lock?}]}`
+  (`unlock_hub_lock` is present on `remove` only; see below).
   (queued commands are claimed; claims older than 15 minutes are re-offered).
 - `POST /api/worktree-host/commands/<id>/result {outcome, reason?, status?, removed?, branch_deleted?}`
   with `outcome` in `ok|refused|error`.
@@ -124,7 +125,14 @@ not on any remote ref (`git rev-list HEAD --not --remotes`).
 Remove refuses (and records why) when: the path fails the guard, the worktree
 is dirty, has unmerged or unpushed-and-unmerged commits, a process has its cwd
 inside it, or a live/held Hub session is bound to it (checked on Hub before
-queuing). It runs `git worktree remove <path>` (never `--force`, never rm),
+queuing). A Git-locked worktree is refused with `worktree locked` unless the
+remove command carries `unlock_hub_lock: true` (intake 36c4cf38): Hub sets it
+only when the intake has qualifying DONE evidence and zero live sessions, and
+the host then releases a canonical Hub lock for that same task after the
+clean/merged/branch/live-process checks pass — strictly before `git worktree
+remove`, re-locking with the original reason if the remove fails. Manual and
+foreign-intake locks are never released this way. It runs
+`git worktree remove <path>` (never `--force`, never rm),
 `git worktree prune`, and `git branch -d <branch>` only when merged (never `-D`).
 
 Path guard: the realpath must equal the path, sit directly under `$HOME/git/`,

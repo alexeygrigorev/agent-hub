@@ -26,7 +26,8 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from .native_sessions import SessionControlError
-from .session_cleanup import BRANCH, _git_common_dir, _parse_worktree_list
+from .session_cleanup import BRANCH, _git_common_dir
+from .worktree_guard import _parse_worktree_list, parse_lock_reason
 
 GIT_TIMEOUT = 30.0
 FETCH_TIMEOUT = 60.0
@@ -281,8 +282,16 @@ def _result(outcome: str, reason: Optional[str], status: Optional[dict], removed
 
 def remove_worktree(path: str, branch: Optional[str] = None, *, live_check: Optional[Callable] = None,
                     git_bin: str = "git", runner: Optional[Callable] = None,
-                    home: Optional[str] = None, fetch: bool = True) -> dict[str, Any]:
-    """Guarded removal: {outcome: ok|refused|error, reason, removed, branch_deleted, status}."""
+                    home: Optional[str] = None, fetch: bool = True,
+                    task_id: Optional[str] = None, unlock_hub_lock: bool = False) -> dict[str, Any]:
+    """Guarded removal: {outcome: ok|refused|error, reason, removed, branch_deleted, status}.
+
+    Intake 36c4cf38 AC5: with unlock_hub_lock=True (Hub attests qualifying
+    DONE evidence plus zero live sessions) a canonical Hub lock for this
+    task is released after the clean/merged/branch/live-process checks pass,
+    strictly before `git worktree remove`; manual and foreign-intake locks
+    are never touched, and a failed remove re-locks with the original reason.
+    """
     runner = runner or default_runner
     try:
         path = path_guard(path, home)
@@ -295,7 +304,14 @@ def remove_worktree(path: str, branch: Optional[str] = None, *, live_check: Opti
         return _result("refused", reason, status)
     if entry.get("bare"):
         return _result("refused", "bare repository", status)
-    if entry.get("locked"):
+    parsed_lock = parse_lock_reason(entry.get("reason")) if entry.get("locked") else None
+    can_unlock_hub = bool(
+        unlock_hub_lock
+        and parsed_lock is not None
+        and parsed_lock[1] is not None
+        and parsed_lock[1] == task_id
+    )
+    if entry.get("locked") and not can_unlock_hub:
         return _result("refused", "worktree locked", status)
     if entry.get("detached") or not status["branch"]:
         return _result("refused", "detached HEAD", status)
@@ -325,8 +341,14 @@ def remove_worktree(path: str, branch: Optional[str] = None, *, live_check: Opti
     main = os.path.dirname(common) if os.path.basename(common) == ".git" else common
     if main == path or main.startswith(path + "/") or not os.path.isdir(main):
         return _result("error", "main repository unknown", status)
+    if entry.get("locked") and can_unlock_hub:
+        _, unlock_err = _git(runner, git_bin, ["worktree", "unlock", path], main)
+        if unlock_err:
+            return _result("error", unlock_err, status)
     _, err = _git(runner, git_bin, ["worktree", "remove", path], main)
     if err:
+        if entry.get("locked") and can_unlock_hub and entry.get("reason"):
+            _git(runner, git_bin, ["worktree", "lock", "--reason", str(entry["reason"]), path], main)
         return _result("error", err, status)
     removed = not os.path.lexists(path)
     _, prune_err = _git(runner, git_bin, ["worktree", "prune"], main)
@@ -562,8 +584,12 @@ def _run_command(cmd: dict, *, git_bin: str, runner: Optional[Callable], home: O
         return {"outcome": "ok", "reason": status.get("error"), "status": status,
                 "removed": False, "branch_deleted": False}
     if kind == "remove":
-        return remove_worktree(path, branch, live_check=live_check, git_bin=git_bin,
-                               runner=runner, home=home)
+        return remove_worktree(
+            path, branch, live_check=live_check, git_bin=git_bin,
+            runner=runner, home=home,
+            task_id=cmd.get("task_id") if isinstance(cmd.get("task_id"), str) else None,
+            unlock_hub_lock=cmd.get("unlock_hub_lock") is True,
+        )
     return {"outcome": "error", "reason": f"unsupported command kind {kind!r}", "status": None,
             "removed": False, "branch_deleted": False}
 
