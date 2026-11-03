@@ -11,6 +11,8 @@ mkdir -p "$HOME/tmp/briefs" && install -m644 "$here/orchestrator/brief.md" "$HOM
 # Agent rm guard (incident 504d662b): refuse recursive rm of $HOME and critical dirs.
 mkdir -p "$dest/guard-bin" "$HOME/.config/environment.d"
 install -m755 "$here/guard-bin/rm" "$dest/guard-bin/rm"
+install -m755 "$here/guard-bin/check-local-bin" "$dest/guard-bin/check-local-bin"
+install -m755 "$here/guard-bin/principal-alert.sh" "$dest/guard-bin/principal-alert.sh"
 install -m644 "$here/guard-bin/env.sh" "$dest/guard-bin/env.sh"
 printf 'PATH=%s:${PATH}\nBASH_ENV=%s\n' "$dest/guard-bin" "$dest/guard-bin/env.sh" > "$HOME/.config/environment.d/50-agent-rm-guard.conf"
 hook='[ -f "$HOME/.local/share/agent-hub-ops/guard-bin/env.sh" ] && . "$HOME/.local/share/agent-hub-ops/guard-bin/env.sh"  # agent rm guard (504d662b)'

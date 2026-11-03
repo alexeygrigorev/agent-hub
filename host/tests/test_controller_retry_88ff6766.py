@@ -90,12 +90,13 @@ class WindowsControllerRetryTests(unittest.TestCase):
         result, log = self.run_main(supervisor, native, stop)
         self.assertIsNone(result)
         self.assertEqual([c['id'] for c in children], ['child-0', 'child-1'])
-        names = [e['event'] for e in log]
         self.assertNotIn('controller_cleanup_unconfirmed', [e['event'] for e in log if e.get('id') == 'child-0'])
         failed = next(e for e in log if e['event'] == 'controller_failed')
         self.assertEqual((failed['id'], failed['type']), ('child-0', 'RuntimeError'))
         self.assertIn('exited', failed['detail'])
-        self.assertIn('controller_child_output', names)
+        child_exit = next(e for e in log if e['event'] == 'controller_child_exit')
+        self.assertEqual(child_exit['phase'], 'exited')
+        self.assertIn('Traceback', child_exit['history_tail'])
         retry = next(e for e in log if e['event'] == 'controller_retry')
         self.assertEqual(retry['retry_in_s'], supervisor.RETRY_DELAYS_S[0])
         self.assertFalse([c for c in calls if c[0] == 'kill' and c[1] == 'child-0'],
@@ -125,6 +126,8 @@ class WindowsControllerRetryTests(unittest.TestCase):
         names = [e['event'] for e in log]
         cleanup = next(e for e in log if e['event'] == 'controller_cleanup_unconfirmed')
         self.assertEqual(cleanup['type'], 'RuntimeError')
+        self.assertIn('Controller status unavailable', cleanup['detail'])
+        self.assertIn('Native controller operation failed', cleanup['detail'])
         self.assertTrue((self.control / 'needs-attention.json').exists())
         retries = [e for e in log if e['event'] == 'controller_retry']
         self.assertEqual([r['type'] for r in retries], ['RuntimeError', 'NeedsAttention'])
