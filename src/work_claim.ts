@@ -14,6 +14,8 @@
  * redacted native state here via `POST /api/bus/native-sync`.
  */
 
+import { isRecord } from './is-record';
+
 export const WORK_CLAIM_SCHEMA = 'hub.work-claim.v1' as const;
 
 export const WORK_CLAIM_EVENTS = [
@@ -61,10 +63,6 @@ export function parseNativeActor(actor: unknown): { machineId: string; tag: stri
   const m = NATIVE_ACTOR_RE.exec(actor);
   if (!m) return null;
   return { machineId: m[1], tag: m[2], sessionShort: m[3] ?? null };
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 function isInt(value: unknown): value is number {
