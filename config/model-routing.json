@@ -19,7 +19,8 @@
       "provider": "codex",
       "aplexer_profile": "hub-codex-orin",
       "credential": {"mode": "managed-bundle", "bundle": "codex-orin"},
-      "quota_probe": ["quse", "codex-orin", "--json"]
+      "quota_probe": ["quse", "codex-orin", "--json"],
+      "plan_end": "2026-11-13"
     },
     {
       "account": "shared-claude",
@@ -523,6 +524,8 @@
     ],
     "reset_urgency_factor": 2.5,
     "headroom_floor": 0.05,
+    "plan_end_urgency_factor": 2.5,
+    "plan_end_reset_horizon_days": 14,
     "reserve_percent": {
       "codex": 0,
       "grok": 5

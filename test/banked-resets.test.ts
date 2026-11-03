@@ -65,7 +65,7 @@ describe('scheduled reset alerts and operator fallback', () => {
       expect(first.map(a => a.subject).sort()).toEqual(['codex-orin','shared-codex','shared-zai']);
       expect(first.find(a => a.subject === 'codex-orin').detail).toContain('codex-orin (codex)');
       const listing = await (await service().handle(new Request('https://hub/api/quota/resets'), operator)).json() as any;
-      expect(listing.accounts).toContainEqual({label:'codex-orin',provider:'codex'});
+      expect(listing.accounts).toContainEqual({label:'codex-orin',provider:'codex',plan_end:'2026-11-13',expired:false});
       expect(first.find(a => a.subject === 'shared-zai').detail).toContain('record');
       expect(service().run()).toHaveLength(0);
     });
@@ -194,6 +194,20 @@ describe('scheduled reset alerts and operator fallback', () => {
       expect(alerts).toHaveLength(1);
       expect(alerts[0].detail).toContain('URGENT');
       expect(service.run()).toHaveLength(0);
+    });
+  });
+  it('marks codex-orin expired after its inclusive plan date and retires unused grants cleanly', async () => {
+    await inDO(stub(), async (h: any) => {
+      setup(h);
+      const afterPlanEnd = Date.parse('2026-11-14T00:00:00.000Z');
+      const service = new BankedResets(h.sql, h.livenessService, () => afterPlanEnd);
+      h.sql.exec("INSERT INTO banked_reset_grants VALUES ('orin-unused','codex-orin','codex','Full reset',?,?,1,?,NULL)",
+        afterPlanEnd + 7 * 86400000, 'quota', afterPlanEnd - HOUR);
+      const listing = await (await service.handle(new Request('https://hub/api/quota/resets'), operator)).json() as any;
+      expect(listing.accounts.find((a: any) => a.label === 'codex-orin')).toMatchObject({ plan_end:'2026-11-13', expired:true });
+      expect(listing.grants).not.toContainEqual(expect.objectContaining({ id:'orin-unused' }));
+      expect(h.sql.exec("SELECT active FROM banked_reset_grants WHERE id='orin-unused'").one().active).toBe(0);
+      expect((await service.handle(post({ account:'codex-orin', grants:[] }), operator)).status).toBe(409);
     });
   });
 });

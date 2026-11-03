@@ -1,6 +1,8 @@
 /** Intake 77f492ed: expiry notifications only. No provider mutations or credentials. */
 import type { SqlStorage } from '@cloudflare/workers-types';
 import type { LivenessService } from './liveness';
+import { accountPlanEndDate, accountPlanEndMs, accountPlanExpired } from './model-routing';
+import { resetUsageSummary } from './reset-credit-evidence';
 
 const HOUR = 3_600_000;
 const LABEL = /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,79}$/;
@@ -50,7 +52,14 @@ export class BankedResets {
   }
 
   private accounts(): any[] {
-    return this.sql.exec("SELECT label,CASE WHEN provider='codex-orin' THEN 'codex' ELSE provider END AS provider FROM fleet_accounts WHERE provider IN ('codex','codex-orin','zai') ORDER BY label").toArray();
+    return (this.sql.exec("SELECT label,CASE WHEN provider='codex-orin' THEN 'codex' ELSE provider END AS provider FROM fleet_accounts WHERE provider IN ('codex','codex-orin','zai') ORDER BY label").toArray() as any[])
+      .map(a => ({ ...a, plan_end: accountPlanEndDate(String(a.label)), expired: accountPlanExpired(String(a.label), this.now()) }));
+  }
+
+  private retireExpiredPlans(now: number) {
+    for (const account of this.sql.exec("SELECT label FROM fleet_accounts WHERE provider IN ('codex','codex-orin','zai')").toArray() as any[]) {
+      if (accountPlanExpired(String(account.label), now)) this.sql.exec('UPDATE banked_reset_grants SET active=0 WHERE account=? AND active=1', account.label);
+    }
   }
 
   /** Use newest successful per-account evidence, across server and registered host producers. */
@@ -109,6 +118,7 @@ export class BankedResets {
   run(): any[] {
     this.sync();
     const now = this.now();
+    this.retireExpiredPlans(now);
     const alerts: any[] = [];
     for (const a of this.accounts()) {
       if (!this.sql.exec('SELECT account FROM banked_reset_accounts WHERE account=?', a.label).toArray().length) {
@@ -119,14 +129,18 @@ export class BankedResets {
     }
     const active = this.sql.exec('SELECT * FROM banked_reset_grants WHERE active=1 AND expires_at>? ORDER BY expires_at,id', now).toArray() as any[];
     for (const g of active) {
-      const threshold = expiryThreshold(g.expires_at, now);
+      const planEnd = accountPlanEndMs(String(g.account));
+      const deadline = planEnd === null ? g.expires_at : Math.min(g.expires_at, planEnd);
+      const planEndsFirst = planEnd !== null && planEnd < g.expires_at;
+      const threshold = expiryThreshold(deadline, now);
       if (!threshold || this.sql.exec('SELECT grant_id FROM banked_reset_notices WHERE grant_id=? AND threshold=?', g.id, threshold).toArray().length) continue;
       const subject = `${g.id}:${threshold}`;
       const action = g.provider === 'codex'
-        ? 'Alexey, please approve whether to use this reset before the deadline. Only you may apply it manually on the correct Codex account using /usage > Redeem reset. Hub and agents must not redeem it. If you choose to use it, verify /status weekly 100% and credits unchanged; never choose paid/credit options or apply two resets back to back.'
+        ? `Alexey, please approve whether to use this reset before the deadline. Only you may apply it manually on the correct Codex account using /usage > Redeem reset${planEndsFirst ? ' as soon as the quota window is spent (Codex reserve is 0%)' : ''}. Hub and agents must not redeem it. If you choose to use it, verify /status weekly 100% and credits unchanged; never choose paid/credit options or apply two resets back to back.`
         : 'Alexey, please approve whether to use this reset before the deadline. Only you may apply it manually at https://z.ai/manage-apikey/coding-plan/personal/usage (email/password; complete the Aliyun slider/captcha yourself). Hub and agents must not redeem it. Do not apply two back to back; update the recorded grant if you use it.';
-      const detail = `${g.account} (${g.provider}), ${g.label}: expires ${berlinDeadline(g.expires_at)}. ` +
-        `${threshold === 'urgent' ? 'URGENT: less than 24 hours remain.' : (g.expires_at - now >= 36 * HOUR ? 'Early warning: at least 36 hours remain.' : 'Late discovery: less than 36 hours remain.')} Needed: ${action}`;
+      const deadlineLabel = planEndsFirst ? `plan ends ${berlinDeadline(deadline)}` : `expires ${berlinDeadline(deadline)}`;
+      const detail = `${g.account} (${g.provider}), ${g.label}: ${deadlineLabel}. ` +
+        `${threshold === 'urgent' ? 'URGENT: less than 24 hours remain.' : (deadline - now >= 36 * HOUR ? 'Early warning: at least 36 hours remain.' : 'Late discovery: less than 36 hours remain.')}${planEnd !== null ? ` Unused resets are lost when the account plan ends ${berlinDeadline(planEnd)}.` : ''} Needed: ${action}`;
       const alert = this.liveness.setAlert('banked_reset_expiry', subject, { state: 'attention', detail });
       this.sql.exec('INSERT INTO banked_reset_notices VALUES (?,?,?,?)', g.id, threshold, subject, now);
       if (alert) alerts.push(alert);
@@ -143,7 +157,9 @@ export class BankedResets {
     if (!caller.isAdmin) return reply({ error: 'forbidden' }, 403);
     if (request.method === 'GET') {
       this.sync();
-      return reply({ accounts: this.accounts(), grants: this.sql.exec('SELECT * FROM banked_reset_grants WHERE active=1 ORDER BY expires_at').toArray(),
+      const now = this.now();
+      this.retireExpiredPlans(now);
+      return reply({ accounts: this.accounts(), reset_usage: resetUsageSummary(this.sql, now), grants: this.sql.exec('SELECT * FROM banked_reset_grants WHERE active=1 ORDER BY expires_at').toArray(),
         observations: this.sql.exec('SELECT * FROM banked_reset_accounts').toArray(),
         notices: this.sql.exec('SELECT * FROM banked_reset_notices ORDER BY created_at DESC LIMIT 100').toArray() });
     }
@@ -155,6 +171,7 @@ export class BankedResets {
     try { d = JSON.parse(raw); } catch { return reply({ error: 'invalid_json' }, 400); }
     if (!d || typeof d !== 'object' || Array.isArray(d) || Object.keys(d).some(k => !['account', 'grants'].includes(k))) return reply({ error: 'invalid_payload' }, 400);
     const account = this.accounts().find(a => a.label === d.account);
+    if (account?.expired) return reply({ error: 'account_expired' }, 409);
     if (!account || !Array.isArray(d.grants) || d.grants.length > 32 ||
         d.grants.some((g: any) => !g || typeof g.label !== 'string' || !LABEL.test(g.label) || typeof g.expires_at !== 'string' ||
           !/(Z|[+-]\d{2}:\d{2})$/.test(g.expires_at) || !Number.isFinite(Date.parse(g.expires_at)) || Date.parse(g.expires_at) <= this.now())) return reply({ error: 'invalid_grants' }, 400);
