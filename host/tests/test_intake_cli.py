@@ -50,3 +50,35 @@ class TestArchiveCli(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     cli.main()
                 request.assert_not_called()
+
+
+class TestQueuePriorityCli(unittest.TestCase):
+    def test_promote_posts_cas_payload(self):
+        output = io.StringIO()
+        with patch('sys.argv', ['hub', 'intake', 'promote', 'fixture-task', '--version', '3', '--key', 'promo-key']), patch('sys.stdout', output), patch.object(intake, 'request', return_value={'task': {'id': 'fixture-task'}}) as request:
+            cli.main()
+        request.assert_called_once_with('POST', '/api/intake/tasks/fixture-task/promote', {'key': 'promo-key', 'expected_version': 3})
+        self.assertEqual(json.loads(output.getvalue())['task']['id'], 'fixture-task')
+
+    def test_promote_fetches_version_and_generates_key_when_omitted(self):
+        output = io.StringIO()
+        with patch('sys.argv', ['hub', 'intake', 'promote', 'fixture-task']), patch('sys.stdout', output), patch.object(intake, 'request', side_effect=[{'task': {'control': {'version': 7}}}, {'task': {'id': 'fixture-task'}}]) as request:
+            cli.main()
+        self.assertEqual(request.call_args_list[0].args, ('GET', '/api/intake/tasks/fixture-task'))
+        post = request.call_args_list[1].args
+        self.assertEqual((post[0], post[1]), ('POST', '/api/intake/tasks/fixture-task/promote'))
+        self.assertEqual(post[2]['expected_version'], 7)
+        self.assertTrue(post[2]['key'].startswith('promote-'))
+
+    def test_create_and_update_carry_priority(self):
+        output = io.StringIO()
+        with patch('sys.argv', ['hub', 'intake', 'create', '--project', 'demo', '--title', 'T', '--text', 'x', '--priority', 'high', '--key', 'k']), patch('sys.stdout', output), patch.object(intake, 'request', return_value={}) as request:
+            cli.main()
+        method, path, body = request.call_args.args
+        self.assertEqual((method, path), ('POST', '/api/intake/tasks'))
+        self.assertEqual(body['priority'], 'high')
+        with patch('sys.argv', ['hub', 'intake', 'update', 'fixture-task', '--version', '2', '--key', 'k2', '--priority', 'low']), patch('sys.stdout', output), patch.object(intake, 'request', return_value={}) as request:
+            cli.main()
+        method, path, body = request.call_args.args
+        self.assertEqual((method, path), ('POST', '/api/intake/tasks/fixture-task'))
+        self.assertEqual(body['priority'], 'low')

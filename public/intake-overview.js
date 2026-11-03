@@ -59,7 +59,8 @@
       for (const item of data.items) {
         const row = document.createElement('details');
         const title = document.createElement('summary');
-        title.textContent = `${item.stuck ? '⚠ Stuck · ' : ''}${item.queue_position ? '#' + item.queue_position + ' · ' : ''}${item.state} · ${item.title}`;
+        const flags = [item.promoted_at ? 'promoted' : '', item.priority && item.priority !== 'normal' ? item.priority : ''].filter(Boolean).join(' · ');
+        title.textContent = `${item.stuck ? '⚠ Stuck · ' : ''}${item.queue_position ? '#' + item.queue_position + ' · ' : ''}${flags ? flags + ' · ' : ''}${item.state} · ${item.title}`;
         row.append(title);
         const info = document.createElement('p');
         info.textContent = `${item.reason} · last movement ${new Date(item.last_movement_at).toLocaleString()} · attempts ${item.attempts}/${item.retry_limit}`;
@@ -67,6 +68,26 @@
         const link = document.createElement('a');
         link.href = '/intake/' + encodeURIComponent(item.id);
         link.textContent = 'Open intake'; row.append(link);
+        if (item.state === 'queued') {
+          const promote = document.createElement('button');
+          promote.textContent = 'Promote to front';
+          promote.onclick = async () => {
+            promote.disabled = true;
+            try {
+              const shown = await fetch('/api/intake/tasks/' + encodeURIComponent(item.id), {credentials: 'same-origin', cache: 'no-store'});
+              if (!shown.ok) throw new Error('unavailable');
+              const version = (await shown.json())?.task?.control?.version;
+              const response = await fetch('/api/intake/tasks/' + encodeURIComponent(item.id) + '/promote', {
+                method: 'POST', credentials: 'same-origin', cache: 'no-store',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({key: 'portal-promote-' + crypto.randomUUID(), expected_version: version}),
+              });
+              if (!response.ok) throw new Error('unavailable');
+              await updateQueue('');
+            } catch { promote.disabled = false; promote.textContent = 'Promote failed — retry'; }
+          };
+          row.append(promote);
+        }
         if (item.completion_evidence) {
           const evidence = document.createElement('p');
           evidence.textContent = 'DONE note includes live evidence; independent verification remains required.';

@@ -54,6 +54,21 @@ export function queuePolicyFrom(env: Record<string, unknown> = {}, capacity = 0)
   return { enabled: valid && String(enabled) === 'true', valid, max_inflight: valid ? global : 2,
     max_per_project: valid ? project : 1, projects: valid && all ? null : valid && scoped ? projects : [] };
 }
+/** Intake priority (intake 68145244): high runs before normal before low; a
+ * missing or unknown value reads as normal so legacy rows keep their place. */
+export const INTAKE_PRIORITY_RANK: Record<string, number> = { high: 0, normal: 1, low: 2 };
+const promotedAt = (t: Obj): number => typeof t?.promoted_at === 'number' && t.promoted_at > 0 ? t.promoted_at : 0;
+/** Queue candidate order (intake 68145244 AC3): promoted intakes first — newest
+ * promotion first, ahead of every priority — then priority high > normal > low,
+ * and within one priority the newest intake first. id is the stable tiebreak. */
+export function queueCandidateOrder(a: Obj, b: Obj): number {
+  const pa = promotedAt(a), pb = promotedAt(b);
+  if ((pa > 0) !== (pb > 0)) return pa > 0 ? -1 : 1;
+  if (pa > 0 && pa !== pb) return pb - pa;
+  const ra = INTAKE_PRIORITY_RANK[a?.priority] ?? 1, rb = INTAKE_PRIORITY_RANK[b?.priority] ?? 1;
+  if (ra !== rb) return ra - rb;
+  return ms(b.created_at) - ms(a.created_at) || a.id.localeCompare(b.id);
+}
 const bindingNative = "json_extract(CASE WHEN json_valid(binding_json) THEN binding_json ELSE '{}' END,'$.native_id')";
 const DAY = 86400000;
 /** Admission holds an automatic restart may clear by moving to another
@@ -276,14 +291,15 @@ export class IntakeWatchdog {
       const byId = new Map(tasks.map(t => [t.id, t]));
       for (const item of this.project(tasks, now, context)) {
         const t = byId.get(item.id)!, q = this.queueRow(item.id);
-        if (!(item.ready && t.acceptance_criteria?.trim() && q?.state !== 'escalated' && (!q || q.next_at <= now || q.reason === 'watchdog_project_not_enabled'))) continue;
+        if (!(item.ready && t.acceptance_criteria?.trim() && q?.state !== 'escalated' &&
+          (!q || q.next_at <= now || q.reason === 'watchdog_project_not_enabled' || promotedAt(t)))) continue;
         const skip = this.idleKickSkip(t, policy);
         if (skip) skipped.push({ t, skip }); else candidates.push(t);
       }
       if (tasks.length < QUEUE_BATCH_SIZE) break;
     }
     const age = (a: Obj, b: Obj) => ms(a.created_at) - ms(b.created_at) || a.id.localeCompare(b.id);
-    candidates.sort(age);
+    candidates.sort(queueCandidateOrder);
     // Nothing kickable: name the oldest skipped backlog's gate (e.g. idle_kick_untriaged).
     let last: { task_id: string | null; reason: string } = { task_id: null,
       reason: skipped.sort((a, b) => age(a.t, b.t))[0]?.skip ?? 'no_ready_intake' };
@@ -662,7 +678,9 @@ export class IntakeWatchdog {
     const context=this.snapshot([fresh],now);
     if(!this.project([fresh],now,context)[0]?.ready)return;
     const existing = this.rows('SELECT * FROM intake_restart_queue WHERE task_id=?', t.id)[0];
-    if (existing?.state === 'escalated' || (existing && existing.next_at > now)) return;
+    // A promotion means "next picked": it overrides a retry backoff while the
+    // escalated (needs-attention) state and the attempts cap still bind.
+    if (existing?.state === 'escalated' || (existing && existing.next_at > now && !promotedAt(fresh))) return;
     if ((existing?.attempts ?? 0) >= QUEUE_RETRY_LIMIT) return this.escalate(fresh, 'restart_retry_limit', now);
     const completionHold = intakeCompletionHoldReason(fresh);
     if (completionHold) return this.hold(fresh, completionHold, now);
@@ -795,14 +813,21 @@ export class IntakeWatchdog {
       const history = this.rows('SELECT state,reason,at FROM intake_queue_movement WHERE task_id=? ORDER BY seq DESC LIMIT ?', p.id, includeHistory ? 32 : 1).reverse();
       const last = history[history.length - 1];
       const at = last?.at ?? ms(t.created_at);
-      return { id: p.id, title: p.title, project: p.project, state, reason, session: s, attempts: q?.attempts ?? 0,
+      return { id: p.id, title: p.title, project: p.project, priority: byId.get(p.id)?.priority ?? 'normal',
+        promoted_at: promotedAt(byId.get(p.id)!) || null,
+        state, reason, session: s, attempts: q?.attempts ?? 0,
         retry_limit: QUEUE_RETRY_LIMIT, next_at: q?.next_at ?? now, last_movement_at: at,
         stuck: !done && now - at >= QUEUE_STALL_MS, history, queue_position: null as number | null,
         completion_evidence: done ? 'reported_live_proof_not_independently_verified' : null };
     }).sort((a,b) => Number(a.next_at > now) - Number(b.next_at > now) ||
       (queueRows.get(a.id)?.updated_at ?? 0) - (queueRows.get(b.id)?.updated_at ?? 0) || a.id.localeCompare(b.id));
     let position = 0;
-    for (const item of items) if (item.state === 'queued' && !this.automationHold(byId.get(item.id)!, policy)) item.queue_position = ++position;
+    // Visible positions: due items lead, then the candidate order
+    // (promoted > priority > newest) so the queue reads as it will run.
+    const dueFirst = (item: Obj) => Number((queueRows.get(item.id)?.next_at ?? now) > now);
+    for (const item of [...items].sort((a,b) => dueFirst(a) - dueFirst(b) ||
+      queueCandidateOrder(byId.get(a.id)!, byId.get(b.id)!)))
+      if (item.state === 'queued' && !this.automationHold(byId.get(item.id)!, policy)) item.queue_position = ++position;
     return items;
   }
   private async escalate(t: Obj, reason: string, now: number) {
@@ -1073,12 +1098,12 @@ export class IntakeWatchdog {
       const task=tasks.find(t=>t.id===i.id);
       // Recovering episodes are candidates too: the canonical stop or hold
       // cancellation above may have settled this tick, and restart re-checks
-      // readiness against a fresh snapshot before admitting anything.
-      return task && !this.automationHold(task) && (i.ready||i.state==='recovering') && q?.state!=='escalated' && (!q || q.next_at<=now);
-    }).sort((a,b)=>{
-      const aq=dispatchRows.get(a.id),bq=dispatchRows.get(b.id);
-      return Number(!aq)-Number(!bq) || (aq?.next_at??0)-(bq?.next_at??0) || a.id.localeCompare(b.id);
-    });
+      // readiness against a fresh snapshot before admitting anything. A
+      // promoted intake overrides a retry backoff (never an escalation);
+      // candidate order is promoted > priority > newest (queueCandidateOrder).
+      return task && !this.automationHold(task) && (i.ready||i.state==='recovering') && q?.state!=='escalated' &&
+        (!q || q.next_at<=now || promotedAt(task));
+    }).sort((a,b)=>queueCandidateOrder(tasks.find(t=>t.id===a.id)!,tasks.find(t=>t.id===b.id)!));
     for(const item of ordered.slice(0,8))await this.restart(tasks.find(t=>t.id===item.id)!,now);
     const human_hold_alerts=await this.alertHumanHolds(tasks,now);
     let asks:Obj|undefined;
