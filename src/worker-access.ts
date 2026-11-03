@@ -5,6 +5,7 @@
 import type { SqlStorage } from '@cloudflare/workers-types';
 import type { CallerContext } from './bus';
 import { generateTokenPair } from './auth/token';
+import { DRIVER_ACCESS_SCHEMA, driverLaunchRegistered, issueDriverAccess } from './driver-access';
 import { formatNativeActor } from './work_claim';
 
 export const WORKER_SCOPE = 'worker:own-intake';
@@ -295,7 +296,7 @@ export function revokeEndedNativeWorkerCredentials(sql: SqlStorage, now: number)
 
 export class WorkerAccess {
   constructor(private sql: SqlStorage, private tx: <T>(fn: () => T) => T, private hostAllowed: (caller: CallerContext) => boolean) {}
-  init() { this.sql.exec(WORKER_ACCESS_SCHEMA); this.sql.exec(WORKER_CREATED_SCHEMA); this.sql.exec(WORKER_CREATED_INDEX); }
+  init() { this.sql.exec(WORKER_ACCESS_SCHEMA); this.sql.exec(DRIVER_ACCESS_SCHEMA); this.sql.exec(WORKER_CREATED_SCHEMA); this.sql.exec(WORKER_CREATED_INDEX); }
   releaseClaim(caller: CallerContext, target: string): Response {
     return this.tx(() => {
       const worker = workerAccessContext(this.sql, caller.tokenId);
@@ -373,6 +374,10 @@ export class WorkerAccess {
       if (!launch || !['headless','interactive'].includes(launch.mode) || !['starting','running'].includes(launch.state)) return reply({error:'worker_launch_not_starting'},409);
       const session: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE fleet_launch_id=?',id).toArray()[0];
       if (!session) return reply({error:'worker_session_required'},409);
+      if (driverLaunchRegistered(this.sql, id)) {
+        const profile = issueDriverAccess(this.sql, id, caller.machineId!, tokens, new URL(request.url).origin);
+        return profile ? reply(profile) : reply({ error: 'driver_credential_refused' }, 409);
+      }
       // The assigned host may restore a lost profile after launch. Keep the
       // original intake binding; this does not restart or adopt a session.
       // The host verifies native process liveness before requesting repair.

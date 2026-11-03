@@ -885,8 +885,10 @@ describe('absolute workspace identifiers and friendly names', () => {
         expect(short.status).toBe(409);
         const shortBody = await short.json() as any;
         expect(shortBody.error).toBe('ambiguous_session_prefix');
+        // Prefixes also match fleet_launch_id and bound native_id (f61c7029),
+        // so the third row joins through its reused launch alias. Ordered by id.
         expect(shortBody.matches.map((row: any) => row.id)).toEqual([
-          nativeSession, 'abcdef01-2222-4222-8222-222222222222',
+          '44444444-4444-4444-8444-444444444444', nativeSession, 'abcdef01-2222-4222-8222-222222222222',
         ]);
       });
     });
@@ -1699,6 +1701,22 @@ describe('held cancellation current human bearer authority', () => {
         expect(sql.exec('SELECT state FROM session_control_sessions WHERE id=?', held.id).toArray()[0].state).toBe('held');
       }, undefined, {env:bindings});
     }
+  });
+  it('rechecks a human operator bearer before stopping another owner held intent', async () => {
+    const bindings = {...env, HUB_ADMINS: 'admin@fake.local'} as unknown as Env;
+    const reserve = fakeReserve({status:409,error:'no_eligible_route',rejected:[]});
+    await fixture(async (s, sql) => {
+      await seed(sql);
+      const held = await (await s.handle(request('/api/sessions', {key:'operator-start',workspace:'demo',mode:'interactive'}), agent())).json() as any;
+      let controller!: ReadableStreamDefaultController<Uint8Array>;
+      const stream = new ReadableStream<Uint8Array>({start(value) {controller=value;}});
+      const pending = s.handle(new Request('https://hub.test/api/sessions/'+held.id+'/stop', {method:'POST',body:stream}), auth);
+      await Promise.resolve();
+      sql.exec("UPDATE credentials SET revoked_at=? WHERE id='human-cancel-cred'", new Date().toISOString());
+      controller.enqueue(new TextEncoder().encode('{"key":"operator-stop"}'));controller.close();
+      expect((await pending).status).toBe(404);
+      expect(sql.exec('SELECT state FROM session_control_sessions WHERE id=?', held.id).toArray()[0].state).toBe('held');
+    }, reserve.hook, {env:bindings});
   });
 });
 
