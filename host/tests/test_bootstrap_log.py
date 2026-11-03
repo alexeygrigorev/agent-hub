@@ -7,6 +7,7 @@ all (intake 4d33b30d). These tests run the real wrapper in a subprocess.
 import os
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
@@ -52,6 +53,65 @@ def test_wrapper_refuses_any_other_module(tmp_path):
     result = launch(tmp_path / 'boot2.log', '-m', 'agent_hub_host.session_host')
     assert result.returncode == 2
     assert not (tmp_path / 'boot2.log').exists()
+
+
+def test_wrapper_binds_owned_streams_when_inherited_windows_handles_are_invalid(tmp_path, monkeypatch):
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location('bootstrap_log_invalid_stdio', WRAPPER)
+    wrapper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(wrapper)
+    log = tmp_path / 'boot.log'
+    calls = []
+
+    class InvalidStream:
+        def reconfigure(self, **_kwargs):
+            calls.append('reconfigure')
+            raise OSError(9, 'The handle is invalid')
+
+    invalid = InvalidStream()
+    fake_sys = types.SimpleNamespace(stdout=invalid, stderr=invalid,
+                                     __stdout__=invalid, __stderr__=invalid, argv=[])
+    monkeypatch.setattr(wrapper, 'sys', fake_sys)
+
+    class InvalidStandardHandles:
+        def __getattr__(self, name):
+            return getattr(os, name)
+
+        @staticmethod
+        def dup2(_source, _target):
+            raise OSError(9, 'The handle is invalid')
+
+    monkeypatch.setattr(wrapper, 'os', InvalidStandardHandles())
+
+    class NoopThread:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def join(self, timeout=None):
+            pass
+
+    monkeypatch.setattr(wrapper.threading, 'Thread', NoopThread)
+
+    def run_session_host(*_args, **_kwargs):
+        wrapper.sys.stdout.write('stdout survived\n')
+        wrapper.sys.stderr.write('stderr survived\n')
+
+    monkeypatch.setattr(wrapper.runpy, 'run_module', run_session_host)
+    wrapper.main(['--log', str(log), '--', '-m', 'agent_hub_host.session_host'])
+    wrapper.sys.stdout.close()
+    wrapper.sys.stderr.close()
+
+    assert calls == []
+    assert fake_sys.stdout is fake_sys.__stdout__
+    assert fake_sys.stderr is fake_sys.__stderr__
+    captured = log.read_text(encoding='utf-8')
+    assert 'stdout survived' in captured
+    assert 'stderr survived' in captured
+    assert 'session_host_exit_code=0' in captured
 
 
 def test_bootstrap_log_rotation_keeps_the_recent_tail(tmp_path):
