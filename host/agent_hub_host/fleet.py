@@ -2383,6 +2383,23 @@ class Dispatcher:
 
         return reconciled
 
+    def _worktree_owner_terminal(self, intake_id):
+        """Return fresh Hub proof that a same-intake lock owner is terminal.
+
+        Dispatch and later binding use the same admission proof. If dispatch
+        may reuse a stopped predecessor's same-intake lock but binding omits
+        that proof, the native can run while its Hub row remains unbound.
+        """
+        def owner_terminal(owner_id):
+            try:
+                fact = self.request('GET', '/api/fleet/worktree-owner/' + owner_id)
+                return (isinstance(fact, dict) and fact.get('session_id') == owner_id
+                        and fact.get('terminal') is True
+                        and fact.get('intake_id') == intake_id)
+            except Exception:
+                return False
+        return owner_terminal
+
     def _lock_session_worktree(self, offer, target_path) -> bool:
         """Protect a linked checkout before native launch; failures refuse start."""
         from . import worktree_guard as guard
@@ -2395,18 +2412,11 @@ class Dispatcher:
                 raise ValueError("worktree_lock_failed: missing canonical session identity") from None
             if not guard.remember_repository(offer.get("id"), str(target_path)):
                 raise ValueError("worktree_identity_failed: original repository could not be recorded")
-        def owner_terminal(owner_id):
-            try:
-                fact = self.request('GET', '/api/fleet/worktree-owner/' + owner_id)
-                return (isinstance(fact, dict) and fact.get('session_id') == owner_id
-                        and fact.get('terminal') is True
-                        and fact.get('intake_id') == offer.get('intake_task_id'))
-            except Exception:
-                return False
         if not guard.protect_bound_worktree("git", str(target_path),
                                            offer.get("hub_session_id"),
                                            offer.get("intake_task_id"),
-                                           owner_terminal=owner_terminal):
+                                           owner_terminal=self._worktree_owner_terminal(
+                                               offer.get("intake_task_id"))):
             if not guard.reuse_stopped_intake_lock("git", str(target_path), offer.get("hub_session_id"),
                                                   offer.get("intake_task_id"), self.request):
                 if not guard.protect_successor_worktree(
@@ -4306,20 +4316,30 @@ class Dispatcher:
         pending_done = time.monotonic()
         rows = raw_rows
         skipped = []
+        outcomes: dict[str, int] = {}
+
+        def outcome(name):
+            outcomes[name] = outcomes.get(name, 0) + 1
+
         for session in pending:
             if not isinstance(session, dict):
                 continue
             row = find_binding_row(rows, session)
             if row is None:
+                outcome('native_not_observed')
                 continue
             from .worktree_guard import protect_adoption
-            if not protect_adoption(row, session, request=self.request):
-                # Intake 1c8d915e: a held worktree lock kept a running native
-                # unbound (row stuck offered) with no trace. Report it.
-                skipped.append({'session': str(session.get('id', ''))[:8], 'reason': 'worktree_lock_held'})
+            if not protect_adoption(
+                    row, session, request=self.request,
+                    owner_terminal=self._worktree_owner_terminal(
+                        session.get("intake_task_id"))):
+                outcome('worktree_lock_refused')
+                skipped.append({'session': str(session.get('id', ''))[:8],
+                                'reason': 'worktree_lock_refused'})
                 continue
             try:
                 self.request("POST", "/api/sessions/" + session["id"] + "/binding", {"native": {"native_id": row["id"], "tag": row["tag"], "workspace": row["workspace"], "native_created_at_ms": row["created_at_ms"]}})
+                outcome('bound')
             except ValueError as exc:
                 # A refused binding (e.g. server fleet_tag_mismatch for a
                 # launcher-backend tag before the server seam lands) must not
@@ -4327,12 +4347,13 @@ class Dispatcher:
                 code, status = getattr(exc, 'hub_error', None), getattr(exc, 'http_status', None)
                 reason = (code if isinstance(code, str) and re.fullmatch(r'[a-z][a-z0-9_]{0,63}', code)
                           else 'binding_http_%d' % status if type(status) is int else 'binding_refused')
+                outcome('binding_refused')
                 skipped.append({'session': str(session.get('id', ''))[:8], 'reason': reason})
                 continue
         if skipped:
             print(json.dumps({'event': 'bindings_skipped', 'skipped': skipped[:20]}), flush=True)
         print(json.dumps({'event': 'bindings_report_phases', 'sessions': len(metadata),
-                          'pending': len(pending), 'phases_s': {
+                          'pending': len(pending), 'outcomes': outcomes, 'phases_s': {
                               'census': round(census_done - started, 3),
                               'metadata': round(metadata_done - census_done, 3),
                               'sessions_put': round(put_done - metadata_done, 3),
