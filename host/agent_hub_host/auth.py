@@ -167,20 +167,23 @@ def _active_profile():
 
 
 @contextlib.contextmanager
-def human_refresh_guard():
+def human_refresh_guard(*, force_human=False):
     """Serialize processes rotating one human refresh token (any config path).
 
     Unlike refresh_guard() this also covers HUB_CONFIG_FILE, which the loops
-    and every service unit use. Lock contention waits (30 s); other lock
-    errors fail open to the previous unlocked behaviour.
+    and every service unit use. Human-auth callers force this guard to resolve
+    the human profile directly; active config may instead resolve to a native
+    worker profile when APLEXER identity is present. Lock contention waits
+    (30 s). Forced human refresh fails closed if its lock is unavailable.
     """
     # Never yield inside a try/except here: an exception thrown into the
     # generator at the yield would be swallowed by the handler and yield again
     # ("generator didn't stop after throw()").
     path = None
     try:
-        cfg = config.load_config()
-        if not cfg.get('worker_launch_id') and config.is_human_config(cfg):
+        cfg = config.load_human_config() if force_human else config.load_config()
+        if (force_human and config.is_human_config(cfg)) or (
+                not force_human and not cfg.get('worker_launch_id') and config.is_human_config(cfg)):
             lock = config.get_human_config_path()
             path = lock.with_name(lock.name + '.refresh.lock')
     except Exception:
@@ -197,6 +200,8 @@ def human_refresh_guard():
                 if exc.errno in (errno.EAGAIN, errno.EACCES) and time.monotonic() < deadline:
                     time.sleep(.05)
                     continue
+                if force_human:
+                    raise RuntimeError('Human refresh lock unavailable') from None
                 break  # cannot lock (read-only dir etc.): unlocked, as before
     if manager is None:
         yield

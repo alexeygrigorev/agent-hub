@@ -41,6 +41,11 @@ def get_human_config_path() -> Path:
         path = Path(explicit).expanduser()
         if not path.is_absolute(): raise ValueError('HUB_CONFIG_FILE must be absolute')
         return _forbid_real_user_profile(path)
+    return _default_human_config_path()
+
+
+def _default_human_config_path() -> Path:
+    """Return the normal human profile path, ignoring HUB_CONFIG_FILE."""
     if sys.platform == "win32":
         appdata = os.environ.get("APPDATA")
         if not appdata:
@@ -49,6 +54,15 @@ def get_human_config_path() -> Path:
     else:
         base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
     return _forbid_real_user_profile(base / "agent-hub" / "cli.json")
+
+
+def _is_default_human_config_path(path: Path) -> bool:
+    """Whether path aliases cli.json, even when an override selects it."""
+    try:
+        return os.path.normcase(str(Path(path).resolve())) == os.path.normcase(
+            str(_default_human_config_path().resolve()))
+    except OSError:
+        return False
 
 
 def get_host_config_path() -> Path:
@@ -323,6 +337,9 @@ def _save_to(path: Path, data: dict, *, human_flow: bool = False):
     _forbid_real_user_profile(path)
     if not isinstance(data, dict):
         raise ValueError("Config data must be a dict")
+    if not human_flow and _is_default_human_config_path(path):
+        raise ConfigPermissionError(
+            'Refusing to write the human profile outside the human authentication flow.')
     cleaned = {}
     for k, v in data.items():
         if k == "refresh_token" and v is None:
@@ -453,6 +470,9 @@ def update_config(**kwargs):
 
 def clear_config():
     path = _forbid_real_user_profile(get_config_path())
+    if _is_default_human_config_path(path):
+        raise ConfigPermissionError(
+            'Refusing to remove the human profile outside the human authentication flow.')
     with _profile_write_lock(path):
         if is_human_config(_load_from(path)):
             raise ConfigPermissionError(

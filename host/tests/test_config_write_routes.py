@@ -100,6 +100,15 @@ class HumanWriteRouteProtection(unittest.TestCase):
             config.clear_config()
         self.assertEqual(self.profile.read_bytes(), before)
 
+    def test_host_writer_cannot_create_config_at_default_human_path(self):
+        self.profile.unlink()
+        with patch.object(config, '_default_human_config_path', return_value=self.profile):
+            with self.assertRaises(config.ConfigPermissionError):
+                config.save_config({'client_kind': 'host', 'access_token': 'fixture-host'})
+            with self.assertRaises(config.ConfigPermissionError):
+                config.clear_config()
+        self.assertFalse(self.profile.exists())
+
     def test_single_file_human_refresh_still_rotates(self):
         def response(request, timeout=10.0, _token_exchange=None):
             result = {'access_token': 'fixture-rotated', 'refresh_token': 'fixture-refreshed'}

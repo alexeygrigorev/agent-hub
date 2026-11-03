@@ -334,12 +334,34 @@ class TestHumanStatusLogout(unittest.TestCase):
         self._write_human()
 
         @contextlib.contextmanager
-        def other_process_rotates_first():
+        def other_process_rotates_first(**_kwargs):
             self._write_human(access_token="h-acc-other", refresh_token="h-ref-other")
             yield
 
         with patch("agent_hub_host.auth.human_refresh_guard", other_process_rotates_first),                 patch("agent_hub_host.api.safe_http_json", side_effect=AssertionError("replayed refresh")):
             self.assertEqual(human_auth.human_refresh(), "h-acc-other")
+
+    def test_human_refresh_guard_targets_human_file_when_active_profile_is_worker(self):
+        import contextlib
+        profile = Path(self._temp_dir.name) / "explicit-human.json"
+        acquired = []
+
+        @contextlib.contextmanager
+        def record_lock(path):
+            acquired.append(Path(path))
+            yield
+
+        with patch.dict(os.environ, {"HUB_CONFIG_FILE": str(profile)}):
+            self._write_human()
+            # A native session can make normal config resolution choose its
+            # worker credential while human_auth still rotates cli.json.
+            with patch.object(config, "load_config", return_value={
+                    "client_kind": "agent", "worker_launch_id": "launch-fixture"}), \
+                    patch.object(auth.private_fs, "exclusive_lock", side_effect=record_lock):
+                with auth.human_refresh_guard(force_human=True):
+                    pass
+
+        self.assertEqual(acquired, [profile.with_name(profile.name + ".refresh.lock")])
 
     def test_single_file_mode_human_refresh_is_locked_and_not_replayed(self):
         cfg_path = Path(self._temp_dir.name) / "loop-cli.json"
