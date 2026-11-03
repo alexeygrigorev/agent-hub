@@ -8,7 +8,7 @@
 import { describe, expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import type { Hub } from '../src/hub';
-import { WorkerAccess } from '../src/worker-access';
+import { WorkerAccess, NATIVE_CREDENTIAL_CANDIDATES_SQL } from '../src/worker-access';
 import { pollSessionCredentials } from '../src/session-messaging';
 
 const NOW = Date.now();
@@ -97,6 +97,15 @@ describe('credential poll indexes', () => {
     expect(join).not.toMatch(/SCAN\s+(c\b|credentials\b)/);
   }));
 
+  it('native credential candidates use one indexed query across sessions and links', () => withHub(async hub => {
+    const plan = (hub.sql.exec('EXPLAIN QUERY PLAN ' + NATIVE_CREDENTIAL_CANDIDATES_SQL,'h0').toArray() as any[])
+      .map(r => String(r.detail)).join(' | ');
+    expect(plan).toContain('session_control_native_credential');
+    expect(plan).toMatch(/intake_session_links.*USING/i);
+    expect(plan).toMatch(/worker_access_session_family/);
+    expect(plan).not.toMatch(/SCAN\s+(session_control_sessions|intake_session_links|worker_access|credentials)\b/i);
+  }));
+
   it('the agent identity poll uses the project/machine index, not a scan', () => withHub(async hub => {
     const plan = (q: string, ...b: any[]) => (hub.sql.exec('EXPLAIN QUERY PLAN ' + q, ...b).toArray() as any[]).map(r => String(r.detail)).join(' | ');
     const agents = plan('SELECT tag FROM agents WHERE project = ? AND machine_id = ? LIMIT 200', 'session', 'h0');
@@ -173,6 +182,8 @@ describe('write-driven credential sweeps', () => {
     const from = t.mark();
     const second: any = await list().json();
     expect(second.sessions).toEqual(first.sessions);
+    expect(t.calls.slice(from).filter(q => /WITH candidates AS MATERIALIZED/i.test(q))).toHaveLength(1);
+    expect(t.calls.slice(from).filter(q => /^\s*SELECT 1 FROM worker_access w JOIN credentials/i.test(q))).toEqual([]);
     expect(t.calls.slice(from).filter(q => /FROM worker_access w LEFT JOIN/i.test(q))).toEqual([]);
     // The repeat list read zero rows (memoized zero-read cursors).
     expect(t.report(from)).toBe(0);

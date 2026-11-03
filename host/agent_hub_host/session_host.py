@@ -652,7 +652,7 @@ def worktree_step_once(dispatcher, machine_id: str, journal_dir: str):
 
 
 def bindings_loop(dispatcher, stop, *, clock=time.monotonic):
-    """Observe in-flight starts and publish an external-session census at most 45s apart.
+    """Observe in-flight starts and publish an external-session census at most 60s apart.
 
     A launcher can await its child's first action for minutes. Its offer
     thread cannot report bindings during that wait, and the slow maintenance
@@ -677,7 +677,7 @@ def bindings_loop(dispatcher, stop, *, clock=time.monotonic):
             if now < tail_until:
                 bindings_step_once(dispatcher)
                 if now >= next_census:
-                    next_census = now + 45
+                    next_census = now + 60
                 if callable(getattr(dispatcher, 'report_native_bindings', None)):
                     # At most one slow sampler, independent of fast reporting.
                     # Its existing lock serializes durable progress and exit
@@ -691,7 +691,7 @@ def bindings_loop(dispatcher, stop, *, clock=time.monotonic):
                     tail_until = clock() + 30
             elif now >= next_census:
                 bindings_step_once(dispatcher)
-                next_census = now + 45
+                next_census = now + 60
             stop.wait(max(0, 5 - (clock() - started)))
     finally:
         if sampler is not None:
@@ -847,7 +847,7 @@ def ensure_private_journal(journal) -> None:
                           'entries': repaired}), flush=True)
 
 
-def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=None):
+def run(settings_path, journal_dir, *, interval=2, fleet_interval=120, cycles=None):
     if interval < 1 or fleet_interval < interval:
         raise ValueError('Invalid host polling intervals')
     cfg = config.load_config()
@@ -1162,7 +1162,7 @@ def main():
     parser.add_argument('--config', required=True)
     parser.add_argument('--journal-dir', required=True)
     parser.add_argument('--interval', type=float, default=2)
-    parser.add_argument('--fleet-interval', type=float, default=20)
+    parser.add_argument('--fleet-interval', type=float, default=120)
     args = parser.parse_args()
     run(args.config, args.journal_dir, interval=args.interval, fleet_interval=args.fleet_interval)
 

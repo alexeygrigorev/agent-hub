@@ -28,8 +28,12 @@ class OffersLoop(unittest.TestCase):
                 thread.join(2)
         self.assertFalse(thread.is_alive())
 
-    def test_default_cadence_is_the_two_second_offers_poll(self):
-        self.assertLessEqual(fleet.OFFERS_POLL_S, 2.0)
+    def test_default_cadence_is_the_ten_second_offers_poll(self):
+        self.assertEqual(fleet.OFFERS_POLL_S, 10.0)
+
+    def test_host_reports_and_credential_provisioning_use_the_cost_cadence(self):
+        self.assertEqual(session_host.run.__kwdefaults__['fleet_interval'], 120)
+        self.assertEqual(session_host.session_messages.PROVISION_INTERVAL_S, 600.0)
 
     def test_polling_flag_covers_exactly_the_poll(self):
         stop, polling, seen = threading.Event(), threading.Event(), []

@@ -7,6 +7,7 @@ import { placementPressureSubjects } from '../src/host-pressure';
 import { MonitoringService } from '../src/monitoring';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
+import { freshCompleteCatalogs } from '../src/catalog-freshness';
 
 const now = Date.parse('2026-10-24T16:00:00Z');
 const iso = (msDelta: number) => new Date(now + msDelta).toISOString();
@@ -67,7 +68,7 @@ describe('fleet health visibility + machine aliasing', () => {
     sql.exec("UPDATE fleet_sessions SET last_activity_at=? WHERE native_id='idle-bound'", iso(0));
     expect(status().active).toBe(4);
     expect(sql.exec('SELECT COUNT(*) AS n FROM fleet_sessions').one().n).toBe(5);
-    // Independent host heartbeats do not prove the native catalog is current.
+    // An independent host heartbeat does not prove the native catalog is current.
     sql.exec("UPDATE fleet_catalog_seen SET observed_at=? WHERE machine_id='idle-host'", iso(-20 * 60000));
     sql.exec("UPDATE fleet_catalog_census SET observed_at=? WHERE machine_id='idle-host'", iso(-20 * 60000));
     expect(status()).toMatchObject({active: 5, reserved: 0, observed_sessions: 5});
@@ -357,12 +358,13 @@ describe('fleet health visibility + machine aliasing', () => {
    expect(sql.exec("SELECT observed_at FROM fleet_catalog_seen WHERE machine_id='census-host'").one().observed_at).toBe(first);
    expect(sql.exec("SELECT observed_at FROM fleet_catalog_census WHERE machine_id='census-host'").one().observed_at).toBe(first);
    tick+=60000; expect((await (await send()).json() as any).written).toBe(0);
-   expect(sql.exec("SELECT observed_at FROM fleet_catalog_seen WHERE machine_id='census-host'").one().observed_at).toBe(iso(90000));
+   expect(freshCompleteCatalogs(sql,tick).has('census-host')).toBe(true);
+   expect(sql.exec("SELECT observed_at FROM fleet_catalog_seen WHERE machine_id='census-host'").one().observed_at).toBe(first);
    expect(sql.exec("SELECT observed_at FROM fleet_sessions WHERE machine_id='census-host'").one().observed_at).toBe(first);
-   expect(sql.exec("SELECT observed_at FROM fleet_catalog_census WHERE machine_id='census-host'").one().observed_at).toBe(iso(90000));
+   expect(sql.exec("SELECT observed_at FROM fleet_catalog_census WHERE machine_id='census-host'").one().observed_at).toBe(first);
    const malformed=await send({...payload,census_complete:1 as any});
    expect(malformed.status).toBe(400);
-   expect(sql.exec("SELECT observed_at,complete FROM fleet_catalog_census WHERE machine_id='census-host'").one()).toMatchObject({observed_at:iso(90000),complete:1});
+   expect(sql.exec("SELECT observed_at,complete FROM fleet_catalog_census WHERE machine_id='census-host'").one()).toMatchObject({observed_at:first,complete:1});
    const flipsImmediately=await send({...payload,census_complete:false});
    expect(flipsImmediately.status).toBe(200);
    expect(sql.exec("SELECT observed_at,complete FROM fleet_catalog_census WHERE machine_id='census-host'").one()).toMatchObject({observed_at:iso(90000),complete:0});

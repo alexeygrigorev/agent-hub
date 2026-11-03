@@ -30,7 +30,7 @@ import { ACTIVE_LAUNCH_STATES_SQL, isEligibleReservedLaunch, parseReservedLaunch
 import { readAccountCapacityHistory } from './account-capacity-history';
 import { LIMIT_MAX, LIMIT_MIN, limitRowUpdates, planLimitSet, resolveLimitTarget } from './fleet-limits';
 import { resolveMachineAliases, projectAliasSessions } from './machine-alias';
-import { freshCatalogs, freshCompleteCatalogs } from './catalog-freshness';
+import { clearCatalogReports, freshCatalogs, freshCompleteCatalogs, noteCatalogReport } from './catalog-freshness';
 import { readFleetCapacitySnapshot, capacityFamilyKey, reservationNativeJoinSql, unobservedReservationReleased, reservationHoldsCapacity, RESERVATION_TTL_MS, INFLIGHT_LAUNCH_ID_SQL, type FleetCapacitySnapshot } from './fleet-capacity-snapshot';
 import { syncTbmFromServerAccounts } from './tbm-ingestion';
 import { recordSessionTokens } from './tbm-controller';
@@ -94,9 +94,32 @@ export const ROUTE_FAILURE_CAP = 8;
  *  `launcher_command_failed` (engine never started) -> skip the route; it re-opens when the window passes. */
 export const ROUTE_QUARANTINE_WINDOW_MS = 10 * 60_000;
 export const ROUTE_QUARANTINE_FAILURES = 3;
+export const ROUTE_QUARANTINE_REFUSAL_REASONS = new Set(['admission_refused','admission_unconfigured','dispatch_refused','dispatch_route_unconfigured']);
 export const ROUTE_FAILURE_NEUTRAL_REASONS = new Set(['launcher_offer_expired', 'model_unsupported', 'launcher_memory_reserve', 'account_capacity', 'account_concurrency',
   'machine_capacity', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking', 'host_load_high', 'operator_stopped', 'stopped_by_operator', 'cancelled']);
 const ACTIVE = ACTIVE_LAUNCH_STATES_SQL;
+const LIVE_CATALOG_PHASES = new Set(['starting','running','broken','unknown','uncertain']);
+function stableJson(value: any): any {
+  if (Array.isArray(value)) return value.map(stableJson);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.keys(value).sort().map(key => [key, stableJson(value[key])]));
+}
+/** Census timestamps are useful evidence when a row changes, but a refreshed
+ * sampler timestamp alone must not turn the same host snapshot into SQL work. */
+function censusFingerprint(sessions: any[], complete: boolean): string {
+  const rows = sessions.map(session => {
+    const row = { ...session };
+    if (['exited','dead','pruned','forgotten'].includes(row.phase) && row.confirmed_exit !== true) row.phase = 'uncertain';
+    if (row.progress && typeof row.progress === 'object') {
+      row.progress = { ...row.progress };
+      delete row.progress.sampled_at;
+      delete row.progress.last_progress_at;
+      delete row.progress.last_cpu_at;
+    }
+    return stableJson(row);
+  }).sort((a, b) => String(a.native_id).localeCompare(String(b.native_id)));
+  return JSON.stringify([complete, rows]);
+}
 // A native catalog can observe spawn before the launcher posts its receipt.
 // Correlate that narrow in-flight window without trusting a tag alone.
 const NATIVE_IN_FLIGHT = `(
@@ -614,6 +637,9 @@ export class FleetService {
   private reofferCursors = new Map<string, [string, string]>();
   /** All-clear offers answers per machine, keyed by the fleet write stamp. */
   private emptyOffers = new Map<string, { stamp: string; at: number; value: any }>();
+  /** Last semantic host catalog and live native set. Exact repeated polls
+   * return before SQL; the set is also the bounded vanished-session source. */
+  private censusSnapshots = new Map<string, { fingerprint: string; live: Set<string>; writeStamp: string | null }>();
   // Last intake linkage revision the census late-link pass ran at, per machine (intake e8a22f4c).
   private linkRevisions = new Map<string, string>();
   private candidateCache = new Map<string, { revision: string; at: number; value: any[] }>();
@@ -725,9 +751,9 @@ export class FleetService {
     // drop the cache so the next read reloads the committed state.
     this.transaction = fn => {
       try { return transaction(fn); }
-      catch (error) { this.observedCatalog?.reset(); throw error; }
+      catch (error) { this.observedCatalog?.reset(); this.censusSnapshots.clear(); clearCatalogReports(this.sql); this.resources?.invalidateReports(); throw error; }
     };
-    this.resources = new ResourceManagement(sql, now, writes, observed);
+    this.resources = new ResourceManagement(sql, now, writes, observed, machine => this.censusSnapshots.delete(machine));
     this.routing = new RoutingService(sql, this, now, this.transaction);
     this.admission = new ClaimAdmission(sql, this.transaction, now);
   }
@@ -785,6 +811,7 @@ export class FleetService {
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_updated ON fleet_launches(updated_at)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_memory_holds_retry ON fleet_memory_holds(retry_id)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_session_incarnation ON fleet_sessions(machine_id,tag,engine,account,profile,workspace,phase)');
+    this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_catalog_census_fresh ON fleet_catalog_census(observed_at,machine_id) WHERE complete=1');
     // Intake 94186660: serves the /api/fleet sessions keyset page
     // (ORDER BY machine_id, tag, native_id with a 3-part cursor).
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_session_page ON fleet_sessions(machine_id,tag,native_id)');
@@ -1353,13 +1380,14 @@ export class FleetService {
     // window, and only count failures a route can be blamed for: capacity holds,
     // expired offers and model refusals say nothing about the account (they were
     // the reason every route read fail=8, the global cap of the old per-label count).
-    const recentFailuresByRoute = new Map<string, { n: number; launcher: string[] }>();
+    const recentFailuresByRoute = new Map<string, { n: number; launcher: string[]; refusing: string[] }>();
     const hostLaunchCounts = new Map<string, { pending: number; running: number }>();
-    const routeFailures = (acct: string, machineId: string): { n: number; launcher: string[] } => {
+    const routeFailures = (acct: string, machineId: string): { n: number; launcher: string[]; refusing: string[] } => {
       const key = acct + ' ' + machineId;
       if (!recentFailuresByRoute.has(key)) {
         let n = 0;
         let launcher: string[] = [];
+        let refusing: string[] = [];
         try {
           const sinceIso = new Date(this.now() - ROUTE_FAILURE_WINDOW_MS).toISOString();
           const skip = [...ROUTE_FAILURE_NEUTRAL_REASONS];
@@ -1367,15 +1395,16 @@ export class FleetService {
             acct, machineId, ...skip, sinceIso).toArray() as any[];
           n = rows.length;
           launcher = rows.filter(r => r.exit_reason === 'launcher_command_failed').map(r => String(r.updated_at));
-        } catch { n = 0; launcher = []; }
-        recentFailuresByRoute.set(key, { n, launcher });
+          refusing = rows.filter(r => ROUTE_QUARANTINE_REFUSAL_REASONS.has(String(r.exit_reason))).map(r => String(r.updated_at));
+        } catch { n = 0; launcher = []; refusing = []; }
+        recentFailuresByRoute.set(key, { n, launcher, refusing });
       }
       return recentFailuresByRoute.get(key)!;
     };
     const countRecentAccountFailures = (acct: string, machineId: string): number => routeFailures(acct, machineId).n;
-    // Reuses the per-route failure statement above (no extra SQL call per route). Only when it shows
-    // ROUTE_QUARANTINE_FAILURES launcher_command_failed rows inside the window does one more statement check that
-    // no other launch on the route is newer than the third of them (a start or other outcome re-opens the route).
+    // Reuses the per-route failure statement above (no extra SQL call per route). Repeated
+    // launcher failures and explicit route refusals quarantine a machine; capacity evidence
+    // stays neutral. A success or different outcome after the third refusal reopens the route.
     const quarantineByRoute = new Map<string, boolean>();
     const routeQuarantined = (acct: string, machineId: string): boolean => {
       const key = acct + ' ' + machineId;
@@ -1383,10 +1412,13 @@ export class FleetService {
         let q = false;
         try {
           const cutoff = new Date(this.now() - ROUTE_QUARANTINE_WINDOW_MS).toISOString();
-          const inWindow = routeFailures(acct, machineId).launcher.filter(t => t > cutoff);
+          const failures = routeFailures(acct, machineId);
+          const inWindow = [...failures.launcher, ...failures.refusing].filter(t => t > cutoff).sort((a, b) => b.localeCompare(a));
           if (inWindow.length >= ROUTE_QUARANTINE_FAILURES) {
             const third = inWindow[ROUTE_QUARANTINE_FAILURES - 1];
-            q = this.sql.exec(`SELECT 1 FROM fleet_launches WHERE account = ? AND machine_id = ? AND updated_at > ? AND NOT (state = 'failed' AND exit_reason = 'launcher_command_failed') LIMIT 1`, acct, machineId, third).toArray().length === 0;
+            const repeated = ['launcher_command_failed', ...ROUTE_QUARANTINE_REFUSAL_REASONS];
+            q = this.sql.exec(`SELECT 1 FROM fleet_launches WHERE account = ? AND machine_id = ? AND updated_at > ?
+              AND NOT (state = 'failed' AND exit_reason IN (${repeated.map(() => '?').join(',')})) LIMIT 1`, acct, machineId, third, ...repeated).toArray().length === 0;
           }
         } catch { q = false; }
         quarantineByRoute.set(key, q);
@@ -2970,18 +3002,29 @@ export class FleetService {
             typeof s.native_id !== 'string' || !/^[a-zA-Z0-9-]{1,160}$/.test(s.native_id) || typeof s.tag !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,159}$/.test(s.tag) || (s.engine !== null && !label(s.engine)) || !label(s.phase) || (s.agent_state !== null && !label(s.agent_state)) || typeof s.workspace !== 'string' || s.workspace.length > 2048 || /[\x00-\x1f\x7f]/.test(s.workspace) || (s.cwd !== undefined && s.cwd !== null && (typeof s.cwd !== 'string' || s.cwd.length > 2048 || /[\x00-\x1f\x7f]/.test(s.cwd))) || (s.profile !== null && !label(s.profile)) || (s.account !== null && !label(s.account)) || ids.has(s.native_id)) return response({ error: 'invalid_session' }, 400);
         ids.add(s.native_id);
       }
+      const machineId = caller.machineId!;
+      const fingerprint = censusFingerprint(data.sessions, censusComplete);
+      const priorSnapshot = this.censusSnapshots.get(machineId);
+      const cacheValid = !!this.writes && !!priorSnapshot && priorSnapshot.writeStamp === this.writes.stamp('fleet_sessions');
+      if (cacheValid && priorSnapshot?.fingerprint === fingerprint && !this.maintenanceDirty) {
+        this.observedCatalog?.refreshProgress(machineId, data.sessions.map((session: any) => ({
+          native_id: session.native_id, progress_json: session.progress ? JSON.stringify(session.progress) : null,
+        })));
+        noteCatalogReport(this.sql, machineId, censusComplete, this.now());
+        return response({ status: 'reported', written: 0 });
+      }
       return this.transaction(() => {
-        // Record the newest completeness verdict before reconciliation or
-        // queue draining can inspect capacity. A change of verdict is applied
-        // immediately; unchanged reports retain the existing 60 s write cap.
+        // These catalog rows are durable presence/completeness markers and
+        // only change when a host first reports or the completeness verdict changes.
         const censusNow = this.now();
         const censusObservedAt = new Date(censusNow).toISOString();
         this.sql.exec(`INSERT INTO fleet_catalog_census (machine_id, observed_at, complete) VALUES (?, ?, ?)
           ON CONFLICT(machine_id) DO UPDATE SET observed_at=excluded.observed_at, complete=excluded.complete
-          WHERE fleet_catalog_census.complete != excluded.complete OR fleet_catalog_census.observed_at <= ?`,
-          caller.machineId!, censusObservedAt, censusComplete ? 1 : 0, new Date(censusNow - 60000).toISOString());
-        // Write only rows that changed: hosts report every minute and Durable Object row writes
-        // are metered. observed_at therefore means "last changed"; host freshness comes from heartbeats.
+          WHERE fleet_catalog_census.complete != excluded.complete`,
+          machineId, censusObservedAt, censusComplete ? 1 : 0);
+        // Write only rows that changed: host polls return before SQL when
+        // unchanged. observed_at therefore means "last changed"; live report
+        // freshness is held in memory.
         const fields = ['tag', 'engine', 'phase', 'agent_state', 'workspace', 'cwd', 'profile', 'account', 'last_activity_at', 'created_at_ms', 'progress_json'];
         // Intake e8a22f4c: read only the reported rows (PK lookups) and the live-phase rows
         // that may have vanished, never the retained history of the machine.
@@ -2989,8 +3032,10 @@ export class FleetService {
         const existing = new Map<string, any>();
         for (const r of this.byChunks(reportedIds, (marks) => `SELECT * FROM fleet_sessions WHERE machine_id = ? AND native_id IN (${marks})`, caller.machineId!)) existing.set(r.native_id, r);
         const reportedSet = new Set(reportedIds);
-        const liveUnreported = (this.sql.exec("SELECT native_id FROM fleet_sessions WHERE machine_id = ? AND phase IN ('starting','running','broken','unknown','uncertain')", caller.machineId!).toArray() as any[])
-          .map(r => String(r.native_id)).filter(id => !reportedSet.has(id));
+        const priorLive = cacheValid && priorSnapshot ? new Set(priorSnapshot.live) : new Set((this.sql.exec(
+          "SELECT native_id FROM fleet_sessions WHERE machine_id = ? AND phase IN ('starting','running','broken','unknown','uncertain')", machineId
+        ).toArray() as any[]).map(r => String(r.native_id)));
+        const liveUnreported = [...priorLive].filter(id => !reportedSet.has(id));
 
         // Stopped same-incarnation native sessions cannot resurrect from late live-catalog snapshots:
         // do not insert or resurrect in fleet_sessions or adoptObservedNativeSessions if already canonically stopped for the same incarnation.
@@ -3022,6 +3067,7 @@ export class FleetService {
         const observedRows: any[] = [];
         const unobservedIds: string[] = [];
         let metadataChanged = false;
+        let settlementDeferred = false;
         const seen = new Set<string>();
         for (const s of data.sessions) {
           if (s.tokens) recordSessionTokens(this.sql, { session_id: `${caller.machineId}:${s.native_id}`,
@@ -3061,16 +3107,8 @@ export class FleetService {
           const rowStable = { ...row, progress_json: stableProgress(row.progress_json) };
           const priorStable = prior ? { ...prior, progress_json: stableProgress(prior.progress_json) } : null;
           if (!staleRecoverable && prior && priorStable && fields.every(f => ((priorStable as any)[f] ?? null) === ((rowStable as any)[f] ?? null))) {
-            // Volatile progress timestamps alone must not rewrite the row every minute:
-            // touch observed_at at most every 5 min to keep the 10-min liveness window.
-            try {
-              const prevObs = prior.observed_at ? Date.parse(prior.observed_at) : 0;
-              if (this.now() - prevObs >= 5 * 60 * 1000) {
-                this.sql.exec('UPDATE fleet_sessions SET observed_at = ? WHERE machine_id = ? AND native_id = ?', new Date(this.now()).toISOString(), caller.machineId!, s.native_id);
-                written++;
-                observedRows.push({ machine_id: caller.machineId!, native_id: s.native_id, tag: s.tag, engine: s.engine, phase: s.phase, agent_state: s.agent_state, observed_at: new Date(this.now()).toISOString(), workspace: s.workspace, cwd: row.cwd, profile: s.profile, account: s.account, last_activity_at: row.last_activity_at });
-              }
-            } catch {}
+            // Heartbeat freshness is independent of row changes; unchanged
+            // rows never need a timestamp touch or write-through refresh.
             continue;
           }
           changedSessions.push(s);
@@ -3094,9 +3132,15 @@ export class FleetService {
         const gone = censusComplete
           ? [...liveUnreported, ...reportedIds.filter(id => existing.has(id) && !seen.has(id))]
           : [];
+        const liveAfter = new Set(priorLive);
         for (const id of gone) {
           this.sql.exec("UPDATE fleet_sessions SET phase = 'unobserved' WHERE machine_id = ? AND native_id = ? AND phase IN ('starting','running','broken','unknown','uncertain')", caller.machineId!, id); written++;
           unobservedIds.push(id);
+          liveAfter.delete(id);
+        }
+        for (const session of cleanSessions) {
+          if (LIVE_CATALOG_PHASES.has(String(session.phase))) liveAfter.add(String(session.native_id));
+          else liveAfter.delete(String(session.native_id));
         }
         // Write-through the observed catalog so watchdog/liveness reads stay
         // at zero rows between real changes (intake 8081a05a/e8a22f4c).
@@ -3132,7 +3176,10 @@ export class FleetService {
             if (binding.native_id !== native.native_id || binding.tag !== native.tag ||
                 binding.workspace !== native.workspace || binding.native_created_at_ms !== native.created_at_ms ||
                 session.engine !== native.engine) continue;
-            if (this.sql.exec('SELECT id FROM routing_jobs WHERE launch_id = ?', session.fleet_launch_id).toArray().length) continue;
+            if (this.sql.exec('SELECT id FROM routing_jobs WHERE launch_id = ?', session.fleet_launch_id).toArray().length) {
+              settlementDeferred = true;
+              continue;
+            }
             const at = new Date(this.now()).toISOString();
             this.sql.exec("UPDATE fleet_launches SET state = 'exited', finished_at = ?, updated_at = ?, verification_status = 'verified' WHERE id = ? AND machine_id = ? AND native_id = ? AND state IN ('starting','running','uncertain')", at, at, session.fleet_launch_id, caller.machineId!, native.native_id);
             this.sql.exec("UPDATE session_control_sessions SET state = 'stopped', updated_at = ? WHERE id = ? AND state IN ('starting','running','uncertain')", at, session.id);
@@ -3140,20 +3187,42 @@ export class FleetService {
         }
         // Adoption and late-link work is per changed native; the link pass over every
         // reported native reruns only when the intake linkage revision moved.
-        let revision = '';
-        try { revision = String((this.sql.exec('SELECT revision FROM session_observation_intake_meta WHERE id=1').toArray()[0] as any)?.revision ?? ''); } catch { /* table not created yet */ }
-        const revisionMoved = !revision || this.linkRevisions.get(caller.machineId!) !== revision;
+        // The missing singleton row is itself a stable revision state. Treating
+        // it as "always moved" repeats late-link adoption on every census before
+        // the first intake-link write has created the metadata row.
+        let revision = '__missing__';
+        try {
+          const revisionRow = this.sql.exec('SELECT revision FROM session_observation_intake_meta WHERE id=1').toArray()[0] as any;
+          if (revisionRow) revision = String(revisionRow.revision ?? '');
+        } catch { /* table not created yet */ }
+        const revisionMoved = this.linkRevisions.get(caller.machineId!) !== revision;
+        if (linkChangedSessions.length || revisionMoved) {
+          adoptObservedNativeSessions(this.sql, caller.machineId!, linkChangedSessions, this.now(), undefined,
+            revisionMoved ? cleanSessions : linkChangedSessions);
+          // The first late-link pass may create and backfill its compact intake
+          // projection, moving the revision it just read. Remember the settled
+          // value so an activity-only census does not repeat that cold pass.
+          try {
+            const settledRevision = this.sql.exec('SELECT revision FROM session_observation_intake_meta WHERE id=1').toArray()[0] as any;
+            if (settledRevision) revision = String(settledRevision.revision ?? '');
+          } catch { /* table not created yet */ }
+        }
         this.linkRevisions.set(caller.machineId!, revision);
-        adoptObservedNativeSessions(this.sql, caller.machineId!, linkChangedSessions, this.now(), undefined,
-          revisionMoved ? cleanSessions : linkChangedSessions);
         if (changedSessions.length || gone.length) this.maintenanceDirty = true;
         reconcileAccountCapacity(this.sql, this.now());
         reconcileVerifiedNoStarts(this.sql, this.now());
         // A refreshed catalog can free machine_capacity: promote waiters.
         try { this.drainCapacityQueue(); } catch { /* best-effort */ }
-        // unchanged rows retain last-change timestamps; the complete census
-        // has separate freshness evidence, bounded to one host write/minute.
-        this.sql.exec('INSERT INTO fleet_catalog_seen VALUES (?,?) ON CONFLICT(machine_id) DO UPDATE SET observed_at=excluded.observed_at WHERE fleet_catalog_seen.observed_at <= ?', caller.machineId!, new Date(this.now()).toISOString(), new Date(this.now() - 60000).toISOString());
+        // This report has already run the maintenance that a later offers
+        // poll would otherwise repeat. Keep dirty only while a routed terminal
+        // receipt is deliberately deferred behind its task result.
+        this.maintenanceDirty = settlementDeferred;
+        // The marker is inserted once. Live report freshness never refreshes
+        // this durable catalog row.
+        this.sql.exec('INSERT OR IGNORE INTO fleet_catalog_seen VALUES (?,?)', machineId, censusObservedAt);
+        noteCatalogReport(this.sql, machineId, censusComplete, censusNow);
+        if (this.censusSnapshots.size >= 64) this.censusSnapshots.clear();
+        this.censusSnapshots.set(machineId, { fingerprint, live: liveAfter, writeStamp: this.writes?.stamp('fleet_sessions') ?? null });
         return response({ status: 'reported', written });
       });
     }

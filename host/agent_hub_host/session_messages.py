@@ -575,7 +575,7 @@ def reconcile_message_record(journal_file: str, *, executable: str, request: Cal
 
 
 _last_provision = [0.0]
-PROVISION_INTERVAL_S = 120.0
+PROVISION_INTERVAL_S = 600.0
 
 
 def provision_credentials(request: Callable, base_url: Optional[str], *, auth_dir=None,

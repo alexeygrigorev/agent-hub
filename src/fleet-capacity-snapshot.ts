@@ -1,6 +1,7 @@
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { canonicalQuotaProvider } from './quota';
 import { effectiveCheckin } from './registry';
+import { freshCompleteCatalogs } from './catalog-freshness';
 
 type Row = Record<string, any>;
 export const CAPACITY_LIMITS = { hosts: 64, accounts: 128, routes: 256, launches: 256, natives: 256, engines: 16 };
@@ -148,9 +149,7 @@ export function readFleetCapacitySnapshot(sql: SqlStorage, now: number, unreserv
         FROM fleet_sessions s WHERE s.machine_id=? AND s.native_id=?`, native.machine_id, native.native_id).one().inflight_launch_id;
     }
   }
-  const seen = keyed(ids, CAPACITY_LIMITS.hosts, (marks, n) => `SELECT machine_id,observed_at FROM fleet_catalog_census
-    WHERE complete=1 AND observed_at>=? AND observed_at<=? AND machine_id IN (${marks}) LIMIT ${n}`,
-    new Date(now - 180000).toISOString(), new Date(now + 60000).toISOString());
+  const completeCatalogs = freshCompleteCatalogs(sql, now, ids);
   const byLabel = new Map(definitions.map(a => [a.label, a]));
   const familyAccounts = new Map<string, Set<string>>();
   for (const r of routes) {
@@ -160,5 +159,5 @@ export function readFleetCapacitySnapshot(sql: SqlStorage, now: number, unreserv
     familyAccounts.get(key)!.add(r.account);
   }
   return { now, definitions, machines, routes, launches, natives,
-    completeCatalogs: new Map(seen.map(r => [r.machine_id, Date.parse(r.observed_at)])), familyAccounts };
+    completeCatalogs, familyAccounts };
 }

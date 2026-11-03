@@ -44,6 +44,34 @@ describe('hot-path query plans use indexes, never full scans', () => {
     expect(p).toMatch(/USING/i);
   }));
 
+  it('native catalog freshness uses timestamp indexes for cold-start markers', () => withHub(async hub => {
+    hub.fleetService.init();
+    const seen = plan(hub, 'SELECT machine_id,observed_at FROM fleet_catalog_seen WHERE observed_at>=? AND observed_at<=?', iso(NOW - 180000), iso(NOW + 60000));
+    const complete = plan(hub, 'SELECT machine_id,observed_at FROM fleet_catalog_census WHERE complete=1 AND observed_at>=? AND observed_at<=?', iso(NOW - 180000), iso(NOW + 60000));
+    expect(seen).toContain('fleet_catalog_seen_fresh');
+    expect(complete).toContain('fleet_catalog_census_fresh');
+    expect(fullScan(seen, 'fleet_catalog_seen')).toBe(false);
+    expect(fullScan(complete, 'fleet_catalog_census')).toBe(false);
+  }));
+
+  it('scheduled intake open-work selection uses the partial status index and task primary key', () => withHub(async hub => {
+    hub.intakeService.init();
+    const p = plan(hub, `SELECT t.data FROM intake_status_summary s INDEXED BY intake_status_summary_open
+      JOIN intake_tasks t ON t.id=s.id
+      WHERE s.archived_at IS NULL AND s.status IN ('open','in_progress','blocked','pending_approval') ORDER BY s.id`);
+    expect(p).toContain('intake_status_summary_open');
+    expect(p).toMatch(/SEARCH t USING/i);
+    expect(fullScan(p, 'intake_status_summary')).toBe(false);
+    expect(fullScan(p, 'intake_tasks')).toBe(false);
+  }));
+
+  it('audit decisions are fetched by run index, not by retained-log scan', () => withHub(async hub => {
+    hub.sessionAudit.init();
+    const p = plan(hub, 'SELECT id FROM session_audit_decisions WHERE run_id = ? ORDER BY id', 1);
+    expect(p).toContain('session_audit_decisions_run');
+    expect(fullScan(p, 'session_audit_decisions')).toBe(false);
+  }));
+
   it('worker credential existence uses the session-family index', () => withHub(async hub => {
     const p = plan(hub, 'SELECT 1 FROM worker_access w JOIN credentials c ON c.family_id = w.family_id WHERE w.session_id = ? AND c.revoked_at IS NULL LIMIT 1', 's');
     expect(p).toContain('worker_access_session_family');

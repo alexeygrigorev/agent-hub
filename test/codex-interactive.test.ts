@@ -3,6 +3,7 @@ import { env, runInDurableObject } from 'cloudflare:test';
 import { SessionControlService } from '../src/session_control';
 import { FleetService } from '../src/fleet';
 import { IntakeWatchdog } from '../src/intake-watchdog';
+import { clearCatalogReports } from '../src/catalog-freshness';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
 
@@ -42,7 +43,7 @@ it('reports a dead Codex TUI as failed while retaining lifecycle and capacity un
     expect(watchdog.queue([task])[0]).toMatchObject({ state: 'needs_attention', reason: 'codex_reconnect_failed' });
     for (const phase of ['running', 'starting', 'broken']) {
       expect((await report({ ...row, phase })).status).toBe(200);
-      const absent = await fleet.handle(new Request('https://hub.test/api/fleet/sessions', { method: 'PUT', body: JSON.stringify({ sessions: [] }) }),
+      const absent = await fleet.handle(new Request('https://hub.test/api/fleet/sessions', { method: 'PUT', body: JSON.stringify({ census_complete: true, sessions: [] }) }),
         { caller: { machineId: 'test-host', kind: 'host', actor: 'machine:test-host' }, scopes: ['host'] });
       expect(absent.status).toBe(200);
       expect(hub.sql.exec('SELECT phase FROM fleet_sessions').toArray()[0].phase).toBe('unobserved');
@@ -61,6 +62,7 @@ it('reports a dead Codex TUI as failed while retaining lifecycle and capacity un
     hub.sql.exec('UPDATE fleet_sessions SET created_at_ms = created_at_ms - 1');
     hub.sql.exec('DELETE FROM fleet_catalog_seen');
     hub.sql.exec("UPDATE machines SET last_checkin_at = '2000-01-01T00:00:00Z'");
+    clearCatalogReports(hub.sql);
     expect(watchdog.project([task])[0]).toMatchObject({ forgotten: false, state: 'unknown' });
   });
 });
