@@ -477,6 +477,10 @@ def prepare_launch_worktree(request: Callable, launch_id: str, workspace: Any, *
         return None
     if isinstance(plan, dict) and isinstance(plan.get("plan"), dict):
         plan = plan["plan"]  # Hub replies {"plan": {...}}
+    if isinstance(plan, dict) and plan.get("mode") == "none" and (
+        plan.get("read_only") is True or plan.get("detached") is True
+    ):
+        return {"read_only": True}
     if not isinstance(plan, dict) or plan.get("mode") not in ("resume", "create"):
         return None
     try:
@@ -518,7 +522,29 @@ def launch_cwd(request: Callable, offer: dict, workspace: Any, target_cwd: Any, 
         wt = None
     if wt is None or explicit:
         return target_cwd, "", None
+    if wt.get("read_only"):
+        return read_only_cwd(target_cwd), "", None
     return Path(wt["path"]), wt["prompt_line"] + "\n", wt
+
+
+def read_only_cwd(target_cwd: Any, git_bin: str = "git", runner: Optional[Callable] = None):
+    """Intake ccc50cca: a read-only/detached review session never starts inside
+    a linked checkout, which the live implementer holds locked. Map the cwd to
+    the same subdirectory of the main checkout; keep it when git cannot tell."""
+    from . import worktree_guard as guard
+    try:
+        path = os.path.normpath(str(target_cwd))
+        root = guard.bound_worktree_root(path, git_bin, runner)
+        if root is None:
+            return target_cwd
+        entries = guard.list_entries(git_bin, root, runner)
+        main = entries[0]["path"] if entries else None
+        if not main or main == root or entries[0].get("bare") or not os.path.isdir(os.path.join(main, ".git")):
+            return target_cwd
+        nested = os.path.join(main, os.path.relpath(path, root))
+        return Path(nested) if os.path.isdir(nested) else Path(main)
+    except Exception:  # noqa: BLE001 - fail-open: the lock guard still decides
+        return target_cwd
 
 
 def _run_command(cmd: dict, *, git_bin: str, runner: Optional[Callable], home: Optional[str],
