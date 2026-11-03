@@ -174,6 +174,12 @@ function disabledEngines(): Set<string> {
 // route_advertisement_stale: the host's last complete list aged out (it
 // stopped posting /api/host/routes); every route holds.
 const CAPACITY_REASONS = new Set(['route_not_advertised', 'route_advertisement_overflow', 'route_advertisement_stale', 'disk_floor', 'launcher_disk_reserve', 'account_capacity', 'account_concurrency', 'machine_capacity', 'launcher_memory_reserve', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking', 'host_load_high']);
+/** Claim-refusal slugs recorded into rejected[] on the offered launch (intake
+ * bcecb55c AC3). fresh_admission_required is the reported silent-refusal
+ * case; the rest are the atomic-claim gate verdicts an offered launch can
+ * hit before native start. already_claimed/invalid_* are claim-protocol
+ * outcomes, not placement evidence, and stay out of rejected[]. */
+const CLAIM_REFUSAL_REJECTED = new Set(['fresh_admission_required', 'model_unsupported', 'account_unavailable', 'quota_unavailable', 'provider_disabled', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking', 'host_load_high', 'machine_capacity', 'account_capacity', 'account_concurrency']);
 /** Runaway-load cap (multiple of cores). Load average counts IO-wait and runnable threads, so it only
  * guards the 2026-10-28 incident (load 275-295 on 12 cores); real busyness is measured CPU/memory. */
 const HOST_LOAD_FACTOR = 6;
@@ -638,6 +644,19 @@ export class FleetService {
           this.sql.exec(`UPDATE session_control_sessions SET state='queued', fleet_launch_id=?, machine_id=NULL, updated_at=?
             WHERE fleet_launch_id=? AND binding_json IS NULL AND state IN ('offered','queued','held')`, retry, at, row.id);
         }
+        // Intake bcecb55c AC3: the requeued intent keeps the refusal
+        // evidence. Without this the new queued row reads rejected[] == []
+        // even though the offer just died on a recorded refusal (e.g. a
+        // fresh-admission refusal followed by the 15-minute unclaimed-offer
+        // bound). Bounded single copy: never overwrites a hold the drain
+        // already wrote for the retry.
+        try {
+          const prior = this.launchRejections(row);
+          if (prior.length) {
+            this.sql.exec('INSERT INTO fleet_memory_holds (launch_id, since, rejected_json, refused, evidence_json) VALUES (?, ?, ?, 0, NULL) ON CONFLICT(launch_id) DO NOTHING',
+              retry, at, JSON.stringify([...prior, { machine: row.machine_id, engine: row.engine, reason: 'launcher_offer_expired' }].slice(-8)));
+          }
+        } catch { /* observability never breaks expiry */ }
       }
       return rows.length;
     });
@@ -1663,6 +1682,43 @@ export class FleetService {
     return row ? parsed(row.rejected_json, []) : [];
   }
 
+  /** Claim-refusal slugs recorded into rejected[] on the offered launch
+   * (intake bcecb55c AC3). fresh_admission_required is the reported
+   * silent-refusal case; the rest are the atomic-claim gate verdicts an
+   * offered launch can hit before native start. Observability only: never
+   * breaks placement. */
+  private recordClaimRefusal(row: any, reason: string): void {
+    try {
+      if (!row?.id || typeof reason !== 'string' || !/^[a-z_]{1,64}$/.test(reason)) return;
+      if (!CLAIM_REFUSAL_REJECTED.has(reason)) return;
+      const entry = { machine: row.machine_id, engine: row.engine, reason };
+      let existing: any[] = [];
+      try { existing = this.memoryRejections(row.id); } catch { existing = []; }
+      if (existing.some(r => r?.machine === entry.machine && r?.engine === entry.engine && r?.reason === reason)) return;
+      const merged = [...existing, entry].slice(-8);
+      this.sql.exec('INSERT INTO fleet_memory_holds (launch_id, since, rejected_json, refused, evidence_json) VALUES (?, ?, ?, 0, NULL) ON CONFLICT(launch_id) DO UPDATE SET rejected_json = excluded.rejected_json',
+        row.id, new Date(this.now()).toISOString(), JSON.stringify(merged));
+    } catch { /* observability never breaks placement */ }
+  }
+
+  /** Rejected[] for queued/offered/failed launch rows (intake bcecb55c AC3).
+   * Stored memory holds are the primary evidence; when a host claim refusal
+   * wrote only launch_error_json (e.g. a fresh-admission refusal that raced
+   * the hold write), synthesize the single-entry rejected from the stored
+   * diagnostic hub_error/hub_reason so the offered row never reads silent. */
+  private launchRejections(row: any): any[] {
+    try {
+      const held = this.memoryRejections(row.id);
+      if (Array.isArray(held) && held.length) return held;
+      const diagnostic = parsed(row.launch_error_json, null);
+      const reason = diagnostic && (CLAIM_REFUSAL_REJECTED.has(diagnostic.hub_error) ? diagnostic.hub_error
+        : CLAIM_REFUSAL_REJECTED.has(diagnostic.hub_reason) ? diagnostic.hub_reason
+        : CLAIM_REFUSAL_REJECTED.has(diagnostic.reason) ? diagnostic.reason : null);
+      if (reason) return [{ machine: row.machine_id, engine: row.engine, reason }];
+    } catch { /* read-only; fall through to empty */ }
+    return [];
+  }
+
   private queuePosition(id: string): number {
     try {
       return Number(this.sql.exec("SELECT COUNT(*) AS n FROM fleet_launches WHERE state = 'queued' AND rowid <= (SELECT rowid FROM fleet_launches WHERE id = ?)", id).one().n);
@@ -1719,6 +1775,18 @@ export class FleetService {
         // Persist only examined progress, in the promotion transaction. Even
         // malformed or held rows must not strand eligible work behind them.
         persistCursor();
+        // Intake bcecb55c AC2: never promote a queued fleet row whose Hub
+        // session was already cancelled. The session cancel transaction
+        // retires the fleet row atomically, but this closes the
+        // queued->placing race if the rows ever diverge: fence the fleet row
+        // instead of offering it to a host.
+        try {
+          const sess: any = this.sql.exec('SELECT state FROM session_control_sessions WHERE fleet_launch_id = ?', row.id).toArray()[0];
+          if (sess && sess.state === 'cancelled') {
+            try { this.sql.exec("UPDATE fleet_launches SET state='cancelled', verification_status='not_started', exit_reason='session_cancelled', finished_at=?, updated_at=? WHERE id=? AND state='queued' AND native_id IS NULL AND launcher_task_id IS NULL", nowIso, nowIso, row.id); } catch {}
+            continue;
+          }
+        } catch { /* session store is optional; promotion proceeds */ }
         let bound: any = null;
         try { bound = JSON.parse(row.request_json); } catch { continue; }
         if (!bound || typeof bound !== 'object') continue;
@@ -2142,7 +2210,7 @@ export class FleetService {
         placement: this.placementOverview(),
         subscriptions: this.sql.exec('SELECT * FROM fleet_subscriptions ORDER BY machine_id, service, account').toArray().map((s: any) => ({ machine_id: s.machine_id, account: canonicalAccountLabel(s.account), service: canonicalQuotaProvider(s.service), plan: s.plan, observed_at: s.observed_at, stale: !fresh(s.observed_at, this.now(), 1200000), quota: parsed(s.quota_json),
           harness: [...(routeHarness.get(String(s.machine_id) + ' ' + String(s.account)) ?? [])].sort() })),
-        launches: this.sql.exec('SELECT * FROM fleet_launches ORDER BY created_at DESC LIMIT 200').toArray().map((row: any) => { const { request_json, request_key, claim_key, prompt, model_selection_json, ...view } = row; const selection = parsed(model_selection_json); return { ...view, rejected: row.state === 'queued' ? this.memoryRejections(row.id) : [], model_id: selection?.id ?? null, model: selection?.model ?? null, decision_score: selection?.decision_score ?? null, decision_reason: selection?.decision_reason ?? null, hub_session_id: controlIds.get(row.id) ?? null, access: parsed(request_json).access?.mode || 'legacy_unspecified', admission_hold: ['offered', 'starting', 'running', 'uncertain'].includes(row.state) ? this.admission.heldReason(row) : null }; }) });
+        launches: this.sql.exec('SELECT * FROM fleet_launches ORDER BY created_at DESC LIMIT 200').toArray().map((row: any) => { const { request_json, request_key, claim_key, prompt, model_selection_json, ...view } = row; const selection = parsed(model_selection_json); return { ...view, rejected: ['queued','offered','failed'].includes(row.state) ? this.launchRejections(row) : [], model_id: selection?.id ?? null, model: selection?.model ?? null, decision_score: selection?.decision_score ?? null, decision_reason: selection?.decision_reason ?? null, hub_session_id: controlIds.get(row.id) ?? null, access: parsed(request_json).access?.mode || 'legacy_unspecified', admission_hold: ['offered', 'starting', 'running', 'uncertain'].includes(row.state) ? this.admission.heldReason(row) : null }; }) });
     }
     const revokeMatch = /^\/api\/fleet\/machines\/([A-Za-z0-9_-]{1,64})\/revoke$/.exec(path);
     if (revokeMatch && request.method === 'POST') {
@@ -2908,6 +2976,9 @@ export class FleetService {
               ...(CLAIM_HTTP_SLUGS.has(body.error) ? { hub_error: body.error } : {}),
               ...(body.reason && CLAIM_HTTP_SLUGS.has(body.reason) ? { hub_reason: body.reason } : {}),
               retryable: row.state === 'offered' && !row.native_id && !row.launcher_task_id && status === 409 && RETRYABLE_CLAIM_ERRORS.has(body.error) };
+            // Intake bcecb55c AC3: surface the refusal reason in rejected[] so
+            // a fresh-admission refusal cannot sit silent on an offered launch.
+            try { this.recordClaimRefusal(row, String((body as any).error || '')); } catch {}
             // A racing post-start attempt must not overwrite native failure proof.
             if (row.state === 'offered' && !row.native_id && !row.launcher_task_id) {
               this.sql.exec('UPDATE fleet_launches SET launch_error_json = ? WHERE id = ?', JSON.stringify(diagnostic), row.id);
@@ -2918,6 +2989,14 @@ export class FleetService {
           if (claimKey !== undefined && (typeof claimKey !== 'string' || !CLAIM_KEY.test(claimKey))) return refuse({ error: 'invalid_claim' }, 400);
           const replay = typeof claimKey === 'string' && row.claim_key === claimKey && row.state === 'starting' && !row.native_id && !row.launcher_task_id;
           if (row.state !== 'offered' && !replay) return refuse({ error: 'already_claimed' }, 409);
+          // Intake bcecb55c AC2: a session cancelled first fences later
+          // placement. The session cancel transaction retires the fleet row
+          // atomically, but a fleet row that somehow still reads offered
+          // (e.g. raced promotion) must not start under a cancelled intent.
+          try {
+            const sess: any = this.sql.exec('SELECT state FROM session_control_sessions WHERE fleet_launch_id = ?', row.id).toArray()[0];
+            if (sess && sess.state === 'cancelled') return refuse({ error: 'already_claimed' }, 409);
+          } catch { /* session store is optional; the state check below still applies */ }
           // Policy also fences effect-free starting claim replays before native start.
           if (modelDisabledByPolicy(parsed(row.model_selection_json)) || modelDisabledByPolicy(row.engine)) return refuse({ error: 'model_disabled_by_policy' }, 409);
           // A delayed first start must still have current edit authority,
