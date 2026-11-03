@@ -10,7 +10,7 @@ tool('repos_show', 'GET', '/api/repos/{name}', 'Repository metadata and canonica
 tool('repos_edit', 'PATCH', '/api/repos/{name}', 'Operator-only human fields: payload label, aliases, purpose, stack, key_folders, urls. Refresh never overwrites these.', ['repos edit']);
 tool('status', 'GET', '/api/status', 'Authorized status; query accepts since, task, project, host, after, limit.', ['status']);
 tool('machines_available', 'GET', '/api/machines/available', 'List available machines.', ['machines available']);
-tool('fleet', 'GET', '/api/fleet', 'Fleet machines, native sessions, agents, accounts and launch lineage. Sessions are keyset-paged (sessions_limit default 100 max 500, follow sessions_cursor_next; duplicate tags safe via native_id tie-break); sections=machines,routes,... returns a subset.', ['fleet']);
+tool('fleet', 'GET', '/api/fleet', 'Fleet machines, native sessions, agents, accounts and launch lineage. Sessions paged (sessions_limit/cursor); sections= subsets.', ['fleet']);
 tool('resources', 'GET', '/api/fleet/resources', 'Resource utilization, placement settings, measured session statistics and recent watchdog reaps.', ['resources']);
 tool('resource_sessions', 'GET', '/api/fleet/resources/sessions', 'Durable per-session resource ledger; query filters project, engine and kind.', []);
 tool('resource_reaps', 'GET', '/api/fleet/resources/reaps', 'Confirmed watchdog reaps with actor, time, reason, freed memory and intake linkage.', []);
