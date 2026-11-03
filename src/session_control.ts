@@ -87,9 +87,8 @@ CREATE INDEX IF NOT EXISTS session_control_wakes_due ON session_control_wakes(st
 CREATE INDEX IF NOT EXISTS session_control_wakes_due_order ON session_control_wakes(state, wake_at_ms, created_at, id);
 CREATE INDEX IF NOT EXISTS session_control_wakes_delivery_order ON session_control_wakes(state, delivered_at, id);
 CREATE INDEX IF NOT EXISTS session_control_wakes_resolution_order ON session_control_wakes(state, updated_at);
-CREATE INDEX IF NOT EXISTS session_control_wakes_resolution_order_v2 ON session_control_wakes(state, updated_at, id);
 CREATE INDEX IF NOT EXISTS session_control_wakes_session ON session_control_wakes(session_id, state);
-CREATE INDEX IF NOT EXISTS session_control_wakes_session_due_order ON session_control_wakes(session_id, state, wake_at_ms, created_at, id);
+CREATE INDEX IF NOT EXISTS intake_queue_wakes_session ON session_control_wakes(session_id,state,wake_at_ms);
 CREATE TABLE IF NOT EXISTS session_control_wake_alerts (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, wake_id TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL, intake_task_id TEXT, created_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS session_control_wake_alerts_session ON session_control_wake_alerts(session_id, created_at);
 `;
@@ -104,13 +103,12 @@ CREATE INDEX IF NOT EXISTS intake_queue_session_task ON session_control_sessions
 CREATE INDEX IF NOT EXISTS session_control_machine_created ON session_control_sessions(machine_id, created_at, id);
 CREATE INDEX IF NOT EXISTS session_control_machine_created_state ON session_control_sessions(machine_id, created_at, id, state);
 CREATE INDEX IF NOT EXISTS session_control_machine_state ON session_control_sessions(machine_id, state, created_at);
-CREATE INDEX IF NOT EXISTS session_control_native_binding ON session_control_sessions(machine_id,
+CREATE INDEX IF NOT EXISTS intake_queue_session_native ON session_control_sessions(machine_id,
   json_extract(CASE WHEN json_valid(binding_json) THEN binding_json ELSE '{}' END,'$.native_id'));
-CREATE INDEX IF NOT EXISTS session_control_running_id ON session_control_sessions(id) WHERE state='running';
+CREATE INDEX IF NOT EXISTS session_control_state ON session_control_sessions(state);
 CREATE INDEX IF NOT EXISTS session_control_live_created ON session_control_sessions(created_at DESC, id DESC) WHERE state IN ('queued','held','offered','starting','running','uncertain');
 CREATE INDEX IF NOT EXISTS session_control_live_actor_created ON session_control_sessions(actor, created_at DESC, id DESC) WHERE state IN ('queued','held','offered','starting','running','uncertain');
 CREATE INDEX IF NOT EXISTS session_control_held_unplaced ON session_control_sessions(created_at, id) WHERE state = 'held' AND fleet_launch_id IS NULL AND binding_json IS NULL;
-CREATE INDEX IF NOT EXISTS session_control_unbound_live_launch ON session_control_sessions(fleet_launch_id) WHERE binding_json IS NULL AND fleet_launch_id IS NOT NULL AND state IN ('queued','held','offered','starting','running','uncertain');
 CREATE TABLE IF NOT EXISTS session_warning_events (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, kind TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL, until_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS session_warning_events_session ON session_warning_events(session_id, created_at);
 CREATE TABLE IF NOT EXISTS session_worktree_episode_notes (subject TEXT NOT NULL, generation INTEGER NOT NULL, intake_id TEXT NOT NULL, PRIMARY KEY(subject, generation, intake_id));
@@ -997,7 +995,7 @@ export class SessionControlService {
   private pendingWakeFor(sessionId: string): any | null {
     try {
       const rows = this.sql.exec(
-        "SELECT * FROM session_control_wakes WHERE session_id = ? AND state = 'pending' AND wake_at_ms > ? ORDER BY wake_at_ms ASC, created_at ASC, id ASC LIMIT 1",
+        "SELECT * FROM session_control_wakes INDEXED BY intake_queue_wakes_session WHERE session_id = ? AND state = 'pending' AND wake_at_ms > ? ORDER BY wake_at_ms ASC, rowid ASC LIMIT 1",
         sessionId, this.now()).toArray() as any[];
       return rows[0] ?? null;
     } catch { return null; }
@@ -1093,7 +1091,7 @@ export class SessionControlService {
     // written to the native recipient inbox. Queue transport alone does not
     // satisfy this receipt.
     let queued: any[] = [];
-    try { queued = this.sql.exec("SELECT * FROM session_control_wakes WHERE state = 'queued' ORDER BY updated_at, id LIMIT 100").toArray() as any[]; }
+    try { queued = this.sql.exec("SELECT * FROM session_control_wakes INDEXED BY session_control_wakes_resolution_order WHERE state = 'queued' ORDER BY updated_at, rowid LIMIT 100").toArray() as any[]; }
     catch { queued = []; }
     for (const wake of queued) {
       try {
@@ -1184,10 +1182,16 @@ export class SessionControlService {
    * the caller so restarts do not repeatedly inspect the same first page. */
   attentionPage(limit = 50, after = ''): { items: any[]; evaluated: string[]; next: string } {
     const size = Math.max(1, Math.min(50, Math.floor(limit)));
-    const rows = this.sql.exec(`SELECT id FROM session_control_sessions INDEXED BY session_control_running_id
-      WHERE state='running' AND id>? ORDER BY id LIMIT ?`, after, size + 1).toArray() as any[];
-    const ids = rows.slice(0, size).map(row => String(row.id));
-    return { items: this.attention(ids), evaluated: ids, next: rows.length > size ? ids[ids.length - 1] : '' };
+    // Reuse the deployed state index's implicit rowid. Old ID cursors are
+    // translated by the session primary key once; new cursors retain rowid
+    // even if the previous page's last session is subsequently removed.
+    const prior = after.startsWith('rowid:') ? Number(after.slice(6)) : after
+      ? Number(this.sql.exec('SELECT rowid AS cursor FROM session_control_sessions WHERE id=?', after).toArray()[0]?.cursor ?? 0) : 0;
+    const cursor = Number.isSafeInteger(prior) && prior >= 0 ? prior : 0;
+    const rows = this.sql.exec(`SELECT id,rowid AS page_rowid FROM session_control_sessions INDEXED BY session_control_state
+      WHERE state='running' AND rowid>? ORDER BY rowid LIMIT ?`, cursor, size + 1).toArray() as any[];
+    const page = rows.slice(0, size), ids = page.map(row => String(row.id));
+    return { items: this.attention(ids), evaluated: ids, next: rows.length > size ? 'rowid:' + page[page.length - 1].page_rowid : '' };
   }
 
   attention(sessionIds?: string[]): any[] {

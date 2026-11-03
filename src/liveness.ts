@@ -19,8 +19,6 @@ CREATE INDEX IF NOT EXISTS liveness_alerts_open ON liveness_alerts (subject_kind
 CREATE INDEX IF NOT EXISTS liveness_alerts_open_kind ON liveness_alerts (subject_kind) WHERE resolved_at IS NULL;
 CREATE INDEX IF NOT EXISTS liveness_alerts_resolved ON liveness_alerts (resolved_at) WHERE resolved_at IS NOT NULL;
 CREATE TABLE IF NOT EXISTS alert_backfill_suppressed (alert_id INTEGER PRIMARY KEY, suppressed_at INTEGER NOT NULL);
-CREATE INDEX IF NOT EXISTS liveness_alerts_open_opened ON liveness_alerts (opened_at) WHERE resolved_at IS NULL;
-CREATE INDEX IF NOT EXISTS liveness_alerts_resolved_opened ON liveness_alerts (opened_at DESC) WHERE resolved_at IS NOT NULL;
 `;
 
 export type Thresholds = { machineStaleS: number; machineOfflineS: number; agentStallS: number; agentToolCallStallS: number; heartbeatStaleS: number; launchStuckS: number };
@@ -403,16 +401,21 @@ export class LivenessService {
   }
 
   alerts(limit = 100, subject?: string) {
-    if (subject !== undefined) return this.sql.exec('SELECT * FROM liveness_alerts WHERE subject = ? ORDER BY resolved_at IS NOT NULL, opened_at DESC LIMIT ?', subject, limit).toArray();
-    // Two indexed partial-index branches instead of one expression sort over
-    // the whole (10k+ row) alert history. Each branch reads at most `limit`
-    // index entries; the true top-N interleaves both, merged in memory.
-    const open = this.sql.exec('SELECT * FROM liveness_alerts WHERE resolved_at IS NULL ORDER BY opened_at DESC LIMIT ?', limit).toArray() as any[];
-    const resolved = this.sql.exec('SELECT * FROM liveness_alerts WHERE resolved_at IS NOT NULL ORDER BY opened_at DESC LIMIT ?', limit).toArray() as any[];
-    return [...open, ...resolved].sort((a, b) =>
+    const take=Math.max(1,Math.min(1000,Math.floor(limit)));
+    // Reuse deployed indexes: adding another history-wide index is itself a
+    // billable migration. Bound candidates before sorting or subject filtering.
+    const open = this.sql.exec('SELECT * FROM liveness_alerts INDEXED BY liveness_alerts_open_kind WHERE resolved_at IS NULL LIMIT 501').toArray() as any[];
+    if(open.length>500) throw new Error('liveness_alert_observation_incomplete');
+    const resolved = this.sql.exec('SELECT * FROM liveness_alerts INDEXED BY liveness_alerts_resolved WHERE resolved_at IS NOT NULL ORDER BY resolved_at DESC,id DESC LIMIT ?',subject===undefined?take:1001).toArray() as any[];
+    const truncated=subject!==undefined && resolved.length>1000;
+    const candidates=[...open,...resolved.slice(0,subject===undefined?take:1000)]
+      .filter(row=>subject===undefined || row.subject===subject);
+    if(!candidates.length && truncated) throw new Error('liveness_alert_observation_incomplete');
+    return candidates.sort((a, b) =>
       ((a.resolved_at !== null ? 1 : 0) - (b.resolved_at !== null ? 1 : 0))
-      || (String(b.opened_at).localeCompare(String(a.opened_at)))
-      || (Number(b.id) - Number(a.id))).slice(0, limit);
+      || (String(b.resolved_at ?? b.opened_at).localeCompare(String(a.resolved_at ?? a.opened_at)))
+      || (Number(b.id) - Number(a.id))).slice(0,take)
+      .map(row=>({...row,...(truncated?{observation_truncated:true}:{})}));
   }
 
   prune(keepDays = 30) {

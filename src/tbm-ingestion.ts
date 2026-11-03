@@ -123,7 +123,8 @@ export function syncTbmFromServerAccounts(sql: SqlStorage, accounts: {account: s
     recordUsageQuota(sql,account,provider,row.quota,at);
     // Read back the shared persisted measurement. Never feed TBM a private
     // latest-only copy that the dashboard cannot see.
-    const stored:any=sql.exec('SELECT quota_json FROM usage_quota_history WHERE account=? AND provider=? AND observed_at_ms=? LIMIT 1',account,provider,at).toArray()[0];
+    const measurements=boundedTbmRows(sql.exec('SELECT account,provider,quota_json FROM usage_quota_history INDEXED BY usage_quota_history_time WHERE observed_at_ms=? LIMIT ?',at,TBM_CONTROL_LIMIT+1).toArray() as any[],TBM_CONTROL_LIMIT,'quota_exact_time');
+    const stored:any=measurements.find(row=>row.account===account && row.provider===provider);
     const quota=stored ? JSON.parse(stored.quota_json) : null;
     if (quota?.status !== 'ok') continue;
     const windows = Object.entries(quota.windows ?? {}).map(([windowName,window]) => ({provider,account,windowName,window}));

@@ -11,7 +11,6 @@ export function initUsageStore(sql: SqlStorage) {
     observed_at_ms INTEGER NOT NULL, quota_json TEXT NOT NULL,
     PRIMARY KEY(account,engine,provider,observed_at_ms))`);
   sql.exec('CREATE INDEX IF NOT EXISTS usage_quota_history_time ON usage_quota_history(observed_at_ms)');
-  sql.exec('CREATE INDEX IF NOT EXISTS usage_quota_history_account_provider_time ON usage_quota_history(account,provider,observed_at_ms)');
   initialized.add(identity);
 }
 export function recordUsageQuota(sql: SqlStorage, account: string, provider: string, quota: any, at: number, prune = true) {

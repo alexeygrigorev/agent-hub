@@ -46,12 +46,12 @@
  * receipt and reads `unknown` — undetectable without host-side poll-failure
  * telemetry, and never penalized.
  *
- * Bounded by construction: every evidence scan is a partial created_at index
- * scan inside a finite age window (proof and failed stops: lookback; live
- * stuck: [now-lookback, now-stuckMs] with index-ordered output, no sort) and
- * nothing here runs on host-polled endpoints; plan() memoizes per machine.
- * COMMAND_CHANNEL_PLAN_SQL is EXPLAIN QUERY PLAN-tested (index used, no temp
- * sort, no bare table scan).
+ * Bounded by construction: existing commands migrate through a durable PK
+ * cursor in 128-row pages. New writes maintain a small derived evidence queue
+ * and one latest proof per host. Evidence queries seek at most 129 rows before
+ * session PK lookups or eligibility filters; incomplete observations remain
+ * unknown and preserve existing incidents. All new indexes are installed on
+ * empty derived tables, never rebuilt over retained command history.
  */
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { effectiveCheckin } from './registry';
@@ -80,57 +80,145 @@ export type CommandChannelHealth = {
   last_channel_proof_at: string | null;
 };
 
-/** Partial indexes keep every evidence scan inside a finite age window; the
- * pending index also satisfies the stuck scan's created_at order (no sort). */
+/** These new tables start empty: installing indexes never rebuilds the
+ * retained command table. Source rows migrate only through bounded PK pages. */
+export const COMMAND_CHANNEL_BACKFILL_LIMIT = 128;
+const EVIDENCE_LIMIT = 128;
 const COMMAND_CHANNEL_SCHEMA = `
-CREATE INDEX IF NOT EXISTS session_control_commands_proof_created_v2 ON session_control_commands(created_at) WHERE state IN ('claimed','acked','refused','uncertain','failed');
-CREATE INDEX IF NOT EXISTS session_control_commands_failed_stops ON session_control_commands(created_at) WHERE kind = 'stop' AND state = 'failed';
-CREATE INDEX IF NOT EXISTS session_control_commands_pending_created ON session_control_commands(created_at) WHERE state IN ('recorded','transported');
+CREATE TABLE IF NOT EXISTS command_channel_projection_state(id INTEGER PRIMARY KEY CHECK(id=1),generation INTEGER NOT NULL,after_id TEXT NOT NULL,complete INTEGER NOT NULL,since_iso TEXT NOT NULL);
+INSERT OR IGNORE INTO command_channel_projection_state VALUES(1,0,'',0,'');
+CREATE TABLE IF NOT EXISTS command_channel_evidence(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,machine_id TEXT NOT NULL,generation INTEGER NOT NULL,bucket TEXT NOT NULL,kind TEXT NOT NULL,created_at TEXT NOT NULL,poll_at TEXT,not_before TEXT);
+CREATE INDEX IF NOT EXISTS command_channel_evidence_host_time ON command_channel_evidence(generation,machine_id,bucket,created_at,id);
+CREATE INDEX IF NOT EXISTS command_channel_evidence_age ON command_channel_evidence(created_at);
+CREATE TABLE IF NOT EXISTS command_channel_proofs(machine_id TEXT NOT NULL,generation INTEGER NOT NULL,command_id TEXT NOT NULL,session_id TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(machine_id,generation));
+CREATE INDEX IF NOT EXISTS command_channel_proofs_command ON command_channel_proofs(generation,command_id);
+CREATE INDEX IF NOT EXISTS command_channel_proofs_generation ON command_channel_proofs(generation);
+CREATE INDEX IF NOT EXISTS command_channel_proofs_session ON command_channel_proofs(generation,session_id);
 `;
+const proofPredicate = (c: string) => `(${c}.state IN ('claimed','acked','refused','uncertain') OR
+  (${c}.state='failed' AND ${c}.claim_token IS NOT NULL AND json_valid(${c}.ack_json)
+    AND json_extract(${c}.ack_json,'$.claim_token')=${c}.claim_token))`;
+const stopPredicate = (c: string) => `(${c}.kind='stop' AND ${c}.state='failed' AND json_valid(${c}.ack_json)
+  AND json_extract(${c}.ack_json,'$.reason')='stop_not_claimed')`;
+const proofUpsert = `ON CONFLICT(machine_id,generation) DO UPDATE SET command_id=excluded.command_id,
+  session_id=excluded.session_id,created_at=excluded.created_at
+  WHERE excluded.created_at>command_channel_proofs.created_at OR
+    (excluded.created_at=command_channel_proofs.created_at AND excluded.command_id>command_channel_proofs.command_id)`;
+const evidenceUpsert = `ON CONFLICT(id) DO UPDATE SET session_id=excluded.session_id,machine_id=excluded.machine_id,
+  generation=excluded.generation,bucket=excluded.bucket,kind=excluded.kind,created_at=excluded.created_at,
+  poll_at=excluded.poll_at,not_before=excluded.not_before
+  WHERE command_channel_evidence.session_id IS NOT excluded.session_id OR command_channel_evidence.machine_id IS NOT excluded.machine_id
+    OR command_channel_evidence.generation IS NOT excluded.generation OR command_channel_evidence.bucket IS NOT excluded.bucket
+    OR command_channel_evidence.kind IS NOT excluded.kind OR command_channel_evidence.created_at IS NOT excluded.created_at
+    OR command_channel_evidence.poll_at IS NOT excluded.poll_at OR command_channel_evidence.not_before IS NOT excluded.not_before`;
+const invalidate = `UPDATE command_channel_projection_state SET generation=generation+1,after_id='',complete=0 WHERE id=1`;
 
 export function ensureCommandChannelSchema(sql: SqlStorage): void {
-  // The partial indexes hang off the session-control command table; fleet-only
-  // boots and fixtures may not have created it yet. Session-control init (or a
-  // later watch cycle) completes the schema.
-  if (!sql.exec("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_control_commands'").toArray().length) return;
+  if (!sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_control_commands'").toArray().length) return;
   for (const stmt of COMMAND_CHANNEL_SCHEMA.split(';')) if (stmt.trim()) sql.exec(stmt);
+  for (const event of ['INSERT','UPDATE']) {
+    const retract = event === 'UPDATE' ? `${invalidate} AND EXISTS(SELECT 1 FROM command_channel_proofs
+      WHERE generation=command_channel_projection_state.generation AND command_id=OLD.id)
+      AND (NOT ${proofPredicate('NEW')} OR OLD.session_id IS NOT NEW.session_id OR OLD.created_at IS NOT NEW.created_at);` : '';
+    sql.exec(`CREATE TRIGGER IF NOT EXISTS command_channel_project_${event.toLowerCase()} AFTER ${event} ON session_control_commands BEGIN
+      ${retract}
+      DELETE FROM command_channel_evidence WHERE id=NEW.id AND NOT(NEW.state IN ('recorded','transported') OR ${stopPredicate('NEW')});
+      INSERT INTO command_channel_evidence
+        SELECT NEW.id,NEW.session_id,s.machine_id,p.generation,
+          CASE WHEN NEW.state IN ('recorded','transported') THEN 'pending' ELSE 'failed_stop' END,
+          NEW.kind,NEW.created_at,NEW.poll_at,NEW.not_before
+        FROM session_control_sessions s CROSS JOIN command_channel_projection_state p
+        WHERE s.id=NEW.session_id AND s.machine_id IS NOT NULL AND p.id=1
+          AND NEW.created_at>=p.since_iso AND (NEW.state IN ('recorded','transported') OR ${stopPredicate('NEW')})
+        ${evidenceUpsert};
+      INSERT INTO command_channel_proofs SELECT s.machine_id,p.generation,NEW.id,NEW.session_id,NEW.created_at
+        FROM session_control_sessions s CROSS JOIN command_channel_projection_state p
+        WHERE s.id=NEW.session_id AND s.machine_id IS NOT NULL AND p.id=1 AND NEW.created_at>=p.since_iso
+          AND ${proofPredicate('NEW')} ${proofUpsert};
+    END`);
+  }
+  sql.exec(`CREATE TRIGGER IF NOT EXISTS command_channel_project_delete AFTER DELETE ON session_control_commands BEGIN
+    ${invalidate} AND EXISTS(SELECT 1 FROM command_channel_proofs WHERE generation=command_channel_projection_state.generation AND command_id=OLD.id);
+    DELETE FROM command_channel_evidence WHERE id=OLD.id;
+  END`);
+  // The deployed UNIQUE(session_id,actor,request_key) autoindex supplies a
+  // singleton existence seek. New sessions without commands cannot restart
+  // the entire migration on their first placement.
+  sql.exec(`CREATE TRIGGER IF NOT EXISTS command_channel_session_move AFTER UPDATE OF machine_id ON session_control_sessions
+    WHEN OLD.machine_id IS NOT NEW.machine_id AND EXISTS(
+      SELECT 1 FROM session_control_commands INDEXED BY sqlite_autoindex_session_control_commands_2 WHERE session_id=NEW.id LIMIT 1)
+    BEGIN ${invalidate}; END`);
+  sql.exec(`CREATE TRIGGER IF NOT EXISTS command_channel_session_delete AFTER DELETE ON session_control_sessions
+    WHEN EXISTS(SELECT 1 FROM command_channel_proofs WHERE generation=(SELECT generation FROM command_channel_projection_state WHERE id=1) AND session_id=OLD.id)
+    BEGIN ${invalidate}; END`);
+}
+
+/** Advance a durable, fair source cursor. Triggers cover writes on either
+ * side of this cursor. Partial migration is unknown, never healthy/unhealthy. */
+function advanceProjection(sql: SqlStorage, since: string): boolean {
+  // The materialization watermark advances once per minute, while health
+  // applies its exact cutoff. Host placement polls cannot write it every call.
+  since = new Date(Math.floor(Date.parse(since) / 60000) * 60000).toISOString();
+  let state: any = sql.exec('SELECT * FROM command_channel_projection_state WHERE id=1').toArray()[0];
+  if (!state) return false;
+  if (since < state.since_iso) {
+    sql.exec(invalidate);
+    state = sql.exec('SELECT * FROM command_channel_projection_state WHERE id=1').toArray()[0];
+  }
+  if (since !== state.since_iso) sql.exec('UPDATE command_channel_projection_state SET since_iso=? WHERE id=1', since);
+  // Prune derived rows only, in bounded ranges. The source is untouched.
+  sql.exec(`DELETE FROM command_channel_evidence WHERE id IN
+    (SELECT id FROM command_channel_evidence WHERE created_at<? LIMIT 64)`, since);
+  sql.exec(`DELETE FROM command_channel_evidence WHERE id IN
+    (SELECT id FROM command_channel_evidence WHERE generation<? LIMIT 64)`, state.generation);
+  sql.exec(`DELETE FROM command_channel_proofs WHERE (machine_id,generation) IN
+    (SELECT machine_id,generation FROM command_channel_proofs WHERE generation<? LIMIT 64)`, state.generation);
+  if (state.complete) return true;
+  const source = sql.exec(`SELECT c.*,s.machine_id AS channel_machine FROM session_control_commands c
+    LEFT JOIN session_control_sessions s ON s.id=c.session_id
+    WHERE c.id>? ORDER BY c.id LIMIT ?`, state.after_id, COMMAND_CHANNEL_BACKFILL_LIMIT + 1).toArray() as any[];
+  const page = source.slice(0, COMMAND_CHANNEL_BACKFILL_LIMIT);
+  for (const row of page) {
+    if (typeof row.channel_machine !== 'string' || row.created_at < since) continue;
+    let ack: any = null;
+    try { ack = JSON.parse(row.ack_json); } catch {}
+    if (['recorded','transported'].includes(row.state) || (row.kind==='stop' && row.state==='failed' && ack?.reason==='stop_not_claimed')) {
+      sql.exec(`INSERT INTO command_channel_evidence VALUES(?,?,?,?,?,?,?,?,?) ${evidenceUpsert}`,
+        row.id,row.session_id,row.channel_machine,state.generation,['recorded','transported'].includes(row.state)?'pending':'failed_stop',
+        row.kind,row.created_at,row.poll_at,row.not_before);
+    }
+    if (['claimed','acked','refused','uncertain'].includes(row.state) || (row.state==='failed' && row.claim_token!==null && ack?.claim_token===row.claim_token))
+      sql.exec(`INSERT INTO command_channel_proofs VALUES(?,?,?,?,?) ${proofUpsert}`,
+        row.channel_machine,state.generation,row.id,row.session_id,row.created_at);
+  }
+  const complete = source.length <= COMMAND_CHANNEL_BACKFILL_LIMIT;
+  sql.exec('UPDATE command_channel_projection_state SET after_id=?,complete=? WHERE id=1', page.at(-1)?.id ?? state.after_id, complete?1:0);
+  return complete;
 }
 
 const ISO = '';
-/** States that are only reachable through a successful claim: channel proof.
- * Inlined as SQL literals (never bound parameters): the partial-index scan
- * requires SQLite to prove the index WHERE clause at planning time. */
-const PROOF_STATES_SQL = "('claimed','acked','refused','uncertain','failed')";
-
-/** The exact evidence queries, exported for EXPLAIN QUERY PLAN tests (review
- * cc84ca6f finding 3): each must stay index-bounded as history grows. */
+/** All machine and eligibility filters follow a bounded evidence prefix.
+ * Session joins are primary-key lookups and cannot scan missing/orphan rows
+ * indefinitely while looking for LIMIT eligible results. */
 export const COMMAND_CHANNEL_PLAN_SQL = {
-  proof: `SELECT MAX(c.created_at) AS p FROM session_control_commands c INDEXED BY session_control_commands_proof_created_v2
-     CROSS JOIN session_control_sessions s ON s.id = c.session_id
-     WHERE c.state IN ${PROOF_STATES_SQL} AND (c.state != 'failed' OR json_extract(c.ack_json, '$.claim_token') = c.claim_token)
-       AND c.created_at >= ? AND s.machine_id = ?`,
-  stuck: `SELECT c.id, c.kind, c.created_at, c.poll_at FROM session_control_commands c INDEXED BY session_control_commands_pending_created
-     CROSS JOIN session_control_sessions s ON s.id = c.session_id
-     WHERE c.state IN ('recorded','transported') AND s.machine_id = ?
-       AND s.state IN ('queued','held','offered','starting','running','uncertain')
-       AND c.created_at <= ? AND c.created_at >= ? AND c.created_at > ?
-       AND (c.not_before IS NULL OR c.not_before <= ?)
-     ORDER BY c.created_at LIMIT 10`,
-  failedStops: `SELECT c.id, c.created_at FROM session_control_commands c INDEXED BY session_control_commands_failed_stops
-     CROSS JOIN session_control_sessions s ON s.id = c.session_id
-     WHERE c.kind = 'stop' AND c.state = 'failed'
-       AND json_extract(c.ack_json, '$.reason') = 'stop_not_claimed'
-       AND c.created_at >= ? AND c.created_at > ?
-       AND +s.machine_id = ?
-     ORDER BY c.created_at DESC LIMIT 10`,
+  proof: `SELECT p.created_at AS p,s.machine_id AS current_machine FROM command_channel_proofs p
+    LEFT JOIN session_control_sessions s ON s.id=p.session_id
+    WHERE p.generation=(SELECT generation FROM command_channel_projection_state WHERE id=1) AND p.created_at>=? AND p.machine_id=?`,
+  stuck: `SELECT c.*,s.state AS session_state,s.machine_id AS current_machine FROM (
+    SELECT * FROM command_channel_evidence INDEXED BY command_channel_evidence_host_time
+    WHERE generation=(SELECT generation FROM command_channel_projection_state WHERE id=1)
+      AND machine_id=? AND bucket='pending' AND created_at<=? AND created_at>=? AND created_at>? AND (? IS NOT NULL)
+    ORDER BY created_at,id LIMIT ${EVIDENCE_LIMIT + 1}) c LEFT JOIN session_control_sessions s ON s.id=c.session_id`,
+  failedStops: `SELECT c.*,s.machine_id AS current_machine FROM (
+    SELECT * FROM command_channel_evidence INDEXED BY command_channel_evidence_host_time
+    WHERE generation=(SELECT generation FROM command_channel_projection_state WHERE id=1)
+      AND created_at>=? AND created_at>? AND machine_id=? AND bucket='failed_stop'
+    ORDER BY created_at DESC,id DESC LIMIT ${EVIDENCE_LIMIT + 1}) c LEFT JOIN session_control_sessions s ON s.id=c.session_id`,
 };
-
-/** Latest claim-or-later command creation time on this host within the
- * lookback window, or null when the host has no recent channel proof. */
 function newestProofAt(sql: SqlStorage, machineId: string, sinceIso: string): string | null {
-  const row = sql.exec(COMMAND_CHANNEL_PLAN_SQL.proof, sinceIso, machineId).toArray()[0];
-  const p = row?.p;
-  return typeof p === 'string' && Number.isFinite(Date.parse(p)) ? p : null;
+  const row: any = sql.exec(COMMAND_CHANNEL_PLAN_SQL.proof, sinceIso, machineId).toArray()[0];
+  if (row && row.current_machine !== machineId) throw new Error('command projection binding changed');
+  return typeof row?.p==='string' && Number.isFinite(Date.parse(row.p)) ? row.p : null;
 }
 
 /** Bounded per-host derivation. `machine` carries at least id,
@@ -158,6 +246,7 @@ export function commandChannelHealth(
   // placement, mirroring the projection fail-open rule (intake 4398ce2a).
   let proof: string | null, stuck: any[], failedStops: any[];
   try {
+    if (!advanceProjection(sql, lookbackCutoff)) return unknown('command channel projection backfill pending');
     proof = newestProofAt(sql, machine.id, lookbackCutoff);
     // A proof older than a stuck command does not supersede it; '' (empty
     // string) sorts before every ISO timestamp when no proof exists.
@@ -167,6 +256,10 @@ export function commandChannelHealth(
     // the created_at order, so the scan stays window-bounded and sort-free.
     stuck = sql.exec(COMMAND_CHANNEL_PLAN_SQL.stuck, machine.id, stuckCutoff, lookbackCutoff, proofFloor, at).toArray() as any[];
     failedStops = sql.exec(COMMAND_CHANNEL_PLAN_SQL.failedStops, lookbackCutoff, proofFloor, machine.id).toArray() as any[];
+    if (stuck.length>EVIDENCE_LIMIT || failedStops.length>EVIDENCE_LIMIT) return unknown('command channel evidence prefix exceeds bounded observation');
+    stuck=stuck.filter(row=>row.current_machine===machine.id && ['queued','held','offered','starting','running','uncertain'].includes(row.session_state)
+      && (row.not_before===null || row.not_before<=at)).slice(0,10);
+    failedStops=failedStops.filter(row=>row.current_machine===machine.id).slice(0,10);
   } catch (e: any) {
     return unknown('command channel evidence unavailable: ' + String(e?.message || e).slice(0, 120));
   }
@@ -216,19 +309,21 @@ export function commandChannelHealth(
 export function watchCommandChannels(sql: SqlStorage, liveness: { setAlert: (kind: string, subject: string, problem: { state: string; detail: string } | null) => unknown }, now: number, thresholds: CommandChannelThresholds = COMMAND_CHANNEL_THRESHOLDS): any[] {
   ensureCommandChannelSchema(sql);
   const notifications: any[] = [];
-  const rows = sql.exec('SELECT id, name, hostname, last_checkin_at, drained FROM machines WHERE revoked_at IS NULL').toArray() as any[];
+  const rows = sql.exec('SELECT id,name,hostname,last_checkin_at,drained,revoked_at FROM machines ORDER BY id LIMIT 129').toArray() as any[];
+  if (rows.length>128) return notifications;
   for (const m of rows) {
+    if (m.revoked_at) continue;
     const health = commandChannelHealth(sql, m, now, thresholds);
     if (health.state === 'unreachable') {
       // Opens on first sight; an existing incident only refreshes its detail
       // (setAlert returns null), so a still-broken host never re-notifies.
       const opened = liveness.setAlert('command_channel', m.id, { state: 'command_channel_unreachable', detail: `${m.name || m.id}: ${health.detail}` });
       if (opened) notifications.push(opened);
-    } else {
+    } else if (health.state === 'ok') {
       const existing: any = sql.exec("SELECT * FROM liveness_alerts WHERE subject_kind = 'command_channel' AND subject = ? AND resolved_at IS NULL", m.id).toArray()[0];
       if (!existing) continue;
-      // Recovered (fresh proof) or unjudgeable (check-in stale or missing
-      // delivery receipt) — host liveness or the Hub transport owns those.
+      // Only complete healthy evidence resolves an incident. A partial
+      // backfill, overflow, stale host or missing receipt remains unknown.
       liveness.setAlert('command_channel', m.id, null);
       if (health.state === 'ok') {
         const recovered = liveness.setAlert('host_recovery', `command_channel:${m.id}`, { state: 'RECOVERED', detail: `${m.name || m.id}: command channel recovered; ${health.detail}; incident ${existing.id}` });

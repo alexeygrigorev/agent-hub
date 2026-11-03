@@ -12,10 +12,15 @@ export type ReservedLaunchContext = {
  * part shared by accountStatus and the bounded page. */
 export type ReservedLaunchEligibility = Pick<ReservedLaunchContext, 'reservation_cutoff' | 'complete_catalogs'>;
 
-export type ReservedLaunchCursor = { state: string; id: string } | null;
+export type ReservedLaunchCursor = { state: string; id: string; rowid?: number } | null;
 
 export function parseReservedLaunchCursor(raw: string | null): ReservedLaunchCursor {
   if (raw === null || raw === '') return null;
+  if (raw.startsWith('v2:')) {
+    const match = /^v2:(offered|running|starting|uncertain):([0-9]+)$/.exec(raw);
+    if (!match || !Number.isSafeInteger(Number(match[2]))) throw new Error('invalid_reserved_launch_cursor');
+    return { state: match[1],id:'',rowid:Number(match[2]) };
+  }
   const sep = raw.indexOf(':');
   if (sep < 1 || sep === raw.length - 1) throw new Error('invalid_reserved_launch_cursor');
   const state = raw.slice(0, sep);
@@ -26,7 +31,7 @@ export function parseReservedLaunchCursor(raw: string | null): ReservedLaunchCur
 }
 
 export function encodeReservedLaunchCursor(cursor: ReservedLaunchCursor): string | null {
-  return cursor ? `${cursor.state}:${cursor.id}` : null;
+  return cursor ? cursor.rowid === undefined ? `${cursor.state}:${cursor.id}` : `v2:${cursor.state}:${cursor.rowid}` : null;
 }
 
 /** The single reserved-eligibility predicate: observed-live natives release,
@@ -57,67 +62,63 @@ export function reservedLaunchPage(
   if (!context.live_ids.length) return { rows: [], raw_count: 0, next_cursor: null };
 
   let hasControlStore = false;
-  let launchIndex = false;
-  try {
-    hasControlStore = sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_control_sessions'").toArray().length > 0;
-  } catch { /* Fleet-only stores have no session-control binding. */ }
-  try {
-    launchIndex = sql.exec("SELECT 1 FROM sqlite_master WHERE type='index' AND name='fleet_launch_account_state_id'").toArray().length > 0;
-  } catch { /* Some query fixtures skip FleetService.init(). */ }
-  const launchIndexHint = launchIndex ? ' INDEXED BY fleet_launch_account_state_id' : '';
-  const hubSessionIdSql = hasControlStore
-    ? `(SELECT h.id FROM session_control_sessions h WHERE h.fleet_launch_id=l.id ORDER BY h.updated_at DESC LIMIT 1)`
-    : 'NULL';
-  // In-flight starts (matching live natives via tag/workspace) do not hold a
-  // second slot: resolve them once per page with the same bounded probe that
-  // accountStatus uses, so the diagnostic agrees exactly with reserved.
-  let inFlightMatchedIds: Set<string> | undefined;
-  try {
-    const natives = sql.exec(`SELECT s.machine_id,s.native_id,s.phase,s.last_activity_at,${INFLIGHT_LAUNCH_ID_SQL} AS inflight_launch_id
-      FROM fleet_sessions s WHERE s.account = ? AND s.phase IN ('starting','running','broken','unknown','uncertain')
-      AND s.machine_id IN (${context.live_ids.map(() => '?').join(',')})`, account, ...context.live_ids).toArray() as any[];
-    inFlightMatchedIds = new Set(
-      natives.map(n => n.inflight_launch_id).filter((id: unknown): id is string => typeof id === 'string' && id.length > 0),
-    );
-  } catch { inFlightMatchedIds = undefined; }
-  const whereCursor = cursor ? 'AND (l.state > ? OR (l.state = ? AND l.id > ?))' : '';
-  const cursorBindings = cursor ? [cursor.state, cursor.state, cursor.id] : [];
-  const rawRows = sql.exec(`SELECT l.id, l.account, l.machine_id, l.state, l.native_id, l.created_at, l.updated_at,
-      ${hubSessionIdSql} AS hub_session_id, s.phase, s.last_activity_at, s.created_at_ms, s.account AS native_account
-    FROM fleet_launches l${launchIndexHint}
-    ${reservationNativeJoinSql(sql)}
-    WHERE l.account = ? AND l.state IN ${ACTIVE_LAUNCH_STATES_SQL}
-      AND EXISTS (SELECT 1 FROM json_each(?) live WHERE live.value=l.machine_id)
-      AND l.updated_at > ? ${whereCursor}
-    ORDER BY l.state, l.id LIMIT ?`, account, JSON.stringify(context.live_ids), context.reservation_cutoff,
-    ...cursorBindings, limit).toArray() as any[];
-  const rows = rawRows.filter(row => isEligibleReservedLaunch(row, context, inFlightMatchedIds))
-    .map(row => ({
-      id: String(row.id),
-      machine: String(row.machine_id),
-      state: String(row.state),
-      native_id: row.native_id ?? null,
-      hub_session_id: row.hub_session_id ?? null,
-      created_at: row.created_at,
-      updated_at: row.updated_at,
-      phase: row.phase ?? null,
-      last_activity_at: row.last_activity_at ?? null,
-      created_at_ms: row.created_at_ms === null || row.created_at_ms === undefined ? null : Number(row.created_at_ms),
-    }));
-  const last = rawRows[rawRows.length - 1];
-  const nextCursor = rawRows.length === limit && last
-    ? encodeReservedLaunchCursor({ state: String(last.state), id: String(last.id) })
-    : null;
-  return { rows, raw_count: rawRows.length, next_cursor: nextCursor };
+  try { hasControlStore = sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_control_sessions'").toArray().length > 0; }
+  catch { /* Fleet-only stores have no session-control binding. */ }
+  if (context.live_ids.length > 64) throw new Error('capacity_observation_limited');
+  const natives = sql.exec(`SELECT machine_id,native_id FROM fleet_sessions INDEXED BY fleet_session_account_phase
+    WHERE account=? AND phase IN ('starting','running','broken','unknown','uncertain') LIMIT 257`,account).toArray() as any[];
+  if (natives.length > 256) throw new Error('capacity_observation_limited');
+  const live = new Set(context.live_ids);
+  const inFlightMatchedIds = new Set<string>();
+  for (const native of natives.filter(row=>live.has(String(row.machine_id)))) {
+    const match = sql.exec(`SELECT ${INFLIGHT_LAUNCH_ID_SQL} AS inflight_launch_id FROM fleet_sessions s
+      WHERE s.machine_id=? AND s.native_id=?`,native.machine_id,native.native_id).toArray()[0] as any;
+    if (typeof match?.inflight_launch_id === 'string') inFlightMatchedIds.add(match.inflight_launch_id);
+  }
+  let after = cursor?.rowid ?? 0;
+  if (cursor && cursor.rowid === undefined) {
+    const legacy = sql.exec('SELECT rowid AS source_rowid FROM fleet_launches WHERE id=? AND account=? AND state=?',cursor.id,account,cursor.state).toArray()[0] as any;
+    if (!legacy) throw new Error('invalid_reserved_launch_cursor');
+    after = Number(legacy.source_rowid);
+  }
+  const candidates: any[] = [];
+  let continuation: ReservedLaunchCursor = null;
+  for (const state of ['offered','running','starting','uncertain']) {
+    if (cursor && state < cursor.state) continue;
+    const page = sql.exec(`SELECT rowid AS source_rowid,id,account,machine_id,state,native_id,created_at,updated_at
+      FROM fleet_launches INDEXED BY fleet_launch_account_state
+      WHERE account=? AND state=? AND rowid>? ORDER BY rowid LIMIT ?`,account,state,cursor?.state === state ? after : 0,limit-candidates.length).toArray() as any[];
+    candidates.push(...page);
+    if (candidates.length === limit) {
+      const last = candidates[candidates.length-1];
+      continuation = { state:String(last.state),id:String(last.id),rowid:Number(last.source_rowid) };
+      break;
+    }
+  }
+  // Hydrate only the bounded source page. The canonical native-incarnation
+  // join and eligibility predicate are unchanged; live/TTL postfilters no
+  // longer force a scan through old reservations before LIMIT applies.
+  const nativeJoin = reservationNativeJoinSql(sql);
+  const rows = candidates.filter(row=>live.has(String(row.machine_id)) && row.updated_at > context.reservation_cutoff)
+    .flatMap(row=>sql.exec(`SELECT l.id,l.account,l.machine_id,l.state,l.native_id,l.created_at,l.updated_at,
+      s.phase,s.last_activity_at,s.created_at_ms,s.account AS native_account
+      FROM fleet_launches l ${nativeJoin} WHERE l.id=?`,row.id).toArray() as any[])
+    .filter(row=>isEligibleReservedLaunch(row,context,inFlightMatchedIds))
+    .map(row=>({ id:String(row.id),machine:String(row.machine_id),state:String(row.state),native_id:row.native_id ?? null,
+      hub_session_id:hasControlStore ? (sql.exec('SELECT id FROM session_control_sessions WHERE fleet_launch_id=? LIMIT 1',row.id).toArray()[0] as any)?.id ?? null : null,
+      created_at:row.created_at,updated_at:row.updated_at,phase:row.phase ?? null,last_activity_at:row.last_activity_at ?? null,
+      created_at_ms:row.created_at_ms == null ? null : Number(row.created_at_ms) }));
+  return { rows,raw_count:candidates.length,next_cursor:encodeReservedLaunchCursor(continuation) };
 }
 
 export function countReservedLaunches(sql: any, account: string, context: ReservedLaunchContext): number {
   let cursor: ReservedLaunchCursor = null;
   let count = 0;
-  while (true) {
+  for (let pageNumber=0;pageNumber<10;pageNumber++) {
     const page = reservedLaunchPage(sql, account, context, 100, cursor);
     count += page.rows.length;
     if (!page.next_cursor) return count;
     cursor = parseReservedLaunchCursor(page.next_cursor);
   }
+  throw new Error('capacity_observation_limited');
 }

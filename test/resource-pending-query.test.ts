@@ -59,7 +59,10 @@ it('bounds reservation reads by active launches while preserving ramp, host and 
     expect(memory.reserved_mb).toBe(6*current.estimate('pending','codex','goal'));
     expect(current.cpuHeadroom('pending-host',input)).toEqual(baseline.cpuHeadroom('pending-host',input));
     expect(current.cpuHeadroom('pending-host',input,'active-offered')).toEqual(baseline.cpuHeadroom('pending-host',input,'active-offered'));
-    expect(work).toHaveLength(3);
+    // Memory visibility seeks each exact active state using the deployed
+    // index; bound the aggregate row work rather than a particular call count.
+    expect(work.length).toBeGreaterThan(0);
+    expect(work.reduce((total, query) => total + query.reads, 0)).toBeLessThan(200);
     for (const query of work) expect(query.reads,query.query).toBeLessThan(100);
     sql.exec("UPDATE fleet_launches SET state='stopped' WHERE id='active-offered'");
     expect(current.headroom('pending-host',input,'codex').reserved_mb).toBe(5*current.estimate('pending','codex','goal'));

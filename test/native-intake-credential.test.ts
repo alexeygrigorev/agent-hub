@@ -55,8 +55,11 @@ describe('native session intake credential', () => {
     expect(cred.access_token).toMatch(/^hubt_/);
     expect(cred.intake_task_id).toBe(task);
     await runInDurableObject<Hub, any>(stub, (h: any) => {
-      const row = h.sql.exec("SELECT scopes FROM credentials WHERE kind='agent' AND revoked_at IS NULL").toArray()[0];
+      const row = h.sql.exec("SELECT scopes,registry_actor,machine_id FROM credentials WHERE kind='agent' AND revoked_at IS NULL").toArray()[0];
       expect(JSON.parse(row.scopes)).toEqual(['bus:read', 'worker:own-intake']);
+      expect(row.registry_actor).toBe('hub-native-workers:native-'+session);
+      const identity=h.sql.exec("SELECT machine_id FROM agents INDEXED BY idx_agents_project_tag_unique WHERE COALESCE(project,'')='hub-native-workers' AND tag=?",'native-'+session).one();
+      expect(identity.machine_id).toBe(row.machine_id);
     });
     // Minted: no longer listed.
     expect(await (await call('/api/session-intake/credentials')).json()).toEqual({ sessions: [] });

@@ -16,16 +16,32 @@ function pool(sql:any,id:string,reset=NOW+600000) {
     VALUES(?,'codex','test',0,0,80,?,?,18000000,0,80,'percent')`,id,reset,NOW);
 }
 
+const forbiddenIndexes=['tbm_terminal_candidates','tbm_session_created','tbm_command_ack','tbm_reward_unknown_sessions','usage_quota_history_account_provider_time'];
+function dropNewLargeIndexes(sql:any) { for(const name of forbiddenIndexes)sql.exec('DROP INDEX IF EXISTS '+name); }
+function newLargeIndexes(sql:any) {
+  return sql.exec(`SELECT name FROM sqlite_master WHERE type='index' AND name IN (${forbiddenIndexes.map(()=>'?').join(',')})`,...forbiddenIndexes).toArray();
+}
+
 describe('bounded TBM background maintenance',()=>{
-  it('installs session indexes after routing created the earlier core schema receipt',async()=>{
-    const stub=(env as any).HUB.get((env as any).HUB.idFromName('tbm-index-init-'+crypto.randomUUID()));
-    await(runInDurableObject as any)(stub,(_hub:any,state:any)=>{
-      const sql=state.storage.sql;
-      expect(sql.exec("SELECT value FROM tbm_maintenance_cursor WHERE key='schema_version'").one().value).toBe('2');
-      const indexes=sql.exec("SELECT name FROM sqlite_master WHERE type='index' AND name IN ('tbm_terminal_candidates','tbm_session_created','tbm_command_ack')").toArray();
-      expect(indexes.map((row:any)=>row.name).sort()).toEqual(['tbm_command_ack','tbm_session_created','tbm_terminal_candidates']);
-    });
-  });
+  it('reuses deployed session/reward indexes without building new indexes over retained data',()=>fixture((_hub,sql)=>{
+    dropNewLargeIndexes(sql);
+    const old=new Date(NOW-2*DAY).toISOString();
+    sql.exec(`WITH RECURSIVE n(i) AS(SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1100)
+      INSERT INTO session_control_sessions(id,actor,request_key,request_json,engine,mode,state,created_at,updated_at)
+      SELECT 'legacy-'||i,'test','legacy-'||i,'{}','codex','interactive','stopped',?,? FROM n`,old,old);
+    sql.exec(`INSERT INTO tbm_reward_events(event_id,timestamp_ms,pool_id,intake_task_id,active_mode,swarm_concurrency,
+      useful_work_reward,pacing_error_penalty,floor_breach_penalty,engine_mix_penalty,waste_at_reset_penalty,banked_waste_penalty,
+      net_reward,token_efficiency_eta,tokens_known,tokens_burned,session_id,event_kind)
+      SELECT 'session:'||id,?,'codex:legacy:5h','fixture','high',1,0,0,0,0,0,0,0,0,1,1,id,'session' FROM session_control_sessions`,NOW-2*DAY);
+    const meter=new RowsMeter(()=>NOW),tracked=meter.wrap(sql);
+    ensureTbmControllerSchema(tracked);
+    pool(sql,'codex:legacy:5h');
+    meter.runSync('legacy_tick',()=>tickTbm(tracked,NOW));
+    expect(meter.snapshot().legacy_tick.rows_read).toBeLessThan(1000);
+    expect(newLargeIndexes(sql)).toEqual([]);
+    const existing=sql.exec("SELECT name FROM sqlite_master WHERE type='index' AND name IN ('session_control_created','idx_reward_timestamp','session_message_order')").toArray();
+    expect(existing).toHaveLength(3);
+  }));
 
   it('refuses incomplete session-mix observations before publishing healthy aggregate metrics',()=>fixture((_hub,sql)=>{
     pool(sql,'codex:test:5h');
@@ -42,6 +58,7 @@ describe('bounded TBM background maintenance',()=>{
   }));
 
   it('pages raw terminal sessions before checking reward existence, independent of rewarded history',()=>fixture((_hub,sql)=>{
+    dropNewLargeIndexes(sql);
     const at=new Date(NOW-2*DAY).toISOString();
     sql.exec(`WITH RECURSIVE n(i) AS(SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<2000)
       INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,created_at,updated_at)
@@ -52,6 +69,7 @@ describe('bounded TBM background maintenance',()=>{
       SELECT 'session:'||id,?,'codex:test','fixture','high',1,0,0,0,0,0,0,0,0,1,1,id,'session' FROM session_control_sessions`,NOW-2*DAY);
     const meter=new RowsMeter(()=>NOW),tracked=meter.wrap(sql);
     const first=meter.runSync('sweep',()=>sweepTerminalSessionRewards(tracked,NOW));
+    expect(newLargeIndexes(sql)).toEqual([]);
     expect(first.written).toBe(0);
     expect(meter.snapshot().sweep.rows_read).toBeLessThan(500);
     const before=String(sql.exec("SELECT value FROM tbm_maintenance_cursor WHERE key='terminal_session'").one().value);

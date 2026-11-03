@@ -115,8 +115,8 @@ export class ChecksService {
     this.sql.exec("CREATE INDEX IF NOT EXISTS hub_check_slots_retry_due ON hub_check_slots(lease_until,name) WHERE state!='done'");
     // Bound candidate visits before testing expiry; an expired backlog must
     // never force a whole-history scan just to discover a live overdue row.
-    this.sql.exec('CREATE INDEX IF NOT EXISTS messages_check_pending_created ON messages(created_at,to_actor,expires_at,registry_unbound_to) WHERE acked_at IS NULL');
-    this.sql.exec('CREATE INDEX IF NOT EXISTS messages_check_actor_pending_created ON messages(to_actor,created_at,expires_at,registry_unbound_to) WHERE acked_at IS NULL');
+    // Reuse deployed message indexes; building a new pending index would
+    // rewrite the retained message table during incident recovery.
     // Seed defaults once; an operator who later removes every check keeps an empty list.
     if (!this.sql.exec("SELECT 1 FROM hub_meta WHERE key = 'checks_seeded'").toArray().length) {
       if (!Number(this.sql.exec('SELECT COUNT(*) AS n FROM hub_checks').one().n)) this.replace(DEFAULT_CHECKS.map(c => (validateCheck(c) as any).row));
@@ -262,10 +262,14 @@ export class ChecksService {
   }
 
   private overdueCandidates(cutoff: number, actor?: string): { rows: any[]; truncated: boolean } {
-    const candidates = this.sql.exec(`SELECT to_actor,expires_at,registry_unbound_to FROM messages
-      WHERE acked_at IS NULL AND created_at < ? ${actor ? 'AND to_actor = ?' : ''}
-      ORDER BY created_at LIMIT 1001`, cutoff, ...(actor ? [actor] : [])).toArray() as any[];
-    return { rows: candidates.slice(0,1000).filter(row => Number(row.expires_at) > this.now()), truncated: candidates.length > 1000 };
+    const candidates = (actor
+      ? this.sql.exec(`SELECT to_actor,created_at,expires_at,acked_at,registry_unbound_to FROM messages INDEXED BY messages_recipient_seq
+          WHERE to_actor=? ORDER BY recipient_seq DESC LIMIT 1001`, actor)
+      : this.sql.exec(`SELECT to_actor,created_at,expires_at,acked_at,registry_unbound_to FROM messages INDEXED BY messages_expires_at
+          WHERE expires_at>? ORDER BY expires_at LIMIT 1001`, this.now())).toArray() as any[];
+    return { rows: candidates.slice(0,1000).filter(row => row.acked_at === null && Number(row.created_at) < cutoff && Number(row.expires_at) > this.now()),
+      truncated: candidates.length > 1000 };
+
   }
 
   private async evaluate(check: any, deps: ActionDeps): Promise<CheckResult> {
@@ -301,7 +305,7 @@ export class ChecksService {
         const cutoff = this.now() - p.max_age_s * 1000;
         const { rows, truncated } = this.overdueCandidates(cutoff, p.actor);
         const n = rows.length;
-        if (truncated) return { status: n ? 'fail' : 'error', detail: `inbox inspection bounded to 1000 pending messages; ${n} overdue in sample for ${p.actor}; backlog truncated` };
+        if (truncated) return { status: n ? 'fail' : 'error', detail: `inbox inspection bounded to 1000 message candidates; ${n} overdue in sample for ${p.actor}; backlog truncated` };
         return n ? { status: 'fail', detail: `${n} unacknowledged message(s) for ${p.actor} older than ${p.max_age_s}s` } : { status: 'pass', detail: `inbox of ${p.actor} is current` };
       }
       case 'delivery_slo': {
@@ -315,14 +319,14 @@ export class ChecksService {
           grouped.set(row.to_actor, value);
         }
         const recipients = [...grouped.values()].sort((a,b) => b.n-a.n || a.actor.localeCompare(b.actor)).slice(0,20);
-        if (truncated && !recipients.length) return { status: 'error', detail: 'delivery SLO inspection bounded to 1000 pending messages; expired backlog truncated, live overdue count unknown' };
+        if (truncated && !recipients.length) return { status: 'error', detail: 'delivery SLO inspection bounded to 1000 live message candidates; backlog truncated, overdue count unknown' };
         if (!recipients.length) return { status: 'pass', detail: `delivery SLO met (${maxAgeS}s limit)` };
         const count = rows.length;
         const more = grouped.size - recipients.length;
         const noReader = recipients.filter(r => Number(r.unbound) > 0 || !inboxReaderStatus(this.sql, r.actor, this.now()).active_reader);
         const detail = `${count} unacknowledged message(s) older than ${maxAgeS}s (delivery SLO violated); ` +
           recipients.map(r => `${r.actor}: ${r.n} overdue${Number(r.unbound) ? `, ${r.unbound} registry-unbound` : ''}`).join('; ') + (more ? `; +${more} more recipients (top 20 shown)` : '');
-        const summary = (noReader.length ? 'NO_READER: ' + noReader.map(r => r.actor).join(', ') + '; ' : '') + detail + (truncated ? '; sample of first 1000 pending messages; backlog truncated, total unknown' : '');
+        const summary = (noReader.length ? 'NO_READER: ' + noReader.map(r => r.actor).join(', ') + '; ' : '') + detail + (truncated ? '; sample of first 1000 message candidates; backlog truncated, total unknown' : '');
         const bytes = new TextEncoder().encode(summary);
         return { status: 'fail', detail: bytes.byteLength <= 12000 ? summary :
           new TextDecoder().decode(bytes.subarray(0, 11900)) + '; further labels omitted; inspect bus backlog' };

@@ -209,6 +209,64 @@ describe('durable daily SQL row circuit breaker', () => {
     expect(nativeList).not.toHaveBeenCalled();
   });
 
+  it('refunds only idle unused credit so repeated orderly cold starts retain actual daily spending', async () => {
+    const store = new MemoryStore();
+    for (let i=0;i<10;i++) {
+      const budget = new RowBudget(store,()=>0,LIMITS,CHUNK);
+      await budget.begin();
+      budget.wrap(nativeSql(0,0,1) as any).exec('UPDATE bounded');
+      expect(await budget.releaseUnused()).toBe(true);
+      expect(budget.status().available).toEqual({read:0,written:0});
+      // SQL requires a new durable preflight after the release.
+      expect(()=>budget.wrap(nativeSql(0) as any).exec('SELECT 1')).toThrow(RowBudgetExceeded);
+    }
+    const last = [...store.data.values()][0] as any;
+    expect(last.written).toBe(30); // per start: reservation + actual write + refund
+    expect(last.read).toBe(10); // one ledger load per start; unused reads refunded
+    expect(last.stopped).toBe(false);
+  });
+
+  it('keeps actual SQL spending despite rollback and never reopens a stopped day', async () => {
+    const store = new MemoryStore();
+    const budget = new RowBudget(store,()=>0,LIMITS,CHUNK);
+    await budget.begin();
+    try { budget.wrap(nativeSql(0,0,4) as any).exec('UPDATE rollback'); throw new Error('application rollback'); } catch {}
+    await budget.releaseUnused();
+    expect((([...store.data.values()][0]) as any).written).toBe(6);
+    await budget.begin();
+    expect(()=>budget.wrap(nativeSql(0,0,70) as any).exec('UPDATE overshoot')).toThrow(RowBudgetExceeded);
+    await budget.finish();
+    await budget.releaseUnused();
+    await expect(new RowBudget(store,()=>0,LIMITS,CHUNK).begin()).rejects.toThrow(RowBudgetExceeded);
+  });
+
+  it('rechecks quiet eligibility after queued operations so new activity cancels a pending refund', async () => {
+    const store = new MemoryStore();
+    let quiet = true;
+    const budget = new RowBudget(store,()=>0,LIMITS,CHUNK);
+    const begin = budget.begin();
+    const refund = budget.releaseUnused(()=>quiet);
+    quiet = false;
+    await begin;
+    expect(await refund).toBe(false);
+    expect(store.writes).toBe(1);
+    expect(budget.status().available).toEqual(CHUNK);
+  });
+
+  it('retains the old reservation and fails closed if an idle checkpoint cannot persist', async () => {
+    const store = new MemoryStore();
+    const budget = new RowBudget(store,()=>0,LIMITS,CHUNK);
+    await budget.begin();
+    const before = budget.status().reserved;
+    store.put = vi.fn(async()=>{throw new Error('checkpoint unavailable');});
+    await expect(budget.releaseUnused()).rejects.toThrow('checkpoint unavailable');
+    expect(budget.status().reserved).toEqual(before);
+    expect(budget.status().available).toEqual(CHUNK);
+    expect(await budget.releaseUnused()).toBe(false);
+    await expect(budget.begin()).rejects.toThrow(RowBudgetExceeded);
+    expect(store.put).toHaveBeenCalledTimes(1);
+  });
+
   it('refuses corrupt persisted counters and clamps configured limits to free-plan safety ceilings', async () => {
     const store = new MemoryStore();
     store.data.set('cf_daily_row_budget_v1', { day: 0, read: -1, written: 0, stopped: false });

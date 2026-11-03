@@ -205,7 +205,7 @@ function seedFleetSessions(sql: any, n: number) {
 }
 
 const fleetPageShape = (hub: Hub) =>
-  (hub.sql.exec('EXPLAIN QUERY PLAN SELECT * FROM fleet_sessions WHERE (machine_id, tag, native_id) > (?, ?, ?) ORDER BY machine_id, tag, native_id LIMIT ?', 'fleetm0', 'tag-0001', 'nat-00001', 51).toArray() as any[]).map(r => String(r.detail)).join(' | ');
+  (hub.sql.exec('EXPLAIN QUERY PLAN SELECT * FROM fleet_sessions WHERE (machine_id,native_id) > (?,?) ORDER BY machine_id,native_id LIMIT ?', 'fleetm0', 'nat-00001', 51).toArray() as any[]).map(r => String(r.detail)).join(' | ');
 
 describe('fleet sessions are keyset-paged with a small default page', () => {
   it('serves a bounded default page and walks every row exactly once', withHub(async (hub: Hub, state: DurableObjectState) => {
@@ -257,7 +257,7 @@ describe('fleet sessions are keyset-paged with a small default page', () => {
     seedFleetSessions(hub.sql, 30);
     const svc = new FleetService(hub.sql, (cb: any) => cb(), () => Date.now());
     expect(fleetPageShape(hub)).not.toMatch(/SCAN fleet_sessions(?! USING)/);
-    expect(fleetPageShape(hub)).toMatch(/USING .*INDEX fleet_session_page/);
+    expect(fleetPageShape(hub)).toMatch(/USING .*INDEX sqlite_autoindex_fleet_sessions_1/);
     expect(fleetPageShape(hub)).toMatch(/SEARCH/);
     // No version primitive in this runtime (see server note): every read is
     // a fresh 200; If-None-Match is ignored rather than risking stale 304s.

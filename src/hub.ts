@@ -691,7 +691,37 @@ export class Hub extends DurableObject {
   /** Every native event passes through this gate, including WebSocket events.
    * No SQL alert/meter flush is permitted after exhaustion: the budget logs
    * once, and deleting the alarm prevents runtime/background retry storms. */
+  private budgetActiveEvents = 0;
+  private budgetActivityEpoch = 0;
+  private budgetRefundTimer: ReturnType<typeof setTimeout> | undefined;
+
+  private cancelBudgetRefund(): void {
+    if (this.budgetRefundTimer !== undefined) clearTimeout(this.budgetRefundTimer);
+    this.budgetRefundTimer = undefined;
+  }
+
+  /** One quiet checkpoint, never an alarm or per-request write. Frequent
+   * host polling cancels the timer and retains its shared reservation. The
+   * pending timer keeps the DO alive; waitUntil covers only the checkpoint
+   * once it actually fires, not twenty seconds of every event's idle time. */
+  private scheduleBudgetRefund(delayMs = 20_000): void {
+    this.cancelBudgetRefund();
+    const epoch = this.budgetActivityEpoch;
+    this.budgetRefundTimer = setTimeout(() => {
+      this.budgetRefundTimer = undefined;
+      const checkpoint = (async () => {
+        try {
+          await this.rowBudget.releaseUnused(() => this.budgetActiveEvents === 0 && this.budgetActivityEpoch === epoch);
+        } catch { console.error('do_daily_row_budget_idle_checkpoint_failed'); }
+      })();
+      this.ctx.waitUntil(checkpoint);
+    },delayMs);
+  }
+
   protected async budgeted<T>(fn: () => Promise<T>, exhausted: T): Promise<T> {
+    this.budgetActiveEvents++;
+    this.budgetActivityEpoch++;
+    this.cancelBudgetRefund();
     try {
       if (!this.initializationComplete) {
         await this.rowBudget.begin(true);
@@ -712,6 +742,10 @@ export class Hub extends DurableObject {
     } finally {
       try { await this.rowBudget.finish(); }
       catch { console.error('do_daily_row_budget_checkpoint_failed'); await this.ctx.storage.deleteAlarm(); }
+      finally {
+        this.budgetActiveEvents--;
+        if (this.budgetActiveEvents === 0) this.scheduleBudgetRefund();
+      }
     }
   }
 
@@ -1243,7 +1277,7 @@ export class Hub extends DurableObject {
         const now = Date.now();
         if (path === '/api/session-messaging/credentials' && request.method === 'GET') {
           return this.ctx.storage.transactionSync(() => {
-            const tables = ['agents', 'session_control_sessions', 'credentials'];
+            const tables = ['agents', 'session_control_sessions'];
             const changed = this.credentialSweepChanged('messaging-credential', ...tables);
             const sessions = pollSessionCredentials(this.sql, caller.machineId, now, changed !== null);
             if (changed !== null) this.credentialSweepDone('messaging-credential', ...tables);

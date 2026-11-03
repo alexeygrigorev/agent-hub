@@ -369,14 +369,14 @@ it('query plans use the new indexes on the high-volume lookups', withFleet(async
   expect(plan(`SELECT 1 FROM worker_access w JOIN credentials c ON c.family_id=w.family_id
     WHERE w.session_id=? AND c.revoked_at IS NULL LIMIT 1`, 'h0')).toContain('worker_access_session_family');
   expect(plan(`SELECT * FROM session_control_wakes WHERE session_id=? AND state='pending'
-    ORDER BY wake_at_ms, created_at, id LIMIT 1`, 'sess'))
-    .toContain('session_control_wakes_session_due_order');
+    ORDER BY wake_at_ms, rowid LIMIT 1`, 'sess'))
+    .toContain('intake_queue_wakes_session');
   expect(plan(`SELECT s.id FROM session_control_sessions s JOIN session_control_protections p ON p.session_id=s.id
     WHERE s.machine_id=? AND json_extract(CASE WHEN json_valid(s.binding_json) THEN s.binding_json ELSE '{}' END,'$.native_id')=? LIMIT 1`, 'h0', 'native'))
     .toMatch(/USING INDEX (?:session_control_native_binding|intake_queue_session_native)/);
-  expect(plan(`SELECT quota_json FROM usage_quota_history
-    WHERE account=? AND provider=? AND observed_at_ms=? LIMIT 1`, 'a0', 'codex', now))
-    .toContain('usage_quota_history_account_provider_time');
+  expect(plan(`SELECT account,provider,quota_json FROM usage_quota_history INDEXED BY usage_quota_history_time
+    WHERE observed_at_ms=? LIMIT 129`, now))
+    .toContain('usage_quota_history_time');
   expect(plan(`SELECT account,provider,observed_at_ms,quota_json FROM usage_quota_history
     WHERE observed_at_ms>=? AND observed_at_ms<=? ORDER BY observed_at_ms LIMIT 4096`, now - 15 * 60_000, now))
     .toContain('usage_quota_history_time');

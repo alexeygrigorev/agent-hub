@@ -104,7 +104,7 @@ export function memoryVerdict(available: number | null, ramp: number | null, est
 // re-parsing whole retained prompts per session. Invalid JSON passes through
 // unchanged and still parses as an empty request.
 const SLIM_REQUEST = `CASE WHEN json_valid(request_json) THEN json_object('intake_task_id', json_extract(request_json, '$.intake_task_id')) ELSE request_json END`;
-// Matches session_control_native_binding exactly (src/session_control.ts).
+// Matches the existing intake_queue_session_native index exactly.
 // The caller binds only native-id strings, so non-text JSON values cannot
 // match and need no per-row json_type guard in the indexed expression.
 const NATIVE_KEY = `json_extract(CASE WHEN json_valid(binding_json) THEN binding_json ELSE '{}' END, '$.native_id')`;
@@ -221,8 +221,6 @@ export class ResourceManagement {
   private cpuPendingSnapshot: Map<string, {id:string;remaining:number}[]> | null = null;
   init() {
     for (const statement of RESOURCE_SCHEMA.split(';')) if (statement.trim()) this.sql.exec(statement);
-    if (this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='fleet_launches'").toArray().length)
-      this.sql.exec("CREATE INDEX IF NOT EXISTS resource_launch_pending ON fleet_launches(machine_id,state,id) WHERE state IN ('offered','starting','running','uncertain')");
     for (const table of ['session_resource_usage', 'session_cpu_usage', 'resource_settings']) {
       for (const op of ['INSERT', 'UPDATE', 'DELETE']) {
         const sides = op === 'INSERT' ? ['NEW'] : op === 'DELETE' ? ['OLD'] : ['OLD', 'NEW'];
@@ -476,13 +474,21 @@ export class ResourceManagement {
     const inFlightCutoff = new Date(now - IN_FLIGHT_RESERVE_SECONDS * 1000).toISOString();
     // Only launch ramps are additional commitments. Resident usage is already in MemAvailable.
     // The explicit state range lets SQLite skip retained terminal history.
-    const candidates = this.readRows(`SELECT l.id,l.engine,l.workspace,l.state,l.created_at,
-      ${resourceRequest('fleet_launches','l.id','l.request_json')} AS request_json,r.resident_mb,p.started_at AS ramp_started_at
-      FROM fleet_launches l INDEXED BY resource_launch_pending
-      LEFT JOIN resource_resident_samples r ON r.launch_id=l.id AND r.observed_at>=?
-      LEFT JOIN resource_ramps p ON p.launch_id=l.id
-      WHERE l.state IN ('offered','starting','running','uncertain') AND l.machine_id=? LIMIT ?`,
-      cutoff, machine, MEMORY_PENDING_SCAN_LIMIT + 1) as any[];
+    const candidates: any[] = [];
+    // The deployed machine/state index already includes rowid ordering.
+    // Seek each exact state separately: an IN + ORDER rowid can sort/walk
+    // the whole active population before LIMIT. The combined source prefix
+    // never exceeds one overflow sentinel beyond the admission bound.
+    for (const state of ['offered','starting','running','uncertain']) {
+      const remaining = MEMORY_PENDING_SCAN_LIMIT + 1 - candidates.length;
+      if (remaining <= 0) break;
+      candidates.push(...this.readRows(`SELECT l.id,l.engine,l.workspace,l.state,l.created_at,
+        ${resourceRequest('fleet_launches','l.id','l.request_json')} AS request_json,r.resident_mb,p.started_at AS ramp_started_at
+        FROM fleet_launches l INDEXED BY fleet_launch_machine_state
+        LEFT JOIN resource_resident_samples r ON r.launch_id=l.id AND r.observed_at>=?
+        LEFT JOIN resource_ramps p ON p.launch_id=l.id
+        WHERE l.machine_id=? AND l.state=? ORDER BY l.rowid LIMIT ?`, cutoff, machine, state, remaining));
+    }
     const overflow = candidates.length > MEMORY_PENDING_SCAN_LIMIT;
     if (overflow) return { mem_available_mb: finite(hb.mem_avail_mb) ? hb.mem_avail_mb : null,
       reserved_mb: null, floor_mb: effectiveFloorMb(config, hb.mem_total_mb), requested_mb: null,

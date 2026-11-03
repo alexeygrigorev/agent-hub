@@ -170,6 +170,41 @@ describe('CF runaway alarm regression', () => {
     expect(raw.exec("SELECT state FROM session_control_wakes WHERE id='due-wake'").toArray()[0].state).toBe('pending');
   }));
 
+  it('uses deployed wake indexes without sorting a large equal-time queue', () => withHub(async (hub, state) => {
+    const raw = state.storage.sql, now = Date.now(), at = new Date(now).toISOString(), future = new Date(now + 3600000).toISOString();
+    raw.exec(`WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<3000)
+      INSERT INTO session_control_wakes(id,session_id,actor,request_key,wake_at_ms,wake_at,prompt,state,created_at,updated_at)
+      SELECT 'queued-'||i,'no-session','test','queued-'||i,?,?,'resume','queued',?,? FROM n`, now + 3600000, future, at, at);
+    const before = hub.meter.snapshot()['probe:deployed-wake-queue']?.rows_read ?? 0;
+    hub.meter.runSync('probe:deployed-wake-queue', () => hub.sessionControlService.processDueWakes());
+    expect((hub.meter.snapshot()['probe:deployed-wake-queue']?.rows_read ?? 0) - before).toBeLessThan(350);
+    const queuedPlan = plan(hub, "SELECT * FROM session_control_wakes INDEXED BY session_control_wakes_resolution_order WHERE state='queued' ORDER BY updated_at,rowid LIMIT 100");
+    expect(queuedPlan).toContain('session_control_wakes_resolution_order');
+    expect(queuedPlan).not.toMatch(/TEMP B-TREE/);
+    const pendingPlan = plan(hub, "SELECT * FROM session_control_wakes INDEXED BY intake_queue_wakes_session WHERE session_id=? AND state='pending' AND wake_at_ms>? ORDER BY wake_at_ms,rowid LIMIT 1", 's', now);
+    expect(pendingPlan).not.toMatch(/TEMP B-TREE/);
+  }));
+
+  it('pages attention through deployed state/rowid ordering over retained session history', () => withHub(async (hub, state) => {
+    const raw = state.storage.sql, at = new Date().toISOString();
+    raw.exec(`WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<5000)
+      INSERT INTO session_control_sessions(id,actor,request_key,request_json,engine,mode,state,created_at,updated_at)
+      SELECT 'retained-'||i,'retained','retained-'||i,'{}','codex','interactive','stopped',?,? FROM n`, at, at);
+    for (let i = 0; i < 120; i++) raw.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,engine,mode,state,created_at,updated_at)
+      VALUES(?,'page-rowid',?,'{}','codex','interactive','running',?,?)`, 'page-rowid-' + i, 'page-rowid-' + i, at, at);
+    hub.sessionControlService.attention = () => [];
+    const before = hub.meter.snapshot()['probe:deployed-attention']?.rows_read ?? 0;
+    const first = hub.meter.runSync('probe:deployed-attention', () => hub.sessionControlService.attentionPage(50));
+    expect((hub.meter.snapshot()['probe:deployed-attention']?.rows_read ?? 0) - before).toBeLessThan(130);
+    expect(first.evaluated).toHaveLength(50);
+    expect(first.next).toMatch(/^rowid:/);
+    const legacy = hub.sessionControlService.attentionPage(50, first.evaluated[49]);
+    expect(legacy.evaluated[0]).toBe('page-rowid-50');
+    raw.exec('DELETE FROM session_control_sessions WHERE id=?', first.evaluated[49]);
+    expect(hub.sessionControlService.attentionPage(50, first.next).evaluated[0]).toBe('page-rowid-50');
+    expect(plan(hub, "SELECT id,rowid FROM session_control_sessions INDEXED BY session_control_state WHERE state='running' AND rowid>? ORDER BY rowid LIMIT 51", 0)).not.toMatch(/TEMP B-TREE/);
+  }));
+
   it('pages idle recovery without clearing episodes outside the evaluated page', () => withHub(async (hub, state) => {
     const at = new Date().toISOString();
     const fixture = state.storage.sql;

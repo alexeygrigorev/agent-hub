@@ -85,7 +85,7 @@ export function initProjectionLinkRefs(sql: SqlStorage) {
 export function workerAccessContext(sql: SqlStorage, tokenId: string | undefined, now = Date.now(), allowExpiredAccess = false): any | null {
   if (!tokenId || !sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='worker_access'").toArray().length) return null;
   const row: any = sql.exec(`SELECT w.*, c.actor, c.token_hash, c.expires_at AS credential_expires_at,
-    c.revoked_at, c.kind, c.scopes, c.machine_id FROM worker_access w JOIN credentials c ON c.family_id=w.family_id WHERE c.id=?`, tokenId).toArray()[0];
+    c.revoked_at, c.kind, c.scopes, c.machine_id, c.registry_actor FROM worker_access w JOIN credentials c ON c.family_id=w.family_id WHERE c.id=?`, tokenId).toArray()[0];
   if (!row || row.kind !== 'agent' || row.revoked_at || !Number.isSafeInteger(row.expires_at) || row.expires_at <= now || (!Number.isFinite(Date.parse(row.credential_expires_at)) || (!allowExpiredAccess && (!allowExpiredAccess && Date.parse(row.credential_expires_at) <= now)))) return null;
   let scopes: any; try { scopes = JSON.parse(row.scopes); } catch { return null; }
   if (!Array.isArray(scopes) || !scopes.includes(WORKER_SCOPE) || scopes.includes('admin')) return null;
@@ -96,6 +96,10 @@ export function workerAccessContext(sql: SqlStorage, tokenId: string | undefined
   // while it runs on the machine the credential was minted for.
   if (parent.fleet_launch_id ? parent.fleet_launch_id !== row.launch_id
     : row.launch_id !== row.session_id || parent.state !== 'running' || parent.machine_id !== row.machine_id) return null;
+  if(!parent.fleet_launch_id) {
+    const authority:any=sql.exec('SELECT enabled FROM native_credential_authority WHERE family_id=?',row.family_id).toArray()[0];
+    if(authority && (!authority.enabled || row.registry_actor!==NATIVE_WORKER_PROJECT+':native-'+row.session_id))return null;
+  }
   let binding: any; try { binding=JSON.parse(parent.binding_json); } catch {}
   let task: any; try { task=JSON.parse((sql.exec('SELECT data FROM intake_tasks WHERE id=?',row.task_id).toArray()[0] as any)?.data); } catch {}
   const native = binding && typeof binding === 'object' && !Array.isArray(binding) ? binding : null;
@@ -291,47 +295,95 @@ const NATIVE_LIST_LIMIT = 10;
 /** Open intakes a server-verified link (operator verify_live, never a START
  * note or tag guess) ties to this running native session, oldest id first.
  * Empty when the session has no verified open intake. */
+const NATIVE_SCAN_BATCH = 64;
+const NATIVE_FAMILY_LIMIT = 128;
+export class NativeCredentialObservationLimit extends Error {
+  constructor() { super('native_credential_observation_limit'); this.name='NativeCredentialObservationLimit'; }
+}
 export function nativeSessionIntakes(sql: SqlStorage, sessionId: string, nativeId: string): string[] {
-  const keys = [sessionId, nativeId].filter(k => typeof k === 'string' && k);
+  const keys = [...new Set([sessionId,nativeId].filter(k=>typeof k==='string' && k))];
   if (!keys.length || !sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='intake_session_links'").toArray().length) return [];
-  const out: string[] = [];
-  for (const r of sql.exec(`SELECT DISTINCT task_id FROM intake_session_links WHERE session_key IN (${keys.map(() => '?').join(',')}) ORDER BY task_id LIMIT ?`,
-    ...keys, WORKER_CREATE_LIMIT).toArray() as any[]) {
-    let task: any; try { task = JSON.parse((sql.exec('SELECT data FROM intake_tasks WHERE id=?', r.task_id).toArray()[0] as any)?.data); } catch { continue; }
-    if (task && !['done', 'cancelled'].includes(task.status)) out.push(String(r.task_id));
+  const ids = new Set<string>();
+  for (const key of keys) {
+    const refs=sql.exec('SELECT task_id FROM intake_session_links WHERE session_key=? ORDER BY task_id LIMIT ?',key,WORKER_CREATE_LIMIT+1).toArray() as any[];
+    if(refs.length>WORKER_CREATE_LIMIT)throw new NativeCredentialObservationLimit();
+    for(const row of refs)ids.add(String(row.task_id));
+  }
+  if(ids.size>WORKER_CREATE_LIMIT)throw new NativeCredentialObservationLimit();
+  const out:string[]=[];
+  for(const id of [...ids].sort()) {
+    let task:any;try{task=JSON.parse((sql.exec('SELECT data FROM intake_tasks WHERE id=?',id).toArray()[0] as any)?.data);}catch{continue;}
+    if(task && !['done','cancelled'].includes(task.status))out.push(id);
   }
   return out;
 }
-/** Running native sessions on this machine that have a verified open intake
- * link and no live scoped credential yet. Bounded; indexed lookups. */
-export function nativeSessionsNeedingIntakeCredential(sql: SqlStorage, machineId: string): { session_id: string; native_id: string; workspace: string; intake_task_id: string }[] {
-  const out: any[] = [];
-  const rows = sql.exec(`SELECT s.id, s.binding_json FROM session_control_sessions s WHERE s.state = 'running' AND s.binding_json IS NOT NULL AND s.machine_id = ? AND s.fleet_launch_id IS NULL
-    AND NOT EXISTS (SELECT 1 FROM worker_access w JOIN credentials c ON c.family_id = w.family_id WHERE w.session_id = s.id AND c.revoked_at IS NULL)
-    AND EXISTS (SELECT 1 FROM intake_session_links l WHERE l.session_key = s.id OR l.session_key = json_extract(s.binding_json, '$.native_id'))
-    ORDER BY s.updated_at DESC LIMIT 300`, machineId).toArray() as any[];
-  for (const row of rows) {
-    let binding: any; try { binding = JSON.parse(row.binding_json); } catch { continue; }
-    if (!binding?.native_id || !binding?.workspace) continue;
-    const intake = nativeSessionIntakes(sql, String(row.id), String(binding.native_id))[0];
-    if (!intake) continue;
-    out.push({ session_id: String(row.id), native_id: String(binding.native_id), workspace: String(binding.workspace), intake_task_id: intake });
-    if (out.length >= NATIVE_LIST_LIMIT) break;
+export function credentialActorRows(sql:SqlStorage,actor:string):any[] {
+  const rows=sql.exec('SELECT id,family_id,revoked_at,kind,machine_id FROM credentials INDEXED BY credentials_registry_actor WHERE registry_actor=? LIMIT ?',actor,NATIVE_FAMILY_LIMIT+1).toArray() as any[];
+  if(rows.length>NATIVE_FAMILY_LIMIT)throw new NativeCredentialObservationLimit();
+  return rows;
+}
+function nativeFamilyCredentials(sql:SqlStorage,sessionId:string,family:string):any[] {
+  // Native grants have one stable actor and launch_id=session_id. The actor
+  // index is already deployed; family_id has no index in the live database.
+  return credentialActorRows(sql,NATIVE_WORKER_PROJECT+':native-'+sessionId)
+    .filter(row=>row.family_id===family && row.revoked_at===null);
+}
+function revokeNativeFamily(sql:SqlStorage,sessionId:string,family:string,now:number):void {
+  // The PK fence revokes every opaque legacy member too; old issuance did
+  // not populate registry_actor, so an actor-index walk cannot enumerate it.
+  sql.exec('INSERT INTO native_credential_authority VALUES(?,0) ON CONFLICT(family_id) DO UPDATE SET enabled=0',family);
+  const at=new Date(now).toISOString();
+  for(const credential of nativeFamilyCredentials(sql,sessionId,family))
+    sql.exec('UPDATE credentials SET revoked_at=? WHERE id=? AND family_id=? AND revoked_at IS NULL',at,credential.id,family);
+}
+export function nativeSessionsNeedingIntakeCredentialPage(sql:SqlStorage,machineId:string,after=0):{sessions:any[];next:number} {
+  // Bound raw running-machine rows before binding/link/credential filtering.
+  // This uses the deployed (machine_id,state,implicit rowid) index and does
+  // not sort or anti-join the entire retained session/credential population.
+  const raw=sql.exec(`SELECT rowid AS scan_id,id,binding_json,fleet_launch_id FROM session_control_sessions
+    INDEXED BY session_control_machine_state WHERE machine_id=? AND state='running' AND rowid>?
+    ORDER BY rowid LIMIT ?`,machineId,after,NATIVE_SCAN_BATCH+1).toArray() as any[];
+  const out:any[]=[];
+  let last=after;
+  for(const row of raw.slice(0,NATIVE_SCAN_BATCH)) {
+    last=Number(row.scan_id);
+    if(row.fleet_launch_id || row.binding_json===null)continue;
+    let binding:any;try{binding=JSON.parse(row.binding_json);}catch{continue;}
+    if(!binding?.native_id || !binding?.workspace)continue;
+    const access:any=sql.exec('SELECT family_id,session_id FROM worker_access WHERE launch_id=?',row.id).toArray()[0];
+    if(access && access.session_id===row.id) {
+      const authority:any=sql.exec('SELECT enabled FROM native_credential_authority WHERE family_id=?',access.family_id).toArray()[0];
+      if(authority?.enabled!==0 && nativeFamilyCredentials(sql,row.id,String(access.family_id)).length)continue;
+    }
+    const intake=nativeSessionIntakes(sql,String(row.id),String(binding.native_id))[0];
+    if(!intake)continue;
+    out.push({session_id:String(row.id),native_id:String(binding.native_id),workspace:String(binding.workspace),intake_task_id:intake});
+    if(out.length>=NATIVE_LIST_LIMIT)return {sessions:out,next:last};
   }
-  return out;
+  return {sessions:out,next:raw.length>NATIVE_SCAN_BATCH?last:0};
 }
-/** Stop/rebind/end of a session kills its native intake credential family. */
-export function revokeNativeWorkerCredentials(sql: SqlStorage, sessionId: string, now: number): void {
-  if (!sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='worker_access'").toArray().length) return;
-  sql.exec(`UPDATE credentials SET revoked_at = ? WHERE revoked_at IS NULL AND family_id IN
-    (SELECT family_id FROM worker_access WHERE session_id = ? AND launch_id = session_id)`, new Date(now).toISOString(), sessionId);
+/** Compatibility entry for bounded direct callers. Hosts use the durable page. */
+export function nativeSessionsNeedingIntakeCredential(sql:SqlStorage,machineId:string):any[] {
+  return nativeSessionsNeedingIntakeCredentialPage(sql,machineId).sessions;
 }
-/** Sweep backstop: revoke native intake credentials of sessions no longer running. */
-export function revokeEndedNativeWorkerCredentials(sql: SqlStorage, now: number): void {
-  if (!sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='worker_access'").toArray().length) return;
-  sql.exec(`UPDATE credentials SET revoked_at = ? WHERE revoked_at IS NULL AND family_id IN
-    (SELECT w.family_id FROM worker_access w LEFT JOIN session_control_sessions s ON s.id = w.session_id
-     WHERE w.launch_id = w.session_id AND (s.id IS NULL OR s.state <> 'running'))`, new Date(now).toISOString());
+export function revokeNativeWorkerCredentials(sql:SqlStorage,sessionId:string,now:number):void {
+  if(!sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='worker_access'").toArray().length)return;
+  const access:any=sql.exec('SELECT family_id,session_id FROM worker_access WHERE launch_id=?',sessionId).toArray()[0];
+  if(access?.session_id===sessionId)revokeNativeFamily(sql,sessionId,String(access.family_id),now);
+}
+/** Fair bounded cleanup. Unknown credential coverage refuses the call; it can
+ * never silently bless an incomplete family revocation as successful. */
+export function revokeEndedNativeWorkerCredentials(sql:SqlStorage,now:number):void {
+  if(!sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='worker_access'").toArray().length)return;
+  const old=String(sql.exec("SELECT cursor FROM native_credential_scan WHERE key='ended'").toArray()[0]?.cursor??'');
+  const rows=sql.exec('SELECT family_id,launch_id,session_id FROM worker_access WHERE family_id>? ORDER BY family_id LIMIT ?',old,NATIVE_SCAN_BATCH+1).toArray() as any[];
+  for(const row of rows.slice(0,NATIVE_SCAN_BATCH)) {
+    if(row.launch_id!==row.session_id)continue;
+    const session:any=sql.exec('SELECT state FROM session_control_sessions WHERE id=?',row.session_id).toArray()[0];
+    if(!session || session.state!=='running')revokeNativeFamily(sql,String(row.session_id),String(row.family_id),now);
+  }
+  const next=rows.length>NATIVE_SCAN_BATCH?String(rows[NATIVE_SCAN_BATCH-1].family_id):'';
+  if(next!==old)sql.exec("INSERT INTO native_credential_scan VALUES('ended',?) ON CONFLICT(key) DO UPDATE SET cursor=excluded.cursor",next);
 }
 
 /** Write-stamp gate for the ended-session backstop sweeps (intake e8a22f4c).
@@ -348,11 +400,8 @@ export class WorkerAccess {
     private sweep?: CredentialSweepGate) {}
   init() {
     this.sql.exec(WORKER_ACCESS_SCHEMA);
-    this.sql.exec('CREATE INDEX IF NOT EXISTS worker_access_session_family ON worker_access(session_id,family_id)');
-    // The per-session live-credential existence join probes one credential
-    // family per session; without this index it scans the whole credential
-    // history on every host poll (intake e8a22f4c).
-    this.sql.exec('CREATE INDEX IF NOT EXISTS credentials_family ON credentials(family_id)');
+    this.sql.exec('CREATE TABLE IF NOT EXISTS native_credential_scan(key TEXT PRIMARY KEY,cursor TEXT NOT NULL)');
+    this.sql.exec('CREATE TABLE IF NOT EXISTS native_credential_authority(family_id TEXT PRIMARY KEY,enabled INTEGER NOT NULL)');
     this.sql.exec(DRIVER_ACCESS_SCHEMA); this.sql.exec(WORKER_CREATED_SCHEMA); this.sql.exec(WORKER_CREATED_INDEX);
   }
   releaseClaim(caller: CallerContext, target: string): Response {
@@ -382,16 +431,43 @@ export class WorkerAccess {
   /** Host lists running native sessions that need an intake credential. The
    * ended-session revoke sweep is a backstop (transitions revoke directly);
    * it runs only after a write to the tables it reads, never on every poll. */
+  private nativePages=new Map<string,any>();
+  private nativeCyclePending=new Map<string,boolean>();
+  private endedScanPending=true;
   listNative(caller: CallerContext | undefined, scopes: string[] | undefined): Response {
-    if (caller?.kind !== 'host' || !caller.machineId || !scopes?.includes('host') || !this.hostAllowed(caller)) return Response.json({ error: 'forbidden' }, { status: 403 });
-    return this.tx(() => {
-      const tables = ['worker_access', 'session_control_sessions', 'credentials'];
-      const changed = this.sweep ? this.sweep.changed('native-credential', ...tables) : 'run';
-      if (changed !== null) revokeEndedNativeWorkerCredentials(this.sql, Date.now());
-      const sessions = nativeSessionsNeedingIntakeCredential(this.sql, caller.machineId!);
-      if (changed !== null && this.sweep) this.sweep.done('native-credential', ...tables);
-      return Response.json({ sessions }, { headers: { 'Cache-Control': 'no-store' } });
-    });
+    if(caller?.kind!=='host' || !caller.machineId || !scopes?.includes('host') || !this.hostAllowed(caller))return Response.json({error:'forbidden'},{status:403});
+    try { return this.tx(()=>{
+      // Credential last_used_at writes cannot invalidate a lifecycle cleanup.
+      // Authentication remains authoritative on every request independently.
+      const lifecycle=['worker_access','session_control_sessions'];
+      const changed=this.sweep?this.sweep.changed('native-credential',...lifecycle):'run';
+      if(changed!==null || this.endedScanPending) {
+        revokeEndedNativeWorkerCredentials(this.sql,Date.now());
+        this.endedScanPending=String(this.sql.exec("SELECT cursor FROM native_credential_scan WHERE key='ended'").toArray()[0]?.cursor??'')!=='';
+        this.sweep?.done('native-credential',...lifecycle);
+      }
+      const key='native-list:'+caller.machineId;
+      const dependencies=['worker_access','native_credential_authority','session_control_sessions','credentials','intake_session_links','intake_tasks'];
+      const cached=this.nativePages.get(caller.machineId!);
+      if(cached && this.sweep?.changed(key,...dependencies)===null)return Response.json(cached,{headers:{'Cache-Control':'no-store'}});
+      const cursorKey='machine:'+caller.machineId;
+      const old=Number(this.sql.exec('SELECT cursor FROM native_credential_scan WHERE key=?',cursorKey).toArray()[0]?.cursor??0);
+      if(!old)this.nativeCyclePending.set(caller.machineId!,false);
+      else if(!this.nativeCyclePending.has(caller.machineId!))this.nativeCyclePending.set(caller.machineId!,true);
+      const page=nativeSessionsNeedingIntakeCredentialPage(this.sql,caller.machineId!,old);
+      if(page.sessions.length)this.nativeCyclePending.set(caller.machineId!,true);
+      if(page.next!==old)this.sql.exec('INSERT INTO native_credential_scan VALUES(?,?) ON CONFLICT(key) DO UPDATE SET cursor=excluded.cursor',cursorKey,String(page.next));
+      const payload={sessions:page.sessions,...(page.next?{observation_scope:'cursor_batch',observation_pending:true}:{})};
+      // Nonempty work must be offered again until issuance changes authority.
+      // Continue unfinished scans on later polls even without a source write.
+      if(!page.next && !this.nativeCyclePending.get(caller.machineId!)) {this.nativePages.set(caller.machineId!,payload);this.sweep?.done(key,...dependencies);}
+      else this.nativePages.delete(caller.machineId!);
+      if(!page.next)this.nativeCyclePending.delete(caller.machineId!);
+      return Response.json(payload,{headers:{'Cache-Control':'no-store'}});
+    }); } catch(error) {
+      if(!(error instanceof NativeCredentialObservationLimit))throw error;
+      return Response.json({error:'native_credential_observation_limit',observation_pending:true},{status:503,headers:{'Retry-After':'60','Cache-Control':'no-store'}});
+    }
   }
   /** Mint the intake-scoped credential of a running native session. Authority is
    * the verified link, never a request field; scope is `worker:own-intake`
@@ -414,11 +490,12 @@ export class WorkerAccess {
       const prior: any = this.sql.exec('SELECT family_id FROM worker_access WHERE launch_id=?', id).toArray()[0];
       const family = prior?.family_id || crypto.randomUUID();
       if (!prior) this.sql.exec('INSERT INTO agents(tag,project,role,machine_id,registered_at) VALUES(?,?,?,?,?)', tag, NATIVE_WORKER_PROJECT, 'worker', caller.machineId!, at);
-      this.sql.exec('UPDATE credentials SET revoked_at=? WHERE family_id=? AND revoked_at IS NULL', at, family);
+      revokeNativeFamily(this.sql,id,family,now);
       const credId = crypto.randomUUID();
-      this.sql.exec(`INSERT INTO credentials(id,kind,token_hash,refresh_hash,family_id,subject,machine_id,actor,scopes,created_by_sub,created_at,expires_at)
-        VALUES(?,'agent',?,?,?,?,?,?,?,?,?,?)`, credId, tokens.accessHash, tokens.refreshHash, family, actor, caller.machineId!, actor,
-        JSON.stringify(['bus:read', WORKER_SCOPE]), 'host:' + caller.machineId, at, new Date(now + 3600000).toISOString());
+      this.sql.exec('INSERT INTO native_credential_authority VALUES(?,1) ON CONFLICT(family_id) DO UPDATE SET enabled=1',family);
+      this.sql.exec(`INSERT INTO credentials(id,kind,token_hash,refresh_hash,family_id,subject,machine_id,actor,scopes,created_by_sub,created_at,expires_at,registry_actor)
+        VALUES(?,'agent',?,?,?,?,?,?,?,?,?,?,?)`, credId, tokens.accessHash, tokens.refreshHash, family, actor, caller.machineId!, actor,
+        JSON.stringify(['bus:read', WORKER_SCOPE]), 'host:' + caller.machineId, at, new Date(now + 3600000).toISOString(),actor);
       this.sql.exec(`INSERT INTO worker_access(family_id,launch_id,session_id,task_id,workspace,expires_at) VALUES(?,?,?,?,?,?)
         ON CONFLICT(family_id) DO UPDATE SET task_id=excluded.task_id, expires_at=excluded.expires_at`, family, id, id, intake, String(binding.workspace), expires);
       return reply({ access_token: tokens.accessToken, refresh_token: tokens.refreshToken, client_kind: 'agent',

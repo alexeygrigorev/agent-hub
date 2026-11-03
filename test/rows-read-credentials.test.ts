@@ -72,10 +72,9 @@ function seed(sql: any) {
     VALUES('s-gone','operator','kg','{}','h0','codex','interactive','stopped',?,?,?)`, binding('n-gone'), iso(NOW - 3600000), iso(NOW));
   sql.exec("INSERT INTO worker_access(family_id,launch_id,session_id,task_id,workspace,expires_at) VALUES('fn-live','s-covered','s-covered','t-open','/w',?)", NOW + 3600000);
   sql.exec("INSERT INTO worker_access(family_id,launch_id,session_id,task_id,workspace,expires_at) VALUES('fn-dead','s-gone','s-gone','t-open','/w',?)", NOW + 3600000);
-  sql.exec(`INSERT INTO credentials(id,kind,token_hash,refresh_hash,family_id,subject,machine_id,actor,scopes,created_by_sub,created_at,expires_at,revoked_at)
-    VALUES('c-fn-live','worker','th-fn-live','rh-fn-live','fn-live','s-covered','h0','worker','[]','host:h0',?, ?, NULL)`, iso(NOW - 3600000), iso(NOW + 3600000));
-  sql.exec(`INSERT INTO credentials(id,kind,token_hash,refresh_hash,family_id,subject,machine_id,actor,scopes,created_by_sub,created_at,expires_at,revoked_at)
-    VALUES('c-fn-dead','worker','th-fn-dead','rh-fn-dead','fn-dead','s-gone','h0','worker','[]','host:h0',?, ?, NULL)`, iso(NOW - 3600000), iso(NOW + 3600000));
+  for(const session of ['s-covered','s-gone'])sql.exec("INSERT INTO agents(tag,project,machine_id,registered_at) VALUES(?,'hub-native-workers','h0',?)",'native-'+session,iso(NOW-3600000));
+  cred('c-fn-live','fn-live','hub-native-workers:native-s-covered',false);
+  cred('c-fn-dead','fn-dead','hub-native-workers:native-s-gone',false);
   sql.exec("INSERT INTO intake_tasks(id,data) VALUES('t-open',?)", JSON.stringify({ id: 't-open', project: 'agent-hub', title: 'open', status: 'open', version: 1, acceptance_criteria: 'AC', history: [], created_at: NOW, updated_at: NOW }));
   sql.exec("INSERT INTO intake_tasks(id,data) VALUES('t-done',?)", JSON.stringify({ id: 't-done', project: 'agent-hub', title: 'done', status: 'done', version: 1, acceptance_criteria: 'AC', history: [], created_at: NOW, updated_at: NOW }));
   sql.exec("INSERT INTO intake_session_links(session_key,task_id,authority) VALUES('s-needy','t-open','hub_launch_verified')");
@@ -90,21 +89,21 @@ const read = (hub: Hub, q: string, ...b: any[]) => { const c: any = hub.sql.exec
 const MESSAGING_TABLES = ['agents', 'session_control_sessions', 'credentials'] as const;
 
 describe('credential poll indexes', () => {
-  it('the native live-credential join uses credentials_family, not a scan', () => withHub(async hub => {
+  it('native lookup uses deployed launch identity and actor indexes, not an unindexed family join', () => withHub(async hub => {
     const plan = (q: string, ...b: any[]) => (hub.sql.exec('EXPLAIN QUERY PLAN ' + q, ...b).toArray() as any[]).map(r => String(r.detail)).join(' | ');
-    const join = plan('SELECT 1 FROM worker_access w JOIN credentials c ON c.family_id = w.family_id WHERE w.session_id = ? AND c.revoked_at IS NULL LIMIT 1', 's-needy');
-    expect(join).toContain('credentials_family');
-    expect(join).not.toMatch(/SCAN\s+(c\b|credentials\b)/);
+    expect(plan('SELECT family_id,session_id FROM worker_access WHERE launch_id=?','s-covered')).toMatch(/SEARCH.*USING INDEX/);
+    const credentials=plan('SELECT id,family_id,revoked_at,kind,machine_id FROM credentials INDEXED BY credentials_registry_actor WHERE registry_actor=? LIMIT 129','hub-native-workers:native-s-covered');
+    expect(credentials).toContain('credentials_registry_actor');
+    expect(credentials).not.toMatch(/SCAN\s+credentials/);
   }));
 
-  it('the agent identity poll uses the project/machine index, not a scan', () => withHub(async hub => {
+  it('identity backstops use the deployed expression project/tag key, not a new registry index', () => withHub(async hub => {
     const plan = (q: string, ...b: any[]) => (hub.sql.exec('EXPLAIN QUERY PLAN ' + q, ...b).toArray() as any[]).map(r => String(r.detail)).join(' | ');
-    const agents = plan('SELECT tag FROM agents WHERE project = ? AND machine_id = ? LIMIT 200', 'session', 'h0');
-    expect(agents).toContain('idx_agents_project_machine');
+    const agents=plan("SELECT tag FROM agents INDEXED BY idx_agents_project_tag_unique WHERE COALESCE(project,'')=? AND tag>? ORDER BY tag LIMIT 65",'session','');
+    expect(agents).toContain('idx_agents_project_tag_unique');
     expect(agents).not.toMatch(/SCAN\s+agents/);
-    const live = plan("SELECT 1 FROM credentials WHERE registry_actor = ? AND kind = 'agent' AND machine_id = ? AND revoked_at IS NULL LIMIT 1", 'session:s0', 'h0');
+    const live=plan('SELECT id,family_id,revoked_at,kind,machine_id FROM credentials INDEXED BY credentials_registry_actor WHERE registry_actor=? LIMIT 129','session:s0');
     expect(live).toContain('credentials_registry_actor');
-    expect(live).not.toMatch(/SCAN\s+credentials/);
   }));
 });
 
@@ -134,14 +133,17 @@ describe('write-driven credential sweeps', () => {
     expect(first.map(s => s.session_id).sort()).toEqual(['s1', 's2']);
     // The backstop revoked the ended session's credential on the first poll.
     expect(read(hub, "SELECT revoked_at FROM credentials WHERE id = 'c-stopped'").rows[0].revoked_at).not.toBeNull();
-    const sweeped = t.calls.filter(q => /agents a LEFT JOIN/i.test(q));
+    const sweeped = t.calls.filter(q => /FROM agents INDEXED BY idx_agents_project_tag_unique.*tag>\?/i.test(q));
     expect(sweeped.length).toBeGreaterThan(0);
+    // The fair backstop intentionally continues across the retained identity
+    // census before its source-stamp gate can become idle.
+    for(let i=0;i<Math.ceil((STALE_AGENTS+4)/64);i++)poll();
     const from = t.mark();
     const second = poll();
     expect(second.map(s => s.session_id).sort()).toEqual(['s1', 's2']);
     // No sweep statement re-ran: identical exec calls would still be recorded
     // by the tracker even on a memo hit, so absence proves the gate skipped it.
-    expect(t.calls.slice(from).filter(q => /agents a LEFT JOIN/i.test(q))).toEqual([]);
+    expect(t.calls.slice(from).filter(q => /FROM agents INDEXED BY idx_agents_project_tag_unique.*tag>\?/i.test(q))).toEqual([]);
     // And the repeat poll read zero rows (memoized zero-read cursors).
     expect(t.report(from)).toBe(0);
   }));

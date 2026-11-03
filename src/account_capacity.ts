@@ -54,6 +54,9 @@ export function reconcileAccountCapacity(sql: SqlStorage, now: number, apply = t
   return changes;
 }
 
+const noStartAfter = new WeakMap<object,Map<string,number>>();
+export const NO_START_CANDIDATE_BATCH = 25;
+
 /** Settle unbound launches whose stored receipt positively proves dispatch
  * stopped before any native start. Only exact launcher memory/disk refusal
  * receipts (ValueError, dispatch_headless, exit 1, fixed message) qualify,
@@ -66,32 +69,42 @@ export function reconcileAccountCapacity(sql: SqlStorage, now: number, apply = t
  *
  * Runs on the host-census path (sessions PUT) and the manual /reconcile
  * endpoint, never inside claim/accountStatus maintenance: the candidate scan
- * walks retained history and would burn the status-perf rows-read budget on
- * the hot admission path. Settlement lag is bounded by host poll cadence,
+ * advances bounded raw state pages with transient rowid cursors. It neither
+ * rescans all retained history nor writes a cursor on each host poll. Settlement lag is bounded by host poll cadence,
  * and the next census drains freed capacity to waiters. */
 export function reconcileVerifiedNoStarts(sql: SqlStorage, now: number, apply = true) {
   const controls = sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_control_sessions'").toArray().length > 0;
   const changes: { id: string; before: string; after: string; reason: string }[] = [];
-  const noBinding = controls ? `AND NOT EXISTS (SELECT 1 FROM session_control_sessions c
-    WHERE c.fleet_launch_id=l.id AND c.binding_json IS NOT NULL AND c.binding_json != '')` : '';
-  const noNativeTag = `AND NOT EXISTS (SELECT 1 FROM fleet_sessions s
-    WHERE s.machine_id=l.machine_id AND s.tag='task-hub-' || l.id)`;
-  // Scan only rows that can actually pin account slots (the population the
-  // capacity count reads): running rows of any age, plus in-flight rows
-  // touched in the last 48h. The fleet_launch_nostart_receipt partial index
-  // keeps this lookup independent of retained launch history.
+  const cursors = noStartAfter.get(sql as any) ?? new Map<string,number>();
+  noStartAfter.set(sql as any,cursors);
   const pinCutoff = new Date(now - 48 * 3600000).toISOString();
-  const noStartCandidates = sql.exec(`SELECT l.id,l.state,l.launch_error_json FROM fleet_launches l
-    WHERE l.mode='headless' AND l.state IN ('starting','running','uncertain')
-      AND (l.state='running' OR l.updated_at > ?)
-      AND l.launch_error_json IS NOT NULL AND l.native_id IS NULL AND l.launcher_task_id IS NULL
-      AND NOT EXISTS(SELECT 1 FROM routing_jobs j WHERE j.launch_id=l.id)
-      ${noBinding} ${noNativeTag}`, pinCutoff).toArray() as any[];
+  const noStartCandidates: any[] = [];
+  let limited = false;
+  for (const state of ['starting','running','uncertain']) {
+    const page = sql.exec(`SELECT rowid AS source_rowid,id,machine_id,mode,state,updated_at,launch_error_json,native_id,launcher_task_id
+      FROM fleet_launches INDEXED BY fleet_launch_state WHERE state=? AND rowid>? ORDER BY rowid LIMIT ?`,
+      state,cursors.get(state) ?? 0,NO_START_CANDIDATE_BATCH+1).toArray() as any[];
+    limited ||= page.length > NO_START_CANDIDATE_BATCH;
+    const raw = page.slice(0,NO_START_CANDIDATE_BATCH);
+    if (apply) cursors.set(state,page.length > NO_START_CANDIDATE_BATCH ? Number(raw[raw.length-1].source_rowid) : 0);
+    for (const row of raw) if (row.mode === 'headless' && (row.state === 'running' || row.updated_at > pinCutoff) &&
+        row.launch_error_json !== null && row.native_id === null && row.launcher_task_id === null) noStartCandidates.push(row);
+  }
+  // A bounded dry-run must not advertise its prefix as a complete preview.
+  if (!apply && limited) throw new Error('capacity_observation_limited');
   for (const launch of noStartCandidates) {
     let diagnostic: any = null;
     try { diagnostic = JSON.parse(launch.launch_error_json || 'null'); } catch { /* unknown evidence */ }
     const reason = verifiedUnboundNoStart(diagnostic);
     if (!reason) continue;
+    if (sql.exec('SELECT 1 FROM routing_jobs WHERE launch_id=? LIMIT 1',launch.id).toArray().length) continue;
+    if (controls) {
+      // Bound raw control bindings before testing values. More than two
+      // retained owners is ambiguous, never proof of no native start.
+      const bindings = sql.exec('SELECT binding_json FROM session_control_sessions WHERE fleet_launch_id=? LIMIT 3',launch.id).toArray() as any[];
+      if (bindings.length > 2 || bindings.some(row=>row.binding_json !== null && row.binding_json !== '')) continue;
+    }
+    if (sql.exec('SELECT 1 FROM fleet_sessions INDEXED BY fleet_session_incarnation WHERE machine_id=? AND tag=? LIMIT 1',launch.machine_id,'task-hub-'+launch.id).toArray().length) continue;
     const at = new Date(now).toISOString();
     if (!apply) {
       changes.push({ id: launch.id, before: launch.state, after: 'failed', reason });

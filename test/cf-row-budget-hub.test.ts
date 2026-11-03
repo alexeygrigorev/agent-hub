@@ -64,3 +64,35 @@ describe('Hub daily cost circuit breaker integration', () => {
     });
   });
 });
+
+it('cancels quiet refunds on activity and checks both active events and the activity epoch', async () => {
+  const stub=(env as any).HUB.get((env as any).HUB.idFromName('cf-budget-quiet-'+crypto.randomUUID()));
+  await (runInDurableObject as any)(stub,async(hub:any)=>{
+    hub.cancelBudgetRefund();
+    let released=0;
+    const nativeRelease=hub.rowBudget.releaseUnused.bind(hub.rowBudget);
+    hub.rowBudget.releaseUnused=async(quiet:()=>boolean)=>{if(quiet())released++;return true;};
+    try {
+      hub.scheduleBudgetRefund(0);
+      await hub.fetch(new Request('https://hub/api/sessions'));
+      await new Promise(resolve=>setTimeout(resolve,5));
+      expect(released).toBe(0); // the real request cancelled the old timer
+      hub.cancelBudgetRefund();
+      hub.budgetActiveEvents=1;
+      hub.scheduleBudgetRefund(0);
+      await new Promise(resolve=>setTimeout(resolve,5));
+      expect(released).toBe(0);
+      hub.budgetActiveEvents=0;
+      hub.scheduleBudgetRefund(0);
+      hub.budgetActivityEpoch++;
+      await new Promise(resolve=>setTimeout(resolve,5));
+      expect(released).toBe(0);
+      hub.scheduleBudgetRefund(0);
+      await new Promise(resolve=>setTimeout(resolve,5));
+      expect(released).toBe(1);
+    } finally {
+      hub.cancelBudgetRefund();
+      hub.rowBudget.releaseUnused=nativeRelease;
+    }
+  });
+});

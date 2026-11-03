@@ -73,17 +73,25 @@ export class OpsLiveness {
     this.sql.exec('INSERT OR IGNORE INTO ops_liveness_meta(id,last_eval,expected_since) VALUES(1,NULL,?)', this.now());
     const cols = (this.sql.exec('PRAGMA table_info(ops_liveness)').toArray() as any[]).map(c => c.name);
     if (!cols.includes('first_seen_at')) this.sql.exec('ALTER TABLE ops_liveness ADD COLUMN first_seen_at INTEGER');
+    // A one-row projection captures future work ends without adding an
+    // index over retained sessions. Its bootstrap time gives a conservative
+    // one-window grace: unseen pre-bootstrap work cannot be newer than it.
+    this.sql.exec('CREATE TABLE IF NOT EXISTS ops_work_observation(id INTEGER PRIMARY KEY CHECK(id=1),started_at INTEGER NOT NULL,last_terminal_at INTEGER NOT NULL)');
+    const endedAt = "ROUND((julianday(NEW.updated_at)-2440587.5)*86400000)";
+    const linked = requestIntake.replaceAll('request_json','NEW.request_json');
+    for (const event of ['INSERT','UPDATE OF state,updated_at']) {
+      const name = event === 'INSERT' ? 'ops_work_ended_insert' : 'ops_work_ended_update';
+      this.sql.exec(`CREATE TRIGGER IF NOT EXISTS ${name} AFTER ${event} ON session_control_sessions
+        WHEN NEW.state NOT IN ${ACTIVE_STATES} AND ${linked} IS NOT NULL AND ${endedAt} IS NOT NULL
+        BEGIN UPDATE ops_work_observation SET last_terminal_at=MAX(last_terminal_at,${endedAt})
+          WHERE id=1 AND last_terminal_at<${endedAt}; END`);
+    }
+    this.sql.exec('INSERT OR IGNORE INTO ops_work_observation VALUES(1,?,?)',this.now(),this.now());
     this.sql.exec("CREATE INDEX IF NOT EXISTS ops_intake_created ON intake_task_projection(json_extract(data,'$.created_at'))");
-    this.sql.exec(`CREATE INDEX IF NOT EXISTS ops_intake_open_ac ON intake_task_projection(id)
-      WHERE json_extract(data,'$.status') IN ('open','in_progress')
-      AND json_extract(data,'$.archived_at') IS NULL
-      AND length(trim(coalesce(json_extract(data,'$.acceptance_criteria'),'')))>0`);
     this.sql.exec("CREATE INDEX IF NOT EXISTS ops_intake_closed_time ON intake_audit(captured_at,task_id) WHERE kind IN ('close','cancel')");
     this.sql.exec(`CREATE INDEX IF NOT EXISTS ops_intake_native_started ON session_control_sessions(
       json_extract(CASE WHEN json_valid(binding_json) THEN binding_json ELSE '{}' END,'$.native_created_at_ms'))`);
-    this.sql.exec(`CREATE INDEX IF NOT EXISTS ops_active_sessions ON session_control_sessions(id) WHERE state IN ${ACTIVE_STATES}`);
-    this.sql.exec(`CREATE INDEX IF NOT EXISTS ops_ended_intake_sessions ON session_control_sessions(created_at DESC)
-      WHERE state NOT IN ${ACTIVE_STATES} AND ${requestIntake} IS NOT NULL`);
+
   }
 
   /** One report from the orchestrator tick (kind=tick) or the host watchdog (kind=watchdog). */
@@ -152,15 +160,25 @@ export class OpsLiveness {
    * idle process is not work. `last_work_at` is the newest such evidence (including recent
    * session ends), so the idle clock starts at the last useful work, not at detection. */
   backlog(now = this.now()): { open_with_ac: number; active_sessions: number; last_work_at: number | null; truncated?: boolean; open_with_ac_truncated?: boolean } {
-    const open = this.rows(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM intake_task_projection INDEXED BY ops_intake_open_ac
-      WHERE json_extract(data,'$.status') IN ('open','in_progress') AND json_extract(data,'$.archived_at') IS NULL
-      AND length(trim(coalesce(json_extract(data,'$.acceptance_criteria'),'')))>0 ORDER BY id LIMIT 1001)`)[0]?.n ?? 0;
-    // Bound the indexed source BEFORE checking linked intake state. An ocean
-    // of closed/unlinked sessions must not be scanned to find 201 matches.
-    const raw = this.rows(`SELECT state,updated_at,machine_id,${requestIntake} AS intake_id,
+    // Deployed indexes provide bounded raw candidates; AC and intake-link
+    // postfilters cannot force scans of retained closed/unlinked history.
+    const openRows = this.rows(`SELECT data FROM intake_task_projection INDEXED BY intake_watchdog_open
+      WHERE json_extract(data,'$.status') IN ('open','in_progress','blocked','pending_approval')
+      AND json_extract(data,'$.archived_at') IS NULL ORDER BY id LIMIT 1001`);
+    const open = openRows.slice(0,1000).filter(row => {
+      const task = JSON.parse(row.data);
+      return ['open','in_progress'].includes(task.status) && String(task.acceptance_criteria ?? '').trim().length > 0;
+    }).length;
+    const raw: Obj[] = [];
+    let activeTruncated = false;
+    for (const state of ['starting','offered','running']) {
+      const page = this.rows(`SELECT state,updated_at,machine_id,${requestIntake} AS intake_id,
         CASE WHEN json_valid(binding_json) THEN json_extract(binding_json,'$.native_id') END AS native_id
-      FROM session_control_sessions INDEXED BY ops_active_sessions WHERE state IN ${ACTIVE_STATES} ORDER BY id LIMIT 201`);
-    const candidates = raw.slice(0,200).filter(row => row.intake_id && this.rows(`SELECT 1 FROM intake_task_projection
+        FROM session_control_sessions INDEXED BY session_control_state WHERE state=? ORDER BY rowid LIMIT 68`,state);
+      if (page.length > 67) activeTruncated = true;
+      raw.push(...page.slice(0,67));
+    }
+    const candidates = raw.filter(row => row.intake_id && this.rows(`SELECT 1 FROM intake_task_projection
       WHERE id=? AND json_extract(data,'$.status') IN ('open','in_progress')`,row.intake_id).length);
     const cache = new Map();
     let active = 0, lastWork: number | null = null;
@@ -180,11 +198,22 @@ export class OpsLiveness {
       saw(progress);
       if (progress !== null && now - progress <= OPS_WINDOW_MS) active++;
     }
-    // A recent intake session end is useful work too (bounded: newest rows by creation).
-    for (const r of this.rows(`SELECT updated_at FROM session_control_sessions INDEXED BY ops_ended_intake_sessions WHERE state NOT IN ${ACTIVE_STATES}
-      AND ${requestIntake} IS NOT NULL ORDER BY created_at DESC LIMIT 32`)) saw(Date.parse(r.updated_at) || null);
+    // Creation-ordered raw candidates are bounded before terminal/intake
+    // filters. A prefix cannot prove that no recent linked work exists.
+    const endedCandidates = this.rows(`SELECT state,updated_at,${requestIntake} AS intake_id
+      FROM session_control_sessions INDEXED BY session_control_created ORDER BY created_at DESC,id DESC LIMIT 33`);
+    for (const r of endedCandidates.slice(0,32)) if (!['starting','offered','running'].includes(r.state) && r.intake_id) saw(Date.parse(r.updated_at) || null);
+    const observation = this.rows('SELECT started_at,last_terminal_at FROM ops_work_observation WHERE id=1')[0];
+    const endedPartial = endedCandidates.length > 32;
+    // Small complete registries preserve exact historical evidence. For a
+    // large registry, the projection proves all post-bootstrap ends; after
+    // one idle window, omitted older history cannot justify another delay.
+    if (endedPartial && observation) saw(Number(observation.last_terminal_at));
+    const endedUnknown = endedPartial && (!observation || now - Number(observation.started_at) < OPS_WINDOW_MS);
     return { open_with_ac: open, active_sessions: active, last_work_at: lastWork,
-      ...(raw.length > 200 ? { truncated: true } : {}), ...(open > 1000 ? { open_with_ac_truncated: true } : {}) };
+      ...(activeTruncated || endedUnknown ? { truncated: true } : {}),
+      ...(openRows.length > 1000 ? { open_with_ac_truncated: true } : {}) };
+
   }
 
   /** Rolling [now-24h, now) counts. A native binding proves a start; queue creation
@@ -270,7 +299,7 @@ export class OpsLiveness {
 
   private async idleTick(now: number, byRole: Map<any, Obj>): Promise<Obj> {
     const b = this.backlog(now);
-    if (b.truncated && b.active_sessions === 0 && b.open_with_ac > 0)
+    if ((b.truncated && b.active_sessions === 0 && b.open_with_ac > 0) || (b.open_with_ac_truncated && b.open_with_ac === 0))
       return { state: 'observation_incomplete', ...b };
     const open = this.rows('SELECT * FROM ops_backlog_idle WHERE resolved_at IS NULL ORDER BY id DESC LIMIT 1')[0];
     if (b.open_with_ac === 0 || b.active_sessions > 0) {

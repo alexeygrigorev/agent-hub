@@ -60,14 +60,14 @@ describe('hot-path query plans use indexes, never full scans', () => {
     expect(fullScan(p, 'session_control_wakes')).toBe(false);
   }));
 
-  it('quota history point lookups use the account/provider/time index', () => withHub(async hub => {
-    const p = plan(hub, 'SELECT * FROM usage_quota_history WHERE account = ? AND provider = ? AND observed_at_ms >= ? ORDER BY observed_at_ms LIMIT 100', 'a', 'codex', NOW - 3600000);
-    expect(p).toContain('usage_quota_history_account_provider_time');
+  it('quota replay bounds exact-time candidates using the deployed time index', () => withHub(async hub => {
+    const p = plan(hub, 'SELECT account,provider,quota_json FROM usage_quota_history INDEXED BY usage_quota_history_time WHERE observed_at_ms=? LIMIT 129', NOW);
+    expect(p).toContain('usage_quota_history_time');
   }));
 
   it('launcher memory-reserve scans stay off the failed-launch history', () => withHub(async hub => {
-    const p = plan(hub, "SELECT id, updated_at, finished_at, machine_id, native_id, verification_status FROM fleet_launches WHERE state = 'failed' AND exit_reason = 'launcher_memory_reserve' AND updated_at >= ?", iso(Date.now() - 86400000));
-    expect(p).toContain('fleet_launch_failed_reason');
+    const p = plan(hub, "SELECT id,updated_at,finished_at,machine_id,native_id,verification_status,exit_reason,state FROM fleet_launches INDEXED BY fleet_launch_updated WHERE updated_at >= ? ORDER BY updated_at DESC LIMIT 129", iso(Date.now() - 86400000));
+    expect(p).toContain('fleet_launch_updated');
     expect(fullScan(p, 'fleet_launches')).toBe(false);
   }));
 

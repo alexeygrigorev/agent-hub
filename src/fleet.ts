@@ -619,6 +619,7 @@ export class FleetService {
   private emptyOffers = new Map<string, { stamp: string; at: number; value: any }>();
   // Last intake linkage revision the census late-link pass ran at, per machine (intake e8a22f4c).
   private linkRevisions = new Map<string, string>();
+  private reconciliationAfter = new Map<string, number>();
   private candidateCache = new Map<string, { revision: string; at: number; value: any[] }>();
   private pollMaintenanceAt = 0;
   private maintenanceDirty = true;
@@ -755,20 +756,15 @@ export class FleetService {
     this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_offered ON fleet_launches(id) WHERE state = 'offered'");
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_state ON fleet_launches(state)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_machine_state ON fleet_launches(machine_id,state)');
-    // Intake e8a22f4c: reconciliation candidates take the oldest 100 per branch; the
-    // updated_at tail keeps each branch to an index prefix instead of the machine history.
-    this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_machine_state_updated ON fleet_launches(machine_id,state,updated_at)');
+    // Reconciliation and reserved pages reuse these deployed state indexes
+    // with rowid seeks; recovery must not index all retained launches.
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_expiry ON fleet_launches(state,created_at)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_account_state ON fleet_launches(account,state)');
-    this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_account_state_id ON fleet_launches(account,state,id)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_session_account_phase ON fleet_sessions(account,phase)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_session_machine_phase ON fleet_sessions(machine_id,phase)');
     this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_launch_failed_recent ON fleet_launches(machine_id,finished_at) WHERE state = 'failed' AND mode = 'headless' AND verification_status = 'unverified'");
     this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_launch_account_failed_recent ON fleet_launches(account,updated_at DESC) WHERE state = 'failed'");
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_native_state ON fleet_launches(machine_id,native_id,state)');
-    // Intake e8a22f4c: the launcher memory-reserve scan runs on the cron path;
-    // keep it off the retained failed-launch history.
-    this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_launch_failed_reason ON fleet_launches(state,exit_reason,updated_at) WHERE state = 'failed'");
     // Intake e8a22f4c: plan() and the choking watchdog look for these rare exit reasons on every poll;
     // partial indexes keep both lookups independent of the machine's retained launch history.
     this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_launch_model_unsupported ON fleet_launches(machine_id,engine,account) WHERE exit_reason = 'model_unsupported'");
@@ -784,19 +780,12 @@ export class FleetService {
       this.sql.exec(runtimeDDL.replace('CREATE INDEX ', 'CREATE INDEX IF NOT EXISTS '));
     });
     this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_launch_inflight_identity ON fleet_launches(machine_id,engine,account,profile) WHERE native_id IS NULL AND state IN ('starting','uncertain')");
-    // Intake 6c9ed671: the verified no-start settlement scan runs only on the
-    // host-census path and the manual /reconcile endpoint, never inside
-    // claim/accountStatus maintenance; this partial index keeps that lookup
-    // independent of retained launch history.
-    this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_launch_nostart_receipt ON fleet_launches(updated_at) WHERE mode = 'headless' AND state IN ('starting','running','uncertain') AND launch_error_json IS NOT NULL AND native_id IS NULL AND launcher_task_id IS NULL");
     // Intake b527e905: the launcher-failure quarantine reads the most recent
     // launches, and Fleet's own retry custody maps retry_id -> held launch.
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_updated ON fleet_launches(updated_at)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_memory_holds_retry ON fleet_memory_holds(retry_id)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_session_incarnation ON fleet_sessions(machine_id,tag,engine,account,profile,workspace,phase)');
-    // Intake 94186660: serves the /api/fleet sessions keyset page
-    // (ORDER BY machine_id, tag, native_id with a 3-part cursor).
-    this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_session_page ON fleet_sessions(machine_id,tag,native_id)');
+    // Sessions paginate through their existing (machine_id,native_id) PK.
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_route_account ON fleet_routes(account)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_queue_live_machines ON machines(last_checkin_at,id) WHERE drained=0 AND revoked_at IS NULL');
     this.sql.exec('CREATE INDEX IF NOT EXISTS routing_launch ON routing_jobs(launch_id)');
@@ -890,26 +879,30 @@ export class FleetService {
     const cutoff = new Date(this.now() - 180000).toISOString();
     // Fleet-only stores need no control table. Probe once, not once per row.
     const controlStore = this.sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_control_sessions'").toArray().length > 0;
-    const bindingProjection = controlStore
-      ? '(SELECT binding_json FROM session_control_sessions c WHERE c.fleet_launch_id=l.id AND c.machine_id=l.machine_id LIMIT 1)'
-      : 'NULL';
-    // One indexed branch per state: an OR across states made SQLite read the machine's whole launch history.
-    const columns = `l.id, l.workspace, ${jsonFields('l.request_json',['cwd'])} AS request_json, l.launch_error_json, l.native_id, l.engine, l.mode, l.launcher_task_id, l.updated_at, ${bindingProjection} AS binding_json`;
-    const unobserved = `AND (l.native_id IS NULL OR NOT EXISTS (SELECT 1 FROM fleet_sessions s
-        WHERE s.machine_id = l.machine_id AND s.native_id = l.native_id AND s.engine = l.engine
-        AND s.phase IN ('starting','running') AND (s.observed_at >= ? OR ?)))`;
-    // Intake e8a22f4c: bound each branch to the same top-100 the union
-    // keeps. A global top-100 is always contained in the per-branch top-100s,
-    // so the result is identical while deep launch histories stop scanning.
-    return this.sql.exec(`SELECT * FROM (
-      SELECT * FROM (SELECT ${columns} FROM fleet_launches l WHERE l.machine_id = ? AND l.state IN ('starting','running','uncertain') ${unobserved} ORDER BY updated_at ASC LIMIT 100)
-      UNION ALL
-      SELECT * FROM (SELECT ${columns} FROM fleet_launches l WHERE l.machine_id = ? AND l.state = 'failed' AND l.mode = 'headless' AND l.exit_reason = ?
-        AND l.verification_status = 'unverified' AND l.finished_at > ? ${unobserved} ORDER BY updated_at ASC LIMIT 100)
-    ) ORDER BY updated_at LIMIT 100`, machine, cutoff, catalogFresh ? 1 : 0,
-      machine, SILENT_START_REASON, new Date(this.now() - ABANDONED_RECOVERY_MS).toISOString(), cutoff, catalogFresh ? 1 : 0).toArray().map((r: any) => {
-      const binding = controlStore ? parsed(r.binding_json) : null;
-      return { id: r.id, workspace: r.workspace, cwd: parsed(r.request_json).cwd ?? null, diagnostic: parsed(r.launch_error_json), native_id: r.native_id, engine: r.engine, mode: r.mode, launcher_task_id: r.launcher_task_id, binding };
+    // The deployed (machine_id,state,rowid) index supplies a bounded raw
+    // page before native/reason predicates. Transient cursors let sparse
+    // candidates behind already observed or unrelated history make progress.
+    const raw: any[] = [];
+    for (const state of ['starting','running','uncertain','failed']) {
+      const key = JSON.stringify([machine,state]);
+      const after = this.reconciliationAfter.get(key) ?? 0;
+      const page = this.sql.exec(`SELECT rowid AS source_rowid,* FROM fleet_launches INDEXED BY fleet_launch_machine_state
+        WHERE machine_id=? AND state=? AND rowid>? ORDER BY rowid LIMIT 25`,machine,state,after).toArray() as any[];
+      this.reconciliationAfter.set(key,page.length === 25 ? Number(page[page.length-1].source_rowid) : 0);
+      for (const row of page) {
+        if (state === 'failed' && !(row.mode === 'headless' && row.exit_reason === SILENT_START_REASON &&
+            row.verification_status === 'unverified' && row.finished_at > new Date(this.now()-ABANDONED_RECOVERY_MS).toISOString())) continue;
+        raw.push(row);
+      }
+    }
+    return raw.filter(row => {
+      if (row.native_id === null) return true;
+      return !this.sql.exec(`SELECT 1 FROM fleet_sessions WHERE machine_id=? AND native_id=? AND engine=?
+        AND phase IN ('starting','running') AND (observed_at>=? OR ?) LIMIT 1`,machine,row.native_id,row.engine,cutoff,catalogFresh ? 1 : 0).toArray().length;
+    }).sort((a,b)=>String(a.updated_at).localeCompare(String(b.updated_at))).slice(0,100).map(row => {
+      const control = controlStore ? this.sql.exec('SELECT binding_json FROM session_control_sessions WHERE fleet_launch_id=? AND machine_id=? LIMIT 1',row.id,machine).toArray()[0] as any : null;
+      return { id: row.id,workspace: row.workspace,cwd: parsed(row.request_json).cwd ?? null,diagnostic: parsed(row.launch_error_json),
+        native_id: row.native_id,engine: row.engine,mode: row.mode,launcher_task_id: row.launcher_task_id,binding: control ? parsed(control.binding_json) : null };
     });
   }
 
@@ -2443,10 +2436,9 @@ export class FleetService {
     if (path === '/api/fleet' && request.method === 'GET') {
       if (!admin) return response({ error: 'forbidden' }, 403);
       // Intake 94186660: paginated sessions + section allowlist.
-      // Sessions are keyset-paged over (machine_id, tag, native_id); the
-      // native_id tie-break keeps page boundaries exact when tags repeat on
-      // one machine (tags are not unique per machine). Defaults are a small
-      // page; full walks follow sessions_cursor_next until null.
+      // Sessions use the deployed (machine_id,native_id) primary-key order.
+      // Legacy three-part cursors map their native component into this order;
+      // new cursors carry two components. Full walks follow the opaque cursor.
       const fleetParams = new URL(request.url).searchParams;
       const KNOWN_SECTIONS = ['accounts', 'routes', 'machines', 'machine_aliases', 'agents', 'sessions', 'host_resources', 'resource_management', 'placement', 'subscriptions', 'launches'];
       const sectionsRaw = fleetParams.get('sections');
@@ -2457,13 +2449,13 @@ export class FleetService {
       const sessLimRaw = fleetParams.get('sessions_limit');
       if (sessLimRaw !== null && !/^\d{1,4}$/.test(sessLimRaw)) return response({ error: 'invalid_sessions_limit' }, 400);
       const sessLimit = sessLimRaw === null ? FLEET_SESSIONS_DEFAULT : Math.min(FLEET_SESSIONS_MAX, Math.max(1, Number(sessLimRaw)));
-      let sessCursor: [string, string, string] | null = null;
+      let sessCursor: [string, string] | null = null;
       const sessCursorRaw = fleetParams.get('sessions_cursor');
       if (sessCursorRaw) {
         try {
           const decoded = JSON.parse(b64urlDecode(sessCursorRaw));
-          if (!Array.isArray(decoded) || decoded.length !== 3 || decoded.some((v: any) => typeof v !== 'string' || v.length > 256 || /[\x00-\x1f\x7f]/.test(v))) throw new Error('bad cursor');
-          sessCursor = decoded as [string, string, string];
+          if (!Array.isArray(decoded) || ![2,3].includes(decoded.length) || decoded.some((v: any) => typeof v !== 'string' || v.length > 256 || /[\x00-\x1f\x7f]/.test(v))) throw new Error('bad cursor');
+          sessCursor = [decoded[0],decoded.length === 3 ? decoded[2] : decoded[1]];
         } catch { return response({ error: 'invalid_cursor' }, 400); }
       }
       // Change detection note (intake 94186660): no ETag/304 here. The only
@@ -2523,9 +2515,9 @@ export class FleetService {
       if (want('sessions')) {
         const take = sessLimit + 1;
         const sessRows = (sessCursor
-          ? this.sql.exec('SELECT * FROM fleet_sessions WHERE (machine_id, tag, native_id) > (?, ?, ?) ORDER BY machine_id, tag, native_id LIMIT ?',
-              sessCursor[0], sessCursor[1], sessCursor[2], take)
-          : this.sql.exec('SELECT * FROM fleet_sessions ORDER BY machine_id, tag, native_id LIMIT ?', take)
+          ? this.sql.exec('SELECT * FROM fleet_sessions WHERE (machine_id,native_id) > (?,?) ORDER BY machine_id,native_id LIMIT ?',
+              sessCursor[0], sessCursor[1], take)
+          : this.sql.exec('SELECT * FROM fleet_sessions ORDER BY machine_id,native_id LIMIT ?', take)
         ).toArray() as any[];
         sessionsTruncated = sessRows.length > sessLimit;
         const pageRows = sessRows.slice(0, sessLimit);
@@ -2535,7 +2527,7 @@ export class FleetService {
         sessions = projectAliasSessions(pageRows, new Map(Object.entries(machineAliases)), this.now(), freshCatalogs(this.sql, this.now()));
         if (sessionsTruncated && pageRows.length) {
           const last = pageRows[pageRows.length - 1];
-          sessionsCursorNext = b64urlEncode(JSON.stringify([String(last.machine_id), String(last.tag), String(last.native_id)]));
+          sessionsCursorNext = b64urlEncode(JSON.stringify([String(last.machine_id),String(last.native_id)]));
         }
       }
       const liveSessions = want('accounts') ? this.liveSessionsByAccount() : new Map<string, number>();
@@ -2549,6 +2541,7 @@ export class FleetService {
         out.sessions = sessions;
         out.sessions_total = sessionsTotal;
         out.sessions_total_unknown = sessionsTotal === null;
+        out.sessions_order = ['machine_id','native_id'];
         out.sessions_cursor_next = sessionsCursorNext;
         out.sessions_truncated = sessionsTruncated;
       }
@@ -2696,7 +2689,7 @@ export class FleetService {
             this.reservedLaunchContext([...liveIds], nowMs), limit, cursor);
           return response({ account: accountLabel, live_ids: [...liveIds].sort(), ...page });
         } catch (error) {
-          return response({ error: error instanceof Error && error.message === 'invalid_reserved_launch_cursor' ? 'invalid_cursor' : 'reserved_launch_read_failed' }, 400);
+          return response({ error: error instanceof Error && error.message === 'invalid_reserved_launch_cursor' ? 'invalid_cursor' : error instanceof Error && error.message === 'capacity_observation_limited' ? 'capacity_observation_limited' : 'reserved_launch_read_failed' }, error instanceof Error && error.message === 'capacity_observation_limited' ? 503 : 400);
         }
       }
       const fromRaw = params.get('from');

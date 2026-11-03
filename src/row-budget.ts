@@ -14,15 +14,17 @@ const DEFAULT_CHUNK = Object.freeze({ read: 50_000, written: 1_000 });
 /** Index DDL scans its entire source before exposing cursor counters. Never
  * let a new migration perform that scan against retained large tables. */
 export const INDEX_BUILD_SOURCE_LIMIT = 1000;
+export const INDEX_PARTIAL_READ_SOURCE_LIMIT = 50_000;
 const INDEX_METADATA_LIMIT = 64;
 
-type IndexBuild = { name: string; table: string };
+type IndexBuild = { name: string; table: string; predicate?: string };
 
 /** Tokenize identifiers, punctuation and literals separately so comments or
  * a quoted column containing CREATE INDEX cannot hide or invent a build. */
 function indexBuilds(query: string): { builds: IndexBuild[]; unsupported: boolean } {
-  const tokens = (query.match(/--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/|'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[[^\]]*\]|[A-Za-z_][A-Za-z0-9_$]*|[^\s]/g) ?? [])
-    .filter(token => !token.startsWith('--') && !token.startsWith('/*'));
+  const matches = [...query.matchAll(/--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/|'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[[^\]]*\]|[A-Za-z_][A-Za-z0-9_$]*|[^\s]/g)]
+    .filter(match => !match[0].startsWith('--') && !match[0].startsWith('/*'));
+  const tokens=matches.map(match=>match[0]);
   const word = (i: number, text: string) => tokens[i]?.toUpperCase() === text;
   const identifier = (i: number): string | null => {
     const value = tokens[i];
@@ -54,7 +56,20 @@ function indexBuilds(query: string): { builds: IndexBuild[]; unsupported: boolea
       table = identifier(j + 1); j += 2;
     }
     if (!name || !table || tokens[j] !== '(') { unsupported = true; continue; }
-    builds.push({ name, table });
+    let depth=0,k=j;
+    for(;k<tokens.length;k++) {
+      if(tokens[k]==='(') depth++;
+      if(tokens[k]===')' && --depth===0) { k++;break; }
+    }
+    if(depth!==0) { unsupported=true;continue; }
+    let predicate:string|undefined;
+    if(word(k,'WHERE')) {
+      const last=tokens.at(-1)===';'?matches.length-2:matches.length-1;
+      const end=last>=k?matches[last].index!+matches[last][0].length:matches[k].index!+matches[k][0].length;
+      predicate=query.slice(matches[k].index!+matches[k][0].length,end).trim();
+      if(!predicate) unsupported=true;
+    } else if(k<tokens.length && !(tokens[k]===';' && k===tokens.length-1)) unsupported=true;
+    builds.push({ name, table, predicate });
   }
   // A batch could mutate/recreate the source after preflight and before its
   // CREATE INDEX. Require separate calls so every build sees its real source.
@@ -192,6 +207,43 @@ export class RowBudget {
     this.dirty = false;
   }
 
+  /** Checkpoint a quiet object's actual spending and return ONLY unused
+   * prepaid credit. The predicate is rechecked after acquiring the ledger
+   * queue, so activity arriving while a refund waits cannot lose its credit.
+   * A crash before this checkpoint still loses reservations conservatively.
+   * No application SQL transaction can refund actual billed work. */
+  async releaseUnused(canRelease: () => boolean = () => true): Promise<boolean> {
+    let released = false;
+    await this.exclusive(async () => {
+      if (!canRelease() || !this.ledger || this.ledgerFailure || this.day() !== this.ledger.day) return;
+      if (this.credit.read <= 0 && this.credit.written <= 0 && !this.dirty) return;
+      const previous = this.ledger;
+      const ledger: Ledger = {
+        day: previous.day,
+        read: Math.max(0,previous.read-this.credit.read)+this.debt.read,
+        written: Math.max(0,previous.written-this.credit.written)+this.debt.written+1,
+        stopped: previous.stopped,
+      };
+      ledger.stopped ||= ledger.read >= this.limits.read || ledger.written >= this.limits.written;
+      // Freeze the old credits until the checkpoint is durable. New events
+      // serialize begin() behind this operation, rather than spending them.
+      this.stopped = true;
+      try { await this.storage.put(LEDGER_KEY,ledger); }
+      catch (error) {
+        this.ledgerFailure = true;
+        // Keep the old, larger reservation and local credit on failure.
+        // It is never made spendable again in this incarnation.
+        throw error;
+      }
+      this.ledger = ledger;
+      this.credit = { read: 0,written: 0 };
+      this.debt = { read: 0,written: 0 };
+      this.dirty = false;
+      released = true;
+    });
+    return released;
+  }
+
   /** No storage access: safe to inspect after the breaker trips. */
   status() {
     return { stopped: this.stopped, day: this.ledger?.day ?? this.day(),
@@ -316,11 +368,23 @@ export class RowBudget {
       // Keep source probe + build within current prepaid credit, allowing
       // conservative schema overhead. This does not preempt arbitrary SQL:
       // it bounds the particular full-source operation before native exec.
-      const cap = Math.min(INDEX_BUILD_SOURCE_LIMIT, Math.floor((this.credit.read - 64) / 3), Math.floor(this.credit.written - 16));
+      const cap = build.predicate
+        ? Math.min(INDEX_PARTIAL_READ_SOURCE_LIMIT,Math.floor((this.credit.read-128)/4))
+        : Math.min(INDEX_BUILD_SOURCE_LIMIT, Math.floor((this.credit.read - 64) / 3), Math.floor(this.credit.written - 16));
       if (cap < 0) deny('insufficient prepaid credit for index migration');
+      const partialWriteCap=Math.min(INDEX_BUILD_SOURCE_LIMIT,Math.floor(this.credit.written-16));
+      if(build.predicate && partialWriteCap<0) deny('insufficient prepaid write credit for partial index migration');
       const table = '"main"."' + build.table.replaceAll('"', '""') + '"';
-      const source = sql.exec(`SELECT 1 FROM ${table} LIMIT ?`, cap + 1).toArray();
+      const source = sql.exec(`SELECT 1 FROM ${table} NOT INDEXED LIMIT ?`, cap + 1).toArray();
       if (source.length > cap) deny('index source exceeds bounded migration allowance');
+      if(build.predicate) {
+        // A partial index reads every source row but writes only matching
+        // entries. Prove BOTH dimensions before DDL: sparse job credentials
+        // may have a large retained non-job history and only a few entries.
+        // The source bound above makes this unindexed predicate probe finite.
+        const matching=sql.exec(`SELECT 1 FROM ${table} NOT INDEXED WHERE ${build.predicate} LIMIT ?`,partialWriteCap+1).toArray();
+        if(matching.length>partialWriteCap) deny('partial index entries exceed bounded migration allowance');
+      }
     }
   }
 

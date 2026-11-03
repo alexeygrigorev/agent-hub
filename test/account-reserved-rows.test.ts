@@ -56,7 +56,7 @@ it('returns every accounted reserved launch, including rows outside the latest-2
       get(target, key) {
         if (key !== 'exec') return Reflect.get(target, key);
         return (query: string, ...bindings: any[]) => {
-          if (query.includes('FROM fleet_launches l') && query.includes('fleet_sessions') && query.includes('json_each')) {
+          if (query.includes('FROM fleet_launches INDEXED BY fleet_launch_account_state')) {
             maxBindings = Math.max(maxBindings, bindings.length);
             queryPlan = target.exec('EXPLAIN QUERY PLAN ' + query, ...bindings).toArray().map((row: any) => String(row.detail));
           }
@@ -93,7 +93,7 @@ it('returns every accounted reserved launch, including rows outside the latest-2
     });
     expect(pages.some(row => row.id === 'launch-000' && !listedByAccountView.has(row.id))).toBe(true);
     expect(maxBindings).toBeLessThanOrEqual(100);
-    expect(queryPlan.join('\n')).toMatch(/fleet_launch_account_state_id/);
+    expect(queryPlan.join('\n')).toMatch(/fleet_launch_account_state/);
 
     const forbidden = await service.handle(request('/accounts/hub-claude/reserved-launches?limit=100'), agent as any);
     expect(forbidden.status).toBe(403);

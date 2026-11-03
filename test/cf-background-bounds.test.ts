@@ -9,13 +9,13 @@ const fixture = (fn: (hub: Hub, state: DurableObjectState) => Promise<void>) =>
   runInDurableObject((env as any).HUB.get((env as any).HUB.idFromName('cf-bg-' + crypto.randomUUID())), fn);
 
 describe('bounded cron observations', () => {
-  it('bounds message inspection before expiry filtering and reports incomplete instead of pass', () => fixture(async (hub,state) => {
+  it('bounds live message candidates before acknowledgement filtering and reports incomplete instead of pass', () => fixture(async (hub,state) => {
     const sql = state.storage.sql;
     const now = Date.now();
     // Raw fixture setup is deliberately outside the production event budget.
     for (let i=0;i<1200;i++) sql.exec(`INSERT INTO messages
-      (id,from_actor,to_actor,kind,thread_id,body,idempotency_key,created_at,expires_at)
-      VALUES (?,'test','test:reader','note','thread','x',?,?,?)`, 'bg-' + String(i).padStart(5,'0'),'bg-key-'+i,now-600000,now-1000);
+      (id,from_actor,to_actor,kind,thread_id,body,idempotency_key,created_at,expires_at,acked_at)
+      VALUES (?,'test','test:reader','note','thread','x',?,?,?,?)`, 'bg-' + String(i).padStart(5,'0'),'bg-key-'+i,now-600000,now+3600000,now);
     const cursors: any[] = [];
     const observed = new Proxy(sql, { get(target,key) {
       if(key==='exec') return (q:string,...args:any[])=>{ const c=target.exec(q,...args);cursors.push(c);return c; };
@@ -26,9 +26,9 @@ describe('bounded cron observations', () => {
     expect(result.status).toBe('error');
     expect(result.detail).toContain('truncated');
     expect(cursors.reduce((n,c)=>n+Number(c.rowsRead),0)).toBeLessThan(2100);
-    const plan = sql.exec(`EXPLAIN QUERY PLAN SELECT to_actor,expires_at,registry_unbound_to FROM messages
-      WHERE acked_at IS NULL AND created_at < ? ORDER BY created_at LIMIT 1001`,now).toArray() as any[];
-    expect(plan.map(r=>r.detail).join(' ')).toContain('messages_check_pending_created');
+    const plan = sql.exec(`EXPLAIN QUERY PLAN SELECT to_actor,created_at,expires_at,acked_at,registry_unbound_to FROM messages INDEXED BY messages_expires_at
+      WHERE expires_at>? ORDER BY expires_at LIMIT 1001`,now).toArray() as any[];
+    expect(plan.map(r=>r.detail).join(' ')).toContain('messages_expires_at');
   }));
   it('prunes at most100 resolved alerts per cron call', () => fixture(async (_hub,state) => {
     const sql = state.storage.sql;
@@ -53,8 +53,8 @@ describe('bounded cron observations', () => {
     expect(backlog.truncated).toBe(true);
     expect(backlog.active_sessions).toBe(0);
     expect(cursors.reduce((n,c)=>n+Number(c.rowsRead),0)).toBeLessThan(1000);
-    expect(sql.exec(`EXPLAIN QUERY PLAN SELECT id FROM session_control_sessions INDEXED BY ops_active_sessions
-      WHERE state IN ('starting','offered','running') ORDER BY id LIMIT 201`).toArray().map((r:any)=>r.detail).join(' '))
-      .toContain('ops_active_sessions');
+    expect(sql.exec(`EXPLAIN QUERY PLAN SELECT id FROM session_control_sessions INDEXED BY session_control_state
+      WHERE state='running' ORDER BY rowid LIMIT 68`).toArray().map((r:any)=>r.detail).join(' '))
+      .toContain('session_control_state');
   }));
 });
