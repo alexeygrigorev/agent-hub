@@ -49,8 +49,8 @@ describe('reader loop write coalescing',()=>{
     try{
       hub.busService.inboxPage(caller,'team:reader');
       const persisted=now;now+=20*60000;
-      hub.sql.exec(`INSERT INTO messages(id,from_actor,to_actor,kind,thread_id,body,created_at,expires_at)
-        VALUES('failing-delivery','human:test','team:reader','note','failing-delivery','body',?,?)`,now,now+3600000);
+      hub.sql.exec(`INSERT INTO messages(id,from_actor,to_actor,kind,thread_id,body,idempotency_key,created_at,expires_at)
+        VALUES('failing-delivery','human:test','team:reader','note','failing-delivery','body','failing-delivery',?,?)`,now,now+3600000);
       const stage=vi.spyOn(hub.busService.hooks,'onStage').mockImplementation(()=>{throw new Error('delivery-ledger-failed');});
       expect(()=>hub.busService.inboxPage(caller,'team:reader')).toThrow('delivery-ledger-failed');
       stage.mockRestore();
