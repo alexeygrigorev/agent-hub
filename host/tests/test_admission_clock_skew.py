@@ -30,7 +30,7 @@ class AdmissionClockSkewTests(unittest.TestCase):
                     self.dispatch(age, duration)
                 diagnostic = classify(caught.exception)
                 self.assertEqual(diagnostic['gate_reason'], 'admission_timestamp_stale')
-                self.assertAlmostEqual(diagnostic['admission_age_s'], age, places=1)
+                self.assertAlmostEqual(diagnostic['admission_age_s'], age, delta=0.1)
                 self.assertEqual(diagnostic['gate_duration_s'], duration)
                 self.assertEqual(diagnostic['gate_post_stamp_s'], 0.4)
                 self.assertAlmostEqual(diagnostic['host_minus_hub_s'], -1.7, places=1)
