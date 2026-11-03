@@ -174,29 +174,33 @@ def human_refresh_guard():
     and every service unit use. Lock contention waits (30 s); other lock
     errors fail open to the previous unlocked behaviour.
     """
+    # Never yield inside a try/except here: an exception thrown into the
+    # generator at the yield would be swallowed by the handler and yield again
+    # ("generator didn't stop after throw()").
+    path = None
     try:
         cfg = config.load_config()
-        if cfg.get('worker_launch_id') or not config.is_human_config(cfg):
-            yield
-            return
-        path = config.get_human_config_path()
-        path = path.with_name(path.name + '.refresh.lock')
+        if not cfg.get('worker_launch_id') and config.is_human_config(cfg):
+            lock = config.get_human_config_path()
+            path = lock.with_name(lock.name + '.refresh.lock')
     except Exception:
+        path = None
+    manager = None
+    if path is not None:
+        deadline = time.monotonic() + 30
+        while manager is None:
+            candidate = private_fs.exclusive_lock(path)
+            try:
+                candidate.__enter__()
+                manager = candidate
+            except OSError as exc:
+                if exc.errno in (errno.EAGAIN, errno.EACCES) and time.monotonic() < deadline:
+                    time.sleep(.05)
+                    continue
+                break  # cannot lock (read-only dir etc.): unlocked, as before
+    if manager is None:
         yield
         return
-    manager = None
-    deadline = time.monotonic() + 30
-    while manager is None:
-        candidate = private_fs.exclusive_lock(path)
-        try:
-            candidate.__enter__()
-            manager = candidate
-        except OSError as exc:
-            if exc.errno in (errno.EAGAIN, errno.EACCES) and time.monotonic() < deadline:
-                time.sleep(.05)
-                continue
-            yield  # cannot lock (read-only dir etc.): unlocked, as before
-            return
     try:
         yield
     finally:
