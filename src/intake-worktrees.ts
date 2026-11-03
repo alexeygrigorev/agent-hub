@@ -108,9 +108,9 @@ export class IntakeWorktrees {
       actor: c.actor, created_at: c.created_at, claimed_at: c.claimed_at ?? null, finished_at: c.finished_at ?? null,
       result: parsed(c.result_json, null) };
   }
-  view(r: Obj): Obj {
-    const pending = (this.sql.exec("SELECT * FROM intake_worktree_commands WHERE worktree_id = ? AND state IN ('queued','claimed') ORDER BY created_at",
-      r.id).toArray() as Obj[]).map(c => this.commandView(c));
+  view(r: Obj, pendingRows?: Obj[]): Obj {
+    const pending = (pendingRows ?? (this.sql.exec("SELECT * FROM intake_worktree_commands WHERE worktree_id = ? AND state IN ('queued','claimed') ORDER BY created_at",
+      r.id).toArray() as Obj[])).map(c => this.commandView(c));
     return { id: r.id, task_id: r.task_id, machine: r.machine, path: r.path, branch: r.branch ?? null, created_at: r.created_at,
       updated_at: r.updated_at, session_ids: parsed(r.session_ids, []), origin: r.origin, state: r.state,
       status: parsed(r.status_json, null), status_at: r.status_at ?? null, last_remove: parsed(r.last_remove_json, null), pending };
@@ -121,10 +121,9 @@ export class IntakeWorktrees {
   }
   list(taskId: string): Obj[] { return this.rows(taskId).map(r => this.view(r)); }
 
-  /** Close gate: every non-removed worktree must be known gone and merged. */
-  gate(taskId: string): { ok: boolean; blocking: Obj[] } {
+  private gateRows(rows: Obj[]): { ok: boolean; blocking: Obj[] } {
     const blocking: Obj[] = [];
-    for (const r of this.rows(taskId)) {
+    for (const r of rows) {
       if (r.state !== 'active') continue;
       const s = parsed(r.status_json, null);
       const problems: string[] = [];
@@ -143,6 +142,43 @@ export class IntakeWorktrees {
         status_at: r.status_at ?? null, problems });
     }
     return { ok: blocking.length === 0, blocking };
+  }
+
+  /** Close gate: every non-removed worktree must be known gone and merged. */
+  gate(taskId: string): { ok: boolean; blocking: Obj[] } {
+    return this.gateRows(this.rows(taskId));
+  }
+
+  /** Batched worktree views and close gates for a page of tasks (chunks of 50). */
+  viewAndGateMany(taskIds: string[]): Map<string, { worktrees: Obj[]; close_gate: { ok: boolean; blocking: Obj[] } }> {
+    const rowsByTask = new Map<string, Obj[]>(taskIds.map(id => [id, []]));
+    const allRows: Obj[] = [];
+    for (let i = 0; i < taskIds.length; i += 50) {
+      const chunk = taskIds.slice(i, i + 50);
+      if (!chunk.length) continue;
+      for (const r of this.sql.exec(`SELECT * FROM intake_worktrees WHERE task_id IN (${chunk.map(() => '?').join(',')}) ORDER BY created_at, id`, ...chunk).toArray() as Obj[]) {
+        rowsByTask.get(r.task_id)?.push(r);
+        allRows.push(r);
+      }
+    }
+    const pendingByWorktree = new Map<string, Obj[]>();
+    for (let i = 0; i < allRows.length; i += 50) {
+      const chunk = allRows.slice(i, i + 50).map(r => r.id);
+      if (!chunk.length) continue;
+      for (const c of this.sql.exec(`SELECT * FROM intake_worktree_commands WHERE worktree_id IN (${chunk.map(() => '?').join(',')}) AND state IN ('queued','claimed') ORDER BY created_at`, ...chunk).toArray() as Obj[]) {
+        let list = pendingByWorktree.get(c.worktree_id);
+        if (!list) { list = []; pendingByWorktree.set(c.worktree_id, list); }
+        list.push(c);
+      }
+    }
+    const out = new Map<string, { worktrees: Obj[]; close_gate: { ok: boolean; blocking: Obj[] } }>();
+    for (const [taskId, rows] of rowsByTask) {
+      out.set(taskId, {
+        worktrees: rows.map(r => this.view(r, pendingByWorktree.get(r.id) ?? [])),
+        close_gate: this.gateRows(rows),
+      });
+    }
+    return out;
   }
 
   /** Upsert this task's ownership of (machine, path). Refuses when another

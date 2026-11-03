@@ -72,6 +72,17 @@ export class MergeGate {
   }
 
   get(taskId: string): Obj | null { return this.view(this.row(taskId)); }
+  getMany(taskIds: string[]): Map<string, Obj | null> {
+    const out = new Map<string, Obj | null>(taskIds.map(id => [id, null]));
+    for (let i = 0; i < taskIds.length; i += 50) {
+      const chunk = taskIds.slice(i, i + 50);
+      if (!chunk.length) continue;
+      for (const r of this.sql.exec(`SELECT * FROM intake_merge_state WHERE task_id IN (${chunk.map(() => '?').join(',')})`, ...chunk).toArray() as Obj[]) {
+        out.set(r.task_id, this.view(r));
+      }
+    }
+    return out;
+  }
 
   /** Newest first; bounded by the partial state index, never a table scan. */
   unmerged(limit = 50): Obj[] {

@@ -609,19 +609,30 @@ export class IntakeService {
     return rows.filter(t => !t.archived_at && OPEN.includes(t.status) && (!principal || this.allowed(principal, t))).length;
   }
   /** Operator-visible soft warning when open intake is high. Null when under threshold. */
-  intakeOpenWarning(principal?: Obj, summaries?: Obj[]): Obj | null {
+  intakeOpenWarning(principal?: Obj, summaries?: Obj[], precomputedOpenCount?: number): Obj | null {
     // Creation remains available while the bounded backfill is incomplete.
     // Never turn a partial counter into an apparently complete soft warning.
     if (!summaries && !this.intakeExportReady()) return { code: 'intake_export_migrating', retry_after: 1,
       message: 'Open intake warning is unavailable until intake export migration completes.' };
     const p = principal ?? { admin: true };
     const supplied = summaries?.filter(t => !t.archived_at && OPEN.includes(t.status) && this.allowed(p, t));
-    const open_count = supplied?.length ?? this.openNonTerminalCount(p);
+    const open_count = supplied?.length ?? precomputedOpenCount ?? this.openNonTerminalCount(p);
     if (open_count <= OPEN_INTAKE_WARN_THRESHOLD) return null;
     const itemLimit = 128;
-    const open = supplied ? supplied.slice(0, itemLimit) : intakeExportPageIds(this.sql, p,
-      { project: null, statuses: OPEN, archived: 0 }, null, itemLimit).map(id =>
-        JSON.parse((this.sql.exec('SELECT data FROM intake_export WHERE id=?', id).toArray()[0] as any).data));
+    let open: Obj[];
+    if (supplied) {
+      open = supplied.slice(0, itemLimit);
+    } else {
+      const ids = intakeExportPageIds(this.sql, p, { project: null, statuses: OPEN, archived: 0 }, null, itemLimit);
+      const byId = new Map<string, Obj>();
+      for (let i = 0; i < ids.length; i += 50) {
+        const chunk = ids.slice(i, i + 50);
+        for (const r of this.sql.exec(`SELECT id, data FROM intake_export WHERE id IN (${chunk.map(() => '?').join(',')})`, ...chunk).toArray() as any[]) {
+          byId.set(r.id, JSON.parse(r.data));
+        }
+      }
+      open = ids.map(id => byId.get(id)).filter((t): t is Obj => !!t);
+    }
     return {
       code: 'intake_open_high',
       severity: 'warn',
@@ -797,6 +808,31 @@ export class IntakeService {
       return row ?? null;
     } catch { return null; }
   }
+  private sessionRows(ids: string[]): Map<string, Obj | null> {
+    const unique = [...new Set(ids)];
+    const out = new Map<string, Obj | null>(unique.map(id => [id, null]));
+    try {
+      for (let i = 0; i < unique.length; i += 50) {
+        const chunk = unique.slice(i, i + 50);
+        if (!chunk.length) continue;
+        for (const r of this.sql.exec(`SELECT * FROM session_control_sessions WHERE id IN (${chunk.map(() => '?').join(',')})`, ...chunk).toArray() as Obj[]) {
+          out.set(r.id, r);
+        }
+      }
+    } catch { /* older database migrated without session_control_sessions */ }
+    return out;
+  }
+  private getTasksMany(ids: string[]): Obj[] {
+    const byId = new Map<string, Obj>();
+    for (let i = 0; i < ids.length; i += 50) {
+      const chunk = ids.slice(i, i + 50);
+      if (!chunk.length) continue;
+      for (const row of this.sql.exec(`SELECT data FROM intake_tasks WHERE id IN (${chunk.map(() => '?').join(',')})`, ...chunk).toArray() as any[]) {
+        const task = JSON.parse(row.data); byId.set(task.id, task);
+      }
+    }
+    return ids.map(id => byId.get(id)).filter((t): t is Obj => !!t);
+  }
   /** The live Hub session id keeping this task assigned, if any. Guards (not
    * disclosure): the row is read regardless of actor, only its id is used.
    * A manual link of an already ended session (intake 27505f04 AC8) appends
@@ -821,7 +857,7 @@ export class IntakeService {
    * task's snapshot revision; full lifecycle detail is visible only to the
    * operator or the session's owning actor, everyone else sees the id with a
    * not_visible marker (the link event itself already discloses the id). */
-  private assignedSessions(task: Obj, p: Obj): Obj[] {
+  private assignedSessions(task: Obj, p: Obj, sessions?: Map<string, Obj | null>): Obj[] {
     const seen = new Set<string>(); const out: Obj[] = [];
     const events = readEvents(task);
     for (let i = events.length - 1; i >= 0; i--) {
@@ -842,7 +878,7 @@ export class IntakeService {
       }
       if (e?.kind !== 'link' || typeof e.hub_session_id !== 'string' || !SESSION_UUID.test(e.hub_session_id) || seen.has(e.hub_session_id)) continue;
       seen.add(e.hub_session_id);
-      const row = this.sessionRow(e.hub_session_id);
+      const row = sessions && sessions.has(e.hub_session_id) ? (sessions.get(e.hub_session_id) ?? null) : this.sessionRow(e.hub_session_id);
       if (!row) { out.push({ hub_session_id: e.hub_session_id, linkage: 'unknown_session' }); continue; }
       if (!p.admin && row.actor !== p.actor) { out.push({ hub_session_id: e.hub_session_id, linkage: 'not_visible' }); continue; }
       let binding: Obj | null = null;
@@ -887,30 +923,64 @@ export class IntakeService {
       ...(status.stale_policy ? { stale_policy: true } : {}),
     };
   }
-  private taskView(task: Obj, p: Obj, graphs?: Map<string, any>): Obj {
+  private taskView(task: Obj, p: Obj, graphs?: Map<string, any>, batch?: {
+    worktrees: Map<string, { worktrees: Obj[]; close_gate: { ok: boolean; blocking: Obj[] } }>;
+    mergeStates: Map<string, Obj | null>;
+    sessions: Map<string, Obj | null>;
+    archiveSeqs: Map<string, number | undefined>;
+  }): Obj {
     const { title, current_state, next_step, owner, uncertainty, acceptance_criteria, history, history_archive,
       _history_order, _history_next_seq, ...identity } = task;
     const latestArchivedSequence = history_archive?.count
-      ? this.sql.exec('SELECT MAX(seq) AS latest_sequence FROM intake_note_archive WHERE task_id=?', task.id).toArray()[0]?.latest_sequence
+      ? (batch?.archiveSeqs.has(task.id) ? batch.archiveSeqs.get(task.id)
+        : this.sql.exec('SELECT MAX(seq) AS latest_sequence FROM intake_note_archive WHERE task_id=?', task.id).toArray()[0]?.latest_sequence)
       : undefined;
     const archiveView = history_archive ? { ...history_archive,
       ...(Number.isSafeInteger(latestArchivedSequence) ? { latest_sequence: latestArchivedSequence } : {}) } : undefined;
     const capacityWarning = taskCapacityWarning(task);
     const graph = { ...(graphs ?? this.dependencies.viewMany([task.id])).get(task.id)! };
     graph.dependencies = graph.dependencies.map(({ project, ...d }: Obj) => project != null && this.allowed(p, { id: d.id, project }) ? d : { ...d, title: null, status: 'not_visible' });
+    const wt = batch?.worktrees.get(task.id);
+    const mergeState = batch && batch.mergeStates.has(task.id) ? (batch.mergeStates.get(task.id) ?? null) : this.mergeGate.get(task.id);
     return { ...identity, ...graph, control: { version: task.version, status: task.status, continuation_state: this.continuation(task),
       authority: 'hub_ledger_cas', execution_evidence: 'not_verified_by_intake' },
       ...(archiveView ? { history_archive: archiveView } : {}),
       ...(capacityWarning ? { capacity_warning: capacityWarning } : {}),
       scope_flag: task.scope?.flag ?? null, scope: this.scopeView(task),
       payload_data: { title, current_state, next_step, owner, uncertainty, acceptance_criteria: acceptance_criteria ?? null, history }, unresolved: this.unresolved(task),
-      assigned_sessions: this.assignedSessions(task, p),
-      worktrees: this.worktrees.list(task.id), close_gate: this.worktrees.gate(task.id), merge_state: this.mergeGate.get(task.id) };
+      assigned_sessions: this.assignedSessions(task, p, batch?.sessions),
+      worktrees: wt ? wt.worktrees : this.worktrees.list(task.id),
+      close_gate: wt ? wt.close_gate : this.worktrees.gate(task.id),
+      merge_state: mergeState };
   }
-  /** One batched dependency read for a page of tasks (never one query per task). */
+  /** Batched reads for a page of tasks (never one query per task). */
   private taskViews(tasks: Obj[], p: Obj): Obj[] {
-    const graphs = this.dependencies.viewMany(tasks.map(t => t.id));
-    return tasks.map(t => this.taskView(t, p, graphs));
+    if (!tasks.length) return [];
+    const taskIds = tasks.map(t => t.id);
+    const graphs = this.dependencies.viewMany(taskIds);
+    const worktrees = this.worktrees.viewAndGateMany(taskIds);
+    const mergeStates = this.mergeGate.getMany(taskIds);
+    const sessionIds: string[] = [];
+    const archiveTaskIds: string[] = [];
+    for (const t of tasks) {
+      if (t.history_archive?.count) archiveTaskIds.push(t.id);
+      for (const e of readEvents(t)) {
+        if (e?.kind === 'link' && typeof e.hub_session_id === 'string' && SESSION_UUID.test(e.hub_session_id)) {
+          sessionIds.push(e.hub_session_id);
+        }
+      }
+    }
+    const sessions = this.sessionRows(sessionIds);
+    const archiveSeqs = new Map<string, number | undefined>(archiveTaskIds.map(id => [id, undefined]));
+    for (let i = 0; i < archiveTaskIds.length; i += 50) {
+      const chunk = archiveTaskIds.slice(i, i + 50);
+      if (!chunk.length) continue;
+      for (const r of this.sql.exec(`SELECT task_id, MAX(seq) AS latest_sequence FROM intake_note_archive WHERE task_id IN (${chunk.map(() => '?').join(',')}) GROUP BY task_id`, ...chunk).toArray() as Obj[]) {
+        archiveSeqs.set(r.task_id, r.latest_sequence);
+      }
+    }
+    const batch = { worktrees, mergeStates, sessions, archiveSeqs };
+    return tasks.map(t => this.taskView(t, p, graphs, batch));
   }
   private view(task: Obj, p: Obj): Obj { return { ...this.taskView(task, p), operator_rules: this.rules([task]), data_notice: DATA_NOTICE }; }
   private pageLimit(url: URL): number {
@@ -970,14 +1040,7 @@ export class IntakeService {
     if (after) credentialId(after);
     const remaining = listing.ids.filter(id => !after || id > after);
     const window = remaining.slice(0, limit);
-    const byId = new Map<string, Obj>();
-    for (let i = 0; i < window.length; i += 50) {
-      const chunk = window.slice(i, i + 50);
-      for (const row of this.sql.exec(`SELECT data FROM intake_tasks WHERE id IN (${chunk.map(() => '?').join(',')})`, ...chunk).toArray() as any[]) {
-        const task = JSON.parse(row.data); byId.set(task.id, task);
-      }
-    }
-    const page = window.map(id => byId.get(id)).filter((t): t is Obj => !!t && this.allowed(p, t));
+    const page = this.getTasksMany(window).filter(t => this.allowed(p, t));
     return { snapshot_version: listing.revision, effective_limit: limit, items: page,
       next: remaining.length > limit ? window[window.length - 1] : null, total: listing.ids.length };
   }
@@ -1003,7 +1066,8 @@ export class IntakeService {
       archived: archived === 'true' ? 1 : defaultOpen ? 0 : null };
     const rulesFor = (): Obj[] => this.rows('rules').filter(rule => rule.project === null ||
       (typeof rule.project === 'string' && (filter.project === null || rule.project === filter.project) && intakeExportCounts(this.sql, p, rule.project).some(r => intakeExportMatches(r, filter))));
-    const warnFor = () => this.intakeOpenWarning(p);
+    const openCount = this.openNonTerminalCount(p);
+    const warnFor = () => this.intakeOpenWarning(p, undefined, openCount);
     // Intake 08658ee8 AC1: a pinned token walk skips the revision check, so
     // create/close churn mid-walk cannot expire the cursor. Ids are pinned
     // (bounded); bodies and authorization are re-read live per page.
@@ -1012,12 +1076,12 @@ export class IntakeService {
       const result = this.pinnedPage(url, pinned, p);
       const warn = warnFor();
       return { ...result, authorization_valid_until: p.valid_until ?? null,
-        items: result.items.map((t: Obj) => this.taskView(t, p)), operator_rules: pinned.rules, data_notice: DATA_NOTICE,
+        items: this.taskViews(result.items, p), operator_rules: pinned.rules, data_notice: DATA_NOTICE,
         authorized_scope: p.admin ? 'operator_all' : 'explicit_grants_only',
         completeness: 'The list_token pins the matching id set and operator rules; pages stay valid while intakes are created or closed, and item bodies are read live. Restart once on list_token_expired (410).',
         list_token: pinned.token, list_expires_at: pinned.expires,
         ...(p.admin ? { intake_storage_warning: this.storageWarning() } : {}), intake_policy: 'soft_unlimited_tasks_t1038u',
-        open_non_terminal_count: this.openNonTerminalCount(p), open_intake_warn_threshold: OPEN_INTAKE_WARN_THRESHOLD,
+        open_non_terminal_count: openCount, open_intake_warn_threshold: OPEN_INTAKE_WARN_THRESHOLD,
         ...(warn ? { intake_open_warning: warn } : {}) };
     }
     // Full matching id set for a new pin or an explicit text search. Export
@@ -1043,39 +1107,33 @@ export class IntakeService {
       const result = this.pinnedPage(url, pinned, p);
       const warn = warnFor();
       return { ...result, authorization_valid_until: p.valid_until ?? null,
-        items: result.items.map((t: Obj) => this.taskView(t, p)), operator_rules: pinned.rules, data_notice: DATA_NOTICE,
+        items: this.taskViews(result.items, p), operator_rules: pinned.rules, data_notice: DATA_NOTICE,
         authorized_scope: p.admin ? 'operator_all' : 'explicit_grants_only',
         completeness: 'The list_token pins the matching id set and operator rules; pages stay valid while intakes are created or closed, and item bodies are read live. Restart once on list_token_expired (410).',
         list_token: pinned.token, list_expires_at: pinned.expires,
         ...(p.admin ? { intake_storage_warning: this.storageWarning() } : {}), intake_policy: 'soft_unlimited_tasks_t1038u',
-        open_non_terminal_count: this.openNonTerminalCount(p), open_intake_warn_threshold: OPEN_INTAKE_WARN_THRESHOLD,
+        open_non_terminal_count: openCount, open_intake_warn_threshold: OPEN_INTAKE_WARN_THRESHOLD,
         ...(warn ? { intake_open_warning: warn } : {}) };
     }
     if (q) {
       // Revision-pinned search page (single-shot dedup without a token).
       // For a churn-proof walk, start with list_token=new instead.
       const ids = fullIds();
-      const tasks: Obj[] = [];
-      for (let i = 0; i < ids.length; i += 50) {
-        const chunk = ids.slice(i, i + 50);
-        for (const row of this.sql.exec(`SELECT data FROM intake_tasks WHERE id IN (${chunk.map(() => '?').join(',')})`, ...chunk).toArray() as any[]) {
-          const t = JSON.parse(row.data); if (this.allowed(p, t)) tasks.push(t);
-        }
-      }
+      const tasks = this.getTasksMany(ids).filter(t => this.allowed(p, t));
       tasks.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
       const result = this.page(url, tasks, revision);
       const warn = warnFor();
-      return { ...result, authorization_valid_until: p.valid_until ?? null, items: result.items.map((t: Obj) => this.taskView(t, p)), operator_rules: rulesFor(), data_notice: DATA_NOTICE,
+      return { ...result, authorization_valid_until: p.valid_until ?? null, items: this.taskViews(result.items, p), operator_rules: rulesFor(), data_notice: DATA_NOTICE,
         authorized_scope: p.admin ? 'operator_all' : 'explicit_grants_only',
         completeness: 'All authorized matching records are included across pages at snapshot_version. Restart on stale_snapshot. For a churn-proof walk use list_token=new.',
         ...(p.admin ? { intake_storage_warning: this.storageWarning() } : {}), intake_policy: 'soft_unlimited_tasks_t1038u',
-        open_non_terminal_count: this.openNonTerminalCount(p), open_intake_warn_threshold: OPEN_INTAKE_WARN_THRESHOLD,
+        open_non_terminal_count: openCount, open_intake_warn_threshold: OPEN_INTAKE_WARN_THRESHOLD,
         ...(warn ? { intake_open_warning: warn } : {}) };
     }
     const page = this.page(url, [], revision); // shared limit/cursor/revision validation
     const total = intakeExportCounts(this.sql, p, filter.project).filter(r => intakeExportMatches(r, filter)).reduce((n, r) => n + Number(r.n), 0);
     const candidates = intakeExportPageIds(this.sql, p, filter, url.searchParams.get('after'), page.effective_limit + 1);
-    const pageTasks = candidates.slice(0, page.effective_limit).map(id => this.get('tasks', id)!);
+    const pageTasks = this.getTasksMany(candidates.slice(0, page.effective_limit));
     const items = this.taskViews(pageTasks, p);
     // Rules are capped at 128; check only their exact project counter keys.
     const rules = rulesFor();
@@ -1085,7 +1143,7 @@ export class IntakeService {
       authorized_scope: p.admin ? 'operator_all' : p.worker ? 'worker_project' : 'explicit_grants_only',
       completeness: 'All authorized matching records are included across pages at snapshot_version. Restart on stale_snapshot.',
       ...(p.admin ? { intake_storage_warning: this.storageWarning() } : {}), intake_policy: 'soft_unlimited_tasks_t1038u',
-      open_non_terminal_count: this.openNonTerminalCount(p), open_intake_warn_threshold: OPEN_INTAKE_WARN_THRESHOLD,
+      open_non_terminal_count: openCount, open_intake_warn_threshold: OPEN_INTAKE_WARN_THRESHOLD,
       ...(warn ? { intake_open_warning: warn } : {}) };
   }
   private exportSummary(url: URL, p: Obj, revision: number): Obj {
@@ -1095,9 +1153,12 @@ export class IntakeService {
       counts[row.status] = (counts[row.status] ?? 0) + Number(row.n); total += Number(row.n);
       if (row.archived) archived += Number(row.n); else if (OPEN.includes(row.status)) open += Number(row.n);
     }
-    const recent = intakeExportRecent(this.sql, p, url.searchParams.get('project'))
-      .map(r => { const task = JSON.parse(r.data); const session = task.last_session_id ? this.sessionRow(task.last_session_id) : null;
-        return { ...task, session: session ? (p.admin || session.actor === p.actor ? { id: session.id, state: session.state, updated_at: session.updated_at } : { id: session.id, linkage: 'not_visible' }) : null }; });
+    const rawRecent = intakeExportRecent(this.sql, p, url.searchParams.get('project')).map(r => JSON.parse(r.data));
+    const sessions = this.sessionRows(rawRecent.map(t => t.last_session_id).filter((id): id is string => typeof id === 'string' && !!id));
+    const recent = rawRecent.map(task => {
+      const session = task.last_session_id ? (sessions.get(task.last_session_id) ?? null) : null;
+      return { ...task, session: session ? (p.admin || session.actor === p.actor ? { id: session.id, state: session.state, updated_at: session.updated_at } : { id: session.id, linkage: 'not_visible' }) : null };
+    });
     return { snapshot_version: revision, as_of: Date.now(), freshness: 'transactional_current_read',
       authorization_valid_until: p.valid_until ?? null, authorized_scope: p.admin ? 'operator_all' : p.worker ? 'worker_project' : 'explicit_grants_only',
       total, counts, archived_count: archived, open_non_terminal_count: open, recent,
@@ -2423,7 +2484,7 @@ export class IntakeService {
       }
       if (!['GET', 'POST'].includes(request.method)) return json({ error: 'method_not_allowed' }, 405);
       const payload = request.method === 'POST' ? await body(request) : null;
-      const auth = await authenticate(); if (auth.error) return json({ error: await denialCode(auth.error) }, auth.error.status);
+      const auth = payload !== null ? await authenticate() : initial; if (auth.error) return json({ error: await denialCode(auth.error) }, auth.error.status);
       const decompose = request.method === 'POST' && /^\/api\/intake\/tasks\/([A-Za-z0-9._:-]+)\/decompose$/.exec(new URL(request.url).pathname);
       if (decompose) {
         const task = this.getAuthorizedTask(decompose[1], auth);

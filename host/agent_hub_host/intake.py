@@ -1,16 +1,10 @@
 """Private durable task context. Task text is data; this client never executes it."""
-import http.client
 import socket
 import json
 import os
 import re
-import uuid
 import sys
-import urllib.error
-import urllib.request
-from pathlib import Path
 from urllib.parse import urlencode
-from . import api, auth, config
 
 BASE = '/api/intake'
 MAX_REQUEST = 32768
@@ -18,6 +12,32 @@ EVENT_KINDS = ('intake', 'note', 'decision', 'followup', 'blocker', 'pending_app
                'link', 'session', 'report', 'commit', 'rule_reference', 'resolution',
                'approval_decision', 'owner_acceptance', 'first_action', 'work_action',
                'independent_review', 'accepted_outcome', 'human_delivery', 'obligation', 'obligation_response')
+
+
+def __getattr__(name):
+    """Load transport and helper modules on access while preserving the module API."""
+    if name in ('api', 'auth', 'config'):
+        module = __import__(f'{__package__}.{name}', fromlist=[name])
+        globals()[name] = module
+        return module
+    if name == 'uuid':
+        import uuid as module
+        globals()['uuid'] = module
+        return module
+    if name == 'Path':
+        from pathlib import Path as cls
+        globals()['Path'] = cls
+        return cls
+    if name == 'urllib':
+        import urllib.error
+        import urllib.request
+        globals()['urllib'] = urllib
+        return urllib
+    if name == 'http':
+        import http.client
+        globals()['http'] = http
+        return http
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 # Server error slugs are lowercase snake_case (longest today is 30 chars).
 # Passing the slug through keeps the exact failure (auth, grant, capacity,
@@ -50,6 +70,11 @@ class IntakeInputError(ValueError):
     """A client diagnostic containing only fixed labels and limits."""
 
 
+def _random_hex():
+    import uuid
+    return uuid.uuid4().hex
+
+
 def valid_key(value):
     # Match the server identifier exactly; rewriting keys breaks idempotency.
     if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}', value):
@@ -58,7 +83,11 @@ def valid_key(value):
 
 def diagnostic(exc):
     """Never interpolate exception bodies: they may contain credentials or payloads."""
-    if isinstance(exc, (IntakeHTTPError, IntakeTransportError, IntakeInputError, config.ConfigPermissionError)):
+    import http.client
+    import urllib.error
+    from .config import ConfigPermissionError
+
+    if isinstance(exc, (IntakeHTTPError, IntakeTransportError, IntakeInputError, ConfigPermissionError)):
         return str(exc)
     if isinstance(exc, StaleSnapshot):
         return 'Snapshot changed; retry the command to restart pagination'
@@ -173,7 +202,274 @@ def http_error(exc, method, payload):
     return result
 
 
+_cached_ssl_ctx = None
+_cached_ssl_env = None
+_summary_tls_pool = {}
+_https_conn_pool = {}
+
+
+def _ssl_context():
+    global _cached_ssl_ctx, _cached_ssl_env
+    import ssl
+    vp = ssl.get_default_verify_paths()
+    env_key = (
+        os.environ.get(vp.openssl_cafile_env or 'SSL_CERT_FILE'),
+        os.environ.get(vp.openssl_capath_env or 'SSL_CERT_DIR'),
+    )
+    if _cached_ssl_ctx is not None and _cached_ssl_env == env_key:
+        return _cached_ssl_ctx
+    if env_key == (None, None) and vp.capath and os.path.isdir(vp.capath):
+        ctx = ssl.create_default_context(capath=vp.capath)
+    else:
+        ctx = ssl.create_default_context()
+    _cached_ssl_ctx = ctx
+    _cached_ssl_env = env_key
+    return ctx
+
+
+def _fast_load_posix_config():
+    """Fast POSIX read of cli.json / host.json without importing pathlib/uuid/platform."""
+    if os.name != 'posix' or any(os.environ.get(k) for k in (
+        'HUB_CONFIG_FILE', 'HUB_WORKER_CONFIG_FILE', 'APLEXER_TAG', 'APLEXER_WORKSPACE'
+    )):
+        return None
+    import stat
+    uid = os.getuid()
+    xdg = os.environ.get('XDG_CONFIG_HOME') or os.path.join(os.path.expanduser('~'), '.config')
+    folder = os.path.join(xdg, 'agent-hub')
+    try:
+        dst = os.lstat(folder)
+        if not stat.S_ISDIR(dst.st_mode) or dst.st_uid != uid or (dst.st_mode & 0o077):
+            return None
+    except OSError:
+        return None
+    for name in ('cli.json', 'host.json'):
+        candidate = os.path.join(folder, name)
+        try:
+            fst = os.lstat(candidate)
+            if not stat.S_ISREG(fst.st_mode) or fst.st_uid != uid or (fst.st_mode & 0o077) or fst.st_nlink != 1 or fst.st_size > 32768:
+                continue
+            with open(candidate, 'rb') as fp:
+                data = json.loads(fp.read(32769).decode('utf-8'))
+            if isinstance(data, dict) and data.get('access_token'):
+                if not data.get('base_url'):
+                    data['base_url'] = 'https://hub.dtcdev.click'
+                return data
+        except Exception:
+            continue
+    return None
+
+
+def _fast_summary_get(path):
+    """Low-overhead TLS 1.3 GET for /api/intake/summary before loading urllib.request/http.client."""
+    from . import _prod_guard, _test_isolation
+    if _test_isolation.under_test_runner():
+        return None
+    cfg = _fast_load_posix_config()
+    if cfg is None:
+        try:
+            from . import config
+            cfg = config.load_config()
+        except Exception:
+            return None
+    base = os.environ.get('HUB_URL') or os.environ.get('HUB_BASE_URL') or cfg.get('base_url')
+    if not isinstance(base, str) or not base or base != base.strip():
+        return None
+    from urllib.parse import urlparse
+    parsed = urlparse(base.rstrip('/'))
+    if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
+        return None
+    try:
+        port = int(parsed.port) if parsed.port is not None else 443
+    except ValueError:
+        return None
+    if not (0 < port <= 65535):
+        return None
+    full_url = base.rstrip('/') + path
+    _prod_guard.assert_request_allowed(full_url)
+    token = os.environ.get('HUB_TOKEN') or os.environ.get('HUB_JOB_TOKEN') or cfg.get('access_token')
+    if not token:
+        return None
+    ctx = _ssl_context()
+    host_hdr = parsed.hostname if port == 443 else f'{parsed.hostname}:{port}'
+    req_bytes = (
+        f'GET {parsed.path + path} HTTP/1.1\r\n'
+        f'Host: {host_hdr}\r\n'
+        f'Authorization: Bearer {token}\r\n'
+        f'User-Agent: agent-hub-host/1\r\n'
+        f'Connection: keep-alive\r\n\r\n'
+    ).encode('ascii')
+    key = (parsed.hostname, port)
+    for attempt in range(2):
+        tls_sock = _summary_tls_pool.pop(key, None)
+        fresh = tls_sock is None
+        try:
+            if fresh:
+                raw_sock = socket.create_connection(key, timeout=10.0)
+                tls_sock = ctx.wrap_socket(raw_sock, server_hostname=parsed.hostname)
+            tls_sock.sendall(req_bytes)
+            buf = bytearray()
+            while b'\r\n\r\n' not in buf:
+                chunk = tls_sock.recv(8192)
+                if not chunk:
+                    raise OSError('eof')
+                buf.extend(chunk)
+                if len(buf) > 65536:
+                    tls_sock.close()
+                    return None
+            head_end = buf.index(b'\r\n\r\n')
+            head_lines = bytes(buf[:head_end]).decode('iso-8859-1').split('\r\n')
+            if not head_lines or not head_lines[0].startswith('HTTP/1.1 200'):
+                tls_sock.close()
+                return None
+            hdrs = {}
+            for line in head_lines[1:]:
+                if ':' in line:
+                    k, v = line.split(':', 1)
+                    hdrs[k.strip().lower()] = v.strip()
+            if 'application/json' not in hdrs.get('content-type', '').lower() or 'content-encoding' in hdrs:
+                tls_sock.close()
+                return None
+            will_close = 'close' in hdrs.get('connection', '').lower()
+            body = bytearray(buf[head_end + 4:])
+            if hdrs.get('transfer-encoding', '').lower() == 'chunked':
+                while True:
+                    if body.endswith(b'0\r\n\r\n') or len(body) > 1048576:
+                        break
+                    chunk = tls_sock.recv(16384)
+                    if not chunk:
+                        break
+                    body.extend(chunk)
+                decoded = bytearray()
+                idx = 0
+                while idx < len(body):
+                    crlf = body.find(b'\r\n', idx)
+                    if crlf < 0:
+                        tls_sock.close()
+                        return None
+                    size = int(bytes(body[idx:crlf]).split(b';', 1)[0], 16)
+                    idx = crlf + 2
+                    if size == 0:
+                        break
+                    if idx + size > len(body):
+                        tls_sock.close()
+                        return None
+                    decoded.extend(body[idx:idx + size])
+                    idx += size + 2
+                if will_close:
+                    tls_sock.close()
+                else:
+                    _summary_tls_pool[key] = tls_sock
+                return json.loads(bytes(decoded).decode('utf-8'))
+            if 'content-length' in hdrs:
+                need = int(hdrs['content-length'])
+                if need > 1048576:
+                    tls_sock.close()
+                    return None
+                while len(body) < need:
+                    chunk = tls_sock.recv(min(16384, need - len(body)))
+                    if not chunk:
+                        tls_sock.close()
+                        return None
+                    body.extend(chunk)
+                if will_close:
+                    tls_sock.close()
+                else:
+                    _summary_tls_pool[key] = tls_sock
+                return json.loads(bytes(body[:need]).decode('utf-8'))
+            tls_sock.close()
+            return None
+        except Exception:
+            if tls_sock is not None:
+                try:
+                    tls_sock.close()
+                except Exception:
+                    pass
+            if not fresh and attempt == 0:
+                continue
+            return None
+    return None
+
+
+def _https_get_json(base, path, access):
+    """Keep-alive HTTPS GET with capath SSLContext and gzip decompression for multi-page export."""
+    import http.client
+    import io
+    import urllib.error
+    from urllib.parse import urlparse
+    from . import _prod_guard
+    full_url = base.rstrip('/') + path
+    _prod_guard.assert_request_allowed(full_url)
+    parsed = urlparse(base.rstrip('/'))
+    host = parsed.hostname
+    port = int(parsed.port) if parsed.port is not None else 443
+    key = (host, port)
+    headers = {
+        'Authorization': 'Bearer ' + access,
+        'Content-Type': 'application/json',
+        'User-Agent': 'agent-hub-host/1',
+        'Connection': 'keep-alive',
+    }
+    if path.startswith(BASE + '/tasks'):
+        headers['Accept-Encoding'] = 'gzip'
+    for attempt in range(2):
+        conn = _https_conn_pool.pop(key, None)
+        if conn is not None and getattr(conn, 'sock', None) is None:
+            conn.close()
+            conn = None
+        fresh = conn is None
+        if fresh:
+            conn = http.client.HTTPSConnection(host, port, timeout=10.0, context=_ssl_context())
+        try:
+            conn.request('GET', (parsed.path or '') + path, headers=headers)
+            res = conn.getresponse()
+            break
+        except Exception as err:
+            conn.close()
+            if not fresh and attempt == 0:
+                continue
+            if isinstance(err, OSError):
+                raise urllib.error.URLError(err)
+            raise
+    if res.status != 200:
+        err_body = res.read(65537)
+        conn.close()
+        raise urllib.error.HTTPError(full_url, res.status, res.reason, res.headers, io.BytesIO(err_body))
+    ct = res.headers.get('Content-Type', '')
+    if 'application/json' not in ct:
+        conn.close()
+        raise RuntimeError('Expected JSON response')
+    cl = res.headers.get('Content-Length')
+    if cl is not None and int(cl) > 10 * 1024 * 1024:
+        conn.close()
+        raise RuntimeError('Response too large')
+    body = res.read(10 * 1024 * 1024 + 1)
+    if len(body) > 10 * 1024 * 1024:
+        conn.close()
+        raise RuntimeError('Response too large')
+    if not getattr(res, 'will_close', True) and res.isclosed() and getattr(conn, 'sock', None) is not None:
+        _https_conn_pool[key] = conn
+    else:
+        conn.close()
+    if (res.headers.get('Content-Encoding') or '').lower() == 'gzip':
+        import gzip
+        with gzip.GzipFile(fileobj=io.BytesIO(body)) as gz:
+            body = gz.read(10 * 1024 * 1024 + 1)
+        if len(body) > 10 * 1024 * 1024:
+            raise RuntimeError('Response too large')
+    return json.loads(body.decode('utf-8'))
+
+
 def request(method, path, payload=None):
+    if method == 'GET' and payload is None and path.startswith(BASE + '/summary') and 'api' not in globals():
+        fast = _fast_summary_get(path)
+        if fast is not None:
+            return fast
+    import http.client
+    import urllib.error
+    import urllib.request
+    from . import _test_isolation, api, auth, config
+
     cfg = config.load_config()
     base = os.environ.get('HUB_URL') or os.environ.get('HUB_BASE_URL') or cfg.get('base_url')
     api.check_url(base)
@@ -181,12 +477,20 @@ def request(method, path, payload=None):
     if data is not None and len(data) > MAX_REQUEST:
         raise IntakeInputError(f'Intake request exceeds {MAX_REQUEST} UTF-8 bytes (JSON envelope included)')
     env_token = os.environ.get('HUB_TOKEN') or os.environ.get('HUB_JOB_TOKEN')
-    token = env_token or auth.get_access_token()
+    token = env_token or cfg.get('access_token') or auth.get_access_token()
 
     def send(access):
-        req = urllib.request.Request(base.rstrip('/') + path, data=data, method=method,
-                                     headers={'Authorization': 'Bearer ' + access, 'Content-Type': 'application/json'})
         try:
+            if (
+                method == 'GET'
+                and data is None
+                and base.lower().startswith('https://')
+                and not _test_isolation.under_test_runner()
+                and getattr(api.safe_http_json, '__module__', '') == 'agent_hub_host.api'
+            ):
+                return _https_get_json(base, path, access)
+            req = urllib.request.Request(base.rstrip('/') + path, data=data, method=method,
+                                         headers={'Authorization': 'Bearer ' + access, 'Content-Type': 'application/json'})
             return api.safe_http_json(req)
         except urllib.error.HTTPError:
             raise
@@ -210,6 +514,7 @@ def request(method, path, payload=None):
 
 
 def read_file(path, limit=MAX_REQUEST, field='Input'):
+    from pathlib import Path
     try:
         if path == '-':
             raw = sys.stdin.buffer.read(limit + 1)
@@ -606,6 +911,7 @@ def execute(args):
         if not merge_evidence.SHA.match(recorded_head):
             recorded_head = ''
         try:
+            from pathlib import Path
             repo = str(Path(args.repo).resolve()) if args.repo else merge_evidence.own_clone()
             candidates = merge_evidence.shas_from_text(text, exclude=(task.get('id'),) + tuple(e.get('hub_session_id') or e.get('id') for e in history if isinstance(e, dict)))
             merge_evidence.fetch_origin(repo)
@@ -617,7 +923,7 @@ def execute(args):
             raise IntakeInputError(str(exc)) from None
         if args.dry_run:
             return {'dry_run': True, 'evidence': evidence}
-        key = args.key or 'merge-check-' + uuid.uuid4().hex
+        key = args.key or 'merge-check-' + _random_hex()
         valid_key(key)
         return request('POST', BASE + '/tasks/' + safe_id(args.id) + '/merge-evidence', {'key': key, **evidence})
     if command in ('rules', 'grants'):
@@ -625,7 +931,7 @@ def execute(args):
                        json_file(args.payload_file) if args.payload_file else None)
     path = BASE + '/tasks/' + safe_id(args.id)
     if command in ('depend', 'blocker', 'decompose'):
-        key = args.key or (command + '-' + uuid.uuid4().hex)
+        key = args.key or (command + '-' + _random_hex())
         valid_key(key)
         version = args.version
         if version is None:
@@ -660,7 +966,7 @@ def execute(args):
         return result
     if command == 'revoke':
         return request('POST', BASE + '/grants/' + safe_id(args.id) + '/revoke', json_file(args.payload_file))
-    key = args.key or (command + '-' + uuid.uuid4().hex if command in ('update', 'close', 'promote') else None)
+    key = args.key or (command + '-' + _random_hex() if command in ('update', 'close', 'promote') else None)
     valid_key(key)
     payload = {'key': key, 'expected_version': args.version}
     if command == 'continue':
@@ -683,6 +989,7 @@ def execute(args):
             session['parent_id'] = args.parent
         session['mode'] = 'interactive' if args.interactive else 'headless'
         if args.brief_file:
+            from pathlib import Path
             if session['mode'] == 'interactive':
                 raise IntakeInputError('Interactive sessions start at an empty native prompt')
             with (sys.stdin.buffer if args.brief_file == '-' else Path(args.brief_file).open('rb')) as stream:
@@ -739,6 +1046,7 @@ def execute(args):
 
 def cas_update(path, payload, automatic, key, read_path=None):
     """POST a task update, refetching the version on CAS conflicts when automatic."""
+    import http.client
     for attempt in range(3):
         if automatic:
             current = request('GET', read_path or path)
@@ -757,10 +1065,27 @@ def cas_update(path, payload, automatic, key, read_path=None):
 
 def summary_main():
     """Small shared entry point; skip unrelated CLI imports/registration."""
-    import argparse
-    parser = argparse.ArgumentParser(prog='hub intake summary', description='Current task counts and five recent tasks; no histories')
-    parser.add_argument('--project')
-    args = parser.parse_args(sys.argv[3:])
+    argv = sys.argv[3:]
+    project = None
+    use_argparse = False
+    if not argv:
+        pass
+    elif len(argv) == 2 and argv[0] == '--project' and not argv[1].startswith('-'):
+        project = argv[1]
+    elif len(argv) == 1 and argv[0].startswith('--project='):
+        project = argv[0].split('=', 1)[1]
+    else:
+        use_argparse = True
+    if use_argparse:
+        import argparse
+        parser = argparse.ArgumentParser(prog='hub intake summary', description='Current task counts and five recent tasks; no histories')
+        parser.add_argument('--project')
+        args = parser.parse_args(argv)
+    else:
+        class _Args:
+            pass
+        args = _Args()
+        args.project = project
     args.cmd, args.intake_cmd = 'intake', 'summary'
     try:
         print(json.dumps(execute(args), ensure_ascii=True))
