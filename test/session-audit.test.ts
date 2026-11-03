@@ -523,10 +523,14 @@ describe('production notification adapter (real hub liveness + delivery receipt)
   }
   function seedNative(h: any, i: number) {
     const nowMs = Date.now();
+    h.sql.exec("INSERT OR IGNORE INTO machines (id,name,hostname,registered_at,last_checkin_at) VALUES ('m1','m1','m1',?,?)", iso(nowMs), iso(nowMs));
     h.sql.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,workspace,progress_json)
       VALUES (?,?,?,?,?,?,?,?)`, 'm1', 'n' + i, 'worker', 'codex', 'running', iso(nowMs),
       '/home/alexey/git/demo-wt-' + i, JSON.stringify({ last_progress_at: iso(nowMs - 2 * HOUR) }));
     h.sql.exec('INSERT OR REPLACE INTO fleet_catalog_seen(machine_id,observed_at) VALUES (?,?)', 'm1', iso(nowMs));
+    // These tests seed fleet_sessions directly instead of through the census
+    // write-through path; discard any catalog snapshot built by Hub init.
+    h.observedCatalog.reset();
   }
   const outcomeCounts = (h: any) =>
     Object.fromEntries(h.sql.exec('SELECT outcome, COUNT(*) AS n FROM session_audit_decisions GROUP BY outcome').toArray().map((r: any) => [r.outcome ?? 'pending', Number(r.n)]));

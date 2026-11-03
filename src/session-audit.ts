@@ -233,7 +233,15 @@ const sessionKey = (machineId: any, nativeId: any, sessionId: any): string =>
 export class SessionAuditService {
   constructor(private sql: SqlStorage, private hooks: SessionAuditHooks = {}, private now = Date.now,
     private decider: (idleThresholdS: number) => SessionDecider = makeHeuristicDecider,
-    private env?: any, private interval = AUDIT_INTERVAL) {}
+    private env?: any, private interval = AUDIT_INTERVAL,
+    private nativeCatalog?: () => Obj[]) {}
+
+  /** The Hub supplies its write-through observed catalog. Standalone service
+   * users retain the indexed SQL fallback, while scheduled Hub audits never
+   * rescan the retained fleet_sessions table. */
+  private nativeSessionRows(): Obj[] {
+    return this.nativeCatalog ? this.nativeCatalog() : this.rows('SELECT * FROM fleet_sessions');
+  }
 
   init() {
     this.sql.exec('CREATE TABLE IF NOT EXISTS session_audit_meta (id INTEGER PRIMARY KEY CHECK(id=1), last_tick INTEGER, last_source TEXT, last_result TEXT)');
@@ -438,10 +446,9 @@ export class SessionAuditService {
     return unverifiedStops;
   }
 
-  private collect(now: number): { audits: AuditFeatures[] } {
+  private collect(now: number, nativeRows = this.nativeSessionRows()): { audits: AuditFeatures[] } {
     const sessions = this.rows(`SELECT * FROM session_control_sessions
       WHERE state IN ('queued','held','offered','starting','running','uncertain')`);
-    const nativeRows = this.rows('SELECT * FROM fleet_sessions');
     const natives = new Map<string, Obj>(nativeRows.map(n => [n.machine_id + '/' + n.native_id, n]));
     const catalogs = freshCatalogs(this.sql, now);
     const cpuByMachine = new Map<string, Obj>();
@@ -549,11 +556,12 @@ export class SessionAuditService {
 
     const thresholdS = idleThresholdFrom(this.env);
     const decider = this.decider(thresholdS);
-    const natives = new Map(this.rows('SELECT * FROM fleet_sessions').map(n => [n.machine_id + '/' + n.native_id, n]));
+    const nativeRows = this.nativeSessionRows();
+    const natives = new Map(nativeRows.map(n => [n.machine_id + '/' + n.native_id, n]));
     const catalogs = freshCatalogs(this.sql, now);
     const unverifiedStops = this.resolveOutcomes(this.pendingRows(), this.trackingStops(), natives, catalogs, now);
 
-    const { audits } = this.collect(now);
+    const { audits } = this.collect(now, nativeRows);
     const runAt = new Date(now).toISOString();
     this.sql.exec('INSERT INTO session_audit_runs(at,source,scanned,counts_json) VALUES (?,?,?,?)', runAt, source, audits.length, '{}');
     const runId = Number(this.rows('SELECT id FROM session_audit_runs ORDER BY id DESC LIMIT 1')[0].id);
