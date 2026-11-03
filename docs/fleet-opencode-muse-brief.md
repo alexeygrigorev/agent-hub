@@ -1,4 +1,10 @@
-# Fleet OpenCode Muse-brief route (platform-muse-brief slice)
+# Historical design: Fleet OpenCode Muse-brief route (platform-muse-brief slice)
+
+> This is an owner-authored design record from 2026-10-17. The pure
+> `fleet_launch.py` helper and its helper-only tests were retired by intake
+> `b6e2bef5` after a current-source call-graph check found no production
+> imports. `fleet.py` remains the production dispatcher, and its integration
+> tests remain. See [the test-only code decisions](test-only-code-decisions-b6e2bef5.md).
 
 Exact source/config contract for head integration. No production launches by worker.
 

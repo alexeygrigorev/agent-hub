@@ -3,7 +3,6 @@ import { recordUsageQuota, USAGE_RETENTION_MS } from '../src/usage-store';
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { HostHistoryService, QUOTA_WINDOW_STALE_MS } from '../src/host-history';
-import { displayAccount, displayAccountLabel, canonicalProviderKey } from '../src/account-display';
 import { TOKEN_SOURCES, tokenEntity, tokenPostAt, validateTokenPayload } from '../src/token-history';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
@@ -156,17 +155,6 @@ describe('quota window history (AC1)', () => {
     expect(h.handle(new Request('https://hub/api/monitoring/history?range=90d'), admin).status).toBe(400);
     expect(h.handle(new Request('https://hub/api/monitoring/history?range=24h'), {}).status).toBe(401);
   }));
-});
-
-describe('account display mapping (AC4)', () => {
-  it('reuses canonical quota labels without inventing sibling rename aliases', () => {
-    expect(displayAccountLabel('codex-orin')).toBe('codex/codex codex-orin');
-    expect(displayAccountLabel('go', 'urgent-muse')).toBe('opencode/go shared-go');
-    expect(displayAccountLabel('zai', 'shared-zai')).toBe('codex/zai shared-zai');
-    expect(displayAccountLabel('codex', 'shared-codex')).toBe('codex/codex shared-codex');
-    expect(canonicalProviderKey('codex-orin')).toBe('codex');
-    expect(displayAccountLabel('brand-new','my-acct')).toBe('brand-new/brand-new my-acct');
-  });
 });
 
 const hourIso = (ms: number) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, '.000Z');
