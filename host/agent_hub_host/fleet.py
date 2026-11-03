@@ -3281,6 +3281,36 @@ class Dispatcher:
                 'pre-claim check timed out; held for retry',
                 claim_key=self._pending_claim_key(offer_id)) from exc
 
+    def _provision_worker_credential(self, provision, workspace, offer_id):
+        try:
+            provision(workspace, offer_id, self.request)
+        except Exception as exc:
+            # Keep the public launch reason fixed, but preserve enough bounded
+            # evidence in the host journal to identify which worker-credential
+            # step failed. Do not log exception text or response bytes: an
+            # arbitrary HTTP body may contain credentials.
+            status = getattr(exc, 'http_status', None)
+            if type(status) is not int or not 100 <= status <= 599:
+                status = None
+            code = (getattr(exc, 'error_code', None)
+                    or getattr(exc, 'error_reason', None))
+            if not isinstance(code, str) or not re.fullmatch(r'[a-z][a-z0-9_]{2,64}', code):
+                code = None
+            try:
+                print(json.dumps({
+                    'event': 'worker_credential_failed',
+                    'offer_id': offer_id,
+                    'error_type': type(exc).__name__[:64],
+                    'status': status,
+                    'code': code,
+                }), flush=True)
+            except Exception:
+                pass
+            # This POST mints credentials. A timeout can follow a committed
+            # issuance, so replaying it without server idempotency may create
+            # more valid tokens. Keep it fail-closed until that contract exists.
+            raise ValueError('Worker Hub credential could not be prepared') from None
+
     def dispatch(self, offer):
         if offer.get('with_goal') and offer.get('mode') != 'interactive':
             raise ValueError('Goal work is interactive only')
@@ -3617,12 +3647,7 @@ class Dispatcher:
                 prepare_tmpdir(workspace)
             if offer.get('worker_credential_required') is True:
                 from .worker_auth import provision
-                try:
-                    provision(str(workspace), offer_id, self.request)
-                except Exception:
-                    # Fixed diagnostic only. A failed/uncertain credential
-                    # response must never leak bytes or start an unscoped worker.
-                    raise ValueError('Worker Hub credential could not be prepared') from None
+                self._provision_worker_credential(provision, str(workspace), offer_id)
             if mode == "interactive" and not offer.get("with_goal"):
                 # Empty interactive starts must remain empty: queue the trusted
                 # preamble in the native inbox before the engine's awareness hook
