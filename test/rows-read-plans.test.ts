@@ -71,6 +71,16 @@ describe('hot-path query plans use indexes, never full scans', () => {
     expect(fullScan(p, 'fleet_launches')).toBe(false);
   }));
 
+  it('message inserts bind agents with indexed lookups, not registry scans', () => withHub(async hub => {
+    for (let i = 0; i < 200; i++) hub.sql.exec("INSERT INTO agents(tag,project,role,machine_id,registered_at) VALUES(?,'p',NULL,NULL,?)", 'probe-' + i, iso(0));
+    const cursor: any = hub.sql.exec("INSERT INTO messages(id,from_actor,to_actor,kind,thread_id,body,idempotency_key,created_at,expires_at,state) VALUES(?,?,?,?,?,?,?,?,?,?)",
+      'bind-probe', 'bot', 'grok-bot', 'note', 't', 'b', 'bind-key', Date.now() - 1000, Date.now() + 86400000, 'accepted');
+    // The bind trigger used a CASE over stored columns and scanned the whole
+    // registry per insert (~8 rows/agent, ~9k live); the sargable form reads
+    // a handful of index entries regardless of registry size.
+    expect(Number(cursor.rowsRead)).toBeLessThan(150);
+  }));
+
   it('cleanup protections use the session primary key', () => withHub(async hub => {
     const p = plan(hub, 'SELECT request_key, created_at FROM session_control_protections WHERE session_id = ?', 's');
     expect(fullScan(p, 'session_control_protections')).toBe(false);
