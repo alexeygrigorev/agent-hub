@@ -82,9 +82,11 @@ remainder is per-intent volume and needs admission-side quarantine).
 
 - `checks:run_due`: identical verdicts skip the `hub_checks` UPDATE and the
   `hub_check_runs` INSERT; the 1000-row trim runs only when history grew.
-- Census PUT: the two fleet-wide terminal reconciles
-  (`reconcileAccountCapacity`, `reconcileVerifiedNoStarts`) run only when the
-  census changed or retired rows; unchanged polls skip them.
+- Census PUT: gating the two fleet-wide terminal reconciles on changed
+  censuses was reverted: `account-capacity.test.ts` and `fleet.test.ts`
+  require per-census settlement of verified no-start phantoms and terminal
+  incarnations, and the reconciles write only on positive terminal evidence.
+  (PR#2 keeps the checks identical-skip and the token persist cooldown.)
 - `recordSessionTokens`: active-phase token upserts persist at most once per
   60s per session (`TOKEN_PERSIST_COOLDOWN_MS`); terminal phases always
   persist so the final count is never lost.
