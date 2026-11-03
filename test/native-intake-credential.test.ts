@@ -146,20 +146,3 @@ describe('native session intake credential', () => {
   }));
 });
 
-describe('watermarked ended-credential sweep', () => {
-  it('bounds the sweep to recently ended sessions; a full sweep catches stragglers', () => setup(async ({ stub, task, session, native, call, link }: any) => {
-    await link(task, native);
-    const minted = await call('/api/sessions/' + session + '/intake-credential', {});
-    expect(minted.status, await minted.clone().text()).toBe(200);
-    // End the session an hour ago: a watermarked sweep misses it, the periodic
-    // full sweep (e.g. after a restart) still revokes it.
-    const old = new Date(Date.now() - 3600000).toISOString();
-    await runInDurableObject<Hub, any>(stub, (h: any) => {
-      h.sql.exec("UPDATE session_control_sessions SET state='stopped', updated_at=? WHERE id=?", old, session);
-      revokeEndedNativeWorkerCredentials(h.sql, Date.now(), Date.now());
-      expect(h.sql.exec("SELECT count(*) AS n FROM credentials WHERE kind='agent' AND revoked_at IS NULL").one().n).toBe(1);
-      revokeEndedNativeWorkerCredentials(h.sql, Date.now(), 0);
-      expect(h.sql.exec("SELECT count(*) AS n FROM credentials WHERE kind='agent' AND revoked_at IS NULL").one().n).toBe(0);
-    });
-  }));
-});

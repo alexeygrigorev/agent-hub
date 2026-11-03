@@ -140,19 +140,6 @@ window) plus the Cloudflare GraphQL rowsRead/rowsWritten series; until the
 live total is under the alert line the budget alert keeps firing as an
 over_budget liveness alert (single notification, hourly refresh, no paging
 storm) rather than a per-hour page.
-## Quiet census (intake e8a22f4c)
-
-PUT /api/fleet/sessions ran ~11 statements / ~560 rows per poll even when the
-catalog was byte-identical (9.8M statements, 490M reads, 8.9M writes/day).
-The handler now keys the canonical catalog (same fields, nulls and volatile
-progress timestamps as the row compare) per machine in memory: on a key match
-only the two capped freshness upserts run (3 statements, near-zero reads,
-zero writes unless the minute cap elapsed). Changed censuses take the full
-path unchanged (probes, adoption, reconciles, drain). The intake linkage
-revision is deliberately not part of the key: it moves on every fleet-wide
-intake write while adoption is idempotent and reruns on the next changed
-census (credential/liveness paths read links live).
-
 ## Read cuts, round 2 (intake e8a22f4c)
 
 - `reconciliationCandidates`: each UNION branch now takes its oldest 100
@@ -161,10 +148,9 @@ census (credential/liveness paths read links live).
   `fleet_launch_machine_state_updated(machine_id,state,updated_at)` index
   instead of scanning the machine's whole live launch history per 2s poll.
 - Credentials: the candidate scan folds the credential-existence and link
-  probes into indexed EXISTS subqueries; the ended-credential sweep is
-  watermarked (only sessions ended since the last sweep, plus a full sweep
-  every 128th poll for stragglers) instead of re-reading the whole
-  worker_access history on every poll.
+  probes into indexed EXISTS subqueries; the ended-credential sweep runs only
+  after a write to the tables it reads (write-stamp gate), never on every
+  host poll.
 - `launcher_memory_reserve` scan: new partial index
   `fleet_launch_failed_reason(state,exit_reason,updated_at) WHERE state='failed'`.
 - Host polls (take effect as hosts update): offers 2s->10s, credential and

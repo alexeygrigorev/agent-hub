@@ -196,18 +196,3 @@ it('PUT /api/fleet/sessions skips rewrites when only volatile progress timestamp
   expect(third.written).toBeGreaterThan(0);
 }));
 
-it('PUT /api/fleet/sessions serves an identical census with only the capped freshness upserts (intake e8a22f4c)', withFleet(async (s, t) => {
-  const sessions = Array.from({ length: 50 }, (_, i) => ({
-    native_id: uuid(3, i), tag: 'hub-' + uuid(1, i), engine: 'codex', phase: i < 5 ? 'running' : 'exited', confirmed_exit: i >= 5, agent_state: null,
-    workspace: '/w', cwd: '/w', profile: null, account: null, last_activity_at: null, created_at_ms: now - 1000 - i }));
-  const put = async () => {
-    const r = await s.handle(new Request('https://hub.test/api/fleet/sessions', { method: 'PUT', body: JSON.stringify({ sessions }) }), host);
-    expect(r.status).toBe(200);
-    return r.json() as Promise<any>;
-  };
-  await put();
-  const from = t.mark();
-  expect((await put()).written).toBe(0);
-  const after = t.report(from);
-  expect(after.total, `quiet census top statements: ${JSON.stringify(after.top)}`).toBeLessThanOrEqual(25);
-}));
