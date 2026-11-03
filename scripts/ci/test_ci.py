@@ -174,6 +174,13 @@ class TestDeployWorkflowRetryWiring(unittest.TestCase):
         self.assertIn("built_from_commit", content)
         self.assertIn("'/livez'", content)
 
+    def test_workflow_dispatch_has_distinct_concurrency_group_from_push(self):
+        content = DEPLOY_WORKFLOW.read_text()
+        self.assertIn(
+            "group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}",
+            content,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
