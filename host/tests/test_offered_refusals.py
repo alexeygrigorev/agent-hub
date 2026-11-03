@@ -89,10 +89,9 @@ class OfferedRefusals(unittest.TestCase):
         dispatcher = Mock()
         dispatcher.once.return_value = [{'id': 'private-id', 'state': 'failed',
                                          'reason': 'admission_unconfigured', 'error': 'PRIVATE'}]
-        collector = Mock(last_collect_monotonic=0, last_hold=None, last_error=None)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            session_host.maintenance_step_once(dispatcher, collector)
+            session_host.maintenance_step_once(dispatcher)
         events = [json.loads(line) for line in out.getvalue().splitlines()]
         self.assertIn({'event': 'fleet_dispatch_refused', 'state': 'failed',
                        'reason': 'admission_unconfigured'}, events)

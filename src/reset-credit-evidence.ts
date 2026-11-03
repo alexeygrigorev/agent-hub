@@ -1,6 +1,7 @@
 /** Operator-mediated earned-credit evidence. Never writes quota, routing or rewards. */
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { loadProviderPacing } from './pacing';
+import { canonicalAccountLabel } from './quota';
 
 const response = (data: unknown, status = 200) => Response.json(data, {
   status, headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' },
@@ -18,6 +19,11 @@ function schema(sql: SqlStorage) {
     provider_account_id TEXT NOT NULL, decision_json TEXT NOT NULL, receipt_json TEXT,
     work_json TEXT, created_at_ms INTEGER NOT NULL, UNIQUE(provider_account_id,credit_id))`);
 }
+function archivedLabels(sql: SqlStorage): Set<string> {
+  try { return new Set((sql.exec('SELECT label FROM fleet_account_archives').toArray() as any[])
+    .map(row => canonicalAccountLabel(String(row.label)))); }
+  catch { return new Set(); }
+}
 function view(row: any) {
   return { event_id: row.event_id, decision_event_id: row.event_id + ':decision',
     receipt_event_id: row.receipt_json ? row.event_id + ':receipt' : null,
@@ -32,9 +38,11 @@ export async function handleResetCreditEvidence(request: Request, sql: SqlStorag
   schema(sql);
   const url = new URL(request.url);
   if (request.method === 'GET') {
+    const archived = archivedLabels(sql);
     const eventId = url.searchParams.get('event_id');
-    const rows = eventId ? sql.exec('SELECT * FROM tbm_reset_credit_evidence WHERE event_id=?', eventId).toArray()
-      : sql.exec('SELECT * FROM tbm_reset_credit_evidence ORDER BY created_at_ms DESC LIMIT 50').toArray();
+    const rows = (eventId ? sql.exec('SELECT * FROM tbm_reset_credit_evidence WHERE event_id=?', eventId).toArray()
+      : sql.exec('SELECT * FROM tbm_reset_credit_evidence ORDER BY created_at_ms DESC LIMIT 50').toArray())
+      .filter((row: any) => !archived.has(canonicalAccountLabel(String(row.account))));
     const sentinel: any = sql.exec("SELECT kill_switch_active FROM tbm_quota_pools WHERE pool_id='*'").toArray()[0];
     const globalHealthHold = sql.exec("SELECT engine FROM fleet_engine_health WHERE engine='codex' AND status='unavailable' AND (machine_id='' OR machine_id IS NULL) LIMIT 1").toArray().length > 0;
     return response({ events: rows.map((r: any) => {
@@ -76,6 +84,7 @@ export async function handleResetCreditEvidence(request: Request, sql: SqlStorag
       typeof body.provider_used_percent !== 'number' || !Number.isFinite(body.provider_used_percent) || body.provider_used_percent < 85 || body.provider_used_percent > 100) {
       return response({ error: 'invalid_credit_observation' }, 400);
     }
+    if (archivedLabels(sql).has(canonicalAccountLabel(body.account))) return response({ error: 'account_archived' }, 409);
     const prior: any = sql.exec('SELECT * FROM tbm_reset_credit_evidence WHERE provider_account_id=? AND credit_id=?', body.provider_account_id, body.credit_id).toArray()[0];
     if (prior) {
       const old = JSON.parse(prior.decision_json);
@@ -120,7 +129,7 @@ export async function handleResetCreditEvidence(request: Request, sql: SqlStorag
   }
   if (!id(body?.event_id)) return response({ error: 'invalid_event_id' }, 400);
   const row: any = sql.exec('SELECT * FROM tbm_reset_credit_evidence WHERE event_id=?', body.event_id).toArray()[0];
-  if (!row) return response({ error: 'not_found' }, 404);
+  if (!row || archivedLabels(sql).has(canonicalAccountLabel(String(row.account)))) return response({ error: 'not_found' }, 404);
   const decision = JSON.parse(row.decision_json);
   if (body.action === 'receipt') {
     if (!keys(body, ['action', 'event_id', 'receipt']) || !keys(body.receipt,
@@ -183,7 +192,7 @@ export async function handleResetCreditEvidence(request: Request, sql: SqlStorag
       account: job.account, machine_id: job.machine_id, selection: JSON.parse(job.selection_json),
       reward, pool,
       quota_baseline: { source: 'operator_native_post_reset_read', observed_at_ms: receipt.after_at_ms, ...baselines[0] },
-      quota_drawdown: { source: 'normal_host_ingestion', observed_at_ms: pool.last_updated_ms,
+      quota_drawdown: { source: 'hub_server_quota_ingestion', observed_at_ms: pool.last_updated_ms,
         remaining_percent: pool.remaining_percent, used_delta_percentage_points: 100 - baselines[0].used_percent - pool.remaining_percent },
       no_starvation_verified: false,
       other_routed_work: sql.exec(`SELECT j.id,j.state,l.account FROM routing_jobs j JOIN fleet_launches l ON l.id=j.launch_id

@@ -22,7 +22,6 @@ from .host_health_monitor import HostHealthMonitor
 from .jobs import JobDispatcher
 from .metrics_producer import MetricsProducer
 from .native_sessions import ensure_runtime_bin_on_path, qualify_sender_binding
-from .quota_snapshot import QuotaCollector
 from .token_usage import TokenCollector
 from .role_dispatch import TrustedRoleConfig, load_role_config
 from .runtime import RuntimeManager
@@ -83,13 +82,6 @@ def status_step_once(collector) -> None:
                           'errors': len(errors) if isinstance(errors, list) else 0}), flush=True)
     except Exception as error:
         _log(json.dumps({'event': 'status_error', 'type': type(error).__name__}), flush=True)
-
-
-def resolve_quse_cmd():
-    """quse argv for the quota collector; the Windows service PATH lacks the venv Scripts."""
-    from .quota_snapshot import quse_argv
-    argv = quse_argv(dict(os.environ))
-    return argv[0] if len(argv) == 1 else argv + ['--json']
 
 
 def maybe_start_status_thread(current: Optional[threading.Thread], collector) -> Optional[threading.Thread]:
@@ -510,8 +502,8 @@ def heavy_test_reaper_step_once(dispatcher):
                          'type': type(error).__name__}), flush=True)
 
 
-def maintenance_step_once(dispatcher, quota_collector):
-    """Placement and quota can take minutes; never run them on the command loop."""
+def maintenance_step_once(dispatcher):
+    """Run one fleet dispatch cycle away from the command loop."""
     started = time.monotonic()
     try:
         results = dispatcher.once()
@@ -524,15 +516,6 @@ def maintenance_step_once(dispatcher, quota_collector):
                                   'state': result['state'], 'reason': result['reason']}), flush=True)
     except Exception as error:
         _log(json.dumps({'event': 'fleet_error', 'type': type(error).__name__}), flush=True)
-    try:
-        before = quota_collector.last_collect_monotonic
-        snapshot = quota_collector.step()
-        if before != quota_collector.last_collect_monotonic:
-            _log(json.dumps({'event': 'quota_cycle', 'reported': snapshot is not None,
-                              'held': bool(quota_collector.last_hold),
-                              'error': bool(quota_collector.last_error)}), flush=True)
-    except Exception as error:
-        _log(json.dumps({'event': 'quota_error', 'type': type(error).__name__}), flush=True)
     heavy_test_reaper_step_once(dispatcher)
     _log(json.dumps({'event': 'maintenance_cycle',
                       'elapsed_s': round(time.monotonic() - started, 3)}), flush=True)
@@ -750,13 +733,13 @@ def drain_inflight_dispatch(dispatcher, timeout_s=DRAIN_TIMEOUT_S, clock=time.mo
     return drained
 
 
-def maybe_start_maintenance_thread(current, dispatcher, quota_collector):
-    # Single inflight preserves Fleet dispatch and quota ownership. No extra
+def maybe_start_maintenance_thread(current, dispatcher):
+    # Single inflight preserves Fleet dispatch. No quota collector, extra
     # controller or native-effect receiver, and no unbounded executor pool.
     if current is not None and current.is_alive():
         return current
     thread = _background_thread(target=maintenance_step_once,
-                              args=(dispatcher, quota_collector),
+                              args=(dispatcher,),
                               daemon=True, name='fleet-maintenance')
     thread.start()
     return thread
@@ -880,7 +863,6 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
             role_config_path=role_cfg_path,
             journal_dir=str(journal),
         )
-        quota_collector = QuotaCollector(base_url=cfg.get('base_url'), quse_cmd=resolve_quse_cmd())
         # Status observation hook (released StatusCollector source): ONE
         # instance for the controller lifetime, trusted allowlist path under
         # the existing journal, this machine, 60s floor. The loop below only
@@ -1011,7 +993,7 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                     _log(json.dumps({'event': 'settings_reloaded'}), flush=True)
                 if time.monotonic() >= next_fleet:
                     maintenance_thread = maybe_start_maintenance_thread(
-                        maintenance_thread, dispatcher, quota_collector)
+                        maintenance_thread, dispatcher)
                     next_fleet = time.monotonic() + fleet_interval
                 # Intake 4398ce2a: telemetry and offer claiming must not wait
                 # for the multi-minute maintenance cycle.

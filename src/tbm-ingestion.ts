@@ -1,7 +1,7 @@
 import { initUsageStore, recordUsageQuota } from './usage-store';
 /** TBM projections of the existing account quota observations. Unknown tokens stay unknown. */
 import type { SqlStorage } from '@cloudflare/workers-types';
-import { canonicalQuotaProvider, canonicalAccountLabel, snapshotRouteForAccount } from './quota';
+import { canonicalQuotaProvider, canonicalAccountLabel } from './quota';
 const HOUR = 3600000, DAY = 24 * HOUR;
 export const tbmPoolId = (provider: string, account: string, window: string) => `${provider}:${account}:${window}`;
 export const WINDOW_CYCLE_MS: Record<string, number> = {
@@ -30,19 +30,6 @@ export function resolveTokenCapacity(w: any): { known: boolean; total: number | 
     total, remaining: remaining !== null && total !== null ? Math.min(total, remaining) : remaining };
 }
 
-/** A provider-wide snapshot must never be copied onto several independent accounts. */
-export function accountsForHostProvider(sql: SqlStorage, host: string, provider: string): string[] {
-  const canonical = canonicalQuotaProvider(provider);
-  const eligible = (rows: any[]) => rows.filter(row => snapshotRouteForAccount(row.label, row.provider, { [provider]: true }) === true);
-  const rows = eligible(sql.exec(`SELECT DISTINCT a.label,a.provider FROM fleet_routes r JOIN fleet_accounts a
-    ON r.account=a.label WHERE r.machine_id=? ORDER BY a.label`, host).toArray());
-  if (rows.length === 1) return [canonicalAccountLabel(rows[0].label)];
-  if (rows.length > 1) return [];
-  const accounts = eligible(sql.exec('SELECT label,provider FROM fleet_accounts ORDER BY label').toArray());
-  return accounts.length === 1 ? [canonicalAccountLabel(accounts[0].label)] : accounts.length === 0
-    && canonical === provider ? [provider] : [];
-
-}
 export interface TbmSyncCounts { pools: number; tranches: number }
 interface WindowIngest { provider: string; account: string; windowName: string; window: any }
 export function syncWindowsIntoTbm(sql: SqlStorage, windows: WindowIngest[], at: number): TbmSyncCounts {
@@ -132,17 +119,10 @@ export function syncTbmFromServerAccounts(sql: SqlStorage, accounts: {account: s
   }
   return result;
 }
-export function syncTbmFromHostSnapshot(sql: SqlStorage, host: string, routes: Record<string, any>, at: number): TbmSyncCounts {
-  return syncTbmFromServerAccounts(sql,Object.entries(routes).flatMap(([provider,quota]) =>
-    accountsForHostProvider(sql,host,provider).map(account => ({provider,account,quota}))),at);
-}
-
 /** Bootstrap and reconcile existing authoritative per-account observations; do not refresh their age. */
 export function syncStoredTbmSnapshots(sql: SqlStorage, now: number): void {
   initUsageStore(sql);
-  const rows: any[] = sql.exec(`SELECT account,provider,captured_at AS observed_at,quota_json FROM server_quota_snapshots
-    UNION ALL SELECT account,service AS provider,observed_at,quota_json FROM fleet_subscriptions
-    ORDER BY observed_at ASC`).toArray();
+  const rows: any[] = sql.exec('SELECT account,provider,captured_at AS observed_at,quota_json FROM server_quota_snapshots ORDER BY observed_at ASC').toArray();
   for (const row of rows) {
     const at = Date.parse(row.observed_at);
     if (!Number.isFinite(at) || at > now || now-at >= 15*60000) continue;
@@ -150,6 +130,6 @@ export function syncStoredTbmSnapshots(sql: SqlStorage, now: number): void {
     try { quota = JSON.parse(row.quota_json); } catch { continue; }
     recordUsageQuota(sql,canonicalAccountLabel(row.account),canonicalQuotaProvider(row.provider),quota,at);
   }
-  const history:any[]=sql.exec('SELECT account,provider,observed_at_ms,quota_json FROM usage_quota_history WHERE observed_at_ms>=? AND observed_at_ms<=? ORDER BY observed_at_ms',now-15*60000,now).toArray();
+  const history:any[]=sql.exec("SELECT account,provider,observed_at_ms,quota_json FROM usage_quota_history WHERE source='hub-server' AND observed_at_ms>=? AND observed_at_ms<=? ORDER BY observed_at_ms",now-15*60000,now).toArray();
   for(const row of history) syncTbmFromServerAccounts(sql,[{account:row.account,provider:row.provider,quota:JSON.parse(row.quota_json)}],row.observed_at_ms);
 }

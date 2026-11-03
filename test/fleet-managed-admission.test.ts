@@ -11,7 +11,7 @@ const iso = (delta = 0) => new Date(now + delta).toISOString();
 const refusal = { engine: 'codex', account: 'shared-codex', profile: 'hub-shared-codex',
   mode: 'interactive', reason: 'codex_quota_gate_codex_reserve_required', observed_at: iso() };
 
-async function fixture(refusals: any[], fn: (service: FleetService) => void) {
+async function fixture(refusals: any[], fn: (service: FleetService, sql: any) => void) {
   const bindings = env as unknown as Env;
   const stub = bindings.HUB.get(bindings.HUB.idFromName('managed-admission-' + crypto.randomUUID()));
   await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
@@ -33,8 +33,10 @@ async function fixture(refusals: any[], fn: (service: FleetService) => void) {
     const subs = new Request('https://hub.test/api/fleet/subscriptions', { method: 'PUT', body: JSON.stringify({
       subscriptions: labels.map(account => ({ service: 'codex', account, plan: 'pro', quota })),
     }) });
-    expect((await service.handle(subs, { caller: { machineId: 'host', kind: 'host', actor: 'machine:host' }, scopes: ['host'] })).status).toBe(200);
-    fn(service);
+    expect((await service.handle(subs, { caller: { machineId: 'host', kind: 'host', actor: 'machine:host' }, scopes: ['host'] })).status).toBe(410);
+    for (const account of labels)
+      hub.sql.exec('INSERT INTO server_quota_snapshots VALUES (?,?,?,?)', account, 'codex', iso(), JSON.stringify(quota));
+    fn(service, hub.sql);
   });
 }
 

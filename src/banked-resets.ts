@@ -50,10 +50,12 @@ export class BankedResets {
   }
 
   private accounts(): any[] {
-    return this.sql.exec("SELECT label,CASE WHEN provider='codex-orin' THEN 'codex' ELSE provider END AS provider FROM fleet_accounts WHERE provider IN ('codex','codex-orin','zai') ORDER BY label").toArray();
+    return this.sql.exec(`SELECT a.label,CASE WHEN a.provider='codex-orin' THEN 'codex' ELSE a.provider END AS provider
+      FROM fleet_accounts a WHERE a.provider IN ('codex','codex-orin','zai')
+      AND NOT EXISTS (SELECT 1 FROM fleet_account_archives x WHERE x.label=a.label) ORDER BY a.label`).toArray();
   }
 
-  /** Use newest successful per-account evidence, across server and registered host producers. */
+  /** Use newest successful Hub-server account evidence. */
   sync() {
     const now = this.now();
     const accounts = this.accounts();
@@ -64,25 +66,6 @@ export class BankedResets {
     };
     for (const s of this.sql.exec('SELECT account,captured_at,quota_json FROM server_quota_snapshots').toArray() as any[]) {
       try { accept(s.account, Date.parse(s.captured_at), JSON.parse(s.quota_json)); } catch { /* retain previous deadlines */ }
-    }
-    // The maintained host publishes account-specific probes here, including alternate homes.
-    for (const s of this.sql.exec('SELECT account,observed_at,quota_json FROM fleet_subscriptions').toArray() as any[]) {
-      try {
-        const quota = JSON.parse(s.quota_json);
-        accept(s.account, Date.parse(quota.observed_at || s.observed_at), quota);
-      } catch { /* retain previous deadlines */ }
-    }
-    for (const s of this.sql.exec('SELECT host_id,captured_at_ms,routes_json FROM host_quota_snapshots').toArray() as any[]) {
-      let routes: any;
-      try { routes = JSON.parse(s.routes_json); } catch { continue; }
-      const registered = this.sql.exec('SELECT DISTINCT account FROM fleet_routes WHERE machine_id=?', s.host_id).toArray() as any[];
-      for (const a of accounts.filter(a => registered.some(r => r.account === a.label))) {
-        // Legacy wire key explicitly identifies the second Codex account.
-        const key = a.label === 'codex-orin' ? 'codex-orin' : a.provider;
-        // An unlabelled provider route cannot identify several accounts on one host.
-        const sameProvider = accounts.filter(b => b.provider === a.provider && b.label !== 'codex-orin' && registered.some(r => r.account === b.label));
-        if (a.label === 'codex-orin' || sameProvider.length === 1) accept(a.label, s.captured_at_ms, routes[key]);
-      }
     }
     for (const a of accounts) {
       const snapshot = latest.get(a.label);
@@ -110,14 +93,17 @@ export class BankedResets {
     this.sync();
     const now = this.now();
     const alerts: any[] = [];
-    for (const a of this.accounts()) {
+    const accounts = this.accounts();
+    const visibleAccounts = new Set(accounts.map(a => String(a.label)));
+    for (const a of accounts) {
       if (!this.sql.exec('SELECT account FROM banked_reset_accounts WHERE account=?', a.label).toArray().length) {
         const alert = this.liveness.setAlert('banked_reset_unknown', a.label, { state: 'attention',
           detail: `${a.label} (${a.provider}): banked-reset expiry is unknown. Needed: open ${a.provider === 'zai' ? 'https://z.ai/manage-apikey/coding-plan/personal/usage (email/password; complete captcha yourself)' : 'Codex /usage > Redeem reset on this account, without confirming a reset'}, then record each available grant and exact expiry, or confirm none, at /banked-resets.html. Hub does not scrape captcha pages.` });
         if (alert) alerts.push(alert);
       }
     }
-    const active = this.sql.exec('SELECT * FROM banked_reset_grants WHERE active=1 AND expires_at>? ORDER BY expires_at,id', now).toArray() as any[];
+    const active = (this.sql.exec('SELECT * FROM banked_reset_grants WHERE active=1 AND expires_at>? ORDER BY expires_at,id', now).toArray() as any[])
+      .filter(g => visibleAccounts.has(String(g.account)));
     for (const g of active) {
       const threshold = expiryThreshold(g.expires_at, now);
       if (!threshold || this.sql.exec('SELECT grant_id FROM banked_reset_notices WHERE grant_id=? AND threshold=?', g.id, threshold).toArray().length) continue;
@@ -143,9 +129,16 @@ export class BankedResets {
     if (!caller.isAdmin) return reply({ error: 'forbidden' }, 403);
     if (request.method === 'GET') {
       this.sync();
-      return reply({ accounts: this.accounts(), grants: this.sql.exec('SELECT * FROM banked_reset_grants WHERE active=1 ORDER BY expires_at').toArray(),
-        observations: this.sql.exec('SELECT * FROM banked_reset_accounts').toArray(),
-        notices: this.sql.exec('SELECT * FROM banked_reset_notices ORDER BY created_at DESC LIMIT 100').toArray() });
+      const accounts = this.accounts();
+      const visibleAccounts = new Set(accounts.map(a => String(a.label)));
+      const allGrants = this.sql.exec('SELECT * FROM banked_reset_grants').toArray() as any[];
+      const visibleGrantIds = new Set(allGrants.filter(g => visibleAccounts.has(String(g.account))).map(g => String(g.id)));
+      return reply({ accounts,
+        grants: allGrants.filter(g => visibleAccounts.has(String(g.account)) && Number(g.active) === 1).sort((a, b) => Number(a.expires_at) - Number(b.expires_at)),
+        observations: (this.sql.exec('SELECT * FROM banked_reset_accounts').toArray() as any[])
+          .filter(row => visibleAccounts.has(String(row.account))),
+        notices: (this.sql.exec('SELECT * FROM banked_reset_notices ORDER BY created_at DESC LIMIT 100').toArray() as any[])
+          .filter(row => visibleGrantIds.has(String(row.grant_id))) });
     }
     if (request.method !== 'POST') return reply({ error: 'method_not_allowed' }, 405);
     if (caller.kind !== 'human') return reply({ error: 'operator_required' }, 403);

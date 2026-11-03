@@ -94,17 +94,6 @@ class TestStatusHook(unittest.TestCase):
                 return {"rate_limited": False, "observations": [],
                         "skipped": [], "errors": []}
 
-        class DummyQuota:
-            last_collect_monotonic = 0
-            last_hold = None
-            last_error = None
-
-            def __init__(self, *a, **k):
-                pass
-
-            def step(self):
-                return None
-
         class DummyDispatcher:
             def __init__(self, *a, **k):
                 pass
@@ -119,7 +108,6 @@ class TestStatusHook(unittest.TestCase):
              patch.object(session_host, "qualify_sender_binding",
                           return_value=SimpleNamespace(session_id="ctrl", workspace="/tmp")), \
              patch.object(session_host.fleet, "Dispatcher", DummyDispatcher), \
-             patch.object(session_host, "QuotaCollector", DummyQuota), \
              patch.object(session_host, "StatusCollector", BlockingCollector), \
              patch.object(session_host.session_control, "execute",
                           side_effect=lambda *a, **k: executed.append(1)):

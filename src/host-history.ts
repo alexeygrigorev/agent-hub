@@ -4,7 +4,7 @@ import { initUsageStore } from './usage-store';
  */
 import type { SqlStorage } from '@cloudflare/workers-types';
 import type { FleetService } from './fleet';
-import { dedupeAccountsByCanonical } from './quota';
+import { canonicalAccountLabel, dedupeAccountsByCanonical } from './quota';
 import { resolveMachineAliases } from './machine-alias';
 import { isValidMachineId } from './machine-id';
 import { effectiveCheckin } from './registry';
@@ -12,10 +12,9 @@ import { freshCatalogs } from './catalog-freshness';
 
 const MINUTE = 60000, DAY = 86400000;
 export const HISTORY_RETENTION_MS = 32 * DAY;
-/** Quota freshness gate mirrors QUOTA_STALE_MS (20 minutes). Quota collection
- * runs every 600 s host-side; a snapshot older than this is stale and must
- * stay a gap, never a held-forward value. Sampling runs at most once a
- * minute, so live history holds points at least every 15 minutes. */
+/** Quota freshness gate mirrors QUOTA_STALE_MS (20 minutes). The Hub server
+ * refreshes account readings every five minutes; older observations stay a
+ * gap, never a held-forward value. Sampling runs at most once a minute. */
 export const QUOTA_WINDOW_STALE_MS = 20 * MINUTE;
 export const HISTORY_RANGES: Record<string, number> = { '1h': 60 * MINUTE, '24h': DAY, '7d': 7 * DAY, '30d': 30 * DAY };
 export const HOST_HISTORY_SCHEMA = `
@@ -86,6 +85,10 @@ export class HostHistoryService {
     this.pending.clear(); this.cache.clear();
   }
   private rows(query: string, ...args: any[]): any[] { return this.sql.exec(query, ...args).toArray(); }
+  private archivedAccountLabels(): Set<string> {
+    try { return new Set(this.rows('SELECT label FROM fleet_account_archives').map(row => canonicalAccountLabel(String(row.label)))); }
+    catch { return new Set(); }
+  }
   private host(row: any) {
     const p = json(row.payload_json);
     const memoryKnown = p.memory?.status !== 'unknown' && !p.memory?.error && p.memory?.total_bytes > 0;
@@ -133,24 +136,22 @@ export class HostHistoryService {
     // must share that observation or later windows at the same instant vanish.
     if (Object.keys(values).length) this.record('quota_window', account, '', at, values, source);
   }
-  /** Fresh per-window observations from every quota source. Stale snapshots
+  /** Fresh per-window observations from Hub-server quota sources. Stale snapshots
    * (older than QUOTA_WINDOW_STALE_MS) are skipped: a stale hold-forward
    * would masquerade as a live measurement. Unknown windows stay gaps. */
   private quotaWindows(now: number) {
+    const archived = this.archivedAccountLabels();
     // The same persisted collection journal feeds TBM; minute packets below
     // are only the bounded rendering/compaction projection of those samples.
-    for (const row of this.rows('SELECT account,observed_at_ms,quota_json FROM usage_quota_history WHERE observed_at_ms>=? AND observed_at_ms<=? ORDER BY observed_at_ms LIMIT 4096',now-QUOTA_WINDOW_STALE_MS,now)) {
+    for (const row of this.rows("SELECT account,observed_at_ms,quota_json FROM usage_quota_history WHERE source='hub-server' AND observed_at_ms>=? AND observed_at_ms<=? ORDER BY observed_at_ms LIMIT 4096",now-QUOTA_WINDOW_STALE_MS,now)) {
+      if (archived.has(canonicalAccountLabel(String(row.account)))) continue;
       this.quotaWindowFromBlob(row.account,row.quota_json,row.observed_at_ms,'usage_quota_history');
     }
     for (const row of this.rows('SELECT account,captured_at,quota_json FROM server_quota_snapshots LIMIT 128')) {
+      if (archived.has(canonicalAccountLabel(String(row.account)))) continue;
       const at = Date.parse(row.captured_at);
       if (!Number.isFinite(at) || now - at > QUOTA_WINDOW_STALE_MS || at > now + MINUTE) continue;
       this.quotaWindowFromBlob(String(row.account || ''), row.quota_json, at, 'server_quota_snapshots');
-    }
-    for (const row of this.rows('SELECT account,observed_at,quota_json FROM fleet_subscriptions LIMIT 4096')) {
-      const at = Date.parse(row.observed_at);
-      if (!Number.isFinite(at) || now - at > QUOTA_WINDOW_STALE_MS || at > now + MINUTE) continue;
-      this.quotaWindowFromBlob(String(row.account || ''), row.quota_json, at, 'fleet_subscriptions');
     }
   }
   /** Import only surviving measurements, preserving their original timestamps.
@@ -160,6 +161,7 @@ export class HostHistoryService {
   backfill() {
     if (this.rows("SELECT value FROM resource_history_meta WHERE key='backfill_v1'").length) return;
     const cutoff = this.now() - HISTORY_RETENTION_MS;
+    const archived = this.archivedAccountLabels();
     for (const row of this.rows('SELECT machine_id,observed_at_ms,payload_json FROM disk_observations WHERE machine_id IN (SELECT id FROM machines) AND observed_at_ms >= ? ORDER BY observed_at_ms LIMIT 1000', cutoff)) this.disk(row);
     for (const row of this.rows('SELECT machine_id,observed_at_ms,payload_json FROM host_health_observations WHERE machine_id IN (SELECT id FROM machines) LIMIT 128')) this.host(row);
     // Existing lifecycle rows establish failure timestamps without guessing when
@@ -168,14 +170,15 @@ export class HostHistoryService {
       FROM fleet_launches WHERE state='failed' AND updated_at >= ? GROUP BY machine_id,at ORDER BY at`, new Date(cutoff).toISOString())) {
       if (row.at !== null) this.record('failures', 'fleet', String(row.machine_id || ''), Number(row.at), { failed_events: Number(row.n) }, 'fleet_launches');
     }
-    for (const row of this.rows('SELECT machine_id,account,observed_at,quota_json FROM fleet_subscriptions LIMIT 4096')) {
+    for (const row of this.rows("SELECT account,provider,observed_at_ms,quota_json FROM usage_quota_history WHERE source='hub-server' AND observed_at_ms>=? AND observed_at_ms<=? ORDER BY observed_at_ms LIMIT 4096", cutoff, this.now())) {
+      if (archived.has(canonicalAccountLabel(String(row.account)))) continue;
       const p = json(row.quota_json);
       const values = Object.values(p.windows || {}).map((w: any) => numeric(w.percent_remaining)).filter((v): v is number => v !== null);
-      if (values.length) this.record('quota', row.account, '', Date.parse(row.observed_at), { remaining_percent: Math.min(...values) }, 'fleet_subscriptions');
-      const at = Date.parse(row.observed_at);
-      if (Number.isFinite(at)) this.quotaWindowFromBlob(String(row.account || ''), row.quota_json, at, 'fleet_subscriptions');
+      if (values.length) this.record('quota', row.account, '', Number(row.observed_at_ms), { remaining_percent: Math.min(...values) }, 'usage_quota_history');
+      this.quotaWindowFromBlob(String(row.account || ''), row.quota_json, Number(row.observed_at_ms), 'usage_quota_history');
     }
     for (const row of this.rows('SELECT account,captured_at,quota_json FROM server_quota_snapshots LIMIT 128')) {
+      if (archived.has(canonicalAccountLabel(String(row.account)))) continue;
       const p = json(row.quota_json);
       const values = Object.values(p.windows || {}).map((w: any) => numeric(w.percent_remaining)).filter((v): v is number => v !== null);
       if (values.length) this.record('quota', row.account, '', Date.parse(row.captured_at), { remaining_percent: Math.min(...values) }, 'server_quota_snapshots');
@@ -207,14 +210,15 @@ export class HostHistoryService {
     // Reuse FleetService account accounting/admission; no second slot calculation.
     // Canonical identity: a rename transition can briefly hold two registry
     // rows for one pool; record the canonical one exactly once.
-    for (const row of dedupeAccountsByCanonical(this.rows('SELECT * FROM fleet_accounts ORDER BY label LIMIT 128'))) {
+    for (const row of dedupeAccountsByCanonical(this.rows(`SELECT a.* FROM fleet_accounts a
+      WHERE NOT EXISTS (SELECT 1 FROM fleet_account_archives x WHERE x.label=a.label)
+      ORDER BY a.label LIMIT 128`))) {
       const a = this.fleet.accountStatus(row);
       this.record('account', a.label, '', now, { used: a.active, max: a.max_concurrency, native_live: numeric((a as any).native_live) }, 'fleet_account_status_census_v2');
       this.record('quota', a.label, '', now, { remaining_percent: a.status === 'unknown' ? null : a.remaining_percent }, 'fleet_account_status');
     }
-    // Per-account AND per-window quota history, sampled with every sample
-    // tick (at most once a minute; quota collection refreshes every 600 s,
-    // so live series always hold points at least every 15 minutes).
+    // Per-account AND per-window quota history, sampled with every tick from
+    // Hub-server account snapshots only.
     this.quotaWindows(now);
     for (const row of this.rows(`SELECT ids.machine_id,
       (SELECT COUNT(*) FROM fleet_launches f WHERE f.machine_id=ids.machine_id AND f.state='queued') AS queued,
@@ -267,7 +271,8 @@ export class HostHistoryService {
   query(range: string, machine?: string): HistoryResponse {
     this.flush();
     const now = this.now(), start = now - HISTORY_RANGES[range];
-    const cacheKey=JSON.stringify([range,machine]);
+    const archived = this.archivedAccountLabels();
+    const cacheKey=JSON.stringify([range,machine,[...archived].sort()]);
     const cached=this.cache.get(cacheKey);
     if (cached && now-cached.at<MINUTE) return cached.data;
     const step = range === '1h' ? MINUTE : range === '24h' ? 5 * MINUTE : range === '7d' ? 30 * MINUTE : 2 * 3600000;
@@ -282,6 +287,7 @@ export class HostHistoryService {
     for (const packet of this.sql.exec('SELECT payload_json FROM resource_history WHERE bucket_ms>=? AND bucket_ms<=? ORDER BY bucket_ms',Math.floor(start/3600000)*3600000,now)) {
       for (const o of this.packet(String(packet.payload_json))) {
         if (o.at<start || o.at>now) continue;
+        if (['account','quota','quota_window'].includes(o.kind) && archived.has(canonicalAccountLabel(String(o.entity)))) continue;
         const host=canonical(o.machine_id);
         if (machine && host && host!==canonical(machine)) continue;
         earliest=earliest===null ? o.at : Math.min(earliest,o.at);

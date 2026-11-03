@@ -468,9 +468,9 @@ def main():
     heartbeat = sub.add_parser('heartbeat', help='Report that this agent is alive (agent credential with health:report)')
     heartbeat.add_argument('--status', default='working', help='Short state word, for example working, idle or waiting')
     heartbeat.add_argument('--summary', help='Non-secret one-line summary shown on the dashboard (max 240 chars)')
-    subscriptions = sub.add_parser('subscriptions', help='Inspect safe machine subscription metadata')
+    subscriptions = sub.add_parser('subscriptions', help='Manage local routes; per-machine quota collection is retired')
     subscriptions.add_argument('--config')
-    subscriptions.add_argument('--report', action='store_true', help='Post metadata to the hub using this host credential')
+    subscriptions.add_argument('--report', action='store_true', help='Retired; machine quota is no longer reported to Hub')
     subscriptions_cmds = subscriptions.add_subparsers(dest='subscriptions_cmd')
     for verb in ('disable', 'enable'):
         route = subscriptions_cmds.add_parser(verb, help=('Disable' if verb == 'disable' else 'Enable')
@@ -638,6 +638,9 @@ def main():
     p_workclaim.add_argument("--dry-run", action="store_true", help="Scan and redact without POSTing to Hub")
 
     args = parser.parse_args()
+    if args.cmd == 'subscriptions' and not getattr(args, 'subscriptions_cmd', None):
+        print('Per-machine quota collection is retired; use `hub quota` for Hub-server readings.', file=sys.stderr)
+        sys.exit(2)
     if args.cmd in ("run", "fleet-host", "bridge"):
         # Long-running host commands: no console window for any child process.
         from . import windows_no_window
@@ -869,12 +872,8 @@ def main():
                         '' if result['changed'] else ' (unchanged)'))
                     return
                 settings = fleet.load_settings(args.config)
-                if args.cmd == 'fleet-host':
-                    fleet.run_cycles(settings, args.cycles, args.interval)
-                    return
-                result = {'subscriptions': fleet.collect_subscriptions(settings)}
-                if args.report:
-                    bus._do_request('PUT', '/api/fleet/subscriptions', result)
+                fleet.run_cycles(settings, args.cycles, args.interval)
+                return
             else:
                 payload = {'mode': 'interactive' if args.cmd == 'start-session' else 'headless', 'workspace': args.workspace,
                            'summary': args.summary, 'idempotency_key': args.key or str(uuid.uuid4())}

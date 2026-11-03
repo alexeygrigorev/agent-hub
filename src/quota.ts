@@ -2,8 +2,7 @@ import { SqlStorage, DurableObjectState } from "@cloudflare/workers-types";
 import { Env } from "./env";
 import { sha256 } from "./auth/crypto";
 import { getSession, allowedCallbackUrls, verifyCsrf } from "./auth/session";
-import { syncTbmFromHostSnapshot, syncTbmFromServerAccounts } from "./tbm-ingestion";
-import { resolveMachineAliases } from "./machine-alias";
+import { syncTbmFromServerAccounts } from "./tbm-ingestion";
 import { isPlainObject, parseUtcIso, readBoundedJsonBody } from "./strict-json";
 import routingPolicy from "../config/model-routing.json";
 import { analyzeQuotaBurn, providerWeight } from "./pacing";
@@ -56,7 +55,7 @@ export const MAX_SPEND_VALUE = 1e15;
 export const ALLOWED_QUOTA_PROVIDERS = new Set<string>([
   "codex",
   // Orin's second Codex account (own CODEX_HOME, own ChatGPT token).
-  // Kept as a wire route key: one host snapshot carries both Codex homes and
+  // Kept as a wire route key: one Hub-server snapshot carries both Codex homes and
   // provider-keyed routes cannot hold two `codex` entries. All presentation,
   // filtering and admission canonicalize it to `codex` (see below).
   "codex-orin",
@@ -1209,9 +1208,6 @@ export class QuotaStore {
         routesJson
       );
 
-      // AC1: every accepted host collection fills TBM pools/tranches.
-      syncTbmFromHostSnapshot(this.sql, hostId, snap.routes as Record<string, any>, snap.captured_at_ms);
-
       const ageMs = Math.max(0, nowMs - snap.captured_at_ms);
       const isStale = ageMs >= QUOTA_STALE_MS;
 
@@ -1336,10 +1332,16 @@ export class QuotaStore {
     filters: FleetQuotaFilters,
     nowMs: number = this.now()
   ): { status: number; body: Record<string, any> } {
+    const archivedLabels = new Set<string>();
+    try {
+      for (const row of this.sql.exec("SELECT label FROM fleet_account_archives").toArray() as any[])
+        archivedLabels.add(canonicalAccountLabel(String(row.label)));
+    } catch { /* isolated quota stores may predate the fleet archive table */ }
     const rawAccounts = dedupeAccountsByCanonical(
       this.sql.exec("SELECT * FROM fleet_accounts ORDER BY provider, label").toArray() as any[],
-    );
-    const serverRows = this.sql.exec("SELECT * FROM server_quota_snapshots ORDER BY account").toArray() as any[];
+    ).filter((account: any) => !archivedLabels.has(canonicalAccountLabel(String(account.label))));
+    const serverRows = (this.sql.exec("SELECT * FROM server_quota_snapshots ORDER BY account").toArray() as any[])
+      .filter(row => !archivedLabels.has(canonicalAccountLabel(String(row.account))));
     // Stored rows keyed by old names (provider `codex-orin`, label
     // `urgent-muse`) canonicalize to the provider model: `codex-orin` is an
     // account under provider `codex`, the Go pool account is `shared-go`.
@@ -1371,79 +1373,8 @@ export class QuotaStore {
         rawAccounts.push({ label: row.account, provider: row.provider });
       }
     }
-    const knownProviders = new Set(rawAccounts.map((a: any) => a.provider));
-    const knownLabels = new Set(rawAccounts.map((a: any) => a.label));
-    const extraAccounts: any[] = [];
     const allRoutes = this.sql.exec("SELECT * FROM fleet_routes ORDER BY machine_id, engine").toArray() as any[];
-    // Machine aliasing (mark, never delete): stale records that resolve to a
-    // live canonical host (same normalized hostname) are not a fleet of their
-    // own — coverage counts canonical machines only, so a superseded
-    // registration can never show as a missing machine.
-    let aliasOf = new Map<string, string>();
-    // Fleet-membership evidence per machine row. Registration alone is not a
-    // check-in (machine registry spec): a record with no check-in never
-    // joined the fleet, and drain is an operator's deliberate removal.
-    // Neither may fail fleet coverage forever — status already treats a
-    // drained machine as never-missing and a never-seen registration is a
-    // pending enrollment, not an outage. Both stay out of the fleet-wide
-    // coverage (listed under not_fleet with the reason); an explicit --host
-    // filter still shows exactly what is known about that machine.
-    const membership = new Map<string, { drained: boolean; joined: boolean }>();
-    try {
-      const aliasRows = this.sql.exec("SELECT id, hostname, drained, last_checkin_at FROM machines WHERE revoked_at IS NULL").toArray() as any[];
-      aliasOf = resolveMachineAliases(aliasRows.map((m: any) => {
-        const seen = typeof m.last_checkin_at === 'string' ? Date.parse(m.last_checkin_at) : NaN;
-        membership.set(String(m.id), { drained: m.drained === 1 || m.drained === true, joined: Number.isFinite(seen) });
-        return { id: String(m.id), hostname: m.hostname, drained: m.drained, last_seen_ms: Number.isFinite(seen) ? seen : null };
-      })).aliasOf;
-    } catch { aliasOf = new Map(); }
-    // A filter naming an alias reads the canonical machine it resolves to.
-    const effectiveHostId = filters.host_id && aliasOf.has(filters.host_id) ? aliasOf.get(filters.host_id)! : filters.host_id;
-    const notFleet = new Map<string, string>();
-    const inFleet = (id: string): boolean => {
-      const m = membership.get(id);
-      // Degrade open: without membership evidence (failed registry read)
-      // every machine counts, as before.
-      if (!m) return true;
-      if (m.drained) { notFleet.set(id, "drained"); return false; }
-      if (!m.joined) { notFleet.set(id, "never_checked_in"); return false; }
-      return true;
-    };
-    const machines = (this.sql.exec("SELECT id FROM machines WHERE revoked_at IS NULL ORDER BY id").toArray() as any[])
-      .map((m: any) => m.id)
-      .filter((id: string) => !aliasOf.has(id) && (!effectiveHostId || id === effectiveHostId))
-      .filter((id: string) => effectiveHostId !== null && effectiveHostId !== undefined ? true : inFleet(id));
-
-    for (const machineId of machines) {
-      const snap: any = this.sql.exec("SELECT * FROM host_quota_snapshots WHERE host_id = ?", machineId).toArray()[0];
-      if (!snap || !isFreshTs(snap.captured_at, nowMs, QUOTA_STALE_MS)) continue;
-      let snapRoutes: any = null;
-      try {
-        snapRoutes = JSON.parse(snap.routes_json);
-      } catch {
-        snapRoutes = null;
-      }
-      if (!snapRoutes || typeof snapRoutes !== "object") continue;
-      for (const prov of Object.keys(snapRoutes)) {
-        if (!ALLOWED_QUOTA_PROVIDERS.has(prov)) continue;
-        const canonical = canonicalQuotaProvider(prov);
-        if (!knownProviders.has(canonical)) {
-          knownProviders.add(canonical);
-          if (!knownLabels.has(prov)) {
-            knownLabels.add(prov);
-            extraAccounts.push({ label: prov, provider: canonical, max_concurrency: 1, reserve_percent: 0, enabled: 1 });
-          }
-        } else if (!knownLabels.has(prov) && canonicalQuotaProvider(prov) !== prov) {
-          // A legacy wire route key (e.g. `codex-orin`) whose canonical
-          // provider is already registered still identifies an account the
-          // registry has not named yet: surface it under its own label so
-          // the second Codex home is never silently merged away.
-          knownLabels.add(prov);
-          extraAccounts.push({ label: prov, provider: canonical, max_concurrency: 1, reserve_percent: 0, enabled: 1 });
-        }
-      }
-    }
-    const accounts = [...rawAccounts, ...extraAccounts].filter(
+    const accounts = rawAccounts.filter(
       (a) => (!filters.provider || canonicalQuotaProvider(a.provider) === filters.provider) && (!filters.account || canonicalAccountLabel(a.label) === filters.account)
     );
 
@@ -1457,105 +1388,22 @@ export class QuotaStore {
       );
       const freshObs: { machine: string; quota: any; kind: string }[] = [];
       let hasStale = false;
-      for (const route of routes) {
-        const sub: any = this.sql
-          .exec("SELECT * FROM fleet_subscriptions WHERE machine_id = ? AND account = ?", route.machine_id, account.label)
-          .toArray()[0];
-        if (sub) {
-          let quota: any = null;
-          try {
-            quota = JSON.parse(sub.quota_json);
-          } catch {
-            quota = null;
-          }
-          const quotaObs = quota?.observed_at || sub.observed_at;
-          if (quota && isFreshTs(sub.observed_at, nowMs, QUOTA_STALE_MS) && isFreshTs(quotaObs, nowMs, QUOTA_STALE_MS)) {
-            // Retain every fresh report as provenance, but do not let an
-            // empty/unknown managed-account probe mask a healthy host-wide
-            // collector snapshot below. This matters for device-login
-            // providers whose direct account probe can fail while the host
-            // collector still has a valid reading. Positive exhaustion and
-            // cooldown evidence remains authoritative.
-            const hasActiveCooldown = typeof quota.details?.cooldown_until === "string" &&
-              Date.parse(quota.details.cooldown_until) > nowMs;
-            const hasExhaustedWindow = windowMinPercent(quota) === 0;
-            freshObs.push({ machine: route.machine_id, quota: quota.observed_at ? quota : { ...quota, observed_at: quotaObs }, kind: "subscription" });
-            if (observationUnavailable(quota) && quota.details?.limit_reached !== true && !hasActiveCooldown && !hasExhaustedWindow) hasStale = true;
-            if (!observationUnavailable(quota) || quota.details?.limit_reached === true || hasActiveCooldown || hasExhaustedWindow) continue;
-          } else {
-            hasStale = true;
-            continue;
-          }
-        }
-        // Single-account host snapshot fallback: same canonical rule as fleet observation().
-        // A named profile that is not the provider itself cannot be read from
-        // a default single-route CLI reading (it cannot address a named
-        // profile or two accounts on one service).
-        if (route.profile !== null && route.profile !== canonicalQuotaProvider(account.provider)) {
-          hasStale = true;
-          continue;
-        }
-        const countRow: any = this.sql
-          .exec(
-            "SELECT COUNT(DISTINCT r.account) AS n FROM fleet_routes r JOIN fleet_accounts a ON r.account = a.label WHERE r.machine_id = ? AND (a.provider = ? OR a.provider = ?)",
-            route.machine_id,
-            account.provider,
-            legacyRouteKeyFor(account.provider) ?? account.provider,
-          )
-          .one();
-        const snap: any = this.sql.exec("SELECT * FROM host_quota_snapshots WHERE host_id = ?", route.machine_id).toArray()[0];
-        if (Number(countRow?.n) !== 1 || !snap || !isFreshTs(snap.captured_at, nowMs, QUOTA_STALE_MS)) {
-          hasStale = true;
-          continue;
-        }
-        let snapRoutes: any = null;
-        try {
-          snapRoutes = JSON.parse(snap.routes_json);
-        } catch {
-          snapRoutes = null;
-        }
-        const quota = snapshotRouteForAccount(account.label, account.provider, snapRoutes);
-        const obsTs = quota?.observed_at || snap.captured_at;
-        if (quota && isFreshTs(obsTs, nowMs, QUOTA_STALE_MS)) {
-          freshObs.push({ machine: route.machine_id, quota: quota.observed_at ? quota : { ...quota, observed_at: obsTs }, kind: "snapshot" });
-        } else {
-          hasStale = true;
-        }
-      }
-
-      const hasHealthyObservation = freshObs.some((o) => !observationUnavailable(o.quota));
-      const hasPositiveHold = freshObs.some((o) => o.quota.details?.limit_reached === true || windowMinPercent(o.quota) === 0 ||
-        (typeof o.quota.details?.cooldown_until === "string" && Date.parse(o.quota.details.cooldown_until) > nowMs));
-      if (!hasHealthyObservation && !hasPositiveHold) {
-        const snapshotSources = new Set(freshObs.filter((o) => o.kind === "snapshot").map((o) => o.machine));
-        for (const machineId of machines) {
-          if (snapshotSources.has(machineId)) continue;
-          const snap: any = this.sql.exec("SELECT * FROM host_quota_snapshots WHERE host_id = ?", machineId).toArray()[0];
-          if (!snap || !isFreshTs(snap.captured_at, nowMs, QUOTA_STALE_MS)) continue;
-          let snapRoutes: any = null;
-          try {
-            snapRoutes = JSON.parse(snap.routes_json);
-          } catch {
-            snapRoutes = null;
-          }
-          const quota = snapshotRouteForAccount(account.label, account.provider, snapRoutes);
-          const obsTs = quota?.observed_at || snap.captured_at;
-          if (quota && isFreshTs(obsTs, nowMs, QUOTA_STALE_MS)) {
-            freshObs.push({ machine: machineId, quota: quota.observed_at ? quota : { ...quota, observed_at: obsTs }, kind: "snapshot" });
-          }
-        }
-      }
-
       const central = serverDeduped.find(r => r.account === canonicalAccountLabel(account.label) && r.provider === canonicalQuotaProvider(account.provider));
-      let source = "machine-fallback";
+      let source = "server";
       if (central) {
         let quota: any = null;
         try { quota = JSON.parse(central.quota_json); } catch { /* unavailable */ }
         if (quota && isFreshTs(central.captured_at, nowMs, QUOTA_STALE_MS) &&
             (!quota.observed_at || isFreshTs(quota.observed_at, nowMs, QUOTA_STALE_MS))) {
           freshObs.splice(0, freshObs.length, { machine: "hub-server", quota, kind: "server" });
-          source = "server";
-        } else hasStale = true;
+        } else {
+          freshObs.splice(0, freshObs.length);
+          hasStale = true;
+        }
+      } else {
+        // Legacy machine reports are ignored and cannot fill a missing
+        // Hub-server account reading.
+        freshObs.splice(0, freshObs.length);
       }
       let state = "unknown";
       let remaining: number | null = null;
@@ -1565,11 +1413,11 @@ export class QuotaStore {
         state = "fresh";
         if (freshObs.some((o) => o.quota.details?.limit_reached === true)) {
           state = "exhausted";
+          remaining = 0;
         } else {
-          // One broken host probe must not hold the whole pool when another
-          // host reports healthy evidence: a known 7d window with a missing
-          // short window stays placeable. Fail closed only when NO healthy
-          // observation remains (genuine window errors still fail that host).
+          // The Hub-server observation is authoritative. A missing short
+          // window does not erase a known weekly balance; only present numeric
+          // windows contribute to the displayed remainder.
           const healthy = freshObs.filter((o) => !observationUnavailable(o.quota));
           if (!healthy.length) {
             state = "unavailable";
@@ -1612,6 +1460,10 @@ export class QuotaStore {
       // Display the first healthy observation when one exists so a broken
       // sibling probe never masks known windows (e.g. 7d 80% with 5h absent).
       const displayObs = freshObs.find((o) => !observationUnavailable(o.quota)) ?? freshObs[0];
+      const resetTimes = Object.values(displayObs?.quota.windows || {})
+        .map((window: any) => window?.reset_at)
+        .filter((value: unknown): value is string => typeof value === "string" && Number.isFinite(Date.parse(value)))
+        .sort((a, b) => Date.parse(a) - Date.parse(b));
       const canonProv = canonicalQuotaProvider(account.provider);
       const canonAcct = canonicalAccountLabel(account.label);
       const unmetered = isUnmeteredProvider(canonProv);
@@ -1650,6 +1502,7 @@ export class QuotaStore {
         decision_score: decisionScore,
         decision_reason: decisionReason,
         observed_at: observedAt,
+        reset_at: resetTimes[0] ?? null,
         collector_version: collectorVersion,
         observed_by_hosts: [...new Set(freshObs.map((o) => o.machine))].sort(),
         engines: routeEngines,
@@ -1662,78 +1515,6 @@ export class QuotaStore {
       });
     }
 
-    const hosts: Record<string, any>[] = [];
-    const coverage = { machines_total: machines.length, fresh: [] as string[], stale: [] as string[], missing: [] as string[],
-      // Machines counted fresh through their own per-account route reports
-      // (no fresh host-wide quse snapshot); see routeReportCoverage below.
-      route_reports: [] as string[],
-      // Registered records outside the operating fleet (drained, or
-      // registered without ever checking in), with the reason each is not
-      // counted. Empty on any membership-evidence failure.
-      not_fleet: [...notFleet.entries()].sort(([a], [b]) => a.localeCompare(b))
-        .map(([machine_id, reason]) => ({ machine_id, reason })) };
-    const coverageAccounts = new Set(accounts.map((a: any) => a.label));
-    const accountFiltered = Boolean(filters.provider || filters.account);
-    // A machine's own fleet subscription reports (one per routed account,
-    // posted every fleet cycle) are quota reports for exactly the accounts
-    // it can serve. A host without a host-wide quse snapshot (e.g. the
-    // Windows tablet serving only managed Codex bundles) is still a covered
-    // machine when every account routed to it has a fresh report from it;
-    // some-but-not-all is stale, none is missing.
-    const routeReportCoverage = (machineId: string): { routed: number; reported: number } => {
-      const routed = [...new Set(allRoutes
-        .filter((r) => r.machine_id === machineId && (!filters.engine || r.engine === filters.engine) &&
-          (!accountFiltered || coverageAccounts.has(r.account)))
-        .map((r) => r.account as string))];
-      let reported = 0;
-      for (const account of routed) {
-        const sub: any = this.sql
-          .exec("SELECT observed_at, quota_json FROM fleet_subscriptions WHERE machine_id = ? AND account = ?", machineId, account)
-          .toArray()[0];
-        if (!sub || !isFreshTs(sub.observed_at, nowMs, QUOTA_STALE_MS)) continue;
-        let quota: any = null;
-        try { quota = JSON.parse(sub.quota_json); } catch { quota = null; }
-        if (!quota || typeof quota !== "object") continue;
-        if (quota.observed_at !== undefined && quota.observed_at !== null && !isFreshTs(quota.observed_at, nowMs, QUOTA_STALE_MS)) continue;
-        reported += 1;
-      }
-      return { routed: routed.length, reported };
-    };
-    for (const machineId of machines) {
-      const snap = this.getSnapshot(machineId, nowMs);
-      const body = snap.body as Record<string, any>;
-      if (filters.provider && body.routes) {
-        body.routes = Object.fromEntries(Object.entries(body.routes).filter(([p]) => canonicalQuotaProvider(p) === filters.provider));
-      }
-      const subs = (this.sql.exec("SELECT * FROM fleet_subscriptions WHERE machine_id = ? ORDER BY service, account", machineId).toArray() as any[])
-        .filter((s) => (!filters.provider || canonicalQuotaProvider(s.service) === filters.provider) && (!filters.account || canonicalAccountLabel(s.account) === filters.account))
-        .map((s: any) => {
-          let quota: any = null;
-          try {
-            quota = JSON.parse(s.quota_json);
-          } catch {
-            quota = null;
-          }
-          // Harness serving this subscription, from the machine's routes for
-          // the account (canonicalized: native zcodex reads as harness codex).
-          const subEngines = [...new Set(allRoutes
-            .filter((r) => r.machine_id === s.machine_id && r.account === s.account)
-            .map((r) => canonicalHarness(r.engine)))].sort();
-          return { machine_id: s.machine_id, account: canonicalAccountLabel(s.account), service: canonicalQuotaProvider(s.service), plan: s.plan, observed_at: s.observed_at,
-            stale: !isFreshTs(s.observed_at, nowMs, QUOTA_STALE_MS), quota, engines: subEngines };
-        });
-      hosts.push({ host_id: machineId, snapshot: body, subscriptions: subs });
-      if (snap.status === 200 && body.status === "ok") coverage.fresh.push(machineId);
-      else {
-        const { routed, reported } = routeReportCoverage(machineId);
-        if (routed > 0 && reported === routed) {
-          coverage.fresh.push(machineId);
-          coverage.route_reports.push(machineId);
-        } else if (snap.status === 404 && reported === 0) coverage.missing.push(machineId);
-        else coverage.stale.push(machineId);
-      }
-    }
-
     return {
       status: 200,
       body: {
@@ -1741,11 +1522,9 @@ export class QuotaStore {
         as_of: new Date(nowMs).toISOString(),
         filters,
         pools,
-        hosts,
-        coverage,
         // Canonical name mappings applied to this view: legacy wire route
         // keys and account labels (kept on ingest for backward compatibility
-        // with stored rows and host snapshots) and their canonical
+        // with stored rows and Hub-server snapshots) and their canonical
         // provider/harness/account names. UIs join per-window rows through it.
         canonical: {
           providers: { ...LEGACY_QUOTA_ROUTE_PROVIDERS },
@@ -1773,6 +1552,11 @@ export class QuotaStore {
    */
   public getWorkerEnginesView(nowMs: number = this.now()): Record<string, any> {
     const { body } = this.getFleetView({ host_id: null, provider: null, engine: null, account: null }, nowMs);
+    const archivedLabels = new Set<string>();
+    try {
+      for (const row of this.sql.exec('SELECT label FROM fleet_account_archives').toArray() as any[])
+        archivedLabels.add(canonicalAccountLabel(String(row.label)));
+    } catch { /* isolated quota stores may predate fleet account archives */ }
     const poolState = new Map<string, string>();
     const poolProviderByLabel = new Map<string, string>();
     for (const pool of body.pools as Record<string, any>[]) {
@@ -1782,7 +1566,8 @@ export class QuotaStore {
     }
     const registry = new Map<string, { enabled: number; provider: string }>();
     for (const a of dedupeAccountsByCanonical(this.sql.exec("SELECT * FROM fleet_accounts ORDER BY label").toArray() as any[])) {
-      registry.set(canonicalAccountLabel(a.label), { enabled: Number(a.enabled) === 0 ? 0 : 1, provider: canonicalQuotaProvider(a.provider) });
+      const label = canonicalAccountLabel(a.label);
+      if (!archivedLabels.has(label)) registry.set(label, { enabled: Number(a.enabled) === 0 ? 0 : 1, provider: canonicalQuotaProvider(a.provider) });
     }
     const health = new Map<string, string>();
     for (const h of this.sql.exec("SELECT engine, machine_id, status FROM fleet_engine_health").toArray() as any[]) {
@@ -1791,6 +1576,7 @@ export class QuotaStore {
     const engines: Record<string, string>[] = [];
     for (const r of this.sql.exec("SELECT machine_id, engine, account FROM fleet_routes ORDER BY engine, account, machine_id").toArray() as any[]) {
       const account = canonicalAccountLabel(String(r.account));
+      if (archivedLabels.has(account)) continue;
       const registered = registry.get(account);
       const provider = registered ? registered.provider : poolProviderByLabel.get(account) ?? "";
       const state = poolState.get(account + "\u0000" + provider);
@@ -1829,6 +1615,12 @@ export class QuotaStore {
     }
     const rows: { account: string; provider: string; quota: QuotaRouteDTO }[] = [];
     const seen = new Set<string>();
+    const archivedLabels = new Set<string>();
+    try {
+      for (const archived of this.sql.exec("SELECT label FROM fleet_account_archives").toArray() as any[])
+        archivedLabels.add(canonicalAccountLabel(String(archived.label)));
+    } catch { /* isolated quota stores may predate the fleet archive table */ }
+    let ignoredArchived = 0;
     for (const row of data.accounts) {
       if (!isPlainObject(row) || Object.keys(row).some(k => !["account", "provider", "quota"].includes(k)) ||
           typeof row.account !== "string" || !FLEET_LABEL.test(row.account)) {
@@ -1839,6 +1631,10 @@ export class QuotaStore {
       const account = canonicalAccountLabel(row.account);
       if (seen.has(account)) return jsonResponse({ error: "invalid_account", reason: "duplicate_account" }, 400);
       seen.add(account);
+      if (archivedLabels.has(account)) {
+        ignoredArchived++;
+        continue;
+      }
       // Legacy names canonicalize on ingest: a `codex-orin` route key is the
       // second Codex account (provider `codex`), `urgent-muse` the Go pool
       // account (`shared-go`). Stored rows keyed by old names keep working.
@@ -1865,7 +1661,7 @@ export class QuotaStore {
       // AC1: every accepted server collection fills TBM pools/tranches.
       syncTbmFromServerAccounts(this.sql, rows, Date.parse(data.captured_at));
     });
-    return jsonResponse({ status: "stored", accounts: rows.length });
+    return jsonResponse({ status: "stored", accounts: rows.length, ignored_archived: ignoredArchived });
   }
 
   public async handleRequest(request: Request, url?: URL, canonicalAuth?: CanonicalQuotaAuth): Promise<Response> {
@@ -1934,6 +1730,9 @@ export class QuotaStore {
         );
       }
 
+      // Machine quota collection is retired. Fleet quota is sourced only from
+      // the Hub server snapshot endpoint; keep authentication and identity
+      // checks above so legacy clients receive a clear, authenticated response.
       const parsedBody = await readBoundedJsonBody(request, QUOTA_MAX_BODY_BYTES);
       if (parsedBody.errorStatus || !parsedBody.data) {
         return jsonResponse(
@@ -1941,9 +1740,17 @@ export class QuotaStore {
           parsedBody.errorStatus || 400
         );
       }
+      const validation = validateQuotaSnapshotPayload(parsedBody.data, hostId, nowMs);
+      if (!validation.ok) {
+        const body: Record<string, any> = { error: validation.error || "invalid_payload" };
+        if (validation.reason) body.reason = validation.reason;
+        return jsonResponse(body, validation.status);
+      }
+      return jsonResponse(
+        { error: "machine_quota_collection_disabled", source: "hub_server" },
+        410
+      );
 
-      const putRes = this.putSnapshot(hostId, parsedBody.data, nowMs);
-      return jsonResponse(putRes.body, putRes.status);
     }
 
     // GET /api/quota
@@ -1997,8 +1804,7 @@ export class QuotaStore {
         }
       }
 
-      const getRes = this.getSnapshot(hostId, nowMs);
-      return jsonResponse(getRes.body, getRes.status);
+      return jsonResponse({ error: "machine_quota_collection_disabled", source: "hub_server" }, 410);
     }
 
     // Optional verified admin session with explicit ?host_id
@@ -2015,37 +1821,7 @@ export class QuotaStore {
     const integrity = checkSessionReadIntegrity(request, reqUrl, session.csrfToken);
     if (integrity) return integrity;
 
-    const requestedHostId = reqUrl.searchParams.get("host_id");
-    if (
-      !requestedHostId ||
-      !requestedHostId.trim() ||
-      requestedHostId.length > 128 ||
-      !/^[A-Za-z0-9_.:-]{1,128}$/.test(requestedHostId)
-    ) {
-      return jsonResponse(
-        { error: "missing_host_id", reason: "explicit_host_id_required" },
-        400
-      );
-    }
-
-    if (!this.isRegisteredMachine(requestedHostId)) {
-      return jsonResponse(
-        {
-          schema_version: "1.0",
-          captured_at: null,
-          received_at: null,
-          host_id: requestedHostId,
-          stale: true,
-          status: "unknown",
-          error: "unavailable",
-          routes: {},
-        },
-        404
-      );
-    }
-
-    const getRes = this.getSnapshot(requestedHostId, nowMs);
-    return jsonResponse(getRes.body, getRes.status);
+    return jsonResponse({ error: "machine_quota_collection_disabled", source: "hub_server" }, 410);
   }
 }
 

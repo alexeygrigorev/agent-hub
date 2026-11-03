@@ -70,7 +70,7 @@ def test_phases_published_with_expected_keys():
         assert len(phase_events) == 1, events
         phases = phase_events[0]['phases']
         for key in ('provisioning', 'system', 'register', 'admission', 'heartbeat',
-                    'probes', 'subscriptions', 'catalog', 'workclaim', 'capabilities',
+                    'probes', 'catalog', 'workclaim', 'capabilities',
                     'reconcile', 'watchdog', 'unconfigured_probes',
                     'offers', 'dispatch'):
             assert key in phases, (key, sorted(phases))
@@ -79,15 +79,13 @@ def test_phases_published_with_expected_keys():
         assert set(dispatcher.last_cycle_phases) == set(phases)
 
 
-def test_subscriptions_400_is_nonfatal_and_offers_still_dispatched():
+def test_no_subscription_report_and_offers_still_dispatched():
     with tempfile.TemporaryDirectory() as tmp:
         cfg = settings(Path(tmp))
         calls = []
         item = offer()
         dispatched = []
-        request = _base_request_factory(
-            calls, offers=[item],
-            fail_paths={('PUT', '/api/fleet/subscriptions'): 400})
+        request = _base_request_factory(calls, offers=[item])
         dispatcher = fleet.Dispatcher(cfg, request, _base_runner, journal_dir=str(Path(tmp)))
         buf = io.StringIO()
         with contextlib.ExitStack() as stack:
@@ -107,8 +105,8 @@ def test_subscriptions_400_is_nonfatal_and_offers_still_dispatched():
             with contextlib.redirect_stdout(buf):
                 results = dispatcher.once()
         events = [json.loads(line) for line in buf.getvalue().splitlines() if line.strip()]
-        skipped = [e for e in events if e.get('event') == 'fleet_telemetry_skipped']
-        assert any(s['phase'] == 'subscriptions' and 'invalid_subscription' in s['error'] for s in skipped), events
+        assert not any(e.get('phase') == 'subscriptions' for e in events), events
+        assert not any(p == '/api/fleet/subscriptions' for _, p in calls), calls
         assert [m for m, p in calls if p == '/api/fleet/offers'], calls
         assert dispatched == [item['id']], dispatched
         assert any(r.get('id') == item['id'] for r in results), results

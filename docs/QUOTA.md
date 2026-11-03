@@ -1,4 +1,4 @@
-# Account Quota and Host Snapshot API
+# Hub-Server Quota and Retired Host Snapshot API
 
 ## Primary collection: Hub server
 
@@ -30,19 +30,21 @@ is validated before storage. Duplicate accounts, mismatched providers, private
 fields, future measurements and replayed/older snapshots are refused. Failed
 probes explicitly replace previous success with unavailable evidence.
 
-The latest row per account lives in `server_quota_snapshots`. Fresh server
-observations take precedence in both fleet quota views and route admission,
-including failures that must hold dispatch. After 20 minutes they expire; fresh
-machine observations may then be used as an explicitly labeled fallback.
-Existing provider reserve, entitlement, reset and local launch gates still apply.
-`GET /api/quota?view=fleet` reports `source`, `windows` and `account_coverage`;
-the CLI and Usage dashboard count accounts independently of machine coverage.
-The legacy `coverage` and `hosts` fields remain diagnostic data. Operators who
+The latest row per account lives in `server_quota_snapshots`. The fleet quota
+view uses only this Hub-server observation: missing, stale or failed server
+readings are never filled from a machine subscription or host snapshot.
+`GET /api/quota?view=fleet` returns account `pools`, `source`, `windows` and
+`account_coverage`; the former per-host `hosts` and machine `coverage` fields
+are omitted. Legacy `GET /api/quota` host-scoped reads return
+`410 machine_quota_collection_disabled`; historical host rows are retained but
+not exposed. Operators who
 already have the private bootstrap credential can read with
 `hub quota --admin-token-file ~/.config/agent-hub/admin-token`, without issuing a
 new credential or changing any machine's login profile.
+The machine-side `hub subscriptions` collection command is retired and refuses
+to probe or report quota; use `hub quota` for the Hub-server projection.
 
-## Fallback collection: host snapshots
+## Host snapshots
 
 
 Status: Founder-authorized specification ([Issue #12](https://github.com/alexeygrigorev/agent-hub/issues/12)).
@@ -52,12 +54,21 @@ Implementation scope: Hub server (`src/quota.ts`, `src/hub.ts`) and host collect
 
 `QUOTA-HUB-SPEC-20261014` defines an expressly authorized exception to the general rule against storing quota figures in Agent Hub:
 
-- **60 s heartbeats remain boolean-only**: Regular host heartbeats (`POST /api/host/poll` and WebSocket `heartbeat` frames, [docs/SPEC.md §7.2](SPEC.md#72-heartbeat-and-sanitized-quota-snapshot-quota-hub-spec-20261014)) continue to report only the boolean `gate: { launch_allowed, reason, at }` for scheduling and never run `quse` on every beat.
-- **600 s sanitized quota snapshots**: Each registered host collects one bounded `quse --json` snapshot every **600 seconds (10 minutes)** and posts a strictly sanitized Data Transfer Object (DTO) to `POST /api/quota`.
-- **Single-row per-host retention**: The Hub Durable Object persists only the single latest validated snapshot per verified host in `host_quota_snapshots` (`host_id TEXT PRIMARY KEY`), keeping storage and row-write counts well within Cloudflare Workers Free plan limits.
-- **`GET /api/quota` never triggers `quse`**: Reading `/api/quota` is a pure SQLite read inside the Hub Durable Object and never spawns a host process or triggers an on-demand `quse` probe.
+**Current quota authority (intake 58ebeb9f):** fleet quota comes only from the
+Hub server. The maintained HostAgent no longer schedules the former 600-second
+host snapshot collector. The legacy DTO validator and historical rows remain
+for a safe transition; the retired host API neither reads nor writes those rows.
 
-## 2. Exact DTO contract (`schema_version: "1.0"`)
+- **60 s heartbeats remain boolean-only**: Regular host heartbeats (`POST /api/host/poll` and WebSocket `heartbeat` frames, [docs/SPEC.md §7.2](SPEC.md#72-heartbeat-and-sanitized-quota-snapshot-quota-hub-spec-20261014)) continue to report only the boolean `gate: { launch_allowed, reason, at }` for scheduling and never run `quse` on every beat.
+- **Historical 600 s snapshot contract**: The former host collector posted one bounded `quse --json` snapshot every **600 seconds (10 minutes)** to `POST /api/quota`. Maintained HostAgent no longer schedules this collection.
+- **Historical single-row per-host retention**: Existing rows in `host_quota_snapshots` (`host_id TEXT PRIMARY KEY`) are retained for audit and migration only. No public quota read exposes them, and they never contribute to fleet quota or routing.
+- **No host read or collection route**: `GET` and `POST /api/quota` return `410 machine_quota_collection_disabled` to valid legacy callers. Neither operation reads or writes machine snapshots.
+
+## 2. Legacy host snapshot DTO (`schema_version: "1.0"`)
+
+This schema is retained to validate legacy submissions and interpret historical
+rows. A valid host submission is rejected with `410 machine_quota_collection_disabled`;
+it is never written to `host_quota_snapshots`.
 
 ### 2.1 `POST /api/quota` request body
 
@@ -112,25 +123,11 @@ Implementation scope: Hub server (`src/quota.ts`, `src/hub.ts`) and host collect
 }
 ```
 
-### 2.2 `GET /api/quota` response body
+### 2.2 Retired `GET /api/quota` response
 
-`GET /api/quota` returns the sanitized contract augmented with server-side `received_at` (canonical UTC ISO-8601) and `stale` (`boolean`), with header `Cache-Control: private, no-store`:
-
-- **Fresh (`age < 1200 s`, HTTP `200 OK`)**: `stale: false`, `status: "ok"`, `error: null`.
-- **Stale (`age >= 1200 s`, HTTP `503 Service Unavailable`)**: `stale: true`, `status: "stale"`, `error: "unavailable"`, and every provider route in `routes` is marked `error: "unavailable"` (`status: "error"` or `"unknown"`) while preserving `captured_at`, `received_at`, `observed_at`, `details`, and `windows` for diagnostics.
-- **Missing (no snapshot stored for the host, HTTP `404 Not Found`)**:
-  ```json
-  {
-    "schema_version": "1.0",
-    "captured_at": null,
-    "received_at": null,
-    "host_id": "mach_01hxyz...",
-    "stale": true,
-    "status": "unknown",
-    "error": "unavailable",
-    "routes": {}
-  }
-  ```
+The endpoint authenticates legacy callers, then returns HTTP `410 Gone` with
+`{"error":"machine_quota_collection_disabled","source":"hub_server"}`.
+It never returns the former fresh, stale or missing host snapshot bodies.
 
 ### 2.3 Field validation rules
 
@@ -160,14 +157,14 @@ Implementation scope: Hub server (`src/quota.ts`, `src/hub.ts`) and host collect
 
 ## 4. Authentication and machine isolation
 
-1. **`POST /api/quota` (Host write only)**:
+1. **`POST /api/quota` (retired)**:
    - Requires `Authorization: Bearer hubt_...` backed by a non-revoked, non-expired `credentials` row with `kind === "host"`, scope `"host"`, and a `machine_id` registered in `machines`.
-   - `body.host_id` must equal `cred.machine_id` (`403 Forbidden` on mismatch).
+   - Host identity and DTO validation remain enforced for legacy clients. A valid DTO receives `410 Gone` with `{ "error": "machine_quota_collection_disabled", "source": "hub_server" }`; it is not stored. `body.host_id` must equal `cred.machine_id` (`403 Forbidden` on mismatch).
    - Anonymous callers (`401`), expired/revoked tokens (`401`), `job` tokens (`403`), `agent` tokens (`403`), `human` tokens (`403`), and admin session cookies (`403`) are denied before any SQLite write.
    - Host-spoofing headers (`X-Host-Id`, `X-Machine-Id`, `X-Forwarded-Host`) and mismatched `?host_id` query parameters are rejected (`403`).
-2. **`GET /api/quota` (Own-host read or scoped admin session read)**:
-   - **Host bearer token**: Reads only the caller's own `cred.machine_id` snapshot. No `?host_id` query parameter is needed; passing another machine's `host_id` returns `403 Forbidden`.
-   - **Verified admin session (`hub_session` cookie)**: Must pass Origin, `Sec-Fetch-Site`, and optional `X-CSRF-Token` integrity checks, and **must** provide an explicit `?host_id=<machine_id>` query parameter (`400 Bad Request` if omitted). There is no global anonymous or unscoped multi-host feed.
+2. **`GET /api/quota` (retired host read)**:
+   - A valid host bearer or verified admin session receives `410 machine_quota_collection_disabled`; no host snapshot content is returned.
+   - Invalid, expired or revoked credentials remain denied by the existing authentication checks before the retirement response.
 3. **Response caching**:
    - Every `/api/quota` response sets `Cache-Control: private, no-store`.
 4. **Host machine binding**:
@@ -178,21 +175,22 @@ Implementation scope: Hub server (`src/quota.ts`, `src/hub.ts`) and host collect
 
 - **Strict allowlist and unknown-key rejection**: No account identifiers, emails, billing records, dollar/credit balances, subscription names, raw error strings, token counts, usage logs, or transcripts may be sent or stored. Any unknown key at top-level, route-level, details-level, or window-level causes the entire payload to be rejected (`400 Bad Request`) prior to any SQLite transaction, and rejected values or credentials are never echoed in error responses or logs.
 - **32 KiB body cap**: Request bodies are bounded to `32,768` bytes both via `Content-Length` and incremental stream chunk accounting (`413 Payload Too Large`).
-- **Transactional replacement**: Validation completes before opening the synchronous SQLite write transaction. Only one row per `host_id` is stored.
+- **Historical storage only**: Existing `host_quota_snapshots` rows are retained for audit and migration. The retired host API performs no insert, update, or delete on this table, and public views do not read it.
 
-## 6. Collection cadence (600 s) and staleness boundary (1200 s)
+## 6. Retired collection and historical staleness boundary
 
-- **Host collection every 600 s**: The host agent schedules at most one bounded `[quse, "--json"]` subprocess (`shell=False`, timeout `<= 30 s`, bounded stdout) every `600 s` using a monotonic clock. Failed or unconfigured host states hold without spinning or leaking tokens.
-- **Collector window consistency**: The host collector emits every absent or errored window as `percent_remaining: null, reset_at: null, present: false`, matching the Hub rule in §2.3. An errored window also carries `error: "unavailable"` and marks its own provider route `status: "error", error: "unavailable"`. An upstream explicit `present: false` with a numeric `percent_remaining` is contradictory and fails closed the same way. One bad window therefore marks only its own route unavailable; it no longer causes a `400` that drops every provider's data for that cycle.
-- **Replay and out-of-order protection**: A post with `captured_at <= existing.captured_at` is rejected with `409 Conflict` so a cached or replayed post cannot reset `received_at` or extend snapshot freshness.
-- **Conservative 1200 s (20-minute) staleness boundary**: Freshness on `GET /api/quota` is evaluated exclusively against the server's UTC clock (`Date.now()`), ignoring any caller-supplied clock headers or query parameters. When `max(server_now - captured_at, server_now - received_at) >= 1200 s`, the snapshot is marked `stale: true, status: "stale", error: "unavailable"` (`HTTP 503`).
+- **No host collection**: Maintained HostAgent does not schedule `quse` quota collection. The Hub rejects valid host submissions with HTTP `410` and does not create or update machine snapshot rows.
+- **No controller collector**: `session_host` maintenance runs fleet dispatch only; it no longer constructs, schedules, or ticks a per-machine quota collector.
+- **Standalone host runner retired**: `python -m agent_hub_host.quota_snapshot` exits with a retirement message before probing or submitting quota data.
+- **Legacy collector DTO validation**: The retired DTO validator still rejects malformed, secret-bearing, future, and oversized submissions before returning the retirement response. It exists for a safe transition and historical data handling, not as an ingestion path.
+- **Derived quota history**: Resource history, TBM pools and banked-reset alerts use Hub-server account observations. Legacy machine subscription and snapshot rows are ignored.
 
 ## 7. Client caching and fallback contract
 
 Downstream consumers (`agent-quota-launcher` and `cloudflare-agent-git/scripts/quota-gate.py`):
 
-1. Read `GET /api/quota` using the host's existing machine-bound credential. Only a `200` with `stale: false`, `status: "ok"` and `error: null` is a usable Hub answer; cache it locally for a `30 s` TTL.
-2. If the Hub query is inaccessible (network error, timeout) **or** returns anything else (stale `503`, missing `404`, any other non-`200`, `stale: true`, top-level `status` other than `"ok"`, a non-null `error`, or an unparseable body), run exactly **one** fresh bounded local `quse --json` (`shell=False`, timeout `<= 30 s`, stdout `<= 64 KiB`), sanitize it with the same rules as the host collector, and apply the gates below to that result. There is no second attempt and no retry loop. If that one run fails, times out, overflows or does not parse, fail closed. The body of a `503` or `404` is never used for admission.
+1. Read `GET /api/quota` using the host's existing machine-bound credential. The retired endpoint returns `410`, so it supplies no quota reading.
+2. Downstream launchers may still perform their separately maintained local admission checks. Those checks do not post per-machine quota to Hub, and the Hub fleet view, routing and reset alerts never use their results.
 3. Apply strict per-route gates to the Hub answer or to the single local result. Each gate that is not met fails closed:
    - **Missing route**: the required provider route must exist. A `200` with `routes: {}` is a valid snapshot that admits nothing.
    - **Per-route status/error**: the route must have `status: "ok"` and `error: null`. A top-level `status: "ok"` does not imply that each route is ok; a `200` with one route in `error` is normal.

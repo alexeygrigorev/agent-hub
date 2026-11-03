@@ -131,6 +131,18 @@ async function pairAgent(actor: string, scopes: string[], sessionCookie: string,
 }
 
 const isoNow = (deltaMs = 0) => new Date(Date.now() + deltaMs).toISOString();
+let lastServerCapturedAtMs = 0;
+
+function serverQuotaPost(sessionCookie: string, csrfToken: string, accounts: { account: string; provider: string; quota: any }[]) {
+  const observedAt = accounts.map((row) => Date.parse(row.quota.observed_at)).filter(Number.isFinite);
+  const capturedAtMs = Math.max(Date.now() - 1000, lastServerCapturedAtMs + 1, ...observedAt);
+  lastServerCapturedAtMs = capturedAtMs;
+  return doFetch(new Request('http://example.com/api/quota/server', {
+    method: 'POST',
+    headers: { Cookie: sessionCookie, 'Content-Type': 'application/json', 'x-csrf-token': csrfToken },
+    body: JSON.stringify({ captured_at: new Date(capturedAtMs).toISOString(), accounts }),
+  }));
+}
 
 function snap11(hostId: string, captured: string) {
   return {
@@ -181,62 +193,22 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
     globalThis.fetch = originalFetch;
   });
 
-  it('round-trips 1.1 native units and collector_version; 1.0 rejects new keys; secrets rejected', async () => {
+  it('rejects retired per-machine quota collection without storing a snapshot', async () => {
     const host = await pairHost('m13-native-host', 'm13native.local', sessionCookie, csrfToken);
     const captured = isoNow(-1000);
     const postRes = await quotaPost(host.accessToken, snap11(host.machineId, captured));
-    expect(postRes.status).toBe(200);
-    const posted = (await postRes.json()) as any;
-    expect(posted.schema_version).toBe('1.1');
-    expect(posted.collector_version).toBe('quota_snapshot/1.1');
+    expect(postRes.status).toBe(410);
+    expect(await postRes.json()).toEqual({ error: 'machine_quota_collection_disabled', source: 'hub_server' });
 
-    const getRes = await doFetch(
-      new Request('http://example.com/api/quota', { headers: { Authorization: `Bearer ${host.accessToken}` } })
-    );
-    expect(getRes.status).toBe(200);
-    const body = (await getRes.json()) as any;
-    expect(body.schema_version).toBe('1.1');
-    expect(body.collector_version).toBe('quota_snapshot/1.1');
-    expect(body.routes.codex.windows['7d'].credits_remaining).toBe(12.5);
-    expect(body.routes.codex.windows['7d'].unit).toBe('credits');
-    expect(body.routes.go.details.spend_used).toBe(150);
-    expect(body.routes.go.details.spend_limit).toBe(1000);
-    expect(body.routes.go.details.unit).toBe('usd_cents');
-    expect(body.routes.go.details.profile).toBe('opencode-go/muse-spark-1.3-contributor');
-
-    // Stored DTO keeps natives and carries no secret material.
+    // No per-machine snapshot data is persisted by the retired endpoint.
     const stub = (defaultEnv as any).HUB.get((defaultEnv as any).HUB.idFromName('hub'));
     await runInDurableObject(stub, async (instance: Hub) => {
-      const row = instance.sql.exec('SELECT routes_json, collector_version FROM host_quota_snapshots WHERE host_id = ?', host.machineId).one() as any;
-      expect(row.collector_version).toBe('quota_snapshot/1.1');
-      expect(row.routes_json).toContain('muse-spark-1.3-contributor');
-      expect(row.routes_json).not.toMatch(/token|cookie|email|secret|bearer|authorization/i);
+      const rows = instance.sql.exec('SELECT routes_json FROM host_quota_snapshots WHERE host_id = ?', host.machineId).toArray();
+      expect(rows).toHaveLength(0);
     });
-
-    // Explicit version negotiation: 1.0 payloads reject the new keys.
-    const v10 = { ...snap11(host.machineId, isoNow(-500)), schema_version: '1.0' };
-    delete (v10 as any).collector_version;
-    expect((await quotaPost(host.accessToken, v10)).status).toBe(400);
-
-    // Secret and malformed native keys are rejected in 1.1 too.
-    const badSecrets = snap11(host.machineId, isoNow(-400)) as any;
-    badSecrets.routes.codex.details.access_token = 'secret';
-    expect((await quotaPost(host.accessToken, badSecrets)).status).toBe(400);
-    const badEmail = snap11(host.machineId, isoNow(-300)) as any;
-    badEmail.routes.codex.windows['7d'].email = 'someone@example.com';
-    expect((await quotaPost(host.accessToken, badEmail)).status).toBe(400);
-    const badUnit = snap11(host.machineId, isoNow(-200)) as any;
-    badUnit.routes.codex.windows['7d'].unit = 'dollars';
-    expect((await quotaPost(host.accessToken, badUnit)).status).toBe(400);
-    const badCredits = snap11(host.machineId, isoNow(-100)) as any;
-    badCredits.routes.codex.windows['7d'].credits_remaining = -5;
-    expect((await quotaPost(host.accessToken, badCredits)).status).toBe(400);
-    const badProfile = snap11(host.machineId, isoNow()) as any;
-    badProfile.routes.go.details.profile = 'not a profile!';
-    expect((await quotaPost(host.accessToken, badProfile)).status).toBe(400);
   });
 
-  it('fleet view dedupes a shared pool with min-remaining and provenance; filters and grants hold', async () => {
+  it('fleet view reads accounts from the Hub only; machine reports do not supply quota', async () => {
     const hostA = await pairHost('m13-fleet-a', 'm13a.local', sessionCookie, csrfToken);
     const hostB = await pairHost('m13-fleet-b', 'm13b.local', sessionCookie, csrfToken);
     const adminHeaders = { Cookie: sessionCookie, 'Content-Type': 'application/json', 'x-csrf-token': csrfToken };
@@ -246,11 +218,13 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
         body: JSON.stringify({
           accounts: [
             { label: 'm13-shared', provider: 'codex', max_concurrency: 4, reserve_percent: 15, enabled: true },
+            { label: 'codex-orin', provider: 'codex', max_concurrency: 4, reserve_percent: 0, enabled: true },
             { label: 'm13-zai', provider: 'zai', max_concurrency: 2, reserve_percent: 0, enabled: true },
           ],
           routes: [
             { machine_id: hostA.machineId, engine: 'codex', account: 'm13-shared', profile: null },
             { machine_id: hostB.machineId, engine: 'codex', account: 'm13-shared', profile: null },
+            { machine_id: hostB.machineId, engine: 'codex', account: 'codex-orin', profile: 'hub-codex-orin' },
             { machine_id: hostA.machineId, engine: 'zcodex', account: 'm13-zai', profile: 'zcodex' },
           ],
         }),
@@ -258,30 +232,24 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
     );
     expect(regRes.status).toBe(200);
 
-    const sub = (percent: number, observed = isoNow(-1000)) => ({
-      subscriptions: [{
-        service: 'codex', account: 'm13-shared', plan: 'pro',
-        quota: { status: 'ok', observed_at: observed, details: { limit_reached: false },
-          windows: { weekly: { present: true, percent_remaining: percent, reset_at: isoNow(86400000) } } },
-      }],
-    });
+    const sub = (percent: number, observed = isoNow(-1000)) => ({ status: 'ok', error: null, observed_at: observed,
+      details: { limit_reached: false },
+      windows: { weekly: { present: true, percent_remaining: percent, reset_at: isoNow(86400000), rolling: false } } });
     const putA = await doFetch(new Request('http://example.com/api/fleet/subscriptions', {
-      method: 'PUT', headers: { Authorization: `Bearer ${hostA.accessToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify(sub(80)),
+      method: 'PUT', headers: { Authorization: `Bearer ${hostA.accessToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ subscriptions: [sub(80)] }),
     }));
-    expect(putA.status).toBe(200);
+    expect(putA.status).toBe(410);
     const putB = await doFetch(new Request('http://example.com/api/fleet/subscriptions', {
-      method: 'PUT', headers: { Authorization: `Bearer ${hostB.accessToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify(sub(60)),
+      method: 'PUT', headers: { Authorization: `Bearer ${hostB.accessToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ subscriptions: [sub(60)] }),
     }));
-    expect(putB.status).toBe(200);
+    expect(putB.status).toBe(410);
 
     // Canonical binding: codex subscription cannot claim the zai account.
     const mismatch = await doFetch(new Request('http://example.com/api/fleet/subscriptions', {
       method: 'PUT', headers: { Authorization: `Bearer ${hostA.accessToken}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ subscriptions: [{ service: 'codex', account: 'm13-zai', plan: 'pro',
-        quota: { status: 'ok', observed_at: isoNow(-1000), details: { limit_reached: false },
-          windows: { weekly: { present: true, percent_remaining: 50, reset_at: isoNow(86400000) } } } }] }),
+      body: JSON.stringify({ subscriptions: [{ service: 'codex', account: 'm13-zai', plan: 'pro', quota: sub(50) }] }),
     }));
-    expect(mismatch.status).toBe(400);
+    expect(mismatch.status).toBe(410);
 
     const fleetRes = await doFetch(
       new Request('http://example.com/api/quota?view=fleet', { headers: { Cookie: sessionCookie } })
@@ -291,10 +259,24 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
     expect(fleet.schema_version).toBe('1.1');
     const pool = fleet.pools.find((p: any) => p.provider === 'codex' && p.account === 'm13-shared');
     expect(pool).toBeDefined();
-    // One shared pool, conservative minimum, both hosts retained as provenance — never summed.
-    expect(pool.state).toBe('fresh');
-    expect(pool.remaining_percent).toBe(60);
-    expect(pool.observed_by_hosts.sort()).toEqual([hostA.machineId, hostB.machineId].sort());
+    // Fresh per-machine subscriptions and snapshots do not fill an absent Hub reading.
+    expect(pool).toMatchObject({ state: 'unknown', source: 'server', remaining_percent: null, observed_by_hosts: [] });
+    expect(fleet.hosts).toBeUndefined();
+    expect(fleet.coverage).toBeUndefined();
+    expect(fleet.pools.find((p: any) => p.account === 'codex-orin')).toMatchObject({ state: 'unknown', source: 'server' });
+
+    const serverQuota = (percent: number) => ({ status: 'ok', error: null, observed_at: isoNow(-1000),
+      details: { limit_reached: percent === 0 },
+      windows: { '7d': { present: true, percent_remaining: percent, reset_at: isoNow(86400000), rolling: false } } });
+    const serverPost = await serverQuotaPost(sessionCookie, csrfToken, [
+      { account: 'm13-shared', provider: 'codex', quota: serverQuota(60) },
+      { account: 'codex-orin', provider: 'codex', quota: serverQuota(0) },
+      { account: 'm13-zai', provider: 'zai', quota: serverQuota(80) },
+    ]);
+    expect(serverPost.status).toBe(200);
+    const serverFleet = (await (await doFetch(new Request('http://example.com/api/quota?view=fleet', { headers: { Cookie: sessionCookie } }))).json()) as any;
+    expect(serverFleet.pools.find((p: any) => p.account === 'm13-shared')).toMatchObject({ state: 'fresh', source: 'server', remaining_percent: 60, observed_by_hosts: ['hub-server'] });
+    expect(serverFleet.pools.find((p: any) => p.account === 'codex-orin')).toMatchObject({ state: 'exhausted', source: 'server', remaining_percent: 0, observed_by_hosts: ['hub-server'] });
 
     // Filters narrow; unauthenticated callers are denied the fleet view. Host
     // bearers hold the read grant for this sanitized usage projection (AC5:
@@ -311,9 +293,9 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
     const anonDenied = await doFetch(new Request('http://example.com/api/quota?view=fleet'));
     expect(anonDenied.status).toBe(401);
 
-    // Admin sessions keep the legacy contract: no host selector, no fleet flag → 400.
+    // The legacy host quota view stays retired for admin sessions too.
     const bareSession = await doFetch(new Request('http://example.com/api/quota', { headers: { Cookie: sessionCookie } }));
-    expect(bareSession.status).toBe(400);
+    expect(bareSession.status).toBe(410);
 
     // Assistant grants: fleet-launch agent and routing-client read; bus-only agent refused.
     const fleetAgent = await pairAgent('m13quota-agent', ['bus:send', 'bus:read', 'fleet:launch'], sessionCookie, csrfToken);
@@ -330,7 +312,7 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
     const rcOk = await doFetch(new Request('http://example.com/api/quota?view=fleet', { headers: { Authorization: `Bearer ${rcToken}` } }));
     expect(rcOk.status).toBe(200);
 
-    // Verify auto-discovery of codex-orin and snapshot fallback in fleet view
+    // A host snapshot cannot overwrite the Hub reading or introduce quota rows.
     const snapOrin = snap11(hostA.machineId, isoNow(-1000));
     // Fleet quota coverage includes checked-in machines only. Pairing creates
     // the registry row but does not itself constitute a host check-in.
@@ -346,7 +328,7 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
         '7d': { percent_remaining: 99.0, reset_at: isoNow(86400000), present: true, rolling: false },
       },
     };
-    expect((await quotaPost(hostA.accessToken, snapOrin)).status).toBe(200);
+    expect((await quotaPost(hostA.accessToken, snapOrin)).status).toBe(410);
     const fleetWithOrin = (await (await doFetch(new Request('http://example.com/api/quota?view=fleet', { headers: { Cookie: sessionCookie } }))).json()) as any;
     // Canonical provider model: the second Codex home is provider `codex`
     // with its own account, never a separate `codex-orin` provider. Grouping
@@ -354,9 +336,10 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
     const orinPool = fleetWithOrin.pools.find((p: any) => p.account === 'codex-orin');
     expect(orinPool).toBeDefined();
     expect(orinPool.provider).toBe('codex');
-    expect(orinPool.state).toBe('fresh');
-    expect(orinPool.remaining_percent).toBe(99.0);
-    expect(orinPool.observed_by_hosts).toContain(hostA.machineId);
+    expect(orinPool.state).toBe('exhausted');
+    expect(orinPool.source).toBe('server');
+    expect(orinPool.remaining_percent).toBe(0);
+    expect(orinPool.observed_by_hosts).toEqual(['hub-server']);
     expect(orinPool.harness).toContain('codex');
     expect(fleetWithOrin.pools.some((p: any) => p.provider === 'codex-orin')).toBe(false);
     expect(fleetWithOrin.canonical.providers['codex-orin']).toBe('codex');
@@ -470,16 +453,13 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
       }),
     }))).status).toBe(200);
 
-    const quota = (limit: boolean, pct = 80) => ({
-      subscriptions: [{ service: 'codex', account: 'm13-claim', plan: 'pro',
-        quota: { status: 'ok', observed_at: isoNow(-1000), details: { limit_reached: limit },
-          windows: { weekly: { present: true, percent_remaining: pct, reset_at: isoNow(86400000) } } } }],
-    });
+    const quota = (limit: boolean, pct = 80) => ({ status: 'ok', error: null, observed_at: isoNow(-1000),
+      details: { limit_reached: limit },
+      windows: { weekly: { present: true, percent_remaining: pct, reset_at: isoNow(86400000), rolling: false } } });
     const authSub = { Authorization: `Bearer ${host.accessToken}`, 'Content-Type': 'application/json' };
-    const putSub = (body: unknown) => doFetch(new Request('http://example.com/api/fleet/subscriptions', {
-      method: 'PUT', headers: authSub, body: JSON.stringify(body),
-    }));
-    expect((await putSub(quota(false))).status).toBe(200);
+    const putQuota = (body: any) => serverQuotaPost(sessionCookie, csrfToken,
+      [{ account: 'm13-claim', provider: 'codex', quota: body }]);
+    expect((await putQuota(quota(false))).status).toBe(200);
 
     const launchBody = (key: string) => ({
       method: 'POST', headers: adminHeaders,
@@ -490,7 +470,7 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
     const launch = (await launchRes.json()) as any;
 
     // Exhaust the engine: plan refuses and the atomic claim re-check refuses too.
-    expect((await putSub(quota(true))).status).toBe(200);
+    expect((await putQuota(quota(true))).status).toBe(200);
     const planned = (await (await doFetch(new Request('http://example.com/api/fleet/plan', launchBody('m13-claim-2') as RequestInit))).json()) as any;
     expect(planned.selected).toBeFalsy();
     const claimRes = await doFetch(new Request(`http://example.com/api/fleet/launches/${launch.id}/claim`, {
@@ -500,7 +480,7 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
     expect(claimRes.status).toBe(409);
 
     // Fresh post-exhaustion evidence recovers both plan and claim.
-    expect((await putSub(quota(false))).status).toBe(200);
+    expect((await putQuota(quota(false))).status).toBe(200);
     const planned2 = (await (await doFetch(new Request('http://example.com/api/fleet/plan', launchBody('m13-claim-3') as RequestInit))).json()) as any;
     expect(planned2.selected).toBeTruthy();
     const claimRes2 = await doFetch(new Request(`http://example.com/api/fleet/launches/${launch.id}/claim`, {
@@ -547,15 +527,10 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
       }),
     }))).status).toBe(200);
 
-    const subWith = (details: unknown) => ({
-      subscriptions: [{ service: 'codex', account: 'm13-hold', plan: 'pro',
-        quota: { status: 'ok', observed_at: isoNow(-1000), details,
-          windows: { weekly: { present: true, percent_remaining: 80, reset_at: isoNow(86400000) } } } }],
-    });
-    const authSub = { Authorization: `Bearer ${host.accessToken}`, 'Content-Type': 'application/json' };
-    const putSub = (body: unknown) => doFetch(new Request('http://example.com/api/fleet/subscriptions', {
-      method: 'PUT', headers: authSub, body: JSON.stringify(body),
-    }));
+    const subWith = (details: unknown) => ({ status: 'ok', error: null, observed_at: isoNow(-1000), details,
+      windows: { weekly: { present: true, percent_remaining: 80, reset_at: isoNow(86400000), rolling: false } } });
+    const putSub = (body: any) => serverQuotaPost(sessionCookie, csrfToken,
+      [{ account: 'm13-hold', provider: 'codex', quota: body }]);
     const planNow = async (key: string) => (await (await doFetch(new Request('http://example.com/api/fleet/plan', {
       method: 'POST', headers: adminHeaders, body: JSON.stringify({ workspace: 'demo', prompt: 'm13 hold proof', idempotency_key: key }),
     }))).json()) as any;
@@ -567,7 +542,7 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
     // A later report that omits the field must not erase the unexpired hold.
     expect((await putSub(subWith({ limit_reached: false }))).status).toBe(200);
     const stored: any = await runInDurableObject(stub, async (instance: Hub) =>
-      JSON.parse((instance.sql.exec('SELECT quota_json FROM fleet_subscriptions WHERE machine_id = ? AND account = ?', host.machineId, 'm13-hold').one() as any).quota_json));
+      JSON.parse((instance.sql.exec("SELECT quota_json FROM server_quota_snapshots WHERE account = 'm13-hold'").one() as any).quota_json));
     expect(typeof stored.details.cooldown_until).toBe('string');
     expect((await planNow('m13-hold-2')).selected).toBeFalsy();
 
@@ -637,19 +612,16 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
         ],
       }),
     }))).status).toBe(200);
-    const quota = (service: string, account: string) => ({
-      subscriptions: [{ service, account, plan: 'pro',
-        quota: { status: 'ok', observed_at: isoNow(-1000),
-          details: service === 'grok' ? { limit_reached: false, has_grok_code_access: true } : { limit_reached: false },
-          windows: { weekly: { present: true, percent_remaining: 80, reset_at: isoNow(86400000) } } } }],
-    });
+    const quota = (service: string) => ({ status: 'ok', error: null, observed_at: isoNow(-1000),
+      details: service === 'grok' ? { limit_reached: false, has_grok_code_access: true } : { limit_reached: false },
+      windows: { weekly: { present: true, percent_remaining: 80, reset_at: isoNow(86400000), rolling: false } } });
+    expect((await serverQuotaPost(sessionCookie, csrfToken, [
+      { account: 'm13-grok-main', provider: 'grok', quota: quota('grok') },
+    ])).status).toBe(200);
+    expect((await serverQuotaPost(sessionCookie, csrfToken, [
+      { account: 'm13-codex-ok', provider: 'codex', quota: quota('codex') },
+    ])).status).toBe(200);
     const authSub = { Authorization: `Bearer ${host.accessToken}`, 'Content-Type': 'application/json' };
-    expect((await doFetch(new Request('http://example.com/api/fleet/subscriptions', {
-      method: 'PUT', headers: authSub, body: JSON.stringify(quota('grok', 'm13-grok-main')),
-    }))).status).toBe(200);
-    expect((await doFetch(new Request('http://example.com/api/fleet/subscriptions', {
-      method: 'PUT', headers: authSub, body: JSON.stringify(quota('codex', 'm13-codex-ok')),
-    }))).status).toBe(200);
 
     const launchBody = (key: string, engine?: string) => ({
       method: 'POST', headers: adminHeaders,
@@ -706,13 +678,13 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
 
   it('stored quota DTOs carry no secret material', async () => {
     const host = await pairHost('m13-privacy-host', 'm13privacy.local', sessionCookie, csrfToken);
-    expect((await quotaPost(host.accessToken, snap11(host.machineId, isoNow(-1000)))).status).toBe(200);
+    expect((await quotaPost(host.accessToken, snap11(host.machineId, isoNow(-1000)))).status).toBe(410);
     const stub = (defaultEnv as any).HUB.get((defaultEnv as any).HUB.idFromName('hub'));
     await runInDurableObject(stub, async (instance: Hub) => {
       const blobs: string[] = [];
       for (const row of instance.sql.exec('SELECT routes_json FROM host_quota_snapshots').toArray() as any[]) blobs.push(row.routes_json);
       for (const row of instance.sql.exec('SELECT quota_json FROM fleet_subscriptions').toArray() as any[]) blobs.push(row.quota_json);
-      expect(blobs.length).toBeGreaterThan(0);
+      expect(instance.sql.exec('SELECT COUNT(*) AS n FROM host_quota_snapshots WHERE host_id = ?', host.machineId).one()?.n).toBe(0);
       for (const blob of blobs) {
         expect(blob).not.toMatch(/access_token|refresh_token|cookie|email|secret|bearer|authorization|account_id|organization_id|raw_output/i);
       }

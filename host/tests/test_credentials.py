@@ -236,14 +236,9 @@ def test_collect_subscriptions_never_runs_quse():
         {'service': 'codex', 'account_label': 'shared-codex', 'plan': 'pro'},
         {'service': 'claude', 'account_label': 'shared-claude', 'plan': 'max', 'quota_argv': ['/home/u/.local/bin/quse', 'claude', '--json']},
     ]}
-    try:
-        fleet.collect_subscriptions(settings, runner=lambda argv: ran.append(argv) or {})
-    except Exception:
-        pass
-    assert not any('quse' in ' '.join(map(str, a)) for a in ran)
-    assert fleet._is_quota_cli(['C:\\venv\\Scripts\\quse.exe', 'codex'])
-    assert fleet._is_quota_cli([sys.executable, '-m', 'quse.cli', 'codex'])
-    assert not fleet._is_quota_cli(['/opt/adapter', 'codex'])
+    assert fleet.collect_subscriptions(settings, runner=lambda argv: ran.append(argv) or {}) == []
+    assert ran == []
+    assert not hasattr(fleet, '_is_quota_cli')
 
 
 class FakeResponse(io.BytesIO):

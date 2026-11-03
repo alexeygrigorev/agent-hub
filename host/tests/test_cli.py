@@ -7,6 +7,27 @@ import unittest
 HOST_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 class TestCliIsolated(unittest.TestCase):
+    def test_subscriptions_command_is_retired_without_local_collection_or_hub_report(self):
+        import io
+        from contextlib import redirect_stderr
+        from unittest.mock import patch
+        from agent_hub_host import bus, cli, fleet
+
+        err = io.StringIO()
+        with patch.object(sys, 'argv', ['hub', 'subscriptions', '--report']), \
+                patch.object(fleet, 'load_settings') as load_settings, \
+                patch.object(fleet, 'collect_subscriptions') as collect, \
+                patch.object(bus, '_do_request') as request, \
+                redirect_stderr(err):
+            with self.assertRaises(SystemExit) as raised:
+                cli.main()
+
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn('Per-machine quota collection is retired', err.getvalue())
+        load_settings.assert_not_called()
+        collect.assert_not_called()
+        request.assert_not_called()
+
     def test_interactive_prompt_is_sent_after_binding(self):
         from agent_hub_host import cli, session_control
         from unittest.mock import patch, mock_open

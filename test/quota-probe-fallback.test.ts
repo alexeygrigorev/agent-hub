@@ -33,10 +33,9 @@ async function fixture(refusals: any[], fn: (service: FleetService, sql: any) =>
     expect((await service.handle(req, admin)).status).toBe(200);
     const quota = { status: 'ok', observed_at: iso(), details: { limit_reached: false },
       windows: { weekly: { present: true, percent_remaining: 99, reset_at: iso(86400000) } } };
-    const subs = new Request('https://hub.test/api/fleet/subscriptions', { method: 'PUT', body: JSON.stringify({
-      subscriptions: labels.map(account => ({ service: 'codex', account, plan: 'pro', quota })),
-    }) });
-    expect((await service.handle(subs, { caller: { machineId: 'host', kind: 'host', actor: 'machine:host' }, scopes: ['host'] })).status).toBe(200);
+    for (const account of labels) {
+      hub.sql.exec('INSERT OR REPLACE INTO server_quota_snapshots VALUES (?, ?, ?, ?)', account, 'codex', iso(), JSON.stringify(quota));
+    }
     await fn(service, hub.sql);
   });
 }
@@ -58,16 +57,16 @@ describe('quota probe failure placement (b3749cbb)', () => {
       expect((await admit()).launch_allowed).toBe(false);
     });
   });
-  it('does not let a sibling unknown observation poison a healthy shared-account pool', async () => {
+  it('ignores sibling machine reports when the Hub has a healthy shared-account reading', async () => {
     await fixture([], (service, sql) => {
       sql.exec("INSERT INTO fleet_routes VALUES ('sibling','codex','shared-codex','hub-shared-codex')");
       sql.exec("INSERT INTO fleet_subscriptions VALUES ('sibling','shared-codex','codex',NULL,?,?)", iso(), JSON.stringify({status: 'unknown', observed_at: iso(), details: {limit_reached: null}, windows: {}}));
       const view = new QuotaStore(sql, undefined, undefined, () => now).getFleetView({host_id:null,provider:null,engine:null,account:null}, now);
       const pool = view.body.pools.find((p: any) => p.account === 'shared-codex');
-      expect(pool.state).toBe('fresh');
-      expect(pool.remaining_percent).toBe(99);
+      expect(pool).toMatchObject({ state: 'fresh', source: 'server', remaining_percent: 99, observed_by_hosts: ['hub-server'] });
       sql.exec("UPDATE fleet_subscriptions SET quota_json=? WHERE machine_id='sibling'", JSON.stringify({status: 'unknown', observed_at: iso(), details: {limit_reached: true}, windows: {}}));
-      expect(new QuotaStore(sql, undefined, undefined, () => now).getFleetView({host_id:null,provider:null,engine:null,account:null}, now).body.pools.find((p: any) => p.account === 'shared-codex').state).toBe('exhausted');
+      expect(new QuotaStore(sql, undefined, undefined, () => now).getFleetView({host_id:null,provider:null,engine:null,account:null}, now).body.pools.find((p: any) => p.account === 'shared-codex'))
+        .toMatchObject({ state: 'fresh', source: 'server', remaining_percent: 99 });
     });
   });
   // A probe that crashed carries no verdict about the credential: fail open.
@@ -97,11 +96,11 @@ describe('quota probe failure placement (b3749cbb)', () => {
   });
   it('allows an unknown account with a warning and an unknown balance', async () => {
     await fixture([], (service, sql) => {
-      sql.exec('DELETE FROM fleet_subscriptions');
+      sql.exec("DELETE FROM server_quota_snapshots WHERE provider = 'codex'");
       const plan = service.plan({ workspace: 'demo', mode: 'interactive', engine: 'codex', prompt: 'test' });
       expect(plan.selected?.quota_warning).toBe('quota_probe_unavailable');
       expect(Number.isFinite(plan.selected?.score)).toBe(true);
-      expect(service.accountStatus(sql.exec("SELECT * FROM fleet_accounts LIMIT 1").one()).remaining_percent).toBeNull();
+      expect(service.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label = 'shared-codex'").one()).remaining_percent).toBeNull();
     });
   });
   it('keeps an installed OpenCode Go route placeable when quota is unknown', async () => {
@@ -120,11 +119,10 @@ describe('quota probe failure placement (b3749cbb)', () => {
       expect(service.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label='shared-go'").one()).remaining_percent).toBeNull();
     });
   });
-  it('uses a healthy host snapshot when the fresh managed-account probe is unknown', async () => {
+  it('does not use a host snapshot when the Hub account reading is missing', async () => {
     await fixture([], (_service, sql) => {
-      sql.exec("INSERT INTO fleet_accounts VALUES ('shared-go','go',10,5,1)");
-      sql.exec("INSERT INTO fleet_routes VALUES ('host','opencode','shared-go','hub-shared-go')");
-      sql.exec("INSERT INTO fleet_subscriptions VALUES ('host','shared-go','go',NULL,?,?)",
+      sql.exec("DELETE FROM server_quota_snapshots WHERE account = 'shared-codex'");
+      sql.exec("INSERT INTO fleet_subscriptions VALUES ('host','shared-codex','codex',NULL,?,?)",
         iso(), JSON.stringify({ status: 'unknown', observed_at: iso(), details: { limit_reached: null }, windows: {} }));
       const hostQuota = { status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: {
         weekly: { present: true, percent_remaining: 17, reset_at: iso(86400000) },
@@ -132,21 +130,21 @@ describe('quota probe failure placement (b3749cbb)', () => {
       sql.exec(`INSERT INTO host_quota_snapshots
         (host_id,schema_version,collector_version,captured_at,captured_at_ms,received_at,received_at_ms,status,error,routes_json)
         VALUES ('host','1.1','quota_snapshot/1.1',?,?,?,?,'ok',NULL,?)`,
-        iso(), now, iso(), now, JSON.stringify({ go: hostQuota }));
+        iso(), now, iso(), now, JSON.stringify({ codex: hostQuota }));
 
       const view = new QuotaStore(sql, undefined, undefined, () => now)
-        .getFleetView({ host_id: null, provider: 'go', engine: null, account: null }, now);
-      expect(view.body.pools.find((pool: any) => pool.account === 'shared-go')).toMatchObject({
-        state: 'fresh', source: 'machine-fallback', remaining_percent: 17,
+        .getFleetView({ host_id: null, provider: 'codex', engine: null, account: null }, now);
+      expect(view.body.pools.find((pool: any) => pool.account === 'shared-codex')).toMatchObject({
+        state: 'unknown', source: 'server', remaining_percent: null, observed_by_hosts: [],
       });
     });
   });
   it('holds an explicit Codex start when every Codex account is rejected', async () => {
     await fixture([], (service, sql) => {
-      sql.exec("UPDATE fleet_subscriptions SET quota_json = ?", JSON.stringify({status: 'ok', observed_at: iso(), details: {limit_reached: true}, windows: {}}));
+      sql.exec("UPDATE server_quota_snapshots SET quota_json = ? WHERE provider = 'codex'", JSON.stringify({status: 'ok', observed_at: iso(), details: {limit_reached: true}, windows: {}}));
       sql.exec("INSERT INTO fleet_accounts VALUES ('shared-go','go',10,0,1)");
       sql.exec("INSERT INTO fleet_routes VALUES ('host','opencode','shared-go',NULL)");
-      sql.exec("INSERT INTO fleet_subscriptions (machine_id,account,service,plan,quota_json,observed_at) VALUES ('host','shared-go','go',NULL,?,?)", JSON.stringify({status: 'ok', observed_at: iso(), details: {limit_reached: false}, windows: {weekly: {present: true, percent_remaining: 60, reset_at: iso(86400000)}}}), iso());
+      sql.exec("INSERT INTO server_quota_snapshots VALUES ('shared-go','go',?,?)", iso(), JSON.stringify({status: 'ok', observed_at: iso(), details: {limit_reached: false}, windows: {weekly: {present: true, percent_remaining: 60, reset_at: iso(86400000)}}}));
       const caps = JSON.parse(sql.exec("SELECT capabilities FROM machines WHERE id='host'").one().capabilities);
       sql.exec("UPDATE machines SET capabilities=?", JSON.stringify({...caps, workspaces: ['/srv/repos'], engines: ['codex','opencode']}));
       const plan = service.plan({ workspace: 'demo', mode: 'interactive', engine: 'codex', tier: 'daily', prompt: 'test' });
@@ -167,10 +165,10 @@ describe('quota probe failure placement (b3749cbb)', () => {
   });
   it('holds an explicit --engine codex instead of silently landing on claude (f147094b)', async () => {
     await fixture([], (service, sql) => {
-      sql.exec("UPDATE fleet_subscriptions SET quota_json=?", JSON.stringify({status:'ok',observed_at:iso(),details:{limit_reached:true},windows:{}}));
+      sql.exec("UPDATE server_quota_snapshots SET quota_json=? WHERE provider='codex'", JSON.stringify({status:'ok',observed_at:iso(),details:{limit_reached:true},windows:{}}));
       sql.exec("INSERT INTO fleet_accounts VALUES ('shared-claude','claude',10,0,1)");
       sql.exec("INSERT INTO fleet_routes VALUES ('host','claude','shared-claude',NULL)");
-      sql.exec("INSERT INTO fleet_subscriptions VALUES ('host','shared-claude','claude',NULL,?,?)", iso(), JSON.stringify({status:'ok',observed_at:iso(),details:{limit_reached:false},windows:{weekly:{present:true,percent_remaining:80,reset_at:iso(86400000)}}}));
+      sql.exec("INSERT INTO server_quota_snapshots VALUES ('shared-claude','claude',?,?)", iso(), JSON.stringify({status:'ok',observed_at:iso(),details:{limit_reached:false},windows:{weekly:{present:true,percent_remaining:80,reset_at:iso(86400000)}}}));
       const caps=JSON.parse(sql.exec("SELECT capabilities FROM machines WHERE id='host'").one().capabilities);
       sql.exec("UPDATE machines SET capabilities=?", JSON.stringify({...caps,engines:['codex','claude']}));
       const plan=service.plan({workspace:'demo',mode:'headless',engine:'codex',tier:'daily',prompt:'work'});
@@ -183,10 +181,10 @@ describe('quota probe failure placement (b3749cbb)', () => {
   });
   it('holds an explicit Codex goal when only a zcodex goal route remains', async () => {
     await fixture([], (service, sql) => {
-      sql.exec("UPDATE fleet_subscriptions SET quota_json=?", JSON.stringify({status:'ok',observed_at:iso(),details:{limit_reached:true},windows:{}}));
+      sql.exec("UPDATE server_quota_snapshots SET quota_json=? WHERE provider='codex'", JSON.stringify({status:'ok',observed_at:iso(),details:{limit_reached:true},windows:{}}));
       sql.exec("INSERT INTO fleet_accounts VALUES ('shared-zai','zai',10,0,1)");
       sql.exec("INSERT INTO fleet_routes VALUES ('host','zcodex','shared-zai',NULL)");
-      sql.exec("INSERT INTO fleet_subscriptions VALUES ('host','shared-zai','zai',NULL,?,?)", iso(), JSON.stringify({status:'ok',observed_at:iso(),details:{limit_reached:false},windows:{weekly:{present:true,percent_remaining:60,reset_at:iso(86400000)}}}));
+      sql.exec("INSERT INTO server_quota_snapshots VALUES ('shared-zai','zai',?,?)", iso(), JSON.stringify({status:'ok',observed_at:iso(),details:{limit_reached:false},windows:{weekly:{present:true,percent_remaining:60,reset_at:iso(86400000)}}}));
       const caps=JSON.parse(sql.exec("SELECT capabilities FROM machines WHERE id='host'").one().capabilities);
       sql.exec("UPDATE machines SET capabilities=?", JSON.stringify({...caps,engines:['codex','zcodex'],fleet_goal_routes:[
         {engine:'codex',account:'shared-codex',profile:'hub-shared-codex'},

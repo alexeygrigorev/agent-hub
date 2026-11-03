@@ -145,7 +145,7 @@ def render_text(data):
     coverage = data.get("coverage") if isinstance(data.get("coverage"), dict) else {}
     account_coverage = data.get("account_coverage")
     if isinstance(account_coverage, dict):
-        lines.append("accounts: %s fresh, %s stale, %s unavailable of %s (server probes; machine reports are fallback)" % (
+        lines.append("accounts: %s fresh, %s stale, %s unavailable of %s (Hub server probes only)" % (
             len(account_coverage.get("fresh") or []), len(account_coverage.get("stale") or []),
             len(account_coverage.get("unavailable") or []), account_coverage.get("total")))
     if isinstance(coverage, dict) and coverage.get("machines_total") is not None:

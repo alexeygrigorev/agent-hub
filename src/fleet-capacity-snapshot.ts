@@ -116,7 +116,9 @@ export function readFleetCapacitySnapshot(sql: SqlStorage, now: number, unreserv
     new Date(now - 360000).toISOString(), new Date(now + 60000).toISOString())
     .map((m): Row => ({ ...m, last_checkin_at: effectiveCheckin(m.id, m.last_checkin_at) }))
     .filter(m => { const at = Date.parse(m.last_checkin_at || ''); return Number.isFinite(at) && at <= now + 60000 && now - at <= 180000; });
-  const definitions = bounded('SELECT * FROM fleet_accounts ORDER BY label LIMIT 129', CAPACITY_LIMITS.accounts);
+  const definitions = bounded(`SELECT a.* FROM fleet_accounts a
+    WHERE NOT EXISTS (SELECT 1 FROM fleet_account_archives x WHERE x.label=a.label)
+    ORDER BY a.label LIMIT 129`, CAPACITY_LIMITS.accounts);
   const keyed = (keys: string[], limit: number, query: (marks: string, remaining: number) => string, ...fixed: any[]) => {
     const out: Row[] = [];
     const size = Math.min(50, 100 - fixed.length);
@@ -128,8 +130,8 @@ export function readFleetCapacitySnapshot(sql: SqlStorage, now: number, unreserv
     }
     return out;
   };
-  // Include disabled definitions too: the legacy quota fallback counts all
-  // registered accounts in a host/provider family, not only eligible ones.
+  // Include disabled definitions too because family capacity tracks every
+  // configured route, not only accounts eligible for a new launch.
   const routes = keyed(definitions.map(a => a.label), CAPACITY_LIMITS.routes,
     (marks, n) => `SELECT * FROM fleet_routes WHERE account IN (${marks}) LIMIT ${n}`);
   const ids = machines.map(m => m.id);

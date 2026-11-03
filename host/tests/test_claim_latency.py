@@ -227,7 +227,6 @@ def test_controller_does_not_reload_settings_during_offer_read_or_startup(tmp_pa
         stack.enter_context(patch.object(session_host, 'qualify_sender_binding', return_value=SimpleNamespace(
             session_id='synthetic-controller', workspace=str(tmp_path))))
         stack.enter_context(patch.object(session_host.fleet, 'Dispatcher', return_value=dispatcher))
-        stack.enter_context(patch.object(session_host, 'QuotaCollector', return_value=Mock()))
         stack.enter_context(patch.object(session_host, 'maybe_reload_fleet_settings', side_effect=reload_settings))
         stack.enter_context(patch.object(session_host, 'maybe_start_maintenance_thread', return_value=None))
         stack.enter_context(patch.object(session_host, 'maybe_start_named_thread', side_effect=start))

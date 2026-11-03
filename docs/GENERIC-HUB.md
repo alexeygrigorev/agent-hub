@@ -31,7 +31,7 @@ hub fleet
 
 Supply `--parent HUB_LAUNCH_ID` when one hub agent spawns another. The parent must be active and owned by the same authenticated requester; attaching an unrelated or finished parent is refused. Every row records the authenticated requester, requester kind, parent ID (null for a root request), time, summary, machine, engine, profile, account label and mode. Requester identity comes from authentication; the caller cannot override it. Native session reports include workspace, tag, engine, profile and state, without copying commands, environments or transcripts. Legacy scheduler job credentials do not grant generic spawn authority.
 
-The dashboard at `/` requires an authenticated administrator. It shows machines and their subscriptions, shared account capacity, hub agents and parent relationships, registered agents and reported aplexer sessions. It refreshes every 30 seconds. A successful queue response means offered work, not started work.
+The dashboard at `/` requires an authenticated administrator. It shows machines, Hub-server account quota and shared account capacity, hub agents and parent relationships, registered agents and reported aplexer sessions. It refreshes every 30 seconds. A successful queue response means offered work, not started work.
 
 ## Account registry
 
@@ -50,7 +50,7 @@ Upload a JSON registry through the authenticated dashboard. Account labels ident
 }
 ```
 
-Use enrolled machine IDs. Registry replacement is refused while active launches hold capacity and invalidates retained subscription reports. Codex reserves at least 15%; Grok at least 5%. Placement combines fresh machine admission, resource floors, capabilities, measured load, pending work and conservative account headroom. A shared account's slots are counted across all machines. The selected machine must supply fresh account evidence; a fresh report on another machine does not qualify it. Default CLI quota cannot qualify a named profile. Expired, missing or contradictory observations fail closed.
+Use enrolled machine IDs. Registry replacement is refused while active launches hold capacity. Codex reserves at least 15%; Grok at least 5%. Placement combines machine check-in, resource floors, capabilities, measured load, pending work and conservative account headroom. Account quota comes only from fresh Hub-server observations and applies to the shared account pool across machines. Default CLI quota cannot qualify a named profile. Expired, missing or contradictory observations fail closed.
 
 `available_slots` is the remaining account pool. `placeable_slots` counts that pool only when at least one fresh, undrained machine advertises a registered engine route. `placement_reasons` explains missing routes (`no_routes`), stale/drained machines (`machine_unavailable`), unadvertised engines (`engine_unavailable`), and a full pool (`account_capacity`). Reasons for unavailable sibling routes can appear alongside usable capacity. These fields describe account capacity and route liveness; the request's plan still checks quota, admission, resources, workspace, mode and tier. An account with free slots and no routes cannot launch until an authorized, configured host serves it; increasing concurrency does not repair that condition.
 
@@ -60,7 +60,7 @@ Interactive goal placement requires the exact account, engine and profile in the
 
 Capacity-only starts return a waitable `202 queued` intent. Host polling and capacity releases re-plan the same intent automatically. Routes outside the requested tier or without requested goal support remain visible in `rejected`, but do not turn eligible capacity waits into a `409`. Those excluded routes alone never queue; capability, quota, admission and resource failures still reject. Queue promotion preserves tier and goal constraints, and same-key retries observe the original intent.
 
-## Machine subscriptions
+## Local engine account configuration
 
 Each machine owns `~/.config/agent-hub/subscriptions.json`, or `%APPDATA%\agent-hub\subscriptions.json` on Windows. It contains metadata and local command references. Keep provider credentials in the provider's native store.
 
@@ -75,24 +75,21 @@ Each machine owns `~/.config/agent-hub/subscriptions.json`, or `%APPDATA%\agent-
   },
   "subscriptions":[
     {"service":"codex","account_label":"shared-codex","plan":"pro","engine":"codex","profile":null,"admission_argv":["/absolute/path/to/maintained-admission-adapter"]},
-    {"service":"codex","account_label":"second-codex","plan":null,"engine":"codex","profile":"secondary","quota_argv":["/absolute/path/to/secondary-quota-adapter"],"admission_argv":["/absolute/path/to/secondary-admission-adapter"]}
+    {"service":"codex","account_label":"second-codex","plan":null,"engine":"codex","profile":"secondary","admission_argv":["/absolute/path/to/secondary-admission-adapter"]}
   ]
 }
 ```
 
 Git identity (`user.name`, `user.email`, optional signing keys or push defaults) is configured under `"git"` in `subscriptions.json` (or `host.json`). During host/engine bootstrap, Hub writes `.gitconfig` to each managed engine's `HOME` and re-applies on re-bootstrap or home recreation. Launched sessions also receive `GIT_AUTHOR_*` and `GIT_COMMITTER_*` environment variables as a fallback.
 
-Labels and configured plans are explicit declarations. The default Claude tier can be detected through `claude auth status --json`. The default Codex tier can be detected through local app-server `account/read` with token refresh disabled. Neither probe copies email addresses, account IDs or tokens into reports. Other plans remain unknown unless their status adapter reports a recognized tier or the local configuration supplies one.
-
-Quota collection uses the existing `quse SERVICE --json` for an unambiguous default account. Multiple accounts or a non-default profile need a separate local `quota_argv`; default quota is never copied across them. The quota adapter returns the quse shape for that account. Collection whitelists booleans, remaining percentages and reset times and drops raw error bodies and credentials. Used allowance percentage is distinct from token usage or cost; unknown token usage stays unknown.
+Labels and configured plans are explicit declarations. The default Claude tier can be detected through `claude auth status --json`. The default Codex tier can be detected through local app-server `account/read` with token refresh disabled. Neither probe copies email addresses, account IDs or tokens into reports. Other plans remain unknown unless their status adapter reports a recognized tier or the local configuration supplies one. These machine-local entries configure engine accounts and admission adapters; they do not collect or report quota to Hub. Fleet quota comes only from Hub-server account observations.
 
 ```sh
-hub subscriptions --config /path/to/subscriptions.json
-hub subscriptions --config /path/to/subscriptions.json --report
 hub fleet-host --config /path/to/subscriptions.json --cycles 10 --interval 60
+hub quota
 ```
 
-`fleet-host` is opt-in and bounded. It registers capabilities, reports heartbeats, subscriptions and native sessions, and polls its own offers. It installs no service or timer. Preserve existing supervisors until the replacement has completed physical host tests.
+`fleet-host` is opt-in and bounded. It registers capabilities, reports heartbeats and native sessions, and polls its own offers. It installs no service or timer. Per-machine subscription quota reports are retired; `hub quota` reads the Hub-server projection. Preserve existing supervisors until the replacement has completed physical host tests.
 
 ## Host execution contract
 

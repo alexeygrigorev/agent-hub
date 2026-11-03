@@ -1,4 +1,4 @@
-"""M13 collector/admission contract: native units, collector_version, window error.
+"""M13 server quota normalization contract: native units, collector_version, window error.
 
 Offline fixtures only: no subprocess, no network, no real credentials.
 """
@@ -16,8 +16,8 @@ def utcnow():
     return datetime.datetime.now(datetime.timezone.utc)
 
 
-class CollectorNativeTests(unittest.TestCase):
-    def test_collector_stamps_version_and_passes_native_fields(self):
+class ServerQuotaNativeTests(unittest.TestCase):
+    def test_server_snapshot_stamps_version_and_passes_native_fields(self):
         now = utcnow()
         raw = {'codex': {'status': 'ok', 'error': None,
                          'observed_at': quota_snapshot.format_iso_utc(now),
@@ -27,7 +27,7 @@ class CollectorNativeTests(unittest.TestCase):
                                             'present': True, 'rolling': False,
                                             'credits_remaining': 12.5, 'unit': 'credits',
                                             'profile': 'muse-spark-1.3'}}}}
-        snap = quota_snapshot.create_quota_snapshot(raw, 'mach1', now)
+        snap = quota_snapshot.create_quota_snapshot(raw, 'hub-server', now)
         self.assertEqual(snap['schema_version'], '1.1')
         self.assertEqual(snap['collector_version'], 'quota_snapshot/1.1')
         win = snap['routes']['codex']['windows']['7d']
@@ -44,7 +44,7 @@ class CollectorNativeTests(unittest.TestCase):
                       'windows': {'5h': {'percent_remaining': 91.0,
                                          'reset_at': '2026-10-17T16:21:20Z',
                                          'rolling': True}}}}
-        snap = quota_snapshot.create_quota_snapshot(raw, 'mach1', now)
+        snap = quota_snapshot.create_quota_snapshot(raw, 'hub-server', now)
         win = snap['routes']['go']['windows']['5h']
         self.assertEqual(win['percent_remaining'], 91.0)
         # Unknown extra detail keys are dropped, never converted into money.
@@ -68,7 +68,7 @@ class CollectorNativeTests(unittest.TestCase):
                                             'spend_used': float('nan'),
                                             'unit': 'dollars',
                                             'profile': 'has spaces'}}}}
-        snap = quota_snapshot.create_quota_snapshot(raw, 'mach1', now)
+        snap = quota_snapshot.create_quota_snapshot(raw, 'hub-server', now)
         win = snap['routes']['codex']['windows']['7d']
         self.assertEqual(win['percent_remaining'], 80.0)
         for key in ('credits_remaining', 'spend_used', 'unit', 'profile'):
@@ -86,11 +86,11 @@ class CollectorNativeTests(unittest.TestCase):
                          'windows': {'7d': {'percent_remaining': 80.0,
                                             'reset_at': '2026-10-20T00:00:00Z',
                                             'present': True, 'rolling': False}}}}
-        snap = quota_snapshot.create_quota_snapshot(raw, 'mach1', now)
+        snap = quota_snapshot.create_quota_snapshot(raw, 'hub-server', now)
         self.assertEqual(snap['routes']['codex']['details']['cooldown_until'],
                          '2026-10-17T13:00:00Z')
         raw['codex']['details']['cooldown_until'] = 'soon'
-        snap = quota_snapshot.create_quota_snapshot(raw, 'mach1', now)
+        snap = quota_snapshot.create_quota_snapshot(raw, 'hub-server', now)
         self.assertIsNone(snap['routes']['codex']['details'].get('cooldown_until'))
 
     def test_absent_window_carries_no_natives(self):
@@ -101,7 +101,7 @@ class CollectorNativeTests(unittest.TestCase):
                          'windows': {'5h': {'percent_remaining': None, 'reset_at': None,
                                             'present': False, 'rolling': True,
                                             'credits_remaining': 3.0}}}}
-        snap = quota_snapshot.create_quota_snapshot(raw, 'mach1', now)
+        snap = quota_snapshot.create_quota_snapshot(raw, 'hub-server', now)
         win = snap['routes']['codex']['windows']['5h']
         self.assertFalse(win['present'])
         self.assertIsNone(win.get('credits_remaining'))
@@ -119,7 +119,7 @@ class CollectorNativeTests(unittest.TestCase):
                                              'credits_remaining': 1.0, 'unit': 'credits'}
                                   for i in range(8)}}
                for prov in quota_snapshot.ALLOWED_PROVIDERS}
-        snap = quota_snapshot.create_quota_snapshot(raw, 'mach1', now)
+        snap = quota_snapshot.create_quota_snapshot(raw, 'hub-server', now)
         self.assertLessEqual(len(json.dumps(snap).encode('utf-8')), quota_snapshot.MAX_SNAPSHOT_BYTES)
 
 
@@ -247,6 +247,8 @@ class QuotaCliTests(unittest.TestCase):
             'coverage': {'machines_total': 1, 'fresh': ['m1'], 'stale': [], 'missing': []}})
         self.assertIn('accounts: 2 fresh, 0 stale, 0 unavailable of 2', text)
         self.assertIn('coverage: 1 fresh, 0 stale, 0 missing of 1 machines', text)
+        self.assertIn('(Hub server probes only)', text)
+        self.assertNotIn('machine reports are fallback', text)
         self.assertIn('codex/codex/shared-codex', text)
         self.assertIn('opencode/go/shared-go', text)
 

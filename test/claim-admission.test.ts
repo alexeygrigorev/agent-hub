@@ -40,8 +40,8 @@ async function fleetFixture(fn: (f: FleetService, sql: any, bus: BusService) => 
     const bus = new BusService(sql, cb => state.storage.transactionSync(cb));
     for (const machine of ['hetzner', 'win35']) {
       sql.exec('INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, drained, capabilities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', machine, machine, machine, at(), at(), JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], cpu_usage: freshCpu(at()), gate: { launch_allowed: true, at: at() } }), 0, JSON.stringify({ engines: ['codex'], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8 }));
-      sql.exec('INSERT INTO host_quota_snapshots (host_id, schema_version, captured_at, captured_at_ms, received_at, received_at_ms, status, error, routes_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', machine, '1.0', at(), now, at(), now, 'ok', null, JSON.stringify({ codex: { status: 'ok', observed_at: at(), details: { limit_reached: false }, windows: { weekly: { present: true, percent_remaining: 80, reset_at: at(86400000) } } } }));
     }
+    sql.exec('INSERT INTO server_quota_snapshots VALUES (?,?,?,?)', 'shared-codex', 'codex', at(), JSON.stringify(quota));
     sql.exec("INSERT INTO agents (tag, project, role, machine_id, registered_at) VALUES ('worker-1', 'projA', 'worker', 'hetzner', ?)", at());
     sql.exec("INSERT INTO agents (tag, project, role, machine_id, registered_at) VALUES ('worker-2', 'projB', 'worker', 'win35', ?)", at());
     expect((await f.handle(req('/api/fleet/accounts', { accounts: [{ label: 'shared-codex', provider: 'codex', max_concurrency: 2, reserve_percent: 15, enabled: true }], routes: [{ machine_id: 'hetzner', engine: 'codex', account: 'shared-codex', profile: null }, { machine_id: 'win35', engine: 'codex', account: 'shared-codex', profile: null }] }, 'PUT'), admin)).status).toBe(200);
@@ -63,8 +63,8 @@ async function routingFixture(fn: (r: RoutingService, f: FleetService, sql: any,
       sql.exec('INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, capabilities) VALUES (?, ?, ?, ?, ?, ?, ?)', machine, machine, machine, at(), at(), JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], cpu_usage: freshCpu(at()), gate: { launch_allowed: true, at: at() } }), JSON.stringify({ engines: ['zcodex'], fleet_modes: ['headless'], workspaces: ['tasks'], cpu_count: 8 }));
     }
     expect((await f.handle(req('/api/fleet/accounts', { accounts: [{ label: 'shared-zai', provider: 'zai', max_concurrency: 3, reserve_percent: 0, enabled: true }], routes: ['hetzner', 'win35'].map(machine_id => ({ machine_id, engine: 'zcodex', account: 'shared-zai', profile: null })) }, 'PUT'), admin)).status).toBe(200);
+    sql.exec('INSERT INTO server_quota_snapshots VALUES (?,?,?,?)', 'shared-zai', 'zai', at(), JSON.stringify(quota));
     for (const machine of ['hetzner', 'win35']) {
-      expect((await f.handle(req('/api/fleet/subscriptions', { subscriptions: [{ service: 'zai', account: 'shared-zai', plan: null, quota }] }, 'PUT'), host(machine))).status).toBe(200);
       expect((await r.handle(req('/api/routing/capabilities', { needs: machine === 'win35' ? ['browser:orin', 'phone-sms'] : [], max_agents: 2, runners: [{ engine: 'zcodex', profile: null, account: 'shared-zai', model: 'glm-5.3-flash', effort: 'high' }] }, 'PUT'), host(machine))).status).toBe(200);
     }
     sql.exec("INSERT INTO agents (tag, project, role, machine_id, registered_at) VALUES ('client-a', 'tasks', 'worker', 'hetzner', ?)", at());
@@ -623,7 +623,9 @@ async function pairedHttp() {
   const registry = { accounts: [{ label: 'paired-zai', provider: 'zai', max_concurrency: 2, reserve_percent: 0, enabled: true }],
     routes: [{ machine_id: machineId, engine: 'zcodex', account: 'paired-zai', profile: null }] };
   expect((await call('/api/fleet/accounts', registry, undefined, 'PUT')).status).toBe(200);
-  expect((await hostCall('/api/fleet/subscriptions', { subscriptions: [{ service: 'zai', account: 'paired-zai', plan: null, quota }] }, 'PUT')).status).toBe(200);
+  await runInDurableObject(stub, (hub: Hub) => {
+    hub.sql.exec('INSERT INTO server_quota_snapshots VALUES (?,?,?,?)', 'paired-zai', 'zai', at(), JSON.stringify(quota));
+  });
   const advertise = (needs: string[] = []) => hostCall('/api/fleet/routing/capabilities', { needs, max_agents: 2,
     runners: [{ engine: 'zcodex', profile: null, account: 'paired-zai', model: 'glm-5.3-flash', effort: 'high' }] }, 'PUT');
   expect((await advertise()).status).toBe(200);

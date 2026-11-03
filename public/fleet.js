@@ -65,12 +65,9 @@ function render(data) {
     const section = document.createElement('article'); section.className = 'machine';
     const title = document.createElement('h3'); title.textContent = `${m.name || m.id} · ${m.drained ? 'drained' : fresh(m.last_checkin_at) ? 'online' : 'stale / offline'}${m.alias_of ? ` · alias of ${m.canonical_id || m.alias_of} (same physical host; reporting via ${m.canonical_id || m.alias_of})` : ''}`; section.append(title);
     const checkin = document.createElement('p'); checkin.textContent = `Last check-in: ${m.last_checkin_at || 'never'}`; section.append(checkin);
-    const subscriptions = data.subscriptions.filter(s => s.machine_id === m.id);
-    section.append(table(['Service', 'Harness', 'Account label', 'Plan', 'Quota / used allowance / reset'], subscriptions.map(s => [s.service, (s.harness && s.harness.length ? s.harness.join(', ') : 'unknown'), s.account, s.plan, `${s.stale ? 'stale; ' : ''}${s.quota.status}; ` + Object.entries(s.quota.windows || {}).map(([name, w]) => `${name}: ${w.present ? `${w.percent_remaining ?? 'unknown'}% left / ${w.percent_remaining === null ? 'unknown' : 100 - w.percent_remaining}% used; reset ${w.reset_at || 'unknown'}` : 'not present'}`).join(' | ')])));
-    if (!subscriptions.length) { const p = document.createElement('p'); p.textContent = 'No subscription report. Configure this machine and enable its metadata collector.'; section.append(p); }
     root.append(section);
   }
-  root.append(table(['Shared account', 'Service', 'Status', 'Remaining', 'Burn forecast', 'Active / limit', 'Machines'], data.accounts.map(a => [a.label, a.provider, a.status + (a.placement_reasons && a.placement_reasons.length ? ` (${a.placement_reasons.join(', ')})` : ''), a.remaining_percent === null ? 'unknown' : `${a.remaining_percent}%`, burnCell(a.burn_forecast), slotCell(a), a.machines.join(', ')])));
+  root.append(table(['Shared account', 'Service', 'Status', 'Remaining', 'Reset', 'Burn forecast', 'Active / limit', 'Machines'], data.accounts.map(a => [a.label, a.provider, a.status + (a.placement_reasons && a.placement_reasons.length ? ` (${a.placement_reasons.join(', ')})` : ''), a.remaining_percent === 0 ? '0%' : a.remaining_percent === null || a.remaining_percent === undefined ? 'unknown' : `${a.remaining_percent}%`, a.reset_at || (a.remaining_percent === 0 ? 'reset not reported' : 'unknown'), burnCell(a.burn_forecast), slotCell(a), a.machines.join(', ')])));
   const map = new Map(data.launches.map(a => [a.id, a]));
   const depth = launch => { const seen = new Set(); let p = launch, n = 0; while (p.parent_id && map.has(p.parent_id) && !seen.has(p.parent_id) && n < 20) { seen.add(p.parent_id); p = map.get(p.parent_id); n++; } return n; };
   byId('hub-agents').replaceChildren(table(['Agent / parent', 'Kind', 'Machine', 'Mode', 'Requested by / when', 'Task', 'State / native reference'], data.launches.map(a => [`${'↳ '.repeat(depth(a))}${a.id}${a.parent_id ? `; parent ${a.parent_id}` : '; root request'}`, `${a.engine} / ${a.profile || 'default'} / ${a.account}`, a.machine_id, a.mode, `${a.actor} (${a.requester_kind}) / ${a.created_at}`, a.summary, `${a.state} / ${a.native_id || 'none yet'}`])));
@@ -110,14 +107,6 @@ function quotaBadge(state) {
   span.textContent = state || 'unknown';
   return span;
 }
-function quotaWindowState(snap, w) {
-  if (!snap || snap.stale) return 'stale';
-  if (snap.status === 'error') return 'unavailable';
-  if (snap.status !== 'ok') return 'unknown';
-  if (w && w.error === 'unavailable') return 'unavailable';
-  if (!w || w.present !== true) return 'unknown';
-  return 'fresh';
-}
 function nativeText(w) {
   if (!w) return 'unknown';
   const parts = [];
@@ -139,44 +128,23 @@ function renderQuota(q) {
   const canonAccount = a => (canonical.accounts && canonical.accounts[a]) || a;
   const pools = Array.isArray(q.pools) ? q.pools : [];
   const harnessOf = p => ((p.harness && p.harness.length ? p.harness : (p.engines || []).map(canonEngine))).join(', ') || 'unknown';
-  root.append(richTable(['Harness', 'Provider', 'Account', 'State', 'Remaining', 'Observed', 'Source'],
+  root.append(richTable(['Harness', 'Provider', 'Account', 'State', 'Remaining', 'Reset', 'Observed', 'Source'],
     pools.map(p => [harnessOf(p), canonProvider(p.provider), canonAccount(p.account), quotaBadge(p.state),
-      p.remaining_percent === null || p.remaining_percent === undefined ? 'unknown' : `${p.remaining_percent}%`,
+      p.state === 'exhausted' ? '0%' : p.remaining_percent === null || p.remaining_percent === undefined ? 'unknown' : `${p.remaining_percent}%`,
+      p.reset_at || Object.values(p.windows || {}).map(w => w && w.reset_at).find(Boolean) || (p.state === 'exhausted' ? 'reset not reported' : 'unknown'),
       p.observed_at || 'never',
-      p.source === 'server' ? 'Hub server' : `Machine fallback: ${(p.observed_by_hosts || []).join(', ') || 'unavailable'}`])));
+      'Hub server'])));
   const cp = document.createElement('p');
   const cov = q.account_coverage || {};
-  cp.textContent = `Coverage: ${((cov.fresh || []).length)} fresh, ${((cov.stale || []).length)} stale, ${((cov.unavailable || []).length)} unavailable of ${cov.total ?? '?'} accounts. Hub server probes are primary; machine reports are fallback.`;
+  cp.textContent = `Coverage: ${((cov.fresh || []).length)} fresh, ${((cov.stale || []).length)} stale, ${((cov.unavailable || []).length)} unavailable of ${cov.total ?? '?'} accounts. Quota is reported by the Hub server.`;
   root.append(cp);
-  const poolsByProvider = new Map();
-  for (const p of pools) {
-    const key = canonProvider(p.provider);
-    if (!poolsByProvider.has(key)) poolsByProvider.set(key, []);
-    poolsByProvider.get(key).push(p);
-  }
-  const matchPools = routeKey => poolsByProvider.get(canonProvider(routeKey)) || [];
   const winRows = [];
-  for (const p of pools.filter(p => p.source === 'server')) {
+  for (const p of pools) {
     for (const [name, w] of Object.entries(p.windows || {})) {
+      const remaining = p.state === 'exhausted' && (!w || w.percent_remaining == null) ? '0%'
+        : w && w.present && w.percent_remaining != null ? `${w.percent_remaining}%` : 'unknown';
       winRows.push(['Hub server', harnessOf(p), canonProvider(p.provider), canonAccount(p.account), name, quotaBadge(p.state),
-        w.present && w.percent_remaining != null ? `${w.percent_remaining}%` : 'unknown', nativeText(w), w.reset_at || 'unknown']);
-    }
-  }
-  for (const h of Array.isArray(q.hosts) ? q.hosts : []) {
-    const snap = h.snapshot || {};
-    const routes = snap.routes && typeof snap.routes === 'object' ? snap.routes : {};
-    for (const [provider, route] of Object.entries(routes)) {
-      const windows = route && typeof route.windows === 'object' ? route.windows : {};
-      const matched = matchPools(provider);
-      const harness = [...new Set(matched.flatMap(p => (p.harness && p.harness.length ? p.harness : (p.engines || [])).map(canonEngine)))].join(', ') || 'unknown';
-      const accounts = [...new Set(matched.map(p => canonAccount(p.account)))].join(', ') || 'shared pool';
-      for (const [name, w] of Object.entries(windows)) {
-        const pct = !w || w.percent_remaining === null || w.percent_remaining === undefined ? 'unknown' : `${w.percent_remaining}%`;
-        winRows.push([h.host_id, harness, canonProvider(provider), accounts, name, quotaBadge(quotaWindowState(snap, w)), pct, nativeText(w), (w && w.reset_at) || 'unknown']);
-      }
-    }
-    for (const s of Array.isArray(h.subscriptions) ? h.subscriptions : []) {
-      if (s && s.stale) winRows.push([h.host_id, ((s.engines || []).map(canonEngine).join(', ') || 'unknown'), canonProvider(s.service), canonAccount(s.account), 'subscription', quotaBadge('stale'), 'unknown', 'unknown', 'unknown']);
+        remaining, nativeText(w), (w && w.reset_at) || p.reset_at || (p.state === 'exhausted' ? 'reset not reported' : 'unknown')]);
     }
   }
   root.append(richTable(['Host', 'Harness', 'Provider', 'Account', 'Window', 'State', 'Remaining', 'Native units', 'Reset'], winRows));
