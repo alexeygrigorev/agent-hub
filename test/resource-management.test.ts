@@ -19,6 +19,7 @@ async function fixture(fn:(r:ResourceManagement,sql:any,f:FleetService)=>Promise
   sql.exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,native_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,'launch','admin','human','work','key',JSON.stringify({intake_task_id:'task'}),'host','opencode','go','headless','/repo','goal','running','native',iso(-600000),iso());
   sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,fleet_launch_id,machine_id,engine,mode,state,binding_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,'session','admin','control',JSON.stringify({intake_task_id:'task'}),'launch','host','opencode','headless','running',JSON.stringify(binding),iso(-600000),iso());
   sql.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,workspace,last_activity_at) VALUES(?,?,?,?,?,?,?,?)`,'host','native','agent','opencode','running',iso(),'/repo',iso(-3600001));
+  r.initCatalogCache();
   await fn(r,sql,f);
  });
 }
@@ -76,6 +77,8 @@ describe('resource management',()=>{
   }};
   const reporter=new ResourceManagement(boundedSql,()=>now);
   reporter.report('host',{samples:[],reaps:[]});
+  // An unrelated source revision must not restart an in-progress terminal sweep.
+  sql.exec("UPDATE session_control_sessions SET updated_at=? WHERE id='session'",iso(-1));
   reporter.report('host',{samples:[],reaps:[]});
   expect(ledgerReads).toBeLessThanOrEqual(4);
   expect(ledgerWrites).toBe(0);

@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS session_rss_median (session_id TEXT PRIMARY KEY, p50_
 CREATE TABLE IF NOT EXISTS session_oom_kills (session_id TEXT PRIMARY KEY, oom_kills INTEGER NOT NULL, observed_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_cpu_finalized (session_id TEXT PRIMARY KEY, observed_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_resource_metadata (session_id TEXT PRIMARY KEY, workspace TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS resource_terminal_reconcile (machine_id TEXT PRIMARY KEY, revision TEXT NOT NULL, cursor_session_id TEXT, complete INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS resource_terminal_reconcile (machine_id TEXT PRIMARY KEY, revision TEXT NOT NULL, cursor_key TEXT, complete INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS resource_ramps (launch_id TEXT PRIMARY KEY, started_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS resource_settings (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_resource_usage (
@@ -524,15 +524,20 @@ export class ResourceManagement {
     if(limit<=0 || !this.catalogRevision) return [];
     const current=this.sql.exec('SELECT revision,cursor_session_id,complete FROM resource_terminal_reconcile WHERE machine_id=?',machine).toArray()[0] as any;
     if(current?.revision===this.catalogRevision && current.complete===1) return [];
-    const cursor=current?.revision===this.catalogRevision ? current.cursor_session_id as string|null : null;
+    // Keep an in-progress cursor when unrelated source rows advance the shared
+    // catalog revision; terminal rows are ordered by their finish timestamp so
+    // newly finished sessions continue after the cursor instead of restarting
+    // this sweep from page one.
+    const cursor=current?.cursor_key as string|null ?? null;
     const candidates=[...new Map([...sessions.values()].filter(s=>TERMINAL.has(s.state) && s.finished_at)
       .map(s=>[s.native_id,s])).values()]
-      .filter(s=>!s.aliases.some((id:string)=>sampled.has(id)) && (!cursor || s.session_id>cursor))
-      .sort((a,b)=>a.session_id.localeCompare(b.session_id));
+      .map(s=>({...s,terminalCursorKey:String(s.finished_at)+'\n'+s.session_id}))
+      .filter(s=>!s.aliases.some((id:string)=>sampled.has(id)) && (!cursor || s.terminalCursorKey>cursor))
+      .sort((a,b)=>a.terminalCursorKey<b.terminalCursorKey?-1:a.terminalCursorKey>b.terminalCursorKey?1:0);
     const window=candidates.slice(0,Math.min(200,limit));
     if(!window.length) {
-      this.sql.exec(`INSERT INTO resource_terminal_reconcile(machine_id,revision,cursor_session_id,complete) VALUES(?,?,NULL,1)
-        ON CONFLICT(machine_id) DO UPDATE SET revision=excluded.revision,cursor_session_id=NULL,complete=1`,machine,this.catalogRevision);
+      this.sql.exec(`INSERT INTO resource_terminal_reconcile(machine_id,revision,cursor_key,complete) VALUES(?,?,?,1)
+        ON CONFLICT(machine_id) DO UPDATE SET revision=excluded.revision,complete=1`,machine,this.catalogRevision,cursor);
       return [];
     }
     const finished=new Set<string>();
@@ -540,11 +545,11 @@ export class ResourceManagement {
       const batch=window.slice(i,i+99);
       for(const row of this.sql.exec('SELECT native_id FROM session_resource_usage WHERE machine_id=? AND finished_at IS NOT NULL AND native_id IN ('+batch.map(()=>'?').join(',')+')',machine,...batch.map(s=>s.native_id)).toArray()) finished.add(String(row.native_id));
     }
-    const last=window[window.length-1].session_id;
+    const last=window[window.length-1].terminalCursorKey;
     const hasMore=candidates.length>window.length;
-    this.sql.exec(`INSERT INTO resource_terminal_reconcile(machine_id,revision,cursor_session_id,complete) VALUES(?,?,?,?)
-      ON CONFLICT(machine_id) DO UPDATE SET revision=excluded.revision,cursor_session_id=excluded.cursor_session_id,complete=excluded.complete`,
-      machine,this.catalogRevision,hasMore?last:null,hasMore?0:1);
+    this.sql.exec(`INSERT INTO resource_terminal_reconcile(machine_id,revision,cursor_key,complete) VALUES(?,?,?,?)
+      ON CONFLICT(machine_id) DO UPDATE SET revision=excluded.revision,cursor_key=excluded.cursor_key,complete=excluded.complete`,
+      machine,this.catalogRevision,last,hasMore?0:1);
     const at=new Date(this.now()).toISOString();
     return window.filter(s=>!finished.has(s.native_id)).map(s=>({session_id:s.session_id,native_id:s.native_id,observed_at:at}));
   }
