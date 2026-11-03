@@ -27,7 +27,7 @@ import { createSessionCookie, getSession, clearSessionCookie, createLoginCookie,
 import { isHumanCredentialAllowed as isHumanCredentialAllowedFn, validateHumanCredentialRecord } from './auth/human-credential';
 
 import { randomString, sha256, generateUserCode, base64url } from './auth/crypto';
-import { generateTokenPair, verifyBearerScope } from './auth/token';
+import { deriveHumanRefreshSuccessor, generateTokenPair, verifyBearerScope } from './auth/token';
 import { handleRegistryRoutes, handleWebSocketMessageRegistry, handleWebSocketCloseRegistry, updateHeartbeatMemoryOnly, updateHeartbeat } from './registry';
 import { BusService, BUS_SCHEMA_SQL, CallerContext, generateUlid } from './bus';
 import {
@@ -72,6 +72,7 @@ import { placementPressureSubjects } from './host-pressure';
 import { RowsMeter, ROWS_STATS_SCHEMA, normalizeRoute, rowsReadReport, rowsReadAlertThreshold, ROWS_READ_TARGET_PER_DAY } from './rows-meter';
 import { sampleAccountCapacityHistory } from './account-capacity-history';
 
+const HUMAN_REFRESH_REPLAY_GRACE_MS = 30_000;
 const IDLE_WORK_INTERVAL_MS = 5 * 60_000;
 const METER_FLUSH_INTERVAL_MS = 5 * 60_000;
 
@@ -714,7 +715,13 @@ export class Hub extends DurableObject {
 
     // R5 R2: server-owned enrollment authority migration.
     this.ensureColumns('device_pairings', { approved_seq: 'INTEGER' });
-    this.ensureColumns('credentials', { approval_seq: 'INTEGER' });
+    this.ensureColumns('credentials', {
+      approval_seq: 'INTEGER',
+      // Only non-null for a normally rotated human refresh token. This lets a
+      // short retry window distinguish a lost rotation response from logout,
+      // admin revocation, or a replay after the grace period.
+      refresh_rotated_at: 'TEXT',
+    });
 
     this.ensureColumns('jobs', {
       deadline_at: 'TEXT',
@@ -2058,9 +2065,17 @@ export class Hub extends DurableObject {
 
       const refreshHash = await sha256(body.refresh_token);
 
+      // The raw predecessor token is never persisted. Human successors are a
+      // deterministic PRF keyed by the Hub session secret and bound to that
+      // token so retries recover the same pair without a stored token copy.
+      const predecessor = this.sql.exec('SELECT * FROM credentials WHERE refresh_hash = ?', refreshHash).toArray()[0] as any;
+      const humanSuccessor = predecessor?.kind === 'human'
+        ? await deriveHumanRefreshSuccessor(body.refresh_token, String(predecessor.id), this.env.SESSION_SECRET)
+        : null;
+
       // PRE-GENERATE values before any synchronous DB interaction to prevent partial state on await failures
-      const { accessToken, refreshToken, accessHash, refreshHash: newRefreshHash } = await generateTokenPair();
-      const newId = randomString(16);
+      const { accessToken, refreshToken, accessHash, refreshHash: newRefreshHash } = humanSuccessor ?? await generateTokenPair();
+      const newId = humanSuccessor?.credentialId ?? randomString(16);
       const now = new Date(Date.now()).toISOString();
 
       let errorResponse = null;
@@ -2089,9 +2104,34 @@ export class Hub extends DurableObject {
       if (!cred) {
         errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
       } else if (cred.revoked_at) {
-        // Replay or explicitly revoked! Revoke family.
-        this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL', now, cred.family_id);
-        errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
+        const rotatedAtMs = Date.parse(String(cred.refresh_rotated_at ?? ''));
+        const retryWithinGrace = cred.kind === 'human'
+          && humanSuccessor !== null
+          && Number.isFinite(rotatedAtMs)
+          && nowMs >= rotatedAtMs
+          && nowMs - rotatedAtMs <= HUMAN_REFRESH_REPLAY_GRACE_MS;
+        const successor = retryWithinGrace
+          ? this.sql.exec('SELECT * FROM credentials WHERE id = ? AND family_id = ?', newId, cred.family_id).toArray()[0] as any
+          : null;
+        if (successor
+          && successor.kind === 'human'
+          && !successor.revoked_at
+          && Number.isFinite(Date.parse(successor.expires_at))
+          && Date.parse(successor.expires_at) > nowMs
+          && successor.refresh_hash === newRefreshHash
+          && successor.token_hash === accessHash
+          && this.isHumanRefreshAllowed(successor)) {
+          // Return the already-issued pair. No extra generation is inserted,
+          // and the successor remains usable when a refresh response was lost.
+          scopesResponse = JSON.parse(successor.scopes).join(' ');
+          expiresAtResponse = successor.expires_at;
+          machineIdResponse = successor.machine_id ?? null;
+        } else {
+          // Replays outside grace and explicit revocations retain the existing
+          // fail-closed family behavior.
+          this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL', now, cred.family_id);
+          errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
+        }
       } else if (workerScoped && !worker) {
         errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
       } else if (driverScoped && !driver) {
@@ -2113,7 +2153,8 @@ export class Hub extends DurableObject {
         const role = worker || driver;
         const accessExpiresAt = role ? new Date(Math.min(nowMs + 3600000, role.expires_at)).toISOString()
           : sessionActor ? new Date(nowMs + 3600000).toISOString() : cred.expires_at;
-        const res = this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL', now, cred.id);
+        const rotatedAt = cred.kind === 'human' ? now : null;
+        const res = this.sql.exec('UPDATE credentials SET revoked_at = ?, refresh_rotated_at = ? WHERE id = ? AND revoked_at IS NULL', now, rotatedAt, cred.id);
         if (res.rowsWritten !== 1) {
           this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL', now, cred.family_id);
           errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });

@@ -243,7 +243,20 @@ class TestHumanStatusLogout(unittest.TestCase):
         config.save_host_config({"base_url": "https://hub.example.com",
                                  "access_token": "host-tok", "client_kind": "host"})
         st = human_auth.human_status()
-        self.assertEqual(st, {"logged_in": False})
+        self.assertEqual(st, {"logged_in": False, "state": "never_logged_in"})
+
+    def test_status_distinguishes_server_revocation_from_never_logged_in(self):
+        self._write_human()
+
+        def rejected_refresh(req, timeout=10.0, _token_exchange=None):
+            if req.full_url.endswith("/api/auth/me"):
+                raise urllib.error.HTTPError(req.full_url, 401, "unauthorized", {}, io.BytesIO(b""))
+            if req.full_url.endswith("/api/token/refresh"):
+                raise urllib.error.HTTPError(req.full_url, 400, "invalid_grant", {}, io.BytesIO(b'{"error":"invalid_grant"}'))
+            raise AssertionError(req.full_url)
+
+        with patch("agent_hub_host.api.safe_http_json", side_effect=rejected_refresh):
+            self.assertEqual(human_auth.human_status(), {"logged_in": False, "state": "revoked"})
 
     def test_status_returns_safe_identity(self):
         self._write_human()
@@ -431,8 +444,8 @@ class TestFreshCli(unittest.TestCase):
                 [sys.executable, "-m", "agent_hub_host", "auth", "status", "--json"],
                 capture_output=True, text=True, env=env, timeout=15,
             )
-            self.assertEqual(res.returncode, 0)
-            self.assertEqual(json.loads(res.stdout), {"logged_in": False})
+            self.assertEqual(res.returncode, 1)
+            self.assertEqual(json.loads(res.stdout), {"logged_in": False, "state": "never_logged_in"})
 
     def test_cli_help_lists_auth_and_version(self):
         with tempfile.TemporaryDirectory() as td:

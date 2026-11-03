@@ -19,6 +19,9 @@ class BootstrapTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        self.service_identity_patch = patch.object(b, 'provision_loop_service_identities')
+        self.provision_service_identities = self.service_identity_patch.start()
+        self.addCleanup(self.service_identity_patch.stop)
 
     def test_checksum_requires_exact_asset_and_content(self):
         asset = self.root / 'runtime'
@@ -331,8 +334,48 @@ class BootstrapTests(unittest.TestCase):
              patch.object(provisioning, 'sync'), patch.object(b, 'install_service', return_value='systemd_user'), patch.dict(os.environ):
             b.configure('https://hub.test')
         login.assert_not_called()
+        self.provision_service_identities.assert_called_once()
+        self.assertEqual(self.provision_service_identities.call_args.args[0], 'https://hub.test')
         register.assert_called_once_with('https://hub.test')
         self.assertEqual(settings.read_text(), '{}')
+
+    def test_loop_service_identities_use_distinct_files_and_preserve_developer_cli(self):
+        from agent_hub_host import config, human_auth
+        provision = self.service_identity_patch.temp_original
+        config_root = self.root / '.config'
+        cli_profile = config_root / 'agent-hub/cli.json'
+        with patch.dict(os.environ, {'HUB_CONFIG_FILE': str(cli_profile), 'XDG_CONFIG_HOME': str(config_root)}):
+            config.save_human_config({'base_url': 'https://hub.test', 'access_token': 'developer-access',
+                                      'refresh_token': 'developer-refresh', 'client_kind': 'human',
+                                      'client_name': 'developer-cli'})
+            cli_bytes = cli_profile.read_bytes()
+            calls = []
+
+            def login(base_url, label):
+                profile = Path(os.environ['HUB_CONFIG_FILE'])
+                calls.append((base_url, label, profile))
+                config.save_human_config({'base_url': base_url, 'access_token': label + '-access',
+                                          'refresh_token': label + '-refresh', 'client_kind': 'human',
+                                          'client_name': label})
+
+            with patch.object(human_auth, 'human_login', side_effect=login):
+                provision('https://hub.test', config_root)
+            self.assertEqual(os.environ['HUB_CONFIG_FILE'], str(cli_profile))
+            self.assertEqual([label for _base, label, _path in calls], list(b.LOOP_SERVICE_IDENTITIES))
+            self.assertEqual(len({path for _base, _label, path in calls}), len(b.LOOP_SERVICE_IDENTITIES))
+            self.assertTrue(all(path != cli_profile for _base, _label, path in calls))
+            self.assertEqual(cli_profile.read_bytes(), cli_bytes)
+
+            with patch.object(human_auth, 'human_status', return_value={'logged_in': True}):
+                with patch.object(human_auth, 'human_login', side_effect=AssertionError('unexpected relogin')):
+                    provision('https://hub.test', config_root)
+            self.assertEqual(os.environ['HUB_CONFIG_FILE'], str(cli_profile))
+            for label in b.LOOP_SERVICE_IDENTITIES:
+                profile = config_root / 'agent-hub/services' / (label + '.json')
+                with patch.dict(os.environ, {'HUB_CONFIG_FILE': str(profile)}):
+                    cfg = config.load_human_config()
+                self.assertEqual(cfg['client_name'], label)
+                self.assertNotEqual(cfg['access_token'], 'developer-access')
 
     def test_cross_hub_reuse_refused_before_effects(self):
         from agent_hub_host import config, auth

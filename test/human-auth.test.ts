@@ -186,26 +186,49 @@ describe('Human/operator device credentials', () => {
     }));
     expect(hostPoll.status).toBe(401);
 
-    // Refresh rotates; absolute expiry preserved; old refresh replays fail closed.
+    // Refresh rotates; absolute expiry is preserved; a bounded retry returns
+    // exactly the issued successor without revoking the human family.
     const firstExpiry = status.expires_at;
-    const ref = await doFetch(new Request('http://example.com/api/token/refresh', {
+    const refreshOldToken = () => doFetch(new Request('http://example.com/api/token/refresh', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: tok.refresh_token }),
     }));
+    const [ref, replay] = await Promise.all([refreshOldToken(), refreshOldToken()]);
     expect(ref.status).toBe(200);
+    expect(replay.status).toBe(200);
     const rotated = (await ref.json()) as any;
+    const replayed = (await replay.json()) as any;
     expect(rotated.scope).toBe('admin');
     expect(rotated.machine_id).toBeNull();
+    expect(replayed.access_token).toBe(rotated.access_token);
+    expect(replayed.refresh_token).toBe(rotated.refresh_token);
     const me2 = await doFetch(new Request('http://example.com/api/auth/me', {
       headers: { Authorization: `Bearer ${rotated.access_token}` },
     }));
     expect(me2.status).toBe(200);
     expect(((await me2.json()) as any).expires_at).toBe(firstExpiry);
-    const replay = await doFetch(new Request('http://example.com/api/token/refresh', {
+    await runInDurableObject(stub, async (instance: Hub) => {
+      const oldHash = await sha256(tok.refresh_token);
+      const predecessor = instance.sql.exec('SELECT family_id, refresh_rotated_at FROM credentials WHERE refresh_hash = ?', oldHash).toArray()[0] as any;
+      expect(predecessor.refresh_rotated_at).toBeTruthy();
+      const rows = instance.sql.exec('SELECT id, revoked_at FROM credentials WHERE family_id = ? ORDER BY created_at', predecessor.family_id).toArray();
+      expect(rows).toHaveLength(2);
+    });
+
+    // Once the grace window has elapsed, a predecessor replay keeps the
+    // existing fail-closed behavior and revokes the family.
+    await runInDurableObject(stub, async (instance: Hub) => {
+      instance.sql.exec('UPDATE credentials SET refresh_rotated_at = ? WHERE refresh_hash = ?', new Date(Date.now() - 31000).toISOString(), await sha256(tok.refresh_token));
+    });
+    const staleReplay = await doFetch(new Request('http://example.com/api/token/refresh', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: tok.refresh_token }),
     }));
-    expect(replay.status).toBe(400);
+    expect(staleReplay.status).toBe(400);
+    const afterStaleReplay = await doFetch(new Request('http://example.com/api/auth/me', {
+      headers: { Authorization: `Bearer ${rotated.access_token}` },
+    }));
+    expect(afterStaleReplay.status).toBe(401);
   });
 
   it('removed admin fails closed on use and refresh without coming back', async () => {
@@ -221,6 +244,12 @@ describe('Human/operator device credentials', () => {
     const tokRes = await pollToken(device_code);
     expect(tokRes.status).toBe(200);
     const tok = (await tokRes.json()) as any;
+    const rotation = await doFetch(new Request('http://example.com/api/token/refresh', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: tok.refresh_token }),
+    }));
+    expect(rotation.status).toBe(200);
+    const rotated = (await rotation.json()) as any;
     // Simulate allowlist removal.
     await runInDurableObject(stub, async (instance: Hub) => {
       instance.env = { ...instance.env, HUB_ADMINS: 'admin@fake.local' } as any;
@@ -239,6 +268,11 @@ describe('Human/operator device credentials', () => {
         body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: tok.refresh_token }),
       }));
       expect(refGone.status).toBe(400);
+      const rotatedRefGone = await doFetch(new Request('http://example.com/api/token/refresh', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: rotated.refresh_token }),
+      }));
+      expect(rotatedRefGone.status).toBe(400);
       // Family stays revoked: even the rotated token (if any) cannot come back.
       const meAfter = await doFetch(new Request('http://example.com/api/auth/me', {
         headers: { Authorization: `Bearer ${tok.access_token}` },

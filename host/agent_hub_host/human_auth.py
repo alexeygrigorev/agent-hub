@@ -23,6 +23,14 @@ from . import config
 from .auth import HUMAN_SCOPES
 
 
+class HumanSessionRevoked(RuntimeError):
+    """The Hub rejected the human refresh credential as invalid or revoked."""
+
+
+class HumanSessionExpired(RuntimeError):
+    """The saved human profile cannot refresh because required data is absent."""
+
+
 def resolve_base_url(explicit=None) -> str:
     if explicit:
         api.check_url(explicit)
@@ -130,7 +138,7 @@ def _human_refresh_locked() -> str:
     refresh = cfg.get("refresh_token")
     base_url = cfg.get("base_url")
     if not refresh or not base_url:
-        raise RuntimeError("Human session expired. Run `hub auth login` again.")
+        raise HumanSessionExpired("Human session is missing its refresh credential or Hub URL.")
     exchange = config._TokenExchange(
         base_url, "/api/token/refresh", cfg,
         _load_fn=config.load_human_config, _save_fn=config.save_human_config,
@@ -146,7 +154,7 @@ def _human_refresh_locked() -> str:
         return token_res["access_token"]
     except urllib.error.HTTPError as exc:
         if exc.code in (400, 401):
-            raise RuntimeError("Human session revoked or expired. Run `hub auth login` again.") from None
+            raise HumanSessionRevoked("Hub rejected the human refresh credential.") from None
         raise RuntimeError(f"Transient HTTP error during refresh: {exc.code}") from None
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Network error during refresh: {exc}") from None
@@ -179,13 +187,23 @@ def human_status():
     """Safe human identity/status. Never mistakes a host token for human."""
     cfg = config.load_human_config()
     if not config.is_human_config(cfg):
-        return {"logged_in": False}
+        return {"logged_in": False, "state": "never_logged_in"}
+    if not cfg.get("access_token") and not cfg.get("refresh_token"):
+        return {"logged_in": False, "state": "never_logged_in"}
     try:
         me = _authed_get("/api/auth/me")
+    except HumanSessionRevoked:
+        return {"logged_in": False, "state": "revoked"}
+    except HumanSessionExpired:
+        return {"logged_in": False, "state": "expired"}
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            return {"logged_in": False, "state": "revoked"}
+        raise
     except RuntimeError as exc:
         msg = str(exc)
-        if "revoked" in msg or "expired" in msg or "Not logged in" in msg:
-            return {"logged_in": False}
+        if "Not logged in" in msg:
+            return {"logged_in": False, "state": "never_logged_in"}
         raise
     if not isinstance(me, dict):
         return {"logged_in": True, "base_url": cfg.get("base_url")}

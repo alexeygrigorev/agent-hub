@@ -42,7 +42,10 @@ hub auth logout
 - `status` shows safe identity only (never tokens). `logout` revokes ONLY the
   human credential family (`POST /api/auth/logout {}`) and removes ONLY the
   human config; the legacy host profile is preserved. Already-logged-out is
-  handled gracefully.
+  reported as `Never logged in as human` with the login command. If Hub rejects
+  the saved refresh token, status reports `Revoked by server (refresh replay or
+  admin)` with the recovery command. Both unauthenticated states exit nonzero,
+  including `--json`, so scripts can detect them.
 - `HUB_CONFIG_FILE` (absolute path) overrides both profiles into one file;
   human commands then check `client_kind == "human"` so a host token is never
   mistaken for human.
@@ -55,6 +58,15 @@ hub auth logout
 - Normal user commands (sessions/intake/status/bus) use the human profile
   when present (fresh Linux after login); host enrollment/poll/agent-run
   stay host-only.
+- Hub host bootstrap provisions independent human device-login profiles for
+  `refill-loop`, `ready-slim`, and `desktop-loop` under
+  `~/.config/agent-hub/services/` (or the platform config directory). Approve
+  their device codes during install/bootstrap. Each profile has its own
+  refresh family; the fleet host keeps its separate `host.json` family. Loop
+  service units must set `HUB_CONFIG_FILE` to their own profile path and must
+  never point at `cli.json`. The profiles are checked during re-bootstrap; a
+  revoked or expired one is re-created there, so loops do not run `hub auth
+  login` after installation.
 
 ## Server contract (server worker implements; client expects)
 

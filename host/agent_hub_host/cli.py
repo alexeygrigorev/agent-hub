@@ -192,9 +192,17 @@ def cmd_auth_status(args):
         sys.exit(1)
     if getattr(args, 'json', False):
         print(json.dumps(status, indent=2, sort_keys=True))
+        if not status.get("logged_in"):
+            sys.exit(1)
         return
     if not status.get("logged_in"):
-        print("Status: Not logged in as human. Run `hub auth login`.")
+        state = status.get("state")
+        if state == "revoked":
+            print("Status: Revoked by server (refresh replay or admin). Run `hub auth login` to create a new human session.")
+        elif state == "never_logged_in":
+            print("Status: Never logged in as human. Run `hub auth login` to sign in.")
+        else:
+            print("Status: Human session expired or unavailable. Run `hub auth login` to sign in again.")
         sys.exit(1)
     print("Status: Logged in as human.")
     if status.get("base_url"):
