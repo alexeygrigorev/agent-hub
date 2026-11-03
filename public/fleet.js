@@ -25,6 +25,25 @@ async function api(path, method = 'GET', data) {
   if (!r.ok) throw Error(`Hub request failed (${r.status}); request may need reconciliation.`);
   return r.json();
 }
+// Intake 94186660: sessions arrive keyset-paged (small default page).
+// Page walks stop at a hard client cap so the 30s poll never fetches
+// unbounded data; unchanged-payload 304s stay out until the Workers
+// runtime offers a trustworthy version primitive (see server note).
+const FLEET_SESSIONS_LIMIT = 200;
+const FLEET_SESSION_PAGES = 5;
+async function fetchFleet() {
+  const data = await api(`/api/fleet?sessions_limit=${FLEET_SESSIONS_LIMIT}`);
+  let cursor = data.sessions_cursor_next || null;
+  let pages = 1;
+  while (cursor && pages < FLEET_SESSION_PAGES) {
+    const page = await api(`/api/fleet?sessions_limit=${FLEET_SESSIONS_LIMIT}&sessions_cursor=${encodeURIComponent(cursor)}`);
+    for (const s of page.sessions || []) data.sessions.push(s);
+    cursor = page.sessions_cursor_next || null;
+    pages++;
+  }
+  if (cursor) { data.sessions_truncated = true; data.sessions_cursor_next = cursor; }
+  return data;
+}
 // Projected unused quota at the next weekly/monthly reset (intake ebfe9d85 AC3).
 function burnCell(f) {
   if (!f) return 'no forecast';
@@ -424,7 +443,7 @@ async function refresh() {
     HubHostCharts.refresh(api);
     for (const id of ['account-name','menu-name','menu-email']) byId(id).textContent = me.email;
     document.querySelector('.dk-avatar__initials').textContent = me.email.slice(0,1).toUpperCase();
-    const [fleet, live, checks] = await Promise.all([api('/api/fleet'), api('/api/liveness'), api('/api/checks')]);
+    const [fleet, live, checks] = await Promise.all([fetchFleet(), api('/api/liveness'), api('/api/checks')]);
     render(fleet); renderWatch(live, checks);
     await refreshBreakdown();
     try {
@@ -447,7 +466,8 @@ async function refresh() {
     } catch (e) {
       renderActivity({ error: e.message });
     }
-    byId('status').textContent = `Authenticated · updated ${new Date().toLocaleTimeString()}`;
+    byId('status').textContent = `Authenticated · updated ${new Date().toLocaleTimeString()}` +
+      (fleet.sessions_truncated ? ` · sessions capped at ${fleet.sessions.length} of ${fleet.sessions_total ?? 'unknown'} (refine filters)` : '');
   }
   catch (e) { byId('status').textContent = 'Fleet could not be refreshed. Any displayed data is from the last successful update. ' + e.message; }
   finally { refreshing = false; byId('fleet-refresh').disabled = false; }

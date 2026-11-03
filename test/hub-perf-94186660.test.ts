@@ -15,7 +15,8 @@ import { describe, expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { IntakeService } from '../src/intake';
 import { advanceIntakeExport } from '../src/intake-export';
-import { FleetService } from '../src/fleet';
+import { FleetService, FLEET_SESSIONS_DEFAULT, FLEET_SESSIONS_MAX } from '../src/fleet';
+import { SessionControlService } from '../src/session_control';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
 
@@ -160,8 +161,7 @@ describe('audit endpoints never scan the retained ledger', () => {
 });
 
 describe('fleet supports_goal comes from one batched machines read', () => {
-  it('computes the same flags without a per-route machines query', withHub(async (hub: Hub, state: DurableObjectState) => {
-    for (const m of ['fm0', 'fm1', 'fm2']) {
+  it('computes the same flags without a per-route machines query', withHub(async (hub: Hub, state: DurableObjectState) => {    for (const m of ['fm0', 'fm1', 'fm2']) {
       hub.sql.exec("INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at,drained) VALUES (?,?,?,?,?,0) ON CONFLICT(id) DO UPDATE SET last_checkin_at=excluded.last_checkin_at",
         m, m, m, new Date().toISOString(), new Date().toISOString());
     }
@@ -188,5 +188,158 @@ describe('fleet supports_goal comes from one batched machines read', () => {
     const stmts = t.statements(0).filter(q => q.includes('FROM machines'));
     expect(stmts.filter(q => q === 'SELECT capabilities FROM machines WHERE id = ?').length).toBe(0);
     expect(stmts.filter(q => q === 'SELECT id, capabilities FROM machines').length).toBe(1);
+  }));
+});
+
+function seedFleetSessions(sql: any, n: number) {
+  // Every third row reuses tag 'task-dup' on the SAME machine (fleetm0):
+  // the duplicate-tag boundary the keyset cursor must not drop or double.
+  for (let i = 0; i < n; i++) {
+    const dup = i % 3 === 0;
+    const m = dup ? 'fleetm0' : 'fleetm' + String(i % 4);
+    const tag = dup ? 'task-dup' : 'tag-' + String(i).padStart(4, '0');
+    sql.exec(`INSERT OR REPLACE INTO fleet_sessions(machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace,profile,account) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      m, 'nat-' + String(i).padStart(5, '0'), tag, 'codex', 'running', 'active',
+      new Date(1000 + i).toISOString(), '/w/' + i, null, 'acc');
+  }
+}
+
+const fleetPageShape = (hub: Hub) =>
+  (hub.sql.exec('EXPLAIN QUERY PLAN SELECT * FROM fleet_sessions WHERE (machine_id, tag, native_id) > (?, ?, ?) ORDER BY machine_id, tag, native_id LIMIT ?', 'fleetm0', 'tag-0001', 'nat-00001', 51).toArray() as any[]).map(r => String(r.detail)).join(' | ');
+
+describe('fleet sessions are keyset-paged with a small default page', () => {
+  it('serves a bounded default page and walks every row exactly once', withHub(async (hub: Hub, state: DurableObjectState) => {
+    expect(FLEET_SESSIONS_DEFAULT).toBeLessThanOrEqual(100);
+    expect(FLEET_SESSIONS_MAX).toBeLessThanOrEqual(500);
+    hub.sql.exec('DELETE FROM fleet_sessions');
+    seedFleetSessions(hub.sql, 250);
+    const t = tracked(hub.sql);
+    const svc = new FleetService(t.proxy, (cb: any) => cb(), () => Date.now());
+    const first: any = await (await svc.handle(new Request('https://hub.test/api/fleet'), admin)).json();
+    expect(first.sessions).toHaveLength(FLEET_SESSIONS_DEFAULT);
+    expect(first.sessions_total).toBe(250);
+    expect(first.sessions_truncated).toBe(true);
+    expect(typeof first.sessions_cursor_next).toBe('string');
+    // Walk the whole list at limit 50, including across duplicate-tag pages.
+    const seen = new Map<string, number>();
+    let cursor: string | null = null;
+    let pages = 0;
+    do {
+      const url = 'https://hub.test/api/fleet?sections=sessions&sessions_limit=50' + (cursor ? `&sessions_cursor=${encodeURIComponent(cursor)}` : '');
+      const page: any = await (await svc.handle(new Request(url), admin)).json();
+      expect(page.sessions.length).toBeLessThanOrEqual(50);
+      for (const s of page.sessions) seen.set(String(s.machine_id) + '/' + String(s.native_id), (seen.get(String(s.machine_id) + '/' + String(s.native_id)) ?? 0) + 1);
+      cursor = page.sessions_cursor_next ?? null;
+      pages++;
+      expect(pages).toBeLessThanOrEqual(10); // 250 rows at 50/page terminate
+    } while (cursor);
+    expect(seen.size).toBe(250);
+    expect([...seen.values()].every(n => n === 1)).toBe(true);
+    const r = t.report(0);
+    expect(r.total, `fleet sessions walk top statements: ${JSON.stringify(r.top)}`).toBeLessThanOrEqual(4000);
+  }));
+
+  it('rejects bad cursors/limits and scopes sections', withHub(async (hub: Hub, state: DurableObjectState) => {
+    hub.sql.exec('DELETE FROM fleet_sessions');
+    seedFleetSessions(hub.sql, 10);
+    const svc = new FleetService(hub.sql, (cb: any) => cb(), () => Date.now());
+    expect((await svc.handle(new Request('https://hub.test/api/fleet?sessions_cursor=!!!'), admin)).status).toBe(400);
+    expect((await svc.handle(new Request('https://hub.test/api/fleet?sessions_limit=99999'), admin)).status).toBe(400);
+    expect((await svc.handle(new Request('https://hub.test/api/fleet?sections=nope'), admin)).status).toBe(400);
+    const slim: any = await (await svc.handle(new Request('https://hub.test/api/fleet?sections=machines'), admin)).json();
+    expect(Object.keys(slim).sort()).toEqual(['machines']);
+    expect(slim.sessions).toBeUndefined();
+  }));
+
+  it('plans the cursor page as an index seek and always serves fresh reads', withHub(async (hub: Hub, state: DurableObjectState) => {
+    hub.sql.exec('DELETE FROM fleet_sessions');
+    seedFleetSessions(hub.sql, 30);
+    const svc = new FleetService(hub.sql, (cb: any) => cb(), () => Date.now());
+    expect(fleetPageShape(hub)).not.toMatch(/SCAN fleet_sessions(?! USING)/);
+    expect(fleetPageShape(hub)).toMatch(/USING .*INDEX fleet_session_page/);
+    expect(fleetPageShape(hub)).toMatch(/SEARCH/);
+    // No version primitive in this runtime (see server note): every read is
+    // a fresh 200; If-None-Match is ignored rather than risking stale 304s.
+    const res = await svc.handle(new Request('https://hub.test/api/fleet?sections=sessions&sessions_limit=10'), admin);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('ETag')).toBeNull();
+    const again = await svc.handle(new Request('https://hub.test/api/fleet?sections=sessions&sessions_limit=10', { headers: { 'If-None-Match': 'W/"fleet-1-x"' } }), admin);
+    expect(again.status).toBe(200);
+    hub.sql.exec(`INSERT OR REPLACE INTO fleet_sessions(machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace,profile,account) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      'fleetm9', 'nat-new', 'tag-new', 'codex', 'running', 'active', new Date().toISOString(), '/w/new', null, 'acc');
+    const changed: any = await (await svc.handle(new Request('https://hub.test/api/fleet?sections=sessions&sessions_limit=10'), admin)).json();
+    expect(changed.sessions_total).toBe(31);
+  }));
+
+  it('keeps the default page small as the table grows past 1000 rows', withHub(async (hub: Hub, state: DurableObjectState) => {
+    hub.sql.exec('DELETE FROM fleet_sessions');
+    seedFleetSessions(hub.sql, 1200);
+    const svc = new FleetService(hub.sql, (cb: any) => cb(), () => Date.now());
+    const res = await svc.handle(new Request('https://hub.test/api/fleet'), admin);
+    const body: any = await res.json();
+    expect(body.sessions).toHaveLength(FLEET_SESSIONS_DEFAULT);
+    expect(body.sessions_total).toBe(1200);
+    expect(body.sessions_truncated).toBe(true);
+    const bytes = JSON.stringify(body).length;
+    expect(bytes, 'default fleet page must stay a small page').toBeLessThan(512 * 1024);
+  }));
+});
+
+function seedLiveControl(sql: any, n: number, fleet: boolean) {
+  const fresh = new Date().toISOString();
+  for (let i = 0; i < n; i++) {
+    const id = 'perf-ctl-' + String(i).padStart(5, '0');
+    const nat = 'perf-nat-' + String(i).padStart(5, '0');
+    sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+      id, 'perf-admin', 'ctl-rk-' + i, '{}', 'fleetm0', 'codex', 'headless', 'running',
+      JSON.stringify({ native_id: nat, tag: 'tag-' + i }), fresh, fresh);
+    if (fleet) {
+      sql.exec(`INSERT OR REPLACE INTO fleet_sessions(machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace,profile,account) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+        'fleetm0', nat, 'tag-' + i, 'codex', 'running', 'active', fresh, '/w/' + i, null, 'acc');
+    }
+  }
+}
+
+describe('warnings and tree stay capped as tables grow', () => {
+  it('caps the warnings page with truncation instead of a full running scan', withHub(async (hub: Hub, state: DurableObjectState) => {
+    await state.storage.transactionSync(() => {
+      new SessionControlService(hub.sql, (cb) => cb(), () => Date.now()).init();
+    });
+    hub.sql.exec("DELETE FROM session_control_sessions WHERE id LIKE 'perf-ctl-%'");
+    const old = new Date(Date.now() - 4 * 3600 * 1000).toISOString();
+    for (let i = 0; i < 1200; i++) {
+      const id = 'perf-ctl-' + String(i).padStart(5, '0');
+      hub.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,mode,state,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)`,
+        id, 'perf-admin', 'warn-rk-' + i, '{}', 'headless', 'running', old, old);
+    }
+    const t = tracked(hub.sql);
+    const svc = new SessionControlService(t.proxy, (cb: any) => cb(), () => Date.now());
+    const res = await svc.handle(new Request('https://hub.test/api/sessions/warnings'), admin);
+    expect(res.status).toBe(200);
+    const body: any = await res.json();
+    expect(body.warnings.length).toBeLessThanOrEqual(500);
+    expect(body.truncated).toBe(true);
+    const r = t.report(0);
+    expect(r.total, `warnings top statements: ${JSON.stringify(r.top)}`).toBeLessThanOrEqual(12000);
+    expect((hub.sql.exec("EXPLAIN QUERY PLAN SELECT * FROM session_control_sessions WHERE state = 'running' ORDER BY created_at, id LIMIT ?", 501).toArray() as any[]).map(x => String(x.detail)).join(' | ')).not.toMatch(/SCAN/i);
+  }));
+
+  it('caps the tree page and never scans the sessions table for it', withHub(async (hub: Hub, state: DurableObjectState) => {
+    await state.storage.transactionSync(() => {
+      new SessionControlService(hub.sql, (cb) => cb(), () => Date.now()).init();
+    });
+    hub.sql.exec("DELETE FROM session_control_sessions WHERE id LIKE 'perf-ctl-%'");
+    hub.sql.exec("DELETE FROM fleet_sessions WHERE machine_id = 'fleetm0'");
+    seedLiveControl(hub.sql, 600, true);
+    const t = tracked(hub.sql);
+    const svc = new SessionControlService(t.proxy, (cb: any) => cb(), () => Date.now());
+    const res = await svc.handle(new Request('https://hub.test/api/sessions/tree'), admin);
+    expect(res.status).toBe(200);
+    const body: any = await res.json();
+    expect(body.tree.length + body.total).toBeGreaterThan(0);
+    expect(body.total).toBeLessThanOrEqual(200);
+    expect(body.truncated).toBe(true);
+    const r = t.report(0);
+    expect(r.total, `tree top statements: ${JSON.stringify(r.top)}`).toBeLessThanOrEqual(6000);
   }));
 });
