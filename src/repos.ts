@@ -1,11 +1,13 @@
 /** Private repository registry. Human fields are insert-only during discovery. */
 import { boundedText } from './mcp';
 import { decodeRepoWorkspace, encodeRepoWorkspace } from './fleet';
+import { advertisedRepoPaths, allowedMachinesValid, repoPathKey } from './repo-host-policy';
 import type { SqlStorage } from '@cloudflare/workers-types';
 
 type Auth = { caller?: { kind?: string; isAdmin?: boolean; machineId?: string }; scopes?: string[]; error?: Response };
-const human = ['label', 'purpose', 'stack', 'key_folders', 'urls', 'aliases'] as const;
+const human = ['label', 'purpose', 'stack', 'key_folders', 'urls', 'aliases', 'category', 'description', 'preferred_workspace_subdir', 'clone_policy', 'seed_data', 'allowed_machines'] as const;
 const operatorFields = [...human, 'status', 'canonical', 'portable'] as const;
+const checkoutFields = ['workspace_root', 'checkout_status', 'branch', 'dirty_counts', 'disk_free_bytes', 'cloned_on_demand'] as const;
 const machineFields = ['dir', 'origin', 'org', 'default_branch', 'status', 'canonical', 'last_commit', 'workflows', 'github_url', 'flags'] as const;
 const nameOk = (v: any) => typeof v === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(v);
 const textOk = (v: any) => typeof v === 'string' && v.length <= 4096 && !/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(v);
@@ -19,21 +21,96 @@ export function registeredRepoLabel(sql: SqlStorage, value: unknown): boolean {
   try {
     return sql.exec('SELECT data FROM repo_registry').toArray().some(row => {
       const repo = JSON.parse(String(row.data));
-      return [repo.name, repo.label, ...(repo.aliases || [])].some(v => typeof v === 'string' && v.toLowerCase() === value.toLowerCase());
+      return [repo.repo_id, repo.name, repo.label, ...(repo.aliases || [])].some(v => typeof v === 'string' && v.toLowerCase() === value.toLowerCase());
     });
   } catch { return false; }
 }
 
 export class RepoRegistry {
-  constructor(private sql: SqlStorage, private txn: <T>(fn: () => T) => T) {}
+  constructor(private sql: SqlStorage, private txn: <T>(fn: () => T) => T, private now: () => number = Date.now) {}
   init() {
-    this.sql.exec('CREATE TABLE IF NOT EXISTS repo_registry (name TEXT PRIMARY KEY, machine TEXT NOT NULL, data TEXT NOT NULL, updated_at TEXT NOT NULL)');
+    this.txn(() => {
+      const columns = this.sql.exec('PRAGMA table_info(repo_registry)').toArray();
+      const legacy = columns.length && !columns.some(c => c.name === 'repo_id');
+      if (legacy) this.sql.exec('ALTER TABLE repo_registry RENAME TO repo_registry_single_host');
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS repo_registry (
+        repo_id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        origin TEXT NOT NULL DEFAULT '', origin_url TEXT NOT NULL DEFAULT '', default_branch TEXT NOT NULL DEFAULT '',
+        category TEXT, description TEXT, preferred_workspace_subdir TEXT, clone_policy TEXT, seed_data TEXT,
+        data TEXT NOT NULL, updated_at TEXT NOT NULL)`);
+      this.sql.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_repo_registry_name_nocase ON repo_registry(LOWER(name))');
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS repo_checkouts (
+        repo_id TEXT NOT NULL, host_id TEXT NOT NULL, path TEXT, workspace_root TEXT,
+        status TEXT NOT NULL, last_seen TEXT, head_sha TEXT, head_date TEXT, branch TEXT,
+        dirty_counts TEXT, disk_free_bytes INTEGER, cloned_on_demand INTEGER NOT NULL DEFAULT 0,
+        last_used_at TEXT, flags_json TEXT NOT NULL DEFAULT '[]', updated_at TEXT NOT NULL,
+        PRIMARY KEY(repo_id, host_id))`);
+      this.sql.exec('CREATE INDEX IF NOT EXISTS idx_repo_checkouts_host ON repo_checkouts(host_id)');
+      this.sql.exec('CREATE INDEX IF NOT EXISTS idx_repo_checkouts_path ON repo_checkouts(host_id,path)');
+      if (legacy) {
+        for (const row of this.sql.exec('SELECT data FROM repo_registry_single_host ORDER BY name').toArray()) {
+          const old = JSON.parse(String(row.data));
+          let id = this.identity(old);
+          // Seeded duplicates and distinct legacy labels retain their own data.
+          if (this.sql.exec('SELECT repo_id FROM repo_registry WHERE repo_id=?', id).toArray().length) {
+            const base = 'local/' + old.name.toLowerCase(); id = base; let suffix = 1;
+            while (this.sql.exec('SELECT repo_id FROM repo_registry WHERE repo_id=?', id).toArray().length) id = base + '-legacy-' + suffix++;
+          }
+          let name = old.name;
+          if (this.named(name)) name = this.availableName(name);
+          const migrated = { ...old, name, repo_id: id };
+          this.save(migrated, old.updated_at);
+          this.saveCheckout(id, old, old.updated_at);
+        }
+        this.sql.exec('DROP TABLE repo_registry_single_host');
+      }
+    });
   }
-  all(): any[] { return this.sql.exec('SELECT data FROM repo_registry ORDER BY name').toArray().map(r => JSON.parse(String(r.data))); }
+  private identity(repo: any): string {
+    return repo.status === 'duplicate' || !repo.origin ? 'local/' + repo.name.toLowerCase() : repo.origin.toLowerCase();
+  }
+  private availableName(base: string): string {
+    let candidate = base.slice(0, 118), i = 1;
+    while (this.named(candidate)) candidate = base.slice(0, 118) + '-' + i++;
+    return candidate;
+  }
+  all(): any[] {
+    const machines = this.sql.exec('SELECT id,last_checkin_at,capabilities FROM machines').toArray();
+    const online = new Set(machines
+      .filter(m => { const age = this.now() - Date.parse(String(m.last_checkin_at)); return age >= 0 && age <= 180000; }).map(m => String(m.id)));
+    return this.sql.exec('SELECT repo_id,data FROM repo_registry ORDER BY name').toArray().map(row => {
+      const repo = { ...JSON.parse(String(row.data)), repo_id: row.repo_id };
+      const checkouts: any[] = this.sql.exec('SELECT * FROM repo_checkouts WHERE repo_id=? ORDER BY host_id', row.repo_id).toArray().map(c => ({
+        ...c, machine_id: c.host_id, local_path: c.path, cloned_on_demand: !!c.cloned_on_demand,
+        dirty_counts: c.dirty_counts ? JSON.parse(String(c.dirty_counts)) : null,
+        flags: JSON.parse(String(c.flags_json)), online: online.has(String(c.host_id)),
+      }));
+      // Hosts already advertising a checkout need no operator registry edit.
+      // A scanned row, including an explicit missing/error result, takes precedence.
+      for (const machine of machines) {
+        if (checkouts.some(c => c.host_id === machine.id)) continue;
+        let caps: any;
+        try { caps = JSON.parse(String(machine.capabilities || '{}')); } catch { continue; }
+        const paths = advertisedRepoPaths(caps, repo.name);
+        if (paths.length !== 1) continue;
+        checkouts.push({host_id:machine.id, machine_id:machine.id, path:paths[0], local_path:paths[0],
+          status:'present', last_seen:machine.last_checkin_at, flags:[], online:online.has(String(machine.id)),
+          source:'host_workspaces', cloned_on_demand:false});
+      }
+      const representative = checkouts.find(c => c.status === 'present' && c.online) || checkouts.find(c => c.status === 'present') || checkouts[0];
+      const present = checkouts.filter(c => c.status === 'present');
+      const noOnline = !present.some(c => c.online);
+      return { ...repo, machine: representative?.host_id ?? null, dir: representative?.path ?? null,
+        checkouts, checkouts_by_host:Object.fromEntries(checkouts.map(c => [c.host_id, c])),
+        hosts: present.map(c => c.host_id), present_online_count: present.filter(c => c.online).length,
+        no_present_online: noOnline,
+        flags: Array.from(new Set([...(repo.flags || []), ...checkouts.flatMap(c => c.flags), ...(noOnline ? ['NO_PRESENT_ONLINE'] : [])])) };
+    });
+  }
   get(name: string): any | undefined {
     if (typeof name !== 'string') return undefined;
     const rows = this.all();
-    const exact = rows.find(r => r.name.toLowerCase() === name.toLowerCase());
+    const exact = rows.find(r => r.name.toLowerCase() === name.toLowerCase()) || rows.find(r => r.repo_id === name.toLowerCase());
     if (exact) return exact;
     const matches = rows.filter(r => r.label?.toLowerCase() === name.toLowerCase() || r.aliases?.some((a: string) => a.toLowerCase() === name.toLowerCase()));
     if (matches.length > 1) throw new Error('ambiguous_repo');
@@ -97,18 +174,67 @@ export class RepoRegistry {
     return { error: { error: 'unknown_repo', repo: value, ...(matches.length ? { matches } : {}) } };
   }
   private named(name: string): any | undefined {
-    const row = this.sql.exec('SELECT data FROM repo_registry WHERE name = ?', name).toArray()[0];
-    return row ? JSON.parse(String(row.data)) : undefined;
+    const row = this.sql.exec('SELECT repo_id,data FROM repo_registry WHERE name = ? COLLATE NOCASE', name).toArray()[0];
+    return row ? { ...JSON.parse(String(row.data)), repo_id: row.repo_id } : undefined;
   }
-  private save(repo: any) {
-    repo.updated_at = new Date().toISOString();
-    this.sql.exec('INSERT INTO repo_registry (name,machine,data,updated_at) VALUES (?,?,?,?) ON CONFLICT(name) DO UPDATE SET machine=excluded.machine,data=excluded.data,updated_at=excluded.updated_at', repo.name, repo.machine, JSON.stringify(repo), repo.updated_at);
+  private save(repo: any, at?: string) {
+    const shared = { ...repo, origin_url: repo.origin || '', updated_at: at || new Date().toISOString() };
+    for (const key of ['machine', 'dir', 'checkouts', 'checkouts_by_host', 'hosts', 'no_present_online', 'present_online_count', ...checkoutFields]) delete shared[key];
+    this.sql.exec(`INSERT INTO repo_registry (repo_id,name,origin,origin_url,default_branch,category,description,preferred_workspace_subdir,clone_policy,seed_data,data,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(repo_id) DO UPDATE SET name=excluded.name,origin=excluded.origin,origin_url=excluded.origin_url,default_branch=excluded.default_branch,category=excluded.category,description=excluded.description,preferred_workspace_subdir=excluded.preferred_workspace_subdir,clone_policy=excluded.clone_policy,seed_data=excluded.seed_data,data=excluded.data,updated_at=excluded.updated_at`,
+      shared.repo_id, shared.name, shared.origin || '', shared.origin_url, shared.default_branch || '', shared.category ?? null, shared.description ?? null, shared.preferred_workspace_subdir ?? null, shared.clone_policy ?? null, shared.seed_data ?? null, JSON.stringify(shared), shared.updated_at);
+  }
+  private saveCheckout(id: string, r: any, at?: string) {
+    const updated = at || new Date().toISOString();
+    const status = r.checkout_status?.toLowerCase() || (r.flags?.includes('WORKTREE') ? 'worktree_only' : r.flags?.includes('MISSING') ? 'missing' : r.flags?.includes('GIT_ERROR') ? 'error' : 'present');
+    this.sql.exec(`INSERT INTO repo_checkouts (repo_id,host_id,path,workspace_root,status,last_seen,head_sha,head_date,branch,dirty_counts,disk_free_bytes,flags_json,updated_at,cloned_on_demand,last_used_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(repo_id,host_id) DO UPDATE SET
+      path=excluded.path,workspace_root=excluded.workspace_root,status=excluded.status,
+      last_seen=CASE WHEN excluded.status='present' THEN excluded.last_seen ELSE repo_checkouts.last_seen END,
+      head_sha=COALESCE(excluded.head_sha,repo_checkouts.head_sha),head_date=COALESCE(excluded.head_date,repo_checkouts.head_date),
+      branch=COALESCE(excluded.branch,repo_checkouts.branch),dirty_counts=excluded.dirty_counts,
+      disk_free_bytes=excluded.disk_free_bytes,flags_json=excluded.flags_json,updated_at=excluded.updated_at,
+      cloned_on_demand=CASE WHEN excluded.path=repo_checkouts.path THEN MAX(repo_checkouts.cloned_on_demand,excluded.cloned_on_demand) ELSE excluded.cloned_on_demand END,
+      last_used_at=CASE WHEN excluded.cloned_on_demand=1 THEN excluded.updated_at ELSE repo_checkouts.last_used_at END`,
+      id, r.machine, r.dir, r.workspace_root ?? null, status, status === 'present' ? updated : null,
+      r.last_commit?.sha ?? null, r.last_commit?.date ?? null, r.branch ?? null,
+      r.dirty_counts == null ? null : JSON.stringify(r.dirty_counts), r.disk_free_bytes ?? null, JSON.stringify(r.flags || []), updated,
+      r.cloned_on_demand === true ? 1 : 0, r.cloned_on_demand === true ? updated : null);
+  }
+  private upsert(r: any, seed: boolean) {
+    let old = this.named(r.name);
+    const origin = r.origin || r.origin_url;
+    const desired = this.identity({ ...r, origin });
+    const sameOrigin = origin && old?.status !== 'duplicate' && r.status !== 'duplicate' && this.sql.exec('SELECT data,repo_id FROM repo_registry WHERE repo_id=?', desired).toArray()[0];
+    if (sameOrigin) old = { ...JSON.parse(String(sameOrigin.data)), repo_id: sameOrigin.repo_id };
+    // Different remotes using the same short name cannot overwrite one another.
+    if (old && origin && old.origin && old.origin.toLowerCase() !== origin.toLowerCase()) old = undefined;
+    if (seed && old) return;
+    const name = old?.name || (this.named(r.name) ? this.availableName(origin ? origin.replace('/', '-') : r.name) : r.name);
+    let id = old?.repo_id || desired;
+    if (old?.repo_id.startsWith('local/') && origin && old.status !== 'duplicate') {
+      id = desired;
+      this.sql.exec('UPDATE repo_checkouts SET repo_id=? WHERE repo_id=?', id, old.repo_id);
+      this.sql.exec('DELETE FROM repo_registry WHERE repo_id=?', old.repo_id);
+    }
+    const next = old ? { ...old } : { name, label: name, purpose: '', stack: '', key_folders: '', urls: '', aliases: [], status: 'active', default_branch: '', workflows: '', github_url: '', last_commit: null, canonical: null, flags: ['NEW'] };
+    for (const k of [...machineFields, ...(seed ? human : [])]) {
+      if (k !== 'dir' && k !== 'flags' && r[k] !== undefined && r[k] !== null && (k !== 'origin' && k !== 'default_branch' || r[k] !== '')) next[k] = r[k];
+    }
+    if (origin) next.origin = origin;
+    if (seed && r.flags) next.flags = r.flags.filter((f: string) => !['MISSING', 'MOVED', 'WORKTREE', 'GIT_ERROR'].includes(f));
+    if (!old && name !== r.name) next.flags = [...next.flags, 'NAME_COLLISION'];
+    if (old?.status === 'duplicate') { next.status = 'duplicate'; next.canonical = old.canonical; }
+    next.name = name; next.repo_id = id;
+    this.save(next);
+    this.saveCheckout(id, r);
   }
   private valid(repo: any, seed: boolean): boolean {
     if (!repo || !nameOk(repo.name) || !nameOk(repo.machine) || !pathOk(repo.dir)) return false;
-    const allowed = new Set<string>(['name', 'machine', ...machineFields, ...(seed ? human : [])]);
+    const allowed = new Set<string>(['name', 'machine', ...machineFields, ...checkoutFields, 'origin_url', ...(seed ? human : [])]);
     if (Object.keys(repo).some(k => !allowed.has(k))) return false;
-    if (seed && human.some(k => k !== 'aliases' && repo[k] !== undefined && !textOk(repo[k]))) return false;
+    if (seed && human.some(k => !['aliases', 'allowed_machines'].includes(k) && repo[k] !== undefined && !textOk(repo[k]))) return false;
+    if (repo.allowed_machines !== undefined && !allowedMachinesValid(repo.allowed_machines)) return false;
     if (repo.aliases !== undefined && (!Array.isArray(repo.aliases) || repo.aliases.length > 32 || repo.aliases.some((a: any) => !textOk(a) || !a.trim() || a.length > 128))) return false;
     for (const k of ['origin', 'org', 'default_branch', 'canonical', 'github_url', 'workflows']) if (repo[k] !== undefined && repo[k] !== null && !textOk(repo[k])) return false;
     if (repo.origin && !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo.origin)) return false;
@@ -116,15 +242,40 @@ export class RepoRegistry {
     if (repo.status === 'duplicate' && !nameOk(repo.canonical)) return false;
     if (repo.last_commit !== undefined && repo.last_commit !== null && (!repo.last_commit || !/^[a-f0-9]{40,64}$/.test(repo.last_commit.sha) || typeof repo.last_commit.date !== 'string' || !Number.isFinite(Date.parse(repo.last_commit.date)))) return false;
     if (repo.flags !== undefined && (!Array.isArray(repo.flags) || repo.flags.some((f: any) => !['NEW', 'MOVED', 'MISSING', 'GH_ERROR', 'GIT_ERROR', 'WORKTREE'].includes(f)))) return false;
+    if (repo.origin_url != null && (typeof repo.origin_url !== 'string' || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo.origin_url))) return false;
+    if (repo.origin && repo.origin_url && repo.origin.toLowerCase() !== repo.origin_url.toLowerCase()) return false;
+    if (repo.workspace_root != null && !pathOk(repo.workspace_root)) return false;
+    if (repo.cloned_on_demand !== undefined && typeof repo.cloned_on_demand !== 'boolean') return false;
+    if (repo.checkout_status != null && !['present','missing','cloning','error','worktree_only'].includes(String(repo.checkout_status).toLowerCase())) return false;
+    if (repo.branch != null && !textOk(repo.branch)) return false;
+    if (repo.disk_free_bytes != null && (!Number.isSafeInteger(repo.disk_free_bytes) || repo.disk_free_bytes < 0)) return false;
+    if (repo.dirty_counts != null && (typeof repo.dirty_counts !== 'object' || Array.isArray(repo.dirty_counts) || Object.entries(repo.dirty_counts).some(([k,v]) => !['staged','unstaged','untracked'].includes(k) || !Number.isSafeInteger(v) || Number(v) < 0))) return false;
     return true;
   }
-  /** Resolve before Fleet placement, pinning the owning host and keeping Fleet/host confinement. */
-  prepareLaunch(input: any): { input?: any; error?: any } {
+  /** Resolve catalog identity; placement chooses the host and checkout later. */
+  resolveLaunchRepo(input: any): { input?: any; error?: any } {
     // Repo-identity workspaces (intake 8028bb06) are resolved by each host, not by this registry.
-    if (typeof input.workspace !== 'string' || pathOk(input.workspace) || decodeRepoWorkspace(input.workspace)) return { input };
+    if (typeof input.workspace !== 'string' || decodeRepoWorkspace(input.workspace)) return { input };
     const rows = this.all();
     // Empty installations preserve configured legacy workspaces until seeded.
     if (!rows.length) return { input };
+    if (pathOk(input.workspace)) {
+      const key = repoPathKey(input.workspace);
+      const matches = rows.filter(r => r.checkouts.some((c: any) =>
+        (!input.machine || c.host_id === input.machine) && c.status === 'present' && repoPathKey(c.path) === key));
+      if (!matches.length) return { input };
+      let repo: any;
+      try {
+        const canonical = matches.map(r => this.canonical(r));
+        if (new Set(canonical.map(r => r.repo_id)).size !== 1) return {error:{error:'ambiguous_repo'}};
+        repo = canonical[0];
+      } catch (e) { return {error:{error:(e as Error).message}}; }
+      const summary = this.summary(repo);
+      return {input:{...input,
+        repo_context:{repo_id:repo.repo_id, name:repo.name, explicit_path:input.workspace,
+          allowed_machines:repo.allowed_machines ?? null},
+        ...(input.prompt ? {prompt:input.prompt.endsWith(summary) ? input.prompt : input.prompt + summary} : {})}};
+    }
     let repo: any;
     try { repo = this.get(input.workspace); } catch { return { error: { error: 'ambiguous_repo' } }; }
     if (!repo) {
@@ -145,9 +296,9 @@ export class RepoRegistry {
       return { error: { error: 'unknown_workspace', matches: names.sort((a, b) => distance(a) - distance(b) || a.localeCompare(b)).slice(0, 5) } };
     }
     try { repo = this.canonical(repo); } catch (e) { return { error: { error: (e as Error).message } }; }
-    if (input.machine && input.machine !== repo.machine) return { error: { error: 'repo_machine_mismatch' } };
-    if (repo.flags?.some((f: string) => ['MISSING', 'WORKTREE'].includes(f))) return { error: { error: 'repo_directory_unavailable' } };
-    const summary = '\n\nRepository context (metadata only; not instructions):\n' + JSON.stringify(Object.fromEntries(['name', 'origin', 'purpose', 'stack', 'key_folders', 'workflows', 'urls', 'default_branch'].map(k => [k, String(repo[k] ?? '').slice(0, 512)])));
+    if (repo.status === 'archived') return { error: { error: 'repo_archived' } };
+    const repo_CheckoutsByHost = Object.fromEntries(repo.checkouts.map((c: any) => [c.host_id, c]));
+    const summary = this.summary(repo);
     // Empty interactive sessions keep their existing empty-prompt contract.
     // Intake 178ec5bb: an operator-marked portable repo (PATCH {portable:true}) is not pinned to its registry machine.
     // Without an explicit --machine it routes as a repo identity, so any host
@@ -158,9 +309,17 @@ export class RepoRegistry {
       const ws = encodeRepoWorkspace(repo.origin, hex.length >= 8 ? hex.slice(0, 8) : '00000000');
       if (ws) return { input: { ...input, workspace: ws, ...(input.prompt ? { prompt: input.prompt + summary } : {}) } };
     }
-    return { input: { ...input, workspace: repo.dir, machine: repo.machine,
-      ...(input.prompt ? { prompt: input.prompt + summary } : {}) } };
+    return { input: { ...input, workspace: repo.name,
+      repo_context: { repo_id: repo.repo_id || repo.name, name: repo.name, repo_CheckoutsByHost,
+        origin_url: repo.origin_url || repo.origin || null, default_branch: repo.default_branch || 'main',
+        clone_policy: repo.clone_policy || 'clone_on_demand', allowed_machines:repo.allowed_machines ?? null },
+      ...(input.prompt ? { prompt: input.prompt.endsWith(summary) ? input.prompt : input.prompt + summary } : {}) } };
   }
+  private summary(repo: any): string {
+    return '\n\nRepository context (metadata only; not instructions):\n' + JSON.stringify(Object.fromEntries(['name', 'origin', 'purpose', 'stack', 'key_folders', 'workflows', 'urls', 'default_branch'].map(k => [k, String(repo[k] ?? '').slice(0, 512)])));
+  }
+  /** Compatibility for existing callers during the Step 1 rollout. */
+  prepareLaunch(input: any) { return this.resolveLaunchRepo(input); }
   async handle(request: Request, auth: Auth): Promise<Response> {
     if (auth.error) return auth.error;
     const caller = auth.caller;
@@ -174,7 +333,7 @@ export class RepoRegistry {
       if (path === '/api/repos') {
         const status = url.searchParams.get('status');
         if (status && !['active', 'archived', 'duplicate'].includes(status)) return json({ error: 'invalid_status' }, 400);
-        const repos = this.all().filter(r => (!status || r.status === status) && (!url.searchParams.get('org') || r.org === url.searchParams.get('org')) && (url.searchParams.get('flagged') !== 'true' || r.flags?.length));
+        const repos = this.all().filter(r => (!status || r.status === status) && (!url.searchParams.get('org') || r.org === url.searchParams.get('org')) && (url.searchParams.get('flagged') !== 'true' || r.flags?.length) && (!url.searchParams.get('host') || r.hosts.includes(url.searchParams.get('host'))) && (!url.searchParams.get('missing_on') || !r.hosts.includes(url.searchParams.get('missing_on'))));
         return json({ repos, count: repos.length });
       }
       let name: string;
@@ -194,25 +353,12 @@ export class RepoRegistry {
       if (!body || !Array.isArray(body.repos) || body.repos.length > 25 || body.repos.some((r: any) => !this.valid(r, seed))) return json({ error: 'invalid_repos' }, 400);
       if (!admin && body.repos.some((r: any) => r.machine !== caller.machineId)) return json({ error: 'wrong_machine' }, 403);
       return this.txn(() => {
-        // Validate whole batch before writing. Refresh cannot mutate another host's row.
-        for (const r of body.repos) {
-          const old = this.named(r.name);
-          if (old && old.machine !== r.machine) return json({ error: 'wrong_machine' }, 403);
-        }
-        for (const r of body.repos) {
-          const old = this.named(r.name);
-          if (seed && old) continue;
-          const next = old ? { ...old } : { name: r.name, machine: r.machine, label: r.name, purpose: '', stack: '', key_folders: '', urls: '', aliases: [], status: 'active', default_branch: '', workflows: '', github_url: '', last_commit: null, canonical: null, flags: ['NEW'] };
-          for (const k of [...machineFields, ...(seed ? human : [])]) if (r[k] !== undefined) next[k] = r[k];
-          // A scanner cannot dissolve an operator-seeded duplicate relationship.
-          if (old?.status === 'duplicate') { next.status = 'duplicate'; next.canonical = old.canonical; }
-          this.save(next);
-        }
+        for (const r of body.repos) this.upsert(r, seed);
         return json({ updated: body.repos.length });
       });
     }
     if (request.method === 'PATCH' && path.startsWith('/api/repos/')) {
-      if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some(k => !(operatorFields as readonly string[]).includes(k)) || human.some(k => body[k] !== undefined && (k === 'aliases' ? !Array.isArray(body[k]) || body[k].length > 32 || body[k].some((a: any) => !textOk(a) || a.length > 128 || !a.trim()) : !textOk(body[k])))) return json({ error: 'invalid_repo_fields' }, 400);
+      if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some(k => !(operatorFields as readonly string[]).includes(k)) || human.some(k => body[k] !== undefined && (k === 'allowed_machines' ? !allowedMachinesValid(body[k]) : k === 'aliases' ? !Array.isArray(body[k]) || body[k].length > 32 || body[k].some((a: any) => !textOk(a) || a.length > 128 || !a.trim()) : !textOk(body[k])))) return json({ error: 'invalid_repo_fields' }, 400);
       if (body.status !== undefined && !['active', 'archived', 'duplicate'].includes(body.status)) return json({ error: 'invalid_status' }, 400);
       if (body.portable !== undefined && typeof body.portable !== 'boolean') return json({ error: 'invalid_portable' }, 400);
       if (body.canonical !== undefined && body.canonical !== null && !nameOk(body.canonical)) return json({ error: 'invalid_canonical' }, 400);
@@ -244,7 +390,7 @@ export class RepoRegistry {
           // Canonical links have no meaning once a repository is active/archived.
           next.canonical = null;
         }
-        this.save(next);
+        this.save({ ...this.named(repo.name), ...body, status: next.status, canonical: next.canonical });
         return json({ repo: this.get(repo.name) });
       });
     }

@@ -1,3 +1,4 @@
+import { repoAllowsMachine } from './repo-host-policy';
 import { engineEpoch } from './engine-epoch';
 import { WriteWatch } from './write-watch';
 import { ObservedCatalog } from './observed-catalog';
@@ -226,6 +227,11 @@ const DISPATCH_MESSAGES: Record<string, string> = {
   repo_clone_auth_failed: 'The host could not authenticate to GitHub while cloning the requested repository.',
   repo_not_found: 'The repository origin was not found during host cloning.',
   repo_clone_failed: 'The host could not clone the requested repository.',
+  repo_checkout_missing: 'The requested repository checkout is unavailable on this host.',
+  repo_origin_missing: 'The repository has no cloneable GitHub origin.',
+  host_gh_auth_unavailable: 'The host GitHub CLI authentication is unavailable.',
+  host_disk_warn_no_clone: 'The host filesystem is under pressure; cloning is refused.',
+  host_disk_critical: 'The host filesystem is critically full; provisioning is refused.',
   "mode_unavailable": "This host does not advertise the requested session mode (e.g. headless without a maintained launcher).",
   "dispatch_route_unconfigured": "The offered account, engine and profile do not match a local route.",
   "goal_startup_unconfigured": "This account has no trusted interactive goal startup command.",
@@ -276,7 +282,7 @@ function gateReasonValid(d: any): boolean {
 // model_unsupported: the route cannot serve this intent's model/tier (plan()
 // tier exclusion or a recorded route refusal); it never frees up, so it must not
 // turn a capacity wait into a hard 409.
-const INCIDENTAL_REASONS = new Set(['model_unsupported', 'model_disabled_by_policy', 'machine_unavailable', 'provider_disabled', 'engine_unavailable', 'tier_unavailable', 'goal_unsupported', 'engine_auth_expired', 'engine_tool_permission_refused', 'admission_unconfigured', 'not_logged_in', 'desktop_codex_excluded', 'command_channel_unreachable']);
+const INCIDENTAL_REASONS = new Set(['repo_checkout_missing', 'repo_origin_missing', 'host_gh_auth_unavailable', 'host_disk_warn_no_clone', 'model_unsupported', 'model_disabled_by_policy', 'machine_unavailable', 'provider_disabled', 'engine_unavailable', 'tier_unavailable', 'goal_unsupported', 'engine_auth_expired', 'engine_tool_permission_refused', 'admission_unconfigured', 'not_logged_in', 'desktop_codex_excluded', 'command_channel_unreachable']);
 /** Capacity-only placement failure: every rejected route reports transient
  * capacity (account/machine), optionally alongside incidental stale/disabled
  * routes (drained/stale check-ins, policy-disabled engines, registry routes
@@ -584,6 +590,9 @@ function workspaceReady(caps: any, workspace: any): boolean {
 }
 
 export class FleetService {
+  /** Registry resolver injected by hub.ts: rebuilds repo_context from the
+   * canonical catalog even when a caller supplies forged placement context. */
+  public repos: ((input: any) => { input?: any; error?: any }) | null = null;
   public routing: RoutingService;
   public resources: ResourceManagement;
   public admission: ClaimAdmission;
@@ -1221,7 +1230,8 @@ export class FleetService {
     { error?: undefined; request: any; selected: any; candidates: any[]; rejected: { machine: string; engine: string; reason: string; memory?: any }[]; evidence: Record<string, any>; hold_reason?: string; needs_machines?: { machine: string; hostname: string | null; online: boolean; routed: boolean; routes: { engine: string; account: string; profile?: string }[]; last_checkin_at: string | null }[] } {
     if (input && (modelDisabledByPolicy(input.engine) || modelDisabledByPolicy(input.model) ||
         policy.models.some(m => [m.id, m.model].includes(input.engine) && modelDisabledByPolicy(m)))) return { error: 'model_disabled_by_policy' };
-    if (!object(input, ['mode', 'machine', 'engine', 'engine_override_reason', 'tier', 'effort', 'account', 'workspace', 'cwd', 'prompt', 'idempotency_key', 'parent_id', 'summary', 'access', 'approved_action', 'with_goal', 'task_kind', 'project', 'needs']) ||
+    if (!object(input, ['mode', 'machine', 'engine', 'engine_override_reason', 'tier', 'effort', 'account', 'workspace', 'cwd', 'prompt', 'idempotency_key', 'parent_id', 'summary', 'access', 'approved_action', 'with_goal', 'task_kind', 'project', 'needs', 'repo_context']) ||
+      (input.repo_context !== undefined && (!input.repo_context || typeof input.repo_context !== 'object' || Array.isArray(input.repo_context))) ||
       (input.project !== undefined && (typeof input.project !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(input.project))) ||
       (input.needs !== undefined && (!Array.isArray(input.needs) || input.needs.length > 64 || input.needs.some((n: any) => typeof n !== 'string' || !NEEDS_LABEL.test(n)) || new Set(input.needs).size !== input.needs.length)) ||
       (input.task_kind !== undefined && !['implement','review','ask','goal'].includes(input.task_kind)) ||
@@ -1239,6 +1249,15 @@ export class FleetService {
       (input.prompt !== undefined && (typeof input.prompt !== 'string' || input.prompt.length > 16000)) ||
       (input.approved_action !== undefined && (typeof input.approved_action !== 'string' || !input.approved_action.trim() || input.approved_action.length > 12000)) ||
       (input.mode !== 'interactive' && (typeof input.prompt !== 'string' || !input.prompt.trim()))) return { error: 'invalid_launch_request' };
+    // Accept the internal resolver handoff, but rebuild availability from the
+    // registry even when a caller supplies context. Paths in request JSON are
+    // never authority to provision an unregistered repository.
+    const { repo_context: _suppliedRepoContext, ...logicalInput } = input;
+    if (this.repos) {
+      const resolved = this.repos(logicalInput);
+      if (resolved.error) return { error: resolved.error.error };
+      input = resolved.input;
+    }
     // Tier resolves through the EXISTING model-routing table (aliases +
     // tier membership), never new ranking: candidates are filtered to routes
     // whose (engine, profile) pair is a configured member of the tier, while
@@ -1258,6 +1277,7 @@ export class FleetService {
     // caller's selector in the canonical intent for idempotency.
     const overrideModels = policy.models.filter(m => m.id === input.engine || m.model === input.engine);
     const request: any = { mode: input.mode || 'headless', machine: input.machine || null, engine: input.engine || null, workspace: input.workspace, cwd: input.cwd ?? null, prompt: input.prompt || '', parent_id: input.parent_id || null, summary: input.summary || (input.mode === 'interactive' ? 'Interactive session' : 'Agent task') };
+    if (input.repo_context) request.repo_context = input.repo_context;
     // Unpinned random starts use the narrow configured engine mix even when
     // one member (Argon medium) is intentionally deep-only for ordinary daily
     // placement. Pins, previews and deterministic plans keep the normal tier.
@@ -1432,7 +1452,40 @@ export class FleetService {
           r.engine === route.engine && r.account === route.account && (r.profile ?? null) === route.profile))) {
         rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'goal_unsupported' }); continue;
       }
-      const effectiveWorkspace = resolveLabelUnderRoots(caps.workspaces, request.workspace);
+      let effectiveWorkspace = resolveLabelUnderRoots(caps.workspaces, request.workspace);
+      let repoProvision: any = null;
+      let checkoutFactor = 1;
+      const repo = request.repo_context;
+      if (repo && !repoAllowsMachine(repo.allowed_machines, route.machine_id)) {
+        rejected.push({machine:route.machine_id,engine:route.engine,reason:'repo_machine_not_allowed'}); continue;
+      }
+      if (repo && !repo.explicit_path) {
+        const checkout = repo.repo_CheckoutsByHost?.[route.machine_id];
+        if (checkout?.status?.toLowerCase() === 'present' && absoluteWorkspaceOk(checkout.path) && workspaceCapable(caps.workspaces, checkout.path)) {
+          if ([checkout.path, caps.repo_worktree_root, ...(checkout.path.startsWith('/') ? ['/', '/tmp'] : [])].filter(Boolean).some(p => this.repoDiskState(route.machine_id, p, hb) === 'critical')) {
+            rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'host_disk_critical' }); continue;
+          }
+          effectiveWorkspace = checkout.path;
+          repoProvision = { mode: 'existing', name: repo.name, origin_url: repo.origin_url, default_branch: repo.default_branch };
+        } else {
+          const root = absoluteWorkspaceOk(caps.repo_checkout_root) ? caps.repo_checkout_root : null;
+          const states = [root, caps.repo_worktree_root].filter(Boolean).map(p => this.repoDiskState(route.machine_id, p, hb));
+          const systemCritical = typeof root === 'string' && root.startsWith('/') && ['/', '/tmp'].some(p => this.repoDiskState(route.machine_id, p, hb) === 'critical');
+          const diskState = systemCritical || states.includes('critical') ? 'critical' : states.every(s => s === 'ok') ? 'ok' : 'warn';
+          const reason = repo.clone_policy !== 'clone_on_demand' ? 'repo_checkout_missing'
+            : !repo.origin_url ? 'repo_origin_missing'
+            : caps.repo_clone_enabled !== true || !root ? 'repo_checkout_missing'
+            : (caps.gh_authenticated ?? caps.gh_auth_ok) !== true ? 'host_gh_auth_unavailable'
+            : diskState === 'critical' ? 'host_disk_critical'
+            : diskState !== 'ok' ? 'host_disk_warn_no_clone'
+            : null;
+          if (reason) { rejected.push({ machine: route.machine_id, engine: route.engine, reason }); continue; }
+          checkoutFactor = 0.85;
+          effectiveWorkspace = root.replace(/[\\/]$/, '') + (root.includes('\\') ? '\\' : '/') + repo.name;
+          repoProvision = { mode: 'clone_on_demand', name: repo.name, origin_url: repo.origin_url,
+            default_branch: repo.default_branch, workspace_root: root };
+        }
+      }
       const absoluteCwd = typeof request.cwd === 'string' && (request.cwd.startsWith('/') || /^[A-Za-z]:[\\/]/.test(request.cwd)) ? request.cwd : null;
       // Host admission probes the credential actually used for execution.
       // A healthy sibling account must not mask a refusal for this route.
@@ -1679,7 +1732,7 @@ export class FleetService {
         overrideReason: typeof input.engine_override_reason === 'string' && input.engine_override_reason.trim() ? input.engine_override_reason.trim() : null,
       });
       const decision = decide(false);
-      const score = decision.score;
+      const score = checkoutFactor * decision.score;
       const selectionWithDecision = { ...model, decision_score: score, decision_reason: decision.reason, decision };
       // Windows hosts are overflow for work that does not ask for Windows:
       // agent tooling assumes Linux, so they win only when every Linux route
@@ -1691,7 +1744,7 @@ export class FleetService {
       // while retaining hard refusals for rejected or stale credentials.
       if (isDegraded) gateDegraded.add(candidates.length);
       candidates.push({ machine: route.machine_id, engine: route.engine, account: route.account, profile: route.profile,
-        ...this.resources.cpuEstimate(request.project || request.workspace,request.task_kind || 'goal',route.engine,model.model), selection: selectionWithDecision, score, burn, burn_weight, decision_score: score, decision_reason: decision.reason, decision, ...(isDegraded ? { degraded: true } : {}), ...(routeQuota.reason !== 'eligible' || isDegraded ? { quota_warning: 'quota_probe_unavailable' } : {}), workspace: effectiveWorkspace, tbm_weight, tbm: { ...tbm, urgency }, ...(overflow ? { overflow: true } : {}) });
+        ...this.resources.cpuEstimate(request.project || request.workspace,request.task_kind || 'goal',route.engine,model.model), selection: selectionWithDecision, score, burn, burn_weight, decision_score: score, decision_reason: decision.reason, decision, ...(isDegraded ? { degraded: true } : {}), ...(routeQuota.reason !== 'eligible' || isDegraded ? { quota_warning: 'quota_probe_unavailable' } : {}), workspace: effectiveWorkspace, repo_provision: repoProvision, tbm_weight, tbm: { ...tbm, urgency }, ...(overflow ? { overflow: true } : {}) });
       registerRedo(candidates[candidates.length - 1]);
     }
     // Intake 06d2a0ac AC1: an account with no quota verdict at all (status
@@ -1745,6 +1798,9 @@ export class FleetService {
     if (selected && typeof selected.workspace === 'string' && selected.workspace !== request.workspace) {
       request.workspace = selected.workspace;
     }
+    if (selected?.repo_provision) {
+      request.repo_provision = { ...selected.repo_provision, checkout_path: selected.workspace };
+    }
     // Every matching account and machine for an explicit engine has already
     // been considered above. Replanning without `engine` here could silently
     // offer a different engine while persisting the original requested engine.
@@ -1793,6 +1849,22 @@ export class FleetService {
     }
     return { request, selected, candidates, rejected, evidence: Object.fromEntries(evidenceByMachine) };
     });
+  }
+
+  private repoDiskState(machine: string, root: unknown, hb: any): string {
+    if (typeof root !== 'string') return 'unknown';
+    try {
+      const row: any = this.sql.exec('SELECT observed_at,payload_json FROM disk_observations WHERE machine_id=? ORDER BY observed_at_ms DESC LIMIT 1', machine).toArray()[0];
+      if (!row || !fresh(row.observed_at, this.now(), 180000)) return ['ok','warn','critical'].includes(hb.disk_state) ? hb.disk_state : 'unknown';
+      const mounts = parsed(row.payload_json)?.filesystems;
+      if (!Array.isArray(mounts)) return 'unknown';
+      const match = mounts.filter((m: any) => typeof m.mount_point === 'string' &&
+        (root === m.mount_point || root.startsWith(m.mount_point.replace(/\/$/, '') + '/')))
+        .sort((a: any,b: any) => b.mount_point.length-a.mount_point.length)[0];
+      if (match?.status === 'critical' || (typeof match?.inode_free_percent === 'number' && match.inode_free_percent < 5)) return 'critical';
+      if (match?.fills_within_24h === true || (typeof match?.inode_free_percent === 'number' && match.inode_free_percent < 10)) return 'warn';
+      return ['ok','warn','critical'].includes(match?.status) ? match.status : 'unknown';
+    } catch { return ['ok','warn','critical'].includes(hb.disk_state) ? hb.disk_state : 'unknown'; }
   }
 
   private diskHeadroom(machine: string, workspace?: string, excludeId?: string, cwd?: string) {
@@ -1931,7 +2003,7 @@ export class FleetService {
         let bound: any = null;
         try { bound = JSON.parse(row.request_json); } catch { continue; }
         if (!bound || typeof bound !== 'object') continue;
-        const input: any = { mode: bound.mode || 'headless', workspace: bound.workspace, prompt: bound.prompt ?? '', idempotency_key: 'drain-' + row.id };
+        const input: any = { mode: bound.mode || 'headless', workspace: bound.repo_context?.explicit_path || bound.repo_context?.name || bound.workspace, prompt: bound.prompt ?? '', idempotency_key: 'drain-' + row.id };
         for (const key of ['machine', 'engine', 'account', 'tier', 'effort', 'engine_override_reason', 'cwd', 'parent_id', 'summary', 'approved_action', 'access', 'with_goal', 'task_kind', 'project', 'needs']) {
           if (bound[key] !== undefined && bound[key] !== null) input[key] = bound[key];
         }
@@ -1990,7 +2062,7 @@ export class FleetService {
         // parks promote with the rewritten workspace, not the stale alias).
         let patchedJson: string = row.request_json;
         try {
-          const patched = { ...bound, workspace: normalizedWorkspace };
+          const patched = { ...bound, workspace: (plan as any).request?.repo_context?.explicit_path || (plan as any).request?.repo_context?.name || normalizedWorkspace, ...((plan as any).request?.repo_context ? { repo_context: (plan as any).request.repo_context, repo_provision: (plan as any).request.repo_provision } : {}) };
           patchedJson = JSON.stringify(patched);
         } catch { /* keep the stored intent on stringify failure */ }
         const written: any = this.sql.exec("UPDATE fleet_launches SET machine_id = ?, engine = ?, account = ?, profile = ?, workspace = ?, request_json = ?, model_selection_json = ?, state = 'offered', launch_error_json = CASE WHEN json_extract(launch_error_json, '$.reason') = 'launcher_disk_reserve' THEN NULL ELSE launch_error_json END, updated_at = ? WHERE id = ? AND state = 'queued' RETURNING id",
@@ -2835,6 +2907,7 @@ export class FleetService {
               memory_estimate_mb: this.resources.estimate(request.project || String(row.workspace), String(row.engine), request.task_kind || 'goal'),
               selection: parsed(row.model_selection_json) ?? {}, id: row.id, engine: row.engine, account: row.account, profile: row.profile,
               mode: row.mode, workspace: row.workspace, cwd: request.cwd ?? null, prompt: row.prompt,
+              ...(request.repo_provision ? { repo_provision: request.repo_provision } : {}),
               ...(request.with_goal === true ? { with_goal: true } : {}), access: request.access?.mode || 'legacy_unspecified',
               ...(row.state !== 'offered' ? { state: row.state, claim_key: row.claim_key ?? null } : {}) };
           });

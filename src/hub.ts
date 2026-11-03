@@ -258,13 +258,18 @@ export class Hub extends DurableObject {
     this.workerAccess.init();
     this.repoRegistry = new RepoRegistry(this.sql, fn => this.ctx.storage.transactionSync(fn));
     this.repoRegistry.init();
+    // Multi-host repos (ce1fecdd): FleetService.plan() rebuilds repo_context
+    // from the canonical catalog even when a caller supplies forged context.
+    // The resolver is injected (not imported) to keep the repos->fleet import
+    // one-directional.
+    this.fleetService.repos = (input: any) => this.repoRegistry.resolveLaunchRepo(input);
     // M12e session control (narrow seam, owned by platform-session-api-r2):
     // durable start/send/capture/stop intents over the existing fleet reserve.
     // Placement stays with FleetService; no second dispatcher or consumer here.
     this.sessionControlService = new SessionControlService(this.sql, fn => this.ctx.storage.transactionSync(fn), Date.now, {
       resolveRepo: repo => this.repoRegistry.resolveOrigin(repo),
       reserve: (input, auth) => {
-        const prepared = this.repoRegistry.prepareLaunch(input);
+        const prepared = this.repoRegistry.resolveLaunchRepo(input);
         return prepared.error ? { value: prepared.error, status: 400 } : this.fleetService.reserve(prepared.input, auth);
       },
       wakeMissed: (intakeId, wakeId) => this.intakeWatchdog.enqueueWakeRecovery(intakeId, wakeId),

@@ -21,7 +21,7 @@ Description=Refresh private Hub repository registry
 [Service]
 Type=oneshot
 Environment="HUB_CONFIG_FILE=$HUB_REPO_CONFIG"
-ExecStart="$HUB_REPO_BIN" repos refresh --machine "$HUB_REPO_MACHINE" --root "$HOME/git"
+ExecStart="$HUB_REPO_BIN" repos refresh --machine "$HUB_REPO_MACHINE"
 TimeoutStartSec=1800
 Nice=10
 UMask=0077

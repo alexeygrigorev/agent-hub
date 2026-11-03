@@ -426,6 +426,60 @@ def _path_under_root(path: Path, root: Path) -> bool:
         return False
 
 
+def repo_provisioning_supported() -> bool:
+    """Only advertise effects implemented by this host's OS primitives."""
+    if (os.name != 'posix' or not callable(getattr(os, 'statvfs', None))
+            or not all(hasattr(os, name) for name in ('O_NOFOLLOW', 'O_DIRECTORY', 'killpg'))):
+        return False
+    try:
+        import fcntl
+    except ImportError:
+        return False
+    return callable(getattr(fcntl, 'flock', None))
+
+
+def repo_layout(settings) -> dict:
+    """Resolve clone roots from explicit operator settings, never legacy aliases."""
+    config = settings.get('repos') or {}
+    from .repo_clone_windows import supported as windows_clone_supported
+    if not repo_provisioning_supported() and not windows_clone_supported():
+        return {'checkout_root': None, 'worktree_root': None, 'clone_enabled': False,
+                'clone_filter': config.get('clone_filter', 'blob:none'),
+                'clone_timeout_sec': config.get('clone_timeout_sec', 300)}
+    roots = [Path(r) for r in settings.get('workspace_roots', []) if absolute_workspace_ok(r)]
+    explicit = config.get('checkout_root')
+    candidates = ([explicit] if explicit else config.get('scan_roots') or
+                  [str(r) for r in roots if r.name not in ('worktrees', '.worktrees', 'tmp')])
+    checkout = None
+    for raw in candidates:
+        path = Path(raw)
+        try:
+            if (not path.is_absolute() or not path.is_dir() or path.is_symlink()
+                    or path.resolve() != path or not any(_path_under_root(path, r.resolve()) for r in roots)):
+                continue
+            if os.access(path, os.W_OK | os.X_OK):
+                checkout = path
+                break
+        except (OSError, RuntimeError):
+            continue  # An unavailable configured root cannot advertise clone eligibility.
+    if 'worktree_root' in config:
+        worktree = config['worktree_root']
+    else:
+        worktree = settings.get('repo_worktree_root')
+    return {'checkout_root': checkout, 'worktree_root': Path(worktree) if worktree and repo_provisioning_supported() else None,
+            'clone_enabled': config.get('clone_on_demand', True) is True and checkout is not None,
+            'clone_filter': config.get('clone_filter', 'blob:none'),
+            'clone_timeout_sec': config.get('clone_timeout_sec', 300)}
+
+
+def repo_capabilities(settings) -> dict:
+    layout = repo_layout(settings)
+    return {'repo_checkout_root': str(layout['checkout_root']) if layout['checkout_root'] else None,
+            'repo_clone_enabled': layout['clone_enabled'],
+            'repo_worktree_root': str(layout['worktree_root']) if layout['worktree_root'] else None}
+
+
+
 def _workspace_roots(settings) -> list[str]:
     roots: list[str] = list(settings.get("workspace_roots") or [])
     # Repo-identity checkouts live under the host work root (intake 8028bb06).
@@ -448,6 +502,8 @@ def _workspace_roots(settings) -> list[str]:
                     roots.append(str(parent.parent))
             except Exception:
                 continue
+    layout = repo_layout(settings)
+    roots.extend(str(layout[key]) for key in ('checkout_root', 'worktree_root') if layout[key])
     seen: set[str] = set()
     out: list[str] = []
     for root in roots:
@@ -538,6 +594,342 @@ def register_capabilities_within_budget(caps, roots, budget=REGISTER_CAPABILITIE
         dropped.append('jobs')
     return bounded, {'before': before, 'after': _capabilities_json_size(bounded),
                      'dropped': dropped}
+
+
+_GH_AUTH_LOCK = threading.Lock()
+_GH_AUTH_CACHE: tuple[float, bool] | None = None
+
+
+def gh_auth_ok() -> bool:
+    """Probe the native CLI without reading or retaining any credentials/output."""
+    global _GH_AUTH_CACHE
+    with _GH_AUTH_LOCK:
+        now = time.monotonic()
+        if _GH_AUTH_CACHE is not None and 0 <= now - _GH_AUTH_CACHE[0] < 300:
+            return _GH_AUTH_CACHE[1]
+        try:
+            result = subprocess.run(['gh', 'auth', 'status', '--hostname', 'github.com'],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    timeout=15, check=False)
+            ok = result.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            ok = False
+        _GH_AUTH_CACHE = (time.monotonic(), ok)
+        return ok
+
+
+def offered_repo_checkout(settings, offer) -> Path | None:
+    """Validate provisioning against explicit local roots before filesystem effects."""
+    provision = offer.get('repo_provision')
+    if provision is None:
+        return None
+    if not isinstance(provision, dict) or provision.get('mode') not in ('existing', 'clone_on_demand'):
+        raise ValueError('repo_checkout_missing')
+    name = provision.get('name')
+    if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', name):
+        raise ValueError('repo_checkout_missing')
+    raw = provision.get('checkout_path', offer.get('workspace'))
+    if not isinstance(raw, str) or not Path(raw).is_absolute():
+        raise ValueError('repo_checkout_missing')
+    checkout = Path(raw)
+    if provision['mode'] == 'clone_on_demand':
+        root_raw = provision.get('workspace_root')
+        if not isinstance(root_raw, str) or not Path(root_raw).is_absolute():
+            raise ValueError('repo_checkout_missing')
+        root = Path(root_raw).resolve(strict=True)
+        allowed = [Path(r).resolve() for r in settings.get('workspace_roots', [])]
+        if not any(_path_under_root(root, r) for r in allowed) or str(root) != root_raw or checkout != root / name or checkout.is_symlink():
+            raise ValueError('repo_checkout_missing')
+    else:
+        checkout = resolve_workspace_path(settings, raw)
+    worktree_root = provision.get('worktree_root')
+    if worktree_root is not None:
+        layout_root = repo_layout(settings)['worktree_root']
+        if not layout_root or worktree_root != str(layout_root) or provision.get('session_id') != offer.get('id'):
+            raise ValueError('repo_worktree_root_unconfigured')
+        root = Path(worktree_root).resolve()
+        if str(root) != worktree_root or root not in [Path(r).resolve() for r in settings.get('cleanup_roots', [])]:
+            raise ValueError('repo_worktree_root_unconfigured')
+        expected = root / ('hub-' + offer['id']) / name
+        if str(expected) != offer.get('workspace') or expected.parent.is_symlink() or expected.is_symlink():
+            raise ValueError('repo_worktree_root_unconfigured')
+    elif str(checkout) != offer.get('workspace'):
+        raise ValueError('repo_checkout_missing')
+    return checkout
+
+
+def _check_repo_disk(paths, disk_floor_gb, *, cloning, disk_state='ok'):
+    from .disk_monitor import DEFAULT_WARN_PERCENT, DEFAULT_CRITICAL_PERCENT
+    for raw in paths:
+        if raw is None:
+            continue
+        path = Path(raw)
+        while not path.exists() and path.parent != path:
+            path = path.parent
+        vfs = os.statvfs(path)
+        used = vfs.f_blocks - vfs.f_bfree
+        total = used + vfs.f_bavail
+        if vfs.f_blocks <= 0 or total <= 0:
+            raise ValueError('host_disk_warn_no_clone' if cloning else 'host_disk_critical')
+        percent = used * 100 / total
+        free_gb = vfs.f_bavail * vfs.f_frsize / (1024 ** 3)
+        inodes = getattr(vfs, 'f_files', 0)
+        inode_free = 100 * getattr(vfs, 'f_favail', inodes) / inodes if inodes > 0 else 100
+        if disk_state == 'critical' or percent >= DEFAULT_CRITICAL_PERCENT or inode_free < 5:
+            raise ValueError('host_disk_critical')
+        if cloning and (disk_state != 'ok' or percent >= DEFAULT_WARN_PERCENT or inode_free < 10 or free_gb < disk_floor_gb):
+            raise ValueError('host_disk_warn_no_clone')
+
+
+def verify_repo_origin(checkout: Path, origin_url: str) -> None:
+    from .repos import origin_name
+    remote = subprocess.run(['git', '-C', str(checkout), 'remote', 'get-url', 'origin'],
+                            capture_output=True, text=True, timeout=15, check=False)
+    expected = origin_url.removeprefix('https://github.com/').removesuffix('.git')
+    if remote.returncode or origin_name(remote.stdout.strip()).lower() != expected.lower():
+        raise ValueError('repo_origin_mismatch')
+
+
+def _run_repo_clone_command(argv, *, timeout):
+    """Bound gh and its Git/credential-helper descendants as one owned group."""
+    import signal
+    try:
+        process = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError as exc:
+        raise ValueError('repo_clone_failed') from exc
+    try:
+        return subprocess.CompletedProcess(argv, process.wait(timeout=timeout))
+    except BaseException as exc:
+        # Kill the whole owned group before the caller removes staging data.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+        if isinstance(exc, subprocess.TimeoutExpired):
+            raise ValueError('repo_clone_failed') from exc
+        raise
+
+
+def guarded_repo_clone(settings, repo: str, origin_url: str, target_dir: str,
+                       *, disk_floor_gb: float, disk_state: str = 'ok', on_created=None) -> Path:
+    """Serialize cold provisioning and publish only a complete Git checkout.
+
+    The target must be an immediate child of an explicit local workspace root.
+    Pre-existing staging directories are refused; new failed staging is removed.
+    Native CLI output is discarded because it may contain credential material.
+    """
+    if os.name == 'nt':
+        from . import repo_clone_windows
+        if not repo_clone_windows.supported():
+            raise ValueError('repo_checkout_missing')
+        layout = repo_layout(settings)
+        if not layout['clone_enabled']:
+            raise ValueError('repo_checkout_missing')
+        normalized = {**settings, 'repos':{**(settings.get('repos') or {}),
+                      'checkout_root':str(layout['checkout_root'])}}
+        return repo_clone_windows.clone(normalized, repo, origin_url, target_dir,
+            disk_floor_gb=disk_floor_gb, disk_state=disk_state, on_created=on_created,
+            auth_ok=gh_auth_ok, verify_origin=verify_repo_origin)
+    if not repo_provisioning_supported():
+        raise ValueError('repo_checkout_missing')
+    import fcntl
+    if not isinstance(repo, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', repo):
+        raise ValueError('repo_checkout_missing')
+    if not isinstance(origin_url, str) or not re.fullmatch(
+            r'(?:https://github\.com/)?[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*', origin_url):
+        raise ValueError('repo_origin_missing')
+    if not isinstance(disk_floor_gb, (int, float)) or isinstance(disk_floor_gb, bool) or not math.isfinite(disk_floor_gb) or disk_floor_gb < 1:
+        raise ValueError('invalid_disk_floor')
+    target = Path(target_dir)
+    if not target.is_absolute() or target.name != repo:
+        raise ValueError('repo_checkout_missing')
+    root = target.parent.resolve(strict=True)
+    trusted = [Path(r).resolve() for r in settings.get('workspace_roots', [])]
+    if not any(_path_under_root(root, r) for r in trusted) or target.is_symlink() or target.parent != root:
+        raise ValueError('repo_checkout_missing')
+    lock = root / ('.hub-clone-' + repo + '.lock')
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError('repo_clone_lock_invalid')
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        if target.exists():
+            if target.is_symlink() or not target.is_dir() or not (target / '.git').exists():
+                raise ValueError('repo_checkout_missing')
+            verify_repo_origin(target, origin_url)
+            _check_repo_disk([root, repo_layout(settings)['worktree_root']], 0, cloning=False)
+            return target
+        layout = repo_layout(settings)
+        if not layout['clone_enabled'] or layout['checkout_root'] != root:
+            raise ValueError('repo_checkout_missing')
+        _check_repo_disk([root, repo_layout(settings)['worktree_root']], disk_floor_gb, cloning=True, disk_state=disk_state)
+        if not gh_auth_ok():
+            raise ValueError('host_gh_auth_unavailable')
+        staging = Path(str(target) + '.tmp.' + str(os.getpid()))
+        if staging.exists() or staging.is_symlink():
+            raise ValueError('repo_clone_staging_exists')
+        import shutil
+        try:
+            layout = repo_layout(settings)
+            clone_args = ['gh', 'repo', 'clone', origin_url, str(staging), '--', '--origin', 'origin', '--no-tags']
+            if layout['clone_filter']:
+                clone_args.append('--filter=' + layout['clone_filter'])
+            result = _run_repo_clone_command(clone_args, timeout=layout['clone_timeout_sec'])
+            if result.returncode != 0 or not staging.is_dir() or staging.is_symlink() or not (staging / '.git').is_dir():
+                global _GH_AUTH_CACHE
+                with _GH_AUTH_LOCK:
+                    _GH_AUTH_CACHE = None
+                if not gh_auth_ok():
+                    raise ValueError('host_gh_auth_unavailable')
+                raise ValueError('repo_clone_failed')
+            # flock serializes Hub writers; refuse any external writer's destination.
+            if target.exists() or target.is_symlink():
+                raise ValueError('repo_clone_target_exists')
+            os.replace(staging, target)
+            if on_created is not None:
+                on_created(target)
+            return target
+        finally:
+            # Only this invocation's newly created staging data is disposable.
+            if staging.is_dir() and not staging.is_symlink():
+                shutil.rmtree(staging)
+    finally:
+        os.close(fd)
+
+
+def _remove_repo_runtime_files(workspace: Path, offer_id: str) -> None:
+    """Remove only the two ingested runtime receipts in a qualified owned tree.
+
+    The caller must first verify the terminal ledger, closed intake, worktree
+    journal identity and absence of live users/locks. Descriptor-relative
+    no-follow traversal keeps worker-authored symlinks outside this effect.
+    """
+    from . import private_fs
+    if not isinstance(offer_id, str) or not LABEL.fullmatch(offer_id):
+        raise ValueError('repo_worktree_journal_invalid')
+    paths = [workspace / '.local' / 'hub-results' / (offer_id + '.json'),
+             workspace / '.local' / ('first-action-hub-' + offer_id + '.json')]
+    for path in paths:
+        try:
+            with private_fs.parent(path, private=False) as anchor:
+                info = os.stat(path.name, dir_fd=anchor, follow_symlinks=False)
+                if not stat.S_ISREG(info.st_mode):
+                    raise ValueError('repo_worktree_metadata_invalid')
+                os.unlink(path.name, dir_fd=anchor)
+        except FileNotFoundError:
+            pass
+    for directory in [workspace / '.local' / 'hub-results', workspace / '.local']:
+        try:
+            with private_fs.parent(directory, private=False) as anchor:
+                os.rmdir(directory.name, dir_fd=anchor)
+        except (FileNotFoundError, OSError):
+            pass  # Nonempty directories and unrelated runtime evidence stay.
+
+
+def create_repo_worktree(settings, checkout: Path, session_id: str, default_branch: str, *, repo_name=None) -> Path:
+    """Create an opt-in dedicated tree without resetting an existing branch.
+
+    An explicit trusted worktree root must also be a configured cleanup root;
+    terminal removal remains subject to the existing custody/clean/merge gates.
+    """
+    if not repo_provisioning_supported():
+        raise ValueError('repo_checkout_missing')
+    import fcntl
+    if not isinstance(session_id, str) or not LABEL.fullmatch(session_id):
+        raise ValueError('dispatch_offer_invalid')
+    if not isinstance(default_branch, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_./-]{0,127}', default_branch):
+        raise ValueError('repo_branch_invalid')
+    layout_root = repo_layout(settings)['worktree_root']
+    root_raw = str(layout_root) if layout_root else None
+    if not isinstance(root_raw, str) or not Path(root_raw).is_absolute():
+        raise ValueError('repo_worktree_root_unconfigured')
+    root = Path(root_raw).resolve()
+    if str(root) != root_raw or root not in [Path(r).resolve() for r in settings.get('cleanup_roots', [])]:
+        raise ValueError('repo_worktree_root_unconfigured')
+    checkout = resolve_workspace_path(settings, str(checkout))
+    name = repo_name if repo_name is not None else checkout.name
+    if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', name):
+        raise ValueError('repo_checkout_missing')
+    _check_repo_disk([checkout, root], 0, cloning=False)
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if root.is_symlink() or root.resolve() != root:
+        raise ValueError('repo_worktree_root_unconfigured')
+    parent = root / ('hub-' + session_id)
+    if parent.is_symlink():
+        raise ValueError('repo_worktree_root_unconfigured')
+    target = parent / name
+    branch = 'hub/' + session_id
+    def remember():
+        from . import private_fs
+        journal = Path(settings.get('journal_dir') or (Path.home() / '.local' / 'agent-hub' / 'journal'))
+        if not journal.is_absolute() or _path_under_root(journal.resolve(), root):
+            raise ValueError('repo_worktree_journal_unconfigured')
+        marker = journal / 'repo-worktrees' / (session_id + '.json')
+        record = {'workspace':str(target), 'checkout':str(checkout), 'branch':branch,
+                  'default_branch':default_branch, 'session_id':session_id}
+        try:
+            existing = json.loads(private_fs.read_bytes(marker, 8192))
+        except FileNotFoundError:
+            existing = None
+        if existing is not None:
+            if existing != record:
+                raise ValueError('repo_worktree_journal_conflict')
+            return
+        private_fs.atomic_write(marker, json.dumps(record).encode(), 8192)
+    def git(args, *, check=True):
+        return subprocess.run(['git', '-C', str(checkout), *args], stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=120, check=check)
+    def ignore_runtime_artifacts():
+        common = subprocess.run(['git', '-C', str(checkout), 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+                                capture_output=True, text=True, timeout=15, check=True).stdout.strip()
+        if not Path(common).is_absolute():
+            raise ValueError('repo_worktree_metadata_invalid')
+        # Append only to a regular exclude file beneath the real Git info dir.
+        # Different session locks may share this file, so serialize its update.
+        info_fd = os.open(Path(common) / 'info', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            exclude_fd = os.open('exclude', os.O_CREAT | os.O_RDWR | os.O_APPEND | os.O_NOFOLLOW,
+                                 0o600, dir_fd=info_fd)
+            try:
+                fcntl.flock(exclude_fd, fcntl.LOCK_EX)
+                if not stat.S_ISREG(os.fstat(exclude_fd).st_mode) or os.fstat(exclude_fd).st_size > 65536:
+                    raise ValueError('repo_worktree_metadata_invalid')
+                data = os.read(exclude_fd, 65537)
+                if b'.local/' not in data.splitlines():
+                    os.write(exclude_fd, (b'\n' if data and not data.endswith(b'\n') else b'') + b'.local/\n')
+                    os.fsync(exclude_fd)
+            finally:
+                os.close(exclude_fd)
+        finally:
+            os.close(info_fd)
+    fd = os.open(root / ('.hub-worktree-' + session_id + '.lock'), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        git(['check-ref-format', '--branch', default_branch])
+        if target.is_symlink():
+            raise ValueError('repo_worktree_exists')
+        if target.exists():
+            listing = subprocess.run(['git', '-C', str(checkout), 'worktree', 'list', '--porcelain'],
+                                     capture_output=True, text=True, timeout=15, check=True)
+            from .session_cleanup import _parse_worktree_list
+            entries = _parse_worktree_list(listing.stdout)
+            if any(e.get('path') == str(target) and e.get('branch') == 'refs/heads/' + branch for e in entries):
+                ignore_runtime_artifacts()
+                remember()
+                return target  # Exact retry never fetches or resets a previously created tree.
+            raise ValueError('repo_worktree_exists')
+        if git(['show-ref', '--verify', '--quiet', 'refs/heads/' + branch], check=False).returncode != 1:
+            raise ValueError('repo_worktree_exists')
+        git(['fetch', '--prune', 'origin', '+refs/heads/' + default_branch + ':refs/remotes/origin/' + default_branch])
+        ignore_runtime_artifacts()
+        parent.mkdir(mode=0o700, exist_ok=True)
+        git(['worktree', 'add', '-B', branch, str(target), 'origin/' + default_branch])
+        remember()
+        return target
+    finally:
+        os.close(fd)
 
 
 def resolve_workspace_path(settings, name: str) -> Path:
@@ -750,8 +1142,28 @@ def load_settings(path=None):
         if path.stat().st_size > 65536:
             raise ValueError("Subscription configuration exceeds 64 KiB")
         data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or set(data) - {"version", "subscriptions", "workspaces", "workspace_roots", "launcher", "aplexer_bin", "capabilities", "max_agents", "cleanup_roots", "native_start_argv", "role_consumer", "role_config", "journal_dir", "git", "git_identity", "opencode_auth", "host_load_factor", "disabled_engines", "disabled_accounts"} or data.get("version") != 1:
+    if not isinstance(data, dict) or set(data) - {"version", "subscriptions", "workspaces", "workspace_roots", "launcher", "aplexer_bin", "capabilities", "max_agents", "cleanup_roots", "native_start_argv", "role_consumer", "role_config", "journal_dir", "git", "git_identity", "opencode_auth", "host_load_factor", "disabled_engines", "disabled_accounts", "repo_worktree_root", "repos"} or data.get("version") != 1:
         raise ValueError("Invalid subscription configuration")
+    if 'repos' in data:
+        repos_config = data['repos']
+        if not isinstance(repos_config, dict) or set(repos_config) - {'scan_roots', 'checkout_root', 'worktree_root', 'clone_on_demand', 'clone_filter', 'clone_timeout_sec', 'max_cached_clones'}:
+            raise ValueError('Invalid repository scan configuration')
+        scan_roots = repos_config.get('scan_roots', [])
+        if not isinstance(scan_roots, list) or len(scan_roots) > 32 or any(
+                not isinstance(root, str) or not root or '\0' in root or not Path(root).expanduser().is_absolute()
+                for root in scan_roots):
+            raise ValueError('Invalid repository scan roots')
+        for field in ('checkout_root', 'worktree_root'):
+            if repos_config.get(field) is not None and not absolute_workspace_ok(repos_config[field]):
+                raise ValueError('Invalid repository layout root')
+        if 'clone_on_demand' in repos_config and type(repos_config['clone_on_demand']) is not bool:
+            raise ValueError('Invalid repository clone policy')
+        if repos_config.get('clone_filter', 'blob:none') not in (None, 'blob:none'):
+            raise ValueError('Invalid repository clone filter')
+        for field, default, high in [('clone_timeout_sec', 300, 900), ('max_cached_clones', 64, 10000)]:
+            value = repos_config.get(field, default)
+            if type(value) is not int or not 1 <= value <= high:
+                raise ValueError('Invalid repository clone limit')
     for key in ('disabled_engines', 'disabled_accounts'):
         values = data.get(key, [])
         if (not isinstance(values, list) or len(values) > 128
@@ -890,6 +1302,26 @@ def load_settings(path=None):
         raise ValueError('Invalid cleanup roots allowlist')
     if len(set(roots)) != len(roots):
         raise ValueError('Invalid cleanup roots allowlist')
+    configured_tree = (data.get('repos') or {}).get('worktree_root')
+    legacy_tree = data.get('repo_worktree_root')
+    if legacy_tree is not None and (not absolute_workspace_ok(legacy_tree) or
+            (not configured_tree and (legacy_tree not in roots or legacy_tree not in data['workspace_roots']))):
+        raise ValueError('Invalid repository worktree root')
+    if configured_tree and data.get('repo_worktree_root') not in (None, configured_tree):
+        raise ValueError('Conflicting repository worktree roots')
+    layout_tree = repo_layout(data)['worktree_root']
+    if layout_tree:
+        worktree_root = str(layout_tree)
+        data['repo_worktree_root'] = worktree_root
+        if worktree_root not in roots:
+            roots.append(worktree_root)
+        data['cleanup_roots'] = roots
+        if worktree_root not in data['workspace_roots']:
+            data['workspace_roots'].append(worktree_root)
+    if data.get('repo_worktree_root') is not None:
+        worktree_root = data['repo_worktree_root']
+        if not isinstance(worktree_root, str) or not Path(worktree_root).is_absolute() or worktree_root not in roots or worktree_root not in data.get('workspace_roots', []):
+            raise ValueError('Invalid repository worktree root')
     from .provisioning import managed_subscriptions
     managed = managed_subscriptions()
     # Managed state is the authoritative installed revision for that account,
@@ -2617,6 +3049,22 @@ class Dispatcher:
             custody = CallerCustody(actor=machine_id, machine_id=machine_id, credential_family=f"host-{machine_id}")
             journal_dir = self.settings.get("journal_dir") or str(Path.home() / ".local" / "agent-hub" / "journal")
             Path(journal_dir).mkdir(parents=True, exist_ok=True)
+            default_branch = 'main'
+            tree = Path(ws_str)
+            root_raw = self.settings.get('repo_worktree_root')
+            if root_raw and tree.parent.parent == Path(root_raw).resolve() and tree.parent.name.startswith('hub-'):
+                session_id = tree.parent.name[4:]
+                if not LABEL.fullmatch(session_id):
+                    raise ValueError('repo_worktree_journal_invalid')
+                from . import private_fs
+                marker = Path(journal_dir) / 'repo-worktrees' / (session_id + '.json')
+                record = json.loads(private_fs.read_bytes(marker, 8192))
+                if record.get('workspace') != ws_str or record.get('branch') != 'hub/' + session_id or record.get('session_id') != session_id:
+                    raise ValueError('repo_worktree_journal_invalid')
+                default_branch = record['default_branch']
+                if _guard.is_locked('git', ws_str) is not False:
+                    return
+                _remove_repo_runtime_files(tree, session_id)
             remove_owned_worktree(
                 custody=custody,
                 journal_dir=journal_dir,
@@ -2627,6 +3075,7 @@ class Dispatcher:
                 claim_holder=machine_id,
                 stop_confirmed=True,
                 linked_intake_open=False,
+                default_branch=default_branch,
             )
         except Exception:
             # Cleanup is best-effort and must not break the reporting flow
@@ -2981,7 +3430,7 @@ class Dispatcher:
         # Validates map membership or workspace_roots / worktrees identity paths.
         # A repo-identity workspace is cloned by this host at dispatch (after the claim).
         from . import repo_workspace
-        if not repo_workspace.decode(offer.get("workspace")):
+        if not repo_workspace.decode(offer.get("workspace")) and offered_repo_checkout(self.settings, offer) is None:
             resolve_workspace_path(self.settings, offer.get("workspace"))
         sub = dict(matches[0])
         if offer.get('mode') == 'headless' and sub.get('launcher_provider') == 'claude' and not sub.get('profile'):
@@ -3389,6 +3838,25 @@ class Dispatcher:
         stages = [('start', time.monotonic())]
         check_live_load(self.settings)
         sub = self._route(offer)
+        checkout = offered_repo_checkout(self.settings, offer)
+        if checkout is not None and offer['repo_provision']['mode'] == 'clone_on_demand':
+            provision = offer['repo_provision']
+            machine = offer.get('machine_id') or self.settings.get('machine_id', 'local')
+            if not isinstance(machine, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', machine):
+                raise ValueError('Invalid offer id')
+            created = []
+            guarded_repo_clone(self.settings, provision['name'], provision.get('origin_url'), str(checkout),
+                               disk_floor_gb=(offer.get('resource_management') or {}).get('disk_floor_gb'), on_created=created.append)
+            from .repos import scan_single
+            row = scan_single(checkout, machine, default_branch=provision.get('default_branch') or 'main', cloned_on_demand=bool(created))
+            self._preclaim_check(offer['id'], self.request, 'POST', '/api/repos/refresh', {'repos':[row]})
+        elif checkout is not None and offer['repo_provision'].get('origin_url'):
+            verify_repo_origin(checkout, offer['repo_provision']['origin_url'])
+        if checkout is not None and offer['repo_provision'].get('worktree_root'):
+            created = create_repo_worktree(self.settings, checkout, offer['id'], offer['repo_provision'].get('default_branch'),
+                                           repo_name=offer['repo_provision']['name'])
+            if str(created) != offer['workspace']:
+                raise ValueError('repo_worktree_root_unconfigured')
         device_auth = self.settings.get('opencode_auth') if sub.get('launcher_provider') == 'opencode' else None
         if not device_auth and sub.get('launcher_provider') == 'opencode' and sub.get('account_label') in getattr(self, '_managed_labels', ()):
             try:
@@ -5110,7 +5578,10 @@ class Dispatcher:
         info = system.get_system_info()
         caps = info['capabilities']
         caps.update(engines=sorted({s.get('engine', s['service']) for s in self.settings['subscriptions']}),
-                    workspaces=advertised_workspaces(self.settings), cpu_count=os.cpu_count())
+                    workspaces=advertised_workspaces(self.settings), cpu_count=os.cpu_count(),
+                    workspace_roots=_workspace_roots(self.settings), gh_auth_ok=gh_auth_ok())
+        caps['gh_authenticated'] = caps['gh_auth_ok']
+        caps.update(repo_capabilities(self.settings))
         caps['fleet_modes'] = ['interactive'] + (['headless'] if self.settings.get('launcher') else [])
         caps['launcher_resources'] = bool(self.settings.get('launcher'))
         caps['repo_workspaces'] = True  # intake 8028bb06: clones repo-identity workspaces itself
