@@ -33,6 +33,11 @@ async function loadSessionPages() {
   const cursors = new Set();
   let cursor = null;
   let activeCount;
+  let truncated = false;
+  let pages = 0;
+  // Intake 94186660: hard client cap — the live view never walks unbounded
+  // history; older rows stay behind Load more / cursor pages.
+  const MAX_PAGES = 10;
   do {
     const params = new URLSearchParams({ limit: '100' });
     if (!showAll) params.set('live', '1');
@@ -46,11 +51,13 @@ async function loadSessionPages() {
       }
     }
     cursor = page.next_cursor || null;
+    pages++;
+    if (cursor && pages >= MAX_PAGES) { truncated = true; break; }
     if (showAll) break; // Finished history remains available through Load more.
     if (cursor && cursors.has(cursor)) throw new Error('Session list pagination repeated a cursor');
     if (cursor) cursors.add(cursor);
   } while (cursor);
-  return { sessions, next_cursor: cursor, active_count: activeCount };
+  return { sessions, next_cursor: cursor, active_count: activeCount, truncated };
 }
 let selectedSessionId = null;
 let detailPollTimer = null;
@@ -977,7 +984,8 @@ async function loadData() {
     if (selectedSessionId) {
       await refreshSessionDetail(selectedSessionId);
     }
-    status.textContent = `Authenticated · ${activeCount ?? cachedSessions.length} active · ${cachedSessions.length} loaded`;
+    status.textContent = `Authenticated · ${activeCount ?? cachedSessions.length} active · ${cachedSessions.length} loaded` +
+      (sessionsData.truncated ? ' · list capped at 1000, older rows via Load more' : '');
   } catch (err) {
     status.textContent = 'Sessions could not be refreshed.';
     updateView();

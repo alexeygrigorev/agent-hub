@@ -89,7 +89,7 @@
     dialog.append(form);
     dialog.addEventListener('click', event => { if (event.target === dialog) dialog.close(); });
     document.body.append(dialog);
-    fetch('/api/fleet', { credentials: 'same-origin', cache: 'no-store' }).then(r => r.ok ? r.json() : null).then(data => {
+    fetch('/api/fleet?sections=machines', { credentials: 'same-origin', cache: 'no-store' }).then(r => r.ok ? r.json() : null).then(data => {
       const select = machine.querySelector('select');
       for (const host of data?.machines || []) { const option = document.createElement('option'); option.value = host.id; option.textContent = host.name ? `${host.name} · ${host.id}` : host.id; select.append(option); }
     }).catch(() => {});

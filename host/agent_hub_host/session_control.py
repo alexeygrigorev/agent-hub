@@ -266,6 +266,35 @@ def request(method, path, payload=None):
         raise http_error(exc, key=payload_key) from None
 
 
+def fetch_fleet_snapshot(limit=500, max_pages=20):
+    """GET /api/fleet with server-side sessions pagination walked client-side.
+
+    Intake 94186660: sessions are keyset-paged (small default page); walk all
+    pages so `hub fleet` keeps full output. Older servers ignore the params
+    and return one full page without a cursor (the loop ends after one fetch).
+    """
+    from urllib.parse import quote as _quote
+    result = request('GET', '/api/fleet?sessions_limit=%d' % max(1, min(500, limit)))
+    if not isinstance(result, dict):
+        return result
+    merged = list(result.get('sessions') or [])
+    cursor = result.get('sessions_cursor_next')
+    seen = set()
+    pages = 1
+    while cursor and pages < max_pages and cursor not in seen:
+        seen.add(cursor)
+        nxt = request('GET', '/api/fleet?sessions_limit=%d&sessions_cursor=%s'
+                      % (max(1, min(500, limit)), _quote(str(cursor), safe='')))
+        if not isinstance(nxt, dict):
+            break
+        merged.extend(nxt.get('sessions') or [])
+        cursor = nxt.get('sessions_cursor_next')
+        pages += 1
+    result['sessions'] = merged
+    result.pop('sessions_cursor_next', None)
+    return result
+
+
 def read_file(path, limit=MAX_BODY, max_chars=None, field='Input'):
     try:
         if path == '-':

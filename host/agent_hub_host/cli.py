@@ -836,7 +836,9 @@ def main():
                         sys.exit(1)
                     return
                 else:
-                    result = session_control.request('GET', '/api/fleet')
+                    # Intake 94186660: sessions are keyset-paged server-side;
+                    # walk all pages so `hub fleet` keeps full output.
+                    result = session_control.fetch_fleet_snapshot()
             elif args.cmd in ('fleet-reservations', 'fleet-capacity-history'):
                 from urllib.parse import quote, urlencode
                 if args.cmd == 'fleet-reservations':

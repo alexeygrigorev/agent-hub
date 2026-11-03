@@ -3205,7 +3205,9 @@ def engine_update_command(args):
         if canary_host:
             rest = []
             try:
-                fleet = bus._do_request('GET', '/api/fleet')
+                # Intake 94186660: the canary gate only needs the machine
+                # list; ask for that section instead of the full fleet page.
+                fleet = bus._do_request('GET', '/api/fleet?sections=machines')
                 rest = [m.get('id') for m in fleet.get('machines', [])
                         if isinstance(m, dict) and m.get('id') and m.get('id') != canary_host]
             except Exception:
