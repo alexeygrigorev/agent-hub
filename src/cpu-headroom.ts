@@ -12,6 +12,8 @@ export interface CpuConfig {
 }
 /** A host is CPU-full only when measured busy CPU averaged over >=10s reaches this (Alexey t2362u-t2363u; never from load average). */
 export const CPU_SATURATED_PCT = 98;
+/** MemAvailable below this leaves too little host-wide memory headroom. */
+export const MEMORY_PRESSURE_FLOOR_MB = 2048;
 const finite = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0;
 export function sanitizeCpuAdmission(value:any):Record<string,any>|null {
   const required=['expected_cpu_cores','ramping_cpu_cores','limit_cpu_cores','target_utilization'];
@@ -43,9 +45,12 @@ export function sanitizeCpuUsage(value: any): CpuUsage | null {
     host_oom_kills_delta:Number.isSafeInteger(value.host_oom_kills_delta)&&value.host_oom_kills_delta>=0&&value.host_oom_kills_delta<=1e9 ? value.host_oom_kills_delta : null,
     observed_at:value.observed_at,interval_s:finite(value.interval_s)&&value.interval_s>0&&value.interval_s<=180 ? value.interval_s : null};
 }
-export function cpuVerdict(raw: unknown, cores: number, expected: number, ramping: number, config: CpuConfig, now: number) {
+export function cpuVerdict(raw: unknown, cores: number, expected: number, ramping: number, config: CpuConfig, now: number,
+  memAvailableMb: number | null = null, memoryFloorMb = MEMORY_PRESSURE_FLOOR_MB, memObservedAt: string | null = null) {
   const usage = sanitizeCpuUsage(raw);
   const fresh=usage&&now-Date.parse(usage.observed_at)<=180000&&now-Date.parse(usage.observed_at)>=-30000;
+  const memoryAt = typeof memObservedAt === 'string' ? Date.parse(memObservedAt) : NaN;
+  const freshMemory = Boolean(fresh) || (Number.isFinite(memoryAt) && now-memoryAt<=180000 && now-memoryAt>=-30000);
   const known=fresh&&usage.cores===cores&&usage.busy_cores!==null&&usage.interval_s!==null&&finite(expected)&&finite(ramping);
   const numbers = {current_cpu_cores:known ? usage.busy_cores : null,expected_cpu_cores:expected,
     ramping_cpu_cores:ramping,limit_cpu_cores:cores * config.cpu_target_utilization,
@@ -61,7 +66,10 @@ export function cpuVerdict(raw: unknown, cores: number, expected: number, rampin
     advisory:known ? null : 'cpu_usage_unknown'};
   const reason = known && usage.busy_percent_window!==null && usage.busy_percent_window>=CPU_SATURATED_PCT ? 'cpu_pressure'
     : fresh && usage.psi_full_avg10!==null && usage.psi_full_avg10 > config.cpu_psi_full_hard_cap_pct ? 'cpu_pressure'
-    : fresh && usage.memory_psi_full_avg10!==null && usage.memory_psi_full_avg10 > config.memory_psi_full_hard_cap_pct ? 'memory_pressure'
+    : freshMemory && finite(memAvailableMb) && memAvailableMb < memoryFloorMb ? 'memory_pressure'
+    // PSI is a secondary signal: only a high 10-second full-stall average can
+    // refuse a host when the primary MemAvailable reading is not low.
+    : fresh && usage.memory_psi_full_avg10!==null && usage.memory_psi_full_avg10 >= Math.max(10, config.memory_psi_full_hard_cap_pct) ? 'memory_pressure'
     : fresh && (usage.host_oom_kills_delta ?? 0)>0 ? 'host_oom' : null;
   return {...numbers,reason,admitted:reason === null};
 }
