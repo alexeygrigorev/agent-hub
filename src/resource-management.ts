@@ -374,20 +374,35 @@ export class ResourceManagement {
     return this.sql.exec('SELECT expected_cpu_cores,expected_cpu_source FROM resource_cpu_starts WHERE launch_id=?',launch).toArray()[0] ?? null;
   }
   private hostSessionCount(machine: string, excludeLaunch?: string) {
-    const row: any = this.readRows(`SELECT COUNT(*) AS active_sessions FROM (
-      SELECT native_id AS session_key FROM fleet_sessions WHERE machine_id=?
-        AND phase NOT IN ('exited','finished','failed','stopped','dead','refused')
-      UNION
-      SELECT COALESCE(native_id,'launch:'||id) AS session_key FROM fleet_launches WHERE machine_id=?
-        AND state IN ('offered','starting','running','uncertain') AND (? IS NULL OR id<>?)
-    )`, machine, machine, excludeLaunch ?? null, excludeLaunch ?? null)[0];
-    const count = Number(row?.active_sessions);
-    return Number.isSafeInteger(count) && count >= 0 ? count : 0;
+    const raw:any[]=[];
+    const terminal=['dead','exited','failed','finished','refused','stopped'];
+    // Seek the disjoint live phase ranges of the deployed machine/phase
+    // index. No NOT IN filter may walk retained terminal phases first.
+    for(let i=0;i<=terminal.length;i++) {
+      const remaining=129-raw.length;if(remaining<=0)break;
+      const lower=i?terminal[i-1]:null,upper=i<terminal.length?terminal[i]:null;
+      raw.push(...this.readRows(`SELECT native_id AS session_key FROM fleet_sessions INDEXED BY fleet_session_machine_phase
+        WHERE machine_id=? ${lower!==null?'AND phase>?':''} ${upper!==null?'AND phase<?':''}
+        ORDER BY phase,rowid LIMIT ?`,machine,...(lower!==null?[lower]:[]),...(upper!==null?[upper]:[]),remaining));
+    }
+    if(raw.length>128)return null;
+    const keys=new Set(raw.map(row=>String(row.session_key)));
+    let scanned=raw.length;
+    for(const state of ['offered','starting','running','uncertain']) {
+      const remaining=129-scanned;if(remaining<=0)return null;
+      const page=this.readRows(`SELECT id,native_id FROM fleet_launches INDEXED BY fleet_launch_machine_state
+        WHERE machine_id=? AND state=? ORDER BY rowid LIMIT ?`,machine,state,remaining);
+      scanned+=page.length;if(scanned>128)return null;
+      for(const row of page)if(row.id!==excludeLaunch)keys.add(row.native_id ?? 'launch:'+row.id);
+    }
+    return keys.size;
   }
+
   private hostAdmissionState(machine: string, heartbeat: any, observedAt: unknown, excludeLaunch?: string) {
     const load = Array.isArray(heartbeat?.load) ? heartbeat.load[0] : null;
+    const count=this.hostSessionCount(machine,excludeLaunch);
     return {load1: load, swap_used_percent: heartbeat?.swap_used_percent,
-      observed_at: effectiveHeartbeatAt(this.sql,machine,observedAt), active_sessions: this.hostSessionCount(machine, excludeLaunch)};
+      observed_at: effectiveHeartbeatAt(this.sql,machine,observedAt),active_sessions:count,active_sessions_limited:count===null};
   }
   cpuHeadroom(machine: string, input: any = {}, excludeLaunch?: string) {
     return this.withHistory(() => this.cpuHeadroomFromHistory(machine, input, excludeLaunch));
@@ -462,7 +477,7 @@ export class ResourceManagement {
     const m:any=this.readRows('SELECT last_heartbeat,last_checkin_at,capabilities FROM machines WHERE id=?',machine)[0];
     const heartbeat=parse(effectiveHeartbeat(this.sql,machine,m?.last_heartbeat));
     const verdict=cpuVerdict(heartbeat.cpu_usage,parse(m?.capabilities).cpu_count,0,0,config,now,heartbeat.mem_avail_mb,effectiveFloorMb(config,heartbeat.mem_total_mb),heartbeat.at ?? heartbeat.launcher_resources?.observed_at ?? heartbeat.gate?.at ?? null,
-      this.hostAdmissionState(machine,heartbeat,m?.last_checkin_at));
+      {load1:heartbeat.load?.[0],swap_used_percent:heartbeat.swap_used_percent,observed_at:effectiveHeartbeatAt(this.sql,machine,m?.last_checkin_at)});
     return this.chokingState(machine,now,config,verdict.reason).resource_choking;
   }
   /** Watchdog-poll path: the choking evidence window is time-based, so this

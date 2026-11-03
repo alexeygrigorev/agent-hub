@@ -1,3 +1,4 @@
+import { jobLeaseName } from './auth/job-credential';
 import { externalRootBlocks } from './root-incumbent';
 import { effectiveHost } from './registry';
 import { registryNameSql } from './agent_registry';
@@ -761,7 +762,7 @@ export class JobsService {
         return null;
       }
       if (!['claimed','running'].includes(job.status)) return null;
-      const leaseName = job.role_name || 'root';
+      const leaseName = jobLeaseName(job);
       const lease: any = this.sql.exec('SELECT * FROM leases WHERE name=?', leaseName).toArray()[0];
       if (!lease || lease.holder_job_id!==id || lease.epoch!==job.lease_epoch) return null;
       const expiry = parseExpiryMs(lease.expires_at), firstAction = job.status==='claimed' && !job.started_at ? parseExpiryMs(lease.acquired_at) : null;

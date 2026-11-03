@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS session_deliveries (
   delivered_at TEXT,
   UNIQUE(source_id, delivery_key)
 );
+CREATE INDEX IF NOT EXISTS session_deliveries_command_queued ON session_deliveries(command_id) WHERE status='queued';
 CREATE INDEX IF NOT EXISTS session_deliveries_due ON session_deliveries(status, next_attempt_at);
 CREATE INDEX IF NOT EXISTS session_deliveries_queued_order ON session_deliveries(status, updated_at);
 CREATE INDEX IF NOT EXISTS session_deliveries_active_source ON session_deliveries(status, source, source_id);
@@ -642,7 +643,7 @@ export class WebhookService {
    * refusal failures, so a webhook that arrives while the session is down or
    * busy is still delivered when it comes back. */
   private absenceError(error: string): boolean {
-    if (['target_not_found', 'session_not_bound', 'queue_full', 'session_queue_full', 'command_lost',
+    if (['target_not_found', 'session_not_bound', 'queue_full', 'session_queue_full',
       'failed:recipient_not_ready', 'send_transport_error'].includes(error)) return true;
     if (error.startsWith('uncertain:recipient_not_ready')) return true;
     return /^send_(404|409|429|503):/.test(error) || /^send_(404|409|429|503)$/.test(error);
@@ -657,7 +658,7 @@ export class WebhookService {
       } catch { /* narrow standalone WebhookService fixtures have no driver table */ }
     }
     const waitForSession = (delivery.source === 'driver' || isDriverSchedule) && this.absenceError(error);
-    const maxAttempts = waitForSession ? Number.MAX_SAFE_INTEGER
+    const maxAttempts = waitForSession ? ABSENCE_MAX_ATTEMPTS
       : this.absenceError(error) ? ABSENCE_MAX_ATTEMPTS : MAX_ATTEMPTS;
     this.txn(() => {
       const attempts = Number(delivery.attempts || 0) + 1;
@@ -726,7 +727,7 @@ export class WebhookService {
       : this.sql.exec("SELECT * FROM session_deliveries WHERE status = 'queued' ORDER BY updated_at LIMIT ?", this.maxBatch)).toArray() as any[];
     for (const delivery of queued) {
       const command: any = delivery.command_id
-        ? this.sql.exec('SELECT state, ack_json FROM session_control_commands WHERE id = ?', delivery.command_id).toArray()[0]
+        ? this.sql.exec('SELECT state,ack_json,created_at FROM session_control_commands WHERE id = ?', delivery.command_id).toArray()[0]
         : null;
       if (!command) {
         // Command row vanished (retention/cleanup): redeliver with a fresh attempt.
@@ -748,7 +749,11 @@ export class WebhookService {
         this.retryOrFailed(delivery, ack.reason ? `${ack.outcome}:${ack.reason}` : ack.outcome);
         continue;
       }
-      // Still recorded/transported/claimed: wait for the host ack ledger.
+      // One original command deadline, not a perpetual one-minute ACK poll.
+      const queuedAt=Date.parse(command.created_at);
+      if(!Number.isFinite(queuedAt)||nowMs>=queuedAt+600000) { this.retryOrFailed(delivery,'command_ack_timeout'); continue; }
+      // A known command ACK mutation wakes this entity early via its indexed
+      // command_id producer; otherwise the only alarm is the fixed deadline.
     }
 
     // 2. Pending deliveries due now: resolve target and enqueue a send command.
@@ -798,6 +803,7 @@ export class WebhookService {
       if (result.status === 200 || result.status === 201) {
         this.txn(() => this.transition(delivery.id, {
           status: 'queued', session_id: session.id, command_id: result.json?.command_id ?? null, last_error: null,
+          next_attempt_at:new Date(nowMs+600000).toISOString(),
         }, 'pending'));
         continue;
       }
@@ -812,11 +818,14 @@ export class WebhookService {
     }
 
     if (deliveryId) {
-      const delivery: any=this.sql.exec('SELECT status,next_attempt_at FROM session_deliveries WHERE id=?',deliveryId).toArray()[0];
+      const delivery: any=this.sql.exec('SELECT status,next_attempt_at,command_id FROM session_deliveries WHERE id=?',deliveryId).toArray()[0];
       if (delivery?.status==='queued') {
-        const retry=nowMs+60000;
-        this.sql.exec("UPDATE session_deliveries SET next_attempt_at=? WHERE id=? AND status='queued'",new Date(retry).toISOString(),deliveryId);
-        return retry;
+        const command:any=delivery.command_id?this.sql.exec('SELECT created_at FROM session_control_commands WHERE id=?',delivery.command_id).toArray()[0]:null;
+        const queuedAt=Date.parse(command?.created_at);
+        const deadline=Number.isFinite(queuedAt)?queuedAt+600000:nowMs+15000;
+        const at=new Date(deadline).toISOString();
+        if(delivery.next_attempt_at!==at)this.sql.exec("UPDATE session_deliveries SET next_attempt_at=? WHERE id=? AND status='queued'",at,deliveryId);
+        return deadline;
       }
       if (delivery?.status==='pending') {
         const due=delivery.next_attempt_at===null?nowMs:Date.parse(delivery.next_attempt_at);

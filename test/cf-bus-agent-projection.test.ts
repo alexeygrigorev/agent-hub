@@ -42,7 +42,7 @@ describe('request-owned sparse bus identity projection',()=>{
     }
     expect(send().id).toBeTruthy();
     expect(raw.exec('SELECT COUNT(*) AS n FROM messages').one().n).toBe(1);
-    raw.exec("INSERT INTO agents(tag,project,role,machine_id) VALUES('second-reviewer','project','reviewer','foreign')");
+    hub.sql.exec("INSERT INTO agents(tag,project,role,machine_id) VALUES('second-reviewer','project','reviewer','foreign')");
     expect(bus.validateRecipient('role:reviewer')).toBe(false); // never picks one shared role holder
   }));
 

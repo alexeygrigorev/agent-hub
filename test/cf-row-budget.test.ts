@@ -286,6 +286,32 @@ describe('durable daily SQL row circuit breaker', () => {
     await expect(new RowBudget(store,()=>0).begin()).rejects.toThrow(RowBudgetExceeded);
   });
 
+  it('charges a cold current-day KV lookup even when it loads yesterday’s stopped ledger', async () => {
+    const store=new MemoryStore();
+    store.data.set('cf_daily_row_budget_v1',{day:0,read:19000,written:999,stopped:true});
+    const budget=new RowBudget(store,()=>86400001);
+    await budget.begin();await budget.releaseUnused();
+    const persisted=[...store.data.values()][0] as any;
+    expect(persisted.day).toBe(1);expect(persisted.stopped).toBe(false);
+    expect(persisted.read).toBe(1);expect(persisted.written).toBe(2);
+    expect(store.reads).toBe(1);
+  });
+
+  it('completes a bounded500-row request within one normal prepaid block', async () => {
+    const store=new MemoryStore(),budget=new RowBudget(store,()=>0);
+    await budget.begin();
+    expect(budget.status().available_total).toBe(4096);
+    const sql=budget.wrap(nativeSql(500,2) as any);
+    expect(sql.exec('SELECT bounded_indexed_page').toArray()).toHaveLength(500);
+    budget.wrap(nativeSql(0,0,100) as any).exec('UPDATE bounded_followup');
+    expect(budget.status().stopped).toBe(false);
+    expect(store.writes).toBe(1);
+    await budget.releaseUnused();
+    const persisted=[...store.data.values()][0] as any;
+    expect(persisted.read+persisted.written).toBe(1103);
+    expect(persisted.read+persisted.written).toBeLessThan(20000);
+  });
+
   it('borrows unused prepaid directions for constructor work without raising the combined reservation', async () => {
     const store=new MemoryStore(),budget=new RowBudget(store,()=>0);
     await budget.begin(true);
@@ -310,8 +336,8 @@ describe('durable daily SQL row circuit breaker', () => {
     await budget.begin(true);
     budget.wrap(nativeSql(0,0,2985) as any).exec('UPDATE bounded_bootstrap');
     await budget.begin();
-    expect(budget.status().available_total).toBe(256);
-    expect(budget.status().reserved_total!).toBeLessThan(4000);
+    expect(budget.status().available_total).toBe(4096);
+    expect(budget.status().reserved_total!).toBeLessThan(8000);
     expect(store.writes).toBe(2);
   });
 

@@ -11,7 +11,10 @@ export const DAILY_COMBINED_ROW_LIMIT = 20_000;
 export const DAILY_ROW_LIMITS = Object.freeze({ read: 20_000, written: 20_000 });
 const DAY_MS = 86_400_000;
 const LEDGER_KEY = 'cf_daily_row_budget_v1';
-const DEFAULT_CHUNK = Object.freeze({ read: 192, written: 64 });
+// Covers a bounded request/queue item, including indexed500-row observations.
+// Smaller blocks cannot interrupt native SQL and would repeatedly deny the
+// same legitimate page. Quiet checkpoints still refund unused reservations.
+const DEFAULT_CHUNK = Object.freeze({ read: 3072, written: 1024 });
 /** Index DDL scans its entire source before exposing cursor counters. Never
  * let a new migration perform that scan against retained large tables. */
 export const INDEX_BUILD_SOURCE_LIMIT = 1000;
@@ -155,6 +158,7 @@ export class RowBudget {
   begin(bootstrap = false): Promise<void> {
     return this.exclusive(async () => {
       const day = this.day();
+      let currentDayLookupRead = 0;
       if (this.ledgerFailure) this.trip('durable budget storage unavailable');
       if (!this.ledger) {
         let stored: Ledger | undefined;
@@ -164,12 +168,14 @@ export class RowBudget {
         this.ledger = stored ?? { day, read: 0, written: 0, stopped: false };
         // KV lookup itself consumes a row; persist it with the next reservation.
         this.debt.read++;
+        currentDayLookupRead = 1;
       }
       if (day < this.ledger.day) this.trip('clock moved behind durable ledger');
       if (day > this.ledger.day) {
         this.ledger = { day, read: 0, written: 0, stopped: false };
         this.credit = { read: 0, written: 0 };
-        this.debt = { read: 0, written: 0 };
+        // The cold lookup happened TODAY even when its stored ledger is old.
+        this.debt = { read: currentDayLookupRead, written: 0 };
         this.stopped = false;
         this.emergencyAlarmDeleted = false;
       }

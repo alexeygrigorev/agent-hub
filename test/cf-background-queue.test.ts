@@ -9,6 +9,8 @@ const withHub = (fn: (hub:any,state:any) => Promise<void>|void) => (runInDurable
   (env as any).HUB.get((env as any).HUB.idFromName('strict-background-' + crypto.randomUUID())), async (hub:any,state:any) => {
     hub.sql.exec('UPDATE root_scheduling SET enabled=0 WHERE id=1');
     hub.backgroundWork.cancel('root-slot');
+    await hub.refreshBackgroundJobs();
+    await state.storage.deleteAlarm();
     await fn(hub,state);
   });
 const intent = (id:string,dueAt:number) => ({id,kind:'job-deadline' as const,dueAt,payload:{entity_id:id}});
@@ -96,6 +98,8 @@ describe('strict indexed background queue', () => {
     await hub.alarm();
     expect(raw.exec("SELECT status FROM jobs WHERE id='following'").one().status).toBe('expired');
     expect(raw.exec("SELECT id FROM hub_background_work WHERE kind='job-deadline'").toArray()).toEqual([]);
+    raw.exec("UPDATE jobs SET status=status,offer_expires_at=offer_expires_at WHERE id='failing'");
+    raw.exec('UPDATE root_scheduling SET enabled=enabled WHERE id=1');
     hub.backgroundWork.initEntityProducers(); // restoration is once-only, not a retry loop
     expect(raw.exec("SELECT id FROM hub_background_work WHERE kind='job-deadline'").toArray()).toEqual([]);
     raw.exec("UPDATE jobs SET offer_expires_at=? WHERE id='failing'",new Date(now+60000).toISOString());
@@ -109,10 +113,40 @@ describe('strict indexed background queue', () => {
     raw.exec(`INSERT INTO session_control_wakes(id,session_id,actor,request_key,wake_at_ms,wake_at,prompt,state,created_at,updated_at)
       VALUES('failed-wake','wake-owner','test','failed-wake',?,?,'resume','pending',?,?)`,now-1000,at,at,at);
     raw.exec("UPDATE hub_background_work SET attempts=3 WHERE id='session-wake:failed-wake'");
-    await hub.alarm();hub.backgroundWork.initEntityProducers();
+    await hub.alarm();
+    raw.exec("UPDATE session_control_wakes SET state=state,wake_at_ms=wake_at_ms WHERE id='failed-wake'");
+    hub.backgroundWork.initEntityProducers();
     expect(raw.exec("SELECT id FROM hub_background_work WHERE id='session-wake:failed-wake'").toArray()).toEqual([]);
     raw.exec("UPDATE session_control_wakes SET wake_at_ms=? WHERE id='failed-wake'",now+60000);
     expect(raw.exec("SELECT id FROM hub_background_work WHERE id='session-wake:failed-wake'").toArray()).toHaveLength(1);
+  }));
+
+  it('failed root deadlines stay fenced across no-op root flag writes and cold restoration', () => withHub(async(hub,state) => {
+    const raw=state.storage.sql,now=Date.now(),at=new Date(now).toISOString(),future=new Date(now+600000).toISOString();
+    raw.exec(`INSERT INTO jobs(id,kind,idempotency_key,payload,status,created_at,deadline_at,offer_expires_at,actor)
+      VALUES('fenced-root','root-run','fenced-root','{}','offered',?,?,?,'test')`,at,future,at);
+    raw.exec("UPDATE hub_background_work SET attempts=3,due_ms=? WHERE id='job-deadline:fenced-root'",now-1000);
+    await hub.alarm();
+    raw.exec('UPDATE root_scheduling SET enabled=enabled WHERE id=1');
+    raw.exec("UPDATE jobs SET status=status,deadline_at=deadline_at WHERE id='fenced-root'");
+    hub.backgroundWork.initEntityProducers();
+    expect(raw.exec("SELECT id FROM hub_background_work WHERE id='job-deadline:fenced-root'").toArray()).toEqual([]);
+    raw.exec("UPDATE jobs SET deadline_at=? WHERE id='fenced-root'",new Date(now+1200000).toISOString());
+    expect(raw.exec("SELECT id FROM hub_background_work WHERE id='job-deadline:fenced-root'").toArray()).toHaveLength(1);
+  }));
+
+  it('targeted deadlines preserve legacy writer, head, root and generic lease names', () => withHub((hub,state)=>{
+    const raw=state.storage.sql,now=Date.now(),at=new Date(now).toISOString(),future=new Date(now+600000).toISOString(),past=new Date(now-600000).toISOString();
+    for(const [id,kind,payload,name] of [['old-writer','writer-run',{date:'2026-11-04'},'writer:2026-11-04'],['old-head','head-recovery',{project:'project'},'head:project'],['old-root','root-run',{},'root'],['old-job','custom',{},'job:old-job']] as const){
+      raw.exec(`INSERT INTO jobs(id,kind,idempotency_key,payload,status,created_at,deadline_at,actor,lease_epoch)
+        VALUES(?,?,?,?,'claimed',?,?,'test',1)`,id,kind,id,JSON.stringify(payload),at,future);
+      raw.exec(`INSERT INTO leases(name,epoch,holder_job_id,expires_at,acquired_at) VALUES(?,1,?,?,?)
+        ON CONFLICT(name) DO UPDATE SET epoch=1,holder_job_id=excluded.holder_job_id,expires_at=excluded.expires_at,acquired_at=excluded.acquired_at`,name,id,future,past);
+      expect(raw.exec('SELECT due_ms FROM hub_background_work WHERE id=?','job-deadline:'+id).one().due_ms).toBe(Date.parse(past)+300000);
+      expect(hub.jobsService.processBackground(id)).toBe(null);
+      expect(raw.exec('SELECT status FROM jobs WHERE id=?',id).one().status).toBe('failed');
+      expect(raw.exec('SELECT holder_job_id FROM leases WHERE name=?',name).one().holder_job_id).toBe(null);
+    }
   }));
 
   it('known job and lease producers maintain claim deadlines and frozen root offers', () => withHub((hub,state) => {

@@ -1346,7 +1346,7 @@ export class FleetService {
     const recentFailuresByRoute = new Map<string, { n: number; launcher: string[] }>();
     const hostLaunchCounts = new Map<string, { pending: number; running: number }>();
     const routeFailures = (acct: string, machineId: string): { n: number; launcher: string[] } => {
-      const key = acct + ' ' + machineId;
+      const key = acct + '\0' + machineId;
       if (!recentFailuresByRoute.has(key)) {
         let n = 0;
         let launcher: string[] = [];
@@ -2323,7 +2323,7 @@ export class FleetService {
       if ('error' in planned) return response(planned, 400);
       if (workspaces.length > 1) {
         // Merge by (machine, engine, account, profile); a route counts once, with the first plan that accepts it.
-        const keyOf = (c: any) => [c.machine, c.engine, c.account, c.profile ?? ''].join(' ');
+        const keyOf = (c: any) => [c.machine, c.engine, c.account, c.profile ?? ''].join('\0');
         const merged = new Map<string, any>();
         let rejected: any[] = Array.isArray(planned.rejected) ? [...planned.rejected] : [];
         for (const c of planned.candidates ?? []) merged.set(keyOf(c), c);
@@ -2339,7 +2339,7 @@ export class FleetService {
           || a.machine.localeCompare(b.machine) || a.engine.localeCompare(b.engine) || String(a.account ?? '').localeCompare(String(b.account ?? '')));
         // A route accepted under some workspace is not a rejection of the preview.
         const seen = new Set<string>();
-        rejected = rejected.filter(r => { const k = [r.machine, r.engine, r.reason].join(' '); if (seen.has(k)) return false; seen.add(k);
+        rejected = rejected.filter(r => { const k = [r.machine, r.engine, r.reason].join('\0'); if (seen.has(k)) return false; seen.add(k);
           return !list.some(c => c.machine === r.machine && c.engine === r.engine); });
         applyNormalizedScores(list);
         planned = { ...planned, selected: list[0] ?? null, candidates: list, rejected };

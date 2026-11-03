@@ -1,6 +1,6 @@
 /** Request-owned sparse identity subscriptions. Never backfill from alarms or
  * construction, and never infer authority from a partial or overflowed view. */
-import { registryRowSql } from './agent_registry';
+import { registryRowSql, registryAddress } from './agent_registry';
 interface Sql { exec(query:string,...args:any[]):{toArray():any[]}; }
 const PAGE=100,CAP=128;
 export function initBusAgentProjection(sql:Sql):void {
@@ -31,9 +31,9 @@ export function subscribedBusAgents(sql:Sql,kind:'role'|'host',value:string,adva
   let state=sql.exec('SELECT after_rowid,done,overflow FROM bus_agent_subscriptions WHERE key=?',key).toArray()[0];
   if(!state||state.overflow)return null;
   if(!state.done && advance) {
-    const rows=sql.exec(`SELECT rowid AS source_rowid,tag,project,role,machine_id,CASE WHEN ${registryRowSql()} THEN 1 ELSE 0 END AS valid
+    const rows=sql.exec(`SELECT rowid AS source_rowid,tag,project,role,machine_id
       FROM agents WHERE rowid>? ORDER BY rowid LIMIT ${PAGE}`,state.after_rowid).toArray();
-    for(const row of rows) if(row.valid && (kind==='role'?row.role===value:row.machine_id===value&&row.role!=='root'))
+    for(const row of rows) if(registryAddress(row.project?`${row.project}:${row.tag}`:row.tag) && (kind==='role'?row.role===value:row.machine_id===value&&row.role!=='root'))
       sql.exec('INSERT OR IGNORE INTO bus_agent_members VALUES(?,?)',key,row.source_rowid);
     sql.exec('UPDATE bus_agent_subscriptions SET after_rowid=?,done=? WHERE key=?',rows.at(-1)?.source_rowid??state.after_rowid,rows.length<PAGE?1:0,key);
     state=sql.exec('SELECT done,overflow FROM bus_agent_subscriptions WHERE key=?',key).toArray()[0];

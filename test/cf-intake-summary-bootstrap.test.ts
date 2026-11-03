@@ -5,6 +5,8 @@ import { LivenessService } from '../src/liveness';
 const fixture=(fn:(sql:any)=>void)=>(runInDurableObject as any)((env as any).HUB.get((env as any).HUB.idFromName('summary-bounds-'+crypto.randomUUID())),async(_hub:any,state:any)=>fn(state.storage.sql));
 function observe(raw:any){const calls:{query:string;cursor:any}[]=[];return{calls,sql:new Proxy(raw,{get(target,key){if(key==='exec')return(query:string,...args:any[])=>{const cursor=target.exec(query,...args);calls.push({query,cursor});return cursor;};const v=target[key];return typeof v==='function'?v.bind(target):v;}})};}
 const reads=(calls:{cursor:any}[])=>calls.reduce((n,c)=>n+c.cursor.rowsRead,0);
+const metadata=(call:{query:string})=>call.query==='SELECT name,type,sql FROM sqlite_master LIMIT 4097';
+function boundedMetadata(calls:{query:string;cursor:any}[]){const probes=calls.filter(metadata);expect(probes).toHaveLength(1);expect(reads(probes)).toBeLessThanOrEqual(4097);return calls.filter(c=>!metadata(c));}
 describe('retained intake and alert bootstrap uses deployed indexes',()=>{
  it('proves legacy trigger bootstrap without COUNT or rewriting 1270 summaries',()=>fixture(raw=>{
   initIntakeSummary(raw);while(!advanceIntakeSummary(raw)){}
@@ -13,6 +15,9 @@ describe('retained intake and alert bootstrap uses deployed indexes',()=>{
   const o=observe(raw);initIntakeSummary(o.sql);
   expect(o.calls.some(c=>/COUNT\(|INSERT INTO intake_status_summary\([^]*SELECT|DELETE FROM intake_status_summary WHERE id=\?/.test(c.query))).toBe(false);
   expect(raw.exec('SELECT phase FROM intake_summary_migration WHERE id=1').one().phase).toBe(2);
+  expect(reads(boundedMetadata(o.calls))).toBeLessThan(100);
+  o.calls.length=0;initIntakeSummary(o.sql);
+  expect(o.calls.some(metadata)).toBe(false);
   expect(reads(o.calls)).toBeLessThan(100);
  }));
  it('repairs absent-trigger summaries with durable bounded pages and preserves concurrent writes',()=>fixture(raw=>{
@@ -23,7 +28,9 @@ describe('retained intake and alert bootstrap uses deployed indexes',()=>{
   const o=observe(raw);initIntakeSummary(o.sql);
   expect(o.calls.some(c=>/FROM intake_tasks/.test(c.query))).toBe(false);
   advanceIntakeSummary(o.sql);
-  expect(reads(o.calls)).toBeLessThan(200);
+  expect(reads(boundedMetadata(o.calls))).toBeLessThan(200);
+  const repeat=observe(raw);initIntakeSummary(repeat.sql);
+  expect(repeat.calls.some(metadata)).toBe(false); // pending receipt must not be promoted by its newly installed triggers
   expect(raw.exec('SELECT phase FROM intake_summary_migration WHERE id=1').one().phase).toBe(0);
   raw.exec("UPDATE intake_tasks SET data=json_set(data,'$.title','concurrent') WHERE id='page-summary-000'");
   let pages=0;while(!advanceIntakeSummary(raw)){expect(++pages).toBeLessThan(20);}

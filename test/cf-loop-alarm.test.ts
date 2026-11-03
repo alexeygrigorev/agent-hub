@@ -10,6 +10,8 @@ const withHub = (fn: (hub: Hub, state: DurableObjectState) => Promise<void>) =>
     // default is unrelated to the production-disabled root schedule.
     hub.sql.exec('UPDATE root_scheduling SET enabled=0 WHERE id=1');
     (hub as any).backgroundWork?.cancel('root-slot');
+    await (hub as any).refreshBackgroundJobs();
+    await state.storage.deleteAlarm();
     await fn(hub,state);
   });
 
@@ -19,6 +21,8 @@ const plan = (hub: Hub, q: string, ...args: any[]) => (hub.sql.exec('EXPLAIN QUE
 describe('CF runaway alarm regression', () => {
   it('bounds host offer polls and advances past expired prefixes without starving an older live offer', () => withHub(async (hub,state) => {
     const sql=state.storage.sql, now=Date.now();
+    // Historical offer-page fixture predates the128-active-intent admission cap.
+    sql.exec('DROP TRIGGER IF EXISTS hub_background_job_insert');
     for(let i=0;i<221;i++) sql.exec(`INSERT INTO jobs(id,kind,idempotency_key,payload,status,created_at,deadline_at,actor,offer_host_id,offer_machine_id,offer_expires_at)
       VALUES(?,'root-run',?,'{}','offered',?,?,'test','a','a',?)`,
       'poll-'+i,'poll-'+i,new Date(now-i*1000).toISOString(),new Date(now+3600000).toISOString(),new Date(now+(i===220?3600000:-3600000)).toISOString());
@@ -186,7 +190,6 @@ describe('CF runaway alarm regression', () => {
     // Historical manual-sweep fixture predates the new 128-intent admission
     // policy; no producer can create this population in normal operation.
     for(const name of ['hub_background_wake_insert','hub_background_wake_update','hub_background_wake_delete'])raw.exec('DROP TRIGGER IF EXISTS '+name);
-    raw.exec('DROP TRIGGER hub_background_wake_insert');
     raw.exec(`WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<3000)
       INSERT INTO session_control_wakes(id,session_id,actor,request_key,wake_at_ms,wake_at,prompt,state,created_at,updated_at)
       SELECT 'queued-'||i,'no-session','test','queued-'||i,?,?,'resume','queued',?,? FROM n`, now + 3600000, future, at, at);

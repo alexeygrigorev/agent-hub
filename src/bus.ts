@@ -1,5 +1,5 @@
 import { initBusAgentProjection, subscribedBusAgents } from './bus-agent-projection';
-import { initAlertRouting } from './alert-routing';
+import { initAlertRouting, prepareReaderObservation } from './alert-routing';
 import { registryAddress, registryRowSql } from './agent_registry';
 import { validateRef } from './session-messaging';
 /** Older writers could cut a metadata JSON string mid-escape. Keep the
@@ -698,12 +698,11 @@ export class BusService {
       if(this.inboxOffsets.size>=512)this.inboxOffsets.delete(this.inboxOffsets.keys().next().value!);
       this.inboxOffsets.set(key,resume);
     }
-    return this.runInTxn(()=> {
+    let publishReader: (() => void) | undefined;
+    const result = this.runInTxn(()=> {
       if (this.isRecipientPrincipal(caller, actor, now)) {
         if (caller.tokenId) {
-          this.sql.exec(`INSERT INTO bus_reader_activity(recipient, credential_id, last_read_at) VALUES (?, ?, ?)
-            ON CONFLICT(recipient, credential_id) DO UPDATE SET last_read_at=excluded.last_read_at
-            WHERE last_read_at < excluded.last_read_at - 60000`, aliases[0], caller.tokenId, now);
+          publishReader = prepareReaderObservation(this.sql, aliases[0], caller.tokenId, now);
         }
         for (const row of rows) {
           if (row.delivered_at || row.to_session_id) continue;
@@ -714,6 +713,8 @@ export class BusService {
       }
       return {rows,next:truncated?'ib1:'+btoa(JSON.stringify(next)):null,truncated};
     });
+    publishReader?.();
+    return result;
   }
 
   /** Recipient batch read (`hub inbox --mark-read`, §11): only the recipient

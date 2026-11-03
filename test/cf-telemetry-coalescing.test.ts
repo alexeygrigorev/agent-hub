@@ -15,6 +15,7 @@ const fixture=(fn:(x:any)=>Promise<void>|void)=>(runInDurableObject as any)((env
   raw.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,fleet_launch_id,machine_id,engine,mode,state,binding_json,created_at,updated_at)
     VALUES('session','test','control',?,'launch','host','opencode','headless','running',?,?,?)`,JSON.stringify({intake_task_id:'task'}),JSON.stringify({native_id:'native',tag:'agent',workspace:'/repo'}),iso(),iso());
   raw.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,workspace) VALUES('host','native','agent','opencode','running',?,'/repo')",iso());
+  raw.exec("INSERT INTO resource_cpu_starts VALUES('launch',2,'fixture_commitment')");
   const meter=new RowsMeter(()=>now),watch=new WriteWatch(),sql=watch.wrap(meter.wrap(raw));
   const f=new FleetService(sql,fn=>state.storage.transactionSync(fn),()=>now,watch),r=f.resources;r.initCatalogCache();
   const sample=(extra:any={})=>({session_id:'session',native_id:'native',current_rss_mb:200,peak_rss_mb:200,peak_pss_mb:210,current_cpu_cores:1,cpu_seconds:20,runtime_s:100,observed_at:iso(),...extra});
@@ -29,7 +30,7 @@ describe('live telemetry persistence coalescing',()=>{
     for(let i=0;i<60;i++) {
       advance(1000);
       meter.runSync('report-'+i,()=>r.report('host',{samples:[sample({current_rss_mb:100,current_cpu_cores:.5,cpu_seconds:30+i,runtime_s:110+i,peak_rss_mb:250+i})],reaps:[]}));
-      expect(meter.snapshot()['report-'+i].rows_written).toBe(0);
+      expect(meter.snapshot()['report-'+i]?.rows_written??0).toBe(0);
     }
     expect(r.headroom('host').reserved_mb).toBe(412);
     expect(r.cpuHeadroom('host').ramping_cpu_cores).toBe(1.5);
@@ -91,8 +92,7 @@ describe('heartbeat coalescing with live admission overlays',()=>{
     const first=iso();updateHeartbeat('host',heartbeat(3000,0),sql,Date.parse(iso()));
     advance(240000);
     meter.runSync('heartbeat',()=>updateHeartbeat('host',heartbeat(500,85),sql,Date.parse(iso())));
-    expect(meter.snapshot().heartbeat.rows_written).toBe(0);
-    expect(meter.snapshot().heartbeat.rows_read).toBe(0);
+    expect(meter.snapshot().heartbeat).toBeUndefined(); // No SQL cursor was issued.
     const durable=raw.exec("SELECT * FROM machines WHERE id='host'").one();
     expect(durable.last_checkin_at).toBe(first);
     expect(JSON.parse(effectiveHeartbeat(sql,'host',durable.last_heartbeat)!)).toMatchObject({mem_avail_mb:500,swap_used_percent:85});
@@ -200,7 +200,7 @@ describe('bounded offer and dashboard source windows',()=>{
       expect(response.status).toBe(200);
       const body:any=await response.json();
       for(const offer of body.offers){expect(offer.id).toBe('late-retry');expect(offer.claim_key).toBe('same-host-key');found=true;}
-      expect(meter.snapshot()['offer-page-'+i].rows_read).toBeLessThan(1000);
+      expect(meter.snapshot()['offer-page-'+i]?.rows_read??0,JSON.stringify(meter.statementTop(8))).toBeLessThan(1000);
     }
     expect(found).toBe(true);
   }));

@@ -26,7 +26,9 @@ describe('strict queue background dispatch', () => {
     for (const spy of spies) expect(spy).not.toHaveBeenCalled();
     expect(await state.storage.getAlarm()).toBeNull();
     expect(hub.meter.snapshot()['empty-background'].rows_written).toBe(0);
-    expect(hub.meter.snapshot()['empty-background'].rows_read).toBe(0);
+    // Each explicitly invoked alarm may read its single empty index head.
+    // No alarm is scheduled, so a truly idle Hub performs zero such calls.
+    expect(hub.meter.snapshot()['empty-background'].rows_read).toBeLessThanOrEqual(2);
     vi.restoreAllMocks();
   }));
 

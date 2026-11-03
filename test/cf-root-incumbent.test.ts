@@ -7,11 +7,11 @@ const fixture=(fn:(raw:any)=>void)=>(runInDurableObject as any)((env as any).HUB
  raw.exec('DROP TABLE IF EXISTS root_incumbent_candidates');raw.exec('DROP TABLE IF EXISTS root_incumbent_migration');fn(raw);
 });
 function observe(raw:any){const calls:{query:string;cursor:any}[]=[];return{calls,sql:new Proxy(raw,{get(target,key){if(key==='exec')return(query:string,...args:any[])=>{const cursor=target.exec(query,...args);calls.push({query,cursor});return cursor;};const v=target[key];return typeof v==='function'?v.bind(target):v;}})};}
-const insert=(sql:any,tag:string,state='active',machine:string|null=null,lastSeen:string|null=null)=>sql.exec('INSERT INTO agents(project,tag,role,state,health_state,machine_id,last_seen_at) VALUES(?,?,\'root\',?,?,?,?)','root-test',tag,state,state,machine,lastSeen);
+const insert=(sql:any,tag:string,state='active',machine:string|null=null,lastSeen:string|null=null)=>sql.exec('INSERT INTO agents(project,tag,role,state,health_state,machine_id,last_seen_at) VALUES(?,?,\'root\',?,?,?,?)','incumbent-fixture',tag,state,state,machine,lastSeen);
 describe('external root authority without background registry scans',()=>{
  it('blocks until bounded durable rowid backfill has proved the retained source complete',()=>fixture(raw=>{
   raw.exec(`WITH RECURSIVE n(i) AS(SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<2000)
-    INSERT INTO agents(project,tag,role) SELECT 'root-test','worker-'||i,'worker' FROM n`);
+    INSERT INTO agents(project,tag,role) SELECT 'incumbent-fixture','worker-'||i,'worker' FROM n`);
   const o=observe(raw);initRootIncumbentProjection(o.sql);
   expect(externalRootBlocks(o.sql,Date.now())).toBeNull();
   expect(o.calls.some(c=>/FROM agents/.test(c.query))).toBe(false);
@@ -26,7 +26,7 @@ describe('external root authority without background registry scans',()=>{
  }));
  it('maintains root candidates while migration is incomplete, including changed and deleted source rows',()=>fixture(raw=>{
   raw.exec(`WITH RECURSIVE n(i) AS(SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<150)
-    INSERT INTO agents(project,tag,role) SELECT 'root-test','worker-'||i,'worker' FROM n`);
+    INSERT INTO agents(project,tag,role) SELECT 'incumbent-fixture','worker-'||i,'worker' FROM n`);
   initRootIncumbentProjection(raw);
   advanceRootIncumbentProjection(raw);
   raw.exec("UPDATE agents SET role='root',state='active' WHERE tag='worker-1'");
