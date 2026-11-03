@@ -296,11 +296,17 @@ describe('weighted random auto-start (intake 9647e6d5)', () => {
       sub('hub-antigravity', 'gemini', metered(iso(), 45, now));
       sub('shared-go', 'go', broken(iso()));
 
-      // Without a random source the fully unpinned start stays deterministic.
-      const top = fleet.plan({ mode: 'headless', workspace: 'demo', prompt: 'deterministic' }, undefined, () => 0);
+      // Without a random source ordinary daily planning stays deterministic and
+      // keeps Argon deep-only; the random auto-start gets its configured pool.
+      const deterministic = fleet.plan({ mode: 'headless', workspace: 'demo', prompt: 'deterministic' });
+      expect(deterministic.selected, JSON.stringify(deterministic.rejected)).toBeTruthy();
+      expect(deterministic.selected).toBe(deterministic.candidates![0]);
+      expect(deterministic.candidates!.some((candidate: any) => candidate.engine === 'antigravity')).toBe(false);
+
+      const top = fleet.plan({ mode: 'headless', workspace: 'demo', prompt: 'random pool' }, undefined, () => 0);
       expect(top.selected, JSON.stringify(top.rejected)).toBeTruthy();
       expect(top.candidates!.length).toBe(5);
-      expect(top.selected).toBe(top.candidates![0]);
+      expect(top.selected).toBe(top.candidates!.find((candidate: any) => candidate.draw_probability > 0));
       const codexTop: any = top.candidates!.find((candidate: any) => candidate.engine === 'codex');
       const claudeTop: any = top.candidates!.find((candidate: any) => candidate.engine === 'claude');
       expect(codexTop.draw_probability / claudeTop.draw_probability).toBeCloseTo(60 / 35, 5);
