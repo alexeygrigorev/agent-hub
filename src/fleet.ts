@@ -16,7 +16,7 @@ import { RoutingService } from './routing';
 import { ClaimAdmission, sameIntent, sameEditCaller, type EditAuthority, type AdmissionCaller } from './claim_admission';
 import { effectiveCheckin, effectiveRoutesAt } from './registry';
 import { commandChannelHealth } from './command-channel';
-import { taskTier, policy, modelDisabledByPolicy, heavyModelEffortAllowed, deepModelAllowedForTier } from './model-routing';
+import { taskTier, policy, modelDisabledByPolicy, heavyModelEffortAllowed, deepModelAllowedForTier, accountPlanEndDate, accountPlanEndMs } from './model-routing';
 import { isUnmeteredProvider, quotaPositivelyBlocked, unmeteredObservation, QUOTA_SCHEMA_SQL, QUOTA_STALE_MS, LEGACY_ACCOUNT_LABELS, canonicalAccountLabel, canonicalHarness, canonicalQuotaProvider, dedupeAccountsByCanonical, ensureTbmQuotaSchema, legacyRouteKeyFor, snapshotRouteForAccount } from './quota';
 import { evaluateLaunchQuota } from './quota_admission';
 import { adoptObservedNativeSessions, promoteStartedOffers, reconcileUnboundFleetSessions } from './session_control';
@@ -970,6 +970,8 @@ export class FleetService {
     // Canonical placement continues to own its normal maintenance path.
     if (!snapshot) this.reconcileCapacity();
     const now = snapshot?.now ?? this.now();
+    const planEndMs = accountPlanEndMs(String(account.label));
+    const planExpired = planEndMs !== null && now >= planEndMs;
     // Canonical provider model: `codex-orin` is an account under provider
     // `codex`, never a separate provider. Stored rows keyed by old names
     // canonicalize here so grouping by provider shows both Codex accounts.
@@ -1066,16 +1068,18 @@ export class FleetService {
     const placementReasons = new Set<string>();
     if (!routes.length) placementReasons.add('no_routes');
     if (!account.enabled) placementReasons.add('account_disabled');
+    if (planExpired) placementReasons.add('account_expired');
     if (!availableSlots) placementReasons.add('account_concurrency');
     let placeableRoutes = 0;
     for (const route of routes) {
-      if (liveEnginesByMachine.get(String(route.machine_id))?.has(String(route.engine))) {
+      if (!planExpired && liveEnginesByMachine.get(String(route.machine_id))?.has(String(route.engine))) {
         placeableRoutes++;
         placeableMachines.add(String(route.machine_id));
       } else placementReasons.add(liveIds.has(String(route.machine_id)) ? 'engine_unavailable' : 'machine_unavailable');
     }
     return { label: canonicalAccountLabel(account.label), provider, max_concurrency: account.max_concurrency, reserve_percent: account.reserve_percent, enabled: !!account.enabled, supports_goal: GOAL_PROVIDERS.has(provider),
-      remaining_percent: remaining, status: blocked ? 'blocked' : (!observed || (remaining === null && !unmeteredOk) || (!healthy && unknown)) ? 'unknown' : 'ok', active, available_slots: availableSlots,
+      plan_end: accountPlanEndDate(String(account.label)), remaining_percent: remaining,
+      status: planExpired ? 'expired' : blocked ? 'blocked' : (!observed || (remaining === null && !unmeteredOk) || (!healthy && unknown)) ? 'unknown' : 'ok', active, available_slots: availableSlots,
       // Counted vs live: active splits into launch reservations + orphan
       // observed sessions; native_live is the host-catalog verified live
       // process count for this account (includes launch-linked sessions).
@@ -1557,7 +1561,7 @@ export class FleetService {
       else if (Number.isFinite(hb.disk_free_gb) && hb.disk_free_gb < this.resources.config().disk_floor_gb) reason = 'disk_floor';
       else if (request.mode === 'headless' && disk()?.admitted === false) reason = 'launcher_disk_reserve';
       else if (!cpu().admitted) reason = cpu().reason!;
-      else if (!account || account.status === 'blocked') reason = 'account_' + (account?.status || 'unmapped');
+      else if (!account || account.status === 'blocked' || account.status === 'expired') reason = 'account_' + (account?.status || 'unmapped');
       else if (!routeQuota.ok) reason = 'quota_' + routeQuota.reason;
       else if (account.available_slots < 1) reason = 'account_concurrency';
       if (reason) {
@@ -1674,6 +1678,7 @@ export class FleetService {
         degraded: isDegraded,
         tbmWeight: tbm_weight,
         reservePercent: Number(account!.reserve_percent) || 0,
+        planEndMs: accountPlanEndMs(route.account),
         expiryForecast: request.mode !== 'interactive',
         pinnedEngine: request.engine ?? null,
         overrideReason: typeof input.engine_override_reason === 'string' && input.engine_override_reason.trim() ? input.engine_override_reason.trim() : null,
@@ -3318,7 +3323,7 @@ export class FleetService {
           const selectedModel = parsed(row.model_selection_json)?.model;
           if (typeof selectedModel !== 'string' || data.model !== selectedModel) return refuse({ error: 'model_unsupported', detail: 'Host must confirm the resolved model before native launch' }, 409);
           const account: any = this.sql.exec('SELECT * FROM fleet_accounts WHERE label = ?', row.account).toArray()[0];
-          if (!account || this.accountStatus(account).status === 'blocked') return refuse({ error: 'account_unavailable' }, 409);
+          if (!account || ['blocked', 'expired'].includes(this.accountStatus(account).status)) return refuse({ error: 'account_unavailable' }, 409);
           // Re-verify the exact launch route quota inside the atomic claim: no manual override bypass.
           const claimRoute: any = this.sql.exec('SELECT machine_id, profile FROM fleet_routes WHERE machine_id = ? AND account = ?', row.machine_id, row.account).toArray()[0];
           const claimProv = claimRoute ? this.observationProvenance(account, claimRoute) : null;

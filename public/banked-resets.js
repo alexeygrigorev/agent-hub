@@ -21,18 +21,31 @@ async function refresh() {
   const selected = accountSelect.value;
   accountSelect.replaceChildren();
   const container = document.getElementById('accounts');
+  const usageContainer = document.getElementById('reset-usage');
   container.replaceChildren();
+  usageContainer.replaceChildren();
   for (const a of snapshot.accounts) {
     const option = node('option', `${a.label} (${a.provider})`); option.value = a.label;
     accountSelect.append(option);
     const section = document.createElement('section');
     section.append(node('h2', `${a.label} (${a.provider})`));
+    if (a.plan_end) section.append(node('p', `Plan ends: ${a.plan_end}${a.expired ? ' · expired; routing stopped' : ''}`));
     const observation = snapshot.observations.find(o => o.account === a.label);
     section.append(node('p', observation ? `Last recorded: ${berlin(observation.observed_at)} · ${observation.source}` : 'Expiry unknown — record each available grant or confirm none.'));
     const grants = snapshot.grants.filter(g => g.account === a.label);
     for (const g of grants) section.append(node('p', `${g.label} · ${berlin(g.expires_at)} · ${g.source}${g.expires_at <= Date.now() ? ' · expired' : ''}`));
     if (!grants.length && observation) section.append(node('p', 'No available grants recorded.'));
     container.append(section);
+
+    const totals = (snapshot.reset_usage || []).find(item => item.account === a.label);
+    const metric = document.createElement('p');
+    metric.append(node('strong', `${a.label}: `));
+    if (!totals || !totals.observed) {
+      metric.append(document.createTextNode(`verified uses: ${totals?.resets_used_verified ?? 0} · total used, lost, and available unknown (awaiting a complete reset-list observation)`));
+    } else {
+      metric.append(document.createTextNode(`used: ${totals.resets_used} (${totals.resets_used_verified} verified) · lost: ${totals.resets_lost} · available: ${totals.resets_available}`));
+    }
+    usageContainer.append(metric);
   }
   if ([...accountSelect.options].some(o => o.value === selected)) accountSelect.value = selected;
   fillList();

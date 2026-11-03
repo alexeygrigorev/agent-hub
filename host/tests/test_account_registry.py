@@ -47,6 +47,7 @@ class CatalogTest(unittest.TestCase):
         self.assertEqual({"mode": "managed-bundle", "bundle": "shared-codex"},
                          by_account["shared-codex"]["credential"])
         self.assertEqual(["quse", "codex", "--json"], by_account["shared-codex"]["quota_probe"])
+        self.assertEqual("2026-11-13", by_account["codex-orin"]["plan_end"])
         self.assertIsNone(by_account["shared-zai"]["aplexer_profile"])
         self.assertEqual({"mode": "host-home", "path": "~/.zcode"},
                          by_account["shared-zai"]["credential"])
@@ -59,7 +60,9 @@ class CatalogTest(unittest.TestCase):
         for mutate in (lambda a: a.__setitem__("account", "codex-orin"),
                        lambda a: a["credential"].__setitem__("mode", "vault"),
                        lambda a: a.__setitem__("quota_probe", "not-a-list"),
-                       lambda a: a.__setitem__("aplexer_profile", "codex")):
+                       lambda a: a.__setitem__("aplexer_profile", "codex"),
+                       lambda a: a.__setitem__("plan_end", "2026-02-30"),
+                       lambda a: a.__setitem__("plan_end", "2026-2-3")):
             bad = sample_accounts()
             mutate(bad[0])
             with self.assertRaises(ValueError):

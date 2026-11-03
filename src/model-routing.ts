@@ -4,6 +4,47 @@ import { canonicalAccountLabel } from './quota';
 import { burnFactor, burnForecast, burnReleasesExplicitOnly, burnRules } from './burn';
 import { grokDemotion, netHeadroom, pacingFor, providerPreference, resetUrgency, routeScore, type ProviderPacing, type RouteScoreFactors } from './pacing';
 export { policy };
+
+const DAY_MS = 86_400_000;
+
+/** Parse an inclusive YYYY-MM-DD plan end into the next UTC midnight. */
+export function planEndExpiryMs(value: unknown): number | null {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+  const start = Date.parse(`${value}T00:00:00.000Z`);
+  if (!Number.isFinite(start) || new Date(start).toISOString().slice(0, 10) !== value) return null;
+  return start + DAY_MS;
+}
+
+const accountPlanEnds = new Map<string, { date: string; expiresAtMs: number }>();
+for (const entry of (((policy as any).accounts ?? []) as any[])) {
+  const date = typeof entry?.plan_end === 'string' ? entry.plan_end : null;
+  const expiresAtMs = planEndExpiryMs(date);
+  if (typeof entry?.account === 'string' && date && expiresAtMs !== null) {
+    accountPlanEnds.set(canonicalAccountLabel(entry.account), { date, expiresAtMs });
+  }
+}
+
+export function accountPlanEndDate(label: string): string | null {
+  return accountPlanEnds.get(canonicalAccountLabel(label))?.date ?? null;
+}
+
+export function accountPlanEndMs(label: string): number | null {
+  return accountPlanEnds.get(canonicalAccountLabel(label))?.expiresAtMs ?? null;
+}
+
+export function accountPlanExpired(label: string, nowMs: number): boolean {
+  const end = accountPlanEndMs(label);
+  return end !== null && nowMs >= end;
+}
+
+/** Plan-end deadline for reset burning while the subscription is near expiry. */
+export function planEndBurnMode(label: string, nowMs: number): number | null {
+  const end = accountPlanEndMs(label);
+  const horizonDays = Number((policy.rules as any).plan_end_reset_horizon_days);
+  if (end === null || end <= nowMs || !Number.isFinite(horizonDays) || horizonDays <= 0) return null;
+  return end - nowMs <= horizonDays * DAY_MS ? end : null;
+}
+
 const HEAVY_MODEL_IDS = new Set(['sol', 'astra', 'argon', 'argon-gemini']);
 const FORBIDDEN_HEAVY_EFFORTS = new Set(['high', 'max', 'xhigh']);
 // These are the heavy deep-model selectors. Some deep-tier models (for
@@ -60,7 +101,6 @@ export function deepModelAllowedForTier(model: any, tier: unknown, explicitlyReq
   const members: unknown = (policy.tiers as any)[tier as string];
   return (Array.isArray(members) && members.includes(id)) || explicitlyRequested;
 }
-
 /** Case-insensitive literal model-family matches, independent of provider. */
 export function modelDisabledByPolicy(model: any): boolean {
   const values = typeof model === 'string' ? [model] : [model?.id, model?.model];

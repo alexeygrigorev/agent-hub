@@ -69,6 +69,16 @@ class ResetCreditTests(unittest.TestCase):
                 with self.assertRaises(CreditError):
                     native._eligible(snapshot(raw), 'credit-a', NOW)
 
+    def test_plan_end_burn_mode_allows_longer_lived_credit_only_before_deadline(self):
+        raw = view()
+        raw['rateLimitResetCredits']['credits'][0]['expiresAt'] = NOW + 3 * 86400
+        clean = snapshot(raw)
+        with self.assertRaisesRegex(CreditError, 'not_expiring'):
+            native._eligible(clean, 'credit-a', NOW)
+        native._eligible(clean, 'credit-a', NOW, plan_end_deadline=NOW + 86400)
+        with self.assertRaisesRegex(CreditError, 'not_expiring'):
+            native._eligible(clean, 'credit-a', NOW, plan_end_deadline=NOW)
+
     def test_healthy_quota_not_reset(self):
         for used in (0, 1, 84):
             with self.subTest(used=used):
