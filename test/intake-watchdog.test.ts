@@ -115,7 +115,21 @@ describe('forgotten intake watchdog', () => {
     const t = task('fresh', 60000), pending = task('pending');
     session(h,'failure',t,'failed'); session(h,'held',pending,'held');
     const w = new IntakeWatchdog(h.sql,h.intakeService,(f: any)=>f(),{},()=>NOW);w.init();
-    const p=w.project([t,pending]);expect(p[0]).toMatchObject({forgotten:true,reason:'only_failed_sessions'});expect(p[1].forgotten).toBe(false);
+    const p=w.project([t,pending]);expect(p[0]).toMatchObject({forgotten:true,reason:'session_ended_without_done_or_blocker_intake'});expect(p[1].forgotten).toBe(false);
+    expect(w.queue([t])[0]).toMatchObject({reason:'session_ended_without_done_or_blocker_intake'});
+  }));
+  it('does not flag a terminal session when it has current DONE evidence or a blocker follow-up', async () => fixture(h => {
+    const done = task('done-outcome', 60000), blocked = task('blocker-outcome', 60000);
+    done.history = [{ kind: 'note', text: 'DONE abc1234\nLive check: fixture\nResult: passed' }];
+    session(h, 'done-terminal', done, 'failed'); session(h, 'blocked-terminal', blocked, 'failed');
+    const blocker = { ...task('blocker-followup', 60000), created_by: { blocker_followup: true } };
+    h.sql.exec('INSERT INTO intake_tasks(id,data) VALUES(?,?)', blocker.id, JSON.stringify(blocker));
+    h.intakeService.dependencies.add(blocked.id, blocker.id, 'fixture');
+    const w = new IntakeWatchdog(h.sql, h.intakeService, (f: any)=>f(), {}, ()=>NOW); w.init();
+    expect(w.project([done, blocked])).toMatchObject([
+      { forgotten: true, reason: 'only_failed_sessions' },
+      { forgotten: false, reason: 'waiting_on_prereq', blocked_by: [blocker.id] },
+    ]);
   }));
   it('suppresses restart with fresh native work claim; stale evidence is unknown', async () => fixture(h => {
     const t = task();

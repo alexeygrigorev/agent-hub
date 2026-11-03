@@ -715,6 +715,10 @@ function renderDetail(task) {
     const promotedAt = control.promoted_at ?? task.promoted_at ?? null;
     if (promotedAt) addMetaItem(metaEl, 'Promoted', fmtTime(promotedAt));
     addMetaItem(metaEl, 'Version', detailVersion === null ? '-' : String(detailVersion));
+    for (const dependency of (task.dependencies || [])) {
+      addMetaItem(metaEl, dependency.resolved ? 'Prerequisite DONE' : 'Blocked by',
+        `${dependency.title || dependency.id} · ${dependency.id}`, () => openTaskDetail(dependency.id));
+    }
     // Scope flag comes from the F2 project-scope registry when present;
     // older tasks carry no flag and the row is omitted (never invented).
     if (task.scope_flag !== undefined && task.scope_flag !== null) {
