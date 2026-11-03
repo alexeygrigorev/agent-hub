@@ -826,6 +826,29 @@ describe('private durable intake HTTP/SQLite', () => {
     expect(await ok('/tasks/' + a.task.id, change)).toEqual(b);
     expect((await ok('/tasks')).total).toBe(1);
   });
+  it('replays lost append and close responses without duplicating history', async () => {
+    const { task } = await create();
+    const appendPayload = { key: 'lost-append-response', expected_version: task.version,
+      event: { kind: 'note', text: 'Synthetic append whose first response is discarded' } };
+    const firstAppend = await call('/tasks/' + task.id + '/events', appendPayload);
+    expect(firstAppend.status).toBe(200);
+    // Model a lost response by replaying the exact request without reading it.
+    const replayAppend = await ok('/tasks/' + task.id + '/events', appendPayload);
+    expect(replayAppend.task.version).toBe(task.version + 1);
+    let shown = (await ok('/tasks/' + task.id)).task;
+    expect(shown.payload_data.history.filter((event: any) =>
+      event.text === 'Synthetic append whose first response is discarded')).toHaveLength(1);
+
+    const closePayload = { key: 'lost-close-response', expected_version: shown.version, status: 'done',
+      outcome: 'closed_unverified', reason: 'Synthetic fixture; work was not verified' };
+    const firstClose = await call('/tasks/' + task.id, closePayload);
+    expect(firstClose.status).toBe(200);
+    const replayClose = await ok('/tasks/' + task.id, closePayload);
+    expect(replayClose.task.version).toBe(shown.version + 1);
+    shown = (await ok('/tasks/' + task.id)).task;
+    expect(shown.payload_data.history.filter((event: any) =>
+      event.kind === 'update' && event.changes?.outcome === 'closed_unverified')).toHaveLength(1);
+  });
   it('CAS rejects concurrent lost updates and keeps contiguous task history', async () => {
     const { task } = await create();
     const results = await Promise.all(['a','b'].map(key => call('/tasks/' + task.id, { key, expected_version: 1, next_step: key })));
