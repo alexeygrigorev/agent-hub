@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -57,6 +58,90 @@ from .session_executor import (
 RECV_JOURNAL_LIMIT = 64 * 1024
 UUID_RE = re.compile(r"^[a-f0-9-]{36}$", re.IGNORECASE)
 CORRELATION_RE = re.compile(r"^cmd:([a-f0-9-]{36}):gen:(\d+)$", re.IGNORECASE)
+MESSAGE_DELIVERY_LIMIT = 4
+
+
+class MessageDeliveryWorkers:
+    """Daemon workers for slow message delivery, isolated from command polling.
+
+    Session messages have one in-flight worker per Hub session and four per
+    host. Capture and stop command execution stays on the receiver thread.
+    """
+    def __init__(self, limit: int = MESSAGE_DELIVERY_LIMIT):
+        if type(limit) is not int or not 1 <= limit <= MESSAGE_DELIVERY_LIMIT:
+            raise ValueError("Message worker limit must be 1..4")
+        self.limit = limit
+        self._condition = threading.Condition()
+        self._active_commands: dict[str, str] = {}
+        self._active_sessions: set[str] = set()
+        self._completed: list[dict[str, Any]] = []
+
+    def submit(self, session_id: str, command_id: str, work: Callable[[], Any]) -> bool:
+        if not isinstance(session_id, str) or not session_id or not isinstance(command_id, str) or not command_id:
+            return False
+        with self._condition:
+            if (len(self._active_commands) >= self.limit or session_id in self._active_sessions
+                    or command_id in self._active_commands):
+                return False
+            self._active_commands[command_id] = session_id
+            self._active_sessions.add(session_id)
+
+        def run():
+            result: dict[str, Any] = {"command_id": command_id, "session_id": session_id}
+            try:
+                value = work()
+                if isinstance(value, dict):
+                    result["state"] = value.get("state")
+                    result["replayed"] = bool(value.get("replayed", False))
+                else:
+                    result["state"] = "completed"
+            except Exception as exc:
+                result["state"] = "error"
+                result["error"] = type(exc).__name__
+            finally:
+                with self._condition:
+                    self._active_commands.pop(command_id, None)
+                    self._active_sessions.discard(session_id)
+                    self._completed.append(result)
+                    if len(self._completed) > 256:
+                        del self._completed[:-256]
+                    self._condition.notify_all()
+
+        thread = threading.Thread(target=run, name="session-message-delivery", daemon=True)
+        try:
+            thread.start()
+        except Exception:
+            with self._condition:
+                self._active_commands.pop(command_id, None)
+                self._active_sessions.discard(session_id)
+                self._condition.notify_all()
+            return False
+        return True
+
+    def wait_idle(self, timeout: Optional[float] = None) -> bool:
+        """Test/operator seam; host command polling never waits on this."""
+        import time
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._condition:
+            while self._active_commands:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return False
+                self._condition.wait(remaining)
+            return True
+
+    def drain_completed(self) -> list[dict[str, Any]]:
+        with self._condition:
+            rows, self._completed = self._completed, []
+            return rows
+
+    @property
+    def active_count(self) -> int:
+        with self._condition:
+            return len(self._active_commands)
+
+
+_MESSAGE_DELIVERY_WORKERS = MessageDeliveryWorkers()
 
 
 def _journal_path(journal_dir: str, command_id: str) -> str:
@@ -246,6 +331,7 @@ def receive_once(
     limit: int = 20,
     sender_workspace: Optional[str] = None,
     cleanup_roots: Optional[list] = None,
+    message_workers: Optional[MessageDeliveryWorkers] = None,
 ) -> dict[str, Any]:
     """Run ONE bounded receiver cycle: poll -> claim -> execute -> ack.
 
@@ -278,6 +364,20 @@ def receive_once(
         raise SessionControlError("sender_workspace must be an absolute path")
     _ensure_journal_dir(journal_dir)
 
+    workers = message_workers or _MESSAGE_DELIVERY_WORKERS
+    # Reconcile crash-left message intents before polling. These workers share
+    # the same per-session and host-wide bounds as fresh delivery.
+    try:
+        pending_messages = session_messages.pending_message_reconciliations(
+            journal_dir, now_ms=now_ms, limit=32)
+    except OSError:
+        pending_messages = []
+    for path, record in pending_messages:
+        session_id, command_id = record.get("hub_session_id"), record.get("command_id")
+        if isinstance(session_id, str) and isinstance(command_id, str):
+            workers.submit(session_id, command_id, lambda path=path: session_messages.reconcile_message_record(
+                path, executable=executable, request=request, now_ms=now_ms))
+
     try:
         listing = request("GET", "/api/session-commands/offers", None)
     except Exception as exc:
@@ -293,13 +393,21 @@ def receive_once(
         command_id = offer.get("command_id") if isinstance(offer, dict) else None
         correlation = offer.get("correlation", "") if isinstance(offer, dict) else ""
         if isinstance(offer, dict) and offer.get("kind") == "message":
-            # Hub session messages (docs/SESSION-MESSAGING.md §5.2): own
-            # journal, send-once inbox write, at-most-once TUI deliver.
+            # Message delivery can block in a native TUI guard. Run it outside
+            # this poll thread so subsequent capture/stop offers stay live.
             try:
                 attempt_id = get_or_create_attempt(journal_dir, str(command_id), str(correlation or ""))
-                processed.append({"op": "message", **session_messages.handle_message_offer(
-                    offer, journal_dir=journal_dir, executable=executable, request=request,
-                    attempt_id=attempt_id, sender_workspace=sender_workspace, now_ms=now_ms)})
+                target_session = offer.get("session_id")
+                if not isinstance(target_session, str) or not target_session:
+                    raise SessionControlError("Message offer has no Hub session id")
+                submitted = workers.submit(target_session, str(command_id), lambda offer=offer, attempt_id=attempt_id:
+                    session_messages.handle_message_offer(
+                        offer, journal_dir=journal_dir, executable=executable, request=request,
+                        attempt_id=attempt_id, sender_workspace=sender_workspace, now_ms=now_ms))
+                if submitted:
+                    processed.append({"op": "message", "command_id": command_id, "state": "scheduled"})
+                else:
+                    skipped.append({"command_id": command_id, "reason": "message_worker_busy"})
             except (SessionControlError, SessionUncertain) as exc:
                 skipped.append({"command_id": command_id, "reason": str(exc)[:300]})
             except Exception as exc:
@@ -455,7 +563,8 @@ def receive_once(
     except Exception:
         relayed = []
     return {"offers_seen": len(offers), "processed": processed, "skipped": skipped,
-            "reconciled": reconciled, "relayed": relayed}
+            "reconciled": reconciled, "relayed": relayed,
+            "message_workers": workers.drain_completed()}
 
 
 def _is_terminal_ack_error(err: Any) -> bool:

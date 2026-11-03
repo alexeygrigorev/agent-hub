@@ -277,18 +277,26 @@ export function checkSendScoping(sql: SqlStorage, caller: { kind?: string; isAdm
 /** Text typed into the TUI: bounded, control characters stripped, with the
  * marker used for uncertain-delivery resolution and the reply instruction. */
 export function renderTui(msg: { id: string; from_actor: string; to_actor?: string; thread_id: string; body: string }): string {
-  const clean = (s: string) => s.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
-  const head = `⟦hub:${msg.id.slice(-8)}⟧ from ${clean(msg.from_actor)} (thread ${msg.thread_id}): `;
+  const clean = (s: string) => s.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, '');
+  const head = `⟦hub:${msg.id.slice(-8)}⟧ from ${clean(msg.from_actor)} (thread ${clean(msg.thread_id)}): `;
   const reply = msg.to_actor?.startsWith(NAMED_AGENT_PROJECT + ':')
     ? `hub msg reply ${msg.id} --as ${clean(msg.to_actor)} --body "text"`
     : `hub reply ${msg.id} --body "text"`;
   const tail = `\n[Reply: a message reply <this inbox message id> "text", or ${reply}]`;
   const enc = new TextEncoder();
-  let body = clean(msg.body);
-  const budget = TUI_RENDER_BYTES - enc.encode(head + tail).length - 64;
-  if (enc.encode(body).length > budget) {
-    while (enc.encode(body).length > budget) body = body.slice(0, Math.floor(body.length * 0.9));
-    body += `\n[truncated: hub show ${msg.id}]`;
+  const body = clean(msg.body);
+  if (enc.encode(head + body + tail).length > TUI_RENDER_BYTES) {
+    const pointer = `\n[truncated: hub msg show ${msg.id}]`;
+    const bodyBudget = TUI_RENDER_BYTES - enc.encode(head + pointer + tail).length;
+    let prefix = '';
+    let used = 0;
+    for (const char of body) {
+      const bytes = enc.encode(char).length;
+      if (used + bytes > bodyBudget) break;
+      prefix += char;
+      used += bytes;
+    }
+    return head + prefix + pointer + tail;
   }
   return head + body + tail;
 }
