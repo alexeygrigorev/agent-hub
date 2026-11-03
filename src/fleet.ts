@@ -29,7 +29,7 @@ import { freshCatalogs, freshCompleteCatalogs } from './catalog-freshness';
 import { readFleetCapacitySnapshot, capacityFamilyKey, reservationNativeJoinSql, unobservedReservationReleased, reservationHoldsCapacity, RESERVATION_TTL_MS, INFLIGHT_LAUNCH_ID_SQL, type FleetCapacitySnapshot } from './fleet-capacity-snapshot';
 import { syncTbmFromServerAccounts } from './tbm-ingestion';
 import { recordSessionTokens } from './tbm-controller';
-import { computeEngineDecision, fallbackModelIds, isDesktopCodexExcluded, isHealthyAlternative, loadProviderPacing, loadPools, netHeadroom, pacingFor, resetUrgency, scheduleBurnFactor } from './pacing';
+import { applyNormalizedScores, computeEngineDecision, fallbackModelIds, isDesktopCodexExcluded, isHealthyAlternative, loadProviderPacing, loadPools, netHeadroom, pacingFor, resetUrgency, scheduleBurnFactor } from './pacing';
 import { burnFactor, burnForecast, type BurnForecast } from './burn';
 import { autoStartDrawDistribution, weightedDrawIndex } from './draw';
 import { invalidLabels, recordCredentialRejection, rejectedPairs } from './credentials';
@@ -82,6 +82,11 @@ const CLAIM_KEY = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 // yet, but it canonicalizes to provider `codex` (the second Codex account)
 // on every read path. Never register new accounts under it.
 const PROVIDERS = new Set(['codex', 'codex-orin', 'claude', 'grok', 'gemini', 'zai', 'go', 'copilot']);
+/** Window and cap of the per-route failure count in plan() and the failures that do not count. */
+export const ROUTE_FAILURE_WINDOW_MS = 30 * 60_000;
+export const ROUTE_FAILURE_CAP = 8;
+export const ROUTE_FAILURE_NEUTRAL_REASONS = new Set(['launcher_offer_expired', 'model_unsupported', 'launcher_memory_reserve', 'account_capacity', 'account_concurrency',
+  'machine_capacity', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking', 'host_load_high', 'operator_stopped', 'stopped_by_operator', 'cancelled']);
 const ACTIVE = ACTIVE_LAUNCH_STATES_SQL;
 // A native catalog can observe spawn before the launcher posts its receipt.
 // Correlate that narrow in-flight window without trusting a tag alone.
@@ -1255,17 +1260,25 @@ export class FleetService {
       }
       return runnersByMachine.get(machineId);
     };
-    const recentFailuresByAccount = new Map<string, number>();
-    const countRecentAccountFailures = (acct: string): number => {
-      if (!recentFailuresByAccount.has(acct)) {
+    // Recent failures are scoped to the exact (account, machine) route and a short
+    // window, and only count failures a route can be blamed for: capacity holds,
+    // expired offers and model refusals say nothing about the account (they were
+    // the reason every route read fail=8, the global cap of the old per-label count).
+    const recentFailuresByRoute = new Map<string, number>();
+    const hostLaunchCounts = new Map<string, { pending: number; running: number }>();
+    const countRecentAccountFailures = (acct: string, machineId: string): number => {
+      const key = acct + ' ' + machineId;
+      if (!recentFailuresByRoute.has(key)) {
         let n = 0;
         try {
-          const sinceIso = new Date(this.now() - 3600_000).toISOString();
-          n = this.sql.exec("SELECT 1 FROM fleet_launches WHERE account = ? AND state = 'failed' AND updated_at > ? LIMIT 8", acct, sinceIso).toArray().length;
+          const sinceIso = new Date(this.now() - ROUTE_FAILURE_WINDOW_MS).toISOString();
+          const skip = [...ROUTE_FAILURE_NEUTRAL_REASONS];
+          n = this.sql.exec(`SELECT 1 FROM fleet_launches WHERE account = ? AND machine_id = ? AND state = 'failed' AND exit_reason IS NOT NULL AND exit_reason NOT IN (${skip.map(() => '?').join(',')}) AND updated_at > ? LIMIT ${ROUTE_FAILURE_CAP}`,
+            acct, machineId, ...skip, sinceIso).toArray().length;
         } catch { n = 0; }
-        recentFailuresByAccount.set(acct, n);
+        recentFailuresByRoute.set(key, n);
       }
-      return recentFailuresByAccount.get(acct)!;
+      return recentFailuresByRoute.get(key)!;
     };
     for (const route of this.sql.exec('SELECT * FROM fleet_routes ORDER BY machine_id, engine').toArray() as any[]) {
       if ((request.account && route.account !== request.account) || (request.machine && route.machine_id !== request.machine) || (request.engine && !overrideModels.length && route.engine !== request.engine)) continue;
@@ -1498,7 +1511,18 @@ export class FleetService {
       const advertisedRefusal = Array.isArray(caps.fleet_route_rejections) && caps.fleet_route_rejections.some((r: any) =>
         r.engine === route.engine && r.account === route.account && (r.profile ?? null) === route.profile && r.mode === request.mode && r.reason === 'model_unsupported');
       if (unsupported || advertisedRefusal) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'model_unsupported' }); continue; }
-      const pending = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_launches WHERE machine_id = ? AND state IN ${ACTIVE}`, route.machine_id).one().n);
+      // Host factor input: launches still being started on this host (not yet visible in
+      // its CPU telemetry). Running sessions already show up as busy cores / load, so they only add a
+      // small capped spread term; counting every active row as pending gave a host with many sessions a
+      // ~1/(1+N) penalty regardless of CPU (live check 2026-11-02: host_factor 0.006).
+      if (!hostLaunchCounts.has(route.machine_id)) {
+        let counts = { pending: 0, running: 0 };
+        for (const r of this.sql.exec(`SELECT state, COUNT(*) AS n FROM fleet_launches WHERE machine_id = ? AND state IN ${ACTIVE} GROUP BY state`, route.machine_id).toArray() as any[]) {
+          if (r.state === 'offered' || r.state === 'starting') counts.pending += Number(r.n); else counts.running += Number(r.n);
+        }
+        hostLaunchCounts.set(route.machine_id, counts);
+      }
+      const { pending, running } = hostLaunchCounts.get(route.machine_id)!;
       // Machine admission uses the resource verdicts above, not catalog counts.
       // Idle/stalled sessions are observations, not launch reservations.
 
@@ -1538,10 +1562,11 @@ export class FleetService {
         nowMs: this.now(),
         cpuLoad,
         pendingLaunches: pending,
+        runningSessions: running,
         familyLoad,
         accountActive: account?.active ?? 0,
         accountMaxConcurrency: account?.max_concurrency ?? 1,
-        recentAccountFailures: countRecentAccountFailures(route.account),
+        recentAccountFailures: countRecentAccountFailures(route.account, route.machine_id),
         degraded: isDegraded,
         tbmWeight: tbm_weight,
         reservePercent: Number(account!.reserve_percent) || 0,
@@ -1603,6 +1628,8 @@ export class FleetService {
       || a.engine.localeCompare(b.engine)
       || String(a.account ?? '').localeCompare(String(b.account ?? ''))
     );
+    // Ordering is final; add the 0-100 score relative to the best candidate.
+    applyNormalizedScores(candidates);
     // Intake 9647e6d5: a fully unpinned auto-start draws weighted by remaining quota headroom,
     // never stacking on the top score. Any pin, previews and sourceless
     // callers keep candidates[0].
@@ -2060,19 +2087,29 @@ export class FleetService {
         return response({ error: 'engine_reason_required', detail: 'Pinning an engine requires --reason (engine_override_reason).' }, 400);
       }
       let workspace = typeof params.workspace === 'string' && params.workspace.trim() ? params.workspace.trim() : '';
-      if (!workspace) {
+      // `repo` (owner/name) names the work like `hub sessions start --repo`: a repo-identity workspace
+      // that any host advertising repo_workspaces can take. Preview only, so no registry round trip.
+      if (!workspace && typeof params.repo === 'string' && params.repo.trim()) {
+        const encoded = encodeRepoWorkspace(params.repo.trim(), '00000000');
+        if (!encoded) return response({ error: 'invalid_repo', detail: 'repo must be owner/name' }, 400);
+        workspace = encoded;
+      }
+      // Without a named workspace, preview every live host: each one's first advertised workspace is
+      // planned separately and the results are merged. Taking only the freshest host's workspace
+      // rejected every other host with workspace_unavailable.
+      const workspaces: string[] = [];
+      if (workspace) workspaces.push(workspace);
+      else {
         try {
           for (const m of this.sql.exec('SELECT capabilities FROM machines WHERE revoked_at IS NULL AND drained = 0 ORDER BY last_checkin_at DESC LIMIT 8').toArray() as any[]) {
             const ws = parsed(m.capabilities)?.workspaces;
-            if (Array.isArray(ws) && typeof ws[0] === 'string') { workspace = ws[0]; break; }
-            if (ws && typeof ws === 'object') {
-              const firstKey = Object.keys(ws)[0];
-              if (firstKey) { workspace = firstKey; break; }
-            }
+            const first = Array.isArray(ws) && typeof ws[0] === 'string' ? ws[0] : (ws && typeof ws === 'object' ? Object.keys(ws)[0] : undefined);
+            if (first && !workspaces.includes(first)) workspaces.push(first);
           }
         } catch { /* fallback below */ }
+        if (!workspaces.length) workspaces.push('agent-hub');
+        workspace = workspaces[0];
       }
-      if (!workspace) workspace = 'agent-hub';
       const needs = Array.isArray(params.needs)
         ? params.needs
         : (typeof params.needs === 'string' && params.needs.trim() ? params.needs.split(',').map((s: string) => s.trim()).filter(Boolean) : undefined);
@@ -2089,8 +2126,31 @@ export class FleetService {
         ...(needs?.length ? { needs } : {}),
         ...(params.engine_override_reason || params.reason ? { engine_override_reason: String(params.engine_override_reason || params.reason) } : {}),
       };
-      const planned: any = this.plan(planInput);
+      let planned: any = this.plan(planInput);
       if ('error' in planned) return response(planned, 400);
+      if (workspaces.length > 1) {
+        // Merge by (machine, engine, account, profile); a route counts once, with the first plan that accepts it.
+        const keyOf = (c: any) => [c.machine, c.engine, c.account, c.profile ?? ''].join(' ');
+        const merged = new Map<string, any>();
+        let rejected: any[] = Array.isArray(planned.rejected) ? [...planned.rejected] : [];
+        for (const c of planned.candidates ?? []) merged.set(keyOf(c), c);
+        for (const w of workspaces.slice(1)) {
+          const extra: any = this.plan({ ...planInput, workspace: w });
+          if ('error' in extra) continue;
+          for (const c of extra.candidates ?? []) if (!merged.has(keyOf(c))) merged.set(keyOf(c), c);
+          rejected = rejected.concat(extra.rejected ?? []);
+        }
+        const list = [...merged.values()].sort((a, b) =>
+          Number(!!a.overflow) - Number(!!b.overflow) || b.score - a.score
+          || (b.decision?.factors?.burn_ratio ?? 0) - (a.decision?.factors?.burn_ratio ?? 0)
+          || a.machine.localeCompare(b.machine) || a.engine.localeCompare(b.engine) || String(a.account ?? '').localeCompare(String(b.account ?? '')));
+        // A route accepted under some workspace is not a rejection of the preview.
+        const seen = new Set<string>();
+        rejected = rejected.filter(r => { const k = [r.machine, r.engine, r.reason].join(' '); if (seen.has(k)) return false; seen.add(k);
+          return !list.some(c => c.machine === r.machine && c.engine === r.engine); });
+        applyNormalizedScores(list);
+        planned = { ...planned, selected: list[0] ?? null, candidates: list, rejected };
+      }
       const formatCandidate = (c: any) => ({
         machine: c.machine,
         engine: c.engine,
@@ -2100,6 +2160,7 @@ export class FleetService {
         model: c.selection?.model ?? null,
         effort: c.selection?.effort ?? null,
         decision_score: c.decision_score ?? c.score ?? null,
+        normalized_score: c.decision?.normalized_score ?? null,
         decision_reason: c.decision_reason ?? c.selection?.decision_reason ?? null,
         decision: c.decision ?? c.selection?.decision ?? null,
         draw_probability: c.draw_probability ?? 0,
@@ -2108,6 +2169,7 @@ export class FleetService {
         tier: taskTier({ tier: params.tier }) || policy.default_tier,
         selected: planned.selected ? formatCandidate(planned.selected) : null,
         decision_score: planned.selected ? (planned.selected.decision_score ?? planned.selected.score ?? null) : null,
+        normalized_score: planned.selected?.decision?.normalized_score ?? null,
         decision_reason: planned.selected ? (planned.selected.decision_reason ?? null) : null,
         candidates: Array.isArray(planned.candidates) ? planned.candidates.map(formatCandidate) : [],
         rejected: planned.rejected || [],

@@ -636,7 +636,11 @@ def main():
         windows_no_window.install()
     if args.cmd == 'engines':
         try:
-            print(json.dumps(provisioning.command(args)))
+            result = provisioning.command(args)
+            if getattr(args, 'engines_cmd', None) == 'recommend' and not getattr(args, 'json', False) and isinstance(result, dict):
+                print(provisioning.render_recommend(result))
+            else:
+                print(json.dumps(result))
         except Exception as exc:
             print(provisioning.engine_error_message(exc, getattr(args, 'engines_cmd', None)), file=sys.stderr)
             sys.exit(1)

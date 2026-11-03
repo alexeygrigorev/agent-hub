@@ -2924,11 +2924,12 @@ def add_commands(sub):
     recommend.add_argument('--workspace', default=None, help='Workspace name or path')
     recommend.add_argument('--machine', default=None, help='Preferred machine id')
     recommend.add_argument('--project', default=None, help='Project name')
+    recommend.add_argument('--repo', default=None, help='Repository owner/name (like hub sessions start --repo): any host that clones its own work tree is eligible')
     recommend.add_argument('--needs', default=None, help='Comma-separated capability/OS labels')
     recommend.add_argument('--mode', choices=['headless', 'interactive'], default='headless')
     recommend.add_argument('--engine', default=None, help='Optional pinned engine (requires --reason)')
     recommend.add_argument('--reason', default=None, help='Required explanation when --engine is pinned')
-    recommend.add_argument('--json', action='store_true', default=True, help='JSON output (default)')
+    recommend.add_argument('--json', action='store_true', default=False, help='Raw JSON instead of the ranked table')
 
 
 def central_login(args, prompt=None):
@@ -3151,13 +3152,43 @@ def engine_update_command(args):
     return check
 
 
+def render_recommend(result):
+    """Ranked candidates of `GET /api/fleet/recommend` as text: rank, normalized score, route, reason."""
+    lines = []
+    selected = result.get('selected') or {}
+    candidates = result.get('candidates') or []
+    if not candidates:
+        lines.append('no eligible candidate')
+    else:
+        lines.append('tier=%s; ranked candidates (score 0-100 is relative to the best):' % (result.get('tier') or '-'))
+    for i, c in enumerate(candidates, 1):
+        norm = c.get('normalized_score')
+        factors = (c.get('decision') or {}).get('factors') or {}
+        lines.append('%2d. %5s  %s/%s (%s) on %s%s' % (
+            i, ('%.1f' % norm) if isinstance(norm, (int, float)) else '-', c.get('engine'), c.get('account'),
+            c.get('model_id') or c.get('model') or '-', c.get('machine'),
+            '  <- selected' if selected and c.get('machine') == selected.get('machine') and c.get('engine') == selected.get('engine') and c.get('account') == selected.get('account') else ''))
+        lines.append('      %s' % (c.get('decision_reason') or ''))
+        if factors:
+            lines.append('      rem=%s%% ratio=%s burn=%sx load=%sx host=%sx fail=%sx (recent failures %s)' % (
+                factors.get('remaining_pct'), factors.get('burn_ratio'), factors.get('burn_factor'), factors.get('load_factor'),
+                factors.get('host_factor'), factors.get('failure_factor'), factors.get('recent_failures')))
+    rejected = result.get('rejected') or []
+    if rejected:
+        counts = {}
+        for r in rejected:
+            counts[r.get('reason')] = counts.get(r.get('reason'), 0) + 1
+        lines.append('excluded: ' + ', '.join('%s x%d' % (k, v) for k, v in sorted(counts.items(), key=lambda kv: str(kv[0]))))
+    return '\n'.join(lines)
+
+
 def command(args):
     if args.engines_cmd == 'recommend':
         import urllib.parse
         if getattr(args, 'engine', None) and not (getattr(args, 'reason', None) and str(args.reason).strip()):
             raise ValueError('engine_reason_required: --engine requires --reason')
         q = {}
-        for k in ('tier', 'workspace', 'machine', 'project', 'needs', 'mode', 'engine', 'reason'):
+        for k in ('tier', 'workspace', 'machine', 'project', 'repo', 'needs', 'mode', 'engine', 'reason'):
             v = getattr(args, k, None)
             if v is not None and str(v).strip():
                 q[k] = str(v).strip()

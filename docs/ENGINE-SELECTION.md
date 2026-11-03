@@ -49,12 +49,14 @@ $$S = H \times B_{\text{burn}} \times F_{\text{fallback}} \times P_{\text{pref}}
 | $F_{\text{fallback}}$ | **Fallback-Model Factor** | For an unpinned request, a model in `rules.fallback_models` is multiplied by `rules.fallback_factor` only when another eligible non-fallback candidate has at least `rules.fallback_headroom_percent` remaining and is neither `depleted` nor `ahead_of_schedule`. Otherwise the factor is `1.0`. Fallback candidates remain visible in the decision and recommendation. | Makes Luna a scored fallback when other eligible routes have usable quota headroom, while preserving burn-aware ranking and diagnostics. |
 | $P_{\text{pref}}$ | **Provider & Project Preference** | Base provider weight from `config/model-routing.json`:<br>• `go` (`muse`): `1.30`<br>• `gemini` (`antigravity`): `1.30`<br>• `zai` (`zai-central`): `1.30`<br>• `codex` (OpenAI): `1.15`<br>• `copilot`: `1.00`<br>• `claude`: `0.75`<br>• `grok`: `0.20`<br>Multiplied by optional per-project weight (`rules.project_preferences[project][provider]`, default `1.0`). | Implements *«focus on using muse antigravity and zai and codex more than claude»* even when burn ratios are close. |
 | $F_{\text{tier}}$ | **Tier & Capability Fit** | Base `1.0`, adjusted by:<br>• Tier position bonus: $1 + 0.02 \times \max(0, 6 - \text{tier\_index})$<br>• Capability fit for `needs` (`tool_use`, `long_context`, `fast`, `cheap`) and `tier` (`deep` boosts 1M-context/deep-reasoning engines; `quick` boosts high-speed engines). | Matches task requirements (tool use, context window, speed) while preserving tier ordering as a gentle preference rather than a hard lock onto index 0. |
-| $L_{\text{load}}$ | **Live Session Concurrency & Slot Headroom** | Let $a_{\text{acct}}$ be live + reserved sessions on the specific account, $a_{\text{fam}}$ be live sessions across the provider family, and $u_{\text{slot}} = \frac{\text{available\_slots}}{\text{max\_concurrency}} \in (0, 1]$:<br>$$L_{\text{load}} = \frac{0.5 + 0.5 \cdot u_{\text{slot}}}{(1 + 0.35 \cdot a_{\text{acct}}) \cdot (1 + 0.5 \cdot a_{\text{fam}})}$$ | Spreads concurrent sessions across accounts and engines so a heavily loaded family (`claude` with 15/50 live sessions) loses to idle/lightly loaded accounts (`muse` with 0 live sessions). |
-| $E_{\text{fail}}$ | **Recent Account Failure / Exhaustion Penalty** | Let $f_{1\text{h}}$ be the count of launch failures or quota/auth refusals on the account in the last 60 minutes, plus `1` if `degraded`:<br>$$E_{\text{fail}} = \frac{1}{1 + 0.5 \cdot f_{1\text{h}}}$$ | Avoids repeatedly hammering an account that recently failed or hit transient rate limits. |
-| $M_{\text{host}}$ | **Host Load Factor** | $M_{\text{host}} = \frac{1}{1 + \text{busy\_cores}/\text{cpu\_count} + \text{pending\_launches}}$ | Balances CPU and launch queue across eligible hosts (`hetzner`, `tabo`, `desktop`). |
+| $L_{\text{load}}$ | **Live Session Concurrency & Slot Headroom** | Let $a_{\text{acct}}$ be live + reserved sessions on the specific account, $a_{\text{fam}}$ be live sessions across the provider family, and $u_{\text{slot}} = \frac{\text{available\_slots}}{\text{max\_concurrency}} \in (0, 1]$:<br>$$L_{\text{load}} = \frac{0.7 + 0.3 \cdot u_{\text{slot}}}{(1 + a_{\text{fam}}) \cdot (1 + 0.25 \cdot a_{\text{acct}})}$$ | Spreads concurrent sessions across accounts and engines so a heavily loaded family (`claude` with 15/50 live sessions) loses to idle/lightly loaded accounts (`muse` with 0 live sessions). |
+| $E_{\text{fail}}$ | **Recent Account Failure / Exhaustion Penalty** | Let $f$ be the count (cap 8) of failed launches of that exact `(account, machine)` route in the last 30 minutes whose `exit_reason` is blamable on the route; capacity holds, expired offers, model refusals and operator stops do not count (`ROUTE_FAILURE_NEUTRAL_REASONS`). `degraded` adds `0.5`:<br>$$E_{\text{fail}} = \frac{1}{1 + 0.5 \cdot f + 0.5 \cdot [\text{degraded}]}$$ | Avoids repeatedly hammering an account that recently failed or hit transient rate limits. |
+| $M_{\text{host}}$ | **Host Load Factor** | $M_{\text{host}} = \frac{1}{1 + \max(\text{busy\_cores},\ \text{load}_1)/\text{cpu\_count} + \text{pending\_launches} + \min(0.5,\ 0.05 \cdot \text{running})}$, where `pending_launches` are launches of that host in `offered`/`starting` (not yet visible in its CPU telemetry). Running/uncertain sessions are already part of the CPU term, so they add only a small capped spread term. | Balances CPU and launch queue across eligible hosts (`hetzner`, `tabo`, `desktop`). Counting every active row as pending (fixed 2026-11-02) gave a host with 30+ sessions `host_factor` 0.006 whatever its CPU. |
 | $W_{\text{tbm}}$ | **Learned TBM Weight** | Historical completion/value weight $\in [0.25, 2.0]$ (default `1.0`). | Incorporates observed task completion efficiency. |
 
 ### Phase C: Deterministic Tie-Break Order
+
+Ordering is by the raw composite score $S$. The burn ratio is **not** a ranking key by itself: it enters $S$ only through $B_{\text{burn}}$ and is consulted again only when two scores are equal. So a candidate with a lower ratio (`muse` 0.68) can legitimately outrank one with a higher ratio (`argon` 0.72) when its other factors (headroom, load, host, tier fit) outweigh the 0.04 ratio gap; the reason string shows every factor so the cause is readable. Engines are never ordered by ratio alone.
 
 When two eligible candidates have scores within floating-point tolerance (or identical scores):
 1. Non-overflow pool before overflow pool (`!a.overflow` before `b.overflow`).
@@ -66,6 +68,10 @@ When two eligible candidates have scores within floating-point tolerance (or ide
 7. Lexicographical order of `(machine, engine, account, model_id)`.
 
 ---
+
+### Normalized score
+
+Raw scores are a product of up to eight factors and routinely sit at 1e-4 or below, so `decision_score` alone is hard to compare. Each plan therefore also reports `normalized_score` (0-100, `100 * S / S_best` over that plan's eligible candidates) and `decision_reason` carries `norm=NN/100`. Ordering is unchanged (the transform is monotonic); raw `score` stays for ties and audit. Raw scores below 1e-3 print in exponent form (`score=8.40e-5`) instead of `0.0000`.
 
 ## 3. Worked Examples (2026-11-02 17:15Z Live Fleet Snapshot)
 
@@ -116,7 +122,9 @@ Every planned or reserved session records:
 Callers (skills, routines, briefs, refill loops, operators) that want to inspect or use Hub's recommendation without hard-coding `claude` can either omit `--engine` when calling `hub sessions start` or query:
 
 ```bash
-hub engines recommend [--tier daily|deep|quick|review|ask] [--workspace repo] [--machine host] [--project proj]
+hub engines recommend [--tier daily|deep|quick|review|ask] [--repo owner/name | --workspace label] [--machine host] [--project proj] [--needs a,b] [--json]
 ```
+
+The CLI prints the ranked candidates (normalized score, route, reason, key factors) and the excluded reasons; `--json` prints the raw response. Without `--workspace`/`--repo` the preview plans every live host's first workspace and merges the results, so one host's workspace no longer hides the others. `--repo` uses the same repo-identity workspace as `hub sessions start --repo` (any host that advertises `repo_workspaces`); the preview does not consult the repo registry.
 
 This endpoint runs the exact `FleetService.plan()` decision function without creating a reservation and returns the winning `(engine, account, profile, model_id, machine, decision_score, decision_reason)` along with the ranked candidate list and any excluded candidates with their exclusion reasons.
