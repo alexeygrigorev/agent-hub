@@ -111,7 +111,7 @@ try {
     const page = await context.newPage();
     const errors = [];
     page.on('pageerror', (e) => errors.push(e.message));
-    await page.goto('http://tbm.fixture/metrics.html');
+    await page.goto('http://tbm.fixture/metrics.html#routing-settings');
     await page.waitForFunction(() => document.getElementById('tbm-status').textContent.includes('TBM ·'));
     // Preference metadata never implies routing authority, at either viewport.
     await page.waitForFunction(() => document.getElementById('tbm-grok-mode'));
@@ -126,6 +126,9 @@ try {
       assert.deepEqual(lastGrokPost, { mode: preference, reason: 'browser preference proof' });
       assert.match(await page.locator('#tbm-grok').innerText(), /Effective state: disabled/);
     }
+    await page.getByRole('link', { name: 'Back to Metrics', exact: true }).click();
+    await page.getByRole('button', { name: 'Usage', exact: true }).click();
+    await page.locator('#tbm > summary').click();
     // Spend-vs-pace per pool.
     assert.equal(await page.locator('#tbm-pacing .tbm-pool').count(), 2);
     assert.equal(await page.locator('#tbm-pacing .tbm-pool svg').count(), 1, 'only the pool with reset renders a chart');
@@ -140,6 +143,7 @@ try {
     assert.match(firstRow, /rollover/);
     assert.equal(await page.locator('#tbm-banked tbody tr').count(), 2);
     assert.match(await page.locator('#tbm-banked').innerText(), /Earliest deadline first/);
+    await page.locator('#tbm a[href="#routing-settings"]').click();
     // Kill-switch off, then activate with reason + CSRF.
     assert.match(await page.locator('#tbm-kill-status').innerText(), /off/);
     await page.locator('#tbm-kill-reason').fill('staged low-quota drill');
@@ -159,6 +163,8 @@ try {
       assert.equal(grokPreference, 'disabled');
       assert.equal(await page.locator('#tbm-grok button[type=submit]').isEnabled(), true);
       grokWriteStatus = 200;
+      await page.getByRole('link', { name: 'Back to Metrics', exact: true }).click();
+      await page.getByRole('button', { name: 'Usage', exact: true }).click();
       // Empty banked + service failure paths stay honest, never zero-filled.
       const keep = banked;
       banked = () => ({ as_of: new Date(NOW).toISOString(), tranches: [] });
@@ -176,7 +182,7 @@ try {
       await page.locator('#tbm-refresh').click();
       await page.waitForFunction(() => document.getElementById('tbm-status').textContent.includes('denied'));
       authStatus = 200;
-      await page.goto('http://tbm.fixture/metrics.html');
+      await page.goto('http://tbm.fixture/metrics.html#routing-settings');
       await page.waitForFunction(() => document.getElementById('tbm-status').textContent.includes('TBM ·'));
       killState = { active: false, reason: '' };
     }

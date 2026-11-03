@@ -115,6 +115,8 @@ try {
     page.on('pageerror', e => errors.push(e.message));
     await page.goto('http://usage.fixture/metrics.html#usage-history');
     await page.waitForSelector('#usage-quota-history svg');
+    await page.getByText('Current account usage snapshot', { exact: true }).click();
+    await page.getByText('Token coverage and sources', { exact: true }).click();
     const current=await page.locator('#usage-current').innerText();
     assert.match(current,/20%/);assert.match(current,/75%/);assert.match(current,/42 credits/);
     assert.match(current,/28 Oct, 13:00 CET/);assert.match(current,/Expiring soon/);
@@ -148,7 +150,7 @@ try {
     assert.match(await page.locator('#usage-token-sources').innerText(), /gemini: not collected/);
     // Range selector offers 24h/7d/30d and refetches.
     for (const value of ['7d', '30d', '24h']) {
-      await page.getByLabel('Usage history range', { exact: true }).selectOption(value);
+      await page.getByLabel('Metrics timeframe', { exact: true }).selectOption(value);
       await page.waitForFunction(v => document.querySelector('#usage-history [data-usage-note]').textContent.startsWith(v + ' ·'), value);
       assert.equal(range, value);
       assert.ok((await page.locator('#usage-token-history .metrics-line').first().getAttribute('d')).includes('L'), `${value} hourly API points connect`);
