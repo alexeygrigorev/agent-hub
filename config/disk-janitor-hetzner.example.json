@@ -1,0 +1,44 @@
+{
+  "enabled": true,
+  "dry_run": false,
+  "mount": "/",
+  "floor_gb": 100,
+  "target_gb": 200,
+  "interval_s": 900,
+  "pressure_interval_s": 120,
+  "workspace_roots": ["/home/alexey/git"],
+  "grace_hours": 2,
+  "orphan_idle_hours": 24,
+  "held_idle_hours": 24,
+  "archive_idle_hours": 72,
+  "archive_dir": "/home/alexey/storagebox/agent-archives/hetzner-workspaces",
+  "archive_max_mb": 2048,
+  "protected_paths": [
+    "/home/alexey/prod",
+    "/home/alexey/backups",
+    "/home/alexey/exports",
+    "/home/alexey/work",
+    "/home/alexey/storagebox"
+  ],
+  "cache_rules": [
+    {"path": "/home/alexey/.cache/pip", "depth": 1, "min_age_hours": 168},
+    {"path": "/home/alexey/.cache/uv", "depth": 1, "min_age_hours": 168},
+    {"path": "/home/alexey/.cache/go-build", "depth": 1, "min_age_hours": 168},
+    {"path": "/home/alexey/.cache/ms-playwright", "depth": 1, "min_age_hours": 168},
+    {"path": "/home/alexey/.npm/_cacache", "depth": 1, "min_age_hours": 168},
+    {"path": "/home/alexey/.cargo/registry/cache", "depth": 1, "min_age_hours": 168},
+    {"path": "/home/alexey/.config/agent-hub/managed-engines/*/home/.cache", "depth": 2, "min_age_hours": 168},
+    {"path": "/home/alexey/.config/agent-hub/managed-engines/*/home/.npm/_cacache", "depth": 1, "min_age_hours": 168},
+    {"path": "/home/alexey/.config/agent-hub/managed-engines/*/home/go/pkg/mod/cache", "depth": 1, "min_age_hours": 168},
+    {"path": "/home/alexey/.config/agent-hub/managed-engines/*/home/.cargo/registry/cache", "depth": 1, "min_age_hours": 168}
+  ],
+  "scratch_rules": [
+    {"glob": "/tmp/hubtest-*", "min_age_hours": 24},
+    {"glob": "/tmp/pytest-of-*", "min_age_hours": 24},
+    {"glob": "/tmp/dataops-*", "min_age_hours": 24},
+    {"glob": "/tmp/playwright*", "min_age_hours": 24},
+    {"glob": "/tmp/miniflare-*", "min_age_hours": 24}
+  ],
+  "max_removals_per_run": 40,
+  "time_budget_s": 900
+}

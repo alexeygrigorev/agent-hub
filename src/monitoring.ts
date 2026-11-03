@@ -183,7 +183,59 @@ export type DiskFilesystem = {
   top_consumers?: DiskTopConsumer[];
   top_consumers_truncated?: boolean;
   error?: string | null;
+  floor?: DiskFloor | null;
 };
+
+/** Host disk floor janitor summary (intake fcc31e56) for a floor-managed filesystem. */
+export type DiskFloor = {
+  floor_bytes: number;
+  target_bytes: number;
+  cleanup_at: string | null;
+  free_after_cleanup_bytes: number | null;
+  freed_bytes: number;
+  removed: number;
+  dry_run: boolean;
+};
+
+/**
+ * Status of a floor-managed filesystem. Percent thresholds are informational
+ * here: alert only when a completed, non-dry-run cleanup pass still left free
+ * space below the floor and the latest observation remains below it.
+ */
+export function floorStatus(free: number, _percent: number, floor: DiskFloor, _observedMs: number): 'ok' | 'critical' {
+  if (free >= floor.floor_bytes) return 'ok';
+  const cleaned = !floor.dry_run && !!floor.cleanup_at && floor.free_after_cleanup_bytes !== null;
+  return cleaned && floor.free_after_cleanup_bytes! < floor.floor_bytes ? 'critical' : 'ok';
+}
+
+function parseFloor(raw: any): DiskFloor | null {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw !== 'object' || Array.isArray(raw)) throw new Error('invalid_floor');
+  const count = (v: any, nullable: boolean): number | null => {
+    if (nullable && (v === null || v === undefined)) return null;
+    const n = Number(v);
+    if (!Number.isSafeInteger(n) || n < 0) throw new Error('invalid_floor');
+    return n;
+  };
+  const floorBytes = count(raw.floor_bytes, false)!;
+  const targetBytes = count(raw.target_bytes, false)!;
+  if (floorBytes <= 0 || targetBytes < floorBytes) throw new Error('invalid_floor');
+  let cleanupAt: string | null = null;
+  if (raw.cleanup_at !== null && raw.cleanup_at !== undefined) {
+    const ms = typeof raw.cleanup_at === 'string' ? Date.parse(raw.cleanup_at) : NaN;
+    if (!Number.isFinite(ms)) throw new Error('invalid_floor');
+    cleanupAt = new Date(ms).toISOString();
+  }
+  return {
+    floor_bytes: floorBytes,
+    target_bytes: targetBytes,
+    cleanup_at: cleanupAt,
+    free_after_cleanup_bytes: count(raw.free_after_cleanup_bytes, true),
+    freed_bytes: count(raw.freed_bytes ?? 0, false)!,
+    removed: count(raw.removed ?? 0, false)!,
+    dry_run: raw.dry_run === true,
+  };
+}
 
 export type DiskTrend = {
   state: 'insufficient_history' | 'stale' | 'calculated';
@@ -572,10 +624,16 @@ export class MonitoringService {
       if (!Number.isFinite(percent) || percent < 0 || percent > 100) fail('invalid_percent');
       percent = Math.min(100, Math.max(0, Math.round(percent * 10) / 10));
 
-      // Status derived from threshold: >=95% critical, >=85% warn, else ok; error if error reported
+      let floor: DiskFloor | null = null;
+      try { floor = parseFloor(raw.floor); } catch { fail('invalid_floor'); }
+
+      // Status derived from threshold: >=95% critical, >=85% warn, else ok; error if error reported.
+      // A floor-managed filesystem uses floorStatus instead (no informational alerts).
       let computedStatus: 'ok' | 'warn' | 'critical' | 'error' = 'ok';
       if (raw.error || raw.status === 'error') {
         computedStatus = 'error';
+      } else if (floor) {
+        computedStatus = floorStatus(free, percent, floor, observedMs);
       } else if (percent >= DISK_THRESHOLDS.criticalPercent) {
         computedStatus = 'critical';
       } else if (percent >= DISK_THRESHOLDS.warnPercent) {
@@ -607,6 +665,7 @@ export class MonitoringService {
         top_consumers: topConsumers,
         top_consumers_truncated: Boolean(raw.top_consumers_truncated),
         error: raw.error ? String(raw.error).slice(0, 128) : null,
+        ...(floor ? { floor } : {}),
       });
     }
 
@@ -703,7 +762,11 @@ export class MonitoringService {
             .map(c => `${c.path} (${formatBytes(c.size_bytes)})`)
             .join(', ');
       }
-      const detail = `${fs.mount_point} on ${machineId} is at ${fs.percent}% (${formatBytes(fs.used_bytes)} / ${formatBytes(fs.total_bytes)} used)${topConsumersText}`;
+      const floorText = fs.floor
+        ? `; free ${formatBytes(fs.free_bytes)} is below the ${formatBytes(fs.floor.floor_bytes)} floor after automatic cleanup` +
+          (fs.floor.cleanup_at ? ` (last pass ${fs.floor.cleanup_at}, freed ${formatBytes(fs.floor.freed_bytes)})` : ' (no cleanup pass yet)')
+        : '';
+      const detail = `${fs.mount_point} on ${machineId} is at ${fs.percent}% (${formatBytes(fs.used_bytes)} / ${formatBytes(fs.total_bytes)} used)${floorText}${topConsumersText}`;
 
       if (!row || row.resolved_at !== null) {
         // Newly opened episode!
