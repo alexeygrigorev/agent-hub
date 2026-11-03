@@ -211,9 +211,16 @@ class DeviceActivation(unittest.TestCase):
 
         dispatcher = fleet.Dispatcher(cfg, lambda *a, **kw: {}, runner, journal_dir=self.tmp.name)
         prepared_cfgs = []
-        with patch('agent_hub_host.opencode_auth.prepare', side_effect=lambda c: prepared_cfgs.append(c) or {'ok': True}):
-            with self.assertRaisesRegex(ValueError, 'Fresh admission refused'):
-                dispatcher.dispatch(dict(actual_offer))
+        # Hermetic: the temp workspace may sit inside a linked git worktree
+        # (TMPDIR under .local/tmp), which would otherwise trigger the real
+        # worktree lock guard. Locking is covered by dedicated worktree
+        # tests; the regression under test here is the launcher-plan
+        # credential behavior (intake 1b47f2d4).
+        with patch('agent_hub_host.worktree_guard.bound_worktree_root', return_value=None), \
+             patch('agent_hub_host.worktree_guard.protect_bound_worktree', return_value=True):
+            with patch('agent_hub_host.opencode_auth.prepare', side_effect=lambda c: prepared_cfgs.append(c) or {'ok': True}):
+                with self.assertRaisesRegex(ValueError, 'Fresh admission refused'):
+                    dispatcher.dispatch(dict(actual_offer))
         self.assertEqual(prepared_cfgs, [cfg['opencode_auth']])
         self.assertEqual(len(submitted_payloads), 1)
         self.assertEqual(submitted_payloads[0]['model_requirements'], {
@@ -225,8 +232,10 @@ class DeviceActivation(unittest.TestCase):
         self.assertEqual(submitted_payloads[0]['managed_dir'], self.tmp.name)
 
         plan_has_creds['ok'] = True
-        with patch('agent_hub_host.opencode_auth.prepare', side_effect=lambda c: prepared_cfgs.append(c) or {'ok': True}):
-            accepted = dispatcher.dispatch(dict(actual_offer, id='da1e2c52-880e-463c-8f03-7a5fc257774f'))
+        with patch('agent_hub_host.worktree_guard.bound_worktree_root', return_value=None), \
+             patch('agent_hub_host.worktree_guard.protect_bound_worktree', return_value=True):
+            with patch('agent_hub_host.opencode_auth.prepare', side_effect=lambda c: prepared_cfgs.append(c) or {'ok': True}):
+                accepted = dispatcher.dispatch(dict(actual_offer, id='da1e2c52-880e-463c-8f03-7a5fc257774f'))
         self.assertEqual(accepted['state'], 'running')
         self.assertEqual(accepted['native_id'], 'native-go-1')
 
