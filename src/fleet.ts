@@ -596,6 +596,33 @@ function workspaceReady(caps: any, workspace: any): boolean {
   return workspaceCapable(caps?.workspaces, workspace);
 }
 
+/** Canonical key of a census catalog for the quiet-path check (intake e8a22f4c).
+ * Mirrors the row comparison in the PUT handler: terminal labels without a
+ * confirmed exit read as uncertain, nulls normalize, and volatile progress
+ * timestamps (sampled_at/last_progress_at/last_cpu_at) do not move the key.
+ * Tokens are excluded on purpose: idle catalogs keep a stable key while
+ * active catalogs change activity/progress every census anyway. */
+export function censusCatalogKey(sessions: any[]): string {
+  const parts: string[] = [];
+  const sorted = [...sessions].sort((a, b) => String(a?.native_id ?? '').localeCompare(String(b?.native_id ?? '')));
+  for (const s of sorted) {
+    const phase = ['exited', 'dead', 'pruned', 'forgotten'].includes(s?.phase) && s?.confirmed_exit !== true ? 'uncertain' : (s?.phase ?? null);
+    let progress: string | null = null;
+    try {
+      const raw = s?.progress;
+      const o = typeof raw === 'object' && raw !== null ? raw : JSON.parse(String(raw));
+      if (o && typeof o === 'object') {
+        const { sampled_at: _sa, last_progress_at: _lpa, last_cpu_at: _lca, ...rest } = o as any;
+        progress = JSON.stringify(rest);
+      } else progress = String(raw);
+    } catch { progress = s?.progress == null ? null : String(s.progress); }
+    parts.push(JSON.stringify([s?.native_id ?? null, s?.tag ?? null, s?.engine ?? null, phase,
+      s?.agent_state ?? null, s?.workspace ?? null, s?.cwd ?? null, s?.profile ?? null,
+      s?.account ?? null, s?.last_activity_at ?? null, s?.created_at_ms ?? null, progress]));
+  }
+  return parts.join('\n');
+}
+
 export class FleetService {
   /** Registry resolver injected by hub.ts: rebuilds repo_context from the
    * canonical catalog even when a caller supplies forged placement context. */
@@ -618,6 +645,7 @@ export class FleetService {
   private candidateCache = new Map<string, { revision: string; at: number; value: any[] }>();
   private pollMaintenanceAt = 0;
   private maintenanceDirty = true;
+  private lastCensusKey = new Map<string, string>();
 
   /** Run `query(placeholders)` over `ids` in bounded chunks: reads only matching rows. */
   private byChunks(ids: string[], query: (marks: string) => string, ...lead: any[]): any[] {
@@ -2970,6 +2998,25 @@ export class FleetService {
         ids.add(s.native_id);
       }
       return this.transaction(() => {
+        // Intake e8a22f4c: an unchanged catalog repeats on every host poll.
+        // When the canonical key and the linkage revision both match the last
+        // fully processed census, only the capped freshness upserts run below;
+        // every probe, reconcile, adoption and drain is skipped (near-zero reads).
+        // Quiet when the catalog itself is unchanged. The intake linkage
+        // revision is deliberately not part of the key: it moves on every
+        // fleet-wide intake write, while adoption is idempotent and reruns on
+        // the next changed census (credential/liveness paths read links live).
+        const censusKey = censusCatalogKey(data.sessions);
+        if (this.lastCensusKey.get(caller.machineId!) === censusKey) {
+          const quietNow = this.now();
+          this.sql.exec(`INSERT INTO fleet_catalog_census (machine_id, observed_at, complete) VALUES (?, ?, ?)
+            ON CONFLICT(machine_id) DO UPDATE SET observed_at=excluded.observed_at, complete=excluded.complete
+            WHERE fleet_catalog_census.complete != excluded.complete OR fleet_catalog_census.observed_at <= ?`,
+            caller.machineId!, new Date(quietNow).toISOString(), censusComplete ? 1 : 0, new Date(quietNow - 60000).toISOString());
+          this.sql.exec('INSERT INTO fleet_catalog_seen VALUES (?,?) ON CONFLICT(machine_id) DO UPDATE SET observed_at=excluded.observed_at WHERE fleet_catalog_seen.observed_at <= ?', caller.machineId!,
+            new Date(quietNow).toISOString(), new Date(quietNow - 60000).toISOString());
+          return response({ status: 'reported', written: 0 });
+        }
         // Record the newest completeness verdict before reconciliation or
         // queue draining can inspect capacity. A change of verdict is applied
         // immediately; unchanged reports retain the existing 60 s write cap.
@@ -3152,6 +3199,7 @@ export class FleetService {
         // unchanged rows retain last-change timestamps; the complete census
         // has separate freshness evidence, bounded to one host write/minute.
         this.sql.exec('INSERT INTO fleet_catalog_seen VALUES (?,?) ON CONFLICT(machine_id) DO UPDATE SET observed_at=excluded.observed_at WHERE fleet_catalog_seen.observed_at <= ?', caller.machineId!, new Date(this.now()).toISOString(), new Date(this.now() - 60000).toISOString());
+        this.lastCensusKey.set(caller.machineId!, censusKey);
         return response({ status: 'reported', written });
       });
     }
