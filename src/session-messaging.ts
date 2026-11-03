@@ -408,11 +408,12 @@ const CREDENTIAL_TTL_MS = 3600 * 1000; // 1 h access token (docs/SESSION-MESSAGI
 export function sessionsNeedingCredentials(sql:SqlStorage,machineId:string,now:number):{session_id:string;native_id:string;tag:string;workspace:string}[] {
   const key='machine:'+machineId;
   const old=Number(sql.exec('SELECT cursor FROM session_credential_scan WHERE key=?',key).toArray()[0]?.cursor??0);
-  const raw=sql.exec(`SELECT rowid AS scan_id,id,binding_json FROM session_control_sessions INDEXED BY session_control_machine_state
-    WHERE machine_id=? AND state='running' AND rowid>? ORDER BY rowid LIMIT 65`,machineId,old).toArray() as any[];
+  const raw=sql.exec(`SELECT rowid AS scan_id,id,machine_id,binding_json FROM session_control_sessions INDEXED BY session_control_state
+    WHERE state='running' AND rowid>? ORDER BY rowid LIMIT 65`,old).toArray() as any[];
   const out:any[]=[];let last=old,unfinished=false;
   for(const row of raw.slice(0,64)) {
     last=Number(row.scan_id);
+    if(row.machine_id!==machineId)continue;
     const identity:any=sql.exec("SELECT machine_id FROM agents INDEXED BY idx_agents_project_tag_unique WHERE COALESCE(project,'')=? AND tag=?",SESSION_PROJECT,row.id).toArray()[0];
     if(!identity || identity.machine_id!==machineId || row.binding_json===null)continue;
     let binding:any;try{binding=JSON.parse(row.binding_json);}catch{continue;}

@@ -338,16 +338,16 @@ function revokeNativeFamily(sql:SqlStorage,sessionId:string,family:string,now:nu
 }
 export function nativeSessionsNeedingIntakeCredentialPage(sql:SqlStorage,machineId:string,after=0):{sessions:any[];next:number} {
   // Bound raw running-machine rows before binding/link/credential filtering.
-  // This uses the deployed (machine_id,state,implicit rowid) index and does
+  // This uses the deployed (state,implicit rowid) index and does
   // not sort or anti-join the entire retained session/credential population.
-  const raw=sql.exec(`SELECT rowid AS scan_id,id,binding_json,fleet_launch_id FROM session_control_sessions
-    INDEXED BY session_control_machine_state WHERE machine_id=? AND state='running' AND rowid>?
-    ORDER BY rowid LIMIT ?`,machineId,after,NATIVE_SCAN_BATCH+1).toArray() as any[];
+  const raw=sql.exec(`SELECT rowid AS scan_id,id,machine_id,binding_json,fleet_launch_id FROM session_control_sessions
+    INDEXED BY session_control_state WHERE state='running' AND rowid>?
+    ORDER BY rowid LIMIT ?`,after,NATIVE_SCAN_BATCH+1).toArray() as any[];
   const out:any[]=[];
   let last=after;
   for(const row of raw.slice(0,NATIVE_SCAN_BATCH)) {
     last=Number(row.scan_id);
-    if(row.fleet_launch_id || row.binding_json===null)continue;
+    if(row.machine_id!==machineId || row.fleet_launch_id || row.binding_json===null)continue;
     let binding:any;try{binding=JSON.parse(row.binding_json);}catch{continue;}
     if(!binding?.native_id || !binding?.workspace)continue;
     const access:any=sql.exec('SELECT family_id,session_id FROM worker_access WHERE launch_id=?',row.id).toArray()[0];

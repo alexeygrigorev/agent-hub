@@ -52,6 +52,28 @@ describe('production-schema credential polling bounds',()=>{
     expect(indexes).toEqual([]);
   }));
 
+  it('bounds the running-state page before machine filtering on the actual deployed index layout',()=>fixture(async(_hub,raw)=>{
+    raw.exec('DROP INDEX IF EXISTS session_control_machine_state');
+    raw.exec('CREATE INDEX session_control_machine_state ON session_control_sessions(machine_id,state,created_at)');
+    raw.exec(`WITH RECURSIVE n(i) AS(SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<2100)
+      INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at)
+      SELECT 'busy-'||i,'test','busy-'||i,'{}','host','codex','interactive','running',?, ?,? FROM n`,JSON.stringify({native_id:'unlinked',workspace:'/repo'}),iso,iso);
+    session(raw,'late');raw.exec("INSERT INTO intake_tasks(id,data) VALUES('task',?)",JSON.stringify({id:'task',project:'demo',status:'open'}));
+    raw.exec("INSERT INTO intake_session_links VALUES('late','task','host_census_verified')");
+    const meter=new RowsMeter(()=>NOW),worker=new WorkerAccess(meter.wrap(raw),fn=>fn(),()=>true);worker.init();
+    let found=false;
+    for(let i=0;i<34;i++) {
+      const response=await meter.run('page-'+i,()=>worker.listNative({kind:'host',machineId:'host'} as any,['host']));
+      expect(response.status).toBe(200);
+      found ||= (await response.json() as any).sessions.some((row:any)=>row.session_id==='late');
+      expect(meter.snapshot()['page-'+i].rows_read).toBeLessThan(200);
+    }
+    expect(found).toBe(true);
+    const plan=raw.exec("EXPLAIN QUERY PLAN SELECT rowid,id,machine_id FROM session_control_sessions INDEXED BY session_control_state WHERE state='running' AND rowid>? ORDER BY rowid LIMIT 65",0).toArray().map((r:any)=>r.detail).join(' ');
+    expect(plan).toContain('session_control_state');
+    expect(plan).not.toMatch(/TEMP B-TREE|SCAN session_control_sessions/);
+  }));
+
   it('revokes all native-family members by authoritative IDs and preserves unrelated credentials',()=>fixture((_hub,raw)=>{
     unrelatedHistory(raw);session(raw,'ended','stopped');access(raw,'ended');
     const actor=NATIVE_WORKER_PROJECT+':native-ended';
