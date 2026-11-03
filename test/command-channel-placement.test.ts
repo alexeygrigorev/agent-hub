@@ -167,8 +167,19 @@ describe('command-channel health (intake 3aa850b4)', () => {
     seedCommand(ctx, { id: 'stuck-b', state: 'transported', createdDelta: -18 * 60_000, pollAtDelta: -17 * 60_000 });
     expect(health(ctx).state).toBe('unreachable');
     seedCommand(ctx, { id: 'claimed-then-failed', state: 'failed', createdDelta: -60_000,
-      claimToken: true, ack: { outcome: 'failed', reason: 'Inbox refused' } });
+      claimToken: true, ack: { outcome: 'failed', reason: 'Inbox refused', claim_token: 'token-claimed-then-failed' } });
     expect(health(ctx).state).toBe('ok');
+  }));
+
+  it('does not count server-side claim exhaustion as a host channel proof', () => fixture(async ctx => {
+    seedCommand(ctx, { id: 'stuck-a', state: 'recorded', createdDelta: -20 * 60_000, pollAtDelta: -19 * 60_000 });
+    seedCommand(ctx, { id: 'stuck-b', state: 'transported', createdDelta: -18 * 60_000, pollAtDelta: -17 * 60_000 });
+    expect(health(ctx).state).toBe('unreachable');
+    // expireClaim retains the row claim_token but its server-generated ack has
+    // no claim_token, distinguishing it from a host-submitted failure ack.
+    seedCommand(ctx, { id: 'retry-exhausted', state: 'failed', createdDelta: -60_000,
+      claimToken: true, ack: { outcome: 'failed', reason: 'claim_expired_retry_exhausted' } });
+    expect(health(ctx).state).toBe('unreachable');
   }));
 
   it('AC3: stale check-in (Hub transport failure) reads unknown, blocks only via machine_unavailable, alerts nothing', () => fixture(async ctx => {
