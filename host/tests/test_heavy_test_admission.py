@@ -557,6 +557,18 @@ class SharedReleaseDelegationTests(unittest.TestCase):
         }), encoding='utf-8')
         return module
 
+    def run_with_passwd_home(self, account_home):
+        admission_script = WRAPPER.with_name('heavy-test-admission.py')
+        bootstrap = (
+            'import pwd,runpy,sys; '
+            f'pwd.getpwuid=lambda uid:type("Pw",(),{{"pw_dir":{str(account_home)!r}}})(); '
+            f'sys.argv=[{str(admission_script)!r},"--wait","0","--",sys.executable,'
+            '"-c","raise SystemExit(0)"]; '
+            f'runpy.run_path({str(admission_script)!r},run_name="__main__")'
+        )
+        return subprocess.run([sys.executable, '-c', bootstrap], env=self.env,
+                              capture_output=True, text=True, timeout=10)
+
     def test_verified_active_release_runs_shared_implementation(self):
         self.install_module()
         result = subprocess.run([str(WRAPPER), '--wait', '0', '--', sys.executable,
@@ -582,9 +594,31 @@ class SharedReleaseDelegationTests(unittest.TestCase):
             encoding='utf-8')
         systemctl.chmod(0o755)
         self.install_module()
-        result = subprocess.run([str(WRAPPER), '--wait', '0', '--', sys.executable,
-                                 '-c', 'raise SystemExit(0)'], env=self.env,
-                                capture_output=True, text=True, timeout=10)
+        result = self.run_with_passwd_home(home)
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertTrue(self.marker.exists())
+        self.assertIn('no heavy-test slot free', result.stderr)
+
+    def test_passwd_release_root_is_selected_when_home_is_overridden(self):
+        account_home = self.root / 'account-home'
+        releases = account_home / '.local/share/agent-hub/host-releases-orch'
+        releases.mkdir(parents=True)
+        self.release.rename(releases / self.release.name)
+        self.release = releases / self.release.name
+        executable = self.release / '.venv/bin/python'
+        self.env['HOME'] = str(self.root / 'managed-home')
+        self.env.pop('AGENT_HUB_HOST_RELEASES_DIR', None)
+        systemctl = self.fake_bin / 'systemctl'
+        systemctl.write_text(
+            '#!/bin/sh\nprintf " { path=%s ; argv[]=%s }\\n" '
+            f'"{executable}" "{executable} -m agent_hub_host.session_host"\n',
+            encoding='utf-8')
+        systemctl.chmod(0o755)
+        self.install_module()
+
+        # Hub-managed engines and disposable test homes may override HOME.
+        # The service's release still lives under the account's passwd home.
+        result = self.run_with_passwd_home(account_home)
         self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
         self.assertTrue(self.marker.exists())
         self.assertIn('no heavy-test slot free', result.stderr)
