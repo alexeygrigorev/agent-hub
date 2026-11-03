@@ -328,13 +328,20 @@ describe('F5 canonical fleet launch reconciliation', () => {
       workspace: '/tmp/unrelated-foreign-workspace', native_created_at_ms: NATIVE_CREATED });
     expect(offeredBad.status).toBe(409);
     expect((await offeredBad.json() as any).error).toBe('fleet_launch_state');
-    // Terminal failures.
-    for (const state of ['failed', 'exited', 'uncertain']) {
+    // Terminal failures cannot bind.
+    for (const state of ['failed', 'exited']) {
       ensureFleetLaunch(sql, lid, 'hetzner', null, state);
       const res = await attempt(shape());
       expect(res.status, state).toBe(409);
       expect((await res.json() as any).error).toBe('fleet_launch_state');
     }
+    // An uncertain launch can still have started. Without an exact live
+    // native report, refuse it for missing evidence rather than treating the
+    // launch state itself as terminal.
+    ensureFleetLaunch(sql, lid, 'hetzner', null, 'uncertain');
+    const uncertainUnreported = await attempt(shape());
+    expect(uncertainUnreported.status).toBe(409);
+    expect((await uncertainUnreported.json() as any).error).toBe('fleet_native_unreported');
     // Foreign machine.
     ensureFleetLaunch(sql, lid, 'win35', null, 'running');
     const foreign = await attempt(shape());
