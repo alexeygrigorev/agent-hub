@@ -319,6 +319,11 @@ describe('warnings and tree stay capped as tables grow', () => {
     const body: any = await res.json();
     expect(body.warnings.length).toBeLessThanOrEqual(500);
     expect(body.truncated).toBe(true);
+    // Below the cap the common response keeps its exact historical shape.
+    hub.sql.exec("UPDATE session_control_sessions SET state = 'stopped' WHERE id LIKE 'perf-ctl-%'");
+    const slim: any = await (await svc.handle(new Request('https://hub.test/api/sessions/warnings'), admin)).json();
+    expect(slim.warnings).toEqual([]);
+    expect('truncated' in slim).toBe(false);
     const r = t.report(0);
     expect(r.total, `warnings top statements: ${JSON.stringify(r.top)}`).toBeLessThanOrEqual(12000);
     expect((hub.sql.exec("EXPLAIN QUERY PLAN SELECT * FROM session_control_sessions WHERE state = 'running' ORDER BY created_at, id LIMIT ?", 501).toArray() as any[]).map(x => String(x.detail)).join(' | ')).not.toMatch(/SCAN/i);
