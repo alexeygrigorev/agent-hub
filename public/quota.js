@@ -189,18 +189,16 @@
       if (ia !== -1 || ib !== -1) return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
       return a.localeCompare(b);
     });
-    const poolRem = percent(pool.remaining_percent);
-    if (poolRem !== null && entries.length) {
-      const minEntry = entries.reduce((best, cur) => {
-        const rem = cur[1]?.present === true ? percent(cur[1].percent_remaining) : null;
-        if (rem === null) return best;
-        return !best || rem < best.rem ? { win: cur[1], rem } : best;
-      }, null);
-      if (minEntry && minEntry.rem > poolRem) {
-        minEntry.win.percent_remaining = poolRem;
-      }
-    }
     return entries;
+  }
+
+  function unattributedMinimum(pool, windows) {
+    if (!['fresh', 'exhausted'].includes(pool.state)) return null;
+    const poolMin = percent(pool.remaining_percent);
+    if (poolMin === null) return null;
+    const values = windows.map(([, win]) => win?.present === true ? percent(win.percent_remaining) : null)
+      .filter(value => value !== null);
+    return !values.length || poolMin < Math.min(...values) ? poolMin : null;
   }
 
   function collectBankedResets(data, pools, resetsSnapshot) {
@@ -391,6 +389,10 @@
       const windows = ['fresh', 'exhausted'].includes(state) || hasPresentWindow
         ? allWindows
         : [];
+      const poolMinimum = unattributedMinimum(pool, windows);
+      if (poolMinimum !== null) {
+        body.append(element('p', `Pool minimum: ${poolMinimum}% remaining (window not identified)`, 'quota-provider__message'));
+      }
       if (!windows.length) {
         const message = element('p',
           providerError || (state === 'stale'
