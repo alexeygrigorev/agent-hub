@@ -27,14 +27,15 @@ it('initializes an empty exported Hub within the strict combined daily budget', 
 it('reinitializes host goal trigger wiring without scanning the schema for trigger existence',async()=>{
  const stub=(env as any).HUB.get((env as any).HUB.idFromName('host-goal-init-'+crypto.randomUUID()));
  await (runInDurableObject as any)(stub,(hub:any,state:any)=>{
-  const queries:string[]=[];
-  const sql=new Proxy(hub.sql,{get(target,key){if(key==='exec')return(q:string,...args:any[])=>{queries.push(q);return target.exec(q,...args);};const v=target[key];return typeof v==='function'?v.bind(target):v;}});
-  const goals=new HostGoals(sql,hub.fleetService);
+  // Production services share the configured SQL handle and its verified
+  // locator records; a new unconfigured proxy would model a different owner.
+  const goals=new HostGoals(hub.sql,hub.fleetService);
   hub.meter.runSync('host-goal-repeat',()=>{goals.init();goals.init();});
-  expect(queries.some(q=>/sqlite_master.*type\s*=\s*'trigger'/i.test(q))).toBe(false);
+  const queries=hub.meter.statementTop(4096).filter((row:any)=>row.scope==='host-goal-repeat').map((row:any)=>row.sql);
+  expect(queries.some((q:string)=>/sqlite_master.*type\s*=\s*'trigger'/i.test(q))).toBe(false);
   expect(hub.meter.snapshot()['host-goal-repeat'].rows_read).toBeLessThan(20);
   const names=state.storage.sql.exec("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'host_goal_%'").toArray().map((r:any)=>r.name);
-  expect(names.sort()).toEqual(['host_goal_launch_running_v2','host_goal_running_insert_v2','host_goal_running_update_v2']);
+  expect(names.sort()).toEqual(['host_goal_launch_running_v2','host_goal_running_insert','host_goal_running_update']);
   expect(hub.rowBudget.status().stopped).toBe(false);
  });
 });
@@ -50,7 +51,7 @@ it.each([false,true])('measures full uncached initialization including real lega
    setup.exec("DELETE FROM hub_init_stamps WHERE key='agents_projectless_collision_validation_v1'");
    // Locator hints are untrusted identifiers, never definition receipts.
    // Gather before the measured cold boundary, without warming its SQL handle.
-   const rows=state.storage.sql.exec("SELECT rowid,name,type,tbl_name FROM sqlite_master WHERE name IN ('messages_bind_agents','resource_catalog_fleet_sessions_update','fleet_launch_runtime_exit','agents_no_legacy_collision_insert','agents_no_legacy_collision_update')").toArray();
+   const rows=state.storage.sql.exec("SELECT rowid,name,type,tbl_name FROM sqlite_master WHERE name IN ('messages_bind_agents','resource_catalog_fleet_sessions_update','fleet_launch_runtime_exit','agents_no_legacy_collision_insert','agents_no_legacy_collision_update','host_goal_running_insert','host_goal_running_update')").toArray();
    startupEnv={...env,SCHEMA_OBJECT_ROWID_HINTS:JSON.stringify(rows)};
   }
   // Preserve physical tables, rows and receipts. Reset the SQL/cache graph;

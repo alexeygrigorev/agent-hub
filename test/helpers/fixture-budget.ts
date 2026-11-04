@@ -1,3 +1,5 @@
+import type {RowsMeter} from '../../src/rows-meter';
+
 /** Test fixtures are separate synthetic days, never a larger production limit.
  * Use explicitly at case boundaries for shared named Hub instances. Business
  * clocks, SQL wrappers, durable ledger persistence and breaker behavior remain
@@ -39,13 +41,13 @@ export const advanceFixtureBudgetDay=freshFixtureBudgetDay;
  * exported subclass. Rebuild its services after prepayment instead of creating
  * a second live DurableObject on the same state and stacking storage guards.
  * Each independent restart scenario uses its own strict synthetic budget day. */
-export async function restartFixtureHub<T>(hub:T, envOverride?:unknown):Promise<T> {
+export async function restartFixtureHub<T>(hub:T, envOverride?:unknown, nativeMeter?:RowsMeter):Promise<T> {
   const instance=hub as any;
   await advanceFixtureBudgetDay(instance);
   await instance.rowBudget.releaseUnused();
   await instance.rowBudget.begin(true);
   instance.observedCatalog?.reset();
-  instance.sql=instance.meter.wrap(instance.writes.wrap(instance.rowBudget.wrap(instance.ctx.storage.sql)));
+  instance.sql=instance.meter.wrap(instance.writes.wrap(instance.rowBudget.wrap(nativeMeter ? nativeMeter.wrap(instance.ctx.storage.sql) : instance.ctx.storage.sql)));
   instance.observedCatalog=new instance.observedCatalog.constructor(instance.sql,instance.writes);
   if(envOverride!==undefined)instance.env=envOverride;
   instance.initializeServices(instance.env);

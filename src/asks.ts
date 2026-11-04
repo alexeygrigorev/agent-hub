@@ -1,3 +1,4 @@
+import {MetadataCompat} from './metadata-compat';
 import { boundedRecentHoleInput,boundedBatchSubjects,batchCompleteStillOpen,boundedReconcilePage,type AskBatchKind } from './ask-bounded-observation';
 /** Ask ledger (intake 55c10deb, Alexey t1984u). Hub stores every message Alexey
  * sends an agent verbatim, splits it into atomic asks and maps each ask to an
@@ -157,6 +158,7 @@ export type AskHooks = {
 export type AskCaller = { admin: boolean; actor: string; machineId?: string | null };
 
 export class AskLedger {
+  private metadata!:MetadataCompat;
   constructor(private sql: SqlStorage, private intake: IntakeService, private tx: <T>(fn: () => T) => T,
     private hooks: AskHooks = {}, private now = Date.now) {}
   init() {
@@ -192,9 +194,7 @@ export class AskLedger {
       last_tick INTEGER, last_result TEXT, daily_day TEXT, last_user_batch_at INTEGER, reconcile_intake TEXT, reconcile_session TEXT,
       reconcile_started_at INTEGER, reconcile_batch_at INTEGER, reconcile_cursor INTEGER NOT NULL DEFAULT 0, last_reconcile_run TEXT,
       last_reconcile_at INTEGER)`);
-    for (const col of ['reconcile_cursor INTEGER NOT NULL DEFAULT 0', 'last_reconcile_run TEXT', 'last_reconcile_at INTEGER']) {
-      try { this.sql.exec(`ALTER TABLE ask_meta ADD COLUMN ${col}`); } catch { /* already present */ }
-    }
+    this.metadata=new MetadataCompat(this.sql,'ask_meta',['reconcile_cursor','last_reconcile_run','last_reconcile_at']);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS ask_reconcile_runs(id TEXT PRIMARY KEY, ran_at INTEGER NOT NULL, from_cursor INTEGER NOT NULL,
       to_cursor INTEGER NOT NULL, scanned_messages INTEGER NOT NULL, found_asks INTEGER NOT NULL, mapped INTEGER NOT NULL,
       appended INTEGER NOT NULL, created INTEGER NOT NULL, created_ids TEXT NOT NULL, appended_ids TEXT NOT NULL,
@@ -221,7 +221,10 @@ export class AskLedger {
     }
   }
   private rows(q: string, ...a: any[]): Obj[] { return this.sql.exec(q, ...a).toArray() as Obj[]; }
-  private meta(): Obj { return this.rows('SELECT * FROM ask_meta WHERE id=1')[0]; }
+  private meta(): Obj { return this.metadata.read(1); }
+  private reconcileMeta(cursor:number,extra:Obj={}) {
+    this.tx(()=>this.metadata.patch(1,{...extra,reconcile_cursor:Math.max(Number(this.meta().reconcile_cursor??0),cursor)}));
+  }
   /** Every intake: only for the operator-run check (history backfill maps to closed intakes). */
   private tasks(): Obj[] {
     if(this.rows('SELECT id FROM intake_tasks ORDER BY id LIMIT 129').length>128)fail('ask_intake_observation_limited',503);
@@ -730,7 +733,7 @@ export class AskLedger {
     if(observation.limited)fail('ask_reconcile_parts_observation_limited',503);
     const msgRows=observation.messages,toCursor=observation.toCursor,askRows=observation.asks;
     if(!msgRows.length){
-      if(toCursor>fromCursor)this.sql.exec('UPDATE ask_meta SET reconcile_cursor=MAX(reconcile_cursor,?) WHERE id=1',toCursor);
+      if(toCursor>fromCursor)this.reconcileMeta(toCursor);
       return {state:observation.observationPending?'observation_pending':'no_new_messages',from_cursor:fromCursor,to_cursor:toCursor,scanned_messages:0,
         source_rows_scanned:observation.sourceRowsScanned,observation_pending:observation.observationPending,found_asks:0,mapped:0,appended:0,created:0,created_ids:[],appended_ids:[],mapped_ids:[],report:null};
     }
@@ -889,11 +892,12 @@ export class AskLedger {
       found_asks: askRows.length, mapped: MappedCount, appended: AppendedCount, created: CreatedCount,
       created_ids: createdIds, appended_ids: appendedIds, mapped_ids: mappedIds, report: reportText,
     };
-    this.sql.exec(`INSERT INTO ask_reconcile_runs(id,ran_at,from_cursor,to_cursor,scanned_messages,found_asks,mapped,appended,created,created_ids,appended_ids,mapped_ids,report)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, runId, now, fromCursor, toCursor, msgRows.length, askRows.length, MappedCount, AppendedCount, CreatedCount,
-      JSON.stringify(createdIds), JSON.stringify(appendedIds), JSON.stringify(mappedIds), reportText);
-    this.sql.exec('UPDATE ask_meta SET reconcile_cursor=MAX(reconcile_cursor,?),last_reconcile_run=?,last_reconcile_at=? WHERE id=1',
-      toCursor, JSON.stringify(runRow), now);
+    this.tx(()=>{
+      this.sql.exec(`INSERT INTO ask_reconcile_runs(id,ran_at,from_cursor,to_cursor,scanned_messages,found_asks,mapped,appended,created,created_ids,appended_ids,mapped_ids,report)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, runId, now, fromCursor, toCursor, msgRows.length, askRows.length, MappedCount, AppendedCount, CreatedCount,
+        JSON.stringify(createdIds), JSON.stringify(appendedIds), JSON.stringify(mappedIds), reportText);
+      this.reconcileMeta(toCursor,{last_reconcile_run:JSON.stringify(runRow),last_reconcile_at:now});
+    });
     if (m.reconcile_intake && (askRows.length > 0 || CreatedCount > 0 || AppendedCount > 0)) {
       this.intake.serviceRecordEvent(m.reconcile_intake, {
         event: { kind: 'note', text: reportText, actor: 'hub:service:ask-reconciler', sourceType: 'schedule', sourceRef: `reconcile-run:${runId}`, sourceTimestamp: new Date(now).toISOString(), intakeKey: `reconcile-report-${fromCursor}-${toCursor}`, authority: 'operator_record' },

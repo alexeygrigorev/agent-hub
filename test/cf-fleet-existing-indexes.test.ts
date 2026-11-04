@@ -33,21 +33,32 @@ describe('Fleet recovery and paging use deployed indexes',()=>{
     const actual=seed.exec("SELECT rowid,sql FROM sqlite_master WHERE name='fleet_launch_runtime_exit' AND type='index'").one();
     const other=seed.exec("SELECT rowid FROM sqlite_master WHERE name='fleet_sessions' AND type='table'").one();
     await hub.rowBudget.begin(true);const day=hub.rowBudget.status().day;
-    const valid=measured(hub.sql);configureSchemaObjectHints(valid.sql,{fleet_launch_runtime_exit:actual.rowid});
+    const nativeMeter=new RowsMeter(()=>NOW),guarded=hub.writes.wrap(hub.rowBudget.wrap(nativeMeter.wrap(raw)));
+    const actualOperations=()=>Object.values(nativeMeter.snapshot()).reduce((sum:number,row:any)=>sum+row.rows_read+row.rows_written,0);
+    const used=()=>hub.rowBudget.status().reserved_total-hub.rowBudget.status().available_total;
+    const valid=measured(guarded);configureSchemaObjectHints(valid.sql,{fleet_launch_runtime_exit:actual.rowid});valid.reset();
+    const before=used(),nativeBefore=actualOperations();
     expect(readSchemaObject(valid.sql,identity)?.sql).toBe(actual.sql);
-    expect(valid.queries).toHaveLength(1);expect(valid.queries[0]).toContain('WHERE rowid=?');expect(valid.rows()).toBeLessThanOrEqual(1);
-    const wrong=measured(hub.sql);configureSchemaObjectHints(wrong.sql,JSON.stringify([{name:identity.name,rowid:other.rowid}]));
+    expect(valid.queries.filter(q=>q.includes('WHERE rowid=?'))).toHaveLength(1);
+    const physical=nativeMeter.statementTop(4096).filter(row=>row.sql.includes('FROM sqlite_master')&&row.sql.includes('WHERE rowid=?'));
+    expect(physical.reduce((sum,row)=>sum+row.rows_read,0)).toBe(1);
+    expect(valid.queries.some(q=>q.includes('ORDER BY rowid LIMIT 1025'))).toBe(false);
+    // Every locator lookup/persist and native metadata counter remains billed.
+    expect(used()-before).toBe(actualOperations()-nativeBefore);
+    const wrong=measured(guarded);configureSchemaObjectHints(wrong.sql,JSON.stringify([{name:identity.name,rowid:other.rowid}]));wrong.reset();
     expect(readSchemaObject(wrong.sql,identity)?.sql).toBe(actual.sql);
-    expect(wrong.queries.filter(q=>q.includes('ORDER BY rowid LIMIT 1025'))).toHaveLength(1);
+    // An already verified durable locator outranks this wrong deployment hint.
+    expect(wrong.queries.some(q=>q.includes('ORDER BY rowid LIMIT 1025'))).toBe(false);
     const replacement="CREATE INDEX fleet_launch_runtime_exit ON fleet_launches(updated_at) WHERE state='failed'";
     // An operator/schema owner can mutate outside WriteWatch. Verification
     // must read native metadata rather than reuse a positive SQL memo.
     raw.exec('DROP INDEX fleet_launch_runtime_exit');raw.exec(replacement);
-    // Reusing the hinted rowid never reuses its prior definition. A create
-    // refresh reads only the newest actual schema object and verifies it.
     valid.reset();expect(readSchemaObject(valid.sql,identity)?.sql).toBe(replacement);
-    valid.reset();expect(noteCreatedSchemaObject(valid.sql,identity)?.sql).toBe(replacement);
-    expect(valid.queries).toHaveLength(1);expect(valid.rows()).toBeLessThanOrEqual(1);
+    valid.reset();const refreshBefore=used(),refreshNativeBefore=actualOperations();
+    expect(noteCreatedSchemaObject(valid.sql,identity)?.sql).toBe(replacement);
+    expect(valid.queries.filter(q=>q.includes('ORDER BY rowid DESC LIMIT 1'))).toHaveLength(1);
+    expect(valid.queries.some(q=>/^(?:INSERT INTO|UPDATE) schema_object_locators/i.test(q))).toBe(false);
+    expect(used()-refreshBefore).toBe(actualOperations()-refreshNativeBefore);
     valid.reset();expect(readSchemaObject(valid.sql,identity)?.sql).toBe(replacement);
     expect(valid.queries.some(q=>q.includes('ORDER BY rowid LIMIT 1025'))).toBe(false);
     expect(hub.rowBudget.status()).toMatchObject({day,limit_total:20000,stopped:false});

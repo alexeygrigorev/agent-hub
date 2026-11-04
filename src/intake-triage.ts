@@ -1,3 +1,4 @@
+import {MetadataCompat} from './metadata-compat';
 /** Hourly backlog triage (intake d8d509d2 AC5). Forgotten intakes that carry no
  * triage verdict yet are handed, oldest first and a bounded slice at a time,
  * to ONE headless Claude Opus reviewer session through the canonical session
@@ -82,12 +83,11 @@ export class IntakeTriage {
   constructor(private sql: SqlStorage, private intake: Pick<IntakeService, 'statusAuthorizedTasks'> & Partial<Pick<IntakeService, 'watchdogTasks' | 'statusTaskById'>>,
     private watchdog: Pick<IntakeWatchdog, 'project'>, private tx: <T>(fn: () => T) => T,
     private hooks: TriageHooks = {}, private now = Date.now) {}
+  private metadata!:MetadataCompat;
   init() {
     this.sql.exec('CREATE TABLE IF NOT EXISTS intake_triage_meta(id INTEGER PRIMARY KEY CHECK(id=1),last_tick INTEGER,last_source TEXT,last_result TEXT,last_session TEXT,last_alert TEXT,task_cursor TEXT NOT NULL DEFAULT \'\',request_cursor TEXT NOT NULL DEFAULT \'\')');
     this.sql.exec('INSERT OR IGNORE INTO intake_triage_meta(id) VALUES(1)');
-    const cols = new Set(this.rows('PRAGMA table_info(intake_triage_meta)').map(row => row.name));
-    for (const [name, def] of [['last_session','TEXT'],['last_alert','TEXT'],['task_cursor',"TEXT NOT NULL DEFAULT ''"],['request_cursor',"TEXT NOT NULL DEFAULT ''"]])
-      if (!cols.has(name)) this.sql.exec(`ALTER TABLE intake_triage_meta ADD COLUMN ${name} ${def}`);
+    this.metadata=new MetadataCompat(this.sql,'intake_triage_meta',['last_session','last_alert','task_cursor','request_cursor']);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS intake_triage_requests(task_id TEXT PRIMARY KEY, request_key TEXT NOT NULL,
       session_id TEXT, state TEXT NOT NULL, requested_at INTEGER NOT NULL)`);
     this.sql.exec('CREATE INDEX IF NOT EXISTS intake_triage_pending ON intake_triage_requests(state,task_id)');
@@ -97,7 +97,7 @@ export class IntakeTriage {
   }
   private rows(query: string, ...args: any[]): Obj[] { return this.sql.exec(query, ...args).toArray() as Obj[]; }
   status(): Obj {
-    const m = this.rows('SELECT last_tick,last_source,last_result,last_alert FROM intake_triage_meta WHERE id=1')[0] ?? {};
+    const m = this.metadata.read(1);
     const pending = this.rows("SELECT task_id FROM intake_triage_requests INDEXED BY intake_triage_pending WHERE state='requested' ORDER BY task_id LIMIT 1001").length;
     return { last_checked_at: m.last_tick ?? null, source: m.last_source ?? null, last_result: parse(m.last_result), pending_requests: pending > 1000 ? null : pending, pending_requests_lower_bound: Math.min(pending,1000), pending_requests_truncated: pending > 1000,
       start_alert: m.last_alert ?? null };
@@ -111,22 +111,22 @@ export class IntakeTriage {
   }
   /** Alert once per distinct failure reason; a healthy reviewer resolves it. */
   private async surface(failure: string | null, detail?: string) {
-    const m = this.rows('SELECT last_alert FROM intake_triage_meta WHERE id=1')[0] ?? {};
+    const m = this.metadata.read(1);
     if ((m.last_alert ?? null) === failure) return;
-    this.sql.exec('UPDATE intake_triage_meta SET last_alert=? WHERE id=1', failure);
+    this.metadata.patch(1,{last_alert:failure});
     if (this.hooks.alert) {
       try { await this.hooks.alert(TRIAGE_ALERT_SUBJECT, failure === null ? null : (detail ?? failure)); } catch { /* the ledger keeps the state */ }
     }
   }
   /** The previous start's outcome: a launch failure releases its slice and alerts. */
   private async reconcileLastStart(): Promise<string | null> {
-    const m = this.rows('SELECT last_session FROM intake_triage_meta WHERE id=1')[0] ?? {};
+    const m = this.metadata.read(1);
     if (!m.last_session) return null;
     const failure = sessionLaunchFailure(this.sql, m.last_session);
     if (failure) {
       // Nothing ran: offer the slice again instead of holding it for the retry window.
       this.sql.exec("DELETE FROM intake_triage_requests WHERE session_id=? AND state='requested'", m.last_session);
-      this.sql.exec('UPDATE intake_triage_meta SET last_session=NULL WHERE id=1');
+      this.metadata.patch(1,{last_session:null});
       await this.surface(failure, `Hourly backlog triage reviewer ${m.last_session} failed to start: ${failure}. Triage is not running until this is fixed; Hub retries hourly.`);
       return failure;
     }
@@ -134,7 +134,7 @@ export class IntakeTriage {
     // Running (or ended after running) proves the start path works: resolve and
     // forget it, so an old healthy session never resolves a later refusal's alert.
     if (!s || s.state === 'running' || !ACTIVE.has(s.state)) {
-      this.sql.exec('UPDATE intake_triage_meta SET last_session=NULL WHERE id=1');
+      this.metadata.patch(1,{last_session:null});
       if (s) await this.surface(null);
     }
     return null;
@@ -148,7 +148,7 @@ export class IntakeTriage {
     });
     if (!acquired) return { state: 'already_checked' };
     const finish = (result: Obj) => { this.sql.exec('UPDATE intake_triage_meta SET last_result=? WHERE id=1', JSON.stringify(result)); return result; };
-    const meta = this.rows('SELECT task_cursor,request_cursor FROM intake_triage_meta WHERE id=1')[0];
+    const meta = this.metadata.read(1);
     const after = String(meta.task_cursor ?? '');
     const tasks = typeof this.intake.watchdogTasks === 'function'
       ? this.intake.watchdogTasks(after, TRIAGE_OBSERVATION_BATCH)
@@ -156,7 +156,7 @@ export class IntakeTriage {
         .sort((a,b) => String(a.id).localeCompare(String(b.id))).slice(0,TRIAGE_OBSERVATION_BATCH);
     const limited = tasks.length >= TRIAGE_OBSERVATION_BATCH || after !== '';
     const next = tasks.length >= TRIAGE_OBSERVATION_BATCH ? String(tasks[tasks.length-1].id) : '';
-    this.sql.exec('UPDATE intake_triage_meta SET task_cursor=? WHERE id=1', next);
+    this.metadata.patch(1,{task_cursor:next});
     const byId = new Map(tasks.map(t => [t.id, t]));
     // Reconcile a separate fair request page by primary key, never assume an
     // intake missing from THIS task page was deleted or completed.
@@ -167,13 +167,13 @@ export class IntakeTriage {
         : this.intake.statusAuthorizedTasks({ admin: true }).find(t => t.id === r.task_id);
       if (!t || hasTriageVerdict(t)) this.sql.exec("UPDATE intake_triage_requests SET state='triaged' WHERE task_id=?", r.task_id);
     }
-    this.sql.exec('UPDATE intake_triage_meta SET request_cursor=? WHERE id=1', requests.length > 64 ? String(requests[63].task_id) : '');
+    this.metadata.patch(1,{request_cursor:requests.length > 64 ? String(requests[63].task_id) : ''});
     const lastFailure = await this.reconcileLastStart();
     const active = this.activeSession();
     // A reviewer stuck waiting for placement still owns its slice (never a
     // duplicate start, never an auto-cancel) but is surfaced once (79458f2d).
     const held = staleHeldReviewer(active, now);
-    const alerted = this.rows('SELECT last_alert FROM intake_triage_meta WHERE id=1')[0]?.last_alert;
+    const alerted = this.metadata.read(1).last_alert;
     if (held) await this.surface(held, `Hourly backlog triage reviewer ${active!.id} has waited ${Math.round((now - Date.parse(active!.created_at)) / 60000)} min for placement (${held}). Triage is not running until it is placed or cancelled.`);
     else if (typeof alerted === 'string' && alerted.startsWith('reviewer_held:')) await this.surface(null);
     if (active) return finish({ state: 'reviewer_active', checked_at: now, session_id: active.id, session_state: active.state, held_alert: held });
@@ -208,7 +208,7 @@ export class IntakeTriage {
     const error = id ? null : String(result.body?.reason || result.body?.error || 'admission_refused').slice(0, 128);
     if (id) {
       this.sql.exec('UPDATE intake_triage_requests SET session_id=? WHERE request_key=?', id, input.key);
-      this.sql.exec('UPDATE intake_triage_meta SET last_session=? WHERE id=1', id);
+      this.metadata.patch(1,{last_session:id});
     }
     // An explicit refusal created nothing: offer the slice again next hour. An
     // unknown outcome (5xx) keeps the hold so a lost reply never duplicates.

@@ -1,4 +1,7 @@
 /** Durable host bring-up goals. Installation alone never proves readiness. */
+import {readCompatibleMetadata} from './metadata-compat';
+import {noteCreatedSchemaObject} from './schema-object-locator';
+import {schemaSqlEquivalent} from './schema-sql-equivalent';
 import type { SqlStorage } from '@cloudflare/workers-types';
 import type { FleetService } from './fleet';
 import { effectiveCheckin } from './registry';
@@ -40,9 +43,18 @@ export class HostGoals {
             AND r.sha=g.sha AND r.current_sha=g.sha AND r.state='current' AND r.reported_at>=g.set_at
         )`;
     for (const event of ['INSERT', 'UPDATE']) {
-      this.sql.exec(`DROP TRIGGER IF EXISTS host_goal_running_${event.toLowerCase()}`);
-      this.sql.exec(`CREATE TRIGGER IF NOT EXISTS host_goal_running_${event.toLowerCase()}_v2
-        AFTER ${event} ON fleet_sessions WHEN NEW.phase='running' BEGIN ${recordProof}; END`);
+      // These canonical names already carry the exact strong proof in the
+      // deployed schema. Keep them rather than dropping/recreating metadata.
+      // Fresh databases use the same names; old v2 aliases can coexist (the
+      // verified_at IS NULL CAS prevents duplicate successful proof writes).
+      const name='host_goal_running_'+event.toLowerCase();
+      const definition=`CREATE TRIGGER IF NOT EXISTS ${name}
+        AFTER ${event} ON fleet_sessions WHEN NEW.phase='running' BEGIN ${recordProof}; END`;
+      this.sql.exec(definition);
+      // A new object is verified at the schema tail; an existing one uses
+      // its untrusted locator and exact LIVE SQL, never a receipt/name alone.
+      const actual=noteCreatedSchemaObject(this.sql,{name,type:'trigger',table:'fleet_sessions'});
+      if(!actual||!schemaSqlEquivalent(actual.sql,definition))throw new Error('host_goal_trigger_upgrade_required');
     }
     this.sql.exec(`CREATE TRIGGER IF NOT EXISTS host_goal_launch_running_v2
       AFTER UPDATE ON fleet_launches WHEN NEW.state='running' BEGIN ${recordProof}; END`);
@@ -74,7 +86,7 @@ export class HostGoals {
     const host: any = this.sql.exec('SELECT last_checkin_at,drained,capabilities FROM machines WHERE id=?', machine).toArray()[0];
     const seen = Date.parse(effectiveCheckin(machine, host?.last_checkin_at) || '');
     const online = !host?.drained && Number.isFinite(seen) && this.now() - seen <= 180000;
-    const release: any = this.sql.exec('SELECT * FROM host_release_targets WHERE machine_id=?', machine).toArray()[0];
+    const release: any = readCompatibleMetadata(this.sql,'host_release_targets',machine,this.sql.exec('SELECT * FROM host_release_targets WHERE machine_id=?', machine).toArray()[0]);
     const releaseReady = release?.sha === goal.sha && release?.current_sha === goal.sha && release?.state === 'current' && release.reported_at >= goal.set_at;
     const advertisedModes = hostCapabilities(host?.capabilities).fleet_modes;
     const modes = Array.isArray(advertisedModes) ? advertisedModes : [];

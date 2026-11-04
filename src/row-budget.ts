@@ -466,8 +466,21 @@ export class RowBudget {
     };
     if (parsed.unsupported) deny('index migration requires a supported single-statement build');
     for (const build of parsed.builds) {
+      // Unqualified targets resolve to TEMP before MAIN. Never let a MAIN
+      // metadata proof authorize a different, shadowing source table.
+      const shadow=sql.exec("SELECT schema FROM pragma_table_list(?) WHERE schema='temp' LIMIT 1",build.table).toArray();
+      if(shadow.length)deny('temporary index source is not supported');
       let facts=this.indexFactsEnabled?this.indexFacts.get(foldSqlIdentifier(build.table)):undefined;
       if(!facts){
+        // Exact-name metadata returns at most one index column, even for a
+        // wide or heavily indexed table. An existing schema-wide index name
+        // makes CREATE INDEX IF NOT EXISTS a native no-op: its source does
+        // not need inspection. This proof is live and never cached. SQLite
+        // also exposes WITHOUT ROWID primary-key columns through this pragma;
+        // a same-name table cannot become an index (native CREATE rejects the
+        // name collision before touching source rows, then stops this budget).
+        const present=sql.exec("SELECT cid FROM pragma_index_info(?, 'main') LIMIT 1",build.name).toArray();
+        if(present.length)continue;
         const indexes=sql.exec("SELECT name FROM pragma_index_list(?, 'main') LIMIT ?",build.table,INDEX_METADATA_LIMIT+1).toArray() as any[];
         const names=new Set(indexes.map(row=>foldSqlIdentifier(String(row.name))));
         // Only complete, bounded table-local facts are retained. The original

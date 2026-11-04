@@ -81,8 +81,45 @@ describe('index migration cost preflight', () => {
     sql.exec('CREATE INDEX IF NOT EXISTS already_present ON existing_source(value)').toArray();
     expect(observed.calls.some(call => /^SELECT 1 FROM/.test(call.query))).toBe(false);
     expect(observed.calls.filter(call => /CREATE INDEX/.test(call.query))).toHaveLength(1);
-    expect(observed.calls.some(call => /pragma_index_list/.test(call.query))).toBe(true);
+    expect(observed.calls.some(call => /pragma_index_info/.test(call.query))).toBe(true);
+    expect(observed.calls.some(call => /pragma_index_list/.test(call.query))).toBe(false);
     expect(budget.status().stopped).toBe(false);
+  }));
+
+  it('refuses a TEMP-shadowed source before relying on any MAIN index proof', async () => {
+    const budget=new RowBudget(new LedgerStore());await budget.begin(true);
+    const queries:string[]=[];
+    const native={exec(query:string){queries.push(query);return {rowsRead:1,rowsWritten:0,
+      *[Symbol.iterator](){yield {cid:0};}};}};
+    expect(()=>budget.wrap(native as any).exec('CREATE INDEX IF NOT EXISTS existing_main_index ON shadowed_source(id)'))
+      .toThrow(RowBudgetExceeded);
+    expect(queries).toEqual(["SELECT schema FROM pragma_table_list(?) WHERE schema='temp' LIMIT 1"]);
+    expect(budget.status().stopped).toBe(true);
+  });
+
+  it('uses one live exact-name proof for an expression index without scanning its source', () => nativeCase(async raw => {
+    fixture(raw,'expression_source',INDEX_BUILD_SOURCE_LIMIT+5);
+    raw.exec('CREATE INDEX expression_present ON expression_source((value+1),id)');
+    const budget=new RowBudget(new LedgerStore());await budget.begin(true);
+    const observed=observe(raw),sql=budget.wrap(observed.sql),before=budget.status().available_total;
+    sql.exec('CREATE INDEX IF NOT EXISTS expression_present ON expression_source((value+1),id)').toArray();
+    expect(observed.calls.filter(call=>/pragma_index_info/.test(call.query))).toHaveLength(1);
+    expect(observed.calls.some(call=>/pragma_index_list|NOT INDEXED/.test(call.query))).toBe(false);
+    const actual=observed.calls.reduce((sum,call)=>sum+Number(call.cursor.rowsRead)+Number(call.cursor.rowsWritten),0);
+    expect(before-budget.status().available_total).toBe(actual);
+    expect(actual).toBeLessThanOrEqual(2);
+    expect(budget.status().stopped).toBe(false);
+  }));
+
+  it('fails closed on a WITHOUT ROWID table name collision before any index build', () => nativeCase(async raw => {
+    fixture(raw,'collision_source',INDEX_BUILD_SOURCE_LIMIT+5);
+    raw.exec('CREATE TABLE index_collision(k TEXT PRIMARY KEY) WITHOUT ROWID');
+    const budget=new RowBudget(new LedgerStore());await budget.begin(true);
+    const observed=observe(raw),sql=budget.wrap(observed.sql);
+    expect(()=>sql.exec('CREATE INDEX IF NOT EXISTS index_collision ON collision_source(value)')).toThrow(RowBudgetExceeded);
+    expect(budget.status().stopped).toBe(true);
+    expect(observed.calls.some(call=>/NOT INDEXED/.test(call.query))).toBe(false);
+    expect(raw.exec("SELECT name FROM pragma_index_list('collision_source') WHERE name='index_collision'").toArray()).toHaveLength(0);
   }));
 
   it('charges metadata, source probe and actual small index counters, with quoted identifiers', () => nativeCase(async raw => {

@@ -1,3 +1,4 @@
+import {MetadataCompat} from './metadata-compat';
 /** Post-DONE verification (intake d8d509d2, Alexey t1936u–t1937u). When an
  * intake's work reports DONE, Hub decides from the intake's `verification`
  * field (required|skip|auto, default auto) whether a SEPARATE verifier agent
@@ -90,10 +91,10 @@ export type VerifierHooks = {
 export class IntakeVerifier {
   constructor(private sql: SqlStorage, private intake: { statusAuthorizedTasks(p: Obj): Obj[]; watchdogTasks?(after: string, limit: number): Obj[]; statusTaskById?(p: Obj, id: string): Obj | undefined },
     private tx: <T>(fn: () => T) => T, private hooks: VerifierHooks = {}, private now = Date.now) {}
+  private metadata!:MetadataCompat;
   init() {
     this.sql.exec('CREATE TABLE IF NOT EXISTS intake_verifier_meta(id INTEGER PRIMARY KEY CHECK(id=1),enabled_at INTEGER NOT NULL,last_tick INTEGER,last_result TEXT,task_cursor TEXT NOT NULL DEFAULT \'\')');
-    const cols = new Set(this.rows('PRAGMA table_info(intake_verifier_meta)').map(row => row.name));
-    if (!cols.has('task_cursor')) this.sql.exec("ALTER TABLE intake_verifier_meta ADD COLUMN task_cursor TEXT NOT NULL DEFAULT ''");
+    this.metadata=new MetadataCompat(this.sql,'intake_verifier_meta',['task_cursor']);
     this.sql.exec('INSERT OR IGNORE INTO intake_verifier_meta(id,enabled_at) VALUES(1,?)', this.now());
     this.sql.exec(`CREATE TABLE IF NOT EXISTS intake_verifications(task_id TEXT NOT NULL, claim_id TEXT NOT NULL, mode TEXT NOT NULL,
       reason TEXT NOT NULL, state TEXT NOT NULL, engine TEXT, session_id TEXT, request_key TEXT, attempts INTEGER NOT NULL DEFAULT 0,
@@ -201,7 +202,7 @@ export class IntakeVerifier {
   async tick(source = 'scheduled'): Promise<Obj> {
     const now = this.now();
     const meta = this.tx(() => {
-      const m = this.rows('SELECT * FROM intake_verifier_meta WHERE id=1')[0];
+      const m = this.metadata.read(1);
       if (m.last_tick !== null && now - m.last_tick < VERIFIER_INTERVAL) return null;
       this.sql.exec('UPDATE intake_verifier_meta SET last_tick=? WHERE id=1', now); return m;
     });
@@ -216,7 +217,7 @@ export class IntakeVerifier {
         .sort((a,b) => String(a.id).localeCompare(String(b.id))).slice(0,VERIFIER_OBSERVATION_BATCH);
     const limited = page.length >= VERIFIER_OBSERVATION_BATCH || after !== '';
     const next = page.length >= VERIFIER_OBSERVATION_BATCH ? String(page[page.length-1].id) : '';
-    this.sql.exec('UPDATE intake_verifier_meta SET task_cursor=? WHERE id=1', next);
+    this.metadata.patch(1,{task_cursor:next});
     const tasks = page.filter(t => OPEN.has(t.status) && !t.archived_at && intakeCompletionHoldReason(t))
       .sort((a, b) => ms(a.updated_at) - ms(b.updated_at));
     for (const task of tasks) {

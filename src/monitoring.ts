@@ -16,6 +16,8 @@ import type { LivenessService } from './liveness';
 import type { StatusMachineAuth } from './status';
 import type { IntakeService } from './intake';
 import { isValidMachineId } from './machine-id';
+import type { WriteWatch } from './write-watch';
+type DiskPruneRow={id:string;machine_id:string;observed_at_ms:number;source_rowid:number};
 
 export const MONITORING_SCHEMA = `
 CREATE TABLE IF NOT EXISTS disk_observations (
@@ -28,7 +30,6 @@ CREATE TABLE IF NOT EXISTS disk_observations (
   reporter TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_disk_obs_machine ON disk_observations(machine_id, observed_at_ms);
-CREATE INDEX IF NOT EXISTS idx_disk_obs_time ON disk_observations(observed_at_ms);
 
 CREATE TABLE IF NOT EXISTS disk_episodes (
   episode_key TEXT PRIMARY KEY,
@@ -368,6 +369,7 @@ export type HostHealthSummary = {
 type TrendSample = {timeMs:number;usedBytes:number;totalBytes:number;percent:number};
 export class MonitoringService {
   private trendCache = new Map<string,{revision:string;samples:Map<string,TrendSample[]>;limited:boolean}>();
+  private diskCleanupCache?:{stamp:string;rows:DiskPruneRow[]};
   constructor(
     private sql: SqlStorage,
     private tx: <T>(fn: () => T) => T,
@@ -375,10 +377,14 @@ export class MonitoringService {
     private notifyAlertFn?: (alert: any) => Promise<void>,
     private intake?: IntakeService,
     public now: () => number = Date.now,
+    // Optional trusted owner of this exact SQL handle, supplied together by
+    // Hub. Unwatched/ad-hoc handles must omit it and always re-observe keys.
+    private writes?: WriteWatch,
   ) {}
 
   init(): void {
     this.trendCache.clear();
+    this.diskCleanupCache=undefined;
     for (const stmt of MONITORING_SCHEMA.split(';')) {
       const trimmed = stmt.trim();
       if (trimmed) this.sql.exec(trimmed);
@@ -460,7 +466,16 @@ export class MonitoringService {
 
       const validated = this.validatePayload(body, auth);
 
-      const result = this.tx(() => this.recordObservation(validated, auth));
+      // The complete source proof belongs to this explicit write request.
+      // Cache only after commit; rollback/foreign writes/schema changes lose
+      // the exact watcher stamp and force a new bounded observation.
+      let rows:DiskPruneRow[]=[];
+      let result:any;
+      try {
+        result=this.tx(()=>{rows=this.diskCleanupRows();return this.recordObservation(validated,auth,rows);});
+      } catch(error) {this.diskCleanupCache=undefined;throw error;}
+      if(this.writes&&rows.reduce((sum,row)=>sum+96+2*(row.id.length+row.machine_id.length),0)<=256*1024)this.diskCleanupCache={stamp:this.writes.stamp('disk_observations'),rows};
+      else this.diskCleanupCache=undefined;
       return json(result, 200);
     } catch (e: any) {
       const code = e?.code || 'internal_error';
@@ -689,7 +704,7 @@ export class MonitoringService {
   }
 
   /** Record observation, handle alert and task episodes, and enforce storage bounds. */
-  private recordObservation(payload: DiskObservationPayload, auth: StatusMachineAuth): any {
+  private recordObservation(payload: DiskObservationPayload, auth: StatusMachineAuth, rows:DiskPruneRow[]): any {
     const now = this.now();
     const nowIso = new Date(now).toISOString();
     const id = crypto.randomUUID();
@@ -697,8 +712,8 @@ export class MonitoringService {
     const reporter = auth.kind === 'host' ? `host:${auth.tokenId}` : `admin:${auth.actor}`;
 
     // 1. Store observation
-    this.sql.exec(
-      'INSERT INTO disk_observations(id, machine_id, observed_at, observed_at_ms, received_at, payload_json, reporter) VALUES(?,?,?,?,?,?,?)',
+    const inserted=this.sql.exec(
+      'INSERT INTO disk_observations(id, machine_id, observed_at, observed_at_ms, received_at, payload_json, reporter) VALUES(?,?,?,?,?,?,?) RETURNING rowid AS source_rowid',
       id,
       payload.machine_id,
       payload.observed_at,
@@ -706,7 +721,11 @@ export class MonitoringService {
       nowIso,
       JSON.stringify(payload),
       reporter,
-    );
+    ).toArray();
+    const sourceRowid=inserted[0]?.source_rowid;
+    if(inserted.length!==1||!Number.isSafeInteger(sourceRowid)||Number(sourceRowid)<1)fail('disk_cleanup_observation_limited',503);
+
+    rows.push({id,machine_id:payload.machine_id,observed_at_ms:observedMs,source_rowid:Number(sourceRowid)});
 
     // 2. Reconcile episodes for each filesystem
     const episodesSummary: any[] = [];
@@ -716,7 +735,7 @@ export class MonitoringService {
     }
 
     // 3. Enforce storage bounds & retention
-    this.pruneStorage(payload.machine_id, now);
+    this.pruneStorage(payload.machine_id, now, rows);
 
     return {
       ok: true,
@@ -1063,33 +1082,34 @@ export class MonitoringService {
     }
   }
 
-  /** Prune storage to bounded limits. */
-  private pruneStorage(machineId: string, now: number): void {
-    try {
-      const retentionCutoff = now - DISK_LIMITS.retentionDays * 86400000;
-      this.sql.exec(`DELETE FROM disk_observations WHERE id IN (SELECT id FROM disk_observations
-        WHERE observed_at_ms < ? ORDER BY observed_at_ms LIMIT 100)`, retentionCutoff);
-
-      // Per-machine cap
-      const machineRows = this.sql
-        .exec(
-          'SELECT id FROM disk_observations WHERE machine_id = ? ORDER BY observed_at_ms DESC LIMIT 100 OFFSET ?',
-          machineId, DISK_LIMITS.maxHistoryPerMachine,
-        )
-        .toArray() as any[];
-      if (machineRows.length) {
-        const toDelete = machineRows.map(r => r.id);
-        const placeholders = toDelete.map(() => '?').join(',');
-        this.sql.exec(`DELETE FROM disk_observations WHERE id IN (${placeholders})`, ...toDelete);
-      }
-
-      // Global cap
-      this.sql.exec(`DELETE FROM disk_observations WHERE id IN (
-        SELECT id FROM disk_observations ORDER BY observed_at_ms DESC LIMIT 100 OFFSET ?
-      )`, DISK_LIMITS.maxGlobalObservations);
-    } catch {
-      // Best-effort storage trim
+  /** Complete bounded keys only, before retention/host filtering or sorting. */
+  private diskCleanupRows():DiskPruneRow[] {
+    const stamp=this.writes?.stamp('disk_observations');
+    if(stamp!==undefined&&this.diskCleanupCache?.stamp===stamp)return this.diskCleanupCache.rows.map(row=>({...row}));
+    const rows=this.sql.exec('SELECT rowid AS source_rowid,id,machine_id,observed_at_ms FROM disk_observations NOT INDEXED ORDER BY rowid LIMIT 1001').toArray() as DiskPruneRow[];
+    if(rows.length>DISK_LIMITS.maxGlobalObservations)fail('disk_cleanup_observation_limited',503);
+    let bytes=0;
+    for(const row of rows) {
+      if(typeof row.id!=='string'||typeof row.machine_id!=='string'||!Number.isSafeInteger(row.source_rowid)||row.source_rowid<1||!Number.isFinite(row.observed_at_ms))fail('disk_cleanup_observation_limited',503);
+      bytes+=96+2*(row.id.length+row.machine_id.length);
+      if(bytes>256*1024)fail('disk_cleanup_observation_limited',503);
     }
+    return rows;
+  }
+
+  /** Exact old retention/cap semantics over a proven complete small source.
+   * Every mutation is an ID PK operation; no global history index is built. */
+  private pruneStorage(machineId:string,now:number,rows:DiskPruneRow[]):void {
+    const remove=(selected:DiskPruneRow[])=>{
+      if(!selected.length)return;
+      const deleted=this.sql.exec(`DELETE FROM disk_observations WHERE id IN (${selected.map(()=>'?').join(',')}) RETURNING id`,...selected.map(row=>row.id)).toArray();
+      const ids=new Set(deleted.map(row=>String(row.id)));
+      for(let i=rows.length-1;i>=0;i--)if(ids.has(rows[i].id))rows.splice(i,1);
+    };
+    const oldest=(a:DiskPruneRow,b:DiskPruneRow)=>a.observed_at_ms-b.observed_at_ms||a.source_rowid-b.source_rowid;
+    remove(rows.filter(row=>row.observed_at_ms<now-DISK_LIMITS.retentionDays*86400000).sort(oldest).slice(0,100));
+    remove(rows.filter(row=>row.machine_id===machineId).sort((a,b)=>oldest(b,a)).slice(DISK_LIMITS.maxHistoryPerMachine,DISK_LIMITS.maxHistoryPerMachine+100));
+    remove([...rows].sort((a,b)=>oldest(b,a)).slice(DISK_LIMITS.maxGlobalObservations,DISK_LIMITS.maxGlobalObservations+100));
   }
 
   /** Compute growth trend per day for a filesystem on a machine. */

@@ -74,7 +74,11 @@ export function initSessionLinks(sql: SqlStorage) {
     `CREATE TRIGGER IF NOT EXISTS intake_session_links_projection_${op.split(' ')[0].toLowerCase()} AFTER ${op} ON intake_task_projection ${when} BEGIN
     INSERT INTO intake_session_links(session_key,task_id,authority) ${linkRows('NEW.id', 'json_each(NEW.links) e')}
     ON CONFLICT DO NOTHING; END`);
-  sql.exec('DROP TRIGGER IF EXISTS intake_session_links_delete');
+  // BEFORE, not AFTER: reject an incomplete source observation before an
+  // older deployed AFTER DELETE cleanup can scan or mutate retained refs.
+  sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_session_links_delete_preflight BEFORE DELETE ON intake_tasks BEGIN
+    SELECT CASE WHEN (SELECT COUNT(*) FROM(SELECT 1 FROM intake_session_links LIMIT 129))>128
+      THEN RAISE(ABORT,'intake_link_delete_observation_limited') END; END`);
   sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_session_links_delete_bounded AFTER DELETE ON intake_tasks BEGIN
     SELECT CASE WHEN (SELECT COUNT(*) FROM(SELECT 1 FROM intake_session_links LIMIT 129))>128
       THEN RAISE(ABORT,'intake_link_delete_observation_limited') END;
@@ -94,7 +98,9 @@ export function initLinkRefs(sql: SqlStorage) {
   for (const op of ['INSERT', 'UPDATE']) sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_link_refs_${op.toLowerCase()} AFTER ${op} ON intake_tasks BEGIN
     INSERT INTO intake_link_refs(ref,task_id) ${rows('NEW.id', "json_each(NEW.data,'$.history') e")} ON CONFLICT DO NOTHING; END`);
   // Stale candidates are safe: worktree readers rehydrate exact current links.
-  sql.exec('DROP TRIGGER IF EXISTS intake_link_refs_delete');
+  sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_link_refs_delete_preflight BEFORE DELETE ON intake_tasks BEGIN
+    SELECT CASE WHEN (SELECT COUNT(*) FROM(SELECT 1 FROM intake_link_refs LIMIT 129))>128
+      THEN RAISE(ABORT,'intake_link_delete_observation_limited') END; END`);
   initProjectionLinkRefs(sql);
 }
 
@@ -115,7 +121,12 @@ export function initProjectionLinkRefs(sql: SqlStorage) {
     `CREATE TRIGGER IF NOT EXISTS intake_projection_link_refs_${op.split(' ')[0].toLowerCase()} AFTER ${op} ON intake_task_projection ${when} BEGIN
     INSERT INTO intake_projection_link_refs(ref,task_id) ${rows('NEW.id', 'json_each(NEW.links) e')} ON CONFLICT DO NOTHING; END`);
   // Deletion never scans retained references by an unindexed task_id.
-  sql.exec('DROP TRIGGER IF EXISTS intake_projection_link_refs_delete');
+  // Source deletion may cascade into projection deletion from another
+  // AFTER trigger. Fence BOTH surfaces before any legacy AFTER cleanup runs.
+  for(const [name,table] of [['intake_projection_link_refs_task_delete_preflight','intake_tasks'],['intake_projection_link_refs_delete_preflight','intake_task_projection']])
+    sql.exec(`CREATE TRIGGER IF NOT EXISTS ${name} BEFORE DELETE ON ${table} BEGIN
+      SELECT CASE WHEN (SELECT COUNT(*) FROM(SELECT 1 FROM intake_projection_link_refs LIMIT 129))>128
+        THEN RAISE(ABORT,'intake_link_delete_observation_limited') END; END`);
 }
 
 export function workerAccessContext(sql: SqlStorage, tokenId: string | undefined, now = Date.now(), allowExpiredAccess = false): any | null {

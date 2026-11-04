@@ -1,5 +1,6 @@
 import {configureSchemaObjectHints} from './schema-object-locator';
 import { invalidateCatalogObservations } from './catalog-freshness';
+import { invalidateRoutingObservations } from './routing';
 import { initRootIncumbentProjection } from './root-incumbent';
 import { BackgroundWorkQueue } from './background-work';
 import { jobCredentialAllowed, roleFinishReceiptAllowed } from './auth/job-credential';
@@ -231,6 +232,7 @@ export class Hub extends DurableObject {
           invalidateReaderObservations(this.sql);
           this.busService?.invalidateInboxOffsets();
           invalidateCatalogObservations(this.sql);
+          invalidateRoutingObservations(this.sql);
           this.fleetService?.resources?.invalidateLiveTelemetry();
         },
       );
@@ -600,6 +602,8 @@ export class Hub extends DurableObject {
       this.livenessService,
       alert => { return this.notifyAlert(alert).then(() => undefined); },
       this.intakeService,
+      Date.now,
+      this.writes,
     );
     this.monitoringService.init();
     this.monitoringService.setResourceProjection(machine => this.fleetService.hostResources(machine)[0]);
@@ -874,10 +878,6 @@ export class Hub extends DurableObject {
     this.ensureColumns('device_pairings', { approved_seq: 'INTEGER' });
     this.ensureColumns('credentials', {
       approval_seq: 'INTEGER',
-      // Only non-null for a normally rotated human refresh token. This lets a
-      // short retry window distinguish a lost rotation response from logout,
-      // admin revocation, or a replay after the grace period.
-      refresh_rotated_at: 'TEXT',
     });
 
     this.ensureColumns('jobs', {
@@ -2269,7 +2269,15 @@ export class Hub extends DurableObject {
       if (!cred) {
         errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
       } else if (cred.revoked_at) {
-        const rotatedAtMs = Date.parse(String(cred.refresh_rotated_at ?? ''));
+        // Older deployments lack the optional credentials column. A tiny
+        // request-owned sidecar preserves exactly the same rotation proof
+        // without rewriting the whole legacy schema during construction.
+        let rotatedAt=cred.refresh_rotated_at;
+        if(cred.kind==='human'&&!Object.prototype.hasOwnProperty.call(cred,'refresh_rotated_at')) {
+          this.sql.exec('CREATE TABLE IF NOT EXISTS credential_refresh_rotations(id TEXT PRIMARY KEY,rotated_at TEXT NOT NULL) WITHOUT ROWID');
+          rotatedAt=this.sql.exec('SELECT rotated_at FROM credential_refresh_rotations WHERE id=?',cred.id).toArray()[0]?.rotated_at;
+        }
+        const rotatedAtMs = Date.parse(String(rotatedAt ?? ''));
         const retryWithinGrace = cred.kind === 'human'
           && humanSuccessor !== null
           && Number.isFinite(rotatedAtMs)
@@ -2322,11 +2330,18 @@ export class Hub extends DurableObject {
         const accessExpiresAt = role ? new Date(Math.min(nowMs + 3600000, role.expires_at)).toISOString()
           : sessionActor ? new Date(nowMs + 3600000).toISOString() : cred.expires_at;
         const rotatedAt = cred.kind === 'human' ? now : null;
-        const res = this.sql.exec('UPDATE credentials SET revoked_at = ?, refresh_rotated_at = ? WHERE id = ? AND revoked_at IS NULL RETURNING id', now, rotatedAt, cred.id).toArray();
+        const hasRotationColumn=Object.prototype.hasOwnProperty.call(cred,'refresh_rotated_at');
+        const res = hasRotationColumn
+          ? this.sql.exec('UPDATE credentials SET revoked_at = ?, refresh_rotated_at = ? WHERE id = ? AND revoked_at IS NULL RETURNING id', now, rotatedAt, cred.id).toArray()
+          : this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL RETURNING id', now, cred.id).toArray();
         if (res.length !== 1) {
           this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL', now, cred.family_id);
           errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
         } else {
+          if(cred.kind==='human'&&!hasRotationColumn) {
+            this.sql.exec('CREATE TABLE IF NOT EXISTS credential_refresh_rotations(id TEXT PRIMARY KEY,rotated_at TEXT NOT NULL) WITHOUT ROWID');
+            this.sql.exec('INSERT INTO credential_refresh_rotations(id,rotated_at) VALUES(?,?)',cred.id,now);
+          }
           this.sql.exec(`
             INSERT INTO credentials
             (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at, registry_actor, approval_seq)

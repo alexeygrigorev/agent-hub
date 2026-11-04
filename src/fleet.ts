@@ -18,7 +18,7 @@ import {sanitizeCpuAdmission,sanitizeCpuUsage,CPU_SATURATED_PCT} from './cpu-hea
 import { launcherDiskHeadroom } from './launcher-disk';
 /** Generic account registry and placement. Provider credentials never enter this service. */
 import type { SqlStorage } from '@cloudflare/workers-types';
-import { RoutingService } from './routing';
+import { RoutingService,effectiveRoutingObservedAt } from './routing';
 import { ClaimAdmission, sameIntent, sameEditCaller, type EditAuthority, type AdmissionCaller } from './claim_admission';
 import { effectiveCheckin, effectiveRoutesAt, effectiveHeartbeat } from './registry';
 import { commandChannelHealth } from './command-channel';
@@ -718,7 +718,7 @@ export class FleetService {
       catch (error) { this.observedCatalog?.reset(); this.resources?.invalidateLiveTelemetry(); invalidateCatalogObservations(this.sql); throw error; }
     };
     this.resources = new ResourceManagement(sql, now, writes, observed);
-    this.routing = new RoutingService(sql, this, now, this.transaction);
+    this.routing = new RoutingService(sql, this, now, this.transaction,writes);
     this.admission = new ClaimAdmission(sql, this.transaction, now, writes);
   }
   init() {
@@ -1505,7 +1505,7 @@ export class FleetService {
         let routingNeeds: unknown = [];
         try {
           const rn: any = this.sql.exec('SELECT needs_json, observed_at FROM routing_machines WHERE machine_id = ?', route.machine_id).toArray()[0];
-          if (rn && fresh(rn.observed_at, this.now(), 180000)) routingNeeds = JSON.parse(rn.needs_json);
+          if (rn && fresh(effectiveRoutingObservedAt(this.sql,route.machine_id,rn.observed_at), this.now(), 180000)) routingNeeds = JSON.parse(rn.needs_json);
         } catch { routingNeeds = []; }
         const labels = new Set<string>(Array.isArray(routingNeeds) ? (routingNeeds as unknown[]).filter((n): n is string => typeof n === 'string') : []);
         if (typeof machine?.os === 'string' && machine.os.trim()) labels.add('os:' + machine.os.trim().toLowerCase());
@@ -1899,7 +1899,7 @@ export class FleetService {
           const labels = new Set<string>();
           try {
             const rn: any = this.sql.exec('SELECT needs_json, observed_at FROM routing_machines WHERE machine_id = ?', m.id).toArray()[0];
-            if (rn && fresh(rn.observed_at, this.now(), 180000)) {
+            if (rn && fresh(effectiveRoutingObservedAt(this.sql,m.id,rn.observed_at), this.now(), 180000)) {
               const advertised = JSON.parse(rn.needs_json);
               if (Array.isArray(advertised)) for (const n of advertised) if (typeof n === 'string') labels.add(n);
             }

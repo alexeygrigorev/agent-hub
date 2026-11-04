@@ -15,57 +15,113 @@ const textOk = (v: any) => typeof v === 'string' && v.length <= 4096 && !/[\x00-
 const pathOk = (v: any) => typeof v === 'string' && v.length <= 512 && /^(\/|[A-Za-z]:[\\/])/.test(v) && !/[\x00-\x1f\x7f]/.test(v) && !v.split(/[\\/]/).some((p: string) => p === '..' || p === '.');
 const json = (v: any, status = 200) => Response.json(v, { status, headers: { 'Cache-Control': 'private, no-store' } });
 
+const foldRepoName=(name:string)=>name.replace(/[A-Z]/g,value=>value.toLowerCase());
+const repoObservation=(code:string)=>Object.assign(new Error(code),{code,status:503});
+
 /** Friendly registered aliases may contain spaces, Unicode or a descriptive slash.
  * They never become paths: only the registry's canonical absolute dir is executable. */
 export function registeredRepoLabel(sql: SqlStorage, value: unknown): boolean {
   if (typeof value !== 'string' || !value || value.length > 128 || /[\x00-\x1f\x7f]/.test(value)) return false;
   try {
-    return sql.exec('SELECT data FROM repo_registry').toArray().some(row => {
-      const repo = JSON.parse(String(row.data));
-      return [repo.repo_id, repo.name, repo.label, ...(repo.aliases || [])].some(v => typeof v === 'string' && v.toLowerCase() === value.toLowerCase());
-    });
-  } catch { return false; }
+    let table='repo_registry',pendingLegacy=false;
+    if(sql.exec("SELECT name FROM pragma_table_list('repo_registry_upgrade') WHERE schema='main' AND type='table'").toArray().length){
+      const state=sql.exec('SELECT /* live repo upgrade */ done,after_name,source_revision,start_revision FROM repo_registry_upgrade WHERE id=1').toArray()[0] as any;
+      if(state&&(state.done||state.after_name!==null)&&state.source_revision!==state.start_revision)throw repoObservation('repo_registry_upgrade_source_changed');
+      if(state?.done)table='repo_registry_v2';else pendingLegacy=true;
+    }
+    const rows=sql.exec(`SELECT data FROM ${table} ORDER BY name LIMIT 257`).toArray();
+    if(rows.length>256||rows.reduce((sum,row)=>sum+String(row.data).length*2,0)>2*1024*1024)throw repoObservation('repo_registry_observation_limited');
+    const ids=new Set<string>(),names=new Set<string>();let matched=false;
+    for(const row of rows){
+      const repo=JSON.parse(String(row.data));let id=repo.repo_id,name=repo.name;
+      if(pendingLegacy){
+        if(typeof repo?.name!=='string'||!repo.name||repo.name.length>128||repo.origin!=null&&typeof repo.origin!=='string')throw repoObservation('repo_registry_invalid_legacy');
+        id=repo.status==='duplicate'||!repo.origin?'local/'+repo.name.toLowerCase():repo.origin.toLowerCase();
+        if(ids.has(id)){const base='local/'+repo.name.toLowerCase();id=base;let suffix=1;while(ids.has(id))id=base+'-legacy-'+suffix++;}
+        ids.add(id);
+        if(names.has(foldRepoName(name))){let suffix=1;name=repo.name.slice(0,118);while(names.has(foldRepoName(name)))name=repo.name.slice(0,118)+'-'+suffix++;}
+        names.add(foldRepoName(name));
+      }
+      matched ||= [id,name,repo.label,...(Array.isArray(repo.aliases)?repo.aliases:[])].some(v=>typeof v==='string'&&v.toLowerCase()===value.toLowerCase());
+    }
+    return matched;
+  } catch(error) {if((error as any)?.status===503)throw error;return false;}
 }
 
 export class RepoRegistry {
-  constructor(private sql: SqlStorage, private txn: <T>(fn: () => T) => T, private now: () => number = Date.now) {}
+  private readonly sourceSql:SqlStorage;
+  private legacy=false;
+  private table:'repo_registry'|'repo_registry_v2'='repo_registry';
+  constructor(private sql: SqlStorage, private txn: <T>(fn: () => T) => T, private now: () => number = Date.now) {this.sourceSql=sql;}
   init() {
+    this.sql=this.sourceSql;
     this.txn(() => {
-      const columns = this.sql.exec('PRAGMA table_info(repo_registry)').toArray();
-      const legacy = columns.length && !columns.some(c => c.name === 'repo_id');
-      if (legacy) this.sql.exec('ALTER TABLE repo_registry RENAME TO repo_registry_single_host');
-      this.sql.exec(`CREATE TABLE IF NOT EXISTS repo_registry (
+      const columns=this.sourceSql.exec('PRAGMA table_info(repo_registry)').toArray();
+      this.legacy=columns.length>0&&!columns.some(c=>c.name==='repo_id');
+      const table=this.legacy?'repo_registry_v2':'repo_registry';this.table=table;
+      // Original single-host data remains untouched. An empty destination and
+      // cursor are cheap; only explicit authorized repo requests copy pages.
+      this.sourceSql.exec(`CREATE TABLE IF NOT EXISTS ${table} (
         repo_id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE,
         origin TEXT NOT NULL DEFAULT '', origin_url TEXT NOT NULL DEFAULT '', default_branch TEXT NOT NULL DEFAULT '',
         category TEXT, description TEXT, preferred_workspace_subdir TEXT, clone_policy TEXT, seed_data TEXT,
         data TEXT NOT NULL, updated_at TEXT NOT NULL)`);
-      this.sql.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_repo_registry_name_nocase ON repo_registry(LOWER(name))');
-      this.sql.exec(`CREATE TABLE IF NOT EXISTS repo_checkouts (
+      this.sourceSql.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_${table}_name_nocase ON ${table}(LOWER(name))`);
+      this.sourceSql.exec(`CREATE TABLE IF NOT EXISTS repo_checkouts (
         repo_id TEXT NOT NULL, host_id TEXT NOT NULL, path TEXT, workspace_root TEXT,
         status TEXT NOT NULL, last_seen TEXT, head_sha TEXT, head_date TEXT, branch TEXT,
         dirty_counts TEXT, disk_free_bytes INTEGER, cloned_on_demand INTEGER NOT NULL DEFAULT 0,
         last_used_at TEXT, flags_json TEXT NOT NULL DEFAULT '[]', updated_at TEXT NOT NULL,
         PRIMARY KEY(repo_id, host_id))`);
-      this.sql.exec('CREATE INDEX IF NOT EXISTS idx_repo_checkouts_host ON repo_checkouts(host_id)');
-      this.sql.exec('CREATE INDEX IF NOT EXISTS idx_repo_checkouts_path ON repo_checkouts(host_id,path)');
-      if (legacy) {
-        for (const row of this.sql.exec('SELECT data FROM repo_registry_single_host ORDER BY name').toArray()) {
-          const old = JSON.parse(String(row.data));
-          let id = this.identity(old);
-          // Seeded duplicates and distinct legacy labels retain their own data.
-          if (this.sql.exec('SELECT repo_id FROM repo_registry WHERE repo_id=?', id).toArray().length) {
-            const base = 'local/' + old.name.toLowerCase(); id = base; let suffix = 1;
-            while (this.sql.exec('SELECT repo_id FROM repo_registry WHERE repo_id=?', id).toArray().length) id = base + '-legacy-' + suffix++;
-          }
-          let name = old.name;
-          if (this.named(name)) name = this.availableName(name);
-          const migrated = { ...old, name, repo_id: id };
-          this.save(migrated, old.updated_at);
-          this.saveCheckout(id, old, old.updated_at);
-        }
-        this.sql.exec('DROP TABLE repo_registry_single_host');
+      this.sourceSql.exec('CREATE INDEX IF NOT EXISTS idx_repo_checkouts_host ON repo_checkouts(host_id)');
+      this.sourceSql.exec('CREATE INDEX IF NOT EXISTS idx_repo_checkouts_path ON repo_checkouts(host_id,path)');
+      if(this.legacy){
+        this.sourceSql.exec('CREATE TABLE IF NOT EXISTS repo_registry_upgrade(id INTEGER PRIMARY KEY CHECK(id=1),after_name TEXT,done INTEGER NOT NULL,source_revision INTEGER NOT NULL,start_revision INTEGER NOT NULL)');
+        this.sourceSql.exec('INSERT OR IGNORE INTO repo_registry_upgrade VALUES(1,NULL,0,0,0)');
+        for(const op of ['INSERT','UPDATE','DELETE'])this.sourceSql.exec(`CREATE TRIGGER IF NOT EXISTS repo_registry_upgrade_${op.toLowerCase()} AFTER ${op} ON repo_registry BEGIN UPDATE repo_registry_upgrade SET source_revision=source_revision+1 WHERE id=1; END`);
       }
     });
+  }
+
+  private upgradeState():any {
+    if(!this.legacy)return {done:1};
+    const state=this.sourceSql.exec('SELECT /* live repo upgrade */ * FROM repo_registry_upgrade WHERE id=1').toArray()[0] as any;
+    if(!state)throw repoObservation('repo_registry_upgrade_unavailable');
+    if((state.done||state.after_name!==null)&&state.source_revision!==state.start_revision)throw repoObservation('repo_registry_upgrade_source_changed');
+    return state;
+  }
+  private legacyRecords():{source_name:string;repo:any}[] {
+    const rows=this.sourceSql.exec('SELECT /* live legacy repos */ name,machine,data,updated_at FROM repo_registry ORDER BY name LIMIT 257').toArray() as any[];
+    if(rows.length>256)throw repoObservation('repo_registry_observation_limited');
+    if(rows.reduce((sum,row)=>sum+String(row.data).length*2,0)>2*1024*1024)throw repoObservation('repo_registry_observation_limited');
+    const names=new Set<string>(),ids=new Set<string>();
+    return rows.map(row=>{
+      let old:any;try{old=JSON.parse(row.data);}catch{throw repoObservation('repo_registry_invalid_legacy');}
+      if(typeof old?.name!=='string'||!old.name||old.name.length>128||old.origin!=null&&typeof old.origin!=='string')throw repoObservation('repo_registry_invalid_legacy');
+      let id=this.identity(old),name=old.name;
+      if(ids.has(id)){const base='local/'+old.name.toLowerCase();id=base;let suffix=1;while(ids.has(id))id=base+'-legacy-'+suffix++;}
+      if(names.has(foldRepoName(name))){let suffix=1;name=old.name.slice(0,118);while(names.has(foldRepoName(name)))name=old.name.slice(0,118)+'-'+suffix++;}
+      ids.add(id);names.add(foldRepoName(name));
+      return{source_name:row.name,repo:{...old,name,repo_id:id,machine:old.machine??row.machine,updated_at:old.updated_at??row.updated_at}};
+    });
+  }
+  private advanceLegacy():{ready:boolean;copied:number} {
+    return this.txn(()=>{
+      const state=this.upgradeState();if(state.done)return{ready:true,copied:0};
+      const all=this.legacyRecords(),after=state.after_name===null?-1:all.findIndex(row=>row.source_name===state.after_name);
+      if(state.after_name!==null&&after<0)throw repoObservation('repo_registry_upgrade_source_changed');
+      const remaining=all.slice(after+1),page=remaining.slice(0,16);
+      for(const row of page){this.save(row.repo,row.repo.updated_at);this.saveCheckout(row.repo.repo_id,row.repo,row.repo.updated_at);}
+      const done=remaining.length<=16;
+      const changed=this.sourceSql.exec('UPDATE repo_registry_upgrade SET after_name=?,done=?,start_revision=? WHERE id=1 AND source_revision=? RETURNING id',page.at(-1)?.source_name??state.after_name,done?1:0,state.source_revision,state.source_revision).toArray();
+      if(changed.length!==1)throw repoObservation('repo_registry_upgrade_source_changed');
+      return{ready:done,copied:page.length};
+    });
+  }
+  private prepareLegacy():Response|null {
+    if(!this.legacy)return null;
+    try{const progress=this.advanceLegacy();return progress.ready?null:json({error:'repo_registry_upgrade_pending',copied:progress.copied,retry:true},503);}
+    catch(error){return json({error:(error as any)?.code??'repo_registry_upgrade_unavailable'},503);}
   }
   private identity(repo: any): string {
     return repo.status === 'duplicate' || !repo.origin ? 'local/' + repo.name.toLowerCase() : repo.origin.toLowerCase();
@@ -76,16 +132,29 @@ export class RepoRegistry {
     return candidate;
   }
   all(): any[] {
-    const machines = this.sql.exec('SELECT id,last_checkin_at,capabilities FROM machines').toArray().map(m=>effectiveHost(this.sql,m));
+    const machineRows=this.sql.exec('SELECT id,last_checkin_at,capabilities FROM machines ORDER BY id LIMIT 65').toArray();
+    if(machineRows.length>64)throw repoObservation('repo_registry_observation_limited');
+    if(machineRows.reduce((sum,row)=>sum+String(row.capabilities??'').length*2,0)>2*1024*1024)throw repoObservation('repo_registry_observation_limited');
+    const machines=machineRows.map(m=>effectiveHost(this.sql,m));
     const online = new Set(machines
       .filter(m => { const age = this.now() - Date.parse(String(m.last_checkin_at)); return age >= 0 && age <= 180000; }).map(m => String(m.id)));
-    return this.sql.exec('SELECT repo_id,data FROM repo_registry ORDER BY name').toArray().map(row => {
+    const pending=!this.upgradeState().done;
+    const source=pending?this.legacyRecords().map(row=>({repo_id:row.repo.repo_id,data:JSON.stringify(row.repo)})):this.sql.exec(`SELECT repo_id,data FROM ${this.table} ORDER BY name LIMIT 257`).toArray();
+    if(source.length>256||source.reduce((sum,row)=>sum+String(row.data).length*2,0)>2*1024*1024)throw repoObservation('repo_registry_observation_limited');
+    return source.map(row => {
       const repo = { ...JSON.parse(String(row.data)), repo_id: row.repo_id };
-      const checkouts: any[] = this.sql.exec('SELECT * FROM repo_checkouts WHERE repo_id=? ORDER BY host_id', row.repo_id).toArray().map(c => ({
+      const checkoutRows=this.sql.exec('SELECT * FROM repo_checkouts WHERE repo_id=? ORDER BY host_id LIMIT 65',row.repo_id).toArray();
+      if(checkoutRows.length>64||checkoutRows.reduce((sum,c)=>sum+String(c.dirty_counts??'').length*2+String(c.flags_json??'').length*2,0)>2*1024*1024)throw repoObservation('repo_registry_observation_limited');
+      const checkouts: any[] = checkoutRows.map(c => ({
         ...c, machine_id: c.host_id, local_path: c.path, cloned_on_demand: !!c.cloned_on_demand,
         dirty_counts: c.dirty_counts ? JSON.parse(String(c.dirty_counts)) : null,
         flags: JSON.parse(String(c.flags_json)), online: online.has(String(c.host_id)),
       }));
+      if(checkouts.length>64)throw repoObservation('repo_registry_observation_limited');
+      if(pending&&repo.machine&&!checkouts.some(c=>c.host_id===repo.machine))checkouts.push({host_id:repo.machine,machine_id:repo.machine,path:repo.dir??null,local_path:repo.dir??null,
+        status:repo.flags?.includes('WORKTREE')?'worktree_only':repo.flags?.includes('MISSING')?'missing':repo.flags?.includes('GIT_ERROR')?'error':'present',
+        last_seen:repo.updated_at,updated_at:repo.updated_at,workspace_root:repo.workspace_root??null,last_used_at:repo.cloned_on_demand===true?repo.updated_at:null,flags:repo.flags??[],branch:repo.branch??null,head_sha:repo.last_commit?.sha??null,head_date:repo.last_commit?.date??null,
+        dirty_counts:repo.dirty_counts??null,cloned_on_demand:repo.cloned_on_demand===true,online:online.has(repo.machine),source:'legacy_registry'});
       // Hosts already advertising a checkout need no operator registry edit.
       // A scanned row, including an explicit missing/error result, takes precedence.
       for (const machine of machines) {
@@ -98,6 +167,7 @@ export class RepoRegistry {
           status:'present', last_seen:machine.last_checkin_at, flags:[], online:online.has(String(machine.id)),
           source:'host_workspaces', cloned_on_demand:false});
       }
+      if(checkouts.length>64)throw repoObservation('repo_registry_observation_limited');
       const representative = checkouts.find(c => c.status === 'present' && c.online) || checkouts.find(c => c.status === 'present') || checkouts[0];
       const present = checkouts.filter(c => c.status === 'present');
       const noOnline = !present.some(c => c.online);
@@ -175,13 +245,13 @@ export class RepoRegistry {
     return { error: { error: 'unknown_repo', repo: value, ...(matches.length ? { matches } : {}) } };
   }
   private named(name: string): any | undefined {
-    const row = this.sql.exec('SELECT repo_id,data FROM repo_registry WHERE name = ? COLLATE NOCASE', name).toArray()[0];
+    const row = this.sql.exec(`SELECT repo_id,data FROM ${this.table} WHERE name = ? COLLATE NOCASE`, name).toArray()[0];
     return row ? { ...JSON.parse(String(row.data)), repo_id: row.repo_id } : undefined;
   }
   private save(repo: any, at?: string) {
     const shared = { ...repo, origin_url: repo.origin || '', updated_at: at || new Date().toISOString() };
     for (const key of ['machine', 'dir', 'checkouts', 'checkouts_by_host', 'hosts', 'no_present_online', 'present_online_count', ...checkoutFields]) delete shared[key];
-    this.sql.exec(`INSERT INTO repo_registry (repo_id,name,origin,origin_url,default_branch,category,description,preferred_workspace_subdir,clone_policy,seed_data,data,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+    this.sql.exec(`INSERT INTO ${this.table} (repo_id,name,origin,origin_url,default_branch,category,description,preferred_workspace_subdir,clone_policy,seed_data,data,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
       ON CONFLICT(repo_id) DO UPDATE SET name=excluded.name,origin=excluded.origin,origin_url=excluded.origin_url,default_branch=excluded.default_branch,category=excluded.category,description=excluded.description,preferred_workspace_subdir=excluded.preferred_workspace_subdir,clone_policy=excluded.clone_policy,seed_data=excluded.seed_data,data=excluded.data,updated_at=excluded.updated_at`,
       shared.repo_id, shared.name, shared.origin || '', shared.origin_url, shared.default_branch || '', shared.category ?? null, shared.description ?? null, shared.preferred_workspace_subdir ?? null, shared.clone_policy ?? null, shared.seed_data ?? null, JSON.stringify(shared), shared.updated_at);
   }
@@ -207,7 +277,7 @@ export class RepoRegistry {
     const origin = r.origin || r.origin_url;
     const desired = this.identity({ ...r, origin });
     const sameOrigin = !seed && !old && origin && r.status !== 'duplicate'
-      && (this.sql.exec('SELECT data,repo_id FROM repo_registry WHERE repo_id=?', desired).toArray()[0] as any);
+      && (this.sql.exec(`SELECT data,repo_id FROM ${this.table} WHERE repo_id=?`, desired).toArray()[0] as any);
     // Host scans (refresh) link an unknown name to the entry for the same
     // remote; a seed names its own entry and never merges into another name.
     if (sameOrigin) {
@@ -223,15 +293,15 @@ export class RepoRegistry {
     // name for the same remote, needed for duplicate classification) keeps
     // its own row under a local identity instead of overwriting the other
     // entry through the shared primary key.
-    if (!old && (this.sql.exec('SELECT repo_id FROM repo_registry WHERE repo_id=?', id).toArray().length)) {
+    if (!old && (this.sql.exec(`SELECT repo_id FROM ${this.table} WHERE repo_id=?`, id).toArray().length)) {
       id = 'local/' + String(r.name).toLowerCase();
       let suffix = 1;
-      while (this.sql.exec('SELECT repo_id FROM repo_registry WHERE repo_id=?', id).toArray().length) id = 'local/' + String(r.name).toLowerCase() + '-' + (++suffix);
+      while (this.sql.exec(`SELECT repo_id FROM ${this.table} WHERE repo_id=?`, id).toArray().length) id = 'local/' + String(r.name).toLowerCase() + '-' + (++suffix);
     }
     if (old?.repo_id.startsWith('local/') && origin && old.status !== 'duplicate') {
       id = desired;
       this.sql.exec('UPDATE repo_checkouts SET repo_id=? WHERE repo_id=?', id, old.repo_id);
-      this.sql.exec('DELETE FROM repo_registry WHERE repo_id=?', old.repo_id);
+      this.sql.exec(`DELETE FROM ${this.table} WHERE repo_id=?`, old.repo_id);
     }
     const next = old ? { ...old } : { name, label: name, purpose: '', stack: '', key_folders: '', urls: '', aliases: [], status: 'active', default_branch: '', workflows: '', github_url: '', last_commit: null, canonical: null, flags: ['NEW'] };
     for (const k of [...machineFields, ...(seed ? human : [])]) {
@@ -350,15 +420,17 @@ export class RepoRegistry {
       if (path === '/api/repos') {
         const status = url.searchParams.get('status');
         if (status && !['active', 'archived', 'duplicate'].includes(status)) return json({ error: 'invalid_status' }, 400);
+        const pending=this.prepareLegacy();if(pending)return pending;
         const repos = this.all().filter(r => (!status || r.status === status) && (!url.searchParams.get('org') || r.org === url.searchParams.get('org')) && (url.searchParams.get('flagged') !== 'true' || r.flags?.length) && (!url.searchParams.get('host') || r.hosts.includes(url.searchParams.get('host'))) && (!url.searchParams.get('missing_on') || !r.hosts.includes(url.searchParams.get('missing_on'))));
         return json({ repos, count: repos.length });
       }
       let name: string;
       try { name = decodeURIComponent(path.slice('/api/repos/'.length)); } catch { return json({ error: 'invalid_repo' }, 400); }
+      const pending=this.prepareLegacy();if(pending)return pending;
       try {
         const repo = this.get(name);
         return repo ? json({ repo, canonical: this.canonical(repo).name }) : json({ error: 'repo_not_found' }, 404);
-      } catch { return json({ error: 'invalid_canonical_repo' }, 409); }
+      } catch(error) { return (error as any)?.status===503?json({error:(error as any).code},503):json({ error: 'invalid_canonical_repo' }, 409); }
     }
     if (!admin && !(host && path === '/api/repos/refresh')) return json({ error: 'operator_required' }, 403);
     let raw: string;
@@ -369,6 +441,7 @@ export class RepoRegistry {
       const seed = path.endsWith('/seed');
       if (!body || !Array.isArray(body.repos) || body.repos.length > 25 || body.repos.some((r: any) => !this.valid(r, seed))) return json({ error: 'invalid_repos' }, 400);
       if (!admin && body.repos.some((r: any) => r.machine !== caller.machineId)) return json({ error: 'wrong_machine' }, 403);
+      const pending=this.prepareLegacy();if(pending)return pending;
       return this.txn(() => {
         for (const r of body.repos) this.upsert(r, seed);
         return json({ updated: body.repos.length });
@@ -379,6 +452,7 @@ export class RepoRegistry {
       if (body.status !== undefined && !['active', 'archived', 'duplicate'].includes(body.status)) return json({ error: 'invalid_status' }, 400);
       if (body.portable !== undefined && typeof body.portable !== 'boolean') return json({ error: 'invalid_portable' }, 400);
       if (body.canonical !== undefined && body.canonical !== null && !nameOk(body.canonical)) return json({ error: 'invalid_canonical' }, 400);
+      const pending=this.prepareLegacy();if(pending)return pending;
       return this.txn(() => {
         let name: string;
         try { name = decodeURIComponent(path.slice('/api/repos/'.length)); } catch { return json({ error: 'invalid_repo' }, 400); }

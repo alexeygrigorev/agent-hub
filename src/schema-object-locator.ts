@@ -7,6 +7,15 @@ type Locator={rowid:number;name:string;type:string;tbl_name:string};
 // live verification even if an operator changed schema outside its DDL hook.
 const snapshots=new WeakMap<object,Map<string,Locator>>();
 const hints=new WeakMap<object,Map<string,number>>();
+const durableOwners=new WeakSet<object>();
+const LOCATOR_TABLE='schema_object_locators';
+function configureDurableLocators(sql:SqlStorage):void {
+  // Re-run native IF NOT EXISTS: an earlier configure may have been inside
+  // an outer transaction that later rolled back the table creation.
+  sql.exec(`CREATE TABLE IF NOT EXISTS ${LOCATOR_TABLE}(object_type TEXT NOT NULL,table_name TEXT NOT NULL,name TEXT NOT NULL,
+    object_rowid INTEGER NOT NULL,PRIMARY KEY(object_type,table_name,name)) WITHOUT ROWID`);
+  durableOwners.add(sql);
+}
 const key=(object:Identity)=>JSON.stringify([object.type,object.table,object.name]);
 const validName=(value:unknown):value is string=>typeof value==='string'&&/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(value);
 const locatorBytes=(identity:string,row:Locator)=>128+2*(identity.length+row.name.length+row.type.length+row.tbl_name.length);
@@ -20,6 +29,7 @@ export class SchemaObjectObservationLimit extends Error {
 /** Deployment hints locate rows only. They never prove identity, existence
  * or definition. Invalid/absent hints simply use bounded metadata discovery. */
 export function configureSchemaObjectHints(sql:SqlStorage,raw:unknown):void {
+  configureDurableLocators(sql);
   hints.delete(sql);
   if(typeof raw==='string') {
     if(raw.length>4096)return;
@@ -53,7 +63,31 @@ function snapshot(sql:SqlStorage):Map<string,Locator> {
   snapshots.set(sql,result);return result;
 }
 
-function remember(sql:SqlStorage,identity:Identity,rowid:number):void {
+type DurableLocator={object_rowid:unknown};
+function durableLocator(sql:SqlStorage,identity:Identity):DurableLocator|null|undefined {
+  if(!durableOwners.has(sql))return;
+  return sql.exec(`SELECT /* live locator metadata */ object_rowid FROM ${LOCATOR_TABLE} WHERE object_type=? AND table_name=? AND name=?`,
+    identity.type,identity.table,identity.name).toArray()[0] as DurableLocator|undefined??null;
+}
+function persistLocator(sql:SqlStorage,identity:Identity,rowid:number,observed?:DurableLocator|null):void {
+  if(!durableOwners.has(sql))return;
+  // A readSchemaObject caller just observed this row in the same synchronous
+  // call. Carry it locally, never cache its absence or verification verdict.
+  const current=observed===undefined?durableLocator(sql,identity):observed;
+  if(current?.object_rowid===rowid)return;
+  if(!current) {
+    // Only this tiny metadata table is counted, never application history.
+    // Raw sentinel first; no COUNT aggregate may traverse an unknown source.
+    const rows=sql.exec(`SELECT /* live locator metadata */ object_type,table_name,name FROM ${LOCATOR_TABLE} LIMIT 1025`).toArray();
+    if(rows.length>=1024)throw new SchemaObjectObservationLimit();
+    for(const row of rows)if(!['index','trigger'].includes(String(row.object_type))||!validName(row.table_name)||!validName(row.name))throw new SchemaObjectObservationLimit();
+  }
+  sql.exec(`INSERT INTO ${LOCATOR_TABLE}(object_type,table_name,name,object_rowid) VALUES(?,?,?,?)
+    ON CONFLICT(object_type,table_name,name) DO UPDATE SET object_rowid=excluded.object_rowid
+    WHERE ${LOCATOR_TABLE}.object_rowid IS NOT excluded.object_rowid`,identity.type,identity.table,identity.name,rowid);
+}
+function remember(sql:SqlStorage,identity:Identity,rowid:number,observed?:DurableLocator|null):void {
+  persistLocator(sql,identity,rowid,observed);
   let locators=snapshots.get(sql)??new Map<string,Locator>();
   const identityKey=key(identity),row={rowid,name:identity.name,type:identity.type,tbl_name:identity.table};
   if(!locators.has(identityKey)) {
@@ -76,18 +110,24 @@ function read(sql:SqlStorage,identity:Identity,rowid:number):Located|null {
 }
 
 /** Every lookup verifies actual live identity and SQL through the rowid.
- * Wrong/reused deployment hints and stale in-memory locators fall back to a
+ * Durable metadata stores ROWIDs only and survives eviction; every candidate
+ * still needs this live physical proof. Wrong/reused hints and locators fall back to a
  * shared bounded schema snapshot. Absence is never cached as authority. */
 export function readSchemaObject(sql:SqlStorage,identity:Identity):Located|null {
   validate(identity);
   const locator=snapshots.get(sql)?.get(key(identity));
+  const observed=durableLocator(sql,identity);
+  const stored=observed?.object_rowid;
+  const durable=Number.isSafeInteger(stored)&&Number(stored)>0?Number(stored):undefined;
   const hinted=hints.get(sql)?.get(identity.name);
-  for(const rowid of new Set([locator?.rowid,hinted]))if(rowid!==undefined) {
+  for(const rowid of new Set([locator?.rowid,durable,hinted]))if(rowid!==undefined) {
     const actual=read(sql,identity,rowid);
-    if(actual){remember(sql,identity,actual.rowid);return actual;}
+    if(actual){remember(sql,identity,actual.rowid,observed);return actual;}
   }
   const discovered=snapshot(sql).get(key(identity));
-  return discovered?read(sql,identity,discovered.rowid):null;
+  const actual=discovered?read(sql,identity,discovered.rowid):null;
+  if(actual)remember(sql,identity,actual.rowid,observed);
+  return actual;
 }
 
 /** Call immediately after an actual CREATE/replace. New schema objects are

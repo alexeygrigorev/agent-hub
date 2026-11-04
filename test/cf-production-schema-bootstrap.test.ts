@@ -14,7 +14,7 @@ const earlyTriggerNames=new Set(['resource_request_session_control_sessions_inse
   'lifecycle_request_insert','session_observation_intake_insert','intake_projection_insert','intake_storage_tasks_insert',
   'intake_export_insert','intake_export_count_insert','intake_export_total_insert','named_agent_registry_insert']);
 const hintNames=['messages_bind_agents','resource_catalog_fleet_sessions_update','fleet_launch_runtime_exit',
-  'agents_no_legacy_collision_insert','agents_no_legacy_collision_update'];
+  'agents_no_legacy_collision_insert','agents_no_legacy_collision_update','host_goal_running_insert','host_goal_running_update'];
 const retained=1001;
 
 describe('first restoration from the actual deployed schema',()=>{
@@ -91,7 +91,7 @@ describe('first restoration from the actual deployed schema',()=>{
      expect(setup.exec('SELECT 1 FROM '+table+' LIMIT 1002').toArray()).toHaveLength(retained);
    expect(setup.exec("SELECT count FROM intake_storage_totals WHERE kind='tasks'").one().count).toBe(retained);
    const hints=setup.exec(`SELECT rowid,name,type,tbl_name FROM sqlite_master WHERE name IN (${hintNames.map(()=>'?').join(',')})`,...hintNames).toArray();
-   expect(hints).toHaveLength(5);
+   expect(hints).toHaveLength(hintNames.length);
    const oldCatalog=setup.exec('SELECT name,tbl_name FROM sqlite_master ORDER BY rowid LIMIT 1025').toArray();
    const oldObjects=oldCatalog.length;
    expect(oldCatalog.filter((row:any)=>!reserved(row.tbl_name))).toHaveLength(deployedUserObjectCount);
@@ -99,9 +99,10 @@ describe('first restoration from the actual deployed schema',()=>{
    // All synthetic history/replayed OLD schema work ends above. The fresh
    // initializer below pays EVERY new table/index/trigger and source probe.
    h.writes=new WriteWatch();h.meter=new RowsMeter();
+   const nativeMeter=new RowsMeter();
    let failure:unknown;
    try{
-    await restartFixtureHub(h,{...env,SCHEMA_OBJECT_ROWID_HINTS:JSON.stringify(hints)});
+    await restartFixtureHub(h,{...env,SCHEMA_OBJECT_ROWID_HINTS:JSON.stringify(hints)},nativeMeter);
     h.backgroundRootStamp=null;h.backgroundAlarmStamp=null;
     await h.budgeted(async()=>undefined,undefined);
    }catch(error){failure=error;}
@@ -112,6 +113,7 @@ describe('first restoration from the actual deployed schema',()=>{
     retained_per_large_source:retained,retained_small_sources:{disk_observations:200,jobs:17,leases:2},guard_consumed_total:cost,native_sql:native,ledger,
     failure:failure?{name:(failure as any)?.name,code:(failure as any)?.code}:null,
     top_sql:h.meter.statementTop(30),
+    all_guarded_native_sql:nativeMeter.snapshot(),all_guarded_native_top_sql:nativeMeter.statementTop(60),
     scope:'actual OLD schema plus observed OLD receipts; full current initializer/subclass and outer queue/root/alarm gates; one strict20kday'}));
    h.cancelBudgetRefund();
    if(failure)throw failure;
