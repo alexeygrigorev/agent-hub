@@ -367,7 +367,7 @@ export type HostHealthSummary = {
 
 type TrendSample = {timeMs:number;usedBytes:number;totalBytes:number;percent:number};
 export class MonitoringService {
-  private trendCache = new Map<string,{revision:string;samples:Map<string,TrendSample[]>}>();
+  private trendCache = new Map<string,{revision:string;samples:Map<string,TrendSample[]>;limited:boolean}>();
   constructor(
     private sql: SqlStorage,
     private tx: <T>(fn: () => T) => T,
@@ -1099,8 +1099,17 @@ export class MonitoringService {
       const revision=String(this.sql.exec('SELECT revision FROM disk_trend_revision WHERE machine_id=?',machineId).toArray()[0]?.revision ?? 'initial');
       let cached=this.trendCache.get(machineId);
       if(!cached || cached.revision!==revision) {
+        // Configured retention is200observations with at most32filesystems
+        // each. Reject legacy excess from the covering host index first;
+        // never traverse its expanded historical sample projection.
+        const source=this.sql.exec('SELECT 1 FROM disk_observations INDEXED BY idx_disk_obs_machine WHERE machine_id=? LIMIT ?',machineId,DISK_LIMITS.maxHistoryPerMachine+1).toArray();
+        if(source.length>DISK_LIMITS.maxHistoryPerMachine) {
+          if(this.trendCache.size>=128)this.trendCache.clear();
+          this.trendCache.set(machineId,{revision,samples:new Map(),limited:true});return null;
+        }
+        const maxSamples=DISK_LIMITS.maxHistoryPerMachine*32;
         const rows=this.sql.exec(`SELECT id,observed_at_ms,mount_point,used_bytes,total_bytes,percent
-          FROM disk_trend_samples WHERE machine_id=? ORDER BY observed_at_ms,observation_rowid,ordinal`,machineId).toArray() as any[];
+          FROM disk_trend_samples INDEXED BY disk_trend_machine_time WHERE machine_id=? ORDER BY observed_at_ms,observation_rowid,ordinal LIMIT ${maxSamples+1}`,machineId).toArray() as any[];
         const samples=new Map<string,TrendSample[]>(),seen=new Set<string>();
         for(const row of rows) {
           const key=JSON.stringify([row.id,row.mount_point]);
@@ -1111,12 +1120,13 @@ export class MonitoringService {
           values.push({timeMs:row.observed_at_ms,usedBytes:row.used_bytes,totalBytes:row.total_bytes,percent:row.percent});
           samples.set(row.mount_point,values);
         }
-        cached={revision,samples};
+        cached={revision,samples,limited:rows.length>maxSamples};
         if(this.trendCache.size>=128) this.trendCache.clear();
         this.trendCache.set(machineId,cached);
       }
       // Cache retained facts only. The window and freshness advance on every
       // call, and an earlier explicit now can still see its original history.
+      if(cached.limited)return null;
       return new Map([...cached.samples].map(([mount,samples])=>[mount,samples.filter(s=>s.timeMs>=now-DISK_LIMITS.maxTrendWindowMs)]));
     } catch { return null; }
   }
@@ -1201,16 +1211,29 @@ export class MonitoringService {
 
   /** Complete disk status with trends and active episodes. */
   getDiskStatus(now: number = this.now(), machineFilter?: string): any {
-    const machinesQuery = machineFilter
-      ? this.sql.exec('SELECT DISTINCT machine_id FROM disk_observations WHERE machine_id = ?', machineFilter).toArray()
-      : this.sql.exec('SELECT DISTINCT machine_id FROM disk_observations').toArray();
+    const machinesQuery:any[]=[];let hostsLimited=false;
+    if(machineFilter) {
+      const row=this.sql.exec('SELECT machine_id FROM disk_observations INDEXED BY idx_disk_obs_machine WHERE machine_id=? LIMIT 1',machineFilter).toArray()[0];
+      if(row)machinesQuery.push(row);
+    } else {
+      let after:string|undefined;
+      // Seek the next leading index key instead of DISTINCT over retained
+      // samples. One extra host is an explicit incomplete-list sentinel.
+      for(let i=0;i<=64;i++) {
+        const row:any=after===undefined?this.sql.exec('SELECT machine_id FROM disk_observations INDEXED BY idx_disk_obs_machine ORDER BY machine_id LIMIT 1').toArray()[0]
+          :this.sql.exec('SELECT machine_id FROM disk_observations INDEXED BY idx_disk_obs_machine WHERE machine_id>? ORDER BY machine_id LIMIT 1',after).toArray()[0];
+        if(!row)break;
+        if(i===64){hostsLimited=true;break;}
+        machinesQuery.push(row);after=String(row.machine_id);
+      }
+    }
 
     const machineList: any[] = [];
 
     for (const mRow of machinesQuery as any[]) {
       const mid = mRow.machine_id;
       const latestRow: any = this.sql
-        .exec('SELECT * FROM disk_observations WHERE machine_id = ? ORDER BY observed_at_ms DESC LIMIT 1', mid)
+        .exec('SELECT * FROM disk_observations INDEXED BY idx_disk_obs_machine WHERE machine_id = ? ORDER BY observed_at_ms DESC LIMIT 1', mid)
         .toArray()[0];
       if (!latestRow) continue;
 
@@ -1237,7 +1260,7 @@ export class MonitoringService {
 
       const openEpisodes = this.sql
         .exec(
-          'SELECT episode_key, mount_point, state, opened_at, last_updated_at, alert_id, intake_task_id FROM disk_episodes WHERE machine_id = ? AND resolved_at IS NULL',
+          'SELECT episode_key, mount_point, state, opened_at, last_updated_at, alert_id, intake_task_id FROM disk_episodes INDEXED BY idx_disk_episodes_open WHERE machine_id = ? AND resolved_at IS NULL LIMIT 129',
           mid,
         )
         .toArray();
@@ -1251,13 +1274,17 @@ export class MonitoringService {
         observed_at: latestRow.observed_at,
         freshness,
         filesystems: filesystemsWithTrend,
-        open_episodes: openEpisodes,
+        open_episodes: openEpisodes.slice(0,128),
+        observation_pending:samples===null||openEpisodes.length>128,
+        open_episodes_observation_pending:openEpisodes.length>128,
       });
     }
 
     return {
       snapshot_at: new Date(now).toISOString(),
       machines: machineList,
+      observation_pending:hostsLimited||machineList.some(m=>m.observation_pending),
+      machine_list_observation_pending:hostsLimited,
     };
   }
 

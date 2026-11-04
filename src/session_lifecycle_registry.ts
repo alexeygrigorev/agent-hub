@@ -1,3 +1,4 @@
+import { RowBudgetExceeded } from './row-budget';
 import { jsonFields } from './sql-json-projection';
 import { backfillOnce } from './sql-probes';
 import { intakeHasDoneEvidence } from './intake';
@@ -72,6 +73,7 @@ export type LifecycleRefs = {
   protected_session: boolean;
   task_refs: string[];
   report_refs: string[];
+  task_linkage_observation_pending?: boolean;
   has_brief: boolean;
 };
 
@@ -153,6 +155,12 @@ export function initLifecycleRequestProjection(sql: SqlStorage): void {
 /** Canonical identity union. Only sessions with a native identity
  * (bound hub sessions, observed fleet sessions) are keyed; unbound
  * queued/held intents stay in the existing flat list view only. */
+export class LifecycleObservationLimit extends Error {
+  readonly code='lifecycle_observation_limit';
+  readonly status=503;
+  constructor(){super('lifecycle_observation_limit');}
+}
+
 function joinedBases(sql: SqlStorage, sessionIds?: Set<string>): JoinedBase[] {
   const byKey = new Map<string, JoinedBase>();
   const get = (machine_id: string, native_id: string): JoinedBase => {
@@ -168,9 +176,7 @@ function joinedBases(sql: SqlStorage, sessionIds?: Set<string>): JoinedBase[] {
   // Batch canonical joins rather than materializing the entire fleet archive.
   const selected = sessionIds ? [...sessionIds] : null;
   let projected = false;
-  try { projected = sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='lifecycle_request_projection'").toArray().length > 0; } catch {}
-  const source = (table: string) => table === 'session_control_sessions' && projected
-    ? `${table} c LEFT JOIN lifecycle_request_projection lp ON lp.id=c.id` : `${table} c`;
+  try { projected = sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='lifecycle_request_projection'").toArray().length > 0; } catch(error) {if(error instanceof RowBudgetExceeded)throw error;}
   const columns = (table: string) => {
     if (table === 'session_control_sessions') return `c.id,c.actor,c.machine_id,c.fleet_launch_id,c.binding_json,c.mode,c.session_type,
       c.owner_token_id,c.owner_family,c.state,c.updated_at,c.engine,
@@ -180,40 +186,74 @@ function joinedBases(sql: SqlStorage, sessionIds?: Set<string>): JoinedBase[] {
       typeof(c.prompt)='text' AS has_prompt`;
     return 'c.machine_id,c.native_id,c.engine,c.workspace,c.cwd,c.tag,c.last_activity_at,c.observed_at,c.phase,c.agent_state';
   };
-  const read = (table: string): any[] => {
-    const projection = columns(table);
-    if (!selected) return sql.exec(`SELECT ${projection} FROM ${source(table)} ORDER BY c.rowid`).toArray() as any[];
-    const rows = new Map<string, any>();
-    for (let i = 0; i < selected.length; i += 1000) {
-      const ids = selected.slice(i, i + 1000);
-      const nativeId = `CASE WHEN json_valid(binding_json) THEN CASE WHEN json_type(binding_json, '$.native_id') = 'text' THEN json_extract(binding_json, '$.native_id') END END`;
-      // Tuple-IN only seeks machine_id on SQLite's expression index. An
-      // equality join with untyped RHS seeks the complete native identity.
-      const targetNative = table === 'session_control_sessions'
-        ? nativeId.replaceAll('binding_json', 'c.binding_json') : 'c.native_id';
-      const prefix = `WITH selected AS (SELECT id,fleet_launch_id,machine_id,${nativeId} AS native_id
-        FROM session_control_sessions WHERE id IN (SELECT value FROM json_each(?))) `;
-      const nativeRows = `SELECT c.rowid AS matched_rowid FROM
-        (SELECT DISTINCT machine_id,native_id FROM selected) s
-        JOIN ${table} c ON c.machine_id=s.machine_id AND ${targetNative}=+s.native_id`;
-      const matches = table === 'session_control_sessions'
-        ? `SELECT c.rowid AS matched_rowid FROM ${table} c WHERE c.id IN (SELECT id FROM selected) UNION ${nativeRows}`
-        : table === 'fleet_sessions' ? nativeRows
-        : `SELECT c.rowid AS matched_rowid FROM ${table} c WHERE c.id IN
-          (SELECT fleet_launch_id FROM selected) UNION ${nativeRows}`;
-      // Deduplicate identity before projecting JSON: a selected bound control
-      // row normally matches both branches, but its large request needs parsing
-      // only once. Canonical rowid ordering still selects the oldest alias.
-      const query = `SELECT c.rowid AS _join_order,${projection} FROM ${source(table)}
-        WHERE c.rowid IN (${matches})`;
-      for (const row of sql.exec(prefix + query, JSON.stringify(ids)).toArray() as any[]) rows.set(row.id ?? `${row.machine_id}/${row.native_id}`, row);
+  if(selected && selected.length>512)throw new LifecycleObservationLimit();
+  const aliasLimit=1024;
+  const joinProjection=(table:string)=>table==='session_control_sessions' && projected
+    ? ' LEFT JOIN lifecycle_request_projection lp ON lp.id=c.id' : '';
+  let selectedControls:any[]|undefined;
+  const controls=():any[]=>{
+    if(selectedControls)return selectedControls;
+    if(!selected?.length)return selectedControls=[];
+    // Drive from the caller's bounded IDs, never from the retained table.
+    return selectedControls=sql.exec(`SELECT c.rowid AS _join_order,${columns('session_control_sessions')}
+      FROM json_each(?) ids CROSS JOIN session_control_sessions c ON c.id=ids.value
+      ${joinProjection('session_control_sessions')}`,JSON.stringify(selected)).toArray() as any[];
+  };
+  let nativeIdentities:string|undefined;
+  const identities=():string=>{
+    if(nativeIdentities!==undefined)return nativeIdentities;
+    const unique=new Map<string,[string,string]>();
+    for(const row of controls()) {
+      const binding=parsed(row.binding_json,null);
+      if(typeof row.machine_id!=='string' || typeof binding?.native_id!=='string')continue;
+      const pair:[string,string]=[row.machine_id,binding.native_id];
+      unique.set(JSON.stringify(pair),pair);
     }
-    return [...rows.values()].sort((a, b) => a._join_order - b._join_order);
+    return nativeIdentities=JSON.stringify([...unique.values()]);
+  };
+  const read = (table: string): any[] => {
+    const projection=columns(table);
+    if(!selected) {
+      const raw=sql.exec(`SELECT rowid AS matched_rowid FROM ${table} ORDER BY rowid LIMIT 1025`).toArray() as any[];
+      if(raw.length>aliasLimit)throw new LifecycleObservationLimit();
+      if(!raw.length)return [];
+      return (sql.exec(`SELECT c.rowid AS _join_order,${projection} FROM json_each(?) ids
+        CROSS JOIN ${table} c ON c.rowid=ids.value ${joinProjection(table)}`,
+        JSON.stringify(raw.map(row=>row.matched_rowid))).toArray() as any[]).sort((a,b)=>a._join_order-b._join_order);
+    }
+    const direct=controls();
+    const rows=new Map<number,any>();
+    const ids=new Set<number>();
+    if(table==='session_control_sessions')for(const row of direct){rows.set(row._join_order,row);ids.add(row._join_order);}
+    if(table==='fleet_launches') {
+      const launches=[...new Set(direct.map(row=>row.fleet_launch_id).filter(id=>typeof id==='string'))];
+      if(launches.length)for(const row of sql.exec(`SELECT c.rowid AS matched_rowid FROM json_each(?) ids
+        CROSS JOIN fleet_launches c ON c.id=ids.value`,JSON.stringify(launches)).toArray() as any[])ids.add(row.matched_rowid);
+    }
+    const nativeId=`CASE WHEN json_valid(c.binding_json) THEN CASE WHEN json_type(c.binding_json,'$.native_id')='text' THEN json_extract(c.binding_json,'$.native_id') END END`;
+    const hint=table==='session_control_sessions'?' INDEXED BY session_control_native'
+      :table==='fleet_launches'?' INDEXED BY fleet_launch_native_state':'';
+    const target=table==='session_control_sessions'?nativeId:'c.native_id';
+    // Materialize only identity keys. The exact deployed index prefixes seek
+    // aliases, and the GLOBAL raw sentinel precedes any request JSON hydration.
+    const aliases=sql.exec(`WITH identities AS MATERIALIZED (
+      SELECT json_extract(value,'$[0]') AS machine_id,json_extract(value,'$[1]') AS native_id FROM json_each(?))
+      SELECT c.rowid AS matched_rowid FROM identities k CROSS JOIN ${table} c${hint}
+      ON c.machine_id=k.machine_id AND ${target}=+k.native_id LIMIT 1025`,identities()).toArray() as any[];
+    if(aliases.length>aliasLimit)throw new LifecycleObservationLimit();
+    for(const row of aliases)ids.add(row.matched_rowid);
+    if(ids.size>aliasLimit)throw new LifecycleObservationLimit();
+    const missing=[...ids].filter(id=>!rows.has(id));
+    if(missing.length)for(const row of sql.exec(`SELECT c.rowid AS _join_order,${projection}
+      FROM json_each(?) ids CROSS JOIN ${table} c ON c.rowid=ids.value ${joinProjection(table)}`,
+      JSON.stringify(missing)).toArray() as any[])rows.set(row._join_order,row);
+    return [...rows.values()].sort((a,b)=>a._join_order-b._join_order);
   };
   let scRows: any[] = [];
   try {
     scRows = read('session_control_sessions');
-  } catch {
+  } catch(error) {
+    if(error instanceof LifecycleObservationLimit || error instanceof RowBudgetExceeded)throw error;
     scRows = [];
   }
   const launchesById = new Map<string, any>();
@@ -221,7 +261,7 @@ function joinedBases(sql: SqlStorage, sessionIds?: Set<string>): JoinedBase[] {
     for (const launch of read('fleet_launches')) {
       launchesById.set(launch.id, launch);
     }
-  } catch { /* fleet tables predate; join degrades to session-control only */ }
+  } catch(error) { if(error instanceof LifecycleObservationLimit || error instanceof RowBudgetExceeded)throw error; /* fleet tables predate; join degrades to session-control only */ }
   for (const sc of scRows) {
     const binding = sc.binding_json ? parsed(sc.binding_json) : null;
     if (!sc.machine_id || !binding?.native_id) continue;
@@ -231,7 +271,8 @@ function joinedBases(sql: SqlStorage, sessionIds?: Set<string>): JoinedBase[] {
   let fleetRows: any[] = [];
   try {
     fleetRows = read('fleet_sessions');
-  } catch {
+  } catch(error) {
+    if(error instanceof LifecycleObservationLimit || error instanceof RowBudgetExceeded)throw error;
     fleetRows = [];
   }
   for (const fleet of fleetRows) {
@@ -252,7 +293,7 @@ function joinedBases(sql: SqlStorage, sessionIds?: Set<string>): JoinedBase[] {
   return [...byKey.values()];
 }
 
-type TaskLinks = { task_refs: string[]; report_refs: string[] };
+type TaskLinks = { task_refs: string[]; report_refs: string[]; observation_pending?:boolean };
 
 /** Canonical intake links only: link events WITHOUT a routing_job_id are
  * external/unverified and never join — EXCEPT links carrying a
@@ -263,15 +304,28 @@ type TaskLinks = { task_refs: string[]; report_refs: string[] };
 /** Parse each history once per projection, not once per session. The maps
  * contain canonical link candidates; union in intake order preserves the
  * existing 25-task / 5-report bounds when a task links both identities. */
-function taskLinkIndex(sql: SqlStorage): (native: string, hub: string | null) => TaskLinks {
+function taskLinkIndex(sql: SqlStorage, selected:Set<string>): (native: string, hub: string | null) => TaskLinks {
   type LinkedTask = { order: number; id: string; reports: string[] };
   const natives = new Map<string, LinkedTask[]>();
   const hubs = new Map<string, LinkedTask[]>();
+  const unknown=()=>({task_refs:[],report_refs:[],observation_pending:true});
+  if(!selected.size)return ()=>({task_refs:[],report_refs:[]});
+  if(selected.size>2048)return unknown;
   try {
-    const rows = sql.exec('SELECT id, links FROM intake_task_projection').toArray() as any[];
+    // Normalized refs are initialized atomically by IntakeService and kept
+    // insert-only by triggers. Global health proves malformed/unfinished
+    // legacy input cannot hide a link behind an empty candidate result.
+    const stores=sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('intake_projection_link_refs','intake_link_health','intake_link_health_meta')").toArray();
+    if(stores.length!==3)return unknown;
+    if((sql.exec('SELECT complete FROM intake_link_health_meta WHERE id=1').toArray()[0] as any)?.complete!==1
+      ||sql.exec('SELECT id FROM intake_link_health ORDER BY id LIMIT 1').toArray().length)return unknown;
+    const refs=sql.exec('SELECT ref,task_id FROM intake_projection_link_refs WHERE ref IN (SELECT value FROM json_each(?)) LIMIT 129',JSON.stringify([...selected])).toArray() as any[];
+    if(refs.length>128)return unknown;
+    const ids=[...new Set(refs.map(r=>String(r.task_id)))];
+    const rows=ids.length?sql.exec('SELECT id,links FROM intake_task_projection WHERE id IN (SELECT value FROM json_each(?)) ORDER BY rowid',JSON.stringify(ids)).toArray() as any[]:[];
     for (const [order, row] of rows.entries()) {
       const task = { id: row.id, history: parsed(row.links, []) };
-      if (!Array.isArray(task.history)) continue;
+      if (!Array.isArray(task.history)||task.history.length>128||new TextEncoder().encode(String(row.links)).byteLength>2097152)return unknown;
       const nativeIds = new Set<string>();
       const hubIds = new Set<string>();
       const reports: string[] = [];
@@ -291,7 +345,7 @@ function taskLinkIndex(sql: SqlStorage): (native: string, hub: string | null) =>
         }
       }
     }
-  } catch { /* intake tables absent: unknown task linkage */ }
+  } catch { return unknown; /* never interpret unreadable linkage as absence */ }
   return (native, hub) => {
     const tasks = [...new Set([...(natives.get(native) ?? []), ...(hub ? hubs.get(hub) ?? [] : [])])]
       .sort((a, b) => a.order - b.order).slice(0, 25);
@@ -303,39 +357,28 @@ function taskLinkIndex(sql: SqlStorage): (native: string, hub: string | null) =>
   };
 }
 
-function observationsByKey(sql: SqlStorage, keys?: string[]): Map<string, any> {
-  const map = new Map<string, any>();
+function observationsByKey(sql:SqlStorage,keys:string[]):Map<string,any> {
+  const map=new Map<string,any>();
   try {
-    if (!keys) {
-      for (const row of sql.exec('SELECT * FROM session_lifecycle_observations').toArray() as any[]) map.set(row.session_key, row);
-    } else {
-      for (let i=0;i<keys.length;i+=1000) {
-        for (const row of sql.exec('SELECT * FROM session_lifecycle_observations WHERE session_key IN (SELECT value FROM json_each(?))',
-          JSON.stringify(keys.slice(i,i+1000))).toArray() as any[]) map.set(row.session_key,row);
-      }
-    }
-  } catch { /* pre-init: no observations yet */ }
+    for(let i=0;i<keys.length;i+=512)for(const row of sql.exec(
+      'SELECT * FROM session_lifecycle_observations WHERE session_key IN (SELECT value FROM json_each(?))',
+      JSON.stringify(keys.slice(i,i+512))).toArray() as any[])map.set(row.session_key,row);
+  } catch(error) {if(error instanceof RowBudgetExceeded)throw error; /* absent additive schema: unknown */}
   return map;
 }
 
-function decisionsByKey(sql: SqlStorage): Map<string, LifecycleDecision[]> {
-  const map = new Map<string, LifecycleDecision[]>();
+function decisionsByKey(sql:SqlStorage,keys:string[]):Map<string,LifecycleDecision[]> {
+  const map=new Map<string,LifecycleDecision[]>();
   try {
-    for (const row of sql.exec('SELECT * FROM session_lifecycle_decisions ORDER BY created_at, decision_id').toArray() as any[]) {
-      const list = map.get(row.session_key) ?? [];
-      list.push({
-        session_key: row.session_key,
-        decision_id: row.decision_id,
-        kind: row.kind,
-        actor: row.actor,
-        reason: row.reason,
-        engine: row.engine ?? null,
-        target: row.target ?? null,
-        created_at: row.created_at,
-      });
-      map.set(row.session_key, list);
+    for(let i=0;i<keys.length;i+=512)for(const row of sql.exec(`SELECT d.* FROM json_each(?) ids
+      CROSS JOIN session_lifecycle_decisions d ON d.decision_id=(
+        SELECT decision_id FROM session_lifecycle_decisions INDEXED BY lifecycle_decision_latest
+        WHERE session_key=ids.value ORDER BY created_at DESC,decision_id DESC LIMIT 1)`,
+      JSON.stringify(keys.slice(i,i+512))).toArray() as any[]) {
+      map.set(row.session_key,[{session_key:row.session_key,decision_id:row.decision_id,kind:row.kind,
+        actor:row.actor,reason:row.reason,engine:row.engine??null,target:row.target??null,created_at:row.created_at}]);
     }
-  } catch { /* pre-init: no decisions yet */ }
+  } catch(error) {if(error instanceof RowBudgetExceeded)throw error; /* absent additive schema: unknown */}
   return map;
 }
 
@@ -410,21 +453,19 @@ function checkObservationPayload(input: any): { ok: true; stored: Record<string,
  * from canonical rows; observations supply host-verified flags only. */
 export function buildSessionInputs(sql: SqlStorage, sessionIds?: Set<string>, options: { taskLinks?: boolean } = {}): { inputs: SessionInput[]; refs: Map<string, LifecycleRefs> } {
   const bases = joinedBases(sql, sessionIds);
-  const observations = observationsByKey(sql, sessionIds ? bases.map(base=>base.key) : undefined);
+  const observations = observationsByKey(sql,bases.map(base=>base.key));
   // Callers that read only protection/ownership refs (worktree-guards) skip the
-  // full intake_task_projection scan; task_refs/report_refs are then empty.
-  const taskLinks = options.taskLinks === false ? () => ({ task_refs: [], report_refs: [] }) : taskLinkIndex(sql);
-  const protectedSessions = new Set<string>();
-  let protectionKnown = true;
+  // selected intake links; task_refs/report_refs are then deliberately skipped.
+  const taskLinks:(native:string,hub:string|null)=>TaskLinks = options.taskLinks === false ? () => ({ task_refs: [], report_refs: [] })
+    :taskLinkIndex(sql,new Set(bases.flatMap(base=>[base.native_id,base.sc?.id].filter((id):id is string=>typeof id==='string'))));
+  const protectedSessions=new Set<string>();
+  let protectionKnown=true;
   try {
-    if (sessionIds) {
-      const all = [...sessionIds];
-      for (let i = 0; i < all.length; i += 1000) {
-        for (const row of sql.exec('SELECT session_id FROM session_control_protections WHERE session_id IN (SELECT value FROM json_each(?))',
-          JSON.stringify(all.slice(i, i + 1000))).toArray() as any[]) protectedSessions.add(row.session_id);
-      }
-    } else for (const row of sql.exec('SELECT session_id FROM session_control_protections').toArray() as any[]) protectedSessions.add(row.session_id);
-  } catch { protectionKnown = false; }
+    const all=[...new Set([...(sessionIds??[]),...bases.map(base=>base.sc?.id).filter((id):id is string=>typeof id==='string')])];
+    for(let i=0;i<all.length;i+=512)for(const row of sql.exec(
+      'SELECT session_id FROM session_control_protections WHERE session_id IN (SELECT value FROM json_each(?))',
+      JSON.stringify(all.slice(i,i+512))).toArray() as any[])protectedSessions.add(row.session_id);
+  } catch(error) {if(error instanceof RowBudgetExceeded)throw error;protectionKnown=false;}
   const inputs: SessionInput[] = [];
   const refs = new Map<string, LifecycleRefs>();
   // Creator provenance is immutable during this synchronous read. Many
@@ -509,7 +550,8 @@ export function buildSessionInputs(sql: SqlStorage, sessionIds?: Set<string>, op
       starter,
       owner: starter,
       human_owned,
-      protected_session,
+      protected_session:protected_session||links.observation_pending===true,
+      task_linkage_observation_pending:links.observation_pending===true,
       task_refs: links.task_refs,
       report_refs: links.report_refs,
       has_brief: (Object.prototype.hasOwnProperty.call(request, 'brief')
@@ -528,9 +570,10 @@ export function buildLifecycleView(
   options: { limit?: number; cursor?: string | null; now_ms?: number },
 ): { groups: Record<LifecycleGroup, Record<string, unknown>[]>; next_cursor: string | null; total: number } {
   const { inputs, refs } = buildSessionInputs(sql);
-  const decisions = decisionsByKey(sql);
   const now = options.now_ms ?? Date.now();
   const projection = projectSessions(inputs, scope, { ...options, now_ms: now });
+  const visibleEntries=Object.values(projection.groups).flat();
+  const decisions=decisionsByKey(sql,visibleEntries.map(entry=>entry.session_key));
   const groups = {
     waiting_alexey: [],
     limit_blocked: [],
@@ -538,12 +581,16 @@ export function buildLifecycleView(
     active: [],
     unknown: [],
   } as Record<LifecycleGroup, Record<string, unknown>[]>;
-  const wakes = new Map<string, string>();
+  const wakes=new Map<string,string>();
   try {
-    for (const w of sql.exec("SELECT session_id,MIN(wake_at_ms) AS at FROM session_control_wakes WHERE state='pending' AND wake_at_ms>? GROUP BY session_id", now).toArray() as any[]) {
-      wakes.set(w.session_id, new Date(w.at).toISOString());
+    const visible=new Set(visibleEntries.map(entry=>refs.get(entry.session_key)?.session_id)
+      .filter((id):id is string=>typeof id==='string'));
+    for(const id of visible) {
+      const wake=sql.exec(`SELECT wake_at_ms FROM session_control_wakes INDEXED BY intake_queue_wakes_session
+        WHERE session_id=? AND state='pending' AND wake_at_ms>? ORDER BY wake_at_ms LIMIT 1`,id,now).toArray()[0] as any;
+      if(wake)wakes.set(id,new Date(wake.wake_at_ms).toISOString());
     }
-  } catch { /* optional scheduled-wake schema */ }
+  } catch(error) {if(error instanceof RowBudgetExceeded)throw error; /* absent optional wake schema */}
   const enrich = (entry: ClassifiedSession): Record<string, unknown> => {
     const dto = toStatusDto(entry) as Record<string, unknown>;
     const ref = refs.get(entry.session_key) ?? null;

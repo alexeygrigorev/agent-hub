@@ -127,11 +127,22 @@ jobs:
 
       - name: Cloudflare cost safety regressions
         timeout-minutes: 5
+        shell: bash
         env:
           UV_THREADPOOL_SIZE: "1"
           GOMAXPROCS: "1"
           NODE_OPTIONS: "--v8-pool-size=1"
-        run: npx --no-install vitest run test/cf-row-budget.test.ts test/cf-row-budget-hub.test.ts test/cf-loop-alarm.test.ts test/cf-background-bounds.test.ts test/cf-placement-pressure-bounded.test.ts test/host-history-bounded.test.ts test/cf-tbm-bounds.test.ts test/cf-intake-services-bounded.test.ts test/cf-memory-snapshot-budget.test.ts test/cf-index-migration-budget.test.ts test/cf-legacy-cost-replay.test.ts test/cf-existing-bootstrap-indexes.test.ts test/cf-fleet-existing-indexes.test.ts test/cf-native-credential-bounds.test.ts test/cf-command-channel-projection.test.ts test/command-channel-placement.test.ts test/cf-job-authority.test.ts test/cf-telemetry-coalescing.test.ts test/cf-intake-summary-bootstrap.test.ts test/cf-background-dispatch.test.ts test/cf-bootstrap-cost.test.ts test/cf-background-queue.test.ts test/cf-bus-agent-projection.test.ts test/cf-root-incumbent.test.ts test/cf-bus-history-bounds.test.ts test/cf-bus-inbox-bounds.test.ts test/cf-reader-coalescing.test.ts test/cf-returning-cache.test.ts test/cf-webhook-ack-deadline.test.ts test/cf-fleet-failure-observation.test.ts test/cf-credential-session-cache.test.ts test/cf-job-cas-trigger.test.ts test/cf-auth-cas-trigger.test.ts test/helpers/fixture-budget.test.ts test/cf-backup-bounds.test.ts test/cf-conversation-visibility.test.ts test/cf-intake-link-bounds.test.ts test/cf-worker-child-observation.test.ts test/cf-asks-bounds.test.ts test/cf-intake-link-seed.test.ts test/cf-conversation-migration-bounds.test.ts test/cf-ask-maintenance-observation.test.ts test/cf-session-observation-bounds.test.ts test/cf-session-audit-bounds.test.ts test/cf-intake-link-health.test.ts --configLoader runner --no-file-parallelism --maxWorkers 1 --disableConsoleIntercept
+        run: npx --no-install vitest run test/cf-disk-status-bounds.test.ts test/cf-lifecycle-task-link-bounds.test.ts test/status-perf.test.ts test/cf-row-budget.test.ts test/cf-row-budget-hub.test.ts test/cf-loop-alarm.test.ts test/cf-background-bounds.test.ts test/cf-placement-pressure-bounded.test.ts test/host-history-bounded.test.ts test/cf-tbm-bounds.test.ts test/cf-intake-services-bounded.test.ts test/cf-memory-snapshot-budget.test.ts test/cf-index-migration-budget.test.ts test/cf-legacy-cost-replay.test.ts test/cf-existing-bootstrap-indexes.test.ts test/cf-fleet-existing-indexes.test.ts test/cf-native-credential-bounds.test.ts test/cf-command-channel-projection.test.ts test/command-channel-placement.test.ts test/cf-job-authority.test.ts test/cf-telemetry-coalescing.test.ts test/cf-intake-summary-bootstrap.test.ts test/cf-background-dispatch.test.ts test/cf-bootstrap-cost.test.ts test/cf-background-queue.test.ts test/cf-bus-agent-projection.test.ts test/cf-root-incumbent.test.ts test/cf-bus-history-bounds.test.ts test/cf-bus-inbox-bounds.test.ts test/cf-reader-coalescing.test.ts test/cf-returning-cache.test.ts test/cf-webhook-ack-deadline.test.ts test/cf-fleet-failure-observation.test.ts test/cf-credential-session-cache.test.ts test/cf-job-cas-trigger.test.ts test/cf-auth-cas-trigger.test.ts test/helpers/fixture-budget.test.ts test/cf-backup-bounds.test.ts test/cf-conversation-visibility.test.ts test/cf-intake-link-bounds.test.ts test/cf-worker-child-observation.test.ts test/cf-asks-bounds.test.ts test/cf-intake-link-seed.test.ts test/cf-conversation-migration-bounds.test.ts test/cf-ask-maintenance-observation.test.ts test/cf-session-observation-bounds.test.ts test/cf-session-audit-bounds.test.ts test/cf-intake-link-health.test.ts --configLoader runner --no-file-parallelism --maxWorkers 1 --disableConsoleIntercept 2>&1 | tee .local/cf-cost-safety.log
+
+      - name: Retain early cost regression diagnostics
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cf-cost-safety-${{ github.run_id }}
+          path: .local/cf-cost-safety.log
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 3
 
       - name: Worker discovery tests (Vitest)
         # Keep the full regression evidence even when an early cost test fails.

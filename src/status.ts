@@ -1,3 +1,4 @@
+import { RowBudgetExceeded } from './row-budget';
 /** M14b slice1 one-call status projection. Readonly: SELECTs only, no writes, no native effects.
  * Slice1 wires canonical intake-assigned Hub sessions (hub_session_id links
  * into session_control_sessions) plus the live M15 lifecycle group/decision
@@ -5,7 +6,7 @@
 import type { SqlStorage } from '@cloudflare/workers-types';
 import type { IntakeService } from './intake';
 import type { MonitoringService } from './monitoring';
-import { buildSessionInputs, initLifecycleRequestProjection } from './session_lifecycle_registry';
+import { buildSessionInputs, initLifecycleRequestProjection, LifecycleObservationLimit } from './session_lifecycle_registry';
 import { classifySession, toStatusDto } from './session_lifecycle';
 import { EXPECTED_OFFLINE_UNTIL, EXPECTED_OFFLINE_REASON, expectedOfflineWindowActive, isExpectedOffline } from './status_offline';
 import { resolveMachineAliases } from './machine-alias';
@@ -365,7 +366,7 @@ export class StatusService {
     // Keep this list in sync with the generation-cached SQL reader below.
     for(const table of ['session_control_sessions','fleet_launches','session_control_protections',
       'session_lifecycle_observations','intake_task_projection','credentials','lifecycle_request_projection',
-      'status_observations','session_lifecycle_decisions']) {
+      'status_observations','session_lifecycle_decisions','intake_link_health_meta','intake_link_health','intake_projection_link_refs']) {
       for(const op of ['INSERT','UPDATE','DELETE']) this.sql.exec(`CREATE TRIGGER IF NOT EXISTS status_source_${table}_${op.toLowerCase()}
         AFTER ${table === 'credentials' && op === 'UPDATE' ? 'UPDATE OF id,kind,actor,subject,created_by_sub,family_id' : op} ON ${table} BEGIN UPDATE status_source_revision SET revision=lower(hex(randomblob(16))) WHERE id=1; END`);
     }
@@ -375,7 +376,8 @@ export class StatusService {
     this.sql.exec('CREATE TABLE IF NOT EXISTS status_lifecycle_revision(id INTEGER PRIMARY KEY CHECK(id=1),revision TEXT NOT NULL)');
     this.sql.exec("INSERT OR IGNORE INTO status_lifecycle_revision VALUES(1,lower(hex(randomblob(16))))");
     for (const table of ['session_control_sessions','fleet_launches','fleet_sessions','session_control_protections',
-      'session_lifecycle_observations','intake_task_projection','credentials','status_observations','lifecycle_request_projection']) {
+      'session_lifecycle_observations','intake_task_projection','credentials','status_observations','lifecycle_request_projection',
+      'intake_link_health_meta','intake_link_health','intake_projection_link_refs']) {
       for (const op of ['INSERT','UPDATE','DELETE']) {
         // Authentication restamps last_used_at on every request. Only creator
         // provenance fields are inputs to the lifecycle ownership calculation.
@@ -1155,7 +1157,7 @@ export class StatusService {
             decisions.set(row.session_key, [row]);
           }
         }
-      } catch { /* pre-init: no decisions yet */ }
+      } catch(error) { if(error instanceof RowBudgetExceeded)throw error; /* pre-init: no decisions yet */ }
       for (const input of inputs) {
         let dto: Obj;
         try {
@@ -1167,7 +1169,7 @@ export class StatusService {
         const latest = decisions.get((dto as any).session_key)?.slice(-1)[0] ?? null;
         out.set(sessionId, { ...(dto as Obj), decision: latest ? { kind: latest.kind, actor: latest.actor, reason: latest.reason, engine: latest.engine ?? null, target: latest.target ?? null, created_at: latest.created_at } : null, refs: ref });
       }
-    } catch { /* canonical tables absent: unknown lifecycle, never a hard error */ }
+    } catch(error) { if(error instanceof LifecycleObservationLimit || error instanceof RowBudgetExceeded)throw error; /* canonical tables absent: unknown lifecycle */ }
     return out;
   }
 

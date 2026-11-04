@@ -1,3 +1,4 @@
+import {buildSessionInputs,LifecycleObservationLimit} from '../src/session_lifecycle_registry';
 import {fixtureSql} from './helpers/fixture-budget';
 import { describe,expect,it } from 'vitest';
 import { env,runInDurableObject } from 'cloudflare:test';
@@ -243,6 +244,55 @@ describe('Fleet recovery and paging use deployed indexes',()=>{
     const queries=hub.meter.statementTop(1500).filter((statement:any)=>statement.scope==='test:existing-status-baseline').map((statement:any)=>statement.sql);
     expect(queries.some((query:string)=>query.includes('COUNT(*) AS n FROM status_baselines') || query.includes('SELECT 1 FROM status_baselines LIMIT'))).toBe(false);
     expect(hub.rowBudget.status()).toMatchObject({day,limit_total:20000,stopped:false});
+  }));
+
+  it('lifecycle linkage drives bounded selected identities through existing indexes and keeps oldest aliases',()=>fixture(async(hub,raw)=>{
+    const setup=fixtureSql(hub),ids=new Set<string>();
+    const control=(id:string,native:string,explicit:string|null=null,mode='headless')=>setup.exec(`INSERT INTO session_control_sessions
+      (id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,fleet_launch_id,created_at,updated_at)
+      VALUES(?,'test',?,'{}','host','codex',?,'stopped',?,?,?,?)`,id,id,mode,JSON.stringify({native_id:native,workspace:'/repo'}),explicit,AT,AT);
+    for(let i=0;i<2100;i++) {
+      control('retained-control-'+i,'retained-native-'+i);
+      launch(setup,'retained-launch-'+i,'stopped');
+      setup.exec("UPDATE fleet_launches SET native_id=? WHERE id=?",'retained-native-'+i,'retained-launch-'+i);
+      setup.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,workspace)
+        VALUES('host',?,?,'codex','exited',?,'/repo')`,'retained-native-'+i,'retained-tag-'+i,AT);
+    }
+    launch(setup,'preferred-launch','stopped');
+    control('oldest-alias','selected-native-0','preferred-launch','interactive');
+    for(let i=0;i<384;i++) {
+      const id='selected-control-'+i;ids.add(id);
+      control(id,'selected-native-'+i,i===0?'preferred-launch':null);
+      launch(setup,'selected-launch-'+i,'stopped');
+      setup.exec('UPDATE fleet_launches SET native_id=? WHERE id=?','selected-native-'+i,'selected-launch-'+i);
+      setup.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,workspace)
+        VALUES('host',?,?,'codex','exited',?,'/repo')`,'selected-native-'+i,'selected-tag-'+i,AT);
+    }
+    await hub.rowBudget.begin(true);const day=hub.rowBudget.status().day;
+    const value=hub.meter.runSync('test:selected-lifecycle-linkage',()=>buildSessionInputs(hub.sql,ids,{taskLinks:false}));
+    expect(value.inputs).toHaveLength(384);
+    expect(value.refs.get('host/selected-native-0')).toMatchObject({session_id:'oldest-alias',fleet_launch_id:'preferred-launch',protected_session:true});
+    const work=hub.meter.snapshot()['test:selected-lifecycle-linkage'];
+    console.log(JSON.stringify({evidence:'route_service_native_cost',operation:'buildSessionInputs selected384',history_per_table:2100,
+      rows_read:work.rows_read,rows_written:work.rows_written,excludes:'outer authentication, KVledger and fixture seeding'}));
+    expect(work.rows_read).toBeLessThan(10000);expect(work.rows_written).toBe(0);
+    expect(()=>buildSessionInputs(hub.sql,undefined,{taskLinks:false})).toThrow(LifecycleObservationLimit);
+    expect(()=>buildSessionInputs(hub.sql,new Set(Array.from({length:513},(_,i)=>'too-many-'+i)),{taskLinks:false})).toThrow(LifecycleObservationLimit);
+    for(let i=0;i<1025;i++)control('duplicate-alias-'+i,'selected-native-0');
+    hub.meter.runSync('test:lifecycle-alias-overflow',()=>{
+      expect(()=>buildSessionInputs(hub.sql,new Set(['selected-control-0']),{taskLinks:false})).toThrow(LifecycleObservationLimit);
+    });
+    expect(hub.meter.snapshot()['test:lifecycle-alias-overflow'].rows_written).toBe(0);
+    expect(hub.rowBudget.status()).toMatchObject({day,limit_total:20000,stopped:false});
+    const nativeQuery=hub.meter.statementTop(1500).find((statement:any)=>statement.scope==='test:selected-lifecycle-linkage' && statement.sql.includes('WITH identities AS MATERIALIZED'));
+    expect(nativeQuery).toBeTruthy();
+    const plan=raw.exec(`EXPLAIN QUERY PLAN WITH identities AS MATERIALIZED (
+      SELECT json_extract(value,'$[0]') AS machine_id,json_extract(value,'$[1]') AS native_id FROM json_each(?))
+      SELECT c.rowid FROM identities k CROSS JOIN session_control_sessions c INDEXED BY session_control_native
+      ON c.machine_id=k.machine_id AND CASE WHEN json_valid(c.binding_json) THEN CASE WHEN json_type(c.binding_json,'$.native_id')='text'
+        THEN json_extract(c.binding_json,'$.native_id') END END=+k.native_id LIMIT 1025`,JSON.stringify([['host','selected-native-0']]))
+      .toArray().map((r:any)=>r.detail).join(' | ');
+    expect(plan).toContain('machine_id=? AND <expr>=?');expect(plan).not.toMatch(/TEMP B-TREE/);
   }));
 
   it('maps legacy three-part session cursors to the existing primary-key order',()=>fixture(async(_hub,raw)=>{
