@@ -61,3 +61,16 @@ describe('request-owned sparse bus identity projection',()=>{
     expect(subscribedBusAgents(raw,'role','writer')).toBe(null);
   }));
 });
+
+it('seeks a qualified registry identity and bounds bare-tag ambiguity across2000projects',()=>withHub((hub,state)=>{
+  const raw=state.storage.sql;
+  raw.exec(`WITH RECURSIVE n(i) AS(SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<2000)
+    INSERT INTO agents(tag,project,role) SELECT 'shared-tag',printf('p%04d',i),'reviewer' FROM n`);
+  const found=hub.meter.runSync('qualified-identity',()=>hub.busService.resolveAgent({kind:'qualified',project:'p1999',tag:'shared-tag'}));
+  expect(found).toMatchObject({project:'p1999',tag:'shared-tag'});
+  expect(hub.meter.snapshot()['qualified-identity'].rows_read).toBeLessThanOrEqual(2);
+  const plan=raw.exec("EXPLAIN QUERY PLAN SELECT tag,project,role,machine_id FROM agents WHERE COALESCE(project,'')=? AND tag=? LIMIT 2",'p1999','shared-tag').toArray().map((r:any)=>r.detail).join(' ');
+  expect(plan).toContain('idx_agents_project_tag_unique');expect(plan).not.toMatch(/SCAN agents/);
+  expect(hub.meter.runSync('bare-identity',()=>hub.busService.resolveAgent({kind:'tag',tag:'shared-tag'}))).toBeNull();
+  expect(hub.meter.snapshot()['bare-identity'].rows_read).toBeLessThanOrEqual(2);
+}));

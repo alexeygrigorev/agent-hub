@@ -1,3 +1,4 @@
+import { freshFixtureBudgetDay, fixtureSql } from './helpers/fixture-budget';
 import { describe, expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { OpsLiveness, THROUGHPUT_OBSERVATION_LIMIT, THROUGHPUT_QUERIES } from '../src/ops-liveness';
@@ -6,6 +7,7 @@ const NOW = Date.parse('2026-11-01T10:00:00Z'), DAY = 86400000;
 async function fixture(fn: (h: any, ops: OpsLiveness, alerts: any[]) => Promise<void> | void) {
   const stub = (env as any).HUB.get((env as any).HUB.idFromName('throughput-' + crypto.randomUUID()));
   await (runInDurableObject as any)(stub, async (h: any) => {
+    await freshFixtureBudgetDay(h);
     const alerts: any[] = [];
     const ops = new OpsLiveness(h.sql, { queuePolicy: () => ({ enabled: true, valid: true, max_inflight: 8,
       capacity: { source: 'live_host_account', active: 3, available_slots: 5 } }),
@@ -16,11 +18,11 @@ async function fixture(fn: (h: any, ops: OpsLiveness, alerts: any[]) => Promise<
   });
 }
 function task(h: any, id: string, at: number) {
-  h.sql.exec('INSERT INTO intake_task_projection(id,data,links) VALUES(?,?,?)', id,
+  fixtureSql(h).exec('INSERT INTO intake_task_projection(id,data,links) VALUES(?,?,?)', id,
     JSON.stringify({id, project:'demo', status:'open', created_at:at}), '[]');
 }
 function session(h: any, id: string, taskId: string, at: number, automatic = true, bound = true) {
-  h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,mode,state,created_at,updated_at,binding_json)
+  fixtureSql(h).exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,mode,state,created_at,updated_at,binding_json)
     VALUES(?,?,?,?,'headless',?,?,?,?)`, id, automatic ? 'hub:service:intake-watchdog' : 'operator', id,
     JSON.stringify({intake_task_id:taskId}), bound ? 'running' : 'offered', new Date(at).toISOString(), new Date(at).toISOString(),
     bound ? JSON.stringify({native_id:id,native_created_at_ms:at}) : null);
@@ -35,7 +37,7 @@ describe('intake throughput evidence', () => {
   it('counts lifecycle closes once, excludes unverified/archives, and exposes growing backlog with idle capacity', async () => fixture(async (h, ops, alerts) => {
     task(h, 'created-one', NOW - 100); task(h, 'created-two', NOW - DAY); task(h, 'future', NOW);
     for (const [id, kind, at] of [['one','close',NOW-100], ['one','archive',NOW-100], ['two','close_unverified',NOW-100], ['old','cancel',NOW-DAY-1]] as const)
-      h.sql.exec("INSERT INTO intake_audit(task_id,project,kind,actor,captured_at,reason) VALUES(?,'demo',?,'operator',?,'test')", id, kind, at);
+      fixtureSql(h).exec("INSERT INTO intake_audit(task_id,project,kind,actor,captured_at,reason) VALUES(?,'demo',?,'operator',?,'test')", id, kind, at);
     const result = ops.throughput();
     expect(result).toMatchObject({ created_24h: 2, closed_24h: 1, net_24h: 1,
       active_vs_capacity: { active_sessions: 3, effective_capacity: 8, idle_capacity: 5 },
@@ -52,14 +54,14 @@ describe('intake throughput evidence', () => {
   }));
   it('keeps close and cancellation evidence distinct within a half-open window',()=>fixture((h,ops)=>{
     for(const [id,kind,at] of [['edge','close',NOW-DAY],['edge','cancel',NOW-DAY],['old','cancel',NOW-DAY-1],['future','close',NOW]] as const)
-      h.sql.exec("INSERT INTO intake_audit(task_id,project,kind,actor,captured_at,reason) VALUES(?,'demo',?,'operator',?,'test')",id,kind,at);
+      fixtureSql(h).exec("INSERT INTO intake_audit(task_id,project,kind,actor,captured_at,reason) VALUES(?,'demo',?,'operator',?,'test')",id,kind,at);
     expect(ops.throughput()).toMatchObject({complete:true,closed_24h:1});
   }));
   it.each(['starts','created','closed'])('reports unknown on overflowing %s observations without fabricated growth alerts', kind => fixture(async (h,ops,alerts) => {
     for(let i=0;i<=THROUGHPUT_OBSERVATION_LIMIT;i++) {
       if(kind==='starts') session(h,'start-'+i,'same-intake',NOW-1000);
       if(kind==='created') task(h,'created-'+i,NOW-1000);
-      if(kind==='closed') h.sql.exec("INSERT INTO intake_audit(task_id,project,kind,actor,captured_at,reason) VALUES('same-intake','demo','close','operator',?,'test')",NOW-1000);
+      if(kind==='closed') fixtureSql(h).exec("INSERT INTO intake_audit(task_id,project,kind,actor,captured_at,reason) VALUES('same-intake','demo','close','operator',?,'test')",NOW-1000);
     }
     const result=ops.throughput();
     expect(result.complete).toBe(false);
@@ -78,10 +80,10 @@ describe('intake throughput evidence', () => {
     for(let i=0;i<THROUGHPUT_OBSERVATION_LIMIT;i++) {
       session(h,'retry-'+i,'same-intake',NOW-1000,i%2===0);
       task(h,'created-'+i,NOW-1000);
-      h.sql.exec("INSERT INTO intake_audit(task_id,project,kind,actor,captured_at,reason) VALUES('same-intake','demo',?,'operator',?,'test')",i%2?'close':'cancel',NOW-1000);
+      fixtureSql(h).exec("INSERT INTO intake_audit(task_id,project,kind,actor,captured_at,reason) VALUES('same-intake','demo',?,'operator',?,'test')",i%2?'close':'cancel',NOW-1000);
     }
     for(let i=0;i<THROUGHPUT_OBSERVATION_LIMIT+1;i++)
-      h.sql.exec("INSERT INTO intake_audit(task_id,project,kind,actor,captured_at,reason) VALUES('unrelated','demo','note','operator',?,'test')",NOW-1000);
+      fixtureSql(h).exec("INSERT INTO intake_audit(task_id,project,kind,actor,captured_at,reason) VALUES('unrelated','demo','note','operator',?,'test')",NOW-1000);
     expect(ops.throughput()).toMatchObject({complete:true,incomplete_metrics:[],started_24h:1,automatic_started_24h:1,
       created_24h:THROUGHPUT_OBSERVATION_LIMIT,closed_24h:1,net_24h:THROUGHPUT_OBSERVATION_LIMIT-1});
   }));

@@ -1,3 +1,4 @@
+import {intakeLinkHealth} from './intake-link-health';
 /** Destructive worktree cleanup requires a complete, readable intake ledger. */
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { intakeHasDoneEvidence } from './intake';
@@ -24,8 +25,9 @@ function parseNative(raw: unknown): string | null {
   try { const v = JSON.parse(String(raw || '{}')); return v && typeof v.native_id === 'string' && v.native_id ? v.native_id : null; } catch { return null; }
 }
 
-export function worktreeIntakeSnapshot(sql: SqlStorage, scope?: WorktreeSnapshotScope): WorktreeIntakeSnapshot {
+export function worktreeIntakeSnapshot(sql: SqlStorage, scope?: WorktreeSnapshotScope, advanceHealth=true): WorktreeIntakeSnapshot {
   try {
+    if(!intakeLinkHealth(sql,advanceHealth).ready)throw new Error('intake_link_health_unknown');
     const machines = sql.exec('SELECT id, hostname FROM machines ORDER BY id LIMIT 65').toArray();
     if(machines.length>64)throw new Error('worktree_observation_limit');
     const NATIVE = `CASE WHEN json_valid(s.binding_json) THEN CASE WHEN json_type(s.binding_json, '$.native_id') = 'text'

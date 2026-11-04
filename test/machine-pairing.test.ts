@@ -1,3 +1,4 @@
+import {fixtureSql,freshFixtureBudgetDay} from './helpers/fixture-budget';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { SELF, env, runInDurableObject } from 'cloudflare:test';
 import { createSessionCookie } from '../src/auth/session';
@@ -6,7 +7,7 @@ import { Hub } from '../src/conversation-hub';
 const csrf='local-pairing-csrf';
 const scopes=['bus:read','bus:send','health:report'];
 const stub=()=> (env as any).HUB.get((env as any).HUB.idFromName('hub'));
-async function sql(q:string,...args:any[]) { let rows:any[]=[];await runInDurableObject(stub(),(h:Hub)=>{rows=h.sql.exec(q,...args).toArray();});return rows; }
+async function sql(q:string,...args:any[]) { let rows:any[]=[];await runInDurableObject(stub(),(h:Hub)=>{rows=fixtureSql(h).exec(q,...args).toArray();});return rows; }
 async function human(isAdmin=true) {return (await createSessionCookie(env as any,{sub:'pairing-human',email:'admin@fake.local',isAdmin,csrfToken:csrf,exp:Math.floor(Date.now()/1000)+3600})).split(';')[0];}
 async function req(path:string,method='GET',body?:any,auth?:string,csrfHeader:string|null=csrf) {
  const headers:Record<string,string>={};if(auth?.startsWith('hubt_'))headers.Authorization='Bearer '+auth;else if(auth)headers.Cookie=auth;
@@ -25,7 +26,7 @@ const credential=async(t:any)=>(await sql('SELECT * FROM credentials WHERE token
 const self=(t:any)=>req('/api/conversations/participants','GET',undefined,t.access_token);
 
 describe('public machine-bound agent enrollment through real SELF Worker and bound Hub',()=>{
- beforeEach(async()=>{ for(const table of ['device_pairings','credentials','agents','machines','jobs'])await sql('DELETE FROM '+table); });
+ beforeEach(async()=>{await (runInDurableObject as any)(stub(),async(h:any)=>freshFixtureBudgetDay(h)); for(const table of ['device_pairings','credentials','agents','machines','jobs'])await sql('DELETE FROM '+table); });
  it('issues ordinary-agent identity, exact machine/scopes and immutable F7 actor; preserves host pointer on poll/refresh',async()=>{
   await machine();const p=await challenge();expect((await poll(p)).status).toBe(400);
   const c=await human();expect((await approve(p,{machine_id:'pair-node',expected_actor:'pair:worker'},c)).status).toBe(200);
@@ -233,7 +234,8 @@ describe('public machine-bound agent enrollment through real SELF Worker and bou
   const operation=phase==='approval'?"UPDATE OF status":"INSERT";
   await sql(`CREATE TRIGGER pairing_injected_failure BEFORE ${operation} ON ${table} BEGIN SELECT RAISE(ABORT,'pairing_injected_failure'); END`);
   const result=phase==='approval'?await approve(p,{machine_id:'pair-node'},c):phase==='issuance'?await poll(p):await refresh(t);
-  expect(result.status).toBe(500);await sql('DROP TRIGGER pairing_injected_failure');
+  expect(result.status).toBe(503);expect(await result.json()).toMatchObject({error:'do_daily_row_budget_exceeded'});await sql('DROP TRIGGER pairing_injected_failure');
+  await (runInDurableObject as any)(stub(),async(h:any)=>freshFixtureBudgetDay(h));
   if(phase==='approval') {expect((await sql("SELECT * FROM agents WHERE project='pair'")).length).toBe(0);expect((await approve(p,{machine_id:'pair-node'},c)).status).toBe(200);}
   if(phase==='refresh') {expect((await credential(t)).revoked_at).toBeNull();expect((await refresh(t)).status).toBe(200);}
   else {expect((await poll(p)).status).toBe(200);expect((await poll(p)).status).toBe(400);}

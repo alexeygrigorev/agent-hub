@@ -427,7 +427,7 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
       );
     });
 
-    // Attempt action with old epoch 1 -> 409 fenced
+    // A superseded job bearer is rejected by the global authority fence before dispatch.
     const resAction = await doFetch(new Request('http://example.com/api/root/actions', {
       method: 'POST',
       headers: { 'Authorization': 'Bearer token_alpha_root', 'Content-Type': 'application/json' },
@@ -441,11 +441,8 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
         }
       })
     }));
-    expect(resAction.status).toBe(409);
-    const actionData = await resAction.json() as any;
-    expect(actionData.status).toBe('fenced');
-    expect(actionData.reason).toBe('superseded');
-    expect(actionData.current_epoch).toBe(2);
+    expect(resAction.status).toBe(401);
+    expect(await resAction.json()).toMatchObject({error:'unauthorized'});
 
     // Verify ZERO rows in root_actions table for this stale attempt
     await (runInDurableObject as any)(stub, async (instance: any) => {
@@ -655,22 +652,24 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
 
     // Part A: Startup over a real M3 BUS_SCHEMA_SQL agents table (project NOT NULL, no tag PK)
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      instance.sql.exec('DROP TABLE IF EXISTS agents');
+      fixtureSql(instance).exec('DROP TABLE IF EXISTS agents');
       for (const stmt of BUS_SCHEMA_SQL.split(';').map((s: string) => s.trim()).filter(Boolean)) {
-        instance.sql.exec(stmt);
+        fixtureSql(instance).exec(stmt);
       }
       // Seed pre-existing M3 agent with project
       const now = new Date().toISOString();
-      instance.sql.exec(
+      fixtureSql(instance).exec(
         `INSERT INTO agents (tag, project, role, machine_id, registered_at) VALUES (?, ?, ?, ?, ?)`,
         'm3-old-agent', 'm3-proj', 'worker', 'host-alpha', now
       );
 
       // Re-run Hub migration sequence on real M3 table
+      await advanceFixtureBudgetDay(instance);
+      await instance.rowBudget.releaseUnused();await instance.rowBudget.begin(true);
       instance.initDb();
 
       // Verify M3 agent is preserved
-      const oldAgent = instance.sql.exec("SELECT * FROM agents WHERE tag = 'm3-old-agent'").toArray()[0] as any;
+      const oldAgent = fixtureSql(instance).exec("SELECT * FROM agents WHERE tag = 'm3-old-agent'").toArray()[0] as any;
       expect(oldAgent.tag).toBe('m3-old-agent');
       expect(oldAgent.project).toBe('m3-proj');
 
@@ -679,28 +678,28 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
       // pre-migration rows remain. The legacy constraint is preserved and
       // projectless inserts on such a database fail closed.
       expect(() =>
-        instance.sql.exec(
+        fixtureSql(instance).exec(
           `INSERT INTO agents (tag, role, machine_id, registered_at, state, updated_at) VALUES ('m3-agent-no-proj', 'worker', 'host-1', ?, 'idle', ?)`,
           now, now
         )
       ).toThrow();
 
       // Verify project-qualified uniqueness (no global tag PRIMARY KEY)
-      const agentCols = instance.sql.exec("PRAGMA table_info(agents)").toArray();
+      const agentCols = fixtureSql(instance).exec("PRAGMA table_info(agents)").toArray();
       const tagCol = agentCols.find((c: any) => c.name === 'tag');
       expect(tagCol.pk).toBe(0);
       // The unique identity index keeps per-project uniqueness with same-tag peers.
-      instance.sql.exec("INSERT INTO agents(tag, project) VALUES ('schema-peer', 'first')");
-      instance.sql.exec("INSERT INTO agents(tag, project) VALUES ('schema-peer', 'second')");
-      expect(() => instance.sql.exec("INSERT INTO agents(tag, project) VALUES ('schema-peer', 'first')")).toThrow();
+      fixtureSql(instance).exec("INSERT INTO agents(tag, project) VALUES ('schema-peer', 'first')");
+      fixtureSql(instance).exec("INSERT INTO agents(tag, project) VALUES ('schema-peer', 'second')");
+      expect(() => fixtureSql(instance).exec("INSERT INTO agents(tag, project) VALUES ('schema-peer', 'first')")).toThrow();
     });
 
     // Part B: Upgrade from SPEC §6 tables (jobs, leases, audit before M4 columns)
     await (runInDurableObject as any)(stub, async (instance: any) => {
-      instance.sql.exec('DROP TABLE IF EXISTS jobs');
-      instance.sql.exec('DROP TABLE IF EXISTS leases');
-      instance.sql.exec('DROP TABLE IF EXISTS audit');
-      instance.sql.exec(`
+      fixtureSql(instance).exec('DROP TABLE IF EXISTS jobs');
+      fixtureSql(instance).exec('DROP TABLE IF EXISTS leases');
+      fixtureSql(instance).exec('DROP TABLE IF EXISTS audit');
+      fixtureSql(instance).exec(`
         CREATE TABLE jobs (
           id TEXT PRIMARY KEY,
           kind TEXT NOT NULL,
@@ -721,7 +720,7 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
           finished_at TEXT
         )
       `);
-      instance.sql.exec(`
+      fixtureSql(instance).exec(`
         CREATE TABLE leases (
           name TEXT PRIMARY KEY,
           holder_job_id TEXT,
@@ -731,7 +730,7 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
           expires_at TEXT
         )
       `);
-      instance.sql.exec(`
+      fixtureSql(instance).exec(`
         CREATE TABLE audit (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           ts TEXT NOT NULL,
@@ -743,29 +742,31 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
 
       // Seed pre-existing records
       const now = new Date().toISOString();
-      instance.sql.exec(
+      fixtureSql(instance).exec(
         `INSERT INTO jobs (id, kind, status, created_at) VALUES ('spec6-job-1', 'generic', 'completed', ?)`,
         now
       );
-      instance.sql.exec(
+      fixtureSql(instance).exec(
         `INSERT INTO leases (name, epoch) VALUES ('root', 0)`
       );
-      instance.sql.exec(
+      fixtureSql(instance).exec(
         `INSERT INTO audit (ts, actor, action) VALUES (?, 'system', 'test_init')`,
         now
       );
 
       // Re-run Hub migration sequence on SPEC §6 tables
+      await advanceFixtureBudgetDay(instance);
+      await instance.rowBudget.releaseUnused();await instance.rowBudget.begin(true);
       instance.initDb();
 
       // Verify all M4 extra columns exist on jobs, leases, audit
-      const jobCols = instance.sql.exec("PRAGMA table_info(jobs)").toArray().map((c: any) => c.name);
+      const jobCols = fixtureSql(instance).exec("PRAGMA table_info(jobs)").toArray().map((c: any) => c.name);
       expect(jobCols).toContain('offer_attempts');
       expect(jobCols).toContain('outcome_summary');
       expect(jobCols).toContain('outcome_evidence');
       expect(jobCols).toContain('deadline_at');
 
-      const leaseCols = instance.sql.exec("PRAGMA table_info(leases)").toArray().map((c: any) => c.name);
+      const leaseCols = fixtureSql(instance).exec("PRAGMA table_info(leases)").toArray().map((c: any) => c.name);
       expect(leaseCols).toContain('holder_host_id');
       expect(leaseCols).toContain('holder_machine_id');
       expect(leaseCols).toContain('holder_actor');
@@ -773,15 +774,15 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
       expect(leaseCols).toContain('released_at');
       expect(leaseCols).toContain('release_reason');
 
-      const auditCols = instance.sql.exec("PRAGMA table_info(audit)").toArray().map((c: any) => c.name);
+      const auditCols = fixtureSql(instance).exec("PRAGMA table_info(audit)").toArray().map((c: any) => c.name);
       expect(auditCols).toContain('resource');
       expect(auditCols).toContain('target');
       expect(auditCols).toContain('at');
 
       // Verify pre-existing data preserved
-      const oldJob = instance.sql.exec("SELECT * FROM jobs WHERE id = 'spec6-job-1'").toArray()[0] as any;
+      const oldJob = fixtureSql(instance).exec("SELECT * FROM jobs WHERE id = 'spec6-job-1'").toArray()[0] as any;
       expect(oldJob.id).toBe('spec6-job-1');
-      const oldAudit = instance.sql.exec("SELECT * FROM audit WHERE action = 'test_init'").toArray()[0] as any;
+      const oldAudit = fixtureSql(instance).exec("SELECT * FROM audit WHERE action = 'test_init'").toArray()[0] as any;
       expect(oldAudit.actor).toBe('system');
     });
 

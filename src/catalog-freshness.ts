@@ -44,3 +44,14 @@ export function freshCompleteCatalogs(sql: SqlStorage, now: number): Map<string,
       .map(row => [String(row.machine_id), Date.parse(row.observed_at)])),now,true);
   } catch { return new Map(); }
 }
+
+/** Known-host freshness without a retained catalog census. */
+export function freshCatalogsForMachines(sql:SqlStorage,now:number,machines:string[]):Map<string,number> {
+ const rows=new Map<string,number>();
+ for(const machine of machines) {
+  const row:any=sql.exec('SELECT observed_at FROM fleet_catalog_seen WHERE machine_id=?',machine).toArray()[0];
+  const at=Date.parse(row?.observed_at);if(at>=now-180000&&at<=now+60000)rows.set(machine,at);
+ }
+ const allowed=new Set(machines);
+ return new Map([...overlay(sql,rows,now,false)].filter(([machine])=>allowed.has(machine)));
+}

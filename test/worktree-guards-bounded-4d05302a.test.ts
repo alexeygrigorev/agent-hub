@@ -1,3 +1,5 @@
+import {registerFixtureStatements,fixtureStatements} from './helpers/fixture-statements';
+import {fixtureSql} from './helpers/fixture-budget';
 import { describe, expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { seedFixtureIntake } from './tbm-fixture';
@@ -32,15 +34,17 @@ async function fixture(fn: (s: SessionControlService, sql: any, measure: (fn: ()
   const bindings = env as unknown as Env;
   const stub = bindings.HUB.get(bindings.HUB.idFromName('wg-bounded-' + crypto.randomUUID()));
   await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
+    registerFixtureStatements(hub,state);
     const m = metered(hub.sql);
     const service = new SessionControlService(m.proxy, (cb) => state.storage.transactionSync(cb), () => Date.now(), { reserve: () => ({ value: null, status: 200 }) }, {});
     service.init();
     seedFixtureIntake(hub.sql);
     const at = new Date().toISOString();
     const far = new Date(Date.now() + 30 * 86400000).toISOString();
-    hub.sql.exec(`INSERT OR IGNORE INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at)
+    fixtureSql(hub).exec(`INSERT OR IGNORE INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at)
       VALUES ('host-cred-1', 'host', 'hash-host-cred-1', 'refresh-host-cred-1', 'host-family-1', 'test-host', 'hetzner', NULL, '["host"]', 'test', ?, ?)`, at, far);
-    hub.sql.exec(`INSERT OR IGNORE INTO machines (id, name, hostname, credential_id, registered_at) VALUES ('hetzner', 'hetzner', 'hetzner', 'host-cred-1', ?)`, at);
+    fixtureSql(hub).exec(`INSERT OR IGNORE INTO machines (id, name, hostname, credential_id, registered_at) VALUES ('hetzner', 'hetzner', 'hetzner', 'host-cred-1', ?)`, at);
+    await (hub as any).rowBudget.begin(true);
     await fn(service, hub.sql, m.measure);
   });
 }
@@ -50,11 +54,11 @@ const NATIVE = (i: number) => `00000000-0000-4000-8000-${String(i).padStart(12, 
 describe('worktree-guards bounded read (4d05302a)', () => {
   it('reads a bounded row set at production scale and still refuses foreign/live owners', async () => {
     await fixture(async (s, sql, measure) => {
-      sql.exec(`WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 50000)
+      fixtureStatements(sql).exec(`WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 50000)
         INSERT INTO fleet_launches (id, actor, requester_kind, summary, request_key, request_json, machine_id, engine, account, mode, workspace, prompt, state, created_at, updated_at)
         SELECT 'hist-' || i, 'demo:assistant', 'agent', 's', 'k-' || i, '{"workspace":"demo"}', 'hetzner', 'claude', 'default', 'headless', 'demo', 'p',
           'exited', '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z' FROM c`);
-      sql.exec(`WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 5000)
+      fixtureStatements(sql).exec(`WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 5000)
         INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, engine, mode, state, created_at, updated_at)
         SELECT printf('11111111-0000-4000-8000-%012d', i), 'demo:assistant', 'rk-' || i, '{"workspace":"demo"}', 'hist-' || i, 'hetzner', 'claude', 'headless', 'stopped',
           '2026-10-01T00:' || printf('%02d', (i / 60) % 60) || ':' || printf('%02d', i % 60) || '.000Z', '2026-10-01T00:00:00.000Z' FROM c`);
@@ -63,9 +67,9 @@ describe('worktree-guards bounded read (4d05302a)', () => {
       const foreign = crypto.randomUUID();
       const now = new Date().toISOString();
       const binding = JSON.stringify({ native_id: NATIVE(1), tag: 'hub-x', workspace: '/w', native_created_at_ms: 1, generation: 1 });
-      sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at)
+      fixtureStatements(sql).exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at)
         VALUES(?,'demo:assistant',?,?,'hetzner','claude','headless','running',?,?,?)`, live, live, JSON.stringify({ intake_task_id: 'task-live' }), binding, now, now);
-      sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,created_at,updated_at)
+      fixtureStatements(sql).exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,created_at,updated_at)
         VALUES(?,'demo:assistant',?,?,'other-host','claude','headless','running',?,?)`, foreign, foreign, JSON.stringify({ intake_task_id: 'task-live' }), now, now);
 
       const call = async (qs: string) => {
@@ -98,14 +102,14 @@ describe('worktree-guards bounded read (4d05302a)', () => {
       expect(legacy.read).toBeLessThanOrEqual(6500);
 
       // History growth must not change the cost: add 2k more old sessions and re-measure.
-      sql.exec(`WITH RECURSIVE c(i) AS (SELECT 5001 UNION ALL SELECT i + 1 FROM c WHERE i < 7000)
+      fixtureStatements(sql).exec(`WITH RECURSIVE c(i) AS (SELECT 5001 UNION ALL SELECT i + 1 FROM c WHERE i < 7000)
         INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, engine, mode, state, created_at, updated_at)
         SELECT printf('11111111-0000-4000-8000-%012d', i), 'demo:assistant', 'rk-' || i, '{"workspace":"demo"}', 'hist-' || i, 'hetzner', 'claude', 'headless', 'stopped',
           '2026-09-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z' FROM c`);
       const grown = await call(`?session_id=${live}`);
       expect(Math.abs(grown.read - targeted.read)).toBeLessThanOrEqual(20);
       // Every statement the endpoint can issue is indexed.
-      const plan = (q: string, ...a: any[]) => (sql.exec('EXPLAIN QUERY PLAN ' + q, ...a).toArray() as any[]).map(r => r.detail).join('\n');
+      const plan = (q: string, ...a: any[]) => (fixtureStatements(sql).exec('EXPLAIN QUERY PLAN ' + q, ...a).toArray() as any[]).map(r => r.detail).join('\n');
       // Keyset page with a row-value seek: a range seek on (created_at,id), no sort, covering (no table fetch).
       const seek = plan(`SELECT id, created_at FROM session_control_sessions INDEXED BY session_control_machine_created_state WHERE machine_id = ? AND state IN (SELECT value FROM json_each(?)) AND (created_at, id) > (?, ?) ORDER BY created_at, id LIMIT 101`, 'hetzner', '[]', 'x', 'y');
       console.log('worktree-guards page plan', seek.replace(/\n/g, ' | '));
@@ -122,7 +126,7 @@ describe('worktree-guards bounded read (4d05302a)', () => {
   });
 
   const insertSession = (sql: any, id: string, intake: string | null, state: string, at: string, machine = 'hetzner') =>
-    sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,created_at,updated_at)
+    fixtureStatements(sql).exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,created_at,updated_at)
       VALUES(?,'demo:assistant',?,?,?,'claude','headless',?,?,?)`, id, id, JSON.stringify(intake ? { intake_task_id: intake } : {}), machine, state, at, at);
   const sid = (i: number) => `22222222-0000-4000-8000-${String(i).padStart(12, '0')}`;
 

@@ -78,20 +78,43 @@ describe('ask status, digest and history observations are bounded',()=>{
   const {ledger,calls}=service(h,state);await h.rowBudget.begin();
   expect(()=>(ledger as any).resolveFilledGaps('fixture',2000,Date.now())).toThrow('ask_gap_coverage_observation_limited');
   expect(raw.exec("SELECT resolved_at FROM ask_gaps WHERE scope='*'").one().resolved_at).toBeNull();
-  expect(reads(calls)).toBeLessThanOrEqual(150);expect(calls.some(c=>/COUNT\s*\(/i.test(c.query))).toBe(false);
+  // A non-covering index can bill both the129indexentries and129table rows.
+  expect(reads(calls)).toBeLessThanOrEqual(300);expect(calls.some(c=>/COUNT\s*\(/i.test(c.query))).toBe(false);
  }));
  it('refuses reconciler launch on an incomplete pending cohort before any start effect',()=>fixture(async(h,raw,state)=>{
   raw.exec("UPDATE asks SET state='pending'");raw.exec("UPDATE ask_meta SET reconcile_intake='fixture' WHERE id=1");
   const o=service(h,state);let starts=0;
   const ledger=new AskLedger((o.ledger as any).sql,h.intakeService,fn=>state.storage.transactionSync(fn),{start:async()=>{starts++;return{status:202,body:{}};}} as any);
   await h.rowBudget.begin();await expect(ledger.reconcileDue()).rejects.toMatchObject({code:'ask_reconcile_waiting_observation_limited'});
-  expect(starts).toBe(0);expect(reads(o.calls)).toBeLessThanOrEqual(160);
+  expect(starts).toBe(0);expect(reads(o.calls)).toBeLessThanOrEqual(300);
  }));
  it('does not declare a filtered latest-user head absent after scanning only a backfill prefix',()=>fixture(async(h,raw,state)=>{
   raw.exec("UPDATE ask_messages SET source='backfill'");raw.exec("UPDATE ask_meta SET reconcile_intake='fixture' WHERE id=1");
   const o=service(h,state);const ledger=new AskLedger((o.ledger as any).sql,h.intakeService,fn=>state.storage.transactionSync(fn),{start:async()=>({status:202,body:{}})} as any);
   await h.rowBudget.begin();await expect(ledger.reconcileDue()).rejects.toMatchObject({code:'ask_reconcile_cursor_observation_limited'});
   expect(reads(o.calls)).toBeLessThanOrEqual(160);
+ }));
+ it('manual checking skips2000settled messages/asks without refusing the empty active cohorts',()=>fixture(async(h,raw,state)=>{
+  raw.exec('DELETE FROM ask_gaps');raw.exec('UPDATE ask_messages SET conflict_count=0');
+  const {ledger,calls}=service(h,state);await h.rowBudget.begin();
+  const result=await ledger.tick();expect(result.state).toBe('checked');expect(result.observation_pending).toBe(false);
+  expect(result.counts.verified).toBe(2000);expect(reads(calls)).toBeLessThanOrEqual(100);
+  expect(h.rowBudget.status().stopped).toBe(false);
+ }));
+ it('manual reconciliation commits raw cursor progress across an assistant-only page before finding a later user',()=>fixture(async(h,raw,state)=>{
+  raw.exec("UPDATE ask_messages SET role='assistant',conflict_count=0");raw.exec("UPDATE ask_messages SET role='user' WHERE id='msg-130'");
+  raw.exec("UPDATE ask_counts SET n=1 WHERE k='user_messages'");
+  const {ledger,calls}=service(h,state);await h.rowBudget.begin();
+  const first=await ledger.runReconcilePass();expect(first.state).toBe('observation_pending');expect(first.to_cursor).toBe(128);
+  expect(raw.exec('SELECT reconcile_cursor FROM ask_meta WHERE id=1').one().reconcile_cursor).toBe(128);expect(reads(calls)).toBeLessThanOrEqual(500);
+  calls.length=0;await h.rowBudget.begin();const next=await ledger.runReconcilePass();
+  expect(next.state).toBe('reconciled');expect(next.scanned_messages).toBe(1);expect(next.to_cursor).toBe(256);
+  expect(reads(calls)).toBeLessThanOrEqual(1000);expect(h.rowBudget.status().stopped).toBe(false);
+ }));
+ it('does not approve intake closure from an incomplete2000ask intake prefix',()=>fixture(async(h,raw,state)=>{
+  raw.exec("UPDATE asks SET intake_id='target'");const {ledger,calls}=service(h,state);await h.rowBudget.begin();
+  expect(ledger.closeGate({id:'target',status:'done',history:[]},false)).toMatchObject({code:'ask_close_observation_limited'});
+  expect(reads(calls)).toBeLessThanOrEqual(300);
  }));
  it('publishes JSONL progress headers even when a sparse text filter yields an empty first source page',()=>fixture(async(h,raw,state)=>{
   raw.exec("UPDATE ask_messages SET text='needle' WHERE id='msg-130'");

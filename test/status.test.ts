@@ -795,15 +795,15 @@ describe('M14d caller-scoped durable baseline with complete POST summary', () =>
     await inDO(stub(),(h:any)=>h.ctx.storage.transactionSync(()=>{
       for(let i=0;i<5000;i++) {
         const key='evict-'+i;
-        h.sql.exec("INSERT INTO status_baselines VALUES(?,'{}',0,'2000-01-01T00:00:00.000Z')",key);
-        h.sql.exec("INSERT INTO status_baseline_payloads VALUES(?,'{\"tasks\":{}}')",key);
+        fixtureSql(h).exec("INSERT INTO status_baselines VALUES(?,'{}',0,'2000-01-01T00:00:00.000Z')",key);
+        fixtureSql(h).exec("INSERT INTO status_baseline_payloads VALUES(?,'{\"tasks\":{}}')",key);
       }
     }));
     await postOk('',{});
     const counts=await inDO(stub(),(h:any)=>({
-      metadata:h.sql.exec('SELECT COUNT(*) AS n FROM status_baselines').toArray()[0].n,
-      payloads:h.sql.exec('SELECT COUNT(*) AS n FROM status_baseline_payloads').toArray()[0].n,
-      orphans:h.sql.exec('SELECT COUNT(*) AS n FROM status_baseline_payloads p LEFT JOIN status_baselines b USING(caller_key) WHERE b.caller_key IS NULL').toArray()[0].n,
+      metadata:fixtureSql(h).exec('SELECT COUNT(*) AS n FROM status_baselines').toArray()[0].n,
+      payloads:fixtureSql(h).exec('SELECT COUNT(*) AS n FROM status_baseline_payloads').toArray()[0].n,
+      orphans:fixtureSql(h).exec('SELECT COUNT(*) AS n FROM status_baseline_payloads p LEFT JOIN status_baselines b USING(caller_key) WHERE b.caller_key IS NULL').toArray()[0].n,
     }));
     expect(counts).toEqual({metadata:4501,payloads:4501,orphans:0});
   });

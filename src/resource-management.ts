@@ -1,3 +1,4 @@
+import {initIntakeLinkHealth,intakeLinkHealth} from './intake-link-health';
 import { effectiveHeartbeat, effectiveHeartbeatAt } from './registry';
 import { worktreeIntakeProtected, worktreeIntakeSnapshot, type WorktreeSnapshotScope } from './worktree-intakes';
 import { openWorkPreventsIdleReap, type IdleReapCache } from './intake-session';
@@ -158,6 +159,8 @@ export class ResourceManagement {
     // Its cached closure/DONE verdicts must never survive an authority write.
     const tables=['session_control_sessions','fleet_launches','fleet_sessions','session_control_protections','resource_reaps','intake_tasks','intake_task_projection','resource_request_projection','machines'];
     if (tables.some(table=>!this.sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",table).toArray().length)) return;
+    initIntakeLinkHealth(this.sql,true);
+    tables.push('intake_link_health','intake_link_health_meta');
     this.sql.exec('CREATE TABLE IF NOT EXISTS resource_catalog_revision(id INTEGER PRIMARY KEY CHECK(id=1),revision TEXT NOT NULL,structure_revision TEXT NOT NULL)');
     this.sql.exec("INSERT OR IGNORE INTO resource_catalog_revision VALUES(1,lower(hex(randomblob(16))),lower(hex(randomblob(16))))");
     // Activity is sampled afresh on every read; observed_at is not canonical
@@ -182,10 +185,10 @@ export class ResourceManagement {
    * catalog and must not invalidate anything. */
   private canonicalStampTables(machine?: string): string[] {
     void machine;
-    return ['session_control_sessions','fleet_launches','machines','session_control_protections','resource_reaps','intake_tasks','intake_task_projection','resource_request_projection','fleet_sessions_meta'];
+    return ['intake_link_health','intake_link_health_meta','session_control_sessions','fleet_launches','machines','session_control_protections','resource_reaps','intake_tasks','intake_task_projection','resource_request_projection','fleet_sessions_meta'];
   }
   private intakeStampTables(): string[] {
-    return ['machines','session_control_sessions','fleet_launches','intake_tasks','intake_task_projection','resource_request_projection'];
+    return ['intake_link_health','intake_link_health_meta','machines','session_control_sessions','fleet_launches','intake_tasks','intake_task_projection','resource_request_projection'];
   }
   /** Census PUT: patch the write-through catalog with the rows just written.
    * metadataChanged marks rows whose identity fields (tag/engine/phase/...)
@@ -211,7 +214,7 @@ export class ResourceManagement {
     const sessionIds = [...controlData.keys()];
     const nativeIds = [...new Set([...controlData.values()].map(d => d.binding.native_id).concat([...launchData.values()].map(d=>d.native_id)).filter(v => typeof v === 'string' && v))];
     const scope: WorktreeSnapshotScope = { sessionIds, nativeIds };
-    return worktreeIntakeSnapshot(this.sql, scope);
+    return worktreeIntakeSnapshot(this.sql, scope, false);
   }
   private sharedHistoryRevision: string | null = null;
   private sharedHistoryStamp: string | null = null;
@@ -497,14 +500,13 @@ export class ResourceManagement {
   private chokingState(machine: string, now: number, config: ResourceConfig, verdictReason: string | null) {
     const cooldown=new Date(now-config.choking_cooldown_seconds*1000).toISOString();
     const event:any=this.readRows(`SELECT reason,observed_at FROM resource_choking_events WHERE machine_id=? AND observed_at>=? AND reason!='host_runtime_choking' ORDER BY observed_at DESC LIMIT 1`,machine,cooldown)[0];
-    // Bound the deployed time-index prefix before host/state/reason filters.
-    // Absence behind retained unrelated transitions is unknown, not clearance.
-    const runtimeRows=this.readRows(`SELECT machine_id,state,exit_reason,updated_at
-      FROM fleet_launches INDEXED BY fleet_launch_updated WHERE updated_at>=?
-      ORDER BY updated_at DESC LIMIT 129`,cooldown);
-    const runtime:any=runtimeRows.find(row=>row.machine_id===machine && ['failed','exited'].includes(row.state)
-      && ['engine_runtime_timeout','engine_signal_exit'].includes(row.exit_reason));
-    const runtimeLimited=!runtime && runtimeRows.length>128;
+    // This deployed partial index contains exactly terminal runtime failures.
+    // Seek the host/time range directly; unrelated retained transitions never
+    // enter the source, so absence is complete without a broad history gate.
+    const runtime:any=this.readRows(`SELECT exit_reason,updated_at FROM fleet_launches INDEXED BY fleet_launch_runtime_exit
+      WHERE machine_id=? AND updated_at>=? AND state IN ('failed','exited')
+      AND exit_reason IN ('engine_runtime_timeout','engine_signal_exit')
+      ORDER BY updated_at DESC LIMIT 1`,machine,cooldown)[0];
     let serviceChoking=false; let serviceAt:string|null=null;
     if(this.readRows("SELECT name FROM sqlite_master WHERE type='table' AND name='host_health_observations'").length) {
       const health:any=this.readRows('SELECT payload_json,observed_at FROM host_health_observations WHERE machine_id=? AND observed_at>=?',machine,cooldown)[0];
@@ -515,9 +517,9 @@ export class ResourceManagement {
       serviceChoking=(parse(health?.payload_json).services || []).some((s:any)=>
         s.worker==='broken' && ['service_crash','service_timeout'].includes(s.reason));
     }
-    const reason=event?.reason || (runtime || serviceChoking ? 'host_runtime_choking' : verdictReason || (runtimeLimited?'runtime_observation_limited':null));
+    const reason=event?.reason || (runtime || serviceChoking ? 'host_runtime_choking' : verdictReason);
     const chokingAt=event?.observed_at || runtime?.updated_at || (serviceChoking ? serviceAt : null);
-    return {reason,choking_observed_at:chokingAt,runtime_observation_limited:runtimeLimited,
+    return {reason,choking_observed_at:chokingAt,runtime_observation_limited:false,
       resource_choking:['host_oom','host_runtime_choking'].includes(reason)&&chokingAt ? {reason,observed_at:chokingAt} : null};
   }
   headroom(machine: string, input: any = {}, engine: string | null = null) {
@@ -729,7 +731,8 @@ export class ResourceManagement {
     });
     return [...bound,...fleetOnly];
   }
-  private canonicalSessions(machine?: string, requested?:string[]) {
+  private canonicalSessions(machine?: string, requested?:string[],advanceHealth=true) {
+    intakeLinkHealth(this.sql,advanceHealth);
     // No time-based authority cache: metadata/authority writes change the
     // durable random generation, including rollback and retry. With the
     // write-through watch, the stamp check reads zero rows and is exactly as
@@ -869,6 +872,7 @@ export class ResourceManagement {
     } catch { return false; } // corrupt/missing authority is never reap permission
   }
   sessions(machine?: string) {
+    intakeLinkHealth(this.sql);
     // The watchdog response is served per host poll (and per session-progress
     // poll on the host); the canonical stamp plus the watchdog-only authority
     // sources gate the whole computation. Exactly-as-fresh: any write to a
@@ -882,7 +886,7 @@ export class ResourceManagement {
     return this.sessionsUncached(machine);
   }
   private sessionsUncached(machine?: string) {
-    const canonical = this.canonicalSessions(machine).slice(0,1000);
+    const canonical = this.canonicalSessions(machine,undefined,false).slice(0,1000);
     let authority:ReturnType<ResourceManagement['idleAuthority']>;
     try { authority = this.idleAuthority(canonical); } catch { authority = () => { throw new Error('idle_authority_unavailable'); }; }
     const cache: IdleReapCache = { intakes: new Map() };

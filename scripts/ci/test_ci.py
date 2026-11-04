@@ -108,6 +108,8 @@ class TestCICD(unittest.TestCase):
         full_step = workflow.split('- name: Worker discovery tests (Vitest)', 1)[1].split('\n      - ', 1)[0]
         full_invocations = [ln for ln in full_step.splitlines() if 'vitest run' in ln]
         self.assertEqual(len(full_invocations), 1, 'full discovery step remains mandatory')
+        self.assertIn('if: ${{ !cancelled() }}', full_step,
+                      'early safety failures must not hide full discovery evidence')
         self.assertIsNone(re.search(r'\btest/[\w./-]+\.test\.ts', full_invocations[0]), full_invocations[0])
         self.assertNotIn('--exclude', full_invocations[0])
         self.assertNotIn('--testNamePattern', full_invocations[0])

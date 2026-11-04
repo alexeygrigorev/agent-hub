@@ -49,7 +49,7 @@ async function insertBearerCredential(
     tokenHash,
     'fam-' + opts.id,
     opts.subject,
-    opts.machineId ?? null,
+    opts.machineId ?? (opts.kind==='job'?'fixture-job-host':null),
     opts.actor ?? null,
     JSON.stringify(opts.scopes),
     'sub-owner',
@@ -57,6 +57,14 @@ async function insertBearerCredential(
     expiresAt,
     opts.revokedAt ?? null
   );
+  if(opts.kind==='job') {
+    const machine=opts.machineId??'fixture-job-host';
+    sql.exec(`INSERT INTO jobs(id,kind,idempotency_key,payload,status,created_at,deadline_at,actor,holder_host_id,holder_machine_id,lease_epoch,claim_token_hash)
+      VALUES(?,'fixture',?,'{}','running',?,?,'role:fixture',?,?,1,?)`,opts.subject,'job:'+opts.id,nowIso,expiresAt,machine,machine,tokenHash);
+    sql.exec(`INSERT INTO leases(name,epoch,holder_job_id,holder_host_id,holder_machine_id,expires_at)
+      VALUES(?,1,?,?,?,?)`,'job:'+opts.subject,opts.subject,machine,machine,expiresAt);
+  }
+
 }
 
 describe('ConversationHub Durable Object Integration (src/conversation-hub.ts)', () => {
@@ -65,7 +73,7 @@ describe('ConversationHub Durable Object Integration (src/conversation-hub.ts)',
     const stub = bindings.HUB.get(bindings.HUB.idFromName('conv-hub-meta-' + crypto.randomUUID()));
 
     await runInDurableObject(stub, async (_baseInstance: BaseHub, state: DurableObjectState) => {
-      const hub = await restartFixtureHub(_baseInstance as Hub);
+      const hub = await restartFixtureHub(_baseInstance as Hub,bindings);
       expect(Hub).toBe(ConversationHub);
       expect(Hub.name).toBe('Hub');
       expect(hub).toBeInstanceOf(BaseHub);
@@ -98,7 +106,7 @@ describe('ConversationHub Durable Object Integration (src/conversation-hub.ts)',
     const stub = bindings.HUB.get(bindings.HUB.idFromName('conv-hub-auth-' + crypto.randomUUID()));
 
     await runInDurableObject(stub, async (_baseInstance: BaseHub, state: DurableObjectState) => {
-      const hub = await restartFixtureHub(_baseInstance as Hub);
+      const hub = await restartFixtureHub(_baseInstance as Hub,bindings);
 
       const alice = await makeAdminSession(bindings, {
         sub: 'oidc-alice-001',
@@ -237,7 +245,7 @@ describe('ConversationHub Durable Object Integration (src/conversation-hub.ts)',
     const stub = bindings.HUB.get(bindings.HUB.idFromName('conv-hub-bearer-' + crypto.randomUUID()));
 
     await runInDurableObject(stub, async (_baseInstance: BaseHub, state: DurableObjectState) => {
-      const hub = await restartFixtureHub(_baseInstance as Hub);
+      const hub = await restartFixtureHub(_baseInstance as Hub,bindings);
       const nowIso = new Date().toISOString();
 
       fixtureSql(hub).exec(
@@ -366,7 +374,7 @@ describe('ConversationHub Durable Object Integration (src/conversation-hub.ts)',
     const stub = bindings.HUB.get(bindings.HUB.idFromName('conv-hub-delegate-' + crypto.randomUUID()));
 
     await runInDurableObject(stub, async (baseInstance: BaseHub, state: DurableObjectState) => {
-      const hub = await restartFixtureHub(baseInstance as Hub);
+      const hub = await restartFixtureHub(baseInstance as Hub,bindings);
       const admin = await makeAdminSession(bindings, {
         sub: 'oidc-admin-delegate',
         email: 'admin@fake.local',
@@ -392,15 +400,15 @@ describe('ConversationHub Durable Object Integration (src/conversation-hub.ts)',
       );
       expect(otherRes.status).toBe(404);
 
-      // 3. Inherited RPC / cron / alarm methods work deterministically on ConversationHub:
+      // 3. Inherited manual RPC / alarm methods work deterministically on ConversationHub:
       // Pin clock to valid slot (01:05:00Z, 5m into 01:00Z slot) -> status 'ok', matching BaseHub
       const validSlotDate = new Date('2026-10-17T01:05:00.000Z');
       (hub.jobsService as any).now = () => validSlotDate;
       (baseInstance.jobsService as any).now = () => validSlotDate;
 
-      const tickRes = await hub.scheduledTick();
+      const tickRes = await hub.scheduledTick(undefined,'manual');
       expect(tickRes.status).toBe('ok');
-      const baseValidTick = await baseInstance.scheduledTick();
+      const baseValidTick = await baseInstance.scheduledTick(undefined,'manual');
       expect(baseValidTick.status).toBe('ok');
 
       // Pin clock to late slot in final 5 minutes of 30m window (01:26:00Z, age 1,560,000ms >= 1,500,000ms) -> status 'refused'
@@ -408,8 +416,8 @@ describe('ConversationHub Durable Object Integration (src/conversation-hub.ts)',
       (hub.jobsService as any).now = () => lateSlotDate;
       (baseInstance.jobsService as any).now = () => lateSlotDate;
 
-      const lateTickRes = await hub.scheduledTick();
-      const baseLateTickRes = await baseInstance.scheduledTick();
+      const lateTickRes = await hub.scheduledTick(undefined,'manual');
+      const baseLateTickRes = await baseInstance.scheduledTick(undefined,'manual');
       expect(lateTickRes).toEqual({
         status: 'refused',
         reason: 'late_slot_refused',
@@ -467,7 +475,7 @@ describe('ConversationHub Durable Object Integration (src/conversation-hub.ts)',
     );
 
     await runInDurableObject(stub, async (_baseInstance: BaseHub, state: DurableObjectState) => {
-      const hub = await restartFixtureHub(_baseInstance as Hub);
+      const hub = await restartFixtureHub(_baseInstance as Hub,bindings);
       const admin = await makeAdminSession(bindings, {
         sub: 'oidc-admin-ret',
         email: 'admin@fake.local',

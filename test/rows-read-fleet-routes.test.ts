@@ -54,11 +54,24 @@ const withFleet = (fn: (s: FleetService, t: ReturnType<typeof tracked>, hub: Hub
   const stub = bindings.HUB.get(bindings.HUB.idFromName('fleet-rows-' + crypto.randomUUID()));
   await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
     await freshFixtureBudgetDay(hub);
+    await (hub as any).rowBudget.begin(true);
     seed(fixtureSql(hub,state));
     const t = tracked(hub.sql);
-    const s = new FleetService(t.proxy, (cb) => state.storage.transactionSync(cb), () => now);
-    s.init();
-    await fn(s, t, hub);
+    // Log only the SQL shape, never bindings. Native execution errors can be
+    // caught by optional-schema callers before the budget's failure latch
+    // surfaces, so the first throwing statement is the useful diagnosis.
+    const native:any=state.storage.sql,exec=native.exec;
+    const failures:string[]=[];
+    native.exec=function(query:string,...bindings:any[]) {
+      try{return exec.call(native,query,...bindings);}
+      catch(error){if(!/^(?:SQLITE_ERROR:\s*)?(?:duplicate column name:|table \S+ already exists|index \S+ already exists)/i.test(String((error as any)?.message??error))){failures.push(query);console.error('FLEET_ROWS_NATIVE_SQL_FAILURE',query);}throw error;}
+    };
+    (t as any).nativeFailures=failures;
+    try {
+      const s = new FleetService(t.proxy, (cb) => state.storage.transactionSync(cb), () => now);
+      s.init();
+      await fn(s, t, hub);
+    } finally { native.exec=exec; }
   });
 };
 
@@ -110,9 +123,9 @@ it('GET /api/fleet/offers reuses reconciliation candidates until a launch or ses
   // except launch 0, whose native is unobserved so it is a reconciliation candidate.
   for (let i = 0; i < 60; i++) {
     const n = 10000 + i, launch = uuid(5, n), native = uuid(6, n);
-    hub.sql.exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,native_id,created_at,updated_at)
+    fixtureSql(hub).exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,native_id,created_at,updated_at)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, launch, 'owner', 'agent', 's', 'kx' + n, '{}', 'h0', 'codex', 'a', 'interactive', '/w', 'p', 'running', native, iso(-1000), iso(-1000));
-    if (i > 0) hub.sql.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace,cwd,created_at_ms) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    if (i > 0) fixtureSql(hub).exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace,cwd,created_at_ms) VALUES (?,?,?,?,?,?,?,?,?,?)`,
       'h0', native, 'hub-' + launch, 'codex', 'running', null, iso(-1000), '/w', '/w', now - 1000);
   }
   const get = async () => { const r = await s.handle(new Request('https://hub.test/api/fleet/offers'), host); expect(r.status).toBe(200); return r.json() as Promise<any>; };
@@ -152,7 +165,7 @@ it('provider efficiencies are reused until a reward event is added', withFleet(a
   const { loadProviderEfficiencies } = await import('../src/pacing');
   for (let i = 0; i < 300; i++) reward(hub, 'ev' + i, 'codex:a:5h', now - 1000 - i, 60);
   const first = loadProviderEfficiencies(t.proxy, now);
-  expect(first.size).toBeGreaterThan(0);
+  expect(first.size,JSON.stringify({native_failures:(t as any).nativeFailures,budget:(hub as any).rowBudget.status(),sql:t.report().top})).toBeGreaterThan(0);
   const from = t.mark();
   const second = loadProviderEfficiencies(t.proxy, now + 1000);
   expect([...second]).toEqual([...first]);

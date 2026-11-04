@@ -99,6 +99,8 @@ CREATE TABLE IF NOT EXISTS session_control_sessions (id TEXT PRIMARY KEY, actor 
 CREATE TABLE IF NOT EXISTS session_control_commands (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, kind TEXT NOT NULL, actor TEXT NOT NULL, request_key TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL, generation INTEGER NOT NULL, correlation TEXT NOT NULL, poll_at TEXT, ack_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, owner_token_id TEXT, owner_family TEXT, holder_machine TEXT, claim_token TEXT, claim_expires_at TEXT, holder_attempt TEXT, attempts INTEGER DEFAULT 0, host_status TEXT, host_reason TEXT, not_before TEXT, recipient_seq INTEGER, UNIQUE(session_id, actor, request_key));
 CREATE TABLE IF NOT EXISTS session_control_cancellations (session_id TEXT PRIMARY KEY, actor TEXT NOT NULL, request_key TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_control_protections (session_id TEXT PRIMARY KEY, actor TEXT NOT NULL, request_key TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS session_intake_link_repair_cursor (key TEXT PRIMARY KEY, created_at TEXT NOT NULL, session_id TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS session_control_created ON session_control_sessions(created_at,id);
 CREATE TABLE IF NOT EXISTS session_control_held_cursor (id INTEGER PRIMARY KEY CHECK(id=1), created_at TEXT NOT NULL, session_id TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS intake_queue_session_task ON session_control_sessions(json_extract(CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END,'$.intake_task_id'));
 CREATE INDEX IF NOT EXISTS session_control_machine_created ON session_control_sessions(machine_id, created_at, id);
@@ -494,15 +496,34 @@ export class SessionControlService {
     initLifecycleTables(this.sql);
     registerHeldReconciler(this.sql, () => this.reconcileHeldSessions(5, undefined, { urgentRecovery: true }));
     try { ensureTbmControllerSchema(this.sql); } catch {}
-    // Repair this day's pre-fix starts from canonical requests, once per id.
-    // Run each repair atomically; historical manual links are left untouched.
-    const hasIntake = this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='intake_tasks'").toArray().length;
-    if (hasIntake) this.transaction(() => backfillOnce(this.sql, 'session_intake_links_t2609u', () => {
-      const today = this.at().slice(0, 10);
-      this.sql.exec('CREATE INDEX IF NOT EXISTS session_control_created ON session_control_sessions(created_at,id)');
-      const sessions = this.sql.exec("SELECT * FROM session_control_sessions WHERE created_at >= ? AND json_extract(request_json, '$.intake_task_id') IS NOT NULL ORDER BY created_at,id", today).toArray();
-      for (const row of sessions) recordIntakeSessionLink(this.sql, row, this.now());
-    }));
+    // Legacy link repair is explicit operator work; cold starts never walk it.
+  }
+
+  repairIntakeLinks(limit=16):any {
+    if(!Number.isSafeInteger(limit)||limit<1||limit>16)throw new Error('invalid_repair_limit');
+    const hasIntake=this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='intake_tasks'").toArray().length;
+    if(!hasIntake)return {repaired:0,complete:false,reason:'intake_store_unavailable'};
+    return this.transaction(()=>{
+      const key='session_intake_links_t2609u';
+      if(this.sql.exec('SELECT 1 FROM hub_init_stamps WHERE key=?',key).toArray().length)return {repaired:0,complete:true,next_cursor:null,source_rows_scanned:0};
+      this.sql.exec('INSERT OR IGNORE INTO session_intake_link_repair_cursor VALUES(?,?,?)',key,this.at().slice(0,10),'');
+      const cursor:any=this.sql.exec('SELECT created_at,session_id FROM session_intake_link_repair_cursor WHERE key=?',key).toArray()[0];
+      // Two seek arms handle large equal-timestamp cohorts without sorting or
+      // repeatedly walking today's already repaired prefix. Persist progress
+      // atomically, and never stamp an incomplete repair as done.
+      const page=this.sql.exec(`SELECT * FROM session_control_sessions INDEXED BY session_control_created
+        WHERE created_at=? AND id>? ORDER BY id LIMIT ?`,cursor.created_at,cursor.session_id,limit+1).toArray() as any[];
+      if(page.length<limit+1)page.push(...this.sql.exec(`SELECT * FROM session_control_sessions INDEXED BY session_control_created
+        WHERE created_at>? ORDER BY created_at,id LIMIT ?`,cursor.created_at,limit+1-page.length).toArray());
+      const batch=page.slice(0,limit);
+      let repaired=0;
+      for(const row of batch)if(parsed(row.request_json,{}).intake_task_id!=null&&recordIntakeSessionLink(this.sql,row,this.now()))repaired++;
+      if(batch.length){const last=batch.at(-1)!;this.sql.exec('UPDATE session_intake_link_repair_cursor SET created_at=?,session_id=? WHERE key=?',last.created_at,last.id,key);}
+      const complete=page.length<=limit;
+      if(complete)this.sql.exec('INSERT OR IGNORE INTO hub_init_stamps VALUES(?,?)',key,this.now());
+      const last=batch.at(-1);
+      return {repaired,complete,next_cursor:complete?null:{created_at:last?.created_at??cursor.created_at,session_id:last?.id??cursor.session_id},source_rows_scanned:batch.length};
+    });
   }
 
   private at() { return new Date(this.now()).toISOString(); }
@@ -1383,10 +1404,11 @@ export class SessionControlService {
     if (row.fleet_launch_id) {
       // Intake 17e774f8: separate read so older fleet tables without the
       // column cannot hide the launch diagnostics below.
-      try {
+      const statusColumn=this.sql.exec("SELECT name FROM pragma_table_info('fleet_launches') WHERE name='worker_status' LIMIT 1").toArray().length;
+      if(statusColumn) {
         const done: any = this.sql.exec('SELECT state, worker_status, runtime_json FROM fleet_launches WHERE id = ?', row.fleet_launch_id).toArray()[0];
         if (done?.state === 'exited' && WORKER_STATUSES.includes(done.worker_status) && cleanReportedExit(parsed(done.runtime_json, null))) workerStatus = done.worker_status;
-      } catch {}
+      }
     }
     if (row.fleet_launch_id) {
       try {
@@ -2574,6 +2596,13 @@ export class SessionControlService {
     const writer = admin || (caller.kind === 'agent' && auth.scopes?.includes('fleet:launch'));
     const host = caller.kind === 'host' && !!caller.machineId && auth.scopes?.includes('host');
 
+    if(path==='/api/sessions/maintenance/repair-intake-links'&&request.method==='POST') {
+      if(!admin||!auth.scopes?.includes('admin'))return response({error:'forbidden'},403);
+      const limit=Number(url.searchParams.get('limit')??16);
+      if(!Number.isSafeInteger(limit)||limit<1||limit>16)return response({error:'invalid_repair_limit'},400);
+      return response(this.repairIntakeLinks(limit));
+    }
+
     if (path === '/api/sessions/worktree-guards' && request.method === 'GET') {
       if (!host) return response({ error: 'forbidden' }, 403);
       const scope = this.worktreeGuardScope(url, caller);
@@ -3612,6 +3641,7 @@ export class SessionControlService {
         }
         if (!session && sub !== 'binding' && sub !== 'retirement') {
           const matches = observedHubTagMatches(this.sql, rawRef, row => this.ownerOk(row, caller));
+          if(matches.observationLimited)return response({error:'session_alias_observation_limited',observation_pending:true},503);
           if (matches.length > 1) return response({error:'ambiguous_session_prefix'}, 409);
           session = matches[0] ?? null;
         }
@@ -3626,8 +3656,10 @@ export class SessionControlService {
           return intent.provenance === 'observed_native' && binding.provenance === 'observed_native' &&
             workspace === linkWorker.workspace;
         };
+        const observed=observedHubTagMatches(this.sql,rawRef,visibleToCaller);
+        if(observed.observationLimited)return response({error:'session_alias_observation_limited',observation_pending:true},503);
         const matches = [...new Map([...visibleSessionPrefixMatches(this.sql, rawRef, visibleToCaller),
-          ...observedHubTagMatches(this.sql, rawRef, visibleToCaller)].map(row => [row.id, row])).values()];
+          ...observed].map(row => [row.id, row])).values()];
         if (matches.length > 1) return response({ error: 'ambiguous_session_prefix',
           matches: matches.map(row => ({ id: row.id, name: parsed(row.request_json, {}).name ?? null })) }, 409);
         session = matches[0] ?? null;
@@ -5246,18 +5278,17 @@ export function adoptObservedNativeSessions(
     const request = parsed(row.request_json, {});
     const revision = `${linkageRevision}/${row.updated_at}/${request.observation_only === true}/${row.owner_family ?? ''}/${row.owner_token_id ?? ''}`;
     if (request.observation_link_revision === revision) continue;
-    sql.exec('UPDATE session_control_sessions SET request_json=? WHERE id=?',
-      JSON.stringify({...request, observation_link_revision: revision}), row.id);
-    pending.push(row);
+    pending.push({...row,observation_candidate_revision:revision});
   }
   const links = observedIntakeCandidates(sql, machineId, pending);
+  if(links.observationLimited)return {adopted,updated,deferred:deferred+pending.length};
   for (const row of pending) {
     const taskId = links.get(row.id);
-    if (!taskId) continue;
-    const intent = { ...parsed(row.request_json, {}), intake_task_id: taskId };
+    const intent = { ...parsed(row.request_json, {}),observation_link_revision:row.observation_candidate_revision,
+      ...(taskId?{intake_task_id:taskId}:{}) };
     sql.exec('UPDATE session_control_sessions SET request_json=? WHERE id=?', JSON.stringify(intent), row.id);
     row.request_json = JSON.stringify(intent);
-    recordIntakeSessionLink(sql, row, nowMs);
+    if(taskId)recordIntakeSessionLink(sql, row, nowMs);
   }
   return { adopted, updated, deferred };
 }

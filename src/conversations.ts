@@ -1945,6 +1945,11 @@ export class ConversationsService {
     return archivedMs <= nowMs - this.limits.archivedConversationRetentionMs;
   }
 
+  private automationAtCapacity(table:'conversation_automation_grants'|'conversation_automation_receipts',limit:number):boolean {
+    // Only the threshold matters; retained overflow must not enlarge the read.
+    return this.sql.exec(`SELECT 1 FROM ${table} LIMIT ?`,limit).toArray().length>=limit;
+  }
+
   private getRetainedVisibility(
     conversationId: string,
     lastSeq: number,
@@ -2993,7 +2998,7 @@ export class ConversationsService {
         if (!credentialId) throw new ConversationDomainError('automation_target_unavailable', 403);
       } else throw new ConversationDomainError('automation_target_unavailable', 403);
       const prior = this.sql.exec('SELECT id FROM conversation_automation_grants WHERE conversation_id = ? AND check_name = ?', cid, input.check).toArray()[0];
-      if (!prior && Number(this.sql.exec('SELECT COUNT(*) AS n FROM conversation_automation_grants').toArray()[0].n) >= 1000) throw new ConversationDomainError('automation_capacity', 409);
+      if (!prior && this.automationAtCapacity('conversation_automation_grants',1000)) throw new ConversationDomainError('automation_capacity', 409);
       const id = generateUlid(this.now());
       this.sql.exec(`INSERT INTO conversation_automation_grants (id, conversation_id, check_name, target_actor, target_credential_id, owner_sub, expires_at, body_template, action_on)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(conversation_id, check_name) DO UPDATE SET
@@ -3083,7 +3088,7 @@ export class ConversationsService {
         intent.checkName, intent.idempotencyKey, request).toArray().length) {
         throw new ConversationDomainError('automation_slot_retired', 409);
       }
-      if (Number(this.sql.exec('SELECT COUNT(*) AS n FROM conversation_automation_receipts').toArray()[0].n) >= 4096) throw new ConversationDomainError('automation_capacity', 409);
+      if (this.automationAtCapacity('conversation_automation_receipts',4096)) throw new ConversationDomainError('automation_capacity', 409);
       const message = this.writeMessage({ conversationId: intent.conversationId, body: intent.body, idempotencyKey: intent.idempotencyKey, kind: 'note' }, () => {
         const grant = this.sql.exec('SELECT * FROM conversation_automation_grants WHERE id = ?', intent.grantId).toArray()[0] as any;
         if (!grant || grant.conversation_id !== intent.conversationId || grant.check_name !== intent.checkName || grant.target_actor !== intent.actor || grant.body_template !== intent.bodyTemplate || grant.action_on !== intent.on) throw new ConversationDomainError('automation_grant_mismatch', 403);

@@ -21,7 +21,6 @@ export class HostGoals {
     // Routing initializes before fleet/provisioning on a fresh database.
     // Hub calls init again after both schemas exist.
     if (this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('fleet_sessions','engine_installations')").toArray().length !== 2) return;
-    if (this.sql.exec("SELECT name FROM sqlite_master WHERE type='trigger' AND name='host_goal_launch_running_v2'").toArray().length) return;
     // Capture either ordering of launch acknowledgement and native observation.
     // Both must prove running; a merely starting launch never completes a goal.
     const recordProof = `
@@ -42,10 +41,10 @@ export class HostGoals {
         )`;
     for (const event of ['INSERT', 'UPDATE']) {
       this.sql.exec(`DROP TRIGGER IF EXISTS host_goal_running_${event.toLowerCase()}`);
-      this.sql.exec(`CREATE TRIGGER host_goal_running_${event.toLowerCase()}
+      this.sql.exec(`CREATE TRIGGER IF NOT EXISTS host_goal_running_${event.toLowerCase()}_v2
         AFTER ${event} ON fleet_sessions WHEN NEW.phase='running' BEGIN ${recordProof}; END`);
     }
-    this.sql.exec(`CREATE TRIGGER host_goal_launch_running_v2
+    this.sql.exec(`CREATE TRIGGER IF NOT EXISTS host_goal_launch_running_v2
       AFTER UPDATE ON fleet_launches WHEN NEW.state='running' BEGIN ${recordProof}; END`);
   }
   set(machine: string, input: any): { error: string } | any {

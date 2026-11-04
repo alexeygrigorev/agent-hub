@@ -1,3 +1,4 @@
+import {fixtureSql,freshFixtureBudgetDay} from './helpers/fixture-budget';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { Env } from '../src/env';
@@ -101,14 +102,15 @@ describe('launch schedules admin API', () => {
     const id = defaultEnv.HUB.idFromName('hub');
     stub = defaultEnv.HUB.get(id);
     await runInDurableObject(stub, async (instance: Hub) => {
+      await freshFixtureBudgetDay(instance);
       instance.env = { ...instance.env, HUB_ADMIN_TOKEN_SHA256: await sha() } as Env;
       for (const statement of SCHEMA_SQL.split(';')) {
         const trimmed = statement.trim();
-        if (trimmed) { try { instance.sql.exec(trimmed); } catch (e) {} }
+        if (trimmed) { try { fixtureSql(instance).exec(trimmed); } catch (e) {} }
       }
       try { instance.launchSchedules.init(); } catch (e) {}
       for (const table of CLEANUP_TABLES) {
-        try { instance.sql.exec(`DELETE FROM ${table}`); } catch (e) {}
+        try { fixtureSql(instance).exec(`DELETE FROM ${table}`); } catch (e) {}
       }
     });
   });
@@ -176,7 +178,7 @@ describe('launch schedules admin API', () => {
     expect(resumed.enabled).toBe(true);
     expect(resumed.next_due_at).toBeTruthy();
     await runInDurableObject(stub, async (instance: Hub) => {
-      instance.sql.exec(`INSERT INTO launch_schedule_runs (id, schedule_id, schedule_name, tick_at, fired_at, outcome, created_at)
+      fixtureSql(instance).exec(`INSERT INTO launch_schedule_runs (id, schedule_id, schedule_name, tick_at, fired_at, outcome, created_at)
         VALUES ('run-1', ?, 'daily-writer', '2026-10-31T10:05:00.000Z', '2026-10-31T10:05:01.000Z', 'held', '2026-10-31T10:05:01.000Z')`, created.id);
     });
     const runs: any = await (await admin('GET', `/api/schedules/daily-writer/runs?limit=10`)).json();
@@ -187,11 +189,11 @@ describe('launch schedules admin API', () => {
     expect(deleted.deleted).toBe(true);
     expect((await admin('GET', `/api/schedules/${created.id}`)).status).toBe(404);
     await runInDurableObject(stub, async (instance: Hub) => {
-      const runs = instance.sql.exec("SELECT * FROM launch_schedule_runs WHERE id = 'run-1'").toArray();
+      const runs = fixtureSql(instance).exec("SELECT * FROM launch_schedule_runs WHERE id = 'run-1'").toArray();
       expect(runs).toHaveLength(1); // run history outlives the schedule
     });
     await runInDurableObject(stub, async (instance: Hub) => {
-      const audits = instance.sql.exec("SELECT action FROM audit WHERE resource = 'schedule'").toArray() as any[];
+      const audits = fixtureSql(instance).exec("SELECT action FROM audit WHERE resource = 'schedule'").toArray() as any[];
       expect(audits.map(a => a.action)).toEqual(expect.arrayContaining(['schedule.create', 'schedule.pause', 'schedule.resume', 'schedule.delete']));
     });
   });
@@ -419,13 +421,14 @@ describe('launch schedules end-to-end through real admission', () => {
     const id = defaultEnv.HUB.idFromName('hub');
     stub = defaultEnv.HUB.get(id);
     await runInDurableObject(stub, async (instance: Hub) => {
+      await freshFixtureBudgetDay(instance);
       instance.env = { ...instance.env, HUB_ADMIN_TOKEN_SHA256: await sha() } as Env;
       for (const statement of SCHEMA_SQL.split(';')) {
         const trimmed = statement.trim();
-        if (trimmed) { try { instance.sql.exec(trimmed); } catch (e) {} }
+        if (trimmed) { try { fixtureSql(instance).exec(trimmed); } catch (e) {} }
       }
       for (const table of CLEANUP_TABLES) {
-        try { instance.sql.exec(`DELETE FROM ${table}`); } catch (e) {}
+        try { fixtureSql(instance).exec(`DELETE FROM ${table}`); } catch (e) {}
       }
     });
   });
@@ -442,7 +445,7 @@ describe('launch schedules end-to-end through real admission', () => {
     })).json();
     // Simulate the */5 cron having come due two minutes ago.
     await runInDurableObject(stub, async (instance: Hub) => {
-      instance.sql.exec('UPDATE launch_schedules SET last_tick_ms = ? WHERE id = ?', Date.now() - 7 * 60000, created.id);
+      fixtureSql(instance).exec('UPDATE launch_schedules SET last_tick_ms = ? WHERE id = ?', Date.now() - 7 * 60000, created.id);
       const result = await instance.launchSchedules.tick('cron');
       expect(result.schedules).toHaveLength(1);
       expect(['held', 'started', 'queued']).toContain(result.schedules[0].state);
@@ -454,7 +457,7 @@ describe('launch schedules end-to-end through real admission', () => {
     expect(run.session_id).toBeTruthy();
     expect(['held', 'started']).toContain(run.outcome);
     await runInDurableObject(stub, async (instance: Hub) => {
-      const task: any = instance.sql.exec('SELECT * FROM intake_tasks WHERE id = ?', run.intake_id).toArray()[0];
+      const task: any = fixtureSql(instance).exec('SELECT * FROM intake_tasks WHERE id = ?', run.intake_id).toArray()[0];
       expect(task).toBeTruthy();
       const data = JSON.parse(task.data);
       // Schedule provenance lives on the intake history entry that carried the prompt.
@@ -463,7 +466,7 @@ describe('launch schedules end-to-end through real admission', () => {
       expect(entry.source.reference).toBe('e2e-tick');
       expect(entry.source.timestamp).toBe(run.tick_at);
       expect(data.acceptance_criteria).toBe('A screenshot is attached as evidence');
-      const session: any = instance.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', run.session_id).toArray()[0];
+      const session: any = fixtureSql(instance).exec('SELECT * FROM session_control_sessions WHERE id = ?', run.session_id).toArray()[0];
       expect(session).toBeTruthy();
       expect(session.mode).toBe('headless');
       const request = JSON.parse(session.request_json);
@@ -473,7 +476,7 @@ describe('launch schedules end-to-end through real admission', () => {
     // Overlap skip: the held/queued session is still live, so an immediately
     // due next occurrence is skipped with the live session named.
     await runInDurableObject(stub, async (instance: Hub) => {
-      instance.sql.exec('UPDATE launch_schedules SET last_tick_ms = ? WHERE id = ?', Date.now() - 7 * 60000, created.id);
+      fixtureSql(instance).exec('UPDATE launch_schedules SET last_tick_ms = ? WHERE id = ?', Date.now() - 7 * 60000, created.id);
       const result = await instance.launchSchedules.tick('cron');
       expect(result.schedules[0]).toMatchObject({ state: 'skipped' });
       expect(String(result.schedules[0].reason)).toContain('overlap_previous_live');
@@ -487,7 +490,7 @@ describe('launch schedules end-to-end through real admission', () => {
     })).json();
     await runInDurableObject(stub, async (instance: Hub) => {
       // Make an occurrence already due (create set the cursor to now).
-      instance.sql.exec('UPDATE launch_schedules SET last_tick_ms = ? WHERE id = ?', Date.now() - 2 * 60000, created.id);
+      fixtureSql(instance).exec('UPDATE launch_schedules SET last_tick_ms = ? WHERE id = ?', Date.now() - 2 * 60000, created.id);
       const result = await instance.launchSchedules.tick('cron');
       expect(result.schedules[0]).toMatchObject({ state: 'refused', reason: 'acceptance_criteria_required' });
     });

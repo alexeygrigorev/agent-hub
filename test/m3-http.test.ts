@@ -1,3 +1,5 @@
+import {registerFixtureStatements,fixtureStatements} from './helpers/fixture-statements';
+import {fixtureSql} from './helpers/fixture-budget';
 import { restartFixtureHub, freshFixtureBudgetDay } from './helpers/fixture-budget';
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { pinJobsClock } from './slot-clock';
@@ -17,86 +19,86 @@ async function seedTestData(sql: any) {
   for (const statement of SCHEMA_SQL.split(';')) {
     const trimmed = statement.trim();
     if (trimmed) {
-      try { sql.exec(trimmed); } catch (e) {}
+      try { fixtureStatements(sql).exec(trimmed); } catch (e) {}
     }
   }
   for (const statement of BUS_SCHEMA_SQL.split(';')) {
     const trimmed = statement.trim();
     if (trimmed) {
-      try { sql.exec(trimmed); } catch (e) {}
+      try { fixtureStatements(sql).exec(trimmed); } catch (e) {}
     }
   }
 
-  try { sql.exec('DELETE FROM messages'); } catch (e) {}
-  try { sql.exec('DELETE FROM claims'); } catch (e) {}
-  try { sql.exec('DELETE FROM agents'); } catch (e) {}
-  try { sql.exec('DELETE FROM machines'); } catch (e) {}
-  try { sql.exec('DELETE FROM credentials'); } catch (e) {}
+  try { fixtureStatements(sql).exec('DELETE FROM messages'); } catch (e) {}
+  try { fixtureStatements(sql).exec('DELETE FROM claims'); } catch (e) {}
+  try { fixtureStatements(sql).exec('DELETE FROM agents'); } catch (e) {}
+  try { fixtureStatements(sql).exec('DELETE FROM machines'); } catch (e) {}
+  try { fixtureStatements(sql).exec('DELETE FROM credentials'); } catch (e) {}
 
   const now = new Date().toISOString();
   const future = new Date(Date.now() + 86400000).toISOString();
 
   // Seed Machines
-  sql.exec("INSERT INTO machines (id, name, hostname, registered_at) VALUES ('mach-A', 'Machine A', 'host-a', ?)", now);
-  sql.exec("INSERT INTO machines (id, name, hostname, registered_at) VALUES ('mach-B', 'Machine B', 'host-b', ?)", now);
-  sql.exec("INSERT INTO machines (id, name, hostname, registered_at) VALUES ('mach-C', 'Machine C', 'host-c', ?)", now);
+  fixtureStatements(sql).exec("INSERT INTO machines (id, name, hostname, registered_at) VALUES ('mach-A', 'Machine A', 'host-a', ?)", now);
+  fixtureStatements(sql).exec("INSERT INTO machines (id, name, hostname, registered_at) VALUES ('mach-B', 'Machine B', 'host-b', ?)", now);
+  fixtureStatements(sql).exec("INSERT INTO machines (id, name, hostname, registered_at) VALUES ('mach-C', 'Machine C', 'host-c', ?)", now);
 
   // Seed Host Credentials
   const tokenHostA = await sha256('token_host_a');
-  sql.exec(
+  fixtureStatements(sql).exec(
     "INSERT INTO credentials (id, kind, token_hash, family_id, subject, machine_id, scopes, created_by_sub, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     'cred_mach_a', 'host', tokenHostA, 'fam_a', 'host-a', 'mach-A', JSON.stringify(['host', 'bus:send', 'bus:read']), 'admin-1', now, future
   );
 
   const tokenHostB = await sha256('token_host_b');
-  sql.exec(
+  fixtureStatements(sql).exec(
     "INSERT INTO credentials (id, kind, token_hash, family_id, subject, machine_id, scopes, created_by_sub, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     'cred_mach_b', 'host', tokenHostB, 'fam_b', 'host-b', 'mach-B', JSON.stringify(['host', 'bus:send', 'bus:read']), 'admin-1', now, future
   );
 
   // Seed agents
-  sql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('worker-1', 'projA', 'worker', 'mach-A')");
-  sql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('worker-2', 'projB', 'worker', 'mach-B')");
-  sql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('worker-3', 'projC', 'worker', 'mach-C')");
-  sql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('principal-1', 'projA', 'principal', 'mach-A')");
+  fixtureStatements(sql).exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('worker-1', 'projA', 'worker', 'mach-A')");
+  fixtureStatements(sql).exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('worker-2', 'projB', 'worker', 'mach-B')");
+  fixtureStatements(sql).exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('worker-3', 'projC', 'worker', 'mach-C')");
+  fixtureStatements(sql).exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('principal-1', 'projA', 'principal', 'mach-A')");
 
   // Seed Scoped Agent Credentials
   const tokenAgent1 = await sha256('token_agent_1');
-  sql.exec(
+  fixtureStatements(sql).exec(
     "INSERT INTO credentials (id, kind, token_hash, family_id, subject, actor, machine_id, scopes, created_by_sub, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     'cred_agent_1', 'agent', tokenAgent1, 'fam_ag1', 'worker-1', 'worker-1', 'mach-A', JSON.stringify(['bus:send', 'bus:read']), 'admin-1', now, future
   );
 
   const tokenPrincipal1 = await sha256('token_principal_1');
-  sql.exec(
+  fixtureStatements(sql).exec(
     "INSERT INTO credentials (id, kind, token_hash, family_id, subject, actor, machine_id, scopes, created_by_sub, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     'cred_prin_1', 'agent', tokenPrincipal1, 'fam_p1', 'principal-1', 'principal-1', 'mach-A', JSON.stringify(['bus:send', 'bus:read']), 'admin-1', now, future
   );
 
   // Read-only Agent Credential
   const tokenReadOnly = await sha256('token_read_only');
-  sql.exec(
+  fixtureStatements(sql).exec(
     "INSERT INTO credentials (id, kind, token_hash, family_id, subject, actor, machine_id, scopes, created_by_sub, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     'cred_ro', 'agent', tokenReadOnly, 'fam_ro', 'worker-1', 'worker-1', 'mach-A', JSON.stringify(['bus:read']), 'admin-1', now, future
   );
 
   // Send-only Agent Credential
   const tokenSendOnly = await sha256('token_send_only');
-  sql.exec(
+  fixtureStatements(sql).exec(
     "INSERT INTO credentials (id, kind, token_hash, family_id, subject, actor, machine_id, scopes, created_by_sub, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     'cred_so', 'agent', tokenSendOnly, 'fam_so', 'worker-1', 'worker-1', 'mach-A', JSON.stringify(['bus:send']), 'admin-1', now, future
   );
 
   // Expired Credential
   const tokenExpired = await sha256('token_expired');
-  sql.exec(
+  fixtureStatements(sql).exec(
     "INSERT INTO credentials (id, kind, token_hash, family_id, subject, actor, machine_id, scopes, created_by_sub, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     'cred_exp', 'agent', tokenExpired, 'fam_exp', 'worker-1', 'worker-1', 'mach-A', JSON.stringify(['bus:send', 'bus:read']), 'admin-1', now, new Date(Date.now() - 1000).toISOString()
   );
 
   // Revoked Credential
   const tokenRevoked = await sha256('token_revoked');
-  sql.exec(
+  fixtureStatements(sql).exec(
     "INSERT INTO credentials (id, kind, token_hash, family_id, subject, actor, machine_id, scopes, created_by_sub, created_at, expires_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     'cred_rev', 'agent', tokenRevoked, 'fam_rev', 'worker-1', 'worker-1', 'mach-A', JSON.stringify(['bus:send', 'bus:read']), 'admin-1', now, future, now
   );
@@ -104,7 +106,7 @@ async function seedTestData(sql: any) {
 
 function countSql(sql: any, query: string, ...params: any[]): number {
   try {
-    return Number((sql.exec(query, ...params).toArray()[0] as any)?.c ?? 0);
+    return Number((fixtureStatements(sql).exec(query, ...params).toArray()[0] as any)?.c ?? 0);
   } catch {
     return 0;
   }
@@ -144,6 +146,7 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
     const id = defaultEnv.HUB.idFromName("hub");
     stub = defaultEnv.HUB.get(id);
     await runInDurableObject(stub, async (instance: Hub) => {
+      registerFixtureStatements(instance);
       await seedTestData(instance.sql);
     });
   });
@@ -221,7 +224,8 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
 
     // Deliver & read before ack
     await runInDurableObject(stub, async (instance: Hub) => {
-      instance.sql.exec('UPDATE messages SET delivered_at = ?, read_at = ? WHERE id = ?', Date.now(), Date.now(), messageId);
+      registerFixtureStatements(instance);
+      fixtureSql(instance).exec('UPDATE messages SET delivered_at = ?, read_at = ? WHERE id = ?', Date.now(), Date.now(), messageId);
     });
 
     const ackRes = await doFetch(new Request(`http://example.com/api/bus/messages/${messageId}/ack`, {
@@ -442,6 +446,7 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
   it('5. Cookie Authentication & CSRF Validation', async () => {
     let adminCookie = '';
     await runInDurableObject(stub, async (instance: Hub) => {
+      registerFixtureStatements(instance);
       adminCookie = await createSessionCookie(instance.env, {
         sub: 'admin-1',
         email: 'admin@fake.local',
@@ -490,6 +495,7 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
     // C. Non-admin cookie session -> 401 Unauthorized
     let nonAdminCookie = '';
     await runInDurableObject(stub, async (instance: Hub) => {
+      registerFixtureStatements(instance);
       nonAdminCookie = await createSessionCookie(instance.env, {
         sub: 'user-2',
         email: 'user2@fake.local',
@@ -596,7 +602,8 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
 
     // Verify stored scope is normalized
     await runInDurableObject(stub, async (instance: Hub) => {
-      const row = instance.sql.exec('SELECT scope FROM claims WHERE id = ?', claimId1).toArray()[0] as any;
+      registerFixtureStatements(instance);
+      const row = fixtureSql(instance).exec('SELECT scope FROM claims WHERE id = ?', claimId1).toArray()[0] as any;
       expect(row.scope).toBe('src/bus.ts');
     });
 
@@ -641,7 +648,8 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
 
     // Verified released in SQLite
     await runInDurableObject(stub, async (instance: Hub) => {
-      const row = instance.sql.exec('SELECT released_at FROM claims WHERE id = ?', claimId1).toArray()[0] as any;
+      registerFixtureStatements(instance);
+      const row = fixtureSql(instance).exec('SELECT released_at FROM claims WHERE id = ?', claimId1).toArray()[0] as any;
       expect(row.released_at).toBeTruthy();
     });
 
@@ -685,6 +693,7 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
     // e. admin session cookie without CSRF -> 403
     let adminCookie = '';
     await runInDurableObject(stub, async (instance: Hub) => {
+      registerFixtureStatements(instance);
       adminCookie = await createSessionCookie(instance.env, {
         sub: 'admin-1',
         email: 'admin@fake.local',
@@ -715,14 +724,15 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
       defaultEnv.HUB.idFromName('m3-http-ret-iso-' + crypto.randomUUID()),
     );
     await runInDurableObject(isoStub, async (instance: Hub) => {
+      registerFixtureStatements(instance);
       await seedTestData(instance.sql);
-      instance.sql.exec(
+      fixtureSql(instance).exec(
         "INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, body, idempotency_key, created_at, expires_at) VALUES ('iso-valid-msg-future', 'worker-1', 'worker-2', 'note', 'th', 'valid', 'iso-valid-key-future', ?, ?)",
         EARLY_T,
         EARLY_T + 30 * 24 * 3600 * 1000,
       );
       for (let i = 0; i < 250; i++) {
-        instance.sql.exec(
+        fixtureSql(instance).exec(
           "INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, body, idempotency_key, created_at, expires_at) VALUES (?, 'worker-1', 'worker-2', 'note', 'th', 'exp', ?, ?, ?)",
           `iso-exp-msg-${i}`,
           `iso-exp-key-${i}`,
@@ -742,8 +752,9 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
     }));
     expect(isoTickRes.status).toBe(200);
     await runInDurableObject(isoStub, async (instance: Hub) => {
+      registerFixtureStatements(instance);
       expect(
-        instance.sql.exec("SELECT id FROM messages WHERE id = 'iso-valid-msg-future'").toArray(),
+        fixtureSql(instance).exec("SELECT id FROM messages WHERE id = 'iso-valid-msg-future'").toArray(),
       ).toHaveLength(1);
       const isoAfter = busCategorySnapshot(instance.sql, EARLY_T);
       expect(isoAfter.expiredMessages).toBe(150);
@@ -755,6 +766,7 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
     });
     await freezeJobsClock(isoStub, EARLY_T);
     await runInDurableObject(isoStub, async (instance: Hub) => {
+      registerFixtureStatements(instance);
       const coldHub = await restartFixtureHub(instance);
       (coldHub as any).jobsService.setClock(() => new Date(EARLY_T));
       expect(
@@ -769,7 +781,7 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
         countSql(coldHub.sql, "SELECT COUNT(*) AS c FROM messages WHERE id LIKE 'iso-exp-msg-%'"),
       ).toBe(0);
       expect(
-        coldHub.sql.exec("SELECT id FROM messages WHERE id = 'iso-valid-msg-future'").toArray(),
+        fixtureSql(coldHub).exec("SELECT id FROM messages WHERE id = 'iso-valid-msg-future'").toArray(),
       ).toHaveLength(1);
     });
 
@@ -779,14 +791,15 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
     );
     const lateLiveClaim = 'late-genuine-live-claim';
     await runInDurableObject(lateStub, async (instance: Hub) => {
+      registerFixtureStatements(instance);
       await seedTestData(instance.sql);
-      instance.sql.exec(
+      fixtureSql(instance).exec(
         "INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, body, idempotency_key, created_at, expires_at) VALUES ('late-valid-msg', 'worker-1', 'worker-2', 'note', 'th', 'valid', 'late-valid-key', ?, ?)",
         LATE_T,
         LATE_T + 90 * 24 * 3600 * 1000,
       );
       for (let i = 0; i < 250; i++) {
-        instance.sql.exec(
+        fixtureSql(instance).exec(
           "INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, body, idempotency_key, created_at, expires_at) VALUES (?, 'worker-1', 'worker-2', 'note', 'th', 'exp', ?, ?, ?)",
           `late-exp-msg-${i}`,
           `late-exp-key-${i}`,
@@ -794,7 +807,7 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
           LATE_T - 1000,
         );
       }
-      instance.sql.exec(
+      fixtureSql(instance).exec(
         'INSERT INTO claims (id, project, scope, holder, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)',
         lateLiveClaim,
         'projA',
@@ -808,6 +821,7 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
     });
     await freezeJobsClock(lateStub, LATE_T);
     await runInDurableObject(lateStub, async (instance: Hub) => {
+      registerFixtureStatements(instance);
       await instance.runChecks();
       const lateAfter = busCategorySnapshot(instance.sql, LATE_T);
       // The shared retention budget may spend part of this step on another
@@ -816,7 +830,7 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
       expect(lateAfter.expiredMessages).toBeLessThan(250);
       expect(lateAfter.liveClaimIds).toEqual([lateLiveClaim]);
       expect(
-        instance.sql.exec('SELECT id FROM messages WHERE id = ?', 'late-valid-msg').toArray(),
+        fixtureSql(instance).exec('SELECT id FROM messages WHERE id = ?', 'late-valid-msg').toArray(),
       ).toHaveLength(1);
     });
 
@@ -831,7 +845,8 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
     };
     await freezeJobsClock(stub, EARLY_T);
     await runInDurableObject(stub, async (instance: Hub) => {
-      instance.sql.exec(
+      registerFixtureStatements(instance);
+      fixtureSql(instance).exec(
         "INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, body, idempotency_key, created_at, expires_at) VALUES (?, 'worker-1', 'worker-2', 'note', 'th', 'valid', ?, ?, ?)",
         mixValidId,
         `mix-valid-key-${mixValidId}`,
@@ -839,7 +854,7 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
         EARLY_T + 30 * 24 * 3600 * 1000,
       );
       for (let i = 0; i < 250; i++) {
-        instance.sql.exec(
+        fixtureSql(instance).exec(
           "INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, body, idempotency_key, created_at, expires_at) VALUES (?, 'worker-1', 'worker-2', 'note', 'th', 'exp', ?, ?, ?)",
           `${mixPrefix}${i}`,
           `${mixPrefix}key-${i}`,
@@ -847,7 +862,7 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
           EARLY_T - 1000,
         );
       }
-      instance.sql.exec(
+      fixtureSql(instance).exec(
         'INSERT INTO claims (id, project, scope, holder, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)',
         genuineLiveClaim,
         'projA',
@@ -869,8 +884,9 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
     expect(tickFutureRes.status).toBe(200);
     const tickJson = await tickFutureRes.json() as any;
     await runInDurableObject(stub, async (instance: Hub) => {
+      registerFixtureStatements(instance);
       expect(
-        instance.sql.exec('SELECT id FROM messages WHERE id = ?', mixValidId).toArray(),
+        fixtureSql(instance).exec('SELECT id FROM messages WHERE id = ?', mixValidId).toArray(),
       ).toHaveLength(1);
       const mixAfter = busCategorySnapshot(instance.sql, EARLY_T);
       const deletedMessages = mixBefore.expiredMessages - mixAfter.expiredMessages;
@@ -901,7 +917,8 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
       liveClaimIds: [] as string[],
     };
     await runInDurableObject(stub, async (instance: Hub) => {
-      instance.sql.exec(
+      registerFixtureStatements(instance);
+      fixtureSql(instance).exec(
         'INSERT INTO claims (id, project, scope, holder, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)',
         publicLiveClaim,
         'projA',
@@ -928,8 +945,9 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
     const maintainData = await adminMaintainRes.json() as any;
     expect(maintainData.status).toBe('ok');
     await runInDurableObject(stub, async (instance: Hub) => {
+      registerFixtureStatements(instance);
       expect(
-        instance.sql.exec('SELECT id FROM messages WHERE id = ?', mixValidId).toArray(),
+        fixtureSql(instance).exec('SELECT id FROM messages WHERE id = ?', mixValidId).toArray(),
       ).toHaveLength(1);
       const publicAfter = busCategorySnapshot(instance.sql, publicNow);
       expect(publicAfter.liveClaimIds).toEqual(publicBefore.liveClaimIds);
@@ -1016,12 +1034,13 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
     // Message 1: projA (worker-1 <-> worker-2)
     // Message 2: projB/C (worker-2 <-> worker-3)
     await runInDurableObject(stub, async (instance: Hub) => {
+      registerFixtureStatements(instance);
       const now = Date.now();
-      instance.sql.exec(
+      fixtureSql(instance).exec(
         "INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, body, idempotency_key, created_at, expires_at) VALUES ('msg-w1-w2', 'worker-1', 'worker-2', 'note', 'th1', 'hello from w1', 'idemp-w1-w2', ?, ?)",
         now - 2000, now + 86400000
       );
-      instance.sql.exec(
+      fixtureSql(instance).exec(
         "INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, body, idempotency_key, created_at, expires_at) VALUES ('msg-w2-w3', 'worker-2', 'worker-3', 'note', 'th2', 'hello from w2', 'idemp-w2-w3', ?, ?)",
         now - 1000, now + 86400000
       );
@@ -1060,6 +1079,7 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
     // C. Admin listing: all actors returned, but role:root remains denied / excluded
     let adminCookie = '';
     await runInDurableObject(stub, async (instance: Hub) => {
+      registerFixtureStatements(instance);
       adminCookie = await createSessionCookie(instance.env, {
         sub: 'admin-1',
         email: 'admin@fake.local',

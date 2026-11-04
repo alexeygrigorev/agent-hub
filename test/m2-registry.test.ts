@@ -121,7 +121,7 @@ describe('M2 Adverse: Registry Runtime & Persistence Cadence', () => {
         let writesCount = 1;
 
         // Simulate 16 minutes of stable heartbeats arriving every 60 seconds (t = 1min to t = 16min)
-        for (let m = 1; m <= 16; m++) {
+        for (let m = 1; m <= 31; m++) {
           const currentTime = initialTime + m * 60 * 1000;
           Date.now = () => currentTime;
           updateHeartbeat(machineId, stableHb, sql);
@@ -133,8 +133,8 @@ describe('M2 Adverse: Registry Runtime & Persistence Cadence', () => {
           }
         }
 
-        // Under SPEC 5-minute persistence cadence, SQL should be updated at t=0, ~5m, ~10m, ~15m (>= 3 writes).
-        // Actual in registry.ts: writesCount is 1 because machineLastHb resets ts=now every 60s, starving persistence!
+        // The cost-safe 15-minute cadence must persist at t=0, 15m and 30m;
+        // frequent unchanged beats must never postpone its checkpoint.
         expect(writesCount).toBeGreaterThanOrEqual(3);
       } finally {
         Date.now = origNow;
@@ -438,7 +438,7 @@ describe('M2 Adverse: Registry Runtime & Persistence Cadence', () => {
           closedReason = reason;
         }
       };
-      instance.webSocketMessage(fakeWs, JSON.stringify({ type: 'heartbeat' }));
+      await instance.webSocketMessage(fakeWs, JSON.stringify({ type: 'heartbeat' }));
       expect(closedCode).toBe(1008);
       expect(closedReason).toBe('Credential revoked or expired');
     });
@@ -460,7 +460,7 @@ describe('M2 Adverse: Registry Runtime & Persistence Cadence', () => {
       instance.sql.exec("INSERT OR REPLACE INTO credentials (id, kind, token_hash, family_id, subject, scopes, created_by_sub, created_at, expires_at) VALUES ('cred_m_adv', 'host', 'hash_test', 'fam_test', 'subj', '[\"host\"]', 'admin-1', datetime('now'), datetime('now', '+1 hour'))");
 
       const oversized = 'x'.repeat(4097);
-      instance.webSocketMessage(fakeWs, oversized);
+      await instance.webSocketMessage(fakeWs, oversized);
       expect(closedCode).toBe(1009);
       expect(closedReason).toBe('Message too large');
     });

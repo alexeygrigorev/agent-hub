@@ -181,7 +181,16 @@ export class RowBudget {
       }
       if (this.ledger.stopped) this.trip('durable daily allowance exhausted');
       if (!this.limits.read || !this.limits.written || !this.chunk.read || !this.chunk.written || !this.combinedLimit) this.trip('invalid budget configuration');
-      if (!this.stopped && this.credit.read > this.chunk.read / 4 && this.credit.written > this.chunk.written / 4 && !this.dirty) return;
+      const pooled=this.limits.read>=this.combinedLimit && this.limits.written>=this.combinedLimit;
+      const available=this.credit.read+this.credit.written;
+      const spent=this.ledger.read+this.ledger.written-available+this.debt.read+this.debt.written;
+      // A bulk reservation prepays the remaining day. Its minimum shrinks
+      // with actual spending; repeatedly requesting it must not write a new
+      // ledger row merely because the previous request consumed one row.
+      const bulkTarget=Math.max(0,Math.min(19_000,this.combinedLimit-spent-1));
+      const enough=pooled ? available>0 && (bootstrap ? available>=bulkTarget : available>(this.chunk.read+this.chunk.written)/4)
+        : this.credit.read>this.chunk.read/4 && this.credit.written>this.chunk.written/4;
+      if (!this.stopped && enough && !this.dirty) return;
       await this.checkpoint(true, bootstrap);
       if (this.ledger.stopped || this.credit.read <= 0 || this.credit.written <= 0) this.trip('daily allowance exhausted');
       this.stopped = false;
@@ -213,7 +222,12 @@ export class RowBudget {
       add.written = Math.max(0,Math.min(chunk.written,this.limits.written-ledger.written));
       const available = Math.max(0,this.combinedLimit-1-ledger.read-ledger.written);
       const requested = add.read+add.written;
-      if (requested > available) {
+      if(bootstrap && this.limits.read>=this.combinedLimit && this.limits.written>=this.combinedLimit) {
+        // Persist the entire issued pool before exposing it. A crash loses
+        // unused credit conservatively; the daily ceiling never increases.
+        add.read=Math.floor(available*chunk.read/(chunk.read+chunk.written));
+        add.written=available-add.read;
+      } else if (requested > available) {
         add.read = Math.floor(available*add.read/requested);
         add.written = Math.max(0,Math.min(add.written,available-add.read));
       }

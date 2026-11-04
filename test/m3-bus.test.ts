@@ -238,7 +238,7 @@ describe('M3 Bus Service & Schema Tests', () => {
       const past = Date.now() - 500000;
 
       for (let i = 0; i < 150; i++) {
-        instance.sql.exec(
+        fixtureSql(instance).exec(
           "INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, body, idempotency_key, created_at, expires_at) VALUES (?, 'worker-1', 'worker-2', 'note', 'th', 'b', ?, ?, ?)",
           `batch-msg-${i}`, `batch-key-${i}`, past - 1000, past
         );
@@ -830,7 +830,7 @@ describe('M3 bus corrections: recipient ACK, addresses, aliases, expiry', () => 
       for (const [tag, project, role, mach] of [['dup', 'projA', 'dup-a', 'mach-A'], ['dup', 'projB', 'dup-b', 'mach-B'], ['worker-1', 'projA', 'worker', 'mach-A']]) {
         instance.sql.exec('INSERT INTO bus_agents_dup (tag, project, role, machine_id) VALUES (?, ?, ?, ?)', tag, project, role, mach);
       }
-      const sql = { exec: (q: string, ...p: any[]) => instance.sql.exec(q.replace(/\bagents\b/g, 'bus_agents_dup'), ...p) };
+      const sql = { exec: (q: string, ...p: any[]) => instance.sql.exec(q.replace(/\bagents\b/g, 'bus_agents_dup').replace(/\bbus_agent_([A-Za-z0-9_]+)\b/g,'dup_bus_agent_$1'), ...p) };
       const bus = new BusService(sql as any);
       const a: CallerContext = { actor: 'projA:dup' };
       const b: CallerContext = { actor: 'projB:dup' };

@@ -61,6 +61,7 @@ beforeEach(async () => {
     const sql=fixtureSql(h,state);
     h.env.HUB_ADMIN_TOKEN_SHA256 = 'a'.repeat(64);
     // Only fixture-owned archive rows are reset; production archives are append-only.
+    sql.exec('DROP TRIGGER IF EXISTS intake_fixture_fault');
     sql.exec('DROP TRIGGER IF EXISTS intake_note_archive_no_delete');
     sql.exec('DELETE FROM intake_note_archive');
     sql.exec("CREATE TRIGGER intake_note_archive_no_delete BEFORE DELETE ON intake_note_archive BEGIN SELECT RAISE(ABORT,'append_only_note_archive'); END");
@@ -1053,6 +1054,12 @@ describe('private durable intake HTTP/SQLite', () => {
       h.sql.exec('INSERT INTO credentials(id,kind,token_hash,family_id,subject,scopes,created_by_sub,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?)',
         'cred-job', 'job', jobHash, 'family-job', 'fixture-job', '["job"]', 'operator', '2026-01-01T00:00:00.000Z', new Date(Date.now() + 86400000).toISOString());
     });
+    await inDO(stub(), (h:any) => {
+      const sql=fixtureSql(h);
+      sql.exec("UPDATE credentials SET machine_id='fixture-host' WHERE id='cred-job'");
+      sql.exec("INSERT INTO jobs(id,kind,idempotency_key,status,payload,created_at,deadline_at,actor,holder_machine_id,claim_token_hash,lease_epoch) VALUES('fixture-job','head-recovery','fixture-job','running','{}',?,?,'fixture','fixture-host',?,1)",new Date().toISOString(),new Date(Date.now()+3600000).toISOString(),jobHash);
+      sql.exec("INSERT OR REPLACE INTO leases(name,holder_job_id,epoch,expires_at) VALUES('head:default','fixture-job',1,?)",new Date(Date.now()+3600000).toISOString());
+    });
     expect((await call('/grantees?actor=demo:assistant', undefined, jobToken)).status).toBe(403);
   });
   it('supports explicit family selection and honest cursor pagination across >25 active families', async () => {
@@ -1160,11 +1167,19 @@ describe('private durable intake HTTP/SQLite', () => {
   });
   it('SQL failure rolls back task, receipt and revision together, then safe retry succeeds', async () => {
     const { task } = await create(); const before = await state();
-    await inDO(stub(), (h: any) => h.sql.exec("CREATE TRIGGER intake_fixture_fault BEFORE INSERT ON intake_receipts BEGIN SELECT RAISE(ABORT,'fixture fault'); END"));
     const payload = { key: 'fault', expected_version: 1, next_step: 'Synthetic update' };
-    expect((await call('/tasks/' + task.id, payload)).status).toBe(500);
-    expect(await state()).toEqual(before);
-    await inDO(stub(), (h: any) => h.sql.exec('DROP TRIGGER intake_fixture_fault'));
+    await inDO(stub(), (h: any) => fixtureSql(h).exec("CREATE TRIGGER intake_fixture_fault BEFORE INSERT ON intake_receipts BEGIN SELECT RAISE(ABORT,'fixture fault'); END"));
+    try {
+      // Native failures without reliable counters fail closed for this day.
+      expect((await call('/tasks/' + task.id, payload)).status).toBe(503);
+      const rolledBack = await inDO(stub(), (h:any) => Object.fromEntries(['tasks','rules','grants','receipts','meta','note_archive'].map(t => [t, fixtureSql(h).exec('SELECT * FROM intake_' + t + ' ORDER BY id').toArray()])));
+      expect(rolledBack).toEqual(before);
+    } finally {
+      await inDO(stub(), async (h:any) => {
+        fixtureSql(h).exec('DROP TRIGGER IF EXISTS intake_fixture_fault');
+        await freshFixtureBudgetDay(h);
+      });
+    }
     expect((await ok('/tasks/' + task.id, payload)).task.version).toBe(2);
   });
   it('accepts both session links and notes on an existing 173 KiB open ledger', async () => {

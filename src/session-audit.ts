@@ -22,7 +22,7 @@ import { effectiveHeartbeat } from './registry';
  * unsupported targets are escalated once per idle episode and then observed —
  * they are never stopped on alerts alone. */
 import type { SqlStorage } from '@cloudflare/workers-types';
-import { freshCatalogs } from './catalog-freshness';
+import { freshCatalogsForMachines } from './catalog-freshness';
 import { nativeProgress } from './session_stall';
 import { sanitizeCpuUsage } from './cpu-headroom';
 import { linkedTaskIds } from './intake-session';
@@ -41,7 +41,10 @@ const ALERT_BUDGET = 12; // escalation/prompt entries considered per run
 const ALERT_SEND = 10; // entries actually carried by one notification
 const MAX_DETAIL = 512;
 const RETENTION_MS = 7 * 86400000;
-const RETENTION_DELETE = 400;
+const RETENTION_DELETE = 32;
+const ACTIVE_CAP = 32;
+const SOURCE_CAP = 128;
+class AuditObservationLimited extends Error {}
 const TERMINAL_PHASES = new Set(['exited', 'stopped', 'failed', 'pruned', 'forgotten', 'dead']);
 const UNOBSERVED_PHASES = new Set(['unknown', 'unobserved']);
 const HUMAN_BLOCKED = new Set(['blocked', 'pending_approval']);
@@ -237,12 +240,47 @@ export class SessionAuditService {
     private env?: any, private interval = AUDIT_INTERVAL,
     private nativeCatalog?: () => Obj[]) {}
 
-  /** The Hub supplies its write-through observed catalog. Standalone service
-   * users retain the indexed SQL fallback, while scheduled Hub audits never
-   * rescan the retained fleet_sessions table. */
-  private nativeSessionRows(): Obj[] {
-    return this.nativeCatalog ? this.nativeCatalog() : this.rows('SELECT * FROM fleet_sessions');
+  private screens=new Map<string,{tail:string|null;ageS:number|null}>();
+  private intakeIds=new Map<string,string|null>();
+  private snapshot?: {sessions:Obj[];machines:Obj[];worktrees:Obj[];protectedIds:Set<string>;natives:Obj[]};
+  private bounded(query:string,...args:any[]):Obj[] {
+    const rows=this.rows(query,...args);
+    if(rows.length>SOURCE_CAP)throw new AuditObservationLimited('source_prefix_incomplete');
+    return rows;
   }
+  private catalogs(now:number):Map<string,number> {
+    return freshCatalogsForMachines(this.sql,now,(this.snapshot?.machines??[]).map(m=>String(m.id)));
+  }
+  private prepare():void {
+    this.screens.clear();this.intakeIds.clear();
+    const sessions=this.rows("SELECT * FROM session_control_sessions INDEXED BY session_control_state WHERE state IN ('queued','held','offered','starting','running','uncertain') LIMIT 33");
+    const machines=this.rows('SELECT id,last_heartbeat FROM machines ORDER BY id LIMIT 33');
+    if(sessions.length>ACTIVE_CAP||machines.length>ACTIVE_CAP)throw new AuditObservationLimited('active_population_incomplete');
+    // Observe complete decision cohorts before resolving or issuing any action.
+    const pending=this.pendingRows(),tracking=this.trackingStops();
+    const natives=new Map<string,Obj>();const worktrees:Obj[]=[];
+    const add=(n:Obj)=>natives.set(n.machine_id+'/'+n.native_id,n);
+    for(const machine of machines) {
+      for(const phase of ['running','starting']) {
+        const live=this.rows('SELECT * FROM fleet_sessions INDEXED BY fleet_session_machine_phase WHERE machine_id=? AND phase=? LIMIT 33',machine.id,phase);
+        if(live.length>ACTIVE_CAP)throw new AuditObservationLimited('native_population_incomplete');
+        live.forEach(add);
+      }
+      worktrees.push(...this.bounded('SELECT machine,path,state,status_json,status_at FROM intake_worktrees INDEXED BY intake_worktrees_path WHERE machine=? ORDER BY path,rowid LIMIT 129',machine.id));
+    }
+    const known=[...sessions.map(s=>({machine_id:s.machine_id,native_id:parse(s.binding_json).native_id})),...[...pending.values(),...tracking.values()].flat()];
+    for(const ref of known)if(ref.machine_id&&ref.native_id&&!natives.has(ref.machine_id+'/'+ref.native_id)) {
+      const n=this.rows('SELECT * FROM fleet_sessions WHERE machine_id=? AND native_id=?',ref.machine_id,ref.native_id)[0];if(n)add(n);
+    }
+    if(natives.size>ACTIVE_CAP||worktrees.length>SOURCE_CAP)throw new AuditObservationLimited('combined_population_incomplete');
+    const protectedIds=new Set<string>();
+    for(const session of sessions)if(this.rows('SELECT session_id FROM session_control_protections WHERE session_id=?',session.id).length)protectedIds.add(session.id);
+    this.snapshot={sessions,machines,worktrees,protectedIds,natives:[...natives.values()]};
+    this.episodeSteps(natives);this.brokenSends(natives);
+    for(const d of [...pending.values()].flat())if(d.action==='capture'&&d.session_id)this.screenFor(d.session_id);
+    for(const session of sessions) {this.screenFor(session.id);this.linkedIntakeId(session);}
+  }
+  private nativeSessionRows():Obj[] {return this.snapshot?.natives??[];}
 
   init() {
     this.sql.exec('CREATE TABLE IF NOT EXISTS session_audit_meta (id INTEGER PRIMARY KEY CHECK(id=1), last_tick INTEGER, last_source TEXT, last_result TEXT)');
@@ -281,21 +319,23 @@ export class SessionAuditService {
 
   /** Recent runs plus their decisions (CLI/UI action log, AC4). */
   view(last: number): Obj {
-    const runs = this.rows('SELECT * FROM session_audit_runs ORDER BY id DESC LIMIT ?', Math.min(50, Math.max(1, last)));
+    const runs = this.rows('SELECT * FROM session_audit_runs ORDER BY id DESC LIMIT ?', Math.min(16, Math.max(1, Number.isFinite(last)?last:1)));
     const ids = runs.map(r => r.id);
     const decisions = ids.length ? this.rows(
-      `SELECT * FROM session_audit_decisions WHERE run_id IN (${ids.map(() => '?').join(',')}) ORDER BY id`, ...ids) : [];
-    return { audit: this.status(), runs: runs.map(r => this.runView(r)), decisions: decisions.map(d => this.decisionView(d)) };
+      `SELECT * FROM session_audit_decisions INDEXED BY session_audit_decisions_run WHERE run_id IN (${ids.map(() => '?').join(',')}) LIMIT 129`, ...ids) : [];
+    return { audit: this.status(), runs: runs.map(r => this.runView(r)), observation_pending:decisions.length>128, decisions: decisions.slice(0,128).map(d => this.decisionView(d)) };
   }
 
   /** Full dataset export for offline decider training (AC3). */
   exportRows(limit: number): Obj {
-    const capped = Math.min(20000, Math.max(1, limit));
+    const capped = Math.min(128, Math.max(1, Number.isFinite(limit)?limit:1));
+    const runs=this.rows('SELECT * FROM session_audit_runs ORDER BY id DESC LIMIT ?',capped+1);
+    const decisions=this.rows('SELECT * FROM session_audit_decisions ORDER BY id DESC LIMIT ?',capped+1);
     return {
-      exported_at: new Date(this.now()).toISOString(),
-      runs: this.rows('SELECT * FROM session_audit_runs ORDER BY id DESC LIMIT ?', capped).map(r => this.runView(r)),
-      decisions: this.rows('SELECT * FROM session_audit_decisions ORDER BY id DESC LIMIT ?', capped)
-        .map(d => ({ ...this.decisionView(d), dispatched: !!d.dispatched, features: parse(d.features_json), screen_tail: d.screen_tail })),
+      exported_at:new Date(this.now()).toISOString(),effective_limit:capped,
+      observation_pending:runs.length>capped||decisions.length>capped,
+      runs:runs.slice(0,capped).map(r=>this.runView(r)),
+      decisions:decisions.slice(0,capped).map(d=>({...this.decisionView(d),dispatched:!!d.dispatched,features:parse(d.features_json),screen_tail:d.screen_tail})),
     };
   }
 
@@ -317,27 +357,32 @@ export class SessionAuditService {
   }
 
   private linkedIntakeId(session: Obj): string | null {
+    if(this.intakeIds.has(session.id))return this.intakeIds.get(session.id)!;
     const sid = session.id, native = parse(session.binding_json)?.native_id ?? '';
     const textEq = (v: unknown, want: unknown) => typeof v === 'string' && v === want;
-    return linkedTaskIds(this.sql, [sid, native], e => e.kind === 'link' && (textEq(e.hub_session_id, sid) || textEq(e.native_id, native)), 1)[0] ?? null;
+    const id=linkedTaskIds(this.sql, [sid, native], e => e.kind === 'link' && (textEq(e.hub_session_id, sid) || textEq(e.native_id, native)), 1)[0] ?? null;
+    this.intakeIds.set(session.id,id);return id;
   }
 
   private screenFor(sessionId: string): { tail: string | null; ageS: number | null } {
-    const row = this.rows(`SELECT ack_json, updated_at FROM session_control_commands
-      WHERE session_id = ? AND kind = 'capture' AND state = 'acked' ORDER BY updated_at DESC LIMIT 1`, sessionId)[0];
-    if (!row) return { tail: null, ageS: null };
+    if(this.screens.has(sessionId))return this.screens.get(sessionId)!;
+    const source=this.bounded(`SELECT ack_json,updated_at,state,kind FROM session_control_commands
+      INDEXED BY sqlite_autoindex_session_control_commands_2 WHERE session_id=? LIMIT 129`,sessionId);
+    const row=source.filter(r=>r.kind==='capture'&&r.state==='acked').sort((a,b)=>String(b.updated_at).localeCompare(String(a.updated_at)))[0];
+    if (!row) {const empty={tail:null,ageS:null};this.screens.set(sessionId,empty);return empty;}
     const capture = parse(row.ack_json).capture;
     const at = Date.parse(row.updated_at);
     const age = Number.isFinite(at) ? Math.max(0, (this.now() - at) / 1000) : null;
-    return { tail: typeof capture === 'string' && capture ? capture.slice(-SCREEN_TAIL_CHARS) : null, ageS: age };
+    const result={ tail: typeof capture === 'string' && capture ? capture.slice(-SCREEN_TAIL_CHARS) : null, ageS: age };
+    this.screens.set(sessionId,result);return result;
   }
 
   /** Every unresolved actionable decision per session, newest last (drives
    * sequencing and verification). */
   private pendingRows(): Map<string, Obj[]> {
     const out = new Map<string, Obj[]>();
-    for (const d of this.rows(`SELECT * FROM session_audit_decisions
-        WHERE outcome IS NULL AND action IN ('keystroke','nudge','stop','capture') ORDER BY id`)) {
+    for (const d of this.bounded(`SELECT * FROM session_audit_decisions INDEXED BY session_audit_decisions_pending
+        WHERE outcome IS NULL AND action IN ('keystroke','nudge','stop','capture') ORDER BY id LIMIT 129`)) {
       const key = sessionKey(d.machine_id, d.native_id, d.session_id);
       if (!out.has(key)) out.set(key, []);
       out.get(key)!.push(d);
@@ -349,8 +394,8 @@ export class SessionAuditService {
    * proves the exit; they are reselected explicitly every run. */
   private trackingStops(): Map<string, Obj[]> {
     const out = new Map<string, Obj[]>();
-    for (const d of this.rows(`SELECT * FROM session_audit_decisions
-        WHERE action = 'stop' AND outcome = 'stop_timeout' ORDER BY id`)) {
+    for (const d of this.bounded(`SELECT * FROM session_audit_decisions INDEXED BY session_audit_decisions_stop_timeout
+        WHERE action = 'stop' AND outcome = 'stop_timeout' ORDER BY id LIMIT 129`)) {
       const key = sessionKey(d.machine_id, d.native_id, d.session_id);
       if (!out.has(key)) out.set(key, []);
       out.get(key)!.push(d);
@@ -362,8 +407,8 @@ export class SessionAuditService {
    * endpoint (episode-scoped: progress after the failure clears it). */
   private brokenSends(natives: Map<string, Obj>): Map<string, boolean> {
     const out = new Map<string, boolean>();
-    for (const d of this.rows(`SELECT machine_id, native_id, session_id, at, outcome FROM session_audit_decisions
-        WHERE action = 'nudge' AND dispatched = 0 AND outcome = 'enqueue_failed' ORDER BY id DESC LIMIT 400`)) {
+    for (const d of this.bounded(`SELECT machine_id, native_id, session_id, at, outcome FROM session_audit_decisions INDEXED BY session_audit_decisions_enqueue_failed
+        WHERE action = 'nudge' AND dispatched = 0 AND outcome = 'enqueue_failed' ORDER BY id DESC LIMIT 129`)) {
       const key = sessionKey(d.machine_id, d.native_id, d.session_id);
       if (out.has(key)) continue; // newest nudge row per session wins
       const native = d.machine_id && d.native_id ? natives.get(d.machine_id + '/' + d.native_id) : null;
@@ -384,14 +429,14 @@ export class SessionAuditService {
       const boundary = native ? nativeProgress(native) : null;
       return boundary === null || Date.parse(d.at) > boundary;
     };
-    for (const d of this.rows(`SELECT machine_id, native_id, session_id, at FROM session_audit_decisions
-        WHERE action = 'nudge' AND dispatched = 1 ORDER BY id`)) {
+    for (const d of this.bounded(`SELECT machine_id, native_id, session_id, at FROM session_audit_decisions INDEXED BY session_audit_decisions_nudge_dispatched
+        WHERE action = 'nudge' AND dispatched = 1 ORDER BY id LIMIT 129`)) {
       if (!inEpisode(d)) continue;
       const key = sessionKey(d.machine_id, d.native_id, d.session_id);
       nudges.set(key, (nudges.get(key) ?? 0) + 1);
     }
-    for (const d of this.rows(`SELECT machine_id, native_id, session_id, at FROM session_audit_decisions
-        WHERE action = 'escalate' AND dispatched = 1 ORDER BY id`)) {
+    for (const d of this.bounded(`SELECT machine_id, native_id, session_id, at FROM session_audit_decisions INDEXED BY session_audit_decisions_escalate_dispatched
+        WHERE action = 'escalate' AND dispatched = 1 ORDER BY id LIMIT 129`)) {
       if (!inEpisode(d)) continue;
       const key = sessionKey(d.machine_id, d.native_id, d.session_id);
       escalations.set(key, (escalations.get(key) ?? 0) + 1);
@@ -448,20 +493,17 @@ export class SessionAuditService {
   }
 
   private collect(now: number, nativeRows = this.nativeSessionRows()): { audits: AuditFeatures[] } {
-    const sessions = this.rows(`SELECT * FROM session_control_sessions
-      WHERE state IN ('queued','held','offered','starting','running','uncertain')`);
+    const sessions=this.snapshot!.sessions;
     const natives = new Map<string, Obj>(nativeRows.map(n => [n.machine_id + '/' + n.native_id, n]));
-    const catalogs = freshCatalogs(this.sql, now);
-    const cpuByMachine = new Map<string, Obj>();
-    for (const m of this.rows('SELECT id, last_heartbeat FROM machines')) {
-      const usage = sanitizeCpuUsage(parse(effectiveHeartbeat(this.sql,m.id,m.last_heartbeat)).cpu_usage);
-      if (usage) cpuByMachine.set(m.id, { busy_percent: usage.busy_percent, busy_cores: usage.busy_cores, cores: usage.cores, observed_at: usage.observed_at });
+    const catalogs=this.catalogs(now);
+    const cpuByMachine=new Map<string,Obj>();
+    for(const m of this.snapshot!.machines) {
+      const usage=sanitizeCpuUsage(parse(effectiveHeartbeat(this.sql,m.id,m.last_heartbeat)).cpu_usage);
+      if(usage)cpuByMachine.set(m.id,{busy_percent:usage.busy_percent,busy_cores:usage.busy_cores,cores:usage.cores,observed_at:usage.observed_at});
     }
-    const worktrees = new Map<string, Obj>();
-    for (const w of this.rows("SELECT machine, path, status_json, status_at FROM intake_worktrees WHERE state = 'active'")) {
-      worktrees.set(w.machine + '|' + w.path, { ...parse(w.status_json), checked_at: w.status_at ? new Date(Number(w.status_at)).toISOString() : null });
-    }
-    const protectedIds = new Set(this.rows('SELECT session_id FROM session_control_protections').map(r => r.session_id));
+    const worktrees=new Map<string,Obj>();
+    for(const w of this.snapshot!.worktrees)if(w.state==='active')worktrees.set(w.machine+'|'+w.path,{...parse(w.status_json),checked_at:w.status_at?new Date(Number(w.status_at)).toISOString():null});
+    const protectedIds=this.snapshot!.protectedIds;
     const boundNatives = new Set(sessions
       .filter((s: Obj) => s.machine_id && parse(s.binding_json)?.native_id)
       .map((s: Obj) => s.machine_id + '/' + parse(s.binding_json).native_id));
@@ -553,13 +595,18 @@ export class SessionAuditService {
     const meta: any = this.rows('SELECT last_tick FROM session_audit_meta WHERE id=1')[0] ?? {};
     if (source !== 'manual' && meta.last_tick !== null && meta.last_tick !== undefined && now - Number(meta.last_tick) < this.interval)
       return { state: 'already_audited', last_run_at: meta.last_tick };
+    this.snapshot=undefined;
+    try {this.prepare();} catch(error) {
+      if(error instanceof AuditObservationLimited||error instanceof Error&&/^intake_(link|history)_observation_limited$/.test(error.message))return {state:'observation_pending',observation_pending:true,reason:error.message};
+      throw error;
+    }
     this.sql.exec('UPDATE session_audit_meta SET last_tick=?, last_source=? WHERE id=1', now, source);
 
     const thresholdS = idleThresholdFrom(this.env);
     const decider = this.decider(thresholdS);
     const nativeRows = this.nativeSessionRows();
     const natives = new Map(nativeRows.map(n => [n.machine_id + '/' + n.native_id, n]));
-    const catalogs = freshCatalogs(this.sql, now);
+    const catalogs = this.catalogs(now);
     const unverifiedStops = this.resolveOutcomes(this.pendingRows(), this.trackingStops(), natives, catalogs, now);
 
     const { audits } = this.collect(now, nativeRows);
@@ -650,7 +697,7 @@ export class SessionAuditService {
    * (a decision's run carries the same at, so both age out together). */
   private prune(now: number) {
     const cutoff = new Date(now - RETENTION_MS).toISOString();
-    this.sql.exec(`DELETE FROM session_audit_decisions WHERE id IN (SELECT id FROM session_audit_decisions INDEXED BY session_audit_decisions_at WHERE at < ? ORDER BY id LIMIT ?)`, cutoff, RETENTION_DELETE);
-    this.sql.exec(`DELETE FROM session_audit_runs WHERE id IN (SELECT id FROM session_audit_runs WHERE at < ? ORDER BY id LIMIT ?)`, cutoff, RETENTION_DELETE);
+    this.sql.exec(`DELETE FROM session_audit_decisions WHERE id IN (SELECT id FROM session_audit_decisions INDEXED BY session_audit_decisions_at WHERE at < ? ORDER BY at,id LIMIT ?)`, cutoff, RETENTION_DELETE);
+    this.sql.exec(`DELETE FROM session_audit_runs WHERE id IN (SELECT id FROM (SELECT id,at FROM session_audit_runs ORDER BY id LIMIT ?) WHERE at < ?)`, RETENTION_DELETE, cutoff);
   }
 }

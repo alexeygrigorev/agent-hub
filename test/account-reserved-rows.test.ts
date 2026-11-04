@@ -1,3 +1,4 @@
+import {fixtureSql} from './helpers/fixture-budget';
 import { expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { FleetService } from '../src/fleet';
@@ -13,7 +14,7 @@ function request(path: string) {
 }
 
 function tableSnapshot(sql: any) {
-  const names = sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+  const names = sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\' ORDER BY name")
     .toArray().map((row: any) => String(row.name));
   return names.map((name: string) => {
     const count = Number(sql.exec(`SELECT COUNT(*) AS n FROM "${name}"`).one().n);
@@ -68,7 +69,7 @@ it('returns every accounted reserved launch, including rows outside the latest-2
     service.init();
 
     const listedByAccountView = new Set(sql.exec('SELECT id FROM fleet_launches ORDER BY created_at DESC LIMIT 200').toArray().map((row: any) => row.id));
-    const beforeReads = tableSnapshot(sql);
+    const beforeReads = tableSnapshot(fixtureSql(hub));
     const pages: any[] = [];
     let cursor: string | null = null;
     do {

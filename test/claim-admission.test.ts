@@ -1,3 +1,5 @@
+import { fixtureSql, freshFixtureBudgetDay } from './helpers/fixture-budget';
+import { RowBudgetExceeded } from '../src/row-budget';
 import {freshCpu} from './cpu-fixture';
 import { describe, it, expect, vi } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
@@ -30,7 +32,7 @@ describe('scope coverage helpers', () => {
   });
 });
 
-async function fleetFixture(fn: (f: FleetService, sql: any, bus: BusService) => Promise<void>, stubOverride?: any) {
+async function fleetFixture(fn: (f: FleetService, sql: any, bus: BusService, hub:any) => Promise<void>, stubOverride?: any) {
   const bindings = env as unknown as Env;
   const stub = stubOverride ?? bindings.HUB.get(bindings.HUB.idFromName('claims-fleet-' + crypto.randomUUID()));
   await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
@@ -47,11 +49,11 @@ async function fleetFixture(fn: (f: FleetService, sql: any, bus: BusService) => 
     expect((await f.handle(req('/api/fleet/accounts', { accounts: [{ label: 'shared-codex', provider: 'codex', max_concurrency: 2, reserve_percent: 15, enabled: true }], routes: [{ machine_id: 'hetzner', engine: 'codex', account: 'shared-codex', profile: null }, { machine_id: 'win35', engine: 'codex', account: 'shared-codex', profile: null }] }, 'PUT'), admin)).status).toBe(200);
     credentials(sql, ['worker-1', 'worker-2']);
     f.admission.replacePolicy([{ workspace: 'demo', project: 'projA', require_claim: false }]);
-    await fn(f, sql, bus);
+    await fn(f, sql, bus, hub);
   });
 }
 
-async function routingFixture(fn: (r: RoutingService, f: FleetService, sql: any, bus: BusService) => Promise<void>) {
+async function routingFixture(fn: (r: RoutingService, f: FleetService, sql: any, bus: BusService, hub:any) => Promise<void>) {
   const bindings = env as unknown as Env;
   const stub = bindings.HUB.get(bindings.HUB.idFromName('claims-routing-' + crypto.randomUUID()));
   await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
@@ -71,7 +73,7 @@ async function routingFixture(fn: (r: RoutingService, f: FleetService, sql: any,
     sql.exec("INSERT INTO agents (tag, project, role, machine_id, registered_at) VALUES ('worker-1', 'projA', 'worker', 'hetzner', ?)", at());
     credentials(sql, ['client-a', 'worker-1']);
     f.admission.replacePolicy([{ workspace: 'tasks', project: 'tasks', require_claim: false }]);
-    await fn(r, f, sql, bus);
+    await fn(r, f, sql, bus, hub);
   });
 }
 
@@ -146,11 +148,12 @@ describe('fleet edit admission', () => {
     expect(sql.exec('SELECT COUNT(*) AS n FROM fleet_launches').one().n).toBe(1);
   }));
 
-  it('rolls back a failed reservation with zero capacity effects', () => fleetFixture(async (f, sql, bus) => {
+  it('rolls back a failed reservation with zero capacity effects', () => fleetFixture(async (f, sql, bus, hub) => {
     const claim = bus.claim(holder.caller, 'projA', 'src', 'worker-1', 3600000, now);
     sql.exec("CREATE TRIGGER fail_launch BEFORE INSERT ON fleet_launches BEGIN SELECT RAISE(ABORT, 'injected launch failure'); END");
     await expect(f.handle(req('/api/fleet/launches', intent({ access: { mode: 'edit', claim_id: claim.id, scopes: ['src/a.ts'] } })), holder)).rejects.toThrow();
-    sql.exec('DROP TRIGGER fail_launch');
+    fixtureSql(hub).exec('DROP TRIGGER fail_launch');
+    await freshFixtureBudgetDay(hub);
     expect(sql.exec('SELECT COUNT(*) AS n FROM fleet_launches').one().n).toBe(0);
     expect(f.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label = 'shared-codex'").one()).active).toBe(0);
   }));
@@ -406,13 +409,14 @@ describe('atomic editable routing placement', () => {
     expect(JSON.parse(launch.approved_action)).toEqual([{ prompt: input.prompt, approved_action: input.approved_action }]);
   }));
 
-  it('rolls back reservation, selection and link if the routing link write fails', () => routingFixture(async (r, f, sql, bus) => {
+  it('rolls back reservation, selection and link if the routing link write fails', () => routingFixture(async (r, f, sql, bus, hub) => {
     const claim = bus.claim({ kind: 'agent', actor: 'tasks:client-a' }, 'tasks', 'src', 'client-a', 3600000);
     const queued: any = await (await r.handle(req('/api/tasks', task({ needs: ['later'], access: editAccess(claim.id) })), routingClient())).json();
     sql.exec("UPDATE routing_machines SET needs_json = '[\"later\"]'");
     sql.exec("CREATE TRIGGER fail_link BEFORE UPDATE OF launch_id ON routing_jobs BEGIN SELECT RAISE(ABORT, 'injected link failure'); END");
-    await expect(r.dispatch()).rejects.toThrow('injected link failure');
-    sql.exec('DROP TRIGGER fail_link');
+    await expect(r.dispatch()).rejects.toThrow(RowBudgetExceeded);
+    fixtureSql(hub).exec('DROP TRIGGER fail_link');
+    await freshFixtureBudgetDay(hub);
     expect(sql.exec('SELECT COUNT(*) AS n FROM fleet_launches').one().n).toBe(0);
     const stored = sql.exec('SELECT * FROM routing_jobs WHERE id = ?', queued.id).one();
     expect(stored.launch_id).toBeNull(); expect(stored.selection_json).toBeNull();
@@ -736,11 +740,13 @@ describe('Argon F1-F4 real HTTP regressions', () => {
     await runInDurableObject(h.stub, async (hub: Hub) => {
       hub.sql.exec("CREATE TRIGGER reject_retirement BEFORE UPDATE OF state ON routing_jobs BEGIN SELECT RAISE(ABORT, 'retirement linkage failure'); END");
     });
-    await expect(h.start(job.launch_id)).rejects.toThrow('retirement linkage failure');
+    const failedStart=await h.start(job.launch_id);expect(failedStart.status).toBe(503);
+    expect(await failedStart.json()).toMatchObject({error:'do_daily_row_budget_exceeded'});
     await runInDurableObject(h.stub, async (hub: Hub) => {
-      expect(hub.sql.exec('SELECT state FROM fleet_launches WHERE id = ?', job.launch_id).one().state).toBe('offered');
-      expect(hub.sql.exec('SELECT state FROM routing_jobs WHERE id = ?', job.id).one().state).toBe('queued');
-      hub.sql.exec('DROP TRIGGER reject_retirement');
+      expect(fixtureSql(hub).exec('SELECT state FROM fleet_launches WHERE id = ?', job.launch_id).one().state).toBe('offered');
+      expect(fixtureSql(hub).exec('SELECT state FROM routing_jobs WHERE id = ?', job.id).one().state).toBe('queued');
+      fixtureSql(hub).exec('DROP TRIGGER reject_retirement');
+      await freshFixtureBudgetDay(hub);
     });
     expect((await h.start(job.launch_id)).status).toBe(409);
     const replay: any = await (await h.agentCall('/api/fleet/tasks', input)).json();

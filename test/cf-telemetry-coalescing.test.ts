@@ -230,17 +230,17 @@ describe('bounded offer and dashboard source windows',()=>{
   }));
 });
 
-it('bounds runtime choking history before host/reason filters and refuses unknown absence',()=>fixture(({r,raw,sql,meter,iso}:any)=>{
+it('seeks the deployed runtime-failure partial index independently of neutral retained history',()=>fixture(({r,raw,sql,meter,iso}:any)=>{
   raw.exec(`WITH RECURSIVE n(i) AS(SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<2100)
     INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,exit_reason,created_at,updated_at)
     SELECT 'runtime-noise-'||i,'test','human','test','runtime-noise-'||i,'{}','foreign','codex','acct','headless','/repo','test','failed','normal_exit',?,? FROM n`,iso(),iso());
   const first=meter.runSync('runtime-unknown',()=>r.cpuHeadroom('host'));
-  expect(first).toMatchObject({admitted:false,reason:'runtime_observation_limited',runtime_observation_limited:true});
-  expect(meter.snapshot()['runtime-unknown'].rows_read).toBeLessThan(700);
+  expect(first).toMatchObject({admitted:true,reason:null,runtime_observation_limited:false});
+  expect(meter.snapshot()['runtime-unknown'].rows_read).toBeLessThan(100);
   // Mutate through the same WriteWatch as the service: a raw write after a
   // measured read would intentionally bypass the memo generation fence.
   sql.exec("UPDATE fleet_launches SET state='failed',exit_reason='engine_runtime_timeout',updated_at=? WHERE id='launch'",new Date(Date.parse(iso())+1).toISOString());
   const second=meter.runSync('runtime-known',()=>r.cpuHeadroom('host'));
   expect(second).toMatchObject({admitted:false,reason:'host_runtime_choking',runtime_observation_limited:false});
-  expect(meter.snapshot()['runtime-known'].rows_read).toBeLessThan(700);
+  expect(meter.snapshot()['runtime-known'].rows_read).toBeLessThan(100);
 }));

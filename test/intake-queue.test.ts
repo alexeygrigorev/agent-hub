@@ -25,7 +25,7 @@ async function fixture(fn: (h:any)=>any) {
   });
 }
 function session(h:any, t:any, id:string, state:string, bound=false) {
-  h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,engine,mode,state,created_at,updated_at,machine_id,binding_json)
+  fixtureSql(h).exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,engine,mode,state,created_at,updated_at,machine_id,binding_json)
     VALUES(?,'hub:service:intake-watchdog',?,?,'codex','interactive',?,?,?,'queue-host',?)`,id,id,JSON.stringify({intake_task_id:t.id,workspace:'demo',with_goal:true}),state,new Date(NOW).toISOString(),new Date(NOW).toISOString(),bound?JSON.stringify({native_id:'native',tag:'native',workspace:'demo',native_created_at_ms:NOW-3600000}):null);
 }
 describe('autonomous intake queue',()=>{
@@ -61,20 +61,20 @@ describe('autonomous intake queue',()=>{
   }));
   it('rechecks project scope after awaited stall observation before stopping a worker',()=>fixture(async h=>{
     const t=task('changed-project');session(h,t,'project-worker','running',true);let commands=0;
-    h.sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace,created_at_ms,agent_state,progress_json) VALUES('queue-host','native','native','running',?,'demo',?,'idle',?)",new Date(NOW).toISOString(),NOW-3600000,JSON.stringify({last_progress_at:new Date(NOW-QUEUE_STALL_MS-1).toISOString()}));
-    h.sql.exec("INSERT OR REPLACE INTO fleet_catalog_seen(machine_id,observed_at) VALUES('queue-host',?)",new Date(NOW).toISOString());
+    fixtureSql(h).exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace,created_at_ms,agent_state,progress_json) VALUES('queue-host','native','native','running',?,'demo',?,'idle',?)",new Date(NOW).toISOString(),NOW-3600000,JSON.stringify({last_progress_at:new Date(NOW-QUEUE_STALL_MS-1).toISOString()}));
+    fixtureSql(h).exec("INSERT OR REPLACE INTO fleet_catalog_seen(machine_id,observed_at) VALUES('queue-host',?)",new Date(NOW).toISOString());
     const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{policy:()=>queuePolicyFrom({HUB_INTAKE_QUEUE_PROJECTS:'demo'}),observe:async()=>{t.project='backlog';return {status:200,body:{stalled:true,stall_reason:'no_native_progress'}}},command:async()=>{commands++;return {status:202,body:{}}}},()=>NOW);w.init();await w.tick();
     expect(commands).toBe(0);
   }));
   it('continues beyond three productive sessions by resetting the healthy episode',()=>fixture(async h=>{
     const t=task('healthy-episode');let now=NOW,starts=0,notes=0;
-    const fresh=()=>h.sql.exec("INSERT OR REPLACE INTO fleet_catalog_seen(machine_id,observed_at) VALUES('queue-host',?)",new Date(now).toISOString());
+    const fresh=()=>fixtureSql(h).exec("INSERT OR REPLACE INTO fleet_catalog_seen(machine_id,observed_at) VALUES('queue-host',?)",new Date(now).toISOString());
     const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{
       start:async()=>{
         const id='healthy-'+(++starts),native='healthy-native-'+starts;
         session(h,t,id,'running',true);
         h.sql.exec('UPDATE session_control_sessions SET created_at=?,binding_json=? WHERE id=?',new Date(now+starts).toISOString(),JSON.stringify({native_id:native,tag:'native',workspace:'demo',native_created_at_ms:NOW-3600000}),id);
-        h.sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace,created_at_ms,last_activity_at,agent_state) VALUES('queue-host',?,'native','running',?,'demo',?,?,'working')",native,new Date(now).toISOString(),NOW-3600000,new Date(now).toISOString());
+        fixtureSql(h).exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace,created_at_ms,last_activity_at,agent_state) VALUES('queue-host',?,'native','running',?,'demo',?,?,'working')",native,new Date(now).toISOString(),NOW-3600000,new Date(now).toISOString());
         fresh();return {status:202,body:{id,state:'running'}};
       },note:async()=>{notes++;return true}
     },()=>now);w.init();await w.tick();
@@ -98,7 +98,7 @@ describe('autonomous intake queue',()=>{
   it('caps total held intents across projects through indexed owned-session receipts',()=>fixture(async h=>{
     const tasks=['a','b','c'].map(id=>({...task('global-'+id),project:'project-'+id}));let starts=0;
     h.sql.exec('UPDATE machines SET capabilities=? WHERE id=?',JSON.stringify({workspaces:tasks.map(t=>t.project)}),'queue-host');
-    for(const t of tasks)h.sql.exec('INSERT INTO intake_tasks(id,data) VALUES(?,?)',t.id,JSON.stringify(t));
+    for(const t of tasks)fixtureSql(h).exec('INSERT INTO intake_tasks(id,data) VALUES(?,?)',t.id,JSON.stringify(t));
     const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>tasks} as any,(f:any)=>f(),{
       start:async input=>{const t=tasks.find(t=>t.id===input.intake_task_id)!;const id='global-session-'+(++starts);session(h,t,id,'held');return {status:202,body:{id,state:'held'}}}
     },()=>NOW);w.init();await w.tick();
@@ -168,9 +168,9 @@ describe('autonomous intake queue',()=>{
   }));
   it.each(['running','starting','offered','uncertain'])('never replaces a live bound %s worker until the stop has confirmed native exit',state=>fixture(async h=>{
     const t=task();session(h,t,'stalled',state,true);let now=NOW,starts=0,stops=0;
-    h.sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace,last_activity_at,created_at_ms) VALUES('queue-host','native','native','running',?,'demo',?,?)",new Date(now).toISOString(),new Date(now-QUEUE_STALL_MS-1).toISOString(),NOW-3600000);
+    fixtureSql(h).exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace,last_activity_at,created_at_ms) VALUES('queue-host','native','native','running',?,'demo',?,?)",new Date(now).toISOString(),new Date(now-QUEUE_STALL_MS-1).toISOString(),NOW-3600000);
     h.sql.exec("UPDATE fleet_sessions SET agent_state='idle',progress_json=?",JSON.stringify({last_progress_at:new Date(now-QUEUE_STALL_MS-1).toISOString()}));
-    const fresh=()=>h.sql.exec("INSERT OR REPLACE INTO fleet_catalog_seen(machine_id,observed_at) VALUES('queue-host',?)",new Date(now).toISOString());fresh();
+    const fresh=()=>fixtureSql(h).exec("INSERT OR REPLACE INTO fleet_catalog_seen(machine_id,observed_at) VALUES('queue-host',?)",new Date(now).toISOString());fresh();
     const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{observe:async()=>({status:200,body:{stalled:state==='running',stall_reason:'no_native_progress'}}),command:async(_id,action)=>{expect(action).toBe('stop');stops++;return {status:202,body:{}}},start:async()=>{starts++;return {status:202,body:{id:'replacement',state:'queued'}}}},()=>now);w.init();
     await w.tick();expect(stops).toBe(1);expect(starts).toBe(0);
     now+=WATCHDOG_INTERVAL;fresh();await w.tick();expect(starts).toBe(0);
@@ -179,8 +179,8 @@ describe('autonomous intake queue',()=>{
   }));
   it('shows a terminal failure but stops its live native process before replacement',()=>fixture(async h=>{
     const t=task();session(h,t,'terminal','running',true);let starts=0,stops=0;
-    h.sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace,created_at_ms,engine,progress_json) VALUES('queue-host','native','native','running',?,'demo',?,'codex',?)",new Date(NOW).toISOString(),NOW-3600000,JSON.stringify({headless:false,terminal_error:'codex_reconnect_failed',last_progress_at:new Date(NOW).toISOString()}));
-    h.sql.exec("INSERT INTO fleet_catalog_seen(machine_id,observed_at) VALUES('queue-host',?)",new Date(NOW).toISOString());
+    fixtureSql(h).exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace,created_at_ms,engine,progress_json) VALUES('queue-host','native','native','running',?,'demo',?,'codex',?)",new Date(NOW).toISOString(),NOW-3600000,JSON.stringify({headless:false,terminal_error:'codex_reconnect_failed',last_progress_at:new Date(NOW).toISOString()}));
+    fixtureSql(h).exec("INSERT INTO fleet_catalog_seen(machine_id,observed_at) VALUES('queue-host',?)",new Date(NOW).toISOString());
     const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{
       command:async(_id,action)=>{expect(action).toBe('stop');stops++;return {status:202,body:{}}},
       start:async()=>{starts++;return {status:202,body:{}}}
@@ -191,11 +191,11 @@ describe('autonomous intake queue',()=>{
   }));
   it.each(['waiting','human','working','failed-working','unsampled','bad-sample','host-healthy'])('does not stop a protected or unproven %s session',kind=>fixture(async h=>{
     const t=task();session(h,t,'protected','running',true);let commands=0,starts=0;
-    h.sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace,created_at_ms,engine,agent_state,progress_json) VALUES('queue-host','native','native','running',?,'demo',?,'codex',?,?)",new Date(NOW).toISOString(),NOW-3600000,kind.includes('working')?'working':'idle',kind==='unsampled'?null:JSON.stringify({last_progress_at:kind==='bad-sample'?'invalid':new Date(NOW-QUEUE_STALL_MS-1).toISOString()}));
-    h.sql.exec("INSERT INTO fleet_catalog_seen(machine_id,observed_at) VALUES('queue-host',?)",new Date(NOW).toISOString());
+    fixtureSql(h).exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace,created_at_ms,engine,agent_state,progress_json) VALUES('queue-host','native','native','running',?,'demo',?,'codex',?,?)",new Date(NOW).toISOString(),NOW-3600000,kind.includes('working')?'working':'idle',kind==='unsampled'?null:JSON.stringify({last_progress_at:kind==='bad-sample'?'invalid':new Date(NOW-QUEUE_STALL_MS-1).toISOString()}));
+    fixtureSql(h).exec("INSERT INTO fleet_catalog_seen(machine_id,observed_at) VALUES('queue-host',?)",new Date(NOW).toISOString());
     if(kind==='failed-working')h.sql.exec("UPDATE session_control_sessions SET state='failed'");
     if(kind==='human')h.sql.exec("UPDATE session_control_sessions SET actor='human:alexey'");
-    if(kind==='waiting')h.sql.exec("INSERT INTO session_control_wakes(id,session_id,actor,request_key,wake_at_ms,wake_at,prompt,state,intake_task_id,created_at,updated_at) VALUES('protected-wake','protected','owner','pause',?,?,'resume','pending',?,?,?)",NOW+3600000,new Date(NOW+3600000).toISOString(),t.id,new Date(NOW).toISOString(),new Date(NOW).toISOString());
+    if(kind==='waiting')fixtureSql(h).exec("INSERT INTO session_control_wakes(id,session_id,actor,request_key,wake_at_ms,wake_at,prompt,state,intake_task_id,created_at,updated_at) VALUES('protected-wake','protected','owner','pause',?,?,'resume','pending',?,?,?)",NOW+3600000,new Date(NOW+3600000).toISOString(),t.id,new Date(NOW).toISOString(),new Date(NOW).toISOString());
     const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{
       observe:async()=>({status:200,body:{stalled:kind!=='host-healthy',stall_reason:'no_native_progress'}}),
       command:async()=>{commands++;return {status:202,body:{}}},start:async()=>{starts++;return {status:202,body:{}}}
@@ -238,12 +238,12 @@ describe('autonomous intake queue',()=>{
   it('deduplicates escalation delivery and recovers when a new canonical worker is healthy',()=>fixture(async h=>{
     const t=task();let now=NOW,notes=0;const alerts:any[]=[];
     const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{note:async()=>{notes++;return true},notify:async(...a)=>{alerts.push(a)}},()=>now);w.init();
-    h.sql.exec("INSERT INTO intake_restart_queue(task_id,state,reason,session_id,attempts,next_at,updated_at) VALUES(?,'escalated','restart_retry_limit','old',3,?,?)",t.id,now,now);
+    fixtureSql(h).exec("INSERT INTO intake_restart_queue(task_id,state,reason,session_id,attempts,next_at,updated_at) VALUES(?,'escalated','restart_retry_limit','old',3,?,?)",t.id,now,now);
     await w.tick();now+=QUEUE_RETRY_MAX_MS;await w.tick();
     expect(notes).toBe(1);expect(alerts.filter(a=>a[0]==='intake_queue'&&a[2]!==null)).toHaveLength(1);
     session(h,t,'repaired','running',true);
-    h.sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace,created_at_ms,last_activity_at) VALUES('queue-host','native','native','running',?,'demo',?,?)",new Date(now).toISOString(),NOW-3600000,new Date(now).toISOString());
-    h.sql.exec("INSERT INTO fleet_catalog_seen(machine_id,observed_at) VALUES('queue-host',?)",new Date(now).toISOString());
+    fixtureSql(h).exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace,created_at_ms,last_activity_at) VALUES('queue-host','native','native','running',?,'demo',?,?)",new Date(now).toISOString(),NOW-3600000,new Date(now).toISOString());
+    fixtureSql(h).exec("INSERT INTO fleet_catalog_seen(machine_id,observed_at) VALUES('queue-host',?)",new Date(now).toISOString());
     now+=WATCHDOG_INTERVAL;await w.tick();expect(w.queue([t])[0]).toMatchObject({state:'running',attempts:0});
     expect(alerts.filter(a=>a[0]==='intake_queue'&&a[2]===null)).toHaveLength(1);
   }));
@@ -261,8 +261,8 @@ describe('autonomous intake queue',()=>{
   }));
   it('does not infer death from a failed canonical row while native worker is still live',()=>fixture(h=>{
     const t=task();session(h,t,'failed-but-bound','failed',true);
-    h.sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace) VALUES('queue-host','native','native','running',?,'demo')",new Date(NOW).toISOString());
-    h.sql.exec("INSERT INTO fleet_catalog_seen(machine_id,observed_at) VALUES('queue-host',?)",new Date(NOW).toISOString());
+    fixtureSql(h).exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace) VALUES('queue-host','native','native','running',?,'demo')",new Date(NOW).toISOString());
+    fixtureSql(h).exec("INSERT INTO fleet_catalog_seen(machine_id,observed_at) VALUES('queue-host',?)",new Date(NOW).toISOString());
     const w=new IntakeWatchdog(h.sql,h.intakeService,(f:any)=>f(),{},()=>NOW);w.init();expect(w.project([t])[0].ready).toBe(false);
   }));
   it('preserves queue movement timestamps on repeated polling and highlights stuck work',()=>fixture(async h=>{
@@ -306,7 +306,7 @@ describe('autonomous intake queue',()=>{
   it('paginates authorized queue reads with bounded ordinal cursors',()=>fixture(async h=>{
     h.intakeWatchdog.init();
     h.sql.exec('DELETE FROM intake_tasks');
-    for(let i=0;i<65;i++){const t=task('page-'+i);h.sql.exec('INSERT INTO intake_tasks(id,data) VALUES(?,?)',t.id,JSON.stringify(t));}
+    for(let i=0;i<65;i++){const t=task('page-'+i);fixtureSql(h).exec('INSERT INTO intake_tasks(id,data) VALUES(?,?)',t.id,JSON.stringify(t));}
     const auth=async()=>({caller:{isAdmin:true,actor:'queue-reader',kind:'human'},scopes:['admin']});
     const response=await h.intakeService.handle(new Request('https://hub.test/api/intake/queue'),auth);const first=await response.json();expect(response.status,JSON.stringify(first)).toBe(200);
     expect(first.items).toHaveLength(64);expect(first.next_cursor).toMatch(/^\d+$/);expect(first.queue_position_scope).toBe('authorized_page');
@@ -319,18 +319,18 @@ describe('autonomous intake queue',()=>{
     h.sql.exec('DELETE FROM intake_tasks');let now=NOW;
     const intake=h.intakeService;
     h.ctx.storage.transactionSync(()=>{
-      for(let i=0;i<764;i++){const t=task('budget-'+String(i).padStart(4,'0'));h.sql.exec('INSERT INTO intake_tasks(id,data) VALUES(?,?)',t.id,JSON.stringify(t));}
-      for(let i=0;i<5000;i++)h.sql.exec("INSERT INTO session_control_sessions(id,actor,request_key,request_json,engine,mode,state,machine_id,binding_json,created_at,updated_at) VALUES(?,'retained',?,?,'codex','headless','stopped','queue-host',?,?,?)",'retained-'+i,'retained-'+i,JSON.stringify({intake_task_id:i<2292?'budget-'+String(Math.floor(i/3)).padStart(4,'0'):'closed-'+i,brief:'retained history '.repeat(40)}),i<2000?JSON.stringify({native_id:'retained-native-'+i}):null,new Date(NOW).toISOString(),new Date(NOW).toISOString());
-      for(let i=0;i<2000;i++)h.sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace) VALUES('queue-host',?,?,'exited',?,'other')",'retained-native-'+i,'retained-'+i,new Date(NOW).toISOString());
-      for(let i=0;i<3000;i++)h.sql.exec("INSERT INTO claims(id,project,scope,holder,created_at,expires_at,work_key,claim_source) VALUES(?,'other','@work/task','owner',?,?,?,'native')",'retained-claim-'+i,NOW,NOW+3600000,'task:closed-'+i);
+      for(let i=0;i<764;i++){const t=task('budget-'+String(i).padStart(4,'0'));fixtureSql(h).exec('INSERT INTO intake_tasks(id,data) VALUES(?,?)',t.id,JSON.stringify(t));}
+      for(let i=0;i<5000;i++)fixtureSql(h).exec("INSERT INTO session_control_sessions(id,actor,request_key,request_json,engine,mode,state,machine_id,binding_json,created_at,updated_at) VALUES(?,'retained',?,?,'codex','headless','stopped','queue-host',?,?,?)",'retained-'+i,'retained-'+i,JSON.stringify({intake_task_id:i<2292?'budget-'+String(Math.floor(i/3)).padStart(4,'0'):'closed-'+i,brief:'retained history '.repeat(40)}),i<2000?JSON.stringify({native_id:'retained-native-'+i}):null,new Date(NOW).toISOString(),new Date(NOW).toISOString());
+      for(let i=0;i<2000;i++)fixtureSql(h).exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace) VALUES('queue-host',?,?,'exited',?,'other')",'retained-native-'+i,'retained-'+i,new Date(NOW).toISOString());
+      for(let i=0;i<3000;i++)fixtureSql(h).exec("INSERT INTO claims(id,project,scope,holder,created_at,expires_at,work_key,claim_source) VALUES(?,'other','@work/task','owner',?,?,?,'native')",'retained-claim-'+i,NOW,NOW+3600000,'task:closed-'+i);
     });
-    h.sql.exec("INSERT INTO fleet_catalog_seen(machine_id,observed_at) VALUES('queue-host',?)",new Date(NOW).toISOString());
+    fixtureSql(h).exec("INSERT INTO fleet_catalog_seen(machine_id,observed_at) VALUES('queue-host',?)",new Date(NOW).toISOString());
     const plan=h.sql.exec("EXPLAIN QUERY PLAN SELECT t.data FROM intake_task_projection p JOIN intake_tasks t ON t.id=p.id WHERE p.id>? AND json_extract(p.data,'$.status') IN ('open','in_progress','blocked','pending_approval') AND json_extract(p.data,'$.archived_at') IS NULL ORDER BY p.id LIMIT 64",'').toArray();
     expect(JSON.stringify(plan)).toContain('intake_watchdog_open');
     const w=new IntakeWatchdog(h.sql,intake,(f:any)=>f(),{notify:async()=>false},()=>now);w.init();
-    const measured=await w.tick();if(!('elapsed_ms' in measured))throw new Error('tick did not execute');
+    await advanceFixtureBudgetDay(h);await advanceFixtureBudgetDay(h);const measured=await w.tick();if(!('elapsed_ms' in measured))throw new Error('tick did not execute');
     expect(measured).toMatchObject({state:'checked',open_count:64,batch_limit:64,observed_sessions:192,observed_native:192,observation_limited:false});expect(measured.elapsed_ms).toBeLessThan(250);
-    for(let i=0;i<12;i++){now+=WATCHDOG_INTERVAL;await w.tick();}
+    for(let i=0;i<12;i++){now+=WATCHDOG_INTERVAL;await advanceFixtureBudgetDay(h);await w.tick();}
     expect(h.sql.exec('SELECT COUNT(DISTINCT task_id) AS n FROM intake_queue_movement').one().n).toBe(764);
     return measured;
   }).then((result:any)=>{console.log('QUEUE_BUDGET_TICK',JSON.stringify(result))}),30000);
@@ -338,8 +338,8 @@ describe('autonomous intake queue',()=>{
   it('rotating SQL sweep: 150 young open rows never hide 150 closable done-task rows (review of 0841a966)',()=>fixture(async h=>{
     let now=NOW;
     const insert=(id:string,status:string,heldSince:number)=>{
-      h.sql.exec('INSERT INTO intake_tasks(id,data) VALUES(?,?)',id,JSON.stringify({...task(id),status}));
-      h.sql.exec(`INSERT INTO intake_restart_queue(task_id,state,reason,held_since,next_at,updated_at)
+      fixtureSql(h).exec('INSERT INTO intake_tasks(id,data) VALUES(?,?)',id,JSON.stringify({...task(id),status}));
+      fixtureSql(h).exec(`INSERT INTO intake_restart_queue(task_id,state,reason,held_since,next_at,updated_at)
         VALUES(?,'queued','watchdog_global_capacity',?,?,?)`,id,heldSince,NOW,NOW);
     };
     for(let i=0;i<150;i++)insert('zz-young-'+String(i).padStart(3,'0'),'open',NOW);
@@ -351,7 +351,7 @@ describe('autonomous intake queue',()=>{
     // the young open rows (SQL-excluded, not TTL-due) were never mistaken for progress.
     const first=h.sql.exec("SELECT COUNT(*) AS n FROM intake_restart_queue WHERE task_id LIKE 'aa-done-%'").one().n;
     expect(first).toBeLessThanOrEqual(150-QUEUE_SWEEP_LIMIT);
-    for(let t=0;t<4;t++){now+=WATCHDOG_INTERVAL;await w.tick();}
+    for(let t=0;t<4;t++){now+=WATCHDOG_INTERVAL;await advanceFixtureBudgetDay(h);await w.tick();}
     expect(h.sql.exec("SELECT COUNT(*) AS n FROM intake_restart_queue WHERE task_id LIKE 'aa-done-%'").one().n).toBe(0);
     expect(h.sql.exec("SELECT COUNT(*) AS n FROM intake_restart_queue WHERE task_id LIKE 'zz-young-%'").one().n).toBe(150);
     expect(h.sql.exec("SELECT COUNT(*) AS n FROM intake_audit WHERE kind='restart_closed' AND reason LIKE '%closed (intake_done)%'").one().n).toBe(150);
@@ -359,8 +359,8 @@ describe('autonomous intake queue',()=>{
   it('bounded raw window: one closable row behind 130 non-actionable rows is reached (review F2 of 0841a966)',()=>fixture(async h=>{
     let now=NOW;
     const insert=(id:string,status:string)=>{
-      h.sql.exec('INSERT INTO intake_tasks(id,data) VALUES(?,?)',id,JSON.stringify({...task(id),status}));
-      h.sql.exec(`INSERT INTO intake_restart_queue(task_id,state,reason,held_since,next_at,updated_at)
+      fixtureSql(h).exec('INSERT INTO intake_tasks(id,data) VALUES(?,?)',id,JSON.stringify({...task(id),status}));
+      fixtureSql(h).exec(`INSERT INTO intake_restart_queue(task_id,state,reason,held_since,next_at,updated_at)
         VALUES(?,'queued','watchdog_global_capacity',?,?,?)`,id,NOW,NOW,NOW);
     };
     for(let i=0;i<130;i++)insert('aa-young-'+String(i).padStart(3,'0'),'open');
@@ -404,7 +404,7 @@ describe('queue priority and promotion (intake 68145244)',()=>{
   }));
   it('a promoted intake overrides a retry backoff and is the next started',()=>fixture(async h=>{
     const backoff=task('backoff'),promoted={...task('jump'),promoted_at:NOW-1};
-    for(const id of ['backoff','jump'])h.sql.exec(`INSERT INTO intake_restart_queue(task_id,state,reason,next_at,updated_at)
+    for(const id of ['backoff','jump'])fixtureSql(h).exec(`INSERT INTO intake_restart_queue(task_id,state,reason,next_at,updated_at)
       VALUES(?,'queued','watchdog_project_capacity',?,?)`,id,NOW+600000,NOW);
     const started:string[]=[];
     const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[backoff,promoted]} as any,(f:any)=>f(),{

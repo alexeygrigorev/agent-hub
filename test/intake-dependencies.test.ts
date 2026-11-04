@@ -245,13 +245,13 @@ it('reads dependency graphs in batches for list views (no per-task query)', asyn
 
 it('fails closed: an unreadable dependency graph refuses a start instead of allowing it', async () => {
   const original = await create();
-  await inDO(stub(), (h: any) => h.sql.exec('ALTER TABLE intake_dependencies RENAME TO intake_dependencies_hold'));
+  await inDO(stub(), (h: any) => fixtureSql(h).exec('ALTER TABLE intake_dependencies RENAME TO intake_dependencies_hold'));
   try {
     const refused = await api('/sessions', { key: 'fail-closed', workspace: 'demo', intake_task_id: original.id, brief: 'Go' });
     expect(refused.status, JSON.stringify(refused.data)).toBe(503);
     expect(refused.data.error).toBe('dependency_check_failed');
   } finally {
-    await inDO(stub(), (h: any) => h.sql.exec('ALTER TABLE intake_dependencies_hold RENAME TO intake_dependencies'));
+    await inDO(stub(), (h: any) => fixtureSql(h).exec('ALTER TABLE intake_dependencies_hold RENAME TO intake_dependencies'));
   }
 });
 

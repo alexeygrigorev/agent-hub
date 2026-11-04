@@ -1,3 +1,4 @@
+import { freshFixtureBudgetDay, fixtureSql } from './helpers/fixture-budget';
 import { expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { buildSessionInputs, initLifecycleRequestProjection } from '../src/session_lifecycle_registry';
@@ -5,7 +6,8 @@ import { buildSessionInputs, initLifecycleRequestProjection } from '../src/sessi
 const inDO: any = runInDurableObject;
 const fixture = (fn: (h: any) => void) => inDO((env as any).HUB.get((env as any).HUB.idFromName('projection-' + crypto.randomUUID())), fn);
 
-it('keeps projection and byte totals exact through writes, rollback and cold migration', async () => fixture(h => {
+it('keeps projection and byte totals exact through writes, rollback and cold migration', async () => fixture(async h => {
+  await freshFixtureBudgetDay(h);
   const task = { id: 'task', project: 'perf', status: 'open', title: 'Synthetic', version: 1, history: [
     {kind: 'intake', text: null, source: {reference: 'voice'}},
     {kind: 'note', text: 'Private retained note'},
@@ -55,10 +57,12 @@ it('keeps projection and byte totals exact through writes, rollback and cold mig
   expect(verify().counts.audit).toBe(2);
   // Simulate a pre-migration database. Only derived data is removed, from
   // this isolated disposable test DO; all canonical ledger rows survive.
-  h.sql.exec('DROP TABLE intake_task_projection');
-  h.sql.exec('DROP TABLE intake_storage_totals');
-  h.sql.exec('DROP TABLE intake_status_summary');
+  fixtureSql(h).exec('DROP TABLE intake_task_projection');
+  fixtureSql(h).exec('DROP TABLE intake_storage_totals');
+  fixtureSql(h).exec('DROP TABLE intake_status_summary');
+  await freshFixtureBudgetDay(h);
   h.intakeService.init();
+  expect(h.intakeService.advanceStatusSummary()).toBe(true);
   const migrated = verify();
   h.intakeService.init();
   expect(verify()).toEqual(migrated);

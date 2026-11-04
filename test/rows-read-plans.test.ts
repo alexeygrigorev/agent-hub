@@ -44,9 +44,9 @@ describe('hot-path query plans use indexes, never full scans', () => {
     expect(p).toMatch(/USING/i);
   }));
 
-  it('worker credential existence uses the session-family index', () => withHub(async hub => {
-    const p = plan(hub, 'SELECT 1 FROM worker_access w JOIN credentials c ON c.family_id = w.family_id WHERE w.session_id = ? AND c.revoked_at IS NULL LIMIT 1', 's');
-    expect(p).toContain('worker_access_session_family');
+  it('worker credential enumeration uses the deployed registry-actor index', () => withHub(async hub => {
+    const p = plan(hub, 'SELECT id,family_id,revoked_at,kind,machine_id FROM credentials INDEXED BY credentials_registry_actor WHERE registry_actor=? LIMIT ?', 'native:session',129);
+    expect(p).toContain('credentials_registry_actor');
   }));
 
   it('message expiry probes use the expiry index', () => withHub(async hub => {

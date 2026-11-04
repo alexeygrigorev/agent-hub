@@ -271,10 +271,13 @@ describe('M5 durable intent, scheduler reservations and uncertain dispatch', () 
         message: async () => { started(); await gate; return 'local'; },
         conversation: { evaluateBacklog: q => { evaluations++; return h.conversationsService.evaluateScheduledBacklog(q); }, sendFollowUp: intent => { sends++; return h.conversationsService.postScheduledFollowUp(intent); } },
       };
-      const first = h.checksService.runDue(deps); await entered;
-      const second = await h.checksService.runDue(deps); expect(second.map(r => r.name)).toEqual(['followup']);
-      h.checksService.replace([validate(definition)]);
-      release(); await first;
+      const clock=Date.now()+1000,checks=new ChecksService(h.sql,()=>clock);
+      fixtureSql(h).exec('UPDATE hub_checks SET next_due_at=?',new Date(clock-1).toISOString());
+      const first=checks.runDue(deps);await entered;
+      try {
+        const second=await checks.runDue(deps);expect(second.map(r=>r.name)).toEqual(['followup']);
+        checks.replace([validate(definition)]);
+      } finally {release();await first;}
       expect(evaluations).toBe(1); expect(sends).toBe(1);
       expect(h.sql.exec("SELECT * FROM hub_check_runs WHERE name='followup'").toArray()).toHaveLength(1);
     });

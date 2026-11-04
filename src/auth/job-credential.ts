@@ -40,3 +40,17 @@ export function jobCredentialAllowed(sql: JobAuthoritySql, credential: any, now 
   };
   return !!lease && lease.holder_job_id === job.id && lease.epoch === job.lease_epoch && (expiry(lease.expires_at) ?? 0) > now;
 }
+
+/** A terminal role token may only present its already-recorded finish receipt.
+ * This grants no generic job authority: the HTTP caller must additionally
+ * match POST /api/jobs/<subject>/finish, and finishJob rechecks configuration,
+ * generation, host binding, token/epoch and the exact receipt contents. */
+export function roleFinishReceiptAllowed(sql:JobAuthoritySql,credential:any,subject:string,now=Date.now()):boolean {
+  if(credential.kind!=='job'||credential.subject!==subject||credential.revoked_at!=null||!(Date.parse(credential.expires_at)>now))return false;
+  const job:any=sql.exec('SELECT * FROM jobs WHERE id=?',subject).toArray()[0];
+  if(!job?.role_name||!job.role_finish||!['succeeded','finished','failed','cancelled'].includes(job.status)
+    ||job.claim_token_hash!==credential.token_hash||!credential.machine_id
+    ||credential.machine_id!==(job.holder_machine_id||job.holder_host_id))return false;
+  const lease:any=sql.exec('SELECT epoch,holder_job_id FROM leases WHERE name=?',job.role_name).toArray()[0];
+  return !!lease&&lease.epoch===job.lease_epoch&&(lease.holder_job_id===null||lease.holder_job_id===job.id);
+}

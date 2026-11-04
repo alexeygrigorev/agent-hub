@@ -3168,10 +3168,11 @@ export class FleetService {
         // Adoption and late-link work is per changed native; the link pass over every
         // reported native reruns only when the intake linkage revision moved.
         let revision = '';
-        try { revision = String((this.sql.exec('SELECT revision FROM session_observation_intake_meta WHERE id=1').toArray()[0] as any)?.revision ?? ''); } catch { /* table not created yet */ }
+        if(this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='session_observation_intake_meta'").toArray().length)
+          revision=String((this.sql.exec('SELECT revision FROM session_observation_intake_meta WHERE id=1').toArray()[0] as any)?.revision ?? '');
         const revisionMoved = !revision || this.linkRevisions.get(caller.machineId!) !== revision;
         this.linkRevisions.set(caller.machineId!, revision);
-        adoptObservedNativeSessions(this.sql, caller.machineId!, linkChangedSessions, this.now(), undefined,
+        const observation=adoptObservedNativeSessions(this.sql, caller.machineId!, linkChangedSessions, this.now(), undefined,
           revisionMoved ? cleanSessions : linkChangedSessions);
         if (changedSessions.length || gone.length) this.maintenanceDirty = true;
         reconcileAccountCapacity(this.sql, this.now());
@@ -3181,7 +3182,7 @@ export class FleetService {
         // unchanged rows retain last-change timestamps; the complete census
         // has separate freshness evidence, coalesced to a durable checkpoint every fifteen minutes.
         if(persistCensus)this.sql.exec('INSERT INTO fleet_catalog_seen VALUES (?,?) ON CONFLICT(machine_id) DO UPDATE SET observed_at=excluded.observed_at WHERE fleet_catalog_seen.observed_at <= ?', caller.machineId!, new Date(this.now()).toISOString(), new Date(this.now() - 900000).toISOString());
-        return response({ status: 'reported', written });
+        return response({ status: 'reported', written, observation_deferred:observation.deferred });
       });
     }
     if (path === '/api/fleet/subscriptions' && request.method === 'PUT') {

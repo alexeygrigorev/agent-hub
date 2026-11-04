@@ -38,6 +38,12 @@ async function credential(actor: string, kind = 'agent', scopes = ['bus:send','b
   const token = 'hubt_'+crypto.randomUUID().replaceAll('-',''); const hash = await sha256(token);
   await rows(`INSERT INTO credentials (id,kind,token_hash,family_id,subject,actor,scopes,created_by_sub,created_at,expires_at,revoked_at,machine_id)
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`, token,kind,hash,token,actor,actor,JSON.stringify(scopes),'local-owner',new Date().toISOString(),extra.expires ?? new Date(Date.now()+3600000).toISOString(),extra.revoked ?? null,extra.machine ?? null);
+  if(kind==='job') {
+    const at=new Date().toISOString(),expires=new Date(Date.now()+3600000).toISOString();
+    await rows('UPDATE credentials SET machine_id=? WHERE id=?','fixture-job-host',token);
+    await rows("INSERT INTO jobs(id,kind,idempotency_key,payload,status,created_at,deadline_at,actor,holder_machine_id,claim_token_hash,lease_epoch) VALUES(?,'generic',?,'{}','running',?,?,'system','fixture-job-host',?,1)",actor,actor,at,expires,hash);
+    await rows("INSERT INTO leases(name,epoch,holder_job_id,holder_machine_id,expires_at) VALUES(?,1,?,'fixture-job-host',?)",'job:'+actor,actor,expires);
+  }
   return token;
 }
 async function register(project: string | null, tag: string, cookie: string, extra: any = {}) {

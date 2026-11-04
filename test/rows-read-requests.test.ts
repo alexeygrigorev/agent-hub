@@ -64,12 +64,12 @@ describe('session-command offers ignore command history', () => {
   it('reads only live commands, not the machine session history', () => withHub(async hub => {
     // 1,500 more finished sessions on the machine, each with an acked command, plus one live recorded command.
     for (let i = 1; i <= 1500; i++) {
-      hub.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at)
+      fixtureSql(hub).exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at)
         VALUES(?,'operator',?,'{}','budget-host','codex','interactive','stopped','{}',?,?)`, 's' + i, 'k' + i, iso(NOW - i * 1000), iso(NOW));
-      hub.sql.exec(`INSERT INTO session_control_commands(id,session_id,kind,actor,request_key,payload_json,state,generation,correlation,created_at,updated_at)
+      fixtureSql(hub).exec(`INSERT INTO session_control_commands(id,session_id,kind,actor,request_key,payload_json,state,generation,correlation,created_at,updated_at)
         VALUES(?,?,'send','operator','x','{}','acked',1,'c',?,?)`, 'sc' + i, 's' + i, iso(NOW - i * 1000), iso(NOW));
     }
-    hub.sql.exec(`INSERT INTO session_control_commands(id,session_id,kind,actor,request_key,payload_json,state,generation,correlation,created_at,updated_at)
+    fixtureSql(hub).exec(`INSERT INTO session_control_commands(id,session_id,kind,actor,request_key,payload_json,state,generation,correlation,created_at,updated_at)
       VALUES('live','sess-0','send','operator','live','{}','recorded',1,'c',?,?)`, iso(NOW), iso(NOW));
     const offers = read(hub, `SELECT c.* FROM session_control_commands c INDEXED BY session_control_commands_state CROSS JOIN session_control_sessions s ON s.id = c.session_id
       WHERE s.machine_id = ? AND c.state = 'recorded' AND (c.not_before IS NULL OR c.not_before <= ?) ORDER BY c.created_at, c.id LIMIT 20`, 'budget-host', iso(NOW));

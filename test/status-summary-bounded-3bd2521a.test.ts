@@ -93,6 +93,7 @@ it('status reads stay bounded to the capped selection and keep their output shap
   // never scan all intake_tasks bodies.
   queries.length = 0;
   for (let w = 0; w < 3; w++) {
+    await freshFixtureBudgetDay(h);
     const ev = await h.fetch(new Request('https://hub.test/api/intake/tasks/t0000/events', {
       method: 'POST',
       headers: { Cookie: cookie, 'x-csrf-token': csrf, 'Content-Type': 'application/json' },
@@ -110,6 +111,7 @@ it('status reads stay bounded to the capped selection and keep their output shap
   // multi-second projection (generous headroom keeps CI variance out).
   const times: number[] = [];
   for (let i = 0; i < 8; i++) {
+    await freshFixtureBudgetDay(h);
     const start = performance.now();
     const r = await h.fetch(new Request('https://hub.test/api/status', { method: 'POST', headers: { Cookie: cookie, 'x-csrf-token': csrf }, body: '{}' }));
     expect(r.status).toBe(200);
@@ -120,7 +122,8 @@ it('status reads stay bounded to the capped selection and keep their output shap
   expect(times[Math.floor(times.length / 2)]).toBeLessThan(2500);
 }));
 
-it('summary table tracks every write path, rebuilds after loss and survives rollback', async () => fixture(h => {
+it('summary table tracks every write path, rebuilds after loss and survives rollback', async () => fixture(async h => {
+  await freshFixtureBudgetDay(h);
   const put = (value: any) => h.sql.exec('INSERT INTO intake_tasks(id,data) VALUES (?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data', value.id, JSON.stringify(value));
   const rows = () => h.sql.exec('SELECT id,project,status,title,updated_at,created_at,archived_at,version FROM intake_status_summary ORDER BY id').toArray().map((r: any) => {
     const t: any = { id: r.id };
@@ -145,13 +148,16 @@ it('summary table tracks every write path, rebuilds after loss and survives roll
   expect(() => h.ctx.storage.transactionSync(() => { put({ id: 'c', project: 'p', status: 'open', title: 'C', version: 1, created_at: 1, updated_at: 2, history: [] }); throw new Error('rollback'); })).toThrow('rollback');
   expect(rows()).toEqual(before);
   // Loss of the derived table rebuilds it from the canonical ledger once.
-  h.sql.exec('DROP TABLE intake_status_summary');
+  fixtureSql(h).exec('DROP TABLE intake_status_summary');
   h.intakeService.init();
+  expect(h.intakeService.advanceStatusSummary()).toBe(true);
   expect(rows()).toEqual([...before]);
   h.intakeService.init();
   expect(rows()).toEqual([...before]);
-  // Counts equal, so no rescan; a real drift is repaired anyway.
+  // Explicit repair restarts the durable cursor; construction does no census.
   h.sql.exec(`DELETE FROM intake_status_summary WHERE id='a'`);
+  fixtureSql(h).exec('UPDATE intake_summary_migration SET after_id=NULL,phase=0 WHERE id=1');
   h.intakeService.init();
+  expect(h.intakeService.advanceStatusSummary()).toBe(true);
   expect(rows()).toEqual([...before]);
 }));

@@ -111,6 +111,8 @@ it('bounds status and host query work with retained production-scale history', a
     const times: number[] = [];
     const clientTimes: number[] = [];
     for (let i = 0; i < SAMPLES; i++) {
+      // Each independent latency sample has the unchanged strict daily guard.
+      await inDO(stub, (h:any) => freshFixtureBudgetDay(h));
       const start = performance.now();
       const response = await stub.fetch('https://hub.test' + path, { method, headers: host ? {Authorization: 'Bearer ' + token} : {Cookie: cookie, 'x-csrf-token': 'perf'}, ...(payload ? {body: JSON.stringify(payload)} : {}) });
       times.push(performance.now() - start);

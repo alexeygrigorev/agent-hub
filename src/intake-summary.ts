@@ -10,8 +10,10 @@ const trigger = (op: 'INSERT'|'UPDATE'|'DELETE') => op === 'DELETE'
   ? 'CREATE TRIGGER IF NOT EXISTS intake_status_summary_delete AFTER DELETE ON intake_tasks BEGIN DELETE FROM intake_status_summary WHERE id=OLD.id; END'
   : `CREATE TRIGGER IF NOT EXISTS intake_status_summary_${op.toLowerCase()} AFTER ${op} ON intake_tasks BEGIN INSERT INTO intake_status_summary(${columns}) VALUES(${values('NEW.')}) ON CONFLICT(id) DO UPDATE SET ${update}; END`;
 export function initIntakeSummary(sql: SqlStorage) {
+  const existed=sql.exec("SELECT name FROM pragma_table_list('intake_status_summary') WHERE schema='main' AND type='table'").toArray().length>0;
   sql.exec(`CREATE TABLE IF NOT EXISTS intake_status_summary (${columns.split(',').map((k,i)=>i===0?'id TEXT PRIMARY KEY':k).join(',')}) WITHOUT ROWID`);
   sql.exec('CREATE TABLE IF NOT EXISTS intake_summary_migration(id INTEGER PRIMARY KEY CHECK(id=1),after_id TEXT,phase INTEGER NOT NULL)');
+  if(!existed)sql.exec('DELETE FROM intake_summary_migration WHERE id=1');
   const receipt=sql.exec('SELECT phase FROM intake_summary_migration WHERE id=1').toArray()[0];
   if(!receipt && !sql.exec('SELECT id FROM intake_tasks ORDER BY id LIMIT 1').toArray().length &&
       !sql.exec('SELECT id FROM intake_status_summary ORDER BY id LIMIT 1').toArray().length) {
@@ -26,7 +28,7 @@ export function initIntakeSummary(sql: SqlStorage) {
     // no catalog index and does not make an unbounded metadata scan cheaper.
     const catalog=sql.exec('SELECT name,type,sql FROM sqlite_master LIMIT 4097').toArray() as {name:string;type:string;sql:string}[];
     if(catalog.length>4096)throw new Error('intake_summary_schema_observation_incomplete');
-    const proven=['INSERT','UPDATE','DELETE'].every(op=>catalog.some(row=>row.type==='trigger' &&
+    const proven=existed && ['INSERT','UPDATE','DELETE'].every(op=>catalog.some(row=>row.type==='trigger' &&
       row.name==='intake_status_summary_'+op.toLowerCase() && normalize(row.sql)===normalize(trigger(op as any).replace('IF NOT EXISTS ',''))));
     sql.exec('INSERT INTO intake_summary_migration VALUES(1,NULL,?)',proven?2:0);
   }

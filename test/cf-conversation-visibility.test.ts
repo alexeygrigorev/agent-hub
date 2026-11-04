@@ -36,3 +36,15 @@ describe('bounded retained conversation visibility',()=>{
   expect((svc as any).getRetainedVisibility('conv',12,0)).toEqual({oldestRetainedSeq:null,newestRetainedSeq:null,prunedThroughSeq:12,retainedCount:0,unreadCount:0});
  }));
 });
+
+it('bounds automation capacity checks at their enforced thresholds despite oversized retained fixtures',()=>fixture((raw,state)=>{
+ raw.exec(`WITH RECURSIVE n(i) AS(SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<10000)
+   INSERT INTO conversation_automation_receipts SELECT 'capacity-'||i,'{}','m-'||i,'legacy',0 FROM n`);
+ raw.exec(`WITH RECURSIVE n(i) AS(SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<2000)
+   INSERT INTO conversation_automation_grants SELECT 'capacity-'||i,'legacy','check-'||i,'human:reader',NULL,'reader',0,'body','always',NULL FROM n`);
+ const meter=new RowsMeter(),svc=new ConversationsService(meter.wrap(raw),fn=>state.storage.transactionSync(fn));
+ expect(meter.runSync('receipt-cap',()=>(svc as any).automationAtCapacity('conversation_automation_receipts',4096))).toBe(true);
+ expect(meter.snapshot()['receipt-cap'].rows_read).toBeLessThanOrEqual(4096);
+ expect(meter.runSync('grant-cap',()=>(svc as any).automationAtCapacity('conversation_automation_grants',1000))).toBe(true);
+ expect(meter.snapshot()['grant-cap'].rows_read).toBeLessThanOrEqual(1000);
+}));

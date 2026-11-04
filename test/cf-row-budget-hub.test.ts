@@ -9,6 +9,23 @@ const memoryLedger = () => {
 };
 
 describe('Hub daily cost circuit breaker integration', () => {
+  it('selects large prepayment for bounded bulk HTTP paths while scheduled queue work stays small', async () => {
+    const stub=(env as any).HUB.get((env as any).HUB.idFromName('cf-budget-bulk-routes-'+crypto.randomUUID()));
+    await (runInDurableObject as any)(stub,async(hub:any)=>{
+      const begin=vi.spyOn(hub.rowBudget,'begin');
+      for(const [method,path] of [['GET','/api/status'],['POST','/api/status'],['PUT','/api/fleet/sessions'],['POST','/api/fleet/resources/report'],['GET','/api/backup/status'],['GET','/api/backup/export'],['POST','/api/cron/retention'],['POST','/api/intake/tasks/task/events']]) {
+        begin.mockClear();
+        await hub.fetch(new Request('https://hub'+path,{method}));
+        expect(begin.mock.calls.some(call=>call[0]===true),path).toBe(true);
+      }
+      begin.mockClear();
+      await hub.scheduledTick(undefined,'scheduled');
+      expect(begin.mock.calls.some(call=>call[0]===true)).toBe(false);
+      expect(hub.rowBudget.status().limit_total).toBe(20000);
+      begin.mockRestore();
+    });
+  });
+
   it('stops alarm, cron RPCs and requests without SQL, KV scans or rearming', async () => {
     const stub = (env as any).HUB.get((env as any).HUB.idFromName('cf-budget-event-stop-' + crypto.randomUUID()));
     await (runInDurableObject as any)(stub, async (hub: any, state: any) => {

@@ -221,6 +221,7 @@ describe('session scheduled wakes', () => {
       }));
       // Isolate wake scheduling from default-job/command fixture deadlines.
       // The producer source remains intact; only this test's unrelated intents are removed.
+      fixtureStatements(sql).exec("UPDATE root_scheduling SET enabled=0");
       fixtureStatements(sql).exec("DELETE FROM hub_background_work WHERE kind!='session-wake'");
       await state.storage.deleteAlarm();
       const due = Date.now() + 300000;
@@ -389,11 +390,20 @@ describe('session scheduled wakes', () => {
         key:'wake-'+wake.wake_id.slice(0,32), body:'unrelated prompt',
       }), admin)).json();
       fixtureStatements(sql).exec('UPDATE session_control_wakes SET wake_at_ms=? WHERE id=?',Date.now()-1,wake.wake_id);
-      fixtureStatements(sql).exec(`CREATE TRIGGER reject_wake_delivery BEFORE UPDATE ON session_control_wakes
-        WHEN NEW.state='queued' BEGIN SELECT RAISE(ABORT,'fixture rollback'); END`);
-      expect(s.processDueWakes().delivered).toBe(0);
+      // Inject the component failure before SQL execution. A real unknown
+      // SQLite failure intentionally latches the financial guard and cannot
+      // model a recoverable enqueue fault followed by a successful retry.
+      const originalSql=(s as any).sql;
+      (s as any).sql=new Proxy(sql,{get(target,key){
+        if(key==='exec')return(query:string,...args:any[])=>{
+          if(/UPDATE\s+session_control_wakes\s+SET\s+state\s*=\s*'queued'/i.test(query))throw new Error('fixture rollback');
+          return target.exec(query,...args);
+        };
+        const value=target[key];return typeof value==='function'?value.bind(target):value;
+      }});
+      try {expect(s.processDueWakes().delivered).toBe(0);}
+      finally {(s as any).sql=originalSql;}
       expect(fixtureStatements(sql).exec('SELECT id FROM session_control_commands').toArray()).toHaveLength(1);
-      fixtureStatements(sql).exec('DROP TRIGGER reject_wake_delivery');
       expect(s.processDueWakes().delivered).toBe(0);
       const stored = fixtureStatements(sql).exec('SELECT command_id FROM session_control_wakes WHERE id=?',wake.wake_id).toArray()[0];
       expect(stored.command_id).not.toBe(unrelated.command_id);

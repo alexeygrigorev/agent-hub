@@ -42,7 +42,7 @@ async function countAll(name: string): Promise<Record<string, number>> {
   let out: Record<string, number> = {};
   await runInDurableObject(stub(name), async (hub: Hub) => {
     const rows = fixtureSql(hub).exec(
-      "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+      "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\' ORDER BY name"
     ).toArray() as any[];
     for (const r of rows) {
       const t = String((r as any).name);
@@ -121,7 +121,7 @@ describe('Hub DB backup export', () => {
     const body = await res.json() as any;
     const expected = await listTables(name);
     expect(body.tables).toEqual(expected);
-    expect(body.api_version).toBe(5);
+    expect(body.api_version).toBe(6);
     expect(Object.keys(body.row_counts).sort()).toEqual(expected);
     // WITHOUT ROWID tables are listed so the script pages them by offset.
     expect(body.without_rowid).toContain('token_hours_posted');

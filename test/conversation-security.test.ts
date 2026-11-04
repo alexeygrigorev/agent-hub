@@ -1274,10 +1274,10 @@ describe('Conversation Security Regressions (Cluster 3: F6 Bounded Storage & Ret
       expect(m2Replay.status).toBe(200);
       expect(((await m2Replay.json()) as any).replay).toBe(true);
 
-      // 4. Trigger inherited scheduledTick: prunes c2 (archived at t0), bot1 removal (at t0), and m1 (at t0),
+      // 4. Trigger explicit manual scheduledTick: prunes c2 (archived at t0), bot1 removal (at t0), and m1 (at t0),
       // while retaining m2 (created at t0+90s, cutoff is t0+30s).
       const tickRes = (await hub.scheduledTick(
-        new Date(currentMs).toISOString(),
+        new Date(currentMs).toISOString(),'manual',
       )) as any;
       expect(tickRes.status).toBe('ok');
       expect(tickRes.retention.conversationsDeleted).toBe(1);
@@ -1456,8 +1456,8 @@ describe('Conversation Security Regressions (Cluster 4: F7 Real Registry & F9 De
       (hub.jobsService as any).now = () => validTime;
       (baseHub.jobsService as any).now = () => validTime;
 
-      const validHubTick = await hub.scheduledTick();
-      const validBaseTick = await baseHub.scheduledTick();
+      const validHubTick = await hub.scheduledTick(undefined,'manual');
+      const validBaseTick = await baseHub.scheduledTick(undefined,'manual');
       expect(validHubTick.status).toBe('ok');
       expect(validBaseTick.status).toBe('ok');
 
@@ -1466,8 +1466,8 @@ describe('Conversation Security Regressions (Cluster 4: F7 Real Registry & F9 De
       (hub.jobsService as any).now = () => lateTime;
       (baseHub.jobsService as any).now = () => lateTime;
 
-      const lateHubTick = await hub.scheduledTick();
-      const lateBaseTick = await baseHub.scheduledTick();
+      const lateHubTick = await hub.scheduledTick(undefined,'manual');
+      const lateBaseTick = await baseHub.scheduledTick(undefined,'manual');
       expect(lateHubTick).toEqual({
         status: 'refused',
         reason: 'late_slot_refused',

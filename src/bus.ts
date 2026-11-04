@@ -303,11 +303,11 @@ export class BusService {
     if (!addr) return null;
     let rows: any[];
     if (addr.kind === 'tag') {
-      rows = this.sql.exec('SELECT tag, project, role, machine_id FROM agents WHERE tag = ?', addr.tag).toArray();
+      rows = this.sql.exec('SELECT tag, project, role, machine_id FROM agents WHERE tag = ? LIMIT 2', addr.tag).toArray();
     } else if (addr.kind === 'qualified' || addr.kind === 'agent' || addr.kind === 'session') {
       const project = addr.kind === 'qualified' ? addr.project : addr.kind;
       const tag = addr.kind === 'qualified' ? addr.tag : addr.kind === 'agent' ? addr.name : addr.sessionId;
-      rows = this.sql.exec('SELECT tag, project, role, machine_id FROM agents WHERE project = ? AND tag = ?', project, tag).toArray();
+      rows = this.sql.exec("SELECT tag, project, role, machine_id FROM agents WHERE COALESCE(project,'') = ? AND tag = ? LIMIT 2", project, tag).toArray();
     } else if (addr.kind === 'role') {
       if (isRootRole(addr.role)) return null;
       const projected = this.projectedAgents('role', addr.role, false);
@@ -362,7 +362,7 @@ export class BusService {
     if (isRootRoleAddress(a) || isRootRoleAddress(b)) return false;
     if (a === b) {
       const addr = parseAddress(a);
-      if (addr?.kind === 'tag') return this.sql.exec('SELECT 1 FROM agents WHERE tag = ?', addr.tag).toArray().length <= 1;
+      if (addr?.kind === 'tag') return this.sql.exec('SELECT 1 FROM agents WHERE tag = ? LIMIT 2', addr.tag).toArray().length <= 1;
       return addr !== null;
     }
     const x = this.resolveAgent(parseAddress(a));

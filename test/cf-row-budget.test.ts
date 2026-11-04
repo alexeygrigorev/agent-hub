@@ -316,11 +316,12 @@ describe('durable daily SQL row circuit breaker', () => {
     const store=new MemoryStore(),budget=new RowBudget(store,()=>0);
     await budget.begin(true);
     const original=budget.status().reserved_total;
+    const credit=budget.status().available_total;
     budget.wrap(nativeSql(0,0,5000) as any).exec('UPDATE bounded_constructor');
     budget.wrap(nativeSql(1,10000,0) as any).exec('SELECT bounded_constructor').toArray();
     expect(budget.status().stopped).toBe(false);
     expect(budget.status().reserved_total).toBe(original);
-    expect(budget.status().available_total).toBe(4000);
+    expect(budget.status().available_total).toBe(credit-15000);
     await budget.releaseUnused();
     const persisted=[...store.data.values()][0] as any;
     expect(persisted.read).toBe(10001);
@@ -330,15 +331,16 @@ describe('durable daily SQL row circuit breaker', () => {
     expect(restart.status().stopped).toBe(false);
   });
 
-  it('rebalances unused bootstrap credits in one refill write instead of denying a hot directional workload', async () => {
-    const store = new MemoryStore();
-    const budget = new RowBudget(store,()=>0);
+  it('keeps fungible bulk credit across a directional workload without another checkpoint', async () => {
+    const store=new MemoryStore(),budget=new RowBudget(store,()=>0);
     await budget.begin(true);
-    budget.wrap(nativeSql(0,0,2985) as any).exec('UPDATE bounded_bootstrap');
+    const credit=budget.status().available_total;
+    budget.wrap(nativeSql(0,0,5000) as any).exec('UPDATE bounded_bootstrap');
     await budget.begin();
-    expect(budget.status().available_total).toBe(4096);
-    expect(budget.status().reserved_total!).toBeLessThan(8000);
-    expect(store.writes).toBe(2);
+    await budget.begin(true);
+    expect(budget.status().available_total).toBe(credit-5000);
+    expect(budget.status().reserved_total!).toBeLessThan(20000);
+    expect(store.writes).toBe(1);
   });
 
   it('refuses corrupt persisted counters and clamps configured limits to free-plan safety ceilings', async () => {
@@ -352,6 +354,41 @@ describe('durable daily SQL row circuit breaker', () => {
 
 
 describe('native SQLite budget accounting', () => {
+  it('upgrades a bounded bulk event past4096 operations without cheap-event checkpoint churn or a higher daily cap', async () => {
+    const stub=(env as any).HUB.get((env as any).HUB.idFromName('cf-large-prepay-'+crypto.randomUUID()));
+    await (runInDurableObject as any)(stub,async(_hub:any,state:any)=>{
+      const raw=state.storage.sql;
+      raw.exec('CREATE TABLE cf_bulk_source(id INTEGER PRIMARY KEY)');
+      for(let i=0;i<500;i++)raw.exec('INSERT INTO cf_bulk_source VALUES(?)',i);
+      const store=new MemoryStore(),budget=new RowBudget(store,()=>0);
+      await budget.begin();
+      expect(budget.status().available_total).toBe(4096);
+      await budget.begin(true);
+      const sql=budget.wrap(raw);
+      let nativeReads=0;
+      for(let i=0;i<10;i++) {
+        const cursor=sql.exec('SELECT id FROM cf_bulk_source ORDER BY id LIMIT 500');
+        expect(cursor.toArray()).toHaveLength(500);nativeReads+=cursor.rowsRead;
+      }
+      expect(nativeReads).toBeGreaterThan(4096);
+      expect(budget.status().stopped).toBe(false);
+      const writes=store.writes;
+      for(let i=0;i<100;i++) {
+        await budget.begin(true);
+        expect(sql.exec('SELECT id FROM cf_bulk_source WHERE id=?',i).toArray()).toHaveLength(1);
+        await budget.finish();
+      }
+      expect(store.writes).toBe(writes);
+      expect(budget.status().reserved_total).toBeLessThan(20000);
+      expect(()=>{for(let i=0;i<40;i++)sql.exec('SELECT id FROM cf_bulk_source ORDER BY id LIMIT 500').toArray();}).toThrow(RowBudgetExceeded);
+      await budget.finish();
+      const persisted=[...store.data.values()][0] as any;
+      expect(persisted.read+persisted.written).toBeGreaterThanOrEqual(20000);
+      await expect(new RowBudget(store,()=>0).begin(true)).rejects.toThrow(RowBudgetExceeded);
+      expect(()=>sql.exec('SELECT 1')).toThrow(RowBudgetExceeded);
+    });
+  });
+
   it('preflights a small real index using the same combined pool after write credit is borrowed', async () => {
     const stub=(env as any).HUB.get((env as any).HUB.idFromName('cf-pooled-ddl-'+crypto.randomUUID()));
     await (runInDurableObject as any)(stub,async(_hub:any,state:any)=>{

@@ -232,6 +232,8 @@ describe('R2 independent-review counterexamples through SELF Worker and bound Hu
     await rows(`INSERT INTO jobs(id,kind,idempotency_key,payload,status,created_at,started_at,deadline_at,actor,holder_host_id,native_session,claim_token_hash)
       VALUES ('job-1','root-run','slot-1','{}','running',?,?,?,'system','m1','sess-1',?)`,new Date().toISOString(),new Date().toISOString(),new Date(Date.now()+600000).toISOString(),hash);
     await rows(`INSERT OR REPLACE INTO leases(name,epoch,holder_job_id,holder_host_id,holder_machine_id,acquired_at,expires_at) VALUES ('root',1,'job-1','m1','m1',?,?)`,new Date().toISOString(),new Date(Date.now()+600000).toISOString());
+    await rows("UPDATE credentials SET machine_id='m1' WHERE id=?",token);
+    await rows("UPDATE jobs SET lease_epoch=1,holder_machine_id='m1' WHERE id='job-1'");
     await rows(`INSERT INTO messages(id,from_actor,to_actor,kind,thread_id,body,idempotency_key,created_at,expires_at) VALUES ('root-parent','solo-worker','root','note','root-parent','local','parent-key',?,?)`,Date.now(),Date.now()+600000);
     expect((await rows("SELECT from_actor,to_actor FROM messages WHERE id='root-parent'"))[0]).toEqual({from_actor:'pA:solo-worker',to_actor:'root'});
     const action=(to:string,epoch=1)=>req('/api/root/actions','POST',{job_id:'job-1',epoch,session_id:'sess-1',action:{type:'bus_dispatch',name:'reply',idempotency_key:crypto.randomUUID(),payload:{to_actor:to,kind:'reply',body:'local reply',reply_to:'root-parent'}}},token);

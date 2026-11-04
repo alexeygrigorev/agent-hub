@@ -1,7 +1,7 @@
 import { invalidateCatalogObservations } from './catalog-freshness';
 import { initRootIncumbentProjection, advanceRootIncumbentProjection } from './root-incumbent';
 import { BackgroundWorkQueue } from './background-work';
-import { jobCredentialAllowed } from './auth/job-credential';
+import { jobCredentialAllowed, roleFinishReceiptAllowed } from './auth/job-credential';
 import { alertDestinations, inboxReaderStatus, invalidateReaderObservations, ALERT_SUBJECT_COOLDOWN_MS, BUS_REFRESH_GRACE_MS, pruneAlertRouting, suppressOpenAlertBackfill } from './alert-routing';
 import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES, RecipientError, ScopingRefusal, NAMED_AGENT_PROJECT, pollSessionCredentials, mintSessionCredential, checkSendScoping, sessionIdOf, sessionRefreshAllowed, messagingSettings, updateMessagingSettings, messageEvent, setMessageState, expireSessionMessages, expireMessageEvents, readdressMessage, setDelegate, listDelegates, authorizedNamedAgent, setNamedAgentForward } from './session-messaging';
 import { handleNamedAgentRequest } from './named-agents';
@@ -588,7 +588,7 @@ export class Hub extends DurableObject {
         setAlert: (kind, subject, problem) => this.livenessService.setAlert(kind, subject, problem),
         deliverAlert: alert => this.notifyAlert(alert),
       }),
-    }, Date.now, makeHeuristicDecider, this.env, undefined, () => this.observedCatalog.rows());
+    }, Date.now, makeHeuristicDecider, this.env);
     this.sessionAudit.init();
     this.livenessService.setPressureProjection(() => placementPressureSubjects(this.sql, Date.now()));
     this.checksService = new ChecksService(this.sql);
@@ -738,7 +738,7 @@ export class Hub extends DurableObject {
     },delayMs);
   }
 
-  protected async budgeted<T>(fn: () => Promise<T>, exhausted: T): Promise<T> {
+  protected async budgeted<T>(fn: () => Promise<T>, exhausted: T, bulk = false): Promise<T> {
     this.budgetActiveEvents++;
     this.budgetActivityEpoch++;
     this.cancelBudgetRefund();
@@ -748,7 +748,7 @@ export class Hub extends DurableObject {
         this.initializeServices(this.env);
         this.initializationComplete = true;
       }
-      await this.rowBudget.begin();
+      await this.rowBudget.begin(bulk);
       const result = await fn();
       if (this.budgetActiveEvents === 1 && !this.rowBudget.status().stopped) {
         await this.refreshBackgroundJobs();
@@ -953,10 +953,16 @@ export class Hub extends DurableObject {
   async fetch(request: Request): Promise<Response> {
     let scope = 'route:?';
     try { scope = 'route:' + normalizeRoute(request.method, new URL(request.url).pathname); } catch {}
+    const path=new URL(request.url).pathname,method=request.method;
+    const bulk=((path==='/api/status') && ['GET','POST'].includes(method)) ||
+      (path==='/api/fleet/sessions' && method==='PUT') ||
+      (path==='/api/fleet/resources/report' && method==='POST') ||
+      ['/api/backup/status','/api/backup/export'].includes(path) || path.startsWith('/api/cron/') ||
+      (method==='POST' && /^\/api\/intake\/tasks(?:\/[^/]+(?:\/events)?)?$/.test(path));
     return this.budgeted(async () => {
       try { return await this.meter.run(scope, () => this.routeFetch(request)); }
       finally { if (!this.rowBudget.status().stopped) this.maybeFlushRowsMeter(); }
-    }, Response.json({ error: 'do_daily_row_budget_exceeded' }, { status: 503, headers: { 'Retry-After': '3600' } }));
+    }, Response.json({ error: 'do_daily_row_budget_exceeded' }, { status: 503, headers: { 'Retry-After': '3600' } }), bulk);
   }
 
   private lastMeterFlush = 0;
@@ -2742,7 +2748,7 @@ export class Hub extends DurableObject {
     return this.budgeted(async () => {
       try { return await this.meter.run('rpc:runChecks', () => this.runChecksMetered(only)); }
       finally { if (!this.rowBudget.status().stopped) this.maybeFlushRowsMeter(); }
-    }, []);
+    }, [], true);
   }
 
   private async runChecksMetered(only?: string) {
@@ -2856,7 +2862,7 @@ export class Hub extends DurableObject {
     return this.budgeted<any>(async () => {
       try { return await this.meter.run('tick:' + source, () => this.scheduledTickMetered(slotOverride, source)); }
       finally { if (!this.rowBudget.status().stopped) this.maybeFlushRowsMeter(); }
-    }, { status: 'stopped', reason: 'do_daily_row_budget_exceeded' });
+    }, { status: 'stopped', reason: 'do_daily_row_budget_exceeded' }, source === 'manual');
   }
 
   private async scheduledTickMetered(slotOverride?: string, source = 'scheduled') {
@@ -2963,7 +2969,7 @@ export class Hub extends DurableObject {
   async sampleHostHistory() {
     return this.budgeted(async () => {
       try { this.hostHistoryService.sample(); } catch { console.warn('resource_history_sampling_failed'); }
-    }, undefined);
+    }, undefined, true);
   }
 
   /** Source changes and concrete future reset/expiry work drive the tick.
@@ -3254,7 +3260,9 @@ export class Hub extends DurableObject {
       return { error: Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'WWW-Authenticate': 'Bearer' } }) };
     }
 
-    if (!jobCredentialAllowed(this.sql, cred)) return { error: Response.json({ error: 'unauthorized' }, { status: 401 }) };
+    const roleFinishSubject=request.method==='POST'?/^\/api\/jobs\/([^/]+)\/finish$/.exec(new URL(request.url).pathname)?.[1]:undefined;
+    if (!jobCredentialAllowed(this.sql, cred) && !(roleFinishSubject && roleFinishReceiptAllowed(this.sql,cred,roleFinishSubject)))
+      return { error: Response.json({ error: 'unauthorized' }, { status: 401 }) };
 
     const expiresMs = Date.parse(cred.expires_at);
     if (!Number.isFinite(expiresMs) || expiresMs <= Date.now()) {

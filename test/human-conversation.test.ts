@@ -714,6 +714,13 @@ describe('Human CLI Conversation Integration (test/human-conversation.test.ts)',
         new Date(Date.now() + 3600_000).toISOString()
       );
 
+      // A real current job/lease proves kind separation after authentication;
+      // an orphan job credential would correctly fail the global fence at 401.
+      hub.sql.exec("UPDATE credentials SET machine_id='job-host' WHERE id='cred-job-1'");
+      hub.sql.exec(`INSERT INTO jobs(id,kind,idempotency_key,payload,status,created_at,deadline_at,actor,holder_machine_id,claim_token_hash,lease_epoch)
+        VALUES('job-uuid-1','generic','job-uuid-1','{}','running',?,?,'system','job-host',?,1)`,nowIso,new Date(Date.now()+3600000).toISOString(),jobHash);
+      hub.sql.exec("INSERT INTO leases(name,epoch,holder_job_id,holder_machine_id,expires_at) VALUES('job:job-uuid-1',1,'job-uuid-1','job-host',?)",new Date(Date.now()+3600000).toISOString());
+
       // Insert agent credential with human-looking actor string or admin claim
       const spoofAgentHash = await sha256('tok-spoof-agent');
       hub.sql.exec(

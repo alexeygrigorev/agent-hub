@@ -28,20 +28,25 @@ export function insertSessionObservation(sql: SqlStorage, machine: string, nativ
 }
 
 /** Tags are lookup aliases only. Filter ownership before testing ambiguity. */
-export function observedHubTagMatches(sql: SqlStorage, ref: string, owns: (row: any) => boolean): any[] {
+export function observedHubTagMatches(sql: SqlStorage, ref: string, owns: (row: any) => boolean): any[]&{observationLimited?:boolean} {
   if (!/^[a-f0-9][a-f0-9-]{7,35}$/i.test(ref)) return [];
-  return (sql.exec(`SELECT * FROM session_control_sessions
-    WHERE json_extract(request_json,'$.provenance')='observed_native'
-      AND json_extract(binding_json,'$.tag') LIKE ?`, 'hub-' + ref.toLowerCase() + '%').toArray() as any[])
-    .filter(row => {
-      const tag = JSON.parse(row.binding_json).tag;
-      return /^hub-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(tag) && owns(row);
-    });
+  const source=sql.exec('SELECT * FROM session_control_sessions ORDER BY id LIMIT 129').toArray() as any[];
+  if(source.length>128){const unknown:any[]&{observationLimited?:boolean}=[];unknown.observationLimited=true;return unknown;}
+  return source.filter(row=>{
+    let request:any,binding:any;try{request=JSON.parse(row.request_json);binding=JSON.parse(row.binding_json);}catch{return false;}
+    const tag=binding?.tag;
+    return request?.provenance==='observed_native'&&typeof tag==='string'&&tag.toLowerCase().startsWith('hub-'+ref.toLowerCase())
+      && /^hub-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(tag)&&owns(row);
+  });
 }
 
 /** Compact evidence projection, updated on task writes. Historical backfill is
  * keyset-paged and never copies full task bodies into the census handler. */
 export function observationIntakeRevision(sql: SqlStorage, machine: string): string {
+  const initialized=['session_observation_intake_schema','session_observation_intake_meta','session_observation_intakes']
+    .every(name=>sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name=?",name).toArray().length>0)
+    && Number((sql.exec('SELECT version FROM session_observation_intake_schema WHERE id=1').toArray()[0] as any)?.version)===2;
+  if(!initialized) {
   sql.exec(`CREATE TABLE IF NOT EXISTS session_observation_intake_meta
     (id INTEGER PRIMARY KEY CHECK(id=1), cursor TEXT NOT NULL, complete INTEGER NOT NULL, revision INTEGER NOT NULL)`);
   sql.exec("INSERT OR IGNORE INTO session_observation_intake_meta VALUES(1,'',0,0)");
@@ -81,38 +86,62 @@ export function observationIntakeRevision(sql: SqlStorage, machine: string): str
     DELETE FROM session_observation_intakes WHERE task_id=OLD.id;
     UPDATE session_observation_intake_meta SET revision=revision+1 WHERE id=1; END`);
   if (rebuildAplexerNotes) sql.exec('UPDATE session_observation_intake_schema SET version=2 WHERE id=1');
+  }
   let meta: any = sql.exec('SELECT * FROM session_observation_intake_meta WHERE id=1').toArray()[0];
   if (!meta.complete) {
-    const batch = sql.exec(`SELECT id,${events('data')} AS events FROM intake_tasks WHERE id>? ORDER BY id LIMIT 100`, meta.cursor).toArray();
+    // Read a raw task page before expanding history. json_each over100task
+    // histories made the formerly bounded-looking page expensive in SQL.
+    const source=sql.exec('SELECT id,data FROM intake_tasks WHERE id>? ORDER BY id LIMIT 16',meta.cursor).toArray() as any[];
+    const batch:any[]=[];
+    for(const task of source) {
+      let data:any;try{data=JSON.parse(task.data);}catch{return `${meta.revision}/0/history_unreadable`;}
+      const history=data?.history??[];
+      if(!Array.isArray(history)||history.length>128)return `${meta.revision}/0/history_limited`;
+      const events=history.filter((e:any)=>e&&typeof e==='object'&&!Array.isArray(e)&&(e.hub_session_id!=null||e.native_id!=null
+        ||e.kind==='note'&&(/^START/i.test(String(e.text??'').replace(/^ +/,''))||String(e.intake_key??'').startsWith('note-aplexer-'))))
+        .map((e:any)=>({hub_session_id:e.hub_session_id??null,native_id:e.native_id??null,host:e.host??null,kind:e.kind??null,intake_key:e.intake_key??null,text:e.kind==='note'?e.text??null:null}));
+      batch.push({id:task.id,events:JSON.stringify(events)});
+    }
     for (const task of batch) sql.exec(`INSERT INTO session_observation_intakes(task_id,events) VALUES(?,?)
       ON CONFLICT(task_id) DO UPDATE SET events=excluded.events`, task.id, task.events);
     sql.exec('UPDATE session_observation_intake_meta SET cursor=?,complete=?,revision=revision+1 WHERE id=1',
-      batch.length ? batch[batch.length-1].id : meta.cursor, batch.length < 100 ? 1 : 0);
+      batch.length ? batch[batch.length-1].id : meta.cursor, batch.length < 16 ? 1 : 0);
     meta = sql.exec('SELECT * FROM session_observation_intake_meta WHERE id=1').toArray()[0];
   }
   const hasWorktrees = sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='intake_worktrees'").toArray().length;
-  const trees: any = hasWorktrees ? sql.exec("SELECT count(*) AS n,max(updated_at) AS at FROM intake_worktrees WHERE machine=? AND state='active'",machine).toArray()[0] : {};
-  return `${meta.revision}/${meta.complete}/${trees.n ?? 0}/${trees.at ?? ''}`;
+  const trees=hasWorktrees?sql.exec(`SELECT task_id,path,state,updated_at FROM intake_worktrees INDEXED BY intake_worktrees_path
+    WHERE machine=? ORDER BY path,rowid LIMIT 129`,machine).toArray() as any[]:[];
+  const active=trees.filter(row=>row.state==='active');
+  return `${meta.revision}/${meta.complete}/${active.length}/${active.map(row=>String(row.updated_at)).sort().at(-1)??''}/${trees.length>128?'worktrees_limited':''}`;
 }
 
 /** Exact token matching remains in JS; SQL only prefilters compact evidence.
  * Ambiguity and incomplete backfill fail closed rather than choosing a task. */
-export function observedIntakeCandidates(sql: SqlStorage, machine: string, rows: any[]): Map<string, string> {
-  const links = new Map<string, string>();
+export function observedIntakeCandidates(sql: SqlStorage, machine: string, rows: any[]): Map<string, string>&{observationLimited?:boolean} {
+  const links:Map<string,string>&{observationLimited?:boolean}=new Map<string,string>();
   if (!rows.length) return links;
   const meta: any = sql.exec('SELECT complete FROM session_observation_intake_meta WHERE id=1').toArray()[0];
-  if (!meta?.complete) return links;
+  if (!meta?.complete) {links.observationLimited=true;return links;}
   const hasWorktrees = sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='intake_worktrees'").toArray().length;
+  // Observe the complete compact source once, before text matching. An
+  // incomplete set must never manufacture unique linkage from an old prefix.
+  const candidates=sql.exec('SELECT task_id,events FROM session_observation_intakes ORDER BY task_id LIMIT 129').toArray();
+  const trees=hasWorktrees?sql.exec(`SELECT task_id,path,state,updated_at FROM intake_worktrees INDEXED BY intake_worktrees_path
+    WHERE machine=? ORDER BY path,rowid LIMIT 129`,machine).toArray() as any[]:[];
+  if(candidates.length>128||trees.length>128){links.observationLimited=true;return links;}
+  const taskIds=new Set(candidates.map(row=>String(row.task_id)));
+  const parsedEvents=new Map<string,any[]>();
+  for(const task of candidates) {
+    let events:any;try{events=JSON.parse(String(task.events));}catch{links.observationLimited=true;return links;}
+    if(!Array.isArray(events)||events.length>128){links.observationLimited=true;return links;}
+    parsedEvents.set(String(task.task_id),events);
+  }
   for (const row of rows) {
     const binding = JSON.parse(row.binding_json);
     const ids = new Set([row.id, binding.native_id].filter(Boolean));
     const matches = new Set<string>();
-    const candidates = sql.exec(`SELECT task_id,events FROM session_observation_intakes
-      WHERE instr(events,?)>0 OR instr(events,?)>0 OR instr(events,?)>0 LIMIT 101`,
-      row.id, binding.native_id || row.id, binding.tag || row.id).toArray();
-    if (candidates.length > 100) continue;
     for (const task of candidates) {
-      const events = JSON.parse(String(task.events));
+      const events = parsedEvents.get(String(task.task_id))!;
       for (const event of events) {
         if (ids.has(event.hub_session_id) || (ids.has(event.native_id) && (!event.host || event.host === machine))) {
           matches.add(String(task.task_id)); break;
@@ -129,10 +158,7 @@ export function observedIntakeCandidates(sql: SqlStorage, machine: string, rows:
         }
       }
     }
-    if (hasWorktrees) for (const tree of sql.exec(`SELECT task_id FROM intake_worktrees w
-      WHERE machine=? AND path=? AND state='active' AND EXISTS(SELECT 1 FROM session_observation_intakes i WHERE i.task_id=w.task_id)`,machine,binding.workspace)) {
-      matches.add(String(tree.task_id));
-    }
+    for(const tree of trees)if(tree.state==='active'&&tree.path===binding.workspace&&taskIds.has(String(tree.task_id)))matches.add(String(tree.task_id));
     if (matches.size === 1) links.set(row.id,[...matches][0]);
   }
   return links;
