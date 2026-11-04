@@ -12,7 +12,7 @@ const fixture=(fn:(x:any)=>void)=>(runInDurableObject as any)((env as any).HUB.g
 function launch(seed:any,id:string,state:string,at:string,native:string|null=null){seed.exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,native_id,created_at,updated_at)
  VALUES(?,'fixture','agent','test',?,'{}','host','codex','account','headless','/repo','test',?,?,?,?)`,id,id,state,native,at,at);}
 function control(seed:any,id:string,state:string,at:string,native:string){seed.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at)
- VALUES(?,'fixture',?,'{}','host','codex','headless',?,?,?,?)`,id,id,state,JSON.stringify({native_id:native,workspace:'/repo'}),at,at);}
+ VALUES(?,'fixture',?,'{}','host','codex','headless',?,?,?,?)`,id,id,state,JSON.stringify({native_id:native,workspace:'/repo',tag:'active'}),at,at);}
 describe('shared bounded resource observations',()=>{
  it('batches disjoint phase ranges within Cloudflare compound limits without losing unknown phases or raw sentinels',()=>fixture(({h,r,seed,at,queries}:any)=>{
   for(let i=0;i<2100;i++){

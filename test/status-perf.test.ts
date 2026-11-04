@@ -382,6 +382,7 @@ it('bounds status and host query work with retained production-scale history', a
       console.log(JSON.stringify({evidence:'route_work_limit_exceeded',route,requests,work,
         limits:{calls:requests*maxCallsPerRequest,rows_read:requests*maxRowsPerRequest},statements}));
     }
+    console.log(JSON.stringify({evidence:'route_native_cost_cohort',route,requests,...work}));
     console.log(`route work ${route} requests=${requests} sql_calls=${work.calls} sql_calls_per_request=${(work.calls / requests).toFixed(1)} rows_read=${work.rows_read} rows_read_per_request=${(work.rows_read / requests).toFixed(1)}`);
   }
   for(const {route,requests,maxCallsPerRequest,maxRowsPerRequest,work} of routeResults) {
