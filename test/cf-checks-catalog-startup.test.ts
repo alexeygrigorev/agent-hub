@@ -40,7 +40,7 @@ describe('retained checks and catalog need no constructor history indexes',()=>{
  for(const source of ['checks','slots'])it('refuses101raw '+source+' before JSON, evaluator or slot/audit effects',()=>fixture(async({h,seed,now}:any)=>{
   const x=checksSetup(h,seed,now);x.service.init();
   if(source==='checks')for(let i=4;i<101;i++)x.check(i,'{');
-  else for(let i=4;i<101;i++)seed.exec("INSERT INTO hub_check_slots(name,slot_key,next_at,check_json,state,token,lease_until) VALUES(?,?,0,'{','done','fixture',0)",'noise-'+i,'noise-slot-'+i);
+  else for(let i=4;i<101;i++)seed.exec("INSERT INTO hub_check_slots(name,slot_key,next_at,check_json,state,token,lease_until) VALUES(?,?,0,'{}','done','fixture',0)",'noise-'+i,'noise-slot-'+i);
   await expect(h.meter.run('checks-overflow',()=>x.service.runDue(x.deps))).rejects.toThrow(ChecksObservationLimit);
   expect(x.evaluated).toEqual([]);expect(h.meter.snapshot()['checks-overflow'].rows_written).toBe(0);
   expect(h.meter.snapshot()['checks-overflow'].rows_read).toBeLessThan(220);
@@ -53,7 +53,7 @@ describe('retained checks and catalog need no constructor history indexes',()=>{
   const x=checksSetup(h,seed,now);seed.exec('UPDATE hub_checks SET next_due_at=?',new Date(now+86400000).toISOString());seed.exec("UPDATE hub_check_slots SET state='done'");
   for(let i=4;i<1004;i++){
    x.check(i,'{');seed.exec("UPDATE hub_checks SET enabled=0 WHERE name=?",'fixture-check-'+i);
-   seed.exec("INSERT INTO hub_check_slots(name,slot_key,next_at,check_json,state,token,lease_until) VALUES(?,?,0,'{','done','fixture',0)",'noise-'+i,'slot-'+i);
+   seed.exec("INSERT INTO hub_check_slots(name,slot_key,next_at,check_json,state,token,lease_until) VALUES(?,?,0,'{}','done','fixture',0)",'noise-'+i,'slot-'+i);
   }
   seed.exec('CREATE INDEX hub_checks_enabled_due ON hub_checks(enabled,next_due_at,name)');
   seed.exec("CREATE INDEX hub_check_slots_retry_due ON hub_check_slots(lease_until,name) WHERE state!='done'");
