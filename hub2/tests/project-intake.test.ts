@@ -113,6 +113,24 @@ test('old concurrent finish resuming after account release cannot overwrite a ne
  release();const result=await pending;assert.equal(result.status,200);assert.equal((await body(result)).duplicate,true);
  const after=f.sql.prepare('SELECT * FROM intakes WHERE id=?').get(own.id) as any;assert.equal(after.session_id,current.session_id);assert.equal(after.status,'queued');assert.equal(after.final_evidence_json,null);
 });
+test('late AccountDO admission cannot authorize a completed attempt after the intake is retried',async()=>{
+ const f=fixture(),own=await intake(f,'admission-race'),start={key:'first-admission-race',workspace:'/tmp/synthetic-admission-race',engine:'shell',machine_id:'h1',override_reason:'Synthetic semantic test'};
+ await f.call('/api/intakes/'+own.id+'/start','POST',start);
+ const first=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any,project=f.project as any;
+ project.db.run("UPDATE dispatch_sagas SET state='admitted',account_id=? WHERE operation_id=?",'synthetic-account',first.operation_id);
+ let entered!:()=>void,release!:()=>void;const admissionStarted=new Promise<void>(resolve=>entered=resolve),accountGate=new Promise<void>(resolve=>release=resolve);
+ const env=project.env;env.ACCOUNTS={idFromName:(id:string)=>id,get:()=>({fetch:async()=>{entered();await accountGate;return Response.json({reservation:{operation_id:first.attempt_operation_id,session_id:first.session_id,machine_id:first.machine_id,epoch:first.epoch,state:'running'}});}})};
+ const admission=f.call('/_internal/admission','POST',{operation_id:first.attempt_operation_id,session_id:first.session_id,machine_id:first.machine_id,epoch:first.epoch});await admissionStarted;
+ project.releaseAccount=async()=>true;
+ const native='66666666-6666-4666-8666-666666666666',failedProof={source:'aplexer_status',containment_empty:true,native_identity:{id:native,tag:'task-hub2-'+first.session_id,workspace:start.workspace},native_exit:{code:0}};
+ assert.equal((await f.call('/_internal/finish','POST',{operation_id:first.operation_id,attempt_operation_id:first.attempt_operation_id,session_id:first.session_id,machine_id:first.machine_id,epoch:first.epoch,native_id:native,exit_code:0,native_exit_confirmed:true,launch_failed:true,evidence:failedProof})).status,200);
+ assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',{...start,key:'retry-after-admission-race'})).status,201);
+ const retried=f.sql.prepare('SELECT * FROM intakes WHERE id=?').get(own.id) as any,newSaga=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE session_id=?').get(retried.session_id) as any;
+ assert.notEqual(retried.session_id,first.session_id);assert.equal(retried.status,'queued');assert.notEqual(newSaga.operation_id,first.operation_id);
+ release();const stale=await admission;assert.equal(stale.status,409);const staleBody=await body(stale);assert.equal(staleBody.error,'stale_or_unoffered_admission');
+ const after=f.sql.prepare('SELECT * FROM intakes WHERE id=?').get(own.id) as any,oldSaga=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE operation_id=?').get(first.operation_id) as any;
+ assert.equal(after.session_id,retried.session_id);assert.equal(after.status,'queued');assert.equal(oldSaga.state,'complete');assert.equal(staleBody.launch_allowed,undefined);
+});
 test('qualified admitted launch failure binds actual native exit without fabricating started or a nonzero exit',async()=>{
  const f=fixture(),own=await intake(f,'launch-failed'),start={key:'failed-launch',workspace:'/tmp/synthetic-abort',engine:'shell',machine_id:'h1',override_reason:'Synthetic semantic test'};
  await f.call('/api/intakes/'+own.id+'/start','POST',start);

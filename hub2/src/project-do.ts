@@ -636,13 +636,35 @@ export class ProjectDO {
       });
       if (!response.ok && await this.pauseForBudget(response) !== undefined) return response;
       if (!response.ok) return error('account_admission_refused', response.status === 503 ? 503 : 409);
-      const result = await response.json() as { reservation?: { state?: string; epoch?: number; machine_id?: string } };
+      const result = await response.json() as { reservation?: { operation_id?: string; session_id?: string; state?: string; epoch?: number; machine_id?: string } };
       if (result.reservation?.state !== 'running' || result.reservation.epoch !== saga.epoch
-        || (result.reservation.machine_id && result.reservation.machine_id !== saga.machine_id)) return error('account_admission_unverified', 503);
+        || result.reservation.operation_id !== saga.attempt_operation_id
+        || result.reservation.session_id !== saga.session_id
+        || result.reservation.machine_id !== saga.machine_id) return error('account_admission_unverified', 503);
     }
     const now = Date.now();
-    if (saga.state !== 'running') this.db.run("UPDATE dispatch_sagas SET state='admitted', next_action_at=NULL, updated_at=? WHERE operation_id=? AND state IN ('offered','claimed','admitted') AND attempt_operation_id=? AND epoch=?",
-      now, saga.operation_id, saga.attempt_operation_id, saga.epoch);
+    // Account admission is an awaited cross-DO call. The saga or intake can be
+    // completed/retried while it is pending, so the earlier snapshot is not a
+    // launch permit. Re-read both bindings and transition atomically after the
+    // await; a stale AccountDO success must never authorize an old attempt.
+    const stillCurrent = this.transaction(() => {
+      const current = this.sagaByAttempt(saga.attempt_operation_id);
+      if (!current || current.operation_id !== saga.operation_id || current.session_id !== saga.session_id
+        || current.machine_id !== saga.machine_id || current.epoch !== saga.epoch
+        || !['offered', 'claimed', 'admitted', 'running'].includes(current.state)) return false;
+      const intake = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?', current.intake_id);
+      if (!intake || intake.session_id !== current.session_id || intake.assigned_machine_id !== current.machine_id) return false;
+      if (current.state === 'running') return intake.status === 'running';
+      if (!['offered', 'claimed', 'admitted'].includes(current.state) || intake.status !== 'queued') return false;
+      if (current.state !== 'admitted') this.db.run("UPDATE dispatch_sagas SET state='admitted', next_action_at=NULL, updated_at=? WHERE operation_id=? AND state=? AND attempt_operation_id=? AND epoch=?",
+        now, current.operation_id, current.state, current.attempt_operation_id, current.epoch);
+      const admitted = this.sagaByAttempt(saga.attempt_operation_id);
+      const queued = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?', current.intake_id);
+      return admitted?.operation_id === saga.operation_id && admitted.state === 'admitted'
+        && admitted.session_id === saga.session_id && admitted.machine_id === saga.machine_id && admitted.epoch === saga.epoch
+        && queued?.session_id === saga.session_id && queued.assigned_machine_id === saga.machine_id && queued.status === 'queued';
+    });
+    if (!stillCurrent) return error('stale_or_unoffered_admission', 409);
     return json({ launch_allowed: true, epoch: saga.epoch, engine: launch.engine, model: launch.model ?? null, observed_at: now });
   }
 
