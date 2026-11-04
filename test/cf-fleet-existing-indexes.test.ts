@@ -42,6 +42,97 @@ describe('Fleet recovery and paging use deployed indexes',()=>{
     expect(m.queries.some(q=>q.includes('ORDER BY rowid LIMIT 26'))).toBe(true);
   }));
 
+  it('batches reconciliation identity probes without reusing stale freshness or phase verdicts',()=>fixture(async(hub,raw)=>{
+    const seed=fixtureSql(hub),stale=new Date(NOW-180001).toISOString();
+    for(let i=0;i<2100;i++) {
+      launch(seed,'batch-history-'+i,'stopped');
+      seed.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,workspace)
+        VALUES('host',?,?,'codex','exited',?,'/repo')`,'history-native-'+i,'history-'+i,AT);
+    }
+    for(const state of ['starting','running','uncertain','failed'])for(let i=0;i<25;i++) {
+      const id=state+'-'+i;
+      launch(seed,id,state,state==='failed'?SILENT_START_REASON:null);
+      if(state!=='failed') {
+        seed.exec('UPDATE fleet_launches SET native_id=? WHERE id=?','native-'+id,id);
+        seed.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,workspace)
+          VALUES('host',?, ?,?,'running',?,'/repo')`,'native-'+id,id,state==='uncertain'?'other':'codex',state==='running'?stale:AT);
+      }
+    }
+    await hub.rowBudget.begin(true);const day=hub.rowBudget.status().day;
+    let clock=NOW;
+    const m=measured(hub.sql),fleet=new FleetService(m.sql as any,(fn:any)=>fn(),()=>clock,hub.writes);
+    const read=(fresh:boolean)=>{m.reset();const result=(fleet as any).reconciliationCandidatesUncached('host',fresh);
+      expect(m.queries.length).toBeLessThanOrEqual(7);expect(m.rows()).toBeLessThan(650);return result;};
+    expect(read(false)).toHaveLength(75);
+    // A complete fresh census supplies positive proof for the previously
+    // stale native rows; engine mismatch and missing native remain visible.
+    expect(read(true)).toHaveLength(50);
+    seed.exec("UPDATE fleet_sessions SET phase='exited' WHERE native_id='native-starting-0'");
+    expect(read(true).some((row:any)=>row.id==='starting-0')).toBe(true);
+    expect(m.queries.some(q=>q.includes('CROSS JOIN fleet_sessions n'))).toBe(true);
+    clock=NOW+180001;
+    // Time alone retires positive freshness. Raw facts remain generation
+    // cached; no native SQL runs to recompute the changed verdict.
+    expect(read(false)).toHaveLength(100);
+    expect(m.queries.some(q=>q.includes('CROSS JOIN fleet_sessions n'))).toBe(false);
+    expect(m.rows()).toBe(0);
+    expect(hub.rowBudget.status()).toMatchObject({day,limit_total:20000,stopped:false});
+  }));
+
+  it('shares only policy source rows inside a synchronous maintenance scope and invalidates writes and rollback',()=>fixture(async(hub,raw)=>{
+    const seed=fixtureSql(hub);seed.exec("INSERT INTO fleet_claim_policy VALUES('/snapshot','project',0)");
+    await hub.rowBudget.begin(true);const day=hub.rowBudget.status().day;
+    const m=measured(hub.sql),fleet=new FleetService(m.sql as any,(fn:any)=>hub.ctx.storage.transactionSync(fn),()=>NOW,hub.writes);
+    m.reset();fleet.withMaintenance(()=>{
+      const first=fleet.admission.policy('/snapshot');first.require_claim=true;first.project='forged';
+      expect(fleet.admission.policy('/snapshot')).toEqual({project:'project',require_claim:false});
+      for(let i=0;i<100;i++)expect(fleet.admission.policy('/snapshot').require_claim).toBe(false);
+      expect(m.queries).toHaveLength(1);
+      seed.exec("UPDATE fleet_claim_policy SET require_claim=1 WHERE workspace='/snapshot'");
+      expect(fleet.admission.policy('/snapshot').require_claim).toBe(true);
+      expect(m.queries).toHaveLength(2);
+      expect(()=>hub.ctx.storage.transactionSync(()=>{
+        seed.exec("UPDATE fleet_claim_policy SET require_claim=0 WHERE workspace='/snapshot'");
+        expect(fleet.admission.policy('/snapshot').require_claim).toBe(false);
+        throw new Error('fixture rollback');
+      })).toThrow('fixture rollback');
+      expect(fleet.admission.policy('/snapshot').require_claim).toBe(true);
+    });
+    m.reset();expect(fleet.admission.policy('/snapshot').require_claim).toBe(true);
+    expect(m.queries).toHaveLength(1); // no cache survives finally
+    // A standalone store without an exact write generation never reuses a
+    // source row, even inside the same synchronous operation.
+    const plain=new FleetService(m.sql as any,(fn:any)=>fn(),()=>NOW);
+    m.reset();plain.withMaintenance(()=>{plain.admission.policy('/snapshot');plain.admission.policy('/snapshot');});
+    expect(m.queries).toHaveLength(2);
+    expect(hub.rowBudget.status()).toMatchObject({day,limit_total:20000,stopped:false});
+  }));
+
+  it('hydrates account reservations in one bounded PK cohort and refuses incomplete CLI account families',()=>fixture(async(hub,raw)=>{
+    const seed=fixtureSql(hub);
+    seed.exec("INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at,capabilities) VALUES('host','host','host',?,?,?)",AT,AT,JSON.stringify({engines:['codex']}));
+    seed.exec("INSERT INTO fleet_accounts VALUES('account','codex',100,15,1)");
+    seed.exec("INSERT INTO fleet_routes VALUES('host','codex','account',NULL)");
+    for(let i=0;i<80;i++)launch(seed,'batch-reservation-'+i,'offered');
+    for(let i=0;i<2100;i++)launch(seed,'batch-reservation-history-'+i,'stopped');
+    await hub.rowBudget.begin(true);const day=hub.rowBudget.status().day;
+    const m=measured(hub.sql),fleet=new FleetService(m.sql as any,(fn:any)=>fn(),()=>NOW);
+    (fleet as any).reconcileCapacity=()=>{};
+    m.reset();const result=fleet.accountStatus({label:'account',provider:'codex',max_concurrency:100,reserve_percent:15,enabled:1});
+    expect(result).toMatchObject({active:80,reserved:80,capacity_observation_limited:false});
+    expect(m.queries.filter(q=>q.includes('CROSS JOIN fleet_launches l ON l.id=requested.value'))).toHaveLength(1);
+    expect(m.queries.some(q=>q.includes('WHERE l.id=?'))).toBe(false);
+    expect(m.rows()).toBeLessThan(1000);
+    // Even unrelated provider routes count against the raw observation cap;
+    // they cannot be filtered away to manufacture unique-account proof.
+    for(let i=0;i<129;i++)seed.exec('INSERT INTO fleet_routes VALUES(?,?,?,NULL)','host','engine-'+i,'missing-'+i);
+    m.reset();expect(fleet.observationProvenance({label:'account',provider:'codex'},{machine_id:'host',profile:null})).toBeNull();
+    expect(m.rows()).toBeLessThan(150);
+    expect(m.queries.some(q=>q.includes('COUNT(DISTINCT'))).toBe(false);
+    expect(m.queries.some(q=>q.includes('FROM host_quota_snapshots'))).toBe(false);
+    expect(hub.rowBudget.status()).toMatchObject({day,limit_total:20000,stopped:false});
+  }));
+
   it('reserved pages seek account/state/rowid before filtering old reservations',()=>fixture(async(_hub,raw)=>{
     const old=new Date(NOW-86400000).toISOString();
     for(let i=0;i<1000;i++)launch(raw,'stale-'+i,'offered',null,old);

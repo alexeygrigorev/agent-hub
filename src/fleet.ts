@@ -75,7 +75,7 @@ type Auth = { caller?: AdmissionCaller; scopes?: string[]; error?: Response };
  * minute per host; counting them as writes made every offers poll re-run planning (intake e8a22f4c). */
 const QUIET_FLEET_WRITES = /^\/api\/(?:fleet\/(?:sessions|subscriptions|probe)$|fleet\/resources(?:\/|$)|(?:fleet\/)?routing\/(?:capabilities|host-release|host-goal)(?:\/|$))/;
 export function marksMaintenanceDirty(method: string, path: string): boolean {
-  return method !== 'GET' && !QUIET_FLEET_WRITES.test(path);
+  return method !== 'GET' && !QUIET_FLEET_WRITES.test(path) && !/^\/api\/fleet\/launches\/[a-f0-9-]{36}\/claim$/.test(path);
 }
 
 /** Longest an idle offers poll may reuse the previous capacity maintenance pass (intake e8a22f4c). */
@@ -612,7 +612,20 @@ export class FleetService {
   withMaintenance<T>(fn: () => T, queueLimit=2): T {
     if (this.maintenance) return fn();
     this.maintenance = { reconciled: false, drained: false, queueLimit };
-    try { return fn(); } finally { this.maintenance = null; }
+    try { return this.admission.withPolicySnapshot(fn); } finally { this.maintenance = null; }
+  }
+
+  /** A replay with no SQL effects cannot invalidate otherwise settled
+   * Offers maintenance. Source generations also cover refusal and credential
+   * rejection writes; no permission or capacity verdict is cached here. */
+  private claimTransaction<T>(claim:boolean,fn:()=>T):T {
+    if(!claim)return this.transaction(fn);
+    const tables=['fleet_launches','session_control_sessions','fleet_memory_holds','resource_ramps',
+      'engine_credentials','engine_credential_rejections','fleet_engine_health'];
+    const stamp=this.writes?.stamp(...tables);
+    try{return this.transaction(fn);}finally{
+      if(stamp!==undefined && stamp!==this.writes!.stamp(...tables))this.maintenanceDirty=true;
+    }
   }
 
   reconcileCapacity() {
@@ -704,7 +717,7 @@ export class FleetService {
     };
     this.resources = new ResourceManagement(sql, now, writes, observed);
     this.routing = new RoutingService(sql, this, now, this.transaction);
-    this.admission = new ClaimAdmission(sql, this.transaction, now);
+    this.admission = new ClaimAdmission(sql, this.transaction, now, writes);
   }
   init() {
     this.resources.init();
@@ -804,8 +817,19 @@ export class FleetService {
     }
     // A default CLI reading cannot describe a named profile or two accounts on one service.
     if (route.profile !== null && route.profile !== provider) return null;
-    const count = snapshot ? (snapshot.familyAccounts.get(capacityFamilyKey(route.machine_id, provider))?.size ?? 0)
-      : Number(this.sql.exec('SELECT COUNT(DISTINCT r.account) AS n FROM fleet_routes r JOIN fleet_accounts a ON r.account = a.label WHERE r.machine_id = ? AND (a.provider = ? OR a.provider = ?)', route.machine_id, provider, legacyRouteKeyFor(provider) ?? provider).one().n);
+    let count:number;
+    if(snapshot)count=snapshot.familyAccounts.get(capacityFamilyKey(route.machine_id,provider))?.size??0;
+    else {
+      // A machine can have many routes for unrelated providers. Bound its
+      // raw primary-key prefix before family filtering or account hydration;
+      // a truncated cohort cannot establish the unique-account CLI proof.
+      const routes=this.sql.exec('SELECT account FROM fleet_routes WHERE machine_id=? LIMIT 129',route.machine_id).toArray() as any[];
+      if(routes.length>128)return null;
+      const accounts=[...new Set(routes.map(r=>String(r.account)))];
+      const family=accounts.length?this.sql.exec(`SELECT a.label,a.provider FROM json_each(?) requested
+        CROSS JOIN fleet_accounts a ON a.label=requested.value`,JSON.stringify(accounts)).toArray() as any[]:[];
+      count=family.filter(a=>a.provider===provider || a.provider===(legacyRouteKeyFor(provider)??provider)).length;
+    }
     const hostSnapshot: any = this.sql.exec('SELECT * FROM host_quota_snapshots WHERE host_id = ?', route.machine_id).toArray()[0];
     if (count !== 1 || !hostSnapshot || !fresh(hostSnapshot.captured_at, now, 1200000)) return null;
     const quota = snapshotRouteForAccount(account.label, provider, parsed(hostSnapshot.routes_json));
@@ -839,6 +863,8 @@ export class FleetService {
     return value;
   }
 
+  private reconciliationNativeFacts=new Map<string,{stamp:string;rows:any[]}>();
+
   private reconciliationCandidatesUncached(machine: string, catalogFresh: boolean) {
     // Intake 0b87eb29: a claim Hub abandoned on the silent-start bound has no
     // exit proof. Keep offering it to its owning host for a bounded window so
@@ -870,15 +896,36 @@ export class FleetService {
       }
     }
     this.reconciliationPages.set(machine,{pending,cursors});
-    return raw.filter(row => {
-      if (row.native_id === null) return true;
-      return !this.sql.exec(`SELECT 1 FROM fleet_sessions WHERE machine_id=? AND native_id=? AND engine=?
-        AND phase IN ('starting','running') AND (observed_at>=? OR ?) LIMIT 1`,machine,row.native_id,row.engine,cutoff,catalogFresh ? 1 : 0).toArray().length;
-    }).sort((a,b)=>String(a.updated_at).localeCompare(String(b.updated_at))).slice(0,100).map(row => {
-      const control = controlStore ? this.sql.exec('SELECT binding_json FROM session_control_sessions WHERE fleet_launch_id=? AND machine_id=? LIMIT 1',row.id,machine).toArray()[0] as any : null;
-      return { id: row.id,workspace: row.workspace,cwd: parsed(row.request_json).cwd ?? null,diagnostic: parsed(row.launch_error_json),
-        native_id: row.native_id,engine: row.engine,mode: row.mode,launcher_task_id: row.launcher_task_id,binding: control ? parsed(control.binding_json) : null };
-    });
+    // Cache raw PK facts only. A moving clock must change the verdict, not
+    // force unchanged native history to be read again on every host poll.
+    const identities=JSON.stringify(raw.filter(row=>row.native_id!==null).map(row=>({id:String(row.id),native_id:row.native_id})));
+    const key=JSON.stringify([machine,identities]);
+    const stamp=this.writes?.stamp('fleet_sessions');
+    const hit=stamp!==undefined?this.reconciliationNativeFacts.get(key):undefined;
+    const facts=hit && hit.stamp===stamp ? hit.rows : raw.some(row=>row.native_id!==null)?this.sql.exec(`
+      SELECT json_extract(requested.value,'$.id') AS id,n.engine,n.phase,n.observed_at
+      FROM json_each(?) requested CROSS JOIN fleet_sessions n
+        ON n.machine_id=? AND n.native_id=json_extract(requested.value,'$.native_id')`,identities,machine).toArray() as any[]:[];
+    if(stamp!==undefined && (!hit || hit.stamp!==stamp)) {
+      if(this.reconciliationNativeFacts.size>=16)this.reconciliationNativeFacts.clear();
+      this.reconciliationNativeFacts.set(key,{stamp,rows:facts});
+    }
+    const byId=new Map(facts.map(row=>[String(row.id),row]));
+    const observed=new Set(raw.filter(row=>{
+      const native=byId.get(String(row.id));
+      return native && native.engine===row.engine && ['starting','running'].includes(native.phase)
+        && (catalogFresh || native.observed_at>=cutoff);
+    }).map(row=>String(row.id)));
+    const selected=raw.filter(row=>!observed.has(String(row.id)))
+      .sort((a,b)=>String(a.updated_at).localeCompare(String(b.updated_at))).slice(0,100);
+    const bindings = controlStore && selected.length ? new Map(this.sql.exec(`SELECT requested.value AS id,
+      (SELECT binding_json FROM session_control_sessions INDEXED BY session_control_fleet_lookup
+        WHERE fleet_launch_id=requested.value AND machine_id=? LIMIT 1) AS binding_json
+      FROM json_each(?) requested`,machine,JSON.stringify(selected.map(row=>String(row.id)))).toArray()
+      .map((row:any)=>[String(row.id),row.binding_json] as const)) : new Map<string,any>();
+    return selected.map(row => ({id:row.id,workspace:row.workspace,cwd:parsed(row.request_json).cwd??null,
+      diagnostic:parsed(row.launch_error_json),native_id:row.native_id,engine:row.engine,mode:row.mode,
+      launcher_task_id:row.launcher_task_id,binding:bindings.get(String(row.id))==null?null:parsed(bindings.get(String(row.id)))}));
   }
 
   /** Live Hub sessions per canonical account (intake 93e7817b): one row per
@@ -1028,9 +1075,10 @@ export class FleetService {
     const nativeJoin = !snapshot && !capacityLimited && rawReservations.length ? reservationNativeJoinSql(this.sql) : '';
     const reservations = snapshot ? snapshot.launches.filter(l => l.account === account.label &&
       l.state !== 'queued' && l.updated_at > reservationCutoff)
-      : capacityLimited ? [] : rawReservations.filter(l => liveIds.has(String(l.machine_id)) && l.updated_at > reservationCutoff)
-        .flatMap(l => this.sql.exec(`SELECT l.id,l.account,l.state,l.native_id,l.machine_id,l.updated_at,s.phase,s.last_activity_at,s.account AS native_account
-          FROM fleet_launches l ${nativeJoin} WHERE l.id=?`,l.id).toArray() as any[]);
+      : capacityLimited || !rawReservations.length ? [] : this.sql.exec(`
+          SELECT l.id,l.account,l.state,l.native_id,l.machine_id,l.updated_at,s.phase,s.last_activity_at,s.account AS native_account
+          FROM json_each(?) requested CROSS JOIN fleet_launches l ON l.id=requested.value ${nativeJoin}`,
+          JSON.stringify(rawReservations.filter(l => liveIds.has(String(l.machine_id)) && l.updated_at > reservationCutoff).map(l=>String(l.id)))).toArray() as any[];
     const hasInFlight = reservations.some(r => !r.native_id && (r.state === 'starting' || r.state === 'uncertain'));
     const natives: any[] = snapshot ? snapshot.natives.filter(n => n.account === account.label)
       : capacityLimited ? [] : rawNatives.filter(n => liveIds.has(String(n.machine_id)));
@@ -2914,13 +2962,15 @@ export class FleetService {
           // Offer metadata needs host failure evidence, not a hypothetical
           // admission estimate for each launch. Claim admission remains live.
           const choking = valid.length ? this.resources.resourceChoking(caller.machineId!) : null;
+          const cpuStarts=this.resources.cpuStarts(valid.map(row=>String(row.id)));
+          const resourceConfig=valid.length?this.resources.configFor(caller.machineId!):null;
           return valid.map(row => {
             const request = parsed(row.request_json);
             const link = hubLinks.get(String(row.id));
             return { ...(scopedWorkers.has(String(row.id)) || link?.driver ? { worker_credential_required: true } : {}),
               // AC1 lock identity (additive; unknown keys are ignored by hosts).
               ...(link ? { hub_session_id: link.hub_session_id, ...(link.intake_task_id ? { intake_task_id: link.intake_task_id } : {}) } : {}),
-              ...this.resources.cpuStart(String(row.id)), resource_choking: choking, resource_management: this.resources.configFor(caller.machineId!),
+              ...cpuStarts.get(String(row.id)), resource_choking: choking, resource_management: resourceConfig,
               memory_estimate_mb: this.resources.estimate(request.project || String(row.workspace), String(row.engine), request.task_kind || 'goal'),
               selection: parsed(row.model_selection_json) ?? {}, id: row.id, engine: row.engine, account: row.account, profile: row.profile,
               mode: row.mode, workspace: row.workspace, cwd: request.cwd ?? null, prompt: row.prompt,
@@ -3317,12 +3367,18 @@ export class FleetService {
       if (!data || typeof data !== 'object' || Array.isArray(data)) return response({ error: 'invalid_launch_result' }, 400);
       const runtime = data.runtime === undefined ? undefined : sanitizeExitEvidence(data.runtime);
       if (data?.runtime !== undefined && (!runtime || !['failed', 'exited'].includes(data.state) || data.confirmed_exit !== true)) return response({ error: 'invalid_exit_evidence' }, 400);
-      return this.transaction(() => {
+      return this.claimTransaction(match[2]==='claim',() => {
         const row: any = this.sql.exec('SELECT * FROM fleet_launches WHERE id = ? AND machine_id = ?', match[1], caller.machineId!).toArray()[0];
         if (!row) return response({ error: 'not_found' }, 404);
+        // Unwatched standalone stores cannot prove which nested service wrote.
+        // Keep their conservative active-attempt behavior, never terminal replays.
+        if(match[2]==='claim' && !this.writes && ['offered','starting'].includes(row.state))this.maintenanceDirty=true;
         // An authentication failure of a Hub-held credential on this host
         // excludes this (machine, account) until a newer generation exists (I5).
-        if (row.account && (data.reason === 'engine_auth_expired' || data.reason === 'credential_rejected')) recordCredentialRejection(this.sql, row.machine_id, row.account, data.reason, this.now());
+        if (row.account && (data.reason === 'engine_auth_expired' || data.reason === 'credential_rejected')) {
+          recordCredentialRejection(this.sql, row.machine_id, row.account, data.reason, this.now());
+          if(!this.writes)this.maintenanceDirty=true;
+        }
         if (match[2] === 'reject') {
           if (!object(data, ['reason', 'diagnostic', 'host_load_factor', 'claim_key']) || (data.reason !== 'dispatch_refused' && !Object.hasOwn(DISPATCH_MESSAGES, data.reason))) return response({ error: 'invalid_rejection' }, 400);
           const claimRefusal = data.claim_key !== undefined;

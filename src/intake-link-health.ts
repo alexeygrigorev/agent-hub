@@ -1,4 +1,8 @@
 import type {SqlStorage} from '@cloudflare/workers-types';
+type HealthWatch={stamp(...tables:string[]):string;trackAll(tables:Iterable<string>):void};
+type HealthResult={ready:boolean;complete:boolean};
+const healthMemo=new WeakMap<object,{watch:HealthWatch;stamp:string;result:HealthResult}>();
+const HEALTH_TABLES=['intake_task_projection','intake_link_health','intake_link_health_meta'];
 const MAX_LINK_BYTES=2*1024*1024;
 const invalid=(value:string)=>`CASE WHEN json_valid(${value}) THEN CASE WHEN json_type(${value})='array'
  AND json_array_length(${value})<=128 AND length(CAST(${value} AS BLOB))<=${MAX_LINK_BYTES} THEN 0 ELSE 1 END ELSE 1 END`;
@@ -25,7 +29,14 @@ export function initIntakeLinkHealth(sql:SqlStorage,registerTriggers=false):void
 }
 /** One bounded request page. Concurrent/source writes maintain their own exact
  * health entry, including inserts lexically before the durable cursor. */
-export function intakeLinkHealth(sql:SqlStorage,advance=true):{ready:boolean;complete:boolean} {
+export function intakeLinkHealth(sql:SqlStorage,advance=true,watch?:HealthWatch):HealthResult {
+ // A trusted watcher is registered only for this exact SQL handle; other
+ // handles keep their ordinary SQL path. No incomplete page is memoized.
+ const previous=healthMemo.get(sql as object),owner=watch??previous?.watch;
+ if(owner) {
+  owner.trackAll(HEALTH_TABLES);
+  if(previous?.watch===owner&&previous.stamp===owner.stamp(...HEALTH_TABLES)&&previous.result.complete)return {...previous.result};
+ }
  if(!sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='intake_task_projection'").toArray().length)return {ready:false,complete:false};
  initIntakeLinkHealth(sql);
  const meta:any=sql.exec('SELECT after_id,complete FROM intake_link_health_meta WHERE id=1').toArray()[0];
@@ -45,5 +56,9 @@ export function intakeLinkHealth(sql:SqlStorage,advance=true):{ready:boolean;com
  // Keep the source in memo dependencies even for component wrappers that
  // did not observe trigger creation. The unused zero-row CTE reads no source.
  const bad=sql.exec('WITH health_source AS (SELECT id FROM intake_task_projection LIMIT 0) SELECT id FROM intake_link_health ORDER BY id LIMIT 1').toArray().length>0;
- return {ready:complete&&!bad,complete};
+ const result={ready:complete&&!bad,complete};
+ // Incomplete pages must continue advancing on later explicit requests.
+ // Complete-invalid proofs remain authoritative until an exact source write.
+ if(owner&&complete)healthMemo.set(sql as object,{watch:owner,stamp:owner.stamp(...HEALTH_TABLES),result:{...result}});
+ return result;
 }

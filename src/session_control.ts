@@ -1197,7 +1197,10 @@ export class SessionControlService {
     } catch { awaiting = []; }
     for (const storedWake of awaiting) {
       try {
-        const wake=this.upgradeWakeNativeReceipt(storedWake.id);
+        // A selected delivery without a command has no legacy native
+        // receipt to repair. Re-reading its PK cannot add authority; the
+        // existing timeout path below still handles it conservatively.
+        const wake=storedWake.command_id?this.upgradeWakeNativeReceipt(storedWake.id):storedWake;
         if(!wake||wake.state!=='delivered')continue;
         const cmd: any = wake.command_id
           ? this.sql.exec('SELECT * FROM session_control_commands WHERE id = ?', wake.command_id).toArray()[0]

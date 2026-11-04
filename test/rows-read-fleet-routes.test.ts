@@ -252,9 +252,11 @@ it('only writes that can change capacity or the queue mark fleet maintenance dir
   for (const [m, p] of [['PUT', '/api/fleet/sessions'], ['PUT', '/api/fleet/subscriptions'], ['POST', '/api/fleet/probe'],
     ['POST', '/api/fleet/resources/report'], ['PUT', '/api/routing/capabilities'], ['PUT', '/api/fleet/routing/capabilities'],
     ['POST', '/api/routing/host-release/report'], ['PUT', '/api/routing/host-goal/h0']]) expect(dirty(m, p), `${m} ${p}`).toBe(false);
-  // Reads never dirty; placement, claims, results and task submission do.
+  // Claims defer invalidation until a source actually mutates; terminal
+  // replay requests are as quiet as reads. Other explicit mutations dirty.
+  expect(dirty('POST', `/api/fleet/launches/${uuid(1, 1)}/claim`)).toBe(false);
   expect(dirty('GET', '/api/fleet/offers')).toBe(false);
-  for (const [m, p] of [['POST', '/api/fleet/launches'], ['POST', `/api/fleet/launches/${uuid(1, 1)}/claim`], ['POST', `/api/fleet/launches/${uuid(1, 1)}/result`],
+  for (const [m, p] of [['POST', '/api/fleet/launches'], ['POST', `/api/fleet/launches/${uuid(1, 1)}/result`],
     ['POST', '/api/fleet/tasks'], ['POST', '/api/fleet/tasks/abc/result'], ['PATCH', '/api/fleet/accounts'], ['POST', '/api/fleet/reconcile']]) expect(dirty(m, p), `${m} ${p}`).toBe(true);
 });
 

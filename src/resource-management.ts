@@ -396,31 +396,46 @@ export class ResourceManagement {
   freezeCpuStart(launch: string, estimate: {expected_cpu_cores:number,expected_cpu_source:string}) {
     this.sql.exec('INSERT OR IGNORE INTO resource_cpu_starts VALUES(?,?,?)',launch,estimate.expected_cpu_cores,estimate.expected_cpu_source);
   }
-  cpuStart(launch: string) {
-    return this.sql.exec('SELECT expected_cpu_cores,expected_cpu_source FROM resource_cpu_starts WHERE launch_id=?',launch).toArray()[0] ?? null;
-  }
-  private hostSessionCount(machine: string, excludeLaunch?: string) {
-    const raw:any[]=[];
-    const terminal=['dead','exited','failed','finished','refused','stopped'];
-    // Seek the disjoint live phase ranges of the deployed machine/phase
-    // index. No NOT IN filter may walk retained terminal phases first.
-    for(let i=0;i<=terminal.length;i++) {
-      const remaining=129-raw.length;if(remaining<=0)break;
-      const lower=i?terminal[i-1]:null,upper=i<terminal.length?terminal[i]:null;
-      raw.push(...this.readRows(`SELECT native_id AS session_key FROM fleet_sessions INDEXED BY fleet_session_machine_phase
-        WHERE machine_id=? ${lower!==null?'AND phase>?':''} ${upper!==null?'AND phase<?':''}
-        ORDER BY phase,rowid LIMIT ?`,machine,...(lower!==null?[lower]:[]),...(upper!==null?[upper]:[]),remaining));
+  private cpuStartFacts=new Map<string,{expected_cpu_cores:number;expected_cpu_source:string}|null>();
+  private cpuStartFactsStamp:string|null=null;
+  /** Raw commitment facts only; every caller recomputes its own live verdict. */
+  cpuStarts(launches:readonly string[]):Map<string,{expected_cpu_cores:number;expected_cpu_source:string}|null> {
+    if(launches.length>128||launches.some(id=>typeof id!=='string'))throw new ResourceObservationLimit();
+    const stamp=this.writes?.stamp('resource_cpu_starts')??null;
+    if(stamp===null||stamp!==this.cpuStartFactsStamp){this.cpuStartFacts.clear();this.cpuStartFactsStamp=stamp;}
+    const ids=[...new Set(launches)],missing=ids.filter(id=>!this.cpuStartFacts.has(id));
+    const found=new Map<string,{expected_cpu_cores:number;expected_cpu_source:string}|null>();
+    if(missing.length)for(const row of this.readRows(`SELECT launch_id,expected_cpu_cores,expected_cpu_source FROM resource_cpu_starts
+      WHERE launch_id IN (SELECT value FROM json_each(?))`,JSON.stringify(missing)))
+      found.set(String(row.launch_id),{expected_cpu_cores:row.expected_cpu_cores,expected_cpu_source:row.expected_cpu_source});
+    const result=new Map(ids.map(id=>{const row=found.get(id)??this.cpuStartFacts.get(id)??null;return [id,row?{...row}:null] as const;}));
+    if(stamp!==null) {
+      if(this.cpuStartFacts.size+missing.length>2048)this.cpuStartFacts.clear();
+      for(const [id,row] of result)this.cpuStartFacts.set(id,row?{...row}:null);
     }
+    return result;
+
+  }
+  cpuStart(launch: string) {return this.cpuStarts([launch]).get(launch)??null;}
+  private hostSessionCount(machine: string, excludeLaunch?: string) {
+    const terminal=['dead','exited','failed','finished','refused','stopped'];
+    // Preserve every nonterminal phase, including unknown legacy names. Each
+    // UNION arm seeks a disjoint leading-index range; the outer sentinel
+    // stops the combined raw source before any counting/deduplication.
+    const arms=Array.from({length:terminal.length+1},(_,i)=>{
+      const lower=i?terminal[i-1]:null,upper=i<terminal.length?terminal[i]:null;
+      return `SELECT session_key FROM (SELECT native_id AS session_key FROM fleet_sessions INDEXED BY fleet_session_machine_phase
+        WHERE machine_id=? ${lower!==null?`AND phase>'${lower}'`:''} ${upper!==null?`AND phase<'${upper}'`:''}
+        ORDER BY phase,rowid LIMIT 129)`;
+    });
+    const raw=this.readRows('SELECT session_key FROM ('+arms.join(' UNION ALL ')+') LIMIT 129',...arms.map(()=>machine));
     if(raw.length>128)return null;
     const keys=new Set(raw.map(row=>String(row.session_key)));
     let scanned=raw.length;
-    for(const state of ['offered','starting','running','uncertain']) {
-      const remaining=129-scanned;if(remaining<=0)return null;
-      const page=this.readRows(`SELECT id,native_id FROM fleet_launches INDEXED BY fleet_launch_machine_state
-        WHERE machine_id=? AND state=? ORDER BY rowid LIMIT ?`,machine,state,remaining);
-      scanned+=page.length;if(scanned>128)return null;
-      for(const row of page)if(row.id!==excludeLaunch)keys.add(row.native_id ?? 'launch:'+row.id);
-    }
+    const page=this.readRows(`SELECT id,native_id FROM fleet_launches INDEXED BY fleet_launch_machine_state
+      WHERE machine_id=? AND state IN ('offered','starting','running','uncertain') ORDER BY state,rowid LIMIT ?`,machine,129-scanned);
+    scanned+=page.length;if(scanned>128)return null;
+    for(const row of page)if(row.id!==excludeLaunch)keys.add(row.native_id ?? 'launch:'+row.id);
     return keys.size;
   }
 
@@ -444,16 +459,12 @@ export class ResourceManagement {
       admitted:false,reason:'cpu_history_observation_limited',snapshot_truncated:true,ramping_cpu_cores:null,
       resource_choking:null,choking_observed_at:null,expected_cpu_source:estimate.expected_cpu_source,
     };
-    const candidates:any[]=[];
-    for(const state of ['offered','starting','running','uncertain']) {
-      const remaining=MEMORY_PENDING_SCAN_LIMIT+1-candidates.length;
-      if(remaining<=0)break;
-      candidates.push(...this.readRows(`SELECT l.id,l.native_id,l.state,l.created_at,
-        ${resourceRequest('fleet_launches','l.id','l.request_json')} AS request_json,l.workspace,s.expected_cpu_cores,p.started_at AS ramp_started_at
-        FROM fleet_launches l INDEXED BY fleet_launch_machine_state
-        LEFT JOIN resource_cpu_starts s ON s.launch_id=l.id LEFT JOIN resource_ramps p ON p.launch_id=l.id
-        WHERE l.machine_id=? AND l.state=? ORDER BY l.rowid LIMIT ?`,machine,state,remaining));
-    }
+    const candidates=this.readRows(`SELECT l.rowid AS source_rowid,l.id,l.native_id,l.state,l.created_at,
+      ${resourceRequest('fleet_launches','l.id','l.request_json')} AS request_json,l.workspace,s.expected_cpu_cores,p.started_at AS ramp_started_at
+      FROM fleet_launches l INDEXED BY fleet_launch_machine_state
+      LEFT JOIN resource_cpu_starts s ON s.launch_id=l.id LEFT JOIN resource_ramps p ON p.launch_id=l.id
+      WHERE l.machine_id=? AND l.state IN ('offered','starting','running','uncertain') ORDER BY l.state,l.rowid LIMIT ?`,machine,MEMORY_PENDING_SCAN_LIMIT+1);
+    candidates.sort((a,b)=>['offered','starting','running','uncertain'].indexOf(a.state)-['offered','starting','running','uncertain'].indexOf(b.state)||a.source_rowid-b.source_rowid);
     if(candidates.length>MEMORY_PENDING_SCAN_LIMIT)return {
       ...cpuVerdict(hb.cpu_usage,parse(m?.capabilities).cpu_count,estimate.expected_cpu_cores,0,config,now),
       admitted:false,reason:'resource_snapshot_overflow',snapshot_truncated:true,ramping_cpu_cores:null,
@@ -556,21 +567,13 @@ export class ResourceManagement {
     const inFlightCutoff = new Date(now - IN_FLIGHT_RESERVE_SECONDS * 1000).toISOString();
     // Only launch ramps are additional commitments. Resident usage is already in MemAvailable.
     // The explicit state range lets SQLite skip retained terminal history.
-    const candidates: any[] = [];
-    // The deployed machine/state index already includes rowid ordering.
-    // Seek each exact state separately: an IN + ORDER rowid can sort/walk
-    // the whole active population before LIMIT. The combined source prefix
-    // never exceeds one overflow sentinel beyond the admission bound.
-    for (const state of ['offered','starting','running','uncertain']) {
-      const remaining = MEMORY_PENDING_SCAN_LIMIT + 1 - candidates.length;
-      if (remaining <= 0) break;
-      candidates.push(...this.readRows(`SELECT l.id,l.native_id,l.engine,l.workspace,l.state,l.created_at,
-        ${resourceRequest('fleet_launches','l.id','l.request_json')} AS request_json,r.resident_mb,p.started_at AS ramp_started_at
-        FROM fleet_launches l INDEXED BY fleet_launch_machine_state
-        LEFT JOIN resource_resident_samples r ON r.launch_id=l.id AND r.observed_at>=?
-        LEFT JOIN resource_ramps p ON p.launch_id=l.id
-        WHERE l.machine_id=? AND l.state=? ORDER BY l.rowid LIMIT ?`, cutoff, machine, state, remaining));
-    }
+    const candidates=this.readRows(`SELECT l.rowid AS source_rowid,l.id,l.native_id,l.engine,l.workspace,l.state,l.created_at,
+      ${resourceRequest('fleet_launches','l.id','l.request_json')} AS request_json,r.resident_mb,p.started_at AS ramp_started_at
+      FROM fleet_launches l INDEXED BY fleet_launch_machine_state
+      LEFT JOIN resource_resident_samples r ON r.launch_id=l.id AND r.observed_at>=?
+      LEFT JOIN resource_ramps p ON p.launch_id=l.id
+      WHERE l.machine_id=? AND l.state IN ('offered','starting','running','uncertain') ORDER BY l.state,l.rowid LIMIT ?`,cutoff,machine,MEMORY_PENDING_SCAN_LIMIT+1);
+    candidates.sort((a,b)=>['offered','starting','running','uncertain'].indexOf(a.state)-['offered','starting','running','uncertain'].indexOf(b.state)||a.source_rowid-b.source_rowid);
     const overflow = candidates.length > MEMORY_PENDING_SCAN_LIMIT;
     if (overflow) return { mem_available_mb: finite(hb.mem_avail_mb) ? hb.mem_avail_mb : null,
       reserved_mb: null, floor_mb: effectiveFloorMb(config, hb.mem_total_mb), requested_mb: null,
@@ -633,18 +636,22 @@ export class ResourceManagement {
         else addControl(read('SELECT id,machine_id,binding_json FROM session_control_sessions WHERE id=?',id)[0]);
       }
     } else {
-      for(const state of ['queued','held','offered','starting','running','uncertain']) {
-        const source=read(`SELECT id,machine_id,binding_json FROM session_control_sessions INDEXED BY ${machine?'session_control_machine_state':'session_control_state'}
-          WHERE ${machine?'machine_id=? AND ':''}state=? ORDER BY ${machine?'created_at,':''}rowid LIMIT 129`,...(machine?[machine,state]:[state]));
-        if(source.length>RESOURCE_CATALOG_LIMIT)throw new ResourceObservationLimit();
-        for(const row of source)addControl(row);
-      }
-      for(const state of ['offered','starting','running','uncertain']) {
-        const source=read(`SELECT id,machine_id,native_id FROM fleet_launches INDEXED BY ${machine?'fleet_launch_machine_state':'fleet_launch_state'}
-          WHERE ${machine?'machine_id=? AND ':''}state=? ORDER BY rowid LIMIT 129`,...(machine?[machine,state]:[state]));
-        if(source.length>RESOURCE_CATALOG_LIMIT)throw new ResourceObservationLimit();
-        for(const row of source)addLaunch(row);
-      }
+      const controlStates=['queued','held','offered','starting','running','uncertain'];
+      const controls=read(`SELECT rowid AS source_rowid,id,machine_id,binding_json,state,created_at
+        FROM session_control_sessions INDEXED BY ${machine?'session_control_machine_state':'session_control_state'}
+        WHERE ${machine?'machine_id=? AND ':''}state IN ('queued','held','offered','starting','running','uncertain')
+        ORDER BY state,${machine?'created_at,':''}rowid LIMIT 129`,...(machine?[machine]:[]));
+      if(controls.length>RESOURCE_CATALOG_LIMIT)throw new ResourceObservationLimit();
+      controls.sort((a,b)=>controlStates.indexOf(a.state)-controlStates.indexOf(b.state)||(machine?String(a.created_at).localeCompare(String(b.created_at)):0)||a.source_rowid-b.source_rowid);
+      for(const row of controls)addControl(row);
+      const launchStates=['offered','starting','running','uncertain'];
+      const launches=read(`SELECT rowid AS source_rowid,id,machine_id,native_id,state FROM fleet_launches
+        INDEXED BY ${machine?'fleet_launch_machine_state':'fleet_launch_state'}
+        WHERE ${machine?'machine_id=? AND ':''}state IN ('offered','starting','running','uncertain') ORDER BY state,rowid LIMIT 129`,...(machine?[machine]:[]));
+      if(launches.length>RESOURCE_CATALOG_LIMIT)throw new ResourceObservationLimit();
+      launches.sort((a,b)=>launchStates.indexOf(a.state)-launchStates.indexOf(b.state)||a.source_rowid-b.source_rowid);
+      for(const row of launches)addLaunch(row);
+
     }
     // Complete native alias closure includes terminal/protected identities.
     // A cap refuses authority rather than silently dropping an old protection.
@@ -755,7 +762,7 @@ export class ResourceManagement {
     return [...bound,...fleetOnly];
   }
   private canonicalSessions(machine?: string, requested?:string[],advanceHealth=true) {
-    intakeLinkHealth(this.sql,advanceHealth);
+    intakeLinkHealth(this.sql,advanceHealth,this.writes??undefined);
     // No time-based authority cache: metadata/authority writes change the
     // durable random generation, including rollback and retry. With the
     // write-through watch, the stamp check reads zero rows and is exactly as
@@ -911,7 +918,7 @@ export class ResourceManagement {
     } catch { return false; } // corrupt/missing authority is never reap permission
   }
   sessions(machine?: string) {
-    intakeLinkHealth(this.sql);
+    intakeLinkHealth(this.sql,true,this.writes??undefined);
     // The watchdog response is served per host poll (and per session-progress
     // poll on the host); the canonical stamp plus the watchdog-only authority
     // sources gate the whole computation. Exactly-as-fresh: any write to a
@@ -973,7 +980,7 @@ export class ResourceManagement {
     // migration metadata. An oversized native cohort must be a zero-write
     // refusal, including control writes which a SQL rollback cannot unbill.
     const preflight=this.canonicalSessions(machine,requested,false);
-    const health=intakeLinkHealth(this.sql);
+    const health=intakeLinkHealth(this.sql,true,this.writes??undefined);
     // A completed page can change authority metadata. Reuse the bounded raw
     // identity observations, but render against the newly proven health so
     // the first sample and its unchanged retry share identical metadata.
