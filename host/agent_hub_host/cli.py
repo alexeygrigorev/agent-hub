@@ -490,6 +490,8 @@ def main():
     schedules_cli.add_parser(sub)
     from . import prompt_schedules as prompt_schedules_cli
     prompt_schedules_cli.add_parser(sub)
+    from . import alert_receipts as alert_receipts_cli
+    alert_receipts_cli.add_parser(sub)
     from . import ops_liveness
     ops_liveness.add_parser(sub)
     from . import limits_cli
@@ -762,6 +764,19 @@ def main():
             print(rendered if isinstance(rendered, str) else json.dumps(rendered, indent=2, ensure_ascii=True))
         except Exception as exc:
             print(ps_cli.diagnostic(exc), file=sys.stderr)
+            sys.exit(1)
+        return
+    if args.cmd == 'alerts':
+        from . import alert_receipts as alert_receipts_cli
+        try:
+            result = alert_receipts_cli.execute(args)
+            rendered = alert_receipts_cli.render_output(args, result)
+            if isinstance(rendered, str):
+                print(rendered)
+            else:
+                print(json.dumps(rendered, indent=2, ensure_ascii=True))
+        except Exception as exc:
+            print(alert_receipts_cli.diagnostic(exc), file=sys.stderr)
             sys.exit(1)
         return
     if args.cmd == 'schedule':
