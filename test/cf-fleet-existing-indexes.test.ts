@@ -36,7 +36,7 @@ describe('Fleet recovery and paging use deployed indexes',()=>{
       if(rows.some((row:any)=>row.id==='recover-me')) {found=true;break;}
     }
     expect(found).toBe(true);
-    expect(m.queries.some(q=>q.includes('ORDER BY rowid LIMIT 25'))).toBe(true);
+    expect(m.queries.some(q=>q.includes('ORDER BY rowid LIMIT 26'))).toBe(true);
   }));
 
   it('reserved pages seek account/state/rowid before filtering old reservations',()=>fixture(async(_hub,raw)=>{

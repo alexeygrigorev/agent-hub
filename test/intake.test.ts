@@ -1292,8 +1292,11 @@ describe('private durable intake HTTP/SQLite', () => {
     await grant(other, 'task', task.id, 'read');
     expect((await ok('/tasks/' + task.id + '/history?archived=1&limit=2', undefined, other.token)).items).toHaveLength(2);
     await inDO(stub(), (h: any) => {
-      expect(() => h.sql.exec('DELETE FROM intake_note_archive WHERE task_id=?', task.id)).toThrow(/append_only_note_archive/);
-      expect(() => h.sql.exec('UPDATE intake_note_archive SET data=data WHERE task_id=?', task.id)).toThrow(/append_only_note_archive/);
+      // Inspect native append-only constraints separately from the guarded
+      // application fault/rollback path exercised above.
+      const native=fixtureSql(h);
+      expect(() => native.exec('DELETE FROM intake_note_archive WHERE task_id=?', task.id)).toThrow(/append_only_note_archive/);
+      expect(() => native.exec('UPDATE intake_note_archive SET data=data WHERE task_id=?', task.id)).toThrow(/append_only_note_archive/);
     });
     expect((await call('/tasks/' + task.id + '/history?archived=1&limit=101')).status).toBe(400);
   });
@@ -1496,7 +1499,7 @@ describe('private durable intake HTTP/SQLite', () => {
     const stale = Date.now() - 20 * 86400000;
     const seed = 300;
     await inDO(stub(), (h: any) => {
-      for (let i = 0; i < seed; i++) h.sql.exec('INSERT INTO intake_tasks VALUES(?,?)', 'fixture-' + i, JSON.stringify({ id: 'fixture-' + i, project: 'demo', status: 'done', updated_at: stale, history: [] }));
+      for (let i = 0; i < seed; i++) fixtureSql(h).exec('INSERT INTO intake_tasks VALUES(?,?)', 'fixture-' + i, JSON.stringify({ id: 'fixture-' + i, project: 'demo', status: 'done', updated_at: stale, history: [] }));
     });
     const created = await ok('/tasks', { key: 'after-prune', project: 'demo', title: 'Synthetic', text: 'Synthetic', source });
     expect(created.task.id).toBeTruthy();
@@ -1514,7 +1517,7 @@ describe('private durable intake HTTP/SQLite', () => {
   it('keeps terminal tasks within retention but still admits create (soft task cap)', async () => {
     const seed = 120;
     await inDO(stub(), (h: any) => {
-      for (let i = 0; i < seed; i++) h.sql.exec('INSERT INTO intake_tasks VALUES(?,?)', 'fixture-' + i, JSON.stringify({ id: 'fixture-' + i, project: 'demo', status: 'done', updated_at: Date.now() - 30_000, history: [] }));
+      for (let i = 0; i < seed; i++) fixtureSql(h).exec('INSERT INTO intake_tasks VALUES(?,?)', 'fixture-' + i, JSON.stringify({ id: 'fixture-' + i, project: 'demo', status: 'done', updated_at: Date.now() - 30_000, history: [] }));
     });
     const created = await ok('/tasks', { key: 'cap-still', project: 'demo', title: 'Synthetic', text: 'Synthetic', source });
     expect(created.task.id).toBeTruthy();
@@ -1619,9 +1622,10 @@ describe('archive retention, evidence gates and durable audit', () => {
     expect((await call('/tasks/' + task.id + '/audit', undefined, agent.token)).status).toBe(404);
     expect((await ok('/audit', undefined, agent.token)).items.every((e: any) => e.project === 'demo')).toBe(true);
     await inDO(stub(), (h: any) => {
-      expect(() => h.sql.exec('UPDATE intake_audit SET reason=? WHERE task_id=?', 'tamper', task.id)).toThrow();
-      expect(() => h.sql.exec('DELETE FROM intake_audit WHERE task_id=?', task.id)).toThrow();
-      h.sql.exec('DELETE FROM intake_tasks WHERE id=?', task.id); // disposable fixture only
+      const native=fixtureSql(h);
+      expect(() => native.exec('UPDATE intake_audit SET reason=? WHERE task_id=?', 'tamper', task.id)).toThrow(/append_only/);
+      expect(() => native.exec('DELETE FROM intake_audit WHERE task_id=?', task.id)).toThrow(/append_only/);
+      native.exec('DELETE FROM intake_tasks WHERE id=?', task.id); // disposable fixture only
     });
     const events = (await ok('/tasks/' + task.id.slice(0, 8) + '/audit')).items;
     expect(events.map((e: any) => e.kind)).toEqual(['delete', 'close', 'archive']);
@@ -1680,7 +1684,7 @@ describe('intake retention accounting', () => {
     const payload = { key: 'retained-count', project: 'demo', title: 'Synthetic', text: 'Original', source };
     const first = await ok('/tasks', payload);
     await inDO(stub(), (h: any) => {
-      for (let i = 0; i < 8192; i++) h.sql.exec('INSERT INTO intake_receipts VALUES(?,?)', 'retained-count-' + i, JSON.stringify({ id: 'retained-count-' + i }));
+      for (let i = 0; i < 8192; i++) fixtureSql(h).exec('INSERT INTO intake_receipts VALUES(?,?)', 'retained-count-' + i, JSON.stringify({ id: 'retained-count-' + i }));
     });
     expect((await create()).task.id).toBeTruthy();
     expect(await ok('/tasks', payload)).toEqual(first);

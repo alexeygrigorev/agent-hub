@@ -2607,6 +2607,23 @@ export class SessionControlService {
       if (!host) return response({ error: 'forbidden' }, 403);
       const scope = this.worktreeGuardScope(url, caller);
       const rows = scope.rows;
+      if(scope.truncated || scope.snapshot.sessionIds.length>128 || scope.snapshot.nativeIds.length>128) {
+        // An incomplete authority closure can never permit destruction. Do
+        // not spend more rows hydrating lifecycle or per-session receipts
+        // merely to rediscover this already-known refusal.
+        const sessions=rows.filter(row=>scope.targets.has(row.id)).map(row=>{
+          const binding=parsed(row.binding_json,null);
+          return {session_id:row.id,session_state:row.state,intake_task_id:parsed(row.request_json,{}).intake_task_id??null,
+            native_terminal:false,native_id:binding?.native_id??null,native_last_activity_at:null,
+            lock_release_permitted:false,engine:row.engine,adoption_intent_id:binding?.adoption_intent_id??null,
+            tag:binding?.tag??((row.mode==='headless'?'task-hub-':'hub-')+row.fleet_launch_id),
+            workspace:binding?.workspace??null,native_created_at_ms:binding?.native_created_at_ms??null,
+            terminal:['stopped','finished','failed','refused','cancelled'].includes(row.state),
+            linked_intake_open:true,protected:true,human_owned:true,observation_pending:true};
+        });
+        return response({sessions,next_cursor:scope.nextCursor,bounded:true,observation_pending:true,
+          reason:'worktree_identity_closure_limited'});
+      }
       const worktreeLinks = worktreeIntakeSnapshot(this.sql, scope.snapshot);
       // One immutable read snapshot for the whole response. classifyKey
       // rebuilds every session's inputs; doing that per row made the host's

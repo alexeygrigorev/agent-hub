@@ -32,7 +32,7 @@ describe('live telemetry persistence coalescing',()=>{
       meter.runSync('report-'+i,()=>r.report('host',{samples:[sample({current_rss_mb:100,current_cpu_cores:.5,cpu_seconds:30+i,runtime_s:110+i,peak_rss_mb:250+i})],reaps:[]}));
       expect(meter.snapshot()['report-'+i]?.rows_written??0).toBe(0);
     }
-    console.log(JSON.stringify({evidence:'route_service_native_cost',route:'POST /api/fleet/resources/report',case:'warm changing telemetry',...meter.snapshot()['report-59'],excludes:'outer authentication, KV ledger and guard migration preflight'}));
+    console.log(JSON.stringify({evidence:'route_service_native_cost',route:'POST /api/fleet/resources/report',case:'warm changing telemetry',calls:0,rows_read:0,rows_written:0,...meter.snapshot()['report-59'],excludes:'outer authentication, KV ledger and guard migration preflight'}));
     expect(r.headroom('host').reserved_mb).toBe(412);
     expect(r.cpuHeadroom('host').ramping_cpu_cores).toBe(1.5);
     expect(raw.exec("SELECT peak_rss_mb FROM session_resource_usage WHERE session_id='session'").one().peak_rss_mb).toBe(200);

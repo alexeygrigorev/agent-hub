@@ -49,7 +49,7 @@ function seed(sql: any) {
   sql.exec("INSERT INTO fleet_catalog_seen VALUES ('h0', ?) ON CONFLICT(machine_id) DO UPDATE SET observed_at=excluded.observed_at", iso(-1000));
 }
 
-const withFleet = (fn: (s: FleetService, t: ReturnType<typeof tracked>, hub: Hub) => Promise<void>) => async () => {
+const withFleet = (fn: (s: FleetService, t: ReturnType<typeof tracked>, hub: Hub) => Promise<void>, productionCaches = false) => async () => {
   const bindings = env as unknown as Env;
   const stub = bindings.HUB.get(bindings.HUB.idFromName('fleet-rows-' + crypto.randomUUID()));
   await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
@@ -68,7 +68,8 @@ const withFleet = (fn: (s: FleetService, t: ReturnType<typeof tracked>, hub: Hub
     };
     (t as any).nativeFailures=failures;
     try {
-      const s = new FleetService(t.proxy, (cb) => state.storage.transactionSync(cb), () => now);
+      const s = new FleetService(t.proxy, (cb) => state.storage.transactionSync(cb), () => now,
+        productionCaches ? (hub as any).writes : undefined, productionCaches ? (hub as any).observedCatalog : undefined);
       s.init();
       await fn(s, t, hub);
     } finally { native.exec=exec; }
@@ -87,7 +88,29 @@ it('PUT /api/fleet/sessions with an unchanged census reads rows per reported row
   const second = after.total;
   expect(second, `unchanged PUT top statements: ${JSON.stringify(after.top)}`).toBeLessThanOrEqual(CENSUS * 4);
   console.log(JSON.stringify({evidence:'route_service_native_cost',route:'PUT /api/fleet/sessions',case:'unchanged500',history_rows:HOSTS*HISTORY,rows_read:after.total,rows_written:after.written,excludes:'outer authentication, KV ledger and guard migration preflight'}));
-}));
+},true));
+
+it('production cache configuration serves100 unchanged500-row census polls in one strict budget day', withFleet(async(s,t,hub)=>{
+  const sessions=Array.from({length:CENSUS},(_,i)=>({native_id:uuid(3,i),tag:'hub-'+uuid(1,i),engine:'codex',
+    phase:i<5?'running':'exited',confirmed_exit:i>=5,agent_state:null,workspace:'/w',cwd:'/w',profile:null,
+    account:null,last_activity_at:null,created_at_ms:now-1000-i}));
+  const put=()=>s.handle(new Request('https://hub.test/api/fleet/sessions',{method:'PUT',body:JSON.stringify({sessions})}),host);
+  expect((await put()).status).toBe(200);
+  const before=(hub as any).rowBudget.status();
+  const from=t.mark();
+  for(let i=0;i<100;i++)expect((await put()).status).toBe(200);
+  const receipt=t.report(from);
+  expect(receipt.written).toBe(0);
+  expect(receipt.total,JSON.stringify(receipt.top)).toBeLessThanOrEqual(100);
+  const after=(hub as any).rowBudget.status();
+  expect(after).toMatchObject({limit_total:20000,stopped:false});
+  const guardConsumed=(after.reserved_total-after.available_total)-(before.reserved_total-before.available_total);
+  expect(guardConsumed).toBeGreaterThanOrEqual(0);
+  expect(guardConsumed).toBeLessThanOrEqual(100);
+  console.log(JSON.stringify({evidence:'route_service_native_cost',route:'PUT /api/fleet/sessions',case:'100 warm unchanged500 polls, fixed observation clock, production caches',
+    calls:100,history_rows:HOSTS*HISTORY,rows_read:receipt.total,rows_written:receipt.written,guard_consumed_total:guardConsumed,
+    excludes:'outer authentication, KV ledger and guard migration preflight'}));
+},true));
 
 it('GET /api/fleet/offers with no offers reads a bounded number of rows', withFleet(async (s, t) => {
   const get = () => s.handle(new Request('https://hub.test/api/fleet/offers'), host);

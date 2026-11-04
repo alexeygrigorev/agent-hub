@@ -1,6 +1,6 @@
 import {registerFixtureStatements,fixtureStatements} from './helpers/fixture-statements';
 import {fixtureSql,freshFixtureBudgetDay} from './helpers/fixture-budget';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { seedFixtureIntake } from './tbm-fixture';
 import { SessionControlService } from '../src/session_control';
@@ -47,6 +47,7 @@ async function fixture(fn: (s: SessionControlService, sql: any, measure: (fn: ()
     await freshFixtureBudgetDay(hub);
     await (hub as any).rowBudget.begin(true);
     await fn(service, hub.sql, m.measure);
+    expect((hub as any).rowBudget.status()).toMatchObject({limit_total:20000,stopped:false});
   });
 }
 
@@ -158,14 +159,25 @@ describe('worktree-guards bounded read (4d05302a)', () => {
   });
 
   it('fails closed when the intake closure exceeds the cap (hidden live owner)', async () => {
-    await fixture(async (s, sql) => {
+    await fixture(async (s, sql, measure) => {
       for (let i = 1; i <= 410; i++) insertSession(sql, sid(i), 'task-big', 'stopped', '2026-10-01T00:00:00.000Z');
       insertSession(sql, sid(411), 'task-big', 'running', '2026-10-02T00:00:00.000Z');
+      const before=fixtureStatements(sql).exec('SELECT count(*) AS n FROM session_control_commands').one().n;
+      const receipts=vi.spyOn(s as any,'confirmedStopRecorded');
       for (const qs of [`session_id=${sid(1)}`, 'intake_task_id=task-big']) {
-        const res: any = await (await s.handle(get('/api/sessions/worktree-guards?' + qs), host('hetzner') as any)).json();
+        const {out:res,read}=await measure(async()=>{
+          const response=await s.handle(get('/api/sessions/worktree-guards?'+qs),host('hetzner') as any);
+          expect(response.status).toBe(200);
+          return await response.json() as any;
+        });
+        expect(res).toMatchObject({observation_pending:true,reason:'worktree_identity_closure_limited'});
         expect(res.sessions.length).toBeGreaterThan(0);
-        for (const fact of res.sessions) expect(fact.lock_release_permitted).toBe(false);
+        for(const fact of res.sessions)expect(fact).toMatchObject({lock_release_permitted:false,native_terminal:false,protected:true});
+        expect(read).toBeLessThan(3000);
       }
+      expect(receipts).not.toHaveBeenCalled();
+      expect(fixtureStatements(sql).exec('SELECT count(*) AS n FROM session_control_commands').one().n).toBe(before);
+      receipts.mockRestore();
     });
   });
 });

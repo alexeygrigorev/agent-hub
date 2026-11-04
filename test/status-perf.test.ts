@@ -101,7 +101,7 @@ it('bounds status and host query work with retained production-scale history', a
     ['POST', '/api/host/poll', true, {type: 'heartbeat'}, 200],
     ['POST', '/api/machines/register', true, {hostname: 'perf-host', os: 'linux', network: 'synthetic', roles: [], capabilities: {}}, 200],
     ['GET', '/api/fleet/offers', true, undefined, 200],
-    ['GET', '/api/fleet/resources/watchdog', true, undefined, 200],
+    ['GET', '/api/fleet/resources/watchdog', true, undefined, 503],
     ['POST', '/api/fleet/resources/report', true, {samples:[],reaps:[]}, 200],
     // Real retained launch: replay claims must promptly refuse a terminal row.
     ['POST', `/api/fleet/launches/${sessionId(11999)}/claim`, true, {}, 409],
@@ -119,7 +119,13 @@ it('bounds status and host query work with retained production-scale history', a
       times.push(performance.now() - start);
       const body: any = await response.json();
       clientTimes.push(performance.now() - start);
-      expect(response.status, JSON.stringify(body).slice(0, 200)).toBe(status);
+      expect(response.status, path+' '+JSON.stringify(body).slice(0,200)).toBe(status);
+      if(path==='/api/fleet/resources/watchdog') {
+        //100controls +156Fleetidentities exceed the strict128identity closure.
+        //This retained-load benchmark must refuse unknown destructive authority.
+        expect(body).toMatchObject({error:'resource_catalog_observation_limit',observation_pending:true});
+        expect(body.sessions).toBeUndefined();
+      }
       if(path === '/api/fleet/offers') {
         expect(body.reconciliation.length).toBeGreaterThan(0);expect(body.reconciliation.length).toBeLessThanOrEqual(25);
         expect(body.reconciliation_observation_pending).toBe(true);expect(body.observation_pending).toBe(true);
@@ -143,6 +149,7 @@ it('bounds status and host query work with retained production-scale history', a
   // lifecycle facts; cold status must not re-query that creator per session.
   const coldPost:number[]=[];
   for(let i=0;i<SAMPLES;i++) {
+    await inDO(stub,(h:any)=>freshFixtureBudgetDay(h));
     await inDO(stub,(h:any)=>h.sql.exec("UPDATE fleet_sessions SET last_activity_at=? WHERE machine_id='perf-host' AND native_id='native-0'",new Date(Date.now()+i).toISOString()).toArray());
     const start=performance.now();
     const response=await stub.fetch('https://hub.test/api/status',{method:'POST',headers:{Cookie:cookie,'x-csrf-token':'perf'},body:'{}'});
@@ -155,13 +162,15 @@ it('bounds status and host query work with retained production-scale history', a
   // would miss expensive canonical projection rebuilds after that write.
   const invalidatedWatchdog:number[]=[];
   for(let i=0;i<SAMPLES;i++) {
+    await inDO(stub,(h:any)=>freshFixtureBudgetDay(h));
     await inDO(stub,(h:any)=>h.sql.exec("UPDATE fleet_sessions SET last_activity_at=? WHERE machine_id='perf-host' AND native_id='native-0'",new Date(Date.now()+i).toISOString()).toArray());
     const start=performance.now();
     const response=await stub.fetch('https://hub.test/api/fleet/resources/watchdog',{headers:{Authorization:'Bearer '+token}});
     invalidatedWatchdog.push(performance.now()-start);
-    expect(response.status).toBe(200);await response.json();
+    expect(response.status).toBe(503);expect(await response.json()).toMatchObject({error:'resource_catalog_observation_limit',observation_pending:true});
   }
-  report("DO fetch/headers watchdog after native write", invalidatedWatchdog);
+  report("DO fetch/headers bounded watchdog refusal after native write", invalidatedWatchdog);
+  await inDO(stub,(h:any)=>expect(h.rowBudget.status()).toMatchObject({limit_total:20000,stopped:false}));
   // Exercise actual admission/transition work as well as terminal replay.
   // An independent healthy host avoids altering the retained workload above.
   const claimToken = 'hubt_perf_synthetic_claim_host';
@@ -185,6 +194,9 @@ it('bounds status and host query work with retained production-scale history', a
   const admittedTimes: number[] = [];
   const offeredTimes: number[] = [];
   for (let i = 0; i < SAMPLES; i++) {
+    // Each reserve/offers/claim/stop flow is one independent latency sample.
+    // Business state and every measured service/HTTP operation stay real.
+    await inDO(stub,(h:any)=>freshFixtureBudgetDay(h));
     const launch = await inDO(stub, (h: any) => {
       const service = new FleetService(h.sql, (cb) => h.ctx.storage.transactionSync(cb));
       const result = service.reserve({workspace: 'demo', prompt: 'Synthetic performance claim', machine: 'claim-host', idempotency_key: `perf-claim-${i}`},
@@ -213,6 +225,7 @@ it('bounds status and host query work with retained production-scale history', a
     report(`DO fetch/headers ${name}`, times);
   }
   // A busy retained queue must not make every host poll re-plan its backlog.
+  await inDO(stub,(h:any)=>freshFixtureBudgetDay(h));
   await inDO(stub, (h: any) => h.ctx.storage.transactionSync(() => {
     // Real placement reads measured history for every pending commitment.
     // Empty history and unroutable workloads hide multiplicative SQL reads.
@@ -222,7 +235,7 @@ it('bounds status and host query work with retained production-scale history', a
         VALUES(?,?,?,?,?,?,?,?,?,?,?)`, `usage-${i}`, 'claim-host', `usage-${i}`, `project-${i % 20}`, 'codex', 'goal', at, at, 'stopped', 64 + i % 64, at);
       fixtureSql(h).exec('INSERT INTO session_cpu_usage VALUES(?,?,?)', `usage-${i}`, 0.01, at);
     }
-    for (let i = 0; i < 100; i++) {
+    for (let i = 0; i < 36; i++) {
       fixtureSql(h).exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,created_at,updated_at)
         SELECT ?,actor,requester_kind,summary,?,request_json,machine_id,engine,account,mode,workspace,prompt,'uncertain',created_at,updated_at
         FROM fleet_launches WHERE account='claim-account' AND state='stopped' LIMIT 1`, sessionId(40000+i), `perf-pending-${i}`);
@@ -246,16 +259,18 @@ it('bounds status and host query work with retained production-scale history', a
       JSON.stringify({status:'ok',observed_at:at,details:{limit_reached:false},windows:{weekly:{present:true,percent_remaining:80,reset_at:new Date(Date.now()+86400000).toISOString()}}}));
     for (let i=0;i<200;i++) {
       const account=accounts[i%accounts.length];
-      fixtureSql(h).exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace,account,last_activity_at) VALUES('claim-host',?,?,'codex','running','working',?,'demo',?,?)",
-        `active-${i}`,`active-${i}`,at,account,at);
+      fixtureSql(h).exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace,account,last_activity_at) VALUES('claim-host',?,?,'codex',?,'working',?,'demo',?,?)",
+        `active-${i}`,`active-${i}`,i<64?'running':'exited',at,account,at);
       if (i<36) fixtureSql(h).exec("UPDATE fleet_launches SET state='running',native_id=?,account=? WHERE id=?",`active-${i}`,account,sessionId(40000+i));
     }
-    // The 200 synthetic actives above are scan-cost scaffolding for the
-    // orphan correlation, not a real 200-session host: lift the per-host
-    // live-session cap here so this perf test keeps measuring the intended
-    // account-concurrency path (the cap itself is covered in cpu-headroom tests).
+    // Retain200native rows, with64actualactive observations. The36bound
+    // launches +20offers bring the raw active source to120 and deduplicated
+    // physical population to84: both remain below the128observation ceiling.
+    // This high-core fixture uses a96-session host policy, reduced from500.
     fixtureSql(h).exec("INSERT INTO resource_settings VALUES(1,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
-      JSON.stringify({host_max_sessions:500}));
+      JSON.stringify({host_max_sessions:96}));
+    const knownHost:any=h.fleetService.resources.cpuHeadroom('claim-host');
+    expect(knownHost).toMatchObject({host_session_count:84,host_count_observation_limited:false});
     const fixturePlan:any = new FleetService(h.sql,(cb)=>h.ctx.storage.transactionSync(cb)).plan({workspace:'demo',prompt:'Synthetic',machine:'claim-host'});
     expect(fixturePlan.rejected.length===7 && fixturePlan.rejected.every((r:any)=>r.reason==='account_concurrency')).toBe(true);
     for (let i = 0; i < 200; i++) {
@@ -270,6 +285,7 @@ it('bounds status and host query work with retained production-scale history', a
   }));
   const backlogTimes: number[] = [];
   for (let i = 0; i < SAMPLES; i++) {
+    await inDO(stub,(h:any)=>freshFixtureBudgetDay(h));
     const start = performance.now();
     const response = await stub.fetch('https://hub.test/api/fleet/offers', {headers: {Authorization: 'Bearer ' + claimToken}});
     backlogTimes.push(performance.now() - start);
@@ -289,6 +305,8 @@ it('bounds status and host query work with retained production-scale history', a
   const mixedTimes: number[][] = mixed.map(()=>[]);
   const cohortClientTimes: number[] = [];
   for(let i=0;i<SAMPLES;i++) {
+    // One shared strict day covers the entire concurrent request cohort.
+    await inDO(stub,(h:any)=>freshFixtureBudgetDay(h));
     const cohortStart=performance.now();
     const responses=await Promise.all(mixed.map(async ([,path,options],j)=>{
       const start=performance.now();
