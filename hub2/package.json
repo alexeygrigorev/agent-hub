@@ -1,0 +1,22 @@
+{
+  "name": "agent-hub-hub2",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Commands for Hub 2.0 typechecking, acceptance, and local bundle validation.",
+  "scripts": {
+    "typecheck": "tsc --ignoreConfig --noEmit --target ES2022 --module ES2022 --lib ES2022 --types @cloudflare/workers-types --moduleResolution bundler --strict --skipLibCheck --isolatedModules src/*.ts",
+    "test:accounts-mail": "node --experimental-transform-types tests/run-accounts-mail.mjs",
+    "test:project-work": "node --experimental-transform-types tests/run-project-work.mjs",
+    "test:project-intake": "node --experimental-transform-types tests/run-project-intake.mjs",
+    "test:read-cache": "node --experimental-transform-types tests/run-read-cache.mjs",
+    "test:db-metering": "node --experimental-transform-types tests/run-db-metering.mjs",
+    "test:control": "node --experimental-transform-types tests/run-control-grants-directory.mjs",
+    "test:accounts-mail-workerd": "node tests/run-accounts-mail-workerd.mjs",
+    "test:core-workerd": "node tests/run-core-integration-workerd.mjs",
+    "test:normal-day-auth": "node tests/run-normal-day-auth-workerd.mjs",
+    "test:normal-day": "node tests/run-normal-day-workerd.mjs",
+    "budget": "python3 scripts/production-line-budget.py",
+    "bundle:dry-run": "wrangler deploy --dry-run --config wrangler.dev.jsonc --outdir .local/hub2-dist"
+  }
+}

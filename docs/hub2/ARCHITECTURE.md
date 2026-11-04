@@ -1,151 +1,184 @@
 # Hub 2.0 architecture
 
-Status: architecture proposal, 4 November 2026. This is step 1 only: no implementation and no production changes.
+Status: implementation and acceptance are in progress, 4 November 2026. The contracts below remain acceptance requirements. No production deployment, route cutover, or production-data mutation is authorized or claimed.
 
 ## Goal and boundaries
 
-Hub 2.0 preserves the Hub workflows that the current operator skills and the aplexer host bridge actually use, with an authored production-code budget of 5,700 lines including the host agent and dashboard. The stricter service target is fewer than 20,000 Durable Object SQLite row operations per normal day, reads plus writes across all Hub objects.
+Preserve the Hub workflows used by operator skills and the aplexer bridge, including the canonical repository registry explicitly required by Alexey. Target at most 6,000 authored production lines and fewer than 20,000 combined Durable Object SQLite row operations per normal day across all objects. Both feasibility claims remain unvalidated. The provisional 5,700-line allocation is a hypothesis pending a complete vertical slice.
 
-The existing Hub puts the registry, queue, sessions, messages, quotas, health, intake, and dashboard projections behind one global Durable Object. Hub 2.0 keeps strong consistency inside the small object that owns a particular decision, while moving high-volume state into deterministic shards: one per project, machine, account, or recipient. The global control object handles identity, small configuration, and cross-shard dispatch steps; it does not receive host heartbeats, message bodies, session output, or full-list queries.
+The Worker never runs model processes. Hosts invoke the maintained Agent Quota Launcher and native aplexer, preserving quota, resource, identity and workspace gates. Hub does not replace Agent Branches. Canonical repository metadata is Hub state; host checkout scanning and worktree mechanics are separate responsibilities.
 
-The Worker never runs model processes. A host agent receives an authorized offer and invokes the existing Agent Quota Launcher and aplexer installation on that host. Aplexer remains the native session runtime. Hub does not replace Agent Branches, quota gates, or the launcher.
+Use Workers Free, SQLite-backed Durable Objects and static assets, without D1, KV, R2 or paid services. Count SQL rows scanned and written, including indexes; separately instrument storage/alarm operations that SQL cursors do not report. Statement counts are insufficient. Platform references: [DO pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/), [limits](https://developers.cloudflare.com/durable-objects/platform/limits/), [hibernation](https://developers.cloudflare.com/durable-objects/best-practices/websockets/), [alarms](https://developers.cloudflare.com/durable-objects/api/alarms/).
 
-The product remains on Cloudflare Workers Free and uses SQLite-backed Durable Objects. The 20,000 combined-row-operation target is deliberately much lower than the current platform limits. Cloudflare's published pricing counts rows scanned by SQL reads, index rows written, deletes, and alarm writes; a SQL statement count is not a useful cost estimate. See [Workers pricing](https://developers.cloudflare.com/workers/platform/pricing/), [Durable Object limits](https://developers.cloudflare.com/durable-objects/platform/limits/), and [hibernatable WebSockets](https://developers.cloudflare.com/durable-objects/best-practices/websockets/).
+## Components and routing
 
-## Components
-
-| Component | Responsibility | State ownership |
-| --- | --- | --- |
-| Worker edge | Static dashboard, API and MCP entry points, bounded request validation, OAuth callback routing, Cron entry point | Stateless |
-| ControlDO | Human and client identities, device-pairing approval, small global policy, actor routing metadata | One small global object |
-| ProjectDO | One project's intakes, acceptance criteria, append-only task events, dependencies, active work claims, autonomous queue and project-level schedule rows | One object per canonical project |
-| MachineDO | One host's capabilities, live connection, launch offers, session command delivery and host-reported lifecycle changes | One object per enrolled machine |
-| AccountDO | One provider account's encrypted credential bundle, quota snapshot, refresh generation and capacity lease | One object per provider account |
-| MailboxDO | One actor's durable inbox, message threads, delivery receipts and deduplication keys | One object per human, agent, or session recipient |
-| SessionDirectoryDO | Compact session-id to project/machine routing index; no message bodies or output | One object, bounded indexed rows |
-| Host agent | Outbound connection, local resource/quota recheck, launch/stop/capture command execution, aplexer hooks and state/message bridge | Host-local files and processes |
-| CLI and MCP | Stable operator and agent interfaces over the same authorized API contracts | No independent Hub state |
-| Dashboard | Static phone-friendly inbox, intake, session, fleet, quota, and health views | Reads bounded API projections |
-
-Each shard has its own SQLite database. A start that needs more than one shard uses an idempotent saga: ProjectDO records a launch intent; the dispatcher reserves an account slot and a machine slot using the same operation id and increasing fencing epoch; it records each step; any failed reservation releases prior holds; the machine acknowledges its launch before the project task becomes running. Retries resume the recorded step instead of creating another native session. No cross-object transaction is assumed.
-
-Machine state is event-driven. The host opens an outbound hibernatable WebSocket. Keepalives and unchanged resource samples do not write SQLite rows. A capability, drain, health, or connection-state transition writes only the affected machine row. Session commands and lifecycle events go to the owning MachineDO. The Hub uses the native session UUID and a fencing epoch; it never treats a queued command or a TUI keystroke as proof that work happened.
-
-## Data model and indexes
-
-Tables are intentionally small, normalized around their owner shard, and queried by primary key or a listed composite index. JSON payload columns are bounded and reserved for small details, not transcript or output storage.
-
-| Owner | Tables and essential keys | Required indexes |
-| --- | --- | --- |
-| ControlDO | users(sub), credentials(id, token_hash, family_id, scopes, expires_at, revoked_at), device_pairings(code_hash, user_code, status, expires_at), global_policy(key, version, value), actor_route(actor, object_name, kind) | credentials(token_hash UNIQUE), credentials(family_id), device_pairings(user_code UNIQUE), actor_route(actor UNIQUE) |
-| ProjectDO | intakes(id, title, text, acceptance_criteria, project, status, priority, version, created_at, updated_at); intake_events(task_id, seq, actor, kind, body, at); dependencies(task_id, prerequisite_id); claims(id, scope, holder, work_key, mode, expires_at, released_at); dispatch_queue(seq, item_id, ready_at, idempotency_key, payload); dispatch_sagas(operation_id, session_id, state, epoch, updated_at); schedules(id, enabled, next_due_at, cron, timezone, kind, payload) | intakes(project, status, updated_at, id); intake_events(task_id, seq); dependencies(prerequisite_id, task_id); claims(scope, expires_at) WHERE released_at IS NULL; dispatch_queue(ready_at, seq) WHERE ready_at IS NOT NULL; dispatch_queue(idempotency_key UNIQUE); dispatch_sagas(state, updated_at); schedules(enabled, next_due_at, id) |
-| MachineDO | machine(id, alias, os, arch, capability_revision, drain_state, last_transition_at); machine_labels(label, machine_id); sessions(id, operation_id, intake_id, native_id, state, engine, tier, created_at, started_at, updated_at, epoch, lease_expires_at); session_commands(session_id, seq, key, kind, payload, state, acked_at) | machine_labels(label, machine_id); sessions(intake_id, created_at); sessions(state, updated_at, id); sessions(native_id UNIQUE); sessions(operation_id UNIQUE); session_commands(session_id, seq); UNIQUE(session_commands.session_id, session_commands.key) |
-| AccountDO | account(id, provider, enabled, max_concurrency, generation, ciphertext); quota_snapshot(account_id, captured_at, remaining, reset_at, source, confidence); reservations(operation_id, session_id, epoch, expires_at, released_at) | quota_snapshot(captured_at); reservations(operation_id UNIQUE); reservations(expires_at) |
-| MailboxDO | messages(id, sender, recipient, kind, thread_id, reply_to, body, key, state, created_at, delivered_at, read_at, acked_at, expires_at); delivery_events(message_id, seq, stage, actor, at) | messages(sender, key UNIQUE); messages(recipient, state, created_at, id); messages(thread_id, created_at, id); delivery_events(message_id, seq) |
-| SessionDirectoryDO | session_route(session_id, project_id, machine_id, created_at, ended_at) | session_route(session_id PRIMARY KEY) |
-
-The queue selects one eligible row with a B-tree seek on ready_at and sequence, then deletes that row and records the dispatch saga in one owner-shard transaction. It does not count the queue, sort an unindexed set, or walk completed rows. The scheduler writes the next occurrence only when a recurring job is enabled. An alarm is armed only for the earliest queued item, scheduled wake, expiry, or enabled recurring job. There is no alarm and no background database scan when none of those rows exists. An alarm pops only the first eligible queue item by its index.
-
-Inbox reads use recipient plus state and a keyset cursor. Session and intake lists are also keyset-paged with a hard page cap. Histories are fetched by (owner id, sequence). We do not use unbounded COUNT, offset pagination, JSON-text searches, or full-table expiry sweeps on request paths.
-
-## API, CLI, and MCP surface
-
-The compatibility surface keeps the commands evidenced in the current skills:
-
-| CLI group | v2 commands |
+| Component | Responsibility and ownership |
 | --- | --- |
-| Auth | auth login, status, logout; device approval for operator |
-| Intake | create, list, show, context, history, append, update, assign, depend, blocker, forgotten |
-| Sessions | start, list, show, send, commands, capture, stop, wake, shell-audit, count, tree |
-| Messages | msg send, inbox, show, reply, ack, status, readdress |
-| Fleet and quota | machines available, host-capabilities, routing-machines, quota, quota banked, model-policy |
-| Operations | status, schedules list/create/pause/resume, driver start/status |
+| Worker edge | Static assets, bounded API/MCP validation, OIDC callbacks, authenticated webhook ingress; no client-selected internal authority |
+| ControlDO | Identities, credential families and revocation, named-agent delegation/forwarding, canonical repository registry, project aliases, small policy, compact object routing directories |
+| ProjectDO | One canonical project's intakes, original asks/provenance, AC, task events, dependencies, claims, queue, dispatch saga and schedules |
+| MachineDO | One enrolled host's capabilities, connection/freshness, sessions, commands, native evidence and deadlines |
+| AccountDO | One provider account's sealed credentials, refresh generation, quota/reset discovery and expiry alerts, capacity reservations |
+| MailboxDO | One actor's durable outbox/deduplication ledger, inbox projections and delivery receipts |
+| Host agent | Outbound transport, persisted launch/command journal, local admission, launcher/aplexer invocation, native state/work/mailbox bridge |
+| CLI/MCP | Compatible authorized contracts; CLI waits may use a bounded WebSocket; MCP reads are short and paged |
+| Dashboard | Phone-friendly inbox, intake, session, fleet, quota/reset alerts and health views through bounded authorized projections |
 
-The REST API exposes these as versioned JSON resources under /api/intakes, /api/sessions, /api/messages, /api/machines, /api/fleet, /api/quota, /api/schedules, and /api/status. MCP is a narrow registry over the same handlers: intake_create/list/show/context/history/append/update/assign/depend/blocker; sessions_start/list/show/send/commands/capture/stop/wake; msg_send/inbox/show/reply/ack/status; machines_available, routing_machines, quota, model_policy, and status. Schedule administration remains in the operator CLI and dashboard. MCP does not expose host-local filesystem operations or administrator-only credential minting.
+ControlDO owns `object_routes(kind,id,owner)` for intake, session, message and schedule IDs, plus indexed name/alias lookups. Existing UUIDs and minimum-six-character unique intake prefixes remain usable without a project argument: an indexed prefix range returns at most two authorized matches and refuses ambiguity. New route registration is a durable idempotent step before an object is publicly discoverable. Missing routes are repaired from an import/creation journal, never by unbounded shard scans. Directory retention follows the retained records.
 
-The existing hub sessions send --wait and hub msg inbox --wait options remain bounded waits over the hibernation WebSocket API. MCP inbox calls remain short, paged reads. The Durable Object never holds an HTTP long-poll request open. Hibernatable WebSockets preserve an idle host or inbox connection without keeping the object active; the runtime restores per-connection identity from a bounded attachment.
+Repository records retain canonical owner/name, active/archived/duplicate status, duplicate target, purpose, labels, aliases, stack, key folders, URLs and domain metadata. Operator metadata survives refresh. Project aliases resolve to one canonical ProjectDO before dispatch, deduplication or claims. Work on the same canonical repository uses that project's claim authority; an alias cannot create a second conflict domain. A multi-repository operation must declare each canonical scope and acquire all claims or release partial acquisitions before editing.
 
-Every state-changing operation carries an idempotency key. Start requires a nonempty intake acceptance-criteria list. A model tier is an alias resolved by one policy table; the Hub chooses the engine/account. An explicit override requires a reason. Message identity is derived from the credential; an actor cannot claim another sender. Session-specific credentials cannot read another session's intake or inbox.
+## Storage and query contracts
 
-## Session, machine, quota, and intake flow
+Tables below name the required keys and query indexes, not a complete executable schema. Every owner has a schema-version record and `deadlines(kind,key,due_at)` with a unique `(kind,key)` and `(due_at,kind,key)` index. Every persisted idempotency record stores the request digest, result and retention deadline; a changed request under the same key conflicts.
 
-1. The requester records the verbatim ask and one acceptance criterion per required outcome in ProjectDO. Creating or reading an intake never launches a process.
-2. sessions start validates the intake and AC, capability needs, machine freshness, account quota confidence, account capacity, host admission, idempotency key, and any engine override reason.
-3. ProjectDO stores a queued launch intent. The queue index picks the oldest eligible item. The dispatcher records a saga, reserves a provider account slot and a machine slot with the same operation id and fencing epoch, and sends one bounded offer over the host's WebSocket.
-4. The host rechecks current quota and local memory/disk gates. It launches through the maintained launcher and native aplexer. A native UUID plus Hub session UUID is returned as evidence. The host cannot assert completion without confirmed native exit and a result record.
-5. State-report hooks send only working, idle, or waiting transitions. Aplexer mailbox messages are bridged to the recipient's MailboxDO; delivery keys and acknowledgements prevent duplicate sends and expose recorded, transported, acknowledged, read, and completed states separately.
-6. The task records the session and final evidence. A distinct reviewer can record acceptance. On the next wake, the intake queue can resume a dependency or assign another queued task.
-7. Quota views and placement use sanitized snapshots. A stale snapshot is refreshed only on a quota view or placement request. Provider credential refresh is on demand and single-owner per account generation; hosts receive only their approved encrypted bundle and report its generation.
+| Owner | Tables and essential query indexes |
+| --- | --- |
+| ControlDO | credentials: unique token hash, family/revocation generation; device_pairings: unique code hashes/user codes; named_agents and delegates: actor/family/client; repos: unique canonical name, `(status,name)`, unique aliases and duplicate target; object_routes: unique `(kind,id)` and indexed names; project_aliases; policy |
+| ProjectDO | intakes: ID, source message key, verbatim text, transcription/source reference/time, ordered AC, status, priority, promotion, version and timestamps; `(status,updated_at,id)`; intake_events `(task_id,seq)`; ask_mappings `(source_actor,source_message_id)`; dependencies unique `(task_id,prerequisite_id)` and reverse index; claims `(scope,expires_at)` for active rows plus `(expires_at,id)`; scope_ancestors `(ancestor,claim_id)`; queue and sagas as specified below; schedules `(enabled,next_due_at,id)` |
+| MachineDO | machine/capabilities and admission settings; sessions: unique operation/native IDs, `(intake_id,created_at)`, `(state,updated_at,id)`; commands: unique `(session_id,key)`, `(session_id,seq)` and due receipt/ack deadlines; native observations, completion-report outbox and confirmed-stop receipts |
+| AccountDO | account/generation, quota snapshot and reset grants `(available,expires_at,id)`; discovery deadline; reservations: unique operation ID, `(state,expires_at,operation_id)` |
+| MailboxDO | sender outbox: unique `(sender,key)`, message ID, immutable digest, current recipient, route epoch and transition journal; recipient inbox: unique message ID, `(state,created_at,id)`, `(thread_id,created_at,id)`; delivery events `(message_id,seq)`; `(expires_at,id)` for bounded retention |
 
-Root runs every 30 minutes, daily writer runs, user-created schedules, recurring prompts, and durable session wakes are explicit queued work. They are not empty-queue polling. A scheduled occurrence creates one indexed queue row and advances that schedule. When no work, wake, expiry, or enabled schedule is due, there is no Hub alarm.
+Lists use bounded keyset pages with stable tiebreaks; full CLI walks preserve the existing snapshot/list-token or explicit stale-snapshot restart contract. Authorization applies before returning a page or prefix result. A global list carries bounded per-shard cursors; fan-out, authorization and empty shard reads count in its budget. No request path scans historical JSON, performs offset pagination, counts an unbounded table or sweeps all expiries.
 
-## Authentication and secrets
+## Bounded read-cache experiment
 
-Humans authenticate through DTC OIDC authorization-code plus PKCE, an allowlisted operator identity, a secure session cookie, and CSRF protection on browser mutations. Host and agent identities use a one-time device approval, least-privilege scopes, hashed access/refresh credentials, rotation, and revocation. MCP uses OAuth authorization and the same scopes. A session token is bound to its intake, machine, workspace, and native session.
+The DO-local `ReadCache` may retain only simple deterministic single-table `SELECT` results, with cloned values and strict per-instance entry/byte bounds. Joins, CTEs, subqueries (including SQLite's `IN table-name` shorthand), functions, clock expressions, comments, multi-statement SQL, unknown bindings and unsupported query shapes bypass caching. Cache hits/misses/entries/bytes are reported separately; SQLite cursor rows-read/rows-written counters change only when SQL actually executes.
 
-Provider OAuth material is encrypted at rest with an account-specific generation and a Worker-held encryption key. It is returned only to an authenticated, approved host during a signed provisioning request; it is never included in a UI, MCP response, error, audit body, or message. Operational logs contain fixed reason codes and bounded identifiers, not prompts, credentials, quota raw responses, transcripts, or command output. Device and host tokens are never included in migration reports or Git.
+Every mutation invalidates its table before execution; unknown SQL and DDL clear the cache. A failed transaction clears all cached rows. Initial schema and declared migrations are audited before any schema SQL runs; triggers, views, virtual tables, cascade/set-null/set-default actions and SQL comments are rejected. Production SQL must use `MeteredDb`; authorization decisions are never cached, and credential expiry/revocation is rechecked for each request even when the credential row is cached. No separate SQLite catalog query is added for the schema audit.
 
-## Deployment
+If SQL execution, cursor materialization, or counter access throws, MeteredDb marks the measurement invalid, increments its error count, clears cached rows, and rethrows. Missing, non-finite, or negative row counters also invalidate the measurement; none may be interpreted as zero-cost. The native normal-day gate rejects every invalid measurement.
 
-The deploy kit targets Workers Free, SQLite-backed Durable Objects, Cron only for explicit recurring schedules, and static assets. No D1, KV, R2, or paid plan is required. DO class versions and shard identifiers are introduced additively; an implementation release first runs only local Miniflare/Wrangler dry-run validation and a seeded migration test. Production deployment, traffic cutover, or Cloudflare resource changes require Alexey's later approval. This architecture step performs none of them.
+Typed conflict/refusal paths must precheck known conflicts inside their transaction or use conflict-aware SQL so expected 4xx outcomes do not throw SQLite constraints and poison later cost snapshots. Unexpected SQL exceptions remain unknown-cost and fail closed.
 
-The current source includes cost instrumentation in src/rows-meter.ts and event-shaped session, intake, bus, quota, and provisioning modules in src/. Hub 2.0 keeps bounded route-level row counters and reports them through Cloudflare telemetry or one batched nonzero daily summary. It does not write one meter row per API call.
+This is an experiment, not an accepted cost saving. It must pass exact-head core, authentication, account/mail, restart and idle gates, receive independent code review, and show a material reduction on the full required normal-day profile. If it adds no material benefit or weakens cache coherence, remove the module and mount. Never count cache hits as SQL rows saved when counters lack evidence.
 
-## Normal-load Durable Object row-operation budget
+`intake list --all` and archived/history retrieval retain prior asks. `--search`/API `q` is implemented as a bounded client-side page walk over authorized title/text/context; MCP returns a bounded continuation rather than claiming an incomplete search is complete. This deliberately incurs reads proportional to searched history. A future server search index requires its own measured read/write budget. Archived asks remain searchable; retention may remove ephemeral transport data after its deduplication window, never silently delete intake history.
 
-This is a conservative design estimate, not a measurement. “Row operation” means a SQLite row read or write, including index rows, across every shard. Normal workload assumes 48 root runs/day, one daily writer, 20 additional sessions, four hosts, six provider accounts, 20 intake tasks, 100 messages, and 200 operator/dashboard reads. The per-session rows round the resulting 69 scheduled and user sessions up to 70. Empty queue checks and idle WebSocket keepalives make zero SQLite row operations.
+Claim conflicts include ancestor/descendant path scopes, not just equal strings. Check indexed ancestors and bounded descendant ranges in the canonical project transaction; refuse an observation-limit result rather than treating it as no conflict. Preserve native `hub.work-claim.v1` claim/heartbeat/complete/abandon/steal/handoff events and local-first work declarations. TTL renewal, cleanup and redacted audit events are measured work.
 
-| Flow | Daily assumption and allowance | Row operations/day |
-| --- | --- | ---: |
-| Session placement and cross-shard reservation | 70 starts × 40 reads/writes, including saga, account and machine leases | 2,800 |
-| Session state and command lifecycle | 70 sessions × four transitions × five row touches | 1,400 |
-| Intake writes and reads | 20 tasks × 12 plus 50 indexed lists/details × 10 rows | 740 |
-| Messages and delivery receipts | 100 messages × eight rows for insert, inbox, delivery, and ack | 800 |
-| Native work claims | 50 create/check/release cycles × four rows | 200 |
-| On-demand quota snapshots | Up to 48 stale placement/view batches × six accounts × four read/write row touches | 1,152 |
-| Scheduled root/writer queue | 48 root occurrences plus one writer × two queue/schedule touches | 98 |
-| Root and writer API activity | 49 runs × 10 bounded calls × about five returned/index rows | 2,450 |
-| Operator, MCP, and dashboard reads | 200 calls × 11 rows including authorization and bounded projection | 2,200 |
-| Retry/expiry work | 20 due or retrying rows × six indexed touches | 120 |
-| Index, metering, audit, and cross-shard reserve | Explicit 13% allowance for extra index and saga rows | 1,800 |
-| Machine event transitions | Four hosts × two actual state transitions/day × four rows | 32 |
-| Total forecast | Rounded upward from 13,792 | 14,000 |
+## Queue, saga, fencing and recovery
 
-The forecast leaves 6,000 row operations/day below the strict 20,000 combined target. A real implementation must meter rows_read plus rows_written by shard and route, alert at 15,000/day, stop optional summaries/retries above 18,000/day, and fail the load-test gate at 20,000/day. The estimate assumes indexed keyset reads, no per-heartbeat SQL, no periodic quota polling, and no unbounded retention work; if measured data disproves any assumption, revise the architecture before production.
+The autonomous queue is an explicit durable state machine. Intake creation with AC inserts an eligible queue record in the same ProjectDO transaction, unless a live assignment, dependency or completion-review hold already owns it. Editing AC, dependency completion, machine/account capacity release and recovery events update eligibility. Read-only context/show never launches a process.
 
-## Production line budget and planned tests
+Preserve promotion and priority behavior: promoted first (newest promotion first), then high/normal/low, then newest intake with ID as tiebreak. Due-time and precedence are separate indexes: an indexed due lane moves a bounded batch into a ready lane indexed by precedence; delayed rows cannot block ready work. Due-time ties use sequence order. Explicit session starts use FIFO within their ready lane. Do not describe all queue selection as FIFO. Each transaction handles one bounded item and arms the next deadline if more work remains; admission holds receive backoff, so an ineligible head cannot spin or starve later work. Capacity/dependency notifications are durable idempotent outbox events to subscribed projects, with bounded replay after disconnect; their retries and reads are budgeted.
 
-The line budget covers authored production code, excluding tests, generated bundles, vendored assets, and documentation. It includes src/ plus the host CLI/agent, dashboard, and deploy scripts so the whole rewrite stays below 6,000 lines.
+ProjectDO owns each dispatch saga: `operation_id`, immutable request/digest, session ID, attempt, epoch, selected account/machine, reservation receipts, step, `next_action_at`, retry count and last reason. Index `(next_action_at,operation_id)` for nonterminal rows. Pop the queue and create the saga plus its deadline atomically. States are pending-account, pending-machine, pending-offer, awaiting-native, running, compensating, complete and needs-attention. Persist the next action before every external effect; replay with the same operation ID. An ambiguous timeout queries the existing reservation/host journal instead of making a new intent. Partial holds are compensated idempotently; compensation itself has a durable retry deadline. Bounded retries escalate visibly with intake context instead of deleting work. Cloudflare's finite automatic alarm retries do not replace this journal.
 
-| Module | Budget |
-| --- | ---: |
-| src/worker.ts: edge routes, assets, cron | 160 |
-| src/control-do.ts: auth directory, config, dispatch saga | 220 |
-| src/repositories.ts: schemas, indexes, transactions, bounded query helpers | 400 |
-| src/auth.ts: DTC, device pairing, scopes, MCP OAuth | 420 |
-| src/project-do.ts: intakes, events, dependencies, queue | 420 |
-| src/machine-do.ts: host presence, sessions, commands, lifecycle | 500 |
-| src/dispatch.ts: route choice, lease fencing, retries | 380 |
-| src/fleet.ts: machine registry and capability matching | 300 |
-| src/account-do.ts: quota, model policy, sealed credentials | 450 |
-| src/mailbox-do.ts: messages, receipts, aplexer relay | 380 |
-| src/schedules.ts: root, writer, prompts, session wakes | 220 |
-| src/status.ts: health and bounded dashboard projections | 150 |
-| src/api-mcp.ts: REST validation and allowlisted MCP registry | 400 |
-| src subtotal | 4,400 |
-| host/agent_hub_host/: stdlib CLI, receiver, installer/update, aplexer bridge | 800 |
-| public/: phone-friendly static dashboard | 350 |
-| scripts/: local build, migration, and deploy-kit helpers | 150 |
-| Total production-code budget | 5,700 |
-| Unallocated ceiling | 300 |
+MachineDO issues increasing epochs for a session operation; reservations accept only the current authorized epoch and retain terminal receipts through the retry window. The host fsyncs operation ID, epoch and intended native identity before launch and records the resulting UUID. A restart reconciles the journal against native census before retrying; a crash between spawn and receipt is uncertain, never permission to spawn again. Stale offers/commands are rejected against the host's persisted high-water epoch. A replay returns the prior receipt. Native launch acknowledgement and first actual agent activity are separate states.
 
-Planned tests, not run as part of this architecture task:
+An unclaimed offer may expire. A running process does not release account/machine capacity merely because its lease or connection expires: quarantine it as uncertain until fresh native exit/stop evidence proves release. Remote epoch changes cannot fence off an isolated running process. Replacements on the same task require confirmed predecessor stop or an explicitly acknowledged, isolated handoff that retains its occupied capacity and claims. No claim is silently stolen on a timer. Late receipts reconcile to the original operation and cannot resurrect a cancelled or superseded intent.
 
-- Contract tests for every kept CLI and MCP command, JSON/API compatibility, page limits, and typed refusals.
-- SQLite tests assert each list, inbox, queue-pop, retention, and status query uses its named index; test row counts from cursor rowsRead/rowsWritten rather than SQL statement counts.
-- Queue tests cover FIFO among due items, delayed items, idempotent retries, partial cross-shard reservation rollback, stale fencing epochs, and no alarm on an empty queue.
-- Placement tests combine machine capabilities, online state, quota freshness, account caps, and local host admission without routing to an unadvertised tool or OS.
-- Aplexer integration tests cover native UUID binding, state-report transitions, command delivery/ack, inbox/reply threading, duplicate suppression, stop confirmation, and disconnected-host recovery.
-- Security tests cover DTC PKCE, CSRF, device-code one-time use, scope ceilings, refresh rotation, revocation, MCP grants, credential encryption, and secret-free errors.
-- Migration tests round-trip representative intakes, dependencies, schedules, machines, accounts, sessions, and message threads with IDs and event order preserved.
-- A load-budget test replays the normal workload above and fails if aggregate SQLite rows_read plus rows_written reaches 20,000/day; idle tests assert zero DB reads/writes and no alarm when no explicit work exists.
+MachineDO persists deadlines for offer receipt, first activity, command receipt/ack, host freshness/offline alert and session progress. Stalls preserve capacity; recovery requests canonical stop, waits for exit proof, then schedules bounded retry/fallback through normal admission. Goal capability, engine/account failure history, protected custody and pending wakes constrain recovery. A reconnect replays unacknowledged events from host journals, reconciles native UUIDs and external/backup-started sessions, and retries pending report forwarding without duplicate intake events.
+
+A durable session wake has pending, queued, delivered, acknowledged, missed and resolved states. `waiting_until` suppresses stall/nudge while the future wake is pending. No native inbox receipt within ten minutes of due time opens attention; after receipt, no verified ack within ten minutes of delivery also opens attention and an intake recovery event. A late ack resolves attention but preserves the missed deadline history. Recurring prompts coalesce while busy, retain delivery evidence and end with their session unless explicitly rebound by an operator.
+
+Every DO schedules its one alarm for the earliest nonterminal deadline: queue, saga retry, reservation/claim expiry, host freshness, wake/command ack, report forwarding, reset discovery/alert, retention or enabled recurrence. A transaction updates state and its deadline; duplicate alarm execution is harmless. No alarm is needed when no such work exists. There are no periodic empty-queue scans. Correctness recovery, revocation and deadline delivery remain enabled under budget pressure; optional summaries may be reduced.
+
+## Cross-shard messages
+
+The sender's MailboxDO is the sole authority for `(sender,idempotency_key)` across all recipients, matching the existing bus conflict contract. It assigns a stable message ID and route epoch, records an immutable payload digest and persists an outbox step before delivery. Recipient MailboxDO inserts an inbox projection idempotently by message ID/epoch and returns a receipt; the sender retries until recorded. One logical message may have several projections, but only the authorized current recipient epoch can deliver it. Directory registration is another replayable outbox step.
+
+Replies authorize against a stable parent-message participant record at its sender owner, inherit the thread ID, and create a new sender-owned outbox entry. Thread history uses bounded participant-authorized mailbox pages and explicit cursors; no global thread scan is assumed. Stage events have stable event IDs so retrying delivery/read/ack/accept/complete notifications cannot duplicate audit history. Transport receipt, native inbox delivery, read, acknowledgement and completion remain distinct.
+
+Operator readdress is allowed only before native delivery. The sender first marks the old route revoking; its recipient must atomically fence that epoch against native-delivery authorization and acknowledge revocation before the sender activates the new epoch. If delivery is uncertain, reconcile it or refuse readdress; never deliver to both recipients. Recipient ACLs follow the current epoch. Preserve original request digest and the readdress event so retrying the original send returns its existing message rather than creating another. Deduplication retention cannot end before all delivery/readdress retries are terminal.
+
+Named agents retain operator-granted credential-family/MCP-client delegation and explicit session forwarding. `as` chooses only a granted identity; sender identity is never trusted from arbitrary payload text. The phone inbox includes only the human and named-agent inboxes authorized to that login.
+
+## API, CLI, MCP and contract coverage
+
+Keep the existing `/api/intake/tasks`, `/api/sessions`, `/api/bus`, `/api/repos` and fleet contracts through compatible handlers; additive v2 routes do not silently break old clients. Each row below requires positive, refusal, idempotent-retry and authorization contract tests. CLI file/stdin handling stays local; MCP never reads host files or returns newly minted secrets.
+
+| Workflow and CLI flags | REST and MCP contract | Authorization and required special cases |
+| --- | --- | --- |
+| `repos list --status active`, `repos show <name>`, `repos edit` | GET `/api/repos`, GET/PATCH `/api/repos/:name`; `repos_list/show/edit` | Authorized registry readers; operator edits only; canonical/duplicate/alias/domain metadata survives refresh; ambiguous alias refuses |
+| `intake create`, append/update (`--version`, `--key`), show/context/history | `/api/intake/tasks[/:id]`, `/:id/events`, `/:id/context`, `/:id/history`; `intake_create/append/update/show/context/history` | Operator/project grants; scoped worker writes only its allowed intake events; source/transcription and AC order preserved; CAS conflicts; never infer DONE from exit alone |
+| `intake list --all --search --status`, forgotten | GET `/api/intake/tasks`, `/api/intake/forgotten`; `intake_list/forgotten` | Authorized pages, prefix ambiguity, churn/restart, archived dedup search and incomplete-search continuation |
+| `intake assign/depend/blocker/decompose/promote` | POST `/:id/assign`, `/depend`, `/blocker`, `/decompose`, `/promote`; matching `intake_*` tools | AC gate; same-project acyclic dependencies; session may file its own blocker; shared blocker-key dedup; goal/deep-tier admission and reason; promotion/CAS |
+| `sessions start --workspace/--repo --intake-task-id --tier --needs --machine --interactive/--brief-file/--prompt --with-goal --effort --parent --key`; override `--engine --reason` | POST `/api/sessions`; `sessions_start` | Authorized intake and workspace/machine; nonempty AC; goal-capable interactive start; explicit deep/engine reason; preserve parent lineage and typed rejection details |
+| `sessions link`, list/show/count/tree | POST `/:id/link`, GET `/api/sessions[/:id]`, `/api/sessions/tree`; `sessions_link/list/show/tree` | Link requires fresh native census and matching task/machine/workspace; count/breakdown and global pages bounded, never unbounded COUNT |
+| `sessions send --prompt/--body-file --key --wait --timeout`, commands, capture `--screen` | POST `/:id/send`, `/:id/capture`; GET `/:id/commands`; `sessions_send/capture/commands` | Own/granted interactive session; headless send refusal; readiness, bounded sanitized capture, native receipt/ack after reconnect; wait is not proof |
+| `sessions cancel/stop --key`, wake `--at --prompt/--body-file --key` | POST `/:id/cancel`, `/stop`, `/wake`; `sessions_cancel/stop/wake` | Cancel only preauthorization; stop requires native exit; own-session wake; ten-minute deadlines, waiting suppression and missed-wake recovery |
+| `sessions start --engine shell --interactive --reason`, `shell-audit` | POST `/api/sessions`; GET `/:id/shell-audit` | Human operator only, including send/capture; no shell-start agent MCP authority; command audit excludes output |
+| `msg send/reply --to --body/--body-file --key --tui/--inbox`, inbox `--wait --unread`, show/ack/status | `/api/bus/send`, `/reply`, `/inbox`, `/messages/:id[/ack|/status]`; `msg_send/reply/inbox/show/ack/status`; legacy bus accept/complete aliases | Session/human/named-agent recipient grants; delegated `as`; sender-key conflict across recipients, thread ACL, distinct stage receipts, exit codes 0/2/3/4 |
+| `msg readdress`; `msg --profile`, `msg agent-delegate`, named-agent create/delegate/forward | POST `/api/bus/messages/:id/readdress`, `/api/agents/named/:name/{create,delegate,forward}` | Operator administration; secret-minting stays CLI/private file; test revoked grants, forwarding and readdress races |
+| claims/activity and native `workclaim-sync` | `/api/bus/claims[/:id/release]`, `/activity`, `/native-sync`; `claims_list/create/release`, `bus_activity` | Scoped holders; host attestation for native events; path overlap, TTL, handoff and stale-epoch refusals |
+| machines available, host-capabilities `--add`, routing-machines, model-policy, quota/banked | `/api/machines/available`, `/api/fleet/routing/{machines,policy}`, `/api/quota`; `machines_available/routing_machines/model_policy/quota` | Sanitized authorized views; host changes only its advertisement; stale/unknown fail closed; reset expiry alerts and no automatic redemption |
+| auth login/status/logout; host login/device approval; managed engines login/status | `/api/auth/*`, `/api/device/*`, `/api/mcp/oauth/*`, approved provisioning endpoints | Human PKCE/CSRF, one-time pairing, operator account import/consent, least privilege, encrypted generations/host ack; credentials never in MCP output |
+| schedules create `--session --cron --prompt-file`, list/show/deliveries/pause/resume; ping/loop aliases | `/api/schedules[/:id[/deliveries|/pause|/resume]]`, `/api/sessions/:id/ping[-clear]`; `sessions_ping/ping_clear/pings` | Operator schedules; session clears its own ping; cron timezone/DST, busy coalescing, stop/rebind, durable receipts |
+| driver start/status/stop/restart; status/dashboard; webhook wake | `/api/driver[/start|/stop|/restart]`, `/api/status`, `/api/webhooks/:route`; `driver_start/status/stop/restart`, `status` | Operator singleton lifecycle; bounded health projections; authenticated/rate-bounded webhook with deduplication, fixed configured recipient and no payload-granted authority |
+
+Completion is host-journaled: native exit plus bounded report/evidence is sent through MachineDO's completion outbox to ProjectDO as one deduplicated intake event. Missing reports stay unknown/failed and retry forwarding; they cannot become accepted completion. A distinct reviewer records AC acceptance. Final evidence and task state update together with dependency/capacity notifications. Existing automatic intake finish reporting must not require an operator to babysit a session.
+
+## Authentication and transport
+
+Humans use DTC OIDC authorization-code plus PKCE, allowlisted identity and secure cookies. Cookie mutations require same-origin checks and a CSRF token, including explicit read/delivery receipt mutations. Browser GETs remain safe. CLI/MCP `show` and inbox retain their user-facing read/delivered behavior by following the safe read with an authorized idempotent receipt POST; MCP's compatibility handler performs that POST under its bearer authority. Bearer requests do not inherit cookie authority.
+
+The Worker authenticates each request against current ControlDO credential/grant state and passes a bounded internal capability binding actor, scopes, resource, request digest and expiry to the owner. Internal capabilities are signed with service-only key material and accepted only through fixed internal dispatch; shards recheck resource ownership. Writes and WebSocket application messages revalidate current revocation/grants before effects. Pure protocol keepalives do not authorize work. A hibernation attachment restores connection identity, not permanent authorization. Idle revoked connections may remain physically open until an event but cannot act or receive sensitive delivery without a fresh check. No per-request `last_used_at` write; any coarse audit write is explicit and measured. CSRF/cookie cryptographic checks themselves need no SQL, but credential/grant/directory reads do.
+
+Provider OAuth bundles are encrypted at rest with generation and returned only to approved authenticated hosts. Refresh is single-owner and generation-fenced. Operators retain central account login/import and per-host sync status. Quota refresh runs on stale placement/view and explicit reset discovery jobs. Keep grant expiry, availability and unknown-probe reasons; schedule deduplicated >=36h and <24h alerts. Refresh discovery at a configured maximum six-hour interval for enabled accounts, plus on demand, to discover new grants while otherwise idle. Late-discovered grants alert immediately with their remaining lead time; unknown discovery raises attention rather than claiming advance coverage. No reset is redeemed automatically; each requires explicit operator authorization. These are enabled jobs with measured cost, not free idle behavior.
+
+Hosts and CLI use an outbound hibernatable WebSocket protocol with authenticated upgrade, bounded frames, request IDs, resume cursor and reconnect backoff. The transport implementation is an unresolved vertical-slice gate: Python stdlib has no assumed ready-made WebSocket client. First evaluate a maintained aplexer transport seam; otherwise count an authored stdlib RFC 6455 client and its TLS/framing/close/reconnect behavior in the host budget. Do not silently introduce an undeclared dependency. Linux and native Windows must both pass the same contracts. Reuse the maintained launcher/aplexer binaries, not their source copied outside the line count.
+
+## Deployment and initialization
+
+No deploy, resource creation or traffic cutover is authorized by this proposal. Prepare local Miniflare/Wrangler dry-run artifacts and a seeded migration; production needs Alexey's later approval.
+
+Schema/index creation and data migrations are version-gated. A normal reactivation performs only the bounded version check and attachment restoration; no historical scan, index rebuild or unconditional backfill. Instrument first creation, repeated activation, schema upgrade, reconnect and failed migration separately. Index creation on populated data is migration work and must be measured before rollout. Hibernation resets memory, so constructor work is not a one-time service cost.
+
+Rows instrumentation covers SQL cursors in constructors, auth, API, internal dispatch, alarms, retries, expiry and migration. Export route/shard totals via telemetry; do not rely on a daily in-memory counter surviving eviction. Count alarm/storage writes outside SQL separately in the combined gate and avoid double counting them. Metering writes, if used, count too. Free-plan request, CPU/duration and storage limits require separate checks; a row target alone does not establish Free-plan viability.
+
+## Row-operation worksheet and acceptance gate
+
+The previous 14,000/day forecast is withdrawn: fixed allowances omitted cross-shard auth, index amplification, activation, discovery, retention and recovery. No <20,000/day result is claimed. The latest reported native Workerd baseline measured 5,748 SQLite row reads+writes and 660 alarm operations across 20 happy user lifecycles, with zero idle SQL/alarm work. The required 70 starts alone extrapolate to about 20,118 row operations at that baseline, before messages and the other required workflows. That extrapolation is not a measurement; the current complete-day gate is incomplete and failing. Rerun it against a stable exact source after the active Project, Worker, Machine, and Account changes land.
+
+Normal replay inputs are 70 starts (48 root, one writer, 20 user, rounded up), four host transitions per host for four hosts, six enabled accounts, 20 new tasks, 100 messages, 50 claim cycles, 49 scheduled occurrences, 490 root/writer API calls, 200 dashboard/operator calls, and 20 retry episodes. Workload size is a proposed fixture, not measured demand; additionally replay the actual orchestrator/on-call prompt schedules when configured. Calls already attributed to a workflow must not be counted again as generic calls.
+
+| Worksheet term | Required measurement and daily multiplier |
+| --- | --- |
+| Dispatch | 70 × full saga: queue/index writes, directory, account/machine reservation, offer, admission, launch receipt and compensation |
+| Session/command/report | Observed per-session transition/command counts × indexed reads/writes and report forwarding; four transitions is only an initial fixture |
+| Intake/history/search | 20 creates plus measured update/history traffic; page rows × pages × queried project shards, including retained archive searches |
+| Messages | 100 × sender outbox, recipient projection, directory, native delivery, read/ack/event rows and any thread/readdress work |
+| Claims | 50 × create/overlap checks/renewals/release, including ancestor/index entries and expiry |
+| Quota/reset | Up to 48 stale batches × six accounts, plus up to four six-account discovery batches/day, expiry alerts and failed-probe handling; coalesce overlapping batches |
+| Schedules | 49 root/writer occurrences plus configured recurring prompts and wakes, including occurrence dedup, advance, enqueue, delivery and alarm rearming |
+| API/auth/fan-out | 490 root/writer and 200 operator calls, with actual shard/page counts; credential/grant/directory checks on every applicable API/internal/WS operation, counted once |
+| Recovery/retention | 20 retry episodes plus due command/wake/host/claim/account deadlines, bounded purges and notification replay; include index deletes |
+| Activation/schema | Activations by class × measured cold-constructor cost; populated first creation/index migration measured separately |
+| Metering/storage | Telemetry or persisted summaries plus alarm/storage operations not reported by SQL cursors |
+
+For scenario s, total is `sum(count[s,flow] * measured_cost[s,flow])`, including rows read plus written and separately metered storage/alarm row operations. Report costs by shard and reason, not an arbitrary percentage reserve. Until a runnable slice measures these coefficients, a revised point estimate would repeat the original unsupported claim.
+
+| Scenario | Required replay and interpretation |
+| --- | --- |
+| Empty steady idle | No jobs/deadlines or requests: zero SQL and no alarm. Connection keepalives use protocol/auto-response handling. This excludes fresh activation and enabled discovery jobs. |
+| Normal warm | Inputs above, populated history, normal list/search pages and configured prompts; must stay strictly below 20,000 combined operations/day |
+| Normal cold/reconnect | Same workload with forced eviction between events and host reconnect/replay; constructor and reauthorization costs included; same normal-day target |
+| Failure day | Lost offer/receipt, account refresh failure, host partition and missed wake; measure bounded retry/escalation and remaining capacity truthfully; never disable correctness to meet a number |
+| Migration/index build | Representative retained data and new indexes; separately report one-time operations, runtime/storage limits and approved activation plan |
+
+Sensitivity only: adding 200 projection calls with 19 extra touches, 700 auth paths with two extra touches and 1,000 activations with two schema touches to the withdrawn 13,792 subtotal yields 20,992/day. These are hypothetical coefficients, not measured usage or a replacement forecast. They demonstrate why the margin was unproven.
+
+Alert at 15,000/day; reduce optional summaries at 18,000/day. Preserve recovery, required alerts, authorization and state reconciliation. The normal-day load gate fails at 20,000/day. A failure requires architecture/workload correction before production; the number is not permission to abandon queued work or silently weaken retained features.
+
+## Authored line target and test status
+
+The <=6,000 limit is product SLOC: Worker modules, schemas, host/CLI, transport, dashboard, and actual production package, migration, build, install, and deploy code. Count any test-directory code that ships with or is imported by the application after auditing its purpose. Test assertions/harnesses, local-only Wrangler config, package commands used only for tests, line-count tooling and CI workflows are not product code; report their SLOC and physical totals separately. The checker counts nonblank, noncomment physical source lines and never minifies. Generated/vendor files, documentation and binary assets are excluded and listed by rule.
+
+The provisional 5,700-line allocation has been withdrawn. `hub2/scripts/production-line-budget.py` reports product SLOC, physical lines, test harnesses and verification tooling as separate categories. Its 6,000-line gate applies only to product SLOC. A changing-tree snapshot on 4 November measured 5,729 product SLOC / 6,022 physical lines across 26 files, 253 verification-tool SLOC / 300 physical lines, and 2,043 test/harness SLOC / 2,167 physical lines. The product portion was below the limit by 271 SLOC at that snapshot; all scoped code totaled 8,025 SLOC / 8,489 physical lines. This is not a stable exact-head result. No app-source reference to the test/harness directories was found during classification; test wrappers exercise synthetic fixtures and remain separately reported. Rerun the count after all edits stop and before acceptance; do not move shipped functionality under tests or omit actual production operations.
+
+The earlier Worker-to-native Muse slice passed locally through genuine quota, enrollment, authenticated WebSocket, maintained launcher, verified first action, artifact, natural exit and intake finish; that proof predates current Project/Worker and integration edits and must be repeated for final acceptance. Host tests and targeted Durable Object tests have also passed on prior source revisions. The full parity suite, complete native normal-day workload, exact-head line budget, fresh restart/index-cost run, and cross-surface review remain required. A prior green slice is not final acceptance, and no budget or feature may be weakened to obtain it.
+
+Remaining verification coverage includes:
+
+- Every contract-matrix row, including repo metadata/operator edits, goal capability, cancel/link/decompose/forgotten, named-agent delegation, safe read plus receipt, old route aliases and CLI exit codes.
+- Query plans and cursor row counts for ready/due lanes, precedence, scope ancestors, directories/prefixes, history/search, expiry and bounded fan-out, using representative retained data.
+- Crash injection before/after each saga/outbox effect; repeated alarms; reservation/compensation failure; stale epochs, host journal restart, uncertain native launch and no duplicate process after reconnect.
+- Wake due/delivery acknowledgement clocks, late ack, pending-wake stall suppression, host freshness, first activity, terminal recovery, completion/report replay and dependency/capacity notification delivery.
+- Sender-key conflicts across recipients, reply ACL, readdress racing native delivery, revoked delegation, projection replay and dedup expiry.
+- DTC PKCE, browser CSRF including read receipts, bearer scope separation, revoked connected clients, internal capability tampering, credential rotation and encrypted provisioning with secret-free errors.
+- Reset discovery without traffic, unknown probes, scheduled lead-time alerts, late discovery and no unauthorized redemption; cron timezone/DST and busy coalescing.
+- Migration parity for all historical asks, provenance, repo metadata, grants/named agents, directory mappings, queue/saga state, reports and message deduplication.
+- Warm/cold/reconnect load scenarios above; first-creation and populated-index migration costs; no-event idle and platform Free-plan limits independently of rows.

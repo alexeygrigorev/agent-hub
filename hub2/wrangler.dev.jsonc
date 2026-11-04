@@ -1,0 +1,28 @@
+{
+  // Local-only acceptance environment. This file has no production routes,
+  // workers.dev exposure, cron triggers, or remote bindings.
+  "name": "agent-hub2-local",
+  "main": "host/tests/e2e-worker.ts",
+  "compatibility_date": "2026-10-01",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": true
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "CONTROL", "class_name": "ControlDO" },
+      { "name": "PROJECTS", "class_name": "ProjectDO" },
+      { "name": "MACHINES", "class_name": "MachineDO" },
+      { "name": "ACCOUNTS", "class_name": "AccountDO" },
+      { "name": "MAILBOXES", "class_name": "MailboxDO" }
+    ]
+  },
+  "migrations": [
+    { "tag": "hub2-local-v1", "new_sqlite_classes": ["ControlDO", "ProjectDO", "MachineDO", "AccountDO", "MailboxDO"] }
+  ],
+  "vars": {
+    "HUB2_DEFAULT_ACCOUNT_ID": "e2e-muse",
+    "HUB2_ENGINE_ACCOUNTS": "{\"opencode\":\"e2e-muse\"}"
+  }
+}

@@ -1,0 +1,73 @@
+import assert from 'node:assert/strict';
+import {webcrypto,createHash} from 'node:crypto';
+import {build} from 'esbuild';
+import {Miniflare,Log,LogLevel,convertV4MiniflareOptions} from 'miniflare';
+import {resolve} from 'node:path';
+import {spawn} from 'node:child_process';
+import {readFile,writeFile,mkdir,mkdtemp,stat} from 'node:fs/promises';
+const root=resolve(import.meta.dirname,'../..');const sourceNames=['auth','control-auth','control-do','worker','mcp'];const sourceHashes=async()=>Object.fromEntries(await Promise.all(sourceNames.map(async n=>[n,createHash('sha256').update(await readFile(resolve(root,'hub2/src/'+n+'.ts'))).digest('hex')])));const beforeHashes=await sourceHashes();const bootstrap='synthetic-auth-fixture-bootstrap-0000000000';
+const bundle=await build({entryPoints:[resolve(root,'hub2/tests/normal-day-auth-worker.ts')],bundle:true,write:false,format:'esm',platform:'browser',external:['cloudflare:workers']});
+const names={CONTROL:'CoreControl',PROJECTS:'CoreProject',MACHINES:'CoreMachine',ACCOUNTS:'CoreAccount',MAILBOXES:'CoreMailbox'};
+const mf=new Miniflare(convertV4MiniflareOptions({port:0,host:'127.0.0.1',log:new Log(LogLevel.ERROR),workers:[{name:'hub2-auth-native-test',script:bundle.outputFiles[0].text,modules:true,compatibilityDate:'2024-04-05',durableObjects:Object.fromEntries(Object.entries(names).map(([k,className])=>[k,{className,useSQLite:true}])),bindings:{HUB2_DEV_OPERATOR_TOKEN:bootstrap,AUTH_BASE_URL:'https://oidc.fixture',AUTH_CLIENT_ID:'hub2-auth-test',AUTH_CALLBACK_URL:'https://hub.fixture/auth/callback',AUTH_ISSUER:'https://oidc.fixture',AUTH_JWKS_URL:'https://oidc.fixture/jwks',HUB_ADMINS:'allowed@example.test'}}]}));
+const key=await webcrypto.subtle.generateKey({name:'RSASSA-PKCS1-v1_5',modulusLength:2048,publicExponent:new Uint8Array([1,0,1]),hash:'SHA-256'},true,['sign','verify']);
+const jwk={...await webcrypto.subtle.exportKey('jwk',key.publicKey),kid:'fixture-key',alg:'RS256',use:'sig'};
+let base;const results=[];
+async function call(path,method='GET',body,headers={}){return fetch(base+path,{method,redirect:'manual',headers:{'Content-Type':'application/json',...headers},...(body===undefined?{}:{body:JSON.stringify(body)})});}
+const cookie=r=>r.headers.getSetCookie().map(s=>s.split(';')[0]).filter(s=>!s.endsWith('=')).join('; ');
+async function signed(claims,invalid=false){const h=Buffer.from(JSON.stringify({alg:'RS256',kid:'fixture-key'})).toString('base64url'),p=Buffer.from(JSON.stringify(claims)).toString('base64url'),sig=Buffer.from(await webcrypto.subtle.sign('RSASSA-PKCS1-v1_5',key.privateKey,Buffer.from(h+'.'+p))).toString('base64url');return h+'.'+p+'.'+(invalid?'bad-signature':sig);}
+async function login(patch={},invalid=false){const response=await call('/auth/login');assert.equal(response.status,302,'login '+await response.clone().text());const location=new URL(response.headers.get('Location')),state=location.searchParams.get('state'),nonce=location.searchParams.get('nonce');assert.equal(location.searchParams.get('code_challenge_method'),'S256');const jwt=await signed({sub:'fixture-user',email:'allowed@example.test',email_verified:true,iss:'https://oidc.fixture',aud:'hub2-auth-test',nonce,token_use:'id',exp:Math.floor(Date.now()/1000)+3600,...patch},invalid);assert.equal((await call('/_fixture/provider','POST',{jwks:{keys:[jwk]},challenge:location.searchParams.get('code_challenge'),token:jwt},{Authorization:'Bearer '+bootstrap})).status,200);return{state,cookie:cookie(response),path:'/auth/callback?state='+encodeURIComponent(state)+'&code=fixture-code'};}
+async function cliRoundtrip(sessionCookie,csrf){
+ assert.equal((await call('/_fixture/use-actual-origin','POST',{}, {Authorization:'Bearer '+bootstrap})).status,200);
+ await mkdir(resolve(root,'.local/tmp'),{recursive:true});const directory=await mkdtemp(resolve(root,'.local/tmp/auth-cli-')),config=resolve(directory,'credentials.json');
+ const env={...process.env,PYTHONPATH:resolve(root,'hub2/host')};delete env.HUB2_TOKEN;
+ async function command(action,approve=false){let out='',err='',approval,approvalError;const child=spawn('python3',['-m','agent_hub_host.cli','--server',base,'--config',config,'auth',action,...(action==='login'?['--no-browser']:[])],{cwd:root,env,stdio:['ignore','pipe','pipe']});const timer=setTimeout(()=>child.kill(),20000);
+  child.stdout.on('data',b=>out+=b);child.stderr.on('data',b=>{err+=b;if(approve&&!approval){const match=err.match(/https?:\/\/[^\s]+\/device\?user_code=([A-Za-z0-9_%=-]+)/);if(match)approval=(async()=>{const response=await call('/api/device/approve','POST',{user_code:decodeURIComponent(match[1])},{Cookie:sessionCookie,'x-csrf-token':csrf});assert.equal(response.status,200);})().catch(e=>{approvalError=e;child.kill();});}});
+  const code=await new Promise((resolve,reject)=>{child.once('error',reject);child.once('close',resolve);});clearTimeout(timer);if(approval)await approval;if(approvalError)throw approvalError;if(code!==0)await writeFile('/home/alexey/tmp/agent-reports/hub2-auth-cli-failure-private.txt',out+'\n'+err,{mode:0o600});assert.equal(code,0,'CLI '+action+' failed (output kept private)');if(approve)assert(approval,'CLI must print only the public approval URL');return{out,err};
+ }
+ const logged=await command('login',true),credentials=JSON.parse(await readFile(config,'utf8'));assert.equal((await stat(config)).mode&0o777,0o600);assert(credentials.token&&credentials.refresh_token);assert(!logged.out.includes(credentials.token)&&!logged.err.includes(credentials.token)&&!logged.out.includes(credentials.refresh_token)&&!logged.err.includes(credentials.refresh_token));
+ assert.equal((await call('/api/repos','GET',undefined,{Authorization:'Bearer '+credentials.token})).status,200);
+ const refreshed=await command('refresh'),newer=JSON.parse(await readFile(config,'utf8'));assert.notEqual(newer.token,credentials.token);assert.notEqual(newer.refresh_token,credentials.refresh_token);assert(!refreshed.out.includes(newer.token)&&!refreshed.err.includes(newer.refresh_token));assert.equal((await call('/api/repos','GET',undefined,{Authorization:'Bearer '+credentials.token})).status,401);
+ await command('logout');const gone=JSON.parse(await readFile(config,'utf8'));assert(!gone.token&&!gone.refresh_token);assert.equal((await call('/api/repos','GET',undefined,{Authorization:'Bearer '+newer.token})).status,401);
+}
+async function test(name,fn){try{await fn();results.push({name,passed:true});}catch(e){results.push({name,passed:false,error:String(e.stack)});}}
+try{base=(await mf.ready).origin;
+ await test('OIDC callback requires browser-bound one-use state',async()=>{const l=await login();assert.equal((await call(l.path)).status,400);const good=await call(l.path,'GET',undefined,{Cookie:l.cookie});assert.equal(good.status,303);assert.equal((await call(l.path,'GET',undefined,{Cookie:l.cookie})).status,400);});
+ for(const[name,patch,invalid]of[['issuer',{iss:'https://evil.invalid'},false],['audience',{aud:'other-client'},false],['nonce',{nonce:'forged'},false],['email',{email:'unlisted@example.test'},false],['signature',{},true],['expired',{exp:Math.floor(Date.now()/1000)-1},false]])await test('reject wrong '+name,async()=>{const l=await login(patch,invalid);assert.equal((await call(l.path,'GET',undefined,{Cookie:l.cookie})).status,400);});
+ await test('secure cookie and CSRF device approval, bearer rotation and revocation',async()=>{
+  const l=await login(),callback=await call(l.path,'GET',undefined,{Cookie:l.cookie});assert.equal(callback.status,303);assert(callback.headers.getSetCookie().some(c=>c.startsWith('hub2_session=')&&c.includes('HttpOnly')&&c.includes('Secure')&&c.includes('SameSite=Lax')));const sessionCookie=cookie(callback);
+  const session=await call('/auth/session','GET',undefined,{Cookie:sessionCookie});assert.equal(session.status,200);const identity=await session.json();assert.equal(identity.actor.id,'human:fixture-user');
+  const metric=async()=>(await(await call('/_fixture/auth-metrics','GET',undefined,{Authorization:'Bearer '+bootstrap})).json()).counts;
+  const authority={actor_id:identity.actor.id,generation:identity.actor.generation};
+  const before=await metric();assert.equal((await call('/_fixture/authority','POST',authority,{Authorization:'Bearer '+bootstrap})).status,200);const small=await metric();
+  assert.equal((await call('/_fixture/auth-history','POST',{}, {Authorization:'Bearer '+bootstrap})).status,200);const largeBefore=await metric();assert.equal((await call('/_fixture/authority','POST',authority,{Authorization:'Bearer '+bootstrap})).status,200);const largeAfter=await metric();assert(largeAfter.rows_read-largeBefore.rows_read<=small.rows_read-before.rows_read+1,'authorization must remain indexed after credential history');
+  assert.equal((await call('/_fixture/narrow-browser','POST',{narrow:true},{Authorization:'Bearer '+bootstrap})).status,200);assert.equal((await call('/_fixture/authority','POST',{...authority,scope:'repos:read'},{Authorization:'Bearer '+bootstrap})).status,403);assert.equal((await call('/_fixture/narrow-browser','POST',{narrow:false},{Authorization:'Bearer '+bootstrap})).status,200);
+  const device=await call('/api/device/code','POST',{client_id:'fixture-cli'});assert.equal(device.status,200);const d=await device.json();
+  assert.equal((await call('/api/device/approve','POST',{user_code:d.user_code},{Cookie:sessionCookie})).status,403);
+  assert.equal((await call('/api/device/approve','POST',{user_code:d.user_code},{Cookie:sessionCookie,'x-csrf-token':identity.csrf_token,Origin:'https://evil.invalid'})).status,403);
+  assert.equal((await call('/api/device/approve','POST',{user_code:d.user_code},{Cookie:sessionCookie,'x-csrf-token':identity.csrf_token,Origin:'https://hub.fixture'})).status,200);
+  const issued=await call('/api/device/token','POST',{device_code:d.device_code});assert.equal(issued.status,200);const tokens=await issued.json();assert.equal((await call('/api/repos','GET',undefined,{Authorization:'Bearer '+tokens.access_token})).status,200);
+  const bearer={Authorization:'Bearer '+tokens.access_token};
+  assert.equal((await call('/api/fleet','GET',undefined,bearer)).status,200);assert.equal((await call('/api/sessions','GET',undefined,bearer)).status,200);
+  for(const method of ['initialize','tools/list']){const r=await call('/mcp','POST',{jsonrpc:'2.0',id:1,method,params:{}},bearer);assert.equal(r.status,200);assert((await r.json()).result);}
+  const tool=await call('/mcp','POST',{jsonrpc:'2.0',id:2,method:'tools/call',params:{name:'repos_list',arguments:{}}},bearer);assert.equal(tool.status,200);assert.equal((await tool.json()).result.isError,false);
+  const mcpCall=async(name,args)=>{const r=await call('/mcp','POST',{jsonrpc:'2.0',id:3,method:'tools/call',params:{name,arguments:args}},bearer);assert.equal(r.status,200);return(await r.json()).result;};
+  const msg=await mcpCall('msg_send',{to_actor:'human:fixture-user',body:'corealias',idempotency_key:'corealias'});assert.equal(msg.isError,false);const message=JSON.parse(msg.content[0].text).message;
+  assert.equal((await mcpCall('msg_show',{id:message.id})).isError,false);assert.equal((await mcpCall('msg_ack',{id:message.id,lease_epoch:message.epoch})).isError,false);
+  assert.equal((await mcpCall('msg_reply',{reply_to:message.id,body:'replyalias',idempotency_key:'replyalias'})).isError,false);assert.equal((await mcpCall('msg_inbox',{limit:1})).isError,false);
+  assert.equal((await mcpCall('msg_send',{to_actor:'human:fixture-user',body:'metadatarefusal',idempotency_key:'unsupported',ref:'not-supported'})).isError,true);
+  assert.equal((await call('/api/messages?as=ungranted','POST',{recipient:'human:fixture-user',body:'refused',key:'no-grant'},bearer)).status,404);
+  assert.equal((await call('/api/device/token','POST',{device_code:d.device_code})).status,400);
+  assert.equal((await call('/_fixture/expire-credential','POST',{token:tokens.access_token},{Authorization:'Bearer '+bootstrap})).status,200);assert.equal((await call('/api/repos','GET',undefined,bearer)).status,401);
+  const refreshed=await call('/api/token/refresh','POST',{refresh_token:tokens.refresh_token});assert.equal(refreshed.status,200);const newer=await refreshed.json();
+  assert.equal((await call('/api/repos','GET',undefined,{Authorization:'Bearer '+tokens.access_token})).status,401);
+  assert.equal((await call('/api/token/refresh','POST',{refresh_token:tokens.refresh_token})).status,401);
+  assert.equal((await call('/api/token/revoke','POST',{}, {Authorization:'Bearer '+newer.access_token})).status,200);
+  assert.equal((await call('/api/repos','GET',undefined,{Authorization:'Bearer '+newer.access_token})).status,401);
+  assert.equal((await call('/api/repos','GET',undefined,{Cookie:sessionCookie,Authorization:'Bearer invalid'})).status,401);
+  if(process.env.HUB2_AUTH_CLI)await test('actual thin CLI login approval refresh and logout',()=>cliRoundtrip(sessionCookie,identity.csrf_token));
+  assert.equal((await call('/_fixture/seed-expired','POST',{}, {Authorization:'Bearer '+bootstrap})).status,200);const gcBefore=await metric();assert.equal((await call('/auth/session','GET',undefined,{Cookie:sessionCookie})).status,200);const gcAfter=await metric();assert(gcAfter.rows_read-gcBefore.rows_read<400,'cleanup must remain bounded');const expired=await(await call('/_fixture/expired-counts','GET',undefined,{Authorization:'Bearer '+bootstrap})).json();assert.deepEqual(expired,{auth_login_states:75,auth_devices:75,auth_rate:75});
+  assert.equal((await call('/auth/logout','POST',{}, {Cookie:sessionCookie,'x-csrf-token':identity.csrf_token})).status,200);
+  assert.equal((await call('/auth/session','GET',undefined,{Cookie:sessionCookie})).status,401);
+ });
+ const stable=JSON.stringify(beforeHashes)===JSON.stringify(await sourceHashes());const report={passed:stable&&results.every(x=>x.passed),source_stable:stable,source_hashes:beforeHashes,engine:'native workerd SQLite with actual generated RSA signature and mock DTC provider transport',results};if(process.env.HUB2_AUTH_REPORT)await writeFile(process.env.HUB2_AUTH_REPORT,JSON.stringify(report,null,2)+'\n');console.log(JSON.stringify(report));if(!report.passed)process.exitCode=1;
+}finally{await mf.dispose();}

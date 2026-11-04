@@ -1,0 +1,73 @@
+name: Hub 2.0 checks
+
+on:
+  push:
+    paths:
+      - "hub2/**"
+      - "docs/hub2/**"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/hub2.yml"
+  pull_request:
+    paths:
+      - "hub2/**"
+      - "docs/hub2/**"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/hub2.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hub2-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install locked root toolchain
+        run: npm ci
+
+      - name: Typecheck Hub 2.0 source
+        run: npm run typecheck --prefix hub2
+
+      - name: Enforce product SLOC and report tooling/test totals
+        run: npm run budget --prefix hub2
+
+      - name: Native SQLite semantic tests
+        run: |
+          npm run test:accounts-mail --prefix hub2
+          npm run test:project-work --prefix hub2
+          npm run test:project-intake --prefix hub2
+          npm run test:read-cache --prefix hub2
+          npm run test:db-metering --prefix hub2
+          npm run test:control --prefix hub2
+
+      - name: Native workerd Durable Object tests
+        run: |
+          npm run test:accounts-mail-workerd --prefix hub2
+          npm run test:normal-day-auth --prefix hub2
+          npm run test:normal-day --prefix hub2
+
+      - name: Public Worker and native mail roundtrip
+        env:
+          HUB2_CORE_PUBLIC_MAIL: "1"
+        run: npm run test:core-workerd --prefix hub2
+
+      - name: Build the local-only Wrangler bundle
+        run: npm run bundle:dry-run --prefix hub2
