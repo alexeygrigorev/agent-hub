@@ -269,9 +269,22 @@ it('bounds status and host query work with retained production-scale history', a
     // This high-core fixture uses a96-session host policy, reduced from500.
     fixtureSql(h).exec("INSERT INTO resource_settings VALUES(1,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
       JSON.stringify({host_max_sessions:96}));
-    const knownHost:any=h.fleetService.resources.cpuHeadroom('claim-host');
+    // Use the production-configured service and its real cache graph. A
+    // second bare service discarded those caches between this census proof
+    // and planning; both observations still share the existing strict day.
+    const diagnostic=(phase:string,fn:()=>any)=>{
+      const scope='test:status-perf:'+phase,before=h.rowBudget.status();
+      try { return h.meter.runSync(scope,fn); }
+      finally {
+        console.log(JSON.stringify({evidence:'status_perf_component_cost',phase,before,after:h.rowBudget.status(),
+          native:h.meter.snapshot()[scope],statements:h.meter.statementTop(1500).filter((statement:any)=>statement.scope===scope)
+            .sort((a:any,b:any)=>b.rows_read-a.rows_read).slice(0,10),
+          excludes:'outer authentication and fixture seeding; guard ledger reported separately'}));
+      }
+    };
+    const knownHost:any=diagnostic('known-host',()=>h.fleetService.resources.cpuHeadroom('claim-host'));
     expect(knownHost).toMatchObject({host_session_count:84,host_count_observation_limited:false});
-    const fixturePlan:any = new FleetService(h.sql,(cb)=>h.ctx.storage.transactionSync(cb)).plan({workspace:'demo',prompt:'Synthetic',machine:'claim-host'});
+    const fixturePlan:any=diagnostic('account-plan',()=>h.fleetService.plan({workspace:'demo',prompt:'Synthetic',machine:'claim-host'}));
     expect(fixturePlan.rejected.length===7 && fixturePlan.rejected.every((r:any)=>r.reason==='account_concurrency')).toBe(true);
     for (let i = 0; i < 200; i++) {
       fixtureSql(h).exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,created_at,updated_at)

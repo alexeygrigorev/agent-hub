@@ -1,3 +1,4 @@
+import {fixtureSql} from './helpers/fixture-budget';
 import { describe,expect,it } from 'vitest';
 import { env,runInDurableObject } from 'cloudflare:test';
 import { FleetService } from '../src/fleet';
@@ -75,18 +76,22 @@ describe('Fleet recovery and paging use deployed indexes',()=>{
       .toMatchObject({state:'failed',verification_status:'not_started'});
   }));
 
-  it('account capacity bounds indexed active prefixes before foreign-host filtering',()=>fixture(async(_hub,raw)=>{
-    raw.exec("INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at,capabilities) VALUES('host','host','host',?,?,?)",AT,AT,JSON.stringify({engines:['codex']}));
+  it('account capacity bounds indexed active prefixes before foreign-host filtering',()=>fixture(async(hub,raw)=>{
+    // One real strict budget day covers every measured accounting probe;
+    // only synthetic retained-history setup uses the native watched handle.
+    await hub.rowBudget.begin(true);
+    const initialDay=hub.rowBudget.status().day,seed=fixtureSql(hub);
+    seed.exec("INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at,capabilities) VALUES('host','host','host',?,?,?)",AT,AT,JSON.stringify({engines:['codex']}));
     // Same account and same machine: a machine-only plan reads all retained
     // terminal history even when there are just two live natives to count.
     for(let i=0;i<2100;i++) {
-      raw.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,account)
-        VALUES('host',?,?,'codex','exited',?,'account')`,'old-'+i,'old-'+i,AT);
-      launch(raw,'terminal-'+i,'stopped');
+      seed.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,account,workspace)
+        VALUES('host',?,?,'codex','exited',?,'account','/repo')`,'old-'+i,'old-'+i,AT);
+      launch(seed,'terminal-'+i,'stopped');
     }
-    for(const phase of ['running','unknown']) raw.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,account)
-      VALUES('host',?,?,'codex',?,?,'account')`,phase,phase,phase,AT);
-    const m=measured(raw),fleet=new FleetService(m.sql as any,(fn:any)=>fn(),()=>NOW);
+    for(const phase of ['running','unknown']) seed.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,account,workspace)
+      VALUES('host',?,?,'codex',?,?,'account','/repo')`,phase,phase,phase,AT);
+    const m=measured(hub.sql),fleet=new FleetService(m.sql as any,(fn:any)=>fn(),()=>NOW);
     const definition={label:'account',provider:'codex',max_concurrency:10,reserve_percent:15,enabled:1};
     // Skip unrelated maintenance only in this component query-cost test;
     // the real account-status implementation and all accounting SQL run.
@@ -102,33 +107,38 @@ describe('Fleet recovery and paging use deployed indexes',()=>{
     }
     // Raw foreign-host occupancy must refuse, rather than scanning until it
     // finds enough eligible local rows or declaring the local account free.
-    for(let i=0;i<257;i++) raw.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,account)
-      VALUES('foreign',?,?,'codex','running',?,'account')`,'foreign-'+i,'foreign-'+i,AT);
+    for(let i=0;i<257;i++) seed.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,account,workspace)
+      VALUES('foreign',?,?,'codex','running',?,'account','/repo')`,'foreign-'+i,'foreign-'+i,AT);
     m.reset();const limited=fleet.accountStatus(definition);
     expect(limited).toMatchObject({status:'blocked',available_slots:0,placeable_slots:0,native_live:null,
       capacity_observation_limited:true,active_is_lower_bound:true});
     expect(limited.placement_reasons).toContain('capacity_observation_limited');
     expect(m.rows()).toBeLessThan(700);
     expect(m.queries.some(q=>q.includes('COUNT(*)'))).toBe(false);
-    raw.exec("DELETE FROM fleet_sessions WHERE machine_id='foreign'");
-    for(let i=0;i<257;i++)launch(raw,'stale-offer-'+i,'offered',null,new Date(NOW-86400000).toISOString());
+    seed.exec("DELETE FROM fleet_sessions WHERE machine_id='foreign'");
+    for(let i=0;i<257;i++)launch(seed,'stale-offer-'+i,'offered',null,new Date(NOW-86400000).toISOString());
     m.reset();const stalePrefix=fleet.accountStatus(definition);
     expect(stalePrefix).toMatchObject({status:'blocked',available_slots:0,capacity_observation_limited:true});
     expect(m.rows()).toBeLessThan(700);
     expect(m.queries.some(q=>q.includes('WHERE l.id=?'))).toBe(false);
+    expect(hub.rowBudget.status()).toMatchObject({day:initialDay,limit_total:20000,stopped:false});
   }));
 
-  it('correlates a unique in-flight native without scanning other accounts and preserves ambiguity fences',()=>fixture(async(_hub,raw)=>{
-    raw.exec("INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at,capabilities) VALUES('host','host','host',?,?,?)",AT,AT,JSON.stringify({engines:['codex']}));
-    raw.exec("INSERT INTO fleet_catalog_census(machine_id,observed_at,complete) VALUES('host',?,1)",AT);
-    for(let i=0;i<2100;i++)raw.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,account,workspace)
+  it('correlates a unique in-flight native without scanning other accounts and preserves ambiguity fences',()=>fixture(async(hub,raw)=>{
+    // One real strict budget day covers every measured accounting probe;
+    // only synthetic retained-history setup uses the native watched handle.
+    await hub.rowBudget.begin(true);
+    const initialDay=hub.rowBudget.status().day,seed=fixtureSql(hub);
+    seed.exec("INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at,capabilities) VALUES('host','host','host',?,?,?)",AT,AT,JSON.stringify({engines:['codex']}));
+    seed.exec("INSERT INTO fleet_catalog_census(machine_id,observed_at,complete) VALUES('host',?,1)",AT);
+    for(let i=0;i<2100;i++)seed.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,account,workspace)
       VALUES('host',?,?,'codex','running',?,'other','/repo')`,'foreign-active-'+i,'noise-'+i,AT);
-    launch(raw,'inflight-start','starting');
+    launch(seed,'inflight-start','starting');
     const old=new Date(NOW-86400000).toISOString();
-    const spawn=(id:string)=>raw.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,account,workspace,last_activity_at)
+    const spawn=(id:string)=>seed.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,account,workspace,last_activity_at)
       VALUES('host',?,'task-hub-inflight-start','codex','running',?,'account','/repo',?)`,id,AT,old);
     spawn('target-native');
-    const m=measured(raw),fleet=new FleetService(m.sql as any,(fn:any)=>fn(),()=>NOW);
+    const m=measured(hub.sql),fleet=new FleetService(m.sql as any,(fn:any)=>fn(),()=>NOW);
     (fleet as any).reconcileCapacity=()=>{};
     const definition={label:'account',provider:'codex',max_concurrency:10,reserve_percent:15,enabled:1};
     m.reset();
@@ -149,14 +159,15 @@ describe('Fleet recovery and paging use deployed indexes',()=>{
     m.reset();
     expect(fleet.accountStatus(definition)).toMatchObject({reserved:1,observed_sessions:0,native_live:2});
     expect(m.rows()).toBeLessThan(150);
-    raw.exec("DELETE FROM fleet_sessions WHERE native_id='duplicate-target'");
-    launch(raw,'already-bound-elsewhere','running');
-    raw.exec("UPDATE fleet_launches SET account='other',native_id='target-native' WHERE id='already-bound-elsewhere'");
+    seed.exec("DELETE FROM fleet_sessions WHERE native_id='duplicate-target'");
+    launch(seed,'already-bound-elsewhere','running');
+    seed.exec("UPDATE fleet_launches SET account='other',native_id='target-native' WHERE id='already-bound-elsewhere'");
     m.reset();
     // Existing direct-native linkage wins even when its account is not in
     // the account-specific source: never deduplicate through a second launch.
     expect(fleet.accountStatus(definition)).toMatchObject({reserved:1,observed_sessions:0,native_live:1});
     expect(m.rows()).toBeLessThan(150);
+    expect(hub.rowBudget.status()).toMatchObject({day:initialDay,limit_total:20000,stopped:false});
   }));
 
   it('maps legacy three-part session cursors to the existing primary-key order',()=>fixture(async(_hub,raw)=>{
