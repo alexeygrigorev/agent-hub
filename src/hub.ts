@@ -1,5 +1,5 @@
 import { invalidateCatalogObservations } from './catalog-freshness';
-import { initRootIncumbentProjection, advanceRootIncumbentProjection } from './root-incumbent';
+import { initRootIncumbentProjection } from './root-incumbent';
 import { BackgroundWorkQueue } from './background-work';
 import { jobCredentialAllowed, roleFinishReceiptAllowed } from './auth/job-credential';
 import { alertDestinations, inboxReaderStatus, invalidateReaderObservations, ALERT_SUBJECT_COOLDOWN_MS, BUS_REFRESH_GRACE_MS, pruneAlertRouting, suppressOpenAlertBackfill } from './alert-routing';
@@ -1153,15 +1153,15 @@ export class Hub extends DurableObject {
         if (!body || body.type !== 'heartbeat') return Response.json({ error: 'malformed_json' }, { status: 400 });
 
         updateHeartbeat(cred.machine_id, body, this.sql);
-        if (isRootSchedulingEnabled(this.sql)) {
-          this.ctx.storage.transactionSync(() => advanceRootIncumbentProjection(this.sql));
-          this.jobsService.markRootReady(cred.machine_id);
-        }
+        // All policy use below is synchronous after credential/body awaits.
+        // No cross-request or cross-await authorization snapshot is retained.
+        const rootSchedulingEnabled = isRootSchedulingEnabled(this.sql);
+        if (rootSchedulingEnabled) this.jobsService.markRootReady(cred.machine_id, rootSchedulingEnabled);
 
         const nowIso = new Date().toISOString();
         const { rows,truncated } = this.jobsService.offeredForHost(cred.machine_id);
         // Root scheduling flag: root-run offers are not listed while disabled.
-        const visibleRows = isRootSchedulingEnabled(this.sql) ? rows : rows.filter((r: any) => r.kind !== 'root-run');
+        const visibleRows = rootSchedulingEnabled ? rows : rows.filter((r: any) => r.kind !== 'root-run');
 
         const offers = visibleRows.map((r: any) => ({
           id: r.id,

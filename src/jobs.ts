@@ -1,5 +1,5 @@
 import { jobLeaseName } from './auth/job-credential';
-import { externalRootBlocks } from './root-incumbent';
+import { externalRootBlocks, advanceRootIncumbentProjection } from './root-incumbent';
 import { effectiveHost } from './registry';
 import { registryNameSql } from './agent_registry';
 import { sha256, base64url } from './auth/crypto';
@@ -638,15 +638,20 @@ export class JobsService {
 
   /** Hosts publish readiness only for their known identity and current/next
    * slot. Stable random ranks provide a lottery without a background census. */
-  markRootReady(hostId: string): void {
-    if(!isRootSchedulingEnabled(this.sql))return;
+  markRootReady(hostId: string, synchronousPolicySnapshot?: boolean): void {
+    // Only an immediately preceding, synchronous server-owned flag read may
+    // be supplied. Independent callers retain the fresh durable policy fence.
+    if(!(synchronousPolicySnapshot ?? isRootSchedulingEnabled(this.sql)))return;
     const now=this.now().getTime(),slot=Math.floor(now/1800000)*1800000;
     const host: any=effectiveHost(this.sql,this.sql.exec('SELECT * FROM machines WHERE id=?',hostId).toArray()[0]);
-    if(!host || host.drained || !this.checkHostRootRunCapability(host))return;
+    if(!host || host.revoked_at || host.drained || !this.checkHostRootRunCapability(host))return;
     const checkin=parseExpiryMs(host.last_checkin_at);
     let heartbeat:any;try{heartbeat=JSON.parse(host.last_heartbeat || '{}');}catch{return;}
     if(checkin===null || now-checkin<0 || now-checkin>180000 || heartbeat?.gate?.launch_allowed!==true)return;
     this.ctx.storage.transactionSync(()=>{
+      // Request-owned migration is useful only after a current host proves it
+      // can actually run a root. Incapable/blocked polls never census agents.
+      advanceRootIncumbentProjection(this.sql);
       const prior:any=this.sql.exec('SELECT last_slot_ms FROM root_background_hosts WHERE host_id=?',hostId).toArray()[0];
       if(prior?.last_slot_ms===slot)return;
       if(typeof prior?.last_slot_ms==='number')for(const old of [prior.last_slot_ms,prior.last_slot_ms+1800000])

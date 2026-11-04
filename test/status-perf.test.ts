@@ -366,16 +366,25 @@ it('bounds status and host query work with retained production-scale history', a
     ['POST', '/api/fleet/resources/report', SAMPLES, 4, 2300],
     ['POST', `/api/fleet/launches/${sessionId(11999)}/claim`, SAMPLES * 3, 18, 260],
   ];
-  for (const [method, path, requests, maxCallsPerRequest, maxRowsPerRequest] of workRoutes) {
-    const work = routeWork(workBefore, workAfter, method, path);
-    const route = `${method} ${new URL(path, 'https://hub.test').pathname}`;
-    if (work.rows_read > requests * maxRowsPerRequest) {
-      const statements = await inDO(stub, (h: any) => h.meter.statementTop(1500)
-        .filter((statement: any) => statement.scope === `route:${route}`)
-        .sort((a: any, b: any) => b.rows_read - a.rows_read));
-      console.log(`route statement breakdown ${route}`, JSON.stringify(statements));
+  const routeResults=workRoutes.map(([method,path,requests,maxCallsPerRequest,maxRowsPerRequest])=>({
+    route:`${method} ${new URL(path,'https://hub.test').pathname}`,
+    scope:`route:${normalizeRoute(method,new URL(path,'https://hub.test').pathname)}`,
+    requests,maxCallsPerRequest,maxRowsPerRequest,work:routeWork(workBefore,workAfter,method,path),
+  }));
+  // Emit every route before any assertion stops the test, including call
+  // breakdowns. A single failure must not hide the next route's evidence.
+  for(const {route,scope,requests,maxCallsPerRequest,maxRowsPerRequest,work} of routeResults) {
+    const rowsLimited=work.rows_read>requests*maxRowsPerRequest;
+    if(rowsLimited || work.calls>requests*maxCallsPerRequest) {
+      const statements=await inDO(stub,(h:any)=>h.meter.statementTop(1500)
+        .filter((statement:any)=>statement.scope===scope)
+        .sort((a:any,b:any)=>rowsLimited?b.rows_read-a.rows_read:b.calls-a.calls));
+      console.log(JSON.stringify({evidence:'route_work_limit_exceeded',route,requests,work,
+        limits:{calls:requests*maxCallsPerRequest,rows_read:requests*maxRowsPerRequest},statements}));
     }
     console.log(`route work ${route} requests=${requests} sql_calls=${work.calls} sql_calls_per_request=${(work.calls / requests).toFixed(1)} rows_read=${work.rows_read} rows_read_per_request=${(work.rows_read / requests).toFixed(1)}`);
+  }
+  for(const {route,requests,maxCallsPerRequest,maxRowsPerRequest,work} of routeResults) {
     expect(work.calls, `${route} should execute SQL`).toBeGreaterThan(0);
     expect(work.calls, `${route} SQL calls`).toBeLessThanOrEqual(requests * maxCallsPerRequest);
     expect(work.rows_read, `${route} rows read`).toBeLessThanOrEqual(requests * maxRowsPerRequest);
