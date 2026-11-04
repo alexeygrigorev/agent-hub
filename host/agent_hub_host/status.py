@@ -338,11 +338,16 @@ def render_human(data):
     summary = data.get('summary')
     agents = data.get('agents') or (summary.get('agents') if isinstance(summary, dict) else None)
     if isinstance(agents, dict):
-        lines.append('agents: running=%d idle=%d waiting=%d (waiting-confirmation=%d)' % (
-            int(agents.get('running') or 0),
-            int(agents.get('idle') or 0),
-            int(agents.get('waiting') or 0),
-            int(agents.get('waiting_confirmation') or 0),
+        def agent_count(name):
+            value = agents.get(name)
+            if agents.get('observation_pending') or value is None or isinstance(value, bool):
+                return 'unknown'
+            try:
+                return str(int(value))
+            except (TypeError, ValueError, OverflowError):
+                return 'unknown'
+        lines.append('agents: running=%s idle=%s waiting=%s (waiting-confirmation=%s)' % (
+            agent_count('running'), agent_count('idle'), agent_count('waiting'), agent_count('waiting_confirmation'),
         ))
     if isinstance(summary, dict):
         by_status = summary.get('by_status') or {}

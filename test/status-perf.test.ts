@@ -320,6 +320,7 @@ it('bounds status and host query work with retained production-scale history', a
   for(let i=0;i<SAMPLES;i++) {
     // One shared strict day covers the entire concurrent request cohort.
     await inDO(stub,(h:any)=>freshFixtureBudgetDay(h));
+    const beforeCohort=await inDO(stub,(h:any)=>({ledger:h.rowBudget.status(),meter:h.meter.snapshot(),statements:h.meter.statementTop(1500)}));
     const cohortStart=performance.now();
     const responses=await Promise.all(mixed.map(async ([,path,options],j)=>{
       const start=performance.now();
@@ -329,11 +330,19 @@ it('bounds status and host query work with retained production-scale history', a
     }));
     // Client parsing must not delay timing callbacks for sibling requests.
     // Complete body validation for all four before issuing the next cohort.
-    await Promise.all(responses.map(async (response,j)=>{
-      await response.json();
-      const name=mixed[j][0];
-      expect(response.status,name).toBe(name==='claim'?409:200);
-    }));
+    const bodies=await Promise.all(responses.map(response=>response.json())) as any[];
+    if(responses.some((response,j)=>response.status!==(mixed[j][0]==='claim'?409:200))) {
+      const after=await inDO(stub,(h:any)=>({ledger:h.rowBudget.status(),meter:h.meter.snapshot(),statements:h.meter.statementTop(1500)}));
+      const beforeStatements=new Map(beforeCohort.statements.map((statement:any)=>[statement.scope+'\n'+statement.sql,statement]));
+      const statements=after.statements.map((statement:any)=>{
+        const prior:any=beforeStatements.get(statement.scope+'\n'+statement.sql);
+        return {...statement,rows_read:statement.rows_read-(prior?.rows_read??0),rows_written:statement.rows_written-(prior?.rows_written??0),calls:statement.calls-(prior?.calls??0)};
+      }).filter((statement:any)=>statement.calls>0).sort((a:any,b:any)=>b.rows_read-a.rows_read).slice(0,30);
+      console.log(JSON.stringify({evidence:'status_perf_failed_cohort',cohort:i,before:beforeCohort.ledger,after:after.ledger,
+        responses:responses.map((response,j)=>({name:mixed[j][0],status:response.status,error:bodies[j]?.error??null,reason:bodies[j]?.reason??null})),
+        statements}));
+    }
+    for(const [j,response] of responses.entries())expect(response.status,mixed[j][0]).toBe(mixed[j][0]==='claim'?409:200);
     cohortClientTimes.push(performance.now()-cohortStart);
   }
   report("concurrent full cohort including client bodies", cohortClientTimes);

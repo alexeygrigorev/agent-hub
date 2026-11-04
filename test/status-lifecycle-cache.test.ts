@@ -182,7 +182,7 @@ it('retries agent observations after a failed read instead of caching incomplete
    return rows(query,...args);
   };
   try {
-   expect(service.computeAgentCounts(now)).toMatchObject({running:1,waiting:0});
+   expect(service.computeAgentCounts(now)).toMatchObject({running:null,waiting:null,observation_pending:true,observation_reason:'source_read_failed'});
    expect(service.computeAgentCounts(now)).toMatchObject({running:0,waiting:1,waiting_confirmation:1});
   } finally {service.rows=rows;}
  });

@@ -170,6 +170,81 @@ describe('Fleet recovery and paging use deployed indexes',()=>{
     expect(hub.rowBudget.status()).toMatchObject({day:initialDay,limit_total:20000,stopped:false});
   }));
 
+  it('status agent counts seek active sources, preserve orphan hosts and refuse incomplete observations',()=>fixture(async(hub,raw)=>{
+    const setup=fixtureSql(hub);
+    for(let i=0;i<2100;i++) {
+      setup.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,workspace)
+        VALUES('orphan',?,?,'codex','exited',?,'/repo')`,'old-'+i,'old-'+i,AT);
+      setup.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,created_at,updated_at)
+        VALUES(?,'test',?,'{}','orphan','codex','headless','stopped',?,?)`,'old-control-'+i,'old-control-'+i,AT,AT);
+      setup.exec('INSERT INTO session_lifecycle_observations VALUES(?,?,?,?,?)','orphan/old-'+i,'orphan','old-'+i,AT,'{}');
+    }
+    setup.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,workspace)
+      VALUES('orphan','current','current','codex','running',?,'/repo'),('orphan','noise','PING-current','codex','running',?,'/repo')`,AT,AT);
+    await hub.rowBudget.begin(true);const day=hub.rowBudget.status().day;
+    let sequence=0;
+    const read=()=>{
+      const scope='test:bounded-agent-counts-'+sequence++;
+      const value=hub.meter.runSync(scope,()=>hub.statusService.computeAgentCounts(NOW));
+      const cost=hub.meter.snapshot()[scope];
+      expect(cost.rows_read).toBeLessThan(800);
+      return value;
+    };
+    expect(read()).toEqual({running:1,idle:0,waiting:0,waiting_confirmation:0});
+    setup.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,session_type,binding_json,created_at,updated_at)
+      VALUES('probe-alias','test','probe-alias','{}','orphan','codex','headless','stopped','probe','{"native_id":"current"}',?,?)`,AT,AT);
+    expect(read()).toEqual({running:0,idle:0,waiting:0,waiting_confirmation:0});
+    setup.exec("UPDATE session_control_sessions SET session_type='headless' WHERE id='probe-alias'");
+    setup.exec('INSERT INTO session_lifecycle_observations VALUES(?,?,?,?,?)','orphan/current','orphan','current',AT,'{"waiting_confirmation":true}');
+    expect(read()).toEqual({running:0,idle:1,waiting:1,waiting_confirmation:1});
+    setup.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at)
+      VALUES('duplicate','test','duplicate','{}','orphan','codex','headless','stopped','{"native_id":"current"}',?,?)`,AT,AT);
+    expect(read()).toMatchObject({running:null,observation_pending:true,observation_reason:'native_control_ambiguous'});
+    setup.exec("DELETE FROM session_control_sessions WHERE id='duplicate'");
+    for(let i=0;i<257;i++)setup.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,workspace)
+      VALUES('orphan',?,?,'codex','running',?,'/repo')`,'overflow-'+i,'overflow-'+i,AT);
+    expect(read()).toMatchObject({running:null,observation_pending:true,observation_reason:'native_source_limit'});
+    setup.exec("DELETE FROM fleet_sessions WHERE native_id LIKE 'overflow-%'");
+    for(let i=0;i<257;i++)setup.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,created_at,updated_at)
+      VALUES(?,'test',?,'{}','orphan','codex','headless','running',?,?)`,'active-control-'+i,'active-control-'+i,AT,AT);
+    expect(read()).toMatchObject({running:null,observation_pending:true,observation_reason:'control_source_limit'});
+    expect(hub.rowBudget.status()).toMatchObject({day,limit_total:20000,stopped:false});
+    const plan=raw.exec(`EXPLAIN QUERY PLAN SELECT machine_id FROM fleet_sessions INDEXED BY fleet_session_machine_phase
+      WHERE machine_id>? ORDER BY machine_id LIMIT 1`,'orphan').toArray().map((r:any)=>r.detail).join(' | ');
+    expect(plan).toMatch(/SEARCH.*COVERING INDEX fleet_session_machine_phase/);
+    expect(plan).not.toMatch(/TEMP B-TREE/);
+  }));
+
+  it('status host coverage refuses a bounded revoked prefix instead of declaring all hosts fresh',()=>fixture(async(hub)=>{
+    const setup=fixtureSql(hub);
+    for(let i=0;i<65;i++)setup.exec('INSERT INTO machines(id,name,hostname,registered_at,revoked_at) VALUES(?,?,?,?,?)',
+      'revoked-'+i,'revoked','revoked',AT,AT);
+    await hub.rowBudget.begin(true);
+    const built=hub.statusService.buildItems({admin:true},[],null,null,NOW,AT);
+    expect(built).toMatchObject({sessionCoverage:'partial',hostObservationPending:true});
+    const coverage=hub.statusService.coverageDto(built.missingHosts,built.expectedOffline,built.sessionCoverage,NOW,built);
+    expect(coverage).toMatchObject({host_observation_pending:true,reason:'host_source_limit',sessions:'partial'});
+    expect(hub.statusService.categoriesDto(AT,[],built.sessionCoverage,false,false,{}).tasks_sessions.state).toBe('partial');
+    expect(hub.rowBudget.status().stopped).toBe(false);
+  }));
+
+  it('existing status callers do no global baseline capacity read across retained legacy rows',()=>fixture(async(hub)=>{
+    const setup=fixtureSql(hub),callerKey='human:baseline'+'||'+['','','',''].join('|');
+    for(let i=0;i<5100;i++)setup.exec('INSERT INTO status_baselines VALUES(?,?,?,?)','old-'+i,'{}',0,AT);
+    // A malformed payload is still an existing row, not a new caller.
+    setup.exec('INSERT INTO status_baselines VALUES(?,?,?,?)',callerKey,'broken{',0,AT);
+    await hub.rowBudget.begin(true);const day=hub.rowBudget.status().day;
+    const response=await hub.meter.run('test:existing-status-baseline',()=>hub.statusService.handlePost(
+      new Request('https://hub/api/status',{method:'POST',body:'{}'}),
+      async()=>({caller:{kind:'human',isAdmin:true,actor:'human:baseline'},scopes:['admin']})));
+    expect(response.status).toBe(200);
+    const work=hub.meter.snapshot()['test:existing-status-baseline'];
+    expect(work.rows_read).toBeLessThan(300);
+    const queries=hub.meter.statementTop(1500).filter((statement:any)=>statement.scope==='test:existing-status-baseline').map((statement:any)=>statement.sql);
+    expect(queries.some((query:string)=>query.includes('COUNT(*) AS n FROM status_baselines') || query.includes('SELECT 1 FROM status_baselines LIMIT'))).toBe(false);
+    expect(hub.rowBudget.status()).toMatchObject({day,limit_total:20000,stopped:false});
+  }));
+
   it('maps legacy three-part session cursors to the existing primary-key order',()=>fixture(async(_hub,raw)=>{
     for(let i=0;i<1200;i++)raw.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace)
       VALUES('host',?,?,'exited',?,'/repo')`,'native-'+String(i).padStart(4,'0'),'tag-'+(1200-i),AT);

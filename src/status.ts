@@ -14,6 +14,8 @@ import { isValidMachineId } from './machine-id';
 
 type Auth = { caller?: any; scopes?: string[]; error?: Response };
 type Obj = Record<string, any>;
+type AgentCounts = {running:number|null;idle:number|null;waiting:number|null;waiting_confirmation:number|null;
+  observation_pending?:true;observation_reason?:string};
 type Tx = <T>(fn: () => T) => T;
 
 export const STATUS_LIMITS = { page: 25, string: 2048, snippet: 240, sessionsPerTask: 50 };
@@ -315,7 +317,7 @@ export class StatusService {
     }
     return { live: [...base, ...live], history };
   }
-  private agentCountsCache:{revision:string;value:{running:number;idle:number;waiting:number;waiting_confirmation:number}}|null=null;
+  private agentCountsCache:{revision:string;value:AgentCounts}|null=null;
   private statusSourceRows=new Map<string,Obj[]>();
   private statusSourceBytes=0;
   private statusSourceRevision: string | null = null;
@@ -490,23 +492,35 @@ export class StatusService {
     return tasks;
   }
 
-  private buildItems(p: Obj, tasks: Obj[], hostFilter: string | null, sinceMs: number | null, now: number, nowIso: string): { items: Obj[]; machines: Map<string, Obj>; missingHosts: string[]; expectedOffline: string[]; sessionCoverage: string; reportsCollected: boolean; probesCollected: boolean } {
-    const machines = new Map(this.rows('SELECT id, hostname, last_checkin_at, drained FROM machines WHERE revoked_at IS NULL').map(m => [m.id, m]));
-    const aliases = this.machineAliases(machines);
+  private buildItems(p: Obj, tasks: Obj[], hostFilter: string | null, sinceMs: number | null, now: number, nowIso: string): { items: Obj[]; machines: Map<string, Obj>; missingHosts: string[]; expectedOffline: string[]; sessionCoverage: string; reportsCollected: boolean; probesCollected: boolean; hostObservationPending:boolean; wakeObservationPending:boolean; linkObservationPending:boolean } {
+    const rawMachines=this.rows('SELECT id,hostname,last_checkin_at,drained,revoked_at FROM machines ORDER BY id LIMIT 65');
+    const hostObservationPending=rawMachines.length>64;
+    const machines=new Map(rawMachines.slice(0,64).filter(m=>m.revoked_at==null).map(m=>[m.id,m]));
+    // An unseen member could change canonical alias selection.
+    const aliases=hostObservationPending?new Map<string,string>():this.machineAliases(machines);
     const sessionIds = new Set<string>();
+    let linkObservationPending=false;
     for (const task of tasks) for (const event of task.history ?? []) {
-      if (event?.kind === 'link' && typeof event.hub_session_id === 'string' && SESSION_UUID.test(event.hub_session_id)) sessionIds.add(event.hub_session_id);
-    }
-    // Read pending wakes once per projection rather than once per
-    // linked running session. Read wakes fresh: their writes do not advance
-    // the retained session-source cache revision.
-    const pendingWakes = new Map<string, number>();
-    try {
-      for (const wake of this.rows("SELECT session_id,wake_at_ms FROM session_control_wakes WHERE state='pending' ORDER BY wake_at_ms")) {
-        if (wake.wake_at_ms > now && !pendingWakes.has(wake.session_id)) pendingWakes.set(wake.session_id, wake.wake_at_ms);
+      if (event?.kind === 'link' && typeof event.hub_session_id === 'string' && SESSION_UUID.test(event.hub_session_id)) {
+        if(sessionIds.size<512 || sessionIds.has(event.hub_session_id))sessionIds.add(event.hub_session_id);
+        else linkObservationPending=true;
       }
-    } catch { /* wakes are additive */ }
-    const sessionRows = new Map<string, Obj>();
+    }
+    // Only exact linked sessions matter. The deployed compound index seeks
+    // the earliest FUTURE wake without walking past retained overdue rows.
+    const pendingWakes=new Map<string,number>();
+    let wakeObservationPending=false;
+    try {
+      const anyFuture=sessionIds.size && this.rows(`SELECT 1 FROM session_control_wakes INDEXED BY session_control_wakes_due
+        WHERE state='pending' AND wake_at_ms>? LIMIT 1`,now).length;
+      if(anyFuture)for(const wake of this.rows(`WITH visible AS MATERIALIZED (
+        SELECT value AS session_id,(SELECT wake_at_ms FROM session_control_wakes INDEXED BY intake_queue_wakes_session
+          WHERE session_id=ids.value AND state='pending' AND wake_at_ms>? ORDER BY wake_at_ms LIMIT 1) AS wake_at_ms
+        FROM json_each(?) ids) SELECT session_id,wake_at_ms FROM visible WHERE wake_at_ms IS NOT NULL`,now,JSON.stringify([...sessionIds]))) {
+        pendingWakes.set(wake.session_id,wake.wake_at_ms);
+      }
+    } catch {wakeObservationPending=true;}
+    const sessionRows = Object.assign(new Map<string, Obj>(),{observationLimited:linkObservationPending});
     const ids = [...sessionIds];
     for (let i = 0; i < ids.length; i += 100) {
       const chunk = ids.slice(i, i + 100);
@@ -519,21 +533,24 @@ export class StatusService {
     const probesCollected = items.some(t => (t.commits ?? []).some((c: Obj) => c.git_ancestry || c.ci || c.deploy));
     const { missing: missingHosts, expectedOffline } = this.missingHosts(machines, now, aliases);
     return { items, machines, missingHosts, expectedOffline,
-      sessionCoverage: missingHosts.length ? 'partial' : 'complete', reportsCollected, probesCollected };
+      sessionCoverage: missingHosts.length || hostObservationPending || wakeObservationPending || linkObservationPending ? 'partial' : 'complete',
+      reportsCollected,probesCollected,hostObservationPending,wakeObservationPending,linkObservationPending };
   }
 
-  private coverageDto(missingHosts: string[], expectedOffline: string[], sessionCoverage: string, now: number): Obj {
+  private coverageDto(missingHosts: string[], expectedOffline: string[], sessionCoverage: string, now: number, built:ReturnType<StatusService['buildItems']>): Obj {
     const offlineWindowActive = expectedOfflineWindowActive(now);
     return { sessions: sessionCoverage, missing_hosts: missingHosts, expected_offline: expectedOffline,
-      hosts: this.rows('SELECT id,hostname,last_checkin_at,drained FROM machines WHERE revoked_at IS NULL ORDER BY id').map(m => ({ ...m, last_checkin_at: effectiveCheckin(String(m.id), m.last_checkin_at) ?? null })),
+      hosts: [...built.machines.values()].map(m=>({id:m.id,hostname:m.hostname,drained:m.drained,last_checkin_at:effectiveCheckin(String(m.id),m.last_checkin_at)??null})),
+      host_observation_pending:built.hostObservationPending,wake_observation_pending:built.wakeObservationPending,
+      linked_session_observation_pending:built.linkObservationPending,
       expected_offline_until: offlineWindowActive ? EXPECTED_OFFLINE_UNTIL : null,
       expected_offline_reason: offlineWindowActive && expectedOffline.length ? EXPECTED_OFFLINE_REASON : null,
-      reason: missingHosts.length ? 'one_or_more_hosts_stale_or_unreachable' : expectedOffline.length ? 'all_unexpected_hosts_fresh_expected_offline_excluded' : 'all_known_hosts_fresh' };
+      reason: built.hostObservationPending ? 'host_source_limit' : built.wakeObservationPending ? 'wake_observation_pending' : built.linkObservationPending ? 'linked_session_source_limit' : missingHosts.length ? 'one_or_more_hosts_stale_or_unreachable' : expectedOffline.length ? 'all_unexpected_hosts_fresh_expected_offline_excluded' : 'all_known_hosts_fresh' };
   }
 
   private categoriesDto(nowIso: string, missingHosts: string[], sessionCoverage: string, reportsCollected: boolean, probesCollected: boolean, diff: Obj, diskEntry?: Obj): Obj {
     return {
-      tasks_sessions: { state: missingHosts.length ? 'partial' : 'collected', source: 'intake_tasks+routing_jobs+fleet_launches+fleet_sessions+session_control_sessions+lifecycle', observed_at: nowIso, freshness: 'fresh', coverage: sessionCoverage, reason: 'canonical_hub_session_links_with_live_control_state_and_lifecycle' },
+      tasks_sessions: { state: sessionCoverage==='complete' ? 'collected' : 'partial', source: 'intake_tasks+routing_jobs+fleet_launches+fleet_sessions+session_control_sessions+lifecycle', observed_at: nowIso, freshness: 'fresh', coverage: sessionCoverage, reason: 'canonical_hub_session_links_with_live_control_state_and_lifecycle' },
       reports: reportsCollected
         ? { state: 'collected_host_reported', source: 'host_observation_sanitized_headline', observed_at: nowIso, freshness: 'fresh', coverage: 'partial', reason: 'allowlisted_host_reader_headlines_only_transcripts_tokens_never_stored' }
         : { state: 'unknown_not_collected', source: 'intake_history_report_reference_only', observed_at: nowIso, freshness: 'unknown', coverage: 'unavailable', reason: 'headline_collection_requires_M14b_allowlisted_host_reader', successor: 'M14b' },
@@ -546,89 +563,69 @@ export class StatusService {
     };
   }
 
-  private computeAgentCounts(now: number): { running: number; idle: number; waiting: number; waiting_confirmation: number } {
-    // Counts depend on stored state, not freshness thresholds. Identity and
-    // observation triggers invalidate them; time-based DTOs stay live below.
+  private computeAgentCounts(now: number): AgentCounts {
     const ready=this.refreshLifecycleRevision();
     if(ready && this.agentCountsCache?.revision===this.lifecycleRevision) return {...this.agentCountsCache.value};
-    let complete=true;
-    let running = 0;
-    let idle = 0;
-    let waiting = 0;
-    let waiting_confirmation = 0;
+    const unknown=(reason:string):AgentCounts=>({running:null,idle:null,waiting:null,waiting_confirmation:null,
+      observation_pending:true,observation_reason:reason});
+    const limit=256;
+    let running=0,idle=0,waiting=0,waiting_confirmation=0;
     try {
-      // The guarded JSON expression returns text. Unary + removes the
-      // native column's affinity so SQLite can seek both expression-index
-      // keys, rather than scanning every binding on the same machine.
-      const fleetSessions = this.rows(`
-        SELECT s.machine_id, s.native_id, s.tag, s.engine, s.phase, s.agent_state,
-               c.session_type, c.state AS control_state
-        FROM fleet_sessions s
-        LEFT JOIN session_control_sessions c ON (c.machine_id = s.machine_id AND
-          CASE WHEN json_valid(c.binding_json) THEN
-            CASE WHEN json_type(c.binding_json, '$.native_id') = 'text'
-              THEN json_extract(c.binding_json, '$.native_id') END END = +s.native_id)
-        WHERE s.phase IN ('starting', 'running')
-          AND s.tag NOT LIKE 'ping-%'
-          AND s.tag NOT LIKE 'probe-%'
-          AND (s.engine IS NULL OR s.engine != 'probe')
-          AND (c.session_type IS NULL OR c.session_type != 'probe')
-      `);
-
-      const obsMap = new Map<string, any>();
-      try {
-        const obsRows = this.rows('SELECT machine_id, native_id, payload_json FROM session_lifecycle_observations');
-        for (const r of obsRows) {
-          try {
-            const p = JSON.parse(r.payload_json);
-            obsMap.set(`${r.machine_id}/${r.native_id}`, p);
-          } catch {}
-        }
-      } catch { complete=false; }
-
-      for (const s of fleetSessions) {
-        const obs = obsMap.get(`${s.machine_id}/${s.native_id}`) || {};
-        const isWaitingConf = Boolean(obs.waiting_confirmation || (obs.awaiting_alexey && !obs.awaiting_question));
-        const isWaitingAsk = Boolean(obs.awaiting_alexey || obs.waiting_input || obs.waiting_question);
-        const isWaiting = Boolean(isWaitingConf || isWaitingAsk || s.agent_state === 'waiting' || s.phase === 'waiting');
-        const isIdle = Boolean(s.agent_state === 'idle' || isWaiting);
-
-        if (isWaitingConf) {
-          waiting_confirmation++;
-        }
-        if (isWaiting) {
-          waiting++;
-          idle++;
-        } else if (isIdle) {
-          idle++;
-        } else {
-          running++;
+      const fleetSessions:Obj[]=[];
+      // Seek the next distinct machine through the leading index key rather
+      // than DISTINCT/GROUP BY over retained rows. Include orphan machines:
+      // this is a global count, not only a registered-host projection.
+      let after:string|undefined;
+      for(let hosts=0;;hosts++) {
+        const machine=this.rows(`SELECT machine_id FROM fleet_sessions INDEXED BY fleet_session_machine_phase
+          ${after===undefined?'':'WHERE machine_id>?'} ORDER BY machine_id LIMIT 1`,...(after===undefined?[]:[after]))[0];
+        if(!machine)break;
+        if(hosts>=64)return unknown('machine_limit');
+        after=String(machine.machine_id);
+        for(const phase of ['starting','running']) {
+          fleetSessions.push(...this.rows(`SELECT machine_id,native_id,tag,engine,phase,agent_state
+            FROM fleet_sessions INDEXED BY fleet_session_machine_phase
+            WHERE machine_id=? AND phase=? LIMIT ?`,after,phase,limit-fleetSessions.length+1));
+          if(fleetSessions.length>limit)return unknown('native_source_limit');
         }
       }
-
-      // Standalone session_control_sessions not bound to fleet_sessions
-      const controlSessions = this.rows(`
-        SELECT c.id, c.session_type, c.state, c.engine
-        FROM session_control_sessions c
-        WHERE c.state IN ('starting', 'running')
-          AND (c.session_type IS NULL OR c.session_type != 'probe')
-          AND (c.engine IS NULL OR c.engine != 'probe')
-          AND NOT EXISTS (
-            SELECT 1 FROM fleet_sessions s WHERE s.machine_id = c.machine_id AND s.native_id =
-              CASE WHEN json_valid(c.binding_json) THEN
-                CASE WHEN json_type(c.binding_json, '$.native_id') = 'text'
-                  THEN json_extract(c.binding_json, '$.native_id') END END
-          )
-      `);
-      for (const _ of controlSessions) {
+      const controlSessions=this.rows(`SELECT id,machine_id,session_type,state,engine,binding_json
+        FROM session_control_sessions INDEXED BY session_control_state
+        WHERE state IN ('starting','running') LIMIT 257`);
+      if(controlSessions.length>limit)return unknown('control_source_limit');
+      for(const native of fleetSessions) {
+        if(native.tag==null || /^(?:ping-|probe-)/i.test(String(native.tag)) || native.engine==='probe')continue;
+        // Preserve the original LEFT JOIN over ALL control states. Multiple
+        // aliases cannot be collapsed into one exact count; refuse ambiguity.
+        const bindings=this.rows(`SELECT session_type FROM session_control_sessions INDEXED BY intake_queue_session_native
+          WHERE machine_id=? AND json_extract(CASE WHEN json_valid(binding_json) THEN binding_json ELSE '{}' END,'$.native_id')=? LIMIT 2`,
+          native.machine_id,native.native_id);
+        if(bindings.length>1)return unknown('native_control_ambiguous');
+        if(bindings[0]?.session_type==='probe')continue;
+        const observed=this.rows('SELECT machine_id,native_id,payload_json FROM session_lifecycle_observations WHERE session_key=?',
+          String(native.machine_id)+'/'+String(native.native_id))[0];
+        let obs:Obj={};
+        if(observed) {
+          if(observed.machine_id!==native.machine_id || observed.native_id!==native.native_id)return unknown('observation_identity_mismatch');
+          try {obs=JSON.parse(observed.payload_json);} catch { /* existing malformed observation is advisory unknown */ }
+        }
+        const confirmation=Boolean(obs?.waiting_confirmation || (obs?.awaiting_alexey && !obs?.awaiting_question));
+        const asked=Boolean(obs?.awaiting_alexey || obs?.waiting_input || obs?.waiting_question);
+        const isWaiting=Boolean(confirmation || asked || native.agent_state==='waiting' || native.phase==='waiting');
+        if(confirmation)waiting_confirmation++;
+        if(isWaiting){waiting++;idle++;}else if(native.agent_state==='idle')idle++;else running++;
+      }
+      for(const control of controlSessions) {
+        if(control.session_type==='probe' || control.engine==='probe')continue;
+        let nativeId:unknown;
+        try {nativeId=JSON.parse(control.binding_json)?.native_id;} catch { /* NULL/invalid binding has no native match */ }
+        if(typeof nativeId==='string' && control.machine_id!=null && this.rows(
+          'SELECT 1 FROM fleet_sessions WHERE machine_id=? AND native_id=?',control.machine_id,nativeId).length)continue;
         running++;
       }
-    } catch {
-      complete=false;
-      // Degrade gracefully if tables don't exist yet
-    }
-    const value={ running, idle, waiting, waiting_confirmation };
-    if(ready && complete) this.agentCountsCache={revision:this.lifecycleRevision!,value};
+    } catch { return unknown('source_read_failed'); }
+    const value={running,idle,waiting,waiting_confirmation};
+    if(ready)this.agentCountsCache={revision:this.lifecycleRevision!,value};
     return {...value};
   }
 
@@ -722,7 +719,7 @@ export class StatusService {
           ...this.asksDto(!!(p as any).admin),
           ...this.attentionGroups(!!(p as any).admin, diskSummary?.needs_attention ?? [], intakeWarn),
           pagination: { next, total, limit },
-          coverage: this.coverageDto(built.missingHosts, built.expectedOffline, built.sessionCoverage, now),
+          coverage: this.coverageDto(built.missingHosts, built.expectedOffline, built.sessionCoverage, now,built),
           categories: this.categoriesDto(nowIso, built.missingHosts, built.sessionCoverage, built.reportsCollected, built.probesCollected,
             { state: 'not_available_on_get', source: 'caller_scoped_baseline_store_post_only', observed_at: nowIso, freshness: 'unknown', coverage: 'unavailable', reason: 'use_POST_/api/status_to_project_and_advance_caller_baseline', successor: 'M14d' },
             diskSummary?.categories_entry),
@@ -781,11 +778,13 @@ export class StatusService {
         const callerKey = String((p as any).identity || (p as any).actor || 'unknown') + '||' + filterKey;
         let previous: Obj | null = null;
         let hasPayload = false;
+        let baselineExists = false;
         try {
           const row = this.one(`SELECT b.snapshot_json AS legacy_snapshot,b.updated_at,p.snapshot_json
             FROM status_baselines b LEFT JOIN status_baseline_payloads p USING(caller_key)
             WHERE b.caller_key=?`, callerKey);
           if (row) {
+            baselineExists=true;
             // A rolled-back older Worker may have written a newer inline
             // baseline while leaving our payload row behind. Inline wins.
             hasPayload = row.legacy_snapshot === '{}' && typeof row.snapshot_json === 'string';
@@ -807,9 +806,12 @@ export class StatusService {
         }
         this.sql.exec('INSERT INTO status_baselines(caller_key,snapshot_json,revision,updated_at) VALUES(?,?,?,?) ON CONFLICT(caller_key) DO UPDATE SET snapshot_json=excluded.snapshot_json, revision=excluded.revision, updated_at=excluded.updated_at',
           callerKey, '{}', revision, nowIso);
-        try {
-          const count = Number((this.one('SELECT COUNT(*) AS n FROM status_baselines') as any)?.n ?? 0);
-          if (count > STATUS_BASELINE_ROWS_CAP) {
+        // Existing callers add no row and need no global capacity census,
+        // even if a legacy payload is malformed. Only a new caller checks
+        // the bounded5001-row threshold; retained overflow is never scanned.
+        if(!baselineExists)try {
+          const prefix=this.rows('SELECT 1 FROM status_baselines LIMIT 5001');
+          if(prefix.length>STATUS_BASELINE_ROWS_CAP) {
             this.sql.exec('DELETE FROM status_baselines WHERE caller_key IN (SELECT caller_key FROM status_baselines ORDER BY updated_at ASC LIMIT 500)');
           }
         } catch { /* capacity trim is best-effort */ }
@@ -836,7 +838,7 @@ export class StatusService {
           ...this.asksDto(!!(p as any).admin),
           ...this.attentionGroups(!!(p as any).admin, diskSummary?.needs_attention ?? [], intakeWarn),
           pagination: { next: null, total: tasks.length, limit: tasks.length },
-          coverage: this.coverageDto(built.missingHosts, built.expectedOffline, built.sessionCoverage, now),
+          coverage: this.coverageDto(built.missingHosts, built.expectedOffline, built.sessionCoverage, now,built),
           categories: this.categoriesDto(nowIso, built.missingHosts, built.sessionCoverage, built.reportsCollected, built.probesCollected,
             { state: diff.state, source: 'caller_scoped_durable_baseline', observed_at: nowIso, freshness: 'fresh', coverage: 'complete',
               reason: diff.state === 'first_baseline' ? 'first_call_baseline_recorded' : 'diff_since_caller_previous_post',
@@ -1275,7 +1277,7 @@ export class StatusService {
       const row = sessionRows.get(e.hub_session_id);
       if (!row) {
         out.push({ hub_session_id: e.hub_session_id, linkage: 'unknown_session',
-          provenance: { source: 'intake_history_link_claim', observed_at: null, freshness: 'unknown', coverage: 'unavailable', reason: 'linked_hub_session_row_absent' } });
+          provenance: { source: 'intake_history_link_claim', observed_at: null, freshness: 'unknown', coverage: 'unavailable', reason: (sessionRows as any).observationLimited ? 'linked_session_observation_limited' : 'linked_hub_session_row_absent' } });
         continue;
       }
       const admin = !!(p as any).admin;
