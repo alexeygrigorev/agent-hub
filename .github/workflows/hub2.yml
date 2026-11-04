@@ -32,42 +32,124 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
+        id: setup_node
         with:
           node-version: 22
           cache: npm
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
       - name: Install locked root toolchain
+        id: install
+        continue-on-error: true
         run: npm ci
 
       - name: Typecheck Hub 2.0 source
+        id: typecheck
+        continue-on-error: true
         run: npm run typecheck --prefix hub2
 
       - name: Enforce product SLOC and report tooling/test totals
+        id: budget
+        continue-on-error: true
         run: npm run budget --prefix hub2
 
-      - name: Native SQLite semantic tests
-        run: |
-          npm run test:accounts-mail --prefix hub2
-          npm run test:project-work --prefix hub2
-          npm run test:project-intake --prefix hub2
-          npm run test:read-cache --prefix hub2
-          npm run test:db-metering --prefix hub2
-          npm run test:control --prefix hub2
+      - name: Accounts and mail semantic tests
+        id: accounts_semantic
+        continue-on-error: true
+        run: npm run test:accounts-mail --prefix hub2
 
-      - name: Native workerd Durable Object tests
-        run: |
-          npm run test:accounts-mail-workerd --prefix hub2
-          npm run test:normal-day-auth --prefix hub2
-          npm run test:normal-day --prefix hub2
+      - name: Project work semantic tests
+        id: project_work
+        continue-on-error: true
+        run: npm run test:project-work --prefix hub2
+
+      - name: Project intake semantic tests
+        id: project_intake
+        continue-on-error: true
+        run: npm run test:project-intake --prefix hub2
+
+      - name: Read cache semantic tests
+        id: read_cache
+        continue-on-error: true
+        run: npm run test:read-cache --prefix hub2
+
+      - name: Database metering semantic tests
+        id: db_metering
+        continue-on-error: true
+        run: npm run test:db-metering --prefix hub2
+
+      - name: Control grants and directory semantic tests
+        id: control
+        continue-on-error: true
+        run: npm run test:control --prefix hub2
+
+      - name: Accounts and mail Workerd tests
+        id: accounts_workerd
+        continue-on-error: true
+        run: npm run test:accounts-mail-workerd --prefix hub2
+
+      - name: Auth and enrollment Workerd tests
+        id: auth_workerd
+        continue-on-error: true
+        run: npm run test:normal-day-auth --prefix hub2
+
+      - name: Normal day Workerd budget and idle tests
+        id: normal_day
+        continue-on-error: true
+        run: npm run test:normal-day --prefix hub2
+
+      - name: Public Worker core Workerd tests
+        id: core_workerd
+        continue-on-error: true
+        run: npm run test:core-workerd --prefix hub2
 
       - name: Public Worker and native mail roundtrip
+        id: public_mail
+        continue-on-error: true
         env:
           HUB2_CORE_PUBLIC_MAIL: "1"
         run: npm run test:core-workerd --prefix hub2
 
       - name: Build the local-only Wrangler bundle
+        id: bundle
+        continue-on-error: true
         run: npm run bundle:dry-run --prefix hub2
+
+      - name: Fail the job if any gate failed
+        if: always()
+        env:
+          SETUP_NODE: ${{ steps.setup_node.outcome }}
+          INSTALL: ${{ steps.install.outcome }}
+          TYPECHECK: ${{ steps.typecheck.outcome }}
+          BUDGET: ${{ steps.budget.outcome }}
+          ACCOUNTS_SEMANTIC: ${{ steps.accounts_semantic.outcome }}
+          PROJECT_WORK: ${{ steps.project_work.outcome }}
+          PROJECT_INTAKE: ${{ steps.project_intake.outcome }}
+          READ_CACHE: ${{ steps.read_cache.outcome }}
+          DB_METERING: ${{ steps.db_metering.outcome }}
+          CONTROL: ${{ steps.control.outcome }}
+          ACCOUNTS_WORKERD: ${{ steps.accounts_workerd.outcome }}
+          AUTH_WORKERD: ${{ steps.auth_workerd.outcome }}
+          NORMAL_DAY: ${{ steps.normal_day.outcome }}
+          CORE_WORKERD: ${{ steps.core_workerd.outcome }}
+          PUBLIC_MAIL: ${{ steps.public_mail.outcome }}
+          BUNDLE: ${{ steps.bundle.outcome }}
+        run: |
+          failed=0
+          for result in \
+            "setup_node:$SETUP_NODE" "install:$INSTALL" "typecheck:$TYPECHECK" \
+            "budget:$BUDGET" "accounts_semantic:$ACCOUNTS_SEMANTIC" \
+            "project_work:$PROJECT_WORK" "project_intake:$PROJECT_INTAKE" \
+            "read_cache:$READ_CACHE" "db_metering:$DB_METERING" \
+            "control:$CONTROL" "accounts_workerd:$ACCOUNTS_WORKERD" \
+            "auth_workerd:$AUTH_WORKERD" "normal_day:$NORMAL_DAY" \
+            "core_workerd:$CORE_WORKERD" "public_mail:$PUBLIC_MAIL" "bundle:$BUNDLE"; do
+            name=${result%%:*}
+            outcome=${result#*:}
+            if [ "$outcome" != success ]; then
+              echo "::error::Hub 2.0 gate $name ended with $outcome"
+              failed=1
+            else
+              echo "Hub 2.0 gate $name passed"
+            fi
+          done
+          exit "$failed"
