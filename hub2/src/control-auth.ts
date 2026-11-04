@@ -468,10 +468,10 @@ export class ControlAuth {
       row = this.db.one<Credential>('SELECT * FROM credentials WHERE refresh_hash=?', oldHash);
     if (
       !row ||
-      row.kind !== 'operator' ||
+      (row.kind !== 'operator' && row.kind !== 'agent') ||
       row.revoked_at != null ||
       row.created_at + 30 * 86400000 <= Date.now() ||
-      !allowlisted(this.env, row.principal_email)
+      (row.kind === 'operator' && !allowlisted(this.env, row.principal_email))
     )
       return authError('invalid_refresh', 401);
     const token = randomToken(),

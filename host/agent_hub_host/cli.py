@@ -675,6 +675,11 @@ def main():
         return
     if args.cmd in ('intake', 'handoff', 'worktree', 'stats'):
         try:
+            if args.cmd == 'intake':
+                # Hub-launched sessions read their own intake with the host-
+                # provisioned credential (166af2de AC1); no-op for operators.
+                from .msg_cli import apply_session_credential
+                apply_session_credential()
             result = (intake_stats.execute(args) if args.cmd == 'stats' or (args.cmd == 'intake' and args.intake_cmd == 'stats')
                       else worktree_cli.execute(args) if args.cmd == 'worktree' else intake.execute(args))
             print(json.dumps(result, indent=2, ensure_ascii=True))
