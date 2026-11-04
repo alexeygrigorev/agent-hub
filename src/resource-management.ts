@@ -1,3 +1,5 @@
+import {readSchemaObject,noteCreatedSchemaObject} from './schema-object-locator';
+import {schemaSqlEquivalent} from './schema-sql-equivalent';
 import {initIntakeLinkHealth,intakeLinkHealth} from './intake-link-health';
 import { effectiveHeartbeat, effectiveHeartbeatAt } from './registry';
 import { worktreeIntakeProtected, worktreeIntakeSnapshot, type WorktreeSnapshotScope } from './worktree-intakes';
@@ -177,11 +179,18 @@ export class ResourceManagement {
       .map(name=>{const column='"'+name.replaceAll('"','""')+'"';return `OLD.${column} IS NOT NEW.${column}`;}).join(' OR ') || '1';
     for(const table of tables) for(const op of ['INSERT','UPDATE','DELETE']) {
       const nativeUpdate=table==='fleet_sessions' && op==='UPDATE';
-      // Replace the old unconditional trigger, including on existing databases.
-      // Rebuilding it also includes any newly added native metadata columns.
-      if(nativeUpdate) this.sql.exec('DROP TRIGGER IF EXISTS resource_catalog_fleet_sessions_update');
-      this.sql.exec(`CREATE TRIGGER IF NOT EXISTS resource_catalog_${table}_${op.toLowerCase()} AFTER ${op} ON ${table} ${nativeUpdate ? 'WHEN '+nativeChanged : table === 'machines' && op === 'UPDATE' ? 'WHEN OLD.hostname IS NOT NEW.hostname OR OLD.id IS NOT NEW.id' : ''}
-        BEGIN UPDATE resource_catalog_revision SET revision=lower(hex(randomblob(16)))${table==='fleet_sessions' ? '' : ',structure_revision=lower(hex(randomblob(16)))'} WHERE id=1; END`);
+      // A changed column set or old unconditional body needs an upgrade;
+      // verify the live definition before paying for schema replacement.
+      const triggerSql=`CREATE TRIGGER IF NOT EXISTS resource_catalog_${table}_${op.toLowerCase()} AFTER ${op} ON ${table} ${nativeUpdate ? 'WHEN '+nativeChanged : table === 'machines' && op === 'UPDATE' ? 'WHEN OLD.hostname IS NOT NEW.hostname OR OLD.id IS NOT NEW.id' : ''}
+        BEGIN UPDATE resource_catalog_revision SET revision=lower(hex(randomblob(16)))${table==='fleet_sessions' ? '' : ',structure_revision=lower(hex(randomblob(16)))'} WHERE id=1; END`;
+      let nativeTriggerChanged=false;
+      if(nativeUpdate){
+        const actual=readSchemaObject(this.sql,{name:'resource_catalog_fleet_sessions_update',type:'trigger',table:'fleet_sessions'});
+        nativeTriggerChanged=!actual||!schemaSqlEquivalent(actual.sql,triggerSql);
+        if(actual&&nativeTriggerChanged)this.sql.exec('DROP TRIGGER resource_catalog_fleet_sessions_update');
+      }
+      this.sql.exec(triggerSql);
+      if(nativeUpdate&&nativeTriggerChanged)noteCreatedSchemaObject(this.sql,{name:'resource_catalog_fleet_sessions_update',type:'trigger',table:'fleet_sessions'});
     }
     this.catalogReady=true;
   }

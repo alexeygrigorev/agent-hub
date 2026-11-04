@@ -1,3 +1,5 @@
+import {readSchemaObject,noteCreatedSchemaObject} from './schema-object-locator';
+import {schemaSqlEquivalent} from './schema-sql-equivalent';
 import { accountFailurePrefix,routeFailureObservation,routeQuarantineObservation,unsupportedModelObservation } from './fleet-failure-observation';
 import { readPlacementPressure, PLACEMENT_PRESSURE_REASONS } from './placement-pressure';
 export { PLACEMENT_PRESSURE_REASONS } from './placement-pressure';
@@ -755,13 +757,14 @@ export class FleetService {
     // Preserve the established lookup identity and upgrade legacy definitions
     // atomically to the exact terminal-state range used by choking admission.
     const runtimeDDL = "CREATE INDEX fleet_launch_runtime_exit ON fleet_launches(machine_id,updated_at DESC) WHERE state IN ('failed','exited') AND exit_reason IN ('engine_runtime_timeout','engine_signal_exit')";
-    const normalizeIndex = (ddl: string) => ddl.replace(/\s+/g, '').replace('IFNOTEXISTS', '');
     this.transaction(() => {
-      const runtime: any = this.sql.exec("SELECT sql FROM sqlite_master WHERE type='index' AND name='fleet_launch_runtime_exit'").toArray()[0];
-      if (runtime && normalizeIndex(String(runtime.sql)) !== normalizeIndex(runtimeDDL))
-        this.sql.exec('DROP INDEX fleet_launch_runtime_exit');
+      const identity={name:'fleet_launch_runtime_exit',type:'index' as const,table:'fleet_launches'};
+      const runtime=readSchemaObject(this.sql,identity);
+      const needsCreate=!runtime||!schemaSqlEquivalent(runtime.sql,runtimeDDL);
+      if (runtime && needsCreate)this.sql.exec('DROP INDEX fleet_launch_runtime_exit');
       this.sql.exec('DROP INDEX IF EXISTS fleet_queue_runtime_exit');
       this.sql.exec(runtimeDDL.replace('CREATE INDEX ', 'CREATE INDEX IF NOT EXISTS '));
+      if(needsCreate)noteCreatedSchemaObject(this.sql,identity);
     });
     this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_launch_inflight_identity ON fleet_launches(machine_id,engine,account,profile) WHERE native_id IS NULL AND state IN ('starting','uncertain')");
     // Intake b527e905: the launcher-failure quarantine reads the most recent
@@ -900,21 +903,23 @@ export class FleetService {
     this.reconciliationPages.set(machine,{pending,cursors});
     // Cache raw PK facts only. A moving clock must change the verdict, not
     // force unchanged native history to be read again on every host poll.
-    const identities=JSON.stringify(raw.filter(row=>row.native_id!==null).map(row=>({id:String(row.id),native_id:row.native_id})));
+    const nativeIds=[...new Set(raw.filter(row=>row.native_id!==null).map(row=>String(row.native_id)))];
+    const identities=JSON.stringify(nativeIds);
     const key=JSON.stringify([machine,identities]);
     const stamp=this.writes?.stamp('fleet_sessions');
     const hit=stamp!==undefined?this.reconciliationNativeFacts.get(key):undefined;
-    const facts=hit && hit.stamp===stamp ? hit.rows : raw.some(row=>row.native_id!==null)?this.sql.exec(`
-      SELECT json_extract(requested.value,'$.id') AS id,n.engine,n.phase,n.observed_at
-      FROM json_each(?) requested CROSS JOIN fleet_sessions n
-        ON n.machine_id=? AND n.native_id=json_extract(requested.value,'$.native_id')`,identities,machine).toArray() as any[]:[];
+    // Scalar JSON extraction supplies bounded IN keys without a virtual
+    // input table: Cloudflare bills json_each input rows as well as PK reads.
+    const facts=hit && hit.stamp===stamp ? hit.rows : nativeIds.length?this.sql.exec(`
+      SELECT native_id,engine,phase,observed_at FROM fleet_sessions
+      WHERE machine_id=?1 AND native_id IN (${nativeIds.map((_,i)=>`json_extract(?2,'$[${i}]')`).join(',')})`,machine,identities).toArray() as any[]:[];
     if(stamp!==undefined && (!hit || hit.stamp!==stamp)) {
       if(this.reconciliationNativeFacts.size>=16)this.reconciliationNativeFacts.clear();
       this.reconciliationNativeFacts.set(key,{stamp,rows:facts});
     }
-    const byId=new Map(facts.map(row=>[String(row.id),row]));
+    const byNativeId=new Map(facts.map(row=>[String(row.native_id),row]));
     const observed=new Set(raw.filter(row=>{
-      const native=byId.get(String(row.id));
+      const native=byNativeId.get(String(row.native_id));
       return native && native.engine===row.engine && ['starting','running'].includes(native.phase)
         && (catalogFresh || native.observed_at>=cutoff);
     }).map(row=>String(row.id)));
@@ -927,10 +932,18 @@ export class FleetService {
     const bindingKey=JSON.stringify([machine,bindingIds]);
     const bindingStamp=this.writes?.stamp('session_control_sessions');
     const bindingHit=bindingStamp!==undefined?this.reconciliationBindingFacts.get(bindingKey):undefined;
-    const bindings=bindingHit && bindingHit.stamp===bindingStamp?bindingHit.rows:controlStore && raw.length?new Map(this.sql.exec(`SELECT requested.value AS id,
-      (SELECT binding_json FROM session_control_sessions INDEXED BY session_control_fleet_lookup
-        WHERE fleet_launch_id=requested.value AND machine_id=? LIMIT 1) AS binding_json
-      FROM json_each(?) requested`,machine,bindingIds).toArray()
+    // Each branch emits only a present first control row. Apart from
+    // avoiding billed virtual inputs, this preserves present NULL versus an
+    // absent control. Nest groups to respect Cloudflare's five-term limit.
+    let bindingBranches=raw.map((_,i)=>`SELECT * FROM (SELECT fleet_launch_id AS id,binding_json
+      FROM session_control_sessions INDEXED BY session_control_fleet_lookup
+      WHERE fleet_launch_id=json_extract(?2,'$[${i}]') AND machine_id=?1 LIMIT 1)`);
+    while(bindingBranches.length>1) {
+      const groups:string[]=[];
+      for(let i=0;i<bindingBranches.length;i+=5)groups.push(`SELECT * FROM (${bindingBranches.slice(i,i+5).join(' UNION ALL ')})`);
+      bindingBranches=groups;
+    }
+    const bindings=bindingHit && bindingHit.stamp===bindingStamp?bindingHit.rows:controlStore && raw.length?new Map(this.sql.exec(bindingBranches[0],machine,bindingIds).toArray()
       .map((row:any)=>[String(row.id),row.binding_json] as const)):new Map<string,any>();
     if(bindingStamp!==undefined && (!bindingHit || bindingHit.stamp!==bindingStamp)) {
       if(bindingHit){this.reconciliationBindingFacts.delete(bindingKey);this.reconciliationBindingBytes-=bindingHit.bytes;}
@@ -949,7 +962,7 @@ export class FleetService {
     }
     return selected.map(row => ({id:row.id,workspace:row.workspace,cwd:parsed(row.request_json).cwd??null,
       diagnostic:parsed(row.launch_error_json),native_id:row.native_id,engine:row.engine,mode:row.mode,
-      launcher_task_id:row.launcher_task_id,binding:bindings.get(String(row.id))==null?null:parsed(bindings.get(String(row.id)))}));
+      launcher_task_id:row.launcher_task_id,binding:bindings.has(String(row.id))?parsed(bindings.get(String(row.id))):null}));
   }
 
   /** Live Hub sessions per canonical account (intake 93e7817b): one row per

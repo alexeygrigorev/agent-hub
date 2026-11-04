@@ -1,3 +1,4 @@
+import {readSchemaObject,SchemaObjectObservationLimit} from '../src/schema-object-locator';
 import { describe, expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { ChecksService } from '../src/checks';
@@ -23,6 +24,46 @@ function seedAgents(raw: any,count: number) {
 }
 
 describe('bootstrap reuses deployed indexes on large retained sources',()=>{
+  it('shares bounded schema locators while verifying live definitions after DDL and rollback',()=>fixture(async(raw,state)=>{
+    const observation=observe(raw),budget=new RowBudget(ledger());await budget.begin(true);
+    const sql=budget.wrap(observation.sql),identity={name:'fleet_launch_runtime_exit',type:'index' as const,table:'fleet_launches'};
+    const initial=readSchemaObject(sql,identity)!;
+    expect(initial.sql).toContain("WHERE state IN ('failed','exited')");
+    const other=readSchemaObject(sql,{name:'fleet_launch_machine_state',type:'index',table:'fleet_launches'});
+    expect(other?.sql).toContain('machine_id,state');
+    expect(readSchemaObject(sql,identity)).toEqual(initial);
+    expect(observation.calls.filter(c=>c.query.includes('ORDER BY rowid LIMIT 1025'))).toHaveLength(1);
+    for(const call of observation.calls.filter(c=>c.query.includes('WHERE rowid=?')))
+      expect(Number(call.cursor.rowsRead)).toBeLessThanOrEqual(1);
+    const changed="CREATE INDEX fleet_launch_runtime_exit ON fleet_launches(updated_at,machine_id) WHERE state='failed'";
+    expect(()=>state.storage.transactionSync(()=>{
+      raw.exec('DROP INDEX fleet_launch_runtime_exit');raw.exec(changed);
+      // Even a reused schema rowid must return the ACTUAL new definition.
+      expect(readSchemaObject(sql,identity)?.sql).toBe(changed);
+      throw new Error('schema rollback');
+    })).toThrow('schema rollback');
+    expect(readSchemaObject(sql,identity)?.sql).toBe(initial.sql);
+    raw.exec('DROP INDEX fleet_launch_runtime_exit');
+    expect(readSchemaObject(sql,identity)).toBeNull();
+    raw.exec(changed);
+    // A previous absence is never authoritative after a new object appears.
+    expect(readSchemaObject(sql,identity)?.sql).toBe(changed);
+    expect(budget.status()).toMatchObject({limit_total:20000,stopped:false});await budget.finish();
+  }));
+
+  it('refuses an incomplete schema prefix before validating objects or performing effects',()=>fixture(async(raw,_state)=>{
+    const count=raw.exec('SELECT 1 FROM sqlite_master LIMIT 1025').toArray().length;
+    for(let i=count;i<1025;i++)raw.exec('CREATE TABLE schema_locator_padding_'+i+'(id INTEGER PRIMARY KEY)');
+    const observation=observe(raw),budget=new RowBudget(ledger());await budget.begin(true);
+    const sql=budget.wrap(observation.sql);
+    expect(()=>readSchemaObject(sql,{name:'fleet_launch_runtime_exit',type:'index',table:'fleet_launches'})).toThrow(SchemaObjectObservationLimit);
+    expect(observation.calls).toHaveLength(1);
+    expect(observation.calls[0].query).toContain('ORDER BY rowid LIMIT 1025');
+    expect(Number(observation.calls[0].cursor.rowsRead)).toBeLessThanOrEqual(1025);
+    expect(observation.calls.every(c=>Number(c.cursor.rowsWritten)===0)).toBe(true);
+    expect(budget.status()).toMatchObject({limit_total:20000,stopped:false});await budget.finish();
+  }));
+
   it('checks and ops initialize without building missing indexes over messages/intakes/sessions',()=>fixture(async(raw,state)=>{
     const now=Date.now(),at=new Date(now).toISOString();
     for(const name of ['messages_check_pending_created','messages_check_actor_pending_created','ops_intake_open_ac','ops_active_sessions','ops_ended_intake_sessions']) raw.exec('DROP INDEX IF EXISTS '+name);

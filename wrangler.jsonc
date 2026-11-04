@@ -36,6 +36,7 @@
     ]
   },
   "vars": {
+    "SCHEMA_OBJECT_ROWID_HINTS": "{\"messages_bind_agents\":58,\"agents_no_legacy_collision_insert\":67,\"agents_no_legacy_collision_update\":68,\"fleet_launch_runtime_exit\":748,\"resource_catalog_fleet_sessions_update\":787}",
     "HUB_ALERT_TO": "",
     "HUB_ALERT_WEBHOOK": "https://dapier.dtcdev.click/hooks/webhook/dev",
     "HUB_ADDITIONAL_ADMINS": "alexey@datatalks.club,orin@datatalks.club",

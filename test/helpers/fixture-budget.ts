@@ -17,7 +17,19 @@ export async function freshFixtureBudgetDay(hub:any):Promise<void> {
  * cache invalidation effects of raw fixture writes without charging thousands
  * of deliberately fabricated rows to the operation being measured. */
 export function fixtureSql(hub:any,state:any=hub.ctx):any {
-  return hub.writes.wrap(state.storage.sql);
+  const native=state.storage.sql;
+  // Synthetic setup can issue raw DDL outside the production SQL guard.
+  // Invalidate its advisory index-name facts before every fixture exec so
+  // setup cannot accidentally grant stale schema authority to real work.
+  const setup=new Proxy(native,{get(target,key){
+    if(key==='exec')return(query:string,...bindings:any[])=>{
+      hub.rowBudget.invalidateIndexFacts?.();
+      return target.exec(query,...bindings);
+    };
+    const value=Reflect.get(target,key,target);
+    return typeof value==='function'?value.bind(target):value;
+  }});
+  return hub.writes.wrap(setup);
 }
 
 // Same explicit case-boundary operation; alias retained for fixture callers.

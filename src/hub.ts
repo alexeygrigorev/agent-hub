@@ -1,3 +1,4 @@
+import {configureSchemaObjectHints} from './schema-object-locator';
 import { invalidateCatalogObservations } from './catalog-freshness';
 import { initRootIncumbentProjection } from './root-incumbent';
 import { BackgroundWorkQueue } from './background-work';
@@ -249,6 +250,7 @@ export class Hub extends DurableObject {
   private backgroundAlarmStamp: string | null = null;
 
   private initializeServices(env: Env) {
+    configureSchemaObjectHints(this.sql,env.SCHEMA_OBJECT_ROWID_HINTS);
     this.meter.runSync('init:schema', () => {
       this.initDb();
       for (const stmt of ROWS_STATS_SCHEMA.split(';')) if (stmt.trim()) this.sql.exec(stmt);

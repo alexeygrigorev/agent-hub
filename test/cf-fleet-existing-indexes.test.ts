@@ -1,3 +1,4 @@
+import {configureSchemaObjectHints,readSchemaObject,noteCreatedSchemaObject} from '../src/schema-object-locator';
 import {intakeLinkHealth} from '../src/intake-link-health';
 import {buildSessionInputs,classifyKey,LifecycleObservationLimit} from '../src/session_lifecycle_registry';
 import {fixtureSql} from './helpers/fixture-budget';
@@ -27,6 +28,31 @@ function launch(raw:any,id:string,state:string,reason:string|null=null,updated=A
 }
 
 describe('Fleet recovery and paging use deployed indexes',()=>{
+  it('uses untrusted deployment hints only for live schema PK verification and rejects stale identities',()=>fixture(async(hub,raw)=>{
+    const seed=fixtureSql(hub),identity={name:'fleet_launch_runtime_exit',type:'index' as const,table:'fleet_launches'};
+    const actual=seed.exec("SELECT rowid,sql FROM sqlite_master WHERE name='fleet_launch_runtime_exit' AND type='index'").one();
+    const other=seed.exec("SELECT rowid FROM sqlite_master WHERE name='fleet_sessions' AND type='table'").one();
+    await hub.rowBudget.begin(true);const day=hub.rowBudget.status().day;
+    const valid=measured(hub.sql);configureSchemaObjectHints(valid.sql,{fleet_launch_runtime_exit:actual.rowid});
+    expect(readSchemaObject(valid.sql,identity)?.sql).toBe(actual.sql);
+    expect(valid.queries).toHaveLength(1);expect(valid.queries[0]).toContain('WHERE rowid=?');expect(valid.rows()).toBeLessThanOrEqual(1);
+    const wrong=measured(hub.sql);configureSchemaObjectHints(wrong.sql,JSON.stringify([{name:identity.name,rowid:other.rowid}]));
+    expect(readSchemaObject(wrong.sql,identity)?.sql).toBe(actual.sql);
+    expect(wrong.queries.filter(q=>q.includes('ORDER BY rowid LIMIT 1025'))).toHaveLength(1);
+    const replacement="CREATE INDEX fleet_launch_runtime_exit ON fleet_launches(updated_at) WHERE state='failed'";
+    // An operator/schema owner can mutate outside WriteWatch. Verification
+    // must read native metadata rather than reuse a positive SQL memo.
+    raw.exec('DROP INDEX fleet_launch_runtime_exit');raw.exec(replacement);
+    // Reusing the hinted rowid never reuses its prior definition. A create
+    // refresh reads only the newest actual schema object and verifies it.
+    valid.reset();expect(readSchemaObject(valid.sql,identity)?.sql).toBe(replacement);
+    valid.reset();expect(noteCreatedSchemaObject(valid.sql,identity)?.sql).toBe(replacement);
+    expect(valid.queries).toHaveLength(1);expect(valid.rows()).toBeLessThanOrEqual(1);
+    valid.reset();expect(readSchemaObject(valid.sql,identity)?.sql).toBe(replacement);
+    expect(valid.queries.some(q=>q.includes('ORDER BY rowid LIMIT 1025'))).toBe(false);
+    expect(hub.rowBudget.status()).toMatchObject({day,limit_total:20000,stopped:false});
+  }));
+
   it('reconciliation advances bounded raw state pages past sparse retained failures',()=>fixture(async(_hub,raw)=>{
     for(let i=0;i<1000;i++)launch(raw,'old-'+i,'failed','unrelated');
     launch(raw,'recover-me','failed',SILENT_START_REASON);
@@ -62,23 +88,28 @@ describe('Fleet recovery and paging use deployed indexes',()=>{
     let clock=NOW;
     const m=measured(hub.sql),fleet=new FleetService(m.sql as any,(fn:any)=>fn(),()=>clock,hub.writes);
     const read=(fresh:boolean)=>{m.reset();const result=(fleet as any).reconciliationCandidatesUncached('host',fresh);
-      expect(m.queries.length).toBeLessThanOrEqual(7);expect(m.rows()).toBeLessThan(650);return result;};
+      expect(m.queries.length).toBeLessThanOrEqual(7);expect(m.rows()).toBeLessThan(650);
+      expect(m.queries.some(q=>q.includes('json_each'))).toBe(false);return result;};
     expect(read(false)).toHaveLength(75);
     // A complete fresh census supplies positive proof for the previously
     // stale native rows; engine mismatch and missing native remain visible.
     expect(read(true)).toHaveLength(50);
     seed.exec("UPDATE fleet_sessions SET phase='exited' WHERE native_id='native-starting-0'");
     expect(read(true).some((row:any)=>row.id==='starting-0')).toBe(true);
-    expect(m.queries.some(q=>q.includes('CROSS JOIN fleet_sessions n'))).toBe(true);
+    expect(m.queries.some(q=>q.includes('SELECT native_id,engine,phase,observed_at FROM fleet_sessions'))).toBe(true);
     clock=NOW+180001;
     // Time alone retires positive freshness. Raw facts remain generation
     // cached; no native SQL runs to recompute the changed verdict.
     expect(read(false)).toHaveLength(100);
-    expect(m.queries.some(q=>q.includes('CROSS JOIN fleet_sessions n'))).toBe(false);
+    expect(m.queries.some(q=>q.includes('SELECT native_id,engine,phase,observed_at FROM fleet_sessions'))).toBe(false);
     expect(m.rows()).toBe(0);
     seed.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,fleet_launch_id,machine_id,engine,mode,state,binding_json,created_at,updated_at)
       VALUES('reconciliation-binding','fixture','reconciliation-binding','{}','failed-0','host','codex','headless','running',?,?,?)`,
-      JSON.stringify({native_id:'bound-native'}),AT,AT);
+      null,AT,AT);
+    const withNullBinding=read(false);
+    expect(withNullBinding.find((row:any)=>row.id==='failed-0').binding).toEqual({});
+    expect(withNullBinding.find((row:any)=>row.id==='failed-1').binding).toBeNull();
+    seed.exec("UPDATE session_control_sessions SET binding_json=? WHERE id='reconciliation-binding'",JSON.stringify({native_id:'bound-native'}));
     expect(read(false).find((row:any)=>row.id==='failed-0').binding).toEqual({native_id:'bound-native'});
     expect(()=>hub.ctx.storage.transactionSync(()=>{
       seed.exec("UPDATE session_control_sessions SET binding_json=? WHERE id='reconciliation-binding'",JSON.stringify({native_id:'rolled-back'}));
@@ -92,7 +123,7 @@ describe('Fleet recovery and paging use deployed indexes',()=>{
     read(false);
     // Oversized legacy facts stay complete in the result but are not pinned
     // in the persistent in-memory source cache.
-    expect(m.queries.some(q=>q.includes('SELECT binding_json FROM session_control_sessions'))).toBe(true);
+    expect(m.queries.some(q=>q.includes('fleet_launch_id AS id,binding_json'))).toBe(true);
     expect(hub.rowBudget.status()).toMatchObject({day,limit_total:20000,stopped:false});
   }));
 

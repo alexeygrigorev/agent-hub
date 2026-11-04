@@ -6,6 +6,10 @@ import { freshCpu } from './cpu-fixture';
 
 const inDO: any = runInDurableObject;
 const activeFilter = "AND l.state IN ('offered','starting','running','uncertain')";
+// The reference keeps eligibility but defeats its index constraint. Removing
+// eligibility entirely would put retained terminal rows into the raw sentinel
+// and legitimately make the bounded service refuse an incomplete snapshot.
+const referenceFilter = "AND CASE WHEN l.state IN ('offered','starting','running','uncertain') THEN 1 ELSE 0 END=1";
 
 it('bounds reservation reads by active launches while preserving ramp, host and exclusion semantics', async () => {
   const stub = (env as any).HUB.get((env as any).HUB.idFromName(crypto.randomUUID()));
@@ -36,15 +40,18 @@ it('bounds reservation reads by active launches while preserving ramp, host and 
       fixtureStatements(sql).exec('INSERT INTO resource_ramps(launch_id,started_at) VALUES(?,?),(?,?)',
         'old-created-fresh-ramp',at,'fresh-created-old-ramp',before);
     });
-    const work: {query: string; reads: number}[] = [];
+    const work: {query: string; reads: number}[] = [], referenceWork: {query:string;reads:number}[]=[];
+    let referenceRewrites=0;
     const measured = (baseline: boolean) => new Proxy(sql, { get(target,key) {
       if (key !== 'exec') return Reflect.get(target,key);
       return (query: string, ...args: any[]) => {
         const pending = query.includes('FROM fleet_launches l') && query.includes('resource_ramps') && query.includes('AS request_json');
-        const cursor = target.exec(baseline && pending ? query.replace(activeFilter,'') : query,...args);
-        if (!pending || baseline) return cursor;
+        if(baseline&&pending){expect(query).toContain(activeFilter);referenceRewrites++;}
+        const executed=baseline&&pending?query.replace(activeFilter,referenceFilter):query;
+        const cursor = target.exec(executed,...args);
+        if (!pending) return cursor;
         return new Proxy(cursor,{get(c,property) {
-          if (property === 'toArray') return () => { const rows=c.toArray(); work.push({query,reads:c.rowsRead}); return rows; };
+          if (property === 'toArray') return () => { const rows=c.toArray(); (baseline?referenceWork:work).push({query:executed,reads:c.rowsRead}); return rows; };
           const value=Reflect.get(c,property,c); return typeof value === 'function' ? value.bind(c) : value;
         }});
       };
@@ -54,8 +61,9 @@ it('bounds reservation reads by active launches while preserving ramp, host and 
     const input = {project:'pending',workspace:'/fixture',task_kind:'goal'};
     const memory = current.headroom('pending-host',input,'codex');
     expect(memory).toEqual(baseline.headroom('pending-host',input,'codex'));
-    // Intake 63a9ee3a: the 2000 fresh terminal/queued rows never reserve,
-    // even when the baseline strips the state IN (...) filter.
+    // Intake 63a9ee3a: all 2000 terminal/queued rows remain visible to the
+    // non-sargable reference scan, but never become active reservations.
+
     expect(baseline.headroom('pending-host',input,'codex').reserved_mb).toBe(6*current.estimate('pending','codex','goal'));
     // Four active states, the exact boundary, and an old launch with a fresh
     // ramp count. Old ramps, foreign hosts and terminal/queued history do not.
@@ -64,6 +72,8 @@ it('bounds reservation reads by active launches while preserving ramp, host and 
     expect(current.cpuHeadroom('pending-host',input,'active-offered')).toEqual(baseline.cpuHeadroom('pending-host',input,'active-offered'));
     // Memory visibility seeks each exact active state using the deployed
     // index; bound the aggregate row work rather than a particular call count.
+    expect(referenceRewrites).toBeGreaterThan(0);
+    expect(referenceWork.reduce((total,query)=>total+query.reads,0)).toBeGreaterThan(2000);
     expect(work.length).toBeGreaterThan(0);
     expect(work.reduce((total, query) => total + query.reads, 0)).toBeLessThan(200);
     for (const query of work) expect(query.reads,query.query).toBeLessThan(100);
@@ -71,5 +81,6 @@ it('bounds reservation reads by active launches while preserving ramp, host and 
     expect(current.headroom('pending-host',input,'codex').reserved_mb).toBe(5*current.estimate('pending','codex','goal'));
     fixtureStatements(sql).exec("UPDATE resource_ramps SET started_at=? WHERE launch_id='old-created-fresh-ramp'",before);
     expect(current.headroom('pending-host',input,'codex').reserved_mb).toBe(4*current.estimate('pending','codex','goal'));
+    expect(h.rowBudget.status()).toMatchObject({limit_total:20000,stopped:false});
   });
 });

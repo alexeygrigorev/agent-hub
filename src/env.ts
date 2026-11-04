@@ -9,6 +9,9 @@ export interface Env {
   // staleness, intake 1bc3add1 AC2). Optional: tests may omit it.
   ASSETS?: Fetcher;
 
+  // Untrusted schema rowid locators; identity and actual SQL are always verified.
+  SCHEMA_OBJECT_ROWID_HINTS?: string;
+
   // Auth Config
   AUTH_BASE_URL: string;
   AUTH_CLIENT_ID: string;

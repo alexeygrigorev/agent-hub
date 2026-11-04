@@ -22,7 +22,7 @@ describe('shared bounded resource observations',()=>{
   for(const [i,phase]of ['','paused','running','zz_future'].entries())seed.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace) VALUES('host',?,'active',?,?,'/repo')",'native-'+i,phase,at);
   for(const phase of ['dead','exited','failed','finished','refused','stopped'])seed.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace) VALUES('host',?,'terminal',?,?,'/repo')",'terminal-'+phase,phase,at);
   for(const [i,state]of ['offered','starting','running','uncertain'].entries())launch(seed,'live-'+i,state,at,i===0?'native-0':null);
-  for(const [i,state]of ['queued','held','offered','starting','running','uncertain'].entries())control(seed,'control-'+i,state,at,'native-'+i%4);
+  for(const [i,state]of ['queued','held','offered','starting','running','uncertain'].entries())control(seed,'control-'+i,state,at,'native-'+i);
   const count=h.meter.runSync('physical',()=>r.hostSessionCount('host'));
   expect(count).toBe(7);expect(h.meter.snapshot().physical.calls).toBe(2);expect(h.meter.snapshot().physical.rows_read).toBeLessThan(50);
   expect(r.hostSessionCount('host','live-3')).toBe(6);

@@ -1,3 +1,5 @@
+import {readSchemaObject,noteCreatedSchemaObject} from './schema-object-locator';
+import {schemaSqlEquivalent} from './schema-sql-equivalent';
 import type { SqlStorage } from '@cloudflare/workers-types';
 
 export const AGENT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
@@ -31,16 +33,15 @@ function collisionTrigger(event: string): { name: string; sql: string } {
       AND (COALESCE(project,'') = '' OR COALESCE(NEW.project,'') = ''))
     BEGIN SELECT RAISE(ABORT, 'agent_exists'); END` };
 }
-const normalizeGuard = (ddl: string) => ddl.replace(/IF\s+NOT\s+EXISTS/ig,'').replace(/\s+/g,'').toLowerCase();
 
 /** The deployed f2 migration validated collisions before installing these
  * exact guards. Their presence proves that validated boundary still holds;
  * they prevent later inserts/updates from introducing a projectless clash. */
 function collisionGuardsInstalled(sql: SqlStorage): boolean {
-  const rows = sql.exec("SELECT name,sql FROM sqlite_master WHERE type='trigger' AND name IN ('agents_no_legacy_collision_insert','agents_no_legacy_collision_update') LIMIT 2").toArray() as any[];
   return COLLISION_EVENTS.every(event => {
     const expected = collisionTrigger(event);
-    return rows.some(row => row.name === expected.name && normalizeGuard(String(row.sql)) === normalizeGuard(expected.sql));
+    const actual=readSchemaObject(sql,{name:expected.name,type:'trigger',table:'agents'});
+    return !!actual && schemaSqlEquivalent(actual.sql,expected.sql);
   });
 }
 
@@ -113,16 +114,19 @@ export function bindAgentCredentials(sql: SqlStorage, transaction: <T>(fn: () =>
       }
     }
     const canonical = (raw: string) => `COALESCE(NULLIF(${binding(raw)},''), ${raw})`;
-    // Intake e8a22f4c: the trigger body is sargable now; drop the pre-index
-    // definition once so live deployments pick it up (IF NOT EXISTS would
-    // keep scanning the registry on every message insert).
-    sql.exec('DROP TRIGGER IF EXISTS messages_bind_agents');
-    sql.exec(`CREATE TRIGGER messages_bind_agents AFTER INSERT ON messages BEGIN
+    // Compare the live definition: a new initializer must not rewrite an
+    // already-current trigger, while an old non-sargable body must upgrade.
+    const messageBindingTrigger=`CREATE TRIGGER IF NOT EXISTS messages_bind_agents AFTER INSERT ON messages BEGIN
       UPDATE messages SET from_actor = ${canonical('NEW.from_actor')}, to_actor = ${canonical('NEW.to_actor')},
         registry_unbound_from = CASE WHEN instr(NEW.from_actor,':') = 0 AND ${registryNameSql('NEW.from_actor')} AND ${binding('NEW.from_actor')} = '' THEN 1 ELSE NEW.registry_unbound_from END,
         registry_unbound_to = CASE WHEN instr(NEW.to_actor,':') = 0 AND ${registryNameSql('NEW.to_actor')} AND ${binding('NEW.to_actor')} = '' THEN 1 ELSE NEW.registry_unbound_to END
         WHERE id = NEW.id;
-      END`);
+      END`;
+    const currentMessageBinding=readSchemaObject(sql,{name:'messages_bind_agents',type:'trigger',table:'messages'});
+    const replaceMessageBinding=!!currentMessageBinding&&!schemaSqlEquivalent(currentMessageBinding.sql,messageBindingTrigger);
+    if(replaceMessageBinding)sql.exec('DROP TRIGGER messages_bind_agents');
+    sql.exec(messageBindingTrigger);
+    if(!currentMessageBinding||replaceMessageBinding)noteCreatedSchemaObject(sql,{name:'messages_bind_agents',type:'trigger',table:'messages'});
     sql.exec(`CREATE TRIGGER IF NOT EXISTS credentials_bind_agent AFTER INSERT ON credentials
       WHEN NEW.kind = 'agent' AND NEW.registry_actor IS NULL BEGIN
       UPDATE credentials SET registry_actor = ${binding("COALESCE(NULLIF(NEW.actor,''), NEW.subject)")} WHERE id = NEW.id;

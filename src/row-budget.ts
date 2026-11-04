@@ -20,12 +20,16 @@ const DEFAULT_CHUNK = Object.freeze({ read: 3072, written: 1024 });
 export const INDEX_BUILD_SOURCE_LIMIT = 1000;
 export const INDEX_PARTIAL_READ_SOURCE_LIMIT = 50_000;
 const INDEX_METADATA_LIMIT = 64;
+const INDEX_FACT_TABLE_LIMIT = 128;
+const INDEX_FACT_BYTE_LIMIT = 256 * 1024;
+const foldSqlIdentifier = (value:string) => value.replace(/[A-Z]/g,char=>char.toLowerCase());
 
 type IndexBuild = { name: string; table: string; predicate?: string };
+type IndexFacts = { names:Set<string>;bytes:number };
 
 /** Tokenize identifiers, punctuation and literals separately so comments or
  * a quoted column containing CREATE INDEX cannot hide or invent a build. */
-function indexBuilds(query: string): { builds: IndexBuild[]; unsupported: boolean; executable: string } {
+function indexBuilds(query: string): { builds: IndexBuild[]; unsupported: boolean; executable: string; invalidateFacts:boolean } {
   const matches = [...query.matchAll(/--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/|'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[[^\]]*\]|[A-Za-z_][A-Za-z0-9_$]*|[^\s]/g)]
     .filter(match => !match[0].startsWith('--') && !match[0].startsWith('/*'));
   const tokens=matches.map(match=>match[0]);
@@ -81,7 +85,18 @@ function indexBuilds(query: string): { builds: IndexBuild[]; unsupported: boolea
   const last = tokens.at(-1) === ';' ? matches.length - 2 : matches.length - 1;
   const executable = builds.length && last >= 0
     ? query.slice(0, matches[last].index! + matches[last][0].length) : query;
-  return { builds, unsupported, executable };
+  // Trigger bodies cannot change index lists. Other schema/transaction text
+  // is conservatively invalidated, including batches and failed DDL.
+  const first=tokens[0]?.toUpperCase();
+  const changesCreatedObjects=tokens.some((token,i)=>{
+    if(token.toUpperCase()!=='CREATE')return false;
+    let at=i+1;while(['TEMP','TEMPORARY','UNIQUE'].includes(tokens[at]?.toUpperCase()))at++;
+    return !['INDEX','TRIGGER'].includes(tokens[at]?.toUpperCase());
+  });
+  const invalidateFacts=['ALTER','DROP','VACUUM','REINDEX','BEGIN','COMMIT','END','ROLLBACK','SAVEPOINT','RELEASE'].includes(first)
+    || changesCreatedObjects
+    || tokens.some(token=>['ALTER','DROP','VACUUM','REINDEX','ROLLBACK','COMMIT','SAVEPOINT','RELEASE'].includes(token.toUpperCase()));
+  return { builds, unsupported, executable, invalidateFacts };
 }
 
 type Counts = { read: number; written: number };
@@ -107,6 +122,11 @@ export class RowBudget {
   private readonly storage: Store;
   private emergencyAlarmDeleted = false;
   private ledgerFailure = false;
+  // Metadata caching requires the storage transaction observer. Standalone
+  // raw-SQL wrappers keep probing, because their callers can bypass DDL hooks.
+  private indexFactsEnabled = false;
+  private indexFacts = new Map<string,IndexFacts>();
+  private indexFactBytes = 0;
 
   constructor(storage: Store, private now: () => number = Date.now,
     limits: Counts = DAILY_ROW_LIMITS, chunk: Counts = DEFAULT_CHUNK, combinedLimit = DAILY_COMBINED_ROW_LIMIT) {
@@ -117,6 +137,28 @@ export class RowBudget {
     this.limits = { read: safe(limits.read, DAILY_ROW_LIMITS.read), written: safe(limits.written, DAILY_ROW_LIMITS.written) };
     this.chunk = { read: safe(chunk.read, this.limits.read), written: safe(chunk.written, this.limits.written) };
     this.combinedLimit = safe(combinedLimit, Math.min(DAILY_COMBINED_ROW_LIMIT,this.limits.read+this.limits.written));
+  }
+
+  /** Native fixture/schema owners must invalidate before bypassing wrap(). */
+  invalidateIndexFacts():void {this.indexFacts.clear();this.indexFactBytes=0;}
+
+  private rememberIndexFacts(table:string,names:Set<string>):void {
+    if(!this.indexFactsEnabled)return;
+    const key=foldSqlIdentifier(table),prior=this.indexFacts.get(key);
+    if(prior){this.indexFacts.delete(key);this.indexFactBytes-=prior.bytes;}
+    let bytes=128+key.length*2;
+    for(const name of names)bytes+=64+name.length*2;
+    if(names.size>INDEX_METADATA_LIMIT || bytes>INDEX_FACT_BYTE_LIMIT)return;
+    if(this.indexFacts.size>=INDEX_FACT_TABLE_LIMIT || this.indexFactBytes+bytes>INDEX_FACT_BYTE_LIMIT)this.invalidateIndexFacts();
+    this.indexFacts.set(key,{names:new Set(names),bytes});this.indexFactBytes+=bytes;
+  }
+
+  private rememberIndexBuilds(builds:IndexBuild[]):void {
+    for(const build of builds){
+      const prior=this.indexFacts.get(foldSqlIdentifier(build.table));
+      if(prior && !prior.names.has(foldSqlIdentifier(build.name)))
+        this.rememberIndexFacts(build.table,new Set([...prior.names,foldSqlIdentifier(build.name)]));
+    }
   }
 
   private day() { return Math.floor(this.now() / DAY_MS); }
@@ -141,6 +183,7 @@ export class RowBudget {
     if (!outcome.ok) throw outcome.error;
   }
   private trip(detail: string): never {
+    this.invalidateIndexFacts();
     this.stopped = true;
     if (this.loggedDay !== this.day()) {
       this.loggedDay = this.day();
@@ -156,7 +199,11 @@ export class RowBudget {
    * Cached credit makes normal preflight zero-I/O. Reservations are serialized,
    * while overlapping events spend the same synchronous credit atomically. */
   begin(bootstrap = false): Promise<void> {
+    // Facts live only in the synchronous event/initializer body. An operator
+    // may have changed schema between events without passing this SQL wrapper.
+    this.invalidateIndexFacts();
     return this.exclusive(async () => {
+      try {
       const day = this.day();
       let currentDayLookupRead = 0;
       if (this.ledgerFailure) this.trip('durable budget storage unavailable');
@@ -194,6 +241,7 @@ export class RowBudget {
       await this.checkpoint(true, bootstrap);
       if (this.ledger.stopped || this.credit.read <= 0 || this.credit.written <= 0) this.trip('daily allowance exhausted');
       this.stopped = false;
+      } finally { this.invalidateIndexFacts(); }
     });
   }
 
@@ -327,6 +375,8 @@ export class RowBudget {
    * repeatedly setting alarms or writing KV. Ledger calls retain native binds. */
   guardStorage(storage: any): void {
     const budget = this;
+    this.indexFactsEnabled=typeof storage.transactionSync==='function';
+    this.invalidateIndexFacts();
     const units = (value: any, key = ''): number => {
       let bytes: number;
       if (value instanceof ArrayBuffer) bytes = value.byteLength;
@@ -348,6 +398,11 @@ export class RowBudget {
       const native = storage[name].bind(storage);
       Object.defineProperty(storage, name, { configurable: true, writable: true, value: (...args: any[]) => fn(native, args) });
     };
+    // Hub installs its write-watch observer after this wrapper. Clearing in
+    // finally covers both successful transactions and rollback without SQL.
+    install('transactionSync',(native,args)=>{
+      try{return native(...args);}finally{budget.invalidateIndexFacts();}
+    });
     install('get', async (native, args) => {
       const requested = keys(args[0]);
       charge(requested.length, 0);
@@ -401,8 +456,9 @@ export class RowBudget {
   /** Preflight queries use this same native-cursor wrapper, so their real
    * rows are charged too. Metadata stays table-local and capped. A large
    * existing index is a no-op and never probes/scans its source table. */
-  private preflightIndexes(sql: SqlStorage, query: string): string {
+  private preflightIndexes(sql: SqlStorage, query: string): ReturnType<typeof indexBuilds> {
     const parsed = indexBuilds(query);
+    if(parsed.invalidateFacts)this.invalidateIndexFacts();
     const deny = (detail: string): never => {
       this.ledger!.stopped = true;
       this.dirty = true;
@@ -410,12 +466,20 @@ export class RowBudget {
     };
     if (parsed.unsupported) deny('index migration requires a supported single-statement build');
     for (const build of parsed.builds) {
-      const indexes = sql.exec("SELECT name FROM pragma_index_list(?, 'main') LIMIT ?", build.table, INDEX_METADATA_LIMIT + 1).toArray() as any[];
-      // SQLite identifier folding is ASCII-only. Unicode lowercasing could
-      // mistake a different non-ASCII index for the requested existing one.
-      const fold = (value: string) => value.replace(/[A-Z]/g, char => char.toLowerCase());
-      if (indexes.some(row => fold(String(row.name)) === fold(build.name))) continue;
-      if (indexes.length > INDEX_METADATA_LIMIT) deny('index metadata exceeds bounded migration allowance');
+      let facts=this.indexFactsEnabled?this.indexFacts.get(foldSqlIdentifier(build.table)):undefined;
+      if(!facts){
+        const indexes=sql.exec("SELECT name FROM pragma_index_list(?, 'main') LIMIT ?",build.table,INDEX_METADATA_LIMIT+1).toArray() as any[];
+        const names=new Set(indexes.map(row=>foldSqlIdentifier(String(row.name))));
+        // Only complete, bounded table-local facts are retained. The original
+        // oversized-metadata existing-index exception remains a fresh probe.
+        if(indexes.length<=INDEX_METADATA_LIMIT){
+          this.rememberIndexFacts(build.table,names);facts={names,bytes:0};
+        } else {
+          if(names.has(foldSqlIdentifier(build.name)))continue;
+          deny('index metadata exceeds bounded migration allowance');
+        }
+      }
+      if(facts!.names.has(foldSqlIdentifier(build.name)))continue;
       // Keep source probe + build within current prepaid credit, allowing
       // conservative schema overhead. This does not preempt arbitrary SQL:
       // it bounds the particular full-source operation before native exec.
@@ -443,7 +507,7 @@ export class RowBudget {
         if(matching.length>partialWriteCap) deny('partial index entries exceed bounded migration allowance');
       }
     }
-    return parsed.executable;
+    return parsed;
   }
 
   wrap(sql: SqlStorage): SqlStorage {
@@ -458,10 +522,11 @@ export class RowBudget {
           budget.assertAllowed();
           // Run through a wrapped native handle: preflight must never be
           // unmetered SQL hidden behind the application-level cursor meter.
-          const executable = budget.preflightIndexes(budget.wrap(target as SqlStorage), String(query));
+          const preflight = budget.preflightIndexes(budget.wrap(target as SqlStorage), String(query));
           let cursor: any;
-          try { cursor = target.exec(executable, ...bindings); }
+          try { cursor = target.exec(preflight.executable, ...bindings); }
           catch (error) {
+            budget.invalidateIndexFacts();
             // These schema compilation failures execute no row work. Older
             // migrations intentionally catch them while adding existing columns.
             const message = String((error as any)?.message ?? error);
@@ -485,6 +550,9 @@ export class RowBudget {
             budget.consume(deltaRead, deltaWritten);
           };
           charge();
+          // CREATE INDEX has no result rows: remember only after native
+          // execution succeeded and its actual counters were charged.
+          budget.rememberIndexBuilds(preflight.builds);
           // Charge every next(), including raw() and Symbol.iterator. toArray()
           // must drain incrementally rather than bypassing the per-next guard.
           const advance = (source: any, args: any[]) => {
