@@ -100,6 +100,16 @@ def uv_prefix(env: dict):
     return [sys.executable]
 
 
+def hub2_uv_prefix(env: dict):
+    uv = shutil_which("uv")
+    if uv:
+        # Hub2 is a separate distribution with its own runtime dependency.
+        # Keep it in this short-lived uv invocation so the legacy package is
+        # neither overwritten nor imported by the Hub2 suite.
+        return [uv, "run", "--frozen", "--with", "websockets==16.0", "python"]
+    return [sys.executable]
+
+
 def shutil_which(name: str):
     from shutil import which
     return which(name)
@@ -156,15 +166,32 @@ def main() -> int:
         if build_code != 0:
             return 1
         pytest_code = run_suite(
-            "pytest discovery (repo root)",
+            "pytest discovery (legacy host, repo root)",
             REPO_ROOT,
             prefix + ["-m", "pytest", "-q", "-o", "tmp_path_retention_count=0",
-                      "-o", "tmp_path_retention_policy=none"],
+                      "-o", "tmp_path_retention_policy=none",
+                      # Hub2 ships an isolated host package that intentionally
+                      # shares the import name agent_hub_host with Hub1. Keep
+                      # the legacy suite in its own interpreter, then run the
+                      # Hub2 suite below with its package root first on sys.path.
+                      "--ignore=hub2/host/tests",
+                      "--ignore=hub2/scripts/test_host.py"],
             env,
         )
         after = digest(config_dir)
         if after != before:
             print(f"FAIL: canary mutated after pytest run: {before} -> {after}", flush=True)
+            return 1
+
+        hub2_code = run_suite(
+            "Hub 2 host suite (isolated package root)",
+            REPO_ROOT,
+            hub2_uv_prefix(env) + [str(REPO_ROOT / "hub2" / "scripts" / "test_host.py")],
+            env,
+        )
+        after = digest(config_dir)
+        if after != before:
+            print(f"FAIL: canary mutated after Hub 2 host suite: {before} -> {after}", flush=True)
             return 1
 
         unittest_log = run_tmp / "unittest-discover.log"
@@ -179,10 +206,10 @@ def main() -> int:
         if after != before:
             print(f"FAIL: canary mutated after unittest run: {before} -> {after}", flush=True)
             return 1
-        if pytest_code != 0 or unittest_code != 0:
+        if pytest_code != 0 or hub2_code != 0 or unittest_code != 0:
             for line in unittest_failures(unittest_log):
                 print("  " + line, flush=True)
-            print(f"FAIL: suite exit codes pytest={pytest_code}, unittest={unittest_code}", flush=True)
+            print(f"FAIL: suite exit codes pytest={pytest_code}, hub2={hub2_code}, unittest={unittest_code}", flush=True)
             return 1
 
         print("PASS: canary cli.json and host.json byte-identical after the full host suite "
