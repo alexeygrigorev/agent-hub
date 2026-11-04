@@ -90,10 +90,17 @@ export class AccountDO {
   const account=this.db.one<Account>('SELECT * FROM account WHERE id=1'),quota=this.db.one<Quota>('SELECT * FROM quota WHERE id=1');
   return json({account:account||null,quota:quota||null,fresh:!!quota&&quota.valid_until>Date.now()});
  }
+ private admissionHost(machine:string):void{
+  const credential=this.db.one<{generation:number}>('SELECT generation FROM credentials WHERE id=1');
+  if(!credential)return;
+  if(!this.db.one('SELECT id FROM approved_hosts WHERE id=?',machine))throw new HttpError('host_not_approved',409);
+  if(this.db.one('SELECT host_id FROM credential_rejections WHERE host_id=? AND generation=?',machine,credential.generation))throw new HttpError('credential_generation_rejected',409);
+ }
  private async reserve(r:Request):Promise<Response>{
   const b=await bodyObject(r,4096),ttl=Number(b.ttl_ms??60000);
   if(!boundedString(b.operation_id,120)||!boundedString(b.session_id,120)||!boundedString(b.machine_id,120)||!boundedString(b.request_digest,128)||!Number.isSafeInteger(b.epoch)||Number(b.epoch)<1||!Number.isSafeInteger(ttl)||ttl<1000||ttl>600000)return error('invalid_reservation',400);
   const reservation=this.db.transaction(this.ctx,()=>{
+   this.admissionHost(String(b.machine_id));
    this.expire(Date.now());
    const prior=this.db.one<Reservation>('SELECT * FROM reservations WHERE operation_id=?',b.operation_id);
    if(prior){if(prior.session_id!==b.session_id||prior.machine_id!==b.machine_id||prior.digest!==b.request_digest)throw new HttpError('idempotency_conflict',409);if(prior.epoch!==b.epoch)throw new HttpError('stale_epoch',409);return prior;}
@@ -118,6 +125,7 @@ export class AccountDO {
    if(!row)throw new HttpError('reservation_not_found',404);
    if(row.epoch!==b.epoch)throw new HttpError('stale_epoch',409);
    if(target==='released'&&(row.session_id!==b.session_id||row.machine_id!==b.machine_id))throw new HttpError('release_binding_mismatch',409);
+   if(target!=='released')this.admissionHost(row.machine_id);
    if(row.state===target){if(target==='running'&&(row.session_id!==b.session_id||row.machine_id!==b.machine_id))throw new HttpError('admission_binding_mismatch',409);return row;}
    if(row.state==='released')throw new HttpError('reservation_terminal',409);
    if(target==='confirmed'){
@@ -190,8 +198,19 @@ export class AccountDO {
    if(!repairLease&&account&&['codex','claude'].includes(account.provider)&&this.needsRefresh(account.provider,files,minimum)){
     await this.refresh(account.provider,files,row.generation);row=this.db.one<{generation:number;sealed:string}>('SELECT generation,sealed FROM credentials WHERE id=1')!;files=await this.unseal(row.sealed,account.provider,row.generation) as Record<string,string>;
    }
+   if(!repairLease&&minimum>0){
+    const source='provider:'+account.provider+':generation:'+row.generation;
+    let quota=this.db.one<Quota>('SELECT * FROM quota WHERE id=1');
+    if(!quota||quota.valid_until<=Date.now()||quota.source!==source){
+     await this.collect(false);
+     quota=this.db.one<Quota>('SELECT * FROM quota WHERE id=1');
+    }
+    if(!quota||quota.valid_until<=Date.now()||quota.source!==source)return error('quota_unavailable',503);
+   }
    if(!this.db.one('SELECT id FROM approved_hosts WHERE id=?',machine))return error('host_not_approved',403);
-   const latest=this.db.one<{generation:number}>('SELECT generation FROM credentials WHERE id=1');if(latest?.generation!==row.generation)return error('generation_conflict',409);
+   const latest=this.db.one<{generation:number;refresh_owner:string|null;refresh_lease:string|null}>('SELECT generation,refresh_owner,refresh_lease FROM credentials WHERE id=1');if(latest?.generation!==row.generation)return error('generation_conflict',409);
+   if(repairLease&&(latest.refresh_owner!==machine||latest.refresh_lease!==requested))return error('refresh_permit_mismatch',409);
+   if(!repairLease&&this.db.one('SELECT host_id FROM credential_rejections WHERE host_id=? AND generation=?',machine,row.generation))return error('credential_generation_rejected',409);
    const expires=this.accessExpiry(account.provider,files);
    if(!repairLease&&account.provider!=='zai'&&minimum>0&&(expires===null||expires<=Date.now()+minimum))return error('access_lifetime_insufficient',409);
    if(!repairLease&&account.provider!=='zai'){

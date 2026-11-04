@@ -24,7 +24,7 @@ export async function selectRoute(env:Hub2Env,input:RoutingRequest):Promise<Rout
   const policy=await read(env.CONTROL,'global','/_routing-policy');
   if(!Array.isArray(policy.candidates)||!policy.candidates.length)throw new HttpError('routing_policy_unconfigured',409);
   if(policy.candidates.length>32)throw new HttpError('routing_policy_bound_exceeded',503);
-  const candidates=(policy.candidates as RoutingCandidate[]).filter(c=>c.enabled&&(!input.engine||input.engine===c.engine)&&(!input.model||input.model===c.model)&&(!input.effort||input.effort===c.effort));
+  const candidates=(policy.candidates as RoutingCandidate[]).filter(c=>c.enabled&&(!input.engine||input.engine===c.engine)&&(!input.model||input.model===c.model||input.model===c.id)&&(!input.effort||input.effort===c.effort));
   if(!candidates.length)throw new HttpError('model_policy_unavailable',409);
   const directory=await read(env.CONTROL,'global','/api/directory?kind=machines&limit=50');
   if(directory.next)throw new HttpError('routing_fleet_bound_exceeded',503);

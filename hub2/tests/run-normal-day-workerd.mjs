@@ -5,11 +5,11 @@ import {Miniflare,Log,LogLevel,convertV4MiniflareOptions} from 'miniflare';
 import {WebSocket} from 'ws';
 import {nativeMeter}from'./normal-day-meter.mjs';
 import {resolve} from 'node:path';
-import {readFile,writeFile,mkdir,mkdtemp} from 'node:fs/promises';
+import {readFile,writeFile,mkdir,mkdtemp,readdir} from 'node:fs/promises';
 import {createHash,webcrypto} from 'node:crypto';
 const root=resolve(import.meta.dirname,'../..');
 const canonical={starts:70,user_intakes:20,scheduled_occurrences:49,messages:100,claim_cycles:50,host_transitions:16,accounts:6,root_writer_api_calls:490,operator_api_calls:200,retry_episodes:20,quota_stale_batches:48,discovery_batches:4};
-const sourceFiles=['worker','control-do','project-do','machine-do','account-do','mailbox-do','db','types','auth','control-auth','mcp','routing','project-work','cron','read-cache','worker-credentials','credential-crypto'];
+const sourceFiles=(await readdir(resolve(root,'hub2/src'))).filter(n=>n.endsWith('.ts')).map(n=>n.slice(0,-3)).sort();
 const hashes=async()=>Object.fromEntries(await Promise.all(sourceFiles.map(async n=>[n,createHash('sha256').update(await readFile(resolve(root,`hub2/src/${n}.ts`))).digest('hex')])));
 const sourceBefore=await hashes(),bootstrap='synthetic-normal-day-bootstrap-000000000000000',project='normal-day/fixture';let token=bootstrap;
 const names={control:'CoreControl',project:'CoreProject',machine:'CoreMachine',account:'CoreAccount',mailbox:'CoreMailbox'};
@@ -20,11 +20,12 @@ const cachePlugin={name:'test-only-read-cache-off',setup(builder){builder.onReso
 const bundle=await build({plugins:[nativeTelemetry.plugin,...(cacheVariant==='off'?[cachePlugin]:[])],entryPoints:[resolve(root,'hub2/tests/normal-day-worker.ts')],bundle:true,write:false,format:'esm',platform:'browser',external:['cloudflare:workers']});
 const options=convertV4MiniflareOptions({resourcePersistencePath:persist,host:'127.0.0.1',port:0,log:nativeTelemetry.log,handleStructuredLogs:nativeTelemetry.handleStructuredLogs,workers:[{name:'hub2-normal-day-local',script:bundle.outputFiles[0].text,modules:true,compatibilityDate:'2024-04-05',durableObjects:Object.fromEntries(Object.entries(names).map(([k,className])=>[({control:'CONTROL',project:'PROJECTS',machine:'MACHINES',account:'ACCOUNTS',mailbox:'MAILBOXES'})[k],{className,useSQLite:true}])),bindings:{HUB2_DEV_OPERATOR_TOKEN:bootstrap,AUTH_BASE_URL:'https://oidc.fixture',AUTH_CLIENT_ID:'normal-day-auth-client',AUTH_CALLBACK_URL:'https://hub.fixture/auth/callback',AUTH_ISSUER:'https://oidc.fixture',AUTH_JWKS_URL:'https://oidc.fixture/jwks',HUB_ADMINS:'normal@example.test',HUB2_DEFAULT_ACCOUNT_ID:'normal-account-0',HUB2_ENGINE_ACCOUNTS:JSON.stringify({opencode:'normal-account-0'}),HUB2_CREDENTIAL_KEY:'11'.repeat(32),HUB2_FIXTURE_ASSET_HTML:await readFile(resolve(root,'hub2/public/index.html'),'utf8')}}]});
 const bundleSha=createHash('sha256').update(bundle.outputFiles[0].text).digest('hex');await mkdir(resolve(root,'.local'),{recursive:true});await writeFile(resolve(root,'.local/cache-bundle-'+cacheVariant+'.mjs'),bundle.outputFiles[0].text,{mode:0o600});
-let mf=new Miniflare(options),base,operatorFamily,refreshToken,accessExpires;const role_ledger={operator:0,root_writer:0};
+let mf=new Miniflare(options),base,operatorFamily,refreshToken,accessExpires,writerToken,writerFamily,virtualOffset=0;const role_ledger={operator:0,root_writer:0};
 const objects=[['control','global'],['project',project],...Array.from({length:4},(_,i)=>['machine','normal-machine-'+i]),...Array.from({length:6},(_,i)=>['account','normal-account-'+i]),['mailbox','global']];
 const request_ledger={},flows=[],coverage={},missing=[],errors=[],hosts=[],intakes=[];let historicalIntake;
-async function api(path,method='GET',body,auth=token){const actor=auth===bootstrap?'fixture':!auth?'public':hosts.some(h=>h.token===auth)?'machine':auth===token?'operator':'bounded-child';const key=actor+' '+method+' '+path.split('?')[0].replace(/[0-9a-f]{8}-[0-9a-f-]{27,}/gi,':id');request_ledger[key]=(request_ledger[key]||0)+1;const r=await fetch(base+path,{method,headers:{'Content-Type':'application/json',...(auth?{Authorization:'Bearer '+auth}:{})},...(body===undefined?{}:{body:JSON.stringify(body)})});const text=await r.text();let data;try{data=JSON.parse(text);}catch{data={error:'non_json',fixture_error:text.slice(0,1000)};}return{status:r.status,data};}
-async function roleApi(role,...args){role_ledger[role]++;return api(...args);}
+async function api(path,method='GET',body,auth=token){const actor=auth===bootstrap?'fixture':!auth?'public':hosts.some(h=>h.token===auth)?'machine':auth===token?'operator':auth===writerToken?'root_writer':'bounded-child';const key=actor+' '+method+' '+path.split('?')[0].replace(/[0-9a-f]{8}-[0-9a-f-]{27,}/gi,':id');request_ledger[key]=(request_ledger[key]||0)+1;const r=await fetch(base+path,{method,headers:{'Content-Type':'application/json',...(auth?{Authorization:'Bearer '+auth}:{})},...(body===undefined?{}:{body:JSON.stringify(body)})});const text=await r.text();let data;try{data=JSON.parse(text);}catch{data={error:'non_json',fixture_error:text.slice(0,1000)};}return{status:r.status,data};}
+async function roleApi(role,path,method='GET',body){role_ledger[role]++;if(role==='root_writer')assert(writerToken&&writerToken!==token,'root/writer must use independently issued client credential');return api(path,method,body,role==='root_writer'?writerToken:token);}
+async function raw(path,init={}){const key='issuer '+(init.method||'GET')+' '+path.split('?')[0];request_ledger[key]=(request_ledger[key]||0)+1;return fetch(base+path,init);}
 function expect(r,status,label){assert.equal(r.status,status,`${label}: ${r.status} ${JSON.stringify(r.data)}`);return r.data;}
 const fixture=(kind,id,action='state',body)=>api(`/_fixture/${kind}/${encodeURIComponent(id)}/${action}`,body===undefined?'GET':'POST',body,bootstrap);
 async function snapshot(){const out={};for(const [kind,id]of objects){const d=expect(await fixture(kind,id),200,'metrics');assert.equal(d.counts.measurement_valid,true);out[kind+':'+id]=d;}return out;}
@@ -35,12 +36,14 @@ function storageDifference(a,b){const out={};for(const owner of Object.keys(b)){
 async function telemetryBarrier(){const id=crypto.randomUUID();expect(await api('/_fixture/barrier','POST',{id},bootstrap),200,'meter barrier');await nativeTelemetry.barrier(id);}
 function nativeCounts(data){return{reads:data.reads,writes:data.writes,combined_rows:data.reads+data.writes,sql_calls:data.sql_calls,measurement_valid:data.invalid===0,alarm_operations:Object.values(data.storage).reduce((n,c)=>n+c.succeeded+c.failed,0),classes:data.classes,native_objects:data.objects,storage:data.storage,proven_alarm_rows_written:data.storage.setAlarm.succeeded};}
 async function measure(name,fn){
+ console.error('normal-day phase start: '+name);
  nativeTelemetry.setPhase('observer_before:'+name);const before=await snapshot(),queriesBefore=await querySnapshot();await telemetryBarrier();
  nativeTelemetry.setPhase(name);try{await fn();}catch(e){errors.push({flow:name,error:String(e.stack)});}await telemetryBarrier();const native=nativeTelemetry.phase(name);
  nativeTelemetry.setPhase('observer_after:'+name);const after=await snapshot(),queriesAfter=await querySnapshot();await telemetryBarrier();
+ console.error('normal-day phase finished: '+name+' '+(native.reads+native.writes)+' SQL rows');
  flows.push({name,...nativeCounts(native),snapshot_diagnostic:difference(before,after),queries:queryDifference(queriesBefore,queriesAfter),observer_costs:{before:nativeCounts(nativeTelemetry.phase('observer_before:'+name)),after:nativeCounts(nativeTelemetry.phase('observer_after:'+name))}});
 }
-async function socket(auth){const frames=[],ws=new WebSocket(base.replace(/^http/,'ws')+'/api/connect',{headers:{Authorization:'Bearer '+auth}});ws.on('message',m=>{try{frames.push(JSON.parse(m.toString()));}catch{}});await new Promise((ok,no)=>{ws.once('open',ok);ws.once('error',no);});return{ws,frames,async wait(predicate){const end=Date.now()+5000;while(Date.now()<end){const frame=frames.find(predicate);if(frame)return frame;await new Promise(r=>setTimeout(r,5));}throw new Error('missing real WebSocket frame');}};}
+async function socket(auth){request_ledger['machine WS /api/connect']=(request_ledger['machine WS /api/connect']||0)+1;const frames=[],ws=new WebSocket(base.replace(/^http/,'ws')+'/api/connect',{headers:{Authorization:'Bearer '+auth}});ws.on('message',m=>{try{frames.push(JSON.parse(m.toString()));}catch{}});await new Promise((ok,no)=>{ws.once('open',ok);ws.once('error',no);});return{ws,frames,async wait(predicate){const end=Date.now()+5000;while(Date.now()<end){const frame=frames.find(predicate);if(frame)return frame;await new Promise(r=>setTimeout(r,5));}throw new Error('missing real WebSocket frame');}};}
 async function lifecycle(task,index,beforeFinish,exitCode=0){
  const connections=await Promise.all(hosts.map(h=>socket(h.token)));try{
   const fault=process.env.HUB2_NORMAL_DAY_SLICE!=='twenty'&&index<19?(index<7?'reserve':index<13?'activate':index<16?'started':'finish'):null;
@@ -58,14 +61,15 @@ async function lifecycle(task,index,beforeFinish,exitCode=0){
 }
 async function finishOffered(task,index,host,connection,started,offer,beforeFinish,exitCode=0,fault=null){
  connection.ws.send(JSON.stringify({type:'offer_ack',session_id:started.id,epoch:offer.epoch}));await connection.wait(v=>v.type==='ack'&&v.session_id===started.id);
- expect(await api(`/api/sessions/${started.id}/admission`,'POST',{operation_id:offer.operation_id,epoch:offer.epoch},host.token),200,'admission');
+ const admission=expect(await api(`/api/sessions/${started.id}/admission`,'POST',{operation_id:offer.operation_id,epoch:offer.epoch},host.token),200,'admission');assert(Number.isSafeInteger(admission.runtime_deadline),'synthetic admission must expose its runtime deadline');
  const worker=expect(await api(`/api/sessions/${started.id}/credentials`,'POST',{operation_id:offer.operation_id,epoch:offer.epoch},host.token),200,'bounded child bootstrap');expect(await api('/api/intakes/'+task.id,'GET',undefined,worker.token),200,'child first assigned-task read');
  const native='11111111-2222-4333-8444-'+String(index).padStart(12,'0');
  if(fault==='started')expect(await fixture('project',project,'fault',{paths:['/_internal/started']}),200,'lost started response');
  expect(await api(`/api/sessions/${started.id}/started`,'POST',{operation_id:offer.operation_id,epoch:offer.epoch,native_id:native},host.token),fault==='started'?202:201,'native started');
  if(fault==='started')expect(await fixture('machine',host.id,'due-outbox',{id:'started:'+offer.operation_id}),200,'durable started retry');
  if(beforeFinish)await beforeFinish({connection,session:started,offer,hostToken:host.token});
- const evidence={source:'aplexer_retirement',fixture:true,native_identity:{id:native,tag:'task-hub2-'+started.id,workspace:offer.launch.workspace},containment_empty:true,native_exit:{code:exitCode}};
+ assert(Number.isSafeInteger(admission.observed_at),'synthetic admission must expose its observed timestamp');
+ const evidence={source:'aplexer_retirement',fixture:true,native_identity:{id:native,tag:'task-hub2-'+started.id,workspace:offer.launch.workspace},containment_empty:true,native_deadline:{deadline_ms:admission.runtime_deadline,exceeded:false},native_exit:{code:exitCode,exited_at_ms:admission.observed_at+1}};
  if(fault==='finish')expect(await fixture('project',project,'fault',{paths:['/_internal/finish']}),200,'lost finish response');
  expect(await api(`/api/sessions/${started.id}/finish`,'POST',{operation_id:offer.operation_id,epoch:offer.epoch,native_id:native,exit_code:exitCode,native_exit_confirmed:true,evidence},host.token),fault==='finish'?202:201,'native finish');
  if(fault==='finish')expect(await fixture('machine',host.id,'due-outbox',{id:'finish:'+offer.operation_id}),200,'durable finish retry');
@@ -77,15 +81,16 @@ try{
  // Snapshot activates all configured objects; cold schema/constructor work is retained.
  nativeTelemetry.setPhase('cold_first_creation');const cold=await snapshot();await telemetryBarrier();flows.push({name:'cold_first_creation',...nativeCounts(nativeTelemetry.phase('cold_first_creation')),observer_induced:true,snapshot_diagnostic:difference({},cold)});
  await measure('actual_oidc_issuer_and_device_bearer',async()=>{
-  const response=await fetch(base+'/auth/login',{redirect:'manual'});assert.equal(response.status,302);const location=new URL(response.headers.get('Location')),nonce=location.searchParams.get('nonce'),state=location.searchParams.get('state'),browserCookie=response.headers.getSetCookie()[0].split(';')[0];
+  const response=await raw('/auth/login',{redirect:'manual'});assert.equal(response.status,302);const location=new URL(response.headers.get('Location')),nonce=location.searchParams.get('nonce'),state=location.searchParams.get('state'),browserCookie=response.headers.getSetCookie()[0].split(';')[0];
   const key=await webcrypto.subtle.generateKey({name:'RSASSA-PKCS1-v1_5',modulusLength:2048,publicExponent:new Uint8Array([1,0,1]),hash:'SHA-256'},true,['sign','verify']),jwk={...await webcrypto.subtle.exportKey('jwk',key.publicKey),kid:'normal-key',alg:'RS256',use:'sig'};
   const header=Buffer.from(JSON.stringify({alg:'RS256',kid:'normal-key'})).toString('base64url'),payload=Buffer.from(JSON.stringify({sub:'normal-day-user',email:'normal@example.test',email_verified:true,iss:'https://oidc.fixture',aud:'normal-day-auth-client',nonce,token_use:'id',exp:Math.floor(Date.now()/1000)+3600})).toString('base64url');const signature=Buffer.from(await webcrypto.subtle.sign('RSASSA-PKCS1-v1_5',key.privateKey,Buffer.from(header+'.'+payload))).toString('base64url');
   expect(await api('/_fixture/provider','POST',{jwks:{keys:[jwk]},challenge:location.searchParams.get('code_challenge'),token:header+'.'+payload+'.'+signature},bootstrap),200,'provider fixture');
-  const callback=await fetch(base+'/auth/callback?code=fixture-code&state='+encodeURIComponent(state),{redirect:'manual',headers:{Cookie:browserCookie}});assert.equal(callback.status,303);const sessionCookie=callback.headers.getSetCookie().filter(c=>c.startsWith('hub2_session='))[0].split(';')[0];
-  const current=await(await fetch(base+'/auth/session',{headers:{Cookie:sessionCookie}})).json();
+  const callback=await raw('/auth/callback?code=fixture-code&state='+encodeURIComponent(state),{redirect:'manual',headers:{Cookie:browserCookie}});assert.equal(callback.status,303);const sessionCookie=callback.headers.getSetCookie().filter(c=>c.startsWith('hub2_session='))[0].split(';')[0];
+  const current=await(await raw('/auth/session',{headers:{Cookie:sessionCookie}})).json();
   const device=expect(await api('/api/device/code','POST',{client_id:'normal-day-cli'},null),200,'actual device code');
-  const approved=await fetch(base+'/api/device/approve',{method:'POST',headers:{Cookie:sessionCookie,'Content-Type':'application/json','x-csrf-token':current.csrf_token},body:JSON.stringify({user_code:device.user_code})});assert.equal(approved.status,200);
+  const approved=await raw('/api/device/approve',{method:'POST',headers:{Cookie:sessionCookie,'Content-Type':'application/json','x-csrf-token':current.csrf_token},body:JSON.stringify({user_code:device.user_code})});assert.equal(approved.status,200);
   const issued=expect(await api('/api/device/token','POST',{device_code:device.device_code},null),200,'actual CLI credential');token=issued.access_token;operatorFamily=issued.family_id;refreshToken=issued.refresh_token;accessExpires=Date.now()+issued.expires_in*1000;assert(token);coverage.production_operator_issuer=true;
+  const writerDevice=expect(await api('/api/device/code','POST',{client_id:'normal-day-rootwriter'},null),200,'separate root/writer device code');const writerApproval=await raw('/api/device/approve',{method:'POST',headers:{Cookie:sessionCookie,'Content-Type':'application/json','x-csrf-token':current.csrf_token},body:JSON.stringify({user_code:writerDevice.user_code})});assert.equal(writerApproval.status,200);const writer=expect(await api('/api/device/token','POST',{device_code:writerDevice.device_code},null),200,'actual separate root/writer credential');writerToken=writer.access_token;writerFamily=writer.family_id;assert(writerToken!==token&&writerFamily!==operatorFamily);coverage.role_separated_credentials=true;
  });
  await measure('bootstrap_registry_enrollment_and_six_accounts',async()=>{
   expect(await api('/api/repos/'+encodeURIComponent(project),'PATCH',{canonical_url:'https://github.com/synthetic/normal-day',purpose:'Canonical normal-day acceptance fixture',status:'active',aliases:[],domains:[]}),200,'project');
@@ -102,7 +107,7 @@ try{
  });
  await measure('twenty_user_intakes',async()=>{for(let i=0;i<20;i++){const t=expect(await api('/api/intakes?project='+encodeURIComponent(project),'POST',{title:'User fixture '+i,text:'Synthetic normal-day workload, no native process launched.',acceptance_criteria:['Result remains awaiting independent review.'],key:'user-'+i}),201,'create').intake;intakes.push(t);}coverage.user_intakes=intakes.length;});
  coverage.starts=0;
- await measure('twenty_happy_user_lifecycles',async()=>{for(let i=0;i<intakes.length;i++){await lifecycle(intakes[i],i,process.env.HUB2_NORMAL_DAY_SLICE==='twenty'||i!==0?undefined:async context=>{const{fullMessages}=await import('./normal-day-full-messages.mjs');coverage.full_message_proof=await fullMessages({api,expect,roleApi,...context,family:operatorFamily});coverage.messages=100;});coverage.starts++;}});
+ await measure('twenty_happy_user_lifecycles',async()=>{for(let i=0;i<intakes.length;i++){await lifecycle(intakes[i],i,process.env.HUB2_NORMAL_DAY_SLICE==='twenty'||i!==0?undefined:async context=>{const{fullMessages}=await import('./normal-day-full-messages.mjs');coverage.full_message_proof=await fullMessages({api,expect,roleApi,...context,family:writerFamily,client:'normal-day-rootwriter'});coverage.messages=100;});coverage.starts++;}});
  if(historicalIntake)await measure('one_retained_failed_task_retry',async()=>{await lifecycle(historicalIntake,9001);coverage.starts++;coverage.retry_episodes=(coverage.retry_episodes||0)+1;});
  if(process.env.HUB2_NORMAL_DAY_SLICE!=='twenty')await measure('fifty_claim_create_renew_release_cycles',async()=>{
   for(let i=0;i<50;i++){
@@ -119,7 +124,7 @@ try{
   coverage.host_transitions=transitions;
  });
  if(process.env.HUB2_NORMAL_DAY_SLICE!=='twenty')await measure('forty_nine_scheduled_starts_and_provider_day',async()=>{
-  async function advance(target){const offset=Math.max(0,Math.round(target-Date.now()));expect(await fixture('control','global','clock',{offset}),200,'actual day clock');if(target>=accessExpires-60000){const issued=expect(await api('/api/token/refresh','POST',{refresh_token:refreshToken},null),200,'actual expiring day credential refresh');token=issued.access_token;refreshToken=issued.refresh_token;accessExpires=target+issued.expires_in*1000;}}
+  async function advance(target){const offset=Math.max(0,Math.round(target-Date.now()));virtualOffset=offset;expect(await fixture('control','global','clock',{offset}),200,'actual day clock');if(target>=accessExpires-60000){const issued=expect(await api('/api/token/refresh','POST',{refresh_token:refreshToken},null),200,'actual expiring day credential refresh');token=issued.access_token;refreshToken=issued.refresh_token;accessExpires=target+issued.expires_in*1000;}}
   for(let i=0;i<6;i++)expect(await api(`/api/accounts/normal-account-${i}/api/account/discovery`,'PUT',{enabled:true,interval_ms:21600000}),200,'enable actual six-hour discovery');
   await advance(Date.now()+1000);for(let i=0;i<6;i++)expect(await fixture('account','normal-account-'+i,'alarm',{}),200,'initial enabled discovery alarm');
   const launch={workspace:'/synthetic/normal-day',interactive:false,timeout_seconds:60};
@@ -146,19 +151,46 @@ try{
   expect(await api('/api/schedules/'+encodeURIComponent(rootSchedule.id)+'/pause?project='+encodeURIComponent(project),'POST',{}),200,'stop configured synthetic root job after simulated day');expect(await api('/api/schedules/'+encodeURIComponent(writer.id)+'/pause?project='+encodeURIComponent(project),'POST',{}),200,'stop configured synthetic writer job');
   for(let i=0;i<6;i++)expect(await api(`/api/accounts/normal-account-${i}/api/account/discovery`,'PUT',{enabled:false,interval_ms:21600000}),200,'stop synthetic discovery after measured day');
  });
+ if(process.env.HUB2_NORMAL_DAY_SLICE!=='twenty')await measure('retained_archive_search_and_history',async()=>{
+  const archived=[];
+  for(let i=0;i<5;i++){
+   const path='/api/intakes/'+intakes[i].id+'?project='+encodeURIComponent(project),before=expect(await api(path),200,'retained task before archive').intake;
+   const after=expect(await api(path,'PATCH',{key:'normal-archive-'+i,expected_updated_at:before.updated_at,status:'archived',note:'Synthetic post-day retained archive verification'}),200,'archive actual terminal task').intake;
+   assert.equal(after.status,'archived');assert.deepEqual(after.original_ask,before.original_ask);archived.push(after.id);
+  }
+  let after='',found=[],pages=0;const seen=new Set();
+  do{assert(++pages<=10,'bounded archive pagination');const page=expect(await api('/api/intakes?project='+encodeURIComponent(project)+'&status=archived&q=User%20fixture&limit=2'+(after?'&cursor='+encodeURIComponent(after):'')),200,'bounded retained archive search');found.push(...page.items.map(v=>v.id));if(page.next){assert(!seen.has(page.next),'archive cursor must advance');seen.add(page.next);}after=page.next;}while(after);
+  assert.deepEqual(found.sort(),archived.sort());
+  const history=expect(await api('/api/intakes/'+historicalIntake.id+'/history?project='+encodeURIComponent(project)),200,'retained retry history');
+  assert.equal(history.events.filter(e=>e.kind==='native_session_started').length,2);assert.equal(history.events.filter(e=>e.kind==='finish_evidence_received').length,2);
+  const starts=history.events.filter(e=>e.kind==='session_start_requested');assert.equal(starts.length,2);assert.notEqual(starts[0].body.session_id,starts[1].body.session_id);assert.equal(starts[1].body.retry_of_session,starts[0].body.session_id);
+  coverage.retained_archive_search=true;coverage.retained_failed_retry_history=true;
+ });
+ if(process.env.HUB2_NORMAL_DAY_SLICE!=='twenty')await measure('actual_persisted_cold_restart',async()=>{
+  await mf.dispose();mf=new Miniflare(options);base=(await mf.ready).origin;
+  expect(await fixture('control','global','clock',{offset:virtualOffset}),200,'restore only synthetic clock after actual process restart');
+  const task=expect(await api('/api/intakes/'+intakes[0].id+'?project='+encodeURIComponent(project)),200,'retained archived task after cold restart').intake;assert.equal(task.status,'archived');
+  const retry=expect(await api('/api/intakes/'+historicalIntake.id+'?project='+encodeURIComponent(project)),200,'retained retry after cold restart').intake;assert.equal(retry.status,'completed-awaiting-review');
+  const fleet=expect(await api('/api/fleet'),200,'actual cold fleet projection');assert.equal(fleet.items.length,4);assert(fleet.items.every(m=>m.connected===false),'closed sockets must not become phantom online hosts');
+  for(let i=0;i<6;i++){const quota=expect(await api(`/api/accounts/normal-account-${i}/api/account/quota`),200,'encrypted provider metadata after cold restart');assert.equal(quota.account.provider,'codex');assert(String(quota.quota.source).startsWith('provider:codex:generation:'));}
+  coverage.actual_persisted_cold_restart=true;
+ });
  coverage.root_writer_api_calls=role_ledger.root_writer;coverage.operator_api_calls=role_ledger.operator;
  if(!coverage.claim_cycles)missing.push('50 claim cycles outside this explicit twenty-start comparison slice');
  // Missing retained workflows are explicit failing coverage, never zero coefficients.
  if(!coverage.messages)missing.push('100 full native messages outside explicit twenty-start comparison slice');
  for(const[k,n]of Object.entries(canonical))if(coverage[k]!==n)missing.push(k+': measured '+(coverage[k]??0)+' of '+n);
- missing.push('retained archive/search, populated migration, cold eviction and configured production prompt inventory not yet replayed');
+ if(!coverage.retained_archive_search||!coverage.retained_failed_retry_history)missing.push('retained archive/search/history outside this component slice');
+ if(!coverage.actual_persisted_cold_restart)missing.push('actual persisted cold restart outside this component slice');
+ missing.push('populated older-schema migration and configured production prompt inventory remain separate uncovered scenarios');
  await measure('completed_steady_idle',async()=>{await new Promise(r=>setTimeout(r,50));});
  const idle=flows.at(-1);assert.equal(idle.combined_rows,0,'idle SQL must be zero');assert.equal(idle.alarm_operations,0,'idle alarm work must be zero');
  const profiles={},storage_profiles={};for(const[kind,id]of objects){const d=expect(await fixture(kind,id,'profile'),200,'profile');profiles[kind+':'+id]=d.profile;storage_profiles[kind+':'+id]=d.storage;}
  const final=await snapshot();await telemetryBarrier();const sourceAfter=await hashes(),stable=JSON.stringify(sourceBefore)===JSON.stringify(sourceAfter);
  const telemetry=nativeTelemetry.report();const total=Object.values(telemetry.phases).reduce((n,f)=>n+f.reads+f.writes,0),alarm_operations=Object.values(telemetry.phases).reduce((n,f)=>n+Object.values(f.storage).reduce((m,c)=>m+c.succeeded+c.failed,0),0);
  const provenAlarmWrites=Object.values(telemetry.phases).reduce((n,f)=>n+f.storage.setAlarm.succeeded,0);const complete=missing.length===0&&Object.entries(canonical).every(([k,n])=>coverage[k]===n);
- const report={passed:complete&&stable&&nativeTelemetry.valid()&&!errors.length&&total+provenAlarmWrites<20000,engine:'actual native workerd SQLite',canonical_source:'docs/hub2/ARCHITECTURE.md:124-146',bundle_sha256:bundleSha,source_snapshot_manifest_sha256:process.env.HUB2_SOURCE_MANIFEST?createHash('sha256').update(await readFile(process.env.HUB2_SOURCE_MANIFEST)).digest('hex'):null,cache_variant:cacheVariant,component_slice:process.env.HUB2_NORMAL_DAY_SLICE||'implemented-flows',cache_adapter_sha256:createHash('sha256').update(await readFile(resolve(root,'hub2/tests/normal-day-cache-off.ts'))).digest('hex'),canonical,coverage,role_ledger,request_ledger,missing,errors,profiles,storage_profiles,proven_alarm_rows_written:provenAlarmWrites,measured_partial_combined_rows:total+provenAlarmWrites,source_stable:stable,source_hashes:sourceBefore,native_telemetry:telemetry,native_meter_valid:nativeTelemetry.valid(),native_meter_fixture_sha256:createHash('sha256').update(await readFile(resolve(root,'hub2/tests/normal-day-meter.mjs'))).digest('hex'),flows,measured_partial_rows:total,alarm_operations,complete,threshold:20000,final_alarms:Object.fromEntries(Object.entries(final).map(([k,v])=>[k,v.alarm])),note:'Actual measured partial workload, not a daily forecast. Synthetic provider HTTP and native process receipts are explicit fixtures; quota is generated by the actual provider collector, never manual snapshot PUT. Operator APIs use actual expiring hashed credential issued through OIDC/device flow; bootstrap secret only authorizes test-only observations/provider transport configuration. Root/writer credential/delegation costs remain uncovered. Missing coverage FAILS acceptance.'};
+ const canonicalComplete=Object.entries(canonical).every(([k,n])=>coverage[k]===n)&&coverage.role_separated_credentials&&coverage.retained_archive_search&&coverage.retained_failed_retry_history&&coverage.actual_persisted_cold_restart;
+ const report={passed:complete&&stable&&nativeTelemetry.valid()&&!errors.length,canonical_passed:!!canonicalComplete&&stable&&nativeTelemetry.valid()&&!errors.length,engine:'actual native workerd SQLite',canonical_source:'docs/hub2/ARCHITECTURE.md:124-146',bundle_sha256:bundleSha,source_snapshot_manifest_sha256:process.env.HUB2_SOURCE_MANIFEST?createHash('sha256').update(await readFile(process.env.HUB2_SOURCE_MANIFEST)).digest('hex'):null,cache_variant:cacheVariant,component_slice:process.env.HUB2_NORMAL_DAY_SLICE||'implemented-flows',cache_adapter_sha256:createHash('sha256').update(await readFile(resolve(root,'hub2/tests/normal-day-cache-off.ts'))).digest('hex'),canonical,coverage,role_ledger,request_ledger,missing,errors,profiles,storage_profiles,proven_alarm_rows_written:provenAlarmWrites,measured_partial_combined_rows:total+provenAlarmWrites,conservative_sql_and_all_alarm_calls:total+alarm_operations,source_stable:stable,source_hashes:sourceBefore,native_telemetry:telemetry,native_meter_valid:nativeTelemetry.valid(),native_meter_fixture_sha256:createHash('sha256').update(await readFile(resolve(root,'hub2/tests/normal-day-meter.mjs'))).digest('hex'),flows,measured_partial_rows:total,alarm_operations,complete,threshold:null,legacy_20000_gate_withdrawn:true,required_paid_cost_alert_usd_per_day:0.03,final_alarms:Object.fromEntries(Object.entries(final).map(([k,v])=>[k,v.alarm])),note:'Actual measured partial workload, not a daily forecast. Synthetic provider HTTP and native process receipts are explicit fixtures; quota is generated by the actual provider collector, never manual snapshot PUT. Operator APIs use actual expiring hashed credential issued through OIDC/device flow; bootstrap secret only authorizes test-only observations/provider transport configuration. Root/writer credential/delegation costs remain uncovered. Missing coverage FAILS acceptance.'};
  if(process.env.HUB2_NORMAL_DAY_REPORT)await writeFile(process.env.HUB2_NORMAL_DAY_REPORT,JSON.stringify(report,null,2)+'\n');
  console.log(JSON.stringify(report));if(!report.passed)process.exitCode=1;
 }finally{await mf.dispose();}

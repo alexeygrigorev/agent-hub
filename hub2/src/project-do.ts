@@ -2,6 +2,7 @@ import { MeteredDb, initializeSchema } from './db';
 import { sha256Hex } from './crypto';
 import { actorFrom, bodyObject, error, hasScope, HttpError, json } from './http';
 import { selectRoute, type RoutingDecision } from './routing';
+import { nativeReturncode } from './native-exit';
 import { PROJECT_WORK_SCHEMA, ProjectWork, type ProjectWorkHooks } from './project-work';
 import type { Actor, Hub2Env, JsonRecord } from './types';
 
@@ -602,34 +603,57 @@ export class ProjectDO {
     const body = await bodyObject(request, 12_288);
     if (typeof body.operation_id !== 'string' || typeof body.attempt_operation_id !== 'string' || typeof body.session_id !== 'string'
       || typeof body.machine_id !== 'string' || typeof body.native_id !== 'string' || !Number.isSafeInteger(body.epoch)
-      || !Number.isSafeInteger(body.exit_code) || body.native_exit_confirmed !== true) return error('invalid_completion', 400);
+      || !Number.isInteger(body.exit_code) || Number(body.exit_code) < -2147483648 || Number(body.exit_code) > 2147483647
+      || body.native_exit_confirmed !== true) return error('invalid_completion', 400);
+    if(body.launch_failed!==undefined&&typeof body.launch_failed!=='boolean')return error('invalid_completion',400);
+    const launchFailed=body.launch_failed===true;
     const saga = this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id = ?', body.operation_id);
     if (!saga || saga.session_id !== body.session_id || saga.machine_id !== body.machine_id
       || saga.attempt_operation_id !== body.attempt_operation_id || saga.epoch !== body.epoch
-      || saga.native_id !== body.native_id) return error('dispatch_not_found', 404);
+      || (saga.native_id !== body.native_id&&!(launchFailed&&saga.state==='admitted'&&saga.native_id===null&&/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(body.native_id)))) return error('dispatch_not_found', 404);
     const intake = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id = ?', saga.intake_id);
     if (!intake) return error('intake_not_found', 404);
-    const alreadyFinished = ['completed-awaiting-review', 'failed'].includes(intake.status) || saga.state === 'complete';
-    if (!alreadyFinished && saga.state !== 'running') return error('dispatch_not_found', 404);
+    const alreadyFinished = saga.state === 'complete';
+    if (!alreadyFinished && ((launchFailed?saga.state!=='admitted':saga.state!=='running')||intake.session_id!==saga.session_id||intake.assigned_machine_id!==saga.machine_id)) return error('dispatch_not_found', 404);
     const evidence = body.evidence && typeof body.evidence === 'object' && !Array.isArray(body.evidence) ? body.evidence as JsonRecord : undefined;
     if (!evidence) return error('native_exit_evidence_required', 400);
+    const normalizedExit = evidence.native_exit === undefined ? undefined : nativeReturncode(evidence.native_exit);
+    if (evidence.native_exit !== undefined && (normalizedExit === undefined || normalizedExit !== body.exit_code)) return error('native_exit_code_mismatch', 400);
+    if(launchFailed){
+      const identity=evidence.native_identity as JsonRecord|undefined,exit=evidence.native_exit as JsonRecord|undefined,launch=this.parse(saga.launch_spec_json) as JsonRecord;
+      if(!['aplexer_status','aplexer_retirement'].includes(String(evidence.source))||evidence.containment_empty!==true
+        ||identity?.id!==body.native_id||identity?.tag!=='task-hub2-'+saga.session_id||identity?.workspace!==launch.workspace||normalizedExit!==body.exit_code)return error('invalid_launch_failure_proof',400);
+    }
+    const completionDigest=await sha256Hex(JSON.stringify({operation_id:saga.operation_id,attempt_operation_id:saga.attempt_operation_id,session_id:saga.session_id,machine_id:saga.machine_id,epoch:saga.epoch,native_id:body.native_id,exit_code:body.exit_code,evidence,...(launchFailed?{launch_failed:true}:{})}));
+    const replay=()=>{
+      const event=this.db.one<{body_json:string}>('SELECT body_json FROM intake_events WHERE task_id=? AND event_key=?',intake.id,'finish:'+saga.operation_id);
+      if(!event||(this.parse(event.body_json) as JsonRecord)?.completion_digest!==completionDigest)throw new HttpError('completion_proof_conflict',409);
+    };
+    if(alreadyFinished){replay();return json({ok:true,duplicate:true});}
+
     if (saga.account_id && !await this.releaseAccount(saga, { native_exit_confirmed: true })) return error('account_release_pending', 503);
-    if (alreadyFinished) return json({ ok: true, duplicate: true });
     const now = Date.now();
-    const finishedStatus = body.exit_code === 0 ? 'completed-awaiting-review' : 'failed';
-    this.transaction(() => {
-      this.db.run('UPDATE intakes SET status=?, final_evidence_json=?, updated_at=? WHERE id=?', finishedStatus, JSON.stringify({ ...evidence, native_id: body.native_id, exit_code: body.exit_code,native_exit_confirmed:true,account_released:true }), now, intake.id);
-      this.db.run("UPDATE dispatch_sagas SET state='complete', next_action_at=NULL, last_reason=NULL, updated_at=? WHERE operation_id=?", now, saga.operation_id);
-      this.appendEvent(intake.id, `finish:${saga.operation_id}`, 'hub2-host', 'finish_evidence_received', { session_id: saga.session_id, native_id: body.native_id, exit_code: body.exit_code, evidence }, now);
+    const nativeDeadline = evidence.native_deadline as JsonRecord | undefined;
+    const deadlineExceeded = nativeDeadline?.exceeded === true;
+    const finishedStatus = body.exit_code === 0 && !launchFailed && !deadlineExceeded ? 'completed-awaiting-review' : 'failed';
+    const duplicate=this.transaction(() => {
+      const currentSaga=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?',saga.operation_id);
+      if(currentSaga?.state==='complete'){replay();return true;}
+      const current=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',intake.id);
+      if((launchFailed?currentSaga?.state!=='admitted':currentSaga?.state!=='running')||current?.session_id!==saga.session_id||current.assigned_machine_id!==saga.machine_id)throw new HttpError('completion_binding_changed',409);
+      this.db.run('UPDATE intakes SET status=?, final_evidence_json=?, updated_at=? WHERE id=?', finishedStatus, JSON.stringify({ ...evidence, native_id: body.native_id, exit_code: body.exit_code,native_exit_confirmed:true,account_released:true,...(launchFailed?{launch_failed:true}:{}) }), now, intake.id);
+      this.db.run("UPDATE dispatch_sagas SET state='complete', native_id=?, next_action_at=NULL, last_reason=NULL, updated_at=? WHERE operation_id=?", body.native_id, now, saga.operation_id);
+      this.appendEvent(intake.id, `finish:${saga.operation_id}`, 'hub2-host', 'finish_evidence_received', { session_id: saga.session_id, native_id: body.native_id, exit_code: body.exit_code, evidence,completion_digest:completionDigest,...(launchFailed?{launch_failed:true}:{}) }, now);
+      return false;
     });
     await this.scheduleNext();
-    return json({ ok: true, intake_id: intake.id });
+    return json({ ok: true, intake_id: intake.id,...(duplicate?{duplicate:true}:{}) });
   }
 
   private qualifiedFailure(intake:IntakeRow):boolean{
     if(intake.status!=='failed'||!intake.session_id)return false;
     const prior=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id=?',intake.session_id),proof=this.parse(intake.final_evidence_json) as JsonRecord|null;
-    return !!prior&&prior.state==='complete'&&!!prior.native_id&&proof?.native_id===prior.native_id&&Number.isSafeInteger(proof.exit_code)&&proof.exit_code!==0&&proof.native_exit_confirmed===true&&proof.account_released===true;
+    return !!prior&&prior.state==='complete'&&!!prior.native_id&&proof?.native_id===prior.native_id&&Number.isSafeInteger(proof.exit_code)&&(proof.exit_code!==0||proof.launch_failed===true||(proof.native_deadline as JsonRecord|undefined)?.exceeded===true)&&proof.native_exit_confirmed===true&&proof.account_released===true;
   }
 
   private async releaseAccount(saga: SagaRow, proof: { native_exit_confirmed?: true; unclaimed_proof?: JsonRecord }): Promise<boolean> {

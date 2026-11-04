@@ -1,3 +1,4 @@
+import { nativeReturncode } from './native-exit';
 import { MeteredDb, initializeSchema } from './db';
 import { sha256Hex } from './crypto';
 import { actorFrom, bodyObject, boundedString, error, hasScope, HttpError, json } from './http';
@@ -182,7 +183,7 @@ export class MachineDO {
     const machine=this.db.one<MachineRow>('SELECT * FROM machines LIMIT 1');
     if(!machine)return json({available:false,reason:'machine_not_enrolled'});
     let connected=false;
-    for(const socket of this.ctx.getWebSockets(`hub2:${machine.machine_id}`))if(socket.readyState===1&&await this.authorizedAttachment(socket,'machine:offer')){connected=true;break;}
+    for(const socket of this.ctx.getWebSockets(`hub2:${machine.machine_id}`))if(socket.readyState===1&&!this.stopOnly(socket)&&await this.authorizedAttachment(socket,'machine:offer')){connected=true;break;}
     const capabilities=this.db.one<{engines_json:string;capabilities_json:string}>('SELECT engines_json,capabilities_json FROM machine_capabilities WHERE machine_id=?',machine.machine_id);
     return json({machine_id:machine.machine_id,available:connected&&!machine.active_session_id,connected,
       occupied:machine.active_session_id?1:0,capacity:1,os:machine.os,arch:machine.arch,labels:JSON.parse(machine.labels_json),
@@ -228,7 +229,7 @@ export class MachineDO {
     const machine = this.db.one<MachineRow>('SELECT * FROM machines WHERE machine_id=?', body.machine_id);
     let connected = false;
     for (const socket of this.ctx.getWebSockets(`hub2:${body.machine_id}`)) {
-      if (socket.readyState === 1 && await this.authorizedAttachment(socket, 'machine:offer')) { connected = true; break; }
+      if (socket.readyState === 1 && !this.stopOnly(socket) && await this.authorizedAttachment(socket, 'machine:offer')) { connected = true; break; }
     }
     if (!machine || (!connected && now - machine.last_seen > 120_000)) return json({ reason: 'machine_unavailable' }, 409);
     const retrying = prior !== undefined;
@@ -289,9 +290,11 @@ export class MachineDO {
     const machineId = this.machineActor(actor, 'machine:offer');
     if (!machineId) return error('forbidden', 403);
     if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') return error('websocket_upgrade_required', 426);
+    const stopOnly=request.headers.get('x-hub2-safety-mode')==='operator_stop';
+    if(new URL(request.url).searchParams.has('safety')&&!stopOnly)return error('untrusted_safety_mode',403);
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
-    server.serializeAttachment({ machine_id: machineId, actor_id: actor!.id, generation: actor!.generation });
+    server.serializeAttachment({ machine_id: machineId, actor_id: actor!.id, generation: actor!.generation, stop_only:stopOnly });
     this.ctx.acceptWebSocket(server, [`hub2:${machineId}`]);
     try { server.send(JSON.stringify({ type: 'resync', reason: 'connected' })); } catch {}
     await this.sendOffers(server, machineId);
@@ -307,6 +310,7 @@ export class MachineDO {
     }
     let body: JsonRecord;
     try { body = JSON.parse(message) as JsonRecord; } catch { return; }
+    if(this.stopOnly(socket)&&body.type!=='resync'){try{socket.send(JSON.stringify({type:'error',error:'safety_socket_stop_only'}));}catch{}return;}
     if (body.type === 'ping') {
       try { socket.send(JSON.stringify({ type: 'pong', nonce: typeof body.nonce === 'string' ? body.nonce.slice(0, 80) : undefined })); } catch {}
       return;
@@ -364,6 +368,7 @@ export class MachineDO {
   }
 
   private async sendOffers(socket: WebSocket, machineId: string): Promise<void> {
+    if(this.stopOnly(socket))return;
     const now = Date.now();
     const rows = this.db.all<SessionRow>(
       `SELECT * FROM sessions WHERE machine_id=? AND ((state='offered' AND offer_expires_at > ?) OR state='claimed') ORDER BY created_at, id LIMIT 10`, machineId, now,
@@ -379,7 +384,7 @@ export class MachineDO {
     const frame = JSON.stringify({ type: 'session.offer', offer: this.offerView(row) });
     for (const socket of this.ctx.getWebSockets(`hub2:${row.machine_id}`)) {
       try {
-        if (!await this.authorizedAttachment(socket, 'machine:offer')) continue;
+        if (this.stopOnly(socket)||!await this.authorizedAttachment(socket, 'machine:offer')) continue;
         socket.send(frame);
       } catch {}
     }
@@ -415,13 +420,14 @@ export class MachineDO {
     const recorded = this.db.transaction(this.ctx, () => {
       const current=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',row.id);
       if (!current || current.operation_id!==row.operation_id || current.epoch!==row.epoch || !['claimed','running'].includes(current.state)) return false;
-      if (!this.db.one('SELECT operation_id FROM launch_admissions WHERE operation_id=?',row.operation_id)) {
-        this.db.run('INSERT INTO launch_admissions VALUES(?,?,?,?)',row.operation_id,row.id,row.epoch,result.observed_at);
-      }
-      return true;
+      const admission=this.db.one<{observed_at:number}>('SELECT observed_at FROM launch_admissions WHERE operation_id=?',row.operation_id);
+      if (!admission) this.db.run('INSERT INTO launch_admissions VALUES(?,?,?,?)',row.operation_id,row.id,row.epoch,result.observed_at);
+      return admission?.observed_at ?? Number(result.observed_at);
     });
     if (!recorded) return error('stale_admission_result',409);
-    if(body.provider_check!==true)return json(result);
+    const runtimeDeadline=Number(recorded)+Number(launch.timeout_seconds)*1000;
+    if(!Number.isSafeInteger(runtimeDeadline)||runtimeDeadline<=Date.now()||runtimeDeadline>Date.now()+7_200_000)return error('runtime_deadline_unavailable',409);
+    if(body.provider_check!==true)return json({...result,runtime_deadline:runtimeDeadline});
     if(!row.account_id)return error('provider_account_required',409);
     const accountReply=await this.env.ACCOUNTS.get(this.env.ACCOUNTS.idFromName(row.account_id)).fetch('https://account.internal/_internal/routing');
     if(!accountReply.ok)return error('provider_evidence_unavailable',503);
@@ -430,7 +436,7 @@ export class MachineDO {
       ||evidence.quota?.source!==`provider:${evidence.account.provider}:generation:${evidence.credential_generation}`)return error('provider_evidence_unverified',503);
     if(!this.db.one("SELECT id FROM sessions WHERE id=? AND operation_id=? AND epoch=? AND state='claimed'",row.id,row.operation_id,row.epoch))return error('stale_provider_admission',409);
     return json({...result,session_id:row.id,operation_id:row.operation_id,machine_id:machineId,account_id:row.account_id,
-      provider:evidence.account.provider,credential_generation:evidence.credential_generation,quota:evidence.quota});
+      runtime_deadline:runtimeDeadline,provider:evidence.account.provider,credential_generation:evidence.credential_generation,quota:evidence.quota});
   }
 
   private async childCredentials(request:Request,sessionId:string):Promise<Response>{
@@ -488,34 +494,48 @@ export class MachineDO {
     const machineId = this.machineActor(actor, 'session:report');
     if (!machineId) return error('forbidden', 403);
     const body = await bodyObject(request, 12_288);
+    const launchFailed=body.launch_failed===true;
+    if(body.launch_failed!==undefined&&typeof body.launch_failed!=='boolean')return error('invalid_launch_failure',400);
     if (typeof body.operation_id !== 'string' || !Number.isSafeInteger(body.epoch) || typeof body.exit_code !== 'number'
-      || !Number.isInteger(body.exit_code) || body.exit_code < 0 || body.exit_code > 255
+      || !Number.isInteger(body.exit_code) || body.exit_code < -2147483648 || body.exit_code > 2147483647
       || typeof body.native_id !== 'string' || body.native_exit_confirmed !== true) return error('invalid_finish_evidence', 400);
     const evidence = body.evidence && typeof body.evidence === 'object' && !Array.isArray(body.evidence) ? body.evidence as JsonRecord : {};
     const evidenceJson = JSON.stringify(evidence);
     if (new TextEncoder().encode(evidenceJson).byteLength > 8192) return error('evidence_too_large', 413);
-    const evidenceDigest = await sha256Hex(JSON.stringify({ epoch: body.epoch, native_id: body.native_id, exit_code: body.exit_code, evidence }));
+    const evidenceDigest = await sha256Hex(JSON.stringify({ epoch: body.epoch, native_id: body.native_id, exit_code: body.exit_code, evidence,
+      ...(launchFailed?{launch_failed:true}:{}) }));
     const row = this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND machine_id=?', sessionId, machineId);
     if (!row) return error('session_not_found', 404);
+    if(row.operation_id!==body.operation_id||row.epoch!==body.epoch)return error('stale_or_unmatched_finish',409);
     const launch = this.parse(row.launch_json) as JsonRecord;
     const identity = evidence.native_identity as JsonRecord | undefined;
     const nativeExit = evidence.native_exit as JsonRecord | undefined;
     if (!['aplexer_status', 'aplexer_retirement'].includes(String(evidence.source)) || evidence.containment_empty !== true
       || !identity || identity.id !== body.native_id || identity.tag !== `task-hub2-${row.id}`
-      || identity.workspace !== launch.workspace || !nativeExit || typeof nativeExit.code !== 'number'
-      || !Number.isInteger(nativeExit.code) || nativeExit.code !== body.exit_code) return error('unqualified_native_exit_evidence', 409);
+      || identity.workspace !== launch.workspace || !nativeExit || nativeReturncode(nativeExit) !== body.exit_code) return error('unqualified_native_exit_evidence', 409);
     if (row.state === 'completed-awaiting-review' || row.state === 'failed') {
       return row.evidence_digest === evidenceDigest ? json({ ok: true, duplicate: true, state: row.state }) : error('finish_conflict', 409);
     }
-    if (row.state !== 'running' || row.operation_id !== body.operation_id || row.epoch !== body.epoch || row.native_id !== body.native_id) return error('stale_or_unmatched_finish', 409);
+    const nativeDeadline=evidence.native_deadline as JsonRecord|undefined;
+    const admission=this.db.one<{observed_at:number}>('SELECT observed_at FROM launch_admissions WHERE operation_id=? AND session_id=? AND epoch=?',row.operation_id,row.id,row.epoch);
+    if(!nativeDeadline||!Number.isSafeInteger(nativeDeadline.deadline_ms)||typeof nativeDeadline.exceeded!=='boolean'||!admission
+      ||nativeDeadline.deadline_ms!==admission.observed_at+Number(launch.timeout_seconds)*1000
+      ||!Number.isSafeInteger(nativeExit.exited_at_ms)||Number(nativeExit.exited_at_ms)<admission.observed_at||Number(nativeExit.exited_at_ms)>Date.now()+5000
+      ||(Number(nativeExit.exited_at_ms)>=Number(nativeDeadline.deadline_ms)&&nativeDeadline.exceeded!==true)
+      ||(nativeDeadline.exceeded&&Number(nativeDeadline.deadline_ms)>Date.now()))return error('native_deadline_unverified',409);
+    const admittedAbort=launchFailed&&row.state==='claimed'&&row.native_id===null
+      &&/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(body.native_id)
+      &&this.db.one('SELECT operation_id FROM launch_admissions WHERE operation_id=? AND session_id=? AND epoch=?',row.operation_id,row.id,row.epoch);
+    if (!admittedAbort&&(launchFailed||row.state!=='running'||row.native_id!==body.native_id))return error('stale_or_unmatched_finish',409);
     const now = Date.now();
-    const state = Number(body.exit_code) === 0 ? 'completed-awaiting-review' : 'failed';
+    const state = !launchFailed&&nativeDeadline?.exceeded!==true&&Number(body.exit_code) === 0 ? 'completed-awaiting-review' : 'failed';
     const payload = { operation_id: row.dispatch_id, attempt_operation_id: row.operation_id, session_id: row.id,
-      machine_id: row.machine_id,intake_id:row.intake_id, epoch: row.epoch, native_id: row.native_id,
+      machine_id: row.machine_id,intake_id:row.intake_id, epoch: row.epoch, native_id: body.native_id,
+      ...(launchFailed?{launch_failed:true}:{}),
       exit_code: Number(body.exit_code), native_exit_confirmed: true, evidence, evidence_digest: evidenceDigest };
     this.db.transaction(this.ctx, () => {
-      this.db.run('UPDATE sessions SET state=?, evidence_json=?, evidence_digest=?, exit_code=?, updated_at=? WHERE id=? AND state=\'running\'',
-        state, JSON.stringify(payload), evidenceDigest, Number(body.exit_code), now, row.id);
+      this.db.run('UPDATE sessions SET state=?, evidence_json=?, evidence_digest=?, exit_code=?, updated_at=?,native_id=? WHERE id=? AND state=?',
+        state, JSON.stringify(payload), evidenceDigest, Number(body.exit_code), now, body.native_id,row.id, row.state);
       this.db.run('UPDATE machines SET active_session_id=NULL WHERE machine_id=? AND active_session_id=?', machineId, sessionId);
       this.insertOutbox(`finish:${row.operation_id}`, 'finish', row.operation_id, row.project_id, payload, now);
     });
@@ -642,12 +662,15 @@ export class MachineDO {
   private async ackCommand(request: Request, sessionId: string, commandId: string): Promise<Response> {
     const actor = actorFrom(request), machineId = this.machineActor(actor, 'session:report');
     if (!machineId) return error('forbidden', 403);
+    const safety=request.headers.get('x-hub2-safety-mode')==='operator_stop';
+    if(new URL(request.url).searchParams.has('safety')&&!safety)return error('untrusted_safety_mode',403);
     const body = await bodyObject(request, 12_288);
     if (!Number.isSafeInteger(body.epoch) || !body.result || typeof body.result !== 'object' || Array.isArray(body.result)) return error('invalid_command_ack', 400);
     const resultJson = JSON.stringify(body.result);
     if (new TextEncoder().encode(resultJson).byteLength > 8192) return error('command_ack_too_large', 413);
     const row = this.db.one<CommandRow>('SELECT * FROM session_commands WHERE id=? AND session_id=? AND machine_id=?', commandId, sessionId, machineId);
     if (!row || row.epoch !== body.epoch) return error('stale_command', 409);
+    if(safety&&row.kind!=='stop')return error('safety_command_refused',403);
     if (row.state === 'acked') return row.result_json === resultJson ? json({ acknowledged: true, duplicate: true }) : error('command_ack_conflict', 409);
     if (row.state !== 'pending') return error('command_not_pending', 409);
     this.db.run("UPDATE session_commands SET state='acked',result_json=?,updated_at=? WHERE id=? AND state='pending' AND epoch=?",
@@ -658,7 +681,7 @@ export class MachineDO {
 
   private async sendPendingCommands(socket: WebSocket, machineId: string): Promise<void> {
     const rows = this.db.all<CommandRow>(
-      "SELECT * FROM session_commands WHERE machine_id=? AND state='pending' ORDER BY created_at,id LIMIT 1", machineId,
+      `SELECT * FROM session_commands WHERE machine_id=? AND state='pending' ${this.stopOnly(socket)?"AND kind='stop'":""} ORDER BY created_at,id LIMIT 1`, machineId,
     );
     for (const command of rows) {
       try { socket.send(JSON.stringify({ type: 'session.command', command: this.commandView(command) })); } catch { return; }
@@ -729,6 +752,7 @@ export class MachineDO {
   }
 
   private async sendPendingMail(socket: WebSocket, machine: string): Promise<void> {
+    if(this.stopOnly(socket))return;
     if (!await this.authorizedAttachment(socket,'message:delivery',false)) return;
     const row = this.db.one<NativeMail>("SELECT * FROM native_mail WHERE machine_id=? AND state='pending' ORDER BY created_at,message_id,epoch LIMIT 1",machine);
     if (row) socket.send(JSON.stringify({type:'mailbox.deliver',message:{id:row.message_id,epoch:row.epoch,
@@ -785,6 +809,8 @@ export class MachineDO {
       epoch:row.epoch,operation_id:row.operation_id,native_id:row.native_id,engine:launch.engine,model:launch.model,
       interactive:launch.interactive,evidence:this.parse(row.evidence_json),attention:this.db.one('SELECT reason,observed_at FROM attention WHERE session_id=?',row.id)||null};
   }
+
+  private stopOnly(socket:WebSocket):boolean{try{return socket.deserializeAttachment()?.stop_only===true;}catch{return false;}}
 
   private async authorizedAttachment(socket: WebSocket, scope: string, closeOnRefusal = true): Promise<{ machine_id: string; actor_id: string; generation: string } | undefined> {
     let attachment: { machine_id?: string; actor_id?: string; generation?: string } | null;

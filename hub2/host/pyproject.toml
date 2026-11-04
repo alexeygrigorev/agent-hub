@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools==84.2.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-hub-host-v2"
+version = "2.0.0"
+requires-python = ">=3.11"
+dependencies = ["websockets==16.0"]
+
+[project.scripts]
+hub = "agent_hub_host.cli:main"
+hub2 = "agent_hub_host.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["agent_hub_host*"]
