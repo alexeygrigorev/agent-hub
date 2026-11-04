@@ -200,22 +200,25 @@ export class ProjectDO {
     const selected = 'id, project, title, status, assigned_machine_id, assigned_actor_id, session_id, created_at, updated_at,priority'+(search?',text,original_title,original_text':'');
     let rows: IntakeRow[], next: string | null;
     if (!cursor) {
-      // View page: newest first. When older rows remain, hand the walk off to
-      // the stable ascending (created_at,id) position: created_at never moves,
-      // so intakes created or closed mid-walk cannot expire a page or be
-      // skipped, and rows already shown once simply reappear for dedup.
+      // View page: newest first. The (updated_at,id) upper bound keeps the
+      // planner on the reversed intakes_updated range (a plain ORDER BY on a
+      // large table flips to a sort plan and reads the whole project); when
+      // older rows remain, the walk hands off to the stable ascending
+      // (created_at,id) position: created_at never moves, so intakes created
+      // or closed mid-walk cannot expire a page or be skipped, and rows
+      // already shown once simply reappear for dedup.
       rows = status
-        ? this.db.all<IntakeRow>(`SELECT ${selected} FROM intakes WHERE project=? AND status=? ORDER BY updated_at DESC,id DESC LIMIT ?`, project, status, limit + 1)
-        : this.db.all<IntakeRow>(`SELECT ${selected} FROM intakes WHERE project=? ORDER BY updated_at DESC,id DESC LIMIT ?`, project, limit + 1);
+        ? this.db.all<IntakeRow>(`SELECT ${selected} FROM intakes INDEXED BY intakes_status_updated WHERE project=? AND status=? AND (updated_at,id)<(?,?) ORDER BY updated_at DESC,id DESC LIMIT ?`, project, status, Number.MAX_SAFE_INTEGER, '\uffff', limit + 1)
+        : this.db.all<IntakeRow>(`SELECT ${selected} FROM intakes INDEXED BY intakes_updated WHERE project=? AND (updated_at,id)<(?,?) ORDER BY updated_at DESC,id DESC LIMIT ?`, project, Number.MAX_SAFE_INTEGER, '\uffff', limit + 1);
       const scanned=rows.slice(0,limit),last=scanned[scanned.length-1];
       let more = false;
       if (rows.length > limit && last)
-        more = !!this.db.one('SELECT id FROM intakes WHERE project=? AND (created_at,id)<(?,?) LIMIT 1', project, last.created_at, last.id);
+        more = !!this.db.one('SELECT id FROM intakes INDEXED BY intakes_created WHERE project=? AND (created_at,id)<(?,?) LIMIT 1', project, last.created_at, last.id);
       next = more ? JSON.stringify([0, '']) : null;
     } else {
       rows = status
-        ? this.db.all<IntakeRow>(`SELECT ${selected} FROM intakes WHERE project=? AND status=? AND (created_at,id)>(?,?) ORDER BY created_at,id LIMIT ?`, project, status, ...cursor, limit + 1)
-        : this.db.all<IntakeRow>(`SELECT ${selected} FROM intakes WHERE project=? AND (created_at,id)>(?,?) ORDER BY created_at,id LIMIT ?`, project, ...cursor, limit + 1);
+        ? this.db.all<IntakeRow>(`SELECT ${selected} FROM intakes INDEXED BY intakes_status_created WHERE project=? AND status=? AND (created_at,id)>(?,?) ORDER BY created_at,id LIMIT ?`, project, status, ...cursor, limit + 1)
+        : this.db.all<IntakeRow>(`SELECT ${selected} FROM intakes INDEXED BY intakes_created WHERE project=? AND (created_at,id)>(?,?) ORDER BY created_at,id LIMIT ?`, project, ...cursor, limit + 1);
       const scanned=rows.slice(0,limit),last=scanned[scanned.length-1];
       next = rows.length > limit && last ? JSON.stringify([last.created_at, last.id]) : null;
     }
