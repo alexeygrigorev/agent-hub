@@ -948,6 +948,13 @@ export class ConversationsService {
       }
 
       if (!usageRow || currentVersion < CONVERSATIONS_SCHEMA_VERSION) {
+        // Legacy aggregate repair is safe only after every raw source has
+        // been proven small. Never mutate a retained large table first.
+        for(const table of ['conversations','conversation_messages','conversation_members']) {
+          const prefix=this.sql.exec(`SELECT 1 FROM ${table} LIMIT 129`).toArray();
+          if(prefix.length>128)throw new ConversationDomainError('migration_observation_limited',503,
+            'conversation_migration_observation_limited',{observation_pending:true,table});
+        }
         // Clean up any orphaned child rows without a parent conversation header
         this.sql.exec(
           'DELETE FROM conversation_messages WHERE NOT EXISTS (SELECT 1 FROM conversations c WHERE c.id = conversation_messages.conversation_id)',
@@ -1949,41 +1956,20 @@ export class ConversationsService {
     retainedCount: number;
     unreadCount: number;
   } {
-    const boundsRow = this.sql
-      .exec(
-        `SELECT COUNT(*) AS retained_count,
-                MIN(seq) AS min_seq,
-                MAX(seq) AS max_seq,
-                SUM(CASE WHEN seq > ? THEN 1 ELSE 0 END) AS unread_count
-         FROM conversation_messages
-         WHERE conversation_id = ?`,
-        readSeq,
-        conversationId,
-      )
-      .toArray()[0] as any;
-    const retainedCount = Number(boundsRow?.retained_count ?? 0);
-    const oldestRetainedSeq =
-      retainedCount > 0 &&
-      boundsRow?.min_seq !== null &&
-      boundsRow?.min_seq !== undefined
-        ? Number(boundsRow.min_seq)
-        : null;
-    const newestRetainedSeq =
-      retainedCount > 0 &&
-      boundsRow?.max_seq !== null &&
-      boundsRow?.max_seq !== undefined
-        ? Number(boundsRow.max_seq)
-        : null;
-    const prunedThroughSeq =
-      oldestRetainedSeq !== null
-        ? Math.max(0, oldestRetainedSeq - 1)
-        : lastSeq;
+    // Count only a complete bounded raw prefix. An aggregate with a WHERE
+    // conversation_id seek still walks every retained message on every poll.
+    // The deployed sequence index is covering for this observation.
+    const retained = this.sql.exec(`SELECT seq FROM conversation_messages INDEXED BY idx_conversation_messages_conv_seq
+      WHERE conversation_id=? ORDER BY seq LIMIT 129`,conversationId).toArray() as {seq:number}[];
+    if(retained.length>128)throw new ConversationDomainError('conversation_visibility_observation_limited',503,
+      'retained message visibility exceeds the bounded observation', {observation_pending:true});
+    const oldestRetainedSeq=retained.length?Number(retained[0].seq):null;
+    const newestRetainedSeq=retained.length?Number(retained.at(-1)!.seq):null;
     return {
-      oldestRetainedSeq,
-      newestRetainedSeq,
-      prunedThroughSeq,
-      retainedCount,
-      unreadCount: Number(boundsRow?.unread_count ?? 0),
+      oldestRetainedSeq,newestRetainedSeq,
+      prunedThroughSeq:oldestRetainedSeq!==null?Math.max(0,oldestRetainedSeq-1):lastSeq,
+      retainedCount:retained.length,
+      unreadCount:retained.filter(row=>Number(row.seq)>readSeq).length,
     };
   }
 
@@ -3656,6 +3642,13 @@ export class ConversationsService {
 
       const currentReadSeq = Number(member.last_read_seq ?? 0);
       const newReadSeq = Math.max(currentReadSeq, targetSeq);
+      // Verify complete visibility before advancing any read watermark, even
+      // for component callers that do not supply a transaction adapter.
+      const { unreadCount } = this.getRetainedVisibility(
+        conversationId,
+        lastSeq,
+        newReadSeq,
+      );
       let lastReadAt: string | null = member.last_read_at ?? null;
 
       if (newReadSeq > currentReadSeq || !lastReadAt) {
@@ -3669,11 +3662,7 @@ export class ConversationsService {
         );
       }
 
-      const { unreadCount } = this.getRetainedVisibility(
-        conversationId,
-        lastSeq,
-        newReadSeq,
-      );
+
 
       return {
         conversation_id: conversationId,

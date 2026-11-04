@@ -1,3 +1,4 @@
+import { workerChildObservation } from './worker-child-observation';
 import { backfillOnce } from './sql-probes';
 import { WORKER_STATUSES, cleanReportedExit } from './worker-outcome';
 import { insertSessionObservation, observedHubTagMatches, observationModel, observedIntakeCandidates, observationIntakeRevision } from './session-observation';
@@ -2952,12 +2953,13 @@ export class SessionControlService {
           // reserve stays idempotent on its own derived key, so this cannot double-launch.
         }
         if (!prior && worker) {
-          const live: any = this.sql.exec(`SELECT COUNT(*) AS n FROM session_control_sessions WHERE parent_id = ? AND state NOT IN ('exited','stopped','failed','cancelled','dead','forgotten','pruned')`, worker.session_id).toArray()[0];
-          if (live.n >= WORKER_CHILD_CONCURRENT) return response({ error: 'worker_scope_forbidden', detail: 'child_limit', limit: 'concurrent', max: WORKER_CHILD_CONCURRENT }, 429);
-          const perIntake: any = this.sql.exec(`SELECT COUNT(*) AS n FROM session_control_sessions WHERE parent_id IS NOT NULL AND json_extract(CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END,'$.intake_task_id') = ? AND state NOT IN ('exited','stopped','failed','cancelled','dead','forgotten','pruned')`, worker.task_id).toArray()[0];
-          if (perIntake.n >= WORKER_CHILD_PER_INTAKE) return response({ error: 'worker_scope_forbidden', detail: 'child_limit', limit: 'per_intake', max: WORKER_CHILD_PER_INTAKE }, 429);
-          const hourly: any = this.sql.exec('SELECT COUNT(*) AS n FROM session_control_sessions WHERE parent_id = ? AND created_at > ?', worker.session_id, new Date(this.now() - 3600000).toISOString()).toArray()[0];
-          if (hourly.n >= WORKER_CHILD_PER_HOUR) return response({ error: 'worker_scope_forbidden', detail: 'child_limit', limit: 'per_hour', max: WORKER_CHILD_PER_HOUR }, 429);
+          const observed=workerChildObservation(this.sql,worker.session_id,worker.task_id,this.now());
+          for(const [limit,max] of [['concurrent',WORKER_CHILD_CONCURRENT],['per_intake',WORKER_CHILD_PER_INTAKE],['per_hour',WORKER_CHILD_PER_HOUR]] as const) {
+            if(observed[limit].count>=max)return response({error:'worker_scope_forbidden',detail:'child_limit',limit,max},429);
+          }
+          const incomplete=Object.entries(observed).filter(([,value])=>value.limited).map(([limit])=>limit);
+          if(incomplete.length)return response({error:'worker_child_observation_limited',observation_pending:true,limits:incomplete},503);
+
         }
         // No casual engine picker: fresh starts with an explicit engine must
         // carry a non-empty explanation. Replays under an existing key skip

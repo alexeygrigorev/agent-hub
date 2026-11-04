@@ -29,15 +29,42 @@ const TRUSTED_LINK = `e.type='object' AND json_extract(e.value,'$.kind')='link' 
 const linkRows = (id: string, from: string, filter = '1') => ['hub_session_id', 'native_id'].map(field =>
   `SELECT json_extract(e.value,'$.${field}'), ${id}, json_extract(e.value,'$.authority') FROM ${from}
    WHERE ${filter} AND ${TRUSTED_LINK} AND json_type(e.value,'$.${field}')='text'`).join(' UNION ');
+/** A new side table is seeded only from a complete bounded source and a
+ * complete bounded entry set. Preflight precedes CREATE so even component
+ * callers without a transaction cannot retain a false empty partial index. */
+function boundedLinkSeed(sql:SqlStorage,kind:'trusted'|'link'|'all'):any[][] {
+  const ids=sql.exec('SELECT id FROM intake_task_projection ORDER BY id LIMIT 129').toArray() as any[];
+  if(ids.length>128)throw new Error('intake_link_seed_observation_limited');
+  const entries=new Map<string,any[]>();
+  for(const {id} of ids) {
+    const row:any=sql.exec('SELECT links,data FROM intake_task_projection WHERE id=?',id).toArray()[0];
+    if(!row)throw new Error('intake_link_seed_observation_limited');
+    let links:any,task:any;
+    try{links=JSON.parse(row.links);task=JSON.parse(row.data);}catch{throw new Error('intake_link_seed_observation_limited');}
+    if(!Array.isArray(links)||links.length>128)throw new Error('intake_link_seed_observation_limited');
+    if(kind==='trusted'&&(task?.status==null||['done','cancelled'].includes(task.status)))continue;
+    for(const link of links) {
+      if(!link||typeof link!=='object'||Array.isArray(link))continue;
+      if(kind!=='all'&&link.kind!=='link')continue;
+      if(kind==='trusted'&&!['hub_launch_verified','host_census_verified'].includes(link.authority))continue;
+      for(const field of ['hub_session_id','native_id'])if(typeof link[field]==='string') {
+        const entry=kind==='trusted'?[link[field],id,link.authority]:[link[field],id];
+        entries.set(JSON.stringify([link[field],id]),entry);
+        if(entries.size>128)throw new Error('intake_link_seed_observation_limited');
+      }
+    }
+  }
+  return [...entries.values()];
+}
 /** Create the index, backfill it once, and keep it current on every task write.
- * The backfill reads the small link/report projection of open intakes only. */
+ * A missing side table requires complete bounded source/entry preflight;
+ * existing tables never re-enumerate retained projection history. */
 export function initSessionLinks(sql: SqlStorage) {
   const exists = sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='intake_session_links'").toArray().length > 0;
+  const seed=exists?[]:boundedLinkSeed(sql,'trusted');
   sql.exec(SESSION_LINKS_SCHEMA);
   // Upsert, not INSERT OR IGNORE: the firing statement's conflict policy would override OR IGNORE.
-  if (!exists) sql.exec(`INSERT INTO intake_session_links(session_key,task_id,authority)
-    ${linkRows('p.id', 'intake_task_projection p, json_each(p.links) e', "json_extract(p.data,'$.status') NOT IN ('done','cancelled')")}
-    ON CONFLICT DO NOTHING`);
+  for(const entry of seed)sql.exec('INSERT INTO intake_session_links(session_key,task_id,authority) VALUES(?,?,?) ON CONFLICT DO NOTHING',...entry);
   // Driven by the projection's small link/report column, and only when it changes,
   // so ordinary note writes do not rescan the whole history. A malformed links
   // value is skipped, never thrown: readers already fail closed on it. The first release
@@ -47,7 +74,11 @@ export function initSessionLinks(sql: SqlStorage) {
     `CREATE TRIGGER IF NOT EXISTS intake_session_links_projection_${op.split(' ')[0].toLowerCase()} AFTER ${op} ON intake_task_projection ${when} BEGIN
     INSERT INTO intake_session_links(session_key,task_id,authority) ${linkRows('NEW.id', 'json_each(NEW.links) e')}
     ON CONFLICT DO NOTHING; END`);
-  sql.exec('CREATE TRIGGER IF NOT EXISTS intake_session_links_delete AFTER DELETE ON intake_tasks BEGIN DELETE FROM intake_session_links WHERE task_id=OLD.id; END');
+  sql.exec('DROP TRIGGER IF EXISTS intake_session_links_delete');
+  sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_session_links_delete_bounded AFTER DELETE ON intake_tasks BEGIN
+    SELECT CASE WHEN (SELECT COUNT(*) FROM(SELECT 1 FROM intake_session_links LIMIT 129))>128
+      THEN RAISE(ABORT,'intake_link_delete_observation_limited') END;
+    DELETE FROM intake_session_links WHERE task_id=OLD.id; END`);
 }
 
 /** Indexed (ref -> task) side table of every link event's hub_session_id and
@@ -55,13 +86,15 @@ export function initSessionLinks(sql: SqlStorage) {
  * candidate set because the exact link events are re-read from the projection. */
 export function initLinkRefs(sql: SqlStorage) {
   const exists = sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='intake_link_refs'").toArray().length > 0;
+  const seed=exists?[]:boundedLinkSeed(sql,'link');
   sql.exec('CREATE TABLE IF NOT EXISTS intake_link_refs (ref TEXT NOT NULL, task_id TEXT NOT NULL, PRIMARY KEY(ref, task_id)) WITHOUT ROWID');
   const rows = (id: string, from: string) => ['hub_session_id', 'native_id'].map(field =>
     `SELECT json_extract(e.value,'$.${field}'), ${id} FROM ${from} WHERE e.type='object' AND json_extract(e.value,'$.kind')='link' AND json_type(e.value,'$.${field}')='text'`).join(' UNION ');
-  if (!exists) sql.exec(`INSERT INTO intake_link_refs(ref,task_id) ${rows('p.id', 'intake_task_projection p, json_each(p.links) e')} ON CONFLICT DO NOTHING`);
+  for(const entry of seed)sql.exec('INSERT INTO intake_link_refs(ref,task_id) VALUES(?,?) ON CONFLICT DO NOTHING',...entry);
   for (const op of ['INSERT', 'UPDATE']) sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_link_refs_${op.toLowerCase()} AFTER ${op} ON intake_tasks BEGIN
     INSERT INTO intake_link_refs(ref,task_id) ${rows('NEW.id', "json_each(NEW.data,'$.history') e")} ON CONFLICT DO NOTHING; END`);
-  sql.exec('CREATE TRIGGER IF NOT EXISTS intake_link_refs_delete AFTER DELETE ON intake_tasks BEGIN DELETE FROM intake_link_refs WHERE task_id=OLD.id; END');
+  // Stale candidates are safe: worktree readers rehydrate exact current links.
+  sql.exec('DROP TRIGGER IF EXISTS intake_link_refs_delete');
   initProjectionLinkRefs(sql);
 }
 
@@ -73,14 +106,16 @@ export function initLinkRefs(sql: SqlStorage) {
  * and callers re-check the exact link entries. */
 export function initProjectionLinkRefs(sql: SqlStorage) {
   const exists = sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='intake_projection_link_refs'").toArray().length > 0;
+  const seed=exists?[]:boundedLinkSeed(sql,'all');
   sql.exec('CREATE TABLE IF NOT EXISTS intake_projection_link_refs (ref TEXT NOT NULL, task_id TEXT NOT NULL, PRIMARY KEY(ref, task_id)) WITHOUT ROWID');
   const rows = (id: string, from: string) => ['hub_session_id', 'native_id'].map(field =>
     `SELECT json_extract(e.value,'$.${field}'), ${id} FROM ${from} WHERE e.type='object' AND json_type(e.value,'$.${field}')='text'`).join(' UNION ');
-  if (!exists) sql.exec(`INSERT INTO intake_projection_link_refs(ref,task_id) ${rows('p.id', 'intake_task_projection p, json_each(p.links) e')} ON CONFLICT DO NOTHING`);
+  for(const entry of seed)sql.exec('INSERT INTO intake_projection_link_refs(ref,task_id) VALUES(?,?) ON CONFLICT DO NOTHING',...entry);
   for (const [op, when] of [['INSERT', 'WHEN json_valid(NEW.links)'], ['UPDATE OF links', 'WHEN NEW.links IS NOT OLD.links AND json_valid(NEW.links)']]) sql.exec(
     `CREATE TRIGGER IF NOT EXISTS intake_projection_link_refs_${op.split(' ')[0].toLowerCase()} AFTER ${op} ON intake_task_projection ${when} BEGIN
     INSERT INTO intake_projection_link_refs(ref,task_id) ${rows('NEW.id', 'json_each(NEW.links) e')} ON CONFLICT DO NOTHING; END`);
-  sql.exec('CREATE TRIGGER IF NOT EXISTS intake_projection_link_refs_delete AFTER DELETE ON intake_task_projection BEGIN DELETE FROM intake_projection_link_refs WHERE task_id=OLD.id; END');
+  // Deletion never scans retained references by an unindexed task_id.
+  sql.exec('DROP TRIGGER IF EXISTS intake_projection_link_refs_delete');
 }
 
 export function workerAccessContext(sql: SqlStorage, tokenId: string | undefined, now = Date.now(), allowExpiredAccess = false): any | null {
