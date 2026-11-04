@@ -1,0 +1,13 @@
+# Hub shared AWS config (intake 0043dadb).
+#
+# Synced by the Hub installer/updater path to the Hub-owned file
+# <agent-hub config dir>/shared/aws/config on every host. Non-secret by
+# design: no static keys, ever. The {aws_gate_credential_process} placeholder
+# is substituted per host from the host's aws_gate_credential_process setting
+# (e.g. "python3 <path>/install_aws_gate.py credential-process --env <path>").
+# A host without that setting skips this folder instead of installing a
+# default profile that cannot authenticate.
+
+[profile default]
+region = eu-west-1
+credential_process = {aws_gate_credential_process}

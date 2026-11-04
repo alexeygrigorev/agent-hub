@@ -1,4 +1,5 @@
 import {WorkerCredentials,WORKER_CREDENTIAL_SCHEMA} from './worker-credentials';
+import {SharedCredentials,SHARED_CREDENTIAL_MIGRATIONS,SHARED_CREDENTIAL_SCHEMA} from './shared-credentials';
 import {ControlAuth,CONTROL_AUTH_SCHEMA} from './control-auth';
 import {verifyKnownCredential} from './auth';
 import { MeteredDb, initializeSchema } from './db';
@@ -49,6 +50,7 @@ const SCHEMA = [
     alias TEXT PRIMARY KEY, canonical_name TEXT NOT NULL REFERENCES repos(canonical_name)
   )`,
   'CREATE INDEX repo_aliases_owner_alias ON repo_aliases(canonical_name, alias)',
+  ...SHARED_CREDENTIAL_SCHEMA,
 ];
 
 type PairingRow = { id: string; machine_id: string; alias: string; code_hash: string; scopes_json: string; expires_at: number; used_at: number | null };
@@ -59,12 +61,14 @@ export class ControlDO {
   private readonly db: MeteredDb;
   private readonly auth:ControlAuth;
   private readonly workers:WorkerCredentials;
+  private readonly shared:SharedCredentials;
   private readonly ready:Promise<void>;
 
   constructor(private readonly ctx: DurableObjectState, private readonly env: Hub2Env) {
     this.db = new MeteredDb(ctx.storage.sql);
-    this.ready=initializeSchema(ctx, this.db, 1, SCHEMA,[],()=>this.scheduleWake());
+    this.ready=initializeSchema(ctx, this.db, 2, SCHEMA,SHARED_CREDENTIAL_MIGRATIONS,()=>this.scheduleWake());
     this.auth=new ControlAuth(ctx,this.db,env);this.workers=new WorkerCredentials(ctx,this.db,env);
+    this.shared=new SharedCredentials(ctx,this.db,env);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -72,6 +76,7 @@ export class ControlDO {
     try {
       await this.ready;
       const workerResponse=await this.workers.fetch(request);if(workerResponse)return workerResponse;
+      const sharedResponse=await this.shared.fetch(request);if(sharedResponse)return sharedResponse;
       const authResponse=await this.auth.fetch(request);if(authResponse)return authResponse;
       if (url.pathname === '/_actors/register' && request.method === 'POST') return await this.registerActor(request);
       if(url.pathname==='/api/model-policy'||url.pathname==='/_routing-policy')return await this.modelPolicy(request);
