@@ -428,7 +428,11 @@ export class ResourceManagement {
         WHERE machine_id=? ${lower!==null?`AND phase>'${lower}'`:''} ${upper!==null?`AND phase<'${upper}'`:''}
         ORDER BY phase,rowid LIMIT 129)`;
     });
-    const raw=this.readRows('SELECT session_key FROM ('+arms.join(' UNION ALL ')+') LIMIT 129',...arms.map(()=>machine));
+    // Cloudflare caps each compound SELECT at five terms. Keep the seven
+    // disjoint ranges in4+3groups, each independently bounded, then combine
+    // just two groups under the same global sentinel.
+    const groups=[arms.slice(0,4),arms.slice(4)].map(group=>'SELECT session_key FROM ('+group.join(' UNION ALL ')+') LIMIT 129');
+    const raw=this.readRows('SELECT session_key FROM ('+groups.map(group=>'SELECT session_key FROM ('+group+')').join(' UNION ALL ')+') LIMIT 129',...arms.map(()=>machine));
     if(raw.length>128)return null;
     const keys=new Set(raw.map(row=>String(row.session_key)));
     let scanned=raw.length;

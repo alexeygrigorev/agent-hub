@@ -864,6 +864,8 @@ export class FleetService {
   }
 
   private reconciliationNativeFacts=new Map<string,{stamp:string;rows:any[]}>();
+  private reconciliationBindingFacts=new Map<string,{stamp:string;rows:Map<string,any>;bytes:number}>();
+  private reconciliationBindingBytes=0;
 
   private reconciliationCandidatesUncached(machine: string, catalogFresh: boolean) {
     // Intake 0b87eb29: a claim Hub abandoned on the silent-start bound has no
@@ -918,11 +920,33 @@ export class FleetService {
     }).map(row=>String(row.id)));
     const selected=raw.filter(row=>!observed.has(String(row.id)))
       .sort((a,b)=>String(a.updated_at).localeCompare(String(b.updated_at))).slice(0,100);
-    const bindings = controlStore && selected.length ? new Map(this.sql.exec(`SELECT requested.value AS id,
+    // Binding enrichment is a source fact too: preload the whole bounded
+    // raw cohort, including natives not currently eligible for recovery.
+    // Otherwise a clock-only freshness transition issues new binding reads.
+    const bindingIds=JSON.stringify(raw.map(row=>String(row.id)));
+    const bindingKey=JSON.stringify([machine,bindingIds]);
+    const bindingStamp=this.writes?.stamp('session_control_sessions');
+    const bindingHit=bindingStamp!==undefined?this.reconciliationBindingFacts.get(bindingKey):undefined;
+    const bindings=bindingHit && bindingHit.stamp===bindingStamp?bindingHit.rows:controlStore && raw.length?new Map(this.sql.exec(`SELECT requested.value AS id,
       (SELECT binding_json FROM session_control_sessions INDEXED BY session_control_fleet_lookup
         WHERE fleet_launch_id=requested.value AND machine_id=? LIMIT 1) AS binding_json
-      FROM json_each(?) requested`,machine,JSON.stringify(selected.map(row=>String(row.id)))).toArray()
-      .map((row:any)=>[String(row.id),row.binding_json] as const)) : new Map<string,any>();
+      FROM json_each(?) requested`,machine,bindingIds).toArray()
+      .map((row:any)=>[String(row.id),row.binding_json] as const)):new Map<string,any>();
+    if(bindingStamp!==undefined && (!bindingHit || bindingHit.stamp!==bindingStamp)) {
+      if(bindingHit){this.reconciliationBindingFacts.delete(bindingKey);this.reconciliationBindingBytes-=bindingHit.bytes;}
+      // Legacy bindings have no small stored-value guarantee. Count UTF-16
+      // bytes conservatively and return oversized facts without retaining or
+      // truncating them; a single cohort is never allowed to pin DO memory.
+      let bytes=bindingKey.length*2;
+      for(const [id,value] of bindings)bytes+=128+2*id.length+(typeof value==='string'?2*value.length:value instanceof ArrayBuffer?value.byteLength:8);
+      if(bytes<=256*1024) {
+        if(this.reconciliationBindingFacts.size>=16 || this.reconciliationBindingBytes+bytes>2*1024*1024) {
+          this.reconciliationBindingFacts.clear();this.reconciliationBindingBytes=0;
+        }
+        this.reconciliationBindingFacts.set(bindingKey,{stamp:bindingStamp,rows:bindings,bytes});
+        this.reconciliationBindingBytes+=bytes;
+      }
+    }
     return selected.map(row => ({id:row.id,workspace:row.workspace,cwd:parsed(row.request_json).cwd??null,
       diagnostic:parsed(row.launch_error_json),native_id:row.native_id,engine:row.engine,mode:row.mode,
       launcher_task_id:row.launcher_task_id,binding:bindings.get(String(row.id))==null?null:parsed(bindings.get(String(row.id)))}));

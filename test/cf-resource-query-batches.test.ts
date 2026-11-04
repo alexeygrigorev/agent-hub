@@ -14,12 +14,13 @@ function launch(seed:any,id:string,state:string,at:string,native:string|null=nul
 function control(seed:any,id:string,state:string,at:string,native:string){seed.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at)
  VALUES(?,'fixture',?,'{}','host','codex','headless',?,?,?,?)`,id,id,state,JSON.stringify({native_id:native,workspace:'/repo'}),at,at);}
 describe('shared bounded resource observations',()=>{
- it('batches disjoint phase and active-state sources without losing unknown phases or raw sentinels',()=>fixture(({h,r,seed,at,queries}:any)=>{
+ it('batches disjoint phase ranges within Cloudflare compound limits without losing unknown phases or raw sentinels',()=>fixture(({h,r,seed,at,queries}:any)=>{
   for(let i=0;i<2100;i++){
    seed.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace) VALUES('host',?,'old','exited',?,'/repo')",'old-'+i,at);
    launch(seed,'old-launch-'+i,'stopped',at,'old-'+i);control(seed,'old-control-'+i,'stopped',at,'old-'+i);
   }
-  for(const [i,phase]of ['custom_busy','paused','running','zz_future'].entries())seed.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace) VALUES('host',?,'active',?,?,'/repo')",'native-'+i,phase,at);
+  for(const [i,phase]of ['','paused','running','zz_future'].entries())seed.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace) VALUES('host',?,'active',?,?,'/repo')",'native-'+i,phase,at);
+  for(const phase of ['dead','exited','failed','finished','refused','stopped'])seed.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace) VALUES('host',?,'terminal',?,?,'/repo')",'terminal-'+phase,phase,at);
   for(const [i,state]of ['offered','starting','running','uncertain'].entries())launch(seed,'live-'+i,state,at,i===0?'native-0':null);
   for(const [i,state]of ['queued','held','offered','starting','running','uncertain'].entries())control(seed,'control-'+i,state,at,'native-'+i%4);
   const count=h.meter.runSync('physical',()=>r.hostSessionCount('host'));

@@ -27,7 +27,7 @@ function routeWork(before: any, after: any, method: string, path: string) {
   const scope = `route:${normalizeRoute(method, new URL(path, 'https://hub.test').pathname)}`;
   const start = before[scope] ?? { calls: 0, rows_read: 0, rows_written: 0, max_read: 0 };
   const end = after[scope] ?? { calls: 0, rows_read: 0, rows_written: 0, max_read: 0 };
-  return { calls: end.calls - start.calls, rows_read: end.rows_read - start.rows_read };
+  return { calls: end.calls - start.calls, rows_read: end.rows_read - start.rows_read, rows_written: end.rows_written - start.rows_written };
 }
 it('bounds status and host query work with retained production-scale history', async () => {
   const stub = (env as any).HUB.get((env as any).HUB.idFromName('hub'));

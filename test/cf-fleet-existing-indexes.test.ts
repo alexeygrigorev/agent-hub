@@ -76,6 +76,23 @@ describe('Fleet recovery and paging use deployed indexes',()=>{
     expect(read(false)).toHaveLength(100);
     expect(m.queries.some(q=>q.includes('CROSS JOIN fleet_sessions n'))).toBe(false);
     expect(m.rows()).toBe(0);
+    seed.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,fleet_launch_id,machine_id,engine,mode,state,binding_json,created_at,updated_at)
+      VALUES('reconciliation-binding','fixture','reconciliation-binding','{}','failed-0','host','codex','headless','running',?,?,?)`,
+      JSON.stringify({native_id:'bound-native'}),AT,AT);
+    expect(read(false).find((row:any)=>row.id==='failed-0').binding).toEqual({native_id:'bound-native'});
+    expect(()=>hub.ctx.storage.transactionSync(()=>{
+      seed.exec("UPDATE session_control_sessions SET binding_json=? WHERE id='reconciliation-binding'",JSON.stringify({native_id:'rolled-back'}));
+      expect(read(false).find((row:any)=>row.id==='failed-0').binding).toEqual({native_id:'rolled-back'});
+      throw new Error('binding rollback');
+    })).toThrow('binding rollback');
+    expect(read(false).find((row:any)=>row.id==='failed-0').binding).toEqual({native_id:'bound-native'});
+    read(false);expect(m.rows()).toBe(0);
+    seed.exec("UPDATE session_control_sessions SET binding_json=? WHERE id='reconciliation-binding'",JSON.stringify({native_id:'bound-native',legacy_payload:'x'.repeat(140000)}));
+    expect(read(false).find((row:any)=>row.id==='failed-0').binding.legacy_payload).toHaveLength(140000);
+    read(false);
+    // Oversized legacy facts stay complete in the result but are not pinned
+    // in the persistent in-memory source cache.
+    expect(m.queries.some(q=>q.includes('SELECT binding_json FROM session_control_sessions'))).toBe(true);
     expect(hub.rowBudget.status()).toMatchObject({day,limit_total:20000,stopped:false});
   }));
 
