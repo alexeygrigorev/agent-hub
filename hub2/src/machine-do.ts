@@ -757,7 +757,7 @@ export class MachineDO {
 
   private machineView(): Response {
     const machine=this.db.one<MachineRow>('SELECT * FROM machines LIMIT 1');
-    const sessions=machine?this.db.all("SELECT id,state,project_id,intake_id,native_id,updated_at FROM sessions WHERE machine_id=? AND state IN ('staged','offered','claimed','running') LIMIT 101",machine.machine_id):[];
+    const sessions=machine?this.db.all("SELECT id,machine_id,state,project_id,intake_id,native_id,updated_at FROM sessions WHERE machine_id=? AND state IN ('staged','offered','claimed','running') LIMIT 101",machine.machine_id):[];
     return json({machine:machine?{id:machine.machine_id,alias:machine.alias,os:machine.os,arch:machine.arch,
       labels:this.parse(machine.labels_json),last_seen:machine.last_seen,connected:this.ctx.getWebSockets(`hub2:${machine.machine_id}`).length>0}:null,
       sessions,attention:this.db.all('SELECT * FROM attention ORDER BY observed_at DESC,session_id LIMIT 20'),
@@ -770,18 +770,25 @@ export class MachineDO {
     const query=new URL(request.url).searchParams,after=query.get('after')||'',limit=Number(query.get('limit')||25);
     if (!Number.isInteger(limit)||limit<1||limit>100||after.length>120) return error('invalid_page',400);
     const rows=this.db.all<SessionRow>('SELECT * FROM sessions WHERE id>? ORDER BY id LIMIT ?',after,limit+1);
-    return json({items:rows.slice(0,limit).map(row=>this.sessionView(row)),next:rows.length>limit?rows[limit-1].id:null});
+    const alias=this.machineAlias();
+    return json({items:rows.slice(0,limit).map(row=>this.sessionView(row,alias)),next:rows.length>limit?rows[limit-1].id:null});
   }
 
   private sessionDetail(request: Request, id: string): Response {
     const actor=actorFrom(request),row=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',id);
     if (!row || (!hasScope(actor,'operator:admin') && !(hasScope(actor,'session:read') && [row.id,row.project_id].includes(actor?.resource_id||'')))) return error('session_not_found',404);
-    return json({session:this.sessionView(row)});
+    return json({session:this.sessionView(row,this.machineAlias())});
   }
 
-  private sessionView(row: SessionRow): JsonRecord {
+  /** Machine label for 0992f366: list and show agree on machine_id plus the alias. */
+  private machineAlias(): string | null {
+    return this.db.one<{ alias: string }>('SELECT alias FROM machines LIMIT 1')?.alias ?? null;
+  }
+
+  private sessionView(row: SessionRow, machineAlias: string | null = null): JsonRecord {
     const launch=this.parse(row.launch_json) as JsonRecord;
     return {id:row.id,state:row.state,intake_id:row.intake_id,project_id:row.project_id,machine_id:row.machine_id,
+      machine:machineAlias ?? row.machine_id,
       epoch:row.epoch,operation_id:row.operation_id,native_id:row.native_id,engine:launch.engine,model:launch.model,
       interactive:launch.interactive,evidence:this.parse(row.evidence_json),attention:this.db.one('SELECT reason,observed_at FROM attention WHERE session_id=?',row.id)||null};
   }

@@ -12,6 +12,7 @@
     "test:read-cache": "node --experimental-transform-types tests/run-read-cache.mjs",
     "test:db-metering": "node --experimental-transform-types tests/run-db-metering.mjs",
     "test:control": "node --experimental-transform-types tests/run-control-grants-directory.mjs",
+    "test:cli-compat": "node --experimental-transform-types tests/run-cli-compat.mjs",
     "test:accounts-mail-workerd": "node tests/run-accounts-mail-workerd.mjs",
     "test:core-workerd": "node tests/run-core-integration-workerd.mjs",
     "test:normal-day-auth": "node tests/run-normal-day-auth-workerd.mjs",

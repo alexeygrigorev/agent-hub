@@ -636,7 +636,7 @@ def _list_all_once(params):
             page_params['after'] = after
             if first.get('authorization_valid_until') is not None:
                 page_params['authorization_valid_until'] = first['authorization_valid_until']
-            if token is None:
+            if token is None and first.get('snapshot_version') is not None:
                 # Tokenless fallback: the classic revision-pinned page walk.
                 page_params['revision'] = first['snapshot_version']
         if 'limit' not in page_params:
@@ -649,6 +649,11 @@ def _list_all_once(params):
         if first is None:
             first = page
             token = page.get('list_token')
+            if token is None and page.get('snapshot_version') is None:
+                # Hub2 keyset listing: the opaque `next` token is a stable
+                # (updated_at,id) position, so pages survive create/close
+                # churn without a pinned snapshot or expiry restart.
+                return _keyset_all_once(params, page, reduced)
         elif token is None and (page['snapshot_version'] != first['snapshot_version'] or
                                 page.get('authorization_valid_until') != first.get('authorization_valid_until') or
                                 page['total'] != first['total']):
@@ -670,6 +675,35 @@ def _list_all_once(params):
             raise IntakeInputError('Invalid snapshot cursor; retry the command')
         cursors.add(after)
     raise IntakeInputError('Snapshot page bound exceeded')
+
+
+def _keyset_all_once(params, first, reduced=False):
+    """`--all` against a Hub2 keyset listing: follow `next` cursor pages via
+    `after` until exhausted; bounded like the snapshot walk (10001 pages)."""
+    items, seen = [], set()
+    page = first
+    cursors = set()
+    while True:
+        for task in page.get('items', []):
+            if task['id'] in seen:
+                raise IntakeInputError('Duplicate listing item; retry the command')
+            seen.add(task['id'])
+            items.append(task)
+        after = page.get('next')
+        if not after:
+            result = dict(first, items=items, next=None, total=len(items), keyset_walk=True)
+            if reduced:
+                result.update(page_size_reduced=True)
+            return result
+        if after in cursors:
+            raise IntakeInputError('Invalid listing cursor; retry the command')
+        cursors.add(after)
+        page_params = dict(params, after=after, limit=min(max(params.get('limit', 100), 1), 100))
+        page = _request_page(page_params, params)
+        if not page.get('items'):
+            # A keyset page always carries items when `next` is set; an empty
+            # one means the cursor is stale beyond repair.
+            raise IntakeInputError('Invalid listing page; retry the command')
 
 
 def execute(args):
@@ -938,6 +972,8 @@ def summary_main():
         args.project = project
     args.cmd, args.intake_cmd = 'intake', 'summary'
     try:
+        from .msg_cli import apply_session_credential
+        apply_session_credential()
         print(json.dumps(execute(args), ensure_ascii=True))
     except Exception as exc:
         print(diagnostic(exc), file=sys.stderr)

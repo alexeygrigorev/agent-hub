@@ -55,7 +55,10 @@ def exit_code_for(exc: BaseException) -> int:
     match = HTTP_STATUS.search(text)
     if match:
         status = int(match.group(1))
-        if 'unknown_recipient' in text or 'ambiguous_recipient' in text:
+        # Old-hub slugs (unknown_recipient/ambiguous_recipient) and the Hub2
+        # slugs (recipient_unknown/ambiguous_prefix) both mean exit 3.
+        if any(slug in text for slug in ('unknown_recipient', 'recipient_unknown',
+                                         'ambiguous_recipient', 'ambiguous_prefix')):
             return 3
         if status >= 500:
             return 4
@@ -84,6 +87,28 @@ def profile_path(name: str) -> Path:
             os.environ['HUB_CONFIG_FILE'] = saved
 
 
+def apply_session_credential() -> str | None:
+    """Point HUB_CONFIG_FILE at this session's own provisioned credential
+    (intake 166af2de AC1): inside a Hub-launched session the bound host writes
+    ``<workspace>/.local/hub-session-auth/<native_id>.json``; commands run
+    without an operator-selected config adopt it. No-op otherwise. Never
+    prints the token."""
+    if os.environ.get('HUB_CONFIG_FILE'):
+        return None
+    session_id = os.environ.get('APLEXER_SESSION_ID')
+    workspace = os.environ.get('APLEXER_WORKSPACE')
+    if not session_id or not workspace:
+        return None
+    native = session_id.strip().lower()
+    if not re.fullmatch(r'[0-9a-f-]{36}', native):
+        return None
+    candidate = session_auth_dir(workspace) / (native + '.json')
+    if not candidate.is_file():
+        return None
+    os.environ['HUB_CONFIG_FILE'] = str(candidate)
+    return str(candidate)
+
+
 def resolve_identity(profile: str | None) -> tuple[str | None, str]:
     """Select the credential file (via HUB_CONFIG_FILE) and return (actor, source)."""
     path = None
@@ -92,12 +117,8 @@ def resolve_identity(profile: str | None) -> tuple[str | None, str]:
         path, source = profile_path(profile), 'profile:' + profile
         if not path.is_file():
             raise MsgError('No such profile; ask an operator for `hub agents create`')
-    elif os.environ.get('APLEXER_SESSION_ID') and os.environ.get('APLEXER_WORKSPACE') and not os.environ.get('HUB_CONFIG_FILE'):
-        native = os.environ['APLEXER_SESSION_ID'].strip().lower()
-        if re.fullmatch(r'[0-9a-f-]{36}', native):
-            candidate = session_auth_dir(os.environ['APLEXER_WORKSPACE']) / (native + '.json')
-            if candidate.is_file():
-                path, source = candidate, 'session'
+    elif apply_session_credential() is not None:
+        path, source = os.environ['HUB_CONFIG_FILE'], 'session'
     if path is None:
         return None, source
     os.environ['HUB_CONFIG_FILE'] = str(path)
@@ -325,8 +346,12 @@ def execute(args):
 
 
 def inbox(args, actor: str | None):
-    """Shared inbox path for `hub msg inbox` and `hub inbox` (§11): one long-
-    polled request, then an optional batch mark-read of what was returned."""
+    """Shared inbox path for `hub msg inbox` and `hub inbox` (§11).
+
+    The Hub2 inbox API has no server-side long poll, so --wait is a bounded
+    client-side loop (max 60 s, one request every two seconds) that stops at
+    the first non-empty page; the command still ends within the wait budget.
+    """
     who = getattr(args, 'actor', None) or actor
     if not who:
         raise MsgError('Pass --actor for this profile')
@@ -340,13 +365,23 @@ def inbox(args, actor: str | None):
         params.append('cursor=' + quote(args.cursor, safe=''))
     limit = getattr(args, 'limit', None)
     if limit is not None:
-        # The server clamps 1..100; mirror that instead of refusing.
-        limit = max(1, min(int(limit), 100))
+        # The Hub2 server clamps 1..50; older hubs clamped 1..100.
+        limit = max(1, min(int(limit), 50))
         params.append('limit=' + str(limit))
-    if wait:
-        params.append('wait=' + str(wait))
-    rows = _request('GET', '/api/bus/inbox?' + '&'.join(params))
-    rows = rows if isinstance(rows, list) else rows.get('messages', [])
+    if who.startswith('agent:') and who != actor:
+        # Delegated inbox: the human credential must act as the named agent.
+        params.append('as=' + quote(who, safe=''))
+
+    def _fetch():
+        rows = _request('GET', '/api/bus/inbox?' + '&'.join(params))
+        return rows if isinstance(rows, list) else rows.get('messages', [])
+
+    deadline = time.monotonic() + wait
+    while True:
+        rows = _fetch()
+        if rows or wait <= 0 or time.monotonic() >= deadline:
+            break
+        time.sleep(min(2.0, max(0.0, deadline - time.monotonic())))
     result = {'actor': who, 'messages': rows}
     if getattr(args, 'mark_read', False) and rows:
         result['marked_read'] = _request('POST', '/api/bus/messages/read', {'ids': [r['id'] for r in rows]})

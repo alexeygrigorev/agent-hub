@@ -1,7 +1,7 @@
 import { mcp } from './mcp';
 import { publicAuthentication, cookieActor } from './auth';
 import { safeEqual } from './crypto';
-import { boundedText, error, HttpError, json } from './http';
+import { bodyObject, boundedText, error, HttpError, json } from './http';
 import type { Actor, Hub2Env, JsonRecord } from './types';
 
 const CONTROL = 'https://control.hub2.internal';
@@ -36,6 +36,11 @@ export default {
       if (!actor) return error('unauthorized', 401);
 
       if (path === '/mcp') return mcp(request, env, (r, e) => this.fetch(r, e), actor);
+      if (
+        path.startsWith('/api/bus/') ||
+        /^\/api\/agents\/named\/[^/]+(?:\/(?:create|credential|delegate|delegates|forward))?$/.test(path)
+      )
+        return busCompat(request, env, actor, (r) => this.fetch(r, env));
       const control = env.CONTROL.get(env.CONTROL.idFromName('global'));
       if (
         path === '/api/model-policy' ||
@@ -80,7 +85,7 @@ export default {
 
       if (path === '/api/enrollments/pair' && request.method === 'POST')
         return control.fetch(await forwardRequest(request, `${CONTROL}${path}`, actor));
-      if (path === '/api/repos' || /^\/api\/repos\/[^/]+$/.test(path))
+      if (path === '/api/repos' || /^\/api\/repos\/[^/]{1,240}(?:\/[^/]{1,240})?$/.test(path))
         return control.fetch(
           await forwardRequest(
             request,
@@ -97,9 +102,23 @@ export default {
         path === '/api/intakes' ||
         /^\/api\/intakes\/[^/]+(?:\/(?:start|history|append))?$/.test(path) ||
         path === '/api/intake/tasks' ||
-        /^\/api\/intake\/tasks\/[^/]+(?:\/(?:start|history|append))?$/.test(path);
+        /^\/api\/intake\/tasks\/[^/]+(?:\/(?:start|history|append|events))?$/.test(path);
       if (projectPath) {
         const url = requestUrl(request);
+        if (url.pathname.endsWith('/events')) {
+          // Old CLI append: /tasks/:id/events {key, expected_version, note|event}
+          // maps onto the key-fenced scoped append {key, note|evidence}.
+          const legacy = (await bodyObject(request, 16_384)) as JsonRecord;
+          const mapped: JsonRecord = { key: legacy.key };
+          if (typeof legacy.note === 'string') mapped.note = legacy.note;
+          else if (legacy.note && typeof legacy.note === 'object' && !Array.isArray(legacy.note)) mapped.evidence = legacy.note;
+          else if (legacy.event && typeof legacy.event === 'object' && !Array.isArray(legacy.event)) mapped.evidence = legacy.event;
+          else return error('invalid_append', 400);
+          const headers = new Headers(request.headers);
+          headers.delete('Content-Length');
+          url.pathname = url.pathname.replace(/\/events$/, '/append');
+          request = new Request(url, { method: request.method, headers, body: JSON.stringify(mapped) });
+        }
         let requested = url.searchParams.get('project');
         const intakeId = path.match(/^\/api\/(?:intakes|intake\/tasks)\/([^/]+)/)?.[1];
         if (!requested && intakeId) {
@@ -449,6 +468,215 @@ async function forwardRequest(
 
 function admin(actor: Actor): boolean {
   return actor.scopes.includes('*') || actor.scopes.includes('operator:admin');
+}
+
+// ---------------------------------------------------------------------------
+// Legacy /api/bus and /api/agents CLI compatibility (architecture contract:
+// old clients keep their handlers; unsupported options refuse explicitly).
+// ---------------------------------------------------------------------------
+type Invoke = (request: Request) => Promise<Response>;
+
+const CONTROL_ACTOR = { id: 'service:compat', kind: 'operator' as const, scopes: ['routing:read'] };
+
+async function busCompat(request: Request, env: Hub2Env, actor: Actor, invoke: Invoke): Promise<Response> {
+  try {
+    const url = requestUrl(request);
+    const path = url.pathname;
+    const agentsMatch = path.match(/^\/api\/agents\/named\/([^/]+)(?:\/(create|credential|delegate|delegates|forward))?$/);
+    if (agentsMatch) return await agentsCompat(request, env, actor, decodeURIComponent(agentsMatch[1]), agentsMatch[2]);
+    const messageMatch = path.match(/^\/api\/bus\/messages\/([^/]+)(?:\/(read|ack|accept|complete|status|readdress))?$/);
+    if (request.method === 'POST' && path === '/api/bus/messages/read') return await batchRead(request, actor, invoke);
+    if (request.method === 'POST' && (path === '/api/bus/send' || path === '/api/bus/reply'))
+      return await busSend(request, actor, invoke, path === '/api/bus/reply');
+    if (request.method === 'GET' && path === '/api/bus/inbox') return await busInbox(request, actor, invoke);
+    if (messageMatch) {
+      const id = encodeURIComponent(decodeURIComponent(messageMatch[1]));
+      const suffix = messageMatch[2] ? '/' + messageMatch[2] : '';
+      if (!suffix || suffix === '/status') {
+        const response = await invoke(new Request(new URL('/api/messages/' + id + suffix, url.origin), { headers: request.headers }));
+        if (!response.ok) return response;
+        return withActorAliases(response, await response.json());
+      }
+      if (suffix === '/readdress') return await busReaddress(request, actor, invoke, id, url.origin);
+      const body = (await bodyObject(request, 4096)) as JsonRecord;
+      const epoch = body.epoch ?? body.lease_epoch;
+      if (!Number.isSafeInteger(epoch)) return error('epoch_required', 400);
+      return await invoke(
+        new Request(new URL('/api/messages/' + id + suffix, url.origin), {
+          method: 'POST',
+          headers: request.headers,
+          body: JSON.stringify({ epoch }),
+        }),
+      );
+    }
+    return error('not_found', 404);
+  } catch (caught) {
+    if (caught instanceof HttpError) return error(caught.code, caught.status);
+    return error('compat_failed', 500);
+  }
+}
+
+function unsupported(option: string): Response {
+  return error('unsupported_message_option', 400, option);
+}
+
+function withActorAliases(response: Response, message: JsonRecord): Response {
+  if (!message || typeof message !== 'object') return response;
+  const inner = (message.message ?? {}) as JsonRecord;
+  const out = { ...message, message: { ...inner, from_actor: inner.sender, to_actor: inner.recipient } };
+  return json(out, response.status);
+}
+
+async function busSend(request: Request, actor: Actor, invoke: Invoke, reply: boolean): Promise<Response> {
+  const body = (await bodyObject(request, BODY_LIMIT)) as JsonRecord;
+  if (body.kind !== undefined && body.kind !== 'note') return unsupported('kind');
+  if (body.delivery !== undefined && body.delivery !== 'inbox') return unsupported('delivery');
+  for (const option of ['thread_id', 'ref', 'deliver_by_s', 'lease_epoch'])
+    if (body[option] !== undefined) return unsupported(option);
+  let as = typeof body.as === 'string' ? body.as : undefined;
+  if (typeof body.from_actor === 'string' && body.from_actor !== actor.id) {
+    if (reply || !body.from_actor.startsWith('agent:') || (as && as !== body.from_actor))
+      return error('sender_not_authorized', 403);
+    as = body.from_actor;
+  }
+  if (as && !as.startsWith('agent:')) return error('sender_not_authorized', 403);
+  const headers = new Headers(request.headers);
+  headers.set('Content-Type', 'application/json');
+  let recipient = typeof body.to_actor === 'string' ? body.to_actor : typeof body.to === 'string' ? body.to : undefined;
+  let parentSender: string | undefined;
+  if (typeof body.reply_to === 'string' && body.reply_to) {
+    const parentUrl = new URL('/api/messages/' + encodeURIComponent(body.reply_to), requestUrl(request).origin);
+    if (as) parentUrl.searchParams.set('as', as);
+    const parentResponse = await invoke(new Request(parentUrl, { headers }));
+    if (!parentResponse.ok) return parentResponse;
+    const parent = ((await parentResponse.json()) as { message: JsonRecord }).message;
+    parentSender = String(parent.sender);
+    if (!recipient) recipient = parent.sender === (as || actor.id) ? String(parent.recipient) : String(parent.sender);
+  }  if (!recipient) return error('invalid_recipient', 400);
+  const canonical: JsonRecord = {
+    recipient,
+    body: body.body,
+    key: body.idempotency_key ?? body.key,
+    ...(body.reply_to ? { reply_to: body.reply_to, parent_sender: parentSender } : {}),
+  };
+  const target = new URL('/api/messages', requestUrl(request).origin);
+  if (as) target.searchParams.set('as', as);
+  return invoke(new Request(target, { method: 'POST', headers, body: JSON.stringify(canonical) }));
+}
+
+async function busInbox(request: Request, actor: Actor, invoke: Invoke): Promise<Response> {
+  const source = requestUrl(request).searchParams;
+  const target = new URL('/api/messages', requestUrl(request).origin);
+  const mailbox = source.get('actor') || actor.id;
+  if (mailbox !== actor.id && mailbox.startsWith('agent:')) target.searchParams.set('as', mailbox);
+  target.searchParams.set('mailbox', mailbox);
+  if (source.get('unread') === '1' || source.get('unread') === 'true') target.searchParams.set('state', 'received');
+  for (const key of ['thread', 'cursor', 'limit'])
+    if (source.get(key) !== null) target.searchParams.set(key, source.get(key)!);
+  const response = await invoke(new Request(target, { headers: request.headers }));
+  if (!response.ok) return response;
+  const data = (await response.json()) as JsonRecord & { items?: JsonRecord[] };
+  // `wait` long-polling stays a bounded CLI-side loop; the server never parks.
+  return json({ ...data, actor: mailbox, messages: (data.items || []).map((m) => ({ ...m, from_actor: m.sender, to_actor: m.recipient })) }, 200);
+}
+
+async function busReaddress(request: Request, actor: Actor, invoke: Invoke, id: string, origin: string): Promise<Response> {
+  const body = (await bodyObject(request, 4096)) as JsonRecord;
+  const target = typeof body.to === 'string' ? body.to : typeof body.recipient === 'string' ? body.recipient : undefined;
+  if (!target) return error('invalid_recipient', 400);
+  const showUrl = new URL('/api/messages/' + id, origin);
+  if (requestUrl(request).searchParams.get('as')) showUrl.searchParams.set('as', requestUrl(request).searchParams.get('as')!);
+  const shown = await invoke(new Request(showUrl, { headers: request.headers }));
+  if (!shown.ok) return shown;
+  const epoch = ((await shown.json()) as { message: { epoch: number } }).message.epoch;
+  const headers = new Headers(request.headers);
+  headers.set('Content-Type', 'application/json');
+  // Deterministic operation key: a retried readdress returns its prior receipt.
+  return invoke(
+    new Request(new URL('/api/messages/' + id + '/readdress', origin), {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ recipient: target, key: 'readdress:' + decodeURIComponent(id), epoch }),
+    }),
+  );
+}
+
+async function batchRead(request: Request, actor: Actor, invoke: Invoke): Promise<Response> {
+  const body = (await bodyObject(request, 16_384)) as JsonRecord;
+  if (!Array.isArray(body.ids) || !body.ids.length || body.ids.some((v) => typeof v !== 'string'))
+    return error('invalid_batch', 400);
+  let marked = 0;
+  for (const raw of body.ids as string[]) {
+    const id = encodeURIComponent(raw);
+    const shown = await invoke(new Request(new URL('/api/messages/' + id, requestUrl(request).origin), { headers: request.headers }));
+    if (!shown.ok) return json({ error: 'batch_read_failed', marked, failed: raw }, shown.status);
+    const epoch = ((await shown.json()) as { message: { epoch: number } }).message.epoch;
+    const receipt = await invoke(
+      new Request(new URL('/api/messages/' + id + '/read', requestUrl(request).origin), {
+        method: 'POST',
+        headers: request.headers,
+        body: JSON.stringify({ epoch }),
+      }),
+    );
+    if (!receipt.ok) return json({ error: 'batch_read_failed', marked, failed: raw }, receipt.status);
+    marked++;
+  }
+  return json({ marked });
+}
+
+async function agentsCompat(request: Request, env: Hub2Env, actor: Actor, rawName: string, action?: string): Promise<Response> {
+  const control = env.CONTROL.get(env.CONTROL.idFromName('global'));
+  const name = rawName.replace(/^agent:/, '');
+  if (!/^[a-z][a-z0-9_-]{0,63}$/.test(name)) return error('invalid_named_agent', 400);
+  if (!action && request.method === 'GET')
+    return control.fetch(await forwardRequest(request, CONTROL + '/api/agents/named/' + encodeURIComponent(name), actor));
+  if (action === 'delegates' && request.method === 'GET')
+    return control.fetch(await forwardRequest(request, CONTROL + '/api/named-agents/' + encodeURIComponent(name) + '/grants', actor));
+  if (request.method !== 'POST') return error('not_found', 404);
+  const body = (await bodyObject(request, 4096)) as JsonRecord;
+  if (action === 'create' || action === 'credential') {
+    const display = typeof body.display === 'string' && body.display.trim() ? body.display.trim() : name;
+    if (display.length > 120) return error('invalid_named_agent', 400);
+    const mintRequest = new Request(request.url, {
+      method: 'POST',
+      headers: request.headers,
+      body: JSON.stringify({ name, display_name: display }),
+    });
+    // Minting creates the profile when absent and rotates the family token;
+    // secrets exist only in this response, never in stored projections.
+    return control.fetch(await forwardRequest(mintRequest, CONTROL + '/_named/credential', actor));
+  }
+  if (action === 'forward') {
+    if (body.to !== undefined && body.to !== null && typeof body.to !== 'string') return error('invalid_named_agent', 400);
+    const shown = await control.fetch(
+      new Request(CONTROL + '/api/agents/named/' + encodeURIComponent(name), { headers: { 'x-hub2-actor': JSON.stringify(CONTROL_ACTOR) } }),
+    );
+    const display = shown.ok ? ((await shown.json()) as { agent?: { display_name?: string } }).agent?.display_name : undefined;
+    const upstream = await forwardRequest(new Request(request.url, { method: 'POST', headers: request.headers }), CONTROL + '/api/named-agents', actor);
+    // `to` arrives as session:<uuid>; forward_session stores the bare UUID.
+    const forward = typeof body.to === 'string' ? body.to.replace(/^session:/, '') : null;
+    const payload = { name, display_name: typeof display === 'string' && display ? display : name, forward_session: forward, enabled: true };
+    return control.fetch(new Request(upstream, { method: 'POST', headers: upstream.headers, body: JSON.stringify(payload) }));
+  }
+  if (action === 'delegate' || action === 'delegates') {
+    if (action === 'delegate' && body.session !== undefined) return error('unsupported_delegation_target', 400);
+    const family = typeof body.family === 'string' ? body.family : typeof body.mcp_client === 'string' ? body.mcp_client : typeof body.client === 'string' ? body.client : undefined;
+    if (!family) return error('invalid_agent_grant', 400);
+    const revoke = body.remove === true || body.revoke === true;
+    const upstream = await forwardRequest(
+      new Request(request.url, { method: 'PUT', headers: request.headers }),
+      CONTROL + '/api/named-agents/' + encodeURIComponent(name) + '/grants',
+      actor,
+    );
+    return control.fetch(
+      new Request(upstream, {
+        method: 'PUT',
+        headers: upstream.headers,
+        body: JSON.stringify({ family_id: family, client_id: '*', can_send: true, can_read: true, enabled: !revoke }),
+      }),
+    );
+  }
+  return error('not_found', 404);
 }
 function cursor(value: unknown): string {
   return btoa(JSON.stringify(value)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');

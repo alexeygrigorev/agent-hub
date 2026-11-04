@@ -82,17 +82,23 @@ export class ControlDO {
       if (url.pathname.startsWith('/api/routes/') && request.method === 'GET') return this.lookupRoute(request);
       if (url.pathname === '/api/directory' && request.method === 'GET') return this.directory(request);
       if (url.pathname === '/api/named-agents') return await this.namedAgents(request);
-      const grantMatch=url.pathname.match(/^\/api\/named-agents\/([^/]+)\/grants$/);
-      if(grantMatch) return await this.agentGrants(request,decodeURIComponent(grantMatch[1]));
+      const agentShow=url.pathname.match(/^\/api\/agents\/named\/([^/]+)$/);
+      if(agentShow&&request.method==='GET')return this.showNamedAgent(request,decodeURIComponent(agentShow[1]));
+      const agentGrantMatch=url.pathname.match(/^\/api\/named-agents\/([^/]+)\/grants$/);
+      if(agentGrantMatch) return await this.agentGrants(request,decodeURIComponent(agentGrantMatch[1]));
+      if(url.pathname==='/_named/credential'&&request.method==='POST')return await this.mintNamedAgentCredential(request);
       if (url.pathname === '/_verify' && request.method === 'POST') return await this.verify(request);
       if (url.pathname === '/_authorize' && request.method === 'POST') return await this.authorizeCurrent(request);
       if (url.pathname === '/api/enrollments/pair' && request.method === 'POST') return await this.createPairing(request);
       if (url.pathname === '/api/enrollments/complete' && request.method === 'POST') return await this.completePairing(request);
       if (url.pathname === '/_metrics' && request.method === 'GET') return json({ counts: this.db.snapshot() });
       if (url.pathname === '/api/repos' && request.method === 'GET') return this.listRepos(request);
-      const repoMatch = url.pathname.match(/^\/api\/repos\/([^/]+)$/);
-      if (repoMatch && request.method === 'GET') return this.showRepo(request, decodeURIComponent(repoMatch[1]));
-      if (repoMatch && request.method === 'PATCH') return await this.editRepo(request, decodeURIComponent(repoMatch[1]));
+      // Canonical repository names are owner/name, sent raw or percent-encoded;
+      // decode each bounded segment and rejoin before validation.
+      const repoMatch = url.pathname.match(/^\/api\/repos\/([^/]{1,240})(?:\/([^/]{1,240}))?$/);
+      const repoName = repoMatch && (repoMatch[2] === undefined ? decodeURIComponent(repoMatch[1]) : decodeURIComponent(repoMatch[1]) + '/' + decodeURIComponent(repoMatch[2]));
+      if (repoName && repoMatch && request.method === 'GET') return this.showRepo(request, repoName);
+      if (repoName && repoMatch && request.method === 'PATCH') return await this.editRepo(request, repoName);
       return error('not_found', 404);
     } catch (caught) {
       if (caught instanceof HttpError) return error(caught.code, caught.status);
@@ -109,7 +115,8 @@ export class ControlDO {
     );
     if (!row){const actor=this.workers.verifyHash(tokenHash);return actor?json({actor}):error('invalid_credentials',401);}
     if(row.kind==='operator'){const actor=verifyKnownCredential(row,this.env);return actor?json({actor}):error('invalid_credentials',401);}
-    if(row.kind!=='machine')return error('invalid_credentials',401);
+    if(row.kind!=='machine'&&row.kind!=='agent')return error('invalid_credentials',401);
+    if(row.expires_at!==null&&row.expires_at!==undefined&&row.expires_at<=Date.now())return error('invalid_credentials',401);
     let scopes: unknown;
     try { scopes = JSON.parse(row.scopes_json); } catch { return error('credential_corrupt', 503); }
     if (!Array.isArray(scopes) || !scopes.every(value => typeof value === 'string')) return error('credential_corrupt', 503);
@@ -121,10 +128,10 @@ export class ControlDO {
     if(typeof body.actor_id==='string'&&body.actor_id.startsWith('session:'))return this.workers.authorize(body);
     if(typeof body.actor_id==='string'&&body.actor_id.startsWith('human:'))return (await this.auth.fetch(new Request('https://control.internal/_auth/authorize',{method:'POST',headers:request.headers,body:JSON.stringify(body)})))||error('forbidden',403);
     if (typeof body.actor_id !== 'string' || typeof body.generation !== 'string' || typeof body.scope !== 'string') return error('invalid_authorization_check', 400);
-    const row = this.db.one<{ generation: string; scopes_json: string }>(
-      'SELECT generation, scopes_json FROM credentials WHERE actor_id=? AND revoked_at IS NULL', body.actor_id,
+    const row = this.db.one<{ generation: string; scopes_json: string; expires_at: number | null }>(
+      'SELECT generation, scopes_json, expires_at FROM credentials WHERE actor_id=? AND revoked_at IS NULL', body.actor_id,
     );
-    if (!row || row.generation !== body.generation) return error('credential_revoked', 401);
+    if (!row || row.generation !== body.generation || (row.expires_at !== null && row.expires_at <= Date.now())) return error('credential_revoked', 401);
     const scopes = this.parseArray(row.scopes_json);
     return scopes.includes('*') || scopes.includes(body.scope) ? json({ current: true }) : error('forbidden', 403);
   }
@@ -299,6 +306,35 @@ export class ControlDO {
     await this.scheduleWake();
     return json({agent:{id,display_name:b.display_name,forward_session:forward,enabled:b.enabled!==false}});
   }
+  private showNamedAgent(request:Request,rawName:string):Response{
+    const actor=actorFrom(request);if(!hasScope(actor,'operator:admin'))return error('forbidden',403);
+    const id=rawName.startsWith('agent:')?rawName:'agent:'+rawName;
+    const row=this.db.one<{id:string;display_name:string;forward_session:string|null;enabled:number}>('SELECT id,display_name,forward_session,enabled FROM named_agents WHERE id=?',id);
+    if(!row)return error('named_agent_not_found',404);
+    return json({agent:{id:row.id,display_name:row.display_name,forward_session:row.forward_session,enabled:!!row.enabled},
+      grants:this.db.all('SELECT family_id,client_id,can_send,can_read,enabled FROM agent_grants WHERE agent_id=? ORDER BY family_id,client_id LIMIT 101',row.id)});
+  }
+  /** Messaging M6: mint the named agent's own bearer identity (1 h access,
+   * 30-day refresh family). Secrets go only into this response, never MCP. */
+  private async mintNamedAgentCredential(request:Request):Promise<Response>{
+    const actor=actorFrom(request);if(!hasScope(actor,'operator:admin'))return error('forbidden',403);
+    const b=await bodyObject(request,4096);
+    const name=typeof b.name==='string'?b.name.replace(/^agent:/,''):'';
+    if(!/^[a-z][a-z0-9_-]{0,63}$/.test(name))return error('invalid_named_agent',400);
+    const id='agent:'+name,family=id,now=Date.now();
+    const token=randomToken(32),refresh=randomToken(32),generation=crypto.randomUUID();
+    const tokenHash=await sha256Hex(token),refreshHash=await sha256Hex(refresh);
+    this.db.transaction(this.ctx,()=>{
+      this.db.run('INSERT INTO named_agents(id,display_name,forward_session,enabled) VALUES(?,?,NULL,1) ON CONFLICT(id) DO NOTHING',id,name);
+      this.db.run(`INSERT INTO credentials(actor_id,kind,resource_id,generation,token_hash,scopes_json,family_id,client_id,created_at,expires_at,refresh_hash)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(actor_id) DO UPDATE SET kind='agent',generation=excluded.generation,token_hash=excluded.token_hash,
+          scopes_json=excluded.scopes_json,family_id=excluded.family_id,client_id=excluded.client_id,created_at=excluded.created_at,
+          expires_at=excluded.expires_at,refresh_hash=excluded.refresh_hash,revoked_at=NULL`,
+        id,'agent',null,generation,tokenHash,JSON.stringify(['message:send','message:read']),family,'hub-cli',now,now+3600000,refreshHash);
+    });
+    return json({actor:id,access_token:token,refresh_token:refresh,token_type:'Bearer',expires_in:3600,expires_at:now+3600000},201,{'Cache-Control':'private, no-store'});
+  }
   private async agentGrants(request:Request,name:string):Promise<Response>{
     const actor=actorFrom(request);if(!hasScope(actor,'operator:admin'))return error('forbidden',403);
     const id=name.startsWith('agent:')?name:'agent:'+name;
@@ -339,6 +375,14 @@ export class ControlDO {
     const row=this.db.one<{id:string;forward_session:string|null}>('SELECT id,forward_session FROM named_agents WHERE id=? AND enabled=1',b.recipient);
     if(row)return json({mailbox:row.id,forward_session:row.forward_session});
     if(b.recipient.startsWith('agent:'))return error('recipient_unknown',404);
+    // Session recipients carry their canonical project so message sends can be
+    // project-scoped (messaging M2); legacy/human addresses stay global.
+    if(b.recipient.startsWith('session:')){
+      const route=this.db.one<{resource_id:string}>('SELECT resource_id FROM object_routes WHERE kind=? AND id=?','session',b.recipient.slice(8));
+      const known=this.db.one<{id:string}>('SELECT id FROM actor_directory WHERE id=? AND enabled=1',b.recipient);
+      if(!known)return error('recipient_unknown',404);
+      return json({mailbox:known.id,forward_session:null,project:route?.resource_id??null});
+    }
     const known=this.db.one<{id:string}>('SELECT id FROM actor_directory WHERE id=? AND enabled=1',b.recipient);
     return known?json({mailbox:known.id,forward_session:null}):error('recipient_unknown',404);
   }

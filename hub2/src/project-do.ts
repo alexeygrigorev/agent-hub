@@ -18,6 +18,8 @@ const SCHEMA = [
   'CREATE INDEX intakes_schedule ON intakes(schedule_id,status,id) WHERE schedule_id IS NOT NULL',
   'CREATE INDEX intakes_status_updated ON intakes(status, updated_at, id)',
   'CREATE INDEX intakes_updated ON intakes(updated_at, id)',
+  'CREATE INDEX intakes_created ON intakes(project, created_at, id)',
+  'CREATE INDEX intakes_status_created ON intakes(project, status, created_at, id)',
   `CREATE TABLE intake_events (
     task_id TEXT NOT NULL, seq INTEGER NOT NULL, event_key TEXT NOT NULL UNIQUE,
     actor_id TEXT NOT NULL, kind TEXT NOT NULL, body_json TEXT NOT NULL, at INTEGER NOT NULL,
@@ -75,7 +77,12 @@ export class ProjectDO {
       active: scheduleId => this.scheduleHasActiveSession(scheduleId),
       occurrence: record => this.scheduleOccurrence(record),
     });
-    this.ready = initializeSchema(ctx, this.db, 4, SCHEMA, [], async () => {
+    this.ready = initializeSchema(ctx, this.db, 5, SCHEMA, [
+      [],
+      [],
+      [],
+      ['CREATE INDEX IF NOT EXISTS intakes_created ON intakes(project, created_at, id)', 'CREATE INDEX IF NOT EXISTS intakes_status_created ON intakes(project, status, created_at, id)'],
+    ], async () => {
       await this.retryPendingIntakeRoutes();
       await this.scheduleNext();
       this.constructorMs = performance.now() - started;
@@ -177,25 +184,44 @@ export class ProjectDO {
     if (!this.canProject(actor, project, 'intake:read')) return error('forbidden', 403);
     const limit = Number(query.get('limit') || 25);
     if (!Number.isInteger(limit) || limit < 1 || limit > 50) return error('invalid_limit', 400);
-    const status = query.get('status');
+    const status = query.get('status') || (query.get('archived') === 'true' ? 'archived' : '');
     if (status && !['open', 'queued', 'running', 'completed-awaiting-review', 'failed', 'needs_attention', 'archived','accepted'].includes(status)) return error('invalid_status', 400);
-    let cursor: [number, string] = [Number.MAX_SAFE_INTEGER, '\uffff'];
-    const rawCursor = query.get('cursor');
+    // PUBLIC-API: intake owner pages paginate with `after`; the raw JSON keyset
+    // token is the same opaque value `next` returned on the previous page
+    // (`cursor` stays accepted for earlier callers).
+    const rawCursor = query.get('after') ?? query.get('cursor');
+    let cursor: [number, string] | undefined;
     if (rawCursor) {
       try { cursor = JSON.parse(rawCursor) as [number, string]; } catch { return error('invalid_cursor', 400); }
       if (!Array.isArray(cursor) || cursor.length !== 2 || !Number.isSafeInteger(cursor[0]) || typeof cursor[1] !== 'string' || cursor[1].length > 80) return error('invalid_cursor', 400);
     }
     const search=query.get('q')||'';if(search.length>128)return error('invalid_search',400);
+    const needle=search.toLowerCase(),matching=(list:IntakeRow[])=>search?list.filter(v=>[v.title,v.text,v.original_title,v.original_text].some(t=>t?.toLowerCase().includes(needle))):list;
     const selected = 'id, project, title, status, assigned_machine_id, assigned_actor_id, session_id, created_at, updated_at,priority'+(search?',text,original_title,original_text':'');
-    const rows = status
-      ? this.db.all<IntakeRow>(`SELECT ${selected} FROM intakes WHERE project=? AND status=? AND (updated_at,id)<(?,?) ORDER BY updated_at DESC,id DESC LIMIT ?`, project, status, ...cursor, limit + 1)
-      : this.db.all<IntakeRow>(`SELECT ${selected} FROM intakes WHERE project=? AND (updated_at,id)<(?,?) ORDER BY updated_at DESC,id DESC LIMIT ?`, project, ...cursor, limit + 1);
-    const scanned=rows.slice(0,limit),needle=search.toLowerCase();
-    const shown=search?scanned.filter(v=>[v.title,v.text,v.original_title,v.original_text].some(t=>t?.toLowerCase().includes(needle))):scanned;
-    const last = scanned[scanned.length - 1];
-    return json({ items: shown.map(row => ({ id: row.id, project: row.project, title: row.title, status: row.status,
+    let rows: IntakeRow[], next: string | null;
+    if (!cursor) {
+      // View page: newest first. When older rows remain, hand the walk off to
+      // the stable ascending (created_at,id) position: created_at never moves,
+      // so intakes created or closed mid-walk cannot expire a page or be
+      // skipped, and rows already shown once simply reappear for dedup.
+      rows = status
+        ? this.db.all<IntakeRow>(`SELECT ${selected} FROM intakes WHERE project=? AND status=? ORDER BY updated_at DESC,id DESC LIMIT ?`, project, status, limit + 1)
+        : this.db.all<IntakeRow>(`SELECT ${selected} FROM intakes WHERE project=? ORDER BY updated_at DESC,id DESC LIMIT ?`, project, limit + 1);
+      const scanned=rows.slice(0,limit),last=scanned[scanned.length-1];
+      let more = false;
+      if (rows.length > limit && last)
+        more = !!this.db.one('SELECT id FROM intakes WHERE project=? AND (created_at,id)<(?,?) LIMIT 1', project, last.created_at, last.id);
+      next = more ? JSON.stringify([0, '']) : null;
+    } else {
+      rows = status
+        ? this.db.all<IntakeRow>(`SELECT ${selected} FROM intakes WHERE project=? AND status=? AND (created_at,id)>(?,?) ORDER BY created_at,id LIMIT ?`, project, status, ...cursor, limit + 1)
+        : this.db.all<IntakeRow>(`SELECT ${selected} FROM intakes WHERE project=? AND (created_at,id)>(?,?) ORDER BY created_at,id LIMIT ?`, project, ...cursor, limit + 1);
+      const scanned=rows.slice(0,limit),last=scanned[scanned.length-1];
+      next = rows.length > limit && last ? JSON.stringify([last.created_at, last.id]) : null;
+    }
+    return json({ items: matching(rows.slice(0, limit)).map(row => ({ id: row.id, project: row.project, title: row.title, status: row.status,
       assigned_machine_id: row.assigned_machine_id, assigned_actor_id: row.assigned_actor_id, session_id: row.session_id,
-      created_at: row.created_at, updated_at: row.updated_at,priority:row.priority })),filtered_page:!!search, next: rows.length > limit && last ? JSON.stringify([last.updated_at, last.id]) : null });
+      created_at: row.created_at, updated_at: row.updated_at,priority:row.priority })),filtered_page:!!search, next });
   }
 
   private showIntake(request: Request, intakeId: string, status = 200): Response {

@@ -9,6 +9,7 @@ const definitions = [
   ['intake_list', 'GET', '/api/intakes', 'Read authorized intake page.'],
   ['intake_create', 'POST', '/api/intakes', 'Create durable intake with acceptance criteria.'],
   ['intake_show', 'GET', '/api/intakes/:id', 'Read intake.'],
+  ['intake_append', 'POST', '/api/intakes/:id/append', 'Append a scoped worker note or evidence to the bound intake.'],
   ['intake_history', 'GET', '/api/intakes/:id/history', 'Read intake event page.'],
   ['intake_start', 'POST', '/api/intakes/:id/start', 'Request admitted native launch.'],
   ['sessions_list', 'GET', '/api/sessions', 'Read session page.'],
@@ -37,7 +38,16 @@ const tools = Object.fromEntries(
       ...(method === 'GET'
         ? {}
         : {
-            body: (args: JsonRecord) => (name === 'repos_edit' ? args.patch : args),
+            body: (args: JsonRecord) => {
+              if (name === 'repos_edit') return args.patch;
+              // intake_append's `id` addresses the path; only the append
+              // contract fields may reach the body.
+              if (name === 'intake_append') {
+                const { id: _path, ...append } = args;
+                return append;
+              }
+              return args;
+            },
           }),
     },
   ]),
