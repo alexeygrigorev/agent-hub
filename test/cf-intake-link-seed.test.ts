@@ -29,7 +29,7 @@ describe('bounded intake link startup and deletion',()=>{
  }));
  it('refuses a large authority-ledger delete before its unindexed task filter and preserves data',()=>fixture(raw=>{
   initSessionLinks(raw);initLinkRefs(raw);
-  raw.exec("INSERT INTO intake_tasks(id,data) VALUES('protected',?)",JSON.stringify({id:'protected',status:'open',history:[]}));
+  raw.exec("INSERT INTO intake_tasks(id,data) VALUES('protected',?)",JSON.stringify({id:'protected',project:'fixture',title:'protected',status:'open',version:1,created_at:Date.now(),updated_at:Date.now(),acceptance_criteria:'retain authority',history:[]}));
   raw.exec("WITH RECURSIVE n(i) AS(SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<2000) INSERT INTO intake_session_links SELECT 'session-'||i,'protected','host_census_verified' FROM n");
   const probe=raw.exec('SELECT COUNT(*) AS n FROM(SELECT 1 FROM intake_session_links LIMIT 129)');expect(probe.one().n).toBe(129);expect(probe.rowsRead).toBeLessThanOrEqual(130);
   // A failed native exec exposes no cursor counters. The identical standalone
