@@ -1,3 +1,6 @@
+import {intakeLinkHealth} from '../src/intake-link-health';
+import {freshFixtureBudgetDay} from './helpers/fixture-budget';
+import {registerFixtureStatements,fixtureStatements} from './helpers/fixture-statements';
 /** Worktree-guard server regression tests (intake a0f01448, RCA 95c1862c).
  *
  * AC1: fleet offers carry hub_session_id + intake_task_id for the host lock.
@@ -42,6 +45,9 @@ async function fixture(fn: (s: SessionControlService, sql: any, hooks: Hooks) =>
   const bindings = env as unknown as Env;
   const stub = bindings.HUB.get(bindings.HUB.idFromName('session-worktree-guard-' + crypto.randomUUID()));
   await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
+    registerFixtureStatements(hub,state);
+    await freshFixtureBudgetDay(hub);
+    await (hub as any).rowBudget.begin(true);
     const hooks: Hooks = { alerts: [], notes: [] };
     const reserve = fakeReserve();
     const service = new SessionControlService(hub.sql, (cb) => state.storage.transactionSync(cb), Date.now,
@@ -124,13 +130,19 @@ describe('worktree guard (intake a0f01448)', () => {
 
   it('protects a linked open intake beyond the former projection scan limit', async () => fixture(async (s, sql) => {
     for (let i = 0; i < 510; i++) {
-      sql.exec('INSERT INTO intake_task_projection(id,data,links) VALUES (?, ?, ?)', 'unrelated-' + i, '{}', '[]');
+      fixtureStatements(sql).exec('INSERT INTO intake_task_projection(id,data,links) VALUES (?, ?, ?)', 'unrelated-' + i, '{}', '[]');
     }
     const lateId = 'guard-late-intake';
     sql.exec('INSERT INTO intake_tasks(id,data) VALUES (?, ?)', lateId,
       JSON.stringify({ id: lateId, status: 'open', history: [] }));
     sql.exec('INSERT OR REPLACE INTO intake_task_projection(id,data,links) VALUES (?, ?, ?)', lateId, '{}',
       JSON.stringify([{ kind: 'link', hub_session_id: 'guard-late' }]));
+    // A request-owned bounded migration initially refuses incomplete health;
+    // successive explicit pages complete it without a constructor census.
+    expect((s as any).linkedIntakeProtected({id:'guard-late'})).toBe(true);
+    let ready=false;
+    for(let page=0;page<20&&!ready;page++)ready=intakeLinkHealth(sql).ready;
+    expect(ready).toBe(true);
     expect((s as any).linkedOpenIntakeForSession({ id: 'guard-late' })).toBe(lateId);
   }));
 

@@ -5,7 +5,7 @@ import { freshFixtureBudgetDay, fixtureSql } from './helpers/fixture-budget';
  * history (thousands of retained launches, managed sessions and census rows)
  * and asserts each call reads rows proportional to what changed, not to history.
  */
-import { it, expect } from 'vitest';
+import { it, expect, vi } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { FleetService } from '../src/fleet';
 import type { Hub } from '../src/hub';
@@ -26,9 +26,9 @@ function tracked(sql: any) {
   } });
   /** Rows read by statements issued since `from` (a prior `mark()`), total and per statement. */
   const report = (from = 0) => {
-    const by = new Map<string, number>(); let total = 0;
-    for (const { q, cursor } of calls.slice(from)) { const n = Number(cursor.rowsRead) || 0; total += n; const k = q.replace(/\s+/g, ' ').slice(0, 110); by.set(k, (by.get(k) ?? 0) + n); }
-    return { total, top: [...by].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k, n]) => `${n} ${k}`) };
+    const by = new Map<string, number>(); let total = 0, written = 0;
+    for (const { q, cursor } of calls.slice(from)) { const n = Number(cursor.rowsRead) || 0; total += n; written += Number(cursor.rowsWritten) || 0; const k = q.replace(/\s+/g, ' ').slice(0, 110); by.set(k, (by.get(k) ?? 0) + n); }
+    return { total, written, top: [...by].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k, n]) => `${n} ${k}`) };
   };
   const mark = () => calls.length;
   return { proxy, report, mark };
@@ -86,6 +86,7 @@ it('PUT /api/fleet/sessions with an unchanged census reads rows per reported row
   const after = t.report(from);
   const second = after.total;
   expect(second, `unchanged PUT top statements: ${JSON.stringify(after.top)}`).toBeLessThanOrEqual(CENSUS * 4);
+  console.log(JSON.stringify({evidence:'route_service_native_cost',route:'PUT /api/fleet/sessions',case:'unchanged500',history_rows:HOSTS*HISTORY,rows_read:after.total,rows_written:after.written,excludes:'outer authentication, KV ledger and guard migration preflight'}));
 }));
 
 it('GET /api/fleet/offers with no offers reads a bounded number of rows', withFleet(async (s, t) => {
@@ -96,6 +97,7 @@ it('GET /api/fleet/offers with no offers reads a bounded number of rows', withFl
   const after = t.report(from);
   const second = after.total;
   expect(second, `idle offers top statements: ${JSON.stringify(after.top)}`).toBeLessThanOrEqual(400);
+  console.log(JSON.stringify({evidence:'route_service_native_cost',route:'GET /api/fleet/offers',case:'idle warm poll',history_rows:HOSTS*HISTORY,rows_read:after.total,rows_written:after.written,excludes:'outer authentication, KV ledger and guard migration preflight'}));
 }));
 
 it('PUT /api/fleet/sessions still writes changed rows, retires vanished live rows and skips stopped sessions', withFleet(async (s, _t, hub) => {
@@ -118,7 +120,7 @@ it('PUT /api/fleet/sessions still writes changed rows, retires vanished live row
   expect(phaseOf(10)).toBe('exited');
 }));
 
-it('GET /api/fleet/offers reuses reconciliation candidates until a launch or session write', withFleet(async (s, t, hub) => {
+it('GET /api/fleet/offers rotates incomplete reconciliation pages and caches only a complete small cohort', withFleet(async (s, t, hub) => {
   // 60 extra running launches on h0, each with a fresh live native (probed by the candidates query),
   // except launch 0, whose native is unobserved so it is a reconciliation candidate.
   for (let i = 0; i < 60; i++) {
@@ -129,17 +131,44 @@ it('GET /api/fleet/offers reuses reconciliation candidates until a launch or ses
       'h0', native, 'hub-' + launch, 'codex', 'running', null, iso(-1000), '/w', '/w', now - 1000);
   }
   const get = async () => { const r = await s.handle(new Request('https://hub.test/api/fleet/offers'), host); expect(r.status).toBe(200); return r.json() as Promise<any>; };
+  const uncached=vi.spyOn(s as any,'reconciliationCandidatesUncached');
   const candidate = uuid(5, 10000);
   const first = await get();
   expect(first.reconciliation.map((r: any) => r.id)).toContain(candidate);
-  const from = t.mark();
-  const second = await get();
-  const reads = t.report(from);
-  expect(second.reconciliation).toEqual(first.reconciliation);
-  expect(reads.total, `second poll top statements: ${JSON.stringify(reads.top)}`).toBeLessThanOrEqual(60);
-  // A launch write moves the revision: the next poll recomputes and no longer lists it.
-  hub.sql.exec("UPDATE fleet_launches SET state = 'exited' WHERE id = ?", candidate);
-  expect((await get()).reconciliation.map((r: any) => r.id)).not.toContain(candidate);
+  expect(first.reconciliation_observation_pending).toBe(true);
+  expect(first.reconciliation_cursors.running).toBeGreaterThan(0);
+  const from=t.mark();
+  const second=await get();
+  expect(second.reconciliation_observation_pending).toBe(true);
+  expect(second.reconciliation_cursors.running).toBeGreaterThan(first.reconciliation_cursors.running);
+  expect(second.reconciliation.map((r:any)=>r.id)).not.toContain(candidate);
+  expect(t.report(from).total,JSON.stringify(t.report(from).top)).toBeLessThanOrEqual(60);
+  const tail=await get();
+  expect(tail.reconciliation_observation_pending).toBe(true);
+  expect(tail.reconciliation_cursors.running).toBe(0);
+  // A partial cycle is never cached as all clear: the next cycle must see
+  // the still-unobserved candidate again.
+  expect((await get()).reconciliation.map((r:any)=>r.id)).toContain(candidate);
+
+  // A complete small cohort is cacheable. Fixture reshaping is separate
+  // from all real guarded GET calls and the source invalidation below.
+  const seedSql=fixtureSql(hub),small=uuid(5,10001);
+  seedSql.exec("UPDATE fleet_launches SET state='exited' WHERE machine_id='h0'");
+  seedSql.exec("UPDATE fleet_launches SET state='running',native_id=NULL WHERE id=?",small);
+  let complete=await get();
+  if(complete.reconciliation_observation_pending)complete=await get();
+  expect(complete.reconciliation_observation_pending).toBe(false);
+  expect(complete.reconciliation.map((r:any)=>r.id)).toEqual([small]);
+  const invocations=uncached.mock.calls.length,mark=t.mark();
+  expect((await get()).reconciliation).toEqual(complete.reconciliation);
+  expect(uncached.mock.calls).toHaveLength(invocations);
+  expect(t.report(mark).total,JSON.stringify(t.report(mark).top)).toBeLessThanOrEqual(60);
+  hub.sql.exec("UPDATE fleet_launches SET state='exited' WHERE id=?",small);
+  const cleared=await get();
+  expect(cleared.reconciliation).toEqual([]);
+  expect(cleared.reconciliation_observation_pending).toBe(false);
+  expect(uncached.mock.calls.length).toBeGreaterThan(invocations);
+  uncached.mockRestore();
 }));
 
 /** A measured session reward row with the columns the efficiency aggregation reads. */

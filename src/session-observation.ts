@@ -36,7 +36,7 @@ export function observedHubTagMatches(sql: SqlStorage, ref: string, owns: (row: 
     let request:any,binding:any;try{request=JSON.parse(row.request_json);binding=JSON.parse(row.binding_json);}catch{return false;}
     const tag=binding?.tag;
     return request?.provenance==='observed_native'&&typeof tag==='string'&&tag.toLowerCase().startsWith('hub-'+ref.toLowerCase())
-      && /^hub-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(tag)&&owns(row);
+      && /^hub-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(tag)&&owns(row);
   });
 }
 

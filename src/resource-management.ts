@@ -122,7 +122,14 @@ export class ResourceManagement {
     const at=Date.parse(value.observed_at);
     return Number.isFinite(at)&&at>=now-180000&&at<=now+30000?value:null;
   }
-  invalidateLiveTelemetry():void { this.liveTelemetry.clear(); }
+  private liveActivity=new Map<string,{activity:any;observed:any;durable?:{activity:any;observed:any}}>();
+  private activityStamp:string|null=null;
+  private activityLost=false;
+  invalidateLiveTelemetry():void {
+    this.liveTelemetry.clear();
+    if(this.liveActivity.size)this.activityLost=true;
+    this.liveActivity.clear();this.activityStamp=null;
+  }
   private idleBindingValidity=new Map<string,{stamp:string|null;corrupt:boolean;limited:boolean}>();
   private catalogReady = false;
   private catalogStructureRevision:string|null=null;
@@ -194,6 +201,22 @@ export class ResourceManagement {
    * metadataChanged marks rows whose identity fields (tag/engine/phase/...)
    * changed, not only activity/progress refreshes. */
   noteCensus(machine: string, rows: any[], metadataChanged: boolean): void {
+    const currentStamp=this.writes?.stamp('fleet_sessions')??null;
+    if(this.writes&&this.activityStamp!==null&&currentStamp!==this.activityStamp){this.liveActivity.clear();this.activityLost=true;}
+    // Timestamp persistence is coalesced, but admission/cleanup sees the
+    // freshest authenticated report. This point cache never loads host history.
+    for(const row of rows) {
+      const key=JSON.stringify([machine,row.native_id]);
+      const previous=this.liveActivity.get(key);
+      const oldAt=Date.parse(previous?.observed),newAt=Date.parse(row.observed_at);
+      const oldFresh=Number.isFinite(oldAt)&&oldAt>=this.now()-180000&&oldAt<=this.now()+60000&&Number.isFinite(Date.parse(previous?.activity));
+      const newFresh=Number.isFinite(newAt)&&newAt>=this.now()-180000&&newAt<=this.now()+60000&&Number.isFinite(Date.parse(row.last_activity_at));
+      if(newFresh&&!oldFresh)this.watchdogSessions?.invalidate();
+      if(!this.liveActivity.has(key)&&this.liveActivity.size>=2048){this.liveActivity.clear();this.activityLost=true;}
+      const durable=!this.writes?this.readRows('SELECT last_activity_at,observed_at FROM fleet_sessions WHERE machine_id=? AND native_id=?',machine,row.native_id)[0]:null;
+      this.liveActivity.set(key,{activity:row.last_activity_at??null,observed:row.observed_at,...(!this.writes?{durable:{activity:durable?.last_activity_at??null,observed:durable?.observed_at??null}}:{})});
+    }
+    this.activityStamp=this.writes?.stamp('fleet_sessions')??null;
     this.observed?.note(machine, rows);
     if (metadataChanged) this.writes?.bump('fleet_sessions_meta');
   }
@@ -774,7 +797,22 @@ export class ResourceManagement {
     return this.overlayActivity(rows);
   }
   private overlayActivity(rows:any[]):any[] {
-    return rows.map(row=>({...row,...(row.aliases?{aliases:[...row.aliases]}:{}),last_activity_at:this.readRows('SELECT last_activity_at FROM fleet_sessions WHERE machine_id=? AND native_id=?',row.machine_id,row.native_id)[0]?.last_activity_at ?? null}));
+    const stamp=this.writes?.stamp('fleet_sessions')??null;
+    if(this.writes&&this.activityStamp!==null&&stamp!==this.activityStamp){this.liveActivity.clear();this.activityLost=true;}
+    this.activityStamp=stamp;
+    return rows.map(row=>{
+      const key=JSON.stringify([row.machine_id,row.native_id]);
+      let live=this.liveActivity.get(key);
+      const durable=!this.writes||!live?this.readRows('SELECT last_activity_at,observed_at FROM fleet_sessions WHERE machine_id=? AND native_id=?',row.machine_id,row.native_id)[0]:null;
+      if(live?.durable&&(live.durable.activity!==(durable?.last_activity_at??null)||live.durable.observed!==(durable?.observed_at??null))){
+        this.liveActivity.delete(key);this.activityLost=true;live=undefined;
+      }
+      const observedAt=Date.parse(live?live.observed:durable?.observed_at);
+      const fresh=Number.isFinite(observedAt)&&observedAt>=this.now()-180000&&observedAt<=this.now()+60000;
+      const limited=live?!fresh||!Number.isFinite(Date.parse(live.activity)):this.activityLost||!fresh;
+      return {...row,...(row.aliases?{aliases:[...row.aliases]}:{}),last_activity_at:live?live.activity:durable?.last_activity_at??null,
+        activity_observation_limited:limited,...(limited?{idle_reap_allowed:false}:{})};
+    });
   }
 
   private buildCanonicalSessions(machine?: string,requested?:string[]) {
@@ -864,6 +902,7 @@ export class ResourceManagement {
     lookup.limited=limited;return lookup;
   }
   private idleReapAllowed(session: any, authority?: (session: any) => any[] | null, cache: IdleReapCache = { intakes: new Map() }): boolean {
+    if(session.activity_observation_limited)return false;
     try {
       const rows = (authority ?? this.idleAuthority([session]))(session);
       if (rows === null) return false;
@@ -930,7 +969,16 @@ export class ResourceManagement {
       || (value.throttles !== undefined && (!Array.isArray(value.throttles) || value.throttles.length>100))) throw new Error('invalid_resource_report');
     if(!value.samples.length&&!value.reaps.length&&!(value.throttles?.length))return {reported:true,samples:0,reaps:0};
     const requested=[...new Set<string>([...value.samples,...value.reaps,...(value.throttles??[])].map(item=>item?.session_id).filter(id=>typeof id==='string'))];
-    const sessions = new Map<string,any>(this.canonicalSessions(machine,requested).flatMap(s => s.aliases.map((id:string)=>[id,s] as const)));
+    // Complete the bounded identity/alias observation before advancing even
+    // migration metadata. An oversized native cohort must be a zero-write
+    // refusal, including control writes which a SQL rollback cannot unbill.
+    const preflight=this.canonicalSessions(machine,requested,false);
+    const health=intakeLinkHealth(this.sql);
+    // A completed page can change authority metadata. Reuse the bounded raw
+    // identity observations, but render against the newly proven health so
+    // the first sample and its unchanged retry share identical metadata.
+    const canonical=health.ready?this.canonicalSessions(machine,requested,false):preflight;
+    const sessions = new Map<string,any>(canonical.flatMap(s => s.aliases.map((id:string)=>[id,s] as const)));
     for (const reportedSample of value.samples) {
       let sample={...reportedSample};
       const session = sessions.get(sample.session_id);

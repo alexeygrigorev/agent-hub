@@ -1,3 +1,4 @@
+import {createSessionCookie} from '../src/auth/session';
 import { freshFixtureBudgetDay, fixtureSql } from './helpers/fixture-budget';
 import { describe, expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
@@ -8,6 +9,9 @@ async function fixture(fn: (h: any, ops: OpsLiveness, alerts: any[]) => Promise<
   const stub = (env as any).HUB.get((env as any).HUB.idFromName('throughput-' + crypto.randomUUID()));
   await (runInDurableObject as any)(stub, async (h: any) => {
     await freshFixtureBudgetDay(h);
+    // These direct component calls model a manual bulk observation event.
+    // Prepay its remaining strict 20k day, as the real Hub event gate does.
+    await h.rowBudget.begin(true);
     const alerts: any[] = [];
     const ops = new OpsLiveness(h.sql, { queuePolicy: () => ({ enabled: true, valid: true, max_inflight: 8,
       capacity: { source: 'live_host_account', active: 3, available_slots: 5 } }),
@@ -15,6 +19,7 @@ async function fixture(fn: (h: any, ops: OpsLiveness, alerts: any[]) => Promise<
       alert: async (subject, detail) => { alerts.push({ subject, detail }); } }, () => NOW);
     ops.init();
     await fn(h, ops, alerts);
+    expect(h.rowBudget.status()).toMatchObject({limit_total:20000,stopped:false});
   });
 }
 function task(h: any, id: string, at: number) {
@@ -86,6 +91,17 @@ describe('intake throughput evidence', () => {
       fixtureSql(h).exec("INSERT INTO intake_audit(task_id,project,kind,actor,captured_at,reason) VALUES('unrelated','demo','note','operator',?,'test')",NOW-1000);
     expect(ops.throughput()).toMatchObject({complete:true,incomplete_metrics:[],started_24h:1,automatic_started_24h:1,
       created_24h:THROUGHPUT_OBSERVATION_LIMIT,closed_24h:1,net_24h:THROUGHPUT_OBSERVATION_LIMIT-1});
+  }));
+  it('prepays the real HTTP observation within the unchanged daily ceiling',()=>fixture(async(h)=>{
+    const now=Date.now();
+    for(let i=0;i<THROUGHPUT_OBSERVATION_LIMIT;i++)task(h,'http-created-'+i,now-1000);
+    await h.rowBudget.releaseUnused();await h.rowBudget.begin();
+    expect(h.rowBudget.status().available_total).toBeLessThan(5000);
+    const cookie=(await createSessionCookie(env as any,{sub:'operator',email:'admin@fake.local',isAdmin:true,csrfToken:'csrf',exp:Math.floor(now/1000)+3600})).split(';')[0];
+    const response=await h.fetch(new Request('https://hub.test/api/ops/liveness',{headers:{Cookie:cookie}}));
+    expect(response.status).toBe(200);
+    expect((await response.json() as any).throughput).toMatchObject({complete:true,created_24h:THROUGHPUT_OBSERVATION_LIMIT});
+    expect(h.rowBudget.status()).toMatchObject({limit_total:20000,stopped:false});
   }));
   it('uses bounded range-index reads with no DISTINCT or temporary B-tree on every throughput path',()=>fixture((h)=>{
     const expected={starts:'ops_intake_native_started',created:'ops_intake_created',closed:'ops_intake_closed_time'};

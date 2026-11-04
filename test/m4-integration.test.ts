@@ -694,8 +694,16 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
       expect(() => fixtureSql(instance).exec("INSERT INTO agents(tag, project) VALUES ('schema-peer', 'first')")).toThrow();
     });
 
-    // Part B: Upgrade from SPEC §6 tables (jobs, leases, audit before M4 columns)
-    await (runInDurableObject as any)(stub, async (instance: any) => {
+    // Part B is isolated from the modern Hub used above. SPEC §6 predates
+    // today's hundreds of cross-table triggers: leaving those installed while
+    // replacing their source tables fabricates a schema that never existed,
+    // and makes every legacy ADD COLUMN reparse the entire modern catalog.
+    const legacyStub=(env as any).HUB.get((env as any).HUB.idFromName('spec6-legacy-'+crypto.randomUUID()));
+    await (runInDurableObject as any)(legacyStub, async (instance: any) => {
+      const legacySetup=fixtureSql(instance);
+      for(const row of legacySetup.exec("SELECT name FROM sqlite_master WHERE type='trigger'").toArray())
+        legacySetup.exec('DROP TRIGGER "'+String(row.name).replaceAll('"','""')+'"');
+      expect(legacySetup.exec("SELECT name FROM sqlite_master WHERE type='trigger'").toArray()).toHaveLength(0);
       fixtureSql(instance).exec('DROP TABLE IF EXISTS jobs');
       fixtureSql(instance).exec('DROP TABLE IF EXISTS leases');
       fixtureSql(instance).exec('DROP TABLE IF EXISTS audit');
@@ -757,7 +765,10 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
       // Re-run Hub migration sequence on SPEC §6 tables
       await advanceFixtureBudgetDay(instance);
       await instance.rowBudget.releaseUnused();await instance.rowBudget.begin(true);
-      instance.initDb();
+      instance.meter.runSync('legacy-spec6-init',()=>instance.initDb());
+      const migrationCost=instance.meter.snapshot()['legacy-spec6-init'];
+      expect(migrationCost.rows_read+migrationCost.rows_written).toBeLessThan(20000);
+      expect(instance.rowBudget.status()).toMatchObject({limit_total:20000,stopped:false});
 
       // Verify all M4 extra columns exist on jobs, leases, audit
       const jobCols = fixtureSql(instance).exec("PRAGMA table_info(jobs)").toArray().map((c: any) => c.name);
@@ -784,11 +795,17 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
       expect(oldJob.id).toBe('spec6-job-1');
       const oldAudit = fixtureSql(instance).exec("SELECT * FROM audit WHERE action = 'test_init'").toArray()[0] as any;
       expect(oldAudit.actor).toBe('system');
+      expect(oldAudit.at).toBe(now);
+      expect(fixtureSql(instance).exec("SELECT epoch FROM leases WHERE name='root'").one().epoch).toBe(0);
+      expect(()=>fixtureSql(instance).exec("INSERT INTO jobs(id,kind,status,created_at) VALUES('spec6-job-1','generic','completed',?)",now)).toThrow();
+      fixtureSql(instance).exec("INSERT INTO machines(id,name,hostname,registered_at) VALUES('legacy-host','legacy-host','legacy-host',?)",now);
+      fixtureSql(instance).exec("INSERT INTO credentials(id,kind,token_hash,family_id,subject,machine_id,scopes,created_by_sub,created_at,expires_at) VALUES('legacy-credential','host',?,'legacy-family','legacy-host','legacy-host','[\"host\"]','fixture',?,?)",
+        await sha256('hubt_host_alpha'),now,new Date(Date.now()+3600000).toISOString());
     });
 
-    // Part C: Verify GET /api/jobs succeeds without 500 error after upgrade
+    // Part C: Verify the actual upgraded SPEC §6 namespace serves GET jobs.
     const hostToken = 'hubt_host_alpha';
-    const listRes = await doFetch(new Request('http://example.com/api/jobs', {
+    const listRes = await legacyStub.fetch(new Request('http://example.com/api/jobs', {
       headers: { 'Authorization': `Bearer ${hostToken}` }
     }));
     expect(listRes.status).toBe(200);

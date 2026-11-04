@@ -145,9 +145,13 @@ export function worktreeIntakeSnapshot(sql: SqlStorage, scope?: WorktreeSnapshot
   }
 }
 
-export function openWorktreeIntake(sql: SqlStorage, session: any, snapshot: WorktreeIntakeSnapshot = worktreeIntakeSnapshot(sql)): string | null {
-  if (!snapshot.valid) throw new Error('unreadable intake links');
+export function openWorktreeIntake(sql: SqlStorage, session: any, snapshot?: WorktreeIntakeSnapshot): string | null {
   if (!session) throw new Error('missing session identity');
+  // A known session needs only its complete indexed identity closure. Global
+  // link-health readiness still refuses malformed or incomplete retained data.
+  const native=parseNative(session.binding_json);
+  snapshot ??= worktreeIntakeSnapshot(sql,{sessionIds:typeof session.id==='string'?[session.id]:[],nativeIds:native?[native]:[]});
+  if (!snapshot.valid) throw new Error('unreadable intake links');
   const open = typeof snapshot.open === 'function' ? snapshot.open : (id: unknown) => isIntakeTaskOpen(sql, id);
   const request = record(session.request_json);
   const launch = record(session.launch_request);

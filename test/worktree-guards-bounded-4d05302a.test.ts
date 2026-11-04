@@ -1,5 +1,5 @@
 import {registerFixtureStatements,fixtureStatements} from './helpers/fixture-statements';
-import {fixtureSql} from './helpers/fixture-budget';
+import {fixtureSql,freshFixtureBudgetDay} from './helpers/fixture-budget';
 import { describe, expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { seedFixtureIntake } from './tbm-fixture';
@@ -44,6 +44,7 @@ async function fixture(fn: (s: SessionControlService, sql: any, measure: (fn: ()
     fixtureSql(hub).exec(`INSERT OR IGNORE INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at)
       VALUES ('host-cred-1', 'host', 'hash-host-cred-1', 'refresh-host-cred-1', 'host-family-1', 'test-host', 'hetzner', NULL, '["host"]', 'test', ?, ?)`, at, far);
     fixtureSql(hub).exec(`INSERT OR IGNORE INTO machines (id, name, hostname, credential_id, registered_at) VALUES ('hetzner', 'hetzner', 'hetzner', 'host-cred-1', ?)`, at);
+    await freshFixtureBudgetDay(hub);
     await (hub as any).rowBudget.begin(true);
     await fn(service, hub.sql, m.measure);
   });

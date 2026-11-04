@@ -955,6 +955,7 @@ export class Hub extends DurableObject {
     try { scope = 'route:' + normalizeRoute(request.method, new URL(request.url).pathname); } catch {}
     const path=new URL(request.url).pathname,method=request.method;
     const bulk=((path==='/api/status') && ['GET','POST'].includes(method)) ||
+      (path==='/api/ops/liveness' && method==='GET') ||
       (path==='/api/fleet/sessions' && method==='PUT') ||
       (path==='/api/fleet/resources/report' && method==='POST') ||
       ['/api/backup/status','/api/backup/export'].includes(path) || path.startsWith('/api/cron/') ||
@@ -3076,20 +3077,16 @@ export class Hub extends DurableObject {
     try { return this.sessionControlService.nextWakeTime(); } catch { return null; }
   }
 
-  /** The alarm is a one-shot for due work. Bus-retention continuations may
-   * use 1s re-arms at most 30 times across DO restarts, then back off to 60s.
-   * An omitted retention result preserves the durable backlog state; callers
-   * that did not run cleanup (for example a webhook ingest) cannot clear it. */
+  /** Compatibility for request/manual callers: only the indexed durable
+   * pending-work queue can arm an alarm. Retention hints cannot create work. */
   private async scheduleDueAlarm(_nextTimes: Array<number | null | undefined>, _retentionHasMore?: boolean) {
     // Legacy callers may request a wake, but only explicit durable work can arm it.
     await this.refreshBackgroundJobs();
     await this.armBackgroundQueue();
   }
 
-  /** Idle recovery acts on 30-minute nudge delays, so a census at most every
-   * 5 minutes is enough; the minute alarm used to rerun it (intake 8081a05a).
-   * The gate is in memory and on the wall clock: a cold start runs a census at
-   * once, and HUB_IDLE_OPEN_AC_NUDGE_MINUTES below 5 acts within ~5 minutes. */
+  /** Explicit manual recovery only; alarms and scheduled crons never run
+   * this census. Repeated manual calls retain the existing five-minute gate. */
   private async idleWorkTick() {
     const now = Date.now();
     const durableLast = Number(await this.ctx.storage.get('idle_work_last_tick')) || 0;

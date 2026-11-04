@@ -383,7 +383,11 @@ describe('native SQLite budget accounting', () => {
       expect(()=>{for(let i=0;i<40;i++)sql.exec('SELECT id FROM cf_bulk_source ORDER BY id LIMIT 500').toArray();}).toThrow(RowBudgetExceeded);
       await budget.finish();
       const persisted=[...store.data.values()][0] as any;
-      expect(persisted.read+persisted.written).toBeGreaterThanOrEqual(20000);
+      // Exhausting the prepaid pool can stop exactly at19999, retaining
+      // the control-write safety row without inventing a checkpoint write.
+      expect(persisted.read+persisted.written).toBeGreaterThanOrEqual(19999);
+      expect(persisted.read+persisted.written).toBeLessThanOrEqual(20000);
+      expect(budget.status().stopped).toBe(true);
       await expect(new RowBudget(store,()=>0).begin(true)).rejects.toThrow(RowBudgetExceeded);
       expect(()=>sql.exec('SELECT 1')).toThrow(RowBudgetExceeded);
     });

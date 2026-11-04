@@ -46,6 +46,7 @@ describe('production-schema credential polling bounds',()=>{
       expect(response.status).toBe(200);
       found.push(...(await response.json() as any).sessions);
       expect(meter.snapshot()['poll-'+i].rows_read).toBeLessThan(800);
+      console.log(JSON.stringify({evidence:'route_service_native_cost',route:'GET /api/session-intake/credentials',case:'indexed polling page '+i,history_credentials:2000,...meter.snapshot()['poll-'+i],excludes:'outer authentication, KV ledger and guard migration preflight'}));
     }
     expect(found.map(row=>row.session_id)).toContain('needy');
     const indexes=raw.exec(`SELECT name FROM sqlite_master WHERE type='index' AND name IN (${forbidden.map(()=>'?').join(',')})`,...forbidden).toArray();

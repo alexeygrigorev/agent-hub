@@ -346,7 +346,7 @@ describe('fleet health visibility + machine aliasing', () => {
 
 });
 
- it('persists complete census freshness without rewriting unchanged session rows or every heartbeat', () => fixture(async ({sql}) => {
+ it('coalesces unchanged session and complete census checkpoints while live observations stay fresh', () => fixture(async ({sql}) => {
    let tick=now; const fleet=new FleetService(sql, fn=>fn(), ()=>tick);
    machine(sql,'census-host','census-host',now);
    const caller={caller:{machineId:'census-host',kind:'host',actor:'machine:census-host'},scopes:['host']};
@@ -358,9 +358,11 @@ describe('fleet health visibility + machine aliasing', () => {
    tick+=30000; expect((await (await send()).json() as any).written).toBe(0);
    expect(fixtureStatements(sql).exec("SELECT observed_at FROM fleet_catalog_seen WHERE machine_id='census-host'").one().observed_at).toBe(first);
    expect(fixtureStatements(sql).exec("SELECT observed_at FROM fleet_catalog_census WHERE machine_id='census-host'").one().observed_at).toBe(first);
-   tick+=870000; expect((await (await send()).json() as any).written).toBe(0);
-   expect(fixtureStatements(sql).exec("SELECT observed_at FROM fleet_catalog_seen WHERE machine_id='census-host'").one().observed_at).toBe(iso(900000));
+   tick+=270000; expect((await (await send()).json() as any).written).toBe(0);
    expect(fixtureStatements(sql).exec("SELECT observed_at FROM fleet_sessions WHERE machine_id='census-host'").one().observed_at).toBe(first);
+   tick+=600000; expect((await (await send()).json() as any).written).toBe(1);
+   expect(fixtureStatements(sql).exec("SELECT observed_at FROM fleet_catalog_seen WHERE machine_id='census-host'").one().observed_at).toBe(iso(900000));
+   expect(fixtureStatements(sql).exec("SELECT observed_at FROM fleet_sessions WHERE machine_id='census-host'").one().observed_at).toBe(iso(900000));
    expect(fixtureStatements(sql).exec("SELECT observed_at FROM fleet_catalog_census WHERE machine_id='census-host'").one().observed_at).toBe(iso(900000));
    const malformed=await send({...payload,census_complete:1 as any});
    expect(malformed.status).toBe(400);

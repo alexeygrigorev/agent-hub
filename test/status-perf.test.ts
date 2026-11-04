@@ -106,6 +106,7 @@ it('bounds status and host query work with retained production-scale history', a
     // Real retained launch: replay claims must promptly refuse a terminal row.
     ['POST', `/api/fleet/launches/${sessionId(11999)}/claim`, true, {}, 409],
   ];
+  const reconciledIds=new Set<string>();
   const workBefore = await rowMeterSnapshot(stub);
   for (const [method, path, host, payload, status] of cases) {
     const times: number[] = [];
@@ -120,7 +121,10 @@ it('bounds status and host query work with retained production-scale history', a
       clientTimes.push(performance.now() - start);
       expect(response.status, JSON.stringify(body).slice(0, 200)).toBe(status);
       if(path === '/api/fleet/offers') {
-        expect(body.reconciliation).toHaveLength(56);
+        expect(body.reconciliation.length).toBeGreaterThan(0);expect(body.reconciliation.length).toBeLessThanOrEqual(25);
+        expect(body.reconciliation_observation_pending).toBe(true);expect(body.observation_pending).toBe(true);
+        expect(body.reconciliation_cursors).toHaveProperty('uncertain');
+        for(const item of body.reconciliation)reconciledIds.add(item.id);
         expect(body.reconciliation[0].binding.detail).toHaveLength(200);
       }
       if (path === '/api/status') {
@@ -146,6 +150,7 @@ it('bounds status and host query work with retained production-scale history', a
     expect(response.status).toBe(200);await response.json();
   }
   report("DO fetch/headers POST status after native write", coldPost);
+  expect(reconciledIds.size).toBe(56);
   // A real host census changes activity before watchdog. Warm-only reads
   // would miss expensive canonical projection rebuilds after that write.
   const invalidatedWatchdog:number[]=[];

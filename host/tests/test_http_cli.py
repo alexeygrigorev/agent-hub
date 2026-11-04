@@ -1081,6 +1081,20 @@ export default {{
         self.assertIn("404", res_unknown.stderr)
 
     def test_real_worker_root_role_held_denial_and_zero_effects(self):
+        # Authenticate a real current job generation before exercising the
+        # separate M3 prohibition on role:root routing. An orphan job bearer
+        # correctly fails the global authority gate with 401 instead.
+        job_hash = sha256_b64url("token_root_job")
+        self.seed_sql(
+            "INSERT INTO jobs (id,kind,idempotency_key,payload,status,created_at,deadline_at,actor,holder_host_id,holder_machine_id,claim_token_hash,lease_epoch) "
+            "VALUES ('job-root-1','root-run','cli-root-denial','{}','running',?,?,'role:root','mach-A','mach-A',?,1)",
+            ["2026-01-01T00:00:00Z", "2030-01-01T00:00:00Z", job_hash],
+        )
+        self.seed_sql(
+            "INSERT INTO leases (name,epoch,holder_job_id,holder_host_id,holder_machine_id,expires_at) "
+            "VALUES ('root',1,'job-root-1','mach-A','mach-A',?)",
+            ["2030-01-01T00:00:00Z"],
+        )
         # 1. Attempt send with --from role:root is explicitly denied with 403 (missing_m4_root_authority)
         res_from_root = self.run_cli([
             "send",

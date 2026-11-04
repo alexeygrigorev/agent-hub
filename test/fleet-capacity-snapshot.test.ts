@@ -239,6 +239,9 @@ describe('bounded real Fleet autonomous capacity snapshot',()=>{
     const cursor=fixtureStatements(sql).exec(query,'online',iso(-60000));
     expect(cursor.toArray()).toEqual([{exit_reason:'engine_runtime_timeout',updated_at:iso(-1)}]);
     expect(Number(cursor.rowsRead)).toBeLessThanOrEqual(8);
+    // The400-row index scaffolding must not masquerade as a complete live
+    // admission cohort: the independent safety observation caps at128.
+    fixtureStatements(sql).exec("UPDATE fleet_launches SET state='stopped' WHERE id!='runtime-399'");
     expect(s.resources.capacityCpuAdmitted('online')).toBe(false);
     fixtureStatements(sql).exec("UPDATE fleet_launches SET state='running' WHERE id='runtime-399'");
     expect(s.resources.capacityCpuAdmitted('online')).toBe(true);

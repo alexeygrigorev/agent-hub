@@ -52,7 +52,7 @@ async function fullHistory(id: string): Promise<any[]> {
   return [...archived, ...task.payload_data.history.map((event: any) => ({ sequence: order[event.id], event }))]
     .sort((a, b) => a.sequence - b.sequence).map(item => item.event);
 }
-async function state() { return inDO(stub(), (h: any) => Object.fromEntries(['tasks','rules','grants','receipts','meta','note_archive'].map(t => [t, h.sql.exec('SELECT * FROM intake_' + t + ' ORDER BY id').toArray()]))); }
+async function state() { return inDO(stub(), (h: any, ctx: any) => Object.fromEntries(['tasks','rules','grants','receipts','meta','note_archive'].map(t => [t, fixtureSql(h,ctx).exec('SELECT * FROM intake_' + t + ' ORDER BY id').toArray()]))); }
 
 beforeEach(async () => {
   cookie = (await createSessionCookie(env as any, { sub: 'operator', email: 'admin@fake.local', isAdmin: true, csrfToken: 'csrf', exp: Math.floor(Date.now()/1000)+3600 })).split(';')[0];
@@ -62,6 +62,7 @@ beforeEach(async () => {
     h.env.HUB_ADMIN_TOKEN_SHA256 = 'a'.repeat(64);
     // Only fixture-owned archive rows are reset; production archives are append-only.
     sql.exec('DROP TRIGGER IF EXISTS intake_fixture_fault');
+    sql.exec('DROP TRIGGER IF EXISTS intake_archive_fixture_fault');
     sql.exec('DROP TRIGGER IF EXISTS intake_note_archive_no_delete');
     sql.exec('DELETE FROM intake_note_archive');
     sql.exec("CREATE TRIGGER intake_note_archive_no_delete BEFORE DELETE ON intake_note_archive BEGIN SELECT RAISE(ABORT,'append_only_note_archive'); END");
@@ -1259,13 +1260,20 @@ describe('private durable intake HTTP/SQLite', () => {
       return data.history;
     });
     const before = await state();
-    await inDO(stub(), (h: any) => h.sql.exec("CREATE TRIGGER intake_archive_fixture_fault BEFORE INSERT ON intake_receipts BEGIN SELECT RAISE(ABORT,'fixture fault'); END"));
+    await inDO(stub(), (h: any,ctx: any) => fixtureSql(h,ctx).exec("CREATE TRIGGER intake_archive_fixture_fault BEFORE INSERT ON intake_receipts BEGIN SELECT RAISE(ABORT,'fixture fault'); END"));
     const payload = { key: 'archive-atomic', expected_version: 1, event: { kind: 'note', text: 'new marker', source } };
     try {
-      expect((await call('/tasks/' + task.id + '/events', payload)).status).toBe(500);
+      // Native SQL errors expose no measurable cursor; the financial guard
+      // stops this day even though the business transaction rolls back.
+      const failed = await call('/tasks/' + task.id + '/events', payload);
+      expect(failed.status).toBe(503);
+      expect(await failed.json()).toMatchObject({error:'do_daily_row_budget_exceeded'});
       expect(await state()).toEqual(before);
     } finally {
-      await inDO(stub(), (h: any) => h.sql.exec('DROP TRIGGER intake_archive_fixture_fault'));
+      await inDO(stub(), async (h: any,ctx: any) => {
+        fixtureSql(h,ctx).exec('DROP TRIGGER intake_archive_fixture_fault');
+        await freshFixtureBudgetDay(h);
+      });
     }
     const result = await ok('/tasks/' + task.id + '/events', payload);
     expect(result.task.history_archive.count).toBeGreaterThan(0);

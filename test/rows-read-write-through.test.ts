@@ -315,6 +315,10 @@ it('legacy retention hints cannot rearm an idle alarm or start autonomous cleanu
   await runInDurableObject(stub,async(hub:Hub,state:DurableObjectState)=>{
     await freshFixtureBudgetDay(hub);
     const h:any=hub;
+    // Isolate the retired retention hint from legitimate root/job intents.
+    fixtureSql(hub,state).exec('UPDATE root_scheduling SET enabled=0');
+    fixtureSql(hub,state).exec('DELETE FROM hub_background_work');
+    await state.storage.deleteAlarm();
     await state.storage.put('bus_retention_pending',true);
     let cleanups=0;
     h.busService.retentionCleanup=()=>{cleanups++;return {hasMore:false};};

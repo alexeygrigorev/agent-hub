@@ -249,7 +249,10 @@ it('fails closed: an unreadable dependency graph refuses a start instead of allo
   try {
     const refused = await api('/sessions', { key: 'fail-closed', workspace: 'demo', intake_task_id: original.id, brief: 'Go' });
     expect(refused.status, JSON.stringify(refused.data)).toBe(503);
-    expect(refused.data.error).toBe('dependency_check_failed');
+    expect(refused.data.error).toBe('do_daily_row_budget_exceeded');
+    // The missing authority table also trips the financial breaker; neither
+    // dependency failure nor its budget consequence may start a session.
+    await inDO(stub(),(h:any)=>expect(fixtureSql(h).exec("SELECT id FROM session_control_sessions WHERE json_extract(request_json,'$.intake_task_id')=?",original.id).toArray()).toHaveLength(0));
   } finally {
     await inDO(stub(), (h: any) => fixtureSql(h).exec('ALTER TABLE intake_dependencies_hold RENAME TO intake_dependencies'));
   }

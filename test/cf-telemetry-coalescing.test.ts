@@ -32,6 +32,7 @@ describe('live telemetry persistence coalescing',()=>{
       meter.runSync('report-'+i,()=>r.report('host',{samples:[sample({current_rss_mb:100,current_cpu_cores:.5,cpu_seconds:30+i,runtime_s:110+i,peak_rss_mb:250+i})],reaps:[]}));
       expect(meter.snapshot()['report-'+i]?.rows_written??0).toBe(0);
     }
+    console.log(JSON.stringify({evidence:'route_service_native_cost',route:'POST /api/fleet/resources/report',case:'warm changing telemetry',...meter.snapshot()['report-59'],excludes:'outer authentication, KV ledger and guard migration preflight'}));
     expect(r.headroom('host').reserved_mb).toBe(412);
     expect(r.cpuHeadroom('host').ramping_cpu_cores).toBe(1.5);
     expect(raw.exec("SELECT peak_rss_mb FROM session_resource_usage WHERE session_id='session'").one().peak_rss_mb).toBe(200);
@@ -243,4 +244,70 @@ it('seeks the deployed runtime-failure partial index independently of neutral re
   const second=meter.runSync('runtime-known',()=>r.cpuHeadroom('host'));
   expect(second).toMatchObject({admitted:false,reason:'host_runtime_choking',runtime_observation_limited:false});
   expect(meter.snapshot()['runtime-known'].rows_read).toBeLessThan(100);
+}));
+
+it('keeps fresh coalesced activity visible and expires or invalidates idle authority without scanning history',()=>fixture(({f,r,raw,sql,meter,iso,advance}:any)=>{
+  raw.exec("UPDATE intake_tasks SET data=json_set(data,'$.status','done','$.archived_at',1,'$.history',json(?)) WHERE id='task'",JSON.stringify([{kind:'note',text:'DONE abc1234\nlive check: synthetic activity fixture\nresult: passed'}]));
+  const native=(activity=iso())=>({native_id:'native',last_activity_at:activity,observed_at:iso()});
+  r.noteCensus('host',[native()],false);
+  expect(r.sessions('host')[0]).toMatchObject({last_activity_at:iso(),activity_observation_limited:false});
+  advance(1000);r.noteCensus('host',[native()],false);
+  meter.runSync('fresh-activity',()=>expect(r.sessions('host')[0]).toMatchObject({last_activity_at:iso(),activity_observation_limited:false}));
+  expect(meter.snapshot()['fresh-activity']?.rows_read??0).toBeLessThan(20);
+  expect(meter.snapshot()['fresh-activity']?.rows_written??0).toBe(0);
+  advance(181000);
+  expect(r.sessions('host')[0]).toMatchObject({activity_observation_limited:true,idle_reap_allowed:false});
+  r.noteCensus('host',[native()],false);
+  expect(r.sessions('host')[0]).toMatchObject({activity_observation_limited:false,idle_reap_allowed:true});
+  expect(()=>(f as any).transaction(()=>{r.noteCensus('host',[native()],false);throw new Error('rollback-live-activity');})).toThrow('rollback-live-activity');
+  expect(r.sessions('host')[0]).toMatchObject({activity_observation_limited:true,idle_reap_allowed:false});
+  r.noteCensus('host',[native()],false);
+  sql.exec("UPDATE fleet_sessions SET last_activity_at='2026-01-01T00:00:00Z' WHERE machine_id='host' AND native_id='native'");
+  expect(r.sessions('host')[0]).toMatchObject({activity_observation_limited:true,idle_reap_allowed:false});
+}));
+
+it('never restores idle authority from an old durable row after live activity cache eviction',()=>fixture(({r,raw,iso,advance}:any)=>{
+  raw.exec("UPDATE intake_tasks SET data=json_set(data,'$.status','done','$.archived_at',1,'$.history',json(?)) WHERE id='task'",JSON.stringify([{kind:'note',text:'DONE abc1234\nlive check: synthetic activity fixture\nresult: passed'}]));
+  advance(181000); // a cold read cannot mistake an old15-minute checkpoint for fresh evidence
+  expect(r.sessions('host')[0]).toMatchObject({activity_observation_limited:true,idle_reap_allowed:false});
+  r.noteCensus('host',[{native_id:'native',last_activity_at:iso(),observed_at:iso()}],false);
+  expect(r.sessions('host')[0].activity_observation_limited).toBe(false);
+  for(let batch=0;batch<5;batch++)r.noteCensus('host',Array.from({length:500},(_,i)=>({native_id:'cache-fill-'+batch+'-'+i,last_activity_at:iso(),observed_at:iso()})),false);
+  expect(r.sessions('host')[0]).toMatchObject({activity_observation_limited:true,idle_reap_allowed:false});
+  r.noteCensus('host',[{native_id:'native',last_activity_at:iso(),observed_at:iso()}],false);
+  expect(r.sessions('host')[0]).toMatchObject({activity_observation_limited:false,idle_reap_allowed:true});
+}));
+
+it('does not adopt a new host report stamp while retaining another hosts stale live activity',()=>fixture(({r,raw,sql,iso}:any)=>{
+  raw.exec("UPDATE intake_tasks SET data=json_set(data,'$.status','done','$.archived_at',1,'$.history',json(?)) WHERE id='task'",JSON.stringify([{kind:'note',text:'DONE abc1234\nlive check: synthetic activity fixture\nresult: passed'}]));
+  raw.exec("INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at) VALUES('other','other','other',?,?)",iso(),iso());
+  raw.exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,native_id,created_at,updated_at)
+    SELECT 'other-launch',actor,requester_kind,summary,'other-key',request_json,'other',engine,account,mode,workspace,prompt,state,'other-native',created_at,updated_at FROM fleet_launches WHERE id='launch'`);
+  raw.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,fleet_launch_id,machine_id,engine,mode,state,binding_json,created_at,updated_at)
+    SELECT 'other-session',actor,'other-control',request_json,'other-launch','other',engine,mode,state,json_set(binding_json,'$.native_id','other-native'),created_at,updated_at FROM session_control_sessions WHERE id='session'`);
+  raw.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,workspace,last_activity_at) VALUES('other','other-native','agent','opencode','running',?,'/repo',?)",iso(),iso());
+  const report=(host:string,id:string)=>r.noteCensus(host,[{native_id:id,last_activity_at:iso(),observed_at:iso()}],false);
+  report('host','native');report('other','other-native');
+  expect(r.sessions('other')[0].activity_observation_limited).toBe(false);
+  sql.exec("UPDATE fleet_sessions SET last_activity_at='2026-01-01T00:00:00Z' WHERE machine_id='other' AND native_id='other-native'");
+  report('host','native');
+  expect(r.sessions('other')[0]).toMatchObject({activity_observation_limited:true,idle_reap_allowed:false});
+  report('other','other-native');
+  expect(r.sessions('other')[0].activity_observation_limited).toBe(false);
+}));
+
+it('marks reconciliation pages partial and reaches all56 pending launches without freezing the first25 in a response cache',()=>fixture(async({f,raw,meter,iso}:any)=>{
+ raw.exec(`WITH RECURSIVE n(i) AS(SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<56)
+  INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,created_at,updated_at)
+  SELECT 'reconcile-'||i,'test','human','test','reconcile-'||i,'{}','host','opencode','go','headless','/repo','test','uncertain',?,? FROM n`,iso(),iso());
+ const seen=new Set<string>();
+ for(let page=0;page<3;page++) {
+  const response=await meter.run('reconcile-page-'+page,()=>f.handle(new Request('https://hub/api/fleet/reconciliation'),{caller:{kind:'host',machineId:'host'},scopes:['host']}));
+  expect(response.status).toBe(200);const body=await response.json();
+  expect(body.observation_scope).toBe('raw_state_page');expect(body.observation_pending).toBe(true);
+  expect(body.launches.length).toBeLessThanOrEqual(25);expect(body.next_cursors).toHaveProperty('uncertain');
+  for(const row of body.launches)if(row.id.startsWith('reconcile-'))seen.add(row.id);
+  expect(meter.snapshot()['reconcile-page-'+page].rows_read).toBeLessThan(400);
+ }
+ expect(seen.size).toBe(56);
 }));

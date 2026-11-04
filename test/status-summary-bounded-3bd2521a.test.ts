@@ -101,11 +101,22 @@ it('status reads stay bounded to the capped selection and keep their output shap
     }));
     expect(ev.status).toBe(200);
   }
+  const remaining=()=>Number(h.sql.exec("SELECT COUNT(*) AS n FROM intake_status_summary WHERE archived_at IS NULL AND status IN ('done','cancelled')").one().n);
+  // Three256-row raw pages have not reached the retained terminal tail.
+  // The next explicit request completes it without enlarging a single page.
+  expect(remaining()).toBe(44);
+  await freshFixtureBudgetDay(h);
+  const finalPrune=await h.fetch(new Request('https://hub.test/api/intake/tasks/t0000/events',{
+    method:'POST',headers:{Cookie:cookie,'x-csrf-token':csrf,'Content-Type':'application/json'},
+    body:JSON.stringify({key:'prune-bounded-3',expected_version:6,note:{text:'final bounded page'}}),
+  }));
+  expect(finalPrune.status).toBe(200);
+  expect(remaining()).toBe(0);
+  expect(queries.filter(q=>q.includes('SELECT id,status,archived_at FROM intake_status_summary WHERE id>? ORDER BY id LIMIT 256'))).toHaveLength(4);
   for (const q of queries) {
     expect(q.includes(LEGACY_UNBOUNDED)).toBe(false);
     expect(q.includes(LEGACY_UNBOUNDED_TASKS)).toBe(false);
   }
-  expect(Number(h.sql.exec("SELECT COUNT(*) AS n FROM intake_status_summary WHERE archived_at IS NULL AND status IN ('done','cancelled')").one().n)).toBe(0);
 
   // Loose wall-time fence: the bounded path must stay far below the legacy
   // multi-second projection (generous headroom keeps CI variance out).

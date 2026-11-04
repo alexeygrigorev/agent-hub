@@ -622,6 +622,7 @@ export class FleetService {
   // Last intake linkage revision the census late-link pass ran at, per machine (intake e8a22f4c).
   private linkRevisions = new Map<string, string>();
   private reconciliationAfter = new Map<string, number>();
+  private reconciliationPages=new Map<string,{pending:boolean;cursors:Record<string,number>}>();
   private candidateCache = new Map<string, { revision: string; at: number; value: any[] }>();
   private pollMaintenanceAt = 0;
   private maintenanceDirty = true;
@@ -864,7 +865,7 @@ export class FleetService {
     const revision = this.candidateRevision();
     const key = revision ? `${revision}|${catalogFresh ? 1 : 0}` : null;
     const hit = this.candidateCache.get(machine);
-    if (key && hit && hit.revision === key && at >= hit.at && at - hit.at < POLL_MAINTENANCE_MS) return hit.value;
+    if (key && hit && !this.reconciliationPages.get(machine)?.pending && hit.revision === key && at >= hit.at && at - hit.at < POLL_MAINTENANCE_MS) return hit.value;
     const value = this.reconciliationCandidatesUncached(machine, catalogFresh);
     if (key) this.candidateCache.set(machine, { revision: key, at, value });
     return value;
@@ -885,18 +886,22 @@ export class FleetService {
     // page before native/reason predicates. Transient cursors let sparse
     // candidates behind already observed or unrelated history make progress.
     const raw: any[] = [];
+    let pending=false;const cursors:Record<string,number>={};
     for (const state of ['starting','running','uncertain','failed']) {
       const key = JSON.stringify([machine,state]);
       const after = this.reconciliationAfter.get(key) ?? 0;
       const page = this.sql.exec(`SELECT rowid AS source_rowid,* FROM fleet_launches INDEXED BY fleet_launch_machine_state
-        WHERE machine_id=? AND state=? AND rowid>? ORDER BY rowid LIMIT 25`,machine,state,after).toArray() as any[];
-      this.reconciliationAfter.set(key,page.length === 25 ? Number(page[page.length-1].source_rowid) : 0);
-      for (const row of page) {
+        WHERE machine_id=? AND state=? AND rowid>? ORDER BY rowid LIMIT 26`,machine,state,after).toArray() as any[];
+      const selected=page.slice(0,25);
+      const next=page.length>25?Number(selected.at(-1)!.source_rowid):0;
+      this.reconciliationAfter.set(key,next);cursors[state]=next;pending ||= page.length>25||after>0;
+      for (const row of selected) {
         if (state === 'failed' && !(row.mode === 'headless' && row.exit_reason === SILENT_START_REASON &&
             row.verification_status === 'unverified' && row.finished_at > new Date(this.now()-ABANDONED_RECOVERY_MS).toISOString())) continue;
         raw.push(row);
       }
     }
+    this.reconciliationPages.set(machine,{pending,cursors});
     return raw.filter(row => {
       if (row.native_id === null) return true;
       return !this.sql.exec(`SELECT 1 FROM fleet_sessions WHERE machine_id=? AND native_id=? AND engine=?
@@ -2424,7 +2429,9 @@ export class FleetService {
       if (!host) return response({ error: 'forbidden' }, 403);
       // Legacy failed dispatches predate the host journal. The host must fence
       // the maintained launcher before sending the existing no-start receipt.
-      return response({ launches: this.reconciliationCandidates(caller.machineId!) });
+      const launches=this.reconciliationCandidates(caller.machineId!);
+      const page=this.reconciliationPages.get(caller.machineId!);
+      return response({launches,observation_scope:'raw_state_page',observation_pending:page?.pending??false,next_cursors:page?.cursors??{}});
     }
     if (path === '/api/fleet/reconcile' && request.method === 'POST') {
       if (!admin) return response({ error: 'forbidden' }, 403);
@@ -2946,11 +2953,13 @@ export class FleetService {
           });
         });
         const body = { offers: this.routing.enrichOffers(offers), reconciliation: this.reconciliationCandidates(caller.machineId!), engine_epoch: engineEpoch(this.sql),
-          observation_scope:'raw_state_page',observation_pending:offeredPending||resumePending,
+          observation_scope:'raw_state_page',observation_pending:offeredPending||resumePending||(this.reconciliationPages.get(caller.machineId!)?.pending??false),
+          reconciliation_observation_pending:this.reconciliationPages.get(caller.machineId!)?.pending??false,
+          reconciliation_cursors:this.reconciliationPages.get(caller.machineId!)?.cursors??{},
           offer_cursor:this.offeredCursors.get(caller.machineId!)??null,resume_cursor:this.reofferCursors.get(caller.machineId!)??null };
         // Only the all-clear answer is reusable: with offers present the poll
         // itself drives claim/resume rotation, so every answer is fresh.
-        if (offersStamp !== undefined && valid.length === 0 && resumeRows.length === 0 && !offeredPending && !resumePending) {
+        if (offersStamp !== undefined && valid.length === 0 && resumeRows.length === 0 && !offeredPending && !resumePending && !body.reconciliation_observation_pending) {
           if (this.emptyOffers.size >= 8) this.emptyOffers.clear();
           this.emptyOffers.set(caller.machineId!, { stamp: this.writes!.stamp('fleet_launches','machines','fleet_accounts','fleet_routes','engine_epoch',
             'status_lifecycle_revision','fleet_catalog_seen','session_control_sessions'), at: polledAt, value: body });
@@ -3089,15 +3098,15 @@ export class FleetService {
             // Activity and sampling timestamps coalesce together; actual control state
             // changes above persist immediately. Keep the latest timestamps when due.
             // Volatile progress timestamps alone must not rewrite the row every minute:
-            // touch observed_at at most every 5 min to keep the 10-min liveness window.
+            // persist timestamps every15min; fresh activity is held in the exact live overlay.
             try {
               const prevObs = prior.observed_at ? Date.parse(prior.observed_at) : 0;
-              if (this.now() - prevObs >= 5 * 60 * 1000) {
+              if (this.now() - prevObs >= 15 * 60 * 1000) {
                 this.sql.exec('UPDATE fleet_sessions SET observed_at = ?,last_activity_at=?,progress_json=? WHERE machine_id = ? AND native_id = ?', new Date(this.now()).toISOString(), row.last_activity_at,row.progress_json,caller.machineId!, s.native_id);
                 written++;
-                observedRows.push({ machine_id: caller.machineId!, native_id: s.native_id, tag: s.tag, engine: s.engine, phase: s.phase, agent_state: s.agent_state, observed_at: new Date(this.now()).toISOString(), workspace: s.workspace, cwd: row.cwd, profile: s.profile, account: s.account, last_activity_at: row.last_activity_at });
               }
             } catch {}
+            observedRows.push({...prior,...row,machine_id:caller.machineId!,observed_at:new Date(this.now()).toISOString()});
             continue;
           }
           changedSessions.push(s);
