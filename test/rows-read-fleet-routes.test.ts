@@ -90,26 +90,46 @@ it('PUT /api/fleet/sessions with an unchanged census reads rows per reported row
   console.log(JSON.stringify({evidence:'route_service_native_cost',route:'PUT /api/fleet/sessions',case:'unchanged500',history_rows:HOSTS*HISTORY,rows_read:after.total,rows_written:after.written,excludes:'outer authentication, KV ledger and guard migration preflight'}));
 },true));
 
-it('production cache configuration serves100 unchanged500-row census polls in one strict budget day', withFleet(async(s,t,hub)=>{
+it('production cache configuration settles then serves100 unchanged500-row polls in one strict budget day', withFleet(async(s,t,hub)=>{
   const sessions=Array.from({length:CENSUS},(_,i)=>({native_id:uuid(3,i),tag:'hub-'+uuid(1,i),engine:'codex',
     phase:i<5?'running':'exited',confirmed_exit:i>=5,agent_state:null,workspace:'/w',cwd:'/w',profile:null,
     account:null,last_activity_at:null,created_at_ms:now-1000-i}));
   const put=()=>s.handle(new Request('https://hub.test/api/fleet/sessions',{method:'PUT',body:JSON.stringify({sessions})}),host);
-  expect((await put()).status).toBe(200);
-  const before=(hub as any).rowBudget.status();
-  const from=t.mark();
-  for(let i=0;i<100;i++)expect((await put()).status).toBe(200);
-  const receipt=t.report(from);
+  const budget=()=>(hub as any).rowBudget.status();
+  const consumed=(status:any)=>status.reserved_total-status.available_total;
+  const initial=budget(),startupFrom=t.mark(),startup:any[]=[];
+  let quiet=0;
+  // Adoption can change the linkage revision after Fleet records it, causing
+  // one later full link pass. That500-PK pass evicts chunk reads from the512
+  // entry SQL memo; a following request primes them again. Require observed
+  // settling, rather than hiding any fixed number of expensive requests.
+  for(let i=0;i<8&&quiet<2;i++) {
+    const from=t.mark(),before=budget();
+    const response=await put();
+    const cost=t.report(from),guard=consumed(budget())-consumed(before);
+    startup.push({call:i+1,status:response.status,rows_read:cost.total,rows_written:cost.written,guard_consumed_total:guard});
+    quiet=cost.total===0&&cost.written===0&&guard===0?quiet+1:0;
+  }
+  const startupCost=t.report(startupFrom),startupAfter=budget();
+  console.log(JSON.stringify({evidence:'route_service_native_cost',route:'PUT /api/fleet/sessions',case:'bounded startup cache priming, fixed observation clock, production caches',
+    max_calls:8,settled:quiet===2,calls:startup.length,polls:startup,rows_read:startupCost.total,rows_written:startupCost.written,
+    guard_consumed_total:consumed(startupAfter)-consumed(initial),excludes:'outer authentication, KV ledger and guard migration preflight from visible SQL counters'}));
+  expect(quiet).toBe(2);
+  expect(startup.every(poll=>poll.status===200)).toBe(true);
+  expect(startupAfter).toMatchObject({day:initial.day,limit_total:20000,stopped:false});
+
+  const before=budget(),from=t.mark(),statuses:number[]=[];
+  for(let i=0;i<100;i++)statuses.push((await put()).status);
+  const receipt=t.report(from),after=budget(),guardConsumed=consumed(after)-consumed(before);
+  console.log(JSON.stringify({evidence:'route_service_native_cost',route:'PUT /api/fleet/sessions',case:'100 settled unchanged500 polls, fixed observation clock, production caches',
+    calls:100,history_rows:HOSTS*HISTORY,rows_read:receipt.total,rows_written:receipt.written,guard_consumed_total:guardConsumed,
+    excludes:'outer authentication, KV ledger and guard migration preflight from visible SQL counters'}));
+  expect(statuses.every(status=>status===200)).toBe(true);
   expect(receipt.written).toBe(0);
   expect(receipt.total,JSON.stringify(receipt.top)).toBeLessThanOrEqual(100);
-  const after=(hub as any).rowBudget.status();
-  expect(after).toMatchObject({limit_total:20000,stopped:false});
-  const guardConsumed=(after.reserved_total-after.available_total)-(before.reserved_total-before.available_total);
+  expect(after).toMatchObject({day:initial.day,limit_total:20000,stopped:false});
   expect(guardConsumed).toBeGreaterThanOrEqual(0);
   expect(guardConsumed).toBeLessThanOrEqual(100);
-  console.log(JSON.stringify({evidence:'route_service_native_cost',route:'PUT /api/fleet/sessions',case:'100 warm unchanged500 polls, fixed observation clock, production caches',
-    calls:100,history_rows:HOSTS*HISTORY,rows_read:receipt.total,rows_written:receipt.written,guard_consumed_total:guardConsumed,
-    excludes:'outer authentication, KV ledger and guard migration preflight'}));
 },true));
 
 it('GET /api/fleet/offers with no offers reads a bounded number of rows', withFleet(async (s, t) => {

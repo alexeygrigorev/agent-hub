@@ -1045,18 +1045,31 @@ export class FleetService {
     // Active concurrency is derived from observed live native sessions; launch
     // reservations without a matching observed live native hold capacity only
     // within RESERVATION_TTL_MS and release early on a fresh complete census.
+    // Bound the account/state index prefixes BEFORE TTL/host filters. A busy
+    // foreign host or retained terminal history must not turn an admission
+    // probe into an unbounded machine scan. An incomplete prefix cannot prove
+    // spare account capacity and never reaches native correlation.
+    const capacityLimit = 256;
+    const rawReservations = snapshot ? [] : liveList.length ? this.sql.exec(`SELECT id,machine_id,updated_at
+      FROM fleet_launches INDEXED BY fleet_launch_account_state
+      WHERE account=? AND state IN ('offered','starting','running','uncertain') LIMIT 257`, account.label).toArray() as any[] : [];
+    const rawNatives = snapshot ? [] : liveList.length ? this.sql.exec(`SELECT machine_id,native_id,phase,last_activity_at
+      FROM fleet_sessions INDEXED BY fleet_session_account_phase
+      WHERE account=? AND phase IN ('starting','running','broken','unknown','uncertain') LIMIT 257`, account.label).toArray() as any[] : [];
+    const capacityLimited = !snapshot && (rawReservations.length > capacityLimit || rawNatives.length > capacityLimit);
+    const nativeJoin = !snapshot && !capacityLimited && rawReservations.length ? reservationNativeJoinSql(this.sql) : '';
     const reservations = snapshot ? snapshot.launches.filter(l => l.account === account.label &&
       l.state !== 'queued' && l.updated_at > reservationCutoff)
-      : this.byChunks(liveList, marks => `SELECT l.id,l.account,l.state,l.native_id,l.machine_id,l.updated_at,s.phase,s.last_activity_at,s.account AS native_account FROM fleet_launches l
-          ${reservationNativeJoinSql(this.sql)}
-          WHERE l.account=? AND l.updated_at>?
-          AND l.state IN ${ACTIVE} AND l.machine_id IN (${marks})`, account.label, reservationCutoff);
+      : capacityLimited ? [] : rawReservations.filter(l => liveIds.has(String(l.machine_id)) && l.updated_at > reservationCutoff)
+        .flatMap(l => this.sql.exec(`SELECT l.id,l.account,l.state,l.native_id,l.machine_id,l.updated_at,s.phase,s.last_activity_at,s.account AS native_account
+          FROM fleet_launches l ${nativeJoin} WHERE l.id=?`,l.id).toArray() as any[]);
     const hasInFlight = reservations.some(r => !r.native_id && (r.state === 'starting' || r.state === 'uncertain'));
-    const inflightExpr = hasInFlight ? INFLIGHT_LAUNCH_ID_SQL : 'NULL';
-    const natives = snapshot ? snapshot.natives.filter(n => n.account === account.label)
-      : this.byChunks(liveList, marks => `SELECT s.machine_id,s.native_id,s.phase,s.last_activity_at,${inflightExpr} AS inflight_launch_id
-          FROM fleet_sessions s WHERE s.account = ? AND s.phase IN ('starting','running','broken','unknown','uncertain')
-          AND s.machine_id IN (${marks})`, account.label);
+    const natives: any[] = snapshot ? snapshot.natives.filter(n => n.account === account.label)
+      : capacityLimited ? [] : rawNatives.filter(n => liveIds.has(String(n.machine_id)));
+    if (!snapshot && hasInFlight) for (const native of natives) {
+      native.inflight_launch_id = (this.sql.exec(`SELECT ${INFLIGHT_LAUNCH_ID_SQL} AS inflight_launch_id
+        FROM fleet_sessions s WHERE s.machine_id=? AND s.native_id=?`,native.machine_id,native.native_id).toArray()[0] as any)?.inflight_launch_id;
+    }
     const startingNativeIds = new Set(reservations.filter(r => r.state === 'starting' && r.native_id).map(r => `${r.machine_id}\0${r.native_id}`));
     const startingLaunchIds = new Set(reservations.filter(r => r.state === 'starting' && r.id).map(r => String(r.id)));
     const isIdle = (row: any) => {
@@ -1084,15 +1097,12 @@ export class FleetService {
     let nativeLive: number | null = null;
     try {
       const seen = completeCatalogs;
-      if (liveList.length && liveList.every(id => seen.has(id))) nativeLive = snapshot
-        ? snapshot.natives.filter(n => n.account === account.label && n.phase === 'running').length
-        : this.byChunks(liveList, marks => `SELECT COUNT(*) AS n FROM fleet_sessions s
-            WHERE s.account=? AND s.phase='running' AND s.machine_id IN (${marks})`, account.label)
-            .reduce((total, row) => total + Number(row.n), 0);
+      if (!capacityLimited && liveList.length && liveList.every(id => seen.has(id))) nativeLive = natives.filter(n => n.phase === 'running').length;
     } catch { nativeLive = null; }
-    const availableSlots = Math.max(0, Number(account.max_concurrency) - active);
+    const availableSlots = capacityLimited ? 0 : Math.max(0, Number(account.max_concurrency) - active);
     const placeableMachines = new Set<string>();
     const placementReasons = new Set<string>();
+    if (capacityLimited) placementReasons.add('capacity_observation_limited');
     if (!routes.length) placementReasons.add('no_routes');
     if (!account.enabled) placementReasons.add('account_disabled');
     if (!availableSlots) placementReasons.add('account_concurrency');
@@ -1104,7 +1114,8 @@ export class FleetService {
       } else placementReasons.add(liveIds.has(String(route.machine_id)) ? 'engine_unavailable' : 'machine_unavailable');
     }
     return { label: canonicalAccountLabel(account.label), provider, max_concurrency: account.max_concurrency, reserve_percent: account.reserve_percent, enabled: !!account.enabled, supports_goal: GOAL_PROVIDERS.has(provider),
-      remaining_percent: remaining, status: blocked ? 'blocked' : (!observed || (remaining === null && !unmeteredOk) || (!healthy && unknown)) ? 'unknown' : 'ok', active, available_slots: availableSlots,
+      capacity_observation_limited: capacityLimited, active_is_lower_bound: capacityLimited,
+      remaining_percent: remaining, status: (blocked || capacityLimited) ? 'blocked' : (!observed || (remaining === null && !unmeteredOk) || (!healthy && unknown)) ? 'unknown' : 'ok', active, available_slots: availableSlots,
       // Counted vs live: active splits into launch reservations + orphan
       // observed sessions; native_live is the host-catalog verified live
       // process count for this account (includes launch-linked sessions).
@@ -1613,6 +1624,7 @@ export class FleetService {
       else if (Number.isFinite(hb.disk_free_gb) && hb.disk_free_gb < this.resources.config().disk_floor_gb) reason = 'disk_floor';
       else if (request.mode === 'headless' && disk()?.admitted === false) reason = 'launcher_disk_reserve';
       else if (!cpu().admitted) reason = cpu().reason!;
+      else if (account?.capacity_observation_limited) reason = 'capacity_observation_limited';
       else if (!account || account.status === 'blocked') reason = 'account_' + (account?.status || 'unmapped');
       else if (!routeQuota.ok) reason = 'quota_' + routeQuota.reason;
       else if (account.available_slots < 1) reason = 'account_concurrency';

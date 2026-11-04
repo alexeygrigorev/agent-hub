@@ -75,6 +75,49 @@ describe('Fleet recovery and paging use deployed indexes',()=>{
       .toMatchObject({state:'failed',verification_status:'not_started'});
   }));
 
+  it('account capacity bounds indexed active prefixes before foreign-host filtering',()=>fixture(async(_hub,raw)=>{
+    raw.exec("INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at,capabilities) VALUES('host','host','host',?,?,?)",AT,AT,JSON.stringify({engines:['codex']}));
+    // Same account and same machine: a machine-only plan reads all retained
+    // terminal history even when there are just two live natives to count.
+    for(let i=0;i<2100;i++) {
+      raw.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,account)
+        VALUES('host',?,?,'codex','exited',?,'account')`,'old-'+i,'old-'+i,AT);
+      launch(raw,'terminal-'+i,'stopped');
+    }
+    for(const phase of ['running','unknown']) raw.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,account)
+      VALUES('host',?,?,'codex',?,?,'account')`,phase,phase,phase,AT);
+    const m=measured(raw),fleet=new FleetService(m.sql as any,(fn:any)=>fn(),()=>NOW);
+    const definition={label:'account',provider:'codex',max_concurrency:10,reserve_percent:15,enabled:1};
+    // Skip unrelated maintenance only in this component query-cost test;
+    // the real account-status implementation and all accounting SQL run.
+    (fleet as any).reconcileCapacity=()=>{};
+    m.reset();const known=fleet.accountStatus(definition);
+    expect(known).toMatchObject({active:2,available_slots:8,capacity_observation_limited:false});
+    expect(m.rows()).toBeLessThan(150);
+    console.log(JSON.stringify({evidence:'route_service_native_cost',operation:'FleetService.accountStatus',case:'2100terminal history per table,2live natives',rows_read:m.rows(),excludes:'outer authentication, KV ledger,maintenance and guard migration preflight'}));
+    for(const query of m.queries.filter(q=>q.includes('INDEXED BY fleet_session_account_phase')||q.includes('INDEXED BY fleet_launch_account_state'))) {
+      const detail=raw.exec('EXPLAIN QUERY PLAN '+query,'account').toArray().map((r:any)=>r.detail).join(' | ');
+      expect(detail).toMatch(/SEARCH.*USING INDEX fleet_(session_account_phase|launch_account_state)/);
+      expect(detail).not.toMatch(/TEMP B-TREE|^SCAN /);
+    }
+    // Raw foreign-host occupancy must refuse, rather than scanning until it
+    // finds enough eligible local rows or declaring the local account free.
+    for(let i=0;i<257;i++) raw.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,account)
+      VALUES('foreign',?,?,'codex','running',?,'account')`,'foreign-'+i,'foreign-'+i,AT);
+    m.reset();const limited=fleet.accountStatus(definition);
+    expect(limited).toMatchObject({status:'blocked',available_slots:0,placeable_slots:0,native_live:null,
+      capacity_observation_limited:true,active_is_lower_bound:true});
+    expect(limited.placement_reasons).toContain('capacity_observation_limited');
+    expect(m.rows()).toBeLessThan(700);
+    expect(m.queries.some(q=>q.includes('COUNT(*)'))).toBe(false);
+    raw.exec("DELETE FROM fleet_sessions WHERE machine_id='foreign'");
+    for(let i=0;i<257;i++)launch(raw,'stale-offer-'+i,'offered',null,new Date(NOW-86400000).toISOString());
+    m.reset();const stalePrefix=fleet.accountStatus(definition);
+    expect(stalePrefix).toMatchObject({status:'blocked',available_slots:0,capacity_observation_limited:true});
+    expect(m.rows()).toBeLessThan(700);
+    expect(m.queries.some(q=>q.includes('WHERE l.id=?'))).toBe(false);
+  }));
+
   it('maps legacy three-part session cursors to the existing primary-key order',()=>fixture(async(_hub,raw)=>{
     for(let i=0;i<1200;i++)raw.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace)
       VALUES('host',?,?,'exited',?,'/repo')`,'native-'+String(i).padStart(4,'0'),'tag-'+(1200-i),AT);
