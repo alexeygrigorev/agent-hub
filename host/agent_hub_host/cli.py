@@ -494,6 +494,8 @@ def main():
     ops_liveness.add_parser(sub)
     from . import limits_cli
     limits_cli.add_parser(sub)
+    from . import shared_credentials as shared_credentials_cli
+    shared_credentials_cli.add_parser(sub)
     from . import asks as asks_cli
     asks_cli.add_parser(sub)
     
@@ -727,6 +729,10 @@ def main():
     if args.cmd == 'limits':
         from . import limits_cli
         limits_cli.run(args)
+        return
+    if args.cmd == 'shared-credentials':
+        from . import shared_credentials as shared_credentials_cli
+        shared_credentials_cli.run(args)
         return
     if args.cmd == 'asks':
         from . import asks as asks_cli

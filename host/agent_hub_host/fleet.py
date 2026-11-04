@@ -1203,7 +1203,13 @@ def load_settings(path=None):
         if path.stat().st_size > 65536:
             raise ValueError("Subscription configuration exceeds 64 KiB")
         data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or set(data) - {"version", "subscriptions", "workspaces", "workspace_roots", "launcher", "aplexer_bin", "capabilities", "max_agents", "cleanup_roots", "native_start_argv", "role_consumer", "role_config", "journal_dir", "git", "git_identity", "opencode_auth", "host_load_factor", "disabled_engines", "disabled_accounts", "repo_worktree_root", "repos"} or data.get("version") != 1:
+    if not isinstance(data, dict) or set(data) - {"version", "subscriptions", "workspaces", "workspace_roots", "launcher", "aplexer_bin", "capabilities", "max_agents", "cleanup_roots", "native_start_argv", "role_consumer", "role_config", "journal_dir", "git", "git_identity", "opencode_auth", "host_load_factor", "disabled_engines", "disabled_accounts", "repo_worktree_root", "repos", "aws_gate_credential_process"} or data.get("version") != 1:
+        raise ValueError("Invalid subscription configuration")
+    # Non-secret AWS Gate credential_process command for the shared-config
+    # bundle placeholder (intake 0043dadb); absent means the aws folder is
+    # skipped (fail closed) rather than installed unusable.
+    gate_process = data.get("aws_gate_credential_process", "")
+    if not isinstance(gate_process, str) or len(gate_process) > 2048 or "\0" in gate_process:
         raise ValueError("Invalid subscription configuration")
     if 'repos' in data:
         repos_config = data['repos']
