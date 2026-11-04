@@ -16,28 +16,43 @@ export type FleetCapacitySnapshot = {
 export const capacityFamilyKey = (machine: string, provider: string) => JSON.stringify([machine, provider]);
 export const RESERVATION_TTL_MS = 15 * 60 * 1000;
 export const LIVE_NATIVE_PHASES = new Set(['starting', 'running', 'broken', 'unknown', 'uncertain']);
-export const NATIVE_IN_FLIGHT_SQL = `(
-  l.native_id IS NULL AND l.state IN ('starting','uncertain') AND
-  l.engine = s.engine AND l.account = s.account AND l.profile IS s.profile AND
-  CASE WHEN json_valid(l.request_json) THEN
-    CASE WHEN json_extract(l.request_json, '$.cwd') IS NULL OR json_extract(l.request_json, '$.cwd') = '.'
-      THEN l.workspace
-      WHEN json_extract(l.request_json, '$.cwd') LIKE '/%' OR json_extract(l.request_json, '$.cwd') GLOB '[A-Za-z]:[/\\]*'
-      THEN json_extract(l.request_json, '$.cwd')
-      ELSE rtrim(l.workspace, '/') || '/' || json_extract(l.request_json, '$.cwd') END
-    END = s.workspace AND
-  (SELECT COUNT(*) FROM (SELECT 1 FROM fleet_sessions spawned WHERE spawned.machine_id = s.machine_id
-   AND spawned.tag = s.tag AND spawned.engine = s.engine AND spawned.account = s.account
-   AND spawned.profile IS s.profile AND spawned.workspace = s.workspace
-   AND spawned.phase IN ('starting','running','broken','unknown','uncertain') LIMIT 2)) = 1 AND
-  ((l.mode = 'headless' AND s.tag = 'task-hub-' || l.id) OR
-   (l.mode = 'interactive' AND s.tag = 'hub-' || l.id)))`;
-export const INFLIGHT_LAUNCH_ID_SQL = `CASE WHEN NOT EXISTS (SELECT 1 FROM fleet_launches l
-  WHERE l.machine_id=s.machine_id AND l.native_id=s.native_id AND l.state IN ('offered','starting','running','uncertain'))
-  THEN (SELECT l.id FROM fleet_launches l
-  WHERE l.id = CASE WHEN substr(s.tag,1,9)='task-hub-' THEN substr(s.tag,10)
-    WHEN substr(s.tag,1,4)='hub-' THEN substr(s.tag,5) END
-  AND l.machine_id=s.machine_id AND ${NATIVE_IN_FLIGHT_SQL}) END`;
+const NATIVE_WORKSPACE_SQL = `CASE WHEN json_valid(l.request_json) THEN
+  CASE WHEN json_extract(l.request_json,'$.cwd') IS NULL OR json_extract(l.request_json,'$.cwd')='.' THEN l.workspace
+    WHEN json_extract(l.request_json,'$.cwd') LIKE '/%' OR json_extract(l.request_json,'$.cwd') GLOB '[A-Za-z]:[/\\]*'
+      THEN json_extract(l.request_json,'$.cwd')
+    ELSE rtrim(l.workspace,'/')||'/'||json_extract(l.request_json,'$.cwd') END END`;
+
+/** Match only complete bounded native cohorts. Uniqueness must not be
+ * inferred by filtering an unrelated host's retained rows inside LIMIT2. */
+export function correlateInFlightNatives(sql:SqlStorage,natives:Row[],completeNatives:Row[]=natives):void {
+  if(natives.length>CAPACITY_LIMITS.natives || completeNatives.length>CAPACITY_LIMITS.natives)
+    throw new Error('capacity_observation_limited');
+  const signature=(row:Row)=>JSON.stringify([row.machine_id,row.tag,row.engine,row.account,row.profile??null,row.workspace]);
+  const counts=new Map<string,number>();
+  for(const row of completeNatives)if(LIVE_NATIVE_PHASES.has(row.phase)) {
+    const key=signature(row);counts.set(key,(counts.get(key)??0)+1);
+  }
+  for(const native of natives) {
+    native.inflight_launch_id=null;
+    if(!LIVE_NATIVE_PHASES.has(native.phase)||counts.get(signature(native))!==1||typeof native.tag!=='string'
+      ||native.machine_id==null||native.native_id==null||native.engine==null||native.account==null||native.workspace==null)continue;
+    const id=native.tag.startsWith('task-hub-')?native.tag.slice(9):native.tag.startsWith('hub-')?native.tag.slice(4):null;
+    if(id===null)continue;
+    const launch:any=sql.exec(`SELECT l.id,l.machine_id,l.native_id,l.state,l.engine,l.account,l.profile,l.mode,
+      ${NATIVE_WORKSPACE_SQL} AS native_workspace FROM fleet_launches l WHERE l.id=?`,id).toArray()[0];
+    if(!launch || launch.native_id!==null || !['starting','uncertain'].includes(launch.state)
+      ||launch.machine_id!==native.machine_id ||launch.engine!==native.engine ||launch.account!==native.account
+      ||(launch.profile??null)!==(native.profile??null) ||launch.native_workspace!==native.workspace
+      ||native.tag!==(launch.mode==='headless'?'task-hub-':launch.mode==='interactive'?'hub-':'')+launch.id
+      ||!['headless','interactive'].includes(launch.mode))continue;
+    // Existing native linkage wins across ALL accounts, including a foreign
+    // account omitted from the bounded account-specific candidate cohort.
+    if(sql.exec(`SELECT 1 FROM fleet_launches INDEXED BY fleet_launch_native_state
+      WHERE machine_id=? AND native_id=? AND state IN ('offered','starting','running','uncertain') LIMIT 1`,
+      native.machine_id,native.native_id).toArray().length)continue;
+    native.inflight_launch_id=launch.id;
+  }
+}
 
 /** Match the exact historical native, including an incarnation-checked control
  * binding when a launch shed its native_id. Both ordinary and snapshot reads
@@ -104,7 +119,7 @@ export function reservationHoldsCapacity(
 /** No maintenance, global scans or aggregate counts. Each indexed key batch has
  * at most 50 keys, leaving room for fixed bindings under SQLite's 100 limit.
  * Stop at the first overflow; no account/resource projection sees a prefix. */
-export function readFleetCapacitySnapshot(sql: SqlStorage, now: number, unreservedPredicate: string): FleetCapacitySnapshot {
+export function readFleetCapacitySnapshot(sql: SqlStorage, now: number): FleetCapacitySnapshot {
   const bounded = (query: string, limit: number, ...args: any[]): Row[] => {
     const rows = sql.exec(query, ...args).toArray() as Row[];
     if (rows.length > limit) throw new Error('capacity_observation_limited');
@@ -137,17 +152,12 @@ export function readFleetCapacitySnapshot(sql: SqlStorage, now: number, unreserv
     FROM fleet_launches l ${reservationNativeJoinSql(sql)}
     WHERE l.machine_id IN (${marks}) AND l.state IN ('queued','offered','starting','running','uncertain') LIMIT ${n}`);
   if (new Set(launches.map(l => l.engine)).size > CAPACITY_LIMITS.engines) throw new Error('capacity_observation_limited');
-  const natives = keyed(ids, CAPACITY_LIMITS.natives, (marks, n) => `SELECT machine_id,native_id,account,phase,last_activity_at
+  const natives = keyed(ids, CAPACITY_LIMITS.natives, (marks, n) => `SELECT machine_id,native_id,account,phase,last_activity_at,tag,engine,profile,workspace
     FROM fleet_sessions WHERE machine_id IN (${marks}) AND phase IN ('starting','running','broken','unknown','uncertain') LIMIT ${n}`);
   // Only after BOTH observation budgets succeeded may incarnation correlation
   // run, and only when an unbound starting/uncertain launch exists to correlate.
   const hasInFlight = launches.some(l => !l.native_id && (l.state === 'starting' || l.state === 'uncertain'));
-  if (hasInFlight) {
-    for (const native of natives) {
-      native.inflight_launch_id = sql.exec(`SELECT ${INFLIGHT_LAUNCH_ID_SQL} AS inflight_launch_id
-        FROM fleet_sessions s WHERE s.machine_id=? AND s.native_id=?`, native.machine_id, native.native_id).one().inflight_launch_id;
-    }
-  }
+  if (hasInFlight) correlateInFlightNatives(sql,natives);
   const seen = keyed(ids, CAPACITY_LIMITS.hosts, (marks, n) => `SELECT machine_id,observed_at FROM fleet_catalog_census
     WHERE complete=1 AND observed_at>=? AND observed_at<=? AND machine_id IN (${marks}) LIMIT ${n}`,
     new Date(now - 180000).toISOString(), new Date(now + 60000).toISOString());

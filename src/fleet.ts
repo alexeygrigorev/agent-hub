@@ -34,7 +34,7 @@ import { readAccountCapacityHistory } from './account-capacity-history';
 import { LIMIT_MAX, LIMIT_MIN, limitRowUpdates, planLimitSet, resolveLimitTarget } from './fleet-limits';
 import { resolveMachineAliases, projectAliasSessions } from './machine-alias';
 import { freshCatalogs, freshCompleteCatalogs, noteCatalogObservation, invalidateCatalogObservations } from './catalog-freshness';
-import { readFleetCapacitySnapshot, capacityFamilyKey, reservationNativeJoinSql, unobservedReservationReleased, reservationHoldsCapacity, RESERVATION_TTL_MS, INFLIGHT_LAUNCH_ID_SQL, type FleetCapacitySnapshot } from './fleet-capacity-snapshot';
+import { readFleetCapacitySnapshot, capacityFamilyKey, reservationNativeJoinSql, unobservedReservationReleased, reservationHoldsCapacity, RESERVATION_TTL_MS, correlateInFlightNatives, type FleetCapacitySnapshot } from './fleet-capacity-snapshot';
 import { syncTbmFromServerAccounts } from './tbm-ingestion';
 import { recordSessionTokens } from './tbm-controller';
 import { applyNormalizedScores, computeEngineDecision, fallbackModelIds, isDesktopCodexExcluded, isHealthyAlternative, loadProviderPacing, loadPools, netHeadroom, pacingFor, resetUrgency, scheduleBurnFactor } from './pacing';
@@ -100,38 +100,6 @@ export const ROUTE_QUARANTINE_FAILURES = 3;
 export const ROUTE_FAILURE_NEUTRAL_REASONS = new Set(['launcher_offer_expired', 'model_unsupported', 'launcher_memory_reserve', 'account_capacity', 'account_concurrency',
   'machine_capacity', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking', 'host_load_high', 'operator_stopped', 'stopped_by_operator', 'cancelled']);
 const ACTIVE = ACTIVE_LAUNCH_STATES_SQL;
-// A native catalog can observe spawn before the launcher posts its receipt.
-// Correlate that narrow in-flight window without trusting a tag alone.
-const NATIVE_IN_FLIGHT = `(
-  l.native_id IS NULL AND l.state IN ('starting','uncertain') AND
-  l.engine = s.engine AND l.account = s.account AND l.profile IS s.profile AND
-  -- Native start runs in the validated workspace-relative cwd, which can
-  -- differ from the project root stored on the launch. Match that exact
-  -- intended directory; never correlate by a task tag or path suffix alone.
-  CASE WHEN json_valid(l.request_json) THEN
-    CASE WHEN json_extract(l.request_json, '$.cwd') IS NULL OR json_extract(l.request_json, '$.cwd') = '.'
-      THEN l.workspace
-      WHEN json_extract(l.request_json, '$.cwd') LIKE '/%' OR json_extract(l.request_json, '$.cwd') GLOB '[A-Za-z]:[/\\]*'
-      THEN json_extract(l.request_json, '$.cwd')
-      ELSE rtrim(l.workspace, '/') || '/' || json_extract(l.request_json, '$.cwd') END
-    END = s.workspace AND
-  (SELECT COUNT(*) FROM (SELECT 1 FROM fleet_sessions spawned WHERE spawned.machine_id = s.machine_id
-   AND spawned.tag = s.tag AND spawned.engine = s.engine AND spawned.account = s.account
-   AND spawned.profile IS s.profile AND spawned.workspace = s.workspace
-   AND spawned.phase IN ('starting','running','broken','unknown','uncertain') LIMIT 2)) = 1 AND
-  ((l.mode = 'headless' AND s.tag = 'task-hub-' || l.id) OR
-   (l.mode = 'interactive' AND s.tag = 'hub-' || l.id)))`;
-// Separate exact native identity from the in-flight predicate so SQLite can
-// seek the native index instead of scanning every active reservation per row.
-// The managed tag narrows the second lookup to one primary key; the complete
-// incarnation predicate still proves the correlation (a tag alone cannot).
-const NATIVE_UNRESERVED = `NOT EXISTS (SELECT 1 FROM fleet_launches l
-  WHERE l.machine_id=s.machine_id AND l.native_id=s.native_id AND l.state IN ${ACTIVE})
-  AND NOT EXISTS (SELECT 1 FROM fleet_launches l
-  WHERE l.id = CASE WHEN substr(s.tag,1,9)='task-hub-' THEN substr(s.tag,10)
-    WHEN substr(s.tag,1,4)='hub-' THEN substr(s.tag,5) END
-  AND l.machine_id=s.machine_id AND ${NATIVE_IN_FLIGHT})`;
-
 /** Registry reserves cannot fall below the configured admission reserve. */
 const HEADROOM: Record<string, number> = { ...policy.rules.reserve_percent,
   'codex-orin': policy.rules.reserve_percent.codex };
@@ -937,7 +905,7 @@ export class FleetService {
 
   /** Bounded read-only observations for autonomous queue budgets. */
   queueCapacitySnapshot(now = this.now()): FleetCapacitySnapshot {
-    return readFleetCapacitySnapshot(this.sql, now, NATIVE_UNRESERVED);
+    return readFleetCapacitySnapshot(this.sql, now);
   }
 
   accountStatus(account: any, snapshot?: FleetCapacitySnapshot) {
@@ -1053,7 +1021,7 @@ export class FleetService {
     const rawReservations = snapshot ? [] : liveList.length ? this.sql.exec(`SELECT id,machine_id,updated_at
       FROM fleet_launches INDEXED BY fleet_launch_account_state
       WHERE account=? AND state IN ('offered','starting','running','uncertain') LIMIT 257`, account.label).toArray() as any[] : [];
-    const rawNatives = snapshot ? [] : liveList.length ? this.sql.exec(`SELECT machine_id,native_id,phase,last_activity_at
+    const rawNatives = snapshot ? [] : liveList.length ? this.sql.exec(`SELECT machine_id,native_id,phase,last_activity_at,tag,engine,account,profile,workspace
       FROM fleet_sessions INDEXED BY fleet_session_account_phase
       WHERE account=? AND phase IN ('starting','running','broken','unknown','uncertain') LIMIT 257`, account.label).toArray() as any[] : [];
     const capacityLimited = !snapshot && (rawReservations.length > capacityLimit || rawNatives.length > capacityLimit);
@@ -1066,10 +1034,7 @@ export class FleetService {
     const hasInFlight = reservations.some(r => !r.native_id && (r.state === 'starting' || r.state === 'uncertain'));
     const natives: any[] = snapshot ? snapshot.natives.filter(n => n.account === account.label)
       : capacityLimited ? [] : rawNatives.filter(n => liveIds.has(String(n.machine_id)));
-    if (!snapshot && hasInFlight) for (const native of natives) {
-      native.inflight_launch_id = (this.sql.exec(`SELECT ${INFLIGHT_LAUNCH_ID_SQL} AS inflight_launch_id
-        FROM fleet_sessions s WHERE s.machine_id=? AND s.native_id=?`,native.machine_id,native.native_id).toArray()[0] as any)?.inflight_launch_id;
-    }
+    if (!snapshot && hasInFlight) correlateInFlightNatives(this.sql,natives,rawNatives);
     const startingNativeIds = new Set(reservations.filter(r => r.state === 'starting' && r.native_id).map(r => `${r.machine_id}\0${r.native_id}`));
     const startingLaunchIds = new Set(reservations.filter(r => r.state === 'starting' && r.id).map(r => String(r.id)));
     const isIdle = (row: any) => {

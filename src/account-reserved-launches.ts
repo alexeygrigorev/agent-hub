@@ -1,4 +1,4 @@
-import { reservationNativeJoinSql, reservationHoldsCapacity, INFLIGHT_LAUNCH_ID_SQL } from './fleet-capacity-snapshot';
+import { reservationNativeJoinSql, reservationHoldsCapacity, correlateInFlightNatives } from './fleet-capacity-snapshot';
 
 export const ACTIVE_LAUNCH_STATES_SQL = "('offered','starting','running','uncertain')";
 
@@ -65,16 +65,14 @@ export function reservedLaunchPage(
   try { hasControlStore = sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_control_sessions'").toArray().length > 0; }
   catch { /* Fleet-only stores have no session-control binding. */ }
   if (context.live_ids.length > 64) throw new Error('capacity_observation_limited');
-  const natives = sql.exec(`SELECT machine_id,native_id FROM fleet_sessions INDEXED BY fleet_session_account_phase
+  const natives = sql.exec(`SELECT machine_id,native_id,phase,tag,engine,account,profile,workspace FROM fleet_sessions INDEXED BY fleet_session_account_phase
     WHERE account=? AND phase IN ('starting','running','broken','unknown','uncertain') LIMIT 257`,account).toArray() as any[];
   if (natives.length > 256) throw new Error('capacity_observation_limited');
   const live = new Set(context.live_ids);
   const inFlightMatchedIds = new Set<string>();
-  for (const native of natives.filter(row=>live.has(String(row.machine_id)))) {
-    const match = sql.exec(`SELECT ${INFLIGHT_LAUNCH_ID_SQL} AS inflight_launch_id FROM fleet_sessions s
-      WHERE s.machine_id=? AND s.native_id=?`,native.machine_id,native.native_id).toArray()[0] as any;
-    if (typeof match?.inflight_launch_id === 'string') inFlightMatchedIds.add(match.inflight_launch_id);
-  }
+  const selected=natives.filter(row=>live.has(String(row.machine_id)));
+  correlateInFlightNatives(sql,selected,natives);
+  for(const native of selected)if(typeof native.inflight_launch_id==='string')inFlightMatchedIds.add(native.inflight_launch_id);
   let after = cursor?.rowid ?? 0;
   if (cursor && cursor.rowid === undefined) {
     const legacy = sql.exec('SELECT rowid AS source_rowid FROM fleet_launches WHERE id=? AND account=? AND state=?',cursor.id,account,cursor.state).toArray()[0] as any;

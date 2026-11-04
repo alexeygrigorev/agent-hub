@@ -118,6 +118,47 @@ describe('Fleet recovery and paging use deployed indexes',()=>{
     expect(m.queries.some(q=>q.includes('WHERE l.id=?'))).toBe(false);
   }));
 
+  it('correlates a unique in-flight native without scanning other accounts and preserves ambiguity fences',()=>fixture(async(_hub,raw)=>{
+    raw.exec("INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at,capabilities) VALUES('host','host','host',?,?,?)",AT,AT,JSON.stringify({engines:['codex']}));
+    raw.exec("INSERT INTO fleet_catalog_census(machine_id,observed_at,complete) VALUES('host',?,1)",AT);
+    for(let i=0;i<2100;i++)raw.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,account,workspace)
+      VALUES('host',?,?,'codex','running',?,'other','/repo')`,'foreign-active-'+i,'noise-'+i,AT);
+    launch(raw,'inflight-start','starting');
+    const old=new Date(NOW-86400000).toISOString();
+    const spawn=(id:string)=>raw.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,account,workspace,last_activity_at)
+      VALUES('host',?,'task-hub-inflight-start','codex','running',?,'account','/repo',?)`,id,AT,old);
+    spawn('target-native');
+    const m=measured(raw),fleet=new FleetService(m.sql as any,(fn:any)=>fn(),()=>NOW);
+    (fleet as any).reconcileCapacity=()=>{};
+    const definition={label:'account',provider:'codex',max_concurrency:10,reserve_percent:15,enabled:1};
+    m.reset();
+    expect(fleet.accountStatus(definition)).toMatchObject({active:1,reserved:0,observed_sessions:1,native_live:1,capacity_observation_limited:false});
+    expect(m.rows()).toBeLessThan(150);
+    expect(m.queries.some(q=>q.includes('fleet_sessions spawned'))).toBe(false);
+    const boundQuery=m.queries.find(q=>q.includes('INDEXED BY fleet_launch_native_state'))!;
+    expect(boundQuery).toBeTruthy();
+    const detail=raw.exec('EXPLAIN QUERY PLAN '+boundQuery,'host','target-native').toArray().map((row:any)=>row.detail).join(' | ');
+    expect(detail).toMatch(/SEARCH.*COVERING INDEX fleet_launch_native_state/);
+    expect(detail).not.toMatch(/TEMP B-TREE|^SCAN /);
+    console.log(JSON.stringify({evidence:'route_service_native_cost',operation:'FleetService.accountStatus',case:'2100 other-account active natives, one unique in-flight target',rows_read:m.rows(),excludes:'outer authentication, KV ledger, maintenance and guard migration preflight'}));
+
+    m.reset();
+    expect(reservedLaunchPage(m.sql,'account',{live_ids:['host'],reservation_cutoff:new Date(NOW-900000).toISOString(),complete_catalogs:new Map([['host',NOW]])},10).rows).toEqual([]);
+    expect(m.rows()).toBeLessThan(150);
+    spawn('duplicate-target');
+    m.reset();
+    expect(fleet.accountStatus(definition)).toMatchObject({reserved:1,observed_sessions:0,native_live:2});
+    expect(m.rows()).toBeLessThan(150);
+    raw.exec("DELETE FROM fleet_sessions WHERE native_id='duplicate-target'");
+    launch(raw,'already-bound-elsewhere','running');
+    raw.exec("UPDATE fleet_launches SET account='other',native_id='target-native' WHERE id='already-bound-elsewhere'");
+    m.reset();
+    // Existing direct-native linkage wins even when its account is not in
+    // the account-specific source: never deduplicate through a second launch.
+    expect(fleet.accountStatus(definition)).toMatchObject({reserved:1,observed_sessions:0,native_live:1});
+    expect(m.rows()).toBeLessThan(150);
+  }));
+
   it('maps legacy three-part session cursors to the existing primary-key order',()=>fixture(async(_hub,raw)=>{
     for(let i=0;i<1200;i++)raw.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace)
       VALUES('host',?,?,'exited',?,'/repo')`,'native-'+String(i).padStart(4,'0'),'tag-'+(1200-i),AT);
