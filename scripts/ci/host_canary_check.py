@@ -166,7 +166,7 @@ def main() -> int:
         if build_code != 0:
             return 1
         pytest_code = run_suite(
-            "pytest discovery (legacy host, repo root)",
+            "pytest discovery (repo root)",
             REPO_ROOT,
             prefix + ["-m", "pytest", "-q", "-o", "tmp_path_retention_count=0",
                       "-o", "tmp_path_retention_policy=none",
