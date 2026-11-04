@@ -311,6 +311,11 @@ const offeredIndexPending=()=>Object.assign(new Error('job_offer_indexes_pending
 const leaseIndexNames=['leases_active_due_ms','leases_active_name','leases_holder_job'];
 const deferredLeaseStatements=JOBS_SCHEMA_SQL.split(';').map(s=>s.trim()).filter(s=>leaseIndexNames.some(name=>s.startsWith('CREATE INDEX IF NOT EXISTS '+name+' ')));
 
+export class WriterIntentObservationLimit extends Error {
+  readonly status=503;readonly code='writer_intent_observation_pending';
+  constructor(){super('writer_intent_observation_pending');}
+}
+
 export class JobsService {
   public roles: RoleLeases;
   private sql: SqlStorage;
@@ -507,7 +512,7 @@ export class JobsService {
           !['claimed','running'].includes(job.status) || !this.roleCurrent(job)) return { error: 'unauthorized_or_stale' };
       if (job.role_effect) return { execute: false, status: 'HOLD', reason: 'execution_intent_already_recorded' };
       if (this.hasUnresolvedWriterIntent(job)) return { execute: false, status: 'HOLD', reason: 'previous_execution_unresolved' };
-      const unresolved = this.sql.exec(`SELECT id FROM jobs WHERE role_name IS NOT NULL AND role_effect IS NOT NULL
+      const unresolved = this.sql.exec(`SELECT id FROM jobs INDEXED BY jobs_role_pending_profile WHERE role_name IS NOT NULL AND role_effect IS NOT NULL
         AND role_finish IS NULL AND kind=? AND payload=? AND id!=? LIMIT 1`, job.kind, job.payload, jobId).toArray()[0];
       if (unresolved) return { execute: false, status: 'HOLD', reason: 'previous_execution_unresolved' };
       this.sql.exec('UPDATE jobs SET role_effect=? WHERE id=? AND role_effect IS NULL', canonical({ action: 'execute', epoch, generation, payload: job.payload }), jobId);
@@ -1264,10 +1269,14 @@ export class JobsService {
     // idempotency-key fallback (dated keys without payload.date) was retired
     // with intake 19848714: no stored rows used it and fresh offers always
     // carry payload.date. Project, role name, request key and epoch are not identities.
-    return !!this.sql.exec(`SELECT id FROM jobs WHERE kind='writer-run' AND id!=?
-      AND role_effect IS NOT NULL AND role_finish IS NULL
-      AND COALESCE(NULLIF(CASE WHEN json_valid(payload) THEN json_extract(payload,'$.date') END,''),'')=? LIMIT 1`,
-      job.id, identity.slice('writer:'.length)).toArray()[0];
+    const source=this.sql.exec('SELECT id FROM jobs ORDER BY id LIMIT 129').toArray();
+    if(source.length>128)throw new WriterIntentObservationLimit();
+    // Preserve SQLite's legacy JSON/value equality, but only after proving
+    // the complete raw cohort. CROSS JOIN hydrates each known job by its PK.
+    return !!this.sql.exec(`SELECT j.id FROM json_each(?) raw CROSS JOIN jobs j ON j.id=raw.value
+      WHERE j.kind='writer-run' AND j.id!=? AND j.role_effect IS NOT NULL AND j.role_finish IS NULL
+      AND COALESCE(NULLIF(CASE WHEN json_valid(j.payload) THEN json_extract(j.payload,'$.date') END,''),'')=? LIMIT 1`,
+      JSON.stringify(source.map(row=>row.id)),job.id,identity.slice('writer:'.length)).toArray()[0];
   }
 
   async claimJob(

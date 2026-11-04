@@ -45,7 +45,7 @@ import {
   taskIdFromWorkKey,
   validateWorkClaimData,
 } from './work_claim';
-import { JobsService, JOBS_SCHEMA_SQL } from './jobs';
+import { JobsService, JOBS_SCHEMA_SQL, WriterIntentObservationLimit } from './jobs';
 import { roleName } from './role_leases';
 import { FleetService } from './fleet';
 import { ProvisioningService } from './provisioning';
@@ -2222,6 +2222,7 @@ export class Hub extends DurableObject {
 
       return new Response("Not found", { status: 404 });
     } catch (e: any) {
+      if (e instanceof WriterIntentObservationLimit) return Response.json({ error: e.code, observation_pending: true }, { status: 503, headers: { 'Cache-Control': 'no-store' } });
       return Response.json({ error: 'Internal Server Error' }, { status: 500 });
     }
   }
