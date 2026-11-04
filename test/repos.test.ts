@@ -331,6 +331,9 @@ describe('multi-host repository checkouts', () => {
     for (const entry of entries) hub.sql.exec('INSERT INTO repo_registry VALUES (?,?,?,?)', entry.name, entry.machine, JSON.stringify(entry), at);
     const migrated = new RepoRegistry(hub.sql, fn => state.storage.transactionSync(fn));
     migrated.init(); migrated.init();
+    // Startup leaves the original table intact; this explicit authenticated
+    // request advances the bounded compatibility upgrade.
+    expect((await migrated.handle(req('', 'GET'), admin)).status).toBe(200);
     expect(migrated.all()).toHaveLength(2);
     expect(migrated.get('dtc-website').purpose).toBe(repo().purpose);
     expect(migrated.get('dtc-website').checkouts[0]).toMatchObject({ path: '/srv/git/dtc-website', head_sha: 'a'.repeat(40), updated_at: at, cloned_on_demand: false, last_used_at: null });

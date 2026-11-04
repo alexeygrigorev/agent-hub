@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
-import { updateHeartbeat } from '../src/registry';
+import { updateHeartbeat, effectiveHeartbeat } from '../src/registry';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
 
@@ -25,15 +25,21 @@ describe('host admission heartbeat persistence', () => {
 
         updateHeartbeat(machine, heartbeat(30, 85), hub.sql, now + 1000);
         stored = JSON.parse(String(hub.sql.exec('SELECT last_heartbeat FROM machines WHERE id=?', machine).one().last_heartbeat));
-        expect(stored).toMatchObject({ load: [30, 30, 30], swap_used_percent: 85 });
+        expect(stored).toMatchObject({ load: [1, 1, 1], swap_used_percent: 25 });
+        expect(JSON.parse(effectiveHeartbeat(hub.sql,machine,JSON.stringify(stored))!)).toMatchObject({load:[30,30,30],swap_used_percent:85});
 
         updateHeartbeat(machine, heartbeat(30, 82), hub.sql, now + 1500);
         stored = JSON.parse(String(hub.sql.exec('SELECT last_heartbeat FROM machines WHERE id=?', machine).one().last_heartbeat));
-        expect(stored.swap_used_percent).toBe(82);
+        expect(stored.swap_used_percent).toBe(25);
+        expect(JSON.parse(effectiveHeartbeat(hub.sql,machine,JSON.stringify(stored))!).swap_used_percent).toBe(82);
 
         updateHeartbeat(machine, heartbeat(40, 101), hub.sql, now + 2000);
         stored = JSON.parse(String(hub.sql.exec('SELECT last_heartbeat FROM machines WHERE id=?', machine).one().last_heartbeat));
-        expect(stored.swap_used_percent).toBeUndefined();
+        expect(stored.swap_used_percent).toBe(25);
+        expect(JSON.parse(effectiveHeartbeat(hub.sql,machine,JSON.stringify(stored))!).swap_used_percent).toBeUndefined();
+        updateHeartbeat(machine,heartbeat(40,82),hub.sql,now+900000);
+        stored=JSON.parse(String(hub.sql.exec('SELECT last_heartbeat FROM machines WHERE id=?',machine).one().last_heartbeat));
+        expect(stored).toMatchObject({load:[40,40,40],swap_used_percent:82});
       });
   });
 });

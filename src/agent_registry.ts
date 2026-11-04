@@ -1,3 +1,5 @@
+import {readSchemaObject,noteCreatedSchemaObject} from './schema-object-locator';
+import {schemaSqlEquivalent} from './schema-sql-equivalent';
 import type { SqlStorage } from '@cloudflare/workers-types';
 
 export const AGENT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
@@ -23,6 +25,26 @@ export function registryAddress(raw: string): { tag: string; project: string | n
   return { project: parts[0], tag: parts[1] };
 }
 
+const COLLISION_EVENTS = ['INSERT','UPDATE OF tag, project'];
+function collisionTrigger(event: string): { name: string; sql: string } {
+  const name = event.startsWith('UPDATE') ? 'agents_no_legacy_collision_update' : 'agents_no_legacy_collision_insert';
+  return { name, sql: `CREATE TRIGGER IF NOT EXISTS ${name} BEFORE ${event} ON agents
+    WHEN EXISTS (SELECT 1 FROM agents WHERE tag = NEW.tag AND rowid != NEW.rowid AND COALESCE(project,'') != COALESCE(NEW.project,'')
+      AND (COALESCE(project,'') = '' OR COALESCE(NEW.project,'') = ''))
+    BEGIN SELECT RAISE(ABORT, 'agent_exists'); END` };
+}
+
+/** The deployed f2 migration validated collisions before installing these
+ * exact guards. Their presence proves that validated boundary still holds;
+ * they prevent later inserts/updates from introducing a projectless clash. */
+function collisionGuardsInstalled(sql: SqlStorage): boolean {
+  return COLLISION_EVENTS.every(event => {
+    const expected = collisionTrigger(event);
+    const actual=readSchemaObject(sql,{name:expected.name,type:'trigger',table:'agents'});
+    return !!actual && schemaSqlEquivalent(actual.sql,expected.sql);
+  });
+}
+
 /** Ensure the current agents layout: project-scoped identity indexes plus the
  * projectless-collision guard. The M3/M4 global-tag-PK rebuild was retired
  * (intake 19848714): the live DO schema is current and no pre-migration rows
@@ -34,8 +56,23 @@ export function migrateAgentRegistry(sql: SqlStorage, transaction: <T>(fn: () =>
     if (!(sql.exec('PRAGMA table_info(agents)').toArray() as any[]).some(c => c.name === 'project')) {
       throw new Error('unsupported_agents_schema');
     }
-    if (sql.exec("SELECT 1 FROM agents a WHERE COALESCE(a.project,'') = '' AND (SELECT COUNT(*) FROM agents b WHERE b.tag = a.tag) > 1 LIMIT 1").toArray().length) {
-      throw new Error('ambiguous_legacy_registry');
+    sql.exec('CREATE INDEX IF NOT EXISTS idx_agents_tag_lookup ON agents(tag)');
+    sql.exec('CREATE TABLE IF NOT EXISTS hub_init_stamps (key TEXT PRIMARY KEY, at INTEGER NOT NULL)');
+    if (!sql.exec("SELECT 1 FROM hub_init_stamps WHERE key='agents_projectless_collision_validation_v1'").toArray().length) {
+      if (!collisionGuardsInstalled(sql)) {
+        // One bounded bootstrap observation, never a new index build over the
+        // live registry. Larger unsupported registries refuse explicitly.
+        const rows = sql.exec('SELECT project,tag FROM agents ORDER BY rowid LIMIT 5001').toArray() as any[];
+        if (rows.length > 5000) throw new Error('agent_registry_validation_incomplete');
+        const tags = new Map<string,{ projectless: boolean; count: number }>();
+        for (const row of rows) {
+          const project = String(row.project ?? '');
+          const seen = tags.get(row.tag) ?? { projectless: false, count: 0 };
+          seen.count++; seen.projectless ||= project === '';
+          if (seen.projectless && seen.count > 1) throw new Error('ambiguous_legacy_registry');
+          tags.set(row.tag,seen);
+        }
+      }
     }
     sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_project_tag_unique ON agents(COALESCE(project, ''), tag)");
     sql.exec('CREATE INDEX IF NOT EXISTS idx_agents_tag_lookup ON agents(tag)');
@@ -77,16 +114,19 @@ export function bindAgentCredentials(sql: SqlStorage, transaction: <T>(fn: () =>
       }
     }
     const canonical = (raw: string) => `COALESCE(NULLIF(${binding(raw)},''), ${raw})`;
-    // Intake e8a22f4c: the trigger body is sargable now; drop the pre-index
-    // definition once so live deployments pick it up (IF NOT EXISTS would
-    // keep scanning the registry on every message insert).
-    sql.exec('DROP TRIGGER IF EXISTS messages_bind_agents');
-    sql.exec(`CREATE TRIGGER messages_bind_agents AFTER INSERT ON messages BEGIN
+    // Compare the live definition: a new initializer must not rewrite an
+    // already-current trigger, while an old non-sargable body must upgrade.
+    const messageBindingTrigger=`CREATE TRIGGER IF NOT EXISTS messages_bind_agents AFTER INSERT ON messages BEGIN
       UPDATE messages SET from_actor = ${canonical('NEW.from_actor')}, to_actor = ${canonical('NEW.to_actor')},
         registry_unbound_from = CASE WHEN instr(NEW.from_actor,':') = 0 AND ${registryNameSql('NEW.from_actor')} AND ${binding('NEW.from_actor')} = '' THEN 1 ELSE NEW.registry_unbound_from END,
         registry_unbound_to = CASE WHEN instr(NEW.to_actor,':') = 0 AND ${registryNameSql('NEW.to_actor')} AND ${binding('NEW.to_actor')} = '' THEN 1 ELSE NEW.registry_unbound_to END
         WHERE id = NEW.id;
-      END`);
+      END`;
+    const currentMessageBinding=readSchemaObject(sql,{name:'messages_bind_agents',type:'trigger',table:'messages'});
+    const replaceMessageBinding=!!currentMessageBinding&&!schemaSqlEquivalent(currentMessageBinding.sql,messageBindingTrigger);
+    if(replaceMessageBinding)sql.exec('DROP TRIGGER messages_bind_agents');
+    sql.exec(messageBindingTrigger);
+    if(!currentMessageBinding||replaceMessageBinding)noteCreatedSchemaObject(sql,{name:'messages_bind_agents',type:'trigger',table:'messages'});
     sql.exec(`CREATE TRIGGER IF NOT EXISTS credentials_bind_agent AFTER INSERT ON credentials
       WHEN NEW.kind = 'agent' AND NEW.registry_actor IS NULL BEGIN
       UPDATE credentials SET registry_actor = ${binding("COALESCE(NULLIF(NEW.actor,''), NEW.subject)")} WHERE id = NEW.id;
@@ -123,13 +163,10 @@ export function bindAgentCredentials(sql: SqlStorage, transaction: <T>(fn: () =>
       UPDATE device_pairings SET status = 'denied' WHERE status = 'approved' AND client_kind = 'agent' AND machine_id = OLD.id;
       END`);
     // Imported legacy rows are retained. Future writes cannot introduce projectless collisions.
-    for (const event of ['INSERT','UPDATE OF tag, project']) {
-      const name = event.startsWith('UPDATE') ? 'agents_no_legacy_collision_update' : 'agents_no_legacy_collision_insert';
-      sql.exec(`CREATE TRIGGER IF NOT EXISTS ${name} BEFORE ${event} ON agents
-        WHEN EXISTS (SELECT 1 FROM agents WHERE tag = NEW.tag AND rowid != NEW.rowid AND COALESCE(project,'') != COALESCE(NEW.project,'')
-          AND (COALESCE(project,'') = '' OR COALESCE(NEW.project,'') = ''))
-        BEGIN SELECT RAISE(ABORT, 'agent_exists'); END`);
-    }
+    for (const event of COLLISION_EVENTS) sql.exec(collisionTrigger(event).sql);
+    // The validation can be skipped only after these guards are installed.
+    // Hub initializes migration + bindings in one outer transaction.
+    sql.exec("INSERT OR IGNORE INTO hub_init_stamps VALUES('agents_projectless_collision_validation_v1',?)", Date.now());
   });
 }
 

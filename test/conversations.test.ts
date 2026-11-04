@@ -1,3 +1,4 @@
+import {fixtureSql} from './helpers/fixture-budget';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import type { Hub } from '../src/hub';
@@ -1436,9 +1437,9 @@ describe('M1 Conversations Domain Service & HTTP Route Contract', () => {
           humanAlice,
         ),
       ).rejects.toThrow();
-      hub.sql.exec('DROP TRIGGER fail_conv_update');
+      fixtureSql(hub).exec('DROP TRIGGER fail_conv_update');
 
-      const msgCount = hub.sql
+      const msgCount = fixtureSql(hub)
         .exec(
           'SELECT COUNT(*) AS n FROM conversation_messages WHERE conversation_id = ?',
           conv.id,

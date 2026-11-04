@@ -1,4 +1,10 @@
-import { alertDestinations, inboxReaderStatus, ALERT_SUBJECT_COOLDOWN_MS, BUS_REFRESH_GRACE_MS, pruneAlertRouting, suppressOpenAlertBackfill } from './alert-routing';
+import {configureSchemaObjectHints} from './schema-object-locator';
+import { invalidateCatalogObservations } from './catalog-freshness';
+import { invalidateRoutingObservations } from './routing';
+import { initRootIncumbentProjection } from './root-incumbent';
+import { BackgroundWorkQueue } from './background-work';
+import { jobCredentialAllowed, roleFinishReceiptAllowed } from './auth/job-credential';
+import { alertDestinations, inboxReaderStatus, invalidateReaderObservations, ALERT_SUBJECT_COOLDOWN_MS, BUS_REFRESH_GRACE_MS, pruneAlertRouting, suppressOpenAlertBackfill } from './alert-routing';
 import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES, RecipientError, ScopingRefusal, NAMED_AGENT_PROJECT, pollSessionCredentials, mintSessionCredential, checkSendScoping, sessionIdOf, sessionRefreshAllowed, messagingSettings, updateMessagingSettings, messageEvent, setMessageState, expireSessionMessages, expireMessageEvents, readdressMessage, setDelegate, listDelegates, authorizedNamedAgent, setNamedAgentForward } from './session-messaging';
 import { handleNamedAgentRequest } from './named-agents';
 import { IdleWorkService } from './idle-work';
@@ -29,7 +35,7 @@ import { isHumanCredentialAllowed as isHumanCredentialAllowedFn, validateHumanCr
 
 import { randomString, sha256, generateUserCode, base64url } from './auth/crypto';
 import { deriveHumanRefreshSuccessor, generateTokenPair, verifyBearerScope } from './auth/token';
-import { handleRegistryRoutes, handleWebSocketMessageRegistry, handleWebSocketCloseRegistry, updateHeartbeatMemoryOnly, updateHeartbeat } from './registry';
+import { handleRegistryRoutes, handleWebSocketMessageRegistry, handleWebSocketCloseRegistry, updateHeartbeatMemoryOnly, updateHeartbeat, effectiveHeartbeatAt } from './registry';
 import { BusService, BUS_SCHEMA_SQL, CallerContext, generateUlid } from './bus';
 import {
   formatNativeActor,
@@ -39,7 +45,7 @@ import {
   taskIdFromWorkKey,
   validateWorkClaimData,
 } from './work_claim';
-import { JobsService, JOBS_SCHEMA_SQL } from './jobs';
+import { JobsService, JOBS_SCHEMA_SQL, WriterIntentObservationLimit } from './jobs';
 import { roleName } from './role_leases';
 import { FleetService } from './fleet';
 import { ProvisioningService } from './provisioning';
@@ -49,12 +55,12 @@ import { LivenessService, thresholdsFrom, alertText } from './liveness';
 import { watchCommandChannels, ensureCommandChannelSchema } from './command-channel';
 import { HostGoals } from './host-goals';
 import { BankedResets } from './banked-resets';
-import { ChecksService, validateCheck, type ActionDeps } from './checks';
+import { ChecksService, ChecksObservationLimit, validateCheck, type ActionDeps } from './checks';
 import { approvalAuthorityMatches, assignApprovalAuthority } from './host_enrollment';
 import { ensureRootScheduling, getRootScheduling, isRootSchedulingEnabled, setRootScheduling } from './root_scheduling';
 import { QuotaStore, dedupeAccountsByCanonical, handleQuotaRoutes } from './quota';
 import { handleTbmApi } from './tbm-api';
-import { tickTbm } from './tbm-controller';
+import { tickTbm,ensureTbmControllerSchema,nextTbmDue } from './tbm-controller';
 import { syncStoredTbmSnapshots } from './tbm-ingestion';
 import { SessionControlService } from './session_control';
 import { StatusService, type StatusMachineAuth } from './status';
@@ -72,12 +78,13 @@ import { TOKEN_SCHEMA_VERSION, TOKEN_SOURCES, tokenEntity, tokenPostAt, validate
 import { placementPressureSubjects } from './host-pressure';
 import { RowsMeter, ROWS_STATS_SCHEMA, normalizeRoute, rowsReadReport, rowsReadAlertThreshold, rowsWrittenAlertThreshold, ROWS_READ_TARGET_PER_DAY } from './rows-meter';
 import { sampleAccountCapacityHistory } from './account-capacity-history';
+import { RowBudget, RowBudgetExceeded } from './row-budget';
 import { WriteWatch } from './write-watch';
 import { ObservedCatalog } from './observed-catalog';
 
 const HUMAN_REFRESH_REPLAY_GRACE_MS = 30_000;
 const IDLE_WORK_INTERVAL_MS = 5 * 60_000;
-const METER_FLUSH_INTERVAL_MS = 5 * 60_000;
+const METER_FLUSH_INTERVAL_MS = 60 * 60_000;
 
 function parseEpoch(raw: any): number | null {
   if (raw === undefined || raw === null || raw === '' || typeof raw === 'boolean') return null;
@@ -143,35 +150,37 @@ export class Hub extends DurableObject {
   sql: SqlStorage;
   env: Env;
   jwksCache: JwksCache = new JwksCache();
-  public intakeService: IntakeService;
-  private workerAccess: WorkerAccess;
-  public intakeWatchdog: IntakeWatchdog;
-  public opsLiveness: OpsLiveness;
-  public intakeTriage: IntakeTriage;
-  public intakeVerifier: IntakeVerifier;
-  public askLedger: AskLedger;
-  public sessionAudit: SessionAuditService;
-  public busService: BusService;
-  public jobsService: JobsService;
-  public quotaStore: QuotaStore;
-  public statusService: StatusService;
-  public metricsStore: MetricsStore;
-  public fleetService: FleetService;
-  public repoRegistry: RepoRegistry;
-  public provisioningService: ProvisioningService;
-  public sessionControlService: SessionControlService;
-  public livenessService: LivenessService;
-  public checksService: ChecksService;
-  public monitoringService: MonitoringService;
-  public backupService: BackupService;
-  public hostHistoryService: HostHistoryService;
-  public webhookService: WebhookService;
-  public promptLibrary: PromptLibraryService;
-  public sessionSchedules: SessionSchedulesService;
-  public launchSchedules: LaunchSchedulesService;
-  public driverService: DriverService;
+  public intakeService!: IntakeService;
+  private workerAccess!: WorkerAccess;
+  public intakeWatchdog!: IntakeWatchdog;
+  public opsLiveness!: OpsLiveness;
+  public intakeTriage!: IntakeTriage;
+  public intakeVerifier!: IntakeVerifier;
+  public askLedger!: AskLedger;
+  public sessionAudit!: SessionAuditService;
+  public busService!: BusService;
+  public jobsService!: JobsService;
+  public quotaStore!: QuotaStore;
+  public statusService!: StatusService;
+  public metricsStore!: MetricsStore;
+  public fleetService!: FleetService;
+  public repoRegistry!: RepoRegistry;
+  public provisioningService!: ProvisioningService;
+  public sessionControlService!: SessionControlService;
+  public livenessService!: LivenessService;
+  public checksService!: ChecksService;
+  public monitoringService!: MonitoringService;
+  public backupService!: BackupService;
+  public hostHistoryService!: HostHistoryService;
+  public webhookService!: WebhookService;
+  public promptLibrary!: PromptLibraryService;
+  public sessionSchedules!: SessionSchedulesService;
+  public launchSchedules!: LaunchSchedulesService;
+  public driverService!: DriverService;
 
-  private idleWork: IdleWorkService;
+  private idleWork!: IdleWorkService;
+  readonly rowBudget: RowBudget;
+  private initializationComplete = false;
   readonly meter = new RowsMeter();
   readonly writes = new WriteWatch();
   /** Write-through fleet_sessions catalog shared by resources and liveness. */
@@ -199,13 +208,15 @@ export class Hub extends DurableObject {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.env = env;
+    this.rowBudget = new RowBudget(ctx.storage);
+    this.rowBudget.guardStorage(ctx.storage);
     // DO rows-read meter (intake 8081a05a): every cursor is attributed to
     // the current alarm step / route scope and flushed once per alarm.
     // The write watch observes the same statements so write-through caches
     // can stamp freshness without a SQL probe (intake 8081a05a/e8a22f4c).
     // Meter the outer wrapper so cache hits still count as route/alarm cursor
     // calls (with rowsRead=0); the inner write watch owns SQL invalidation.
-    this.sql = this.meter.wrap(this.writes.wrap(ctx.storage.sql));
+    this.sql = this.meter.wrap(this.writes.wrap(this.rowBudget.wrap(ctx.storage.sql)));
     this.observedCatalog = new ObservedCatalog(this.sql, this.writes);
     // Cache generations advance for SQL writes, including those later rolled
     // back. Observe the native transaction boundary so aborted SQL/memory
@@ -216,7 +227,14 @@ export class Hub extends DurableObject {
       const invokeTransactionSync = nativeTransactionSync.bind(storage);
       const trackedTransactionSync = (fn: any) => this.writes.transaction(
         () => invokeTransactionSync(fn),
-        () => this.observedCatalog.reset(),
+        () => {
+          this.observedCatalog.reset();
+          invalidateReaderObservations(this.sql);
+          this.busService?.invalidateInboxOffsets();
+          invalidateCatalogObservations(this.sql);
+          invalidateRoutingObservations(this.sql);
+          this.fleetService?.resources?.invalidateLiveTelemetry();
+        },
       );
       Object.defineProperty(storage, 'transactionSync', {
         configurable: true,
@@ -224,10 +242,24 @@ export class Hub extends DurableObject {
         value: trackedTransactionSync,
       });
     }
+    // All initialization SQL is prepaid durably before it runs. Exhaustion
+    // leaves this object serving 503 without re-entering expensive migrations.
+    ctx.blockConcurrencyWhile(() => this.budgeted(async () => undefined, undefined));
+  }
+
+  private backgroundWork!: BackgroundWorkQueue;
+  private backgroundRootStamp: string | null = null;
+  private backgroundAlarmStamp: string | null = null;
+
+  private initializeServices(env: Env) {
+    configureSchemaObjectHints(this.sql,env.SCHEMA_OBJECT_ROWID_HINTS);
     this.meter.runSync('init:schema', () => {
       this.initDb();
       for (const stmt of ROWS_STATS_SCHEMA.split(';')) if (stmt.trim()) this.sql.exec(stmt);
     });
+
+    this.backgroundWork = new BackgroundWorkQueue(this.sql, fn => this.ctx.storage.transactionSync(fn));
+    this.backgroundWork.init();
 
     const txSync = (this.ctx.storage as any).transactionSync ? (fn: any) => (this.ctx.storage as any).transactionSync(fn) : undefined;
     // M12b intake assignment (narrow seam, owned by platform-intake-live):
@@ -420,7 +452,8 @@ export class Hub extends DurableObject {
       sessionState: id => (this.sql.exec('SELECT state FROM session_control_sessions WHERE id=?', id).toArray()[0] as any)?.state ?? null,
       hostFresh: machineId => {
         const m = this.sql.exec('SELECT last_checkin_at FROM machines WHERE id=?', machineId).toArray()[0] as any;
-        return !!m?.last_checkin_at && Date.now() - Date.parse(m.last_checkin_at) < 15 * 60000;
+        const at = effectiveHeartbeatAt(this.sql,machineId,m?.last_checkin_at);
+        return !!at && Date.now() - Date.parse(at) < 15 * 60000;
       },
     });
     this.askLedger.init();
@@ -558,7 +591,7 @@ export class Hub extends DurableObject {
         setAlert: (kind, subject, problem) => this.livenessService.setAlert(kind, subject, problem),
         deliverAlert: alert => this.notifyAlert(alert),
       }),
-    }, Date.now, makeHeuristicDecider, this.env, undefined, () => this.observedCatalog.rows());
+    }, Date.now, makeHeuristicDecider, this.env);
     this.sessionAudit.init();
     this.livenessService.setPressureProjection(() => placementPressureSubjects(this.sql, Date.now()));
     this.checksService = new ChecksService(this.sql);
@@ -569,6 +602,8 @@ export class Hub extends DurableObject {
       this.livenessService,
       alert => { return this.notifyAlert(alert).then(() => undefined); },
       this.intakeService,
+      Date.now,
+      this.writes,
     );
     this.monitoringService.init();
     this.monitoringService.setResourceProjection(machine => this.fleetService.hostResources(machine)[0]);
@@ -579,7 +614,7 @@ export class Hub extends DurableObject {
     // non-admin caller, so host/agent/job credentials get 403.
     this.backupService = new BackupService(this.sql, fn => this.ctx.storage.transactionSync(fn), this.env);
     this.backupService.init();
-    this.hostHistoryService = new HostHistoryService(this.sql, this.fleetService, Date.now, this.writes);
+    this.hostHistoryService = new HostHistoryService(this.sql, this.fleetService, Date.now, this.writes,()=>this.ctx.storage.transactionSync(()=>{}));
     this.hostHistoryService.init();
     this.statusService.setMonitoringService(this.monitoringService);
     this.statusService.initLifecycleCache();
@@ -653,8 +688,7 @@ export class Hub extends DurableObject {
 
     this.jobsService = new JobsService(this.sql, this.ctx, {
       busService: busForJobs,
-      enableAlarms: true,
-      alarmDeadline: () => this.hostHistoryService.nextSampleAt(),
+      enableAlarms: false,
       env: this.env,
     });
     this.jobsService.setBusService(busForJobs);
@@ -671,7 +705,79 @@ export class Hub extends DurableObject {
     }
 
     this.quotaStore = new QuotaStore(this.sql, this.ctx, this.env);
+    this.afterInitializeServices(env);
+    this.backgroundWork.initEntityProducers();
+    this.ctx.storage.transactionSync(() => initRootIncumbentProjection(this.sql));
   }
+
+  /** Extension initialization runs inside the same prepaid constructor gate. */
+  protected afterInitializeServices(_env: Env): void {}
+
+  /** Every native event passes through this gate, including WebSocket events.
+   * No SQL alert/meter flush is permitted after exhaustion: the budget logs
+   * once, and deleting the alarm prevents runtime/background retry storms. */
+  private budgetActiveEvents = 0;
+  private budgetActivityEpoch = 0;
+  private budgetRefundTimer: ReturnType<typeof setTimeout> | undefined;
+
+  private cancelBudgetRefund(): void {
+    if (this.budgetRefundTimer !== undefined) clearTimeout(this.budgetRefundTimer);
+    this.budgetRefundTimer = undefined;
+  }
+
+  /** One quiet checkpoint, never an alarm or per-request write. Frequent
+   * host polling cancels the timer and retains its shared reservation. The
+   * pending timer keeps the DO alive; waitUntil covers only the checkpoint
+   * once it actually fires, not five minutes of every event's idle time. */
+  private scheduleBudgetRefund(delayMs = 5 * 60_000): void {
+    this.cancelBudgetRefund();
+    const epoch = this.budgetActivityEpoch;
+    this.budgetRefundTimer = setTimeout(() => {
+      this.budgetRefundTimer = undefined;
+      const checkpoint = (async () => {
+        try {
+          await this.rowBudget.releaseUnused(() => this.budgetActiveEvents === 0 && this.budgetActivityEpoch === epoch);
+        } catch { console.error('do_daily_row_budget_idle_checkpoint_failed'); }
+      })();
+      this.ctx.waitUntil(checkpoint);
+    },delayMs);
+  }
+
+  protected async budgeted<T>(fn: () => Promise<T>, exhausted: T, bulk = false): Promise<T> {
+    this.budgetActiveEvents++;
+    this.budgetActivityEpoch++;
+    this.cancelBudgetRefund();
+    try {
+      if (!this.initializationComplete) {
+        await this.rowBudget.begin(true);
+        this.initializeServices(this.env);
+        this.initializationComplete = true;
+      }
+      await this.rowBudget.begin(bulk);
+      const result = await fn();
+      if (this.budgetActiveEvents === 1 && !this.rowBudget.status().stopped) {
+        await this.refreshBackgroundJobs();
+        await this.armBackgroundQueue();
+      }
+      if (this.rowBudget.status().stopped) {
+        await this.ctx.storage.deleteAlarm();
+        return exhausted;
+      }
+      return result;
+    } catch (error) {
+      if (!(error instanceof RowBudgetExceeded) && !this.rowBudget.status().stopped) throw error;
+      await this.ctx.storage.deleteAlarm();
+      return exhausted;
+    } finally {
+      try { await this.rowBudget.finish(); }
+      catch { console.error('do_daily_row_budget_checkpoint_failed'); await this.ctx.storage.deleteAlarm(); }
+      finally {
+        this.budgetActiveEvents--;
+        if (this.budgetActiveEvents === 0) this.scheduleBudgetRefund();
+      }
+    }
+  }
+
 
   private ensureColumns(table: string, columns: { [col: string]: string }) {
     const existing = new Set<string>();
@@ -772,10 +878,6 @@ export class Hub extends DurableObject {
     this.ensureColumns('device_pairings', { approved_seq: 'INTEGER' });
     this.ensureColumns('credentials', {
       approval_seq: 'INTEGER',
-      // Only non-null for a normally rotated human refresh token. This lets a
-      // short retry window distinguish a lost rotation response from logout,
-      // admin revocation, or a replay after the grace period.
-      refresh_rotated_at: 'TEXT',
     });
 
     this.ensureColumns('jobs', {
@@ -836,15 +938,11 @@ export class Hub extends DurableObject {
       native_session_id: 'TEXT'
     });
 
-    // If audit was upgraded from SPEC §6 where ts existed instead of at:
-    const auditInfo = this.sql.exec("PRAGMA table_info(audit)").toArray() as any[];
-    const hasAt = auditInfo.some(c => c.name.toLowerCase() === 'at');
-    const hasTs = auditInfo.some(c => c.name.toLowerCase() === 'ts');
-    if (hasAt && hasTs) {
-      this.sql.exec("UPDATE audit SET at = ts WHERE at IS NULL AND ts IS NOT NULL");
-    }
+    // Legacy SPEC§6 audit.ts is retained verbatim. Its new `at` field stays
+    // explicitly unknown; construction never rewrites historical audit rows.
 
-    this.sql.exec("INSERT OR IGNORE INTO leases (name, epoch) VALUES ('root', 0)");
+    // JobsService owns the root lease seed after its fresh-empty schema
+    // checks. Existing retained leases are never rewritten during init.
     ensureRootScheduling(this.sql);
     });
   }
@@ -852,13 +950,22 @@ export class Hub extends DurableObject {
   async fetch(request: Request): Promise<Response> {
     let scope = 'route:?';
     try { scope = 'route:' + normalizeRoute(request.method, new URL(request.url).pathname); } catch {}
-    try { return await this.meter.run(scope, () => this.routeFetch(request)); }
-    finally { this.maybeFlushRowsMeter(); }
+    const path=new URL(request.url).pathname,method=request.method;
+    const bulk=((path==='/api/status') && ['GET','POST'].includes(method)) ||
+      (path==='/api/ops/liveness' && method==='GET') ||
+      (path==='/api/fleet/sessions' && method==='PUT') ||
+      (path==='/api/fleet/resources/report' && method==='POST') ||
+      ['/api/backup/status','/api/backup/export'].includes(path) || path.startsWith('/api/cron/') ||
+      (method==='POST' && /^\/api\/intake\/tasks(?:\/[^/]+(?:\/events)?)?$/.test(path));
+    return this.budgeted(async () => {
+      try { return await this.meter.run(scope, () => this.routeFetch(request)); }
+      finally { if (!this.rowBudget.status().stopped) this.maybeFlushRowsMeter(); }
+    }, Response.json({ error: 'do_daily_row_budget_exceeded' }, { status: 503, headers: { 'Retry-After': '3600' } }), bulk);
   }
 
   private lastMeterFlush = 0;
 
-  /** Meter totals are persisted at most every 5 minutes (each flush writes one
+  /** Meter totals are persisted at most every hour (each flush writes one
    * row per active scope). A hibernating DO can be evicted before its next
    * alarm, so requests and WebSocket messages flush too, and the first call
    * after a cold start flushes the constructor's schema reads at once. */
@@ -1049,19 +1156,15 @@ export class Hub extends DurableObject {
         if (!body || body.type !== 'heartbeat') return Response.json({ error: 'malformed_json' }, { status: 400 });
 
         updateHeartbeat(cred.machine_id, body, this.sql);
+        // All policy use below is synchronous after credential/body awaits.
+        // No cross-request or cross-await authorization snapshot is retained.
+        const rootSchedulingEnabled = isRootSchedulingEnabled(this.sql);
+        if (rootSchedulingEnabled) this.jobsService.markRootReady(cred.machine_id, rootSchedulingEnabled);
 
         const nowIso = new Date().toISOString();
-        const rows = this.sql.exec(
-          `SELECT id, kind, payload, status, deadline_at, offer_host_id, offer_machine_id, offer_expires_at, created_at, actor, role_name, role_generation
-           FROM jobs
-           WHERE status = 'offered'
-             AND (offer_host_id = ? OR offer_machine_id = ?)
-             AND (offer_expires_at IS NULL OR offer_expires_at > ?)
-           ORDER BY created_at DESC`,
-          cred.machine_id, cred.machine_id, nowIso
-        ).toArray() as any[];
+        const { rows,truncated } = this.jobsService.offeredForHost(cred.machine_id);
         // Root scheduling flag: root-run offers are not listed while disabled.
-        const visibleRows = isRootSchedulingEnabled(this.sql) ? rows : rows.filter((r: any) => r.kind !== 'root-run');
+        const visibleRows = rootSchedulingEnabled ? rows : rows.filter((r: any) => r.kind !== 'root-run');
 
         const offers = visibleRows.map((r: any) => ({
           id: r.id,
@@ -1076,12 +1179,16 @@ export class Hub extends DurableObject {
           ...(r.role_name ? { role_binding: this.jobsService.roleJobBinding(r) } : {})
         }));
 
-        return Response.json({ status: 'ok', server_time: nowIso, offers });
+        return Response.json({ status: 'ok', server_time: nowIso, offers, offers_truncated: truncated });
       }
 
       if (path === '/api/agents' || path.startsWith('/api/agents/')) return this.handleAgentRegistry(request, path);
       if (path === '/api/heartbeat' || path === '/api/liveness' || path === '/api/checks' || path.startsWith('/api/checks/') || path === '/api/ops/heartbeat' || path === '/api/ops/liveness') {
-        return this.handleWatchRoutes(request, path);
+        try { return await this.handleWatchRoutes(request, path); }
+        catch (error) {
+          if (error instanceof ChecksObservationLimit) return Response.json({ error: error.code, observation_pending: true }, { status: 503, headers: { 'Cache-Control': 'no-store' } });
+          throw error;
+        }
       }
       if (path === '/api/host/repositories' || path === '/api/host/repositories/token') {
         if (request.headers.has('Cookie')) return Response.json({ error: 'mixed_authority' }, { status: 403 });
@@ -1206,9 +1313,10 @@ export class Hub extends DurableObject {
         const now = Date.now();
         if (path === '/api/session-messaging/credentials' && request.method === 'GET') {
           return this.ctx.storage.transactionSync(() => {
-            const tables = ['agents', 'session_control_sessions', 'credentials'];
+            const tables = ['agents', 'session_control_sessions'];
             const changed = this.credentialSweepChanged('messaging-credential', ...tables);
-            const sessions = pollSessionCredentials(this.sql, caller.machineId, now, changed !== null);
+            const sessions = pollSessionCredentials(this.sql, caller.machineId, now, changed !== null,
+              () => this.writes.stamp('agents','session_control_sessions','credentials','native_credential_authority'));
             if (changed !== null) this.credentialSweepDone('messaging-credential', ...tables);
             return Response.json({ sessions });
           });
@@ -1439,9 +1547,9 @@ export class Hub extends DurableObject {
         const stateHash = await sha256(state);
         const stateRows = this.sql.exec('SELECT consumed, expires_at FROM login_states WHERE state_hash = ?', stateHash).toArray() as any[];
         const stateRow = stateRows[0];
-        const consume = this.sql.exec('UPDATE login_states SET consumed = 1 WHERE state_hash = ? AND consumed = 0 AND expires_at > ?', stateHash, Math.floor(Date.now() / 1000));
+        const consume = this.sql.exec('UPDATE login_states SET consumed = 1 WHERE state_hash = ? AND consumed = 0 AND expires_at > ? RETURNING state_hash', stateHash, Math.floor(Date.now() / 1000)).toArray();
         
-        if (consume.rowsWritten !== 1) {
+        if (consume.length !== 1) {
           // Check if caller already has a valid authenticated session (valid sess refresh/replay recovery)
           const existingSession = await getSession(this.env, request);
           if (existingSession) {
@@ -2114,6 +2222,7 @@ export class Hub extends DurableObject {
 
       return new Response("Not found", { status: 404 });
     } catch (e: any) {
+      if (e instanceof WriterIntentObservationLimit) return Response.json({ error: e.code, observation_pending: true }, { status: 503, headers: { 'Cache-Control': 'no-store' } });
       return Response.json({ error: 'Internal Server Error' }, { status: 500 });
     }
   }
@@ -2166,7 +2275,15 @@ export class Hub extends DurableObject {
       if (!cred) {
         errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
       } else if (cred.revoked_at) {
-        const rotatedAtMs = Date.parse(String(cred.refresh_rotated_at ?? ''));
+        // Older deployments lack the optional credentials column. A tiny
+        // request-owned sidecar preserves exactly the same rotation proof
+        // without rewriting the whole legacy schema during construction.
+        let rotatedAt=cred.refresh_rotated_at;
+        if(cred.kind==='human'&&!Object.prototype.hasOwnProperty.call(cred,'refresh_rotated_at')) {
+          this.sql.exec('CREATE TABLE IF NOT EXISTS credential_refresh_rotations(id TEXT PRIMARY KEY,rotated_at TEXT NOT NULL) WITHOUT ROWID');
+          rotatedAt=this.sql.exec('SELECT rotated_at FROM credential_refresh_rotations WHERE id=?',cred.id).toArray()[0]?.rotated_at;
+        }
+        const rotatedAtMs = Date.parse(String(rotatedAt ?? ''));
         const retryWithinGrace = cred.kind === 'human'
           && humanSuccessor !== null
           && Number.isFinite(rotatedAtMs)
@@ -2194,6 +2311,9 @@ export class Hub extends DurableObject {
           this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL', now, cred.family_id);
           errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
         }
+      } else if (cred.kind === 'job') {
+        // Job tokens are bound to the claim hash, never refreshable.
+        errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
       } else if (workerScoped && !worker) {
         errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
       } else if (driverScoped && !driver) {
@@ -2216,11 +2336,18 @@ export class Hub extends DurableObject {
         const accessExpiresAt = role ? new Date(Math.min(nowMs + 3600000, role.expires_at)).toISOString()
           : sessionActor ? new Date(nowMs + 3600000).toISOString() : cred.expires_at;
         const rotatedAt = cred.kind === 'human' ? now : null;
-        const res = this.sql.exec('UPDATE credentials SET revoked_at = ?, refresh_rotated_at = ? WHERE id = ? AND revoked_at IS NULL', now, rotatedAt, cred.id);
-        if (res.rowsWritten !== 1) {
+        const hasRotationColumn=Object.prototype.hasOwnProperty.call(cred,'refresh_rotated_at');
+        const res = hasRotationColumn
+          ? this.sql.exec('UPDATE credentials SET revoked_at = ?, refresh_rotated_at = ? WHERE id = ? AND revoked_at IS NULL RETURNING id', now, rotatedAt, cred.id).toArray()
+          : this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL RETURNING id', now, cred.id).toArray();
+        if (res.length !== 1) {
           this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL', now, cred.family_id);
           errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
         } else {
+          if(cred.kind==='human'&&!hasRotationColumn) {
+            this.sql.exec('CREATE TABLE IF NOT EXISTS credential_refresh_rotations(id TEXT PRIMARY KEY,rotated_at TEXT NOT NULL) WITHOUT ROWID');
+            this.sql.exec('INSERT INTO credential_refresh_rotations(id,rotated_at) VALUES(?,?)',cred.id,now);
+          }
           this.sql.exec(`
             INSERT INTO credentials
             (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at, registry_actor, approval_seq)
@@ -2236,13 +2363,13 @@ export class Hub extends DurableObject {
           // subsequent register calls still pass the owner CAS.
           if (cred.kind === 'host' && typeof cred.machine_id === 'string' && cred.machine_id) {
             const machineUpdate = this.sql.exec(
-              'UPDATE machines SET credential_id = ? WHERE id = ? AND credential_id = ?',
+              'UPDATE machines SET credential_id = ? WHERE id = ? AND credential_id = ? RETURNING id',
               newId, cred.machine_id, cred.id
-            );
+            ).toArray();
             // M9 metrics continuity: migrate rows bound to the validated
             // predecessor only when the machine binding actually rotated.
             // Stale/foreign/rebound refreshes mutate nothing.
-            if (machineUpdate.rowsWritten === 1) {
+            if (machineUpdate.length === 1) {
               try {
                 const hasLatest = this.sql.exec(
                   "SELECT name FROM sqlite_master WHERE type='table' AND name='host_metrics_latest'"
@@ -2482,7 +2609,7 @@ export class Hub extends DurableObject {
     const run = /^\/api\/checks\/([a-z0-9][a-z0-9_-]{0,39})\/run$/.exec(path);
     if (run && request.method === 'POST') {
       await safeJson(request); // the body is unused; drain it so the runtime does not log a stream error
-      if (!this.checksService.list().some(c => c.name === run[1])) return json({ error: 'not_found' }, 404);
+      if (!this.checksService.has(run[1])) return json({ error: 'not_found' }, 404);
       return json({ results: await this.runChecks(run[1]) });
     }
     return json({ error: 'not_found' }, 404);
@@ -2628,13 +2755,18 @@ export class Hub extends DurableObject {
 
   /** Central refresh + direct provider quota for Hub-held engine credentials. */
   async maintainCredentials() {
-    try { return await this.provisioningService.maintainCredentials(); }
-    catch { console.warn('credential_maintenance_failed'); return []; }
-    finally { await this.flushCredentialAlerts().catch(() => console.warn('credential_alert_failed')); }
+    return this.budgeted(async () => {
+      try { return await this.provisioningService.maintainCredentials(); }
+      catch { console.warn('credential_maintenance_failed'); return []; }
+      finally { if (!this.rowBudget.status().stopped) await this.flushCredentialAlerts().catch(() => console.warn('credential_alert_failed')); }
+    }, []);
   }
 
   async runChecks(only?: string) {
-    try { return await this.meter.run('rpc:runChecks', () => this.runChecksMetered(only)); } finally { this.maybeFlushRowsMeter(); }
+    return this.budgeted(async () => {
+      try { return await this.meter.run('rpc:runChecks', () => this.runChecksMetered(only)); }
+      finally { if (!this.rowBudget.status().stopped) this.maybeFlushRowsMeter(); }
+    }, [], true);
   }
 
   private async runChecksMetered(only?: string) {
@@ -2669,7 +2801,7 @@ export class Hub extends DurableObject {
         expireMessageEvents(this.sql, nowMs);
       }));
       try { await m('idle_work', () => this.idleWorkTick()); } catch { console.warn('idle_work_tick_failed'); }
-      try { await m('host_history', () => this.hostHistoryService.sample()); } catch { console.warn('resource_history_sampling_failed'); }
+      try { await m('host_history', () => this.hostHistoryService.sample(true)); } catch { console.warn('resource_history_sampling_failed'); }
       try {
         await m('fleet_account_capacity_history', () => sampleAccountCapacityHistory(
           this.sql,
@@ -2744,11 +2876,15 @@ export class Hub extends DurableObject {
     return results;
   }
 
-  async scheduledTick(slotOverride?: string, source = 'scheduled') {
-    try { return await this.meter.run('tick:' + source, () => this.scheduledTickMetered(slotOverride, source)); } finally { this.maybeFlushRowsMeter(); }
+  async scheduledTick(slotOverride?: string, source = 'scheduled'): Promise<any> {
+    return this.budgeted<any>(async () => {
+      try { return await this.meter.run('tick:' + source, () => this.scheduledTickMetered(slotOverride, source)); }
+      finally { if (!this.rowBudget.status().stopped) this.maybeFlushRowsMeter(); }
+    }, { status: 'stopped', reason: 'do_daily_row_budget_exceeded' }, source === 'manual');
   }
 
   private async scheduledTickMetered(slotOverride?: string, source = 'scheduled') {
+    if (source !== 'manual') { await this.alarmMetered(); return { status: 'queue_processed' }; }
     const m = <T>(step: string, fn: () => T | Promise<T>) => this.meter.run('tick:' + step, fn);
     const now = (this.jobsService as any).now ? (this.jobsService as any).now() : new Date();
     // 1. Bus retention cleanup
@@ -2835,6 +2971,7 @@ export class Hub extends DurableObject {
     const tickResult = await m('root_slot', () => this.jobsService.tickRootSlot(slotStartIso));
 
     // 3. Process alarms & expiry
+    this.jobsService.prepareLeaseWork();
     const nextAlarm = this.jobsService.processAlarms();
     try {
       this.ctx.storage.transactionSync(() => {
@@ -2849,57 +2986,107 @@ export class Hub extends DurableObject {
   }
 
   async sampleHostHistory() {
-    try { this.hostHistoryService.sample(); } catch { console.warn('resource_history_sampling_failed'); }
+    return this.budgeted(async () => {
+      try { this.hostHistoryService.sample(); } catch { console.warn('resource_history_sampling_failed'); }
+    }, undefined, true);
   }
 
-  /** Durable cadence survives hibernation. Alarm plus the existing five-minute cron own the tick. */
+  /** Source changes and concrete future reset/expiry work drive the tick.
+   * An idle hot object performs no SQL, including no freshness probe. */
   private tbmStamp: string | null = null;
+  private tbmNextDue = Infinity;
   runTbmTick(nowMs = Date.now()) {
+    const dependencies = ['tbm_session_tokens','tbm_quota_pools','tbm_reward_events','tbm_pool_resets','tbm_banked_tranches','tbm_controller_state',
+      'fleet_sessions_meta','session_resource_usage','session_control_sessions','fleet_launches','usage_quota_history','server_quota_snapshots','fleet_subscriptions'];
+    const stamp = this.writes.stamp(...dependencies);
+    if (stamp === this.tbmStamp && nowMs < this.tbmNextDue) return;
     const previous: any = this.sql.exec('SELECT last_tick_ms FROM tbm_tick_state WHERE id=1').toArray()[0];
     if (previous && nowMs - previous.last_tick_ms < 240000) return;
-    // Change-driven ceiling: with no quota/session/outcome writes since the
-    // last tick there is nothing new to reward or roll up (rows-read budget).
-    if (this.writes) {
-      const stamp = this.writes.stamp('tbm_session_tokens','tbm_quota_pools','tbm_reward_events','tbm_pool_resets','tbm_banked_tranches','tbm_controller_state',
-        'fleet_sessions_meta','session_resource_usage','session_control_sessions','fleet_launches','usage_quota_history','server_quota_snapshots','fleet_subscriptions');
-      if (stamp === this.tbmStamp && previous && nowMs - previous.last_tick_ms < 900000) return;
-      this.tbmStamp = stamp;
-    }
-    return this.ctx.storage.transactionSync(() => {
+    const completed = this.ctx.storage.transactionSync(() => {
+      ensureTbmControllerSchema(this.sql);
       syncStoredTbmSnapshots(this.sql, nowMs);
       const summary = tickTbm(this.sql, nowMs);
       this.sql.exec('INSERT OR REPLACE INTO tbm_tick_state VALUES (1,?,?)', nowMs, JSON.stringify(summary));
-      return summary;
+      return { summary, nextDue: nextTbmDue(this.sql,nowMs) };
     });
+    // Own projection writes are now served; a rollback or minute throttle
+    // must never acknowledge an unprocessed generation.
+    this.tbmStamp = this.writes.stamp(...dependencies);
+    this.tbmNextDue = completed.nextDue ?? Infinity;
+    return completed.summary;
   }
 
   async alarm() {
-    // Every step is metered (intake 8081a05a); totals flush once per alarm.
-    const m = <T>(step: string, fn: () => T | Promise<T>) => this.meter.run('alarm:' + step, fn);
-    const nowMs = Date.now();
-    const retentionPending = await this.ctx.storage.get('bus_retention_pending') === true;
-    const cleanup = retentionPending
-      ? await m('bus_retention', () => this.busService.retentionCleanup(nowMs, 100))
-      : { hasMore: false };
-    let nextAlarm = await m('jobs_alarms', () => this.jobsService.processAlarms());
-    // Webhook delivery pump (intake 19ec91c2): pending redeliveries pull the
-    // next alarm forward so a returning session is served without waiting
-    // for the full cadence.
-    let webhookNext: number | undefined;
-    try {
-      webhookNext = await m('webhooks', () => this.webhookService.pump());
-      if (webhookNext !== undefined) {
-        const current = nextAlarm ?? undefined;
-        nextAlarm = current === undefined ? webhookNext : Math.min(current, webhookNext);
+    return this.budgeted(() => this.alarmMetered(), undefined);
+  }
+
+  /** Process exactly one explicit queue item. Empty queue never re-arms. */
+  private async alarmMetered() {
+    const work = this.backgroundWork.takeDue();
+    if (!work) { await this.armBackgroundQueue(true,false); return; }
+    if (work.exhausted) {
+      console.error(JSON.stringify({event:'background_work_attempts_exhausted',kind:work.kind,id:work.id}));
+      if(work.kind==='root-slot' && this.env.HUB_AUTOMATION_DISABLED !== 'true' && isRootSchedulingEnabled(this.sql) && typeof work.payload.entity_id==='string') {
+        const slot=Date.parse(work.payload.entity_id);
+        if(Number.isFinite(slot)) this.enqueueRootSlot(Math.max(slot+1800000,Math.ceil(Date.now()/1800000)*1800000));
       }
-    } catch { console.warn('webhook_delivery_pump_failed'); }
+      await this.armBackgroundQueue();
+      return;
+    }
     try {
-      await m('due_wakes', () => this.ctx.storage.transactionSync(() => {
-        try { (this.sessionControlService as any).processDueWakes?.(); } catch {}
-      }));
-    } catch {}
-    try { await this.flushRowsMeter(); } catch { console.warn('rows_meter_flush_failed'); }
-    await this.scheduleDueAlarm([nextAlarm, this.jobsService.getAlarmTime(), webhookNext, this.nextWakeTimeSafe()], retentionPending ? cleanup.hasMore : undefined);
+      const entity = work.payload.entity_id;
+      if (typeof entity !== 'string') throw new Error('background_entity_missing');
+      let due: number | null;
+      if (work.kind === 'job-deadline') due = this.jobsService.processBackground(entity);
+      else if (work.kind === 'session-wake') due = this.sessionControlService.processBackground(entity);
+      else if (work.kind === 'webhook-delivery') due = await this.webhookService.processBackground(entity);
+      else due = await this.processRootSlotWork(entity);
+      if (due === null) {
+        this.backgroundWork.complete(work);
+        if (work.kind === 'root-slot' && this.env.HUB_AUTOMATION_DISABLED !== 'true' && isRootSchedulingEnabled(this.sql)) this.enqueueRootSlot(Date.parse(entity)+1800000);
+      } else this.backgroundWork.reschedule(work,due);
+    } catch (error) {
+      if (error instanceof RowBudgetExceeded) throw error;
+      console.error(JSON.stringify({event:'background_work_failed',kind:work.kind,id:work.id}));
+      this.backgroundWork.reschedule(work,Date.now()+60000,true);
+    }
+    await this.armBackgroundQueue();
+  }
+
+  /** Root policy changes schedule/cancel one explicit slot. Entity producers
+   * address known IDs transactionally; no shared deadline census is needed. */
+  private async refreshBackgroundJobs() {
+    const stamp=this.writes.stamp('root_scheduling');
+    if(stamp===this.backgroundRootStamp)return;
+    if(this.env.HUB_AUTOMATION_DISABLED !== 'true' && isRootSchedulingEnabled(this.sql)) {
+      const now=Date.now(),slot=Math.floor(now/1800000)*1800000;
+      this.enqueueRootSlot(now-slot<1500000?slot:slot+1800000);
+    } else this.backgroundWork.cancel('root-slot');
+    this.backgroundRootStamp=stamp;
+    await this.armBackgroundQueue();
+  }
+
+  private async armBackgroundQueue(force = false, clearEmpty = true) {
+    const stamp = this.writes.stamp('hub_background_work');
+    if (!force && stamp === this.backgroundAlarmStamp) return;
+    const next = this.backgroundWork.nextAt();
+    this.backgroundAlarmStamp = stamp;
+    if (next === null) {
+      if (clearEmpty && await this.ctx.storage.getAlarm() !== null) await this.ctx.storage.deleteAlarm();
+      return;
+    }
+    const target = Math.max(Date.now()+15000,next);
+    const current = await this.ctx.storage.getAlarm();
+    if (current === null || current > target || current <= Date.now()) await this.ctx.storage.setAlarm(target);
+  }
+
+  private enqueueRootSlot(slot: number) {
+    if (!Number.isFinite(slot)) throw new Error('invalid_root_slot');
+    this.backgroundWork.enqueue({id:'root-slot',kind:'root-slot',dueAt:slot,payload:{entity_id:new Date(slot).toISOString()}});
+  }
+
+  private async processRootSlotWork(slot: string): Promise<number | null> {
+    return this.env.HUB_AUTOMATION_DISABLED === 'true' ? null : this.jobsService.processRootSlotBackground(slot);
   }
 
   private idleWorkAt = 0;
@@ -2908,43 +3095,16 @@ export class Hub extends DurableObject {
     try { return this.sessionControlService.nextWakeTime(); } catch { return null; }
   }
 
-  /** The alarm is a one-shot for due work. Bus-retention continuations may
-   * use 1s re-arms at most 30 times across DO restarts, then back off to 60s.
-   * An omitted retention result preserves the durable backlog state; callers
-   * that did not run cleanup (for example a webhook ingest) cannot clear it. */
-  private async scheduleDueAlarm(nextTimes: Array<number | null | undefined>, retentionHasMore?: boolean) {
-    const now = Date.now();
-    const current = await this.ctx.storage.getAlarm();
-    const due = nextTimes.map(Number).filter(value => Number.isFinite(value) && value > 0);
-    let pending = await this.ctx.storage.get('bus_retention_pending') === true;
-    let rearmCount = Number(await this.ctx.storage.get('bus_retention_fast_rearms')) || 0;
-    if (retentionHasMore === true) {
-      pending = true;
-      rearmCount++;
-      await this.ctx.storage.put('bus_retention_pending', true);
-      await this.ctx.storage.put('bus_retention_fast_rearms', rearmCount);
-    } else if (retentionHasMore === false) {
-      pending = false;
-      rearmCount = 0;
-      await this.ctx.storage.put('bus_retention_pending', false);
-      await this.ctx.storage.put('bus_retention_fast_rearms', 0);
-    }
-    let next: number | null = null;
-    const candidates = [...due, ...(current !== null && current > now ? [current] : [])];
-    if (candidates.length) next = Math.min(...candidates);
-    if (pending) {
-      const retentionWake = now + (rearmCount > 30 ? 60000 : 1000);
-      next = next === null ? retentionWake : Math.min(next, retentionWake);
-      if (rearmCount === 31) console.warn(JSON.stringify({ event: 'bus_retention_rearm_capped', consecutive: rearmCount }));
-    }
-    if (next !== null) await this.ctx.storage.setAlarm(Math.max(now + 1, next));
-    else await this.ctx.storage.deleteAlarm();
+  /** Compatibility for request/manual callers: only the indexed durable
+   * pending-work queue can arm an alarm. Retention hints cannot create work. */
+  private async scheduleDueAlarm(_nextTimes: Array<number | null | undefined>, _retentionHasMore?: boolean) {
+    // Legacy callers may request a wake, but only explicit durable work can arm it.
+    await this.refreshBackgroundJobs();
+    await this.armBackgroundQueue();
   }
 
-  /** Idle recovery acts on 30-minute nudge delays, so a census at most every
-   * 5 minutes is enough; the minute alarm used to rerun it (intake 8081a05a).
-   * The gate is in memory and on the wall clock: a cold start runs a census at
-   * once, and HUB_IDLE_OPEN_AC_NUDGE_MINUTES below 5 acts within ~5 minutes. */
+  /** Explicit manual recovery only; alarms and scheduled crons never run
+   * this census. Repeated manual calls retain the existing five-minute gate. */
   private async idleWorkTick() {
     const now = Date.now();
     const durableLast = Number(await this.ctx.storage.get('idle_work_last_tick')) || 0;
@@ -3115,6 +3275,10 @@ export class Hub extends DurableObject {
       return { error: Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'WWW-Authenticate': 'Bearer' } }) };
     }
 
+    const roleFinishSubject=request.method==='POST'?/^\/api\/jobs\/([^/]+)\/finish$/.exec(new URL(request.url).pathname)?.[1]:undefined;
+    if (!jobCredentialAllowed(this.sql, cred) && !(roleFinishSubject && roleFinishReceiptAllowed(this.sql,cred,roleFinishSubject)))
+      return { error: Response.json({ error: 'unauthorized' }, { status: 401 }) };
+
     const expiresMs = Date.parse(cred.expires_at);
     if (!Number.isFinite(expiresMs) || expiresMs <= Date.now()) {
       return { error: Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'WWW-Authenticate': 'Bearer' } }) };
@@ -3140,7 +3304,7 @@ export class Hub extends DurableObject {
 
     const lastUsedMs = cred.last_used_at ? Date.parse(cred.last_used_at) : 0;
     const nowMs = Date.now();
-    if (!lastUsedMs || isNaN(lastUsedMs) || (nowMs - lastUsedMs) >= 300_000) {
+    if (!lastUsedMs || isNaN(lastUsedMs) || (nowMs - lastUsedMs) >= 3_600_000) {
       const nowIso = new Date().toISOString();
       this.sql.exec('UPDATE credentials SET last_used_at = ? WHERE id = ?', nowIso, cred.id);
       cred.last_used_at = nowIso;
@@ -3304,6 +3468,8 @@ export class Hub extends DurableObject {
       try {
         return Response.json(this.busService.getBusActors(auth.caller!));
       } catch (e: any) {
+        if (e.message === 'bus_registry_projection_incomplete') return Response.json({error:e.message},{status:503,headers:{'Retry-After':'1'}});
+        if (e.message === 'invalid_cursor') return Response.json({error:e.message},{status:400});
         if (e.message === 'unauthorized' || (e.message && e.message.startsWith('missing_m4_root_authority'))) {
           return Response.json({ error: 'forbidden', reason: e.message }, { status: 403 });
         }
@@ -3323,8 +3489,12 @@ export class Hub extends DurableObject {
         return Response.json({ error: 'invalid_actor' }, { status: 400 });
       }
       try {
-        return Response.json(this.busService.getBusMessages(auth.caller!, actor));
+        const page=this.busService.getBusMessagesPage(auth.caller!,actor,url.searchParams.get('cursor'));
+        return Response.json(page.rows,{headers:{'X-Hub-History-Order':page.order,
+          'X-Hub-History-Truncated':String(page.truncated),...(page.next?{'X-Hub-History-Cursor':page.next}:{})}});
       } catch (e: any) {
+        if (e.message === 'bus_registry_projection_incomplete') return Response.json({error:e.message},{status:503,headers:{'Retry-After':'1'}});
+        if (e.message === 'invalid_cursor') return Response.json({error:e.message},{status:400});
         if (e.message === 'unauthorized' || (e.message && e.message.startsWith('missing_m4_root_authority'))) {
           return Response.json({ error: 'forbidden', reason: e.message }, { status: 403 });
         }
@@ -3403,6 +3573,7 @@ export class Hub extends DurableObject {
         return Response.json({ id: result.id, thread_id: result.threadId, threadId: result.threadId });
       } catch (e: any) {
         if (['invalid_ref', 'invalid_delivery', 'invalid_deliver_by'].includes(e.message)) return Response.json({ error: e.message }, { status: 400 });
+        if (e.message === 'bus_registry_projection_incomplete') return Response.json({error:e.message},{status:503,headers:{'Retry-After':'1'}});
         if (e.message === 'body_too_large') return Response.json({ error: 'body_too_large' }, { status: 413 });
         if (e.message === 'from_actor_mismatch' || e.message === 'unauthorized' || (e.message && e.message.startsWith('missing_m4_root_authority'))) {
           return Response.json({ error: 'forbidden', reason: e.message }, { status: 403 });
@@ -3485,6 +3656,7 @@ export class Hub extends DurableObject {
         return Response.json({ id: result.id, thread_id: result.threadId, threadId: result.threadId });
       } catch (e: any) {
         if (['invalid_ref', 'invalid_delivery', 'invalid_deliver_by'].includes(e.message)) return Response.json({ error: e.message }, { status: 400 });
+        if (e.message === 'bus_registry_projection_incomplete') return Response.json({error:e.message},{status:503,headers:{'Retry-After':'1'}});
         if (e.message === 'body_too_large') return Response.json({ error: 'body_too_large' }, { status: 413 });
         if (e.message === 'from_actor_mismatch' || e.message === 'unauthorized' || (e.message && e.message.startsWith('missing_m4_root_authority'))) {
           return Response.json({ error: 'forbidden', reason: e.message }, { status: 403 });
@@ -3561,16 +3733,18 @@ export class Hub extends DurableObject {
       }
 
       const cursor = url.searchParams.get('cursor') || url.searchParams.get('before') || undefined;
-      if (cursor && cursor.length > 128) return Response.json({ error: 'invalid_cursor' }, { status: 400 });
+      if (cursor && cursor.length > 1024) return Response.json({ error: 'invalid_cursor' }, { status: 400 });
 
       try {
         const deadline = Date.now() + waitMs;
         for (;;) {
-          const messages = this.busService.inbox(inboxCaller, actor!, limit, cursor, { unread, thread });
-          if (messages.length > 0 || Date.now() >= deadline) return Response.json(messages);
+          const page = this.busService.inboxPage(inboxCaller,actor!,limit,cursor,{unread,thread});
+          if(page.rows.length>0||page.truncated||Date.now()>=deadline) return Response.json(page.rows,{headers:{
+            'X-Hub-Inbox-Truncated':String(page.truncated),...(page.next?{'X-Hub-Inbox-Cursor':page.next}:{})}});
           await new Promise(resolve => setTimeout(resolve, 1000));
         }
       } catch (e: any) {
+        if (e.message === 'bus_registry_projection_incomplete') return Response.json({error:e.message},{status:503,headers:{'Retry-After':'1'}});
         if (e.message === 'invalid_cursor') return Response.json({ error: 'invalid_cursor' }, { status: 400 });
         if (e.message === 'unauthorized' || (e.message && e.message.startsWith('missing_m4_root_authority'))) {
           return Response.json({ error: 'forbidden', reason: e.message }, { status: 403 });
@@ -3963,7 +4137,8 @@ export class Hub extends DurableObject {
           stale: typeof c.expires_at === 'number' ? c.expires_at <= nowMs : false,
         }));
         const messageActor = actor || holder || undefined;
-        const scopedMessages = this.busService.getBusMessages(auth.caller!, messageActor);
+        const historyPage = this.busService.getBusMessagesPage(auth.caller!,messageActor,url.searchParams.get('message_cursor'));
+        const scopedMessages = historyPage.rows;
         // Bridged native work.* envelopes are addressed to project:<project>
         // (no Hub agents row exists for them), so the scoped inbox query
         // above cannot match them: merge them explicitly whenever the scope
@@ -3972,8 +4147,8 @@ export class Hub extends DurableObject {
         if (effectiveProject && !unmappedWorkspace) {
           try {
             const nativeRows = this.sql.exec(
-              'SELECT * FROM messages WHERE to_actor = ? AND expires_at > ? ORDER BY created_at DESC LIMIT ?',
-              `project:${effectiveProject}`, nowMs, limit,
+              'SELECT * FROM (SELECT * FROM messages WHERE to_actor=? ORDER BY recipient_seq DESC LIMIT ?) WHERE expires_at>?',
+              `project:${effectiveProject}`, limit, nowMs,
             ).toArray() as any[];
             const seen = new Set(scopedMessages.map((r: any) => r.id));
             messages = [...scopedMessages, ...nativeRows.filter((r: any) => !seen.has(r.id))]
@@ -3985,7 +4160,7 @@ export class Hub extends DurableObject {
         const notice = unmappedWorkspace
           ? 'no claim policy maps this workspace to a Hub project — claims are not scoped to it; pass ?project= explicitly or configure fleet claim policy'
           : activeClaims.length === 0 && messages.length === 0
-            ? 'no active work declarations or recent bus activity in scope'
+            ? (historyPage.truncated?'Message history is paged; continue with message_cursor to inspect older activity.':'no active work declarations or recent bus activity in scope')
             : `${activeClaims.length} active work declaration${activeClaims.length === 1 ? '' : 's'}, ` +
               `${messages.length} recent bus message${messages.length === 1 ? '' : 's'} in scope — ` +
               'someone may already be on this; read the rows before starting overlapping work';
@@ -3995,9 +4170,12 @@ export class Hub extends DurableObject {
           claim_policy: claimPolicy,
           claims,
           recent_messages: messages,
+          message_history: {next:historyPage.next,truncated:historyPage.truncated,order:historyPage.order},
           notice,
         });
       } catch (e: any) {
+        if (e.message === 'bus_registry_projection_incomplete') return Response.json({error:e.message},{status:503,headers:{'Retry-After':'1'}});
+        if (e.message === 'invalid_cursor') return Response.json({error:e.message},{status:400});
         if (e.message === 'unauthorized' || (e.message && e.message.startsWith('missing_m4_root_authority'))) {
           return Response.json({ error: 'forbidden', reason: e.message }, { status: 403 });
         }
@@ -4278,16 +4456,7 @@ export class Hub extends DurableObject {
         return Response.json({ error: 'forbidden', reason: 'machine_binding_required' }, { status: 403 });
       }
 
-      const nowIso = new Date().toISOString();
-      const rows = this.sql.exec(
-        `SELECT id, kind, payload, status, deadline_at, offer_host_id, offer_machine_id, offer_expires_at, created_at, actor, role_name, role_generation
-         FROM jobs
-         WHERE status = 'offered'
-           AND (offer_host_id = ? OR offer_machine_id = ?)
-           AND (offer_expires_at IS NULL OR offer_expires_at > ?)
-         ORDER BY created_at DESC`,
-        hostId, hostId, nowIso
-      ).toArray() as any[];
+      const { rows,truncated } = this.jobsService.offeredForHost(hostId);
       // Root scheduling flag: root-run offers are not listed while disabled.
       const visibleRows = isRootSchedulingEnabled(this.sql) ? rows : rows.filter((r: any) => r.kind !== 'root-run');
 
@@ -4309,7 +4478,7 @@ export class Hub extends DurableObject {
         };
       });
 
-      return Response.json({ offers });
+      return Response.json({ offers, offers_truncated: truncated });
     }
 
     // 2. Root endpoints (/api/root/...)
@@ -5122,15 +5291,24 @@ export class Hub extends DurableObject {
     return null;
   }
 
-  webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
-    try { return this.meter.runSync('ws:message', () => handleWebSocketMessageRegistry(ws, message, this.sql)); } finally { this.maybeFlushRowsMeter(); }
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
+    return this.budgeted(async () => {
+      try { this.meter.runSync('ws:message', () => handleWebSocketMessageRegistry(ws, message, this.sql)); }
+      finally { if (!this.rowBudget.status().stopped) this.maybeFlushRowsMeter(); }
+    }, undefined);
   }
 
-  webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean) {
-    try { return this.meter.runSync('ws:close', () => handleWebSocketCloseRegistry(ws, this.sql)); } finally { this.maybeFlushRowsMeter(); }
+  async webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean) {
+    return this.budgeted(async () => {
+      try { this.meter.runSync('ws:close', () => handleWebSocketCloseRegistry(ws, this.sql)); }
+      finally { if (!this.rowBudget.status().stopped) this.maybeFlushRowsMeter(); }
+    }, undefined);
   }
 
-  webSocketError(ws: WebSocket, error: any) {
-    try { return this.meter.runSync('ws:error', () => handleWebSocketCloseRegistry(ws, this.sql)); } finally { this.maybeFlushRowsMeter(); }
+  async webSocketError(ws: WebSocket, error: any) {
+    return this.budgeted(async () => {
+      try { this.meter.runSync('ws:error', () => handleWebSocketCloseRegistry(ws, this.sql)); }
+      finally { if (!this.rowBudget.status().stopped) this.maybeFlushRowsMeter(); }
+    }, undefined);
   }
 }

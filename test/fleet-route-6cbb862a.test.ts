@@ -1,3 +1,4 @@
+import { fixtureStatements,registerFixtureStatements } from './helpers/fixture-statements';
 // Intake 6cbb862a: Hub offered Tabo a shared-codex route its host no longer
 // advertised, and every start failed dispatch_route_unconfigured on the host
 // with no hint of which account was offered.
@@ -20,11 +21,12 @@ async function fleet(fn: (service: FleetService, sql: any) => Promise<void>, mac
   const bindings = env as unknown as Env;
   const stub = bindings.HUB.get(bindings.HUB.idFromName('fleet-route-6cbb862a-' + crypto.randomUUID()));
   await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
+    registerFixtureStatements(hub);
     const service = new FleetService(hub.sql, (cb) => state.storage.transactionSync(cb), () => now);
     service.init(); const sql = hub.sql;
-    sql.exec('INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, drained, capabilities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    fixtureStatements(sql).exec('INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, drained, capabilities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       machine, machine, machine, iso(), iso(), JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], cpu_usage: freshCpu(iso()), gate: { launch_allowed: true, at: iso() } }), 0, JSON.stringify(BASE_CAPS));
-    sql.exec('INSERT INTO host_quota_snapshots (host_id, schema_version, captured_at, captured_at_ms, received_at, received_at_ms, status, error, routes_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    fixtureStatements(sql).exec('INSERT INTO host_quota_snapshots (host_id, schema_version, captured_at, captured_at_ms, received_at, received_at_ms, status, error, routes_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
       machine, '1.0', iso(), now, iso(), now, 'ok', null, JSON.stringify({ codex: { status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } } } }));
     const registry = { accounts: [
       { label: 'shared-codex', provider: 'codex', max_concurrency: 2, reserve_percent: 15, enabled: true },
@@ -42,7 +44,7 @@ const SHARED = { engine: 'codex', account: 'shared-codex', profile: 'hub-shared-
 const HB = { mem_avail_mb: 32000, disk_free_gb: 80, load: [1], gate: { launch_allowed: true, at: iso() } };
 // Latest heartbeat as the registry stores it: fleet_routes plus its own freshness.
 const advertise = (sql: any, routes: any[] | undefined, at = iso()) =>
-  sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id = 'tabo'", JSON.stringify({ ...HB, cpu_usage: freshCpu(iso()),
+  fixtureStatements(sql).exec("UPDATE machines SET last_heartbeat = ? WHERE id = 'tabo'", JSON.stringify({ ...HB, cpu_usage: freshCpu(iso()),
     ...(routes === undefined ? {} : { fleet_routes: routes, fleet_routes_at: at }) }));
 const intent = (extra = {}) => ({ workspace: 'demo', prompt: 'private test goal', machine: 'tabo', engine: 'codex', idempotency_key: crypto.randomUUID(), ...extra });
 
@@ -76,7 +78,7 @@ describe('placement offers only host-advertised routes (6cbb862a AC a)', () => {
     expect(plan.rejected).toEqual([{ machine: 'tabo', engine: 'codex', reason: 'route_advertisement_stale', account: 'shared-codex', profile: 'hub-shared-codex', advertised_at: iso(-181000) }]);
     expect(isCapacityOnlyHold(plan.rejected)).toBe(true);
     // Stale evidence never falls back to fresh runners or the registry.
-    sql.exec('INSERT OR REPLACE INTO routing_machines VALUES (?, ?, ?, ?, ?)', 'tabo', '[]', 6, iso(),
+    fixtureStatements(sql).exec('INSERT OR REPLACE INTO routing_machines VALUES (?, ?, ?, ?, ?)', 'tabo', '[]', 6, iso(),
       JSON.stringify([{ ...SHARED, model: 'm', effort: 'high' }]));
     expect((s.plan(intent({ account: 'shared-codex' })) as any).rejected[0].reason).toBe('route_advertisement_stale');
   }));
@@ -85,11 +87,11 @@ describe('placement offers only host-advertised routes (6cbb862a AC a)', () => {
     advertise(sql, undefined);
     // A host with no route evidence at all keeps registry-only placement.
     expect((s.plan(intent({ account: 'shared-codex' })) as any).selected?.account).toBe('shared-codex');
-    sql.exec('INSERT OR REPLACE INTO routing_machines VALUES (?, ?, ?, ?, ?)', 'tabo', '[]', 6, iso(),
+    fixtureStatements(sql).exec('INSERT OR REPLACE INTO routing_machines VALUES (?, ?, ?, ?, ?)', 'tabo', '[]', 6, iso(),
       JSON.stringify([{ engine: 'codex', account: 'codex-orin', profile: 'hub-codex-orin', model: 'm', effort: 'high' }]));
     expect((s.plan(intent()) as any).selected?.account).toBe('codex-orin');
     expect((s.plan(intent({ account: 'shared-codex' })) as any).rejected[0].reason).toBe('route_not_advertised');
-    sql.exec("UPDATE routing_machines SET observed_at = ? WHERE machine_id = 'tabo'", iso(-181000));
+    fixtureStatements(sql).exec("UPDATE routing_machines SET observed_at = ? WHERE machine_id = 'tabo'", iso(-181000));
     expect((s.plan(intent({ account: 'codex-orin' })) as any).rejected[0].reason).toBe('route_not_advertised');
   }));
 
@@ -120,9 +122,10 @@ async function machineRow(fn: (hub: Hub, id: string, stored: () => any) => void)
   const bindings = env as unknown as Env;
   const stub = bindings.HUB.get(bindings.HUB.idFromName('hb-route-6cbb862a-' + crypto.randomUUID()));
   await runInDurableObject(stub, async (hub: Hub) => {
+    registerFixtureStatements(hub);
     const id = 'm-' + crypto.randomUUID().slice(0, 8);
-    hub.sql.exec('INSERT INTO machines (id, name, hostname, registered_at) VALUES (?, ?, ?, ?)', id, id, id, iso());
-    fn(hub, id, () => JSON.parse(String((hub.sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', id).toArray()[0] as any).last_heartbeat)));
+    fixtureStatements(hub.sql).exec('INSERT INTO machines (id, name, hostname, registered_at) VALUES (?, ?, ?, ?)', id, id, id, iso());
+    fn(hub, id, () => JSON.parse(String((fixtureStatements(hub.sql).exec('SELECT last_heartbeat FROM machines WHERE id = ?', id).toArray()[0] as any).last_heartbeat)));
   });
 }
 // Review 4224a469 fixture: supported launcher telemetry (64 disk aliases to a
@@ -241,10 +244,10 @@ describe('route advertisement placement (6cbb862a review)', () => {
   // Review 91bf3c43: overflow must fail closed. The registry still lists
   // shared-codex, the host's real routes omit it, and no other evidence
   // (absent, empty or older runners) may reopen it.
-  const overflowHb = (sql: any) => sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id = 'tabo'",
+  const overflowHb = (sql: any) => fixtureStatements(sql).exec("UPDATE machines SET last_heartbeat = ? WHERE id = 'tabo'",
     JSON.stringify({ ...HB, cpu_usage: freshCpu(iso()), fleet_routes_overflow: 129, fleet_routes_at: iso() }));
   const runners = (sql: any, machine: string, list: any[] | null) => {
-    if (list) sql.exec('INSERT OR REPLACE INTO routing_machines VALUES (?, ?, ?, ?, ?)', machine, '[]', 6, iso(),
+    if (list) fixtureStatements(sql).exec('INSERT OR REPLACE INTO routing_machines VALUES (?, ?, ?, ?, ?)', machine, '[]', 6, iso(),
       JSON.stringify(list.map((r: any) => ({ ...r, model: 'm', effort: 'high' }))));
   };
   const RUNNERS = [['absent', null], ['empty', []], ['older listing the route', [SHARED]]] as const;
@@ -306,9 +309,10 @@ describe('route advertisement over HTTP (6cbb862a review)', () => {
     const adminSecret = 'local-test-only-admin-sign-in';
     const rowId = 'paired-' + crypto.randomUUID();
     await runInDurableObject(stub, async (hub: Hub) => {
+    registerFixtureStatements(hub);
       const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(adminSecret));
       hub.env = { ...hub.env, HUB_ADMIN_TOKEN_SHA256: [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('') } as Env;
-      hub.sql.exec("INSERT INTO machines (id, name, hostname, registered_at) VALUES (?, 'route-host', 'route-host', ?)", rowId, iso());
+      fixtureStatements(hub.sql).exec("INSERT INTO machines (id, name, hostname, registered_at) VALUES (?, 'route-host', 'route-host', ?)", rowId, iso());
     });
     const login = await stub.fetch(new Request('https://hub.test/auth/token', { method: 'POST', redirect: 'manual', body: new URLSearchParams({ token: adminSecret }).toString() }));
     const cookie = login.headers.get('Set-Cookie')!.split(';')[0];
@@ -319,7 +323,8 @@ describe('route advertisement over HTTP (6cbb862a review)', () => {
     const approved: any = await (await call('/api/device/approve/' + challenge.user_code, JSON.stringify({ granted_scopes: ['host'], machine_id: rowId }))).json();
     const tokens: any = await (await call('/api/device/token', JSON.stringify({ grant_type: 'urn:ietf:params:oauth:grant-type:device_code', device_code: challenge.device_code }))).json();
     const stored = async () => { let hb: any; await runInDurableObject(stub, async (hub: Hub) => {
-      hb = JSON.parse(String((hub.sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', approved.machine_id).toArray()[0] as any).last_heartbeat ?? 'null')); }); return hb; };
+    registerFixtureStatements(hub);
+      hb = JSON.parse(String((fixtureStatements(hub.sql).exec('SELECT last_heartbeat FROM machines WHERE id = ?', approved.machine_id).toArray()[0] as any).last_heartbeat ?? 'null')); }); return hb; };
 
     expect((await call('/api/host/routes', JSON.stringify({ fleet_routes: [SHARED], seq: 1 }))).status).toBe(401);
     expect((await call('/api/host/routes', JSON.stringify({ fleet_routes: [SHARED] }), tokens.access_token)).status).toBe(400); // seq required
@@ -359,13 +364,14 @@ describe('sessions show names the offered route on dispatch errors (6cbb862a AC 
     const stub = bindings.HUB.get(bindings.HUB.idFromName('session-route-6cbb862a-' + crypto.randomUUID()));
     let view: any;
     await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
+    registerFixtureStatements(hub);
       const s = new SessionControlService(hub.sql, (cb) => state.storage.transactionSync(cb), Date.now, {}, {});
       s.init(); seedFixtureIntake(hub.sql);
       const at = new Date().toISOString();
-      hub.sql.exec(`INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, exit_reason, launch_error_json, created_at, updated_at)
+      fixtureStatements(hub.sql).exec(`INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, exit_reason, launch_error_json, created_at, updated_at)
         VALUES ('launch-6cbb', 'test-admin', 'human', NULL, 'fixture', 'fleet-launch-6cbb', '{"workspace":"demo"}', 'tabo', 'codex', ?, ?, 'headless', 'demo', 'goal', 'failed', ?, ?, ?, ?)`,
         account, profile, launchError.reason, JSON.stringify(launchError), at, at);
-      hub.sql.exec(`INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, engine, mode, state, created_at, updated_at)
+      fixtureStatements(hub.sql).exec(`INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, engine, mode, state, created_at, updated_at)
         VALUES ('6cbb862a-0000-4000-8000-000000000001', 'test-admin', 'key-6cbb', '{}', 'launch-6cbb', 'tabo', 'codex', 'headless', 'failed', ?, ?)`, at, at);
       const res = await s.handle(new Request('https://hub.test/api/sessions/6cbb862a-0000-4000-8000-000000000001', { method: 'GET' }), admin);
       expect(res.status).toBe(200);

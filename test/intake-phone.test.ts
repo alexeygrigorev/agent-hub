@@ -75,7 +75,7 @@ describe('F7 phone routes and intake pages', () => {
     expect(asksJs).toContain("queryFor('pending'), queryFor('unmapped')");
     expect(asksJs).toContain('const fullText = String(a.text ?? \'\')');
     expect(asksJs).toContain("node('p', fullText)");
-    expect(asksJs).toContain('this endpoint has no cursor yet');
+    expect(asksJs).toContain('observation_pending');
   });
 
   it('gates clean phone URLs (not 404) and keeps unknown paths denied', async () => {

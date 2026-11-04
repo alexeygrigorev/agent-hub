@@ -23,6 +23,72 @@ def load_retry_module():
 
 
 RETRY = load_retry_module()
+spec = importlib.util.spec_from_file_location("cloudflare_preflight_under_test", REPO_ROOT / "scripts/ci/cloudflare_preflight.py")
+PREFLIGHT = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(PREFLIGHT)
+
+
+class TestCloudflarePreflight(unittest.TestCase):
+    ENV = {"CLOUDFLARE_API_TOKEN": "test-secret-never-log", "CLOUDFLARE_ACCOUNT_ID": "a" * 32}
+
+    def test_account_owned_token_never_needs_user_permissions(self):
+        calls = []
+
+        def request(path, token):
+            calls.append(path)
+            return 200, {"success": True, "result": {"status": "active"}}
+
+        self.assertEqual(PREFLIGHT.verify(self.ENV, request), "account")
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(all(path.startswith("/accounts/") for path in calls))
+        self.assertTrue(all("services/" in path for path in calls[1:]))
+
+    def test_user_owned_token_fallback(self):
+        calls = []
+
+        def request(path, token):
+            calls.append(path)
+            if path.startswith("/accounts/") and path.endswith("verify"):
+                return 403, {"success": False, "errors": [{"code": 9109}]}
+            return 200, {"success": True, "result": {"status": "active"}}
+
+        self.assertEqual(PREFLIGHT.verify(self.ENV, request), "user")
+        self.assertIn("/user/tokens/verify", calls)
+
+    def test_invalid_token_stops_before_service_access_and_redacts_api_message(self):
+        calls = []
+
+        def request(path, token):
+            calls.append(path)
+            return 403, {"success": False, "errors": [{"code": 9109, "message": token}]}
+
+        with self.assertRaises(RuntimeError) as error:
+            PREFLIGHT.verify(self.ENV, request)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("9109", str(error.exception))
+        self.assertNotIn(self.ENV["CLOUDFLARE_API_TOKEN"], str(error.exception))
+        self.assertNotIn(self.ENV["CLOUDFLARE_ACCOUNT_ID"], str(error.exception))
+
+    def test_inactive_token_fails_closed(self):
+        with self.assertRaisesRegex(RuntimeError, "not active"):
+            PREFLIGHT.verify(self.ENV, lambda *args: (200, {"success": True, "result": {"status": "disabled"}}))
+
+    def test_missing_account_or_token_fails_before_network(self):
+        def request(*args):
+            self.fail("credentials must be validated before network access")
+
+        for env in ({}, {**self.ENV, "CLOUDFLARE_ACCOUNT_ID": "bad"}):
+            with self.assertRaises(RuntimeError):
+                PREFLIGHT.verify(env, request)
+
+    def test_active_token_without_service_permission_fails_closed(self):
+        def request(path, token):
+            if path.endswith("verify"):
+                return 200, {"success": True, "result": {"status": "active"}}
+            return 403, {"success": False, "errors": [{"code": 10000}]}
+
+        with self.assertRaisesRegex(RuntimeError, "Workers Scripts permissions"):
+            PREFLIGHT.verify(self.ENV, request)
 
 
 class TestCICD(unittest.TestCase):
@@ -33,14 +99,20 @@ class TestCICD(unittest.TestCase):
         for test in ('test/test_no_reset_apply.py', 'host/tests/test_codex_reset_credit.py',
                      'host/tests/test_reset_credit_workflow.py'):
             self.assertEqual(workflow.count(test), 1, test)
-        # Vitest discovery is unfiltered: the guard file must exist and no vitest
-        # invocation may narrow discovery with an explicit .test.ts file list.
+        # Full Vitest discovery is mandatory even when an early targeted lane
+        # catches cost-safety failures before the larger suite starts.
         self.assertTrue((REPO_ROOT / 'test/reset-credit-evidence.test.ts').is_file(),
                         'test/reset-credit-evidence.test.ts')
         vitest_lines = [ln for ln in workflow.splitlines() if 'vitest run' in ln]
         self.assertTrue(vitest_lines, 'deploy.yml runs vitest discovery')
-        for ln in vitest_lines:
-            self.assertIsNone(re.search(r'\btest/[\w./-]+\.test\.ts', ln), ln)
+        full_step = workflow.split('- name: Worker discovery tests (Vitest)', 1)[1].split('\n      - ', 1)[0]
+        full_invocations = [ln for ln in full_step.splitlines() if 'vitest run' in ln]
+        self.assertEqual(len(full_invocations), 1, 'full discovery step remains mandatory')
+        self.assertIn('if: ${{ !cancelled() }}', full_step,
+                      'early safety failures must not hide full discovery evidence')
+        self.assertIsNone(re.search(r'\btest/[\w./-]+\.test\.ts', full_invocations[0]), full_invocations[0])
+        self.assertNotIn('--exclude', full_invocations[0])
+        self.assertNotIn('--testNamePattern', full_invocations[0])
 
     def test_validate_workflows_passes(self):
         """Verify current repository workflows pass static validation."""
@@ -90,6 +162,7 @@ class TestWranglerRetry(unittest.TestCase):
         for output in (
             "ERROR A request to the Cloudflare API (...) failed.\nAuthentication error [code: 10000]\n",
             "ERROR Invalid API token provided; deploy rejected\n",
+            "ERROR Invalid access token [code: 9109]\nfetch failed\n",
             "ERROR could not read config file .local/dev-wrangler.json\n",
             "ERROR [ERROR] Could not resolve \"./src/missing.ts\"\n",
         ):
@@ -168,6 +241,18 @@ class TestDeployWorkflowRetryWiring(unittest.TestCase):
             if "npx wrangler deploy" in line and "--dry-run" not in line:
                 self.assertIn("wrangler_retry.py", line, line)
         self.assertIn("wrangler_retry.py npx wrangler versions list", content)
+
+    def test_read_only_credential_mode_cannot_deploy_or_claim_test_success(self):
+        content = DEPLOY_WORKFLOW.read_text()
+        preflight = content.split("  credential-preflight:\n", 1)[1].split("\n  test:", 1)[0]
+        self.assertIn("inputs.verify_credentials_only == true", preflight)
+        self.assertIn("cloudflare_preflight.py", preflight)
+        self.assertNotIn("wrangler", preflight)
+        test_guard = content.split("\n  test:\n", 1)[1].split("\n", 1)[0]
+        self.assertIn("inputs.verify_credentials_only == true", test_guard)
+        deploy = content.split("\n  deploy:\n", 1)[1]
+        self.assertIn("inputs.verify_credentials_only != true", deploy)
+        self.assertLess(deploy.index("cloudflare_preflight.py"), deploy.index("wrangler deploy --config"))
 
     def test_smoke_checks_unchanged(self):
         content = DEPLOY_WORKFLOW.read_text()

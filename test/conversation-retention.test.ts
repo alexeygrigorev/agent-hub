@@ -1,3 +1,4 @@
+import { restartFixtureHub, fixtureSql, freshFixtureBudgetDay } from './helpers/fixture-budget';
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { Hub, BaseHub } from '../src/conversation-hub';
@@ -56,6 +57,10 @@ function insertExpiredClaim(sql: any, id: string, now: number): void {
   );
 }
 
+function usageSnapshot(hub:Hub) {
+    return fixtureSql(hub).exec('SELECT conversation_count,message_count,message_bytes,removed_member_count FROM conversation_storage_usage WHERE singleton=1').one();
+  }
+
 async function freshHub(
   fn: (hub: Hub, state: DurableObjectState) => Promise<void> | void,
 ): Promise<void> {
@@ -63,8 +68,8 @@ async function freshHub(
     testEnv.HUB.idFromName('ret-' + crypto.randomUUID()),
   );
   await runInDurableObject(stub, async (_base: BaseHub, state: DurableObjectState) => {
-    const hub = new Hub(state, testEnv);
-    hub.sql.exec(
+    const hub = await restartFixtureHub(_base as Hub);
+    fixtureSql(hub).exec(
       "INSERT INTO agents (tag, project, role) VALUES ('bot', 'proj', 'worker')",
     );
     await fn(hub, state);
@@ -100,23 +105,23 @@ describe('F14 shared bus/claim/conversation cleanup budget', () => {
       });
 
       for (let i = 0; i < 50; i++) {
-        insertExpiredBusMessage(hub.sql, `bus-m-${i}`, clockMs);
-        insertExpiredClaim(hub.sql, `bus-c-${i}`, clockMs);
+        insertExpiredBusMessage(fixtureSql(hub), `bus-m-${i}`, clockMs);
+        insertExpiredClaim(fixtureSql(hub), `bus-c-${i}`, clockMs);
       }
 
       clockMs += 2000;
       expect(Hub.prototype.scheduledTick).toBe(BaseHub.prototype.scheduledTick);
       expect(Hub.prototype.alarm).toBe(BaseHub.prototype.alarm);
 
-      const before = tableCounts(hub.sql);
+      const before = tableCounts(fixtureSql(hub));
       expect(before.busMessages).toBe(50);
       expect(before.busClaims).toBe(50);
       expect(before.convMessages).toBe(1);
 
       const run = (limit: number) => {
-        const start = totalRows(hub.sql);
+        const start = totalRows(fixtureSql(hub));
         const res = hub.busService.retentionCleanup(clockMs, limit) as any;
-        const deleted = start - totalRows(hub.sql);
+        const deleted = start - totalRows(fixtureSql(hub));
         const reported =
           Number(res.messagesDeleted ?? 0) +
           Number(res.claimsDeleted ?? 0) +
@@ -142,9 +147,9 @@ describe('F14 shared bus/claim/conversation cleanup budget', () => {
       const hundred = run(100);
       expect(hundred.deleted).toBeLessThanOrEqual(100);
       const remaining =
-        tableCounts(hub.sql).busMessages +
-        tableCounts(hub.sql).busClaims +
-        tableCounts(hub.sql).convMessages;
+        tableCounts(fixtureSql(hub)).busMessages +
+        tableCounts(fixtureSql(hub)).busClaims +
+        tableCounts(fixtureSql(hub)).convMessages;
       if (remaining > 0) {
         expect(hundred.res.hasMore).toBe(true);
       }
@@ -159,9 +164,9 @@ describe('F14 shared bus/claim/conversation cleanup budget', () => {
         guard++;
         expect(guard).toBeLessThan(120);
       }
-      expect(tableCounts(hub.sql).busMessages).toBe(0);
-      expect(tableCounts(hub.sql).busClaims).toBe(0);
-      expect(tableCounts(hub.sql).convMessages).toBe(0);
+      expect(tableCounts(fixtureSql(hub)).busMessages).toBe(0);
+      expect(tableCounts(fixtureSql(hub)).busClaims).toBe(0);
+      expect(tableCounts(fixtureSql(hub)).convMessages).toBe(0);
     });
   });
 
@@ -169,8 +174,8 @@ describe('F14 shared bus/claim/conversation cleanup budget', () => {
     await freshHub(async hub => {
       const now = Date.now();
       for (let i = 0; i < 8; i++) {
-        insertExpiredBusMessage(hub.sql, `only-m-${i}`, now);
-        insertExpiredClaim(hub.sql, `only-c-${i}`, now);
+        insertExpiredBusMessage(fixtureSql(hub), `only-m-${i}`, now);
+        insertExpiredClaim(fixtureSql(hub), `only-c-${i}`, now);
       }
       const busOnly = hub.busService.retentionCleanup(now, 5) as any;
       expect(
@@ -178,7 +183,7 @@ describe('F14 shared bus/claim/conversation cleanup budget', () => {
       ).toBe(5);
       expect(Number(busOnly.conversationRowsDeleted ?? 0)).toBe(0);
       expect(
-        tableCounts(hub.sql).busMessages + tableCounts(hub.sql).busClaims,
+        tableCounts(fixtureSql(hub)).busMessages + tableCounts(fixtureSql(hub)).busClaims,
       ).toBe(11);
       expect(busOnly.hasMore).toBe(true);
       while (hub.busService.hasExpiredRows(now)) {
@@ -215,7 +220,7 @@ describe('F14 shared bus/claim/conversation cleanup budget', () => {
       expect(Number(convOnly.claimsDeleted ?? 0)).toBe(0);
       expect(Number(convOnly.conversationRowsDeleted)).toBe(4);
       expect(convOnly.hasMore).toBe(true);
-      expect(tableCounts(hub.sql).convMessages).toBe(2);
+      expect(tableCounts(fixtureSql(hub)).convMessages).toBe(2);
     });
   });
 
@@ -236,7 +241,7 @@ describe('F14 shared bus/claim/conversation cleanup budget', () => {
         csrfVerified: true,
       };
       for (let i = 0; i < 6; i++) {
-        hub.sql.exec(
+        fixtureSql(hub).exec(
           'INSERT INTO agents (tag, project, role) VALUES (?, ?, ?)',
           `m${i}`,
           'proj',
@@ -282,9 +287,9 @@ describe('F14 shared bus/claim/conversation cleanup budget', () => {
         batches++;
         expect(batches).toBeLessThan(40);
       }
-      expect(tableCounts(hub.sql).conversations).toBe(0);
-      expect(tableCounts(hub.sql).convMessages).toBe(0);
-      expect(tableCounts(hub.sql).convMembers).toBe(0);
+      expect(tableCounts(fixtureSql(hub)).conversations).toBe(0);
+      expect(tableCounts(fixtureSql(hub)).convMessages).toBe(0);
+      expect(tableCounts(fixtureSql(hub)).convMembers).toBe(0);
     });
   });
 });
@@ -338,7 +343,7 @@ describe('F14 durable fairness under replenishment', () => {
   }
 
   function retentionState(hub: Hub) {
-    const sql = hub.sql;
+    const sql = fixtureSql(hub);
     let leases: unknown[] = [];
     try {
       leases = sql
@@ -353,7 +358,7 @@ describe('F14 durable fairness under replenishment', () => {
       tables: tableCounts(sql),
       five: fiveTableCounts(sql),
       cursors: cursorRows(sql),
-      usage: hub.conversationsService.getStorageUsage(),
+      usage: usageSnapshot(hub),
       members: sql
         .exec(
           'SELECT conversation_id, actor, role, removed_at, last_read_seq, last_read_at FROM conversation_members ORDER BY conversation_id, actor',
@@ -403,25 +408,25 @@ describe('F14 durable fairness under replenishment', () => {
           body: 'old',
           idempotencyKey: 'old',
         });
-        insertExpiredBusMessage(hub.sql, 'seed-msg', T);
-        insertExpiredClaim(hub.sql, 'seed-claim', T);
+        insertExpiredBusMessage(fixtureSql(hub), 'seed-msg', T);
+        insertExpiredClaim(fixtureSql(hub), 'seed-claim', T);
 
         let claimsDeleted = 0;
         let conversationRowsDeleted = 0;
         for (let i = 0; i < 12; i++) {
-          hub = new Hub(state, testEnv);
+          hub = await restartFixtureHub(hub);
           pinRetention(hub, T);
           for (let j = 0; j < limit; j++) {
-            insertExpiredBusMessage(hub.sql, `replenish-msg-${i}-${j}`, T);
+            insertExpiredBusMessage(fixtureSql(hub), `replenish-msg-${i}-${j}`, T);
           }
           hub.conversationsService.sendMessage(humanAt(T), {
             conversationId: conv.id,
             body: `replenish${i}`,
             idempotencyKey: `replenish${i}`,
           });
-          const before = totalRows(hub.sql);
+          const before = totalRows(fixtureSql(hub));
           const res = hub.busService.retentionCleanup(T + 2, limit) as any;
-          const deleted = before - totalRows(hub.sql);
+          const deleted = before - totalRows(fixtureSql(hub));
           expect(deleted).toBeLessThanOrEqual(limit);
           expect(deleted).toBe(
             Number(res.messagesDeleted ?? 0) +
@@ -440,15 +445,15 @@ describe('F14 durable fairness under replenishment', () => {
 
   it('standalone BusService limit 1 deletes an expired claim under message replenishment across reconstructed instances', async () => {
     await freshHub(async (hub, state) => {
-      insertExpiredBusMessage(hub.sql, 'base-msg', T);
-      insertExpiredClaim(hub.sql, 'base-claim', T);
+      insertExpiredBusMessage(fixtureSql(hub), 'base-msg', T);
+      insertExpiredClaim(fixtureSql(hub), 'base-claim', T);
       let claimsDeleted = 0;
       for (let i = 0; i < 12; i++) {
-        insertExpiredBusMessage(hub.sql, `base-replenish-${i}`, T);
+        insertExpiredBusMessage(fixtureSql(hub), `base-replenish-${i}`, T);
         const bus = new BusService(hub.sql, fn =>
           state.storage.transactionSync(fn),
         );
-        const before = tableCounts(hub.sql);
+        const before = tableCounts(fixtureSql(hub));
         const res = bus.retentionCleanup(T + 2, 1);
         expect(
           Number(res.messagesDeleted) + Number(res.claimsDeleted),
@@ -456,8 +461,8 @@ describe('F14 durable fairness under replenishment', () => {
         expect(
           before.busMessages +
             before.busClaims -
-            tableCounts(hub.sql).busMessages -
-            tableCounts(hub.sql).busClaims,
+            tableCounts(fixtureSql(hub)).busMessages -
+            tableCounts(fixtureSql(hub)).busClaims,
         ).toBe(Number(res.messagesDeleted) + Number(res.claimsDeleted));
         expect(res.hasMore).toBe(true);
         claimsDeleted += res.claimsDeleted;
@@ -487,7 +492,7 @@ describe('F14 durable fairness under replenishment', () => {
           target.id,
           'proj:bot',
         );
-        hub.sql.exec(
+        fixtureSql(hub).exec(
           'UPDATE conversation_messages SET created_at = ? WHERE conversation_id = ?',
           new Date(T - 100).toISOString(),
           target.id,
@@ -495,7 +500,7 @@ describe('F14 durable fairness under replenishment', () => {
 
         let removed = 0;
         for (let i = 0; i < 12; i++) {
-          hub = new Hub(state, testEnv);
+          hub = await restartFixtureHub(hub);
           pinRetention(hub, T);
           const archived = hub.conversationsService.createConversation(
             humanAt(T),
@@ -507,9 +512,9 @@ describe('F14 durable fairness under replenishment', () => {
             idempotencyKey: `archive-${i}`,
           });
           hub.conversationsService.setArchived(humanAt(T), archived.id, true);
-          const before = totalRows(hub.sql);
+          const before = totalRows(fixtureSql(hub));
           const res = hub.busService.retentionCleanup(T + 2, limit) as any;
-          expect(before - totalRows(hub.sql)).toBeLessThanOrEqual(limit);
+          expect(before - totalRows(fixtureSql(hub))).toBeLessThanOrEqual(limit);
           expect(res.hasMore).toBe(true);
           removed += Number(res.removedMembersDeleted ?? 0);
         }
@@ -527,13 +532,13 @@ describe('F14 durable fairness under replenishment', () => {
 
   it('an empty category that becomes eligible is served within two reconstructed calls', async () => {
     await freshHub(async (hub, state) => {
-      insertExpiredBusMessage(hub.sql, 'only-msg-a', T);
-      insertExpiredBusMessage(hub.sql, 'only-msg-b', T);
+      insertExpiredBusMessage(fixtureSql(hub), 'only-msg-a', T);
+      insertExpiredBusMessage(fixtureSql(hub), 'only-msg-b', T);
       const first = new BusService(hub.sql, fn =>
         state.storage.transactionSync(fn),
       );
       expect(first.retentionCleanup(T + 2, 1).messagesDeleted).toBe(1);
-      insertExpiredClaim(hub.sql, 'late-claim', T);
+      insertExpiredClaim(fixtureSql(hub), 'late-claim', T);
       let claimsDeleted = 0;
       for (let i = 0; i < 2; i++) {
         const bus = new BusService(hub.sql, fn =>
@@ -559,8 +564,8 @@ describe('F14 durable fairness under replenishment', () => {
           body: `m${i}`,
           idempotencyKey: `m${i}`,
         });
-        insertExpiredBusMessage(hub.sql, `odd-m-${i}`, T);
-        insertExpiredClaim(hub.sql, `odd-c-${i}`, T);
+        insertExpiredBusMessage(fixtureSql(hub), `odd-m-${i}`, T);
+        insertExpiredClaim(fixtureSql(hub), `odd-c-${i}`, T);
       }
       for (const limit of [1, 2, 3, 5, 100]) {
         if (
@@ -569,9 +574,9 @@ describe('F14 durable fairness under replenishment', () => {
         ) {
           break;
         }
-        const before = totalRows(hub.sql);
+        const before = totalRows(fixtureSql(hub));
         const res = hub.busService.retentionCleanup(T + 2, limit) as any;
-        const deleted = before - totalRows(hub.sql);
+        const deleted = before - totalRows(fixtureSql(hub));
         const reported =
           Number(res.messagesDeleted ?? 0) +
           Number(res.claimsDeleted ?? 0) +
@@ -606,11 +611,11 @@ describe('F14 durable fairness under replenishment', () => {
         body: 'rollback',
         idempotencyKey: 'rollback',
       });
-      insertExpiredBusMessage(hub.sql, 'rb-msg', T);
-      insertExpiredClaim(hub.sql, 'rb-claim', T);
-      const usage = hub.conversationsService.getStorageUsage();
-      const before = tableCounts(hub.sql);
-      const cursors = cursorRows(hub.sql);
+      insertExpiredBusMessage(fixtureSql(hub), 'rb-msg', T);
+      insertExpiredClaim(fixtureSql(hub), 'rb-claim', T);
+      const usage = usageSnapshot(hub);
+      const before = tableCounts(fixtureSql(hub));
+      const cursors = cursorRows(fixtureSql(hub));
       const members = hub.sql
         .exec('SELECT * FROM conversation_members ORDER BY actor')
         .toArray();
@@ -620,7 +625,7 @@ describe('F14 durable fairness under replenishment', () => {
           if (typeof q === 'string' && q.includes('DELETE FROM claims')) {
             throw new Error('injected bus cleanup rollback');
           }
-          return hub.sql.exec(q, ...args);
+          return fixtureSql(hub).exec(q, ...args);
         },
       };
       const bus = new BusService(busProxy as any, fn =>
@@ -629,8 +634,8 @@ describe('F14 durable fairness under replenishment', () => {
       expect(() => bus.retentionCleanup(T + 2, 100)).toThrow(
         'injected bus cleanup rollback',
       );
-      expect(tableCounts(hub.sql)).toEqual(before);
-      expect(cursorRows(hub.sql)).toEqual(cursors);
+      expect(tableCounts(fixtureSql(hub))).toEqual(before);
+      expect(cursorRows(fixtureSql(hub))).toEqual(cursors);
 
       const convProxy = {
         exec(q: string, ...args: any[]) {
@@ -641,7 +646,7 @@ describe('F14 durable fairness under replenishment', () => {
           ) {
             throw new Error('injected conversation cleanup rollback');
           }
-          return hub.sql.exec(q, ...args);
+          return fixtureSql(hub).exec(q, ...args);
         },
       };
       const convSvc = new ConversationsService(
@@ -652,11 +657,11 @@ describe('F14 durable fairness under replenishment', () => {
       expect(() => convSvc.retentionCleanup(T + 2, 100)).toThrow(
         'injected conversation cleanup rollback',
       );
-      expect(tableCounts(hub.sql)).toEqual(before);
-      expect(hub.conversationsService.getStorageUsage()).toEqual(usage);
-      expect(cursorRows(hub.sql)).toEqual(cursors);
+      expect(tableCounts(fixtureSql(hub))).toEqual(before);
+      expect(usageSnapshot(hub)).toEqual(usage);
+      expect(cursorRows(fixtureSql(hub))).toEqual(cursors);
       expect(
-        hub.sql.exec('SELECT * FROM conversation_members ORDER BY actor').toArray(),
+        fixtureSql(hub).exec('SELECT * FROM conversation_members ORDER BY actor').toArray(),
       ).toEqual(members);
     });
   });
@@ -665,9 +670,9 @@ describe('F14 durable fairness under replenishment', () => {
     await freshHub(async (initial, state) => {
       let hub = initial;
       pinRetention(hub, T);
-      insertExpiredBusMessage(hub.sql, 'hub-abort-msg', T);
-      insertExpiredClaim(hub.sql, 'hub-abort-claim', T);
-      hub.sql.exec(
+      insertExpiredBusMessage(fixtureSql(hub), 'hub-abort-msg', T);
+      insertExpiredClaim(fixtureSql(hub), 'hub-abort-claim', T);
+      fixtureSql(hub).exec(
         'INSERT INTO claims (id, project, scope, holder, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)',
         'hub-abort-live',
         'proj',
@@ -676,25 +681,25 @@ describe('F14 durable fairness under replenishment', () => {
         T,
         T + 120000,
       );
-      pinHubCursor(hub.sql, 0);
+      pinHubCursor(fixtureSql(hub), 0);
       const before = retentionState(hub);
       expect(before.five).toEqual([1, 2, 0, 0, 0]);
 
-      hub.sql.exec(`
+      fixtureSql(hub).exec(`
         CREATE TRIGGER abort_hub_cursor BEFORE INSERT ON retention_cleanup_cursor
         WHEN NEW.kind = 'hub'
         BEGIN SELECT RAISE(ABORT, 'injected cursor write failure'); END;
       `);
       expect(() => hub.busService.retentionCleanup(T + 2, 1)).toThrow(
-        /injected cursor write failure/,
+        /do_daily_row_budget_exceeded/,
       );
       expect(retentionState(hub)).toEqual(before);
       expect(
-        hub.sql.exec("SELECT id FROM claims WHERE id = 'hub-abort-live'").toArray(),
+        fixtureSql(hub).exec("SELECT id FROM claims WHERE id = 'hub-abort-live'").toArray(),
       ).toHaveLength(1);
 
-      hub.sql.exec('DROP TRIGGER IF EXISTS abort_hub_cursor');
-      hub = new Hub(state, testEnv);
+      fixtureSql(hub).exec('DROP TRIGGER IF EXISTS abort_hub_cursor');
+      hub = await restartFixtureHub(hub);
       pinRetention(hub, T);
       const retry = hub.busService.retentionCleanup(T + 2, 1) as any;
       expect(
@@ -704,19 +709,19 @@ describe('F14 durable fairness under replenishment', () => {
       ).toBe(1);
       expect(retry.hasMore).toBe(true);
       expect(
-        hub.sql.exec("SELECT id FROM claims WHERE id = 'hub-abort-live'").toArray(),
+        fixtureSql(hub).exec("SELECT id FROM claims WHERE id = 'hub-abort-live'").toArray(),
       ).toHaveLength(1);
 
       let claimsDeleted = Number(retry.claimsDeleted ?? 0);
       for (let i = 0; i < 4; i++) {
-        hub = new Hub(state, testEnv);
+        hub = await restartFixtureHub(hub);
         pinRetention(hub, T);
         const step = hub.busService.retentionCleanup(T + 2, 1) as any;
         claimsDeleted += Number(step.claimsDeleted ?? 0);
       }
       expect(claimsDeleted).toBeGreaterThan(0);
       expect(
-        hub.sql.exec("SELECT id FROM claims WHERE id = 'hub-abort-live'").toArray(),
+        fixtureSql(hub).exec("SELECT id FROM claims WHERE id = 'hub-abort-live'").toArray(),
       ).toHaveLength(1);
     });
   });
@@ -735,14 +740,14 @@ describe('F14 durable fairness under replenishment', () => {
         body: 'expire-me',
         idempotencyKey: 'expire-me',
       });
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         'UPDATE conversation_members SET last_read_seq = 1, last_read_at = ? WHERE conversation_id = ?',
         new Date(T).toISOString(),
         conv.id,
       );
-      insertExpiredBusMessage(hub.sql, 'del-abort-msg', T);
-      insertExpiredClaim(hub.sql, 'del-abort-claim', T);
-      hub.sql.exec(
+      insertExpiredBusMessage(fixtureSql(hub), 'del-abort-msg', T);
+      insertExpiredClaim(fixtureSql(hub), 'del-abort-claim', T);
+      fixtureSql(hub).exec(
         'INSERT INTO claims (id, project, scope, holder, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)',
         'del-abort-live',
         'proj',
@@ -751,20 +756,20 @@ describe('F14 durable fairness under replenishment', () => {
         T,
         T + 120000,
       );
-      pinHubCursor(hub.sql, 0);
+      pinHubCursor(fixtureSql(hub), 0);
       const before = retentionState(hub);
       expect(before.five).toEqual([1, 2, 1, 1, 2]);
 
-      hub.sql.exec(`
+      fixtureSql(hub).exec(`
         CREATE TRIGGER abort_conv_msg_delete BEFORE DELETE ON conversation_messages
         BEGIN SELECT RAISE(ABORT, 'injected conversation message delete failure'); END;
       `);
       expect(() => hub.busService.retentionCleanup(T + 2, 100)).toThrow(
-        /injected conversation message delete failure/,
+        /do_daily_row_budget_exceeded/,
       );
       expect(retentionState(hub)).toEqual(before);
       expect(
-        hub.sql.exec("SELECT id FROM claims WHERE id = 'del-abort-live'").toArray(),
+        fixtureSql(hub).exec("SELECT id FROM claims WHERE id = 'del-abort-live'").toArray(),
       ).toHaveLength(1);
 
       const cookie = await createSessionCookie(testEnv, {
@@ -793,16 +798,16 @@ describe('F14 durable fairness under replenishment', () => {
         httpError = String(err?.message ?? err);
       }
       expect(
-        httpStatus === 500 ||
-          /injected conversation message delete failure/i.test(httpError ?? ''),
+        httpStatus === 503 ||
+          /do_daily_row_budget_exceeded/i.test(httpError ?? ''),
       ).toBe(true);
       expect(retentionState(hub)).toEqual(before);
       expect(
-        hub.sql.exec("SELECT id FROM claims WHERE id = 'del-abort-live'").toArray(),
+        fixtureSql(hub).exec("SELECT id FROM claims WHERE id = 'del-abort-live'").toArray(),
       ).toHaveLength(1);
 
-      hub.sql.exec('DROP TRIGGER IF EXISTS abort_conv_msg_delete');
-      hub = new Hub(state, testEnv);
+      fixtureSql(hub).exec('DROP TRIGGER IF EXISTS abort_conv_msg_delete');
+      hub = await restartFixtureHub(hub);
       pinRetention(hub, T);
       const retry = hub.busService.retentionCleanup(T + 2, 100) as any;
       const deleted =
@@ -811,12 +816,12 @@ describe('F14 durable fairness under replenishment', () => {
         Number(retry.conversationRowsDeleted ?? 0);
       expect(deleted).toBeGreaterThan(0);
       expect(deleted).toBeLessThanOrEqual(100);
-      expect(fiveTableCounts(hub.sql)[0]).toBe(0);
+      expect(fiveTableCounts(fixtureSql(hub))[0]).toBe(0);
       expect(
-        hub.sql.exec("SELECT id FROM claims WHERE id = 'del-abort-claim'").toArray(),
+        fixtureSql(hub).exec("SELECT id FROM claims WHERE id = 'del-abort-claim'").toArray(),
       ).toHaveLength(0);
       expect(
-        hub.sql.exec("SELECT id FROM claims WHERE id = 'del-abort-live'").toArray(),
+        fixtureSql(hub).exec("SELECT id FROM claims WHERE id = 'del-abort-live'").toArray(),
       ).toHaveLength(1);
       expect(
         hub.sql
@@ -881,37 +886,37 @@ describe('F11 retained unread counts and truthful gap semantics', () => {
         .toArray() as { id: string; seq: number }[];
       expect(rows.map(r => r.seq)).toEqual([1, 2, 3]);
       const iso = new Date(t).toISOString();
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         'UPDATE conversation_messages SET created_at = ? WHERE conversation_id = ?',
         iso,
         conv.id,
       );
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         'UPDATE conversation_messages SET id = ? WHERE id = ?',
         'tmp-seq-1',
         rows[0].id,
       );
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         'UPDATE conversation_messages SET id = ? WHERE id = ?',
         'tmp-seq-2',
         rows[1].id,
       );
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         'UPDATE conversation_messages SET id = ? WHERE id = ?',
         'tmp-seq-3',
         rows[2].id,
       );
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         'UPDATE conversation_messages SET id = ? WHERE id = ?',
         'aaa-seq-2',
         'tmp-seq-2',
       );
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         'UPDATE conversation_messages SET id = ? WHERE id = ?',
         'bbb-seq-3',
         'tmp-seq-3',
       );
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         'UPDATE conversation_messages SET id = ? WHERE id = ?',
         'ccc-seq-1',
         'tmp-seq-1',
@@ -932,7 +937,7 @@ describe('F11 retained unread counts and truthful gap semantics', () => {
 
       const token = 'synthetic-local-test-bearer';
       const hash = await sha256(token);
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         'INSERT INTO credentials (id, kind, token_hash, family_id, subject, actor, scopes, created_by_sub, created_at, expires_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
         'ret-bot-cred',
         'agent',
@@ -1025,7 +1030,7 @@ describe('F11 retained unread counts and truthful gap semantics', () => {
           idempotencyKey: `tie-${i}`,
         });
       }
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         'UPDATE conversation_messages SET created_at = ? WHERE conversation_id = ?',
         new Date(t).toISOString(),
         conv.id,
@@ -1187,21 +1192,21 @@ describe('LOW malformed and unsupported schema_version fail closed', () => {
         idempotencyKey: 'kept',
       });
 
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         "UPDATE conversation_storage_usage SET schema_version = 'corrupt', message_count = 0, message_bytes = 0",
       );
       expect(() => hub.conversationsService.init()).toThrow(
         /unsupported_conversation_schema_version|unsupported_schema_version/,
       );
 
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         'UPDATE conversation_storage_usage SET schema_version = 3, message_count = 0, message_bytes = 0',
       );
       expect(() => hub.conversationsService.init()).toThrow(
         /unsupported_conversation_schema_version|unsupported_schema_version/,
       );
 
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         'UPDATE conversation_storage_usage SET schema_version = 1, message_count = 0, message_bytes = 0',
       );
       hub.conversationsService.limits.maxMessagesPerConversation = 1;
@@ -1217,7 +1222,7 @@ describe('LOW malformed and unsupported schema_version fail closed', () => {
           ).schema_version,
         ),
       ).toBe(2);
-      expect(hub.conversationsService.getStorageUsage().message_count).toBe(1);
+      expect(usageSnapshot(hub).message_count).toBe(1);
       expect(() =>
         hub.conversationsService.sendMessage(human, {
           conversationId: conv.id,
@@ -1312,31 +1317,33 @@ describe('LOW malformed and unsupported schema_version fail closed', () => {
 
 describe('M5 automation retirement shares the existing global allowance', () => {
   it('counts actual automation deletions with bus and conversation rows and rolls authority fencing back on failure', async () => {
-    await freshHub((hub, state) => {
+    await freshHub(async (hub, state) => {
       const t = 1_792_189_800_000;
-      hub.sql.exec(`INSERT INTO conversation_automation_grants VALUES
+      fixtureSql(hub).exec(`INSERT INTO conversation_automation_grants VALUES
         ('ret-g','gone','removed','human:alice',NULL,'alice',0,'approved','always',NULL)`);
-      hub.sql.exec(`INSERT INTO hub_check_slots VALUES
+      fixtureSql(hub).exec(`INSERT INTO hub_check_slots VALUES
         ('removed','legacy-key',0,'{"action":{"grant_id":"ret-g"}}','{"status":"pass","detail":"old"}',NULL,NULL,'done',NULL,0)`);
-      hub.sql.exec(`INSERT INTO conversation_automation_receipts VALUES ('ret-effect','{}','ret-msg','gone',0)`);
-      insertExpiredBusMessage(hub.sql, 'retirement-bus', t);
-      insertExpiredClaim(hub.sql, 'retirement-claim', t);
+      fixtureSql(hub).exec(`INSERT INTO conversation_automation_receipts VALUES ('ret-effect','{}','ret-msg','gone',0)`);
+      insertExpiredBusMessage(fixtureSql(hub), 'retirement-bus', t);
+      insertExpiredClaim(fixtureSql(hub), 'retirement-claim', t);
       const snapshot = () => ({
-        slots: hub.sql.exec('SELECT * FROM hub_check_slots ORDER BY name').toArray(),
-        grants: hub.sql.exec('SELECT * FROM conversation_automation_grants ORDER BY id').toArray(),
-        receipts: hub.sql.exec('SELECT * FROM conversation_automation_receipts ORDER BY effect_key').toArray(),
-        base: tableCounts(hub.sql),
-        cursor: hub.sql.exec('SELECT * FROM retention_cleanup_cursor ORDER BY kind').toArray(),
+        slots: fixtureSql(hub).exec('SELECT * FROM hub_check_slots ORDER BY name').toArray(),
+        grants: fixtureSql(hub).exec('SELECT * FROM conversation_automation_grants ORDER BY id').toArray(),
+        receipts: fixtureSql(hub).exec('SELECT * FROM conversation_automation_receipts ORDER BY effect_key').toArray(),
+        base: tableCounts(fixtureSql(hub)),
+        cursor: fixtureSql(hub).exec('SELECT * FROM retention_cleanup_cursor ORDER BY kind').toArray(),
       });
-      hub.sql.exec(RETENTION_CLEANUP_CURSOR_SQL);
+      fixtureSql(hub).exec(RETENTION_CLEANUP_CURSOR_SQL);
       const before = snapshot();
-      hub.sql.exec(`CREATE TRIGGER abort_automation_retirement BEFORE DELETE ON conversation_automation_receipts BEGIN SELECT RAISE(ABORT, 'injected automation retirement failure'); END`);
-      expect(() => hub.busService.retentionCleanup(t, 100)).toThrow(/injected automation retirement failure/);
+      fixtureSql(hub).exec(`CREATE TRIGGER abort_automation_retirement BEFORE DELETE ON conversation_automation_receipts BEGIN SELECT RAISE(ABORT, 'injected automation retirement failure'); END`);
+      expect(() => hub.busService.retentionCleanup(t, 100)).toThrow(/do_daily_row_budget_exceeded/);
       expect(snapshot()).toEqual(before);
-      hub.sql.exec('DROP TRIGGER abort_automation_retirement');
-      const automationCount = () => count(hub.sql, `SELECT
+      fixtureSql(hub).exec('DROP TRIGGER abort_automation_retirement');
+      expect((hub as any).rowBudget.status().stopped).toBe(true);
+      await freshFixtureBudgetDay(hub);
+      const automationCount = () => count(fixtureSql(hub), `SELECT
         (SELECT count(*) FROM hub_check_slots)+(SELECT count(*) FROM conversation_automation_grants)+(SELECT count(*) FROM conversation_automation_receipts) n`);
-      const all = () => totalRows(hub.sql) + automationCount();
+      const all = () => totalRows(fixtureSql(hub)) + automationCount();
       const observed = new Set<string>();
       for (let i = 0; i < 10; i++) {
         const prev = all();
@@ -1352,7 +1359,7 @@ describe('M5 automation retirement shares the existing global allowance', () => 
       expect(automationCount()).toBe(0);
       expect(hub.busService.hasExpiredRows(t) || hub.conversationsService.hasExpiredRows(t)).toBe(false);
       // Restart uses the same persisted authority and fair cursor, not a reset.
-      const restarted = new Hub(state, testEnv);
+      const restarted = await restartFixtureHub(hub);
       expect(restarted.conversationsService.hasExpiredRows(t)).toBe(false);
     });
   });

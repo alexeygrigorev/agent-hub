@@ -1,4 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import {registerFixtureStatements,fixtureStatements} from './helpers/fixture-statements';
+import {fixtureSql,freshFixtureBudgetDay} from './helpers/fixture-budget';
+import { describe, expect, it, vi } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { seedFixtureIntake } from './tbm-fixture';
 import { SessionControlService } from '../src/session_control';
@@ -13,17 +15,18 @@ const get = (path: string) => new Request('https://hub.test' + path, { method: '
 
 function metered(sql: any) {
   const cursors: any[] = [];
+  const statements:{sql:string;cursor:any}[]=[];
   const proxy = new Proxy(sql, {
     get(target, prop) {
-      if (prop === 'exec') return (q: string, ...args: any[]) => { const c = target.exec(q, ...args); cursors.push(c); return c; };
+      if (prop === 'exec') return (q: string, ...args: any[]) => { const c = target.exec(q, ...args); cursors.push(c);statements.push({sql:q,cursor:c}); return c; };
       const v = target[prop];
       return typeof v === 'function' ? v.bind(target) : v;
     },
   });
   const measure = async (fn: () => any) => {
-    cursors.length = 0;
+    cursors.length = 0;statements.length=0;
     const out = await fn();
-        return { read: cursors.reduce((n, c) => n + c.rowsRead, 0), out };
+        return { read: cursors.reduce((n, c) => n + c.rowsRead, 0), out,statements:statements.map(({sql,cursor})=>({sql,read:cursor.rowsRead,written:cursor.rowsWritten})) };
   };
   return { proxy, measure };
 }
@@ -32,16 +35,20 @@ async function fixture(fn: (s: SessionControlService, sql: any, measure: (fn: ()
   const bindings = env as unknown as Env;
   const stub = bindings.HUB.get(bindings.HUB.idFromName('wg-bounded-' + crypto.randomUUID()));
   await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
+    registerFixtureStatements(hub,state);
     const m = metered(hub.sql);
     const service = new SessionControlService(m.proxy, (cb) => state.storage.transactionSync(cb), () => Date.now(), { reserve: () => ({ value: null, status: 200 }) }, {});
     service.init();
     seedFixtureIntake(hub.sql);
     const at = new Date().toISOString();
     const far = new Date(Date.now() + 30 * 86400000).toISOString();
-    hub.sql.exec(`INSERT OR IGNORE INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at)
+    fixtureSql(hub).exec(`INSERT OR IGNORE INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at)
       VALUES ('host-cred-1', 'host', 'hash-host-cred-1', 'refresh-host-cred-1', 'host-family-1', 'test-host', 'hetzner', NULL, '["host"]', 'test', ?, ?)`, at, far);
-    hub.sql.exec(`INSERT OR IGNORE INTO machines (id, name, hostname, credential_id, registered_at) VALUES ('hetzner', 'hetzner', 'hetzner', 'host-cred-1', ?)`, at);
+    fixtureSql(hub).exec(`INSERT OR IGNORE INTO machines (id, name, hostname, credential_id, registered_at) VALUES ('hetzner', 'hetzner', 'hetzner', 'host-cred-1', ?)`, at);
+    await freshFixtureBudgetDay(hub);
+    await (hub as any).rowBudget.begin(true);
     await fn(service, hub.sql, m.measure);
+    expect((hub as any).rowBudget.status()).toMatchObject({limit_total:20000,stopped:false});
   });
 }
 
@@ -50,11 +57,11 @@ const NATIVE = (i: number) => `00000000-0000-4000-8000-${String(i).padStart(12, 
 describe('worktree-guards bounded read (4d05302a)', () => {
   it('reads a bounded row set at production scale and still refuses foreign/live owners', async () => {
     await fixture(async (s, sql, measure) => {
-      sql.exec(`WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 50000)
+      fixtureStatements(sql).exec(`WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 50000)
         INSERT INTO fleet_launches (id, actor, requester_kind, summary, request_key, request_json, machine_id, engine, account, mode, workspace, prompt, state, created_at, updated_at)
         SELECT 'hist-' || i, 'demo:assistant', 'agent', 's', 'k-' || i, '{"workspace":"demo"}', 'hetzner', 'claude', 'default', 'headless', 'demo', 'p',
           'exited', '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z' FROM c`);
-      sql.exec(`WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 5000)
+      fixtureStatements(sql).exec(`WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 5000)
         INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, engine, mode, state, created_at, updated_at)
         SELECT printf('11111111-0000-4000-8000-%012d', i), 'demo:assistant', 'rk-' || i, '{"workspace":"demo"}', 'hist-' || i, 'hetzner', 'claude', 'headless', 'stopped',
           '2026-10-01T00:' || printf('%02d', (i / 60) % 60) || ':' || printf('%02d', i % 60) || '.000Z', '2026-10-01T00:00:00.000Z' FROM c`);
@@ -63,14 +70,14 @@ describe('worktree-guards bounded read (4d05302a)', () => {
       const foreign = crypto.randomUUID();
       const now = new Date().toISOString();
       const binding = JSON.stringify({ native_id: NATIVE(1), tag: 'hub-x', workspace: '/w', native_created_at_ms: 1, generation: 1 });
-      sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at)
+      fixtureStatements(sql).exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at)
         VALUES(?,'demo:assistant',?,?,'hetzner','claude','headless','running',?,?,?)`, live, live, JSON.stringify({ intake_task_id: 'task-live' }), binding, now, now);
-      sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,created_at,updated_at)
+      fixtureStatements(sql).exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,created_at,updated_at)
         VALUES(?,'demo:assistant',?,?,'other-host','claude','headless','running',?,?)`, foreign, foreign, JSON.stringify({ intake_task_id: 'task-live' }), now, now);
 
       const call = async (qs: string) => {
         const m = await measure(async () => (await s.handle(get('/api/sessions/worktree-guards' + qs), host('hetzner') as any)).json());
-        return { read: m.read, body: m.out as any };
+        return { read: m.read, body: m.out as any,statements:(m as any).statements };
       };
       const targeted = await call(`?session_id=${live}`);
       expect(targeted.body.sessions.map((f: any) => f.session_id)).toEqual([live]);
@@ -98,14 +105,19 @@ describe('worktree-guards bounded read (4d05302a)', () => {
       expect(legacy.read).toBeLessThanOrEqual(6500);
 
       // History growth must not change the cost: add 2k more old sessions and re-measure.
-      sql.exec(`WITH RECURSIVE c(i) AS (SELECT 5001 UNION ALL SELECT i + 1 FROM c WHERE i < 7000)
+      fixtureStatements(sql).exec(`WITH RECURSIVE c(i) AS (SELECT 5001 UNION ALL SELECT i + 1 FROM c WHERE i < 7000)
         INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, engine, mode, state, created_at, updated_at)
         SELECT printf('11111111-0000-4000-8000-%012d', i), 'demo:assistant', 'rk-' || i, '{"workspace":"demo"}', 'hist-' || i, 'hetzner', 'claude', 'headless', 'stopped',
           '2026-09-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z' FROM c`);
       const grown = await call(`?session_id=${live}`);
+      console.log('worktree-guards history-growth native receipt',JSON.stringify({
+        initial:{read:targeted.read,observation_pending:targeted.body.observation_pending??false,
+          fact:targeted.body.sessions[0],statements:targeted.statements},
+        grown:{read:grown.read,observation_pending:grown.body.observation_pending??false,
+          fact:grown.body.sessions[0],statements:grown.statements},delta:grown.read-targeted.read}));
       expect(Math.abs(grown.read - targeted.read)).toBeLessThanOrEqual(20);
       // Every statement the endpoint can issue is indexed.
-      const plan = (q: string, ...a: any[]) => (sql.exec('EXPLAIN QUERY PLAN ' + q, ...a).toArray() as any[]).map(r => r.detail).join('\n');
+      const plan = (q: string, ...a: any[]) => (fixtureStatements(sql).exec('EXPLAIN QUERY PLAN ' + q, ...a).toArray() as any[]).map(r => r.detail).join('\n');
       // Keyset page with a row-value seek: a range seek on (created_at,id), no sort, covering (no table fetch).
       const seek = plan(`SELECT id, created_at FROM session_control_sessions INDEXED BY session_control_machine_created_state WHERE machine_id = ? AND state IN (SELECT value FROM json_each(?)) AND (created_at, id) > (?, ?) ORDER BY created_at, id LIMIT 101`, 'hetzner', '[]', 'x', 'y');
       console.log('worktree-guards page plan', seek.replace(/\n/g, ' | '));
@@ -122,7 +134,7 @@ describe('worktree-guards bounded read (4d05302a)', () => {
   });
 
   const insertSession = (sql: any, id: string, intake: string | null, state: string, at: string, machine = 'hetzner') =>
-    sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,created_at,updated_at)
+    fixtureStatements(sql).exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,created_at,updated_at)
       VALUES(?,'demo:assistant',?,?,?,'claude','headless',?,?,?)`, id, id, JSON.stringify(intake ? { intake_task_id: intake } : {}), machine, state, at, at);
   const sid = (i: number) => `22222222-0000-4000-8000-${String(i).padStart(12, '0')}`;
 
@@ -153,14 +165,25 @@ describe('worktree-guards bounded read (4d05302a)', () => {
   });
 
   it('fails closed when the intake closure exceeds the cap (hidden live owner)', async () => {
-    await fixture(async (s, sql) => {
+    await fixture(async (s, sql, measure) => {
       for (let i = 1; i <= 410; i++) insertSession(sql, sid(i), 'task-big', 'stopped', '2026-10-01T00:00:00.000Z');
       insertSession(sql, sid(411), 'task-big', 'running', '2026-10-02T00:00:00.000Z');
+      const before=fixtureStatements(sql).exec('SELECT count(*) AS n FROM session_control_commands').one().n;
+      const receipts=vi.spyOn(s as any,'confirmedStopRecorded');
       for (const qs of [`session_id=${sid(1)}`, 'intake_task_id=task-big']) {
-        const res: any = await (await s.handle(get('/api/sessions/worktree-guards?' + qs), host('hetzner') as any)).json();
+        const {out:res,read}=await measure(async()=>{
+          const response=await s.handle(get('/api/sessions/worktree-guards?'+qs),host('hetzner') as any);
+          expect(response.status).toBe(200);
+          return await response.json() as any;
+        });
+        expect(res).toMatchObject({observation_pending:true,reason:'worktree_identity_closure_limited'});
         expect(res.sessions.length).toBeGreaterThan(0);
-        for (const fact of res.sessions) expect(fact.lock_release_permitted).toBe(false);
+        for(const fact of res.sessions)expect(fact).toMatchObject({lock_release_permitted:false,native_terminal:false,protected:true});
+        expect(read).toBeLessThan(3000);
       }
+      expect(receipts).not.toHaveBeenCalled();
+      expect(fixtureStatements(sql).exec('SELECT count(*) AS n FROM session_control_commands').one().n).toBe(before);
+      receipts.mockRestore();
     });
   });
 });

@@ -67,21 +67,19 @@ it('rechecks malformed link ledgers and repaired authority after a native-only i
   expect(r.sessions('cache-host')[0].linked_intake_open).toBe(false);
 }));
 
-it('bypasses snapshot retention for oversized input and missing structural generations', async () => fixture((r, sql, _state, scans) => {
-  sql.exec('INSERT INTO intake_task_projection VALUES(?,?,?)', 'large', '{}', JSON.stringify([{kind: 'link', pad: 'x'.repeat(2100000)}]));
-  r.sessions('cache-host');
+it('keeps oversized authority unknown while activity stays fresh and recovers after repair', async () => fixture((r, sql, _state, scans) => {
+  sql.exec('INSERT INTO intake_task_projection VALUES(?,?,?)', 'large', '{}', JSON.stringify([{kind:'link',pad:'x'.repeat(2100000)}]));
+  expect(r.sessions('cache-host')[0]).toMatchObject({linked_intake_open:true,intake_authority_observation_limited:true});
   sql.exec("UPDATE fleet_sessions SET last_activity_at='2026-10-28T12:34:56Z'");
-  expect(r.sessions('cache-host')[0].last_activity_at).toBe('2026-10-28T12:34:56Z');
-  expect(scans()).toBe(1);
-  // Activity overlays stay fresh without rebuilding canonical metadata. A
-  // metadata write must still rescan oversized intake input instead of retaining it.
+  expect(r.sessions('cache-host')[0]).toMatchObject({last_activity_at:'2026-10-28T12:34:56Z',intake_authority_observation_limited:true});
   sql.exec("UPDATE fleet_sessions SET tag=tag || '-updated'");
-  r.sessions('cache-host');
-  expect(scans()).toBe(2);
+  expect(r.sessions('cache-host')[0].intake_authority_observation_limited).toBe(true);
   sql.exec("DELETE FROM intake_task_projection WHERE id='large'");
+  expect(r.sessions('cache-host')[0].intake_authority_observation_limited).toBe(false);
+  const before=scans();
   sql.exec('DELETE FROM resource_catalog_revision');
-  r.sessions('cache-host'); r.sessions('cache-host');
-  expect(scans()).toBe(4);
+  r.sessions('cache-host');r.sessions('cache-host');
+  expect(scans()).toBe(before+2);
 }));
 
 it('refreshes closure links after launch requests, binding identity and hostname aliases change', async () => fixture((r, sql) => {

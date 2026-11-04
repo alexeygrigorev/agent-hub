@@ -1,4 +1,5 @@
-import { initAlertRouting } from './alert-routing';
+import { initBusAgentProjection, subscribedBusAgents } from './bus-agent-projection';
+import { initAlertRouting, prepareReaderObservation } from './alert-routing';
 import { registryAddress, registryRowSql } from './agent_registry';
 import { validateRef } from './session-messaging';
 /** Older writers could cut a metadata JSON string mid-escape. Keep the
@@ -283,10 +284,12 @@ export class BusService {
   public sql: SqlStorage;
   public txSync?: <T>(fn: () => T) => T;
   public hooks?: BusSendHooks;
+  private identityTransactionDepth = 0;
 
   constructor(sql: SqlStorage, txSync?: <T>(fn: () => T) => T, hooks?: BusSendHooks) {
     this.sql = sql;
     initAlertRouting(sql);
+    initBusAgentProjection(sql);
     this.txSync = txSync;
     this.hooks = hooks;
   }
@@ -300,20 +303,46 @@ export class BusService {
     if (!addr) return null;
     let rows: any[];
     if (addr.kind === 'tag') {
-      rows = this.sql.exec('SELECT tag, project, role, machine_id FROM agents WHERE tag = ?', addr.tag).toArray();
+      rows = this.sql.exec('SELECT tag, project, role, machine_id FROM agents WHERE tag = ? LIMIT 2', addr.tag).toArray();
     } else if (addr.kind === 'qualified' || addr.kind === 'agent' || addr.kind === 'session') {
       const project = addr.kind === 'qualified' ? addr.project : addr.kind;
       const tag = addr.kind === 'qualified' ? addr.tag : addr.kind === 'agent' ? addr.name : addr.sessionId;
-      rows = this.sql.exec('SELECT tag, project, role, machine_id FROM agents WHERE project = ? AND tag = ?', project, tag).toArray();
+      rows = this.sql.exec("SELECT tag, project, role, machine_id FROM agents WHERE COALESCE(project,'') = ? AND tag = ? LIMIT 2", project, tag).toArray();
     } else if (addr.kind === 'role') {
       if (isRootRole(addr.role)) return null;
-      rows = this.sql.exec('SELECT tag, project, role, machine_id FROM agents WHERE role = ?', addr.role).toArray();
+      const projected = this.projectedAgents('role', addr.role, false);
+      if (projected === null) throw new Error('bus_registry_projection_incomplete');
+      rows = projected;
     } else {
       return null;
     }
     if (rows.length !== 1 || !registryAddress(rows[0].project ? `${rows[0].project}:${rows[0].tag}` : rows[0].tag)) return null;
     const r = rows[0];
     return { tag: r.tag, project: r.project ?? null, role: r.role ?? null, machine_id: r.machine_id ?? null };
+  }
+
+  private projectedAgents(kind: 'role' | 'host', value: string, advance = true): any[] | null {
+    const read = () => subscribedBusAgents(this.sql, kind, value, advance);
+    return this.txSync ? this.txSync(read) : read();
+  }
+
+  /** Prepare before an outer mutation transaction so refusals keep progress. */
+  public prepareActorRoles(actors: (string | undefined)[]): void {
+    if (this.identityTransactionDepth) return;
+    const roles = new Set<string>();
+    for (const actor of actors) {
+      const address = parseAddress(actor);
+      if (address?.kind === 'role') roles.add(address.role);
+      else { const agent = this.resolveAgent(address); if (agent?.role) roles.add(agent.role); }
+    }
+    let incomplete = false;
+    for (const role of roles) if (!isRootRole(role) && this.projectedAgents('role', role) === null) incomplete = true;
+    if (incomplete) throw new Error('bus_registry_projection_incomplete');
+  }
+
+  /** null is an incomplete/overflowed observation, never an empty authority set. */
+  public hostRows(host: string): any[] | null {
+    return this.projectedAgents('host', host);
   }
 
   /** The registered agent behind a `tag` or `project:tag` address; role, machine and malformed forms are null. */
@@ -333,7 +362,7 @@ export class BusService {
     if (isRootRoleAddress(a) || isRootRoleAddress(b)) return false;
     if (a === b) {
       const addr = parseAddress(a);
-      if (addr?.kind === 'tag') return this.sql.exec('SELECT 1 FROM agents WHERE tag = ?', addr.tag).toArray().length <= 1;
+      if (addr?.kind === 'tag') return this.sql.exec('SELECT 1 FROM agents WHERE tag = ? LIMIT 2', addr.tag).toArray().length <= 1;
       return addr !== null;
     }
     const x = this.resolveAgent(parseAddress(a));
@@ -378,11 +407,13 @@ export class BusService {
   }
 
   public canonicalActor(actor: string): string {
+    this.prepareActorRoles([actor]);
     const agent = this.resolveAgentActor(actor);
     return agent?.project ? `${agent.project}:${agent.tag}` : actor;
   }
 
   public validateRecipient(actor: string, now: number = Date.now()): boolean {
+    this.prepareActorRoles([actor]);
     // M3 has no accepted root authority: fail closed rather than infer/mint Root
     if (isRootRoleAddress(actor)) return false;
 
@@ -410,6 +441,7 @@ export class BusService {
   }
 
   public isAuthorizedForActor(caller: CallerContext, actor: string, now: number = Date.now()): boolean {
+    this.prepareActorRoles([caller.actor,actor]);
     if (caller.isRevoked) return false;
 
     // Root role routing has no accepted root authority in M3: fail closed in any letter case
@@ -442,6 +474,7 @@ export class BusService {
   }
 
   public validateClaimProject(caller: CallerContext, project: string, holder: string, now: number = Date.now(), leaseEpoch?: number): void {
+    this.prepareActorRoles([caller.actor,holder]);
     if (isRootRoleAddress(holder) || isRootRoleAddress(caller.actor)) {
       throw new Error(ROOT_AUTHORITY_ERROR);
     }
@@ -479,11 +512,13 @@ export class BusService {
   }
 
   private runInTxn<T>(fn: () => T): T {
-    if (this.txSync) return this.txSync(fn);
-    return fn();
+    const tracked = () => { this.identityTransactionDepth++; try { return fn(); } finally { this.identityTransactionDepth--; } };
+    if (this.txSync) return this.txSync(tracked);
+    return tracked();
   }
 
   send(caller: CallerContext, opts: SendOpts): { id: string; threadId: string; thread_id: string } {
+    this.prepareActorRoles([caller.actor,opts.senderActor,opts.toActor]);
     try { return this.runInTxn(() => {
       const now = Date.now(); // internal server clock
       const refJson = validateRef(opts.ref);
@@ -592,56 +627,83 @@ export class BusService {
    * (or its host bridge). An admin reading someone else's inbox does not mark anything.
    * Filters (§11): unread hides read messages; thread narrows to one thread id.
    */
-  inbox(caller: CallerContext, actor: string, limit: number = 50, cursor?: string, filters?: { unread?: boolean; thread?: string }): any[] {
-    const now = Date.now();
-    if (isRootRoleAddress(actor)) {
-      throw new Error(ROOT_AUTHORITY_ERROR);
+  private inboxOffsets = new Map<string, any[]>();
+  invalidateInboxOffsets():void { this.inboxOffsets.clear(); }
+
+  inbox(caller: CallerContext, actor: string, limit = 50, cursor?: string, filters?: { unread?: boolean; thread?: string }): any[] {
+    return this.inboxPage(caller,actor,limit,cursor,filters).rows;
+  }
+
+  inboxPage(caller: CallerContext, actor: string, limit = 50, cursor?: string, filters?: { unread?: boolean; thread?: string }): {rows:any[];next:string|null;truncated:boolean} {
+    const now=Date.now();
+    this.prepareActorRoles([caller.actor,actor]);
+    if(isRootRoleAddress(actor))throw new Error(ROOT_AUTHORITY_ERROR);
+    if(!this.isAuthorizedForActor(caller,actor,now))throw new Error('unauthorized');
+    limit=Math.min(100,Math.max(1,limit));
+    const aliases=this.recipientAliases(actor);
+    if(!aliases.length || aliases.length>4)throw new Error('unauthorized');
+    const key=JSON.stringify([aliases,!!caller.isAdmin,!!filters?.unread,filters?.thread??null]);
+    const empty=()=>aliases.map(()=>[0,0,'']);
+    let offsets=cursor?empty():structuredClone(this.inboxOffsets.get(key)??empty());
+    if(cursor?.startsWith('ib1:')) {
+      try {
+        const parsed=JSON.parse(atob(cursor.slice(4)));
+        if(!Array.isArray(parsed)||parsed.length!==aliases.length||parsed.some(p=>!Array.isArray(p)||p.length!==3||
+          !Number.isSafeInteger(p[0])||p[0]<0||!Number.isSafeInteger(p[1])||p[1]<0||typeof p[2]!=='string'||p[2].length>128))throw new Error();
+        offsets=parsed;
+      } catch {throw new Error('invalid_cursor');}
+    } else if(cursor) {
+      if(this.hooks && /^\d+$/.test(cursor)) {
+        const seq=Number(cursor);if(!Number.isSafeInteger(seq))throw new Error('invalid_cursor');
+        offsets=aliases.map(()=>[0,seq,'']);
+      } else {
+        const row:any=this.sql.exec('SELECT rowid AS source_rowid,to_actor,recipient_seq FROM messages WHERE id=?',cursor).toArray()[0];
+        if(!row||!aliases.includes(row.to_actor))throw new Error('invalid_cursor');
+        offsets=aliases.map(alias=>this.hooks?[alias===row.to_actor&&row.recipient_seq==null?row.source_rowid:0,row.recipient_seq??0,'']:[0,0,cursor]);
+      }
     }
-
-    if (!this.isAuthorizedForActor(caller, actor, now)) throw new Error("unauthorized");
-
-    if (limit > 100) limit = 100;
-    if (limit < 1) limit = 1;
-
-    const aliases = this.recipientAliases(actor);
-    if (aliases.length === 0) throw new Error("unauthorized");
-
-    return this.runInTxn(() => {
-      let query = `SELECT * FROM messages WHERE to_actor IN (${aliases.map(() => '?').join(',')}) AND expires_at > ?${caller.isAdmin ? '' : ' AND registry_unbound_to = 0'}`;
-      const params: any[] = [...aliases, now];
-      if (filters?.unread) {
-        query += ' AND read_at IS NULL';
-      }
-      if (filters?.thread) {
-        query += ' AND thread_id = ?';
-        params.push(filters.thread);
-      }
-      if (cursor) {
-        if (this.hooks) {
-          const legacy = /^\d+$/.test(cursor) ? null : this.sql.exec('SELECT recipient_seq FROM messages WHERE id = ? AND to_actor IN (' + aliases.map(() => '?').join(',') + ')', cursor, ...aliases).toArray()[0];
-          if (legacy && legacy.recipient_seq == null) {
-            query += ' AND ((recipient_seq IS NULL AND id > ?) OR recipient_seq IS NOT NULL)';
-            params.push(cursor);
-          } else {
-            const seq = /^\d+$/.test(cursor) ? Number(cursor) : Number(legacy?.recipient_seq);
-            if (!Number.isSafeInteger(seq) || seq < 0) throw new Error('invalid_cursor');
-            query += ' AND recipient_seq > ?';
-            params.push(seq);
-          }
-        } else {
-          query += ' AND id > ?';
-          params.push(cursor);
+    const streams:{alias:number;kind:0|1|2;rows:any[];more:boolean}[]=[];
+    for(let i=0;i<aliases.length;i++) {
+      if(this.hooks) {
+        for(const kind of [0,1] as const) {
+          const raw=(kind===0
+            ? this.sql.exec('SELECT rowid AS inbox_rowid,* FROM messages WHERE to_actor=? AND recipient_seq IS NULL AND rowid>? ORDER BY rowid LIMIT ?',aliases[i],offsets[i][0],limit+1)
+            : this.sql.exec('SELECT rowid AS inbox_rowid,* FROM messages WHERE to_actor=? AND recipient_seq>? ORDER BY recipient_seq LIMIT ?',aliases[i],offsets[i][1],limit+1)).toArray() as any[];
+          streams.push({alias:i,kind,rows:raw.slice(0,limit),more:raw.length>limit});
         }
+      } else if(i===0) {
+        const raw=this.sql.exec('SELECT rowid AS inbox_rowid,* FROM messages WHERE id>? ORDER BY id LIMIT ?',offsets[0][2],limit+1).toArray() as any[];
+        streams.push({alias:0,kind:2,rows:raw.slice(0,limit),more:raw.length>limit});
       }
-      query += this.hooks ? ' ORDER BY recipient_seq ASC, id ASC LIMIT ?' : ' ORDER BY id ASC LIMIT ?';
-      params.push(limit);
-
-      const rows = this.sql.exec(query, ...params).toArray() as any[];
+    }
+    const eligible=(row:any)=>aliases.includes(row.to_actor) && row.expires_at>now && (caller.isAdmin||row.registry_unbound_to===0) &&
+      (!filters?.unread||row.read_at==null) && (!filters?.thread||row.thread_id===filters.thread);
+    const all=streams.flatMap(stream=>stream.rows).filter(eligible).sort((a,b)=>
+      this.hooks?(a.recipient_seq??-1)-(b.recipient_seq??-1)||String(a.id).localeCompare(String(b.id)):String(a.id).localeCompare(String(b.id)));
+    const rows=all.slice(0,limit), selected=new Set(rows.map(row=>row.id));
+    const next=structuredClone(offsets),resume=structuredClone(offsets);
+    let truncated=streams.some(stream=>stream.more)||all.length>limit;
+    for(const stream of streams) {
+      let firstEligible=false;
+      for(const row of stream.rows) {
+        const ok=eligible(row),position=stream.kind===0?row.inbox_rowid:stream.kind===1?row.recipient_seq:row.id;
+        if(!firstEligible&&!ok)resume[stream.alias][stream.kind]=position;
+        if(ok)firstEligible=true;
+        if(ok&&!selected.has(row.id)){truncated=true;break;}
+        next[stream.alias][stream.kind]=position;
+      }
+    }
+    // Only monotonically ineligible prefixes (read/expired/wrong thread/unbound)
+    // advance a cursor-less poll. Undelivered eligible rows remain repeatable.
+    if(!cursor) {
+      if(this.inboxOffsets.size>=512)this.inboxOffsets.delete(this.inboxOffsets.keys().next().value!);
+      this.inboxOffsets.set(key,resume);
+    }
+    let publishReader: (() => void) | undefined;
+    const result = this.runInTxn(()=> {
       if (this.isRecipientPrincipal(caller, actor, now)) {
         if (caller.tokenId) {
-          this.sql.exec(`INSERT INTO bus_reader_activity(recipient, credential_id, last_read_at) VALUES (?, ?, ?)
-            ON CONFLICT(recipient, credential_id) DO UPDATE SET last_read_at=excluded.last_read_at
-            WHERE last_read_at < excluded.last_read_at - 60000`, aliases[0], caller.tokenId, now);
+          publishReader = prepareReaderObservation(this.sql, aliases[0], caller.tokenId, now);
         }
         for (const row of rows) {
           if (row.delivered_at || row.to_session_id) continue;
@@ -650,8 +712,10 @@ export class BusService {
           this.hooks?.onStage?.(row.id, 'delivered', caller.actor ?? null, caller.machineId ?? null, now);
         }
       }
-      return rows;
+      return {rows,next:truncated?'ib1:'+btoa(JSON.stringify(next)):null,truncated};
     });
+    publishReader?.();
+    return result;
   }
 
   /** Recipient batch read (`hub inbox --mark-read`, §11): only the recipient
@@ -1040,82 +1104,46 @@ export class BusService {
   }
 
   getBusMessages(caller?: CallerContext, actor?: string | null): any[] {
+    return this.getBusMessagesPage(caller,actor).rows;
+  }
+
+  /** History uses an explicit primary-key page before applying participant
+   * filters. A cursor describes every inspected row, even an empty actor page;
+   * no sender filter or chronological sort can scan retained history. */
+  getBusMessagesPage(caller?: CallerContext, actor?: string | null, before?: string | null, limit = 100): {
+    rows: any[]; next: string | null; truncated: boolean; order: 'id_desc'; scanned: number;
+  } {
     const now = Date.now();
-
-    if (!caller) {
-      if (actor) {
-        return this.sql.exec('SELECT * FROM messages WHERE (to_actor = ? OR from_actor = ?) AND to_actor != "role:root" AND from_actor != "role:root" ORDER BY created_at DESC LIMIT 100', actor, actor).toArray();
-      }
-      return this.sql.exec('SELECT * FROM messages WHERE to_actor != "role:root" AND from_actor != "role:root" ORDER BY created_at DESC LIMIT 100').toArray();
-    }
-
-    if (isRootRoleAddress(actor) || isRootRoleAddress(caller.actor)) {
-      throw new Error(ROOT_AUTHORITY_ERROR);
-    }
-
-    if (caller.isAdmin) {
-      if (actor) {
-        return this.sql.exec(
-          'SELECT * FROM messages WHERE (to_actor = ? OR from_actor = ?) AND to_actor != "role:root" AND from_actor != "role:root" ORDER BY created_at DESC LIMIT 100',
-          actor, actor
-        ).toArray();
-      }
-      return this.sql.exec('SELECT * FROM messages WHERE to_actor != "role:root" AND from_actor != "role:root" ORDER BY created_at DESC LIMIT 100').toArray();
-    }
-
-    if (caller.actor) {
-      const effectiveActor = actor || caller.actor;
-      if (!this.isAuthorizedForActor(caller, effectiveActor, now)) {
-        throw new Error("unauthorized");
-      }
-
-      const aliases = [this.canonicalActor(effectiveActor)];
-
-      if (aliases.length === 1) {
-        return this.sql.exec(
-          'SELECT * FROM messages WHERE ((registry_unbound_to = 0 AND to_actor = ?) OR (registry_unbound_from = 0 AND from_actor = ?)) AND to_actor != "role:root" AND from_actor != "role:root" ORDER BY created_at DESC LIMIT 100',
-          aliases[0], aliases[0]
-        ).toArray();
-      } else {
-        return this.sql.exec(
-          'SELECT * FROM messages WHERE ((registry_unbound_to = 0 AND to_actor IN (?, ?)) OR (registry_unbound_from = 0 AND from_actor IN (?, ?))) AND to_actor != "role:root" AND from_actor != "role:root" ORDER BY created_at DESC LIMIT 100',
-          aliases[0], aliases[1], aliases[0], aliases[1]
-        ).toArray();
-      }
-    }
-
-    if (caller.kind === 'host' || (!caller.actor && caller.machineId)) {
-      if (!caller.machineId) throw new Error("unauthorized");
-
-      if (actor) {
-        if (!this.isAuthorizedForActor(caller, actor, now)) {
-          throw new Error("unauthorized");
+    if(caller?.isRevoked)throw new Error('unauthorized');
+    if (before && (before.length > 128 || /[\u0000-\u001f]/.test(before))) throw new Error('invalid_cursor');
+    limit = Math.min(100,Math.max(1,Number.isSafeInteger(limit)?limit:100));
+    let allowed: Set<string> | null = null;
+    let scoped = false;
+    if (caller) {
+      if (isRootRoleAddress(actor) || isRootRoleAddress(caller.actor)) throw new Error(ROOT_AUTHORITY_ERROR);
+      if (caller.isAdmin) { if (actor) allowed=new Set([actor]); }
+      else if (caller.actor || actor) {
+        const effective = actor || caller.actor!;
+        if (!this.isAuthorizedForActor(caller,effective,now)) throw new Error('unauthorized');
+        allowed=new Set([this.canonicalActor(effective)]); scoped=true;
+      } else if ((caller.kind==='host' || caller.machineId) && caller.machineId) {
+        const agents=this.hostRows(caller.machineId);
+        if (agents===null) throw new Error('bus_registry_projection_incomplete');
+        allowed=new Set(['machine:'+caller.machineId]);
+        for(const row of agents) {
+          const address=row.project?`${row.project}:${row.tag}`:row.tag;
+          if(registryAddress(address)) allowed.add(address);
         }
-        actor = this.canonicalActor(actor);
-        return this.sql.exec(
-          'SELECT * FROM messages WHERE ((registry_unbound_to = 0 AND to_actor = ?) OR (registry_unbound_from = 0 AND from_actor = ?)) AND to_actor != "role:root" AND from_actor != "role:root" ORDER BY created_at DESC LIMIT 100',
-          actor, actor
-        ).toArray();
-      }
-
-      const machineActor = `machine:${caller.machineId}`;
-      const agentRows = this.sql.exec(
-        'SELECT project, tag FROM agents WHERE machine_id = ? AND role != "root"',
-        caller.machineId
-      ).toArray() as any[];
-      const allowedActors = new Set<string>([machineActor]);
-      for (const row of agentRows) {
-        if (!registryAddress(row.project ? `${row.project}:${row.tag}` : row.tag)) continue;
-        allowedActors.add(row.project ? `${row.project}:${row.tag}` : row.tag);
-      }
-      const allowedList = Array.from(allowedActors);
-      if (allowedList.length === 0) return [];
-
-      const placeholders = allowedList.map(() => '?').join(',');
-      const sqlQuery = `SELECT * FROM messages WHERE ((registry_unbound_to = 0 AND to_actor IN (${placeholders})) OR (registry_unbound_from = 0 AND from_actor IN (${placeholders}))) AND to_actor != "role:root" AND from_actor != "role:root" ORDER BY created_at DESC LIMIT 100`;
-      return this.sql.exec(sqlQuery, ...allowedList, ...allowedList).toArray();
-    }
-
-    throw new Error("unauthorized");
+        scoped=true;
+      } else throw new Error('unauthorized');
+    } else if (actor) allowed=new Set([actor]);
+    const source=(before
+      ? this.sql.exec('SELECT * FROM messages WHERE id<? ORDER BY id DESC LIMIT ?',before,limit+1)
+      : this.sql.exec('SELECT * FROM messages ORDER BY id DESC LIMIT ?',limit+1)).toArray() as any[];
+    const page=source.slice(0,limit),truncated=source.length>limit;
+    const rows=page.filter(row=>row.to_actor!=='role:root' && row.from_actor!=='role:root' &&
+      (!allowed || (!scoped || row.registry_unbound_to===0) && allowed.has(row.to_actor) ||
+        (!scoped || row.registry_unbound_from===0) && allowed.has(row.from_actor)));
+    return {rows,next:truncated&&page.length?page[page.length-1].id:null,truncated,order:'id_desc',scanned:page.length};
   }
 }

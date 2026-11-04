@@ -1,4 +1,5 @@
-import { describe, it, expect, beforeAll } from 'vitest';
+import { advanceFixtureBudgetDay, fixtureSql } from './helpers/fixture-budget';
+import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
 import { pinJobsClock } from './slot-clock';
 import { runInDurableObject, env } from 'cloudflare:test';
 import { doFetch } from './m1-focus-setup';
@@ -110,11 +111,16 @@ async function seedTestDb(sql: any) {
 }
 
 describe('M4 HTTP Endpoints and Worker/Hub Routing', () => {
+  beforeEach(async()=>{
+    const stub=(env as any).HUB.get((env as any).HUB.idFromName('hub'));
+    await (runInDurableObject as any)(stub,advanceFixtureBudgetDay);
+  });
   beforeAll(async () => {
     const id = (env as any).HUB.idFromName("hub");
     const stub = (env as any).HUB.get(id);
-    await (runInDurableObject as any)(stub, async (instance: any) => {
-      await seedTestDb(instance.sql);
+    await (runInDurableObject as any)(stub, async (instance: any, state:any) => {
+      await advanceFixtureBudgetDay(instance);
+      await seedTestDb(fixtureSql(instance,state));
     });
   });
 

@@ -190,11 +190,9 @@ export default {
     return new Response(asset.body, { status: asset.status, headers });
   },
 
-  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
-    const id = env.HUB.idFromName("hub");
-    const stub = env.HUB.get(id);
-    // The 30-minute cron keeps the existing root slot; every cron also runs due checks.
-    if (event.cron !== '*/5 * * * *') await (stub as any).scheduledTick();
-    await (stub as any).runChecks();
+  async scheduled(_event: ScheduledEvent, _env: Env, _ctx: ExecutionContext) {
+    // Work is enqueued by mutations and wakes through durable one-shot alarms.
+    // Scheduled events must never instantiate an idle Hub or run maintenance.
+
   }
 };

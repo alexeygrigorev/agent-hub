@@ -48,7 +48,7 @@ export function sanitizeCpuUsage(value: any): CpuUsage | null {
 }
 export function cpuVerdict(raw: unknown, cores: number, expected: number, ramping: number, config: CpuConfig, now: number,
   memAvailableMb: number | null = null, memoryFloorMb = MEMORY_PRESSURE_FLOOR_MB, memObservedAt: string | null = null,
-  host: {load1?: unknown; swap_used_percent?: unknown; observed_at?: unknown; active_sessions?: unknown} = {}) {
+  host: {load1?: unknown; swap_used_percent?: unknown; observed_at?: unknown; active_sessions?: unknown;active_sessions_limited?:boolean} = {}) {
   const usage = sanitizeCpuUsage(raw);
   const fresh=usage&&now-Date.parse(usage.observed_at)<=180000&&now-Date.parse(usage.observed_at)>=-30000;
   const memoryAt = typeof memObservedAt === 'string' ? Date.parse(memObservedAt) : NaN;
@@ -82,7 +82,7 @@ export function cpuVerdict(raw: unknown, cores: number, expected: number, rampin
   // enforced on the host itself (host_load.py check_live_load + heartbeat
   // gate), and a host refusal propagates as a durable per-retry hold with
   // its measured load_limit in placement diagnostics (src/fleet.ts).
-  const hostReason = swap!==null&&swap>swapLimit ? 'memory_pressure'
+  const hostReason = host.active_sessions_limited ? 'resource_snapshot_overflow' : swap!==null&&swap>swapLimit ? 'memory_pressure'
     : active!==null&&active>=sessionLimit ? 'machine_capacity' : null;
   const cpuReason = known && usage.busy_percent_window!==null && usage.busy_percent_window>=CPU_SATURATED_PCT ? 'cpu_pressure'
     : fresh && usage.psi_full_avg10!==null && usage.psi_full_avg10 > config.cpu_psi_full_hard_cap_pct ? 'cpu_pressure'
@@ -93,6 +93,6 @@ export function cpuVerdict(raw: unknown, cores: number, expected: number, rampin
     : fresh && (usage.host_oom_kills_delta ?? 0)>0 ? 'host_oom' : null;
   const reason=hostReason??cpuReason;
   return {...numbers,host_load1:hostLoad,host_load_limit:loadLimit,swap_used_percent:swap,
-    swap_max_used_percent:swapLimit,host_session_count:active,host_max_sessions:sessionLimit,
+    swap_max_used_percent:swapLimit,host_session_count:active,host_max_sessions:sessionLimit,host_count_observation_limited:host.active_sessions_limited??false,
     reason,admitted:reason === null};
 }

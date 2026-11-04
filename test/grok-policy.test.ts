@@ -1,3 +1,4 @@
+import {fixtureSql,freshFixtureBudgetDay} from './helpers/fixture-budget';
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { RoutingService } from '../src/routing';
@@ -64,8 +65,11 @@ describe('Grok policy control', () => {
       expect((await (await restarted.handle(request(), admin)).json() as any).mode).toBe(before.mode);
       // A state-write failure must roll back its audit entry as well.
       hub.sql.exec("CREATE TRIGGER reject_grok_write BEFORE INSERT ON grok_policy BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END");
-      await expect(service.handle(request({ mode: 'normal', reason: 'must roll back' }), admin)).rejects.toThrow('synthetic failure');
-      expect(hub.sql.exec('SELECT * FROM grok_policy_audit').toArray()).toHaveLength(2);
+      await expect(service.handle(request({ mode: 'normal', reason: 'must roll back' }), admin)).rejects.toThrow('do_daily_row_budget_exceeded');
+      expect(fixtureSql(hub).exec('SELECT * FROM grok_policy_audit').toArray()).toHaveLength(2);
+      expect((hub as any).rowBudget.status().stopped).toBe(true);
+      fixtureSql(hub).exec('DROP TRIGGER reject_grok_write');
+      await freshFixtureBudgetDay(hub);
       expect((await (await service.handle(request(), admin)).json() as any).mode).toBe(before.mode);
     });
   });

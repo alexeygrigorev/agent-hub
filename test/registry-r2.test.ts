@@ -1,4 +1,5 @@
-import { describe, it, expect } from 'vitest';
+import { restartFixtureHub, fixtureSql, freshFixtureBudgetDay } from './helpers/fixture-budget';
+import { describe, it, expect, beforeEach } from 'vitest';
 import { env, SELF, runInDurableObject } from 'cloudflare:test';
 import { createSessionCookie } from '../src/auth/session';
 import { sha256 } from '../src/auth/crypto';
@@ -9,6 +10,13 @@ import type { Env } from '../src/env';
 
 const bindings = env as unknown as Env;
 const stub = () => bindings.HUB.get(bindings.HUB.idFromName('hub'));
+beforeEach(async()=>{await (runInDurableObject as any)(stub() as any,async(hub:any)=>freshFixtureBudgetDay(hub));});
+// Reproduce the actual pre-binding schema; modern fresh CREATE statements
+// already contain these columns and would skip the upgrade being tested.
+function legacyCredentialsSql(){return SCHEMA_SQL.slice(SCHEMA_SQL.indexOf('CREATE TABLE IF NOT EXISTS credentials ('),SCHEMA_SQL.indexOf('CREATE TABLE IF NOT EXISTS device_pairings'))
+  .replace(/,\s*(?:--[^\n]*\n\s*)?registry_actor TEXT/,'');}
+function legacyMessagesSql(){return SCHEMA_SQL.slice(SCHEMA_SQL.indexOf('CREATE TABLE IF NOT EXISTS messages ('),SCHEMA_SQL.indexOf('CREATE TABLE IF NOT EXISTS claims ('))
+  .replace(/\n\s*registry_unbound_(?:from|to) INTEGER NOT NULL DEFAULT 0,/g,'');}
 const csrf = 'r2-local-csrf';
 async function admin() { return (await createSessionCookie(bindings, { sub:'r2-owner', email:'admin@fake.local', isAdmin:true, csrfToken:csrf, exp:Math.floor(Date.now()/1000)+3600 })).split(';')[0]; }
 async function req(path:string, method='GET', body?:any, auth?:string) {
@@ -18,7 +26,7 @@ async function req(path:string, method='GET', body?:any, auth?:string) {
   if(body!==undefined)headers['Content-Type']='application/json';
   return SELF.fetch('https://hub.test'+path,{method,headers,body:body===undefined?undefined:JSON.stringify(body)});
 }
-async function rows(q:string,...params:any[]) { let out:any[]=[]; await runInDurableObject(stub() as any,(hub:Hub)=>{out=hub.sql.exec(q,...params).toArray();});return out; }
+async function rows(q:string,...params:any[]) { let out:any[]=[]; await runInDurableObject(stub() as any,(hub:Hub)=>{out=fixtureSql(hub).exec(q,...params).toArray();});return out; }
 const register = (cookie:string, tag:string, project?:string|null) => req('/api/agents','POST',{tag,project},cookie);
 async function cred(actor:string, kind='agent', scopes=['bus:read','bus:send']) {
   const token='hubt_'+crypto.randomUUID().replaceAll('-','');
@@ -141,11 +149,11 @@ describe('R2 independent-review counterexamples through SELF Worker and bound Hu
     const c=await admin();await register(c,'m6worker','m6proj');
     // Genuine old credentials schema, with issuance after the existing registration.
     const t='hubt_'+crypto.randomUUID().replaceAll('-','');const hash=await sha256(t);
-    await runInDurableObject(stub() as any,(hub:Hub,state)=>{
-      hub.sql.exec('DROP TABLE credentials');
-      hub.sql.exec(SCHEMA_SQL.slice(SCHEMA_SQL.indexOf('CREATE TABLE IF NOT EXISTS credentials ('),SCHEMA_SQL.indexOf('CREATE TABLE IF NOT EXISTS device_pairings')));
-      hub.sql.exec(`INSERT INTO credentials(id,kind,token_hash,family_id,subject,actor,scopes,created_by_sub,created_at,expires_at) VALUES (?,'agent',?,?,'m6worker','m6worker','["bus:read","bus:send","fleet:launch"]','local',?,?)`,t,hash,t,new Date(Date.now()+1000).toISOString(),new Date(Date.now()+3600000).toISOString());
-      new Hub(state,bindings);
+    await runInDurableObject(stub() as any,async(hub:Hub,state)=>{
+      fixtureSql(hub).exec('DROP TABLE credentials');
+      fixtureSql(hub).exec(legacyCredentialsSql());
+      fixtureSql(hub).exec(`INSERT INTO credentials(id,kind,token_hash,family_id,subject,actor,scopes,created_by_sub,created_at,expires_at) VALUES (?,'agent',?,?,'m6worker','m6worker','["bus:read","bus:send","fleet:launch"]','local',?,?)`,t,hash,t,new Date(Date.now()+1000).toISOString(),new Date(Date.now()+3600000).toISOString());
+      await restartFixtureHub(hub,bindings);
     });
     expect((await rows('SELECT actor,registry_actor FROM credentials WHERE id=?',t))[0]).toEqual({actor:'m6worker',registry_actor:'m6proj:m6worker'});
     const claim=await req('/api/bus/claims','POST',{project:'m6proj',scope:'src',holder:'m6proj:m6worker',ttl_ms:60000},t);expect(claim.status).toBe(200);const id=(await claim.json() as any).id;
@@ -165,18 +173,18 @@ describe('R2 independent-review counterexamples through SELF Worker and bound Hu
     const actors=['proven-legacy','legacy-ambig','unknown-legacy','pre-registration'];
     const tokens=actors.map(a=>'hubt_legacy_'+a);
     const hashes=await Promise.all(tokens.map(sha256));
-    await runInDurableObject(stub() as any,(hub:Hub,state)=>{
-      hub.sql.exec('DROP TABLE credentials');
-      hub.sql.exec(SCHEMA_SQL.slice(SCHEMA_SQL.indexOf('CREATE TABLE IF NOT EXISTS credentials ('),SCHEMA_SQL.indexOf('CREATE TABLE IF NOT EXISTS device_pairings')));
-      for(let i=0;i<actors.length;i++)hub.sql.exec(`INSERT INTO credentials(id,kind,token_hash,family_id,subject,actor,scopes,created_by_sub,created_at,expires_at) VALUES (?,'agent',?,?,?,?,'["bus:read","bus:send"]','local','2021-01-01',?)`,tokens[i],hashes[i],tokens[i],actors[i],actors[i],new Date(Date.now()+3600000).toISOString());
-      hub.sql.exec('DROP TABLE messages');
-      hub.sql.exec(SCHEMA_SQL.slice(SCHEMA_SQL.indexOf('CREATE TABLE IF NOT EXISTS messages ('),SCHEMA_SQL.indexOf('CREATE TABLE IF NOT EXISTS claims (')));
-      hub.sql.exec(`INSERT INTO messages(id,from_actor,to_actor,kind,thread_id,body,idempotency_key,created_at,expires_at) VALUES ('foreign-old-history','admin','late-history','note','legacy-thread','foreign private','legacy-key',?,?)`,Date.parse('2021-01-01'),Date.now()+3600000);
-      new Hub(state,bindings);
-      expect(hub.sql.exec('SELECT id,registry_actor FROM credentials ORDER BY id').toArray().map((x:any)=>x.registry_actor).sort()).toEqual(['','','','proven-legacy']);
-      const before=hub.sql.exec('SELECT * FROM credentials ORDER BY id').toArray();
-      new Hub(state,bindings);
-      expect(hub.sql.exec('SELECT * FROM credentials ORDER BY id').toArray()).toEqual(before);
+    await runInDurableObject(stub() as any,async(hub:Hub,state)=>{
+      fixtureSql(hub).exec('DROP TABLE credentials');
+      fixtureSql(hub).exec(legacyCredentialsSql());
+      for(let i=0;i<actors.length;i++)fixtureSql(hub).exec(`INSERT INTO credentials(id,kind,token_hash,family_id,subject,actor,scopes,created_by_sub,created_at,expires_at) VALUES (?,'agent',?,?,?,?,'["bus:read","bus:send"]','local','2021-01-01',?)`,tokens[i],hashes[i],tokens[i],actors[i],actors[i],new Date(Date.now()+3600000).toISOString());
+      fixtureSql(hub).exec('DROP TABLE messages');
+      fixtureSql(hub).exec(legacyMessagesSql());
+      fixtureSql(hub).exec(`INSERT INTO messages(id,from_actor,to_actor,kind,thread_id,body,idempotency_key,created_at,expires_at) VALUES ('foreign-old-history','admin','late-history','note','legacy-thread','foreign private','legacy-key',?,?)`,Date.parse('2021-01-01'),Date.now()+3600000);
+      await restartFixtureHub(hub,bindings);
+      expect(fixtureSql(hub).exec('SELECT id,registry_actor FROM credentials ORDER BY id').toArray().map((x:any)=>x.registry_actor).sort()).toEqual(['','','','proven-legacy']);
+      const before=fixtureSql(hub).exec('SELECT * FROM credentials ORDER BY id').toArray();
+      await restartFixtureHub(hub,bindings);
+      expect(fixtureSql(hub).exec('SELECT * FROM credentials ORDER BY id').toArray()).toEqual(before);
     });
     expect((await req('/api/conversations','GET',undefined,tokens[0])).status).toBe(200);
     for(const token of tokens.slice(1))expect((await req('/api/conversations','GET',undefined,token)).status).toBe(403);
@@ -224,6 +232,8 @@ describe('R2 independent-review counterexamples through SELF Worker and bound Hu
     await rows(`INSERT INTO jobs(id,kind,idempotency_key,payload,status,created_at,started_at,deadline_at,actor,holder_host_id,native_session,claim_token_hash)
       VALUES ('job-1','root-run','slot-1','{}','running',?,?,?,'system','m1','sess-1',?)`,new Date().toISOString(),new Date().toISOString(),new Date(Date.now()+600000).toISOString(),hash);
     await rows(`INSERT OR REPLACE INTO leases(name,epoch,holder_job_id,holder_host_id,holder_machine_id,acquired_at,expires_at) VALUES ('root',1,'job-1','m1','m1',?,?)`,new Date().toISOString(),new Date(Date.now()+600000).toISOString());
+    await rows("UPDATE credentials SET machine_id='m1' WHERE id=?",token);
+    await rows("UPDATE jobs SET lease_epoch=1,holder_machine_id='m1' WHERE id='job-1'");
     await rows(`INSERT INTO messages(id,from_actor,to_actor,kind,thread_id,body,idempotency_key,created_at,expires_at) VALUES ('root-parent','solo-worker','root','note','root-parent','local','parent-key',?,?)`,Date.now(),Date.now()+600000);
     expect((await rows("SELECT from_actor,to_actor FROM messages WHERE id='root-parent'"))[0]).toEqual({from_actor:'pA:solo-worker',to_actor:'root'});
     const action=(to:string,epoch=1)=>req('/api/root/actions','POST',{job_id:'job-1',epoch,session_id:'sess-1',action:{type:'bus_dispatch',name:'reply',idempotency_key:crypto.randomUUID(),payload:{to_actor:to,kind:'reply',body:'local reply',reply_to:'root-parent'}}},token);

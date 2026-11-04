@@ -2593,4 +2593,108 @@ class ImportedCursorPrivateBoundaryTests(unittest.TestCase):
                 fleet.resolve_offer_cwd(repo, str(unconfigured), cfg)
 
 
+
+
+class RegistrationReceiptTests(unittest.TestCase):
+    def dispatcher(self, request=None):
+        with patch('agent_hub_host.provisioning.managed_subscriptions', return_value=[]):
+            return fleet.Dispatcher(settings(Path('/fixture')), **({'request': request} if request is not None else {}))
+
+    def test_success_receipt_suppresses_normalized_payload_until_hourly_renewal_or_restart(self):
+        request = MagicMock(return_value={'status': 'registered', 'machine_id': 'host'})
+        dispatcher = self.dispatcher(request)
+        context = ('https://hub.example', 'host', 'fingerprint')
+        info = {'hostname': 'host', 'capabilities': {'a': 1, 'b': 2}}
+        with patch.object(dispatcher, '_registration_context', return_value=context), \
+             patch('agent_hub_host.fleet.time.monotonic', return_value=100):
+            self.assertTrue(dispatcher._register_if_changed(info))
+            # JSON object order is not a payload change; lists stay ordered.
+            for _ in range(100):
+                self.assertFalse(dispatcher._register_if_changed({'capabilities': {'b': 2, 'a': 1}, 'hostname': 'host'}))
+        self.assertEqual(request.call_count, 1)
+        with patch.object(dispatcher, '_registration_context', return_value=context), \
+             patch('agent_hub_host.fleet.time.monotonic', return_value=3700):
+            self.assertTrue(dispatcher._register_if_changed(info))
+            self.assertFalse(dispatcher._register_if_changed(info))
+        self.assertEqual(request.call_count, 2)
+        restarted = self.dispatcher(request)
+        with patch.object(restarted, '_registration_context', return_value=context):
+            self.assertTrue(restarted._register_if_changed(info))
+        self.assertEqual(request.call_count, 3)
+
+    def test_real_payload_identity_and_credential_changes_send_and_failed_submissions_retry(self):
+        request = MagicMock(return_value={'status': 'registered', 'machine_id': 'host'})
+        dispatcher = self.dispatcher(request)
+        base = ('https://hub.example', 'host', 'credential-a')
+        info = {'hostname': 'host', 'roles': ['worker']}
+        with patch.object(dispatcher, '_registration_context', return_value=base):
+            dispatcher._register_if_changed(info)
+            changed = dict(info, roles=['writer'])
+            dispatcher._register_if_changed(changed)
+            request.side_effect = RuntimeError('transport unavailable')
+            for _ in range(2):
+                with self.assertRaises(RuntimeError):
+                    dispatcher._register_if_changed(dict(changed, hostname='changed'))
+            request.side_effect = None
+            dispatcher._register_if_changed(dict(changed, hostname='changed'))
+        self.assertEqual(request.call_count, 5)
+        for context in [('https://other.example', 'host', 'credential-a'),
+                        ('https://other.example', 'other-host', 'credential-a'),
+                        ('https://other.example', 'other-host', 'credential-b')]:
+            request.return_value = {'status': 'registered', 'machine_id': context[1]}
+            with patch.object(dispatcher, '_registration_context', return_value=context):
+                self.assertTrue(dispatcher._register_if_changed(dict(changed, hostname='changed')))
+        self.assertEqual(request.call_count, 8)
+
+    def test_uncertain_response_or_inflight_refresh_never_seeds_a_receipt(self):
+        request = MagicMock(return_value={})
+        dispatcher = self.dispatcher(request)
+        old = ('https://hub.example', 'host', 'old')
+        new = ('https://hub.example', 'host', 'new')
+        with patch.object(dispatcher, '_registration_context', return_value=old):
+            self.assertTrue(dispatcher._register_if_changed({}))
+            self.assertTrue(dispatcher._register_if_changed({}))
+        request.return_value = {'status': 'registered', 'machine_id': 'host'}
+        with patch.object(dispatcher, '_registration_context', side_effect=[old, new]):
+            self.assertTrue(dispatcher._register_if_changed({}))
+        self.assertIsNone(dispatcher._registration_receipt)
+        with patch.object(dispatcher, '_registration_context', return_value=None):
+            self.assertTrue(dispatcher._register_if_changed({}))
+            self.assertTrue(dispatcher._register_if_changed({}))
+        self.assertEqual(request.call_count, 5)
+
+    def test_changed_uncertain_submission_invalidates_previous_success_before_reversion(self):
+        success = {'status': 'registered', 'machine_id': 'host'}
+        for uncertain in [RuntimeError('ack lost after commit'), {}]:
+            with self.subTest(uncertain=type(uncertain).__name__):
+                request = MagicMock(side_effect=[success, uncertain, success])
+                dispatcher = self.dispatcher(request)
+                with patch.object(dispatcher, '_registration_context', return_value=('https://hub.example', 'host', 'same')):
+                    self.assertTrue(dispatcher._register_if_changed({'hostname': 'A'}))
+                    if isinstance(uncertain, Exception):
+                        with self.assertRaises(RuntimeError):
+                            dispatcher._register_if_changed({'hostname': 'B'})
+                    else:
+                        self.assertTrue(dispatcher._register_if_changed({'hostname': 'B'}))
+                    self.assertIsNone(dispatcher._registration_receipt)
+                    self.assertTrue(dispatcher._register_if_changed({'hostname': 'A'}))
+                self.assertEqual(request.call_count, 3)
+
+    def test_context_fingerprints_effective_transport_without_retaining_token(self):
+        dispatcher = self.dispatcher()
+        cfg = {'base_url': 'https://stored.example/', 'machine_id': 'host', 'access_token': 'private-token'}
+        with patch('agent_hub_host.config.load_config', return_value=cfg), \
+             patch.dict(os.environ, {'HUB_URL': '', 'HUB_BASE_URL': '', 'HUB_JOB_TOKEN': '', 'HUB_TOKEN': ''}):
+            self.assertIsNone(self.dispatcher(MagicMock())._registration_context())
+            context = dispatcher._registration_context()
+            self.assertEqual(context[:2], ('https://stored.example', 'host'))
+            self.assertEqual(len(context[2]), 64)
+            self.assertNotIn('private-token', repr(context))
+            with patch.dict(os.environ, {'HUB_URL': 'https://override.example', 'HUB_TOKEN': 'new-private-token'}):
+                changed = dispatcher._registration_context()
+                self.assertEqual(changed[:2], ('https://override.example', 'host'))
+                self.assertNotEqual(changed[2], context[2])
+                self.assertNotIn('new-private-token', repr(changed))
+
+
 if __name__ == '__main__': unittest.main()

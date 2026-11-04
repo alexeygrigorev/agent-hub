@@ -1,3 +1,4 @@
+import { jobCredentialAllowed } from './auth/job-credential';
 import { AUTOMATION_SCHEMA, AUTOMATION_REVOKE_TRIGGER, AUTOMATION_SENDER, type BacklogQuery, type FollowUpIntent } from './conversation-automation';
 import { ConversationLinksService } from './conversation-links';
 import { credentialActor, validRegistryName, registryAddress } from './agent_registry';
@@ -697,6 +698,8 @@ export async function authenticateConversationRequest(
     };
   }
 
+  if (!jobCredentialAllowed(sql, cred, nowMs)) return { error: jsonResponse({ error: 'unauthorized' }, 401) };
+
   let scopes: string[] = [];
   try {
     scopes =
@@ -724,7 +727,7 @@ export async function authenticateConversationRequest(
     }
 
     const lastUsedMs = cred.last_used_at ? Date.parse(cred.last_used_at) : 0;
-    if (!lastUsedMs || isNaN(lastUsedMs) || nowMs - lastUsedMs >= 300_000) {
+    if (!lastUsedMs || isNaN(lastUsedMs) || nowMs - lastUsedMs >= 3_600_000) {
       const nowIso = new Date(nowMs).toISOString();
       try {
         sql.exec('UPDATE credentials SET last_used_at = ? WHERE id = ?', nowIso, cred.id);
@@ -748,7 +751,7 @@ export async function authenticateConversationRequest(
   }
 
   const lastUsedMs = cred.last_used_at ? Date.parse(cred.last_used_at) : 0;
-  if (!lastUsedMs || isNaN(lastUsedMs) || nowMs - lastUsedMs >= 300_000) {
+  if (!lastUsedMs || isNaN(lastUsedMs) || nowMs - lastUsedMs >= 3_600_000) {
     const nowIso = new Date(nowMs).toISOString();
     try {
       sql.exec('UPDATE credentials SET last_used_at = ? WHERE id = ?', nowIso, cred.id);
@@ -945,6 +948,13 @@ export class ConversationsService {
       }
 
       if (!usageRow || currentVersion < CONVERSATIONS_SCHEMA_VERSION) {
+        // Legacy aggregate repair is safe only after every raw source has
+        // been proven small. Never mutate a retained large table first.
+        for(const table of ['conversations','conversation_messages','conversation_members']) {
+          const prefix=this.sql.exec(`SELECT 1 FROM ${table} LIMIT 129`).toArray();
+          if(prefix.length>128)throw new ConversationDomainError('migration_observation_limited',503,
+            'conversation_migration_observation_limited',{observation_pending:true,table});
+        }
         // Clean up any orphaned child rows without a parent conversation header
         this.sql.exec(
           'DELETE FROM conversation_messages WHERE NOT EXISTS (SELECT 1 FROM conversations c WHERE c.id = conversation_messages.conversation_id)',
@@ -1935,6 +1945,11 @@ export class ConversationsService {
     return archivedMs <= nowMs - this.limits.archivedConversationRetentionMs;
   }
 
+  private automationAtCapacity(table:'conversation_automation_grants'|'conversation_automation_receipts',limit:number):boolean {
+    // Only the threshold matters; retained overflow must not enlarge the read.
+    return this.sql.exec(`SELECT 1 FROM ${table} LIMIT ?`,limit).toArray().length>=limit;
+  }
+
   private getRetainedVisibility(
     conversationId: string,
     lastSeq: number,
@@ -1946,41 +1961,20 @@ export class ConversationsService {
     retainedCount: number;
     unreadCount: number;
   } {
-    const boundsRow = this.sql
-      .exec(
-        `SELECT COUNT(*) AS retained_count,
-                MIN(seq) AS min_seq,
-                MAX(seq) AS max_seq,
-                SUM(CASE WHEN seq > ? THEN 1 ELSE 0 END) AS unread_count
-         FROM conversation_messages
-         WHERE conversation_id = ?`,
-        readSeq,
-        conversationId,
-      )
-      .toArray()[0] as any;
-    const retainedCount = Number(boundsRow?.retained_count ?? 0);
-    const oldestRetainedSeq =
-      retainedCount > 0 &&
-      boundsRow?.min_seq !== null &&
-      boundsRow?.min_seq !== undefined
-        ? Number(boundsRow.min_seq)
-        : null;
-    const newestRetainedSeq =
-      retainedCount > 0 &&
-      boundsRow?.max_seq !== null &&
-      boundsRow?.max_seq !== undefined
-        ? Number(boundsRow.max_seq)
-        : null;
-    const prunedThroughSeq =
-      oldestRetainedSeq !== null
-        ? Math.max(0, oldestRetainedSeq - 1)
-        : lastSeq;
+    // Count only a complete bounded raw prefix. An aggregate with a WHERE
+    // conversation_id seek still walks every retained message on every poll.
+    // The deployed sequence index is covering for this observation.
+    const retained = this.sql.exec(`SELECT seq FROM conversation_messages INDEXED BY idx_conversation_messages_conv_seq
+      WHERE conversation_id=? ORDER BY seq LIMIT 129`,conversationId).toArray() as {seq:number}[];
+    if(retained.length>128)throw new ConversationDomainError('conversation_visibility_observation_limited',503,
+      'retained message visibility exceeds the bounded observation', {observation_pending:true});
+    const oldestRetainedSeq=retained.length?Number(retained[0].seq):null;
+    const newestRetainedSeq=retained.length?Number(retained.at(-1)!.seq):null;
     return {
-      oldestRetainedSeq,
-      newestRetainedSeq,
-      prunedThroughSeq,
-      retainedCount,
-      unreadCount: Number(boundsRow?.unread_count ?? 0),
+      oldestRetainedSeq,newestRetainedSeq,
+      prunedThroughSeq:oldestRetainedSeq!==null?Math.max(0,oldestRetainedSeq-1):lastSeq,
+      retainedCount:retained.length,
+      unreadCount:retained.filter(row=>Number(row.seq)>readSeq).length,
     };
   }
 
@@ -3004,7 +2998,7 @@ export class ConversationsService {
         if (!credentialId) throw new ConversationDomainError('automation_target_unavailable', 403);
       } else throw new ConversationDomainError('automation_target_unavailable', 403);
       const prior = this.sql.exec('SELECT id FROM conversation_automation_grants WHERE conversation_id = ? AND check_name = ?', cid, input.check).toArray()[0];
-      if (!prior && Number(this.sql.exec('SELECT COUNT(*) AS n FROM conversation_automation_grants').toArray()[0].n) >= 1000) throw new ConversationDomainError('automation_capacity', 409);
+      if (!prior && this.automationAtCapacity('conversation_automation_grants',1000)) throw new ConversationDomainError('automation_capacity', 409);
       const id = generateUlid(this.now());
       this.sql.exec(`INSERT INTO conversation_automation_grants (id, conversation_id, check_name, target_actor, target_credential_id, owner_sub, expires_at, body_template, action_on)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(conversation_id, check_name) DO UPDATE SET
@@ -3094,7 +3088,7 @@ export class ConversationsService {
         intent.checkName, intent.idempotencyKey, request).toArray().length) {
         throw new ConversationDomainError('automation_slot_retired', 409);
       }
-      if (Number(this.sql.exec('SELECT COUNT(*) AS n FROM conversation_automation_receipts').toArray()[0].n) >= 4096) throw new ConversationDomainError('automation_capacity', 409);
+      if (this.automationAtCapacity('conversation_automation_receipts',4096)) throw new ConversationDomainError('automation_capacity', 409);
       const message = this.writeMessage({ conversationId: intent.conversationId, body: intent.body, idempotencyKey: intent.idempotencyKey, kind: 'note' }, () => {
         const grant = this.sql.exec('SELECT * FROM conversation_automation_grants WHERE id = ?', intent.grantId).toArray()[0] as any;
         if (!grant || grant.conversation_id !== intent.conversationId || grant.check_name !== intent.checkName || grant.target_actor !== intent.actor || grant.body_template !== intent.bodyTemplate || grant.action_on !== intent.on) throw new ConversationDomainError('automation_grant_mismatch', 403);
@@ -3653,6 +3647,13 @@ export class ConversationsService {
 
       const currentReadSeq = Number(member.last_read_seq ?? 0);
       const newReadSeq = Math.max(currentReadSeq, targetSeq);
+      // Verify complete visibility before advancing any read watermark, even
+      // for component callers that do not supply a transaction adapter.
+      const { unreadCount } = this.getRetainedVisibility(
+        conversationId,
+        lastSeq,
+        newReadSeq,
+      );
       let lastReadAt: string | null = member.last_read_at ?? null;
 
       if (newReadSeq > currentReadSeq || !lastReadAt) {
@@ -3666,11 +3667,7 @@ export class ConversationsService {
         );
       }
 
-      const { unreadCount } = this.getRetainedVisibility(
-        conversationId,
-        lastSeq,
-        newReadSeq,
-      );
+
 
       return {
         conversation_id: conversationId,

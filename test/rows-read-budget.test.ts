@@ -1,3 +1,4 @@
+import { freshFixtureBudgetDay, fixtureSql } from './helpers/fixture-budget';
 /**
  * DO rows-read budgets (intake 8081a05a). Cloudflare bills Durable Object
  * SQL by rows read; the minute alarm and the cron ticks used to scan whole
@@ -56,7 +57,7 @@ async function measure(hub: Hub, fn: () => Promise<unknown>): Promise<Record<str
 }
 
 const withHub = (fn: (hub: Hub) => Promise<void>) => runInDurableObject(
-  (env as any).HUB.get((env as any).HUB.idFromName('rows-budget-' + crypto.randomUUID())), async (hub: Hub) => { seed(hub.sql); await fn(hub); });
+  (env as any).HUB.get((env as any).HUB.idFromName('rows-budget-' + crypto.randomUUID())), async (hub: Hub, state: DurableObjectState) => { await freshFixtureBudgetDay(hub); seed(fixtureSql(hub,state)); await fn(hub); });
 
 describe('schema probe rewrite', () => {
   it('maps the probe shapes in use and leaves anything else alone', () => {
@@ -149,21 +150,22 @@ describe('per-step rows-read budgets', () => {
     expect(total).toBeLessThan(SESSIONS * 80);
   }));
 
-  it('the Hub session audit uses the write-through native catalog, not a full table scan', () => withHub(async hub => {
+  it('a manual audit refuses an incomplete active cohort before reading native history or publishing decisions', () => withHub(async hub => {
     hub.observedCatalog.reset();
-    await hub.meter.run('tick:session_audit', () => hub.sessionAudit.tick('manual'));
-    const nativeReads = hub.meter.statementTop(1500).filter(row => row.scope === 'tick:session_audit' && /\bfleet_sessions\b/i.test(row.sql));
-    expect(nativeReads.length).toBeGreaterThan(0);
-    expect(nativeReads.every(row => /FROM fleet_sessions WHERE machine_id = \?/i.test(row.sql))).toBe(true);
-  }));
-});
+    const result=await hub.meter.run('tick:session_audit', () => hub.sessionAudit.tick('manual'));
+    expect(result).toMatchObject({state:'observation_pending',observation_pending:true});
+    const statements=hub.meter.statementTop(1500).filter(row=>row.scope==='tick:session_audit');
+    expect(statements.some(row=>/\bfleet_sessions\b/i.test(row.sql))).toBe(false);
+    expect(statements.some(row=>/INSERT INTO session_audit_(?:decisions|runs)/i.test(row.sql))).toBe(false);
+  }));});
 
 describe('rows-read budget alert', () => {
-  it('the alarm checks the hourly budget even when a request flushed just before', () => withHub(async hub => {
+  it('explicit monitoring checks the hourly budget even when a request flushed just before', () => withHub(async hub => {
     const hour = Math.floor(Date.now() / 3_600_000) - 1;
     hub.sql.exec("INSERT INTO rows_read_stats(slot,scope,hour,calls,rows_read,rows_written,max_read) VALUES(?,?,?,1,?,0,0)", hour % 192, '__total__', hour, 1_000_000);
+    (hub as any).rowsAlertCheckedHour = -1;
     await hub.fetch(new Request('https://hub/api/metrics/rows-read')); // 401, but flushes the meter
-    await hub.alarm();
+    await (hub as any).flushRowsMeter();
     const open: any = hub.sql.exec("SELECT state, detail FROM liveness_alerts WHERE subject_kind='do_rows_read_budget' AND resolved_at IS NULL").toArray()[0];
     expect(open?.state).toBe('over_budget');
     expect(open.detail).toContain('24000000/day');
@@ -174,8 +176,9 @@ describe('rows-written budget alert', () => {
   it('opens the written-budget alert when the last full hour projects over budget', () => withHub(async hub => {
     const hour = Math.floor(Date.now() / 3_600_000) - 1;
     hub.sql.exec("INSERT INTO rows_read_stats(slot,scope,hour,calls,rows_read,rows_written,max_read) VALUES(?,?,?,1,100,?,0)", hour % 192, '__total__', hour, 100_000);
+    (hub as any).rowsAlertCheckedHour = -1;
     await hub.fetch(new Request('https://hub/api/metrics/rows-read')); // 401, but flushes the meter
-    await hub.alarm();
+    await (hub as any).flushRowsMeter();
     const open: any = hub.sql.exec("SELECT state, detail FROM liveness_alerts WHERE subject_kind='do_rows_written_budget' AND resolved_at IS NULL").toArray()[0];
     expect(open?.state).toBe('over_budget');
     expect(open.detail).toContain('2400000/day');
@@ -185,7 +188,7 @@ describe('rows-written budget alert', () => {
     hub.livenessService.setAlert('do_rows_written_budget', 'hub', { state: 'over_budget', detail: 'test' });
     const hour = Math.floor(Date.now() / 3_600_000) - 1;
     hub.sql.exec("INSERT INTO rows_read_stats(slot,scope,hour,calls,rows_read,rows_written,max_read) VALUES(?,?,?,1,100,?,0)", hour % 192, '__total__', hour, 10);
-    await hub.alarm();
+    await (hub as any).flushRowsMeter();
     expect(hub.sql.exec("SELECT id FROM liveness_alerts WHERE subject_kind='do_rows_written_budget' AND resolved_at IS NULL").toArray()).toHaveLength(0);
   }));
 

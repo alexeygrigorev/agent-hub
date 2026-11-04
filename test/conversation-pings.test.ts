@@ -1,3 +1,4 @@
+import {freshFixtureBudgetDay,fixtureSql} from './helpers/fixture-budget';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { SELF, env, runInDurableObject } from 'cloudflare:test';
 import { Hub } from '../src/conversation-hub';
@@ -10,7 +11,7 @@ const actor = 'pings:recipient', csrf = 'local-pings-csrf', template = 'Follow-u
 const stub = () => (env as any).HUB.get((env as any).HUB.idFromName('hub'));
 const inside = <T>(fn: (hub: Hub, state: DurableObjectState) => T | Promise<T>) => runInDurableObject(stub(), fn);
 async function sql(q: string, ...args: (string | number | null)[]): Promise<any[]> {
-  let rows: any[] = []; await inside(h => { rows = h.sql.exec(q, ...args).toArray(); }); return rows;
+  let rows: any[] = []; await inside(h => { rows = fixtureSql(h).exec(q, ...args).toArray(); }); return rows;
 }
 async function cookie(sub = 'pings-owner') {
   return (await createSessionCookie(env as any, { sub, email: 'admin@fake.local', isAdmin: true, csrfToken: csrf, exp: Math.floor(Date.now() / 1000) + 3600 })).split(';')[0];
@@ -65,7 +66,7 @@ async function setup(target = actor) {
   await config(owner, [definition]); return { owner, token, cid, g, definition };
 }
 beforeEach(async () => {
-  await inside(h => { Reflect.deleteProperty(h, 'extraCheckDeps'); });
+  await inside(async h => {await freshFixtureBudgetDay(h); Reflect.deleteProperty(h, 'extraCheckDeps'); });
   for (const table of ['conversation_automation_receipts', 'conversation_automation_grants', 'conversation_messages', 'conversation_members', 'conversations', 'hub_check_slots', 'hub_check_runs', 'hub_checks', 'device_pairings', 'credentials', 'agents', 'machines', 'users']) await sql('DELETE FROM ' + table);
   await sql('UPDATE conversation_storage_usage SET conversation_count=0,message_count=0,message_bytes=0,removed_member_count=0');
 });
@@ -253,7 +254,7 @@ describe('M5 durable intent, scheduler reservations and uncertain dispatch', () 
     await run(owner); const receipt = (await sql('SELECT * FROM conversation_automation_receipts'))[0];
     await sql('DELETE FROM conversation_messages WHERE id=?', receipt.message_id);
     await ok(await req(`/api/conversations/${cid}/automation`, 'DELETE', { check: 'followup' }, owner));
-    await inside(h => { Reflect.deleteProperty(h, 'extraCheckDeps'); });
+    await inside(async h => {await freshFixtureBudgetDay(h); Reflect.deleteProperty(h, 'extraCheckDeps'); });
     expect((await run(owner)).action).toContain(receipt.message_id);
     expect((await sql('SELECT * FROM conversation_messages WHERE conversation_id=?', cid))).toHaveLength(1);
   });
@@ -270,10 +271,13 @@ describe('M5 durable intent, scheduler reservations and uncertain dispatch', () 
         message: async () => { started(); await gate; return 'local'; },
         conversation: { evaluateBacklog: q => { evaluations++; return h.conversationsService.evaluateScheduledBacklog(q); }, sendFollowUp: intent => { sends++; return h.conversationsService.postScheduledFollowUp(intent); } },
       };
-      const first = h.checksService.runDue(deps); await entered;
-      const second = await h.checksService.runDue(deps); expect(second.map(r => r.name)).toEqual(['followup']);
-      h.checksService.replace([validate(definition)]);
-      release(); await first;
+      const clock=Date.now()+1000,checks=new ChecksService(h.sql,()=>clock);
+      fixtureSql(h).exec('UPDATE hub_checks SET next_due_at=?',new Date(clock-1).toISOString());
+      const first=checks.runDue(deps);await entered;
+      try {
+        const second=await checks.runDue(deps);expect(second.map(r=>r.name)).toEqual(['followup']);
+        checks.replace([validate(definition)]);
+      } finally {release();await first;}
       expect(evaluations).toBe(1); expect(sends).toBe(1);
       expect(h.sql.exec("SELECT * FROM hub_check_runs WHERE name='followup'").toArray()).toHaveLength(1);
     });

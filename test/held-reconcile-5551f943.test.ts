@@ -1,3 +1,5 @@
+import {registerFixtureStatements,fixtureStatements} from './helpers/fixture-statements';
+import {fixtureSql} from './helpers/fixture-budget';
 import { describe, expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { seedFixtureIntake, withFixtureIntake } from './tbm-fixture';
@@ -44,6 +46,7 @@ async function fixture(fn: (s: SessionControlService, sql: any, clock: { t: numb
   const bindings = env as unknown as Env;
   const stub = bindings.HUB.get(bindings.HUB.idFromName('held-reconcile-' + crypto.randomUUID()));
   await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
+    registerFixtureStatements(hub,state);
     const clock = { t: Date.UTC(2026, 9, 30, 17, 0, 0) };
     const m = metered(hub.sql);
     const service = new SessionControlService(m.proxy, (cb) => state.storage.transactionSync(cb), () => clock.t, { reserve }, { worktreeGuard: { setAlert: () => true } as any });
@@ -51,9 +54,10 @@ async function fixture(fn: (s: SessionControlService, sql: any, clock: { t: numb
     seedFixtureIntake(hub.sql);
     const at = new Date().toISOString();
     const far = new Date(Date.now() + 30 * 86400000).toISOString();
-    hub.sql.exec(`INSERT OR IGNORE INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at)
+    fixtureSql(hub).exec(`INSERT OR IGNORE INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at)
       VALUES ('host-cred-1', 'host', 'hash-host-cred-1', 'refresh-host-cred-1', 'host-family-1', 'test-host', 'hetzner', NULL, '["host"]', 'test', ?, ?)`, at, far);
-    hub.sql.exec(`INSERT OR IGNORE INTO machines (id, name, hostname, credential_id, registered_at) VALUES ('hetzner', 'hetzner', 'hetzner', 'host-cred-1', ?)`, at);
+    fixtureSql(hub).exec(`INSERT OR IGNORE INTO machines (id, name, hostname, credential_id, registered_at) VALUES ('hetzner', 'hetzner', 'hetzner', 'host-cred-1', ?)`, at);
+    await (hub as any).rowBudget.begin(true);
     await fn(service, hub.sql, clock, m.measure);
   });
 }
@@ -66,13 +70,13 @@ async function createHeld(s: SessionControlService, sql: any, workspace: string,
       key: `${workspace}-${minute}-${i}`, name: `${workspace}-${minute}-${i}`, workspace, mode: 'interactive',
     }), admin)).json();
     expect(created).toMatchObject({ state: 'held' });
-    sql.exec('UPDATE session_control_sessions SET created_at = ? WHERE id = ?', new Date(Date.UTC(2026, 9, 30, 11, minute, i)).toISOString(), created.id);
+    fixtureStatements(sql).exec('UPDATE session_control_sessions SET created_at = ? WHERE id = ?', new Date(Date.UTC(2026, 9, 30, 11, minute, i)).toISOString(), created.id);
     ids.push(created.id);
   }
   return ids;
 }
 
-const stateOf = (sql: any, id: string) => (sql.exec('SELECT state FROM session_control_sessions WHERE id = ?', id).toArray()[0] as any).state;
+const stateOf = (sql: any, id: string) => (fixtureStatements(sql).exec('SELECT state FROM session_control_sessions WHERE id = ?', id).toArray()[0] as any).state;
 const nextPass = (clock: { t: number }) => { clock.t += HELD_RECONCILE_INTERVAL_MS; };
 
 function placingReserve(open: () => boolean, onCall?: (input: any) => void) {
@@ -93,7 +97,7 @@ describe('held session reconcile (intake 5551f943)', () => {
     await fixture(async (s, sql, clock) => {
       await createHeld(s, sql, 'demo', 25, 0);
       const [target] = await createHeld(s, sql, 'pressured', 1, 1);
-      sql.exec('DELETE FROM session_control_held_cursor');
+      fixtureStatements(sql).exec('DELETE FROM session_control_held_cursor');
       open = true;
       nextPass(clock);
       expect(s.reconcileHeldSessions().promoted).toBe(0); // 5 permanent holds re-evaluated
@@ -106,7 +110,7 @@ describe('held session reconcile (intake 5551f943)', () => {
       for (let i = 0; i < 8 && !promoted; i++) { nextPass(clock); promoted = s.reconcileHeldSessions().promoted; }
       expect(promoted).toBe(1);
       expect(stateOf(sql, target)).toBe('offered');
-      expect((sql.exec("SELECT COUNT(*) AS n FROM session_control_sessions WHERE state = 'held'").toArray()[0] as any).n).toBe(25);
+      expect((fixtureStatements(sql).exec("SELECT COUNT(*) AS n FROM session_control_sessions WHERE state = 'held'").toArray()[0] as any).n).toBe(25);
     }, placingReserve(() => open));
   });
 
@@ -114,7 +118,7 @@ describe('held session reconcile (intake 5551f943)', () => {
     let open = false;
     await fixture(async (s, sql, clock) => {
       const ids = await createHeld(s, sql, 'pressured', 3, 0);
-      sql.exec('DELETE FROM session_control_held_cursor');
+      fixtureStatements(sql).exec('DELETE FROM session_control_held_cursor');
       nextPass(clock);
       expect(s.reconcileHeldSessions().promoted).toBe(0);
       open = true;
@@ -130,7 +134,7 @@ describe('held session reconcile (intake 5551f943)', () => {
     let boom: string | null = null;
     await fixture(async (s, sql, clock) => {
       const ids = await createHeld(s, sql, 'pressured', 12, 0);
-      sql.exec('DELETE FROM session_control_held_cursor');
+      fixtureStatements(sql).exec('DELETE FROM session_control_held_cursor');
       calls.length = 0;
       nextPass(clock);
       s.reconcileHeldSessions();
@@ -175,7 +179,7 @@ describe('held session reconcile (intake 5551f943)', () => {
 
   it('uses the partial index range scan without a temp B-tree', async () => {
     await fixture(async (_s, sql) => {
-      const plan = (q: string, ...a: any[]) => (sql.exec('EXPLAIN QUERY PLAN ' + q, ...a).toArray() as any[]).map(r => r.detail).join('\n');
+      const plan = (q: string, ...a: any[]) => (fixtureStatements(sql).exec('EXPLAIN QUERY PLAN ' + q, ...a).toArray() as any[]).map(r => r.detail).join('\n');
       const base = HELD_UNPLACED_SQL;
       for (const p of [plan(`${base} ORDER BY created_at, id LIMIT 20`),
         plan(`${base} AND (created_at, id) > (?, ?) ORDER BY created_at, id LIMIT 20`, 'x', 'y'),
@@ -189,11 +193,11 @@ describe('held session reconcile (intake 5551f943)', () => {
   it('stays within a rows read/written budget at production scale', async () => {
     await fixture(async (s, sql, clock, measure) => {
       // 5k sessions (mostly terminal), 50k historical launches, 25 permanent + 3 pressure holds.
-      sql.exec(`WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 50000)
+      fixtureStatements(sql).exec(`WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 50000)
         INSERT INTO fleet_launches (id, actor, requester_kind, summary, request_key, request_json, machine_id, engine, account, mode, workspace, prompt, state, created_at, updated_at)
         SELECT 'hist-' || i, 'demo:assistant', 'agent', 's', 'k-' || i, '{"workspace":"demo","pad":"' || hex(randomblob(200)) || '"}', 'hetzner', 'claude', 'default', 'headless', 'demo', 'p',
           'exited', '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z' FROM c`);
-      sql.exec(`WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 5000)
+      fixtureStatements(sql).exec(`WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 5000)
         INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, engine, mode, state, created_at, updated_at)
         SELECT 'old-' || i, 'demo:assistant', 'rk-' || i, '{"workspace":"demo"}', CASE WHEN i % 3 = 0 THEN NULL ELSE 'hist-' || i END,
           CASE WHEN i % 3 = 0 THEN NULL ELSE 'hetzner' END, 'claude', 'headless', CASE WHEN i % 2 = 0 THEN 'cancelled' ELSE 'failed' END,

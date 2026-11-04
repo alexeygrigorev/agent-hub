@@ -1,3 +1,4 @@
+import { workerChildObservation } from './worker-child-observation';
 import { WORKER_STATUSES, cleanReportedExit } from './worker-outcome';
 import { insertSessionObservation, observedHubTagMatches, observationModel, observedIntakeCandidates, observationIntakeRevision } from './session-observation';
 import { bindingMoveAllowed } from './session-binding-move';
@@ -86,36 +87,36 @@ CREATE INDEX IF NOT EXISTS session_control_wakes_due ON session_control_wakes(st
 CREATE INDEX IF NOT EXISTS session_control_wakes_due_order ON session_control_wakes(state, wake_at_ms, created_at, id);
 CREATE INDEX IF NOT EXISTS session_control_wakes_delivery_order ON session_control_wakes(state, delivered_at, id);
 CREATE INDEX IF NOT EXISTS session_control_wakes_resolution_order ON session_control_wakes(state, updated_at);
-CREATE INDEX IF NOT EXISTS session_control_wakes_resolution_order_v2 ON session_control_wakes(state, updated_at, id);
 CREATE INDEX IF NOT EXISTS session_control_wakes_session ON session_control_wakes(session_id, state);
-CREATE INDEX IF NOT EXISTS session_control_wakes_session_due_order ON session_control_wakes(session_id, state, wake_at_ms, created_at, id);
+CREATE INDEX IF NOT EXISTS intake_queue_wakes_session ON session_control_wakes(session_id,state,wake_at_ms);
 CREATE TABLE IF NOT EXISTS session_control_wake_alerts (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, wake_id TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL, intake_task_id TEXT, created_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS session_control_wake_alerts_session ON session_control_wake_alerts(session_id, created_at);
 `;
 
 export const SESSION_CONTROL_SCHEMA = ADOPTION_SCHEMA + `
-CREATE TABLE IF NOT EXISTS session_control_sessions (id TEXT PRIMARY KEY, actor TEXT NOT NULL, request_key TEXT NOT NULL, request_json TEXT NOT NULL, fleet_launch_id TEXT, machine_id TEXT, engine TEXT, mode TEXT NOT NULL, state TEXT NOT NULL, binding_json TEXT, parent_id TEXT, parent_source TEXT, session_type TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(actor, request_key));
-CREATE TABLE IF NOT EXISTS session_control_commands (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, kind TEXT NOT NULL, actor TEXT NOT NULL, request_key TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL, generation INTEGER NOT NULL, correlation TEXT NOT NULL, poll_at TEXT, ack_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(session_id, actor, request_key));
+CREATE TABLE IF NOT EXISTS session_control_sessions (id TEXT PRIMARY KEY, actor TEXT NOT NULL, request_key TEXT NOT NULL, request_json TEXT NOT NULL, fleet_launch_id TEXT, machine_id TEXT, engine TEXT, mode TEXT NOT NULL, state TEXT NOT NULL, binding_json TEXT, parent_id TEXT, parent_source TEXT, session_type TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, owner_token_id TEXT, owner_family TEXT, host_family TEXT, hold_json TEXT, UNIQUE(actor, request_key));
+CREATE TABLE IF NOT EXISTS session_control_commands (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, kind TEXT NOT NULL, actor TEXT NOT NULL, request_key TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL, generation INTEGER NOT NULL, correlation TEXT NOT NULL, poll_at TEXT, ack_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, owner_token_id TEXT, owner_family TEXT, holder_machine TEXT, claim_token TEXT, claim_expires_at TEXT, holder_attempt TEXT, attempts INTEGER DEFAULT 0, host_status TEXT, host_reason TEXT, not_before TEXT, recipient_seq INTEGER, UNIQUE(session_id, actor, request_key));
 CREATE TABLE IF NOT EXISTS session_control_cancellations (session_id TEXT PRIMARY KEY, actor TEXT NOT NULL, request_key TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_control_protections (session_id TEXT PRIMARY KEY, actor TEXT NOT NULL, request_key TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS session_intake_link_repair_cursor (key TEXT PRIMARY KEY, created_at TEXT NOT NULL, session_id TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS session_control_created ON session_control_sessions(created_at,id);
 CREATE TABLE IF NOT EXISTS session_control_held_cursor (id INTEGER PRIMARY KEY CHECK(id=1), created_at TEXT NOT NULL, session_id TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS intake_queue_session_task ON session_control_sessions(json_extract(CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END,'$.intake_task_id'));
 CREATE INDEX IF NOT EXISTS session_control_machine_created ON session_control_sessions(machine_id, created_at, id);
 CREATE INDEX IF NOT EXISTS session_control_machine_created_state ON session_control_sessions(machine_id, created_at, id, state);
 CREATE INDEX IF NOT EXISTS session_control_machine_state ON session_control_sessions(machine_id, state, created_at);
-CREATE INDEX IF NOT EXISTS session_control_native_binding ON session_control_sessions(machine_id,
+CREATE INDEX IF NOT EXISTS intake_queue_session_native ON session_control_sessions(machine_id,
   json_extract(CASE WHEN json_valid(binding_json) THEN binding_json ELSE '{}' END,'$.native_id'));
+CREATE INDEX IF NOT EXISTS session_control_state ON session_control_sessions(state);
 CREATE INDEX IF NOT EXISTS session_control_live_created ON session_control_sessions(created_at DESC, id DESC) WHERE state IN ('queued','held','offered','starting','running','uncertain');
 CREATE INDEX IF NOT EXISTS session_control_live_actor_created ON session_control_sessions(actor, created_at DESC, id DESC) WHERE state IN ('queued','held','offered','starting','running','uncertain');
 CREATE INDEX IF NOT EXISTS session_control_held_unplaced ON session_control_sessions(created_at, id) WHERE state = 'held' AND fleet_launch_id IS NULL AND binding_json IS NULL;
-CREATE INDEX IF NOT EXISTS session_control_unbound_live_launch ON session_control_sessions(fleet_launch_id) WHERE binding_json IS NULL AND fleet_launch_id IS NOT NULL AND state IN ('queued','held','offered','starting','running','uncertain');
 CREATE TABLE IF NOT EXISTS session_warning_events (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, kind TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL, until_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS session_warning_events_session ON session_warning_events(session_id, created_at);
 CREATE TABLE IF NOT EXISTS session_worktree_episode_notes (subject TEXT NOT NULL, generation INTEGER NOT NULL, intake_id TEXT NOT NULL, PRIMARY KEY(subject, generation, intake_id));
 CREATE TABLE IF NOT EXISTS session_worktree_episodes (subject TEXT PRIMARY KEY, active INTEGER NOT NULL, generation INTEGER NOT NULL, completed INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS session_control_proofs (reply_envelope_id TEXT PRIMARY KEY, command_id TEXT NOT NULL, session_id TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS fleet_catalog_seen (machine_id TEXT PRIMARY KEY, observed_at TEXT NOT NULL);
-CREATE INDEX IF NOT EXISTS fleet_catalog_seen_fresh ON fleet_catalog_seen(observed_at, machine_id);
 CREATE TABLE IF NOT EXISTS session_stale_reconciliations (session_id TEXT PRIMARY KEY, previous_state TEXT NOT NULL, reason TEXT NOT NULL, at TEXT NOT NULL);
 `;
 
@@ -174,17 +175,26 @@ const ACTIVE_HEARTBEAT_MS = 10 * 60 * 1000;
 /** Single server-side definition of "active", shared by web and CLI (hub-1101-outage-20261031):
  * pending (queued/held/offered) rows, or starting/running/uncertain rows whose host reported a
  * fresh heartbeat. Used by the list filter, the tree and `active_count`. */
-function activeSessionsSql(nowMs: number): { sql: string; params: any[] } {
+export class FreshCatalogObservationLimit extends Error {
+  readonly status=503;
+  constructor(readonly code='fresh_catalog_observation_limited'){super(code);}
+}
+function activeSessionsSql(sql:SqlStorage,nowMs: number): { sql: string; params: any[] } {
+  if(!Number.isFinite(nowMs))throw new FreshCatalogObservationLimit();
   const cutoff = new Date(nowMs - ACTIVE_HEARTBEAT_MS).toISOString();
+  // Stable facts may be memoized, but freshness is evaluated for this call's
+  // clock. Complete raw host IDs precede time filters and delimiter packing.
+  const rows=sql.exec('SELECT machine_id,observed_at FROM fleet_catalog_seen ORDER BY machine_id LIMIT 65').toArray();
+  if(rows.length>64||rows.some(row=>!isValidMachineId(row.machine_id)||typeof row.observed_at!=='string'||!Number.isFinite(Date.parse(row.observed_at))))throw new FreshCatalogObservationLimit();
+  const hosts=rows.filter(row=>Date.parse(String(row.observed_at))>=nowMs-ACTIVE_HEARTBEAT_MS).map(row=>String(row.machine_id));
+  const packed=hosts.length?'|'+hosts.join('|')+'|':'';
   return {
     sql: `(state = 'queued' OR state = 'held' OR state = 'offered' OR ((state = 'starting' OR state = 'running' OR state = 'uncertain') AND EXISTS (
       SELECT 1 FROM fleet_sessions f WHERE f.machine_id = session_control_sessions.machine_id
       AND f.native_id = json_extract(session_control_sessions.binding_json, '$.native_id')
       AND f.phase != 'exited' AND f.phase != 'dead' AND f.phase != 'pruned' AND f.phase != 'forgotten' AND f.phase != 'unobserved'
-      AND (f.observed_at >= ? OR instr(COALESCE((
-        SELECT '|' || group_concat(c.machine_id, '|') || '|' FROM fleet_catalog_seen c WHERE c.observed_at >= ?
-      ), ''), '|' || f.machine_id || '|') > 0))))`,
-    params: [cutoff, cutoff],
+      AND (f.observed_at >= ? OR instr(?, '|' || f.machine_id || '|') > 0))))`,
+    params: [cutoff, packed],
   };
 }
 /** Literal must match the partial indexes session_control_live_created / _live_actor_created. */
@@ -193,6 +203,14 @@ const ACTIVE_COUNT_CAP = 1000;
 /** FROM clause for live-only reads: forces the partial live index so only non-terminal rows are walked. */
 function liveFrom(admin: boolean): string {
   return `session_control_sessions INDEXED BY ${admin ? 'session_control_live_created' : 'session_control_live_actor_created'}`;
+}
+/** A complete raw live prefix bounds the later freshness predicate even when
+ * every retained running row is stale. Actor scope remains an indexed prefix. */
+function assertBoundedActiveCandidates(sql:SqlStorage,observeAll:boolean,actor?:string):void {
+  const rows=observeAll
+    ?sql.exec(`SELECT id FROM ${liveFrom(true)} WHERE ${LIVE_STATES_SQL} ORDER BY created_at DESC,id DESC LIMIT ?`,ACTIVE_COUNT_CAP+1).toArray()
+    :sql.exec(`SELECT id FROM ${liveFrom(false)} WHERE actor=? AND ${LIVE_STATES_SQL} ORDER BY created_at DESC,id DESC LIMIT ?`,actor,ACTIVE_COUNT_CAP+1).toArray();
+  if(rows.length>ACTIVE_COUNT_CAP)throw new FreshCatalogObservationLimit('active_session_observation_limited');
 }
 const TREE_LIMIT_DEFAULT = 200;
 const TREE_LIMIT_MAX = 500;
@@ -468,41 +486,42 @@ export class SessionControlService {
     // Intake e8a22f4c: host command polls filter by state; without this each poll walked the machine's whole
     // session history. Callers must not count index writes in rowsWritten (see the claim, which uses RETURNING).
     this.sql.exec("CREATE INDEX IF NOT EXISTS session_control_commands_state ON session_control_commands(state, session_id)");
-    // Older builds marked a wake delivered when the Hub merely queued its
-    // command. Reclassify unacknowledged rows without a host inbox receipt so
-    // they continue through the queued-receipt path instead of preserving a
-    // false delivery timestamp across upgrade.
-    this.sql.exec(`UPDATE session_control_wakes SET state='queued', delivered_at=NULL, updated_at=?
-      WHERE state='delivered' AND acked_at IS NULL AND command_id IN (
-        SELECT id FROM session_control_commands
-        WHERE state!='acked' AND COALESCE(host_status,'') NOT IN
-          ('waiting in inbox for recipient','delivered; awaiting recipient reply'))`, this.at());
-    // The old delivered_at recorded Hub enqueue time. For rows with a native
-    // receipt, restart the acknowledgement window from the receipt-bearing
-    // command update; only touch rows whose old timestamp still equals enqueue.
-    this.sql.exec(`UPDATE session_control_wakes SET delivered_at = (
-        SELECT updated_at FROM session_control_commands WHERE id = session_control_wakes.command_id)
-      WHERE state='delivered' AND acked_at IS NULL AND delivered_at = (
-        SELECT created_at FROM session_control_commands WHERE id = session_control_wakes.command_id)
-      AND command_id IN (SELECT id FROM session_control_commands
-        WHERE COALESCE(host_status,'') IN ('waiting in inbox for recipient','delivered; awaiting recipient reply'))`);
+    // Legacy wake receipts are upgraded only for the exact request/queue
+    // entity below. Construction never repairs retained wake history.
     // M15c lifecycle: additive observations/decisions tables. Server-owned
     // DDL (single authority: src/session_lifecycle.ts schema string); the
     // host keeps no DDL copy. No ALTERs to existing tables here.
     initLifecycleTables(this.sql);
     registerHeldReconciler(this.sql, () => this.reconcileHeldSessions(5, undefined, { urgentRecovery: true }));
     try { ensureTbmControllerSchema(this.sql); } catch {}
-    // Repair this day's pre-fix starts from canonical requests, once per id.
-    // Run each repair atomically; historical manual links are left untouched.
-    const hasIntake = this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='intake_tasks'").toArray().length;
-    if (hasIntake) {
-      const today = this.at().slice(0, 10);
-      const sessions = this.sql.exec("SELECT * FROM session_control_sessions WHERE created_at >= ? AND json_extract(request_json, '$.intake_task_id') IS NOT NULL ORDER BY created_at,id", today).toArray();
-      for (const row of sessions) {
-        try { this.transaction(() => recordIntakeSessionLink(this.sql, row, this.now())); }
-        catch { console.warn('intake_session_link_backfill_pending'); }
-      }
-    }
+    // Legacy link repair is explicit operator work; cold starts never walk it.
+  }
+
+  repairIntakeLinks(limit=16):any {
+    if(!Number.isSafeInteger(limit)||limit<1||limit>16)throw new Error('invalid_repair_limit');
+    const hasIntake=this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='intake_tasks'").toArray().length;
+    if(!hasIntake)return {repaired:0,complete:false,reason:'intake_store_unavailable'};
+    return this.transaction(()=>{
+      const key='session_intake_links_t2609u';
+      if(this.sql.exec('SELECT 1 FROM hub_init_stamps WHERE key=?',key).toArray().length)return {repaired:0,complete:true,next_cursor:null,source_rows_scanned:0};
+      this.sql.exec('INSERT OR IGNORE INTO session_intake_link_repair_cursor VALUES(?,?,?)',key,this.at().slice(0,10),'');
+      const cursor:any=this.sql.exec('SELECT created_at,session_id FROM session_intake_link_repair_cursor WHERE key=?',key).toArray()[0];
+      // Two seek arms handle large equal-timestamp cohorts without sorting or
+      // repeatedly walking today's already repaired prefix. Persist progress
+      // atomically, and never stamp an incomplete repair as done.
+      const page=this.sql.exec(`SELECT * FROM session_control_sessions INDEXED BY session_control_created
+        WHERE created_at=? AND id>? ORDER BY id LIMIT ?`,cursor.created_at,cursor.session_id,limit+1).toArray() as any[];
+      if(page.length<limit+1)page.push(...this.sql.exec(`SELECT * FROM session_control_sessions INDEXED BY session_control_created
+        WHERE created_at>? ORDER BY created_at,id LIMIT ?`,cursor.created_at,limit+1-page.length).toArray());
+      const batch=page.slice(0,limit);
+      let repaired=0;
+      for(const row of batch)if(parsed(row.request_json,{}).intake_task_id!=null&&recordIntakeSessionLink(this.sql,row,this.now()))repaired++;
+      if(batch.length){const last=batch.at(-1)!;this.sql.exec('UPDATE session_intake_link_repair_cursor SET created_at=?,session_id=? WHERE key=?',last.created_at,last.id,key);}
+      const complete=page.length<=limit;
+      if(complete)this.sql.exec('INSERT OR IGNORE INTO hub_init_stamps VALUES(?,?)',key,this.now());
+      const last=batch.at(-1);
+      return {repaired,complete,next_cursor:complete?null:{created_at:last?.created_at??cursor.created_at,session_id:last?.id??cursor.session_id},source_rows_scanned:batch.length};
+    });
   }
 
   private at() { return new Date(this.now()).toISOString(); }
@@ -806,7 +825,7 @@ export class SessionControlService {
     if (!binding || typeof binding.native_id !== 'string' || !binding.native_id) return false;
     if (!session.machine_id) return false;
     try {
-      const live = classifyKey(this.sql, `${session.machine_id}/${binding.native_id}`, this.now());
+      const live = classifyKey(this.sql, `${session.machine_id}/${binding.native_id}`, this.now(), {machine_id:session.machine_id,native_id:binding.native_id});
       if (!live) return false;
       if (live.refs?.protected_session) return false;
       if (live.group !== 'finished_stale') return false;
@@ -902,6 +921,41 @@ export class SessionControlService {
     return { ok: true, ms, iso: new Date(ms).toISOString() };
   }
 
+  nextBackgroundWork(): { id: string; dueAt: number } | null {
+    const heads: {id:string;dueAt:number}[] = [];
+    const pending: any = this.sql.exec("SELECT id,wake_at_ms FROM session_control_wakes WHERE state='pending' ORDER BY wake_at_ms,created_at,id LIMIT 1").toArray()[0];
+    if (pending) heads.push({id:pending.id,dueAt:pending.wake_at_ms});
+    const queued: any = this.sql.exec("SELECT id,wake_at_ms FROM session_control_wakes WHERE state='queued' ORDER BY wake_at_ms,created_at,id LIMIT 1").toArray()[0];
+    if (queued) heads.push({id:queued.id,dueAt:queued.wake_at_ms+WAKE_ACK_TIMEOUT_MS});
+    const delivered: any = this.sql.exec("SELECT id,wake_at_ms,delivered_at FROM session_control_wakes WHERE state='delivered' ORDER BY delivered_at,id LIMIT 1").toArray()[0];
+    if (delivered) {
+      const at=Date.parse(delivered.delivered_at);
+      heads.push({id:delivered.id,dueAt:(Number.isFinite(at)?at:delivered.wake_at_ms)+WAKE_ACK_TIMEOUT_MS});
+    }
+    const ping: any = this.sql.exec("SELECT id,next_at_ms FROM session_control_pings WHERE state='active' ORDER BY next_at_ms LIMIT 1").toArray()[0];
+    if (ping) heads.push({id:'ping:'+ping.id,dueAt:ping.next_at_ms});
+    return heads.sort((a,b)=>a.dueAt-b.dueAt)[0] ?? null;
+  }
+
+  processBackground(id: string): number | null {
+    if (id.startsWith('ping:')) {
+      const pingId=id.slice(5);
+      this.processPings(pingId);
+      const ping: any=this.sql.exec("SELECT next_at_ms FROM session_control_pings WHERE id=? AND state='active'",pingId).toArray()[0];
+      return typeof ping?.next_at_ms==='number'?ping.next_at_ms:null;
+    }
+    this.processDueWakes(id);
+    const row: any=this.sql.exec('SELECT state,wake_at_ms,delivered_at FROM session_control_wakes WHERE id=?',id).toArray()[0];
+    if (!row) return null;
+    if (row.state==='pending') return row.wake_at_ms>this.now()?row.wake_at_ms:Math.min(this.now()+15000,row.wake_at_ms+WAKE_ACK_TIMEOUT_MS);
+    if (row.state==='queued') return row.wake_at_ms+WAKE_ACK_TIMEOUT_MS;
+    if (row.state==='delivered') {
+      const at=Date.parse(row.delivered_at);
+      return (Number.isFinite(at)?at:row.wake_at_ms)+WAKE_ACK_TIMEOUT_MS;
+    }
+    return null;
+  }
+
   public nextWakeTime(): number | null {
     // Seek the earliest row of each indexed queue; never aggregate retained
     // outstanding history or apply julianday to every delivery. Keep the
@@ -913,7 +967,7 @@ export class SessionControlService {
         ORDER BY wake_at_ms, created_at, id LIMIT 1)+600000
       UNION ALL SELECT CAST((julianday((SELECT delivered_at FROM session_control_wakes
         WHERE state='delivered' AND delivered_at IS NOT NULL ORDER BY delivered_at, id LIMIT 1))-2440587.5)*86400000 AS INTEGER)+600000
-      UNION ALL SELECT next_at_ms AS deadline FROM session_control_pings WHERE state='active')`).toArray()[0];
+      UNION ALL SELECT (SELECT next_at_ms FROM session_control_pings WHERE state='active' ORDER BY next_at_ms LIMIT 1))`).toArray()[0];
     return typeof row?.deadline === 'number' ? row.deadline : null;
   }
 
@@ -942,11 +996,12 @@ export class SessionControlService {
   /** Sweep external pings: reconcile the last delivery, end pings of finished
    * sessions, deliver due ticks through the normal send command path and
    * coalesce ticks while the session still has an unfinished command. */
-  public processPings(): { delivered: number; skipped: number; failed: number; ended: number } {
+  public processPings(pingId?: string): { delivered: number; skipped: number; failed: number; ended: number } {
     const out = { delivered: 0, skipped: 0, failed: 0, ended: 0 };
     const nowMs = this.now(), at = this.at();
     let pings: any[] = [];
-    try { pings = this.sql.exec("SELECT * FROM session_control_pings WHERE state = 'active' ORDER BY next_at_ms ASC, id ASC LIMIT 200").toArray() as any[]; } catch { return out; }
+    try { pings = (pingId ? this.sql.exec("SELECT * FROM session_control_pings WHERE id=? AND state='active'", pingId)
+      : this.sql.exec("SELECT * FROM session_control_pings WHERE state = 'active' ORDER BY next_at_ms ASC, id ASC LIMIT 200")).toArray() as any[]; } catch { return out; }
     for (const ping of pings) {
       try {
         const session: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', ping.session_id).toArray()[0];
@@ -969,8 +1024,8 @@ export class SessionControlService {
         // Coalesce: at most one tick is ever outstanding, never a catch-up burst.
         const next = nowMs + ping.every_ms;
         if (session.state !== 'running') { this.sql.exec('UPDATE session_control_pings SET next_at_ms=?, updated_at=? WHERE id=?', nowMs + 15000, at, ping.id); continue; }
-        const busy = Number(this.sql.exec("SELECT COUNT(*) AS n FROM session_control_commands WHERE session_id = ? AND state IN ('recorded', 'transported', 'claimed')", session.id).toArray()[0]?.n ?? 0);
-        const pendingAll = Number(this.sql.exec("SELECT COUNT(*) AS n FROM session_control_commands WHERE state IN ('recorded', 'transported', 'claimed')").toArray()[0]?.n ?? 0);
+        const busy = Number(this.sql.exec("SELECT COUNT(*) AS n FROM (SELECT 1 FROM session_control_commands INDEXED BY session_control_commands_state WHERE session_id = ? AND state IN ('recorded', 'transported', 'claimed') LIMIT ?)", session.id, 1).toArray()[0]?.n ?? 0);
+        const pendingAll = Number(this.sql.exec("SELECT COUNT(*) AS n FROM (SELECT 1 FROM session_control_commands INDEXED BY session_control_commands_state WHERE state IN ('recorded', 'transported', 'claimed') LIMIT ?)", this.maxPending).toArray()[0]?.n ?? 0);
         if (busy > 0 || pendingAll >= this.maxPending) {
           this.sql.exec('UPDATE session_control_pings SET skipped_count = skipped_count + 1, next_at_ms=?, updated_at=? WHERE id=?', next, at, ping.id);
           out.skipped++;
@@ -996,7 +1051,7 @@ export class SessionControlService {
   private pendingWakeFor(sessionId: string): any | null {
     try {
       const rows = this.sql.exec(
-        "SELECT * FROM session_control_wakes WHERE session_id = ? AND state = 'pending' AND wake_at_ms > ? ORDER BY wake_at_ms ASC, created_at ASC, id ASC LIMIT 1",
+        "SELECT * FROM session_control_wakes INDEXED BY intake_queue_wakes_session WHERE session_id = ? AND state = 'pending' AND wake_at_ms > ? ORDER BY wake_at_ms ASC, rowid ASC LIMIT 1",
         sessionId, this.now()).toArray() as any[];
       return rows[0] ?? null;
     } catch { return null; }
@@ -1030,15 +1085,45 @@ export class SessionControlService {
   /** Durable wake sweep: deliver due wakes through the verified send path and
    * expire unacked deliveries. Survives Worker/host restarts (DO SQLite).
    * Called opportunistically on session reads and from the Hub tick/alarm. */
-  public processDueWakes(): { delivered: number; acked: number; missed: number } {
+  /** Request/queue-owned repair for one known legacy wake only. A queued
+   * command never proves native delivery, and only its exact send tuple may
+   * correct the historical receipt timestamp. No constructor/global stamp. */
+  public upgradeWakeNativeReceipt(wakeId:string):any {
+    return this.transaction(()=>{
+      const wake:any=this.sql.exec('SELECT * FROM session_control_wakes WHERE id=?',wakeId).toArray()[0];
+      if(!wake||wake.state!=='delivered'||wake.acked_at!=null||!wake.command_id)return wake;
+      const command:any=this.sql.exec('SELECT * FROM session_control_commands WHERE id=?',wake.command_id).toArray()[0];
+      if(!command)return wake;
+      if(command.kind!=='send'||command.session_id!==wake.session_id||command.actor!==wake.actor
+        ||command.request_key!==`wake-${wake.id}-${command.id}`)throw new Error('wake_receipt_binding_invalid');
+      const observed=['waiting in inbox for recipient','delivered; awaiting recipient reply'].includes(command.host_status);
+      const updatedAt=this.at();
+      if(command.state!=='acked'&&!observed) {
+        const changed=this.sql.exec(`UPDATE session_control_wakes SET state='queued',delivered_at=NULL,updated_at=?
+          WHERE id=? AND state='delivered' AND acked_at IS NULL AND session_id=? AND command_id=? AND delivered_at IS ? RETURNING id`,
+          updatedAt,wake.id,wake.session_id,wake.command_id,wake.delivered_at).toArray().length;
+        return changed?{...wake,state:'queued',delivered_at:null,updated_at:updatedAt}:wake;
+      }
+      if(observed&&typeof command.created_at==='string'&&wake.delivered_at===command.created_at
+        &&command.updated_at!==wake.delivered_at) {
+        const changed=this.sql.exec(`UPDATE session_control_wakes SET delivered_at=?,updated_at=?
+          WHERE id=? AND state='delivered' AND acked_at IS NULL AND session_id=? AND command_id=? AND delivered_at IS ? RETURNING id`,
+          command.updated_at,updatedAt,wake.id,wake.session_id,wake.command_id,wake.delivered_at).toArray().length;
+        return changed?{...wake,delivered_at:command.updated_at,updated_at:updatedAt}:wake;
+      }
+      return wake;
+    });
+  }
+
+  public processDueWakes(wakeId?: string): { delivered: number; acked: number; missed: number } {
     let delivered = 0, acked = 0, missed = 0;
     const nowMs = this.now();
     const at = this.at();
+    if(wakeId)this.upgradeWakeNativeReceipt(wakeId);
     let due: any[] = [];
     try {
-      due = this.sql.exec(
-        "SELECT * FROM session_control_wakes WHERE state = 'pending' AND wake_at_ms <= ? ORDER BY wake_at_ms ASC, created_at ASC, id ASC LIMIT 100",
-        nowMs).toArray() as any[];
+      due = (wakeId ? this.sql.exec("SELECT * FROM session_control_wakes WHERE id=? AND state='pending' AND wake_at_ms<=?", wakeId, nowMs)
+        : this.sql.exec("SELECT * FROM session_control_wakes WHERE state = 'pending' AND wake_at_ms <= ? ORDER BY wake_at_ms ASC, created_at ASC, id ASC LIMIT 100", nowMs)).toArray() as any[];
     } catch { due = []; }
     for (const wake of due) {
       try {
@@ -1064,10 +1149,10 @@ export class SessionControlService {
         const binding = session.binding_json ? parsed(session.binding_json, null) : null;
         const generation = binding?.generation ?? 0;
         const pendingCount = Number(this.sql.exec(
-          "SELECT COUNT(*) AS n FROM session_control_commands WHERE state IN ('recorded', 'transported', 'claimed')").toArray()[0]?.n ?? 0);
+          "SELECT COUNT(*) AS n FROM (SELECT 1 FROM session_control_commands INDEXED BY session_control_commands_state WHERE state IN ('recorded', 'transported', 'claimed') LIMIT ?)", this.maxPending).toArray()[0]?.n ?? 0);
         if (pendingCount >= this.maxPending) continue;
         const perSession = Number(this.sql.exec(
-          "SELECT COUNT(*) AS n FROM session_control_commands WHERE session_id = ? AND state IN ('recorded', 'transported', 'claimed')", session.id).toArray()[0]?.n ?? 0);
+          "SELECT COUNT(*) AS n FROM (SELECT 1 FROM session_control_commands INDEXED BY session_control_commands_state WHERE session_id = ? AND state IN ('recorded', 'transported', 'claimed') LIMIT ?)", session.id, this.maxPerSession).toArray()[0]?.n ?? 0);
         if (perSession >= this.maxPerSession) continue;
         const commandId = crypto.randomUUID();
         const correlation = `cmd:${commandId}:gen:${generation}`;
@@ -1092,7 +1177,8 @@ export class SessionControlService {
     // written to the native recipient inbox. Queue transport alone does not
     // satisfy this receipt.
     let queued: any[] = [];
-    try { queued = this.sql.exec("SELECT * FROM session_control_wakes WHERE state = 'queued' ORDER BY updated_at, id LIMIT 100").toArray() as any[]; }
+    try { queued = (wakeId ? this.sql.exec("SELECT * FROM session_control_wakes WHERE id=? AND state='queued'", wakeId)
+      : this.sql.exec("SELECT * FROM session_control_wakes INDEXED BY session_control_wakes_resolution_order WHERE state = 'queued' ORDER BY updated_at, rowid LIMIT 100")).toArray() as any[]; }
     catch { queued = []; }
     for (const wake of queued) {
       try {
@@ -1122,10 +1208,16 @@ export class SessionControlService {
     // Ack reconciliation + 10-minute missed-wake expiry.
     let awaiting: any[] = [];
     try {
-      awaiting = this.sql.exec("SELECT * FROM session_control_wakes WHERE state = 'delivered' ORDER BY delivered_at ASC, id ASC LIMIT 100").toArray() as any[];
+      awaiting = (wakeId ? this.sql.exec("SELECT * FROM session_control_wakes WHERE id=? AND state='delivered'", wakeId)
+        : this.sql.exec("SELECT * FROM session_control_wakes WHERE state = 'delivered' ORDER BY delivered_at ASC, id ASC LIMIT 100")).toArray() as any[];
     } catch { awaiting = []; }
-    for (const wake of awaiting) {
+    for (const storedWake of awaiting) {
       try {
+        // A selected delivery without a command has no legacy native
+        // receipt to repair. Re-reading its PK cannot add authority; the
+        // existing timeout path below still handles it conservatively.
+        const wake=storedWake.command_id?this.upgradeWakeNativeReceipt(storedWake.id):storedWake;
+        if(!wake||wake.state!=='delivered')continue;
         const cmd: any = wake.command_id
           ? this.sql.exec('SELECT * FROM session_control_commands WHERE id = ?', wake.command_id).toArray()[0]
           : null;
@@ -1161,7 +1253,8 @@ export class SessionControlService {
         }
       } catch { /* next */ }
     }
-    const unresolved = this.sql.exec("SELECT * FROM session_control_wakes WHERE state='missed' ORDER BY updated_at LIMIT 100").toArray() as any[];
+    const unresolved = (wakeId ? this.sql.exec("SELECT * FROM session_control_wakes WHERE id=? AND state='missed'", wakeId)
+      : this.sql.exec("SELECT * FROM session_control_wakes WHERE state='missed' ORDER BY updated_at LIMIT 100")).toArray() as any[];
     for (const wake of unresolved) {
       const cmd: any = wake.command_id && this.sql.exec('SELECT state FROM session_control_commands WHERE id=?', wake.command_id).toArray()[0];
       const session: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id=?', wake.session_id).toArray()[0];
@@ -1174,22 +1267,46 @@ export class SessionControlService {
         this.sql.exec("UPDATE session_control_wakes SET state='resolved',updated_at=? WHERE id=?", at, wake.id);
       }
     }
-    try { this.processPings(); } catch { /* ping sweep never breaks wakes */ }
+    if (!wakeId) try { this.processPings(); } catch { /* ping sweep never breaks wakes */ }
     return { delivered, acked, missed };
   }
 
-  attention(): any[] {
+  /** Cron recovery pages through live sessions; the dashboard can still ask
+   * for the full current attention view explicitly. The cursor is owned by
+   * the caller so restarts do not repeatedly inspect the same first page. */
+  attentionPage(limit = 50, after = ''): { items: any[]; evaluated: string[]; next: string } {
+    const size = Math.max(1, Math.min(50, Math.floor(limit)));
+    // Reuse the deployed state index's implicit rowid. Old ID cursors are
+    // translated by the session primary key once; new cursors retain rowid
+    // even if the previous page's last session is subsequently removed.
+    const prior = after.startsWith('rowid:') ? Number(after.slice(6)) : after
+      ? Number(this.sql.exec('SELECT rowid AS cursor FROM session_control_sessions WHERE id=?', after).toArray()[0]?.cursor ?? 0) : 0;
+    const cursor = Number.isSafeInteger(prior) && prior >= 0 ? prior : 0;
+    const rows = this.sql.exec(`SELECT id,rowid AS page_rowid FROM session_control_sessions INDEXED BY session_control_state
+      WHERE state='running' AND rowid>? ORDER BY rowid LIMIT ?`, cursor, size + 1).toArray() as any[];
+    const page = rows.slice(0, size), ids = page.map(row => String(row.id));
+    return { items: this.attention(ids), evaluated: ids, next: rows.length > size ? 'rowid:' + page[page.length - 1].page_rowid : '' };
+  }
+
+  attention(sessionIds?: string[]): any[] {
     const now = this.now(), result: any[] = [];
     const episodes = this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='session_idle_episodes'").toArray().length;
     // Point lookups per running session instead of reading every retained stall.
     const savedStall = (machine: unknown, native: unknown) => machine != null && native != null &&
       this.sql.exec('SELECT 1 FROM session_stalls WHERE machine_id=? AND native_id=? LIMIT 1', machine, native).toArray().length > 0;
-    const missed = new Set((this.sql.exec("SELECT DISTINCT session_id FROM session_control_wakes WHERE state='missed'").toArray() as any[]).map(r=>r.session_id));
-    const natives = new Map((this.sql.exec(`SELECT f.* FROM session_control_sessions s LEFT JOIN fleet_sessions f
-      ON f.machine_id=s.machine_id AND f.native_id=json_extract(s.binding_json,'$.native_id') WHERE s.state='running'`).toArray() as any[])
-      .map(r=>[JSON.stringify([r.machine_id,r.native_id]),r]));
+    const missed = new Set(sessionIds
+      ? sessionIds.filter(id => this.sql.exec("SELECT 1 FROM session_control_wakes WHERE session_id=? AND state='missed' LIMIT 1", id).toArray().length)
+      : (this.sql.exec("SELECT DISTINCT session_id FROM session_control_wakes WHERE state='missed'").toArray() as any[]).map(r => r.session_id));
+    const selected = sessionIds ? sessionIds.flatMap(id => this.sql.exec("SELECT id,machine_id,binding_json,mode,engine,state,created_at,updated_at FROM session_control_sessions WHERE id=? AND state='running'", id).toArray() as any[])
+      : this.sql.exec("SELECT id,machine_id,binding_json,mode,engine,state,created_at,updated_at FROM session_control_sessions WHERE state='running'").toArray() as any[];
+    const nativeRows = sessionIds ? selected.flatMap(row => {
+      const binding = parsed(row.binding_json, {});
+      return binding.native_id ? this.sql.exec('SELECT * FROM fleet_sessions WHERE machine_id=? AND native_id=?', row.machine_id, binding.native_id).toArray() as any[] : [];
+    }) : this.sql.exec(`SELECT f.* FROM session_control_sessions s LEFT JOIN fleet_sessions f
+      ON f.machine_id=s.machine_id AND f.native_id=json_extract(s.binding_json,'$.native_id') WHERE s.state='running'`).toArray() as any[];
+    const natives = new Map(nativeRows.map(r => [JSON.stringify([r.machine_id, r.native_id]), r]));
     const freshness: NativeObservationCache = new Map();
-    for (const row of this.sql.exec("SELECT id,machine_id,binding_json,mode,engine,state,created_at,updated_at FROM session_control_sessions WHERE state='running'").toArray() as any[]) {
+    for (const row of selected) {
       const binding = parsed(row.binding_json, {});
       const nativeKey = JSON.stringify([row.machine_id,binding.native_id]);
       const observed: any = natives.get(nativeKey);
@@ -1222,7 +1339,9 @@ export class SessionControlService {
         title: state + ': ' + row.id, detail: `${state}; intake_id=${intakeId || '(unlinked)'}; idle_for=${idleFor}s; last_activity_at=${lastActivity}; last_nudge=${lastNudge || 'none'}` });
     }
     try {
-      for (const p of this.sql.exec("SELECT * FROM session_control_pings WHERE state='active' AND last_error IS NOT NULL").toArray() as any[]) {
+      const failedPings = sessionIds ? sessionIds.flatMap(id => this.sql.exec("SELECT * FROM session_control_pings WHERE session_id=? AND state='active' AND last_error IS NOT NULL", id).toArray() as any[])
+        : this.sql.exec("SELECT * FROM session_control_pings WHERE state='active' AND last_error IS NOT NULL").toArray() as any[];
+      for (const p of failedPings) {
         result.push({ session_id: p.session_id, intake_id: p.intake_task_id, state: 'ping_failed', severity: 'warn', source: 'session_ping',
           subject: 'session:' + p.session_id, title: 'ping_failed: ' + p.session_id,
           detail: `ping ${p.id} last delivery failed (${p.last_error}); failures=${p.failure_count}; clear with hub loop clear` });
@@ -1319,10 +1438,11 @@ export class SessionControlService {
     if (row.fleet_launch_id) {
       // Intake 17e774f8: separate read so older fleet tables without the
       // column cannot hide the launch diagnostics below.
-      try {
+      const statusColumn=this.sql.exec("SELECT name FROM pragma_table_info('fleet_launches') WHERE name='worker_status' LIMIT 1").toArray().length;
+      if(statusColumn) {
         const done: any = this.sql.exec('SELECT state, worker_status, runtime_json FROM fleet_launches WHERE id = ?', row.fleet_launch_id).toArray()[0];
         if (done?.state === 'exited' && WORKER_STATUSES.includes(done.worker_status) && cleanReportedExit(parsed(done.runtime_json, null))) workerStatus = done.worker_status;
-      } catch {}
+      }
     }
     if (row.fleet_launch_id) {
       try {
@@ -2476,7 +2596,12 @@ export class SessionControlService {
   }
 
   async handle(request: Request, auth: Auth): Promise<Response> {
-    const result = await this.dispatch(request, auth);
+    let result:Response;
+    try{result=await this.dispatch(request,auth);}
+    catch(error){
+      if(error instanceof FreshCatalogObservationLimit)return response({error:error.code,observation_pending:true},503);
+      throw error;
+    }
     const command = /^\/api\/session-commands\/([a-f0-9-]{36})\//.exec(new URL(request.url).pathname);
     if (command && result.status >= 400 && auth.caller) {
       const row: any = this.sql.exec("SELECT payload_json FROM session_control_commands WHERE id = ? AND kind = 'message'", command[1]).toArray()[0];
@@ -2510,10 +2635,34 @@ export class SessionControlService {
     const writer = admin || (caller.kind === 'agent' && auth.scopes?.includes('fleet:launch'));
     const host = caller.kind === 'host' && !!caller.machineId && auth.scopes?.includes('host');
 
+    if(path==='/api/sessions/maintenance/repair-intake-links'&&request.method==='POST') {
+      if(!admin||!auth.scopes?.includes('admin'))return response({error:'forbidden'},403);
+      const limit=Number(url.searchParams.get('limit')??16);
+      if(!Number.isSafeInteger(limit)||limit<1||limit>16)return response({error:'invalid_repair_limit'},400);
+      return response(this.repairIntakeLinks(limit));
+    }
+
     if (path === '/api/sessions/worktree-guards' && request.method === 'GET') {
       if (!host) return response({ error: 'forbidden' }, 403);
       const scope = this.worktreeGuardScope(url, caller);
       const rows = scope.rows;
+      if(scope.truncated || scope.snapshot.sessionIds.length>128 || scope.snapshot.nativeIds.length>128) {
+        // An incomplete authority closure can never permit destruction. Do
+        // not spend more rows hydrating lifecycle or per-session receipts
+        // merely to rediscover this already-known refusal.
+        const sessions=rows.filter(row=>scope.targets.has(row.id)).map(row=>{
+          const binding=parsed(row.binding_json,null);
+          return {session_id:row.id,session_state:row.state,intake_task_id:parsed(row.request_json,{}).intake_task_id??null,
+            native_terminal:false,native_id:binding?.native_id??null,native_last_activity_at:null,
+            lock_release_permitted:false,engine:row.engine,adoption_intent_id:binding?.adoption_intent_id??null,
+            tag:binding?.tag??((row.mode==='headless'?'task-hub-':'hub-')+row.fleet_launch_id),
+            workspace:binding?.workspace??null,native_created_at_ms:binding?.native_created_at_ms??null,
+            terminal:['stopped','finished','failed','refused','cancelled'].includes(row.state),
+            linked_intake_open:true,protected:true,human_owned:true,observation_pending:true};
+        });
+        return response({sessions,next_cursor:scope.nextCursor,bounded:true,observation_pending:true,
+          reason:'worktree_identity_closure_limited'});
+      }
       const worktreeLinks = worktreeIntakeSnapshot(this.sql, scope.snapshot);
       // One immutable read snapshot for the whole response. classifyKey
       // rebuilds every session's inputs; doing that per row made the host's
@@ -2889,12 +3038,13 @@ export class SessionControlService {
           // reserve stays idempotent on its own derived key, so this cannot double-launch.
         }
         if (!prior && worker) {
-          const live: any = this.sql.exec(`SELECT COUNT(*) AS n FROM session_control_sessions WHERE parent_id = ? AND state NOT IN ('exited','stopped','failed','cancelled','dead','forgotten','pruned')`, worker.session_id).toArray()[0];
-          if (live.n >= WORKER_CHILD_CONCURRENT) return response({ error: 'worker_scope_forbidden', detail: 'child_limit', limit: 'concurrent', max: WORKER_CHILD_CONCURRENT }, 429);
-          const perIntake: any = this.sql.exec(`SELECT COUNT(*) AS n FROM session_control_sessions WHERE parent_id IS NOT NULL AND json_extract(CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END,'$.intake_task_id') = ? AND state NOT IN ('exited','stopped','failed','cancelled','dead','forgotten','pruned')`, worker.task_id).toArray()[0];
-          if (perIntake.n >= WORKER_CHILD_PER_INTAKE) return response({ error: 'worker_scope_forbidden', detail: 'child_limit', limit: 'per_intake', max: WORKER_CHILD_PER_INTAKE }, 429);
-          const hourly: any = this.sql.exec('SELECT COUNT(*) AS n FROM session_control_sessions WHERE parent_id = ? AND created_at > ?', worker.session_id, new Date(this.now() - 3600000).toISOString()).toArray()[0];
-          if (hourly.n >= WORKER_CHILD_PER_HOUR) return response({ error: 'worker_scope_forbidden', detail: 'child_limit', limit: 'per_hour', max: WORKER_CHILD_PER_HOUR }, 429);
+          const observed=workerChildObservation(this.sql,worker.session_id,worker.task_id,this.now());
+          for(const [limit,max] of [['concurrent',WORKER_CHILD_CONCURRENT],['per_intake',WORKER_CHILD_PER_INTAKE],['per_hour',WORKER_CHILD_PER_HOUR]] as const) {
+            if(observed[limit].count>=max)return response({error:'worker_scope_forbidden',detail:'child_limit',limit,max},429);
+          }
+          const incomplete=Object.entries(observed).filter(([,value])=>value.limited).map(([limit])=>limit);
+          if(incomplete.length)return response({error:'worker_child_observation_limited',observation_pending:true,limits:incomplete},503);
+
         }
         // No casual engine picker: fresh starts with an explicit engine must
         // carry a non-empty explanation. Replays under an existing key skip
@@ -3117,7 +3267,8 @@ export class SessionControlService {
       // `limit` rows; `include=all` adds terminal sessions but stays capped.
       const treeLimit = Math.min(TREE_LIMIT_MAX, Math.max(1, Number(url.searchParams.get('limit')) || TREE_LIMIT_DEFAULT));
       const treeAll = url.searchParams.get('include') === 'all';
-      const activeFrag = activeSessionsSql(this.now());
+      const activeFrag = treeAll?{sql:'',params:[]}:activeSessionsSql(this.sql,this.now());
+      if(!treeAll)assertBoundedActiveCandidates(this.sql,admin,caller.actor);
       const stateSql = treeAll ? '' : `AND ${LIVE_STATES_SQL} AND ${activeFrag.sql}`;
       const treeFrom = treeAll ? 'session_control_sessions' : liveFrom(admin);
       const stateArgs: any[] = treeAll ? [] : activeFrag.params;
@@ -3181,6 +3332,12 @@ export class SessionControlService {
 
     if (path === '/api/sessions' && request.method === 'GET') {
       if (!writer) return response({ error: 'forbidden' }, 403);
+      // Ordinary lists expose active_count. Refuse incomplete authority
+      // BEFORE GET's existing reconciliation/promote/wake side effects.
+      // Lifecycle and breakdown have their own independently bounded views.
+      const ordinary=!['lifecycle','breakdown'].includes(url.searchParams.get('view')??'');
+      const activityProof=ordinary?activeSessionsSql(this.sql,this.now()):null;
+      if(ordinary)assertBoundedActiveCandidates(this.sql,observeAll,caller.actor);
       this.transaction(() => {
         reconcileUnboundFleetSessions(this.sql, this.now());
         this.reconcileHeldSessions();
@@ -3226,8 +3383,9 @@ export class SessionControlService {
       let cursorSql = this.cursorClause(cursor, params, true);
       const liveOnly = url.searchParams.get('live') === '1' || url.searchParams.get('active') === '1';
       const listFrom = liveOnly ? liveFrom(observeAll) : 'session_control_sessions';
+      const countFrag=activityProof!;
       if (liveOnly) {
-        const frag = activeSessionsSql(this.now());
+        const frag = countFrag;
         cursorSql += ` AND ${LIVE_STATES_SQL} AND ${frag.sql}`;
         params.push(...frag.params);
       }
@@ -3237,8 +3395,8 @@ export class SessionControlService {
       ).filter((r: any) => observeAll || this.ownerOk(r, caller));
       const page = rows.slice(0, limit);
       const next = rows.length > limit ? `${(page[page.length - 1] as any).created_at}|${(page[page.length - 1] as any).id}` : null;
-      const countFrag = activeSessionsSql(this.now());
-      // Capped count over the partial live index: bounded by ACTIVE_COUNT_CAP matches, never a base-table scan.
+      // The complete raw live prefix above bounds this later predicate scan;
+      // ACTIVE_COUNT_CAP remains the public count/match ceiling.
       const countFrom = liveFrom(observeAll);
       const activeCount = Number((observeAll
         ? this.sql.exec(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM ${countFrom} WHERE ${LIVE_STATES_SQL} AND ${countFrag.sql} LIMIT ?)`, ...countFrag.params, ACTIVE_COUNT_CAP)
@@ -3431,13 +3589,13 @@ export class SessionControlService {
               }
             }
             const pendingCount = Number(this.sql.exec(
-              "SELECT COUNT(*) AS n FROM session_control_commands WHERE state IN ('recorded', 'transported', 'claimed')").one().n);
+              "SELECT COUNT(*) AS n FROM (SELECT 1 FROM session_control_commands INDEXED BY session_control_commands_state WHERE state IN ('recorded', 'transported', 'claimed') LIMIT ?)", this.maxPending).one().n);
             if (pendingCount >= this.maxPending) {
               refused.push({ key: target.session_key, reasons: ['queue_full: reconciled via commands listing, do not blind-retry'] });
               continue;
             }
             const perSession = Number(this.sql.exec(
-              "SELECT COUNT(*) AS n FROM session_control_commands WHERE session_id = ? AND state IN ('recorded', 'transported', 'claimed')", live.id).one().n);
+              "SELECT COUNT(*) AS n FROM (SELECT 1 FROM session_control_commands INDEXED BY session_control_commands_state WHERE session_id = ? AND state IN ('recorded', 'transported', 'claimed') LIMIT ?)", live.id, this.maxPerSession).one().n);
             if (perSession >= this.maxPerSession) {
               refused.push({ key: target.session_key, reasons: ['session_queue_full: reconciled via commands listing, do not blind-retry'] });
               continue;
@@ -3547,6 +3705,7 @@ export class SessionControlService {
         }
         if (!session && sub !== 'binding' && sub !== 'retirement') {
           const matches = observedHubTagMatches(this.sql, rawRef, row => this.ownerOk(row, caller));
+          if(matches.observationLimited)return response({error:'session_alias_observation_limited',observation_pending:true},503);
           if (matches.length > 1) return response({error:'ambiguous_session_prefix'}, 409);
           session = matches[0] ?? null;
         }
@@ -3561,8 +3720,10 @@ export class SessionControlService {
           return intent.provenance === 'observed_native' && binding.provenance === 'observed_native' &&
             workspace === linkWorker.workspace;
         };
+        const observed=observedHubTagMatches(this.sql,rawRef,visibleToCaller);
+        if(observed.observationLimited)return response({error:'session_alias_observation_limited',observation_pending:true},503);
         const matches = [...new Map([...visibleSessionPrefixMatches(this.sql, rawRef, visibleToCaller),
-          ...observedHubTagMatches(this.sql, rawRef, visibleToCaller)].map(row => [row.id, row])).values()];
+          ...observed].map(row => [row.id, row])).values()];
         if (matches.length > 1) return response({ error: 'ambiguous_session_prefix',
           matches: matches.map(row => ({ id: row.id, name: parsed(row.request_json, {}).name ?? null })) }, 409);
         session = matches[0] ?? null;
@@ -4844,10 +5005,10 @@ export class SessionControlService {
     if (!this.ownerOk(session, caller)) return response({ error: 'not_found' }, 404);
     // True caps: refuse new work without evicting pending work.
     const pending = Number(this.sql.exec(
-      "SELECT COUNT(*) AS n FROM session_control_commands WHERE state IN ('recorded', 'transported', 'claimed')").one().n);
+      "SELECT COUNT(*) AS n FROM (SELECT 1 FROM session_control_commands INDEXED BY session_control_commands_state WHERE state IN ('recorded', 'transported', 'claimed') LIMIT ?)", this.maxPending).one().n);
     if (pending >= this.maxPending) return response({ error: 'queue_full' }, 429);
     const perSession = Number(this.sql.exec(
-      "SELECT COUNT(*) AS n FROM session_control_commands WHERE session_id = ? AND state IN ('recorded', 'transported', 'claimed')", session.id).one().n);
+      "SELECT COUNT(*) AS n FROM (SELECT 1 FROM session_control_commands INDEXED BY session_control_commands_state WHERE session_id = ? AND state IN ('recorded', 'transported', 'claimed') LIMIT ?)", session.id, this.maxPerSession).one().n);
     if (perSession >= this.maxPerSession) return response({ error: 'session_queue_full' }, 429);
     const prior: any = this.sql.exec(
       'SELECT * FROM session_control_commands WHERE session_id = ? AND actor = ? AND request_key = ?', session.id, actor, key).toArray()[0];
@@ -4914,18 +5075,19 @@ export function promoteStartedOffers(sql: SqlStorage, nowMs: number, scope: { la
  * repeat: live/uncertain launches and bound sessions are never reaped. */
 export function reconcileStaleSessions(sql: SqlStorage, nowMs: number, batch = 200): { reconciled: number; remaining: number } {
   sql.exec('CREATE TABLE IF NOT EXISTS session_stale_reconciliations (session_id TEXT PRIMARY KEY, previous_state TEXT NOT NULL, reason TEXT NOT NULL, at TEXT NOT NULL)');
-  const frag = activeSessionsSql(nowMs);
+  const frag = activeSessionsSql(sql,nowMs);
+  assertBoundedActiveCandidates(sql,true);
   // Grace: never touch rows updated in the last hour (fresh launches that have not reported yet).
   const grace = new Date(nowMs - 3600_000).toISOString();
   const where = `state IN ('starting','running','uncertain','offered') AND updated_at < ? AND NOT ${frag.sql}`;
-  const rows = sql.exec(`SELECT id, state FROM session_control_sessions WHERE ${where} LIMIT ?`, grace, ...frag.params, batch).toArray() as any[];
+  const rows = sql.exec(`SELECT id, state FROM ${liveFrom(true)} WHERE ${LIVE_STATES_SQL} AND ${where} LIMIT ?`, grace, ...frag.params, batch).toArray() as any[];
   const at = new Date(nowMs).toISOString();
   for (const row of rows) {
     sql.exec("INSERT OR IGNORE INTO session_stale_reconciliations (session_id, previous_state, reason, at) VALUES (?, ?, 'stale_no_heartbeat', ?)", row.id, row.state, at);
     sql.exec("UPDATE session_control_sessions SET state = 'stopped', updated_at = ? WHERE id = ?", at, row.id);
   }
   // LIMIT 1 probe: 1 means "at least one more batch", 0 means converged.
-  const remaining = sql.exec(`SELECT 1 AS n FROM session_control_sessions WHERE ${where} LIMIT 1`, grace, ...frag.params).toArray().length;
+  const remaining = sql.exec(`SELECT 1 AS n FROM ${liveFrom(true)} WHERE ${LIVE_STATES_SQL} AND ${where} LIMIT 1`, grace, ...frag.params).toArray().length;
   return { reconciled: rows.length, remaining };
 }
 
@@ -5181,18 +5343,17 @@ export function adoptObservedNativeSessions(
     const request = parsed(row.request_json, {});
     const revision = `${linkageRevision}/${row.updated_at}/${request.observation_only === true}/${row.owner_family ?? ''}/${row.owner_token_id ?? ''}`;
     if (request.observation_link_revision === revision) continue;
-    sql.exec('UPDATE session_control_sessions SET request_json=? WHERE id=?',
-      JSON.stringify({...request, observation_link_revision: revision}), row.id);
-    pending.push(row);
+    pending.push({...row,observation_candidate_revision:revision});
   }
   const links = observedIntakeCandidates(sql, machineId, pending);
+  if(links.observationLimited)return {adopted,updated,deferred:deferred+pending.length};
   for (const row of pending) {
     const taskId = links.get(row.id);
-    if (!taskId) continue;
-    const intent = { ...parsed(row.request_json, {}), intake_task_id: taskId };
+    const intent = { ...parsed(row.request_json, {}),observation_link_revision:row.observation_candidate_revision,
+      ...(taskId?{intake_task_id:taskId}:{}) };
     sql.exec('UPDATE session_control_sessions SET request_json=? WHERE id=?', JSON.stringify(intent), row.id);
     row.request_json = JSON.stringify(intent);
-    recordIntakeSessionLink(sql, row, nowMs);
+    if(taskId)recordIntakeSessionLink(sql, row, nowMs);
   }
   return { adopted, updated, deferred };
 }

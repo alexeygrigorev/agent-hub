@@ -1,3 +1,4 @@
+import { freshFixtureBudgetDay, fixtureSql } from './helpers/fixture-budget';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { env, SELF, runInDurableObject } from 'cloudflare:test';
 import { createSessionCookie } from '../src/auth/session';
@@ -111,19 +112,21 @@ function seedHubSession(sessionId: string, actor: string, machine: string, state
 
 beforeEach(async () => {
   cookie = (await createSessionCookie(env as any, { sub: 'operator', email: 'admin@fake.local', isAdmin: true, csrfToken: 'csrf', exp: Math.floor(Date.now() / 1000) + 3600 })).split(';')[0];
-  await inDO(stub(), (h: any) => {
+  await inDO(stub(), async (h: any, state: any) => {
+    await freshFixtureBudgetDay(h);
+    const sql=fixtureSql(h,state);
     h.env.HUB_ADMIN_TOKEN_SHA256 = 'a'.repeat(64);
-    for (const t of ['tasks', 'grants', 'rules', 'receipts']) h.sql.exec('DELETE FROM intake_' + t);
-    h.sql.exec('UPDATE intake_meta SET revision=0');
-    h.sql.exec('DELETE FROM credentials'); h.sql.exec('DELETE FROM agents');
-    h.sql.exec('DELETE FROM routing_jobs'); h.sql.exec('DELETE FROM fleet_launches'); h.sql.exec('DELETE FROM fleet_sessions');
-    h.sql.exec('DELETE FROM machines');
-    try { h.sql.exec('DELETE FROM session_control_sessions'); } catch {}
-    try { h.sql.exec('DELETE FROM session_control_commands'); } catch {}
-    try { h.sql.exec('DELETE FROM session_lifecycle_observations'); } catch {}
-    try { h.sql.exec('DELETE FROM session_lifecycle_decisions'); } catch {}
-    try { h.sql.exec('DELETE FROM status_observations'); } catch {}
-    try { h.sql.exec('DELETE FROM status_baselines'); } catch {}
+    for (const t of ['tasks', 'grants', 'rules', 'receipts']) sql.exec('DELETE FROM intake_' + t);
+    sql.exec('UPDATE intake_meta SET revision=0');
+    sql.exec('DELETE FROM credentials'); sql.exec('DELETE FROM agents');
+    sql.exec('DELETE FROM routing_jobs'); sql.exec('DELETE FROM fleet_launches'); sql.exec('DELETE FROM fleet_sessions');
+    sql.exec('DELETE FROM machines');
+    try { sql.exec('DELETE FROM session_control_sessions'); } catch {}
+    try { sql.exec('DELETE FROM session_control_commands'); } catch {}
+    try { sql.exec('DELETE FROM session_lifecycle_observations'); } catch {}
+    try { sql.exec('DELETE FROM session_lifecycle_decisions'); } catch {}
+    try { sql.exec('DELETE FROM status_observations'); } catch {}
+    try { sql.exec('DELETE FROM status_baselines'); } catch {}
   });
 });
 
@@ -565,9 +568,10 @@ describe('M14b slice2 machine-authenticated host observations', () => {
   it('resolves a unique native binding beyond 200 machine sessions while retaining duplicate and machine checks', async () => {
     const host = await seedHostMachine('host-many', 'hubt_obs_fixture_many');
     await seedLinkedTask('host-many', 'native-many-target');
-    await inDO(stub(), (h: any) => {
+    await inDO(stub(), (h: any, state:any) => {
+      const seedSql=fixtureSql(h,state);
       const now = new Date().toISOString();
-      const insert = (id: string, machine: string, binding: string | null) => h.sql.exec(
+      const insert = (id: string, machine: string, binding: string | null) => seedSql.exec(
         'INSERT INTO session_control_sessions(id,actor,request_key,request_json,fleet_launch_id,machine_id,engine,mode,state,binding_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
         id, 'demo:assistant', 'many-' + id, '{}', null, machine, 'opencode', 'headless', 'stopped', binding, now, now);
       for (let i = 0; i < 240; i++) {
@@ -791,15 +795,15 @@ describe('M14d caller-scoped durable baseline with complete POST summary', () =>
     await inDO(stub(),(h:any)=>h.ctx.storage.transactionSync(()=>{
       for(let i=0;i<5000;i++) {
         const key='evict-'+i;
-        h.sql.exec("INSERT INTO status_baselines VALUES(?,'{}',0,'2000-01-01T00:00:00.000Z')",key);
-        h.sql.exec("INSERT INTO status_baseline_payloads VALUES(?,'{\"tasks\":{}}')",key);
+        fixtureSql(h).exec("INSERT INTO status_baselines VALUES(?,'{}',0,'2000-01-01T00:00:00.000Z')",key);
+        fixtureSql(h).exec("INSERT INTO status_baseline_payloads VALUES(?,'{\"tasks\":{}}')",key);
       }
     }));
     await postOk('',{});
     const counts=await inDO(stub(),(h:any)=>({
-      metadata:h.sql.exec('SELECT COUNT(*) AS n FROM status_baselines').toArray()[0].n,
-      payloads:h.sql.exec('SELECT COUNT(*) AS n FROM status_baseline_payloads').toArray()[0].n,
-      orphans:h.sql.exec('SELECT COUNT(*) AS n FROM status_baseline_payloads p LEFT JOIN status_baselines b USING(caller_key) WHERE b.caller_key IS NULL').toArray()[0].n,
+      metadata:fixtureSql(h).exec('SELECT COUNT(*) AS n FROM status_baselines').toArray()[0].n,
+      payloads:fixtureSql(h).exec('SELECT COUNT(*) AS n FROM status_baseline_payloads').toArray()[0].n,
+      orphans:fixtureSql(h).exec('SELECT COUNT(*) AS n FROM status_baseline_payloads p LEFT JOIN status_baselines b USING(caller_key) WHERE b.caller_key IS NULL').toArray()[0].n,
     }));
     expect(counts).toEqual({metadata:4501,payloads:4501,orphans:0});
   });

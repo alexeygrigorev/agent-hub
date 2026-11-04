@@ -37,7 +37,9 @@ CREATE TABLE IF NOT EXISTS webhook_routes (
   enabled INTEGER NOT NULL DEFAULT 1,
   created_by TEXT NOT NULL,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  prompt_id TEXT,
+  prompt_vars TEXT
 );
 CREATE TABLE IF NOT EXISTS webhook_rate_buckets (
   webhook_id TEXT NOT NULL,
@@ -64,8 +66,15 @@ CREATE TABLE IF NOT EXISTS session_deliveries (
   UNIQUE(source_id, delivery_key)
 );
 CREATE INDEX IF NOT EXISTS session_deliveries_due ON session_deliveries(status, next_attempt_at);
+CREATE INDEX IF NOT EXISTS session_deliveries_queued_order ON session_deliveries(status, updated_at);
+CREATE INDEX IF NOT EXISTS session_deliveries_active_source ON session_deliveries(status, source, source_id);
 CREATE INDEX IF NOT EXISTS session_deliveries_recent ON session_deliveries(source_id, created_at);
 `;
+
+const PUMP_INDEXES = [
+  ['session_deliveries_queued_order', 'CREATE INDEX IF NOT EXISTS session_deliveries_queued_order ON session_deliveries(status, updated_at)'],
+  ['session_deliveries_active_source', 'CREATE INDEX IF NOT EXISTS session_deliveries_active_source ON session_deliveries(status, source, source_id)'],
+] as const;
 
 const HEADERS = { 'Cache-Control': 'private, no-store' };
 const MAX_SEND_BODY = 16000; // session-control send body limit; renders truncate honestly beyond it
@@ -192,12 +201,24 @@ export class WebhookService {
   init() {
     for (const statement of WEBHOOK_SCHEMA.split(';')) {
       const trimmed = statement.trim();
-      if (trimmed) this.sql.exec(trimmed);
+      if (trimmed && !PUMP_INDEXES.some(([name]) => trimmed.includes('CREATE INDEX IF NOT EXISTS ' + name + ' '))) this.sql.exec(trimmed);
     }
+    // Retained deliveries do not pay a history-index build during startup.
+    if (!this.sql.exec('SELECT id FROM session_deliveries LIMIT 1').toArray().length) this.preparePumpIndexes();
     // Prompt-library binding (intake 19ec91c2 AC10): additive columns.
     for (const column of ['prompt_id TEXT', 'prompt_vars TEXT']) {
       try { this.sql.exec(`ALTER TABLE webhook_routes ADD COLUMN ${column}`); } catch { /* already present */ }
     }
+  }
+
+  private preparePumpIndexes(): void {
+    const present = this.sql.exec("SELECT name FROM pragma_index_list('session_deliveries','main') LIMIT 65").toArray();
+    if (present.length > 64) throw Object.assign(new Error('delivery_index_observation_pending'), { status: 503 });
+    if (PUMP_INDEXES.every(([name]) => present.some(row => row.name === name))) return;
+    // A native transaction boundary invalidates advisory index facts before
+    // a real request-owned build, including after external DDL or rollback.
+    this.txn(() => undefined);
+    this.txn(() => { for (const [,statement] of PUMP_INDEXES) this.sql.exec(statement); });
   }
 
   /** Prompt-library resolver (wired by Hub): slug|id[@version] -> body. */
@@ -235,7 +256,7 @@ export class WebhookService {
 
   async enqueueDelivery(source: string, sourceId: string, deliveryKey: string, targetLabel: string, body: string, pumpNow = true): Promise<{ id: string; status: string; replayed: boolean }> {
     const result = this.txn(() => this.insertDelivery(source, sourceId, deliveryKey, targetLabel, body));
-    if (pumpNow && !result.replayed) { try { await this.pump(); } catch { /* queue retries */ } }
+    if (pumpNow && !result.replayed) { try { await this.processBackground(result.id); } catch { /* queue retries */ } }
     const row: any = this.sql.exec('SELECT status FROM session_deliveries WHERE id = ?', result.id).toArray()[0];
     return { id: result.id, status: row?.status ?? 'pending', replayed: result.replayed };
   }
@@ -350,7 +371,7 @@ export class WebhookService {
 
     // Fast path: attempt delivery inline so live targets receive the payload
     // immediately; failures stay in the durable queue for the alarm pump.
-    try { await this.pump(); } catch { /* queue handles it on the next tick */ }
+    try { await this.processBackground(insert.row.id); } catch { /* queue handles it on the next tick */ }
     const row: any = this.sql.exec('SELECT * FROM session_deliveries WHERE id = ?', insert.row.id).toArray()[0];
     return json({ delivery_id: row.id, status: row.status, replay: false }, 202);
   }
@@ -545,7 +566,7 @@ export class WebhookService {
       this.audit('webhook.test', actor, route.name, { delivery_id: deliveryId });
       return { delivery: this.sql.exec('SELECT * FROM session_deliveries WHERE id = ?', deliveryId).toArray()[0], replayed: false };
     });
-    try { await this.pump(); } catch { /* queue handles it */ }
+    try { await this.processBackground(result.delivery.id); } catch { /* queue handles it */ }
     const fresh: any = this.sql.exec('SELECT * FROM session_deliveries WHERE id = ?', result.delivery.id).toArray()[0];
     return json({
       delivery_id: fresh.id, status: fresh.status, replay: result.replayed,
@@ -638,7 +659,7 @@ export class WebhookService {
    * refusal failures, so a webhook that arrives while the session is down or
    * busy is still delivered when it comes back. */
   private absenceError(error: string): boolean {
-    if (['target_not_found', 'session_not_bound', 'queue_full', 'session_queue_full', 'command_lost',
+    if (['target_not_found', 'session_not_bound', 'queue_full', 'session_queue_full',
       'failed:recipient_not_ready', 'send_transport_error'].includes(error)) return true;
     if (error.startsWith('uncertain:recipient_not_ready')) return true;
     return /^send_(404|409|429|503):/.test(error) || /^send_(404|409|429|503)$/.test(error);
@@ -653,7 +674,7 @@ export class WebhookService {
       } catch { /* narrow standalone WebhookService fixtures have no driver table */ }
     }
     const waitForSession = (delivery.source === 'driver' || isDriverSchedule) && this.absenceError(error);
-    const maxAttempts = waitForSession ? Number.MAX_SAFE_INTEGER
+    const maxAttempts = waitForSession ? ABSENCE_MAX_ATTEMPTS
       : this.absenceError(error) ? ABSENCE_MAX_ATTEMPTS : MAX_ATTEMPTS;
     this.txn(() => {
       const attempts = Number(delivery.attempts || 0) + 1;
@@ -683,30 +704,50 @@ export class WebhookService {
     this.pumping = true;
     let nextDue: number | undefined;
     try {
+      this.preparePumpIndexes();
+      let passes = 0;
       do {
         this.pumpAgain = false;
         nextDue = await this.pumpOnce();
-      } while (this.pumpAgain);
+        passes++;
+      } while (this.pumpAgain && passes < 2);
+      // Sustained ingest cannot keep a single alarm alive indefinitely.
+      if (this.pumpAgain) nextDue = Math.min(nextDue ?? Infinity, this.now() + 15000);
     } finally {
       this.pumping = false;
     }
     return nextDue;
   }
 
+  nextBackgroundWork(): { id: string; dueAt: number } | null {
+    const pending: any=this.sql.exec("SELECT id,next_attempt_at FROM session_deliveries WHERE status='pending' ORDER BY next_attempt_at LIMIT 1").toArray()[0];
+    const queued: any=this.sql.exec("SELECT id,next_attempt_at FROM session_deliveries WHERE status='queued' ORDER BY next_attempt_at LIMIT 1").toArray()[0];
+    const heads: {id:string;dueAt:number}[]=[];
+    if(pending)heads.push({id:pending.id,dueAt:pending.next_attempt_at===null?this.now():Date.parse(pending.next_attempt_at)});
+    if(queued)heads.push({id:queued.id,dueAt:queued.next_attempt_at===null?this.now():Date.parse(queued.next_attempt_at)});
+    return heads.filter(row=>Number.isFinite(row.dueAt)).sort((a,b)=>a.dueAt-b.dueAt)[0]??null;
+  }
+  async processBackground(id: string): Promise<number | null> {
+    if (this.pumping) { this.pumpAgain = true; return this.now() + 15000; }
+    this.pumping = true;
+    try { return (await this.pumpOnce(id))??null; }
+    finally { this.pumping = false; }
+  }
+
   /** One bounded pass over the durable queue. Every mutation is a small
    * transaction on idempotent keys, gated on the row's current status so a
    * stale snapshot can never move a delivery backwards. Returns the next due
    * time (epoch ms) for the alarm. */
-  private async pumpOnce(): Promise<number | undefined> {
+  private async pumpOnce(deliveryId?: string): Promise<number | undefined> {
     const nowMs = this.now();
     let nextDue: number | undefined;
 
     // 1. Queued deliveries: follow the send command's ack ledger.
-    const queued = this.sql.exec(
-      "SELECT * FROM session_deliveries WHERE status = 'queued' ORDER BY updated_at LIMIT ?", this.maxBatch).toArray() as any[];
+    const queued = (deliveryId ? this.sql.exec("SELECT * FROM session_deliveries WHERE id=? AND status='queued'", deliveryId)
+      : this.sql.exec("SELECT * FROM session_deliveries INDEXED BY session_deliveries_queued_order WHERE status = 'queued' ORDER BY updated_at LIMIT ?", this.maxBatch)).toArray() as any[];
     for (const delivery of queued) {
       const command: any = delivery.command_id
-        ? this.sql.exec('SELECT state, ack_json FROM session_control_commands WHERE id = ?', delivery.command_id).toArray()[0]
+        ? this.sql.exec('SELECT state,ack_json,created_at FROM session_control_commands WHERE id = ?', delivery.command_id).toArray()[0]
         : null;
       if (!command) {
         // Command row vanished (retention/cleanup): redeliver with a fresh attempt.
@@ -728,13 +769,17 @@ export class WebhookService {
         this.retryOrFailed(delivery, ack.reason ? `${ack.outcome}:${ack.reason}` : ack.outcome);
         continue;
       }
-      // Still recorded/transported/claimed: wait for the host ack ledger.
+      // One original command deadline, not a perpetual one-minute ACK poll.
+      const queuedAt=Date.parse(command.created_at);
+      if(!Number.isFinite(queuedAt)||nowMs>=queuedAt+600000) { this.retryOrFailed(delivery,'command_ack_timeout'); continue; }
+      // A known command ACK mutation wakes this entity early via its indexed
+      // command_id producer; otherwise the only alarm is the fixed deadline.
     }
 
     // 2. Pending deliveries due now: resolve target and enqueue a send command.
-    const due = this.sql.exec(
-      `SELECT * FROM session_deliveries WHERE status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
-       ORDER BY next_attempt_at LIMIT ?`, this.at(), this.maxBatch).toArray() as any[];
+    const due = (deliveryId ? this.sql.exec("SELECT * FROM session_deliveries WHERE id=? AND status='pending' AND (next_attempt_at IS NULL OR next_attempt_at<=?)", deliveryId,this.at())
+      : this.sql.exec(`SELECT * FROM session_deliveries WHERE status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+       ORDER BY next_attempt_at LIMIT ?`, this.at(), this.maxBatch)).toArray() as any[];
     for (const delivery of due) {
       if (delivery.source === 'driver') {
         const driver: any = this.sql.exec('SELECT phase FROM hub_drivers WHERE id = ?', delivery.source_id).toArray()[0];
@@ -778,6 +823,7 @@ export class WebhookService {
       if (result.status === 200 || result.status === 201) {
         this.txn(() => this.transition(delivery.id, {
           status: 'queued', session_id: session.id, command_id: result.json?.command_id ?? null, last_error: null,
+          next_attempt_at:new Date(nowMs+600000).toISOString(),
         }, 'pending'));
         continue;
       }
@@ -791,24 +837,45 @@ export class WebhookService {
       this.retryOrFailed(delivery, error);
     }
 
+    if (deliveryId) {
+      const delivery: any=this.sql.exec('SELECT status,next_attempt_at,command_id FROM session_deliveries WHERE id=?',deliveryId).toArray()[0];
+      if (delivery?.status==='queued') {
+        const command:any=delivery.command_id?this.sql.exec('SELECT created_at FROM session_control_commands WHERE id=?',delivery.command_id).toArray()[0]:null;
+        const queuedAt=Date.parse(command?.created_at);
+        const deadline=Number.isFinite(queuedAt)?queuedAt+600000:nowMs+15000;
+        const at=new Date(deadline).toISOString();
+        if(delivery.next_attempt_at!==at)this.sql.exec("UPDATE session_deliveries SET next_attempt_at=? WHERE id=? AND status='queued'",at,deliveryId);
+        return deadline;
+      }
+      if (delivery?.status==='pending') {
+        const due=delivery.next_attempt_at===null?nowMs:Date.parse(delivery.next_attempt_at);
+        return Number.isFinite(due)?due:nowMs+60000;
+      }
+      return undefined;
+    }
+
     // 3b. Scheduled deliveries whose schedule was deleted or paused never
     // pile up behind a down session.
     for (const delivery of (this.sql.exec(
-      `SELECT d.id FROM session_deliveries d LEFT JOIN session_schedules s ON s.id = d.source_id
-       WHERE d.status IN ('pending','queued') AND d.source = 'schedule' AND (s.id IS NULL OR s.enabled = 0) LIMIT ?`, this.maxBatch).toArray() as any[])) {
+      `SELECT d.id FROM (SELECT id,source_id FROM (SELECT id,source_id FROM session_deliveries INDEXED BY session_deliveries_active_source
+        WHERE status='pending' AND source='schedule' LIMIT ?)
+        UNION ALL SELECT id,source_id FROM (SELECT id,source_id FROM session_deliveries INDEXED BY session_deliveries_active_source WHERE status='queued' AND source='schedule' LIMIT ?)) d
+       LEFT JOIN session_schedules s ON s.id = d.source_id WHERE s.id IS NULL OR s.enabled=0`, this.maxBatch, this.maxBatch).toArray() as any[])) {
       this.txn(() => this.transition(delivery.id, { status: 'failed', last_error: 'schedule_removed', next_attempt_at: null }, ['pending', 'queued']));
     }
     // 3. Pending/queued deliveries whose route was deleted: fail them honestly.
     for (const delivery of (this.sql.exec(
-      `SELECT d.id, d.target_label FROM session_deliveries d LEFT JOIN webhook_routes r ON r.id = d.source_id
-       WHERE d.status IN ('pending','queued') AND d.source = 'webhook' AND r.id IS NULL LIMIT ?`, this.maxBatch).toArray() as any[])) {
+      `SELECT d.id,d.target_label FROM (SELECT id,source_id,target_label FROM (SELECT id,source_id,target_label FROM session_deliveries INDEXED BY session_deliveries_active_source
+        WHERE status='pending' AND source='webhook' LIMIT ?)
+        UNION ALL SELECT id,source_id,target_label FROM (SELECT id,source_id,target_label FROM session_deliveries INDEXED BY session_deliveries_active_source WHERE status='queued' AND source='webhook' LIMIT ?)) d
+       LEFT JOIN webhook_routes r ON r.id=d.source_id WHERE r.id IS NULL`, this.maxBatch, this.maxBatch).toArray() as any[])) {
       this.txn(() => this.transition(delivery.id, { status: 'failed', last_error: 'route_deleted', next_attempt_at: null }, ['pending', 'queued']));
     }
 
     const next: any = this.sql.exec(
-      "SELECT MIN(next_attempt_at) AS due FROM session_deliveries WHERE status = 'pending'").toArray()[0];
-    if (next?.due) {
-      const dueMs = Date.parse(next.due);
+      "SELECT next_attempt_at AS due FROM session_deliveries WHERE status='pending' ORDER BY next_attempt_at LIMIT 1").toArray()[0];
+    if (next) {
+      const dueMs = next.due === null ? nowMs : Date.parse(next.due);
       if (Number.isFinite(dueMs)) nextDue = Math.max(nowMs, dueMs);
     }
     return nextDue;

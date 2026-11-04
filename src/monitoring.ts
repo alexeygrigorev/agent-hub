@@ -1,3 +1,4 @@
+import { readPlacementPressure, type PlacementPressureSnapshot } from './placement-pressure';
 /**
  * M14/Addendum 6: Disk space monitoring, alert episodes and host ingestion.
  *
@@ -15,6 +16,8 @@ import type { LivenessService } from './liveness';
 import type { StatusMachineAuth } from './status';
 import type { IntakeService } from './intake';
 import { isValidMachineId } from './machine-id';
+import type { WriteWatch } from './write-watch';
+type DiskPruneRow={id:string;machine_id:string;observed_at_ms:number;source_rowid:number};
 
 export const MONITORING_SCHEMA = `
 CREATE TABLE IF NOT EXISTS disk_observations (
@@ -344,6 +347,8 @@ export type HostReservation = {
 export type HostPlacement = {
   machine_pressure: boolean;
   global_pressure: boolean;
+  evidence_truncated?: boolean;
+  evidence_unknown?: boolean;
   reason: string | null;
 };
 
@@ -363,7 +368,8 @@ export type HostHealthSummary = {
 
 type TrendSample = {timeMs:number;usedBytes:number;totalBytes:number;percent:number};
 export class MonitoringService {
-  private trendCache = new Map<string,{revision:string;samples:Map<string,TrendSample[]>}>();
+  private trendCache = new Map<string,{revision:string;samples:Map<string,TrendSample[]>;limited:boolean}>();
+  private diskCleanupCache?:{stamp:string;rows:DiskPruneRow[]};
   constructor(
     private sql: SqlStorage,
     private tx: <T>(fn: () => T) => T,
@@ -371,10 +377,14 @@ export class MonitoringService {
     private notifyAlertFn?: (alert: any) => Promise<void>,
     private intake?: IntakeService,
     public now: () => number = Date.now,
+    // Optional trusted owner of this exact SQL handle, supplied together by
+    // Hub. Unwatched/ad-hoc handles must omit it and always re-observe keys.
+    private writes?: WriteWatch,
   ) {}
 
   init(): void {
     this.trendCache.clear();
+    this.diskCleanupCache=undefined;
     for (const stmt of MONITORING_SCHEMA.split(';')) {
       const trimmed = stmt.trim();
       if (trimmed) this.sql.exec(trimmed);
@@ -407,10 +417,10 @@ export class MonitoringService {
       INSERT INTO disk_trend_samples ${project('NEW.', '')}; END`);
     this.sql.exec('CREATE TRIGGER IF NOT EXISTS disk_trend_delete AFTER DELETE ON disk_observations BEGIN DELETE FROM disk_trend_samples WHERE id=OLD.id; END');
     if (!this.sql.exec('SELECT id FROM disk_trend_projection_meta WHERE id=1').toArray().length) {
-      this.sql.exec(`INSERT OR REPLACE INTO disk_trend_samples ${project('d.', 'disk_observations d, ')}`);
-      this.sql.exec(`INSERT INTO disk_trend_revision SELECT machine_id,lower(hex(randomblob(16))) FROM (SELECT DISTINCT machine_id FROM disk_observations) WHERE 1
-        ON CONFLICT(machine_id) DO UPDATE SET revision=excluded.revision`);
-      this.sql.exec('INSERT INTO disk_trend_projection_meta VALUES(1)');
+      // Only an empty source certifies a new write-through projection. Legacy
+      // retained history is operator work, never constructor JSON repair.
+      if(!this.sql.exec('SELECT 1 FROM disk_observations INDEXED BY idx_disk_obs_machine LIMIT 1').toArray().length)
+        this.sql.exec('INSERT INTO disk_trend_projection_meta VALUES(1)');
     }
   }
 
@@ -456,7 +466,16 @@ export class MonitoringService {
 
       const validated = this.validatePayload(body, auth);
 
-      const result = this.tx(() => this.recordObservation(validated, auth));
+      // The complete source proof belongs to this explicit write request.
+      // Cache only after commit; rollback/foreign writes/schema changes lose
+      // the exact watcher stamp and force a new bounded observation.
+      let rows:DiskPruneRow[]=[];
+      let result:any;
+      try {
+        result=this.tx(()=>{rows=this.diskCleanupRows();return this.recordObservation(validated,auth,rows);});
+      } catch(error) {this.diskCleanupCache=undefined;throw error;}
+      if(this.writes&&rows.reduce((sum,row)=>sum+96+2*(row.id.length+row.machine_id.length),0)<=256*1024)this.diskCleanupCache={stamp:this.writes.stamp('disk_observations'),rows};
+      else this.diskCleanupCache=undefined;
       return json(result, 200);
     } catch (e: any) {
       const code = e?.code || 'internal_error';
@@ -685,7 +704,7 @@ export class MonitoringService {
   }
 
   /** Record observation, handle alert and task episodes, and enforce storage bounds. */
-  private recordObservation(payload: DiskObservationPayload, auth: StatusMachineAuth): any {
+  private recordObservation(payload: DiskObservationPayload, auth: StatusMachineAuth, rows:DiskPruneRow[]): any {
     const now = this.now();
     const nowIso = new Date(now).toISOString();
     const id = crypto.randomUUID();
@@ -693,8 +712,8 @@ export class MonitoringService {
     const reporter = auth.kind === 'host' ? `host:${auth.tokenId}` : `admin:${auth.actor}`;
 
     // 1. Store observation
-    this.sql.exec(
-      'INSERT INTO disk_observations(id, machine_id, observed_at, observed_at_ms, received_at, payload_json, reporter) VALUES(?,?,?,?,?,?,?)',
+    const inserted=this.sql.exec(
+      'INSERT INTO disk_observations(id, machine_id, observed_at, observed_at_ms, received_at, payload_json, reporter) VALUES(?,?,?,?,?,?,?) RETURNING rowid AS source_rowid',
       id,
       payload.machine_id,
       payload.observed_at,
@@ -702,7 +721,11 @@ export class MonitoringService {
       nowIso,
       JSON.stringify(payload),
       reporter,
-    );
+    ).toArray();
+    const sourceRowid=inserted[0]?.source_rowid;
+    if(inserted.length!==1||!Number.isSafeInteger(sourceRowid)||Number(sourceRowid)<1)fail('disk_cleanup_observation_limited',503);
+
+    rows.push({id,machine_id:payload.machine_id,observed_at_ms:observedMs,source_rowid:Number(sourceRowid)});
 
     // 2. Reconcile episodes for each filesystem
     const episodesSummary: any[] = [];
@@ -712,7 +735,7 @@ export class MonitoringService {
     }
 
     // 3. Enforce storage bounds & retention
-    this.pruneStorage(payload.machine_id, now);
+    this.pruneStorage(payload.machine_id, now, rows);
 
     return {
       ok: true,
@@ -1059,51 +1082,55 @@ export class MonitoringService {
     }
   }
 
-  /** Prune storage to bounded limits. */
-  private pruneStorage(machineId: string, now: number): void {
-    try {
-      const retentionCutoff = now - DISK_LIMITS.retentionDays * 86400000;
-      this.sql.exec('DELETE FROM disk_observations WHERE observed_at_ms < ?', retentionCutoff);
-
-      // Per-machine cap
-      const machineRows = this.sql
-        .exec(
-          'SELECT id FROM disk_observations WHERE machine_id = ? ORDER BY observed_at_ms DESC',
-          machineId,
-        )
-        .toArray() as any[];
-      if (machineRows.length > DISK_LIMITS.maxHistoryPerMachine) {
-        const toDelete = machineRows.slice(DISK_LIMITS.maxHistoryPerMachine).map(r => r.id);
-        const placeholders = toDelete.map(() => '?').join(',');
-        this.sql.exec(`DELETE FROM disk_observations WHERE id IN (${placeholders})`, ...toDelete);
-      }
-
-      // Global cap
-      const totalCount = Number(
-        (this.sql.exec('SELECT COUNT(*) AS n FROM disk_observations').toArray()[0] as any)?.n ?? 0,
-      );
-      if (totalCount > DISK_LIMITS.maxGlobalObservations) {
-        this.sql.exec(
-          `DELETE FROM disk_observations WHERE id IN (
-            SELECT id FROM disk_observations ORDER BY observed_at_ms ASC LIMIT ?
-          )`,
-          totalCount - DISK_LIMITS.maxGlobalObservations,
-        );
-      }
-    } catch {
-      // Best-effort storage trim
+  /** Complete bounded keys only, before retention/host filtering or sorting. */
+  private diskCleanupRows():DiskPruneRow[] {
+    const stamp=this.writes?.stamp('disk_observations');
+    if(stamp!==undefined&&this.diskCleanupCache?.stamp===stamp)return this.diskCleanupCache.rows.map(row=>({...row}));
+    const rows=this.sql.exec('SELECT rowid AS source_rowid,id,machine_id,observed_at_ms FROM disk_observations NOT INDEXED ORDER BY rowid LIMIT 1001').toArray() as DiskPruneRow[];
+    if(rows.length>DISK_LIMITS.maxGlobalObservations)fail('disk_cleanup_observation_limited',503);
+    let bytes=0;
+    for(const row of rows) {
+      if(typeof row.id!=='string'||typeof row.machine_id!=='string'||!Number.isSafeInteger(row.source_rowid)||row.source_rowid<1||!Number.isFinite(row.observed_at_ms))fail('disk_cleanup_observation_limited',503);
+      bytes+=96+2*(row.id.length+row.machine_id.length);
+      if(bytes>256*1024)fail('disk_cleanup_observation_limited',503);
     }
+    return rows;
+  }
+
+  /** Exact old retention/cap semantics over a proven complete small source.
+   * Every mutation is an ID PK operation; no global history index is built. */
+  private pruneStorage(machineId:string,now:number,rows:DiskPruneRow[]):void {
+    const remove=(selected:DiskPruneRow[])=>{
+      if(!selected.length)return;
+      const deleted=this.sql.exec(`DELETE FROM disk_observations WHERE id IN (${selected.map(()=>'?').join(',')}) RETURNING id`,...selected.map(row=>row.id)).toArray();
+      const ids=new Set(deleted.map(row=>String(row.id)));
+      for(let i=rows.length-1;i>=0;i--)if(ids.has(rows[i].id))rows.splice(i,1);
+    };
+    const oldest=(a:DiskPruneRow,b:DiskPruneRow)=>a.observed_at_ms-b.observed_at_ms||a.source_rowid-b.source_rowid;
+    remove(rows.filter(row=>row.observed_at_ms<now-DISK_LIMITS.retentionDays*86400000).sort(oldest).slice(0,100));
+    remove(rows.filter(row=>row.machine_id===machineId).sort((a,b)=>oldest(b,a)).slice(DISK_LIMITS.maxHistoryPerMachine,DISK_LIMITS.maxHistoryPerMachine+100));
+    remove([...rows].sort((a,b)=>oldest(b,a)).slice(DISK_LIMITS.maxGlobalObservations,DISK_LIMITS.maxGlobalObservations+100));
   }
 
   /** Compute growth trend per day for a filesystem on a machine. */
   /** Read numeric trend inputs once per host, never full consumer histories. */
   private trendSamples(machineId: string, now: number): Map<string, TrendSample[]> | null {
     try {
+      if(!this.sql.exec('SELECT id FROM disk_trend_projection_meta WHERE id=1').toArray().length)return null;
       const revision=String(this.sql.exec('SELECT revision FROM disk_trend_revision WHERE machine_id=?',machineId).toArray()[0]?.revision ?? 'initial');
       let cached=this.trendCache.get(machineId);
       if(!cached || cached.revision!==revision) {
+        // Configured retention is200observations with at most32filesystems
+        // each. Reject legacy excess from the covering host index first;
+        // never traverse its expanded historical sample projection.
+        const source=this.sql.exec('SELECT 1 FROM disk_observations INDEXED BY idx_disk_obs_machine WHERE machine_id=? LIMIT ?',machineId,DISK_LIMITS.maxHistoryPerMachine+1).toArray();
+        if(source.length>DISK_LIMITS.maxHistoryPerMachine) {
+          if(this.trendCache.size>=128)this.trendCache.clear();
+          this.trendCache.set(machineId,{revision,samples:new Map(),limited:true});return null;
+        }
+        const maxSamples=DISK_LIMITS.maxHistoryPerMachine*32;
         const rows=this.sql.exec(`SELECT id,observed_at_ms,mount_point,used_bytes,total_bytes,percent
-          FROM disk_trend_samples WHERE machine_id=? ORDER BY observed_at_ms,observation_rowid,ordinal`,machineId).toArray() as any[];
+          FROM disk_trend_samples INDEXED BY disk_trend_machine_time WHERE machine_id=? ORDER BY observed_at_ms,observation_rowid,ordinal LIMIT ${maxSamples+1}`,machineId).toArray() as any[];
         const samples=new Map<string,TrendSample[]>(),seen=new Set<string>();
         for(const row of rows) {
           const key=JSON.stringify([row.id,row.mount_point]);
@@ -1114,12 +1141,13 @@ export class MonitoringService {
           values.push({timeMs:row.observed_at_ms,usedBytes:row.used_bytes,totalBytes:row.total_bytes,percent:row.percent});
           samples.set(row.mount_point,values);
         }
-        cached={revision,samples};
+        cached={revision,samples,limited:rows.length>maxSamples};
         if(this.trendCache.size>=128) this.trendCache.clear();
         this.trendCache.set(machineId,cached);
       }
       // Cache retained facts only. The window and freshness advance on every
       // call, and an earlier explicit now can still see its original history.
+      if(cached.limited)return null;
       return new Map([...cached.samples].map(([mount,samples])=>[mount,samples.filter(s=>s.timeMs>=now-DISK_LIMITS.maxTrendWindowMs)]));
     } catch { return null; }
   }
@@ -1204,16 +1232,32 @@ export class MonitoringService {
 
   /** Complete disk status with trends and active episodes. */
   getDiskStatus(now: number = this.now(), machineFilter?: string): any {
-    const machinesQuery = machineFilter
-      ? this.sql.exec('SELECT DISTINCT machine_id FROM disk_observations WHERE machine_id = ?', machineFilter).toArray()
-      : this.sql.exec('SELECT DISTINCT machine_id FROM disk_observations').toArray();
+    const machinesQuery:any[]=[];let hostsLimited=false;
+    if(machineFilter) {
+      const row=this.sql.exec('SELECT machine_id FROM disk_observations INDEXED BY idx_disk_obs_machine WHERE machine_id=? LIMIT 1',machineFilter).toArray()[0];
+      if(row)machinesQuery.push(row);
+    } else {
+      // One bounded statement performs the same leading-key seeks. Never
+      // DISTINCT/GROUP the retained sample index; the65thnon-null head is
+      // solely an explicit incomplete-list sentinel.
+      const heads=this.sql.exec(`WITH RECURSIVE machine_heads(machine_id,ordinal) AS (
+        SELECT (SELECT machine_id FROM disk_observations INDEXED BY idx_disk_obs_machine ORDER BY machine_id LIMIT 1),1
+        UNION ALL
+        SELECT (SELECT machine_id FROM disk_observations INDEXED BY idx_disk_obs_machine
+          WHERE machine_id>machine_heads.machine_id ORDER BY machine_id LIMIT 1),ordinal+1
+        FROM machine_heads WHERE machine_id IS NOT NULL AND ordinal<65)
+        SELECT machine_id FROM machine_heads WHERE machine_id IS NOT NULL ORDER BY ordinal`).toArray();
+      hostsLimited=heads.length>64;
+      machinesQuery.push(...heads.slice(0,64));
+
+    }
 
     const machineList: any[] = [];
 
     for (const mRow of machinesQuery as any[]) {
       const mid = mRow.machine_id;
       const latestRow: any = this.sql
-        .exec('SELECT * FROM disk_observations WHERE machine_id = ? ORDER BY observed_at_ms DESC LIMIT 1', mid)
+        .exec('SELECT * FROM disk_observations INDEXED BY idx_disk_obs_machine WHERE machine_id = ? ORDER BY observed_at_ms DESC LIMIT 1', mid)
         .toArray()[0];
       if (!latestRow) continue;
 
@@ -1240,7 +1284,7 @@ export class MonitoringService {
 
       const openEpisodes = this.sql
         .exec(
-          'SELECT episode_key, mount_point, state, opened_at, last_updated_at, alert_id, intake_task_id FROM disk_episodes WHERE machine_id = ? AND resolved_at IS NULL',
+          'SELECT episode_key, mount_point, state, opened_at, last_updated_at, alert_id, intake_task_id FROM disk_episodes INDEXED BY idx_disk_episodes_open WHERE machine_id = ? AND resolved_at IS NULL LIMIT 129',
           mid,
         )
         .toArray();
@@ -1254,13 +1298,17 @@ export class MonitoringService {
         observed_at: latestRow.observed_at,
         freshness,
         filesystems: filesystemsWithTrend,
-        open_episodes: openEpisodes,
+        open_episodes: openEpisodes.slice(0,128),
+        observation_pending:samples===null||openEpisodes.length>128,
+        open_episodes_observation_pending:openEpisodes.length>128,
       });
     }
 
     return {
       snapshot_at: new Date(now).toISOString(),
       machines: machineList,
+      observation_pending:hostsLimited||machineList.some(m=>m.observation_pending),
+      machine_list_observation_pending:hostsLimited,
     };
   }
 
@@ -1809,6 +1857,23 @@ export class MonitoringService {
 
       const detail = `Supervisor ${svc.service_id} on ${machineId}: worker is ${svc.worker}, status age ${effectiveAgeAtNowS !== null ? effectiveAgeAtNowS + 's' : 'unknown'} (${effectiveReason})`;
 
+      // Persist source/identity transitions, not the wall-clock age derived on
+      // every GET. The durable row is the comparison authority, so rollback
+      // cannot leave an in-memory "already persisted" marker behind.
+      let previous:any=null;
+      try { previous=JSON.parse(row?.details_json??'null'); } catch { /* legacy/malformed details need one checkpoint */ }
+      if (row && row.resolved_at===null && row.state===problemState &&
+          previous?.worker===svc.worker && previous?.observed_at===svc.observed_at &&
+          previous?.reason===effectiveReason && previous?.source_reason===svc.reason &&
+          previous?.source_status_file_age_s===(svc.status_file_age_s??null) &&
+          previous?.outer_observed_at_ms===outerObsMs) {
+        return {episode_key:episodeKey,action:'unchanged',state:problemState};
+      }
+      const detailsJson=JSON.stringify({
+        worker:svc.worker,status_file_age_s:effectiveAgeAtNowS,observed_at:svc.observed_at,reason:effectiveReason,
+        source_status_file_age_s:svc.status_file_age_s??null,source_reason:svc.reason,outer_observed_at_ms:outerObsMs,
+      });
+
       if (!row || row.resolved_at !== null) {
         let alertId: number | null = null;
         if (this.liveness) {
@@ -1823,13 +1888,6 @@ export class MonitoringService {
             }
           }
         }
-
-        const detailsJson = JSON.stringify({
-          worker: svc.worker,
-          status_file_age_s: effectiveAgeAtNowS,
-          observed_at: svc.observed_at,
-          reason: effectiveReason,
-        });
 
         this.sql.exec(
           `INSERT INTO supervisor_episodes (episode_key, machine_id, service_id, state, opened_at, last_updated_at, resolved_at, alert_id, details_json)
@@ -1860,12 +1918,6 @@ export class MonitoringService {
             detail,
           });
         }
-        const detailsJson = JSON.stringify({
-          worker: svc.worker,
-          status_file_age_s: effectiveAgeAtNowS,
-          observed_at: svc.observed_at,
-          reason: effectiveReason,
-        });
         this.sql.exec(
           'UPDATE supervisor_episodes SET state = ?, last_updated_at = ?, details_json = ? WHERE episode_key = ?',
           problemState,
@@ -1895,22 +1947,24 @@ export class MonitoringService {
   getHostHealthStatus(
     now: number = this.now(),
     machineFilter?: string,
-  ): { snapshot_at: string; machines: HostHealthSummary[] } {
+  ): { snapshot_at: string; machines: HostHealthSummary[]; observation_pending:boolean } {
     let query = 'SELECT machine_id, observed_at, observed_at_ms, payload_json FROM host_health_observations';
     const params: any[] = [];
     if (machineFilter) {
       query += ' WHERE machine_id = ?';
       params.push(machineFilter);
     }
-    query += ' ORDER BY machine_id ASC';
+    query += machineFilter?' ORDER BY machine_id ASC LIMIT 1':' ORDER BY machine_id ASC LIMIT 65';
 
     let rows: any[] = [];
     try {
       rows = this.sql.exec(query, ...params).toArray() as any[];
     } catch {
-      return { snapshot_at: new Date(now).toISOString(), machines: [] };
+      return { snapshot_at: new Date(now).toISOString(), machines: [],observation_pending:true };
     }
 
+    let observationPending=!machineFilter&&rows.length>64;
+    rows=rows.slice(0,machineFilter?1:64);
     const machines: HostHealthSummary[] = [];
     // Placement pressure is read-only visibility here: queued holds (>5 min),
     // hard rejections recorded at reserve time, and recent terminal failures
@@ -1925,7 +1979,7 @@ export class MonitoringService {
       try {
         payload = JSON.parse(r.payload_json);
       } catch {
-        continue;
+        observationPending=true;continue;
       }
       const ageMs = now - r.observed_at_ms;
       const freshness: 'fresh' | 'stale' | 'unavailable' =
@@ -2028,40 +2082,16 @@ export class MonitoringService {
     return {
       snapshot_at: new Date(now).toISOString(),
       machines,
+      observation_pending:observationPending,
     };
   }
 
   /** Read-only placement-pressure snapshot shared by the health projection.
    * Queued holds older than 5 minutes, hard rejections recorded at reserve
    * time (24h), and terminal failures with memory/capacity reasons (24h,
-   * per machine). Fail closed to "no pressure" on any storage error. */
-  private readPlacementPressure(now: number): { queuedTotal: number; queuedHeld: number; recentRejects: number; failedByMachine: Map<string, number>; failedTotal: number } {
-    let queuedTotal = 0, queuedHeld = 0, recentRejects = 0, failedTotal = 0;
-    const failedByMachine = new Map<string, number>();
-    try {
-      const heldBefore = new Date(now - 5 * 60000).toISOString();
-      queuedTotal = Number(this.sql.exec("SELECT COUNT(*) AS n FROM fleet_launches WHERE state = 'queued'").toArray()[0]?.n ?? 0);
-      queuedHeld = Number(this.sql.exec("SELECT COUNT(*) AS n FROM fleet_launches WHERE state = 'queued' AND created_at <= ?", heldBefore).toArray()[0]?.n ?? 0);
-    } catch { queuedHeld = 0; }
-    try {
-      recentRejects = Number(this.sql.exec('SELECT COUNT(*) AS n FROM placement_rejections WHERE created_at_ms >= ?', now - 24 * 3600000).toArray()[0]?.n ?? 0);
-    } catch { recentRejects = 0; }
-    try {
-      const dayAgoIso = new Date(now - 24 * 3600000).toISOString();
-      const rows = this.sql.exec("SELECT machine_id, exit_reason, launch_error_json FROM fleet_launches WHERE state = 'failed' AND updated_at >= ?", dayAgoIso).toArray() as any[];
-      for (const row of rows) {
-        const reasons: string[] = [];
-        if (typeof row.exit_reason === 'string' && row.exit_reason) reasons.push(row.exit_reason);
-        try {
-          const diag = JSON.parse(row.launch_error_json || 'null');
-          if (diag && typeof diag.reason === 'string' && diag.reason) reasons.push(diag.reason);
-        } catch { /* ignore */ }
-        if (!reasons.some((r) => r === 'launcher_memory_reserve' || r === 'account_capacity' || r === 'account_concurrency' || r === 'machine_capacity')) continue;
-        failedTotal++;
-        if (row.machine_id) failedByMachine.set(String(row.machine_id), (failedByMachine.get(String(row.machine_id)) ?? 0) + 1);
-      }
-    } catch { failedTotal = 0; }
-    return { queuedTotal, queuedHeld, recentRejects, failedByMachine, failedTotal };
+   * per machine). Samples carry explicit partial/unknown evidence flags. */
+  private readPlacementPressure(now: number): PlacementPressureSnapshot {
+    return readPlacementPressure(this.sql, now);
   }
 
   // The canonical FleetService projection is injected by Hub. This service
@@ -2072,7 +2102,7 @@ export class MonitoringService {
     return this.resourceProjection?.(machineId) ?? { mem_avail_mb: null, reserved_mb: null, floor_mb: MEMORY_FLOOR_MB, next_slot_mb: NEXT_SLOT_MB, headroom_mb: null, headroom_ok: null, stale_telemetry: true, observed_at: null };
   }
 
-  private placementFor(machineId: string, pressure: { queuedTotal: number; queuedHeld: number; recentRejects: number; failedByMachine: Map<string, number>; failedTotal: number }, reservation: HostReservation | null): HostPlacement {
+  private placementFor(machineId: string, pressure: PlacementPressureSnapshot, reservation: HostReservation | null): HostPlacement {
     const overdrawn = Boolean(reservation && reservation.headroom_mb !== null && reservation.headroom_mb < 0 && !reservation.stale_telemetry);
     const hostReasons = new Set(['disk_floor', 'launcher_memory_reserve', 'machine_capacity', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking']);
     const reasons = new Set<string>();
@@ -2081,7 +2111,7 @@ export class MonitoringService {
     let hasMachineHoldReason = false;
     // Show the actual current route reasons, including CPU budget numbers.
     try {
-      const holds = this.sql.exec(`SELECT h.rejected_json FROM fleet_memory_holds h JOIN fleet_launches l ON l.id=h.launch_id WHERE l.state='queued' ORDER BY l.created_at LIMIT 20`).toArray();
+      const holds = this.sql.exec(`SELECT h.rejected_json FROM (SELECT id FROM fleet_launches INDEXED BY fleet_launch_expiry WHERE state='queued' ORDER BY created_at LIMIT 20) l JOIN fleet_memory_holds h ON h.launch_id=l.id`).toArray();
       hasHoldRows = holds.length > 0;
       for (const h of holds) for (const r of JSON.parse(String(h.rejected_json))) {
         if (hostReasons.has(String(r.reason))) {
@@ -2098,15 +2128,18 @@ export class MonitoringService {
     const machinePressure = overdrawn || (pressure.queuedTotal > 0 && hasMachineHoldReason);
     const globalPressure = overdrawn || activeQueuedPressure;
     const bits: string[] = [];
+    const countLabel = (source: keyof typeof pressure.truncated, value: number) => pressure.truncated[source] ? `at least ${value}` : String(value);
     if (machinePressure || globalPressure) {
       if (reasons.size) bits.push([...reasons].join(', '));
-      if (pressure.queuedTotal > 0) bits.push(`${pressure.queuedTotal} launch(es) held queued for placement admission (${pressure.queuedHeld} >5 min)`);
-      if (overdrawn && pressure.recentRejects > 0) bits.push(`${pressure.recentRejects} launch rejection(s) for placement admission in 24h`);
+      if (pressure.queuedTotal > 0) bits.push(`${countLabel('queued', pressure.queuedTotal)} launch(es) held queued for placement admission (${countLabel('queued', pressure.queuedHeld)} >5 min)`);
+      if (overdrawn && pressure.recentRejects > 0) bits.push(`${countLabel('rejections', pressure.recentRejects)} launch rejection(s) for placement admission in 24h`);
       const machineFailures = pressure.failedByMachine.get(machineId) ?? 0;
-      if (overdrawn && machineFailures > 0) bits.push(`${machineFailures} terminal failure(s) for placement admission on this host in 24h`);
-      else if (overdrawn && pressure.failedTotal > 0) bits.push(`${pressure.failedTotal} terminal failure(s) for placement admission elsewhere in 24h`);
+      if (overdrawn && machineFailures > 0) bits.push(`${countLabel('failures', machineFailures)} terminal failure(s) for placement admission on this host in 24h`);
+      else if (overdrawn && pressure.failedTotal > 0) bits.push(`${countLabel('failures', pressure.failedTotal)} terminal failure(s) for placement admission elsewhere in 24h`);
     }
-    return { machine_pressure: machinePressure, global_pressure: globalPressure, reason: bits.length ? bits.join('; ') : null };
+    return { machine_pressure: machinePressure, global_pressure: globalPressure,
+      evidence_truncated: Object.values(pressure.truncated).some(Boolean), evidence_unknown: Object.values(pressure.unknown).some(Boolean),
+      reason: bits.length ? bits.join('; ') : null };
   }
 
   /** Host health is never 'ok' while launches are rejected/held for memory
@@ -2123,13 +2156,16 @@ export class MonitoringService {
 
   /** Condensed summary projection for StatusService (hub status / needs-attention). */
   getStatusSummary(now: number = this.now()): {
+    observation_pending:boolean;
     filesystems: any[];
     host_health: HostHealthSummary[];
     needs_attention: any[];
     categories_entry: any;
   } {
     const full = this.getDiskStatus(now);
+    const diskObservationPending=full.observation_pending===true;
     const healthStatus = this.getHostHealthStatus(now);
+    const observationPending=diskObservationPending||healthStatus.observation_pending;
     const filesystems: any[] = [];
     const hostHealth: HostHealthSummary[] = [];
     const needsAttention: any[] = [];
@@ -2290,6 +2326,7 @@ export class MonitoringService {
           error: fs.error ?? null,
           observed_at: m.observed_at,
           freshness: m.freshness,
+          observation_pending:m.observation_pending===true,
           growth_per_day_bytes: fs.trend?.growth_bytes_per_day ?? null,
           growth_per_day_pct: fs.trend?.growth_pct_per_day ?? null,
           trend_state: fs.trend?.state ?? 'unknown',
@@ -2325,14 +2362,16 @@ export class MonitoringService {
       ? 'stale'
       : 'fresh';
 
-    const coverage = !filesystems.length
+    const coverage = observationPending ? 'partial' : !filesystems.length
       ? 'unavailable'
       : (hasErrors || anyStale || anyUnavailable)
       ? 'partial'
       : 'complete';
 
     let reason = 'linux_stdlib_statvfs_and_bounded_top_consumers';
-    if (!filesystems.length) {
+    if(observationPending) {
+      reason=diskObservationPending?'disk_observation_limited':'host_health_observation_limited';
+    } else if (!filesystems.length) {
       reason = 'no_disk_observations_recorded';
     } else if (hasErrors && (anyStale || anyUnavailable)) {
       reason = 'filesystem_errors_reported_and_host_stale';
@@ -2342,17 +2381,19 @@ export class MonitoringService {
       reason = 'one_or_more_hosts_stale_or_unreachable';
     }
 
-    const state = !filesystems.length
+    const state = observationPending ? 'partially_collected_disk_monitoring' : !filesystems.length
       ? 'unknown_not_collected'
       : hasErrors
       ? 'collected_disk_monitoring_with_errors'
       : 'collected_disk_monitoring';
 
     return {
+      observation_pending:observationPending,
       filesystems,
       host_health: hostHealth,
       needs_attention: needsAttention,
       categories_entry: {
+        observation_pending:observationPending,
         state,
         source: 'host_disk_monitor_stdlib_statvfs',
         observed_at: latestObservedIso,

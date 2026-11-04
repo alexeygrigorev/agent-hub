@@ -1,3 +1,4 @@
+import { runningCredentialSessionPage, credentialSessionCursor } from './credential-session-page';
 /** Cross-device session messaging (docs/SESSION-MESSAGING.md; intakes 4fc83e80,
  * a3227276 AC4/AC6).
  *
@@ -14,7 +15,7 @@
  * kind `message`; the bound host delivers it through the native mailbox and,
  * for `delivery=tui`, the native deliver guard (at most once into the TUI).
  */
-import { revokeNativeWorkerCredentials } from './worker-access';
+import { revokeNativeWorkerCredentials,credentialActorRows } from './worker-access';
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { generateUlid } from './bus';
 import { backfillOnce } from './sql-probes';
@@ -59,7 +60,7 @@ export function initSessionMessaging(sql: SqlStorage): void {
     credential_family TEXT, delegates_json TEXT NOT NULL DEFAULT '[]', forward_session_id TEXT,
     created_by TEXT NOT NULL, created_at TEXT NOT NULL, disabled_at TEXT)`);
   backfillOnce(sql, 'named_agents:agents', () => sql.exec(`INSERT OR IGNORE INTO named_agents (name, display, created_by, created_at)
-    SELECT tag, tag, 'hub:migration', COALESCE(registered_at, '') FROM agents WHERE project = 'agent'`));
+    SELECT tag, tag, 'hub:migration', COALESCE(registered_at, '') FROM agents WHERE project = 'agent'`), false, ['agents']);
   sql.exec(`CREATE TRIGGER IF NOT EXISTS named_agent_registry_insert AFTER INSERT ON agents WHEN NEW.project = 'agent' BEGIN
     INSERT OR IGNORE INTO named_agents (name, display, created_by, created_at) VALUES (NEW.tag, NEW.tag, 'hub:registry', COALESCE(NEW.registered_at, ''));
     END`);
@@ -84,8 +85,9 @@ export function initSessionMessaging(sql: SqlStorage): void {
   sql.exec('CREATE INDEX IF NOT EXISTS message_events_at ON message_events(at)');
   // Session credential lookups go by registry_actor; never scan credentials.
   sql.exec('CREATE INDEX IF NOT EXISTS credentials_registry_actor ON credentials(registry_actor)');
-  // The credential poll lists agent identities per machine; never scan agents (intake e8a22f4c).
-  sql.exec('CREATE INDEX IF NOT EXISTS idx_agents_project_machine ON agents(project, machine_id)');
+  // Reuse the deployed expression project/tag index; no full-registry index
+  // build is needed to resume an existing object safely.
+  sql.exec('CREATE TABLE IF NOT EXISTS session_credential_scan(key TEXT PRIMARY KEY,cursor TEXT NOT NULL)');
   const commandCols = new Set(sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='session_control_commands'").toArray().length
     ? sql.exec('PRAGMA table_info(session_control_commands)').toArray().map((c: any) => String(c.name)) : []);
   if (commandCols.size && !commandCols.has('not_before')) sql.exec('ALTER TABLE session_control_commands ADD COLUMN not_before TEXT');
@@ -404,31 +406,58 @@ const CREDENTIAL_TTL_MS = 3600 * 1000; // 1 h access token (docs/SESSION-MESSAGI
  * refresh-bound to the live session, so no time-based re-mint happens while
  * it runs. Bounded: driven by the small session-identity set, indexed
  * lookups only. */
-export function sessionsNeedingCredentials(sql: SqlStorage, machineId: string, now: number): { session_id: string; native_id: string; tag: string; workspace: string }[] {
-  const identities = sql.exec('SELECT tag FROM agents WHERE project = ? AND machine_id = ? LIMIT 200', SESSION_PROJECT, machineId).toArray() as any[];
-  const out = [];
-  for (const identity of identities) {
-    const row: any = sql.exec("SELECT id, binding_json FROM session_control_sessions WHERE id = ? AND machine_id = ? AND state = 'running' AND binding_json IS NOT NULL", identity.tag, machineId).toArray()[0];
-    if (!row) continue;
-    let binding: any = null;
-    try { binding = JSON.parse(row.binding_json); } catch {}
-    if (!binding?.native_id || !binding?.tag || !binding?.workspace) continue;
-    const live = sql.exec("SELECT 1 FROM credentials WHERE registry_actor = ? AND kind = 'agent' AND machine_id = ? AND revoked_at IS NULL LIMIT 1",
-      `${SESSION_PROJECT}:${row.id}`, machineId).toArray().length;
-    if (!live) out.push({ session_id: String(row.id), native_id: String(binding.native_id), tag: String(binding.tag), workspace: String(binding.workspace) });
-    if (out.length >= 10) break;
+export function sessionsNeedingCredentials(sql:SqlStorage,machineId:string,now:number):{session_id:string;native_id:string;tag:string;workspace:string}[] {
+  const key='machine:'+machineId;
+  const old=String(sql.exec('SELECT cursor FROM session_credential_scan WHERE key=?',key).toArray()[0]?.cursor??'0');
+  const raw=runningCredentialSessionPage(sql,machineId,old);
+  const out:any[]=[];let last=old,unfinished=false;
+  for(const row of raw.slice(0,64)) {
+    last=credentialSessionCursor(row);
+    const identity:any=sql.exec("SELECT machine_id FROM agents INDEXED BY idx_agents_project_tag_unique WHERE COALESCE(project,'')=? AND tag=?",SESSION_PROJECT,row.id).toArray()[0];
+    if(!identity || identity.machine_id!==machineId || row.binding_json===null)continue;
+    let binding:any;try{binding=JSON.parse(row.binding_json);}catch{continue;}
+    if(!binding?.native_id || !binding?.tag || !binding?.workspace)continue;
+    const live=credentialActorRows(sql,SESSION_PROJECT+':'+row.id)
+      .some(credential=>credential.kind==='agent' && credential.machine_id===machineId && credential.revoked_at===null);
+    if(!live)out.push({session_id:String(row.id),native_id:String(binding.native_id),tag:String(binding.tag),workspace:String(binding.workspace)});
+    if(out.length>=10){unfinished=true;break;}
   }
+  const next=unfinished || raw.length>64 ? last : '0';
+  if(next!==old)sql.exec('INSERT INTO session_credential_scan VALUES(?,?) ON CONFLICT(key) DO UPDATE SET cursor=excluded.cursor',key,String(next));
   return out;
 }
+const endedScanPending=new WeakMap<object,boolean>();
+type MessagingScan={generation:string;hadWork:boolean;empty:boolean};
+const messagingScans=new WeakMap<object,Map<string,MessagingScan>>();
+/** Complete-empty observations are reused only while exact source generations
+ * match. Unfinished pages continue; cold mid-cycle cursors require one full
+ * fresh cycle before they can prove absence. */
+export function pollSessionCredentials(sql:SqlStorage,machineId:string,now:number,sweep=true,generation?:()=>string):{session_id:string;native_id:string;tag:string;workspace:string}[] {
+  if(sweep || endedScanPending.get(sql as object))endedScanPending.set(sql as object,revokeEndedSessionCredentials(sql,now));
+  let scans=messagingScans.get(sql);if(!scans)messagingScans.set(sql,scans=new Map());
+  const stamp=generation?.(),prior=scans.get(machineId);
+  if(stamp!==undefined&&prior?.generation===stamp&&prior.empty)return [];
+  const key='machine:'+machineId;
+  let cursor=String(sql.exec('SELECT cursor FROM session_credential_scan WHERE key=?',key).toArray()[0]?.cursor??'0');
+  const changed=stamp!==undefined&&prior!==undefined&&prior.generation!==stamp;
+  if(changed&&cursor!=='0') {sql.exec('UPDATE session_credential_scan SET cursor=? WHERE key=?','0',key);cursor='0';}
+  const state:MessagingScan=stamp!==undefined&&prior?.generation===stamp?prior:{generation:stamp??'',hadWork:cursor!=='0',empty:false};
+  if(cursor==='0')state.hadWork=false;
+  const sessions=sessionsNeedingCredentials(sql,machineId,now);
+  if(sessions.length)state.hadWork=true;
+  const next=String(sql.exec('SELECT cursor FROM session_credential_scan WHERE key=?',key).toArray()[0]?.cursor??'0');
+  state.empty=next==='0'&&!state.hadWork;
+  state.generation=generation?.()??'';
+  if(next==='0'&&!state.empty)state.hadWork=false;
+  if(scans.size>=128&&!scans.has(machineId))scans.delete(scans.keys().next().value!);
+  scans.set(machineId,state);
+  return sessions;
+}
 
-/** Host poll for sessions needing a messaging credential (intake e8a22f4c):
- * the ended-session revoke sweep is a backstop (transitions revoke
- * directly), so it runs only when `sweep` is true — the caller passes false
- * while no source table was written since the last sweep. Returns the
- * sessions still missing a live credential. */
-export function pollSessionCredentials(sql: SqlStorage, machineId: string, now: number, sweep = true): { session_id: string; native_id: string; tag: string; workspace: string }[] {
-  if (sweep) revokeEndedSessionCredentials(sql, now);
-  return sessionsNeedingCredentials(sql, machineId, now);
+function revokeMessagingActor(sql:SqlStorage,actor:string,now:number):void {
+  const at=new Date(now).toISOString();
+  for(const credential of credentialActorRows(sql,actor))if(credential.kind==='agent' && credential.revoked_at===null)
+    sql.exec("UPDATE credentials SET revoked_at=? WHERE id=? AND registry_actor=? AND kind='agent' AND revoked_at IS NULL",at,credential.id,actor);
 }
 
 /** Mint the session's own bus-only credential for its bound host: actor
@@ -440,7 +469,7 @@ export function mintSessionCredential(sql: SqlStorage, sessionId: string, machin
   if (!session || session.machine_id !== machineId) return null;
   const actor = ensureSessionIdentity(sql, sessionId, now);
   const at = new Date(now).toISOString();
-  sql.exec("UPDATE credentials SET revoked_at = ? WHERE kind = 'agent' AND registry_actor = ? AND revoked_at IS NULL", at, actor);
+  revokeMessagingActor(sql,actor,now);
   const id = crypto.randomUUID();
   const expires = new Date(now + CREDENTIAL_TTL_MS).toISOString();
   sql.exec(`INSERT INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at, registry_actor)
@@ -453,8 +482,7 @@ export function mintSessionCredential(sql: SqlStorage, sessionId: string, machin
  * stops or rebinds — called from the session-control stop/bind transitions
  * (the host-poll sweep in revokeEndedSessionCredentials is the backstop). */
 export function revokeSessionCredentials(sql: SqlStorage, sessionId: string, now: number): void {
-  sql.exec("UPDATE credentials SET revoked_at = ? WHERE kind = 'agent' AND registry_actor = ? AND revoked_at IS NULL",
-    new Date(now).toISOString(), `${SESSION_PROJECT}:${sessionId}`);
+  revokeMessagingActor(sql,`${SESSION_PROJECT}:${sessionId}`,now);
   revokeNativeWorkerCredentials(sql, sessionId, now);
   expireSessionMessages(sql, now, undefined, sessionId);
 }
@@ -471,13 +499,16 @@ export function sessionRefreshAllowed(sql: SqlStorage, registryActor: string | n
 
 /** A stopped or ended session's messaging identity stops working: bounded
  * by the session-identity rows, indexed revocation by registry_actor. */
-export function revokeEndedSessionCredentials(sql: SqlStorage, now: number): void {
-  const at = new Date(now).toISOString();
-  const ended = sql.exec(`SELECT a.tag FROM agents a LEFT JOIN session_control_sessions s ON s.id = a.tag
-    WHERE a.project = ? AND (s.id IS NULL OR s.state <> 'running') LIMIT 100`, SESSION_PROJECT).toArray() as any[];
-  for (const row of ended) {
-    sql.exec("UPDATE credentials SET revoked_at = ? WHERE registry_actor = ? AND kind = 'agent' AND revoked_at IS NULL", at, `${SESSION_PROJECT}:${row.tag}`);
+export function revokeEndedSessionCredentials(sql:SqlStorage,now:number):boolean {
+  const old=String(sql.exec("SELECT cursor FROM session_credential_scan WHERE key='ended'").toArray()[0]?.cursor??'');
+  const rows=sql.exec("SELECT tag FROM agents INDEXED BY idx_agents_project_tag_unique WHERE COALESCE(project,'')=? AND tag>? ORDER BY tag LIMIT 65",SESSION_PROJECT,old).toArray() as any[];
+  for(const row of rows.slice(0,64)) {
+    const session:any=sql.exec('SELECT state FROM session_control_sessions WHERE id=?',row.tag).toArray()[0];
+    if(!session || session.state!=='running')revokeMessagingActor(sql,SESSION_PROJECT+':'+row.tag,now);
   }
+  const next=rows.length>64?String(rows[63].tag):'';
+  if(next!==old)sql.exec("INSERT INTO session_credential_scan VALUES('ended',?) ON CONFLICT(key) DO UPDATE SET cursor=excluded.cursor",next);
+  return next!=='';
 }
 
 /** Operator re-address (§3): point an undelivered session message at a

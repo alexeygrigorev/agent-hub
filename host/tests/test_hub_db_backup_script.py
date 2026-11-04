@@ -43,6 +43,7 @@ class FakeHub:
         self.requests: list[str] = []
         # Hooks: called with (hub, table, chunk_body) after a chunk is built.
         self.after_chunk = None
+        self.effective_limit: int | None = None
         # Per-table count of rows to hide from chunk reads (simulated loss).
         self.hide_rows: dict[str, int] = {}
         for name in ("intake_tasks", "session_control_sessions", "claims", "audit"):
@@ -78,7 +79,9 @@ class FakeHub:
 
     def chunk(self, q: dict) -> tuple[int, dict]:
         table = q["table"][0]
-        limit = int(q.get("limit", ["500"])[0])
+        limit = int(q.get("limit", ["128"])[0])
+        if self.effective_limit is not None:
+            limit = min(limit, self.effective_limit)
         if table not in self.tables:
             return 404, {"error": "unknown_table"}
         rows = self.tables[table]
@@ -332,6 +335,52 @@ class HubDbBackupScriptTest(unittest.TestCase):
         self.assertEqual(len(alerts), 1, alerts)
         self.assertIn("chunk fetch failed table=claims", alerts[0][1])
         self.assertIn("HTTP 404", alerts[0][1])
+
+    def test_v6_unknown_status_stops_before_schema_or_data_requests(self) -> None:
+        hub = FakeHub(api_version=6)
+        original = hub.status
+
+        def limited_status() -> dict:
+            body = original()
+            body["counts_observation_limited"] = True
+            body["row_counts"]["audit"] = None
+            return body
+
+        hub.status = limited_status
+        result = self.run_backup(hub)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("bounded observation unavailable; export cannot verify", result.stdout)
+        self.assertEqual(hub.requests, ["/api/backup/status"])
+        self.assertEqual(self.exports("local"), [])
+        self.assertEqual(self.exports("box"), [])
+
+    def test_server_effective_limit_does_not_create_premature_eof(self) -> None:
+        hub = FakeHub()
+        hub.add_table("session_control_commands", 300)
+        hub.effective_limit = 17
+        result = self.run_backup(hub, CHUNK_ROWS="500")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(self.load_export()["tables"]["session_control_commands"]), 300)
+        self.assertIn("clamped to bounded maximum 128", result.stdout)
+        for request in hub.requests:
+            query = parse_qs(urlparse(request).query)
+            if "limit" in query:
+                self.assertLessEqual(int(query["limit"][0]), 128)
+        self.assertFalse(self.load_export()["verification"]["cross_table_snapshot"])
+
+    def test_null_chunk_total_is_unknown_and_never_coerced_to_zero(self) -> None:
+        hub = FakeHub(api_version=6)
+
+        def unknown_total(_hub: FakeHub, _table: str, body: dict) -> None:
+            body["total"] = None
+            body["total_exact"] = False
+
+        hub.after_chunk = unknown_total
+        result = self.run_backup(hub)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("bounded observation unavailable; export cannot verify", result.stdout)
+        self.assertEqual(self.exports("local"), [])
+        self.assertEqual(self.exports("box"), [])
 
     def test_fail_drill_pages_ops_only_without_touching_hub(self) -> None:
         hub = FakeHub()

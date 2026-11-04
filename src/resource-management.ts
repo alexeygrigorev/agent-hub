@@ -1,3 +1,7 @@
+import {readSchemaObject,noteCreatedSchemaObject} from './schema-object-locator';
+import {schemaSqlEquivalent} from './schema-sql-equivalent';
+import {initIntakeLinkHealth,intakeLinkHealth} from './intake-link-health';
+import { effectiveHeartbeat, effectiveHeartbeatAt } from './registry';
 import { worktreeIntakeProtected, worktreeIntakeSnapshot, type WorktreeSnapshotScope } from './worktree-intakes';
 import { openWorkPreventsIdleReap, type IdleReapCache } from './intake-session';
 import { WriteWatch, StampCache } from './write-watch';
@@ -12,6 +16,9 @@ import { resolveMachineAliases } from './machine-alias';
 import { jsonFields, resourceRequest } from './sql-json-projection';
 export const MEMORY_FLOOR_MB = defaults.memory_floor_mb;
 export const NEXT_SLOT_MB = defaults.ramp_reserve_default_mb;
+/** Above this candidate count, resource visibility is unknown and admission
+ * refuses. Eligibility is checked only AFTER this indexed source bound. */
+export const MEMORY_PENDING_SCAN_LIMIT = 128;
 // Intake 63a9ee3a / 736ba282: an offered, starting or uncertain launch holds
 // its full estimate only this long after its claim (or creation when never
 // claimed). Parked offers (host_overload) and stuck uncertain rows otherwise
@@ -24,7 +31,7 @@ export const IN_FLIGHT_RESERVE_SECONDS = 600;
 export const CPU_LOAD_FACTOR = defaults.cpu_load_factor;
 export type ResourceConfig = typeof defaults;
 const parse = (s: any): any => { try { return JSON.parse(s || '{}'); } catch { return {}; } };
-const finite = (n: any) => typeof n === 'number' && Number.isFinite(n) && n >= 0;
+const finite = (n: any): n is number => typeof n === 'number' && Number.isFinite(n) && n >= 0;
 const TERMINAL = new Set(['exited', 'finished', 'failed', 'stopped', 'dead', 'refused']);
 export const RESOURCE_SCHEMA = `
 CREATE TABLE IF NOT EXISTS resource_resident_samples (launch_id TEXT PRIMARY KEY, resident_mb REAL NOT NULL, observed_at TEXT NOT NULL);
@@ -94,18 +101,38 @@ export function effectiveFloorMb(config: ResourceConfig, totalMb: unknown): numb
   if (!finite(totalMb) || (totalMb as number) <= 0) return config.memory_floor_mb;
   return Math.min(config.memory_floor_mb, Math.max(512, Math.round((totalMb as number) * config.memory_floor_pct / 100)));
 }
-export function memoryVerdict(available: number, ramp: number, estimate: number, config: ResourceConfig, totalMb?: unknown) {
+export function memoryVerdict(available: number | null, ramp: number | null, estimate: number | null, config: ResourceConfig, totalMb?: unknown) {
   return finite(available) && finite(ramp) && finite(estimate) && available - ramp - estimate >= effectiveFloorMb(config, totalMb);
 }
 // Idle-reap authority reads only request.intake_task_id; skip copying and
 // re-parsing whole retained prompts per session. Invalid JSON passes through
 // unchanged and still parses as an empty request.
 const SLIM_REQUEST = `CASE WHEN json_valid(request_json) THEN json_object('intake_task_id', json_extract(request_json, '$.intake_task_id')) ELSE request_json END`;
-// Matches session_control_native_binding exactly (src/session_control.ts).
+// Matches the existing intake_queue_session_native index exactly.
 // The caller binds only native-id strings, so non-text JSON values cannot
 // match and need no per-row json_type guard in the indexed expression.
 const NATIVE_KEY = `json_extract(CASE WHEN json_valid(binding_json) THEN binding_json ELSE '{}' END, '$.native_id')`;
+export class ResourceObservationLimit extends Error { constructor(){super('resource_catalog_observation_limit');this.name='ResourceObservationLimit';} }
+const RESOURCE_CATALOG_LIMIT=128;
 export class ResourceManagement {
+  /** Live telemetry is advisory memory, not a per-poll durable event log.
+   * A restart loses freshness and falls back to conservative reservation. */
+  private liveTelemetry=new Map<string,{sample:any;meta:string;persistedAt:number}>();
+  private freshLiveTelemetry(launch:string,now:number,nativeId:unknown):any|null {
+    const value=this.liveTelemetry.get(launch)?.sample;
+    if(!value || value.native_id!==nativeId)return null;
+    const at=Date.parse(value.observed_at);
+    return Number.isFinite(at)&&at>=now-180000&&at<=now+30000?value:null;
+  }
+  private liveActivity=new Map<string,{activity:any;observed:any;durable?:{activity:any;observed:any}}>();
+  private activityStamp:string|null=null;
+  private activityLost=false;
+  invalidateLiveTelemetry():void {
+    this.liveTelemetry.clear();
+    if(this.liveActivity.size)this.activityLost=true;
+    this.liveActivity.clear();this.activityStamp=null;
+  }
+  private idleBindingValidity=new Map<string,{stamp:string|null;corrupt:boolean;limited:boolean}>();
   private catalogReady = false;
   private catalogStructureRevision:string|null=null;
   private catalogRawRows=new Map<string,{rev:string|null;value:any[]}>();
@@ -141,6 +168,8 @@ export class ResourceManagement {
     // Its cached closure/DONE verdicts must never survive an authority write.
     const tables=['session_control_sessions','fleet_launches','fleet_sessions','session_control_protections','resource_reaps','intake_tasks','intake_task_projection','resource_request_projection','machines'];
     if (tables.some(table=>!this.sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",table).toArray().length)) return;
+    initIntakeLinkHealth(this.sql,true);
+    tables.push('intake_link_health','intake_link_health_meta');
     this.sql.exec('CREATE TABLE IF NOT EXISTS resource_catalog_revision(id INTEGER PRIMARY KEY CHECK(id=1),revision TEXT NOT NULL,structure_revision TEXT NOT NULL)');
     this.sql.exec("INSERT OR IGNORE INTO resource_catalog_revision VALUES(1,lower(hex(randomblob(16))),lower(hex(randomblob(16))))");
     // Activity is sampled afresh on every read; observed_at is not canonical
@@ -150,11 +179,18 @@ export class ResourceManagement {
       .map(name=>{const column='"'+name.replaceAll('"','""')+'"';return `OLD.${column} IS NOT NEW.${column}`;}).join(' OR ') || '1';
     for(const table of tables) for(const op of ['INSERT','UPDATE','DELETE']) {
       const nativeUpdate=table==='fleet_sessions' && op==='UPDATE';
-      // Replace the old unconditional trigger, including on existing databases.
-      // Rebuilding it also includes any newly added native metadata columns.
-      if(nativeUpdate) this.sql.exec('DROP TRIGGER IF EXISTS resource_catalog_fleet_sessions_update');
-      this.sql.exec(`CREATE TRIGGER IF NOT EXISTS resource_catalog_${table}_${op.toLowerCase()} AFTER ${op} ON ${table} ${nativeUpdate ? 'WHEN '+nativeChanged : table === 'machines' && op === 'UPDATE' ? 'WHEN OLD.hostname IS NOT NEW.hostname OR OLD.id IS NOT NEW.id' : ''}
-        BEGIN UPDATE resource_catalog_revision SET revision=lower(hex(randomblob(16)))${table==='fleet_sessions' ? '' : ',structure_revision=lower(hex(randomblob(16)))'} WHERE id=1; END`);
+      // A changed column set or old unconditional body needs an upgrade;
+      // verify the live definition before paying for schema replacement.
+      const triggerSql=`CREATE TRIGGER IF NOT EXISTS resource_catalog_${table}_${op.toLowerCase()} AFTER ${op} ON ${table} ${nativeUpdate ? 'WHEN '+nativeChanged : table === 'machines' && op === 'UPDATE' ? 'WHEN OLD.hostname IS NOT NEW.hostname OR OLD.id IS NOT NEW.id' : ''}
+        BEGIN UPDATE resource_catalog_revision SET revision=lower(hex(randomblob(16)))${table==='fleet_sessions' ? '' : ',structure_revision=lower(hex(randomblob(16)))'} WHERE id=1; END`;
+      let nativeTriggerChanged=false;
+      if(nativeUpdate){
+        const actual=readSchemaObject(this.sql,{name:'resource_catalog_fleet_sessions_update',type:'trigger',table:'fleet_sessions'});
+        nativeTriggerChanged=!actual||!schemaSqlEquivalent(actual.sql,triggerSql);
+        if(actual&&nativeTriggerChanged)this.sql.exec('DROP TRIGGER resource_catalog_fleet_sessions_update');
+      }
+      this.sql.exec(triggerSql);
+      if(nativeUpdate&&nativeTriggerChanged)noteCreatedSchemaObject(this.sql,{name:'resource_catalog_fleet_sessions_update',type:'trigger',table:'fleet_sessions'});
     }
     this.catalogReady=true;
   }
@@ -165,15 +201,31 @@ export class ResourceManagement {
    * catalog and must not invalidate anything. */
   private canonicalStampTables(machine?: string): string[] {
     void machine;
-    return ['session_control_sessions','fleet_launches','machines','session_control_protections','resource_reaps','intake_tasks','intake_task_projection','resource_request_projection','fleet_sessions_meta'];
+    return ['intake_link_health','intake_link_health_meta','session_control_sessions','fleet_launches','machines','session_control_protections','resource_reaps','intake_tasks','intake_task_projection','resource_request_projection','fleet_sessions_meta'];
   }
   private intakeStampTables(): string[] {
-    return ['machines','session_control_sessions','fleet_launches','intake_tasks','intake_task_projection','resource_request_projection'];
+    return ['intake_link_health','intake_link_health_meta','machines','session_control_sessions','fleet_launches','intake_tasks','intake_task_projection','resource_request_projection'];
   }
   /** Census PUT: patch the write-through catalog with the rows just written.
    * metadataChanged marks rows whose identity fields (tag/engine/phase/...)
    * changed, not only activity/progress refreshes. */
   noteCensus(machine: string, rows: any[], metadataChanged: boolean): void {
+    const currentStamp=this.writes?.stamp('fleet_sessions')??null;
+    if(this.writes&&this.activityStamp!==null&&currentStamp!==this.activityStamp){this.liveActivity.clear();this.activityLost=true;}
+    // Timestamp persistence is coalesced, but admission/cleanup sees the
+    // freshest authenticated report. This point cache never loads host history.
+    for(const row of rows) {
+      const key=JSON.stringify([machine,row.native_id]);
+      const previous=this.liveActivity.get(key);
+      const oldAt=Date.parse(previous?.observed),newAt=Date.parse(row.observed_at);
+      const oldFresh=Number.isFinite(oldAt)&&oldAt>=this.now()-180000&&oldAt<=this.now()+60000&&Number.isFinite(Date.parse(previous?.activity));
+      const newFresh=Number.isFinite(newAt)&&newAt>=this.now()-180000&&newAt<=this.now()+60000&&Number.isFinite(Date.parse(row.last_activity_at));
+      if(newFresh&&!oldFresh)this.watchdogSessions?.invalidate();
+      if(!this.liveActivity.has(key)&&this.liveActivity.size>=2048){this.liveActivity.clear();this.activityLost=true;}
+      const durable=!this.writes?this.readRows('SELECT last_activity_at,observed_at FROM fleet_sessions WHERE machine_id=? AND native_id=?',machine,row.native_id)[0]:null;
+      this.liveActivity.set(key,{activity:row.last_activity_at??null,observed:row.observed_at,...(!this.writes?{durable:{activity:durable?.last_activity_at??null,observed:durable?.observed_at??null}}:{})});
+    }
+    this.activityStamp=this.writes?.stamp('fleet_sessions')??null;
     this.observed?.note(machine, rows);
     if (metadataChanged) this.writes?.bump('fleet_sessions_meta');
   }
@@ -189,29 +241,31 @@ export class ResourceManagement {
   private scopedIntakeSnapshot(
     machine: string | undefined,
     controlData: Map<string, {binding: any; req: any; launch: any; model: any}>,
-    launchData: Map<string, {req: any; model: any}>,
+    launchData: Map<string, {req: any; model: any;native_id?:string}>,
   ): ReturnType<typeof worktreeIntakeSnapshot> {
-    if (!machine) return worktreeIntakeSnapshot(this.sql);
     const sessionIds = [...controlData.keys()];
-    const nativeIds = [...new Set([...controlData.values()].map(d => d.binding.native_id).filter(v => typeof v === 'string' && v))];
+    const nativeIds = [...new Set([...controlData.values()].map(d => d.binding.native_id).concat([...launchData.values()].map(d=>d.native_id)).filter(v => typeof v === 'string' && v))];
     const scope: WorktreeSnapshotScope = { sessionIds, nativeIds };
-    return worktreeIntakeSnapshot(this.sql, scope);
+    return worktreeIntakeSnapshot(this.sql, scope, false);
   }
-  private static sharedHistoryRevision: string | null = null;
-  private static sharedHistoryStamp: string | null = null;
-  private static sharedMemoryHistory = new Map<string | null, any[]>();
-  private static sharedCpuHistory: any[] | null = null;
-  private static sharedMemoryEstimates = new Map<string, number>();
-  private static sharedCpuEstimates = new Map<string, {expected_cpu_cores: number; expected_cpu_source: string}>();
-  private get historyRevision(): string | null { return ResourceManagement.sharedHistoryRevision; }
-  private set historyRevision(v: string | null) { ResourceManagement.sharedHistoryRevision = v; }
-  private get historyStamp(): string | null { return ResourceManagement.sharedHistoryStamp; }
-  private set historyStamp(v: string | null) { ResourceManagement.sharedHistoryStamp = v; }
-  private get memoryHistory(): Map<string | null, any[]> { return ResourceManagement.sharedMemoryHistory; }
-  private get cpuHistory(): any[] | null { return ResourceManagement.sharedCpuHistory; }
-  private set cpuHistory(v: any[] | null) { ResourceManagement.sharedCpuHistory = v; }
-  private get memoryEstimates(): Map<string, number> { return ResourceManagement.sharedMemoryEstimates; }
-  private get cpuEstimates(): Map<string, {expected_cpu_cores: number; expected_cpu_source: string}> { return ResourceManagement.sharedCpuEstimates; }
+  private sharedHistoryRevision: string | null = null;
+  private sharedHistoryStamp: string | null = null;
+  private sharedMemoryHistory = new Map<string | null, any[]>();
+  private sharedCpuHistory: any[] | null = null;
+  private sharedCpuHistoryLimited=false;
+  private sharedMemoryEstimates = new Map<string, number>();
+  private sharedCpuEstimates = new Map<string, {expected_cpu_cores: number; expected_cpu_source: string;history_observation_limited?:boolean}>();
+  private get historyRevision(): string | null { return this.sharedHistoryRevision; }
+  private set historyRevision(v: string | null) { this.sharedHistoryRevision = v; }
+  private get historyStamp(): string | null { return this.sharedHistoryStamp; }
+  private set historyStamp(v: string | null) { this.sharedHistoryStamp = v; }
+  private get memoryHistory(): Map<string | null, any[]> { return this.sharedMemoryHistory; }
+  private get cpuHistory(): any[] | null { return this.sharedCpuHistory; }
+  private get cpuHistoryLimited():boolean{return this.sharedCpuHistoryLimited;}
+  private set cpuHistoryLimited(value:boolean){this.sharedCpuHistoryLimited=value;}
+  private set cpuHistory(v: any[] | null) { this.sharedCpuHistory = v; }
+  private get memoryEstimates(): Map<string, number> { return this.sharedMemoryEstimates; }
+  private get cpuEstimates(): Map<string, {expected_cpu_cores: number; expected_cpu_source: string;history_observation_limited?:boolean}> { return this.sharedCpuEstimates; }
   private historyScope = 0;
   private readSnapshot: Map<string, any[]> | null = null;
   private snapshotNow: number | null = null;
@@ -275,7 +329,7 @@ export class ResourceManagement {
   configFor(machine: string): ResourceConfig {
     const config = this.config();
     const m: any = this.readRows('SELECT last_heartbeat FROM machines WHERE id=?', machine)[0];
-    return { ...config, memory_floor_mb: effectiveFloorMb(config, parse(m?.last_heartbeat).mem_total_mb) };
+    return { ...config, memory_floor_mb: effectiveFloorMb(config, parse(effectiveHeartbeat(this.sql,machine,m?.last_heartbeat)).mem_total_mb) };
   }
   config(): ResourceConfig { return resourceConfig(parse(this.readRows('SELECT data FROM resource_settings WHERE id=1')[0]?.data)); }
   /** Host-poll path for the resource config: stamp-checked, zero rows between writes. */
@@ -304,7 +358,7 @@ export class ResourceManagement {
     if (!rows) {
       // Typical resident size (p50 of the session's own samples) when recorded, else its peak. A multi-day goal session's
       // test-run peak is not what a new launch needs.
-      rows = this.sql.exec('SELECT u.project,u.kind,u.model,COALESCE(m.p50_rss_mb,u.peak_rss_mb) AS peak_rss_mb FROM session_resource_usage u LEFT JOIN session_rss_median m ON m.session_id=u.session_id WHERE u.engine IS ? AND u.finished_at IS NOT NULL AND u.peak_rss_mb > 0 ORDER BY u.observed_at DESC LIMIT 500', engine).toArray() as any[];
+      rows = this.sql.exec('SELECT u.project,u.kind,u.model,COALESCE(m.p50_rss_mb,u.peak_rss_mb) AS peak_rss_mb FROM session_resource_usage u INDEXED BY resource_memory_recent LEFT JOIN session_rss_median m ON m.session_id=u.session_id WHERE u.engine IS ? AND u.finished_at IS NOT NULL AND u.peak_rss_mb > 0 ORDER BY u.observed_at DESC LIMIT 500', engine).toArray() as any[];
       if (this.memoryHistory.size >= 64) this.memoryHistory.clear();
       this.memoryHistory.set(engine, rows);
     }
@@ -325,9 +379,15 @@ export class ResourceManagement {
     const key = JSON.stringify([project, kind, engine, model]);
     const cached = this.cpuEstimates.get(key);
     if (cached) return {...cached};
-    const rows = this.cpuHistory ??= this.sql.exec(`SELECT u.project,u.kind,u.engine,u.model,c.p95_cpu_cores FROM session_resource_usage u
-      JOIN session_cpu_usage c ON c.session_id=u.session_id WHERE u.finished_at IS NOT NULL
-      AND c.p95_cpu_cores IS NOT NULL ORDER BY u.observed_at DESC LIMIT 500`).toArray() as any[];
+    if(!this.cpuHistory) {
+      const source=this.sql.exec(`SELECT u.project,u.kind,u.engine,u.model,c.p95_cpu_cores FROM
+        (SELECT session_id,project,kind,engine,model FROM session_resource_usage INDEXED BY resource_cpu_recent
+          WHERE finished_at IS NOT NULL ORDER BY observed_at DESC LIMIT 501) u
+        LEFT JOIN session_cpu_usage c ON c.session_id=u.session_id`).toArray() as any[];
+      this.cpuHistoryLimited=source.length>500;
+      this.cpuHistory=source.slice(0,500).filter(row=>row.p95_cpu_cores!==null);
+    }
+    const rows=this.cpuHistory;
     const label = projectLabel(project);
     const sameProject = rows.filter(r=>projectLabel(r.project)===label);
     const byModel = engine && model ? sameProject.filter(r=>r.engine===engine && r.model===model) : [];
@@ -336,7 +396,8 @@ export class ResourceManagement {
     const config=this.config();
     const measured=percentile(cohort.map(r=>Number(r.p95_cpu_cores)),95);
     const result = {expected_cpu_cores:measured === null ? config.cpu_default_cores : measured*config.cpu_estimate_multiplier,
-      expected_cpu_source:byModel.length?'project_engine_model':specific.length?'repo_kind':sameProject.length?'repo':rows.length?'global':'default'};
+      expected_cpu_source:byModel.length?'project_engine_model':specific.length?'repo_kind':sameProject.length?'repo':rows.length?'global':this.cpuHistoryLimited?'default_observation_limited':'default',
+      history_observation_limited:this.cpuHistoryLimited};
     if (this.cpuEstimates.size >= 2048) this.cpuEstimates.clear();
     this.cpuEstimates.set(key, result);
     return {...result};
@@ -344,24 +405,58 @@ export class ResourceManagement {
   freezeCpuStart(launch: string, estimate: {expected_cpu_cores:number,expected_cpu_source:string}) {
     this.sql.exec('INSERT OR IGNORE INTO resource_cpu_starts VALUES(?,?,?)',launch,estimate.expected_cpu_cores,estimate.expected_cpu_source);
   }
-  cpuStart(launch: string) {
-    return this.sql.exec('SELECT expected_cpu_cores,expected_cpu_source FROM resource_cpu_starts WHERE launch_id=?',launch).toArray()[0] ?? null;
+  private cpuStartFacts=new Map<string,{expected_cpu_cores:number;expected_cpu_source:string}|null>();
+  private cpuStartFactsStamp:string|null=null;
+  /** Raw commitment facts only; every caller recomputes its own live verdict. */
+  cpuStarts(launches:readonly string[]):Map<string,{expected_cpu_cores:number;expected_cpu_source:string}|null> {
+    if(launches.length>128||launches.some(id=>typeof id!=='string'))throw new ResourceObservationLimit();
+    const stamp=this.writes?.stamp('resource_cpu_starts')??null;
+    if(stamp===null||stamp!==this.cpuStartFactsStamp){this.cpuStartFacts.clear();this.cpuStartFactsStamp=stamp;}
+    const ids=[...new Set(launches)],missing=ids.filter(id=>!this.cpuStartFacts.has(id));
+    const found=new Map<string,{expected_cpu_cores:number;expected_cpu_source:string}|null>();
+    if(missing.length)for(const row of this.readRows(`SELECT launch_id,expected_cpu_cores,expected_cpu_source FROM resource_cpu_starts
+      WHERE launch_id IN (SELECT value FROM json_each(?))`,JSON.stringify(missing)))
+      found.set(String(row.launch_id),{expected_cpu_cores:row.expected_cpu_cores,expected_cpu_source:row.expected_cpu_source});
+    const result=new Map(ids.map(id=>{const row=found.get(id)??this.cpuStartFacts.get(id)??null;return [id,row?{...row}:null] as const;}));
+    if(stamp!==null) {
+      if(this.cpuStartFacts.size+missing.length>2048)this.cpuStartFacts.clear();
+      for(const [id,row] of result)this.cpuStartFacts.set(id,row?{...row}:null);
+    }
+    return result;
+
   }
+  cpuStart(launch: string) {return this.cpuStarts([launch]).get(launch)??null;}
   private hostSessionCount(machine: string, excludeLaunch?: string) {
-    const row: any = this.readRows(`SELECT COUNT(*) AS active_sessions FROM (
-      SELECT native_id AS session_key FROM fleet_sessions WHERE machine_id=?
-        AND phase NOT IN ('exited','finished','failed','stopped','dead','refused')
-      UNION
-      SELECT COALESCE(native_id,'launch:'||id) AS session_key FROM fleet_launches WHERE machine_id=?
-        AND state IN ('offered','starting','running','uncertain') AND (? IS NULL OR id<>?)
-    )`, machine, machine, excludeLaunch ?? null, excludeLaunch ?? null)[0];
-    const count = Number(row?.active_sessions);
-    return Number.isSafeInteger(count) && count >= 0 ? count : 0;
+    const terminal=['dead','exited','failed','finished','refused','stopped'];
+    // Preserve every nonterminal phase, including unknown legacy names. Each
+    // UNION arm seeks a disjoint leading-index range; the outer sentinel
+    // stops the combined raw source before any counting/deduplication.
+    const arms=Array.from({length:terminal.length+1},(_,i)=>{
+      const lower=i?terminal[i-1]:null,upper=i<terminal.length?terminal[i]:null;
+      return `SELECT session_key FROM (SELECT native_id AS session_key FROM fleet_sessions INDEXED BY fleet_session_machine_phase
+        WHERE machine_id=? ${lower!==null?`AND phase>'${lower}'`:''} ${upper!==null?`AND phase<'${upper}'`:''}
+        ORDER BY phase,rowid LIMIT 129)`;
+    });
+    // Cloudflare caps each compound SELECT at five terms. Keep the seven
+    // disjoint ranges in4+3groups, each independently bounded, then combine
+    // just two groups under the same global sentinel.
+    const groups=[arms.slice(0,4),arms.slice(4)].map(group=>'SELECT session_key FROM ('+group.join(' UNION ALL ')+') LIMIT 129');
+    const raw=this.readRows('SELECT session_key FROM ('+groups.map(group=>'SELECT session_key FROM ('+group+')').join(' UNION ALL ')+') LIMIT 129',...arms.map(()=>machine));
+    if(raw.length>128)return null;
+    const keys=new Set(raw.map(row=>String(row.session_key)));
+    let scanned=raw.length;
+    const page=this.readRows(`SELECT id,native_id FROM fleet_launches INDEXED BY fleet_launch_machine_state
+      WHERE machine_id=? AND state IN ('offered','starting','running','uncertain') ORDER BY state,rowid LIMIT ?`,machine,129-scanned);
+    scanned+=page.length;if(scanned>128)return null;
+    for(const row of page)if(row.id!==excludeLaunch)keys.add(row.native_id ?? 'launch:'+row.id);
+    return keys.size;
   }
+
   private hostAdmissionState(machine: string, heartbeat: any, observedAt: unknown, excludeLaunch?: string) {
     const load = Array.isArray(heartbeat?.load) ? heartbeat.load[0] : null;
+    const count=this.hostSessionCount(machine,excludeLaunch);
     return {load1: load, swap_used_percent: heartbeat?.swap_used_percent,
-      observed_at: observedAt, active_sessions: this.hostSessionCount(machine, excludeLaunch)};
+      observed_at: effectiveHeartbeatAt(this.sql,machine,observedAt),active_sessions:count,active_sessions_limited:count===null};
   }
   cpuHeadroom(machine: string, input: any = {}, excludeLaunch?: string) {
     return this.withHistory(() => this.cpuHeadroomFromHistory(machine, input, excludeLaunch));
@@ -369,18 +464,26 @@ export class ResourceManagement {
   private cpuHeadroomFromHistory(machine: string, input: any, excludeLaunch?: string) {
     const now = this.snapshotNow ?? this.now();
     const m:any=this.readRows('SELECT last_heartbeat,last_checkin_at,capabilities FROM machines WHERE id=?',machine)[0];
-    const hb=parse(m?.last_heartbeat),config=this.config(),cutoff=new Date(now-config.ramp_seconds*1000).toISOString();
+    const hb=parse(effectiveHeartbeat(this.sql,machine,m?.last_heartbeat)),config=this.config(),cutoff=new Date(now-config.ramp_seconds*1000).toISOString();
     const inFlightCutoff=new Date(now-IN_FLIGHT_RESERVE_SECONDS*1000).toISOString();
     const estimate:any=(excludeLaunch ? this.cpuStart(excludeLaunch) : null) ?? this.cpuEstimate(input.project || input.workspace || null,input.task_kind || input.kind || 'goal',input.engine ?? null,input.model ?? null);
-    // Expose the common state range to the machine/state index; the CASE below
-    // applies the running-ramp cutoff or the bounded in-flight window and is
-    // NULL (no reservation) for any other state, so the index filter stays
-    // an optimisation only.
-    const pending=this.readRows(`SELECT l.id,${resourceRequest('fleet_launches','l.id','l.request_json')} AS request_json,l.workspace,s.expected_cpu_cores,
-      c.current_cpu_cores,c.observed_at AS cpu_observed_at FROM fleet_launches l
-      LEFT JOIN resource_cpu_starts s ON s.launch_id=l.id LEFT JOIN resource_cpu_samples c ON c.launch_id=l.id WHERE machine_id=?
-      AND l.state IN ('offered','starting','running','uncertain')
-      AND COALESCE((SELECT started_at FROM resource_ramps WHERE launch_id=l.id),created_at)>=CASE WHEN state='running' THEN ? WHEN state IN ('offered','starting','uncertain') THEN ? END`,machine,cutoff,inFlightCutoff) as any[];
+    if(estimate.expected_cpu_source==='default_observation_limited')return {
+      ...cpuVerdict(hb.cpu_usage,parse(m?.capabilities).cpu_count,estimate.expected_cpu_cores,0,config,now),
+      admitted:false,reason:'cpu_history_observation_limited',snapshot_truncated:true,ramping_cpu_cores:null,
+      resource_choking:null,choking_observed_at:null,expected_cpu_source:estimate.expected_cpu_source,
+    };
+    const candidates=this.readRows(`SELECT l.rowid AS source_rowid,l.id,l.native_id,l.state,l.created_at,
+      ${resourceRequest('fleet_launches','l.id','l.request_json')} AS request_json,l.workspace,s.expected_cpu_cores,p.started_at AS ramp_started_at
+      FROM fleet_launches l INDEXED BY fleet_launch_machine_state
+      LEFT JOIN resource_cpu_starts s ON s.launch_id=l.id LEFT JOIN resource_ramps p ON p.launch_id=l.id
+      WHERE l.machine_id=? AND l.state IN ('offered','starting','running','uncertain') ORDER BY l.state,l.rowid LIMIT ?`,machine,MEMORY_PENDING_SCAN_LIMIT+1);
+    candidates.sort((a,b)=>['offered','starting','running','uncertain'].indexOf(a.state)-['offered','starting','running','uncertain'].indexOf(b.state)||a.source_rowid-b.source_rowid);
+    if(candidates.length>MEMORY_PENDING_SCAN_LIMIT)return {
+      ...cpuVerdict(hb.cpu_usage,parse(m?.capabilities).cpu_count,estimate.expected_cpu_cores,0,config,now),
+      admitted:false,reason:'resource_snapshot_overflow',snapshot_truncated:true,ramping_cpu_cores:null,
+      resource_choking:null,choking_observed_at:null,expected_cpu_source:estimate.expected_cpu_source,
+    };
+    const pending=candidates.filter(row=>(row.ramp_started_at ?? row.created_at)>=(row.state==='running'?cutoff:inFlightCutoff));
     const pendingKey=JSON.stringify([machine,cutoff,inFlightCutoff,now]);
     let commitments=this.cpuPendingSnapshot?.get(pendingKey);
     if (!commitments) {
@@ -390,8 +493,10 @@ export class ResourceManagement {
       // Dispatcher reports per-session counters after the host heartbeat, on
       // separate 30–60s polls. Fresh exact-binding measurements are advisory
       // ramp credit; they need not land inside the 200ms host /proc/stat sample.
-        const at=Date.parse(row.cpu_observed_at);
-        const credit=Number.isFinite(at)&&at>=now-180000&&at<=now+30000&&finite(row.current_cpu_cores) ? row.current_cpu_cores : 0;
+        const live=this.freshLiveTelemetry(row.id,now,row.native_id);
+        const at=Date.parse(live?.observed_at);
+        const current=live?.current_cpu_cores;
+        const credit=Number.isFinite(at)&&at>=now-180000&&at<=now+30000&&finite(current) ? current : 0;
         return {id:row.id,remaining:Math.max(0,committed-credit)};
       });
       this.cpuPendingSnapshot?.set(pendingKey,commitments);
@@ -410,7 +515,7 @@ export class ResourceManagement {
   capacityCpuAdmitted(machine: string): boolean {
     const now = this.snapshotNow ?? this.now(), config = this.config();
     const m: any = this.readRows('SELECT last_heartbeat,last_checkin_at,capabilities FROM machines WHERE id=?', machine)[0];
-    const heartbeat = parse(m?.last_heartbeat);
+    const heartbeat = parse(effectiveHeartbeat(this.sql,machine,m?.last_heartbeat));
     const verdict = cpuVerdict(heartbeat.cpu_usage, parse(m?.capabilities).cpu_count, 0, 0, config, now,heartbeat.mem_avail_mb,effectiveFloorMb(config,heartbeat.mem_total_mb),heartbeat.at ?? heartbeat.launcher_resources?.observed_at ?? heartbeat.gate?.at ?? null,
       this.hostAdmissionState(machine,heartbeat,m?.last_checkin_at));
     return this.chokingState(machine, now, config, verdict.reason).reason === null;
@@ -420,9 +525,9 @@ export class ResourceManagement {
     // reservation estimate across every pending request.
     const now=this.snapshotNow ?? this.now(),config=this.config();
     const m:any=this.readRows('SELECT last_heartbeat,last_checkin_at,capabilities FROM machines WHERE id=?',machine)[0];
-    const heartbeat=parse(m?.last_heartbeat);
+    const heartbeat=parse(effectiveHeartbeat(this.sql,machine,m?.last_heartbeat));
     const verdict=cpuVerdict(heartbeat.cpu_usage,parse(m?.capabilities).cpu_count,0,0,config,now,heartbeat.mem_avail_mb,effectiveFloorMb(config,heartbeat.mem_total_mb),heartbeat.at ?? heartbeat.launcher_resources?.observed_at ?? heartbeat.gate?.at ?? null,
-      this.hostAdmissionState(machine,heartbeat,m?.last_checkin_at));
+      {load1:heartbeat.load?.[0],swap_used_percent:heartbeat.swap_used_percent,observed_at:effectiveHeartbeatAt(this.sql,machine,m?.last_checkin_at)});
     return this.chokingState(machine,now,config,verdict.reason).resource_choking;
   }
   /** Watchdog-poll path: the choking evidence window is time-based, so this
@@ -442,8 +547,12 @@ export class ResourceManagement {
   private chokingState(machine: string, now: number, config: ResourceConfig, verdictReason: string | null) {
     const cooldown=new Date(now-config.choking_cooldown_seconds*1000).toISOString();
     const event:any=this.readRows(`SELECT reason,observed_at FROM resource_choking_events WHERE machine_id=? AND observed_at>=? AND reason!='host_runtime_choking' ORDER BY observed_at DESC LIMIT 1`,machine,cooldown)[0];
-    const runtime:any=this.readRows(`SELECT exit_reason,updated_at FROM fleet_launches WHERE machine_id=? AND updated_at>=?
-      AND state IN ('failed','exited') AND exit_reason IN ('engine_runtime_timeout','engine_signal_exit')
+    // This deployed partial index contains exactly terminal runtime failures.
+    // Seek the host/time range directly; unrelated retained transitions never
+    // enter the source, so absence is complete without a broad history gate.
+    const runtime:any=this.readRows(`SELECT exit_reason,updated_at FROM fleet_launches INDEXED BY fleet_launch_runtime_exit
+      WHERE machine_id=? AND updated_at>=? AND state IN ('failed','exited')
+      AND exit_reason IN ('engine_runtime_timeout','engine_signal_exit')
       ORDER BY updated_at DESC LIMIT 1`,machine,cooldown)[0];
     let serviceChoking=false; let serviceAt:string|null=null;
     if(this.readRows("SELECT name FROM sqlite_master WHERE type='table' AND name='host_health_observations'").length) {
@@ -457,7 +566,7 @@ export class ResourceManagement {
     }
     const reason=event?.reason || (runtime || serviceChoking ? 'host_runtime_choking' : verdictReason);
     const chokingAt=event?.observed_at || runtime?.updated_at || (serviceChoking ? serviceAt : null);
-    return {reason,choking_observed_at:chokingAt,
+    return {reason,choking_observed_at:chokingAt,runtime_observation_limited:false,
       resource_choking:['host_oom','host_runtime_choking'].includes(reason)&&chokingAt ? {reason,observed_at:chokingAt} : null};
   }
   headroom(machine: string, input: any = {}, engine: string | null = null) {
@@ -466,28 +575,39 @@ export class ResourceManagement {
   private headroomFromHistory(machine: string, input: any, engine: string | null) {
     const now = this.snapshotNow ?? this.now();
     const machineRow: any = this.readRows('SELECT last_heartbeat FROM machines WHERE id=?', machine)[0];
-    const hb = parse(machineRow?.last_heartbeat); const config = this.config();
+    const hb = parse(effectiveHeartbeat(this.sql,machine,machineRow?.last_heartbeat)); const config = this.config();
     const cutoff = new Date(now - config.ramp_seconds * 1000).toISOString();
     const inFlightCutoff = new Date(now - IN_FLIGHT_RESERVE_SECONDS * 1000).toISOString();
     // Only launch ramps are additional commitments. Resident usage is already in MemAvailable.
     // The explicit state range lets SQLite skip retained terminal history.
-    const pending = this.readRows(`SELECT l.id,l.engine,l.workspace,${resourceRequest('fleet_launches','l.id','l.request_json')} AS request_json,r.resident_mb FROM fleet_launches l
+    const candidates=this.readRows(`SELECT l.rowid AS source_rowid,l.id,l.native_id,l.engine,l.workspace,l.state,l.created_at,
+      ${resourceRequest('fleet_launches','l.id','l.request_json')} AS request_json,r.resident_mb,p.started_at AS ramp_started_at
+      FROM fleet_launches l INDEXED BY fleet_launch_machine_state
       LEFT JOIN resource_resident_samples r ON r.launch_id=l.id AND r.observed_at>=?
-      WHERE l.machine_id=? AND l.state IN ('offered','starting','running','uncertain')
-      AND COALESCE((SELECT started_at FROM resource_ramps WHERE launch_id=l.id),l.created_at)
-        >=CASE WHEN l.state='running' THEN ? WHEN l.state IN ('offered','starting','uncertain') THEN ? END`, cutoff, machine, cutoff, inFlightCutoff) as any[];
+      LEFT JOIN resource_ramps p ON p.launch_id=l.id
+      WHERE l.machine_id=? AND l.state IN ('offered','starting','running','uncertain') ORDER BY l.state,l.rowid LIMIT ?`,cutoff,machine,MEMORY_PENDING_SCAN_LIMIT+1);
+    candidates.sort((a,b)=>['offered','starting','running','uncertain'].indexOf(a.state)-['offered','starting','running','uncertain'].indexOf(b.state)||a.source_rowid-b.source_rowid);
+    const overflow = candidates.length > MEMORY_PENDING_SCAN_LIMIT;
+    if (overflow) return { mem_available_mb: finite(hb.mem_avail_mb) ? hb.mem_avail_mb : null,
+      reserved_mb: null, floor_mb: effectiveFloorMb(config, hb.mem_total_mb), requested_mb: null,
+      observed_at: hb.launcher_resources?.observed_at ?? hb.at ?? null,
+      snapshot_truncated: true as boolean, reason: 'resource_snapshot_overflow' };
+    const pending = candidates.filter(row => (row.ramp_started_at ?? row.created_at) >= (row.state === 'running' ? cutoff : inFlightCutoff));
     let reserved = 0;
     for (const row of pending) {
       const req = parse(row.request_json);
       const estimate = this.estimate(req.project || row.workspace, row.engine, req.task_kind || req.kind || 'goal');
-      reserved += Math.max(0, estimate - (finite(row.resident_mb) ? row.resident_mb : 0));
+      const live=this.freshLiveTelemetry(row.id,now,row.native_id);
+      const resident=live?.current_rss_mb;
+      reserved += Math.max(0, estimate - (finite(resident) ? resident : 0));
     }
     return { mem_available_mb: finite(hb.mem_avail_mb) ? hb.mem_avail_mb : null,
       reserved_mb: reserved, floor_mb: effectiveFloorMb(config, hb.mem_total_mb),
       requested_mb: this.estimate(input.project || input.workspace || null, engine, input.task_kind || input.kind || 'goal', input.model ?? null),
-      observed_at: hb.launcher_resources?.observed_at ?? hb.at ?? null };
+      observed_at: hb.launcher_resources?.observed_at ?? hb.at ?? null,
+      snapshot_truncated: false as boolean, reason: null as string | null };
   }
-  private boundSessions(machine?: string) {
+  private boundSessions(machine?: string, requested?: string[]) {
     // Share repeated immutable JSON only within this catalog read. Protection
     // and binding facts are always re-read on the next request.
     const parsed = new Map<any, any>();
@@ -514,38 +634,75 @@ export class ResourceManagement {
       }
       return value;
     };
-    // Canonical binding, not tag matching; external interactive sessions can be sampled but never reaped.
-    const rows = read(`SELECT s.id,s.machine_id,s.fleet_launch_id,s.binding_json,${resourceRequest('session_control_sessions','s.id','s.request_json')} AS request_json,s.request_key,
+    // Seed a complete bounded active population, or only explicitly reported
+    // IDs for final telemetry. Retained terminal history is never a seed scan.
+    const controlIds=new Set<string>(),launchIds=new Set<string>();
+    const nativeKeys=new Map<string,{machine:string;native:string}>();
+    const check=()=>{if(controlIds.size+launchIds.size>RESOURCE_CATALOG_LIMIT)throw new ResourceObservationLimit();};
+    const native=(host:any,id:any)=>{if(typeof host==='string'&&typeof id==='string'&&id)nativeKeys.set(JSON.stringify([host,id]),{machine:host,native:id});};
+    const addControl=(row:any)=>{if(!row || machine && row.machine_id!==machine)return;controlIds.add(String(row.id));native(row.machine_id,parse(row.binding_json).native_id);check();};
+    const addLaunch=(row:any)=>{if(!row || machine && row.machine_id!==machine)return;launchIds.add(String(row.id));native(row.machine_id,row.native_id);check();};
+    if(requested) {
+      if(requested.length>RESOURCE_CATALOG_LIMIT)throw new ResourceObservationLimit();
+      for(const id of requested) {
+        if(id.startsWith('fleet:'))addLaunch(read('SELECT id,machine_id,native_id FROM fleet_launches WHERE id=?',id.slice(6))[0]);
+        else addControl(read('SELECT id,machine_id,binding_json FROM session_control_sessions WHERE id=?',id)[0]);
+      }
+    } else {
+      const controlStates=['queued','held','offered','starting','running','uncertain'];
+      const controls=read(`SELECT rowid AS source_rowid,id,machine_id,binding_json,state,created_at
+        FROM session_control_sessions INDEXED BY ${machine?'session_control_machine_state':'session_control_state'}
+        WHERE ${machine?'machine_id=? AND ':''}state IN ('queued','held','offered','starting','running','uncertain')
+        ORDER BY state,${machine?'created_at,':''}rowid LIMIT 129`,...(machine?[machine]:[]));
+      if(controls.length>RESOURCE_CATALOG_LIMIT)throw new ResourceObservationLimit();
+      controls.sort((a,b)=>controlStates.indexOf(a.state)-controlStates.indexOf(b.state)||(machine?String(a.created_at).localeCompare(String(b.created_at)):0)||a.source_rowid-b.source_rowid);
+      for(const row of controls)addControl(row);
+      const launchStates=['offered','starting','running','uncertain'];
+      const launches=read(`SELECT rowid AS source_rowid,id,machine_id,native_id,state FROM fleet_launches
+        INDEXED BY ${machine?'fleet_launch_machine_state':'fleet_launch_state'}
+        WHERE ${machine?'machine_id=? AND ':''}state IN ('offered','starting','running','uncertain') ORDER BY state,rowid LIMIT 129`,...(machine?[machine]:[]));
+      if(launches.length>RESOURCE_CATALOG_LIMIT)throw new ResourceObservationLimit();
+      launches.sort((a,b)=>launchStates.indexOf(a.state)-launchStates.indexOf(b.state)||a.source_rowid-b.source_rowid);
+      for(const row of launches)addLaunch(row);
+
+    }
+    // Complete native alias closure includes terminal/protected identities.
+    // A cap refuses authority rather than silently dropping an old protection.
+    for(const identity of nativeKeys.values()) {
+      const controls=read(`SELECT id,machine_id,binding_json FROM session_control_sessions INDEXED BY session_control_native
+        WHERE machine_id=? AND CASE WHEN json_valid(binding_json) THEN CASE WHEN json_type(binding_json,'$.native_id')='text' THEN json_extract(binding_json,'$.native_id') END END=? LIMIT 129`,identity.machine,identity.native);
+      const fleets=read('SELECT id,machine_id,native_id FROM fleet_launches INDEXED BY fleet_launch_native WHERE machine_id=? AND native_id=? LIMIT 129',identity.machine,identity.native);
+      if(controls.length>RESOURCE_CATALOG_LIMIT || fleets.length>RESOURCE_CATALOG_LIMIT)throw new ResourceObservationLimit();
+      for(const row of controls)addControl(row);for(const row of fleets)addLaunch(row);
+    }
+    if(!controlIds.size&&!launchIds.size)return [];
+    const rows = controlIds.size?read(`SELECT s.id,s.machine_id,s.fleet_launch_id,s.binding_json,${resourceRequest('session_control_sessions','s.id','s.request_json')} AS request_json,s.request_key,
       s.engine,s.mode,s.state,s.created_at,s.updated_at,${resourceRequest('fleet_launches','l.id','l.request_json')} AS launch_request,l.state AS launch_state,l.created_at AS launch_created,
       l.finished_at AS launch_finished,${jsonFields('l.model_selection_json',['model'])} AS model_selection_json,l.workspace AS launch_workspace
       FROM session_control_sessions s LEFT JOIN fleet_launches l ON l.id=s.fleet_launch_id
-      ${machine ? 'WHERE s.machine_id=?' : ''} ORDER BY CASE WHEN s.state IN ('stopped','failed','exited','finished','dead','refused','cancelled') THEN 1 ELSE 0 END,s.updated_at DESC`, ...(machine ? [machine] : []));
-    const launches = read(`SELECT l.id,l.machine_id,l.native_id,l.workspace,l.engine,l.mode,${resourceRequest('fleet_launches','l.id','l.request_json')} AS request_json,
+      WHERE s.id IN(SELECT value FROM json_each(?))`,JSON.stringify([...controlIds])):[];
+    rows.sort((a,b)=>Number(TERMINAL.has(a.state))-Number(TERMINAL.has(b.state)) || String(b.updated_at).localeCompare(String(a.updated_at)));
+    const launches=launchIds.size?read(`SELECT l.id,l.machine_id,l.native_id,l.workspace,l.engine,l.mode,${resourceRequest('fleet_launches','l.id','l.request_json')} AS request_json,
       ${jsonFields('l.model_selection_json',['model'])} AS model_selection_json,l.state,l.finished_at,l.updated_at
-      FROM fleet_launches l WHERE l.native_id IS NOT NULL AND l.native_id<>'' ${machine ? 'AND l.machine_id=?' : ''}`,
-      ...(machine ? [machine] : []));
-    // Hydrate the complete alias set before selecting canonical sessions. Batch
-    // catalog facts instead of re-reading full intake histories for every alias.
+      FROM fleet_launches l WHERE l.id IN(SELECT value FROM json_each(?))`,JSON.stringify([...launchIds])):[];
     const key = (...parts: any[]) => JSON.stringify(parts);
-    // Write-through observed rows (census/reap paths patch the map; zero row
-    // reads on the hot path). Per-rebuild scan stays for the fallback mode.
-    const observedByNative = this.observed ? this.observed.byNative(machine) : new Map(this.sql.exec(`SELECT machine_id,native_id,tag,last_activity_at,created_at_ms,phase
-      FROM fleet_sessions ${machine ? 'WHERE machine_id=?' : ''}`, ...(machine ? [machine] : [])).toArray()
-      .map((r:any)=>[key(r.machine_id,r.native_id),r]));
-    const protectedIds = new Set(this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='session_control_protections'").toArray().length
-      ? this.sql.exec(`SELECT p.session_id FROM session_control_protections p JOIN session_control_sessions s ON s.id=p.session_id
-          ${machine ? 'WHERE s.machine_id=?' : ''}`, ...(machine ? [machine] : [])).toArray().map((r:any)=>r.session_id) : []);
-    const reapRows = this.sql.exec(`SELECT session_id,machine_id,native_id FROM resource_reaps ${machine ? 'WHERE machine_id=?' : ''}`,
-      ...(machine ? [machine] : [])).toArray();
-    const reapedAliases = new Set(reapRows.map((r:any)=>key(r.session_id,r.machine_id,r.native_id)));
-    const reapedNatives = new Set(reapRows.map((r:any)=>key(r.machine_id,r.native_id)));
+    const observedByNative=new Map<string,any>();
+    const reapedNatives=new Set<string>(),reapedAliases=new Set<string>();
+    for(const identity of nativeKeys.values()) {
+      const observed=read('SELECT machine_id,native_id,tag,last_activity_at,created_at_ms,phase FROM fleet_sessions WHERE machine_id=? AND native_id=?',identity.machine,identity.native)[0];
+      if(observed)observedByNative.set(key(identity.machine,identity.native),observed);
+      const reap=read('SELECT session_id FROM resource_reaps INDEXED BY resource_reaps_native WHERE machine_id=? AND native_id=? LIMIT 1',identity.machine,identity.native)[0];
+      if(reap){reapedNatives.add(key(identity.machine,identity.native));reapedAliases.add(key(reap.session_id,identity.machine,identity.native));}
+    }
+    const protectedIds=new Set<string>();
+    for(const id of controlIds)if(read('SELECT session_id FROM session_control_protections WHERE session_id=?',id).length)protectedIds.add(id);
     const controlData = new Map(rows.flatMap(s=>{
       const binding=catalogJson(s.binding_json);
       if(!binding.native_id || !binding.workspace || !binding.tag) return [];
       return [[s.id,{binding,req:catalogJson(s.request_json),launch:catalogJson(s.launch_request),model:catalogJson(s.model_selection_json)}] as const];
     }));
     const launchData = new Map(launches.filter(l=>l.machine_id && l.workspace && l.engine && ['headless','interactive'].includes(l.mode))
-      .map(l=>[l.id,{req:catalogJson(l.request_json),model:catalogJson(l.model_selection_json)}]));
+      .map(l=>[l.id,{req:catalogJson(l.request_json),model:catalogJson(l.model_selection_json),native_id:l.native_id}]));
     const intakeIds = [...new Set([...controlData.values()].map(s=>s.req.intake_task_id || s.launch.intake_task_id)
       .concat([...launchData.values()].map(l=>l.req.intake_task_id)).filter(Boolean))];
     const projects = new Map<any,any>();
@@ -562,8 +719,8 @@ export class ResourceManagement {
     // stamp-cached; without a watch the unscoped snapshot is cached as before.
     // Keep failures uncached.
     const worktreeLinks = this.intakeSnapshots
-      ? this.intakeSnapshots.get(machine ?? '', () => this.scopedIntakeSnapshot(machine, controlData, launchData))
-      : (this.catalogIntakes ?? worktreeIntakeSnapshot(this.sql));
+      ? this.intakeSnapshots.get(JSON.stringify([machine,[...controlData.keys()].sort(),[...launchData.keys()].sort()]), () => this.scopedIntakeSnapshot(machine, controlData, launchData))
+      : this.scopedIntakeSnapshot(machine,controlData,launchData);
     if (!this.intakeSnapshots && !this.catalogIntakes && this.catalogStructureRevision !== null && worktreeLinks.valid) {
       const entries = [...worktreeLinks.machines, ...worktreeLinks.projections, ...worktreeLinks.sessions];
       if (entries.length <= 10000 && entries.reduce((n, row) => n + 512 + JSON.stringify(row).length * 2, 0) <= 4 * 1024 * 1024) {
@@ -582,6 +739,7 @@ export class ResourceManagement {
           && req.provenance==='observed_native' && binding.provenance==='observed_native',
         intake_id:intakeId,
         linked_intake_open:worktreeIntakeProtected(this.sql, s, worktreeLinks),
+        intake_authority_observation_limited:!worktreeLinks.valid,
         native_id:binding.native_id, tag:binding.tag, workspace:binding.workspace,
         native_created_at_ms:binding.native_created_at_ms ?? observed?.created_at_ms ?? null,
         engine:s.engine, mode:s.mode, model:model.model ?? null, project,
@@ -598,7 +756,7 @@ export class ResourceManagement {
     // no new watchdog stop authority, including when an intake is attached.
     const shadowIds=new Map(bound.filter(s=>s.observed_shadow).map(s=>[JSON.stringify([s.machine_id,s.native_id]),s.session_id]));
     const fleetOnly = launches.flatMap(l => {
-      if (!l.machine_id || !l.workspace || !l.engine || !['headless','interactive'].includes(l.mode)) return [];
+      if (!l.machine_id || !l.native_id || !l.workspace || !l.engine || !['headless','interactive'].includes(l.mode)) return [];
       const {req,model}=launchData.get(l.id)!;
       const observed:any=observedByNative.get(key(l.machine_id,l.native_id));
       const intakeId=req.intake_task_id || null;
@@ -607,6 +765,7 @@ export class ResourceManagement {
         workspace:l.workspace,native_created_at_ms:observed?.created_at_ms ?? null,
         engine:l.engine,mode:l.mode,model:model.model ?? null,project:projects.get(intakeId) || req.project || l.workspace,
         tier:req.tier || policy.default_tier,kind:req.task_kind || 'goal',state:l.state,keep:req.keep===true,managed:false,
+        intake_authority_observation_limited:!worktreeLinks.valid,
         reaped:reapedNatives.has(key(l.machine_id,l.native_id)),
         last_activity_at:observed?.last_activity_at ?? null,
         // The request may have queued for hours; it is not a native start time.
@@ -615,21 +774,18 @@ export class ResourceManagement {
     });
     return [...bound,...fleetOnly];
   }
-  private canonicalSessions(machine?: string) {
+  private canonicalSessions(machine?: string, requested?:string[],advanceHealth=true) {
+    intakeLinkHealth(this.sql,advanceHealth,this.writes??undefined);
     // No time-based authority cache: metadata/authority writes change the
     // durable random generation, including rollback and retry. With the
     // write-through watch, the stamp check reads zero rows and is exactly as
     // fresh as the database; otherwise the trigger-maintained revision row
     // decides (and activity is still read live per call below).
     if (this.canonicalByMachine) {
-      const rows = this.canonicalByMachine.get(machine ?? '', () => this.buildCanonicalSessions(machine));
+      const rows = this.canonicalByMachine.get(JSON.stringify([machine,requested]), () => this.buildCanonicalSessions(machine,requested));
       // Activity overlays live from the write-through catalog: a census that
       // only refreshes timestamps must not rebuild retained identity history.
-      const activity = this.observed ? this.observed.activity(machine) : null;
-      const keyOf = (row: any) => JSON.stringify([row.machine_id, row.native_id]);
-      // Callers cannot mutate a cached protection or alias list.
-      return rows.map(row=>({...row,aliases:[...row.aliases],
-        last_activity_at: activity ? (activity.get(keyOf(row)) ?? null) : row.last_activity_at}));
+      return this.overlayActivity(rows);
     }
     const raw=this.catalogReady ? this.sql.exec('SELECT revision,structure_revision FROM resource_catalog_revision WHERE id=1').toArray()[0] : null;
     const revision=typeof raw?.revision==='string' && /^[a-f0-9]{32}$/.test(raw.revision) ? raw.revision : null;
@@ -637,11 +793,11 @@ export class ResourceManagement {
     if(structure===null || structure!==this.catalogStructureRevision) {this.catalogRawRows.clear();this.catalogIntakes=null;}
     this.catalogStructureRevision=structure;
     if(revision===null) this.catalogCache.clear();
-    const key=machine ?? ''; const cached=this.catalogCache.get(key);
+    const key=JSON.stringify([machine,requested]); const cached=this.catalogCache.get(key);
     let rows:ReturnType<ResourceManagement['buildCanonicalSessions']>;
     if(revision!==null && cached?.revision===revision) rows=cached.rows;
     else {
-      rows=this.buildCanonicalSessions(machine);
+      rows=this.buildCanonicalSessions(machine,requested);
       // Bound retained memory, including aliases; malformed legacy nested
       // values bypass caching so callers never share mutable nested data.
       const bytes=rows.reduce((n,row)=>n+256+Object.values(row).reduce<number>((sum,v)=>sum+(typeof v==='string'?v.length*2:Array.isArray(v)?v.reduce((a,b)=>a+String(b).length*2,0):8),0),0);
@@ -658,15 +814,31 @@ export class ResourceManagement {
     // A census activity refresh must not rebuild retained identity/protection
     // history. Read the live timestamps even when canonical metadata is cached,
     // including inside transactions and after their rollback.
-    const activity = new Map(this.readRows(`SELECT machine_id,native_id,last_activity_at FROM fleet_sessions ${machine ? 'WHERE machine_id=?' : ''}`,
-      ...(machine ? [machine] : [])).map(row=>[JSON.stringify([row.machine_id,row.native_id]),row.last_activity_at]));
-    // Callers cannot mutate a cached protection or alias list.
-    return rows.map(row=>({...row,aliases:[...row.aliases],last_activity_at:activity.get(JSON.stringify([row.machine_id,row.native_id])) ?? null}));
+    return this.overlayActivity(rows);
   }
-  private buildCanonicalSessions(machine?: string) {
+  private overlayActivity(rows:any[]):any[] {
+    const stamp=this.writes?.stamp('fleet_sessions')??null;
+    if(this.writes&&this.activityStamp!==null&&stamp!==this.activityStamp){this.liveActivity.clear();this.activityLost=true;}
+    this.activityStamp=stamp;
+    return rows.map(row=>{
+      const key=JSON.stringify([row.machine_id,row.native_id]);
+      let live=this.liveActivity.get(key);
+      const durable=!this.writes||!live?this.readRows('SELECT last_activity_at,observed_at FROM fleet_sessions WHERE machine_id=? AND native_id=?',row.machine_id,row.native_id)[0]:null;
+      if(live?.durable&&(live.durable.activity!==(durable?.last_activity_at??null)||live.durable.observed!==(durable?.observed_at??null))){
+        this.liveActivity.delete(key);this.activityLost=true;live=undefined;
+      }
+      const observedAt=Date.parse(live?live.observed:durable?.observed_at);
+      const fresh=Number.isFinite(observedAt)&&observedAt>=this.now()-180000&&observedAt<=this.now()+60000;
+      const limited=live?!fresh||!Number.isFinite(Date.parse(live.activity)):this.activityLost||!fresh;
+      return {...row,...(row.aliases?{aliases:[...row.aliases]}:{}),last_activity_at:live?live.activity:durable?.last_activity_at??null,
+        activity_observation_limited:limited,...(limited?{idle_reap_allowed:false}:{})};
+    });
+  }
+
+  private buildCanonicalSessions(machine?: string,requested?:string[]) {
     type Bound = ReturnType<ResourceManagement['boundSessions']>[number];
     const groups = new Map<string, {canonical: Bound; keep: boolean; reaped: boolean; intakeOpen: boolean; aliases: Set<string>}>();
-    for (const session of this.boundSessions(machine)) {
+    for (const session of this.boundSessions(machine,requested)) {
       const key = JSON.stringify([session.machine_id,session.native_id]);
       let group = groups.get(key);
       if (!group) {
@@ -695,7 +867,7 @@ export class ResourceManagement {
    * native_id) = (machine, native)`. One projection loads them in bulk instead
    * of a json_extract table scan per session. A corrupt binding on a host makes
    * that host's native authority unreadable, which is never reap permission. */
-  private idleAuthority(sessions: any[]) {
+  private idleAuthority(sessions: any[]):((session:any)=>any[]|null)&{limited?:Set<string>} {
     const byId = new Map<string, any>(), byNative = new Map<string, any[]>(), corrupt = new Set<string>();
     const add = (row: any) => {
       if (byId.has(row.id)) return;
@@ -712,13 +884,24 @@ export class ResourceManagement {
       if (typeof s.native_id === 'string') set.add(s.native_id);
       natives.set(s.machine_id, set);
     }
+    const limited=new Set<string>();
     for (const [machine, set] of natives) {
-      if (this.sql.exec(`SELECT 1 FROM session_control_sessions WHERE machine_id=? AND binding_json IS NOT NULL
-        AND NOT json_valid(binding_json) LIMIT 1`, machine).toArray().length) { corrupt.add(machine); continue; }
+      const stamp=this.writes?.stamp('session_control_sessions') ?? this.catalogStructureRevision;
+      let validity=this.idleBindingValidity.get(machine);
+      if(!validity || stamp===null || validity.stamp!==stamp) {
+        const page=this.sql.exec(`SELECT binding_json FROM session_control_sessions INDEXED BY session_control_machine_created
+          WHERE machine_id=? ORDER BY created_at,id LIMIT 129`,machine).toArray();
+        const malformed=page.some(row=>{if(row.binding_json===null)return false;try{JSON.parse(String(row.binding_json));return false;}catch{return true;}});
+        validity={stamp,corrupt:malformed,limited:page.length>128};this.idleBindingValidity.set(machine,validity);
+      }
+      if(validity.limited)limited.add(machine);
+      if(validity.corrupt || validity.limited){corrupt.add(machine);continue;}
       const list = [...set];
       for (let i = 0; i < list.length; i += 100) {
         const chunk = list.slice(i, i + 100);
-        for (const row of this.sql.exec(`SELECT ${columns} FROM session_control_sessions WHERE machine_id=? AND ${NATIVE_KEY} IN (${chunk.map(() => '?').join(',')})`, machine, ...chunk).toArray()) add(row);
+        const page=this.sql.exec(`SELECT ${columns} FROM session_control_sessions INDEXED BY intake_queue_session_native WHERE machine_id=? AND ${NATIVE_KEY} IN (${chunk.map(() => '?').join(',')}) LIMIT 129`, machine, ...chunk).toArray();
+        if(page.length>128){limited.add(machine);corrupt.add(machine);break;}
+        for(const row of page)add(row);
       }
     }
     const ids = [...new Set(sessions.map(s => s.session_id).filter(id => id !== null && id !== undefined && !byId.has(id)))];
@@ -726,7 +909,7 @@ export class ResourceManagement {
       const chunk = ids.slice(i, i + 100);
       for (const row of this.sql.exec(`SELECT ${columns} FROM session_control_sessions WHERE id IN (${chunk.map(() => '?').join(',')})`, ...chunk).toArray()) add(row);
     }
-    return (session: any): any[] | null => {
+    const lookup=((session: any): any[] | null => {
       if (session.machine_id !== null && session.machine_id !== undefined && corrupt.has(session.machine_id)) return null;
       const rows = new Map<string, any>();
       const own = byId.get(session.session_id);
@@ -735,9 +918,11 @@ export class ResourceManagement {
         for (const row of byNative.get(JSON.stringify([session.machine_id, session.native_id])) ?? []) rows.set(row.id, row);
       }
       return [...rows.values()];
-    };
+    }) as ((session:any)=>any[]|null)&{limited?:Set<string>};
+    lookup.limited=limited;return lookup;
   }
   private idleReapAllowed(session: any, authority?: (session: any) => any[] | null, cache: IdleReapCache = { intakes: new Map() }): boolean {
+    if(session.activity_observation_limited)return false;
     try {
       const rows = (authority ?? this.idleAuthority([session]))(session);
       if (rows === null) return false;
@@ -746,6 +931,7 @@ export class ResourceManagement {
     } catch { return false; } // corrupt/missing authority is never reap permission
   }
   sessions(machine?: string) {
+    intakeLinkHealth(this.sql,true,this.writes??undefined);
     // The watchdog response is served per host poll (and per session-progress
     // poll on the host); the canonical stamp plus the watchdog-only authority
     // sources gate the whole computation. Exactly-as-fresh: any write to a
@@ -754,22 +940,18 @@ export class ResourceManagement {
     // rebuilding the much larger authority projection.
     if (this.watchdogSessions && machine) {
       const sessions = this.watchdogSessions.get(machine, () => this.sessionsUncached(machine));
-      if (!this.observed) return sessions;
-      const activity = this.observed.activity(machine);
-      return sessions.map(session => {
-        const lastActivity = activity.get(JSON.stringify([session.machine_id, session.native_id])) ?? null;
-        return lastActivity === session.last_activity_at ? session : { ...session, last_activity_at: lastActivity };
-      });
+      return this.overlayActivity(sessions);
     }
     return this.sessionsUncached(machine);
   }
   private sessionsUncached(machine?: string) {
-    const canonical = this.canonicalSessions(machine).slice(0,1000);
-    let authority: (session: any) => any[] | null;
+    const canonical = this.canonicalSessions(machine,undefined,false).slice(0,1000);
+    let authority:ReturnType<ResourceManagement['idleAuthority']>;
     try { authority = this.idleAuthority(canonical); } catch { authority = () => { throw new Error('idle_authority_unavailable'); }; }
     const cache: IdleReapCache = { intakes: new Map() };
     return canonical.map(({aliases,...session}) => {
-      return { ...session, idle_reap_allowed: this.idleReapAllowed(session, authority, cache) };
+      return { ...session, idle_reap_allowed: this.idleReapAllowed(session, authority, cache),
+        authority_observation_limited:authority.limited?.has(session.machine_id) ?? false };
     });
   }
   private note(session: any, key: string, text: string) {
@@ -781,7 +963,9 @@ export class ResourceManagement {
   }
 
   evidence(machine: string, value: any) {
-    const session = this.sessions(machine).find(s => s.session_id===value.session_id && s.native_id===value.native_id);
+    const canonical=this.canonicalSessions(machine,[value.session_id]);
+    const match=canonical.find(s => s.aliases.includes(value.session_id) && s.native_id===value.native_id);
+    const session=match ? {...match,idle_reap_allowed:this.idleReapAllowed(match)} : null;
     if (!session?.managed || session.keep || (value.reason === 'idle' && !session.idle_reap_allowed) || !session.intake_id) throw new Error('session_not_reapable');
     // Worktree-guard (AC2): never reap for idleness while the linked intake
     // is open. Nudge/replace instead; reaping resumes after DONE/archive.
@@ -801,20 +985,54 @@ export class ResourceManagement {
   report(machine: string, value: any) {
     // Accept reports already in flight under an older canonical alias, but put
     // every physical native in exactly one durable ledger row.
-    const sessions = new Map(this.canonicalSessions(machine).flatMap(s => s.aliases.map(id=>[id,s] as const)));
     if (!value || !Array.isArray(value.samples) || !Array.isArray(value.reaps) || value.samples.length>200 || value.reaps.length>100
       || (value.throttles !== undefined && (!Array.isArray(value.throttles) || value.throttles.length>100))) throw new Error('invalid_resource_report');
-    for (const sample of value.samples) {
+    if(!value.samples.length&&!value.reaps.length&&!(value.throttles?.length))return {reported:true,samples:0,reaps:0};
+    const requested=[...new Set<string>([...value.samples,...value.reaps,...(value.throttles??[])].map(item=>item?.session_id).filter(id=>typeof id==='string'))];
+    // Complete the bounded identity/alias observation before advancing even
+    // migration metadata. An oversized native cohort must be a zero-write
+    // refusal, including control writes which a SQL rollback cannot unbill.
+    const preflight=this.canonicalSessions(machine,requested,false);
+    const health=intakeLinkHealth(this.sql,true,this.writes??undefined);
+    // A completed page can change authority metadata. Reuse the bounded raw
+    // identity observations, but render against the newly proven health so
+    // the first sample and its unchanged retry share identical metadata.
+    const canonical=health.ready?this.canonicalSessions(machine,requested,false):preflight;
+    const sessions = new Map<string,any>(canonical.flatMap(s => s.aliases.map((id:string)=>[id,s] as const)));
+    for (const reportedSample of value.samples) {
+      let sample={...reportedSample};
       const session = sessions.get(sample.session_id);
       if (!session || sample.native_id!==session.native_id) throw new Error('resource_binding_mismatch');
       for (const k of ['current_rss_mb','peak_rss_mb','peak_pss_mb','p50_rss_mb','cpu_seconds','runtime_s','avg_cpu_cores','current_cpu_cores','p95_cpu_cores','oom_kills']) if (sample[k]!=null && (!finite(sample[k]) || sample[k]>1e12)) throw new Error('invalid_resource_sample');
       const at=Date.parse(sample.observed_at);
       if (!Number.isFinite(at) || at>this.now()+30000 || at<this.now()-86400000) throw new Error('invalid_resource_timestamp');
+      const cacheKey=session.fleet_launch_id || JSON.stringify([machine,session.native_id]);
+      const cached=this.liveTelemetry.get(cacheKey);
+      const meta=JSON.stringify([machine,session.native_id,session.session_id,session.fleet_launch_id,session.intake_id,session.project,session.engine,session.model,session.tier,session.kind,session.started_at,session.finished_at,session.state,session.workspace]);
+      if(cached) {
+        const newest=at>=Date.parse(cached.sample.observed_at)?sample:cached.sample;
+        sample={...newest};
+        for(const key of ['peak_rss_mb','peak_pss_mb','cpu_seconds','runtime_s','oom_kills']) {
+          const values=[cached.sample[key],reportedSample[key]].filter(finite);
+          if(values.length)sample[key]=Math.max(...values);
+        }
+      }
+      const oomChanged=finite(sample.oom_kills) && sample.oom_kills>(cached?.sample.oom_kills ?? 0);
+      // Terminal evidence can arrive after a memory-only final checkpoint.
+      // Flush changed measurements, while timestamp-only terminal polls stay free.
+      const terminalChanged=TERMINAL.has(session.state) && cached &&
+        ['current_rss_mb','peak_rss_mb','peak_pss_mb','p50_rss_mb','cpu_seconds','runtime_s','avg_cpu_cores','current_cpu_cores','p95_cpu_cores','oom_kills']
+          .some(key=>finite(sample[key]) && sample[key]!==cached.sample[key]);
+      const flush=!cached || cached.meta!==meta || this.now()-cached.persistedAt>=3600000 || oomChanged || terminalChanged;
+      // Cap advisory memory only; eviction never grants admission credit.
+      if(!cached && this.liveTelemetry.size>=2048)this.liveTelemetry.delete(this.liveTelemetry.keys().next().value!);
+      this.liveTelemetry.set(cacheKey,{sample,meta,persistedAt:flush?this.now():cached.persistedAt});
+      if(!flush)continue;
       const old:any=this.sql.exec('SELECT * FROM session_resource_usage WHERE machine_id=? AND native_id=?',machine,session.native_id).toArray()[0];
       const ledgerId=old?.session_id ?? session.session_id;
       this.sql.exec('INSERT INTO session_resource_metadata VALUES(?,?) ON CONFLICT(session_id) DO UPDATE SET workspace=excluded.workspace WHERE session_resource_metadata.workspace IS NOT excluded.workspace',ledgerId,session.workspace);
       if (session.fleet_launch_id && finite(sample.current_cpu_cores)) this.sql.exec(`INSERT INTO resource_cpu_samples VALUES(?,?,?) ON CONFLICT(launch_id) DO UPDATE SET current_cpu_cores=excluded.current_cpu_cores,observed_at=excluded.observed_at
-        WHERE excluded.observed_at>resource_cpu_samples.observed_at AND (excluded.current_cpu_cores IS NOT resource_cpu_samples.current_cpu_cores OR substr(excluded.observed_at,1,16)>substr(resource_cpu_samples.observed_at,1,16))`,session.fleet_launch_id,sample.current_cpu_cores,sample.observed_at);
+        WHERE excluded.observed_at>resource_cpu_samples.observed_at AND (excluded.current_cpu_cores IS NOT resource_cpu_samples.current_cpu_cores)`,session.fleet_launch_id,sample.current_cpu_cores,sample.observed_at);
       if (finite(sample.p95_cpu_cores)) {
         const finalized=this.sql.exec('SELECT 1 FROM session_cpu_finalized WHERE session_id=?',ledgerId).toArray().length>0;
         const prior:any=this.sql.exec('SELECT observed_at FROM session_cpu_usage WHERE session_id=?',ledgerId).toArray()[0];
@@ -822,15 +1040,15 @@ export class ResourceManagement {
         // only an actual terminal CPU report, never a memory-only final row.
         if (!finalized && (!prior || at>=Date.parse(prior.observed_at))) {
           this.sql.exec(`INSERT INTO session_cpu_usage VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET p95_cpu_cores=excluded.p95_cpu_cores,observed_at=excluded.observed_at
-            WHERE excluded.observed_at>=session_cpu_usage.observed_at AND (excluded.p95_cpu_cores IS NOT session_cpu_usage.p95_cpu_cores OR substr(excluded.observed_at,1,16)>substr(session_cpu_usage.observed_at,1,16))`,ledgerId,sample.p95_cpu_cores,sample.observed_at);
+            WHERE excluded.observed_at>=session_cpu_usage.observed_at AND (excluded.p95_cpu_cores IS NOT session_cpu_usage.p95_cpu_cores)`,ledgerId,sample.p95_cpu_cores,sample.observed_at);
           if (TERMINAL.has(session.state)) this.sql.exec('INSERT OR IGNORE INTO session_cpu_finalized VALUES(?,?)',ledgerId,sample.observed_at);
         }
       }
       if (finite(sample.oom_kills) && Number.isInteger(sample.oom_kills) && sample.oom_kills>=0) this.sql.exec('INSERT INTO session_oom_kills VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET oom_kills=excluded.oom_kills,observed_at=excluded.observed_at WHERE excluded.oom_kills>session_oom_kills.oom_kills',ledgerId,sample.oom_kills,sample.observed_at);
       if (finite(sample.p50_rss_mb)) this.sql.exec(`INSERT INTO session_rss_median VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET p50_rss_mb=excluded.p50_rss_mb,observed_at=excluded.observed_at
-        WHERE excluded.observed_at>=session_rss_median.observed_at AND (excluded.p50_rss_mb IS NOT session_rss_median.p50_rss_mb OR substr(excluded.observed_at,1,16)>substr(session_rss_median.observed_at,1,16))`,ledgerId,sample.p50_rss_mb,sample.observed_at);
+        WHERE excluded.observed_at>=session_rss_median.observed_at AND (excluded.p50_rss_mb IS NOT session_rss_median.p50_rss_mb)`,ledgerId,sample.p50_rss_mb,sample.observed_at);
       if (session.fleet_launch_id && finite(sample.current_rss_mb)) this.sql.exec(`INSERT INTO resource_resident_samples VALUES(?,?,?) ON CONFLICT(launch_id) DO UPDATE SET resident_mb=excluded.resident_mb,observed_at=excluded.observed_at
-        WHERE excluded.observed_at>=resource_resident_samples.observed_at AND (excluded.resident_mb IS NOT resource_resident_samples.resident_mb OR substr(excluded.observed_at,1,16)>substr(resource_resident_samples.observed_at,1,16))`,session.fleet_launch_id,sample.current_rss_mb,sample.observed_at);
+        WHERE excluded.observed_at>=resource_resident_samples.observed_at AND (excluded.resident_mb IS NOT resource_resident_samples.resident_mb)`,session.fleet_launch_id,sample.current_rss_mb,sample.observed_at);
       const max = (k:string) => finite(sample[k]) ? Math.max(old?.[k] ?? 0,sample[k]) : old?.[k] ?? null;
       const cpu=max('cpu_seconds'),runtime=max('runtime_s');
       this.sql.exec(`INSERT INTO session_resource_usage VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
@@ -848,8 +1066,7 @@ export class ResourceManagement {
           OR session_resource_usage.finished_at IS NOT excluded.finished_at OR session_resource_usage.state IS NOT excluded.state
           OR session_resource_usage.peak_rss_mb IS NOT excluded.peak_rss_mb OR session_resource_usage.peak_pss_mb IS NOT excluded.peak_pss_mb
           OR session_resource_usage.cpu_seconds IS NOT excluded.cpu_seconds OR session_resource_usage.runtime_s IS NOT excluded.runtime_s
-          OR session_resource_usage.avg_cpu_cores IS NOT excluded.avg_cpu_cores
-          OR substr(excluded.observed_at,1,16)>substr(session_resource_usage.observed_at,1,16)`,
+          OR session_resource_usage.avg_cpu_cores IS NOT excluded.avg_cpu_cores`,
         ledgerId,machine,session.native_id,session.fleet_launch_id,session.intake_id,session.project,session.engine,session.model,session.tier,session.kind,
         // Legacy storage requires text; an empty unknown is exposed as null,
         // never replaced with the time a launch entered the queue.
@@ -912,23 +1129,33 @@ export class ResourceManagement {
     }
     return {reported:true,samples:value.samples.length,reaps:value.reaps.length};
   }
+  private lastUsageObservation:{order:string;truncated:boolean;next_cursor:string|null;raw_scanned:number}={order:'insertion_desc',truncated:false,next_cursor:null,raw_scanned:0};
+  usageObservation(){return {...this.lastUsageObservation};}
   usage(filters: any = {}) {
-    const clauses:string[]=[], args:string[]=[];
-    for (const k of ['project','engine','kind']) if(filters[k]) { clauses.push(k+'=?');args.push(filters[k]); }
+    const cursor=filters.cursor;
+    if(cursor!==undefined && (!/^\d{1,16}$/.test(String(cursor)) || !Number.isSafeInteger(Number(cursor))))throw new Error('invalid_resource_cursor');
+    const source=(cursor
+      ?this.sql.exec('SELECT rowid AS page_rowid,* FROM session_resource_usage WHERE rowid<? ORDER BY rowid DESC LIMIT 501',Number(cursor))
+      :this.sql.exec('SELECT rowid AS page_rowid,* FROM session_resource_usage ORDER BY rowid DESC LIMIT 501')).toArray() as any[];
+    const prefix=source.slice(0,500);
+    this.lastUsageObservation={order:'insertion_desc',truncated:source.length>500,next_cursor:source.length>500?String(prefix[prefix.length-1].page_rowid):null,raw_scanned:prefix.length};
+    const candidates=prefix.filter(row=>['project','engine','kind'].every(key=>!filters[key]||row[key]===filters[key]));
     const latestThrottle=new Map<string,boolean>();
-    for (const r of this.sql.exec('SELECT machine_id,native_id,action,outcome FROM resource_throttles ORDER BY at DESC, rowid DESC LIMIT 1000').toArray() as any[]) {
+    const receipts=this.sql.exec('SELECT machine_id,native_id,action,outcome,at FROM resource_throttles ORDER BY rowid DESC LIMIT 1001').toArray() as any[];
+    const receiptsLimited=receipts.length>1000;
+    for (const r of receipts.slice(0,1000).sort((a,b)=>String(b.at).localeCompare(String(a.at)))) {
       const key=r.machine_id+':'+r.native_id;
       if (!latestThrottle.has(key)) latestThrottle.set(key,r.action==='throttled' || (r.action==='released' && r.outcome==='unverified'));
     }
-    return this.sql.exec('SELECT * FROM session_resource_usage'+(clauses.length?' WHERE '+clauses.join(' AND '):'')+' ORDER BY observed_at DESC LIMIT 500',...args).toArray().map((r:any)=>({...r,started_at:r.started_at || null,workspace:this.sql.exec('SELECT workspace FROM session_resource_metadata WHERE session_id=?',r.session_id).toArray()[0]?.workspace ?? null,p95_cpu_cores:this.sql.exec('SELECT p95_cpu_cores FROM session_cpu_usage WHERE session_id=?',r.session_id).toArray()[0]?.p95_cpu_cores ?? null,p50_rss_mb:this.sql.exec('SELECT p50_rss_mb FROM session_rss_median WHERE session_id=?',r.session_id).toArray()[0]?.p50_rss_mb ?? null,oom_kills:this.sql.exec('SELECT oom_kills FROM session_oom_kills WHERE session_id=?',r.session_id).toArray()[0]?.oom_kills ?? null,project_label:projectLabel(r.project),rss_flagged:r.peak_rss_mb>=this.config().rss_flag_gb*1024,token_join_key:r.machine_id+':'+r.native_id,cpu_throttled:latestThrottle.get(r.machine_id+':'+r.native_id)===true}));
+    return candidates.map(({page_rowid,...r}:any)=>({...r,started_at:r.started_at || null,workspace:this.sql.exec('SELECT workspace FROM session_resource_metadata WHERE session_id=?',r.session_id).toArray()[0]?.workspace ?? null,p95_cpu_cores:this.sql.exec('SELECT p95_cpu_cores FROM session_cpu_usage WHERE session_id=?',r.session_id).toArray()[0]?.p95_cpu_cores ?? null,p50_rss_mb:this.sql.exec('SELECT p50_rss_mb FROM session_rss_median WHERE session_id=?',r.session_id).toArray()[0]?.p50_rss_mb ?? null,oom_kills:this.sql.exec('SELECT oom_kills FROM session_oom_kills WHERE session_id=?',r.session_id).toArray()[0]?.oom_kills ?? null,project_label:projectLabel(r.project),rss_flagged:r.peak_rss_mb>=this.config().rss_flag_gb*1024,token_join_key:r.machine_id+':'+r.native_id,cpu_throttled:latestThrottle.has(r.machine_id+':'+r.native_id)?latestThrottle.get(r.machine_id+':'+r.native_id)===true:receiptsLimited?null:false}));
   }
-  reaps() { return this.sql.exec('SELECT * FROM resource_reaps ORDER BY at DESC LIMIT 100').toArray(); }
+  reaps() { return (this.sql.exec('SELECT * FROM resource_reaps ORDER BY rowid DESC LIMIT 100').toArray() as any[]).sort((a,b)=>String(b.at).localeCompare(String(a.at))); }
   throttles() {
-    const rows=this.sql.exec('SELECT * FROM resource_throttles ORDER BY at DESC, rowid DESC LIMIT 100').toArray();
+    const rows=(this.sql.exec('SELECT * FROM resource_throttles ORDER BY rowid DESC LIMIT 100').toArray() as any[]).sort((a,b)=>String(b.at).localeCompare(String(a.at)));
     // Newest receipt per physical native decides the active flag. A failed
     // restore remains active until a later verified release arrives.
     const latest=new Map<string,any>();
-    for (const r of this.sql.exec('SELECT id,machine_id,native_id,action,outcome FROM resource_throttles ORDER BY at DESC, rowid DESC LIMIT 1000').toArray() as any[]) {
+    for (const r of (this.sql.exec('SELECT id,machine_id,native_id,action,outcome,at FROM resource_throttles ORDER BY rowid DESC LIMIT 1000').toArray() as any[]).sort((a,b)=>String(b.at).localeCompare(String(a.at)))) {
       const key=r.machine_id+':'+r.native_id;
       if (!latest.has(key)) latest.set(key,r);
     }
@@ -951,7 +1178,8 @@ export class ResourceManagement {
     if (cpu.cpu_saturated === true) reasons.push('cpu_busy_over_'+CPU_SATURATED_PCT+'pct_10s');
     if (memAvail !== null && memAvail < memoryFloorMb) reasons.push('mem_available_below_'+memoryFloorMb+'mb');
     const perTaskCpu = this.cpuEstimate(null, null).expected_cpu_cores;
-    const rows = this.sql.exec('SELECT COALESCE(m.p50_rss_mb,u.peak_rss_mb) AS peak_rss_mb FROM session_resource_usage u LEFT JOIN session_rss_median m ON m.session_id=u.session_id WHERE u.finished_at IS NOT NULL AND u.peak_rss_mb > 0 ORDER BY u.observed_at DESC LIMIT 500').toArray() as any[];
+    const history = this.readRows('SELECT COALESCE(m.p50_rss_mb,u.peak_rss_mb) AS peak_rss_mb FROM (SELECT session_id,peak_rss_mb FROM session_resource_usage INDEXED BY resource_cpu_recent WHERE finished_at IS NOT NULL ORDER BY observed_at DESC LIMIT 501) u LEFT JOIN session_rss_median m ON m.session_id=u.session_id');
+    const rows=history.slice(0,500).filter(row=>finite(row.peak_rss_mb)&&row.peak_rss_mb>0);
     const p90 = percentile(rows.map(r => Number(r.peak_rss_mb)), config.estimate_percentile);
     const perTaskMem = Math.ceil(Math.min(config.estimate_cap_mb, Math.max(64, p90 === null ? config.ramp_reserve_default_mb : p90 * config.estimate_multiplier)));
     const freeCores = cores !== null && busy !== null ? Math.max(0, cores - busy) : null;
@@ -961,12 +1189,14 @@ export class ResourceManagement {
     return { machine_id: String(m.id), cores, cpu_busy_cores: busy, cpu_busy_percent: finite(cpu.current_cpu_cores) && cores ? Math.round(cpu.current_cpu_cores / cores * 1000) / 10 : null,
       cpu_busy_percent_10s: cpu.busy_percent_window ?? null, cpu_window_s: cpu.window_s ?? null, free_cores: freeCores,
       mem_available_mb: memAvail, mem_total_mb: hb.mem_total_mb ?? null, full: reasons.length > 0, full_reasons: reasons,
+      history_observation_limited:history.length>500,history_scope:'recent_finished_window',
       telemetry_state: cpu.telemetry_state ?? 'unknown', est_cpu_per_task: perTaskCpu, est_mem_per_task_mb: perTaskMem,
       extra_tasks_by_cpu: byCpu, extra_tasks_by_memory: byMem,
       extra_tasks: reasons.length ? 0 : known.length ? Math.min(...known) : null };
   }
   overview() {
-    const rows=this.sql.exec('SELECT id,hostname,drained,capabilities,last_heartbeat,last_checkin_at FROM machines WHERE drained=0 AND revoked_at IS NULL').toArray() as any[];
+    const rows=this.sql.exec('SELECT id,hostname,drained,capabilities,last_heartbeat,last_checkin_at FROM machines WHERE drained=0 AND revoked_at IS NULL ORDER BY id LIMIT 65').toArray() as any[];
+    if(rows.length>64)throw new ResourceObservationLimit();
     // Intake 4398ce2a: a stale re-registered record of the same physical host
     // (SnV2 for live DEFLf4, hostname RMTHZ) has no telemetry and showed up as
     // a second host with CPU/memory 'unknown'. Mark-never-delete aliasing:
@@ -977,17 +1207,20 @@ export class ResourceManagement {
         return {id:String(m.id),hostname:m.hostname,drained:m.drained,last_seen_ms:Number.isFinite(at)?at:null};})).aliasOf;
     } catch { aliasOf=new Map(); }
     const hosts=rows.filter((m:any)=>!aliasOf.has(String(m.id))).map((m:any)=>{
-      const hb=parse(m.last_heartbeat),caps=parse(m.capabilities),headroom=this.headroom(m.id),cpuView=this.cpuHeadroom(m.id);
+      const hb=parse(effectiveHeartbeat(this.sql,m.id,m.last_heartbeat)),caps=parse(m.capabilities),headroom=this.headroom(m.id),cpuView=this.cpuHeadroom(m.id);
       return {machine_id:m.id,aliases:[...aliasOf].filter(([,c])=>c===String(m.id)).map(([a])=>a).sort(),mem_total_mb:hb.mem_total_mb??null,
         mem_used_mb:finite(hb.mem_total_mb)&&finite(hb.mem_avail_mb)?hb.mem_total_mb-hb.mem_avail_mb:null,
         load5:hb.load?.[1]??null,cores:caps.cpu_count??null,...headroom,cpu:cpuView,capacity:this.capacity(m,hb,caps,cpuView),host_observed_at:m.last_checkin_at,
-        running:Number(this.sql.exec("SELECT COUNT(*) AS n FROM fleet_sessions WHERE machine_id=? AND phase='running'",m.id).one().n),
-        queued:Number(this.sql.exec("SELECT COUNT(*) AS n FROM fleet_launches WHERE state='queued' AND (machine_id=? OR machine_id='')",m.id).one().n)};
+        ...(()=>{
+          const running=this.sql.exec("SELECT 1 FROM fleet_sessions INDEXED BY fleet_session_machine_phase WHERE machine_id=? AND phase='running' LIMIT 129",m.id).toArray().length;
+          let queued=0;for(const machine of [m.id,'']){queued+=this.sql.exec("SELECT 1 FROM fleet_launches INDEXED BY fleet_launch_machine_state WHERE machine_id=? AND state='queued' LIMIT ?",machine,Math.max(1,129-queued)).toArray().length;if(queued>128)break;}
+          return {running:running>128?null:running,queued:queued>128?null:queued,count_observation_limited:running>128||queued>128};
+        })()};
     });
     const sessions=this.usage(),groups=new Map<string,any[]>();
     for (const row of sessions as any[]) {const key=JSON.stringify([row.project_label,row.engine,row.model,row.kind]); if(!groups.has(key))groups.set(key,[]);groups.get(key)!.push(row);}
     const throttles=this.throttles();
-    return {config:this.config(),hosts,sessions,stats:[...groups.values()].map(rows=>({project:rows[0].project_label,engine:rows[0].engine,model:rows[0].model,kind:rows[0].kind,samples:rows.length,
+    return {config:this.config(),hosts,sessions,usage_observation:this.usageObservation(),receipt_observation_scope:'recent_insertion_window',stats:[...groups.values()].map(rows=>({project:rows[0].project_label,engine:rows[0].engine,model:rows[0].model,kind:rows[0].kind,samples:rows.length,
       p50_rss_mb:percentile(rows.map(r=>r.peak_rss_mb).filter(finite),50),p90_rss_mb:percentile(rows.map(r=>r.peak_rss_mb).filter(finite),90)})),reaps:this.reaps(),
       throttles,active_throttles:throttles.filter((t:any)=>t.active).length};
   }

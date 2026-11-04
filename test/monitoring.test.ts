@@ -1,3 +1,4 @@
+import {fixtureSql} from './helpers/fixture-budget';
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import type { Hub } from '../src/hub';
@@ -70,17 +71,18 @@ describe('Disk Monitoring Service', () => {
     insert('malformed',3600,'{broken');
     insert('invalid-elements',1800,JSON.stringify({filesystems:['invalid',42,null]}));
     expect(trend()).toMatchObject({sample_count:2,growth_bytes_per_day:240});
-    // Simulate an interrupted legacy backfill; init must repopulate once.
+    // Retained legacy history is never repaired by constructor startup.
     sql.exec('DELETE FROM disk_trend_samples');
     sql.exec('DELETE FROM disk_trend_projection_meta');
     hub.monitoringService.init();
-    expect(trend()).toMatchObject({sample_count:2,growth_bytes_per_day:240});
+    expect(trend()).toMatchObject({state:'insufficient_history',reason:'calculation_error'});
+    expect(sql.exec('SELECT id FROM disk_trend_projection_meta').toArray()).toEqual([]);
     const projected = sql.exec('SELECT * FROM disk_trend_samples ORDER BY id,ordinal').toArray();
     hub.monitoringService.init();
     expect(sql.exec('SELECT * FROM disk_trend_samples ORDER BY id,ordinal').toArray()).toEqual(projected);
     sql.exec("DELETE FROM disk_observations WHERE id='old'");
     expect(sql.exec("SELECT id FROM disk_trend_samples WHERE id='old'").toArray()).toHaveLength(0);
-    expect(trend()).toMatchObject({state:'insufficient_history',reason:'insufficient_samples'});
+    expect(trend()).toMatchObject({state:'insufficient_history',reason:'calculation_error'});
   }));
   it('formats bytes correctly', () => {
     expect(formatBytes(0)).toBe('0 B');
@@ -716,7 +718,7 @@ describe('Disk Monitoring Service', () => {
     // Seed well above the former hard 256/512 refuse without approaching the safety-net ceiling.
     for (let i = 0; i < 520; i++) {
       const dummyId = `dummy-task-${i.toString().padStart(4, '0')}`;
-      hub.sql.exec(
+      fixtureSql(hub).exec(
         'INSERT INTO intake_tasks(id, data) VALUES(?, ?)',
         dummyId,
         JSON.stringify({ id: dummyId, project: 'demo', title: `Dummy ${i}`, status: 'open', version: 1, created_at: clock.t, updated_at: clock.t, history: [] }),

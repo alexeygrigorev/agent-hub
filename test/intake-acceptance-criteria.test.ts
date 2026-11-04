@@ -1,3 +1,4 @@
+import { freshFixtureBudgetDay, fixtureSql } from './helpers/fixture-budget';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { env, SELF, runInDurableObject } from 'cloudflare:test';
 import { createSessionCookie } from '../src/auth/session';
@@ -35,9 +36,10 @@ const assignPayload = (version: number, keySuffix = '') => ({ key: 'ac-assign-' 
 
 beforeEach(async () => {
   cookie = (await createSessionCookie(env as any, { sub: 'operator', email: 'admin@fake.local', isAdmin: true, csrfToken: 'csrf', exp: Math.floor(Date.now()/1000)+3600 })).split(';')[0];
-  await inDO(stub(), (h: any) => {
+  await inDO(stub(), async (h: any) => {
+    await freshFixtureBudgetDay(h);
     h.env.HUB_ADMIN_TOKEN_SHA256 = 'a'.repeat(64);
-    for (const t of ['tasks','grants','rules','receipts']) h.sql.exec('DELETE FROM intake_' + t);
+    for (const t of ['tasks','grants','rules','receipts']) fixtureSql(h).exec('DELETE FROM intake_' + t);
     h.sql.exec('UPDATE intake_meta SET revision=0');
     h.sessionControlService.hooks.reserve = undefined;
     h.sql.exec('DELETE FROM credentials'); h.sql.exec('DELETE FROM agents');
@@ -249,7 +251,12 @@ describe('linked start failure and migration boundaries', () => {
       const data = JSON.parse(h.sql.exec('SELECT data FROM intake_tasks WHERE id=?', task.id).toArray()[0].data);
       data.history = data.history.filter((e: any) => e.kind !== 'link'); data.version = 1;
       h.sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(data), task.id);
-      h.sessionControlService.init(); h.sessionControlService.init();
+      fixtureSql(h).exec('DELETE FROM hub_init_stamps WHERE key=?','session_intake_links_t2609u');
+      fixtureSql(h).exec('DELETE FROM session_intake_link_repair_cursor WHERE key=?','session_intake_links_t2609u');
+      h.sessionControlService.init();
+      expect(JSON.parse(h.sql.exec('SELECT data FROM intake_tasks WHERE id=?',task.id).one().data).history.some((e:any)=>e.kind==='link')).toBe(false);
+      expect(h.sessionControlService.repairIntakeLinks()).toMatchObject({complete:true,repaired:1});
+      expect(h.sessionControlService.repairIntakeLinks()).toMatchObject({complete:true,repaired:0});
     });
     let shown = (await ok('/tasks/' + task.id)).task;
     expect(shown.assigned_sessions[0].hub_session_id).toBe(start.data.id);
@@ -261,6 +268,7 @@ describe('linked start failure and migration boundaries', () => {
       manual.evidence = 'external_unverified_not_launch_proof'; manual.authority = 'untrusted_task_data'; manual.provenance = source;
       h.sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(data), task.id);
       h.sessionControlService.init();
+      expect(h.sessionControlService.repairIntakeLinks()).toMatchObject({complete:true,repaired:0});
     });
     shown = (await ok('/tasks/' + task.id)).task;
     expect(shown.version).toBe(version);

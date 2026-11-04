@@ -1,3 +1,4 @@
+import { initIntakeSummary, advanceIntakeSummary, intakeSummaryReady } from './intake-summary';
 /** Durable private intake. Payload text is data, never execution or operator authority. */
 import type { SqlStorage } from '@cloudflare/workers-types';
 import type { CallerContext } from './bus';
@@ -349,7 +350,14 @@ export function recordIntakeSessionLink(sql: SqlStorage, session: Obj, now: numb
   const taskId = request.intake_task_id;
   if (typeof taskId !== 'string' || !taskId) return false;
   let rows: any[] = sql.exec('SELECT data FROM intake_tasks WHERE id=?', taskId).toArray();
-  if (!rows.length && taskId.length >= 6) rows = sql.exec('SELECT data FROM intake_tasks WHERE id COLLATE NOCASE LIKE ? LIMIT 2', taskId + '%').toArray();
+  if (!rows.length && taskId.length >= 6) {
+    // Imported shorthand is rare. Bound the deployed PK source before the
+    // case-insensitive prefix check, without building a full-table index.
+    const ids=sql.exec('SELECT id FROM intake_tasks ORDER BY id LIMIT 5001').toArray() as any[];
+    if(ids.length>5000) throw new IntakeSessionLinkError('task_lookup_observation_incomplete');
+    const matching=ids.filter(row=>String(row.id).toLowerCase().startsWith(taskId.toLowerCase()));
+    if(matching.length===1) rows=sql.exec('SELECT data FROM intake_tasks WHERE id=?',matching[0].id).toArray();
+  }
   if (rows.length !== 1) return false; // pruned, missing or ambiguous historical task
   const task = JSON.parse(rows[0].data);
   if (task.history.some((e: Obj) => e !== null && typeof e === 'object' && ['link', 'session'].includes(e.kind) && e.hub_session_id === session.id)) return false;
@@ -405,6 +413,7 @@ export class IntakeService {
   public mergeGate: MergeGate;
   public dependencies: IntakeDependencies;
   private closeGates: IntakeCloseGate[] = [];
+  private archiveAfter = '';
   addCloseGate(gate: IntakeCloseGate) { this.closeGates.push(gate); }
   constructor(public sql: SqlStorage, private tx: Tx = <T>(fn: () => T) => fn(), private hooks: IntakeHooks = {}) {
     this.worktrees = new IntakeWorktrees(sql);
@@ -454,22 +463,7 @@ export class IntakeService {
       // single-threaded DO for seconds (same accounting pattern as
       // intake_storage_totals). Value columns are affinity-less so each stored
       // value keeps the exact JSON type of the source field.
-      this.sql.exec('CREATE TABLE IF NOT EXISTS intake_status_summary (id TEXT PRIMARY KEY, project, status, title, updated_at, created_at, archived_at, version) WITHOUT ROWID');
-      this.sql.exec("CREATE INDEX IF NOT EXISTS intake_status_summary_unarchived_terminal ON intake_status_summary(id) WHERE archived_at IS NULL AND status NOT IN ('open','in_progress','blocked','pending_approval')");
-      const summaryValues = (p: string) => `json_extract(${p}data,'$.project'),json_extract(${p}data,'$.status'),json_extract(${p}data,'$.title'),json_extract(${p}data,'$.updated_at'),json_extract(${p}data,'$.created_at'),json_extract(${p}data,'$.archived_at'),json_extract(${p}data,'$.version')`;
-      const summaryUpsert = (p: string) => `INSERT INTO intake_status_summary(id,project,status,title,updated_at,created_at,archived_at,version) VALUES(${p}id,${summaryValues(p)})
-        ON CONFLICT(id) DO UPDATE SET project=excluded.project,status=excluded.status,title=excluded.title,updated_at=excluded.updated_at,created_at=excluded.created_at,archived_at=excluded.archived_at,version=excluded.version`;
-      this.sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_status_summary_insert AFTER INSERT ON intake_tasks BEGIN ${summaryUpsert('NEW.')}; END`);
-      this.sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_status_summary_update AFTER UPDATE ON intake_tasks BEGIN ${summaryUpsert('NEW.')}; END`);
-      this.sql.exec('CREATE TRIGGER IF NOT EXISTS intake_status_summary_delete AFTER DELETE ON intake_tasks BEGIN DELETE FROM intake_status_summary WHERE id=OLD.id; END');
-      // Repair drift only when counts disagree (first boot after this deploy,
-      // or a task written while triggers were absent); never a per-boot scan.
-      if (Number(this.sql.exec('SELECT COUNT(*) AS n FROM intake_tasks').one().n) !== Number(this.sql.exec('SELECT COUNT(*) AS n FROM intake_status_summary').one().n)) {
-        this.sql.exec(`DELETE FROM intake_status_summary WHERE id NOT IN (SELECT id FROM intake_tasks)`);
-        this.sql.exec(`INSERT INTO intake_status_summary(id,project,status,title,updated_at,created_at,archived_at,version) SELECT id,${summaryValues('')} FROM intake_tasks WHERE true
-          ON CONFLICT(id) DO UPDATE SET project=excluded.project,status=excluded.status,title=excluded.title,updated_at=excluded.updated_at,created_at=excluded.created_at,archived_at=excluded.archived_at,version=excluded.version`);
-      }
-      this.sql.exec('CREATE INDEX IF NOT EXISTS intake_tasks_id_nocase ON intake_tasks(id COLLATE NOCASE)');
+      initIntakeSummary(this.sql);
       this.sql.exec('CREATE TABLE IF NOT EXISTS intake_note_archive(id TEXT PRIMARY KEY,task_id TEXT NOT NULL,seq INTEGER NOT NULL,data TEXT NOT NULL,UNIQUE(task_id,seq))');
       for (const op of ['UPDATE', 'DELETE']) this.sql.exec('CREATE TRIGGER IF NOT EXISTS intake_note_archive_no_' + op.toLowerCase() +
         ' BEFORE ' + op + " ON intake_note_archive BEGIN SELECT RAISE(ABORT,'append_only_note_archive'); END");
@@ -650,9 +644,12 @@ export class IntakeService {
   private prune(now: number) {
     // Bounded via intake_status_summary (intake 3bd2521a): never scan and
     // JSON.parse every intake_tasks row on every intake write/create.
-    const ids = this.sql.exec(
-      "SELECT id FROM intake_status_summary WHERE archived_at IS NULL AND status NOT IN ('open','in_progress','blocked','pending_approval') ORDER BY id LIMIT 256"
-    ).toArray().map((r: any) => String(r.id));
+    // Existing primary key gives a fair bounded raw page; terminal filtering
+    // must not require a new index over retained summary history.
+    const rows = this.sql.exec('SELECT id,status,archived_at FROM intake_status_summary WHERE id>? ORDER BY id LIMIT 256',
+      this.archiveAfter).toArray() as Obj[];
+    this.archiveAfter = rows.length === 256 ? String(rows.at(-1)!.id) : '';
+    const ids = rows.filter(row => row.archived_at == null && !OPEN.includes(row.status)).map(row => String(row.id));
     for (const id of ids) {
       const task = this.get('tasks', id);
       if (!task || task.archived_at || OPEN.includes(task.status)) continue;
@@ -2262,7 +2259,7 @@ export class IntakeService {
   /** Internal watchdog range, including paused work for observation/digests.
    * Full histories are fetched only for this bounded indexed range. */
   watchdogTasks(after: string, limit: number): Obj[] {
-    return this.sql.exec(`SELECT t.data FROM intake_task_projection p JOIN intake_tasks t ON t.id=p.id
+    return this.sql.exec(`SELECT t.data FROM intake_task_projection p INDEXED BY intake_watchdog_open JOIN intake_tasks t ON t.id=p.id
       WHERE p.id>? AND json_extract(p.data,'$.status') IN ('open','in_progress','blocked','pending_approval')
       AND json_extract(p.data,'$.archived_at') IS NULL ORDER BY p.id LIMIT ?`,after,Math.min(64,limit)).toArray().map((r:any)=>JSON.parse(r.data));
   }
@@ -2270,12 +2267,19 @@ export class IntakeService {
     const task = this.get('tasks', id);
     return task && this.allowed(p, task) ? task : undefined;
   }
+  /** Explicit request bootstrap, outside any surrounding transaction which
+   * may reject the eventual partial observation. At most two 25-row pages. */
+  advanceStatusSummary(): boolean {
+    return this.tx(() => advanceIntakeSummary(this.sql) || advanceIntakeSummary(this.sql));
+  }
   statusTaskSummaries(p: Obj): Obj[] {
     // Bounded read from the write-maintained summary (intake 3bd2521a): never
     // parse every projected task body per status call. NULL summaries of
     // absent source fields become absent keys, matching the parsed-body shape.
-    return this.sql.exec('SELECT id,project,status,title,updated_at,created_at,archived_at,version FROM intake_status_summary ORDER BY id').toArray()
-      .map(statusSummaryRow).filter(t => this.allowed(p, t));
+    if (!intakeSummaryReady(this.sql)) throw new IntakeError('intake_summary_migrating',503);
+    const rows = this.sql.exec('SELECT id,project,status,title,updated_at,created_at,archived_at,version FROM intake_status_summary ORDER BY id LIMIT 2001').toArray();
+    if (rows.length > 2000) throw new IntakeError('intake_summary_observation_incomplete',503);
+    return rows.map(statusSummaryRow).filter(t => this.allowed(p,t));
   }
   /** Hydrate only a bounded, already-authorized id selection into the
    * projected bodies that status items render. Never scans the projection. */

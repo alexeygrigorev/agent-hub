@@ -1,3 +1,4 @@
+import type { WriteWatch } from './write-watch';
 import { credentialActor } from './agent_registry';
 /** Ownership-aware launch admission over the existing /api/bus/claims table. */
 import { BusService, parseAddress, isRootRoleAddress, type CallerContext } from './bus';
@@ -58,7 +59,8 @@ export function boundAccess(access: AccessDeclaration): AccessDeclaration {
 export class ClaimAdmission {
   public bus: BusService;
   private offerCursor = '';
-  constructor(private sql: SqlStorage, private transaction: <T>(fn: () => T) => T = fn => fn(), private now: () => number = Date.now) {
+  private policySnapshot: Map<string,{stamp:string;value:{project:string|null;require_claim:boolean}}> | null = null;
+  constructor(private sql: SqlStorage, private transaction: <T>(fn: () => T) => T = fn => fn(), private now: () => number = Date.now, private writes?: WriteWatch) {
     this.bus = new BusService(sql, transaction);
   }
 
@@ -114,9 +116,22 @@ export class ClaimAdmission {
     this.offerCursor = cursor;
   }
 
+  /** Synchronous lazy source reads only. Claims, expiry and permission
+   * decisions remain live; a write or rollback invalidates the table stamp. */
+  withPolicySnapshot<T>(fn:()=>T):T {
+    if(this.policySnapshot)return fn();
+    this.policySnapshot=new Map();
+    try{return fn();}finally{this.policySnapshot=null;}
+  }
+
   policy(workspace: string): { project: string | null; require_claim: boolean } {
+    const stamp=this.writes?.stamp('fleet_claim_policy');
+    const cached=stamp!==undefined?this.policySnapshot?.get(workspace):undefined;
+    if(cached && cached.stamp===stamp)return {...cached.value};
     const row: any = this.sql.exec('SELECT project, require_claim FROM fleet_claim_policy WHERE workspace = ?', workspace).toArray()[0];
-    return { project: row?.project || null, require_claim: !!row?.require_claim };
+    const value={project:row?.project||null,require_claim:!!row?.require_claim};
+    if(stamp!==undefined && this.policySnapshot && this.policySnapshot.size<256)this.policySnapshot.set(workspace,{stamp,value:{...value}});
+    return value;
   }
 
   listPolicy() {

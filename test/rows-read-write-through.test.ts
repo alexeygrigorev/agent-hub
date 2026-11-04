@@ -1,3 +1,4 @@
+import { freshFixtureBudgetDay, fixtureSql } from './helpers/fixture-budget';
 /**
  * Write-through cache budgets (intake 8081a05a/e8a22f4c phase 2). The
  * host-polled routes serve from in-memory caches stamped by per-table write
@@ -63,7 +64,9 @@ function seed(sql: any) {
 const withFleet = (fn: (s: any, t: ReturnType<typeof tracked>, watch: WriteWatch, catalog: ObservedCatalog, rawSql: SqlStorage) => Promise<void>) => async () => {
   const stub = (env as any).HUB.get((env as any).HUB.idFromName('write-through-' + crypto.randomUUID()));
   await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
-    seed(hub.sql);
+    await freshFixtureBudgetDay(hub);
+    await (hub as any).rowBudget.begin(true);
+    seed(fixtureSql(hub,state));
     const t = tracked(hub.sql);
     const watch = new WriteWatch();
     watch.trackAll(['session_control_sessions','fleet_launches','machines','intake_tasks','intake_task_projection','resource_request_projection','session_control_protections','resource_reaps','resource_settings','host_health_observations','session_idle_episodes']);
@@ -307,55 +310,23 @@ it('does not memoize reads that depend on random or current time', withFleet(asy
   expect(secondValue).not.toBe(firstValue);
 }));
 
-it('preserves pending retention across unrelated alarm scheduling and caps re-arms durably', async () => {
-  const stub = (env as any).HUB.get((env as any).HUB.idFromName('retention-alarm-' + crypto.randomUUID()));
-  await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
-    const schedule = (hub as any).scheduleDueAlarm.bind(hub);
-    await schedule([], true);
-    const firstCount = Number(await state.storage.get('bus_retention_fast_rearms'));
-    expect(firstCount).toBe(1);
-    await schedule([Date.now() + 1]); // webhook work has no retention result
-    expect(await state.storage.get('bus_retention_pending')).toBe(true);
-    expect(Number(await state.storage.get('bus_retention_fast_rearms'))).toBe(firstCount);
-
-    for (let i = firstCount; i < 30; i++) {
-      await state.storage.deleteAlarm(); // each pass represents a fired alarm
-      await schedule([], true);
-    }
-    expect(Number(await state.storage.get('bus_retention_fast_rearms'))).toBe(30);
+it('legacy retention hints cannot rearm an idle alarm or start autonomous cleanup', async () => {
+  const stub=(env as any).HUB.get((env as any).HUB.idFromName('retention-disabled-'+crypto.randomUUID()));
+  await runInDurableObject(stub,async(hub:Hub,state:DurableObjectState)=>{
+    await freshFixtureBudgetDay(hub);
+    const h:any=hub;
+    // Isolate the retired retention hint from legitimate root/job intents.
+    fixtureSql(hub,state).exec('UPDATE root_scheduling SET enabled=0');
+    fixtureSql(hub,state).exec('DELETE FROM hub_background_work');
     await state.storage.deleteAlarm();
-    const before = Date.now();
-    await schedule([], true);
-    expect(Number(await state.storage.get('bus_retention_fast_rearms'))).toBe(31);
-    expect((await state.storage.getAlarm())!).toBeGreaterThanOrEqual(before + 55_000);
-
-    await schedule([], false);
-    expect(await state.storage.get('bus_retention_pending')).toBe(false);
-    expect(Number(await state.storage.get('bus_retention_fast_rearms'))).toBe(0);
-  });
-});
-
-it('an alarm reloads and drains the persisted retention backlog after DO eviction', async () => {
-  const stub = (env as any).HUB.get((env as any).HUB.idFromName('retention-reload-' + crypto.randomUUID()));
-  await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
-    const h: any = hub;
-    await state.storage.put('bus_retention_pending', true);
-    let cleanups = 0;
-    let tbmCalls = 0;
-    h.busService.retentionCleanup = () => { cleanups++; return { hasMore: false }; };
-    h.runTbmTick = () => { tbmCalls++; };
-    h.jobsService.processAlarms = () => undefined;
-    h.jobsService.getAlarmTime = () => null;
-    h.webhookService.pump = async () => undefined;
-    h.sessionControlService.processDueWakes = () => undefined;
-    h.nextWakeTimeSafe = () => null;
-    h.flushRowsMeter = async () => undefined;
-
+    await state.storage.put('bus_retention_pending',true);
+    let cleanups=0;
+    h.busService.retentionCleanup=()=>{cleanups++;return {hasMore:false};};
+    await h.scheduleDueAlarm([],true);
+    expect(await state.storage.getAlarm()).toBeNull();
     await h.alarm();
-    expect(cleanups).toBe(1);
-    expect(tbmCalls).toBe(0);
-    expect(await state.storage.get('bus_retention_pending')).toBe(false);
-    expect(Number(await state.storage.get('bus_retention_fast_rearms'))).toBe(0);
+    expect(cleanups).toBe(0);
+    expect(await state.storage.getAlarm()).toBeNull();
   });
 });
 
@@ -364,19 +335,18 @@ it('query plans use the new indexes on the high-volume lookups', withFleet(async
   const plan = (query: string, ...bindings: any[]) => (sql.exec('EXPLAIN QUERY PLAN ' + query, ...bindings).toArray() as any[])
     .map(row => String(row.detail)).join('\n');
 
-  expect(plan('SELECT data FROM intake_tasks WHERE id COLLATE NOCASE LIKE ? LIMIT 2', 'ffff%'))
-    .toContain('intake_tasks_id_nocase');
-  expect(plan(`SELECT 1 FROM worker_access w JOIN credentials c ON c.family_id=w.family_id
-    WHERE w.session_id=? AND c.revoked_at IS NULL LIMIT 1`, 'h0')).toContain('worker_access_session_family');
+  expect(plan('SELECT data FROM intake_tasks WHERE id>=? AND id<? ORDER BY id LIMIT 2', 'ffff','fffg'))
+    .toMatch(/(?:PRIMARY KEY|sqlite_autoindex_intake_tasks)/);
+  expect(plan('SELECT id FROM credentials INDEXED BY credentials_registry_actor WHERE registry_actor=? LIMIT 129', 'native:session')).toContain('credentials_registry_actor');
   expect(plan(`SELECT * FROM session_control_wakes WHERE session_id=? AND state='pending'
-    ORDER BY wake_at_ms, created_at, id LIMIT 1`, 'sess'))
-    .toContain('session_control_wakes_session_due_order');
+    ORDER BY wake_at_ms, rowid LIMIT 1`, 'sess'))
+    .toContain('intake_queue_wakes_session');
   expect(plan(`SELECT s.id FROM session_control_sessions s JOIN session_control_protections p ON p.session_id=s.id
     WHERE s.machine_id=? AND json_extract(CASE WHEN json_valid(s.binding_json) THEN s.binding_json ELSE '{}' END,'$.native_id')=? LIMIT 1`, 'h0', 'native'))
     .toMatch(/USING INDEX (?:session_control_native_binding|intake_queue_session_native)/);
-  expect(plan(`SELECT quota_json FROM usage_quota_history
-    WHERE account=? AND provider=? AND observed_at_ms=? LIMIT 1`, 'a0', 'codex', now))
-    .toContain('usage_quota_history_account_provider_time');
+  expect(plan(`SELECT account,provider,quota_json FROM usage_quota_history INDEXED BY usage_quota_history_time
+    WHERE observed_at_ms=? LIMIT 129`, now))
+    .toContain('usage_quota_history_time');
   expect(plan(`SELECT account,provider,observed_at_ms,quota_json FROM usage_quota_history
     WHERE observed_at_ms>=? AND observed_at_ms<=? ORDER BY observed_at_ms LIMIT 4096`, now - 15 * 60_000, now))
     .toContain('usage_quota_history_time');

@@ -17,7 +17,7 @@ describe('production Hub composition', () => {
     });
     expect(Array.isArray(await stub.runChecks())).toBe(true);
     // A past slot exercises real RPC without admitting any job/launch.
-    expect((await stub.scheduledTick('2000-01-01T00:00:00.000Z')).reason).toBe('late_slot_refused');
+    expect((await stub.scheduledTick('2000-01-01T00:00:00.000Z','manual')).reason).toBe('late_slot_refused');
     await worker.scheduled({ cron: '*/5 * * * *' } as ScheduledEvent, env as any, {} as ExecutionContext);
     await worker.scheduled({ cron: '*/30 * * * *' } as ScheduledEvent, env as any, {} as ExecutionContext);
     await runInDurableObject(stub, async (hub: Hub) => { await hub.alarm(); });

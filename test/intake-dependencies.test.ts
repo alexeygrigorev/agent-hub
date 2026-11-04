@@ -1,3 +1,4 @@
+import { advanceFixtureBudgetDay, fixtureSql } from './helpers/fixture-budget';
 import { beforeEach, expect, it } from 'vitest';
 import { env, SELF, runInDurableObject } from 'cloudflare:test';
 import { IntakeDependencies } from '../src/intake-dependencies';
@@ -22,10 +23,12 @@ async function create(project = 'demo') {
 beforeEach(async () => {
   cookie = (await createSessionCookie(env as any, { sub: 'operator', email: 'admin@fake.local', isAdmin: true,
     csrfToken: 'csrf', exp: Math.floor(Date.now()/1000)+3600 })).split(';')[0];
-  await inDO(stub(), (h: any) => {
+  await inDO(stub(), async (h: any,state:any) => {
+    await advanceFixtureBudgetDay(h);
+    const seedSql=fixtureSql(h,state);
     const graph = new IntakeDependencies(h.sql); graph.init();
-    h.sql.exec('DELETE FROM intake_dependencies');
-    for (const id of ['dep-a', 'dep-b', 'dep-c']) h.sql.exec('INSERT OR REPLACE INTO intake_tasks VALUES(?,?)', id,
+    seedSql.exec('DELETE FROM intake_dependencies');
+    for (const id of ['dep-a', 'dep-b', 'dep-c']) seedSql.exec('INSERT OR REPLACE INTO intake_tasks VALUES(?,?)', id,
       JSON.stringify({ id, project: 'demo', title: id, status: 'open', history: [] }));
   });
 });
@@ -242,13 +245,16 @@ it('reads dependency graphs in batches for list views (no per-task query)', asyn
 
 it('fails closed: an unreadable dependency graph refuses a start instead of allowing it', async () => {
   const original = await create();
-  await inDO(stub(), (h: any) => h.sql.exec('ALTER TABLE intake_dependencies RENAME TO intake_dependencies_hold'));
+  await inDO(stub(), (h: any) => fixtureSql(h).exec('ALTER TABLE intake_dependencies RENAME TO intake_dependencies_hold'));
   try {
     const refused = await api('/sessions', { key: 'fail-closed', workspace: 'demo', intake_task_id: original.id, brief: 'Go' });
     expect(refused.status, JSON.stringify(refused.data)).toBe(503);
-    expect(refused.data.error).toBe('dependency_check_failed');
+    expect(refused.data.error).toBe('do_daily_row_budget_exceeded');
+    // The missing authority table also trips the financial breaker; neither
+    // dependency failure nor its budget consequence may start a session.
+    await inDO(stub(),(h:any)=>expect(fixtureSql(h).exec("SELECT id FROM session_control_sessions WHERE json_extract(request_json,'$.intake_task_id')=?",original.id).toArray()).toHaveLength(0));
   } finally {
-    await inDO(stub(), (h: any) => h.sql.exec('ALTER TABLE intake_dependencies_hold RENAME TO intake_dependencies'));
+    await inDO(stub(), (h: any) => fixtureSql(h).exec('ALTER TABLE intake_dependencies_hold RENAME TO intake_dependencies'));
   }
 });
 

@@ -396,7 +396,30 @@ export class WriteWatch {
               const count = Number(cursor.rowsWritten);
               if (Number.isFinite(count)) rowsWritten = count;
             } catch { /* preserve conservative invalidation */ }
-            watch.note(statement, rowsWritten);
+            const returning = /\bRETURNING\b/i.test(statement) && writeTargets(statement).length > 0;
+            // RETURNING executes lazily: zero immediately after exec() does
+            // not prove a no-op. Invalidate before exposing its cursor, then
+            // observe completed steps so reads interleaved with iteration
+            // cannot preserve a snapshot from before later mutations.
+            watch.note(statement, returning ? undefined : rowsWritten);
+            if (returning) {
+              const observe = () => watch.note(statement);
+              const iterable = (source: Iterable<any>) => ({
+                *[Symbol.iterator]() {
+                  try { for (const row of source) { observe(); yield row; } }
+                  finally { observe(); }
+                },
+              });
+              return new Proxy(cursor as any, {
+                get(target, key) {
+                  if (key === Symbol.iterator) return () => iterable(target)[Symbol.iterator]();
+                  if (key === 'raw') return (...args: any[]) => iterable(target.raw(...args))[Symbol.iterator]();
+                  const value = Reflect.get(target, key, target);
+                  if (typeof value !== 'function') return value;
+                  return (...args: any[]) => { try { return value.apply(target, args); } finally { observe(); } };
+                },
+              });
+            }
             return cursor;
           };
         }

@@ -36,7 +36,7 @@ const registry = () => ({
   routes: [{ machine_id: MACHINE, engine: 'codex', account: 'shared-codex', profile: null }],
 });
 
-type Ctx = { f: FleetService; s: SessionControlService; sql: any; clock: { now: number } };
+type Ctx = { f: FleetService; s: SessionControlService; sql: any; rawSql: any; clock: { now: number } };
 
 async function fixture(fn: (ctx: Ctx) => Promise<void>) {
   const bindings = env as unknown as Env;
@@ -60,7 +60,7 @@ async function fixture(fn: (ctx: Ctx) => Promise<void>) {
       MACHINE, '1.0', iso(), clock.now, iso(), clock.now, 'ok', null,
       JSON.stringify({ codex: { status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } } } }));
     expect((await f.handle(new Request('https://hub.test/api/fleet/accounts', { method: 'PUT', body: JSON.stringify(registry()) }), admin)).status).toBe(200);
-    await fn({ f, s, sql, clock });
+    await fn({ f, s, sql, rawSql: state.storage.sql, clock });
   });
 }
 
@@ -232,24 +232,26 @@ describe('command-channel health (intake 3aa850b4)', () => {
     const iso = new Date(clock.now).toISOString();
     const planOf = (q: string, params: unknown[]) => (sql.exec('EXPLAIN QUERY PLAN ' + q, ...params).toArray() as any[]).map(r => String(r.detail));
     const proof = planOf(COMMAND_CHANNEL_PLAN_SQL.proof, [iso, MACHINE]);
-    expect(proof.some(d => d.includes('session_control_commands_proof_created_v2')), proof.join(' | ')).toBe(true);
+    expect(proof.some(d => d.includes('command_channel_proofs')), proof.join(' | ')).toBe(true);
     const stuck = planOf(COMMAND_CHANNEL_PLAN_SQL.stuck, [MACHINE, iso, iso, '', iso]);
-    expect(stuck.some(d => d.includes('session_control_commands_pending_created')), stuck.join(' | ')).toBe(true);
+    expect(stuck.some(d => d.includes('command_channel_evidence_host_time')), stuck.join(' | ')).toBe(true);
     expect(stuck.some(d => d.startsWith('SEARCH') && d.includes('created_at>?') && d.includes('created_at<?')), stuck.join(' | ')).toBe(true);
     expect(stuck.some(d => d.includes('USE TEMP B-TREE')), stuck.join(' | ')).toBe(false);
+    expect(stuck.some(d => d.includes('CO-ROUTINE')), stuck.join(' | ')).toBe(true);
     const stops = planOf(COMMAND_CHANNEL_PLAN_SQL.failedStops, [iso, '', MACHINE]);
-    expect(stops.some(d => d.includes('session_control_commands_failed_stops')), stops.join(' | ')).toBe(true);
+    expect(stops.some(d => d.includes('command_channel_evidence_host_time')), stops.join(' | ')).toBe(true);
     // No plain table scan of the commands or sessions history: every SCAN
     // must go through an index (partial-index scans report USING INDEX).
     for (const detail of [...proof, ...stuck, ...stops]) {
-      expect(detail.startsWith('SCAN') && !detail.includes('USING'), detail).toBe(false);
+      // `c` is a bounded co-routine prefix; base-table scans remain forbidden.
+      expect(detail.startsWith('SCAN') && !detail.includes('USING') && detail !== 'SCAN c', detail).toBe(false);
     }
 
     // A machine can accumulate years of old pending rows. They must stay
     // outside the finite lookback range instead of being walked to satisfy
     // the per-machine LIMIT.
     for (let i = 0; i < 256; i++) {
-      seedCommand(ctx, { id: `old-${i}`, state: i % 2 ? 'recorded' : 'transported', createdDelta: -24 * 3600_000 });
+      seedCommand({ ...ctx, sql: ctx.rawSql }, { id: `old-${i}`, state: i % 2 ? 'recorded' : 'transported', createdDelta: -24 * 3600_000 });
     }
     const oldRows = sql.exec(COMMAND_CHANNEL_PLAN_SQL.stuck, MACHINE, iso, iso, '', iso).toArray();
     expect(oldRows).toHaveLength(0);

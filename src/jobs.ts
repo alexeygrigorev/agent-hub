@@ -1,3 +1,6 @@
+import { jobLeaseName, jobLeaseNameSql } from './auth/job-credential';
+import { externalRootBlocks, advanceRootIncumbentProjection } from './root-incumbent';
+import { effectiveHost } from './registry';
 import { registryNameSql } from './agent_registry';
 import { sha256, base64url } from './auth/crypto';
 import { getSession } from './auth/session';
@@ -60,6 +63,20 @@ function sha256Sync(input: string): string {
   return base64url(out);
 }
 
+/** Same epoch-seconds/epoch-milliseconds/ISO formats as parseExpiryMs.
+ * Stored as an expression index so alarm work seeks deadlines, rather than
+ * parsing every retained job on every invocation. */
+export function expiryMsSql(column: string): string {
+  return `(CASE WHEN CAST(${column} AS TEXT) NOT GLOB '*[^0-9.]*' AND CAST(${column} AS REAL)>0
+    THEN CASE WHEN CAST(${column} AS REAL)<100000000000 THEN CAST(${column} AS REAL)*1000 ELSE CAST(${column} AS REAL) END
+    ELSE ROUND((julianday(${column})-2440587.5)*86400000) END)`;
+}
+const OFFER_MS = expiryMsSql('offer_expires_at');
+const LEASE_MS = `COALESCE(${expiryMsSql('expires_at')},0)`;
+const ACQUIRED_MS = expiryMsSql('acquired_at');
+const DEADLINE_MS = expiryMsSql('deadline_at');
+const ALARM_BATCH = 100;
+
 export const JOBS_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS jobs (
   id TEXT PRIMARY KEY,
@@ -91,6 +108,8 @@ CREATE TABLE IF NOT EXISTS jobs (
 -- Intake e8a22f4c: host polls and the alarm look at offered jobs only, so the
 -- partial index keeps those reads independent of finished-job history.
 CREATE INDEX IF NOT EXISTS jobs_offered ON jobs(offer_expires_at) WHERE status = 'offered';
+CREATE INDEX IF NOT EXISTS jobs_offered_host_created ON jobs(offer_host_id,created_at DESC,id DESC) WHERE status='offered';
+CREATE INDEX IF NOT EXISTS jobs_offered_machine_created ON jobs(offer_machine_id,created_at DESC,id DESC) WHERE status='offered';
 
 CREATE TABLE IF NOT EXISTS leases (
   name TEXT PRIMARY KEY,
@@ -105,6 +124,18 @@ CREATE TABLE IF NOT EXISTS leases (
   released_at TEXT,
   release_reason TEXT
 );
+
+CREATE INDEX IF NOT EXISTS jobs_offered_due_ms ON jobs(${OFFER_MS}) WHERE status='offered';
+CREATE INDEX IF NOT EXISTS jobs_root_offered_due_ms ON jobs(${OFFER_MS}) WHERE status='offered' AND kind='root-run';
+CREATE INDEX IF NOT EXISTS jobs_nonroot_offered_due_ms ON jobs(${OFFER_MS}) WHERE status='offered' AND kind<>'root-run';
+CREATE INDEX IF NOT EXISTS jobs_root_offered_deadline_ms ON jobs(${DEADLINE_MS}) WHERE kind='root-run' AND status='offered';
+CREATE INDEX IF NOT EXISTS leases_active_due_ms ON leases(${LEASE_MS}) WHERE holder_job_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS leases_active_name ON leases(name) WHERE holder_job_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS leases_holder_job ON leases(holder_job_id) WHERE holder_job_id IS NOT NULL;
+CREATE TABLE IF NOT EXISTS job_claim_deadlines(lease_name TEXT PRIMARY KEY,job_id TEXT NOT NULL,due_ms INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS job_claim_deadlines_due ON job_claim_deadlines(due_ms,lease_name);
+CREATE INDEX IF NOT EXISTS job_claim_deadlines_job ON job_claim_deadlines(job_id);
+CREATE TABLE IF NOT EXISTS job_claim_backfill(id INTEGER PRIMARY KEY CHECK(id=1),after_name TEXT NOT NULL,done INTEGER NOT NULL);
 
 CREATE TABLE IF NOT EXISTS offers (
   job_id TEXT,
@@ -272,6 +303,19 @@ export interface Machine {
   state?: string;
 }
 
+const DEFERRED_OFFER_INDEX_NAMES=['jobs_offered_host_created','jobs_offered_machine_created','jobs_offered_due_ms','jobs_root_offered_due_ms','jobs_nonroot_offered_due_ms','jobs_root_offered_deadline_ms'] as const;
+const deferredOfferStatements=JOBS_SCHEMA_SQL.split(';').map(value=>value.trim()).filter(statement=>
+ DEFERRED_OFFER_INDEX_NAMES.some(name=>new RegExp('CREATE\\s+INDEX\\s+IF\\s+NOT\\s+EXISTS\\s+'+name+'\\b','i').test(statement)));
+const offeredIndexPending=()=>Object.assign(new Error('job_offer_indexes_pending'),{code:'job_offer_indexes_pending',status:503});
+
+const leaseIndexNames=['leases_active_due_ms','leases_active_name','leases_holder_job'];
+const deferredLeaseStatements=JOBS_SCHEMA_SQL.split(';').map(s=>s.trim()).filter(s=>leaseIndexNames.some(name=>s.startsWith('CREATE INDEX IF NOT EXISTS '+name+' ')));
+
+export class WriterIntentObservationLimit extends Error {
+  readonly status=503;readonly code='writer_intent_observation_pending';
+  constructor(){super('writer_intent_observation_pending');}
+}
+
 export class JobsService {
   public roles: RoleLeases;
   private sql: SqlStorage;
@@ -285,6 +329,36 @@ export class JobsService {
   private healthService?: any;
   private env?: any;
   private clockSnapshot: Date | null = null;
+  private offerCursors = new Map<string, [string,string]>();
+
+  /** Fair, bounded host polls. Advance over expired/frozen offers as well as
+   * eligible ones, so a stale prefix cannot hide an older role offer forever.
+   * This transient cursor affects observation only; claims remain durable. */
+  offeredForHost(host: string): { rows: any[]; truncated: boolean } {
+    if(!this.hasOfferedWork())return{rows:[],truncated:false};
+    // This method is called only by authenticated host request routes.
+    this.prepareOfferedWork();
+    const candidates: any[] = [];
+    let truncated = false;
+    for (const column of ['offer_host_id','offer_machine_id']) {
+      const key = host + ':' + column, after = this.offerCursors.get(key);
+      const rows = this.sql.exec(`SELECT * FROM jobs INDEXED BY ${column==='offer_host_id'?'jobs_offered_host_created':'jobs_offered_machine_created'} WHERE status='offered' AND ${column}=?
+        ${after ? 'AND (created_at,id)<(?,?)' : ''} ORDER BY created_at DESC,id DESC LIMIT 101`,
+        host,...(after ?? [])).toArray() as any[];
+      const page = rows.slice(0,100);
+      if (rows.length>100) {
+        if (this.offerCursors.size>=256 && !this.offerCursors.has(key)) this.offerCursors.clear();
+        this.offerCursors.set(key,[String(page.at(-1)!.created_at),String(page.at(-1)!.id)]);
+        truncated=true;
+      } else this.offerCursors.delete(key);
+      candidates.push(...page);
+    }
+    const now=this.now().getTime();
+    const rows=[...new Map(candidates.map(row=>[row.id,row])).values()]
+      .filter(row=>row.offer_expires_at===null || (parseExpiryMs(row.offer_expires_at) ?? 0)>now)
+      .sort((a,b)=>String(b.created_at).localeCompare(String(a.created_at)) || String(b.id).localeCompare(String(a.id)));
+    return { rows,truncated };
+  }
 
   constructor(sql: SqlStorage, ctx: DurableObjectState, deps?: JobsDependencies) {
     this.sql = sql;
@@ -305,8 +379,19 @@ export class JobsService {
 
     for (const statement of JOBS_SCHEMA_SQL.split(';')) {
       const trimmed = statement.trim();
-      if (trimmed) this.sql.exec(trimmed);
+      if (trimmed&&!deferredOfferStatements.includes(trimmed)&&!deferredLeaseStatements.includes(trimmed)) this.sql.exec(trimmed);
     }
+
+    // A genuinely empty fresh schema may install cheap empty indexes.
+    // Retained jobs (even all terminal) never trigger historical builds here.
+    if(!this.sql.exec('SELECT id FROM jobs LIMIT 1').toArray().length)this.prepareOfferedWork();
+    if(!this.sql.exec('SELECT name FROM leases ORDER BY name LIMIT 1').toArray().length)this.prepareLeaseWork();
+
+    this.sql.exec('CREATE TABLE IF NOT EXISTS root_background_ready(slot_ms INTEGER NOT NULL,host_id TEXT NOT NULL,rank TEXT NOT NULL,PRIMARY KEY(slot_ms,host_id))');
+    this.sql.exec('CREATE INDEX IF NOT EXISTS root_background_rank ON root_background_ready(slot_ms,rank,host_id)');
+    this.sql.exec('CREATE TABLE IF NOT EXISTS root_background_hosts(host_id TEXT PRIMARY KEY,last_slot_ms INTEGER NOT NULL)');
+    this.sql.exec('CREATE TABLE IF NOT EXISTS root_background_slots(slot_ms INTEGER PRIMARY KEY,invalid_attempts INTEGER NOT NULL DEFAULT 0)');
+    this.initClaimDeadlines();
 
     const agentCols = ['engine TEXT', 'session_id TEXT', 'workspace TEXT', 'state TEXT', 'health_state TEXT', 'detail TEXT', 'lasthealth TEXT', 'health_at TEXT', 'last_seen_at TEXT'];
     for (const col of agentCols) {
@@ -321,6 +406,31 @@ export class JobsService {
     this.sql.exec("INSERT OR IGNORE INTO leases (name, epoch) VALUES ('root', 0)");
     ensureRootScheduling(this.sql);
     this.roles = new RoleLeases(this.sql);
+  }
+
+  private hasOfferedWork():boolean {
+    return this.sql.exec("SELECT id FROM jobs INDEXED BY jobs_offered WHERE status='offered' ORDER BY offer_expires_at LIMIT 1").toArray().length>0;
+  }
+  private offeredIndexesPresent():boolean {
+    // No cached readiness: physical metadata is observed on every positive
+    // work path, so external DROP and transaction rollback cannot freeze it.
+    const rows=this.sql.exec("SELECT name FROM pragma_index_list('jobs','main') LIMIT 65").toArray();
+    if(rows.length>64)throw offeredIndexPending();
+    const names=new Set(rows.map(row=>String(row.name).replace(/[A-Z]/g,value=>value.toLowerCase())));
+    return DEFERRED_OFFER_INDEX_NAMES.every(name=>names.has(name));
+  }
+  private requireOfferedIndexes():void {if(!this.offeredIndexesPresent())throw offeredIndexPending();}
+  /** Request-owned migration, after authorization and before publishing work.
+   * RowBudget still preflights and charges every actual index build. */
+  prepareOfferedWork():void {
+    if(this.offeredIndexesPresent())return;
+    const transaction=this.ctx?.storage?.transactionSync?.bind(this.ctx.storage);
+    // An external DROP may bypass the SQL watch within this event. Crossing
+    // the native boundary discards RowBudget's old positive index facts before
+    // the physical build preflight; the second transaction owns all six DDLs.
+    if(transaction)transaction(()=>undefined);
+    const build=()=>{for(const statement of deferredOfferStatements)this.sql.exec(statement);this.requireOfferedIndexes();};
+    if(transaction)transaction(build);else build();
   }
 
   configureRole(project: string, name: string, config: any, generation: number): any {
@@ -367,6 +477,7 @@ export class JobsService {
       if (!lease || lease.epoch !== body.expected_epoch || (lease.holder_job_id && !isLeaseExpired(lease.expires_at, ms))) return { error: 'role_conflict' };
       this.roles.prune(ms);
       if (Number(this.sql.exec('SELECT count(*) AS n FROM jobs WHERE role_name IS NOT NULL').one().n) >= ROLE_JOB_CAPACITY) return { error: 'role_job_capacity' };
+      this.prepareOfferedWork();
       const id = this.generateId();
       this.sql.exec(`INSERT INTO jobs(id,kind,idempotency_key,payload,status,created_at,deadline_at,actor,offer_host_id,offer_machine_id,offer_expires_at,role_name,role_generation,role_host_credential,role_expected_epoch)
         VALUES(?,?,?,?, 'offered',?,?,?,?,?,?,?,?,?,?)`, id, body.profile, idempotency, payload, now.toISOString(), new Date(ms + 25*60000).toISOString(),
@@ -401,7 +512,7 @@ export class JobsService {
           !['claimed','running'].includes(job.status) || !this.roleCurrent(job)) return { error: 'unauthorized_or_stale' };
       if (job.role_effect) return { execute: false, status: 'HOLD', reason: 'execution_intent_already_recorded' };
       if (this.hasUnresolvedWriterIntent(job)) return { execute: false, status: 'HOLD', reason: 'previous_execution_unresolved' };
-      const unresolved = this.sql.exec(`SELECT id FROM jobs WHERE role_name IS NOT NULL AND role_effect IS NOT NULL
+      const unresolved = this.sql.exec(`SELECT id FROM jobs INDEXED BY jobs_role_pending_profile WHERE role_name IS NOT NULL AND role_effect IS NOT NULL
         AND role_finish IS NULL AND kind=? AND payload=? AND id!=? LIMIT 1`, job.kind, job.payload, jobId).toArray()[0];
       if (unresolved) return { execute: false, status: 'HOLD', reason: 'previous_execution_unresolved' };
       this.sql.exec('UPDATE jobs SET role_effect=? WHERE id=? AND role_effect IS NULL', canonical({ action: 'execute', epoch, generation, payload: job.payload }), jobId);
@@ -445,13 +556,99 @@ export class JobsService {
     }
   }
 
+  /** A maintained queue makes first-action deadlines a singleton index seek.
+   * Filtering claimed jobs after walking every running lease is unbounded,
+   * even when the SELECT ends in LIMIT 1. Both source write orders are safe. */
+  private initClaimDeadlines() {
+    const acquired = expiryMsSql('NEW.acquired_at');
+    for (const event of ['INSERT', 'UPDATE OF holder_job_id,acquired_at']) this.sql.exec(`CREATE TRIGGER IF NOT EXISTS claim_deadline_lease_${event === 'INSERT' ? 'insert' : 'update'}
+      AFTER ${event} ON leases BEGIN
+        DELETE FROM job_claim_deadlines WHERE lease_name=NEW.name;
+        INSERT INTO job_claim_deadlines SELECT NEW.name,NEW.holder_job_id,${acquired}+300000
+          FROM jobs WHERE id=NEW.holder_job_id AND status='claimed' AND started_at IS NULL AND ${acquired} IS NOT NULL;
+      END`);
+    for (const event of ['INSERT', 'UPDATE OF status,started_at']) this.sql.exec(`CREATE TRIGGER IF NOT EXISTS claim_deadline_job_${event === 'INSERT' ? 'insert' : 'update'}
+      AFTER ${event} ON jobs BEGIN
+        DELETE FROM job_claim_deadlines WHERE job_id=NEW.id;
+        INSERT INTO job_claim_deadlines SELECT name,NEW.id,${ACQUIRED_MS}+300000
+          FROM leases WHERE name=${jobLeaseNameSql('NEW')} AND holder_job_id=NEW.id AND holder_job_id IS NOT NULL
+            AND NEW.status='claimed' AND NEW.started_at IS NULL AND ${ACQUIRED_MS} IS NOT NULL;
+      END`);
+    this.sql.exec(`CREATE TRIGGER IF NOT EXISTS claim_deadline_lease_delete AFTER DELETE ON leases
+      BEGIN DELETE FROM job_claim_deadlines WHERE lease_name=OLD.name; END`);
+    this.sql.exec(`CREATE TRIGGER IF NOT EXISTS claim_deadline_job_delete AFTER DELETE ON jobs
+      BEGIN DELETE FROM job_claim_deadlines WHERE job_id=OLD.id; END`);
+    this.sql.exec("INSERT OR IGNORE INTO job_claim_backfill VALUES(1,'',0)");
+    // A complete small negative proof needs no historical projection repair.
+    const receipt:any=this.sql.exec('SELECT done FROM job_claim_backfill WHERE id=1').toArray()[0];
+    if(!receipt?.done&&!this.rawLeaseCohort().some(row=>row.holder_job_id!==null))
+      this.sql.exec('UPDATE job_claim_backfill SET done=1 WHERE id=1 AND done=0');
+  }
+
+  private rawLeaseCohort(): any[] {
+    const rows=this.sql.exec('SELECT * FROM leases ORDER BY name LIMIT 129').toArray();
+    if(rows.length>128)throw Object.assign(new Error('lease_observation_pending'),{status:503,code:'lease_observation_pending'});
+    return rows;
+  }
+  private leaseIndexesPresent():boolean {
+    const rows=this.sql.exec("SELECT name FROM pragma_index_list('leases','main') LIMIT 65").toArray();
+    return rows.length<=64&&leaseIndexNames.every(name=>rows.some(row=>row.name===name));
+  }
+  /** Explicit maintenance request only; queue consumers use known lease PKs. */
+  prepareLeaseWork():void {
+    if(this.leaseIndexesPresent())return;
+    this.ctx.storage.transactionSync(()=>{});
+    this.ctx.storage.transactionSync(()=>{for(const statement of deferredLeaseStatements)this.sql.exec(statement);if(!this.leaseIndexesPresent())throw Object.assign(new Error('lease_indexes_pending'),{status:503,code:'lease_indexes_pending'});});
+  }
+  private hasIndexedLeaseWork():boolean {
+    // Memoizable raw facts save repeated schema probes on an idle small Hub.
+    // Only a COMPLETE negative cohort can bypass physical index proof.
+    const raw=this.sql.exec('SELECT holder_job_id FROM leases ORDER BY name LIMIT 2').toArray();
+    if(raw.length<2&&!raw.some(row=>row.holder_job_id!==null))return false;
+    if(this.leaseIndexesPresent())return true;
+    if(!this.rawLeaseCohort().some(row=>row.holder_job_id!==null))return false;
+    throw Object.assign(new Error('lease_indexes_pending'),{status:503,code:'lease_indexes_pending'});
+  }
+  private activeLeaseCohort():any[] {
+    if(!this.leaseIndexesPresent())return this.rawLeaseCohort().filter(row=>row.holder_job_id!==null);
+    const rows=this.sql.exec('SELECT * FROM leases INDEXED BY leases_active_name WHERE holder_job_id IS NOT NULL ORDER BY name LIMIT 129').toArray();
+    if(rows.length>128)throw Object.assign(new Error('lease_observation_pending'),{status:503,code:'lease_observation_pending'});
+    return rows;
+  }
+
+  /** Explicit legacy maintenance advances raw name-PK pages before eligibility
+   * filtering; released history cannot hide late active leases or stall a cursor. */
+  private backfillClaimDeadlines() {
+    const state: any = this.sql.exec('SELECT after_name,done FROM job_claim_backfill WHERE id=1').toArray()[0];
+    if (!state || state.done) return;
+    this.ctx.storage.transactionSync(() => {
+      const leases = this.sql.exec(`SELECT name,holder_job_id,acquired_at FROM leases
+        WHERE name>? ORDER BY name LIMIT ?`, state.after_name, ALARM_BATCH + 1).toArray() as any[];
+      const page = leases.slice(0, ALARM_BATCH);
+      for (const lease of page) {
+        if(lease.holder_job_id===null)continue;
+        const acquired = parseExpiryMs(lease.acquired_at);
+        if (acquired === null) continue;
+        this.sql.exec(`INSERT OR REPLACE INTO job_claim_deadlines SELECT ?,id,? FROM jobs
+          WHERE id=? AND status='claimed' AND started_at IS NULL`, lease.name, acquired + 300000, lease.holder_job_id);
+      }
+      this.sql.exec('UPDATE job_claim_backfill SET after_name=?,done=? WHERE id=1',
+        page.length ? page[page.length - 1].name : state.after_name, leases.length <= ALARM_BATCH ? 1 : 0);
+    });
+  }
+
   private scheduleAlarm() {
+    // Disabled local alarms also skip legacy deadline probes. Hub owns and
+    // arms the indexed per-entity queue after each committed event.
+    if(!this.deps?.enableAlarms)return;
     const jobAlarmTime = this.getAlarmTime();
     const observer = this.deps?.alarmDeadline?.();
     const alarmTime = Number.isFinite(observer) ? Math.min(jobAlarmTime || Infinity, observer!) : jobAlarmTime;
     if (alarmTime && this.deps?.enableAlarms && typeof this.ctx?.storage?.setAlarm === 'function') {
       try {
-        this.ctx.storage.setAlarm(alarmTime);
+        // A blocked past-due job cannot turn request-side scheduling into a
+        // tight loop either. Catch async storage rejection as well as throws.
+        Promise.resolve(this.ctx.storage.setAlarm(Math.max(this.now().getTime() + 15000, alarmTime))).catch(() => {});
       } catch {}
     }
   }
@@ -499,39 +696,183 @@ export class JobsService {
   }
 
   getAlarmTime(): number | null {
-    const now = this.now();
-    const nowMs = now.getTime();
     const nextTimes: number[] = [];
 
-    // 1. Pending offers
-    const offers = this.sql.exec("SELECT offer_expires_at FROM jobs WHERE status = 'offered' AND offer_expires_at IS NOT NULL").toArray();
-    for (const o of offers) {
-      const t = parseExpiryMs(o.offer_expires_at as string);
-      if (t !== null && t > nowMs) nextTimes.push(t);
+    // Each branch reads its first index entry, independent of history size.
+    const first = (query: string, ...bindings: any[]) => {
+      const row: any = this.sql.exec(query, ...bindings).toArray()[0];
+      if (typeof row?.due === 'number' && Number.isFinite(row.due)) nextTimes.push(Math.max(1, row.due));
+    };
+    if(this.hasOfferedWork()){
+    this.requireOfferedIndexes();
+    if (isRootSchedulingEnabled(this.sql)) {
+      first(`SELECT ${OFFER_MS} AS due FROM jobs INDEXED BY jobs_offered_due_ms WHERE status='offered' AND ${OFFER_MS} IS NOT NULL ORDER BY ${OFFER_MS} LIMIT 1`);
+    } else {
+      // Disabled root offers are frozen until their hard deadline. A stale
+      // offer timeout must not wake the DO repeatedly while frozen.
+      first(`SELECT ${OFFER_MS} AS due FROM jobs INDEXED BY jobs_nonroot_offered_due_ms WHERE status='offered' AND kind<>'root-run' AND ${OFFER_MS} IS NOT NULL ORDER BY ${OFFER_MS} LIMIT 1`);
+      first(`SELECT ${DEADLINE_MS} AS due FROM jobs INDEXED BY jobs_root_offered_deadline_ms WHERE kind='root-run' AND status='offered' AND ${DEADLINE_MS} IS NOT NULL ORDER BY ${DEADLINE_MS} LIMIT 1`);
     }
-
-    // 2. Active leases
-    const leases = this.sql.exec("SELECT expires_at FROM leases WHERE holder_job_id IS NOT NULL AND expires_at IS NOT NULL").toArray();
-    for (const l of leases) {
-      const t = parseExpiryMs(l.expires_at as string);
-      if (t !== null && t > nowMs) nextTimes.push(t);
     }
-
-    // 3. Claims awaiting start timeout (5m from acquired_at) - ONLY if job is claimed and NOT YET started
-    const claimed = this.sql.exec(
-      "SELECT leases.acquired_at FROM leases JOIN jobs ON leases.holder_job_id = jobs.id WHERE jobs.status = 'claimed' AND jobs.started_at IS NULL AND leases.acquired_at IS NOT NULL"
-    ).toArray();
-    for (const c of claimed) {
-      const acq = parseExpiryMs(c.acquired_at as string);
-      if (acq !== null) {
-        const deadline = acq + 5 * 60000;
-        if (deadline > nowMs) nextTimes.push(deadline);
-      }
-    }
+    if(this.hasIndexedLeaseWork())first(`SELECT ${LEASE_MS} AS due FROM leases INDEXED BY leases_active_due_ms WHERE holder_job_id IS NOT NULL ORDER BY ${LEASE_MS} LIMIT 1`);
+    first('SELECT due_ms AS due FROM job_claim_deadlines ORDER BY due_ms,lease_name LIMIT 1');
+    if (!this.sql.exec('SELECT done FROM job_claim_backfill WHERE id=1').toArray()[0]?.done)
+      nextTimes.push(this.now().getTime() + 15000);
 
     if (nextTimes.length === 0) return null;
     nextTimes.sort((a, b) => a - b);
     return nextTimes[0];
+  }
+
+  /** Hosts publish readiness only for their known identity and current/next
+   * slot. Stable random ranks provide a lottery without a background census. */
+  markRootReady(hostId: string, synchronousPolicySnapshot?: boolean): void {
+    // Only an immediately preceding, synchronous server-owned flag read may
+    // be supplied. Independent callers retain the fresh durable policy fence.
+    if(!(synchronousPolicySnapshot ?? isRootSchedulingEnabled(this.sql)))return;
+    const now=this.now().getTime(),slot=Math.floor(now/1800000)*1800000;
+    const host: any=effectiveHost(this.sql,this.sql.exec('SELECT * FROM machines WHERE id=?',hostId).toArray()[0]);
+    if(!host || host.revoked_at || host.drained || !this.checkHostRootRunCapability(host))return;
+    const checkin=parseExpiryMs(host.last_checkin_at);
+    let heartbeat:any;try{heartbeat=JSON.parse(host.last_heartbeat || '{}');}catch{return;}
+    if(checkin===null || now-checkin<0 || now-checkin>180000 || heartbeat?.gate?.launch_allowed!==true)return;
+    this.ctx.storage.transactionSync(()=>{
+      // Request-owned migration is useful only after a current host proves it
+      // can actually run a root. Incapable/blocked polls never census agents.
+      this.prepareOfferedWork();
+      advanceRootIncumbentProjection(this.sql);
+      const prior:any=this.sql.exec('SELECT last_slot_ms FROM root_background_hosts WHERE host_id=?',hostId).toArray()[0];
+      if(prior?.last_slot_ms===slot)return;
+      if(typeof prior?.last_slot_ms==='number')for(const old of [prior.last_slot_ms,prior.last_slot_ms+1800000])
+        if(old<slot)this.sql.exec('DELETE FROM root_background_ready WHERE slot_ms=? AND host_id=?',old,hostId);
+      for(const when of [slot,slot+1800000])this.sql.exec('INSERT OR IGNORE INTO root_background_ready VALUES(?,?,?)',when,hostId,crypto.randomUUID());
+      this.sql.exec('INSERT INTO root_background_hosts VALUES(?,?) ON CONFLICT(host_id) DO UPDATE SET last_slot_ms=excluded.last_slot_ms',hostId,slot);
+    });
+  }
+
+  nextRootSlotWork(): {slot:string;dueAt:number} | null {
+    if(!isRootSchedulingEnabled(this.sql))return null;
+    const dueAt=(Math.floor(this.now().getTime()/1800000)+1)*1800000;
+    return {slot:new Date(dueAt).toISOString(),dueAt};
+  }
+
+  processRootSlotBackground(slot: string): number | null {
+    if(!isRootSchedulingEnabled(this.sql))return null;
+    const when=Date.parse(slot),now=this.now().getTime();
+    if(!Number.isFinite(when)||when%1800000!==0)throw new Error('invalid_root_slot');
+    if(when>now)return when;
+    if(now>=when+1500000)return null;
+    const external=externalRootBlocks(this.sql,now);
+    if(external===null)return Math.min(now+60000,when+1500000);
+    if(external) { this.tickRootSlotForHost(slot,''); return null; }
+    const candidate:any=this.sql.exec('SELECT host_id FROM root_background_ready INDEXED BY root_background_rank WHERE slot_ms=? ORDER BY rank,host_id LIMIT 1',when).toArray()[0];
+    if(!candidate)return Math.min(now+60000,when+1500000);
+    const attempts=Number(this.sql.exec('SELECT invalid_attempts FROM root_background_slots WHERE slot_ms=?',when).toArray()[0]?.invalid_attempts ?? 0);
+    if(attempts>=16)return null;
+    const result=this.tickRootSlotForHost(slot,String(candidate.host_id));
+    if(result.status!=='retry')return null;
+    this.sql.exec('DELETE FROM root_background_ready WHERE slot_ms=? AND host_id=?',when,candidate.host_id);
+    this.sql.exec('INSERT INTO root_background_slots VALUES(?,1) ON CONFLICT(slot_ms) DO UPDATE SET invalid_attempts=invalid_attempts+1',when);
+    return Math.min(now+15000,when+1500000);
+  }
+
+  /** Targeted root offer. The caller owns appointed external-root custody;
+   * this path never guesses it by scanning the agent registry. */
+  tickRootSlotForHost(slot: string, hostId: string): {status:'offered'|'skip'|'retry'|'disabled'|'late'} {
+    return this.withClockSnapshot(now=>this.ctx.storage.transactionSync(()=>{
+      if(!isRootSchedulingEnabled(this.sql))return {status:'disabled'};
+      const when=Date.parse(slot),nowMs=now.getTime(),key='root-run:'+slot;
+      if(!Number.isFinite(when)||when%1800000!==0||when>nowMs||nowMs>=when+1500000)return {status:'late'};
+      const existing:any=this.sql.exec('SELECT id,status FROM jobs WHERE idempotency_key=?',key).toArray()[0];
+      if(existing)return {status:existing.status==='offered'?'offered':'skip'};
+      if(externalRootBlocks(this.sql,nowMs)!==false) {
+        this.sql.exec("INSERT INTO jobs(id,kind,idempotency_key,payload,status,created_at,deadline_at,actor,outcome_summary) VALUES(?,'root-run',?,'{}','skip',?,?,'system','skip: appointed root custody active or unknown')",this.generateId(),key,slot,new Date(when+1500000).toISOString());
+        return {status:'skip'};
+      }
+      const lease:any=this.sql.exec("SELECT * FROM leases WHERE name='root'").toArray()[0];
+      if(lease?.holder_job_id) {
+        const holder:any=this.sql.exec('SELECT status,deadline_at,started_at,created_at FROM jobs WHERE id=?',lease.holder_job_id).toArray()[0];
+        const started=parseExpiryMs(holder?.started_at)??parseExpiryMs(holder?.created_at);
+        const hardstop=Math.min(parseExpiryMs(holder?.deadline_at)??Infinity,started===null?Infinity:started+1500000);
+        // Unknown or still authoritative custody never authorizes a second root.
+        if(!holder || (['claimed','running'].includes(holder.status) && (!isLeaseExpired(lease.expires_at,nowMs)||nowMs<hardstop+120000))) {
+          this.sql.exec("INSERT INTO jobs(id,kind,idempotency_key,payload,status,created_at,deadline_at,actor,outcome_summary) VALUES(?,'root-run',?,'{}','skip',?,?,'system','skip: root custody active or unknown')",this.generateId(),key,slot,new Date(when+1500000).toISOString());
+          return {status:'skip'};
+        }
+      }
+      const host:any=effectiveHost(this.sql,this.sql.exec('SELECT * FROM machines WHERE id=?',hostId).toArray()[0]);
+      if(!host || host.drained || !this.checkHostRootRunCapability(host))return {status:'retry'};
+      const checkin=parseExpiryMs(host.last_checkin_at);let heartbeat:any;
+      try{heartbeat=JSON.parse(host.last_heartbeat||'{}');}catch{return {status:'retry'};}
+      if(checkin===null||nowMs-checkin<0||nowMs-checkin>180000||heartbeat?.gate?.launch_allowed!==true)return {status:'retry'};
+      if(this.rootHostsPolicy?.length && !this.rootHostsPolicy.some(value=>[host.id,host.name,host.hostname].includes(value)))return {status:'retry'};
+      this.requireOfferedIndexes();
+      const id=this.generateId(),expiry=Math.min(nowMs+120000,when+1500000);
+      this.sql.exec(`INSERT INTO jobs(id,kind,idempotency_key,payload,status,created_at,deadline_at,actor,offer_host_id,offer_machine_id,offer_expires_at,offer_attempts)
+        VALUES(?,'root-run',?,'{}','offered',?,?,'system',?,?,?,?)`,id,key,slot,new Date(when+1500000).toISOString(),hostId,hostId,new Date(expiry).toISOString(),JSON.stringify([hostId]));
+      this.addHealthEvent('job',id,'offered','root slot offered to ready host',now.toISOString());
+      return {status:'offered'};
+    }));
+  }
+
+  /** Physical revocation follows the job's current opaque token through
+   * the deployed UNIQUE token_hash key. Generic authorization additionally
+   * fences every legacy token against current job state/hash/lease epoch. */
+  private revokeCurrentCredential(jobId: string, at: string): void {
+    const job: any = this.sql.exec('SELECT claim_token_hash FROM jobs WHERE id=?', jobId).toArray()[0];
+    if (typeof job?.claim_token_hash==='string' && job.claim_token_hash)
+      this.sql.exec("UPDATE credentials SET revoked_at=? WHERE token_hash=? AND subject=? AND kind='job' AND revoked_at IS NULL", at,job.claim_token_hash,jobId);
+  }
+
+  /** Queue adapter: only fixed index-head seeks, never a maintenance pass. */
+  nextBackgroundWork(): { id: string; dueAt: number } | null {
+    const heads: {id:string;dueAt:number}[] = [];
+    const add = (query: string) => {
+      const row: any = this.sql.exec(query).toArray()[0];
+      if (typeof row?.id==='string' && typeof row.due==='number' && Number.isFinite(row.due)) heads.push({id:row.id,dueAt:Math.max(1,row.due)});
+    };
+    if(this.hasOfferedWork()){
+    this.requireOfferedIndexes();
+    if (isRootSchedulingEnabled(this.sql)) add(`SELECT id,${OFFER_MS} AS due FROM jobs INDEXED BY jobs_offered_due_ms WHERE status='offered' AND ${OFFER_MS} IS NOT NULL ORDER BY ${OFFER_MS} LIMIT 1`);
+    else {
+      add(`SELECT id,${OFFER_MS} AS due FROM jobs INDEXED BY jobs_nonroot_offered_due_ms WHERE status='offered' AND kind<>'root-run' AND ${OFFER_MS} IS NOT NULL ORDER BY ${OFFER_MS} LIMIT 1`);
+      add(`SELECT id,${DEADLINE_MS} AS due FROM jobs INDEXED BY jobs_root_offered_deadline_ms WHERE status='offered' AND kind='root-run' AND ${DEADLINE_MS} IS NOT NULL ORDER BY ${DEADLINE_MS} LIMIT 1`);
+    }
+    }
+    if(this.hasIndexedLeaseWork())add(`SELECT holder_job_id AS id,${LEASE_MS} AS due FROM leases INDEXED BY leases_active_due_ms WHERE holder_job_id IS NOT NULL ORDER BY ${LEASE_MS} LIMIT 1`);
+    add('SELECT job_id AS id,due_ms AS due FROM job_claim_deadlines ORDER BY due_ms,lease_name LIMIT 1');
+    return heads.sort((a,b)=>a.dueAt-b.dueAt)[0] ?? null;
+  }
+
+  /** Process one named job. Re-offering expired root jobs remains an explicit
+   * slot action: the deadline consumer must never enumerate candidate hosts. */
+  processBackground(id: string): number | null {
+    return this.withClockSnapshot(now => this.ctx.storage.transactionSync(() => {
+      const job: any = this.sql.exec('SELECT * FROM jobs WHERE id=?', id).toArray()[0];
+      if (!job) return null;
+      const nowMs = now.getTime(), at = now.toISOString();
+      if (job.status==='offered') {
+        const due = job.kind==='root-run' && !isRootSchedulingEnabled(this.sql) ? parseExpiryMs(job.deadline_at) : parseExpiryMs(job.offer_expires_at);
+        if (due===null) return null;
+        if (due>nowMs) return due;
+        this.sql.exec("UPDATE jobs SET status='expired',finished_at=?,outcome_summary='offer expired' WHERE id=? AND status='offered'", at,id);
+        this.addHealthEvent('job',id,'failed','offer expired',at);
+        return null;
+      }
+      if (!['claimed','running'].includes(job.status)) return null;
+      const leaseName = jobLeaseName(job);
+      const lease: any = this.sql.exec('SELECT * FROM leases WHERE name=?', leaseName).toArray()[0];
+      if (!lease || lease.holder_job_id!==id || lease.epoch!==job.lease_epoch) return null;
+      const expiry = parseExpiryMs(lease.expires_at), firstAction = job.status==='claimed' && !job.started_at ? parseExpiryMs(lease.acquired_at) : null;
+      const claimDue = firstAction===null ? null : firstAction+300000;
+      const failure = expiry===null || expiry<=nowMs ? 'lease expired' : claimDue!==null && claimDue<=nowMs ? 'no first action' : null;
+      if (!failure) return Math.min(expiry!,claimDue ?? Infinity);
+      this.sql.exec('UPDATE jobs SET status=?,finished_at=?,outcome_summary=? WHERE id=?',failure==='lease expired'?'expired':'failed',at,failure,id);
+      this.revokeCurrentCredential(id,at);
+      this.sql.exec('UPDATE leases SET holder_job_id=NULL,holder_host_id=NULL,holder_machine_id=NULL,expires_at=NULL,released_at=?,release_reason=? WHERE name=? AND holder_job_id=? AND epoch=?',at,failure,leaseName,id,job.lease_epoch);
+      this.addHealthEvent('job',id,'failed',failure,at);
+      return null;
+    }));
   }
 
   processAlarms(): number | null {
@@ -539,10 +880,15 @@ export class JobsService {
       const nowMs = now.getTime();
       const nowIso = now.toISOString();
 
+      const indexedLeases=this.hasIndexedLeaseWork();
+      this.backfillClaimDeadlines();
+      const hasOffers=this.hasOfferedWork();if(hasOffers)this.requireOfferedIndexes();
       this.ctx.storage.transactionSync(() => {
         // 1. Expire offers (root-run)
-        const offeredJobs = this.sql.exec("SELECT * FROM jobs WHERE kind = 'root-run' AND status = 'offered' AND offer_expires_at IS NOT NULL").toArray();
         const rootSchedulingEnabled = isRootSchedulingEnabled(this.sql);
+        const offeredJobs = !hasOffers?[]:rootSchedulingEnabled
+          ? this.sql.exec(`SELECT * FROM jobs INDEXED BY jobs_root_offered_due_ms WHERE kind='root-run' AND status='offered' AND ${OFFER_MS}<=? ORDER BY ${OFFER_MS} LIMIT ?`, nowMs, ALARM_BATCH).toArray()
+          : this.sql.exec(`SELECT * FROM jobs INDEXED BY jobs_root_offered_deadline_ms WHERE kind='root-run' AND status='offered' AND ${DEADLINE_MS}<=? ORDER BY ${DEADLINE_MS} LIMIT ?`, nowMs, ALARM_BATCH).toArray();
         for (const job of offeredJobs) {
           // Root scheduling flag: while disabled, root-run offers are frozen (no expiry,
           // no re-offer); only a job whose deadline has passed is closed.
@@ -557,8 +903,21 @@ export class JobsService {
           }
         }
 
+        // Every offered deadline returned by getAlarmTime must have a
+        // terminal transition here. Non-root role offers are host-bound;
+        // expiry cannot re-route them using the root host-selection policy
+        // or disturb a different holder of the role lease.
+        const expiredNonRoot = hasOffers?this.sql.exec(`SELECT id FROM jobs INDEXED BY jobs_nonroot_offered_due_ms
+          WHERE status='offered' AND kind<>'root-run' AND ${OFFER_MS}<=?
+          ORDER BY ${OFFER_MS} LIMIT ?`, nowMs, ALARM_BATCH).toArray() as any[]:[];
+        for (const job of expiredNonRoot) {
+          this.sql.exec("UPDATE jobs SET status='expired',finished_at=?,outcome_summary='offer expired' WHERE id=? AND status='offered'", nowIso, job.id);
+          this.addHealthEvent('job', job.id, 'failed', 'offer expired', nowIso);
+        }
+
         // 2. Expire leases (hard deadline or missed renew)
-        const activeLeases = this.sql.exec("SELECT * FROM leases WHERE holder_job_id IS NOT NULL").toArray();
+        const activeLeases = indexedLeases?this.sql.exec(`SELECT * FROM leases INDEXED BY leases_active_due_ms WHERE holder_job_id IS NOT NULL
+          AND ${LEASE_MS}<=? ORDER BY ${LEASE_MS} LIMIT ?`, nowMs, ALARM_BATCH).toArray():[];
         for (const lease of activeLeases) {
           if (isLeaseExpired(lease.expires_at as any, nowMs)) {
             if (lease.name === 'root') {
@@ -570,7 +929,7 @@ export class JobsService {
             const jobId = lease.holder_job_id as string;
             this.sql.exec("UPDATE jobs SET status = 'expired', finished_at = ?, outcome_summary = ? WHERE id = ?", nowIso, 'lease expired', jobId);
             this.addHealthEvent('job', jobId, 'failed', 'lease expired', nowIso);
-            this.sql.exec("UPDATE credentials SET revoked_at = ? WHERE subject = ? AND kind = 'job' AND revoked_at IS NULL", nowIso, jobId);
+            this.revokeCurrentCredential(jobId, nowIso);
             this.sql.exec(
               "UPDATE leases SET holder_job_id = NULL, holder_host_id = NULL, holder_machine_id = NULL, expires_at = NULL, released_at = ?, release_reason = ? WHERE name = ?",
               nowIso, 'lease expired', lease.name as string
@@ -579,16 +938,16 @@ export class JobsService {
         }
 
         // 3. Claims awaiting first action (5 mins)
-        const noStartLeases = this.sql.exec(
-          "SELECT leases.* FROM leases JOIN jobs ON leases.holder_job_id = jobs.id WHERE jobs.started_at IS NULL AND jobs.status = 'claimed'"
-        ).toArray();
+        const noStartLeases = this.sql.exec(`SELECT leases.* FROM
+          (SELECT lease_name FROM job_claim_deadlines WHERE due_ms<=? ORDER BY due_ms,lease_name LIMIT ?) pending
+          JOIN leases ON leases.name=pending.lease_name`, nowMs, ALARM_BATCH).toArray();
         for (const lease of noStartLeases) {
           const acq = parseExpiryMs(lease.acquired_at as string);
           if (acq !== null && (acq + 5 * 60000) <= nowMs) {
             const jobId = lease.holder_job_id as string;
             this.sql.exec("UPDATE jobs SET status = 'failed', finished_at = ?, outcome_summary = ? WHERE id = ?", nowIso, 'no first action', jobId);
             this.addHealthEvent('job', jobId, 'failed', 'no first action', nowIso);
-            this.sql.exec("UPDATE credentials SET revoked_at = ? WHERE subject = ? AND kind = 'job' AND revoked_at IS NULL", nowIso, jobId);
+            this.revokeCurrentCredential(jobId, nowIso);
             this.sql.exec(
               "UPDATE leases SET holder_job_id = NULL, holder_host_id = NULL, holder_machine_id = NULL, expires_at = NULL, released_at = ?, release_reason = ? WHERE name = ?",
               nowIso, 'no first action', lease.name as string
@@ -645,6 +1004,7 @@ export class JobsService {
 
     const chosen = this.unbiasedSample(candidates);
     if (chosen) {
+      this.requireOfferedIndexes();
       attempts.push(chosen.id);
       const offerExpires = new Date(now.getTime() + 120 * 1000).toISOString();
       this.sql.exec(
@@ -659,7 +1019,7 @@ export class JobsService {
   }
 
   private getCandidates(now: Date, excludeIds: string[], slotKeyOrDate?: string | Date): Machine[] {
-    const machines = this.sql.exec("SELECT * FROM machines WHERE revoked_at IS NULL").toArray() as unknown as Machine[];
+    const machines = (this.sql.exec("SELECT * FROM machines WHERE revoked_at IS NULL").toArray() as unknown as Machine[]).map(m=>effectiveHost(this.sql,m));
     const candidates: Machine[] = [];
     const nowMs = now.getTime();
 
@@ -854,6 +1214,7 @@ export class JobsService {
           return;
         }
 
+        this.prepareOfferedWork();
         const jobId = this.generateId();
         const deadlineAt = new Date(slotStartMs + 25 * 60000).toISOString();
         this.sql.exec("INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -908,10 +1269,14 @@ export class JobsService {
     // idempotency-key fallback (dated keys without payload.date) was retired
     // with intake 19848714: no stored rows used it and fresh offers always
     // carry payload.date. Project, role name, request key and epoch are not identities.
-    return !!this.sql.exec(`SELECT id FROM jobs WHERE kind='writer-run' AND id!=?
-      AND role_effect IS NOT NULL AND role_finish IS NULL
-      AND COALESCE(NULLIF(CASE WHEN json_valid(payload) THEN json_extract(payload,'$.date') END,''),'')=? LIMIT 1`,
-      job.id, identity.slice('writer:'.length)).toArray()[0];
+    const source=this.sql.exec('SELECT id FROM jobs ORDER BY id LIMIT 129').toArray();
+    if(source.length>128)throw new WriterIntentObservationLimit();
+    // Preserve SQLite's legacy JSON/value equality, but only after proving
+    // the complete raw cohort. CROSS JOIN hydrates each known job by its PK.
+    return !!this.sql.exec(`SELECT j.id FROM json_each(?) raw CROSS JOIN jobs j ON j.id=raw.value
+      WHERE j.kind='writer-run' AND j.id!=? AND j.role_effect IS NOT NULL AND j.role_finish IS NULL
+      AND COALESCE(NULLIF(CASE WHEN json_valid(j.payload) THEN json_extract(j.payload,'$.date') END,''),'')=? LIMIT 1`,
+      JSON.stringify(source.map(row=>row.id)),job.id,identity.slice('writer:'.length)).toArray()[0];
   }
 
   async claimJob(
@@ -940,6 +1305,14 @@ export class JobsService {
         if (job.role_name && (job.role_host_credential !== hostCredentialId || !this.roleCurrent(job))) {
           result = { error: 'gate_failed', reason: 'role_unauthorized' }; return;
         }
+        // Canonical queue/claim-deadline SQL supports textual payload identities
+        // and JS-falsy defaults. Other truthy JSON types have different SQL/JS
+        // coercions, so refuse them before minting a mismatched lease/token.
+        if(!job.role_name&&['writer-run','head-recovery'].includes(job.kind)) {
+          let payload:any;try{payload=JSON.parse(job.payload||'{}');}catch{}
+          const value=job.kind==='writer-run'?payload?.date:payload?.project;
+          if(value&&typeof value!=='string'){result={error:'conflict',reason:'unsupported_lease_identity'};return;}
+        }
         // Root scheduling flag: root-run claims (offered jobs included) are refused
         // inside the same claim transaction, so there is no flag-check race.
         if (job.kind === 'root-run' && !isRootSchedulingEnabled(this.sql)) {
@@ -956,7 +1329,7 @@ export class JobsService {
         }
 
         // Server revalidate current machine checkin/drain/capability/heartbeat gate in same SQL transaction
-        const host = this.sql.exec("SELECT * FROM machines WHERE id = ?", hostId).toArray()[0] as any;
+        const host = effectiveHost(this.sql,this.sql.exec("SELECT * FROM machines WHERE id = ?", hostId).toArray()[0] as any);
         if (!host) {
           result = { error: 'gate_failed', reason: 'host_not_found' }; return;
         }
@@ -1001,8 +1374,10 @@ export class JobsService {
           }
           const profileLease = this.getLeaseNameForJob({ ...job, role_name: null });
           if (profileLease.startsWith('writer:')) {
-            const holders = this.sql.exec(`SELECT j.*,l.expires_at AS profile_expires_at FROM jobs j JOIN leases l ON l.holder_job_id=j.id
-              WHERE j.kind='writer-run' AND j.id!=? AND j.status IN ('claimed','running')`, jobId).toArray();
+            const holders=this.activeLeaseCohort().filter(l=>l.holder_job_id!==jobId).flatMap(l=>{
+              const held:any=this.sql.exec('SELECT * FROM jobs WHERE id=?',l.holder_job_id).toArray()[0];
+              return held?.kind==='writer-run'&&['claimed','running'].includes(held.status)?[{...held,profile_expires_at:l.expires_at}]:[];
+            });
             if (holders.some(h => this.getLeaseNameForJob({ ...h, role_name: null }) === profileLease &&
                 !isLeaseExpired(h.profile_expires_at as any, nowMs))) {
               result = { error: 'conflict', reason: 'writer_date_busy' }; return;
@@ -1036,11 +1411,11 @@ export class JobsService {
         const jobActor = job.kind === 'root-run' ? 'role:root' : (job.actor || 'role:worker');
 
         const acquire = this.sql.exec(
-          "UPDATE leases SET holder_job_id = ?, holder_host_id = ?, holder_machine_id = ?, holder_actor = ?, epoch = epoch + 1, acquired_at = ?, renewed_at = ?, expires_at = ? WHERE name = ? AND epoch = ?",
+          "UPDATE leases SET holder_job_id = ?, holder_host_id = ?, holder_machine_id = ?, holder_actor = ?, epoch = epoch + 1, acquired_at = ?, renewed_at = ?, expires_at = ? WHERE name = ? AND epoch = ? RETURNING name",
           jobId, hostId, hostId, jobActor, nowIso, nowIso, new Date(leaseExpiresMs).toISOString(), leaseName, currentEpoch
-        );
+        ).toArray();
 
-        if (acquire.rowsWritten !== 1) {
+        if (acquire.length !== 1) {
           result = { error: 'conflict' }; return;
         }
 
@@ -1054,10 +1429,7 @@ export class JobsService {
             "UPDATE jobs SET status = 'fenced', finished_at = ?, outcome_summary = ? WHERE id = ? AND status IN ('claimed', 'running', 'offered')",
             nowIso, `fenced: superseded by takeover epoch ${newEpoch}`, oldJobId
           );
-          this.sql.exec(
-            "UPDATE credentials SET revoked_at = ? WHERE subject = ? AND kind = 'job' AND revoked_at IS NULL",
-            nowIso, oldJobId
-          );
+          this.revokeCurrentCredential(oldJobId, nowIso);
           this.addHealthEvent('job', oldJobId, 'fenced', `superseded by takeover epoch ${newEpoch}`, nowIso);
         }
 
@@ -1098,6 +1470,7 @@ export class JobsService {
         if (!job || job.status !== 'offered' || (job.offer_host_id !== hostId && job.offer_machine_id !== hostId)) {
           result = { error: 'conflict' }; return;
         }
+        this.prepareOfferedWork();
         this.addHealthEvent('job', jobId, 'declined', reason.substring(0, 4096), now.toISOString());
         this.tryOfferNext(job, now);
       });
@@ -1135,10 +1508,12 @@ export class JobsService {
   }
 
   private resolveLeaseForJob(jobId: string, job: any): any {
-    const direct = this.sql.exec("SELECT * FROM leases WHERE holder_job_id = ?", jobId).toArray()[0] as any;
-    if (direct) return direct;
-    const leaseName = this.getLeaseNameForJob(job);
-    return this.sql.exec("SELECT * FROM leases WHERE name = ?", leaseName).toArray()[0] as any;
+    const canonical=this.sql.exec('SELECT * FROM leases WHERE name=?',this.getLeaseNameForJob(job)).toArray()[0] as any;
+    if(canonical?.holder_job_id===jobId)return canonical;
+    const matches=this.activeLeaseCohort().filter(row=>row.holder_job_id===jobId);
+    if(matches.length>1)throw Object.assign(new Error('lease_identity_ambiguous'),{status:503});
+    return matches[0]??canonical;
+
   }
 
   async startJob(
@@ -1286,15 +1661,15 @@ export class JobsService {
         const newExpiresIso = new Date(newExpiresMs).toISOString();
 
         const updateRes = this.sql.exec(
-          "UPDATE leases SET expires_at = ?, renewed_at = ? WHERE name = ? AND epoch = ? AND holder_job_id = ?",
+          "UPDATE leases SET expires_at = ?, renewed_at = ? WHERE name = ? AND epoch = ? AND holder_job_id = ? RETURNING name",
           newExpiresIso, now.toISOString(), lease.name, epoch, jobId
-        );
-        if (updateRes.rowsWritten !== 1) {
+        ).toArray();
+        if (updateRes.length !== 1) {
           result = { error: 'unauthorized_or_stale' }; return;
         }
 
         // Update credential expiry
-        this.sql.exec("UPDATE credentials SET expires_at = ? WHERE subject = ? AND kind = 'job' AND revoked_at IS NULL", newExpiresIso, jobId);
+        this.sql.exec("UPDATE credentials SET expires_at=? WHERE token_hash=? AND subject=? AND kind='job' AND revoked_at IS NULL", newExpiresIso, job.claim_token_hash, jobId);
       });
 
       this.scheduleAlarm();
@@ -1381,10 +1756,10 @@ export class JobsService {
         const safeSummary = safeUtf8Summary(summary, 4096);
 
         const leaseUpdate = this.sql.exec(
-          "UPDATE leases SET holder_job_id = NULL, holder_host_id = NULL, holder_machine_id = NULL, expires_at = NULL, released_at = ?, release_reason = ? WHERE name = ? AND epoch = ?",
+          "UPDATE leases SET holder_job_id = NULL, holder_host_id = NULL, holder_machine_id = NULL, expires_at = NULL, released_at = ?, release_reason = ? WHERE name = ? AND epoch = ? RETURNING name",
           nowIso, status, lease.name, epoch
-        );
-        if (leaseUpdate.rowsWritten !== 1) {
+        ).toArray();
+        if (leaseUpdate.length !== 1) {
           result = { error: 'unauthorized_or_stale' };
           return;
         }
@@ -1395,7 +1770,7 @@ export class JobsService {
         if (job.role_name) this.sql.exec('UPDATE jobs SET role_finish=? WHERE id=?', canonical({ status, summary: safeSummary, evidenceRefs }), jobId);
 
         // Invalidate/revoke job credential
-        if (!job.role_name) this.sql.exec("UPDATE credentials SET revoked_at = ? WHERE subject = ? AND kind = 'job' AND revoked_at IS NULL", nowIso, jobId);
+        if (!job.role_name) this.revokeCurrentCredential(jobId, nowIso);
 
         this.addHealthEvent('job', jobId, status, safeSummary, nowIso);
 
@@ -1465,7 +1840,7 @@ export class JobsService {
           return { error: 'unauthorized_or_stale', status_code: 403 };
         }
         const cred: any = this.sql.exec('SELECT * FROM credentials WHERE id=?', callerTokenId).toArray()[0];
-        const machine: any = this.sql.exec('SELECT * FROM machines WHERE id=?', callerHostId).toArray()[0];
+        const machine: any = effectiveHost(this.sql,this.sql.exec('SELECT * FROM machines WHERE id=?', callerHostId).toArray()[0]);
         let scopes: any;
         try { scopes = JSON.parse(cred?.scopes); } catch { scopes = null; }
         if (!cred || cred.kind !== 'host' || cred.revoked_at || !(Date.parse(cred.expires_at) > nowMs) ||
@@ -1747,6 +2122,7 @@ export class JobsService {
           }
         }
 
+        this.prepareOfferedWork();
         this.sql.exec("INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
           jobId, kind, idempotencyKey, JSON.stringify(payload), 'pending', now.toISOString(), deadlineAt, actor);
 
@@ -1899,7 +2275,7 @@ export class JobsService {
     let machineTransportKnown = false;
 
     if (hostId) {
-      const machine = this.sql.exec("SELECT * FROM machines WHERE id = ?", hostId).toArray()[0] as any;
+      const machine = effectiveHost(this.sql,this.sql.exec("SELECT * FROM machines WHERE id = ?", hostId).toArray()[0] as any);
       if (machine) {
         let hb = null;
         try { hb = machine.last_heartbeat ? JSON.parse(machine.last_heartbeat) : null; } catch {}
@@ -1944,7 +2320,7 @@ export class JobsService {
 
     if (regAgent) {
       const regHostId = regAgent.machine_id;
-      const regMachine = regHostId ? this.sql.exec("SELECT * FROM machines WHERE id = ?", regHostId).toArray()[0] as any : null;
+      const regMachine = regHostId ? effectiveHost(this.sql,this.sql.exec("SELECT * FROM machines WHERE id = ?", regHostId).toArray()[0] as any) : null;
       let regMachineFresh = false;
       let regMachineKnown = false;
       if (regMachine && regMachine.last_checkin_at) {
@@ -2301,7 +2677,7 @@ export class JobsService {
         }
 
         // 5. Validate candidate host eligibility
-        const candidateMachine = this.sql.exec("SELECT * FROM machines WHERE id = ?", hostId).toArray()[0] as any;
+        const candidateMachine = effectiveHost(this.sql,this.sql.exec("SELECT * FROM machines WHERE id = ?", hostId).toArray()[0] as any);
         if (!candidateMachine) {
           result = { error: 'host_not_found', reason: `candidate host ${hostId} not registered in machines` };
           return;
@@ -2360,11 +2736,11 @@ export class JobsService {
 
         // 6. Strong atomic CAS update against expectedEpoch
         const updateLease = this.sql.exec(
-          "UPDATE leases SET holder_job_id = ?, holder_host_id = ?, holder_machine_id = ?, holder_actor = 'role:root', epoch = epoch + 1, acquired_at = ?, renewed_at = ?, expires_at = ?, release_reason = NULL, released_at = NULL WHERE name = 'root' AND epoch = ?",
+          "UPDATE leases SET holder_job_id = ?, holder_host_id = ?, holder_machine_id = ?, holder_actor = 'role:root', epoch = epoch + 1, acquired_at = ?, renewed_at = ?, expires_at = ?, release_reason = NULL, released_at = NULL WHERE name = 'root' AND epoch = ? RETURNING name",
           candidateJobId, hostId, hostId, nowIso, nowIso, leaseExpiresIso, expectedEpoch
-        );
+        ).toArray();
 
-        if (updateLease.rowsWritten !== 1) {
+        if (updateLease.length !== 1) {
           result = {
             error: 'cas_failed',
             reason: 'concurrent update race; epoch changed',
@@ -2380,10 +2756,7 @@ export class JobsService {
             "UPDATE jobs SET status = 'fenced', finished_at = ?, outcome_summary = ? WHERE id = ? AND status IN ('claimed', 'running', 'offered')",
             nowIso, `fenced: superseded by takeover epoch ${newEpoch} on host ${hostId}`, oldJobId
           );
-          this.sql.exec(
-            "UPDATE credentials SET revoked_at = ? WHERE subject = ? AND kind = 'job' AND revoked_at IS NULL",
-            nowIso, oldJobId
-          );
+          this.revokeCurrentCredential(oldJobId, nowIso);
           this.addHealthEvent('job', oldJobId, 'fenced', `superseded by takeover epoch ${newEpoch}`, nowIso);
         }
 
@@ -2813,7 +3186,7 @@ export class JobsService {
           const p = action.payload || {};
           let toActor = p.to_actor;
           if (!toActor && typeof p.to === 'string' && p.to) {
-            const mRow = this.sql.exec("SELECT 1 FROM machines WHERE id = ?", p.to).toArray()[0];
+            const mRow = effectiveHost(this.sql,this.sql.exec("SELECT 1 FROM machines WHERE id = ?", p.to).toArray()[0]);
             toActor = mRow ? `machine:${p.to}` : p.to;
           }
           const msgKind = p.kind || (p.type === 'directive' ? 'note' : p.type);
@@ -2867,7 +3240,7 @@ export class JobsService {
             validRecipient = res.length > 0;
           } else if (toActor.startsWith('machine:')) {
             const mId = toActor.substring(8);
-            const mRow = this.sql.exec("SELECT * FROM machines WHERE id = ? AND COALESCE(drained, 0) = 0", mId).toArray()[0] as any;
+            const mRow = effectiveHost(this.sql,this.sql.exec("SELECT * FROM machines WHERE id = ? AND COALESCE(drained, 0) = 0", mId).toArray()[0] as any);
             validRecipient = Boolean(mRow && (!mRow.state || mRow.state !== 'drained'));
           } else if (toActor.includes(':')) {
             const [project, tag] = toActor.split(':');
@@ -3014,10 +3387,7 @@ export class JobsService {
             nowIso, p.new_status, p.target_job_id
           );
           // Revoke target job credentials
-          this.sql.exec(
-            "UPDATE credentials SET revoked_at = ? WHERE subject = ? AND kind = 'job' AND revoked_at IS NULL",
-            nowIso, p.target_job_id
-          );
+          this.revokeCurrentCredential(p.target_job_id, nowIso);
           this.addHealthEvent('job', p.target_job_id, p.new_status, `transitioned by root epoch ${epoch}`, nowIso);
           effectResult = { target_job_id: p.target_job_id, previous_status: targetJob.status, new_status: p.new_status };
         }
@@ -3079,7 +3449,7 @@ export class JobsService {
       let res: any = { success: false };
       this.ctx.storage.transactionSync(() => {
         // 1. Authenticate caller host exists
-        const host = this.sql.exec("SELECT * FROM machines WHERE id = ?", hostId).toArray()[0] as any;
+        const host = effectiveHost(this.sql,this.sql.exec("SELECT * FROM machines WHERE id = ?", hostId).toArray()[0] as any);
         if (!host) {
           res = { success: false, error: 'host_not_found' };
           return;

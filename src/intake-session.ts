@@ -34,8 +34,17 @@ export function historyReferencesSession(task: any, session: any, binding: any):
 export function linkedTaskIds(sql: SqlStorage, refs: unknown[], match: (e: any) => boolean, limit: number): string[] {
   const keys = [...new Set(refs.filter((r): r is string => typeof r === 'string'))];
   if (!keys.length) return [];
-  const rows = sql.exec(`SELECT i.id, i.links FROM intake_task_projection i WHERE i.id IN
-    (SELECT task_id FROM intake_projection_link_refs WHERE ref IN (${keys.map(() => '?').join(',')})) ORDER BY i.rowid`, ...keys).toArray() as any[];
+  if(keys.length>4)throw new Error('intake_link_observation_limited');
+  const candidates=new Set<string>();
+  for(const key of keys){
+    const prefix=sql.exec('SELECT task_id FROM intake_projection_link_refs WHERE ref=? ORDER BY task_id LIMIT 129',key).toArray() as any[];
+    if(prefix.length>128)throw new Error('intake_link_observation_limited');
+    for(const row of prefix)candidates.add(String(row.task_id));
+    if(candidates.size>128)throw new Error('intake_link_observation_limited');
+  }
+  if(!candidates.size)return [];
+  const candidateIds=[...candidates];
+  const rows=sql.exec(`SELECT i.id,i.links FROM intake_task_projection i WHERE i.id IN (${candidateIds.map(()=>'?').join(',')}) ORDER BY i.rowid`,...candidateIds).toArray() as any[];
   const ids: string[] = [];
   for (const row of rows) {
     let links: any; try { links = JSON.parse(row.links); } catch { continue; }
@@ -69,7 +78,9 @@ export function linkedIntake(sql: SqlStorage, session: any, inferHistory = false
     const row: any = sql.exec('SELECT data FROM intake_tasks WHERE id=?', ids[0]).toArray()[0];
     return row ? parseObject(row.data) : null;
   }
-  const matches = sql.exec('SELECT data FROM intake_tasks').toArray()
+  const prefix=sql.exec('SELECT data FROM intake_tasks ORDER BY id LIMIT 129').toArray();
+  if(prefix.length>128)throw new Error('intake_history_observation_limited');
+  const matches = prefix
     .map((r: any) => parseObject(r.data)).filter(t => historyReferencesSession(t, session, binding));
   // Ambiguous notes require an explicit manual link; never pick an arbitrary task.
   return matches.length === 1 ? matches[0] : null;
@@ -88,14 +99,14 @@ export function nativeGoalStatus(native: any): string | null {
 export function sessionWakeState(sql: SqlStorage, sessionId: string, now: number) {
   const exists = sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='session_control_wakes'").toArray().length;
   if (!exists) return { waiting_until: null as string | null, missed: false };
-  const pending: any = sql.exec("SELECT MIN(wake_at_ms) AS at FROM session_control_wakes WHERE session_id=? AND state='pending' AND wake_at_ms>?", sessionId, now).toArray()[0];
+  const pending: any = sql.exec("SELECT wake_at_ms AS at FROM session_control_wakes INDEXED BY intake_queue_wakes_session WHERE session_id=? AND state='pending' AND wake_at_ms>? ORDER BY wake_at_ms LIMIT 1", sessionId, now).toArray()[0];
   const missed = sql.exec("SELECT 1 FROM session_control_wakes WHERE session_id=? AND state='missed' LIMIT 1", sessionId).toArray().length > 0;
   return { waiting_until: Number.isFinite(pending?.at) ? new Date(pending.at).toISOString() : null, missed };
 }
 
 /** Read-only memo for one synchronous idle-reap projection over many
  * sessions: linked-intake facts by id and the idle-episode index. */
-export type IdleReapCache = { intakes: Map<string, { done: boolean } | null>; episodes?: Set<string> | null };
+export type IdleReapCache = { intakes: Map<string, { done: boolean } | null>; episodes?: Set<string> | null; episodesAvailable?:boolean };
 
 // JSON letters decode only from literal characters or \u escapes, so data
 // without either cannot hold a DONE note; skip parsing retained history.
@@ -131,14 +142,10 @@ export function openWorkPreventsIdleReap(sql: SqlStorage, session: any, now = Da
       return sessionLinkIds(sql, session, binding, 1).length > 0;
     }
     if (task && (cache ? (task as { done: boolean }).done : intakeHasDone(task))) return false;
-    if (cache && cache.episodes === undefined) {
-      const exists = sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='session_idle_episodes'").toArray().length > 0;
-      cache.episodes = exists ? new Set((sql.exec('SELECT session_id FROM session_idle_episodes WHERE replacement_id IS NOT NULL').toArray() as any[]).map(r => r.session_id)) : null;
-    }
-    // Without a replacement id the join below cannot match, so the cached
-    // index only skips queries that would return no row.
-    const episodes = cache ? cache.episodes !== null && cache.episodes!.has(session.id)
-      : sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='session_idle_episodes'").toArray().length > 0;
+    const tableAvailable=cache?.episodesAvailable ?? (sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='session_idle_episodes'").toArray().length > 0);
+    if(cache)cache.episodesAvailable=tableAvailable;
+    // Query only this episode's primary key; no retained-episode census.
+    const episodes=tableAvailable;
     if (episodes) {
       const replacement: any = sql.exec(`SELECT s.* FROM session_idle_episodes e JOIN session_control_sessions s
         ON s.id=e.replacement_id WHERE e.session_id=?`, session.id).toArray()[0];

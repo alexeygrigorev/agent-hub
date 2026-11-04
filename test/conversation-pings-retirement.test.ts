@@ -1,3 +1,4 @@
+import {freshFixtureBudgetDay,fixtureSql} from './helpers/fixture-budget';
 import { beforeEach, expect, it } from 'vitest';
 import { SELF, env, runInDurableObject } from 'cloudflare:test';
 import { Hub } from '../src/conversation-hub';
@@ -27,39 +28,46 @@ async function fixture() {
 function deps(h: Hub): ActionDeps {
   return { liveness: h.livenessService, notify: async () => {}, message: async () => '', launch: async () => '', fetch: async () => new Response(null), evaluateQuota: () => [], conversation: { evaluateBacklog: q => h.conversationsService.evaluateScheduledBacklog(q), sendFollowUp: i => h.conversationsService.postScheduledFollowUp(i) } };
 }
-function scalar(h: Hub, q: string) { return Number(h.sql.exec(q).toArray()[0].n); }
-beforeEach(async () => inside(h => {
+function scalar(h: Hub, q: string) { return Number(fixtureSql(h).exec(q).toArray()[0].n); }
+beforeEach(async () => inside(async h => {
+  await freshFixtureBudgetDay(h);
   Reflect.deleteProperty(h, 'extraCheckDeps');
-  for (const table of ['conversation_automation_receipts', 'conversation_automation_grants', 'hub_check_slots', 'hub_checks', 'hub_check_runs', 'conversation_messages', 'conversation_members', 'conversations', 'users']) h.sql.exec('DELETE FROM ' + table);
-  h.sql.exec('UPDATE conversation_storage_usage SET conversation_count=0,message_count=0,message_bytes=0,removed_member_count=0');
+  for (const table of ['conversation_automation_receipts', 'conversation_automation_grants', 'hub_check_slots', 'hub_checks', 'hub_check_runs', 'conversation_messages', 'conversation_members', 'conversations', 'users']) fixtureSql(h).exec('DELETE FROM ' + table);
+  fixtureSql(h).exec('UPDATE conversation_storage_usage SET conversation_count=0,message_count=0,message_bytes=0,removed_member_count=0');
 }));
 
 it('reclaims more than 4096 settled historical receipts and keeps current intervals bounded and unread', async () => {
   const { t, owner, recipient, cid } = await fixture();
   await inside(async h => {
     expect((await new ChecksService(h.sql, () => t).runDue(deps(h), 'retire'))[0].action).toMatch(/^conversation_message /);
-    const firstReceipt = h.sql.exec('SELECT * FROM conversation_automation_receipts').toArray()[0];
+    const firstReceipt = fixtureSql(h).exec('SELECT * FROM conversation_automation_receipts').toArray()[0];
     // Bounded R2 fixture: 4095 completed historical slots whose messages have
     // already expired, using a real effect's serialized request and bindings.
-    h.sql.exec(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<4095)
+    fixtureSql(h).exec(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<4095)
       INSERT INTO conversation_automation_receipts SELECT 'settled-'||i,json_set(?, '$.idempotencyKey', 'settled-'||i),'old-'||i,?,0 FROM n`, firstReceipt.request_json, cid);
     let retired = 0;
+    // Explicit manual cleanup requests on separate strict synthetic budget days.
+    // Retained legacy history is larger than one permitted production day.
     for (let i = 0; i < 50; i++) {
+      await freshFixtureBudgetDay(h);
       const result = h.busService.retentionCleanup(t, 100) as any;
       expect(Number(result.conversationRowsDeleted) + Number(result.messagesDeleted) + Number(result.claimsDeleted)).toBeLessThanOrEqual(100);
       retired += result.automationRowsDeleted;
+      expect((h as any).rowBudget.status().stopped).toBe(false);
       if (!result.hasMore) break;
     }
     expect(retired).toBe(4096);
-    const watermarks = h.sql.exec('SELECT actor,last_read_seq FROM conversation_members ORDER BY actor').toArray();
+    const watermarks = fixtureSql(h).exec('SELECT actor,last_read_seq FROM conversation_members ORDER BY actor').toArray();
     const clock = { t: t + 300000 }; const checks = new ChecksService(h.sql, () => clock.t);
     for (let i = 0; i < 32; i++) {
+      await freshFixtureBudgetDay(h);
       expect((await checks.runDue(deps(h)))[0].action).toMatch(/^conversation_message /);
       h.busService.retentionCleanup(clock.t, 5);
+      expect((h as any).rowBudget.status().stopped).toBe(false);
       expect(scalar(h, 'SELECT count(*) n FROM conversation_automation_receipts')).toBe(0);
       expect(scalar(h, 'SELECT count(*) n FROM hub_check_slots')).toBe(1);
       expect(scalar(h, 'SELECT count(*) n FROM conversation_automation_grants')).toBe(1);
-      expect(h.sql.exec('SELECT actor,last_read_seq FROM conversation_members ORDER BY actor').toArray()).toEqual(watermarks);
+      expect(fixtureSql(h).exec('SELECT actor,last_read_seq FROM conversation_members ORDER BY actor').toArray()).toEqual(watermarks);
       clock.t += 300000;
     }
     expect(scalar(h, 'SELECT sum(length(check_json)+length(coalesce(intent_json,\'\'))+length(coalesce(result_json,\'\'))) n FROM hub_check_slots')).toBeLessThan(5000);
@@ -76,7 +84,7 @@ it('rejects exact old requests after message and receipt pruning, restart, confi
   await inside(async (h, state) => {
     const checks = new ChecksService(h.sql, () => t);
     await checks.runDue(deps(h), 'retire');
-    const slot = h.sql.exec('SELECT * FROM hub_check_slots').toArray()[0];
+    const slot = fixtureSql(h).exec('SELECT * FROM hub_check_slots').toArray()[0];
     const old: FollowUpIntent = JSON.parse(String(slot.intent_json));
     const pruner = new ConversationsService(h.sql, f => state.storage.transactionSync(f), { now: () => t + 86400000, limits: { messageRetentionMs: 0 } });
     pruner.retentionCleanup(t + 86400000, 100);
@@ -101,7 +109,7 @@ for (const phase of ['preintent', 'intent', 'accepted'] as const) it(`preserves 
     let frozen: FollowUpIntent | undefined;
     if (phase === 'preintent') {
       const check = checks.list()[0];
-      h.sql.exec("INSERT INTO hub_check_slots VALUES ('retire','legacy-r2-key',?,?,NULL,NULL,NULL,'evaluating','dead',?)", t + 300000, JSON.stringify(check), t + 30000);
+      fixtureSql(h).exec("INSERT INTO hub_check_slots VALUES ('retire','legacy-r2-key',?,?,NULL,NULL,NULL,'evaluating','dead',?)", t + 300000, JSON.stringify(check), t + 30000);
     } else {
       port.conversation!.sendFollowUp = i => { frozen = i; if (phase === 'accepted') h.conversationsService.postScheduledFollowUp(i); throw Error('lost response'); };
       expect((await checks.runDue(port, 'retire'))[0].status).toBe('error');
@@ -114,7 +122,7 @@ for (const phase of ['preintent', 'intent', 'accepted'] as const) it(`preserves 
     const fresh = deps(h); fresh.conversation!.sendFollowUp = i => service.postScheduledFollowUp(i);
     expect((await new ChecksService(h.sql, () => clock.t).runDue(fresh, 'retire'))[0].action).toMatch(/^conversation_message /);
     expect(scalar(h, 'SELECT count(*) n FROM conversation_messages')).toBe(2);
-    if (frozen) expect(JSON.parse(String(h.sql.exec('SELECT intent_json FROM hub_check_slots').toArray()[0].intent_json))).toEqual(frozen);
+    if (frozen) expect(JSON.parse(String(fixtureSql(h).exec('SELECT intent_json FROM hub_check_slots').toArray()[0].intent_json))).toEqual(frozen);
     h.conversationsService.retentionCleanup(clock.t, 100);
     if (frozen) expect(() => service.postScheduledFollowUp(frozen!)).toThrow('automation_slot_retired');
     expect(scalar(h, `SELECT last_read_seq n FROM conversation_members WHERE conversation_id='${cid}' AND actor='human:retire-target'`)).toBe(0);
@@ -135,11 +143,11 @@ for (const mutation of ['expire', 'revoke', 'remove', 'archive', 'replace-grant'
     if (mutation === 'archive') await json(await request(`/api/conversations/${cid}/archive`, owner, 'POST', {}));
     if (mutation === 'replace-grant') await json(await request(`/api/conversations/${cid}/automation`, owner, 'PUT', { check: 'retire', target_actor: target, body: 'New generation', on: 'always', expires_at: Date.now() + 3600000 }));
     await inside(async (h, state) => {
-      if (mutation === 'expire') h.sql.exec('UPDATE conversation_automation_grants SET expires_at=?', t - 1);
+      if (mutation === 'expire') fixtureSql(h).exec('UPDATE conversation_automation_grants SET expires_at=?', t - 1);
       const before = scalar(h, 'SELECT count(*) n FROM conversation_messages');
       const cleanup = h.busService.retentionCleanup(t + 1, 100) as any;
       expect(cleanup.conversationRowsDeleted).toBeLessThanOrEqual(100);
-      const slot = h.sql.exec('SELECT * FROM hub_check_slots').toArray()[0];
+      const slot = fixtureSql(h).exec('SELECT * FROM hub_check_slots').toArray()[0];
       expect(slot.state).toBe('done');
       expect(String(slot.action)).toContain(accepted ? 'Hub stored; native delivery unconfirmed' : 'no accepted Hub effect');
       if (!accepted) expect(JSON.parse(String(slot.result_json)).status).toBe('error');
@@ -154,9 +162,9 @@ for (const mutation of ['expire', 'revoke', 'remove', 'archive', 'replace-grant'
 it('reclaims orphan slot and grant caps with a shared one-row allowance, leaving live progress intact', async () => {
   const { t } = await fixture();
   await inside(async h => {
-    h.sql.exec(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1000)
+    fixtureSql(h).exec(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1000)
       INSERT INTO hub_check_slots SELECT 'orphan-'||i,'old-'||i,0,'{"action":{}}','{"status":"pass","detail":"settled"}',NULL,NULL,'done',NULL,0 FROM n`);
-    h.sql.exec(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<999)
+    fixtureSql(h).exec(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<999)
       INSERT INTO conversation_automation_grants SELECT 'expired-'||i,'gone-'||i,'expired','human:retire-target',NULL,'retire-owner',0,'old','always',NULL FROM n`);
     for (let i = 0; i < 6; i++) {
       const before = scalar(h, 'SELECT (SELECT count(*) FROM hub_check_slots)+(SELECT count(*) FROM conversation_automation_grants) n');
@@ -199,18 +207,18 @@ it('standalone R2 initialization preserves legacy frozen rows and keys, and clos
     const checks = new ChecksService(h.sql, () => t), port = deps(h);
     port.conversation!.sendFollowUp = () => { throw Error('not yet accepted'); };
     await checks.runDue(port, 'retire');
-    const original = h.sql.exec('SELECT * FROM hub_check_slots').toArray()[0];
-    h.sql.exec('DROP INDEX idx_check_slot_effect'); h.sql.exec('DROP INDEX idx_check_slot_grant');
-    h.sql.exec('ALTER TABLE hub_check_slots RENAME TO legacy_slots');
-    h.sql.exec(`CREATE TABLE hub_check_slots (name TEXT PRIMARY KEY, slot_key TEXT NOT NULL, next_at INTEGER NOT NULL, check_json TEXT NOT NULL, result_json TEXT, intent_json TEXT, action TEXT, state TEXT NOT NULL, token TEXT, lease_until INTEGER NOT NULL)`);
-    h.sql.exec('INSERT INTO hub_check_slots SELECT * FROM legacy_slots'); h.sql.exec('DROP TABLE legacy_slots');
-    h.sql.exec('DROP TABLE hub_checks');
+    const original = fixtureSql(h).exec('SELECT * FROM hub_check_slots').toArray()[0];
+    fixtureSql(h).exec('DROP INDEX idx_check_slot_effect'); fixtureSql(h).exec('DROP INDEX idx_check_slot_grant');
+    fixtureSql(h).exec('ALTER TABLE hub_check_slots RENAME TO legacy_slots');
+    fixtureSql(h).exec(`CREATE TABLE hub_check_slots (name TEXT PRIMARY KEY, slot_key TEXT NOT NULL, next_at INTEGER NOT NULL, check_json TEXT NOT NULL, result_json TEXT, intent_json TEXT, action TEXT, state TEXT NOT NULL, token TEXT, lease_until INTEGER NOT NULL)`);
+    fixtureSql(h).exec('INSERT INTO hub_check_slots SELECT * FROM legacy_slots'); fixtureSql(h).exec('DROP TABLE legacy_slots');
+    fixtureSql(h).exec('DROP TABLE hub_checks');
     const service = new ConversationsService(h.sql, f => state.storage.transactionSync(f), { now: () => t });
-    service.init(); expect(h.sql.exec('SELECT * FROM hub_check_slots').toArray()[0]).toEqual(original);
+    service.init(); expect(fixtureSql(h).exec('SELECT * FROM hub_check_slots').toArray()[0]).toEqual(original);
     expect(service.retentionCleanup(t, 1).rowsDeleted).toBe(0);
-    h.sql.exec('UPDATE conversation_automation_grants SET expires_at=0');
+    fixtureSql(h).exec('UPDATE conversation_automation_grants SET expires_at=0');
     for (let i = 0; i < 4; i++) expect(service.retentionCleanup(t, 1).rowsDeleted).toBeLessThanOrEqual(1);
-    const slot = h.sql.exec('SELECT * FROM hub_check_slots').toArray()[0];
+    const slot = fixtureSql(h).exec('SELECT * FROM hub_check_slots').toArray()[0];
     expect(slot.state).toBe('done'); expect(JSON.parse(String(slot.result_json)).status).toBe('error');
     expect(() => service.postScheduledFollowUp(JSON.parse(String(original.intent_json)))).toThrow('automation_slot_retired');
     // Restore the public scheduler schema for this shared fixture's later tests.
@@ -223,7 +231,7 @@ it('keeps retired generations rejected when a fresh grant rebinds the name to a 
   let old!: FollowUpIntent;
   await inside(async h => {
     await new ChecksService(h.sql, () => t).runDue(deps(h), 'retire');
-    old = JSON.parse(String(h.sql.exec('SELECT intent_json FROM hub_check_slots').toArray()[0].intent_json));
+    old = JSON.parse(String(fixtureSql(h).exec('SELECT intent_json FROM hub_check_slots').toArray()[0].intent_json));
     h.conversationsService.retentionCleanup(t, 100);
   });
   const other = (await createSessionCookie(env as any, { sub: 'retire-other', email: 'admin@fake.local', isAdmin: true, csrfToken: csrf, exp: Math.floor(Date.now() / 1000) + 3600 })).split(';')[0];
@@ -233,11 +241,11 @@ it('keeps retired generations rejected when a fresh grant rebinds the name to a 
   await json(await request('/api/checks', owner, 'PUT', { checks: [{ ...definition, action: { ...definition.action, to: 'human:retire-other', conversation_id: next.id, grant_id: g.grant_id } }] }));
   await inside(async h => {
     expect((await new ChecksService(h.sql, () => t + 300000).runDue(deps(h), 'retire'))[0].action).toMatch(/^conversation_message /);
-    const key = JSON.parse(String(h.sql.exec('SELECT intent_json FROM hub_check_slots').toArray()[0].intent_json)).idempotencyKey;
+    const key = JSON.parse(String(fixtureSql(h).exec('SELECT intent_json FROM hub_check_slots').toArray()[0].intent_json)).idempotencyKey;
     expect(key).not.toBe(old.idempotencyKey);
     for (const intent of [old, { ...old, grantId: g.grant_id, conversationId: next.id, actor: 'human:retire-other' }]) expect(() => h.conversationsService.postScheduledFollowUp(intent)).toThrow('automation_slot_retired');
-    expect(h.sql.exec('SELECT id FROM conversation_messages WHERE conversation_id=?', cid).toArray()).toHaveLength(2);
-    expect(h.sql.exec('SELECT id FROM conversation_messages WHERE conversation_id=?', next.id).toArray()).toHaveLength(1);
+    expect(fixtureSql(h).exec('SELECT id FROM conversation_messages WHERE conversation_id=?', cid).toArray()).toHaveLength(2);
+    expect(fixtureSql(h).exec('SELECT id FROM conversation_messages WHERE conversation_id=?', next.id).toArray()).toHaveLength(1);
   });
 });
 
@@ -257,7 +265,7 @@ it('finishes archived parent cleanup within the shared allowance without leaving
       expect(result.rowsDeleted).toBeLessThanOrEqual(1);
       if (!result.hasMore) break;
     }
-    expect(h.sql.exec('SELECT id FROM conversations WHERE id=?', cid).toArray()).toHaveLength(0);
+    expect(fixtureSql(h).exec('SELECT id FROM conversations WHERE id=?', cid).toArray()).toHaveLength(0);
     expect(scalar(h, 'SELECT count(*) n FROM conversation_automation_grants')).toBe(0);
     expect(scalar(h, 'SELECT count(*) n FROM conversation_automation_receipts')).toBe(0);
     expect(() => service.postScheduledFollowUp(old)).toThrow('automation_slot_retired');
@@ -277,7 +285,7 @@ it('rejects an oversized rendered effect before persisting intent and leaves ori
   expect(result.results[0]).toMatchObject({ status: 'error', detail: 'followup_intent_too_large', action: null });
   expect(await json(await request(`/api/conversations/${cid}/messages`, recipient))).toEqual(before);
   await inside(h => {
-    const slot = h.sql.exec('SELECT * FROM hub_check_slots').toArray()[0];
+    const slot = fixtureSql(h).exec('SELECT * FROM hub_check_slots').toArray()[0];
     expect(slot.intent_json).toBe(null); expect(slot.state).toBe('done');
     expect(scalar(h, 'SELECT count(*) n FROM conversation_automation_receipts')).toBe(0);
   });

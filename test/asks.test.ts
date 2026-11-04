@@ -1,3 +1,4 @@
+import { advanceFixtureBudgetDay, fixtureSql } from './helpers/fixture-budget';
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { AskLedger, splitAsks, acLines, matchAcLine, noteMarks, ASK_GRACE_MS } from '../src/asks';
@@ -31,10 +32,12 @@ const close = async (h: any, id: string) => {
 const show = async (h: any, id: string) => (await call(h, '/tasks/' + id)).body.task;
 const DONE = (extra: string) => `DONE\nevidence: agent-hub@0123456789abcdef pushed\nlive check: curl https://example.test/health -> 200\nresult: proven\n${extra}`;
 async function fixture(fn: (h: any, ledger: AskLedger, alerts: any[], clock: { now: number }) => any) {
-  return inDO(stub(), async (h: any) => {
-    for (const t of ['tasks', 'receipts']) h.sql.exec('DELETE FROM intake_' + t);
-    for (const t of ['ask_messages', 'asks', 'ask_agents', 'ask_gaps', 'ask_sources', 'ask_reconcile_runs', 'liveness_alerts']) h.sql.exec('DELETE FROM ' + t);
-    h.sql.exec("UPDATE ask_meta SET gap_scope='agent',last_tick=NULL,last_result=NULL,daily_day=NULL,reconcile_cursor=0,last_reconcile_run=NULL,last_reconcile_at=NULL WHERE id=1");
+  return inDO(stub(), async (h: any, state:any) => {
+    await advanceFixtureBudgetDay(h);
+    const seedSql=fixtureSql(h,state);
+    for (const t of ['tasks', 'receipts']) seedSql.exec('DELETE FROM intake_' + t);
+    for (const t of ['ask_messages', 'asks', 'ask_agents', 'ask_gaps', 'ask_sources', 'ask_reconcile_runs', 'liveness_alerts']) seedSql.exec('DELETE FROM ' + t);
+    seedSql.exec("UPDATE ask_meta SET gap_scope='agent',last_tick=NULL,last_result=NULL,daily_day=NULL,reconcile_cursor=0,last_reconcile_run=NULL,last_reconcile_at=NULL WHERE id=1");
     const alerts: any[] = [];
     const clock = { now: Date.now() };
     const ledger = new AskLedger(h.sql, h.intakeService, (f: any) => f(), {
@@ -379,9 +382,9 @@ describe('review regressions', () => {
     const t = await intake(h, '1. Done long ago');
     for (let i = 0; i < 1500; i++) {
       const id = 'hist-' + i;
-      h.sql.exec(`INSERT INTO ask_messages(id,agent_id,t_id,seq,text,text_hash,source,received_at,split_state,role) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+      fixtureSql(h).exec(`INSERT INTO ask_messages(id,agent_id,t_id,seq,text,text_hash,source,received_at,split_state,role) VALUES(?,?,?,?,?,?,?,?,?,?)`,
         id, 'dev', 't' + (10000 + i) + 'u', 10000 + i, 'old ask ' + i, 'h' + i, 'backfill', 1, 'split', 'user');
-      h.sql.exec(`INSERT INTO asks(id,message_id,part,text,state,intake_id,created_at,updated_at,alert_subject) VALUES(?,?,0,?,?,?,1,1,?)`,
+      fixtureSql(h).exec(`INSERT INTO asks(id,message_id,part,text,state,intake_id,created_at,updated_at,alert_subject) VALUES(?,?,0,?,?,?,1,1,?)`,
         'ask-' + i, id, 'old ask ' + i, i % 2 ? 'verified' : 'closed_unverified', t.id, 'resolved:asks_unmapped-' + i);
     }
     let read = 0;

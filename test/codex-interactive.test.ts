@@ -1,3 +1,4 @@
+import {invalidateCatalogObservations} from '../src/catalog-freshness';
 import { expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { SessionControlService } from '../src/session_control';
@@ -59,6 +60,9 @@ it('reports a dead Codex TUI as failed while retaining lifecycle and capacity un
     expect(watchdog.project([task])[0]).toMatchObject({ forgotten: false, state: 'active' });
     // Host loss cannot turn an otherwise valid binding into restart authority.
     hub.sql.exec('UPDATE fleet_sessions SET created_at_ms = created_at_ms - 1');
+    // Simulate eviction/host loss: durable edits alone cannot erase a live
+    // census report that this same SQL instance just received.
+    invalidateCatalogObservations(hub.sql);
     hub.sql.exec('DELETE FROM fleet_catalog_seen');
     hub.sql.exec("UPDATE machines SET last_checkin_at = '2000-01-01T00:00:00Z'");
     expect(watchdog.project([task])[0]).toMatchObject({ forgotten: false, state: 'unknown' });

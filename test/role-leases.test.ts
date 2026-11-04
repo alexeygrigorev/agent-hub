@@ -1,3 +1,4 @@
+import { advanceFixtureBudgetDay, fixtureSql } from './helpers/fixture-budget';
 import { describe, expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { createSessionCookie } from '../src/auth/session';
@@ -14,22 +15,24 @@ let sequence = 0;
 async function fixture() {
   const stub = (env as any).HUB.get((env as any).HUB.idFromName('roles-' + ++sequence));
   const cookie = await inHub(stub, async (hub: any) => {
+    await advanceFixtureBudgetDay(hub);
+    const seedSql=fixtureSql(hub);
     hub._roleNow = BASE;
     hub.jobsService = new JobsService(hub.sql, hub.ctx, { now: () => new Date(hub._roleNow), enableAlarms: false });
     for (const id of ['host-a','host-b','foreign']) {
       const hash = await sha256('token-' + id);
-      hub.sql.exec("INSERT INTO credentials(id,kind,token_hash,family_id,subject,machine_id,scopes,created_by_sub,created_at,expires_at) VALUES(?,'host',?,?,?,?,?,'test',?,?)",
+      seedSql.exec("INSERT INTO credentials(id,kind,token_hash,family_id,subject,machine_id,scopes,created_by_sub,created_at,expires_at) VALUES(?,'host',?,?,?,?,?,'test',?,?)",
         'cred-' + id, hash, id, id, id, '["host"]', new Date(BASE).toISOString(), '2100-01-01T00:00:00Z');
-      hub.sql.exec('INSERT INTO machines(id,name,hostname,credential_id,registered_at,last_checkin_at,last_heartbeat,capabilities) VALUES(?,?,?,?,?,?,?,?)',
+      seedSql.exec('INSERT INTO machines(id,name,hostname,credential_id,registered_at,last_checkin_at,last_heartbeat,capabilities) VALUES(?,?,?,?,?,?,?,?)',
         id,id,id,'cred-' + id,new Date(BASE).toISOString(),new Date(BASE).toISOString(),'{"gate":{"launch_allowed":true}}','{"jobs":["writer-run"]}');
     }
     for (const kind of ['agent','job','routing-client']) {
-      hub.sql.exec("INSERT INTO credentials(id,kind,token_hash,family_id,subject,actor,scopes,created_by_sub,created_at,expires_at) VALUES(?,?,?,?,?,?,?,'test',?,?)",
+      seedSql.exec("INSERT INTO credentials(id,kind,token_hash,family_id,subject,actor,scopes,created_by_sub,created_at,expires_at) VALUES(?,?,?,?,?,?,?,'test',?,?)",
         kind,kind,await sha256('token-' + kind),kind,kind,kind === 'routing-client' ? 'routing-client:test' : 'ordinary',
         kind === 'routing-client' ? '["routing:submit"]' : '["host","admin","jobs:create"]',new Date(BASE).toISOString(),'2100-01-01T00:00:00Z');
     }
-    hub.sql.exec("UPDATE credentials SET approval_seq=1 WHERE kind='host'");
-    hub.sql.exec('UPDATE machines SET approval_seq=1');
+    seedSql.exec("UPDATE credentials SET approval_seq=1 WHERE kind='host'");
+    seedSql.exec('UPDATE machines SET approval_seq=1');
     return createSessionCookie(hub.env, { sub: 'admin', email: 'admin@fake.local', isAdmin: true, csrfToken: 'roles-csrf', exp: Math.floor(Date.now()/1000)+3600 });
   });
   const request = async (path: string, body?: any, token = 'token-host-a', method = body === undefined ? 'GET' : 'POST', session = false, csrf = true) => {
@@ -65,7 +68,7 @@ describe('configured roles through authenticated public HTTP and real Hub SQLite
     expect((await f.configure()).data).toMatchObject({ generation: 1, epoch: 1 });
     expect((await f.configure()).data.error).toBe('configuration_conflict');
     expect((await f.offer('x','foreign')).data.error).toBe('role_unauthorized');
-    for (const kind of ['agent','job','routing-client']) expect((await f.request('/api/roles/demo/writer/jobs', {}, 'token-' + kind)).code).toBeGreaterThanOrEqual(403);
+    for (const kind of ['agent','job','routing-client']) expect((await f.request('/api/roles/demo/writer/jobs', {}, 'token-' + kind)).code).toBe(kind==='job'?401:403);
     expect(await f.inspect((hub: any) => hub.sql.exec("SELECT epoch,holder_job_id FROM leases WHERE name='root'").one())).toMatchObject({ epoch: 0, holder_job_id: null });
   });
 
@@ -87,11 +90,42 @@ describe('configured roles through authenticated public HTTP and real Hub SQLite
     expect((await f.request(`/api/jobs/${id}/finish`, finish, c.job_token)).code).toBe(200);
     expect((await f.request(`/api/jobs/${id}/finish`, finish, c.job_token)).code).toBe(200);
     expect((await f.request(`/api/jobs/${id}/finish`, { ...finish, summary: 'changed' }, c.job_token)).data.error).toBe('completion_conflict');
-    expect((await f.execute(id,c.job_token)).code).toBe(409);
+    expect((await f.execute(id,c.job_token)).code).toBe(401);
     expect(await f.inspect((hub: any) => ({ job: hub.sql.exec('SELECT status,role_effect,role_finish FROM jobs WHERE id=?', id).one(),
       scopes: hub.sql.exec('SELECT scopes FROM credentials WHERE subject=?',id).one().scopes,
       actor: hub.sql.exec('SELECT actor FROM credentials WHERE subject=?',id).one().actor,
       lease: hub.sql.exec("SELECT * FROM leases WHERE name='automation:demo:writer'").one() }))).toMatchObject({ job: { status: 'succeeded' }, scopes: '[]', actor: 'machine:host-a', lease: { epoch: 2, holder_job_id: null } });
+  });
+
+  it('allows only the exact role finish replay route while preserving every authority fence',async()=>{
+    const f=await fixture();await f.configure();const id=(await f.offer()).data.job_id;
+    const claim=(await f.claim(id)).data;await f.execute(id,claim.job_token);await f.start(id,claim.job_token);
+    const receipt={epoch:2,status:'succeeded',summary:'done once',evidence_refs:['fixture:proof']};
+    expect((await f.request(`/api/jobs/${id}/finish`,receipt,claim.job_token)).code).toBe(200);
+    const repeat=()=>f.request(`/api/jobs/${id}/finish`,receipt,claim.job_token);
+    expect((await repeat()).code).toBe(200);
+    expect((await f.request(`/api/jobs/${id}/finish`,{...receipt,summary:'changed'},claim.job_token)).data.error).toBe('completion_conflict');
+    expect((await f.request('/api/bus/messages',undefined,claim.job_token)).code).toBe(401);
+    expect((await f.execute(id,claim.job_token)).code).toBe(401);
+    expect((await f.request('/api/jobs/wrong-subject/finish',receipt,claim.job_token)).code).toBe(401);
+    const saved=await f.inspect((hub:any)=>hub.sql.exec('SELECT role_finish,claim_token_hash FROM jobs WHERE id=?',id).one());
+    await f.inspect((hub:any)=>hub.sql.exec('UPDATE jobs SET claim_token_hash=? WHERE id=?','different-current-hash',id));
+    expect((await repeat()).code).toBe(401);
+    await f.inspect((hub:any)=>hub.sql.exec('UPDATE jobs SET claim_token_hash=? WHERE id=?',saved.claim_token_hash,id));
+    await f.inspect((hub:any)=>hub.sql.exec("UPDATE credentials SET machine_id='host-b' WHERE kind='job' AND subject=?",id));
+    expect((await repeat()).code).toBe(401);
+    await f.inspect((hub:any)=>hub.sql.exec("UPDATE credentials SET machine_id='host-a' WHERE kind='job' AND subject=?",id));
+    await f.inspect((hub:any)=>hub.sql.exec("UPDATE leases SET epoch=3 WHERE name='automation:demo:writer'"));
+    expect((await repeat()).code).toBe(401);
+    await f.inspect((hub:any)=>hub.sql.exec("UPDATE leases SET epoch=2 WHERE name='automation:demo:writer'"));
+    await f.inspect((hub:any)=>hub.sql.exec("UPDATE automation_roles SET generation=2 WHERE name='automation:demo:writer'"));
+    expect((await repeat()).data.error).toBe('unauthorized_or_stale');
+    await f.inspect((hub:any)=>hub.sql.exec("UPDATE automation_roles SET generation=1 WHERE name='automation:demo:writer'"));
+    await f.inspect((hub:any)=>hub.sql.exec("UPDATE credentials SET revoked_at=? WHERE kind='job' AND subject=?",new Date().toISOString(),id));
+    expect((await repeat()).code).toBe(401);
+    await f.inspect((hub:any)=>hub.sql.exec("UPDATE credentials SET revoked_at=NULL,expires_at=? WHERE kind='job' AND subject=?",new Date(Date.now()-1).toISOString(),id));
+    expect((await repeat()).code).toBe(401);
+    expect(await f.inspect((hub:any)=>hub.sql.exec('SELECT role_finish FROM jobs WHERE id=?',id).one().role_finish)).toBe(saved.role_finish);
   });
 
   it('serializes competing acquisitions and fences a delayed partitioned holder after expiry and restart', async () => {
@@ -164,7 +198,7 @@ describe('configured roles through authenticated public HTTP and real Hub SQLite
   it('enforces hard role/job caps, accounts terminal receipts and prunes only resolved old jobs', async () => {
     const f = await fixture(); await f.configure();
     await f.inspect((hub: any) => {
-      hub.sql.exec(`WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<1024)
+      fixtureSql(hub).exec(`WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<1024)
         INSERT INTO jobs(id,kind,idempotency_key,payload,status,created_at,deadline_at,actor,role_name,role_generation,finished_at)
         SELECT 'cap-'||x,'writer-run','cap-'||x,'{}','failed','2099-05-06T00:00:00Z','2099-05-07T00:00:00Z','test','automation:demo:writer',1,'2099-05-06T00:00:00Z' FROM n`);
     });
@@ -175,7 +209,7 @@ describe('configured roles through authenticated public HTTP and real Hub SQLite
     });
     expect((await f.offer('after-prune')).code).toBe(201);
     await f.inspect((hub: any) => {
-      hub.sql.exec(`WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<63)
+      fixtureSql(hub).exec(`WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<63)
         INSERT INTO automation_roles(name,generation,config,last_clock) SELECT 'cap-'||x,1,'{}',0 FROM n`);
     });
     expect((await f.request('/api/roles/demo/extra', {config,expected_generation:0},'', 'PUT',true)).data.error).toBe('role_capacity');
@@ -197,9 +231,9 @@ describe('configured roles through authenticated public HTTP and real Hub SQLite
     const f = await fixture(); await f.configure(); const id = (await f.offer()).data.job_id;
     const c = (await f.claim(id)).data;
     await f.inspect((hub: any) => hub.sql.exec("CREATE TRIGGER reject_role_intent BEFORE UPDATE OF role_effect ON jobs BEGIN SELECT RAISE(ABORT, 'injected SQL intent failure'); END"));
-    expect((await f.execute(id,c.job_token)).code).toBe(500);
-    expect(await f.inspect((hub: any) => hub.sql.exec('SELECT role_effect FROM jobs WHERE id=?',id).one().role_effect)).toBeNull();
-    await f.inspect((hub: any) => hub.sql.exec('DROP TRIGGER reject_role_intent'));
+    const failedIntent=await f.execute(id,c.job_token);expect(failedIntent.code).toBe(503);expect(failedIntent.data.error).toBe('do_daily_row_budget_exceeded');
+    expect(await f.inspect((hub: any) => fixtureSql(hub).exec('SELECT role_effect FROM jobs WHERE id=?',id).one().role_effect)).toBeNull();
+    await f.inspect(async(hub:any)=>{fixtureSql(hub).exec('DROP TRIGGER reject_role_intent');await advanceFixtureBudgetDay(hub);});
     const replies = await Promise.all([f.execute(id,c.job_token),f.execute(id,c.job_token)]);
     expect(replies.filter(r=>r.data.execute === true)).toHaveLength(1);
     expect(replies.filter(r=>r.data.status === 'HOLD')).toHaveLength(1);
@@ -320,12 +354,12 @@ describe('configured roles through authenticated public HTTP and real Hub SQLite
 
   it('rolls back lease acquisition when credential insertion fails and can safely retry', async () => {
     const f = await fixture(); await f.configure(); const id = (await f.offer()).data.job_id;
-    await f.inspect((hub: any) => hub.sql.exec("CREATE TRIGGER reject_role_credential BEFORE INSERT ON credentials WHEN NEW.kind='job' BEGIN SELECT RAISE(ABORT, 'injected SQL credential failure'); END"));
-    expect((await f.claim(id)).code).toBe(500);
-    expect(await f.inspect((hub: any) => hub.sql.exec("SELECT epoch,holder_job_id FROM leases WHERE name='automation:demo:writer'").one())).toMatchObject({epoch:1,holder_job_id:null});
-    expect(await f.inspect((hub: any) => hub.sql.exec('SELECT status,role_effect FROM jobs WHERE id=?',id).one())).toMatchObject({status:'offered',role_effect:null});
-    expect(await f.inspect((hub: any) => hub.sql.exec("SELECT count(*) AS n FROM credentials WHERE kind='job' AND subject IN (SELECT id FROM jobs)").one().n)).toBe(0);
-    await f.inspect((hub: any) => hub.sql.exec('DROP TRIGGER reject_role_credential'));
+    await f.inspect((hub: any) => fixtureSql(hub).exec("CREATE TRIGGER reject_role_credential BEFORE INSERT ON credentials WHEN NEW.kind='job' BEGIN SELECT RAISE(ABORT, 'injected SQL credential failure'); END"));
+    const failedClaim=await f.claim(id);expect(failedClaim.code).toBe(503);expect(failedClaim.data.error).toBe('do_daily_row_budget_exceeded');
+    expect(await f.inspect((hub: any) => fixtureSql(hub).exec("SELECT epoch,holder_job_id FROM leases WHERE name='automation:demo:writer'").one())).toMatchObject({epoch:1,holder_job_id:null});
+    expect(await f.inspect((hub: any) => fixtureSql(hub).exec('SELECT status,role_effect FROM jobs WHERE id=?',id).one())).toMatchObject({status:'offered',role_effect:null});
+    expect(await f.inspect((hub: any) => fixtureSql(hub).exec("SELECT count(*) AS n FROM credentials WHERE kind='job' AND subject IN (SELECT id FROM jobs)").one().n)).toBe(0);
+    await f.inspect(async(hub:any)=>{fixtureSql(hub).exec('DROP TRIGGER reject_role_credential');await advanceFixtureBudgetDay(hub);});
     const c = await f.claim(id); expect(c.code).toBe(200);
     expect((await f.execute(id,c.data.job_token)).data.execute).toBe(true);
   });
@@ -585,7 +619,7 @@ describe('configured roles through authenticated public HTTP and real Hub SQLite
     // Reject unauthorized callers (agents, jobs, foreign hosts, wrong host)
     for (const token of ['token-agent', 'token-job', 'token-foreign', 'token-host-b']) {
       const res = await f.request(`/api/jobs/${id}/reconcile`, { epoch: 2, generation: 1, terminal_case: 'unstarted' }, token);
-      expect(res.code).toBe(403);
+      expect(res.code).toBe(token==='token-job'?401:403);
     }
 
     const mixed = await f.stub.fetch(new Request(`https://hub.test/api/jobs/${id}/reconcile`, { method: 'POST', headers: { Authorization: 'Bearer token-host-a', Cookie: 'irrelevant=1', 'Content-Type': 'application/json' }, body: JSON.stringify({ epoch: 2, generation: 1, terminal_case: 'unstarted' }) }));

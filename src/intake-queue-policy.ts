@@ -39,7 +39,7 @@ export function liveQueuePolicy(env: Record<string, unknown>, sql: SqlStorage,
         if (!reachable.has(m.id) || !Number.isFinite(at) || at > now + 60000 || now - at > 180000) continue;
         const memory = fleet.resources.headroom(m.id), config = fleet.resources.config();
         if (!finite(hb.disk_free_gb) || hb.disk_free_gb < config.disk_floor_gb ||
-          !fleet.resources.capacityCpuAdmitted(m.id) || !finite(memory.mem_available_mb) ||
+          !fleet.resources.capacityCpuAdmitted(m.id) || memory.snapshot_truncated || !finite(memory.reserved_mb) || !finite(memory.mem_available_mb) ||
           !finite(memory.requested_mb) || memory.requested_mb <= 0) continue;
         let slots = Math.max(0, Math.floor((memory.mem_available_mb - memory.reserved_mb - memory.floor_mb) / memory.requested_mb));
         // Honor an advertised machine ceiling without changing it. Native residents

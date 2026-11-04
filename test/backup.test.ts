@@ -1,3 +1,4 @@
+import {fixtureSql,freshFixtureBudgetDay} from './helpers/fixture-budget';
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { sha256 } from '../src/auth/crypto';
@@ -30,7 +31,7 @@ const call = (s: any, path: string, headers: Record<string, string> = {}, method
 async function listTables(name: string): Promise<string[]> {
   let names: string[] = [];
   await runInDurableObject(stub(name), async (hub: Hub) => {
-    names = (hub.sql.exec(
+    names = (fixtureSql(hub).exec(
       "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\' AND name != 'backup_rate' ORDER BY name"
     ).toArray() as any[]).map(r => String(r.name));
   });
@@ -40,12 +41,12 @@ async function listTables(name: string): Promise<string[]> {
 async function countAll(name: string): Promise<Record<string, number>> {
   let out: Record<string, number> = {};
   await runInDurableObject(stub(name), async (hub: Hub) => {
-    const rows = hub.sql.exec(
-      "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+    const rows = fixtureSql(hub).exec(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\' ORDER BY name"
     ).toArray() as any[];
     for (const r of rows) {
       const t = String((r as any).name);
-      out[t] = Number((hub.sql.exec(`SELECT COUNT(*) AS n FROM "${t}"`).one() as any).n);
+      out[t] = Number((fixtureSql(hub).exec(`SELECT COUNT(*) AS n FROM "${t}"`).one() as any).n);
     }
   });
   return out;
@@ -55,9 +56,9 @@ async function seedAgent(name: string): Promise<string> {
   const token = 'hubt_backup_fixture_' + name.replace(/[^A-Za-z0-9]/g, '').slice(-12);
   const hash = await sha256(token);
   await runInDurableObject(stub(name), async (hub: Hub) => {
-    hub.sql.exec("INSERT OR IGNORE INTO machines(id,name,hostname,registered_at) VALUES ('fixture-host','fixture','fixture','2026-01-01T00:00:00.000Z')");
-    hub.sql.exec("INSERT OR IGNORE INTO agents(tag,project,machine_id,registered_at) VALUES ('assistant','demo','fixture-host','2026-01-01T00:00:00.000Z')");
-    hub.sql.exec(
+    fixtureSql(hub).exec("INSERT OR IGNORE INTO machines(id,name,hostname,registered_at) VALUES ('fixture-host','fixture','fixture','2026-01-01T00:00:00.000Z')");
+    fixtureSql(hub).exec("INSERT OR IGNORE INTO agents(tag,project,machine_id,registered_at) VALUES ('assistant','demo','fixture-host','2026-01-01T00:00:00.000Z')");
+    fixtureSql(hub).exec(
       'INSERT INTO credentials(id,kind,token_hash,family_id,subject,machine_id,actor,scopes,created_by_sub,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
       'cred-' + name, 'agent', hash, 'family-' + name, 'demo:assistant', 'fixture-host',
       'demo:assistant', '["bus:read","bus:send"]', 'fixture-operator',
@@ -120,7 +121,7 @@ describe('Hub DB backup export', () => {
     const body = await res.json() as any;
     const expected = await listTables(name);
     expect(body.tables).toEqual(expected);
-    expect(body.api_version).toBe(5);
+    expect(body.api_version).toBe(6);
     expect(Object.keys(body.row_counts).sort()).toEqual(expected);
     // WITHOUT ROWID tables are listed so the script pages them by offset.
     expect(body.without_rowid).toContain('token_hours_posted');
@@ -172,6 +173,8 @@ describe('Hub DB backup export', () => {
     const s = stub(name);
     const headers = { Authorization: 'Bearer ' + token };
     for (let i = 0; i < 30; i++) {
+      // Isolate the hourly endpoint limiter from the independent daily row breaker.
+      await runInDurableObject(s,async h=>freshFixtureBudgetDay(h));
       const res = await call(s, '/api/backup/export', headers);
       expect(res.status).toBe(200);
       await res.arrayBuffer();
@@ -210,8 +213,8 @@ describe('Hub DB backup export', () => {
     const headers = { Authorization: 'Bearer ' + token };
     // Seed enough rows to force multiple pages.
     await runInDurableObject(stub(name), async (hub: Hub) => {
-      hub.sql.exec('CREATE TABLE IF NOT EXISTS chunk_probe (id INTEGER PRIMARY KEY, v TEXT NOT NULL)');
-      for (let i = 0; i < 7; i++) hub.sql.exec('INSERT INTO chunk_probe(v) VALUES(?)', 'row-' + i);
+      fixtureSql(hub).exec('CREATE TABLE IF NOT EXISTS chunk_probe (id INTEGER PRIMARY KEY, v TEXT NOT NULL)');
+      for (let i = 0; i < 7; i++) fixtureSql(hub).exec('INSERT INTO chunk_probe(v) VALUES(?)', 'row-' + i);
     });
     const assembled: any[] = [];
     let total = -1;
@@ -255,13 +258,13 @@ describe('Hub DB backup export', () => {
     const s = stub(name);
     const headers = { Authorization: 'Bearer ' + token };
     const seed = async (table: string) => runInDurableObject(stub(name), async (hub: Hub) => {
-      hub.sql.exec(`CREATE TABLE IF NOT EXISTS ${table} (id TEXT PRIMARY KEY, v TEXT NOT NULL)`);
-      for (let i = 0; i < 7; i++) hub.sql.exec(`INSERT INTO ${table}(id, v) VALUES(?, ?)`, 'k' + i, 'row-' + i);
+      fixtureSql(hub).exec(`CREATE TABLE IF NOT EXISTS ${table} (id TEXT PRIMARY KEY, v TEXT NOT NULL)`);
+      for (let i = 0; i < 7; i++) fixtureSql(hub).exec(`INSERT INTO ${table}(id, v) VALUES(?, ?)`, 'k' + i, 'row-' + i);
     });
     // Between page 1 and page 2: prune two already-read rows and append a burst.
     const churn = async (table: string) => runInDurableObject(stub(name), async (hub: Hub) => {
-      hub.sql.exec(`DELETE FROM ${table} WHERE id IN ('k0', 'k1')`);
-      for (let i = 7; i < 10; i++) hub.sql.exec(`INSERT INTO ${table}(id, v) VALUES(?, ?)`, 'k' + i, 'row-' + i);
+      fixtureSql(hub).exec(`DELETE FROM ${table} WHERE id IN ('k0', 'k1')`);
+      for (let i = 7; i < 10; i++) fixtureSql(hub).exec(`INSERT INTO ${table}(id, v) VALUES(?, ?)`, 'k' + i, 'row-' + i);
     });
 
     await seed('hot_keyset');
@@ -323,9 +326,9 @@ describe('Hub DB backup export', () => {
     const ids = ['-9223372036854775808', '-9007199254740992', '-9007199254740991', '0',
       '9007199254740992', '9007199254740993', '9223372036854775806', '9223372036854775807'];
     await runInDurableObject(stub(name), async (hub: Hub) => {
-      hub.sql.exec('CREATE TABLE extreme_rowids (k TEXT NOT NULL)');
+      fixtureSql(hub).exec('CREATE TABLE extreme_rowids (k TEXT NOT NULL)');
       // rowid and k both from the same decimal text; CAST keeps it exact.
-      for (const id of ids) hub.sql.exec('INSERT INTO extreme_rowids(rowid, k) VALUES (CAST(? AS INTEGER), ?)', id, id);
+      for (const id of ids) fixtureSql(hub).exec('INSERT INTO extreme_rowids(rowid, k) VALUES (CAST(? AS INTEGER), ?)', id, id);
     });
     const got: string[] = [];
     const cursors: string[] = [];
@@ -352,6 +355,8 @@ describe('Hub DB backup export', () => {
     const headers = { Authorization: 'Bearer ' + token };
     // Exhaust the tight full-export budget: 30 OK, 31st limited.
     for (let i = 0; i < 30; i++) {
+      // Isolate the hourly endpoint limiter from the independent daily row breaker.
+      await runInDurableObject(s,async h=>freshFixtureBudgetDay(h));
       const res = await call(s, '/api/backup/export', headers);
       expect(res.status).toBe(200);
       await res.arrayBuffer();

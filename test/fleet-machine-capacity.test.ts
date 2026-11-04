@@ -1,3 +1,4 @@
+import { fixtureStatements,registerFixtureStatements } from './helpers/fixture-statements';
 import { describe, expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { FleetService } from '../src/fleet';
@@ -15,6 +16,7 @@ async function fixture(check: (fleet: FleetService, sql: any, heartbeat: any) =>
   const bindings = env as unknown as Env;
   const stub = bindings.HUB.get(bindings.HUB.idFromName('machine-capacity-' + crypto.randomUUID()));
   await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
+    registerFixtureStatements(hub);
     const fleet = new FleetService(hub.sql, cb => state.storage.transactionSync(cb), () => now);
     fleet.init();
     // This fixture intentionally contains 110 synthetic natives to ensure
@@ -23,11 +25,11 @@ async function fixture(check: (fleet: FleetService, sql: any, heartbeat: any) =>
     fleet.resources.configure({ host_max_sessions: 256 });
     const sql = hub.sql;
     const heartbeat = { mem_avail_mb: 37000, disk_free_gb: 80, load: [1, 1, 1], cpu_usage: freshCpu(iso(), 8, 8) };
-    sql.exec('INSERT INTO machines (id,name,hostname,registered_at,last_checkin_at,last_heartbeat,drained,capabilities) VALUES (?,?,?,?,?,?,?,?)',
+    fixtureStatements(sql).exec('INSERT INTO machines (id,name,hostname,registered_at,last_checkin_at,last_heartbeat,drained,capabilities) VALUES (?,?,?,?,?,?,?,?)',
       'host', 'host', 'host', iso(), iso(), JSON.stringify(heartbeat), 0,
       JSON.stringify({ engines: [engine], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8 }));
-    sql.exec('INSERT INTO routing_machines (machine_id,needs_json,max_agents,runners_json,observed_at) VALUES (?,?,?,?,?)', 'host', '[]', 1, '[]', iso());
-    sql.exec('INSERT INTO host_quota_snapshots (host_id,schema_version,captured_at,captured_at_ms,received_at,received_at_ms,status,error,routes_json) VALUES (?,?,?,?,?,?,?,?,?)',
+    fixtureStatements(sql).exec('INSERT INTO routing_machines (machine_id,needs_json,max_agents,runners_json,observed_at) VALUES (?,?,?,?,?)', 'host', '[]', 1, '[]', iso());
+    fixtureStatements(sql).exec('INSERT INTO host_quota_snapshots (host_id,schema_version,captured_at,captured_at_ms,received_at,received_at_ms,status,error,routes_json) VALUES (?,?,?,?,?,?,?,?,?)',
       'host', '1.0', iso(), now, iso(), now, 'ok', null,
       JSON.stringify({ [provider]: { status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } } } }));
     const configured = await fleet.handle(new Request('https://hub.test/api/fleet/accounts', { method: 'PUT', body: JSON.stringify({
@@ -36,7 +38,7 @@ async function fixture(check: (fleet: FleetService, sql: any, heartbeat: any) =>
     }) }), admin);
     expect(configured.status).toBe(200);
     for (let i = 0; i < 110; i++) {
-      sql.exec('INSERT INTO fleet_sessions (machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace,account,last_activity_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
+      fixtureStatements(sql).exec('INSERT INTO fleet_sessions (machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace,account,last_activity_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
         'host', 'native-' + i, 'old-' + i, engine, 'running', i < 60 ? 'idle' : 'working', iso(), 'demo', null, iso(-7200000));
     }
     await check(fleet, sql, heartbeat);
@@ -46,7 +48,7 @@ async function fixture(check: (fleet: FleetService, sql: any, heartbeat: any) =>
 describe('machine admission uses resource evidence instead of a session ceiling', () => {
   it.each(['codex', 'opencode'])('places %s above max_agents with idle and stalled catalog rows and pending launches', async engine => fixture(async (fleet, sql) => {
     // A fresh observation of productive work must remain intact, too.
-    sql.exec("UPDATE fleet_sessions SET last_activity_at=? WHERE native_id='native-109'", iso());
+    fixtureStatements(sql).exec("UPDATE fleet_sessions SET last_activity_at=? WHERE native_id='native-109'", iso());
     expect(fleet.plan(intent()).selected?.machine).toBe('host');
     for (let i = 0; i < 3; i++) {
       const response = await fleet.handle(new Request('https://hub.test/api/fleet/launches', { method: 'POST', body: JSON.stringify(intent()) }), admin);
@@ -54,8 +56,8 @@ describe('machine admission uses resource evidence instead of a session ceiling'
       expect(await response.json()).toMatchObject({ state: 'offered', machine: 'host' });
     }
     expect(fleet.plan(intent()).rejected).not.toContainEqual(expect.objectContaining({ reason: 'machine_capacity' }));
-    expect(sql.exec('SELECT COUNT(*) AS n FROM fleet_sessions').one().n).toBe(110);
-    expect(sql.exec("SELECT phase,agent_state,last_activity_at FROM fleet_sessions WHERE native_id='native-109'").one())
+    expect(fixtureStatements(sql).exec('SELECT COUNT(*) AS n FROM fleet_sessions').one().n).toBe(110);
+    expect(fixtureStatements(sql).exec("SELECT phase,agent_state,last_activity_at FROM fleet_sessions WHERE native_id='native-109'").one())
       .toMatchObject({ phase: 'running', agent_state: 'working', last_activity_at: iso() });
   }, engine));
 
@@ -68,18 +70,18 @@ describe('machine admission uses resource evidence instead of a session ceiling'
 
   it('promotes a held launch after pressure clears despite an unchanged native census', async () => fixture(async (fleet, sql, heartbeat) => {
     heartbeat.cpu_usage.psi_full_avg10 = 99;
-    sql.exec('UPDATE machines SET last_heartbeat=? WHERE id=?', JSON.stringify(heartbeat), 'host');
+    fixtureStatements(sql).exec('UPDATE machines SET last_heartbeat=? WHERE id=?', JSON.stringify(heartbeat), 'host');
     const held = await fleet.handle(new Request('https://hub.test/api/fleet/launches', { method: 'POST', body: JSON.stringify(intent()) }), admin);
     expect(held.status).toBe(202);
     const launch: any = await held.json();
     expect(launch).toMatchObject({ state: 'queued' });
     heartbeat.cpu_usage.psi_full_avg10 = 0;
-    sql.exec('UPDATE machines SET last_heartbeat=? WHERE id=?', JSON.stringify(heartbeat), 'host');
+    fixtureStatements(sql).exec('UPDATE machines SET last_heartbeat=? WHERE id=?', JSON.stringify(heartbeat), 'host');
     const offered: any = await (await fleet.handle(new Request('https://hub.test/api/fleet/offers'),
       { caller: { machineId: 'host', kind: 'host' }, scopes: ['host'] })).json();
     expect(offered.offers).toContainEqual(expect.objectContaining({ id: launch.id }));
-    expect(sql.exec('SELECT state FROM fleet_launches WHERE id=?', launch.id).one().state).toBe('offered');
-    expect(sql.exec('SELECT COUNT(*) AS n FROM fleet_sessions').one().n).toBe(110);
+    expect(fixtureStatements(sql).exec('SELECT state FROM fleet_launches WHERE id=?', launch.id).one().state).toBe('offered');
+    expect(fixtureStatements(sql).exec('SELECT COUNT(*) AS n FROM fleet_sessions').one().n).toBe(110);
   }));
 
   it.each([
@@ -88,7 +90,7 @@ describe('machine admission uses resource evidence instead of a session ceiling'
     ['host OOM', 'host_oom', { host_oom_kills_delta: 1 }],
   ])('holds for %s even when count limits are ignored', async (_label, reason, cpu) => fixture(async (fleet, sql, heartbeat) => {
     heartbeat.cpu_usage = { ...heartbeat.cpu_usage, ...cpu };
-    sql.exec('UPDATE machines SET last_heartbeat=? WHERE id=?', JSON.stringify(heartbeat), 'host');
+    fixtureStatements(sql).exec('UPDATE machines SET last_heartbeat=? WHERE id=?', JSON.stringify(heartbeat), 'host');
     const plan = fleet.plan(intent());
     expect(plan.selected).toBeNull();
     expect(plan.rejected).toContainEqual(expect.objectContaining({ reason }));
@@ -98,7 +100,7 @@ describe('machine admission uses resource evidence instead of a session ceiling'
     const response = await fleet.handle(new Request('https://hub.test/api/fleet/launches', { method: 'POST', body: JSON.stringify(intent()) }), admin);
     expect(response.status).toBe(201);
     const launch: any = await response.json();
-    sql.exec("UPDATE fleet_launches SET state='failed',exit_reason=?,updated_at=? WHERE id=?", reason, iso(), launch.id);
+    fixtureStatements(sql).exec("UPDATE fleet_launches SET state='failed',exit_reason=?,updated_at=? WHERE id=?", reason, iso(), launch.id);
     const plan = fleet.plan(intent());
     expect(plan.selected).toBeNull();
     expect(plan.rejected).toContainEqual(expect.objectContaining({ reason: 'host_runtime_choking' }));
@@ -106,7 +108,7 @@ describe('machine admission uses resource evidence instead of a session ceiling'
 
   it.each([2047, 2500])('reserves expected task memory above the floor with %i MB available', async available => fixture(async (fleet, sql, heartbeat) => {
     heartbeat.mem_avail_mb = available;
-    sql.exec('UPDATE machines SET last_heartbeat=? WHERE id=?', JSON.stringify(heartbeat), 'host');
+    fixtureStatements(sql).exec('UPDATE machines SET last_heartbeat=? WHERE id=?', JSON.stringify(heartbeat), 'host');
     const plan = fleet.plan(intent());
     expect(plan.selected).toBeNull();
     expect(plan.rejected).toContainEqual(expect.objectContaining({ reason: 'launcher_memory_reserve' }));

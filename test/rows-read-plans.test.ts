@@ -44,9 +44,9 @@ describe('hot-path query plans use indexes, never full scans', () => {
     expect(p).toMatch(/USING/i);
   }));
 
-  it('worker credential existence uses the session-family index', () => withHub(async hub => {
-    const p = plan(hub, 'SELECT 1 FROM worker_access w JOIN credentials c ON c.family_id = w.family_id WHERE w.session_id = ? AND c.revoked_at IS NULL LIMIT 1', 's');
-    expect(p).toContain('worker_access_session_family');
+  it('worker credential enumeration uses the deployed registry-actor index', () => withHub(async hub => {
+    const p = plan(hub, 'SELECT id,family_id,revoked_at,kind,machine_id FROM credentials INDEXED BY credentials_registry_actor WHERE registry_actor=? LIMIT ?', 'native:session',129);
+    expect(p).toContain('credentials_registry_actor');
   }));
 
   it('message expiry probes use the expiry index', () => withHub(async hub => {
@@ -60,14 +60,14 @@ describe('hot-path query plans use indexes, never full scans', () => {
     expect(fullScan(p, 'session_control_wakes')).toBe(false);
   }));
 
-  it('quota history point lookups use the account/provider/time index', () => withHub(async hub => {
-    const p = plan(hub, 'SELECT * FROM usage_quota_history WHERE account = ? AND provider = ? AND observed_at_ms >= ? ORDER BY observed_at_ms LIMIT 100', 'a', 'codex', NOW - 3600000);
-    expect(p).toContain('usage_quota_history_account_provider_time');
+  it('quota replay bounds exact-time candidates using the deployed time index', () => withHub(async hub => {
+    const p = plan(hub, 'SELECT account,provider,quota_json FROM usage_quota_history INDEXED BY usage_quota_history_time WHERE observed_at_ms=? LIMIT 129', NOW);
+    expect(p).toContain('usage_quota_history_time');
   }));
 
   it('launcher memory-reserve scans stay off the failed-launch history', () => withHub(async hub => {
-    const p = plan(hub, "SELECT id, updated_at, finished_at, machine_id, native_id, verification_status FROM fleet_launches WHERE state = 'failed' AND exit_reason = 'launcher_memory_reserve' AND updated_at >= ?", iso(Date.now() - 86400000));
-    expect(p).toContain('fleet_launch_failed_reason');
+    const p = plan(hub, "SELECT id,updated_at,finished_at,machine_id,native_id,verification_status,exit_reason,state FROM fleet_launches INDEXED BY fleet_launch_updated WHERE updated_at >= ? ORDER BY updated_at DESC LIMIT 129", iso(Date.now() - 86400000));
+    expect(p).toContain('fleet_launch_updated');
     expect(fullScan(p, 'fleet_launches')).toBe(false);
   }));
 

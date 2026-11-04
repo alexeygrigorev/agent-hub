@@ -2,6 +2,7 @@ import { describe,it,expect } from 'vitest';
 import { env,runInDurableObject } from 'cloudflare:test';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
+import {intakeLinkHealth} from '../src/intake-link-health';
 import { hostReconcileFact,validReconcileNative } from '../src/host-reconcile';
 
 const native={native_id:'11111111-1111-4111-8111-111111111111',tag:'task-hub-launch',workspace:'/srv/repo',native_created_at_ms:1000,engine:'codex'};
@@ -15,6 +16,7 @@ async function fixture(fn:(sql:any,now:number)=>void|Promise<void>, control=true
     VALUES('launch','agent:test','agent','test','test','{}','host','codex','test','headless','/srv/repo','','running',?,?,?)`,native.native_id,at,at);
   if(control) sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,fleet_launch_id,machine_id,engine,mode,state,binding_json,created_at,updated_at)
     VALUES('session','agent:test','session','{}','launch','host','codex','headless','finished',?,?,?)`,JSON.stringify(native),at,at);
+  expect(intakeLinkHealth(sql).ready).toBe(true);
   await fn(sql,now);
  });
 }

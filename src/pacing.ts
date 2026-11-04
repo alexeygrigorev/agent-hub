@@ -787,17 +787,29 @@ export function pacingFor(
 const hasTable = (sql: SqlStorage, name: string) =>
   sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", name).toArray().length > 0;
 
+/** Hard observation ceilings: control must refuse incomplete input, never
+ * route or publish totals from a silently truncated prefix. */
+export const TBM_CONTROL_LIMIT = 128;
+export const TBM_HISTORY_LIMIT = 512;
+export class TbmObservationLimit extends Error {
+  constructor(scope: string) { super('tbm_observation_limit:' + scope); this.name = 'TbmObservationLimit'; }
+}
+export function boundedTbmRows<T>(rows: T[], limit: number, scope: string): T[] {
+  if (rows.length > limit) throw new TbmObservationLimit(scope);
+  return rows;
+}
+
 export function loadPools(sql: SqlStorage, includeSentinel = false): TbmPoolRow[] {
   if (!hasTable(sql, 'tbm_quota_pools')) return [];
   const query = includeSentinel
-    ? 'SELECT * FROM tbm_quota_pools'
-    : "SELECT * FROM tbm_quota_pools WHERE pool_id != '*'";
-  return sql.exec(query).toArray() as unknown as TbmPoolRow[];
+    ? 'SELECT * FROM tbm_quota_pools ORDER BY pool_id LIMIT ?'
+    : "SELECT * FROM tbm_quota_pools WHERE pool_id != '*' ORDER BY pool_id LIMIT ?";
+  return boundedTbmRows(sql.exec(query, TBM_CONTROL_LIMIT + 1).toArray(), TBM_CONTROL_LIMIT, 'pools') as unknown as TbmPoolRow[];
 }
 
 export function loadActiveTranches(sql: SqlStorage, nowMs: number): TbmTrancheRow[] {
   return hasTable(sql, 'tbm_banked_tranches')
-    ? sql.exec("SELECT * FROM tbm_banked_tranches WHERE status = 'active' AND expires_at_ms > ? ORDER BY expires_at_ms ASC", nowMs).toArray() as unknown as TbmTrancheRow[]
+    ? boundedTbmRows(sql.exec("SELECT * FROM tbm_banked_tranches WHERE status = 'active' AND expires_at_ms > ? ORDER BY expires_at_ms ASC LIMIT ?", nowMs, TBM_CONTROL_LIMIT + 1).toArray(), TBM_CONTROL_LIMIT, 'active_tranches') as unknown as TbmTrancheRow[]
     : [];
 }
 
@@ -816,15 +828,19 @@ export function loadProviderEfficiencies(sql: SqlStorage, nowMs: number): Map<st
   if (key && hit && hit.key === key && nowMs >= hit.at && nowMs - hit.at < EFFICIENCY_CACHE_MS) return new Map(hit.value);
   try {
     const cols = new Set(sql.exec('PRAGMA table_info(tbm_reward_events)').toArray().map((c: any) => String(c.name)));
-    const knownFilter = cols.has('tokens_known') ? 'AND tokens_known = 1' : 'AND token_efficiency_eta > 0';
     const sinceMs = nowMs - 24 * HOUR;
-    const rows = sql.exec(
-      `SELECT pool_id, SUM(token_efficiency_eta * tokens_burned) / SUM(tokens_burned) AS avg_eta, COUNT(*) AS n
-       FROM tbm_reward_events
-       WHERE timestamp_ms >= ? ${knownFilter} AND tokens_burned > 0 AND event_kind = 'session'
-       GROUP BY pool_id`,
-      sinceMs
-    ).toArray() as any[];
+    // Bound native visits before applying token/efficiency filters. An
+    // aggregate followed by LIMIT still reads its entire time range.
+    const raw = boundedTbmRows(sql.exec(`SELECT pool_id,token_efficiency_eta,tokens_burned,tokens_known,event_kind
+      FROM tbm_reward_events WHERE timestamp_ms>=? ORDER BY timestamp_ms LIMIT ?`, sinceMs, TBM_HISTORY_LIMIT + 1).toArray() as any[], TBM_HISTORY_LIMIT, 'routing_efficiency');
+    const grouped = new Map<string, { pool_id: string; weighted: number; tokens: number; n: number }>();
+    for (const row of raw) {
+      if (row.event_kind !== 'session' || !(row.tokens_burned > 0) || (cols.has('tokens_known') ? row.tokens_known !== 1 : !(row.token_efficiency_eta > 0))) continue;
+      const item = grouped.get(row.pool_id) ?? { pool_id: row.pool_id, weighted: 0, tokens: 0, n: 0 };
+      item.weighted += Number(row.token_efficiency_eta) * Number(row.tokens_burned); item.tokens += Number(row.tokens_burned); item.n++;
+      grouped.set(row.pool_id, item);
+    }
+    const rows = [...grouped.values()].map(row => ({ pool_id: row.pool_id, avg_eta: row.weighted / row.tokens, n: row.n }));
     const byProvider = new Map<string, { sum: number; n: number }>();
     for (const r of rows) {
       const eta = Number(r.avg_eta);
@@ -849,7 +865,8 @@ export function loadProviderEfficiencies(sql: SqlStorage, nowMs: number): Map<st
       out.set(prov, mult);
     }
     if (key) efficiencyCache.set(sql as any, { key, at: nowMs, value: new Map(out) });
-  } catch {
+  } catch (error) {
+    if (error instanceof TbmObservationLimit) throw error;
     /* ignore if schema not yet migrated */
   }
   return out;
@@ -873,13 +890,11 @@ export const loadProviderPacing = (sql: SqlStorage, nowMs: number) =>
 export function refreshPacing(sql: SqlStorage, nowMs: number, states: Map<string, PidState>, opts: PacingOptions = {}): PacingResult[] {
   if (!hasTable(sql, 'tbm_quota_pools') || !hasTable(sql, 'tbm_banked_tranches')) return [];
   const trancheCols = new Set(sql.exec('PRAGMA table_info(tbm_banked_tranches)').toArray().map((c: any) => String(c.name)));
-  const exhaustCond = trancheCols.has('quantity_known')
-    ? "status = 'active' AND remaining_tokens <= 0 AND COALESCE(quantity_known, 1) != 0"
-    : "status = 'active' AND remaining_tokens <= 0";
-  sql.exec("UPDATE tbm_banked_tranches SET status = 'expired', expired_unused_tokens = expired_unused_tokens + remaining_tokens, remaining_tokens = 0, target_banked_burn_rate_tpm = 0, updated_at_ms = ? WHERE status = 'active' AND expires_at_ms <= ?", nowMs, nowMs);
-  sql.exec(`UPDATE tbm_banked_tranches SET status = 'exhausted', target_banked_burn_rate_tpm = 0, updated_at_ms = ? WHERE ${exhaustCond}`, nowMs);
-  for (const t of loadActiveTranches(sql, nowMs)) {
-    sql.exec('UPDATE tbm_banked_tranches SET target_banked_burn_rate_tpm = ?, updated_at_ms = ? WHERE tranche_id = ?', trancheUrgencyTpm(t, nowMs), nowMs, t.tranche_id);
+  const active = boundedTbmRows(sql.exec("SELECT * FROM tbm_banked_tranches WHERE status='active' ORDER BY expires_at_ms LIMIT ?",TBM_CONTROL_LIMIT+1).toArray() as any[],TBM_CONTROL_LIMIT,'refresh_active_tranches');
+  for (const t of active) {
+    if (t.expires_at_ms <= nowMs) sql.exec("UPDATE tbm_banked_tranches SET status='expired',expired_unused_tokens=expired_unused_tokens+remaining_tokens,remaining_tokens=0,target_banked_burn_rate_tpm=0,updated_at_ms=? WHERE tranche_id=?",nowMs,t.tranche_id);
+    else if (t.remaining_tokens<=0 && (!trancheCols.has('quantity_known') || t.quantity_known!==0)) sql.exec("UPDATE tbm_banked_tranches SET status='exhausted',target_banked_burn_rate_tpm=0,updated_at_ms=? WHERE tranche_id=?",nowMs,t.tranche_id);
+    else sql.exec('UPDATE tbm_banked_tranches SET target_banked_burn_rate_tpm=?,updated_at_ms=? WHERE tranche_id=?',trancheUrgencyTpm(t,nowMs),nowMs,t.tranche_id);
   }
   return loadPools(sql, false).map(p => withPolicyTbmFloors(p)).map(pool => {
     const result = pacingStep(pool, states.get(pool.pool_id) ?? newPidState(), nowMs, opts);

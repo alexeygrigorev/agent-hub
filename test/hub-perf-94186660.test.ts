@@ -1,3 +1,5 @@
+import {registerFixtureStatements,fixtureStatements} from './helpers/fixture-statements';
+import {fixtureSql} from './helpers/fixture-budget';
 /**
  * Perf bounds for intake 94186660 (Hub perf audit): request-path reads stay
  * bounded as tables grow. Seeds production-shaped volumes and asserts:
@@ -43,7 +45,7 @@ function seedTasks(sql: any, n: number) {
   for (let i = 0; i < n; i++) {
     const id = 'perf-' + String(i).padStart(4, '0');
     const status = i % 3 === 2 ? 'done' : ['open', 'in_progress', 'blocked'][i % 3];
-    sql.exec('INSERT INTO intake_tasks VALUES(?,?)', id, JSON.stringify({ id, project: i % 2 ? 'demo' : 'ops', status,
+    fixtureStatements(sql).exec('INSERT INTO intake_tasks VALUES(?,?)', id, JSON.stringify({ id, project: i % 2 ? 'demo' : 'ops', status,
       title: 'Perf task ' + i, version: 1, created_at: 1000 + i, updated_at: 2000 + i, archived_at: null,
       acceptance_criteria: 'Bounded reads.', history: [] }));
   }
@@ -55,7 +57,7 @@ function seedAudit(sql: any, tasks: number, per: number) {
     const id = 'perf-' + String(t).padStart(4, '0');
     for (let k = 0; k < per; k++) {
       seq++;
-      sql.exec(`INSERT INTO intake_audit(task_id,project,kind,actor,captured_at,from_status,to_status,reason) VALUES (?,?,?,?,?,?,?,?)`,
+      fixtureStatements(sql).exec(`INSERT INTO intake_audit(task_id,project,kind,actor,captured_at,from_status,to_status,reason) VALUES (?,?,?,?,?,?,?,?)`,
         id, t % 2 ? 'demo' : 'ops', 'note', 'perf-admin', 3000 + seq, null, null, 'r' + seq);
     }
   }
@@ -66,22 +68,25 @@ const withHub = (fn: (hub: Hub, state: DurableObjectState) => Promise<void>) => 
   const bindings = env as unknown as Env;
   const stub = bindings.HUB.get(bindings.HUB.idFromName('hub-perf-94186660-' + crypto.randomUUID()));
   await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
+    registerFixtureStatements(hub,state);
     await state.storage.transactionSync(() => {
       new IntakeService(hub.sql, (cb) => cb()).init();
       new FleetService(hub.sql, (cb) => state.storage.transactionSync(cb), () => Date.now()).init();
     });
+    await (hub as any).rowBudget.begin(true);
     await fn(hub, state);
   });
 };
 
 const planOf = (hub: Hub, q: string, ...b: any[]) =>
-  (hub.sql.exec('EXPLAIN QUERY PLAN ' + q, ...b).toArray() as any[]).map(r => String(r.detail)).join(' | ');
+  (fixtureSql(hub).exec('EXPLAIN QUERY PLAN ' + q, ...b).toArray() as any[]).map(r => String(r.detail)).join(' | ');
 
 describe('tasks status=open stays on the bounded export model', () => {
   it('pages 60 tasks with rows proportional to the page', withHub(async (hub: Hub, state: DurableObjectState) => {
-    await hub.sql.exec('DELETE FROM intake_tasks');
-    hub.sql.exec('DELETE FROM intake_export');
-    hub.sql.exec("UPDATE intake_export_migration SET after_id=NULL, done=0 WHERE id=1");
+    registerFixtureStatements(hub,state);
+    await fixtureSql(hub).exec('DELETE FROM intake_tasks');
+    fixtureSql(hub).exec('DELETE FROM intake_export');
+    fixtureSql(hub).exec("UPDATE intake_export_migration SET after_id=NULL, done=0 WHERE id=1");
     seedTasks(hub.sql, 60);
     await state.storage.transactionSync(() => { while (!advanceIntakeExport(hub.sql)); });
     const t = tracked(hub.sql);
@@ -108,10 +113,11 @@ describe('tasks status=open stays on the bounded export model', () => {
 
 describe('audit endpoints never scan the retained ledger', () => {
   it('single-task audit reads an indexed range with an exact total', withHub(async (hub: Hub, state: DurableObjectState) => {
-    await hub.sql.exec('DELETE FROM intake_tasks');
-    await hub.sql.exec('DELETE FROM intake_export');
-    await hub.sql.exec('DELETE FROM intake_audit');
-    hub.sql.exec("UPDATE intake_export_migration SET after_id=NULL, done=0 WHERE id=1");
+    registerFixtureStatements(hub,state);
+    await fixtureSql(hub).exec('DELETE FROM intake_tasks');
+    await fixtureSql(hub).exec('DELETE FROM intake_export');
+    await fixtureSql(hub).exec('DELETE FROM intake_audit');
+    fixtureSql(hub).exec("UPDATE intake_export_migration SET after_id=NULL, done=0 WHERE id=1");
     seedTasks(hub.sql, 4);
     await state.storage.transactionSync(() => { while (!advanceIntakeExport(hub.sql)); });
     const total = seedAudit(hub.sql, 4, 40); // 160 rows retained
@@ -137,10 +143,11 @@ describe('audit endpoints never scan the retained ledger', () => {
   }));
 
   it('cross-task audit takes the recent window and says truncated', withHub(async (hub: Hub, state: DurableObjectState) => {
-    await hub.sql.exec('DELETE FROM intake_tasks');
-    await hub.sql.exec('DELETE FROM intake_export');
-    await hub.sql.exec('DELETE FROM intake_audit');
-    hub.sql.exec("UPDATE intake_export_migration SET after_id=NULL, done=0 WHERE id=1");
+    registerFixtureStatements(hub,state);
+    await fixtureSql(hub).exec('DELETE FROM intake_tasks');
+    await fixtureSql(hub).exec('DELETE FROM intake_export');
+    await fixtureSql(hub).exec('DELETE FROM intake_audit');
+    fixtureSql(hub).exec("UPDATE intake_export_migration SET after_id=NULL, done=0 WHERE id=1");
     seedTasks(hub.sql, 4);
     await state.storage.transactionSync(() => { while (!advanceIntakeExport(hub.sql)); });
     seedAudit(hub.sql, 4, 150); // 600 rows retained
@@ -161,18 +168,19 @@ describe('audit endpoints never scan the retained ledger', () => {
 });
 
 describe('fleet supports_goal comes from one batched machines read', () => {
-  it('computes the same flags without a per-route machines query', withHub(async (hub: Hub, state: DurableObjectState) => {    for (const m of ['fm0', 'fm1', 'fm2']) {
-      hub.sql.exec("INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at,drained) VALUES (?,?,?,?,?,0) ON CONFLICT(id) DO UPDATE SET last_checkin_at=excluded.last_checkin_at",
+  it('computes the same flags without a per-route machines query', withHub(async (hub: Hub, state: DurableObjectState) => {
+    registerFixtureStatements(hub,state);    for (const m of ['fm0', 'fm1', 'fm2']) {
+      fixtureSql(hub).exec("INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at,drained) VALUES (?,?,?,?,?,0) ON CONFLICT(id) DO UPDATE SET last_checkin_at=excluded.last_checkin_at",
         m, m, m, new Date().toISOString(), new Date().toISOString());
     }
-    hub.sql.exec("UPDATE machines SET capabilities=? WHERE id='fm0'", JSON.stringify({ fleet_goal_routes: [{ engine: 'codex', account: 'a', profile: null }] }));
-    hub.sql.exec("UPDATE machines SET capabilities=? WHERE id='fm1'", JSON.stringify({ fleet_goal_routes: [] }));
-    hub.sql.exec("DELETE FROM fleet_routes");
+    fixtureSql(hub).exec("UPDATE machines SET capabilities=? WHERE id='fm0'", JSON.stringify({ fleet_goal_routes: [{ engine: 'codex', account: 'a', profile: null }] }));
+    fixtureSql(hub).exec("UPDATE machines SET capabilities=? WHERE id='fm1'", JSON.stringify({ fleet_goal_routes: [] }));
+    fixtureSql(hub).exec("DELETE FROM fleet_routes");
     const routes: any[] = [
       ['fm0', 'codex', 'a', null], ['fm0', 'codex', 'b', null], ['fm1', 'codex', 'a', null],
       ['fm2', 'codex', 'a', null], ['gone', 'codex', 'a', null],
     ];
-    for (const [mid, eng, acc, prof] of routes) hub.sql.exec('INSERT INTO fleet_routes(machine_id,engine,account,profile) VALUES (?,?,?,?) ON CONFLICT(machine_id,engine,account) DO NOTHING', mid, eng, acc, prof);
+    for (const [mid, eng, acc, prof] of routes) fixtureSql(hub).exec('INSERT INTO fleet_routes(machine_id,engine,account,profile) VALUES (?,?,?,?) ON CONFLICT(machine_id,engine,account) DO NOTHING', mid, eng, acc, prof);
     const t = tracked(hub.sql);
     const svc = new FleetService(t.proxy, (cb: any) => cb(), () => Date.now());
     const res = await svc.handle(new Request('https://hub.test/api/fleet'), admin);
@@ -198,26 +206,28 @@ function seedFleetSessions(sql: any, n: number) {
     const dup = i % 3 === 0;
     const m = dup ? 'fleetm0' : 'fleetm' + String(i % 4);
     const tag = dup ? 'task-dup' : 'tag-' + String(i).padStart(4, '0');
-    sql.exec(`INSERT OR REPLACE INTO fleet_sessions(machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace,profile,account) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    fixtureStatements(sql).exec(`INSERT OR REPLACE INTO fleet_sessions(machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace,profile,account) VALUES (?,?,?,?,?,?,?,?,?,?)`,
       m, 'nat-' + String(i).padStart(5, '0'), tag, 'codex', 'running', 'active',
       new Date(1000 + i).toISOString(), '/w/' + i, null, 'acc');
   }
 }
 
 const fleetPageShape = (hub: Hub) =>
-  (hub.sql.exec('EXPLAIN QUERY PLAN SELECT * FROM fleet_sessions WHERE (machine_id, tag, native_id) > (?, ?, ?) ORDER BY machine_id, tag, native_id LIMIT ?', 'fleetm0', 'tag-0001', 'nat-00001', 51).toArray() as any[]).map(r => String(r.detail)).join(' | ');
+  (fixtureSql(hub).exec('EXPLAIN QUERY PLAN SELECT * FROM fleet_sessions WHERE (machine_id,native_id) > (?,?) ORDER BY machine_id,native_id LIMIT ?', 'fleetm0', 'nat-00001', 51).toArray() as any[]).map(r => String(r.detail)).join(' | ');
 
 describe('fleet sessions are keyset-paged with a small default page', () => {
   it('serves a bounded default page and walks every row exactly once', withHub(async (hub: Hub, state: DurableObjectState) => {
+    registerFixtureStatements(hub,state);
     expect(FLEET_SESSIONS_DEFAULT).toBeLessThanOrEqual(100);
     expect(FLEET_SESSIONS_MAX).toBeLessThanOrEqual(500);
-    hub.sql.exec('DELETE FROM fleet_sessions');
+    fixtureSql(hub).exec('DELETE FROM fleet_sessions');
     seedFleetSessions(hub.sql, 250);
     const t = tracked(hub.sql);
     const svc = new FleetService(t.proxy, (cb: any) => cb(), () => Date.now());
     const first: any = await (await svc.handle(new Request('https://hub.test/api/fleet'), admin)).json();
     expect(first.sessions).toHaveLength(FLEET_SESSIONS_DEFAULT);
-    expect(first.sessions_total).toBe(250);
+    expect(first.sessions_total).toBeNull();
+    expect(first.sessions_total_unknown).toBe(true);
     expect(first.sessions_truncated).toBe(true);
     expect(typeof first.sessions_cursor_next).toBe('string');
     // Walk the whole list at limit 50, including across duplicate-tag pages.
@@ -240,7 +250,8 @@ describe('fleet sessions are keyset-paged with a small default page', () => {
   }));
 
   it('rejects bad cursors/limits and scopes sections', withHub(async (hub: Hub, state: DurableObjectState) => {
-    hub.sql.exec('DELETE FROM fleet_sessions');
+    registerFixtureStatements(hub,state);
+    fixtureSql(hub).exec('DELETE FROM fleet_sessions');
     seedFleetSessions(hub.sql, 10);
     const svc = new FleetService(hub.sql, (cb: any) => cb(), () => Date.now());
     expect((await svc.handle(new Request('https://hub.test/api/fleet?sessions_cursor=!!!'), admin)).status).toBe(400);
@@ -252,11 +263,12 @@ describe('fleet sessions are keyset-paged with a small default page', () => {
   }));
 
   it('plans the cursor page as an index seek and always serves fresh reads', withHub(async (hub: Hub, state: DurableObjectState) => {
-    hub.sql.exec('DELETE FROM fleet_sessions');
+    registerFixtureStatements(hub,state);
+    fixtureSql(hub).exec('DELETE FROM fleet_sessions');
     seedFleetSessions(hub.sql, 30);
     const svc = new FleetService(hub.sql, (cb: any) => cb(), () => Date.now());
     expect(fleetPageShape(hub)).not.toMatch(/SCAN fleet_sessions(?! USING)/);
-    expect(fleetPageShape(hub)).toMatch(/USING .*INDEX fleet_session_page/);
+    expect(fleetPageShape(hub)).toMatch(/USING .*INDEX sqlite_autoindex_fleet_sessions_1/);
     expect(fleetPageShape(hub)).toMatch(/SEARCH/);
     // No version primitive in this runtime (see server note): every read is
     // a fresh 200; If-None-Match is ignored rather than risking stale 304s.
@@ -265,20 +277,23 @@ describe('fleet sessions are keyset-paged with a small default page', () => {
     expect(res.headers.get('ETag')).toBeNull();
     const again = await svc.handle(new Request('https://hub.test/api/fleet?sections=sessions&sessions_limit=10', { headers: { 'If-None-Match': 'W/"fleet-1-x"' } }), admin);
     expect(again.status).toBe(200);
-    hub.sql.exec(`INSERT OR REPLACE INTO fleet_sessions(machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace,profile,account) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    fixtureSql(hub).exec(`INSERT OR REPLACE INTO fleet_sessions(machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace,profile,account) VALUES (?,?,?,?,?,?,?,?,?,?)`,
       'fleetm9', 'nat-new', 'tag-new', 'codex', 'running', 'active', new Date().toISOString(), '/w/new', null, 'acc');
     const changed: any = await (await svc.handle(new Request('https://hub.test/api/fleet?sections=sessions&sessions_limit=10'), admin)).json();
-    expect(changed.sessions_total).toBe(31);
+    expect(changed.sessions_total).toBeNull();
+    expect(changed.sessions_total_unknown).toBe(true);
   }));
 
   it('keeps the default page small as the table grows past 1000 rows', withHub(async (hub: Hub, state: DurableObjectState) => {
-    hub.sql.exec('DELETE FROM fleet_sessions');
+    registerFixtureStatements(hub,state);
+    fixtureSql(hub).exec('DELETE FROM fleet_sessions');
     seedFleetSessions(hub.sql, 1200);
     const svc = new FleetService(hub.sql, (cb: any) => cb(), () => Date.now());
     const res = await svc.handle(new Request('https://hub.test/api/fleet'), admin);
     const body: any = await res.json();
     expect(body.sessions).toHaveLength(FLEET_SESSIONS_DEFAULT);
-    expect(body.sessions_total).toBe(1200);
+    expect(body.sessions_total).toBeNull();
+    expect(body.sessions_total_unknown).toBe(true);
     expect(body.sessions_truncated).toBe(true);
     const bytes = JSON.stringify(body).length;
     expect(bytes, 'default fleet page must stay a small page').toBeLessThan(512 * 1024);
@@ -290,11 +305,11 @@ function seedLiveControl(sql: any, n: number, fleet: boolean) {
   for (let i = 0; i < n; i++) {
     const id = 'perf-ctl-' + String(i).padStart(5, '0');
     const nat = 'perf-nat-' + String(i).padStart(5, '0');
-    sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+    fixtureStatements(sql).exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
       id, 'perf-admin', 'ctl-rk-' + i, '{}', 'fleetm0', 'codex', 'headless', 'running',
       JSON.stringify({ native_id: nat, tag: 'tag-' + i }), fresh, fresh);
     if (fleet) {
-      sql.exec(`INSERT OR REPLACE INTO fleet_sessions(machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace,profile,account) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      fixtureStatements(sql).exec(`INSERT OR REPLACE INTO fleet_sessions(machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace,profile,account) VALUES (?,?,?,?,?,?,?,?,?,?)`,
         'fleetm0', nat, 'tag-' + i, 'codex', 'running', 'active', fresh, '/w/' + i, null, 'acc');
     }
   }
@@ -302,14 +317,15 @@ function seedLiveControl(sql: any, n: number, fleet: boolean) {
 
 describe('warnings and tree stay capped as tables grow', () => {
   it('caps the warnings page with truncation instead of a full running scan', withHub(async (hub: Hub, state: DurableObjectState) => {
+    registerFixtureStatements(hub,state);
     await state.storage.transactionSync(() => {
       new SessionControlService(hub.sql, (cb) => cb(), () => Date.now()).init();
     });
-    hub.sql.exec("DELETE FROM session_control_sessions WHERE id LIKE 'perf-ctl-%'");
+    fixtureSql(hub).exec("DELETE FROM session_control_sessions WHERE id LIKE 'perf-ctl-%'");
     const old = new Date(Date.now() - 4 * 3600 * 1000).toISOString();
     for (let i = 0; i < 1200; i++) {
       const id = 'perf-ctl-' + String(i).padStart(5, '0');
-      hub.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,mode,state,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)`,
+      fixtureSql(hub).exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,mode,state,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)`,
         id, 'perf-admin', 'warn-rk-' + i, '{}', 'headless', 'running', old, old);
     }
     const t = tracked(hub.sql);
@@ -320,21 +336,22 @@ describe('warnings and tree stay capped as tables grow', () => {
     expect(body.warnings.length).toBeLessThanOrEqual(500);
     expect(body.truncated).toBe(true);
     // Below the cap the common response keeps its exact historical shape.
-    hub.sql.exec("UPDATE session_control_sessions SET state = 'stopped' WHERE id LIKE 'perf-ctl-%'");
+    fixtureSql(hub).exec("UPDATE session_control_sessions SET state = 'stopped' WHERE id LIKE 'perf-ctl-%'");
     const slim: any = await (await svc.handle(new Request('https://hub.test/api/sessions/warnings'), admin)).json();
     expect(slim.warnings).toEqual([]);
     expect('truncated' in slim).toBe(false);
     const r = t.report(0);
     expect(r.total, `warnings top statements: ${JSON.stringify(r.top)}`).toBeLessThanOrEqual(12000);
-    expect((hub.sql.exec("EXPLAIN QUERY PLAN SELECT * FROM session_control_sessions WHERE state = 'running' ORDER BY created_at, id LIMIT ?", 501).toArray() as any[]).map(x => String(x.detail)).join(' | ')).not.toMatch(/SCAN/i);
+    expect((fixtureSql(hub).exec("EXPLAIN QUERY PLAN SELECT * FROM session_control_sessions WHERE state = 'running' ORDER BY created_at, id LIMIT ?", 501).toArray() as any[]).map(x => String(x.detail)).join(' | ')).not.toMatch(/SCAN/i);
   }));
 
   it('caps the tree page and never scans the sessions table for it', withHub(async (hub: Hub, state: DurableObjectState) => {
+    registerFixtureStatements(hub,state);
     await state.storage.transactionSync(() => {
       new SessionControlService(hub.sql, (cb) => cb(), () => Date.now()).init();
     });
-    hub.sql.exec("DELETE FROM session_control_sessions WHERE id LIKE 'perf-ctl-%'");
-    hub.sql.exec("DELETE FROM fleet_sessions WHERE machine_id = 'fleetm0'");
+    fixtureSql(hub).exec("DELETE FROM session_control_sessions WHERE id LIKE 'perf-ctl-%'");
+    fixtureSql(hub).exec("DELETE FROM fleet_sessions WHERE machine_id = 'fleetm0'");
     seedLiveControl(hub.sql, 600, true);
     const t = tracked(hub.sql);
     const svc = new SessionControlService(t.proxy, (cb: any) => cb(), () => Date.now());

@@ -106,29 +106,61 @@ export const DEFAULT_CHECKS = [
   BURN_FORECAST_CHECK,
 ];
 
+export class ChecksObservationLimit extends Error {
+  readonly code='checks_observation_limited';readonly status=503;
+  constructor(){super('checks_observation_limited');}
+}
+const checkTextOrder=(left:unknown,right:unknown)=>{
+  const a=new TextEncoder().encode(String(left)),b=new TextEncoder().encode(String(right));
+  for(let i=0;i<Math.min(a.length,b.length);i++)if(a[i]!==b[i])return a[i]-b[i];
+  return a.length-b.length;
+};
 export class ChecksService {
   constructor(private sql: SqlStorage, private now: () => number = Date.now) {}
 
+  private hasIndex(name:string):boolean {
+    return this.sql.exec("SELECT /* live checks index */ cid FROM pragma_index_info(?, 'main') LIMIT 1",name).toArray().length>0;
+  }
+  private rawChecks():any[] {
+    const rows=this.sql.exec('SELECT * FROM hub_checks ORDER BY name LIMIT 101').toArray() as any[];
+    if(rows.length>100)throw new ChecksObservationLimit();return rows;
+  }
+  private rawSlots():any[] {
+    const rows=this.sql.exec('SELECT name,state,lease_until FROM hub_check_slots ORDER BY name LIMIT 101').toArray() as any[];
+    if(rows.length>100)throw new ChecksObservationLimit();return rows;
+  }
+  private freshIndex(table:string,name:string,ddl:string):void {
+    if(!this.hasIndex(name)&&!this.sql.exec('SELECT 1 FROM '+table+' LIMIT 1').toArray().length)this.sql.exec(ddl);
+  }
   init() {
     for (const stmt of CHECKS_SCHEMA.split(';')) if (stmt.trim()) this.sql.exec(stmt);
-    // Seed defaults once; an operator who later removes every check keeps an empty list.
-    if (!this.sql.exec("SELECT 1 FROM hub_meta WHERE key = 'checks_seeded'").toArray().length) {
-      if (!Number(this.sql.exec('SELECT COUNT(*) AS n FROM hub_checks').one().n)) this.replace(DEFAULT_CHECKS.map(c => (validateCheck(c) as any).row));
-      this.sql.exec("INSERT INTO hub_meta (key, value) VALUES ('checks_seeded', ?)", new Date(this.now()).toISOString());
-      this.sql.exec("INSERT INTO hub_meta (key, value) VALUES ('burn_check_seeded', ?)", new Date(this.now()).toISOString());
-    }
-    // Deployments seeded before the burn forecast existed get it once; removing it later sticks.
-    if (!this.sql.exec("SELECT 1 FROM hub_meta WHERE key = 'burn_check_seeded'").toArray().length) {
-      if (Number(this.sql.exec('SELECT COUNT(*) AS n FROM hub_checks').one().n) > 0 && !this.sql.exec("SELECT 1 FROM hub_checks WHERE name = ? OR kind = 'burn_forecast'", BURN_FORECAST_CHECK.name).toArray().length) {
-        const r = (validateCheck(BURN_FORECAST_CHECK) as any).row;
-        this.sql.exec('INSERT INTO hub_checks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', r.name, r.kind, r.interval_s, JSON.stringify(r.params), JSON.stringify(r.action), Number(r.enabled), new Date(this.now()).toISOString(), null, null, null);
+    this.freshIndex('hub_checks','hub_checks_enabled_due','CREATE INDEX IF NOT EXISTS hub_checks_enabled_due ON hub_checks(enabled,next_due_at,name)');
+    this.freshIndex('hub_check_slots','hub_check_slots_retry_due',"CREATE INDEX IF NOT EXISTS hub_check_slots_retry_due ON hub_check_slots(lease_until,name) WHERE state!='done'");
+    // Bound candidate visits before testing expiry; an expired backlog must
+    // never force a whole-history scan just to discover a live overdue row.
+    // Reuse deployed message indexes; building a new pending index would
+    // rewrite the retained message table during incident recovery.
+    // Missing legacy receipts observe a complete bounded source before
+    // any configuration/default write. Existing receipts remain point reads.
+    const seeded=this.sql.exec("SELECT 1 FROM hub_meta WHERE key='checks_seeded'").toArray().length>0;
+    const burnSeeded=this.sql.exec("SELECT 1 FROM hub_meta WHERE key='burn_check_seeded'").toArray().length>0;
+    const rows=!seeded||!burnSeeded?this.rawChecks():[];
+    if(!seeded) {
+      if(!rows.length)this.replace(DEFAULT_CHECKS.map(c=>(validateCheck(c) as any).row));
+      this.sql.exec("INSERT INTO hub_meta (key,value) VALUES('checks_seeded',?)",new Date(this.now()).toISOString());
+      this.sql.exec("INSERT OR REPLACE INTO hub_meta (key,value) VALUES('burn_check_seeded',?)",new Date(this.now()).toISOString());
+    } else if(!burnSeeded) {
+      if(rows.length&&!rows.some(row=>row.name===BURN_FORECAST_CHECK.name||row.kind==='burn_forecast')) {
+        const r=(validateCheck(BURN_FORECAST_CHECK) as any).row;
+        this.sql.exec('INSERT INTO hub_checks VALUES(?,?,?,?,?,?,?,?,?,?)',r.name,r.kind,r.interval_s,JSON.stringify(r.params),JSON.stringify(r.action),Number(r.enabled),new Date(this.now()).toISOString(),null,null,null);
       }
-      this.sql.exec("INSERT INTO hub_meta (key, value) VALUES ('burn_check_seeded', ?)", new Date(this.now()).toISOString());
+      this.sql.exec("INSERT INTO hub_meta (key,value) VALUES('burn_check_seeded',?)",new Date(this.now()).toISOString());
     }
   }
 
   replace(rows: any[]) {
-    const existing = new Map((this.sql.exec('SELECT name, next_due_at, last_run_at, last_status, last_detail FROM hub_checks').toArray() as any[]).map(r => [r.name, r]));
+    if(rows.length>100)throw new ChecksObservationLimit();
+    const existing=new Map(this.rawChecks().map(r=>[r.name,r]));
     this.sql.exec('DELETE FROM hub_checks');
     const at = new Date(this.now()).toISOString();
     for (const r of rows) {
@@ -138,15 +170,17 @@ export class ChecksService {
     }
   }
 
+  has(name:string):boolean {return this.sql.exec('SELECT 1 FROM hub_checks WHERE name=?',name).toArray().length>0;}
+
   list() {
-    return (this.sql.exec('SELECT * FROM hub_checks ORDER BY name').toArray() as any[]).map(r => ({
+    return this.rawChecks().map(r => ({
       name: r.name, kind: r.kind, interval_s: r.interval_s, params: JSON.parse(r.params_json), action: JSON.parse(r.action_json), enabled: !!r.enabled,
       next_due_at: r.next_due_at, last_run_at: r.last_run_at, last_status: r.last_status, last_detail: r.last_detail,
     }));
   }
 
   runs(limit = 50) {
-    return this.sql.exec('SELECT * FROM hub_check_runs ORDER BY id DESC LIMIT ?', limit).toArray();
+    return this.sql.exec('SELECT * FROM hub_check_runs ORDER BY id DESC LIMIT ?', Math.max(1,Math.min(1000,Math.floor(Number(limit)||50)))).toArray();
   }
 
   /** The latest durable slot per name survives replacement and restarts. SQL
@@ -156,7 +190,17 @@ export class ChecksService {
   async runDue(deps: ActionDeps, only?: string): Promise<any[]> {
     const results: any[] = [];
     let insertedRun = false;
-    const names = (this.sql.exec('SELECT name FROM hub_checks WHERE enabled = 1 OR name = ? ORDER BY name', only ?? '').toArray()).map(r => String(r.name));
+    const now=this.now(),at=new Date(now).toISOString();
+    // Observe BOTH sources before evaluator, slot, audit or action effects.
+    const checks=only?null:this.hasIndex('hub_checks_enabled_due')?null:this.rawChecks();
+    const slots=only?null:this.hasIndex('hub_check_slots_retry_due')?null:this.rawSlots();
+    const dueNames=(only?this.sql.exec('SELECT name FROM hub_checks WHERE name=?',only).toArray():checks
+      ? checks.filter(row=>row.enabled===1&&String(row.next_due_at)<=at).sort((a,b)=>checkTextOrder(a.next_due_at,b.next_due_at)||checkTextOrder(a.name,b.name)).slice(0,100)
+      :this.sql.exec('SELECT name FROM hub_checks INDEXED BY hub_checks_enabled_due WHERE enabled=1 AND next_due_at<=? ORDER BY next_due_at,name LIMIT 100',at).toArray()).map(row=>String(row.name));
+    const retryNames=only?[]:(slots?slots.filter(row=>row.state!=='done'&&typeof row.lease_until==='number'&&row.lease_until<=now)
+      .sort((a,b)=>a.lease_until-b.lease_until||checkTextOrder(a.name,b.name)).slice(0,100)
+      :this.sql.exec("SELECT name FROM hub_check_slots INDEXED BY hub_check_slots_retry_due WHERE state!='done' AND lease_until<=? ORDER BY lease_until,name LIMIT 100",now).toArray()).map(row=>String(row.name));
+    const names=[...new Set([...retryNames,...dueNames])];
     for (const name of names) {
       if (only && name !== only) continue;
       const now = this.now(); const at = new Date(now).toISOString();
@@ -172,7 +216,7 @@ export class ChecksService {
       const token = crypto.randomUUID();
       if (!slot || slot.state === 'done') {
         if (!only && Date.parse(row.next_due_at) > now) continue;
-        if (!slot && Number(this.sql.exec('SELECT COUNT(*) AS n FROM hub_check_slots').one().n) >= 1000) throw new Error('check_slot_capacity');
+        if (!slot && Number(this.sql.exec('SELECT COUNT(*) AS n FROM (SELECT 1 FROM hub_check_slots LIMIT 1000)').one().n) >= 1000) throw new Error('check_slot_capacity');
         const n = Math.floor(now / (row.interval_s * 1000));
         const nextAt = (n + 1) * row.interval_s * 1000;
         // Freeze the definition, without duplicating the SQL JSON columns or
@@ -245,8 +289,20 @@ export class ChecksService {
       results.push({ name, ...reported, action });
     }
     // The retained-run trim runs only when this pass appended history.
-    if (insertedRun) this.sql.exec('DELETE FROM hub_check_runs WHERE id <= (SELECT id FROM hub_check_runs ORDER BY id DESC LIMIT 1 OFFSET 1000)');
+    if (insertedRun) this.sql.exec(`DELETE FROM hub_check_runs WHERE id IN (SELECT id FROM hub_check_runs
+      WHERE id <= (SELECT id FROM hub_check_runs ORDER BY id DESC LIMIT 1 OFFSET 1000) ORDER BY id LIMIT 100)`);
     return results;
+  }
+
+  private overdueCandidates(cutoff: number, actor?: string): { rows: any[]; truncated: boolean } {
+    const candidates = (actor
+      ? this.sql.exec(`SELECT to_actor,created_at,expires_at,acked_at,registry_unbound_to FROM messages INDEXED BY messages_recipient_seq
+          WHERE to_actor=? ORDER BY recipient_seq DESC LIMIT 1001`, actor)
+      : this.sql.exec(`SELECT to_actor,created_at,expires_at,acked_at,registry_unbound_to FROM messages INDEXED BY messages_expires_at
+          WHERE expires_at>? ORDER BY expires_at LIMIT 1001`, this.now())).toArray() as any[];
+    return { rows: candidates.slice(0,1000).filter(row => row.acked_at === null && Number(row.created_at) < cutoff && Number(row.expires_at) > this.now()),
+      truncated: candidates.length > 1000 };
+
   }
 
   private async evaluate(check: any, deps: ActionDeps): Promise<CheckResult> {
@@ -280,26 +336,30 @@ export class ChecksService {
       }
       case 'inbox_backlog': {
         const cutoff = this.now() - p.max_age_s * 1000;
-        const n = Number(this.sql.exec('SELECT COUNT(*) AS n FROM messages WHERE to_actor = ? AND acked_at IS NULL AND created_at < ? AND expires_at > ?', p.actor, cutoff, this.now()).one().n);
+        const { rows, truncated } = this.overdueCandidates(cutoff, p.actor);
+        const n = rows.length;
+        if (truncated) return { status: n ? 'fail' : 'error', detail: `inbox inspection bounded to 1000 message candidates; ${n} overdue in sample for ${p.actor}; backlog truncated` };
         return n ? { status: 'fail', detail: `${n} unacknowledged message(s) for ${p.actor} older than ${p.max_age_s}s` } : { status: 'pass', detail: `inbox of ${p.actor} is current` };
       }
       case 'delivery_slo': {
         const maxAgeS = p.max_age_s ?? 300;
         const cutoff = this.now() - maxAgeS * 1000;
-        const totals = this.sql.exec(`SELECT COUNT(*) AS n, COUNT(DISTINCT to_actor) AS recipients
-          FROM messages WHERE acked_at IS NULL AND created_at < ? AND expires_at > ? ${p.actor ? 'AND to_actor = ?' : ''}`,
-          cutoff, this.now(), ...(p.actor ? [p.actor] : [])).one() as any;
-        const recipients = this.sql.exec(`SELECT to_actor AS actor, COUNT(*) AS n,
-          SUM(registry_unbound_to) AS unbound FROM messages WHERE acked_at IS NULL
-          AND created_at < ? AND expires_at > ? ${p.actor ? 'AND to_actor = ?' : ''}
-          GROUP BY to_actor ORDER BY n DESC, to_actor LIMIT 20`, cutoff, this.now(), ...(p.actor ? [p.actor] : [])).toArray() as any[];
+        const { rows, truncated } = this.overdueCandidates(cutoff, p.actor);
+        const grouped = new Map<string, { actor: string; n: number; unbound: number }>();
+        for (const row of rows) {
+          const value = grouped.get(row.to_actor) ?? { actor: row.to_actor, n: 0, unbound: 0 };
+          value.n++; value.unbound += Number(row.registry_unbound_to) || 0;
+          grouped.set(row.to_actor, value);
+        }
+        const recipients = [...grouped.values()].sort((a,b) => b.n-a.n || a.actor.localeCompare(b.actor)).slice(0,20);
+        if (truncated && !recipients.length) return { status: 'error', detail: 'delivery SLO inspection bounded to 1000 live message candidates; backlog truncated, overdue count unknown' };
         if (!recipients.length) return { status: 'pass', detail: `delivery SLO met (${maxAgeS}s limit)` };
-        const count = Number(totals.n);
-        const more = Number(totals.recipients) - recipients.length;
+        const count = rows.length;
+        const more = grouped.size - recipients.length;
         const noReader = recipients.filter(r => Number(r.unbound) > 0 || !inboxReaderStatus(this.sql, r.actor, this.now()).active_reader);
         const detail = `${count} unacknowledged message(s) older than ${maxAgeS}s (delivery SLO violated); ` +
           recipients.map(r => `${r.actor}: ${r.n} overdue${Number(r.unbound) ? `, ${r.unbound} registry-unbound` : ''}`).join('; ') + (more ? `; +${more} more recipients (top 20 shown)` : '');
-        const summary = (noReader.length ? 'NO_READER: ' + noReader.map(r => r.actor).join(', ') + '; ' : '') + detail;
+        const summary = (noReader.length ? 'NO_READER: ' + noReader.map(r => r.actor).join(', ') + '; ' : '') + detail + (truncated ? '; sample of first 1000 message candidates; backlog truncated, total unknown' : '');
         const bytes = new TextEncoder().encode(summary);
         return { status: 'fail', detail: bytes.byteLength <= 12000 ? summary :
           new TextDecoder().decode(bytes.subarray(0, 11900)) + '; further labels omitted; inspect bus backlog' };

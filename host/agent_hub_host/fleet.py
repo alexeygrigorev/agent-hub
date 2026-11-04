@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 from contextlib import closing
 import json
 from . import native_list_cache
@@ -1941,6 +1942,7 @@ class Dispatcher:
         self._active_launches: dict[str, dict[str, Any]] = {}
         self._reconcile_backoff: dict[str, float] = {}
         self._role_jobs_cache: Optional[tuple] = None
+        self._registration_receipt: Optional[tuple] = None
         # Intake 488b860e: offers already faulted once this process (fault flag
         # is once-per-offer; the synchronous same-key retry must run clean).
         self._preclaim_fault_fired: set = set()
@@ -5708,6 +5710,50 @@ class Dispatcher:
         seen, max_s = self.dispatch_offers(results, hb=None, concurrency=concurrency, refresh=False)
         return {'offers': seen, 'results': results, 'dispatch_max_s': round(max_s, 3)}
 
+    def _registration_context(self):
+        """Match the default transport identity without retaining its secret.
+
+        Unknown/custom transport configuration disables suppression. A normal
+        heartbeat still authenticates every cycle, regardless of this receipt.
+        """
+        from . import config
+        if self.request is not bus._do_request:
+            return None
+        try:
+            cfg = config.load_config()
+            base = os.environ.get('HUB_URL') or os.environ.get('HUB_BASE_URL') or cfg.get('base_url')
+            token = os.environ.get('HUB_JOB_TOKEN') or os.environ.get('HUB_TOKEN') or cfg.get('access_token')
+            machine = cfg.get('machine_id')
+            if not all(isinstance(value, str) and value for value in (base, token, machine)):
+                return None
+            return (base.rstrip('/'), machine, hashlib.sha256(token.encode('utf-8')).hexdigest())
+        except Exception:
+            return None
+
+    def _register_if_changed(self, info):
+        """One process-local successful payload receipt; no permission cache."""
+        context = self._registration_context()
+        try:
+            normalized = json.dumps(info, sort_keys=True, separators=(',', ':'), allow_nan=False)
+        except (TypeError, ValueError):
+            normalized = None
+        now = time.monotonic()
+        receipt = self._registration_receipt
+        if (context is not None and normalized is not None and receipt is not None
+                and receipt[:2] == (context, normalized) and 0 <= now - receipt[2] < 3600):
+            return False
+        # A changed submission may commit even if its acknowledgement is
+        # lost. The previous payload is no longer a proven server state.
+        self._registration_receipt = None
+        result = self.request('POST', '/api/machines/register', info)
+        # If a request refreshed credentials, retry next cycle with that new
+        # identity instead of assuming which credential the server accepted.
+        if (context is not None and normalized is not None
+                and self._registration_context() == context and isinstance(result, dict)
+                and result.get('status') == 'registered' and result.get('machine_id') == context[1]):
+            self._registration_receipt = (context, normalized, time.monotonic())
+        return True
+
     def _once_locked(self, phases, _mark, _skip_telemetry):
         from . import api, system
         info = system.get_system_info()
@@ -5770,7 +5816,7 @@ class Dispatcher:
             print(json.dumps({'event': 'register_capabilities_bounded', **trim_meta}), flush=True)
             info = dict(info, capabilities=bounded_caps)
         try:
-            self.request('POST', '/api/machines/register', info)
+            self._register_if_changed(info)
         except Exception as exc:
             print(json.dumps({'event': 'register_skipped',
                               'error': _sanitized_transport_error(exc)}), flush=True)

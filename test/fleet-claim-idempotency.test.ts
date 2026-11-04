@@ -1,3 +1,4 @@
+import { fixtureStatements,registerFixtureStatements } from './helpers/fixture-statements';
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { FleetService } from '../src/fleet';
@@ -15,11 +16,12 @@ async function fixture(fn: (service: FleetService, sql: any) => Promise<void>) {
   const bindings = env as unknown as Env;
   const stub = bindings.HUB.get(bindings.HUB.idFromName('fleet-claim-idem-' + crypto.randomUUID()));
   await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
+    registerFixtureStatements(hub);
     const service = new FleetService(hub.sql, (cb) => state.storage.transactionSync(cb), () => now);
     service.init(); const sql = hub.sql;
     for (const machine of ['hetzner', 'win35']) {
-      sql.exec('INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, drained, capabilities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', machine, machine, machine, iso(), iso(), JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], cpu_usage: { total: 10 }, gate: { launch_allowed: true, at: iso() } }), 0, JSON.stringify({ engines: ['codex', 'claude'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8 }));
-      sql.exec('INSERT INTO host_quota_snapshots (host_id, schema_version, captured_at, captured_at_ms, received_at, received_at_ms, status, error, routes_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', machine, '1.0', iso(), now, iso(), now, 'ok', null, JSON.stringify(Object.fromEntries(['codex', 'claude'].map(provider => [provider, { status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } } }]))));
+      fixtureStatements(sql).exec('INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, drained, capabilities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', machine, machine, machine, iso(), iso(), JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], cpu_usage: { total: 10 }, gate: { launch_allowed: true, at: iso() } }), 0, JSON.stringify({ engines: ['codex', 'claude'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8 }));
+      fixtureStatements(sql).exec('INSERT INTO host_quota_snapshots (host_id, schema_version, captured_at, captured_at_ms, received_at, received_at_ms, status, error, routes_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', machine, '1.0', iso(), now, iso(), now, 'ok', null, JSON.stringify(Object.fromEntries(['codex', 'claude'].map(provider => [provider, { status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } } }]))));
     }
     await fn(service, sql);
   });
@@ -46,13 +48,13 @@ describe('intake 488b860e: idempotent same-host re-claim', () => {
     const first = await s.handle(request(path, { ...baseClaim, claim_key: key }), host('hetzner'));
     expect(first.status).toBe(200);
     expect(await first.json()).toMatchObject({ id: launch.id, state: 'starting' });
-    expect(sql.exec('SELECT state, claim_key, native_id, launcher_task_id FROM fleet_launches WHERE id = ?', launch.id).one()).toMatchObject({ state: 'starting', claim_key: key, native_id: null, launcher_task_id: null });
+    expect(fixtureStatements(sql).exec('SELECT state, claim_key, native_id, launcher_task_id FROM fleet_launches WHERE id = ?', launch.id).one()).toMatchObject({ state: 'starting', claim_key: key, native_id: null, launcher_task_id: null });
     // Late-landing original claim plus retry: the retry replays, no second claim.
     const replay = await s.handle(request(path, { ...baseClaim, claim_key: key }), host('hetzner'));
     expect(replay.status).toBe(200);
     expect(await replay.json()).toMatchObject({ id: launch.id, state: 'starting', replay: true });
-    expect(sql.exec('SELECT COUNT(*) AS n FROM fleet_launches WHERE id = ?', launch.id).one().n).toBe(1);
-    expect(sql.exec('SELECT state, native_id, launcher_task_id FROM fleet_launches WHERE id = ?', launch.id).one()).toMatchObject({ state: 'starting', native_id: null, launcher_task_id: null });
+    expect(fixtureStatements(sql).exec('SELECT COUNT(*) AS n FROM fleet_launches WHERE id = ?', launch.id).one().n).toBe(1);
+    expect(fixtureStatements(sql).exec('SELECT state, native_id, launcher_task_id FROM fleet_launches WHERE id = ?', launch.id).one()).toMatchObject({ state: 'starting', native_id: null, launcher_task_id: null });
   }));
   it('conflicts on a different key or a missing key once claimed', async () => fixture(async (s, sql) => {
     await configure(s);
@@ -64,7 +66,7 @@ describe('intake 488b860e: idempotent same-host re-claim', () => {
     expect((await s.handle(request(path, { ...baseClaim, claim_key: crypto.randomUUID().replace(/-/g, '') }), host('hetzner'))).status).toBe(409);
     // Keyless retry on a claimed launch: conflict as before.
     expect((await s.handle(request(path, baseClaim), host('hetzner'))).status).toBe(409);
-    expect(sql.exec('SELECT state, claim_key FROM fleet_launches WHERE id = ?', launch.id).one()).toMatchObject({ state: 'starting', claim_key: key });
+    expect(fixtureStatements(sql).exec('SELECT state, claim_key FROM fleet_launches WHERE id = ?', launch.id).one()).toMatchObject({ state: 'starting', claim_key: key });
   }));
   it('rejects malformed keys and stays backward compatible with keyless claims', async () => fixture(async (s, sql) => {
     await configure(s);
@@ -73,7 +75,7 @@ describe('intake 488b860e: idempotent same-host re-claim', () => {
     for (const bad of ['x'.repeat(129), 'has space', '', 42, 'semi;colon']) {
       expect((await s.handle(request(path, { ...baseClaim, claim_key: bad }), host('hetzner'))).status).toBe(400);
     }
-    expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', launch.id).one().state).toBe('offered');
+    expect(fixtureStatements(sql).exec('SELECT state FROM fleet_launches WHERE id = ?', launch.id).one().state).toBe('offered');
     // Old hosts send no key: claim works exactly as before.
     expect((await s.handle(request(path, baseClaim), host('hetzner'))).status).toBe(200);
     expect((await s.handle(request(path, baseClaim), host('hetzner'))).status).toBe(409);
@@ -118,8 +120,8 @@ describe('intake 488b860e: idempotent same-host re-claim', () => {
     expect((await s.handle(request('/launches/' + idNative + '/result', { state: 'running', native_id: 'native-1', launcher_task_id: 'hub-' + idNative }), host('hetzner'))).status).toBe(200);
     expect((await s.handle(request('/launches/' + idTask + '/result', { state: 'uncertain', launcher_task_id: 'hub-' + idTask }), host('hetzner'))).status).toBe(200);
     // The fixture clock is frozen, so pin distinct claim times explicitly.
-    sql.exec("UPDATE fleet_launches SET updated_at = ? WHERE id = ?", new Date(now - 60000).toISOString(), idOld);
-    sql.exec("UPDATE fleet_launches SET updated_at = ? WHERE id = ?", new Date(now).toISOString(), idNew);
+    fixtureStatements(sql).exec("UPDATE fleet_launches SET updated_at = ? WHERE id = ?", new Date(now - 60000).toISOString(), idOld);
+    fixtureStatements(sql).exec("UPDATE fleet_launches SET updated_at = ? WHERE id = ?", new Date(now).toISOString(), idNew);
     const offers: any = await (await s.handle(request('/offers', undefined, 'GET'), host('hetzner'))).json();
     const byId = Object.fromEntries(offers.offers.map((o: any) => [o.id, o]));
     // The effect-free starting launches are re-offered with their stored keys
@@ -142,7 +144,7 @@ describe('intake 488b860e: idempotent same-host re-claim', () => {
     // (max_concurrency caps at 100, so this bypasses the launch gate).
     const stamp = new Date(now).toISOString();
     for (let i = 0; i < 105; i++) {
-      sql.exec("INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, claim_key, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      fixtureStatements(sql).exec("INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, claim_key, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         crypto.randomUUID(), 'test-admin', 'human', null, '', 'seed-' + i,
         JSON.stringify({ workspace: 'demo', prompt: 'x', task_kind: 'goal' }),
         'hetzner', 'codex', 'shared-codex', null, 'headless', 'demo', 'x',
@@ -175,7 +177,7 @@ describe('intake 488b860e: idempotent same-host re-claim', () => {
       for (let i = 0; i < count + 20; i++) {
         const id = crypto.randomUUID(), starting = i < count;
         const stamp = new Date(now - (machine === 'win35' ? 1000 : 0)).toISOString();
-        sql.exec("INSERT INTO fleet_launches (id, actor, requester_kind, summary, request_key, request_json, machine_id, engine, account, mode, workspace, prompt, state, claim_key, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        fixtureStatements(sql).exec("INSERT INTO fleet_launches (id, actor, requester_kind, summary, request_key, request_json, machine_id, engine, account, mode, workspace, prompt, state, claim_key, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
           id, 'test-admin', 'human', '', id, JSON.stringify({ workspace: 'demo', task_kind: 'goal' }), machine, 'codex', 'shared-codex', 'headless', 'demo', 'x', starting ? 'starting' : 'offered', starting ? crypto.randomUUID() : null, stamp, stamp);
         if (machine === 'hetzner' && starting) target.add(id);
       }
@@ -197,9 +199,9 @@ describe('intake 488b860e: idempotent same-host re-claim', () => {
     const path = '/launches/' + launch.id + '/claim', claim_key = crypto.randomUUID();
     expect((await s.handle(request(path, { ...baseClaim, claim_key }), host('hetzner'))).status).toBe(200);
     expect((await s.handle(request(path, { ...baseClaim, observed_at: iso(-60000), claim_key }), host('hetzner'))).status).toBe(409);
-    sql.exec("UPDATE fleet_accounts SET enabled = 0 WHERE label = 'shared-codex'");
+    fixtureStatements(sql).exec("UPDATE fleet_accounts SET enabled = 0 WHERE label = 'shared-codex'");
     expect((await s.handle(request(path, { ...baseClaim, claim_key }), host('hetzner'))).status).toBe(409);
-    expect(sql.exec('SELECT state, native_id, launcher_task_id FROM fleet_launches WHERE id = ?', launch.id).one()).toMatchObject({ state: 'starting', native_id: null, launcher_task_id: null });
+    expect(fixtureStatements(sql).exec('SELECT state, native_id, launcher_task_id FROM fleet_launches WHERE id = ?', launch.id).one()).toMatchObject({ state: 'starting', native_id: null, launcher_task_id: null });
   }));
 
 });

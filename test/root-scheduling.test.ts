@@ -1,4 +1,5 @@
-import { describe, it, expect } from 'vitest';
+import { restartFixtureHub, freshFixtureBudgetDay } from './helpers/fixture-budget';
+import { describe, it, expect, beforeEach } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { doFetch } from './m1-focus-setup';
 import { sha256 } from '../src/auth/crypto';
@@ -8,6 +9,8 @@ import { JobsService, JOBS_SCHEMA_SQL } from '../src/jobs';
 import { SCHEMA_SQL } from '../src/schema';
 import { BUS_SCHEMA_SQL } from '../src/bus';
 import { ensureRootScheduling, getRootScheduling, setRootScheduling, isRootSchedulingEnabled } from '../src/root_scheduling';
+
+beforeEach(async()=>{const stub=await getStub();await (runInDurableObject as any)(stub,async(instance:any)=>freshFixtureBudgetDay(instance));});
 
 // Fixed clock five minutes into a fixed slot. Tick, offer and deadline logic run on
 // the JobsService clock, so these tests never depend on the wall-clock minute (the
@@ -482,7 +485,7 @@ describe('Root scheduling flag: idempotence, durability, races', () => {
       expect(d3.status).toBe(200);
 
       // Simulate restart: a fresh Hub instance over the same storage must see the persisted flag
-      const hub2 = new Hub(instance.ctx, instance.env);
+      const hub2 = await restartFixtureHub(instance);
       const res = await hub2.fetch(new Request('http://example.com/api/root/scheduling', { headers: { 'Cookie': sessionCookie } }));
       expect(res.status).toBe(200);
       expect(((await res.json()) as any).enabled).toBe(false);

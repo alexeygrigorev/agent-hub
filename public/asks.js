@@ -22,7 +22,7 @@ async function refresh() {
     let data;
     if (selected === 'unresolved') {
       const [pending, unmapped] = await Promise.all([queryFor('pending'), queryFor('unmapped')]);
-      data = { asks: [...pending.asks, ...unmapped.asks].sort((a, b) => (b.ts || b.received_at || 0) - (a.ts || a.received_at || 0)), counts: pending.counts };
+      data = { asks: [...pending.asks, ...unmapped.asks].sort((a, b) => (b.ts || b.received_at || 0) - (a.ts || a.received_at || 0)), counts: pending.counts, observation_pending: pending.observation_pending || unmapped.observation_pending };
     } else data = await queryFor(selected);
     const c = data.counts;
     const query = (filterEl.value || '').trim().toLocaleLowerCase();
@@ -35,9 +35,10 @@ async function refresh() {
     const capped = selected === 'unresolved'
       ? unresolvedCount > data.asks.length
       : selectedCount > data.asks.length;
-    status.textContent = `${selected === 'unresolved' ? `${unresolvedCount} unresolved mapping asks (${c.pending} pending · ${c.unmapped} unmapped)` : `${c.unmapped} unmapped · ${c.dropped_after_done} dropped after done · ${c.pending} pending · ${c.mapped} mapped · ${c.verified} verified`} · ${c.open_gaps} unrecorded range(s) · ${c.messages} messages` +
+    const observedCount = key => c[key] == null ? (c[key + '_lower_bound'] ? `at least ${c[key + '_lower_bound']} (count limited)` : 'unknown (count limited)') : c[key];
+    status.textContent = `${selected === 'unresolved' ? `${unresolvedCount} unresolved mapping asks (${c.pending} pending · ${c.unmapped} unmapped)` : `${c.unmapped} unmapped · ${c.dropped_after_done} dropped after done · ${c.pending} pending · ${c.mapped} mapped · ${c.verified} verified`} · ${observedCount('open_gaps')} unrecorded range(s) · ${c.messages} messages` +
       (query ? ` · ${visible.length} matching rows` : ` · ${visible.length} rows shown`) +
-      (capped ? ' · showing at most 500 rows per selected state; this endpoint has no cursor yet' : '') +
+      (capped || data.observation_pending ? ' · bounded page shown; older matches may remain' : '') +
       (data.last_tick ? ` · checked ${when(data.last_tick)}` : '');
     rowsEl.replaceChildren(...visible.map(a => {
       const card = document.createElement('article');

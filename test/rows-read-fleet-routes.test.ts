@@ -1,10 +1,11 @@
+import { freshFixtureBudgetDay, fixtureSql } from './helpers/fixture-budget';
 /**
  * Rows-read bounds for the two host-polled fleet routes (intake e8a22f4c):
  * GET /api/fleet/offers and PUT /api/fleet/sessions. Seeds a production-shaped
  * history (thousands of retained launches, managed sessions and census rows)
  * and asserts each call reads rows proportional to what changed, not to history.
  */
-import { it, expect } from 'vitest';
+import { it, expect, vi } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { FleetService } from '../src/fleet';
 import type { Hub } from '../src/hub';
@@ -25,9 +26,9 @@ function tracked(sql: any) {
   } });
   /** Rows read by statements issued since `from` (a prior `mark()`), total and per statement. */
   const report = (from = 0) => {
-    const by = new Map<string, number>(); let total = 0;
-    for (const { q, cursor } of calls.slice(from)) { const n = Number(cursor.rowsRead) || 0; total += n; const k = q.replace(/\s+/g, ' ').slice(0, 110); by.set(k, (by.get(k) ?? 0) + n); }
-    return { total, top: [...by].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k, n]) => `${n} ${k}`) };
+    const by = new Map<string, number>(); let total = 0, written = 0;
+    for (const { q, cursor } of calls.slice(from)) { const n = Number(cursor.rowsRead) || 0; total += n; written += Number(cursor.rowsWritten) || 0; const k = q.replace(/\s+/g, ' ').slice(0, 110); by.set(k, (by.get(k) ?? 0) + n); }
+    return { total, written, top: [...by].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k, n]) => `${n} ${k}`) };
   };
   const mark = () => calls.length;
   return { proxy, report, mark };
@@ -48,15 +49,30 @@ function seed(sql: any) {
   sql.exec("INSERT INTO fleet_catalog_seen VALUES ('h0', ?) ON CONFLICT(machine_id) DO UPDATE SET observed_at=excluded.observed_at", iso(-1000));
 }
 
-const withFleet = (fn: (s: FleetService, t: ReturnType<typeof tracked>, hub: Hub) => Promise<void>) => async () => {
+const withFleet = (fn: (s: FleetService, t: ReturnType<typeof tracked>, hub: Hub) => Promise<void>, productionCaches = false) => async () => {
   const bindings = env as unknown as Env;
   const stub = bindings.HUB.get(bindings.HUB.idFromName('fleet-rows-' + crypto.randomUUID()));
   await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
-    seed(hub.sql);
+    await freshFixtureBudgetDay(hub);
+    await (hub as any).rowBudget.begin(true);
+    seed(fixtureSql(hub,state));
     const t = tracked(hub.sql);
-    const s = new FleetService(t.proxy, (cb) => state.storage.transactionSync(cb), () => now);
-    s.init();
-    await fn(s, t, hub);
+    // Log only the SQL shape, never bindings. Native execution errors can be
+    // caught by optional-schema callers before the budget's failure latch
+    // surfaces, so the first throwing statement is the useful diagnosis.
+    const native:any=state.storage.sql,exec=native.exec;
+    const failures:string[]=[];
+    native.exec=function(query:string,...bindings:any[]) {
+      try{return exec.call(native,query,...bindings);}
+      catch(error){if(!/^(?:SQLITE_ERROR:\s*)?(?:duplicate column name:|table \S+ already exists|index \S+ already exists)/i.test(String((error as any)?.message??error))){failures.push(query);console.error('FLEET_ROWS_NATIVE_SQL_FAILURE',query);}throw error;}
+    };
+    (t as any).nativeFailures=failures;
+    try {
+      const s = new FleetService(t.proxy, (cb) => state.storage.transactionSync(cb), () => now,
+        productionCaches ? (hub as any).writes : undefined, productionCaches ? (hub as any).observedCatalog : undefined);
+      s.init();
+      await fn(s, t, hub);
+    } finally { native.exec=exec; }
   });
 };
 
@@ -71,7 +87,50 @@ it('PUT /api/fleet/sessions with an unchanged census reads rows per reported row
   const after = t.report(from);
   const second = after.total;
   expect(second, `unchanged PUT top statements: ${JSON.stringify(after.top)}`).toBeLessThanOrEqual(CENSUS * 4);
-}));
+  console.log(JSON.stringify({evidence:'route_service_native_cost',route:'PUT /api/fleet/sessions',case:'unchanged500',history_rows:HOSTS*HISTORY,rows_read:after.total,rows_written:after.written,excludes:'outer authentication, KV ledger and guard migration preflight'}));
+},true));
+
+it('production cache configuration settles then serves100 unchanged500-row polls in one strict budget day', withFleet(async(s,t,hub)=>{
+  const sessions=Array.from({length:CENSUS},(_,i)=>({native_id:uuid(3,i),tag:'hub-'+uuid(1,i),engine:'codex',
+    phase:i<5?'running':'exited',confirmed_exit:i>=5,agent_state:null,workspace:'/w',cwd:'/w',profile:null,
+    account:null,last_activity_at:null,created_at_ms:now-1000-i}));
+  const put=()=>s.handle(new Request('https://hub.test/api/fleet/sessions',{method:'PUT',body:JSON.stringify({sessions})}),host);
+  const budget=()=>(hub as any).rowBudget.status();
+  const consumed=(status:any)=>status.reserved_total-status.available_total;
+  const initial=budget(),startupFrom=t.mark(),startup:any[]=[];
+  let quiet=0;
+  // Adoption can change the linkage revision after Fleet records it, causing
+  // one later full link pass. That500-PK pass evicts chunk reads from the512
+  // entry SQL memo; a following request primes them again. Require observed
+  // settling, rather than hiding any fixed number of expensive requests.
+  for(let i=0;i<8&&quiet<2;i++) {
+    const from=t.mark(),before=budget();
+    const response=await put();
+    const cost=t.report(from),guard=consumed(budget())-consumed(before);
+    startup.push({call:i+1,status:response.status,rows_read:cost.total,rows_written:cost.written,guard_consumed_total:guard});
+    quiet=cost.total===0&&cost.written===0&&guard===0?quiet+1:0;
+  }
+  const startupCost=t.report(startupFrom),startupAfter=budget();
+  console.log(JSON.stringify({evidence:'route_service_native_cost',route:'PUT /api/fleet/sessions',case:'bounded startup cache priming, fixed observation clock, production caches',
+    max_calls:8,settled:quiet===2,calls:startup.length,polls:startup,rows_read:startupCost.total,rows_written:startupCost.written,
+    guard_consumed_total:consumed(startupAfter)-consumed(initial),excludes:'outer authentication, KV ledger and guard migration preflight from visible SQL counters'}));
+  expect(quiet).toBe(2);
+  expect(startup.every(poll=>poll.status===200)).toBe(true);
+  expect(startupAfter).toMatchObject({day:initial.day,limit_total:20000,stopped:false});
+
+  const before=budget(),from=t.mark(),statuses:number[]=[];
+  for(let i=0;i<100;i++)statuses.push((await put()).status);
+  const receipt=t.report(from),after=budget(),guardConsumed=consumed(after)-consumed(before);
+  console.log(JSON.stringify({evidence:'route_service_native_cost',route:'PUT /api/fleet/sessions',case:'100 settled unchanged500 polls, fixed observation clock, production caches',
+    calls:100,history_rows:HOSTS*HISTORY,rows_read:receipt.total,rows_written:receipt.written,guard_consumed_total:guardConsumed,
+    excludes:'outer authentication, KV ledger and guard migration preflight from visible SQL counters'}));
+  expect(statuses.every(status=>status===200)).toBe(true);
+  expect(receipt.written).toBe(0);
+  expect(receipt.total,JSON.stringify(receipt.top)).toBeLessThanOrEqual(100);
+  expect(after).toMatchObject({day:initial.day,limit_total:20000,stopped:false});
+  expect(guardConsumed).toBeGreaterThanOrEqual(0);
+  expect(guardConsumed).toBeLessThanOrEqual(100);
+},true));
 
 it('GET /api/fleet/offers with no offers reads a bounded number of rows', withFleet(async (s, t) => {
   const get = () => s.handle(new Request('https://hub.test/api/fleet/offers'), host);
@@ -81,6 +140,7 @@ it('GET /api/fleet/offers with no offers reads a bounded number of rows', withFl
   const after = t.report(from);
   const second = after.total;
   expect(second, `idle offers top statements: ${JSON.stringify(after.top)}`).toBeLessThanOrEqual(400);
+  console.log(JSON.stringify({evidence:'route_service_native_cost',route:'GET /api/fleet/offers',case:'idle warm poll',history_rows:HOSTS*HISTORY,rows_read:after.total,rows_written:after.written,excludes:'outer authentication, KV ledger and guard migration preflight'}));
 }));
 
 it('PUT /api/fleet/sessions still writes changed rows, retires vanished live rows and skips stopped sessions', withFleet(async (s, _t, hub) => {
@@ -103,28 +163,55 @@ it('PUT /api/fleet/sessions still writes changed rows, retires vanished live row
   expect(phaseOf(10)).toBe('exited');
 }));
 
-it('GET /api/fleet/offers reuses reconciliation candidates until a launch or session write', withFleet(async (s, t, hub) => {
+it('GET /api/fleet/offers rotates incomplete reconciliation pages and caches only a complete small cohort', withFleet(async (s, t, hub) => {
   // 60 extra running launches on h0, each with a fresh live native (probed by the candidates query),
   // except launch 0, whose native is unobserved so it is a reconciliation candidate.
   for (let i = 0; i < 60; i++) {
     const n = 10000 + i, launch = uuid(5, n), native = uuid(6, n);
-    hub.sql.exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,native_id,created_at,updated_at)
+    fixtureSql(hub).exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,native_id,created_at,updated_at)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, launch, 'owner', 'agent', 's', 'kx' + n, '{}', 'h0', 'codex', 'a', 'interactive', '/w', 'p', 'running', native, iso(-1000), iso(-1000));
-    if (i > 0) hub.sql.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace,cwd,created_at_ms) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    if (i > 0) fixtureSql(hub).exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace,cwd,created_at_ms) VALUES (?,?,?,?,?,?,?,?,?,?)`,
       'h0', native, 'hub-' + launch, 'codex', 'running', null, iso(-1000), '/w', '/w', now - 1000);
   }
   const get = async () => { const r = await s.handle(new Request('https://hub.test/api/fleet/offers'), host); expect(r.status).toBe(200); return r.json() as Promise<any>; };
+  const uncached=vi.spyOn(s as any,'reconciliationCandidatesUncached');
   const candidate = uuid(5, 10000);
   const first = await get();
   expect(first.reconciliation.map((r: any) => r.id)).toContain(candidate);
-  const from = t.mark();
-  const second = await get();
-  const reads = t.report(from);
-  expect(second.reconciliation).toEqual(first.reconciliation);
-  expect(reads.total, `second poll top statements: ${JSON.stringify(reads.top)}`).toBeLessThanOrEqual(60);
-  // A launch write moves the revision: the next poll recomputes and no longer lists it.
-  hub.sql.exec("UPDATE fleet_launches SET state = 'exited' WHERE id = ?", candidate);
-  expect((await get()).reconciliation.map((r: any) => r.id)).not.toContain(candidate);
+  expect(first.reconciliation_observation_pending).toBe(true);
+  expect(first.reconciliation_cursors.running).toBeGreaterThan(0);
+  const from=t.mark();
+  const second=await get();
+  expect(second.reconciliation_observation_pending).toBe(true);
+  expect(second.reconciliation_cursors.running).toBeGreaterThan(first.reconciliation_cursors.running);
+  expect(second.reconciliation.map((r:any)=>r.id)).not.toContain(candidate);
+  expect(t.report(from).total,JSON.stringify(t.report(from).top)).toBeLessThanOrEqual(60);
+  const tail=await get();
+  expect(tail.reconciliation_observation_pending).toBe(true);
+  expect(tail.reconciliation_cursors.running).toBe(0);
+  // A partial cycle is never cached as all clear: the next cycle must see
+  // the still-unobserved candidate again.
+  expect((await get()).reconciliation.map((r:any)=>r.id)).toContain(candidate);
+
+  // A complete small cohort is cacheable. Fixture reshaping is separate
+  // from all real guarded GET calls and the source invalidation below.
+  const seedSql=fixtureSql(hub),small=uuid(5,10001);
+  seedSql.exec("UPDATE fleet_launches SET state='exited' WHERE machine_id='h0'");
+  seedSql.exec("UPDATE fleet_launches SET state='running',native_id=NULL WHERE id=?",small);
+  let complete=await get();
+  if(complete.reconciliation_observation_pending)complete=await get();
+  expect(complete.reconciliation_observation_pending).toBe(false);
+  expect(complete.reconciliation.map((r:any)=>r.id)).toEqual([small]);
+  const invocations=uncached.mock.calls.length,mark=t.mark();
+  expect((await get()).reconciliation).toEqual(complete.reconciliation);
+  expect(uncached.mock.calls).toHaveLength(invocations);
+  expect(t.report(mark).total,JSON.stringify(t.report(mark).top)).toBeLessThanOrEqual(60);
+  hub.sql.exec("UPDATE fleet_launches SET state='exited' WHERE id=?",small);
+  const cleared=await get();
+  expect(cleared.reconciliation).toEqual([]);
+  expect(cleared.reconciliation_observation_pending).toBe(false);
+  expect(uncached.mock.calls.length).toBeGreaterThan(invocations);
+  uncached.mockRestore();
 }));
 
 /** A measured session reward row with the columns the efficiency aggregation reads. */
@@ -150,7 +237,7 @@ it('provider efficiencies are reused until a reward event is added', withFleet(a
   const { loadProviderEfficiencies } = await import('../src/pacing');
   for (let i = 0; i < 300; i++) reward(hub, 'ev' + i, 'codex:a:5h', now - 1000 - i, 60);
   const first = loadProviderEfficiencies(t.proxy, now);
-  expect(first.size).toBeGreaterThan(0);
+  expect(first.size,JSON.stringify({native_failures:(t as any).nativeFailures,budget:(hub as any).rowBudget.status(),sql:t.report().top})).toBeGreaterThan(0);
   const from = t.mark();
   const second = loadProviderEfficiencies(t.proxy, now + 1000);
   expect([...second]).toEqual([...first]);
@@ -165,9 +252,11 @@ it('only writes that can change capacity or the queue mark fleet maintenance dir
   for (const [m, p] of [['PUT', '/api/fleet/sessions'], ['PUT', '/api/fleet/subscriptions'], ['POST', '/api/fleet/probe'],
     ['POST', '/api/fleet/resources/report'], ['PUT', '/api/routing/capabilities'], ['PUT', '/api/fleet/routing/capabilities'],
     ['POST', '/api/routing/host-release/report'], ['PUT', '/api/routing/host-goal/h0']]) expect(dirty(m, p), `${m} ${p}`).toBe(false);
-  // Reads never dirty; placement, claims, results and task submission do.
+  // Claims defer invalidation until a source actually mutates; terminal
+  // replay requests are as quiet as reads. Other explicit mutations dirty.
+  expect(dirty('POST', `/api/fleet/launches/${uuid(1, 1)}/claim`)).toBe(false);
   expect(dirty('GET', '/api/fleet/offers')).toBe(false);
-  for (const [m, p] of [['POST', '/api/fleet/launches'], ['POST', `/api/fleet/launches/${uuid(1, 1)}/claim`], ['POST', `/api/fleet/launches/${uuid(1, 1)}/result`],
+  for (const [m, p] of [['POST', '/api/fleet/launches'], ['POST', `/api/fleet/launches/${uuid(1, 1)}/result`],
     ['POST', '/api/fleet/tasks'], ['POST', '/api/fleet/tasks/abc/result'], ['PATCH', '/api/fleet/accounts'], ['POST', '/api/fleet/reconcile']]) expect(dirty(m, p), `${m} ${p}`).toBe(true);
 });
 

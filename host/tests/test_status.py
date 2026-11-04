@@ -30,6 +30,15 @@ FIXTURE_DTO = {
 
 
 class TestStatusCli(unittest.TestCase):
+    def test_agent_counts_preserve_unknown_observations(self):
+        unknown = dict(running=None, idle=None, waiting=None, waiting_confirmation=None, observation_pending=True)
+        rendered = status.render_human(dict(FIXTURE_DTO, agents=unknown))
+        self.assertIn('agents: running=unknown idle=unknown waiting=unknown (waiting-confirmation=unknown)', rendered)
+        rendered = status.render_human(dict(FIXTURE_DTO, agents=dict(running=3, idle=0, waiting=2, waiting_confirmation=1)))
+        self.assertIn('agents: running=3 idle=0 waiting=2 (waiting-confirmation=1)', rendered)
+        rendered = status.render_human(dict(FIXTURE_DTO, agents=dict(running=0, observation_pending=True)))
+        self.assertIn('agents: running=unknown', rendered)
+
     def test_idle_attention_retains_all_fields_in_human_status(self):
         detail = 'idle_with_open_ac; intake_id=intake-fixture; idle_for=1801s; last_activity_at=2026-10-27T07:00:00Z; last_nudge=2026-10-27T07:30:00Z'
         rendered = status.render_human(dict(FIXTURE_DTO,needs_attention=[dict(severity='warn',subject='session:owned-fixture',detail=detail)]))

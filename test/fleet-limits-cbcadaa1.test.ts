@@ -1,3 +1,4 @@
+import { fixtureStatements,registerFixtureStatements } from './helpers/fixture-statements';
 import { describe, expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { FleetService } from '../src/fleet';
@@ -60,20 +61,21 @@ describe('cbcadaa1 hub limits', () => {
     const bindings = env as unknown as Env;
     const stub = bindings.HUB.get(bindings.HUB.idFromName('limits-cbcadaa1-' + crypto.randomUUID()));
     await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
+    registerFixtureStatements(hub);
       const fleet = new FleetService(hub.sql, cb => state.storage.transactionSync(cb), () => now);
       fleet.init();
-      hub.sql.exec(`INSERT INTO machines (id,name,hostname,registered_at,last_checkin_at,drained,capabilities)
+      fixtureStatements(hub.sql).exec(`INSERT INTO machines (id,name,hostname,registered_at,last_checkin_at,drained,capabilities)
         VALUES ('limits-host','limits-host','limits-host',?,?,0,?)`, iso(), iso(), JSON.stringify({ engines: ['claude'], fleet_modes: ['interactive'], workspaces: ['demo'] }));
-      hub.sql.exec("INSERT INTO fleet_accounts VALUES ('hub-claude','claude',8,5,1)");
-      hub.sql.exec("INSERT INTO fleet_accounts VALUES ('shared-claude','claude',100,5,1)");
-      hub.sql.exec("INSERT INTO fleet_accounts VALUES ('shared-codex','codex',8,0,1)");
-      hub.sql.exec("INSERT INTO fleet_routes VALUES ('limits-host','claude','hub-claude',NULL)");
-      hub.sql.exec(`INSERT INTO fleet_launches (id,actor,requester_kind,summary,request_key,request_json,
+      fixtureStatements(hub.sql).exec("INSERT INTO fleet_accounts VALUES ('hub-claude','claude',8,5,1)");
+      fixtureStatements(hub.sql).exec("INSERT INTO fleet_accounts VALUES ('shared-claude','claude',100,5,1)");
+      fixtureStatements(hub.sql).exec("INSERT INTO fleet_accounts VALUES ('shared-codex','codex',8,0,1)");
+      fixtureStatements(hub.sql).exec("INSERT INTO fleet_routes VALUES ('limits-host','claude','hub-claude',NULL)");
+      fixtureStatements(hub.sql).exec(`INSERT INTO fleet_launches (id,actor,requester_kind,summary,request_key,request_json,
         machine_id,engine,account,mode,workspace,prompt,state,created_at,updated_at)
         VALUES ('live','test-admin','human','existing','live-key','{}','limits-host','claude','hub-claude','interactive','demo','','running',?,?)`, iso(), iso());
       const call = (method: string, payload?: unknown, auth: any = admin) => fleet.handle(new Request('https://hub.test/api/fleet/limits',
         { method, body: payload === undefined ? undefined : JSON.stringify(payload) }), auth);
-      const cap = (label: string) => Number(hub.sql.exec('SELECT max_concurrency FROM fleet_accounts WHERE label=?', label).one().max_concurrency);
+      const cap = (label: string) => Number(fixtureStatements(hub.sql).exec('SELECT max_concurrency FROM fleet_accounts WHERE label=?', label).one().max_concurrency);
 
       expect((await call('GET', undefined, host)).status).toBe(403);
       expect((await call('PATCH', { target: 'claude', max_concurrency: 13 }, host)).status).toBe(403);
@@ -91,7 +93,7 @@ describe('cbcadaa1 hub limits', () => {
       expect(set).toMatchObject({ status: 'configured', kind: 'engine', changes: [
         { account: 'hub-claude', from: 8, to: 13, result: 'raised' }, { account: 'shared-claude', from: 100, to: 100, result: 'kept_higher' }] });
       expect([cap('hub-claude'), cap('shared-claude'), cap('shared-codex')]).toEqual([13, 100, 8]);
-      expect(hub.sql.exec("SELECT actor, target, detail FROM audit WHERE action='fleet_limits_set'").toArray()).toEqual([
+      expect(fixtureStatements(hub.sql).exec("SELECT actor, target, detail FROM audit WHERE action='fleet_limits_set'").toArray()).toEqual([
         { actor: 'test-admin', target: 'claude', detail: JSON.stringify([{ account: 'hub-claude', from: 8, to: 13 }]) }]);
       expect(((await (await call('GET')).json()) as any).accounts.find((a: any) => a.account === 'hub-claude')).toMatchObject({ max_concurrency: 13, available_slots: 12 });
 
@@ -103,8 +105,8 @@ describe('cbcadaa1 hub limits', () => {
       expect(cap('hub-claude')).toBe(10);
 
       // Legacy alias + canonical rows: one account in show and in set.
-      hub.sql.exec("INSERT INTO fleet_accounts VALUES ('shared-go','go',8,5,1)");
-      hub.sql.exec("INSERT INTO fleet_accounts VALUES ('urgent-muse','go',100,5,1)");
+      fixtureStatements(hub.sql).exec("INSERT INTO fleet_accounts VALUES ('shared-go','go',8,5,1)");
+      fixtureStatements(hub.sql).exec("INSERT INTO fleet_accounts VALUES ('urgent-muse','go',100,5,1)");
       expect(((await (await call('GET')).json()) as any).accounts.filter((a: any) => a.provider === 'go').map((a: any) => [a.account, a.max_concurrency])).toEqual([['shared-go', 8]]);
       const goSet: any = await (await call('PATCH', { target: 'shared-go', max_concurrency: 13 })).json();
       expect(goSet.changes).toEqual([{ label: 'shared-go', account: 'shared-go', provider: 'go', from: 8, to: 13, result: 'raised' }]);
@@ -113,7 +115,7 @@ describe('cbcadaa1 hub limits', () => {
       // Persisted: a fresh service over the same storage reads the new cap.
       const restarted = new FleetService(hub.sql, cb => state.storage.transactionSync(cb), () => now);
       restarted.init();
-      expect(restarted.accountStatus(hub.sql.exec("SELECT * FROM fleet_accounts WHERE label='hub-claude'").one())).toMatchObject({ max_concurrency: 10 });
+      expect(restarted.accountStatus(fixtureStatements(hub.sql).exec("SELECT * FROM fleet_accounts WHERE label='hub-claude'").one())).toMatchObject({ max_concurrency: 10 });
     });
   });
 });

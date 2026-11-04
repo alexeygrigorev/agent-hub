@@ -1,3 +1,5 @@
+import {MetadataCompat} from './metadata-compat';
+import { boundedRecentHoleInput,boundedBatchSubjects,batchCompleteStillOpen,boundedReconcilePage,type AskBatchKind } from './ask-bounded-observation';
 /** Ask ledger (intake 55c10deb, Alexey t1984u). Hub stores every message Alexey
  * sends an agent verbatim, splits it into atomic asks and maps each ask to an
  * intake acceptance-criteria line. The IntakeWatchdog tick alerts unmapped
@@ -156,6 +158,7 @@ export type AskHooks = {
 export type AskCaller = { admin: boolean; actor: string; machineId?: string | null };
 
 export class AskLedger {
+  private metadata!:MetadataCompat;
   constructor(private sql: SqlStorage, private intake: IntakeService, private tx: <T>(fn: () => T) => T,
     private hooks: AskHooks = {}, private now = Date.now) {}
   init() {
@@ -191,9 +194,7 @@ export class AskLedger {
       last_tick INTEGER, last_result TEXT, daily_day TEXT, last_user_batch_at INTEGER, reconcile_intake TEXT, reconcile_session TEXT,
       reconcile_started_at INTEGER, reconcile_batch_at INTEGER, reconcile_cursor INTEGER NOT NULL DEFAULT 0, last_reconcile_run TEXT,
       last_reconcile_at INTEGER)`);
-    for (const col of ['reconcile_cursor INTEGER NOT NULL DEFAULT 0', 'last_reconcile_run TEXT', 'last_reconcile_at INTEGER']) {
-      try { this.sql.exec(`ALTER TABLE ask_meta ADD COLUMN ${col}`); } catch { /* already present */ }
-    }
+    this.metadata=new MetadataCompat(this.sql,'ask_meta',['reconcile_cursor','last_reconcile_run','last_reconcile_at']);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS ask_reconcile_runs(id TEXT PRIMARY KEY, ran_at INTEGER NOT NULL, from_cursor INTEGER NOT NULL,
       to_cursor INTEGER NOT NULL, scanned_messages INTEGER NOT NULL, found_asks INTEGER NOT NULL, mapped INTEGER NOT NULL,
       appended INTEGER NOT NULL, created INTEGER NOT NULL, created_ids TEXT NOT NULL, appended_ids TEXT NOT NULL,
@@ -202,6 +203,9 @@ export class AskLedger {
     this.sql.exec('INSERT OR IGNORE INTO ask_meta(id) VALUES(1)');
     // Status counters (polled by /api/status): maintained per write, never a scan of history.
     const fresh = !this.rows("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ask_counts'").length;
+    const initialAsks=fresh?this.rows('SELECT state FROM asks ORDER BY rowid LIMIT 129'):[];
+    const initialMessages=fresh?this.rows('SELECT role FROM ask_messages ORDER BY rowid LIMIT 129'):[];
+    if(initialAsks.length>128||initialMessages.length>128)fail('ask_counter_migration_observation_limited',503);
     this.sql.exec('CREATE TABLE IF NOT EXISTS ask_counts(k TEXT PRIMARY KEY, n INTEGER NOT NULL DEFAULT 0)');
     const bump = (key: string, d: number) => `INSERT INTO ask_counts(k,n) VALUES(${key},${d}) ON CONFLICT(k) DO UPDATE SET n=n+(${d});`;
     this.sql.exec(`CREATE TRIGGER IF NOT EXISTS ask_counts_ins AFTER INSERT ON asks BEGIN ${bump("'state:'||NEW.state", 1)} END`);
@@ -210,23 +214,45 @@ export class AskLedger {
     this.sql.exec(`CREATE TRIGGER IF NOT EXISTS ask_counts_msg_ins AFTER INSERT ON ask_messages WHEN NEW.role='user' BEGIN ${bump("'user_messages'", 1)} END`);
     this.sql.exec(`CREATE TRIGGER IF NOT EXISTS ask_counts_msg_del AFTER DELETE ON ask_messages WHEN OLD.role='user' BEGIN ${bump("'user_messages'", -1)} END`);
     if (fresh) {
-      this.sql.exec("INSERT INTO ask_counts(k,n) SELECT 'state:'||state,COUNT(*) FROM asks GROUP BY state");
-      this.sql.exec("INSERT INTO ask_counts(k,n) SELECT 'user_messages',COUNT(*) FROM ask_messages WHERE role='user'");
+      const states=new Map<string,number>();
+      for(const row of initialAsks)states.set(row.state,(states.get(row.state)??0)+1);
+      for(const [state,n] of states)this.sql.exec('INSERT INTO ask_counts VALUES(?,?)','state:'+state,n);
+      this.sql.exec('INSERT INTO ask_counts VALUES(?,?)','user_messages',initialMessages.filter(row=>row.role==='user').length);
     }
   }
   private rows(q: string, ...a: any[]): Obj[] { return this.sql.exec(q, ...a).toArray() as Obj[]; }
-  private meta(): Obj { return this.rows('SELECT * FROM ask_meta WHERE id=1')[0]; }
+  private compatibleMeta():MetadataCompat {
+    return this.metadata??=MetadataCompat.forInitializedSchema(this.sql,'ask_meta',['reconcile_cursor','last_reconcile_run','last_reconcile_at']);
+  }
+  private meta(): Obj { return this.compatibleMeta().read(1); }
+  private reconcileMeta(cursor:number,extra:Obj={}) {
+    this.tx(()=>this.compatibleMeta().patch(1,{...extra,reconcile_cursor:Math.max(Number(this.meta().reconcile_cursor??0),cursor)}));
+  }
   /** Every intake: only for the operator-run check (history backfill maps to closed intakes). */
-  private tasks(): Obj[] { return this.intake.statusAuthorizedTasks({ admin: true }); }
+  private tasks(): Obj[] {
+    if(this.rows('SELECT id FROM intake_tasks ORDER BY id LIMIT 129').length>128)fail('ask_intake_observation_limited',503);
+    return this.intake.statusAuthorizedTasks({admin:true});
+  }
   /** The scheduled pass looks at open intakes only, a bounded indexed range. */
-  private openTasks(): Obj[] {
-    const out: Obj[] = [];
-    for (let after = ''; out.length < LIMITS.openIntakes;) {
-      const page = this.intake.watchdogTasks(after, 64);
-      out.push(...page);
-      if (page.length < 64) break;
-      after = page[page.length - 1].id;
+  private maintenancePending=false;
+  private activeAsks(states:string[]):Obj[] {
+    const out:Obj[]=[];
+    for(const state of states) {
+      const remaining=128-out.length;
+      if(!remaining){this.maintenancePending=true;break;}
+      const raw=this.rows('SELECT * FROM asks INDEXED BY asks_state WHERE state=? ORDER BY created_at,rowid LIMIT ?',state,remaining+1);
+      if(raw.length>remaining)this.maintenancePending=true;
+      for(const row of raw.slice(0,remaining)) {
+        const message=this.rows('SELECT t_id,intake_hint,source,received_at,agent_id,agent_name FROM ask_messages WHERE id=?',row.message_id)[0];
+        if(message)out.push({...row,...message});
+      }
     }
+    return out;
+  }
+  private openTasks():Obj[] {
+    const out:Obj[]=[];let after='';
+    while(out.length<128){const page=this.intake.watchdogTasks(after,Math.min(64,128-out.length));out.push(...page);if(page.length<64)return out;after=page.at(-1)!.id;}
+    if(this.intake.watchdogTasks(after,1).length)fail('ask_intake_observation_limited',503);
     return out;
   }
   /** Exact id or unique prefix, read by primary key. */
@@ -391,7 +417,8 @@ export class AskLedger {
     const mode = this.meta().gap_scope;
     if (mode === 'window') return [];
     const since = now - 14 * DAY;
-    const rows = this.rows(`SELECT DISTINCT agent_id,seq FROM ask_messages WHERE role='user' AND source<>'backfill' AND received_at>=? ORDER BY seq`, since);
+    const observation=boundedRecentHoleInput(this.sql,since);if(observation.limited)fail('ask_hole_observation_limited',503);
+    const rows=observation.rows;
     const groups = new Map<string, number[]>();
     for (const r of rows) {
       const k = mode === 'global' ? '*' : r.agent_id;
@@ -411,18 +438,24 @@ export class AskLedger {
     return out;
   }
   private resolveFilledGaps(scope: string, seq: number, now: number) {
-    for (const g of this.rows('SELECT * FROM ask_gaps WHERE scope IN (?,?) AND resolved_at IS NULL AND from_seq<=? AND to_seq>=?', scope, '*', seq, seq)) {
-      // A hole closes only when every number in it is recorded.
-      const have = this.rows(`SELECT COUNT(DISTINCT seq) AS n FROM ask_messages WHERE role='user' AND seq BETWEEN ? AND ? ${g.scope === '*' ? '' : 'AND agent_id=?'}`,
-        g.from_seq, g.to_seq, ...(g.scope === '*' ? [] : [g.scope]))[0].n;
-      if ((g.kind === 'hole' || g.kind.startsWith('rejected:')) && have >= g.to_seq - g.from_seq + 1)
-        this.sql.exec('UPDATE ask_gaps SET resolved_at=? WHERE scope=? AND from_seq=? AND to_seq=?', now, g.scope, g.from_seq, g.to_seq);
+    const gaps=this.rows('SELECT * FROM ask_gaps INDEXED BY ask_gaps_open WHERE resolved_at IS NULL ORDER BY detected_at LIMIT 129');
+    if(gaps.length>128)fail('ask_gap_observation_limited',503);
+    for(const g of gaps.filter(g=>(g.scope===scope||g.scope==='*')&&g.from_seq<=seq&&g.to_seq>=seq)) {
+      const raw=g.scope==='*'
+        ?this.rows("SELECT seq FROM ask_messages INDEXED BY ask_messages_role WHERE role='user' ORDER BY rowid LIMIT 129")
+        :this.rows('SELECT seq,role FROM ask_messages INDEXED BY ask_messages_agent_seq WHERE agent_id=? AND seq BETWEEN ? AND ? ORDER BY seq LIMIT 129',g.scope,g.from_seq,g.to_seq);
+      const have=new Set(raw.filter(row=>(g.scope==='*'||row.role==='user')&&row.seq>=g.from_seq&&row.seq<=g.to_seq).map(row=>row.seq)).size;
+      if((g.kind==='hole'||g.kind.startsWith('rejected:'))&&have>=g.to_seq-g.from_seq+1)
+        this.sql.exec('UPDATE ask_gaps SET resolved_at=? WHERE scope=? AND from_seq=? AND to_seq=?',now,g.scope,g.from_seq,g.to_seq);
+      else if(raw.length>128)fail('ask_gap_coverage_observation_limited',503);
     }
   }
 
   /** Split newly recorded messages into asks (cheap LLM when configured, else rules-v1). */
   private async splitPending(now: number): Promise<number> {
-    const pending = this.rows(`SELECT * FROM ask_messages WHERE split_state='pending' ORDER BY received_at LIMIT ${LIMITS.splitPerTick}`);
+    const source=this.rows("SELECT * FROM ask_messages INDEXED BY ask_messages_split WHERE split_state='pending' ORDER BY received_at,rowid LIMIT 33");
+    if(source.length>32)this.maintenancePending=true;
+    const pending=source.slice(0,32);let splitParts=0;
     for (const m of pending) {
       let parts: string[] | null = null, splitter = 'rules-v1';
       if (this.hooks.split) {
@@ -433,6 +466,8 @@ export class AskLedger {
         } catch { /* fall back */ }
       }
       parts ??= splitAsks(m.text);
+      if(splitParts+parts.length>128)fail('ask_split_observation_limited',503);
+      splitParts+=parts.length;
       this.tx(() => {
         parts!.forEach((text, part) => {
           const state = ACK_ONLY.test(text) ? 'not_an_ask' : 'pending';
@@ -447,7 +482,7 @@ export class AskLedger {
   /** Explicit link first, else intakes whose history/title/AC cite the message ref. */
   private autoMap(tasksFn: () => Obj[], now: number): number {
     let tasks: Obj[];
-    const open = this.rows(`SELECT a.*,m.t_id,m.intake_hint FROM asks a JOIN ask_messages m ON m.id=a.message_id WHERE a.state IN ('pending','unmapped') ORDER BY a.state,a.created_at LIMIT ${LIMITS.perTick}`);
+    const open=this.activeAsks(['pending','unmapped']);
     if (!open.length) return 0;
     tasks = tasksFn();
     const byRef = new Map<string, Obj[]>();
@@ -504,7 +539,11 @@ export class AskLedger {
    * closed_unverified closes stay possible; their asks are marked, not dropped. */
   closeGate(task: Obj, unverified: boolean): { code: string; detail: Obj } | null {
     if (unverified) return null;
-    const asks = this.rows(`SELECT a.*,m.t_id FROM asks a JOIN ask_messages m ON m.id=a.message_id WHERE a.intake_id=? AND a.state IN ('mapped','dropped_after_done','closed_unverified')`, task.id);
+    const raw=this.rows('SELECT * FROM asks INDEXED BY asks_intake WHERE intake_id=? ORDER BY rowid LIMIT 129',task.id);
+    if(raw.length>128)return {code:'ask_close_observation_limited',detail:{observation_limited:true}};
+    const asks=raw.filter(a=>['mapped','dropped_after_done','closed_unverified'].includes(a.state)).flatMap(a=>{
+      const message=this.rows('SELECT t_id FROM ask_messages WHERE id=?',a.message_id)[0];return message?[{...a,...message}]:[];
+    });
     const missing = asks.filter(a => !this.provenByNotes(a, task));
     if (!missing.length) return null;
     return { code: 'asks_unverified', detail: {
@@ -518,10 +557,7 @@ export class AskLedger {
   private reconcile(now: number): Obj[] {
     const byId = new Map<string, Obj | undefined>();
     const dropped: Obj[] = [];
-    const live = this.rows(`SELECT a.*,m.t_id,m.source,m.received_at FROM asks a JOIN ask_messages m ON m.id=a.message_id
-      WHERE a.state='mapped' AND a.intake_id IS NOT NULL ORDER BY a.updated_at LIMIT ${LIMITS.perTick}`)
-      .concat(this.rows(`SELECT a.*,m.t_id,m.source,m.received_at FROM asks a JOIN ask_messages m ON m.id=a.message_id
-      WHERE a.state='dropped_after_done' AND a.intake_id IS NOT NULL AND a.dropped_subject IS NOT 'backfill' ORDER BY a.updated_at DESC LIMIT ${LIMITS.perTick}`));
+    const live=this.activeAsks(['mapped','dropped_after_done']).filter(a=>a.intake_id!==null && (a.state!=='dropped_after_done'||a.dropped_subject!=='backfill'));
     for (const a of live) {
       if (!byId.has(a.intake_id)) byId.set(a.intake_id, this.intake.statusTaskById({ admin: true }, a.intake_id));
       const t = byId.get(a.intake_id);
@@ -551,20 +587,25 @@ export class AskLedger {
   private async clearBatches(kind: string, table: string, column: string, stillOpen: string) {
     if (!this.hooks.notify) return;
     // Index range over live '<kind>-<ts>' subjects; resolved ones were renamed out of it.
-    const subjects = this.rows(`SELECT DISTINCT ${column} AS s FROM ${table} WHERE ${column}>=? AND ${column}<? LIMIT ${LIMITS.perTick}`, kind + '-', kind + '.').map(r => r.s);
-    for (const s of subjects) {
-      if (this.rows(`SELECT 1 FROM ${table} WHERE ${column}=? AND ${stillOpen} LIMIT 1`, s).length) continue;
-      await this.hooks.notify(kind, s, null);
-      this.sql.exec(`UPDATE ${table} SET ${column}=? WHERE ${column}=?`, 'resolved:' + s, s);
+    const observation=boundedBatchSubjects(this.sql,kind as AskBatchKind);
+    if(observation.limited)fail('ask_batch_observation_limited',503);
+    for(const subject of observation.subjects) {
+      const members=batchCompleteStillOpen(this.sql,kind as AskBatchKind,subject);
+      if(members.stillOpen===true)continue;
+      if(members.stillOpen===null)fail('ask_batch_members_observation_limited',503);
+      await this.hooks.notify(kind,subject,null);
+      this.sql.exec(`UPDATE ${table} SET ${column}=? WHERE rowid IN(SELECT rowid FROM ${table} WHERE ${column}=? ORDER BY rowid LIMIT 128)`,'resolved:'+subject,subject);
     }
   }
   /** Runs inside the IntakeWatchdog tick (30 min) over bounded ranges; `full` (the
    * operator's hub asks check) also auto-maps against closed intakes, for history. */
   async tick(now = this.now(), opts: { full?: boolean } = {}): Promise<Obj> {
+    this.maintenancePending=false;
     const split = await this.splitPending(now);
     const mapped = this.tx(() => this.autoMap(() => opts.full ? this.tasks() : this.openTasks(), now));
     // Grace is measured from the message, so a late split does not hide an old ask.
-    this.sql.exec(`UPDATE asks SET state='unmapped',updated_at=? WHERE state='pending' AND (SELECT received_at FROM ask_messages WHERE id=asks.message_id)<=?`, now, now - ASK_GRACE_MS);
+    for(const ask of this.activeAsks(['pending']))if(ask.received_at<=now-ASK_GRACE_MS)
+      this.sql.exec("UPDATE asks SET state='unmapped',updated_at=? WHERE id=? AND state='pending'",now,ask.id);
     const dropped = this.tx(() => this.reconcile(now));
     let reopened = 0;
     for (const d of dropped) {
@@ -578,7 +619,7 @@ export class AskLedger {
       if (r.ok) { reopened++; d.outcome = 'reopened'; this.sql.exec(`UPDATE asks SET state='mapped',updated_at=? WHERE id=?`, now, d.id); }
       else d.outcome = 'reopen failed: ' + String((r as Obj).error ?? 'unknown');
     }
-    const unmapped = this.rows(`SELECT a.*,m.t_id,m.agent_id,m.agent_name FROM asks a JOIN ask_messages m ON m.id=a.message_id WHERE a.state='unmapped' AND a.alert_subject IS NULL AND m.source<>'backfill' ORDER BY a.created_at LIMIT ${LIMITS.perTick}`);
+    const unmapped=this.activeAsks(['unmapped']).filter(a=>a.alert_subject===null&&a.source!=='backfill');
     const unmappedAlerts = await this.alertBatch('asks_unmapped', unmapped,
       a => `${a.id.slice(0, 8)} ${a.agent_name || a.agent_id} ${a.t_id}: ${oneLine(a.text)}`,
       `${unmapped.length} ask(s) from Alexey are not mapped to any intake AC line after 30 min. Map: hub asks map <ask> --intake <id> [--ac N]; not work: hub asks dismiss <ask> --reason TEXT. View: https://hub.dtcdev.click/asks.html`,
@@ -596,33 +637,40 @@ export class AskLedger {
       const old = a.dropped_subject;
       if (old && old !== 'backfill' && !old.startsWith('resolved:') && !this.rows('SELECT 1 FROM asks WHERE dropped_subject=? LIMIT 1', old).length) await this.hooks.notify?.('asks_dropped', old, null);
     }
-    const gaps = this.rows(`SELECT * FROM ask_gaps WHERE resolved_at IS NULL AND alert_subject IS NULL ORDER BY detected_at LIMIT ${LIMITS.perTick}`);
+    const gapSource=this.rows('SELECT * FROM ask_gaps INDEXED BY ask_gaps_open WHERE resolved_at IS NULL ORDER BY detected_at,rowid LIMIT 129');
+    if(gapSource.length>128)this.maintenancePending=true;
+    const gaps=gapSource.slice(0,128).filter(g=>g.alert_subject===null);
     const gapAlerts = await this.alertBatch('asks_unrecorded', gaps,
       g => `${g.scope === '*' ? 'all agents' : g.scope}: ${g.from_seq === g.to_seq ? `t${g.from_seq}u` : `t${g.from_seq}u–t${g.to_seq}u`} (${g.to_seq - g.from_seq + 1} ref(s), ${g.kind})`,
       `unrecorded_messages: ${gaps.length} range(s) of Alexey message refs never reached the ask ledger.`,
-      s => { for (const g of gaps) this.sql.exec('UPDATE ask_gaps SET alert_subject=? WHERE scope=? AND from_seq=? AND to_seq=?', s, g.scope, g.from_seq, g.to_seq); }, now);
+      s => { for (const g of gaps) {this.sql.exec('UPDATE ask_gaps SET alert_subject=? WHERE scope=? AND from_seq=? AND to_seq=?',s,g.scope,g.from_seq,g.to_seq);g.alert_subject=s;} },now);
     await this.clearBatches('asks_unmapped', 'asks', 'alert_subject', "state='unmapped'");
     // Resolved once every ask in the batch is proven, dismissed or otherwise off the open path.
     await this.clearBatches('asks_dropped', 'asks', 'dropped_subject', "state IN ('dropped_after_done','mapped')");
     // Window overflow and rejected messages are one-time losses: alerted once, then they age out after a day.
-    this.sql.exec(`UPDATE ask_gaps SET resolved_at=? WHERE kind<>'hole' AND resolved_at IS NULL AND alert_subject IS NOT NULL AND detected_at<=?`, now, now - DAY);
+    for(const gap of gapSource.slice(0,128))if(gap.kind!=='hole'&&gap.alert_subject!==null&&gap.detected_at<=now-DAY)
+      this.sql.exec('UPDATE ask_gaps SET resolved_at=? WHERE scope=? AND from_seq=? AND to_seq=?',now,gap.scope,gap.from_seq,gap.to_seq);
     await this.clearBatches('asks_unrecorded', 'ask_gaps', 'alert_subject', 'resolved_at IS NULL');
     const silent = await this.checkSources(now);
     // An agent that was alerted silent and has since recorded messages is no longer silent.
-    for (const a of this.rows(`SELECT agent_id,silent_alert_day FROM ask_agents WHERE silent_alert_day IS NOT NULL AND last_any_at>=?`, now - DAY)) {
+    const agentSource=this.rows('SELECT agent_id,silent_alert_day,last_any_at FROM ask_agents ORDER BY agent_id LIMIT 129');
+    if(agentSource.length>128)this.maintenancePending=true;
+    for(const a of agentSource.slice(0,128).filter(a=>a.silent_alert_day!==null&&a.last_any_at>=now-DAY)) {
       await this.hooks.notify?.('asks_agent_silent', a.agent_id + '-' + a.silent_alert_day, null);
       this.sql.exec('UPDATE ask_agents SET silent_alert_day=NULL WHERE agent_id=?', a.agent_id);
     }
     const daily = await this.daily(now);
     const result = { state: 'checked', checked_at: now, split, mapped, reopened, unmapped_alerts: unmappedAlerts, dropped_alerts: droppedAlerts,
-      gap_alerts: gapAlerts, silent_sources: silent, ...daily, counts: this.counts() };
+      gap_alerts: gapAlerts, silent_sources: silent, ...daily, counts: this.counts(),observation_pending:this.maintenancePending };
     this.sql.exec('UPDATE ask_meta SET last_tick=?,last_result=? WHERE id=1', now, JSON.stringify(result));
     return result;
   }
   /** Watcher liveness: silent >2h while its host is otherwise alive → one alert; next ingest resolves. */
   private async checkSources(now: number): Promise<number> {
     let silent = 0;
-    for (const s of this.rows('SELECT * FROM ask_sources')) {
+    const source=this.rows('SELECT * FROM ask_sources ORDER BY machine_id,source LIMIT 129');
+    if(source.length>128)this.maintenancePending=true;
+    for(const s of source.slice(0,128)) {
       const quiet = now - s.last_ingest_at > SOURCE_SILENT_MS && (this.hooks.hostFresh?.(s.machine_id) ?? false);
       if (quiet) silent++;
       if (!this.hooks.notify || !!s.alerted === quiet) continue;
@@ -637,8 +685,10 @@ export class AskLedger {
   private async daily(now: number): Promise<Obj> {
     const day = new Date(now).toISOString().slice(0, 10);
     if (this.meta().daily_day === day) return {};
-    this.sql.exec('UPDATE ask_meta SET daily_day=? WHERE id=1', day);
-    const quiet = this.rows(`SELECT * FROM ask_agents WHERE window_changed_at>=? AND COALESCE(last_any_at,0)<? AND silent_alert_day IS NULL`, now - DAY, now - DAY);
+    const source=this.rows('SELECT * FROM ask_agents ORDER BY agent_id LIMIT 129');
+    if(source.length>128)this.maintenancePending=true;
+    else this.sql.exec('UPDATE ask_meta SET daily_day=? WHERE id=1',day);
+    const quiet=source.slice(0,128).filter(a=>a.window_changed_at>=now-DAY&&(a.last_any_at??0)<now-DAY&&a.silent_alert_day===null);
     for (const a of quiet) {
       await this.hooks.notify?.('asks_agent_silent', a.agent_id + '-' + day,
         `Agent ${a.agent_name || a.agent_id} was active in the last 24h (chat window advanced) but zero messages were recorded for it, so Alexey's asks to it are not reaching the ledger.`);
@@ -649,20 +699,27 @@ export class AskLedger {
   counts(): Obj {
     const c: Obj = Object.fromEntries(ASK_STATES.map(s => [s, 0]));
     let messages = 0;
-    for (const r of this.rows('SELECT k,n FROM ask_counts')) {
+    for (const r of this.rows(`SELECT k,n FROM ask_counts WHERE k IN (${ASK_STATES.map(()=>'?').join(',')},?)`,...ASK_STATES.map(state=>'state:'+state),'user_messages')) {
       if (r.k === 'user_messages') messages = r.n;
       else if (r.k.startsWith('state:')) c[r.k.slice(6)] = r.n;
     }
-    // Both partial indexes hold only open gaps / conflicted messages.
-    const gaps = this.rows('SELECT COUNT(*) AS n FROM ask_gaps WHERE resolved_at IS NULL')[0].n;
-    const conflicts = this.rows('SELECT COUNT(*) AS n FROM ask_messages WHERE conflict_count>0')[0].n;
-    return { ...c, open_gaps: gaps, messages, conflicts };
+    // The deployed partial indexes bound the raw matching population. COUNT
+    // still walks every matching entry, so an incident cohort must never be
+    // aggregated just to render a status/digest. The sentinel proves partial.
+    const gaps=this.rows('SELECT 1 FROM ask_gaps INDEXED BY ask_gaps_open WHERE resolved_at IS NULL LIMIT 129').length;
+    const conflicts=this.rows('SELECT 1 FROM ask_messages INDEXED BY ask_messages_conflicts WHERE conflict_count>0 LIMIT 129').length;
+    return { ...c, open_gaps:gaps>128?null:gaps, messages, conflicts:conflicts>128?null:conflicts,
+      open_gaps_lower_bound:gaps, conflicts_lower_bound:conflicts,
+      open_gaps_observation_limited:gaps>128, conflicts_observation_limited:conflicts>128,
+      counts_observation_limited:gaps>128||conflicts>128 };
   }
   /** Status/digest line; null when the ledger is empty. */
   summaryLine(): string | null {
     const c = this.counts();
     if (!c.messages) return null;
-    return `Asks: ${c.unmapped} unmapped, ${c.dropped_after_done} dropped after done, ${c.pending} pending, ${c.mapped} mapped, ${c.verified} verified; ${c.open_gaps} unrecorded range(s); ${c.messages} message(s) recorded${c.conflicts ? `; ${c.conflicts} message(s) re-posted with different text` : ''}`;
+    const gaps=c.open_gaps===null?`at least ${c.open_gaps_lower_bound} (count limited)`:String(c.open_gaps);
+    const conflicts=c.conflicts===null?`at least ${c.conflicts_lower_bound} (count limited)`:String(c.conflicts);
+    return `Asks: ${c.unmapped} unmapped, ${c.dropped_after_done} dropped after done, ${c.pending} pending, ${c.mapped} mapped, ${c.verified} verified; ${gaps} unrecorded range(s); ${c.messages} message(s) recorded${c.conflicts_lower_bound ? `; ${conflicts} message(s) re-posted with different text` : ''}`;
   }
 
   /** AC2-AC4 (f530f981): Incremental reconciliation pass over Alexey's own messages since
@@ -675,33 +732,20 @@ export class AskLedger {
     const m = this.meta();
     const fromCursor = opts.cursor != null && Number.isInteger(opts.cursor) && opts.cursor >= 0 ? opts.cursor : Number(m.reconcile_cursor ?? 0);
     const limit = Math.min(200, Math.max(1, opts.maxMessages ?? 100));
-    const sourceCond = opts.includeBackfill ? '1=1' : "m.source<>'backfill'";
-    const msgRows = this.rows(`SELECT m.rowid AS cursor, m.* FROM ask_messages m
-      WHERE m.rowid>? AND m.role='user' AND ${sourceCond} ORDER BY m.rowid ASC LIMIT ${limit}`, fromCursor);
-    if (!msgRows.length) {
-      return { state: 'no_new_messages', from_cursor: fromCursor, to_cursor: fromCursor, scanned_messages: 0, found_asks: 0,
-        mapped: 0, appended: 0, created: 0, created_ids: [], appended_ids: [], mapped_ids: [], report: null };
+    const observation=boundedReconcilePage(this.sql,fromCursor,!!opts.includeBackfill,limit);
+    if(observation.limited)fail('ask_reconcile_parts_observation_limited',503);
+    const msgRows=observation.messages,toCursor=observation.toCursor,askRows=observation.asks;
+    if(!msgRows.length){
+      if(toCursor>fromCursor)this.reconcileMeta(toCursor);
+      return {state:observation.observationPending?'observation_pending':'no_new_messages',from_cursor:fromCursor,to_cursor:toCursor,scanned_messages:0,
+        source_rows_scanned:observation.sourceRowsScanned,observation_pending:observation.observationPending,found_asks:0,mapped:0,appended:0,created:0,created_ids:[],appended_ids:[],mapped_ids:[],report:null};
     }
-    const toCursor = msgRows[msgRows.length - 1].cursor;
-    const msgIds = msgRows.map(r => r.id);
-    const askRows = this.rows(`SELECT a.*, m.rowid AS cursor, m.agent_id, m.agent_name, m.t_id, m.ts, m.source, m.intake_hint, m.received_at
-      FROM asks a JOIN ask_messages m ON m.id=a.message_id
-      WHERE a.message_id IN (${msgIds.map(() => '?').join(',')}) AND a.state <> 'not_an_ask'
-      ORDER BY m.rowid ASC, a.part ASC`, ...msgIds);
     let MappedCount = 0, AppendedCount = 0, CreatedCount = 0;
     const createdIds: string[] = [], appendedIds: string[] = [], mappedIds: string[] = [];
     const actions: string[] = [];
     if (askRows.length) {
       // Load open, done and archived intakes from the summary + task store for matching.
-      const summaries = this.intake.statusTaskSummaries({ admin: true });
-      const allIds = summaries.map(s => s.id);
-      const tasks: Obj[] = [];
-      for (let i = 0; i < allIds.length; i += 100) {
-        const chunk = allIds.slice(i, i + 100);
-        for (const r of this.rows(`SELECT data FROM intake_tasks WHERE id IN (${chunk.map(() => '?').join(',')})`, ...chunk)) {
-          try { tasks.push(JSON.parse(r.data)); } catch { /* skip corrupt */ }
-        }
-      }
+      const tasks=this.tasks();
       const byRef = new Map<string, Obj[]>();
       const taskWords = new Map<string, { task: Obj; words: Set<string>; blob: string }>();
       for (const t of tasks) {
@@ -851,18 +895,19 @@ export class AskLedger {
       found_asks: askRows.length, mapped: MappedCount, appended: AppendedCount, created: CreatedCount,
       created_ids: createdIds, appended_ids: appendedIds, mapped_ids: mappedIds, report: reportText,
     };
-    this.sql.exec(`INSERT INTO ask_reconcile_runs(id,ran_at,from_cursor,to_cursor,scanned_messages,found_asks,mapped,appended,created,created_ids,appended_ids,mapped_ids,report)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, runId, now, fromCursor, toCursor, msgRows.length, askRows.length, MappedCount, AppendedCount, CreatedCount,
-      JSON.stringify(createdIds), JSON.stringify(appendedIds), JSON.stringify(mappedIds), reportText);
-    this.sql.exec('UPDATE ask_meta SET reconcile_cursor=MAX(reconcile_cursor,?),last_reconcile_run=?,last_reconcile_at=? WHERE id=1',
-      toCursor, JSON.stringify(runRow), now);
+    this.tx(()=>{
+      this.sql.exec(`INSERT INTO ask_reconcile_runs(id,ran_at,from_cursor,to_cursor,scanned_messages,found_asks,mapped,appended,created,created_ids,appended_ids,mapped_ids,report)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, runId, now, fromCursor, toCursor, msgRows.length, askRows.length, MappedCount, AppendedCount, CreatedCount,
+        JSON.stringify(createdIds), JSON.stringify(appendedIds), JSON.stringify(mappedIds), reportText);
+      this.reconcileMeta(toCursor,{last_reconcile_run:JSON.stringify(runRow),last_reconcile_at:now});
+    });
     if (m.reconcile_intake && (askRows.length > 0 || CreatedCount > 0 || AppendedCount > 0)) {
       this.intake.serviceRecordEvent(m.reconcile_intake, {
         event: { kind: 'note', text: reportText, actor: 'hub:service:ask-reconciler', sourceType: 'schedule', sourceRef: `reconcile-run:${runId}`, sourceTimestamp: new Date(now).toISOString(), intakeKey: `reconcile-report-${fromCursor}-${toCursor}`, authority: 'operator_record' },
         now,
       });
     }
-    return { state: 'reconciled', ...runRow };
+    return {state:'reconciled',...runRow,source_rows_scanned:observation.sourceRowsScanned,observation_pending:observation.observationPending};
   }
 
   /** A10 / f530f981: Hub-scheduled reconciler. Runs on new messages after 2 min debounce,
@@ -876,9 +921,15 @@ export class AskLedger {
       const st = this.hooks.sessionState?.(m.reconcile_session) ?? null;
       if (st && ACTIVE_SESSION.has(st)) return { state: 'running', session_id: m.reconcile_session };
     }
-    const waiting = this.rows(`SELECT COUNT(*) AS n FROM asks a JOIN ask_messages m ON m.id=a.message_id WHERE a.state IN ('pending','unmapped') AND m.source<>'backfill'`)[0].n;
-    const maxRowid = this.rows(`SELECT COALESCE(MAX(rowid),0) AS r FROM ask_messages WHERE role='user' AND source<>'backfill'`)[0]?.r ?? 0;
-    const cursorDue = maxRowid > (m.reconcile_cursor ?? 0);
+    let waiting=0;
+    for(const state of ['pending','unmapped']) {
+      const raw=this.rows('SELECT message_id FROM asks INDEXED BY asks_state WHERE state=? ORDER BY created_at,rowid LIMIT 129',state);
+      if(raw.length>128)fail('ask_reconcile_waiting_observation_limited',503);
+      for(const ask of raw){const message=this.rows('SELECT source FROM ask_messages WHERE id=?',ask.message_id)[0];if(message&&message.source!=='backfill')waiting++;}
+    }
+    const recent=this.rows('SELECT role,source FROM ask_messages WHERE rowid>? ORDER BY rowid DESC LIMIT 129',m.reconcile_cursor??0);
+    const cursorDue=recent.some(row=>row.role==='user'&&row.source!=='backfill');
+    if(!cursorDue&&recent.length>128)fail('ask_reconcile_cursor_observation_limited',503);
     const dailyDue = cursorDue && (m.last_reconcile_at == null || now - m.last_reconcile_at >= RECONCILE_DAILY_MS);
     if (!waiting && !dailyDue) return { state: 'idle' };
     const newBatch = m.last_user_batch_at != null && m.last_user_batch_at > (m.reconcile_batch_at ?? 0);
@@ -897,42 +948,72 @@ export class AskLedger {
     return id ? { state: 'started', session_id: id, asks: waiting, pass: passResult }
       : { state: 'refused', status: r.status, error: String(r.body?.error ?? 'unknown').slice(0, 128), pass: passResult };
   }
-  /** A13: append-only JSONL export in arrival order; `after` is the last row cursor. */
-  jsonl(q: URLSearchParams): string {
-    const where: string[] = ['rowid>?'], args: any[] = [Number(q.get('after')) || 0];
-    if (q.get('since')) { where.push('received_at>=?'); args.push(Number(q.get('since')) || 0); }
-    if (q.get('agent_id')) { where.push('agent_id=?'); args.push(q.get('agent_id')); }
-    if (q.get('role')) { where.push('role=?'); args.push(q.get('role')); }
-    if (q.get('q')) { where.push("instr(lower(COALESCE(text,'')),lower(?))>0"); args.push(String(q.get('q')).slice(0, 200)); }
-    const limit = Math.min(5000, Math.max(1, Number(q.get('limit')) || 1000));
-    return this.rows(`SELECT rowid AS cursor,* FROM ask_messages WHERE ${where.join(' AND ')} ORDER BY rowid LIMIT ${limit}`, ...args).map(r => JSON.stringify({
-      cursor: r.cursor, agent_id: r.agent_id, agent_name: r.agent_name, msg_id: r.t_id, t_id: 't' + r.seq, role: r.role, kind: r.kind,
-      ts_utc: r.ts == null ? null : new Date(r.ts).toISOString(), ts_berlin: r.ts == null ? null : berlin.format(new Date(r.ts)),
-      text: r.text, reply_to: r.reply_to, attachments: r.attachments ? JSON.parse(r.attachments) : [], source: r.source, received_at: r.received_at,
-    }) + '\n').join('');
+  private messageSourcePage(q:URLSearchParams,ascending:boolean):Obj {
+    const field=ascending?'after':'cursor',raw=q.get(field),position=raw===null?(ascending?0:null):Number(raw);
+    if(raw!==null&&(!/^-?\d+$/.test(raw)||!Number.isSafeInteger(position)))fail('invalid_cursor');
+    const source=this.rows(`SELECT rowid AS cursor,* FROM ask_messages ${position===null?'':`WHERE rowid${ascending?'>':'<'}?`}
+      ORDER BY rowid ${ascending?'ASC':'DESC'} LIMIT 129`,...(position===null?[]:[position]));
+    const limit=Math.min(128,Math.max(1,Number(q.get('limit'))||(ascending?1000:100)));
+    const rows:Obj[]=[];let scanned=0,last:number|null=null;
+    for(const row of source.slice(0,128)) {
+      scanned++;last=row.cursor;
+      if(q.get('agent_id')&&row.agent_id!==q.get('agent_id'))continue;
+      if(q.get('role')&&row.role!==q.get('role'))continue;
+      if(q.get('since')&&(row[ascending?'received_at':'ts']==null||Number(row[ascending?'received_at':'ts'])<(Number(q.get('since'))||0)))continue;
+      if(q.get('q')&&!String(row.text??'').toLowerCase().includes(String(q.get('q')).slice(0,200).toLowerCase()))continue;
+      rows.push(row);if(rows.length>=limit)break;
+    }
+    const pending=source.length>128||scanned<Math.min(source.length,128);
+    return {rows,next_cursor:pending&&last!==null?String(last):null,observation_pending:pending,source_rows_scanned:scanned,
+      order:ascending?'message_arrival_asc':'message_arrival_desc'};
   }
+  /** Append-only JSONL records stay unchanged; HTTP headers carry progress
+   * across empty filtered raw pages, rather than hiding partial observations. */
+  jsonlPage(q:URLSearchParams):Obj {
+    const page=this.messageSourcePage(q,true);
+    return {...page,body:page.rows.map((r:Obj)=>JSON.stringify({
+      cursor:r.cursor,agent_id:r.agent_id,agent_name:r.agent_name,msg_id:r.t_id,t_id:'t'+r.seq,role:r.role,kind:r.kind,
+      ts_utc:r.ts==null?null:new Date(r.ts).toISOString(),ts_berlin:r.ts==null?null:berlin.format(new Date(r.ts)),
+      text:r.text,reply_to:r.reply_to,attachments:r.attachments?JSON.parse(r.attachments):[],source:r.source,received_at:r.received_at,
+    })+'\n').join('')};
+  }
+  jsonl(q:URLSearchParams):string {return this.jsonlPage(q).body;}
   list(q: URLSearchParams): Obj {
-    const where: string[] = [], args: any[] = [];
-    const state = q.get('state');
-    if (state) { if (!ASK_STATES.includes(state)) fail('invalid_state'); where.push('a.state=?'); args.push(state); }
-    if (q.get('agent_id')) { where.push('m.agent_id=?'); args.push(q.get('agent_id')); }
-    if (q.get('intake')) { where.push('a.intake_id LIKE ?'); args.push(q.get('intake') + '%'); }
-    const limit = Math.min(LIMITS.list, Math.max(1, Number(q.get('limit')) || 100));
-    const asks = this.rows(`SELECT a.id,a.part,a.text,a.state,a.intake_id,a.ac_line,a.ac_text,a.match,a.verified_by,a.evidence,a.actor,a.created_at,a.updated_at,
-      m.agent_id,m.agent_name,m.t_id,m.ts,m.source,m.received_at,m.id AS message_id FROM asks a JOIN ask_messages m ON m.id=a.message_id
-      ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY m.ts DESC,a.part LIMIT ${limit}`, ...args);
-    return { asks, counts: this.counts(), last_tick: this.meta().last_tick };
+    const state=q.get('state');if(state&&!ASK_STATES.includes(state))fail('invalid_state');
+    const rawCursor=q.get('cursor'),before=rawCursor===null?null:Number(rawCursor);
+    if(rawCursor!==null&&(!/^-?\d+$/.test(rawCursor)||!Number.isSafeInteger(before)))fail('invalid_cursor');
+    const limit=Math.min(LIMITS.list,Math.max(1,Number(q.get('limit'))||100));
+    const intake=q.get('intake');
+    // A raw ask PK page bounds BOTH the join and sparse participant/state
+    // filters. Timestamp ordering across retained message/ask tables cannot
+    // use an existing index; expose the actual stable arrival order instead.
+    const source=this.rows(`SELECT rowid AS source_cursor,id,message_id,part,text,state,intake_id,ac_line,ac_text,match,verified_by,evidence,actor,created_at,updated_at,
+      ${intake?'intake_id LIKE ?':'1'} AS intake_match FROM asks
+      ${before===null?'':'WHERE rowid<?'} ORDER BY rowid DESC LIMIT 129`,...(intake?[intake+'%']:[]),...(before===null?[]:[before]));
+    const asks:Obj[]=[];let scanned=0,last:number|null=null;
+    for(const row of source.slice(0,128)) {
+      scanned++;last=row.source_cursor;
+      if((state&&row.state!==state)||!row.intake_match)continue;
+      const message=this.rows('SELECT agent_id,agent_name,t_id,ts,source,received_at FROM ask_messages WHERE id=?',row.message_id)[0];
+      if(!message||(q.get('agent_id')&&message.agent_id!==q.get('agent_id')))continue;
+      const {source_cursor,intake_match,...ask}=row;
+      asks.push({...ask,...message});if(asks.length>=limit)break;
+    }
+    const pending=source.length>128||scanned<Math.min(source.length,128);
+    return {asks,counts:this.counts(),last_tick:this.meta().last_tick,
+      next_cursor:pending&&last!==null?String(last):null,observation_pending:pending,order:'ask_arrival_desc',source_rows_scanned:scanned};
   }
   messages(q: URLSearchParams): Obj {
-    const where: string[] = [], args: any[] = [];
-    if (q.get('agent_id')) { where.push('agent_id=?'); args.push(q.get('agent_id')); }
-    if (q.get('since')) { where.push('ts>=?'); args.push(Number(q.get('since')) || 0); }
-    const limit = Math.min(LIMITS.list, Math.max(1, Number(q.get('limit')) || 100));
-    if (q.get('role')) { where.push('role=?'); args.push(q.get('role')); }
-    const messages = this.rows(`SELECT m.agent_id,m.agent_name,m.t_id AS msg_id,m.seq,m.role,m.kind,m.ts,m.text,m.reply_to,m.attachments,m.source,m.received_at,m.conflict_count,
-      (SELECT GROUP_CONCAT(state) FROM asks WHERE message_id=m.id) AS states FROM ask_messages m
-      ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY m.ts DESC LIMIT ${limit}`, ...args);
-    return { messages };
+    const page=this.messageSourcePage(q,false);let remaining=128;
+    const messages=page.rows.map((row:Obj)=>{
+      const states=remaining>0?this.rows('SELECT state FROM asks WHERE message_id=? ORDER BY part LIMIT ?',row.id,remaining+1):null;
+      const limited=states===null||states.length>remaining;
+      if(states)remaining=Math.max(0,remaining-states.length);
+      const {agent_id,agent_name,seq,role,kind,ts,text,reply_to,attachments,source,received_at,conflict_count}=row;
+      return {agent_id,agent_name,msg_id:row.t_id,seq,role,kind,ts,text,reply_to,attachments,source,received_at,conflict_count,
+        states:limited?null:states!.length?states!.map(r=>r.state).join(','):null,states_observation_limited:limited};
+    });
+    const {rows,...observation}=page;return {messages,...observation};
   }
   cursor(agentId: string | null): Obj {
     if (!agentId || !AGENT_ID.test(agentId)) fail('invalid_agent_id');
@@ -949,16 +1030,26 @@ export class AskLedger {
       appended_ids: JSON.parse(r.appended_ids || '[]'),
       mapped_ids: JSON.parse(r.mapped_ids || '[]'),
     }));
-    return { counts: this.counts(), meta: { gap_scope: m.gap_scope, last_tick: m.last_tick, last_result: JSON.parse(m.last_result || 'null'),
+    const sources=this.rows('SELECT machine_id,source,last_ingest_at,last_reason,alerted FROM ask_sources ORDER BY machine_id,source LIMIT 129');
+    const agents=this.rows('SELECT * FROM ask_agents ORDER BY agent_id LIMIT 129');
+    const gaps=this.rows('SELECT scope,from_seq,to_seq,kind,detected_at,resolved_at FROM ask_gaps ORDER BY rowid DESC LIMIT 129');
+    return { counts: this.counts(), observation_pending:sources.length>128||agents.length>128||gaps.length>100,
+      summary_observation_limited:{sources:sources.length>128,agents:agents.length>128,gaps:gaps.length>128},
+      meta: { gap_scope: m.gap_scope, last_tick: m.last_tick, last_result: JSON.parse(m.last_result || 'null'),
       reconcile: { intake: m.reconcile_intake, session_id: m.reconcile_session, started_at: m.reconcile_started_at,
         last_user_batch_at: m.last_user_batch_at, cursor: m.reconcile_cursor ?? 0, last_run_at: m.last_reconcile_at ?? null,
         last_run: JSON.parse(m.last_reconcile_run || 'null'), runs } },
-      sources: this.rows('SELECT machine_id,source,last_ingest_at,last_reason,alerted FROM ask_sources ORDER BY last_ingest_at DESC'),
-      agents: this.rows('SELECT * FROM ask_agents ORDER BY agent_id'),
-      gaps: this.rows('SELECT scope,from_seq,to_seq,kind,detected_at,resolved_at FROM ask_gaps ORDER BY detected_at DESC LIMIT 100') };
+      sources:sources.slice(0,128).sort((a,b)=>b.last_ingest_at-a.last_ingest_at),
+      agents:agents.slice(0,128),
+      gaps:gaps.slice(0,128).sort((a,b)=>b.detected_at-a.detected_at).slice(0,100) };
   }
   private ask(id: string): Obj {
-    const hits = this.rows('SELECT a.*,m.t_id FROM asks a JOIN ask_messages m ON m.id=a.message_id WHERE a.id=? OR (length(?)>=6 AND a.id LIKE ?)', id, id, id + '%');
+    let hits=this.rows('SELECT * FROM asks WHERE id=?',id);
+    if(!hits.length&&id.length>=6) {
+      const prefix=id.toLowerCase();
+      hits=this.rows('SELECT * FROM asks WHERE id>=? AND id<? ORDER BY id LIMIT 2',prefix,prefix+'\uffff');
+    }
+    hits=hits.flatMap(ask=>{const message=this.rows('SELECT t_id FROM ask_messages WHERE id=?',ask.message_id)[0];return message?[{...ask,...message}]:[];});
     if (hits.length !== 1) fail(hits.length ? 'ambiguous_ask' : 'ask_not_found', hits.length ? 409 : 404);
     return hits[0];
   }
@@ -1020,8 +1111,12 @@ export class AskLedger {
       // '/api/asks/list' and POST /api/asks/(map|dismiss|verify) with ask_id are the asks_read/asks_write MCP forms.
       if ((path === '/api/asks' || path === '/api/asks/list') && request.method === 'GET') return json(this.list(url.searchParams));
       if (path === '/api/asks/messages' && request.method === 'GET') return json(this.messages(url.searchParams));
-      if (path === '/api/asks/messages.jsonl' && request.method === 'GET')
-        return new Response(this.jsonl(url.searchParams), { headers: { 'Content-Type': 'application/x-ndjson; charset=utf-8', 'Cache-Control': 'private, no-store' } });
+      if (path === '/api/asks/messages.jsonl' && request.method === 'GET') {
+        const page=this.jsonlPage(url.searchParams);
+        return new Response(page.body,{headers:{'Content-Type':'application/x-ndjson; charset=utf-8','Cache-Control':'private, no-store',
+          'X-Hub-Asks-Observation-Pending':String(page.observation_pending),'X-Hub-Asks-Order':page.order,
+          ...(page.next_cursor?{'X-Hub-Asks-Cursor':page.next_cursor}:{})}});
+      }
       if (path === '/api/asks/summary' && request.method === 'GET') return json(this.summary());
       if (path === '/api/asks/settings' && request.method === 'POST') return json(this.settings(await body()));
       if (path === '/api/asks/check' && request.method === 'POST') return json(await this.tick(this.now(), { full: true }));

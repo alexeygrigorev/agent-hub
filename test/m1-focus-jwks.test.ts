@@ -1,4 +1,6 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { JwksCache } from '../src/auth/dtc';
+import {freshFixtureBudgetDay} from './helpers/fixture-budget';
+import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { createExecutionContext, waitOnExecutionContext } from 'cloudflare:test';
 import { doFetch, loginAndGetState, createHelpers, defaultEnv } from './m1-focus-setup';
 import { runInDurableObject } from 'cloudflare:test';
@@ -19,6 +21,7 @@ afterAll(() => {
 });
 
 describe('M1 Focus: JWKS', () => {
+  beforeEach(async()=>(runInDurableObject as any)(defaultEnv.HUB.get(defaultEnv.HUB.idFromName('hub')),async(h:any)=>{await freshFixtureBudgetDay(h);h.jwksCache=new JwksCache();}));
 
   it('JWKS: multiple unknownkids do not cause repeated refetch within cooldown', async () => {
     let fetchCount = 0;
@@ -72,7 +75,9 @@ describe('M1 Focus: JWKS', () => {
   it('JWKS: real key rotation after allowed cache expiry succeeds with new matching key', async () => {
     const { vi } = await import('vitest');
     
-    vi.useFakeTimers();
+    vi.useFakeTimers({toFake:['Date']});
+    const savedFetch=globalThis.fetch;
+    try {
     let fetchCount = 0;
     
     let currentKid = 'test-key-1';
@@ -87,7 +92,7 @@ describe('M1 Focus: JWKS', () => {
       return oF(i);
     };
 
-    vi.advanceTimersByTime(3600000);
+    vi.setSystemTime(Date.now()+3600000);
     
     let st = await loginAndGetState();
     let idt = await currentHelpers.signJwt({
@@ -108,7 +113,7 @@ describe('M1 Focus: JWKS', () => {
     currentKid = 'test-key-2';
     currentHelpers = newHelpers;
 
-    vi.advanceTimersByTime(3600000);
+    vi.setSystemTime(Date.now()+3600000);
 
     let st2 = await loginAndGetState();
     let idt2 = await newHelpers.signJwt({
@@ -125,8 +130,7 @@ describe('M1 Focus: JWKS', () => {
     let res2 = await doFetch(new Request(`http://example.com/auth/callback?code=fake&state=${st2.state}`, { headers: { 'Cookie': st2.loginCookie }, redirect: 'manual' }));
     expect(res2.status).toBe(302);
 
-    vi.useRealTimers();
-    globalThis.fetch = oF;
+    } finally { vi.useRealTimers(); globalThis.fetch = savedFetch; }
   });
 
   it('JWKS: SQLite serialized rows must not contain raw device/access/refresh tokens after positive pairing/rotation; debug route absent', async () => {

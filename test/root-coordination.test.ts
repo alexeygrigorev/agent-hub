@@ -176,7 +176,7 @@ describe('Root Coordination Acceptance Criteria (M4 / SPEC §8.1 / Issue 6 - Six
         pastHb, pastExp
       );
       sql.exec(
-        "INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor, holder_host_id, started_at, native_session, lease_epoch) VALUES ('job-stale-inc', 'root-run', 'root:stale', '{}', 'running', ?, ?, 'role:root', 'host-stale-inc', ?, 'sess-stale', 1)",
+        "INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor, holder_host_id, started_at, native_session, lease_epoch, claim_token_hash) VALUES ('job-stale-inc', 'root-run', 'root:stale', '{}', 'running', ?, ?, 'role:root', 'host-stale-inc', ?, 'sess-stale', 1, 'hash-stale')",
         pastHb, new Date(nowMs + 600000).toISOString(), pastHb
       );
       // Credential for incumbent

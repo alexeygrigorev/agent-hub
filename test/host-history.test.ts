@@ -1,3 +1,4 @@
+import { fixtureStatements,registerFixtureStatements } from './helpers/fixture-statements';
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { JobsService } from '../src/jobs';
@@ -10,6 +11,7 @@ const admin = { caller: { isAdmin: true, actor: 'test-admin' } };
 async function fixture(fn: (h: HostHistoryService, hub: Hub, clock: { t: number }) => any) {
   const e = env as unknown as Env;
   await runInDurableObject(e.HUB.get(e.HUB.idFromName('history-' + crypto.randomUUID())), async (hub: Hub) => {
+    registerFixtureStatements(hub);
     const clock = { t: NOW };
     const history = new HostHistoryService(hub.sql, hub.fleetService, () => clock.t);
     history.init(); await fn(history, hub, clock);
@@ -17,9 +19,9 @@ async function fixture(fn: (h: HostHistoryService, hub: Hub, clock: { t: number 
 }
 describe('resource history', () => {
   it('backfills surviving disk evidence immediately, preserving timestamps, source records and missing values', () => fixture((h, hub) => {
-    hub.sql.exec("INSERT INTO machines(id,name,hostname,registered_at) VALUES('host-a','host-a','host-a','2026-01-01T00:00:00Z')");
+    fixtureStatements(hub.sql).exec("INSERT INTO machines(id,name,hostname,registered_at) VALUES('host-a','host-a','host-a','2026-01-01T00:00:00Z')");
     const payload = JSON.stringify({ filesystems: [{ mount_point: '/', percent: 82 }, { mount_point: '/missing', error: 'unknown', percent: 0 }] });
-    for (const age of [2 * DAY, 60000]) hub.sql.exec('INSERT INTO disk_observations VALUES(?,?,?,?,?,?,?)', String(age), 'host-a', new Date(NOW - age).toISOString(), NOW - age, new Date(NOW).toISOString(), payload, 'host:test');
+    for (const age of [2 * DAY, 60000]) fixtureStatements(hub.sql).exec('INSERT INTO disk_observations VALUES(?,?,?,?,?,?,?)', String(age), 'host-a', new Date(NOW - age).toISOString(), NOW - age, new Date(NOW).toISOString(), payload, 'host:test');
     h.backfill(); h.backfill();
     const data = h.query('7d');
     expect(data.earliest_observation).toBe(new Date(NOW - 2 * DAY).toISOString());
@@ -27,25 +29,25 @@ describe('resource history', () => {
     expect(data.series[0].points.filter((p: any) => p.value !== null)).toHaveLength(2);
     expect(data.series[0].points.some((p: any) => p.value === null)).toBe(true);
     expect(data.series[0].points.filter((p: any) => p.value === 0)).toHaveLength(0);
-    expect(hub.sql.exec('SELECT COUNT(*) AS n FROM disk_observations').one().n).toBe(2);
+    expect(fixtureStatements(hub.sql).exec('SELECT COUNT(*) AS n FROM disk_observations').one().n).toBe(2);
   }));
   it('samples at most once a minute and persists across service recreation', () => fixture((h, hub, c) => {
-    hub.sql.exec("INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at,last_heartbeat) VALUES('a','a','a','2026-01-01T00:00:00Z',?,?)", new Date(NOW).toISOString(), JSON.stringify({ mem_avail_mb: 32768, launcher_resources: { active_mem_mb: 2048, observed_at: new Date(NOW).toISOString() } }));
+    fixtureStatements(hub.sql).exec("INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at,last_heartbeat) VALUES('a','a','a','2026-01-01T00:00:00Z',?,?)", new Date(NOW).toISOString(), JSON.stringify({ mem_avail_mb: 32768, launcher_resources: { active_mem_mb: 2048, observed_at: new Date(NOW).toISOString() } }));
     h.sample(); h.sample();
-    const n = Number(hub.sql.exec('SELECT COUNT(*) AS n FROM resource_history').one().n);
+    const n = Number(fixtureStatements(hub.sql).exec('SELECT COUNT(*) AS n FROM resource_history').one().n);
     c.t += 60000; h.sample();
-    expect(hub.sql.exec('SELECT payload_json FROM resource_history').toArray().flatMap((r:any)=>JSON.parse(r.payload_json)).filter((o:any)=>o.kind==='reservation').length).toBe(1); // cached heartbeat is not a new measurement
-    expect(hub.sql.exec('SELECT COUNT(*) AS n FROM resource_history').one().n).toBe(n + 1); // fresh session-state read
+    expect(fixtureStatements(hub.sql).exec('SELECT payload_json FROM resource_history').toArray().flatMap((r:any)=>JSON.parse(r.payload_json)).filter((o:any)=>o.kind==='reservation').length).toBe(1); // cached heartbeat is not a new measurement
+    expect(fixtureStatements(hub.sql).exec('SELECT COUNT(*) AS n FROM resource_history').one().n).toBe(n + 1); // fresh session-state read
     const restored = new HostHistoryService(hub.sql, hub.fleetService, () => c.t);
     expect(restored.query('1h').series.find(s => s.metric === 'reserved_gib').points.some((p: any) => p.value === 0)).toBe(true); // no ramp: resident caps are already in live MemAvailable
   }));
   it('compacts old observations, retains over 30 days and never alters source records', () => fixture((h, hub, c) => {
     for (const day of [0, 3, 8, 30, 31]) for (const minute of [0, 1, 2]) h.record('host', 'a', 'a', NOW - day * DAY - minute * 60000, { load1: minute }, 'test');
     h.compact();
-    expect(hub.sql.exec('SELECT COUNT(*) AS n FROM resource_history WHERE bucket_ms < ?', NOW - 30 * DAY).one().n).toBeGreaterThan(0);
+    expect(fixtureStatements(hub.sql).exec('SELECT COUNT(*) AS n FROM resource_history WHERE bucket_ms < ?', NOW - 30 * DAY).one().n).toBeGreaterThan(0);
     expect(h.query('1h').series[0].points.filter((p: any) => p.value !== null)).toHaveLength(3);
     c.t += 34 * DAY; h.compact();
-    expect(hub.sql.exec('SELECT COUNT(*) AS n FROM resource_history').one().n).toBe(0);
+    expect(fixtureStatements(hub.sql).exec('SELECT COUNT(*) AS n FROM resource_history').one().n).toBe(0);
   }));
   it('validates ranges and machine filtering and never serves unauthenticated history', () => fixture(async (h) => {
     h.record('host', 'a', 'a', NOW - 60000, { load1: 1 }, 'test');
@@ -71,10 +73,10 @@ describe('resource history', () => {
   }));
   it('counts running native observations rather than historical launch records and leaves stale-host running unknown', () => fixture((h, hub, c) => {
     const at = new Date(NOW).toISOString();
-    hub.sql.exec("INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at) VALUES('live','live','live',?,?)",at,at);
-    hub.sql.exec("INSERT INTO fleet_catalog_seen VALUES('live',?)",at);
-    hub.sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace) VALUES('live','n1','worker','running',?,'/repo')",at);
-    hub.sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace) VALUES('live','n2','old','unobserved',?,'/repo')",at);
+    fixtureStatements(hub.sql).exec("INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at) VALUES('live','live','live',?,?)",at,at);
+    fixtureStatements(hub.sql).exec("INSERT INTO fleet_catalog_seen VALUES('live',?)",at);
+    fixtureStatements(hub.sql).exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace) VALUES('live','n1','worker','running',?,'/repo')",at);
+    fixtureStatements(hub.sql).exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace) VALUES('live','n2','old','unobserved',?,'/repo')",at);
     h.sample();
     let s = h.query('1h').series.find(s => s.kind === 'sessions' && s.machine_id === 'live' && s.metric === 'running');
     expect(s.points.filter((p: any) => p.value !== null).map((p: any) => p.value)).toEqual([1]);
@@ -83,8 +85,12 @@ describe('resource history', () => {
     expect(s.points.at(-1).value).toBeNull();
   }));
   it('bounds history dimensions and range response, reporting omitted series explicitly', () => fixture((h, hub) => {
-    for (let i=0;i<520;i++) h.record('disk','/mount-'+i,'a',NOW,{percent:1},'test');
-    expect(hub.sql.exec('SELECT COUNT(*) AS n FROM resource_history_entities').one().n).toBe(512);
+    const observations=Array.from({length:512},(_,i)=>({kind:'disk',entity:'/mount-'+i,machine_id:'a',at:NOW,values:{percent:1},source:'synthetic-history'}));
+    for(const observation of observations)fixtureStatements(hub.sql).exec('INSERT INTO resource_history_entities VALUES(?,?,?,?)',observation.kind,observation.entity,observation.machine_id,NOW);
+    fixtureStatements(hub.sql).exec('INSERT INTO resource_history VALUES(?,?)',NOW,JSON.stringify(observations));
+    // Exercise the real guarded dimension refusal once; the retained population is synthetic.
+    h.record('disk','/overflow','a',NOW,{percent:1},'test');
+    expect(fixtureStatements(hub.sql).exec('SELECT COUNT(*) AS n FROM resource_history_entities').one().n).toBe(512);
     expect(h.query('1h').dimension_limit).toBe(true);
     expect(h.query('1h').truncated).toBe(true);
     expect(h.query('1h').series.length).toBe(256);
@@ -97,18 +103,19 @@ describe('resource history', () => {
     let alarm: number | null = null;
     const jobs = new JobsService(hub.sql, {storage:{setAlarm:(at:number)=>{alarm=at;}}} as any,
       {enableAlarms:true,alarmDeadline:()=>h.nextSampleAt()});
+    jobs.setClock(()=>new Date(c.t));
     (jobs as any).getAlarmTime = () => NOW + 1800000;
     (jobs as any).scheduleAlarm();
     expect(alarm).toBe(NOW + 60000);
     (jobs as any).getAlarmTime = () => NOW + 1000;
     (jobs as any).scheduleAlarm();
-    expect(alarm).toBe(NOW + 1000);
+    expect(alarm).toBe(c.t + 15000); // due work respects the minimum alarm delay
   }));
 
   it('preserves explicit unknown/error source observations as gaps instead of collector fallback zeroes', () => fixture((h, hub) => {
-    hub.sql.exec("INSERT INTO machines(id,name,hostname,registered_at) VALUES('a','a','a','2026-01-01T00:00:00Z')");
+    fixtureStatements(hub.sql).exec("INSERT INTO machines(id,name,hostname,registered_at) VALUES('a','a','a','2026-01-01T00:00:00Z')");
     const payload = {load:{load1:0,load15:0,status:'unknown'},memory:{used_bytes:0,available_bytes:0,total_bytes:0,status:'unknown',error:'meminfo_unavailable'}};
-    hub.sql.exec('INSERT INTO host_health_observations VALUES(?,?,?,?,?,?)','a',new Date(NOW).toISOString(),NOW,new Date(NOW).toISOString(),JSON.stringify(payload),'host:test');
+    fixtureStatements(hub.sql).exec('INSERT INTO host_health_observations VALUES(?,?,?,?,?,?)','a',new Date(NOW).toISOString(),NOW,new Date(NOW).toISOString(),JSON.stringify(payload),'host:test');
     h.backfill();
     const series = h.query('1h').series;
     expect(series.length).toBe(4);
@@ -121,8 +128,8 @@ describe('resource history', () => {
 
   it('joins historical aliases into one physical-host chart while preserving original rows', () => fixture((h, hub) => {
     const at = new Date(NOW).toISOString(), old = new Date(NOW-3*DAY).toISOString();
-    hub.sql.exec("INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at) VALUES('old','old','SAME',?,?)",old,old);
-    hub.sql.exec("INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at) VALUES('live','live','same',?,?)",old,at);
+    fixtureStatements(hub.sql).exec("INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at) VALUES('old','old','SAME',?,?)",old,old);
+    fixtureStatements(hub.sql).exec("INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at) VALUES('live','live','same',?,?)",old,at);
     h.record('host','old','old',NOW-2*DAY,{load1:1},'test');
     h.record('host','live','live',NOW,{load1:2},'test');
     const d=h.query('7d','live');
@@ -130,21 +137,21 @@ describe('resource history', () => {
     expect(d.series).toHaveLength(1);
     expect(d.series[0].machine_id).toBe('live');
     expect(d.series[0].points.filter((p:any)=>p.value!==null).map((p:any)=>p.value)).toEqual([1,2]);
-    expect(hub.sql.exec('SELECT payload_json FROM resource_history').toArray().flatMap((r:any)=>JSON.parse(r.payload_json)).filter((o:any)=>o.machine_id==='old').length).toBe(1);
+    expect(fixtureStatements(hub.sql).exec('SELECT payload_json FROM resource_history').toArray().flatMap((r:any)=>JSON.parse(r.payload_json)).filter((o:any)=>o.machine_id==='old').length).toBe(1);
   }));
 
   it('batches many account/host observations into one durable row per minute', () => fixture((h, hub) => {
     for(let i=0;i<100;i++) h.record('account','account-'+i,'',NOW,{used:i,max:100},'test');
     h.flush();
-    expect(hub.sql.exec('SELECT COUNT(*) AS n FROM resource_history').one().n).toBe(1);
-    const packet=JSON.parse(String(hub.sql.exec('SELECT payload_json FROM resource_history').one().payload_json));
+    expect(fixtureStatements(hub.sql).exec('SELECT COUNT(*) AS n FROM resource_history').one().n).toBe(1);
+    const packet=JSON.parse(String(fixtureStatements(hub.sql).exec('SELECT payload_json FROM resource_history').one().payload_json));
     expect(packet.length).toBe(100);
     expect(h.query('1h').series.length).toBe(200);
   }));
 
   it('does not invent a running-session zero from a fresh heartbeat without a fresh native census', () => fixture((h, hub) => {
     const at=new Date(NOW).toISOString();
-    hub.sql.exec("INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at) VALUES('new-host','new-host','new-host',?,?)",at,at);
+    fixtureStatements(hub.sql).exec("INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at) VALUES('new-host','new-host','new-host',?,?)",at,at);
     h.sample();
     const series=h.query('1h').series.find(s=>s.kind==='sessions' && s.metric==='running');
     expect(series.points.every((p:any)=>p.value===null)).toBe(true);
@@ -152,13 +159,13 @@ describe('resource history', () => {
 
   it('samples unchanged running rows with a fresh census and a batched in-memory heartbeat', () => fixture((h, hub, c) => {
     c.t=Date.now(); const id='batched-'+crypto.randomUUID(), at=new Date(c.t).toISOString(), old=new Date(c.t-86400000).toISOString();
-    hub.sql.exec('INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at) VALUES(?,?,?,?,?)',id,id,id,old,old);
-    hub.sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace) VALUES(?,'native','worker','running',?,'/repo')",id,old);
-    hub.sql.exec('INSERT INTO fleet_catalog_seen VALUES(?,?)',id,at);
+    fixtureStatements(hub.sql).exec('INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at) VALUES(?,?,?,?,?)',id,id,id,old,old);
+    fixtureStatements(hub.sql).exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace) VALUES(?,'native','worker','running',?,'/repo')",id,old);
+    fixtureStatements(hub.sql).exec('INSERT INTO fleet_catalog_seen VALUES(?,?)',id,at);
     updateHeartbeatMemoryOnly(id); h.sample();
     const series=h.query('1h').series.find(s=>s.kind==='sessions' && s.metric==='running');
     expect(series.points.filter((p:any)=>p.value!==null).map((p:any)=>p.value)).toEqual([1]);
-    expect(hub.sql.exec('SELECT observed_at FROM fleet_sessions WHERE machine_id=?',id).one().observed_at).toBe(old);
+    expect(fixtureStatements(hub.sql).exec('SELECT observed_at FROM fleet_sessions WHERE machine_id=?',id).one().observed_at).toBe(old);
   }));
 
   it('shows pre-census native-live counts as unknown without changing stored evidence or valid counted slots', () => fixture((h, hub) => {
@@ -171,13 +178,13 @@ describe('resource history', () => {
     expect(d.series.find(s=>s.metric==='failed').points.filter((p:any)=>p.value!==null).map((p:any)=>p.value)).toEqual([7,8]);
     expect(d.series.find(s=>s.metric==='native_live').points.filter((p:any)=>p.value!==null).map((p:any)=>p.value)).toEqual([2]);
     expect(d.series.find(s=>s.metric==='used').points.filter((p:any)=>p.value!==null).map((p:any)=>p.value)).toEqual([3,3]);
-    const old=JSON.parse(String(hub.sql.exec('SELECT payload_json FROM resource_history ORDER BY bucket_ms LIMIT 1').one().payload_json));
+    const old=JSON.parse(String(fixtureStatements(hub.sql).exec('SELECT payload_json FROM resource_history ORDER BY bucket_ms LIMIT 1').one().payload_json));
     expect(old[0].values.native_live).toBe(0);
     expect(old.find((o:any)=>o.kind==='sessions').values.running).toBe(4);
   }));
 
   it('prefers simultaneous canonical session counts over stale alias unknowns in either packet order', () => fixture((h, hub) => {
-    hub.sql.exec("INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at) VALUES('old','old','RMTHZ',?,?),('live','live','RMTHZ',?,?)",new Date(NOW-DAY).toISOString(),new Date(NOW-DAY).toISOString(),new Date(NOW).toISOString(),new Date(NOW).toISOString());
+    fixtureStatements(hub.sql).exec("INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at) VALUES('old','old','RMTHZ',?,?),('live','live','RMTHZ',?,?)",new Date(NOW-DAY).toISOString(),new Date(NOW-DAY).toISOString(),new Date(NOW).toISOString(),new Date(NOW).toISOString());
     h.record('sessions','fleet','live',NOW-60000,{running:3,failed:7},'census');
     h.record('sessions','fleet','old',NOW-60000,{running:null,failed:0},'census');
     h.record('sessions','fleet','old',NOW,{running:null,failed:0},'census');

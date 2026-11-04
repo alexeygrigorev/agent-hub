@@ -1,3 +1,4 @@
+import {fixtureSql} from './helpers/fixture-budget';
 import { describe, expect, it } from 'vitest';
 import { insertSessionObservation, observedHubTagMatches } from '../src/session-observation';
 import { env, runInDurableObject } from 'cloudflare:test';
@@ -37,7 +38,7 @@ async function fixture(fn: (f: any) => Promise<void>) {
       JSON.stringify({ last_progress_at: new Date(at - 3600000).toISOString(), goal_status: 'blocked' }));
     const view = async () => await (await sc.handle(new Request('https://hub/api/sessions/' + id), auth)).json() as any;
     const row = () => sql.exec('SELECT * FROM session_control_sessions WHERE id=?', id).toArray()[0];
-    await fn({ sql, clock, tx, sc, task, view, row });
+    await fn({ sql, seed:fixtureSql(hub,state), clock, tx, sc, task, view, row });
   });
 }
 
@@ -111,7 +112,7 @@ describe('idle with open acceptance criteria', () => {
     expect(intake(natives[0])).toBe(taskId);
     expect(intake(natives[1])).toBe(taskId);
     expect(intake(natives[2])).toBeUndefined();
-    expect(reads.filter(q=>q.includes('AS events FROM intake_tasks WHERE id>'))).toHaveLength(1);
+    expect(reads.filter(q=>q.includes('SELECT id,data FROM intake_tasks WHERE id>'))).toHaveLength(1);
     reads.length = 0;
     adoptObservedNativeSessions(counted as any,'idle-host',natives,at+1000);
     expect(reads.some(q=>q.includes('FROM intake_tasks'))).toBe(false);
@@ -151,20 +152,27 @@ describe('idle with open acceptance criteria', () => {
     adoptObservedNativeSessions(sql,'idle-host',[next],at+1000);
     expect(JSON.parse(sql.exec('SELECT request_json FROM session_control_sessions WHERE id=?',next.native_id).one().request_json).intake_task_id).toBe(taskId);
   }));
-  it('backfills large ledgers in bounded pages and observes late START notes without native changes', async () => fixture(async ({sql,task}: any) => {
+  it('backfills large ledgers in bounded pages and observes late START notes without native changes', async () => fixture(async ({sql,seed,task}: any) => {
     const native={native_id:crypto.randomUUID(),tag:'late-manual',workspace:'/late-manual',engine:'codex',created_at_ms:at-1000,phase:'running'};
     for (let n=0;n<120;n++) {
       const otherId=`history-${String(n).padStart(3,'0')}`;
-      sql.exec('INSERT INTO intake_tasks(id,data) VALUES(?,?)',otherId,JSON.stringify({...task,id:otherId,history:[]}));
+      seed.exec('INSERT INTO intake_tasks(id,data) VALUES(?,?)',otherId,JSON.stringify({...task,id:otherId,history:[]}));
     }
     const reads:string[]=[];
     const counted={exec(query:string,...args:any[]){reads.push(query);return sql.exec(query,...args);}};
     adoptObservedNativeSessions(counted as any,'idle-host',[native],at);
-    expect(sql.exec('SELECT count(*) AS n FROM session_observation_intakes').one().n).toBe(100);
+    expect(sql.exec('SELECT count(*) AS n FROM session_observation_intakes').one().n).toBe(16);
     expect(sql.exec('SELECT complete FROM session_observation_intake_meta').one().complete).toBe(0);
-    adoptObservedNativeSessions(counted as any,'idle-host',[native],at+1000);
+    for(let page=1;page<8;page++) {
+      const before=sql.exec('SELECT count(*) AS n FROM session_observation_intakes').one().n;
+      adoptObservedNativeSessions(counted as any,'idle-host',[native],at+1000);
+      const after=sql.exec('SELECT count(*) AS n FROM session_observation_intakes').one().n;
+      expect(after-before).toBeLessThanOrEqual(16);
+      if(page<7)expect(sql.exec('SELECT complete FROM session_observation_intake_meta').one().complete).toBe(0);
+    }
     expect(sql.exec('SELECT complete FROM session_observation_intake_meta').one().complete).toBe(1);
-    expect(reads.filter(q=>q.includes('AS events FROM intake_tasks WHERE id>'))).toHaveLength(2);
+    expect(sql.exec('SELECT count(*) AS n FROM session_observation_intakes').one().n).toBe(121);
+    expect(reads.filter(q=>q.includes('SELECT id,data FROM intake_tasks WHERE id>'))).toHaveLength(8);
     const revision=sql.exec('SELECT updated_at FROM session_control_sessions WHERE id=?',native.native_id).one().updated_at;
     task.history.push({kind:'note',text:`START: native ${native.native_id}`});
     sql.exec('UPDATE intake_tasks SET data=? WHERE id=?',JSON.stringify(task),taskId);

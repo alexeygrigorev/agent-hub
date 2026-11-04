@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS credentials (
   revoked_at TEXT,
   last_used_at TEXT,
   refresh_rotated_at TEXT,
-  approval_seq INTEGER -- R5 R2 enrollment authority inherited at issuance and preserved across refresh, NULL is pre-migration legacy
+  approval_seq INTEGER, -- R5 R2 enrollment authority inherited at issuance and preserved across refresh, NULL is pre-migration legacy
+  registry_actor TEXT
 );
 
 CREATE TABLE IF NOT EXISTS device_pairings (
@@ -64,7 +65,8 @@ CREATE TABLE IF NOT EXISTS machines (
   approval_seq INTEGER, -- R5 R2 current enrollment authority for this machine, NULL is pre-migration legacy
   revoked_at TEXT, -- hard revoke (intake 298e50f9): hidden from every view, credentials dead
   revoked_reason TEXT,
-  revoked_by TEXT
+  revoked_by TEXT,
+  state TEXT
 );
 
 CREATE TABLE IF NOT EXISTS login_states (
@@ -107,7 +109,13 @@ CREATE TABLE IF NOT EXISTS jobs (
   lease_epoch INTEGER,
   finished_at TEXT,
   outcome_summary TEXT,
-  outcome_evidence JSON
+  outcome_evidence JSON,
+  role_name TEXT,
+  role_generation INTEGER,
+  role_host_credential TEXT,
+  role_expected_epoch INTEGER,
+  role_effect TEXT,
+  role_finish TEXT
 );
 
 CREATE TABLE IF NOT EXISTS leases (
@@ -209,6 +217,16 @@ CREATE TABLE IF NOT EXISTS messages (
   accepted_at INTEGER,
   completed_at INTEGER,
   expires_at INTEGER NOT NULL,
+  registry_unbound_from INTEGER NOT NULL DEFAULT 0,
+  registry_unbound_to INTEGER NOT NULL DEFAULT 0,
+  delivery TEXT,
+  state TEXT,
+  state_reason TEXT,
+  deliver_by INTEGER,
+  to_session_id TEXT,
+  from_session_id TEXT,
+  recipient_seq INTEGER,
+  ref_json TEXT,
   UNIQUE(from_actor, idempotency_key)
 );
 
@@ -225,7 +243,8 @@ CREATE TABLE IF NOT EXISTS claims (
   claim_source TEXT,
   worktree TEXT,
   session_state TEXT,
-  native_claim_id TEXT
+  native_claim_id TEXT,
+  native_session_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS messages_expires_at ON messages(expires_at);

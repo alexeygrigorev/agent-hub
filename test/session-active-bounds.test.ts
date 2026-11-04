@@ -1,3 +1,4 @@
+import {fixtureSql} from './helpers/fixture-budget';
 import { describe, expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { SessionControlService, reconcileStaleSessions } from '../src/session_control';
@@ -18,9 +19,9 @@ async function seed(hub: Hub, now: number) {
     const st = n <= 560 ? 'stopped' : n <= 600 ? 'running' : n <= 640 ? 'running' : 'queued';
     const actor = n >= 641 ? 'agent-b' : 'agent-a';
     const native = n > 560 && n <= 600 ? `n${n}` : n > 600 && n <= 640 ? `x${n}` : null;
-    hub.sql.exec(`INSERT INTO session_control_sessions (id, actor, request_key, request_json, machine_id, engine, mode, state, binding_json, created_at, updated_at)
+    fixtureSql(hub).exec(`INSERT INTO session_control_sessions (id, actor, request_key, request_json, machine_id, engine, mode, state, binding_json, created_at, updated_at)
       VALUES (?, ?, ?, '{}', 'm1', 'claude', 'headless', ?, ?, ?, ?)`, u(n), actor, 'k' + n, st, native ? JSON.stringify({ native_id: native }) : null, old(n), old(n));
-    if (n > 560 && n <= 600) hub.sql.exec(`INSERT INTO fleet_sessions (machine_id, native_id, tag, phase, observed_at, workspace) VALUES ('m1',?,'t','running',?,'w')`, `n${n}`, fresh);
+    if (n > 560 && n <= 600) fixtureSql(hub).exec(`INSERT INTO fleet_sessions (machine_id, native_id, tag, phase, observed_at, workspace) VALUES ('m1',?,'t','running',?,'w')`, `n${n}`, fresh);
   }
 }
 
@@ -35,7 +36,7 @@ describe('live/active reads are index-served and bounded (intake b2236d2c)', () 
       await seed(hub, now);
       for (let n = 701; n <= 830; n++) {
         const created = new Date(now - 24 * 3600_000 + n * 1000).toISOString();
-        hub.sql.exec(`INSERT INTO session_control_sessions (id, actor, request_key, request_json, machine_id, engine, mode, state, created_at, updated_at)
+        fixtureSql(hub).exec(`INSERT INTO session_control_sessions (id, actor, request_key, request_json, machine_id, engine, mode, state, created_at, updated_at)
           VALUES (?, 'agent-b', ?, '{}', 'm1', 'codex', 'headless', 'queued', ?, ?)`, u(n), 'k' + n, created, created);
       }
       // Credential-family liveness is covered elsewhere; here only the actor-scoped SQL path matters.
@@ -84,7 +85,7 @@ describe('live/active reads are index-served and bounded (intake b2236d2c)', () 
       // reconcile: batch > 200 with remaining > 0, converges, live rows untouched
       for (let n = 1000; n < 1300; n++) {
         const t0 = new Date(now - 48 * 3600_000).toISOString();
-        hub.sql.exec(`INSERT INTO session_control_sessions (id, actor, request_key, request_json, machine_id, engine, mode, state, binding_json, created_at, updated_at)
+        fixtureSql(hub).exec(`INSERT INTO session_control_sessions (id, actor, request_key, request_json, machine_id, engine, mode, state, binding_json, created_at, updated_at)
           VALUES (?, 'agent-a', ?, '{}', 'm1', 'claude', 'headless', 'running', NULL, ?, ?)`, u(n), 'k' + n, t0, t0);
       }
       const r1 = reconcileStaleSessions(hub.sql, now, 250);
@@ -93,8 +94,8 @@ describe('live/active reads are index-served and bounded (intake b2236d2c)', () 
       const r2 = reconcileStaleSessions(hub.sql, now);
       expect(r2.reconciled).toBe(90);
       expect(r2.remaining).toBe(0);
-      expect((hub.sql.exec(`SELECT COUNT(*) AS n FROM session_control_sessions WHERE state = 'running'`).toArray()[0] as any).n).toBe(40);
-      expect((hub.sql.exec('SELECT COUNT(*) AS n FROM session_control_sessions').toArray()[0] as any).n).toBe(1130);
+      expect((fixtureSql(hub).exec(`SELECT COUNT(*) AS n FROM session_control_sessions WHERE state = 'running'`).toArray()[0] as any).n).toBe(40);
+      expect((fixtureSql(hub).exec('SELECT COUNT(*) AS n FROM session_control_sessions').toArray()[0] as any).n).toBe(1130);
 
       // EXPLAIN QUERY PLAN: no base-table SCAN without an index, no temp b-tree
       const live = `state IN ('queued','held','offered','starting','running','uncertain')`;
@@ -106,7 +107,7 @@ describe('live/active reads are index-served and bounded (intake b2236d2c)', () 
       ];
       for (const q of plans) {
         const args = q.includes('?') ? ['z'] : [];
-        const detail = (hub.sql.exec('EXPLAIN QUERY PLAN ' + q, ...args).toArray() as any[]).map(x => String(x.detail)).join('\n');
+        const detail = (fixtureSql(hub).exec('EXPLAIN QUERY PLAN ' + q, ...args).toArray() as any[]).map(x => String(x.detail)).join('\n');
         expect(detail).not.toMatch(/SCAN session_control_sessions(?! USING)/);
         expect(detail).not.toMatch(/TEMP B-TREE/);
         expect(detail).toMatch(/USING (COVERING )?INDEX session_control_(live_|state)/);
