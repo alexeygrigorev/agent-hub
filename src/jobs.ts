@@ -1,4 +1,4 @@
-import { jobLeaseName } from './auth/job-credential';
+import { jobLeaseName, jobLeaseNameSql } from './auth/job-credential';
 import { externalRootBlocks, advanceRootIncumbentProjection } from './root-incumbent';
 import { effectiveHost } from './registry';
 import { registryNameSql } from './agent_registry';
@@ -308,6 +308,9 @@ const deferredOfferStatements=JOBS_SCHEMA_SQL.split(';').map(value=>value.trim()
  DEFERRED_OFFER_INDEX_NAMES.some(name=>new RegExp('CREATE\\s+INDEX\\s+IF\\s+NOT\\s+EXISTS\\s+'+name+'\\b','i').test(statement)));
 const offeredIndexPending=()=>Object.assign(new Error('job_offer_indexes_pending'),{code:'job_offer_indexes_pending',status:503});
 
+const leaseIndexNames=['leases_active_due_ms','leases_active_name','leases_holder_job'];
+const deferredLeaseStatements=JOBS_SCHEMA_SQL.split(';').map(s=>s.trim()).filter(s=>leaseIndexNames.some(name=>s.startsWith('CREATE INDEX IF NOT EXISTS '+name+' ')));
+
 export class JobsService {
   public roles: RoleLeases;
   private sql: SqlStorage;
@@ -371,12 +374,13 @@ export class JobsService {
 
     for (const statement of JOBS_SCHEMA_SQL.split(';')) {
       const trimmed = statement.trim();
-      if (trimmed&&!deferredOfferStatements.includes(trimmed)) this.sql.exec(trimmed);
+      if (trimmed&&!deferredOfferStatements.includes(trimmed)&&!deferredLeaseStatements.includes(trimmed)) this.sql.exec(trimmed);
     }
 
     // A genuinely empty fresh schema may install cheap empty indexes.
     // Retained jobs (even all terminal) never trigger historical builds here.
     if(!this.sql.exec('SELECT id FROM jobs LIMIT 1').toArray().length)this.prepareOfferedWork();
+    if(!this.sql.exec('SELECT name FROM leases ORDER BY name LIMIT 1').toArray().length)this.prepareLeaseWork();
 
     this.sql.exec('CREATE TABLE IF NOT EXISTS root_background_ready(slot_ms INTEGER NOT NULL,host_id TEXT NOT NULL,rank TEXT NOT NULL,PRIMARY KEY(slot_ms,host_id))');
     this.sql.exec('CREATE INDEX IF NOT EXISTS root_background_rank ON root_background_ready(slot_ms,rank,host_id)');
@@ -562,7 +566,7 @@ export class JobsService {
       AFTER ${event} ON jobs BEGIN
         DELETE FROM job_claim_deadlines WHERE job_id=NEW.id;
         INSERT INTO job_claim_deadlines SELECT name,NEW.id,${ACQUIRED_MS}+300000
-          FROM leases WHERE holder_job_id=NEW.id AND holder_job_id IS NOT NULL
+          FROM leases WHERE name=${jobLeaseNameSql('NEW')} AND holder_job_id=NEW.id AND holder_job_id IS NOT NULL
             AND NEW.status='claimed' AND NEW.started_at IS NULL AND ${ACQUIRED_MS} IS NOT NULL;
       END`);
     this.sql.exec(`CREATE TRIGGER IF NOT EXISTS claim_deadline_lease_delete AFTER DELETE ON leases
@@ -570,19 +574,54 @@ export class JobsService {
     this.sql.exec(`CREATE TRIGGER IF NOT EXISTS claim_deadline_job_delete AFTER DELETE ON jobs
       BEGIN DELETE FROM job_claim_deadlines WHERE job_id=OLD.id; END`);
     this.sql.exec("INSERT OR IGNORE INTO job_claim_backfill VALUES(1,'',0)");
-    this.backfillClaimDeadlines();
+    // A complete small negative proof needs no historical projection repair.
+    const receipt:any=this.sql.exec('SELECT done FROM job_claim_backfill WHERE id=1').toArray()[0];
+    if(!receipt?.done&&!this.rawLeaseCohort().some(row=>row.holder_job_id!==null))
+      this.sql.exec('UPDATE job_claim_backfill SET done=1 WHERE id=1 AND done=0');
   }
 
-  /** Existing leases migrate in indexed pages. A durable cursor and a real
-   * continuation alarm avoid an unbounded first-deploy scan or starvation. */
+  private rawLeaseCohort(): any[] {
+    const rows=this.sql.exec('SELECT * FROM leases ORDER BY name LIMIT 129').toArray();
+    if(rows.length>128)throw Object.assign(new Error('lease_observation_pending'),{status:503,code:'lease_observation_pending'});
+    return rows;
+  }
+  private leaseIndexesPresent():boolean {
+    const rows=this.sql.exec("SELECT name FROM pragma_index_list('leases','main') LIMIT 65").toArray();
+    return rows.length<=64&&leaseIndexNames.every(name=>rows.some(row=>row.name===name));
+  }
+  /** Explicit maintenance request only; queue consumers use known lease PKs. */
+  prepareLeaseWork():void {
+    if(this.leaseIndexesPresent())return;
+    this.ctx.storage.transactionSync(()=>{});
+    this.ctx.storage.transactionSync(()=>{for(const statement of deferredLeaseStatements)this.sql.exec(statement);if(!this.leaseIndexesPresent())throw Object.assign(new Error('lease_indexes_pending'),{status:503,code:'lease_indexes_pending'});});
+  }
+  private hasIndexedLeaseWork():boolean {
+    // Memoizable raw facts save repeated schema probes on an idle small Hub.
+    // Only a COMPLETE negative cohort can bypass physical index proof.
+    const raw=this.sql.exec('SELECT holder_job_id FROM leases ORDER BY name LIMIT 2').toArray();
+    if(raw.length<2&&!raw.some(row=>row.holder_job_id!==null))return false;
+    if(this.leaseIndexesPresent())return true;
+    if(!this.rawLeaseCohort().some(row=>row.holder_job_id!==null))return false;
+    throw Object.assign(new Error('lease_indexes_pending'),{status:503,code:'lease_indexes_pending'});
+  }
+  private activeLeaseCohort():any[] {
+    if(!this.leaseIndexesPresent())return this.rawLeaseCohort().filter(row=>row.holder_job_id!==null);
+    const rows=this.sql.exec('SELECT * FROM leases INDEXED BY leases_active_name WHERE holder_job_id IS NOT NULL ORDER BY name LIMIT 129').toArray();
+    if(rows.length>128)throw Object.assign(new Error('lease_observation_pending'),{status:503,code:'lease_observation_pending'});
+    return rows;
+  }
+
+  /** Explicit legacy maintenance advances raw name-PK pages before eligibility
+   * filtering; released history cannot hide late active leases or stall a cursor. */
   private backfillClaimDeadlines() {
     const state: any = this.sql.exec('SELECT after_name,done FROM job_claim_backfill WHERE id=1').toArray()[0];
     if (!state || state.done) return;
     this.ctx.storage.transactionSync(() => {
-      const leases = this.sql.exec(`SELECT name,holder_job_id,acquired_at FROM leases INDEXED BY leases_active_name
-        WHERE holder_job_id IS NOT NULL AND name>? ORDER BY name LIMIT ?`, state.after_name, ALARM_BATCH + 1).toArray() as any[];
+      const leases = this.sql.exec(`SELECT name,holder_job_id,acquired_at FROM leases
+        WHERE name>? ORDER BY name LIMIT ?`, state.after_name, ALARM_BATCH + 1).toArray() as any[];
       const page = leases.slice(0, ALARM_BATCH);
       for (const lease of page) {
+        if(lease.holder_job_id===null)continue;
         const acquired = parseExpiryMs(lease.acquired_at);
         if (acquired === null) continue;
         this.sql.exec(`INSERT OR REPLACE INTO job_claim_deadlines SELECT ?,id,? FROM jobs
@@ -594,6 +633,9 @@ export class JobsService {
   }
 
   private scheduleAlarm() {
+    // Disabled local alarms also skip legacy deadline probes. Hub owns and
+    // arms the indexed per-entity queue after each committed event.
+    if(!this.deps?.enableAlarms)return;
     const jobAlarmTime = this.getAlarmTime();
     const observer = this.deps?.alarmDeadline?.();
     const alarmTime = Number.isFinite(observer) ? Math.min(jobAlarmTime || Infinity, observer!) : jobAlarmTime;
@@ -667,7 +709,7 @@ export class JobsService {
       first(`SELECT ${DEADLINE_MS} AS due FROM jobs INDEXED BY jobs_root_offered_deadline_ms WHERE kind='root-run' AND status='offered' AND ${DEADLINE_MS} IS NOT NULL ORDER BY ${DEADLINE_MS} LIMIT 1`);
     }
     }
-    first(`SELECT ${LEASE_MS} AS due FROM leases WHERE holder_job_id IS NOT NULL ORDER BY ${LEASE_MS} LIMIT 1`);
+    if(this.hasIndexedLeaseWork())first(`SELECT ${LEASE_MS} AS due FROM leases INDEXED BY leases_active_due_ms WHERE holder_job_id IS NOT NULL ORDER BY ${LEASE_MS} LIMIT 1`);
     first('SELECT due_ms AS due FROM job_claim_deadlines ORDER BY due_ms,lease_name LIMIT 1');
     if (!this.sql.exec('SELECT done FROM job_claim_backfill WHERE id=1').toArray()[0]?.done)
       nextTimes.push(this.now().getTime() + 15000);
@@ -792,7 +834,7 @@ export class JobsService {
       add(`SELECT id,${DEADLINE_MS} AS due FROM jobs INDEXED BY jobs_root_offered_deadline_ms WHERE status='offered' AND kind='root-run' AND ${DEADLINE_MS} IS NOT NULL ORDER BY ${DEADLINE_MS} LIMIT 1`);
     }
     }
-    add(`SELECT holder_job_id AS id,${LEASE_MS} AS due FROM leases WHERE holder_job_id IS NOT NULL ORDER BY ${LEASE_MS} LIMIT 1`);
+    if(this.hasIndexedLeaseWork())add(`SELECT holder_job_id AS id,${LEASE_MS} AS due FROM leases INDEXED BY leases_active_due_ms WHERE holder_job_id IS NOT NULL ORDER BY ${LEASE_MS} LIMIT 1`);
     add('SELECT job_id AS id,due_ms AS due FROM job_claim_deadlines ORDER BY due_ms,lease_name LIMIT 1');
     return heads.sort((a,b)=>a.dueAt-b.dueAt)[0] ?? null;
   }
@@ -833,6 +875,7 @@ export class JobsService {
       const nowMs = now.getTime();
       const nowIso = now.toISOString();
 
+      const indexedLeases=this.hasIndexedLeaseWork();
       this.backfillClaimDeadlines();
       const hasOffers=this.hasOfferedWork();if(hasOffers)this.requireOfferedIndexes();
       this.ctx.storage.transactionSync(() => {
@@ -868,8 +911,8 @@ export class JobsService {
         }
 
         // 2. Expire leases (hard deadline or missed renew)
-        const activeLeases = this.sql.exec(`SELECT * FROM leases WHERE holder_job_id IS NOT NULL
-          AND ${LEASE_MS}<=? ORDER BY ${LEASE_MS} LIMIT ?`, nowMs, ALARM_BATCH).toArray();
+        const activeLeases = indexedLeases?this.sql.exec(`SELECT * FROM leases INDEXED BY leases_active_due_ms WHERE holder_job_id IS NOT NULL
+          AND ${LEASE_MS}<=? ORDER BY ${LEASE_MS} LIMIT ?`, nowMs, ALARM_BATCH).toArray():[];
         for (const lease of activeLeases) {
           if (isLeaseExpired(lease.expires_at as any, nowMs)) {
             if (lease.name === 'root') {
@@ -1253,6 +1296,14 @@ export class JobsService {
         if (job.role_name && (job.role_host_credential !== hostCredentialId || !this.roleCurrent(job))) {
           result = { error: 'gate_failed', reason: 'role_unauthorized' }; return;
         }
+        // Canonical queue/claim-deadline SQL supports textual payload identities
+        // and JS-falsy defaults. Other truthy JSON types have different SQL/JS
+        // coercions, so refuse them before minting a mismatched lease/token.
+        if(!job.role_name&&['writer-run','head-recovery'].includes(job.kind)) {
+          let payload:any;try{payload=JSON.parse(job.payload||'{}');}catch{}
+          const value=job.kind==='writer-run'?payload?.date:payload?.project;
+          if(value&&typeof value!=='string'){result={error:'conflict',reason:'unsupported_lease_identity'};return;}
+        }
         // Root scheduling flag: root-run claims (offered jobs included) are refused
         // inside the same claim transaction, so there is no flag-check race.
         if (job.kind === 'root-run' && !isRootSchedulingEnabled(this.sql)) {
@@ -1314,8 +1365,10 @@ export class JobsService {
           }
           const profileLease = this.getLeaseNameForJob({ ...job, role_name: null });
           if (profileLease.startsWith('writer:')) {
-            const holders = this.sql.exec(`SELECT j.*,l.expires_at AS profile_expires_at FROM jobs j JOIN leases l ON l.holder_job_id=j.id
-              WHERE j.kind='writer-run' AND j.id!=? AND j.status IN ('claimed','running')`, jobId).toArray();
+            const holders=this.activeLeaseCohort().filter(l=>l.holder_job_id!==jobId).flatMap(l=>{
+              const held:any=this.sql.exec('SELECT * FROM jobs WHERE id=?',l.holder_job_id).toArray()[0];
+              return held?.kind==='writer-run'&&['claimed','running'].includes(held.status)?[{...held,profile_expires_at:l.expires_at}]:[];
+            });
             if (holders.some(h => this.getLeaseNameForJob({ ...h, role_name: null }) === profileLease &&
                 !isLeaseExpired(h.profile_expires_at as any, nowMs))) {
               result = { error: 'conflict', reason: 'writer_date_busy' }; return;
@@ -1446,10 +1499,12 @@ export class JobsService {
   }
 
   private resolveLeaseForJob(jobId: string, job: any): any {
-    const direct = this.sql.exec("SELECT * FROM leases WHERE holder_job_id = ?", jobId).toArray()[0] as any;
-    if (direct) return direct;
-    const leaseName = this.getLeaseNameForJob(job);
-    return this.sql.exec("SELECT * FROM leases WHERE name = ?", leaseName).toArray()[0] as any;
+    const canonical=this.sql.exec('SELECT * FROM leases WHERE name=?',this.getLeaseNameForJob(job)).toArray()[0] as any;
+    if(canonical?.holder_job_id===jobId)return canonical;
+    const matches=this.activeLeaseCohort().filter(row=>row.holder_job_id===jobId);
+    if(matches.length>1)throw Object.assign(new Error('lease_identity_ambiguous'),{status:503});
+    return matches[0]??canonical;
+
   }
 
   async startJob(

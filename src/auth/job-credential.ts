@@ -9,8 +9,8 @@ export function jobLeaseName(job:any):string {
 }
 export function jobLeaseNameSql(alias:string):string {
   const json=`CASE WHEN json_valid(${alias}.payload) THEN ${alias}.payload ELSE '{}' END`;
-  return `COALESCE(${alias}.role_name,CASE WHEN ${alias}.kind='root-run' THEN 'root'
-    WHEN ${alias}.kind='writer-run' AND json_extract(${json},'$.date') IS NOT NULL THEN 'writer:'||json_extract(${json},'$.date')
+  return `COALESCE(NULLIF(${alias}.role_name,''),CASE WHEN ${alias}.kind='root-run' THEN 'root'
+    WHEN ${alias}.kind='writer-run' AND NULLIF(NULLIF(json_extract(${json},'$.date'),''),0) IS NOT NULL THEN 'writer:'||json_extract(${json},'$.date')
     WHEN ${alias}.kind='head-recovery' THEN 'head:'||COALESCE(NULLIF(NULLIF(json_extract(${json},'$.project'),''),0),'default')
     ELSE 'job:'||${alias}.id END)`;
 }

@@ -58,9 +58,9 @@ export function initJobBackgroundProducers(sql:SqlStorage,enqueue:(intent:Backgr
   if(sql.exec('SELECT done FROM job_background_seed WHERE id=1').toArray()[0]?.done)return;
   const ids=new Set<string>();
   const offers=sql.exec("SELECT id FROM jobs INDEXED BY jobs_offered WHERE status='offered' ORDER BY offer_expires_at LIMIT 129").toArray();
-  const leases=sql.exec('SELECT holder_job_id FROM leases INDEXED BY leases_active_name WHERE holder_job_id IS NOT NULL ORDER BY name LIMIT 129').toArray();
+  const leases=sql.exec('SELECT name,holder_job_id FROM leases ORDER BY name LIMIT 129').toArray();
   if(offers.length>128||leases.length>128)throw new Error('background_job_observation_limit');
-  for(const row of offers)ids.add(String(row.id));for(const row of leases)ids.add(String(row.holder_job_id));
+  for(const row of offers)ids.add(String(row.id));for(const row of leases)if(row.holder_job_id!==null)ids.add(String(row.holder_job_id));
   if(ids.size>128)throw new Error('background_job_observation_limit');
   const intents:BackgroundIntent[]=[];
   for(const id of ids) {

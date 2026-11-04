@@ -50,11 +50,26 @@ export class HostHistoryService {
   private packet(raw: string): Observation[] { const p = json(raw); return Array.isArray(p) ? p : []; }
   private writes: WriteWatch | null = null;
   private lastSampleStamp: string | null = null;
-  constructor(private sql: SqlStorage, private fleet: FleetService, private now = Date.now, writes?: WriteWatch) {
+  constructor(private sql: SqlStorage, private fleet: FleetService, private now = Date.now, writes?: WriteWatch, private beforeIndexBuild?:()=>void) {
     this.writes = writes ?? null;
     if (writes) writes.trackAll(['host_health_observations','disk_observations','fleet_accounts','fleet_launches','fleet_sessions_meta','machines','session_resource_usage','resource_resident_samples','usage_quota_history','server_quota_snapshots','fleet_subscriptions']);
   }
-  init() { initUsageStore(this.sql); for (const s of HOST_HISTORY_SCHEMA.split(';')) if (s.trim()) this.sql.exec(s); }
+  init() {
+    initUsageStore(this.sql);
+    for(const statement of HOST_HISTORY_SCHEMA.split(';'))if(statement.trim()&&!statement.includes('CREATE INDEX IF NOT EXISTS resource_history_entities_seen'))this.sql.exec(statement);
+    // A known empty source has no retained history to index. Existing
+    // dimensions keep their physical layout until explicit compaction.
+    if(!this.rows('SELECT kind FROM resource_history_entities ORDER BY kind,entity,machine_id LIMIT 1').length)
+      this.sql.exec('CREATE INDEX IF NOT EXISTS resource_history_entities_seen ON resource_history_entities(last_seen_ms)');
+  }
+  private prepareCompaction():void {
+    const rows=this.rows("SELECT name FROM pragma_index_list('resource_history_entities','main') LIMIT 65");
+    if(rows.length>64)throw Object.assign(new Error('history_compaction_observation_pending'),{status:503,code:'history_compaction_observation_pending'});
+    if(!rows.some(row=>row.name==='resource_history_entities_seen')){
+      this.beforeIndexBuild?.();
+      this.sql.exec('CREATE INDEX IF NOT EXISTS resource_history_entities_seen ON resource_history_entities(last_seen_ms)');
+    }
+  }
   /** One real observation per minute; retries and backfill cannot overwrite newer evidence. */
   record(kind: string, entity: string, machine: string, at: number, values: Values, source: string) {
     if (!Number.isFinite(at) || at > this.now() + MINUTE || at < this.now() - HISTORY_RETENTION_MS) return;
@@ -216,8 +231,13 @@ export class HostHistoryService {
   /** Called by the existing Durable Object alarm and after successful host writes.
    * Minute idempotency prevents page refreshes/poll frequency from inflating history.
    */
-  sample() {
+  sample(allowMaintenance=false) {
     const now = this.now();
+    if(allowMaintenance){
+      const compacted=this.rows("SELECT value FROM resource_history_meta WHERE key='compact'")[0]?.value;
+      if(!compacted||now-Number(compacted)>=3600000){this.compact();this.sql.exec("INSERT OR REPLACE INTO resource_history_meta VALUES('compact',?)",now);}
+    }
+
     let sampleStamp: string | null = null;
     // Source-driven sampling: unchanged evidence cannot create a new sample.
     // Quota journals are dependencies too, so new quota samples invalidate
@@ -266,8 +286,6 @@ export class HostHistoryService {
     }
     this.flush();
     this.sql.exec("INSERT OR REPLACE INTO resource_history_meta VALUES('sample',?)", now);
-    const compacted = this.rows("SELECT value FROM resource_history_meta WHERE key='compact'")[0]?.value;
-    if (!compacted || now - Number(compacted) >= 3600000) { this.compact(); this.sql.exec("INSERT OR REPLACE INTO resource_history_meta VALUES('compact',?)", now); }
     // Only a completed sample serves this source generation. A write inside
     // the minute throttle (or a failed sample) must remain pending for retry.
     this.lastSampleStamp = sampleStamp;
@@ -319,6 +337,9 @@ export class HostHistoryService {
     return Number.isFinite(last) ? last + MINUTE : this.now() + MINUTE;
   }
   compact() {
+    // Explicit maintenance must establish its physical access path before
+    // flushing pending packets or deleting any derived history.
+    this.prepareCompaction();
     this.flush();
     const now = this.now();
     // Expiry is batched even if this DO wakes after months of downtime.

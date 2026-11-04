@@ -15,7 +15,6 @@ export const CHECKS_SCHEMA = `
 CREATE TABLE IF NOT EXISTS hub_checks (name TEXT PRIMARY KEY, kind TEXT NOT NULL, interval_s INTEGER NOT NULL, params_json TEXT NOT NULL, action_json TEXT NOT NULL, enabled INTEGER NOT NULL, next_due_at TEXT NOT NULL, last_run_at TEXT, last_status TEXT, last_detail TEXT);
 CREATE TABLE IF NOT EXISTS hub_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS hub_check_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, at TEXT NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL, action TEXT);
-CREATE INDEX IF NOT EXISTS hub_checks_enabled_due ON hub_checks(enabled,next_due_at,name);
 ` + CHECK_SLOT_SCHEMA;
 
 export const CHECK_KINDS = ['liveness', 'quota', 'http', 'inbox_backlog', 'conversation_backlog', 'delivery_slo', 'dispatch_route', 'burn_forecast', 'routine'] as const;
@@ -107,34 +106,61 @@ export const DEFAULT_CHECKS = [
   BURN_FORECAST_CHECK,
 ];
 
+export class ChecksObservationLimit extends Error {
+  readonly code='checks_observation_limited';readonly status=503;
+  constructor(){super('checks_observation_limited');}
+}
+const checkTextOrder=(left:unknown,right:unknown)=>{
+  const a=new TextEncoder().encode(String(left)),b=new TextEncoder().encode(String(right));
+  for(let i=0;i<Math.min(a.length,b.length);i++)if(a[i]!==b[i])return a[i]-b[i];
+  return a.length-b.length;
+};
 export class ChecksService {
   constructor(private sql: SqlStorage, private now: () => number = Date.now) {}
 
+  private hasIndex(name:string):boolean {
+    return this.sql.exec("SELECT /* live checks index */ cid FROM pragma_index_info(?, 'main') LIMIT 1",name).toArray().length>0;
+  }
+  private rawChecks():any[] {
+    const rows=this.sql.exec('SELECT * FROM hub_checks ORDER BY name LIMIT 101').toArray() as any[];
+    if(rows.length>100)throw new ChecksObservationLimit();return rows;
+  }
+  private rawSlots():any[] {
+    const rows=this.sql.exec('SELECT name,state,lease_until FROM hub_check_slots ORDER BY name LIMIT 101').toArray() as any[];
+    if(rows.length>100)throw new ChecksObservationLimit();return rows;
+  }
+  private freshIndex(table:string,name:string,ddl:string):void {
+    if(!this.hasIndex(name)&&!this.sql.exec('SELECT 1 FROM '+table+' LIMIT 1').toArray().length)this.sql.exec(ddl);
+  }
   init() {
     for (const stmt of CHECKS_SCHEMA.split(';')) if (stmt.trim()) this.sql.exec(stmt);
-    this.sql.exec("CREATE INDEX IF NOT EXISTS hub_check_slots_retry_due ON hub_check_slots(lease_until,name) WHERE state!='done'");
+    this.freshIndex('hub_checks','hub_checks_enabled_due','CREATE INDEX IF NOT EXISTS hub_checks_enabled_due ON hub_checks(enabled,next_due_at,name)');
+    this.freshIndex('hub_check_slots','hub_check_slots_retry_due',"CREATE INDEX IF NOT EXISTS hub_check_slots_retry_due ON hub_check_slots(lease_until,name) WHERE state!='done'");
     // Bound candidate visits before testing expiry; an expired backlog must
     // never force a whole-history scan just to discover a live overdue row.
     // Reuse deployed message indexes; building a new pending index would
     // rewrite the retained message table during incident recovery.
-    // Seed defaults once; an operator who later removes every check keeps an empty list.
-    if (!this.sql.exec("SELECT 1 FROM hub_meta WHERE key = 'checks_seeded'").toArray().length) {
-      if (!Number(this.sql.exec('SELECT COUNT(*) AS n FROM hub_checks').one().n)) this.replace(DEFAULT_CHECKS.map(c => (validateCheck(c) as any).row));
-      this.sql.exec("INSERT INTO hub_meta (key, value) VALUES ('checks_seeded', ?)", new Date(this.now()).toISOString());
-      this.sql.exec("INSERT INTO hub_meta (key, value) VALUES ('burn_check_seeded', ?)", new Date(this.now()).toISOString());
-    }
-    // Deployments seeded before the burn forecast existed get it once; removing it later sticks.
-    if (!this.sql.exec("SELECT 1 FROM hub_meta WHERE key = 'burn_check_seeded'").toArray().length) {
-      if (Number(this.sql.exec('SELECT COUNT(*) AS n FROM hub_checks').one().n) > 0 && !this.sql.exec("SELECT 1 FROM hub_checks WHERE name = ? OR kind = 'burn_forecast'", BURN_FORECAST_CHECK.name).toArray().length) {
-        const r = (validateCheck(BURN_FORECAST_CHECK) as any).row;
-        this.sql.exec('INSERT INTO hub_checks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', r.name, r.kind, r.interval_s, JSON.stringify(r.params), JSON.stringify(r.action), Number(r.enabled), new Date(this.now()).toISOString(), null, null, null);
+    // Missing legacy receipts observe a complete bounded source before
+    // any configuration/default write. Existing receipts remain point reads.
+    const seeded=this.sql.exec("SELECT 1 FROM hub_meta WHERE key='checks_seeded'").toArray().length>0;
+    const burnSeeded=this.sql.exec("SELECT 1 FROM hub_meta WHERE key='burn_check_seeded'").toArray().length>0;
+    const rows=!seeded||!burnSeeded?this.rawChecks():[];
+    if(!seeded) {
+      if(!rows.length)this.replace(DEFAULT_CHECKS.map(c=>(validateCheck(c) as any).row));
+      this.sql.exec("INSERT INTO hub_meta (key,value) VALUES('checks_seeded',?)",new Date(this.now()).toISOString());
+      this.sql.exec("INSERT OR REPLACE INTO hub_meta (key,value) VALUES('burn_check_seeded',?)",new Date(this.now()).toISOString());
+    } else if(!burnSeeded) {
+      if(rows.length&&!rows.some(row=>row.name===BURN_FORECAST_CHECK.name||row.kind==='burn_forecast')) {
+        const r=(validateCheck(BURN_FORECAST_CHECK) as any).row;
+        this.sql.exec('INSERT INTO hub_checks VALUES(?,?,?,?,?,?,?,?,?,?)',r.name,r.kind,r.interval_s,JSON.stringify(r.params),JSON.stringify(r.action),Number(r.enabled),new Date(this.now()).toISOString(),null,null,null);
       }
-      this.sql.exec("INSERT INTO hub_meta (key, value) VALUES ('burn_check_seeded', ?)", new Date(this.now()).toISOString());
+      this.sql.exec("INSERT INTO hub_meta (key,value) VALUES('burn_check_seeded',?)",new Date(this.now()).toISOString());
     }
   }
 
   replace(rows: any[]) {
-    const existing = new Map((this.sql.exec('SELECT name, next_due_at, last_run_at, last_status, last_detail FROM hub_checks').toArray() as any[]).map(r => [r.name, r]));
+    if(rows.length>100)throw new ChecksObservationLimit();
+    const existing=new Map(this.rawChecks().map(r=>[r.name,r]));
     this.sql.exec('DELETE FROM hub_checks');
     const at = new Date(this.now()).toISOString();
     for (const r of rows) {
@@ -144,15 +170,17 @@ export class ChecksService {
     }
   }
 
+  has(name:string):boolean {return this.sql.exec('SELECT 1 FROM hub_checks WHERE name=?',name).toArray().length>0;}
+
   list() {
-    return (this.sql.exec('SELECT * FROM hub_checks ORDER BY name').toArray() as any[]).map(r => ({
+    return this.rawChecks().map(r => ({
       name: r.name, kind: r.kind, interval_s: r.interval_s, params: JSON.parse(r.params_json), action: JSON.parse(r.action_json), enabled: !!r.enabled,
       next_due_at: r.next_due_at, last_run_at: r.last_run_at, last_status: r.last_status, last_detail: r.last_detail,
     }));
   }
 
   runs(limit = 50) {
-    return this.sql.exec('SELECT * FROM hub_check_runs ORDER BY id DESC LIMIT ?', limit).toArray();
+    return this.sql.exec('SELECT * FROM hub_check_runs ORDER BY id DESC LIMIT ?', Math.max(1,Math.min(1000,Math.floor(Number(limit)||50)))).toArray();
   }
 
   /** The latest durable slot per name survives replacement and restarts. SQL
@@ -162,11 +190,16 @@ export class ChecksService {
   async runDue(deps: ActionDeps, only?: string): Promise<any[]> {
     const results: any[] = [];
     let insertedRun = false;
-    const dueNames = (only
-      ? this.sql.exec('SELECT name FROM hub_checks WHERE name=?', only).toArray()
-      : this.sql.exec('SELECT name FROM hub_checks WHERE enabled=1 AND next_due_at<=? ORDER BY next_due_at,name LIMIT 100', new Date(this.now()).toISOString()).toArray())
-      .map(r => String(r.name));
-    const retryNames = only ? [] : this.sql.exec("SELECT name FROM hub_check_slots WHERE state!='done' AND lease_until<=? ORDER BY lease_until,name LIMIT 100",this.now()).toArray().map(r=>String(r.name));
+    const now=this.now(),at=new Date(now).toISOString();
+    // Observe BOTH sources before evaluator, slot, audit or action effects.
+    const checks=only?null:this.hasIndex('hub_checks_enabled_due')?null:this.rawChecks();
+    const slots=only?null:this.hasIndex('hub_check_slots_retry_due')?null:this.rawSlots();
+    const dueNames=(only?this.sql.exec('SELECT name FROM hub_checks WHERE name=?',only).toArray():checks
+      ? checks.filter(row=>row.enabled===1&&String(row.next_due_at)<=at).sort((a,b)=>checkTextOrder(a.next_due_at,b.next_due_at)||checkTextOrder(a.name,b.name)).slice(0,100)
+      :this.sql.exec('SELECT name FROM hub_checks INDEXED BY hub_checks_enabled_due WHERE enabled=1 AND next_due_at<=? ORDER BY next_due_at,name LIMIT 100',at).toArray()).map(row=>String(row.name));
+    const retryNames=only?[]:(slots?slots.filter(row=>row.state!=='done'&&typeof row.lease_until==='number'&&row.lease_until<=now)
+      .sort((a,b)=>a.lease_until-b.lease_until||checkTextOrder(a.name,b.name)).slice(0,100)
+      :this.sql.exec("SELECT name FROM hub_check_slots INDEXED BY hub_check_slots_retry_due WHERE state!='done' AND lease_until<=? ORDER BY lease_until,name LIMIT 100",now).toArray()).map(row=>String(row.name));
     const names=[...new Set([...retryNames,...dueNames])];
     for (const name of names) {
       if (only && name !== only) continue;

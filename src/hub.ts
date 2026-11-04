@@ -55,7 +55,7 @@ import { LivenessService, thresholdsFrom, alertText } from './liveness';
 import { watchCommandChannels, ensureCommandChannelSchema } from './command-channel';
 import { HostGoals } from './host-goals';
 import { BankedResets } from './banked-resets';
-import { ChecksService, validateCheck, type ActionDeps } from './checks';
+import { ChecksService, ChecksObservationLimit, validateCheck, type ActionDeps } from './checks';
 import { approvalAuthorityMatches, assignApprovalAuthority } from './host_enrollment';
 import { ensureRootScheduling, getRootScheduling, isRootSchedulingEnabled, setRootScheduling } from './root_scheduling';
 import { QuotaStore, dedupeAccountsByCanonical, handleQuotaRoutes } from './quota';
@@ -614,7 +614,7 @@ export class Hub extends DurableObject {
     // non-admin caller, so host/agent/job credentials get 403.
     this.backupService = new BackupService(this.sql, fn => this.ctx.storage.transactionSync(fn), this.env);
     this.backupService.init();
-    this.hostHistoryService = new HostHistoryService(this.sql, this.fleetService, Date.now, this.writes);
+    this.hostHistoryService = new HostHistoryService(this.sql, this.fleetService, Date.now, this.writes,()=>this.ctx.storage.transactionSync(()=>{}));
     this.hostHistoryService.init();
     this.statusService.setMonitoringService(this.monitoringService);
     this.statusService.initLifecycleCache();
@@ -688,7 +688,7 @@ export class Hub extends DurableObject {
 
     this.jobsService = new JobsService(this.sql, this.ctx, {
       busService: busForJobs,
-      enableAlarms: true,
+      enableAlarms: false,
       env: this.env,
     });
     this.jobsService.setBusService(busForJobs);
@@ -941,7 +941,8 @@ export class Hub extends DurableObject {
     // Legacy SPEC§6 audit.ts is retained verbatim. Its new `at` field stays
     // explicitly unknown; construction never rewrites historical audit rows.
 
-    this.sql.exec("INSERT OR IGNORE INTO leases (name, epoch) VALUES ('root', 0)");
+    // JobsService owns the root lease seed after its fresh-empty schema
+    // checks. Existing retained leases are never rewritten during init.
     ensureRootScheduling(this.sql);
     });
   }
@@ -1183,7 +1184,11 @@ export class Hub extends DurableObject {
 
       if (path === '/api/agents' || path.startsWith('/api/agents/')) return this.handleAgentRegistry(request, path);
       if (path === '/api/heartbeat' || path === '/api/liveness' || path === '/api/checks' || path.startsWith('/api/checks/') || path === '/api/ops/heartbeat' || path === '/api/ops/liveness') {
-        return this.handleWatchRoutes(request, path);
+        try { return await this.handleWatchRoutes(request, path); }
+        catch (error) {
+          if (error instanceof ChecksObservationLimit) return Response.json({ error: error.code, observation_pending: true }, { status: 503, headers: { 'Cache-Control': 'no-store' } });
+          throw error;
+        }
       }
       if (path === '/api/host/repositories' || path === '/api/host/repositories/token') {
         if (request.headers.has('Cookie')) return Response.json({ error: 'mixed_authority' }, { status: 403 });
@@ -2603,7 +2608,7 @@ export class Hub extends DurableObject {
     const run = /^\/api\/checks\/([a-z0-9][a-z0-9_-]{0,39})\/run$/.exec(path);
     if (run && request.method === 'POST') {
       await safeJson(request); // the body is unused; drain it so the runtime does not log a stream error
-      if (!this.checksService.list().some(c => c.name === run[1])) return json({ error: 'not_found' }, 404);
+      if (!this.checksService.has(run[1])) return json({ error: 'not_found' }, 404);
       return json({ results: await this.runChecks(run[1]) });
     }
     return json({ error: 'not_found' }, 404);
@@ -2795,7 +2800,7 @@ export class Hub extends DurableObject {
         expireMessageEvents(this.sql, nowMs);
       }));
       try { await m('idle_work', () => this.idleWorkTick()); } catch { console.warn('idle_work_tick_failed'); }
-      try { await m('host_history', () => this.hostHistoryService.sample()); } catch { console.warn('resource_history_sampling_failed'); }
+      try { await m('host_history', () => this.hostHistoryService.sample(true)); } catch { console.warn('resource_history_sampling_failed'); }
       try {
         await m('fleet_account_capacity_history', () => sampleAccountCapacityHistory(
           this.sql,
@@ -2965,6 +2970,7 @@ export class Hub extends DurableObject {
     const tickResult = await m('root_slot', () => this.jobsService.tickRootSlot(slotStartIso));
 
     // 3. Process alarms & expiry
+    this.jobsService.prepareLeaseWork();
     const nextAlarm = this.jobsService.processAlarms();
     try {
       this.ctx.storage.transactionSync(() => {

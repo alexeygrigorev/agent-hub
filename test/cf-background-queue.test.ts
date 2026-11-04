@@ -149,20 +149,24 @@ describe('strict indexed background queue', () => {
     }
   }));
 
-  it('known job and lease producers maintain claim deadlines and frozen root offers', () => withHub((hub,state) => {
+  it('known job and lease producers maintain claim deadlines and frozen root offers', () => withHub(async(hub,state) => {
     const raw=state.storage.sql,now=Date.now(),at=new Date(now).toISOString(),future=new Date(now+600000).toISOString(),past=new Date(now-600000).toISOString();
-    raw.exec(`INSERT INTO jobs(id,kind,idempotency_key,payload,status,created_at,deadline_at,offer_expires_at,actor)
+    hub.sql.exec(`INSERT INTO jobs(id,kind,idempotency_key,payload,status,created_at,deadline_at,offer_expires_at,actor)
       VALUES('root-timer','root-run','root-timer','{}','offered',?,?,?,'test')`,at,future,past);
     const due=()=>raw.exec("SELECT due_ms FROM hub_background_work WHERE id='job-deadline:root-timer'").one().due_ms;
     expect(due()).toBe(Date.parse(future));
-    raw.exec('UPDATE root_scheduling SET enabled=1 WHERE id=1');expect(due()).toBe(Date.parse(past));
-    raw.exec('UPDATE root_scheduling SET enabled=0 WHERE id=1');expect(due()).toBe(Date.parse(future));
-    raw.exec("UPDATE jobs SET status='claimed',lease_epoch=1 WHERE id='root-timer'");
-    raw.exec("UPDATE leases SET epoch=1,holder_job_id='root-timer',expires_at=?,acquired_at=? WHERE name='root'",future,past);
+    hub.sql.exec('UPDATE root_scheduling SET enabled=1 WHERE id=1');expect(due()).toBe(Date.parse(past));
+    hub.sql.exec('UPDATE root_scheduling SET enabled=0 WHERE id=1');
+    // Disabling does no global offer rewrite. The one real queued entity
+    // observes the current flag at its old timeout and moves to its hard due.
+    expect(due()).toBe(Date.parse(past));
+    await hub.alarm();expect(due()).toBe(Date.parse(future));
+    hub.sql.exec("UPDATE jobs SET status='claimed',lease_epoch=1 WHERE id='root-timer'");
+    hub.sql.exec("UPDATE leases SET epoch=1,holder_job_id='root-timer',expires_at=?,acquired_at=? WHERE name='root'",future,past);
     expect(due()).toBe(Date.parse(past)+300000);
-    const changed=raw.exec("UPDATE jobs SET status='running',started_at=? WHERE id='root-timer'",at);changed.toArray();
+    const changed=hub.sql.exec("UPDATE jobs SET status='running',started_at=? WHERE id='root-timer'",at);changed.toArray();
     expect(changed.rowsRead).toBeLessThan(100);expect(due()).toBe(Date.parse(future));
-    raw.exec("UPDATE jobs SET status='done' WHERE id='root-timer'");
+    hub.sql.exec("UPDATE jobs SET status='done' WHERE id='root-timer'");
     expect(raw.exec("SELECT id FROM hub_background_work WHERE id='job-deadline:root-timer'").toArray()).toEqual([]);
   }));
 

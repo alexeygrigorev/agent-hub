@@ -63,12 +63,21 @@ export class BackgroundWorkQueue {
     install('session_control_wakes','wake','session-wake',"NEW.state IN ('pending','queued','delivered')",wakeDue,'NEW.id','json_array(NEW.state,NEW.command_id,NEW.delivered_at)');
     install('session_control_pings','ping','session-wake',"NEW.state='active'",'NEW.next_at_ms',"'ping:'||NEW.id",'json_array(NEW.state,NEW.last_command_id)');
     const deliveryDue = `COALESCE(${epoch('NEW.next_attempt_at')},${epoch('NEW.created_at')},0)`;
+    // A point-owned reverse binding avoids building an index over retained
+    // delivery history. Legacy queued rows still retain their real deadline.
+    this.sql.exec('CREATE TABLE IF NOT EXISTS session_delivery_command_bindings(delivery_id TEXT PRIMARY KEY,command_id TEXT NOT NULL UNIQUE) WITHOUT ROWID');
+    for (const event of ['INSERT','UPDATE OF status,command_id']) this.sql.exec(`CREATE TRIGGER IF NOT EXISTS hub_delivery_command_${event === 'INSERT' ? 'insert' : 'update'}
+      AFTER ${event} ON session_deliveries WHEN NEW.status='queued' AND NEW.command_id IS NOT NULL AND NEW.command_id<>'' BEGIN
+      INSERT INTO session_delivery_command_bindings(delivery_id,command_id) VALUES(NEW.id,NEW.command_id)
+      ON CONFLICT(delivery_id) DO UPDATE SET command_id=excluded.command_id WHERE command_id IS NOT excluded.command_id; END`);
+    this.sql.exec(`CREATE TRIGGER IF NOT EXISTS hub_delivery_command_delete AFTER DELETE ON session_deliveries
+      BEGIN DELETE FROM session_delivery_command_bindings WHERE delivery_id=OLD.id; END`);
     install('session_deliveries','delivery','webhook-delivery',"NEW.status IN ('pending','queued')",deliveryDue,'NEW.id','json_array(NEW.status,NEW.command_id,NEW.attempts)');
     this.sql.exec(`CREATE TRIGGER IF NOT EXISTS hub_background_delivery_ack AFTER UPDATE OF ack_json ON session_control_commands
       WHEN NEW.ack_json IS NOT OLD.ack_json AND NEW.ack_json IS NOT NULL BEGIN
       UPDATE session_deliveries SET next_attempt_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-      WHERE id IN(SELECT id FROM session_deliveries INDEXED BY session_deliveries_command_queued
-        WHERE command_id=NEW.id AND status='queued' LIMIT 129); END`);
+      WHERE id=(SELECT delivery_id FROM session_delivery_command_bindings WHERE command_id=NEW.id)
+        AND command_id=NEW.id AND status='queued'; END`);
 
     this.tx(() => {
     if(this.sql.exec('SELECT done FROM hub_background_entity_seed WHERE id=1').toArray()[0]?.done)return;

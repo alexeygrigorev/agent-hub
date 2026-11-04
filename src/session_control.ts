@@ -117,7 +117,6 @@ CREATE TABLE IF NOT EXISTS session_worktree_episode_notes (subject TEXT NOT NULL
 CREATE TABLE IF NOT EXISTS session_worktree_episodes (subject TEXT PRIMARY KEY, active INTEGER NOT NULL, generation INTEGER NOT NULL, completed INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS session_control_proofs (reply_envelope_id TEXT PRIMARY KEY, command_id TEXT NOT NULL, session_id TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS fleet_catalog_seen (machine_id TEXT PRIMARY KEY, observed_at TEXT NOT NULL);
-CREATE INDEX IF NOT EXISTS fleet_catalog_seen_fresh ON fleet_catalog_seen(observed_at, machine_id);
 CREATE TABLE IF NOT EXISTS session_stale_reconciliations (session_id TEXT PRIMARY KEY, previous_state TEXT NOT NULL, reason TEXT NOT NULL, at TEXT NOT NULL);
 `;
 
@@ -176,17 +175,26 @@ const ACTIVE_HEARTBEAT_MS = 10 * 60 * 1000;
 /** Single server-side definition of "active", shared by web and CLI (hub-1101-outage-20261031):
  * pending (queued/held/offered) rows, or starting/running/uncertain rows whose host reported a
  * fresh heartbeat. Used by the list filter, the tree and `active_count`. */
-function activeSessionsSql(nowMs: number): { sql: string; params: any[] } {
+export class FreshCatalogObservationLimit extends Error {
+  readonly status=503;
+  constructor(readonly code='fresh_catalog_observation_limited'){super(code);}
+}
+function activeSessionsSql(sql:SqlStorage,nowMs: number): { sql: string; params: any[] } {
+  if(!Number.isFinite(nowMs))throw new FreshCatalogObservationLimit();
   const cutoff = new Date(nowMs - ACTIVE_HEARTBEAT_MS).toISOString();
+  // Stable facts may be memoized, but freshness is evaluated for this call's
+  // clock. Complete raw host IDs precede time filters and delimiter packing.
+  const rows=sql.exec('SELECT machine_id,observed_at FROM fleet_catalog_seen ORDER BY machine_id LIMIT 65').toArray();
+  if(rows.length>64||rows.some(row=>!isValidMachineId(row.machine_id)||typeof row.observed_at!=='string'||!Number.isFinite(Date.parse(row.observed_at))))throw new FreshCatalogObservationLimit();
+  const hosts=rows.filter(row=>Date.parse(String(row.observed_at))>=nowMs-ACTIVE_HEARTBEAT_MS).map(row=>String(row.machine_id));
+  const packed=hosts.length?'|'+hosts.join('|')+'|':'';
   return {
     sql: `(state = 'queued' OR state = 'held' OR state = 'offered' OR ((state = 'starting' OR state = 'running' OR state = 'uncertain') AND EXISTS (
       SELECT 1 FROM fleet_sessions f WHERE f.machine_id = session_control_sessions.machine_id
       AND f.native_id = json_extract(session_control_sessions.binding_json, '$.native_id')
       AND f.phase != 'exited' AND f.phase != 'dead' AND f.phase != 'pruned' AND f.phase != 'forgotten' AND f.phase != 'unobserved'
-      AND (f.observed_at >= ? OR instr(COALESCE((
-        SELECT '|' || group_concat(c.machine_id, '|') || '|' FROM fleet_catalog_seen c WHERE c.observed_at >= ?
-      ), ''), '|' || f.machine_id || '|') > 0))))`,
-    params: [cutoff, cutoff],
+      AND (f.observed_at >= ? OR instr(?, '|' || f.machine_id || '|') > 0))))`,
+    params: [cutoff, packed],
   };
 }
 /** Literal must match the partial indexes session_control_live_created / _live_actor_created. */
@@ -195,6 +203,14 @@ const ACTIVE_COUNT_CAP = 1000;
 /** FROM clause for live-only reads: forces the partial live index so only non-terminal rows are walked. */
 function liveFrom(admin: boolean): string {
   return `session_control_sessions INDEXED BY ${admin ? 'session_control_live_created' : 'session_control_live_actor_created'}`;
+}
+/** A complete raw live prefix bounds the later freshness predicate even when
+ * every retained running row is stale. Actor scope remains an indexed prefix. */
+function assertBoundedActiveCandidates(sql:SqlStorage,observeAll:boolean,actor?:string):void {
+  const rows=observeAll
+    ?sql.exec(`SELECT id FROM ${liveFrom(true)} WHERE ${LIVE_STATES_SQL} ORDER BY created_at DESC,id DESC LIMIT ?`,ACTIVE_COUNT_CAP+1).toArray()
+    :sql.exec(`SELECT id FROM ${liveFrom(false)} WHERE actor=? AND ${LIVE_STATES_SQL} ORDER BY created_at DESC,id DESC LIMIT ?`,actor,ACTIVE_COUNT_CAP+1).toArray();
+  if(rows.length>ACTIVE_COUNT_CAP)throw new FreshCatalogObservationLimit('active_session_observation_limited');
 }
 const TREE_LIMIT_DEFAULT = 200;
 const TREE_LIMIT_MAX = 500;
@@ -2580,7 +2596,12 @@ export class SessionControlService {
   }
 
   async handle(request: Request, auth: Auth): Promise<Response> {
-    const result = await this.dispatch(request, auth);
+    let result:Response;
+    try{result=await this.dispatch(request,auth);}
+    catch(error){
+      if(error instanceof FreshCatalogObservationLimit)return response({error:error.code,observation_pending:true},503);
+      throw error;
+    }
     const command = /^\/api\/session-commands\/([a-f0-9-]{36})\//.exec(new URL(request.url).pathname);
     if (command && result.status >= 400 && auth.caller) {
       const row: any = this.sql.exec("SELECT payload_json FROM session_control_commands WHERE id = ? AND kind = 'message'", command[1]).toArray()[0];
@@ -3246,7 +3267,8 @@ export class SessionControlService {
       // `limit` rows; `include=all` adds terminal sessions but stays capped.
       const treeLimit = Math.min(TREE_LIMIT_MAX, Math.max(1, Number(url.searchParams.get('limit')) || TREE_LIMIT_DEFAULT));
       const treeAll = url.searchParams.get('include') === 'all';
-      const activeFrag = activeSessionsSql(this.now());
+      const activeFrag = treeAll?{sql:'',params:[]}:activeSessionsSql(this.sql,this.now());
+      if(!treeAll)assertBoundedActiveCandidates(this.sql,admin,caller.actor);
       const stateSql = treeAll ? '' : `AND ${LIVE_STATES_SQL} AND ${activeFrag.sql}`;
       const treeFrom = treeAll ? 'session_control_sessions' : liveFrom(admin);
       const stateArgs: any[] = treeAll ? [] : activeFrag.params;
@@ -3310,6 +3332,12 @@ export class SessionControlService {
 
     if (path === '/api/sessions' && request.method === 'GET') {
       if (!writer) return response({ error: 'forbidden' }, 403);
+      // Ordinary lists expose active_count. Refuse incomplete authority
+      // BEFORE GET's existing reconciliation/promote/wake side effects.
+      // Lifecycle and breakdown have their own independently bounded views.
+      const ordinary=!['lifecycle','breakdown'].includes(url.searchParams.get('view')??'');
+      const activityProof=ordinary?activeSessionsSql(this.sql,this.now()):null;
+      if(ordinary)assertBoundedActiveCandidates(this.sql,observeAll,caller.actor);
       this.transaction(() => {
         reconcileUnboundFleetSessions(this.sql, this.now());
         this.reconcileHeldSessions();
@@ -3355,8 +3383,9 @@ export class SessionControlService {
       let cursorSql = this.cursorClause(cursor, params, true);
       const liveOnly = url.searchParams.get('live') === '1' || url.searchParams.get('active') === '1';
       const listFrom = liveOnly ? liveFrom(observeAll) : 'session_control_sessions';
+      const countFrag=activityProof!;
       if (liveOnly) {
-        const frag = activeSessionsSql(this.now());
+        const frag = countFrag;
         cursorSql += ` AND ${LIVE_STATES_SQL} AND ${frag.sql}`;
         params.push(...frag.params);
       }
@@ -3366,8 +3395,8 @@ export class SessionControlService {
       ).filter((r: any) => observeAll || this.ownerOk(r, caller));
       const page = rows.slice(0, limit);
       const next = rows.length > limit ? `${(page[page.length - 1] as any).created_at}|${(page[page.length - 1] as any).id}` : null;
-      const countFrag = activeSessionsSql(this.now());
-      // Capped count over the partial live index: bounded by ACTIVE_COUNT_CAP matches, never a base-table scan.
+      // The complete raw live prefix above bounds this later predicate scan;
+      // ACTIVE_COUNT_CAP remains the public count/match ceiling.
       const countFrom = liveFrom(observeAll);
       const activeCount = Number((observeAll
         ? this.sql.exec(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM ${countFrom} WHERE ${LIVE_STATES_SQL} AND ${countFrag.sql} LIMIT ?)`, ...countFrag.params, ACTIVE_COUNT_CAP)
@@ -5046,18 +5075,19 @@ export function promoteStartedOffers(sql: SqlStorage, nowMs: number, scope: { la
  * repeat: live/uncertain launches and bound sessions are never reaped. */
 export function reconcileStaleSessions(sql: SqlStorage, nowMs: number, batch = 200): { reconciled: number; remaining: number } {
   sql.exec('CREATE TABLE IF NOT EXISTS session_stale_reconciliations (session_id TEXT PRIMARY KEY, previous_state TEXT NOT NULL, reason TEXT NOT NULL, at TEXT NOT NULL)');
-  const frag = activeSessionsSql(nowMs);
+  const frag = activeSessionsSql(sql,nowMs);
+  assertBoundedActiveCandidates(sql,true);
   // Grace: never touch rows updated in the last hour (fresh launches that have not reported yet).
   const grace = new Date(nowMs - 3600_000).toISOString();
   const where = `state IN ('starting','running','uncertain','offered') AND updated_at < ? AND NOT ${frag.sql}`;
-  const rows = sql.exec(`SELECT id, state FROM session_control_sessions WHERE ${where} LIMIT ?`, grace, ...frag.params, batch).toArray() as any[];
+  const rows = sql.exec(`SELECT id, state FROM ${liveFrom(true)} WHERE ${LIVE_STATES_SQL} AND ${where} LIMIT ?`, grace, ...frag.params, batch).toArray() as any[];
   const at = new Date(nowMs).toISOString();
   for (const row of rows) {
     sql.exec("INSERT OR IGNORE INTO session_stale_reconciliations (session_id, previous_state, reason, at) VALUES (?, ?, 'stale_no_heartbeat', ?)", row.id, row.state, at);
     sql.exec("UPDATE session_control_sessions SET state = 'stopped', updated_at = ? WHERE id = ?", at, row.id);
   }
   // LIMIT 1 probe: 1 means "at least one more batch", 0 means converged.
-  const remaining = sql.exec(`SELECT 1 AS n FROM session_control_sessions WHERE ${where} LIMIT 1`, grace, ...frag.params).toArray().length;
+  const remaining = sql.exec(`SELECT 1 AS n FROM ${liveFrom(true)} WHERE ${LIVE_STATES_SQL} AND ${where} LIMIT 1`, grace, ...frag.params).toArray().length;
   return { reconciled: rows.length, remaining };
 }
 
