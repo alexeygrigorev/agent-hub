@@ -77,7 +77,6 @@ import { placementPressureSubjects } from './host-pressure';
 import { RowsMeter, ROWS_STATS_SCHEMA, normalizeRoute, rowsReadReport, rowsReadAlertThreshold, rowsWrittenAlertThreshold, ROWS_READ_TARGET_PER_DAY } from './rows-meter';
 import { sampleAccountCapacityHistory } from './account-capacity-history';
 import { RowBudget, RowBudgetExceeded } from './row-budget';
-import { backfillOnce } from './sql-probes';
 import { WriteWatch } from './write-watch';
 import { ObservedCatalog } from './observed-catalog';
 
@@ -937,13 +936,8 @@ export class Hub extends DurableObject {
       native_session_id: 'TEXT'
     });
 
-    // If audit was upgraded from SPEC §6 where ts existed instead of at:
-    const auditInfo = this.sql.exec("PRAGMA table_info(audit)").toArray() as any[];
-    const hasAt = auditInfo.some(c => c.name.toLowerCase() === 'at');
-    const hasTs = auditInfo.some(c => c.name.toLowerCase() === 'ts');
-    if (hasAt && hasTs) {
-      backfillOnce(this.sql, 'audit_timestamp_upgrade', () => this.sql.exec("UPDATE audit SET at = ts WHERE at IS NULL AND ts IS NOT NULL"));
-    }
+    // Legacy SPEC§6 audit.ts is retained verbatim. Its new `at` field stays
+    // explicitly unknown; construction never rewrites historical audit rows.
 
     this.sql.exec("INSERT OR IGNORE INTO leases (name, epoch) VALUES ('root', 0)");
     ensureRootScheduling(this.sql);

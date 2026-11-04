@@ -358,7 +358,7 @@ describe('session scheduled wakes', () => {
     });
   });
 
-  it('backfills the acknowledgement window from a pre-upgrade native receipt', async () => {
+  it('repairs only the requested acknowledgement window from a pre-upgrade native receipt', async () => {
     await fixture(async (s, sql) => {
       const sess = await startAndBind(s, sql, 'wake-upgrade-receipt-window');
       const response = await s.handle(request(`/api/sessions/${sess.id}/wake`, {
@@ -374,7 +374,8 @@ describe('session scheduled wakes', () => {
 
       fixtureStatements(sql).exec("DELETE FROM hub_init_stamps WHERE key='wake_native_receipt_v2'"); // recreate the pre-upgrade migration state
       s.init();
-
+      expect(fixtureStatements(sql).exec('SELECT delivered_at FROM session_control_wakes WHERE id=?',wake.wake_id).toArray()[0].delivered_at).toBe(oldEnqueueTime);
+      s.processDueWakes(wake.wake_id);
       expect(fixtureStatements(sql).exec('SELECT state,delivered_at FROM session_control_wakes WHERE id=?', wake.wake_id).toArray()[0])
         .toMatchObject({ state: 'delivered', delivered_at: receiptTime });
     });

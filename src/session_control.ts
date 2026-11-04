@@ -1,5 +1,4 @@
 import { workerChildObservation } from './worker-child-observation';
-import { backfillOnce } from './sql-probes';
 import { WORKER_STATUSES, cleanReportedExit } from './worker-outcome';
 import { insertSessionObservation, observedHubTagMatches, observationModel, observedIntakeCandidates, observationIntakeRevision } from './session-observation';
 import { bindingMoveAllowed } from './session-binding-move';
@@ -471,25 +470,8 @@ export class SessionControlService {
     // Intake e8a22f4c: host command polls filter by state; without this each poll walked the machine's whole
     // session history. Callers must not count index writes in rowsWritten (see the claim, which uses RETURNING).
     this.sql.exec("CREATE INDEX IF NOT EXISTS session_control_commands_state ON session_control_commands(state, session_id)");
-    // Older builds marked a wake delivered when the Hub merely queued its
-    // command. Reclassify unacknowledged rows without a host inbox receipt so
-    // they continue through the queued-receipt path instead of preserving a
-    // false delivery timestamp across upgrade.
-    this.transaction(() => backfillOnce(this.sql, 'wake_native_receipt_v2', () => {
-      this.sql.exec(`UPDATE session_control_wakes SET state='queued', delivered_at=NULL, updated_at=?
-        WHERE state='delivered' AND acked_at IS NULL AND EXISTS (
-          SELECT 1 FROM session_control_commands WHERE id=session_control_wakes.command_id
-          AND state!='acked' AND COALESCE(host_status,'') NOT IN
-            ('waiting in inbox for recipient','delivered; awaiting recipient reply'))`, this.at());
-      // Seek each wake's command by primary key. The previous IN subqueries
-      // materialized the entire command history on every DO cold start.
-      this.sql.exec(`UPDATE session_control_wakes SET delivered_at = (
-          SELECT updated_at FROM session_control_commands WHERE id=session_control_wakes.command_id)
-        WHERE state='delivered' AND acked_at IS NULL AND delivered_at = (
-          SELECT created_at FROM session_control_commands WHERE id=session_control_wakes.command_id)
-        AND EXISTS (SELECT 1 FROM session_control_commands WHERE id=session_control_wakes.command_id
-          AND COALESCE(host_status,'') IN ('waiting in inbox for recipient','delivered; awaiting recipient reply'))`);
-    }));
+    // Legacy wake receipts are upgraded only for the exact request/queue
+    // entity below. Construction never repairs retained wake history.
     // M15c lifecycle: additive observations/decisions tables. Server-owned
     // DDL (single authority: src/session_lifecycle.ts schema string); the
     // host keeps no DDL copy. No ALTERs to existing tables here.
@@ -827,7 +809,7 @@ export class SessionControlService {
     if (!binding || typeof binding.native_id !== 'string' || !binding.native_id) return false;
     if (!session.machine_id) return false;
     try {
-      const live = classifyKey(this.sql, `${session.machine_id}/${binding.native_id}`, this.now());
+      const live = classifyKey(this.sql, `${session.machine_id}/${binding.native_id}`, this.now(), {machine_id:session.machine_id,native_id:binding.native_id});
       if (!live) return false;
       if (live.refs?.protected_session) return false;
       if (live.group !== 'finished_stale') return false;
@@ -1087,10 +1069,41 @@ export class SessionControlService {
   /** Durable wake sweep: deliver due wakes through the verified send path and
    * expire unacked deliveries. Survives Worker/host restarts (DO SQLite).
    * Called opportunistically on session reads and from the Hub tick/alarm. */
+  /** Request/queue-owned repair for one known legacy wake only. A queued
+   * command never proves native delivery, and only its exact send tuple may
+   * correct the historical receipt timestamp. No constructor/global stamp. */
+  public upgradeWakeNativeReceipt(wakeId:string):any {
+    return this.transaction(()=>{
+      const wake:any=this.sql.exec('SELECT * FROM session_control_wakes WHERE id=?',wakeId).toArray()[0];
+      if(!wake||wake.state!=='delivered'||wake.acked_at!=null||!wake.command_id)return wake;
+      const command:any=this.sql.exec('SELECT * FROM session_control_commands WHERE id=?',wake.command_id).toArray()[0];
+      if(!command)return wake;
+      if(command.kind!=='send'||command.session_id!==wake.session_id||command.actor!==wake.actor
+        ||command.request_key!==`wake-${wake.id}-${command.id}`)throw new Error('wake_receipt_binding_invalid');
+      const observed=['waiting in inbox for recipient','delivered; awaiting recipient reply'].includes(command.host_status);
+      const updatedAt=this.at();
+      if(command.state!=='acked'&&!observed) {
+        const changed=this.sql.exec(`UPDATE session_control_wakes SET state='queued',delivered_at=NULL,updated_at=?
+          WHERE id=? AND state='delivered' AND acked_at IS NULL AND session_id=? AND command_id=? AND delivered_at IS ? RETURNING id`,
+          updatedAt,wake.id,wake.session_id,wake.command_id,wake.delivered_at).toArray().length;
+        return changed?{...wake,state:'queued',delivered_at:null,updated_at:updatedAt}:wake;
+      }
+      if(observed&&typeof command.created_at==='string'&&wake.delivered_at===command.created_at
+        &&command.updated_at!==wake.delivered_at) {
+        const changed=this.sql.exec(`UPDATE session_control_wakes SET delivered_at=?,updated_at=?
+          WHERE id=? AND state='delivered' AND acked_at IS NULL AND session_id=? AND command_id=? AND delivered_at IS ? RETURNING id`,
+          command.updated_at,updatedAt,wake.id,wake.session_id,wake.command_id,wake.delivered_at).toArray().length;
+        return changed?{...wake,delivered_at:command.updated_at,updated_at:updatedAt}:wake;
+      }
+      return wake;
+    });
+  }
+
   public processDueWakes(wakeId?: string): { delivered: number; acked: number; missed: number } {
     let delivered = 0, acked = 0, missed = 0;
     const nowMs = this.now();
     const at = this.at();
+    if(wakeId)this.upgradeWakeNativeReceipt(wakeId);
     let due: any[] = [];
     try {
       due = (wakeId ? this.sql.exec("SELECT * FROM session_control_wakes WHERE id=? AND state='pending' AND wake_at_ms<=?", wakeId, nowMs)
@@ -1182,8 +1195,10 @@ export class SessionControlService {
       awaiting = (wakeId ? this.sql.exec("SELECT * FROM session_control_wakes WHERE id=? AND state='delivered'", wakeId)
         : this.sql.exec("SELECT * FROM session_control_wakes WHERE state = 'delivered' ORDER BY delivered_at ASC, id ASC LIMIT 100")).toArray() as any[];
     } catch { awaiting = []; }
-    for (const wake of awaiting) {
+    for (const storedWake of awaiting) {
       try {
+        const wake=this.upgradeWakeNativeReceipt(storedWake.id);
+        if(!wake||wake.state!=='delivered')continue;
         const cmd: any = wake.command_id
           ? this.sql.exec('SELECT * FROM session_control_commands WHERE id = ?', wake.command_id).toArray()[0]
           : null;

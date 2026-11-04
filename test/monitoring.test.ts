@@ -71,17 +71,18 @@ describe('Disk Monitoring Service', () => {
     insert('malformed',3600,'{broken');
     insert('invalid-elements',1800,JSON.stringify({filesystems:['invalid',42,null]}));
     expect(trend()).toMatchObject({sample_count:2,growth_bytes_per_day:240});
-    // Simulate an interrupted legacy backfill; init must repopulate once.
+    // Retained legacy history is never repaired by constructor startup.
     sql.exec('DELETE FROM disk_trend_samples');
     sql.exec('DELETE FROM disk_trend_projection_meta');
     hub.monitoringService.init();
-    expect(trend()).toMatchObject({sample_count:2,growth_bytes_per_day:240});
+    expect(trend()).toMatchObject({state:'insufficient_history',reason:'calculation_error'});
+    expect(sql.exec('SELECT id FROM disk_trend_projection_meta').toArray()).toEqual([]);
     const projected = sql.exec('SELECT * FROM disk_trend_samples ORDER BY id,ordinal').toArray();
     hub.monitoringService.init();
     expect(sql.exec('SELECT * FROM disk_trend_samples ORDER BY id,ordinal').toArray()).toEqual(projected);
     sql.exec("DELETE FROM disk_observations WHERE id='old'");
     expect(sql.exec("SELECT id FROM disk_trend_samples WHERE id='old'").toArray()).toHaveLength(0);
-    expect(trend()).toMatchObject({state:'insufficient_history',reason:'insufficient_samples'});
+    expect(trend()).toMatchObject({state:'insufficient_history',reason:'calculation_error'});
   }));
   it('formats bytes correctly', () => {
     expect(formatBytes(0)).toBe('0 B');

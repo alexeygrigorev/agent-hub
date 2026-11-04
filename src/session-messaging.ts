@@ -60,7 +60,7 @@ export function initSessionMessaging(sql: SqlStorage): void {
     credential_family TEXT, delegates_json TEXT NOT NULL DEFAULT '[]', forward_session_id TEXT,
     created_by TEXT NOT NULL, created_at TEXT NOT NULL, disabled_at TEXT)`);
   backfillOnce(sql, 'named_agents:agents', () => sql.exec(`INSERT OR IGNORE INTO named_agents (name, display, created_by, created_at)
-    SELECT tag, tag, 'hub:migration', COALESCE(registered_at, '') FROM agents WHERE project = 'agent'`));
+    SELECT tag, tag, 'hub:migration', COALESCE(registered_at, '') FROM agents WHERE project = 'agent'`), false, ['agents']);
   sql.exec(`CREATE TRIGGER IF NOT EXISTS named_agent_registry_insert AFTER INSERT ON agents WHEN NEW.project = 'agent' BEGIN
     INSERT OR IGNORE INTO named_agents (name, display, created_by, created_at) VALUES (NEW.tag, NEW.tag, 'hub:registry', COALESCE(NEW.registered_at, ''));
     END`);

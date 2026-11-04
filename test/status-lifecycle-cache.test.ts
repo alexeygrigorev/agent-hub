@@ -263,7 +263,15 @@ it('reuses generation-keyed SQL reads across census writes and covers every cach
       .map(match=>match[1]).filter(table=>tables.has(table))));
     const triggers=new Set(h.sql.exec("SELECT tbl_name FROM sqlite_master WHERE type='trigger' AND name LIKE 'status_source_%'")
       .toArray().map((r:any)=>r.tbl_name));
-    expect([...touched].sort()).toEqual([...triggers].sort());
+    // Conditional unknown-linkage branches need not read every dependency.
+    // Every table actually memoized MUST still have durable invalidation.
+    for(const table of touched)expect(triggers.has(table),'cached source '+table).toBe(true);
+    const required=['session_control_sessions','fleet_launches','session_control_protections',
+      'session_lifecycle_observations','intake_task_projection','credentials','lifecycle_request_projection',
+      'status_observations','session_lifecycle_decisions','intake_link_health_meta','intake_link_health','intake_projection_link_refs'];
+    expect([...triggers].sort()).toEqual(required.sort());
+    for(const table of ['intake_link_health_meta','intake_link_health','intake_projection_link_refs'])
+      expect(triggers.has(table),'linkage authority dependency '+table).toBe(true);
     expect(touched.has('fleet_sessions')).toBe(false);
     const normalized=(value:any)=>({inputs:value.inputs,refs:[...value.refs]});
     const fresh=()=>normalized(buildSessionInputs(h.sql,ids));

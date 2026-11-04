@@ -2,7 +2,8 @@ import type {SqlStorage} from '@cloudflare/workers-types';
 const MAX_LINK_BYTES=2*1024*1024;
 const invalid=(value:string)=>`CASE WHEN json_valid(${value}) THEN CASE WHEN json_type(${value})='array'
  AND json_array_length(${value})<=128 AND length(CAST(${value} AS BLOB))<=${MAX_LINK_BYTES} THEN 0 ELSE 1 END ELSE 1 END`;
-/** Schema/triggers only. Construction never enumerates retained projections. */
+/** Construction may prove an empty source with one indexed row; retained
+ * projections are checked only by bounded request pages, never hydrated here. */
 export function initIntakeLinkHealth(sql:SqlStorage,registerTriggers=false):void {
  const tables=['intake_link_health','intake_link_health_meta'];
  const present=tables.every(name=>sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name=?",name).toArray().length>0);
@@ -15,7 +16,12 @@ export function initIntakeLinkHealth(sql:SqlStorage,registerTriggers=false):void
  INSERT INTO intake_link_health(id) SELECT NEW.id WHERE ${invalid('NEW.links')} ON CONFLICT(id) DO NOTHING;
  DELETE FROM intake_link_health WHERE id=NEW.id AND NOT(${invalid('NEW.links')}); END`);
  sql.exec('CREATE TRIGGER IF NOT EXISTS intake_link_health_delete AFTER DELETE ON intake_task_projection BEGIN DELETE FROM intake_link_health WHERE id=OLD.id; END');
- if(!ready)sql.exec("INSERT INTO intake_link_health_meta VALUES(1,'',0) ON CONFLICT(id) DO UPDATE SET after_id='',complete=0");
+ if(!ready) {
+  // Triggers already cover every subsequent source mutation. A newly empty
+  // source is complete now; an existing incomplete marker is never promoted.
+  const empty=sql.exec('SELECT 1 FROM intake_task_projection LIMIT 1').toArray().length===0;
+  sql.exec("INSERT INTO intake_link_health_meta VALUES(1,'',?) ON CONFLICT(id) DO UPDATE SET after_id='',complete=excluded.complete",empty?1:0);
+ }
 }
 /** One bounded request page. Concurrent/source writes maintain their own exact
  * health entry, including inserts lexically before the durable cursor. */

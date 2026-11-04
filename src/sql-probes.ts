@@ -39,11 +39,23 @@ export function rewriteSchemaProbe(query: string): string | null {
  * A one-row stamp (point lookup) records that the backfill has completed.
  * (A whole-table COUNT(*) is not free: workerd bills every row it counts.)
  */
-export function backfillOnce(sql: { exec: (q: string, ...a: any[]) => any }, key: string, backfill: () => void, repair = false): void {
+export class ProjectionObservationPending extends Error {
+  readonly code = 'projection_observation_pending';
+  readonly status = 503;
+  constructor() { super('Projection receipt missing; bounded operator repair required'); }
+}
+
+export function backfillOnce(sql: { exec: (q: string, ...a: any[]) => any }, key: string, backfill: () => void, repair = false, sources: readonly string[] = []): void {
   sql.exec('CREATE TABLE IF NOT EXISTS hub_init_stamps (key TEXT PRIMARY KEY, at INTEGER NOT NULL)');
-  // `repair` reruns the idempotent backfill on demand (tests, operator repair).
   if (!repair && sql.exec('SELECT 1 FROM hub_init_stamps WHERE key=?', key).toArray().length) return;
+  // Default callers are constructors: only a proven empty source may run.
+  // Explicit repair is request/operator owned and remains bounded before the
+  // callback. Never publish a completion receipt for unobserved legacy rows.
+  if (!sources.length || sources.some(table => !IDENT.test(table))) throw new ProjectionObservationPending();
+  for (const table of sources) {
+    const rows = sql.exec(`SELECT 1 FROM ${table} LIMIT ${repair ? 129 : 1}`).toArray();
+    if (rows.length > (repair ? 128 : 0)) throw new ProjectionObservationPending();
+  }
   backfill();
   sql.exec('INSERT OR IGNORE INTO hub_init_stamps VALUES(?,?)', key, Date.now());
 }
-

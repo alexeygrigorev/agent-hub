@@ -32,7 +32,7 @@ export function initResourceRequestProjection(sql: SqlStorage, table: RequestTab
     DELETE FROM resource_request_projection WHERE source='${table}' AND id=OLD.id; END`);
   backfillOnce(sql, 'resource_request_projection:' + table, () => sql.exec(`INSERT INTO resource_request_projection(source,id,request_json)
     SELECT '${table}',s.id,${jsonFields('s.request_json',RESOURCE_FIELDS)} FROM ${table} s
-    WHERE NOT EXISTS(SELECT 1 FROM resource_request_projection p WHERE p.source='${table}' AND p.id=s.id)`), opts.repair);
+    WHERE NOT EXISTS(SELECT 1 FROM resource_request_projection p WHERE p.source='${table}' AND p.id=s.id)`), opts.repair, [table]);
 }
 
 export function resourceRequest(table: RequestTable, id: string, raw: string): string {

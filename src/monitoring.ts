@@ -411,10 +411,10 @@ export class MonitoringService {
       INSERT INTO disk_trend_samples ${project('NEW.', '')}; END`);
     this.sql.exec('CREATE TRIGGER IF NOT EXISTS disk_trend_delete AFTER DELETE ON disk_observations BEGIN DELETE FROM disk_trend_samples WHERE id=OLD.id; END');
     if (!this.sql.exec('SELECT id FROM disk_trend_projection_meta WHERE id=1').toArray().length) {
-      this.sql.exec(`INSERT OR REPLACE INTO disk_trend_samples ${project('d.', 'disk_observations d, ')}`);
-      this.sql.exec(`INSERT INTO disk_trend_revision SELECT machine_id,lower(hex(randomblob(16))) FROM (SELECT DISTINCT machine_id FROM disk_observations) WHERE 1
-        ON CONFLICT(machine_id) DO UPDATE SET revision=excluded.revision`);
-      this.sql.exec('INSERT INTO disk_trend_projection_meta VALUES(1)');
+      // Only an empty source certifies a new write-through projection. Legacy
+      // retained history is operator work, never constructor JSON repair.
+      if(!this.sql.exec('SELECT 1 FROM disk_observations INDEXED BY idx_disk_obs_machine LIMIT 1').toArray().length)
+        this.sql.exec('INSERT INTO disk_trend_projection_meta VALUES(1)');
     }
   }
 
@@ -1096,6 +1096,7 @@ export class MonitoringService {
   /** Read numeric trend inputs once per host, never full consumer histories. */
   private trendSamples(machineId: string, now: number): Map<string, TrendSample[]> | null {
     try {
+      if(!this.sql.exec('SELECT id FROM disk_trend_projection_meta WHERE id=1').toArray().length)return null;
       const revision=String(this.sql.exec('SELECT revision FROM disk_trend_revision WHERE machine_id=?',machineId).toArray()[0]?.revision ?? 'initial');
       let cached=this.trendCache.get(machineId);
       if(!cached || cached.revision!==revision) {
@@ -1833,6 +1834,23 @@ export class MonitoringService {
 
       const detail = `Supervisor ${svc.service_id} on ${machineId}: worker is ${svc.worker}, status age ${effectiveAgeAtNowS !== null ? effectiveAgeAtNowS + 's' : 'unknown'} (${effectiveReason})`;
 
+      // Persist source/identity transitions, not the wall-clock age derived on
+      // every GET. The durable row is the comparison authority, so rollback
+      // cannot leave an in-memory "already persisted" marker behind.
+      let previous:any=null;
+      try { previous=JSON.parse(row?.details_json??'null'); } catch { /* legacy/malformed details need one checkpoint */ }
+      if (row && row.resolved_at===null && row.state===problemState &&
+          previous?.worker===svc.worker && previous?.observed_at===svc.observed_at &&
+          previous?.reason===effectiveReason && previous?.source_reason===svc.reason &&
+          previous?.source_status_file_age_s===(svc.status_file_age_s??null) &&
+          previous?.outer_observed_at_ms===outerObsMs) {
+        return {episode_key:episodeKey,action:'unchanged',state:problemState};
+      }
+      const detailsJson=JSON.stringify({
+        worker:svc.worker,status_file_age_s:effectiveAgeAtNowS,observed_at:svc.observed_at,reason:effectiveReason,
+        source_status_file_age_s:svc.status_file_age_s??null,source_reason:svc.reason,outer_observed_at_ms:outerObsMs,
+      });
+
       if (!row || row.resolved_at !== null) {
         let alertId: number | null = null;
         if (this.liveness) {
@@ -1847,13 +1865,6 @@ export class MonitoringService {
             }
           }
         }
-
-        const detailsJson = JSON.stringify({
-          worker: svc.worker,
-          status_file_age_s: effectiveAgeAtNowS,
-          observed_at: svc.observed_at,
-          reason: effectiveReason,
-        });
 
         this.sql.exec(
           `INSERT INTO supervisor_episodes (episode_key, machine_id, service_id, state, opened_at, last_updated_at, resolved_at, alert_id, details_json)
@@ -1884,12 +1895,6 @@ export class MonitoringService {
             detail,
           });
         }
-        const detailsJson = JSON.stringify({
-          worker: svc.worker,
-          status_file_age_s: effectiveAgeAtNowS,
-          observed_at: svc.observed_at,
-          reason: effectiveReason,
-        });
         this.sql.exec(
           'UPDATE supervisor_episodes SET state = ?, last_updated_at = ?, details_json = ? WHERE episode_key = ?',
           problemState,
@@ -1919,22 +1924,24 @@ export class MonitoringService {
   getHostHealthStatus(
     now: number = this.now(),
     machineFilter?: string,
-  ): { snapshot_at: string; machines: HostHealthSummary[] } {
+  ): { snapshot_at: string; machines: HostHealthSummary[]; observation_pending:boolean } {
     let query = 'SELECT machine_id, observed_at, observed_at_ms, payload_json FROM host_health_observations';
     const params: any[] = [];
     if (machineFilter) {
       query += ' WHERE machine_id = ?';
       params.push(machineFilter);
     }
-    query += ' ORDER BY machine_id ASC';
+    query += machineFilter?' ORDER BY machine_id ASC LIMIT 1':' ORDER BY machine_id ASC LIMIT 65';
 
     let rows: any[] = [];
     try {
       rows = this.sql.exec(query, ...params).toArray() as any[];
     } catch {
-      return { snapshot_at: new Date(now).toISOString(), machines: [] };
+      return { snapshot_at: new Date(now).toISOString(), machines: [],observation_pending:true };
     }
 
+    let observationPending=!machineFilter&&rows.length>64;
+    rows=rows.slice(0,machineFilter?1:64);
     const machines: HostHealthSummary[] = [];
     // Placement pressure is read-only visibility here: queued holds (>5 min),
     // hard rejections recorded at reserve time, and recent terminal failures
@@ -1949,7 +1956,7 @@ export class MonitoringService {
       try {
         payload = JSON.parse(r.payload_json);
       } catch {
-        continue;
+        observationPending=true;continue;
       }
       const ageMs = now - r.observed_at_ms;
       const freshness: 'fresh' | 'stale' | 'unavailable' =
@@ -2052,6 +2059,7 @@ export class MonitoringService {
     return {
       snapshot_at: new Date(now).toISOString(),
       machines,
+      observation_pending:observationPending,
     };
   }
 
@@ -2125,13 +2133,16 @@ export class MonitoringService {
 
   /** Condensed summary projection for StatusService (hub status / needs-attention). */
   getStatusSummary(now: number = this.now()): {
+    observation_pending:boolean;
     filesystems: any[];
     host_health: HostHealthSummary[];
     needs_attention: any[];
     categories_entry: any;
   } {
     const full = this.getDiskStatus(now);
+    const diskObservationPending=full.observation_pending===true;
     const healthStatus = this.getHostHealthStatus(now);
+    const observationPending=diskObservationPending||healthStatus.observation_pending;
     const filesystems: any[] = [];
     const hostHealth: HostHealthSummary[] = [];
     const needsAttention: any[] = [];
@@ -2292,6 +2303,7 @@ export class MonitoringService {
           error: fs.error ?? null,
           observed_at: m.observed_at,
           freshness: m.freshness,
+          observation_pending:m.observation_pending===true,
           growth_per_day_bytes: fs.trend?.growth_bytes_per_day ?? null,
           growth_per_day_pct: fs.trend?.growth_pct_per_day ?? null,
           trend_state: fs.trend?.state ?? 'unknown',
@@ -2327,14 +2339,16 @@ export class MonitoringService {
       ? 'stale'
       : 'fresh';
 
-    const coverage = !filesystems.length
+    const coverage = observationPending ? 'partial' : !filesystems.length
       ? 'unavailable'
       : (hasErrors || anyStale || anyUnavailable)
       ? 'partial'
       : 'complete';
 
     let reason = 'linux_stdlib_statvfs_and_bounded_top_consumers';
-    if (!filesystems.length) {
+    if(observationPending) {
+      reason=diskObservationPending?'disk_observation_limited':'host_health_observation_limited';
+    } else if (!filesystems.length) {
       reason = 'no_disk_observations_recorded';
     } else if (hasErrors && (anyStale || anyUnavailable)) {
       reason = 'filesystem_errors_reported_and_host_stale';
@@ -2344,17 +2358,19 @@ export class MonitoringService {
       reason = 'one_or_more_hosts_stale_or_unreachable';
     }
 
-    const state = !filesystems.length
+    const state = observationPending ? 'partially_collected_disk_monitoring' : !filesystems.length
       ? 'unknown_not_collected'
       : hasErrors
       ? 'collected_disk_monitoring_with_errors'
       : 'collected_disk_monitoring';
 
     return {
+      observation_pending:observationPending,
       filesystems,
       host_health: hostHealth,
       needs_attention: needsAttention,
       categories_entry: {
+        observation_pending:observationPending,
         state,
         source: 'host_disk_monitor_stdlib_statvfs',
         observed_at: latestObservedIso,

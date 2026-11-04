@@ -15,17 +15,18 @@ const get = (path: string) => new Request('https://hub.test' + path, { method: '
 
 function metered(sql: any) {
   const cursors: any[] = [];
+  const statements:{sql:string;cursor:any}[]=[];
   const proxy = new Proxy(sql, {
     get(target, prop) {
-      if (prop === 'exec') return (q: string, ...args: any[]) => { const c = target.exec(q, ...args); cursors.push(c); return c; };
+      if (prop === 'exec') return (q: string, ...args: any[]) => { const c = target.exec(q, ...args); cursors.push(c);statements.push({sql:q,cursor:c}); return c; };
       const v = target[prop];
       return typeof v === 'function' ? v.bind(target) : v;
     },
   });
   const measure = async (fn: () => any) => {
-    cursors.length = 0;
+    cursors.length = 0;statements.length=0;
     const out = await fn();
-        return { read: cursors.reduce((n, c) => n + c.rowsRead, 0), out };
+        return { read: cursors.reduce((n, c) => n + c.rowsRead, 0), out,statements:statements.map(({sql,cursor})=>({sql,read:cursor.rowsRead,written:cursor.rowsWritten})) };
   };
   return { proxy, measure };
 }
@@ -76,7 +77,7 @@ describe('worktree-guards bounded read (4d05302a)', () => {
 
       const call = async (qs: string) => {
         const m = await measure(async () => (await s.handle(get('/api/sessions/worktree-guards' + qs), host('hetzner') as any)).json());
-        return { read: m.read, body: m.out as any };
+        return { read: m.read, body: m.out as any,statements:(m as any).statements };
       };
       const targeted = await call(`?session_id=${live}`);
       expect(targeted.body.sessions.map((f: any) => f.session_id)).toEqual([live]);
@@ -109,6 +110,11 @@ describe('worktree-guards bounded read (4d05302a)', () => {
         SELECT printf('11111111-0000-4000-8000-%012d', i), 'demo:assistant', 'rk-' || i, '{"workspace":"demo"}', 'hist-' || i, 'hetzner', 'claude', 'headless', 'stopped',
           '2026-09-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z' FROM c`);
       const grown = await call(`?session_id=${live}`);
+      console.log('worktree-guards history-growth native receipt',JSON.stringify({
+        initial:{read:targeted.read,observation_pending:targeted.body.observation_pending??false,
+          fact:targeted.body.sessions[0],statements:targeted.statements},
+        grown:{read:grown.read,observation_pending:grown.body.observation_pending??false,
+          fact:grown.body.sessions[0],statements:grown.statements},delta:grown.read-targeted.read}));
       expect(Math.abs(grown.read - targeted.read)).toBeLessThanOrEqual(20);
       // Every statement the endpoint can issue is indexed.
       const plan = (q: string, ...a: any[]) => (fixtureStatements(sql).exec('EXPLAIN QUERY PLAN ' + q, ...a).toArray() as any[]).map(r => r.detail).join('\n');

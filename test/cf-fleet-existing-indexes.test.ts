@@ -1,4 +1,5 @@
-import {buildSessionInputs,LifecycleObservationLimit} from '../src/session_lifecycle_registry';
+import {intakeLinkHealth} from '../src/intake-link-health';
+import {buildSessionInputs,classifyKey,LifecycleObservationLimit} from '../src/session_lifecycle_registry';
 import {fixtureSql} from './helpers/fixture-budget';
 import { describe,expect,it } from 'vitest';
 import { env,runInDurableObject } from 'cloudflare:test';
@@ -293,6 +294,109 @@ describe('Fleet recovery and paging use deployed indexes',()=>{
         THEN json_extract(c.binding_json,'$.native_id') END END=+k.native_id LIMIT 1025`,JSON.stringify([['host','selected-native-0']]))
       .toArray().map((r:any)=>r.detail).join(' | ');
     expect(plan).toContain('machine_id=? AND <expr>=?');expect(plan).not.toMatch(/TEMP B-TREE/);
+  }));
+
+  it('classifies exact native targets independently of retained archives and refuses ambiguous keys or alias overflow',()=>fixture(async(hub)=>{
+    const setup=fixtureSql(hub);
+    for(let i=0;i<2100;i++) {
+      setup.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at)
+        VALUES(?,'agent:owner',?,'{}','host','codex','headless','stopped',?,?,?)`,
+        'history-'+i,'history-'+i,JSON.stringify({native_id:'history-native-'+i}),AT,AT);
+      launch(setup,'history-launch-'+i,'stopped');
+      setup.exec('UPDATE fleet_launches SET native_id=? WHERE id=?','history-native-'+i,'history-launch-'+i);
+      setup.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,workspace)
+        VALUES('host',?,?,'codex','exited',?,'/repo')`,'history-native-'+i,'history-tag-'+i,AT);
+    }
+    setup.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,workspace)
+      VALUES('host','target-native','target','codex','exited',?,'/repo')`,AT);
+    await hub.rowBudget.begin(true);const day=hub.rowBudget.status().day;
+    expect(intakeLinkHealth(hub.sql,true).ready).toBe(true);
+    let probe=0;const costs:any[]=[];
+    const read=()=>{
+      const scope='test:targeted-lifecycle-'+probe++;
+      const value=hub.meter.runSync(scope,()=>classifyKey(hub.sql,'host/target-native',NOW,{machine_id:'host',native_id:'target-native'}));
+      const work=hub.meter.snapshot()[scope];
+      expect(work.rows_read).toBeLessThan(300);expect(work.rows_written).toBe(0);
+      costs.push({probe:scope,rows_read:work.rows_read,rows_written:work.rows_written});
+      return value;
+    };
+    expect(read()?.refs).toMatchObject({native_id:'target-native',session_id:null,protected_session:false});
+    launch(setup,'native-target-launch','stopped');
+    setup.exec("UPDATE fleet_launches SET native_id='target-native',requester_kind='agent' WHERE id='native-target-launch'");
+    launch(setup,'preferred-target-launch','stopped');
+    const alias=(id:string)=>setup.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,fleet_launch_id,created_at,updated_at)
+      VALUES(?,'agent:owner',?,'{}','host','codex','headless','stopped',?,'preferred-target-launch',?,?)`,
+      id,id,JSON.stringify({native_id:'target-native',workspace:'/repo'}),AT,AT);
+    alias('oldest-target-alias');alias('newer-target-alias');
+    expect(read()?.refs).toMatchObject({session_id:'oldest-target-alias',fleet_launch_id:'preferred-target-launch',human_owned:true,protected_session:true});
+    setup.exec("UPDATE fleet_launches SET requester_kind='agent',actor='agent:owner' WHERE id='preferred-target-launch'");
+    expect(read()?.refs).toMatchObject({human_owned:false,protected_session:false});
+    setup.exec("INSERT INTO session_control_protections(session_id,actor,request_key,created_at) VALUES('oldest-target-alias','agent:owner','keep',?)",AT);
+    expect(read()?.refs.protected_session).toBe(true);
+    expect(classifyKey(hub.sql,'host/target-native',NOW)?.refs.session_id).toBe('oldest-target-alias');
+    expect(classifyKey(hub.sql,'missing/native',NOW)).toBeNull();
+    expect(classifyKey(hub.sql,'host/target-native',NOW,{machine_id:'other',native_id:'target-native'})).toBeNull();
+    setup.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,workspace)
+      VALUES('split/a','b','split1','codex','exited',?,'/repo'),('split','a/b','split2','codex','exited',?,'/repo')`,AT,AT);
+    expect(()=>classifyKey(hub.sql,'split/a/b',NOW)).toThrow(LifecycleObservationLimit);
+    expect(()=>classifyKey(hub.sql,'a/'.repeat(66)+'b',NOW)).toThrow(LifecycleObservationLimit);
+    for(let i=0;i<127;i++)alias('overflow-target-'+i);
+    hub.meter.runSync('test:targeted-lifecycle-overflow',()=>expect(()=>classifyKey(hub.sql,'host/target-native',NOW,
+      {machine_id:'host',native_id:'target-native'})).toThrow(LifecycleObservationLimit));
+    const overflow=hub.meter.snapshot()['test:targeted-lifecycle-overflow'];
+    expect(overflow.rows_read).toBeLessThan(300);expect(overflow.rows_written).toBe(0);
+    console.log(JSON.stringify({evidence:'route_service_native_cost',operation:'classifyKey exactnative',history_per_table:2100,probes:costs,overflow,excludes:'outerauth, KVledger and fixtureseeding'}));
+    expect(hub.rowBudget.status()).toMatchObject({day,limit_total:20000,stopped:false});
+  }));
+
+  it('constructors do not repair retained wake/audit history and exact wake receipt upgrades touch only their entity',()=>fixture(async(hub)=>{
+    const setup=fixtureSql(hub),now=Date.now(),created=new Date(now-1000).toISOString(),receipt=new Date(now).toISOString();
+    setup.exec('ALTER TABLE audit ADD COLUMN ts TEXT');
+    for(let i=0;i<2100;i++) {
+      setup.exec("INSERT INTO audit(actor,action,at,ts) VALUES('fixture','retained',?,?)",created,created);
+      setup.exec(`INSERT INTO session_control_wakes(id,session_id,actor,request_key,wake_at_ms,wake_at,prompt,state,created_at,updated_at,acked_at)
+        VALUES(?,'session-target','actor',?,?,?,'fixture','acked',?,?,?)`,'history-wake-'+i,'history-wake-'+i,now-1000,created,created,created,created);
+    }
+    const wake=(id:string,command:string)=>setup.exec(`INSERT INTO session_control_wakes(id,session_id,actor,request_key,wake_at_ms,wake_at,prompt,state,command_id,created_at,updated_at,delivered_at)
+      VALUES(?,'session-target','actor',?,?,?,'fixture','delivered',?,?,?,?)`,id,id,now-1000,created,command,created,created,created);
+    const command=(id:string,wakeId:string,status:string|null,session='session-target')=>setup.exec(`INSERT INTO session_control_commands
+      (id,session_id,kind,actor,request_key,payload_json,state,generation,correlation,created_at,updated_at,host_status)
+      VALUES(?,?,'send','actor',?,'{"body":"fixture"}','recorded',1,?,?,?,?)`,
+      id,session,`wake-${wakeId}-${id}`,'cmd:'+id+':gen:1',created,receipt,status);
+    wake('receipt-target','receipt-command');command('receipt-command','receipt-target','waiting in inbox for recipient');
+    wake('queue-target','queue-command');command('queue-command','queue-target',null);
+    wake('foreign-target','foreign-command');command('foreign-command','foreign-target','waiting in inbox for recipient','other-session');
+    setup.exec("CREATE TRIGGER fixture_no_ctor_wake_repair BEFORE UPDATE ON session_control_wakes BEGIN SELECT RAISE(ABORT,'constructor_wake_repair'); END");
+    setup.exec("CREATE TRIGGER fixture_no_ctor_audit_repair BEFORE UPDATE ON audit BEGIN SELECT RAISE(ABORT,'constructor_audit_repair'); END");
+    await hub.rowBudget.begin(true);const day=hub.rowBudget.status().day;
+    hub.meter.runSync('test:no-constructor-history-repair',()=>{hub.initDb();hub.sessionControlService.init();});
+    const sql=hub.meter.statementTop(1500).filter((statement:any)=>statement.scope==='test:no-constructor-history-repair').map((statement:any)=>statement.sql);
+    expect(sql.some((query:string)=>/^UPDATE (?:audit|session_control_wakes)\b/i.test(query.trim()))).toBe(false);
+    expect(setup.exec("SELECT delivered_at FROM session_control_wakes WHERE id='receipt-target'").one().delivered_at).toBe(created);
+    expect(setup.exec("SELECT COUNT(*) AS n FROM audit WHERE at=? AND ts=?",created,created).one().n).toBe(2100);
+    setup.exec('DROP TRIGGER fixture_no_ctor_wake_repair');
+    const service=hub.sessionControlService;
+    hub.meter.runSync('test:exact-wake-upgrade',()=>service.upgradeWakeNativeReceipt('receipt-target'));
+    expect(setup.exec("SELECT state,delivered_at FROM session_control_wakes WHERE id='receipt-target'").one())
+      .toMatchObject({state:'delivered',delivered_at:receipt});
+    expect(setup.exec("SELECT delivered_at FROM session_control_wakes WHERE id='queue-target'").one().delivered_at).toBe(created);
+    service.processDueWakes('queue-target');
+    expect(setup.exec("SELECT state,delivered_at FROM session_control_wakes WHERE id='queue-target'").one())
+      .toMatchObject({state:'queued',delivered_at:null});
+    hub.meter.runSync('test:foreign-wake-upgrade',()=>expect(()=>service.upgradeWakeNativeReceipt('foreign-target')).toThrow('wake_receipt_binding_invalid'));
+    expect(hub.meter.snapshot()['test:foreign-wake-upgrade'].rows_written).toBe(0);
+    expect(setup.exec("SELECT state,delivered_at FROM session_control_wakes WHERE id='foreign-target'").one())
+      .toMatchObject({state:'delivered',delivered_at:created});
+    wake('cas-target','cas-command');command('cas-command','cas-target','waiting in inbox for recipient');
+    setup.exec("CREATE TRIGGER fixture_ignore_wake_upgrade BEFORE UPDATE ON session_control_wakes WHEN OLD.id='cas-target' BEGIN SELECT RAISE(IGNORE); END");
+    const ignored=hub.meter.runSync('test:ignored-wake-upgrade',()=>service.upgradeWakeNativeReceipt('cas-target'));
+    expect(ignored.delivered_at).toBe(created);
+    expect(hub.meter.snapshot()['test:ignored-wake-upgrade'].rows_written).toBe(0);
+    expect(setup.exec("SELECT delivered_at FROM session_control_wakes WHERE id='cas-target'").one().delivered_at).toBe(created);
+    setup.exec('DROP TRIGGER fixture_ignore_wake_upgrade');
+    expect(service.upgradeWakeNativeReceipt('cas-target').delivered_at).toBe(receipt);
+    expect(setup.exec("SELECT COUNT(*) AS n FROM session_control_wakes WHERE state='acked'").one().n).toBe(2100);
+    expect(hub.rowBudget.status()).toMatchObject({day,limit_total:20000,stopped:false});
   }));
 
   it('maps legacy three-part session cursors to the existing primary-key order',()=>fixture(async(_hub,raw)=>{

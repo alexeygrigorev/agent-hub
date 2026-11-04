@@ -8,6 +8,26 @@ const fixture=(fn:(x:any)=>void)=>(runInDurableObject as any)((env as any).HUB.g
  fn({h,state,setup,meter,sql});
 });
 describe('complete bounded intake-link health',()=>{
+ it('certifies only a newly empty source without promoting existing incomplete progress',()=>fixture(({h,state,setup,meter,sql}:any)=>{
+  const day=h.rowBudget.status().day;
+  for(const name of ['intake_link_health_insert','intake_link_health_update','intake_link_health_delete'])setup.exec('DROP TRIGGER IF EXISTS '+name);
+  setup.exec('DROP TABLE intake_link_health');setup.exec('DROP TABLE intake_link_health_meta');
+  meter.runSync('new-empty',()=>initIntakeLinkHealth(sql,true));
+  expect(setup.exec('SELECT complete FROM intake_link_health_meta WHERE id=1').one()).toEqual({complete:1});
+  expect(meter.snapshot()['new-empty'].rows_read).toBeLessThan(100);
+  setup.exec("INSERT INTO intake_task_projection VALUES('later','{}','invalid')");
+  expect(intakeLinkHealth(sql,false)).toEqual({ready:false,complete:true});
+  setup.exec("UPDATE intake_task_projection SET links='[]' WHERE id='later'");
+  expect(intakeLinkHealth(sql,false)).toEqual({ready:true,complete:true});
+  setup.exec("UPDATE intake_link_health_meta SET complete=0,after_id='legacy-progress' WHERE id=1");
+  initIntakeLinkHealth(sql,true);
+  expect(setup.exec('SELECT after_id,complete FROM intake_link_health_meta WHERE id=1').one()).toEqual({after_id:'legacy-progress',complete:0});
+  expect(()=>state.storage.transactionSync(()=>{
+   sql.exec("UPDATE intake_link_health_meta SET complete=1 WHERE id=1");throw new Error('rollback-empty-proof');
+  })).toThrow('rollback-empty-proof');
+  expect(intakeLinkHealth(sql,false)).toEqual({ready:false,complete:false});
+  expect(h.rowBudget.status()).toMatchObject({day,limit_total:20000,stopped:false});
+ }));
  it('keeps cold initialization empty and advances32request rows while representing writes behind the cursor',()=>fixture(({setup,meter,sql}:any)=>{
   for(const name of ['intake_link_health_insert','intake_link_health_update','intake_link_health_delete'])setup.exec('DROP TRIGGER IF EXISTS '+name);
   setup.exec('DROP TABLE intake_link_health');setup.exec('DROP TABLE intake_link_health_meta');

@@ -149,7 +149,7 @@ export function initLifecycleRequestProjection(sql: SqlStorage): void {
     DELETE FROM lifecycle_request_projection WHERE id=OLD.id; END`);
   backfillOnce(sql, 'lifecycle_request_projection', () => sql.exec(`INSERT INTO lifecycle_request_projection SELECT c.id,
     ${jsonFields('c.request_json',['provenance','workspace','cwd'])},${brief('c.request_json')}
-    FROM session_control_sessions c WHERE NOT EXISTS(SELECT 1 FROM lifecycle_request_projection p WHERE p.id=c.id)`));
+    FROM session_control_sessions c WHERE NOT EXISTS(SELECT 1 FROM lifecycle_request_projection p WHERE p.id=c.id)`), false, ['session_control_sessions']);
 }
 
 /** Canonical identity union. Only sessions with a native identity
@@ -161,7 +161,9 @@ export class LifecycleObservationLimit extends Error {
   constructor(){super('lifecycle_observation_limit');}
 }
 
-function joinedBases(sql: SqlStorage, sessionIds?: Set<string>): JoinedBase[] {
+export type LifecycleNativeIdentity={machine_id:string;native_id:string};
+
+function joinedBases(sql: SqlStorage, sessionIds?: Set<string>, providedIdentities?:readonly LifecycleNativeIdentity[]): JoinedBase[] {
   const byKey = new Map<string, JoinedBase>();
   const get = (machine_id: string, native_id: string): JoinedBase => {
     const key = `${machine_id}/${native_id}`;
@@ -174,7 +176,19 @@ function joinedBases(sql: SqlStorage, sessionIds?: Set<string>): JoinedBase[] {
   };
   // Status supplies only session ids referenced by its bounded task page.
   // Batch canonical joins rather than materializing the entire fleet archive.
-  const selected = sessionIds ? [...sessionIds] : null;
+  const targeted=providedIdentities!==undefined;
+  const selected=sessionIds?[...sessionIds]:targeted?[]:null;
+  if(targeted) {
+    if(providedIdentities.length>64)throw new LifecycleObservationLimit();
+    const composite=new Map<string,string>();
+    for(const pair of providedIdentities) {
+      if(typeof pair?.machine_id!=='string'||!pair.machine_id||typeof pair.native_id!=='string'||!pair.native_id
+        ||pair.machine_id.length+pair.native_id.length+1>512)throw new LifecycleObservationLimit();
+      const key=pair.machine_id+'/'+pair.native_id,exact=JSON.stringify([pair.machine_id,pair.native_id]);
+      if(composite.has(key)&&composite.get(key)!==exact)throw new LifecycleObservationLimit();
+      composite.set(key,exact);
+    }
+  }
   let projected = false;
   try { projected = sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='lifecycle_request_projection'").toArray().length > 0; } catch(error) {if(error instanceof RowBudgetExceeded)throw error;}
   const columns = (table: string) => {
@@ -209,6 +223,10 @@ function joinedBases(sql: SqlStorage, sessionIds?: Set<string>): JoinedBase[] {
       const pair:[string,string]=[row.machine_id,binding.native_id];
       unique.set(JSON.stringify(pair),pair);
     }
+    for(const pair of providedIdentities??[]) {
+      const tuple:[string,string]=[pair.machine_id,pair.native_id];
+      unique.set(JSON.stringify(tuple),tuple);
+    }
     return nativeIdentities=JSON.stringify([...unique.values()]);
   };
   const read = (table: string): any[] => {
@@ -226,7 +244,7 @@ function joinedBases(sql: SqlStorage, sessionIds?: Set<string>): JoinedBase[] {
     const ids=new Set<number>();
     if(table==='session_control_sessions')for(const row of direct){rows.set(row._join_order,row);ids.add(row._join_order);}
     if(table==='fleet_launches') {
-      const launches=[...new Set(direct.map(row=>row.fleet_launch_id).filter(id=>typeof id==='string'))];
+      const launches=[...new Set((targeted?scRows:direct).map(row=>row.fleet_launch_id).filter(id=>typeof id==='string'))];
       if(launches.length)for(const row of sql.exec(`SELECT c.rowid AS matched_rowid FROM json_each(?) ids
         CROSS JOIN fleet_launches c ON c.id=ids.value`,JSON.stringify(launches)).toArray() as any[])ids.add(row.matched_rowid);
     }
@@ -236,13 +254,22 @@ function joinedBases(sql: SqlStorage, sessionIds?: Set<string>): JoinedBase[] {
     const target=table==='session_control_sessions'?nativeId:'c.native_id';
     // Materialize only identity keys. The exact deployed index prefixes seek
     // aliases, and the GLOBAL raw sentinel precedes any request JSON hydration.
-    const aliases=sql.exec(`WITH identities AS MATERIALIZED (
+    const aliases:any[]=[];
+    if(targeted) {
+      for(const [machine,native] of JSON.parse(identities()) as [string,string][]) {
+        const raw=sql.exec(`SELECT c.rowid AS matched_rowid FROM ${table} c${hint}
+          WHERE c.machine_id=? AND ${target}=? LIMIT 129`,machine,native).toArray() as any[];
+        if(raw.length>128)throw new LifecycleObservationLimit();
+        aliases.push(...raw);
+        if(aliases.length>aliasLimit)throw new LifecycleObservationLimit();
+      }
+    } else aliases.push(...sql.exec(`WITH identities AS MATERIALIZED (
       SELECT json_extract(value,'$[0]') AS machine_id,json_extract(value,'$[1]') AS native_id FROM json_each(?))
       SELECT c.rowid AS matched_rowid FROM identities k CROSS JOIN ${table} c${hint}
-      ON c.machine_id=k.machine_id AND ${target}=+k.native_id LIMIT 1025`,identities()).toArray() as any[];
+      ON c.machine_id=k.machine_id AND ${target}=+k.native_id LIMIT 1025`,identities()).toArray() as any[]);
     if(aliases.length>aliasLimit)throw new LifecycleObservationLimit();
     for(const row of aliases)ids.add(row.matched_rowid);
-    if(ids.size>aliasLimit)throw new LifecycleObservationLimit();
+    if(ids.size>(targeted?128:aliasLimit))throw new LifecycleObservationLimit();
     const missing=[...ids].filter(id=>!rows.has(id));
     if(missing.length)for(const row of sql.exec(`SELECT c.rowid AS _join_order,${projection}
       FROM json_each(?) ids CROSS JOIN ${table} c ON c.rowid=ids.value ${joinProjection(table)}`,
@@ -277,7 +304,7 @@ function joinedBases(sql: SqlStorage, sessionIds?: Set<string>): JoinedBase[] {
   }
   for (const fleet of fleetRows) {
     if (!fleet.machine_id || !fleet.native_id) continue;
-    if (sessionIds && !byKey.has(`${fleet.machine_id}/${fleet.native_id}`)) continue;
+    if (sessionIds && !targeted && !byKey.has(`${fleet.machine_id}/${fleet.native_id}`)) continue;
     const base = get(fleet.machine_id, fleet.native_id);
     if (!base.fleet) base.fleet = fleet;
   }
@@ -451,8 +478,8 @@ function checkObservationPayload(input: any): { ok: true; stored: Record<string,
 /** Build trusted classifier inputs from canonical joins + stored
  * observations. Owner/provenance/human/engine/task linkage always come
  * from canonical rows; observations supply host-verified flags only. */
-export function buildSessionInputs(sql: SqlStorage, sessionIds?: Set<string>, options: { taskLinks?: boolean } = {}): { inputs: SessionInput[]; refs: Map<string, LifecycleRefs> } {
-  const bases = joinedBases(sql, sessionIds);
+export function buildSessionInputs(sql: SqlStorage, sessionIds?: Set<string>, options: { taskLinks?: boolean;nativeIdentities?:readonly LifecycleNativeIdentity[] } = {}): { inputs: SessionInput[]; refs: Map<string, LifecycleRefs> } {
+  const bases = joinedBases(sql, sessionIds,options.nativeIdentities);
   const observations = observationsByKey(sql,bases.map(base=>base.key));
   // Callers that read only protection/ownership refs (worktree-guards) skip the
   // selected intake links; task_refs/report_refs are then deliberately skipped.
@@ -608,11 +635,36 @@ export function buildLifecycleView(
 }
 
 /** Classify one joined key (used to gate decisions on live facts). */
-export function classifyKey(sql: SqlStorage, session_key: string, now_ms?: number): (ClassifiedSession & { refs: LifecycleRefs }) | null {
-  const { inputs, refs } = buildSessionInputs(sql);
-  const input = inputs.find((candidate) => `${candidate.machine_id}/${candidate.native_id}` === session_key);
-  if (!input) return null;
-  return { ...classifySession(input, now_ms === undefined ? {} : { now_ms }), refs: refs.get(session_key)! };
+export function classifyKey(sql:SqlStorage,session_key:string,now_ms?:number,trustedIdentity?:LifecycleNativeIdentity):
+  (ClassifiedSession & {refs:LifecycleRefs})|null {
+  let identity=trustedIdentity;
+  if(identity) {
+    if(session_key!==identity.machine_id+'/'+identity.native_id)return null;
+  } else {
+    if(typeof session_key!=='string'||session_key.length>512)return null;
+    const candidates:LifecycleNativeIdentity[]=[];
+    for(let at=session_key.indexOf('/');at>=0;at=session_key.indexOf('/',at+1)) {
+      if(at>0&&at<session_key.length-1)candidates.push({machine_id:session_key.slice(0,at),native_id:session_key.slice(at+1)});
+      if(candidates.length>64)throw new LifecycleObservationLimit();
+    }
+    for(const candidate of candidates) {
+      // Only controls or observed natives establish a joined base. A launch
+      // alone must not invent a native or establish cleanup authority.
+      const present=sql.exec('SELECT 1 FROM fleet_sessions WHERE machine_id=? AND native_id=? LIMIT 1',
+        candidate.machine_id,candidate.native_id).toArray().length || sql.exec(`SELECT 1 FROM session_control_sessions
+        INDEXED BY session_control_native WHERE machine_id=? AND CASE WHEN json_valid(binding_json)
+          THEN CASE WHEN json_type(binding_json,'$.native_id')='text' THEN json_extract(binding_json,'$.native_id') END END=? LIMIT 1`,
+        candidate.machine_id,candidate.native_id).toArray().length;
+      if(!present)continue;
+      if(identity)throw new LifecycleObservationLimit();
+      identity=candidate;
+    }
+    if(!identity)return null;
+  }
+  const {inputs,refs}=buildSessionInputs(sql,undefined,{nativeIdentities:[identity]});
+  const input=inputs.find(candidate=>candidate.machine_id===identity.machine_id&&candidate.native_id===identity.native_id);
+  if(!input)return null;
+  return {...classifySession(input,now_ms===undefined?{}:{now_ms}),refs:refs.get(session_key)!};
 }
 
 export function recordObservation(

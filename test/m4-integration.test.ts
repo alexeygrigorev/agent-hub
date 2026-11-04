@@ -795,7 +795,8 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
       expect(oldJob.id).toBe('spec6-job-1');
       const oldAudit = fixtureSql(instance).exec("SELECT * FROM audit WHERE action = 'test_init'").toArray()[0] as any;
       expect(oldAudit.actor).toBe('system');
-      expect(oldAudit.at).toBe(now);
+      expect(oldAudit.at).toBeNull(); // Legacy timestamp is unknown, never constructor-repaired.
+      expect(oldAudit.ts).toBe(now);
       expect(fixtureSql(instance).exec("SELECT epoch FROM leases WHERE name='root'").one().epoch).toBe(0);
       expect(()=>fixtureSql(instance).exec("INSERT INTO jobs(id,kind,status,created_at) VALUES('spec6-job-1','generic','completed',?)",now)).toThrow();
       fixtureSql(instance).exec("INSERT INTO machines(id,name,hostname,registered_at) VALUES('legacy-host','legacy-host','legacy-host',?)",now);

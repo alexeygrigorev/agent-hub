@@ -333,6 +333,9 @@ export class StatusService {
   }
   private cachedSourceRows(query:string,...bindings:any[]):Obj[] {
     const revision=this.lifecycleCacheReady ? this.one('SELECT revision FROM status_source_revision WHERE id=1')?.revision : null;
+    return this.cachedSourceRowsAtRevision(revision,query,...bindings);
+  }
+  private cachedSourceRowsAtRevision(revision:unknown,query:string,...bindings:any[]):Obj[] {
     const ready=typeof revision==='string' && !!revision;
     if(!ready || revision!==this.statusSourceRevision) {
       this.statusSourceRows.clear();this.statusSourceBytes=0;
@@ -404,13 +407,17 @@ export class StatusService {
     // All their tables have rollback-safe status_source triggers above;
     // cachedSourceRows retains at most four MiB and bypasses oversized reads.
     let complete = true;
+    // The builder is synchronous and read-only. Its source generation cannot
+    // change between these SELECTs; the next invocation reads it afresh, which
+    // also discards any rows observed inside a subsequently rolled-back txn.
+    const sourceRevision=this.one('SELECT revision FROM status_source_revision WHERE id=1')?.revision;
     const source = new Proxy(this.sql, { get: (target, key) => {
       if (key !== 'exec') return Reflect.get(target, key);
       return (query: string, ...bindings: any[]) => {
         return { toArray: () => {
           try {
             return /\bfleet_sessions\b/i.test(query)
-              ? target.exec(query, ...bindings).toArray() : this.cachedSourceRows(query, ...bindings);
+              ? target.exec(query, ...bindings).toArray() : this.cachedSourceRowsAtRevision(sourceRevision,query, ...bindings);
           } catch (error) { complete = false; throw error; }
         }};
       };
@@ -595,17 +602,40 @@ export class StatusService {
         FROM session_control_sessions INDEXED BY session_control_state
         WHERE state IN ('starting','running') LIMIT 257`);
       if(controlSessions.length>limit)return unknown('control_source_limit');
-      for(const native of fleetSessions) {
-        if(native.tag==null || /^(?:ping-|probe-)/i.test(String(native.tag)) || native.engine==='probe')continue;
+      const countedNatives=fleetSessions.filter(native=>native.tag!=null&&!/^(?:ping-|probe-)/i.test(String(native.tag))&&native.engine!=='probe');
+      const identities=countedNatives.map(native=>({machine_id:native.machine_id,native_id:native.native_id}));
+      const bindingsByPosition=new Map<number,Obj[]>();
+      if(identities.length)for(const row of this.rows(`WITH requested AS MATERIALIZED (
+        SELECT CAST(key AS INTEGER) AS position,json_extract(value,'$.machine_id') AS machine_id,
+          json_extract(value,'$.native_id') AS native_id FROM json_each(?))
+        SELECT r.position,c.session_type FROM requested r CROSS JOIN session_control_sessions c
+        WHERE c.rowid IN (SELECT s.rowid FROM session_control_sessions s INDEXED BY intake_queue_session_native
+          WHERE s.machine_id=r.machine_id AND json_extract(CASE WHEN json_valid(s.binding_json) THEN s.binding_json ELSE '{}' END,'$.native_id')=r.native_id
+          ORDER BY s.rowid LIMIT 2)`,JSON.stringify(identities))) {
+        const key=Number(row.position),group=bindingsByPosition.get(key)??[];group.push(row);bindingsByPosition.set(key,group);
+      }
+      const observations=new Map<string,Obj>();
+      const observationKeys=countedNatives.map(n=>String(n.machine_id)+'/'+String(n.native_id));
+      if(observationKeys.length)for(const observed of this.rows(`SELECT session_key,machine_id,native_id,payload_json
+        FROM session_lifecycle_observations WHERE session_key IN (SELECT value FROM json_each(?))`,JSON.stringify(observationKeys)))
+        observations.set(String(observed.session_key),observed);
+      const controlBindings=controlSessions.filter(control=>control.session_type!=='probe'&&control.engine!=='probe').flatMap(control=>{
+        let nativeId:unknown;try{nativeId=JSON.parse(control.binding_json)?.native_id;}catch{}
+        return typeof nativeId==='string'&&control.machine_id!=null?[{id:control.id,machine_id:control.machine_id,native_id:nativeId}]:[];
+      });
+      const nativeControls=new Set<string>();
+      if(controlBindings.length)for(const row of this.rows(`WITH requested AS MATERIALIZED (
+        SELECT json_extract(value,'$.id') AS id,json_extract(value,'$.machine_id') AS machine_id,
+          json_extract(value,'$.native_id') AS native_id FROM json_each(?))
+        SELECT r.id FROM requested r CROSS JOIN fleet_sessions f
+        WHERE f.machine_id=r.machine_id AND f.native_id=r.native_id`,JSON.stringify(controlBindings)))nativeControls.add(String(row.id));
+      for(const [position,native] of countedNatives.entries()) {
         // Preserve the original LEFT JOIN over ALL control states. Multiple
         // aliases cannot be collapsed into one exact count; refuse ambiguity.
-        const bindings=this.rows(`SELECT session_type FROM session_control_sessions INDEXED BY intake_queue_session_native
-          WHERE machine_id=? AND json_extract(CASE WHEN json_valid(binding_json) THEN binding_json ELSE '{}' END,'$.native_id')=? LIMIT 2`,
-          native.machine_id,native.native_id);
+        const bindings=bindingsByPosition.get(position)??[];
         if(bindings.length>1)return unknown('native_control_ambiguous');
         if(bindings[0]?.session_type==='probe')continue;
-        const observed=this.rows('SELECT machine_id,native_id,payload_json FROM session_lifecycle_observations WHERE session_key=?',
-          String(native.machine_id)+'/'+String(native.native_id))[0];
+        const observed=observations.get(String(native.machine_id)+'/'+String(native.native_id));
         let obs:Obj={};
         if(observed) {
           if(observed.machine_id!==native.machine_id || observed.native_id!==native.native_id)return unknown('observation_identity_mismatch');
@@ -619,10 +649,7 @@ export class StatusService {
       }
       for(const control of controlSessions) {
         if(control.session_type==='probe' || control.engine==='probe')continue;
-        let nativeId:unknown;
-        try {nativeId=JSON.parse(control.binding_json)?.native_id;} catch { /* NULL/invalid binding has no native match */ }
-        if(typeof nativeId==='string' && control.machine_id!=null && this.rows(
-          'SELECT 1 FROM fleet_sessions WHERE machine_id=? AND native_id=?',control.machine_id,nativeId).length)continue;
+        if(nativeControls.has(String(control.id)))continue;
         running++;
       }
     } catch { return unknown('source_read_failed'); }
