@@ -42,7 +42,9 @@ export default {
         path === '/api/named-agents' ||
         /^\/api\/named-agents\/[^/]+\/grants$/.test(path) ||
         path === '/api/directory' ||
-        path.startsWith('/api/routes/')
+        path.startsWith('/api/routes/') ||
+        path === '/api/shared-credentials' ||
+        path.startsWith('/api/shared-credentials/')
       )
         return control.fetch(
           await forwardRequest(request, CONTROL + path + requestUrl(request).search, actor),

@@ -2189,6 +2189,19 @@ def sync(request=None):
             request('POST', '/api/engines/' + b['label'], {'revision': b['revision'], 'authenticated': authenticated})
         from . import engine_login
         engine_login.tick(response.get('logins', []), installed_bundles, request)
+        # Hub-shared host credentials and the shared-config bundle
+        # (54d5b703/0043dadb): materialize the current generations and report
+        # non-secret status. Failures never break the engine sync above.
+        try:
+            from . import shared_config
+            shared_config.sync_shared_config()
+        except Exception as e:
+            print(json.dumps({'shared_config_sync_failed': type(e).__name__}), file=sys.stderr)
+        try:
+            from . import shared_credentials
+            shared_credentials.sync_shared(request)
+        except Exception as e:
+            print(json.dumps({'shared_credentials_sync_failed': type(e).__name__}), file=sys.stderr)
     report_sync(request, 'synced', installed_bundles, failed_bundles, errors)
     result = {'status': 'synced', 'profiles': ['hub-' + b['label'] for b in installed_bundles]}
     if failed_bundles:
@@ -2431,7 +2444,29 @@ def engine_environment(bundle, home, dest=None):
         # RMTHZ goal routes run with yolo; keep an explicit operator override.
         env.setdefault('ZCODE_WARM', '1')
         env.setdefault('ZCODE_WARM_MODE', 'yolo')
-    env['GH_CONFIG_DIR'] = os.environ.get('GH_CONFIG_DIR') or str(Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'gh')
+    # Hub-shared credentials (54d5b703/0043dadb): the Hub-owned materialized
+    # copies win when present; hosts without them keep the previous behavior.
+    try:
+        from . import shared_config, shared_credentials
+        aws_cfg = shared_config.aws_config_path()
+        if aws_cfg is not None and aws_cfg.is_file():
+            # The shared non-secret config plus a managed-home credentials path
+            # that never exists keep per-machine static keys unreachable
+            # (0043dadb AC4): `--profile default` authenticates via AWS Gate.
+            env['AWS_CONFIG_FILE'] = str(aws_cfg)
+            env['AWS_SHARED_CREDENTIALS_FILE'] = str(shared_config.aws_credentials_path(home))
+        if (shared_credentials.gh_config_dir() / 'hosts.yml').is_file():
+            env['GH_CONFIG_DIR'] = str(shared_credentials.gh_config_dir())
+            git_cfg = shared_credentials.git_config_path()
+            if git_cfg.is_file() and 'GIT_CONFIG_GLOBAL' not in env:
+                env['GIT_CONFIG_GLOBAL'] = str(git_cfg)
+        ssh_cfg = shared_credentials.ssh_config_path()
+        if ssh_cfg.is_file() and 'GIT_SSH_COMMAND' not in env:
+            env['GIT_SSH_COMMAND'] = 'ssh -F %s' % ssh_cfg
+    except Exception:
+        pass
+    if 'GH_CONFIG_DIR' not in env:
+        env['GH_CONFIG_DIR'] = os.environ.get('GH_CONFIG_DIR') or str(Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'gh')
     env.update(bundle.get('env') or {})
     shared = shared_dataops_dir()
     if shared is not None and 'DATAOPS_CONFIG_DIR' not in env and (shared / 'credentials.json').is_file():
