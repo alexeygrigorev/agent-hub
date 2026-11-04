@@ -18,7 +18,24 @@ describe('bounded disk status observations',()=>{
   for(let i=0;i<1000;i++)observation(seed,'history-'+i,'host',NOW-i*60000);
   const result=meter.runSync('status',()=>service.getDiskStatus(NOW));
   expect(result.machines).toHaveLength(1);expect(result.observation_pending).toBe(false);
+  expect(meter.snapshot().status.calls).toBe(3);
   expect(meter.snapshot().status.rows_read).toBeLessThan(20);expect(meter.snapshot().status.rows_written).toBe(0);
+ }));
+ it('batches five host-key seeks into one statement and keeps the empty-source contract',()=>fixture(({seed,meter,service}:any)=>{
+  const empty=meter.runSync('empty',()=>service.getDiskStatus(NOW));
+  expect(empty).toMatchObject({machines:[],observation_pending:false});expect(meter.snapshot().empty.calls).toBe(1);
+  for(let host=0;host<5;host++)for(let i=0;i<200;i++)observation(seed,'five-'+host+'-'+i,'host-'+host,NOW-i*60000);
+  const result=meter.runSync('five',()=>service.getDiskStatus(NOW));
+  expect(result.machines.map((m:any)=>m.machine_id)).toEqual(['host-0','host-1','host-2','host-3','host-4']);
+  expect(result.observation_pending).toBe(false);expect(meter.snapshot().five.calls).toBe(11);
+  expect(meter.snapshot().five.rows_read).toBeLessThan(80);expect(meter.snapshot().five.rows_written).toBe(0);
+  const shape=meter.statementTop(1500).find((q:any)=>q.scope==='five'&&q.sql.startsWith('WITH RECURSIVE machine_heads'));
+  expect(shape).toBeTruthy();expect(shape.calls).toBe(1);
+  meter.runSync('five-warm',()=>expect(service.getDiskStatus(NOW).machines).toHaveLength(5));
+  expect(meter.snapshot()['five-warm'].rows_read).toBe(0);expect(meter.snapshot()['five-warm'].rows_written).toBe(0);
+  observation(seed,'new-host','host-5',NOW);
+  const changed=meter.runSync('new-host',()=>service.getDiskStatus(NOW));
+  expect(changed.machines).toHaveLength(6);expect(changed.observation_pending).toBe(false);
  }));
  it('preserves configured200-observation,3-mount history and refuses excess before sample expansion',()=>fixture(({seed,meter,service}:any)=>{
   for(let i=0;i<200;i++)observation(seed,'sample-'+i,'host',NOW-(199-i)*60000,true,3);

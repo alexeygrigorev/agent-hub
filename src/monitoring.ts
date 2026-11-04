@@ -1217,16 +1217,19 @@ export class MonitoringService {
       const row=this.sql.exec('SELECT machine_id FROM disk_observations INDEXED BY idx_disk_obs_machine WHERE machine_id=? LIMIT 1',machineFilter).toArray()[0];
       if(row)machinesQuery.push(row);
     } else {
-      let after:string|undefined;
-      // Seek the next leading index key instead of DISTINCT over retained
-      // samples. One extra host is an explicit incomplete-list sentinel.
-      for(let i=0;i<=64;i++) {
-        const row:any=after===undefined?this.sql.exec('SELECT machine_id FROM disk_observations INDEXED BY idx_disk_obs_machine ORDER BY machine_id LIMIT 1').toArray()[0]
-          :this.sql.exec('SELECT machine_id FROM disk_observations INDEXED BY idx_disk_obs_machine WHERE machine_id>? ORDER BY machine_id LIMIT 1',after).toArray()[0];
-        if(!row)break;
-        if(i===64){hostsLimited=true;break;}
-        machinesQuery.push(row);after=String(row.machine_id);
-      }
+      // One bounded statement performs the same leading-key seeks. Never
+      // DISTINCT/GROUP the retained sample index; the65thnon-null head is
+      // solely an explicit incomplete-list sentinel.
+      const heads=this.sql.exec(`WITH RECURSIVE machine_heads(machine_id,ordinal) AS (
+        SELECT (SELECT machine_id FROM disk_observations INDEXED BY idx_disk_obs_machine ORDER BY machine_id LIMIT 1),1
+        UNION ALL
+        SELECT (SELECT machine_id FROM disk_observations INDEXED BY idx_disk_obs_machine
+          WHERE machine_id>machine_heads.machine_id ORDER BY machine_id LIMIT 1),ordinal+1
+        FROM machine_heads WHERE machine_id IS NOT NULL AND ordinal<65)
+        SELECT machine_id FROM machine_heads WHERE machine_id IS NOT NULL ORDER BY ordinal`).toArray();
+      hostsLimited=heads.length>64;
+      machinesQuery.push(...heads.slice(0,64));
+
     }
 
     const machineList: any[] = [];
