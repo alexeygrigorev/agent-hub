@@ -125,6 +125,15 @@ jobs:
           mkdir -p .local/tmp
           bash scripts/with-temp-home.sh -- bash ops/tests/session-ctl.test.sh
 
+      - name: Host registration receipt regressions
+        env:
+          DTC_AUTH_HOME: ${{ github.workspace }}/.deps/auth
+          PYTHONPATH: ${{ github.workspace }}/host
+          TMPDIR: ${{ github.workspace }}/.local/tmp
+        run: |
+          mkdir -p .local/tmp
+          python3 -m unittest host.tests.test_fleet.RegistrationReceiptTests -v
+
       - name: Cloudflare cost safety regressions
         timeout-minutes: 5
         shell: bash
