@@ -1,3 +1,4 @@
+import {credentialKey,sealCredential,openCredential} from './credential-crypto';
 import { MeteredDb, initializeSchema } from './db';
 import { actorFrom, bodyObject, boundedString, error, hasScope, HttpError, json } from './http';
 import type { Actor } from './types';
@@ -8,7 +9,7 @@ const SCHEMA = [
  'CREATE TABLE credential_candidates(id TEXT PRIMARY KEY,host_id TEXT NOT NULL,base_generation INTEGER NOT NULL,sealed TEXT NOT NULL,observed_at INTEGER NOT NULL,state TEXT NOT NULL) WITHOUT ROWID',
 
  'CREATE INDEX candidate_recovery ON credential_candidates(base_generation,state,id)',
- 'CREATE TABLE probes(id INTEGER PRIMARY KEY CHECK(id=1),token TEXT NOT NULL)',
+ 'CREATE TABLE probes(id INTEGER PRIMARY KEY CHECK(id=1),token TEXT NOT NULL,retry_at INTEGER NOT NULL DEFAULT 0)',
  'CREATE TABLE credentials(id INTEGER PRIMARY KEY CHECK(id=1),generation INTEGER NOT NULL,sealed TEXT NOT NULL,refresh_until INTEGER NOT NULL DEFAULT 0,refresh_owner TEXT,refresh_lease TEXT)',
  'CREATE TABLE approved_hosts(id TEXT PRIMARY KEY,ack_generation INTEGER,acked_at INTEGER)',
  'CREATE TABLE discovery(id INTEGER PRIMARY KEY CHECK(id=1),enabled INTEGER NOT NULL,interval_ms INTEGER NOT NULL,next_at INTEGER NOT NULL,status TEXT NOT NULL)',
@@ -27,6 +28,7 @@ type Quota={remaining:number;captured_at:number;valid_until:number;reset_at:numb
 type Reservation={operation_id:string;session_id:string;machine_id:string;epoch:number;digest:string;state:string;expires_at:number};
 /** One provider account owns its capacity. Expiry never frees confirmed native work. */
 export class AccountDO {
+ private collecting?:Promise<Response>;
  private readonly db:MeteredDb;
  constructor(private readonly ctx:DurableObjectState,private readonly env:AccountEnv={}){this.db=new MeteredDb(ctx.storage.sql);initializeSchema(ctx,this.db,1,SCHEMA);}
  async fetch(request:Request):Promise<Response>{
@@ -37,27 +39,30 @@ export class AccountDO {
    if(p==='/api/account/hosts')return await this.hosts(request,a);
    if(p==='/api/account/discovery')return await this.discovery(request,a);
    if(p==='/api/account/alerts'&&method==='GET')return this.alerts(request,a);
-   if(p==='/_internal/routing'&&method==='GET')return this.routingView();
+   if(p==='/_internal/routing'&&method==='GET'){await this.lazyQuota();return this.routingView();}
    if(p==='/_internal/release'&&method==='POST')return await this.transition(request,'released');
    if(p==='/api/account/release')return error('not_found',404);
    if(p==='/_metrics')return json({counts:this.db.snapshot()});
    if(p==='/api/account'&&method==='PATCH')return await this.configure(request,a);
    if(p==='/api/account/quota'&&method==='PUT')return await this.quota(request,a);
    if(p==='/api/account/resets')return await this.resets(request,a);
-   if((p==='/api/account'||p==='/api/account/quota')&&method==='GET')return this.view(a);
+   if((p==='/api/account'||p==='/api/account/quota')&&method==='GET'){if(this.canReadQuota(a))await this.lazyQuota();return this.view(a);}
    if(!hasScope(a,'account:reserve')&&!hasScope(a,'operator:admin'))return error('forbidden',403);
    if(method!=='POST')return error('not_found',404);
    if(p==='/api/account/reserve')return await this.reserve(request);
    if(p==='/api/account/confirm')return await this.transition(request,'confirmed');
    if(p==='/api/account/start')return await this.transition(request,'running');
-
+   
    return error('not_found',404);
   }catch(e){return e instanceof HttpError?error(e.code,e.status):error('internal_error',500);}
  }
  private routingView():Response{
   const account=this.db.one<Account>('SELECT * FROM account WHERE id=1'),quota=this.db.one<Quota>('SELECT * FROM quota WHERE id=1');
   const credential=this.db.one<{generation:number}>('SELECT generation FROM credentials WHERE id=1');
-  const hosts=this.db.all<{id:string}>('SELECT h.id FROM approved_hosts h LEFT JOIN credential_rejections r ON r.host_id=h.id AND r.generation=? WHERE r.host_id IS NULL ORDER BY h.id LIMIT 51',credential?.generation??-1);
+  const approved=this.db.all<{id:string}>('SELECT id FROM approved_hosts ORDER BY id LIMIT 51');
+  if(approved.length>50)return error('host_observation_limit',503);
+  const rejected=approved.length?this.db.all<{host_id:string}>('SELECT host_id FROM credential_rejections WHERE generation=? AND host_id IN ('+approved.map(()=>'?').join(',')+')',credential?.generation??-1,...approved.map(v=>v.id)):[];
+  const hosts=approved.filter(v=>!rejected.some(r=>r.host_id===v.id));
   if(hosts.length>50)return error('host_observation_limit',503);
   return json({account:account||null,quota:quota||null,fresh:!!quota&&quota.valid_until>Date.now(),hosts:hosts.map(v=>v.id),credential_generation:credential?.generation??null});
  }
@@ -79,8 +84,9 @@ export class AccountDO {
   this.db.run(`INSERT INTO quota(id,remaining,captured_at,valid_until,reset_at,source) VALUES(1,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET remaining=excluded.remaining,captured_at=excluded.captured_at,valid_until=excluded.valid_until,reset_at=excluded.reset_at,source=excluded.source`,b.remaining,b.captured_at,b.valid_until,b.reset_at??null,b.source);
   this.db.run('UPDATE probes SET token=? WHERE id=1',crypto.randomUUID());return json({recorded:true});
  }
+ private canReadQuota(a:Actor|undefined):boolean{return hasScope(a,'quota:read')||hasScope(a,'operator:admin')||!!(a?.kind==='machine'&&a.resource_id&&this.db.one('SELECT id FROM approved_hosts WHERE id=?',a.resource_id));}
  private view(a:Actor|undefined):Response{
-  if(!hasScope(a,'quota:read')&&!hasScope(a,'operator:admin'))return error('forbidden',403);
+  if(!this.canReadQuota(a))return error('forbidden',403);
   const account=this.db.one<Account>('SELECT * FROM account WHERE id=1'),quota=this.db.one<Quota>('SELECT * FROM quota WHERE id=1');
   return json({account:account||null,quota:quota||null,fresh:!!quota&&quota.valid_until>Date.now()});
  }
@@ -172,18 +178,27 @@ export class AccountDO {
   const machine=a?.kind==='machine'?a.resource_id:undefined;
   if(r.method==='GET'){
    if(!machine||!this.db.one('SELECT id FROM approved_hosts WHERE id=?',machine))return error('host_not_approved',403);
-   let row=this.db.one<{generation:number;sealed:string;refresh_owner?:string;refresh_until?:number}>('SELECT generation,sealed,refresh_owner,refresh_until FROM credentials WHERE id=1');
+   let row=this.db.one<{generation:number;sealed:string;refresh_owner?:string;refresh_until?:number;refresh_lease?:string|null}>('SELECT generation,sealed,refresh_owner,refresh_until,refresh_lease FROM credentials WHERE id=1');
    if(!row)return error('credentials_unavailable',503);
-   const repairLease=row.refresh_owner===machine&&Number(row.refresh_until)>Date.now();
-   if(!repairLease&&this.db.one('SELECT host_id FROM credential_rejections WHERE host_id=? AND generation=?',machine,row.generation))return error('credential_generation_rejected',409);
+   const query=new URL(r.url).searchParams,requested=query.get('refresh_lease'),repairLease=!!requested&&row.refresh_owner===machine&&row.refresh_lease===requested;
+   if(requested&&!repairLease)return error('refresh_permit_mismatch',409);
    const account=this.db.one<Account>('SELECT * FROM account WHERE id=1');if(!account)return error('account_unconfigured',409);
+   if(query.get('metadata')==='1')return json({generation:row.generation,provider:account.provider,refresh_mode:account.provider==='zai'?'static':'central'});
+   if(!repairLease&&this.db.one('SELECT host_id FROM credential_rejections WHERE host_id=? AND generation=?',machine,row.generation))return error('credential_generation_rejected',409);
+   const minimum=Number(query.get('min_validity_ms')||0);if(!Number.isSafeInteger(minimum)||minimum<0||minimum>10800000)return error('invalid_access_validity',400);
    let files=await this.unseal(row.sealed,account.provider,row.generation) as Record<string,string>;
-   if(!repairLease&&account&&['codex','claude'].includes(account.provider)&&this.needsRefresh(account.provider,files)){
+   if(!repairLease&&account&&['codex','claude'].includes(account.provider)&&this.needsRefresh(account.provider,files,minimum)){
     await this.refresh(account.provider,files,row.generation);row=this.db.one<{generation:number;sealed:string}>('SELECT generation,sealed FROM credentials WHERE id=1')!;files=await this.unseal(row.sealed,account.provider,row.generation) as Record<string,string>;
    }
    if(!this.db.one('SELECT id FROM approved_hosts WHERE id=?',machine))return error('host_not_approved',403);
    const latest=this.db.one<{generation:number}>('SELECT generation FROM credentials WHERE id=1');if(latest?.generation!==row.generation)return error('generation_conflict',409);
-   return json({generation:row.generation,files});
+   const expires=this.accessExpiry(account.provider,files);
+   if(!repairLease&&account.provider!=='zai'&&minimum>0&&(expires===null||expires<=Date.now()+minimum))return error('access_lifetime_insufficient',409);
+   if(!repairLease&&account.provider!=='zai'){
+    const strip=(v:any):void=>{if(v&&typeof v==='object')for(const key of Object.keys(v)){if(key.toLowerCase().includes('refresh')&&typeof v[key]==='string')v[key]='';else strip(v[key]);}};
+    files={...files};for(const path of Object.keys(files))if(path.endsWith('.json')||path.endsWith('antigravity-oauth-token')){const auth=JSON.parse(files[path]),lastRefresh=path==='.codex/auth.json'&&typeof auth.last_refresh==='string'&&Number.isFinite(Date.parse(auth.last_refresh))?auth.last_refresh:undefined;strip(auth);if(lastRefresh!==undefined)auth.last_refresh=lastRefresh;files[path]=JSON.stringify(auth);}
+   }
+   return json({generation:row.generation,provider:account.provider,files,access_expires_at:expires,refresh_material:repairLease,static_key:account.provider==='zai'});
   }
   if(r.method==='POST'){
    if(!machine)return error('forbidden',403);const b=await bodyObject(r,4096);
@@ -213,6 +228,7 @@ export class AccountDO {
    const row=this.db.one<{generation:number;refresh_until:number}>('SELECT generation,refresh_until FROM credentials WHERE id=1');
    if((row?.generation||0)!==b.expected_generation)throw new HttpError('generation_conflict',409);
    if(row&&row.refresh_until>Date.now())throw new HttpError('refresh_in_progress',409);
+   this.db.run('UPDATE probes SET token=?,retry_at=0 WHERE id=1',crypto.randomUUID());
    const next=(row?.generation||0)+1;this.db.run('INSERT INTO credentials(id,generation,sealed) VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET generation=excluded.generation,sealed=excluded.sealed',next,sealed);this.db.run('UPDATE quota SET valid_until=0 WHERE id=1');return next;
   });return json({generation});
  }
@@ -226,14 +242,24 @@ export class AccountDO {
  }
  private async discovery(r:Request,a:Actor|undefined):Promise<Response>{
   if(!hasScope(a,'quota:write')&&!hasScope(a,'operator:admin'))return error('forbidden',403);
-  if(r.method==='POST'){const result=await this.collect();await this.schedule();return result;}
+  if(r.method==='POST'){const result=await this.collect(true,true);await this.schedule();return result;}
   if(r.method==='GET')return json({discovery:this.db.one('SELECT enabled,interval_ms,next_at,status FROM discovery WHERE id=1')||null});
   if(r.method!=='PUT')return error('not_found',404);const b=await bodyObject(r,4096),interval=Number(b.interval_ms??21600000);
   if(typeof b.enabled!=='boolean'||!Number.isInteger(interval)||interval<3600000||interval>21600000)return error('invalid_discovery_schedule',400);
   this.db.run('INSERT INTO discovery(id,enabled,interval_ms,next_at,status) VALUES(1,?,?,?,?) ON CONFLICT(id) DO UPDATE SET enabled=excluded.enabled,interval_ms=excluded.interval_ms,next_at=excluded.next_at',Number(b.enabled),interval,Date.now()+100,'unobserved');await this.schedule();return json({recorded:true});
  }
- private async collect():Promise<Response>{
-  const probe=crypto.randomUUID();this.db.run('INSERT INTO probes(id,token) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET token=excluded.token',probe);
+ private async lazyQuota():Promise<void>{
+  const quota=this.db.one<Quota>('SELECT * FROM quota WHERE id=1');if(quota&&quota.valid_until>Date.now())return;
+  const account=this.db.one<Account>('SELECT * FROM account WHERE id=1');
+  if(account&&['codex','claude','go','zai'].includes(account.provider)&&this.db.one('SELECT generation FROM credentials WHERE id=1'))await this.collect(false);
+ }
+ private collect(force=true,supersede=false):Promise<Response>{
+  if(this.collecting&&!supersede)return this.collecting;
+  if(!force&&(this.db.one<{retry_at:number}>('SELECT retry_at FROM probes WHERE id=1')?.retry_at||0)>Date.now())return Promise.resolve(error('quota_probe_backoff',503));
+  const pending=this.collectNow().finally(()=>{if(this.collecting===pending)this.collecting=undefined;});this.collecting=pending;return pending;
+ }
+ private async collectNow():Promise<Response>{
+  const probe=crypto.randomUUID();this.db.run('INSERT INTO probes(id,token,retry_at) VALUES(1,?,0) ON CONFLICT(id) DO UPDATE SET token=excluded.token,retry_at=0',probe);
   const fail=(reason:string,invalidate=true)=>this.unknown(reason,probe,invalidate);let quotaProved=false;
   try{
    const account=this.db.one<Account>('SELECT * FROM account WHERE id=1'),row=this.db.one<{generation:number;sealed:string;refresh_until:number}>('SELECT generation,sealed,refresh_until FROM credentials WHERE id=1');
@@ -277,6 +303,7 @@ export class AccountDO {
  private unknown(reason:string,probe:string,invalidate=true):Response{
   if(this.db.one<{token:string}>('SELECT token FROM probes WHERE id=1')?.token!==probe)return error('probe_superseded',409);
   if(invalidate)this.db.run('UPDATE quota SET valid_until=0 WHERE id=1');
+  this.db.run('UPDATE probes SET retry_at=? WHERE id=1 AND token=?',Date.now()+60000,probe);
   this.db.run('UPDATE discovery SET status=? WHERE id=1',reason);
   const bucket=Math.floor(Date.now()/21600000);this.db.run('INSERT OR IGNORE INTO alerts(id,kind,observed_at) VALUES(?,?,?)','discovery:'+bucket+':'+reason,reason,Date.now());return error(reason,503);
  }
@@ -290,12 +317,17 @@ export class AccountDO {
   if(!hasScope(a,'quota:read')&&!hasScope(a,'operator:admin'))return error('forbidden',403);const cursor=new URL(r.url).searchParams.get('cursor')||'';
   const rows=this.db.all<{id:string}>('SELECT * FROM alerts WHERE id>? ORDER BY id LIMIT 51',cursor);return json({items:rows.slice(0,50),next:rows.length>50?rows[49].id:null});
  }
- private needsRefresh(provider:string,files:Record<string,string>):boolean{
-  try{const auth=JSON.parse(files[PATHS[provider][0]]);
-   if(provider==='claude')return typeof auth?.claudeAiOauth?.refreshToken==='string'&&Number(auth.claudeAiOauth.expiresAt)<Date.now()+10800000;
-   if(typeof auth?.tokens?.refresh_token!=='string')return false;
-   let expires=0;try{const part=auth.tokens.access_token.split('.')[1];expires=Number(JSON.parse(atob(part.replace(/-/g,'+').replace(/_/g,'/'))).exp)*1000;}catch{}
-   return expires<Date.now()+259200000||Date.parse(auth.last_refresh)<Date.now()-259200000;
+ private accessExpiry(provider:string,files:Record<string,string>):number|null{
+  try{const auth=JSON.parse(files[PATHS[provider][0]]);if(provider==='claude')return timestamp(auth?.claudeAiOauth?.expiresAt);
+   const token=provider==='codex'?auth?.tokens?.access_token:provider==='go'&&Array.isArray(auth)?auth.find(v=>v?.active===true)?.value?.access:auth?.access_token??auth?.token?.access_token;
+   if(typeof token==='string'){const part=token.split('.')[1],exp=JSON.parse(atob(part.replace(/-/g,'+').replace(/_/g,'/'))).exp;if(typeof exp==='number'&&Number.isFinite(exp))return exp*1000;}
+   return timestamp(auth?.expiry_date??auth?.token?.expiry);
+  }catch{return null;}
+ }
+ private needsRefresh(provider:string,files:Record<string,string>,minimum=0):boolean{
+  try{const auth=JSON.parse(files[PATHS[provider][0]]),expires=this.accessExpiry(provider,files);
+   if(provider==='claude')return typeof auth?.claudeAiOauth?.refreshToken==='string'&&(expires===null||expires<Date.now()+Math.max(minimum,300000));
+   return provider==='codex'&&typeof auth?.tokens?.refresh_token==='string'&&(expires===null||expires<Date.now()+minimum||!Number.isFinite(Date.parse(auth.last_refresh))||Date.parse(auth.last_refresh)+691200000<Date.now()+minimum);
   }catch{return false;}
  }
  private async refresh(provider:string,files:Record<string,string>,generation:number):Promise<any>{
@@ -329,9 +361,9 @@ export class AccountDO {
   while(true){const {done,value}=await reader.read();if(done)break;size+=value.byteLength;if(size>131072){await reader.cancel();throw new Error('oversized_response');}chunks.push(value);}
   const bytes=new Uint8Array(size);let offset=0;for(const c of chunks){bytes.set(c,offset);offset+=c.length;}return JSON.parse(new TextDecoder().decode(bytes));
  }
- private async key():Promise<CryptoKey>{const raw=this.env.HUB2_CREDENTIAL_KEY;if(!raw||!/^[0-9a-f]{64}$/i.test(raw))throw new HttpError('credential_key_unavailable',503);const bytes=new Uint8Array(raw.match(/../g)!.map(v=>parseInt(v,16)));return crypto.subtle.importKey('raw',bytes,'AES-GCM',false,['encrypt','decrypt']);}
- private async seal(value:unknown,provider:string,generation:number):Promise<string>{const iv=crypto.getRandomValues(new Uint8Array(12)),data=new TextEncoder().encode(JSON.stringify(value)),sealed=new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv,additionalData:new TextEncoder().encode(JSON.stringify([this.ctx.id?.toString()||'test-account',provider,generation]))},await this.key(),data));return JSON.stringify({iv:Array.from(iv),data:Array.from(sealed)});}
- private async unseal(value:string,provider:string,generation:number):Promise<unknown>{try{const b=JSON.parse(value);return JSON.parse(new TextDecoder().decode(await crypto.subtle.decrypt({name:'AES-GCM',iv:new Uint8Array(b.iv),additionalData:new TextEncoder().encode(JSON.stringify([this.ctx.id?.toString()||'test-account',provider,generation]))},await this.key(),new Uint8Array(b.data))));}catch{throw new HttpError('credential_decryption_failed',503);}}
+ private async key():Promise<CryptoKey>{try{return await credentialKey(this.env.HUB2_CREDENTIAL_KEY||'');}catch{throw new HttpError('credential_key_unavailable',503);}}
+ private async seal(value:unknown,provider:string,generation:number):Promise<string>{const sealed=await sealCredential(await this.key(),new TextEncoder().encode(JSON.stringify(value)),new TextEncoder().encode(JSON.stringify([this.ctx.id?.toString()||'test-account',provider,generation])));return JSON.stringify({iv:Array.from(sealed.iv),data:Array.from(sealed.data)});}
+ private async unseal(value:string,provider:string,generation:number):Promise<unknown>{try{const b=JSON.parse(value),plain=await openCredential(await this.key(),new Uint8Array(b.iv),new Uint8Array(b.data),new TextEncoder().encode(JSON.stringify([this.ctx.id?.toString()||'test-account',provider,generation])));return JSON.parse(new TextDecoder().decode(plain));}catch{throw new HttpError('credential_decryption_failed',503);}}
 
  private async rotationRoute(r:Request,a:Actor|undefined,path:string):Promise<Response>{
   const admin=hasScope(a,'operator:admin'),host=a?.kind==='machine'?a.resource_id:undefined;
@@ -389,7 +421,8 @@ export class AccountDO {
    if(host&&!this.db.one('SELECT id FROM approved_hosts WHERE id=?',host))return error('host_not_approved',403);
    const row=this.db.one<{generation:number;refresh_until:number;refresh_owner:string|null;refresh_lease:string|null}>('SELECT * FROM credentials WHERE id=1');
    if(!row||row.generation!==base)return error('generation_conflict',409);
-   if(row.refresh_until>Date.now()&&(!host||row.refresh_owner!==host||row.refresh_lease!==lease))return error('refresh_in_progress',409);
+   if(host&&provider!=='zai'&&(row.refresh_owner||this.hasUnresolvedRefresh(base))&&(row.refresh_owner!==host||row.refresh_lease!==lease))return error('refresh_permit_mismatch',409);
+   if(!host&&row.refresh_until>Date.now())return error('refresh_in_progress',409);
    this.db.run('UPDATE credentials SET generation=?,sealed=?,refresh_until=0,refresh_owner=NULL,refresh_lease=NULL WHERE id=1',base+1,sealed);if(row.refresh_lease)this.db.run('UPDATE credential_candidates SET state=? WHERE id=?','published',row.refresh_lease);
    this.db.run('UPDATE quota SET valid_until=0 WHERE id=1');if(candidate)this.db.run('UPDATE credential_candidates SET state=? WHERE id=?','published',candidate);return json({generation:base+1});
   });return result;

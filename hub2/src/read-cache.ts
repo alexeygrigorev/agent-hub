@@ -7,7 +7,8 @@ export class ReadCache{
  private table(sql:string):string|undefined{
   if(sql.length>16384||/;|--|\/\*/.test(sql))return;
   const tokens=sql.replace(/'(?:''|[^'])*'/g,"''");
-  if(!/^\s*SELECT\b/i.test(tokens)||/\b(?:JOIN|WITH|UNION|INTERSECT|EXCEPT|OVER|CURRENT_TIMESTAMP|CURRENT_DATE|CURRENT_TIME)\b/i.test(tokens)||(tokens.match(/\bSELECT\b/gi)||[]).length!==1||/\b[A-Za-z_]\w*\s*\(/.test(tokens))return;
+  if(/["\x60\[\]]/.test(tokens)||/\bIN\b(?!\s*\()/i.test(tokens))return;
+  if(!/^\s*SELECT\b/i.test(tokens)||/\b(?:JOIN|WITH|UNION|INTERSECT|EXCEPT|OVER|CURRENT_TIMESTAMP|CURRENT_DATE|CURRENT_TIME)\b/i.test(tokens)||(tokens.match(/\bSELECT\b/gi)||[]).length!==1||[...tokens.matchAll(/\b([A-Za-z_]\w*)\s*\(/g)].some(m=>m[1].toUpperCase()!=='IN'))return;
   const from=tokens.match(/\bFROM\s+([A-Za-z_]\w*)\b/i);if(!from)return;
   const tail=tokens.slice(from.index!+from[0].length);
   // No table lists, schema/quoted names, aliases or second relation.

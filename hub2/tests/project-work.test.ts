@@ -61,3 +61,13 @@ test('queued overlap preserves original due provenance through repeated active p
  f.setActive(false);await f.work.alarm(s.next_due+120000);
  assert.equal([...f.effects.values()][0].due_at,s.next_due);assert.equal([...f.effects.keys()][0],s.id+':'+s.next_due);
 });
+test('cron retains numeric grammar, DOM/DOW OR and first-only repeated wall minutes',()=>{
+ for(const expression of ['@daily','0 0 0 * * *','0 0 * JAN *','0 0 ? * *','H * * * *','0 0 L * *','0 0 * * 1#2','*/61 * * * *','0 0 *-3 * *'])assert.equal(parseCron(expression),null,expression);
+ const next=(expression:string,date:string)=>new Date(cronNext(parseCron(expression)!,'Europe/Berlin',Date.parse(date))!).toISOString();
+ assert.equal(next('30 2 * * *','2026-10-25T00:40:00Z'),'2026-10-26T01:30:00.000Z');
+ assert.equal(next('30 2 * * *','2026-10-25T01:20:00Z'),'2026-10-26T01:30:00.000Z');
+ assert.equal(next('* * * * *','2026-10-25T01:20:00Z'),'2026-10-25T02:00:00.000Z');
+ assert.equal(next('0 12 1 * 1','2026-11-02T00:00:00Z'),'2026-11-02T11:00:00.000Z');
+ assert.equal(next('0 12 */2 * 1','2026-11-02T00:00:00Z'),'2026-11-02T11:00:00.000Z');
+ assert.equal(cronNext(parseCron('0 0 31 2 *')!,'UTC',Date.parse('2026-01-01')),null);
+});

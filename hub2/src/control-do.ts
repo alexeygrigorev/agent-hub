@@ -107,8 +107,8 @@ export class ControlDO {
     const row = this.db.one<CredentialRow>(
       'SELECT actor_id,kind,resource_id,generation,scopes_json,family_id,client_id,expires_at,principal_email,revoked_at FROM credentials WHERE token_hash = ? AND revoked_at IS NULL', tokenHash,
     );
-    if (!row) return error('invalid_credentials', 401);
-    if(row.kind==='operator'||row.kind==='agent'){const actor=verifyKnownCredential(row,this.env);return actor?json({actor}):error('invalid_credentials',401);}
+    if (!row){const actor=this.workers.verifyHash(tokenHash);return actor?json({actor}):error('invalid_credentials',401);}
+    if(row.kind==='operator'){const actor=verifyKnownCredential(row,this.env);return actor?json({actor}):error('invalid_credentials',401);}
     if(row.kind!=='machine')return error('invalid_credentials',401);
     let scopes: unknown;
     try { scopes = JSON.parse(row.scopes_json); } catch { return error('credential_corrupt', 503); }
@@ -118,7 +118,8 @@ export class ControlDO {
 
   private async authorizeCurrent(request: Request): Promise<Response> {
     const body = await bodyObject(request.clone(), 4096);
-    if(typeof body.actor_id==='string'&&(body.actor_id.startsWith('human:')||body.actor_id.startsWith('session:')))return (await this.auth.fetch(new Request('https://control.internal/_auth/authorize',{method:'POST',headers:request.headers,body:JSON.stringify(body)})))||error('forbidden',403);
+    if(typeof body.actor_id==='string'&&body.actor_id.startsWith('session:'))return this.workers.authorize(body);
+    if(typeof body.actor_id==='string'&&body.actor_id.startsWith('human:'))return (await this.auth.fetch(new Request('https://control.internal/_auth/authorize',{method:'POST',headers:request.headers,body:JSON.stringify(body)})))||error('forbidden',403);
     if (typeof body.actor_id !== 'string' || typeof body.generation !== 'string' || typeof body.scope !== 'string') return error('invalid_authorization_check', 400);
     const row = this.db.one<{ generation: string; scopes_json: string }>(
       'SELECT generation, scopes_json FROM credentials WHERE actor_id=? AND revoked_at IS NULL', body.actor_id,
@@ -311,7 +312,7 @@ export class ControlDO {
   }
   private grant(actor:CredentialActor,id:string):{can_send:number;can_read:number}|undefined{
     if(!actor.family_id)return undefined;
-    const rows=this.db.all<{can_send:number;can_read:number}>('SELECT can_send,can_read FROM agent_grants WHERE agent_id=? AND family_id=? AND client_id IN (?,?) AND enabled=1 LIMIT 2',id,actor.family_id,actor.client_id||'','*');
+    const rows=[...new Set([actor.client_id||'','*'])].map(client=>this.db.one<{can_send:number;can_read:number}>('SELECT can_send,can_read FROM agent_grants WHERE agent_id=? AND family_id=? AND client_id=? AND enabled=1',id,actor.family_id,client)).filter((v):v is {can_send:number;can_read:number}=>!!v);
     if(!rows.length)return undefined;return {can_send:Number(rows.some(v=>v.can_send)),can_read:Number(rows.some(v=>v.can_read))};
   }
   private async delegate(request:Request):Promise<Response>{
@@ -436,7 +437,7 @@ export class ControlDO {
     await this.ready;
     for(const row of this.db.all<{owner:string;revision:number;after_id:string;attempt:number}>('SELECT * FROM mailbox_wakes WHERE next_attempt<=? ORDER BY next_attempt,owner LIMIT 8',Date.now())){
       try{
-        const response=await this.env.MAILBOXES.get(this.env.MAILBOXES.idFromName(row.owner)).fetch(new Request('https://mailbox.internal/_resume-native',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({after:row.after_id})}));
+        const response=await this.env.MAILBOXES.get(this.env.MAILBOXES.idFromName('global')).fetch(new Request('https://mailbox.internal/_resume-native',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({owner:row.owner,after:row.after_id})}));
         if(!response.ok)throw new Error('wake_refused');
         const result=await response.json() as {next:unknown;resumed:unknown};
         if(!Number.isInteger(result.resumed)||Number(result.resumed)<0||Number(result.resumed)>16||(result.next!==null&&(!boundedString(result.next,180)||result.next<=row.after_id)))throw new Error('invalid_wake_result');

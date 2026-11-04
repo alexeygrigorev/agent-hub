@@ -80,12 +80,13 @@ function mailboxes(){
  controlState.database.prepare('INSERT INTO actor_directory(id,kind,enabled) VALUES(?,?,1)').run('session:session-test','session');
  for(const name of ['a','b','c','d','e'])controlState.database.prepare('INSERT INTO named_agents(id,display_name,forward_session,enabled) VALUES(?,?,?,1)').run('agent:'+name,name,'session-test');clearFixtureCache(control);
  const nativeCalls:any[]=[];const nativeFetch=async(r:Request)=>{const b=await r.json();nativeCalls.push({path:new URL(r.url).pathname,body:b});return flags.blockMachine?new Response('{}',{status:503}):Response.json({queued:true,acked:new URL(r.url).pathname.endsWith('mail-ack'),cancelled:new URL(r.url).pathname.endsWith('mail-cancel'),state:'pending',message_id:b.message_id,epoch:b.epoch,operation_id:b.operation_id});};
- const boxes=new Map<string,MailboxDO>(),stores=new Map<string,ReturnType<typeof state>>();
+ const stores=new Map<string,ReturnType<typeof state>>(),shared=state();let box:MailboxDO;
  const env:any={MACHINES:{idFromName:(id:string)=>id,get:()=>({fetch:nativeFetch})},CONTROL:{idFromName:(id:string)=>id,get:()=>({fetch:async(r:Request)=>{const path=new URL(r.url).pathname;if(flags.blockDirectory&&path==='/_routes/register')return new Response('{}',{status:503});const response=await control.fetch(r);if(path==='/_recipient'&&flags.afterRecipient){const hook=flags.afterRecipient;flags.afterRecipient=undefined;await hook();}return response;}})},MAILBOXES:{idFromName:(id:string)=>id,get:(id:string)=>({fetch:async(r:Request)=>{const path=new URL(r.url).pathname;if(flags.blockReceipts&&path==='/_receipt')return new Response('{}',{status:503});const response=await get(id).fetch(r);if(flags.failWakeAfterEffect&&path==='/_resume-native'){flags.failWakeAfterEffect=false;return new Response('{}',{status:503});}return response;}})}};
  Object.assign(controlEnv,env);
- function get(id:string){if(!boxes.has(id)){const s=state();stores.set(id,s);boxes.set(id,new MailboxDO(s.ctx,env));}return boxes.get(id)!;}
+ box=new MailboxDO(shared.ctx,env);for(const id of ['global','agent:a','agent:b','agent:c','agent:d','agent:e'])stores.set(id,shared);
+ function get(id:string){stores.set(id,shared);return box;}
  const fetch=(owner:string,path:string,method='GET',body?:unknown,actor:any={id:owner,kind:'agent',scopes:[]})=>get(owner).fetch(request(path,method,body,actor,owner));
- const restart=(id:string)=>{const prior=stores.get(id)!;boxes.set(id,new MailboxDO(prior.ctx,env));return boxes.get(id)!;};
+ const restart=(_id:string)=>box=new MailboxDO(shared.ctx,env);
  return {get,fetch,stores,flags,restart,get control(){return control;},restartControl:()=>control=new ControlDO(controlState.ctx,controlEnv),controlState,nativeCalls};
 }
 async function nativeDelivered(m:ReturnType<typeof mailboxes>,owner:string,id:string,epoch=1){
@@ -102,16 +103,15 @@ test('sender key dedup is global across recipients and unauthorized inbox access
  assert.equal((await m.fetch('agent:b','/api/messages','GET',undefined,{id:'agent:e',kind:'agent',scopes:[]})).status,403);
  const metric=await data(await m.get('agent:a').fetch(request('/_metrics')));assert.equal(metric.counts.measurement_valid,false);
 });
-test('readdress fences old inbox including late delivery and preserves original send replay',async()=>{
- const m=mailboxes(),body={recipient:'agent:b',body:'synthetic',key:'k2'};
- const original=(await data(await m.fetch('agent:a','/api/messages','POST',body))).message;
- const old=(m.stores.get('agent:a')!.database.prepare('SELECT * FROM outbox WHERE id=?').get(original.id)) as any;
- const changed=await data(await m.fetch('agent:a',`/api/messages/${original.id}/readdress`,'POST',{recipient:'agent:c'},admin));assert.equal(changed.message.epoch,2);
- assert.equal((await data(await m.fetch('agent:b','/api/messages'))).items.length,0);
- assert.equal((await data(await m.fetch('agent:c','/api/messages'))).items.length,1);
- assert.equal((await m.get('agent:b').fetch(request('/_receive','POST',{mail:old}))).status,409);
+test('readdress fences the previous recipient and epoch while preserving the sender key replay',async()=>{
+ const m=mailboxes(),body={recipient:'agent:b',body:'synthetic',key:'k2'},original=(await data(await m.fetch('agent:a','/api/messages','POST',body))).message;
+ const changed=await data(await m.fetch('agent:a','/api/messages/'+original.id+'/readdress','POST',{recipient:'agent:c'},admin));assert.equal(changed.message.epoch,2);
+ assert.equal((await data(await m.fetch('agent:b','/api/messages'))).items.length,0);assert.equal((await data(await m.fetch('agent:c','/api/messages'))).items.length,1);
+ assert.equal((await m.fetch('agent:b','/api/messages/'+original.id+'/read','POST',{epoch:1})).status,404);
+ assert.equal((await m.fetch('agent:c','/api/messages/'+original.id+'/read','POST',{epoch:1})).status,409);
  const replay=await data(await m.fetch('agent:a','/api/messages','POST',body));assert.equal(replay.message.id,original.id);assert.equal(replay.message.recipient,'agent:c');
 });
+
 test('native delivery fences readdress, read/ack receipts are idempotent, reply participants are enforced',async()=>{
  const m=mailboxes();const parent=(await data(await m.fetch('agent:a','/api/messages','POST',{recipient:'agent:b',body:'hello',key:'parent'}))).message;
  assert.equal((await nativeDelivered(m,'agent:b',parent.id)).status,200);
@@ -122,12 +122,15 @@ test('native delivery fences readdress, read/ack receipts are idempotent, reply 
  const reply=await data(await m.fetch('agent:b','/api/messages','POST',{recipient:'agent:a',body:'reply',key:'reply',reply_to:parent.id,parent_sender:'agent:a'}));assert.equal(reply.message.thread_id,parent.thread_id);
  assert.equal((await m.fetch('agent:c','/api/messages','POST',{recipient:'agent:a',body:'intrusion',key:'bad',reply_to:parent.id,parent_sender:'agent:a'})).status,403);
 });
-test('revoking a not-yet-received route leaves a tombstone rejecting delayed old envelopes',async()=>{
- const m=mailboxes();const box=m.get('agent:b');
- assert.equal((await box.fetch(request('/_revoke','POST',{id:'late',epoch:1}))).status,200);
- const envelope={id:'late',sender:'agent:a',recipient:'agent:b',body:'late body',key:'late',digest:'digest',thread_id:'thread',reply_to:null,epoch:1,state:'pending',created_at:Date.now()};
- assert.equal((await box.fetch(request('/_receive','POST',{mail:envelope}))).status,409);
+test('global authority rejects obsolete envelope injection and old native delivery after fenced reroute',async()=>{
+ const m=mailboxes(),sent=(await data(await m.fetch('agent:a','/api/messages','POST',{recipient:'agent:b',body:'global',key:'fence'}))).message;
+ await m.fetch('agent:a','/api/messages/'+sent.id+'/readdress','POST',{recipient:'agent:c'},admin);
+ assert.equal((await m.get('global').fetch(request('/_receive','POST',{mail:{id:sent.id,epoch:1,recipient:'agent:b'}}))).status,404);
+ const old={id:'machine:h1',kind:'machine',resource_id:'h1',scopes:['message:delivery','mailbox:agent:b']};
+ assert.equal((await m.fetch('agent:b','/api/messages/'+sent.id+'/delivered','POST',{phase:'claim',epoch:1,operation_id:'native:'+sent.id+':1'},old)).status,404);
+ assert(m.nativeCalls.some(c=>c.path.endsWith('/mail-cancel')&&c.body.message_id===sent.id&&c.body.epoch===1));
 });
+
 test('central credential generations are encrypted, CAS fenced and provisioned only to approved hosts',async()=>{
  const s=state();let refreshes=0;
  const provider=async(url:string,init:any)=>{
@@ -182,16 +185,14 @@ test('message completion and acceptance retain distinct idempotent receipt stage
  const status=await data(await m.fetch('agent:a',`/api/messages/${sent.id}/status`));
  assert.equal(status.events.filter((e:any)=>e.stage==='complete').length,1);assert.equal(status.events.filter((e:any)=>e.stage==='accept').length,1);assert(status.message.completed_at);assert(status.message.accepted_at);
 });
-test('recipient receipt journals survive transport failure and retry without duplicate completion',async()=>{
- const m=mailboxes(),sent=(await data(await m.fetch('agent:a','/api/messages','POST',{recipient:'agent:b',body:'work',key:'retry-receipt'}))).message;
- m.flags.blockReceipts=true;
- assert.equal((await m.fetch('agent:b',`/api/messages/${sent.id}/complete`,'POST',{})).status,503);
- const store=m.stores.get('agent:b')!;assert(store.ctx.alarm);
- assert.equal((store.database.prepare('SELECT state FROM receipts WHERE message_id=?').get(sent.id) as any).state,'pending');
- m.flags.blockReceipts=false;store.database.prepare('UPDATE receipts SET next_attempt=? WHERE message_id=?').run(Date.now()-1,sent.id);clearFixtureCache(m.get('agent:b'));
- await m.get('agent:b').alarm();assert.equal(store.ctx.alarm,null);
- const status=await data(await m.fetch('agent:a',`/api/messages/${sent.id}/status`));assert(status.message.completed_at);assert.equal(status.events.filter((e:any)=>e.stage==='complete').length,1);
+test('one durable message stage is immediately shared by both views without a receipt-forwarding transport',async()=>{
+ const m=mailboxes(),sent=(await data(await m.fetch('agent:a','/api/messages','POST',{recipient:'agent:b',body:'work',key:'atomic-stage'}))).message;
+ m.flags.blockReceipts=true;assert.equal((await m.fetch('agent:b','/api/messages/'+sent.id+'/complete','POST',{})).status,200);
+ const sender=await data(await m.fetch('agent:a','/api/messages/'+sent.id+'/status')),recipient=await data(await m.fetch('agent:b','/api/messages/'+sent.id+'/status'));assert(sender.message.completed_at);assert.equal(sender.message.completed_at,recipient.message.completed_at);
+ m.restart('global');assert.equal((await m.fetch('agent:b','/api/messages/'+sent.id+'/complete','POST',{})).status,200);
+ const replay=await data(await m.fetch('agent:a','/api/messages/'+sent.id+'/status'));assert.equal(replay.events.filter((e:any)=>e.stage==='complete').length,1);assert.equal(m.stores.get('global')!.ctx.alarm,null);
 });
+
 test('refresh has one owner and a host revoked during refresh receives no credential bundle',async()=>{
  const s=state();let refreshes=0;let release!:()=>void;let started!:()=>void;
  const gate=new Promise<void>(resolve=>{release=resolve;}),seen=new Promise<void>(resolve=>{started=resolve;});
@@ -248,7 +249,7 @@ test('approved host refresh lease supports blocked-egress repair, CAS writeback,
  const h1={id:'machine:h1',kind:'machine',resource_id:'h1',scopes:[]},h2={id:'machine:h2',kind:'machine',resource_id:'h2',scopes:[]};
  const lease=await data(await account.fetch(request('/api/account/refresh-lease','POST',{generation:1},h1)));assert(lease.lease);
  assert.equal((await account.fetch(request('/api/account/refresh-lease','POST',{generation:1},h2))).status,409);
- const repair=await data(await account.fetch(request('/api/account/credentials','GET',undefined,h1)));assert.equal(repair.generation,1);assert.equal(providerCalls,0,'leased host reads repair bundle without blocked central refresh');
+ const repair=await data(await account.fetch(request('/api/account/credentials?refresh_lease='+encodeURIComponent(lease.lease),'GET',undefined,h1)));assert.equal(repair.generation,1);assert.equal(providerCalls,0,'leased host reads repair bundle without blocked central refresh');
  const rotated=auth('2026-11-04T12:00:00Z','synthetic-host-rotated');
  const written=await data(await account.fetch(request('/api/account/rotation','POST',{expected_generation:1,lease:lease.lease,files:rotated},h1)));assert.equal(written.generation,2);
  const current=await data(await account.fetch(request('/api/account/rotation','POST',{expected_generation:2,files:rotated},h1)));assert.equal(current.unchanged,true);assert.equal(current.generation,2);
@@ -362,29 +363,28 @@ test('host rotation rejects primitive GO JSON instead of publishing a broken gen
  const host={id:'machine:h1',kind:'machine',resource_id:'h1',scopes:[]};assert.equal((await account.fetch(request('/api/account/rotation','POST',{files:{'.local/share/opencode-hub/device-auth.json':'1'},expected_generation:1},host))).status,400);
  assert.equal((s.database.prepare('SELECT generation FROM credentials').get() as any).generation,1);
 });
-test('native evidence cannot override authenticated machine identity and receipt retry survives missing alarm',async()=>{
+test('native proof normalizes authenticated machine identity and both views survive missing alarm and restart',async()=>{
  const m=mailboxes(),sent=(await data(await m.fetch('agent:a','/api/messages','POST',{recipient:'agent:b',body:'native',key:'proof-auth'}))).message;
- const host={id:'machine:h1',kind:'machine',resource_id:'h1',scopes:['message:delivery','mailbox:agent:b']},operation='native:'+sent.id+':1';
- const claim=await data(await m.fetch('agent:b',`/api/messages/${sent.id}/delivered`,'POST',{phase:'claim',epoch:1,operation_id:operation},host));
- const body={phase:'receipt',epoch:1,operation_id:operation,claim_id:claim.claim_id,native_receipt:{provider:'aplexer',message_id:'physical-auth',session_id:'session-test',recipient:'agent:b',machine_id:'forged-machine'}};
- m.flags.blockReceipts=true;assert.equal((await m.fetch('agent:b',`/api/messages/${sent.id}/delivered`,'POST',body,host)).status,503);
- const store=m.stores.get('agent:b')!;store.ctx.alarm=null;m.restart('agent:b');assert(store.ctx.alarm,'constructor restores receipt continuation after lost alarm');
- m.flags.blockReceipts=false;store.database.prepare('UPDATE receipts SET next_attempt=?').run(Date.now()-1);clearFixtureCache(m.get('agent:b'));await m.get('agent:b').alarm();
- const status=await data(await m.fetch('agent:a',`/api/messages/${sent.id}/status`));assert.equal(status.message.native_receipt.machine_id,'h1');assert.equal(JSON.stringify(status).includes('forged-machine'),false);
- assert.equal((await m.fetch('agent:b',`/api/messages/${sent.id}/delivered`,'POST',body,host)).status,200);
+ const h={id:'machine:h1',kind:'machine',resource_id:'h1',scopes:['message:delivery','mailbox:agent:b']},operation='native:'+sent.id+':1';
+ const claim=await data(await m.fetch('agent:b','/api/messages/'+sent.id+'/delivered','POST',{phase:'claim',epoch:1,operation_id:operation},h));
+ const proof={phase:'receipt',epoch:1,operation_id:operation,claim_id:claim.claim_id,native_receipt:{provider:'aplexer',message_id:'physical-identity',session_id:'session-test',recipient:'agent:b',machine_id:'forged'}};
+ assert.equal((await m.fetch('agent:b','/api/messages/'+sent.id+'/delivered','POST',proof,h)).status,200);
+ m.stores.get('global')!.ctx.alarm=null;m.restart('global');
+ assert.equal((await m.fetch('agent:b','/api/messages/'+sent.id+'/delivered','POST',proof,h)).status,200);
+ const status=await data(await m.fetch('agent:a','/api/messages/'+sent.id+'/status'));assert.equal(status.message.native_receipt.machine_id,'h1');assert.equal(status.events.filter((e:any)=>e.stage==='delivered').length,1);
 });
-test('owner journal registers global ACL before delivery and repairs pending-directory after restart',async()=>{
+
+test('global authority resolves authorized IDs and prefixes directly without a central message ACL projection',async()=>{
  const m=mailboxes();m.flags.blockDirectory=true;
- const sent=(await data(await m.fetch('agent:a','/api/messages','POST',{recipient:'agent:b',body:'directory',key:'directory-retry'}))).message;assert.equal(sent.state,'pending-directory');
- assert.equal((await data(await m.fetch('agent:b','/api/messages'))).items.length,0);
- const store=m.stores.get('agent:a')!;store.ctx.alarm=null;m.restart('agent:a');assert(store.ctx.alarm);
- m.flags.blockDirectory=false;store.database.prepare('UPDATE outbox SET next_attempt=? WHERE id=?').run(Date.now()-1,sent.id);clearFixtureCache(m.get('agent:a'));await m.get('agent:a').alarm();
- const route='/api/routes/message/'+sent.id;assert.equal((await m.control.fetch(request(route,'GET',undefined,{id:'agent:b',kind:'agent',scopes:[]}))).status,200);
- await m.fetch('agent:a',`/api/messages/${sent.id}/readdress`,'POST',{recipient:'agent:c',epoch:1,key:'directory-move'},admin);
- assert.equal((await m.control.fetch(request(route,'GET',undefined,{id:'agent:b',kind:'agent',scopes:[]}))).status,404);
- assert.equal((await m.control.fetch(request(route,'GET',undefined,{id:'agent:c',kind:'agent',scopes:[]}))).status,200);
- assert.equal((await m.fetch('agent:a','/api/messages','POST',{recipient:'agent:unknown',body:'unreachable',key:'unknown'})).status,404);
+ const sent=(await data(await m.fetch('agent:a','/api/messages','POST',{recipient:'agent:b',body:'direct owner authority',key:'owner'}))).message;
+ assert.equal((await m.fetch('agent:a','/api/messages/'+sent.id.slice(0,8))).status,200);
+ assert.equal((await m.fetch('agent:b','/api/messages/'+sent.id.slice(0,8))).status,200);
+ assert.equal((await m.fetch('agent:c','/api/messages/'+sent.id)).status,404);
+ assert.equal((await m.fetch('agent:c','/api/messages/'+sent.id.slice(0,8))).status,404);
+ assert.equal((m.controlState.database.prepare("SELECT COUNT(*) AS n FROM object_routes WHERE kind='message'").get() as any).n,0);
+ m.restart('global');assert.equal((await data(await m.fetch('agent:b','/api/messages'))).items[0].id,sent.id);
 });
+
 test('combined thread/state filter continues across nonmatching indexed pages without false completion',async()=>{
  const m=mailboxes();for(let i=0;i<3;i++){const sent=(await data(await m.fetch('agent:a','/api/messages','POST',{recipient:'agent:b',body:'thread '+i,key:'thread-'+i}))).message;await m.fetch('agent:b',`/api/messages/${sent.id}/complete`,'POST',{epoch:1});}
  const all=await data(await m.fetch('agent:b','/api/messages?state=completed')),target=all.items[all.items.length-1];let cursor=null,items:any[]=[];let pages=0;
@@ -412,7 +412,7 @@ test('unrouted native producer is idle until explicit durable directory wake, th
  const sent=(await data(await m.fetch('agent:a','/api/messages','POST',{recipient:'agent:b',body:'later forward',key:'unrouted'}))).message,store=m.stores.get('agent:b')!;
  assert.equal((store.database.prepare('SELECT state FROM native_outbox').get() as any).state,'unrouted');assert.equal(store.ctx.alarm,null);
  m.controlState.database.prepare("UPDATE named_agents SET forward_session='session-test' WHERE id='agent:b'").run();clearFixtureCache(m.control);
- m.restart('agent:b');await m.get('agent:b').fetch(request('/_resume-native','POST',{}));await m.get('agent:b').alarm();
+ m.restart('agent:b');await m.get('agent:b').fetch(request('/_resume-native','POST',{owner:'agent:b'}));await m.get('agent:b').alarm();
  assert.equal((store.database.prepare('SELECT state FROM native_outbox').get() as any).state,'queued');
  assert.equal(m.nativeCalls.filter(c=>c.path.endsWith('/mail')&&c.body.message_id===sent.id).length,1);
 });
@@ -444,9 +444,9 @@ test('phone read and ack stages remain independent of subsequent queued native c
  for(const stage of ['read','ack','accept','complete']){
   const m=mailboxes(),sent=(await data(await m.fetch('agent:a','/api/messages','POST',{recipient:'agent:b',body:'phone first',key:'phone-'+stage}))).message;
   await m.fetch('agent:b','/api/messages/'+sent.id+'/'+stage,'POST',{epoch:1});
-  const before=(m.stores.get('agent:b')!.database.prepare('SELECT state FROM inbox').get() as any).state;
+  const before=(m.stores.get('agent:b')!.database.prepare('SELECT state FROM messages').get() as any).state;
   assert.equal((await nativeDelivered(m,'agent:b',sent.id)).status,200);
-  assert.equal((m.stores.get('agent:b')!.database.prepare('SELECT state FROM inbox').get() as any).state,before);
+  assert.equal((m.stores.get('agent:b')!.database.prepare('SELECT state FROM messages').get() as any).state,before);
   const status=await data(await m.fetch('agent:a','/api/messages/'+sent.id+'/status'));assert(status.message.delivered_at);
  }
 });
@@ -522,4 +522,80 @@ test('zai configuration and policy refuse retired account aliases without bannin
  assert.equal((await control.fetch(request('/api/model-policy','PUT',{candidates:[{...candidate,account_id:'shared-zai'}]}))).status,400);
  assert.equal((await control.fetch(request('/api/model-policy','PUT',{candidates:[{...candidate,account_id:'zcodex'}]}))).status,400);
  assert.equal((await control.fetch(request('/api/model-policy','PUT',{candidates:[candidate]}))).status,200);
+});
+
+test('concurrent global reroute retries share one operation and a no-change key cannot later mutate another target',async()=>{
+ const m=mailboxes(),sent=(await data(await m.fetch('agent:a','/api/messages','POST',{recipient:'agent:b',body:'concurrent',key:'concurrent-move'}))).message,path='/api/messages/'+sent.id+'/readdress',move={recipient:'agent:c',key:'move-once',epoch:1};
+ const results=await Promise.all([m.fetch('agent:a',path,'POST',move,admin),m.fetch('agent:a',path,'POST',move,admin)]);
+ assert.equal(results.every(r=>r.status===200||r.status===202),true);
+ const current=(await data(await m.fetch('agent:a','/api/messages/'+sent.id))).message;assert.equal(current.epoch,2);assert.equal(current.recipient,'agent:c');
+ assert.equal((await m.fetch('agent:a',path,'POST',{recipient:'agent:c',key:'no-change',epoch:2},admin)).status,200);
+ assert.equal((await m.fetch('agent:a',path,'POST',{recipient:'agent:d',key:'no-change',epoch:2},admin)).status,409);
+});
+test('global physical native receipt cannot be reused for another sender or recipient message',async()=>{
+ const m=mailboxes(),h={id:'machine:h1',kind:'machine',resource_id:'h1',scopes:['message:delivery','mailbox:agent:b']};
+ const first=(await data(await m.fetch('agent:a','/api/messages','POST',{recipient:'agent:b',body:'one',key:'physical-one'}))).message;
+ assert.equal((await nativeDelivered(m,'agent:b',first.id)).status,200);
+ const second=(await data(await m.fetch('agent:c','/api/messages','POST',{recipient:'agent:b',body:'two',key:'physical-two'}))).message,op='native:'+second.id+':1';
+ const claim=await data(await m.fetch('agent:b','/api/messages/'+second.id+'/delivered','POST',{phase:'claim',epoch:1,operation_id:op},h));
+ const replay={phase:'receipt',epoch:1,operation_id:op,claim_id:claim.claim_id,native_receipt:{provider:'aplexer',message_id:'native:'+first.id+':1',session_id:'session-test',recipient:'agent:b'}};
+ assert.equal((await m.fetch('agent:b','/api/messages/'+second.id+'/delivered','POST',replay,h)).status,409);
+ assert.equal((await data(await m.fetch('agent:c','/api/messages/'+second.id+'/status'))).message.delivered_at,null);
+});
+
+test('stale authorized views and placement coalesce with actual scheduled collector work, without quota PUT',async()=>{
+ const s=state();let calls=0,release!:()=>void,entered!:()=>void;const waiting=new Promise<void>(r=>entered=r),gate=new Promise<void>(r=>release=r);
+ const provider=async()=>{calls++;entered();await gate;return Response.json({usage:{rolling:{percent:20},weekly:{usagePercent:30}}});};
+ const account=new AccountDO(s.ctx,{HUB2_CREDENTIAL_KEY:'55'.repeat(32),HUB2_PROVIDER_FETCH:provider as any});
+ await account.fetch(request('/api/account','PATCH',{provider:'go',capacity:1,enabled:true}));
+ await account.fetch(request('/api/account/credentials','PUT',{expected_generation:0,files:{'.local/share/opencode-hub/device-auth.json':JSON.stringify([{active:true,value:{access:'synthetic-go-token'}}])}}));
+ await account.fetch(request('/api/account/discovery','PUT',{enabled:true,interval_ms:21600000}));
+ (account as any).db.run('UPDATE discovery SET next_at=?',Date.now()-1);
+ assert.equal((await account.fetch(request('/api/account/quota','GET',undefined,{id:'agent:denied',kind:'agent',scopes:[]}))).status,403);assert.equal(calls,0);
+ const views=Array.from({length:8},()=>account.fetch(request('/api/account/quota'))),placement=account.fetch(request('/_internal/routing'));
+ await waiting;const scheduled=account.alarm();await Promise.resolve();assert.equal(calls,1);release();
+ const results=await Promise.all(views);await placement;await scheduled;
+ for(const result of results){const snapshot=await data(result);assert.equal(snapshot.fresh,true);assert.equal(snapshot.quota.remaining,70);assert.equal(snapshot.quota.source,'provider:go:generation:1');}
+ assert.equal(calls,1);
+});
+test('failed lazy probe has durable backoff while explicit operator probe can repair immediately',async()=>{
+ const s=state();let calls=0,fail=true;const account=new AccountDO(s.ctx,{HUB2_CREDENTIAL_KEY:'66'.repeat(32),HUB2_PROVIDER_FETCH:(async()=>{calls++;return fail?new Response('{}',{status:503}):Response.json({usage:{rolling:{percent:10}}});}) as any});
+ await account.fetch(request('/api/account','PATCH',{provider:'go',capacity:1,enabled:true}));
+ await account.fetch(request('/api/account/credentials','PUT',{expected_generation:0,files:{'.local/share/opencode-hub/device-auth.json':JSON.stringify([{active:true,value:{access:'synthetic-go-token'}}])}}));
+ assert.equal((await data(await account.fetch(request('/api/account/quota')))).fresh,false);
+ assert.equal((await data(await account.fetch(request('/_internal/routing')))).fresh,false);assert.equal(calls,1);
+ const restarted=new AccountDO(s.ctx,{HUB2_CREDENTIAL_KEY:'66'.repeat(32),HUB2_PROVIDER_FETCH:(async()=>{calls++;return Response.json({usage:{rolling:{percent:10}}});}) as any});
+ assert.equal((await data(await restarted.fetch(request('/api/account/quota')))).fresh,false);assert.equal(calls,1);
+ fail=false;assert.equal((await restarted.fetch(request('/api/account/discovery','POST',{}))).status,200);
+ assert.equal((await data(await restarted.fetch(request('/api/account/quota')))).fresh,true);assert.equal(calls,2);
+});
+
+test('default native homes receive access-only material and approved host metadata is account scoped',async()=>{
+ const s=state(),expiry=Math.floor(Date.now()/1000)+864000,token='e30.'+btoa(JSON.stringify({exp:expiry})).replaceAll('=','')+'.synthetic',account=new AccountDO(s.ctx,{HUB2_CREDENTIAL_KEY:'77'.repeat(32),HUB2_PROVIDER_FETCH:(async(url:any)=>Response.json(String(url).includes('resetcredits')?{credits:[]}:{rate_limit:{primary_window:{used_percent:20,reset_at:expiry},secondary_window:{used_percent:30,reset_at:expiry}}})) as any});
+ await account.fetch(request('/api/account','PATCH',{provider:'codex',capacity:1,enabled:true}));
+ const files={'.codex/auth.json':JSON.stringify({tokens:{access_token:token,refresh_token:'synthetic-controller-refresh'},last_refresh:new Date().toISOString()})};
+ await account.fetch(request('/api/account/credentials','PUT',{expected_generation:0,files}));
+ const host={id:'machine:h1',kind:'machine',resource_id:'h1',scopes:[]};
+ assert.equal((await account.fetch(request('/api/account','GET',undefined,host))).status,403);
+ await account.fetch(request('/api/account/hosts','PUT',{hosts:['h1']}));
+ const metadata=await data(await account.fetch(request('/api/account/credentials?metadata=1','GET',undefined,host)));assert.equal(metadata.generation,1);assert.equal(metadata.files,undefined);
+ const access=await data(await account.fetch(request('/api/account/credentials?min_validity_ms=7560000','GET',undefined,host)));
+ assert.equal(access.generation,1);assert.equal(access.refresh_material,false);assert.equal(access.access_expires_at,expiry*1000);assert.equal(JSON.parse(access.files['.codex/auth.json']).tokens.refresh_token,'');assert.equal(JSON.parse(access.files['.codex/auth.json']).tokens.access_token,token);assert.equal(JSON.parse(access.files['.codex/auth.json']).last_refresh,JSON.parse(files['.codex/auth.json']).last_refresh);
+ const lease=await data(await account.fetch(request('/api/account/refresh-lease','POST',{generation:1},host)));
+ const controller=await data(await account.fetch(request('/api/account/credentials?refresh_lease='+lease.lease,'GET',undefined,host)));assert.equal(JSON.parse(controller.files['.codex/auth.json']).tokens.refresh_token,'synthetic-controller-refresh');assert.equal(controller.refresh_material,true);
+ const view=await data(await account.fetch(request('/api/account','GET',undefined,host)));assert.equal(view.account.provider,'codex');
+ await account.fetch(request('/api/account/hosts','PUT',{hosts:[]}));assert.equal((await account.fetch(request('/api/account','GET',undefined,host))).status,403);
+});
+test('expired issued refresh permit still fences a different host rotation and wrong material retrieval',async()=>{
+ const s=state(),account=new AccountDO(s.ctx,{HUB2_CREDENTIAL_KEY:'88'.repeat(32)}),h1={id:'machine:h1',kind:'machine',resource_id:'h1',scopes:[]},h2={...h1,id:'machine:h2',resource_id:'h2'};
+ await account.fetch(request('/api/account','PATCH',{provider:'codex',capacity:1,enabled:true}));
+ const auth=(stamp:string)=>({'.codex/auth.json':JSON.stringify({tokens:{access_token:'synthetic-access',refresh_token:'synthetic-refresh'},last_refresh:stamp})});
+ await account.fetch(request('/api/account/credentials','PUT',{expected_generation:0,files:auth('2026-11-01T00:00:00Z')}));
+ await account.fetch(request('/api/account/hosts','PUT',{hosts:['h1','h2']}));
+ const lease=await data(await account.fetch(request('/api/account/refresh-lease','POST',{generation:1},h1)));
+ (account as any).db.run('UPDATE credentials SET refresh_until=?',Date.now()-1);
+ assert.equal((await account.fetch(request('/api/account/credentials?refresh_lease='+lease.lease,'GET',undefined,h2))).status,409);
+ const denied=await account.fetch(request('/api/account/rotation','POST',{expected_generation:1,files:auth('2026-11-04T00:00:00Z')},h2));assert.equal(denied.status,409);
+ assert.equal((s.database.prepare('SELECT generation FROM credentials').get() as any).generation,1);
+ const owned=await account.fetch(request('/api/account/rotation','POST',{expected_generation:1,lease:lease.lease,files:auth('2026-11-04T00:00:00Z')},h1));assert.equal(owned.status,200);
 });

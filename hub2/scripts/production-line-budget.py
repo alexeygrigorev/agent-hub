@@ -29,7 +29,7 @@ def text_files(path: Path) -> set[Path]:
     return {
         file for file in path.rglob("*")
         if file.is_file() and file.suffix.lower() in TEXT_SUFFIXES
-        and not {"__pycache__", "build", "dist"}.intersection(file.parts)
+        and not {"__pycache__", "build", "dist", "node_modules"}.intersection(file.parts)
         and not any(part.startswith(".") for part in file.relative_to(ROOT).parts)
     }
 
@@ -39,6 +39,9 @@ def production_files() -> set[Path]:
     package = HUB2 / "package.json"
     if package.is_file():
         files.add(package)
+    package_lock = HUB2 / "package-lock.json"
+    if package_lock.is_file():
+        files.add(package_lock)
     package = HUB2 / "host" / "pyproject.toml"
     if package.is_file():
         files.add(package)

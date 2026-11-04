@@ -260,6 +260,7 @@ export default {
         }
         let deliverySession: string | undefined;
         const owner = q.get('mailbox') || actor.id;
+        if (path === '/api/messages' && request.method === 'POST' && owner !== actor.id) return error('sender_not_authorized',403);
         if (actor.kind === 'machine' && /\/delivered$/.test(path) && request.method === 'POST') {
           if (!actor.resource_id || !actor.scopes.includes('message:delivery'))
             return error('forbidden', 403);
@@ -304,7 +305,7 @@ export default {
           !deliverySession
         )
           return error('forbidden', 403);
-        const mailbox = env.MAILBOXES.get(env.MAILBOXES.idFromName(owner));
+        const mailbox = env.MAILBOXES.get(env.MAILBOXES.idFromName('global'));
         return mailbox.fetch(
           await forwardRequest(
             request,

@@ -8,8 +8,8 @@ export class MailboxFixture extends MailboxDO{
  async fetch(request:Request):Promise<Response>{
   if(new URL(request.url).pathname==='/_fixture/profile'){
    const db=(this as any).db,rows=[];
-   for(const table of ['outbox','receipts','native_outbox']){
-    const tail=table==='outbox'?'id':table==='receipts'?'message_id,stage,epoch':'message_id,epoch';
+   for(const table of ['native_outbox','readdress_operations']){
+    const tail=table==='native_outbox'?'message_id,epoch':'sender,key';
     const query='SELECT next_attempt FROM '+table+' WHERE due=1 ORDER BY next_attempt,'+tail+' LIMIT 1';
     const before=db.snapshot();db.all(query);const after=db.snapshot();
     rows.push({table,reads:after.rows_read-before.rows_read,writes:after.rows_written-before.rows_written,plan:db.all('EXPLAIN QUERY PLAN '+query)});
@@ -36,6 +36,6 @@ export default {async fetch(request:Request,env:any){
  const url=new URL(request.url),match=url.pathname.match(/^\/(accounts|mailboxes|control|machines)\/([^/]+)(\/.*)$/);
  if(!match)return new Response('not found',{status:404});
  const id=decodeURIComponent(match[2]),namespace=match[1]==='accounts'?env.ACCOUNTS:match[1]==='control'?env.CONTROL:match[1]==='machines'?env.MACHINES:env.MAILBOXES;
- const headers=new Headers(request.headers);const actor=JSON.parse(headers.get('x-hub2-actor')||'{}');if(actor.kind==='machine')headers.set('x-hub2-delivery-session','session-test');if(match[1]==='mailboxes')headers.set('x-hub2-mailbox',id);
- return namespace.get(namespace.idFromName(id)).fetch(new Request('https://fixture.internal'+match[3]+url.search,{method:request.method,headers,body:request.body,duplex:'half'} as RequestInit));
+ const headers=new Headers(request.headers);const actor=JSON.parse(headers.get('x-hub2-actor')||'{}');if(actor.kind==='machine')headers.set('x-hub2-delivery-session','session-test');if(match[1]==='mailboxes')headers.set('x-hub2-mailbox',id);if(match[1]==='accounts')headers.set('x-hub2-account-id',id);
+ return namespace.get(namespace.idFromName(match[1]==='mailboxes'?'global':id)).fetch(new Request('https://fixture.internal'+match[3]+url.search,{method:request.method,headers,body:request.body,duplex:'half'} as RequestInit));
 }};

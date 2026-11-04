@@ -270,6 +270,7 @@ export class ProjectDO {
     const intake = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id = ?', intakeId);
     if (!intake) return error('intake_not_found', 404);
     if (!this.canProject(actor, intake.project, 'session:start')) return error('forbidden', 403);
+    if(intake.status==='failed'&&!this.qualifiedFailure(intake))return error('retry_requires_qualified_failure',409);
     if (intake.route_registered !== 1 && !await this.registerIntakeRoute(intake)) {
       await this.scheduleNext();
       return error('route_registration_pending', 503);
@@ -359,12 +360,12 @@ export class ProjectDO {
     try {
       this.transaction(() => {
         const current = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?', intakeId);
-        if (!current || (current.status !== 'open' && !(current.status === 'queued' && current.session_id === null))) throw new HttpError('intake_already_assigned', 409);
+        if (!current || (current.status !== 'open' && !(current.status === 'queued' && current.session_id === null)&&!this.qualifiedFailure(current))) throw new HttpError('intake_already_assigned', 409);
         this.db.run(`INSERT INTO dispatch_sagas(operation_id, request_digest, request_key, intake_id, session_id, machine_id, account_id, attempt_operation_id, launch_spec_json, routing_json, epoch, state, attempt, next_action_at, last_reason, created_at, updated_at)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending_machine', 0, ?, NULL, ?, ?)`, operationId, digest, key, intakeId, sessionId, machineId, accountId, `${operationId}:0`, JSON.stringify(launchSpec), JSON.stringify(route), now + 30_000, now, now);
-        this.db.run("UPDATE intakes SET status = 'queued', assigned_machine_id = ?, assigned_actor_id = ?, session_id = ?, updated_at = ? WHERE id = ?", machineId, actor?.id || 'operator', sessionId, now, intakeId);
+        this.db.run("UPDATE intakes SET status = 'queued', assigned_machine_id = ?, assigned_actor_id = ?, session_id = ?, final_evidence_json=NULL, updated_at = ? WHERE id = ?", machineId, actor?.id || 'operator', sessionId, now, intakeId);
         this.appendEvent(intakeId, `start:${operationId}:requested`, actor?.id || 'operator', 'session_start_requested', {
-          operation_id: operationId, session_id: sessionId, machine_id: machineId, account_id: accountId, routing_decision: route,
+          operation_id: operationId, session_id: sessionId, machine_id: machineId, account_id: accountId, routing_decision: route,...(current.status==='failed'?{retry_of_session:current.session_id}:{}),
         }, now);
         this.db.run('INSERT INTO idempotency(scope, request_key, request_digest, response_json, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)',
           scope, key, digest, JSON.stringify({ operation_id: operationId }), now, now + 180 * 24 * 60 * 60_000);
@@ -617,12 +618,18 @@ export class ProjectDO {
     const now = Date.now();
     const finishedStatus = body.exit_code === 0 ? 'completed-awaiting-review' : 'failed';
     this.transaction(() => {
-      this.db.run('UPDATE intakes SET status=?, final_evidence_json=?, updated_at=? WHERE id=?', finishedStatus, JSON.stringify({ ...evidence, native_id: body.native_id, exit_code: body.exit_code }), now, intake.id);
+      this.db.run('UPDATE intakes SET status=?, final_evidence_json=?, updated_at=? WHERE id=?', finishedStatus, JSON.stringify({ ...evidence, native_id: body.native_id, exit_code: body.exit_code,native_exit_confirmed:true,account_released:true }), now, intake.id);
       this.db.run("UPDATE dispatch_sagas SET state='complete', next_action_at=NULL, last_reason=NULL, updated_at=? WHERE operation_id=?", now, saga.operation_id);
       this.appendEvent(intake.id, `finish:${saga.operation_id}`, 'hub2-host', 'finish_evidence_received', { session_id: saga.session_id, native_id: body.native_id, exit_code: body.exit_code, evidence }, now);
     });
     await this.scheduleNext();
     return json({ ok: true, intake_id: intake.id });
+  }
+
+  private qualifiedFailure(intake:IntakeRow):boolean{
+    if(intake.status!=='failed'||!intake.session_id)return false;
+    const prior=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id=?',intake.session_id),proof=this.parse(intake.final_evidence_json) as JsonRecord|null;
+    return !!prior&&prior.state==='complete'&&!!prior.native_id&&proof?.native_id===prior.native_id&&Number.isSafeInteger(proof.exit_code)&&proof.exit_code!==0&&proof.native_exit_confirmed===true&&proof.account_released===true;
   }
 
   private async releaseAccount(saga: SagaRow, proof: { native_exit_confirmed?: true; unclaimed_proof?: JsonRecord }): Promise<boolean> {
@@ -676,7 +683,7 @@ export class ProjectDO {
     if(record.kind==='prompt'||record.kind==='wake'){
       const recipient=record.payload.recipient??(parent.session_id?'session:'+parent.session_id:null),body=record.payload.body??record.payload.prompt;
       if(typeof recipient!=='string'||typeof body!=='string'||!body.trim()||body.length>12000)throw new Error('invalid_scheduled_message');
-      const response=await this.env.MAILBOXES.get(this.env.MAILBOXES.idFromName(record.owner)).fetch('https://mailbox.internal/api/messages',{method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(actor),'x-hub2-mailbox':record.owner},body:JSON.stringify({key:record.id,recipient,body})});
+      const response=await this.env.MAILBOXES.get(this.env.MAILBOXES.idFromName('global')).fetch('https://mailbox.internal/api/messages',{method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(actor),'x-hub2-mailbox':record.owner},body:JSON.stringify({key:record.id,recipient,body})});
       if(!response.ok)throw new Error('scheduled_message_pending');
       return {intake_id:parent.id,...(parent.session_id?{session_id:parent.session_id}:{})};
     }

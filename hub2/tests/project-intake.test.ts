@@ -45,3 +45,21 @@ test('event sequence cache publishes only committed state and reloads correctly 
  const history=await body(await f.call('/api/intakes/'+own.id+'/history'));assert.deepEqual(history.events.map((e:any)=>e.seq),[1,2]);assert.equal(history.events.some((e:any)=>e.body.note==='must disappear'),false);
  f.restart();await f.call('/api/intakes/'+own.id,'PATCH',{key:'after-restart',note:'persisted restart'});const resumed=await body(await f.call('/api/intakes/'+own.id+'/history'));assert.deepEqual(resumed.events.map((e:any)=>e.seq),[1,2,3]);
 });
+test('failed task retry requires native exit and release evidence, preserves old key and creates a new immutable session',async()=>{
+ const f=fixture(),own=await intake(f,'retry'),start={key:'first',workspace:'/tmp/synthetic-retry',engine:'shell',machine_id:'h1',override_reason:'Synthetic semantic test'};
+ assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',start)).status<300,true);
+ const first=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any,db=(f.project as any).db,native='11111111-1111-4111-8111-111111111111';
+ // Machine admission is synthetic in this unit fixture; actual public native gates cover the host seam.
+ db.run("UPDATE dispatch_sagas SET state='admitted' WHERE operation_id=?",first.operation_id);
+ const binding={operation_id:first.operation_id,attempt_operation_id:first.attempt_operation_id,session_id:first.session_id,machine_id:first.machine_id,epoch:first.epoch,native_id:native};
+ assert.equal((await f.call('/_internal/started','POST',binding)).status,201);
+ assert.equal((await f.call('/_internal/finish','POST',{...binding,exit_code:1,native_exit_confirmed:false,evidence:{result:'failed'}})).status,400);
+ assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',{...start,key:'premature'})).status,409);
+ assert.equal((await f.call('/_internal/finish','POST',{...binding,exit_code:1,native_exit_confirmed:true,evidence:{result:'failed'}})).status,200);
+ const replay=await f.call('/api/intakes/'+own.id+'/start','POST',start);assert.equal(replay.status<300,true);assert.equal((f.sql.prepare('SELECT COUNT(*) AS n FROM dispatch_sagas').get() as any).n,1);
+ const retried=await f.call('/api/intakes/'+own.id+'/start','POST',{...start,key:'second'});assert.equal(retried.status<300,true);
+ const current=f.sql.prepare('SELECT * FROM intakes WHERE id=?').get(own.id) as any;assert.notEqual(current.session_id,first.session_id);assert.equal(current.status,'queued');assert.equal(current.final_evidence_json,null);
+ assert.equal((f.sql.prepare('SELECT state FROM dispatch_sagas WHERE operation_id=?').get(first.operation_id) as any).state,'complete');
+ assert.equal((await f.call('/_internal/finish','POST',{...binding,exit_code:1,native_exit_confirmed:true,evidence:{result:'failed'}})).status,200);
+ assert.equal((f.sql.prepare('SELECT session_id FROM intakes WHERE id=?').get(own.id) as any).session_id,current.session_id);
+});

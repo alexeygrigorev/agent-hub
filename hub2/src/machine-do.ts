@@ -77,6 +77,7 @@ type NativeMail = {message_id:string;epoch:number;operation_id:string;session_id
 
 /** Per-host presence, native-session evidence and durable completion outbox. */
 export class MachineDO {
+  private alarmQueue:Promise<void>=Promise.resolve();
   private readonly db: MeteredDb;
   private readonly constructorMs: number;
 
@@ -387,7 +388,7 @@ export class MachineDO {
   private offerView(row: SessionRow): JsonRecord {
     return {
       session_id: row.id, operation_id: row.operation_id, intake_id: row.intake_id,
-      project_id: row.project_id, epoch: row.epoch, title: row.title,
+      project_id: row.project_id, account_id: row.account_id, epoch: row.epoch, title: row.title,
       acceptance_criteria: this.parse(row.acceptance_criteria_json),
       launch: this.parse(row.launch_json), expires_at: row.offer_expires_at, claimed: row.state === 'claimed',
     };
@@ -420,7 +421,16 @@ export class MachineDO {
       return true;
     });
     if (!recorded) return error('stale_admission_result',409);
-    return json(result);
+    if(body.provider_check!==true)return json(result);
+    if(!row.account_id)return error('provider_account_required',409);
+    const accountReply=await this.env.ACCOUNTS.get(this.env.ACCOUNTS.idFromName(row.account_id)).fetch('https://account.internal/_internal/routing');
+    if(!accountReply.ok)return error('provider_evidence_unavailable',503);
+    const evidence=await accountReply.json() as any;
+    if(!evidence.fresh||!evidence.account?.enabled||!evidence.hosts?.includes(machineId)||!Number.isSafeInteger(evidence.credential_generation)
+      ||evidence.quota?.source!==`provider:${evidence.account.provider}:generation:${evidence.credential_generation}`)return error('provider_evidence_unverified',503);
+    if(!this.db.one("SELECT id FROM sessions WHERE id=? AND operation_id=? AND epoch=? AND state='claimed'",row.id,row.operation_id,row.epoch))return error('stale_provider_admission',409);
+    return json({...result,session_id:row.id,operation_id:row.operation_id,machine_id:machineId,account_id:row.account_id,
+      provider:evidence.account.provider,credential_generation:evidence.credential_generation,quota:evidence.quota});
   }
 
   private async childCredentials(request:Request,sessionId:string):Promise<Response>{
@@ -560,24 +570,32 @@ export class MachineDO {
   }
 
   private async scheduleNext(): Promise<void> {
+    const pending=this.alarmQueue.catch(()=>{}).then(async()=>{
+    this.db.alarmOperation();
+    const current = await this.ctx.storage.getAlarm();
     const next = this.db.one<{ due: number | null }>(`SELECT MIN(due) AS due FROM (
       SELECT MIN(offer_expires_at) AS due FROM sessions WHERE state='offered' AND offer_expires_at IS NOT NULL
       UNION ALL SELECT MIN(next_action_at) AS due FROM machine_outbox WHERE state='pending'
     )`);
-    this.db.alarmOperation();
-    const current = await this.ctx.storage.getAlarm();
     if (next?.due !== null && next?.due !== undefined) {
       if (current !== next.due) { this.db.alarmOperation(); await this.ctx.storage.setAlarm(next.due); }
     } else if (current !== null) {
       this.db.alarmOperation();
       await this.ctx.storage.deleteAlarm();
     }
+    });
+    this.alarmQueue=pending;
+    await pending;
   }
 
   private async ensureDeadline(due:number):Promise<void>{
+    const pending=this.alarmQueue.catch(()=>{}).then(async()=>{
     this.db.alarmOperation();
     const current=await this.ctx.storage.getAlarm();
     if(current===null||current>due){this.db.alarmOperation();await this.ctx.storage.setAlarm(due);}
+    });
+    this.alarmQueue=pending;
+    await pending;
   }
 
   private async createCommand(request: Request, sessionId: string): Promise<Response> {

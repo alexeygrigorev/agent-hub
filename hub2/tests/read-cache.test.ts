@@ -70,9 +70,17 @@ test('actual MeteredDb mount invalidates all/run mutations before execution and 
  const adapter:any={exec(q:string,...a:any[]){const s=sql.prepare(q),rows=s.columns().length?s.all(...a):(s.run(...a),[]);return{toArray:()=>rows};}};
  const state:any={storage:{transactionSync(fn:any){sql.exec('BEGIN');try{const result=fn();sql.exec('COMMIT');return result;}catch(e){sql.exec('ROLLBACK');throw e;}}}};
  const db=new MeteredDb(adapter);db.run('CREATE TABLE config(id INTEGER,value TEXT)');db.run('INSERT INTO config VALUES(1,?)','old');
- assert.equal(db.all<any>('SELECT * FROM config')[0].value,'old');db.all('SELECT * FROM config');assert.equal(db.snapshot().read_cache.hits,1);
+ // Node SQLite has no native cursor row counters: seed real query data only for this hook test. Native cost/cache insertion is verified in workerd.
+ (db as any).cache.put('SELECT * FROM config',[],sql.prepare('SELECT * FROM config').all());
+ assert.equal(db.all<any>('SELECT * FROM config')[0].value,'old');assert.equal(db.snapshot().read_cache.hits,1);
  db.all('UPDATE config SET value=? RETURNING id','via all');assert.equal(db.all<any>('SELECT * FROM config')[0].value,'via all');
- assert.throws(()=>db.transaction(state,()=>{db.run('UPDATE config SET value=?','uncommitted');assert.equal(db.all<any>('SELECT * FROM config')[0].value,'uncommitted');throw Error('rollback');}));
+ assert.throws(()=>db.transaction(state,()=>{db.run('UPDATE config SET value=?','uncommitted');assert.equal(db.all<any>('SELECT * FROM config')[0].value,'uncommitted');(db as any).cache.put('SELECT * FROM config',[],sql.prepare('SELECT * FROM config').all());throw Error('rollback');}));
  assert.equal(db.all<any>('SELECT * FROM config')[0].value,'via all');
  db.run('UPDATE config SET value=?','via run');assert.equal(db.all<any>('SELECT * FROM config')[0].value,'via run');
+});
+test('quoted volatile function names and IN table shorthand cannot hide dependencies; scalar IN lists remain data cached',()=>{
+ const c=new ReadCache();
+ for(const q of ['SELECT "random"() AS value FROM config','SELECT [random]() AS value FROM config','SELECT '+String.fromCharCode(96)+'random'+String.fromCharCode(96)+'() AS value FROM config','SELECT * FROM config WHERE id IN other','SELECT * FROM config WHERE id IN (SELECT id FROM other)']){c.put(q,[],[{id:'unsafe'}]);assert.equal(c.get(q,[]),undefined);}
+ const q='SELECT * FROM config WHERE id IN (?,?)';c.put(q,['a','b'],[{id:'a'}]);assert.deepEqual(c.get(q,['a','b']),[{id:'a'}]);
+ c.before('UPDATE config SET value=1');assert.equal(c.get(q,['a','b']),undefined);
 });

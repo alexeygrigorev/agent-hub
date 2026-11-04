@@ -21,42 +21,25 @@ export const publicAuthPaths = new Set([
   '/api/token/refresh',
   '/api/token/revoke',
 ]);
-export async function publicAuthentication(
-  request: Request,
-  env: AuthEnv,
-): Promise<Response | undefined> {
-  if (!publicAuthPaths.has(new URL(request.url).pathname)) return;
+async function controlAuth(request: Request, env: AuthEnv, path: string, includeBody = true): Promise<Response> {
   const headers = new Headers(request.headers);
   for (const k of [...headers.keys()]) if (k.toLowerCase().startsWith('x-hub2-')) headers.delete(k);
   headers.set('x-hub2-public-origin', new URL(request.url).origin);
-  return env.CONTROL.get(env.CONTROL.idFromName('global')).fetch(
-    new Request(
-      'https://control.internal/_auth/public' +
-        new URL(request.url).pathname +
-        new URL(request.url).search,
-      {
-        method: request.method,
-        redirect: 'manual',
-        headers,
-        body: ['GET', 'HEAD'].includes(request.method) ? undefined : request.body,
-      },
-    ),
-  );
+  return env.CONTROL.get(env.CONTROL.idFromName('global')).fetch(new Request(
+    'https://control.internal/_auth/' + path,
+    { method: request.method, redirect: 'manual', headers,
+      body: includeBody && !['GET', 'HEAD'].includes(request.method) ? request.body : undefined },
+  ));
+}
+export async function publicAuthentication(request: Request, env: AuthEnv): Promise<Response | undefined> {
+  const url = new URL(request.url);
+  if (publicAuthPaths.has(url.pathname)) return controlAuth(request, env, 'public' + url.pathname + url.search);
 }
 export async function cookieActor(request: Request, env: AuthEnv): Promise<Actor | undefined> {
-  // Authorization is a separate authority. An invalid bearer cannot fall back to cookies.
+  // An invalid bearer cannot fall back to the independently authenticated cookie.
   if (request.headers.has('Authorization')) return;
-  const headers = new Headers(request.headers);
-  for (const k of [...headers.keys()]) if (k.toLowerCase().startsWith('x-hub2-')) headers.delete(k);
-  headers.set('x-hub2-public-origin', new URL(request.url).origin);
-  const response = await env.CONTROL.get(env.CONTROL.idFromName('global')).fetch(
-    new Request('https://control.internal/_auth/cookie', {
-      method: request.method,
-      headers,
-    }),
-  );
-  if (!response.ok) return;
-  return ((await response.json()) as { actor: Actor }).actor;
+  const response = await controlAuth(request, env, 'cookie', false);
+  return response.ok ? ((await response.json()) as { actor: Actor }).actor : undefined;
 }
 export function allowlisted(env: AuthEnv, email: string): boolean {
   return [env.HUB_ADMINS, env.HUB_ADDITIONAL_ADMINS]
@@ -75,11 +58,6 @@ export function cookieValue(r: Request, name: string): string | undefined {
 }
 export function authCookie(name: string, value: string, age: number): string {
   return `${name}=${value}; Path=/; Max-Age=${age}; Secure; HttpOnly; SameSite=Lax`;
-}
-export function sameOrigin(r: Request): boolean {
-  const origin = r.headers.get('Origin'),
-    site = r.headers.get('Sec-Fetch-Site');
-  return (!origin || origin === new URL(r.url).origin) && (!site || site === 'same-origin');
 }
 export const noStore = {
   'Cache-Control': 'private, no-store',

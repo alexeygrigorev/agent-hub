@@ -85,24 +85,6 @@ export class ControlAuth {
       );
     });
   }
-  private async issue(
-    principal: string,
-    email: string,
-    client: string,
-    browser = false,
-  ): Promise<any> {
-    if (!allowlisted(this.env, email)) throw new Error('principal_not_authorized');
-    const issued = await this.preparedIssue(principal, email, client, browser);
-    this.db.transaction(this.ctx, () => {
-      issued.persist();
-      this.db.run(
-        'INSERT INTO actor_directory(id,kind,enabled) VALUES(?,?,1) ON CONFLICT(id) DO UPDATE SET enabled=1',
-        principal,
-        'human',
-      );
-    });
-    return issued.tokens;
-  }
   private cleanup(): void {
     const now = Date.now();
     if (now - this.lastCleanup < 60000) return;
@@ -136,9 +118,7 @@ export class ControlAuth {
         if (typeof b.actor_id !== 'string' || typeof b.generation !== 'string')
           return authError('invalid_authority', 401);
         const row = this.db.one<Credential>(
-          b.actor_id.startsWith('session:')
-            ? 'SELECT * FROM credentials WHERE actor_id=? AND generation=? AND revoked_at IS NULL'
-            : 'SELECT * FROM credentials WHERE resource_id=? AND generation=? AND revoked_at IS NULL',
+          'SELECT * FROM credentials WHERE resource_id=? AND generation=? AND revoked_at IS NULL',
           b.actor_id,
           b.generation,
         );
@@ -208,13 +188,15 @@ export class ControlAuth {
       verifier = randomToken(),
       now = Date.now(),
       returnTo = new URL(r.url).searchParams.get('return_to') || '/';
-    if (
-      !returnTo.startsWith('/') ||
-      returnTo.startsWith('//') ||
-      returnTo.includes('\\') ||
-      returnTo.length > 2048
-    )
-      return authError('invalid_return_to');
+    if (!returnTo.startsWith('/') || returnTo.length > 2048) return authError('invalid_return_to');
+    let decoded = returnTo;
+    for (let i=0;i<3;i++) {
+      if (decoded.startsWith('//') || /[\u0000-\u001f\u007f\\]/.test(decoded)) return authError('invalid_return_to');
+      const next = decodeURIComponent(decoded); if (next === decoded) break; decoded = next;
+    }
+    const destination = new URL(returnTo,this.origin(r));
+    if (destination.origin !== this.origin(r)) return authError('invalid_return_to');
+    const safeReturn = destination.pathname+destination.search+destination.hash;
     this.db.run(
       'INSERT INTO auth_login_states(hash,browser_hash,nonce,verifier,redirect,return_to,expires_at) VALUES(?,?,?,?,?,?,?)',
       await sha256Hex(state),
@@ -222,7 +204,7 @@ export class ControlAuth {
       nonce,
       verifier,
       this.env.AUTH_CALLBACK_URL,
-      returnTo,
+      safeReturn,
       now + 600000,
     );
     const url = new URL(this.env.AUTH_BASE_URL + '/oauth2/authorize');
@@ -286,9 +268,10 @@ export class ControlAuth {
       32768,
     );
     const identity = await identityToken(this.env, tokens.id_token, row.nonce),
-      issued = await this.issue('human:' + identity.sub, identity.email, 'browser', true);
+      issued = await this.preparedIssue('human:' + identity.sub, identity.email, 'browser', true);
+    this.db.transaction(this.ctx, issued.persist);
     const headers = new Headers({ ...noStore, Location: row.return_to });
-    headers.append('Set-Cookie', authCookie('hub2_session', issued.access_token, 43200));
+    headers.append('Set-Cookie', authCookie('hub2_session', issued.tokens.access_token, 43200));
     headers.append('Set-Cookie', authCookie('hub2_login', '', 0));
     return new Response(null, { status: 303, headers });
   }
@@ -436,6 +419,7 @@ export class ControlAuth {
     client: string,
     browser = false,
   ): Promise<{ tokens: any; persist: () => void }> {
+    if (!allowlisted(this.env, email)) throw new Error('principal_not_authorized');
     const token = randomToken(),
       refresh = randomToken(),
       csrf = randomToken(),
@@ -455,6 +439,7 @@ export class ControlAuth {
         family_id: family,
       },
       persist: () => {
+        if (browser) this.db.run('INSERT INTO actor_directory(id,kind,enabled) VALUES(?,?,1) ON CONFLICT(id) DO UPDATE SET enabled=1', principal, 'human');
         this.db.run(
           'INSERT INTO credentials(actor_id,kind,resource_id,generation,token_hash,scopes_json,family_id,client_id,created_at,expires_at,principal_email,refresh_hash,csrf_token) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
           id,

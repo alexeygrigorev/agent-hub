@@ -12,13 +12,13 @@ const entry=process.env.HUB2_CORE_ENTRY||resolve(root,'hub2/tests/core-integrati
 const reportPath=process.env.HUB2_CORE_REPORT;
 const names={control:'CoreControl',project:'CoreProject',machine:'CoreMachine',account:'CoreAccount',mailbox:'CoreMailbox'};
 const token='synthetic-core-operator-token-000000000000000000',project='synthetic/core',machine='synthetic-machine',account='synthetic-account';
-const sourceFiles=['worker','project-do','machine-do','control-do','account-do','mailbox-do','db','types'];
+const sourceFiles=['worker','project-do','machine-do','control-do','account-do','mailbox-do','db','types','auth','control-auth','worker-credentials','credential-crypto','read-cache','mcp','routing','project-work','cron'];
 async function hashes(){return Object.fromEntries(await Promise.all(sourceFiles.map(async n=>[n,createHash('sha256').update(await readFile(resolve(root,`hub2/src/${n}.ts`))).digest('hex')])));}
 const sourceBefore=await hashes();
 const bundle=await build({entryPoints:[entry],bundle:true,write:false,format:'esm',platform:'browser',external:['cloudflare:workers']});
 await mkdir(resolve(root,'.local/tmp'),{recursive:true});const persist=await mkdtemp(resolve(root,'.local/tmp/core-integration-'));
-const workspace=process.env.HUB2_CORE_WORKER_CONTEXT?resolve(persist,'workspace'):'/synthetic/workspace';if(process.env.HUB2_CORE_WORKER_CONTEXT)await mkdir(workspace,{recursive:true,mode:0o700});
-const options=convertV4MiniflareOptions({resourcePersistencePath:persist,host:'127.0.0.1',port:0,log:new Log(LogLevel.ERROR),workers:[{name:'hub2-core-native-fixture',script:bundle.outputFiles[0].text,modules:true,compatibilityDate:'2024-04-05',durableObjects:Object.fromEntries(Object.entries(names).map(([k,className])=>[({control:'CONTROL',project:'PROJECTS',machine:'MACHINES',account:'ACCOUNTS',mailbox:'MAILBOXES'})[k],{className,useSQLite:true}])),bindings:{HUB2_DEV_OPERATOR_TOKEN:token,HUB2_DEFAULT_ACCOUNT_ID:account,HUB2_ENGINE_ACCOUNTS:JSON.stringify({opencode:account}),HUB2_CREDENTIAL_KEY:'11'.repeat(32),HUB2_FIXTURE_ASSET_HTML:await readFile(resolve(root,'hub2/public/index.html'),'utf8')}}]});
+const workspace=process.env.HUB2_CORE_WORKER_CONTEXT||process.env.HUB2_CORE_PROVISION?resolve(persist,'workspace'):'/synthetic/workspace';if(process.env.HUB2_CORE_WORKER_CONTEXT||process.env.HUB2_CORE_PROVISION)await mkdir(workspace,{recursive:true,mode:0o700});
+const options=convertV4MiniflareOptions({resourcePersistencePath:persist,host:'127.0.0.1',port:0,log:new Log(LogLevel.ERROR),workers:[{name:'hub2-core-native-fixture',script:bundle.outputFiles[0].text,modules:true,compatibilityDate:'2024-04-05',durableObjects:Object.fromEntries(Object.entries(names).map(([k,className])=>[({control:'CONTROL',project:'PROJECTS',machine:'MACHINES',account:'ACCOUNTS',mailbox:'MAILBOXES'})[k],{className,useSQLite:true}])),bindings:{HUB2_FIXTURE_CODEX_PROVIDER:process.env.HUB2_CORE_PROVISION?'yes':'',HUB2_DEV_OPERATOR_TOKEN:token,HUB2_DEFAULT_ACCOUNT_ID:account,HUB2_ENGINE_ACCOUNTS:JSON.stringify({opencode:account}),HUB2_CREDENTIAL_KEY:'11'.repeat(32),HUB2_FIXTURE_ASSET_HTML:await readFile(resolve(root,'hub2/public/index.html'),'utf8')}}]});
 let mf=new Miniflare(options),base,hostToken,liveSocket,completedIntakeId;const results=[],measurements={};
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 async function api(path,method='GET',body,auth=token,extra={}){
@@ -28,7 +28,7 @@ async function api(path,method='GET',body,auth=token,extra={}){
 }
 function expect(result,status,label){assert.equal(result.status,status,`${label}: HTTP ${result.status}, error=${result.data.error||result.data.reason||''}`);return result.data;}
 const fixture=(kind,id,action='state',body)=>api(`/_fixture/${kind}/${encodeURIComponent(id)}/${action}`,body===undefined?'GET':'POST',body);
-async function snapshots(){const out={};for(const [kind,id] of [['control','global'],['project',project],['machine',machine],['account',account],...(process.env.HUB2_CORE_PUBLIC_MAIL?[['mailbox','human:dev'],['mailbox','agent:public-core-recipient']]:[])] ){const name=kind==='mailbox'?kind+':'+id:kind;out[name]=expect(await fixture(kind,id),200,kind+' state');assert.equal(out[name].counts.measurement_valid,true,kind+' invalid native meter');}return out;}
+async function snapshots(){const out={};for(const [kind,id] of [['control','global'],['project',project],['machine',machine],['account',account],...(process.env.HUB2_CORE_PUBLIC_MAIL?[['mailbox','global']]:[])] ){const name=kind==='mailbox'?kind+':'+id:kind;out[name]=expect(await fixture(kind,id),200,kind+' state');assert.equal(out[name].counts.measurement_valid,true,kind+' invalid native meter');}return out;}
 function delta(before,after){return Object.fromEntries(Object.keys(before).map(k=>[k,{reads:after[k].counts.rows_read-before[k].counts.rows_read,writes:after[k].counts.rows_written-before[k].counts.rows_written,alarm_calls:after[k].counts.alarm_operations-before[k].counts.alarm_operations}]));}
 async function test(name,fn){try{await fn();results.push({name,passed:true});}catch(e){results.push({name,passed:false,error:String(e.message),stack:String(e.stack).split('\n').slice(0,6).join('\n')});}}
 async function intake(key,title='Synthetic core lifecycle'){
@@ -58,8 +58,9 @@ try{
   const enrolled=expect(await api('/api/enrollments/complete','POST',{code:pair.pairing_code},null),201,'complete pairing');hostToken=enrolled.token;assert.equal(typeof hostToken,'string');
   expect(await api('/api/enrollments/complete','POST',{code:pair.pairing_code},null),410,'one-use pairing');
   expect(await api('/api/heartbeat','POST',{os:'synthetic',arch:'synthetic',labels:['fixture'],engines:['opencode','shell'],capabilities:['headless','interactive']},hostToken),200,'heartbeat');
-  expect(await api('/api/account','PATCH',{provider:'synthetic-fixture',enabled:true,capacity:2,min_remaining:10}),200,'configure synthetic account');
-  expect(await api('/api/account/quota','PUT',{remaining:80,captured_at:Date.now(),valid_until:Date.now()+300000,source:'synthetic-native-integration-fixture'}),200,'synthetic quota');
+  expect(await api('/api/account','PATCH',{provider:process.env.HUB2_CORE_PROVISION?'codex':'synthetic-fixture',enabled:true,capacity:2,min_remaining:10}),200,'configure synthetic account');
+  if(process.env.HUB2_CORE_PROVISION){const access='fixture.'+Buffer.from(JSON.stringify({exp:Math.floor(Date.now()/1000)+864000})).toString('base64url')+'.signature';expect(await api('/api/account/credentials','PUT',{expected_generation:0,files:{'.codex/auth.json':JSON.stringify({tokens:{access_token:access,refresh_token:'synthetic-native-fixture',account_id:'fixture-id'},last_refresh:new Date().toISOString()})}}),200,'encrypted synthetic provider fixture');expect(await api('/api/account/discovery','POST',{}),200,'actual provider collector over synthetic HTTP');}
+  else expect(await api('/api/account/quota','PUT',{remaining:80,captured_at:Date.now(),valid_until:Date.now()+300000,source:'synthetic-native-integration-fixture'}),200,'synthetic quota');
   expect(await api('/api/account/hosts','PUT',{hosts:[machine]}),200,'approve synthetic account host');
   expect(await api('/api/model-policy','PUT',{expected_version:0,candidates:[{id:'synthetic-model',engine:'opencode',model:'synthetic-test-model',account_id:account,weight:1,capabilities:[],enabled:true}]}),200,'configure actual synthetic model policy');
   expect(await api('/api/account','PATCH',{provider:'forbidden',enabled:true,capacity:1},hostToken,{'x-hub2-actor':JSON.stringify({id:'forged',kind:'operator',scopes:['*']})}),403,'machine cannot edit account');
@@ -103,6 +104,7 @@ try{
   expect(await api(`/api/sessions/${started.id}/finish`,'POST',finish,hostToken),202,'finish durable pending response');
   expect(await fixture('machine',machine,'due-outbox',{id:'finish:'+offer.operation_id}),200,'retry finish durable journal');
   expect(await api(`/api/sessions/${started.id}/finish`,'POST',finish,hostToken),200,'finish retry');
+  if(workerCheck)expect(await fixture('machine',machine,'due-outbox',{id:'finish:'+offer.operation_id}),200,'retry second independent lost Project finish response after revoked worker replay');
   expect(await api(`/api/sessions/${started.id}/finish`,'POST',{...finish,exit_code:1},hostToken),409,'finish conflict');
   if(workerCheck)measurements.worker_credentials=await workerCheck.afterFinish();
   const final=expect(await api(`/api/intakes/${created.id}?project=${encodeURIComponent(project)}`),200,'final intake');assert.equal(final.intake.status,'completed-awaiting-review');assert.notEqual(final.intake.status,'done');completedIntakeId=created.id;
@@ -110,6 +112,7 @@ try{
   const offers=expect(await api('/api/offers','GET',undefined,hostToken),200,'no finished offer');assert.equal(offers.offers.length,0);
   liveSocket.socket.close();liveSocket=null;
   const after=await snapshots();measurements.complete_flow=delta(before,after);measurements.quiescent=after;const total=Object.values(measurements.complete_flow).reduce((n,v)=>n+v.reads+v.writes,0);assert(total<2000,'warm core flow exceeds2000row guard');
+  measurements.machine_deadlines=expect(await fixture('machine',machine,'machine-deadlines'),200,'exact machine pending work diagnostics');
   assert.equal(after.project.alarm,null,'finished project has no pending alarm');assert.equal(after.machine.alarm,null,'finished machine has no pending alarm');assert.equal(after.account.alarm,null,'released account has no pending alarm');
   const quietBefore=await snapshots();await sleep(120);const quietAfter=await snapshots();for(const k of Object.keys(quietBefore)){assert.equal(quietAfter[k].counts.rows_read,quietBefore[k].counts.rows_read,k+' idle reads');assert.equal(quietAfter[k].counts.rows_written,quietBefore[k].counts.rows_written,k+' idle writes');}
  });
