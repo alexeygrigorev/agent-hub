@@ -17,6 +17,23 @@ def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
+def same_workspace(left, right):
+    """Compare workspace identity across equivalent OS path spellings.
+
+    Windows can report a temporary directory through both its long path and
+    its DOS 8.3 alias. Both names must refer to the same existing directory;
+    textual normalization alone is not sufficient for the native identity
+    fence.
+    """
+    if not isinstance(left, str) or not isinstance(right, str):
+        return False
+    try:
+        left_path, right_path = Path(left), Path(right)
+        return left_path.is_absolute() and right_path.is_absolute() and left_path.samefile(right_path)
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
 class Journal:
     def __init__(self, path):
         path = Path(path)
@@ -89,7 +106,7 @@ class Bridge:
         if not isinstance(row, dict) or not isinstance(row.get("id"), str):
             raise RuntimeError("invalid_native_status")
         if expected and (row["id"] != selector or row.get("tag") != expected["tag"]
-                         or row.get("workspace") != expected["workspace"]):
+                         or not same_workspace(row.get("workspace"), expected["workspace"])):
             raise RuntimeError("native_identity_mismatch")
         return row
 
@@ -252,7 +269,7 @@ class Bridge:
                 if not identity:
                     candidate=self.lookup(row['workspace']+':'+row['tag'])
                     if candidate:
-                        if candidate.get('tag')!=row['tag'] or candidate.get('workspace')!=row['workspace']:
+                        if candidate.get('tag')!=row['tag'] or not same_workspace(candidate.get('workspace'),row['workspace']):
                             raise RuntimeError('native_abort_identity_mismatch')
                         identity=candidate['id']
                 if not identity:continue

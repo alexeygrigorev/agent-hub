@@ -271,8 +271,8 @@ class HostTests(unittest.TestCase):
         launches = [(call, options) for call, options in self.native.calls if "run" in call or "submit" in call]
         self.assertEqual(len(launches), 2)
         for _, options in launches:
-            self.assertEqual(options["cwd"], str(self.root))
-            self.assertEqual(options["env"]["PWD"], str(self.root.resolve()))
+            self.assertTrue(Path(options["cwd"]).samefile(self.root))
+            self.assertTrue(Path(options["env"]["PWD"]).samefile(self.root))
 
     def test_expired_stale_changed_spec_and_workspace_escape_refused(self):
         with self.assertRaisesRegex(ValueError, "expired"):

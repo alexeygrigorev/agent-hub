@@ -1,6 +1,7 @@
 import json
 import subprocess
 import unittest
+from pathlib import Path
 import test_host
 
 from agent_hub_host.client import ApiError
@@ -41,7 +42,7 @@ class MailTests(unittest.TestCase):
         self.assertEqual(receipt["message_id"], "11bdb3e2-854e-4aaa-9ddd-3e3ec823f2c4")
         self.assertEqual(self.client.calls[-1][2]["native_receipt"], receipt)
         self.assertNotIn("APLEXER_SESSION_ID", calls[0][1]["env"])
-        self.assertEqual(calls[0][1]["cwd"], str(self.root))
+        self.assertTrue(Path(calls[0][1]["cwd"]).samefile(self.root))
         self.assertNotIn("--from", calls[0][0])
 
     def test_unconfirmed_effect_remains_uncertain_and_is_not_retried(self):

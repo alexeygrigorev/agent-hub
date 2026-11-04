@@ -9,6 +9,16 @@ from pathlib import Path
 from .client import private_file
 
 
+def same_workspace(left, right):
+    if not isinstance(left, str) or not isinstance(right, str):
+        return False
+    try:
+        left_path, right_path = Path(left), Path(right)
+        return left_path.is_absolute() and right_path.is_absolute() and left_path.samefile(right_path)
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
 def native_returncode(value):
     if not isinstance(value,dict):return None
     code,signal=value.get('code'),value.get('signal')
@@ -172,7 +182,7 @@ print(json.dumps({'id':t['id'],'tag':t['tag'],'workspace':t['workspace'],'phase'
         for document in documents:
             binding = document.get("native_binding", {})
             details = binding.get("details", {})
-            if (binding.get("workspace") == workspace and binding.get("tag") == "task-" + task_id
+            if (same_workspace(binding.get("workspace"), workspace) and binding.get("tag") == "task-" + task_id
                     and details.get("first_action_validated_at") and isinstance(binding.get("native_id"), str)):
                 if requirements and any(requirements.get(key) for key in ('interactive','with_goal','effort')):
                     with (Path(workspace)/'.local'/('launch-'+task_id+'.json')).open('rb') as stream:raw=stream.read(262145)
@@ -187,7 +197,7 @@ print(json.dumps({'id':t['id'],'tag':t['tag'],'workspace':t['workspace'],'phase'
         """Birth binding identifies what may be stopped, never successful start."""
         for document in self.invoke('status','--id',task_id,workspace=workspace):
             binding=document.get('native_binding',{})
-            if binding.get('workspace')==workspace and binding.get('tag')=='task-'+task_id and isinstance(binding.get('native_id'),str):
+            if same_workspace(binding.get('workspace'),workspace) and binding.get('tag')=='task-'+task_id and isinstance(binding.get('native_id'),str):
                 return binding['native_id']
         return None
 

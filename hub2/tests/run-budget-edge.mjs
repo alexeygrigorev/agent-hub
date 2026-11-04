@@ -101,5 +101,5 @@ try{
  assert.equal((await call('/_fixture/unknown-health','POST',{})).status,503);
  assert.equal((await call('/api/budget/override','POST',proposal)).status,503,'unknown metrics cannot be cleared');
  const proof={passed:true,gate:'actual public Worker / BudgetDO / idempotent receiver restart',tests:16,public_overrun_recovery_atomic:true,unknown_recovery_refused:true,scheduled_empty_invocation_priced:true,public_ceiling_persisted:true,safety_stop_available:true,unknown_metrics_fail_closed:true,alert_physical_ids:after.map(v=>v.id),delivery_attempts:after.map(v=>v.attempts),provider_billing_verified:false,production_data_mutated:false,note:'Synthetic financial bounds/auth/receiver; actual Worker, BudgetDO and restart. Not production sizing or live external delivery proof.'};
- await writeFile('/home/alexey/tmp/agent-reports/hub2-public-budget-workerd.json',JSON.stringify(proof,null,2));console.log(JSON.stringify(proof));
+ await writeFile(resolve(root,'.local/tmp/hub2-public-budget-workerd.json'),JSON.stringify(proof,null,2));console.log(JSON.stringify(proof));
 }finally{await mf.dispose();await rm(persist,{recursive:true,force:true});}
