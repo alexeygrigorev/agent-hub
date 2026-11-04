@@ -5,8 +5,8 @@ import { LivenessService } from '../src/liveness';
 const fixture=(fn:(sql:any)=>void)=>(runInDurableObject as any)((env as any).HUB.get((env as any).HUB.idFromName('summary-bounds-'+crypto.randomUUID())),async(_hub:any,state:any)=>fn(state.storage.sql));
 function observe(raw:any){const calls:{query:string;cursor:any}[]=[];return{calls,sql:new Proxy(raw,{get(target,key){if(key==='exec')return(query:string,...args:any[])=>{const cursor=target.exec(query,...args);calls.push({query,cursor});return cursor;};const v=target[key];return typeof v==='function'?v.bind(target):v;}})};}
 const reads=(calls:{cursor:any}[])=>calls.reduce((n,c)=>n+c.cursor.rowsRead,0);
-const metadata=(call:{query:string})=>call.query==='SELECT name,type,sql FROM sqlite_master LIMIT 4097';
-function boundedMetadata(calls:{query:string;cursor:any}[]){const probes=calls.filter(metadata);expect(probes).toHaveLength(1);expect(reads(probes)).toBeLessThanOrEqual(4097);return calls.filter(c=>!metadata(c));}
+const metadata=(call:{query:string})=>call.query.includes('ORDER BY rowid LIMIT 1025');
+function boundedMetadata(calls:{query:string;cursor:any}[]){const probes=calls.filter(metadata);expect(probes).toHaveLength(1);expect(reads(probes)).toBeLessThanOrEqual(1025);return calls.filter(c=>!metadata(c));}
 describe('retained intake and alert bootstrap uses deployed indexes',()=>{
  it('proves a fresh empty summary ready using only indexed heads, with no backfill or catalog scan',()=>fixture(raw=>{
   raw.exec('DROP TABLE intake_summary_migration');

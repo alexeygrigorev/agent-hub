@@ -1,11 +1,12 @@
 /** Trigger-maintained intake summary; bootstrap never counts or rewrites history. */
+import {readSchemaObject} from './schema-object-locator';
+import {schemaSqlEquivalent} from './schema-sql-equivalent';
 import type { SqlStorage } from '@cloudflare/workers-types';
 const columns = 'id,project,status,title,updated_at,created_at,archived_at,version';
 const values = (p: string) => `${p}id,` + ['project','status','title','updated_at','created_at','archived_at','version']
   .map(k=>`json_extract(${p}data,'$.${k}')`).join(',');
 const update = ['project','status','title','updated_at','created_at','archived_at','version']
   .map(k=>`${k}=excluded.${k}`).join(',');
-const normalize = (sql: string) => sql.replace(/\s+/g,' ').trim().replace(/;$/,'');
 const trigger = (op: 'INSERT'|'UPDATE'|'DELETE') => op === 'DELETE'
   ? 'CREATE TRIGGER IF NOT EXISTS intake_status_summary_delete AFTER DELETE ON intake_tasks BEGIN DELETE FROM intake_status_summary WHERE id=OLD.id; END'
   : `CREATE TRIGGER IF NOT EXISTS intake_status_summary_${op.toLowerCase()} AFTER ${op} ON intake_tasks BEGIN INSERT INTO intake_status_summary(${columns}) VALUES(${values('NEW.')}) ON CONFLICT(id) DO UPDATE SET ${update}; END`;
@@ -21,15 +22,15 @@ export function initIntakeSummary(sql: SqlStorage) {
     // proved with two indexed heads. Construction never backfills history.
     sql.exec('INSERT INTO intake_summary_migration VALUES(1,NULL,2)');
   } else if(!receipt) {
-    // The previous version committed full bootstrap and these exact triggers
-    // atomically. Prove that legacy boundary ONCE; later cold starts use the
-    // durable receipt instead of re-reading the entire SQLite catalog.
-    // Bound the raw catalog before filtering names: WHERE name IN (...) has
-    // no catalog index and does not make an unbounded metadata scan cheaper.
-    const catalog=sql.exec('SELECT name,type,sql FROM sqlite_master LIMIT 4097').toArray() as {name:string;type:string;sql:string}[];
-    if(catalog.length>4096)throw new Error('intake_summary_schema_observation_incomplete');
-    const proven=existed && ['INSERT','UPDATE','DELETE'].every(op=>catalog.some(row=>row.type==='trigger' &&
-      row.name==='intake_status_summary_'+op.toLowerCase() && normalize(row.sql)===normalize(trigger(op as any).replace('IF NOT EXISTS ',''))));
+    // Only a pre-existing summary can inherit the old atomic-bootstrap
+    // boundary. A newly created projection has no legacy proof to inspect:
+    // retained source data leaves it pending, without any catalog/history scan.
+    // Existing projections require the exact LIVE definitions of all guards;
+    // deployment rowid hints locate objects but never prove their contents.
+    const proven=existed && (['INSERT','UPDATE','DELETE'] as const).every(op=>{
+      const actual=readSchemaObject(sql,{name:'intake_status_summary_'+op.toLowerCase(),type:'trigger',table:'intake_tasks'});
+      return !!actual&&schemaSqlEquivalent(actual.sql,trigger(op));
+    });
     sql.exec('INSERT INTO intake_summary_migration VALUES(1,NULL,?)',proven?2:0);
   }
   for(const op of ['INSERT','UPDATE','DELETE'] as const) sql.exec(trigger(op));
