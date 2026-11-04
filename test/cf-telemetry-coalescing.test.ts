@@ -1,3 +1,4 @@
+import {fixtureSql} from './helpers/fixture-budget';
 import { describe,it,expect } from 'vitest';
 import { env,runInDurableObject } from 'cloudflare:test';
 import { FleetService } from '../src/fleet';
@@ -311,3 +312,58 @@ it('marks reconciliation pages partial and reaches all56 pending launches withou
  }
  expect(seen.size).toBe(56);
 }));
+
+
+it('keeps500 unchanged reported natives write-free across2h and checkpoints only real active activity',()=>(runInDurableObject as any)(
+ (env as any).HUB.get((env as any).HUB.idFromName('advancing-census-'+crypto.randomUUID())),async(h:any,state:any)=>{
+  const seed=fixtureSql(h,state),initial=Date.now(),at=new Date(initial).toISOString();let clock=initial;
+  seed.exec("INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at) VALUES('census-host','census-host','census-host',?,?)",at,at);
+  const progress={last_progress_at:at,headless:false,agent_alive:false,orphaned:false,cleanup:'none',sampled_at:at};
+  const sessions=Array.from({length:500},(_,i)=>({native_id:'retained-'+i,tag:'native-'+i,engine:'codex',phase:i===499?'running':'exited',
+    confirmed_exit:i!==499,agent_state:null,workspace:'/repo',profile:null,account:null,last_activity_at:at,created_at_ms:initial-10000,progress:{...progress,agent_alive:i===499}}));
+  for(const row of sessions)seed.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace,profile,account,last_activity_at,created_at_ms,progress_json)
+    VALUES('census-host',?,?,?,?,?,?,?,?,?,?,?,?)`,row.native_id,row.tag,row.engine,row.phase,null,at,row.workspace,null,null,at,row.created_at_ms,JSON.stringify(row.progress));
+  const fleet=new FleetService(h.sql,(fn:any)=>state.storage.transactionSync(fn),()=>clock,h.writes,h.observedCatalog);
+  const auth={caller:{kind:'host',machineId:'census-host'},scopes:['host']};
+  await h.rowBudget.begin(true);const day=h.rowBudget.status().day;
+  const send=async(scope:string)=>{
+    for(const row of sessions)row.progress.sampled_at=new Date(clock).toISOString();
+    const response=await h.meter.run(scope,()=>fleet.handle(new Request('https://hub/api/fleet/sessions',
+      {method:'PUT',body:JSON.stringify({sessions,census_complete:true})}),auth));
+    expect(response.status,await response.clone().text()).toBe(200);return response.json() as Promise<any>;
+  };
+  expect((await send('census-prime')).written).toBe(0);
+  for(let quarter=1;quarter<=8;quarter++){
+    clock=initial+quarter*15*60000;
+    expect((await send('census-unchanged-'+quarter)).written).toBe(0);
+  }
+  const nativeChanges=h.meter.statementTop(4096).filter((entry:any)=>entry.scope.startsWith('census-unchanged-')
+    &&/^\s*(?:UPDATE|INSERT(?: OR REPLACE)? INTO)\s+fleet_sessions\b/i.test(entry.sql));
+  expect(nativeChanges).toEqual([]);
+  // The explicitly allowed per-host census/seen receipts may checkpoint;
+  // their count must not scale with the500 retained native rows.
+  const steady=Object.entries(h.meter.snapshot()).filter(([name])=>name.startsWith('census-unchanged-'));
+  // Per quarter: census row1 + seen row1 + its freshness-index delete/insert2.
+  expect(steady.reduce((sum,value:any)=>sum+value[1].rows_written,0)).toBeLessThanOrEqual(8*4);
+  expect(seed.exec("SELECT observed_at FROM fleet_sessions WHERE machine_id='census-host' AND native_id='retained-0'").one().observed_at).toBe(at);
+  const active=sessions[499];clock+=1000;active.last_activity_at=new Date(clock).toISOString();
+  expect((await send('census-real-activity')).written).toBe(1);
+  const persisted=seed.exec("SELECT observed_at,last_activity_at FROM fleet_sessions WHERE machine_id='census-host' AND native_id='retained-499'").one();
+  expect(persisted).toEqual({observed_at:new Date(clock).toISOString(),last_activity_at:active.last_activity_at});
+  // Real transcript progress is distinct from sampled_at and must survive a
+  // due checkpoint even when native last_activity_at did not advance.
+  clock+=15*60000;active.progress.last_progress_at=new Date(clock).toISOString();
+  expect((await send('census-real-progress')).written).toBe(1);
+  expect(JSON.parse(seed.exec("SELECT progress_json FROM fleet_sessions WHERE machine_id='census-host' AND native_id='retained-499'").one().progress_json).last_progress_at).toBe(active.progress.last_progress_at);
+  clock+=60000;active.last_activity_at=new Date(clock).toISOString();
+  expect((await send('census-coalesced-activity')).written).toBe(0);
+  expect(seed.exec("SELECT last_activity_at FROM fleet_sessions WHERE machine_id='census-host' AND native_id='retained-499'").one().last_activity_at).toBe(persisted.last_activity_at);
+  active.phase='exited';active.confirmed_exit=true;
+  expect((await send('census-positive-exit')).written).toBe(1);
+  expect(seed.exec("SELECT phase FROM fleet_sessions WHERE machine_id='census-host' AND native_id='retained-499'").one().phase).toBe('exited');
+  clock+=3600000;expect((await send('census-terminal-hour')).written).toBe(0);
+  expect(h.rowBudget.status()).toMatchObject({day,limit_total:20000,stopped:false});
+  console.log(JSON.stringify({evidence:'advancing_clock_native_census',reported:500,terminal:499,active:1,unchanged_minutes:120,
+    native_update_statements:nativeChanges.length,steady_rows_written:steady.reduce((sum,value:any)=>sum+value[1].rows_written,0),
+    caveat:'per-host census receipts included; real activity and exit transitions measured on the same strict20kday'}));
+ }));

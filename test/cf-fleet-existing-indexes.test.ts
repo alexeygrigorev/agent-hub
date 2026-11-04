@@ -90,7 +90,17 @@ describe('Fleet recovery and paging use deployed indexes',()=>{
     const read=(fresh:boolean)=>{m.reset();const result=(fleet as any).reconciliationCandidatesUncached('host',fresh);
       expect(m.queries.length).toBeLessThanOrEqual(7);expect(m.rows()).toBeLessThan(650);
       expect(m.queries.some(q=>q.includes('json_each'))).toBe(false);return result;};
-    expect(read(false)).toHaveLength(75);
+    expect(hub.meter.runSync('test:reconciliation-native-points',()=>read(false))).toHaveLength(75);
+    const nativePoints=hub.meter.statementTop(1500).find((row:any)=>row.scope==='test:reconciliation-native-points'
+      && row.sql.includes('SELECT native_id,engine,phase,observed_at FROM fleet_sessions'));
+    expect(nativePoints).toBeDefined();expect(nativePoints!.calls).toBe(1);
+    expect(nativePoints!.rows_read).toBeLessThanOrEqual(75);expect(nativePoints!.rows_written).toBe(0);
+    const nativeQuery=m.queries.find(q=>q.includes('SELECT native_id,engine,phase,observed_at FROM fleet_sessions'))!;
+    expect(nativeQuery).not.toMatch(/json_each|native_id IN/);
+    const nativePlan=seed.exec('EXPLAIN QUERY PLAN '+nativeQuery,'host',JSON.stringify(
+      ['starting','running','uncertain'].flatMap(state=>Array.from({length:25},(_,i)=>'native-'+state+'-'+i)))).toArray().map((row:any)=>row.detail).join(' | ');
+    expect(nativePlan).toMatch(/SEARCH fleet_sessions USING INDEX sqlite_autoindex_fleet_sessions_1 \(machine_id=\? AND native_id=\?\)/);
+    expect(nativePlan).not.toMatch(/SCAN fleet_sessions|TEMP B-TREE/);
     // A complete fresh census supplies positive proof for the previously
     // stale native rows; engine mismatch and missing native remain visible.
     expect(read(true)).toHaveLength(50);

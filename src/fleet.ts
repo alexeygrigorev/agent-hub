@@ -908,11 +908,20 @@ export class FleetService {
     const key=JSON.stringify([machine,identities]);
     const stamp=this.writes?.stamp('fleet_sessions');
     const hit=stamp!==undefined?this.reconciliationNativeFacts.get(key):undefined;
-    // Scalar JSON extraction supplies bounded IN keys without a virtual
-    // input table: Cloudflare bills json_each input rows as well as PK reads.
-    const facts=hit && hit.stamp===stamp ? hit.rows : nativeIds.length?this.sql.exec(`
-      SELECT native_id,engine,phase,observed_at FROM fleet_sessions
-      WHERE machine_id=?1 AND native_id IN (${nativeIds.map((_,i)=>`json_extract(?2,'$[${i}]')`).join(',')})`,machine,identities).toArray() as any[]:[];
+    // Exact equality probes avoid SQLite's billed ephemeral IN-input tree.
+    // Each branch seeks one composite PK; nested groups stay within the
+    // Cloudflare five-term compound limit and reuse just two SQL bindings.
+    let facts:any[]=hit && hit.stamp===stamp?hit.rows:[];
+    if((!hit || hit.stamp!==stamp) && nativeIds.length) {
+      let branches=nativeIds.map((_,i)=>`SELECT * FROM (SELECT native_id,engine,phase,observed_at FROM fleet_sessions
+        WHERE machine_id=?1 AND native_id=json_extract(?2,'$[${i}]') LIMIT 1)`);
+      while(branches.length>1) {
+        const groups:string[]=[];
+        for(let i=0;i<branches.length;i+=5)groups.push(`SELECT * FROM (${branches.slice(i,i+5).join(' UNION ALL ')})`);
+        branches=groups;
+      }
+      facts=this.sql.exec(branches[0],machine,identities).toArray() as any[];
+    }
     if(stamp!==undefined && (!hit || hit.stamp!==stamp)) {
       if(this.reconciliationNativeFacts.size>=16)this.reconciliationNativeFacts.clear();
       this.reconciliationNativeFacts.set(key,{stamp,rows:facts});
@@ -3159,13 +3168,16 @@ export class FleetService {
           const rowStable = { ...row, progress_json: stableProgress(row.progress_json) };
           const priorStable = prior ? { ...prior, progress_json: stableProgress(prior.progress_json) } : null;
           if (!staleRecoverable && prior && priorStable && fields.filter(f=>f!=='last_activity_at').every(f => ((priorStable as any)[f] ?? null) === ((rowStable as any)[f] ?? null))) {
-            // Activity and sampling timestamps coalesce together; actual control state
-            // changes above persist immediately. Keep the latest timestamps when due.
-            // Volatile progress timestamps alone must not rewrite the row every minute:
-            // persist timestamps every15min; fresh activity is held in the exact live overlay.
+            // Host/census overlays supply freshness without restamping every
+            // retained native. Persist real nonterminal activity/progress only when due;
+            // sampling timestamps and unchanged terminal history are not work.
+            const terminal=['exited','dead','failed','stopped','finished','refused','pruned','forgotten','cancelled'].includes(s.phase);
+            const activityChanged=(prior.last_activity_at??null)!==row.last_activity_at;
+            const priorProgress=parsed(prior.progress_json)??{},nextProgress=parsed(row.progress_json)??{};
+            const progressChanged=['last_progress_at','last_cpu_at'].some(field=>(priorProgress[field]??null)!==(nextProgress[field]??null));
             try {
               const prevObs = prior.observed_at ? Date.parse(prior.observed_at) : 0;
-              if (this.now() - prevObs >= 15 * 60 * 1000) {
+              if (!terminal && (activityChanged||progressChanged) && this.now() - prevObs >= 15 * 60 * 1000) {
                 this.sql.exec('UPDATE fleet_sessions SET observed_at = ?,last_activity_at=?,progress_json=? WHERE machine_id = ? AND native_id = ?', new Date(this.now()).toISOString(), row.last_activity_at,row.progress_json,caller.machineId!, s.native_id);
                 written++;
               }

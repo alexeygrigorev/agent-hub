@@ -360,9 +360,9 @@ describe('fleet health visibility + machine aliasing', () => {
    expect(fixtureStatements(sql).exec("SELECT observed_at FROM fleet_catalog_census WHERE machine_id='census-host'").one().observed_at).toBe(first);
    tick+=270000; expect((await (await send()).json() as any).written).toBe(0);
    expect(fixtureStatements(sql).exec("SELECT observed_at FROM fleet_sessions WHERE machine_id='census-host'").one().observed_at).toBe(first);
-   tick+=600000; expect((await (await send()).json() as any).written).toBe(1);
+   tick+=600000; expect((await (await send()).json() as any).written).toBe(0);
    expect(fixtureStatements(sql).exec("SELECT observed_at FROM fleet_catalog_seen WHERE machine_id='census-host'").one().observed_at).toBe(iso(900000));
-   expect(fixtureStatements(sql).exec("SELECT observed_at FROM fleet_sessions WHERE machine_id='census-host'").one().observed_at).toBe(iso(900000));
+   expect(fixtureStatements(sql).exec("SELECT observed_at FROM fleet_sessions WHERE machine_id='census-host'").one().observed_at).toBe(first);
    expect(fixtureStatements(sql).exec("SELECT observed_at FROM fleet_catalog_census WHERE machine_id='census-host'").one().observed_at).toBe(iso(900000));
    const malformed=await send({...payload,census_complete:1 as any});
    expect(malformed.status).toBe(400);
@@ -373,6 +373,9 @@ describe('fleet health visibility + machine aliasing', () => {
    tick+=30000;
    expect((await send({...payload,census_complete:false})).status).toBe(200);
    expect(fixtureStatements(sql).exec("SELECT observed_at,complete FROM fleet_catalog_census WHERE machine_id='census-host'").one()).toMatchObject({observed_at:iso(900000),complete:0});
+   const activeChanged={...payload,census_complete:false,sessions:[{...payload.sessions[0],last_activity_at:iso(930000)}]};
+   expect((await (await send(activeChanged)).json() as any).written).toBe(1);
+   expect(fixtureStatements(sql).exec("SELECT last_activity_at FROM fleet_sessions WHERE machine_id='census-host'").one().last_activity_at).toBe(iso(930000));
  }));
 
  it('keeps absent native observations unknown rather than asserting exit', () => fixture(async ({live,sql}) => {

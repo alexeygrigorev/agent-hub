@@ -385,8 +385,8 @@ export async function handleRegistryRoutes(
     return runInTxn(() => {
       // Fresh sync storage authority: the presenting token's live row, by
       // server-issued id (never by client body), re-read after the body.
-      const live = sql.exec('SELECT * FROM credentials WHERE id = ?', presentedId).toArray()[0] as any;
-      if (!live || live.revoked_at) return Response.json({ error: 'Unauthorized' }, { status: 401 });
+      const live = sql.exec('SELECT /* live registration authority */ * FROM credentials WHERE id = ?', presentedId).toArray()[0] as any;
+      if (!live || live.revoked_at || live.token_hash !== cred.token_hash) return Response.json({ error: 'Unauthorized' }, { status: 401 });
       if (!Number.isFinite(Date.parse(live.expires_at)) || Date.parse(live.expires_at) <= Date.now()) {
         return Response.json({ error: 'Unauthorized' }, { status: 401 });
       }
@@ -408,7 +408,7 @@ export async function handleRegistryRoutes(
       // binding); the register surface never performs it. A revoked
       // predecessor is denied even for an unbound machine; the current
       // refresh descendant still bootstraps with its live credential.
-      const current = sql.exec('SELECT id, credential_id, approval_seq FROM machines WHERE id = ?', machineId).toArray()[0] as any;
+      const current = sql.exec('SELECT /* live registration binding */ id,credential_id,approval_seq,hostname,os,arch,network,roles,capabilities FROM machines WHERE id = ?', machineId).toArray()[0] as any;
       if (!current) return Response.json({ error: 'unknown_machine' }, { status: 404 });
       if (
         typeof current.credential_id === 'string' &&
@@ -432,17 +432,25 @@ export async function handleRegistryRoutes(
         return Response.json({ error: 'forbidden', reason: 'stale_machine_binding' }, { status: 403 });
       }
 
+      const desiredRegistration=(row:any)=>row.hostname===hostname&&row.os===os&&row.arch===arch&&row.network===network
+        &&row.roles===rolesJson&&row.capabilities===capJson&&row.credential_id===live.id;
+      // Authority was re-read after the final await, inside this transaction.
+      // Stable registration is a read, not a periodic heartbeat write. Do not
+      // cache acceptance: credential/binding checks still run on every call.
+      if(desiredRegistration(current))return Response.json({status:'registered',machine_id:machineId});
+
       const registered = sql.exec(`
         UPDATE machines
         SET hostname = ?, os = ?, arch = ?, network = ?, roles = ?, capabilities = ?, credential_id = ?
         WHERE id = ? AND (credential_id IS NULL OR credential_id = '' OR credential_id = ?) RETURNING id
       `, hostname, os, arch, network, rolesJson, capJson, live.id, machineId, live.id).toArray();
       if (registered.length !== 1) {
-        const raced = sql.exec('SELECT credential_id FROM machines WHERE id = ?', machineId).toArray()[0] as any;
+        const raced = sql.exec('SELECT /* live registration CAS */ credential_id,hostname,os,arch,network,roles,capabilities FROM machines WHERE id = ?', machineId).toArray()[0] as any;
         if (!raced) return Response.json({ error: 'unknown_machine' }, { status: 404 });
         if (raced.credential_id !== live.id) {
           return Response.json({ error: 'forbidden', reason: 'stale_machine_binding' }, { status: 403 });
         }
+        if(!desiredRegistration(raced))return Response.json({error:'registration_conflict'},{status:409});
       }
 
       // machine_id comes only from the presented credential, never from the body
