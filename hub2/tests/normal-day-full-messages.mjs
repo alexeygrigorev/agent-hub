@@ -1,9 +1,9 @@
 // Canonical normal-day message ledger:100operator reads+400root/writer message calls.
 import assert from 'node:assert/strict';
-export async function fullMessages({api,expect,roleApi,connection,session,hostToken,family}){
+export async function fullMessages({api,expect,roleApi,connection,session,hostToken,family,client}){
  const sender='agent:normal-root',recipient='agent:normal-recipient',actor='human:normal-day-user';
  for(const[name,forward]of[['normal-root',null],['normal-recipient',session.id]])expect(await api('/api/named-agents','POST',{name,display_name:name,forward_session:forward}),200,'normal named identity');
- for(const[id,send]of[[sender,true],[recipient,false]])expect(await api('/api/named-agents/'+encodeURIComponent(id)+'/grants','PUT',{family_id:family,client_id:'normal-day-cli',can_send:send,can_read:true,enabled:true}),200,'actual caller family delegation');
+ for(const[id,send]of[[sender,true],[recipient,false]])expect(await api('/api/named-agents/'+encodeURIComponent(id)+'/grants','PUT',{family_id:family,client_id:client,can_send:send,can_read:true,enabled:true}),200,'actual caller family delegation');
  const ids=[];
  for(let i=0;i<100;i++){
   const sent=expect(await roleApi('root_writer','/api/messages?as='+encodeURIComponent(sender),'POST',{recipient,body:'Synthetic canonical native message '+i,key:'normal-message-'+i}),201,'normal message send').message;ids.push(sent.id);

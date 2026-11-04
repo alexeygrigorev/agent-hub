@@ -21,6 +21,10 @@ export interface Hub2Env {
   MACHINES: DurableObjectNamespace;
   ACCOUNTS: DurableObjectNamespace;
   MAILBOXES: DurableObjectNamespace;
+  BUDGET: DurableObjectNamespace;
+  HUB2_BUDGET_ENVELOPES?: string;
+  HUB_ALERT_WEBHOOK?: string;
+  HUB_ALERT_WEBHOOK_TOKEN?: string;
   HUB2_BOOTSTRAP_TOKEN?: string;
   HUB2_DEV_OPERATOR_TOKEN?: string;
   HUB2_DEFAULT_ACCOUNT_ID?: string;

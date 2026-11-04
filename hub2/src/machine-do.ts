@@ -1,3 +1,4 @@
+import { budgetedBackgroundRequest, type BudgetKind } from './budget-edge';
 import { nativeReturncode } from './native-exit';
 import { MeteredDb, initializeSchema } from './db';
 import { sha256Hex } from './crypto';
@@ -132,22 +133,33 @@ export class MachineDO {
     }
   }
 
+  private async budgetEffect(kind:BudgetKind,run:(env:Hub2Env)=>Promise<void>,socket?:WebSocket,retryId?:string):Promise<boolean>{
+    const response=await budgetedBackgroundRequest(this.env,kind,async env=>{await run(env);return new Response(null,{status:204});});
+    if(response.ok)return true;
+    const body=await response.json().catch(()=>({})) as {error?:string;retry_at?:number};
+    const now=Date.now(),day=new Date(now),midnight=Date.UTC(day.getUTCFullYear(),day.getUTCMonth(),day.getUTCDate()+1);
+    const paused=response.status===429||body.error==='budget_metrics_unknown';
+    const retry=paused?(Number.isSafeInteger(body.retry_at)&&Number(body.retry_at)>now&&Number(body.retry_at)<=now+86405000?Number(body.retry_at):midnight):now+30000;
+    if(retryId){
+      this.db.run("UPDATE machine_outbox SET next_action_at=?,updated_at=? WHERE id=? AND state='pending'",retry,now,retryId);
+      await this.scheduleNext();
+    }
+    if(socket&&paused){
+      try{socket.send(JSON.stringify({type:'budget.paused',error:'budget_paused',retry_at:retry}));socket.close(1013,'budget paused');}catch{}
+    }
+    return false;
+  }
+
   async alarm(): Promise<void> {
     const now = Date.now();
     const expired = this.db.all<SessionRow>(
-      `SELECT * FROM sessions WHERE state='offered' AND offer_expires_at <= ? ORDER BY offer_expires_at, id LIMIT 20`, now,
+      `SELECT * FROM sessions WHERE state='offered' AND offer_expires_at <= ? AND NOT EXISTS(SELECT 1 FROM machine_outbox b WHERE b.id='expiry:'||sessions.id||':'||sessions.epoch AND b.state='pending') ORDER BY offer_expires_at, id LIMIT 20`, now,
     );
     for (const session of expired) {
-      this.db.transaction(this.ctx, () => {
-        this.db.run("UPDATE sessions SET state='expired', offer_expires_at=NULL, updated_at=? WHERE id=? AND state='offered'", now, session.id);
-        this.db.run('UPDATE machines SET active_session_id=NULL WHERE active_session_id=?', session.id);
-        this.db.run("UPDATE machine_session_operations SET state='expired' WHERE operation_id=? AND session_id=? AND epoch=? AND state='current'",
-          session.operation_id, session.id, session.epoch);
-        this.insertOutbox(`requeue:${session.operation_id}`, 'requeue', session.operation_id, session.project_id,
-          { operation_id: session.dispatch_id, attempt_operation_id: session.operation_id, session_id: session.id,
-            machine_id: session.machine_id, epoch: session.epoch, proof_kind: 'offer-expired-unclaimed',
-            offer_expires_at: session.offer_expires_at, observed_at: now }, now);
-      });
+      const id='expiry:'+session.id+':'+session.epoch;
+      this.insertOutbox(id,'expiry',session.operation_id,session.project_id,
+        {session_id:session.id,operation_id:session.operation_id,epoch:session.epoch},now);
+      await this.flushOne(id);
     }
     await this.scheduleNext();
     await this.flushOutbox(now);
@@ -303,7 +315,12 @@ export class MachineDO {
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  async webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): Promise<void> {
+  async webSocketMessage(socket:WebSocket,message:string|ArrayBuffer):Promise<void>{
+    await this.budgetEffect(this.stopOnly(socket)?'operator_stop':'background_effect',
+      env=>this.webSocketMessageRaw(socket,message,env),socket);
+  }
+
+  private async webSocketMessageRaw(socket: WebSocket, message: string | ArrayBuffer, env:Hub2Env): Promise<void> {
     if (typeof message !== 'string' || message.length > 8192) {
       try { socket.close(1009, 'message too large'); } catch {}
       return;
@@ -317,16 +334,16 @@ export class MachineDO {
     }
     if (body.type === 'resync') {
       try {
-        const attachment = await this.authorizedAttachment(socket, 'machine:offer');
-        if (attachment?.machine_id) { await this.sendOffers(socket, attachment.machine_id); await this.sendPendingCommands(socket, attachment.machine_id); await this.sendPendingMail(socket, attachment.machine_id); }
+        const attachment = await this.authorizedAttachment(socket, 'machine:offer',true,env);
+        if (attachment?.machine_id) { await this.sendOffers(socket, attachment.machine_id,env); await this.sendPendingCommands(socket, attachment.machine_id,env); await this.sendPendingMail(socket, attachment.machine_id,env); }
       } catch {}
       return;
     }
     if (body.type === 'offer_ack') {
-      await this.ackOffer(socket, body);
+      await this.ackOffer(socket, body,env);
       return;
     }
-    if (body.type === 'host.error') { await this.recordAttention(socket, body); return; }
+    if (body.type === 'host.error') { await this.recordAttention(socket, body,env); return; }
     try { socket.send(JSON.stringify({ type: 'error', error: 'unsupported_message' })); } catch {}
   }
 
@@ -334,10 +351,10 @@ export class MachineDO {
 
   webSocketError(_socket: WebSocket, _error: unknown): void {}
 
-  private async ackOffer(socket: WebSocket, body: JsonRecord): Promise<void> {
+  private async ackOffer(socket: WebSocket, body: JsonRecord,env:Hub2Env): Promise<void> {
     if (typeof body.session_id !== 'string' || !Number.isInteger(body.epoch)) return;
     try {
-      const attachment = await this.authorizedAttachment(socket, 'machine:offer');
+      const attachment = await this.authorizedAttachment(socket, 'machine:offer',true,env);
       if (!attachment?.machine_id) return;
       const row = this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND machine_id=?', body.session_id, attachment.machine_id);
       if (!row || row.epoch !== body.epoch) {
@@ -360,15 +377,16 @@ export class MachineDO {
             machine_id: row.machine_id, epoch: row.epoch }, now);
       });
       await this.ensureDeadline(now+30_000);
-      await this.flushOne(`claim:${row.operation_id}`);
+      await this.flushOne(`claim:${row.operation_id}`,env);
       await this.scheduleNext();
-      await this.sendPendingCommands(socket, attachment.machine_id);
+      await this.sendPendingCommands(socket, attachment.machine_id,env);
       socket.send(JSON.stringify({ type: 'ack', session_id: row.id, epoch: row.epoch }));
     } catch {}
   }
 
-  private async sendOffers(socket: WebSocket, machineId: string): Promise<void> {
+  private async sendOffers(socket: WebSocket, machineId: string,env?:Hub2Env): Promise<void> {
     if(this.stopOnly(socket))return;
+    if(!env){await this.budgetEffect('native_delivery',guarded=>this.sendOffers(socket,machineId,guarded),socket);return;}
     const now = Date.now();
     const rows = this.db.all<SessionRow>(
       `SELECT * FROM sessions WHERE machine_id=? AND ((state='offered' AND offer_expires_at > ?) OR state='claimed') ORDER BY created_at, id LIMIT 10`, machineId, now,
@@ -384,8 +402,10 @@ export class MachineDO {
     const frame = JSON.stringify({ type: 'session.offer', offer: this.offerView(row) });
     for (const socket of this.ctx.getWebSockets(`hub2:${row.machine_id}`)) {
       try {
-        if (this.stopOnly(socket)||!await this.authorizedAttachment(socket, 'machine:offer')) continue;
-        socket.send(frame);
+        if(this.stopOnly(socket))continue;
+        await this.budgetEffect('native_delivery',async env=>{
+          if(await this.authorizedAttachment(socket,'machine:offer',true,env))socket.send(frame);
+        },socket);
       } catch {}
     }
   }
@@ -552,7 +572,17 @@ export class MachineDO {
     for (const row of rows) await this.flushOne(row.id);
   }
 
-  private async flushOne(id: string): Promise<boolean> {
+  private async flushOne(id:string,env?:Hub2Env):Promise<boolean>{
+    if(env)return this.flushOneRaw(id,env);
+    const row=this.db.one<{kind:string}>("SELECT kind FROM machine_outbox WHERE id=? AND state='pending'",id);
+    if(!row)return false;
+    const kind:BudgetKind=row.kind==='finish'?'native_exit':['started','requeue','expiry'].includes(row.kind)?'capacity_reconcile':'retry';
+    let forwarded=false;
+    await this.budgetEffect(kind,async guarded=>{forwarded=await this.flushOneRaw(id,guarded);},undefined,id);
+    return forwarded;
+  }
+
+  private async flushOneRaw(id: string, env:Hub2Env): Promise<boolean> {
     const row = this.db.one<OutboxRow>('SELECT * FROM machine_outbox WHERE id=? AND state=\'pending\'', id);
     if (!row) return false;
     const payload = this.parse(row.payload_json) as JsonRecord;
@@ -560,14 +590,33 @@ export class MachineDO {
     // Every finish outbox row was created only after verified public finish evidence.
     if (row.kind === 'finish') payload.native_exit_confirmed = true;
     try {
+      if(row.kind==='expiry'){
+        const session=this.db.one<SessionRow>("SELECT * FROM sessions WHERE id=? AND operation_id=? AND epoch=? AND state='offered' AND offer_expires_at<=?",
+          payload.session_id,payload.operation_id,payload.epoch,Date.now());
+        if(session){
+          const now=Date.now();
+          this.db.transaction(this.ctx, () => {
+            this.db.run("UPDATE sessions SET state='expired', offer_expires_at=NULL, updated_at=? WHERE id=? AND state='offered'", now, session.id);
+            this.db.run('UPDATE machines SET active_session_id=NULL WHERE active_session_id=?', session.id);
+            this.db.run("UPDATE machine_session_operations SET state='expired' WHERE operation_id=? AND session_id=? AND epoch=? AND state='current'",
+              session.operation_id, session.id, session.epoch);
+            this.insertOutbox(`requeue:${session.operation_id}`, 'requeue', session.operation_id, session.project_id,
+              { operation_id: session.dispatch_id, attempt_operation_id: session.operation_id, session_id: session.id,
+                machine_id: session.machine_id, epoch: session.epoch, proof_kind: 'offer-expired-unclaimed',
+                offer_expires_at: session.offer_expires_at, observed_at: now }, now);
+          });
+        }
+        this.db.run("UPDATE machine_outbox SET state='delivered',updated_at=? WHERE id=? AND state='pending'",Date.now(),row.id);
+        return true;
+      }
       if(row.kind==='finish'){
-        const revoked=await this.env.CONTROL.get(this.env.CONTROL.idFromName('global')).fetch('https://control.internal/_worker/revoke',{
+        const revoked=await env.CONTROL.get(env.CONTROL.idFromName('global')).fetch('https://control.internal/_worker/revoke',{
           method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:payload.session_id,
             operation_id:payload.attempt_operation_id,epoch:payload.epoch,machine_id:payload.machine_id,
             intake_id:payload.intake_id,project_id:row.project_id,reason:'native_exit_confirmed'})});
         if(!revoked.ok||(await revoked.json() as JsonRecord).revoked!==true)throw new Error('child_revocation_pending');
       }
-      const stub = this.env.PROJECTS.get(this.env.PROJECTS.idFromName(row.project_id));
+      const stub = env.PROJECTS.get(env.PROJECTS.idFromName(row.project_id));
       const path = row.kind === 'finish' ? '/_internal/finish' : row.kind === 'started' ? '/_internal/started' : row.kind === 'claim' ? '/_internal/claim' : '/_internal/requeue';
       const response = await stub.fetch(`https://project.internal${path}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
@@ -594,7 +643,7 @@ export class MachineDO {
     this.db.alarmOperation();
     const current = await this.ctx.storage.getAlarm();
     const next = this.db.one<{ due: number | null }>(`SELECT MIN(due) AS due FROM (
-      SELECT MIN(offer_expires_at) AS due FROM sessions WHERE state='offered' AND offer_expires_at IS NOT NULL
+      SELECT MIN(offer_expires_at) AS due FROM sessions WHERE state='offered' AND offer_expires_at IS NOT NULL AND NOT EXISTS(SELECT 1 FROM machine_outbox b WHERE b.id='expiry:'||sessions.id||':'||sessions.epoch AND b.state='pending')
       UNION ALL SELECT MIN(next_action_at) AS due FROM machine_outbox WHERE state='pending'
     )`);
     if (next?.due !== null && next?.due !== undefined) {
@@ -679,19 +728,21 @@ export class MachineDO {
     return json({ acknowledged: true });
   }
 
-  private async sendPendingCommands(socket: WebSocket, machineId: string): Promise<void> {
-    const rows = this.db.all<CommandRow>(
-      `SELECT * FROM session_commands WHERE machine_id=? AND state='pending' ${this.stopOnly(socket)?"AND kind='stop'":""} ORDER BY created_at,id LIMIT 1`, machineId,
-    );
-    for (const command of rows) {
-      try { socket.send(JSON.stringify({ type: 'session.command', command: this.commandView(command) })); } catch { return; }
-    }
+  private async sendPendingCommands(socket:WebSocket,machineId:string,env?:Hub2Env):Promise<void>{
+    const stop=this.stopOnly(socket);
+    const command=this.db.one<CommandRow>("SELECT * FROM session_commands WHERE machine_id=? AND session_id=(SELECT active_session_id FROM machines WHERE machine_id=?) AND state='pending' "+(stop?"AND kind='stop' ":"")+"ORDER BY created_at,id LIMIT 1",machineId,machineId);
+    if(!command)return;
+    const send=async(guarded:Hub2Env)=>{
+      if(!await this.authorizedAttachment(socket,'machine:offer',true,guarded))return;
+      try{socket.send(JSON.stringify({type:'session.command',command:this.commandView(command)}));}catch{}
+    };
+    if(env)await send(env);
+    else await this.budgetEffect(command.kind==='stop'?'operator_stop':'native_delivery',send,socket);
   }
 
   private async notifyPendingCommands(machineId: string): Promise<void> {
     for (const socket of this.ctx.getWebSockets(`hub2:${machineId}`)) {
       try {
-        if (!await this.authorizedAttachment(socket, 'machine:offer')) continue;
         await this.sendPendingCommands(socket, machineId);
       } catch {}
     }
@@ -751,10 +802,11 @@ export class MachineDO {
       message_id:body.message_id,epoch:body.epoch,operation_id:body.operation_id});
   }
 
-  private async sendPendingMail(socket: WebSocket, machine: string): Promise<void> {
+  private async sendPendingMail(socket: WebSocket, machine: string,env?:Hub2Env): Promise<void> {
     if(this.stopOnly(socket))return;
-    if (!await this.authorizedAttachment(socket,'message:delivery',false)) return;
-    const row = this.db.one<NativeMail>("SELECT * FROM native_mail WHERE machine_id=? AND state='pending' ORDER BY created_at,message_id,epoch LIMIT 1",machine);
+    if(!env){await this.budgetEffect('native_delivery',guarded=>this.sendPendingMail(socket,machine,guarded),socket);return;}
+    if (!await this.authorizedAttachment(socket,'message:delivery',false,env)) return;
+    const row = this.db.one<NativeMail>("SELECT * FROM native_mail WHERE machine_id=? AND session_id=(SELECT active_session_id FROM machines WHERE machine_id=?) AND state='pending' ORDER BY created_at,message_id,epoch LIMIT 1",machine,machine);
     if (row) socket.send(JSON.stringify({type:'mailbox.deliver',message:{id:row.message_id,epoch:row.epoch,
       recipient:row.recipient,session_id:row.session_id,operation_id:row.operation_id,body:row.body}}));
   }
@@ -765,9 +817,9 @@ export class MachineDO {
     }
   }
 
-  private async recordAttention(socket: WebSocket, body: JsonRecord): Promise<void> {
+  private async recordAttention(socket: WebSocket, body: JsonRecord,env:Hub2Env): Promise<void> {
     if (!boundedString(body.session_id,120) || typeof body.reason!=='string' || !/^[a-z_]{1,80}$/.test(body.reason)) return;
-    const attachment = await this.authorizedAttachment(socket,'machine:offer');
+    const attachment = await this.authorizedAttachment(socket,'machine:offer',true,env);
     if (!attachment) return;
     const row = this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND machine_id=?',body.session_id,attachment.machine_id);
     if (!row) return;
@@ -812,11 +864,11 @@ export class MachineDO {
 
   private stopOnly(socket:WebSocket):boolean{try{return socket.deserializeAttachment()?.stop_only===true;}catch{return false;}}
 
-  private async authorizedAttachment(socket: WebSocket, scope: string, closeOnRefusal = true): Promise<{ machine_id: string; actor_id: string; generation: string } | undefined> {
+  private async authorizedAttachment(socket: WebSocket, scope: string, closeOnRefusal = true,env:Hub2Env=this.env): Promise<{ machine_id: string; actor_id: string; generation: string } | undefined> {
     let attachment: { machine_id?: string; actor_id?: string; generation?: string } | null;
     try { attachment = socket.deserializeAttachment(); } catch { attachment = null; }
     if (!attachment?.machine_id || !attachment.actor_id || !attachment.generation) return undefined;
-    const control = this.env.CONTROL.get(this.env.CONTROL.idFromName('global'));
+    const control = env.CONTROL.get(env.CONTROL.idFromName('global'));
     const response = await control.fetch('https://control.hub2.internal/_authorize', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ actor_id: attachment.actor_id, generation: attachment.generation, scope }),

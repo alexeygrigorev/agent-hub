@@ -12,11 +12,16 @@
     "test:read-cache": "node --experimental-transform-types tests/run-read-cache.mjs",
     "test:db-metering": "node --experimental-transform-types tests/run-db-metering.mjs",
     "test:control": "node --experimental-transform-types tests/run-control-grants-directory.mjs",
+    "test:routing": "cd .. && node hub2/host/tests/test-routing.mjs",
+    "test:host": "python scripts/test_host.py",
+    "test:billing-policy": "python3 tests/cloudflare-billing-policy.test.py",
+    "test:budget": "node --experimental-transform-types tests/run-budget-do.mjs",
     "test:accounts-mail-workerd": "node tests/run-accounts-mail-workerd.mjs",
     "test:core-workerd": "node tests/run-core-integration-workerd.mjs",
     "test:normal-day-auth": "node tests/run-normal-day-auth-workerd.mjs",
     "test:normal-day": "node tests/run-normal-day-workerd.mjs",
     "budget": "python3 scripts/production-line-budget.py",
-    "bundle:dry-run": "wrangler deploy --dry-run --config wrangler.dev.jsonc --outdir .local/hub2-dist"
+    "bundle:dry-run": "wrangler deploy --dry-run --config wrangler.dev.jsonc --outdir .local/hub2-dist",
+    "test:budget-edge": "node tests/run-budget-edge.mjs"
   }
 }

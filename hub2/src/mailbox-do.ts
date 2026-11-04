@@ -1,12 +1,13 @@
+import {budgetedBackgroundRequest} from './budget-edge';
 import {MeteredDb,initializeSchema} from './db';
 import {sha256Hex} from './crypto';
 import {actorFrom,bodyObject,boundedString,error,hasScope,HttpError,json} from './http';
-import type {Actor,JsonRecord} from './types';
+import type {Actor,JsonRecord,Hub2Env} from './types';
 type Mail={id:string;sender:string;recipient:string;body:string;key:string;digest:string;thread_id:string;reply_to:string|null;epoch:number;state:string;visible:number;created_at:number;read_at:number|null;acked_at:number|null;accepted_at:number|null;completed_at:number|null;delivered_at:number|null;native_receipt_json:string|null;attention_json:string|null};
 type Native={message_id:string;epoch:number;operation_id:string;recipient:string;body:string;session_id:string|null;machine_id:string|null;state:string;next_attempt:number|null;attempts:number;receipt_json:string|null};
 type Claim={message_id:string;epoch:number;operation_id:string;claim_id:string;machine_id:string;session_id:string;state:string;receipt_digest:string|null};
 type Move={sender:string;key:string;message_id:string;digest:string;target:string;epoch:number;state:string;next_attempt:number|null;result_json:string|null};
-type Env={CONTROL:DurableObjectNamespace;MACHINES:DurableObjectNamespace};
+type Env=Partial<Hub2Env>&{CONTROL:DurableObjectNamespace;MACHINES:DurableObjectNamespace};
 const FIELDS:Record<string,string>={read:'read_at',ack:'acked_at',accept:'accepted_at',complete:'completed_at'};
 const SCHEMA=[
  'CREATE TABLE messages(id TEXT PRIMARY KEY,sender TEXT NOT NULL,recipient TEXT NOT NULL,body TEXT NOT NULL,key TEXT NOT NULL,digest TEXT NOT NULL,thread_id TEXT NOT NULL,reply_to TEXT,epoch INTEGER NOT NULL,state TEXT NOT NULL,visible INTEGER NOT NULL DEFAULT 1,created_at INTEGER NOT NULL,read_at INTEGER,acked_at INTEGER,accepted_at INTEGER,completed_at INTEGER,delivered_at INTEGER,native_receipt_json TEXT,attention_json TEXT,UNIQUE(sender,key)) WITHOUT ROWID',
@@ -61,8 +62,8 @@ export class MailboxDO{
    ...this.db.all<Mail>('SELECT * FROM messages WHERE recipient=? AND visible=1 AND id>=? AND id<? ORDER BY id LIMIT 2',owner,id,id+'\uffff')];
   const unique=[...new Map(rows.map(m=>[m.id,m])).values()];return unique.length===1?unique[0]:error(unique.length?'ambiguous_prefix':'message_not_found',unique.length?409:404);
  }
- private async directory(recipient:string):Promise<{mailbox:string;forward_session?:string|null}>{
-  const response=await this.env.CONTROL.get(this.env.CONTROL.idFromName('global')).fetch(new Request('https://control.internal/_recipient',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({recipient})}));
+ private async directory(recipient:string,effectEnv:Env=this.env):Promise<{mailbox:string;forward_session?:string|null}>{
+  const response=await effectEnv.CONTROL.get(effectEnv.CONTROL.idFromName('global')).fetch(new Request('https://control.internal/_recipient',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({recipient})}));
   if(!response.ok)throw new HttpError('recipient_unknown',response.status===404?404:503);const result=await response.json() as {mailbox:string;forward_session?:string|null};
   if(!boundedString(result.mailbox,180))throw new HttpError('invalid_directory_result',503);return result;
  }
@@ -188,18 +189,32 @@ export class MailboxDO{
   }await this.schedule();return json({resumed:Math.min(rows.length,16),next:rows.length>16?rows[15].message_id:null});
  }
  private async flushNative(id:string,epoch:number):Promise<void>{
+  const row=this.db.one<Native>('SELECT * FROM native_outbox WHERE message_id=? AND epoch=?',id,epoch);
+  if(!row||!['pending-target','pending-machine','pending-ack','pending-cancel','attention-pending'].includes(row.state))return;
+  const kind=row.state==='pending-ack'?'native_exit':['pending-cancel','attention-pending'].includes(row.state)?'capacity_reconcile':'native_delivery';
+  const result=await budgetedBackgroundRequest(this.env as Hub2Env,kind,async guarded=>{
+   await this.flushNativeEffect(id,epoch,guarded as Env);
+   return new Response(null,{status:204});
+  });
+  if(result.status!==204){
+   const denied=await result.json().catch(()=>({})) as {retry_at?:number};
+   const retry=Number.isSafeInteger(denied.retry_at)?denied.retry_at!:Date.now()+300000;
+   this.db.run('UPDATE native_outbox SET next_attempt=? WHERE message_id=? AND epoch=? AND next_attempt IS NOT NULL',retry,id,epoch);
+  }
+ }
+ private async flushNativeEffect(id:string,epoch:number,effectEnv:Env):Promise<void>{
   let n=this.db.one<Native>('SELECT * FROM native_outbox WHERE message_id=? AND epoch=?',id,epoch);if(!n)return;
   try{
    if(n.state==='pending-target'){
-    const target=await this.directory(n.recipient),session=n.recipient.startsWith('session:')?n.recipient.slice(8):target.forward_session;
-    if(!session){this.db.run("UPDATE native_outbox SET state='unrouted',next_attempt=NULL WHERE message_id=? AND epoch=? AND state='pending-target'",id,epoch);const latest=await this.directory(n.recipient);if(latest.forward_session)this.db.run("UPDATE native_outbox SET state='pending-target',next_attempt=? WHERE message_id=? AND epoch=? AND state='unrouted'",Date.now(),id,epoch);return;}
-    const response=await this.env.CONTROL.get(this.env.CONTROL.idFromName('global')).fetch(new Request('https://control.internal/api/routes/session/'+encodeURIComponent(session),{headers:{'x-hub2-actor':JSON.stringify({id:'service:mail',kind:'operator',scopes:['routing:read']})}}));
+    const target=await this.directory(n.recipient,effectEnv),session=n.recipient.startsWith('session:')?n.recipient.slice(8):target.forward_session;
+    if(!session){this.db.run("UPDATE native_outbox SET state='unrouted',next_attempt=NULL WHERE message_id=? AND epoch=? AND state='pending-target'",id,epoch);const latest=await this.directory(n.recipient,effectEnv);if(latest.forward_session)this.db.run("UPDATE native_outbox SET state='pending-target',next_attempt=? WHERE message_id=? AND epoch=? AND state='unrouted'",Date.now(),id,epoch);return;}
+    const response=await effectEnv.CONTROL.get(effectEnv.CONTROL.idFromName('global')).fetch(new Request('https://control.internal/api/routes/session/'+encodeURIComponent(session),{headers:{'x-hub2-actor':JSON.stringify({id:'service:mail',kind:'operator',scopes:['routing:read']})}}));
     if(!response.ok)throw new Error('native_route_unavailable');const route=await response.json() as {route?:{owner:string}};if(!boundedString(route.route?.owner,180))throw new Error('native_route_invalid');
     this.db.run("UPDATE native_outbox SET state='pending-machine',session_id=?,machine_id=? WHERE message_id=? AND epoch=? AND state='pending-target'",session,route.route.owner,id,epoch);n=this.db.one<Native>('SELECT * FROM native_outbox WHERE message_id=? AND epoch=?',id,epoch)!;
    }
    if(!['pending-machine','pending-ack','pending-cancel','attention-pending'].includes(n.state)||!n.machine_id||!n.session_id)return;
    const state=n.state,path=state==='pending-machine'?'mail':state==='pending-ack'?'mail-ack':'mail-cancel';
-   const response=await this.env.MACHINES.get(this.env.MACHINES.idFromName(n.machine_id)).fetch(new Request('https://machine.internal/_internal/'+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message_id:id,epoch,operation_id:n.operation_id,...(state==='pending-machine'?{recipient:n.recipient,session_id:n.session_id,body:n.body}:state==='pending-ack'?{native_receipt:JSON.parse(n.receipt_json!)}:{})})}));
+   const response=await effectEnv.MACHINES.get(effectEnv.MACHINES.idFromName(n.machine_id)).fetch(new Request('https://machine.internal/_internal/'+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message_id:id,epoch,operation_id:n.operation_id,...(state==='pending-machine'?{recipient:n.recipient,session_id:n.session_id,body:n.body}:state==='pending-ack'?{native_receipt:JSON.parse(n.receipt_json!)}:{})})}));
    if(!response.ok)throw new Error('native_handoff_pending');const proof=await response.json() as JsonRecord;
    if(proof.message_id!==id||proof.epoch!==epoch||proof.operation_id!==n.operation_id||(state==='pending-machine'?proof.queued!==true:state==='pending-ack'?proof.acked!==true:proof.cancelled!==true))throw new Error('native_handoff_mismatch');
    this.db.run('UPDATE native_outbox SET state=?,next_attempt=NULL WHERE message_id=? AND epoch=? AND state=?',state==='pending-machine'?'queued':state==='pending-ack'?'acked':state==='attention-pending'?'attention':'cancelled',id,epoch,state);

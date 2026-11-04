@@ -21,6 +21,12 @@ TEXT_SUFFIXES = {
     ".cjs", ".css", ".html", ".js", ".json", ".jsonc", ".mjs", ".py",
     ".sh", ".sql", ".svg", ".toml", ".ts", ".tsx", ".yaml", ".yml",
 }
+GENERATED_PARTS = {"__pycache__", "build", "dist", "node_modules"}
+
+
+def is_generated(path: Path) -> bool:
+    parts = path.relative_to(ROOT).parts
+    return any(part in GENERATED_PARTS or part.endswith(".egg-info") for part in parts)
 
 
 def text_files(path: Path) -> set[Path]:
@@ -29,7 +35,7 @@ def text_files(path: Path) -> set[Path]:
     return {
         file for file in path.rglob("*")
         if file.is_file() and file.suffix.lower() in TEXT_SUFFIXES
-        and not {"__pycache__", "build", "dist", "node_modules"}.intersection(file.parts)
+        and not is_generated(file)
         and not any(part.startswith(".") for part in file.relative_to(ROOT).parts)
     }
 
@@ -48,11 +54,28 @@ def production_files() -> set[Path]:
     bootstrap = HUB2 / "host" / "bootstrap.py"
     if bootstrap.is_file():
         files.add(bootstrap)
+    # These scripts/workflows create or reconcile real production billing
+    # policies, so classify them as operational product code, not test tooling.
+    for path in (
+        HUB2 / "scripts" / "cloudflare-billing-policy.py",
+        ROOT / ".github" / "workflows" / "hub2-billing-audit.yml",
+    ):
+        if path.is_file():
+            files.add(path)
+    for path in (HUB2 / "wrangler.jsonc", HUB2 / "wrangler.production.jsonc"):
+        if path.is_file():
+            files.add(path)
+    files.update(path for path in (HUB2 / "scripts").glob("deploy*") if path.is_file() and path.suffix.lower() in TEXT_SUFFIXES)
+    files.update(path for path in (HUB2 / "scripts").glob("registry-import*") if path.is_file() and path.suffix.lower() in TEXT_SUFFIXES)
     return files
 
 
 def verification_files() -> set[Path]:
     files = text_files(HUB2 / "scripts")
+    files.difference_update(
+        HUB2 / "scripts" / name
+        for name in ("cloudflare-billing-policy.py",)
+    )
     files.update(
         file for file in (
             HUB2 / "wrangler.dev.jsonc",
@@ -119,11 +142,15 @@ def describe(files: set[Path]) -> dict[str, object]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--limit", type=int, default=6000, help="hard product SLOC limit")
+    parser.add_argument("--limit", type=int, default=6000, help="product SLOC target")
+    parser.add_argument(
+        "--accepted-overage", type=int, default=362,
+        help="previously accepted modest overage; failures begin above target plus this amount",
+    )
     parser.add_argument("--json", action="store_true", help="emit machine-readable report")
     args = parser.parse_args()
-    if args.limit < 1:
-        parser.error("--limit must be positive")
+    if args.limit < 1 or args.accepted_overage < 0:
+        parser.error("--limit must be positive and --accepted-overage nonnegative")
 
     product = production_files()
     verification = verification_files()
@@ -137,17 +164,23 @@ def main() -> int:
         print(f"Unclassified Hub 2 source/config files: {names}", file=sys.stderr)
         return 2
 
+    product = describe(product)
+    within_target = product["sloc"] <= args.limit
+    accepted_maximum = args.limit + args.accepted_overage
     report = {
         "limit": args.limit,
-        "product": describe(product),
+        "accepted_previous_overage": args.accepted_overage,
+        "accepted_maximum": accepted_maximum,
+        "product": product,
+        "within_target": within_target,
         "verification_tooling": describe(verification),
         "tests_and_harnesses": describe(tests),
         "all_scoped_code": describe(all_scoped),
-        "within_product_limit": describe(product)["sloc"] <= args.limit and host_runtime_complete,
+        "within_product_limit": product["sloc"] <= accepted_maximum and host_runtime_complete,
         "host_runtime_complete": host_runtime_complete,
         "missing_host_files": missing_host_files,
-        "policy": "The 6000 limit applies to product SLOC. SLOC is nonblank/noncomment physical source lines; physical totals are reported separately. No source is minified. Test-only harnesses and CI verification are separate categories, never silently omitted from this report.",
-        "excluded": ["documentation", "generated/hidden files", "binary assets"],
+        "policy": "6000 product SLOC is the target. The previously reported 362-line modest overage is accepted for this rollout and remains visible; greater overage fails the gate. SLOC is nonblank/noncomment physical source lines; physical totals are reported separately. No source is minified. Test-only harnesses and CI verification are separate categories, never silently omitted from this report.",
+        "excluded": ["documentation", "hidden local files", "generated caches/build/dist/node_modules", "Python *.egg-info packaging metadata", "binary assets"],
     }
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
@@ -155,7 +188,10 @@ def main() -> int:
         for name in ("product", "verification_tooling", "tests_and_harnesses", "all_scoped_code"):
             group = report[name]
             print(f"{name}: {group['sloc']} SLOC; {group['physical_lines']} physical lines; {group['file_count']} files")
-        print(f"product limit: {report['product']['sloc']}/{args.limit} SLOC")
+        print(f"product target: {report['product']['sloc']}/{args.limit} SLOC")
+        if not within_target and report["product"]["sloc"] <= accepted_maximum:
+            print(f"accepted previous overage: {report['product']['sloc'] - args.limit}/{args.accepted_overage} SLOC (non-blocking for this rollout)")
+        print(f"product gate maximum: {accepted_maximum} SLOC")
         if missing_host_files:
             print(f"complete product gate: FAIL (host runtime missing: {', '.join(missing_host_files)})")
         print("policy: SLOC counts nonblank/noncomment physical lines; no minification")

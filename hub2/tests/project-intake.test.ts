@@ -1,8 +1,17 @@
 import {test} from 'node:test';import assert from 'node:assert/strict';import {DatabaseSync} from 'node:sqlite';import {ProjectDO} from '../src/project-do';
 const admin={id:'human:admin',kind:'operator',scopes:['operator:admin']};
-function fixture(){const sql=new DatabaseSync(':memory:');let alarm:any=null;const ctx:any={id:{toString:()=> 'synthetic-project'},storage:{sql:{exec(q:string,...a:any[]){const p=sql.prepare(q);const rows=p.columns().length?p.all(...a):(p.run(...a),[]);return{toArray:()=>rows};}},transactionSync(fn:any){sql.exec('BEGIN');try{const r=fn();sql.exec('COMMIT');return r;}catch(e){sql.exec('ROLLBACK');throw e;}},async getAlarm(){return alarm;},async setAlarm(at:number){alarm=at;},async deleteAlarm(){alarm=null;}},blockConcurrencyWhile:(f:any)=>Promise.resolve(f())};
- const routes:any[]=[];const env:any={CONTROL:{idFromName:(id:any)=>id,get:()=>({fetch:async(_r:any,init:any)=>{routes.push(JSON.parse(init.body));return Response.json({registered:true});}})},MACHINES:{idFromName:(id:any)=>id,get:()=>({fetch:async(url:string)=>Response.json(url.endsWith('/reserve')?{state:'staged',epoch:1}:{state:'offered'})})}};
- let project=new ProjectDO(ctx,env);const call=(p:string,m='GET',b?:unknown,a:any=admin)=>project.fetch(new Request('https://p.test'+p,{method:m,headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(a)},...(b===undefined?{}:{body:JSON.stringify(b)})}));return{sql,get project(){return project;},restart:()=>project=new ProjectDO(ctx,env),routes,call,getAlarm:()=>alarm};}
+const budgetMetrics=['worker_requests','worker_cpu_ms','do_requests','do_ws_messages','do_gb_ms','background_invocations','sqlite_rows_read','sqlite_rows_written','sqlite_byte_days','kv_reads','kv_writes','kv_deletes','kv_lists','kv_byte_days'];
+const budgetUnits=Object.fromEntries(budgetMetrics.map((key)=>[key,key==='do_requests'?67:100])) as Record<string,number>;
+const budgetEnvelopes=JSON.stringify({version:1,...Object.fromEntries(['normal','safety'].map(kind=>[kind,{units:budgetUnits,max_do_calls:64,max_wall_ms:60000,provenance:'synthetic-project-test-envelope-v1'}]))});
+function fixture(options:{denyKinds?:string[];retryAt?:number}={}){const sql=new DatabaseSync(':memory:');let alarm:any=null;const storageValues=new Map<string,unknown>(),ctx:any={id:{toString:()=> 'synthetic-project'},storage:{sql:{exec(q:string,...a:any[]){const p=sql.prepare(q);const rows=p.columns().length?p.all(...a):(p.run(...a),[]);return{toArray:()=>rows};}},transactionSync(fn:any){sql.exec('BEGIN');try{const r=fn();sql.exec('COMMIT');return r;}catch(e){sql.exec('ROLLBACK');throw e;}},async getAlarm(){return alarm;},async setAlarm(at:number){alarm=at;},async deleteAlarm(){alarm=null;},async get(key:string){return storageValues.get(key);},async put(key:string,value:unknown){storageValues.set(key,value);},async delete(key:string){return storageValues.delete(key);}},blockConcurrencyWhile:(f:any)=>Promise.resolve(f())};
+ const routes:any[]=[],machineCalls:string[]=[],budgetCalls:any[]=[],denied=new Set(options.denyKinds||[]),retryAt=options.retryAt??Date.now()+60_000;
+ const requestOf=(input:string|Request,init?:RequestInit)=>input instanceof Request?input:new Request(input,init);
+ const CONTROL={idFromName:(id:any)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{const request=requestOf(input,init);routes.push(await request.json());return Response.json({registered:true});}})};
+ const MACHINES={idFromName:(id:any)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{const request=requestOf(input,init);const path=new URL(request.url).pathname;machineCalls.push(path);return Response.json(path.endsWith('/reserve')?{state:'staged',epoch:1}:{state:'offered'});}})};
+ const unused={idFromName:(id:any)=>id,get:()=>({fetch:async()=>Response.json({ok:true})})};
+ const BUDGET={idFromName:(id:any)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{const request=requestOf(input,init),path=new URL(request.url).pathname,body=request.method==='POST'?await request.json() as any:{};if(path==='/_internal/reserve'){budgetCalls.push(body);if(denied.has(body.kind))return Response.json({allowed:false,reason:'daily_ceiling',retry_at:retryAt},{status:429});return Response.json({allowed:true});}if(path==='/_internal/settle')return Response.json({settled:true});return Response.json({ok:true});}})};
+ const env:any={CONTROL,PROJECTS:unused,MACHINES,ACCOUNTS:unused,MAILBOXES:unused,BUDGET,HUB2_BUDGET_ENVELOPES:budgetEnvelopes};
+ let project=new ProjectDO(ctx,env);const call=(p:string,m='GET',b?:unknown,a:any=admin)=>project.fetch(new Request('https://p.test'+p,{method:m,headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(a)},...(b===undefined?{}:{body:JSON.stringify(b)})}));return{sql,get project(){return project;},restart:()=>project=new ProjectDO(ctx,env),routes,machineCalls,budgetCalls,call,getAlarm:()=>alarm,deny:(kind:string)=>denied.add(kind),storageValues};}
 const body=async(r:Response)=>await r.json() as any;
 async function intake(f:ReturnType<typeof fixture>,key='task'){const result=await f.call('/api/intakes?project=org/a','POST',{key,title:'Original task',text:'Original requested behavior',acceptance_criteria:['Actual result']});assert.equal(result.status,201);return(await body(result)).intake;}
 test('intake edits preserve original ask and notes/history; archive search paginates retained data',async()=>{
@@ -24,6 +33,30 @@ test('schedule adapter creates distinct child provenance and actual launch saga,
  const before=f.sql.prepare('SELECT COUNT(*) AS n FROM dispatch_sagas').get() as any;
  (f.project as any).db.run("UPDATE schedule_occurrences SET state='pending',next_attempt=?,result_json=NULL",Date.now()-1);await f.project.alarm();assert.equal((f.sql.prepare('SELECT COUNT(*) AS n FROM dispatch_sagas').get() as any).n,before.n);assert.equal((f.sql.prepare('SELECT COUNT(*) AS n FROM intakes WHERE schedule_id=?').get(created.schedule.id) as any).n,1);
  assert.equal((await f.call('/api/schedules','POST',{key:'bad-shell',intake_id:parent.id,kind:'root',interval_ms:60000,payload:{engine:'shell'}},{id:'agent:writer',kind:'agent',resource_id:'org/a',scopes:['schedule:write','intake:read','session:start']})).status,403);
+});
+
+test('budget denial precedes Project fanout and persists its exact retry across restart',async()=>{
+ const retryAt=Date.now()+45*60_000,f=fixture({denyKinds:['scheduled_start'],retryAt}),own=await intake(f),priorRoutes=f.routes.length;
+ const response=await f.call('/api/intakes/'+own.id+'/start','POST',{key:'budget-paused',workspace:'/tmp/synthetic-budget-start',engine:'shell',machine_id:'h1',override_reason:'Synthetic semantic test'});
+ assert.equal(response.status,202);
+ const saga=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any;
+ assert.equal(saga.state,'pending_machine');assert.equal(saga.next_action_at,retryAt);assert.equal(saga.last_reason,'budget_paused');
+ assert.equal(f.machineCalls.length,0,'reservation refusal happens before MachineDO calls');assert.equal(f.routes.length,priorRoutes,'reservation refusal happens before Control route fanout');
+ assert.equal(f.getAlarm(),retryAt);assert.equal(f.storageValues.get('hub2:budget_pause_until'),retryAt);
+ f.restart();await f.project.alarm();
+ const restarted=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any;
+ assert.equal(restarted.state,'pending_machine');assert.equal(restarted.next_action_at,retryAt);assert.equal(f.machineCalls.length,0);assert.equal(f.getAlarm(),retryAt);
+});
+
+test('budget denial pauses scheduled alarm work without consuming due occurrences',async()=>{
+ const retryAt=Date.now()+30*60_000,f=fixture({denyKinds:['background_effect'],retryAt}),parent=await intake(f,'alarm-budget');
+ const created=await body(await f.call('/api/schedules','POST',{key:'budgeted-root',intake_id:parent.id,kind:'writer',interval_ms:60000,overlap:'allow',payload:{start:{workspace:'/tmp/synthetic-paused-alarm',engine:'shell',machine_id:'h1',override_reason:'Synthetic semantic test'}}}));
+ (f.project as any).db.run('UPDATE work_schedules SET next_due=? WHERE id=?',Date.now()-1,created.schedule.id);
+ await f.project.alarm();
+ assert.equal((f.sql.prepare('SELECT COUNT(*) AS n FROM schedule_occurrences WHERE schedule_id=?').get(created.schedule.id) as any).n,0);
+ assert.equal(f.storageValues.get('hub2:budget_pause_until'),retryAt);assert.equal(f.getAlarm(),retryAt);
+ f.restart();await f.project.alarm();
+ assert.equal((f.sql.prepare('SELECT COUNT(*) AS n FROM schedule_occurrences WHERE schedule_id=?').get(created.schedule.id) as any).n,0);assert.equal(f.getAlarm(),retryAt);
 });
 
 test('worker append is exact-intake scoped, immutable key fenced and cannot alter acceptance or task state',async()=>{

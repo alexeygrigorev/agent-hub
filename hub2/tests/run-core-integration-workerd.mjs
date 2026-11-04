@@ -5,20 +5,20 @@ import {build} from 'esbuild';
 import {Miniflare,Log,LogLevel,convertV4MiniflareOptions} from 'miniflare';
 import {WebSocket} from 'ws';
 import {resolve} from 'node:path';
-import {mkdtemp,readFile,writeFile,mkdir} from 'node:fs/promises';
+import {mkdtemp,readFile,writeFile,mkdir,readdir} from 'node:fs/promises';
 import {createHash} from 'node:crypto';
 const root=process.env.HUB2_CORE_ROOT||resolve(import.meta.dirname,'../..');
 const entry=process.env.HUB2_CORE_ENTRY||resolve(root,'hub2/tests/core-integration-worker.ts');
 const reportPath=process.env.HUB2_CORE_REPORT;
-const names={control:'CoreControl',project:'CoreProject',machine:'CoreMachine',account:'CoreAccount',mailbox:'CoreMailbox'};
+const names={control:'CoreControl',project:'CoreProject',machine:'CoreMachine',account:'CoreAccount',mailbox:'CoreMailbox',budget:'CoreBudget'};
 const token='synthetic-core-operator-token-000000000000000000',project='synthetic/core',machine='synthetic-machine',account='synthetic-account';
-const sourceFiles=['worker','project-do','machine-do','control-do','account-do','mailbox-do','db','types','auth','control-auth','worker-credentials','credential-crypto','read-cache','mcp','routing','project-work','cron'];
+const sourceFiles=(await readdir(resolve(root,'hub2/src'))).filter(n=>n.endsWith('.ts')).map(n=>n.slice(0,-3)).sort();
 async function hashes(){return Object.fromEntries(await Promise.all(sourceFiles.map(async n=>[n,createHash('sha256').update(await readFile(resolve(root,`hub2/src/${n}.ts`))).digest('hex')])));}
 const sourceBefore=await hashes();
 const bundle=await build({entryPoints:[entry],bundle:true,write:false,format:'esm',platform:'browser',external:['cloudflare:workers']});
 await mkdir(resolve(root,'.local/tmp'),{recursive:true});const persist=await mkdtemp(resolve(root,'.local/tmp/core-integration-'));
 const workspace=process.env.HUB2_CORE_WORKER_CONTEXT||process.env.HUB2_CORE_PROVISION?resolve(persist,'workspace'):'/synthetic/workspace';if(process.env.HUB2_CORE_WORKER_CONTEXT||process.env.HUB2_CORE_PROVISION)await mkdir(workspace,{recursive:true,mode:0o700});
-const options=convertV4MiniflareOptions({resourcePersistencePath:persist,host:'127.0.0.1',port:0,log:new Log(LogLevel.ERROR),workers:[{name:'hub2-core-native-fixture',script:bundle.outputFiles[0].text,modules:true,compatibilityDate:'2024-04-05',durableObjects:Object.fromEntries(Object.entries(names).map(([k,className])=>[({control:'CONTROL',project:'PROJECTS',machine:'MACHINES',account:'ACCOUNTS',mailbox:'MAILBOXES'})[k],{className,useSQLite:true}])),bindings:{HUB2_FIXTURE_CODEX_PROVIDER:process.env.HUB2_CORE_PROVISION?'yes':'',HUB2_DEV_OPERATOR_TOKEN:token,HUB2_DEFAULT_ACCOUNT_ID:account,HUB2_ENGINE_ACCOUNTS:JSON.stringify({opencode:account}),HUB2_CREDENTIAL_KEY:'11'.repeat(32),HUB2_FIXTURE_ASSET_HTML:await readFile(resolve(root,'hub2/public/index.html'),'utf8')}}]});
+const options=convertV4MiniflareOptions({resourcePersistencePath:persist,host:'127.0.0.1',port:0,log:new Log(LogLevel.ERROR),workers:[{name:'hub2-core-native-fixture',script:bundle.outputFiles[0].text,modules:true,compatibilityDate:'2024-04-05',durableObjects:Object.fromEntries(Object.entries(names).map(([k,className])=>[({control:'CONTROL',project:'PROJECTS',machine:'MACHINES',account:'ACCOUNTS',mailbox:'MAILBOXES',budget:'BUDGET'})[k],{className,useSQLite:true}])),bindings:{HUB2_FIXTURE_CODEX_PROVIDER:process.env.HUB2_CORE_PROVISION?'yes':'',HUB2_DEV_OPERATOR_TOKEN:token,HUB2_DEFAULT_ACCOUNT_ID:account,HUB2_ENGINE_ACCOUNTS:JSON.stringify({opencode:account}),HUB2_CREDENTIAL_KEY:'11'.repeat(32),HUB2_FIXTURE_ASSET_HTML:await readFile(resolve(root,'hub2/public/index.html'),'utf8')}}]});
 let mf=new Miniflare(options),base,hostToken,liveSocket,completedIntakeId;const results=[],measurements={};
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 async function api(path,method='GET',body,auth=token,extra={}){
@@ -28,7 +28,7 @@ async function api(path,method='GET',body,auth=token,extra={}){
 }
 function expect(result,status,label){assert.equal(result.status,status,`${label}: HTTP ${result.status}, error=${result.data.error||result.data.reason||''}`);return result.data;}
 const fixture=(kind,id,action='state',body)=>api(`/_fixture/${kind}/${encodeURIComponent(id)}/${action}`,body===undefined?'GET':'POST',body);
-async function snapshots(){const out={};for(const [kind,id] of [['control','global'],['project',project],['machine',machine],['account',account],...(process.env.HUB2_CORE_PUBLIC_MAIL?[['mailbox','global']]:[])] ){const name=kind==='mailbox'?kind+':'+id:kind;out[name]=expect(await fixture(kind,id),200,kind+' state');assert.equal(out[name].counts.measurement_valid,true,kind+' invalid native meter');}return out;}
+async function snapshots(){const out={};for(const [kind,id] of [['control','global'],['project',project],['machine',machine],['account',account],['budget','global'],...(process.env.HUB2_CORE_PUBLIC_MAIL?[['mailbox','global']]:[])] ){const name=kind==='mailbox'?kind+':'+id:kind;out[name]=expect(await fixture(kind,id),200,kind+' state');assert.equal(out[name].counts.measurement_valid,true,kind+' invalid native meter');}return out;}
 function delta(before,after){return Object.fromEntries(Object.keys(before).map(k=>[k,{reads:after[k].counts.rows_read-before[k].counts.rows_read,writes:after[k].counts.rows_written-before[k].counts.rows_written,alarm_calls:after[k].counts.alarm_operations-before[k].counts.alarm_operations}]));}
 async function test(name,fn){try{await fn();results.push({name,passed:true});}catch(e){results.push({name,passed:false,error:String(e.message),stack:String(e.stack).split('\n').slice(0,6).join('\n')});}}
 async function intake(key,title='Synthetic core lifecycle'){
@@ -84,19 +84,29 @@ try{
   liveSocket.socket.send(JSON.stringify({type:'offer_ack',session_id:started.id,epoch:offer.epoch}));await liveSocket.wait(v=>v.type==='ack'&&v.session_id===started.id);
   const native='11111111-2222-4333-8444-555555555555';
   expect(await api(`/api/sessions/${started.id}/started`,'POST',{operation_id:offer.operation_id,epoch:offer.epoch,native_id:native},hostToken),409,'started before admission');
-  const admission=expect(await api(`/api/sessions/${started.id}/admission`,'POST',{epoch:offer.epoch,operation_id:offer.operation_id},hostToken),200,'host admission');assert.equal(admission.launch_allowed,true);assert.equal(admission.epoch,offer.epoch);
+  const admission=expect(await api(`/api/sessions/${started.id}/admission`,'POST',{epoch:offer.epoch,operation_id:offer.operation_id},hostToken),200,'host admission');assert.equal(admission.launch_allowed,true);assert.equal(admission.epoch,offer.epoch);assert(Number.isSafeInteger(admission.runtime_deadline)&&admission.runtime_deadline>Date.now(),'admission must expose its immutable synthetic deadline');
   expect(await api(`/api/sessions/${started.id}/started`,'POST',{operation_id:offer.operation_id,epoch:offer.epoch+1,native_id:native},hostToken),409,'stale started receipt');
   let workerCheck;if(process.env.HUB2_CORE_WORKER){const {prepareWorkerProof}=await import('./normal-day-worker-credentials.mjs');workerCheck=await prepareWorkerProof({api,expect,fixture,socket,intake,start,project,machine,hostToken,session:started,offer,intakeId:created.id,root,persist,base});}
   expect(await fixture('project',project,'fault',{paths:['/_internal/started']}),200,'lose successful started forwarding response');
+  expect(await fixture('budget','global','pause-normal',{}),200,'synthetic financial ceiling fixture');
+  expect(await api('/api/repos','GET'),429,'normal request paused before native receipt');
   expect(await api(`/api/sessions/${started.id}/started`,'POST',{operation_id:offer.operation_id,epoch:offer.epoch,native_id:native},hostToken),202,'started durable pending response');
+  const budgetStatus=await api('/api/budget','GET');expect(budgetStatus,200,'budget safety status');
+  expect(await api('/api/budget/override','POST',{day:budgetStatus.data.day,ceiling_pusd:'1000000000000',reason:'Synthetic core fixture resumes after started-safety test'}),200,'audited test-only ceiling override');
+
   expect(await fixture('machine',machine,'due-outbox',{id:'started:'+offer.operation_id}),200,'retry started durable journal');
   expect(await api(`/api/sessions/${started.id}/started`,'POST',{operation_id:offer.operation_id,epoch:offer.epoch,native_id:native},hostToken),200,'started retry');
   const live=expect(await api(`/api/intakes/${created.id}?project=${encodeURIComponent(project)}`),200,'running intake');assert.equal(live.intake.status,'running');
   if(process.env.HUB2_CORE_PUBLIC_MAIL){const {publicNativeMail}=await import('./normal-day-public-mail.mjs');measurements.public_mail=await publicNativeMail({api,expect,connection:liveSocket,session:started,hostToken,intakeId:created.id});}
-  const evidence={source:'aplexer_retirement',fixture:true,artifact:'synthetic-artifact.txt',independent_acceptance:false,native_identity:{id:native,tag:'task-hub2-'+started.id,workspace:offer.launch.workspace},containment_empty:true,native_exit:{code:0}};
+  const evidence={source:'aplexer_retirement',fixture:true,artifact:'synthetic-artifact.txt',independent_acceptance:false,native_identity:{id:native,tag:'task-hub2-'+started.id,workspace:offer.launch.workspace},containment_empty:true,native_deadline:{deadline_ms:admission.runtime_deadline,exceeded:false},native_exit:{code:0,exited_at_ms:Date.now()}};
   const finish={operation_id:offer.operation_id,epoch:offer.epoch,native_id:native,exit_code:0,evidence,native_exit_confirmed:true};
   expect(await api(`/api/sessions/${started.id}/finish`,'POST',{...finish,native_exit_confirmed:false},hostToken),400,'unproved exit');
   const contradicted=await api(`/api/sessions/${started.id}/finish`,'POST',{...finish,evidence:{...evidence,native_exit:{code:1}}},hostToken);assert([400,409].includes(contradicted.status),'contradictory native exit evidence accepted');
+  const missingDeadline={...finish,evidence:{...evidence}};delete missingDeadline.evidence.native_deadline;expect(await api(`/api/sessions/${started.id}/finish`,'POST',missingDeadline,hostToken),409,'missing deadline marker');
+  expect(await api(`/api/sessions/${started.id}/finish`,'POST',{...finish,evidence:{...evidence,native_deadline:{...evidence.native_deadline,deadline_ms:admission.runtime_deadline+1}}},hostToken),409,'changed immutable deadline');
+  expect(await api(`/api/sessions/${started.id}/finish`,'POST',{...finish,evidence:{...evidence,native_exit:{code:0,exited_at_ms:admission.runtime_deadline}}},hostToken),409,'late exit cannot claim exceeded=false');
+  expect(await api(`/api/sessions/${started.id}/finish`,'POST',{...finish,evidence:{...evidence,native_exit:{code:0,exited_at_ms:Date.now()+6001}}},hostToken),409,'future native exit timestamp');
+  expect(await api(`/api/sessions/${started.id}/finish`,'POST',{...finish,evidence:{...evidence,native_deadline:{...evidence.native_deadline,exceeded:true}}},hostToken),409,'deadline cannot be exceeded before it expires');
   expect(await api(`/api/sessions/${started.id}/finish`,'POST',{...finish,epoch:finish.epoch+1},hostToken),409,'stale finish epoch');
   expect(await api(`/api/sessions/${started.id}/finish`,'POST',{...finish,operation_id:'stale-attempt'},hostToken),409,'stale finish operation');
   assert.equal(expect(await api('/api/account/quota'),200,'unqualified exit retains reservation').account.occupied,1);
@@ -116,6 +126,31 @@ try{
   assert.equal(after.project.alarm,null,'finished project has no pending alarm');assert.equal(after.machine.alarm,null,'finished machine has no pending alarm');assert.equal(after.account.alarm,null,'released account has no pending alarm');
   const quietBefore=await snapshots();await sleep(120);const quietAfter=await snapshots();for(const k of Object.keys(quietBefore)){assert.equal(quietAfter[k].counts.rows_read,quietBefore[k].counts.rows_read,k+' idle reads');assert.equal(quietAfter[k].counts.rows_written,quietBefore[k].counts.rows_written,k+' idle writes');}
  });
+ await test('late successful native exit is durably failed by the immutable admission deadline',async()=>{
+  const created=expect((await intake('intake-late-exit')).response,201,'late exit intake').intake;
+  liveSocket=await socket();
+  const started=expect(await start(created.id,'start-late-exit'),201,'late exit start').session;
+  const offer=(await liveSocket.wait(v=>v.type==='session.offer'&&v.offer.session_id===started.id)).offer;
+  liveSocket.socket.send(JSON.stringify({type:'offer_ack',session_id:started.id,epoch:offer.epoch}));await liveSocket.wait(v=>v.type==='ack'&&v.session_id===started.id);
+  const admission=expect(await api(`/api/sessions/${started.id}/admission`,'POST',{epoch:offer.epoch,operation_id:offer.operation_id},hostToken),200,'late exit admission');
+  assert(Number.isSafeInteger(admission.runtime_deadline)&&admission.runtime_deadline>Date.now(),'late exit fixture needs a future admission deadline');
+  const native='22222222-3333-4444-8555-666666666666';
+  expect(await api(`/api/sessions/${started.id}/started`,'POST',{operation_id:offer.operation_id,epoch:offer.epoch,native_id:native},hostToken),201,'late exit native start');
+  const exitedAt=admission.runtime_deadline+1;
+  const evidence={source:'aplexer_retirement',fixture:true,artifact:'synthetic-late-artifact.txt',independent_acceptance:false,
+   native_identity:{id:native,tag:'task-hub2-'+started.id,workspace:offer.launch.workspace},containment_empty:true,
+   native_deadline:{deadline_ms:admission.runtime_deadline,exceeded:true},native_exit:{code:0,exited_at_ms:exitedAt}};
+  const finish={operation_id:offer.operation_id,epoch:offer.epoch,native_id:native,exit_code:0,evidence,native_exit_confirmed:true};
+  const offset=exitedAt+1000-Date.now();assert(offset>0&&offset<86400000,'synthetic clock offset outside fixture bounds');
+  expect(await fixture('control','global','clock',{offset}),200,'advance only synthetic finish clock');
+  try{const finished=expect(await api(`/api/sessions/${started.id}/finish`,'POST',finish,hostToken),201,'late zero exit is recorded as failed');assert.equal(finished.state,'failed','MachineDO must preserve the proven deadline breach');}
+  finally{expect(await fixture('control','global','clock',{offset:0}),200,'restore synthetic finish clock');}
+  const failed=expect(await api(`/api/intakes/${created.id}?project=${encodeURIComponent(project)}`),200,'late exit intake state');
+  assert.equal(failed.intake.status,'failed','late native exit must not be certified complete');
+  assert.equal(expect(await api('/api/account/quota'),200,'late exit reservation released').account.occupied,0,'qualified late exit frees only its own reservation');
+  liveSocket.socket.close();liveSocket=null;
+ });
+ if(process.env.HUB2_CORE_ABORT!=='0')await test('qualified admitted abort preserves zero exit, revocation and retry binding',async()=>{const{admittedAbort}=await import('./normal-day-abort.mjs');measurements.admitted_abort=await admittedAbort({api,expect,fixture,socket,intake,start,project,machine,hostToken});});
  await test('lost reserve and activation responses replay one operation and epoch',async()=>{
   const target='synthetic-fault-machine';
   const pair=expect(await api('/api/enrollments/pair','POST',{machine_id:target,alias:'Synthetic lost-response fixture'}),201,'fault pairing');

@@ -31,13 +31,14 @@ class BudgetTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             journal=Journal(Path(directory)/'private/journal.sqlite')
             journal.emit('ordinary','/api/sessions/session-1/commands/cmd-1/ack',{'result':'retained'})
+            journal.emit('started','/api/sessions/session-1/started',{'epoch':1,'operation_id':'operation-1','native_id':'11111111-1111-4111-8111-111111111111'})
             journal.emit('finish','/api/sessions/session-1/finish',{'native_exit_confirmed':True})
             stop_path='/api/sessions/session-1/commands/cmd-2/ack?safety=operator_stop'
             journal.emit('stop',stop_path,{'result':{'stopped':True}})
             calls=[];client=Mock()
             def request(method,path,body,key):
                 calls.append((method,path,key))
-                if not (path.endswith('/finish') or path==stop_path):
+                if not (path.endswith('/finish') or path.endswith('/started') or path==stop_path):
                     raise AssertionError('ordinary network during pause')
                 return {}
             client.request.side_effect=request
@@ -54,7 +55,7 @@ class BudgetTests(unittest.TestCase):
             self.assertGreaterEqual(bridge.reconcile.call_count,4);bridge.heartbeat.assert_not_called()
             bridge.command.assert_called_once_with(stop)
             client.socket.assert_called_once_with('machine-1',safety=True)
-            self.assertEqual(calls,[('POST','/api/sessions/session-1/finish','finish'),('POST',stop_path,'stop')])
+            self.assertEqual(calls,[('POST','/api/sessions/session-1/started','started'),('POST','/api/sessions/session-1/finish','finish'),('POST',stop_path,'stop')])
             self.assertEqual([r['key'] for r in journal.db.execute('SELECT key FROM outbox')],['ordinary'])
             journal.db.close()
 

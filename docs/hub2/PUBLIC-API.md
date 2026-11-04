@@ -24,7 +24,7 @@ Messages now use one physical global MessageDO. The authenticated mailbox identi
 
 Native delivery authority is derived from the authenticated machine's exact persisted queue entry. The edge verifies message ID, operation, epoch, recipient and machine, then adds only that mailbox capability and the server-derived session ID to the internal request. Caller-supplied delivery/session headers do not grant authority. Native claims, physical delivery receipts and phone read/ack/accept/complete stages remain separate.
 
-Mailbox pagination uses cursor; registry, intake and session owner pages use after. Fleet and global session projections use opaque bounded fan-out continuations. Intake/session UUID or unique prefixes resolve through the durable owner directory; no historical shard scan is used.
+Mailbox and intake-list pagination use cursor; registry, intake history, and session owner pages use after. Fleet and global session projections use opaque bounded fan-out continuations. Intake/session UUID or unique prefixes resolve through the durable owner directory; no historical shard scan is used.
 
 ## Verification
 

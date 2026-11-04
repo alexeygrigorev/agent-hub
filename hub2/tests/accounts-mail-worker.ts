@@ -1,8 +1,12 @@
 // Local-only fixture. Never deploy: it deliberately accepts synthetic actor headers.
 import { MachineDO } from '../src/machine-do';
 import { ControlDO } from '../src/control-do';
-import { AccountDO } from '../src/account-do';
-import { MailboxDO } from '../src/mailbox-do';
+import { AccountDO as ActualAccountDO } from '../src/account-do';
+import {fixtureBudgetEnvelopes} from './budget-fixture';
+export {BudgetDO} from '../src/budget-do';
+class AccountDO extends ActualAccountDO {constructor(ctx:any,env:any){super(ctx,{HUB2_BUDGET_ENVELOPES:fixtureBudgetEnvelopes,...env});}}
+import { MailboxDO as ActualMailboxDO } from '../src/mailbox-do';
+class MailboxDO extends ActualMailboxDO {constructor(ctx:any,env:any){super(ctx,{HUB2_BUDGET_ENVELOPES:fixtureBudgetEnvelopes,...env});}}
 export { AccountDO,MailboxDO,ControlDO };
 export class MailboxFixture extends MailboxDO{
  async fetch(request:Request):Promise<Response>{
@@ -33,9 +37,9 @@ export class MachineFixture extends MachineDO{
  }
 }
 export default {async fetch(request:Request,env:any){
- const url=new URL(request.url),match=url.pathname.match(/^\/(accounts|mailboxes|control|machines)\/([^/]+)(\/.*)$/);
+ const url=new URL(request.url),match=url.pathname.match(/^\/(accounts|mailboxes|control|machines|budget)\/([^/]+)(\/.*)$/);
  if(!match)return new Response('not found',{status:404});
- const id=decodeURIComponent(match[2]),namespace=match[1]==='accounts'?env.ACCOUNTS:match[1]==='control'?env.CONTROL:match[1]==='machines'?env.MACHINES:env.MAILBOXES;
+ const id=decodeURIComponent(match[2]),namespace=match[1]==='accounts'?env.ACCOUNTS:match[1]==='control'?env.CONTROL:match[1]==='machines'?env.MACHINES:match[1]==='budget'?env.BUDGET:env.MAILBOXES;
  const headers=new Headers(request.headers);const actor=JSON.parse(headers.get('x-hub2-actor')||'{}');if(actor.kind==='machine')headers.set('x-hub2-delivery-session','session-test');if(match[1]==='mailboxes')headers.set('x-hub2-mailbox',id);if(match[1]==='accounts')headers.set('x-hub2-account-id',id);
  return namespace.get(namespace.idFromName(match[1]==='mailboxes'?'global':id)).fetch(new Request('https://fixture.internal'+match[3]+url.search,{method:request.method,headers,body:request.body,duplex:'half'} as RequestInit));
 }};

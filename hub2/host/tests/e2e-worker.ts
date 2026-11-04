@@ -5,6 +5,7 @@ import { ControlDO as Control } from '../../src/control-do';
 import { ProjectDO as Project } from '../../src/project-do';
 import { MachineDO as Machine } from '../../src/machine-do';
 import { AccountDO as Account } from '../../src/account-do';
+export { BudgetDO } from '../../src/budget-do';
 export { MailboxDO } from '../../src/mailbox-do';
 async function measured(request:Request,ctx:DurableObjectState,fetcher:()=>Promise<Response>){
   const response=await fetcher();
@@ -34,7 +35,7 @@ export default { async fetch(request: Request, env: Hub2Env): Promise<Response> 
   if (!env.HUB2_DEV_OPERATOR_TOKEN || request.headers.get('Authorization') !== `Bearer ${env.HUB2_DEV_OPERATOR_TOKEN}`) {
     return new Response('unauthorized', { status: 401 });
   }
-  const namespaces = { control: env.CONTROL, project: env.PROJECTS, machine: env.MACHINES, account: env.ACCOUNTS, mailbox: env.MAILBOXES };
+  const namespaces = { control: env.CONTROL, project: env.PROJECTS, machine: env.MACHINES, account: env.ACCOUNTS, mailbox: env.MAILBOXES, budget: env.BUDGET };
   const kind = url.searchParams.get('kind') as keyof typeof namespaces;
   const id = url.searchParams.get('id');
   if (!namespaces[kind] || !id || id.length > 180) return new Response('invalid metric target', { status: 400 });

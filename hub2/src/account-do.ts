@@ -1,8 +1,9 @@
+import {budgetedBackgroundRequest,BudgetPause,budgetPauseResponse} from './budget-edge';
 import {credentialKey,sealCredential,openCredential} from './credential-crypto';
 import { MeteredDb, initializeSchema } from './db';
 import { actorFrom, bodyObject, boundedString, error, hasScope, HttpError, json } from './http';
-import type { Actor } from './types';
-type AccountEnv={HUB2_CREDENTIAL_KEY?:string;HUB2_PROVIDER_FETCH?:typeof fetch};
+import type { Actor,Hub2Env } from './types';
+type AccountEnv=Partial<Hub2Env>&{HUB2_CREDENTIAL_KEY?:string;HUB2_PROVIDER_FETCH?:typeof fetch};
 const PATHS:Record<string,string[]>={codex:['.codex/auth.json'],claude:['.claude/.credentials.json'],zai:['.config/goz/config.json'],gemini:['.gemini/oauth_creds.json'],antigravity:['.gemini/antigravity-cli/antigravity-oauth-token'],go:['.local/share/opencode-hub/device-auth.json']};
 const SCHEMA = [
  'CREATE TABLE credential_rejections(host_id TEXT PRIMARY KEY,generation INTEGER NOT NULL,reason TEXT NOT NULL,observed_at INTEGER NOT NULL) WITHOUT ROWID',
@@ -54,7 +55,7 @@ export class AccountDO {
    if(p==='/api/account/start')return await this.transition(request,'running');
    
    return error('not_found',404);
-  }catch(e){return e instanceof HttpError?error(e.code,e.status):error('internal_error',500);}
+  }catch(e){if(e instanceof BudgetPause)return budgetPauseResponse(e.retryAt);return e instanceof HttpError?error(e.code,e.status):error('internal_error',500);}
  }
  private routingView():Response{
   const account=this.db.one<Account>('SELECT * FROM account WHERE id=1'),quota=this.db.one<Quota>('SELECT * FROM quota WHERE id=1');
@@ -202,7 +203,7 @@ export class AccountDO {
     const source='provider:'+account.provider+':generation:'+row.generation;
     let quota=this.db.one<Quota>('SELECT * FROM quota WHERE id=1');
     if(!quota||quota.valid_until<=Date.now()||quota.source!==source){
-     await this.collect(false);
+     const collected=await this.collect(false);if(collected.status===429)return collected;
      quota=this.db.one<Quota>('SELECT * FROM quota WHERE id=1');
     }
     if(!quota||quota.valid_until<=Date.now()||quota.source!==source)return error('quota_unavailable',503);
@@ -278,6 +279,18 @@ export class AccountDO {
   const pending=this.collectNow().finally(()=>{if(this.collecting===pending)this.collecting=undefined;});this.collecting=pending;return pending;
  }
  private async collectNow():Promise<Response>{
+  const result=await budgetedBackgroundRequest(this.env as Hub2Env,'provider_refresh',()=>this.collectProvider());
+  if(result.status===429||result.status===503){
+   const body=await result.clone().json().catch(()=>({})) as {error?:string;retry_at?:number};
+   if(body.error?.startsWith('budget_')){
+    const retry=Number.isSafeInteger(body.retry_at)?body.retry_at!:Date.now()+300000;
+    this.db.run('INSERT INTO probes(id,token,retry_at) VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET retry_at=excluded.retry_at',crypto.randomUUID(),retry);
+    this.db.run('UPDATE discovery SET next_at=? WHERE id=1 AND enabled=1',retry);
+   }
+  }
+  return result;
+ }
+ private async collectProvider():Promise<Response>{
   const probe=crypto.randomUUID();this.db.run('INSERT INTO probes(id,token,retry_at) VALUES(1,?,0) ON CONFLICT(id) DO UPDATE SET token=excluded.token,retry_at=0',probe);
   const fail=(reason:string,invalidate=true)=>this.unknown(reason,probe,invalidate);let quotaProved=false;
   try{
@@ -317,7 +330,7 @@ export class AccountDO {
     });
    }
    this.db.run('UPDATE discovery SET status=? WHERE id=1','observed');return json({observed:true,remaining});
-  }catch{return fail('provider_probe_failed',!quotaProved);}
+  }catch(e){if(e instanceof BudgetPause){fail('budget_paused',!quotaProved);return budgetPauseResponse(e.retryAt);}return fail('provider_probe_failed',!quotaProved);}
  }
  private unknown(reason:string,probe:string,invalidate=true):Response{
   if(this.db.one<{token:string}>('SELECT token FROM probes WHERE id=1')?.token!==probe)return error('probe_superseded',409);
@@ -350,6 +363,19 @@ export class AccountDO {
   }catch{return false;}
  }
  private async refresh(provider:string,files:Record<string,string>,generation:number):Promise<any>{
+  let value:any;
+  const decision=await budgetedBackgroundRequest(this.env as Hub2Env,'provider_refresh',async()=>{
+   value=await this.refreshProvider(provider,files,generation);
+   return new Response(null,{status:204});
+  });
+  if(decision.status!==204){
+   const denied=await decision.json().catch(()=>({})) as {error?:string;retry_at?:number};
+   if(decision.status===429)throw new BudgetPause(Number(denied.retry_at)||Date.now()+86400000);
+   throw new HttpError(denied.error||'budget_effect_outcome_uncertain',decision.status);
+  }
+  return value;
+ }
+ private async refreshProvider(provider:string,files:Record<string,string>,generation:number):Promise<any>{
   const until=Date.now()+30000,attempt=crypto.randomUUID();
   this.db.transaction(this.ctx,()=>{const row=this.db.one<{generation:number;refresh_until:number}>('SELECT generation,refresh_until FROM credentials WHERE id=1');if(!row||row.generation!==generation||row.refresh_until>Date.now())throw new HttpError('refresh_in_progress',409);if(this.hasUnresolvedRefresh(generation))throw new HttpError('refresh_outcome_uncertain',503);this.db.run('UPDATE credentials SET refresh_until=?,refresh_owner=?,refresh_lease=NULL WHERE id=1',until,'central');});
   this.db.run('INSERT INTO credential_candidates(id,host_id,base_generation,sealed,observed_at,state) VALUES(?,?,?,?,?,?)',attempt,'hub:central',generation,'',Date.now(),'issued');

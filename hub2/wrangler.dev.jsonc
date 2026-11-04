@@ -15,13 +15,16 @@
       { "name": "PROJECTS", "class_name": "ProjectDO" },
       { "name": "MACHINES", "class_name": "MachineDO" },
       { "name": "ACCOUNTS", "class_name": "AccountDO" },
-      { "name": "MAILBOXES", "class_name": "MailboxDO" }
+      { "name": "MAILBOXES", "class_name": "MailboxDO" },
+      { "name": "BUDGET", "class_name": "BudgetDO" }
     ]
   },
   "migrations": [
-    { "tag": "hub2-local-v1", "new_sqlite_classes": ["ControlDO", "ProjectDO", "MachineDO", "AccountDO", "MailboxDO"] }
+    { "tag": "hub2-local-v1", "new_sqlite_classes": ["ControlDO", "ProjectDO", "MachineDO", "AccountDO", "MailboxDO", "BudgetDO"] }
   ],
   "vars": {
+    // Test-only envelope. Production must supply reviewed server bounds.
+    "HUB2_BUDGET_ENVELOPES": "{\"version\":1,\"normal\":{\"units\":{\"worker_requests\":1,\"worker_cpu_ms\":100,\"do_requests\":67,\"do_ws_messages\":0,\"do_gb_ms\":1000,\"background_invocations\":0,\"sqlite_rows_read\":4096,\"sqlite_rows_written\":64,\"sqlite_byte_days\":1,\"kv_reads\":0,\"kv_writes\":0,\"kv_deletes\":0,\"kv_lists\":0,\"kv_byte_days\":0},\"max_do_calls\":64,\"max_wall_ms\":60000,\"provenance\":\"Synthetic local-only acceptance envelope, not production sizing\"},\"safety\":{\"units\":{\"worker_requests\":1,\"worker_cpu_ms\":100,\"do_requests\":67,\"do_ws_messages\":0,\"do_gb_ms\":1000,\"background_invocations\":0,\"sqlite_rows_read\":4096,\"sqlite_rows_written\":64,\"sqlite_byte_days\":1,\"kv_reads\":0,\"kv_writes\":0,\"kv_deletes\":0,\"kv_lists\":0,\"kv_byte_days\":0},\"max_do_calls\":64,\"max_wall_ms\":60000,\"provenance\":\"Synthetic local-only acceptance envelope, not production sizing\"}}",
     "HUB2_DEFAULT_ACCOUNT_ID": "e2e-muse",
     "HUB2_ENGINE_ACCOUNTS": "{\"opencode\":\"e2e-muse\"}"
   }

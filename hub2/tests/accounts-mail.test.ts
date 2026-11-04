@@ -1,9 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
-import { AccountDO } from '../src/account-do';
+import { AccountDO as ActualAccountDO } from '../src/account-do';
+import {semanticBudgetEnv} from './budget-fixture';
+class AccountDO extends ActualAccountDO { constructor(ctx:any,env:any={}){super(ctx,semanticBudgetEnv(env));} }
 import { ControlDO } from '../src/control-do';
-import { MailboxDO } from '../src/mailbox-do';
+import { MailboxDO as ActualMailboxDO } from '../src/mailbox-do';
+class MailboxDO extends ActualMailboxDO { constructor(ctx:any,env:any){super(ctx,semanticBudgetEnv(env));} }
 
 // Native SQLite semantics, not a Cloudflare row-cost measurement. Native cost
 // gates run separately in workerd; the cursor counters here are intentionally absent.
@@ -73,7 +76,7 @@ test('unclaimed account hold expiry frees once; invalid quota evidence and unaut
  assert.equal((await account.fetch(request('/api/account/quota','PUT',{remaining:null,captured_at:Date.now(),valid_until:Date.now()+1000,source:'test'}))).status,400);
  assert.equal((await account.fetch(request('/api/account/resets','PUT',{id:'r1',expires_at:Date.now()+10000,available:true,source:'test'},{id:'bad',scopes:[]}))).status,403);
 });
-function mailboxes(){
+function mailboxes(budget?:any){
  const flags={blockReceipts:false,blockDirectory:false,blockMachine:false,failWakeAfterEffect:false,afterRecipient:undefined as undefined|(()=>Promise<void>)};
  const controlEnv:any={},controlState=state();let control=new ControlDO(controlState.ctx,controlEnv);
  controlState.database.prepare('INSERT INTO object_routes(kind,id,owner,resource_id,epoch,digest,participants_json) VALUES(?,?,?,?,?,?,?)').run('session','session-test','h1','task-test',1,'synthetic-fixture','[]');
@@ -81,7 +84,7 @@ function mailboxes(){
  for(const name of ['a','b','c','d','e'])controlState.database.prepare('INSERT INTO named_agents(id,display_name,forward_session,enabled) VALUES(?,?,?,1)').run('agent:'+name,name,'session-test');clearFixtureCache(control);
  const nativeCalls:any[]=[];const nativeFetch=async(r:Request)=>{const b=await r.json();nativeCalls.push({path:new URL(r.url).pathname,body:b});return flags.blockMachine?new Response('{}',{status:503}):Response.json({queued:true,acked:new URL(r.url).pathname.endsWith('mail-ack'),cancelled:new URL(r.url).pathname.endsWith('mail-cancel'),state:'pending',message_id:b.message_id,epoch:b.epoch,operation_id:b.operation_id});};
  const stores=new Map<string,ReturnType<typeof state>>(),shared=state();let box:MailboxDO;
- const env:any={MACHINES:{idFromName:(id:string)=>id,get:()=>({fetch:nativeFetch})},CONTROL:{idFromName:(id:string)=>id,get:()=>({fetch:async(r:Request)=>{const path=new URL(r.url).pathname;if(flags.blockDirectory&&path==='/_routes/register')return new Response('{}',{status:503});const response=await control.fetch(r);if(path==='/_recipient'&&flags.afterRecipient){const hook=flags.afterRecipient;flags.afterRecipient=undefined;await hook();}return response;}})},MAILBOXES:{idFromName:(id:string)=>id,get:(id:string)=>({fetch:async(r:Request)=>{const path=new URL(r.url).pathname;if(flags.blockReceipts&&path==='/_receipt')return new Response('{}',{status:503});const response=await get(id).fetch(r);if(flags.failWakeAfterEffect&&path==='/_resume-native'){flags.failWakeAfterEffect=false;return new Response('{}',{status:503});}return response;}})}};
+ const env:any={...(budget?{BUDGET:budget}:{}),MACHINES:{idFromName:(id:string)=>id,get:()=>({fetch:nativeFetch})},CONTROL:{idFromName:(id:string)=>id,get:()=>({fetch:async(r:Request)=>{const path=new URL(r.url).pathname;if(flags.blockDirectory&&path==='/_routes/register')return new Response('{}',{status:503});const response=await control.fetch(r);if(path==='/_recipient'&&flags.afterRecipient){const hook=flags.afterRecipient;flags.afterRecipient=undefined;await hook();}return response;}})},MAILBOXES:{idFromName:(id:string)=>id,get:(id:string)=>({fetch:async(r:Request)=>{const path=new URL(r.url).pathname;if(flags.blockReceipts&&path==='/_receipt')return new Response('{}',{status:503});const response=await get(id).fetch(r);if(flags.failWakeAfterEffect&&path==='/_resume-native'){flags.failWakeAfterEffect=false;return new Response('{}',{status:503});}return response;}})}};
  Object.assign(controlEnv,env);
  box=new MailboxDO(shared.ctx,env);for(const id of ['global','agent:a','agent:b','agent:c','agent:d','agent:e'])stores.set(id,shared);
  function get(id:string){stores.set(id,shared);return box;}
@@ -210,6 +213,7 @@ test('failed provider quota invalidates a prior fresh observation and refuses ad
  const s=state(),account=new AccountDO(s.ctx,{HUB2_CREDENTIAL_KEY:'55'.repeat(32),HUB2_PROVIDER_FETCH:(async()=>new Response('{}',{status:503})) as any});
  await account.fetch(request('/api/account','PATCH',{provider:'codex',enabled:true,capacity:1}));
  await account.fetch(request('/api/account/credentials','PUT',{files:{'.codex/auth.json':JSON.stringify({tokens:{access_token:'synthetic',refresh_token:'synthetic'}})},expected_generation:0}));await quota(account);
+ await account.fetch(request('/api/account/hosts','PUT',{hosts:['h1']}));
  assert.equal((await account.fetch(request('/api/account/discovery','POST',{}))).status,503);
  assert.equal((await data(await account.fetch(request('/api/account/quota')))).fresh,false);
  assert.equal((await account.fetch(request('/api/account/reserve','POST',reserve))).status,503);
@@ -598,4 +602,81 @@ test('expired issued refresh permit still fences a different host rotation and w
  const denied=await account.fetch(request('/api/account/rotation','POST',{expected_generation:1,files:auth('2026-11-04T00:00:00Z')},h2));assert.equal(denied.status,409);
  assert.equal((s.database.prepare('SELECT generation FROM credentials').get() as any).generation,1);
  const owned=await account.fetch(request('/api/account/rotation','POST',{expected_generation:1,lease:lease.lease,files:auth('2026-11-04T00:00:00Z')},h1));assert.equal(owned.status,200);
+});
+test('refresh material export rechecks the exact permit after real decrypt completes asynchronously',async()=>{
+ const s=state(),account=new AccountDO(s.ctx,{HUB2_CREDENTIAL_KEY:'99'.repeat(32)}),h1={id:'machine:h1',kind:'machine',resource_id:'h1',scopes:[]},h2={...h1,id:'machine:h2',resource_id:'h2'};
+ await account.fetch(request('/api/account','PATCH',{provider:'codex',capacity:1,enabled:true}));
+ await account.fetch(request('/api/account/credentials','PUT',{expected_generation:0,files:{'.codex/auth.json':JSON.stringify({tokens:{access_token:'synthetic-access',refresh_token:'synthetic-refresh'},last_refresh:new Date().toISOString()})}}));
+ await account.fetch(request('/api/account/hosts','PUT',{hosts:['h1','h2']}));
+ const lease=await data(await account.fetch(request('/api/account/refresh-lease','POST',{generation:1},h1)));
+ let entered!:()=>void,release!:()=>void;const started=new Promise<void>(r=>entered=r),gate=new Promise<void>(r=>release=r),real=(account as any).unseal.bind(account);
+ (account as any).unseal=async(...args:any[])=>{const value=await real(...args);entered();await gate;return value;};
+ const pending=account.fetch(request('/api/account/credentials?refresh_lease='+lease.lease,'GET',undefined,h1));await started;
+ assert.equal((await account.fetch(request('/api/account/refresh-outcome','POST',{generation:1,lease:lease.lease,outcome:'not-started'},h1))).status,200);
+ assert.equal((await account.fetch(request('/api/account/refresh-lease','POST',{generation:1},h2))).status,200);
+ release();const refused=await pending;assert.equal(refused.status,409);assert.equal((await data(refused)).files,undefined);
+});
+test('minimum-validity provisioning collects genuine same-generation quota after central refresh and fails before launch if unavailable',async()=>{
+ const s=state(),exp=Math.floor(Date.now()/1000)+14400,jwt=(expiry:number)=>'e30.'+btoa(JSON.stringify({exp:expiry})).replaceAll('=','')+'.synthetic';let refreshes=0,usage=0,fail=true;
+ const provider=async(url:string)=>{
+  if(url==='https://auth.openai.com/oauth/token'){refreshes++;return Response.json({access_token:jwt(exp),refresh_token:'synthetic-new-controller'});}
+  if(url.endsWith('/wham/usage')){usage++;return fail?new Response('{}',{status:503}):Response.json({rate_limit:{primary_window:{used_percent:20}}});}
+  if(url.endsWith('/rate-limit-reset-credits'))return Response.json({credits:[]});
+  throw Error('unexpected deterministic provider URL');
+ };
+ const account=new AccountDO(s.ctx,{HUB2_CREDENTIAL_KEY:'aa'.repeat(32),HUB2_PROVIDER_FETCH:provider as any}),host={id:'machine:h1',kind:'machine',resource_id:'h1',scopes:[]};
+ await account.fetch(request('/api/account','PATCH',{provider:'codex',enabled:true,capacity:1}));
+ await account.fetch(request('/api/account/credentials','PUT',{expected_generation:0,files:{'.codex/auth.json':JSON.stringify({tokens:{access_token:jwt(1),refresh_token:'synthetic-old-controller'},last_refresh:'2000-01-01T00:00:00Z'})}}));
+ await account.fetch(request('/api/account/hosts','PUT',{hosts:['h1']}));
+ const path='/api/account/credentials?min_validity_ms=7560000',denied=await account.fetch(request(path,'GET',undefined,host));assert.equal(denied.status,503);assert.equal((await data(denied)).files,undefined);assert.equal(refreshes,1);assert.equal(usage,1);
+ fail=false;assert.equal((await account.fetch(request('/api/account/discovery','POST',{}))).status,200);
+ const granted=await data(await account.fetch(request(path,'GET',undefined,host)));assert.equal(granted.generation,2);assert.equal(granted.refresh_material,false);assert.equal(refreshes,1);
+ const quota=await data(await account.fetch(request('/api/account/quota')));assert.equal(quota.fresh,true);assert.equal(quota.quota.source,'provider:codex:generation:2');
+});
+test('current host approval and credential generation rejection fence reserve confirm and admission without freeing uncertain effects',async()=>{
+ const s=state(),account=new AccountDO(s.ctx,{HUB2_CREDENTIAL_KEY:'bb'.repeat(32)}),host={id:'machine:h1',kind:'machine',resource_id:'h1',scopes:[]};
+ await account.fetch(request('/api/account','PATCH',{provider:'go',enabled:true,capacity:2}));
+ const files=(token:string)=>({'.local/share/opencode-hub/device-auth.json':JSON.stringify([{active:true,value:{access:token}}])});
+ await account.fetch(request('/api/account/credentials','PUT',{expected_generation:0,files:files('synthetic-one')}));
+ const quota=()=>account.fetch(request('/api/account/quota','PUT',{remaining:80,source:'synthetic admission fixture',captured_at:Date.now(),valid_until:Date.now()+60000}));
+ await quota();const binding={operation_id:'host-policy-op',session_id:'host-policy-session',machine_id:'h1',request_digest:'synthetic',epoch:1};
+ assert.equal((await account.fetch(request('/api/account/reserve','POST',binding))).status,409);
+ await account.fetch(request('/api/account/hosts','PUT',{hosts:['h1']}));assert.equal((await account.fetch(request('/api/account/reserve','POST',binding))).status,200);
+ await account.fetch(request('/api/account/hosts','PUT',{hosts:[]}));assert.equal((await account.fetch(request('/api/account/confirm','POST',binding))).status,409);
+ assert.equal((s.database.prepare('SELECT occupied FROM account').get() as any).occupied,1);
+ await account.fetch(request('/api/account/hosts','PUT',{hosts:['h1']}));assert.equal((await account.fetch(request('/api/account/confirm','POST',binding))).status,200);
+ assert.equal((await account.fetch(request('/api/account/credential-rejection','POST',{generation:1,reason:'credential_rejected'},host))).status,200);
+ assert.equal((await account.fetch(request('/api/account/start','POST',binding))).status,409);
+ assert.equal((s.database.prepare('SELECT occupied FROM account').get() as any).occupied,1);
+ await account.fetch(request('/api/account/credentials','PUT',{expected_generation:1,files:files('synthetic-two')}));await quota();
+ assert.equal((await account.fetch(request('/api/account/start','POST',binding))).status,200);
+ await account.fetch(request('/api/account/hosts','PUT',{hosts:[]}));assert.equal((await account.fetch(request('/api/account/start','POST',binding))).status,409);
+ assert.equal((await account.fetch(request('/_internal/release','POST',{...binding,native_exit_confirmed:true}))).status,200);
+ assert.equal((s.database.prepare('SELECT occupied FROM account').get() as any).occupied,0);
+});
+test('budget denial occurs before provider probe or refresh intent and persists quota retry without consuming credentials',async()=>{
+ const s=state(),retry=Date.now()+3600000;let calls=0;
+ const BUDGET={idFromName:(v:string)=>v,get:()=>({fetch:async()=>Response.json({allowed:false,retry_at:retry},{status:429})})};
+ const env:any={BUDGET,HUB2_CREDENTIAL_KEY:'ab'.repeat(32),HUB2_PROVIDER_FETCH:async()=>{calls++;throw Error('must not issue provider request');}};
+ const account=new AccountDO(s.ctx,env);
+ await account.fetch(request('/api/account','PATCH',{provider:'codex',enabled:true,capacity:1}));
+ await account.fetch(request('/api/account/credentials','PUT',{expected_generation:0,files:{'.codex/auth.json':JSON.stringify({tokens:{access_token:'synthetic',refresh_token:'synthetic'}})}}));
+ await account.fetch(request('/api/account/hosts','PUT',{hosts:['h1']}));
+ const denied=await account.fetch(request('/api/account/discovery','POST',{}));assert.equal(denied.status,429);assert.equal((await data(denied)).retry_at,retry);assert.equal(calls,0);
+ assert.equal((s.database.prepare('SELECT retry_at FROM probes').get() as any).retry_at,retry);
+ const restarted=new AccountDO(s.ctx,env),host={id:'machine:h1',kind:'machine',resource_id:'h1',scopes:[]};
+ const material=await restarted.fetch(request('/api/account/credentials','GET',undefined,host));assert.equal(material.status,429);assert.equal((await data(material)).retry_at,retry);
+ assert.equal((s.database.prepare('SELECT COUNT(*) AS n FROM credential_candidates').get() as any).n,0);assert.equal(calls,0);
+});
+test('native producer budget pause preserves epoch/body/intent through restart and resumes once without false delivery',async()=>{
+ let paused=true;const retry=Date.now()+3600000;
+ const BUDGET={idFromName:(v:string)=>v,get:()=>({fetch:async(input:any)=>String(typeof input==='string'?input:input.url).endsWith('/reserve')&&paused?Response.json({allowed:false,retry_at:retry},{status:429}):Response.json({allowed:true})})};
+ const m=mailboxes(BUDGET),sent=(await data(await m.fetch('agent:a','/api/messages','POST',{recipient:'agent:b',body:'retained while budget paused',key:'budget-pause'}))).message;
+ assert.equal(m.nativeCalls.length,0);
+ const store=m.stores.get('global')!,before=store.database.prepare('SELECT * FROM native_outbox WHERE message_id=?').get(sent.id) as any;
+ assert.equal(before.state,'pending-target');assert.equal(before.next_attempt,retry);assert.equal(before.attempts,0);assert.equal(before.epoch,1);
+ m.restart('global');await m.get('global').alarm();assert.equal(m.nativeCalls.length,0);
+ paused=false;store.database.prepare('UPDATE native_outbox SET next_attempt=? WHERE message_id=?').run(Date.now()-1,sent.id);clearFixtureCache(m.get('global'));
+ await m.get('global').alarm();await m.get('global').alarm();assert.equal(m.nativeCalls.length,1);assert.equal(m.nativeCalls[0].body.epoch,1);assert.equal(m.nativeCalls[0].body.body,'retained while budget paused');
+ const status=await data(await m.fetch('agent:a','/api/messages/'+sent.id+'/status'));assert.equal(status.message.delivered_at,null);
 });

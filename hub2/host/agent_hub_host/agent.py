@@ -52,9 +52,9 @@ class Journal:
     def flush(self, client, safety_only=False):
         query="SELECT * FROM outbox"
         if safety_only:
-            query+=" WHERE path LIKE '/api/sessions/%/finish' OR path LIKE '/api/sessions/%/commands/%/ack?safety=operator_stop'"
+            query+=" WHERE path LIKE '/api/sessions/%/finish' OR path LIKE '/api/sessions/%/started' OR path LIKE '/api/sessions/%/commands/%/ack?safety=operator_stop'"
         for row in self.db.execute(query+" ORDER BY rowid LIMIT 100").fetchall():
-            if safety_only and not re.fullmatch(r"/api/sessions/[A-Za-z0-9-]{1,80}/(?:finish|commands/[A-Za-z0-9-]{1,80}/ack\?safety=operator_stop)",row["path"]):
+            if safety_only and not re.fullmatch(r"/api/sessions/[A-Za-z0-9-]{1,80}/(?:finish|started|commands/[A-Za-z0-9-]{1,80}/ack\?safety=operator_stop)",row["path"]):
                 continue
             client.request("POST", row["path"], json.loads(row["payload"]), row["key"])
             with self.db:

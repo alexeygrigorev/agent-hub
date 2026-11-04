@@ -8,6 +8,8 @@ on:
       - "package.json"
       - "package-lock.json"
       - ".github/workflows/hub2.yml"
+      - ".github/workflows/hub2-billing-audit.yml"
+      - "AGENTS.md"
   pull_request:
     paths:
       - "hub2/**"
@@ -15,6 +17,8 @@ on:
       - "package.json"
       - "package-lock.json"
       - ".github/workflows/hub2.yml"
+      - ".github/workflows/hub2-billing-audit.yml"
+      - "AGENTS.md"
   workflow_dispatch:
 
 permissions:
@@ -36,6 +40,10 @@ jobs:
         with:
           node-version: 22
           cache: npm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
       - name: Install locked root toolchain
         id: install
@@ -82,6 +90,26 @@ jobs:
         continue-on-error: true
         run: npm run test:control --prefix hub2
 
+      - name: Model and machine routing tests
+        id: routing
+        continue-on-error: true
+        run: npm run test:routing --prefix hub2
+
+      - name: Cloudflare backstop policy safety tests
+        id: billing_policy
+        continue-on-error: true
+        run: npm run test:billing-policy --prefix hub2
+
+      - name: Durable cost ledger, ceilings, alerts, and restart tests
+        id: budget_controller
+        continue-on-error: true
+        run: npm run test:budget --prefix hub2
+
+      - name: Public budget enforcement and alert delivery restart
+        id: budget_edge
+        continue-on-error: true
+        run: npm run test:budget-edge --prefix hub2
+
       - name: Accounts and mail Workerd tests
         id: accounts_workerd
         continue-on-error: true
@@ -127,6 +155,10 @@ jobs:
           READ_CACHE: ${{ steps.read_cache.outcome }}
           DB_METERING: ${{ steps.db_metering.outcome }}
           CONTROL: ${{ steps.control.outcome }}
+          ROUTING: ${{ steps.routing.outcome }}
+          BILLING_POLICY: ${{ steps.billing_policy.outcome }}
+          BUDGET_CONTROLLER: ${{ steps.budget_controller.outcome }}
+          BUDGET_EDGE: ${{ steps.budget_edge.outcome }}
           ACCOUNTS_WORKERD: ${{ steps.accounts_workerd.outcome }}
           AUTH_WORKERD: ${{ steps.auth_workerd.outcome }}
           NORMAL_DAY: ${{ steps.normal_day.outcome }}
@@ -140,7 +172,9 @@ jobs:
             "budget:$BUDGET" "accounts_semantic:$ACCOUNTS_SEMANTIC" \
             "project_work:$PROJECT_WORK" "project_intake:$PROJECT_INTAKE" \
             "read_cache:$READ_CACHE" "db_metering:$DB_METERING" \
-            "control:$CONTROL" "accounts_workerd:$ACCOUNTS_WORKERD" \
+            "control:$CONTROL" "routing:$ROUTING" "billing_policy:$BILLING_POLICY" \
+            "budget_controller:$BUDGET_CONTROLLER" "budget_edge:$BUDGET_EDGE" \
+            "accounts_workerd:$ACCOUNTS_WORKERD" \
             "auth_workerd:$AUTH_WORKERD" "normal_day:$NORMAL_DAY" \
             "core_workerd:$CORE_WORKERD" "public_mail:$PUBLIC_MAIL" "bundle:$BUNDLE"; do
             name=${result%%:*}
@@ -153,3 +187,20 @@ jobs:
             fi
           done
           exit "$failed"
+
+  host-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the exact Hub 2 host dependency
+        run: python -m pip install -e ./hub2/host
+      - name: Run Hub 2 host tests
+        run: python hub2/scripts/test_host.py

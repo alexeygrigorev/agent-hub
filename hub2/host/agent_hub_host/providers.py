@@ -1,5 +1,6 @@
 """Provision approved central generations before native admission."""
 import json
+import hashlib
 import os
 import re
 import subprocess
@@ -23,7 +24,9 @@ def provision(client, offer, launch, directory, launcher, runner=subprocess.run)
     repository = launcher.config['repository']
     env = os.environ.copy()
     env['PYTHONPATH'] = repository
-    request = dict(root=str(Path(directory).resolve() / 'providers'), account=account,
+    # SDKs may normalize their own files; never reuse a different attempt's mutable home.
+    fence=hashlib.sha256(json.dumps([offer['session_id'],offer['operation_id'],offer['epoch']],separators=(',',':')).encode()).hexdigest()
+    request = dict(root=str(Path(directory).resolve() / 'providers' / fence), account=account,
                    provider=provider, generation=bundle['generation'], files=bundle['files'], model=launch['model'], timeout_seconds=launch['timeout_seconds'])
     result = runner([sys.executable, '-m', 'launcher.provider_home'], input=json.dumps(request),
                     text=True, capture_output=True, timeout=20, check=False, env=env)

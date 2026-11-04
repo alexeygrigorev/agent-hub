@@ -1,3 +1,4 @@
+import {budgetedPublicRequest,budgetedBackgroundRequest,budgetedOperatorOverride,dispatchBudgetAlerts} from './budget-edge';
 import { mcp } from './mcp';
 import { publicAuthentication, cookieActor } from './auth';
 import { safeEqual } from './crypto';
@@ -10,17 +11,29 @@ let devActorRegistration: Promise<boolean> | undefined;
 
 export default {
   async fetch(request: Request, env: Hub2Env): Promise<Response> {
+    return budgetedPublicRequest(request,env,authenticate,guarded=>routeFetch(request,guarded));
+  },
+  async scheduled(_event:ScheduledController,env:Hub2Env):Promise<void>{
+    const outcome=await budgetedBackgroundRequest(env,'alert_delivery',async guarded=>{
+      await dispatchBudgetAlerts(guarded);
+      return new Response(null,{status:204});
+    },true);
+    if(!outcome.ok)throw new Error('budget_dispatcher_paused_or_unavailable');
+  },
+};
+const router = {
+  async fetch(request: Request, env: Hub2Env): Promise<Response> {
     try {
       const path = publicPath(request.url);
       if (!path) return error('internal_route_forbidden', 404);
-      const authResponse = await publicAuthentication(request, env);
-      if (authResponse) return authResponse;
-      if (path === '/health' && request.method === 'GET')
-        return json({ ok: true, service: 'hub2' });
       // The dashboard is the only public route. Its bearer token is held in
       // memory after load; do not put static HTML behind API authentication.
       if (env.ASSETS && request.method === 'GET' && path === '/')
         return secureStatic(await env.ASSETS.fetch(request));
+      const authResponse = await publicAuthentication(request, env);
+      if (authResponse) return authResponse;
+      if (path === '/health' && request.method === 'GET')
+        return json({ ok: true, service: 'hub2' });
       if (path === '/api/enrollments/complete' && request.method === 'POST') {
         if (
           !sameOriginMutation(request) ||
@@ -35,7 +48,16 @@ export default {
       let actor = await authenticate(request, env);
       if (!actor) return error('unauthorized', 401);
 
-      if (path === '/mcp') return mcp(request, env, (r, e) => this.fetch(r, e), actor);
+      const safetyMode = safetyModeForRequest(request, path, actor);
+      if (safetyMode === false) return error('safety_mode_refused', 403);
+
+      if(path==='/api/budget/override'&&request.method==='POST')return budgetedOperatorOverride(request,env,actor);
+      if (path === '/api/budget' || path === '/api/budget/override') {
+        const budget = env.BUDGET.get(env.BUDGET.idFromName('global'));
+        return budget.fetch(await forwardRequest(request, 'https://budget.hub2.internal' + path, actor));
+      }
+
+      if (path === '/mcp') return mcp(request, env, (r, e) => budgetedPublicRequest(r,e,authenticate,g=>routeFetch(r,g)), actor);
       const control = env.CONTROL.get(env.CONTROL.idFromName('global'));
       if (
         path === '/api/model-policy' ||
@@ -161,6 +183,9 @@ export default {
             request,
             `https://machine.hub2.internal${path}${requestUrl(request).search}`,
             actor,
+            undefined,
+            undefined,
+            safetyMode || undefined,
           ),
         );
       }
@@ -198,6 +223,9 @@ export default {
             request,
             `https://machine.hub2.internal${sessionPath}${requestUrl(request).search}`,
             actor,
+            undefined,
+            undefined,
+            safetyMode || undefined,
           ),
         );
       }
@@ -425,6 +453,7 @@ async function forwardRequest(
   actor?: Actor,
   mailbox?: string,
   deliverySession?: string,
+  safetyMode?: 'operator_stop',
 ): Promise<Request> {
   const headers = new Headers(request.headers);
   for (const key of [...headers.keys()])
@@ -432,6 +461,7 @@ async function forwardRequest(
   if (actor) headers.set('x-hub2-actor', JSON.stringify(actor));
   if (mailbox) headers.set('x-hub2-mailbox', mailbox);
   if (deliverySession) headers.set('x-hub2-delivery-session', deliverySession);
+  if (safetyMode === 'operator_stop') headers.set('x-hub2-safety-mode', safetyMode);
   let body: ArrayBuffer | undefined;
   if (!['GET', 'HEAD'].includes(request.method)) {
     const text = await boundedText(request.clone(), BODY_LIMIT);
@@ -445,6 +475,24 @@ async function forwardRequest(
     headers,
     ...(body ? { body } : {}),
   });
+}
+
+function safetyModeForRequest(
+  request: Request,
+  path: string,
+  actor: Actor,
+): 'operator_stop' | undefined | false {
+  const value = requestUrl(request).searchParams.get('safety');
+  if (value === null) return undefined;
+  const isConnect = path === '/api/connect' && request.method === 'GET';
+  const isStopAck = /^\/api\/sessions\/[^/]+\/commands\/[^/]+\/ack$/.test(path) && request.method === 'POST';
+  if (
+    value !== 'operator_stop' ||
+    (!isConnect && !isStopAck) ||
+    actor.kind !== 'machine' ||
+    !actor.resource_id
+  ) return false;
+  return 'operator_stop';
 }
 
 function admin(actor: Actor): boolean {
@@ -554,3 +602,5 @@ async function machineProjection(
   if (!sessions) next = page.next ? cursor({ directory_after: page.next }) : null;
   return json({ items, next, complete: next === null });
 }
+
+async function routeFetch(request:Request,env:Hub2Env):Promise<Response>{return router.fetch(request,env);}

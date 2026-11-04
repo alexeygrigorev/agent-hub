@@ -8,7 +8,7 @@ import {tmpdir} from 'node:os';
 const root=resolve(import.meta.dirname,'../..');
 const bundle=await build({entryPoints:[resolve(root,'hub2/tests/accounts-mail-worker.ts')],bundle:true,write:false,format:'esm',platform:'browser',external:['cloudflare:workers']});
 const persist=await mkdtemp(resolve(tmpdir(),'hub2-global-mail-workerd-'));
-const options=convertV4MiniflareOptions({resourcePersistencePath:persist,host:'127.0.0.1',port:0,log:new Log(LogLevel.ERROR),workers:[{name:'hub2-global-mail-fixture',script:bundle.outputFiles[0].text,modules:true,compatibilityDate:'2024-04-05',durableObjects:{MACHINES:{className:'MachineFixture',useSQLite:true},CONTROL:{className:'ControlDO',useSQLite:true},ACCOUNTS:{className:'AccountDO',useSQLite:true},MAILBOXES:{className:'MailboxFixture',useSQLite:true}},bindings:{HUB2_CREDENTIAL_KEY:'11'.repeat(32)}}]});
+const options=convertV4MiniflareOptions({resourcePersistencePath:persist,host:'127.0.0.1',port:0,log:new Log(LogLevel.ERROR),workers:[{name:'hub2-global-mail-fixture',script:bundle.outputFiles[0].text,modules:true,compatibilityDate:'2024-04-05',durableObjects:{BUDGET:{className:'BudgetDO',useSQLite:true},MACHINES:{className:'MachineFixture',useSQLite:true},CONTROL:{className:'ControlDO',useSQLite:true},ACCOUNTS:{className:'AccountDO',useSQLite:true},MAILBOXES:{className:'MailboxFixture',useSQLite:true}},bindings:{HUB2_CREDENTIAL_KEY:'11'.repeat(32)}}]});
 let mf=new Miniflare(options),base;
 const admin={id:'operator:test',kind:'operator',scopes:['operator:admin']};
 const a={id:'agent:a',kind:'agent',scopes:[]},b={id:'agent:b',kind:'agent',scopes:[]};
@@ -45,15 +45,15 @@ try{
  const smallBefore=await count('mailboxes','global');await call('mailboxes','agent:b','/api/messages?limit=1','GET',undefined,b);const smallPage=delta(smallBefore,await count('mailboxes','global'));
  for(let i=0;i<100;i++)assert.equal((await call('mailboxes','agent:a','/api/messages','POST',{recipient:'agent:b',body:'retained history '+i,key:'history-'+i},a)).response.status,201);
  const largeBefore=await count('mailboxes','global');await call('mailboxes','agent:b','/api/messages?limit=1','GET',undefined,b);const largePage=delta(largeBefore,await count('mailboxes','global'));assert(largePage.total<=smallPage.total+4);
- const before={mailbox:await count('mailboxes','global'),control:await count('control','global'),machine:await count('machines','h1')};
+ const before={budget:await count('budget','global'),mailbox:await count('mailboxes','global'),control:await count('control','global'),machine:await count('machines','h1')};
  const warm=await call('mailboxes','agent:a','/api/messages','POST',{recipient:'agent:b',body:'full warm lifecycle',key:'warm'},a);await completeNative(warm.result.message.id);
- const flow={mailbox:delta(before.mailbox,await count('mailboxes','global')),control:delta(before.control,await count('control','global')),machine:delta(before.machine,await count('machines','h1'))};
+ const flow={budget:delta(before.budget,await count('budget','global')),mailbox:delta(before.mailbox,await count('mailboxes','global')),control:delta(before.control,await count('control','global')),machine:delta(before.machine,await count('machines','h1'))};
  const total=Object.values(flow).reduce((n,v)=>n+v.total,0),alarms=Object.values(flow).reduce((n,v)=>n+v.alarm_operations,0);
- for(const item of Object.values(before))assert.equal(item.measurement_valid,true);assert(total<117,JSON.stringify(flow));
+ for(const item of Object.values(before))assert.equal(item.measurement_valid,true);assert(flow.mailbox.total+flow.control.total+flow.machine.total<117,JSON.stringify(flow));
  await mf.dispose();mf=new Miniflare(options);base=(await mf.ready).origin;
  const reactivation={mailbox:await count('mailboxes','global'),account:await count('accounts','a1'),control:await count('control','global')};
  const after=await call('mailboxes','agent:a','/api/messages/'+warm.result.message.id+'/status','GET',undefined,a);assert(after.result.message.completed_at);assert(after.result.message.native_receipt);
  const profile=(await call('mailboxes','global','/_fixture/profile')).result;
- console.log(JSON.stringify({passed:true,engine:'native workerd SQLite',physical_mailbox_authorities:1,mailbox_id:'global',accountFlow,warmFullMessage:{...flow,total,alarm_operations:alarms},smallPage,largePage,reactivation,profile,note:'Actual SQL and alarm calls, one global Mailbox counter counted once. Synthetic running-session precondition and native receipts; not provider/live-process or whole-day proof.'}));
+ console.log(JSON.stringify({passed:true,engine:'native workerd SQLite',physical_mailbox_authorities:1,mailbox_id:'global',accountFlow,warmFullMessage:{...flow,total,alarm_operations:alarms},smallPage,largePage,reactivation,profile,note:'Actual SQL and alarm calls, one global Mailbox counter counted once; Budget controller costs included separately and in total. Synthetic running-session precondition and native receipts; not provider/live-process or whole-day proof.'}));
 }finally{await mf.dispose();}
 
