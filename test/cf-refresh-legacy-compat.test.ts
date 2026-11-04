@@ -37,9 +37,23 @@ describe('legacy credentials retain human refresh replay safety without a constr
   expect(h.meter.statementTop(4096).some((row:any)=>/ALTER TABLE credentials ADD COLUMN refresh_rotated_at/i.test(row.sql))).toBe(false);
  }));
  it('rolls back predecessor CAS, sidecar receipt and successor together before a safe retry',()=>fixture(async({h,state,seed,mint,refresh}:any)=>{
-  const pair=await mint('rollback-family'),transaction=state.storage.transactionSync;
-  state.storage.transactionSync=(fn:any)=>transaction.call(state.storage,()=>{const result=fn();throw new Error('refresh-rollback');return result;});
+  const pair=await mint('rollback-family');
+  // Settle unrelated real queue/root work on this SAME guarded day before
+  // targeting the refresh transaction. No SQL/budget costs are discarded.
+  await h.budgeted(async()=>undefined,undefined);
+  const transaction=state.storage.transactionSync;let injected=false;
+  state.storage.transactionSync=(fn:any)=>transaction.call(state.storage,()=>{
+   fn();
+   // Prove this is the completed refresh mutation, rather than a queue
+   // transaction. These observer reads use the real guarded SQL handle too.
+   expect(h.sql.exec("SELECT revoked_at FROM credentials WHERE id='rollback-family'").one().revoked_at).toBeTruthy();
+   expect(h.sql.exec("SELECT id FROM credential_refresh_rotations WHERE id='rollback-family'").toArray()).toHaveLength(1);
+   expect(h.sql.exec("SELECT id FROM credentials WHERE family_id='rollback-family'").toArray()).toHaveLength(2);
+   injected=true;state.storage.transactionSync=transaction;
+   throw new Error('refresh-rollback');
+  });
   try{expect((await refresh(pair.refreshToken)).status).toBe(500);}finally{state.storage.transactionSync=transaction;}
+  expect(injected).toBe(true);
   expect(seed.exec("SELECT revoked_at FROM credentials WHERE id='rollback-family'").one().revoked_at).toBeNull();
   expect(seed.exec("SELECT id FROM credentials WHERE family_id='rollback-family'").toArray()).toHaveLength(1);
   expect(seed.exec("SELECT name FROM sqlite_master WHERE name='credential_refresh_rotations'").toArray()).toHaveLength(0);

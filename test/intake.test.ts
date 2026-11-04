@@ -66,6 +66,9 @@ beforeEach(async () => {
     sql.exec('DROP TRIGGER IF EXISTS intake_note_archive_no_delete');
     sql.exec('DELETE FROM intake_note_archive');
     sql.exec("CREATE TRIGGER intake_note_archive_no_delete BEFORE DELETE ON intake_note_archive BEGIN SELECT RAISE(ABORT,'append_only_note_archive'); END");
+    // Case-boundary fixture cleanup: clear child references first, so the
+    // real BEFORE DELETE safety fence sees no retained reference history.
+    for (const t of ['session_links','link_refs','projection_link_refs']) sql.exec('DELETE FROM intake_' + t);
     for (const t of ['tasks','grants','rules','receipts']) sql.exec('DELETE FROM intake_' + t);
     sql.exec('UPDATE intake_meta SET revision=0');
     sql.exec('DELETE FROM credentials'); sql.exec('DELETE FROM agents');

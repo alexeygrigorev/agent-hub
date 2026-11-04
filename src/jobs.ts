@@ -303,6 +303,11 @@ export interface Machine {
   state?: string;
 }
 
+const DEFERRED_OFFER_INDEX_NAMES=['jobs_offered_host_created','jobs_offered_machine_created','jobs_offered_due_ms','jobs_root_offered_due_ms','jobs_nonroot_offered_due_ms','jobs_root_offered_deadline_ms'] as const;
+const deferredOfferStatements=JOBS_SCHEMA_SQL.split(';').map(value=>value.trim()).filter(statement=>
+ DEFERRED_OFFER_INDEX_NAMES.some(name=>new RegExp('CREATE\\s+INDEX\\s+IF\\s+NOT\\s+EXISTS\\s+'+name+'\\b','i').test(statement)));
+const offeredIndexPending=()=>Object.assign(new Error('job_offer_indexes_pending'),{code:'job_offer_indexes_pending',status:503});
+
 export class JobsService {
   public roles: RoleLeases;
   private sql: SqlStorage;
@@ -322,11 +327,14 @@ export class JobsService {
    * eligible ones, so a stale prefix cannot hide an older role offer forever.
    * This transient cursor affects observation only; claims remain durable. */
   offeredForHost(host: string): { rows: any[]; truncated: boolean } {
+    if(!this.hasOfferedWork())return{rows:[],truncated:false};
+    // This method is called only by authenticated host request routes.
+    this.prepareOfferedWork();
     const candidates: any[] = [];
     let truncated = false;
     for (const column of ['offer_host_id','offer_machine_id']) {
       const key = host + ':' + column, after = this.offerCursors.get(key);
-      const rows = this.sql.exec(`SELECT * FROM jobs WHERE status='offered' AND ${column}=?
+      const rows = this.sql.exec(`SELECT * FROM jobs INDEXED BY ${column==='offer_host_id'?'jobs_offered_host_created':'jobs_offered_machine_created'} WHERE status='offered' AND ${column}=?
         ${after ? 'AND (created_at,id)<(?,?)' : ''} ORDER BY created_at DESC,id DESC LIMIT 101`,
         host,...(after ?? [])).toArray() as any[];
       const page = rows.slice(0,100);
@@ -363,8 +371,12 @@ export class JobsService {
 
     for (const statement of JOBS_SCHEMA_SQL.split(';')) {
       const trimmed = statement.trim();
-      if (trimmed) this.sql.exec(trimmed);
+      if (trimmed&&!deferredOfferStatements.includes(trimmed)) this.sql.exec(trimmed);
     }
+
+    // A genuinely empty fresh schema may install cheap empty indexes.
+    // Retained jobs (even all terminal) never trigger historical builds here.
+    if(!this.sql.exec('SELECT id FROM jobs LIMIT 1').toArray().length)this.prepareOfferedWork();
 
     this.sql.exec('CREATE TABLE IF NOT EXISTS root_background_ready(slot_ms INTEGER NOT NULL,host_id TEXT NOT NULL,rank TEXT NOT NULL,PRIMARY KEY(slot_ms,host_id))');
     this.sql.exec('CREATE INDEX IF NOT EXISTS root_background_rank ON root_background_ready(slot_ms,rank,host_id)');
@@ -385,6 +397,31 @@ export class JobsService {
     this.sql.exec("INSERT OR IGNORE INTO leases (name, epoch) VALUES ('root', 0)");
     ensureRootScheduling(this.sql);
     this.roles = new RoleLeases(this.sql);
+  }
+
+  private hasOfferedWork():boolean {
+    return this.sql.exec("SELECT id FROM jobs INDEXED BY jobs_offered WHERE status='offered' ORDER BY offer_expires_at LIMIT 1").toArray().length>0;
+  }
+  private offeredIndexesPresent():boolean {
+    // No cached readiness: physical metadata is observed on every positive
+    // work path, so external DROP and transaction rollback cannot freeze it.
+    const rows=this.sql.exec("SELECT name FROM pragma_index_list('jobs','main') LIMIT 65").toArray();
+    if(rows.length>64)throw offeredIndexPending();
+    const names=new Set(rows.map(row=>String(row.name).replace(/[A-Z]/g,value=>value.toLowerCase())));
+    return DEFERRED_OFFER_INDEX_NAMES.every(name=>names.has(name));
+  }
+  private requireOfferedIndexes():void {if(!this.offeredIndexesPresent())throw offeredIndexPending();}
+  /** Request-owned migration, after authorization and before publishing work.
+   * RowBudget still preflights and charges every actual index build. */
+  prepareOfferedWork():void {
+    if(this.offeredIndexesPresent())return;
+    const transaction=this.ctx?.storage?.transactionSync?.bind(this.ctx.storage);
+    // An external DROP may bypass the SQL watch within this event. Crossing
+    // the native boundary discards RowBudget's old positive index facts before
+    // the physical build preflight; the second transaction owns all six DDLs.
+    if(transaction)transaction(()=>undefined);
+    const build=()=>{for(const statement of deferredOfferStatements)this.sql.exec(statement);this.requireOfferedIndexes();};
+    if(transaction)transaction(build);else build();
   }
 
   configureRole(project: string, name: string, config: any, generation: number): any {
@@ -431,6 +468,7 @@ export class JobsService {
       if (!lease || lease.epoch !== body.expected_epoch || (lease.holder_job_id && !isLeaseExpired(lease.expires_at, ms))) return { error: 'role_conflict' };
       this.roles.prune(ms);
       if (Number(this.sql.exec('SELECT count(*) AS n FROM jobs WHERE role_name IS NOT NULL').one().n) >= ROLE_JOB_CAPACITY) return { error: 'role_job_capacity' };
+      this.prepareOfferedWork();
       const id = this.generateId();
       this.sql.exec(`INSERT INTO jobs(id,kind,idempotency_key,payload,status,created_at,deadline_at,actor,offer_host_id,offer_machine_id,offer_expires_at,role_name,role_generation,role_host_credential,role_expected_epoch)
         VALUES(?,?,?,?, 'offered',?,?,?,?,?,?,?,?,?,?)`, id, body.profile, idempotency, payload, now.toISOString(), new Date(ms + 25*60000).toISOString(),
@@ -618,13 +656,16 @@ export class JobsService {
       const row: any = this.sql.exec(query, ...bindings).toArray()[0];
       if (typeof row?.due === 'number' && Number.isFinite(row.due)) nextTimes.push(Math.max(1, row.due));
     };
+    if(this.hasOfferedWork()){
+    this.requireOfferedIndexes();
     if (isRootSchedulingEnabled(this.sql)) {
-      first(`SELECT ${OFFER_MS} AS due FROM jobs WHERE status='offered' AND ${OFFER_MS} IS NOT NULL ORDER BY ${OFFER_MS} LIMIT 1`);
+      first(`SELECT ${OFFER_MS} AS due FROM jobs INDEXED BY jobs_offered_due_ms WHERE status='offered' AND ${OFFER_MS} IS NOT NULL ORDER BY ${OFFER_MS} LIMIT 1`);
     } else {
       // Disabled root offers are frozen until their hard deadline. A stale
       // offer timeout must not wake the DO repeatedly while frozen.
-      first(`SELECT ${OFFER_MS} AS due FROM jobs WHERE status='offered' AND kind<>'root-run' AND ${OFFER_MS} IS NOT NULL ORDER BY ${OFFER_MS} LIMIT 1`);
-      first(`SELECT ${DEADLINE_MS} AS due FROM jobs WHERE kind='root-run' AND status='offered' AND ${DEADLINE_MS} IS NOT NULL ORDER BY ${DEADLINE_MS} LIMIT 1`);
+      first(`SELECT ${OFFER_MS} AS due FROM jobs INDEXED BY jobs_nonroot_offered_due_ms WHERE status='offered' AND kind<>'root-run' AND ${OFFER_MS} IS NOT NULL ORDER BY ${OFFER_MS} LIMIT 1`);
+      first(`SELECT ${DEADLINE_MS} AS due FROM jobs INDEXED BY jobs_root_offered_deadline_ms WHERE kind='root-run' AND status='offered' AND ${DEADLINE_MS} IS NOT NULL ORDER BY ${DEADLINE_MS} LIMIT 1`);
+    }
     }
     first(`SELECT ${LEASE_MS} AS due FROM leases WHERE holder_job_id IS NOT NULL ORDER BY ${LEASE_MS} LIMIT 1`);
     first('SELECT due_ms AS due FROM job_claim_deadlines ORDER BY due_ms,lease_name LIMIT 1');
@@ -651,6 +692,7 @@ export class JobsService {
     this.ctx.storage.transactionSync(()=>{
       // Request-owned migration is useful only after a current host proves it
       // can actually run a root. Incapable/blocked polls never census agents.
+      this.prepareOfferedWork();
       advanceRootIncumbentProjection(this.sql);
       const prior:any=this.sql.exec('SELECT last_slot_ms FROM root_background_hosts WHERE host_id=?',hostId).toArray()[0];
       if(prior?.last_slot_ms===slot)return;
@@ -717,6 +759,7 @@ export class JobsService {
       try{heartbeat=JSON.parse(host.last_heartbeat||'{}');}catch{return {status:'retry'};}
       if(checkin===null||nowMs-checkin<0||nowMs-checkin>180000||heartbeat?.gate?.launch_allowed!==true)return {status:'retry'};
       if(this.rootHostsPolicy?.length && !this.rootHostsPolicy.some(value=>[host.id,host.name,host.hostname].includes(value)))return {status:'retry'};
+      this.requireOfferedIndexes();
       const id=this.generateId(),expiry=Math.min(nowMs+120000,when+1500000);
       this.sql.exec(`INSERT INTO jobs(id,kind,idempotency_key,payload,status,created_at,deadline_at,actor,offer_host_id,offer_machine_id,offer_expires_at,offer_attempts)
         VALUES(?,'root-run',?,'{}','offered',?,?,'system',?,?,?,?)`,id,key,slot,new Date(when+1500000).toISOString(),hostId,hostId,new Date(expiry).toISOString(),JSON.stringify([hostId]));
@@ -741,10 +784,13 @@ export class JobsService {
       const row: any = this.sql.exec(query).toArray()[0];
       if (typeof row?.id==='string' && typeof row.due==='number' && Number.isFinite(row.due)) heads.push({id:row.id,dueAt:Math.max(1,row.due)});
     };
-    if (isRootSchedulingEnabled(this.sql)) add(`SELECT id,${OFFER_MS} AS due FROM jobs WHERE status='offered' AND ${OFFER_MS} IS NOT NULL ORDER BY ${OFFER_MS} LIMIT 1`);
+    if(this.hasOfferedWork()){
+    this.requireOfferedIndexes();
+    if (isRootSchedulingEnabled(this.sql)) add(`SELECT id,${OFFER_MS} AS due FROM jobs INDEXED BY jobs_offered_due_ms WHERE status='offered' AND ${OFFER_MS} IS NOT NULL ORDER BY ${OFFER_MS} LIMIT 1`);
     else {
       add(`SELECT id,${OFFER_MS} AS due FROM jobs INDEXED BY jobs_nonroot_offered_due_ms WHERE status='offered' AND kind<>'root-run' AND ${OFFER_MS} IS NOT NULL ORDER BY ${OFFER_MS} LIMIT 1`);
       add(`SELECT id,${DEADLINE_MS} AS due FROM jobs INDEXED BY jobs_root_offered_deadline_ms WHERE status='offered' AND kind='root-run' AND ${DEADLINE_MS} IS NOT NULL ORDER BY ${DEADLINE_MS} LIMIT 1`);
+    }
     }
     add(`SELECT holder_job_id AS id,${LEASE_MS} AS due FROM leases WHERE holder_job_id IS NOT NULL ORDER BY ${LEASE_MS} LIMIT 1`);
     add('SELECT job_id AS id,due_ms AS due FROM job_claim_deadlines ORDER BY due_ms,lease_name LIMIT 1');
@@ -788,12 +834,13 @@ export class JobsService {
       const nowIso = now.toISOString();
 
       this.backfillClaimDeadlines();
+      const hasOffers=this.hasOfferedWork();if(hasOffers)this.requireOfferedIndexes();
       this.ctx.storage.transactionSync(() => {
         // 1. Expire offers (root-run)
         const rootSchedulingEnabled = isRootSchedulingEnabled(this.sql);
-        const offeredJobs = rootSchedulingEnabled
-          ? this.sql.exec(`SELECT * FROM jobs WHERE kind='root-run' AND status='offered' AND ${OFFER_MS}<=? ORDER BY ${OFFER_MS} LIMIT ?`, nowMs, ALARM_BATCH).toArray()
-          : this.sql.exec(`SELECT * FROM jobs WHERE kind='root-run' AND status='offered' AND ${DEADLINE_MS}<=? ORDER BY ${DEADLINE_MS} LIMIT ?`, nowMs, ALARM_BATCH).toArray();
+        const offeredJobs = !hasOffers?[]:rootSchedulingEnabled
+          ? this.sql.exec(`SELECT * FROM jobs INDEXED BY jobs_root_offered_due_ms WHERE kind='root-run' AND status='offered' AND ${OFFER_MS}<=? ORDER BY ${OFFER_MS} LIMIT ?`, nowMs, ALARM_BATCH).toArray()
+          : this.sql.exec(`SELECT * FROM jobs INDEXED BY jobs_root_offered_deadline_ms WHERE kind='root-run' AND status='offered' AND ${DEADLINE_MS}<=? ORDER BY ${DEADLINE_MS} LIMIT ?`, nowMs, ALARM_BATCH).toArray();
         for (const job of offeredJobs) {
           // Root scheduling flag: while disabled, root-run offers are frozen (no expiry,
           // no re-offer); only a job whose deadline has passed is closed.
@@ -812,9 +859,9 @@ export class JobsService {
         // terminal transition here. Non-root role offers are host-bound;
         // expiry cannot re-route them using the root host-selection policy
         // or disturb a different holder of the role lease.
-        const expiredNonRoot = this.sql.exec(`SELECT id FROM jobs
+        const expiredNonRoot = hasOffers?this.sql.exec(`SELECT id FROM jobs INDEXED BY jobs_nonroot_offered_due_ms
           WHERE status='offered' AND kind<>'root-run' AND ${OFFER_MS}<=?
-          ORDER BY ${OFFER_MS} LIMIT ?`, nowMs, ALARM_BATCH).toArray() as any[];
+          ORDER BY ${OFFER_MS} LIMIT ?`, nowMs, ALARM_BATCH).toArray() as any[]:[];
         for (const job of expiredNonRoot) {
           this.sql.exec("UPDATE jobs SET status='expired',finished_at=?,outcome_summary='offer expired' WHERE id=? AND status='offered'", nowIso, job.id);
           this.addHealthEvent('job', job.id, 'failed', 'offer expired', nowIso);
@@ -909,6 +956,7 @@ export class JobsService {
 
     const chosen = this.unbiasedSample(candidates);
     if (chosen) {
+      this.requireOfferedIndexes();
       attempts.push(chosen.id);
       const offerExpires = new Date(now.getTime() + 120 * 1000).toISOString();
       this.sql.exec(
@@ -1118,6 +1166,7 @@ export class JobsService {
           return;
         }
 
+        this.prepareOfferedWork();
         const jobId = this.generateId();
         const deadlineAt = new Date(slotStartMs + 25 * 60000).toISOString();
         this.sql.exec("INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1359,6 +1408,7 @@ export class JobsService {
         if (!job || job.status !== 'offered' || (job.offer_host_id !== hostId && job.offer_machine_id !== hostId)) {
           result = { error: 'conflict' }; return;
         }
+        this.prepareOfferedWork();
         this.addHealthEvent('job', jobId, 'declined', reason.substring(0, 4096), now.toISOString());
         this.tryOfferNext(job, now);
       });
@@ -2008,6 +2058,7 @@ export class JobsService {
           }
         }
 
+        this.prepareOfferedWork();
         this.sql.exec("INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
           jobId, kind, idempotencyKey, JSON.stringify(payload), 'pending', now.toISOString(), deadlineAt, actor);
 

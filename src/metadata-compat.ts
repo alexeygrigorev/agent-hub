@@ -15,6 +15,13 @@ export class MetadataCompatibilityError extends Error {
 /** Point-owned optional metadata. Legacy tables are never ALTERed or copied.
  * JSON preserves explicit NULL independently from a missing sidecar field. */
 export class MetadataCompat {
+ /** Reuse only the exact initialized metadata contract on this SQL handle.
+  * Reader wrappers may be created after the owning service initialized tables. */
+ static forInitializedSchema(sql:SqlStorage,table:string,fields:readonly string[],pk='id'):MetadataCompat {
+  const existing=initialized.get(sql)?.get(table);
+  if(existing&&existing.pk===pk&&fields.length===existing.allowed.size&&new Set(fields).size===fields.length&&fields.every(field=>existing.allowed.has(field)))return existing;
+  return new MetadataCompat(sql,table,fields,pk);
+ }
  private columns:Set<string>;
  private allowed:Set<string>;
  constructor(private sql:SqlStorage,private table:string,fields:readonly string[],private pk='id') {

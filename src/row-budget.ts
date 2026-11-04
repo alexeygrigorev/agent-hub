@@ -44,6 +44,7 @@ function indexBuilds(query: string): { builds: IndexBuild[]; unsupported: boolea
     return null;
   };
   const builds: IndexBuild[] = [];
+  const mainInsertions:number[]=[];
   let unsupported = false;
   for (let i = 0; i < tokens.length; i++) {
     if (!word(i, 'CREATE')) continue;
@@ -52,7 +53,9 @@ function indexBuilds(query: string): { builds: IndexBuild[]; unsupported: boolea
     if (!word(j, 'INDEX')) continue;
     j++;
     if (word(j, 'IF') && word(j + 1, 'NOT') && word(j + 2, 'EXISTS')) j += 3;
+    const nameToken=j;
     let name = identifier(j++);
+    const qualifiedName=tokens[j]==='.';
     if (tokens[j] === '.') {
       if (name?.toLowerCase() !== 'main') unsupported = true;
       name = identifier(j + 1); j += 2;
@@ -78,13 +81,19 @@ function indexBuilds(query: string): { builds: IndexBuild[]; unsupported: boolea
       if(!predicate) unsupported=true;
     } else if(k<tokens.length && !(tokens[k]===';' && k===tokens.length-1)) unsupported=true;
     builds.push({ name, table, predicate });
+    if(!qualifiedName)mainInsertions.push(matches[nameToken].index!);
   }
   // A batch could mutate/recreate the source after preflight and before its
   // CREATE INDEX. Require separate calls so every build sees its real source.
   if (builds.length && tokens.slice(0, -1).includes(';')) unsupported = true;
   const last = tokens.at(-1) === ';' ? matches.length - 2 : matches.length - 1;
-  const executable = builds.length && last >= 0
+  let executable = builds.length && last >= 0
     ? query.slice(0, matches[last].index! + matches[last][0].length) : query;
+  // SQLite resolves ON's unqualified source in the index identifier's
+  // schema. MAIN qualification binds native execution to the SAME source
+  // our preflight observes, even when TEMP shadows a table/index name.
+  // Insert at lexer offsets only: never rewrite literals or comment text.
+  for(const at of mainInsertions.sort((a,b)=>b-a))executable=executable.slice(0,at)+'"main".'+executable.slice(at);
   // Trigger bodies cannot change index lists. Other schema/transaction text
   // is conservatively invalidated, including batches and failed DDL.
   const first=tokens[0]?.toUpperCase();
@@ -466,10 +475,6 @@ export class RowBudget {
     };
     if (parsed.unsupported) deny('index migration requires a supported single-statement build');
     for (const build of parsed.builds) {
-      // Unqualified targets resolve to TEMP before MAIN. Never let a MAIN
-      // metadata proof authorize a different, shadowing source table.
-      const shadow=sql.exec("SELECT schema FROM pragma_table_list(?) WHERE schema='temp' LIMIT 1",build.table).toArray();
-      if(shadow.length)deny('temporary index source is not supported');
       let facts=this.indexFactsEnabled?this.indexFacts.get(foldSqlIdentifier(build.table)):undefined;
       if(!facts){
         // Exact-name metadata returns at most one index column, even for a
@@ -511,10 +516,13 @@ export class RowBudget {
       const table = '"main"."' + build.table.replaceAll('"', '""') + '"';
       const source = sql.exec(`SELECT 1 FROM ${table} NOT INDEXED LIMIT ?`, cap + 1).toArray();
       if (source.length > cap) deny('index source exceeds bounded migration allowance');
-      if(build.predicate) {
+      if(build.predicate && source.length>partialWriteCap) {
         // A partial index reads every source row but writes only matching
         // entries. Prove BOTH dimensions before DDL: sparse job credentials
         // may have a large retained non-job history and only a few entries.
+        // The same-call complete source is already an upper bound on its
+        // matches. Only a source larger than the write cap needs this second
+        // proof; no source count/absence is cached.
         // The source bound above makes this unindexed predicate probe finite.
         const matching=sql.exec(`SELECT 1 FROM ${table} NOT INDEXED WHERE ${build.predicate} LIMIT ?`,partialWriteCap+1).toArray();
         if(matching.length>partialWriteCap) deny('partial index entries exceed bounded migration allowance');

@@ -14,8 +14,10 @@ function dueSql(j:string):string {
       AND l.holder_job_id=${j}.id AND l.epoch=${j}.lease_epoch) END AS INTEGER)`;
 }
 function payloadSql(j:string):string {
-  return `json_object('entity_id',${j}.id,'source_generation',json_array(${j}.status,${j}.lease_epoch,${j}.started_at,${j}.role_name,
-    CASE WHEN ${j}.kind='root-run' THEN (SELECT enabled FROM root_scheduling WHERE id=1) END))`;
+  const fields=`${j}.status,${j}.lease_epoch,${j}.started_at,${j}.role_name`;
+  return `json_object('entity_id',${j}.id,'source_generation',CASE WHEN ${j}.kind='root-run'
+    THEN json_array(${fields},(SELECT enabled FROM root_scheduling WHERE id=1),(SELECT generation FROM job_background_root_generation WHERE id=1))
+    ELSE json_array(${fields},NULL) END)`;
 }
 function refreshJob(id:string):string {
   const due=dueSql('j');
@@ -28,6 +30,10 @@ function refreshJob(id:string):string {
       WHERE hub_background_work.token IS NULL AND (hub_background_work.source_due_ms IS NOT excluded.source_due_ms OR hub_background_work.payload IS NOT excluded.payload);`;
 }
 export function initJobBackgroundProducers(sql:SqlStorage,enqueue:(intent:BackgroundIntent)=>unknown):void {
+  sql.exec('CREATE TABLE IF NOT EXISTS job_background_root_generation(id INTEGER PRIMARY KEY CHECK(id=1),generation INTEGER NOT NULL)');
+  sql.exec('INSERT OR IGNORE INTO job_background_root_generation VALUES(1,0)');
+  sql.exec(`CREATE TRIGGER IF NOT EXISTS hub_background_job_root_generation BEFORE UPDATE OF enabled ON root_scheduling
+    WHEN NEW.enabled IS NOT OLD.enabled BEGIN UPDATE job_background_root_generation SET generation=generation+1 WHERE id=1; END`);
   sql.exec('CREATE TABLE IF NOT EXISTS job_background_seed(id INTEGER PRIMARY KEY CHECK(id=1),done INTEGER NOT NULL)');
   for(const op of ['INSERT','UPDATE OF status,offer_expires_at,deadline_at,started_at,role_name,lease_epoch'])
     sql.exec(`CREATE TRIGGER IF NOT EXISTS hub_background_job_${op==='INSERT'?'insert':'update'} AFTER ${op} ON jobs BEGIN ${refreshJob('NEW.id')} END`);
@@ -38,11 +44,16 @@ export function initJobBackgroundProducers(sql:SqlStorage,enqueue:(intent:Backgr
   sql.exec(`CREATE TRIGGER IF NOT EXISTS hub_background_lease_delete AFTER DELETE ON leases BEGIN ${refreshJob('OLD.holder_job_id')} END`);
   // Flag updates are explicit user mutations. The active population was
   // proven <=128 by restoration; LIMIT129 still bounds corrupt legacy data.
-  sql.exec(`CREATE TRIGGER IF NOT EXISTS hub_background_job_root_flag AFTER UPDATE OF enabled ON root_scheduling BEGIN
+  // Root toggles must not depend on optional expression indexes. The
+  // deployed partial offer index bounds the COMPLETE active source first.
+  sql.exec(`CREATE TRIGGER IF NOT EXISTS hub_background_job_root_flag_bound BEFORE UPDATE OF enabled ON root_scheduling WHEN NEW.enabled=1 AND NEW.enabled IS NOT OLD.enabled BEGIN
+    SELECT CASE WHEN (SELECT COUNT(*) FROM(SELECT 1 FROM jobs INDEXED BY jobs_offered WHERE status='offered' ORDER BY offer_expires_at LIMIT 129))>128
+      THEN RAISE(ABORT,'background_job_observation_limit') END; END`);
+  sql.exec(`CREATE TRIGGER IF NOT EXISTS hub_background_job_root_flag AFTER UPDATE OF enabled ON root_scheduling WHEN NEW.enabled=1 AND NEW.enabled IS NOT OLD.enabled BEGIN
     INSERT INTO hub_background_work(id,kind,due_ms,payload,source_due_ms)
       SELECT 'job-deadline:'||j.id,'job-deadline',${dueSql('j')},${payloadSql('j')},${dueSql('j')}
-      FROM jobs j INDEXED BY jobs_root_offered_due_ms WHERE j.status='offered' AND j.kind='root-run'
-      ORDER BY ${expiryMsSql('j.offer_expires_at')} LIMIT 129
+      FROM (SELECT id FROM jobs INDEXED BY jobs_offered WHERE status='offered' ORDER BY offer_expires_at LIMIT 129) raw
+      CROSS JOIN jobs j ON j.id=raw.id WHERE j.kind='root-run' ORDER BY ${expiryMsSql('j.offer_expires_at')} LIMIT 129
       ON CONFLICT(id) DO UPDATE SET due_ms=excluded.due_ms,source_due_ms=excluded.source_due_ms,payload=excluded.payload,token=NULL,attempts=0 WHERE hub_background_work.token IS NULL AND (hub_background_work.source_due_ms IS NOT excluded.source_due_ms OR hub_background_work.payload IS NOT excluded.payload); END`);
   if(sql.exec('SELECT done FROM job_background_seed WHERE id=1').toArray()[0]?.done)return;
   const ids=new Set<string>();

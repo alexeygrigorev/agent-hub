@@ -42,7 +42,14 @@ describe('legacy optional metadata uses point-owned sidecars',()=>{
   (s.a as any).reconcileMeta(72,{last_reconcile_run:'kept',last_reconcile_at:now});(s.a as any).reconcileMeta(12);
   expect((s.a as any).meta()).toMatchObject({reconcile_cursor:72,last_reconcile_run:'kept'});
   expect(()=>tx(()=>{(s.a as any).reconcileMeta(99,{last_reconcile_run:'rolled back'});throw new Error('rollback-metadata');})).toThrow('rollback-metadata');
-  const cold=services().a;cold.init();expect((cold as any).meta()).toMatchObject({reconcile_cursor:72,last_reconcile_run:'kept'});
+  // A separate reader/writer over initialized legacy schema retains the old
+  // contract: it need not rerun init() or rewrite metadata to use cursors.
+  const cold=services().a;expect((cold as any).meta()).toMatchObject({reconcile_cursor:72,last_reconcile_run:'kept'});
+  (cold as any).reconcileMeta(73);expect((services().a as any).meta().reconcile_cursor).toBe(73);
+  new MetadataCompat(h.sql,'ask_meta',['reconcile_cursor']);
+  expect((services().a as any).meta()).toMatchObject({reconcile_cursor:73,last_reconcile_run:'kept'});
+  new MetadataCompat(h.sql,'ask_meta',['reconcile_cursor','last_reconcile_run','last_reconcile_at'],'gap_scope');
+  expect((services().a as any).meta()).toMatchObject({reconcile_cursor:73,last_reconcile_run:'kept'});
  }));
  it('preserves explicit null, caps encoded bytes before effects and keeps sidecar fields atomic with caller transactions',()=>fixture(({h,seed,tx}:any)=>{
   seed.exec('CREATE TABLE legacy_optional(id INTEGER PRIMARY KEY,old_flag TEXT)');seed.exec("INSERT INTO legacy_optional VALUES(1,'kept')");

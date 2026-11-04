@@ -54,6 +54,8 @@ describe('index migration cost preflight', () => {
     const budget=new RowBudget(new LedgerStore());await budget.begin(true);
     const observed=observe(raw),sql=budget.wrap(observed.sql),before=budget.status().available;
     sql.exec('CREATE INDEX sparse_live ON sparse_source(value) WHERE value<=5 /* internal */ AND id>0; -- trailing comment').toArray();
+    expect(observed.calls.filter(call=>/^SELECT 1 FROM/.test(call.query))).toHaveLength(1);
+    expect(observed.calls.some(call=>/^SELECT 1 FROM.* NOT INDEXED WHERE /.test(call.query))).toBe(false);
     const after=budget.status().available;
     expect(before.read-after.read).toBe(observed.calls.reduce((n,c)=>n+Number(c.cursor.rowsRead),0));
     expect(before.written-after.written).toBe(observed.calls.reduce((n,c)=>n+Number(c.cursor.rowsWritten),0));
@@ -61,6 +63,17 @@ describe('index migration cost preflight', () => {
     expect(before.written-after.written).toBeLessThan(20);
     expect(budget.status().stopped).toBe(false);
     console.log('sparse partial index: source=500 entries=5 rows_read='+(before.read-after.read)+' rows_written='+(before.written-after.written));
+  }));
+
+  it('still probes predicate matches when the complete source exceeds the write cap', () => nativeCase(async raw => {
+    fixture(raw,'larger_sparse_source',1500);
+    const budget=new RowBudget(new LedgerStore());await budget.begin(true);
+    const observed=observe(raw),sql=budget.wrap(observed.sql);
+    sql.exec('CREATE INDEX larger_sparse_live ON larger_sparse_source(value) WHERE value<=5').toArray();
+    expect(observed.calls.filter(call=>/^SELECT 1 FROM/.test(call.query))).toHaveLength(2);
+    expect(observed.calls.some(call=>/^SELECT 1 FROM.* NOT INDEXED WHERE /.test(call.query))).toBe(true);
+    expect(raw.exec("SELECT name FROM pragma_index_list('larger_sparse_source','main') WHERE name='larger_sparse_live'").toArray()).toHaveLength(1);
+    expect(budget.status().stopped).toBe(false);
   }));
 
   it('refuses a partial index whose matching write set exceeds the hard build cap', () => nativeCase(async raw => {
@@ -86,15 +99,52 @@ describe('index migration cost preflight', () => {
     expect(budget.status().stopped).toBe(false);
   }));
 
-  it('refuses a TEMP-shadowed source before relying on any MAIN index proof', async () => {
+  it('binds native execution to MAIN despite a large TEMP shadow and preserves lexical text', () => nativeCase(async raw => {
+    fixture(raw,'main_bound_source',3);
+    let temp=false;
+    try{raw.exec('CREATE TEMP TABLE main_bound_source(id INTEGER PRIMARY KEY,value INTEGER)');temp=true;}
+    catch(error){expect(String(error)).toMatch(/not authorized|SQLITE_AUTH|not supported/i);}
+    if(temp)raw.exec(`WITH RECURSIVE n(i) AS(VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<2100) INSERT INTO temp.main_bound_source SELECT i,i FROM n`);
     const budget=new RowBudget(new LedgerStore());await budget.begin(true);
-    const queries:string[]=[];
-    const native={exec(query:string){queries.push(query);return {rowsRead:1,rowsWritten:0,
-      *[Symbol.iterator](){yield {cid:0};}};}};
-    expect(()=>budget.wrap(native as any).exec('CREATE INDEX IF NOT EXISTS existing_main_index ON shadowed_source(id)'))
-      .toThrow(RowBudgetExceeded);
-    expect(queries).toEqual(["SELECT schema FROM pragma_table_list(?) WHERE schema='temp' LIMIT 1"]);
-    expect(budget.status().stopped).toBe(true);
+    const observed=observe(raw),sql=budget.wrap(observed.sql);
+    const original="/* before */ CREATE /* index */ INDEX IF NOT EXISTS [main_bound_index] ON main_bound_source(value+length('CREATE INDEX temp.fake ON source(x)')); -- tail";
+    sql.exec(original).toArray();
+    const native=observed.calls.find(call=>call.query.includes('CREATE /* index */ INDEX'))!.query;
+    expect(native).toBe("/* before */ CREATE /* index */ INDEX IF NOT EXISTS \"main\".[main_bound_index] ON main_bound_source(value+length('CREATE INDEX temp.fake ON source(x)'))");
+    expect(observed.calls.some(call=>/pragma_table_list/.test(call.query))).toBe(false);
+    expect(raw.exec("SELECT name FROM pragma_index_list('main_bound_source','main') WHERE name='main_bound_index'").toArray()).toHaveLength(1);
+    if(temp){
+      expect(raw.exec("SELECT name FROM pragma_index_list('main_bound_source','temp') WHERE name='main_bound_index'").toArray()).toHaveLength(0);
+      raw.exec('CREATE INDEX temp.main_bound_index ON main_bound_source(value)');
+    }
+    const repeatedAt=observed.calls.length;
+    sql.exec('CREATE INDEX IF NOT EXISTS main.main_bound_index ON main_bound_source(value)').toArray();
+    expect(observed.calls.slice(repeatedAt).some(call=>/^SELECT 1 FROM/.test(call.query))).toBe(false);
+    expect(observed.calls.at(-1)!.query).toBe('CREATE INDEX IF NOT EXISTS main.main_bound_index ON main_bound_source(value)');
+    expect(budget.status().stopped).toBe(false);
+  }));
+
+  it('does not let a tiny TEMP source or TEMP index excuse a large MAIN build', () => nativeCase(async raw => {
+    fixture(raw,'main_large_shadow',INDEX_BUILD_SOURCE_LIMIT+5);
+    let temp=false;
+    try{raw.exec('CREATE TEMP TABLE main_large_shadow(id INTEGER PRIMARY KEY,value INTEGER)');temp=true;}
+    catch(error){expect(String(error)).toMatch(/not authorized|SQLITE_AUTH|not supported/i);}
+    if(temp){raw.exec('INSERT INTO temp.main_large_shadow VALUES(1,1)');raw.exec('CREATE INDEX temp.main_large_guard ON main_large_shadow(value)');}
+    const budget=new RowBudget(new LedgerStore());await budget.begin(true);
+    const observed=observe(raw),sql=budget.wrap(observed.sql);
+    expect(()=>sql.exec('CREATE INDEX IF NOT EXISTS main_large_guard ON main_large_shadow(value)')).toThrow(RowBudgetExceeded);
+    expect(observed.calls.some(call=>/CREATE INDEX/.test(call.query))).toBe(false);
+    expect(observed.calls.some(call=>call.query.includes('FROM "main"."main_large_shadow" NOT INDEXED'))).toBe(true);
+    expect(raw.exec("SELECT name FROM pragma_index_list('main_large_shadow','main') WHERE name='main_large_guard'").toArray()).toHaveLength(0);
+  }));
+
+  it('never permits an explicitly TEMP-qualified build', async () => {
+    for(const query of ['CREATE INDEX temp.forbidden ON source(value)','CREATE INDEX forbidden ON temp.source(value)']) {
+      const budget=new RowBudget(new LedgerStore());await budget.begin(true);
+      const queries:string[]=[],native={exec(q:string){queries.push(q);throw new Error('must not execute');}};
+      expect(()=>budget.wrap(native as any).exec(query)).toThrow(RowBudgetExceeded);
+      expect(queries).toEqual([]);expect(budget.status().stopped).toBe(true);
+    }
   });
 
   it('uses one live exact-name proof for an expression index without scanning its source', () => nativeCase(async raw => {

@@ -221,9 +221,12 @@ export class AskLedger {
     }
   }
   private rows(q: string, ...a: any[]): Obj[] { return this.sql.exec(q, ...a).toArray() as Obj[]; }
-  private meta(): Obj { return this.metadata.read(1); }
+  private compatibleMeta():MetadataCompat {
+    return this.metadata??=MetadataCompat.forInitializedSchema(this.sql,'ask_meta',['reconcile_cursor','last_reconcile_run','last_reconcile_at']);
+  }
+  private meta(): Obj { return this.compatibleMeta().read(1); }
   private reconcileMeta(cursor:number,extra:Obj={}) {
-    this.tx(()=>this.metadata.patch(1,{...extra,reconcile_cursor:Math.max(Number(this.meta().reconcile_cursor??0),cursor)}));
+    this.tx(()=>this.compatibleMeta().patch(1,{...extra,reconcile_cursor:Math.max(Number(this.meta().reconcile_cursor??0),cursor)}));
   }
   /** Every intake: only for the operator-run check (history backfill maps to closed intakes). */
   private tasks(): Obj[] {
