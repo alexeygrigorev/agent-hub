@@ -200,10 +200,7 @@ class PhysicalResourceTest(unittest.TestCase):
             self.assertFalse(ready)
             self.assertEqual(reason, 'host_physical_resources_unknown')
 
-    def test_available_memory_reads_proc(self):
-        if os.name == 'nt':
-            self.skipTest('posix procfs reading')
-            return
+    def test_available_memory_reads_host_platform(self):
         value = nl.available_memory_mb()
         self.assertIsInstance(value, int)
         self.assertGreater(value, 0)
