@@ -60,6 +60,16 @@ test('stale host resource snapshot holds admission, missing snapshot fails close
  outcome=await admitLaunch(z.env,input);
  assert.equal(outcome.ok,false,'a non-positive snapshot is unknown, never capacity');
  if(!outcome.ok)assert.equal(outcome.code,'host_resources_unknown');
+ const fut=setup();fut.machine.resources={mem_available_mb:42000,observed_at:Date.now()+60_000};
+ outcome=await admitLaunch(fut.env,input);
+ assert.equal(outcome.ok,false,'a future-dated snapshot is unverified, never trusted');
+ if(!outcome.ok)assert.equal(outcome.code,'host_resources_stale');
+ const skew=setup();skew.machine.resources={mem_available_mb:42000,observed_at:Date.now()+1_000};
+ assert.equal((await admitLaunch(skew.env,input)).ok,true,'sub-tolerance clock skew admits');
+ const bad=setup();bad.machine.resources={mem_available_mb:42000,observed_at:Number.NaN};
+ outcome=await admitLaunch(bad.env,input);
+ assert.equal(outcome.ok,false,'a malformed timestamp is unknown');
+ if(!outcome.ok)assert.equal(outcome.code,'host_resources_unknown');
 });
 test('goal preflight and override reason cannot bypass real capabilities or host approval',async()=>{
  let f=setup();

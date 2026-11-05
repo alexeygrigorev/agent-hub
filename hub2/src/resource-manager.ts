@@ -39,13 +39,17 @@ const HOST_RESOURCE_TTL_MS=120_000;
 /**
  * Host snapshot classification. Fail closed: a missing snapshot is unknown
  * (hosts must heartbeat resources before admission passes), a stale snapshot
- * is unverified, and a non-positive reading is unusable. Only a fresh,
- * positive snapshot admits.
+ * is unverified, a non-positive reading is unusable, a malformed timestamp is
+ * unknown, and a future-dated snapshot beyond small clock-skew tolerance is
+ * unverified rather than trusted. Only a fresh, positive, properly dated
+ * snapshot admits.
  */
+const HOST_RESOURCE_FUTURE_TOLERANCE_MS=2_000;
 function hostHold(resources:MachineView['resources'],now:number):{code:HoldKind;retry_at:number|null}|null{
   if(!resources)return{code:'host_resources_unknown',retry_at:now+REFRESH_BACKOFF_MS};
   if(!Number.isFinite(resources.mem_available_mb)||resources.mem_available_mb<=0)return{code:'host_resources_unknown',retry_at:now+REFRESH_BACKOFF_MS};
-  if(now-resources.observed_at>HOST_RESOURCE_TTL_MS)return{code:'host_resources_stale',retry_at:now+REFRESH_BACKOFF_MS};
+  if(!Number.isSafeInteger(resources.observed_at))return{code:'host_resources_unknown',retry_at:now+REFRESH_BACKOFF_MS};
+  if(resources.observed_at>now+HOST_RESOURCE_FUTURE_TOLERANCE_MS||now-resources.observed_at>HOST_RESOURCE_TTL_MS)return{code:'host_resources_stale',retry_at:now+REFRESH_BACKOFF_MS};
   return null;
 }
 
