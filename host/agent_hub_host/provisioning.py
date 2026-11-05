@@ -2919,10 +2919,25 @@ def admission():
                 text = ''
             profile_missing = expected_header not in text
 
+    stamp_sent_mono = time.monotonic()
     try:
         result = host_request('POST', '/api/engines/admission', {'label': label})
     except Exception:
         result = {'launch_allowed': False, 'profile_supported': False, 'account_label': label, 'reason': 'hub_unreachable'}
+    else:
+        # Measured, credential-free gate evidence (intake 06728269 AC1): the
+        # gate duration after the Hub stamp (POST send to verdict receipt) and
+        # the host-vs-Hub clock offset at receipt (host wall minus Hub stamp,
+        # includes the one-way transit). fleet.py mirrors the Hub's 30 s claim
+        # window from these measurements instead of trusting the wall age,
+        # which a skewed host clock shifts in both directions.
+        result['gate_post_stamp_s'] = round(time.monotonic() - stamp_sent_mono, 3)
+        try:
+            stamp = dt.datetime.fromisoformat(str(result.get('observed_at')).replace('Z', '+00:00'))
+            result['gate_stamp_offset_s'] = round(
+                (dt.datetime.now(dt.timezone.utc) - stamp).total_seconds(), 3)
+        except (AttributeError, TypeError, ValueError):
+            pass
 
     stamp_received = time.monotonic()
     try:

@@ -997,6 +997,21 @@ describe('generic accounts and launch placement', () => {
     if (status === 200) expect(JSON.parse(String(stored))).toEqual(diagnostic);
     else expect(stored).toBeNull();
   }));
+  it('stores bounded numeric admission stamp evidence on admission_refused (intake 06728269)', async () => fixture(async (s, sql) => {
+    await configure(s);
+    const evidence = { gate_stamp_age_s: -40.002, gate_duration_s: 1.234, gate_post_stamp_s: 0.05, gate_stamp_offset_s: -39.9 };
+    const base = { reason: 'admission_refused', message: ADMISSION_MESSAGE, stage: 'dispatch_route', error_type: 'AdmissionRefusedError', gate_reason: 'admission_timestamp_stale' };
+    const launch: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    const res = await s.handle(request('/launches/' + launch.id + '/reject', { reason: base.reason, diagnostic: { ...base, ...evidence } }), host('hetzner'));
+    expect(res.status).toBe(200);
+    expect(JSON.parse(String(sql.exec('SELECT launch_error_json FROM fleet_launches WHERE id = ?', launch.id).one().launch_error_json))).toEqual({ ...base, ...evidence });
+    const refused: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    for (const bad of [{ gate_stamp_age_s: 'x' }, { gate_stamp_age_s: 1e9 }, { gate_post_stamp_s: Number.NaN }, { gate_stamp_offset_s: true }]) {
+      const res = await s.handle(request('/launches/' + refused.id + '/reject', { reason: base.reason, diagnostic: { ...base, ...bad } }), host('hetzner'));
+      expect(res.status).toBe(400);
+      expect(sql.exec('SELECT launch_error_json FROM fleet_launches WHERE id = ?', refused.id).one().launch_error_json).toBeNull();
+    }
+  }));
   it('retains a stale claim cause across service restart and safely retries the same offer', async () => fixture(async (s, sql) => {
     await configure(s);
     const launch: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
