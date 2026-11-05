@@ -92,7 +92,7 @@ export class MachineDO {
     this.db = new MeteredDb(ctx.storage.sql);
     this.sqlReceipts = new SqlReceiptMeter(this.db);
     this.env = wrapSqlNamespaces(env, this.sqlReceipts) as Hub2Env;
-    initializeSchema(ctx, this.db, 4, LATEST_SCHEMA, [[SCHEMA[0]],COMPACT_KEYS,['ALTER TABLE machine_capabilities ADD COLUMN resources_json TEXT']],()=>this.scheduleNext(),3);
+    initializeSchema(ctx, this.db, 4, LATEST_SCHEMA, [[SCHEMA[0]],COMPACT_KEYS,['ALTER TABLE machine_capabilities ADD COLUMN resources_json TEXT']],()=>this.scheduleNext(),4);
     this.constructorMs = performance.now() - started;
   }
 
