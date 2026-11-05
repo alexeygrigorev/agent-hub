@@ -33,7 +33,7 @@ export default { async fetch(request, env) {
 `;
 const bundle = await build({
   stdin: { contents: fixture, resolveDir: hub2, sourcefile: 'budget-entry.ts', loader: 'ts' },
-  bundle: true, write: false, format: 'esm', platform: 'browser', external: ['cloudflare:workers'],
+  bundle: true, write: false, format: 'esm', platform: 'browser', external: ['cloudflare:workers', 'node:async_hooks'],
 });
 await mkdir(resolve(root, '.local/tmp'), { recursive: true });
 const persist = await mkdtemp(resolve(root, '.local/tmp/hub2-budget-workerd-'));
@@ -42,7 +42,7 @@ const options = convertV4MiniflareOptions({
   log: new Log(LogLevel.ERROR),
   workers: [{
     name: 'hub2-budget-ledger-fixture', script: bundle.outputFiles[0].text,
-    modules: true, compatibilityDate: '2024-04-05',
+    modules: true, compatibilityDate: '2024-04-05', compatibilityFlags: ['nodejs_als'],
     durableObjects: { BUDGETS: { className: 'BudgetDO', useSQLite: true } },
   }],
 });

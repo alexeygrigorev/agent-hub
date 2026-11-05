@@ -80,7 +80,7 @@ async function driveDueAlarms(){
 async function measure(name,fn){
  console.error('normal-day phase start: '+name);
  nativeTelemetry.setPhase('observer_before:'+name);const before=await snapshot(),queriesBefore=await querySnapshot();await telemetryBarrier();
- nativeTelemetry.setPhase(name);try{await fn();if(name!=='completed_steady_idle')await driveDueAlarms();}catch(e){errors.push({flow:name,error:String(e.stack)});}await telemetryBarrier();const native=nativeTelemetry.phase(name);
+ nativeTelemetry.setPhase(name);try{await fn();if(name!=='completed_steady_idle')await driveDueAlarms();}catch(e){const failure={flow:name,error:String(e.stack)};errors.push(failure);console.error('normal-day failure: '+JSON.stringify(failure));}await telemetryBarrier();const native=nativeTelemetry.phase(name);
  nativeTelemetry.setPhase('observer_after:'+name);const after=await snapshot(),queriesAfter=await querySnapshot();await telemetryBarrier();
  console.error('normal-day phase finished: '+name+' '+(native.reads+native.writes)+' SQL rows');
  flows.push({name,...nativeCounts(native),snapshot_diagnostic:difference(before,after),queries:queryDifference(queriesBefore,queriesAfter),observer_costs:{before:nativeCounts(nativeTelemetry.phase('observer_before:'+name)),after:nativeCounts(nativeTelemetry.phase('observer_after:'+name))}});
@@ -265,6 +265,7 @@ try{
  });
  await measure('completed_steady_idle',async()=>{await new Promise(r=>setTimeout(r,50));});
  const idle=flows.at(-1);assert.equal(idle.combined_rows,0,'idle SQL must be zero');assert.equal(idle.alarm_operations,0,'idle alarm work must be zero');
+ console.error('normal-day collecting final profiles');
  const profiles={},storage_profiles={};for(const[kind,id]of objects){const d=expect(await fixture(kind,id,'profile'),200,'profile');profiles[kind+':'+id]=d.profile;storage_profiles[kind+':'+id]=d.storage;}
  const final=await snapshot();await telemetryBarrier();const sourceAfter=await hashes(),stable=JSON.stringify(sourceBefore)===JSON.stringify(sourceAfter);
  const telemetry=nativeTelemetry.report();const total=Object.values(telemetry.phases).reduce((n,f)=>n+f.reads+f.writes,0),alarm_operations=Object.values(telemetry.phases).reduce((n,f)=>n+Object.values(f.storage).reduce((m,c)=>m+c.succeeded+c.failed,0),0);
@@ -276,6 +277,8 @@ try{
   report.passed=false;report.canonical_passed=false;
   report.runtime_assumptions={cpu_upper_ms:Number(process.env.HUB2_COST_HTTP_CPU_MS),settle_deadline_ms:Number(process.env.HUB2_COST_HTTP_CPU_MS)===100?200:500,post_settle_gb_ms:Number(process.env.HUB2_COST_HTTP_CPU_MS)===100?160:512,http_only:true,production_cpu_enforcement_verified:false,acceptance:'Conditional fixture comparison only; source adapter supplies CPU/HTTP eligibility assumptions. Production runtime canary and final exact-source gate required.'};
  }
- if(process.env.HUB2_NORMAL_DAY_REPORT)await writeFile(process.env.HUB2_NORMAL_DAY_REPORT,JSON.stringify(report,null,2)+'\n');
+ const reportPath=process.env.HUB2_NORMAL_DAY_REPORT||resolve(persist,'normal-day-report.json');
+ await writeFile(reportPath,JSON.stringify(report,null,2)+'\n');
+ console.error(JSON.stringify({gate:'normal-day-summary',report_path:reportPath,passed:report.passed,source_stable:stable,coverage,missing,errors,budget_status:budgetStatus}));
  console.log(JSON.stringify(report));if(!report.passed)process.exitCode=1;
-}finally{await mf.dispose();}
+}catch(error){console.error('normal-day fatal: '+(error?.stack||String(error)));throw error;}finally{await mf.dispose();}
