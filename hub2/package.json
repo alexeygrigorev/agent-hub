@@ -9,6 +9,7 @@
     "test:accounts-mail": "node --experimental-transform-types tests/run-accounts-mail.mjs",
     "test:account-provider-timeout": "node --experimental-transform-types tests/run-account-provider-timeout.mjs",
     "test:project-work": "node --experimental-transform-types tests/run-project-work.mjs",
+    "test:auto-policy": "node --experimental-transform-types tests/run-auto-policy.mjs",
     "test:project-intake": "node --experimental-transform-types tests/run-project-intake.mjs",
     "test:read-cache": "node --experimental-transform-types tests/run-read-cache.mjs",
     "test:db-metering": "node --experimental-transform-types tests/run-db-metering.mjs",
