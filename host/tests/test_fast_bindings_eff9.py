@@ -305,7 +305,7 @@ class CensusIsolationTests(unittest.TestCase):
                     contextlib.redirect_stdout(out):
                 dispatcher.report_native_bindings()
             events = [json.loads(line) for line in out.getvalue().splitlines() if line.startswith('{')]
-            self.assertIn({'event': 'bindings_skipped', 'skipped': [{'session': 'hub-sess', 'reason': 'worktree_lock_held'}]}, events)
+            self.assertIn({'event': 'bindings_skipped', 'skipped': [{'session': 'hub-sess', 'reason': 'worktree_lock_refused'}]}, events)
             real = dispatcher.request
 
             def refuse(method, path, body=None):

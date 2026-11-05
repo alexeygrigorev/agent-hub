@@ -828,15 +828,22 @@ def cleanup_permitted(row: Any, request: Callable, git_bin: str = "git") -> bool
 
 
 def protect_adoption(row: dict, session: dict, git_bin: str = "git",
-                     *, request: Optional[Callable] = None) -> bool:
-    """Lock actual adopted native binding; never invent pre-start evidence."""
+                     *, request: Optional[Callable] = None,
+                     owner_terminal: Optional[Callable[[str], bool]] = None) -> bool:
+    """Lock an observed native binding with the launch's lock proof.
+
+    Dispatch and binding must agree on same-intake predecessor reuse. A
+    native already started under that proof must not remain unbound because
+    this later check omitted it.
+    """
     path = row.get("cwd") or row.get("workspace")
     if not isinstance(path, str) or not os.path.isdir(path):
         return False
     expected = expected_repository(row)
     if expected and expected.get("repository") != repository_identity(path, git_bin):
         return False
-    if not protect_bound_worktree(git_bin, path, session.get("id"), session.get("intake_task_id")):
+    if not protect_bound_worktree(git_bin, path, session.get("id"), session.get("intake_task_id"),
+                                  owner_terminal=owner_terminal):
         # The launch can legitimately retain its stopped predecessor's lock.
         # Binding must consume the same authenticated same-intake proof too;
         # otherwise a running successor remains permanently unbound.

@@ -95,7 +95,11 @@ def test_run_json_forwards_env_to_popen_and_skips_native_client():
 
 def test_only_headless_launcher_run_site_uses_launcher_env():
     src = Path(fleet.__file__).read_text(encoding="utf-8")
-    assert 'self._launcher_run(argv, cwd=cwd, timeout=120) if mode == "headless"' in src
+    assert """interactive_effect_invoked = True
+                native_start_invoked = True
+                receipt = self.runner(argv, cwd=cwd, timeout=120)
+            else:
+                receipt = self._launcher_run(argv, cwd=cwd, timeout=120)""" in src
     for site in ('self._launcher_run(submit_argv, cwd=launcher["root"])',
                  'self._launcher_run(reconcile_argv, cwd=launcher["root"])',
                  'self._preclaim_check(offer_id, self._launcher_run, prefix + ["plan", "--id", task_id]'):

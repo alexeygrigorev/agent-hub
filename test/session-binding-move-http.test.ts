@@ -40,6 +40,8 @@ async function fixture(fn: (service: SessionControlService, sql: any) => Promise
         sessionId, JSON.stringify({ workspace: 'demo', intake_task_id: FIXTURE_INTAKE_ID }), launchId, JSON.stringify(prior), at, at);
       sql.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,workspace,cwd,created_at_ms)
         VALUES ('host',?,?,'codex','running',?,?,?,?)`, nativeId, tag, at, workspace, workspace, created);
+      sql.exec(`INSERT INTO fleet_catalog_census(machine_id,observed_at,complete) VALUES ('host',?,1)
+        ON CONFLICT(machine_id) DO UPDATE SET observed_at=excluded.observed_at,complete=1`, at);
       sql.exec(`INSERT INTO intake_worktrees(id,task_id,machine,path,created_at,updated_at,origin,state)
         VALUES ('tree',?,'host',?,?,?,'hub_started','active')`, FIXTURE_INTAKE_ID, workspace, now, now);
       await fn(service, sql);

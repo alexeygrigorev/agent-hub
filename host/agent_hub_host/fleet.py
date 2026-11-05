@@ -2034,6 +2034,56 @@ class Dispatcher:
         from .terminal_reports import persist
         persist(self, record)
 
+    def _record_interactive_no_start(self, offer_id, workspace, target_cwd, error_type):
+        """Report a claimed interactive start that never invoked aplexer start.
+
+        This proof is distinct from an absent catalog row: the dispatcher knows
+        the native start command was never called. Persist it before the Hub
+        request so a lost reply can be retried without starting a second native.
+        """
+        reason = 'launcher_not_started'
+        diagnostic = {
+            'reason': reason,
+            'message': 'The interactive native start command was not invoked.',
+            'error_type': error_type if isinstance(error_type, str) and re.fullmatch(r'[A-Za-z]{1,64}', error_type) else 'Error',
+            'stage': 'dispatch_interactive',
+        }
+        record = {
+            'offer_id': offer_id,
+            'task_id': 'hub-' + offer_id,
+            'mode': 'interactive',
+            'state': 'interactive_not_started',
+            'native_start_invoked': False,
+            'workspace': str(workspace),
+            'target_cwd': str(target_cwd),
+            'reason': reason,
+            'diagnostic': diagnostic,
+            'settled': False,
+        }
+        self._active_launches[offer_id] = record
+        try:
+            self._persist_launch_record(record)
+        except Exception:
+            # The current process may still send the fenced receipt, but this
+            # volatile evidence cannot authorize a retry after restart.
+            pass
+        try:
+            ack = self.request('POST', '/api/fleet/launches/' + offer_id + '/result', {
+                'state': 'failed', 'launcher_task_id': record['task_id'],
+                'confirmed_exit': True, 'reason': reason, 'diagnostic': diagnostic,
+            })
+            if isinstance(ack, dict) and ack.get('id') == offer_id and ack.get('state') == 'failed':
+                record['settled'] = True
+                try:
+                    self._persist_launch_record(record)
+                except Exception:
+                    pass
+                return {'id': offer_id, 'state': 'failed', 'reason': reason, 'diagnostic': diagnostic}
+        except Exception:
+            pass
+        return {'id': offer_id, 'state': 'uncertain',
+                'reason': 'interactive_no_start_receipt_pending', 'diagnostic': diagnostic}
+
     def _load_pending_launches_from_journal(self) -> None:
         jdir = self._journal_launches_dir()
         if not jdir or not jdir.is_dir():
@@ -2062,6 +2112,17 @@ class Dispatcher:
                             and data.get("mode") == "headless"
                             and isinstance(data.get("reason"), str)
                             and data["reason"].startswith("launcher_")):
+                        self._active_launches[offer_id] = data
+                    continue
+                if data.get('state') == 'interactive_not_started':
+                    offer_id = data.get('offer_id')
+                    if (isinstance(offer_id, str) and LABEL.fullmatch(offer_id)
+                            and entry.name == f'{offer_id}.json'
+                            and data.get('task_id') == f'hub-{offer_id}'
+                            and data.get('mode') == 'interactive'
+                            and data.get('native_start_invoked') is False
+                            and data.get('reason') == 'launcher_not_started'
+                            and not any(data.get(k) for k in ('native_id', 'tag', 'incarnation'))):
                         self._active_launches[offer_id] = data
                     continue
                 if data.get("state") != "running" and not late:
@@ -2602,6 +2663,27 @@ class Dispatcher:
                 except Exception:
                     pass  # Keep the durable cleanup marker for the next cycle.
                 continue
+            if record.get('state') == 'interactive_not_started':
+                if (record.get('mode') != 'interactive'
+                        or record.get('task_id') != f'hub-{offer_id}'
+                        or record.get('native_start_invoked') is not False
+                        or record.get('reason') != 'launcher_not_started'
+                        or any(record.get(k) for k in ('native_id', 'tag', 'incarnation'))):
+                    continue
+                try:
+                    ack = self.request('POST', '/api/fleet/launches/' + offer_id + '/result', {
+                        'state': 'failed', 'launcher_task_id': record['task_id'],
+                        'confirmed_exit': True, 'reason': record['reason'],
+                        'diagnostic': record.get('diagnostic'),
+                    })
+                    if not (isinstance(ack, dict) and ack.get('id') == offer_id and ack.get('state') == 'failed'):
+                        continue
+                    record['settled'] = True
+                    self._persist_launch_record(record)
+                    reconciled.append({'id': offer_id, 'state': 'failed', 'reason': record['reason']})
+                except Exception:
+                    pass
+                continue
             if record.get("state") == "not_started":
                 try:
                     # Repeat the fenced proof, including after process restart.
@@ -2923,18 +3005,11 @@ class Dispatcher:
                 raise ValueError("worktree_lock_failed: missing canonical session identity") from None
             if not guard.remember_repository(offer.get("id"), str(target_path)):
                 raise ValueError("worktree_identity_failed: original repository could not be recorded")
-        def owner_terminal(owner_id):
-            try:
-                fact = self.request('GET', '/api/fleet/worktree-owner/' + owner_id)
-                return (isinstance(fact, dict) and fact.get('session_id') == owner_id
-                        and fact.get('terminal') is True
-                        and fact.get('intake_id') == offer.get('intake_task_id'))
-            except Exception:
-                return False
         if not guard.protect_bound_worktree("git", str(target_path),
                                            offer.get("hub_session_id"),
                                            offer.get("intake_task_id"),
-                                           owner_terminal=owner_terminal):
+                                           owner_terminal=self._worktree_owner_terminal(
+                                               offer.get("intake_task_id"))):
             if not guard.reuse_stopped_intake_lock("git", str(target_path), offer.get("hub_session_id"),
                                                   offer.get("intake_task_id"), self.request):
                 if not guard.protect_successor_worktree(
@@ -2944,6 +3019,23 @@ class Dispatcher:
                     if error is not None:
                         raise ValueError(error)
         return True
+
+    def _worktree_owner_terminal(self, intake_id):
+        """Return fresh Hub proof that a same-intake lock owner is terminal.
+
+        Dispatch and later binding use the same admission proof. If dispatch
+        may reuse a stopped predecessor's same-intake lock but binding omits
+        that proof, the native can run while its Hub row remains unbound.
+        """
+        def owner_terminal(owner_id):
+            try:
+                fact = self.request('GET', '/api/fleet/worktree-owner/' + owner_id)
+                return (isinstance(fact, dict) and fact.get('session_id') == owner_id
+                        and fact.get('terminal') is True
+                        and fact.get('intake_id') == intake_id)
+            except Exception:
+                return False
+        return owner_terminal
 
     def _stale_owner_hours(self) -> Optional[int]:
         """Return the configured stale-owner bound; invalid values disable takeover."""
@@ -4256,7 +4348,11 @@ class Dispatcher:
         from .host_load import check_live_load, policy_settings
         check_live_load(policy_settings(self.settings, offer))
         claim_key = self._pending_claim_key(offer_id) or uuid.uuid4().hex
+        claim_confirmed = False
+        native_start_invoked = False
+        interactive_effect_invoked = False
         self._claim_launch(path + "/claim", {"gate_allowed": True, "profile_supported": True, "observed_at": at, "account": offer.get("account") or sub["account_label"], "claim_key": claim_key, **({"model": selection["model"]} if selection else {})}, offer_id, offer_workspace)
+        claim_confirmed = True
         stages.append(('claim', time.monotonic()))
         _emit_stage_timing(offer_id, stages)
         from .launch_diagnostics import capture_log_offsets
@@ -4286,6 +4382,7 @@ class Dispatcher:
                 # compose_prompt keeps the worktree-guard footer on this path
                 # too (AC3): an empty interactive brief still carries the
                 # cleanup rules, after the planned-worktree note.
+                interactive_effect_invoked = True
                 self.runner([native, "message", "send",
                              "--to", "hub-" + offer_id, "--queue",
                              "--kind", "hub-session-preamble", "--json", wt_note + compose_prompt("")],
@@ -4307,8 +4404,12 @@ class Dispatcher:
                 self._persist_launch_record(fence)
             # Headless starts are launcher `run` commands; interactive starts are
             # native aplexer and never receive the launcher-only host path.
-            receipt = (self._launcher_run(argv, cwd=cwd, timeout=120) if mode == "headless"
-                       else self.runner(argv, cwd=cwd, timeout=120))
+            if mode == 'interactive':
+                interactive_effect_invoked = True
+                native_start_invoked = True
+                receipt = self.runner(argv, cwd=cwd, timeout=120)
+            else:
+                receipt = self._launcher_run(argv, cwd=cwd, timeout=120)
             if mode == "interactive":
                 native_id = receipt.get("id")
                 if selection:
@@ -4492,6 +4593,9 @@ class Dispatcher:
                 failure = exception_diagnostic(exc, stage,
                                                engine=engine_name, cwd=t_cwd, task_id=t_id,
                                                launched_at=l_at, start_offsets=l_offsets)
+            if mode == 'interactive' and claim_confirmed and not interactive_effect_invoked:
+                return self._record_interactive_no_start(
+                    offer_id, workspace, target_cwd, type(exc).__name__)
             if mode == "headless" and t_id and failure.get("reason") == "launcher_command_failed":
                 # Intake 17e774f8: an empty-pipe launcher exit still saved its
                 # cause in this launch's own record; keep it, sanitized. The
@@ -4954,20 +5058,30 @@ class Dispatcher:
         pending_done = time.monotonic()
         rows = raw_rows
         skipped = []
+        outcomes = {}
+
+        def outcome(name):
+            outcomes[name] = outcomes.get(name, 0) + 1
+
         for session in pending:
             if not isinstance(session, dict):
                 continue
             row = find_binding_row(rows, session)
             if row is None:
+                outcome('native_not_observed')
                 continue
             from .worktree_guard import protect_adoption
-            if not protect_adoption(row, session, request=self.request):
-                # Intake 1c8d915e: a held worktree lock kept a running native
-                # unbound (row stuck offered) with no trace. Report it.
-                skipped.append({'session': str(session.get('id', ''))[:8], 'reason': 'worktree_lock_held'})
+            if not protect_adoption(
+                    row, session, request=self.request,
+                    owner_terminal=self._worktree_owner_terminal(
+                        session.get("intake_task_id"))):
+                outcome('worktree_lock_refused')
+                skipped.append({'session': str(session.get('id', ''))[:8],
+                                'reason': 'worktree_lock_refused'})
                 continue
             try:
                 self.request("POST", "/api/sessions/" + session["id"] + "/binding", {"native": {"native_id": row["id"], "tag": row["tag"], "workspace": row["workspace"], "native_created_at_ms": row["created_at_ms"]}})
+                outcome('bound')
             except ValueError as exc:
                 # A refused binding (e.g. server fleet_tag_mismatch for a
                 # launcher-backend tag before the server seam lands) must not
@@ -4975,12 +5089,13 @@ class Dispatcher:
                 code, status = getattr(exc, 'hub_error', None), getattr(exc, 'http_status', None)
                 reason = (code if isinstance(code, str) and re.fullmatch(r'[a-z][a-z0-9_]{0,63}', code)
                           else 'binding_http_%d' % status if type(status) is int else 'binding_refused')
+                outcome('binding_refused')
                 skipped.append({'session': str(session.get('id', ''))[:8], 'reason': reason})
                 continue
         if skipped:
             print(json.dumps({'event': 'bindings_skipped', 'skipped': skipped[:20]}), flush=True)
         print(json.dumps({'event': 'bindings_report_phases', 'sessions': len(metadata),
-                          'pending': len(pending), 'phases_s': {
+                          'pending': len(pending), 'outcomes': outcomes, 'phases_s': {
                               'census': round(census_done - started, 3),
                               'metadata': round(metadata_done - census_done, 3),
                               'sessions_put': round(put_done - metadata_done, 3),
@@ -5139,6 +5254,13 @@ class Dispatcher:
         immediately; refusals and holds keep their existing receipts.
         """
         try:
+            pending_no_start = self._active_launches.get(offer.get('id'))
+            if (isinstance(pending_no_start, dict)
+                    and pending_no_start.get('state') == 'interactive_not_started'
+                    and pending_no_start.get('settled') is not True):
+                results.append({'id': offer.get('id'), 'state': 'held',
+                                'reason': 'interactive_no_start_receipt_pending'})
+                return
             # Intake 488b860e follow-up: the server re-offers effect-free
             # starting launches (all claim attempts timed out, one landed
             # late) with their stored claim_key. Resume only when this host
