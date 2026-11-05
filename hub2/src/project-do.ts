@@ -2,7 +2,8 @@ import { MeteredDb, initializeSchema } from './db';
 import { SqlReceiptMeter, SQL_PROBE_HEADER, wrapSqlNamespaces } from './sql-receipt';
 import { sha256Hex } from './crypto';
 import { actorFrom, bodyObject, error, hasScope, HttpError, json } from './http';
-import { selectRoute, type RoutingDecision } from './routing';
+import { admitLaunch, type AdmissionOutcome } from './resource-manager';
+import type { RoutingDecision } from './routing';
 import { nativeReturncode } from './native-exit';
 import { budgetedBackgroundRequest, type BudgetKind } from './budget-edge';
 import { PROJECT_WORK_SCHEMA, ProjectWork, type ProjectWorkHooks } from './project-work';
@@ -359,7 +360,7 @@ export class ProjectDO {
       };
     } else {
       const selected = await budgetedBackgroundRequest(this.env, 'scheduled_start', async guardedEnv => {
-        const decision = await selectRoute(guardedEnv, {
+      const decision = await admitLaunch(guardedEnv, {
           operation_id: operationId,
           ...(typeof machineInput === 'string' ? { machine_id: machineInput } : {}),
           ...(typeof engineInput === 'string' ? { engine: engineInput } : {}),
@@ -374,7 +375,15 @@ export class ProjectDO {
         await this.pauseForBudget(selected);
         return selected;
       }
-      route = await selected.json() as RoutingDecision;
+      const decision = await selected.json() as AdmissionOutcome;
+      if (!decision.ok) {
+        // Typed Resource Manager hold: quota refresh, reset expiry, host snapshot
+        // staleness and saturation each carry their own bounded retry time.
+        this.deferSagaUntil(operationId, decision.hold.retry_at ?? Date.now() + 30_000, 'rm_hold:' + decision.code);
+        const saga = this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id = ?', operationId);
+        return saga ? json({ session: this.sagaView(saga) }, 202) : error('dispatch_state_unavailable', 503);
+      }
+      route = decision.plan;
     }
     const raced = this.idempotent(scope, key, digest);
     if (raced instanceof Response) return raced;
