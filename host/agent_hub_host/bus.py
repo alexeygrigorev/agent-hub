@@ -53,7 +53,9 @@ class HttpRequestError(ValueError):
         super().__init__(f"HTTP request failed with status {status}{_sanitized_body_detail(body)}")
 
 
-def _do_request(method, path, payload=None):
+def _do_request(method, path, payload=None, timeout=10.0):
+    if timeout <= 0:
+        raise TimeoutError("Hub request time budget exhausted")
     cfg = config.load_config()
     base_url = os.environ.get("HUB_URL") or os.environ.get("HUB_BASE_URL") or cfg.get("base_url")
     if not base_url:
@@ -83,7 +85,7 @@ def _do_request(method, path, payload=None):
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     
     try:
-        return safe_http_json(req)
+        return safe_http_json(req, timeout=timeout)
     except urllib.error.HTTPError as e:
         if e.code == 401 and not job_token:
             try:
@@ -98,7 +100,7 @@ def _do_request(method, path, payload=None):
             else:
                 req = urllib.request.Request(url, data=data, headers=headers, method=method)
                 try:
-                    return safe_http_json(req)
+                    return safe_http_json(req, timeout=timeout)
                 except urllib.error.HTTPError as refreshed_error:
                     e = refreshed_error
         body_bytes = b""
