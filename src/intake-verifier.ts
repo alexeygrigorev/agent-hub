@@ -87,7 +87,7 @@ export type VerifierHooks = {
   alert?: (subject: string, detail: string) => Promise<void>;
 };
 export class IntakeVerifier {
-  constructor(private sql: SqlStorage, private intake: { statusAuthorizedTasks(p: Obj): Obj[] },
+  constructor(private sql: SqlStorage, private intake: { statusAuthorizedTasks(p: Obj): Obj[]; statusOpenTasks?(p: Obj): Obj[] },
     private tx: <T>(fn: () => T) => T, private hooks: VerifierHooks = {}, private now = Date.now) {}
   init() {
     this.sql.exec('CREATE TABLE IF NOT EXISTS intake_verifier_meta(id INTEGER PRIMARY KEY CHECK(id=1),enabled_at INTEGER NOT NULL,last_tick INTEGER,last_result TEXT)');
@@ -188,7 +188,7 @@ export class IntakeVerifier {
     if (!meta) return { state: 'already_checked' };
     const counts: Obj = { skipped: 0, launched: 0, closed: 0, failed: 0, escalated: 0, waiting: 0 };
     let budget = VERIFIER_LAUNCH_BUDGET;
-    const tasks = this.intake.statusAuthorizedTasks({ admin: true })
+    const tasks = (this.intake.statusOpenTasks?.({ admin: true }) ?? this.intake.statusAuthorizedTasks({ admin: true }))
       .filter(t => OPEN.has(t.status) && !t.archived_at && intakeCompletionHoldReason(t))
       .sort((a, b) => ms(a.updated_at) - ms(b.updated_at));
     for (const task of tasks) {

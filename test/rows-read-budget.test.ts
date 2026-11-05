@@ -36,7 +36,7 @@ function seed(sql: any) {
       JSON.stringify({ last_progress_at: iso(NOW - 60000), sampled_at: iso(NOW) }));
   }
   for (let i = 0; i < DECISIONS; i++) sql.exec(`INSERT INTO session_audit_decisions(run_id,at,session_id,machine_id,native_id,rule,action,features_json)
-    VALUES(1,?,?,'budget-host',?,'healthy','observe','{}')`, iso(NOW - i * 1000), 'sess-' + (i % SESSIONS), 'native-' + (i % SESSIONS));
+    VALUES(0,?,?,'budget-host',?,'healthy','observe','{}')`, iso(NOW - i * 1000), 'sess-' + (i % SESSIONS), 'native-' + (i % SESSIONS));
   for (let i = 0; i < MESSAGES; i++) sql.exec(`INSERT INTO messages(id,from_actor,to_actor,kind,thread_id,body,idempotency_key,created_at,expires_at,state)
     VALUES(?,'bot','grok-bot','note',?,'b',?,?,?,'accepted')`, 'm' + i, 't' + i, 'k' + i, NOW - 1000, NOW + 86400000);
 }
@@ -112,6 +112,42 @@ describe('indexed intake link lookups', () => {
 });
 
 describe('per-step rows-read budgets', () => {
+  it('unchanged native censuses read zero SQL and the cached live set detects vanished rows', () => withHub(async hub => {
+    const auth = { caller: { machineId: 'budget-host', kind: 'host', actor: 'machine:budget-host' }, scopes: ['host'] } as any;
+    const native = { native_id:'budget-native', tag:'budget-native', engine:'codex', phase:'running', agent_state:'idle', workspace:'/test',
+      profile:null, account:null, created_at_ms:NOW, progress:{last_progress_at:iso(NOW),headless:false,agent_alive:true,orphaned:false,cleanup:'none',sampled_at:iso(NOW)} };
+    const send = (sessions: any[], complete: boolean) => hub.meter.run('probe:census', () => hub.fleetService.handle(new Request('https://hub.test/api/fleet/sessions', {
+      method: 'PUT', body: JSON.stringify({ sessions, census_complete: complete }),
+    }), auth));
+    expect((await send([native], false)).status).toBe(200);
+    hub.observedCatalog.rows('budget-host'); // one cold backfill, then progress refreshes are write-through
+    const exactRepeat = await measure(hub, () => send([native], false));
+    expect(exactRepeat['probe:census'] ?? 0).toBe(0);
+    const refreshed = { ...native, progress:{ ...native.progress, sampled_at:iso(NOW + 1000), last_progress_at:iso(NOW + 500) } };
+    const unchanged = await measure(hub, () => send([refreshed], false));
+    expect(unchanged['probe:census'] ?? 0).toBe(0);
+    const memoryRow = hub.observedCatalog.rows('budget-host').find((row: any) => row.native_id === 'budget-native');
+    expect(JSON.parse(memoryRow.progress_json).last_progress_at).toBe(iso(NOW + 500));
+    const backfillsBefore = () => hub.meter.statementTop(2000).filter(row => row.scope === 'probe:census' && /SELECT native_id FROM fleet_sessions WHERE machine_id = \? AND phase IN/i.test(row.sql))
+      .reduce((n, row) => n + row.calls, 0);
+    const priorBackfills = backfillsBefore();
+    expect((await send([], true)).status).toBe(200);
+    expect(hub.sql.exec("SELECT COUNT(*) AS n FROM fleet_sessions WHERE machine_id='budget-host' AND phase IN ('starting','running','broken','unknown','uncertain')").one().n).toBe(0);
+    expect(backfillsBefore()).toBe(priorBackfills); // cold-start backfill ran once on the first census only
+  }));
+
+  it('unchanged resource measurements read zero SQL even when sample timestamps advance', () => withHub(async hub => {
+    const report = { samples: [{ session_id: 'sess-0', native_id: 'native-0', current_rss_mb: 180, peak_rss_mb: 220,
+      peak_pss_mb: 240, cpu_seconds: 12, runtime_s: 60, avg_cpu_cores: 0.2, current_cpu_cores: 0.1,
+      p95_cpu_cores: 0.3, p50_rss_mb: 170, oom_kills: 0, observed_at: iso(NOW) }], reaps: [], throttles: [] };
+    expect(hub.fleetService.resources.report('budget-host', report)).toMatchObject({ reported: true, samples: 1 });
+    const exactRepeat = await measure(hub, () => hub.meter.run('probe:resource_report', () => hub.fleetService.resources.report('budget-host', report)));
+    expect(exactRepeat['probe:resource_report'] ?? 0).toBe(0);
+    const next = { ...report, samples: [{ ...report.samples[0], observed_at: iso(NOW + 1000) }] };
+    const unchanged = await measure(hub, () => hub.meter.run('probe:resource_report', () => hub.fleetService.resources.report('budget-host', next)));
+    expect(unchanged['probe:resource_report'] ?? 0).toBe(0);
+  }));
+
   it('a minute alarm reads a bounded number of rows per step', () => withHub(async hub => {
     await hub.alarm(); // first alarm: idle census and once-only work
     const rows = await measure(hub, () => hub.alarm());
@@ -137,15 +173,35 @@ describe('per-step rows-read budgets', () => {
   }));
 
   it('a scheduled tick keeps the audit, verifier and triage steps bounded', () => withHub(async hub => {
+    const stableTickNow = Math.floor(NOW / 1800000) * 1800000 + 60000;
+    (hub.jobsService as any).now = () => new Date(stableTickNow);
     const rows = await measure(hub, () => hub.scheduledTick(undefined, 'test'));
     console.log('tick rows by scope', JSON.stringify(rows));
-    expect(rows['tick:session_audit'] ?? 0).toBeLessThan(SESSIONS * 40);
-    expect(rows['tick:bus_retention'] ?? 0).toBeLessThanOrEqual(40);
+    for (const scope of ['tick:idle_work', 'tick:intake_verifier', 'tick:intake_watchdog', 'tick:session_audit', 'tick:intake_triage'])
+      expect(rows[scope] ?? 0, `${scope} should have exercised its fixture`).toBeGreaterThan(0);
+    const budgets: Record<string, number> = {
+      'tick:idle_work': SESSIONS * 4,
+      'tick:intake_triage': INTAKES * 11,
+      'tick:intake_verifier': INTAKES * 3,
+      'tick:intake_watchdog': INTAKES * 8,
+      'tick:session_audit': SESSIONS * 40,
+      'tick:bus_retention': 40,
+      'tick:root_slot': 100,
+      'tick:webhooks': 50,
+    };
+    const over = Object.entries(budgets).filter(([scope, budget]) => (rows[scope] ?? 0) > budget)
+      .map(([scope, budget]) => `${scope}=${rows[scope]} > ${budget}`);
+    expect(over).toEqual([]);
+    const hotQueries = hub.meter.statementTop(5000).filter(row => row.scope.startsWith('tick:'));
+    // Open-task hydration reads one indexed summary entry and its primary-key
+    // body row, bounded to two rows per eligible intake in this fixture.
+    const perQueryBudget = INTAKES * 2;
+    const overQuery = hotQueries.filter(row => row.max_read > perQueryBudget)
+      .map(row => `${row.scope}:${row.max_read}:${row.sql}`);
+    expect(overQuery).toEqual([]);
     const total = Object.values(rows).reduce((a, b) => a + b, 0);
-    // Bounding work (snapshot maps, one shared reservation predicate, LIMIT 2
-    // uniqueness probes) holds the full scheduled tick at ~10900 rows on the
-    // 150-session fixture (deterministic seed; late-half-hour slot refusals
-    // read ~34); restore the 12000 ceiling per intake b1d66970 AC2.
+    // Per-scope and per-query budgets above identify the path if the aggregate
+    // exceeds the 12,000-row fixture ceiling.
     expect(total).toBeLessThan(SESSIONS * 80);
   }));
 

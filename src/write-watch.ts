@@ -270,6 +270,14 @@ export class WriteWatch {
   private triggerTargets = new Map<string, Set<string>>();
   private memo = new Map<string, MemoEntry>();
   private memoBytes = 0;
+  private writeListeners = new Set<(tables: readonly string[]) => void>();
+
+  /** Subscribe to actual table writes. Listeners are for change-driven work
+   * that needs an in-memory invalidation signal, not a SQL freshness probe. */
+  onWrite(listener: (tables: readonly string[]) => void): () => void {
+    this.writeListeners.add(listener);
+    return () => this.writeListeners.delete(listener);
+  }
 
   /** Run a storage transaction while keeping cache stamps safe on rollback.
    * Generations are deliberately advanced after an aborted write instead of
@@ -323,6 +331,10 @@ export class WriteWatch {
       for (const downstream of this.triggerTargets.get(table) ?? []) pending.push(downstream);
     }
     for (const table of changed) this.generations.set(table, (this.generations.get(table) ?? 0) + 1);
+    const changedTables = [...changed];
+    for (const listener of this.writeListeners) {
+      try { listener(changedTables); } catch { /* invalidation listeners must not break SQL writes */ }
+    }
   }
 
   private noteTrigger(query: string): void {

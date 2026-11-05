@@ -456,6 +456,7 @@ export class IntakeService {
       // value keeps the exact JSON type of the source field.
       this.sql.exec('CREATE TABLE IF NOT EXISTS intake_status_summary (id TEXT PRIMARY KEY, project, status, title, updated_at, created_at, archived_at, version) WITHOUT ROWID');
       this.sql.exec("CREATE INDEX IF NOT EXISTS intake_status_summary_unarchived_terminal ON intake_status_summary(id) WHERE archived_at IS NULL AND status NOT IN ('open','in_progress','blocked','pending_approval')");
+      this.sql.exec("CREATE INDEX IF NOT EXISTS intake_status_summary_open ON intake_status_summary(id) WHERE archived_at IS NULL AND status IN ('open','in_progress','blocked','pending_approval')");
       const summaryValues = (p: string) => `json_extract(${p}data,'$.project'),json_extract(${p}data,'$.status'),json_extract(${p}data,'$.title'),json_extract(${p}data,'$.updated_at'),json_extract(${p}data,'$.created_at'),json_extract(${p}data,'$.archived_at'),json_extract(${p}data,'$.version')`;
       const summaryUpsert = (p: string) => `INSERT INTO intake_status_summary(id,project,status,title,updated_at,created_at,archived_at,version) VALUES(${p}id,${summaryValues(p)})
         ON CONFLICT(id) DO UPDATE SET project=excluded.project,status=excluded.status,title=excluded.title,updated_at=excluded.updated_at,created_at=excluded.created_at,archived_at=excluded.archived_at,version=excluded.version`;
@@ -2259,6 +2260,15 @@ export class IntakeService {
   }
   /** Readonly status-projection helpers for M14a. No write, grant or permission semantics change. */
   statusPrincipal(auth: Auth): Obj { return this.principal(auth); }  statusAuthorizedTasks(p: Obj): Obj[] { return this.rows('tasks').filter(t => this.allowed(p, t)); }
+  /** Scheduled intake services only need open, unarchived work. The partial
+   * status index selects those IDs and the primary key hydrates each full
+   * ledger body, so closed history is never scanned on a timer tick. */
+  statusOpenTasks(p: Obj): Obj[] {
+    return this.sql.exec(`SELECT t.data FROM intake_status_summary s INDEXED BY intake_status_summary_open
+      JOIN intake_tasks t ON t.id=s.id
+      WHERE s.archived_at IS NULL AND s.status IN ('open','in_progress','blocked','pending_approval')
+      ORDER BY s.id`).toArray().map((r: any) => JSON.parse(r.data)).filter((t: Obj) => this.allowed(p, t));
+  }
   /** Internal watchdog range, including paused work for observation/digests.
    * Full histories are fetched only for this bounded indexed range. */
   watchdogTasks(after: string, limit: number): Obj[] {

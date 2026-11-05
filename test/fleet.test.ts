@@ -20,7 +20,7 @@ async function fixture(fn: (service: FleetService, sql: any) => Promise<void>) {
   const bindings = env as unknown as Env;
   const stub = bindings.HUB.get(bindings.HUB.idFromName('fleet-test-' + crypto.randomUUID()));
   await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
-    const service = new FleetService(hub.sql, (cb) => state.storage.transactionSync(cb), () => now);
+    const service = new FleetService(hub.sql, (cb) => state.storage.transactionSync(cb), () => now, hub.writes);
     service.init(); const sql = hub.sql;
     for (const machine of ['hetzner', 'win35']) {
       sql.exec('INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, drained, capabilities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', machine, machine, machine, iso(), iso(), JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], cpu_usage: freshCpu(iso()), gate: { launch_allowed: true, at: iso() } }), 0, JSON.stringify({ engines: ['codex', 'claude'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8 }));
@@ -601,6 +601,20 @@ describe('generic accounts and launch placement', () => {
     sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id='hetzner'", JSON.stringify(hb));
     expect(s.reserve(input, admin).status).toBe(201);
     expect(s.plan(intent({ machine: 'hetzner', mode: 'headless' })).rejected?.[0]?.reason).toBe('launcher_memory_reserve');
+  }));
+  it('quarantines a repeatedly refusing machine route and reopens after a different outcome', async () => fixture(async (s, sql) => {
+    await configure(s);
+    const add = (id: string, reason: string, at: string) => sql.exec(`INSERT INTO fleet_launches
+      (id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,profile,mode,workspace,prompt,state,created_at,updated_at,finished_at,verification_status,exit_reason)
+      VALUES(?,'test-admin','human','refusal',?,'{}','hetzner','codex','shared-codex',NULL,'headless','demo','', 'failed',?,?,?,'not_started',?)`,
+      id, id, at, at, at, reason);
+    for (let i=1;i<=3;i++) add('refusal-' + i, 'admission_refused', iso(-i * 1000));
+    const blocked = s.plan(intent());
+    expect(blocked.rejected).toContainEqual({ machine:'hetzner', engine:'codex', reason:'route_quarantined' });
+    expect(blocked.selected?.machine).toBe('win35');
+    add('later-outcome', 'operator_stopped', iso());
+    const reopened = s.plan(intent());
+    expect(reopened.rejected?.some((r: any) => r.machine === 'hetzner' && r.reason === 'route_quarantined')).toBe(false);
   }));
   it('binds claims to authenticated host and requires fresh account admission; duplicate claims cannot run twice', async () => fixture(async s => {
     await configure(s);

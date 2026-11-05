@@ -110,23 +110,44 @@ probes too.
 
 | Job | Trigger | Worst case / run (test) | Expected / day, quiet fleet |
 | --- | --- | --- | --- |
-| `alarm:idle_work` | due wakes only, internally at most every 5 min | `SESSIONS*25` (first census) | 0 (gate skips; memo serves repeats) |
+| `alarm:idle_work` | due wakes only, internally at most every 5 min | `SESSIONS*25` (first census) | 0 without due sessions/wakes |
 | `alarm:bus_retention` | retention backlog only | 40 rows | 0 (skipped when no backlog) |
 | `alarm:expire_messages` | due expiries only | 20 rows | 0 (indexed due scan, empty) |
 | `alarm:jobs_alarms` | due jobs only | 100 rows | ~0 (no due alarms) |
 | `alarm:webhooks` | pending deliveries only | 50 rows | 0 (empty pump) |
-| `meter:flush` + hourly budget check | every 5 min flush; check once per hour | 1 upsert/row per active scope | ~300 rows (ring upserts) + 2 small reads/hour |
-| 5-min cron ticks (watchdog, liveness, host/capacity history, tbm, audit, triage, schedules) | cron; each step internally write-gated or index-bounded | `SESSIONS*40` audit; 40 retention; indexed branches elsewhere | ~0 steady state (caches/memo); bounded re-reads on real events |
-| `GET /api/fleet/offers` (per host, every few s) | host poll | 400 idle / 60 repeat | 0 repeat (stamp cache); re-read on launch/session writes only |
-| `PUT /api/fleet/sessions` (per host, ~60 s) | host census | `CENSUS*4` repeat; 0 writes on volatile-only progress | 0 repeat; writes only on semantic change |
-| `GET /api/session-messaging/credentials` (per host, 120 s) | host poll | sweep <= ~300 first run, then 0; list indexed + memoized | 0 repeat (stamp gate skips sweep, memo serves list) |
-| `GET /api/session-intake/credentials` (per host, 120 s) | host poll | repeat 0; first run indexed (credentials_family) | 0 repeat; re-sweep only after session/credential writes |
-| `GET /api/fleet/resources/watchdog`, `POST .../report` | host poll | revision-cached catalog; re-read on authority writes only | 0 repeat (test: repeat poll reads zero) |
+| `meter:flush` + hourly budget check | every 5 min flush; check once per hour | one ring upsert per active scope plus the total row; indexed two-hour summary | Conservative envelope ~4.4k rows/day at 12 active scopes: 13 × 288 ring rows plus at most 26 rows × 24 hourly checks |
+| `alarm:host_history` | due sample only | O(1) history revision and bounded upsert | 0 when no host fact changed |
+| `alarm:tbm` | quota/session/outcome writes | one write-stamp check; bounded 4,096-row replay after a real change | 0 without a relevant write |
+| `tick:session_audit` | 30-min audit cadence | `SESSIONS*40` on the 150-session fixture; pending/outcome branches are indexed | 0 with no active sessions or outstanding actions; audit evidence follows session events |
+| `tick:intake_watchdog` | 5-min cron, due queue and digest events | 2,077 rows on the 300-intake fixture; indexed due/queue branches | 0 with no open intakes or due work |
+| `tick:intake_verifier` | 5-min cron, DONE claims only | 603 rows on the 300-intake fixture; indexed open-task selection | 0 with no claims awaiting verification |
+| `tick:intake_triage` | hourly | 3,069 rows on the 300-intake fixture; indexed open-task selection | 0 with no forgotten intake candidates |
+| `GET /api/fleet/offers` (per host, 10 s) | host poll | 400 idle / 60 repeat | 0 repeat (stamp cache); re-read on launch/session writes only |
+| `PUT /api/fleet/sessions` (per host, 60 s) | host census | bounded primary-key lookups on change; write events invalidate settlement state | 0 repeat; reprocess after a relevant write |
+| `GET /api/session-messaging/credentials` (per host, 600 s) | host poll | up to 200 identity candidates with indexed session/credential probes; ended-session backstop reads at most 100 identities once per relevant write | 0 repeat (stamp gate skips sweep, memo serves list) |
+| `GET /api/session-intake/credentials` (per host, 600 s) | host poll | repeat 0; first run indexed (credentials_family) | 0 repeat; re-sweep only after session/credential writes |
+| `GET /api/fleet/resources/watchdog`, `POST .../report` (report every 120 s) | host poll | revision-cached catalog; unchanged report returns before SQL | 0 repeat (test: repeat poll reads zero) |
 | `GET /api/sessions` CPU estimates | dashboard/admin poll | <=500 recent rows per rebuild; shared cross-request cache | 0 repeat; rebuild on resource/CPU/RSS/config writes only |
 
-Quiet-fleet design total: low hundreds of rows/day (meter ring + hourly
-checks + first-reads after genuine events), inside the ~5,000/day guideline;
-the 20,000/day alert (`GET /api/metrics/rows-read`, `do_rows_read_budget`
+The durable catalog markers record first-seen and completeness changes only.
+While the DO is live, an authenticated report refreshes an in-memory per-host
+freshness entry; a cold start uses the durable marker until the host reports
+again. The machine heartbeat is not treated as proof that its native-session
+census is current. Unchanged census and resource reports return before SQL.
+
+The first scheduled-tick pass in the production-shaped budget fixture read
+about 8.3k rows across scopes (150 sessions, 300 intakes, 3,000 retained audit
+decisions and 3,000 queued messages). CI caps each step and each query (the
+open-task join is bounded at two rows per eligible intake) and caps the total
+stress-fixture pass at 12k. The quiet-fleet daily estimate assumes no active
+sessions, open intakes, outstanding actions, or due work; it is a design
+estimate, not a post-deploy measurement.
+
+With 12 active meter scopes, the conservative meter envelope is about 4.4k
+rows/day (counting one read for each ring upsert plus the two-hour indexed
+summary). Other quiet-fleet scheduled jobs add close to zero without active
+sessions, open intakes, outstanding actions, or due work. The 20,000/day
+alert (`GET /api/metrics/rows-read`, `do_rows_read_budget`
 liveness alert, deduped to one notification per open alert + hourly refresh)
 stays silent at these levels. Noisy-fleet cost is proportional to real
 placements, launches, credential mints and session transitions, not to poll
@@ -154,4 +175,4 @@ storm) rather than a per-hour page.
 - `launcher_memory_reserve` scan: new partial index
   `fleet_launch_failed_reason(state,exit_reason,updated_at) WHERE state='failed'`.
 - Host polls (take effect as hosts update): offers 2s->10s, credential and
-  messaging provisioning 120s->300s.
+  messaging provisioning 120s->600s.

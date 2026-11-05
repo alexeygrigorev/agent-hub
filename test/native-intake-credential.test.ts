@@ -145,4 +145,3 @@ describe('native session intake credential', () => {
     expect(await (await call('/api/session-intake/credentials')).json()).toEqual({ sessions: [] });
   }));
 });
-

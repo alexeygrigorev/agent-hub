@@ -18,6 +18,7 @@ import { WriteWatch } from './write-watch';
  */
 export class ObservedCatalog {
   private byMachine = new Map<string, Map<string, any>>();
+  private pendingProgress = new Map<string, Map<string, string | null>>();
   private loadedAll = false;
   private loadedMachinesStamp: string | null = null;
   private machineIds: string[] = [];
@@ -35,6 +36,14 @@ export class ObservedCatalog {
         const rows = this.sql.exec('SELECT * FROM fleet_sessions WHERE machine_id = ?', machine).toArray() as any[];
         const map = new Map<string, any>();
         for (const row of rows) map.set(String(row.native_id), this.copy(row));
+        const progress = this.pendingProgress.get(machine);
+        if (progress) {
+          for (const [nativeId, value] of progress) {
+            const row = map.get(nativeId);
+            if (row) row.progress_json = value;
+          }
+          this.pendingProgress.delete(machine);
+        }
         this.byMachine.set(machine, map);
       }
       return;
@@ -66,6 +75,24 @@ export class ObservedCatalog {
       for (const row of rows) map.set(String(row.native_id), this.copy(row));
     }
     // Not loaded yet: nothing to patch; the lazy load reads the table.
+  }
+
+  /** Volatile progress timestamps are refreshed in memory without touching
+   * the durable row's last-change timestamp or causing a history scan. */
+  refreshProgress(machine: string, rows: Array<{ native_id: string; progress_json: string | null }>): void {
+    if (!this.byMachine.has(machine) && this.pendingProgress.size >= 64 && !this.pendingProgress.has(machine)) {
+      const oldest = this.pendingProgress.keys().next().value;
+      if (oldest !== undefined) this.pendingProgress.delete(oldest);
+    }
+    let patches = this.pendingProgress.get(machine);
+    if (!patches) this.pendingProgress.set(machine, patches = new Map());
+    const map = this.byMachine.get(machine);
+    for (const row of rows.slice(0, 500)) {
+      const id = String(row.native_id), prior = map?.get(id);
+      if (prior) prior.progress_json = row.progress_json;
+      else patches.set(id, row.progress_json);
+    }
+    if (patches.size === 0) this.pendingProgress.delete(machine);
   }
 
   /** Patch one column flip (reap exit, census unobserved). */
@@ -102,7 +129,7 @@ export class ObservedCatalog {
 
   /** Drop cached rows (backup restore swapped the database). */
   reset(): void {
-    this.byMachine.clear(); this.loadedAll = false; this.loadedMachinesStamp = null;
+    this.byMachine.clear(); this.pendingProgress.clear(); this.loadedAll = false; this.loadedMachinesStamp = null;
     this.machineIds = []; this.machineIdsStamp = null; this.machineIdsLoaded = false;
   }
 }

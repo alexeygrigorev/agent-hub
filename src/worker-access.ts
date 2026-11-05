@@ -288,6 +288,29 @@ export function workerRequestAllowed(sql: SqlStorage, request: Request, tokenId:
 
 export const NATIVE_WORKER_PROJECT = 'hub-native-workers';
 const NATIVE_LIST_LIMIT = 10;
+/** One bounded indexed statement replaces the per-session credential and
+ * intake-link probes on the host's credential poll. */
+export const NATIVE_CREDENTIAL_CANDIDATES_SQL = `WITH candidates AS MATERIALIZED (
+  SELECT id,binding_json,updated_at FROM session_control_sessions INDEXED BY session_control_native_credential
+  WHERE machine_id=? AND state='running' AND binding_json IS NOT NULL AND fleet_launch_id IS NULL
+    AND json_type(CASE WHEN json_valid(binding_json) THEN binding_json ELSE '{}' END,'$.native_id')='text'
+    AND json_type(CASE WHEN json_valid(binding_json) THEN binding_json ELSE '{}' END,'$.workspace')='text'
+  ORDER BY updated_at DESC,id DESC LIMIT 300
+), linked AS MATERIALIZED (
+  SELECT s.id,s.binding_json,s.updated_at,
+    (SELECT l.task_id FROM intake_session_links l JOIN intake_task_projection p ON p.id=l.task_id
+      WHERE l.session_key IN (s.id,json_extract(s.binding_json,'$.native_id'))
+        AND json_extract(p.data,'$.status') NOT IN ('done','cancelled')
+      ORDER BY l.task_id LIMIT 1) AS intake_task_id
+  FROM candidates s
+)
+SELECT s.id AS session_id,json_extract(s.binding_json,'$.native_id') AS native_id,
+  json_extract(s.binding_json,'$.workspace') AS workspace,s.intake_task_id
+FROM linked s
+WHERE s.intake_task_id IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM worker_access w JOIN credentials c ON c.family_id=w.family_id
+    WHERE w.session_id=s.id AND c.revoked_at IS NULL)
+ORDER BY s.updated_at DESC,s.id DESC LIMIT ${NATIVE_LIST_LIMIT}`;
 /** Open intakes a server-verified link (operator verify_live, never a START
  * note or tag guess) ties to this running native session, oldest id first.
  * Empty when the session has no verified open intake. */
@@ -305,20 +328,11 @@ export function nativeSessionIntakes(sql: SqlStorage, sessionId: string, nativeI
 /** Running native sessions on this machine that have a verified open intake
  * link and no live scoped credential yet. Bounded; indexed lookups. */
 export function nativeSessionsNeedingIntakeCredential(sql: SqlStorage, machineId: string): { session_id: string; native_id: string; workspace: string; intake_task_id: string }[] {
-  const out: any[] = [];
-  const rows = sql.exec(`SELECT s.id, s.binding_json FROM session_control_sessions s WHERE s.state = 'running' AND s.binding_json IS NOT NULL AND s.machine_id = ? AND s.fleet_launch_id IS NULL
-    AND NOT EXISTS (SELECT 1 FROM worker_access w JOIN credentials c ON c.family_id = w.family_id WHERE w.session_id = s.id AND c.revoked_at IS NULL)
-    AND EXISTS (SELECT 1 FROM intake_session_links l WHERE l.session_key = s.id OR l.session_key = json_extract(s.binding_json, '$.native_id'))
-    ORDER BY s.updated_at DESC LIMIT 300`, machineId).toArray() as any[];
-  for (const row of rows) {
-    let binding: any; try { binding = JSON.parse(row.binding_json); } catch { continue; }
-    if (!binding?.native_id || !binding?.workspace) continue;
-    const intake = nativeSessionIntakes(sql, String(row.id), String(binding.native_id))[0];
-    if (!intake) continue;
-    out.push({ session_id: String(row.id), native_id: String(binding.native_id), workspace: String(binding.workspace), intake_task_id: intake });
-    if (out.length >= NATIVE_LIST_LIMIT) break;
-  }
-  return out;
+  try {
+    return (sql.exec(NATIVE_CREDENTIAL_CANDIDATES_SQL,machineId).toArray() as any[]).map(row => ({
+      session_id:String(row.session_id), native_id:String(row.native_id), workspace:String(row.workspace), intake_task_id:String(row.intake_task_id),
+    }));
+  } catch { return []; } // Missing optional link projections fail closed outside Hub composition.
 }
 /** Stop/rebind/end of a session kills its native intake credential family. */
 export function revokeNativeWorkerCredentials(sql: SqlStorage, sessionId: string, now: number): void {

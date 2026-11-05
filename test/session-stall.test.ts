@@ -20,6 +20,7 @@ async function fixture(fn: (s: SessionControlService, live: LivenessService, sql
     const live = new LivenessService(hub.sql, undefined, () => clock.now); live.init();
     const at = new Date(start).toISOString(), created = new Date(start - 11000000).toISOString();
     hub.sql.exec("INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at) VALUES ('test-host', 'test-host', 'test-host', ?, ?)", created, at);
+    hub.sql.exec("INSERT INTO fleet_catalog_seen(machine_id,observed_at) VALUES('test-host',?)", at);
     hub.sql.exec(`INSERT INTO session_control_sessions (id, actor, request_key, request_json, machine_id, engine, mode, state, binding_json, created_at, updated_at)
       VALUES (?, 'test-admin', 'test', '{}', 'test-host', 'codex', 'headless', 'running', ?, ?, ?)`, id,
       JSON.stringify({ native_id: id, tag: 'test', workspace: '/test', native_created_at_ms: start - 11000000 }), created, at);
@@ -42,12 +43,13 @@ describe('stalled running sessions', () => {
     expect(nativeObservationFresh(counted, fallback, start, cache)).toBe(true);
     expect(nativeObservationFresh(counted, { ...fallback, observed_at: new Date(start - 180001).toISOString() }, start, cache)).toBe(false);
     expect(nativeObservationFresh(counted, { ...fallback, observed_at: new Date(start + 60001).toISOString() }, start, cache)).toBe(false);
-    expect(reads).toBe(2);
+    expect(reads).toBe(1); // one indexed freshness lookup supplies the whole projection
     const observed = { machine_id: 'test-host', observed_at: new Date(start - 3600000).toISOString() };
     expect(nativeObservationFresh(counted, observed, start, cache)).toBe(true);
-    expect(reads).toBe(4);
-    sql.exec('UPDATE machines SET last_checkin_at = ? WHERE id = ?', new Date(start - 180001).toISOString(), 'test-host');
+    expect(reads).toBe(1);
+    sql.exec('UPDATE fleet_catalog_seen SET observed_at = ? WHERE machine_id = ?', new Date(start - 180001).toISOString(), 'test-host');
     expect(nativeObservationFresh(counted, observed, start, new Map())).toBe(false);
+    expect(reads).toBe(2);
   }));
 
   it('stalls while heartbeats and terminal activity continue but the agent rollout is frozen', async () => fixture(async (s, live, sql, clock) => {
@@ -170,7 +172,8 @@ describe('stalled running sessions', () => {
     sql.exec("UPDATE fleet_sessions SET phase = 'exited'");
     expect(classifySessionStall(sql, native(sql), clock.now).stalled).toBe(false);
     sql.exec("UPDATE fleet_sessions SET phase = 'running', last_activity_at = ?", new Date(start - 2000000).toISOString());
-    sql.exec('UPDATE machines SET last_checkin_at = ?', new Date(start - 900000).toISOString());
+    sql.exec('UPDATE machines SET last_checkin_at = ?', new Date(clock.now).toISOString());
+    sql.exec('UPDATE fleet_catalog_seen SET observed_at = ?', new Date(start - 900000).toISOString());
     sql.exec('UPDATE fleet_sessions SET observed_at = ?', new Date(start - 900000).toISOString());
     expect((await view(s)).stalled).toBe(false);
   }));

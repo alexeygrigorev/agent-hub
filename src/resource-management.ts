@@ -122,7 +122,9 @@ export class ResourceManagement {
   /** Per-machine watchdog response (canonical + idle authority verdicts). */
   private watchdogSessions: StampCache<string, ReturnType<ResourceManagement['sessionsUncached']>> | null = null;
   private observed: ObservedCatalog | null;
-  constructor(private sql: SqlStorage, private now: () => number = Date.now, writes?: WriteWatch, observed?: ObservedCatalog) {
+  private reportFingerprints = new Map<string, string>();
+  constructor(private sql: SqlStorage, private now: () => number = Date.now, writes?: WriteWatch, observed?: ObservedCatalog,
+    private onCatalogChange?: (machine: string) => void) {
     this.writes = writes ?? null;
     this.observed = observed ?? null;
     if (this.writes) {
@@ -175,13 +177,18 @@ export class ResourceManagement {
    * changed, not only activity/progress refreshes. */
   noteCensus(machine: string, rows: any[], metadataChanged: boolean): void {
     this.observed?.note(machine, rows);
+    this.reportFingerprints.delete(machine);
+    this.onCatalogChange?.(machine);
     if (metadataChanged) this.writes?.bump('fleet_sessions_meta');
   }
   /** Watchdog/census phase flips (exited, unobserved). */
   notePhase(machine: string, nativeId: string, phase: string, observedAt: string): void {
     this.observed?.notePhase(machine, nativeId, phase, observedAt);
+    this.reportFingerprints.delete(machine);
+    this.onCatalogChange?.(machine);
     this.writes?.bump('fleet_sessions_meta');
   }
+  invalidateReports(): void { this.reportFingerprints.clear(); }
   /** Intake-linkage snapshot restricted to what this catalog rebuild can
    * reference: the machine's bound sessions, their native aliases on every
    * hostname sibling, and the projections linked to them. Unscoped (global
@@ -780,6 +787,12 @@ export class ResourceManagement {
     if (!result.ok) throw new Error(result.error==='not_found'?'intake_not_found':'intake_capacity');
   }
 
+  private reportRevision(): string | null {
+    return this.writes?.stamp('session_control_sessions','fleet_launches','machines','fleet_sessions_meta',
+      'resource_reaps','resource_evidence','session_resource_usage','session_cpu_usage','session_rss_median',
+      'intake_tasks','intake_task_projection','resource_request_projection') ?? null;
+  }
+
   evidence(machine: string, value: any) {
     const session = this.sessions(machine).find(s => s.session_id===value.session_id && s.native_id===value.native_id);
     if (!session?.managed || session.keep || (value.reason === 'idle' && !session.idle_reap_allowed) || !session.intake_id) throw new Error('session_not_reapable');
@@ -799,11 +812,30 @@ export class ResourceManagement {
     return {saved:true,evidence_id:value.id};
   }
   report(machine: string, value: any) {
+    if (!value || !Array.isArray(value.samples) || !Array.isArray(value.reaps) || value.samples.length>200 || value.reaps.length>100
+      || (value.throttles !== undefined && (!Array.isArray(value.throttles) || value.throttles.length>100))) throw new Error('invalid_resource_report');
+    // Sample observed_at advances on every host report even when every
+    // measurement is unchanged. Validate it, then compare the semantic body
+    // before canonical session joins or any per-row probes.
+    for (const sample of value.samples) {
+      const at = Date.parse(sample?.observed_at);
+      if (!Number.isFinite(at) || at>this.now()+30000 || at<this.now()-86400000) throw new Error('invalid_resource_timestamp');
+    }
+    const stableSamples = value.samples.map((sample: any) => {
+      const { observed_at: _observedAt, ...stable } = sample ?? {};
+      return stable;
+    }).sort((a: any, b: any) => String(a.session_id).localeCompare(String(b.session_id)) || String(a.native_id).localeCompare(String(b.native_id)));
+    const stableValue = (input: any): any => Array.isArray(input) ? input.map(stableValue)
+      : input && typeof input === 'object' ? Object.fromEntries(Object.keys(input).sort().map(key => [key, stableValue(input[key])])) : input;
+    const bodyFingerprint = JSON.stringify(stableValue({ ...value, samples: stableSamples }));
+    const fingerprint = JSON.stringify([bodyFingerprint, this.reportRevision()]);
+    const priorReport = this.reportFingerprints.get(machine);
+    if (this.writes && priorReport === fingerprint) {
+      return {reported:true,samples:value.samples.length,reaps:value.reaps.length};
+    }
     // Accept reports already in flight under an older canonical alias, but put
     // every physical native in exactly one durable ledger row.
     const sessions = new Map(this.canonicalSessions(machine).flatMap(s => s.aliases.map(id=>[id,s] as const)));
-    if (!value || !Array.isArray(value.samples) || !Array.isArray(value.reaps) || value.samples.length>200 || value.reaps.length>100
-      || (value.throttles !== undefined && (!Array.isArray(value.throttles) || value.throttles.length>100))) throw new Error('invalid_resource_report');
     for (const sample of value.samples) {
       const session = sessions.get(sample.session_id);
       if (!session || sample.native_id!==session.native_id) throw new Error('resource_binding_mismatch');
@@ -910,6 +942,8 @@ export class ResourceManagement {
         catch (error) { if (!(error instanceof Error && ['intake_required','intake_not_found','intake_capacity','intake_history_capacity'].includes(error.message))) throw error; }
       }
     }
+    if (this.reportFingerprints.size >= 64) this.reportFingerprints.clear();
+    this.reportFingerprints.set(machine, JSON.stringify([bodyFingerprint, this.reportRevision()]));
     return {reported:true,samples:value.samples.length,reaps:value.reaps.length};
   }
   usage(filters: any = {}) {

@@ -5,6 +5,7 @@ import type { SessionControlService } from './session_control';
 import { IntakeService } from './intake';
 import { IntakeWorktrees } from './intake-worktrees';
 import { nativeObservationFresh } from './session_stall';
+import { freshCatalogs } from './catalog-freshness';
 import { linkedIntake, hasOpenWork, parseObject } from './intake-session';
 
 export interface IdleRecoveryOwner {
@@ -44,6 +45,7 @@ export class IdleWorkService {
       // One attention census per tick (intake 8081a05a): it also decides
       // which episodes stay active below, instead of recomputing it. A session
       // that recovers during this loop is marked inactive on the next census.
+      const freshHosts = freshCatalogs(this.sql, this.now());
       const attention = this.sessions.attention();
       for (const item of attention) {
         try {
@@ -69,10 +71,8 @@ export class IdleWorkService {
           episode = this.sql.exec('SELECT * FROM session_idle_episodes WHERE session_id=?', row.id).toArray()[0];
           if (!episode?.active) continue;
         }
-        const host: any = this.sql.exec('SELECT observed_at FROM fleet_catalog_seen WHERE machine_id=?', row.machine_id).toArray()[0];
         // Uncertain host observations are attention, never new native effects.
-        const hostAt = Date.parse(host?.observed_at || '');
-        if (!Number.isFinite(hostAt) || hostAt > this.now() + 60000 || this.now() - hostAt > 180000) continue;
+        if (!freshHosts.has(String(row.machine_id))) continue;
         const observedNative: any = binding.native_id && this.sql.exec('SELECT progress_json FROM fleet_sessions WHERE machine_id=? AND native_id=?',row.machine_id,binding.native_id).toArray()[0];
         const sampledAt = Date.parse(parseObject(observedNative?.progress_json).sampled_at || '');
         // Fast census reports may reuse a slow sampler's old enrichment.

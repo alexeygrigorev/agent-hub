@@ -575,9 +575,7 @@ def reconcile_message_record(journal_file: str, *, executable: str, request: Cal
 
 
 _last_provision = [0.0]
-# Intake e8a22f4c: credential/messaging provisioning polls are fleet-wide
-# reads on every host; 300s keeps new-native setup delay negligible here.
-PROVISION_INTERVAL_S = 300.0
+PROVISION_INTERVAL_S = 600.0
 
 
 def provision_credentials(request: Callable, base_url: Optional[str], *, auth_dir=None,

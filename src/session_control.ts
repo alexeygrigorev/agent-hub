@@ -14,6 +14,7 @@ import { decodeRepoWorkspace, disabledEngines, encodeRepoWorkspace } from './fle
 import { modelDisabledByPolicy } from './model-routing';
 import { initResourceRequestProjection } from './sql-json-projection';
 import { abandonedLaunch, expireSilentStartRows } from './silent-start';
+import { freshCatalogs, freshCompleteCatalogs } from './catalog-freshness';
 /** Hub session orchestration (M12e): durable start/send/capture/stop intents over existing fleet placement.
  *
  * Placement itself is never reimplemented here: starts delegate to the existing
@@ -109,6 +110,7 @@ CREATE INDEX IF NOT EXISTS session_control_live_created ON session_control_sessi
 CREATE INDEX IF NOT EXISTS session_control_live_actor_created ON session_control_sessions(actor, created_at DESC, id DESC) WHERE state IN ('queued','held','offered','starting','running','uncertain');
 CREATE INDEX IF NOT EXISTS session_control_held_unplaced ON session_control_sessions(created_at, id) WHERE state = 'held' AND fleet_launch_id IS NULL AND binding_json IS NULL;
 CREATE INDEX IF NOT EXISTS session_control_unbound_live_launch ON session_control_sessions(fleet_launch_id) WHERE binding_json IS NULL AND fleet_launch_id IS NOT NULL AND state IN ('queued','held','offered','starting','running','uncertain');
+CREATE INDEX IF NOT EXISTS session_control_native_credential ON session_control_sessions(machine_id,updated_at DESC,id DESC) WHERE state='running' AND binding_json IS NOT NULL AND fleet_launch_id IS NULL;
 CREATE TABLE IF NOT EXISTS session_warning_events (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, kind TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL, until_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS session_warning_events_session ON session_warning_events(session_id, created_at);
 CREATE TABLE IF NOT EXISTS session_worktree_episode_notes (subject TEXT NOT NULL, generation INTEGER NOT NULL, intake_id TEXT NOT NULL, PRIMARY KEY(subject, generation, intake_id));
@@ -169,22 +171,24 @@ const GUARD_PAGE_DEFAULT = 100;
 const GUARD_PAGE_MAX = 200;
 const GUARD_LEGACY_ROWS = 100;
 const GUARD_MAX_CLOSURE = 400;
-/** A host heartbeat (fleet_sessions.observed_at) older than this means the process is gone. */
+/** A native row is live only while it is recent or its host sent a fresh catalog. */
 const ACTIVE_HEARTBEAT_MS = 10 * 60 * 1000;
 /** Single server-side definition of "active", shared by web and CLI (hub-1101-outage-20261031):
- * pending (queued/held/offered) rows, or starting/running/uncertain rows whose host reported a
- * fresh heartbeat. Used by the list filter, the tree and `active_count`. */
-function activeSessionsSql(nowMs: number): { sql: string; params: any[] } {
+ * pending (queued/held/offered) rows, or starting/running/uncertain rows whose native observation
+ * is recent or whose host sent a fresh catalog. Used by the list filter, the tree and `active_count`. */
+function activeSessionsSql(sqlStorage: SqlStorage, nowMs: number): { sql: string; params: any[] } {
   const cutoff = new Date(nowMs - ACTIVE_HEARTBEAT_MS).toISOString();
+  const catalogs = [...freshCatalogs(sqlStorage, nowMs).keys()];
+  const recentCatalog = catalogs.length ? `f.machine_id IN (${catalogs.map(() => '?').join(',')})` : '0';
   return {
-    sql: `(state = 'queued' OR state = 'held' OR state = 'offered' OR ((state = 'starting' OR state = 'running' OR state = 'uncertain') AND EXISTS (
+    sql: `(state IN ('queued','held','offered') OR (
+      state IN ('starting','running','uncertain') AND EXISTS (
       SELECT 1 FROM fleet_sessions f WHERE f.machine_id = session_control_sessions.machine_id
       AND f.native_id = json_extract(session_control_sessions.binding_json, '$.native_id')
-      AND f.phase != 'exited' AND f.phase != 'dead' AND f.phase != 'pruned' AND f.phase != 'forgotten' AND f.phase != 'unobserved'
-      AND (f.observed_at >= ? OR instr(COALESCE((
-        SELECT '|' || group_concat(c.machine_id, '|') || '|' FROM fleet_catalog_seen c WHERE c.observed_at >= ?
-      ), ''), '|' || f.machine_id || '|') > 0))))`,
-    params: [cutoff, cutoff],
+      AND f.phase NOT IN ('exited','dead','pruned','forgotten','unobserved')
+      AND (f.observed_at >= ? OR ${recentCatalog})
+    )))`,
+    params: [cutoff, ...catalogs],
   };
 }
 /** Literal must match the partial indexes session_control_live_created / _live_actor_created. */
@@ -1210,7 +1214,7 @@ export class SessionControlService {
       // Candidate selection avoids retained intake/model/warning histories for
       // healthy rows; the canonical view still decides every emitted state.
       const full: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id=?',row.id).toArray()[0];
-      const v = this.view(full,10800);
+      const v = this.view(full,10800,freshness);
       if (!['idle_with_open_ac','stalled'].includes(v.state)) continue;
       const state = v.state, idleFor = v.idle_for, lastActivity = v.last_activity_at;
       const e: any = episodes ? this.sql.exec('SELECT last_nudge_at FROM session_idle_episodes WHERE session_id=?', row.id).toArray()[0] : null;
@@ -1266,7 +1270,7 @@ export class SessionControlService {
     };
   }
 
-  private view(row: any, threshold: number | null = null) {
+  private view(row: any, threshold: number | null = null, freshness?: NativeObservationCache) {
     const request = parsed(row.request_json, {});
     const protection: any = this.sql.exec('SELECT request_key, created_at FROM session_control_protections WHERE session_id = ?', row.id).toArray()[0];
     const binding = row.binding_json ? parsed(row.binding_json, null) : null;
@@ -1278,7 +1282,7 @@ export class SessionControlService {
       machine_id: row.machine_id, native_id: binding.native_id, phase: 'unobserved',
       created_at_ms: binding.native_created_at_ms ?? Date.parse(row.created_at), observed_at: row.updated_at,
     } : null;
-    const hostFresh = nativeObservationFresh(this.sql, native, this.now());
+    const hostFresh = nativeObservationFresh(this.sql, native, this.now(), freshness);
     const terminalError = hostFresh ? sessionTerminalError(row, observed) : null;
     const stall = classifySessionStall(this.sql, native, this.now(), stallThreshold(this.options.env), hostFresh, toolCallStallThreshold(this.options.env));
     const intake = linkedIntake(this.sql, row);
@@ -1794,6 +1798,12 @@ export class SessionControlService {
                     linkedRows.set(String(s.id), s);
                   }
                 }
+                const linkedCatalogMachines = [...new Set([...linkedRows.values()]
+                  .filter(s => s.machine_id && !s.fleet_launch_id &&
+                    (s.actor === 'unknown' || parsed(s.request_json, {}).provenance === 'observed_native' ||
+                     parsed(s.binding_json, null)?.provenance === 'observed_native'))
+                  .map(s => String(s.machine_id)))];
+                const freshLinkedCatalogs = freshCompleteCatalogs(this.sql, now, linkedCatalogMachines);
                 const heldCreatedAt = Date.parse(row.created_at);
                 const isLiveReplacement = (s: any): boolean => {
                   if (!s || s.id === row.id) return false;
@@ -1807,12 +1817,10 @@ export class SessionControlService {
                   if (observedNative) {
                     try {
                       if (typeof linkedBinding?.native_id !== 'string' || !s.machine_id) return false;
-                      const observed: any = this.sql.exec(`SELECT f.native_id, f.tag, f.engine, f.phase, f.workspace,
-                        f.created_at_ms, c.observed_at AS census_at, c.complete AS census_complete
-                        FROM fleet_sessions f LEFT JOIN fleet_catalog_census c ON c.machine_id = f.machine_id
-                        WHERE f.machine_id = ? AND f.native_id = ?`, s.machine_id, linkedBinding.native_id).toArray()[0];
-                      const censusAt = Date.parse(String(observed?.census_at ?? ''));
-                      if (!observed || observed.census_complete !== 1 || !Number.isFinite(censusAt) ||
+                      const observed: any = this.sql.exec(`SELECT native_id,tag,engine,phase,workspace,created_at_ms
+                        FROM fleet_sessions WHERE machine_id=? AND native_id=?`, s.machine_id, linkedBinding.native_id).toArray()[0];
+                      const censusAt = freshLinkedCatalogs.get(String(s.machine_id)) ?? NaN;
+                      if (!observed || !Number.isFinite(censusAt) ||
                           censusAt > now + 60000 || now - censusAt > 180000 ||
                           !['starting', 'running'].includes(String(observed.phase))) return false;
                       if ((linkedBinding.tag && observed.tag !== linkedBinding.tag) ||
@@ -3117,7 +3125,7 @@ export class SessionControlService {
       // `limit` rows; `include=all` adds terminal sessions but stays capped.
       const treeLimit = Math.min(TREE_LIMIT_MAX, Math.max(1, Number(url.searchParams.get('limit')) || TREE_LIMIT_DEFAULT));
       const treeAll = url.searchParams.get('include') === 'all';
-      const activeFrag = activeSessionsSql(this.now());
+      const activeFrag = activeSessionsSql(this.sql, this.now());
       const stateSql = treeAll ? '' : `AND ${LIVE_STATES_SQL} AND ${activeFrag.sql}`;
       const treeFrom = treeAll ? 'session_control_sessions' : liveFrom(admin);
       const stateArgs: any[] = treeAll ? [] : activeFrag.params;
@@ -3167,7 +3175,8 @@ export class SessionControlService {
         : this.sql.exec("SELECT * FROM session_control_sessions WHERE state = 'running' AND actor = ? ORDER BY created_at, id LIMIT ?", caller.actor, WARN_LIMIT + 1).toArray()) as any[];
       const warningsTruncated = warnRows.length > WARN_LIMIT;
       const rows = warnRows.slice(0, WARN_LIMIT);
-      const warnings = rows.filter(row => this.ownerOk(row, caller)).map(row => this.view(row, threshold)).filter(row => row.warning_active);
+      const freshness: NativeObservationCache = new Map();
+      const warnings = rows.filter(row => this.ownerOk(row, caller)).map(row => this.view(row, threshold, freshness)).filter(row => row.warning_active);
       let wake_alerts: any[] = [];
       try {
         const ownedIds = new Set(rows.filter(row => this.ownerOk(row, caller)).map((r: any) => r.id));
@@ -3217,7 +3226,8 @@ export class SessionControlService {
           : this.sql.exec(`SELECT * FROM session_control_sessions WHERE actor = ? AND state IN (${states}) ORDER BY created_at DESC, id DESC LIMIT ?`, caller.actor, ...LIVE_STORED_STATES, cap + 1).toArray()
         ).filter((r: any) => observeAll || this.ownerOk(r, caller));
         const scanned = live.slice(0, cap);
-        return response(buildSessionBreakdown(this.sql, scanned.map(r => this.view(r)), dims,
+        const freshness: NativeObservationCache = new Map();
+        return response(buildSessionBreakdown(this.sql, scanned.map(r => this.view(r, null, freshness)), dims,
           { now_ms: this.now(), scanned: scanned.length, truncated: live.length > cap }));
       }
       const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit')) || 50));
@@ -3227,7 +3237,7 @@ export class SessionControlService {
       const liveOnly = url.searchParams.get('live') === '1' || url.searchParams.get('active') === '1';
       const listFrom = liveOnly ? liveFrom(observeAll) : 'session_control_sessions';
       if (liveOnly) {
-        const frag = activeSessionsSql(this.now());
+        const frag = activeSessionsSql(this.sql, this.now());
         cursorSql += ` AND ${LIVE_STATES_SQL} AND ${frag.sql}`;
         params.push(...frag.params);
       }
@@ -3237,14 +3247,15 @@ export class SessionControlService {
       ).filter((r: any) => observeAll || this.ownerOk(r, caller));
       const page = rows.slice(0, limit);
       const next = rows.length > limit ? `${(page[page.length - 1] as any).created_at}|${(page[page.length - 1] as any).id}` : null;
-      const countFrag = activeSessionsSql(this.now());
+      const countFrag = activeSessionsSql(this.sql, this.now());
       // Capped count over the partial live index: bounded by ACTIVE_COUNT_CAP matches, never a base-table scan.
       const countFrom = liveFrom(observeAll);
       const activeCount = Number((observeAll
         ? this.sql.exec(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM ${countFrom} WHERE ${LIVE_STATES_SQL} AND ${countFrag.sql} LIMIT ?)`, ...countFrag.params, ACTIVE_COUNT_CAP)
         : this.sql.exec(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM ${countFrom} WHERE actor = ? AND ${LIVE_STATES_SQL} AND ${countFrag.sql} LIMIT ?)`, caller.actor, ...countFrag.params, ACTIVE_COUNT_CAP)
       ).toArray()[0]?.n ?? 0);
-      return response({ sessions: page.map(r => this.view(r, threshold)), next_cursor: next, active_count: activeCount, active_count_capped: activeCount >= ACTIVE_COUNT_CAP });
+      const freshness: NativeObservationCache = new Map();
+      return response({ sessions: page.map(r => this.view(r, threshold, freshness)), next_cursor: next, active_count: activeCount, active_count_capped: activeCount >= ACTIVE_COUNT_CAP });
     }
 
     // M15c lifecycle durable seams (narrow; command auth/effect code untouched).
@@ -4207,9 +4218,9 @@ export class SessionControlService {
             // while its state is still being reported. The host's last census
             // proves the row is still current for a session that stays in the
             // live catalog; a dead/unobserved phase gets no such credit.
-            const seen: any = (reported && live.machine_id)
-              ? this.sql.exec('SELECT observed_at FROM fleet_catalog_seen WHERE machine_id = ?', live.machine_id).toArray()[0] : null;
-            const seenMs = typeof seen?.observed_at === 'string' ? Date.parse(seen.observed_at) : NaN;
+            const catalogAt = (reported && live.machine_id)
+              ? freshCatalogs(this.sql, this.now()).get(String(live.machine_id)) : undefined;
+            const seenMs = catalogAt ?? NaN;
             const catalogLive = ['starting', 'running'].includes(String(reported?.phase ?? ''));
 
             // Recency (AC4): agent_state alone is not enough — a stale report
@@ -4914,7 +4925,7 @@ export function promoteStartedOffers(sql: SqlStorage, nowMs: number, scope: { la
  * repeat: live/uncertain launches and bound sessions are never reaped. */
 export function reconcileStaleSessions(sql: SqlStorage, nowMs: number, batch = 200): { reconciled: number; remaining: number } {
   sql.exec('CREATE TABLE IF NOT EXISTS session_stale_reconciliations (session_id TEXT PRIMARY KEY, previous_state TEXT NOT NULL, reason TEXT NOT NULL, at TEXT NOT NULL)');
-  const frag = activeSessionsSql(nowMs);
+  const frag = activeSessionsSql(sql, nowMs);
   // Grace: never touch rows updated in the last hour (fresh launches that have not reported yet).
   const grace = new Date(nowMs - 3600_000).toISOString();
   const where = `state IN ('starting','running','uncertain','offered') AND updated_at < ? AND NOT ${frag.sql}`;
