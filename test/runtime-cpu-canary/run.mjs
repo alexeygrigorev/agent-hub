@@ -87,10 +87,12 @@ if(process.argv.includes('--cleanup-only')){
   await cli(['secret','bulk',resolve(out,'private-secrets.json'),'--config',config]);
   const settings=await api('/workers/scripts/'+j.worker+'/settings');assert.equal(settings.status,200);assert.equal(settings.body.result?.limits?.cpu_ms,500);
   proof.provider_limits=settings.body.result.limits;
+  const tailSettings=await api('/workers/scripts/'+j.worker+'/script-settings');
+  proof.tail_consumer_readback={status:tailSettings.status,services:Array.isArray(tailSettings.body.result?.tail_consumers)?tailSettings.body.result.tail_consumers.map(v=>v.service):[]};
   const subdomain=await api('/workers/subdomain');assert.equal(subdomain.status,200);
   const base='https://'+j.worker+'.'+subdomain.body.result.subdomain+'.workers.dev';proof.url=base;
   const key=JSON.parse(await readFile(resolve(out,'private-secrets.json'),'utf8')).CANARY_KEY;
-  async function request(path){const started=performance.now();const response=await fetch(base+path,{headers:{Authorization:'Bearer '+key,'User-Agent':'hub2-cpu-runtime/'+source},signal:AbortSignal.timeout(Math.min(8000,remaining()))});return{status:response.status,text:await response.text(),round_trip_ms:Math.ceil(performance.now()-started)};}
+  async function request(path){const started=performance.now();const response=await fetch(base+path,{headers:{Authorization:'Bearer '+key,'User-Agent':'hub2-cpu-runtime/'+source},signal:AbortSignal.timeout(Math.min(8000,remaining()))});const result={status:response.status,text:await response.text(),round_trip_ms:Math.ceil(performance.now()-started)};(proof.http_requests??=[]);if(proof.http_requests.length<48)proof.http_requests.push({path,...observation(result)});return result;}
   const observation=result=>{let body;try{body=JSON.parse(result?.text||'');}catch{}return{status:result?.status,round_trip_ms:result?.round_trip_ms,cpu_signature:/1102|(?<![A-Za-z])CPU(?![A-Za-z])[^".]{0,80}(?:limit|exceed)|resource limits?/i.test(result?.text||''),completed:body?.completed===true,error:body?.probe_error??body?.error??null,secret_bound:body?.secret_bound,source_matches:body?.source===source,edge_error_codes:[...String(result?.text||'').matchAll(/\b(10\d\d|11\d\d)\b/g)].map(m=>m[1]).slice(0,4)};};
   let smoke;
   for(let i=0;i<6;i++){try{smoke=await request('/smoke');if(smoke.status===200)break;}catch{}remaining();await new Promise(r=>setTimeout(r,1000));}
