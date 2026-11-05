@@ -104,7 +104,7 @@ try {
   assert(controllerProfiles['/_internal/settle'].max_reads<=64);
   assert(controllerProfiles['/_internal/settle'].max_writes<=8);
   const controllerProof={profiles:controllerProfiles,proposed_settle_allowance:{reads:64,writes:8},basis:'Native cold reserve, new threshold during actual overrun settle, warm settle and post-restart replay. Source bounded PK lookups, budget_days row write <=1, reservation row plus changed day/state index <=3, at most one alert row/index insertion <=2; <=6 source-level row/index writes, allowance8, no alarms.'};
-  await (await import('node:fs/promises')).writeFile('/home/alexey/tmp/agent-reports/hub2-controller-sql-profile.json',JSON.stringify(controllerProof,null,2));
+  await (await import('node:fs/promises')).writeFile(resolve(root,'.local/tmp/hub2-controller-sql-profile.json'),JSON.stringify(controllerProof,null,2));
   console.log(JSON.stringify({ passed: true, gate: 'workerd SQLite object restart', daily_alerts_after_restart: afterRestart.result.alerts, settled_usd: afterRestart.result.settled_usd, controller_native_profiles:controllerProfiles, note: 'Synthetic cost units; no Cloudflare billing/API or production data accessed.' }));
 } finally {
   await mf.dispose();
