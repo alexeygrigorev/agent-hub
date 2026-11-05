@@ -1,0 +1,87 @@
+name: Isolated Hub runtime CPU canary
+on:
+  push:
+    branches: [hub2-runtime-canary-*]
+    paths:
+      - test/runtime-cpu-canary/**
+      - .github/workflows/hub2-runtime-canary.yml
+permissions:
+  contents: read
+concurrency:
+  group: runtime-cpu-canary-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  cpu-enforcement:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      journal: ${{ steps.prepare.outputs.artifact }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: node test/runtime-cpu-canary/fences.test.mjs
+      - run: npm ci
+        timeout-minutes: 3
+      - name: Prepare owned fresh-name journal
+        id: prepare
+        timeout-minutes: 1
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          node test/runtime-cpu-canary/run.mjs --prepare
+          echo "artifact=runtime-cpu-journal-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.prepare.outputs.artifact }}
+          path: .local/runtime-cpu-canary/journal.json
+          if-no-files-found: error
+      - name: Verify isolated provider CPU limit
+        timeout-minutes: 4
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: node test/runtime-cpu-canary/run.mjs --execute
+      - name: Always remove only the journaled synthetic Worker
+        if: always() && steps.prepare.outcome == 'success'
+        timeout-minutes: 2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: node test/runtime-cpu-canary/run.mjs --cleanup-only
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: runtime-cpu-proof
+          path: |
+            .local/runtime-cpu-canary/proof.json
+            .local/runtime-cpu-canary/cleanup-proof.json
+          if-no-files-found: warn
+  independent-cleanup:
+    needs: cpu-enforcement
+    if: always() && needs.cpu-enforcement.outputs.journal != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.cpu-enforcement.outputs.journal }}
+          path: .local/runtime-cpu-canary
+      - name: Verify owned resource absent, independently of test runner
+        timeout-minutes: 2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: node test/runtime-cpu-canary/run.mjs --cleanup-only
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: runtime-cpu-independent-cleanup
+          path: .local/runtime-cpu-canary/cleanup-proof.json
