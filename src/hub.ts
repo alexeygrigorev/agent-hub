@@ -1,4 +1,5 @@
 import { alertDestinations, inboxReaderStatus, ALERT_SUBJECT_COOLDOWN_MS, BUS_REFRESH_GRACE_MS, pruneAlertRouting, suppressOpenAlertBackfill } from './alert-routing';
+import { alertReceipts, linkAlertInboxMessage, onMessageStageReceipt, pruneAlertReceipts, recordRelayReceipt } from './alert-relay-receipts';
 import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES, RecipientError, ScopingRefusal, NAMED_AGENT_PROJECT, pollSessionCredentials, mintSessionCredential, checkSendScoping, sessionIdOf, sessionRefreshAllowed, messagingSettings, updateMessagingSettings, messageEvent, setMessageState, expireSessionMessages, expireMessageEvents, readdressMessage, setDelegate, listDelegates, authorizedNamedAgent, setNamedAgentForward } from './session-messaging';
 import { handleNamedAgentRequest } from './named-agents';
 import { IdleWorkService } from './idle-work';
@@ -261,7 +262,7 @@ export class Hub extends DurableObject {
       resolveRecipient: (toActor, now) => resolveRecipient(this.sql, toActor, now),
       checkSendScope: (caller, senderActor, toActor, now) => checkSendScoping(this.sql, caller, senderActor, toActor, now),
       afterInsert: (message, opts, now) => afterMessageInsert(this.sql, message, { delivery: opts.delivery, deliverByMs: opts.deliverByMs, ref: opts.ref, now }),
-      onStage: (id, state, actor, machine, now) => setMessageState(this.sql, id, state, null, actor, machine, now),
+      onStage: (id, state, actor, machine, now) => { setMessageState(this.sql, id, state, null, actor, machine, now); onMessageStageReceipt(this.sql, id, state, now); },
       onRefusal: (caller, opts, error) => {
         if (error instanceof ScopingRefusal || ['unauthorized', 'from_actor_mismatch'].includes(error?.message)) {
           messageEvent(this.sql, 'refused-' + crypto.randomUUID(), 'send_refused', caller.actor ?? null, caller.machineId ?? null, Date.now(),
@@ -1301,6 +1302,32 @@ export class Hub extends DurableObject {
       }
       if (path === '/api/session-schedules' || path.startsWith('/api/session-schedules/')) {
         return this.sessionSchedules.handle(request, await this.sessionControlAuth(request));
+      }
+      // Alert inbox-ack and onward-relay receipts (intake 1429bf88). The
+      // read view is operator-only; relay receipts are written by the relay
+      // owner through the operator path, never by worker credentials.
+      if (path === '/api/alert-receipts' || path.startsWith('/api/alert-receipts/')) {
+        const auth = await this.sessionControlAuth(request);
+        const caller = auth.caller;
+        if (!caller?.isAdmin) return auth.error || Response.json({ error: 'forbidden' }, { status: 403 });
+        if (path === '/api/alert-receipts' && request.method === 'GET') {
+          const raw = new URL(request.url).searchParams.get('limit');
+          const limit = raw === null ? 100 : Number(raw);
+          if (!Number.isFinite(limit)) return Response.json({ error: 'invalid_limit' }, { status: 400 });
+          return Response.json(alertReceipts(this.sql, limit), { headers: { 'Cache-Control': 'private, no-store' } });
+        }
+        const relayMatch = /^\/api\/alert-receipts\/(\d+)\/relay$/.exec(path);
+        if (relayMatch && request.method === 'POST') {
+          let input: any;
+          try { input = await request.json(); } catch { return Response.json({ error: 'malformed_json' }, { status: 400 }); }
+          const result = recordRelayReceipt(this.sql, Number(relayMatch[1]), input, caller.actor || 'admin', Date.now);
+          if ('error' in result) return Response.json(result, { status: result.error === 'alert_not_found' ? 404 : 400 });
+          this.sql.exec('INSERT INTO audit (actor, action, resource, target, detail, at) VALUES (?, ?, ?, ?, ?, ?)',
+            caller.actor || 'admin', 'alert.relay_receipt', 'liveness_alert', relayMatch[1],
+            JSON.stringify({ relay_ref: result.receipt.relay_ref, relayed_at: result.receipt.relayed_at }), new Date().toISOString());
+          return Response.json({ relay: result.receipt }, { status: 201, headers: { 'Cache-Control': 'private, no-store' } });
+        }
+        return Response.json({ error: 'not_found' }, { status: 404 });
       }
       // Cron launch schedules (intake a839dfb6). Admin management under
       // /api/schedules with the same operator/cookie authority as webhooks;
@@ -2588,11 +2615,14 @@ export class Hub extends DurableObject {
         const canonical = this.busService.canonicalActor(to);
         if (!inboxReaderStatus(this.sql, canonical).active_reader) { errors.push(`${to}: no_active_credential_read_loop`); continue; }
         if (!allowed(target)) continue;
+        let sentId: string | null = null;
         try {
           const key = 'alert-' + alert.id + '-' + (await sha256(target)).slice(0, 24);
-          this.busService.send({ isAdmin: true, actor: 'hub', kind: 'human' }, { senderActor: 'hub', toActor: to, kind: 'note', body: text, idempotencyKey: key });
+          const sent = this.busService.send({ isAdmin: true, actor: 'hub', kind: 'human' }, { senderActor: 'hub', toActor: to, kind: 'note', body: text, idempotencyKey: key });
           success(target);
+          sentId = sent.id;
         } catch { errors.push(`${to}: inbox delivery failed`); }
+        if (sentId) linkAlertInboxMessage(this.sql, alert.id, 'inbox:' + to, sentId, Date.now());
       }
       // Keep a destination fingerprint, never the webhook URL, in receipts.
       const webhookTarget = webhook ? 'webhook:' + (await sha256(webhook)).slice(0, 24) : null;
@@ -2713,6 +2743,7 @@ export class Hub extends DurableObject {
     for (const alert of await m('banked_resets', () => new BankedResets(this.sql, this.livenessService).run())) await this.notifyAlert(alert);
     await m('liveness_prune', () => this.livenessService.prune());
     pruneAlertRouting(this.sql);
+    pruneAlertReceipts(this.sql);
     this.checkBusAuthFailures();
     const routingErrors = destinations.actors.filter(to => !inboxReaderStatus(this.sql, this.busService.canonicalActor(to)).active_reader).map(to => `${to}: no_active_credential_read_loop`);
     if (destinations.invalidWebhook) routingErrors.push('invalid alert webhook configuration');

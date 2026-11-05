@@ -1,4 +1,5 @@
 import { initAlertRouting } from './alert-routing';
+import { initAlertRelayReceipts } from './alert-relay-receipts';
 import { registryAddress, registryRowSql } from './agent_registry';
 import { validateRef } from './session-messaging';
 /** Older writers could cut a metadata JSON string mid-escape. Keep the
@@ -287,6 +288,7 @@ export class BusService {
   constructor(sql: SqlStorage, txSync?: <T>(fn: () => T) => T, hooks?: BusSendHooks) {
     this.sql = sql;
     initAlertRouting(sql);
+    initAlertRelayReceipts(sql);
     this.txSync = txSync;
     this.hooks = hooks;
   }

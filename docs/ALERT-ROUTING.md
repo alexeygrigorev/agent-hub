@@ -68,3 +68,27 @@ operator ACK is not a replacement for its reader.
 The alerting Worker credential cannot inspect the current production backlog.
 The first production check after a destination cutover reports the number of
 open rows it suppresses in the single summary; no live total is claimed here.
+
+## Inbox-ack and onward-relay receipts (intake 1429bf88)
+
+Delivery to a bot inbox is not the end of an alert, so the Hub now records
+what happened next. Every successful inbox alert send links its bus message id
+to the alert (`alert_inbox_links`), and the recipient's `read`/`ack` stages
+stamp that link, giving a durable, operator-readable receipt per alert with no
+message bodies. Onward relay to Alexey is reported, never inferred: the relay
+owner (Grok Bot / Developer) records the forward receipt id and timestamp per
+alert through the operator path, and an alert with no such receipt is reported
+as explicitly `unconfirmed`.
+
+- Operator view: `GET /api/alert-receipts?limit=N` (bounded, admin/cookie or
+  operator token) lists per alert: `delivered_to`, inbox links with read/ack
+  times, the relay receipt or `relay_state: "unconfirmed"`, plus an
+  `unconfirmed` count. CLI: `hub alerts receipts [--limit N] [--json]`.
+- Relay report: `POST /api/alert-receipts/:id/relay` with `{"relay_ref":
+  "<forward receipt id>", "relayed_at": "<ISO>"}` (admin only; worker
+  credentials are denied). CLI: `hub alerts relay <id> --ref <receipt-id>
+  [--at ISO]`. A later report replaces the earlier one; writes are audited
+  (`alert.relay_receipt`) and carry ids only.
+- Retention: receipt rows share the liveness alert lifecycle and are pruned
+  when their alert row ages out of retention; orphans never linger.
+
