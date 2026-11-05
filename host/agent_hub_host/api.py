@@ -92,7 +92,7 @@ def replay_keyed(call, transient, *, delays=None, sleep=None, notify=None):
 # (2026-11-02 desktop) otherwise looks exactly like an offline machine.
 HUB_UNREACHABLE_LOG_AFTER_S = 120.0
 HUB_UNREACHABLE_RELOG_S = 600.0
-_hub_outage = {'since': None, 'logged_at': None, 'failures': 0}
+_hub_outage = {'since': None, 'logged_at': None, 'failures': 0, 'successes': 0}
 
 
 def hub_unreachable_suspect(error) -> str:
@@ -110,14 +110,33 @@ def hub_unreachable_suspect(error) -> str:
     return 'transport error %s' % type(reason).__name__
 
 
-def _note_hub_success():
-    _hub_outage.update(since=None, logged_at=None, failures=0)
+def _note_hub_success(*, now=None, emit=None):
+    """Close a reported outage after two consecutive Hub responses.
+
+    A single successful request can be a transient recovery. Keep the outage
+    episode open until a second response succeeds; any transport failure resets
+    the streak. The notice goes to the host process log, outside Hub.
+    """
+    out = _hub_outage
+    if out['since'] is None or out['logged_at'] is None:
+        out.update(since=None, logged_at=None, failures=0, successes=0)
+        return False
+    out['successes'] += 1
+    if out['successes'] < 2:
+        return False
+    now = time.monotonic() if now is None else now
+    line = json.dumps({'event': 'hub_recovered', 'after_successes': 2,
+                       'outage_for_s': max(0, int(now - out['since']))})
+    (emit or (lambda l: print(l, flush=True)))(line)
+    out.update(since=None, logged_at=None, failures=0, successes=0)
+    return True
 
 
 def _note_hub_failure(error, *, now=None, emit=None):
     now = time.monotonic() if now is None else now
     out = _hub_outage
     out['failures'] += 1
+    out['successes'] = 0
     if out['since'] is None:
         out['since'] = now
     if now - out['since'] < HUB_UNREACHABLE_LOG_AFTER_S:

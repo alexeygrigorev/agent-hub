@@ -1,5 +1,9 @@
 import urllib.request
 import urllib.error
+import socket
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import pytest
 import sys, os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import unittest
@@ -160,6 +164,7 @@ def test_hub_unreachable_guard_logs_once_with_suspect(monkeypatch):
     import urllib.error
     from agent_hub_host import api
     api._note_hub_success()
+
     monkeypatch.setenv('HTTPS_PROXY', 'http://127.0.0.1:8899')
     lines = []
     err = urllib.error.URLError(ConnectionRefusedError(10061, 'refused'))
@@ -168,10 +173,54 @@ def test_hub_unreachable_guard_logs_once_with_suspect(monkeypatch):
     assert api._note_hub_failure(err, now=1121.0, emit=lines.append)
     assert not api._note_hub_failure(err, now=1200.0, emit=lines.append)
     assert len(lines) == 1 and 'HTTPS_PROXY' in lines[0] and 'refused' in lines[0] and '8899' not in lines[0]
-    api._note_hub_success()
+    assert not api._note_hub_success(now=1201.0, emit=lines.append)
+    assert api._note_hub_success(now=1202.0, emit=lines.append)
+    assert len(lines) == 2 and '"event": "hub_recovered"' in lines[-1]
     assert api._hub_outage['since'] is None
     dns = urllib.error.URLError(socket.gaierror(11001, 'no host'))
     assert 'DNS' in api.hub_unreachable_suspect(dns)
+
+
+def test_local_refusal_emits_one_host_log_episode_then_two_success_recovery(monkeypatch, capsys):
+    """Exercise the existing transport observer and host-log sink against local endpoints."""
+    api._note_hub_success()
+    class HealthyHub(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(b'{"ok":true}')
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), HealthyHub)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    with socket.socket() as sock:
+        sock.bind(('127.0.0.1', 0))
+        unreachable = 'http://127.0.0.1:%d/' % sock.getsockname()[1]
+    try:
+        healthy = 'http://127.0.0.1:%d/' % server.server_port
+        monkeypatch.setattr(api, 'HUB_UNREACHABLE_LOG_AFTER_S', 0)
+        from agent_hub_host import _prod_guard
+        monkeypatch.setattr(_prod_guard, 'assert_request_allowed', lambda _req: None)
+        with pytest.raises(urllib.error.URLError):
+            api.safe_http_json(urllib.request.Request(unreachable), timeout=0.2)
+        with pytest.raises(urllib.error.URLError):
+            api.safe_http_json(urllib.request.Request(unreachable), timeout=0.2)
+        assert api.safe_http_json(urllib.request.Request(healthy), timeout=1) == {'ok': True}
+        assert api._hub_outage['successes'] == 1
+        assert api.safe_http_json(urllib.request.Request(healthy), timeout=1) == {'ok': True}
+        assert api._hub_outage['since'] is None
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 2
+    assert '"event": "hub_unreachable"' in lines[0]
+    assert '"event": "hub_recovered"' in lines[1] and '"after_successes": 2' in lines[1]
 
 
 def test_package_import_adds_hub_to_no_proxy():
