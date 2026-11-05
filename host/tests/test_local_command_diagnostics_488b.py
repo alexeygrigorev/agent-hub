@@ -85,7 +85,17 @@ class LocalCommandDiagnostics(unittest.TestCase):
         raw = ('Traceback (most recent call last):\n'
                '  File "/private/path", line 1, in main\n'
                '    print("arbitrary-private-value")\nValueError: disk reserve')
-        self.assertEqual(output_tail(raw), '[traceback output withheld]')
+        self.assertEqual(output_tail(raw), '[traceback output withheld] ValueError: disk reserve')
+        self.assertNotIn('arbitrary-private-value', output_tail(raw))
+        self.assertNotIn('/private/path', output_tail(raw))
+
+    def test_traceback_final_line_keeps_failure_name_without_paths(self):
+        raw = ('Traceback (most recent call last):\n  File "/x", line 1, in m\n'
+               'sqlite3.OperationalError: unable to open /home/alexey/git/a/state.db')
+        self.assertEqual(output_tail(raw),
+                         '[traceback output withheld] sqlite3.OperationalError: unable to open <path>')
+        self.assertEqual(output_tail('Traceback (most recent call last):\n  x\nnot an exception line'),
+                         '[traceback output withheld]')
 
     def test_full_window_is_redacted_before_tail_truncation(self):
         secret = 'multiline-secret-' * 100
