@@ -127,7 +127,11 @@ PYTEST_RC=0
 PYTEST_MARKER="${RUN_TMP_ABSOLUTE}/refused-pytest"
 # Native worker-profile discovery bypasses HOME. Test children must not inherit
 # the real session identity, credential selectors, or managed XDG config roots.
-PYTHON_ENV=(env)
+# Absolute path: uv's shell setup includes ~/.local/bin/env as a snippet for
+# profiles to source; it must remain non-executable. After incident 504d662b,
+# its executable bit let it shadow coreutils. Because it ignores arguments,
+# the bare name silently skipped this phase when ~/.local/bin led PATH.
+PYTHON_ENV=(/usr/bin/env)
 while IFS= read -r name; do
   case "$name" in
     AGENT_HUB_HEAVY_TEST_HELD) ;;  # keep: nested runners must not take a second slot

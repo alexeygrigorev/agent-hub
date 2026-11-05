@@ -81,7 +81,9 @@ class FullLocalStorageTests(unittest.TestCase):
         base = Path(os.environ.get("TMPDIR", RUNNER.parent.parent / ".local/tmp")).resolve()
         base.mkdir(parents=True, exist_ok=True)
         self.root = Path(tempfile.mkdtemp(prefix="runner-storage-", dir=base))
-        self.repo = self.root / "repo"
+        # Keep the fake checkout path long enough to exercise Linux's socket
+        # path limit even when the real worktree path is short.
+        self.repo = self.root / "repo" / "fixture-path-for-unix-domain-socket-boundary"
         scripts = self.repo / "scripts"
         scripts.mkdir(parents=True)
         shutil.copyfile(RUNNER, scripts / RUNNER.name)
@@ -117,7 +119,7 @@ class FullLocalStorageTests(unittest.TestCase):
 
     def start(self, name, runner_args=(), capped=False, retry=None, **overrides):
         record = self.root / f"{name}.jsonl"
-        env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}",
+        env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}", CI="true",
                    TMPDIR=str(self.temp), HOME=str(self.root / "original-home"),
                    UV_CACHE_DIR=str(self.root / "shared-uv-cache"), STORAGE_RECORD=str(record),
                    # These commands are stubs, not real heavy suites. Keep
