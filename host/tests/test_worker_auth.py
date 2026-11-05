@@ -16,6 +16,48 @@ OFFER = '11111111-2222-4333-8444-555555555555'
 
 
 class WorkerAuthTests(unittest.TestCase):
+    def test_provision_failure_categories_are_sanitized_and_stable(self):
+        cases = [
+            (409, 'already_claimed', 'hub_refused_duplicate'),
+            (409, 'worker_launch_not_starting', 'hub_refused'),
+            (503, 'private_server_text', 'hub_unreachable'),
+            (401, 'private_server_text', 'expired'),
+        ]
+
+        class HubFailure(RuntimeError):
+            def __init__(self, status, code):
+                self.http_status = status
+                self.error_code = code
+                super().__init__('PRIVATE_RESPONSE_BODY')
+
+        with tempfile.TemporaryDirectory() as tmp:
+            for status, code, expected in cases:
+                with self.subTest(status=status, code=code):
+                    def fail(*args, **kwargs):
+                        raise HubFailure(status, code)
+                    with self.assertRaises(auth.WorkerCredentialError) as caught:
+                        auth.provision(tmp, OFFER, fail)
+                    self.assertEqual(caught.exception.category, expected)
+                    self.assertNotIn('PRIVATE_RESPONSE_BODY', str(caught.exception))
+
+    def test_invalid_expired_and_unwritable_provision_results_have_distinct_categories(self):
+        valid = dict(worker_launch_id=OFFER, client_kind='agent',
+                     access_token='hubt_test-only', refresh_token='hubr_test-only',
+                     base_url='https://hub.test', worker_expires_at=9999999999999)
+        with tempfile.TemporaryDirectory() as tmp:
+            cases = [({}, 'invalid_response'),
+                     ({**valid, 'worker_expires_at': 1}, 'expired')]
+            for response, expected in cases:
+                with self.subTest(expected=expected), self.assertRaises(auth.WorkerCredentialError) as caught:
+                    auth.provision(tmp, OFFER, Mock(return_value=response))
+                self.assertEqual(caught.exception.category, expected)
+
+            with patch.object(auth.private_fs, 'atomic_write', side_effect=PermissionError('PRIVATE_PATH')):
+                with self.assertRaises(auth.WorkerCredentialError) as caught:
+                    auth.provision(tmp, OFFER, Mock(return_value=valid))
+            self.assertEqual(caught.exception.category, 'workspace_unwritable')
+            self.assertNotIn('PRIVATE_PATH', str(caught.exception))
+
     def test_managed_home_scrub_does_not_remove_repo_scoped_credential(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -71,8 +113,9 @@ class WorkerAuthTests(unittest.TestCase):
             path.symlink_to(outside)
             request = Mock(return_value=dict(worker_launch_id=OFFER, client_kind='agent',
                 access_token='hubt_test', refresh_token='hubr_test', base_url='https://hub.test', worker_expires_at=9999999999999))
-            with self.assertRaises(OSError):
+            with self.assertRaises(auth.WorkerCredentialError) as caught:
                 auth.provision(tmp, OFFER, request)
+            self.assertEqual(caught.exception.category, 'workspace_unwritable')
             self.assertEqual(outside.read_text(), 'preserve')
 
     def test_published_workspace_finds_profile_after_worker_changes_directory(self):

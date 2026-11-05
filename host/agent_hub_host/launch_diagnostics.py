@@ -17,6 +17,13 @@ REFUSALS = {
     'worktree_identity_failed: original repository could not be recorded': ('launcher_worktree_identity_failed', 'The original worktree repository identity could not be recorded before native start.'),
     'launcher_disk_reserve': ('launcher_disk_reserve', 'Host disk headroom after launcher reservations is below the maintained disk floor.'),
     'Worker Hub credential could not be prepared': ('launcher_worker_auth_unavailable', 'Worker Hub credential could not be prepared.'),
+    'Worker Hub credential unavailable (hub_refused_duplicate)': ('launcher_worker_auth_hub_refused_duplicate', 'Worker Hub refused the credential request as a duplicate.'),
+    'Worker Hub credential unavailable (hub_refused)': ('launcher_worker_auth_hub_refused', 'Worker Hub refused the credential request.'),
+    'Worker Hub credential unavailable (hub_unreachable)': ('launcher_worker_auth_hub_unreachable', 'Worker Hub could not be reached while preparing the credential.'),
+    'Worker Hub credential unavailable (invalid_response)': ('launcher_worker_auth_invalid_response', 'Worker Hub returned an invalid credential response.'),
+    'Worker Hub credential unavailable (expired)': ('launcher_worker_auth_expired', 'The Worker Hub credential request or returned credential was expired.'),
+    'Worker Hub credential unavailable (workspace_unwritable)': ('launcher_worker_auth_workspace_unwritable', 'The worker workspace could not safely store the scoped credential.'),
+    'Worker Hub credential unavailable (unknown)': ('launcher_worker_auth_unknown', 'The worker credential could not be prepared for an unclassified reason.'),
     'memory_pressure': ('memory_pressure', 'Host memory full pressure exceeds the safety cap.'),
     'host_oom': ('host_oom', 'A recent host OOM kill requires a placement cooldown.'),
     # Also registers the fixed summary accepted by launcher_recovery's

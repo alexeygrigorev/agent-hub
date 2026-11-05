@@ -3867,6 +3867,9 @@ class Dispatcher:
         try:
             provision(workspace, offer_id, self.request)
         except Exception as exc:
+            from .worker_auth import WorkerCredentialError
+            category = (exc.category if isinstance(exc, WorkerCredentialError)
+                        else 'unknown')
             # Keep the public launch reason fixed, but preserve enough bounded
             # evidence in the host journal to identify which worker-credential
             # step failed. Do not log exception text or response bytes: an
@@ -3885,13 +3888,14 @@ class Dispatcher:
                     'error_type': type(exc).__name__[:64],
                     'status': status,
                     'code': code,
+                    'category': category,
                 }), flush=True)
             except Exception:
                 pass
             # This POST mints credentials. A timeout can follow a committed
             # issuance, so replaying it without server idempotency may create
             # more valid tokens. Keep it fail-closed until that contract exists.
-            raise ValueError('Worker Hub credential could not be prepared') from None
+            raise ValueError('Worker Hub credential unavailable (' + category + ')') from None
 
     def dispatch(self, offer):
         if offer.get('with_goal') and offer.get('mode') != 'interactive':
