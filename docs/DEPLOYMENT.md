@@ -18,6 +18,28 @@ Continuous deployment is orchestrated via GitHub Actions workflows:
 
 ---
 
+## 1b. Release slots (orchestrator release gate, intake 2c87c231)
+
+Every production deploy consumes exactly one **release slot**: a single-use, target-bound record the orchestrator issued through the Hub. Main-push CI checks the slot without consuming it. A real `workflow_dispatch` deploy checks and consumes it as its first deploy-job step (`scripts/ci/release_slot_verify.py`), before any build or deploy action. Either check refuses with the reason when the slot is missing, already consumed, revoked, expired, or bound to a different target. The gate fails closed: an unreachable Hub also refuses.
+
+**Flow for a deploy-relevant push to `main`:**
+
+1. Choose a random UUID v4 slot id before finalizing the commit and add `Release-Slot: <uuid>` as a commit trailer. Keep the existing `Scope: in` or `Scope: gray <intake-UUID>` trailer too.
+2. With the final commit SHA known, send that SHA and UUID to the orchestrator (`aplexer message send --to orchestrator-main`), or run as the orchestrator: `hub releases issue --sha <full-sha> --id <uuid> [--ttl-hours N] [--note "..."]` (admin credential required; default TTL 48 h, max 336 h). The Hub rejects SHA slots without a UUID so a guessable capability cannot be issued.
+3. Push `HEAD:main` in the orchestrator's release slot. The first CI job validates the trailer and SHA without consuming the record, then the test job runs. A docs-only push is outside the deployment path filters and needs no release slot.
+4. To deploy that tested SHA, dispatch `deploy.yml` on `main`. The gate repeats the SHA/trailer check and consumes the slot atomically before any deploy step. A dry-run dispatch checks the slot without consuming it. A rollback dispatch similarly consumes a separate slot issued for the exact target version id.
+5. If a check refuses, the Hub response says why: `release_slot_not_found` (never issued / typo), `release_slot_target_mismatch` (slot bound to another SHA), `release_slot_already_consumed` (single-use), `release_slot_revoked`, `release_slot_expired` (ask for a fresh one), or gate-unreachable (fail closed). Fix the cause and get a fresh slot. A refused push never deploys and a check-only failure never burns the slot.
+
+**Rules and exemptions:**
+
+- Deploy-relevant pushes (the `deploy.yml` path filter: `src/**`, `host/**`, `test/**`, `scripts/**`, `public/**`, configs, workflows) require a slot. Docs-only pushes and `[skip ci]` commits never reach the deploy job and are exempt by rule. Pull requests never deploy and need no slot.
+- Manual `workflow_dispatch` runs of `deploy.yml` run the same gate step unconditionally — dispatching cannot bypass the gate, even with `skip_tests` or `dry_run`.
+- `rollback.yml` requires a `release_slot` input consumed against the exact version id: `hub releases issue --target <version_id>`, then dispatch with that slot. Incident flow: read the version id (`npx wrangler versions list`), issue the version-bound slot, dispatch.
+- Only one live (issued, unexpired) slot may exist per target; re-issue after refusal requires the old slot to be consumed, revoked (`hub releases revoke <id>`), or expired (superseded automatically on re-issue). Issue/show/list/revoke are admin-only; the verify endpoint is a capability endpoint — the random UUID v4 slot id is the credential, so no CI secret is needed.
+- Slots and every issue/consume/revoke are audited in the Hub `audit` table (`release_slot_*` actions). Reads are indexed and bounded (`release_slots_active_target` partial unique index, list LIMIT ≤ 200); the public verify endpoint writes only on a successful consume.
+
+---
+
 ## 2. Quota & Trigger Optimization (90% Quota Gate)
 
 To strictly conserve GitHub Actions runner minutes and remain well within the 90% quota boundary:

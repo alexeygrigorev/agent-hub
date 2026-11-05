@@ -53,6 +53,7 @@ import { ChecksService, validateCheck, type ActionDeps } from './checks';
 import { approvalAuthorityMatches, assignApprovalAuthority } from './host_enrollment';
 import { ensureRootScheduling, getRootScheduling, isRootSchedulingEnabled, setRootScheduling } from './root_scheduling';
 import { QuotaStore, dedupeAccountsByCanonical, handleQuotaRoutes } from './quota';
+import { ReleaseSlotService } from './releases';
 import { handleTbmApi } from './tbm-api';
 import { tickTbm } from './tbm-controller';
 import { syncStoredTbmSnapshots } from './tbm-ingestion';
@@ -160,6 +161,7 @@ export class Hub extends DurableObject {
   public repoRegistry: RepoRegistry;
   public provisioningService: ProvisioningService;
   public sessionControlService: SessionControlService;
+  public releaseSlotService: ReleaseSlotService;
   public livenessService: LivenessService;
   public checksService: ChecksService;
   public monitoringService: MonitoringService;
@@ -253,6 +255,10 @@ export class Hub extends DurableObject {
       },
     });
     this.intakeService.init();
+    // Orchestrator release slots (intake 2c87c231): CI consumes one slot per
+    // deploy; issue/show/list/revoke stay admin-only.
+    this.releaseSlotService = new ReleaseSlotService(this.sql, Date.now, fn => this.ctx.storage.transactionSync(fn));
+    this.releaseSlotService.init();
     this.statusService = new StatusService(this.sql, fn => this.ctx.storage.transactionSync(fn), this.intakeService);
     this.statusService.init();
     this.loadDeployMarker();
@@ -921,6 +927,12 @@ export class Hub extends DurableObject {
           }
           return auth;
         });
+      }
+      // Orchestrator release slots (intake 2c87c231): the verify/consume step
+      // is a public capability endpoint (the unguessable slot id is the
+      // credential); every other release-slot route is admin-only.
+      if (path === '/api/releases/slots' || path.startsWith('/api/releases/slots/')) {
+        return this.releaseSlotService.handle(request, await this.authenticateBusRequest(request));
       }
       if (path === '/api/status/observations') {
         const resolved = await this.statusObservationAuth(request);

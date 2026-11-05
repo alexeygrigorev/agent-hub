@@ -7,12 +7,15 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 VALIDATE_SCRIPT = REPO_ROOT / "scripts" / "ci" / "validate-workflow.py"
 ROLLBACK_SCRIPT = REPO_ROOT / "scripts" / "ci" / "rollback.py"
 RETRY_SCRIPT = REPO_ROOT / "scripts" / "ci" / "wrangler_retry.py"
+SLOT_SCRIPT = REPO_ROOT / "scripts" / "ci" / "release_slot_verify.py"
 DEPLOY_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "deploy.yml"
+ROLLBACK_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "rollback.yml"
 
 
 def load_retry_module():
@@ -22,7 +25,18 @@ def load_retry_module():
     return module
 
 
+def load_slot_module():
+    spec = importlib.util.spec_from_file_location("release_slot_verify_under_test", SLOT_SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 RETRY = load_retry_module()
+SLOT = load_slot_module()
+SLOT_A = "00000000-0000-4000-8000-000000000001"
+SLOT_B = "00000000-0000-4000-8000-000000000002"
+SHA_A = "a" * 40
 
 
 class TestCICD(unittest.TestCase):
@@ -57,6 +71,115 @@ class TestCICD(unittest.TestCase):
         self.assertIn("--version-id", res.stdout)
         self.assertIn("--list", res.stdout)
         self.assertIn("Agent Hub Worker Rollback Helper", res.stdout)
+
+
+class TestReleaseSlotGate(unittest.TestCase):
+    """Orchestrator release gate (intake 2c87c231): machine-checked wiring.
+
+    AC1/AC2: main pushes check a slot before tests without consuming it; a
+    workflow_dispatch deploy consumes the same SHA-bound slot before deploy.
+    Rollback dispatch consumes a version-bound slot the same way.
+    """
+
+    def test_deploy_job_gates_before_any_deploy_step(self):
+        content = DEPLOY_WORKFLOW.read_text()
+        self.assertIn("release_slot_verify.py", content, "deploy.yml must run the release slot gate")
+        deploy_job = content.split("\n  deploy:", 1)[1]
+        gate_at = deploy_job.index("release_slot_verify.py")
+        first_deploy_at = deploy_job.index("npx wrangler deploy")
+        self.assertLess(gate_at, first_deploy_at,
+                        "the release slot gate must precede every deploy action")
+        gate_step = deploy_job[deploy_job.index("- name: Release slot gate"):]
+        gate_step = gate_step[:gate_step.index("- name:", 1)]
+        self.assertNotIn("if:", gate_step,
+                         "the gate step itself must be unconditional")
+
+    def test_main_push_gate_checks_without_consuming_and_dispatch_consumes(self):
+        content = DEPLOY_WORKFLOW.read_text()
+        push_gate = content.split("\n  release_slot:", 1)[1].split("\n  test:", 1)[0]
+        self.assertIn("github.event_name == 'push'", push_gate)
+        self.assertIn("github.ref == 'refs/heads/main'", push_gate)
+        self.assertIn("release_slot_verify.py --check-only", push_gate)
+        test_job = content.split("\n  test:", 1)[1].split("\n  deploy:", 1)[0]
+        self.assertIn("needs: release_slot", test_job)
+        deploy_job = content.split("\n  deploy:", 1)[1]
+        self.assertIn("github.event_name == 'workflow_dispatch'", deploy_job)
+        self.assertIn("python3 scripts/ci/release_slot_verify.py", deploy_job)
+        self.assertIn("--check-only", deploy_job, "dry-run dispatch must not consume a slot")
+
+    def test_rollback_job_gates_before_deploy(self):
+        content = ROLLBACK_WORKFLOW.read_text()
+        self.assertIn("release_slot:", content, "rollback.yml must require a release_slot input")
+        self.assertIn("release_slot_verify.py", content, "rollback.yml must run the release slot gate")
+        job = content.split("\n  rollback:", 1)[1]
+        self.assertLess(job.index("release_slot_verify.py"), job.index("wrangler versions deploy"),
+                        "the release slot gate must precede the rollback deploy")
+        self.assertIn('--target "$INPUT_VERSION_ID" --slot "$INPUT_RELEASE_SLOT"', content)
+
+    def test_trailer_parser_requires_exactly_one_uuid_and_refuses_missing(self):
+        message = "feat: x\n\nsome body\nRelease-Slot: " + SLOT_A + "\n"
+        sha = SHA_A
+        with mock.patch.object(SLOT, "commit_message", return_value=message):
+            slot, reason = SLOT.trailer_slot(sha)
+        self.assertEqual(slot, SLOT_A)
+        self.assertIsNone(reason)
+        with mock.patch.object(SLOT, "commit_message", return_value="feat: no trailer\n\nbody only\n"):
+            slot, reason = SLOT.trailer_slot(sha)
+        self.assertIsNone(slot)
+        self.assertIn("no Release-Slot trailer", reason)
+        with mock.patch.object(SLOT, "commit_message", return_value=message + "Release-Slot: " + SLOT_B + "\n"):
+            slot, reason = SLOT.trailer_slot(sha)
+        self.assertIsNone(slot)
+        self.assertIn("multiple Release-Slot trailers", reason)
+
+    def test_verify_mapping_matrix(self):
+        cases = [
+            (200, {"ok": True, "id": SLOT_A, "target": SHA_A, "consumed": True}, True, None),
+            (404, {"error": "release_slot_not_found"}, False, "never issued"),
+            (403, {"error": "release_slot_target_mismatch"}, False, "different deploy target"),
+            (409, {"error": "release_slot_already_consumed"}, False, "already consumed"),
+            (409, {"error": "release_slot_revoked"}, False, "revoked"),
+            (409, {"error": "release_slot_expired"}, False, "expired"),
+            (400, {"error": "invalid_request"}, False, "rejected"),
+        ]
+        for status, body, expect_ok, needle in cases:
+            with self.subTest(status=status, body=body):
+                with mock.patch.object(SLOT, "post_verify", return_value=(status, body, None)):
+                    ok, result = SLOT.verify("https://hub.test", SLOT_A, SHA_A, "ci", clock=lambda s: None, attempts=1)
+                self.assertEqual(ok, expect_ok)
+                if needle:
+                    self.assertIn(needle, str(result))
+
+    def test_verify_retries_transport_and_5xx_only(self):
+        sleeps = []
+        responses = [(None, {}, OSError("down")), (500, {}, None),
+                     (200, {"ok": True, "target": SHA_A, "consumed": True}, None)]
+        with mock.patch.object(SLOT, "post_verify", side_effect=lambda *a: responses.pop(0)):
+            ok, result = SLOT.verify("https://hub.test", SLOT_A, SHA_A, "ci",
+                                     clock=sleeps.append, attempts=3)
+        self.assertTrue(ok)
+        self.assertEqual(sleeps, list(SLOT.RETRY_SLEEP_SECONDS[:2]))
+
+        responses = [(404, {"error": "release_slot_not_found"}, None),
+                     (200, {"ok": True, "target": SHA_A, "consumed": True}, None)]
+        with mock.patch.object(SLOT, "post_verify", side_effect=lambda *a: responses.pop(0)):
+            ok, result = SLOT.verify("https://hub.test", SLOT_A, SHA_A, "ci",
+                                     clock=sleeps.append, attempts=2)
+        self.assertFalse(ok)
+        self.assertEqual(len(responses), 1, "a definitive 4xx must never retry")
+
+    def test_check_only_sends_non_consuming_request(self):
+        response = {"ok": True, "target": SHA_A, "consumed": False}
+        with mock.patch.object(SLOT, "post_verify", return_value=(200, response, None)) as post:
+            ok, _ = SLOT.verify("https://hub.test", SLOT_A, SHA_A, "ci", check_only=True, attempts=1)
+        self.assertTrue(ok)
+        self.assertFalse(post.call_args.args[1]["consume"])
+
+    def test_verify_fails_closed_when_hub_unreachable(self):
+        with mock.patch.object(SLOT, "post_verify", return_value=(None, {}, OSError("down"))):
+            ok, result = SLOT.verify("https://hub.test", SLOT_A, SHA_A, "ci", clock=lambda s: None, attempts=2)
+        self.assertFalse(ok)
+        self.assertIn("fail closed", result)
 
 
 class TestWranglerRetry(unittest.TestCase):

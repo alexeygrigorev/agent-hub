@@ -496,7 +496,10 @@ def main():
     limits_cli.add_parser(sub)
     from . import asks as asks_cli
     asks_cli.add_parser(sub)
-    
+
+    from . import releases as releases_cli
+    releases_cli.add_parser(sub)
+
     p_login = sub.add_parser("login", help="Login to Agent Hub")
     p_login.add_argument("base_url", help="Base URL of the Agent Hub")
     p_login.add_argument('--kind', choices=['host', 'agent'], default='host')
@@ -740,6 +743,9 @@ def main():
         except Exception as exc:
             print(asks_cli.diagnostic(exc), file=sys.stderr)
             sys.exit(1)
+    if args.cmd == 'releases':
+        from . import releases as releases_cli
+        releases_cli.run(args)
         return
     if args.cmd == 'webhooks':
         from . import webhooks as webhooks_cli
