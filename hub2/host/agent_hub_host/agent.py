@@ -376,7 +376,11 @@ class Bridge:
         capabilities=['headless']+[cap+':'+engine for engine in engines for cap in sorted(available[engine]-{'headless'})]
         # Resource Manager collector input: one bounded physical snapshot per heartbeat.
         memory=native_launch.available_memory_mb()
-        resources={'mem_available_mb':memory,'observed_at':int(time.time()*1000)} if memory is not None else None
+        snapshot={'mem_available_mb':memory,'observed_at':int(time.time()*1000)} if memory is not None else None
+        if snapshot is not None:
+            cpu=native_launch.cpu_load_pct()
+            if cpu is not None:snapshot['cpu_load_pct']=cpu
+        resources=snapshot
         self.client.heartbeat(labels,engines,capabilities,resources=resources)
 
     def safety_pause(self,machine_id):

@@ -24,10 +24,10 @@ type RoutingCandidate={id:string;engine:string;model:string;effort?:string;accou
 /** MachineDO /_internal/routing wire contract: resources is the bounded
  * heartbeat snapshot {mem_available_mb,observed_at} exactly as persisted, or
  * absent on hosts that have not reported one yet. */
-type MachineView={machine_id:string;available:boolean;capacity:number;occupied:number;engines:string[];capabilities:string[];resources?:{mem_available_mb:number;observed_at:number}};
+type MachineView={machine_id:string;available:boolean;capacity:number;occupied:number;engines:string[];capabilities:string[];resources?:{mem_available_mb:number;observed_at:number;cpu_load_pct?:number}};
 type AccountView={account:{enabled:number|boolean;capacity:number;occupied:number;min_remaining:number}|null;quota:{remaining:number;valid_until:number;captured_at?:number;reset_at?:number;source:string}|null;fresh:boolean;hosts:string[]};
 export type AdmissionPlan={machine_id:string;engine:string;model:string;effort?:string;account_id:string;policy_id:string;policy_version:unknown;override_reason:string|null;weight:number;quota_remaining:number;required_capabilities:string[]};
-export type HoldKind='quota_unknown'|'quota_stale'|'quota_exhausted'|'account_saturated'|'machine_unavailable'|'host_resources_unknown'|'host_resources_stale'|'capability_unavailable'|'model_policy_unavailable'|'routing_policy_unavailable';
+export type HoldKind='quota_unknown'|'quota_stale'|'quota_exhausted'|'account_saturated'|'machine_unavailable'|'host_resources_unknown'|'host_resources_stale'|'host_resources_saturated'|'capability_unavailable'|'model_policy_unavailable'|'routing_policy_unavailable';
 export type AdmissionOutcome={ok:true;plan:AdmissionPlan}|{ok:false;code:HoldKind;hold:{retry_at:number|null}};
 type PolicyDocument={version:unknown;candidates:RoutingCandidate[]};
 const internalActor=JSON.stringify({id:'hub2-resource-manager',kind:'operator',scopes:['operator:admin','routing:read']});
@@ -41,15 +41,21 @@ const HOST_RESOURCE_TTL_MS=120_000;
  * (hosts must heartbeat resources before admission passes), a stale snapshot
  * is unverified, a non-positive reading is unusable, a malformed timestamp is
  * unknown, and a future-dated snapshot beyond small clock-skew tolerance is
- * unverified rather than trusted. Only a fresh, positive, properly dated
- * snapshot admits.
+ * unverified rather than trusted. A present-but-invalid CPU reading is
+ * unknown; a fresh snapshot reporting CPU saturation refuses admission. Only
+ * a fresh, positive, properly dated snapshot with bounded readings admits.
  */
 const HOST_RESOURCE_FUTURE_TOLERANCE_MS=2_000;
+const HOST_CPU_SATURATED_PCT=90;
 function hostHold(resources:MachineView['resources'],now:number):{code:HoldKind;retry_at:number|null}|null{
   if(!resources)return{code:'host_resources_unknown',retry_at:now+REFRESH_BACKOFF_MS};
   if(!Number.isFinite(resources.mem_available_mb)||resources.mem_available_mb<=0)return{code:'host_resources_unknown',retry_at:now+REFRESH_BACKOFF_MS};
   if(!Number.isSafeInteger(resources.observed_at))return{code:'host_resources_unknown',retry_at:now+REFRESH_BACKOFF_MS};
   if(resources.observed_at>now+HOST_RESOURCE_FUTURE_TOLERANCE_MS||now-resources.observed_at>HOST_RESOURCE_TTL_MS)return{code:'host_resources_stale',retry_at:now+REFRESH_BACKOFF_MS};
+  if(resources.cpu_load_pct!==undefined){
+    if(!Number.isFinite(resources.cpu_load_pct)||resources.cpu_load_pct<0||resources.cpu_load_pct>100)return{code:'host_resources_unknown',retry_at:now+REFRESH_BACKOFF_MS};
+    if(resources.cpu_load_pct>=HOST_CPU_SATURATED_PCT)return{code:'host_resources_saturated',retry_at:now+REFRESH_BACKOFF_MS};
+  }
   return null;
 }
 
@@ -99,7 +105,7 @@ export async function admitLaunch(env:Hub2Env,input:AdmissionRequest):Promise<Ad
   const accounts=new Map<string,AccountView|null>(await Promise.all(accountIds.map(async id=>{try{return [id,await read(env.ACCOUNTS,id,'/_internal/routing') as AccountView] as const;}catch{return [id,null] as const;}})));
   const options:AdmissionPlan[]=[];
   let worst:{code:HoldKind;retry_at:number|null}|null=null;
-  const rank=(code:HoldKind)=>['quota_unknown','quota_stale','quota_exhausted','account_saturated','host_resources_unknown','host_resources_stale','capability_unavailable','machine_unavailable'].indexOf(code);
+  const rank=(code:HoldKind)=>['quota_unknown','quota_stale','quota_exhausted','account_saturated','host_resources_unknown','host_resources_stale','host_resources_saturated','capability_unavailable','machine_unavailable'].indexOf(code);
   const merge=(code:HoldKind,retry_at:number|null):{code:HoldKind;retry_at:number|null}=>!worst||rank(code)<rank(worst.code)?{code,retry_at}:worst;
   for(const c of candidates){
     const a=accounts.get(c.account_id);
@@ -113,6 +119,7 @@ export async function admitLaunch(env:Hub2Env,input:AdmissionRequest):Promise<Ad
       if(resources){worst=merge(resources.code,resources.retry_at);continue;}
       if(!m.engines.includes(c.engine)||required.some(v=>!m.capabilities.includes(v)&&!m.capabilities.includes(v+':'+c.engine))||(c.effort&&!m.capabilities.includes('effort')&&!m.capabilities.includes('effort:'+c.engine))||required.filter(v=>!['headless','interactive'].includes(v)).some(v=>!c.capabilities.includes(v))){
         worst=merge('capability_unavailable',null);continue;}
+      if(!Number.isFinite(m.capacity)||m.capacity<=0||!Number.isFinite(m.occupied)||m.occupied<0||m.occupied>m.capacity){worst=merge('machine_unavailable',null);continue;}
       const weight=c.weight*((a.quota!.remaining-a.account.min_remaining)/100)*((a.account.capacity-a.account.occupied)/a.account.capacity)*((m.capacity-m.occupied)/m.capacity);
       if(!Number.isFinite(weight)||weight<=0)continue;
       options.push({machine_id:m.machine_id,engine:c.engine,model:c.model,...(c.effort?{effort:c.effort}:{}),account_id:c.account_id,policy_id:c.id,policy_version:policy.version,override_reason:override?input.override_reason!.trim():null,weight,quota_remaining:a.quota!.remaining,required_capabilities:required});
@@ -155,7 +162,7 @@ export type AdvanceOutcome=
 /** Wire-compatible refusal code for API paths that predate typed holds. */
 export function holdWireCode(code:HoldKind):string{
   if(code==='quota_unknown'||code==='quota_stale'||code==='quota_exhausted'||code==='account_saturated')return'quota_unavailable';
-  if(code==='host_resources_unknown'||code==='host_resources_stale')return'machine_unavailable';
+  if(code==='host_resources_unknown'||code==='host_resources_stale'||code==='host_resources_saturated')return'machine_unavailable';
   return code;
 }
 

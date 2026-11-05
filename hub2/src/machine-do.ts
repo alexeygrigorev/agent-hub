@@ -204,9 +204,15 @@ export class MachineDO {
     const resources=body.resources as JsonRecord|undefined;
     if(resources&&typeof resources==='object'){
       const mem=Number(resources.mem_available_mb),observed=Number(resources.observed_at);
-      if(Number.isFinite(mem)&&mem>=0&&mem<=1048576&&Number.isSafeInteger(observed)&&observed>now-600000&&observed<=now+5000)
+      const validMem=Number.isFinite(mem)&&mem>=0&&mem<=1048576&&Number.isSafeInteger(observed)&&observed>now-600000&&observed<=now+5000;
+      const cpu=Number(resources.cpu_load_pct);
+      const validCpu=Number.isFinite(cpu)&&cpu>=0&&cpu<=100;
+      if(validMem){
+        const snapshot:{mem_available_mb:number;observed_at:number;cpu_load_pct?:number}={mem_available_mb:Math.round(mem),observed_at:observed};
+        if(validCpu)snapshot.cpu_load_pct=Math.round(cpu*10)/10;
         this.db.run('INSERT INTO machine_capabilities(machine_id,engines_json,capabilities_json,resources_json) VALUES(?,?,?,?) ON CONFLICT(machine_id) DO UPDATE SET resources_json=excluded.resources_json',
-          machineId,enginesJson,capabilitiesJson,JSON.stringify({mem_available_mb:Math.round(mem),observed_at:observed}));
+          machineId,enginesJson,capabilitiesJson,JSON.stringify(snapshot));
+      }
     }
     return json({ ok: true, machine_id: machineId, last_seen: now });
   }

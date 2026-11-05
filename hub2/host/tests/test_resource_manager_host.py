@@ -205,6 +205,12 @@ class PhysicalResourceTest(unittest.TestCase):
         self.assertIsInstance(value, int)
         self.assertGreater(value, 0)
 
+    def test_cpu_load_pct_is_bounded_percentage(self):
+        value = nl.cpu_load_pct(sample=0.05)
+        self.assertIsInstance(value, float)
+        self.assertGreaterEqual(value, 0.0)
+        self.assertLessEqual(value, 100.0)
+
 
 class ProviderHomeTest(unittest.TestCase):
     zai_bundle = {'config': {'schemaVersion': 1}, 'zai_token': 'test-token-value-no-spaces',

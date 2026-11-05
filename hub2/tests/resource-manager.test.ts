@@ -5,7 +5,7 @@ const bundle=await build({entryPoints:['hub2/src/resource-manager.ts'],bundle:tr
 const {admitLaunch,advanceDispatch,releaseAccountCapacity}=await import('data:text/javascript;base64,'+Buffer.from(bundle.outputFiles[0].text).toString('base64'));
 function setup(){
  const policy={version:7,candidates:[{id:'configured-model',engine:'engine',model:'actual-model',account_id:'account',weight:2,capabilities:[],enabled:true}]};
- const machine={machine_id:'machine',available:true,capacity:1,occupied:0,engines:['engine'],capabilities:['headless'],resources:{mem_available_mb:42000,observed_at:Date.now()}};
+ const machine={machine_id:'machine',available:true,capacity:1,occupied:0,engines:['engine'],capabilities:['headless'],resources:{mem_available_mb:42000,cpu_load_pct:12.5,observed_at:Date.now()}};
  const account={account:{enabled:true,capacity:2,occupied:0,min_remaining:10},quota:{remaining:70,valid_until:Date.now()+300000,source:'provider-observed'},fresh:true,hosts:['machine']};
  const calls=[];
  const ns=(kind,fn)=>({idFromName:id=>id,get:id=>({fetch:async url=>{calls.push([kind,id,new URL(url).pathname]);return Response.json(fn(new URL(url)));}})});
@@ -70,6 +70,18 @@ test('stale host resource snapshot holds admission, missing snapshot fails close
  outcome=await admitLaunch(bad.env,input);
  assert.equal(outcome.ok,false,'a malformed timestamp is unknown');
  if(!outcome.ok)assert.equal(outcome.code,'host_resources_unknown');
+ const cpu=setup();cpu.machine.resources={mem_available_mb:42000,cpu_load_pct:96,observed_at:Date.now()};
+ outcome=await admitLaunch(cpu.env,input);
+ assert.equal(outcome.ok,false,'a saturated CPU refuses admission');
+ if(!outcome.ok)assert.equal(outcome.code,'host_resources_saturated');
+ const invalid=setup();invalid.machine.resources={mem_available_mb:42000,cpu_load_pct:180,observed_at:Date.now()};
+ outcome=await admitLaunch(invalid.env,input);
+ assert.equal(outcome.ok,false,'an out-of-range CPU reading is unknown');
+ if(!outcome.ok)assert.equal(outcome.code,'host_resources_unknown');
+ const broken=setup();broken.machine.capacity=0;
+ outcome=await admitLaunch(broken.env,input);
+ assert.equal(outcome.ok,false,'a degenerate capacity field is machine_unavailable, never a division artifact');
+ if(!outcome.ok)assert.equal(outcome.code,'machine_unavailable');
 });
 test('goal preflight and override reason cannot bypass real capabilities or host approval',async()=>{
  let f=setup();

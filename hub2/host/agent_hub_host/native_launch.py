@@ -83,6 +83,45 @@ def available_memory_mb():
     return None
 
 
+def cpu_load_pct(sample=None):
+    """Bounded normalized CPU load percentage, or None when unverifiable.
+
+    Linux reads /proc/loadavg normalized by the core count; Windows samples
+    GetSystemTimes twice over a short interval. Used as one bounded health
+    datum in the heartbeat snapshot; never a local quota probe."""
+    if os.name == 'nt':
+        import ctypes
+        import ctypes.wintypes
+        class Times(ctypes.Structure):
+            _fields_ = [("idle", ctypes.wintypes.FILETIME), ("kernel", ctypes.wintypes.FILETIME), ("user", ctypes.wintypes.FILETIME)]
+        kernel32 = ctypes.windll.kernel32
+        def busy():
+            times = Times()
+            if not kernel32.GetSystemTimes(ctypes.byref(times.idle), ctypes.byref(times.kernel), ctypes.byref(times.user)):
+                return None
+            to64 = lambda ft: (ft.dwHighDateTime << 32) | ft.dwLowDateTime
+            idle = to64(times.idle)
+            total = to64(times.kernel) + to64(times.user)
+            return idle, total
+        first = busy()
+        if first is None:
+            return None
+        time.sleep(0.25 if sample is None else sample)
+        second = busy()
+        if second is None:
+            return None
+        delta_total = second[1] - first[1]
+        if delta_total <= 0:
+            return None
+        return round(min(100.0, max(0.0, (1 - (second[0] - first[0]) / delta_total) * 100)), 1)
+    try:
+        load = os.getloadavg()[0]
+    except (OSError, AttributeError):
+        return None
+    cores = os.cpu_count() or 1
+    return round(min(100.0, max(0.0, load / cores * 100)), 1)
+
+
 def physical_resources_ready(min_free_mb, requested_mb):
     available = available_memory_mb()
     if available is None:
