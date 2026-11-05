@@ -59,6 +59,19 @@ CI_ONLY_TESTS_RULE = (
 )
 SESSION_PREAMBLE = SESSION_PREAMBLE + "\n" + CAPACITY_RETRY_RULE + "\n" + CLEAN_EXIT_RULE + "\n" + CI_ONLY_TESTS_RULE
 
+CI_POLLING_RULE = (
+    "GitHub Actions polling (intake ee7c3fb0): never use `gh run watch` or "
+    "`gh pr checks --watch`. Poll no more often than once every 60 seconds; "
+    "do not run parallel polling loops or sleep/gh run view loops. Read status "
+    "through the shared Agent Hub cache with `python3 ~/git/agent-hub/scripts/ci-status.py "
+    "--repo OWNER/REPO --sha <commit-sha>`. The cache coalesces same-commit "
+    "requests and shares 403/secondary-limit cooldowns; exit 75 means wait the "
+    "reported interval before retrying. If that installed command is unavailable, "
+    "use one `gh run list` or `gh run view` request and wait at least 60 seconds "
+    "before the next request."
+)
+SESSION_PREAMBLE = SESSION_PREAMBLE + "\n" + CI_POLLING_RULE
+
 PREPUSH_TEST_RULE = (
     "Hub worker releases: after obtaining the orchestrator-main release slot, "
     "use `scripts/push-main.sh` from the Agent Hub checkout to push to main. "

@@ -770,6 +770,7 @@ session is live or its intake is open.
 
 Rules for every session brief (also appended to Hub-generated briefs):
 
+- Never use `gh run watch` or `gh pr checks --watch`. Poll CI no more than once every 60 seconds and do not run parallel polling loops. When the shared status cache is installed, use `python3 ~/git/agent-hub/scripts/ci-status.py --repo OWNER/REPO --sha <commit-sha>`; it coalesces concurrent requests and shares a cooldown after a 403/secondary rate limit. Exit 75 means wait the reported interval before retrying. Without the cache, use one `gh run list` or `gh run view` request and wait at least 60 seconds before polling again.
 - NEVER remove your git worktree yourself — not with `git worktree remove`,
   `git worktree prune`, `rm -rf`, or branch deletes. The lock refuses; do not
   work around it.
