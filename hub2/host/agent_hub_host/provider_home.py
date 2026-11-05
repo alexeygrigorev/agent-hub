@@ -43,20 +43,37 @@ def make_private(path):
         os.chmod(path, 0o700 if Path(path).is_dir() else 0o600)
 
 
+_BROAD_NT_ACCOUNTS = {'everyone', 'users', 'authenticated users', 'all application packages',
+                      'all restricted application packages', 'creator owner', 'guests', 'restricted'}
+_TRUSTED_NT_ACCOUNTS = {'system', 'administrators'}
+
+
 def _nt_acl_allows_only_current_user(path):
-    """Minimal Windows ACL check: inheritance removed and only trusted principals remain."""
+    """Minimal Windows ACL check: no inherited grants, no broad principals, and
+    the current user must hold the only other access. ACE accounts are matched
+    by their last name segment so the icacls path header sharing the line, or
+    account casing, cannot break the check; anything unrecognized fails closed."""
     raw = subprocess.run(['icacls', str(path)], text=True, capture_output=True, timeout=10, check=False)
     if raw.returncode:
         raise ValueError('provider_file_not_private')
-    user = subprocess.check_output(['whoami'], text=True).strip()
-    lines = [line.strip() for line in raw.stdout.splitlines()[1:] if line.strip()]
-    if not lines or any('“(OI)' in line or '(I)' in line for line in lines):
+    user = subprocess.check_output(['whoami'], text=True).strip().lower()
+    user_tail = user.rsplit('\\', 1)[-1]
+    entries = re.findall(r'([^:()]+):\(([^)]*)\)', raw.stdout)
+    if not entries:
         raise ValueError('provider_file_not_private')
-    allowed = {user, 'NT AUTHORITY\\SYSTEM', 'BUILTIN\\Administrators'}
-    for line in lines:
-        entry = line.split(':', 1)[0].strip()
-        if entry not in allowed:
+    found_user = False
+    for account, grant in entries:
+        if '(I)' in grant:
             raise ValueError('provider_file_not_private')
+        tail = account.strip().lower().rsplit('\\', 1)[-1]
+        if tail in _BROAD_NT_ACCOUNTS:
+            raise ValueError('provider_file_not_private')
+        if account.strip().lower() == user or tail == user_tail:
+            found_user = True
+        elif tail not in _TRUSTED_NT_ACCOUNTS:
+            raise ValueError('provider_file_not_private')
+    if not found_user:
+        raise ValueError('provider_file_not_private')
 
 
 def private_read(path, limit=131072):
