@@ -31,7 +31,7 @@ export class CPUProbe {
  webSocketError(socket){socket.close();}
 }
 export default {async fetch(request,env){
- if(!env.CANARY_KEY||request.headers.get('Authorization')!=='Bearer '+env.CANARY_KEY)return new Response('forbidden',{status:403});
+ if(!env.CANARY_KEY||request.headers.get('Authorization')!=='Bearer '+env.CANARY_KEY)return Response.json({error:'forbidden',secret_bound:typeof env.CANARY_KEY==='string',source:env.SOURCE_SHA},{status:403});
  const path=new URL(request.url).pathname,stub=env.PROBE.get(env.PROBE.idFromName('single-synthetic-probe'));
  if(path==='/smoke')return Response.json({ok:true,checksum:small(),source:env.SOURCE_SHA});
  if(path==='/worker-burn'){
