@@ -1,12 +1,16 @@
 # Hub 2.0 architecture
 
-Status: implementation and acceptance are in progress, 4 November 2026. Alexey has explicitly authorized replacing the Hub1 implementation with Hub2 and deploying to the existing production endpoint after the release gates pass. No production deployment, route cutover, or production-data mutation has happened yet.
+Status: implementation and acceptance are in progress, 5 November 2026. Alexey has explicitly authorized replacing the Hub1 implementation with Hub2 and deploying to the existing production endpoint after the release gates pass. The production route currently serves the intentional Hub-disabled 503 stub. No Hub2 deployment, data import, or production-data mutation has happened yet. The ResourceManager/native-launch replacement is a newly authorized implementation change; the existing Hub2 execution path is not yet fully rewired to it.
 
 ## Goal and boundaries
 
 Preserve the Hub workflows used by operator skills and the aplexer bridge, including the canonical repository registry explicitly required by Alexey. The 6,000 product-SLOC architecture target remains visible; do not minify or drop retained features to hit it. On 2026-11-05 Alexey explicitly approved 7,853 product SLOC as the maximum baseline for this release, superseding the prior 6,362 release maximum. Growth above 7,853 requires a new decision. The former `<20,000` daily row-operation hard target is withdrawn. Alexey accepts approximately 33,000 operations/day for the complete measured workload, with SQL rows, alarm writes, requests, duration, CPU and storage reported separately. This workload number is not a monetary limit. Idle background work remains zero when no work is due.
 
-The Worker never runs model processes. Hosts invoke the maintained Agent Quota Launcher and native aplexer, preserving quota, resource, identity and workspace gates. Hub does not replace Agent Branches. Canonical repository metadata is Hub state; host checkout scanning and worktree mechanics are separate responsibilities.
+The Worker never runs model processes. Hub owns provider-quota collection and session resource policy through an in-process **ResourceManager** facade. This is a logical component inside Hub, not a separate service, DO, or network hop. TaskManager/ProjectDO owns intake, queue, dependencies, schedules, and durable launch intent; it asks ResourceManager to admit and place work. ResourceManager combines fresh provider-quota and account-concurrency state from AccountDO, host slots/capabilities/health from MachineDO, model policy, workspace constraints, and existing claims. AccountDO and MachineDO remain the durable authorities for their own reservations and release proofs; there is no new global quota ledger or pretend cross-DO transaction.
+
+The Hub Host Agent rechecks local physical capacity, prepares the minimum private provider configuration and child-scoped context, then invokes ap lexer/native directly. It reports the real native identity, first activity, deadline, and verified whole-containment exit. Hub2 must not depend at runtime on the external `agent-quota-launcher` package/service for session admission or launch. The launcher repository and its history remain intact for other consumers. The Hub-native adapter replaces only the Hub2 runtime dependency, preserving the existing public API/CLI contracts and their authorization, idempotency, deadline, stop, and receipt behavior. Until the adapter is integrated and exact-head tests pass, the current Hub2 launch path remains transitional and does not satisfy this architecture decision.
+
+Provider quota is one input to ResourceManager, not the whole resource model. CostController separately guards Hub infrastructure spend and the USD 0.03/day alert; its monetary ledger is not a provider quota percentage. Hub does not replace Agent Branches. Canonical repository metadata is Hub state; host checkout scanning and worktree mechanics are separate responsibilities.
 
 Use SQLite-backed Durable Objects and static assets. Alexey reports the account's free Cloudflare allowance is exhausted for this month, so all forecasts and limits use fully marginal paid rates; no free-operation claim is allowed. Count SQL rows scanned and written, including indexes; separately instrument requests, active duration, alarm invocations/writes, Worker CPU, storage and any legacy KV. Statement counts and SQL rows alone do not establish a bill ceiling. See [cost controls and alert status](COST-CONTROL.md), [DO pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/), [Worker pricing](https://developers.cloudflare.com/workers/platform/pricing/), [KV pricing](https://developers.cloudflare.com/kv/platform/pricing/), [hibernation](https://developers.cloudflare.com/workers/best-practices/websockets/), and [alarms](https://developers.cloudflare.com/durable-objects/api/alarms/).
 
@@ -19,10 +23,32 @@ Use SQLite-backed Durable Objects and static assets. Alexey reports the account'
 | ProjectDO | One canonical project's intakes, original asks/provenance, AC, task events, dependencies, claims, queue, dispatch saga and schedules |
 | MachineDO | One enrolled host's capabilities, connection/freshness, sessions, commands, native evidence and deadlines |
 | AccountDO | One provider account's sealed credentials, refresh generation, quota/reset discovery and expiry alerts, capacity reservations |
+| ResourceManager (in-process Hub facade) | Combines fresh AccountDO quota/concurrency, MachineDO availability/capabilities, model policy, workspace constraints and claims into a structured admission/placement decision; coordinates existing per-owner reservations through ProjectDO's durable saga; no new storage authority or service |
+| CostController | Separate USD/day reservations, category usage, alert dedupe and runaway stop/recovery budget; consulted before expensive fanout and retries, but never treated as provider quota |
 | MailboxDO | One actor's durable outbox/deduplication ledger, inbox projections and delivery receipts |
-| Host agent | Outbound transport, persisted launch/command journal, local admission, launcher/aplexer invocation, native state/work/mailbox bridge |
+| Host agent | Outbound transport, persisted launch/command journal, local physical-admission recheck, direct native ap lexer invocation, provider home, native state/work/mailbox bridge |
 | CLI/MCP | Compatible authorized contracts; CLI waits may use a bounded WebSocket; MCP reads are short and paged |
 | Dashboard | Phone-friendly inbox, intake, session, fleet, quota/reset alerts and health views through bounded authorized projections |
+
+The launch path is coordinated but not globally atomic:
+
+```mermaid
+flowchart LR
+  TM[TaskManager / ProjectDO\nAC, queue, schedule, durable intent] --> RM[ResourceManager\nin-process admission and placement]
+  CC[CostController\nUSD ceiling and reserve] --> RM
+  RM --> A[AccountDO\nfresh quota and account reservation]
+  RM --> M[MachineDO\nhost slots, capability, session lease]
+  A --> P[ProjectDO saga records receipts]
+  M --> P
+  P --> H[Host Agent\nlocal physical recheck]
+  H --> N[ap lexer native supervisor]
+  N --> H
+  H --> M
+  H --> A
+  M --> P
+```
+
+Each step uses the existing owner authority and an idempotent operation/epoch. If a later reservation or native step fails, ProjectDO records and retries compensation; uncertain native occupancy is retained until a verified exit/containment receipt arrives. Provider quota outages or stale snapshots produce typed holds rather than zero quota. A second host-side physical check closes the time-of-check/time-of-use gap.
 
 ControlDO owns `object_routes(kind,id,owner)` for intake, session, message and schedule IDs, plus indexed name/alias lookups. Existing UUIDs and minimum-six-character unique intake prefixes remain usable without a project argument: an indexed prefix range returns at most two authorized matches and refuses ambiguity. New route registration is a durable idempotent step before an object is publicly discoverable. Missing routes are repaired from an import/creation journal, never by unbounded shard scans. Directory retention follows the retained records.
 
@@ -119,7 +145,7 @@ The Worker authenticates each request against current ControlDO credential/grant
 
 Provider OAuth bundles are encrypted at rest with generation and returned only to approved authenticated hosts. Refresh is single-owner and generation-fenced. Operators retain central account login/import and per-host sync status. Quota refresh runs on stale placement/view and explicit reset discovery jobs. Keep grant expiry, availability and unknown-probe reasons; schedule deduplicated >=36h and <24h alerts. Refresh discovery at a configured maximum six-hour interval for enabled accounts, plus on demand, to discover new grants while otherwise idle. Late-discovered grants alert immediately with their remaining lead time; unknown discovery raises attention rather than claiming advance coverage. No reset is redeemed automatically; each requires explicit operator authorization. These are enabled jobs with measured cost, not free idle behavior.
 
-Hosts and CLI use an outbound hibernatable WebSocket protocol with authenticated upgrade, bounded frames, request IDs, resume cursor and reconnect backoff. The host uses the explicitly approved, pinned `websockets==16.0` dependency, installed in its isolated user environment by the host bootstrap. Keep the pin and rationale in the manifest and CI; no other dependency exception is implied. Linux and native Windows must both pass the same contracts. Reuse the maintained launcher/aplexer binaries, not their source copied outside the line count. A START first-action timeout does not bound a native worker's lifetime: release acceptance requires a persisted native runtime deadline that survives host disconnect and returns verified stop/exit evidence.
+Hosts and CLI use an outbound hibernatable WebSocket protocol with authenticated upgrade, bounded frames, request IDs, resume cursor and reconnect backoff. The host uses the explicitly approved, pinned `websockets==16.0` dependency, installed in its isolated user environment by the host bootstrap. Keep the pin and rationale in the manifest and CI; no other dependency exception is implied. Linux and native Windows must both pass the same contracts. The Hub2 runtime must not import or invoke the external launcher's Python package; it keeps ap lexer as the process supervisor and moves only the minimum reviewed provider-home/native-launch adapter into Hub2. The external launcher repository and binaries remain available to other consumers. A START first-action timeout does not bound a native worker's lifetime: release acceptance requires a persisted native runtime deadline that survives host disconnect and returns verified stop/exit evidence.
 
 ## Deployment and initialization
 
