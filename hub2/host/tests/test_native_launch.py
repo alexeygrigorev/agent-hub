@@ -223,8 +223,11 @@ class ProviderHomeTest(unittest.TestCase):
             harness = (home / '.zcodex' / 'config.toml').read_text()
             self.assertIn('wire_api="zcode"', harness)
             self.assertIn('glm-5.3-flash', harness)
-            mode = stat.S_IMODE((home / '.zcodex' / 'config.toml').stat().st_mode)
-            self.assertEqual(mode & 0o077, 0)
+            if os.name != 'nt':
+                # Windows ACL privacy is enforced through the icacls check in
+                # make_private; the coarse stat mode does not map to ACL bits.
+                mode = stat.S_IMODE((home / '.zcodex' / 'config.toml').stat().st_mode)
+                self.assertEqual(mode & 0o077, 0)
             env = ph.native_environment(manifest)
             self.assertEqual(env['CODEX_HOME'], str(home / '.zcodex'))
             self.assertEqual(env['ZCODE_HOME'], str(home / '.zcode'))
