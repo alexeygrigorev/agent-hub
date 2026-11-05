@@ -21,6 +21,12 @@ export class MeteredDb {
     measurement_valid: true, measurement_errors: 0, transactions: 0, alarm_operations: 0,
   };
 
+  private rowObserver?: (reads: number, writes: number, valid: boolean) => void;
+  private rowGuard?: () => void;
+  private initializedObserver?: () => void;
+  observeRows(observer: (reads: number, writes: number, valid: boolean) => void, guard?: () => void, initialized?: () => void): void { this.rowObserver = observer; this.rowGuard = guard; this.initializedObserver = initialized; }
+  initialized(): void { this.initializedObserver?.(); }
+
   constructor(private readonly sql: SqlStorage) {}
 
   all<T = Record<string, unknown>>(query: string, ...bindings: unknown[]): T[] {
@@ -73,9 +79,10 @@ export class MeteredDb {
     }
   }
 
-  alarmOperation(): void { this.totals.alarm_operations++; }
+  alarmOperation(): void { this.rowGuard?.(); this.totals.alarm_operations++; this.rowObserver?.(0, 1, true); }
 
   private execute(query: string, bindings: unknown[]): ReturnType<SqlStorage['exec']> {
+    this.rowGuard?.();
     const cursor = this.sql.exec(query, ...bindings);
     return cursor;
   }
@@ -99,6 +106,7 @@ export class MeteredDb {
     }
     this.totals.rows_read += read;
     this.totals.rows_written += written;
+    this.rowObserver?.(read, written, true);
   }
 
   private recordFailure(query: string): void {
@@ -109,6 +117,7 @@ export class MeteredDb {
 
   private invalidateMeasurement(): void {
     this.totals.measurement_valid = false;
+    this.rowObserver?.(0, 0, false);
     this.totals.measurement_errors++;
     this.cache.clear();
   }
@@ -147,5 +156,6 @@ export function initializeSchema(
       }
     });
     await afterInitialize?.();
+    db.initialized();
   });
 }

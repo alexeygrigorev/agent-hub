@@ -2,29 +2,66 @@ import {METRICS, type Units, type Coverage} from './budget-do';
 import {bodyObject, error, HttpError} from './http';
 import type {Actor, Hub2Env} from './types';
 import {nativeReturncode} from './native-exit';
+import {SqlReceiptMeter, wrapSqlNamespaces, type SqlReceipt} from './sql-receipt';
 
 type Plan={units:Units;max_do_calls:number;max_wall_ms:number;provenance:string};
-export type BudgetKind='public_request'|'background_effect'|'provider_refresh'|'scheduled_start'|'native_delivery'|'retry'|'operator_stop'|'native_exit'|'capacity_reconcile'|'auth_revoke'|'alert_delivery'|'budget_recovery';
+export type BudgetKind='public_request'|'public_read'|'public_write'|'placement_request'|'connection_request'|'fleet_read'|'project_request'|'claim_request'|'message_request'|'account_request'|'background_effect'|'provider_refresh'|'scheduled_start'|'native_delivery'|'retry'|'operator_stop'|'native_exit'|'capacity_reconcile'|'auth_revoke'|'alert_delivery'|'budget_recovery';
+type PlanSet=Plan&{by_kind?:Partial<Record<BudgetKind,Plan>>};
+const KINDS=new Set<BudgetKind>(['public_request','public_read','public_write','placement_request','connection_request','fleet_read','project_request','claim_request','message_request','account_request','background_effect','provider_refresh','scheduled_start','native_delivery','retry','operator_stop','native_exit','capacity_reconcile','auth_revoke','alert_delivery','budget_recovery']);
 const SAFE=new Set<BudgetKind>(['operator_stop','native_exit','capacity_reconcile','auth_revoke','alert_delivery','budget_recovery']);
 type ResolveActor=(request:Request,env:Hub2Env)=>Promise<Actor|undefined>;
 const NAMES=['CONTROL','PROJECTS','MACHINES','ACCOUNTS','MAILBOXES'] as const;
+// Source-bound native Workerd profile: settlement performed 4 reads/5 writes
+// in all tested warm, cold-alert, and restart cases. Keep a 64R/8W upper bound
+// for this settle RPC; the reserve RPC is charged from its authenticated receipt.
+const SETTLE_SQL_ALLOWANCE={reads:64,writes:8} as const;
 const COVERAGE=Object.fromEntries(METRICS.map(k=>[k,'upper_bound'])) as Coverage;
 const internal='https://budget.hub2.internal';
 const admin=(a:Actor)=>a.scopes.includes('*')||a.scopes.includes('operator:admin');
 const scoped=(a:Actor,s:string)=>admin(a)||a.scopes.includes(s);
 const nextDay=()=>{const now=new Date();return Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),now.getUTCDate()+1);};
 
-function planFor(env:Hub2Env,safety:boolean):Plan|undefined{
+function validPlan(p:any):p is Plan{
+ if(!p||typeof p.provenance!=='string'||p.provenance.length<8||p.provenance.length>500)return false;
+ if(!Number.isSafeInteger(p.max_do_calls)||p.max_do_calls<1||p.max_do_calls>64||!Number.isSafeInteger(p.max_wall_ms)||p.max_wall_ms<100||p.max_wall_ms>60000)return false;
+ if(!p.units||Object.keys(p.units).length!==METRICS.length||METRICS.some(k=>!Number.isSafeInteger(p.units[k])||p.units[k]<0))return false;
+ // Never call missing CPU, duration, SQLite or persistent-storage coverage zero.
+ return p.units.worker_requests>=1&&p.units.worker_cpu_ms>=1&&p.units.do_requests>=p.max_do_calls+3&&p.units.do_gb_ms>=1&&p.units.sqlite_rows_read>=1&&p.units.sqlite_rows_written>=1&&p.units.sqlite_byte_days>=1;
+}
+function planFor(env:Hub2Env,safety:boolean,kind:BudgetKind):Plan|undefined{
  try{
-  const all=JSON.parse(env.HUB2_BUDGET_ENVELOPES||'null'),p=all?.[safety?'safety':'normal'];
-  if(all?.version!==1||!p||typeof p.provenance!=='string'||p.provenance.length<8||p.provenance.length>500)return;
-  if(!Number.isSafeInteger(p.max_do_calls)||p.max_do_calls<1||p.max_do_calls>64||!Number.isSafeInteger(p.max_wall_ms)||p.max_wall_ms<100||p.max_wall_ms>60000)return;
-  if(!p.units||Object.keys(p.units).length!==METRICS.length||METRICS.some(k=>!Number.isSafeInteger(p.units[k])||p.units[k]<0))return;
-  // Never call missing CPU, duration, SQLite or persistent-storage coverage zero.
-  if(p.units.worker_requests<1||p.units.worker_cpu_ms<1||p.units.do_requests<p.max_do_calls+3||p.units.do_gb_ms<1||p.units.sqlite_rows_read<1||p.units.sqlite_rows_written<1||p.units.sqlite_byte_days<1)return;
+  const all=JSON.parse(env.HUB2_BUDGET_ENVELOPES||'null'),set=all?.[safety?'safety':'normal'] as PlanSet|undefined;
+  if(all?.version!==1||!set)return;
+  let p:Plan|undefined=set;
+  if(set.by_kind!==undefined){
+   if(!set.by_kind||typeof set.by_kind!=='object'||Array.isArray(set.by_kind))return;
+   for(const [key,override]of Object.entries(set.by_kind))if(!KINDS.has(key as BudgetKind)||!validPlan(override))return;
+   p=set.by_kind[kind]||set;
+  }
+  if(!validPlan(p))return;
   // Hub2 has no KV binding; a future one needs an explicitly priced envelope.
   return p;
  }catch{return;}
+}
+type ReceiptEnv=Hub2Env&{SQL_RECEIPT_METER?:SqlReceiptMeter};
+function receiptContext(env:Hub2Env):{env:Hub2Env;meter:SqlReceiptMeter;parent:boolean}{
+ const existing=(env as ReceiptEnv).SQL_RECEIPT_METER;
+ if(existing&&typeof existing.checkpoint==='function'&&typeof existing.finish==='function'&&typeof existing.account==='function')
+  return{env,meter:existing,parent:true};
+ const meter=new SqlReceiptMeter();
+ return{env:wrapSqlNamespaces(env,meter) as Hub2Env,meter,parent:false};
+}
+function sqlActual(plan:Units,receipt:SqlReceipt):Units|undefined{
+ const reads=receipt.reads+SETTLE_SQL_ALLOWANCE.reads,writes=receipt.writes+SETTLE_SQL_ALLOWANCE.writes;
+ if(!receipt.valid||!Number.isSafeInteger(reads)||!Number.isSafeInteger(writes))return;
+ // Other dimensions remain configured upper bounds until authoritative provider
+ // usage APIs supply actual CPU, duration, storage and KV observations.
+ return{...plan,sqlite_rows_read:reads,sqlite_rows_written:writes};
+}
+function stripSqlReceiptHeaders(response:Response):Response{
+ if(!response.headers.has('x-hub2-sql-receipt')&&!response.headers.has('x-hub2-sql-operation'))return response;
+ const headers=new Headers(response.headers);headers.delete('x-hub2-sql-receipt');headers.delete('x-hub2-sql-operation');
+ return new Response(response.body,{status:response.status,statusText:response.statusText,headers,webSocket:(response as any).webSocket} as ResponseInit);
 }
 async function safetyKind(r:Request,env:Hub2Env,resolve:ResolveActor):Promise<BudgetKind|undefined>{
  const path=new URL(r.url).pathname,method=r.method;
@@ -60,7 +97,9 @@ export function budgetPauseResponse(retryAt=nextDay()):Response{
 }
 async function ledger(env:Hub2Env,path:string,body:unknown):Promise<Response>{
  if(!env.BUDGET)throw new HttpError('budget_unavailable',503);
- return env.BUDGET.get(env.BUDGET.idFromName('global')).fetch(internal+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+ const controller=new AbortController(),timer=path==='/_internal/settle'?setTimeout(()=>controller.abort(),500):undefined;
+ try{return await env.BUDGET.get(env.BUDGET.idFromName('global')).fetch(internal+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:controller.signal});}
+ finally{if(timer!==undefined)clearTimeout(timer);}
 }
 
 /** A request is durably priced before any normal auth or application fanout.
@@ -68,19 +107,31 @@ async function ledger(env:Hub2Env,path:string,body:unknown):Promise<Response>{
 export async function budgetedPublicRequest(
  request:Request,env:Hub2Env,resolve:ResolveActor,run:(guarded:Hub2Env)=>Promise<Response>,
 ):Promise<Response>{
- let kind:BudgetKind='public_request';
+ const path=new URL(request.url).pathname,method=request.method;
+ let kind:BudgetKind;
+ if(method==='GET'&&path==='/api/connect')kind='connection_request';
+ else if(method==='POST'&&(path==='/api/sessions'||/^\/api\/intakes\/[^/]+\/start$/.test(path)))kind='placement_request';
+ else if(method==='GET'&&['/api/fleet','/api/fleet/machines','/api/sessions','/api/status'].includes(path))kind='fleet_read';
+ else if(path==='/api/messages'||/^\/api\/messages\/[^/]+(?:\/(?:read|ack|delivered|accept|complete|readdress|status))?$/.test(path))kind='message_request';
+ else if(path==='/api/claims'||/^\/api\/claims\/[^/]+(?:\/(?:renew|release))?$/.test(path))kind='claim_request';
+ else if(path==='/api/intakes'||/^\/api\/(?:intakes|intake\/tasks)(?:\/[^/]+(?:\/(?:start|history|append))?)?$/.test(path)||path==='/api/schedules'||/^\/api\/schedules\/[^/]+(?:\/(?:pause|resume|cancel|occurrences))?$/.test(path))kind='project_request';
+ else if(/^\/api\/(?:accounts\/[^/]+\/)?(?:api\/)?account\/(?:quota|discovery|refresh)(?:\/|$)/.test(path))kind='provider_refresh';
+ else if(path.startsWith('/api/accounts/')||path==='/api/account'||path.startsWith('/api/account/'))kind='account_request';
+ else if(method==='GET')kind='public_read';
+ else if(['POST','PUT','PATCH','DELETE'].includes(method))kind='public_write';
+ else kind='public_request';
  try{kind=await safetyKind(request,env,resolve)||kind;}catch(e){return e instanceof HttpError?error(e.code,e.status):error('budget_safety_auth_unavailable',503);}
  // The authenticated override funds itself atomically under its proposed ceiling.
  if(kind==='budget_recovery'&&request.method==='POST'&&new URL(request.url).pathname==='/api/budget/override'){
-  if(!planFor(env,true))return error('budget_metrics_unknown',503);
-  return run(env); // Router still enforces CSRF and fresh authentication before the dedicated adapter.
+  if(!planFor(env,true,'budget_recovery'))return error('budget_metrics_unknown',503);
+  return stripSqlReceiptHeaders(await run(env)); // Router still enforces CSRF and fresh authentication before the dedicated adapter.
  }
- return budgetedBackgroundRequest(env,kind,run);
+ return stripSqlReceiptHeaders(await budgetedBackgroundRequest(env,kind,run,false,(env as ReceiptEnv).SQL_RECEIPT_METER?'nested':'worker'));
 }
 
 export async function budgetedOperatorOverride(request:Request,env:Hub2Env,actor:Actor):Promise<Response>{
  if(!scoped(actor,'budget:override'))return error('forbidden',403);
- const plan=planFor(env,true);if(!plan)return error('budget_metrics_unknown',503);
+ const plan=planFor(env,true,'budget_recovery');if(!plan)return error('budget_metrics_unknown',503);
  const proposal=await bodyObject(request,4096),id='recovery:'+crypto.randomUUID();
  const stub=env.BUDGET.get(env.BUDGET.idFromName('global'));
  const reserved=await stub.fetch(internal+'/_internal/reserve',{method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(actor)},body:JSON.stringify({id,kind:'budget_recovery',emergency:true,override:proposal,estimated_units:plan.units,coverage:COVERAGE})});
@@ -92,23 +143,35 @@ export async function budgetedOperatorOverride(request:Request,env:Hub2Env,actor
 
 /** Namespace-only callers use this before alarms, retries or provider effects. */
 export async function budgetedBackgroundRequest(
- env:Hub2Env,kind:BudgetKind,run:(guarded:Hub2Env)=>Promise<Response>,backgroundInvocation=false,
+ env:Hub2Env,kind:BudgetKind,run:(guarded:Hub2Env)=>Promise<Response>,backgroundInvocation=false,origin:'worker'|'cron'|'nested'=(env as ReceiptEnv).SQL_RECEIPT_METER?'nested':'cron',
 ):Promise<Response>{
- const safety=SAFE.has(kind),plan=planFor(env,safety);
+ const context=receiptContext(env);
+ return context.meter.withScope(()=>budgetedScopedRequest(context.env,kind,run,backgroundInvocation,origin));
+}
+async function budgetedScopedRequest(env:Hub2Env,kind:BudgetKind,run:(guarded:Hub2Env)=>Promise<Response>,backgroundInvocation:boolean,origin:'worker'|'cron'|'nested'):Promise<Response>{
+ const safety=SAFE.has(kind),plan=planFor(env,safety,kind);
  if(!plan)return error('budget_metrics_unknown',503);
- const units={...plan.units,background_invocations:backgroundInvocation?Math.max(1,plan.units.background_invocations):plan.units.background_invocations};
+ // Source-proven N/A: internal DO/subrequests are not Worker ingress or
+ // Worker CPU. Cron has CPU but no billed inbound Worker request. Outer
+ // Worker guards retain CPU bounds for any nested Worker-side helpers.
+ const units={...plan.units,worker_requests:origin==='worker'?plan.units.worker_requests:0,
+  worker_cpu_ms:origin==='nested'?0:plan.units.worker_cpu_ms,
+  background_invocations:backgroundInvocation?Math.max(1,plan.units.background_invocations):plan.units.background_invocations};
  const id='edge:'+crypto.randomUUID(),started=performance.now();
+ const receipt=receiptContext(env),receiptPoint=receipt.parent
+  ?receipt.meter.checkpointUnassigned()
+  :receipt.meter.checkpoint();
  let reservation:Response;
- try{reservation=await ledger(env,'/_internal/reserve',{id,kind,emergency:safety,estimated_units:units,coverage:COVERAGE});}
+ try{reservation=await ledger(receipt.env,'/_internal/reserve',{id,kind,emergency:safety,estimated_units:units,coverage:COVERAGE});}
  catch{return error('budget_unavailable',503);}
  if(reservation.status===429){const denied=await reservation.json() as {retry_at?:number};return budgetPauseResponse(denied.retry_at);}
  if(!reservation.ok)return error('budget_unavailable',503);
  const reserved=await reservation.json() as {allowed?:boolean;retry_at?:number};
  if(reserved.allowed!==true)return budgetPauseResponse(reserved.retry_at);
  let calls=0;
- const guarded={...env} as Hub2Env;
+ const guarded={...receipt.env} as Hub2Env;
  for(const name of NAMES){
-  const ns=env[name];
+  const ns=receipt.env[name];
   if(!ns)continue;
   guarded[name]=new Proxy(ns,{get(target,key){
    if(key==='get')return(...args:any[])=>{
@@ -130,14 +193,27 @@ export async function budgetedBackgroundRequest(
  try{
   const response=await run(guarded);
   if(performance.now()-started>plan.max_wall_ms)return error('budget_effect_outcome_uncertain',503);
-  // Conservatively debit the entire envelope, including controller overhead.
-  // Coverage stays upper_bound; these are not claimed runtime CPU observations.
-  const settled=await ledger(env,'/_internal/settle',{id,actual_units:units,coverage:COVERAGE});
+  const measured=receipt.meter.finish(receiptPoint),actual=sqlActual(units,measured);
+  if(!actual){
+   // Attribution may overlap a concurrent operation. Its complete validated
+   // envelope is still durably reserved: do not refund, settle or credit it.
+   return response;
+  }
+  const usage=receipt.meter.usage(receiptPoint);
+  const actualUnits={...actual,
+   do_requests:usage.do_requests===undefined?units.do_requests:usage.do_requests+1,
+   do_gb_ms:usage.do_gb_ms===undefined?units.do_gb_ms:usage.do_gb_ms+512};
+
+  // Coverage remains upper_bound: cursor receipts and alarm-operation writes
+  // are conservative source-bound SQL counts, not provider invoices.
+  const settled=await ledger(receipt.env,'/_internal/settle',{id,actual_units:actualUnits,coverage:COVERAGE});
   if(!settled.ok)return error('budget_settlement_uncertain',503);
+  if(receipt.parent&&!receipt.meter.account(receiptPoint,{reads:actualUnits.sqlite_rows_read,writes:actualUnits.sqlite_rows_written,...(usage.do_requests===undefined?{}:{do_requests:actualUnits.do_requests}),...(usage.do_gb_ms===undefined?{}:{do_gb_ms:actualUnits.do_gb_ms})}))
+   return error('budget_sql_parent_accounting_unverified',503);
   return response;
  }catch(e){
   // Any started/ambiguous effect retains its full reservation across restart.
-  return e instanceof HttpError?(e.status===429?budgetPauseResponse():error(e.code,e.status)):error('budget_effect_outcome_uncertain',503);
+  return e instanceof HttpError?(e instanceof BudgetPause?budgetPauseResponse(e.retryAt):e.status===429?budgetPauseResponse():error(e.code,e.status)):error('budget_effect_outcome_uncertain',503);
  }
 }
 

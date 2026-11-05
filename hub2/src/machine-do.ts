@@ -1,6 +1,7 @@
 import { budgetedBackgroundRequest, type BudgetKind } from './budget-edge';
 import { nativeReturncode } from './native-exit';
 import { MeteredDb, initializeSchema } from './db';
+import { SqlReceiptMeter, SQL_PROBE_HEADER, wrapSqlNamespaces } from './sql-receipt';
 import { sha256Hex } from './crypto';
 import { actorFrom, bodyObject, boundedString, error, hasScope, HttpError, json } from './http';
 import type { Actor, Hub2Env, JsonRecord } from './types';
@@ -80,17 +81,26 @@ type NativeMail = {message_id:string;epoch:number;operation_id:string;session_id
 /** Per-host presence, native-session evidence and durable completion outbox. */
 export class MachineDO {
   private alarmQueue:Promise<void>=Promise.resolve();
+  private connectQueue:Promise<void>=Promise.resolve();
   private readonly db: MeteredDb;
+  private readonly sqlReceipts: SqlReceiptMeter;
+  private readonly env: Hub2Env;
   private readonly constructorMs: number;
 
-  constructor(private readonly ctx: DurableObjectState, private readonly env: Hub2Env) {
+  constructor(private readonly ctx: DurableObjectState, env: Hub2Env) {
     const started = performance.now();
     this.db = new MeteredDb(ctx.storage.sql);
+    this.sqlReceipts = new SqlReceiptMeter(this.db);
+    this.env = wrapSqlNamespaces(env, this.sqlReceipts) as Hub2Env;
     initializeSchema(ctx, this.db, 3, LATEST_SCHEMA, [[SCHEMA[0]],COMPACT_KEYS],()=>this.scheduleNext(),3);
     this.constructorMs = performance.now() - started;
   }
 
   async fetch(request: Request): Promise<Response> {
+    return this.sqlReceipts.measure(() => this.handleFetch(request), request.headers.get(SQL_PROBE_HEADER));
+  }
+
+  private async handleFetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     try {
       if (url.pathname === '/_internal/reserve' && request.method === 'POST') return await this.reserveInternal(request);
@@ -195,7 +205,7 @@ export class MachineDO {
     const machine=this.db.one<MachineRow>('SELECT * FROM machines LIMIT 1');
     if(!machine)return json({available:false,reason:'machine_not_enrolled'});
     let connected=false;
-    for(const socket of this.ctx.getWebSockets(`hub2:${machine.machine_id}`))if(socket.readyState===1&&!this.stopOnly(socket)&&await this.authorizedAttachment(socket,'machine:offer')){connected=true;break;}
+    for(const socket of this.machineSockets(`${machine.machine_id}`))if(socket.readyState===1&&!this.stopOnly(socket)&&await this.authorizedAttachment(socket,'machine:offer')){connected=true;break;}
     const capabilities=this.db.one<{engines_json:string;capabilities_json:string}>('SELECT engines_json,capabilities_json FROM machine_capabilities WHERE machine_id=?',machine.machine_id);
     return json({machine_id:machine.machine_id,available:connected&&!machine.active_session_id,connected,
       occupied:machine.active_session_id?1:0,capacity:1,os:machine.os,arch:machine.arch,labels:JSON.parse(machine.labels_json),
@@ -240,7 +250,7 @@ export class MachineDO {
     }
     const machine = this.db.one<MachineRow>('SELECT * FROM machines WHERE machine_id=?', body.machine_id);
     let connected = false;
-    for (const socket of this.ctx.getWebSockets(`hub2:${body.machine_id}`)) {
+    for (const socket of this.machineSockets(`${body.machine_id}`)) {
       if (socket.readyState === 1 && !this.stopOnly(socket) && await this.authorizedAttachment(socket, 'machine:offer')) { connected = true; break; }
     }
     if (!machine || (!connected && now - machine.last_seen > 120_000)) return json({ reason: 'machine_unavailable' }, 409);
@@ -304,10 +314,25 @@ export class MachineDO {
     if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') return error('websocket_upgrade_required', 426);
     const stopOnly=request.headers.get('x-hub2-safety-mode')==='operator_stop';
     if(new URL(request.url).searchParams.has('safety')&&!stopOnly)return error('untrusted_safety_mode',403);
-    const pair = new WebSocketPair();
-    const [client, server] = Object.values(pair);
-    server.serializeAttachment({ machine_id: machineId, actor_id: actor!.id, generation: actor!.generation, stop_only:stopOnly });
-    this.ctx.acceptWebSocket(server, [`hub2:${machineId}`]);
+    let client!:WebSocket,server!:WebSocket;
+    const accepted=this.connectQueue.then(async()=>{
+      const control=this.env.CONTROL.get(this.env.CONTROL.idFromName('global'));
+      const current=await control.fetch('https://control.hub2.internal/_authorize',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({actor_id:actor!.id,generation:actor!.generation,scope:'machine:offer'}),
+      });
+      if(!current.ok)return false;
+      const pair=new WebSocketPair();[client,server]=Object.values(pair);
+      for(const old of this.ctx.getWebSockets('hub2:'+machineId)){
+        try{old.close(1000,'connection superseded');}catch{}
+      }
+      server.serializeAttachment({machine_id:machineId,actor_id:actor!.id,generation:actor!.generation,
+        stop_only:stopOnly,connection_id:crypto.randomUUID(),connected_at:Date.now()});
+      this.ctx.acceptWebSocket(server,['hub2:'+machineId]);
+      return true;
+    });
+    this.connectQueue=accepted.then(()=>{},()=>{});
+    if(!await accepted)return error('credential_revoked',401);
     try { server.send(JSON.stringify({ type: 'resync', reason: 'connected' })); } catch {}
     await this.sendOffers(server, machineId);
     await this.sendPendingCommands(server, machineId);
@@ -316,6 +341,7 @@ export class MachineDO {
   }
 
   async webSocketMessage(socket:WebSocket,message:string|ArrayBuffer):Promise<void>{
+    if(!this.currentSocket(socket))return;
     await this.budgetEffect(this.stopOnly(socket)?'operator_stop':'background_effect',
       env=>this.webSocketMessageRaw(socket,message,env),socket);
   }
@@ -347,7 +373,9 @@ export class MachineDO {
     try { socket.send(JSON.stringify({ type: 'error', error: 'unsupported_message' })); } catch {}
   }
 
-  webSocketClose(_socket: WebSocket, _code: number, _reason: string, _wasClean: boolean): void {}
+  webSocketClose(socket:WebSocket,code:number,reason:string,_wasClean:boolean):void{
+    try{socket.close(code===1005||code===1006?1000:code,reason);}catch{}
+  }
 
   webSocketError(_socket: WebSocket, _error: unknown): void {}
 
@@ -387,6 +415,7 @@ export class MachineDO {
   private async sendOffers(socket: WebSocket, machineId: string,env?:Hub2Env): Promise<void> {
     if(this.stopOnly(socket))return;
     if(!env){await this.budgetEffect('native_delivery',guarded=>this.sendOffers(socket,machineId,guarded),socket);return;}
+    if(!this.currentSocket(socket))return;
     const now = Date.now();
     const rows = this.db.all<SessionRow>(
       `SELECT * FROM sessions WHERE machine_id=? AND ((state='offered' AND offer_expires_at > ?) OR state='claimed') ORDER BY created_at, id LIMIT 10`, machineId, now,
@@ -400,7 +429,7 @@ export class MachineDO {
     const row = this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND state=\'offered\'', sessionId);
     if (!row) return;
     const frame = JSON.stringify({ type: 'session.offer', offer: this.offerView(row) });
-    for (const socket of this.ctx.getWebSockets(`hub2:${row.machine_id}`)) {
+    for (const socket of this.machineSockets(`${row.machine_id}`)) {
       try {
         if(this.stopOnly(socket))continue;
         await this.budgetEffect('native_delivery',async env=>{
@@ -741,7 +770,7 @@ export class MachineDO {
   }
 
   private async notifyPendingCommands(machineId: string): Promise<void> {
-    for (const socket of this.ctx.getWebSockets(`hub2:${machineId}`)) {
+    for (const socket of this.machineSockets(`${machineId}`)) {
       try {
         await this.sendPendingCommands(socket, machineId);
       } catch {}
@@ -812,7 +841,7 @@ export class MachineDO {
   }
 
   private async notifyPendingMail(machine: string): Promise<void> {
-    for (const socket of this.ctx.getWebSockets(`hub2:${machine}`)) {
+    for (const socket of this.machineSockets(`${machine}`)) {
       try { await this.sendPendingMail(socket,machine); } catch {}
     }
   }
@@ -835,7 +864,7 @@ export class MachineDO {
     const machine=this.db.one<MachineRow>('SELECT * FROM machines LIMIT 1');
     const sessions=machine?this.db.all("SELECT id,state,project_id,intake_id,native_id,updated_at FROM sessions WHERE machine_id=? AND state IN ('staged','offered','claimed','running') LIMIT 101",machine.machine_id):[];
     return json({machine:machine?{id:machine.machine_id,alias:machine.alias,os:machine.os,arch:machine.arch,
-      labels:this.parse(machine.labels_json),last_seen:machine.last_seen,connected:this.ctx.getWebSockets(`hub2:${machine.machine_id}`).length>0}:null,
+      labels:this.parse(machine.labels_json),last_seen:machine.last_seen,connected:this.machineSockets(`${machine.machine_id}`).length>0}:null,
       sessions,attention:this.db.all('SELECT * FROM attention ORDER BY observed_at DESC,session_id LIMIT 20'),
       pending_notifications:this.db.all("SELECT id,kind,attempt,next_action_at FROM machine_outbox WHERE state='pending' ORDER BY next_action_at,id LIMIT 21")});
   }
@@ -862,9 +891,28 @@ export class MachineDO {
       interactive:launch.interactive,evidence:this.parse(row.evidence_json),attention:this.db.one('SELECT reason,observed_at FROM attention WHERE session_id=?',row.id)||null};
   }
 
+  /** Hibernation attachments retain selection across eviction; prune legacy duplicates before RPCs. */
+  private machineSockets(machineId:string):WebSocket[]{
+    const sockets=this.ctx.getWebSockets('hub2:'+machineId).filter(socket=>socket.readyState===1);
+    const rank=(socket:WebSocket):string=>{
+      try{const a=socket.deserializeAttachment();return String(a?.connected_at??0).padStart(16,'0')+':'+String(a?.connection_id??'');}
+      catch{return '';}
+    };
+    sockets.sort((a,b)=>rank(b).localeCompare(rank(a)));
+    for(const old of sockets.slice(1)){try{old.close(1000,'connection superseded');}catch{}}
+    return sockets.slice(0,1);
+  }
+
+  private currentSocket(socket:WebSocket):boolean{
+    try{const machine=socket.deserializeAttachment()?.machine_id;
+      return typeof machine==='string'&&this.machineSockets(machine)[0]===socket;
+    }catch{return false;}
+  }
+
   private stopOnly(socket:WebSocket):boolean{try{return socket.deserializeAttachment()?.stop_only===true;}catch{return false;}}
 
   private async authorizedAttachment(socket: WebSocket, scope: string, closeOnRefusal = true,env:Hub2Env=this.env): Promise<{ machine_id: string; actor_id: string; generation: string } | undefined> {
+    if(!this.currentSocket(socket))return undefined;
     let attachment: { machine_id?: string; actor_id?: string; generation?: string } | null;
     try { attachment = socket.deserializeAttachment(); } catch { attachment = null; }
     if (!attachment?.machine_id || !attachment.actor_id || !attachment.generation) return undefined;
@@ -877,6 +925,7 @@ export class MachineDO {
       if (closeOnRefusal) { try { socket.close(1008, 'credential revoked'); } catch {} }
       return undefined;
     }
+    if(!this.currentSocket(socket))return undefined;
     return attachment as { machine_id: string; actor_id: string; generation: string };
   }
 

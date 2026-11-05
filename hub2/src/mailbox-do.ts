@@ -1,5 +1,6 @@
 import {budgetedBackgroundRequest} from './budget-edge';
 import {MeteredDb,initializeSchema} from './db';
+import {SqlReceiptMeter,SQL_PROBE_HEADER,wrapSqlNamespaces} from './sql-receipt';
 import {sha256Hex} from './crypto';
 import {actorFrom,bodyObject,boundedString,error,hasScope,HttpError,json} from './http';
 import type {Actor,JsonRecord,Hub2Env} from './types';
@@ -30,9 +31,12 @@ const SCHEMA=[
  * still requires sender/current-recipient authorization. Native effects remain
  * a fenced durable producer, independent of the four human receipt stages. */
 export class MailboxDO{
- private db:MeteredDb;private ready:Promise<void>;
- constructor(private ctx:DurableObjectState,private env:Env){this.db=new MeteredDb(ctx.storage.sql);this.ready=initializeSchema(ctx,this.db,1,SCHEMA,[],()=>this.schedule());}
+ private db:MeteredDb;private ready:Promise<void>;private sqlReceipts:SqlReceiptMeter;private env:Env;
+ constructor(private ctx:DurableObjectState,env:Env){this.db=new MeteredDb(ctx.storage.sql);this.sqlReceipts=new SqlReceiptMeter(this.db);this.env=wrapSqlNamespaces(env,this.sqlReceipts) as Env;this.ready=initializeSchema(ctx,this.db,1,SCHEMA,[],()=>this.schedule());}
  async fetch(r:Request):Promise<Response>{
+  return this.sqlReceipts.measure(()=>this.handleFetch(r),r.headers.get(SQL_PROBE_HEADER));
+ }
+ private async handleFetch(r:Request):Promise<Response>{
   try{
    await this.ready;const p=new URL(r.url).pathname;
    if(p==='/_metrics')return json({counts:this.db.snapshot()});

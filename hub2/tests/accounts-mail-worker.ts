@@ -1,15 +1,36 @@
 // Local-only fixture. Never deploy: it deliberately accepts synthetic actor headers.
 import { MachineDO } from '../src/machine-do';
 import { ControlDO } from '../src/control-do';
+import {BudgetDO as ActualBudgetDO} from '../src/budget-do';
 import { AccountDO as ActualAccountDO } from '../src/account-do';
 import {fixtureBudgetEnvelopes} from './budget-fixture';
-export {BudgetDO} from '../src/budget-do';
+export class BudgetDO extends ActualBudgetDO {
+ async fetch(request:Request):Promise<Response>{
+  if(new URL(request.url).pathname==='/_fixture/reservations'){
+   const db=(this as any).db;
+   return Response.json({reservations:db.all('SELECT id,kind,state,estimate_pusd,actual_pusd,estimate_json,actual_json FROM budget_reservations ORDER BY created_at,id')});
+  }
+  return super.fetch(request);
+ }
+}
+// Persistence stress only: the dedicated normal-day budget gate uses the
+// conservative production candidate. This disposable history fixture needs 100
+// sends to complete so it can measure indexed growth independently of the $0.10
+// daily affordability gate; its override/profile is never deployed or reused.
+const historyProfile=JSON.parse(fixtureBudgetEnvelopes);
+historyProfile.normal.by_kind={native_delivery:{provenance:'Synthetic retained-history Workerd fixture only; not production cost sizing',max_do_calls:4,max_wall_ms:2000,units:{worker_requests:1,worker_cpu_ms:100,do_requests:7,do_ws_messages:0,do_gb_ms:250,background_invocations:0,sqlite_rows_read:512,sqlite_rows_written:160,sqlite_byte_days:1,kv_reads:1,kv_writes:1,kv_deletes:1,kv_lists:1,kv_byte_days:1}}};
+const HISTORY_STRESS_ENVELOPES=JSON.stringify(historyProfile);
 class AccountDO extends ActualAccountDO {constructor(ctx:any,env:any){super(ctx,{HUB2_BUDGET_ENVELOPES:fixtureBudgetEnvelopes,...env});}}
 import { MailboxDO as ActualMailboxDO } from '../src/mailbox-do';
-class MailboxDO extends ActualMailboxDO {constructor(ctx:any,env:any){super(ctx,{HUB2_BUDGET_ENVELOPES:fixtureBudgetEnvelopes,...env});}}
+class MailboxDO extends ActualMailboxDO {constructor(ctx:any,env:any){super(ctx,{HUB2_BUDGET_ENVELOPES:HISTORY_STRESS_ENVELOPES,...env});}}
 export { AccountDO,MailboxDO,ControlDO };
 export class MailboxFixture extends MailboxDO{
  async fetch(request:Request):Promise<Response>{
+  if(new URL(request.url).pathname==='/_fixture/outbox'){
+   const db=(this as any).db,id=new URL(request.url).searchParams.get('id');
+   const outbox=id?db.all("SELECT message_id,epoch,operation_id,state,next_attempt,session_id,machine_id,attempts FROM native_outbox WHERE message_id=? ORDER BY epoch",id):db.all("SELECT message_id,epoch,operation_id,state,next_attempt,session_id,machine_id,attempts FROM native_outbox ORDER BY message_id,epoch LIMIT 16");
+   return Response.json({outbox});
+  }
   if(new URL(request.url).pathname==='/_fixture/profile'){
    const db=(this as any).db,rows=[];
    for(const table of ['native_outbox','readdress_operations']){

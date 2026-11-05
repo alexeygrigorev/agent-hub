@@ -1,4 +1,5 @@
 import { MeteredDb, initializeSchema } from './db';
+import {SqlReceiptMeter,SQL_PROBE_HEADER} from './sql-receipt';
 import { actorFrom, bodyObject, boundedString, error, hasScope, HttpError, json } from './http';
 
 export const BUDGET_SCHEMA = [
@@ -125,6 +126,13 @@ function parseObject<T>(raw: string | null | undefined, fallback: T): T {
   try { return raw ? JSON.parse(raw) as T : fallback; } catch { return fallback; }
 }
 
+function fundedCoverage(row:DayRow|undefined,openHealth:boolean):Coverage{
+ const raw=parseObject<Record<string,unknown>>(row?.coverage_json,{}),known=Object.fromEntries(METRICS.map(k=>[k,raw[k]==='exact'||raw[k]==='upper_bound'?raw[k]:'unknown'])) as Coverage;
+ // Every accepted reservation has complete validated exact/upper-bound units.
+ // A hold certifies funding, never fabricated observed usage or repaired health.
+ return row&&BigInt(row.reserved_pusd)>0n?mergeCoverage(known,Object.fromEntries(METRICS.map(k=>[k,'upper_bound'])) as Coverage,row.events>0||openHealth):known;
+}
+
 function httpError(e: unknown): Response {
   return e instanceof HttpError ? error(e.code, e.status) : error('internal_error', 500);
 }
@@ -134,13 +142,17 @@ function httpError(e: unknown): Response {
 export class BudgetDO {
   private readonly db: MeteredDb;
   private readonly ready: Promise<void>;
+  private readonly sqlMeter:SqlReceiptMeter;
 
   constructor(private readonly ctx: DurableObjectState, _env: BudgetEnv = {}, private readonly clock: () => number = Date.now) {
     this.db = new MeteredDb(ctx.storage.sql);
+    this.sqlMeter=new SqlReceiptMeter(this.db,{hibernates_after_handler:true});
     this.ready = initializeSchema(ctx, this.db, 1, BUDGET_SCHEMA);
   }
 
-  async fetch(request: Request): Promise<Response> {
+  fetch(request:Request):Promise<Response>{return this.sqlMeter.measure(()=>this.handle(request),request.headers.get(SQL_PROBE_HEADER));}
+
+  private async handle(request: Request): Promise<Response> {
     try {
       await this.ready;
       const path = new URL(request.url).pathname;
@@ -277,8 +289,8 @@ export class BudgetDO {
       ||b.clear_hard_stop!==undefined&&typeof b.clear_hard_stop!=='boolean')throw new HttpError('invalid_budget_override',400);
     const current=this.db.one<DayRow>('SELECT * FROM budget_days WHERE day=?',day);
     if(b.clear_hard_stop===true){
-      const known=parseObject<Coverage>(current?.coverage_json,emptyCoverage());
-      if(METRICS.some(k=>known[k]!=='exact'&&known[k]!=='upper_bound')||this.db.one("SELECT metric FROM budget_health WHERE day=? AND state='open' LIMIT 1",day))throw new HttpError('budget_recovery_metrics_unknown',503);
+      const open=!!this.db.one("SELECT metric FROM budget_health WHERE day=? AND state='open' LIMIT 1",day),known=fundedCoverage(current,open);
+      if(METRICS.some(k=>known[k]!=='exact'&&known[k]!=='upper_bound')||open)throw new HttpError('budget_recovery_metrics_unknown',503);
     }
     if(current&&ceiling<BigInt(current.settled_pusd)+BigInt(current.reserved_pusd)+RECOVERY_RESERVE_PUSD)throw new HttpError('budget_override_below_committed',409);
     this.db.run("INSERT INTO budget_overrides(day,ceiling_pusd,actor_id,reason,created_at) VALUES(?,?,?,?,?) ON CONFLICT(day) DO UPDATE SET ceiling_pusd=excluded.ceiling_pusd,actor_id=excluded.actor_id,reason=excluded.reason,created_at=excluded.created_at",day,String(ceiling),actor.id,b.reason,now);
@@ -350,9 +362,9 @@ export class BudgetDO {
     const override = this.db.one<Row>('SELECT ceiling_pusd,actor_id,reason,created_at FROM budget_overrides WHERE day=?', day);
     const units = parseObject<Record<Metric, string>>(row?.units_json, emptyUnits());
     const costs = parseObject<Record<Bucket, string>>(row?.costs_json, emptyCosts());
-    const coverage = parseObject<Coverage>(row?.coverage_json, emptyCoverage());
     const pending = this.db.all<Row>('SELECT id,kind,state,attempts,created_at FROM budget_alerts WHERE day=? ORDER BY created_at,id', day);
     const healthEvents = this.db.all<Row>('SELECT metric,reason,failures,first_at,last_at FROM budget_health WHERE day=? AND state=\'open\' ORDER BY metric', day);
+    const coverage=fundedCoverage(row,healthEvents.length>0);
     const settled = BigInt(row?.settled_pusd || '0'), held = BigInt(row?.reserved_pusd || '0');
     const ceiling = this.ceilingFor(day), elapsed = Math.max(60_000, this.clock() - Date.parse(`${day}T00:00:00.000Z`));
     const projection = (settled + held) * 86_400_000n / BigInt(Math.min(elapsed, 86_400_000));
@@ -367,7 +379,7 @@ export class BudgetDO {
       day, currency: 'USD', timezone: 'UTC', allowances: 'assumed_exhausted', rate_basis: 'marginal_paid_estimate_from_exact_or_upper_bound_units',
       alert_threshold_usd: usd(ALERT_PUSD), daily_ceiling_usd: usd(ceiling), recovery_reserve_usd: usd(RECOVERY_RESERVE_PUSD),
       settled_usd: usd(settled), reserved_usd: usd(held), projected_usd: usd(projection),
-      units, category_costs_usd: Object.fromEntries(Object.entries(costs).map(([k, v]) => [k, usd(BigInt(v))])),
+      units, units_basis:'Settled ledger units only; fully held estimates remain in reserved_usd, not observed usage.', category_costs_usd: Object.fromEntries(Object.entries(costs).map(([k, v]) => [k, usd(BigInt(v))])),
       coverage, health, health_events: healthEvents, controller_metering_valid: metering.measurement_valid,
       hard_stopped: !!row?.hard_stopped, override: override ? { ...override, ceiling_usd: usd(BigInt(String(override.ceiling_pusd))) } : null,
       alerts: pending.map(v => ({ id: v.id, kind: v.kind, state: v.state, attempts: v.attempts, created_at: v.created_at })),

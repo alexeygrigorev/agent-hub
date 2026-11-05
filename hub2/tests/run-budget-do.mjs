@@ -48,15 +48,22 @@ const options = convertV4MiniflareOptions({
 });
 
 let mf = new Miniflare(options), base = '';
+const controllerProfiles={};
 const admin = { id: 'operator:workerd-budget-fixture', kind: 'operator', scopes: ['operator:admin', 'budget:read'] };
 async function api(instance, path, method = 'GET', body) {
   const url = new URL(base + '/_test' + path);
   url.searchParams.set('instance', instance);
   const response = await fetch(url, {
     method,
-    headers: { 'Content-Type': 'application/json', 'x-hub2-actor': JSON.stringify(admin) },
+    headers: { 'Content-Type': 'application/json', 'x-hub2-actor': JSON.stringify(admin),'x-hub2-sql-operation':instance+':'+path },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
+  const receipt=JSON.parse(response.headers.get('x-hub2-sql-receipt')||'null');
+  if(response.ok&&receipt?.valid){
+   assert.equal(receipt.operation_id,instance+':'+path);
+   const p=controllerProfiles[path]??={calls:0,max_reads:0,max_writes:0};
+   p.calls++;p.max_reads=Math.max(p.max_reads,receipt.reads);p.max_writes=Math.max(p.max_writes,receipt.writes);
+  }
   let result;
   try { result = await response.json(); } catch { result = { error: 'invalid_json' }; }
   return { status: response.status, result };
@@ -74,6 +81,11 @@ try {
   assert.equal(reserved.status, 200);
   const settled = await api('persistent', '/_internal/settle', 'POST', { id: 'workerd-restart-crossing', actual_units: metrics, coverage });
   assert.equal(settled.status, 200);
+  // Extra same-source native profiles: tiny reserve then actual overrun creates
+  // a threshold alert during settle; it must include all controller writes.
+  const tiny={...metrics,worker_requests:1};
+  assert.equal((await api('threshold-at-settle','/_internal/reserve','POST',{id:'threshold-native',kind:'test',estimated_units:tiny,coverage})).status,200);
+  assert.equal((await api('threshold-at-settle','/_internal/settle','POST',{id:'threshold-native',actual_units:{...tiny,worker_requests:400000},coverage})).status,200);
   const first = await api('persistent', '/api/budget');
   assert.equal(first.status, 200);
   assert.equal(first.result.alerts.filter(v => v.kind === 'threshold').length, 1);
@@ -89,8 +101,14 @@ try {
   assert.equal(replay.result.replay, true);
   const outbox = await api('persistent', '/_internal/alerts');
   assert.equal(outbox.result.items.filter(v => v.kind === 'threshold').length, 1);
-  console.log(JSON.stringify({ passed: true, gate: 'workerd SQLite object restart', daily_alerts_after_restart: afterRestart.result.alerts, settled_usd: afterRestart.result.settled_usd, note: 'Synthetic cost units; no Cloudflare billing/API or production data accessed.' }));
+  assert(controllerProfiles['/_internal/settle'].max_reads<=64);
+  assert(controllerProfiles['/_internal/settle'].max_writes<=8);
+  const controllerProof={profiles:controllerProfiles,proposed_settle_allowance:{reads:64,writes:8},basis:'Native cold reserve, new threshold during actual overrun settle, warm settle and post-restart replay. Source bounded PK lookups, budget_days row write <=1, reservation row plus changed day/state index <=3, at most one alert row/index insertion <=2; <=6 source-level row/index writes, allowance8, no alarms.'};
+  await (await import('node:fs/promises')).writeFile('/home/alexey/tmp/agent-reports/hub2-controller-sql-profile.json',JSON.stringify(controllerProof,null,2));
+  console.log(JSON.stringify({ passed: true, gate: 'workerd SQLite object restart', daily_alerts_after_restart: afterRestart.result.alerts, settled_usd: afterRestart.result.settled_usd, controller_native_profiles:controllerProfiles, note: 'Synthetic cost units; no Cloudflare billing/API or production data accessed.' }));
 } finally {
   await mf.dispose();
   await rm(persist, { recursive: true, force: true });
 }
+
+await import('./normal-day-alarm-clock.test.mjs');

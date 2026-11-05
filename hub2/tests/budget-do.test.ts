@@ -262,3 +262,27 @@ test('breaker recovery rejects missing and invalid stored metric coverage',async
   assert.equal((await status(budget)).hard_stopped,true);
  }
 });
+
+test('BudgetDO receipt binds the current namespace operation and includes first-request schema work',async()=>{
+ const s=state(),budget=new BudgetDO(s.ctx,{},()=>Date.parse('2026-11-04T12:00:00Z'));
+ const r=await budget.fetch(new Request('https://budget/_metrics',{headers:{'x-hub2-sql-operation':'namespace-operation-1'}}));
+ const receipt=JSON.parse(r.headers.get('x-hub2-sql-receipt')!);
+ assert.equal(receipt.valid,true);assert.equal(receipt.operation_id,'namespace-operation-1');
+ const measured=(await r.json() as any).counts;
+ assert.equal(receipt.reads,measured.rows_read);assert.equal(receipt.writes,measured.rows_written);assert(receipt.writes>0);
+ const next=await budget.fetch(new Request('https://budget/_metrics',{headers:{'x-hub2-sql-operation':'namespace-operation-2'}}));
+ const nextReceipt=JSON.parse(next.headers.get('x-hub2-sql-receipt')!);
+ assert.equal(nextReceipt.valid,true);assert.equal(nextReceipt.operation_id,'namespace-operation-2');
+ assert.equal(nextReceipt.reads,0);assert.equal(nextReceipt.writes,0,'metrics snapshot executes no SQLite');
+});
+
+test('fully held known envelopes remain upper-bound funding without invented settled units',async()=>{
+ const s=state(),budget=new BudgetDO(s.ctx,{},()=>Date.parse('2026-11-05T12:00:00Z'));
+ await reserve(budget,'held-only',units({worker_requests:100}));
+ let view=await status(budget);
+ assert(Number(view.reserved_usd)>0);assert.equal(view.settled_usd,'0.000000000000');
+ assert.equal(view.coverage.sqlite_rows_written,'upper_bound');assert.equal(view.units.worker_requests,'0');
+ assert.match(view.units_basis,/Settled/);
+ await budget.fetch(request('/_internal/reserve','POST',{id:'unknown-after-hold',kind:'test',estimated_units:{},coverage:{}}));
+ view=await status(budget);assert.equal(view.coverage.sqlite_rows_written,'unknown','an actual open unknown-health event is never hidden by a valid hold');
+});

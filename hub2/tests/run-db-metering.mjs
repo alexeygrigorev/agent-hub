@@ -14,3 +14,5 @@ registerHooks({
 });
 
 await import('./db-metering.test.ts');
+
+await import('./sql-receipt.test.ts');

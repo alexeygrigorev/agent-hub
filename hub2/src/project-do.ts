@@ -1,4 +1,5 @@
 import { MeteredDb, initializeSchema } from './db';
+import { SqlReceiptMeter, SQL_PROBE_HEADER, wrapSqlNamespaces } from './sql-receipt';
 import { sha256Hex } from './crypto';
 import { actorFrom, bodyObject, error, hasScope, HttpError, json } from './http';
 import { selectRoute, type RoutingDecision } from './routing';
@@ -63,15 +64,19 @@ type IntakeEventRow = { seq: number; actor_id: string; kind: string; body_json: 
 /** Per-project intake, queue, idempotency and launch-saga owner. */
 export class ProjectDO {
   private readonly db: MeteredDb;
+  private readonly sqlReceipts: SqlReceiptMeter;
+  private readonly env: Hub2Env;
   private readonly work: ProjectWork;
   private readonly ready: Promise<void>;
   private constructorMs = 0;
   private readonly eventSequences=new Map<string,number>();
   private pendingSequences:Map<string,number>|undefined;
 
-  constructor(private readonly ctx: DurableObjectState, private readonly env: Hub2Env) {
+  constructor(private readonly ctx: DurableObjectState, env: Hub2Env) {
     const started = performance.now();
     this.db = new MeteredDb(ctx.storage.sql);
+    this.sqlReceipts = new SqlReceiptMeter(this.db);
+    this.env = wrapSqlNamespaces(env, this.sqlReceipts) as Hub2Env;
     this.work = new ProjectWork(ctx, this.db, {
       authorize: (actor, intakeId) => this.workAuthorized(actor, intakeId),
       active: scheduleId => this.scheduleHasActiveSession(scheduleId),
@@ -85,6 +90,10 @@ export class ProjectDO {
   }
 
   async fetch(request: Request): Promise<Response> {
+    return this.sqlReceipts.measure(() => this.handleFetch(request), request.headers.get(SQL_PROBE_HEADER));
+  }
+
+  private async handleFetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     try {
       await this.ready;

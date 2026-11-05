@@ -4,6 +4,7 @@
   "name": "agent-hub2-local",
   "main": "host/tests/e2e-worker.ts",
   "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_als"],
   "assets": {
     "directory": "./public",
     "binding": "ASSETS",

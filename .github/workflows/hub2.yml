@@ -65,6 +65,11 @@ jobs:
         continue-on-error: true
         run: npm run test:accounts-mail --prefix hub2
 
+      - name: Account provider response timeout tests
+        id: account_provider_timeout
+        continue-on-error: true
+        run: npm run test:account-provider-timeout --prefix hub2
+
       - name: Project work semantic tests
         id: project_work
         continue-on-error: true
@@ -89,6 +94,11 @@ jobs:
         id: control
         continue-on-error: true
         run: npm run test:control --prefix hub2
+
+      - name: Control alarm budget retry tests
+        id: control_budget_alarm
+        continue-on-error: true
+        run: npm run test:control-budget-alarm --prefix hub2
 
       - name: Model and machine routing tests
         id: routing
@@ -120,6 +130,11 @@ jobs:
         continue-on-error: true
         run: npm run test:normal-day-auth --prefix hub2
 
+      - name: Machine WebSocket singleton Workerd tests
+        id: machine_socket_cap
+        continue-on-error: true
+        run: npm run test:machine-socket-cap --prefix hub2
+
       - name: Normal day Workerd budget and idle tests
         id: normal_day
         continue-on-error: true
@@ -150,17 +165,20 @@ jobs:
           TYPECHECK: ${{ steps.typecheck.outcome }}
           BUDGET: ${{ steps.budget.outcome }}
           ACCOUNTS_SEMANTIC: ${{ steps.accounts_semantic.outcome }}
+          ACCOUNT_PROVIDER_TIMEOUT: ${{ steps.account_provider_timeout.outcome }}
           PROJECT_WORK: ${{ steps.project_work.outcome }}
           PROJECT_INTAKE: ${{ steps.project_intake.outcome }}
           READ_CACHE: ${{ steps.read_cache.outcome }}
           DB_METERING: ${{ steps.db_metering.outcome }}
           CONTROL: ${{ steps.control.outcome }}
+          CONTROL_BUDGET_ALARM: ${{ steps.control_budget_alarm.outcome }}
           ROUTING: ${{ steps.routing.outcome }}
           BILLING_POLICY: ${{ steps.billing_policy.outcome }}
           BUDGET_CONTROLLER: ${{ steps.budget_controller.outcome }}
           BUDGET_EDGE: ${{ steps.budget_edge.outcome }}
           ACCOUNTS_WORKERD: ${{ steps.accounts_workerd.outcome }}
           AUTH_WORKERD: ${{ steps.auth_workerd.outcome }}
+          MACHINE_SOCKET_CAP: ${{ steps.machine_socket_cap.outcome }}
           NORMAL_DAY: ${{ steps.normal_day.outcome }}
           CORE_WORKERD: ${{ steps.core_workerd.outcome }}
           PUBLIC_MAIL: ${{ steps.public_mail.outcome }}
@@ -170,12 +188,15 @@ jobs:
           for result in \
             "setup_node:$SETUP_NODE" "install:$INSTALL" "typecheck:$TYPECHECK" \
             "budget:$BUDGET" "accounts_semantic:$ACCOUNTS_SEMANTIC" \
+            "account_provider_timeout:$ACCOUNT_PROVIDER_TIMEOUT" \
             "project_work:$PROJECT_WORK" "project_intake:$PROJECT_INTAKE" \
             "read_cache:$READ_CACHE" "db_metering:$DB_METERING" \
-            "control:$CONTROL" "routing:$ROUTING" "billing_policy:$BILLING_POLICY" \
+            "control:$CONTROL" "control_budget_alarm:$CONTROL_BUDGET_ALARM" \
+            "routing:$ROUTING" "billing_policy:$BILLING_POLICY" \
             "budget_controller:$BUDGET_CONTROLLER" "budget_edge:$BUDGET_EDGE" \
             "accounts_workerd:$ACCOUNTS_WORKERD" \
-            "auth_workerd:$AUTH_WORKERD" "normal_day:$NORMAL_DAY" \
+            "auth_workerd:$AUTH_WORKERD" "machine_socket_cap:$MACHINE_SOCKET_CAP" \
+            "normal_day:$NORMAL_DAY" \
             "core_workerd:$CORE_WORKERD" "public_mail:$PUBLIC_MAIL" "bundle:$BUNDLE"; do
             name=${result%%:*}
             outcome=${result#*:}

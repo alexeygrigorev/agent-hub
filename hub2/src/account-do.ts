@@ -1,6 +1,7 @@
 import {budgetedBackgroundRequest,BudgetPause,budgetPauseResponse} from './budget-edge';
 import {credentialKey,sealCredential,openCredential} from './credential-crypto';
 import { MeteredDb, initializeSchema } from './db';
+import { SqlReceiptMeter, SQL_PROBE_HEADER, wrapSqlNamespaces } from './sql-receipt';
 import { actorFrom, bodyObject, boundedString, error, hasScope, HttpError, json } from './http';
 import type { Actor,Hub2Env } from './types';
 type AccountEnv=Partial<Hub2Env>&{HUB2_CREDENTIAL_KEY?:string;HUB2_PROVIDER_FETCH?:typeof fetch};
@@ -31,8 +32,13 @@ type Reservation={operation_id:string;session_id:string;machine_id:string;epoch:
 export class AccountDO {
  private collecting?:Promise<Response>;
  private readonly db:MeteredDb;
- constructor(private readonly ctx:DurableObjectState,private readonly env:AccountEnv={}){this.db=new MeteredDb(ctx.storage.sql);initializeSchema(ctx,this.db,1,SCHEMA);}
+ private readonly sqlReceipts:SqlReceiptMeter;
+ private readonly env:AccountEnv;
+ constructor(private readonly ctx:DurableObjectState,env:AccountEnv={}){this.db=new MeteredDb(ctx.storage.sql);this.sqlReceipts=new SqlReceiptMeter(this.db);this.env=wrapSqlNamespaces(env,this.sqlReceipts) as AccountEnv;initializeSchema(ctx,this.db,1,SCHEMA);}
  async fetch(request:Request):Promise<Response>{
+  return this.sqlReceipts.measure(()=>this.handleFetch(request),request.headers.get(SQL_PROBE_HEADER));
+ }
+ private async handleFetch(request:Request):Promise<Response>{
   try{
    const p=new URL(request.url).pathname,a=actorFrom(request),method=request.method;
    if(p==='/api/account/rotation'||p==='/api/account/refresh-lease'||p==='/api/account/credential-rejection'||p==='/api/account/reconcile'||p==='/api/account/refresh-outcome')return await this.rotationRoute(request,a,p);
@@ -400,12 +406,22 @@ export class AccountDO {
   const token=auth?.claudeAiOauth?.accessToken;if(provider==='claude'&&typeof token!=='string')throw new Error('credential_missing');
   return this.provider(provider==='codex'?'https://chatgpt.com/backend-api/wham/usage':'https://api.anthropic.com/api/oauth/usage',{headers:provider==='codex'?this.codexHeaders(auth):{Authorization:'Bearer '+String(token),Accept:'application/json','anthropic-beta':'oauth-2025-04-20','User-Agent':'Claude-Code/2.1.198'}});
  }
- private provider(url:string,init:RequestInit):Promise<Response>{return (this.env.HUB2_PROVIDER_FETCH||fetch)(url,{...init,redirect:'manual',signal:AbortSignal.timeout(15000)});}
- private async boundedJson(response:Response):Promise<any>{
-  const reader=response.body?.getReader();if(!reader)throw new Error('empty_response');let size=0;const chunks:Uint8Array[]=[];
-  while(true){const {done,value}=await reader.read();if(done)break;size+=value.byteLength;if(size>131072){await reader.cancel();throw new Error('oversized_response');}chunks.push(value);}
-  const bytes=new Uint8Array(size);let offset=0;for(const c of chunks){bytes.set(c,offset);offset+=c.length;}return JSON.parse(new TextDecoder().decode(bytes));
+ private async provider(url:string,init:RequestInit,timeoutMs=15000):Promise<Response>{
+  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),timeoutMs);let consumed=false;
+  try{
+   const response=await (this.env.HUB2_PROVIDER_FETCH||fetch)(url,{...init,redirect:'manual',signal:controller.signal});
+   const text=response.body?await this.boundedText(response):null;consumed=true;
+   return new Response(text,{status:response.status,statusText:response.statusText,headers:response.headers});
+  }finally{clearTimeout(timer);if(!consumed)controller.abort();}
  }
+ private async boundedText(response:Response):Promise<string>{
+  const reader=response.body?.getReader();if(!reader)throw new Error('empty_response');let size=0;const chunks:Uint8Array[]=[];
+  try{
+   while(true){const {done,value}=await reader.read();if(done)break;size+=value.byteLength;if(size>131072){await reader.cancel().catch(()=>{});throw new Error('oversized_response');}chunks.push(value);}
+  }catch(e){await reader.cancel().catch(()=>{});throw e;}
+  const bytes=new Uint8Array(size);let offset=0;for(const c of chunks){bytes.set(c,offset);offset+=c.length;}return new TextDecoder().decode(bytes);
+ }
+ private async boundedJson(response:Response):Promise<any>{return JSON.parse(await this.boundedText(response));}
  private async key():Promise<CryptoKey>{try{return await credentialKey(this.env.HUB2_CREDENTIAL_KEY||'');}catch{throw new HttpError('credential_key_unavailable',503);}}
  private async seal(value:unknown,provider:string,generation:number):Promise<string>{const sealed=await sealCredential(await this.key(),new TextEncoder().encode(JSON.stringify(value)),new TextEncoder().encode(JSON.stringify([this.ctx.id?.toString()||'test-account',provider,generation])));return JSON.stringify({iv:Array.from(sealed.iv),data:Array.from(sealed.data)});}
  private async unseal(value:string,provider:string,generation:number):Promise<unknown>{try{const b=JSON.parse(value),plain=await openCredential(await this.key(),new Uint8Array(b.iv),new Uint8Array(b.data),new TextEncoder().encode(JSON.stringify([this.ctx.id?.toString()||'test-account',provider,generation])));return JSON.parse(new TextDecoder().decode(plain));}catch{throw new HttpError('credential_decryption_failed',503);}}

@@ -2,20 +2,23 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { AccountDO as ActualAccountDO } from '../src/account-do';
-import {semanticBudgetEnv} from './budget-fixture';
-class AccountDO extends ActualAccountDO { constructor(ctx:any,env:any={}){super(ctx,semanticBudgetEnv(env));} }
+import {semanticBudgetEnv,semanticNoSqlResponse} from './budget-fixture';
+function semanticEnv(env:any={}){return semanticBudgetEnv(env);}
+class AccountDO extends ActualAccountDO { constructor(ctx:any,env:any={}){super(ctx,semanticEnv(env));} }
 import { ControlDO } from '../src/control-do';
 import { MailboxDO as ActualMailboxDO } from '../src/mailbox-do';
-class MailboxDO extends ActualMailboxDO { constructor(ctx:any,env:any){super(ctx,semanticBudgetEnv(env));} }
+class MailboxDO extends ActualMailboxDO { constructor(ctx:any,env:any){super(ctx,semanticEnv(env));} }
 
-// Native SQLite semantics, not a Cloudflare row-cost measurement. Native cost
-// gates run separately in workerd; the cursor counters here are intentionally absent.
+// Native SQLite semantics only, not a Cloudflare row-cost measurement. The
+// local cursor supplies result-row/changed-row counts so guarded code paths can
+// run; native workerd owns all Cloudflare billing/cost assertions.
 function state() {
  const database=new DatabaseSync(':memory:');
  const ctx:any={storage:{sql:{exec(query:string,...args:unknown[]){
-  const statement=database.prepare(query);let rows:unknown[]=[];
-  if(statement.columns().length)rows=statement.all(...args as any);else statement.run(...args as any);
-  return {toArray:()=>rows};
+  const statement=database.prepare(query);let rows:unknown[]=[],rowsRead=0,rowsWritten=0;
+  if(statement.columns().length){rows=statement.all(...args as any);rowsRead=rows.length;}
+  else{const result=statement.run(...args as any);rowsWritten=Number(result.changes);}
+  return {toArray:()=>rows,rowsRead,rowsWritten};
  }},transactionSync<T>(fn:()=>T):T{database.exec('BEGIN');try{const result=fn();database.exec('COMMIT');return result;}catch(e){database.exec('ROLLBACK');throw e;}},
  async setAlarm(at:number){ctx.alarm=at;},async deleteAlarm(){ctx.alarm=null;},},blockConcurrencyWhile(fn:()=>unknown){return Promise.resolve(fn());},alarm:null};
  return {ctx,database};
@@ -78,11 +81,11 @@ test('unclaimed account hold expiry frees once; invalid quota evidence and unaut
 });
 function mailboxes(budget?:any){
  const flags={blockReceipts:false,blockDirectory:false,blockMachine:false,failWakeAfterEffect:false,afterRecipient:undefined as undefined|(()=>Promise<void>)};
- const controlEnv:any={},controlState=state();let control=new ControlDO(controlState.ctx,controlEnv);
+ const controlEnv:any=semanticEnv({}),controlState=state();let control=new ControlDO(controlState.ctx,controlEnv);
  controlState.database.prepare('INSERT INTO object_routes(kind,id,owner,resource_id,epoch,digest,participants_json) VALUES(?,?,?,?,?,?,?)').run('session','session-test','h1','task-test',1,'synthetic-fixture','[]');
  controlState.database.prepare('INSERT INTO actor_directory(id,kind,enabled) VALUES(?,?,1)').run('session:session-test','session');
  for(const name of ['a','b','c','d','e'])controlState.database.prepare('INSERT INTO named_agents(id,display_name,forward_session,enabled) VALUES(?,?,?,1)').run('agent:'+name,name,'session-test');clearFixtureCache(control);
- const nativeCalls:any[]=[];const nativeFetch=async(r:Request)=>{const b=await r.json();nativeCalls.push({path:new URL(r.url).pathname,body:b});return flags.blockMachine?new Response('{}',{status:503}):Response.json({queued:true,acked:new URL(r.url).pathname.endsWith('mail-ack'),cancelled:new URL(r.url).pathname.endsWith('mail-cancel'),state:'pending',message_id:b.message_id,epoch:b.epoch,operation_id:b.operation_id});};
+ const nativeCalls:any[]=[];const nativeFetch=async(r:Request)=>{const b=await r.json();nativeCalls.push({path:new URL(r.url).pathname,body:b});return flags.blockMachine?semanticNoSqlResponse(r,{},503):semanticNoSqlResponse(r,{queued:true,acked:new URL(r.url).pathname.endsWith('mail-ack'),cancelled:new URL(r.url).pathname.endsWith('mail-cancel'),state:'pending',message_id:b.message_id,epoch:b.epoch,operation_id:b.operation_id});};
  const stores=new Map<string,ReturnType<typeof state>>(),shared=state();let box:MailboxDO;
  const env:any={...(budget?{BUDGET:budget}:{}),MACHINES:{idFromName:(id:string)=>id,get:()=>({fetch:nativeFetch})},CONTROL:{idFromName:(id:string)=>id,get:()=>({fetch:async(r:Request)=>{const path=new URL(r.url).pathname;if(flags.blockDirectory&&path==='/_routes/register')return new Response('{}',{status:503});const response=await control.fetch(r);if(path==='/_recipient'&&flags.afterRecipient){const hook=flags.afterRecipient;flags.afterRecipient=undefined;await hook();}return response;}})},MAILBOXES:{idFromName:(id:string)=>id,get:(id:string)=>({fetch:async(r:Request)=>{const path=new URL(r.url).pathname;if(flags.blockReceipts&&path==='/_receipt')return new Response('{}',{status:503});const response=await get(id).fetch(r);if(flags.failWakeAfterEffect&&path==='/_resume-native'){flags.failWakeAfterEffect=false;return new Response('{}',{status:503});}return response;}})}};
  Object.assign(controlEnv,env);
@@ -104,7 +107,7 @@ test('sender key dedup is global across recipients and unauthorized inbox access
  assert.equal((await m.fetch('agent:a','/api/messages','POST',{...body,recipient:'agent:c'})).status,409);
  const inbox=await data(await m.fetch('agent:b','/api/messages'));assert.equal(inbox.items.length,1);
  assert.equal((await m.fetch('agent:b','/api/messages','GET',undefined,{id:'agent:e',kind:'agent',scopes:[]})).status,403);
- const metric=await data(await m.get('agent:a').fetch(request('/_metrics')));assert.equal(metric.counts.measurement_valid,false);
+ const metric=await data(await m.get('agent:a').fetch(request('/_metrics')));assert.equal(metric.counts.measurement_valid,true,'local result/changes instrumentation supports semantic execution only');
 });
 test('readdress fences the previous recipient and epoch while preserving the sender key replay',async()=>{
  const m=mailboxes(),body={recipient:'agent:b',body:'synthetic',key:'k2'},original=(await data(await m.fetch('agent:a','/api/messages','POST',body))).message;
