@@ -128,10 +128,14 @@ class FirstActionTest(unittest.TestCase):
 
 
 class TombstoneTest(unittest.TestCase):
-    def tombstone(self, tmp, native_id='D6CF9872-8597-48A5-BE64-990CDEF4DB31', **overrides):
+    def tombstone(self, tmp, native_id='D6CF9872-8597-48A5-BE64-990CDEF4DB31', output=None, meta=None, **overrides):
         base = {'id': native_id, 'tag': 'task-t1', 'workspace': str(tmp), 'cause': 'finished',
                 'exit': {'code': 0, 'signal': None}, 'containment_empty': True,
                 'deadline_ms': 1000, 'deadline_exceeded': False}
+        if output is not None:
+            base['output'] = output
+        if meta is not None:
+            base['meta'] = meta
         base.update(overrides)
         directory = Path(tmp) / '.local' / 'state' / 'aplexer' / 'retired-sessions' / native_id.lower()
         directory.mkdir(parents=True, exist_ok=True)
@@ -172,6 +176,25 @@ class TombstoneTest(unittest.TestCase):
             link.symlink_to(path)
             self.assertIsNone(nl.read_tombstone('link-id', state_dir=state_dir))
             self.assertIsNone(nl.read_tombstone('not-a-uuid', state_dir=state_dir))
+
+    def test_retained_output_is_stripped_before_metadata_cap(self):
+        """A tombstone whose retained PTY output enlarges the 1 MiB envelope
+        must still verify: output is dropped before the 64 KiB metadata cap
+        (the real 70,196-byte retirement case), while genuine oversized
+        metadata keeps failing closed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir, document = self.tombstone(tmp, output=[0] * 40000)
+            raw = (Path(state_dir) / 'retired-sessions' / document['id'].lower() / 'tombstone.json').read_bytes()
+            self.assertGreater(len(raw), 65536, 'fixture output must exceed the old metadata cap')
+            read = nl.read_tombstone(document['id'], state_dir=state_dir)
+            self.assertIsNotNone(read, 'retained output must not reject the tombstone')
+            self.assertNotIn('output', read)
+            adapter = nl.NativeLauncher({'routes': {}, 'aplexer_state_dir': state_dir}, runner=lambda *a, **k: None)
+            result = adapter.retired(document['id'], {'tag': 'task-t1', 'workspace': tmp})
+            self.assertIsNotNone(result)
+            self.assertEqual(result['exit']['code'], 0)
+            fat = self.tombstone(tmp, native_id='A1B2C3D4-0000-4000-8000-000000000001', meta='y' * 70000)
+            self.assertIsNone(nl.read_tombstone(fat[1]['id'], state_dir=state_dir), 'oversized metadata still refused')
 
 
 class CapabilityTest(unittest.TestCase):
@@ -319,6 +342,25 @@ class ProviderAdmissionTest(unittest.TestCase):
             client.request.return_value = binding
             with self.assertRaises(ValueError):
                 ph.provider_admission(manifest, client, 's1', 'op1', 2)
+
+
+class SpawnEnvironmentTest(unittest.TestCase):
+    def test_fixed_credentials_always_stripped_provider_prefixes_only_with_central_home(self):
+        hostile = {'OPENAI_API_KEY': 'ambient', 'ANTHROPIC_AUTH_TOKEN': 'ambient',
+                   'ZAI_API_KEY': 'ambient', 'HUB2_TOKEN': 'host-token', 'HUB2_SERVER': 'https://x.invalid',
+                   'HUB2_LAUNCH_CONTEXT': 'stale', 'OPENCODE_API_KEY': 'ambient', 'GO_API_KEY': 'ambient',
+                   'PATH': '/bin', 'HOME': '/home/test'}
+        with mock.patch.dict(os.environ, hostile, clear=True):
+            plain = nl.spawn_environment(False)
+            self.assertNotIn('OPENAI_API_KEY', plain)
+            self.assertNotIn('HUB2_TOKEN', plain)
+            self.assertNotIn('HUB2_LAUNCH_CONTEXT', plain)
+            self.assertIn('PATH', plain)
+            central = nl.spawn_environment(True)
+            for key in ('OPENAI_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ZAI_API_KEY', 'OPENCODE_API_KEY',
+                        'GO_API_KEY', 'HUB2_TOKEN', 'HUB2_SERVER'):
+                self.assertNotIn(key, central)
+            self.assertEqual(central.get('PATH'), '/bin')
 
 
 class LaunchReceiptTest(unittest.TestCase):

@@ -415,4 +415,6 @@ def provider_admission(manifest, client, session_id, operation_id, epoch):
     data['runtime_deadline'] = deadline
     if data['provider'] == 'codex' and quota['remaining'] <= CODEX_MIN_REMAINING:
         raise ValueError('central_provider_quota_floor')
-    return {'provider': 'opencode' if data['provider'] == 'go' else data['provider'], 'model': data['model']}, data
+    # The raw manifest provider is returned: the launcher adapter compares it
+    # against the route's provider field, where a go route is 'go'.
+    return {'provider': data['provider'], 'model': data['model']}, data

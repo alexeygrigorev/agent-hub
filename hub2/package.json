@@ -15,7 +15,7 @@
     "test:control": "node --experimental-transform-types tests/run-control-grants-directory.mjs",
     "test:control-budget-alarm": "node --experimental-transform-types tests/run-control-budget-alarm.mjs",
     "test:machine-socket-cap": "node tests/run-machine-socket-cap.mjs",
-    "test:routing": "cd .. && node hub2/host/tests/test-routing.mjs",
+    "test:routing": "cd .. && node --experimental-transform-types hub2/tests/run-resource-manager.mjs",
     "test:host": "python scripts/test_host.py",
     "test:billing-policy": "python3 tests/cloudflare-billing-policy.test.py",
     "test:budget": "node --experimental-transform-types tests/run-budget-do.mjs",

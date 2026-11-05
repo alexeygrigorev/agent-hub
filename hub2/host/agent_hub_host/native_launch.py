@@ -122,6 +122,29 @@ def cpu_load_pct(sample=None):
     return round(min(100.0, max(0.0, load / cores * 100)), 1)
 
 
+# Inherited credentials that must never reach aplexer or the native SDK,
+# where the ambient value would override the central private home.
+INHERITED_SECRET_VARS = ('HUB2_LAUNCH_CONTEXT', 'HUB2_TOKEN', 'HUB2_SERVER', 'HUB_TOKEN', 'HUB_JOB_TOKEN',
+                         'HUB_CONFIG_FILE', 'OPENAI_API_KEY', 'CODEX_API_KEY', 'CODEX_AUTH_TOKEN', 'CODEX_BASE_URL',
+                         'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ZAI_API_KEY', 'GO_API_KEY',
+                         'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY')
+
+
+def spawn_environment(central_home):
+    """Environment for the aplexer spawn client and its inherited child env.
+
+    The fixed credential list is always removed. With a central private home,
+    every provider-prefixed variable is removed too so the SDK can only see
+    the materialized home; the home's own values reach the child exclusively
+    through explicit --env entries, which override nothing here."""
+    env = os.environ.copy()
+    for name in INHERITED_SECRET_VARS:
+        env.pop(name, None)
+    if central_home:
+        env = clean_provider_environment(env)
+    return env
+
+
 def physical_resources_ready(min_free_mb, requested_mb):
     available = available_memory_mb()
     if available is None:
@@ -323,10 +346,17 @@ def validate_first_action(fa_path, start_json, min_mtime):
 
 
 def read_tombstone(native_id, state_dir=None):
-    """Bounded explicit read of retired-sessions/<native_id>/tombstone.json."""
+    """Bounded explicit read of retired-sessions/<native_id>/tombstone.json.
+
+    Optional retained output may enlarge the bounded 1 MiB envelope but is
+    never returned as lifecycle evidence: it is stripped before the original
+    64 KiB metadata cap applies. Symlinks, oversize envelopes/metadata and
+    malformed JSON are rejected."""
     if not isinstance(native_id, str) or not UUID_RE.fullmatch(native_id.strip()):
         return None
     canonical_id = native_id.strip().lower()
+    if state_dir is None:
+        state_dir = os.environ.get("APLEXER_STATE_DIR")
     base = Path(state_dir).resolve() if state_dir else Path(os.path.expanduser("~/.local/state/aplexer")).resolve()
     tombstone_file = base / "retired-sessions" / canonical_id / "tombstone.json"
     try:
@@ -339,9 +369,12 @@ def read_tombstone(native_id, state_dir=None):
         if len(raw) > TOMBSTONE_ENVELOPE_BYTES:
             return None
         data = json.loads(raw)
+        if not isinstance(data, dict):
+            return None
+        data.pop("output", None)
         if len(json.dumps(data, ensure_ascii=True).encode("utf-8")) > TOMBSTONE_METADATA_BYTES:
             return None
-        return data if isinstance(data, dict) else None
+        return data
     except (OSError, ValueError):
         return None
 
@@ -519,9 +552,7 @@ class NativeLauncher:
             argv += ["--env", f"{key}={value}"]
         argv += ["--"] + child
         started = time.time()
-        env = os.environ.copy()
-        for key in ('HUB2_TOKEN', 'HUB2_SERVER', 'HUB2_CONFIG', 'HUB2_LAUNCH_CONTEXT'):
-            env.pop(key, None)
+        env = spawn_environment(bool(specification.get("provider_home")))
         env["PWD"] = str(Path(specification["workspace"]).resolve())
         # `a start` is only the daemon handshake client: the spawned session lives
         # under the aplexer supervisor, so the runner timeout bounds the handshake

@@ -2,8 +2,7 @@ import { MeteredDb, initializeSchema } from './db';
 import { SqlReceiptMeter, SQL_PROBE_HEADER, wrapSqlNamespaces } from './sql-receipt';
 import { sha256Hex } from './crypto';
 import { actorFrom, bodyObject, error, hasScope, HttpError, json } from './http';
-import { admitLaunch, advanceDispatch, holdWireCode, releaseAccountCapacity, type AdmissionOutcome } from './resource-manager';
-import type { RoutingDecision } from './routing';
+import { admitLaunch, advanceDispatch, holdWireCode, releaseAccountCapacity, type AdmissionOutcome, type AdmissionPlan } from './resource-manager';
 import { nativeReturncode } from './native-exit';
 import { budgetedBackgroundRequest, type BudgetKind } from './budget-edge';
 import { PROJECT_WORK_SCHEMA, ProjectWork, type ProjectWorkHooks } from './project-work';
@@ -348,7 +347,7 @@ export class ProjectDO {
     }
 
     const operationId = crypto.randomUUID();
-    let route: RoutingDecision;
+    let route: AdmissionPlan;
     if (typeof engineInput === 'string' && engineInput.toLowerCase() === 'shell') {
       if (typeof machineInput !== 'string' || !hasScope(actor, 'operator:admin') || !overrideReason || overrideReason.length < 8) {
         return error('shell_reason_required', 403);
