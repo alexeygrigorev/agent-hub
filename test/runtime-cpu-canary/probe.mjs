@@ -8,7 +8,12 @@ export class CPUProbe {
  async handle(request){
   const path=new URL(request.url).pathname;
   if(path==='/smoke')return Response.json({ok:true,checksum:small(),source:this.env.SOURCE_SHA});
-  if(path==='/status'){const keys=['burn:worker','burn:do','burn:ws','alarm:started','alarm:completed','alarm:recovered','ws:completed'];return Response.json(Object.fromEntries(await this.ctx.storage.get(keys)));}
+  if(path==='/status'){const keys=['burn:worker','burn:do','burn:ws','alarm:started','alarm:completed','alarm:recovered','ws:completed','tail'];return Response.json(Object.fromEntries(await this.ctx.storage.get(keys)));}
+  if(path==='/metrics'){
+   const text=await request.text();if(text.length>8192)return new Response('too large',{status:413});
+   const b=JSON.parse(text);if(!Array.isArray(b.records)||b.records.length>16)return new Response('invalid',{status:400});
+   const prior=await this.ctx.storage.get('tail')||[];await this.ctx.storage.put('tail',[...prior,...b.records].slice(-16));return new Response(null,{status:204});
+  }
   if(path==='/ticket')return Response.json({allowed:await this.ticket('worker')});
   if(path==='/burn'){if(!await this.ticket('do'))return new Response('already used',{status:409});const checksum=burn();return Response.json({completed:true,checksum});}
   if(path==='/arm'){if(await this.ctx.storage.get('alarm:started'))return new Response('already used',{status:409});await this.ctx.storage.setAlarm(Date.now()+200);return Response.json({armed:true});}

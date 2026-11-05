@@ -1,4 +1,4 @@
-name: Isolated Hub runtime CPU canary
+name: Isolated Hub runtime CPU measurement
 on:
   push:
     branches: [hub2-runtime-canary-*]
@@ -13,7 +13,7 @@ concurrency:
 jobs:
   cpu-enforcement:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     outputs:
       journal: ${{ steps.prepare.outputs.artifact }}
     steps:

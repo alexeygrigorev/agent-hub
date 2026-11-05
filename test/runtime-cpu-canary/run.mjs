@@ -21,30 +21,39 @@ function validateJournal(j){
  assert(j.creation_allowed===true||j.creation_allowed===false,'invalid creation authorization');
  assert(j.run_id===run&&j.source_commit===source&&j.account_sha256===digest(account),'journal owner/account/source mismatch');
  assert(new RegExp('^hub2-cpu-proof-'+run+'-[a-f0-9]{6}$').test(j.worker),'fresh-name fence');
+ if(j.tail_worker!==undefined)assert(j.tail_worker===j.worker+'-tail','tail name fence');
 }
 async function cleanup(j){
  validateJournal(j);if(!j.creation_allowed)return{passed:true,skipped:'preexisting/inaccessible resource was never authorized'};
- const deadline=Date.now()+40000,attempts=[];
- for(let n=0;n<3&&Date.now()<deadline;n++){
-  try{
-   const removed=await api('/workers/scripts/'+j.worker+'?force=true',{method:'DELETE'},Math.min(5000,deadline-Date.now()));
-   const absent=await api('/workers/scripts/'+j.worker+'/settings',{},Math.min(5000,deadline-Date.now()));
-   attempts.push({delete_status:removed.status,absent_status:absent.status});
-   if(absent.status===404)return{passed:true,attempts,only_fresh_name:true};
-  }catch{attempts.push({transport_error:true});}
-  await new Promise(r=>setTimeout(r,1000));
+ const deadline=Date.now()+70000,attempts=[],names=j.tail_worker?[j.tail_worker,j.worker]:[j.worker];
+ let passed=true;
+ for(const name of names){
+  let absentConfirmed=false;
+  for(let n=0;n<3&&Date.now()<deadline;n++){
+   try{
+    const removed=await api('/workers/scripts/'+name+'?force=true',{method:'DELETE'},Math.min(5000,deadline-Date.now()));
+    const absent=await api('/workers/scripts/'+name+'/settings',{},Math.min(5000,deadline-Date.now()));
+    attempts.push({worker:name,delete_status:removed.status,absent_status:absent.status});
+    if(absent.status===404){absentConfirmed=true;break;}
+   }catch{attempts.push({worker:name,transport_error:true});}
+   await new Promise(r=>setTimeout(r,1000));
+  }
+  if(!absentConfirmed)passed=false;
  }
+ if(passed)return{passed:true,attempts,only_fresh_name:true};
  return{passed:false,attempts,only_fresh_name:true};
 }
 if(process.argv.includes('--prepare')){
  const name='hub2-cpu-proof-'+run+'-'+randomBytes(3).toString('hex');
- const j={worker:name,run_id:run,source_commit:source,account_sha256:digest(account),creation_allowed:false};
+ const j={worker:name,tail_worker:name+'-tail',run_id:run,source_commit:source,account_sha256:digest(account),creation_allowed:false};
  await durableJson(journalPath,j);
- const before=await api('/workers/scripts/'+name+'/settings');
- assert.equal(before.status,404,'refuse existing or inaccessible Worker');
- await durableJson(config,{name,main:resolve(root,'test/runtime-cpu-canary/probe.mjs'),account_id:account,compatibility_date:'2026-11-01',workers_dev:true,limits:{cpu_ms:500,subrequests:16},vars:{SOURCE_SHA:source},durable_objects:{bindings:[{name:'PROBE',class_name:'CPUProbe'}]},migrations:[{tag:'synthetic-v1',new_sqlite_classes:['CPUProbe']}]});
+ for(const worker of[name,j.tail_worker]){const before=await api('/workers/scripts/'+worker+'/settings');assert.equal(before.status,404,'refuse existing or inaccessible Worker');}
+ await durableJson(config,{name,main:resolve(root,'test/runtime-cpu-canary/probe.mjs'),account_id:account,compatibility_date:'2026-11-01',workers_dev:true,tail_consumers:[{service:j.tail_worker}],limits:{cpu_ms:500,subrequests:16},vars:{SOURCE_SHA:source},durable_objects:{bindings:[{name:'PROBE',class_name:'CPUProbe'}]},migrations:[{tag:'synthetic-v1',new_sqlite_classes:['CPUProbe']}]});
+ const tailBase={name:j.tail_worker,main:resolve(root,'test/runtime-cpu-canary/tail.mjs'),account_id:account,compatibility_date:'2026-11-01',workers_dev:false,limits:{cpu_ms:500,subrequests:8},vars:{PRODUCER_NAME:name,SOURCE_SHA:source}};
+ await durableJson(resolve(out,'tail-base.json'),tailBase);
+ await durableJson(resolve(out,'tail-final.json'),{...tailBase,durable_objects:{bindings:[{name:'PROBE',class_name:'CPUProbe',script_name:name}]}});
  await durableJson(resolve(out,'private-secrets.json'),{CANARY_KEY:randomBytes(32).toString('hex')});
- j.config_sha256=digest(await readFile(config));j.probe_sha256=digest(await readFile('test/runtime-cpu-canary/probe.mjs'));j.creation_allowed=true;await durableJson(journalPath,j); // Uploaded BEFORE deploy.
+ j.config_sha256=digest(await readFile(config));j.probe_sha256=digest(await readFile('test/runtime-cpu-canary/probe.mjs'));j.tail_source_sha256=digest(await readFile('test/runtime-cpu-canary/tail.mjs'));j.tail_config_hashes={};for(const file of['tail-base.json','tail-final.json'])j.tail_config_hashes[file]=digest(await readFile(resolve(out,file)));j.creation_allowed=true;await durableJson(journalPath,j); // Uploaded BEFORE deploy.
  console.log('Prepared fresh, undeployed CPU canary journal');process.exit(0);
 }
 const j=JSON.parse(await readFile(journalPath,'utf8'));validateJournal(j);
@@ -52,8 +61,8 @@ if(process.argv.includes('--cleanup-only')){
  const result=await cleanup(j);await durableJson(resolve(out,'cleanup-proof.json'),{worker:j.worker,source_commit:source,cleanup:result});
  console.log(JSON.stringify({worker:j.worker,cleanup:result}));if(!result.passed)process.exitCode=1;
 }else{
- const proof={passed:false,worker:j.worker,source_commit:source,cpu_limit_ms:500,probe_source_sha256:digest(await readFile('test/runtime-cpu-canary/probe.mjs')),production_hub_mutated:false,model_or_provider_credentials_used:false,maximum_burns:4,all_handler_cpu_proven:false,provider_cpu_time_ms_verified:false,proof_scope:'Provider CPU enforcement on synthetic Worker/DO HTTP; alarm and WS interruption/recovery observations only. Not Hub2 workflow/billing acceptance.'};
- const deadline=Date.now()+180000,remaining=()=>{const n=deadline-Date.now();assert(n>0,'bounded canary deadline');return n;};
+ const proof={passed:false,measurement_complete:false,bound_candidate_accepted:false,worker:j.worker,tail_worker:j.tail_worker,source_commit:source,cpu_limit_ms:500,probe_source_sha256:digest(await readFile('test/runtime-cpu-canary/probe.mjs')),production_hub_mutated:false,model_or_provider_credentials_used:false,maximum_burns:4,all_handler_cpu_proven:false,provider_cpu_time_ms_verified:false,proof_scope:'Provider CPU/Wall measurement in isolated synthetic resources. Configuration allows bursts; no strict-500-ms bound, Hub2 workflow or billing acceptance.'};
+ const deadline=Date.now()+150000,remaining=()=>{const n=deadline-Date.now();assert(n>0,'bounded canary deadline');return n;};
  const wrangler=resolve(root,'node_modules/wrangler/bin/wrangler.js');
  async function cli(args){
   try{const r=await execute(process.execPath,[wrangler,...args],{cwd:root,env:process.env,timeout:Math.min(90000,remaining()),maxBuffer:4*1024*1024});await writeFile(resolve(out,'last-cli-private.log'),r.stdout+r.stderr,{mode:0o600});}
@@ -66,7 +75,15 @@ if(process.argv.includes('--cleanup-only')){
   assert(c.name===j.worker&&c.account_id===account&&c.main===resolve(root,'test/runtime-cpu-canary/probe.mjs')&&c.limits?.cpu_ms===500&&!c.routes&&!c.route,'config/journal mismatch');
   assert(digest(await readFile(config))===j.config_sha256,'canary config changed after prepare');
   assert(proof.probe_source_sha256===j.probe_sha256,'canary source changed after prepare');
+  assert(digest(await readFile('test/runtime-cpu-canary/tail.mjs'))===j.tail_source_sha256,'tail source changed after prepare');
+  for(const file of['tail-base.json','tail-final.json']){
+   const path=resolve(out,file),tail=JSON.parse(await readFile(path,'utf8'));
+   assert(tail.name===j.tail_worker&&tail.account_id===account&&tail.main===resolve(root,'test/runtime-cpu-canary/tail.mjs')&&tail.workers_dev===false&&tail.limits?.cpu_ms===500&&!tail.routes&&!tail.route,'tail config/journal mismatch');
+   assert(digest(await readFile(path))===j.tail_config_hashes[file],'tail config changed after prepare');
+  }
+  await cli(['deploy','--config',resolve(out,'tail-base.json'),'--tag',source.slice(0,12)]);
   await cli(['deploy','--config',config,'--tag',source.slice(0,12),'--message','CPU runtime measurement source_commit='+source]);
+  await cli(['deploy','--config',resolve(out,'tail-final.json'),'--tag',source.slice(0,12)]);
   await cli(['secret','bulk',resolve(out,'private-secrets.json'),'--config',config]);
   const settings=await api('/workers/scripts/'+j.worker+'/settings');assert.equal(settings.status,200);assert.equal(settings.body.result?.limits?.cpu_ms,500);
   proof.provider_limits=settings.body.result.limits;
@@ -83,21 +100,26 @@ if(process.argv.includes('--cleanup-only')){
   const workerBurn=await request('/worker-burn'),doBurn=await request('/do-burn');
 
   proof.http_probe_observations={worker:observation(workerBurn),durable_object:observation(doBurn)};
-  assert(workerBurn.status>=500&&/1102|(?<![A-Za-z])CPU(?![A-Za-z])[^".]{0,80}(?:limit|exceed)|resource limits?/i.test(workerBurn.text),'Worker burn must hit provider CPU limit');
-  assert(doBurn.status>=500&&/1102|(?<![A-Za-z])CPU(?![A-Za-z])[^".]{0,80}(?:limit|exceed)|resource limits?/i.test(doBurn.text),'DO burn must hit provider CPU limit');
-  proof.http_burns={worker_status:workerBurn.status,worker_cpu_limit_observed:true,do_status:doBurn.status,do_cpu_limit_observed:true};
+  proof.http_burns={worker_status:workerBurn.status,worker_cpu_limit_observed:observation(workerBurn).cpu_signature,do_status:doBurn.status,do_cpu_limit_observed:observation(doBurn).cpu_signature};
   const {default:WebSocket}=await import('ws');
   ws=new WebSocket(base.replace('https:','wss:')+'/ws',{headers:{Authorization:'Bearer '+key,'User-Agent':'hub2-cpu-runtime/'+source}});
   await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(new Error('WebSocket open timeout')),Math.min(10000,remaining()));ws.once('open',()=>{clearTimeout(timer);resolve();});ws.once('error',e=>{clearTimeout(timer);reject(e);});});
   await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(new Error('WebSocket smoke timeout')),Math.min(5000,remaining()));ws.once('message',data=>{clearTimeout(timer);try{assert.equal(JSON.parse(String(data)).ok,true);resolve();}catch(e){reject(e);}});ws.send('smoke');});
   ws.send('burn');await new Promise(r=>setTimeout(r,2000));
-  let state=JSON.parse((await request('/do-status')).text);assert.equal(state['burn:ws'],1);assert.equal(state['ws:completed'],undefined);
+  let state=JSON.parse((await request('/do-status')).text);assert.equal(state['burn:ws'],1);proof.ws_burn_completed=state['ws:completed']===1;
   ws.close(1000,'probe complete');ws.terminate();ws=undefined;
   assert.equal((await request('/do-arm')).status,200);
-  for(let i=0;i<20;i++){remaining();await new Promise(r=>setTimeout(r,2000));const result=await request('/do-status');if(result.status!==200)continue;state=JSON.parse(result.text);if(state['alarm:recovered'])break;}
-  assert.equal(state['burn:worker'],1);assert.equal(state['burn:do'],1);assert.equal(state['alarm:started'],1);assert.equal(state['alarm:completed'],undefined);assert.equal(state['alarm:recovered'],1);
-  proof.persisted_probe_state=state;proof.alarm_ws_observations='Burn did not complete; alarm recovered without repeating burn. No provider event attribution, so this is not an all-handler CPU enforcement claim.';
-  assert.equal((await request('/smoke')).status,200);assert.equal((await request('/do-smoke')).status,200);proof.passed=true;
+  for(let i=0;i<20;i++){remaining();await new Promise(r=>setTimeout(r,2000));const result=await request('/do-status');if(result.status!==200)continue;state=JSON.parse(result.text);if(state['alarm:recovered']||state['alarm:completed'])break;}
+  assert.equal(state['burn:worker'],1);assert.equal(state['burn:do'],1);assert.equal(state['alarm:started'],1);proof.alarm_burn_completed=state['alarm:completed']===1;proof.alarm_recovered=state['alarm:recovered']===1;
+  proof.persisted_probe_state=state;proof.alarm_ws_observations='Completion/interruption is recorded without inferring CPU time. Provider trace fields below are authoritative measurements; no strict-limit acceptance.';
+  assert.equal((await request('/smoke')).status,200);assert.equal((await request('/do-smoke')).status,200);
+  for(let i=0;i<12;i++){state=JSON.parse((await request('/do-status')).text);if((state.tail||[]).some(v=>v.kind==='worker_http'&&v.path==='/worker-burn')&&(state.tail||[]).some(v=>v.kind==='do_http'&&v.path==='/burn'))break;await new Promise(r=>setTimeout(r,1000));}
+  proof.provider_trace_records=state.tail||[];
+  proof.provider_cpu_time_ms_verified=proof.provider_trace_records.some(v=>v.kind==='worker_http'&&v.path==='/worker-burn')&&proof.provider_trace_records.some(v=>v.kind==='do_http'&&v.path==='/burn');
+  assert(proof.provider_cpu_time_ms_verified,'provider CPU trace records required, no JS clock substitute');
+  proof.successful_over_limit=proof.provider_trace_records.filter(v=>v.outcome==='ok'&&v.cpu_ms>500);
+  proof.measurement_complete=true;proof.passed=true;
+
  }catch(error){proof.error=String(error?.message||error);process.exitCode=1;}
  finally{
   ws?.terminate();
