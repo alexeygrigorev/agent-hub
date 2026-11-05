@@ -10,7 +10,8 @@ import time
 from pathlib import Path
 
 from .client import ApiError, private_file, save_config
-from .launcher import Launcher, native_returncode
+from . import native_launch
+from .native_launch import NativeLauncher, native_returncode
 
 
 def canonical(value):
@@ -83,7 +84,10 @@ class Bridge:
         self.client, self.journal, self.runner = client, journal, runner
         self.roots = [Path(root).resolve(strict=True) for root in roots]
         self.engines = set(engines)
-        self.launcher = Launcher(launcher_config or {}, runner)
+        # Native launch path: the Hub Resource Manager owns admission; the host
+        # spawns admitted plans directly through aplexer. The external launcher
+        # runtime is no longer consulted for admission or spawn.
+        self.launcher = NativeLauncher(launcher_config or {}, runner, aplexer=executable, journal=journal)
         self.machine_id=machine_id
         self.budget_paused_until=0
         self.budget_safety_paused_until=0
@@ -223,7 +227,7 @@ class Bridge:
             launch['worker_context']['machine_id']=self.machine_id
             if launch['engine']!='shell':
                 from .providers import provision
-                launch['provider_home'],launch['controller_config']=provision(self.client,offer,launch,self.journal.directory,self.launcher,self.runner)
+                launch['provider_home'],launch['controller_config']=provision(self.client,offer,launch,self.journal.directory,self.launcher.config.get('routes'))
             if acknowledge:
                 acknowledge(session, epoch)
             admission = self.client.request("POST", f"/api/sessions/{session}/admission",
@@ -232,6 +236,12 @@ class Bridge:
                 raise RuntimeError("server_admission_refused")
             launch['child_config_file']=self.child_context(offer,launch)
             launch['runtime_deadline']=round(json.loads(Path(launch['child_config_file']).read_text())['expires_at']*1000)
+            # The adapter's final gate re-verifies the admitted generation against
+            # this live admission view immediately before spawn.
+            launch['client']=self.client
+            launch['session_id']=session
+            launch['operation_id']=operation
+            launch['epoch']=epoch
             with db:
                 db.execute("UPDATE launches SET state='launching' WHERE operation_id=?", (operation,))
             try:
@@ -290,7 +300,7 @@ class Bridge:
             code = native_returncode(exit_info)
             if code is None:
                 continue
-            launcher_state=self.launcher.finalize('hub2-'+row['session_id'],row['workspace'])
+            launcher_state=self.launcher.finalize(row["native_id"], {"tag": row["tag"], "workspace": row["workspace"]})
             payload = {"operation_id": row["operation_id"], "epoch": row["epoch"],
                        "native_id": row["native_id"], "exit_code": code,
                        "native_exit_confirmed": True,
@@ -383,7 +393,11 @@ class Bridge:
     def heartbeat(self,labels):
         available=self.launcher.capabilities()
         engines=sorted(engine for engine in self.engines.intersection(available) if available[engine])
-        self.client.heartbeat(labels,engines,['headless']+[cap+':'+engine for engine in engines for cap in sorted(available[engine]-{'headless'})])
+        capabilities=['headless']+[cap+':'+engine for engine in engines for cap in sorted(available[engine]-{'headless'})]
+        # Resource Manager collector input: one bounded physical snapshot per heartbeat.
+        memory=native_launch.available_memory_mb()
+        resources={'mem_available_mb':memory,'observed_at':int(time.time()*1000)} if memory is not None else None
+        self.client.heartbeat(labels,engines,capabilities,resources=resources)
 
     def safety_pause(self,machine_id):
         self.reconcile()

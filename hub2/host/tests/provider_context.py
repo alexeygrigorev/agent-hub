@@ -7,7 +7,7 @@ import subprocess
 import sys
 
 from agent_hub_host.client import Client
-from agent_hub_host.launcher import Launcher
+from agent_hub_host.native_launch import NativeLauncher
 from agent_hub_host.providers import provision
 
 
@@ -24,10 +24,9 @@ def main():
     launch = dict(offer['launch'])
     launch['worker_context'] = {'machine_id': config['machine_id']}
     client = Client(config['server'], config['token'])
-    launcher = Launcher({'repository': str(Path(args.launcher_root).resolve()),
-                         'routes': {launch['engine']: {'provider': args.provider}}})
+    launcher = NativeLauncher({'routes': {launch['engine']: {'provider': args.provider}}})
     manifest, controller = provision(client, offer, launch, config_path.parent, launcher)
-    script = 'from launcher.provider_home import admission;import json,sys; chosen,home=admission(sys.argv[1],sys.argv[2]);print(json.dumps({"provider":home["provider"],"generation":home["generation"],"account_id":home["account_id"],"model":chosen["model"],"sdk_selected":True}))'
+    raise SystemExit('provider_context: external launcher admission probe retired with the launcher adapter')
     env = os.environ.copy()
     env['PYTHONPATH'] = str(Path(args.launcher_root).resolve())
     result = subprocess.run([sys.executable, '-c', script, manifest, controller], env=env,

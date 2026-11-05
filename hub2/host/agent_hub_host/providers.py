@@ -1,15 +1,15 @@
 """Provision approved central generations before native admission."""
-import json
 import hashlib
+import json
 import os
 import re
-import subprocess
-import sys
 from pathlib import Path
+
+from . import provider_home
 from .client import save_config
 
 
-def provision(client, offer, launch, directory, launcher, runner=subprocess.run):
+def provision(client, offer, launch, directory, routes, runner=None):
     account = offer.get('account_id')
     if not isinstance(account, str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,80}', account):
         raise RuntimeError('provider_account_required')
@@ -17,22 +17,21 @@ def provision(client, offer, launch, directory, launcher, runner=subprocess.run)
     prefix = '/api/accounts/' + account + '/api/account'
     view = client.request('GET', prefix)
     provider = view.get('account', {}).get('provider')
-    route = launcher.config.get('routes', {}).get(launch['engine'], {})
+    route = (routes or {}).get(launch['engine'], {})
     if provider not in {'go', 'codex', 'claude', 'zai'} or route.get('provider') != provider:
         raise RuntimeError('provider_route_mismatch')
     bundle = client.request('GET', prefix + '/credentials?min_validity_ms=' + str((launch['timeout_seconds'] + 360) * 1000))
-    repository = launcher.config['repository']
-    env = os.environ.copy()
-    env['PYTHONPATH'] = repository
     # SDKs may normalize their own files; never reuse a different attempt's mutable home.
     fence=hashlib.sha256(json.dumps([offer['session_id'],offer['operation_id'],offer['epoch']],separators=(',',':')).encode()).hexdigest()
-    request = dict(root=str(Path(directory).resolve() / 'providers' / fence), account=account,
-                   provider=provider, generation=bundle['generation'], files=bundle['files'], model=launch['model'], timeout_seconds=launch['timeout_seconds'])
-    result = runner([sys.executable, '-m', 'launcher.provider_home'], input=json.dumps(request),
-                    text=True, capture_output=True, timeout=20, check=False, env=env)
-    if result.returncode or len(result.stdout) > 4096:
-        raise RuntimeError('provider_materialization_refused')
-    manifest = json.loads(result.stdout)['manifest']
+    root=str(Path(directory).resolve() / 'providers' / fence)
+    # Materialization runs in-process from the internalized adapter; the external
+    # launcher runtime and its repository path are no longer on the Hub2 host path.
+    try:
+        manifest = provider_home.materialize(root, account, provider, bundle['generation'],
+                                             bundle['files'], launch['model'],
+                                             timeout_seconds=launch['timeout_seconds'])
+    except (OSError, ValueError):
+        raise RuntimeError('provider_materialization_refused') from None
     acknowledged = client.request('POST', prefix + '/credentials', {'generation': bundle['generation']})
     if acknowledged.get('acknowledged') is not True:
         raise RuntimeError('provider_generation_ack_unverified')
