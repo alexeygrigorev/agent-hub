@@ -55,10 +55,10 @@ jobs:
         continue-on-error: true
         run: npm run typecheck --prefix hub2
 
-      - name: Enforce product SLOC and report tooling/test totals
+      - name: Enforce approved 7,853-SLOC release baseline and report totals
         id: budget
         continue-on-error: true
-        run: npm run budget --prefix hub2
+        run: npm run budget --prefix hub2 -- --limit 6000 --accepted-baseline 7853
 
       - name: Accounts and mail semantic tests
         id: accounts_semantic

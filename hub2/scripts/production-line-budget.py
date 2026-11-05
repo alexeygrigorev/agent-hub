@@ -144,13 +144,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--limit", type=int, default=6000, help="product SLOC target")
     parser.add_argument(
-        "--accepted-overage", type=int, default=362,
-        help="previously accepted modest overage; failures begin above target plus this amount",
+        "--accepted-baseline", type=int, default=7853,
+        help="Alexey-approved maximum product SLOC for the current release; growth above it fails",
     )
     parser.add_argument("--json", action="store_true", help="emit machine-readable report")
     args = parser.parse_args()
-    if args.limit < 1 or args.accepted_overage < 0:
-        parser.error("--limit must be positive and --accepted-overage nonnegative")
+    if args.limit < 1 or args.accepted_baseline < args.limit:
+        parser.error("--limit must be positive and --accepted-baseline must be at least --limit")
 
     product = production_files()
     verification = verification_files()
@@ -166,10 +166,11 @@ def main() -> int:
 
     product = describe(product)
     within_target = product["sloc"] <= args.limit
-    accepted_maximum = args.limit + args.accepted_overage
+    accepted_maximum = args.accepted_baseline
     report = {
         "limit": args.limit,
-        "accepted_previous_overage": args.accepted_overage,
+        "accepted_release_baseline": args.accepted_baseline,
+        "accepted_over_target": args.accepted_baseline - args.limit,
         "accepted_maximum": accepted_maximum,
         "product": product,
         "within_target": within_target,
@@ -179,7 +180,7 @@ def main() -> int:
         "within_product_limit": product["sloc"] <= accepted_maximum and host_runtime_complete,
         "host_runtime_complete": host_runtime_complete,
         "missing_host_files": missing_host_files,
-        "policy": "6000 product SLOC is the target. The previously reported 362-line modest overage is accepted for this rollout and remains visible; greater overage fails the gate. SLOC is nonblank/noncomment physical source lines; physical totals are reported separately. No source is minified. Test-only harnesses and CI verification are separate categories, never silently omitted from this report.",
+        "policy": "6000 product SLOC remains the architecture target. Alexey explicitly approved 7853 product SLOC as the maximum baseline for this release on 2026-11-05, superseding the obsolete 6362 maximum. The accepted over-target amount remains visible; any growth above 7853 fails this release gate and needs a new decision. SLOC is nonblank/noncomment physical source lines; physical totals are reported separately. No source is minified. Test-only harnesses and CI verification are separate categories, never silently omitted from this report.",
         "excluded": ["documentation", "hidden local files", "generated caches/build/dist/node_modules", "Python *.egg-info packaging metadata", "binary assets"],
     }
     if args.json:
@@ -190,8 +191,8 @@ def main() -> int:
             print(f"{name}: {group['sloc']} SLOC; {group['physical_lines']} physical lines; {group['file_count']} files")
         print(f"product target: {report['product']['sloc']}/{args.limit} SLOC")
         if not within_target and report["product"]["sloc"] <= accepted_maximum:
-            print(f"accepted previous overage: {report['product']['sloc'] - args.limit}/{args.accepted_overage} SLOC (non-blocking for this rollout)")
-        print(f"product gate maximum: {accepted_maximum} SLOC")
+            print(f"Alexey-approved release overage: {report['product']['sloc'] - args.limit}/{report['accepted_over_target']} SLOC")
+        print(f"Alexey-approved current-release maximum: {accepted_maximum} SLOC")
         if missing_host_files:
             print(f"complete product gate: FAIL (host runtime missing: {', '.join(missing_host_files)})")
         print("policy: SLOC counts nonblank/noncomment physical lines; no minification")

@@ -8,7 +8,7 @@ Status: release gate in progress, 4 November 2026. This document records Alexey'
 - The primary alert fires once when Hub variable cost is **strictly greater than USD 0.03 in a UTC day**. Its persisted record must include the UTC day, accumulated/estimated USD, category breakdown, observation timestamp, metric coverage and provider-data lag. A threshold alert does not stop work.
 - Initial enforced ceiling: **USD 0.10 per Hub UTC day**, with **USD 0.01 reserved** for status, alert delivery, stop and recovery. The local BudgetDO/Worker gate implements and tests this default and audited recovery. A production envelope has not been derived or installed, so this is not production-ready.
 - Assume all monthly included allowances are exhausted. Use marginal paid rates for projections. The shared fixed USD 5 Workers subscription is excluded from the Hub variable-cost alert and is reported separately.
-- The accepted 6,000 product-SLOC target is tracked independently from operation and money budgets. Alexey accepted the previously reported modest 362-line overage for rollout; do not minify or delete retained behavior to meet the target.
+- The 6,000 product-SLOC target is tracked independently from operation and money budgets. Alexey explicitly approved 7,853 product SLOC as the maximum for this release on 2026-11-05, superseding the obsolete 6,362 release maximum. CI rejects any growth above 7,853; do not minify or delete retained behavior to meet the target.
 
 ## Billable dimensions and rates
 
