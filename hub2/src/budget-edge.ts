@@ -5,9 +5,9 @@ import {nativeReturncode} from './native-exit';
 import {SqlReceiptMeter, wrapSqlNamespaces, type SqlReceipt} from './sql-receipt';
 
 type Plan={units:Units;max_do_calls:number;max_wall_ms:number;provenance:string};
-export type BudgetKind='public_request'|'public_read'|'public_write'|'placement_request'|'connection_request'|'fleet_read'|'project_request'|'claim_request'|'message_request'|'account_request'|'background_effect'|'provider_refresh'|'scheduled_start'|'native_delivery'|'retry'|'operator_stop'|'native_exit'|'capacity_reconcile'|'auth_revoke'|'alert_delivery'|'budget_recovery';
+export type BudgetKind='auth_request'|'public_request'|'public_read'|'public_write'|'placement_request'|'connection_request'|'fleet_read'|'project_request'|'claim_request'|'message_request'|'account_request'|'background_effect'|'provider_refresh'|'scheduled_start'|'native_delivery'|'retry'|'operator_stop'|'native_exit'|'capacity_reconcile'|'auth_revoke'|'alert_delivery'|'budget_recovery';
 type PlanSet=Plan&{by_kind?:Partial<Record<BudgetKind,Plan>>};
-const KINDS=new Set<BudgetKind>(['public_request','public_read','public_write','placement_request','connection_request','fleet_read','project_request','claim_request','message_request','account_request','background_effect','provider_refresh','scheduled_start','native_delivery','retry','operator_stop','native_exit','capacity_reconcile','auth_revoke','alert_delivery','budget_recovery']);
+const KINDS=new Set<BudgetKind>(['auth_request','public_request','public_read','public_write','placement_request','connection_request','fleet_read','project_request','claim_request','message_request','account_request','background_effect','provider_refresh','scheduled_start','native_delivery','retry','operator_stop','native_exit','capacity_reconcile','auth_revoke','alert_delivery','budget_recovery']);
 const SAFE=new Set<BudgetKind>(['operator_stop','native_exit','capacity_reconcile','auth_revoke','alert_delivery','budget_recovery']);
 type ResolveActor=(request:Request,env:Hub2Env)=>Promise<Actor|undefined>;
 const NAMES=['CONTROL','PROJECTS','MACHINES','ACCOUNTS','MAILBOXES'] as const;
@@ -108,8 +108,11 @@ export async function budgetedPublicRequest(
  request:Request,env:Hub2Env,resolve:ResolveActor,run:(guarded:Hub2Env)=>Promise<Response>,
 ):Promise<Response>{
  const path=new URL(request.url).pathname,method=request.method;
+ const origin=(env as ReceiptEnv).SQL_RECEIPT_METER?'nested':'worker';
+ env=receiptContext(env).env; // Include bounded safety authentication in the charged prelude.
  let kind:BudgetKind;
- if(method==='GET'&&path==='/api/connect')kind='connection_request';
+ if(path==='/device'||path.startsWith('/auth/')||path.startsWith('/api/device/')||path.startsWith('/api/token/'))kind='auth_request';
+ else if(method==='GET'&&path==='/api/connect')kind='connection_request';
  else if(method==='POST'&&(path==='/api/sessions'||/^\/api\/intakes\/[^/]+\/start$/.test(path)))kind='placement_request';
  else if(method==='GET'&&['/api/fleet','/api/fleet/machines','/api/sessions','/api/status'].includes(path))kind='fleet_read';
  else if(path==='/api/messages'||/^\/api\/messages\/[^/]+(?:\/(?:read|ack|delivered|accept|complete|readdress|status))?$/.test(path))kind='message_request';
@@ -126,7 +129,7 @@ export async function budgetedPublicRequest(
   if(!planFor(env,true,'budget_recovery'))return error('budget_metrics_unknown',503);
   return stripSqlReceiptHeaders(await run(env)); // Router still enforces CSRF and fresh authentication before the dedicated adapter.
  }
- return stripSqlReceiptHeaders(await budgetedBackgroundRequest(env,kind,run,false,(env as ReceiptEnv).SQL_RECEIPT_METER?'nested':'worker'));
+ return stripSqlReceiptHeaders(await budgetedBackgroundRequest(env,kind,run,false,origin));
 }
 
 export async function budgetedOperatorOverride(request:Request,env:Hub2Env,actor:Actor):Promise<Response>{

@@ -1,0 +1,89 @@
+// Maintenance is the default; activation and final gates belong to the release coordinator.
+// Keep all v1 bindings/migrations; never delete or remap an existing namespace.
+// Install private secrets separately: HUB1_EXPORT_TOKEN, HUB2_IMPORT_TOKEN, HUB2_CREDENTIAL_KEY,
+// HUB2_IMPORT_MANIFEST (audited source/run/Merkle commitment), HUB2_BUDGET_ENVELOPES, alert transport token.
+// 500ms is a configured policy, not a verified strict runtime upper bound.
+// Active mode may add ONLY the approved 15-minute budget-alert cron; maintenance has none.
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "agent-hub",
+  "main": "production-worker.ts",
+  "compatibility_date": "2026-11-01",
+  "compatibility_flags": [
+    "nodejs_als"
+  ],
+  "workers_dev": true,
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": true
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "HUB",
+        "class_name": "Hub"
+      },
+      {
+        "name": "CONTROL",
+        "class_name": "ControlDO"
+      },
+      {
+        "name": "PROJECTS",
+        "class_name": "ProjectDO"
+      },
+      {
+        "name": "MACHINES",
+        "class_name": "MachineDO"
+      },
+      {
+        "name": "ACCOUNTS",
+        "class_name": "AccountDO"
+      },
+      {
+        "name": "MAILBOXES",
+        "class_name": "MailboxDO"
+      },
+      {
+        "name": "BUDGET",
+        "class_name": "BudgetDO"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "Hub"
+      ]
+    },
+    {
+      "tag": "hub2-v1",
+      "new_sqlite_classes": [
+        "ControlDO",
+        "ProjectDO",
+        "MachineDO",
+        "AccountDO",
+        "MailboxDO",
+        "BudgetDO"
+      ]
+    }
+  ],
+  "triggers": {
+    "crons": []
+  },
+  "limits": {
+    "cpu_ms": 500,
+    "subrequests": 64
+  },
+  "vars": {
+    "HUB2_RELEASE_MODE": "maintenance",
+    "HUB1_EXPORT_GENERATION": "hub2-readonly-20261105-v1",
+    "AUTH_CLIENT_ID": "1tplqm9l6q6545mrk0gjv6eaeh",
+    "AUTH_ISSUER": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_H7nJu52Bs",
+    "AUTH_BASE_URL": "https://auth.dtcdev.click",
+    "AUTH_CALLBACK_URL": "https://hub.dtcdev.click/auth/callback",
+    "AUTH_JWKS_URL": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_H7nJu52Bs/.well-known/jwks.json",
+    "HUB_ADMINS": "alexey@datatalks.club,orin@datatalks.club"
+  }
+}

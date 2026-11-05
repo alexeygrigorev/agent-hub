@@ -4,6 +4,7 @@ import {build} from 'esbuild';
 import {Miniflare,Log,LogLevel,convertV4MiniflareOptions} from 'miniflare';
 import {WebSocket} from 'ws';
 import {nativeMeter}from'./normal-day-meter.mjs';
+import {canonicalSizingEnvelopes}from'./canonical-cost-envelope.mjs';
 import {resolve,relative,sep} from 'node:path';
 import {readFile,writeFile,mkdir,mkdtemp,readdir} from 'node:fs/promises';
 import {createHash,webcrypto} from 'node:crypto';
@@ -20,7 +21,7 @@ const normalDayUnits=Object.fromEntries(budgetMetrics.map(k=>[k,0]));
 Object.assign(normalDayUnits,{worker_requests:1,worker_cpu_ms:500,do_requests:19,do_ws_messages:1,do_gb_ms:2048,background_invocations:1,sqlite_rows_read:128,sqlite_rows_written:16,sqlite_byte_days:65536});
 const publicRequestUnits={...normalDayUnits,worker_cpu_ms:250,do_requests:11,do_gb_ms:512,sqlite_rows_read:64,sqlite_rows_written:8};
 const routePlan=(calls,wall,cpu,gbms,reads,writes,label)=>({units:{...normalDayUnits,worker_cpu_ms:cpu,do_requests:calls+3,do_gb_ms:gbms,sqlite_rows_read:reads,sqlite_rows_written:writes},max_do_calls:calls,max_wall_ms:wall,provenance:`Measured canonical ${label} upper bound; test-only, not production sizing`});
-const normalDayBudget=process.env.HUB2_COST_PROFILE?await readFile(process.env.HUB2_COST_PROFILE,'utf8'):JSON.stringify({version:1,normal:{units:normalDayUnits,max_do_calls:16,max_wall_ms:500,by_kind:{
+const normalDayBudget=process.env.HUB2_COST_PROFILE?await readFile(process.env.HUB2_COST_PROFILE,'utf8'):process.env.HUB2_NORMAL_DAY_SIZING_CANDIDATE==='1'?canonicalSizingEnvelopes(budgetMetrics):JSON.stringify({version:1,normal:{units:normalDayUnits,max_do_calls:16,max_wall_ms:500,by_kind:{
  public_request:{units:publicRequestUnits,max_do_calls:8,max_wall_ms:250,provenance:'Unclassified public fallback; test-only, not production sizing'},
  public_read:routePlan(3,250,200,192,32,5,'read'),public_write:routePlan(4,300,250,320,64,12,'write'),
  fleet_read:routePlan(6,250,250,384,128,5,'bounded fleet read'),project_request:routePlan(4,250,250,256,64,12,'project operation'),
@@ -49,7 +50,19 @@ let mf=new Miniflare(options),base,operatorFamily,refreshToken,accessExpires,wri
 const objects=[['control','global'],['project',project],...Array.from({length:4},(_,i)=>['machine','normal-machine-'+i]),...Array.from({length:6},(_,i)=>['account','normal-account-'+i]),['mailbox','global'],['budget','global']];
 const drivenAlarms={};
 const request_ledger={},flows=[],coverage={},missing=[],errors=[],hosts=[],intakes=[];let historicalIntake;
-async function api(path,method='GET',body,auth=token){const actor=auth===bootstrap?'fixture':!auth?'public':hosts.some(h=>h.token===auth)?'machine':auth===token?'operator':auth===writerToken?'root_writer':'bounded-child';const key=actor+' '+method+' '+path.split('?')[0].replace(/[0-9a-f]{8}-[0-9a-f-]{27,}/gi,':id');request_ledger[key]=(request_ledger[key]||0)+1;const r=await fetch(base+path,{method,headers:{'Content-Type':'application/json',...(auth?{Authorization:'Bearer '+auth}:{})},...(body===undefined?{}:{body:JSON.stringify(body)})});const text=await r.text();let data;try{data=JSON.parse(text);}catch{data={error:'non_json',fixture_error:text.slice(0,1000)};}return{status:r.status,data};}
+async function apiOnce(path,method='GET',body,auth=token,wireBody){const actor=auth===bootstrap?'fixture':!auth?'public':hosts.some(h=>h.token===auth)?'machine':auth===token?'operator':auth===writerToken?'root_writer':'bounded-child';const key=actor+' '+method+' '+path.split('?')[0].replace(/[0-9a-f]{8}-[0-9a-f-]{27,}/gi,':id');request_ledger[key]=(request_ledger[key]||0)+1;const r=await fetch(base+path,{method,headers:{'Content-Type':'application/json',...(auth?{Authorization:'Bearer '+auth}:{})},...(body===undefined?{}:{body:wireBody??JSON.stringify(body)})});const text=await r.text();let data;try{data=JSON.parse(text);}catch{data={error:'non_json',fixture_error:text.slice(0,1000)};}return{status:r.status,data};}
+const recoveryAttempts=[];
+async function api(path,method='GET',body,auth=token){
+ const wireBody=body===undefined?undefined:JSON.stringify(body),first=await apiOnce(path,method,body,auth,wireBody);
+ const eligible=process.env.HUB2_NORMAL_DAY_EXPLICIT_RECOVERY==='1'&&method==='POST'&&typeof body?.key==='string'
+  &&(path.startsWith('/api/messages?')||/^\/api\/intakes\/[^/]+\/start(?:\?|$)/.test(path));
+ if(first.status!==503||first.data?.error!=='budget_effect_outcome_uncertain'||!eligible)return first;
+ // A single explicit operator retry, not automatic CLI behaviour. Its real
+ // status and both physical requests remain visible; original funding is held.
+ const retry=await apiOnce(path,method,body,auth,wireBody);
+ const recovery={path,key:body.key,first_status:first.status,retry_status:retry.status};
+ recoveryAttempts.push(recovery);return{...retry,recovery};
+}
 async function roleApi(role,path,method='GET',body){role_ledger[role]++;if(role==='root_writer')assert(writerToken&&writerToken!==token,'root/writer must use independently issued client credential');return api(path,method,body,role==='root_writer'?writerToken:token);}
 async function raw(path,init={}){const key='issuer '+(init.method||'GET')+' '+path.split('?')[0];request_ledger[key]=(request_ledger[key]||0)+1;return fetch(base+path,init);}
 function expect(r,status,label){assert.equal(r.status,status,`${label}: ${r.status} ${JSON.stringify(r.data)}`);return r.data;}
@@ -91,7 +104,8 @@ async function lifecycle(task,index,beforeFinish,exitCode=0){
   const fault=process.env.HUB2_NORMAL_DAY_SLICE!=='twenty'&&index<19?(index<7?'reserve':index<13?'activate':index<16?'started':'finish'):null;
   if(fault==='reserve'||fault==='activate')expect(await fixture('project',project,'outbound-fault',{paths:['/_internal/'+fault]}),200,'actual selected-machine response loss');
   const path=`/api/intakes/${encodeURIComponent(task.id)}/start?project=${encodeURIComponent(project)}`,body={workspace:'/synthetic/normal-day',interactive:false,timeout_seconds:60,key:'start-user-'+index};
-  const started=expect(await api(path,'POST',body),fault==='reserve'||fault==='activate'?202:201,'automatic start').session;
+  const initial=await api(path,'POST',body);if(initial.recovery)assert([200,201,202].includes(initial.status),'explicit recovery requires a real launch response');
+ const started=expect(initial,initial.recovery?initial.status:fault==='reserve'||fault==='activate'?202:201,'automatic start').session;
   const selected=hosts.findIndex(h=>h.id===started.machine_id);assert(selected>=0,'actual policy must select an enrolled host');const host=hosts[selected],connection=connections[selected];
   const replay=expect(await api(path,'POST',body),200,'automatic lost-response replay while chosen host occupied');assert.equal(replay.session.id,started.id);assert.equal(replay.session.machine_id,host.id);
   if(fault==='reserve'||fault==='activate')expect(await fixture('project',project,'due-saga',{operation_id:started.operation_id}),200,'persisted dispatch backoff retry');
@@ -122,6 +136,7 @@ try{
  base=(await mf.ready).origin;
  // Snapshot activates all configured objects; cold schema/constructor work is retained.
  nativeTelemetry.setPhase('cold_first_creation');const cold=await snapshot();await telemetryBarrier();flows.push({name:'cold_first_creation',...nativeCounts(nativeTelemetry.phase('cold_first_creation')),observer_induced:true,snapshot_diagnostic:difference({},cold)});
+ if(!nativeTelemetry.valid())throw new Error('native_meter_not_installed_before_workload');
  await measure('actual_oidc_issuer_and_device_bearer',async()=>{
   const response=await raw('/auth/login',{redirect:'manual'});assert.equal(response.status,302);const location=new URL(response.headers.get('Location')),nonce=location.searchParams.get('nonce'),state=location.searchParams.get('state'),browserCookie=response.headers.getSetCookie()[0].split(';')[0];
   const key=await webcrypto.subtle.generateKey({name:'RSASSA-PKCS1-v1_5',modulusLength:2048,publicExponent:new Uint8Array([1,0,1]),hash:'SHA-256'},true,['sign','verify']),jwk={...await webcrypto.subtle.exportKey('jwk',key.publicKey),kid:'normal-key',alg:'RS256',use:'sig'};
@@ -185,7 +200,7 @@ try{
   const launch={workspace:'/synthetic/normal-day',interactive:false,timeout_seconds:60};
   const rootSchedule=expect(await api('/api/schedules?project='+encodeURIComponent(project),'POST',{key:'normal-root-half-hour',intake_id:intakes[0].id,kind:'root',interval_ms:1800000,timezone:'UTC',overlap:'skip',payload:{start:launch}}),201,'root schedule').schedule;
   const writer=expect(await api('/api/schedules?project='+encodeURIComponent(project),'POST',{key:'normal-writer-daily',intake_id:intakes[0].id,kind:'writer',interval_ms:86400000,timezone:'UTC',overlap:'skip',payload:{start:launch}}),201,'writer schedule').schedule;
-  const scheduleDayStart=Date.now()+virtualOffset+1000,writerDue=scheduleDayStart+47*1800000;
+  const scheduleDayStart=Date.now()+virtualOffset+1800000,writerDue=scheduleDayStart+47*1800000;
   expect(await fixture('project',project,'align-schedules',{root_id:rootSchedule.id,root_due:scheduleDayStart,writer_id:writer.id,writer_due:writerDue}),200,'align existing recurring deadlines to this measured UTC day');
   let occurrences=0,discoveryBatches=0;
   for(let tick=1;tick<=48;tick++){
@@ -277,6 +292,7 @@ try{
   report.passed=false;report.canonical_passed=false;
   report.runtime_assumptions={cpu_upper_ms:Number(process.env.HUB2_COST_HTTP_CPU_MS),settle_deadline_ms:Number(process.env.HUB2_COST_HTTP_CPU_MS)===100?200:500,post_settle_gb_ms:Number(process.env.HUB2_COST_HTTP_CPU_MS)===100?160:512,http_only:true,production_cpu_enforcement_verified:false,acceptance:'Conditional fixture comparison only; source adapter supplies CPU/HTTP eligibility assumptions. Production runtime canary and final exact-source gate required.'};
  }
+ report.explicit_operator_recovery_attempts=recoveryAttempts;report.actual_cli_automatic_retry=false;report.recovery_cost_semantics='One explicit same-key byte-identical retry for uncertain start/send; both attempts measured and original hold retained. Planned role calls exclude extra recovery attempts, never their real cost.';
  const reportPath=process.env.HUB2_NORMAL_DAY_REPORT||resolve(persist,'normal-day-report.json');
  await writeFile(reportPath,JSON.stringify(report,null,2)+'\n');
  console.error(JSON.stringify({gate:'normal-day-summary',report_path:reportPath,passed:report.passed,source_stable:stable,coverage,missing,errors,budget_status:budgetStatus}));

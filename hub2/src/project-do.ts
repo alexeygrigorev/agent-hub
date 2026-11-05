@@ -63,7 +63,7 @@ type IntakeEventRow = { seq: number; actor_id: string; kind: string; body_json: 
 
 /** Per-project intake, queue, idempotency and launch-saga owner. */
 export class ProjectDO {
-  private readonly db: MeteredDb;
+  protected readonly db: MeteredDb;
   private readonly sqlReceipts: SqlReceiptMeter;
   private readonly env: Hub2Env;
   private readonly work: ProjectWork;

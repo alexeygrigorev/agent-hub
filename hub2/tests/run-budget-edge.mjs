@@ -68,9 +68,20 @@ export default {async fetch(r,env){const u=new URL(r.url);
    return Response.json({connected:true});
   });
  }
+ if(u.pathname==='/_fixture/safety-prelude'){
+  const budget=env.BUDGET.get(env.BUDGET.idFromName('safety-prelude')),control=env.CONTROL.get(env.CONTROL.idFromName('safety-prelude'));
+  let preauth,reserve;
+  const fixtureEnv={...env,CONTROL:{idFromName:()=>null,get:()=>control},BUDGET:{idFromName:()=>null,get:()=>({fetch:async(...args)=>{const reserveCall=String(args[0]?.url||args[0]).endsWith('/_internal/reserve');const response=await budget.fetch(...args);if(reserveCall)reserve=JSON.parse(response.headers.get('x-hub2-sql-receipt'));return response;}})}};
+  const response=await budgetedPublicRequest(new Request('https://public/api/budget'),fixtureEnv,async(request,guarded)=>{
+   const proof=await guarded.CONTROL.get(null).fetch('https://probe/_verify',{method:'POST',body:JSON.stringify({token:'synthetic-fixture-token-0000000000000000'})});
+   preauth=JSON.parse(proof.headers.get('x-hub2-sql-receipt'));return(await proof.json()).actor;
+  },async()=>Response.json({done:true}));
+  const status=await budget.fetch('https://budget/api/budget',{headers:{'x-hub2-actor':JSON.stringify({id:'human:fixture',kind:'operator',scopes:['*']})}});
+  return Response.json({status:response.status,body:await response.json(),preauth,reserve,budget:await status.json()});
+ }
  if(u.pathname==='/_fixture/selected-kind'){
   const b=await r.json(),p=JSON.parse(env.HUB2_BUDGET_ENVELOPES),base={...p.normal};delete base.by_kind;
-  const kinds=['public_read','public_write','fleet_read','project_request','claim_request','message_request','account_request','provider_refresh'];
+  const kinds=['auth_request','public_read','public_write','fleet_read','project_request','claim_request','message_request','account_request','provider_refresh'];
   const by_kind=Object.fromEntries(kinds.map(k=>[k,{...base,max_do_calls:k===b.expected?2:1}]));
   p.normal={...base,max_do_calls:1,by_kind};const original=env.BUDGET,id='selected-kind-'+b.expected;
   const fixtureEnv={...env,HUB2_BUDGET_ENVELOPES:JSON.stringify(p),BUDGET:{idFromName:()=>original.idFromName(id),get:()=>original.get(original.idFromName(id))}};
@@ -172,7 +183,11 @@ try{
  assert.deepEqual((await call('/_fixture/stats')).data,beforeInvalid,'invalid per-kind envelope refuses before auth fanout');
  const placement=await call('/_fixture/placement-kind','POST',{});assert.equal(placement.status,200,JSON.stringify(placement.data));assert.equal(placement.data.placed,true,'session creation uses its higher fan-out envelope');
  const connected=await call('/_fixture/connection-kind','POST',{});assert.equal(connected.status,200,JSON.stringify(connected.data));assert.equal(connected.data.connected,true,'connection establishment uses its bounded handshake envelope');
- const routeKinds=[['public_read','GET','/health'],['public_write','POST','/api/repos'],['fleet_read','GET','/api/fleet'],['project_request','GET','/api/intakes/t?project=p'],['claim_request','POST','/api/claims?project=p'],['message_request','POST','/api/messages'],['account_request','GET','/api/accounts/a/api/account/credentials'],['provider_refresh','GET','/api/accounts/a/api/account/quota']];
+ const safetyPrelude=await call('/_fixture/safety-prelude');assert.equal(safetyPrelude.data.status,200,JSON.stringify(safetyPrelude.data));
+ assert(safetyPrelude.data.preauth.writes>0,'cold safety auth must execute real SQLite');
+ assert.equal(Number(safetyPrelude.data.budget.units.sqlite_rows_read),safetyPrelude.data.preauth.reads+safetyPrelude.data.reserve.reads+64,'cold preauth+reserve+settle reads charged exactly once');
+ assert.equal(Number(safetyPrelude.data.budget.units.sqlite_rows_written),safetyPrelude.data.preauth.writes+safetyPrelude.data.reserve.writes+8,'cold preauth+reserve+settle writes charged exactly once');
+ const routeKinds=[['auth_request','GET','/device'],['auth_request','GET','/auth/login'],['auth_request','GET','/auth/callback'],['auth_request','POST','/api/device/code'],['public_read','GET','/health'],['public_write','POST','/api/repos'],['fleet_read','GET','/api/fleet'],['project_request','GET','/api/intakes/t?project=p'],['claim_request','POST','/api/claims?project=p'],['message_request','POST','/api/messages'],['account_request','GET','/api/accounts/a/api/account/credentials'],['provider_refresh','GET','/api/accounts/a/api/account/quota']];
  for(const[expected,method,path]of routeKinds){const selected=await call('/_fixture/selected-kind','POST',{expected,method,path});assert.equal(selected.status,200,`${expected} must select its own request envelope: ${JSON.stringify(selected.data)}`);assert.equal(selected.data.selected,expected);}
  for(const mode of['worker','cron','nested']){
   const origin=await call('/_fixture/origin-cost?mode='+mode);assert.equal(origin.status,200);assert.equal(origin.data.status,200);
@@ -230,6 +245,6 @@ try{
  assert.equal((await call('/api/repos','POST',{})).status,200,'breaker recovery survives restart');
  assert.equal((await call('/_fixture/unknown-health','POST',{})).status,503);
  assert.equal((await call('/api/budget/override','POST',proposal)).status,503,'unknown metrics cannot be cleared');
- const proof={passed:true,gate:'actual public Worker / BudgetDO / idempotent receiver restart',tests:36,namespace_request_refund_verified:true,settlement_timeout_retains_funding:true,source_origin_billing_dimensions_verified:true,concurrent_native_receipts_isolated:true,invalid_sql_attribution_retains_full_funding:true,domain_status_preserved_under_full_hold:true,per_kind_envelope_selected:true,route_kinds:routeKinds.map(([kind])=>kind),placement_uses_bounded_high_fanout_envelope:true,connection_uses_bounded_handshake_envelope:true,invalid_per_kind_envelope_refused:true,public_overrun_recovery_atomic:true,unknown_recovery_refused:true,scheduled_empty_invocation_priced:true,public_ceiling_persisted:true,safety_stop_available:true,unknown_metrics_fail_closed:true,alert_physical_ids:after.map(v=>v.id),delivery_attempts:after.map(v=>v.attempts),provider_billing_verified:false,production_data_mutated:false,note:'Synthetic financial bounds/auth/receiver; actual Worker, BudgetDO and restart. Not production sizing or live external delivery proof.'};
+ const proof={passed:true,gate:'actual public Worker / BudgetDO / idempotent receiver restart',tests:37,namespace_request_refund_verified:true,settlement_timeout_retains_funding:true,source_origin_billing_dimensions_verified:true,concurrent_native_receipts_isolated:true,invalid_sql_attribution_retains_full_funding:true,domain_status_preserved_under_full_hold:true,per_kind_envelope_selected:true,route_kinds:routeKinds.map(([kind])=>kind),placement_uses_bounded_high_fanout_envelope:true,connection_uses_bounded_handshake_envelope:true,invalid_per_kind_envelope_refused:true,public_overrun_recovery_atomic:true,unknown_recovery_refused:true,scheduled_empty_invocation_priced:true,public_ceiling_persisted:true,safety_stop_available:true,unknown_metrics_fail_closed:true,alert_physical_ids:after.map(v=>v.id),delivery_attempts:after.map(v=>v.attempts),provider_billing_verified:false,production_data_mutated:false,note:'Synthetic financial bounds/auth/receiver; actual Worker, BudgetDO and restart. Not production sizing or live external delivery proof.'};
  await writeFile(resolve(root,'.local/tmp/hub2-public-budget-workerd.json'),JSON.stringify(proof,null,2));console.log(JSON.stringify(proof));
 }finally{await mf.dispose();await rm(persist,{recursive:true,force:true});}

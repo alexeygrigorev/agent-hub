@@ -130,6 +130,26 @@ jobs:
         continue-on-error: true
         run: npm run test:normal-day-auth --prefix hub2
 
+      - name: Auth cleanup metering and restart tests
+        id: auth_gc
+        continue-on-error: true
+        run: npm run test:auth-gc --prefix hub2
+
+      - name: Maintenance transfer Workerd tests
+        id: maintenance_transfer
+        continue-on-error: true
+        run: npm run test:maintenance-transfer --prefix hub2
+
+      - name: Install pinned backup-transform test dependency
+        id: backup_transform_dependency
+        continue-on-error: true
+        run: python -m pip install ijson==3.4.0.post0
+
+      - name: Offline backup transform tests
+        id: backup_transform
+        continue-on-error: true
+        run: python test/hub2-backup-transform.test.py
+
       - name: Machine WebSocket singleton Workerd tests
         id: machine_socket_cap
         continue-on-error: true
@@ -178,6 +198,10 @@ jobs:
           BUDGET_EDGE: ${{ steps.budget_edge.outcome }}
           ACCOUNTS_WORKERD: ${{ steps.accounts_workerd.outcome }}
           AUTH_WORKERD: ${{ steps.auth_workerd.outcome }}
+          AUTH_GC: ${{ steps.auth_gc.outcome }}
+          MAINTENANCE_TRANSFER: ${{ steps.maintenance_transfer.outcome }}
+          BACKUP_TRANSFORM_DEPENDENCY: ${{ steps.backup_transform_dependency.outcome }}
+          BACKUP_TRANSFORM: ${{ steps.backup_transform.outcome }}
           MACHINE_SOCKET_CAP: ${{ steps.machine_socket_cap.outcome }}
           NORMAL_DAY: ${{ steps.normal_day.outcome }}
           CORE_WORKERD: ${{ steps.core_workerd.outcome }}
@@ -195,7 +219,10 @@ jobs:
             "routing:$ROUTING" "billing_policy:$BILLING_POLICY" \
             "budget_controller:$BUDGET_CONTROLLER" "budget_edge:$BUDGET_EDGE" \
             "accounts_workerd:$ACCOUNTS_WORKERD" \
-            "auth_workerd:$AUTH_WORKERD" "machine_socket_cap:$MACHINE_SOCKET_CAP" \
+            "auth_workerd:$AUTH_WORKERD" "auth_gc:$AUTH_GC" \
+            "maintenance_transfer:$MAINTENANCE_TRANSFER" \
+            "backup_transform_dependency:$BACKUP_TRANSFORM_DEPENDENCY" \
+            "backup_transform:$BACKUP_TRANSFORM" "machine_socket_cap:$MACHINE_SOCKET_CAP" \
             "normal_day:$NORMAL_DAY" \
             "core_workerd:$CORE_WORKERD" "public_mail:$PUBLIC_MAIL" "bundle:$BUNDLE"; do
             name=${result%%:*}
