@@ -2,7 +2,7 @@ import { MeteredDb, initializeSchema } from './db';
 import { SqlReceiptMeter, SQL_PROBE_HEADER, wrapSqlNamespaces } from './sql-receipt';
 import { sha256Hex } from './crypto';
 import { actorFrom, bodyObject, error, hasScope, HttpError, json } from './http';
-import { admitLaunch, type AdmissionOutcome } from './resource-manager';
+import { admitLaunch, advanceDispatch, holdWireCode, releaseAccountCapacity, type AdmissionOutcome } from './resource-manager';
 import type { RoutingDecision } from './routing';
 import { nativeReturncode } from './native-exit';
 import { budgetedBackgroundRequest, type BudgetKind } from './budget-edge';
@@ -377,11 +377,10 @@ export class ProjectDO {
       }
       const decision = await selected.json() as AdmissionOutcome;
       if (!decision.ok) {
-        // Typed Resource Manager hold: quota refresh, reset expiry, host snapshot
-        // staleness and saturation each carry their own bounded retry time.
-        this.deferSagaUntil(operationId, decision.hold.retry_at ?? Date.now() + 30_000, 'rm_hold:' + decision.code);
-        const saga = this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id = ?', operationId);
-        return saga ? json({ session: this.sagaView(saga) }, 202) : error('dispatch_state_unavailable', 503);
+        // Typed Resource Manager hold before any saga exists: refuse with the
+        // wire-compatible code; the next start attempt re-runs selection after
+        // the bounded refresh/backoff carried by the hold kind.
+        return error(holdWireCode(decision.code), 409);
       }
       route = decision.plan;
     }
@@ -464,74 +463,36 @@ export class ProjectDO {
     for (let step = 0; step < 3; step++) {
       const saga = this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?', operationId);
       if (!saga || !['pending_machine', 'staged', 'account_confirmed'].includes(saga.state)) return;
-      const machine = env.MACHINES.get(env.MACHINES.idFromName(saga.machine_id));
       try {
-        if (saga.state === 'pending_machine') {
-          const response = await machine.fetch('https://machine.hub2.internal/_internal/reserve', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              operation_id: saga.attempt_operation_id, dispatch_id: saga.operation_id, attempt: saga.attempt,
-              ...(saga.attempt > 0 ? { retry_epoch: saga.epoch } : {}),
-              session_id: saga.session_id, project_id: intake.project,
-              intake_id: intake.id, machine_id: saga.machine_id, request_digest: saga.request_digest,
-              title: intake.title, acceptance_criteria: this.parse(intake.acceptance_criteria_json),
-              account_id: saga.account_id, launch: this.parse(saga.launch_spec_json),
-            }),
-          });
-          const payload = await response.json() as { epoch?: number; state?: string; reason?: string; error?: string };
-          if ((response.status !== 201 && response.status !== 200) || !Number.isSafeInteger(payload.epoch) || payload.state !== 'staged') {
-            await this.deferSaga(saga, payload.reason || payload.error || 'machine_unavailable');
-            return;
-          }
-          const now = Date.now();
+        // The Resource Manager orchestrates capacity against the authoritative
+        // MachineDO/AccountDO APIs; this saga only journals the returned step.
+        const outcome = await advanceDispatch(env, {
+          state: saga.state as 'pending_machine' | 'staged' | 'account_confirmed',
+          operation_id: saga.operation_id, attempt_operation_id: saga.attempt_operation_id,
+          dispatch_id: saga.operation_id, attempt: saga.attempt,
+          session_id: saga.session_id, machine_id: saga.machine_id,
+          account_id: saga.account_id, epoch: saga.epoch,
+          request_digest: saga.request_digest, project_id: intake.project, intake_id: intake.id,
+          title: intake.title, acceptance_criteria: this.parse(intake.acceptance_criteria_json),
+          launch: this.parse(saga.launch_spec_json),
+        });
+        if (!outcome.ok) { await this.deferSaga(saga, outcome.reason); return; }
+        const now = Date.now();
+        if (outcome.state === 'staged') {
           this.transaction(() => {
             this.db.run("UPDATE dispatch_sagas SET state='staged', epoch=?, retry_count=0, next_action_at=?, last_reason=NULL, updated_at=? WHERE operation_id=? AND state='pending_machine'",
-              payload.epoch, now + 30_000, now, operationId);
-            this.appendEvent(intake.id, `start:${operationId}:staged`, 'hub2-dispatch', 'machine_slot_staged', { session_id: saga.session_id, machine_id: saga.machine_id, epoch: payload.epoch }, now);
+              outcome.epoch, now + 30_000, now, operationId);
+            this.appendEvent(intake.id, `start:${operationId}:staged`, 'hub2-dispatch', 'machine_slot_staged', { session_id: saga.session_id, machine_id: saga.machine_id, epoch: outcome.epoch }, now);
           });
           continue;
         }
-
-        if (saga.state === 'staged') {
-          if (saga.account_id) {
-            const account = env.ACCOUNTS.get(env.ACCOUNTS.idFromName(saga.account_id));
-            const headers = { 'Content-Type': 'application/json', 'x-hub2-actor': JSON.stringify({
-              id: `hub2-dispatch:${saga.account_id}`, kind: 'operator', resource_id: saga.account_id,
-              generation: 'dispatch', scopes: ['operator:admin', 'account:reserve'],
-            }) };
-            const reserved = await account.fetch('https://account.hub2.internal/api/account/reserve', {
-              method: 'POST', headers,
-              body: JSON.stringify({ operation_id: saga.attempt_operation_id, session_id: saga.session_id, machine_id: saga.machine_id, epoch: saga.epoch,
-                request_digest: saga.request_digest, ttl_ms: 600_000 }),
-            });
-            if (!reserved.ok) { await this.deferSaga(saga, 'account_reservation_refused'); return; }
-            const confirmed = await account.fetch('https://account.hub2.internal/api/account/confirm', {
-              method: 'POST', headers, body: JSON.stringify({ operation_id: saga.attempt_operation_id, epoch: saga.epoch }),
-            });
-            if (!confirmed.ok) { await this.deferSaga(saga, 'account_confirmation_refused'); return; }
-            const result = await confirmed.json() as { reservation?: { state?: string; epoch?: number } };
-            if (result.reservation?.state !== 'confirmed' || result.reservation.epoch !== saga.epoch) {
-              await this.deferSaga(saga, 'account_confirmation_unverified'); return;
-            }
-          }
-          const now = Date.now();
+        if (outcome.state === 'account_confirmed') {
           this.transaction(() => {
             this.db.run("UPDATE dispatch_sagas SET state='account_confirmed', retry_count=0, next_action_at=?, last_reason=NULL, updated_at=? WHERE operation_id=? AND state='staged'",
               now + 30_000, now, operationId);
           });
           continue;
         }
-
-        const response = await machine.fetch('https://machine.hub2.internal/_internal/activate', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ operation_id: saga.attempt_operation_id, session_id: saga.session_id, epoch: saga.epoch }),
-        });
-        const result = await response.json() as { state?: string; error?: string };
-        if (!response.ok || !['offered', 'claimed', 'running'].includes(String(result.state))) {
-          await this.deferSaga(saga, result.error || 'machine_activation_uncertain');
-          return;
-        }
-        const now = Date.now();
         this.transaction(() => {
           this.db.run("UPDATE dispatch_sagas SET state='offered', retry_count=0, next_action_at=NULL, last_reason=NULL, updated_at=? WHERE operation_id=? AND state='account_confirmed'", now, operationId);
           this.appendEvent(intake.id, `start:${operationId}:offered`, 'hub2-dispatch', 'session_offered', { session_id: saga.session_id, machine_id: saga.machine_id, epoch: saga.epoch }, now);
@@ -773,28 +734,14 @@ export class ProjectDO {
 
   private async releaseAccount(saga: SagaRow, proof: { native_exit_confirmed?: true; unclaimed_proof?: JsonRecord }): Promise<boolean> {
     if (!saga.account_id) return true;
-    try {
-      const result = await budgetedBackgroundRequest(this.env, 'capacity_reconcile', async guardedEnv => {
-        const account = guardedEnv.ACCOUNTS.get(guardedEnv.ACCOUNTS.idFromName(saga.account_id!));
-        return account.fetch('https://account.hub2.internal/_internal/release', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ operation_id: saga.attempt_operation_id, session_id: saga.session_id,
-            machine_id: saga.machine_id, epoch: saga.epoch, ...proof }),
-        });
-      });
-      if (!result.ok) {
-        await this.pauseForBudget(result);
-        return false;
-      }
-      const payload = await result.json() as { reservation?: {
-        operation_id?: string; session_id?: string; machine_id?: string; epoch?: number; state?: string;
-      } };
-      const reservation = payload.reservation;
-      return reservation?.operation_id === saga.attempt_operation_id && reservation.session_id === saga.session_id
-        && reservation.machine_id === saga.machine_id && reservation.epoch === saga.epoch && reservation.state === 'released';
-    } catch {
-      return false;
-    }
+    // The Resource Manager coordinates the release against the authoritative
+    // AccountDO API with the same qualified-proof enforcement as before.
+    const outcome = await releaseAccountCapacity(this.env, {
+      account_id: saga.account_id, attempt_operation_id: saga.attempt_operation_id,
+      session_id: saga.session_id, machine_id: saga.machine_id, epoch: saga.epoch,
+    }, proof);
+    if (outcome.budgetRefusal) await this.pauseForBudget(outcome.budgetRefusal);
+    return outcome.released;
   }
 
 

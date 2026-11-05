@@ -11,28 +11,7 @@ from pathlib import Path
 
 from .client import ApiError, private_file, save_config
 from . import native_launch
-from .native_launch import NativeLauncher, native_returncode
-
-
-def canonical(value):
-    return json.dumps(value, sort_keys=True, separators=(",", ":"))
-
-
-def same_workspace(left, right):
-    """Compare workspace identity across equivalent OS path spellings.
-
-    Windows can report a temporary directory through both its long path and
-    its DOS 8.3 alias. Both names must refer to the same existing directory;
-    textual normalization alone is not sufficient for the native identity
-    fence.
-    """
-    if not isinstance(left, str) or not isinstance(right, str):
-        return False
-    try:
-        left_path, right_path = Path(left), Path(right)
-        return left_path.is_absolute() and right_path.is_absolute() and left_path.samefile(right_path)
-    except (OSError, RuntimeError, ValueError):
-        return False
+from .native_launch import NativeLauncher, canonical, native_returncode, same_workspace
 
 
 class Journal:
@@ -227,7 +206,7 @@ class Bridge:
             launch['worker_context']['machine_id']=self.machine_id
             if launch['engine']!='shell':
                 from .providers import provision
-                launch['provider_home'],launch['controller_config']=provision(self.client,offer,launch,self.journal.directory,self.launcher.config.get('routes'))
+                launch['provider_home']=provision(self.client,offer,launch,self.journal.directory,self.launcher.config.get('routes'))
             if acknowledge:
                 acknowledge(session, epoch)
             admission = self.client.request("POST", f"/api/sessions/{session}/admission",

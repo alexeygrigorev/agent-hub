@@ -1,4 +1,5 @@
 import { HttpError } from './http';
+import { budgetedBackgroundRequest } from './budget-edge';
 import type { Hub2Env } from './types';
 
 /**
@@ -20,10 +21,13 @@ import type { Hub2Env } from './types';
 
 export type AdmissionRequest={operation_id:string;machine_id?:string;engine?:string;model?:string;effort?:string;override_reason?:string;interactive:boolean;with_goal?:boolean;required_capabilities?:string[]};
 type RoutingCandidate={id:string;engine:string;model:string;effort?:string;account_id:string;weight:number;capabilities:string[];enabled:boolean};
-type MachineView={machine_id:string;available:boolean;capacity:number;occupied:number;engines:string[];capabilities:string[];resources?:{fresh:boolean;observed_at:number}};
+/** MachineDO /_internal/routing wire contract: resources is the bounded
+ * heartbeat snapshot {mem_available_mb,observed_at} exactly as persisted, or
+ * absent on hosts that have not reported one yet. */
+type MachineView={machine_id:string;available:boolean;capacity:number;occupied:number;engines:string[];capabilities:string[];resources?:{mem_available_mb:number;observed_at:number}};
 type AccountView={account:{enabled:number|boolean;capacity:number;occupied:number;min_remaining:number}|null;quota:{remaining:number;valid_until:number;captured_at?:number;reset_at?:number;source:string}|null;fresh:boolean;hosts:string[]};
 export type AdmissionPlan={machine_id:string;engine:string;model:string;effort?:string;account_id:string;policy_id:string;policy_version:unknown;override_reason:string|null;weight:number;quota_remaining:number;required_capabilities:string[]};
-export type HoldKind='quota_unknown'|'quota_stale'|'quota_exhausted'|'account_saturated'|'machine_unavailable'|'host_resources_stale'|'capability_unavailable'|'model_policy_unavailable'|'routing_policy_unavailable';
+export type HoldKind='quota_unknown'|'quota_stale'|'quota_exhausted'|'account_saturated'|'machine_unavailable'|'host_resources_unknown'|'host_resources_stale'|'capability_unavailable'|'model_policy_unavailable'|'routing_policy_unavailable';
 export type AdmissionOutcome={ok:true;plan:AdmissionPlan}|{ok:false;code:HoldKind;hold:{retry_at:number|null}};
 type PolicyDocument={version:unknown;candidates:RoutingCandidate[]};
 const internalActor=JSON.stringify({id:'hub2-resource-manager',kind:'operator',scopes:['operator:admin','routing:read']});
@@ -31,6 +35,19 @@ const internalActor=JSON.stringify({id:'hub2-resource-manager',kind:'operator',s
 const REFRESH_BACKOFF_MS=60_000;
 /** Host resource snapshot older than this is unverified for admission. */
 const HOST_RESOURCE_TTL_MS=120_000;
+
+/**
+ * Host snapshot classification. Fail closed: a missing snapshot is unknown
+ * (hosts must heartbeat resources before admission passes), a stale snapshot
+ * is unverified, and a non-positive reading is unusable. Only a fresh,
+ * positive snapshot admits.
+ */
+function hostHold(resources:MachineView['resources'],now:number):{code:HoldKind;retry_at:number|null}|null{
+  if(!resources)return{code:'host_resources_unknown',retry_at:now+REFRESH_BACKOFF_MS};
+  if(!Number.isFinite(resources.mem_available_mb)||resources.mem_available_mb<=0)return{code:'host_resources_unknown',retry_at:now+REFRESH_BACKOFF_MS};
+  if(now-resources.observed_at>HOST_RESOURCE_TTL_MS)return{code:'host_resources_stale',retry_at:now+REFRESH_BACKOFF_MS};
+  return null;
+}
 
 async function read(namespace:DurableObjectNamespace,id:string,path:string){
   const response=await namespace.get(namespace.idFromName(id)).fetch('https://routing.internal'+path,{headers:{'x-hub2-actor':internalActor}});
@@ -78,7 +95,7 @@ export async function admitLaunch(env:Hub2Env,input:AdmissionRequest):Promise<Ad
   const accounts=new Map<string,AccountView|null>(await Promise.all(accountIds.map(async id=>{try{return [id,await read(env.ACCOUNTS,id,'/_internal/routing') as AccountView] as const;}catch{return [id,null] as const;}})));
   const options:AdmissionPlan[]=[];
   let worst:{code:HoldKind;retry_at:number|null}|null=null;
-  const rank=(code:HoldKind)=>['quota_unknown','quota_stale','quota_exhausted','account_saturated','host_resources_stale','capability_unavailable','machine_unavailable'].indexOf(code);
+  const rank=(code:HoldKind)=>['quota_unknown','quota_stale','quota_exhausted','account_saturated','host_resources_unknown','host_resources_stale','capability_unavailable','machine_unavailable'].indexOf(code);
   const merge=(code:HoldKind,retry_at:number|null):{code:HoldKind;retry_at:number|null}=>!worst||rank(code)<rank(worst.code)?{code,retry_at}:worst;
   for(const c of candidates){
     const a=accounts.get(c.account_id);
@@ -88,7 +105,8 @@ export async function admitLaunch(env:Hub2Env,input:AdmissionRequest):Promise<Ad
     if(!Number.isFinite(c.weight)||c.weight<=0)throw new HttpError('routing_policy_invalid',503);
     for(const m of machines){
       if(!a.hosts.includes(m.machine_id)){worst=merge('machine_unavailable',null);continue;}
-      if(m.resources&&(!m.resources.fresh||now-m.resources.observed_at>HOST_RESOURCE_TTL_MS)){worst=merge('host_resources_stale',now+REFRESH_BACKOFF_MS);continue;}
+      const resources=hostHold(m.resources,now);
+      if(resources){worst=merge(resources.code,resources.retry_at);continue;}
       if(!m.engines.includes(c.engine)||required.some(v=>!m.capabilities.includes(v)&&!m.capabilities.includes(v+':'+c.engine))||(c.effort&&!m.capabilities.includes('effort')&&!m.capabilities.includes('effort:'+c.engine))||required.filter(v=>!['headless','interactive'].includes(v)).some(v=>!c.capabilities.includes(v))){
         worst=merge('capability_unavailable',null);continue;}
       const weight=c.weight*((a.quota!.remaining-a.account.min_remaining)/100)*((a.account.capacity-a.account.occupied)/a.account.capacity)*((m.capacity-m.occupied)/m.capacity);
@@ -105,4 +123,116 @@ export async function admitLaunch(env:Hub2Env,input:AdmissionRequest):Promise<Ad
   let draw=new DataView(digest).getUint32(0)/4294967296*options.reduce((sum,v)=>sum+v.weight,0);
   for(const option of options){draw-=option.weight;if(draw<0)return{ok:true,plan:option};}
   return{ok:true,plan:options[options.length-1]};
+}
+
+/**
+ * Reservation orchestration. The ResourceManager coordinates machine slot and
+ * provider account capacity by calling the existing authoritative
+ * MachineDO/AccountDO APIs with the same idempotent, epoch-fenced payloads as
+ * before — it adds no durable state, DO, or authority of its own. ProjectDO
+ * stays the durable saga intent and compensation journal: it journals the
+ * returned step, schedules retries, and compensates partial holds through
+ * releaseAccountCapacity. Uncertain native occupancy is never released here;
+ * release requires the same qualified proof the account owner enforced before.
+ */
+
+export type DispatchIntent={
+  state:'pending_machine'|'staged'|'account_confirmed';
+  operation_id:string;attempt_operation_id:string;dispatch_id:string;attempt:number;
+  session_id:string;machine_id:string;account_id:string|null;epoch:number|null;
+  request_digest:string;project_id:string;intake_id:string;
+  title:string;acceptance_criteria:unknown;launch:unknown;
+};
+export type AdvanceOutcome=
+  |{ok:true;state:'staged';epoch:number}
+  |{ok:true;state:'account_confirmed'|'offered'}
+  |{ok:false;reason:string};
+
+/** Wire-compatible refusal code for API paths that predate typed holds. */
+export function holdWireCode(code:HoldKind):string{
+  if(code==='quota_unknown'||code==='quota_stale'||code==='quota_exhausted'||code==='account_saturated')return'quota_unavailable';
+  if(code==='host_resources_unknown'||code==='host_resources_stale')return'machine_unavailable';
+  return code;
+}
+
+const machineDispatchActor={'Content-Type':'application/json'} as const;
+
+/** Advance one saga step through the authoritative capacity owners. */
+export async function advanceDispatch(env:Hub2Env,saga:DispatchIntent):Promise<AdvanceOutcome>{
+  const machine=env.MACHINES.get(env.MACHINES.idFromName(saga.machine_id));
+  if(saga.state==='pending_machine'){
+    const response=await machine.fetch('https://machine.hub2.internal/_internal/reserve',{
+      method:'POST',headers:machineDispatchActor,
+      body:JSON.stringify({
+        operation_id:saga.attempt_operation_id,dispatch_id:saga.dispatch_id,attempt:saga.attempt,
+        ...(saga.attempt>0?{retry_epoch:saga.epoch}:{}),
+        session_id:saga.session_id,project_id:saga.project_id,
+        intake_id:saga.intake_id,machine_id:saga.machine_id,request_digest:saga.request_digest,
+        title:saga.title,acceptance_criteria:saga.acceptance_criteria,
+        account_id:saga.account_id,launch:saga.launch,
+      }),
+    });
+    const payload=await response.json() as {epoch?:number;state?:string;reason?:string;error?:string};
+    const epoch=payload.epoch;
+    if((response.status!==201&&response.status!==200)||typeof epoch!=='number'||!Number.isSafeInteger(epoch)||payload.state!=='staged')
+      return{ok:false,reason:payload.reason||payload.error||'machine_unavailable'};
+    return{ok:true,state:'staged',epoch};
+  }
+  if(saga.state==='staged'){
+    if(saga.account_id){
+      const account=env.ACCOUNTS.get(env.ACCOUNTS.idFromName(saga.account_id));
+      const headers={'Content-Type':'application/json','x-hub2-actor':JSON.stringify({
+        id:`hub2-dispatch:${saga.account_id}`,kind:'operator',resource_id:saga.account_id,
+        generation:'dispatch',scopes:['operator:admin','account:reserve'],
+      })};
+      const reserved=await account.fetch('https://account.hub2.internal/api/account/reserve',{
+        method:'POST',headers,
+        body:JSON.stringify({operation_id:saga.attempt_operation_id,session_id:saga.session_id,machine_id:saga.machine_id,epoch:saga.epoch,
+          request_digest:saga.request_digest,ttl_ms:600_000}),
+      });
+      if(!reserved.ok)return{ok:false,reason:'account_reservation_refused'};
+      const confirmed=await account.fetch('https://account.hub2.internal/api/account/confirm',{
+        method:'POST',headers,body:JSON.stringify({operation_id:saga.attempt_operation_id,epoch:saga.epoch}),
+      });
+      if(!confirmed.ok)return{ok:false,reason:'account_confirmation_refused'};
+      const result=await confirmed.json() as {reservation?:{state?:string;epoch?:number}};
+      if(result.reservation?.state!=='confirmed'||result.reservation.epoch!==saga.epoch)
+        return{ok:false,reason:'account_confirmation_unverified'};
+    }
+    return{ok:true,state:'account_confirmed'};
+  }
+  const response=await machine.fetch('https://machine.hub2.internal/_internal/activate',{
+    method:'POST',headers:machineDispatchActor,
+    body:JSON.stringify({operation_id:saga.attempt_operation_id,session_id:saga.session_id,epoch:saga.epoch}),
+  });
+  const result=await response.json() as {state?:string;error?:string};
+  if(!response.ok||!['offered','claimed','running'].includes(String(result.state)))
+    return{ok:false,reason:result.error||'machine_activation_uncertain'};
+  return{ok:true,state:'offered'};
+}
+
+export type CapacityTarget={account_id:string;attempt_operation_id:string;session_id:string;machine_id:string;epoch:number|null};
+export type CapacityRelease={released:boolean;budgetRefusal?:Response};
+
+/** Release the account reservation only against the owner's qualified proof. */
+export async function releaseAccountCapacity(env:Hub2Env,target:CapacityTarget,proof:{native_exit_confirmed?:true;unclaimed_proof?:unknown}):Promise<CapacityRelease>{
+  try{
+    const result=await budgetedBackgroundRequest(env,'capacity_reconcile',async guardedEnv=>{
+      const account=guardedEnv.ACCOUNTS.get(guardedEnv.ACCOUNTS.idFromName(target.account_id));
+      return account.fetch('https://account.hub2.internal/_internal/release',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({operation_id:target.attempt_operation_id,session_id:target.session_id,
+          machine_id:target.machine_id,epoch:target.epoch,...proof}),
+      });
+    });
+    if(!result.ok)return{released:false,budgetRefusal:result};
+    const payload=await result.json() as {reservation?:{
+      operation_id?:string;session_id?:string;machine_id?:string;epoch?:number;state?:string;
+    }};
+    const reservation=payload.reservation;
+    return{released:reservation?.operation_id===target.attempt_operation_id&&reservation.session_id===target.session_id
+      &&reservation.machine_id===target.machine_id&&reservation.epoch===target.epoch&&reservation.state==='released'};
+  }catch{
+    return{released:false};
+  }
 }

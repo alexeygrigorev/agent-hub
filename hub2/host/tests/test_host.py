@@ -82,7 +82,7 @@ class HostTests(unittest.TestCase):
             launch['account_id']='synthetic-account'
             # Lifecycle fixtures isolate Bridge semantics from the provider gate:
             # no provider home means the adapter skips the final admission recheck.
-            return None,str(self.root/'synthetic-controller.json')
+            return None
         provisioning=patch('agent_hub_host.providers.provision',side_effect=provision_fixture)
         provisioning.start()
         self.addCleanup(provisioning.stop)

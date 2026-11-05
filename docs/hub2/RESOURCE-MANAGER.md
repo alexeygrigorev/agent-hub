@@ -72,10 +72,16 @@ Boundaries that must not merge:
   fenced) is the only quota source. Unknown or stale quota becomes a typed
   hold with a bounded refresh trigger, never fake zero and never a local
   `quse` probe. Automatic reset redemption stays prohibited.
-- **Task Manager owns intent; owners own capacity.** The ProjectDO dispatch
-  saga remains the single durable launch-intent owner with compensation.
-  Account/Machine reserve/release stays idempotent and epoch-fenced inside
-  its owner; there is no fake cross-DO atomic transaction.
+- **Task Manager owns intent; the Resource Manager coordinates; owners own
+  capacity.** The ProjectDO dispatch saga remains the single durable
+  launch-intent owner with compensation: it journals each step, schedules
+  retries, and compensates partial holds. The RM facade
+  (`advanceDispatch`/`releaseAccountCapacity`) orchestrates machine slot
+  reserve/activate and account reserve/confirm/release by calling the
+  existing authoritative MachineDO/AccountDO APIs with the same idempotent,
+  epoch-fenced payloads as before — no new DO, no durable state outside the
+  owners, no fake cross-DO atomic transaction, and no release of uncertain
+  native occupancy (the qualified-proof gate stays in the account owner).
 - **Cost Controller is a separate monetary guard.** BudgetDO/edge consults
   happen before expensive fanout (dispatch already wraps RM selection in
   `budgetedBackgroundRequest`). Provider quota percent and infra USD are
@@ -129,7 +135,9 @@ Host config gains a `native_launch` block next to the legacy `launcher` one:
 - Central-home launches require `client`, `session_id`, `operation_id` and
   `epoch` on the launch specification so the final gate re-verifies the exact
   admitted generation against `/api/sessions/:id/admission` with
-  `provider_check: true` immediately before spawn.
+  `provider_check: true` immediately before spawn. The old per-session
+  controller config file is gone with the external launcher path: no
+  parent-token file is written next to workspaces anymore.
 - The child runs with the materialized private home environment and a scoped
   child Hub context (`HUB2_CONFIG`), never with the host's operator token;
   no tokens enter argv, env of the host process, or logs.
@@ -151,10 +159,14 @@ Host config gains a `native_launch` block next to the legacy `launcher` one:
   discovery, never as a hot global poll.
 - Host CPU/memory/slots/engines/capabilities: the host heartbeat advertises
   engines and capabilities (existing) plus a bounded resource snapshot
-  (memory available, CPU load, active slots, observed_at). MachineDO
-  persists it with the machine's capability row and exposes `resources` in
-  its `/_internal/routing` view; a missing snapshot stays backward
-  compatible, a stale one produces the `host_resources_stale` hold.
+  `{mem_available_mb, observed_at}`. MachineDO persists it in
+  `machine_capabilities.resources_json` and exposes `resources` verbatim in
+  its `/_internal/routing` view — that wire shape is the admission contract.
+  Classification fails closed: a missing or non-positive snapshot is a
+  `host_resources_unknown` hold, a snapshot older than 120 s is
+  `host_resources_stale`; only a fresh positive snapshot admits. Cutover
+  note: hosts must run a heartbeat that includes the snapshot before
+  admission passes (rollout timing belongs to the coordinator).
 
 ## Acceptance coverage
 

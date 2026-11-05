@@ -42,19 +42,17 @@ class ProvisionTests(unittest.TestCase):
                 launch = {'engine': 'codex', 'model': 'glm-5.3-flash', 'timeout_seconds': 3600,
                           'worker_context': {'machine_id': 'host-1'}}
                 offer = {'account_id': 'zai-central', 'session_id': 'session-1', 'operation_id': 'operation-1', 'epoch': 2}
-                manifest, controller = provision(Client(), offer, launch, root, {'codex': {'provider': 'zai'}})
+                manifest = provision(Client(), offer, launch, root, {'codex': {'provider': 'zai'}})
                 # In-process materialization receives the bundle in memory only:
                 # it must never reach an HTTP request body or a child process argv.
                 for method, path, body in calls:
                     self_test.assertNotIn(ZAI_BUNDLE, json.dumps(body))
             self.assertEqual(calls[-1], ('POST', '/api/accounts/zai-central/api/account/credentials', {'generation': 7}))
             self.assertEqual(json.loads(Path(manifest).read_text())['generation'], 7)
-            saved = json.loads(Path(controller).read_text())
-            self.assertEqual(saved['token'], 'synthetic-parent-token')
-            self.assertEqual(saved['binding'], {**offer, 'machine_id': 'host-1'})
-            self.assertNotIn('synthetic-parent-token', json.dumps(manifest))
-            if os.name != 'nt':
-                self.assertEqual(Path(controller).stat().st_mode & 0o777, 0o600)
+            # The controller config is gone with the external launcher path: the
+            # parent token must never be written into a workspace-adjacent file.
+            self.assertEqual(list((root / 'controllers').glob('*')) if (root / 'controllers').exists() else [], [])
+            self.assertNotIn('synthetic-parent-token', json.dumps(json.loads(Path(manifest).read_text())))
 
     def test_materialization_isolated_between_attempts_and_replay_stable(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -73,7 +71,7 @@ class ProvisionTests(unittest.TestCase):
                       'worker_context': {'machine_id': 'host-1'}}
             first = {'account_id': 'zai-central', 'session_id': 'session-1', 'operation_id': 'operation-1', 'epoch': 1}
             routes = {'codex': {'provider': 'zai'}}
-            manifest1, _ = provision(Client(), first, dict(launch), root, routes)
+            manifest1 = provision(Client(), first, dict(launch), root, routes)
             home1 = Path(manifest1).parent / 'home'
             harness = (home1 / '.zcodex' / 'config.toml').read_text()
             self.assertIn('wire_api="zcode"', harness)
@@ -82,13 +80,13 @@ class ProvisionTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'provider_materialization_refused'):
                 provision(Client(), first, dict(launch), root, routes)
             second = {**first, 'session_id': 'session-2', 'operation_id': 'operation-2'}
-            manifest2, _ = provision(Client(), second, dict(launch), root, routes)
-            replay, _ = provision(Client(), second, dict(launch), root, routes)
+            manifest2 = provision(Client(), second, dict(launch), root, routes)
+            replay = provision(Client(), second, dict(launch), root, routes)
             self.assertNotEqual(Path(manifest1).parent, Path(manifest2).parent)
             self.assertEqual(manifest2, replay)
             self.assertEqual((Path(manifest2).parent / 'home' / '.zcodex' / 'config.toml').read_text(), harness)
             higher = {**second, 'epoch': 2}
-            manifest3, _ = provision(Client(), higher, dict(launch), root, routes)
+            manifest3 = provision(Client(), higher, dict(launch), root, routes)
             self.assertNotEqual(Path(manifest2).parent, Path(manifest3).parent)
 
     def test_wrong_provider_refuses_before_bundles_or_ack(self):

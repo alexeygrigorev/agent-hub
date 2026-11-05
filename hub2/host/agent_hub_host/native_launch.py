@@ -97,6 +97,10 @@ def canonical(value):
 
 
 def same_workspace(left, right):
+    """Compare workspace identity across equivalent OS path spellings: Windows
+    can report a temporary directory through its long path and its DOS 8.3
+    alias, and both must resolve to the same existing directory for the
+    native identity fence."""
     if not isinstance(left, str) or not isinstance(right, str):
         return False
     try:
@@ -422,14 +426,8 @@ class NativeLauncher:
         if not isinstance(route, dict) or route.get("provider") not in PROVIDER_CAPABILITIES:
             raise RuntimeError("native_launch_route_missing")
         provider = route["provider"]
-        supported = self.capabilities().get(specification["engine"], set())
-        required = {'interactive' if specification.get("interactive") else 'headless'}
-        if specification.get("with_goal"):
-            required.add('goal')
-        if specification.get("effort") is not None:
-            required.add('effort')
-        if not required.issubset(supported):
-            raise RuntimeError("native_launch_capability_unavailable")
+        # Mode/effort/goal capability gating already happened in the Bridge's
+        # validate_launch against the same capability table.
         workspace = Path(specification["workspace"])
         requested_mb = int(self.config.get("memory_mb", 1500))
         ready, reason = physical_resources_ready(int(self.config.get("min_free_mem_mb", 6000)), requested_mb)

@@ -1,13 +1,10 @@
 """Provision approved central generations before native admission."""
 import hashlib
 import json
-import os
 import re
 from pathlib import Path
 
 from . import provider_home
-from .client import save_config
-
 
 def provision(client, offer, launch, directory, routes, runner=None):
     account = offer.get('account_id')
@@ -35,8 +32,4 @@ def provision(client, offer, launch, directory, routes, runner=None):
     acknowledged = client.request('POST', prefix + '/credentials', {'generation': bundle['generation']})
     if acknowledged.get('acknowledged') is not True:
         raise RuntimeError('provider_generation_ack_unverified')
-    binding = {key: offer[key] for key in ('session_id', 'operation_id', 'epoch', 'account_id')}
-    binding['machine_id'] = launch['worker_context']['machine_id']
-    controller = Path(directory).resolve() / 'controllers' / (offer['session_id'] + '-' + str(offer['epoch']) + '.json')
-    save_config(controller, {'server': client.base_url, 'token': client.token, 'binding': binding})
-    return manifest, str(controller)
+    return manifest
