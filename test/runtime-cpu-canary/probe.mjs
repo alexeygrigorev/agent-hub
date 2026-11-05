@@ -4,7 +4,8 @@ function burn(iterations=1000000000){let value=17;for(let i=0;i<iterations;i++)v
 export class CPUProbe {
  constructor(ctx,env){this.ctx=ctx;this.env=env;}
  async ticket(kind){const key='burn:'+kind;return this.ctx.storage.transaction(async tx=>{if(await tx.get(key))return false;await tx.put(key,1);return true;});}
- async fetch(request){
+ async fetch(request){try{return await this.handle(request);}catch(error){return Response.json({probe_error:String(error?.message||error).slice(0,240)},{status:503});}}
+ async handle(request){
   const path=new URL(request.url).pathname;
   if(path==='/smoke')return Response.json({ok:true,checksum:small(),source:this.env.SOURCE_SHA});
   if(path==='/status'){const keys=['burn:worker','burn:do','burn:ws','alarm:started','alarm:completed','alarm:recovered','ws:completed'];return Response.json(Object.fromEntries(await this.ctx.storage.get(keys)));}
@@ -34,7 +35,9 @@ export default {async fetch(request,env){
  const path=new URL(request.url).pathname,stub=env.PROBE.get(env.PROBE.idFromName('single-synthetic-probe'));
  if(path==='/smoke')return Response.json({ok:true,checksum:small(),source:env.SOURCE_SHA});
  if(path==='/worker-burn'){
-  const ticket=await(await stub.fetch('https://probe/ticket')).json();
+  const response=await stub.fetch('https://probe/ticket');
+  if(!response.ok)return response;
+  const ticket=await response.json();
   if(!ticket.allowed)return new Response('already used',{status:409});
   return Response.json({completed:true,checksum:burn()});
  }
