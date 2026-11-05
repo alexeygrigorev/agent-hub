@@ -249,9 +249,10 @@ class Bridge:
                 native = self.lookup(receipt["session_id"], {"tag": tag, "workspace": launch["workspace"]})
                 if not native or native["id"] != receipt["session_id"]:
                     raise RuntimeError("launch_outcome_uncertain")
-            except (RuntimeError,ValueError,subprocess.SubprocessError,OSError):
+            except (RuntimeError,ValueError,subprocess.SubprocessError,OSError) as error:
                 self.abort_launch(operation)
-                raise RuntimeError('native_launch_unverified') from None
+                # Keep the stable refusal slug; chain the typed cause for diagnostics.
+                raise RuntimeError('native_launch_unverified') from error
             with db:
                 db.execute("UPDATE launches SET native_id=?,state='running' WHERE operation_id=?",
                            (native["id"], operation))
