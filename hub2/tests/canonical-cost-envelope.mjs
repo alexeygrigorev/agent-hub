@@ -20,7 +20,10 @@ export function canonicalSizingEnvelopes(metrics=CANONICAL_COST_METRICS){
   // determines the durable daily charge.
   resource_heartbeat:plan(2,250,250,320,72,128),
   project_request:plan(4,250,250,256),claim_request:plan(3,250,250,192),
-  message_request:plan(4,750,250,1536),account_request:plan(2,250,250,128),
+  // CI Workerd observed the 750ms message bound expiring on the normal
+  // first-send path. At 1.5s, four 0.25GiB namespace calls plus the
+  // 512GB-ms controller allowance total 2,012GB-ms; round up to 2,048.
+  message_request:plan(4,1500,250,2048),account_request:plan(2,250,250,128),
   placement_request:normal,connection_request:normal,provider_refresh:normal,
   auth_request:auth,
  }},safety:{...normal,by_kind:{operator_stop:normal,native_exit:plan(16,750,500,2048,112,160),capacity_reconcile:plan(16,750,500,2048,96,160),auth_revoke:auth,alert_delivery:normal,budget_recovery:plan(16,750,500,2048,80,128)}}});
