@@ -4,7 +4,9 @@ import {build} from 'esbuild';
 import {Miniflare,Log,LogLevel,convertV4MiniflareOptions} from 'miniflare';
 import {mkdtemp,mkdir,writeFile,rm} from 'node:fs/promises';
 import {resolve} from 'node:path';
+import {canonicalSizingEnvelopes} from './canonical-cost-envelope.mjs';
 const root=resolve(import.meta.dirname,'../..'),hub=resolve(root,'hub2');
+const splitTestEnvelope=canonicalSizingEnvelopes();
 const names=['worker_requests','worker_cpu_ms','do_requests','do_ws_messages','do_gb_ms','background_invocations','sqlite_rows_read','sqlite_rows_written','sqlite_byte_days','kv_reads','kv_writes','kv_deletes','kv_lists','kv_byte_days'];
 const units=Object.fromEntries(names.map(k=>[k,0]));
 Object.assign(units,{worker_requests:1,worker_cpu_ms:100,do_requests:12,do_gb_ms:1000,sqlite_rows_read:1000,sqlite_rows_written:40000,sqlite_byte_days:1});
@@ -46,6 +48,17 @@ export default {async fetch(r,env){const u=new URL(r.url);
  if(u.pathname==='/_fixture/dispatch')return Response.json(await dispatchBudgetAlerts(env));
  if(u.pathname==='/_fixture/scheduled'){await worker.scheduled({},env);return Response.json({invoked:true});}
  if(u.pathname==='/_fixture/unknown')return worker.fetch(new Request('https://public/api/repos',r),{...env,HUB2_BUDGET_ENVELOPES:'{}'});
+ if(u.pathname==='/_fixture/split-envelope'){
+  const raw=env.HUB2_SPLIT_TEST_ENVELOPE,mid=Math.floor(raw.length/2),original=env.BUDGET;
+  const encoder=new TextEncoder();if(encoder.encode(raw.slice(0,mid)).length>5000||encoder.encode(raw.slice(mid)).length>5000)throw Error('budget envelope chunks exceed 5KB');
+  const make=(tail)=>({...env,HUB2_RELEASE_MODE:'maintenance',HUB2_BUDGET_ENVELOPES:raw.slice(0,mid),...(tail?{HUB2_BUDGET_ENVELOPES_PART2:raw.slice(mid)}:{}),BUDGET:{idFromName:()=>original.idFromName('split-envelope'),get:()=>original.get(original.idFromName('split-envelope'))}});
+  let handled=false;
+  const valid=await budgetedPublicRequest(new Request('https://public/api/repos'),make(true),async()=>undefined,async()=>{handled=true;return Response.json({ok:true});});
+  let missingHandled=false;
+  const missing=await budgetedPublicRequest(new Request('https://public/api/repos'),make(false),async()=>undefined,async()=>{missingHandled=true;return Response.json({ok:true});});
+  const validSingle=env.HUB2_BUDGET_ENVELOPES,withoutTail=await budgetedPublicRequest(new Request('https://public/api/repos'),{...env,HUB2_RELEASE_MODE:'maintenance',HUB2_BUDGET_ENVELOPES:validSingle},async()=>undefined,async()=>Response.json({ok:true})),withoutHead=await budgetedPublicRequest(new Request('https://public/api/repos'),{...env,HUB2_RELEASE_MODE:'maintenance',HUB2_BUDGET_ENVELOPES:undefined,HUB2_BUDGET_ENVELOPES_PART2:validSingle},async()=>undefined,async()=>Response.json({ok:true}));
+  return Response.json({valid:valid.status,handled,missing:missing.status,missing_error:await missing.json().then(v=>v.error),missing_handled:missingHandled,valid_single_without_tail:withoutTail.status,valid_single_without_head:withoutHead.status});
+ }
  if(u.pathname==='/_fixture/invalid-kind-plan'){
   const p=JSON.parse(env.HUB2_BUDGET_ENVELOPES),base={...p.normal};p.normal.by_kind={not_a_budget_kind:base};
   return worker.fetch(new Request('https://public/api/repos',r),{...env,HUB2_BUDGET_ENVELOPES:JSON.stringify(p)});
@@ -179,7 +192,7 @@ export default {fetch(r,env){return env.SINK.get(env.SINK.idFromName('global')).
 const bundles=await Promise.all([entry,sink].map(contents=>build({stdin:{contents,resolveDir:hub,loader:'ts'},bundle:true,write:false,format:'esm',platform:'browser',external:['cloudflare:workers','node:async_hooks']})));
 await mkdir(resolve(root,'.local/tmp'),{recursive:true});const persist=await mkdtemp(resolve(root,'.local/tmp/hub2-public-budget-'));
 const options=convertV4MiniflareOptions({resourcePersistencePath:persist,host:'127.0.0.1',port:0,log:new Log(LogLevel.ERROR),workers:[
-{name:'public-budget-fixture',script:bundles[0].outputFiles[0].text,modules:true,compatibilityDate:'2024-04-05',compatibilityFlags:['nodejs_als'],outboundService:'alert-sink',durableObjects:{BUDGET:{className:'BudgetDO',useSQLite:true},CONTROL:{className:'Probe',useSQLite:true},PROJECTS:{className:'Probe',useSQLite:true},MACHINES:{className:'Probe',useSQLite:true},ACCOUNTS:{className:'Probe',useSQLite:true},MAILBOXES:{className:'Probe',useSQLite:true}},bindings:{HUB2_BUDGET_ENVELOPES:JSON.stringify(plan),HUB_ALERT_WEBHOOK:'https://fixture-alert.test/deliver',HUB_ALERT_WEBHOOK_TOKEN:'synthetic-alert-secret'}},
+{name:'public-budget-fixture',script:bundles[0].outputFiles[0].text,modules:true,compatibilityDate:'2024-04-05',compatibilityFlags:['nodejs_als'],outboundService:'alert-sink',durableObjects:{BUDGET:{className:'BudgetDO',useSQLite:true},CONTROL:{className:'Probe',useSQLite:true},PROJECTS:{className:'Probe',useSQLite:true},MACHINES:{className:'Probe',useSQLite:true},ACCOUNTS:{className:'Probe',useSQLite:true},MAILBOXES:{className:'Probe',useSQLite:true}},bindings:{HUB2_BUDGET_ENVELOPES:JSON.stringify(plan),HUB2_SPLIT_TEST_ENVELOPE:splitTestEnvelope,HUB_ALERT_WEBHOOK:'https://fixture-alert.test/deliver',HUB_ALERT_WEBHOOK_TOKEN:'synthetic-alert-secret'}},
 {name:'alert-sink',script:bundles[1].outputFiles[0].text,modules:true,compatibilityDate:'2024-04-05',compatibilityFlags:['nodejs_als'],durableObjects:{SINK:{className:'Sink',useSQLite:true}}}]});
 let mf=new Miniflare(options),base='';
 const call=async(path,method='GET',body)=>{const r=await fetch(base+path,{method,headers:{'Content-Type':'application/json',Authorization:'Bearer synthetic-fixture-token-0000000000000000'},...(body===undefined?{}:{body:JSON.stringify(body)})});let data;try{data=await r.json();}catch{data={};}return {status:r.status,data,headers:r.headers};};
@@ -199,6 +212,7 @@ try{
  const blocked=await call('/_fixture/deny-before-fanout');assert.equal(blocked.status,200);assert.equal(blocked.data.status,429);assert.equal(blocked.data.body.error,'budget_paused');assert(Number(blocked.data.retry_after)>0);
  assert.deepEqual(blocked.data.after,blocked.data.before,'ceiling denies before authentication fanout');
  const unknown=await call('/_fixture/unknown','POST',{});assert.equal(unknown.status,503);assert.equal(unknown.data.error,'budget_metrics_unknown');
+ const split=await call('/_fixture/split-envelope','POST',{});assert.equal(split.status,200);assert.equal(split.data.valid,200);assert.equal(split.data.handled,true);assert.equal(split.data.missing,503);assert.equal(split.data.missing_error,'budget_metrics_unknown');assert.equal(split.data.missing_handled,false,'missing envelope chunk refuses before effect');assert.equal(split.data.valid_single_without_tail,503,'production mode requires the second binding even with a complete plan in the first');assert.equal(split.data.valid_single_without_head,503,'production mode requires the first binding even with a complete plan in the second');
  const beforeInvalid=(await call('/_fixture/stats')).data;
  const invalidKind=await call('/_fixture/invalid-kind-plan','POST',{});assert.equal(invalidKind.status,503);assert.equal(invalidKind.data.error,'budget_metrics_unknown','unknown per-kind envelope fails closed');
  assert.deepEqual((await call('/_fixture/stats')).data,beforeInvalid,'invalid per-kind envelope refuses before auth fanout');
