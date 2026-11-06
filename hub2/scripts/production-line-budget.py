@@ -42,8 +42,7 @@ def text_files(path: Path) -> set[Path]:
 
 def production_files() -> set[Path]:
     files = text_files(HUB2 / "src") | text_files(HUB2 / "host" / "agent_hub_host") | text_files(HUB2 / "public")
-    # Production Wrangler entry that preserves the legacy Durable Object class
-    # export while routing requests to Hub2 during namespace migration.
+    # Production Wrangler entry keeps first activation in maintenance mode.
     production_worker = HUB2 / "production-worker.ts"
     if production_worker.is_file():
         files.add(production_worker)
@@ -64,15 +63,6 @@ def production_files() -> set[Path]:
     for path in (
         HUB2 / "scripts" / "cloudflare-billing-policy.py",
         ROOT / ".github" / "workflows" / "hub2-billing-audit.yml",
-    ):
-        if path.is_file():
-            files.add(path)
-    # These are real maintenance/export/import procedures used to preserve and
-    # reconcile Hub1 data, not test or verification tooling.
-    for path in (
-        ROOT / "scripts" / "hub2-backup-transform.py",
-        ROOT / "scripts" / "hub2-maintenance-export.mjs",
-        ROOT / "scripts" / "hub2-import-reconcile.mjs",
     ):
         if path.is_file():
             files.add(path)

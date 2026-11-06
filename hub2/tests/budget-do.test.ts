@@ -43,6 +43,19 @@ async function settle(budget: BudgetDO, id: string, values: Units) {
   return budget.fetch(request('/_internal/settle', 'POST', { id, actual_units: values, coverage: coverage() }));
 }
 async function status(budget: BudgetDO) { return body(await budget.fetch(request('/api/budget', 'GET', undefined, admin))); }
+async function setTestCeiling(budget: BudgetDO, day: string, ceiling_pusd: string) {
+  return budget.fetch(request('/api/budget/override', 'POST', {
+    day, ceiling_pusd, reason: 'Synthetic lower ceiling for cutoff behavior test',
+  }, admin));
+}
+
+test('fresh budget state uses the approved daily ceiling, alert, and recovery reserve', async () => {
+  const s = state(), budget = new BudgetDO(s.ctx);
+  const report = await status(budget);
+  assert.equal(report.daily_ceiling_usd, '0.250000000000');
+  assert.equal(report.alert_threshold_usd, '0.030000000000');
+  assert.equal(report.recovery_reserve_usd, '0.010000000000');
+});
 
 test('paid rates use marginal units and include every configured cost dimension', () => {
   const estimate = costForUnits(units({
@@ -123,6 +136,7 @@ test('UTC rollover isolates daily ceilings without deleting the previous ledger'
 test('daily ceiling denies before fanout, returns one retry boundary, and leaves recovery reserve', async () => {
   const s = state(), now = Date.parse('2026-11-04T12:00:00.000Z');
   const budget = new BudgetDO(s.ctx, {}, () => now);
+  assert.equal((await setTestCeiling(budget, '2026-11-04', '100000000000')).status, 200);
   const nearCeiling = units({ worker_requests: 300_000 });
   assert.equal((await body(await reserve(budget, 'bulk-1', nearCeiling))).allowed, true);
   const denied = await budget.fetch(request('/_internal/reserve', 'POST', { id: 'bulk-2', kind: 'fanout', estimated_units: units({ worker_requests: 1 }), coverage: coverage() }));
@@ -213,6 +227,7 @@ test('operator override is day-scoped and provider reconciliation remains explic
 
 test('denied unique request flood creates no per-request ledger rows or day rewrites',async()=>{
  const s=state(),budget=new BudgetDO(s.ctx,{},()=>Date.parse('2026-11-04T12:00:00Z'));
+ assert.equal((await setTestCeiling(budget,'2026-11-04','100000000000')).status,200);
  await reserve(budget,'fill-flood-fixture',units({worker_requests:300000}));
  const before=(s.database.prepare('SELECT COUNT(*) AS n FROM budget_reservations').get() as any).n;
  const beforeWrites=(s.database.prepare('SELECT total_changes() AS n').get() as any).n;

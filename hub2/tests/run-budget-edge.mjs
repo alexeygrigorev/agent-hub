@@ -81,7 +81,7 @@ export default {async fetch(r,env){const u=new URL(r.url);
  }
  if(u.pathname==='/_fixture/selected-kind'){
   const b=await r.json(),p=JSON.parse(env.HUB2_BUDGET_ENVELOPES),base={...p.normal};delete base.by_kind;
-  const kinds=['auth_request','public_read','public_write','fleet_read','project_request','claim_request','message_request','account_request','provider_refresh'];
+  const kinds=['auth_request','public_read','public_write','resource_heartbeat','fleet_read','project_request','claim_request','message_request','account_request','provider_refresh'];
   const by_kind=Object.fromEntries(kinds.map(k=>[k,{...base,max_do_calls:k===b.expected?2:1}]));
   p.normal={...base,max_do_calls:1,by_kind};const original=env.BUDGET,id='selected-kind-'+b.expected;
   const fixtureEnv={...env,HUB2_BUDGET_ENVELOPES:JSON.stringify(p),BUDGET:{idFromName:()=>original.idFromName(id),get:()=>original.get(original.idFromName(id))}};
@@ -169,6 +169,8 @@ let mf=new Miniflare(options),base='';
 const call=async(path,method='GET',body)=>{const r=await fetch(base+path,{method,headers:{'Content-Type':'application/json',Authorization:'Bearer synthetic-fixture-token-0000000000000000'},...(body===undefined?{}:{body:JSON.stringify(body)})});let data;try{data=await r.json();}catch{data={};}return {status:r.status,data,headers:r.headers};};
 try{
  base=(await mf.ready).origin;
+ const testCeiling=await call('/api/budget/override','POST',{day:new Date().toISOString().slice(0,10),ceiling_pusd:'100000000000',reason:'Synthetic lower ceiling for cutoff and recovery tests'});
+ assert.equal(testCeiling.status,200,JSON.stringify(testCeiling.data));
  const concurrent=await call('/_fixture/concurrent');
  assert.equal(concurrent.status,200);
  for(const {receipt,body}of concurrent.data.results){assert.equal(receipt.valid,true);assert.equal(receipt.reads,body.reads);assert.equal(receipt.writes,body.writes);}
@@ -187,7 +189,7 @@ try{
  assert(safetyPrelude.data.preauth.writes>0,'cold safety auth must execute real SQLite');
  assert.equal(Number(safetyPrelude.data.budget.units.sqlite_rows_read),safetyPrelude.data.preauth.reads+safetyPrelude.data.reserve.reads+64,'cold preauth+reserve+settle reads charged exactly once');
  assert.equal(Number(safetyPrelude.data.budget.units.sqlite_rows_written),safetyPrelude.data.preauth.writes+safetyPrelude.data.reserve.writes+8,'cold preauth+reserve+settle writes charged exactly once');
- const routeKinds=[['auth_request','GET','/device'],['auth_request','GET','/auth/login'],['auth_request','GET','/auth/callback'],['auth_request','POST','/api/device/code'],['public_read','GET','/health'],['public_write','POST','/api/repos'],['fleet_read','GET','/api/fleet'],['project_request','GET','/api/intakes/t?project=p'],['claim_request','POST','/api/claims?project=p'],['message_request','POST','/api/messages'],['account_request','GET','/api/accounts/a/api/account/credentials'],['provider_refresh','GET','/api/accounts/a/api/account/quota']];
+ const routeKinds=[['auth_request','GET','/device'],['auth_request','GET','/auth/login'],['auth_request','GET','/auth/callback'],['auth_request','POST','/api/device/code'],['public_read','GET','/health'],['public_write','POST','/api/repos'],['resource_heartbeat','POST','/api/heartbeat'],['fleet_read','GET','/api/fleet'],['project_request','GET','/api/intakes/t?project=p'],['claim_request','POST','/api/claims?project=p'],['message_request','POST','/api/messages'],['account_request','GET','/api/accounts/a/api/account/credentials'],['provider_refresh','GET','/api/accounts/a/api/account/quota']];
  for(const[expected,method,path]of routeKinds){const selected=await call('/_fixture/selected-kind','POST',{expected,method,path});assert.equal(selected.status,200,`${expected} must select its own request envelope: ${JSON.stringify(selected.data)}`);assert.equal(selected.data.selected,expected);}
  for(const mode of['worker','cron','nested']){
   const origin=await call('/_fixture/origin-cost?mode='+mode);assert.equal(origin.status,200);assert.equal(origin.data.status,200);

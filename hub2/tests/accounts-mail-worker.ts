@@ -15,7 +15,7 @@ export class BudgetDO extends ActualBudgetDO {
 }
 // Persistence stress only: the dedicated normal-day budget gate uses the
 // conservative production candidate. This disposable history fixture needs 100
-// sends to complete so it can measure indexed growth independently of the $0.10
+// sends to complete so it can measure indexed growth independently of the $0.25
 // daily affordability gate; its override/profile is never deployed or reused.
 const historyProfile=JSON.parse(fixtureBudgetEnvelopes);
 historyProfile.normal.by_kind={native_delivery:{provenance:'Synthetic retained-history Workerd fixture only; not production cost sizing',max_do_calls:4,max_wall_ms:2000,units:{worker_requests:1,worker_cpu_ms:100,do_requests:7,do_ws_messages:0,do_gb_ms:250,background_invocations:0,sqlite_rows_read:512,sqlite_rows_written:160,sqlite_byte_days:1,kv_reads:1,kv_writes:1,kv_deletes:1,kv_lists:1,kv_byte_days:1}}};

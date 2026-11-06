@@ -20,6 +20,7 @@ on:
       - ".github/workflows/hub2-billing-audit.yml"
       - "AGENTS.md"
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -100,10 +101,10 @@ jobs:
         continue-on-error: true
         run: npm run test:control-budget-alarm --prefix hub2
 
-      - name: Model and machine routing tests
-        id: routing
+      - name: Resource Manager admission and routing tests
+        id: resource_manager
         continue-on-error: true
-        run: npm run test:routing --prefix hub2
+        run: npm run test:resource-manager --prefix hub2
 
       - name: Cloudflare backstop policy safety tests
         id: billing_policy
@@ -135,21 +136,6 @@ jobs:
         continue-on-error: true
         run: npm run test:auth-gc --prefix hub2
 
-      - name: Maintenance transfer Workerd tests
-        id: maintenance_transfer
-        continue-on-error: true
-        run: npm run test:maintenance-transfer --prefix hub2
-
-      - name: Install pinned backup-transform test dependency
-        id: backup_transform_dependency
-        continue-on-error: true
-        run: python -m pip install ijson==3.4.0.post0
-
-      - name: Offline backup transform tests
-        id: backup_transform
-        continue-on-error: true
-        run: python test/hub2-backup-transform.test.py
-
       - name: Machine WebSocket singleton Workerd tests
         id: machine_socket_cap
         continue-on-error: true
@@ -177,6 +163,14 @@ jobs:
         continue-on-error: true
         run: npm run bundle:dry-run --prefix hub2
 
+      - name: Validate clean-start production manifest and bundle
+        id: production_clean_start
+        continue-on-error: true
+        run: |
+          node hub2/tests/production-clean-start.test.mjs
+          cd hub2
+          npx wrangler deploy --dry-run --config wrangler.production.jsonc --outdir .local/hub2-production-dist
+
       - name: Fail the job if any gate failed
         if: always()
         env:
@@ -192,21 +186,19 @@ jobs:
           DB_METERING: ${{ steps.db_metering.outcome }}
           CONTROL: ${{ steps.control.outcome }}
           CONTROL_BUDGET_ALARM: ${{ steps.control_budget_alarm.outcome }}
-          ROUTING: ${{ steps.routing.outcome }}
+          RESOURCE_MANAGER: ${{ steps.resource_manager.outcome }}
           BILLING_POLICY: ${{ steps.billing_policy.outcome }}
           BUDGET_CONTROLLER: ${{ steps.budget_controller.outcome }}
           BUDGET_EDGE: ${{ steps.budget_edge.outcome }}
           ACCOUNTS_WORKERD: ${{ steps.accounts_workerd.outcome }}
           AUTH_WORKERD: ${{ steps.auth_workerd.outcome }}
           AUTH_GC: ${{ steps.auth_gc.outcome }}
-          MAINTENANCE_TRANSFER: ${{ steps.maintenance_transfer.outcome }}
-          BACKUP_TRANSFORM_DEPENDENCY: ${{ steps.backup_transform_dependency.outcome }}
-          BACKUP_TRANSFORM: ${{ steps.backup_transform.outcome }}
           MACHINE_SOCKET_CAP: ${{ steps.machine_socket_cap.outcome }}
           NORMAL_DAY: ${{ steps.normal_day.outcome }}
           CORE_WORKERD: ${{ steps.core_workerd.outcome }}
           PUBLIC_MAIL: ${{ steps.public_mail.outcome }}
           BUNDLE: ${{ steps.bundle.outcome }}
+          PRODUCTION_CLEAN_START: ${{ steps.production_clean_start.outcome }}
         run: |
           failed=0
           for result in \
@@ -216,15 +208,14 @@ jobs:
             "project_work:$PROJECT_WORK" "project_intake:$PROJECT_INTAKE" \
             "read_cache:$READ_CACHE" "db_metering:$DB_METERING" \
             "control:$CONTROL" "control_budget_alarm:$CONTROL_BUDGET_ALARM" \
-            "routing:$ROUTING" "billing_policy:$BILLING_POLICY" \
+            "resource_manager:$RESOURCE_MANAGER" "billing_policy:$BILLING_POLICY" \
             "budget_controller:$BUDGET_CONTROLLER" "budget_edge:$BUDGET_EDGE" \
             "accounts_workerd:$ACCOUNTS_WORKERD" \
             "auth_workerd:$AUTH_WORKERD" "auth_gc:$AUTH_GC" \
-            "maintenance_transfer:$MAINTENANCE_TRANSFER" \
-            "backup_transform_dependency:$BACKUP_TRANSFORM_DEPENDENCY" \
-            "backup_transform:$BACKUP_TRANSFORM" "machine_socket_cap:$MACHINE_SOCKET_CAP" \
+            "machine_socket_cap:$MACHINE_SOCKET_CAP" \
             "normal_day:$NORMAL_DAY" \
-            "core_workerd:$CORE_WORKERD" "public_mail:$PUBLIC_MAIL" "bundle:$BUNDLE"; do
+            "core_workerd:$CORE_WORKERD" "public_mail:$PUBLIC_MAIL" "bundle:$BUNDLE" \
+            "production_clean_start:$PRODUCTION_CLEAN_START"; do
             name=${result%%:*}
             outcome=${result#*:}
             if [ "$outcome" != success ]; then

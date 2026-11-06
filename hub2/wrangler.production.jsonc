@@ -1,7 +1,7 @@
-// Maintenance is the default; activation and final gates belong to the release coordinator.
-// Keep all v1 bindings/migrations; never delete or remap an existing namespace.
-// Install private secrets separately: HUB1_EXPORT_TOKEN, HUB2_IMPORT_TOKEN, HUB2_CREDENTIAL_KEY,
-// HUB2_IMPORT_MANIFEST (audited source/run/Merkle commitment), HUB2_BUDGET_ENVELOPES, alert transport token.
+// Maintenance is the default. Bootstrap mode allows only auth, registry,
+// account/quota setup and host pairing/heartbeats; dispatch stays disabled.
+// The 15-minute cron is a no-op until explicit active mode.
+// Install HUB2_CREDENTIAL_KEY, HUB2_BUDGET_ENVELOPES and alert secrets separately.
 // 500ms is a configured policy, not a verified strict runtime upper bound.
 // Active mode may add ONLY the approved 15-minute budget-alert cron; maintenance has none.
 {
@@ -20,10 +20,6 @@
   },
   "durable_objects": {
     "bindings": [
-      {
-        "name": "HUB",
-        "class_name": "Hub"
-      },
       {
         "name": "CONTROL",
         "class_name": "ControlDO"
@@ -50,27 +46,17 @@
       }
     ]
   },
-  "migrations": [
-    {
-      "tag": "v1",
-      "new_sqlite_classes": [
-        "Hub"
-      ]
-    },
-    {
-      "tag": "hub2-v1",
-      "new_sqlite_classes": [
-        "ControlDO",
-        "ProjectDO",
-        "MachineDO",
-        "AccountDO",
-        "MailboxDO",
-        "BudgetDO"
-      ]
-    }
-  ],
+  "exports": {
+    "Hub": { "type": "durable-object", "state": "deleted" },
+    "ControlDO": { "type": "durable-object", "storage": "sqlite" },
+    "ProjectDO": { "type": "durable-object", "storage": "sqlite" },
+    "MachineDO": { "type": "durable-object", "storage": "sqlite" },
+    "AccountDO": { "type": "durable-object", "storage": "sqlite" },
+    "MailboxDO": { "type": "durable-object", "storage": "sqlite" },
+    "BudgetDO": { "type": "durable-object", "storage": "sqlite" }
+  },
   "triggers": {
-    "crons": []
+    "crons": ["*/15 * * * *"]
   },
   "limits": {
     "cpu_ms": 500,
@@ -78,7 +64,6 @@
   },
   "vars": {
     "HUB2_RELEASE_MODE": "maintenance",
-    "HUB1_EXPORT_GENERATION": "hub2-readonly-20261105-v1",
     "AUTH_CLIENT_ID": "1tplqm9l6q6545mrk0gjv6eaeh",
     "AUTH_ISSUER": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_H7nJu52Bs",
     "AUTH_BASE_URL": "https://auth.dtcdev.click",

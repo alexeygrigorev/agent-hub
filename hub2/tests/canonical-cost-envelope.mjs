@@ -14,6 +14,11 @@ export function canonicalSizingEnvelopes(metrics=CANONICAL_COST_METRICS){
  return JSON.stringify({version:1,normal:{...normal,by_kind:{
   public_request:plan(8,250,250,512),public_read:plan(3,250,200,192),
   public_write:plan(4,300,250,320),fleet_read:plan(6,250,250,384),
+  // The first heartbeat for a freshly enrolled machine includes the bounded
+  // cold-owner/control receipt path. Cover the observed 97 reads / 54 writes
+  // with explicit headroom; settled usage, not this temporary reservation,
+  // determines the durable daily charge.
+  resource_heartbeat:plan(2,250,250,320,72,128),
   project_request:plan(4,250,250,256),claim_request:plan(3,250,250,192),
   message_request:plan(4,750,250,1536),account_request:plan(2,250,250,128),
   placement_request:normal,connection_request:normal,provider_refresh:normal,

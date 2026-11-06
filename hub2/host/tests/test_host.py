@@ -10,7 +10,6 @@ from unittest.mock import patch
 
 from agent_hub_host.agent import Bridge, Journal
 from agent_hub_host.client import ApiError, Client, save_config
-from agent_hub_host.launcher import Launcher
 
 
 class FakeNative:
@@ -20,24 +19,23 @@ class FakeNative:
     def __call__(self, args, **options):
         self.calls.append((args, options))
         command = args[1:]
-        if "submit" in command:
-            self.mode=json.loads(args[args.index('--payload')+1])['mode']
-            return subprocess.CompletedProcess(args, 0, '{"task_id":"test"}', "")
-        if "reconcile" in command:
-            return subprocess.CompletedProcess(args, 0, '{"native_status":"retired-finished","resources_reserved":false,"state":"completed-awaiting-review"}', "")
-        if "run" in command:
-            self.process = {"id": "native-123456", "phase": "running", "tag": "task-hub2-session-1",
-                            "workspace": options["cwd"], "containment_empty": False}
-            return subprocess.CompletedProcess(args, 0, json.dumps({'receipt':{'session_id':'native-123456','first_action_verified':True,'model_verified':True,'model':'test-model','mode':self.mode,'interactive_verified':self.mode=='interactive'}}), "")
-        if "--config-dir" in command and "status" in command:
-            if self.process:
-                body = {"native_binding": {"native_id": "native-123456", "workspace": options["cwd"],
-                        "tag": "task-hub2-session-1", "details": {"first_action_validated_at": "2026-01-01T00:00:00Z"}}}
-            else:
-                body = {"native_binding": {}}
-            return subprocess.CompletedProcess(args, 0, json.dumps(body, indent=2), "")
-        if "start" in command:
-            self.process = {"id": "native-123456", "phase": "running"}
+        if "start" in command[:1]:
+            child = args[args.index("--") + 1:]
+            tag = args[args.index("--tag") + 1]
+            created = int(time.time() * 1000) - 1000
+            self.process = {"id": "1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d", "tag": tag,
+                            "workspace": options["cwd"], "engine": "codex", "created_at_ms": created,
+                            "command": child, "phase": "running"}
+            if "--deadline-ms" in args:
+                self.process["deadline_ms"] = int(args[args.index("--deadline-ms") + 1])
+            # The native worker proves its first action with a whoami artifact.
+            task = tag[len("task-"):]
+            artifact = Path(options["cwd"]) / ".local" / f"first-action-{task}.json"
+            artifact.parent.mkdir(parents=True, exist_ok=True)
+            artifact.write_text(json.dumps({"id": self.process["id"], "tag": tag,
+                "workspace": options["cwd"], "command": child, "phase": "working",
+                "schema_version": 2, "worker_pid": os.getpid() + 7,
+                "updated_at_ms": created + 500, "boot_id": "fixture"}))
             return subprocess.CompletedProcess(args, 0, json.dumps(self.process), "")
         if command[0] == "status":
             return subprocess.CompletedProcess(args, 0 if self.process else 1, json.dumps(self.process), "")
@@ -82,7 +80,9 @@ class HostTests(unittest.TestCase):
         # APIs. test_providers separately verifies the actual materializer ABI.
         def provision_fixture(client,offer,launch,*args):
             launch['account_id']='synthetic-account'
-            return str(self.root/'synthetic-provider.json'),str(self.root/'synthetic-controller.json')
+            # Lifecycle fixtures isolate Bridge semantics from the provider gate:
+            # no provider home means the adapter skips the final admission recheck.
+            return None
         provisioning=patch('agent_hub_host.providers.provision',side_effect=provision_fixture)
         provisioning.start()
         self.addCleanup(provisioning.stop)
@@ -99,12 +99,12 @@ class HostTests(unittest.TestCase):
                 self.bridge.offer(offer,lambda *args:acknowledgements.append(args))
         self.assertFalse(acknowledgements)
         self.assertFalse(any(path.endswith('/admission') for method,path,body,key in self.client.calls))
-        self.assertFalse(any('run' in argv for argv,options in self.native.calls))
+        self.assertFalse(any(argv[1]=='start' for argv,_ in self.native.calls))
         retried={**offer,'operation_id':offer['operation_id']+'-retry','epoch':offer['epoch']+1}
         self.bridge.offer(retried)
         row=self.journal.db.execute('SELECT * FROM launches').fetchone()
         self.assertEqual((row['operation_id'],row['epoch'],row['state']),(retried['operation_id'],retried['epoch'],'running'))
-        self.assertEqual(sum('run' in argv for argv,options in self.native.calls),1)
+        self.assertEqual(sum(argv[1]=='start' for argv,_ in self.native.calls),1)
 
     def failed_native(self,exit_code=None,wrong_tag=False):
         identity='11111111-1111-4111-8111-111111111111'
@@ -182,36 +182,6 @@ class HostTests(unittest.TestCase):
         self.assertFalse(any('kill' in argv for argv,options in self.native.calls))
         self.assertFalse(self.journal.db.execute('SELECT 1 FROM outbox').fetchone())
 
-    def test_installed_capability_hashes_fence_old_or_changed_launcher(self):
-        repository=self.root/'installed'
-        files={}
-        for name in ('launcher/launch.py','launcher/cli.py','launcher/interactive.py','launcher/provider_home.py'):
-            target=repository/name;target.parent.mkdir(parents=True,exist_ok=True);target.write_text('reviewed-source')
-            files[name]=hashlib.sha256(target.read_bytes()).hexdigest()
-        manifest=self.root/'capabilities.json'
-        native=self.root/'aplexer';native.write_bytes(b'\x7fELFsynthetic-native-fixture')
-        data={'version':3,'files':files,'native_sha256':hashlib.sha256(native.read_bytes()).hexdigest(),'providers':{'codex':['headless','interactive','goal','effort']}}
-        manifest.write_text(json.dumps(data))
-        selected=patch('agent_hub_host.launcher.shutil.which',return_value=str(native));selected.start();self.addCleanup(selected.stop)
-        launcher=Launcher({'repository':str(repository),'capabilities_manifest':str(manifest),'routes':{'codex':{'model_requirements':{'providers':['codex']}}}})
-        self.assertEqual(launcher.capabilities()['codex'],{'headless','interactive','goal','effort'})
-        renamed=self.root/'aplexer-windows-amd64.exe';renamed.write_bytes(native.read_bytes())
-        with patch('agent_hub_host.launcher.shutil.which',return_value=str(renamed)):
-            self.assertEqual(launcher.capabilities()['codex'],set())
-        native.write_bytes(b'\x7fELFchanged-native')
-        self.assertEqual(launcher.capabilities()['codex'],set())
-        native.write_bytes(b'\x7fELFsynthetic-native-fixture')
-        manifest.write_text(json.dumps({**data,'version':2}))
-        self.assertEqual(launcher.capabilities()['codex'],set())
-        manifest.write_text(json.dumps(data))
-        (repository/'launcher/launch.py').write_text('different installed version')
-        self.assertEqual(launcher.capabilities()['codex'],set())
-
-    def test_claimed_modes_need_positive_native_receipts(self):
-        for requirements in ({'interactive':True},{'effort':'max'},{'with_goal':True}):
-            with self.subTest(requirements=requirements),self.assertRaises(RuntimeError):
-                Launcher.verify_modes({},requirements)
-
     def test_scoped_context_is_private_before_spawn_without_metadata_token_leak(self):
         with patch.dict(os.environ,{'HUB2_TOKEN':'host-human-token','HUB2_SERVER':'https://host-secret.invalid'}):
             self.bridge.offer(self.offer())
@@ -222,7 +192,7 @@ class HostTests(unittest.TestCase):
         for args,options in self.native.calls:
             self.assertNotIn(value['token'],str(args))
             self.assertNotIn('host-human-token',str(options.get('env',{})))
-        native_start=next(options for args,options in self.native.calls if 'run' in args)
+        native_start=next(opt for arg,opt in self.native.calls if arg[1]=='start')
         self.assertNotIn('HUB2_TOKEN',native_start['env'])
         self.assertNotIn('HUB2_SERVER',native_start['env'])
         if os.name!='nt':self.assertEqual(context.stat().st_mode&0o777,0o600)
@@ -236,9 +206,9 @@ class HostTests(unittest.TestCase):
             return reply
         self.client.request=request
         with self.assertRaises(ApiError):self.bridge.offer(self.offer())
-        self.assertFalse(any('run' in args for args,_ in self.native.calls))
+        self.assertFalse(any(args[1]=='start' for args,_ in self.native.calls))
         self.bridge.offer(self.offer())
-        self.assertEqual(sum('run' in args for args,_ in self.native.calls),1)
+        self.assertEqual(sum(args[1]=='start' for args,_ in self.native.calls),1)
 
     def offer(self, **changes):
         offer = {"operation_id": "operation-1", "session_id": "session-1", "epoch": 1,
@@ -252,10 +222,10 @@ class HostTests(unittest.TestCase):
     def test_duplicate_offer_reconnect_launches_exactly_once(self):
         self.bridge.offer(self.offer())
         self.bridge.offer(self.offer())
-        starts = [call for call, _ in self.native.calls if "run" in call]
+        starts = [call for call, _ in self.native.calls if call[1]=='start']
         self.assertEqual(len(starts), 1)
-        self.assertIn("run", starts[0])
-        self.assertNotIn("Print hello", " ".join(starts[0]))
+        self.assertIn("start", starts[0])
+        self.assertEqual(" ".join(starts[0]).count("Print hello; $(do not interpret as shell)"), 1)
         self.assertFalse(any(call[1] == "send" for call, _ in self.native.calls))
         self.assertEqual(len(self.journal.db.execute("SELECT * FROM outbox").fetchall()), 1)
 
@@ -268,8 +238,8 @@ class HostTests(unittest.TestCase):
 
     def test_launcher_cwd_and_pwd_match_assigned_workspace(self):
         self.bridge.offer(self.offer())
-        launches = [(call, options) for call, options in self.native.calls if "run" in call or "submit" in call]
-        self.assertEqual(len(launches), 2)
+        launches = [(call, options) for call, options in self.native.calls if call[1] == "start"]
+        self.assertEqual(len(launches), 1)
         for _, options in launches:
             self.assertTrue(Path(options["cwd"]).samefile(self.root))
             self.assertTrue(Path(options["env"]["PWD"]).samefile(self.root))
@@ -295,7 +265,7 @@ class HostTests(unittest.TestCase):
         with self.journal.db:
             self.journal.db.execute("UPDATE launches SET native_id=NULL,state='launching'")
         self.bridge.offer(offer)
-        self.assertEqual(sum("run" in call for call, _ in self.native.calls), 1)
+        self.assertEqual(sum(call[1] == "start" for call, _ in self.native.calls), 1)
 
     def test_crash_before_native_launch_remains_uncertain_not_duplicated(self):
         self.bridge.offer(self.offer())
@@ -304,7 +274,7 @@ class HostTests(unittest.TestCase):
         self.native.process = None
         with self.assertRaises(RuntimeError):
             self.bridge.offer(self.offer())
-        self.assertEqual(sum("run" in call for call, _ in self.native.calls), 1)
+        self.assertEqual(sum(call[1] == "start" for call, _ in self.native.calls), 1)
 
     def test_missing_maintained_launcher_refuses_before_native_spawn(self):
         self.bridge.launcher.config = {}
@@ -317,7 +287,7 @@ class HostTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "server_admission"):
             self.bridge.offer(self.offer())
         self.assertIsNone(self.native.process)
-        self.assertFalse(any("run" in call for call, _ in self.native.calls))
+        self.assertFalse(any(call[1] == "start" for call, _ in self.native.calls))
 
     def test_claimed_reconnect_resumes_only_existing_durable_intent_with_fresh_admission(self):
         real_request = self.client.request
@@ -327,7 +297,7 @@ class HostTests(unittest.TestCase):
         self.assertIsNone(self.native.process)
         self.client.request = real_request
         self.bridge.offer(self.offer(claimed=True, expires_at=None))
-        self.assertEqual(sum("run" in call for call, _ in self.native.calls), 1)
+        self.assertEqual(sum(call[1] == "start" for call, _ in self.native.calls), 1)
         with self.assertRaisesRegex(ValueError, "local_intent"):
             self.bridge.offer(self.offer(operation_id="unknown-op", session_id="unknown-session", claimed=True, expires_at=None))
 
@@ -473,7 +443,7 @@ class HostTests(unittest.TestCase):
             value = Socket(len(connections))
             connections.append(value)
             return value
-        self.client.socket, self.client.heartbeat = socket, lambda labels, engines, capabilities: None
+        self.client.socket, self.client.heartbeat = socket, lambda labels, engines, capabilities, resources=None: None
         with patch("agent_hub_host.agent.time.sleep"), self.assertRaises(StopServe):
             self.bridge.serve("machine-1", [])
         self.assertEqual(len(connections), 3)

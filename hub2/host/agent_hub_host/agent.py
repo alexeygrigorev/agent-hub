@@ -10,28 +10,10 @@ import time
 from pathlib import Path
 
 from .client import ApiError, private_file, save_config
-from .launcher import Launcher, native_returncode
+from . import native_launch
+from .native_launch import NativeLauncher, canonical, native_returncode, same_workspace
 
-
-def canonical(value):
-    return json.dumps(value, sort_keys=True, separators=(",", ":"))
-
-
-def same_workspace(left, right):
-    """Compare workspace identity across equivalent OS path spellings.
-
-    Windows can report a temporary directory through both its long path and
-    its DOS 8.3 alias. Both names must refer to the same existing directory;
-    textual normalization alone is not sufficient for the native identity
-    fence.
-    """
-    if not isinstance(left, str) or not isinstance(right, str):
-        return False
-    try:
-        left_path, right_path = Path(left), Path(right)
-        return left_path.is_absolute() and right_path.is_absolute() and left_path.samefile(right_path)
-    except (OSError, RuntimeError, ValueError):
-        return False
+RESOURCE_HEARTBEAT_SECONDS = 240
 
 
 class Journal:
@@ -83,7 +65,10 @@ class Bridge:
         self.client, self.journal, self.runner = client, journal, runner
         self.roots = [Path(root).resolve(strict=True) for root in roots]
         self.engines = set(engines)
-        self.launcher = Launcher(launcher_config or {}, runner)
+        # Native launch path: the Hub Resource Manager owns admission; the host
+        # spawns admitted plans directly through aplexer. The external launcher
+        # runtime is no longer consulted for admission or spawn.
+        self.launcher = NativeLauncher(launcher_config or {}, runner, aplexer=executable, journal=journal)
         self.machine_id=machine_id
         self.budget_paused_until=0
         self.budget_safety_paused_until=0
@@ -223,7 +208,7 @@ class Bridge:
             launch['worker_context']['machine_id']=self.machine_id
             if launch['engine']!='shell':
                 from .providers import provision
-                launch['provider_home'],launch['controller_config']=provision(self.client,offer,launch,self.journal.directory,self.launcher,self.runner)
+                launch['provider_home']=provision(self.client,offer,launch,self.journal.directory,self.launcher.config.get('routes'))
             if acknowledge:
                 acknowledge(session, epoch)
             admission = self.client.request("POST", f"/api/sessions/{session}/admission",
@@ -232,6 +217,12 @@ class Bridge:
                 raise RuntimeError("server_admission_refused")
             launch['child_config_file']=self.child_context(offer,launch)
             launch['runtime_deadline']=round(json.loads(Path(launch['child_config_file']).read_text())['expires_at']*1000)
+            # The adapter's final gate re-verifies the admitted generation against
+            # this live admission view immediately before spawn.
+            launch['client']=self.client
+            launch['session_id']=session
+            launch['operation_id']=operation
+            launch['epoch']=epoch
             with db:
                 db.execute("UPDATE launches SET state='launching' WHERE operation_id=?", (operation,))
             try:
@@ -239,9 +230,10 @@ class Bridge:
                 native = self.lookup(receipt["session_id"], {"tag": tag, "workspace": launch["workspace"]})
                 if not native or native["id"] != receipt["session_id"]:
                     raise RuntimeError("launch_outcome_uncertain")
-            except (RuntimeError,ValueError,subprocess.SubprocessError,OSError):
+            except (RuntimeError,ValueError,subprocess.SubprocessError,OSError) as error:
                 self.abort_launch(operation)
-                raise RuntimeError('native_launch_unverified') from None
+                # Keep the stable refusal slug; chain the typed cause for diagnostics.
+                raise RuntimeError('native_launch_unverified') from error
             with db:
                 db.execute("UPDATE launches SET native_id=?,state='running' WHERE operation_id=?",
                            (native["id"], operation))
@@ -290,7 +282,7 @@ class Bridge:
             code = native_returncode(exit_info)
             if code is None:
                 continue
-            launcher_state=self.launcher.finalize('hub2-'+row['session_id'],row['workspace'])
+            launcher_state=self.launcher.finalize(row["native_id"], {"tag": row["tag"], "workspace": row["workspace"]})
             payload = {"operation_id": row["operation_id"], "epoch": row["epoch"],
                        "native_id": row["native_id"], "exit_code": code,
                        "native_exit_confirmed": True,
@@ -383,7 +375,15 @@ class Bridge:
     def heartbeat(self,labels):
         available=self.launcher.capabilities()
         engines=sorted(engine for engine in self.engines.intersection(available) if available[engine])
-        self.client.heartbeat(labels,engines,['headless']+[cap+':'+engine for engine in engines for cap in sorted(available[engine]-{'headless'})])
+        capabilities=['headless']+[cap+':'+engine for engine in engines for cap in sorted(available[engine]-{'headless'})]
+        # Resource Manager collector input: one bounded physical snapshot per heartbeat.
+        memory=native_launch.available_memory_mb()
+        snapshot={'mem_available_mb':memory,'observed_at':int(time.time()*1000)} if memory is not None else None
+        if snapshot is not None:
+            cpu=native_launch.cpu_load_pct()
+            if cpu is not None:snapshot['cpu_load_pct']=cpu
+        resources=snapshot
+        self.client.heartbeat(labels,engines,capabilities,resources=resources)
 
     def safety_pause(self,machine_id):
         self.reconcile()
@@ -415,6 +415,7 @@ class Bridge:
                 self.heartbeat(labels)
                 with self.client.socket(machine_id) as socket:
                     pending = []
+                    next_resource_heartbeat = time.monotonic() + RESOURCE_HEARTBEAT_SECONDS
                     def acknowledge(session, epoch):
                         socket.send(canonical({"type": "offer_ack", "session_id": session, "epoch": epoch}))
                         deadline = time.monotonic() + 15
@@ -434,12 +435,24 @@ class Bridge:
                     self.reconcile()
                     delay = 1
                     while True:
+                        now = time.monotonic()
+                        if now >= next_resource_heartbeat:
+                            self.heartbeat(labels)
+                            next_resource_heartbeat = time.monotonic() + RESOURCE_HEARTBEAT_SECONDS
                         active = self.journal.db.execute("SELECT 1 FROM launches WHERE state IN ('running','aborting','launching') LIMIT 1").fetchone()
+                        recv_timeout = 5 if active else min(
+                            RESOURCE_HEARTBEAT_SECONDS,
+                            max(0.01, next_resource_heartbeat - now),
+                        )
                         try:
-                            event = pending.pop(0) if pending else json.loads(socket.recv(timeout=5 if active else None))
+                            event = pending.pop(0) if pending else json.loads(socket.recv(timeout=recv_timeout))
                             self.dispatch(event, socket, acknowledge)
                         except TimeoutError:
                             pass
+                        now = time.monotonic()
+                        if now >= next_resource_heartbeat:
+                            self.heartbeat(labels)
+                            next_resource_heartbeat = time.monotonic() + RESOURCE_HEARTBEAT_SECONDS
                         self.reconcile()
                         self.journal.flush(self.client)
             except (ApiError, OSError, RuntimeError, ValueError) as error:

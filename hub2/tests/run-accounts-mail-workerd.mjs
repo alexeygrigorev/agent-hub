@@ -36,8 +36,8 @@ try{
  // This gate measures retained-history query growth and restart semantics, not
  // the production daily ceiling. Use the real audited override only inside this
  // disposable Workerd namespace so 100 synthetic sends do not stop midway;
- // run-budget-edge and run-normal-day-workerd separately enforce the $0.10 cap.
- const stressCeiling=await call('budget','global','/api/budget/override','POST',{day:new Date().toISOString().slice(0,10),ceiling_pusd:'1000000000000',reason:'Synthetic 100-message retained-history Workerd stress only; production ceiling remains $0.10/day'});
+ // run-budget-edge and run-normal-day-workerd separately enforce the $0.25 cap.
+ const stressCeiling=await call('budget','global','/api/budget/override','POST',{day:new Date().toISOString().slice(0,10),ceiling_pusd:'1000000000000',reason:'Synthetic 100-message retained-history Workerd stress only; production ceiling remains $0.25/day'});
  assert.equal(stressCeiling.response.status,200,JSON.stringify(stressCeiling.result));
  await call('accounts','a1','/api/account','PATCH',{provider:'synthetic',enabled:true,capacity:1});
  await call('accounts','a1','/api/account/quota','PUT',{remaining:80,captured_at:Date.now(),valid_until:Date.now()+60000,source:'synthetic-local-evidence'});
@@ -61,6 +61,6 @@ try{
  const reactivation={mailbox:await count('mailboxes','global'),account:await count('accounts','a1'),control:await count('control','global')};
  const after=await call('mailboxes','agent:a','/api/messages/'+warm.result.message.id+'/status','GET',undefined,a);assert(after.result.message.completed_at);assert(after.result.message.native_receipt);
  const profile=(await call('mailboxes','global','/_fixture/profile')).result;
- console.log(JSON.stringify({passed:true,engine:'native workerd SQLite',physical_mailbox_authorities:1,mailbox_id:'global',syntheticStressCeilingUsd:'1.00',accountFlow,warmFullMessage:{...flow,total,alarm_operations:alarms},smallPage,largePage,reactivation,profile,note:'Actual SQL and alarm calls, one global Mailbox counter counted once; Budget controller costs included separately and in total. The $1.00 audited override exists only in this disposable 100-message history stress fixture; production ceiling remains $0.10/day and is verified by separate gates. Synthetic running-session precondition and native receipts; not provider/live-process or whole-day proof.'}));
+ console.log(JSON.stringify({passed:true,engine:'native workerd SQLite',physical_mailbox_authorities:1,mailbox_id:'global',syntheticStressCeilingUsd:'1.00',accountFlow,warmFullMessage:{...flow,total,alarm_operations:alarms},smallPage,largePage,reactivation,profile,note:'Actual SQL and alarm calls, one global Mailbox counter counted once; Budget controller costs included separately and in total. The $1.00 audited override exists only in this disposable 100-message history stress fixture; production ceiling remains $0.25/day and is verified by separate gates. Synthetic running-session precondition and native receipts; not provider/live-process or whole-day proof.'}));
 }finally{await mf.dispose();}
 

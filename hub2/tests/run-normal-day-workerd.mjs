@@ -9,28 +9,14 @@ import {resolve,relative,sep} from 'node:path';
 import {readFile,writeFile,mkdir,mkdtemp,readdir} from 'node:fs/promises';
 import {createHash,webcrypto} from 'node:crypto';
 const root=resolve(import.meta.dirname,'../..');
-const canonical={starts:70,user_intakes:20,scheduled_occurrences:49,messages:100,claim_cycles:50,host_transitions:16,accounts:6,root_writer_api_calls:490,operator_api_calls:200,retry_episodes:20,quota_stale_batches:48,discovery_batches:4};
+const canonical={starts:70,user_intakes:20,scheduled_occurrences:49,messages:100,claim_cycles:50,host_transitions:16,host_resource_heartbeats:1440,accounts:6,root_writer_api_calls:490,operator_api_calls:200,retry_episodes:20,quota_stale_batches:48,discovery_batches:4};
 const budgetMetrics=['worker_requests','worker_cpu_ms','do_requests','do_ws_messages','do_gb_ms','background_invocations','sqlite_rows_read','sqlite_rows_written','sqlite_byte_days','kv_reads','kv_writes','kv_deletes','kv_lists','kv_byte_days'];
-// Measurement envelope for the canonical Workerd workload, distinct from the
-// deliberately broad semantic-test envelope. Route selection reads one policy,
-// one directory page, four machine states and six account states; the later
-// saga effect has its own reservation. Sixteen calls leave bounded headroom for
-// that fan-out. The DO duration is 16 instances x 256MiB x 500ms. This remains
-// a test envelope, not production sizing.
-const normalDayUnits=Object.fromEntries(budgetMetrics.map(k=>[k,0]));
-Object.assign(normalDayUnits,{worker_requests:1,worker_cpu_ms:500,do_requests:19,do_ws_messages:1,do_gb_ms:2048,background_invocations:1,sqlite_rows_read:128,sqlite_rows_written:16,sqlite_byte_days:65536});
-const publicRequestUnits={...normalDayUnits,worker_cpu_ms:250,do_requests:11,do_gb_ms:512,sqlite_rows_read:64,sqlite_rows_written:8};
-const routePlan=(calls,wall,cpu,gbms,reads,writes,label)=>({units:{...normalDayUnits,worker_cpu_ms:cpu,do_requests:calls+3,do_gb_ms:gbms,sqlite_rows_read:reads,sqlite_rows_written:writes},max_do_calls:calls,max_wall_ms:wall,provenance:`Measured canonical ${label} upper bound; test-only, not production sizing`});
-const normalDayBudget=process.env.HUB2_COST_PROFILE?await readFile(process.env.HUB2_COST_PROFILE,'utf8'):process.env.HUB2_NORMAL_DAY_SIZING_CANDIDATE==='1'?canonicalSizingEnvelopes(budgetMetrics):JSON.stringify({version:1,normal:{units:normalDayUnits,max_do_calls:16,max_wall_ms:500,by_kind:{
- public_request:{units:publicRequestUnits,max_do_calls:8,max_wall_ms:250,provenance:'Unclassified public fallback; test-only, not production sizing'},
- public_read:routePlan(3,250,200,192,32,5,'read'),public_write:routePlan(4,300,250,320,64,12,'write'),
- fleet_read:routePlan(6,250,250,384,128,5,'bounded fleet read'),project_request:routePlan(4,250,250,256,64,12,'project operation'),
- claim_request:routePlan(3,250,250,192,32,12,'claim mutation'),message_request:routePlan(4,250,250,256,32,12,'mailbox operation'),
- account_request:routePlan(2,250,250,128,32,12,'account operation'),
- placement_request:{units:normalDayUnits,max_do_calls:16,max_wall_ms:500,provenance:'Canonical high-fanout placement; test-only, not production sizing'},
- connection_request:{units:normalDayUnits,max_do_calls:16,max_wall_ms:500,provenance:'Canonical authenticated WebSocket handshake; test-only, not production sizing'},
- provider_refresh:{units:normalDayUnits,max_do_calls:16,max_wall_ms:500,provenance:'Canonical provider collector call; test-only, not production sizing'}
-},provenance:'Per-kind canonical Workerd workload bounds; test-only, not production sizing'},safety:{units:normalDayUnits,max_do_calls:16,max_wall_ms:500,provenance:'Canonical Workerd safety envelope; test-only, not production sizing'}});
+// Default to the reviewed per-kind profile for the complete native workload.
+// Provider-rated CPU, duration and storage remain configured upper bounds,
+// not verified Cloudflare invoice measurements.
+const normalDayBudget=process.env.HUB2_COST_PROFILE
+ ?await readFile(process.env.HUB2_COST_PROFILE,'utf8')
+ :canonicalSizingEnvelopes(budgetMetrics);
 const liveSourceDir=resolve(root,'hub2/src'),sourceDir=process.env.HUB2_COST_SOURCE_DIR?resolve(process.env.HUB2_COST_SOURCE_DIR):liveSourceDir;
 const sourceFiles=(await readdir(sourceDir)).filter(n=>n.endsWith('.ts')).map(n=>n.slice(0,-3)).sort();
 const hashes=async()=>Object.fromEntries(await Promise.all(sourceFiles.map(async n=>[n,createHash('sha256').update(await readFile(resolve(sourceDir,n+'.ts'))).digest('hex')])));
@@ -49,7 +35,7 @@ const bundleSha=createHash('sha256').update(bundle.outputFiles[0].text).digest('
 let mf=new Miniflare(options),base,operatorFamily,refreshToken,accessExpires,writerToken,writerFamily,virtualOffset=0;const role_ledger={operator:0,root_writer:0};
 const objects=[['control','global'],['project',project],...Array.from({length:4},(_,i)=>['machine','normal-machine-'+i]),...Array.from({length:6},(_,i)=>['account','normal-account-'+i]),['mailbox','global'],['budget','global']];
 const drivenAlarms={};
-const request_ledger={},flows=[],coverage={},missing=[],errors=[],hosts=[],intakes=[];let historicalIntake;
+const request_ledger={},flows=[],coverage={},missing=[],separate_coverage=[],errors=[],hosts=[],intakes=[];let historicalIntake;
 async function apiOnce(path,method='GET',body,auth=token,wireBody){const actor=auth===bootstrap?'fixture':!auth?'public':hosts.some(h=>h.token===auth)?'machine':auth===token?'operator':auth===writerToken?'root_writer':'bounded-child';const key=actor+' '+method+' '+path.split('?')[0].replace(/[0-9a-f]{8}-[0-9a-f-]{27,}/gi,':id');request_ledger[key]=(request_ledger[key]||0)+1;const r=await fetch(base+path,{method,headers:{'Content-Type':'application/json',...(auth?{Authorization:'Bearer '+auth}:{})},...(body===undefined?{}:{body:wireBody??JSON.stringify(body)})});const text=await r.text();let data;try{data=JSON.parse(text);}catch{data={error:'non_json',fixture_error:text.slice(0,1000)};}return{status:r.status,data};}
 const recoveryAttempts=[];
 async function api(path,method='GET',body,auth=token){
@@ -62,6 +48,12 @@ async function api(path,method='GET',body,auth=token){
  const retry=await apiOnce(path,method,body,auth,wireBody);
  const recovery={path,key:body.key,first_status:first.status,retry_status:retry.status};
  recoveryAttempts.push(recovery);return{...retry,recovery};
+}
+async function heartbeatHostsAt(offset,label){
+ for(const host of hosts)expect(await api('/api/heartbeat','POST',{
+  os:'synthetic',arch:'fixture',labels:[],engines:['opencode','shell'],capabilities:['headless','interactive'],
+  resources:{mem_available_mb:42000,observed_at:Date.now()+offset,cpu_load_pct:10},
+ },host.token),200,label);
 }
 async function roleApi(role,path,method='GET',body){role_ledger[role]++;if(role==='root_writer')assert(writerToken&&writerToken!==token,'root/writer must use independently issued client credential');return api(path,method,body,role==='root_writer'?writerToken:token);}
 async function raw(path,init={}){const key='issuer '+(init.method||'GET')+' '+path.split('?')[0];request_ledger[key]=(request_ledger[key]||0)+1;return fetch(base+path,init);}
@@ -156,16 +148,31 @@ try{
  expect(await fixture('control','global','clock',{offset:virtualOffset}),200,'anchor the native workload replay to UTC day start');
  await measure('bootstrap_registry_enrollment_and_six_accounts',async()=>{
   expect(await api('/api/repos/'+encodeURIComponent(project),'PATCH',{canonical_url:'https://github.com/synthetic/normal-day',purpose:'Canonical normal-day acceptance fixture',status:'active',aliases:[],domains:[]}),200,'project');
-  for(let i=0;i<4;i++){const id='normal-machine-'+i,p=expect(await api('/api/enrollments/pair','POST',{machine_id:id,alias:id}),201,'pair');const auth=expect(await api('/api/enrollments/complete','POST',{code:p.pairing_code},null),201,'enroll').token;hosts.push({id,token:auth});expect(await api('/api/heartbeat','POST',{os:'synthetic',arch:'fixture',labels:[],engines:['opencode','shell'],capabilities:['headless','interactive']},auth),200,'host online');}
+  for(let i=0;i<4;i++){
+   const id='normal-machine-'+i;
+   const pair=expect(await api('/api/enrollments/pair','POST',{machine_id:id,alias:id}),201,'pair');
+   const auth=expect(await api('/api/enrollments/complete','POST',{code:pair.pairing_code},null),201,'enroll').token;
+   hosts.push({id,token:auth});
+   // The Workerd fixture advances its own clock by virtualOffset. Match that
+   // clock here; real hosts continue reporting their actual epoch timestamp.
+   expect(await api('/api/heartbeat','POST',{
+    os:'synthetic',arch:'fixture',labels:[],engines:['opencode','shell'],capabilities:['headless','interactive'],
+    resources:{mem_available_mb:42000,observed_at:Date.now()+virtualOffset,cpu_load_pct:10},
+   },auth),200,'host online');
+  }
   for(let i=0;i<6;i++){const prefix=`/api/accounts/normal-account-${i}/api/account`;expect(await api(prefix,'PATCH',{provider:'codex',enabled:true,capacity:1,min_remaining:10}),200,'account');const access='fixture.'+Buffer.from(JSON.stringify({exp:Math.floor(Date.now()/1000)+864000})).toString('base64url')+'.signature';expect(await api(prefix+'/credentials','PUT',{expected_generation:0,files:{'.codex/auth.json':JSON.stringify({tokens:{access_token:access,refresh_token:'synthetic-native-fixture',account_id:'fixture-id'},last_refresh:new Date().toISOString()})}}),200,'encrypted synthetic provider bundle');expect(await api(prefix+'/discovery','POST',{}),200,'actual provider collector over synthetic HTTP');expect(await api(prefix+'/hosts','PUT',{hosts:hosts.map(h=>h.id)}),200,'approve actual fixture hosts');}expect(await api('/api/model-policy','PUT',{expected_version:0,candidates:Array.from({length:6},(_,i)=>({id:'normal-model-'+i,engine:'opencode',model:'synthetic-test-model',account_id:'normal-account-'+i,weight:i+1,capabilities:[],enabled:true}))}),200,'normal model policy');coverage.accounts=6;
  });
  if(process.env.HUB2_NORMAL_DAY_SLICE!=='twenty')await measure('previous_day_failed_intake_setup',async()=>{
   expect(await fixture('control','global','clock',{offset:-86400000}),200,'previous-day actual API fixture clock');
   try{
+   await heartbeatHostsAt(-86400000,'align fresh host resources with previous-day fixture clock');
    for(let i=0;i<6;i++)expect(await api(`/api/accounts/normal-account-${i}/api/account/discovery`,'POST',{}),200,'historical actual collector');
    historicalIntake=expect(await api('/api/intakes?project='+encodeURIComponent(project),'POST',{title:'Retained failed task from previous day',text:'Synthetic actual API history, not raw SQL seed.',acceptance_criteria:['Retry preserves prior failed attempt provenance.'],key:'previous-day-task'}),201,'historical intake').intake;
    await lifecycle(historicalIntake,9000,undefined,1);
-  }finally{expect(await fixture('control','global','clock',{offset:virtualOffset}),200,'restore anchored current normal day');}
+  }finally{
+   expect(await fixture('control','global','clock',{offset:virtualOffset}),200,'restore anchored current normal day');
+   await heartbeatHostsAt(virtualOffset,'restore fresh host resources to current fixture clock');
+  }
  });
  await measure('twenty_user_intakes',async()=>{for(let i=0;i<20;i++){const t=expect(await api('/api/intakes?project='+encodeURIComponent(project),'POST',{title:'User fixture '+i,text:'Synthetic normal-day workload, no native process launched.',acceptance_criteria:['Result remains awaiting independent review.'],key:'user-'+i}),201,'create').intake;intakes.push(t);}coverage.user_intakes=intakes.length;});
  coverage.starts=0;
@@ -202,9 +209,20 @@ try{
   const writer=expect(await api('/api/schedules?project='+encodeURIComponent(project),'POST',{key:'normal-writer-daily',intake_id:intakes[0].id,kind:'writer',interval_ms:86400000,timezone:'UTC',overlap:'skip',payload:{start:launch}}),201,'writer schedule').schedule;
   const scheduleDayStart=Date.now()+virtualOffset+1800000,writerDue=scheduleDayStart+47*1800000;
   expect(await fixture('project',project,'align-schedules',{root_id:rootSchedule.id,root_due:scheduleDayStart,writer_id:writer.id,writer_due:writerDue}),200,'align existing recurring deadlines to this measured UTC day');
-  let occurrences=0,discoveryBatches=0;
+  let occurrences=0,discoveryBatches=0,nextResourceHeartbeat=0;
   for(let tick=1;tick<=48;tick++){
-   const rootState=expect(await api('/api/schedules/'+encodeURIComponent(rootSchedule.id)+'?project='+encodeURIComponent(project)),200,'actual next root deadline').schedule,due=rootState.next_due,target=due+50;await advance(target);let discovered=false;
+   const rootState=expect(await api('/api/schedules/'+encodeURIComponent(rootSchedule.id)+'?project='+encodeURIComponent(project)),200,'actual next root deadline').schedule,due=rootState.next_due,target=due+50;
+  // A monotonic 240-second cadence produces alternating 7/8 refreshes in
+  // each 30-minute scheduling interval. The five-minute Resource Manager TTL
+  // leaves at least 60 seconds of freshness margin before the scheduled start.
+  if(tick===1)nextResourceHeartbeat=due-30*60_000+240_000;
+  while(nextResourceHeartbeat<=target){
+    await advance(nextResourceHeartbeat);
+    await heartbeatHostsAt(virtualOffset,'240-second host resource heartbeat');
+    coverage.host_resource_heartbeats=(coverage.host_resource_heartbeats||0)+hosts.length;
+    nextResourceHeartbeat+=240_000;
+  }
+   await advance(target);let discovered=false;
    for(let i=0;i<6;i++){const prefix=`/api/accounts/normal-account-${i}/api/account`;const state=expect(await api(prefix+'/discovery'),200,'scheduled discovery deadline');if(state.discovery.next_at<=target){expect(await fixture('account','normal-account-'+i,'alarm',{}),200,'due actual provider discovery');discovered=true;}const view=expect(await api(prefix+'/quota'),200,'stale authorized view triggers genuine collector');assert(view.fresh===true||view.quota?.valid_until>target,'actual quota must refresh');assert(String(view.quota?.source||'').startsWith('provider:codex:generation:'),'quota requires actual collector generation provenance');}
    if(discovered)discoveryBatches++;coverage.quota_stale_batches=tick;
    const sockets=await Promise.all(hosts.map(h=>socket(h.token)));
@@ -258,7 +276,10 @@ try{
  for(const[k,n]of Object.entries(canonical))if(coverage[k]!==n)missing.push(k+': measured '+(coverage[k]??0)+' of '+n);
  if(!coverage.retained_archive_search||!coverage.retained_failed_retry_history)missing.push('retained archive/search/history outside this component slice');
  if(!coverage.actual_persisted_cold_restart)missing.push('actual persisted cold restart outside this component slice');
- missing.push('populated older-schema migration and configured production prompt inventory remain separate uncovered scenarios');
+ // The approved clean-start release intentionally imports no Hub1 records.
+ // Scheduler behavior is exercised above; only a pre-existing configured
+ // prompt inventory is absent by design and must remain visible separately.
+ separate_coverage.push({scenario:'legacy configured production prompt inventory',status:'not_imported_by_authorized_clean_start',release_gate:false,behavior_covered_by:'49 real durable schedule occurrences and ProjectWork schedule tests'});
  let budgetStatus,budgetLedger;
  await measure('post_workload_budget_status_view',async()=>{
   // This is an explicit observer phase after canonical workload counters are frozen.
@@ -268,7 +289,7 @@ try{
   assert.equal(budgetStatus.timezone,'UTC');
   assert.equal(budgetStatus.allowances,'assumed_exhausted');
   assert.equal(budgetStatus.alert_threshold_usd,'0.030000000000');
-  assert.equal(budgetStatus.daily_ceiling_usd,'0.100000000000');
+  assert.equal(budgetStatus.daily_ceiling_usd,'0.250000000000');
   assert.equal(budgetStatus.recovery_reserve_usd,'0.010000000000');
   assert.equal(budgetStatus.controller_metering_valid,true);
   assert.equal(budgetStatus.health,'degraded','missing provider-rated usage must remain visible as degraded');
@@ -286,7 +307,8 @@ try{
  const telemetry=nativeTelemetry.report();const total=Object.values(telemetry.phases).reduce((n,f)=>n+f.reads+f.writes,0),alarm_operations=Object.values(telemetry.phases).reduce((n,f)=>n+Object.values(f.storage).reduce((m,c)=>m+c.succeeded+c.failed,0),0);
  const provenAlarmWrites=Object.values(telemetry.phases).reduce((n,f)=>n+f.storage.setAlarm.succeeded,0);const complete=missing.length===0&&Object.entries(canonical).every(([k,n])=>coverage[k]===n);
  const canonicalComplete=Object.entries(canonical).every(([k,n])=>coverage[k]===n)&&coverage.role_separated_credentials&&coverage.retained_archive_search&&coverage.retained_failed_retry_history&&coverage.actual_persisted_cold_restart;
- const report={passed:complete&&stable&&nativeTelemetry.valid()&&!errors.length,canonical_passed:!!canonicalComplete&&stable&&nativeTelemetry.valid()&&!errors.length,engine:'actual native workerd SQLite',canonical_source:'docs/hub2/ARCHITECTURE.md:124-146',production_source_directory:sourceDir,bundle_sha256:bundleSha,budget_profile_sha256:createHash('sha256').update(normalDayBudget).digest('hex'),source_snapshot_manifest_sha256:process.env.HUB2_SOURCE_MANIFEST?createHash('sha256').update(await readFile(process.env.HUB2_SOURCE_MANIFEST)).digest('hex'):null,cache_variant:cacheVariant,component_slice:process.env.HUB2_NORMAL_DAY_SLICE||'implemented-flows',cache_adapter_sha256:createHash('sha256').update(await readFile(resolve(root,'hub2/tests/normal-day-cache-off.ts'))).digest('hex'),canonical,coverage,role_ledger,request_ledger,missing,errors,profiles,storage_profiles,configured_alert_cron:{invocations:configuredCronInvocations,cadence_minutes:1440/configuredCronInvocations,basis:process.env.HUB2_BUDGET_CRON_PER_DAY?'explicit test parameter; must match deployment manifest':'test-only 15-minute candidate assumption, NOT production approval',delivery_ids:cronDeliveryIds,transport:'synthetic 202/idempotent receiver; real channel delivery proven separately'},alarm_clock_fixture:{physical_shift_ms:7*86400000,driver:'bounded explicit invocation of actual handlers when durable virtual deadlines are due',driven_alarms:drivenAlarms,prevents:'Native real-clock refiring of virtual past timestamps; not a production optimization'},budget_status:budgetStatus,budget_all_days_ledger:budgetLedger,settled_ledger_reclaimed_pusd:budgetLedger?String(budgetLedger.kinds.filter(k=>k.state==='settled').reduce((sum,k)=>sum+BigInt(k.estimate_pusd)-BigInt(k.actual_pusd),0n)):null,settled_ledger_reclaim_semantics:'Actual durable settled reservation estimate minus its recorded settlement, not a counterfactual native-cost subtraction or verified provider bill.',persistence_directory:persist,budget_status_snapshot_semantics:'The authenticated response is observed before its own reservation settles; the separate post_workload_budget_status_view native phase includes its full reservation and settlement cost.',native_observed_sql_cost_usd_pusd:String(Object.values(telemetry.phases).reduce((sum,f)=>sum+BigInt(f.reads)*1000n+BigInt(f.writes)*1000000n,0n)+BigInt(provenAlarmWrites)*1000000n),native_sql_cost_semantics:'Actual native read/write cursor units plus proven setAlarm row writes at marginal rates; excludes unobserved CPU, DO duration and storage. Not total observed provider bill.',proven_alarm_rows_written:provenAlarmWrites,measured_partial_combined_rows:total+provenAlarmWrites,conservative_sql_and_all_alarm_calls:total+alarm_operations,observed_source_invocations:{worker_http_requests:Object.entries(request_ledger).filter(([k])=>!k.startsWith('fixture ')).reduce((n,[,v])=>n+v,0),do_fetch_requests:Object.values(telemetry.phases).reduce((n,p)=>n+p.source_do_requests,0),alarm_handler_entries:Object.values(telemetry.phases).reduce((n,p)=>n+p.source_alarm_entries,0),websocket_messages:Object.values(telemetry.phases).reduce((n,p)=>n+p.source_ws_messages,0),semantics:'Actual source method entries plus public request ledger; not configured upper units. Fixture metadata bypasses source fetch; source alarm handlers are explicitly driven.'},source_stable:stable,source_hashes:sourceBefore,native_telemetry:telemetry,native_meter_valid:nativeTelemetry.valid(),native_meter_fixture_sha256:createHash('sha256').update(await readFile(resolve(root,'hub2/tests/normal-day-meter.mjs'))).digest('hex'),flows,measured_partial_rows:total,alarm_operations,complete,threshold:budgetStatus?.alert_threshold_usd??null,legacy_20000_gate_withdrawn:true,required_paid_cost_alert_usd_per_day:0.03,final_alarms:Object.fromEntries(Object.entries(final).map(([k,v])=>[k,v.alarm])),note:'Actual measured partial workload, not a daily forecast. Synthetic provider HTTP and native process receipts are explicit fixtures; quota is generated by the actual provider collector, never manual snapshot PUT. Operator APIs use actual expiring hashed credential issued through OIDC/device flow; bootstrap secret only authorizes test-only observations/provider transport configuration. Provider-rated usage remains visibly unknown until an authorized source is available. Missing coverage FAILS acceptance.'};
+ const report={passed:complete&&stable&&nativeTelemetry.valid()&&!errors.length,canonical_passed:!!canonicalComplete&&stable&&nativeTelemetry.valid()&&!errors.length,engine:'actual native workerd SQLite',canonical_source:'docs/hub2/ARCHITECTURE.md:124-146',production_source_directory:sourceDir,bundle_sha256:bundleSha,budget_profile_sha256:createHash('sha256').update(normalDayBudget).digest('hex'),source_snapshot_manifest_sha256:process.env.HUB2_SOURCE_MANIFEST?createHash('sha256').update(await readFile(process.env.HUB2_SOURCE_MANIFEST)).digest('hex'):null,cache_variant:cacheVariant,component_slice:process.env.HUB2_NORMAL_DAY_SLICE||'implemented-flows',cache_adapter_sha256:createHash('sha256').update(await readFile(resolve(root,'hub2/tests/normal-day-cache-off.ts'))).digest('hex'),canonical,coverage,role_ledger,request_ledger,missing,separate_coverage,errors,profiles,storage_profiles,configured_alert_cron:{invocations:configuredCronInvocations,cadence_minutes:1440/configuredCronInvocations,basis:process.env.HUB2_BUDGET_CRON_PER_DAY?'explicit test parameter; must match deployment manifest':'test-only 15-minute candidate assumption, NOT production approval',delivery_ids:cronDeliveryIds,transport:'synthetic 202/idempotent receiver; real channel delivery proven separately'},alarm_clock_fixture:{physical_shift_ms:7*86400000,driver:'bounded explicit invocation of actual handlers when durable virtual deadlines are due',driven_alarms:drivenAlarms,prevents:'Native real-clock refiring of virtual past timestamps; not a production optimization'},budget_status:budgetStatus,budget_all_days_ledger:budgetLedger,settled_ledger_reclaimed_pusd:budgetLedger?String(budgetLedger.kinds.filter(k=>k.state==='settled').reduce((sum,k)=>sum+BigInt(k.estimate_pusd)-BigInt(k.actual_pusd),0n)):null,settled_ledger_reclaim_semantics:'Actual durable settled reservation estimate minus its recorded settlement, not a counterfactual native-cost subtraction or verified provider bill.',persistence_directory:persist,budget_status_snapshot_semantics:'The authenticated response is observed before its own reservation settles; the separate post_workload_budget_status_view native phase includes its full reservation and settlement cost.',native_observed_sql_cost_usd_pusd:String(Object.values(telemetry.phases).reduce((sum,f)=>sum+BigInt(f.reads)*1000n+BigInt(f.writes)*1000000n,0n)+BigInt(provenAlarmWrites)*1000000n),native_sql_cost_semantics:'Actual native read/write cursor units plus proven setAlarm row writes at marginal rates; excludes unobserved CPU, DO duration and storage. Not total observed provider bill.',proven_alarm_rows_written:provenAlarmWrites,measured_partial_combined_rows:total+provenAlarmWrites,conservative_sql_and_all_alarm_calls:total+alarm_operations,observed_source_invocations:{worker_http_requests:Object.entries(request_ledger).filter(([k])=>!k.startsWith('fixture ')).reduce((n,[,v])=>n+v,0),do_fetch_requests:Object.values(telemetry.phases).reduce((n,p)=>n+p.source_do_requests,0),alarm_handler_entries:Object.values(telemetry.phases).reduce((n,p)=>n+p.source_alarm_entries,0),websocket_messages:Object.values(telemetry.phases).reduce((n,p)=>n+p.source_ws_messages,0),semantics:'Actual source method entries plus public request ledger; not configured upper units. Fixture metadata bypasses source fetch; source alarm handlers are explicitly driven.'},source_stable:stable,source_hashes:sourceBefore,native_telemetry:telemetry,native_meter_valid:nativeTelemetry.valid(),native_meter_fixture_sha256:createHash('sha256').update(await readFile(resolve(root,'hub2/tests/normal-day-meter.mjs'))).digest('hex'),flows,measured_partial_rows:total,alarm_operations,complete,threshold:budgetStatus?.alert_threshold_usd??null,legacy_20000_gate_withdrawn:true,required_paid_cost_alert_usd_per_day:0.03,final_alarms:Object.fromEntries(Object.entries(final).map(([k,v])=>[k,v.alarm])),note:'Actual measured partial workload, not a daily forecast. Synthetic provider HTTP and native process receipts are explicit fixtures; quota is generated by the actual provider collector, never manual snapshot PUT. Operator APIs use actual expiring hashed credential issued through OIDC/device flow; bootstrap secret only authorizes test-only observations/provider transport configuration. Provider-rated usage remains visibly unknown until an authorized source is available. Missing required coverage FAILS acceptance; the separate legacy prompt inventory is intentionally absent after the approved clean-start and is not imported.'};
+ report.host_resource_heartbeat_model={cadence_seconds:240,per_host_per_day:360,hosts:4,fixture_requests:1440,source:'periodic host resource refresh; Resource Manager snapshot TTL is 300 seconds, leaving at least a 60-second timing margin before each 30-minute scheduled start'};
  if(process.env.HUB2_COST_HTTP_CPU_MS){
   report.conditional_runtime_workload_passed=report.passed;report.conditional_runtime_canonical_passed=report.canonical_passed;
   report.passed=false;report.canonical_passed=false;

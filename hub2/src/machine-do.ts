@@ -7,7 +7,7 @@ import { actorFrom, bodyObject, boundedString, error, hasScope, HttpError, json 
 import type { Actor, Hub2Env, JsonRecord } from './types';
 
 const SCHEMA = [
-  'CREATE TABLE IF NOT EXISTS machine_capabilities(machine_id TEXT PRIMARY KEY,engines_json TEXT NOT NULL,capabilities_json TEXT NOT NULL) WITHOUT ROWID',
+  'CREATE TABLE IF NOT EXISTS machine_capabilities(machine_id TEXT PRIMARY KEY,engines_json TEXT NOT NULL,capabilities_json TEXT NOT NULL,resources_json TEXT) WITHOUT ROWID',
   `CREATE TABLE machines (
     machine_id TEXT PRIMARY KEY, alias TEXT NOT NULL, os TEXT NOT NULL, arch TEXT NOT NULL,
     labels_json TEXT NOT NULL, last_seen INTEGER NOT NULL, next_epoch INTEGER NOT NULL DEFAULT 0,
@@ -92,7 +92,7 @@ export class MachineDO {
     this.db = new MeteredDb(ctx.storage.sql);
     this.sqlReceipts = new SqlReceiptMeter(this.db);
     this.env = wrapSqlNamespaces(env, this.sqlReceipts) as Hub2Env;
-    initializeSchema(ctx, this.db, 3, LATEST_SCHEMA, [[SCHEMA[0]],COMPACT_KEYS],()=>this.scheduleNext(),3);
+    initializeSchema(ctx, this.db, 4, LATEST_SCHEMA, [[SCHEMA[0]],COMPACT_KEYS,['ALTER TABLE machine_capabilities ADD COLUMN resources_json TEXT']],()=>this.scheduleNext(),4);
     this.constructorMs = performance.now() - started;
   }
 
@@ -197,7 +197,23 @@ export class MachineDO {
       this.db.run('UPDATE machines SET os=?, arch=?, labels_json=?, last_seen=? WHERE machine_id=?', os, arch, JSON.stringify([...new Set(labels)]), now, machineId);
     }
     const prior=this.db.one<{engines_json:string;capabilities_json:string}>('SELECT engines_json,capabilities_json FROM machine_capabilities WHERE machine_id=?',machineId);
-    if(!prior||prior.engines_json!==enginesJson||prior.capabilities_json!==capabilitiesJson)this.db.run('INSERT INTO machine_capabilities VALUES(?,?,?) ON CONFLICT(machine_id) DO UPDATE SET engines_json=excluded.engines_json,capabilities_json=excluded.capabilities_json',machineId,enginesJson,capabilitiesJson);
+    if(!prior||prior.engines_json!==enginesJson||prior.capabilities_json!==capabilitiesJson)this.db.run('INSERT INTO machine_capabilities(machine_id,engines_json,capabilities_json) VALUES(?,?,?) ON CONFLICT(machine_id) DO UPDATE SET engines_json=excluded.engines_json,capabilities_json=excluded.capabilities_json',machineId,enginesJson,capabilitiesJson);
+    // Resource Manager collector input: bounded host resource snapshot persisted
+    // in its own column. Malformed snapshots leave it NULL; the admission facade
+    // treats missing as unconstrained and stale as a typed hold.
+    const resources=body.resources as JsonRecord|undefined;
+    if(resources&&typeof resources==='object'){
+      const mem=Number(resources.mem_available_mb),observed=Number(resources.observed_at);
+      const validMem=Number.isFinite(mem)&&mem>=0&&mem<=1048576&&Number.isSafeInteger(observed)&&observed>now-600000&&observed<=now+5000;
+      const cpu=Number(resources.cpu_load_pct);
+      const validCpu=Number.isFinite(cpu)&&cpu>=0&&cpu<=100;
+      if(validMem){
+        const snapshot:{mem_available_mb:number;observed_at:number;cpu_load_pct?:number}={mem_available_mb:Math.round(mem),observed_at:observed};
+        if(validCpu)snapshot.cpu_load_pct=Math.round(cpu*10)/10;
+        this.db.run('INSERT INTO machine_capabilities(machine_id,engines_json,capabilities_json,resources_json) VALUES(?,?,?,?) ON CONFLICT(machine_id) DO UPDATE SET resources_json=excluded.resources_json',
+          machineId,enginesJson,capabilitiesJson,JSON.stringify(snapshot));
+      }
+    }
     return json({ ok: true, machine_id: machineId, last_seen: now });
   }
 
@@ -206,11 +222,12 @@ export class MachineDO {
     if(!machine)return json({available:false,reason:'machine_not_enrolled'});
     let connected=false;
     for(const socket of this.machineSockets(`${machine.machine_id}`))if(socket.readyState===1&&!this.stopOnly(socket)&&await this.authorizedAttachment(socket,'machine:offer')){connected=true;break;}
-    const capabilities=this.db.one<{engines_json:string;capabilities_json:string}>('SELECT engines_json,capabilities_json FROM machine_capabilities WHERE machine_id=?',machine.machine_id);
+    const capabilities=this.db.one<{engines_json:string;capabilities_json:string;resources_json:string|null}>('SELECT engines_json,capabilities_json,resources_json FROM machine_capabilities WHERE machine_id=?',machine.machine_id);
+    const resources=capabilities?.resources_json?JSON.parse(capabilities.resources_json) as {mem_available_mb:number;observed_at:number}:undefined;
     return json({machine_id:machine.machine_id,available:connected&&!machine.active_session_id,connected,
       occupied:machine.active_session_id?1:0,capacity:1,os:machine.os,arch:machine.arch,labels:JSON.parse(machine.labels_json),
       engines:capabilities?JSON.parse(capabilities.engines_json):[],capabilities:capabilities?JSON.parse(capabilities.capabilities_json):[],
-      reason:!connected?'machine_offline':machine.active_session_id?'machine_capacity':null});
+      ...(resources?{resources}:{}) ,reason:!connected?'machine_offline':machine.active_session_id?'machine_capacity':null});
   }
 
   private offers(request: Request): Response {
