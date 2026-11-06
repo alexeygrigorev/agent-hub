@@ -9,7 +9,7 @@ test('canonical root configuration selects six-DO Hub2 only', () => {
  const root=config('wrangler.jsonc'), nested=config('hub2/wrangler.production.jsonc');
  assert.equal(root.main,'hub2/production-worker.ts');
  assert.equal(root.assets.directory,'hub2/public');
- assert.equal(root.workers_dev,false,'keep the dashboard-managed production hostname without enabling workers.dev');
+ assert.equal(root.workers_dev,true,'preserve the approved workers.dev endpoint across deployments');
  assert.equal(Object.hasOwn(root,'route') || Object.hasOwn(root,'routes'),false,'do not replace the dashboard-managed route');
  const normalized=structuredClone(root);
  normalized.main='production-worker.ts'; normalized.assets.directory='./public';
