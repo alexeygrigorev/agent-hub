@@ -161,7 +161,7 @@ async function budgetedScopedRequest(env:Hub2Env,kind:BudgetKind,run:(guarded:Hu
  const units={...plan.units,worker_requests:origin==='worker'?plan.units.worker_requests:0,
   worker_cpu_ms:origin==='nested'?0:plan.units.worker_cpu_ms,
   background_invocations:backgroundInvocation?Math.max(1,plan.units.background_invocations):plan.units.background_invocations};
- const id='edge:'+crypto.randomUUID(),started=performance.now();
+ const id='edge:'+crypto.randomUUID();
  const receipt=receiptContext(env),receiptPoint=receipt.parent
   ?receipt.meter.checkpointUnassigned()
   :receipt.meter.checkpoint();
@@ -172,7 +172,11 @@ async function budgetedScopedRequest(env:Hub2Env,kind:BudgetKind,run:(guarded:Hu
  if(!reservation.ok)return error('budget_unavailable',503);
  const reserved=await reservation.json() as {allowed?:boolean;retry_at?:number};
  if(reserved.allowed!==true)return budgetPauseResponse(reserved.retry_at);
- let calls=0;
+ // The wall bound limits effect execution, not the preceding durable budget
+ // reservation. Controller latency is funded separately in the request
+ // envelope and must not turn a successful bounded effect into an ambiguous
+ // result after the effect has run.
+ let calls=0,started=performance.now();
  const guarded={...receipt.env} as Hub2Env;
  for(const name of NAMES){
   const ns=receipt.env[name];

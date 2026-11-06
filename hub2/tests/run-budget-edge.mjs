@@ -126,6 +126,22 @@ export default {async fetch(r,env){const u=new URL(r.url);
   const statusResponse=await original.get(original.idFromName(id)).fetch('https://budget/api/budget',{headers:{'x-hub2-actor':JSON.stringify({id:'operator:fixture',kind:'operator',scopes:['budget:read']})}});
   return Response.json({status:response.status,account_calls:accountCalls,budget:await statusResponse.json()});
  }
+ if(u.pathname==='/_fixture/reservation-latency'){
+  const p=JSON.parse(env.HUB2_BUDGET_ENVELOPES),base={...p.normal};delete base.by_kind;
+  p.normal={...base,by_kind:{public_read:{...base,max_wall_ms:250}}};
+  const original=env.BUDGET,id='reservation-latency',raw=original.get(original.idFromName(id));
+  const delayed= new Proxy(raw,{get(target,key){
+   if(key==='fetch')return async(input,init)=>{
+    const url=new URL(typeof input==='string'?input:input.url);
+    if(url.pathname==='/_internal/reserve')await new Promise(resolve=>setTimeout(resolve,350));
+    return target.fetch(input,init);
+   };
+   const value=Reflect.get(target,key,target);return typeof value==='function'?value.bind(target):value;
+  }});
+  const fixtureEnv={...env,HUB2_BUDGET_ENVELOPES:JSON.stringify(p),BUDGET:{idFromName:()=>original.idFromName(id),get:()=>delayed}};
+  const response=await budgetedPublicRequest(new Request('https://public/health'),fixtureEnv,async()=>undefined,async()=>Response.json({bounded:true}));
+  return Response.json({status:response.status,body:await response.json()});
+ }
  if(u.pathname==='/_fixture/deny-before-fanout'){
   const original=env.BUDGET,id='deny-before-fanout',stub=original.get(original.idFromName(id));
   const reserveUnits=Object.fromEntries(${JSON.stringify(names)}.map(k=>[k,0])),coverage=Object.fromEntries(${JSON.stringify(names)}.map(k=>[k,'exact']));
@@ -169,6 +185,9 @@ let mf=new Miniflare(options),base='';
 const call=async(path,method='GET',body)=>{const r=await fetch(base+path,{method,headers:{'Content-Type':'application/json',Authorization:'Bearer synthetic-fixture-token-0000000000000000'},...(body===undefined?{}:{body:JSON.stringify(body)})});let data;try{data=await r.json();}catch{data={};}return {status:r.status,data,headers:r.headers};};
 try{
  base=(await mf.ready).origin;
+ const delayedReservation=await call('/_fixture/reservation-latency');
+ assert.equal(delayedReservation.status,200);assert.equal(delayedReservation.data.status,200,'pre-effect reservation latency must not consume the bounded effect wall window');
+ assert.equal(delayedReservation.data.body.bounded,true);
  const testCeiling=await call('/api/budget/override','POST',{day:new Date().toISOString().slice(0,10),ceiling_pusd:'100000000000',reason:'Synthetic lower ceiling for cutoff and recovery tests'});
  assert.equal(testCeiling.status,200,JSON.stringify(testCeiling.data));
  const concurrent=await call('/_fixture/concurrent');
