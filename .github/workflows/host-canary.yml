@@ -1,71 +1,26 @@
-name: Host canary hermeticity
-
+name: Canonical host distribution
 on:
+  pull_request:
+    paths: ['hub2/host/**', 'pyproject.toml', 'uv.lock', 'scripts/ci/test_root_distribution.py', '.github/workflows/host-canary.yml']
   push:
     branches: [main]
-    paths:
-      - "host/**"
-      - "scripts/**"
-      - "pyproject.toml"
-      - "uv.lock"
-      - "package.json"
-      - "package-lock.json"
-      - ".github/workflows/**"
-  pull_request:
-    branches: [main]
-    paths:
-      - "host/**"
-      - "scripts/**"
-      - "pyproject.toml"
-      - "uv.lock"
-      - "package.json"
-      - "package-lock.json"
-      - ".github/workflows/**"
+    paths: ['hub2/host/**', 'pyproject.toml', 'uv.lock', 'scripts/ci/test_root_distribution.py', '.github/workflows/host-canary.yml']
   workflow_dispatch:
-
 permissions:
   contents: read
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
 jobs:
-  canary:
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
+  package:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Shared device login (DataTalksClub/auth)
-        uses: actions/checkout@v4
-        with:
-          repository: DataTalksClub/auth
-          path: .deps/auth
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-
+          python-version: '3.12'
       - uses: astral-sh/setup-uv@v6
         with:
-          version: "0.10.11"
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Canary hermeticity (full host suite, pytest + unittest discover)
-        env:
-          DTC_AUTH_HOME: ${{ github.workspace }}/.deps/auth
-          TMPDIR: ${{ github.workspace }}/.local/tmp
-        run: |
-          mkdir -p .local/tmp
-          uv sync --frozen
-          uv run --frozen python scripts/ci/host_canary_check.py
+          version: '0.10.11'
+      - run: python scripts/ci/test_root_distribution.py

@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-e4JXokFInCEmxaWDx5VwfxjGssAavfVzgWe7YsuGBww='; style-src 'sha256-TVlA0VLccCTkG5+NUmq9uVRqKKoie5ZEuClO8RoPfMM='; connect-src 'self'; base-uri 'none'; form-action 'none'">
+<title>Hub 2 · Work and conversations</title><style>
+:root{color-scheme:light dark;font:16px/1.5 system-ui,sans-serif;--bg:#f4f6f9;--card:#fff;--ink:#172334;--muted:#536275;--line:#ccd5df;--accent:#075ac4;--danger:#a51d30}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink)}main{max-width:1060px;margin:auto;padding:20px}header,.bar,nav,.actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap}header{justify-content:space-between}h1{font-size:1.6rem;margin:0}h2{font-size:1.25rem}h3{font-size:1.05rem;margin:0 0 8px}.muted,small{color:var(--muted)}button,input,textarea,select{font:inherit}button{cursor:pointer;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink);padding:9px 14px;min-height:44px}button.primary,nav button[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:#fff}button:disabled{opacity:.6;cursor:wait}input,textarea{width:100%;border:1px solid var(--line);border-radius:6px;padding:10px;background:var(--card);color:var(--ink)}textarea{min-height:100px;resize:vertical}label{display:block;font-weight:600;margin:8px 0}label small{display:block;font-weight:400}.fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px}.card,form.box,details{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin:12px 0}.card p{margin:7px 0;overflow-wrap:anywhere}.pre,pre{white-space:pre-wrap;overflow-wrap:anywhere}pre{font:14px/1.5 ui-monospace,monospace;max-height:55vh;overflow:auto}nav{margin:20px 0 12px;gap:6px}nav button{flex:1}#notice{min-height:26px;margin:12px 0;overflow-wrap:anywhere}#notice[data-error=true]{color:var(--danger)}summary{cursor:pointer;font-weight:600;min-height:30px}.badge{border:1px solid var(--line);border-radius:20px;padding:4px 10px;font-size:.85rem}a.skip{position:absolute;left:-9999px}a.skip:focus{left:12px;top:8px;background:var(--card);padding:8px;z-index:5}:focus-visible{outline:3px solid #e29913;outline-offset:3px}[hidden]{display:none!important}.grow{flex:1}.meta{font-size:.9rem;color:var(--muted)}
+@media(max-width:520px){.bar>.grow{flex-basis:100%}main{padding:12px}.fields{grid-template-columns:1fr}nav{display:grid;grid-template-columns:repeat(3,1fr)}button{padding:9px 10px}header .bar{gap:6px}.card,form.box,details{padding:12px}}
+@media(prefers-color-scheme:dark){:root{--bg:#111923;--card:#1b2838;--ink:#edf3fa;--muted:#b5c4d5;--line:#41546b;--accent:#266cce;--danger:#ff9ba8}}
+</style></head>
+<body><a class="skip" href="#content">Skip to work</a><main>
+<header><div><h1>Hub 2</h1><small>Work and conversations</small></div><span id="state" class="badge">Disconnected</span></header>
+<p id="notice" role="status" aria-live="polite"></p>
+<section id="connection" aria-labelledby="connectionTitle"><h2 id="connectionTitle">Connect to your Hub</h2>
+<p><a href="/auth/login">Sign in with your authorized DTC account</a>, or use a CLI access token. Access tokens stay in memory until you disconnect or close this page.</p>
+<form id="connect" class="box"><label for="token">Access token</label><input id="token" type="password" autocomplete="off" spellcheck="false" required minlength="32" maxlength="256"><p><button id="connectButton" class="primary" type="submit">Connect</button></p></form></section>
+<section id="dashboard" hidden><div class="bar"><span class="grow muted">Refresh when you need an update.</span><button id="refresh" type="button">Refresh view</button><button id="disconnect" type="button">Disconnect</button></div>
+<details><summary>Project, machine and mailbox</summary><div class="fields">
+<label for="project">Project<input id="project" list="projects" autocomplete="off"><datalist id="projects"></datalist></label>
+<label for="machine">Machine ID<input id="machine" autocomplete="off"><small>Choose a machine from Fleet to view sessions.</small></label>
+<label for="account">Account ID<input id="account" autocomplete="off"><small>Leave empty for the default account.</small></label>
+<label for="mailbox">Mailbox identity<input id="mailbox" autocomplete="off"><small>Leave empty for your own mailbox.</small></label></div><button id="moreProjects" type="button" hidden>Load more projects</button></details>
+<nav aria-label="Views"><button data-view="intakes" type="button" aria-pressed="true">Intakes</button><button data-view="sessions" type="button" aria-pressed="false">Sessions</button><button data-view="fleet" type="button" aria-pressed="false">Fleet</button><button data-view="quota" type="button" aria-pressed="false">Quota</button><button data-view="inbox" type="button" aria-pressed="false">Inbox</button></nav>
+<section id="content" aria-labelledby="title" tabindex="-1"><h2 id="title">Intakes</h2>
+<details id="createIntake"><summary>Create intake</summary><form id="intakeForm"><label>Title<input name="title" maxlength="240" required></label><label>Request<textarea name="text" required></textarea></label><label>Acceptance criteria<small>One requirement per line.</small><textarea name="criteria" required></textarea></label><button class="primary" type="submit">Create intake</button></form></details>
+<details id="compose" hidden><summary>New message</summary><form id="messageForm"><label>Recipient identity<input name="recipient" required maxlength="180"></label><label>Message<textarea name="body" required></textarea></label><button class="primary" type="submit">Send message</button></form></details>
+<div id="results" aria-busy="false"></div><div class="actions"><button id="first" type="button">First page</button><button id="next" type="button" hidden>Next page</button></div>
+<details id="details" hidden><summary>Record details</summary><div id="detail"></div></details></section></section>
+</main><script type="module">
+const $=id=>document.getElementById(id);
+let token='',cookieAuth=false,csrf='',tab='intakes',page=null,revision=0,projectsNext=null;
+const names={intakes:'Intakes',sessions:'Sessions',fleet:'Fleet',quota:'Quota',inbox:'Inbox'};
+class ApiError extends Error{constructor(code,status=0){super(code);this.code=code;this.status=status;}}
+function say(text,bad=false){$('notice').textContent=text;$('notice').dataset.error=String(bad);}
+function report(e){say(`${e instanceof ApiError?`${e.status||'Local'} · ${e.code}`:'Unexpected error'}. ${e.status===401?'Connect again with a valid token.':'Try again or check the selected context.'}`,true);}
+function node(tag,text,cls){const e=document.createElement(tag);if(text!==undefined)e.textContent=String(text);if(cls)e.className=cls;return e;}
+function button(text,fn){const b=node('button',text);b.type='button';b.addEventListener('click',()=>run(b,fn));return b;}
+async function run(b,fn){b.disabled=true;try{await fn();}catch(e){report(e);}finally{b.disabled=false;}}
+function params(values){return new URLSearchParams(Object.entries(values).filter(([,v])=>v!==null&&v!==undefined&&v!=='')).toString();}
+function context(){return {project:$('project').value.trim(),machine:$('machine').value.trim(),account:$('account').value.trim(),mailbox:$('mailbox').value.trim()};}
+function accountPath(suffix){const id=context().account;return id?`/api/accounts/${encodeURIComponent(id)}/api/account${suffix}`:`/api/account${suffix}`;}
+async function api(path,method='GET',body){
+ if(!token&&!cookieAuth)throw new ApiError('authentication_required',401);
+ let response;try{response=await fetch(path,{method,headers:{...(token?{Authorization:'Bearer '+token}:{}),...(!token&&body!==undefined?{'x-csrf-token':csrf}:{}),...(body===undefined?{}:{'Content-Type':'application/json'})},credentials:token?'omit':'same-origin',mode:'same-origin',redirect:'error',referrerPolicy:'no-referrer',signal:AbortSignal.timeout(15000),...(body===undefined?{}:{body:JSON.stringify(body)})});}catch(e){throw new ApiError(e.name==='TimeoutError'?'request_timeout':'network_unavailable');}
+ let data;try{data=await response.json();}catch{throw new ApiError('invalid_server_response',response.status);}
+ if(!response.ok){if(response.status===401)disconnect();throw new ApiError(typeof data.error==='string'?data.error:'request_failed',response.status);}
+ return data;
+}
+function disconnect(){token='';cookieAuth=false;csrf='';revision++;$('dashboard').hidden=true;$('connection').hidden=false;$('token').value='';$('state').textContent='Disconnected';$('results').replaceChildren();$('detail').replaceChildren();}
+function stamp(value){if(value===null||value===undefined)return 'Not reported';const d=new Date(value);return Number.isNaN(d.valueOf())?'Not reported':d.toLocaleString();}
+function card(title,meta,body){const c=node('article',undefined,'card');c.append(node('h3',title),node('p',meta,'meta'));if(body!==undefined)c.append(node('p',body,'pre'));return c;}
+function detail(title,data){$('detail').replaceChildren(node('h3',title),node('pre',JSON.stringify(data,null,2)));$('details').hidden=false;$('details').open=true;$('details').scrollIntoView({block:'nearest'});}
+async function projects(after=null){const data=await api('/api/repos?'+params({status:'active',limit:50,after}));if(!Array.isArray(data.items))throw new ApiError('invalid_project_page');if(!after)$('projects').replaceChildren();for(const r of data.items){const o=node('option');o.value=r.canonical_name;$('projects').append(o);}projectsNext=data.next??null;$('moreProjects').hidden=!projectsNext;if(!$('project').value&&data.items[0])$('project').value=data.items[0].canonical_name;}
+function select(view){tab=view;page=null;for(const b of document.querySelectorAll('nav button'))b.setAttribute('aria-pressed',String(b.dataset.view===tab));$('title').textContent=names[tab];$('createIntake').hidden=tab!=='intakes';$('compose').hidden=tab!=='inbox';$('details').hidden=true;return load();}
+function draw(items){
+ if(!items.length){$('results').append(node('p','No records in this page.','muted'));return;}
+ for(const item of items){
+  let c;
+  if(tab==='intakes'){c=card(item.title||item.id,`${item.status||'Unreported'} · ${stamp(item.updated_at)}`,item.session_id?'Session: '+item.session_id:undefined);c.append(button('Open intake',async()=>detail('Intake',await api(`/api/intakes/${encodeURIComponent(item.id)}?`+params({project:context().project})))));}
+  if(tab==='sessions'){c=card(item.title||item.id,`${item.state||'Unreported'} · ${item.engine||'Engine unreported'} · ${stamp(item.updated_at)}`,item.id);c.append(button('Open session',async()=>detail('Session',await api(`/api/sessions/${encodeURIComponent(item.id)}?`+params({machine_id:context().machine})))));}
+  if(tab==='fleet'){c=card(item.alias||item.id,`${item.connected===true?'Connected':item.connected===false?'Disconnected':'State unreported'} · ${item.os||''} ${item.arch||''}`,`Last seen: ${stamp(item.last_seen)}`);c.append(button('View sessions',async()=>{$('machine').value=item.id;await select('sessions');}));}
+  if(tab==='inbox'){c=card(item.sender||'Sender unreported',`${item.state||'Unreported'} · ${stamp(item.created_at)}`,item.body);const actions=node('div',undefined,'actions');for(const [stage,label] of [['read','Mark read'],['ack','Acknowledge'],['accept','Accept'],['complete','Complete']])actions.append(button(label,async()=>{if(!Number.isSafeInteger(item.epoch))throw new ApiError('invalid_message_epoch');await api(`/api/messages/${encodeURIComponent(item.id)}/${stage}?`+params({mailbox:context().mailbox}),'POST',{epoch:item.epoch});await load();}));actions.append(button('Delivery status',async()=>detail('Message status',await api(`/api/messages/${encodeURIComponent(item.id)}/status?`+params({mailbox:context().mailbox})))));c.append(actions);}
+  if(c)$('results').append(c);
+ }
+}
+async function load(){
+ const request=++revision,view=tab,ctx=context();$('first').hidden=view==='quota';$('next').hidden=true;$('results').replaceChildren();$('details').hidden=true;
+ if(view==='intakes'&&!ctx.project){say('Choose a project to view its intakes.');return;}
+ if(view==='sessions'&&!ctx.machine){say('Choose a machine, or open one from Fleet.');return;}
+ say('Loading '+names[view].toLowerCase()+'...');$('results').setAttribute('aria-busy','true');
+ try{
+  if(view==='quota'){
+   const data=await api(accountPath('/quota'));if(request!==revision)return;
+   const a=data.account,q=data.quota;
+   $('results').append(card(a?.provider||'Account',data.fresh?'Fresh quota observation':'Quota unavailable or stale',q?`${q.remaining}% remaining · captured ${stamp(q.captured_at)} · valid until ${stamp(q.valid_until)}`:'No quota observation available.'));
+   if(a)$('results').append(card('Capacity',`${a.occupied} occupied / ${a.capacity} total`,a.enabled?'Enabled':'Disabled'));
+   const actions=node('div',undefined,'actions');actions.append(button('Reset grants',async()=>detail('Reset grants',await api(accountPath('/resets')))),button('Quota alerts',async()=>detail('Quota alerts',await api(accountPath('/alerts')))));$('results').append(actions);say('Loaded quota.');return true;
+  }
+  const paths={intakes:'/api/intakes?'+params({project:ctx.project,limit:25,cursor:page}),sessions:'/api/sessions?'+params({machine_id:ctx.machine,limit:25,after:page}),fleet:'/api/fleet?'+params({limit:25,after:page}),inbox:'/api/messages?'+params({mailbox:ctx.mailbox,limit:25,cursor:page})};
+  const data=await api(paths[view]);if(request!==revision)return;if(!Array.isArray(data.items))throw new ApiError('invalid_list_response');draw(data.items);$('next').hidden=!data.next;$('next').dataset.cursor=data.next??'';say(`${data.items.length} ${names[view].toLowerCase()} loaded${data.next?' · more available':''}.`);return true;
+ }catch(e){if(request===revision)report(e);return false;}finally{if(request===revision)$('results').setAttribute('aria-busy','false');}
+}
+$('connect').addEventListener('submit',async event=>{
+ event.preventDefault();const candidate=$('token').value.trim();if(!/^[^\s]{32,256}$/.test(candidate)){say('Enter a valid access token (32-256 characters).',true);return;}
+ cookieAuth=false;csrf='';token=candidate;$('token').value='';await run($('connectButton'),async()=>{try{await projects();$('connection').hidden=true;$('dashboard').hidden=false;$('state').textContent='Connected';await select(tab);}catch(e){disconnect();throw e;}});
+});
+$('disconnect').addEventListener('click',()=>run($('disconnect'),async()=>{if(cookieAuth)await api('/auth/logout','POST',{});disconnect();say('Disconnected.');$('token').focus();}));
+$('refresh').addEventListener('click',()=>run($('refresh'),load));
+$('moreProjects').addEventListener('click',()=>run($('moreProjects'),()=>projects(projectsNext)));
+for(const b of document.querySelectorAll('nav button'))b.addEventListener('click',()=>run(b,()=>select(b.dataset.view)));
+for(const id of ['project','machine','account','mailbox'])$(id).addEventListener('change',()=>{page=null;load();});
+$('next').addEventListener('click',()=>{page=$('next').dataset.cursor;load();});$('first').addEventListener('click',()=>{page=null;load();});
+for(const [formId,build] of [['intakeForm',form=>({title:form.elements.title.value,text:form.elements.text.value,acceptance_criteria:form.elements.criteria.value.split('\n').map(s=>s.trim()).filter(Boolean)})],['messageForm',form=>({recipient:form.elements.recipient.value.trim(),body:form.elements.body.value})]]){
+ const form=$(formId);form.addEventListener('input',()=>{delete form.dataset.key;});
+ form.addEventListener('submit',event=>{event.preventDefault();run(form.querySelector('button[type=submit]'),async()=>{
+  const body=build(form);if(formId==='intakeForm'&&!context().project)throw new ApiError('project_required');
+  const key=form.dataset.key||(form.dataset.key=crypto.randomUUID());body.key=key;
+  const path=formId==='intakeForm'?'/api/intakes?'+params({project:context().project}):'/api/messages?'+params(context().mailbox.startsWith('agent:')?{as:context().mailbox}:{mailbox:context().mailbox});
+  await api(path,'POST',body);form.reset();delete form.dataset.key;page=null;const refreshed=await load(),done=formId==='intakeForm'?'Intake created.':'Message sent.';say(done+(refreshed===false?' '+$('notice').textContent:''),refreshed===false);
+ });});
+}
+(async()=>{try{const response=await fetch('/auth/session',{credentials:'same-origin',redirect:'error',headers:{Accept:'application/json'}});if(!response.ok||token)return;const session=await response.json();if(typeof session.csrf_token!=='string')return;cookieAuth=true;csrf=session.csrf_token;await projects();$('connection').hidden=true;$('dashboard').hidden=false;$('state').textContent='Signed in';await select(tab);}catch{}})();
+</script></body></html>

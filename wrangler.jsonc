@@ -1,55 +1,74 @@
+// Maintenance is the default. Bootstrap mode allows only auth, registry,
+// account/quota setup and host pairing/heartbeats; dispatch stays disabled.
+// The 15-minute cron is a no-op until explicit active mode.
+// Install HUB2_CREDENTIAL_KEY, HUB2_BUDGET_ENVELOPES and alert secrets separately.
+// 500ms is a configured policy, not a verified strict runtime upper bound.
+// Active mode may add ONLY the approved 15-minute budget-alert cron; maintenance has none.
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "agent-hub",
-  "main": "src/worker.ts",
-  "compatibility_date": "2024-04-05",
+  "main": "hub2/production-worker.ts",
+  "compatibility_date": "2026-11-01",
   "compatibility_flags": [
-    "nodejs_compat"
+    "nodejs_als"
   ],
+  "workers_dev": false,
   "assets": {
-    "directory": "./public",
+    "directory": "hub2/public",
     "binding": "ASSETS",
-    "run_worker_first": true,
-    "html_handling": "none"
+    "run_worker_first": true
   },
   "durable_objects": {
     "bindings": [
       {
-        "name": "HUB",
-        "class_name": "Hub"
+        "name": "CONTROL",
+        "class_name": "ControlDO"
+      },
+      {
+        "name": "PROJECTS",
+        "class_name": "ProjectDO"
+      },
+      {
+        "name": "MACHINES",
+        "class_name": "MachineDO"
+      },
+      {
+        "name": "ACCOUNTS",
+        "class_name": "AccountDO"
+      },
+      {
+        "name": "MAILBOXES",
+        "class_name": "MailboxDO"
+      },
+      {
+        "name": "BUDGET",
+        "class_name": "BudgetDO"
       }
     ]
   },
-  "migrations": [
-    {
-      "tag": "v1",
-      "new_sqlite_classes": [
-        "Hub"
-      ]
-    }
-  ],
+  "exports": {
+    "Hub": { "type": "durable-object", "state": "deleted" },
+    "ControlDO": { "type": "durable-object", "storage": "sqlite" },
+    "ProjectDO": { "type": "durable-object", "storage": "sqlite" },
+    "MachineDO": { "type": "durable-object", "storage": "sqlite" },
+    "AccountDO": { "type": "durable-object", "storage": "sqlite" },
+    "MailboxDO": { "type": "durable-object", "storage": "sqlite" },
+    "BudgetDO": { "type": "durable-object", "storage": "sqlite" }
+  },
   "triggers": {
-    "crons": [
-      "*/30 * * * *",
-      "*/5 * * * *"
-    ]
+    "crons": ["*/15 * * * *"]
+  },
+  "limits": {
+    "cpu_ms": 500,
+    "subrequests": 64
   },
   "vars": {
-    "HUB_ALERT_TO": "",
-    "HUB_ALERT_WEBHOOK": "https://dapier.dtcdev.click/hooks/webhook/dev",
-    "HUB_ADDITIONAL_ADMINS": "alexey@datatalks.club,orin@datatalks.club",
+    "HUB2_RELEASE_MODE": "maintenance",
     "AUTH_CLIENT_ID": "1tplqm9l6q6545mrk0gjv6eaeh",
     "AUTH_ISSUER": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_H7nJu52Bs",
     "AUTH_BASE_URL": "https://auth.dtcdev.click",
     "AUTH_CALLBACK_URL": "https://hub.dtcdev.click/auth/callback",
-    "AUTH_CALLBACK_URLS": "https://hub.dtcdev.click/auth/callback,https://agent-hub.cloudflare-ai-agent-de9ca0.workers.dev/auth/callback,http://localhost:19130/auth/callback",
     "AUTH_JWKS_URL": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_H7nJu52Bs/.well-known/jwks.json",
-    "HUB_INTAKE_QUEUE_ENABLED": "true",
-    "HUB_INTAKE_QUEUE_PROJECTS": "*",
-    "HUB_INTAKE_QUEUE_MAX_INFLIGHT": "auto",
-    "HUB_INTAKE_QUEUE_MAX_PER_PROJECT": "auto"
-  },
-  "dev": {
-    "port": 19130
+    "HUB_ADMINS": "alexey@datatalks.club,orin@datatalks.club"
   }
 }
