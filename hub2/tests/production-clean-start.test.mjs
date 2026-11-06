@@ -18,6 +18,7 @@ for (const binding of config.durable_objects.bindings) {
 }
 assert.equal(Object.keys(config.vars).some(key => /HUB1_|HUB2_IMPORT|DEV_OPERATOR_TOKEN/.test(key)), false);
 assert.equal(config.vars.HUB2_RELEASE_MODE, 'maintenance', 'first deployment keeps dispatch disabled');
+assert.equal(config.workers_dev, true, 'production deployment keeps the approved Worker route enabled');
 assert.deepEqual(config.vars, {
   HUB2_RELEASE_MODE: 'maintenance',
   AUTH_CLIENT_ID: config.vars.AUTH_CLIENT_ID,

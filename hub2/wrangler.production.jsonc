@@ -12,7 +12,8 @@
   "compatibility_flags": [
     "nodejs_als"
   ],
-  "workers_dev": false,
+  // Preserve the explicitly re-enabled production workers.dev route on deploy.
+  "workers_dev": true,
   "assets": {
     "directory": "./public",
     "binding": "ASSETS",

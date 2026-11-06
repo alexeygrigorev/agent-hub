@@ -12,7 +12,7 @@
   "compatibility_flags": [
     "nodejs_als"
   ],
-  "workers_dev": false,
+  "workers_dev": true,
   "assets": {
     "directory": "hub2/public",
     "binding": "ASSETS",
