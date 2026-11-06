@@ -8,7 +8,7 @@ Status: release gate in progress, 6 November 2026. The clean-start source passed
 - The primary alert fires once when Hub variable cost is **strictly greater than USD 0.03 in a UTC day**. Its persisted record must include the UTC day, accumulated/estimated USD, category breakdown, observation timestamp, metric coverage and provider-data lag. A threshold alert does not stop work.
 - Approved enforced ceiling: **USD 0.25 per Hub UTC day**, with **USD 0.01 reserved** for status, alert delivery, stop and recovery. The primary alert remains **USD 0.03 per UTC day**. The local BudgetDO/Worker gate must use this default and audited recovery on the exact release source; production is not active until the complete gate passes.
 - Assume all monthly included allowances are exhausted. Use marginal paid rates for projections. The shared fixed USD 5 Workers subscription is excluded from the Hub variable-cost alert and is reported separately.
-- The 6,000 product-SLOC target is tracked independently from operation and money budgets. Alexey explicitly approved 7,853 product SLOC as the maximum for this release on 2026-11-05, superseding the obsolete 6,362 release maximum. CI rejects any growth above 7,853; do not minify or delete retained behavior to meet the target.
+- The 6,000 product-SLOC target is tracked independently from operation and money budgets. On 2026-11-06 Alexey explicitly approved the exact 8,962 product-SLOC tree, including Resource Manager, as the maximum for this release, superseding the prior 7,853 maximum and obsolete 6,362 maximum. CI rejects growth above 8,962; do not minify or delete retained behavior to meet the target.
 
 ## Billable dimensions and rates
 

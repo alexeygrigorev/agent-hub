@@ -148,7 +148,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--limit", type=int, default=6000, help="product SLOC target")
     parser.add_argument(
-        "--accepted-baseline", type=int, default=7853,
+        "--accepted-baseline", type=int, default=8962,
         help="Alexey-approved maximum product SLOC for the current release; growth above it fails",
     )
     parser.add_argument("--json", action="store_true", help="emit machine-readable report")
@@ -184,7 +184,7 @@ def main() -> int:
         "within_product_limit": product["sloc"] <= accepted_maximum and host_runtime_complete,
         "host_runtime_complete": host_runtime_complete,
         "missing_host_files": missing_host_files,
-        "policy": "6000 product SLOC remains the architecture target. Alexey explicitly approved 7853 product SLOC as the maximum baseline for this release on 2026-11-05, superseding the obsolete 6362 maximum. The accepted over-target amount remains visible; any growth above 7853 fails this release gate and needs a new decision. SLOC is nonblank/noncomment physical source lines; physical totals are reported separately. No source is minified. Test-only harnesses and CI verification are separate categories, never silently omitted from this report.",
+        "policy": "6000 product SLOC remains the architecture target. Alexey approved the exact 8962 product-SLOC tree, including Resource Manager, as the maximum for this release on 2026-11-06; this supersedes the prior 7853 release maximum and the obsolete 6362 maximum. Any growth above 8962 fails this release gate and needs a new decision. SLOC is nonblank/noncomment physical source lines; physical totals are reported separately. No source is minified. Test-only harnesses and CI verification are separate categories, never silently omitted from this report.",
         "excluded": ["documentation", "hidden local files", "generated caches/build/dist/node_modules", "Python *.egg-info packaging metadata", "binary assets"],
     }
     if args.json:
