@@ -12,7 +12,7 @@
   "compatibility_flags": [
     "nodejs_als"
   ],
-  "workers_dev": true,
+  "workers_dev": false,
   "assets": {
     "directory": "./public",
     "binding": "ASSETS",

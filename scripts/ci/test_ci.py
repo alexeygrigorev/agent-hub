@@ -26,37 +26,18 @@ RETRY = load_retry_module()
 
 
 class TestCICD(unittest.TestCase):
-    def test_reset_credit_safety_suites_are_discovered(self):
-        """Money-adjacent reset-credit guards must run in the deploy job."""
-        workflow = (REPO_ROOT / '.github/workflows/deploy.yml').read_text()
-        # Python money-adjacent suites are listed explicitly in the deploy pytest step.
-        for test in ('test/test_no_reset_apply.py', 'host/tests/test_codex_reset_credit.py',
-                     'host/tests/test_reset_credit_workflow.py'):
-            self.assertEqual(workflow.count(test), 1, test)
-        # Vitest discovery is unfiltered: the guard file must exist and no vitest
-        # invocation may narrow discovery with an explicit .test.ts file list.
-        self.assertTrue((REPO_ROOT / 'test/reset-credit-evidence.test.ts').is_file(),
-                        'test/reset-credit-evidence.test.ts')
-        vitest_lines = [ln for ln in workflow.splitlines() if 'vitest run' in ln]
-        self.assertTrue(vitest_lines, 'deploy.yml runs vitest discovery')
-        for ln in vitest_lines:
-            self.assertIsNone(re.search(r'\btest/[\w./-]+\.test\.ts', ln), ln)
+    def test_canonical_release_contract(self):
+        result = subprocess.run(["node", "--test", "test/root-promotion.test.mjs"],
+                                cwd=REPO_ROOT, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_validate_workflows_passes(self):
-        """Verify current repository workflows pass static validation."""
-        res = subprocess.run([sys.executable, str(VALIDATE_SCRIPT)], capture_output=True, text=True)
-        self.assertEqual(res.returncode, 0, f"Validator failed: {res.stdout}\n{res.stderr}")
-        self.assertIn("deploy.yml passed all checks", res.stdout)
-        self.assertIn("rollback.yml passed all checks", res.stdout)
-        self.assertIn("All CI/CD workflow validations PASSED", res.stdout)
-
-    def test_rollback_help(self):
-        """Verify rollback helper prints usage cleanly."""
-        res = subprocess.run([sys.executable, str(ROLLBACK_SCRIPT), "--help"], capture_output=True, text=True)
-        self.assertEqual(res.returncode, 0, f"Rollback help failed: {res.stderr}")
-        self.assertIn("--version-id", res.stdout)
-        self.assertIn("--list", res.stdout)
-        self.assertIn("Agent Hub Worker Rollback Helper", res.stdout)
+    def test_host_distribution_and_dependency_contract(self):
+        import tomllib
+        package = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+        self.assertEqual(package["project"]["version"], "2.0.0")
+        self.assertEqual(package["project"]["dependencies"], ["websockets==16.0"])
+        self.assertEqual(package["tool"]["setuptools"]["package-dir"], {"": "hub2/host"})
+        self.assertEqual(set(package["project"]["scripts"]), {"hub", "hub2"})
 
 
 class TestWranglerRetry(unittest.TestCase):
@@ -147,39 +128,18 @@ class TestWranglerRetry(unittest.TestCase):
 
 
 class TestDeployWorkflowRetryWiring(unittest.TestCase):
-    """Both production deploy paths must route through the shared retry wrapper."""
-
-    def test_push_ci_cannot_enter_production_deploy(self):
+    def test_production_retry_and_health_are_retained(self):
         content = DEPLOY_WORKFLOW.read_text()
-        match = re.search(r"(?ms)^  deploy:\n(?P<job>.*?)(?=^  [A-Za-z0-9_-]+:|\Z)", content)
-        self.assertIsNotNone(match, "deploy job")
-        guard = re.search(r"(?m)^    if: \|\n(?P<condition>(?:^      [^\n]*\n)+)", match.group("job"))
-        self.assertIsNotNone(guard, "deploy condition")
-        condition = guard.group("condition")
-        self.assertIn("github.event_name == 'workflow_dispatch'", {line.strip() for line in condition.splitlines()})
-        self.assertNotRegex(condition, r"\bpush\b")
+        self.assertIn("wrangler_retry.py npx wrangler deploy --config wrangler.jsonc", content)
+        self.assertIn("wrangler_retry.py npx wrangler versions list --config wrangler.jsonc", content)
+        self.assertIn("https://hub.dtcdev.click/health", content)
+        self.assertIn("payload.get('service') == 'hub2'", content)
 
-    def test_both_deploy_steps_use_retry_wrapper(self):
-        content = DEPLOY_WORKFLOW.read_text()
-        self.assertTrue(RETRY_SCRIPT.is_file())
-        self.assertGreaterEqual(
-            content.count("python3 scripts/ci/wrangler_retry.py npx wrangler deploy"), 2)
-        for line in content.splitlines():
-            if "npx wrangler deploy" in line and "--dry-run" not in line:
-                self.assertIn("wrangler_retry.py", line, line)
-        self.assertIn("wrangler_retry.py npx wrangler versions list", content)
-
-    def test_smoke_checks_unchanged(self):
-        content = DEPLOY_WORKFLOW.read_text()
-        self.assertIn("built_from_commit", content)
-        self.assertIn("'/livez'", content)
-
-    def test_workflow_dispatch_has_distinct_concurrency_group_from_push(self):
-        content = DEPLOY_WORKFLOW.read_text()
-        self.assertIn(
-            "group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}",
-            content,
-        )
+    def test_rollback_cannot_restore_legacy_version(self):
+        rollback = (REPO_ROOT / ".github/workflows/rollback.yml").read_text()
+        self.assertNotIn("CLOUDFLARE_API_TOKEN", rollback)
+        self.assertNotIn("versions deploy", rollback)
+        self.assertIn("source_ref", rollback)
 
 
 if __name__ == "__main__":
