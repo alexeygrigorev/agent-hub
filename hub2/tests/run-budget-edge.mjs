@@ -51,12 +51,13 @@ export default {async fetch(r,env){const u=new URL(r.url);
  if(u.pathname==='/_fixture/split-envelope'){
   const raw=env.HUB2_SPLIT_TEST_ENVELOPE,mid=Math.floor(raw.length/2),original=env.BUDGET;
   const encoder=new TextEncoder();if(encoder.encode(raw.slice(0,mid)).length>5000||encoder.encode(raw.slice(mid)).length>5000)throw Error('budget envelope chunks exceed 5KB');
-  const make=(tail)=>({...env,HUB2_BUDGET_ENVELOPES:raw.slice(0,mid),...(tail?{HUB2_BUDGET_ENVELOPES_PART2:raw.slice(mid)}:{}),BUDGET:{idFromName:()=>original.idFromName('split-envelope'),get:()=>original.get(original.idFromName('split-envelope'))}});
+  const make=(tail)=>({...env,HUB2_RELEASE_MODE:'maintenance',HUB2_BUDGET_ENVELOPES:raw.slice(0,mid),...(tail?{HUB2_BUDGET_ENVELOPES_PART2:raw.slice(mid)}:{}),BUDGET:{idFromName:()=>original.idFromName('split-envelope'),get:()=>original.get(original.idFromName('split-envelope'))}});
   let handled=false;
   const valid=await budgetedPublicRequest(new Request('https://public/api/repos'),make(true),async()=>undefined,async()=>{handled=true;return Response.json({ok:true});});
   let missingHandled=false;
   const missing=await budgetedPublicRequest(new Request('https://public/api/repos'),make(false),async()=>undefined,async()=>{missingHandled=true;return Response.json({ok:true});});
-  return Response.json({valid:valid.status,handled,missing:missing.status,missing_error:await missing.json().then(v=>v.error),missing_handled:missingHandled});
+  const validSingle=env.HUB2_BUDGET_ENVELOPES,withoutTail=await budgetedPublicRequest(new Request('https://public/api/repos'),{...env,HUB2_RELEASE_MODE:'maintenance',HUB2_BUDGET_ENVELOPES:validSingle},async()=>undefined,async()=>Response.json({ok:true})),withoutHead=await budgetedPublicRequest(new Request('https://public/api/repos'),{...env,HUB2_RELEASE_MODE:'maintenance',HUB2_BUDGET_ENVELOPES:undefined,HUB2_BUDGET_ENVELOPES_PART2:validSingle},async()=>undefined,async()=>Response.json({ok:true}));
+  return Response.json({valid:valid.status,handled,missing:missing.status,missing_error:await missing.json().then(v=>v.error),missing_handled:missingHandled,valid_single_without_tail:withoutTail.status,valid_single_without_head:withoutHead.status});
  }
  if(u.pathname==='/_fixture/invalid-kind-plan'){
   const p=JSON.parse(env.HUB2_BUDGET_ENVELOPES),base={...p.normal};p.normal.by_kind={not_a_budget_kind:base};
@@ -211,7 +212,7 @@ try{
  const blocked=await call('/_fixture/deny-before-fanout');assert.equal(blocked.status,200);assert.equal(blocked.data.status,429);assert.equal(blocked.data.body.error,'budget_paused');assert(Number(blocked.data.retry_after)>0);
  assert.deepEqual(blocked.data.after,blocked.data.before,'ceiling denies before authentication fanout');
  const unknown=await call('/_fixture/unknown','POST',{});assert.equal(unknown.status,503);assert.equal(unknown.data.error,'budget_metrics_unknown');
- const split=await call('/_fixture/split-envelope','POST',{});assert.equal(split.status,200);assert.equal(split.data.valid,200);assert.equal(split.data.handled,true);assert.equal(split.data.missing,503);assert.equal(split.data.missing_error,'budget_metrics_unknown');assert.equal(split.data.missing_handled,false,'missing envelope chunk refuses before effect');
+ const split=await call('/_fixture/split-envelope','POST',{});assert.equal(split.status,200);assert.equal(split.data.valid,200);assert.equal(split.data.handled,true);assert.equal(split.data.missing,503);assert.equal(split.data.missing_error,'budget_metrics_unknown');assert.equal(split.data.missing_handled,false,'missing envelope chunk refuses before effect');assert.equal(split.data.valid_single_without_tail,503,'production mode requires the second binding even with a complete plan in the first');assert.equal(split.data.valid_single_without_head,503,'production mode requires the first binding even with a complete plan in the second');
  const beforeInvalid=(await call('/_fixture/stats')).data;
  const invalidKind=await call('/_fixture/invalid-kind-plan','POST',{});assert.equal(invalidKind.status,503);assert.equal(invalidKind.data.error,'budget_metrics_unknown','unknown per-kind envelope fails closed');
  assert.deepEqual((await call('/_fixture/stats')).data,beforeInvalid,'invalid per-kind envelope refuses before auth fanout');

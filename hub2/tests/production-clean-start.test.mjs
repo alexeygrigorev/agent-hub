@@ -120,7 +120,8 @@ const budget = namespace(async input => {
   });
 const accounts = namespace(async input => receiptResponse(input instanceof Request ? input : new Request(input), {configured: true}));
 const machines = namespace(async input => receiptResponse(input instanceof Request ? input : new Request(input), {heartbeat: true}));
-const bootstrapEnv = {HUB2_RELEASE_MODE: 'bootstrap', HUB2_BUDGET_ENVELOPES: bootstrapEnvelope, CONTROL: control, BUDGET: budget, ACCOUNTS: accounts, MACHINES: machines};
+const bootstrapMid = Math.floor(bootstrapEnvelope.length / 2);
+const bootstrapEnv = {HUB2_RELEASE_MODE: 'bootstrap', HUB2_BUDGET_ENVELOPES: bootstrapEnvelope.slice(0, bootstrapMid), HUB2_BUDGET_ENVELOPES_PART2: bootstrapEnvelope.slice(bootstrapMid), CONTROL: control, BUDGET: budget, ACCOUNTS: accounts, MACHINES: machines};
 const health = await production.fetch(new Request('https://synthetic.invalid/health'), bootstrapEnv);
 assert.equal(health.status, 200);
 assert.deepEqual(await health.json(), {status: 'bootstrap', dispatch_enabled: false});
