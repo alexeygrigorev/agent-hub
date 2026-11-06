@@ -30,7 +30,7 @@ function validPlan(p:any):p is Plan{
 }
 function planFor(env:Hub2Env,safety:boolean,kind:BudgetKind):Plan|undefined{
  try{
-  const all=JSON.parse(env.HUB2_BUDGET_ENVELOPES||'null'),set=all?.[safety?'safety':'normal'] as PlanSet|undefined;
+  const all=JSON.parse((env.HUB2_BUDGET_ENVELOPES||'')+(env.HUB2_BUDGET_ENVELOPES_PART2||'')||'null'),set=all?.[safety?'safety':'normal'] as PlanSet|undefined;
   if(all?.version!==1||!set)return;
   let p:Plan|undefined=set;
   if(set.by_kind!==undefined){

@@ -22,7 +22,7 @@ export interface Hub2Env {
   ACCOUNTS: DurableObjectNamespace;
   MAILBOXES: DurableObjectNamespace;
   BUDGET: DurableObjectNamespace;
-  HUB2_BUDGET_ENVELOPES?: string;
+  HUB2_BUDGET_ENVELOPES?: string; HUB2_BUDGET_ENVELOPES_PART2?: string;
   HUB_ALERT_WEBHOOK?: string;
   HUB_ALERT_WEBHOOK_TOKEN?: string;
   HUB2_BOOTSTRAP_TOKEN?: string;

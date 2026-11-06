@@ -99,9 +99,13 @@ call count and wall deadline, and retains reservations after ambiguous effects.
 It conservatively settles the configured envelope with coverage labelled
 upper_bound; it does not report these estimates as observed CPU or provider bills.
 
-HUB2_BUDGET_ENVELOPES has no production fallback. It is JSON with version:1 and
-normal/safety plans. Each plan requires all fourteen BudgetDO metric units,
-max_do_calls (1?64), max_wall_ms (100?60000), and a provenance description.
+HUB2_BUDGET_ENVELOPES and HUB2_BUDGET_ENVELOPES_PART2 have no production
+fallback. Concatenate their exact UTF-8 contents, in that order, to obtain one
+JSON document with version:1 and normal/safety plans. Split the document at a
+UTF-8 character boundary so each value is at most 5,000 bytes. Both bindings
+must be installed; a missing, truncated, or invalid pair fails closed before
+effects. Each plan requires all fourteen BudgetDO metric units, max_do_calls
+(1?64), max_wall_ms (100?60000), and a provenance description.
 CPU, DO duration, SQLite reads/writes and persistent storage cannot silently be
 zero/missing. Production sizing/provenance remains an operator rollout gate;
 the checked-in test envelope is explicitly synthetic and is never loaded by

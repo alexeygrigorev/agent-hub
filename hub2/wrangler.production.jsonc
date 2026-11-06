@@ -1,7 +1,7 @@
 // Maintenance is the default. Bootstrap mode allows only auth, registry,
 // account/quota setup and host pairing/heartbeats; dispatch stays disabled.
 // The 15-minute cron is a no-op until explicit active mode.
-// Install HUB2_CREDENTIAL_KEY, HUB2_BUDGET_ENVELOPES and alert secrets separately.
+// Install HUB2_CREDENTIAL_KEY, both HUB2_BUDGET_ENVELOPES parts and alert secrets separately.
 // 500ms is a configured policy, not a verified strict runtime upper bound.
 // Active mode may add ONLY the approved 15-minute budget-alert cron; maintenance has none.
 {
