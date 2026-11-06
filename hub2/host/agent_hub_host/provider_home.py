@@ -359,7 +359,9 @@ def home_environment(home, provider):
 
 
 def clean_provider_environment(source=None):
-    prefixes = ('HUB', 'AGENT_HUB_', 'OPENCODE_', 'ANTHROPIC_', 'OPENAI_', 'CODEX_', 'CLAUDE_', 'ZAI_', 'GO_API_')
+    # AWS_ covers ambient cloud credentials that would otherwise leak into the
+    # native SDK environment alongside the provider keys.
+    prefixes = ('HUB', 'AGENT_HUB_', 'OPENCODE_', 'ANTHROPIC_', 'OPENAI_', 'CODEX_', 'CLAUDE_', 'ZAI_', 'GO_API_', 'AWS_')
     return {key: value for key, value in (os.environ if source is None else source).items() if not key.startswith(prefixes)}
 
 

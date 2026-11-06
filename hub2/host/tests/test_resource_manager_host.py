@@ -348,17 +348,22 @@ class SpawnEnvironmentTest(unittest.TestCase):
     def test_fixed_credentials_always_stripped_provider_prefixes_only_with_central_home(self):
         hostile = {'OPENAI_API_KEY': 'ambient', 'ANTHROPIC_AUTH_TOKEN': 'ambient',
                    'ZAI_API_KEY': 'ambient', 'HUB2_TOKEN': 'host-token', 'HUB2_SERVER': 'https://x.invalid',
-                   'HUB2_LAUNCH_CONTEXT': 'stale', 'OPENCODE_API_KEY': 'ambient', 'GO_API_KEY': 'ambient',
+                   'HUB2_LAUNCH_CONTEXT': 'stale', 'HUB2_CONFIG': 'stale-config', 'OPENCODE_API_KEY': 'ambient',
+                   'GO_API_KEY': 'ambient', 'AWS_ACCESS_KEY_ID': 'ambient-aws',
+                   'AWS_SECRET_ACCESS_KEY': 'ambient-aws-secret', 'AWS_SESSION_TOKEN': 'ambient-session',
                    'PATH': '/bin', 'HOME': '/home/test'}
         with mock.patch.dict(os.environ, hostile, clear=True):
             plain = nl.spawn_environment(False)
             self.assertNotIn('OPENAI_API_KEY', plain)
             self.assertNotIn('HUB2_TOKEN', plain)
             self.assertNotIn('HUB2_LAUNCH_CONTEXT', plain)
+            self.assertNotIn('HUB2_CONFIG', plain)
+            self.assertNotIn('AWS_ACCESS_KEY_ID', plain)
             self.assertIn('PATH', plain)
             central = nl.spawn_environment(True)
             for key in ('OPENAI_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ZAI_API_KEY', 'OPENCODE_API_KEY',
-                        'GO_API_KEY', 'HUB2_TOKEN', 'HUB2_SERVER'):
+                        'GO_API_KEY', 'HUB2_TOKEN', 'HUB2_SERVER', 'HUB2_CONFIG',
+                        'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN'):
                 self.assertNotIn(key, central)
             self.assertEqual(central.get('PATH'), '/bin')
 
@@ -411,3 +416,74 @@ class LaunchReceiptTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class CentralSpawnEnvironmentTest(unittest.TestCase):
+    """Regression: ambient credentials are sanitized in the spawn-client
+    environment BEFORE the trusted native home is added, and the child
+    receives the intended provider home through explicit --env entries."""
+
+    def test_central_spawn_passes_trusted_home_and_strips_ambient(self):
+        import json as json_module
+        import subprocess as subprocess_module
+        with tempfile.TemporaryDirectory() as workspace, tempfile.TemporaryDirectory() as providers_tmp:
+            files = {ph.PATHS['zai']: json_module.dumps(ProviderHomeTest.zai_bundle)}
+            manifest = ph.materialize(str(Path(providers_tmp) / 'providers'), 'zai-central', 'zai', 3,
+                                      files, 'glm-5.3-flash', timeout_seconds=3600)
+            home = Path(manifest).parent / 'home'
+            now = time.time() * 1000
+            admission = {'session_id': 'session-env', 'operation_id': 'operation-env', 'epoch': 1,
+                         'account_id': 'zai-central', 'launch_allowed': True, 'provider': 'zai',
+                         'credential_generation': 3, 'model': 'glm-5.3-flash',
+                         'runtime_deadline': int(now + 600000),
+                         'quota': {'source': 'provider:zai:generation:3', 'captured_at': int(now) - 1000,
+                                   'valid_until': int(now) + 60000, 'remaining': 88.0}}
+            client = mock.Mock()
+            client.request.return_value = admission
+            native_id = '9d9d7183-96cb-4c58-9f0e-b69e70f39b69'
+            created = int(time.time() * 1000) - 1000
+            calls = []
+
+            def runner(argv, **options):
+                calls.append((argv, options))
+                child = argv[argv.index('--') + 1:]
+                tag = argv[argv.index('--tag') + 1]
+                cwd = options['cwd']
+                process = {'id': native_id, 'tag': tag, 'workspace': cwd, 'engine': 'codex',
+                           'created_at_ms': created, 'command': child, 'phase': 'running',
+                           'deadline_ms': int(argv[argv.index('--deadline-ms') + 1])}
+                task = tag[len('task-'):]
+                artifact = Path(cwd) / '.local' / ('first-action-' + task + '.json')
+                artifact.parent.mkdir(parents=True, exist_ok=True)
+                artifact.write_text(json_module.dumps({'id': native_id, 'tag': tag, 'workspace': cwd,
+                    'command': child, 'phase': 'working', 'schema_version': 2, 'worker_pid': os.getpid() + 3,
+                    'updated_at_ms': created + 500}))
+                return subprocess_module.CompletedProcess(argv, 0, json_module.dumps(process), '')
+
+            adapter = nl.NativeLauncher({'routes': {'codex': {'provider': 'zai'}}, 'min_free_mem_mb': 0,
+                                         'memory_mb': 1500}, runner=runner)
+            spec = {'workspace': workspace, 'engine': 'codex', 'model': 'glm-5.3-flash',
+                    'prompt': 'ambient-vs-trusted regression', 'interactive': False, 'timeout_seconds': 600,
+                    'provider_home': manifest, 'client': client, 'session_id': 'session-env',
+                    'operation_id': 'operation-env', 'epoch': 1}
+            with mock.patch.dict(os.environ, {'OPENAI_API_KEY': 'ambient-openai',
+                                              'AWS_ACCESS_KEY_ID': 'ambient-aws',
+                                              'HUB2_CONFIG': 'stale-path',
+                                              'ANTHROPIC_AUTH_TOKEN': 'ambient-anthropic'}, clear=False):
+                receipt = adapter.launch('task-env', spec)
+            self.assertEqual(receipt['session_id'], native_id)
+            argv, options = calls[0]
+            env_pairs = {argv[i + 1].split('=', 1)[0]: argv[i + 1].split('=', 1)[1]
+                         for i in range(len(argv) - 1) if argv[i] == '--env'}
+            # Trusted native home paths survive and point at the materialized home.
+            self.assertEqual(env_pairs.get('CODEX_HOME'), str(home / '.zcodex'))
+            self.assertEqual(env_pairs.get('CLAUDE_CONFIG_DIR'), str(home / '.claude'))
+            self.assertEqual(env_pairs.get('ZCODE_HOME'), str(home / '.zcode'))
+            self.assertEqual(env_pairs.get('HOME'), str(home))
+            # Ambient credentials are absent from both the child --env set and the client env.
+            for key in ('OPENAI_API_KEY', 'AWS_ACCESS_KEY_ID', 'ANTHROPIC_AUTH_TOKEN', 'HUB2_CONFIG'):
+                self.assertNotIn(key, env_pairs, key)
+                self.assertNotIn(key, options['env'], key)
+            # The spawn client itself carries no ambient provider credential.
+            self.assertNotIn('CODEX_HOME', options['env'])
+            client.request.assert_called_once_with('POST', '/api/sessions/session-env/admission', mock.ANY)

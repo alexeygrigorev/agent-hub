@@ -124,9 +124,10 @@ def cpu_load_pct(sample=None):
 
 # Inherited credentials that must never reach aplexer or the native SDK,
 # where the ambient value would override the central private home.
-INHERITED_SECRET_VARS = ('HUB2_LAUNCH_CONTEXT', 'HUB2_TOKEN', 'HUB2_SERVER', 'HUB_TOKEN', 'HUB_JOB_TOKEN',
+INHERITED_SECRET_VARS = ('HUB2_LAUNCH_CONTEXT', 'HUB2_TOKEN', 'HUB2_SERVER', 'HUB2_CONFIG', 'HUB_TOKEN', 'HUB_JOB_TOKEN',
                          'HUB_CONFIG_FILE', 'OPENAI_API_KEY', 'CODEX_API_KEY', 'CODEX_AUTH_TOKEN', 'CODEX_BASE_URL',
-                         'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ZAI_API_KEY', 'GO_API_KEY',
+                         'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ZAI_API_KEY', 'GO_API_KEY', 'AWS_ACCESS_KEY_ID',
+                         'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN',
                          'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY')
 
 
@@ -534,8 +535,11 @@ class NativeLauncher:
             if chosen["provider"] != provider or chosen["model"] != specification["model"]:
                 raise RuntimeError("central_provider_changed_before_spawn")
             runtime_deadline = data["runtime_deadline"]
+            # Ambient credentials were already sanitized in spawn_environment
+            # (client env) BEFORE the trusted home is added; the child dict is
+            # built fresh and must keep the trusted CODEX_HOME/CLAUDE_CONFIG_DIR/
+            # OPENCODE_DB/ZCODE_HOME paths from native_environment intact.
             child_env.update(native_environment(specification["provider_home"]))
-            child_env = clean_provider_environment(child_env)
             child_env["TMPDIR"] = str(workspace / ".local" / "tmp" / task_id)
             child_env["APLEXER_RETAIN_RETIRED_OUTPUT"] = "1"
         if specification.get("child_config_file"):
