@@ -19,7 +19,10 @@ export function canonicalSizingEnvelopes(metrics=CANONICAL_COST_METRICS){
   // with explicit headroom; settled usage, not this temporary reservation,
   // determines the durable daily charge.
   resource_heartbeat:plan(2,250,250,320,72,128),
-  project_request:plan(4,250,250,256),claim_request:plan(3,250,250,192),
+  // CI Workerd observed the cold intake-create effect exceed 250ms. Fund the
+  // complete four-call path at 1.5s: 4 * 0.25GiB * 1500ms plus the 512GB-ms
+  // controller allowance is 2,012GB-ms, rounded up to 2,048.
+  project_request:plan(4,1500,250,2048),claim_request:plan(3,250,250,192),
   // CI Workerd observed the 750ms message bound expiring on the normal
   // first-send path. At 1.5s, four 0.25GiB namespace calls plus the
   // 512GB-ms controller allowance total 2,012GB-ms; round up to 2,048.
