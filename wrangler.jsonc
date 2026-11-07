@@ -1,9 +1,9 @@
-// Maintenance is the default. Bootstrap mode allows only auth, registry,
-// account/quota setup and host pairing/heartbeats; dispatch stays disabled.
-// The 15-minute cron is a no-op until explicit active mode.
+// Production is active after clean bootstrap and exact-head release checks.
+// Bootstrap mode allows only auth, registry, account/quota setup and host
+// pairing/heartbeats; maintenance mode serves health only.
 // Install HUB2_CREDENTIAL_KEY, HUB2_BUDGET_ENVELOPES and alert secrets separately.
 // 500ms is a configured policy, not a verified strict runtime upper bound.
-// Active mode may add ONLY the approved 15-minute budget-alert cron; maintenance has none.
+// Active mode enables the approved 15-minute budget-alert cron.
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "agent-hub",
@@ -63,7 +63,7 @@
     "subrequests": 64
   },
   "vars": {
-    "HUB2_RELEASE_MODE": "maintenance",
+    "HUB2_RELEASE_MODE": "active",
     "AUTH_CLIENT_ID": "1tplqm9l6q6545mrk0gjv6eaeh",
     "AUTH_ISSUER": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_H7nJu52Bs",
     "AUTH_BASE_URL": "https://auth.dtcdev.click",
