@@ -1,0 +1,13 @@
+[Unit]
+Description=Point agent-hub-vm.dtcdev.click at this VM's current external IP (Route53 UPSERT)
+Documentation=file:///opt/agent-hub/docs/NODE-VM-DEPLOY.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/agent-hub/dns-updater.env
+ExecStart=/usr/local/sbin/hub2-dns-update.sh
+
+[Install]
+WantedBy=multi-user.target
