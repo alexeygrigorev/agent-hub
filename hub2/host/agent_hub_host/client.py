@@ -83,7 +83,7 @@ class Client:
     def request(self, method, path, body=None, key=None):
         if not path.startswith("/api/") or "\r" in path or "\n" in path:
             raise ValueError("API path required")
-        headers = {"Accept": "application/json"}
+        headers = {"Accept": "application/json", "User-Agent": "agent-hub2-host/2.0"}
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
         if key:

@@ -482,6 +482,33 @@ class HostTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             Client("https://example.com").request("GET", "//attacker.invalid/")
 
+    def test_http_requests_identify_the_hub2_host_agent(self):
+        captured = {}
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _limit):
+                return b"{}"
+
+        class Opener:
+            def open(self, request, timeout):
+                captured["request"] = request
+                captured["timeout"] = timeout
+                return Response()
+
+        with patch("agent_hub_host.client.urllib.request.build_opener", return_value=Opener()):
+            result = Client("https://hub.example", "secret-token").request("GET", "/api/health")
+
+        self.assertEqual(result, {})
+        self.assertEqual(captured["request"].get_header("User-agent"), "agent-hub2-host/2.0")
+        self.assertEqual(captured["request"].get_header("Authorization"), "Bearer secret-token")
+        self.assertEqual(captured["timeout"], 30)
+
 
 if __name__ == "__main__":
     unittest.main()
