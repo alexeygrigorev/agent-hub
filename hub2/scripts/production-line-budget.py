@@ -41,7 +41,7 @@ def text_files(path: Path) -> set[Path]:
 
 
 def production_files() -> set[Path]:
-    files = text_files(HUB2 / "src") | text_files(HUB2 / "host" / "agent_hub_host") | text_files(HUB2 / "public")
+    files = text_files(HUB2 / "src") | text_files(HUB2 / "node") | text_files(HUB2 / "host" / "agent_hub_host") | text_files(HUB2 / "public")
     # Production Wrangler entry keeps first activation in maintenance mode.
     production_worker = HUB2 / "production-worker.ts"
     if production_worker.is_file():
@@ -58,17 +58,7 @@ def production_files() -> set[Path]:
     bootstrap = HUB2 / "host" / "bootstrap.py"
     if bootstrap.is_file():
         files.add(bootstrap)
-    # These scripts/workflows create or reconcile real production billing
-    # policies, so classify them as operational product code, not test tooling.
-    for path in (
-        HUB2 / "scripts" / "cloudflare-billing-policy.py",
-        ROOT / ".github" / "workflows" / "hub2-billing-audit.yml",
-    ):
-        if path.is_file():
-            files.add(path)
-    for path in (HUB2 / "wrangler.jsonc", HUB2 / "wrangler.production.jsonc"):
-        if path.is_file():
-            files.add(path)
+    # Cloudflare billing tooling was retired with the budget checkers.
     files.update(path for path in (HUB2 / "scripts").glob("deploy*") if path.is_file() and path.suffix.lower() in TEXT_SUFFIXES)
     files.update(path for path in (HUB2 / "scripts").glob("registry-import*") if path.is_file() and path.suffix.lower() in TEXT_SUFFIXES)
     return files

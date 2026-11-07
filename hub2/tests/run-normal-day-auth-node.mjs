@@ -4,7 +4,7 @@ import { webcrypto, createHash } from 'node:crypto';
 import { resolve } from 'node:path';
 import { spawn } from 'node:child_process';
 import { readFile, writeFile, mkdir, mkdtemp, stat } from 'node:fs/promises';
-import { createFixture } from './node-fixture.mjs';
+import { createFixture, makeTempDir } from './node-fixture.mjs';
 const root = resolve(import.meta.dirname, '../..');
 const sourceNames = ['auth', 'control-auth', 'control-do', 'worker', 'mcp'];
 const sourceHashes = async () => Object.fromEntries(await Promise.all(sourceNames.map(async n => [n, createHash('sha256').update(await readFile(resolve(root, 'hub2/src/' + n + '.ts'))).digest('hex')])));

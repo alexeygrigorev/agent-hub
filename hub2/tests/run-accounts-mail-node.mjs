@@ -2,9 +2,9 @@
 import assert from 'node:assert/strict';
 import { mkdtemp } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import { createFixture, restartFixture } from './node-fixture.mjs';
+import { createFixture, restartFixture, makeTempDir } from './node-fixture.mjs';
 const root = resolve(import.meta.dirname, '../..');
-const persistDir = await mkdtemp(resolve(root, '.local/tmp/mail-node-'));
+const persistDir = await makeTempDir('mail-node-');
 const specBase = {
   root,
   env: { HUB2_CREDENTIAL_KEY: '11'.repeat(32) },

@@ -5,7 +5,7 @@ import { WebSocket } from 'ws';
 import { resolve } from 'node:path';
 import { mkdtemp, mkdir, readFile, writeFile, readdir } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
-import { createFixture, restartFixture } from './node-fixture.mjs';
+import { createFixture, restartFixture, makeTempDir } from './node-fixture.mjs';
 const root = process.env.HUB2_CORE_ROOT || resolve(import.meta.dirname, '../..');
 const entry = process.env.HUB2_CORE_ENTRY || resolve(root, 'hub2/tests/core-integration-worker.ts');
 const reportPath = process.env.HUB2_CORE_REPORT;
@@ -13,7 +13,7 @@ const token = 'synthetic-core-operator-token-0000000000000000', project = 'synth
 const sourceFiles = (await readdir(resolve(root, 'hub2/src'))).filter(n => n.endsWith('.ts')).map(n => n.slice(0, -3)).sort();
 async function hashes() { return Object.fromEntries(await Promise.all(sourceFiles.map(async n => [n, createHash('sha256').update(await readFile(resolve(root, 'hub2/src/' + n + '.ts'))).digest('hex')]))); }
 const sourceBefore = await hashes();
-const persist = await mkdtemp(resolve(root, '.local/tmp/core-node-'));
+const persist = await makeTempDir('core-node-');
 const workspace = process.env.HUB2_CORE_WORKER_CONTEXT || process.env.HUB2_CORE_PROVISION ? resolve(persist, 'workspace') : '/synthetic/workspace';
 if (process.env.HUB2_CORE_WORKER_CONTEXT || process.env.HUB2_CORE_PROVISION) await mkdir(workspace, { recursive: true, mode: 0o700 });
 const { default: coreWorker, CoreControl, CoreProject, CoreMachine, CoreAccount, CoreMailbox } = await import('./core-integration-worker.ts');
