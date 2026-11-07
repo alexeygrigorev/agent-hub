@@ -6,6 +6,8 @@ import {build} from 'esbuild';
 const root = resolve(import.meta.dirname, '../..');
 const configText = await readFile(resolve(root, 'hub2/wrangler.production.jsonc'), 'utf8');
 const config = JSON.parse(configText.replace(/^\s*\/\/.*$/gm, ''));
+const rootConfigText = await readFile(resolve(root, 'wrangler.jsonc'), 'utf8');
+const rootConfig = JSON.parse(rootConfigText.replace(/^\s*\/\/.*$/gm, ''));
 const worker = await readFile(resolve(root, 'hub2/production-worker.ts'), 'utf8');
 const freshClasses = ['ControlDO', 'ProjectDO', 'MachineDO', 'AccountDO', 'MailboxDO', 'BudgetDO'];
 
@@ -17,10 +19,16 @@ for (const binding of config.durable_objects.bindings) {
   assert.equal(Object.hasOwn(binding, 'namespace_id'), false, 'no existing unrelated namespace identity');
 }
 assert.equal(Object.keys(config.vars).some(key => /HUB1_|HUB2_IMPORT|DEV_OPERATOR_TOKEN/.test(key)), false);
-assert.equal(config.vars.HUB2_RELEASE_MODE, 'maintenance', 'first deployment keeps dispatch disabled');
+assert.equal(config.vars.HUB2_RELEASE_MODE, 'active', 'the approved final deployment enables Hub2 after bootstrap');
+assert.equal(rootConfig.vars.HUB2_RELEASE_MODE, 'active', 'the production deploy manifest enables the same approved release');
+assert.equal(rootConfig.name, config.name, 'root production and Hub2 validation manifests target the same Worker');
+assert.equal(rootConfig.main, 'hub2/production-worker.ts', 'the production deploy manifest selects Hub2, not Hub1');
+assert.deepEqual(rootConfig.triggers, config.triggers, 'the deployed Worker has the tested cost-alert schedule');
+assert.deepEqual(rootConfig.durable_objects, config.durable_objects, 'the deployed Worker has the tested fresh Hub2 namespaces');
+assert.deepEqual(rootConfig.exports, config.exports, 'the deployed Worker preserves the reviewed Hub2 namespace lifecycle');
 assert.equal(config.workers_dev, true, 'production deployment keeps the approved Worker route enabled');
 assert.deepEqual(config.vars, {
-  HUB2_RELEASE_MODE: 'maintenance',
+  HUB2_RELEASE_MODE: 'active',
   AUTH_CLIENT_ID: config.vars.AUTH_CLIENT_ID,
   AUTH_ISSUER: config.vars.AUTH_ISSUER,
   AUTH_BASE_URL: config.vars.AUTH_BASE_URL,
@@ -123,6 +131,12 @@ const accounts = namespace(async input => receiptResponse(input instanceof Reque
 const machines = namespace(async input => receiptResponse(input instanceof Request ? input : new Request(input), {heartbeat: true}));
 const bootstrapMid = Math.floor(bootstrapEnvelope.length / 2);
 const bootstrapEnv = {HUB2_RELEASE_MODE: 'bootstrap', HUB2_BUDGET_ENVELOPES: bootstrapEnvelope.slice(0, bootstrapMid), HUB2_BUDGET_ENVELOPES_PART2: bootstrapEnvelope.slice(bootstrapMid), CONTROL: control, BUDGET: budget, ACCOUNTS: accounts, MACHINES: machines};
+const activeHealth = await production.fetch(
+  new Request('https://synthetic.invalid/health'),
+  {...bootstrapEnv, HUB2_RELEASE_MODE: 'active'},
+);
+assert.equal(activeHealth.status, 200);
+assert.deepEqual(await activeHealth.json(), {ok: true, service: 'hub2'}, 'the active production composition reaches Hub2');
 const health = await production.fetch(new Request('https://synthetic.invalid/health'), bootstrapEnv);
 assert.equal(health.status, 200);
 assert.deepEqual(await health.json(), {status: 'bootstrap', dispatch_enabled: false});
