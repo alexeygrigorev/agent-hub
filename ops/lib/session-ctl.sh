@@ -17,7 +17,7 @@ BASE_REPO="${BASE_REPO:-$HOME/git/agent-hub}"           # donor clone for the ru
 SKILLS_REPO="${SKILLS_REPO:-$HOME/git/bots-management-ops}"   # read-only clone of alexeygrigorev/bots-management (bot-skills is archived)
 SKILLS_REMOTE="${SKILLS_REMOTE:-alexeygrigorev/bots-management}"
 SKILLS_DIR="${SKILLS_DIR:-$SKILLS_REPO/.agents/skills}"   # skills live under .agents/skills
-ENGINE="${ORCH_ENGINE:-gemini}"
+ENGINE="${ENGINE:-${ORCH_ENGINE:-gemini}}"
 TICKS="$HOME/tmp/agent-reports/orchestrator-ticks.jsonl"; MAX_TICK_AGE="${MAX_TICK_AGE:-1800}"
 BRIEF="$HOME/tmp/briefs/orchestrator-main.md"
 MIN_RESTART_GAP="${MIN_RESTART_GAP:-600}"
@@ -25,7 +25,7 @@ PROOF_WINDOW="${PROOF_WINDOW:-600}"                      # a restart must produc
 FALLBACK_ENGINE="${ORCH_FALLBACK_ENGINE:-opencode}"      # second recovery path: new session, other engine
 MAX_ONCALL_INBOX_AGE="${MAX_ONCALL_INBOX_AGE:-1200}"
 ENGINE_EXCLUDE=""
-ENGINE_SELECTED=0
+ENGINE_SELECTED="${ENGINE_SELECTED:-0}"
 STATE="$REPORTS/state"; mkdir -p "$REPORTS/inbox/processed" "$REPORTS/history" "$STATE"
 log() { echo "[$(date -u +%FT%TZ)] $ROLE: $*"; }
 # fd 9 holds the per-role lock (role_lock). No child may inherit it: a detached aplexer worker,
@@ -173,13 +173,14 @@ prep_worktree() {
 
 screen() { a capture "$1" --screen --plain 2>/dev/null; }
 
-# Select only a configured non-Claude route whose Hub quota is fresh and above its
-# provider reserve. The allowlist intentionally excludes Codex model aliases so a
-# watchdog cannot pick sol/astra/argon with an unknown effort setting.
+# Prefer a configured non-Claude route whose Hub quota is fresh and above its
+# provider reserve; when Hub quota is unavailable, use the locally configured
+# engine list. The allowlist excludes Codex model aliases so a watchdog cannot
+# pick sol/astra/argon with an unknown effort setting.
 quota_engine() {  # $1 preferred, $2 excluded route, $3 fallback preference
   local quota engines
-  quota=$(HUB_CONFIG_FILE="${HUB_CONFIG_FILE:-$HOME/.config/agent-hub/cli.json}" T=30 t hub quota --json 2>/dev/null) || return 1
-  engines=$(T=15 t a engines --json 2>/dev/null) || return 1
+  quota=$(HUB_CONFIG_FILE="${HUB_CONFIG_FILE:-$HOME/.config/agent-hub/cli.json}" T=30 t hub quota --json 2>/dev/null) || return 2
+  engines=$(T=15 t a engines --json 2>/dev/null) || return 2
   printf '%s\n%s\n' "$quota" "$engines" | python3 -c '
 import json, math, sys
 
@@ -191,7 +192,11 @@ try:
     quota, end = decoder.raw_decode(first)
     engines_doc, _ = decoder.raw_decode(first[end:].lstrip())
 except Exception:
-    sys.exit(1)
+    sys.exit(2)
+if not isinstance(quota, dict) or "error" in quota or not isinstance(quota.get("pools"), list):
+    # A 503 release_bootstrap stub and other unavailable/malformed responses do
+    # not prove quota exhaustion. Let select_engine use the local engine list.
+    sys.exit(2)
 
 allowed = {"gemini": "gemini", "antigravity": "gemini", "grok": "grok",
            "opencode": "go", "zcodex": "zai"}
@@ -261,14 +266,83 @@ sys.exit(1)
 ' "$1" "$2" "$3"
 }
 
+local_engine() {  # $1 preferred, $2 excluded route, $3 fallback preference, $4 exact-only
+  local engines
+  engines=$(T=15 t a engines --json 2>/dev/null) || return 1
+  printf '%s\n' "$engines" | python3 -c '
+import json, sys
+
+preferred, excluded, fallback, exact = sys.argv[1:5]
+allowed = {"gemini", "antigravity", "grok", "opencode", "zcodex"}
+try:
+    engines_doc = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+
+configured = set()
+def collect(value):
+    if isinstance(value, dict):
+        for key in ("name", "id", "engine"):
+            item = value.get(key)
+            if isinstance(item, str):
+                configured.add(item.lower())
+        for child in value.values():
+            if isinstance(child, (dict, list)):
+                collect(child)
+    elif isinstance(value, list):
+        for child in value:
+            collect(child)
+collect(engines_doc)
+
+preferred = preferred.strip().lower()
+if exact == "1":
+    order = [preferred]
+else:
+    order = []
+    for candidate in (preferred, fallback, "gemini", "antigravity", "opencode", "grok", "zcodex"):
+        candidate = candidate.strip().lower()
+        if candidate in allowed and candidate not in order:
+            order.append(candidate)
+
+excluded = excluded.strip().lower()
+# Prefer a different route after a failed recovery proof. If the only local
+# engine is the excluded one, still recover instead of holding indefinitely.
+for allow_excluded in (False, True):
+    for candidate in order:
+        if candidate not in allowed or candidate not in configured:
+            continue
+        if candidate == excluded and not allow_excluded:
+            continue
+        print(candidate)
+        sys.exit(0)
+sys.exit(1)
+' "$1" "$2" "$3" "$4"
+}
+
 select_engine() {
-  [ "$ENGINE_SELECTED" = 1 ] && return 0
-  local selected
-  selected=$(quota_engine "$ENGINE" "$ENGINE_EXCLUDE" "$FALLBACK_ENGINE") || {
+  local selected quota_status
+  if [ "$ENGINE_SELECTED" = 1 ]; then
+    selected=$(local_engine "$ENGINE" "" "" 1) || {
+      log "preselected engine is not a configured non-Claude aplexer engine; recovery held"
+      return 1
+    }
+    ENGINE="$selected"
+    return 0
+  fi
+  selected=$(quota_engine "$ENGINE" "$ENGINE_EXCLUDE" "$FALLBACK_ENGINE")
+  quota_status=$?
+  if [ "$quota_status" -eq 2 ]; then
+    selected=$(local_engine "$ENGINE" "$ENGINE_EXCLUDE" "$FALLBACK_ENGINE" 0) || {
+      log "Hub quota unavailable and no configured non-Claude aplexer engine is available; recovery held"
+      return 1
+    }
+    log "Hub quota unavailable; using local engine $selected"
+  elif [ "$quota_status" -ne 0 ]; then
     log "no configured non-Claude engine has fresh Hub quota headroom; recovery held"
     return 1
-  }
-  [ "$selected" = "$ENGINE" ] || log "engine preference unavailable; Hub quota selected $selected"
+  elif [ "$selected" != "$ENGINE" ]; then
+    log "engine preference unavailable; Hub quota selected $selected"
+  fi
   ENGINE="$selected"
   ENGINE_SELECTED=1
 }

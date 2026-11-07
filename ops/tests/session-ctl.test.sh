@@ -18,7 +18,7 @@ export FAKE_QUOTA="$fake/quota.json"
 export FAKE_KILLED="$fake/killed.log"
 export FAKE_START_ENGINE="$fake/start-engine"
 export FAKE_SEND_LOG="$fake/send.log"
-unset ORCH_ENGINE ORCH_FALLBACK_ENGINE
+unset ENGINE ENGINE_SELECTED ORCH_ENGINE ORCH_FALLBACK_ENGINE
 
 cat > "$bin/a" <<'APLEXER'
 #!/usr/bin/env bash
@@ -68,7 +68,13 @@ cat > "$bin/hub" <<'HUB'
 #!/usr/bin/env bash
 set -euo pipefail
 [[ "${1:-}" == quota && "${2:-}" == --json ]] || exit 2
-cat "$FAKE_QUOTA"
+case "${FAKE_HUB_MODE:-healthy}" in
+  fail) exit 1 ;;
+  timeout) exit 124 ;;
+  stub) printf '{"error":"release_bootstrap","dispatch_enabled":false}\n' ;;
+  healthy) cat "$FAKE_QUOTA" ;;
+  *) exit 2 ;;
+esac
 HUB
 
 cat > "$bin/systemd-run" <<'SYSTEMD_RUN'
@@ -129,6 +135,18 @@ write_live() {
   rm -f "$FAKE_START_ENGINE" "$HOME/tmp/agent-reports/$sub/state/last_start"
 }
 
+write_dead() {
+  local role="$1" tag sub
+  if [[ "$role" == orchestrator ]]; then tag=orchestrator-main; sub=orchestrator
+  else tag=oncall-engineer; sub=oncall; fi
+  mkdir -p "$HOME/git/agent-hub-wt-${role}-run/ops/$sub" "$HOME/tmp/agent-reports/$sub/inbox"
+  printf '[]\n' > "$FAKE_SESSIONS"
+  printf 'normal ready prompt\n' > "$FAKE_SCREEN"
+  : > "$FAKE_KILLED"
+  : > "$FAKE_SEND_LOG"
+  rm -f "$FAKE_START_ENGINE" "$HOME/tmp/agent-reports/$sub/state/last_start"
+}
+
 write_default_quota() {
   write_quota <<'JSON'
 {"pools":[
@@ -165,6 +183,53 @@ assert_not_contains "$output" 'OK session='
 [[ "$(<"$FAKE_START_ENGINE")" == gemini ]]
 assert_contains "$(<"$FAKE_SEND_LOG")" 'Run the oncall check now:'
 assert_not_contains "$(<"$FAKE_SEND_LOG")" '/loop'
+
+# A failed Hub quota command falls back to the preferred locally available
+# engine, allowing a dead oncall session to start.
+write_default_quota
+write_dead oncall
+export FAKE_HUB_MODE=fail
+output="$(run_ctl oncall start 2>&1)"
+unset FAKE_HUB_MODE
+assert_contains "$output" 'Hub quota unavailable; using local engine gemini'
+assert_not_contains "$output" 'recovery held'
+[[ "$(<"$FAKE_START_ENGINE")" == gemini ]]
+
+# The Hub release_bootstrap stub falls back during a real oncall recovery.
+write_live oncall 'You have hit your weekly limit - resets Nov 5'
+export FAKE_HUB_MODE=stub
+output="$(run_ctl oncall check 2>&1)"
+unset FAKE_HUB_MODE
+assert_contains "$output" 'provider usage limit screen'
+assert_contains "$output" 'Hub quota unavailable; using local engine gemini'
+assert_not_contains "$output" 'recovery held'
+[[ "$(<"$FAKE_START_ENGINE")" == gemini ]]
+
+# An HTTP-command timeout (the same nonzero result as timeout(1)) also uses
+# the local route instead of holding recovery.
+write_live oncall 'You have hit your weekly limit - resets Nov 5'
+export FAKE_HUB_MODE=timeout
+output="$(run_ctl oncall check 2>&1)"
+unset FAKE_HUB_MODE
+assert_contains "$output" 'Hub quota unavailable; using local engine gemini'
+assert_not_contains "$output" 'recovery held'
+[[ "$(<"$FAKE_START_ENGINE")" == gemini ]]
+
+# A healthy quota document still wins over the local preference.
+write_quota <<'JSON'
+{"pools":[{"provider":"go","state":"fresh","remaining_percent":36,"harness":["opencode"]}]}
+JSON
+write_live oncall 'You have hit your weekly limit - resets Nov 5'
+output="$(run_ctl oncall check 2>&1)"
+assert_contains "$output" 'Hub quota selected opencode'
+[[ "$(<"$FAKE_START_ENGINE")" == opencode ]]
+
+# The documented operator override survives script initialization, but is
+# accepted only for an available non-Claude engine.
+write_dead oncall
+output="$(ENGINE=gemini ENGINE_SELECTED=1 "$repo/ops/lib/session-ctl.sh" oncall start 2>&1)"
+assert_not_contains "$output" 'recovery held'
+[[ "$(<"$FAKE_START_ENGINE")" == gemini ]]
 
 # Immediately after a restart, oncall gets a MAX_ONCALL_INBOX_AGE grace window from last_start
 # to finish draining pre-existing inbox items instead of being killed mid-triage.
