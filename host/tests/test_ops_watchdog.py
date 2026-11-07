@@ -152,6 +152,24 @@ class OpsWatchdogTest(unittest.TestCase):
         self.assertNotIn('--engine claude', self.starts()[-1])
         self.assertNotIn('--engine sonnet', self.starts()[-1])
 
+    def test_dead_worker_recovers_when_hub_quota_command_fails(self):
+        self.data['sessions'] = [self.session()]
+        self.data['quota_error'] = 1
+        result = self.run_ctl()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('Hub quota unavailable; using local engine gemini', result.stdout)
+        self.assertIn('--engine gemini', self.starts()[-1])
+        self.assertNotIn('recovery held', result.stdout)
+
+    def test_dead_worker_recovers_when_hub_returns_release_bootstrap_stub(self):
+        self.data['sessions'] = [self.session()]
+        self.data['quota'] = {'error': 'release_bootstrap', 'dispatch_enabled': False}
+        result = self.run_ctl()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('Hub quota unavailable; using local engine gemini', result.stdout)
+        self.assertIn('--engine gemini', self.starts()[-1])
+        self.assertNotIn('recovery held', result.stdout)
+
     def test_surviving_workload_blocks_forget_and_launch(self):
         self.data['sessions'] = [self.session(pid=os.getpid())]
         result = self.run_ctl()
