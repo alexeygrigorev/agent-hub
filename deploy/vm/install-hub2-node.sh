@@ -65,7 +65,8 @@ systemctl enable agent-hub-dns-update.service
 
 echo "== services"
 systemctl daemon-reload
-systemctl enable --now agent-hub-hub2.service
+systemctl enable agent-hub-hub2.service
+systemctl restart agent-hub-hub2.service
 systemctl reload caddy 2>/dev/null || systemctl restart caddy
 
 sleep 3
