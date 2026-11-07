@@ -83,9 +83,12 @@ restart the service. The clean-start model holds: the VM DB initializes fresh;
 the CLI/hosts re-pair once. `HUB2_BOOTSTRAP_TOKEN` in `.dev.vars` is carried for
 out-of-band host bootstrap only; the operator device flow does not use it.
 
-## Ephemeral VM IP self-heal (DNS updater)
+## VM IP self-heal (DNS updater, safety net)
 
-The VM external IP is ephemeral: a stop/start can change it. The unit
+The VM external IP is a reserved static address (see "Static VM IP" below), so
+a restart keeps it and this unit normally no-ops; it stays enabled as a
+safety net in case the address is ever released or the VM is recreated. The
+unit
 `agent-hub-dns-update.service` (enabled for boot by
 `deploy/vm/install-hub2-node.sh`) runs `deploy/vm/hub2-dns-update.sh`, which
 compares the GCP metadata external IP with the current
@@ -152,9 +155,18 @@ Cloudflare Workers endpoint, which stays deployed but idle). Rollback of code
 additive per hub2's schema versions, and `deploy/vm/install-hub2-node.sh` is
 idempotent.
 
-## EPHEMERAL IP (known gap)
+## Static VM IP
 
-`35.198.99.237` is an **ephemeral** GCP address. If the VM restarts under a
-new IP: update `vm_ipv4` in `aws-infra/sandbox/agent-hub` and `terraform
-apply` (TTL 300 s). Reserving a static IP needs GCP access, which this setup
-deliberately does not require.
+`35.198.99.237` is reserved as static address `agent-hub-vm-ip`
+(region `europe-west3`, project `dtcdev-click`), promoted in place from the
+ephemeral address on 2026-11-07 — zero downtime, same IP. GCP charges nothing
+while a static address is attached to a running VM; it bills
+reserved-but-unattached addresses (~USD 3.6/month), so never release it
+without attaching it elsewhere. `vm_ipv4` in `aws-infra/sandbox/agent-hub`
+should therefore no longer drift after a VM restart.
+
+GCP access from this machine: the PATH `gcloud` (`~/.local/bin/gcloud`) is a
+phone-cloud-gate wrapper that fails token refresh with HTTP 403. The working
+invocation is the real SDK against the operator's SDK config directly:
+`CLOUDSDK_CONFIG=~/tmp/gcp ~/.local/share/google-cloud-cli/google-cloud-sdk/bin/gcloud ...`
+(project `dtcdev-click`).
