@@ -75,6 +75,11 @@ it is a recovery check, not a periodic prompt:
 - A healthy live session is left alone. Oncall is checked for inbox progress;
   the orchestrator is checked for tick progress.
 
+Status snapshot: on 2026-11-07, the timer had stopped firing at about 09:17
+Europe/Berlin. The separate `ops-watchdog-t2657u` session is investigating
+that failure. The cadence above describes the timer's configured purpose, not
+confirmation that it is currently firing.
+
 The unit files live in `~/.config/systemd/user/ops-watchdog.{timer,service}`;
 their source and the recovery logic are in
 [`ops/systemd/`](../ops/systemd/) and [`ops/lib/`](../ops/lib/). The host
