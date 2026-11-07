@@ -1,15 +1,18 @@
 import json
 import hashlib
+import io
 import os
 import subprocess
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
 from agent_hub_host.agent import Bridge, Journal
 from agent_hub_host.client import ApiError, Client, save_config
+from agent_hub_host.cli import main as cli_main
 
 
 class FakeNative:
@@ -508,6 +511,16 @@ class HostTests(unittest.TestCase):
         self.assertEqual(captured["request"].get_header("User-agent"), "agent-hub2-host/2.0")
         self.assertEqual(captured["request"].get_header("Authorization"), "Bearer secret-token")
         self.assertEqual(captured["timeout"], 30)
+
+    def test_top_level_status_command_uses_the_hub_status_endpoint(self):
+        output = io.StringIO()
+        config = self.root / "operator.json"
+        with patch("agent_hub_host.cli.Client", return_value=self.client), redirect_stdout(output):
+            result = cli_main(["--config", str(config), "--server", "https://hub.example", "status"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(output.getvalue(), "{}\n")
+        self.assertEqual(self.client.calls, [("GET", "/api/status", None, None)])
 
 
 if __name__ == "__main__":

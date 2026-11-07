@@ -170,10 +170,10 @@ def execute(client, args, config):
             query["limit"] = args.limit
     base_path = path
     page_key='cursor' if group=='intake' and action=='list' else 'after'
-    if args.cursor and (page_key!='cursor' or args.after):
+    if getattr(args,'cursor',None) and (page_key!='cursor' or getattr(args,'after',None)):
         raise ValueError('--cursor is only for intake list and cannot combine with --after')
-    if method=='GET' and (args.cursor or args.after):
-        query[page_key]=args.cursor or args.after
+    if method=='GET' and (getattr(args,'cursor',None) or getattr(args,'after',None)):
+        query[page_key]=getattr(args,'cursor',None) or getattr(args,'after',None)
     if query:
         path += "?" + urlencode(query)
     result = client.request(method, path, None if method == "GET" else body, key if method != "GET" else None)
