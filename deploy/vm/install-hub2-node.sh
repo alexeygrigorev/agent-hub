@@ -7,19 +7,19 @@
 # Budget envelopes are retired with the Cloudflare budget checkers.
 set -euo pipefail
 
-# The service unit and Caddyfile live in deploy/, beside vm/.
-STAGING="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DEPLOY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO=/opt/agent-hub
 STATE=/var/lib/agent-hub
 DB_DIR=$STATE/hub2-db
 
 echo "== systemd units"
-install -m 644 "$STAGING/agent-hub-hub2.service" /etc/systemd/system/agent-hub-hub2.service
+install -m 644 "$DEPLOY_DIR/agent-hub-hub2.service" /etc/systemd/system/agent-hub-hub2.service
 systemctl disable --now agent-hub-worker.service agent-hub-cron.timer agent-hub-cron.service 2>/dev/null || true
 rm -f /etc/systemd/system/agent-hub-worker.service /etc/systemd/system/agent-hub-cron.service /etc/systemd/system/agent-hub-cron.timer
 
 echo "== edge (caddy :80 -> 127.0.0.1:8787; TLS terminates upstream)"
-install -m 644 "$STAGING/Caddyfile" /etc/caddy/Caddyfile
+install -m 644 "$DEPLOY_DIR/Caddyfile" /etc/caddy/Caddyfile
 
 echo "== state directories"
 install -d -m 750 -o alexey -g alexey "$DB_DIR" "$REPO/.local/tmp"
@@ -59,8 +59,8 @@ echo "== dns updater"
 # the repo: create /etc/agent-hub/dns-updater.env (0600, AWS_ACCESS_KEY_ID /
 # AWS_SECRET_ACCESS_KEY of the scoped IAM user) on the VM separately. Without
 # it the updater logs a warning and does nothing.
-install -m 750 "$STAGING/hub2-dns-update.sh" /usr/local/sbin/hub2-dns-update.sh
-install -m 644 "$STAGING/agent-hub-dns-update.service" /etc/systemd/system/agent-hub-dns-update.service
+install -m 750 "$VM_DIR/hub2-dns-update.sh" /usr/local/sbin/hub2-dns-update.sh
+install -m 644 "$VM_DIR/agent-hub-dns-update.service" /etc/systemd/system/agent-hub-dns-update.service
 systemctl enable agent-hub-dns-update.service
 
 echo "== services"

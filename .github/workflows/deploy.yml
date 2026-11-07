@@ -33,6 +33,8 @@ jobs:
           bash -n deploy/vm/install-hub2-node.sh
           test -s deploy/agent-hub-hub2.service
           test -s deploy/Caddyfile
+          test -s deploy/vm/hub2-dns-update.sh
+          test -s deploy/vm/agent-hub-dns-update.service
       - name: Session controller shell regression tests
         run: |
           mkdir -p "${RUNNER_TEMP}/ops-watchdog-home"
