@@ -21,10 +21,36 @@ export const publicAuthPaths = new Set([
   '/api/token/refresh',
   '/api/token/revoke',
 ]);
+function configuredPublicOrigin(env: AuthEnv): string | undefined {
+  if (!env.AUTH_CALLBACK_URL) return;
+  try {
+    const callback = new URL(env.AUTH_CALLBACK_URL);
+    if (
+      callback.protocol !== 'https:' ||
+      !callback.hostname ||
+      callback.username ||
+      callback.password ||
+      callback.pathname !== '/auth/callback' ||
+      callback.search ||
+      callback.hash
+    )
+      return;
+    return callback.origin;
+  } catch {
+    return;
+  }
+}
 async function controlAuth(request: Request, env: AuthEnv, path: string, includeBody = true): Promise<Response> {
   const headers = new Headers(request.headers);
   for (const k of [...headers.keys()]) if (k.toLowerCase().startsWith('x-hub2-')) headers.delete(k);
-  headers.set('x-hub2-public-origin', new URL(request.url).origin);
+  // The request host may be the Worker origin behind the production reverse
+  // proxy. Only the configured HTTPS callback origin is authoritative for the
+  // browser flow; never trust a forwarded or caller-supplied host.
+  const origin = env.AUTH_CALLBACK_URL
+    ? configuredPublicOrigin(env)
+    : new URL(request.url).origin;
+  if (!origin) return error('authentication_not_configured', 503);
+  headers.set('x-hub2-public-origin', origin);
   return env.CONTROL.get(env.CONTROL.idFromName('global')).fetch(new Request(
     'https://control.internal/_auth/' + path,
     { method: request.method, redirect: 'manual', headers,

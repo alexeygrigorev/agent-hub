@@ -12,6 +12,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 VALIDATE_SCRIPT = REPO_ROOT / "scripts" / "ci" / "validate-workflow.py"
 ROLLBACK_SCRIPT = REPO_ROOT / "scripts" / "ci" / "rollback.py"
 RETRY_SCRIPT = REPO_ROOT / "scripts" / "ci" / "wrangler_retry.py"
+RENDER_DEPLOY_CONFIG_SCRIPT = REPO_ROOT / "scripts" / "ci" / "render-wrangler-deploy-config.py"
 DEPLOY_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "deploy.yml"
 
 
@@ -130,10 +131,49 @@ class TestWranglerRetry(unittest.TestCase):
 class TestDeployWorkflowRetryWiring(unittest.TestCase):
     def test_production_retry_and_health_are_retained(self):
         content = DEPLOY_WORKFLOW.read_text()
-        self.assertIn("wrangler_retry.py npx wrangler deploy --config wrangler.jsonc", content)
-        self.assertIn("wrangler_retry.py npx wrangler versions list --config wrangler.jsonc", content)
+        self.assertIn("default: bootstrap", content)
+        self.assertIn("- bootstrap", content)
+        self.assertIn("- active", content)
+        self.assertIn("render-wrangler-deploy-config.py --mode \"$HUB2_RELEASE_MODE\"", content)
+        self.assertIn("wrangler_retry.py npx wrangler deploy --config wrangler.deploy.jsonc", content)
+        self.assertIn("wrangler_retry.py npx wrangler versions list --config wrangler.deploy.jsonc", content)
         self.assertIn("https://hub.dtcdev.click/health", content)
         self.assertIn("payload.get('service') == 'hub2'", content)
+
+    def test_release_config_changes_only_the_mode_and_refuses_overwrite(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "wrangler.jsonc"
+            output = Path(directory) / "wrangler.deploy.jsonc"
+            config.write_text('{\n  "vars": {\n    "HUB2_RELEASE_MODE": "active",\n    "KEEP": "same"\n  }\n}\n')
+            result = subprocess.run(
+                [sys.executable, str(RENDER_DEPLOY_CONFIG_SCRIPT), "--config", str(config), "--output", str(output), "--mode", "bootstrap"],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(output.read_text(), config.read_text().replace('"HUB2_RELEASE_MODE": "active"', '"HUB2_RELEASE_MODE": "bootstrap"'))
+            self.assertEqual(config.read_text().count('"HUB2_RELEASE_MODE": "active"'), 1)
+            result = subprocess.run(
+                [sys.executable, str(RENDER_DEPLOY_CONFIG_SCRIPT), "--config", str(config), "--output", str(output), "--mode", "active"],
+                capture_output=True, text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("File exists", result.stderr)
+
+    def test_release_config_requires_one_mode_binding(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "wrangler.jsonc"
+            output = Path(directory) / "wrangler.deploy.jsonc"
+            config.write_text('{"vars":{}}')
+            result = subprocess.run(
+                [sys.executable, str(RENDER_DEPLOY_CONFIG_SCRIPT), "--config", str(config), "--output", str(output), "--mode", "bootstrap"],
+                capture_output=True, text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("exactly one HUB2_RELEASE_MODE", result.stderr)
 
     def test_rollback_cannot_restore_legacy_version(self):
         rollback = (REPO_ROOT / ".github/workflows/rollback.yml").read_text()

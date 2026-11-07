@@ -151,6 +151,7 @@ def main() -> int:
         "--accepted-baseline", type=int, default=8962,
         help="Alexey-approved maximum product SLOC for the current release; growth above it fails",
     )
+    parser.add_argument("--report-only-size", action="store_true", help="Report SLOC overage without blocking functional fixes; completeness/classification still enforced")
     parser.add_argument("--json", action="store_true", help="emit machine-readable report")
     args = parser.parse_args()
     if args.limit < 1 or args.accepted_baseline < args.limit:
@@ -182,9 +183,10 @@ def main() -> int:
         "tests_and_harnesses": describe(tests),
         "all_scoped_code": describe(all_scoped),
         "within_product_limit": product["sloc"] <= accepted_maximum and host_runtime_complete,
+        "size_enforcement": "report_only" if args.report_only_size else "enforced",
         "host_runtime_complete": host_runtime_complete,
         "missing_host_files": missing_host_files,
-        "policy": "6000 product SLOC remains the architecture target. Alexey approved the exact 8962 product-SLOC tree, including Resource Manager, as the maximum for this release on 2026-11-06; this supersedes the prior 7853 release maximum and the obsolete 6362 maximum. Any growth above 8962 fails this release gate and needs a new decision. SLOC is nonblank/noncomment physical source lines; physical totals are reported separately. No source is minified. Test-only harnesses and CI verification are separate categories, never silently omitted from this report.",
+        "policy": "6000 product SLOC remains the architecture target; 8962 is the previously approved release baseline. Alexey subsequently directed make it work first and shrink later (2026-11-07). --report-only-size records any growth honestly while preserving complete runtime and source-classification gates; it does not change the baseline or financial/runtime safety controls.",
         "excluded": ["documentation", "hidden local files", "generated caches/build/dist/node_modules", "Python *.egg-info packaging metadata", "binary assets"],
     }
     if args.json:
@@ -202,7 +204,9 @@ def main() -> int:
         print("policy: SLOC counts nonblank/noncomment physical lines; no minification")
         for path, counts in report["product"]["files"].items():
             print(f"  {counts['sloc']:5d} SLOC  {counts['physical_lines']:5d} physical  {path}")
-    return 0 if report["within_product_limit"] else 1
+    if args.report_only_size:
+        print("Size is reporting-only under Alexey 2026-11-07 functional-fix directive.", file=sys.stderr)
+    return 0 if host_runtime_complete and (args.report_only_size or report["within_product_limit"]) else 1
 
 
 if __name__ == "__main__":
