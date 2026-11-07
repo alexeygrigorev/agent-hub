@@ -17,12 +17,20 @@ BASE_REPO="${BASE_REPO:-$HOME/git/agent-hub}"           # donor clone for the ru
 SKILLS_REPO="${SKILLS_REPO:-$HOME/git/bots-management-ops}"   # read-only clone of alexeygrigorev/bots-management (bot-skills is archived)
 SKILLS_REMOTE="${SKILLS_REMOTE:-alexeygrigorev/bots-management}"
 SKILLS_DIR="${SKILLS_DIR:-$SKILLS_REPO/.agents/skills}"   # skills live under .agents/skills
-ENGINE="${ENGINE:-${ORCH_ENGINE:-antigravity}}"
+# Oncall triage runs on opencode by default (Alexey 2026-11-07): no argon for ops.
+case "$ROLE" in
+  oncall) ENGINE="${ENGINE:-${ORCH_ENGINE:-opencode}}" ;;
+  *) ENGINE="${ENGINE:-${ORCH_ENGINE:-antigravity}}" ;;
+esac
 TICKS="$HOME/tmp/agent-reports/orchestrator-ticks.jsonl"; MAX_TICK_AGE="${MAX_TICK_AGE:-1800}"
 BRIEF="$HOME/tmp/briefs/orchestrator-main.md"
 MIN_RESTART_GAP="${MIN_RESTART_GAP:-600}"
 PROOF_WINDOW="${PROOF_WINDOW:-600}"                      # a restart must produce a fresh tick within 10 min
-FALLBACK_ENGINE="${ORCH_FALLBACK_ENGINE:-antigravity}"  # second recovery path prefers Ag; selection excludes the failed route
+# Oncall fallback avoids antigravity/argon too (Alexey 2026-11-07).
+case "$ROLE" in
+  oncall) FALLBACK_ENGINE="${ORCH_FALLBACK_ENGINE:-grok}" ;;
+  *) FALLBACK_ENGINE="${ORCH_FALLBACK_ENGINE:-antigravity}" ;;  # second recovery path prefers Ag; selection excludes the failed route
+esac
 MAX_ONCALL_INBOX_AGE="${MAX_ONCALL_INBOX_AGE:-1200}"
 ENGINE_EXCLUDE=""
 ENGINE_SELECTED="${ENGINE_SELECTED:-0}"
@@ -393,8 +401,15 @@ start() {
   stop_old || return 1
   prep_worktree || return 1
   date +%s > "$STATE/last_start"
+  # Antigravity without an explicit model lands on the agy default (argon).
+  # Ops never runs argon (Alexey 2026-11-07): pin flash unless ORCH_MODEL names one.
+  model_args=()
+  if [ "$ENGINE" = antigravity ]; then
+    model_args=(--model "${ORCH_MODEL:-gemini-3.8-flash-high}")
+  fi
   # own transient scope so the session outlives the (oneshot) watchdog unit cgroup
   systemd-run --user --scope --collect -q -- a start --workspace "$RUNDIR/$SUB" --tag "$TAG" --engine "$ENGINE" \
+    "${model_args[@]}" \
     --label "ops.role=$ROLE" --label "hub.intake=$INTAKE" >/dev/null 9>&- || { log "a start failed"; return 1; }
   local id; id=$(find_session); [ -n "$id" ] || { log "session not found after start"; return 1; }
   log "started session $id; waiting for prompt"
