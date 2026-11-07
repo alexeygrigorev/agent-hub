@@ -175,9 +175,38 @@ api_get() {
   printf '%s' "$code"
 }
 
+# The release_bootstrap worker is an intentional 503 safety stub while Hub is
+# disabled. Skip only when the response is HTTP 503 and its JSON body carries
+# an explicit disabled-stub marker; bare/unknown 503s still fail and alert.
+skip_if_intentional_stub_503() {
+  local code="$1" body="$2" context="$3"
+  [[ "$code" == "503" ]] || return 0
+  if python3 - "$body" 2>/dev/null <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        body = json.load(fh)
+except (OSError, UnicodeError, json.JSONDecodeError):
+    sys.exit(1)
+
+is_stub = isinstance(body, dict) and (
+    body.get("error") == "release_bootstrap"
+    or body.get("dispatch_enabled") is False
+)
+sys.exit(0 if is_stub else 1)
+PY
+  then
+    log "SKIP: Hub stubbed / dispatch disabled; backup skipped (${context}, HTTP 503)"
+    exit 0
+  fi
+}
+
 # 1. Status: table inventory + row counts (cheap liveness proof).
 PRE_STATUS="${TMP_PARTS}/status-pre.json"
 CODE="$(api_get "/api/backup/status" "$PRE_STATUS")"
+skip_if_intentional_stub_503 "$CODE" "$PRE_STATUS" "status fetch"
 [[ "$CODE" == "200" ]] || fail "status fetch failed HTTP ${CODE}"
 
 # 2. Schema: full replayable DDL (tables, indexes, triggers, views).
@@ -289,6 +318,7 @@ done < "$TABLES_LIST"
 # 4. Post-read status (presence check only), then assemble + validate.
 POST_STATUS="${TMP_PARTS}/status-post.json"
 CODE="$(api_get "/api/backup/status" "$POST_STATUS")"
+skip_if_intentional_stub_503 "$CODE" "$POST_STATUS" "post status fetch"
 [[ "$CODE" == "200" ]] || fail "post status fetch failed HTTP ${CODE}"
 
 # Assemble the chunked parts into the canonical export document (same shape
