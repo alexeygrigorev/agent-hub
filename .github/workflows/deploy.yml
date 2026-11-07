@@ -10,6 +10,13 @@ on:
         description: Validate without changing production
         type: boolean
         default: true
+      release_mode:
+        description: Production mode to deploy (bootstrap keeps dispatch disabled)
+        type: choice
+        options:
+          - bootstrap
+          - active
+        default: bootstrap
 permissions:
   contents: read
 jobs:
@@ -71,9 +78,12 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          HUB2_RELEASE_MODE: ${{ inputs.release_mode }}
         run: |
-          python3 scripts/ci/wrangler_retry.py npx wrangler deploy --config wrangler.jsonc
-          python3 scripts/ci/wrangler_retry.py npx wrangler versions list --config wrangler.jsonc
+          python3 scripts/ci/render-wrangler-deploy-config.py --mode "$HUB2_RELEASE_MODE" --output wrangler.deploy.jsonc
+          trap 'rm -- wrangler.deploy.jsonc' EXIT
+          python3 scripts/ci/wrangler_retry.py npx wrangler deploy --config wrangler.deploy.jsonc
+          python3 scripts/ci/wrangler_retry.py npx wrangler versions list --config wrangler.deploy.jsonc
       - name: Verify Hub2 health
         run: |
           python3 - <<'PYTHON'

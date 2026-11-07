@@ -30,7 +30,9 @@ test('root release is manually gated behind full Hub2 and distribution checks',(
  assert.match(flow,/github.event_name == 'workflow_dispatch'/);
  assert.match(flow,/needs: \[hub2, distribution\]/);
  assert.doesNotMatch(flow,/DataTalksClub\/auth|build-hub-cli|host\/tests|playwright/);
- assert.match(flow,/wrangler deploy --config wrangler.jsonc/);
+ assert.match(flow,/release_mode:[\s\S]*default: bootstrap/);
+ assert.match(flow,/render-wrangler-deploy-config\.py/);
+ assert.match(flow,/wrangler deploy --config wrangler\.deploy\.jsonc/);
  assert.doesNotMatch(read('.github/workflows/rollback.yml'),/versions deploy/);
 });
 
