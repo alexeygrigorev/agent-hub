@@ -24,7 +24,7 @@ if name=='a':
         if s.get('census_error'): sys.exit(1)
         print(json.dumps(s['sessions']))
     elif cmd=='engines':
-        print(json.dumps(s.get('engines', [{'name': 'gemini'}, {'name': 'antigravity'}, {'name': 'grok'}, {'name': 'opencode'}, {'name': 'zcodex'}])))
+        print(json.dumps(s.get('engines', [{'name': 'antigravity'}, {'name': 'grok'}, {'name': 'opencode'}, {'name': 'zcodex'}])))
     elif cmd=='status': print(json.dumps(next(x for x in s['sessions'] if x['id']==args[1])))
     elif cmd=='kill':
         if s.get('kill_ok'):
@@ -48,7 +48,7 @@ elif name=='systemd-run':
 elif name=='hub':
     if args and args[0]=='quota':
         default={'pools': [
-            {'provider': 'gemini', 'harness': ['gemini', 'antigravity'], 'state': 'fresh', 'remaining_percent': 80, 'limit_reached': False},
+            {'provider': 'gemini', 'harness': ['antigravity'], 'state': 'fresh', 'remaining_percent': 80, 'limit_reached': False},
             {'provider': 'go', 'harness': ['opencode'], 'state': 'fresh', 'remaining_percent': 80, 'limit_reached': False},
             {'provider': 'grok', 'harness': ['grok'], 'state': 'fresh', 'remaining_percent': 80, 'limit_reached': False},
             {'provider': 'zai', 'harness': ['zcodex'], 'state': 'fresh', 'remaining_percent': 80, 'limit_reached': False},
@@ -85,7 +85,7 @@ class OpsWatchdogTest(unittest.TestCase):
         self.ticks.write_text('{}\n')  # fresh tick log: the orchestrator is progressing
         self.data = {
             'sessions': [],
-            'engines': [{'name': 'gemini'}, {'name': 'opencode'}],
+            'engines': [{'name': 'antigravity'}, {'name': 'opencode'}],
             'quota': {'pools': [
                 {'provider': 'gemini', 'harness': ['gemini'], 'state': 'fresh', 'remaining_percent': 100},
                 {'provider': 'go', 'harness': ['opencode'], 'state': 'fresh', 'remaining_percent': 80},
@@ -157,8 +157,8 @@ class OpsWatchdogTest(unittest.TestCase):
         self.data['quota_error'] = 1
         result = self.run_ctl()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn('Hub quota unavailable; using local engine gemini', result.stdout)
-        self.assertIn('--engine gemini', self.starts()[-1])
+        self.assertIn('Hub quota unavailable; using local engine antigravity', result.stdout)
+        self.assertIn('--engine antigravity', self.starts()[-1])
         self.assertNotIn('recovery held', result.stdout)
 
     def test_dead_worker_recovers_when_hub_returns_release_bootstrap_stub(self):
@@ -166,8 +166,8 @@ class OpsWatchdogTest(unittest.TestCase):
         self.data['quota'] = {'error': 'release_bootstrap', 'dispatch_enabled': False}
         result = self.run_ctl()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn('Hub quota unavailable; using local engine gemini', result.stdout)
-        self.assertIn('--engine gemini', self.starts()[-1])
+        self.assertIn('Hub quota unavailable; using local engine antigravity', result.stdout)
+        self.assertIn('--engine antigravity', self.starts()[-1])
         self.assertNotIn('recovery held', result.stdout)
 
     def test_surviving_workload_blocks_forget_and_launch(self):
@@ -388,7 +388,7 @@ class OpsWatchdogTest(unittest.TestCase):
         self.data['sessions'] = [self.session()]
         self.data['kill_ok'] = True
         self.run_ctl()
-        self.assertIn('--engine gemini', self.starts()[-1])
+        self.assertIn('--engine antigravity', self.starts()[-1])
         self.due_now()
         result = self.run_ctl()
         self.assertIn('recovery proof FAILED (path 1)', result.stdout)
@@ -402,7 +402,7 @@ class OpsWatchdogTest(unittest.TestCase):
         self.assertIn('recovery proof FAILED (path 2)', result.stdout)
         self.assertIn('automatic recovery failed 2 consecutive times', needs.read_text())
         self.assertIn('--recovery-failures 2', self.calls())
-        self.assertIn('--engine gemini', self.starts()[-1])  # keeps recovering after the alert
+        self.assertIn('--engine antigravity', self.starts()[-1])  # keeps recovering after the alert
         self.assertEqual(len(self.starts()), 3)
 
     def test_session_dying_inside_proof_window_fails_proof_immediately(self):
