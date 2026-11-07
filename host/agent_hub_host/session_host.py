@@ -596,6 +596,7 @@ def terminal_step_once(dispatcher):
 
 
 WORKTREE_POLL_S = 30
+ONCALL_ALERTS_POLL_S = 30
 
 
 def worktree_commands_step_once(dispatcher):
@@ -613,6 +614,19 @@ def worktree_commands_step_once(dispatcher):
                               'errors': out['errors']}), flush=True)
     except Exception as error:
         _log(json.dumps({'event': 'worktree_commands_error', 'type': type(error).__name__}), flush=True)
+
+
+def oncall_alerts_step_once(journal_dir):
+    """Poll Hub2's independent alert outbox; the helper saves before wake."""
+    try:
+        from .oncall_alerts import poll_once
+        result = poll_once(journal_dir)
+    except Exception as error:
+        _log(json.dumps({'event': 'oncall_alerts_error', 'type': type(error).__name__}), flush=True)
+        return
+    if result.get('offers') or result.get('errors'):
+        _log(json.dumps({'event': 'oncall_alerts_cycle', 'offers': result.get('offers', 0),
+                          'saved': result.get('saved', 0), 'errors': result.get('errors', 0)}), flush=True)
 
 
 def bindings_step_once(dispatcher, *, enrich=False):
@@ -990,6 +1004,8 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
         # worktree close gate kept reporting 'status unknown'.
         worktree_commands_thread = None
         next_worktree_commands = 0
+        oncall_alerts_thread = None
+        next_oncall_alerts = 0
         count = 0
         # Operator fleet settings (workspaces map, workspace_roots,
         # subscriptions, launcher) are re-read when the file changes, so a
@@ -1105,6 +1121,11 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                     worktree_commands_thread = maybe_start_named_thread(
                         worktree_commands_thread, worktree_commands_step_once, (dispatcher,), 'intake-worktree-commands')
                     next_worktree_commands = time.monotonic() + WORKTREE_POLL_S
+                if time.monotonic() >= next_oncall_alerts:
+                    oncall_alerts_thread = maybe_start_named_thread(
+                        oncall_alerts_thread, oncall_alerts_step_once,
+                        (str(journal),), 'oncall-alerts')
+                    next_oncall_alerts = time.monotonic() + ONCALL_ALERTS_POLL_S
                 # Status observation never blocks commands/quota: one bounded
                 # single-inflight daemon thread, skipped while alive.
                 status_thread = maybe_start_status_thread(status_thread, status_collector)

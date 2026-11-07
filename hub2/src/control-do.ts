@@ -3,8 +3,8 @@ import {ControlAuth,CONTROL_AUTH_SCHEMA} from './control-auth';
 import {verifyKnownCredential} from './auth';
 import { MeteredDb, initializeSchema } from './db';
 import { SqlReceiptMeter, SQL_PROBE_HEADER, wrapSqlNamespaces } from './sql-receipt';
-import { randomToken, sha256Hex } from './crypto';
-import { actorFrom, bodyObject, boundedString, error, hasScope, HttpError, json } from './http';
+import { randomToken, safeEqual, sha256Hex } from './crypto';
+import { actorFrom, bodyObject, boundedString, boundedText, error, hasScope, HttpError, json } from './http';
 import type { Actor, Hub2Env, JsonRecord } from './types';
 
 type CredentialActor=Actor&{family_id?:string;client_id?:string};
@@ -52,6 +52,12 @@ const SCHEMA = [
   'CREATE INDEX repo_aliases_owner_alias ON repo_aliases(canonical_name, alias)',
 ];
 
+const ONCALL_SCHEMA = [
+ 'CREATE TABLE oncall_alert_config(singleton INTEGER PRIMARY KEY CHECK(singleton=1),ingest_token_hash TEXT NOT NULL,poll_token_hash TEXT NOT NULL,created_at INTEGER NOT NULL)',
+ 'CREATE TABLE oncall_alert_deliveries(id TEXT PRIMARY KEY,delivery_key TEXT NOT NULL UNIQUE,payload_json TEXT NOT NULL,payload_digest TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN (\'pending\',\'leased\',\'saved\')),attempts INTEGER NOT NULL DEFAULT 0,available_at INTEGER NOT NULL,lease_token_hash TEXT,lease_until INTEGER,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,saved_at INTEGER)',
+ 'CREATE INDEX oncall_alerts_due ON oncall_alert_deliveries(status,available_at,lease_until,created_at)',
+];
+
 type PairingRow = { id: string; machine_id: string; alias: string; code_hash: string; scopes_json: string; expires_at: number; used_at: number | null };
 type CredentialRow = { actor_id: string; kind: Actor['kind']; resource_id: string | null; generation: string; scopes_json: string;family_id:string;client_id:string;expires_at:number|null;principal_email:string|null;revoked_at:number|null };
 
@@ -68,7 +74,7 @@ export class ControlDO {
     this.db = new MeteredDb(ctx.storage.sql);
     this.sqlReceipts = new SqlReceiptMeter(this.db);
     this.env = wrapSqlNamespaces(env, this.sqlReceipts) as Hub2Env;
-    this.ready=initializeSchema(ctx, this.db, 1, SCHEMA,[],()=>this.scheduleWake());
+    this.ready=initializeSchema(ctx, this.db, 2, SCHEMA,[ONCALL_SCHEMA],()=>this.scheduleWake());
     this.auth=new ControlAuth(ctx,this.db,this.env);this.workers=new WorkerCredentials(ctx,this.db,this.env);
   }
 
@@ -82,6 +88,12 @@ export class ControlDO {
       await this.ready;
       const workerResponse=await this.workers.fetch(request);if(workerResponse)return workerResponse;
       const authResponse=await this.auth.fetch(request);if(authResponse)return authResponse;
+      if (url.pathname === '/_oncall/config' && request.method === 'POST') return await this.configureOncall(request);
+      if (url.pathname === '/_oncall/ingest' && request.method === 'POST') return await this.ingestOncall(request);
+      if (url.pathname === '/_oncall/offers' && request.method === 'GET') return await this.oncallOffers(request);
+      const oncallDelivery = url.pathname.match(/^\/_oncall\/deliveries\/([0-9a-f-]{36})\/(ack|nack)$/i);
+      if (oncallDelivery && request.method === 'POST')
+        return await this.finishOncallDelivery(request, oncallDelivery[1], oncallDelivery[2] as 'ack' | 'nack');
       if (url.pathname === '/_actors/register' && request.method === 'POST') return await this.registerActor(request);
       if(url.pathname==='/api/model-policy'||url.pathname==='/_routing-policy')return await this.modelPolicy(request);
       if (url.pathname === '/_routes/register' && request.method === 'POST') return await this.registerRoute(request);
@@ -107,6 +119,131 @@ export class ControlDO {
       if (caught instanceof HttpError) return error(caught.code, caught.status);
       return error('internal_error', 500);
     }
+  }
+
+  private bearer(request: Request): string | undefined {
+    const match = (request.headers.get('Authorization') || '').match(/^Bearer ([A-Za-z0-9_-]{32,256})$/);
+    return match?.[1];
+  }
+
+  private async configureOncall(request: Request): Promise<Response> {
+    const actor = actorFrom(request);
+    const bootstrapToken = this.bearer(request);
+    const bootstrap = this.env.HUB2_RELEASE_MODE === 'bootstrap' && !!this.env.HUB2_BOOTSTRAP_TOKEN &&
+      !!bootstrapToken && safeEqual(bootstrapToken, this.env.HUB2_BOOTSTRAP_TOKEN);
+    if (!bootstrap && !hasScope(actor, 'operator:admin')) return error('forbidden', 403);
+    const body = await bodyObject(request, 4096);
+    if (body.rotate !== undefined && typeof body.rotate !== 'boolean') return error('invalid_request', 400);
+
+    const ingestToken = randomToken(32);
+    const pollToken = randomToken(32);
+    const ingestHash = await sha256Hex(ingestToken);
+    const pollHash = await sha256Hex(pollToken);
+    const now = Date.now();
+    const configured = this.db.transaction(this.ctx, () => {
+      const prior = this.db.one<{ singleton: number }>('SELECT singleton FROM oncall_alert_config WHERE singleton=1');
+      if (prior && body.rotate !== true) return false;
+      this.db.run(
+        'INSERT INTO oncall_alert_config(singleton,ingest_token_hash,poll_token_hash,created_at) VALUES(1,?,?,?) ON CONFLICT(singleton) DO UPDATE SET ingest_token_hash=excluded.ingest_token_hash,poll_token_hash=excluded.poll_token_hash,created_at=excluded.created_at',
+        ingestHash, pollHash, now,
+      );
+      return true;
+    });
+    if (!configured) return error('already_configured', 409);
+    return json({ configured: true, ingest_path: '/webhooks/oncall', offers_path: '/api/oncall-alerts/offers',
+      ingest_token: ingestToken, poll_token: pollToken,
+      secret_note: 'shown once; store in Dapier and the private host config' }, 201);
+  }
+
+  private async oncallAuthorized(request: Request, field: 'ingest_token_hash' | 'poll_token_hash'): Promise<boolean> {
+    const token = this.bearer(request);
+    if (!token) return false;
+    const row = this.db.one<Record<string, unknown>>(`SELECT ${field} FROM oncall_alert_config WHERE singleton=1`);
+    if (!row || typeof row[field] !== 'string') return false;
+    return safeEqual(await sha256Hex(token), String(row[field]));
+  }
+
+  private async ingestOncall(request: Request): Promise<Response> {
+    if (!(await this.oncallAuthorized(request, 'ingest_token_hash'))) return error('unauthorized', 401);
+    const deliveryKey = request.headers.get('X-Delivery-Id') || '';
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(deliveryKey)) return error('invalid_delivery_id', 400);
+    const raw = await boundedText(request, 65_536);
+    let payload: unknown;
+    try { payload = JSON.parse(raw); } catch { return error('invalid_json', 400); }
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return error('invalid_json_object', 400);
+    const canonicalPayload = JSON.stringify(payload);
+    const digest = await sha256Hex(canonicalPayload);
+    const id = crypto.randomUUID();
+    const now = Date.now();
+    const result = this.db.transaction(this.ctx, () => {
+      const prior = this.db.one<{ id: string; status: string; payload_digest: string }>(
+        'SELECT id,status,payload_digest FROM oncall_alert_deliveries WHERE delivery_key=?', deliveryKey);
+      if (prior) return safeEqual(prior.payload_digest, digest)
+        ? { delivery_id: prior.id, status: prior.status, replay: true }
+        : { conflict: true };
+      const pending = this.db.one<{ total: number }>("SELECT COUNT(*) AS total FROM oncall_alert_deliveries WHERE status<>'saved'");
+      if (Number(pending?.total || 0) >= 5000) throw new HttpError('oncall_queue_full', 503);
+      this.db.run('INSERT INTO oncall_alert_deliveries(id,delivery_key,payload_json,payload_digest,status,attempts,available_at,created_at,updated_at) VALUES(?,?,?,?,\'pending\',0,?,?,?)',
+        id, deliveryKey, canonicalPayload, digest, now, now, now);
+      return { delivery_id: id, status: 'pending', replay: false };
+    });
+    if ('conflict' in result) return error('delivery_id_conflict', 409);
+    return json(result, 202);
+  }
+
+  private async oncallOffers(request: Request): Promise<Response> {
+    if (!(await this.oncallAuthorized(request, 'poll_token_hash'))) return error('unauthorized', 401);
+    const now = Date.now();
+    const rows = this.db.all<{ id: string; payload_json: string; attempts: number }>(
+      "SELECT id,payload_json,attempts FROM oncall_alert_deliveries WHERE (status='pending' AND available_at<=?) OR (status='leased' AND lease_until<=?) ORDER BY created_at,id LIMIT 10",
+      now, now);
+    const staged = rows.map(row => ({ row, token: randomToken(32) }));
+    const tokenHashes = await Promise.all(staged.map(item => sha256Hex(item.token)));
+    const offers: Array<Record<string, unknown>> = [];
+    this.db.transaction(this.ctx, () => {
+      for (let index = 0; index < staged.length; index++) {
+        const { row, token } = staged[index];
+        const leaseHash = tokenHashes[index];
+        const leaseUntil = now + 10 * 60_000;
+        this.db.run(
+          "UPDATE oncall_alert_deliveries SET status='leased',attempts=attempts+1,lease_token_hash=?,lease_until=?,updated_at=? WHERE id=? AND ((status='pending' AND available_at<=?) OR (status='leased' AND lease_until<=?))",
+          leaseHash, leaseUntil, now, row.id, now, now,
+        );
+        const current = this.db.one<{ lease_token_hash: string | null }>(
+          'SELECT lease_token_hash FROM oncall_alert_deliveries WHERE id=?', row.id);
+        if (!current?.lease_token_hash || !safeEqual(current.lease_token_hash, leaseHash)) continue;
+        let payload: unknown;
+        try { payload = JSON.parse(row.payload_json); } catch { payload = {}; }
+        offers.push({ delivery_id: row.id, payload, lease_token: token, lease_until: leaseUntil,
+          attempt: Number(row.attempts) + 1 });
+      }
+    });
+    return json({ offers });
+  }
+
+  private async finishOncallDelivery(request: Request, id: string, action: 'ack' | 'nack'): Promise<Response> {
+    if (!(await this.oncallAuthorized(request, 'poll_token_hash'))) return error('unauthorized', 401);
+    const body = await bodyObject(request, 4096);
+    if (!boundedString(body.lease_token, 256)) return error('invalid_lease', 400);
+    const leaseHash = await sha256Hex(body.lease_token);
+    const row = this.db.one<{ status: string; lease_token_hash: string | null; attempts: number }>(
+      'SELECT status,lease_token_hash,attempts FROM oncall_alert_deliveries WHERE id=?', id);
+    if (!row) return error('delivery_not_found', 404);
+    if (action === 'ack' && row.status === 'saved') return json({ saved: true, replay: true });
+    if (row.status !== 'leased' || !row.lease_token_hash || !safeEqual(row.lease_token_hash, leaseHash))
+      return error('lease_conflict', 409);
+    const now = Date.now();
+    if (action === 'ack') {
+      this.db.transaction(this.ctx, () => this.db.run(
+        "UPDATE oncall_alert_deliveries SET status='saved',payload_json='{}',lease_token_hash=NULL,lease_until=NULL,saved_at=?,updated_at=? WHERE id=? AND status='leased' AND lease_token_hash=?",
+        now, now, id, leaseHash));
+      return json({ saved: true, replay: false });
+    }
+    const delay = Math.min(5 * 60_000, 15_000 * (2 ** Math.min(Number(row.attempts || 1) - 1, 4)));
+    this.db.transaction(this.ctx, () => this.db.run(
+      "UPDATE oncall_alert_deliveries SET status='pending',lease_token_hash=NULL,lease_until=NULL,available_at=?,updated_at=? WHERE id=? AND status='leased' AND lease_token_hash=?",
+      now + delay, now, id, leaseHash));
+    return json({ retry: true, retry_after_ms: delay });
   }
 
   private async verify(request: Request): Promise<Response> {
