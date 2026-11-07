@@ -38,6 +38,20 @@ else
   echo "   keeping existing .dev.vars"
 fi
 
+echo "== daily backup + staleness cron (no MTA on this VM; alerts via ALERT_CMD)"
+install -m 750 scripts/hub2-db-backup.sh /usr/local/sbin/hub2-db-backup.sh
+install -m 750 scripts/hub-db-backup-staleness.sh /usr/local/sbin/hub2-db-backup-staleness.sh
+install -m 600 deploy/hub2-db-backup.env /etc/hub2-db-backup.env
+install -m 600 deploy/hub2-db-backup-staleness.env /etc/hub2-db-backup-staleness.env
+cat > /etc/cron.d/hub2-db-backup <<'CRON'
+# agent-hub daily DB snapshot (root) — 04:20 CET-ish; logs to journal
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+20 4 * * * root /usr/local/sbin/hub2-db-backup.sh >>/var/log/hub2-db-backup.log 2>&1
+50 4 * * * root /usr/local/sbin/hub2-db-backup-staleness.sh >>/var/log/hub2-db-backup-staleness.log 2>&1
+CRON
+chmod 644 /etc/cron.d/hub2-db-backup
+
 echo "== services"
 systemctl daemon-reload
 systemctl enable --now agent-hub-hub2.service

@@ -166,14 +166,8 @@ test('orchestration refusals carry typed reasons and account release requires qu
    // Model the authoritative owner: release only against qualified proof.
    if(releaseBody.native_exit_confirmed!==true)return new Response(JSON.stringify({error:'unqualified_release_proof'}),{status:409});
    return new Response(JSON.stringify({reservation:{operation_id:'op:0',session_id:'s',machine_id:'m',epoch:3,state:'released'}}));}};
- const budgetMetrics=['worker_requests','worker_cpu_ms','do_requests','do_ws_messages','do_gb_ms','background_invocations','sqlite_rows_read','sqlite_rows_written','sqlite_byte_days','kv_reads','kv_writes','kv_deletes','kv_lists','kv_byte_days'];
- const unitMap=Object.fromEntries(budgetMetrics.map((key)=>[key,key==='do_requests'?64:10]));
- const envelopes=JSON.stringify({version:1,...Object.fromEntries(['normal','safety'].map((kind)=>[kind,{units:unitMap,max_do_calls:16,max_wall_ms:60000,provenance:'synthetic-release-envelope'}]))});
  const renv:any={CONTROL:f.env.CONTROL,MACHINES:f.env.MACHINES,PROJECTS:f.env.PROJECTS,MAILBOXES:f.env.MAILBOXES,
-  BUDGET:{idFromName:(id:string)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{
-   void (input instanceof Request?input:new Request(input,init));
-   return new Response(JSON.stringify({allowed:true}));}})},
-  ACCOUNTS:{idFromName:(id:string)=>id,get:()=>releaseAccount},HUB2_BUDGET_ENVELOPES:envelopes};
+  ACCOUNTS:{idFromName:(id:string)=>id,get:()=>releaseAccount}};
  const release=await releaseAccountCapacity(renv,{account_id:'account',attempt_operation_id:'op:0',session_id:'s',machine_id:'m',epoch:3},{native_exit_confirmed:true});
  assert.equal(release.released,true);
  assert.deepEqual(releaseBody,{operation_id:'op:0',session_id:'s',machine_id:'m',epoch:3,native_exit_confirmed:true});
