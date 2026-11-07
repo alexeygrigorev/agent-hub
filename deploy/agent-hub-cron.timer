@@ -1,0 +1,11 @@
+[Unit]
+Description=Fire Agent Hub scheduled trigger every 15 minutes (matches hub2 wrangler cron)
+
+[Timer]
+OnCalendar=*-*-* *:00/15:00
+AccuracySec=30s
+Persistent=false
+Unit=agent-hub-cron.service
+
+[Install]
+WantedBy=timers.target

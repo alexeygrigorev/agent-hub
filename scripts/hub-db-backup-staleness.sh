@@ -68,6 +68,10 @@ MSMTP_ACCOUNT="${MSMTP_ACCOUNT:-ses}"
 STATE_DIR="${STATE_DIR:-/var/lib/hub-db-backup}"
 DRY_RUN="${DRY_RUN:-0}"
 HUB_DB_STALE_DRILL="${HUB_DB_STALE_DRILL:-0}"
+# Artifact name glob. Defaults to the hub1 REST export shape; the GCP VM
+# deployment (port-gcloud) sets BACKUP_GLOB='hub2-do-*.tar.gz' for the
+# file-snapshot artifacts written by scripts/hub2-db-backup.sh.
+BACKUP_GLOB="${BACKUP_GLOB:-hub-do-*.json.gz}"
 
 NO_MAIL=0
 BACKUP_FAILED=0
@@ -113,7 +117,7 @@ unset _guard_path
 newest_epoch() {
   local root="$1" newest=""
   if [[ -d "$root" ]]; then
-    newest="$(find "$root" -type f -name 'hub-do-*.json.gz' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n 1 || true)"
+    newest="$(find "$root" -type f -name "$BACKUP_GLOB" -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n 1 || true)"
   fi
   if [[ -n "$newest" ]]; then
     printf '%s' "${newest%% *}" | cut -d. -f1
@@ -127,11 +131,11 @@ NEWEST=0
 NEWEST_PATH=""
 if [[ -n "$LOCAL_NEWEST" && "$LOCAL_NEWEST" -gt "$NEWEST" ]]; then
   NEWEST="$LOCAL_NEWEST"
-  NEWEST_PATH="$(find "$BACKUP_DIR" -type f -name 'hub-do-*.json.gz' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n 1 | cut -d' ' -f2-)"
+  NEWEST_PATH="$(find "$BACKUP_DIR" -type f -name "$BACKUP_GLOB" -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n 1 | cut -d' ' -f2-)"
 fi
 if [[ -n "$BOX_NEWEST" && "$BOX_NEWEST" -gt "$NEWEST" ]]; then
   NEWEST="$BOX_NEWEST"
-  NEWEST_PATH="$(find "$STORAGEBOX_DIR" -type f -name 'hub-do-*.json.gz' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n 1 | cut -d' ' -f2-)"
+  NEWEST_PATH="$(find "$STORAGEBOX_DIR" -type f -name "$BACKUP_GLOB" -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n 1 | cut -d' ' -f2-)"
 fi
 
 if [[ "$NEWEST" -le 0 ]]; then
