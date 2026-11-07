@@ -28,6 +28,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Validate Hub2 VM installer inputs
+        run: |
+          bash -n deploy/vm/install-hub2-node.sh
+          test -s deploy/agent-hub-hub2.service
+          test -s deploy/Caddyfile
       - name: Session controller shell regression tests
         run: |
           mkdir -p "${RUNNER_TEMP}/ops-watchdog-home"
