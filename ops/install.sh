@@ -22,4 +22,10 @@ done
 systemctl --user set-environment PATH="$dest/guard-bin:$(systemctl --user show-environment | sed -n 's/^PATH=//p')" BASH_ENV="$dest/guard-bin/env.sh" || true
 systemctl --user daemon-reload
 systemctl --user enable --now ops-watchdog.timer
+timer_active=$(systemctl --user is-active ops-watchdog.timer 2>/dev/null || true)
+timer_next=$(systemctl --user show ops-watchdog.timer -p NextElapseUSecRealtime --value 2>/dev/null || true)
+if [ "$timer_active" != active ] || [ -z "$timer_next" ] || [ "$timer_next" = n/a ]; then
+  echo "ops-watchdog.timer did not become active with a next elapse (active=$timer_active next=$timer_next)" >&2
+  exit 1
+fi
 echo "installed: $dest, ~/bin/orch-send, ~/bin/oncall-send, ops-watchdog.timer"

@@ -6,6 +6,10 @@
 # Needs: a (aplexer), git, gh, python3. Never prints secrets.
 set -uo pipefail
 
+# Direct start.sh invocations may run from SSH rather than the watchdog unit.
+# Keep worker placement consistent with the systemd-managed launch path.
+export APLEXER_LAUNCH_SYSTEM_SCOPE="${APLEXER_LAUNCH_SYSTEM_SCOPE:-system}"
+
 ROLE="${1:-}"; CMD="${2:-status}"
 case "$ROLE" in
   orchestrator) TAG=orchestrator-main; REPORTS="$HOME/tmp/agent-reports/orchestrator"; RUNDIR="$HOME/git/agent-hub-wt-orchestrator-run"; SUB=ops/orchestrator; INTAKE=67847fde-a00a-4689-8460-fbad45599f99 ;;
@@ -24,6 +28,7 @@ MIN_RESTART_GAP="${MIN_RESTART_GAP:-600}"
 PROOF_WINDOW="${PROOF_WINDOW:-600}"                      # a restart must produce a fresh tick within 10 min
 FALLBACK_ENGINE="${ORCH_FALLBACK_ENGINE:-antigravity}"  # second recovery path prefers Ag; selection excludes the failed route
 MAX_ONCALL_INBOX_AGE="${MAX_ONCALL_INBOX_AGE:-1200}"
+STARTUP_WORK_WAIT="${STARTUP_WORK_WAIT:-60}"
 ENGINE_EXCLUDE=""
 ENGINE_SELECTED="${ENGINE_SELECTED:-0}"
 STATE="$REPORTS/state"; mkdir -p "$REPORTS/inbox/processed" "$REPORTS/history" "$STATE"
@@ -172,6 +177,57 @@ prep_worktree() {
 }
 
 screen() { a capture "$1" --screen --plain 2>/dev/null; }
+
+reported_work_state() {
+  local raw
+  raw=$(t a status "$1" --json 2>/dev/null) || { echo unknown; return 0; }
+  printf '%s\n' "$raw" | python3 -c '
+import json,sys
+try:
+    session=json.load(sys.stdin)
+except Exception:
+    print("unknown"); sys.exit(0)
+if session.get("worker_alive") is not True:
+    print("dead")
+elif session.get("reported_state") in ("working", "idle"):
+    print(session["reported_state"])
+else:
+    print("unknown")
+'
+}
+
+worker_scope_safe() {
+  local raw
+  raw=$(t a status "$1" --json 2>/dev/null) || return 1
+  printf '%s\n' "$raw" | python3 -c '
+import json,sys
+try:
+    session=json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+if session.get("worker_alive") is not True:
+    sys.exit(1)
+for key in ("worker_placement", "workload_placement"):
+    placement=session.get(key)
+    if not isinstance(placement, dict) or placement.get("placement") != "system_slice" or placement.get("vulnerable_to_user_manager_exit") is not False:
+        sys.exit(1)
+sys.exit(0)
+'
+}
+
+await_reported_work() {
+  local id="$1" seconds="$STARTUP_WORK_WAIT" tries state saw_idle=0 i
+  [[ "$seconds" =~ ^[0-9]+$ ]] || seconds=60
+  tries=$((seconds / 2))
+  for ((i=0; i<=tries; i++)); do
+    state=$(reported_work_state "$id")
+    [ "$state" = working ] && return 0
+    [ "$state" = idle ] && saw_idle=1
+    [ "$i" -lt "$tries" ] && sleep 2
+  done
+  [ "$saw_idle" = 1 ] && return 1
+  return 2
+}
 
 # Prefer a configured non-Claude route whose Hub quota is fresh and above its
 # provider reserve; when Hub quota is unavailable, use the locally configured
@@ -393,11 +449,17 @@ start() {
   stop_old || return 1
   prep_worktree || return 1
   date +%s > "$STATE/last_start"
-  # own transient scope so the session outlives the (oneshot) watchdog unit cgroup
-  systemd-run --user --scope --collect -q -- a start --workspace "$RUNDIR/$SUB" --tag "$TAG" --engine "$ENGINE" \
+  # Let aplexer place both worker processes in a system-manager scope. An
+  # outer --user --scope would keep them vulnerable to user-manager exit.
+  a start --workspace "$RUNDIR/$SUB" --tag "$TAG" --engine "$ENGINE" \
     --label "ops.role=$ROLE" --label "hub.intake=$INTAKE" >/dev/null 9>&- || { log "a start failed"; return 1; }
   local id; id=$(find_session); [ -n "$id" ] || { log "session not found after start"; return 1; }
   log "started session $id; waiting for prompt"
+  if ! worker_scope_safe "$id"; then
+    log "worker placement is not verified in a system-manager scope; stopping new session $id"
+    t a kill "$id" >/dev/null 2>&1 || log "could not stop unsafe-scope session $id"
+    return 1
+  fi
   local i s ready=0
   for i in $(seq 1 60); do
     sleep 3; s=$(screen "$id")
@@ -408,9 +470,35 @@ start() {
   [ "$ready" = 1 ] || { log "prompt readiness failed: $id"; return 1; }
   local prompt="Run the $ROLE check now: follow $RUNDIR/$SUB/hourly-check.md, starting with step 0 (skills sync, handoff, inbox). Hub scheduled prompts continue the recurring work for session tag $TAG."
   [ "$ROLE" = orchestrator ] && prompt="Run the orchestrator tick now: follow $BRIEF (durable brief) and $RUNDIR/$SUB/CLAUDE.md; append one line to $TICKS. Hub scheduled prompts continue the recurring work for session tag $TAG."
-  a send "$id" "$prompt" --enter >/dev/null; local rc=$?
+  local delivery rc
+  delivery=$(a send "$id" "$prompt" --enter --json 2>&1); rc=$?
+  if [ "$rc" -eq 3 ]; then
+    log "startup prompt was delivered but the agent stayed idle; stopping the unstarted session $id"
+    t a kill "$id" >/dev/null 2>&1 || log "could not stop idle startup session $id"
+    return 1
+  fi
+  if [ "$rc" -ne 0 ]; then
+    log "startup prompt delivery failed (rc=$rc) for $id"
+    return "$rc"
+  fi
   echo "$prompt" > "$STATE/loop_command"
-  log "engine-neutral startup prompt sent (rc=$rc); Hub schedules provide recurring work"
+  if grep -qiE 'unverified:|bytes written only|not checkable' <<<"$delivery"; then
+    if await_reported_work "$id"; then
+      log "startup prompt was unverified by the engine screen model; live reported work confirmed for $id"
+    else
+      local proof_rc=$?
+      if [ "$proof_rc" -eq 1 ]; then
+        log "startup prompt was unverified and session stayed idle; stopping the unstarted session $id"
+        t a kill "$id" >/dev/null 2>&1 || log "could not stop unverified idle session $id"
+      else
+        log "startup prompt was unverified and live-work state could not be read for $id"
+      fi
+      return 1
+    fi
+  else
+    log "engine acknowledged startup work for $id"
+  fi
+  log "engine-neutral startup prompt sent; Hub schedules provide recurring work"
   return "$rc"
 }
 
@@ -494,9 +582,14 @@ check_proof() {
   # and the next recovery path starts, as AC2 requires.
   rm -f "$STATE/proof_due"
   log "recovery proof FAILED (path ${path:-1}): no tick within ${PROOF_WINDOW}s after start${id:+ (session $id alive)}"
-  restart_failed proof_failed
+  restart_failed proof_failed || true
   local next=2; [ "${path:-1}" = 2 ] && next=1
-  recover "$next" "no tick within ${PROOF_WINDOW}s after recovery path ${path:-1}" "$failed_engine" || true
+  if recover "$next" "no tick within ${PROOF_WINDOW}s after recovery path ${path:-1}" "$failed_engine"; then
+    # The old proof failed, but recovery started successfully and now has a new
+    # proof window. Do not mark this watchdog invocation failed solely because
+    # it performed the recovery action.
+    return 3
+  fi
   return 1
 }
 
@@ -514,7 +607,7 @@ check() {
     recover 1 "oncall inbox item older than ${MAX_ONCALL_INBOX_AGE}s"; return
   fi
   if [ "$ROLE" = orchestrator ]; then
-    check_proof; case $? in 1) return 1 ;; 2) return 0 ;; esac
+    check_proof; case $? in 1) return 1 ;; 2|3) return 0 ;; esac
     id=$(find_session) || { log "session census failed"; restart_failed census_failed; return 1; }
   fi
   if [ -n "$id" ] && [ "$ROLE" = orchestrator ]; then
