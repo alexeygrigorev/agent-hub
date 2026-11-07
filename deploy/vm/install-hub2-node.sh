@@ -7,7 +7,8 @@
 # Budget envelopes are retired with the Cloudflare budget checkers.
 set -euo pipefail
 
-STAGING="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The service unit and Caddyfile live in deploy/, beside vm/.
+STAGING="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO=/opt/agent-hub
 STATE=/var/lib/agent-hub
 DB_DIR=$STATE/hub2-db
