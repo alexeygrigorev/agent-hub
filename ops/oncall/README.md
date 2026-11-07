@@ -8,8 +8,9 @@ incident routing across Alexey's infrastructure. It receives messages through
 
 Read the [on-call and orchestrator architecture](../../docs/ONCALL-ORCHESTRATOR-ARCHITECTURE.md)
 for the purpose of the session, the current Developer-mediated alert path,
-the intended direct route, the watchdog's recovery role, and the intended
-oncall model rule. This is an ops role for services beyond the Hub product.
+the intended direct route, the watchdog's recovery role, and the configured
+oncall model policy. Verify the live session before assuming it has switched
+models. This is an ops role for services beyond the Hub product.
 
 Role instructions: [`CLAUDE.md`](CLAUDE.md). Hourly check:
 [`hourly-check.md`](hourly-check.md). Start or restart it with

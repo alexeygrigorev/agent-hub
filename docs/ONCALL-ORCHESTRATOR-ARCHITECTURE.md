@@ -91,12 +91,16 @@ work, and hand it the right instructions. `oncall-engineer` investigates
 incidents; `orchestrator-main` drives Hub queue work. Developer relays
 `NEEDS_ALEXEY.md` when a decision truly belongs to Alexey.
 
-## Intended oncall model rule
+## Oncall model policy
 
-Oncall should use a cheaper daily model. The intended rule is no Argon, Astra,
-Opus, or high effort for oncall. A separate start-path change is in progress;
-this policy describes the target and does not establish which model the live
-session currently uses.
+The official `oncall-engineer` start and watchdog recovery paths are now pinned
+to OpenCode with `opencode-go/muse-spark-1.3-contributor`. They do not select
+Argon (including medium), Astra, Opus, or a high-effort model. When Hub quota
+is unavailable, the local fallback stays on the pinned route; if that route is
+unavailable, recovery holds rather than widening the allowlist. This describes
+the configured start path. It does not prove that an already-running live
+session has restarted on that model; verify the live session before claiming
+it has switched.
 
 ## Pointers
 

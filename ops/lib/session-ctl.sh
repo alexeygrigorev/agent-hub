@@ -17,20 +17,19 @@ BASE_REPO="${BASE_REPO:-$HOME/git/agent-hub}"           # donor clone for the ru
 SKILLS_REPO="${SKILLS_REPO:-$HOME/git/bots-management-ops}"   # read-only clone of alexeygrigorev/bots-management (bot-skills is archived)
 SKILLS_REMOTE="${SKILLS_REMOTE:-alexeygrigorev/bots-management}"
 SKILLS_DIR="${SKILLS_DIR:-$SKILLS_REPO/.agents/skills}"   # skills live under .agents/skills
-# Oncall triage runs on opencode by default (Alexey 2026-11-07): no argon for ops.
-case "$ROLE" in
-  oncall) ENGINE="${ENGINE:-${ORCH_ENGINE:-opencode}}" ;;
-  *) ENGINE="${ENGINE:-${ORCH_ENGINE:-antigravity}}" ;;
-esac
+if [ "$ROLE" = oncall ]; then
+  # The persistent oncall coordinator stays on the explicitly named daily Muse model.
+  # Do not inherit the old shared Antigravity preference or the orchestrator fallback.
+  ENGINE="${ONCALL_ENGINE:-${ENGINE:-opencode}}"
+  FALLBACK_ENGINE="opencode"
+else
+  ENGINE="${ENGINE:-${ORCH_ENGINE:-antigravity}}"
+  FALLBACK_ENGINE="${ORCH_FALLBACK_ENGINE:-antigravity}"  # second recovery path prefers Ag; selection excludes the failed route
+fi
 TICKS="$HOME/tmp/agent-reports/orchestrator-ticks.jsonl"; MAX_TICK_AGE="${MAX_TICK_AGE:-1800}"
 BRIEF="$HOME/tmp/briefs/orchestrator-main.md"
 MIN_RESTART_GAP="${MIN_RESTART_GAP:-600}"
 PROOF_WINDOW="${PROOF_WINDOW:-600}"                      # a restart must produce a fresh tick within 10 min
-# Oncall fallback avoids antigravity/argon too (Alexey 2026-11-07).
-case "$ROLE" in
-  oncall) FALLBACK_ENGINE="${ORCH_FALLBACK_ENGINE:-grok}" ;;
-  *) FALLBACK_ENGINE="${ORCH_FALLBACK_ENGINE:-antigravity}" ;;  # second recovery path prefers Ag; selection excludes the failed route
-esac
 MAX_ONCALL_INBOX_AGE="${MAX_ONCALL_INBOX_AGE:-1200}"
 ENGINE_EXCLUDE=""
 ENGINE_SELECTED="${ENGINE_SELECTED:-0}"
@@ -181,10 +180,10 @@ prep_worktree() {
 
 screen() { a capture "$1" --screen --plain 2>/dev/null; }
 
-# Prefer a configured non-Claude route whose Hub quota is fresh and above its
-# provider reserve; when Hub quota is unavailable, use the locally configured
-# engine list. The allowlist excludes Codex model aliases so a watchdog cannot
-# pick sol/astra/argon with an unknown effort setting.
+# Prefer a configured route whose Hub quota is fresh and above its provider
+# reserve; when Hub quota is unavailable, use the locally configured engine
+# list. Oncall has a narrower allowlist and a pinned model so a recovery cannot
+# inherit Antigravity's Argon default or pick an unknown high-effort model.
 quota_engine() {  # $1 preferred, $2 excluded route, $3 fallback preference
   local quota engines
   quota=$(HUB_CONFIG_FILE="${HUB_CONFIG_FILE:-$HOME/.config/agent-hub/cli.json}" T=30 t hub quota --json 2>/dev/null) || return 2
@@ -192,7 +191,7 @@ quota_engine() {  # $1 preferred, $2 excluded route, $3 fallback preference
   printf '%s\n%s\n' "$quota" "$engines" | python3 -c '
 import json, math, sys
 
-preferred, excluded, fallback = sys.argv[1:4]
+preferred, excluded, fallback, role = sys.argv[1:5]
 raw = sys.stdin.read()
 decoder = json.JSONDecoder()
 try:
@@ -208,8 +207,11 @@ if not isinstance(quota, dict) or "error" in quota or not isinstance(quota.get("
 
 # Hub currently labels the Google quota pool "gemini". That is quota metadata;
 # the only Google-family engine this watchdog selects is Antigravity.
-allowed = {"antigravity": "gemini", "grok": "grok",
-           "opencode": "go", "zcodex": "zai"}
+if role == "oncall":
+    allowed = {"opencode": "go"}
+else:
+    allowed = {"antigravity": "gemini", "grok": "grok",
+               "opencode": "go", "zcodex": "zai"}
 aliases = {"gemini": "antigravity"}
 def normalize_engine(value):
     value = value.strip().lower()
@@ -265,7 +267,8 @@ def has_headroom(engine, pool):
     return remaining > reserve
 
 order = []
-for candidate in (preferred, fallback, "antigravity", "opencode", "grok", "zcodex"):
+default_order = ("opencode",) if role == "oncall" else ("antigravity", "opencode", "grok", "zcodex")
+for candidate in (preferred, fallback, *default_order):
     candidate = normalize_engine(candidate)
     if candidate in allowed and candidate not in order:
         order.append(candidate)
@@ -280,7 +283,7 @@ for candidate in order:
         print(candidate)
         sys.exit(0)
 sys.exit(1)
-' "$1" "$2" "$3"
+' "$1" "$2" "$3" "$ROLE"
 }
 
 local_engine() {  # $1 preferred, $2 excluded route, $3 fallback preference, $4 exact-only
@@ -289,8 +292,8 @@ local_engine() {  # $1 preferred, $2 excluded route, $3 fallback preference, $4 
   printf '%s\n' "$engines" | python3 -c '
 import json, sys
 
-preferred, excluded, fallback, exact = sys.argv[1:5]
-allowed = {"antigravity", "grok", "opencode", "zcodex"}
+preferred, excluded, fallback, exact, role = sys.argv[1:6]
+allowed = {"opencode"} if role == "oncall" else {"antigravity", "grok", "opencode", "zcodex"}
 aliases = {"gemini": "antigravity"}
 def normalize_engine(value):
     value = value.strip().lower()
@@ -321,7 +324,8 @@ if exact == "1":
     order = [preferred]
 else:
     order = []
-    for candidate in (preferred, fallback, "antigravity", "opencode", "grok", "zcodex"):
+    default_order = ("opencode",) if role == "oncall" else ("antigravity", "opencode", "grok", "zcodex")
+    for candidate in (preferred, fallback, *default_order):
         candidate = normalize_engine(candidate)
         if candidate in allowed and candidate not in order:
             order.append(candidate)
@@ -338,11 +342,24 @@ for allow_excluded in (False, True):
         print(candidate)
         sys.exit(0)
 sys.exit(1)
-' "$1" "$2" "$3" "$4"
+' "$1" "$2" "$3" "$4" "$ROLE"
+}
+
+enforce_oncall_route() {
+  [ "$ROLE" = oncall ] || return 0
+  if [ "$ENGINE" != opencode ]; then
+    log "oncall route '$ENGINE' is disallowed; using OpenCode Muse Spark"
+    ENGINE=opencode
+    ENGINE_SELECTED=0
+  fi
+  # Recovery path 2 must stay on the same safe route; environment settings
+  # intended for orchestrator recovery cannot widen the oncall allowlist.
+  FALLBACK_ENGINE=opencode
 }
 
 select_engine() {
   local selected quota_status
+  enforce_oncall_route
   if [ "$ENGINE_SELECTED" = 1 ]; then
     selected=$(local_engine "$ENGINE" "" "" 1) || {
       log "preselected engine is not a configured non-Claude aplexer engine; recovery held"
@@ -393,7 +410,7 @@ oncall_inbox_stalled() {
 }
 
 start() {
-  local current
+  local current model_args=()
   current=$(find_session) || { log "session census failed"; return 1; }
   [ -n "$current" ] && { log "already running: $current"; return 0; }
   select_engine || return 1
@@ -401,10 +418,13 @@ start() {
   stop_old || return 1
   prep_worktree || return 1
   date +%s > "$STATE/last_start"
-  # Antigravity without an explicit model lands on the agy default (argon).
-  # Ops never runs argon (Alexey 2026-11-07): pin flash unless ORCH_MODEL names one.
   model_args=()
-  if [ "$ENGINE" = antigravity ]; then
+  if [ "$ROLE" = oncall ]; then
+    [ "$ENGINE" = opencode ] || { log "refusing unsafe oncall engine $ENGINE"; return 1; }
+    model_args=(--model opencode-go/muse-spark-1.3-contributor)
+    log "oncall model pinned to opencode-go/muse-spark-1.3-contributor"
+  elif [ "$ENGINE" = antigravity ]; then
+    # Preserve the orchestrator's explicit Flash default; never leak it into oncall.
     model_args=(--model "${ORCH_MODEL:-gemini-3.8-flash-high}")
   fi
   # own transient scope so the session outlives the (oneshot) watchdog unit cgroup

@@ -1,6 +1,13 @@
 # orchestrator-main and oncall-engineer: runbook
 
-Two persistent interactive ops sessions on Hetzner handle Hub queue work and cross-service incident triage. Developer (the Grok Bot overseer) forwards work and checks progress; the sessions perform the investigation and queue work. For the architecture, current alert path, and intended end state, see [On-call and orchestrator architecture](../../docs/ONCALL-ORCHESTRATOR-ARCHITECTURE.md). The watchdog chooses a configured non-Claude engine only when `hub quota` reports fresh headroom. Contract: Hub intake `67847fde-a00a-4689-8460-fbad45599f99` (AC1-AC14).
+Two persistent operations sessions on Hetzner handle Hub queue work and
+cross-service incident triage. Developer (the Grok Bot overseer) forwards work
+and checks progress; the sessions do investigation and queue work. The watchdog
+selects from each role's configured engine allowlist when `hub quota` reports
+fresh headroom; if Hub quota is unavailable, local fallback uses the same role
+allowlist. For the purpose, current alert path, and intended end state, see
+[On-call and orchestrator architecture](../../docs/ONCALL-ORCHESTRATOR-ARCHITECTURE.md).
+Contract: Hub intake `67847fde-a00a-4689-8460-fbad45599f99` (AC1-AC14).
 
 | | orchestrator-main | oncall-engineer |
 |---|---|---|
@@ -22,21 +29,41 @@ Copies `session-ctl.sh`, `watchdog.sh` to `~/.local/share/agent-hub-ops/`, `orch
 ```bash
 ops/orchestrator/start.sh        # or: ops/oncall/start.sh
 ```
-It (1) fetches origin/main and creates/refreshes the run worktree (detached at origin/main), (2) syncs skills (below), (3) selects a configured non-Claude engine with fresh quota headroom and starts it, (4) accepts the bypass/trust prompts, and (5) sends one engine-neutral kickoff prompt. Recurring work is intended to come from Hub scheduled prompts attached to the session tag; the live cadence is described below and on the [architecture page](../../docs/ONCALL-ORCHESTRATOR-ARCHITECTURE.md).
+It (1) fetches origin/main and creates or refreshes the run worktree (detached
+at origin/main), (2) syncs skills (below), (3) selects a configured
+role-allowed engine with fresh quota headroom and starts it, (4) accepts the
+bypass/trust prompts, and (5) sends one engine-neutral kickoff prompt. The
+live sessions currently use Claude `/loop` for hourly work as a stopgap; Hub
+scheduled prompts attached to the session tags are the engine-neutral target.
+See the [architecture page](../../docs/ONCALL-ORCHESTRATOR-ARCHITECTURE.md) for
+the current cadence and transition status.
 
 ## Startup prompt and schedule
 
-Both engine preferences default to `antigravity`. The Hub quota pool is still
-named `gemini` in `provider` metadata; that legacy provider key does not select
-the old Gemini CLI. Any legacy `ENGINE=gemini` or `ORCH_ENGINE=gemini` preference is normalized to
-Antigravity. If the preferred route is unavailable, selection tries configured
+`orchestrator-main` still prefers `antigravity`; its other configured non-Claude
+routes remain OpenCode, Grok and ZCode. `oncall-engineer` is restricted to
+OpenCode with the explicit model `opencode-go/muse-spark-1.3-contributor`.
+Its start and every watchdog recovery pass that model to `a start --model`;
+its allowlist does not include Antigravity, Gemini, Grok, Codex or ZCode. An
+unavailable Hub quota or an unsafe engine override therefore cannot select
+Argon, Astra, Opus or a high-effort route for oncall. If the pinned OpenCode
+route is not configured or lacks fresh quota when Hub is available, recovery
+holds rather than widening the allowlist.
+
+For orchestrator only, the Hub quota pool is still named `gemini` in `provider`
+metadata; that legacy provider key does not select the old Gemini CLI. Any
+legacy `ENGINE=gemini` or `ORCH_ENGINE=gemini` preference is normalized to
+Antigravity. If its preferred route is unavailable, selection tries configured
 non-Claude routes in order: Antigravity, OpenCode, Grok, then ZCode.
 The start script sends the role's hourly check (or orchestrator brief) as a normal prompt and records it in `<reports>/state/loop_command`. It does not issue Claude Code's `/loop` command. The current live sessions still use Claude `/loop` for hourly work as a stopgap. Hub scheduled prompts attached to `orchestrator-main` and `oncall-engineer` are the engine-neutral target; verify the live attachment and deliveries with `hub schedules list` before treating that transition as complete.
 
-The oncall model target is a cheaper daily model, with no Argon, Astra, Opus,
-or high effort. The start-path change that enforces this is being handled
-separately; the generic engine-selection behavior above does not prove which
-model the live oncall session uses.
+The `oncall-engineer` start and watchdog recovery paths are pinned to OpenCode
+with `opencode-go/muse-spark-1.3-contributor`. They do not select Argon,
+including medium, Astra, Opus, or a high-effort model. When Hub quota is
+unavailable, local fallback stays on the pinned route; if that route is
+unavailable, recovery holds rather than widening the allowlist. This is the
+configured start policy and does not prove which model an already-running live
+session uses; verify the live session before claiming it has switched.
 
 ## Skills (AC14)
 Source: clone of `alexeygrigorev/bot-skills` at `~/git/bot-skills-ops` (note: `~/git/bot-skills` is not a git repo on Hetzner). `session-ctl.sh <role> skills-sync` runs `git pull --ff-only` and symlinks every `<skill>/SKILL.md` directory into `<run dir>/.claude/skills/` (the dir is git-excluded in the run worktree). It runs on every start/restart and as step 0 of each scheduled check. Both role instruction files list the skills to read and follow. If a pull fails the last checkout is used and logged.
@@ -53,7 +80,7 @@ For the orchestrator a live process is not enough. `check`:
 
 Hub-side check (`src/ops-liveness.ts`, minute alarm; `hub ops status`): it works without this watchdog and without the session. It alerts only after automatic recovery failed twice: the watchdog reports 2 consecutive failures, or the watchdog has been silent for two 30-min windows. Its backlog check counts open intakes with AC against intake sessions starting or running. After 30 min with none, Hub records why it was idle and starts the oldest ready intake through canonical admission, at most once per 30 min. Two starts in a row that produce no working session raise an alert. `HUB_OPS_LIVENESS=false` disables it, and `HUB_BACKLOG_IDLE_KICK=false` disables only the start. Details: `docs/ORCHESTRATOR-LIVENESS.md`.
 
-The oncall role checks dead processes, limit screens, and unprocessed inbox items older than 20 min. The orchestrator also checks limit screens and stale ticks. Recovery requires a configured non-Claude route with fresh Hub quota headroom; Claude and Codex model routes are excluded. Restarts outside recovery are rate limited (10 min). The unit sets `APLEXER_LAUNCH_SYSTEM_SCOPE=system` so sessions it starts do not die with the oneshot unit's cgroup. Manual run: `systemctl --user start ops-watchdog.service`; logs: `journalctl --user -u ops-watchdog.service`; `systemctl --user list-timers ops-watchdog.timer`.
+The oncall role checks dead processes, limit screens, and unprocessed inbox items older than 20 min. Its recovery uses only the pinned OpenCode Muse Spark route; fresh Hub quota is required when Hub is available, and an unavailable Hub falls back locally to that same route. The orchestrator also checks limit screens and stale ticks. Its recovery requires a configured non-Claude route with fresh Hub quota headroom; Claude and Codex model routes are excluded. Restarts outside recovery are rate limited (10 min). The unit sets `APLEXER_LAUNCH_SYSTEM_SCOPE=system` so sessions it starts do not die with the oneshot unit's cgroup. Manual run: `systemctl --user start ops-watchdog.service`; logs: `journalctl --user -u ops-watchdog.service`; `systemctl --user list-timers ops-watchdog.timer`.
 
 ## Restart / handoff (AC3)
 - Context under 15%: the session writes `handoff.md` and runs `session-ctl.sh <role> handoff-restart` (detached; kills itself and starts a fresh one, which reads the handoff in step 0).
@@ -103,4 +130,4 @@ Also a bot-skills skill: `grok-limits-playbook`.
 The Hub now exposes authenticated webhook endpoints that deliver payloads into a target session (intake `19ec91c2`): routes, delivery status and audit live at hub.dtcdev.click `/webhooks.html`, CLI `hub webhooks create|list|delete|test`. The dev@ mailbox route targets **oncall-engineer** (not orchestrator-main); see [docs/WEBHOOKS.md](../docs/WEBHOOKS.md) for auth (token/HMAC), rate limits, size caps and the test command. Dapier's live webhook is only repointed once the old Grok Bot wake keeps working (dual-deliver); deleting the old webhook needs Alexey.
 
 ## Rules
-Standing rules live in each role instruction file (AC6). Watchdog-selected engines must be non-Claude and have fresh Hub quota headroom.
+Standing rules live in each role instruction file (AC6). Watchdog-selected engines must be non-Claude and have fresh Hub quota headroom. Oncall is pinned to the OpenCode Muse Spark model above; never use Argon, Astra, Opus or high effort for `oncall-engineer`.
