@@ -165,8 +165,10 @@ reserved-but-unattached addresses (~USD 3.6/month), so never release it
 without attaching it elsewhere. `vm_ipv4` in `aws-infra/sandbox/agent-hub`
 should therefore no longer drift after a VM restart.
 
-GCP access from this machine: the PATH `gcloud` (`~/.local/bin/gcloud`) is a
-phone-cloud-gate wrapper that fails token refresh with HTTP 403. The working
-invocation is the real SDK against the operator's SDK config directly:
-`CLOUDSDK_CONFIG=~/tmp/gcp ~/.local/share/google-cloud-cli/google-cloud-sdk/bin/gcloud ...`
-(project `dtcdev-click`).
+GCP access from this machine: ad-hoc credentials were removed on 2026-11-07
+(`~/tmp/gcp` deleted, tokens revoked where the token type allowed it) so the
+account is reachable only through the phone-cloud-gate wrapper
+(`~/.local/bin/gcloud`, approval on the operator's phone). The real SDK binary
+(`~/.local/share/google-cloud-cli/google-cloud-sdk/bin/gcloud`) has no
+credentialed config anymore. CI deploys need no GCP access (SSH deploy key),
+and the VM IP is static, so routine operation is unaffected.
