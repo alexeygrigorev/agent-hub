@@ -4,7 +4,6 @@ import { sha256Hex } from './crypto';
 import { actorFrom, bodyObject, error, hasScope, HttpError, json } from './http';
 import { admitLaunch, advanceDispatch, holdWireCode, releaseAccountCapacity, type AdmissionOutcome, type AdmissionPlan } from './resource-manager';
 import { nativeReturncode } from './native-exit';
-import { budgetedBackgroundRequest, type BudgetKind } from './budget-edge';
 import { PROJECT_WORK_SCHEMA, ProjectWork, type ProjectWorkHooks } from './project-work';
 import type { Actor, Hub2Env, JsonRecord } from './types';
 
@@ -135,27 +134,19 @@ export class ProjectDO {
   async alarm(): Promise<void> {
     await this.ready;
     const now = Date.now();
-    const pause = await this.ctx.storage.get<number>('hub2:budget_pause_until');
-    if (Number.isSafeInteger(pause) && Number(pause) > now) {
-      if (await this.ctx.storage.getAlarm() !== Number(pause)) { this.db.alarmOperation(); await this.ctx.storage.setAlarm(Number(pause)); }
-      return;
-    }
-    if (pause !== undefined) await this.ctx.storage.delete('hub2:budget_pause_until');
-    const guarded = await budgetedBackgroundRequest(this.env, 'background_effect', async () => {
+    try {
       await this.work.alarm(now);
       await this.retryPendingIntakeRoutes(now);
       const due = this.db.all<{ operation_id: string }>(
         `SELECT operation_id FROM dispatch_sagas WHERE due=1 AND state IN ('pending_machine','staged','account_confirmed') AND next_action_at <= ? ORDER BY next_action_at, operation_id LIMIT 20`, now,
       );
       for (const row of due) {
-        if (!await this.dispatchSaga(row.operation_id, 'retry')) break;
+        if (!await this.dispatchSaga(row.operation_id)) break;
       }
+    } catch (caught) {
+      console.error('[hub2] project alarm failed:', caught);
+    } finally {
       await this.scheduleNext();
-      return new Response(null, { status: 204 });
-    });
-    if (!guarded.ok) {
-      const retryAt = await this.pauseForBudget(guarded);
-      if (retryAt !== undefined) await this.scheduleNext();
     }
   }
 
@@ -358,8 +349,7 @@ export class ProjectDO {
         required_capabilities: [interactive ? 'interactive' : 'headless', ...requiredCapabilities],
       };
     } else {
-      const selected = await budgetedBackgroundRequest(this.env, 'scheduled_start', async guardedEnv => {
-      const decision = await admitLaunch(guardedEnv, {
+      const decision = await admitLaunch(this.env, {
           operation_id: operationId,
           ...(typeof machineInput === 'string' ? { machine_id: machineInput } : {}),
           ...(typeof engineInput === 'string' ? { engine: engineInput } : {}),
@@ -367,14 +357,7 @@ export class ProjectDO {
           ...(typeof effortInput === 'string' ? { effort: effortInput } : {}),
           ...(overrideReason ? { override_reason: overrideReason } : {}),
           interactive, with_goal: withGoal, required_capabilities: requiredCapabilities,
-        });
-        return Response.json(decision);
-      });
-      if (!selected.ok) {
-        await this.pauseForBudget(selected);
-        return selected;
-      }
-      const decision = await selected.json() as AdmissionOutcome;
+        }) as AdmissionOutcome;
       if (!decision.ok) {
         // Typed Resource Manager hold before any saga exists: refuse with the
         // wire-compatible code; the next start attempt re-runs selection after
@@ -422,22 +405,17 @@ export class ProjectDO {
     return saga ? json({ session: this.sagaView(saga) }, ['offered', 'claimed', 'running'].includes(saga.state) ? 201 : 202) : error('dispatch_state_unavailable', 503);
   }
 
-  private async dispatchSaga(operationId: string, kind: BudgetKind = 'scheduled_start'): Promise<boolean> {
-    const result = await budgetedBackgroundRequest(this.env, kind, async guardedEnv => {
-      await this.dispatchSagaEffects(operationId, guardedEnv);
-      return new Response(null, { status: 204 });
-    });
-    if (!result.ok) {
-      const retryAt = await this.pauseForBudget(result);
-      if (retryAt !== undefined) await this.deferSagaUntil(operationId, retryAt, 'budget_paused');
-      else {
-        const current = this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?', operationId);
-        if (current && ['pending_machine', 'staged', 'account_confirmed'].includes(current.state)) await this.deferSaga(current, 'budget_dispatch_unavailable');
-      }
+  private async dispatchSaga(operationId: string): Promise<boolean> {
+    try {
+      await this.dispatchSagaEffects(operationId, this.env);
+      return true;
+    } catch (caught) {
+      if (!(caught instanceof HttpError)) console.error('[hub2] dispatch saga failed:', caught);
+      const current = this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?', operationId);
+      if (current && ['pending_machine', 'staged', 'account_confirmed'].includes(current.state)) await this.deferSaga(current, 'budget_dispatch_unavailable');
       await this.scheduleNext();
       return false;
     }
-    return true;
   }
 
   private async dispatchSagaEffects(operationId: string, env: Hub2Env): Promise<void> {
@@ -524,25 +502,6 @@ export class ProjectDO {
     });
   }
 
-  private async pauseForBudget(response: Response): Promise<number | undefined> {
-    let payload: { error?: unknown; retry_at?: unknown };
-    try { payload = await response.clone().json() as { error?: unknown; retry_at?: unknown }; }
-    catch { return undefined; }
-    if (payload.error !== 'budget_paused' && !(typeof payload.error === 'string' && payload.error.startsWith('budget_'))) return undefined;
-    const now = Date.now();
-    const tomorrow = Date.UTC(new Date(now).getUTCFullYear(), new Date(now).getUTCMonth(), new Date(now).getUTCDate() + 1);
-    const proposed = payload.error === 'budget_paused' && Number.isSafeInteger(payload.retry_at)
-      && Number(payload.retry_at) > now && Number(payload.retry_at) <= now + 48 * 60 * 60_000
-      ? Number(payload.retry_at) : tomorrow;
-    const prior = await this.ctx.storage.get<number>('hub2:budget_pause_until');
-    const retryAt = Number.isSafeInteger(prior) && Number(prior) > now ? Math.max(Number(prior), proposed) : proposed;
-    await this.ctx.storage.put('hub2:budget_pause_until', retryAt);
-    if (await this.ctx.storage.getAlarm() !== retryAt) {
-      this.db.alarmOperation();
-      await this.ctx.storage.setAlarm(retryAt);
-    }
-    return retryAt;
-  }
 
   private async requeueInternal(request: Request): Promise<Response> {
     const body = await bodyObject(request, 4096);
@@ -605,14 +564,11 @@ export class ProjectDO {
         id: `hub2-machine:${saga.machine_id}`, kind: 'machine', resource_id: saga.machine_id,
         generation: 'internal', scopes: ['account:reserve'],
       }) };
-      const response = await budgetedBackgroundRequest(this.env, 'scheduled_start', async guardedEnv => {
-        const account = guardedEnv.ACCOUNTS.get(guardedEnv.ACCOUNTS.idFromName(saga.account_id!));
-        return account.fetch('https://account.hub2.internal/api/account/start', {
-          method: 'POST', headers,
-          body: JSON.stringify({ operation_id: saga.attempt_operation_id, session_id: saga.session_id, machine_id: saga.machine_id, epoch: saga.epoch }),
-        });
+      const account = this.env.ACCOUNTS.get(this.env.ACCOUNTS.idFromName(saga.account_id!));
+      const response = await account.fetch('https://account.hub2.internal/api/account/start', {
+        method: 'POST', headers,
+        body: JSON.stringify({ operation_id: saga.attempt_operation_id, session_id: saga.session_id, machine_id: saga.machine_id, epoch: saga.epoch }),
       });
-      if (!response.ok && await this.pauseForBudget(response) !== undefined) return response;
       if (!response.ok) return error('account_admission_refused', response.status === 503 ? 503 : 409);
       const result = await response.json() as { reservation?: { operation_id?: string; session_id?: string; state?: string; epoch?: number; machine_id?: string } };
       if (result.reservation?.state !== 'running' || result.reservation.epoch !== saga.epoch
@@ -739,7 +695,6 @@ export class ProjectDO {
       account_id: saga.account_id, attempt_operation_id: saga.attempt_operation_id,
       session_id: saga.session_id, machine_id: saga.machine_id, epoch: saga.epoch,
     }, proof);
-    if (outcome.budgetRefusal) await this.pauseForBudget(outcome.budgetRefusal);
     return outcome.released;
   }
 
@@ -752,15 +707,12 @@ export class ProjectDO {
     const response=await env.CONTROL.get(env.CONTROL.idFromName('global')).fetch('https://control.internal/_routes/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind,id,owner,resource_id:project,participants:[...new Set(participants)],...(intakeId?{bound_intake_id:intakeId}:{})})});
     return response.ok;
   }
-  private async registerIntakeRoute(intake:IntakeRow,kind:BudgetKind='public_request'):Promise<boolean>{
+  private async registerIntakeRoute(intake:IntakeRow):Promise<boolean>{
     try{
       const participants=[intake.owner_actor_id,intake.assigned_actor_id].filter((v):v is string=>!!v);
-      const response=await budgetedBackgroundRequest(this.env,kind,async guardedEnv=>new Response(null,{status:
-        await this.registerControlRoute('intake',intake.id,intake.project,intake.project,participants,undefined,guardedEnv)?204:503}));
-      if(!response.ok){
-        const paused=await this.pauseForBudget(response);
-        const next=paused??Date.now()+30000;
-        this.db.run('UPDATE intakes SET route_next_action_at=? WHERE route_registered=0 AND route_next_action_at<=?',next,Date.now());
+      const registered=await this.registerControlRoute('intake',intake.id,intake.project,intake.project,participants);
+      if(!registered){
+        this.db.run('UPDATE intakes SET route_next_action_at=? WHERE route_registered=0 AND route_next_action_at<=?',Date.now()+30000,Date.now());
         return false;
       }
       this.db.run('UPDATE intakes SET route_registered=1 WHERE id=?',intake.id);return true;
@@ -770,7 +722,7 @@ export class ProjectDO {
   }
   private async retryPendingIntakeRoutes(now=Date.now()):Promise<void>{
     for(const row of this.db.all<IntakeRow>('SELECT * FROM intakes WHERE route_registered=0 AND route_next_action_at<=? ORDER BY route_next_action_at,id LIMIT 8',now)){
-      if(!await this.registerIntakeRoute(row,'retry'))break;
+      if(!await this.registerIntakeRoute(row))break;
     }
   }
   private async scheduleHasActiveSession(scheduleId:string):Promise<boolean>{
@@ -782,8 +734,8 @@ export class ProjectDO {
     if(record.kind==='prompt'||record.kind==='wake'){
       const recipient=record.payload.recipient??(parent.session_id?'session:'+parent.session_id:null),body=record.payload.body??record.payload.prompt;
       if(typeof recipient!=='string'||typeof body!=='string'||!body.trim()||body.length>12000)throw new Error('invalid_scheduled_message');
-      const response=await budgetedBackgroundRequest(this.env,'native_delivery',guardedEnv=>guardedEnv.MAILBOXES.get(guardedEnv.MAILBOXES.idFromName('global')).fetch('https://mailbox.internal/api/messages',{method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(actor),'x-hub2-mailbox':record.owner},body:JSON.stringify({key:record.id,recipient,body})}));
-      if(!response.ok){await this.pauseForBudget(response);throw new Error('scheduled_message_pending');}
+      const response=await this.env.MAILBOXES.get(this.env.MAILBOXES.idFromName('global')).fetch('https://mailbox.internal/api/messages',{method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(actor),'x-hub2-mailbox':record.owner},body:JSON.stringify({key:record.id,recipient,body})});
+      if(!response.ok)throw new Error('scheduled_message_pending');
       return {intake_id:parent.id,...(parent.session_id?{session_id:parent.session_id}:{})};
     }
     const id='scheduled:'+await sha256Hex(record.id),now=Date.now();
@@ -805,13 +757,6 @@ export class ProjectDO {
   }
 
   private async scheduleNext(): Promise<void> {
-    const budgetPause=await this.ctx.storage.get<number>('hub2:budget_pause_until');
-    if(Number.isSafeInteger(budgetPause)&&Number(budgetPause)>Date.now()){
-      const current=await this.ctx.storage.getAlarm();
-      if(current!==Number(budgetPause)){this.db.alarmOperation();await this.ctx.storage.setAlarm(Number(budgetPause));}
-      return;
-    }
-    if(budgetPause!==undefined)await this.ctx.storage.delete('hub2:budget_pause_until');
     const deadlines = [
       this.db.one<{ due: number }>('SELECT next_action_at AS due FROM dispatch_sagas WHERE due=1 ORDER BY next_action_at,operation_id LIMIT 1')?.due,
       this.db.one<{ due: number }>('SELECT route_next_action_at AS due FROM intakes WHERE route_registered=0 ORDER BY route_next_action_at,id LIMIT 1')?.due,

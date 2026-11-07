@@ -1,8 +1,8 @@
 """Regression tests for scripts/hub2-db-backup.sh (GCP VM port, 2026-11-07).
 
 Hub2 on the GCP VM stores its Durable Object SQLite databases under the
-wrangler persist dir (miniflare layout v3/do/<worker>-<Class>/<hash>.sqlite
-plus per-class metadata.sqlite). The daily backup is therefore a file
+Node runtime data dir (one SQLite file per object instance,
+<Class>-<instance>.sqlite). The daily backup is therefore a file
 snapshot (VACUUM INTO per database + counts manifest), not the hub1 REST
 export. These tests run the real script against a fake DO state tree:
 
@@ -37,12 +37,12 @@ DRILL = REPO / "scripts" / "hub2-db-restore-drill.py"
 class Hub2BackupTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(tempfile.mkdtemp(prefix="hub2-backup-test-"))
-        self.do_state = self.root / "do-state"
+        self.db_dir = self.root / "hub2-db"
         self.backup = self.root / "backups"
         self.mirror = self.root / "mirror"
         self.state = self.root / "state"
         self.lock = self.state / "hub2-db-backup.lock"
-        for path in (self.do_state, self.backup, self.mirror, self.state):
+        for path in (self.db_dir, self.backup, self.mirror, self.state):
             path.mkdir(parents=True)
         self.stub_out = self.root / "alert-calls.log"
         self.alert_stub = self.root / "alert-stub.sh"
@@ -53,7 +53,7 @@ class Hub2BackupTestCase(unittest.TestCase):
         self.env = {
             **os.environ,
             "HUB2_DB_BACKUP_ENV_FILE": str(self.root / "missing-env"),
-            "DO_STATE_DIR": str(self.do_state),
+            "HUB2_DB_DIR": str(self.db_dir),
             "BACKUP_DIR": str(self.backup),
             "MIRROR_DIR": str(self.mirror),
             "RETENTION_DAYS": "30",
@@ -68,9 +68,8 @@ class Hub2BackupTestCase(unittest.TestCase):
 
     # ---- fixtures -------------------------------------------------------
 
-    def write_do_db(self, rel: str, tables: dict[str, list[tuple]]) -> Path:
-        db_path = self.do_state / rel
-        db_path.parent.mkdir(parents=True, exist_ok=True)
+    def write_db(self, rel: str, tables: dict[str, list[tuple]]) -> Path:
+        db_path = self.db_dir / rel
         con = sqlite3.connect(db_path)
         for name, rows in tables.items():
             con.execute(f"CREATE TABLE {name} (id INTEGER PRIMARY KEY, value TEXT)")
@@ -81,18 +80,18 @@ class Hub2BackupTestCase(unittest.TestCase):
 
     def fake_do_state(self) -> None:
         # Real miniflare shape: instance DBs named <hash>.sqlite under
-        # v3/do/<worker>-<Class>/, plus one metadata.sqlite per class, and a
+        # <Class>-<instance>.sqlite flat files, and a
         # WAL sibling that must not be picked up as a database.
-        self.write_do_db(
-            "v3/do/agent-hub-ControlDO/abc123.sqlite",
+        self.write_db(
+            "ControlDO-abc123.sqlite",
             {"identities": [("a",), ("b",)], "routes": [("r1",)]},
         )
-        self.write_do_db(
-            "v3/do/agent-hub-ControlDO/metadata.sqlite", {"ns": [("only",)]}
+        self.write_db(
+            "metadata.sqlite", {"ns": [("only",)]}
         )
-        self.write_do_db("v3/do/agent-hub-ProjectDO/def456.sqlite", {"intakes": [("i1",)]})
-        (self.do_state / "v3/do/agent-hub-ControlDO/abc123.sqlite-wal").write_bytes(b"")
-        unrelated = self.do_state / "v3/unrelated/keep.sqlite"
+        self.write_db("ProjectDO-def456.sqlite", {"intakes": [("i1",)]})
+        (self.db_dir / "CONTROL-global-abc123.sqlite-wal").write_bytes(b"")
+        unrelated = self.db_dir / "v3/unrelated/keep.sqlite"
         unrelated.parent.mkdir(parents=True, exist_ok=True)
         unrelated.write_bytes(b"other state")
 
@@ -104,7 +103,7 @@ class Hub2BackupTestCase(unittest.TestCase):
         )
 
     def artifacts(self, tree: Path) -> list[Path]:
-        return sorted(tree.glob("*/*/*/hub2-do-*.tar.gz"))
+        return sorted(tree.glob("*/*/*/hub2-db-*.tar.gz"))
 
     def newest_artifact(self) -> Path:
         files = self.artifacts(self.backup)
@@ -146,7 +145,7 @@ class Hub2BackupTestCase(unittest.TestCase):
         unpack = self.root / "tamper"
         unpack.mkdir()
         subprocess.run(["tar", "-C", str(unpack), "-xzf", str(artifact)], check=True)
-        db = unpack / "v3/do/agent-hub-ControlDO/abc123.sqlite"
+        db = unpack / "ControlDO-abc123.sqlite"
         con = sqlite3.connect(db)
         con.execute("DELETE FROM routes")
         con.commit()
@@ -166,7 +165,7 @@ class Hub2BackupTestCase(unittest.TestCase):
         self.fake_do_state()
         old_dir = self.backup / "2026/09/01"
         old_dir.mkdir(parents=True)
-        old = old_dir / "hub2-do-20260901T0000+0200.tar.gz"
+        old = old_dir / "hub2-db-20260901T0000+0200.tar.gz"
         old.write_bytes(b"old artifact")
         old_epoch = time.time() - 40 * 86400
         os.utime(old, (old_epoch, old_epoch))
@@ -177,7 +176,7 @@ class Hub2BackupTestCase(unittest.TestCase):
 
         young_dir = self.backup / "2026/10/20"
         young_dir.mkdir(parents=True)
-        young = young_dir / "hub2-do-20261020T0000+0200.tar.gz"
+        young = young_dir / "hub2-db-20261020T0000+0200.tar.gz"
         young.write_bytes(b"young artifact")
         young_epoch = time.time() - 10 * 86400
         os.utime(young, (young_epoch, young_epoch))
@@ -204,12 +203,12 @@ class Hub2BackupTestCase(unittest.TestCase):
 
     def test_real_failure_dispatches_one_alert(self) -> None:
         # Missing DO state dir: config failure, alert fires exactly once.
-        proc = self.run_backup({"DO_STATE_DIR": str(self.root / "nowhere")})
+        proc = self.run_backup({"HUB2_DB_DIR": str(self.root / "nowhere")})
         self.assertEqual(proc.returncode, 1)
         calls = self.stub_out.read_text().splitlines()
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0], "--backup-failed")
-        self.assertIn("DO_STATE_DIR missing", calls[1])
+        self.assertIn("HUB2_DB_DIR missing", calls[1])
 
     def test_manifest_counts_match_fixture(self) -> None:
         self.fake_do_state()
@@ -218,10 +217,10 @@ class Hub2BackupTestCase(unittest.TestCase):
         unpack.mkdir()
         subprocess.run(["tar", "-C", str(unpack), "-xzf", str(self.newest_artifact())], check=True)
         manifest = json.loads((unpack / "manifest.json").read_text())
-        self.assertEqual(manifest["snapshot"], "hub2-do-sqlite")
+        self.assertEqual(manifest["snapshot"], "hub2-node-sqlite")
         counts = {entry["path"]: entry["tables"] for entry in manifest["databases"]}
         self.assertEqual(
-            counts["v3/do/agent-hub-ControlDO/abc123.sqlite"],
+            counts["ControlDO-abc123.sqlite"],
             {"identities": 2, "routes": 1},
         )
 

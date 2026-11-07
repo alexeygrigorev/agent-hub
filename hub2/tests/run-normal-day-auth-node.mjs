@@ -1,17 +1,26 @@
+// Actual OIDC browser flow and thin CLI served by the Node runtime.
 import assert from 'node:assert/strict';
-import {webcrypto,createHash} from 'node:crypto';
-import {build} from 'esbuild';
-import {Miniflare,Log,LogLevel,convertV4MiniflareOptions} from 'miniflare';
-import {resolve} from 'node:path';
-import {spawn} from 'node:child_process';
-import {readFile,writeFile,mkdir,mkdtemp,stat} from 'node:fs/promises';
-const root=resolve(import.meta.dirname,'../..');const sourceNames=['auth','control-auth','control-do','worker','mcp'];const sourceHashes=async()=>Object.fromEntries(await Promise.all(sourceNames.map(async n=>[n,createHash('sha256').update(await readFile(resolve(root,'hub2/src/'+n+'.ts'))).digest('hex')])));const beforeHashes=await sourceHashes();const bootstrap='synthetic-auth-fixture-bootstrap-0000000000';
-const bundle=await build({entryPoints:[resolve(root,'hub2/tests/normal-day-auth-worker.ts')],bundle:true,write:false,format:'esm',platform:'browser',external:['cloudflare:workers','node:async_hooks']});
-const names={CONTROL:'CoreControl',PROJECTS:'CoreProject',MACHINES:'CoreMachine',ACCOUNTS:'CoreAccount',MAILBOXES:'CoreMailbox',BUDGET:'BudgetDO'};
-const mf=new Miniflare(convertV4MiniflareOptions({port:0,host:'127.0.0.1',log:new Log(LogLevel.ERROR),workers:[{name:'hub2-auth-native-test',script:bundle.outputFiles[0].text,modules:true,compatibilityDate:'2024-04-05',compatibilityFlags:['nodejs_als'],durableObjects:Object.fromEntries(Object.entries(names).map(([k,className])=>[k,{className,useSQLite:true}])),bindings:{HUB2_DEV_OPERATOR_TOKEN:bootstrap,AUTH_BASE_URL:'https://oidc.fixture',AUTH_CLIENT_ID:'hub2-auth-test',AUTH_CALLBACK_URL:'https://hub.fixture/auth/callback',AUTH_ISSUER:'https://oidc.fixture',AUTH_JWKS_URL:'https://oidc.fixture/jwks',HUB_ADMINS:'allowed@example.test'}}]}));
+import { webcrypto, createHash } from 'node:crypto';
+import { resolve } from 'node:path';
+import { spawn } from 'node:child_process';
+import { readFile, writeFile, mkdir, mkdtemp, stat } from 'node:fs/promises';
+import { createFixture } from './node-fixture.mjs';
+const root = resolve(import.meta.dirname, '../..');
+const sourceNames = ['auth', 'control-auth', 'control-do', 'worker', 'mcp'];
+const sourceHashes = async () => Object.fromEntries(await Promise.all(sourceNames.map(async n => [n, createHash('sha256').update(await readFile(resolve(root, 'hub2/src/' + n + '.ts'))).digest('hex')])));
+const beforeHashes = await sourceHashes();
+const bootstrap = 'synthetic-auth-fixture-bootstrap-0000000000';
+const { default: authWorker, CoreControl, CoreProject, CoreMachine, CoreAccount, CoreMailbox } = await import('./normal-day-auth-worker.ts');
+const spec = {
+  root,
+  entry: authWorker,
+  classes: { CONTROL: CoreControl, PROJECTS: CoreProject, MACHINES: CoreMachine, ACCOUNTS: CoreAccount, MAILBOXES: CoreMailbox },
+  env: { HUB2_DEV_OPERATOR_TOKEN:bootstrap,AUTH_BASE_URL:'https://oidc.fixture',AUTH_CLIENT_ID:'hub2-auth-test',AUTH_CALLBACK_URL:'https://hub.fixture/auth/callback',AUTH_ISSUER:'https://oidc.fixture',AUTH_JWKS_URL:'https://oidc.fixture/jwks',HUB_ADMINS:'allowed@example.test' },
+};
+let fixture = await createFixture(spec);
+let base, results = [];
 const key=await webcrypto.subtle.generateKey({name:'RSASSA-PKCS1-v1_5',modulusLength:2048,publicExponent:new Uint8Array([1,0,1]),hash:'SHA-256'},true,['sign','verify']);
 const jwk={...await webcrypto.subtle.exportKey('jwk',key.publicKey),kid:'fixture-key',alg:'RS256',use:'sig'};
-let base;const results=[];
 async function call(path,method='GET',body,headers={}){return fetch(base+path,{method,redirect:'manual',headers:{'Content-Type':'application/json',...headers},...(body===undefined?{}:{body:JSON.stringify(body)})});}
 const cookie=r=>r.headers.getSetCookie().map(s=>s.split(';')[0]).filter(s=>!s.endsWith('=')).join('; ');
 async function signed(claims,invalid=false){const h=Buffer.from(JSON.stringify({alg:'RS256',kid:'fixture-key'})).toString('base64url'),p=Buffer.from(JSON.stringify(claims)).toString('base64url'),sig=Buffer.from(await webcrypto.subtle.sign('RSASSA-PKCS1-v1_5',key.privateKey,Buffer.from(h+'.'+p))).toString('base64url');return h+'.'+p+'.'+(invalid?'bad-signature':sig);}
@@ -30,7 +39,8 @@ async function cliRoundtrip(sessionCookie,csrf){
  await command('logout');const gone=JSON.parse(await readFile(config,'utf8'));assert(!gone.token&&!gone.refresh_token);assert.equal((await call('/api/repos','GET',undefined,{Authorization:'Bearer '+newer.token})).status,401);
 }
 async function test(name,fn){try{await fn();results.push({name,passed:true});}catch(e){results.push({name,passed:false,error:String(e.stack)});}}
-try{base=(await mf.ready).origin;
+try{
+base = fixture.origin;
  await test('OIDC callback requires browser-bound one-use state',async()=>{const l=await login();assert.equal((await call(l.path)).status,400);const good=await call(l.path,'GET',undefined,{Cookie:l.cookie});assert.equal(good.status,303);assert.equal((await call(l.path,'GET',undefined,{Cookie:l.cookie})).status,400);});
  await test('configured callback origin works when proxy request host differs',async()=>{const returnTo='/device?user_code=fixture-code',l=await login({},false,returnTo,true);assert.equal(l.redirectUri,'https://hub.fixture/auth/callback');const callback=await call(l.path,'GET',undefined,{Cookie:l.cookie});assert.equal(callback.status,303);assert.equal(callback.headers.get('Location'),returnTo);});
  await test('callback return targets reject controls and stay same origin',async()=>{for(const target of['/\t/evil.example','/%09/evil.example','/%2509/evil.example','//evil.example','/%5c/evil.example','/\r\nLocation: https://evil.invalid'])assert.equal((await call('/auth/login?return_to='+encodeURIComponent(target))).status,400,'unsafe return target must be rejected');const path='/intakes?project=owner%2Frepo#details',l=await login({},false,path),r=await call(l.path,'GET',undefined,{Cookie:l.cookie});assert.equal(r.status,303);assert.equal(r.headers.get('Location'),path);assert.equal(new URL(r.headers.get('Location'),'https://hub.fixture').origin,'https://hub.fixture');});
@@ -72,5 +82,5 @@ try{base=(await mf.ready).origin;
   assert.equal((await call('/auth/logout','POST',{}, {Cookie:sessionCookie,'x-csrf-token':identity.csrf_token})).status,200);
   assert.equal((await call('/auth/session','GET',undefined,{Cookie:sessionCookie})).status,401);
  });
- const stable=JSON.stringify(beforeHashes)===JSON.stringify(await sourceHashes());const report={passed:stable&&results.every(x=>x.passed),source_stable:stable,source_hashes:beforeHashes,engine:'native workerd SQLite with actual generated RSA signature and mock DTC provider transport',results};if(process.env.HUB2_AUTH_REPORT)await writeFile(process.env.HUB2_AUTH_REPORT,JSON.stringify(report,null,2)+'\n');console.log(JSON.stringify(report));if(!report.passed)process.exitCode=1;
-}finally{await mf.dispose();}
+ const stable=JSON.stringify(beforeHashes)===JSON.stringify(await sourceHashes());const report={passed:stable&&results.every(x=>x.passed),source_stable:stable,source_hashes:beforeHashes,engine:'node sqlite with actual RSA signature and mock OIDC transport',results};if(process.env.HUB2_AUTH_REPORT)await writeFile(process.env.HUB2_AUTH_REPORT,JSON.stringify(report,null,2)+'\n');console.log(JSON.stringify(report));if(!report.passed)process.exitCode=1;
+}finally{await fixture.dispose();}

@@ -1,7 +1,6 @@
 // Isolated test-only composition; all credentials and expired rows are synthetic.
 import worker from '../src/worker';
 import {ControlDO as ActualControl} from '../src/control-do';
-import {BudgetDO as ActualBudget} from '../src/budget-do';
 import {sha256Hex} from '../src/crypto';
 export class AuthGcControl extends ActualControl {
  async fetch(r:Request):Promise<Response>{
@@ -28,21 +27,11 @@ export class AuthGcControl extends ActualControl {
   return super.fetch(r);
  }
 }
-export class AuthGcBudget extends ActualBudget {
- async fetch(r:Request):Promise<Response>{
-  if(new URL(r.url).pathname==='/_fixture/reservations'){
-   await (this as any).ready;
-   return (this as any).sqlMeter.withScope(async()=>Response.json((this as any).db.all('SELECT kind,state,estimate_json,actual_json FROM budget_reservations')));
-  }
-  return super.fetch(r);
- }
-}
 export default {async fetch(r:Request,env:any):Promise<Response>{
  const u=new URL(r.url),id=u.searchParams.get('case')||'device';
- const control=env.CONTROL.get(env.CONTROL.idFromName(id)),budget=env.BUDGET.get(env.BUDGET.idFromName(id));
+ const control=env.CONTROL.get(env.CONTROL.idFromName(id));
  if(u.pathname==='/_fixture/seed')return control.fetch(new Request('https://control/_fixture/seed',r));
  if(u.pathname==='/_fixture/remaining')return control.fetch('https://control/_fixture/remaining');
- if(u.pathname==='/_fixture/reservations')return budget.fetch('https://budget/_fixture/reservations');
- const scoped={...env,CONTROL:{idFromName:()=>id,get:()=>control},BUDGET:{idFromName:()=>id,get:()=>budget}};
+ const scoped={...env,CONTROL:{idFromName:()=>id,get:()=>control}};
  return worker.fetch(r,scoped);
 }};

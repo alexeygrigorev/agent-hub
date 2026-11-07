@@ -7,7 +7,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 def validate():
-    result = subprocess.run(["node", "--test", "test/root-promotion.test.mjs"],
+    result = subprocess.run(["node", "--test", "test/release-contract.test.mjs"],
                             cwd=ROOT, capture_output=True, text=True)
     if result.returncode:
         raise ValueError(result.stdout + result.stderr)

@@ -1,26 +1,33 @@
-// Real local workerd/SQLite slice. No provider requests or native process launch.
+// Real local SQLite slice on the Node runtime. No provider requests or native process launch.
 // Quota and native evidence are explicitly synthetic fixtures; live host proof is separate.
 import assert from 'node:assert/strict';
-import {build} from 'esbuild';
-import {Miniflare,Log,LogLevel,convertV4MiniflareOptions} from 'miniflare';
-import {WebSocket} from 'ws';
-import {resolve} from 'node:path';
-import {mkdtemp,readFile,writeFile,mkdir,readdir} from 'node:fs/promises';
-import {createHash} from 'node:crypto';
-const root=process.env.HUB2_CORE_ROOT||resolve(import.meta.dirname,'../..');
-const entry=process.env.HUB2_CORE_ENTRY||resolve(root,'hub2/tests/core-integration-worker.ts');
-const reportPath=process.env.HUB2_CORE_REPORT;
-const names={control:'CoreControl',project:'CoreProject',machine:'CoreMachine',account:'CoreAccount',mailbox:'CoreMailbox',budget:'CoreBudget'};
-const token='synthetic-core-operator-token-000000000000000000',project='synthetic/core',machine='synthetic-machine',account='synthetic-account';
-const sourceFiles=(await readdir(resolve(root,'hub2/src'))).filter(n=>n.endsWith('.ts')).map(n=>n.slice(0,-3)).sort();
-async function hashes(){return Object.fromEntries(await Promise.all(sourceFiles.map(async n=>[n,createHash('sha256').update(await readFile(resolve(root,`hub2/src/${n}.ts`))).digest('hex')])));}
-const sourceBefore=await hashes();
-const bundle=await build({entryPoints:[entry],bundle:true,write:false,format:'esm',platform:'browser',external:['cloudflare:workers','node:async_hooks']});
-await mkdir(resolve(root,'.local/tmp'),{recursive:true});const persist=await mkdtemp(resolve(root,'.local/tmp/core-integration-'));
-const workspace=process.env.HUB2_CORE_WORKER_CONTEXT||process.env.HUB2_CORE_PROVISION?resolve(persist,'workspace'):'/synthetic/workspace';if(process.env.HUB2_CORE_WORKER_CONTEXT||process.env.HUB2_CORE_PROVISION)await mkdir(workspace,{recursive:true,mode:0o700});
-const options=convertV4MiniflareOptions({resourcePersistencePath:persist,host:'127.0.0.1',port:0,log:new Log(LogLevel.ERROR),workers:[{name:'hub2-core-native-fixture',script:bundle.outputFiles[0].text,modules:true,compatibilityDate:'2024-04-05',compatibilityFlags:['nodejs_als'],durableObjects:Object.fromEntries(Object.entries(names).map(([k,className])=>[({control:'CONTROL',project:'PROJECTS',machine:'MACHINES',account:'ACCOUNTS',mailbox:'MAILBOXES',budget:'BUDGET'})[k],{className,useSQLite:true}])),bindings:{HUB2_FIXTURE_CODEX_PROVIDER:process.env.HUB2_CORE_PROVISION?'yes':'',HUB2_DEV_OPERATOR_TOKEN:token,HUB2_DEFAULT_ACCOUNT_ID:account,HUB2_ENGINE_ACCOUNTS:JSON.stringify({opencode:account}),HUB2_CREDENTIAL_KEY:'11'.repeat(32),HUB2_FIXTURE_ASSET_HTML:await readFile(resolve(root,'hub2/public/index.html'),'utf8')}}]});
-let mf=new Miniflare(options),base,hostToken,liveSocket,completedIntakeId;const results=[],measurements={};
-const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+import { WebSocket } from 'ws';
+import { resolve } from 'node:path';
+import { mkdtemp, mkdir, readFile, writeFile, readdir } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { createFixture, restartFixture } from './node-fixture.mjs';
+const root = process.env.HUB2_CORE_ROOT || resolve(import.meta.dirname, '../..');
+const entry = process.env.HUB2_CORE_ENTRY || resolve(root, 'hub2/tests/core-integration-worker.ts');
+const reportPath = process.env.HUB2_CORE_REPORT;
+const token = 'synthetic-core-operator-token-0000000000000000', project = 'synthetic/core', machine = 'synthetic-machine', account = 'synthetic-account';
+const sourceFiles = (await readdir(resolve(root, 'hub2/src'))).filter(n => n.endsWith('.ts')).map(n => n.slice(0, -3)).sort();
+async function hashes() { return Object.fromEntries(await Promise.all(sourceFiles.map(async n => [n, createHash('sha256').update(await readFile(resolve(root, 'hub2/src/' + n + '.ts'))).digest('hex')]))); }
+const sourceBefore = await hashes();
+const persist = await mkdtemp(resolve(root, '.local/tmp/core-node-'));
+const workspace = process.env.HUB2_CORE_WORKER_CONTEXT || process.env.HUB2_CORE_PROVISION ? resolve(persist, 'workspace') : '/synthetic/workspace';
+if (process.env.HUB2_CORE_WORKER_CONTEXT || process.env.HUB2_CORE_PROVISION) await mkdir(workspace, { recursive: true, mode: 0o700 });
+const { default: coreWorker, CoreControl, CoreProject, CoreMachine, CoreAccount, CoreMailbox } = await import('./core-integration-worker.ts');
+const spec = {
+  root,
+  entry: coreWorker,
+  classes: { CONTROL: CoreControl, PROJECTS: CoreProject, MACHINES: CoreMachine, ACCOUNTS: CoreAccount, MAILBOXES: CoreMailbox },
+  env: { HUB2_FIXTURE_CODEX_PROVIDER:process.env.HUB2_CORE_PROVISION?'yes':'',HUB2_DEV_OPERATOR_TOKEN:token,HUB2_DEFAULT_ACCOUNT_ID:account,HUB2_ENGINE_ACCOUNTS:JSON.stringify({opencode:account}),HUB2_CREDENTIAL_KEY:'11'.repeat(32),HUB2_FIXTURE_ASSET_HTML:await readFile(resolve(root,'hub2/public/index.html'),'utf8') },
+  dataDir: persist,
+};
+let rt = await createFixture(spec);
+let base, hostToken, liveSocket, completedIntakeId;
+const results = [], measurements = {};
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function api(path,method='GET',body,auth=token,extra={}){
  const response=await fetch(base+path,{method,headers:{'Content-Type':'application/json',...(auth?{Authorization:'Bearer '+auth}:{}),...extra},...(body===undefined?{}:{body:JSON.stringify(body)})});
  const text=await response.text();let data;try{data=JSON.parse(text);}catch{data={error:'non_json_response'};}
@@ -28,7 +35,7 @@ async function api(path,method='GET',body,auth=token,extra={}){
 }
 function expect(result,status,label){assert.equal(result.status,status,`${label}: HTTP ${result.status}, error=${result.data.error||result.data.reason||''}`);return result.data;}
 const fixture=(kind,id,action='state',body)=>api(`/_fixture/${kind}/${encodeURIComponent(id)}/${action}`,body===undefined?'GET':'POST',body);
-async function snapshots(){const out={};for(const [kind,id] of [['control','global'],['project',project],['machine',machine],['account',account],['budget','global'],...(process.env.HUB2_CORE_PUBLIC_MAIL?[['mailbox','global']]:[])] ){const name=kind==='mailbox'?kind+':'+id:kind;out[name]=expect(await fixture(kind,id),200,kind+' state');assert.equal(out[name].counts.measurement_valid,true,kind+' invalid native meter');}return out;}
+async function snapshots(){const out={};for(const [kind,id] of [['control','global'],['project',project],['machine',machine],['account',account],...(process.env.HUB2_CORE_PUBLIC_MAIL?[['mailbox','global']]:[])] ){const name=kind==='mailbox'?kind+':'+id:kind;out[name]=expect(await fixture(kind,id),200,kind+' state');assert.equal(out[name].counts.measurement_valid,true,kind+' invalid native meter');}return out;}
 function delta(before,after){return Object.fromEntries(Object.keys(before).map(k=>[k,{reads:after[k].counts.rows_read-before[k].counts.rows_read,writes:after[k].counts.rows_written-before[k].counts.rows_written,alarm_calls:after[k].counts.alarm_operations-before[k].counts.alarm_operations}]));}
 async function test(name,fn){try{await fn();results.push({name,passed:true});}catch(e){results.push({name,passed:false,error:String(e.message),stack:String(e.stack).split('\n').slice(0,6).join('\n')});}}
 async function intake(key,title='Synthetic core lifecycle'){
@@ -43,7 +50,7 @@ async function socket(auth=hostToken){
  return {socket,frames,async wait(predicate){const until=Date.now()+5000;while(Date.now()<until){const match=frames.find(predicate);if(match)return match;await sleep(10);}throw new Error('expected WebSocket frame absent: '+JSON.stringify(frames.map(v=>v.type)));}};
 }
 try{
- base=(await mf.ready).origin;
+ base = rt.origin;
  await test('unauthenticated browser can load the real Connect page',async()=>{const response=await fetch(base+'/');assert.equal(response.status,200,'public assets must precede API authentication');assert((await response.text()).includes('<title>Hub 2'));});
  await test('public auth/internal path/CSRF refusals',async()=>{
   expect(await api('/health','GET',undefined,null),200,'health');
@@ -88,11 +95,7 @@ try{
   expect(await api(`/api/sessions/${started.id}/started`,'POST',{operation_id:offer.operation_id,epoch:offer.epoch+1,native_id:native},hostToken),409,'stale started receipt');
   let workerCheck;if(process.env.HUB2_CORE_WORKER){const {prepareWorkerProof}=await import('./normal-day-worker-credentials.mjs');workerCheck=await prepareWorkerProof({api,expect,fixture,socket,intake,start,project,machine,hostToken,session:started,offer,intakeId:created.id,root,persist,base});}
   expect(await fixture('project',project,'fault',{paths:['/_internal/started']}),200,'lose successful started forwarding response');
-  expect(await fixture('budget','global','pause-normal',{}),200,'synthetic financial ceiling fixture');
-  expect(await api('/api/repos','GET'),429,'normal request paused before native receipt');
   expect(await api(`/api/sessions/${started.id}/started`,'POST',{operation_id:offer.operation_id,epoch:offer.epoch,native_id:native},hostToken),202,'started durable pending response');
-  const budgetStatus=await api('/api/budget','GET');expect(budgetStatus,200,'budget safety status');
-  expect(await api('/api/budget/override','POST',{day:budgetStatus.data.day,ceiling_pusd:'1000000000000',reason:'Synthetic core fixture resumes after started-safety test'}),200,'audited test-only ceiling override');
 
   expect(await fixture('machine',machine,'due-outbox',{id:'started:'+offer.operation_id}),200,'retry started durable journal');
   expect(await api(`/api/sessions/${started.id}/started`,'POST',{operation_id:offer.operation_id,epoch:offer.epoch,native_id:native},hostToken),200,'started retry');
@@ -205,7 +208,7 @@ try{
   const created=expect((await intake('intake-alarm-interruption')).response,201,'alarm interruption intake').intake;
   expect(await fixture('project',project,'fail-next-alarm',{}),200,'arm alarm failure');
   const interrupted=await start(created.id,'start-alarm-interruption',machine,'shell');
-  if(liveSocket){liveSocket.socket.close();liveSocket=null;}await mf.dispose();mf=new Miniflare(options);base=(await mf.ready).origin;
+  if(liveSocket){liveSocket.socket.close();liveSocket=null;}rt = await restartFixture(rt,spec); base = rt.origin;
   let restored=expect(await api(`/api/intakes/${created.id}?project=${encodeURIComponent(project)}`),200,'interrupted saga survived restart');
   let projection=expect(await fixture('project',project),200,'restarted deadline');
   // A recovered already-due alarm may complete between two HTTP reads. Re-read
@@ -215,14 +218,14 @@ try{
   if(typeof restored.intake.dispatch?.next_action_at==='number')assert.notEqual(projection.alarm,null,'durable pending saga has no alarm after restart: '+JSON.stringify(measurements.alarm_interruption));
  });
  await test('persistent restart preserves auth and terminal outcome',async()=>{
-  if(liveSocket){liveSocket.socket.close();liveSocket=null;}await mf.dispose();mf=new Miniflare(options);base=(await mf.ready).origin;
+  if(liveSocket){liveSocket.socket.close();liveSocket=null;}rt = await restartFixture(rt,spec); base = rt.origin;
   expect(await api('/api/offers','GET',undefined,hostToken),200,'credential survives restart');
   assert(completedIntakeId,'completed lifecycle prerequisite did not pass');const restored=expect(await api(`/api/intakes/${completedIntakeId}?project=${encodeURIComponent(project)}`),200,'restored terminal intake');assert.equal(restored.intake.status,'completed-awaiting-review');assert.equal(restored.intake.final_evidence.exit_code,0);
   const snap=await snapshots();for(const v of Object.values(snap))assert.equal(v.counts.measurement_valid,true);measurements.restart=snap;
  });
 }finally{
- if(liveSocket)liveSocket.socket.close();await mf.dispose();
+ if(liveSocket)liveSocket.socket.close();await rt.dispose();
  const sourceAfter=await hashes();const sourceStable=JSON.stringify(sourceBefore)===JSON.stringify(sourceAfter);
- const report={passed:results.every(r=>r.passed)&&sourceStable,engine:'native workerd SQLite',source_stable:sourceStable,source_hashes:sourceAfter,results,measurements,note:'Quota/native receipts are synthetic fixtures, not provider or actual-process proof. Local test-only alarm inspection is outside production call counts. Whole-Hub daily budget is not proven by this slice.'};
+ const report={passed:results.every(r=>r.passed)&&sourceStable,engine:'node sqlite',source_stable:sourceStable,source_hashes:sourceAfter,results,measurements,note:'Quota/native receipts are synthetic fixtures, not provider or actual-process proof. Local test-only alarm inspection is outside production call counts. Whole-Hub daily budget is not proven by this slice.'};
  if(reportPath)await writeFile(reportPath,JSON.stringify(report,null,2));console.log(JSON.stringify(report));if(!report.passed)process.exitCode=1;
 }

@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-BROAD = ('package.json', 'package-lock.json', 'vitest.config.ts', 'wrangler.jsonc', 'pyproject.toml', 'uv.lock',
+BROAD = ('package.json', 'package-lock.json', 'vitest.config.ts', 'pyproject.toml', 'uv.lock',
          'host/tests/conftest.py', 'test/heavy-slot.global-setup.mjs')
 BROAD_PREFIX = ('tsconfig', 'scripts/heavy-', 'scripts/capped-', 'scripts/test-full-local', 'scripts/local-dependencies')
 SOURCE_DIRS = ('src/', 'public/', 'host/', 'scripts/', 'test/', 'migrations/')
@@ -120,7 +120,7 @@ def select(changed, root=ROOT):
         'pytest': py,
         'typecheck': any(c.endswith('.ts') or c.startswith('tsconfig') for c in changed),
         'workflows': any(c.startswith(('.github/workflows/', 'scripts/ci/')) for c in changed),
-        'build': any(c.startswith(('src/', 'wrangler')) for c in changed),
+        'build': any(c.startswith(('src/', 'hub2/')) for c in changed),
     }
 
 

@@ -3,7 +3,6 @@ import {ControlAuth,CONTROL_AUTH_SCHEMA} from './control-auth';
 import {verifyKnownCredential} from './auth';
 import { MeteredDb, initializeSchema } from './db';
 import { SqlReceiptMeter, SQL_PROBE_HEADER, wrapSqlNamespaces } from './sql-receipt';
-import { budgetedBackgroundRequest } from './budget-edge';
 import { randomToken, sha256Hex } from './crypto';
 import { actorFrom, bodyObject, boundedString, error, hasScope, HttpError, json } from './http';
 import type { Actor, Hub2Env, JsonRecord } from './types';
@@ -447,25 +446,12 @@ export class ControlDO {
     await this.ready;
     for(const row of this.db.all<{owner:string;revision:number;after_id:string;attempt:number}>('SELECT * FROM mailbox_wakes WHERE next_attempt<=? ORDER BY next_attempt,owner LIMIT 8',Date.now())){
       try{
-        const response=await budgetedBackgroundRequest(this.env,'background_effect',async guarded=>{
-          const effect=await guarded.MAILBOXES.get(guarded.MAILBOXES.idFromName('global')).fetch(new Request('https://mailbox.internal/_resume-native',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({owner:row.owner,after:row.after_id})}));
-          if(!effect.ok)return effect;
-          const result=await effect.json() as {next:unknown;resumed:unknown};
-          if(!Number.isInteger(result.resumed)||Number(result.resumed)<0||Number(result.resumed)>16||(result.next!==null&&(!boundedString(result.next,180)||result.next<=row.after_id)))throw new Error('invalid_wake_result');
-          if(result.next===null)this.db.run('DELETE FROM mailbox_wakes WHERE owner=? AND revision=?',row.owner,row.revision);
-          else this.db.run('UPDATE mailbox_wakes SET after_id=?,next_attempt=?,attempt=0 WHERE owner=? AND revision=?',result.next,Date.now()+1,row.owner,row.revision);
-          return new Response(null,{status:204});
-        });
-        if(!response.ok){
-          const payload=await response.clone().json().catch(()=>({})) as {error?:unknown;retry_at?:unknown};
-          if(typeof payload.error==='string'&&payload.error.startsWith('budget_')){
-            const now=Date.now(),tomorrow=Date.UTC(new Date(now).getUTCFullYear(),new Date(now).getUTCMonth(),new Date(now).getUTCDate()+1);
-            const retryAt=payload.error==='budget_paused'&&Number.isSafeInteger(payload.retry_at)&&Number(payload.retry_at)>now&&Number(payload.retry_at)<=now+48*60*60_000?Number(payload.retry_at):tomorrow;
-            this.db.run('UPDATE mailbox_wakes SET attempt=attempt+1,next_attempt=? WHERE owner=? AND revision=?',retryAt,row.owner,row.revision);
-            break;
-          }
-          throw new Error('wake_refused');
-        }
+        const effect=await this.env.MAILBOXES.get(this.env.MAILBOXES.idFromName('global')).fetch(new Request('https://mailbox.internal/_resume-native',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({owner:row.owner,after:row.after_id})}));
+        if(!effect.ok)throw new Error('wake_refused');
+        const result=await effect.json() as {next:unknown;resumed:unknown};
+        if(!Number.isInteger(result.resumed)||Number(result.resumed)<0||Number(result.resumed)>16||(result.next!==null&&(!boundedString(result.next,180)||result.next<=row.after_id)))throw new Error('invalid_wake_result');
+        if(result.next===null)this.db.run('DELETE FROM mailbox_wakes WHERE owner=? AND revision=?',row.owner,row.revision);
+        else this.db.run('UPDATE mailbox_wakes SET after_id=?,next_attempt=?,attempt=0 WHERE owner=? AND revision=?',result.next,Date.now()+1,row.owner,row.revision);
       }catch{this.db.run('UPDATE mailbox_wakes SET attempt=attempt+1,next_attempt=? WHERE owner=? AND revision=?',Date.now()+Math.min(300000,1000*2**Math.min(row.attempt,8)),row.owner,row.revision);}
     }
     await this.scheduleWake();

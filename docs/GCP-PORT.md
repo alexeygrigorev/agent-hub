@@ -1,3 +1,9 @@
+> **SUPERSEDED (2026-11-07).** hub2 no longer runs under wrangler/workerd; the
+> budget cron and envelopes described below are retired. Current topology,
+> cutover record and operations live in [docs/NODE-VM-DEPLOY.md](NODE-VM-DEPLOY.md).
+> Kept for the port history and the GCP VM facts (machine type, firewall,
+> secrets layout).
+
 # GCP VM port (port-gcloud, 2026-11-07)
 
 Agent Hub (hub2) now runs on a GCP Compute Engine VM in project

@@ -69,7 +69,7 @@ STATE_DIR="${STATE_DIR:-/var/lib/hub-db-backup}"
 DRY_RUN="${DRY_RUN:-0}"
 HUB_DB_STALE_DRILL="${HUB_DB_STALE_DRILL:-0}"
 # Artifact name glob. Defaults to the hub1 REST export shape; the GCP VM
-# deployment (port-gcloud) sets BACKUP_GLOB='hub2-do-*.tar.gz' for the
+# deployment (port-gcloud) sets BACKUP_GLOB='hub2-db-*.tar.gz' for the
 # file-snapshot artifacts written by scripts/hub2-db-backup.sh.
 BACKUP_GLOB="${BACKUP_GLOB:-hub-do-*.json.gz}"
 

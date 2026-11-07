@@ -1,5 +1,4 @@
 import { HttpError } from './http';
-import { budgetedBackgroundRequest } from './budget-edge';
 import type { Hub2Env } from './types';
 
 /**
@@ -12,11 +11,9 @@ import type { Hub2Env } from './types';
  * host engines/capabilities/resources live in MachineDO. It never reserves,
  * releases, writes quota evidence, or consults the monetary guard directly —
  * AccountDO/MachineDO owners stay authoritative for reserve/release, the
- * dispatch saga stays the single launch-intent owner, and Cost Controller
- * gates fanout before this facade runs (budgetedBackgroundRequest in the
- * dispatch path). Quota is one resource input here, never a separate
- * authority; unknown or stale quota becomes a typed hold with a bounded
- * refresh, never fake zero and never a local probe.
+ * dispatch saga stays the single launch-intent owner. Quota is one resource
+ * input here, never a separate authority; unknown or stale quota becomes a
+ * typed hold with a bounded refresh, never fake zero and never a local probe.
  */
 
 export type AdmissionRequest={operation_id:string;machine_id?:string;engine?:string;model?:string;effort?:string;override_reason?:string;interactive:boolean;with_goal?:boolean;required_capabilities?:string[]};
@@ -223,20 +220,18 @@ export async function advanceDispatch(env:Hub2Env,saga:DispatchIntent):Promise<A
 }
 
 export type CapacityTarget={account_id:string;attempt_operation_id:string;session_id:string;machine_id:string;epoch:number|null};
-export type CapacityRelease={released:boolean;budgetRefusal?:Response};
+export type CapacityRelease={released:boolean};
 
 /** Release the account reservation only against the owner's qualified proof. */
 export async function releaseAccountCapacity(env:Hub2Env,target:CapacityTarget,proof:{native_exit_confirmed?:true;unclaimed_proof?:unknown}):Promise<CapacityRelease>{
   try{
-    const result=await budgetedBackgroundRequest(env,'capacity_reconcile',async guardedEnv=>{
-      const account=guardedEnv.ACCOUNTS.get(guardedEnv.ACCOUNTS.idFromName(target.account_id));
-      return account.fetch('https://account.hub2.internal/_internal/release',{
-        method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({operation_id:target.attempt_operation_id,session_id:target.session_id,
-          machine_id:target.machine_id,epoch:target.epoch,...proof}),
-      });
+    const account=env.ACCOUNTS.get(env.ACCOUNTS.idFromName(target.account_id));
+    const result=await account.fetch('https://account.hub2.internal/_internal/release',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({operation_id:target.attempt_operation_id,session_id:target.session_id,
+        machine_id:target.machine_id,epoch:target.epoch,...proof}),
     });
-    if(!result.ok)return{released:false,budgetRefusal:result};
+    if(!result.ok)return{released:false};
     const payload=await result.json() as {reservation?:{
       operation_id?:string;session_id?:string;machine_id?:string;epoch?:number;state?:string;
     }};

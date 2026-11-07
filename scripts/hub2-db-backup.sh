@@ -2,9 +2,8 @@
 # Hub2 DB backup for the GCP VM deployment (port-gcloud, 2026-11-07).
 #
 # Hub2 on the GCP VM stores every Durable Object SQLite database locally
-# under the wrangler persist dir (miniflare layout, wrangler 4.158):
-#   <DO_STATE_DIR>/v3/do/<worker>-<ClassName>/<instance-hash>.sqlite
-#   <DO_STATE_DIR>/v3/do/<worker>-<ClassName>/metadata.sqlite
+# under the Node runtime data dir (one SQLite file per object instance):
+#   <HUB2_DB_DIR>/<ClassName>-<instance>.sqlite
 # plus -wal/-shm siblings. The DB lives on the machine, so the daily
 # backup is a consistent FILE snapshot instead of the hub1 REST export:
 # each db.sqlite is copied with `VACUUM INTO` (online, WAL-safe, takes a
@@ -12,8 +11,8 @@
 # into one gzip tarball, and stored with the SAME tree layout, retention
 # floor and failure alerting as scripts/hub-db-backup.sh:
 #
-#   <BACKUP_DIR>/YYYY/MM/DD/hub2-do-<STAMP>.tar.gz       (copy #1)
-#   <MIRROR_DIR>/YYYY/MM/DD/hub2-do-<STAMP>.tar.gz       (copy #2, optional)
+#   <BACKUP_DIR>/YYYY/MM/DD/hub2-db-<STAMP>.tar.gz       (copy #1)
+#   <MIRROR_DIR>/YYYY/MM/DD/hub2-db-<STAMP>.tar.gz       (copy #2, optional)
 #
 # STAMP is Europe/Berlin %Y%m%dT%H%M%z. Artifacts get mode 600. Retention
 # prunes ONLY files with age >= RETENTION_DAYS+1 whole days (`find -mtime
@@ -56,7 +55,7 @@ if [[ -f "$ENV_FILE" ]]; then
   set +a
 fi
 
-DO_STATE_DIR="${DO_STATE_DIR:-/var/lib/agent-hub/do-state}"
+HUB2_DB_DIR="${HUB2_DB_DIR:-/var/lib/agent-hub/hub2-db}"
 BACKUP_DIR="${BACKUP_DIR:-/var/backups/hub-do}"
 MIRROR_DIR="${MIRROR_DIR:-}"                       # empty = single-tree mode
 RETENTION_DAYS="${RETENTION_DAYS:-30}"
@@ -89,8 +88,8 @@ fail() { # reason
 if [[ "$RETENTION_DAYS" -lt 30 ]]; then
   fail "RETENTION_DAYS must be >= 30 (got $RETENTION_DAYS)"
 fi
-if [[ ! -d "$DO_STATE_DIR" ]]; then
-  fail "DO_STATE_DIR missing: $DO_STATE_DIR"
+if [[ ! -d "$HUB2_DB_DIR" ]]; then
+  fail "HUB2_DB_DIR missing: $HUB2_DB_DIR"
 fi
 case "$BACKUP_DIR" in /tmp/*|/var/tmp/*|/tmp|/var/tmp)
   fail "BACKUP_DIR must not live under /tmp or /var/tmp";; esac
@@ -120,20 +119,20 @@ chmod 700 "$WORK"
 cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT
 
-mapfile -t DBS < <(find "$DO_STATE_DIR" -type f -name '*.sqlite' -path '*/v3/do/*' | sort)
+mapfile -t DBS < <(find "$HUB2_DB_DIR" -maxdepth 1 -type f -name "*.sqlite" | sort)
 if [[ "${#DBS[@]}" -eq 0 ]]; then
-  fail "no DO databases found under $DO_STATE_DIR (is the worker running with --persist-to $DO_STATE_DIR?)"
+  fail "no DO databases found under $HUB2_DB_DIR (is the worker running with --persist-to $HUB2_DB_DIR?)"
 fi
 
 MANIFEST="$WORK/manifest.json"
 {
-  printf '{\n  "snapshot": "hub2-do-sqlite",\n  "generated": "%s",\n  "do_state_dir": %s,\n  "databases": [\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "\"$DO_STATE_DIR\""
+  printf '{\n  "snapshot": "hub2-node-sqlite",\n  "generated": "%s",\n  "db_dir": %s,\n  "databases": [\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "\"$HUB2_DB_DIR\""
 } >"$MANIFEST"
 
 first=1
 for db in "${DBS[@]}"; do
-  rel="$(realpath --relative-to="$DO_STATE_DIR" "$db")"
+  rel="$(realpath --relative-to="$HUB2_DB_DIR" "$db")"
   dest="$WORK/snapshot/$rel"
   mkdir -p "$(dirname "$dest")"
   # VACUUM INTO reads through a transaction; safe against a live worker.
@@ -169,7 +168,7 @@ printf '\n  ]\n}\n' >>"$MANIFEST"
 
 # ---- assemble artifact -------------------------------------------------------
 STAMP="$(TZ=Europe/Berlin date +%Y%m%dT%H%M%z)"
-ARTIFACT="hub2-do-${STAMP}.tar.gz"
+ARTIFACT="hub2-db-${STAMP}.tar.gz"
 RELDIR="$(TZ=Europe/Berlin date +%Y/%m/%d)"
 mkdir -p "$WORK/pack/$RELDIR"
 # shellcheck disable=SC2211  # intentional: paths inside the tarball are relative
@@ -193,7 +192,7 @@ fi
 # ---- retention (each tree independently, floor enforced) ---------------------
 prune() {
   local root="$1"
-  find "$root" -type f -name 'hub2-do-*.tar.gz' -mtime "+$RETENTION_DAYS" -print -delete |
+  find "$root" -type f -name 'hub2-db-*.tar.gz' -mtime "+$RETENTION_DAYS" -print -delete |
     while IFS= read -r old; do log "pruned $old"; done
 }
 prune "$BACKUP_DIR"
