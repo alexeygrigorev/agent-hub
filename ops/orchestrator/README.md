@@ -1,6 +1,6 @@
 # orchestrator-main and oncall-engineer: runbook
 
-Two interactive ops sessions on Hetzner replace Grok Bot's recurring routines. The watchdog chooses a configured non-Claude engine only when `hub quota` reports fresh headroom. Contract: Hub intake `67847fde-a00a-4689-8460-fbad45599f99` (AC1-AC14).
+Two persistent interactive ops sessions on Hetzner handle Hub queue work and cross-service incident triage. Developer (the Grok Bot overseer) forwards work and checks progress; the sessions perform the investigation and queue work. For the architecture, current alert path, and intended end state, see [On-call and orchestrator architecture](../../docs/ONCALL-ORCHESTRATOR-ARCHITECTURE.md). The watchdog chooses a configured non-Claude engine only when `hub quota` reports fresh headroom. Contract: Hub intake `67847fde-a00a-4689-8460-fbad45599f99` (AC1-AC14).
 
 | | orchestrator-main | oncall-engineer |
 |---|---|---|
@@ -22,7 +22,7 @@ Copies `session-ctl.sh`, `watchdog.sh` to `~/.local/share/agent-hub-ops/`, `orch
 ```bash
 ops/orchestrator/start.sh        # or: ops/oncall/start.sh
 ```
-It (1) fetches origin/main and creates/refreshes the run worktree (detached at origin/main), (2) syncs skills (below), (3) selects a configured non-Claude engine with fresh quota headroom and starts it, (4) accepts the bypass/trust prompts, and (5) sends one engine-neutral kickoff prompt. The recurring Hub schedule remains attached to the session tag.
+It (1) fetches origin/main and creates/refreshes the run worktree (detached at origin/main), (2) syncs skills (below), (3) selects a configured non-Claude engine with fresh quota headroom and starts it, (4) accepts the bypass/trust prompts, and (5) sends one engine-neutral kickoff prompt. Recurring work is intended to come from Hub scheduled prompts attached to the session tag; the live cadence is described below and on the [architecture page](../../docs/ONCALL-ORCHESTRATOR-ARCHITECTURE.md).
 
 ## Startup prompt and schedule
 
@@ -31,7 +31,12 @@ named `gemini` in `provider` metadata; that legacy provider key does not select
 the old Gemini CLI. Any legacy `ENGINE=gemini` or `ORCH_ENGINE=gemini` preference is normalized to
 Antigravity. If the preferred route is unavailable, selection tries configured
 non-Claude routes in order: Antigravity, OpenCode, Grok, then ZCode.
-The start script sends the role's hourly check (or orchestrator brief) as a normal prompt and records it in `<reports>/state/loop_command`. It does not issue Claude Code's `/loop` command. Hub scheduled prompts attached to `orchestrator-main` and `oncall-engineer` provide recurring work for any supported engine; verify them with `hub schedules list` and their deliveries.
+The start script sends the role's hourly check (or orchestrator brief) as a normal prompt and records it in `<reports>/state/loop_command`. It does not issue Claude Code's `/loop` command. The current live sessions still use Claude `/loop` for hourly work as a stopgap. Hub scheduled prompts attached to `orchestrator-main` and `oncall-engineer` are the engine-neutral target; verify the live attachment and deliveries with `hub schedules list` before treating that transition as complete.
+
+The oncall model target is a cheaper daily model, with no Argon, Astra, Opus,
+or high effort. The start-path change that enforces this is being handled
+separately; the generic engine-selection behavior above does not prove which
+model the live oncall session uses.
 
 ## Skills (AC14)
 Source: clone of `alexeygrigorev/bot-skills` at `~/git/bot-skills-ops` (note: `~/git/bot-skills` is not a git repo on Hetzner). `session-ctl.sh <role> skills-sync` runs `git pull --ff-only` and symlinks every `<skill>/SKILL.md` directory into `<run dir>/.claude/skills/` (the dir is git-excluded in the run worktree). It runs on every start/restart and as step 0 of each scheduled check. Both role instruction files list the skills to read and follow. If a pull fails the last checkout is used and logged.
@@ -64,8 +69,16 @@ oncall-send "text"                                                            # 
 ```
 `*-send` first appends `inbox/<UTC ts>-<pid>.md` (atomic, fsynced, never lost), then types a one-line `[INBOX id] …` into the pane via `a send --enter`, and prints `INBOX=saved <path>` plus `DELIVERY=delivered|not-delivered`. Exit 0 delivered, 2 saved only (the session drains the inbox on scheduled checks and after a restart), 1 not saved. The session moves handled files to `inbox/processed/`. Set `SENDER=alexey` to label the source.
 
-## Mail access (alert triage)
-This host cannot read `dev@dtcdev.click` or any alert mailbox: only `msmtp` (send-only) is installed; there is no IMAP client, Maildir, mbsync/fetchmail config, and no Gmail API reader. Missing: a read-only mailbox path (IMAP read credentials or Gmail API read scope for dev@dtcdev.click / the alert label) provisioned for a non-secret-printing fetcher by Alexey. Until then alerts arrive via `oncall-send` (Grok Bot forwards dev@ mail) and, later, the Hub webhook->session routing intake. Credential files were deliberately not read.
+## Mail access and alert delivery
+
+This host has no alert-mail reader. The current route is infrastructure mail to
+`dev@dtcdev.click`, then Dapier and the Grok Bot's “Dapier/dev mailbox wake”
+routine; Developer forwards the alert with `oncall-send` and usually
+`orch-send` as well. The send command saves the message before pane delivery.
+If no oncall session is live, `oncall-send` exits 2 after saving it to the
+inbox. A direct Dapier-to-oncall route is being implemented separately and is
+not the current path; keep using the Developer-forwarded route until direct
+delivery has an end-to-end proof. See the [architecture page](../../docs/ONCALL-ORCHESTRATOR-ARCHITECTURE.md).
 
 ## Moving to another host
 Pick a host with the Hub-validated resource floors, `a`, `hub`, `gh` logged in and the repo clone `~/git/agent-hub`. At least one supported non-Claude engine must be configured and have fresh Hub quota headroom. Run `ops/install.sh`, copy `~/tmp/agent-reports/{orchestrator,oncall}` (handoff + inbox), stop the old sessions (`session-ctl.sh <role> status`, `a kill <id>`; ask Alexey first), run `start.sh` on the new host, point Grok Bot's `orch-send`/`oncall-send` at the new host (ssh wrapper). Disable the timer on the old host: `systemctl --user disable --now ops-watchdog.timer`.
