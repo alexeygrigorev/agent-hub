@@ -3,11 +3,11 @@
 import assert from 'node:assert/strict';
 import { mkdtemp, readdir } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import { createFixture, restartFixture } from './node-fixture.mjs';
+import { createFixture, restartFixture, makeTempDir } from './node-fixture.mjs';
 
 const root = resolve(import.meta.dirname, '../..');
 const { default: entry, ControlDO, ProjectDO, MachineDO, AccountDO, MailboxDO } = await import('../production-worker.ts');
-const dataDir = await mkdtemp(resolve(root, '.local/tmp/clean-start-'));
+const dataDir = await makeTempDir('clean-start-');
 const spec = {
   root,
   entry,
