@@ -52,6 +52,16 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 CRON
 chmod 644 /etc/cron.d/hub2-db-backup
 
+echo "== dns updater"
+# Boot-time Route53 self-heal for the ephemeral VM IP (agent-hub-vm.dtcdev.click
+# A record); the CloudFront origin resolves this name. Credentials are NOT in
+# the repo: create /etc/agent-hub/dns-updater.env (0600, AWS_ACCESS_KEY_ID /
+# AWS_SECRET_ACCESS_KEY of the scoped IAM user) on the VM separately. Without
+# it the updater logs a warning and does nothing.
+install -m 750 "$STAGING/hub2-dns-update.sh" /usr/local/sbin/hub2-dns-update.sh
+install -m 644 "$STAGING/agent-hub-dns-update.service" /etc/systemd/system/agent-hub-dns-update.service
+systemctl enable agent-hub-dns-update.service
+
 echo "== services"
 systemctl daemon-reload
 systemctl enable --now agent-hub-hub2.service

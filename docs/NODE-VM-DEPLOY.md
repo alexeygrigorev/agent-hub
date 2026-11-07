@@ -76,10 +76,27 @@ Run locally: `node --experimental-transform-types hub2/node/main.ts --data-dir
 
 Same contract as before: `/health` shows
 `{"status":"bootstrap","dispatch_enabled":false}` until the operator pairs
-(device flow, approve with `HUB2_BOOTSTRAP_TOKEN`, Cognito login — callback
-origin unchanged) and hosts enroll; then set `HUB2_RELEASE_MODE=active` in
-`/opt/agent-hub/.dev.vars` and restart the service. The clean-start model
-holds: the VM DB initializes fresh; the CLI/hosts re-pair once.
+(device flow at `https://hub.dtcdev.click/device`, Cognito login — allowlist and
+callback origin are the non-secret defaults in `hub2/node/config.ts`) and hosts
+enroll; then set `HUB2_RELEASE_MODE=active` in `/opt/agent-hub/.dev.vars` and
+restart the service. The clean-start model holds: the VM DB initializes fresh;
+the CLI/hosts re-pair once. `HUB2_BOOTSTRAP_TOKEN` in `.dev.vars` is carried for
+out-of-band host bootstrap only; the operator device flow does not use it.
+
+## Ephemeral VM IP self-heal (DNS updater)
+
+The VM external IP is ephemeral: a stop/start can change it. The unit
+`agent-hub-dns-update.service` (enabled for boot by
+`deploy/vm/install-hub2-node.sh`) runs `deploy/vm/hub2-dns-update.sh`, which
+compares the GCP metadata external IP with the current
+`agent-hub-vm.dtcdev.click` A record and Route53-UPSERTs when they differ.
+Because the CloudFront origin uses that DNS name (not a bare IP), this one
+update restores the whole edge path. The script no-ops (warning only) without
+`/etc/agent-hub/dns-updater.env`, which holds the scoped IAM user
+`agent-hub-vm-dns` keys (only `route53:ChangeResourceRecordSets` on record
+`agent-hub-vm.dtcdev.click` A in zone `Z05963572WVWFHDQZH5NE`); that env file
+is provisioned on the VM out of band and never lives in Git. Run
+`sudo /usr/local/sbin/hub2-dns-update.sh --force` to verify the credential path.
 
 ## Backup (works with the Node deployment)
 
