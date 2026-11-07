@@ -58,3 +58,14 @@ engine+cwd/tier, stop oracle. No code edits until head acks checkpoint (reading 
 3. New suites `test/session-control-r3.test.ts`, `test/host-authority-r6.test.ts`,
    `host/tests/test_session_r3.py` + configs; preserve/run 169.
 4. Poll own inbox at design/test/freeze; freeze with SHA/parent/pathlist/digest/matrix.
+
+## 2026-11-07 — hub2 ported off Cloudflare to the VM (Node runtime)
+
+- hub2/node runtime (DO shim on node:sqlite, WebSocket bridge, alarms) hosts the
+  unchanged worker source on the VM; production = agent-hub-hub2.service behind
+  caddy. Budget checkers (BudgetDO, envelopes, cron, billing audit) retired.
+- CI/CD is cloud-credential-free: SSH deploy to the VM, health-verified at
+  https://hub.dtcdev.click/health. DNS/edge: aws-infra sandbox/agent-hub
+  (Terraform records, imported) + sandbox/hub-edge (CloudFront origin cutover).
+- Backup kit retargeted to flat SQLite layout; live drill PASS on the VM.
+- Runbook: docs/NODE-VM-DEPLOY.md. PRs: #281, #283 (fix-forward), merged.

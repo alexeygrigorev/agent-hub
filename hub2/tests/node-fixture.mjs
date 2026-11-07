@@ -5,7 +5,7 @@
 
 import { mkdtemp, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { resolve, dirname } from 'node:path';
+import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { registerTypeScriptResolveHook, installCompatGlobals } from '../node/compat.ts';
 import { Hub2Runtime } from '../node/runtime.ts';
@@ -17,6 +17,14 @@ const here = dirname(fileURLToPath(import.meta.url));
 // Install before any hub2 source is imported by the runner module graph.
 registerTypeScriptResolveHook();
 installCompatGlobals();
+
+/** Fresh CI checkouts lack .local/tmp; ensure it exists and return a new
+ * uniquely-named directory under it. */
+export async function makeTempDir(prefix) {
+  const parent = resolve(here, '../.local/tmp');
+  await mkdir(parent, { recursive: true });
+  return mkdtemp(join(parent, prefix));
+}
 
 export async function createFixture(spec) {
   await mkdir(resolve(spec.root ?? here, '../.local/tmp'), { recursive: true });

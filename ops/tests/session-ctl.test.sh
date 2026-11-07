@@ -17,8 +17,9 @@ export FAKE_SCREEN="$fake/screen.txt"
 export FAKE_QUOTA="$fake/quota.json"
 export FAKE_KILLED="$fake/killed.log"
 export FAKE_START_ENGINE="$fake/start-engine"
+export FAKE_START_MODEL="$fake/start-model"
 export FAKE_SEND_LOG="$fake/send.log"
-unset ENGINE ENGINE_SELECTED ORCH_ENGINE ORCH_FALLBACK_ENGINE
+unset ENGINE ENGINE_SELECTED ORCH_ENGINE ORCH_FALLBACK_ENGINE ONCALL_ENGINE
 
 cat > "$bin/a" <<'APLEXER'
 #!/usr/bin/env bash
@@ -38,16 +39,18 @@ case "${1:-}" in
     printf '[]\n' > "$FAKE_SESSIONS"
     ;;
   start)
-    workspace=""; tag=""; engine=""
+    workspace=""; tag=""; engine=""; model=""
     while (($#)); do
       case "$1" in
         --workspace) workspace="$2"; shift 2 ;;
         --tag) tag="$2"; shift 2 ;;
         --engine) engine="$2"; shift 2 ;;
+        --model) model="$2"; shift 2 ;;
         *) shift ;;
       esac
     done
     printf '%s\n' "$engine" > "$FAKE_START_ENGINE"
+    printf '%s' "$model" > "$FAKE_START_MODEL"
     printf '[{"id":"new-%s","workspace":"%s","tag":"%s","phase":"running","worker_alive":true}]\n' "$tag" "$workspace" "$tag" > "$FAKE_SESSIONS"
     printf '%s\n' "${FAKE_START_SCREEN:-❯}" > "$FAKE_SCREEN"
     ;;
@@ -132,7 +135,7 @@ write_live() {
   printf '%s\n' "$pane" > "$FAKE_SCREEN"
   : > "$FAKE_KILLED"
   : > "$FAKE_SEND_LOG"
-  rm -f "$FAKE_START_ENGINE" "$HOME/tmp/agent-reports/$sub/state/last_start"
+  rm -f "$FAKE_START_ENGINE" "$FAKE_START_MODEL" "$HOME/tmp/agent-reports/$sub/state/last_start"
 }
 
 write_dead() {
@@ -144,7 +147,7 @@ write_dead() {
   printf 'normal ready prompt\n' > "$FAKE_SCREEN"
   : > "$FAKE_KILLED"
   : > "$FAKE_SEND_LOG"
-  rm -f "$FAKE_START_ENGINE" "$HOME/tmp/agent-reports/$sub/state/last_start"
+  rm -f "$FAKE_START_ENGINE" "$FAKE_START_MODEL" "$HOME/tmp/agent-reports/$sub/state/last_start"
 }
 
 write_default_quota() {
@@ -182,7 +185,8 @@ touch -d '25 minutes ago' "$HOME/tmp/agent-reports/oncall/inbox/old.md"
 output="$(run_ctl oncall check 2>&1)"
 assert_contains "$output" 'STALLED session=old-oncall: oncall inbox'
 assert_not_contains "$output" 'OK session='
-[[ "$(<"$FAKE_START_ENGINE")" == antigravity ]]
+[[ "$(<"$FAKE_START_ENGINE")" == opencode ]]
+[[ "$(<"$FAKE_START_MODEL")" == opencode-go/muse-spark-1.3-contributor ]]
 assert_contains "$(<"$FAKE_SEND_LOG")" 'Run the oncall check now:'
 assert_not_contains "$(<"$FAKE_SEND_LOG")" '/loop'
 
@@ -193,9 +197,10 @@ write_dead oncall
 export FAKE_HUB_MODE=fail
 output="$(run_ctl oncall start 2>&1)"
 unset FAKE_HUB_MODE
-assert_contains "$output" 'Hub quota unavailable; using local engine antigravity'
+assert_contains "$output" 'Hub quota unavailable; using local engine opencode'
 assert_not_contains "$output" 'recovery held'
-[[ "$(<"$FAKE_START_ENGINE")" == antigravity ]]
+[[ "$(<"$FAKE_START_ENGINE")" == opencode ]]
+[[ "$(<"$FAKE_START_MODEL")" == opencode-go/muse-spark-1.3-contributor ]]
 
 # The Hub release_bootstrap stub falls back during a real oncall recovery.
 write_live oncall 'You have hit your weekly limit - resets Nov 5'
@@ -203,9 +208,10 @@ export FAKE_HUB_MODE=stub
 output="$(run_ctl oncall check 2>&1)"
 unset FAKE_HUB_MODE
 assert_contains "$output" 'provider usage limit screen'
-assert_contains "$output" 'Hub quota unavailable; using local engine antigravity'
+assert_contains "$output" 'Hub quota unavailable; using local engine opencode'
 assert_not_contains "$output" 'recovery held'
-[[ "$(<"$FAKE_START_ENGINE")" == antigravity ]]
+[[ "$(<"$FAKE_START_ENGINE")" == opencode ]]
+[[ "$(<"$FAKE_START_MODEL")" == opencode-go/muse-spark-1.3-contributor ]]
 
 # An HTTP-command timeout (the same nonzero result as timeout(1)) also uses
 # the local route instead of holding recovery.
@@ -213,9 +219,10 @@ write_live oncall 'You have hit your weekly limit - resets Nov 5'
 export FAKE_HUB_MODE=timeout
 output="$(run_ctl oncall check 2>&1)"
 unset FAKE_HUB_MODE
-assert_contains "$output" 'Hub quota unavailable; using local engine antigravity'
+assert_contains "$output" 'Hub quota unavailable; using local engine opencode'
 assert_not_contains "$output" 'recovery held'
-[[ "$(<"$FAKE_START_ENGINE")" == antigravity ]]
+[[ "$(<"$FAKE_START_ENGINE")" == opencode ]]
+[[ "$(<"$FAKE_START_MODEL")" == opencode-go/muse-spark-1.3-contributor ]]
 
 # A healthy quota document still wins over the local preference.
 write_quota <<'JSON'
@@ -223,29 +230,36 @@ write_quota <<'JSON'
 JSON
 write_live oncall 'You have hit your weekly limit - resets Nov 5'
 output="$(run_ctl oncall check 2>&1)"
-assert_contains "$output" 'Hub quota selected opencode'
+assert_not_contains "$output" 'Hub quota unavailable'
 [[ "$(<"$FAKE_START_ENGINE")" == opencode ]]
+[[ "$(<"$FAKE_START_MODEL")" == opencode-go/muse-spark-1.3-contributor ]]
 
-# A legacy Hub harness name under the legacy Google quota provider still routes
-# to Antigravity, even though the configured engine list contains no Gemini CLI.
+# A legacy Gemini quota route is never eligible for oncall, even when Hub
+# advertises it as fresh and configured.
 write_quota <<'JSON'
 {"pools":[{"provider":"gemini","state":"fresh","remaining_percent":44,"harness":["gemini"]}]}
 JSON
 write_live oncall 'You have hit your weekly limit - resets Nov 5'
-output="$(run_ctl oncall check 2>&1)"
+status=0
+output="$(run_ctl oncall check 2>&1)" || status=$?
+[[ "$status" -ne 0 ]]
 assert_not_contains "$output" 'Hub quota unavailable'
-[[ "$(<"$FAKE_START_ENGINE")" == antigravity ]]
+assert_contains "$output" 'no configured non-Claude engine has fresh Hub quota headroom'
+[[ ! -e "$FAKE_START_ENGINE" ]]
 
-# A legacy operator ENGINE=gemini override is normalized to the configured
-# Antigravity route; ops never starts the old Gemini engine name.
+# A legacy engine override cannot widen the oncall allowlist, even when it is
+# marked preselected. It normalizes to the pinned Muse route.
+write_default_quota
 write_dead oncall
-output="$(ENGINE=gemini ENGINE_SELECTED=1 "$repo/ops/lib/session-ctl.sh" oncall start 2>&1)"
+output="$(ENGINE=antigravity ENGINE_SELECTED=1 "$repo/ops/lib/session-ctl.sh" oncall start 2>&1)"
 assert_not_contains "$output" 'recovery held'
-[[ "$(<"$FAKE_START_ENGINE")" == antigravity ]]
+assert_contains "$output" 'oncall route '\''antigravity'\'' is disallowed'
+[[ "$(<"$FAKE_START_ENGINE")" == opencode ]]
+[[ "$(<"$FAKE_START_MODEL")" == opencode-go/muse-spark-1.3-contributor ]]
 
 # Immediately after a restart, oncall gets a MAX_ONCALL_INBOX_AGE grace window from last_start
 # to finish draining pre-existing inbox items instead of being killed mid-triage.
-rm -f "$FAKE_START_ENGINE"
+rm -f "$FAKE_START_ENGINE" "$FAKE_START_MODEL"
 output="$(run_ctl oncall check 2>&1)"
 assert_contains "$output" 'OK session=new-oncall-engineer'
 [[ ! -e "$FAKE_START_ENGINE" ]]
@@ -266,6 +280,7 @@ output="$(run_ctl oncall check 2>&1)"
 unset FAKE_START_SCREEN FAKE_AFTER_HEX_SCREEN
 assert_contains "$output" 'provider usage limit screen'
 [[ "$(<"$FAKE_START_ENGINE")" == opencode ]]
+[[ "$(<"$FAKE_START_MODEL")" == opencode-go/muse-spark-1.3-contributor ]]
 assert_contains "$(<"$FAKE_SEND_LOG")" 'new-oncall-engineer --hex 0d'
 assert_not_contains "$(<"$FAKE_SEND_LOG")" '--raw --hex'
 assert_contains "$(<"$FAKE_SEND_LOG")" 'Run the oncall check now:'
@@ -277,7 +292,13 @@ for role in oncall orchestrator; do
   output="$(run_ctl "$role" check 2>&1)"
   assert_contains "$output" 'provider usage limit screen'
   assert_not_contains "$output" 'OK session='
-  [[ "$(<"$FAKE_START_ENGINE")" == antigravity ]]
+  if [[ "$role" == oncall ]]; then
+    [[ "$(<"$FAKE_START_ENGINE")" == opencode ]]
+    [[ "$(<"$FAKE_START_MODEL")" == opencode-go/muse-spark-1.3-contributor ]]
+  else
+    [[ "$(<"$FAKE_START_ENGINE")" == antigravity ]]
+    [[ "$(<"$FAKE_START_MODEL")" == gemini-3.8-flash-high ]]
+  fi
 done
 
 # Recovery path 2 prefers Antigravity but excludes its failed route, so it uses
