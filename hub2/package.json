@@ -21,6 +21,7 @@
     "test:resource-manager": "cd .. && node --experimental-transform-types hub2/tests/run-resource-manager.mjs",
     "test:production-clean-start": "node --experimental-transform-types tests/production-clean-start.test.mjs",
     "test:core": "node --experimental-transform-types tests/run-core-integration-node.mjs",
-    "test:accounts-mail-node": "node --experimental-transform-types tests/run-accounts-mail-node.mjs"
+    "test:accounts-mail-node": "node --experimental-transform-types tests/run-accounts-mail-node.mjs",
+    "test:normal-day-auth": "node --experimental-transform-types tests/run-normal-day-auth-node.mjs"
   }
 }

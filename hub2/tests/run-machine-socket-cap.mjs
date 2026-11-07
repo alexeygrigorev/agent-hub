@@ -4,7 +4,7 @@ import { WebSocket } from 'ws';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { createHash } from 'node:crypto';
-import { createFixture, restartFixture } from './node-fixture.mjs';
+import { createFixture, restartFixture, makeTempDir } from './node-fixture.mjs';
 const root = resolve(import.meta.dirname, '../..');
 const token = 'synthetic-socket-cap-operator-token-0000000000000';
 const machine = 'socket-cap-machine';
@@ -13,7 +13,7 @@ const hash = () => readFile(machineSource).then(b => createHash('sha256').update
 const before = await hash();
 const workerExports = await import('./socket-cap-worker.ts');
 const [CountControl, SocketMachine, ] = [workerExports.CountControl, workerExports.SocketMachine, ];
-const persist = await mkdtemp(resolve(root, '.local/tmp/socket-cap-'));
+const persist = await makeTempDir('socket-cap-');
 const sockets = [];
 const spec = {
   root,
