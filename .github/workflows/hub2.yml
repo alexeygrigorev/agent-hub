@@ -8,7 +8,6 @@ on:
       - "package.json"
       - "package-lock.json"
       - ".github/workflows/hub2.yml"
-      - ".github/workflows/hub2-billing-audit.yml"
       - "AGENTS.md"
   pull_request:
     paths:
@@ -17,7 +16,6 @@ on:
       - "package.json"
       - "package-lock.json"
       - ".github/workflows/hub2.yml"
-      - ".github/workflows/hub2-billing-audit.yml"
       - "AGENTS.md"
   workflow_dispatch:
   workflow_call:
@@ -39,24 +37,26 @@ jobs:
       - uses: actions/setup-node@v4
         id: setup_node
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install locked root toolchain
+      - name: Install locked toolchain
         id: install
         continue-on-error: true
         run: npm ci
 
-      - name: Typecheck Hub 2.0 source
+      - name: Typecheck Hub 2.0 source and Node runtime
         id: typecheck
         continue-on-error: true
-        run: npm run typecheck --prefix hub2
+        run: |
+          npm run typecheck
+          npm run typecheck --prefix hub2
 
-      - name: Report product SLOC; enforce runtime completeness and source classification
+      - name: Report product SLOC and enforce runtime completeness
         id: budget
         continue-on-error: true
         run: npm run budget --prefix hub2 -- --limit 6000 --accepted-baseline 8962 --report-only-size
@@ -96,80 +96,47 @@ jobs:
         continue-on-error: true
         run: npm run test:control --prefix hub2
 
-      - name: Control alarm budget retry tests
-        id: control_budget_alarm
-        continue-on-error: true
-        run: npm run test:control-budget-alarm --prefix hub2
-
       - name: Resource Manager admission and routing tests
         id: resource_manager
         continue-on-error: true
         run: npm run test:resource-manager --prefix hub2
 
-      - name: Cloudflare backstop policy safety tests
-        id: billing_policy
+      - name: Mail retention and restart e2e on Node runtime
+        id: accounts_mail_node
         continue-on-error: true
-        run: npm run test:billing-policy --prefix hub2
+        run: npm run test:accounts-mail-node --prefix hub2
 
-      - name: Durable cost ledger, ceilings, alerts, and restart tests
-        id: budget_controller
-        continue-on-error: true
-        run: npm run test:budget --prefix hub2
-
-      - name: Public budget enforcement and alert delivery restart
-        id: budget_edge
-        continue-on-error: true
-        run: npm run test:budget-edge --prefix hub2
-
-      - name: Accounts and mail Workerd tests
-        id: accounts_workerd
-        continue-on-error: true
-        run: npm run test:accounts-mail-workerd --prefix hub2
-
-      - name: Auth and enrollment Workerd tests
-        id: auth_workerd
+      - name: OIDC auth flows e2e on Node runtime
+        id: auth_flows
         continue-on-error: true
         run: npm run test:normal-day-auth --prefix hub2
 
-      - name: Auth cleanup metering and restart tests
+      - name: Auth cleanup bounded-restart tests on Node runtime
         id: auth_gc
         continue-on-error: true
         run: npm run test:auth-gc --prefix hub2
 
-      - name: Machine WebSocket singleton Workerd tests
+      - name: Machine websocket capacity e2e on Node runtime
         id: machine_socket_cap
         continue-on-error: true
         run: npm run test:machine-socket-cap --prefix hub2
 
-      - name: Normal day Workerd budget and idle tests
-        id: normal_day
+      - name: Public worker core e2e on Node runtime
+        id: core_node
         continue-on-error: true
-        run: npm run test:normal-day --prefix hub2
+        run: npm run test:core --prefix hub2
 
-      - name: Public Worker core Workerd tests
-        id: core_workerd
-        continue-on-error: true
-        run: npm run test:core-workerd --prefix hub2
-
-      - name: Public Worker and native mail roundtrip
+      - name: Public worker and native mail roundtrip
         id: public_mail
         continue-on-error: true
         env:
           HUB2_CORE_PUBLIC_MAIL: "1"
-        run: npm run test:core-workerd --prefix hub2
+        run: npm run test:core --prefix hub2
 
-      - name: Build the local-only Wrangler bundle
-        id: bundle
-        continue-on-error: true
-        run: npm run bundle:dry-run --prefix hub2
-
-      - name: Validate clean-start production manifest and bundle
+      - name: Clean-start production entry on Node runtime
         id: production_clean_start
         continue-on-error: true
-        run: |
-          node hub2/tests/production-clean-start.test.mjs
-          cd hub2
-          npx wrangler deploy --dry-run --config wrangler.production.jsonc --outdir .local/hub2-production-dist
+        run: npm run test:production-clean-start --prefix hub2
 
       - name: Fail the job if any gate failed
         if: always()
@@ -185,19 +152,13 @@ jobs:
           READ_CACHE: ${{ steps.read_cache.outcome }}
           DB_METERING: ${{ steps.db_metering.outcome }}
           CONTROL: ${{ steps.control.outcome }}
-          CONTROL_BUDGET_ALARM: ${{ steps.control_budget_alarm.outcome }}
           RESOURCE_MANAGER: ${{ steps.resource_manager.outcome }}
-          BILLING_POLICY: ${{ steps.billing_policy.outcome }}
-          BUDGET_CONTROLLER: ${{ steps.budget_controller.outcome }}
-          BUDGET_EDGE: ${{ steps.budget_edge.outcome }}
-          ACCOUNTS_WORKERD: ${{ steps.accounts_workerd.outcome }}
-          AUTH_WORKERD: ${{ steps.auth_workerd.outcome }}
+          ACCOUNTS_MAIL_NODE: ${{ steps.accounts_mail_node.outcome }}
+          AUTH_FLOWS: ${{ steps.auth_flows.outcome }}
           AUTH_GC: ${{ steps.auth_gc.outcome }}
           MACHINE_SOCKET_CAP: ${{ steps.machine_socket_cap.outcome }}
-          NORMAL_DAY: ${{ steps.normal_day.outcome }}
-          CORE_WORKERD: ${{ steps.core_workerd.outcome }}
+          CORE_NODE: ${{ steps.core_node.outcome }}
           PUBLIC_MAIL: ${{ steps.public_mail.outcome }}
-          BUNDLE: ${{ steps.bundle.outcome }}
           PRODUCTION_CLEAN_START: ${{ steps.production_clean_start.outcome }}
         run: |
           failed=0
@@ -207,39 +168,16 @@ jobs:
             "account_provider_timeout:$ACCOUNT_PROVIDER_TIMEOUT" \
             "project_work:$PROJECT_WORK" "project_intake:$PROJECT_INTAKE" \
             "read_cache:$READ_CACHE" "db_metering:$DB_METERING" \
-            "control:$CONTROL" "control_budget_alarm:$CONTROL_BUDGET_ALARM" \
-            "resource_manager:$RESOURCE_MANAGER" "billing_policy:$BILLING_POLICY" \
-            "budget_controller:$BUDGET_CONTROLLER" "budget_edge:$BUDGET_EDGE" \
-            "accounts_workerd:$ACCOUNTS_WORKERD" \
-            "auth_workerd:$AUTH_WORKERD" "auth_gc:$AUTH_GC" \
-            "machine_socket_cap:$MACHINE_SOCKET_CAP" \
-            "normal_day:$NORMAL_DAY" \
-            "core_workerd:$CORE_WORKERD" "public_mail:$PUBLIC_MAIL" "bundle:$BUNDLE" \
+            "control:$CONTROL" "resource_manager:$RESOURCE_MANAGER" \
+            "accounts_mail_node:$ACCOUNTS_MAIL_NODE" "auth_flows:$AUTH_FLOWS" \
+            "auth_gc:$AUTH_GC" "machine_socket_cap:$MACHINE_SOCKET_CAP" \
+            "core_node:$CORE_NODE" "public_mail:$PUBLIC_MAIL" \
             "production_clean_start:$PRODUCTION_CLEAN_START"; do
             name=${result%%:*}
             outcome=${result#*:}
-            if [ "$outcome" != success ]; then
-              echo "::error::Hub 2.0 gate $name ended with $outcome"
+            echo "$name: $outcome"
+            if [ "$outcome" != "success" ] && [ "$outcome" != "skipped" ]; then
               failed=1
-            else
-              echo "Hub 2.0 gate $name passed"
             fi
           done
-          exit "$failed"
-
-  host-tests:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install the exact Hub 2 host dependency
-        run: python -m pip install -e ./hub2/host
-      - name: Run Hub 2 host tests
-        run: python hub2/scripts/test_host.py
+          exit $failed

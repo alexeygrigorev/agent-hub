@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for CI/CD workflow validator, rollback helper and wrangler deploy retry."""
+"""CI/CD contract tests: canonical release, host distribution, rollback guard."""
 
 import importlib.util
 import re
@@ -11,24 +11,14 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 VALIDATE_SCRIPT = REPO_ROOT / "scripts" / "ci" / "validate-workflow.py"
 ROLLBACK_SCRIPT = REPO_ROOT / "scripts" / "ci" / "rollback.py"
-RETRY_SCRIPT = REPO_ROOT / "scripts" / "ci" / "wrangler_retry.py"
-RENDER_DEPLOY_CONFIG_SCRIPT = REPO_ROOT / "scripts" / "ci" / "render-wrangler-deploy-config.py"
 DEPLOY_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "deploy.yml"
 
 
-def load_retry_module():
-    spec = importlib.util.spec_from_file_location("wrangler_retry_under_test", RETRY_SCRIPT)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-RETRY = load_retry_module()
 
 
 class TestCICD(unittest.TestCase):
     def test_canonical_release_contract(self):
-        result = subprocess.run(["node", "--test", "test/root-promotion.test.mjs"],
+        result = subprocess.run(["node", "--test", "test/release-contract.test.mjs"],
                                 cwd=REPO_ROOT, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
@@ -41,140 +31,7 @@ class TestCICD(unittest.TestCase):
         self.assertEqual(set(package["project"]["scripts"]), {"hub", "hub2"})
 
 
-class TestWranglerRetry(unittest.TestCase):
-    """Classifier and bounded-retry behavior for transient Cloudflare API errors."""
-
-    # The exact failure from run 40494634371 attempt #3 (2026-10-27).
-    INCIDENT_10013_OUTPUT = (
-        "Deploying agent-hub-dev\n"
-        "ERROR A request to the Cloudflare API "
-        "(/accounts/***/workers/scripts/agent-hub-dev/assets-upload-session) failed.\n"
-        "An unknown error has occurred ... [code: 10013]\n"
-    )
-
-    def test_transient_cloudflare_10013(self):
-        kind, reason = RETRY.classify_failure(self.INCIDENT_10013_OUTPUT)
-        self.assertEqual(kind, "transient")
-        self.assertIn("10013", reason)
-        self.assertEqual(RETRY.error_code(self.INCIDENT_10013_OUTPUT), "10013")
-
-    def test_transient_network_and_5xx_samples(self):
-        for output in (
-            "ERROR A request to the Cloudflare API (...) failed.\nfetch failed\n",
-            "ERROR network connection lost while uploading assets\n",
-            "ERROR A request to the Cloudflare API (...) failed.\ninternal server error\n",
-            "ERROR request failed with status code: 503\n",
-        ):
-            kind, _ = RETRY.classify_failure(output)
-            self.assertEqual(kind, "transient", output)
-
-    def test_fatal_auth_config_build_samples(self):
-        for output in (
-            "ERROR A request to the Cloudflare API (...) failed.\nAuthentication error [code: 10000]\n",
-            "ERROR Invalid API token provided; deploy rejected\n",
-            "ERROR could not read config file .local/dev-wrangler.json\n",
-            "ERROR [ERROR] Could not resolve \"./src/missing.ts\"\n",
-        ):
-            kind, _ = RETRY.classify_failure(output)
-            self.assertEqual(kind, "fatal", output)
-
-    def test_fatal_takes_precedence_over_transient(self):
-        mixed = "fetch failed\nERROR Authentication error [code: 10000]\n"
-        kind, _ = RETRY.classify_failure(mixed)
-        self.assertEqual(kind, "fatal")
-
-    def test_unrecognized_failure_is_not_transient(self):
-        kind, _ = RETRY.classify_failure("ERROR something exploded unexpectedly\n")
-        self.assertIsNone(kind)
-
-    def test_retry_until_success_within_max_attempts(self):
-        outputs = [(1, "blip [code: 10013]\n"), (1, "blip [code: 10013]\n"), (0, "Uploaded\n")]
-        calls, sleeps = [], []
-
-        def runner(argv):
-            calls.append(argv)
-            return outputs[len(calls) - 1]
-
-        code, attempts, _ = RETRY.run_with_retries(
-            ["npx", "wrangler", "deploy"], runner=runner, clock=sleeps.append)
-        self.assertEqual(code, 0)
-        self.assertEqual(attempts, 3)
-        self.assertEqual(len(calls), 3)
-        self.assertEqual(sleeps, list(RETRY.RETRY_SLEEP_SECONDS))
-
-    def test_fatal_failure_never_retries(self):
-        calls, sleeps = [], []
-        code, attempts, kind = RETRY.run_with_retries(
-            ["npx", "wrangler", "deploy"],
-            runner=lambda argv: (calls.append(argv), (7, "Authentication error [code: 10000]\n"))[1],
-            clock=sleeps.append)
-        self.assertEqual(code, 7)
-        self.assertEqual(attempts, 1)
-        self.assertEqual(kind, "fatal")
-        self.assertEqual(sleeps, [])
-
-    def test_persistent_transient_stops_at_max_attempts(self):
-        calls, sleeps = [], []
-
-        def runner(argv):
-            calls.append(argv)
-            return (1, "blip [code: 10013]\n")
-
-        code, attempts, kind = RETRY.run_with_retries(
-            ["npx", "wrangler", "deploy"], runner=runner, clock=sleeps.append)
-        self.assertEqual(code, 1)
-        self.assertEqual(attempts, RETRY.MAX_ATTEMPTS)
-        self.assertEqual(kind, "transient")
-        self.assertEqual(sleeps, list(RETRY.RETRY_SLEEP_SECONDS))
-
-
-class TestDeployWorkflowRetryWiring(unittest.TestCase):
-    def test_production_retry_and_health_are_retained(self):
-        content = DEPLOY_WORKFLOW.read_text()
-        self.assertIn("default: bootstrap", content)
-        self.assertIn("- bootstrap", content)
-        self.assertIn("- active", content)
-        self.assertIn("render-wrangler-deploy-config.py --mode \"$HUB2_RELEASE_MODE\"", content)
-        self.assertIn("wrangler_retry.py npx wrangler deploy --config wrangler.deploy.jsonc", content)
-        self.assertIn("wrangler_retry.py npx wrangler versions list --config wrangler.deploy.jsonc", content)
-        self.assertIn("https://hub.dtcdev.click/health", content)
-        self.assertIn("payload.get('service') == 'hub2'", content)
-
-    def test_release_config_changes_only_the_mode_and_refuses_overwrite(self):
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as directory:
-            config = Path(directory) / "wrangler.jsonc"
-            output = Path(directory) / "wrangler.deploy.jsonc"
-            config.write_text('{\n  "vars": {\n    "HUB2_RELEASE_MODE": "active",\n    "KEEP": "same"\n  }\n}\n')
-            result = subprocess.run(
-                [sys.executable, str(RENDER_DEPLOY_CONFIG_SCRIPT), "--config", str(config), "--output", str(output), "--mode", "bootstrap"],
-                capture_output=True, text=True,
-            )
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(output.read_text(), config.read_text().replace('"HUB2_RELEASE_MODE": "active"', '"HUB2_RELEASE_MODE": "bootstrap"'))
-            self.assertEqual(config.read_text().count('"HUB2_RELEASE_MODE": "active"'), 1)
-            result = subprocess.run(
-                [sys.executable, str(RENDER_DEPLOY_CONFIG_SCRIPT), "--config", str(config), "--output", str(output), "--mode", "active"],
-                capture_output=True, text=True,
-            )
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("File exists", result.stderr)
-
-    def test_release_config_requires_one_mode_binding(self):
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as directory:
-            config = Path(directory) / "wrangler.jsonc"
-            output = Path(directory) / "wrangler.deploy.jsonc"
-            config.write_text('{"vars":{}}')
-            result = subprocess.run(
-                [sys.executable, str(RENDER_DEPLOY_CONFIG_SCRIPT), "--config", str(config), "--output", str(output), "--mode", "bootstrap"],
-                capture_output=True, text=True,
-            )
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("exactly one HUB2_RELEASE_MODE", result.stderr)
-
+class TestRollbackContract(unittest.TestCase):
     def test_rollback_cannot_restore_legacy_version(self):
         rollback = (REPO_ROOT / ".github/workflows/rollback.yml").read_text()
         self.assertNotIn("CLOUDFLARE_API_TOKEN", rollback)

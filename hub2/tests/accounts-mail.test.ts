@@ -2,8 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { AccountDO as ActualAccountDO } from '../src/account-do';
-import {semanticBudgetEnv,semanticNoSqlResponse} from './budget-fixture';
-function semanticEnv(env:any={}){return semanticBudgetEnv(env);}
+function semanticEnv(env:any={}){return env;}
 class AccountDO extends ActualAccountDO { constructor(ctx:any,env:any={}){super(ctx,semanticEnv(env));} }
 import { ControlDO } from '../src/control-do';
 import { MailboxDO as ActualMailboxDO } from '../src/mailbox-do';
@@ -79,15 +78,15 @@ test('unclaimed account hold expiry frees once; invalid quota evidence and unaut
  assert.equal((await account.fetch(request('/api/account/quota','PUT',{remaining:null,captured_at:Date.now(),valid_until:Date.now()+1000,source:'test'}))).status,400);
  assert.equal((await account.fetch(request('/api/account/resets','PUT',{id:'r1',expires_at:Date.now()+10000,available:true,source:'test'},{id:'bad',scopes:[]}))).status,403);
 });
-function mailboxes(budget?:any){
+function mailboxes(){
  const flags={blockReceipts:false,blockDirectory:false,blockMachine:false,failWakeAfterEffect:false,afterRecipient:undefined as undefined|(()=>Promise<void>)};
  const controlEnv:any=semanticEnv({}),controlState=state();let control=new ControlDO(controlState.ctx,controlEnv);
  controlState.database.prepare('INSERT INTO object_routes(kind,id,owner,resource_id,epoch,digest,participants_json) VALUES(?,?,?,?,?,?,?)').run('session','session-test','h1','task-test',1,'synthetic-fixture','[]');
  controlState.database.prepare('INSERT INTO actor_directory(id,kind,enabled) VALUES(?,?,1)').run('session:session-test','session');
  for(const name of ['a','b','c','d','e'])controlState.database.prepare('INSERT INTO named_agents(id,display_name,forward_session,enabled) VALUES(?,?,?,1)').run('agent:'+name,name,'session-test');clearFixtureCache(control);
- const nativeCalls:any[]=[];const nativeFetch=async(r:Request)=>{const b=await r.json();nativeCalls.push({path:new URL(r.url).pathname,body:b});return flags.blockMachine?semanticNoSqlResponse(r,{},503):semanticNoSqlResponse(r,{queued:true,acked:new URL(r.url).pathname.endsWith('mail-ack'),cancelled:new URL(r.url).pathname.endsWith('mail-cancel'),state:'pending',message_id:b.message_id,epoch:b.epoch,operation_id:b.operation_id});};
+ const nativeCalls:any[]=[];const nativeFetch=async(r:Request)=>{const b=await r.json();nativeCalls.push({path:new URL(r.url).pathname,body:b});return flags.blockMachine?Response.json({},{status:503}):Response.json({queued:true,acked:new URL(r.url).pathname.endsWith('mail-ack'),cancelled:new URL(r.url).pathname.endsWith('mail-cancel'),state:'pending',message_id:b.message_id,epoch:b.epoch,operation_id:b.operation_id});};
  const stores=new Map<string,ReturnType<typeof state>>(),shared=state();let box:MailboxDO;
- const env:any={...(budget?{BUDGET:budget}:{}),MACHINES:{idFromName:(id:string)=>id,get:()=>({fetch:nativeFetch})},CONTROL:{idFromName:(id:string)=>id,get:()=>({fetch:async(r:Request)=>{const path=new URL(r.url).pathname;if(flags.blockDirectory&&path==='/_routes/register')return new Response('{}',{status:503});const response=await control.fetch(r);if(path==='/_recipient'&&flags.afterRecipient){const hook=flags.afterRecipient;flags.afterRecipient=undefined;await hook();}return response;}})},MAILBOXES:{idFromName:(id:string)=>id,get:(id:string)=>({fetch:async(r:Request)=>{const path=new URL(r.url).pathname;if(flags.blockReceipts&&path==='/_receipt')return new Response('{}',{status:503});const response=await get(id).fetch(r);if(flags.failWakeAfterEffect&&path==='/_resume-native'){flags.failWakeAfterEffect=false;return new Response('{}',{status:503});}return response;}})}};
+ const env:any={MACHINES:{idFromName:(id:string)=>id,get:()=>({fetch:nativeFetch})},CONTROL:{idFromName:(id:string)=>id,get:()=>({fetch:async(r:Request)=>{const path=new URL(r.url).pathname;if(flags.blockDirectory&&path==='/_routes/register')return new Response('{}',{status:503});const response=await control.fetch(r);if(path==='/_recipient'&&flags.afterRecipient){const hook=flags.afterRecipient;flags.afterRecipient=undefined;await hook();}return response;}})},MAILBOXES:{idFromName:(id:string)=>id,get:(id:string)=>({fetch:async(r:Request)=>{const path=new URL(r.url).pathname;if(flags.blockReceipts&&path==='/_receipt')return new Response('{}',{status:503});const response=await get(id).fetch(r);if(flags.failWakeAfterEffect&&path==='/_resume-native'){flags.failWakeAfterEffect=false;return new Response('{}',{status:503});}return response;}})}};
  Object.assign(controlEnv,env);
  box=new MailboxDO(shared.ctx,env);for(const id of ['global','agent:a','agent:b','agent:c','agent:d','agent:e'])stores.set(id,shared);
  function get(id:string){stores.set(id,shared);return box;}
@@ -656,30 +655,4 @@ test('current host approval and credential generation rejection fence reserve co
  await account.fetch(request('/api/account/hosts','PUT',{hosts:[]}));assert.equal((await account.fetch(request('/api/account/start','POST',binding))).status,409);
  assert.equal((await account.fetch(request('/_internal/release','POST',{...binding,native_exit_confirmed:true}))).status,200);
  assert.equal((s.database.prepare('SELECT occupied FROM account').get() as any).occupied,0);
-});
-test('budget denial occurs before provider probe or refresh intent and persists quota retry without consuming credentials',async()=>{
- const s=state(),retry=Date.now()+3600000;let calls=0;
- const BUDGET={idFromName:(v:string)=>v,get:()=>({fetch:async()=>Response.json({allowed:false,retry_at:retry},{status:429})})};
- const env:any={BUDGET,HUB2_CREDENTIAL_KEY:'ab'.repeat(32),HUB2_PROVIDER_FETCH:async()=>{calls++;throw Error('must not issue provider request');}};
- const account=new AccountDO(s.ctx,env);
- await account.fetch(request('/api/account','PATCH',{provider:'codex',enabled:true,capacity:1}));
- await account.fetch(request('/api/account/credentials','PUT',{expected_generation:0,files:{'.codex/auth.json':JSON.stringify({tokens:{access_token:'synthetic',refresh_token:'synthetic'}})}}));
- await account.fetch(request('/api/account/hosts','PUT',{hosts:['h1']}));
- const denied=await account.fetch(request('/api/account/discovery','POST',{}));assert.equal(denied.status,429);assert.equal((await data(denied)).retry_at,retry);assert.equal(calls,0);
- assert.equal((s.database.prepare('SELECT retry_at FROM probes').get() as any).retry_at,retry);
- const restarted=new AccountDO(s.ctx,env),host={id:'machine:h1',kind:'machine',resource_id:'h1',scopes:[]};
- const material=await restarted.fetch(request('/api/account/credentials','GET',undefined,host));assert.equal(material.status,429);assert.equal((await data(material)).retry_at,retry);
- assert.equal((s.database.prepare('SELECT COUNT(*) AS n FROM credential_candidates').get() as any).n,0);assert.equal(calls,0);
-});
-test('native producer budget pause preserves epoch/body/intent through restart and resumes once without false delivery',async()=>{
- let paused=true;const retry=Date.now()+3600000;
- const BUDGET={idFromName:(v:string)=>v,get:()=>({fetch:async(input:any)=>String(typeof input==='string'?input:input.url).endsWith('/reserve')&&paused?Response.json({allowed:false,retry_at:retry},{status:429}):Response.json({allowed:true})})};
- const m=mailboxes(BUDGET),sent=(await data(await m.fetch('agent:a','/api/messages','POST',{recipient:'agent:b',body:'retained while budget paused',key:'budget-pause'}))).message;
- assert.equal(m.nativeCalls.length,0);
- const store=m.stores.get('global')!,before=store.database.prepare('SELECT * FROM native_outbox WHERE message_id=?').get(sent.id) as any;
- assert.equal(before.state,'pending-target');assert.equal(before.next_attempt,retry);assert.equal(before.attempts,0);assert.equal(before.epoch,1);
- m.restart('global');await m.get('global').alarm();assert.equal(m.nativeCalls.length,0);
- paused=false;store.database.prepare('UPDATE native_outbox SET next_attempt=? WHERE message_id=?').run(Date.now()-1,sent.id);clearFixtureCache(m.get('global'));
- await m.get('global').alarm();await m.get('global').alarm();assert.equal(m.nativeCalls.length,1);assert.equal(m.nativeCalls[0].body.epoch,1);assert.equal(m.nativeCalls[0].body.body,'retained while budget paused');
- const status=await data(await m.fetch('agent:a','/api/messages/'+sent.id+'/status'));assert.equal(status.message.delivered_at,null);
 });

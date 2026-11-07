@@ -7,7 +7,7 @@ export type SqlReceipt={v:1;valid:boolean;reads:number;writes:number;operation_i
 type Scope={reads:number;writes:number;fundedReads:number;fundedWrites:number;fault:number;pending:number;closed:boolean;requests:number;duration:number;fundedRequests:number;fundedDuration:number;requestsValid:boolean;durationValid:boolean;started:number;prelude:number;own:boolean};
 type Point={scope:Scope;reads:number;writes:number;fundedReads:number;fundedWrites:number;fault:number;requests:number;duration:number;fundedRequests:number;fundedDuration:number};
 const scope=():Scope=>({reads:0,writes:0,fundedReads:0,fundedWrites:0,fault:0,pending:0,closed:false,requests:0,duration:0,fundedRequests:0,fundedDuration:0,requestsValid:true,durationValid:true,started:performance.now(),prelude:0,own:false});
-const names=['CONTROL','PROJECTS','MACHINES','ACCOUNTS','MAILBOXES','BUDGET'] as const;
+const names=['CONTROL','PROJECTS','MACHINES','ACCOUNTS','MAILBOXES'] as const;
 const finite=(n:unknown):n is number=>Number.isSafeInteger(n)&&Number(n)>=0;
 export function parseSqlReceipt(raw:string|null,operationId?:string):SqlReceipt|undefined{
  if(!raw||raw.length>384)return;

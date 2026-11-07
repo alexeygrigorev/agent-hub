@@ -1,5 +1,5 @@
 [Unit]
-Description=Agent Hub worker (hub2 production worker on workerd, GCP VM)
+Description=Agent Hub hub2 server (Node runtime, SQLite on machine)
 After=network-online.target
 Wants=network-online.target
 
@@ -9,17 +9,17 @@ User=alexey
 Group=alexey
 UMask=0077
 WorkingDirectory=/opt/agent-hub
-Environment=WRANGLER_SEND_METRICS=false
 Environment=NODE_ENV=production
 Environment=TMPDIR=/opt/agent-hub/.local/tmp
 Environment=HOME=/home/alexey
-ExecStart=/opt/agent-hub/node_modules/.bin/wrangler dev --config wrangler.jsonc --ip 127.0.0.1 --port 8787 --persist-to /var/lib/agent-hub/do-state --test-scheduled
+ExecStart=/usr/bin/node --experimental-transform-types hub2/node/main.ts --host 127.0.0.1 --port 8787 --data-dir /var/lib/agent-hub/hub2-db --dev-vars /opt/agent-hub/.dev.vars
 Restart=on-failure
 RestartSec=10
 KillMode=mixed
 TimeoutStopSec=45
-MemoryMax=1500M
+MemoryMax=1200M
 TasksMax=512
+NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target

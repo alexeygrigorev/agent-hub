@@ -8,7 +8,6 @@ export { ProjectDO } from './src/project-do';
 export { MachineDO } from './src/machine-do';
 export { AccountDO } from './src/account-do';
 export { MailboxDO } from './src/mailbox-do';
-export { BudgetDO } from './src/budget-do';
 
 const unavailable = (health = false) => Response.json(
   health ? { status: 'maintenance', dispatch_enabled: false } : { error: 'release_maintenance', dispatch_enabled: false },
@@ -44,7 +43,7 @@ function bootstrapRequestAllowed(request: Request): boolean {
   if (path === '/api/model-policy') return method === 'GET' || method === 'PUT';
   if (path === '/api/enrollments/pair' || path === '/api/enrollments/complete') return method === 'POST';
   if (path === '/api/heartbeat') return method === 'POST';
-  if (['/api/fleet', '/api/fleet/machines', '/api/sessions', '/api/status', '/api/budget'].includes(path))
+  if (['/api/fleet', '/api/fleet/machines', '/api/sessions', '/api/status'].includes(path))
     return method === 'GET';
 
   const accountPath = path.match(/^\/api\/(?:accounts\/[A-Za-z0-9_.-]{1,80}\/api\/)?account(?:\/(credentials|hosts|discovery|quota|resets|alerts))?$/);
@@ -77,8 +76,5 @@ export default {
       return bootstrapRequestAllowed(request) ? worker.fetch(request, env) : Promise.resolve(bootstrapResponse(request));
     }
     return Promise.resolve(unavailable(new URL(request.url).pathname === '/health' && request.method === 'GET'));
-  },
-  async scheduled(event: ScheduledController, env: ProductionEnv): Promise<void> {
-    if (env.HUB2_RELEASE_MODE === 'active') await worker.scheduled(event, env);
   },
 };

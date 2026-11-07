@@ -1,3 +1,8 @@
+> **RETIRED (2026-11-07, Alexey).** The hub runs off Cloudflare on a Node
+> runtime with SQLite on the machine; the BudgetDO cost checker, envelopes,
+> the 15-minute alert cron and the Cloudflare billing backstop are removed.
+> Kept for history only — do not reintroduce any of this machinery.
+
 # Hub 2.0 cost controls
 
 Status: release gate in progress, 6 November 2026. The clean-start source passed the complete numeric canonical Workerd workload with a source-stable native meter and no budget hard stop under the approved USD 0.25 cap. The test-only profile is not installed on the production Worker. The USD 0.03/day alert and USD 0.01 reserve remain unchanged. Provider-rated usage and Cloudflare billing backstop access remain unverified, so Hub estimates are not invoice guarantees.

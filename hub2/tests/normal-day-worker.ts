@@ -1,9 +1,7 @@
-import sourceWorker from '../src/worker';
 import {providerFetch} from './normal-day-provider';
-import {fixtureBudgetEnvelopes} from './budget-fixture';
 // Test-only real five-DO fixture, native cursor profiles; never deploy.
 import authFixture from './normal-day-auth-worker';
-import fixture,{CoreControl as Control,CoreProject as Project,CoreMachine as Machine,CoreAccount as Account,CoreMailbox as Mailbox,CoreBudget as Budget} from './core-integration-worker';
+import fixture,{CoreControl as Control,CoreProject as Project,CoreMachine as Machine,CoreAccount as Account,CoreMailbox as Mailbox} from './core-integration-worker';
 // The test advances Date.now independently of workerd's physical alarm clock.
 // Fixed translation persists across restart; due handlers are explicitly driven.
 const FIXTURE_ALARM_SHIFT=7*86400000;
@@ -31,21 +29,4 @@ export class CoreProject extends ProfiledProject{
   return super.fetch(request);
  }
 }
-export class CoreAccount extends profileClass(Account){constructor(ctx:DurableObjectState,env:any){super(ctx,{...env,HUB2_BUDGET_ENVELOPES:env.HUB2_BUDGET_ENVELOPES??fixtureBudgetEnvelopes,HUB2_PROVIDER_FETCH:providerFetch});}}
-const ProfiledBudget=profileClass(Budget);
-export class CoreBudget extends ProfiledBudget{
- private readonly fixtureContext:DurableObjectState;
- constructor(ctx:DurableObjectState,env:any){super(ctx,env);this.fixtureContext=ctx;}
- async fetch(request:Request){
-  if(new URL(request.url).pathname==='/_fixture/ledger'){
-   await (this as any).core.fetch(new Request('https://budget.internal/_metrics'));
-   const db=(this as any).core.db;
-   return Response.json({object_id:this.fixtureContext.id.toString(),days:db.all('SELECT day,settled_pusd,reserved_pusd,units_json,costs_json,coverage_json,hard_stopped FROM budget_days ORDER BY day'),kinds:db.all('SELECT day,kind,state,COUNT(*) AS reservations,SUM(CAST(estimate_pusd AS INTEGER)) AS estimate_pusd,SUM(CAST(actual_pusd AS INTEGER)) AS actual_pusd FROM budget_reservations GROUP BY day,kind,state ORDER BY day,kind,state')});
-  }
-  if(new URL(request.url).pathname==='/_fixture/state'){
-   await(this as any).core.ready;return Response.json({counts:(this as any).core.db.snapshot(),alarm:await this.fixtureContext.storage.getAlarm()});
-  }
-  return super.fetch(request);
- }
-}
-export default{async fetch(r:Request,env:any){const pathname=new URL(r.url).pathname;if(pathname==='/_fixture/alert-stats'){if(r.headers.get('Authorization')!=='Bearer '+env.HUB2_DEV_OPERATOR_TOKEN)return new Response(null,{status:401});return fetch('https://normal-day-alert.fixture/_stats');}if(pathname==='/_fixture/budget-cron'){if(r.method!=='POST'||r.headers.get('Authorization')!=='Bearer '+env.HUB2_DEV_OPERATOR_TOKEN)return new Response(null,{status:401});await sourceWorker.scheduled({} as ScheduledController,env);return Response.json({invoked:true});}const m=pathname.match(/^\/_fixture\/(control|project|machine|account|mailbox|budget)\/([^/]+)\/(profile|ledger)$/),align=pathname.match(/^\/_fixture\/project\/([^/]+)\/align-schedules$/);if(pathname==='/_fixture/barrier'){if(r.headers.get('Authorization')!=='Bearer '+env.HUB2_DEV_OPERATOR_TOKEN)return new Response(null,{status:401});const b=await r.json()as{id:string};console.log('HUB2_BARRIER '+b.id);return Response.json({observed:true});}if(pathname==='/_fixture/provider')return authFixture.fetch(r,env);if(align){if(r.method!=='POST'||r.headers.get('Authorization')!=='Bearer '+env.HUB2_DEV_OPERATOR_TOKEN)return Response.json({error:'unauthorized'},{status:401});return env.PROJECTS.get(env.PROJECTS.idFromName(decodeURIComponent(align[1]))).fetch(new Request('https://fixture.internal/_fixture/align-schedules',r));}if(!m){const u=new URL(r.url);return fixture.fetch(new Request('https://hub.fixture'+u.pathname+u.search,r),env);}if(r.headers.get('Authorization')!=='Bearer '+env.HUB2_DEV_OPERATOR_TOKEN)return Response.json({error:'unauthorized'},{status:401});const ns=({control:env.CONTROL,project:env.PROJECTS,machine:env.MACHINES,account:env.ACCOUNTS,mailbox:env.MAILBOXES,budget:env.BUDGET}as any)[m[1]];return ns.get(ns.idFromName(decodeURIComponent(m[2]))).fetch(new Request('https://fixture.internal/_fixture/'+m[3]));}};
+export default{async fetch(r:Request,env:any){const pathname=new URL(r.url).pathname;const m=pathname.match(/^\/_fixture\/(control|project|machine|account|mailbox)\/([^/]+)\/(profile)$/),align=pathname.match(/^\/_fixture\/project\/([^/]+)\/align-schedules$/);if(pathname==='/_fixture/barrier'){if(r.headers.get('Authorization')!=='Bearer '+env.HUB2_DEV_OPERATOR_TOKEN)return new Response(null,{status:401});const b=await r.json()as{id:string};console.log('HUB2_BARRIER '+b.id);return Response.json({observed:true});}if(pathname==='/_fixture/provider')return authFixture.fetch(r,env);if(align){if(r.method!=='POST'||r.headers.get('Authorization')!=='Bearer '+env.HUB2_DEV_OPERATOR_TOKEN)return Response.json({error:'unauthorized'},{status:401});return env.PROJECTS.get(env.PROJECTS.idFromName(decodeURIComponent(align[1]))).fetch(new Request('https://fixture.internal/_fixture/align-schedules',r));}if(!m){const u=new URL(r.url);return fixture.fetch(new Request('https://hub.fixture'+u.pathname+u.search,r),env);}if(r.headers.get('Authorization')!=='Bearer '+env.HUB2_DEV_OPERATOR_TOKEN)return Response.json({error:'unauthorized'},{status:401});const ns=({control:env.CONTROL,project:env.PROJECTS,machine:env.MACHINES,account:env.ACCOUNTS,mailbox:env.MAILBOXES}as any)[m[1]];return ns.get(ns.idFromName(decodeURIComponent(m[2]))).fetch(new Request('https://fixture.internal/_fixture/'+m[3]));}};

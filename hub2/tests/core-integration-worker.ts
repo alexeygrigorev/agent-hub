@@ -1,4 +1,3 @@
-import {fixtureBudgetEnvelopes} from './budget-fixture';
 import {providerFetch} from './normal-day-provider';
 // Local test entry only. Never referenced by a deployment configuration.
 import worker from '../src/worker';
@@ -7,7 +6,6 @@ import { ProjectDO } from '../src/project-do';
 import { MachineDO } from '../src/machine-do';
 import { AccountDO } from '../src/account-do';
 import { MailboxDO } from '../src/mailbox-do';
-import { BudgetDO } from '../src/budget-do';
 import { MeteredDb } from '../src/db';
 
 const actualFixtureNow=Date.now;
@@ -58,7 +56,7 @@ function alarmFaultContext(ctx:DurableObjectState,fault:{armed:boolean}):Durable
 }
 export class CoreControl{
  private core:ControlDO;private faults=new Set<string>();private cryptGate?:{entered:boolean;release?:()=>void};
- constructor(private ctx:DurableObjectState,env:any){this.core=new ControlDO(ctx,{HUB2_BUDGET_ENVELOPES:fixtureBudgetEnvelopes,...env});}
+ constructor(private ctx:DurableObjectState,env:any){this.core=new ControlDO(ctx,{...env});}
  async fetch(r:Request){const path=new URL(r.url).pathname;if(path==='/_fixture/worker-storage'){const b=await r.json()as{session_id:string;epoch:number},db=(this.core as any).db;return Response.json({duplicate_agent_rows:db.one('SELECT COUNT(*) AS n FROM credentials WHERE kind=?','agent').n,grant:db.one('SELECT epoch,deadline,revoked_at,token_hash IS NOT NULL AS has_hash,length(sealed_token)>0 AS has_sealed FROM worker_credentials WHERE session_id=? AND epoch=?',b.session_id,b.epoch)});}if(path==='/_fixture/hold-worker-crypt'){const workers=(this.core as any).workers,original=workers.crypt.bind(workers),gate:{entered:boolean;release?:()=>void}=this.cryptGate={entered:false};workers.crypt=async(...args:any[])=>{const value=await original(...args);if(!args[2]&&!gate.entered){gate.entered=true;await new Promise<void>(resolve=>gate.release=resolve);}return value;};return Response.json({armed:true});}if(path==='/_fixture/worker-crypt-state')return Response.json({entered:this.cryptGate?.entered||false});if(path==='/_fixture/release-worker-crypt'){this.cryptGate?.release?.();return Response.json({released:true});}if(path==='/_fixture/revoke-worker')return this.core.fetch(new Request('https://control.internal/_worker/revoke',r));if(path==='/_fixture/fault'&&r.method==='POST'){const b=await r.json()as{paths:string[]};if(!Array.isArray(b.paths)||b.paths.some(p=>!['/_worker/issue','/_worker/revoke'].includes(p)))return Response.json({error:'invalid_fixture_fault'},{status:400});this.faults=new Set(b.paths);return Response.json({armed:true});}const response=await dispatch(r,this.ctx,this.core,'control');if(response.ok&&this.faults.delete(path))return Response.json({error:'fixture_lost_worker_success'},{status:503});return response;}
  alarm(){return this.core.alarm();}
 }
@@ -66,7 +64,7 @@ export class CoreProject{
  private core:ProjectDO;private fault={armed:false};private faults=new Set<string>();private outboundFaults=new Set<string>();private finishGate?:{entered:boolean;release?:()=>void};
  constructor(private ctx:DurableObjectState,env:any){
   const faults=this.outboundFaults,ns=new Proxy(env.MACHINES,{get(t:any,k){if(k==='get')return(id:any)=>{const stub=t.get(id);return new Proxy(stub,{get(target:any,key){if(key==='fetch')return async(input:any,init?:any)=>{const response=await target.fetch(input,init),path=new URL(typeof input==='string'?input:input.url).pathname;if(response.ok&&faults.delete(path))return Response.json({error:'fixture_lost_selected_machine_success'},{status:503});return response;};const value=target[key];return typeof value==='function'?value.bind(target):value;}});};const value=t[k];return typeof value==='function'?value.bind(t):value;}});
-  this.core=new ProjectDO(alarmFaultContext(ctx,this.fault),{HUB2_BUDGET_ENVELOPES:fixtureBudgetEnvelopes,...env,MACHINES:ns});
+  this.core=new ProjectDO(alarmFaultContext(ctx,this.fault),{...env,MACHINES:ns});
  }
  async fetch(r:Request){const path=new URL(r.url).pathname;
   if(path==='/_fixture/hold-finish-response'){this.finishGate={entered:false};return Response.json({armed:true});}
@@ -80,44 +78,25 @@ export class CoreProject{
 }
 export class CoreAccount{
  private core:AccountDO;private providerFailure=false;private syntheticProvider:boolean;
- constructor(private ctx:DurableObjectState,env:any){this.syntheticProvider=!!env.HUB2_FIXTURE_CODEX_PROVIDER;this.core=new AccountDO(ctx,this.syntheticProvider?{HUB2_BUDGET_ENVELOPES:fixtureBudgetEnvelopes,...env,HUB2_PROVIDER_FETCH:(input:any,init:any)=>this.providerFailure?Promise.resolve(Response.json({error:'synthetic_provider_unavailable'},{status:503})):providerFetch(input,init)}:env);}
+ constructor(private ctx:DurableObjectState,env:any){this.syntheticProvider=!!env.HUB2_FIXTURE_CODEX_PROVIDER;this.core=new AccountDO(ctx,this.syntheticProvider?{...env,HUB2_PROVIDER_FETCH:(input:any,init:any)=>this.providerFailure?Promise.resolve(Response.json({error:'synthetic_provider_unavailable'},{status:503})):providerFetch(input,init)}:env);}
  async fetch(r:Request){const path=new URL(r.url).pathname;
   if(path==='/_fixture/provider-failure'){if(!this.syntheticProvider)return Response.json({error:'synthetic_provider_disabled'},{status:400});const b=await r.json()as{enabled:boolean};if(typeof b.enabled!=='boolean')return Response.json({error:'invalid_fixture'},{status:400});this.providerFailure=b.enabled;return Response.json({enabled:b.enabled});}
   if(path==='/_fixture/expire-quota'){(this.core as any).db.run('UPDATE quota SET valid_until=0 WHERE id=1');return Response.json({expired:true});}
   return dispatch(r,this.ctx,this.core,'account');
  }alarm(){return this.core.alarm();}
 }
-export class CoreMailbox{private core:MailboxDO;constructor(private ctx:DurableObjectState,env:any){this.core=new MailboxDO(ctx,{HUB2_BUDGET_ENVELOPES:fixtureBudgetEnvelopes,...env});}fetch(r:Request){return dispatch(r,this.ctx,this.core,'mailbox');}alarm(){return this.core.alarm();}}
-export class CoreBudget{
- private core:BudgetDO;
- constructor(private ctx:DurableObjectState,env:any){this.core=new BudgetDO(ctx,env);}
- async fetch(r:Request){
-  if(new URL(r.url).pathname==='/_fixture/pause-normal'){
-   const headers={'Content-Type':'application/json','x-hub2-actor':JSON.stringify({id:'operator:fixture',kind:'operator',scopes:['operator:admin']})};
-   const view=await this.core.fetch(new Request('https://budget/api/budget',{headers})),status=await view.json() as any;
-   const money=(v:string)=>BigInt(v.replace('.',''));
-   const available=money(status.daily_ceiling_usd)-money(status.recovery_reserve_usd)-money(status.settled_usd)-money(status.reserved_usd);
-   const units=Object.fromEntries(['worker_requests','worker_cpu_ms','do_requests','do_ws_messages','do_gb_ms','background_invocations','sqlite_rows_read','sqlite_rows_written','sqlite_byte_days','kv_reads','kv_writes','kv_deletes','kv_lists','kv_byte_days'].map(k=>[k,0]));
-   units.worker_requests=Number(available/300000n);
-   const id='synthetic-pause-'+crypto.randomUUID(),coverage=Object.fromEntries(Object.keys(units).map(k=>[k,'exact']));
-   const reserved=await this.core.fetch(new Request('https://budget/_internal/reserve',{method:'POST',headers,body:JSON.stringify({id,kind:'synthetic_financial_fixture',estimated_units:units,coverage})}));
-   if(!reserved.ok)return reserved;
-   return this.core.fetch(new Request('https://budget/_internal/settle',{method:'POST',headers,body:JSON.stringify({id,actual_units:units,coverage})}));
-  }
-  return dispatch(r,this.ctx,this.core,'budget');
- }
-}
+export class CoreMailbox{private core:MailboxDO;constructor(private ctx:DurableObjectState,env:any){this.core=new MailboxDO(ctx,{...env});}fetch(r:Request){return dispatch(r,this.ctx,this.core,'mailbox');}alarm(){return this.core.alarm();}}
 export class CoreMachine{
- private core:MachineDO;private faults=new Set<string>();constructor(private ctx:DurableObjectState,env:any){this.core=new MachineDO(ctx,{HUB2_BUDGET_ENVELOPES:fixtureBudgetEnvelopes,...env});}
+ private core:MachineDO;private faults=new Set<string>();constructor(private ctx:DurableObjectState,env:any){this.core=new MachineDO(ctx,{...env});}
  async fetch(r:Request){const path=new URL(r.url).pathname;if(path==='/_fixture/fault'&&r.method==='POST'){const b=await r.json() as {paths:string[]};if(!Array.isArray(b.paths)||b.paths.some(p=>!['/_internal/reserve','/_internal/activate'].includes(p)))return Response.json({error:'invalid_fixture_fault'},{status:400});this.faults=new Set(b.paths);return Response.json({armed:true});}const response=await dispatch(r,this.ctx,this.core,'machine');if(response.ok&&this.faults.delete(path))return Response.json({error:'fixture_lost_success_response'},{status:503});return response;}alarm(){return this.core.alarm();}
  webSocketMessage(s:WebSocket,m:string|ArrayBuffer){return this.core.webSocketMessage(s,m);}
  webSocketClose(s:WebSocket,c:number,r:string,w:boolean){return this.core.webSocketClose(s,c,r,w);}
  webSocketError(s:WebSocket,e:unknown){return this.core.webSocketError(s,e);}
 }
 export default {async fetch(request:Request,env:any):Promise<Response>{
- const u=new URL(request.url),m=u.pathname.match(/^\/_fixture\/(control|project|machine|account|mailbox|budget)\/([^/]+)\/(state|pause-normal|provider-failure|expire-quota|hold-finish-response|finish-response-state|release-finish-response|machine-deadlines|meter-invalid|outbound-fault|fault|fail-next-alarm|alarm|expire-offer|expire-account|due-saga|due-outbox|clock|worker-storage|hold-worker-crypt|worker-crypt-state|release-worker-crypt|revoke-worker)$/);
- if(!m)return worker.fetch(request,{HUB2_BUDGET_ENVELOPES:fixtureBudgetEnvelopes,...env,ASSETS:{fetch:async()=>new Response(env.HUB2_FIXTURE_ASSET_HTML,{headers:{'Content-Type':'text/html; charset=utf-8'}})}});
+ const u=new URL(request.url),m=u.pathname.match(/^\/_fixture\/(control|project|machine|account|mailbox)\/([^/]+)\/(state|pause-normal|provider-failure|expire-quota|hold-finish-response|finish-response-state|release-finish-response|machine-deadlines|meter-invalid|outbound-fault|fault|fail-next-alarm|alarm|expire-offer|expire-account|due-saga|due-outbox|clock|worker-storage|hold-worker-crypt|worker-crypt-state|release-worker-crypt|revoke-worker)$/);
+ if(!m)return worker.fetch(request,{...env,ASSETS:{fetch:async()=>new Response(env.HUB2_FIXTURE_ASSET_HTML,{headers:{'Content-Type':'text/html; charset=utf-8'}})}});
  if(request.headers.get('Authorization')!=='Bearer '+env.HUB2_DEV_OPERATOR_TOKEN)return Response.json({error:'unauthorized'},{status:401});
- const ns=({control:env.CONTROL,project:env.PROJECTS,machine:env.MACHINES,account:env.ACCOUNTS,mailbox:env.MAILBOXES,budget:env.BUDGET} as any)[m[1]];
+ const ns=({control:env.CONTROL,project:env.PROJECTS,machine:env.MACHINES,account:env.ACCOUNTS,mailbox:env.MAILBOXES} as any)[m[1]];
  return ns.get(ns.idFromName(decodeURIComponent(m[2]))).fetch(new Request('https://fixture.internal/_fixture/'+m[3],request));
 }};

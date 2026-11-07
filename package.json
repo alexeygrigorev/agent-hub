@@ -6,9 +6,9 @@
     "doc": "docs"
   },
   "scripts": {
-    "test": "node --test test/root-promotion.test.mjs",
+    "test": "node --test test/release-contract.test.mjs",
     "typecheck": "tsc --noEmit",
-    "build": "wrangler deploy --config wrangler.jsonc --dry-run --outdir dist",
+    "build": "npm run typecheck && node --experimental-transform-types hub2/tests/production-clean-start.test.mjs",
     "test:distribution": "python3 scripts/ci/test_root_distribution.py"
   },
   "repository": {
@@ -24,6 +24,10 @@
     "@cloudflare/workers-types": "^5.20261011.1",
     "typescript": "^7.0.2",
     "vitest": "^4.1.11",
-    "wrangler": "4.158.0"
+    "@types/node": "^24.7.0",
+    "@types/ws": "^8.5.13"
+  },
+  "dependencies": {
+    "ws": "8.21.0"
   }
 }

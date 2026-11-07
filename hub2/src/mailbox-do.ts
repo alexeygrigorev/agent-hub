@@ -1,4 +1,3 @@
-import {budgetedBackgroundRequest} from './budget-edge';
 import {MeteredDb,initializeSchema} from './db';
 import {SqlReceiptMeter,SQL_PROBE_HEADER,wrapSqlNamespaces} from './sql-receipt';
 import {sha256Hex} from './crypto';
@@ -195,15 +194,10 @@ export class MailboxDO{
  private async flushNative(id:string,epoch:number):Promise<void>{
   const row=this.db.one<Native>('SELECT * FROM native_outbox WHERE message_id=? AND epoch=?',id,epoch);
   if(!row||!['pending-target','pending-machine','pending-ack','pending-cancel','attention-pending'].includes(row.state))return;
-  const kind=row.state==='pending-ack'?'native_exit':['pending-cancel','attention-pending'].includes(row.state)?'capacity_reconcile':'native_delivery';
-  const result=await budgetedBackgroundRequest(this.env as Hub2Env,kind,async guarded=>{
-   await this.flushNativeEffect(id,epoch,guarded as Env);
-   return new Response(null,{status:204});
-  });
-  if(result.status!==204){
-   const denied=await result.json().catch(()=>({})) as {retry_at?:number};
-   const retry=Number.isSafeInteger(denied.retry_at)?denied.retry_at!:Date.now()+300000;
-   this.db.run('UPDATE native_outbox SET next_attempt=? WHERE message_id=? AND epoch=? AND next_attempt IS NOT NULL',retry,id,epoch);
+  try {
+   await this.flushNativeEffect(id,epoch,this.env as Env);
+  } catch {
+   this.db.run('UPDATE native_outbox SET next_attempt=? WHERE message_id=? AND epoch=? AND next_attempt IS NOT NULL',Date.now()+300000,id,epoch);
   }
  }
  private async flushNativeEffect(id:string,epoch:number,effectEnv:Env):Promise<void>{

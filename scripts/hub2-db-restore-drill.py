@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Hub2 DB restore drill (GCP VM deployment, port-gcloud 2026-11-07).
 
-Loads a hub2-do-*.tar.gz artifact produced by scripts/hub2-db-backup.sh
+Loads a hub2-db-*.tar.gz artifact produced by scripts/hub2-db-backup.sh
 into a throwaway 0700 directory and verifies it without touching the
 running deployment:
 
     python3 scripts/hub2-db-restore-drill.py [ARTIFACT.tar.gz] [--out-dir DIR]
 
-Without ARTIFACT, the newest hub2-do-*.tar.gz under BACKUP_DIR / MIRROR_DIR
+Without ARTIFACT, the newest hub2-db-*.tar.gz under BACKUP_DIR / MIRROR_DIR
 is used. Steps: extract every snapshot SQLite database, re-run
 PRAGMA integrity_check on each, and compare every per-table row count with
 the manifest recorded inside the artifact (must be exact — the snapshot is
@@ -31,7 +31,7 @@ import sys
 import tarfile
 import tempfile
 
-CORE_HINT = "hub2-do-*.tar.gz"
+CORE_HINT = "hub2-db-*.tar.gz"
 
 
 def newest_artifact() -> str:
@@ -69,7 +69,7 @@ def main() -> int:
         sys.exit("manifest.json missing from artifact")
     with open(manifest_path, "rb") as fh:
         manifest = json.load(fh)
-    if manifest.get("snapshot") != "hub2-do-sqlite":
+    if manifest.get("snapshot") != "hub2-node-sqlite":
         sys.exit(f"unexpected snapshot marker: {manifest.get('snapshot')!r}")
 
     failures: list[str] = []

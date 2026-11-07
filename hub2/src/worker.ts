@@ -1,4 +1,3 @@
-import {budgetedPublicRequest,budgetedBackgroundRequest,budgetedOperatorOverride,dispatchBudgetAlerts} from './budget-edge';
 import { mcp } from './mcp';
 import { publicAuthentication, cookieActor } from './auth';
 import { safeEqual } from './crypto';
@@ -11,14 +10,7 @@ let devActorRegistration: Promise<boolean> | undefined;
 
 export default {
   async fetch(request: Request, env: Hub2Env): Promise<Response> {
-    return budgetedPublicRequest(request,env,authenticate,guarded=>routeFetch(request,guarded));
-  },
-  async scheduled(_event:ScheduledController,env:Hub2Env):Promise<void>{
-    const outcome=await budgetedBackgroundRequest(env,'alert_delivery',async guarded=>{
-      await dispatchBudgetAlerts(guarded);
-      return new Response(null,{status:204});
-    },true);
-    if(!outcome.ok)throw new Error('budget_dispatcher_paused_or_unavailable');
+    return router.fetch(request, env);
   },
 };
 const router = {
@@ -51,13 +43,7 @@ const router = {
       const safetyMode = safetyModeForRequest(request, path, actor);
       if (safetyMode === false) return error('safety_mode_refused', 403);
 
-      if(path==='/api/budget/override'&&request.method==='POST')return budgetedOperatorOverride(request,env,actor);
-      if (path === '/api/budget' || path === '/api/budget/override') {
-        const budget = env.BUDGET.get(env.BUDGET.idFromName('global'));
-        return budget.fetch(await forwardRequest(request, 'https://budget.hub2.internal' + path, actor));
-      }
-
-      if (path === '/mcp') return mcp(request, env, (r, e) => budgetedPublicRequest(r,e,authenticate,g=>routeFetch(r,g)), actor);
+      if (path === '/mcp') return mcp(request, env, (r, e) => router.fetch(r, e), actor);
       const control = env.CONTROL.get(env.CONTROL.idFromName('global'));
       if (
         path === '/api/model-policy' ||
@@ -347,6 +333,7 @@ const router = {
       return error('not_found', 404);
     } catch (caught) {
       if (caught instanceof HttpError) return error(caught.code, caught.status);
+      console.error('[hub2] unhandled worker error:', caught);
       return error('internal_error', 500);
     }
   },
@@ -603,4 +590,3 @@ async function machineProjection(
   return json({ items, next, complete: next === null });
 }
 
-async function routeFetch(request:Request,env:Hub2Env):Promise<Response>{return router.fetch(request,env);}

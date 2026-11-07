@@ -21,7 +21,7 @@ class LocalDependenciesTests(unittest.TestCase):
         self.repo = self.root / "worktree"
         self.source = self.root / "main"
         packages = {f"node_modules/{name}": {"version": "1.0.0", "integrity": f"sha512-{name}"}
-                    for name in ("typescript", "vitest", "wrangler")}
+                    for name in ("typescript", "vitest", "ws")}
         self.lock = {"lockfileVersion": 3, "packages": packages}
         for repo in (self.repo, self.source):
             repo.mkdir()
@@ -30,7 +30,7 @@ class LocalDependenciesTests(unittest.TestCase):
         self.modules = self.source / "node_modules"
         self.modules.mkdir()
         (self.modules / ".package-lock.json").write_text(json.dumps(self.lock))
-        for name in ("typescript", "vitest", "wrangler"):
+        for name in ("typescript", "vitest", "ws"):
             package = self.modules / name
             package.mkdir()
             (package / "package.json").write_text('{"version":"1.0.0"}')
@@ -86,7 +86,7 @@ class LocalDependenciesTests(unittest.TestCase):
         self.assertTrue(target.is_symlink())
 
     def test_missing_required_package_is_refused(self):
-        del self.lock["packages"]["node_modules/wrangler"]
+        del self.lock["packages"]["node_modules/ws"]
         (self.modules / ".package-lock.json").write_text(json.dumps(self.lock))
         with self.assertRaisesRegex(DEPS.DependencyError, "Required package missing"):
             DEPS.prepare(self.repo, self.source)

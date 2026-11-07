@@ -50,8 +50,6 @@ def validate_install(repo, modules):
         path = modules / ".bin" / executable
         if not path.is_file() or not os.access(path, os.X_OK):
             raise DependencyError(f"Required dependency executable missing: {path}")
-    if not (modules / "wrangler" / "package.json").is_file():
-        raise DependencyError("Required wrangler package missing")
 
 
 def compare_manifests(repo, source):

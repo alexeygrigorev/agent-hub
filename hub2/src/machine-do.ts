@@ -1,4 +1,3 @@
-import { budgetedBackgroundRequest, type BudgetKind } from './budget-edge';
 import { nativeReturncode } from './native-exit';
 import { MeteredDb, initializeSchema } from './db';
 import { SqlReceiptMeter, SQL_PROBE_HEADER, wrapSqlNamespaces } from './sql-receipt';
@@ -141,23 +140,6 @@ export class MachineDO {
       if (caught instanceof HttpError) return error(caught.code, caught.status);
       return error('internal_error', 500);
     }
-  }
-
-  private async budgetEffect(kind:BudgetKind,run:(env:Hub2Env)=>Promise<void>,socket?:WebSocket,retryId?:string):Promise<boolean>{
-    const response=await budgetedBackgroundRequest(this.env,kind,async env=>{await run(env);return new Response(null,{status:204});});
-    if(response.ok)return true;
-    const body=await response.json().catch(()=>({})) as {error?:string;retry_at?:number};
-    const now=Date.now(),day=new Date(now),midnight=Date.UTC(day.getUTCFullYear(),day.getUTCMonth(),day.getUTCDate()+1);
-    const paused=response.status===429||body.error==='budget_metrics_unknown';
-    const retry=paused?(Number.isSafeInteger(body.retry_at)&&Number(body.retry_at)>now&&Number(body.retry_at)<=now+86405000?Number(body.retry_at):midnight):now+30000;
-    if(retryId){
-      this.db.run("UPDATE machine_outbox SET next_action_at=?,updated_at=? WHERE id=? AND state='pending'",retry,now,retryId);
-      await this.scheduleNext();
-    }
-    if(socket&&paused){
-      try{socket.send(JSON.stringify({type:'budget.paused',error:'budget_paused',retry_at:retry}));socket.close(1013,'budget paused');}catch{}
-    }
-    return false;
   }
 
   async alarm(): Promise<void> {
@@ -359,8 +341,7 @@ export class MachineDO {
 
   async webSocketMessage(socket:WebSocket,message:string|ArrayBuffer):Promise<void>{
     if(!this.currentSocket(socket))return;
-    await this.budgetEffect(this.stopOnly(socket)?'operator_stop':'background_effect',
-      env=>this.webSocketMessageRaw(socket,message,env),socket);
+    await this.webSocketMessageRaw(socket, message, this.env);
   }
 
   private async webSocketMessageRaw(socket: WebSocket, message: string | ArrayBuffer, env:Hub2Env): Promise<void> {
@@ -422,16 +403,15 @@ export class MachineDO {
             machine_id: row.machine_id, epoch: row.epoch }, now);
       });
       await this.ensureDeadline(now+30_000);
-      await this.flushOne(`claim:${row.operation_id}`,env);
+      await this.flushOne(`claim:${row.operation_id}`);
       await this.scheduleNext();
       await this.sendPendingCommands(socket, attachment.machine_id,env);
       socket.send(JSON.stringify({ type: 'ack', session_id: row.id, epoch: row.epoch }));
     } catch {}
   }
 
-  private async sendOffers(socket: WebSocket, machineId: string,env?:Hub2Env): Promise<void> {
+  private async sendOffers(socket: WebSocket, machineId: string,env:Hub2Env=this.env): Promise<void> {
     if(this.stopOnly(socket))return;
-    if(!env){await this.budgetEffect('native_delivery',guarded=>this.sendOffers(socket,machineId,guarded),socket);return;}
     if(!this.currentSocket(socket))return;
     const now = Date.now();
     const rows = this.db.all<SessionRow>(
@@ -449,9 +429,7 @@ export class MachineDO {
     for (const socket of this.machineSockets(`${row.machine_id}`)) {
       try {
         if(this.stopOnly(socket))continue;
-        await this.budgetEffect('native_delivery',async env=>{
-          if(await this.authorizedAttachment(socket,'machine:offer',true,env))socket.send(frame);
-        },socket);
+        if(await this.authorizedAttachment(socket,'machine:offer',true,this.env))socket.send(frame);
       } catch {}
     }
   }
@@ -618,14 +596,8 @@ export class MachineDO {
     for (const row of rows) await this.flushOne(row.id);
   }
 
-  private async flushOne(id:string,env?:Hub2Env):Promise<boolean>{
-    if(env)return this.flushOneRaw(id,env);
-    const row=this.db.one<{kind:string}>("SELECT kind FROM machine_outbox WHERE id=? AND state='pending'",id);
-    if(!row)return false;
-    const kind:BudgetKind=row.kind==='finish'?'native_exit':['started','requeue','expiry'].includes(row.kind)?'capacity_reconcile':'retry';
-    let forwarded=false;
-    await this.budgetEffect(kind,async guarded=>{forwarded=await this.flushOneRaw(id,guarded);},undefined,id);
-    return forwarded;
+  private async flushOne(id:string):Promise<boolean>{
+    return this.flushOneRaw(id,this.env);
   }
 
   private async flushOneRaw(id: string, env:Hub2Env): Promise<boolean> {
@@ -774,16 +746,12 @@ export class MachineDO {
     return json({ acknowledged: true });
   }
 
-  private async sendPendingCommands(socket:WebSocket,machineId:string,env?:Hub2Env):Promise<void>{
+  private async sendPendingCommands(socket:WebSocket,machineId:string,env:Hub2Env=this.env):Promise<void>{
     const stop=this.stopOnly(socket);
     const command=this.db.one<CommandRow>("SELECT * FROM session_commands WHERE machine_id=? AND session_id=(SELECT active_session_id FROM machines WHERE machine_id=?) AND state='pending' "+(stop?"AND kind='stop' ":"")+"ORDER BY created_at,id LIMIT 1",machineId,machineId);
     if(!command)return;
-    const send=async(guarded:Hub2Env)=>{
-      if(!await this.authorizedAttachment(socket,'machine:offer',true,guarded))return;
-      try{socket.send(JSON.stringify({type:'session.command',command:this.commandView(command)}));}catch{}
-    };
-    if(env)await send(env);
-    else await this.budgetEffect(command.kind==='stop'?'operator_stop':'native_delivery',send,socket);
+    if(!await this.authorizedAttachment(socket,'machine:offer',true,env))return;
+    try{socket.send(JSON.stringify({type:'session.command',command:this.commandView(command)}));}catch{}
   }
 
   private async notifyPendingCommands(machineId: string): Promise<void> {
@@ -848,9 +816,8 @@ export class MachineDO {
       message_id:body.message_id,epoch:body.epoch,operation_id:body.operation_id});
   }
 
-  private async sendPendingMail(socket: WebSocket, machine: string,env?:Hub2Env): Promise<void> {
+  private async sendPendingMail(socket: WebSocket, machine: string,env:Hub2Env=this.env): Promise<void> {
     if(this.stopOnly(socket))return;
-    if(!env){await this.budgetEffect('native_delivery',guarded=>this.sendPendingMail(socket,machine,guarded),socket);return;}
     if (!await this.authorizedAttachment(socket,'message:delivery',false,env)) return;
     const row = this.db.one<NativeMail>("SELECT * FROM native_mail WHERE machine_id=? AND session_id=(SELECT active_session_id FROM machines WHERE machine_id=?) AND state='pending' ORDER BY created_at,message_id,epoch LIMIT 1",machine,machine);
     if (row) socket.send(JSON.stringify({type:'mailbox.deliver',message:{id:row.message_id,epoch:row.epoch,
