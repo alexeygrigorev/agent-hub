@@ -17,6 +17,7 @@ Reports dir layout: `latest.md`, `NEEDS_ALEXEY.md`, `handoff.md`, `history/` (ma
 git -C ~/git/agent-hub fetch origin && ops/install.sh   # from any checkout of origin/main
 ```
 Copies `session-ctl.sh`, `watchdog.sh` to `~/.local/share/agent-hub-ops/`, `orch-send` / `oncall-send` to `~/bin/`, installs and enables the user timer `ops-watchdog.timer`.
+The installer verifies that the timer is active and has a scheduled next elapse. The timer uses `Persistent=true` to catch up one missed calendar run when reactivated and refuses a direct manual stop to guard against an accidental `systemctl stop`.
 
 ## Start
 ```bash
@@ -68,7 +69,19 @@ oncall-send "text"                                                            # 
 This host cannot read `dev@dtcdev.click` or any alert mailbox: only `msmtp` (send-only) is installed; there is no IMAP client, Maildir, mbsync/fetchmail config, and no Gmail API reader. Missing: a read-only mailbox path (IMAP read credentials or Gmail API read scope for dev@dtcdev.click / the alert label) provisioned for a non-secret-printing fetcher by Alexey. Until then alerts arrive via `oncall-send` (Grok Bot forwards dev@ mail) and, later, the Hub webhook->session routing intake. Credential files were deliberately not read.
 
 ## Moving to another host
-Pick a host with the Hub-validated resource floors, `a`, `hub`, `gh` logged in and the repo clone `~/git/agent-hub`. At least one supported non-Claude engine must be configured and have fresh Hub quota headroom. Run `ops/install.sh`, copy `~/tmp/agent-reports/{orchestrator,oncall}` (handoff + inbox), stop the old sessions (`session-ctl.sh <role> status`, `a kill <id>`; ask Alexey first), run `start.sh` on the new host, point Grok Bot's `orch-send`/`oncall-send` at the new host (ssh wrapper). Disable the timer on the old host: `systemctl --user disable --now ops-watchdog.timer`.
+Pick a host with the Hub-validated resource floors, `a`, `hub`, `gh` logged in and the repo clone `~/git/agent-hub`. At least one supported non-Claude engine must be configured and have fresh Hub quota headroom. Run `ops/install.sh`, copy `~/tmp/agent-reports/{orchestrator,oncall}` (handoff + inbox), stop the old sessions (`session-ctl.sh <role> status`, `a kill <id>`; ask Alexey first), run `start.sh` on the new host, point Grok Bot's `orch-send`/`oncall-send` at the new host (ssh wrapper). To intentionally retire the timer on the old host, temporarily allow manual stop, then disable it:
+```bash
+mkdir -p ~/.config/systemd/user/ops-watchdog.timer.d
+cat > ~/.config/systemd/user/ops-watchdog.timer.d/allow-manual-stop.conf <<'UNIT'
+[Unit]
+RefuseManualStop=no
+UNIT
+systemctl --user daemon-reload
+systemctl --user disable --now ops-watchdog.timer
+rm ~/.config/systemd/user/ops-watchdog.timer.d/allow-manual-stop.conf
+rmdir ~/.config/systemd/user/ops-watchdog.timer.d 2>/dev/null || true
+systemctl --user daemon-reload
+```
 
 ## Playbook: Grok Bot limits running out (AC13)
 Also a bot-skills skill: `grok-limits-playbook`.

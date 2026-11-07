@@ -1,10 +1,11 @@
 [Unit]
 Description=10-minute dead-session watchdog for ops Claude sessions
+RefuseManualStop=yes
 
 [Timer]
 OnCalendar=*:0/10
 RandomizedDelaySec=60
-Persistent=false
+Persistent=true
 
 [Install]
 WantedBy=timers.target

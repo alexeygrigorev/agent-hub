@@ -17,8 +17,18 @@ export FAKE_SCREEN="$fake/screen.txt"
 export FAKE_QUOTA="$fake/quota.json"
 export FAKE_KILLED="$fake/killed.log"
 export FAKE_START_ENGINE="$fake/start-engine"
+export FAKE_START_SCOPE="$fake/start-scope"
 export FAKE_SEND_LOG="$fake/send.log"
 unset ENGINE ENGINE_SELECTED ORCH_ENGINE ORCH_FALLBACK_ENGINE
+unset STARTUP_WORK_WAIT FAKE_SEND_UNVERIFIED FAKE_REPORTED_STATE FAKE_PLACEMENT FAKE_VULNERABLE
+
+# Fake sessions reach the ready prompt immediately; avoid real sleeps in the
+# shell fixture so the many restart cases stay deterministic and quick.
+cat > "$bin/sleep" <<'SLEEP'
+#!/usr/bin/env bash
+exit 0
+SLEEP
+chmod +x "$bin/sleep"
 
 cat > "$bin/a" <<'APLEXER'
 #!/usr/bin/env bash
@@ -29,6 +39,9 @@ case "${1:-}" in
     ;;
   list)
     cat "$FAKE_SESSIONS"
+    ;;
+  status)
+    python3 -c 'import json,sys; sessions=json.load(open(sys.argv[1])); print(json.dumps(sessions[0] if sessions else {}))' "$FAKE_SESSIONS"
     ;;
   capture)
     cat "$FAKE_SCREEN"
@@ -48,11 +61,15 @@ case "${1:-}" in
       esac
     done
     printf '%s\n' "$engine" > "$FAKE_START_ENGINE"
-    printf '[{"id":"new-%s","workspace":"%s","tag":"%s","phase":"running","worker_alive":true}]\n' "$tag" "$workspace" "$tag" > "$FAKE_SESSIONS"
+    printf '%s\n' "${APLEXER_LAUNCH_SYSTEM_SCOPE:-unset}" > "$FAKE_START_SCOPE"
+    printf '[{"id":"new-%s","workspace":"%s","tag":"%s","phase":"running","worker_alive":true,"reported_state":"%s","worker_placement":{"placement":"%s","vulnerable_to_user_manager_exit":%s},"workload_placement":{"placement":"%s","vulnerable_to_user_manager_exit":%s}}]\n' "$tag" "$workspace" "$tag" "${FAKE_REPORTED_STATE:-working}" "${FAKE_PLACEMENT:-system_slice}" "${FAKE_VULNERABLE:-false}" "${FAKE_PLACEMENT:-system_slice}" "${FAKE_VULNERABLE:-false}" > "$FAKE_SESSIONS"
     printf '%s\n' "${FAKE_START_SCREEN:-❯}" > "$FAKE_SCREEN"
     ;;
   send)
     printf '%s\n' "$*" >> "$FAKE_SEND_LOG"
+    if [[ "${FAKE_SEND_UNVERIFIED:-0}" == 1 ]]; then
+      echo 'a: unverified: no screen model for engine "antigravity"; bytes written only' >&2
+    fi
     if [[ " $* " == *" --hex "* && -n "${FAKE_AFTER_HEX_SCREEN:-}" ]]; then
       printf '%s\n' "$FAKE_AFTER_HEX_SCREEN" > "$FAKE_SCREEN"
     fi
@@ -183,6 +200,7 @@ output="$(run_ctl oncall check 2>&1)"
 assert_contains "$output" 'STALLED session=old-oncall: oncall inbox'
 assert_not_contains "$output" 'OK session='
 [[ "$(<"$FAKE_START_ENGINE")" == antigravity ]]
+[[ "$(<"$FAKE_START_SCOPE")" == system ]]
 assert_contains "$(<"$FAKE_SEND_LOG")" 'Run the oncall check now:'
 assert_not_contains "$(<"$FAKE_SEND_LOG")" '/loop'
 
@@ -196,6 +214,37 @@ unset FAKE_HUB_MODE
 assert_contains "$output" 'Hub quota unavailable; using local engine antigravity'
 assert_not_contains "$output" 'recovery held'
 [[ "$(<"$FAKE_START_ENGINE")" == antigravity ]]
+
+# User-manager placement is not accepted as durable recovery; stop the new
+# worker before sending a prompt that would otherwise appear to succeed.
+write_dead oncall
+export FAKE_PLACEMENT=user_manager FAKE_VULNERABLE=true
+status=0
+output="$(run_ctl oncall start 2>&1)" || status=$?
+unset FAKE_PLACEMENT FAKE_VULNERABLE
+[[ "$status" -ne 0 ]]
+assert_contains "$output" 'not verified in a system-manager scope'
+assert_contains "$(<"$FAKE_KILLED")" 'new-oncall-engineer'
+[[ ! -s "$FAKE_SEND_LOG" ]]
+
+# An engine without a screen model only counts as started once aplexer reports
+# the new session working. An idle unverified start is stopped and fails closed.
+write_dead oncall
+export FAKE_SEND_UNVERIFIED=1 FAKE_REPORTED_STATE=working
+output="$(run_ctl oncall start 2>&1)"
+unset FAKE_SEND_UNVERIFIED FAKE_REPORTED_STATE
+assert_contains "$output" 'live reported work confirmed'
+[[ "$(<"$FAKE_START_ENGINE")" == antigravity ]]
+
+write_dead oncall
+export FAKE_SEND_UNVERIFIED=1 FAKE_REPORTED_STATE=idle STARTUP_WORK_WAIT=0
+status=0
+output="$(run_ctl oncall start 2>&1)" || status=$?
+unset FAKE_SEND_UNVERIFIED FAKE_REPORTED_STATE STARTUP_WORK_WAIT
+[[ "$status" -ne 0 ]]
+assert_contains "$output" 'session stayed idle; stopping the unstarted session'
+assert_contains "$(<"$FAKE_KILLED")" 'new-oncall-engineer'
+[[ "$(<"$FAKE_SESSIONS")" == '[]' ]]
 
 # The Hub release_bootstrap stub falls back during a real oncall recovery.
 write_live oncall 'You have hit your weekly limit - resets Nov 5'
@@ -288,7 +337,9 @@ state="$HOME/tmp/agent-reports/orchestrator/state"
 mkdir -p "$state"
 printf '%s\n' "$(( $(date +%s)-20 ))" > "$state/last_start"
 printf '%s 1\n' "$(( $(date +%s)-1 ))" > "$state/proof_due"
-if output="$(run_ctl orchestrator check 2>&1)"; then :; fi
+status=0
+output="$(run_ctl orchestrator check 2>&1)" || status=$?
+[[ "$status" -eq 0 ]]
 assert_contains "$output" 'recovery path 2'
 [[ "$(<"$FAKE_START_ENGINE")" == opencode ]]
 assert_not_contains "$(<"$FAKE_SEND_LOG")" '/loop'
