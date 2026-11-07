@@ -81,6 +81,28 @@ origin unchanged) and hosts enroll; then set `HUB2_RELEASE_MODE=active` in
 `/opt/agent-hub/.dev.vars` and restart the service. The clean-start model
 holds: the VM DB initializes fresh; the CLI/hosts re-pair once.
 
+## Dapier dev-alert direct ingest
+
+`POST https://hub.dtcdev.click/webhooks/oncall` is served by this Hub2 Node
+service on the GCP VM. It stores each authenticated alert in the ControlDO
+SQLite database before returning success. Dapier keeps the existing Developer
+webhook as its first destination and posts the same event to this endpoint as
+its second destination. A stable `X-Delivery-Id` makes Dapier retries
+idempotent.
+
+The host session service polls `/api/oncall-alerts/offers` with a separate
+poll token, then runs `~/bin/oncall-send` and `~/bin/orch-send`. Those helpers
+write their inbox files before attempting session wake, so a stopped
+`oncall-engineer` still leaves the alert in the inbox. Provision the token
+pair once with `POST /api/oncall-alerts/config`: while release mode is
+`bootstrap`, authorize with `HUB2_BOOTSTRAP_TOKEN`; in `active` mode, use an
+operator-admin credential. The response displays the ingest and poll tokens
+once. Store only the ingest token in Dapier's private
+`dev-mailbox/oncall_webhook_token` storage value. Store the poll token in the
+host's private `<journal_dir>/oncall-alerts.json` file with shape
+`{"poll_token":"<one-time-token>"}` and owner-only permissions. Never commit
+or include either token in reports.
+
 ## Backup (works with the Node deployment)
 
 - `scripts/hub2-db-backup.sh` — `VACUUM INTO` per instance DB (WAL-safe

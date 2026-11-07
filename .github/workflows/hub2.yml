@@ -138,6 +138,11 @@ jobs:
         continue-on-error: true
         run: npm run test:production-clean-start --prefix hub2
 
+      - name: Durable oncall alert ingest on Node runtime
+        id: oncall_alerts
+        continue-on-error: true
+        run: npm run test:oncall-alerts --prefix hub2
+
       - name: Fail the job if any gate failed
         if: always()
         env:
@@ -160,6 +165,7 @@ jobs:
           CORE_NODE: ${{ steps.core_node.outcome }}
           PUBLIC_MAIL: ${{ steps.public_mail.outcome }}
           PRODUCTION_CLEAN_START: ${{ steps.production_clean_start.outcome }}
+          ONCALL_ALERTS: ${{ steps.oncall_alerts.outcome }}
         run: |
           failed=0
           for result in \
@@ -172,7 +178,8 @@ jobs:
             "accounts_mail_node:$ACCOUNTS_MAIL_NODE" "auth_flows:$AUTH_FLOWS" \
             "auth_gc:$AUTH_GC" "machine_socket_cap:$MACHINE_SOCKET_CAP" \
             "core_node:$CORE_NODE" "public_mail:$PUBLIC_MAIL" \
-            "production_clean_start:$PRODUCTION_CLEAN_START"; do
+            "production_clean_start:$PRODUCTION_CLEAN_START" \
+            "oncall_alerts:$ONCALL_ALERTS"; do
             name=${result%%:*}
             outcome=${result#*:}
             echo "$name: $outcome"

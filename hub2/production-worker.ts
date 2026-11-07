@@ -25,6 +25,9 @@ const bootstrapPublicMethods: Readonly<Record<string, readonly string[]>> = {
   '/api/device/approve': ['POST'],
   '/api/token/refresh': ['POST'],
   '/api/token/revoke': ['POST'],
+  '/api/oncall-alerts/config': ['POST'],
+  '/api/oncall-alerts/offers': ['GET'],
+  '/webhooks/oncall': ['POST'],
 };
 
 function bootstrapRequestAllowed(request: Request): boolean {
@@ -45,6 +48,7 @@ function bootstrapRequestAllowed(request: Request): boolean {
   if (path === '/api/heartbeat') return method === 'POST';
   if (['/api/fleet', '/api/fleet/machines', '/api/sessions', '/api/status'].includes(path))
     return method === 'GET';
+  if (/^\/api\/oncall-alerts\/[0-9a-f-]{36}\/(?:ack|nack)$/i.test(path)) return method === 'POST';
 
   const accountPath = path.match(/^\/api\/(?:accounts\/[A-Za-z0-9_.-]{1,80}\/api\/)?account(?:\/(credentials|hosts|discovery|quota|resets|alerts))?$/);
   if (!accountPath) return false;

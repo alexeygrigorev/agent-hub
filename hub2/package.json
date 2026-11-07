@@ -20,6 +20,7 @@
     "budget": "python3 scripts/production-line-budget.py",
     "test:resource-manager": "cd .. && node --experimental-transform-types hub2/tests/run-resource-manager.mjs",
     "test:production-clean-start": "node --experimental-transform-types tests/production-clean-start.test.mjs",
+    "test:oncall-alerts": "node --experimental-transform-types --test tests/oncall-alerts.test.ts",
     "test:core": "node --experimental-transform-types tests/run-core-integration-node.mjs",
     "test:accounts-mail-node": "node --experimental-transform-types tests/run-accounts-mail-node.mjs"
   }

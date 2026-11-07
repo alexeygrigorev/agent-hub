@@ -24,6 +24,27 @@ const router = {
         return secureStatic(await env.ASSETS.fetch(request));
       const authResponse = await publicAuthentication(request, env);
       if (authResponse) return authResponse;
+      const control = env.CONTROL.get(env.CONTROL.idFromName('global'));
+      if (path === '/webhooks/oncall' && request.method === 'POST') {
+        return control.fetch(await forwardRequest(request, CONTROL + '/_oncall/ingest'));
+      }
+      if (path === '/api/oncall-alerts/offers' && request.method === 'GET') {
+        return control.fetch(await forwardRequest(request, CONTROL + '/_oncall/offers'));
+      }
+      const oncallDelivery = path.match(/^\/api\/oncall-alerts\/([0-9a-f-]{36})\/(ack|nack)$/i);
+      if (oncallDelivery && request.method === 'POST') {
+        return control.fetch(await forwardRequest(request,
+          CONTROL + '/_oncall/deliveries/' + oncallDelivery[1] + '/' + oncallDelivery[2]));
+      }
+      if (path === '/api/oncall-alerts/config' && request.method === 'POST') {
+        if (!sameOriginMutation(request)) return error('csrf_refused', 403);
+        if (env.HUB2_RELEASE_MODE === 'bootstrap') {
+          return control.fetch(await forwardRequest(request, CONTROL + '/_oncall/config'));
+        }
+        const configActor = await authenticate(request, env);
+        if (!configActor || !admin(configActor)) return error('forbidden', 403);
+        return control.fetch(await forwardRequest(request, CONTROL + '/_oncall/config', configActor));
+      }
       if (path === '/health' && request.method === 'GET')
         return json({ ok: true, service: 'hub2' });
       if (path === '/api/enrollments/complete' && request.method === 'POST') {
@@ -44,7 +65,6 @@ const router = {
       if (safetyMode === false) return error('safety_mode_refused', 403);
 
       if (path === '/mcp') return mcp(request, env, (r, e) => router.fetch(r, e), actor);
-      const control = env.CONTROL.get(env.CONTROL.idFromName('global'));
       if (
         path === '/api/model-policy' ||
         path === '/api/named-agents' ||
