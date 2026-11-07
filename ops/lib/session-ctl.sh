@@ -17,12 +17,12 @@ BASE_REPO="${BASE_REPO:-$HOME/git/agent-hub}"           # donor clone for the ru
 SKILLS_REPO="${SKILLS_REPO:-$HOME/git/bots-management-ops}"   # read-only clone of alexeygrigorev/bots-management (bot-skills is archived)
 SKILLS_REMOTE="${SKILLS_REMOTE:-alexeygrigorev/bots-management}"
 SKILLS_DIR="${SKILLS_DIR:-$SKILLS_REPO/.agents/skills}"   # skills live under .agents/skills
-ENGINE="${ENGINE:-${ORCH_ENGINE:-gemini}}"
+ENGINE="${ENGINE:-${ORCH_ENGINE:-antigravity}}"
 TICKS="$HOME/tmp/agent-reports/orchestrator-ticks.jsonl"; MAX_TICK_AGE="${MAX_TICK_AGE:-1800}"
 BRIEF="$HOME/tmp/briefs/orchestrator-main.md"
 MIN_RESTART_GAP="${MIN_RESTART_GAP:-600}"
 PROOF_WINDOW="${PROOF_WINDOW:-600}"                      # a restart must produce a fresh tick within 10 min
-FALLBACK_ENGINE="${ORCH_FALLBACK_ENGINE:-opencode}"      # second recovery path: new session, other engine
+FALLBACK_ENGINE="${ORCH_FALLBACK_ENGINE:-antigravity}"  # second recovery path prefers Ag; selection excludes the failed route
 MAX_ONCALL_INBOX_AGE="${MAX_ONCALL_INBOX_AGE:-1200}"
 ENGINE_EXCLUDE=""
 ENGINE_SELECTED="${ENGINE_SELECTED:-0}"
@@ -198,15 +198,22 @@ if not isinstance(quota, dict) or "error" in quota or not isinstance(quota.get("
     # not prove quota exhaustion. Let select_engine use the local engine list.
     sys.exit(2)
 
-allowed = {"gemini": "gemini", "antigravity": "gemini", "grok": "grok",
+# Hub currently labels the Google quota pool "gemini". That is quota metadata;
+# the only Google-family engine this watchdog selects is Antigravity.
+allowed = {"antigravity": "gemini", "grok": "grok",
            "opencode": "go", "zcodex": "zai"}
+aliases = {"gemini": "antigravity"}
+def normalize_engine(value):
+    value = value.strip().lower()
+    return aliases.get(value, value)
+
 configured = set()
 def collect(value):
     if isinstance(value, dict):
         for key in ("name", "id", "engine"):
             item = value.get(key)
             if isinstance(item, str):
-                configured.add(item.lower())
+                configured.add(normalize_engine(item))
         for child in value.values():
             if isinstance(child, (dict, list)):
                 collect(child)
@@ -226,9 +233,10 @@ for pool in pools if isinstance(pools, list) else []:
         if isinstance(value, list):
             names.extend(value)
     for value in names:
-        if isinstance(value, str) and value.lower() in allowed:
-            engine = value.lower()
-            if pool.get("provider") == allowed[engine] and pool not in routes[engine]:
+        if isinstance(value, str) and normalize_engine(value) in allowed:
+            engine = normalize_engine(value)
+            provider = pool.get("provider")
+            if isinstance(provider, str) and provider.lower() == allowed[engine] and pool not in routes[engine]:
                 routes[engine].append(pool)
 
 def has_headroom(engine, pool):
@@ -249,12 +257,13 @@ def has_headroom(engine, pool):
     return remaining > reserve
 
 order = []
-for candidate in (preferred, fallback, "gemini", "antigravity", "opencode", "grok", "zcodex"):
-    candidate = candidate.strip().lower()
+for candidate in (preferred, fallback, "antigravity", "opencode", "grok", "zcodex"):
+    candidate = normalize_engine(candidate)
     if candidate in allowed and candidate not in order:
         order.append(candidate)
+excluded = normalize_engine(excluded)
 for candidate in order:
-    if candidate == excluded.strip().lower() or candidate not in configured:
+    if candidate == excluded or candidate not in configured:
         continue
     matching = routes.get(candidate, [])
     # Provider families can contain multiple account pools. Any usable pool
@@ -273,7 +282,12 @@ local_engine() {  # $1 preferred, $2 excluded route, $3 fallback preference, $4 
 import json, sys
 
 preferred, excluded, fallback, exact = sys.argv[1:5]
-allowed = {"gemini", "antigravity", "grok", "opencode", "zcodex"}
+allowed = {"antigravity", "grok", "opencode", "zcodex"}
+aliases = {"gemini": "antigravity"}
+def normalize_engine(value):
+    value = value.strip().lower()
+    return aliases.get(value, value)
+
 try:
     engines_doc = json.load(sys.stdin)
 except Exception:
@@ -285,7 +299,7 @@ def collect(value):
         for key in ("name", "id", "engine"):
             item = value.get(key)
             if isinstance(item, str):
-                configured.add(item.lower())
+                configured.add(normalize_engine(item))
         for child in value.values():
             if isinstance(child, (dict, list)):
                 collect(child)
@@ -294,17 +308,17 @@ def collect(value):
             collect(child)
 collect(engines_doc)
 
-preferred = preferred.strip().lower()
+preferred = normalize_engine(preferred)
 if exact == "1":
     order = [preferred]
 else:
     order = []
-    for candidate in (preferred, fallback, "gemini", "antigravity", "opencode", "grok", "zcodex"):
-        candidate = candidate.strip().lower()
+    for candidate in (preferred, fallback, "antigravity", "opencode", "grok", "zcodex"):
+        candidate = normalize_engine(candidate)
         if candidate in allowed and candidate not in order:
             order.append(candidate)
 
-excluded = excluded.strip().lower()
+excluded = normalize_engine(excluded)
 # Prefer a different route after a failed recovery proof. If the only local
 # engine is the excluded one, still recover instead of holding indefinitely.
 for allow_excluded in (False, True):

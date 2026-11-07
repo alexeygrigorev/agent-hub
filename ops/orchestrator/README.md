@@ -25,6 +25,12 @@ ops/orchestrator/start.sh        # or: ops/oncall/start.sh
 It (1) fetches origin/main and creates/refreshes the run worktree (detached at origin/main), (2) syncs skills (below), (3) selects a configured non-Claude engine with fresh quota headroom and starts it, (4) accepts the bypass/trust prompts, and (5) sends one engine-neutral kickoff prompt. The recurring Hub schedule remains attached to the session tag.
 
 ## Startup prompt and schedule
+
+Both engine preferences default to `antigravity`. The Hub quota pool is still
+named `gemini` in `provider` metadata; that legacy provider key does not select
+the old Gemini CLI. Any legacy `ENGINE=gemini` or `ORCH_ENGINE=gemini` preference is normalized to
+Antigravity. If the preferred route is unavailable, selection tries configured
+non-Claude routes in order: Antigravity, OpenCode, Grok, then ZCode.
 The start script sends the role's hourly check (or orchestrator brief) as a normal prompt and records it in `<reports>/state/loop_command`. It does not issue Claude Code's `/loop` command. Hub scheduled prompts attached to `orchestrator-main` and `oncall-engineer` provide recurring work for any supported engine; verify them with `hub schedules list` and their deliveries.
 
 ## Skills (AC14)
@@ -36,7 +42,7 @@ Hub scheduled prompts attached to each session tag are the scheduler. `ops-watch
 For the orchestrator a live process is not enough. `check`:
 - restarts when the session is dead, or when it is alive but `~/tmp/agent-reports/orchestrator-ticks.jsonl` has not changed for 30 min (`MAX_TICK_AGE`). Every OK run arms a 1s-accurate transient deadline timer for the moment the newest tick turns 30 min old. That timer runs this role's check directly under a per-role lock, so detection waits neither for the 10-min timer nor for the oncall check;
 - proves every restart: the new session must append a tick within 10 min of the recorded start (`PROOF_WINDOW`). A transient timer re-runs the watchdog right after the deadline. Inside the window it neither restarts again nor reports OK. Proof reads the tick history: only a tick inside the window counts, and a late first tick starts path 2;
-- if the proof fails, it starts recovery path 2: a new session preferring `ORCH_FALLBACK_ENGINE` (default `opencode`), excluding the failed route and requiring fresh quota headroom, with a fresh handoff and a 10-min proof. Paths then alternate;
+- if the proof fails, it starts recovery path 2: a new session preferring `ORCH_FALLBACK_ENGINE` (default `antigravity`), excluding the failed route and requiring fresh quota headroom, with a fresh handoff and a 10-min proof. Paths then alternate;
 - counts consecutive failed recoveries (failed restart or failed proof). Only at 2 does it alert: `NEEDS_ALEXEY.md`, the oncall inbox, and Hub (below). A proven recovery resets the count;
 - reports each run to Hub: `hub ops heartbeat --kind watchdog --state <ok|recovering|proof_pending|proof_failed|...> --recovery-failures N --tick-at <tick log time>`. A failed report never changes the local decision.
 
@@ -71,7 +77,7 @@ Also a bot-skills skill: `grok-limits-playbook`.
 
 > **Hub driver (intake 1035ad06):** the replacement orchestrator is one managed interactive session, started with `hub driver start --engine codex --workspace agent-hub`; inspect it with `hub driver status`. The start command also queues the standing order and creates the 15-minute session prompt schedule through `/api/session-schedules`. This is distinct from `hub schedule`, which starts a fresh session on each tick. Keep `orchestrator-main` and its watchdog until its owner verifies two consecutive useful driver cycles, acknowledges the handoff, and retires the old in-session cron. See [Hub driver migration](../../docs/DRIVER.md#orchestrator-migration).
 
-> **Engine-neutral operation (AC15).** The start script sends a plain one-time kickoff. Hub scheduled prompts deliver each later check to the session tag, so the schedule works across supported engines. Watchdog recovery chooses only configured non-Claude routes with fresh Hub quota headroom; `ORCH_FALLBACK_ENGINE` defaults to `opencode`.
+> **Engine-neutral operation (AC15).** The start script sends a plain one-time kickoff. Hub scheduled prompts deliver each later check to the session tag, so the schedule works across supported engines. Watchdog recovery chooses only configured non-Claude routes with fresh Hub quota headroom; `ORCH_FALLBACK_ENGINE` defaults to `antigravity`.
 1. **Signs**: Grok usage near the weekly budget (65% at mid-week on 2026-10-27), or Grok routines failing/refusing for quota.
 2. **Cut order** (cheapest to lose first): hourly Hub report -> pending research follow-ups -> Codex quota check -> open-intake drain -> dev mailbox wake (last, until the Hub webhook exists). Grok keeps only: forwarding Alexey's messages and alerts, relaying `NEEDS_ALEXEY.md`.
 3. **Scheduler note**: Hub schedules (`hub schedules list`, engine-agnostic, durable queue) drive both sessions; watchdog recovery does not depend on `/loop`.

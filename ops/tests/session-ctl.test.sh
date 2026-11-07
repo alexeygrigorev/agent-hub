@@ -25,7 +25,7 @@ cat > "$bin/a" <<'APLEXER'
 set -euo pipefail
 case "${1:-}" in
   engines)
-    printf '[{"name":"gemini"},{"name":"antigravity"},{"name":"grok"},{"name":"opencode"},{"name":"zcodex"},{"name":"codex"},{"name":"claude"}]\n'
+    printf '[{"name":"antigravity"},{"name":"grok"},{"name":"opencode"},{"name":"zcodex"},{"name":"codex"},{"name":"claude"}]\n'
     ;;
   list)
     cat "$FAKE_SESSIONS"
@@ -148,9 +148,11 @@ write_dead() {
 }
 
 write_default_quota() {
+  # Hub's provider-family quota key is still "gemini"; its runnable engine is
+  # Antigravity. Keep the provider label while exposing only the Agy harness.
   write_quota <<'JSON'
 {"pools":[
- {"provider":"gemini","state":"fresh","remaining_percent":44,"harness":["gemini","antigravity"]},
+ {"provider":"gemini","state":"fresh","remaining_percent":44,"harness":["antigravity"]},
  {"provider":"go","state":"fresh","remaining_percent":36,"harness":["opencode"]},
  {"provider":"grok","state":"fresh","remaining_percent":32,"harness":["grok"]},
  {"provider":"zai","state":"fresh","remaining_percent":50,"harness":["zcodex"]},
@@ -180,7 +182,7 @@ touch -d '25 minutes ago' "$HOME/tmp/agent-reports/oncall/inbox/old.md"
 output="$(run_ctl oncall check 2>&1)"
 assert_contains "$output" 'STALLED session=old-oncall: oncall inbox'
 assert_not_contains "$output" 'OK session='
-[[ "$(<"$FAKE_START_ENGINE")" == gemini ]]
+[[ "$(<"$FAKE_START_ENGINE")" == antigravity ]]
 assert_contains "$(<"$FAKE_SEND_LOG")" 'Run the oncall check now:'
 assert_not_contains "$(<"$FAKE_SEND_LOG")" '/loop'
 
@@ -191,9 +193,9 @@ write_dead oncall
 export FAKE_HUB_MODE=fail
 output="$(run_ctl oncall start 2>&1)"
 unset FAKE_HUB_MODE
-assert_contains "$output" 'Hub quota unavailable; using local engine gemini'
+assert_contains "$output" 'Hub quota unavailable; using local engine antigravity'
 assert_not_contains "$output" 'recovery held'
-[[ "$(<"$FAKE_START_ENGINE")" == gemini ]]
+[[ "$(<"$FAKE_START_ENGINE")" == antigravity ]]
 
 # The Hub release_bootstrap stub falls back during a real oncall recovery.
 write_live oncall 'You have hit your weekly limit - resets Nov 5'
@@ -201,9 +203,9 @@ export FAKE_HUB_MODE=stub
 output="$(run_ctl oncall check 2>&1)"
 unset FAKE_HUB_MODE
 assert_contains "$output" 'provider usage limit screen'
-assert_contains "$output" 'Hub quota unavailable; using local engine gemini'
+assert_contains "$output" 'Hub quota unavailable; using local engine antigravity'
 assert_not_contains "$output" 'recovery held'
-[[ "$(<"$FAKE_START_ENGINE")" == gemini ]]
+[[ "$(<"$FAKE_START_ENGINE")" == antigravity ]]
 
 # An HTTP-command timeout (the same nonzero result as timeout(1)) also uses
 # the local route instead of holding recovery.
@@ -211,9 +213,9 @@ write_live oncall 'You have hit your weekly limit - resets Nov 5'
 export FAKE_HUB_MODE=timeout
 output="$(run_ctl oncall check 2>&1)"
 unset FAKE_HUB_MODE
-assert_contains "$output" 'Hub quota unavailable; using local engine gemini'
+assert_contains "$output" 'Hub quota unavailable; using local engine antigravity'
 assert_not_contains "$output" 'recovery held'
-[[ "$(<"$FAKE_START_ENGINE")" == gemini ]]
+[[ "$(<"$FAKE_START_ENGINE")" == antigravity ]]
 
 # A healthy quota document still wins over the local preference.
 write_quota <<'JSON'
@@ -224,12 +226,22 @@ output="$(run_ctl oncall check 2>&1)"
 assert_contains "$output" 'Hub quota selected opencode'
 [[ "$(<"$FAKE_START_ENGINE")" == opencode ]]
 
-# The documented operator override survives script initialization, but is
-# accepted only for an available non-Claude engine.
+# A legacy Hub harness name under the legacy Google quota provider still routes
+# to Antigravity, even though the configured engine list contains no Gemini CLI.
+write_quota <<'JSON'
+{"pools":[{"provider":"gemini","state":"fresh","remaining_percent":44,"harness":["gemini"]}]}
+JSON
+write_live oncall 'You have hit your weekly limit - resets Nov 5'
+output="$(run_ctl oncall check 2>&1)"
+assert_not_contains "$output" 'Hub quota unavailable'
+[[ "$(<"$FAKE_START_ENGINE")" == antigravity ]]
+
+# A legacy operator ENGINE=gemini override is normalized to the configured
+# Antigravity route; ops never starts the old Gemini engine name.
 write_dead oncall
 output="$(ENGINE=gemini ENGINE_SELECTED=1 "$repo/ops/lib/session-ctl.sh" oncall start 2>&1)"
 assert_not_contains "$output" 'recovery held'
-[[ "$(<"$FAKE_START_ENGINE")" == gemini ]]
+[[ "$(<"$FAKE_START_ENGINE")" == antigravity ]]
 
 # Immediately after a restart, oncall gets a MAX_ONCALL_INBOX_AGE grace window from last_start
 # to finish draining pre-existing inbox items instead of being killed mid-triage.
@@ -265,10 +277,11 @@ for role in oncall orchestrator; do
   output="$(run_ctl "$role" check 2>&1)"
   assert_contains "$output" 'provider usage limit screen'
   assert_not_contains "$output" 'OK session='
-  [[ "$(<"$FAKE_START_ENGINE")" == gemini ]]
+  [[ "$(<"$FAKE_START_ENGINE")" == antigravity ]]
 done
 
-# The second orchestrator recovery path defaults to OpenCode and avoids the failed route.
+# Recovery path 2 prefers Antigravity but excludes its failed route, so it uses
+# the next configured route, OpenCode.
 write_default_quota
 write_live orchestrator 'normal ready prompt'
 state="$HOME/tmp/agent-reports/orchestrator/state"
@@ -298,8 +311,8 @@ read -r due path attempted_engine < "$state/proof_due"
 printf '%s %s %s\n' "$(( $(date +%s)-1 ))" "$path" "$attempted_engine" > "$state/proof_due"
 write_default_quota
 output="$(run_ctl orchestrator check 2>&1)" || true
-assert_contains "$output" 'recovery path 2 started on gemini'
-[[ "$(<"$FAKE_START_ENGINE")" == gemini ]]
+assert_contains "$output" 'recovery path 2 started on antigravity'
+[[ "$(<"$FAKE_START_ENGINE")" == antigravity ]]
 assert_not_contains "$(<"$FAKE_SEND_LOG")" '/loop'
 
 # Claude-only, Codex-only, stale and exhausted quota are not sufficient recovery evidence.
