@@ -1,0 +1,6 @@
+[Unit]
+Description=Agent Hub scheduled trigger (15-minute budget-alert cron on workerd)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/curl --fail --silent --show-error --max-time 120 "http://127.0.0.1:8787/__scheduled?cron=*/15+*+*+*+*"

@@ -1,0 +1,25 @@
+[Unit]
+Description=Agent Hub worker (hub2 production worker on workerd, GCP VM)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=alexey
+Group=alexey
+UMask=0077
+WorkingDirectory=/opt/agent-hub
+Environment=WRANGLER_SEND_METRICS=false
+Environment=NODE_ENV=production
+Environment=TMPDIR=/opt/agent-hub/.local/tmp
+Environment=HOME=/home/alexey
+ExecStart=/opt/agent-hub/node_modules/.bin/wrangler dev --config wrangler.jsonc --ip 127.0.0.1 --port 8787 --persist-to /var/lib/agent-hub/do-state --test-scheduled
+Restart=on-failure
+RestartSec=10
+KillMode=mixed
+TimeoutStopSec=45
+MemoryMax=1500M
+TasksMax=512
+
+[Install]
+WantedBy=multi-user.target
