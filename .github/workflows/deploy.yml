@@ -17,6 +17,15 @@ on:
           - bootstrap
           - active
         default: bootstrap
+      oncall_recipient_public_key_b64:
+        description: Optional base64 PEM RSA public key for a one-time, recipient-encrypted oncall token artifact
+        type: string
+        required: false
+        default: ''
+      oncall_rotate:
+        description: Explicitly rotate the oncall token pair when recovering from a lost encrypted artifact
+        type: boolean
+        default: false
 permissions:
   contents: read
 jobs:
@@ -43,6 +52,8 @@ jobs:
       - name: Ops watchdog Python regression tests
         working-directory: host
         run: python -m unittest discover -s tests -p 'test_ops_watchdog.py'
+      - name: Oncall credential envelope tests
+        run: python deploy/vm/test_provision_oncall_alerts.py
   hub2:
     uses: ./.github/workflows/hub2.yml
   distribution:
@@ -107,3 +118,28 @@ jobs:
           done
           echo "public health check failed" >&2
           exit 1
+      - name: Provision oncall tokens into a recipient-encrypted artifact
+        if: inputs.oncall_recipient_public_key_b64 != ''
+        env:
+          ONCALL_RECIPIENT_PUBLIC_KEY_B64: ${{ inputs.oncall_recipient_public_key_b64 }}
+          ONCALL_ROTATE: ${{ inputs.oncall_rotate }}
+          SSH: ssh -i ~/.ssh/hub_vm_key -o StrictHostKeyChecking=accept-new -o BatchMode=yes ${{ secrets.AGENT_HUB_VM_USER }}@${{ secrets.AGENT_HUB_VM_HOST }}
+        run: |
+          set -euo pipefail
+          recipient_key="${RUNNER_TEMP}/oncall-recipient.pub"
+          envelope="${RUNNER_TEMP}/oncall-token-envelope.b64"
+          printf '%s' "$ONCALL_RECIPIENT_PUBLIC_KEY_B64" | base64 --decode > "$recipient_key"
+          chmod 600 "$recipient_key"
+          rotate_args=()
+          if [ "$ONCALL_ROTATE" = true ]; then rotate_args+=(--rotate); fi
+          $SSH "sudo python3 /opt/agent-hub/deploy/vm/provision-oncall-alerts.py ${rotate_args[*]}" < "$recipient_key" > "$envelope"
+          base64 --decode "$envelope" >/dev/null
+          chmod 600 "$envelope"
+      - name: Upload encrypted oncall token artifact
+        if: inputs.oncall_recipient_public_key_b64 != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: oncall-token-envelope-${{ github.run_id }}
+          path: ${{ runner.temp }}/oncall-token-envelope.b64
+          if-no-files-found: error
+          retention-days: 1
