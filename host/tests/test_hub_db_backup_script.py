@@ -37,6 +37,7 @@ class FakeHub:
 
     def __init__(self, api_version: int = 5) -> None:
         self.api_version = api_version
+        self.status_override: tuple[int, dict | None] | None = None
         self.tables: dict[str, dict[int, dict]] = {}
         self.without_rowid: set[str] = set()
         self.lock = threading.Lock()
@@ -110,12 +111,14 @@ class FakeHub:
             self.after_chunk(self, table, body)
         return 200, body
 
-    def handle(self, path: str) -> tuple[int, dict]:
+    def handle(self, path: str) -> tuple[int, dict | None]:
         url = urlparse(path)
         q = parse_qs(url.query)
         with self.lock:
             self.requests.append(path)
             if url.path == "/api/backup/status":
+                if self.status_override is not None:
+                    return self.status_override
                 return 200, self.status()
             if url.path == "/api/backup/export" and q.get("schema") == ["1"]:
                 return 200, {"exported_at": "x", "snapshot": "hub-do-sqlite",
@@ -132,7 +135,7 @@ def serve(hub: FakeHub) -> ThreadingHTTPServer:
                 code, body = 401, {"error": "unauthorized"}
             else:
                 code, body = hub.handle(self.path)
-            data = json.dumps(body).encode()
+            data = b"" if body is None else json.dumps(body).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
@@ -332,6 +335,50 @@ class HubDbBackupScriptTest(unittest.TestCase):
         self.assertEqual(len(alerts), 1, alerts)
         self.assertIn("chunk fetch failed table=claims", alerts[0][1])
         self.assertIn("HTTP 404", alerts[0][1])
+
+    def test_release_bootstrap_503_skips_without_alert(self) -> None:
+        for body in (
+            {"error": "release_bootstrap"},
+            {"dispatch_enabled": False},
+        ):
+            with self.subTest(body=body):
+                hub = FakeHub()
+                hub.status_override = (503, body)
+
+                res = self.run_backup(hub)
+
+                self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+                self.assertIn("SKIP: Hub stubbed / dispatch disabled; backup skipped", res.stdout)
+                self.assertEqual(hub.requests, ["/api/backup/status"])
+                self.assertEqual(self.alerts(), [])
+                self.assertEqual(self.exports("local"), [])
+                self.assertEqual(self.exports("box"), [])
+
+    def test_unmarked_503_status_fails_and_alerts(self) -> None:
+        hub = FakeHub()
+        hub.status_override = (503, None)  # Empty body is not proof of the stub.
+
+        res = self.run_backup(hub)
+
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn("status fetch failed HTTP 503", res.stdout)
+        alerts = self.alerts()
+        self.assertEqual(len(alerts), 1, alerts)
+        self.assertEqual(alerts[0][0], "--backup-failed")
+        self.assertIn("status fetch failed HTTP 503", alerts[0][1])
+
+    def test_internal_server_error_status_fails_and_alerts(self) -> None:
+        hub = FakeHub()
+        hub.status_override = (500, {"error": "internal"})
+
+        res = self.run_backup(hub)
+
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn("status fetch failed HTTP 500", res.stdout)
+        alerts = self.alerts()
+        self.assertEqual(len(alerts), 1, alerts)
+        self.assertEqual(alerts[0][0], "--backup-failed")
+        self.assertIn("status fetch failed HTTP 500", alerts[0][1])
 
     def test_fail_drill_pages_ops_only_without_touching_hub(self) -> None:
         hub = FakeHub()
