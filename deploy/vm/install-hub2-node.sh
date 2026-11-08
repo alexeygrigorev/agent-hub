@@ -4,8 +4,31 @@
 #   agent-hub-hub2.service  Caddyfile
 # Secrets: /opt/agent-hub/.dev.vars is preserved if present; on first run it is
 # created with a fresh HUB2_CREDENTIAL_KEY (64 hex) and HUB2_BOOTSTRAP_TOKEN.
+# Optional --release-mode updates only HUB2_RELEASE_MODE in the existing file.
 # Budget envelopes are retired with the Cloudflare budget checkers.
 set -euo pipefail
+
+RELEASE_MODE=""
+while (($#)); do
+  case "$1" in
+    --release-mode)
+      if (($# < 2)); then
+        echo "--release-mode requires bootstrap or active" >&2
+        exit 2
+      fi
+      RELEASE_MODE="$2"
+      shift 2
+      ;;
+    *)
+      echo "unknown argument: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+if [[ -n "$RELEASE_MODE" && "$RELEASE_MODE" != bootstrap && "$RELEASE_MODE" != active ]]; then
+  echo "--release-mode must be bootstrap or active" >&2
+  exit 2
+fi
 
 DEPLOY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,6 +60,54 @@ if [[ ! -f "$REPO/.dev.vars" ]]; then
   chmod 600 "$REPO/.dev.vars"
 else
   echo "   keeping existing .dev.vars"
+fi
+
+if [[ -n "$RELEASE_MODE" ]]; then
+  echo "== release mode ($RELEASE_MODE)"
+  python3 - "$REPO/.dev.vars" "$RELEASE_MODE" <<'PY'
+import os
+import stat
+import sys
+import tempfile
+from pathlib import Path
+
+path = Path(sys.argv[1])
+mode = sys.argv[2]
+if mode not in {"bootstrap", "active"}:
+    raise SystemExit("invalid release mode")
+
+original_stat = path.stat()
+lines = path.read_text(encoding="utf-8").splitlines()
+updated = []
+inserted = False
+for line in lines:
+    key, separator, _value = line.partition("=")
+    if separator and key.strip() == "HUB2_RELEASE_MODE":
+        if not inserted:
+            updated.append(f"HUB2_RELEASE_MODE={mode}")
+            inserted = True
+        continue
+    updated.append(line)
+if not inserted:
+    updated.insert(0, f"HUB2_RELEASE_MODE={mode}")
+contents = "\n".join(updated) + "\n"
+
+fd, temporary_name = tempfile.mkstemp(prefix=".dev.vars.", dir=path.parent)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as temporary:
+        temporary.write(contents)
+        temporary.flush()
+        os.fsync(temporary.fileno())
+    os.chown(temporary_name, original_stat.st_uid, original_stat.st_gid)
+    os.chmod(temporary_name, stat.S_IMODE(original_stat.st_mode))
+    os.replace(temporary_name, path)
+except BaseException:
+    try:
+        os.unlink(temporary_name)
+    except FileNotFoundError:
+        pass
+    raise
+PY
 fi
 
 echo "== daily backup + staleness cron (no MTA on this VM; alerts via ALERT_CMD)"

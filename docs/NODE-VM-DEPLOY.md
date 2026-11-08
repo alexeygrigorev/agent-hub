@@ -72,6 +72,12 @@ Run locally: `node --experimental-transform-types hub2/node/main.ts --data-dir
    npm ci --omit=dev && sudo bash deploy/vm/install-hub2-node.sh`.
 3. `systemctl status agent-hub-hub2` + `curl -s http://127.0.0.1:8787/health`.
 
+The CI dispatch `release_mode` choice is passed to the installer. The installer
+updates only `HUB2_RELEASE_MODE` in the VM's existing `.dev.vars`, preserving
+the other private values; a local installer run without `--release-mode`
+preserves the current mode. Select `active` after operator pairing and host
+enrollment are complete.
+
 ## Bootstrap → active
 
 Same contract as before: `/health` shows

@@ -95,8 +95,13 @@ jobs:
           install -m 600 /dev/stdin ~/.ssh/hub_vm_key <<< "${{ secrets.AGENT_HUB_VM_DEPLOY_KEY }}"
       - name: Deploy validated revision to the hub VM (SSH only; no cloud credentials)
         env:
+          RELEASE_MODE: ${{ inputs.release_mode }}
           SSH: ssh -i ~/.ssh/hub_vm_key -o StrictHostKeyChecking=accept-new -o BatchMode=yes ${{ secrets.AGENT_HUB_VM_USER }}@${{ secrets.AGENT_HUB_VM_HOST }}
         run: |
+          case "$RELEASE_MODE" in
+            bootstrap|active) ;;
+            *) echo "invalid release mode" >&2; exit 2 ;;
+          esac
           $SSH 'set -eu
             cd /opt/agent-hub
             git fetch origin main
@@ -104,19 +109,26 @@ jobs:
             export TMPDIR=/opt/agent-hub/.local/tmp
             mkdir -p "$TMPDIR"
             npm ci --omit=dev
-            sudo bash deploy/vm/install-hub2-node.sh
+            sudo bash deploy/vm/install-hub2-node.sh --release-mode '"$RELEASE_MODE"'
             systemctl is-active --quiet agent-hub-hub2.service
             curl -fsS --max-time 10 http://127.0.0.1:8787/health'
       - name: Verify public health through the edge
+        env:
+          RELEASE_MODE: ${{ inputs.release_mode }}
         run: |
+          case "$RELEASE_MODE" in
+            bootstrap) expected='"status":"bootstrap"' ;;
+            active) expected='"ok":true' ;;
+            *) echo "invalid release mode" >&2; exit 2 ;;
+          esac
           for attempt in 1 2 3 4 5 6; do
             payload="$(curl -fsS --max-time 15 https://hub.dtcdev.click/health 2>/dev/null || true)"
             case "$payload" in
-              *'"status"'*) echo "$payload"; exit 0 ;;
+              *"$expected"*) echo "$payload"; exit 0 ;;
             esac
             sleep 10
           done
-          echo "public health check failed" >&2
+          echo "public health did not report requested release mode: $RELEASE_MODE" >&2
           exit 1
       - name: Provision oncall tokens into a recipient-encrypted artifact
         if: inputs.oncall_recipient_public_key_b64 != ''
