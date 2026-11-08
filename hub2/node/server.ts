@@ -33,11 +33,16 @@ async function buildRequest(request: http.IncomingMessage, origin: string): Prom
   });
 }
 
-async function writeResponse(response: Response, out: http.ServerResponse): Promise<void> {
-  const headers: Record<string, string> = {};
+export async function writeResponse(response: Response, out: http.ServerResponse): Promise<void> {
+  const headers: Record<string, string | string[]> = {};
   response.headers.forEach((value, key) => {
+    if (key.toLowerCase() === 'set-cookie') return;
     headers[key] = headers[key] ? headers[key] + ', ' + value : value;
   });
+  // Set-Cookie must never be comma-folded: a merged header makes browsers apply
+  // the later cookie's Max-Age=0 to the session cookie.
+  const cookies = response.headers.getSetCookie();
+  if (cookies.length) headers['set-cookie'] = cookies;
   out.writeHead(response.status, headers);
   if (!response.body) {
     out.end();
