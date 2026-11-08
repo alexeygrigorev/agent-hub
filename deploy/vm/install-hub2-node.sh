@@ -120,7 +120,7 @@ cat > /etc/cron.d/hub2-db-backup <<'CRON'
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 20 4 * * * root /usr/local/sbin/hub2-db-backup.sh >>/var/log/hub2-db-backup.log 2>&1
-50 4 * * * root /usr/local/sbin/hub2-db-backup-staleness.sh >>/var/log/hub2-db-backup-staleness.log 2>&1
+50 4 * * * root HUB_DB_BACKUP_ENV_FILE=/etc/hub2-db-backup-staleness.env /usr/local/sbin/hub2-db-backup-staleness.sh --no-mail >>/var/log/hub2-db-backup-staleness.log 2>&1
 CRON
 chmod 644 /etc/cron.d/hub2-db-backup
 
