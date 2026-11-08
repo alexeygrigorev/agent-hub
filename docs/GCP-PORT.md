@@ -2,7 +2,8 @@
 > budget cron and envelopes described below are retired. Current topology,
 > cutover record and operations live in [docs/NODE-VM-DEPLOY.md](NODE-VM-DEPLOY.md).
 > Kept for the port history and the GCP VM facts (machine type, firewall,
-> secrets layout).
+> secrets layout). Its `gcloud`/VM-rebuild steps are history, not an update
+> path: updates ship only through CI/CD (NODE-VM-DEPLOY.md, "Shipping an update").
 
 # GCP VM port (port-gcloud, 2026-11-07)
 

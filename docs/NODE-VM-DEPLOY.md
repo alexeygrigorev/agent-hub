@@ -157,9 +157,10 @@ or include either token in reports.
 
 Rollback of traffic = revert the hub-edge change set (origin back to the
 Cloudflare Workers endpoint, which stays deployed but idle). Rollback of code
-= `git checkout --detach <previous-ref>` on the VM + restart; the DB schema is
-additive per hub2's schema versions, and `deploy/vm/install-hub2-node.sh` is
-idempotent.
+= revert the bad change on `main` through a PR, then run the production
+workflow again (see "Shipping an update"); never edit the VM by hand. The DB
+schema is additive per hub2's schema versions, and
+`deploy/vm/install-hub2-node.sh` is idempotent.
 
 ## Static VM IP
 
@@ -171,10 +172,19 @@ reserved-but-unattached addresses (~USD 3.6/month), so never release it
 without attaching it elsewhere. `vm_ipv4` in `aws-infra/sandbox/agent-hub`
 should therefore no longer drift after a VM restart.
 
-GCP access from this machine: ad-hoc credentials were removed on 2026-11-07
-(`~/tmp/gcp` deleted, tokens revoked where the token type allowed it) so the
-account is reachable only through the phone-cloud-gate wrapper
-(`~/.local/bin/gcloud`, approval on the operator's phone). The real SDK binary
-(`~/.local/share/google-cloud-cli/google-cloud-sdk/bin/gcloud`) has no
-credentialed config anymore. CI deploys need no GCP access (SSH deploy key),
-and the VM IP is static, so routine operation is unaffected.
+GCP access is not part of operating Hub. Do not use `gcloud`, GCP console
+SSH or hand edits on the VM to update or inspect it. The VM IP is static and
+CI deploys over the SSH deploy key, so routine operation needs neither.
+
+## Shipping an update (CI/CD only)
+
+1. Open a PR against `main`; the `Hub 2 production` and `Hub 2.0 checks`
+   workflows run the full suite. Merge when green (`gh pr merge --auto --rebase`).
+2. Run `gh workflow run deploy.yml --ref main -f dry_run=false
+   -f release_mode=<bootstrap|active>` (workflow "Hub 2 production"). A push to
+   `main` only validates; the `deploy` job runs on `workflow_dispatch` with
+   `dry_run=false`, in the `production` environment.
+3. The job SSHes with `AGENT_HUB_VM_DEPLOY_KEY`, fast-forwards `/opt/agent-hub`,
+   runs `npm ci --omit=dev` and `deploy/vm/install-hub2-node.sh`, and checks
+   `https://hub.dtcdev.click/health`.
+4. Verify from anywhere with `curl https://hub.dtcdev.click/health`.
