@@ -139,9 +139,13 @@ or include either token in reports.
 - `scripts/hub2-db-restore-drill.py` — extracts an artifact, `PRAGMA
   integrity_check` per database, compares table counts with the manifest.
 - `scripts/hub-db-backup-staleness.sh` — `BACKUP_GLOB=hub2-db-*.tar.gz` on the
-  VM (`/etc/hub2-db-backup-staleness.env`), cron `20 4 * * *` root.
-- VM cron also mirrors artifacts off-box when the second tree is configured;
-  Hetzner-side staleness alerts keep the working msmtp path.
+  VM (`/etc/hub2-db-backup-staleness.env`), log-only check at 04:50 UTC root.
+  The cron explicitly selects this env and uses `--no-mail` (VM has no MTA).
+- Both VM trees are local. RMTHZ `hub2-backup-pull.sh` takes an additional
+  online snapshot daily at 05:35 Europe/Berlin, copies Hub2 artifacts to RMTHZ
+  and Storagebox, and alerts on failure through the existing msmtp path.
+  RMTHZ checks the Hub2 glob every 15 minutes (36h threshold, 24h repeats).
+  See `docs/HUB-DB-BACKUP.md` for the 2026-11-08 cutover and retired Hub1 cron.
 
 ## Cutover record (2026-11-07)
 

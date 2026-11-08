@@ -1,3 +1,57 @@
+# Hub DB backup
+
+## Active Hub2 pipeline (cut over 2026-11-08)
+
+Root cause: RMTHZ still exported the retired Hub1 Cloudflare Durable Object;
+its deleted export API/operator credential returned HTTP 401 after Hub2 cutover.
+The older Hub1 instructions below are historical and must not be reinstalled.
+
+`hub.dtcdev.click/health` returns `{"ok":true,"service":"hub2"}`. CloudFront
+forwards to `agent-hub-vm.dtcdev.click`, Caddy proxies localhost:8787, and
+`agent-hub-hub2.service` runs Node with
+`--data-dir /var/lib/agent-hub/hub2-db`. Read-only inspection confirmed the
+active service and `CONTROL-global-7d0fe8fd2c.sqlite` plus WAL/SHM there.
+
+VM snapshots use `scripts/hub2-db-backup.sh` (online `VACUUM INTO`, manifest,
+mode 600, 30-day retention) into `/var/backups/hub-do` and
+`/var/backups/hub-do-mirror`. The VM daily snapshot cron remains 04:20 UTC.
+RMTHZ runs `/usr/local/sbin/hub2-backup-pull.sh` at 05:35 Europe/Berlin (04:35 UTC in winter): it takes a
+fresh snapshot over existing host-local SSH credentials, copies only Hub2
+artifacts into `/var/backups/hub-do` and
+`/home/alexey/storagebox/backups/hub-do`, and prunes only Hub2 artifacts older
+than 30 whole days. The VM mirror is local; RMTHZ/Storagebox provide off-VM copies.
+Configuration: `/etc/hub2-backup-pull.env` (0600), with `VM_HOST`,
+`SSH_KEY` (existing local key path), `BACKUP_DIR`, `STORAGEBOX_DIR`,
+`STATE_DIR`, `BACKUP_GLOB`, and optional `RETENTION_DAYS`/`STALENESS_SCRIPT`.
+Install the current shared staleness script as
+`/usr/local/sbin/hub2-db-backup-staleness.sh`; the older RMTHZ Hub1
+installation predates `BACKUP_GLOB` and cannot monitor Hub2 artifacts.
+Manual runs require
+`--no-mail`. SSH and rsync run unattended with pinned known hosts.
+
+RMTHZ `/etc/cron.d/hub2-backup-staleness` checks every 15 minutes with that
+same environment, `BACKUP_GLOB=hub2-db-*.tar.gz`, threshold 36h, repeat 24h,
+and a separate `/var/lib/hub2-backup-pull` state directory. Scheduled pull
+failures page immediately; stalled snapshots page within 36h15m. Both use
+RMTHZ's existing msmtp alert path to alexey@datatalks.club and dev@dtcdev.click.
+Freshest copy across the trees determines staleness. VM-local staleness is
+log-only (no MTA); RMTHZ owns paging. No secrets are copied or committed.
+
+The two RMTHZ Hub1 cron files are disabled with comments; scripts, credentials
+and both last-good `2026/11/03/hub-do-20261103T0420+0100.json.gz` exports
+are retained untouched. They must not produce daily FAIL/STALE pages again.
+
+Verification receipt and exact artifact/drill paths are in
+`~/tmp/agent-reports/hub2-backup-cutover-2026-11-08.md`. Restore checks use
+`scripts/hub2-db-restore-drill.py` against snapshots, never live databases.
+The `2026/11/08/hub2-db-20261108T2113+0100.tar.gz` artifact matched
+across all four trees (two on VM, RMTHZ, Storagebox), each mode 600.
+Independent restores from RMTHZ and Storagebox both passed: 1 database,
+20 tables, 89 rows, integrity OK and exact manifest counts.
+All manual verification suppresses mail; scheduled real failures retain alerts.
+
+## Historical Hub1 runbook (retired; do not execute)
+
 # Hub DB backup (intake c1241bea)
 
 Independent daily export of the Hub Durable Object SQLite (Cloudflare Worker
