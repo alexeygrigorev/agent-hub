@@ -79,6 +79,14 @@ try{
   expect(await api('/api/intakes?project='+encodeURIComponent(project),'POST',{...first.body,key:'empty-ac',acceptance_criteria:[]}),400,'empty AC');
   const text=expect(await api('/api/intakes?project='+encodeURIComponent(project),'POST',{...first.body,key:'text-ac',acceptance_criteria:'- first criterion\n2. second criterion\n\n'}),201,'text AC block');assert.deepEqual(text.intake.acceptance_criteria,['first criterion','second criterion']);
  });
+ await test('sessions start honors an existing intake_task_id without minting another intake',async()=>{
+  const made=expect((await intake('intake-start-existing')).response,201,'intake to start').intake;
+  const before=(await api('/api/intakes?project='+encodeURIComponent(project))).data.items.length;
+  const r=await api('/api/sessions','POST',{key:'start-existing-key',workspace:'/synthetic/workspace',intake_task_id:made.id});
+  assert.notEqual(r.data.error,'project_required');assert.notEqual(r.data.stage,'intake','must not create a second intake');
+  assert.equal(r.data.intake_id,made.id,'start status '+r.status+' '+JSON.stringify(r.data));
+  const list=await api('/api/intakes?project='+encodeURIComponent(project));assert.equal(list.data.items.length,before,'no second intake');
+ });
  await test('reserve/activate/offer/admission/started/finish through real edge',async()=>{
   assert(hostToken,'enrollment prerequisite failed');const before=await snapshots();
   const created=expect((await intake('intake-main')).response,201,'lifecycle intake').intake;
