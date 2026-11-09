@@ -8,7 +8,7 @@ and the Hub code-format change made in this branch.
 | App | User code | Start and poll endpoints | Approval page |
 | --- | --- | --- | --- |
 | Hub 1 (`hub auth login`) | Before this branch: 8 characters, `4-4` split, alphabet `ABCDEFGHJKMNPQRSTUVWXYZ23456789` in `src/auth/crypto.ts`. Updated here to the shared alphabet `BCDFGHJKLMNPQRSTVWXZ23456789`, retaining the shared `XXXX-XXXX` format. | `POST /api/device/code` and `POST /api/device/token`; Hub owns the pairing records and issues its own human credentials (`src/hub.ts`, `host/agent_hub_host/human_auth.py`). | Hub `/device?code=...`, rendered through `authPage()` and the shared `dakit` auth shell (`src/ui-pages.ts`). It reviews the human login label, code, expiry and admin grant. |
-| dapier (`dapier auth login`) | 8 characters, `4-4` split, `USER_CODE_ALPHABET` from `src/dapier/auth/device_sessions.py`; same alphabet as DataTalksClub/auth. | `POST /api/agent/device/start` and `POST /api/agent/device/token`; dapier owns pairing and device sessions (`src/dapier/api/agent/device.py`). | `/device?code=...`, dapier's confirmation page (`src/web/device.html`, `src/web/js/device.js`), with identity and request facts before approval. |
+| dapier (`dapier auth login`) | 8 characters, `4-4` split, `USER_CODE_ALPHABET` from `src/dapier/auth/device_sessions.py`; the dakit canonical `BCDFGHJKMNPQRSTWXZ23456789` (no L/V, mirrored by `src/web/vendor/device-code.js`, which the `/device` page validates against). Deliberately two characters narrower than the shared issuer alphabet; same `XXXX-XXXX` format. | `POST /api/agent/device/start` and `POST /api/agent/device/token`; dapier owns pairing and device sessions (`src/dapier/api/agent/device.py`). | `/device?code=...`, dapier's confirmation page (`src/web/device.html`, `src/web/js/device.js`), with identity and request facts before approval. |
 | DataOps (`dataops login`) | Issuer-generated 8-character code in `XXXX-XXXX` form from DataTalksClub/auth `src/oauth_server.py` (`DEVICE_CODE_ALPHABET`). | `POST /oauth/device` and `POST /oauth/token` on the shared issuer. The CLI loads the shared `dtc_device_login/login.mjs` loop (`cli/src/commands/auth.mjs`). | Shared issuer `/device?code=...`, served by DataTalksClub/auth `handle_device_page_get()` in `src/oauth_server.py`. |
 
 The Hub CLI's polling implementation is the stdlib-compatible
@@ -24,6 +24,12 @@ app's own credential and permissions. Hub already uses the shared `dakit` auth
 shell, but its text and review facts are Hub-specific. The implementation
 change here aligns the Hub code alphabet and displayed code format with
 dapier/DataOps while preserving Hub's approval authority and URL contract.
+
+Net result: Hub and DataOps (shared issuer) now issue codes from exactly the
+same alphabet. dapier keeps the dakit canonical alphabet, which intentionally
+excludes L and V; Hub matches its `XXXX-XXXX` format, hand-typing UX and
+ambiguity-resistant letter set, but does not narrow further because the shared
+issuer page accepts the wider set.
 
 ## Source references
 
