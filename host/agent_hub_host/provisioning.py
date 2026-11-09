@@ -2805,6 +2805,10 @@ def execute():
                 # Keep explicit caller argv last so it can override routed/session policy.
                 argv = command + isolated_argv(b['provider'], bundle_args + bypass_flags + effort_args + extra_argv)
         is_diagnostic = b['args'] + extra_argv in (["--version"], ["-v"], ["--help"], ["-h"])
+        if not is_diagnostic and not profile_logged_in(b, dest):
+            # Fail loudly instead of letting the engine print "Not logged in" (or wait on a login screen).
+            print(json.dumps({'provider': b['provider'], 'launch_allowed': False, 'reason': 'not_logged_in'}), file=sys.stderr)
+            sys.exit(75)
         if not is_diagnostic:
             allowed, reason = hub_launch_gate(label)
             if allowed and reason != 'ok':

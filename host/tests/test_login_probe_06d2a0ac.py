@@ -139,3 +139,24 @@ def test_exec_hang_after_turn_started_is_gone_with_open_pipe_parent(tmp_path):
     finally:
         proc.kill()
     assert proc.stdout.read().strip() == b'0'
+
+
+def test_execute_refuses_logged_out_claude_profile_loudly(tmp_path, monkeypatch, capsys):
+    root = tmp_path / 'managed'
+    root.mkdir(mode=0o700)
+    monkeypatch.setattr(p, 'root', lambda: root)
+    bundle = dict(label='hub-claude', provider='claude', version='2.1.304', files={}, env={}, args=[],
+                  revision='22222222-2222-4222-8222-222222222222')
+    dest = root / ('hub-claude-' + bundle['revision'])
+    dest.mkdir(mode=0o700)
+    p.write_json(dest / 'bundle.json', bundle)
+    p.write_json(root / 'state.json', [{'label': 'hub-claude', 'revision': bundle['revision'], 'provider': 'claude'}])
+    for name in ('provision_managed_home', 'refresh_launch_credential', 'install_managed_engine_permissions'):
+        monkeypatch.setattr(p, name, lambda *a, **k: None)
+    monkeypatch.setattr(p, 'engine_argv', lambda *a, **k: ['/bin/true'])
+    monkeypatch.setattr(p, 'hub_launch_gate', lambda *_a, **_k: pytest.fail('gate must not run'))
+    monkeypatch.setattr(sys, 'argv', ['x', 'hub-claude', '-p', 'hi'])
+    with pytest.raises(SystemExit) as exc:
+        p.execute()
+    assert exc.value.code == 75
+    assert '"reason": "not_logged_in"' in capsys.readouterr().err
