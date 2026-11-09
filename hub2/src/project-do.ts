@@ -823,6 +823,10 @@ export class ProjectDO {
       id: saga.session_id, operation_id: saga.operation_id, attempt_operation_id: saga.attempt_operation_id, intake_id: saga.intake_id,
       machine_id: saga.machine_id, epoch: saga.epoch, state: saga.state, native_id: saga.native_id,
       attempt: saga.attempt, next_action_at: saga.next_action_at, held_reason: saga.last_reason,
+      ...(() => {
+        const launch = this.parse(saga.launch_spec_json) as JsonRecord | null;
+        return launch ? { engine: launch.engine, model: launch.model, effort: launch.effort ?? null } : {};
+      })(),
     };
   }
 

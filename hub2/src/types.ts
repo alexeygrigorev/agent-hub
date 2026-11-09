@@ -27,6 +27,7 @@ export interface Hub2Env {
   HUB2_BOOTSTRAP_TOKEN?: string;
   HUB2_DEV_OPERATOR_TOKEN?: string;
   HUB2_DEFAULT_ACCOUNT_ID?: string;
+  HUB2_DEFAULT_PROJECT?: string;
   HUB2_ENGINE_ACCOUNTS?: string;
   HUB2_CREDENTIAL_KEY?: string;
   HUB2_DEV_METRICS?: string;
