@@ -551,8 +551,17 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
     project = items[0].canonical_name;
   }
   const repoResponse = await control.fetch(new Request(`${CONTROL}/api/repos/${encodeURIComponent(project)}`, { headers: { 'x-hub2-actor': JSON.stringify(actor) } }));
-  if (!repoResponse.ok) return error('project_not_found_or_forbidden', repoResponse.status === 403 ? 403 : 404);
-  const repo = (await repoResponse.json()) as { repo?: { canonical_name?: string; status?: string } };
+  let repoBody = repoResponse;
+  // First start for a repo the registry has not seen: an operator registers it from its GitHub name
+  // (the CLI derives owner/name from the workspace's git origin) instead of failing every new project.
+  if (repoResponse.status === 404 && admin(actor) && existingIntake === undefined && /^[A-Za-z0-9_.-]{1,80}\/[A-Za-z0-9_.-]{1,100}$/.test(project)) {
+    repoBody = await control.fetch(new Request(`${CONTROL}/api/repos/${encodeURIComponent(project)}`, {
+      method: 'PATCH', headers: { 'x-hub2-actor': JSON.stringify(actor), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ canonical_url: `https://github.com/${project}`, purpose: 'Auto-registered by hub sessions start', aliases: [] }),
+    }));
+  }
+  if (!repoBody.ok) return error('project_not_found_or_forbidden', repoBody.status === 403 ? 403 : 404, 'register it with: hub repos import / PATCH /api/repos/owner%2Fname');
+  const repo = (await repoBody.json()) as { repo?: { canonical_name?: string; status?: string } };
   if (repo.repo?.status !== 'active' || !repo.repo.canonical_name) return error('project_inactive', 409);
   const canonical = repo.repo.canonical_name;
   const stub = env.PROJECTS.get(env.PROJECTS.idFromName(canonical));
