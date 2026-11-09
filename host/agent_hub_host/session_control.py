@@ -11,6 +11,7 @@ import http.client
 import json
 import math
 import os
+import subprocess
 import re
 import socket
 import sys
@@ -219,6 +220,17 @@ def http_error(exc, key=None):
     if key and f'reconcile with --key {key}' not in full_message:
         full_message += f' (reconcile with --key {key} via show/commands)'
     return SessionHTTPError(exc.code, code=code, message=full_message, pending=pending, state=pending_state)
+
+
+def _repo_from_workspace(workspace):
+    """owner/name from the workspace's git origin, or None (Hub2 picks the project from it)."""
+    try:
+        done = subprocess.run(['git', '-C', os.path.expanduser(workspace), 'remote', 'get-url', 'origin'],
+                              capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r'github\.com[:/]([A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}?)(?:\.git)?/?$', done.stdout.strip()) if done.returncode == 0 else None
+    return match.group(1) if match else None
 
 
 def request(method, path, payload=None):
@@ -1070,6 +1082,8 @@ def _execute(args):
         if not repo and not getattr(args, 'workspace', None):
             raise ValueError('Give --workspace or --repo (Hub2 needs --workspace for placement; add --repo when several projects exist)')
         payload = {'key': key}
+        if not repo and getattr(args, 'workspace', None):
+            repo = _repo_from_workspace(args.workspace)
         if repo:
             if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}', repo):
                 raise ValueError('--repo must be owner/name')
