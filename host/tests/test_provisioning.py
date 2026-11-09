@@ -1629,7 +1629,7 @@ def test_managed_claude_execution_argv_forces_sonnet_medium(tmp_path, monkeypatc
     label = 'shared-claude'
     b = {'label': label, 'provider': 'claude', 'version': '1.0.0',
          'revision': '22222222-2222-4222-8222-222222222222',
-         'files': {'.claude/.credentials.json': '{"synthetic": true}'}, 'env': {}, 'args': ['--model', 'opus', '--effort', 'high']}
+         'files': {}, 'env': {'CLAUDE_CODE_OAUTH_TOKEN': 'synthetic'}, 'args': ['--model', 'opus', '--effort', 'high']}
     dest = managed / (label + '-' + b['revision'])
     dest.mkdir(mode=0o700)
     p.write_json(dest / 'bundle.json', b)

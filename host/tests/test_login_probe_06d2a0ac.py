@@ -160,3 +160,8 @@ def test_execute_refuses_logged_out_claude_profile_loudly(tmp_path, monkeypatch,
         p.execute()
     assert exc.value.code == 75
     assert '"reason": "not_logged_in"' in capsys.readouterr().err
+
+
+def test_claude_bundle_copy_alone_is_not_a_login(tmp_path):
+    bundle = {'provider': 'claude', 'files': {'.claude/.credentials.json': '{"x": 1}'}, 'env': {}}
+    assert p.profile_logged_in(bundle, tmp_path) is False

@@ -2578,7 +2578,12 @@ def refresh_launch_credential(label, b, home, dest, request=None):
         current = credentials.fetch_current(label, request)
         return credentials.reconcile(label, b, home, dest, request, hub_files=current['files'], hub_generation=current['generation'])
     except Exception:
-        # Hub unreachable: launch with the copy materialized at the last sync.
+        # Hub unreachable: re-materialize from the bundle's own copy (this also
+        # re-tightens an unreadable local file), else launch with the last sync.
+        try:
+            credentials.reconcile(label, b, home, dest, request)
+        except Exception:
+            pass
         return {'status': 'hub_unreachable'}
 
 
@@ -2853,7 +2858,9 @@ def profile_logged_in(bundle, dest):
         return True
     files = bundle.get('files') if isinstance(bundle.get('files'), dict) else {}
     for rel in paths:
-        if files.get(rel):
+        # Claude reads only the materialized home file; a bundle copy that failed
+        # to materialize (mode 000 file, Hub unreachable) is not a login.
+        if files.get(rel) and bundle.get('provider') != 'claude':
             return True
         target = Path(dest) / 'home' / rel
         try:
