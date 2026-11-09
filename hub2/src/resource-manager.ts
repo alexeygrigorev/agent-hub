@@ -95,7 +95,10 @@ export async function admitLaunch(env:Hub2Env,input:AdmissionRequest):Promise<Ad
   const directory=await read(env.CONTROL,'global','/api/directory?kind=machines&limit=50');
   if(directory.next)throw new HttpError('routing_fleet_bound_exceeded',503);
   const ids=(directory.items as {id:string}[]).map(v=>v.id).filter(id=>!input.machine_id||input.machine_id===id);
-  if(!ids.length)return{ok:false,code:'machine_unavailable',hold:{retry_at:null}};
+  // A pinned machine missing from the credential directory was never paired or
+  // was hard-revoked; say so instead of a bare machine_unavailable. An unpinned
+  // start with an empty fleet stays bare: there is no single machine to name.
+  if(!ids.length)return{ok:false,code:'machine_unavailable',hold:{retry_at:null,...(input.machine_id?{reason:'machine_not_enrolled'}:{})}};
   const machineResults=await Promise.all(ids.map(async id=>{try{return await read(env.MACHINES,id,'/_internal/routing') as MachineView;}catch{return null;}}));
   // Say why a host was skipped (busy/offline) instead of a bare machine_unavailable.
   const skipped=machineResults.filter((m):m is MachineView&{reason?:string}=>!!m&&!(m.available&&ids.includes(m.machine_id)));
