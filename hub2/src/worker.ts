@@ -112,12 +112,29 @@ const router = {
           false,
         );
         if (!fleet.ok) return fleet;
+        const view = (await fleet.json()) as { items?: { id: string; connected?: boolean; sessions?: unknown[]; attention?: { session_id?: string; reason?: string }[] }[] };
+        const items = view.items ?? [];
+        // Hub1-shaped keys the CLI (`hub status`) renders; the Hub2 projection stays under `fleet`.
         return json({
-          fleet: await fleet.json(),
+          fleet: view,
           service: 'hub2',
           projection: 'bounded_first_page',
+          snapshot_at: new Date().toISOString(),
+          revision: 'hub2',
+          coverage: {
+            sessions: items.reduce((n, m) => n + (m.sessions?.length ?? 0), 0),
+            missing_hosts: items.filter(m => m.connected === false).map(m => m.id),
+            expected_offline: [],
+          },
+          needs_attention: items.flatMap(m => (m.attention ?? []).map(a => ({
+            severity: 'warning', subject: a.session_id ?? m.id, detail: a.reason ?? 'attention',
+          }))),
         });
       }
+      if (path === '/api/fleet/routing/machines' && request.method === 'GET')
+        return await routingMachines(env, actor);
+      if (path === '/api/fleet/routing/policy' && request.method === 'GET')
+        return control.fetch(await forwardRequest(request, CONTROL + '/api/model-policy', actor));
 
       if (path === '/api/enrollments/pair' && request.method === 'POST')
         return control.fetch(await forwardRequest(request, `${CONTROL}${path}`, actor));
@@ -632,6 +649,28 @@ function readCursor(value: string | null): any {
     throw new HttpError('invalid_cursor', 400);
   }
 }
+/** `hub routing-machines`: per machine the numbers placement judges (capacity, resource freshness, engines). */
+async function routingMachines(env: Hub2Env, actor: Actor): Promise<Response> {
+  if (!admin(actor)) return error('forbidden', 403);
+  const control = env.CONTROL.get(env.CONTROL.idFromName('global'));
+  const directory = await control.fetch(new Request(CONTROL + '/api/directory?kind=machines&limit=50', {
+    headers: { 'x-hub2-actor': JSON.stringify(actor) },
+  }));
+  if (!directory.ok) return directory;
+  const ids = ((await directory.json()) as { items: { id: string }[] }).items.map(m => m.id);
+  const now = Date.now();
+  const machines = await Promise.all(ids.map(async id => {
+    const reply = await env.MACHINES.get(env.MACHINES.idFromName(id)).fetch('https://routing.internal/_internal/routing', {
+      headers: { 'x-hub2-actor': JSON.stringify(actor) },
+    });
+    if (!reply.ok) return { machine_id: id, available: false, reason: 'routing_view_unavailable' };
+    const view = (await reply.json()) as { resources?: { observed_at: number } } & Record<string, unknown>;
+    const age = view.resources ? Math.round((now - view.resources.observed_at) / 1000) : null;
+    return { ...view, resources_age_seconds: age, resources_state: age === null ? 'unknown' : age > 300 ? 'stale' : 'fresh' };
+  }));
+  return json({ machines, observed_at: now });
+}
+
 async function machineProjection(
   request: Request,
   env: Hub2Env,
