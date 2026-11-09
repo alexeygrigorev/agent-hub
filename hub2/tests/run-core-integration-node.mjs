@@ -77,6 +77,7 @@ try{
   const replay=expect(await api('/api/intakes?project='+encodeURIComponent(project),'POST',first.body),200,'replay intake');assert.equal(replay.intake.id,created.intake.id);
   expect(await api('/api/intakes?project='+encodeURIComponent(project),'POST',{...first.body,text:'changed under same key'}),409,'intake digest conflict');
   expect(await api('/api/intakes?project='+encodeURIComponent(project),'POST',{...first.body,key:'empty-ac',acceptance_criteria:[]}),400,'empty AC');
+  const text=expect(await api('/api/intakes?project='+encodeURIComponent(project),'POST',{...first.body,key:'text-ac',acceptance_criteria:'- first criterion\n2. second criterion\n\n'}),201,'text AC block');assert.deepEqual(text.intake.acceptance_criteria,['first criterion','second criterion']);
  });
  await test('reserve/activate/offer/admission/started/finish through real edge',async()=>{
   assert(hostToken,'enrollment prerequisite failed');const before=await snapshots();
