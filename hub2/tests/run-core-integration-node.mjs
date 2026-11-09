@@ -189,6 +189,19 @@ try{
   const result=await api(`/api/sessions/${session.id}/admission`,'POST',{epoch:session.epoch,operation_id:session.attempt_operation_id},expiryToken);
   assert([404,409,410].includes(result.status),'expired offer became launch-authorized: HTTP'+result.status);
  });
+ await test('one machine holds several sessions at once, each with its own epoch',async()=>{
+  const target='synthetic-multi-machine';
+  const pair=expect(await api('/api/enrollments/pair','POST',{machine_id:target,alias:'Synthetic multi-session fixture'}),201,'multi pairing');
+  const multiToken=expect(await api('/api/enrollments/complete','POST',{code:pair.pairing_code},null),201,'multi enrollment').token;
+  expect(await api('/api/heartbeat','POST',{os:'synthetic',arch:'synthetic',labels:['fixture']},multiToken),200,'multi heartbeat');
+  const a=expect((await intake('intake-multi-a')).response,201,'multi intake a').intake;
+  const b=expect((await intake('intake-multi-b')).response,201,'multi intake b').intake;
+  const first=expect(await start(a.id,'start-multi-a',target,'shell'),201,'first multi start').session;
+  const second=expect(await start(b.id,'start-multi-b',target,'shell'),201,'second multi start on a busy machine').session;
+  assert.notEqual(first.id,second.id);assert.notEqual(first.epoch,second.epoch,'each session has its own epoch');
+  const offers=expect(await api('/api/offers','GET',undefined,multiToken),200,'multi offers').offers;
+  assert.equal(offers.length,2,'both sessions are offered to the one machine');
+ });
  await test('machine credential rotation fences its existing WebSocket',async()=>{
   const target='synthetic-rotation-machine';
   const pair=expect(await api('/api/enrollments/pair','POST',{machine_id:target,alias:'Synthetic rotation fixture'}),201,'rotation pairing');

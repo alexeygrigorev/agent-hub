@@ -5,7 +5,11 @@ import { sha256Hex } from './crypto';
 import { actorFrom, bodyObject, boundedString, error, hasScope, HttpError, json } from './http';
 import type { Actor, Hub2Env, JsonRecord } from './types';
 
+const ACTIVE_TABLE='CREATE TABLE IF NOT EXISTS machine_active(session_id TEXT PRIMARY KEY,machine_id TEXT NOT NULL) WITHOUT ROWID';
+// Sessions one machine runs at once. Each has its own epoch, command and mail fences, so only the slot count is shared.
+const DEFAULT_MACHINE_CAPACITY=4;
 const SCHEMA = [
+  ACTIVE_TABLE,
   'CREATE TABLE IF NOT EXISTS machine_capabilities(machine_id TEXT PRIMARY KEY,engines_json TEXT NOT NULL,capabilities_json TEXT NOT NULL,resources_json TEXT) WITHOUT ROWID',
   `CREATE TABLE machines (
     machine_id TEXT PRIMARY KEY, alias TEXT NOT NULL, os TEXT NOT NULL, arch TEXT NOT NULL,
@@ -91,7 +95,7 @@ export class MachineDO {
     this.db = new MeteredDb(ctx.storage.sql);
     this.sqlReceipts = new SqlReceiptMeter(this.db);
     this.env = wrapSqlNamespaces(env, this.sqlReceipts) as Hub2Env;
-    initializeSchema(ctx, this.db, 4, LATEST_SCHEMA, [[SCHEMA[0]],COMPACT_KEYS,['ALTER TABLE machine_capabilities ADD COLUMN resources_json TEXT']],()=>this.scheduleNext(),4);
+    initializeSchema(ctx, this.db, 5, LATEST_SCHEMA, [[SCHEMA[1]],COMPACT_KEYS,['ALTER TABLE machine_capabilities ADD COLUMN resources_json TEXT'],[ACTIVE_TABLE,'INSERT OR IGNORE INTO machine_active(session_id,machine_id) SELECT active_session_id,machine_id FROM machines WHERE active_session_id IS NOT NULL','UPDATE machines SET active_session_id=NULL']],()=>this.scheduleNext(),5);
     this.constructorMs = performance.now() - started;
   }
 
@@ -199,17 +203,26 @@ export class MachineDO {
     return json({ ok: true, machine_id: machineId, last_seen: now });
   }
 
+  private capacity():number{
+    const n=Number(this.env.HUB2_MACHINE_CAPACITY);
+    return Number.isInteger(n)&&n>=1&&n<=32?n:DEFAULT_MACHINE_CAPACITY;
+  }
+  private occupied(machineId:string):number{
+    return this.db.one<{n:number}>('SELECT COUNT(*) AS n FROM machine_active WHERE machine_id=?',machineId)?.n??0;
+  }
+
   private async routingView():Promise<Response>{
     const machine=this.db.one<MachineRow>('SELECT * FROM machines LIMIT 1');
     if(!machine)return json({available:false,reason:'machine_not_enrolled'});
+    const capacity=this.capacity(),occupied=this.occupied(machine.machine_id);
     let connected=false;
     for(const socket of this.machineSockets(`${machine.machine_id}`))if(socket.readyState===1&&!this.stopOnly(socket)&&await this.authorizedAttachment(socket,'machine:offer')){connected=true;break;}
     const capabilities=this.db.one<{engines_json:string;capabilities_json:string;resources_json:string|null}>('SELECT engines_json,capabilities_json,resources_json FROM machine_capabilities WHERE machine_id=?',machine.machine_id);
     const resources=capabilities?.resources_json?JSON.parse(capabilities.resources_json) as {mem_available_mb:number;observed_at:number}:undefined;
-    return json({machine_id:machine.machine_id,available:connected&&!machine.active_session_id,connected,
-      occupied:machine.active_session_id?1:0,capacity:1,os:machine.os,arch:machine.arch,labels:JSON.parse(machine.labels_json),
+    return json({machine_id:machine.machine_id,available:connected&&occupied<capacity,connected,
+      occupied,capacity,os:machine.os,arch:machine.arch,labels:JSON.parse(machine.labels_json),
       engines:capabilities?JSON.parse(capabilities.engines_json):[],capabilities:capabilities?JSON.parse(capabilities.capabilities_json):[],
-      ...(resources?{resources}:{}) ,reason:!connected?'machine_offline':machine.active_session_id?'machine_capacity':null});
+      ...(resources?{resources}:{}) ,reason:!connected?'machine_offline':occupied>=capacity?'machine_capacity':null});
   }
 
   private offers(request: Request): Response {
@@ -262,11 +275,10 @@ export class MachineDO {
     try {
       this.db.transaction(this.ctx, () => {
         const fresh=this.db.one<MachineRow>('SELECT * FROM machines WHERE machine_id=?',body.machine_id);
-        if (!fresh || fresh.active_session_id) throw new HttpError('machine_capacity',409);
+        if (!fresh || this.occupied(String(body.machine_id))>=this.capacity()) throw new HttpError('machine_capacity',409);
         epoch=fresh.next_epoch+1;
-        this.db.run('UPDATE machines SET next_epoch=?, active_session_id=? WHERE machine_id=? AND active_session_id IS NULL', epoch, body.session_id, body.machine_id);
-        const current = this.db.one<MachineRow>('SELECT * FROM machines WHERE machine_id=?', body.machine_id);
-        if (!current || current.active_session_id !== body.session_id || current.next_epoch !== epoch) throw new HttpError('machine_capacity', 409);
+        this.db.run('UPDATE machines SET next_epoch=? WHERE machine_id=?', epoch, body.machine_id);
+        this.db.run('INSERT OR REPLACE INTO machine_active(session_id,machine_id) VALUES(?,?)', String(body.session_id), String(body.machine_id));
         if (retrying) {
           this.db.run("UPDATE machine_session_operations SET state='expired' WHERE operation_id=? AND session_id=? AND epoch=?",
             prior!.operation_id, prior!.id, prior!.epoch);
@@ -580,7 +592,7 @@ export class MachineDO {
     this.db.transaction(this.ctx, () => {
       this.db.run('UPDATE sessions SET state=?, evidence_json=?, evidence_digest=?, exit_code=?, updated_at=?,native_id=? WHERE id=? AND state=?',
         state, JSON.stringify(payload), evidenceDigest, Number(body.exit_code), now, body.native_id,row.id, row.state);
-      this.db.run('UPDATE machines SET active_session_id=NULL WHERE machine_id=? AND active_session_id=?', machineId, sessionId);
+      this.db.run('DELETE FROM machine_active WHERE session_id=?', sessionId);
       this.insertOutbox(`finish:${row.operation_id}`, 'finish', row.operation_id, row.project_id, payload, now);
     });
     await this.ensureDeadline(now+30_000);
@@ -615,7 +627,7 @@ export class MachineDO {
           const now=Date.now();
           this.db.transaction(this.ctx, () => {
             this.db.run("UPDATE sessions SET state='expired', offer_expires_at=NULL, updated_at=? WHERE id=? AND state='offered'", now, session.id);
-            this.db.run('UPDATE machines SET active_session_id=NULL WHERE active_session_id=?', session.id);
+            this.db.run('DELETE FROM machine_active WHERE session_id=?', session.id);
             this.db.run("UPDATE machine_session_operations SET state='expired' WHERE operation_id=? AND session_id=? AND epoch=? AND state='current'",
               session.operation_id, session.id, session.epoch);
             this.insertOutbox(`requeue:${session.operation_id}`, 'requeue', session.operation_id, session.project_id,
@@ -748,7 +760,7 @@ export class MachineDO {
 
   private async sendPendingCommands(socket:WebSocket,machineId:string,env:Hub2Env=this.env):Promise<void>{
     const stop=this.stopOnly(socket);
-    const command=this.db.one<CommandRow>("SELECT * FROM session_commands WHERE machine_id=? AND session_id=(SELECT active_session_id FROM machines WHERE machine_id=?) AND state='pending' "+(stop?"AND kind='stop' ":"")+"ORDER BY created_at,id LIMIT 1",machineId,machineId);
+    const command=this.db.one<CommandRow>("SELECT * FROM session_commands WHERE machine_id=? AND session_id IN (SELECT session_id FROM machine_active WHERE machine_id=?) AND state='pending' "+(stop?"AND kind='stop' ":"")+"ORDER BY created_at,id LIMIT 1",machineId,machineId);
     if(!command)return;
     if(!await this.authorizedAttachment(socket,'machine:offer',true,env))return;
     try{socket.send(JSON.stringify({type:'session.command',command:this.commandView(command)}));}catch{}
@@ -819,7 +831,7 @@ export class MachineDO {
   private async sendPendingMail(socket: WebSocket, machine: string,env:Hub2Env=this.env): Promise<void> {
     if(this.stopOnly(socket))return;
     if (!await this.authorizedAttachment(socket,'message:delivery',false,env)) return;
-    const row = this.db.one<NativeMail>("SELECT * FROM native_mail WHERE machine_id=? AND session_id=(SELECT active_session_id FROM machines WHERE machine_id=?) AND state='pending' ORDER BY created_at,message_id,epoch LIMIT 1",machine,machine);
+    const row = this.db.one<NativeMail>("SELECT * FROM native_mail WHERE machine_id=? AND session_id IN (SELECT session_id FROM machine_active WHERE machine_id=?) AND state='pending' ORDER BY created_at,message_id,epoch LIMIT 1",machine,machine);
     if (row) socket.send(JSON.stringify({type:'mailbox.deliver',message:{id:row.message_id,epoch:row.epoch,
       recipient:row.recipient,session_id:row.session_id,operation_id:row.operation_id,body:row.body}}));
   }
