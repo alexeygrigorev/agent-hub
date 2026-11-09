@@ -202,6 +202,27 @@ try{
   const listing=expect(await api(`/api/sessions/${session.id}/commands`),200,'command listing');
   assert(Array.isArray(listing.commands),'listing has commands[]');
  });
+ await test('intake events/context/audit/close work on the Hub1-shaped task paths',async()=>{
+  const created=expect((await intake('intake-compat')).response,201,'compat intake').intake;
+  const base=`/api/intake/tasks/${created.id}`;
+  const q=`?project=${encodeURIComponent(project)}`;
+  const note=expect(await api(base+'/events'+q,'POST',{key:'compat-note-1',note:'first note'}),201,'append note');
+  assert.equal(note.appended,true);
+  const replay=expect(await api(base+'/events'+q,'POST',{key:'compat-note-1',note:'first note'}),200,'append replay');
+  assert.equal(replay.duplicate,true);
+  expect(await api(base+'/events'+q,'POST',{key:'compat-evt-1',event:{kind:'note',text:'wrapped note'}}),201,'append event-wrapped note');
+  expect(await api(base+'/events'+q,'POST',{key:'compat-evt-2',event:{kind:'commit',sha:'abcdef1'}}),201,'append structured event');
+  const context=expect(await api(base+'/context'+q),200,'context');
+  assert.equal(context.intake.id,created.id);assert(context.events.length>=4,'context carries recent events');
+  const audit=expect(await api(base+'/audit'+q),200,'audit');
+  assert(audit.events.some(e=>e.kind==='worker_append'),'audit lists appended events');
+  const shown=expect(await api(base+q),200,'show with version');
+  assert(Number.isSafeInteger(shown.task.control.version),'show exposes a compare-and-set version');
+  const stale=await api(base+q,'POST',{key:'compat-close-stale',status:'done',expected_version:shown.task.control.version-1});
+  assert.equal(stale.status,409,'stale version is refused');
+  const closed=expect(await api(base+q,'POST',{key:'compat-close-1',status:'done',expected_version:shown.task.control.version,reason:'verified'}),200,'close');
+  assert.equal(closed.intake.status,'archived');
+ });
  await test('machine credential rotation fences its existing WebSocket',async()=>{
   const target='synthetic-rotation-machine';
   const pair=expect(await api('/api/enrollments/pair','POST',{machine_id:target,alias:'Synthetic rotation fixture'}),201,'rotation pairing');
