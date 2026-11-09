@@ -30,7 +30,8 @@ export class MachineFixture extends MachineDO{
  async fetch(request:Request):Promise<Response>{
   if(new URL(request.url).pathname==='/_fixture/seed-running'){
    const now=Date.now(),db=(this as any).db;
-   db.run('INSERT INTO machines(machine_id,alias,os,arch,labels_json,last_seen,next_epoch,active_session_id) VALUES(?,?,?,?,?,?,?,?)','h1','fixture','linux','x64','[]',now,1,'session-test');
+   db.run('INSERT INTO machines(machine_id,alias,os,arch,labels_json,last_seen,next_epoch) VALUES(?,?,?,?,?,?,?)','h1','fixture','linux','x64','[]',now,1);
+   db.run('INSERT INTO machine_active(session_id,machine_id) VALUES(?,?)','session-test','h1');
    db.run('INSERT INTO sessions(id,operation_id,request_digest,dispatch_id,attempt,account_id,project_id,intake_id,machine_id,epoch,title,acceptance_criteria_json,launch_json,state,native_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)','session-test','synthetic-operation','synthetic-digest','synthetic-dispatch',1,null,'synthetic-project','synthetic-intake','h1',1,'synthetic precondition','["no actual native process"]','{}','running','synthetic-native-id',now,now);
    return Response.json({synthetic_precondition:true});
   }

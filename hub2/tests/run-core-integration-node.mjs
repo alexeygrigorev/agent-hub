@@ -232,6 +232,14 @@ try{
   assert(completedIntakeId,'completed lifecycle prerequisite did not pass');const restored=expect(await api(`/api/intakes/${completedIntakeId}?project=${encodeURIComponent(project)}`),200,'restored terminal intake');assert.equal(restored.intake.status,'completed-awaiting-review');assert.equal(restored.intake.final_evidence.exit_code,0);
   const snap=await snapshots();for(const v of Object.values(snap))assert.equal(v.counts.measurement_valid,true);measurements.restart=snap;
  });
+ await test('one machine hosts several sessions at once (account capacity is the next limit)',async()=>{
+  liveSocket=await socket();
+  const one=expect(await start((await intake('intake-multi-1')).response.data.intake.id,'start-multi-1'),201,'first concurrent start').session;
+  const two=expect(await start((await intake('intake-multi-2')).response.data.intake.id,'start-multi-2'),201,'second concurrent start on the same machine').session;
+  assert.notEqual(one.id,two.id);assert.equal(one.machine_id||machine,two.machine_id||machine);
+  const third=await start((await intake('intake-multi-3')).response.data.intake.id,'start-multi-3');
+  assert.equal(third.status,409);assert.notEqual(third.data.reason,'machine_capacity','a third start is refused by account capacity 2, not by a one-session machine');
+ });
 }finally{
  if(liveSocket)liveSocket.socket.close();await rt.dispose();
  const sourceAfter=await hashes();const sourceStable=JSON.stringify(sourceBefore)===JSON.stringify(sourceAfter);
