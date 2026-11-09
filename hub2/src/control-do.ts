@@ -5,6 +5,7 @@ import { MeteredDb, initializeSchema } from './db';
 import { SqlReceiptMeter, SQL_PROBE_HEADER, wrapSqlNamespaces } from './sql-receipt';
 import { randomToken, safeEqual, sha256Hex } from './crypto';
 import { actorFrom, bodyObject, boundedString, boundedText, error, hasScope, HttpError, json } from './http';
+import { modelPolicyCandidateViolation, type ModelPolicyRoute } from './model-policy';
 import type { Actor, Hub2Env, JsonRecord } from './types';
 
 type CredentialActor=Actor&{family_id?:string;client_id?:string};
@@ -564,6 +565,8 @@ export class ControlDO {
       if(Object.keys(c).some(k=>!['id','engine','model','effort','account_id','weight','capabilities','enabled'].includes(k)))return error('unknown_model_candidate_field',400);
       if(!['id','engine','model','account_id'].every(k=>boundedString(c[k],120)&&/^[A-Za-z0-9_.:/-]+$/.test(String(c[k])))||typeof c.weight!=='number'||!Number.isFinite(c.weight)||c.weight<=0||c.weight>1000000||typeof c.enabled!=='boolean'||!Array.isArray(c.capabilities)||c.capabilities.length>32||!c.capabilities.every(v=>boundedString(v,80))||(c.effort!==undefined&&!['low','medium','max'].includes(String(c.effort))))return error('invalid_model_candidate',400);
       if(['shared-zai','zcodex'].includes(String(c.account_id))||['zcodex','goz','zai'].includes(String(c.engine))&&c.account_id!=='zai-central')return error('zai_central_account_required',400);
+      const policyViolation=modelPolicyCandidateViolation(c as unknown as ModelPolicyRoute);
+      if(policyViolation)return error(policyViolation,400);
       if(ids.has(String(c.id)))return error('duplicate_model_candidate',400);ids.add(String(c.id));candidates.push({...c,capabilities:[...new Set(c.capabilities)].sort()});
     }
     const encoded=JSON.stringify(candidates),digest=await sha256Hex(encoded);
