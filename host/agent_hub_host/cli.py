@@ -967,8 +967,9 @@ def main():
                 print(tbm_cmd.render_text(args.tbm, data))
             else:
                 print(quota_cmd.render_text(data))
-        except Exception:
-            print('Hub quota operation failed; check authentication, filters and quota grants.', file=sys.stderr)
+        except Exception as exc:
+            from . import session_control
+            print('Hub quota operation failed: ' + session_control.diagnostic(exc) + '; check authentication, filters and quota grants.', file=sys.stderr)
             sys.exit(1)
     elif args.cmd == "metrics":
         from . import metrics as metrics_mod
