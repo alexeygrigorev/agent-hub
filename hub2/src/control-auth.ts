@@ -333,6 +333,34 @@ export class ControlAuth {
       noStore,
     );
   }
+  private escapeHtml(v: string): string {
+    return v.replace(
+      /[&<>"']/g,
+      (c) =>
+        ({
+          '&': '&amp;',
+          '<': '&lt;',
+          '>': '&gt;',
+          '"': '&quot;',
+          "'": '&#39;',
+        })[c]!,
+    );
+  }
+  private deviceFormError(message: string, status: number): Response {
+    return new Response(
+      '<!doctype html><html lang="en"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Approval failed</title><main><h1>Approval failed</h1><p>' +
+        this.escapeHtml(message) +
+        '</p><p>No access was granted. Run <code>hub auth login</code> for a fresh code and approve only the code shown in your terminal.</p></main></html>',
+      {
+        status,
+        headers: {
+          ...noStore,
+          'Content-Type': 'text/html; charset=utf-8',
+          'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'",
+        },
+      },
+    );
+  }
   private async devicePage(r: Request): Promise<Response> {
     const auth = await this.cookie(r);
     if (!auth)
@@ -356,7 +384,12 @@ export class ControlAuth {
             "'": '&#39;',
           })[c]!,
       );
-    const code = new URL(r.url).searchParams.get('user_code') || '';
+    const params = new URL(r.url).searchParams;
+    // Prefill from the current user_code link; fall back to the legacy code
+    // parameter so older CLI output and bookmarks still populate the field.
+    // An unknown or missing code stays visible as an empty field and every
+    // approve path below fails loudly instead of authorizing anything.
+    const code = params.get('user_code') || params.get('code') || '';
     return new Response(
       '<!doctype html><html lang="en"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Authorize Hub CLI</title><main><h1>Authorize Hub CLI</h1><p>Signed in as ' +
         escape(auth.row.principal_email) +
@@ -380,6 +413,12 @@ export class ControlAuth {
     const form = r.headers.get('Content-Type')?.startsWith('application/x-www-form-urlencoded');
     if (form) b = Object.fromEntries(new URLSearchParams(await boundedText(r, 4096)));
     else b = await bodyObject(r, 4096);
+    // Browser form posts must see a visible failure page, never a bare JSON
+    // error and never a false "authorized" success.
+    const fail = (code: string, status: number, message: string): Response => {
+      if (form) return this.deviceFormError(message, status);
+      return authError(code, status);
+    };
     const auth = await this.cookie(r, false);
     if (
       !auth ||
@@ -387,12 +426,22 @@ export class ControlAuth {
       (form ? b.csrf_token : r.headers.get('x-csrf-token')) !== auth.row.csrf_token
     )
       return authError('csrf_or_session_refused', 403);
-    if (typeof b.user_code !== 'string' || b.user_code.length > 40)
-      return authError('invalid_user_code');
-    const hash = await sha256Hex(b.user_code.toUpperCase()),
+    if (b.user_code === undefined || b.user_code === null || typeof b.user_code !== 'string')
+      return fail('missing_user_code', 400, 'No device code was submitted. Enter the code shown in your terminal.');
+    if (b.user_code.length > 40)
+      return fail('invalid_user_code', 400, 'That device code is not valid. Enter the code shown in your terminal.');
+    // Pasted codes may carry surrounding whitespace; matching stays exact
+    // after trimming. An empty code is rejected loudly instead of consuming
+    // or authorizing anything.
+    const normalized = b.user_code.trim().toUpperCase();
+    if (!normalized)
+      return fail('invalid_user_code', 400, 'The device code is empty. Enter the code shown in your terminal.');
+    const hash = await sha256Hex(normalized),
       row = this.db.one<any>('SELECT * FROM auth_devices WHERE user_hash=?', hash);
-    if (!row || row.expires_at <= Date.now() || row.state !== 'pending')
-      return authError('expired_or_used_code', 409);
+    if (!row)
+      return fail('unknown_or_expired_code', 404, 'This code was not found. It may be mistyped, expired, or already used. Run hub auth login for a new code.');
+    if (row.expires_at <= Date.now() || row.state !== 'pending')
+      return fail('expired_or_used_code', 409, 'This code already expired or was already used. Run hub auth login for a new code.');
     this.db.run(
       "UPDATE auth_devices SET state='approved',principal_id=?,principal_email=? WHERE user_hash=? AND state='pending'",
       auth.actor.id,

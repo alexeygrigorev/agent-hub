@@ -58,6 +58,26 @@ base = fixture.origin;
   assert.equal((await call('/api/device/approve','POST',{user_code:d.user_code},{Cookie:sessionCookie})).status,403);
   assert.equal((await call('/api/device/approve','POST',{user_code:d.user_code},{Cookie:sessionCookie,'x-csrf-token':identity.csrf_token,Origin:'https://evil.invalid'})).status,403);
   assert.equal((await call('/api/device/approve','POST',{user_code:d.user_code},{Cookie:sessionCookie,'x-csrf-token':identity.csrf_token,Origin:'https://hub.fixture'})).status,200);
+  await test('device page prefills the code and rejects empty or unknown approvals loudly',async()=>{
+   const fresh=await call('/api/device/code','POST',{client_id:'fixture-prefill'});assert.equal(fresh.status,200);const f=await fresh.json();
+   const page=await call('/device?user_code='+encodeURIComponent(f.user_code),'GET',undefined,{Cookie:sessionCookie});assert.equal(page.status,200);
+   const html=await page.text();assert(html.includes('value="'+f.user_code+'"'),'device page must prefill user_code from the URL');
+   const legacy=await call('/device?code='+encodeURIComponent(f.user_code),'GET',undefined,{Cookie:sessionCookie});assert.equal(legacy.status,200);
+   assert((await legacy.text()).includes('value="'+f.user_code+'"'),'device page must accept the legacy code parameter');
+   const bare=await call('/device','GET',undefined,{Cookie:sessionCookie});assert.equal(bare.status,200);
+   assert(!(await bare.text()).includes('value="'+f.user_code+'"'),'device page without a code must not prefill another code');
+   const bad=async(body)=>{const r=await call('/api/device/approve','POST',body,{Cookie:sessionCookie,'x-csrf-token':identity.csrf_token,Origin:'https://hub.fixture'});return[r.status,await r.json()];};
+   assert.deepEqual(await bad({}),[400,{error:'missing_user_code'}]);
+   assert.deepEqual(await bad({user_code:''}),[400,{error:'invalid_user_code'}]);
+   assert.deepEqual(await bad({user_code:'   '}),[400,{error:'invalid_user_code'}]);
+   assert.deepEqual(await bad({user_code:'NOT-A-REAL-CODE'}),[404,{error:'unknown_or_expired_code'}]);
+   const form=async(params)=>fetch(base+'/api/device/approve',{method:'POST',redirect:'manual',headers:{Cookie:sessionCookie,Origin:'https://hub.fixture','Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({csrf_token:identity.csrf_token,...params}).toString()});
+   for(const params of [{}, {user_code:''}, {user_code:'NOT-A-REAL-CODE'}]){
+    const r=await form(params);assert([400,404].includes(r.status),'form approve failure must be loud, got '+r.status);
+    const text=await r.text();assert.match(r.headers.get('content-type'),/text\/html/);assert(!text.includes('CLI authorized'),'form approve failure must never claim authorized');
+   }
+   assert.equal((await call('/api/device/approve','POST',{user_code:'  '+f.user_code+'  '},{Cookie:sessionCookie,'x-csrf-token':identity.csrf_token,Origin:'https://hub.fixture'})).status,200);
+  });
   const issued=await call('/api/device/token','POST',{device_code:d.device_code});assert.equal(issued.status,200);const tokens=await issued.json();assert.equal((await call('/api/repos','GET',undefined,{Authorization:'Bearer '+tokens.access_token})).status,200);
   const bearer={Authorization:'Bearer '+tokens.access_token};
   assert.equal((await call('/api/fleet','GET',undefined,bearer)).status,200);assert.equal((await call('/api/sessions','GET',undefined,bearer)).status,200);
