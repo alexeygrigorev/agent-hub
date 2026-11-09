@@ -525,3 +525,18 @@ class HostTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RetiredLookupRowTest(unittest.TestCase):
+    def test_lookup_passes_plain_mapping_to_retired(self):
+        import sqlite3
+        from types import SimpleNamespace
+        from agent_hub_host.agent import Bridge
+        conn = sqlite3.connect(':memory:'); conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT 'tag-1' AS tag, '/ws' AS workspace").fetchone()
+        seen = []
+        bridge = SimpleNamespace(
+            native=lambda *a, **k: SimpleNamespace(returncode=1, stdout=''),
+            launcher=SimpleNamespace(retired=lambda selector, expected: seen.append(expected.get('tag'))))
+        Bridge.lookup(bridge, 'sel', row)
+        self.assertEqual(seen, ['tag-1'])
