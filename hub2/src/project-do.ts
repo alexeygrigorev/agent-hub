@@ -116,12 +116,16 @@ export class ProjectDO {
       }
       if (url.pathname === '/api/intakes' && request.method === 'POST') return await this.createIntake(request);
       if (url.pathname === '/api/intakes' && request.method === 'GET') return this.listIntakes(request);
-      const match = url.pathname.match(/^\/api\/intakes\/([^/]+)(?:\/(start|history|append))?$/);
+      const match = url.pathname.match(/^\/api\/intakes\/([^/]+)(?:\/(start|history|append|events|context|audit))?$/);
       if (!match) return error('not_found', 404);
       const intakeId = decodeURIComponent(match[1]);
       if (match[2] === 'start' && request.method === 'POST') return await this.startIntake(request, intakeId);
       if (match[2] === 'history' && request.method === 'GET') return this.history(request, intakeId);
       if(match[2]==='append'&&request.method==='POST')return await this.appendIntake(request,intakeId);
+      if(match[2]==='events'&&request.method==='POST')return await this.eventsCompat(request,intakeId);
+      if(match[2]==='context'&&request.method==='GET')return this.contextView(request,intakeId);
+      if(match[2]==='audit'&&request.method==='GET')return this.history(request,intakeId);
+      if(!match[2]&&request.method==='POST')return await this.updateCompat(request,intakeId);
       if (!match[2] && request.method === 'GET') return this.showIntake(request, intakeId);
       if(!match[2]&&request.method==='PATCH')return await this.editIntake(request,intakeId);
       return error('not_found', 404);
@@ -221,7 +225,54 @@ export class ProjectDO {
     const row = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id = ?', intakeId);
     if (!row) return error('intake_not_found', 404);
     if (!this.canReadIntake(actor, row)) return error('forbidden', 403);
-    return json({ intake: this.viewIntake(row) }, status);
+    return json({ intake: this.viewIntake(row), task: this.taskCompat(row) }, status);
+  }
+
+  /** Version handle for compare-and-set callers (CLI `intake close/update`): the row's updated_at. */
+  private taskCompat(row: IntakeRow): JsonRecord {
+    return { id: row.id, control: { version: row.updated_at } };
+  }
+
+  /** `hub intake context`: the intake plus its most recent events, bounded. */
+  private contextView(request: Request, intakeId: string): Response {
+    const actor = actorFrom(request);
+    const row = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id = ?', intakeId);
+    if (!row) return error('intake_not_found', 404);
+    if (!this.canReadIntake(actor, row)) return error('forbidden', 403);
+    const rows = this.db.all<IntakeEventRow>('SELECT seq, actor_id, kind, body_json, at FROM intake_events WHERE task_id = ? ORDER BY seq DESC LIMIT 50', intakeId).reverse();
+    return json({ intake: this.viewIntake(row), task: this.taskCompat(row),
+      events: rows.map(r => ({ seq: r.seq, actor_id: r.actor_id, kind: r.kind, at: r.at, body: this.parse(r.body_json) })) });
+  }
+
+  /** Hub1-shaped `POST /events` ({key,note}|{key,event}) mapped onto Hub2 append (note text or evidence object). */
+  private async eventsCompat(request: Request, intakeId: string): Promise<Response> {
+    const body = await bodyObject(request.clone(), 16384);
+    const mapped: JsonRecord = { key: body.key };
+    const event = body.event as JsonRecord | undefined;
+    if (typeof body.note === 'string') mapped.note = body.note;
+    else if (event && typeof event === 'object' && !Array.isArray(event)) {
+      const text = typeof event.text === 'string' ? event.text : typeof event.note === 'string' ? event.note : undefined;
+      if (event.kind === 'note' && text && Object.keys(event).every(k => ['kind', 'text', 'note'].includes(k))) mapped.note = text;
+      else { mapped.evidence = event; }
+    }
+    return await this.appendIntake(new Request(request.url, { method: 'POST', headers: request.headers, body: JSON.stringify(mapped) }), intakeId);
+  }
+
+  /** Hub1-shaped `POST /tasks/:id` ({key,status,expected_version,reason,...}) mapped onto Hub2 edit; `done` closes. */
+  private async updateCompat(request: Request, intakeId: string): Promise<Response> {
+    const body = await bodyObject(request.clone(), 16384);
+    const row = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id = ?', intakeId);
+    if (!row) return error('intake_not_found', 404);
+    const mapped: JsonRecord = { key: body.key };
+    if (typeof body.expected_version === 'number') mapped.expected_updated_at = body.expected_version;
+    for (const field of ['title', 'priority', 'acceptance_criteria']) if (body[field] !== undefined) mapped[field] = body[field];
+    if (body.status !== undefined) {
+      mapped.status = body.status === 'done' || body.status === 'closed'
+        ? (row.status === 'completed-awaiting-review' ? 'accepted' : 'archived') : body.status;
+    }
+    const why = [body.outcome, body.reason].filter(v => typeof v === 'string' && v).join(': ');
+    if (why) mapped.note = why.slice(0, 4000);
+    return await this.editIntake(new Request(request.url, { method: 'PATCH', headers: request.headers, body: JSON.stringify(mapped) }), intakeId);
   }
 
   private history(request: Request, intakeId: string): Response {

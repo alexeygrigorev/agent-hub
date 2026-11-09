@@ -136,9 +136,9 @@ const router = {
         path === '/api/schedules' ||
         /^\/api\/schedules\/[^/]+(?:\/(?:pause|resume|cancel|occurrences))?$/.test(path) ||
         path === '/api/intakes' ||
-        /^\/api\/intakes\/[^/]+(?:\/(?:start|history|append))?$/.test(path) ||
+        /^\/api\/intakes\/[^/]+(?:\/(?:start|history|append|events|context|audit))?$/.test(path) ||
         path === '/api/intake/tasks' ||
-        /^\/api\/intake\/tasks\/[^/]+(?:\/(?:start|history|append))?$/.test(path);
+        /^\/api\/intake\/tasks\/[^/]+(?:\/(?:start|history|append|events|context|audit))?$/.test(path);
       if (projectPath) {
         const url = requestUrl(request);
         let requested = url.searchParams.get('project');
