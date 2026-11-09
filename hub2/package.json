@@ -23,6 +23,6 @@
     "test:oncall-alerts": "node --experimental-transform-types --test tests/oncall-alerts.test.ts",
     "test:core": "node --experimental-transform-types tests/run-core-integration-node.mjs",
     "test:accounts-mail-node": "node --experimental-transform-types tests/run-accounts-mail-node.mjs",
-    "test:normal-day-auth": "node --experimental-transform-types tests/run-normal-day-auth-node.mjs"
+    "test:normal-day-auth": "node --experimental-transform-types tests/run-normal-day-auth-node.mjs && node --experimental-transform-types tests/run-cli-auth-routes.mjs"
   }
 }

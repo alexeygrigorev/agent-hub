@@ -47,6 +47,9 @@ install -m 644 "$DEPLOY_DIR/Caddyfile" /etc/caddy/Caddyfile
 echo "== state directories"
 install -d -m 750 -o alexey -g alexey "$DB_DIR" "$REPO/.local/tmp"
 
+echo "== public CLI artifacts"
+(cd "$REPO" && python3 scripts/build-hub-cli.py --out-dir hub2/public/cli)
+
 echo "== secrets (.dev.vars, generated on this VM, never leave it)"
 if [[ ! -f "$REPO/.dev.vars" ]]; then
   CRED_KEY="$(openssl rand -hex 32)"

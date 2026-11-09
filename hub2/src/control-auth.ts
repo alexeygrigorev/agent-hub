@@ -109,6 +109,31 @@ export class ControlAuth {
     const path = new URL(r.url).pathname;
     if (!path.startsWith('/_auth/')) return;
     try {
+      if (path === '/_auth/me' && r.method === 'GET') {
+        // Resolve the credential itself so profile data never comes from caller
+        // headers or a stale actor projection. A supplied bearer never falls
+        // back to a browser cookie.
+        let auth: { row: Credential; actor: Actor } | undefined;
+        if (r.headers.has('Authorization')) {
+          const token = r.headers.get('Authorization')?.match(/^Bearer ([^\s]{32,256})$/)?.[1];
+          const row = token && this.db.one<Credential>(
+            'SELECT * FROM credentials WHERE token_hash=?', await sha256Hex(token),
+          );
+          const actor = row && verifyKnownCredential(row, this.env);
+          if (row && actor) auth = { row, actor };
+        } else auth = await this.cookie(r);
+        if (!auth) return authError('invalid_credentials', 401);
+        if (auth.actor.kind !== 'operator') return authError('human_required', 403);
+        return json({
+          actor: auth.actor.id,
+          kind: 'human',
+          sub: auth.actor.id.slice('human:'.length),
+          email: auth.row.principal_email,
+          label: auth.actor.client_id,
+          scopes: auth.actor.scopes,
+          isAdmin: hasScope(auth.actor, 'operator:admin'),
+        }, 200, noStore);
+      }
       if (path === '/_auth/cookie') {
         const auth = await this.cookie(r);
         return auth ? json({ actor: auth.actor }) : authError('invalid_session', 401);
