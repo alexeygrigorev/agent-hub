@@ -962,6 +962,8 @@ def main():
             data = quota_cmd.execute(args)
             if args.json:
                 print(json.dumps(data, indent=2))
+            elif getattr(args, "tbm", None) == "publish":
+                print(json.dumps(data, indent=2))
             elif getattr(args, "tbm", None) in ("pacing", "banked", "kill-switch"):
                 from . import tbm as tbm_cmd
                 print(tbm_cmd.render_text(args.tbm, data))

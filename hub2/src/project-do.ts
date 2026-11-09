@@ -155,6 +155,7 @@ export class ProjectDO {
     const project = new URL(request.url).searchParams.get('project') || '';
     if (!project || project.length > 180 || !this.canProject(actor, project, 'intake:write')) return error('forbidden', 403);
     const body = await bodyObject(request, 16_384);
+    normalizeCriteria(body);
     if (typeof body.title !== 'string' || body.title.trim().length < 1 || body.title.length > 240) return error('invalid_title', 400);
     if (typeof body.text !== 'string' || body.text.trim().length < 1 || new TextEncoder().encode(body.text).byteLength > 8192) return error('invalid_text', 400);
     if (!Array.isArray(body.acceptance_criteria) || body.acceptance_criteria.length < 1 || body.acceptance_criteria.length > 32
@@ -255,7 +256,7 @@ export class ProjectDO {
   }
 
   private async editIntake(request:Request,intakeId:string):Promise<Response>{
-    const actor=actorFrom(request),body=await bodyObject(request,16384),key=this.idempotencyKey(request,body);
+    const actor=actorFrom(request),body=await bodyObject(request,16384),key=this.idempotencyKey(request,body);normalizeCriteria(body);
     if(!key)return error('idempotency_key_required',400);
     const allowed=['key','expected_updated_at','title','text','acceptance_criteria','status','priority','note'];
     if(!['title','text','acceptance_criteria','status','priority','note'].some(k=>body[k]!==undefined)||Object.keys(body).some(k=>!allowed.includes(k)))return error('unknown_intake_field',400);
@@ -846,4 +847,11 @@ export class ProjectDO {
   }
 
 
+}
+
+/** CLI/MCP clients send criteria as one text block; store one criterion per non-empty line. */
+function normalizeCriteria(body: Record<string, unknown>): void {
+  if (typeof body.acceptance_criteria !== 'string') return;
+  body.acceptance_criteria = body.acceptance_criteria
+    .split('\n').map(line => line.replace(/^\s*(?:[-*]|\d+[.)])\s+/, '').trim()).filter(Boolean);
 }
