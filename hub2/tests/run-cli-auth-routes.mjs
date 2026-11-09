@@ -109,7 +109,7 @@ try {
     [{ key: undefined }, 400, 'idempotency_key_required'],
     [{ workspace: undefined }, 400, 'workspace_required'],
     [{ brief: undefined }, 400, 'brief_required'],
-    [{ repo: 'owner/missing' }, 404, 'project_not_found_or_forbidden'],
+    [{ repo: 'not-a-repo-name' }, 404, 'project_not_found_or_forbidden'],
   ]) {
     const refused = await start({ ...base, ...patch });
     assert.equal(refused.status, status); assert.equal((await refused.json()).error, code);
@@ -123,6 +123,10 @@ try {
   if (byTaskBody.intake_id) assert.equal(byTaskBody.intake_id, intakeId);
   const missingTask = await start({ key: 'start-by-task-02', workspace: '/tmp/ws', mode: 'headless', intake_task_id: 'deadbeef00' });
   assert.equal(missingTask.status, 404);
+  // An admin's first start for an unregistered owner/name registers the repo instead of refusing.
+  assert.equal((await call('/api/repos/owner%2Fzzz-new')).status, 404);
+  await start({ ...base, key: 'start-autoreg-001', repo: 'owner/zzz-new' });
+  assert.equal((await call('/api/repos/owner%2Fzzz-new')).status, 200);
   assert.equal((await fixture.fetch('/api/sessions', { method: 'POST', body: '{}' })).status, 401);
   // No machine is connected in this fixture: placement must refuse with a typed 4xx/5xx, never 501 or a hang.
   const unplaced = await start(base); const unplacedBody = await unplaced.json();
