@@ -1,5 +1,5 @@
 import { mcp } from './mcp';
-import { publicAuthentication, cookieActor } from './auth';
+import { publicAuthentication, cookieActor, noStore } from './auth';
 import { safeEqual } from './crypto';
 import { boundedText, error, HttpError, json } from './http';
 import type { Actor, Hub2Env, JsonRecord } from './types';
@@ -18,9 +18,10 @@ const router = {
     try {
       const path = publicPath(request.url);
       if (!path) return error('internal_route_forbidden', 404);
-      // The dashboard is the only public route. Its bearer token is held in
-      // memory after load; do not put static HTML behind API authentication.
-      if (env.ASSETS && request.method === 'GET' && path === '/')
+      // Install/update clients have no credential yet. Only the published CLI
+      // artifacts and dashboard are public; API routes still authenticate.
+      const cliAsset = /^\/cli\/(?:manifest\.json|hub\.pyz(?:\.sha256)?|(?:host-)?install\.(?:sh|ps1))$/.test(path);
+      if (env.ASSETS && ['GET', 'HEAD'].includes(request.method) && (path === '/' || cliAsset))
         return secureStatic(await env.ASSETS.fetch(request));
       const authResponse = await publicAuthentication(request, env);
       if (authResponse) return authResponse;
@@ -64,6 +65,16 @@ const router = {
       const safetyMode = safetyModeForRequest(request, path, actor);
       if (safetyMode === false) return error('safety_mode_refused', 403);
 
+      if (path === '/api/auth/me' && request.method === 'GET') {
+        if (actor.kind !== 'operator') return error('human_required', 403);
+        if (actor.generation === 'dev') return json({
+          actor: actor.id, sub: 'dev', kind: 'human', label: actor.client_id,
+          scopes: actor.scopes, isAdmin: true,
+        }, 200, noStore);
+        return control.fetch(await forwardRequest(request, CONTROL + '/_auth/me'));
+      }
+      if (path === '/api/quota' && request.method === 'GET')
+        return quotaProjection(request, env, actor);
       if (path === '/mcp') return mcp(request, env, (r, e) => router.fetch(r, e), actor);
       if (
         path === '/api/model-policy' ||
@@ -527,22 +538,25 @@ async function machineProjection(
   if (!admin(actor)) return error('forbidden', 403);
   const q = new URL(request.url).searchParams,
     limit = Number(q.get('limit') || 25);
-  if (!Number.isInteger(limit) || limit < 1 || limit > 50) return error('invalid_page', 400);
+  if (!Number.isInteger(limit) || limit < 1 || limit > (sessions ? 100 : 50)) return error('invalid_page', 400);
   const selectedMachine = q.get('machine_id');
   if (sessions && selectedMachine) {
     if (!/^[A-Za-z0-9_.-]{1,80}$/.test(selectedMachine)) return error('invalid_machine', 400);
-    return env.MACHINES.get(env.MACHINES.idFromName(selectedMachine)).fetch(
+    const response = await env.MACHINES.get(env.MACHINES.idFromName(selectedMachine)).fetch(
       await forwardRequest(
         request,
         'https://machine.internal/api/sessions?limit=' +
           limit +
           '&after=' +
-          encodeURIComponent(q.get('after') || ''),
+          encodeURIComponent(q.get('after') || q.get('cursor') || ''),
         actor,
       ),
     );
+    if (!response.ok) return response;
+    const page = await response.json() as { items: unknown[]; next: string | null };
+    return json({ ...page, sessions: page.items, next_cursor: page.next });
   }
-  const position = readCursor(q.get('after'));
+  const position = readCursor(q.get('after') || q.get('cursor'));
   if (
     !position ||
     typeof position !== 'object' ||
@@ -607,6 +621,52 @@ async function machineProjection(
     }
   }
   if (!sessions) next = page.next ? cursor({ directory_after: page.next }) : null;
-  return json({ items, next, complete: next === null });
+  return json({ items, next, complete: next === null, ...(sessions ? { sessions: items, next_cursor: next } : {}) });
 }
 
+
+/** Bounded, usage-only view of the accounts referenced by the routing policy. */
+async function quotaProjection(request: Request, env: Hub2Env, actor: Actor): Promise<Response> {
+  if (!admin(actor)) return error('forbidden', 403);
+  const q = new URL(request.url).searchParams;
+  if (q.get('view') && q.get('view') !== 'fleet') return error('invalid_view', 400);
+  // Account evidence is fleet-wide, with no host attribution in Hub2. Do not
+  // silently present fleet evidence as a measurement from one host.
+  if (q.has('host_id')) return error('host_quota_unavailable', 400);
+  for (const key of ['provider', 'engine', 'account'])
+    if (q.has(key) && !/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(q.get(key)!))
+      return error('invalid_filter', 400);
+  const control = env.CONTROL.get(env.CONTROL.idFromName('global'));
+  const response = await control.fetch(await forwardRequest(request, CONTROL + '/api/model-policy', actor));
+  let candidates: { engine: string; account_id: string }[] = [];
+  if (response.ok) candidates = (await response.json() as { candidates: typeof candidates }).candidates;
+  else if (response.status !== 404) return response;
+  if (candidates.length > 32) return error('quota_projection_bound_exceeded', 503);
+  const ids = [...new Set([...candidates.map(c => c.account_id), ...(env.HUB2_DEFAULT_ACCOUNT_ID ? [env.HUB2_DEFAULT_ACCOUNT_ID] : [])])];
+  const pools: JsonRecord[] = [];
+  for (const id of ids) {
+    if (!/^[A-Za-z0-9_.-]{1,80}$/.test(id) || ['shared-zai', 'zcodex'].includes(id))
+      return error('invalid_account', 503);
+    const engines = [...new Set(candidates.filter(c => c.account_id === id).map(c => c.engine))];
+    if ((q.has('account') && q.get('account') !== id) || (q.has('engine') && !engines.includes(q.get('engine')!))) continue;
+    const r = await env.ACCOUNTS.get(env.ACCOUNTS.idFromName(id)).fetch(
+      await forwardRequest(request, 'https://account.internal/api/account/quota', actor),
+    );
+    if (!r.ok) return error('quota_projection_unavailable', 503);
+    const data = await r.json() as {
+      account: { provider: string; enabled: number; min_remaining: number } | null;
+      quota: { remaining: number; captured_at: number; reset_at: number | null } | null;
+      fresh: boolean;
+    };
+    if (q.has('provider') && q.get('provider') !== data.account?.provider) continue;
+    pools.push({
+      provider: data.account?.provider || 'unknown', account: id, engines,
+      routing: data.account?.enabled ? 'enabled' : 'disabled',
+      state: !data.quota ? 'unknown' : !data.fresh ? 'stale' : data.quota.remaining <= (data.account?.min_remaining ?? 0) ? 'exhausted' : 'fresh',
+      remaining_percent: data.fresh ? data.quota?.remaining ?? null : null,
+      observed_at: data.quota ? new Date(data.quota.captured_at).toISOString() : null,
+      reset_at: data.quota?.reset_at ? new Date(data.quota.reset_at).toISOString() : null,
+    });
+  }
+  return json({ pools, projection: 'hub2_accounts', complete: true }, 200, noStore);
+}
