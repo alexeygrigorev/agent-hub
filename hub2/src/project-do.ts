@@ -230,7 +230,7 @@ export class ProjectDO {
 
   /** Version handle for compare-and-set callers (CLI `intake close/update`): the row's updated_at. */
   private taskCompat(row: IntakeRow): JsonRecord {
-    return { id: row.id, control: { version: row.updated_at } };
+    return { id: row.id, updated_at: row.updated_at, control: { version: row.updated_at } };
   }
 
   /** `hub intake context`: the intake plus its most recent events, bounded. */

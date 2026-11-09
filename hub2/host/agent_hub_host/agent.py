@@ -6,6 +6,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -13,7 +14,20 @@ from .client import ApiError, private_file, save_config
 from . import native_launch
 from .native_launch import NativeLauncher, canonical, native_returncode, same_workspace
 
-RESOURCE_HEARTBEAT_SECONDS = 240
+# The Hub treats a host snapshot older than 300 s as stale and refuses placement
+# (host_resources_stale), so beat well inside that window.
+RESOURCE_HEARTBEAT_SECONDS = 60
+
+
+def run_heartbeat_loop(beat, stop, interval=RESOURCE_HEARTBEAT_SECONDS):
+    """Keep the resource snapshot fresh while the serve loop is busy (a long launch or reconcile
+    otherwise blocks it past the Hub's staleness window). A failed beat is retried next interval."""
+    while not stop.wait(interval):
+        try:
+            beat()
+        except Exception:
+            pass
+
 
 
 class Journal:
@@ -405,6 +419,8 @@ class Bridge:
 
     def serve(self, machine_id, labels):
         self.machine_id=machine_id
+        threading.Thread(target=run_heartbeat_loop, args=(lambda: self.heartbeat(labels), threading.Event()),
+                         name='hub2-resource-heartbeat', daemon=True).start()
         delay = 1
         while True:
             safety=time.time()*1000 < self.budget_paused_until

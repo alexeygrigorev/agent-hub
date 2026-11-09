@@ -540,3 +540,24 @@ class RetiredLookupRowTest(unittest.TestCase):
             launcher=SimpleNamespace(retired=lambda selector, expected: seen.append(expected.get('tag'))))
         Bridge.lookup(bridge, 'sel', row)
         self.assertEqual(seen, ['tag-1'])
+
+
+class ResourceHeartbeatLoopTest(unittest.TestCase):
+    def test_beats_repeatedly_and_survives_failures(self):
+        import threading
+        from agent_hub_host.agent import run_heartbeat_loop
+        calls, stop = [], threading.Event()
+        def beat():
+            calls.append(1)
+            if len(calls) == 1:
+                raise OSError('hub unreachable')
+            if len(calls) >= 3:
+                stop.set()
+        thread = threading.Thread(target=run_heartbeat_loop, args=(beat, stop, 0.01))
+        thread.start(); thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertGreaterEqual(len(calls), 3)
+
+    def test_interval_is_well_inside_the_hub_staleness_window(self):
+        from agent_hub_host.agent import RESOURCE_HEARTBEAT_SECONDS
+        self.assertLessEqual(RESOURCE_HEARTBEAT_SECONDS * 4, 300)
