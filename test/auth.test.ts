@@ -356,7 +356,7 @@ describe('M1 Auth Worker Runtime', () => {
     codeRes = await doFetch(codeReq);
     expect(codeRes.status).toBe(200);
     const { device_code, user_code } = await codeRes.json() as any;
-    expect(user_code).toMatch(/^[A-Z2-9]{4}-[A-Z2-9]{4}$/); // MUST have hyphen
+    expect(user_code).toMatch(/^[BCDFGHJKLMNPQRSTVWXZ23456789]{4}-[BCDFGHJKLMNPQRSTVWXZ23456789]{4}$/); // MUST have hyphen
 
     // Adjust last_poll_at
     const id = defaultEnv.HUB.idFromName("hub");
