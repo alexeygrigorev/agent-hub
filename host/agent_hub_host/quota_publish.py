@@ -17,6 +17,9 @@ ACCOUNTS = {
     'go': ('shared-go', 'go'), 'zai': ('zai-central', 'zai'),
 }
 VALID_MS = 15 * 60 * 1000
+# Concurrent sessions per account. Capacity 1 turned every second start into account_saturated,
+# which Hub reports as quota_unavailable even with headroom.
+DEFAULT_CAPACITY = 8
 QUSE_TIMEOUT = 90
 
 
@@ -65,10 +68,11 @@ def publish(quse=None, request=intake.request, now_ms=None, enable=False):
         base = f'/api/accounts/{account}/api/account'
         current = request('GET', base)
         existing = current.get('account')
-        if not existing or (enable and not existing.get('enabled')):
+        grow = bool(existing) and (existing.get('capacity') or 0) < DEFAULT_CAPACITY
+        if not existing or grow or (enable and not existing.get('enabled')):
             # Routable by default: pools Hub reports must be usable by engine pickers (model-roulette).
-            request('PATCH', base, {'provider': provider, 'enabled': True,
-                                    'capacity': (existing or {}).get('capacity') or 1,
+            request('PATCH', base, {'provider': provider, 'enabled': bool(existing.get('enabled')) if existing and not enable else True,
+                                    'capacity': max((existing or {}).get('capacity') or 0, DEFAULT_CAPACITY),
                                     'min_remaining': (existing or {}).get('min_remaining') or 0})
         request('PUT', base + '/quota', body)
         result['published'].append(account)

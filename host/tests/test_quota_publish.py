@@ -41,12 +41,22 @@ class QuotaPublishTests(unittest.TestCase):
         calls = []
         def req(method, path, body=None):
             calls.append(method)
-            return {'account': {'enabled': 0, 'capacity': 3, 'min_remaining': 5}} if method == 'GET' else {}
+            return {'account': {'enabled': 0, 'capacity': 8, 'min_remaining': 5}} if method == 'GET' else {}
         quse = {'claude': {'status': 'ok', 'windows': {'7d': {'percent_remaining': 9.0, 'reset_at': None}}}}
         qp.publish(quse=quse, request=req, now_ms=5)
         self.assertEqual(calls, ['GET', 'PUT'])
         calls.clear(); qp.publish(quse=quse, request=req, now_ms=5, enable=True)
         self.assertEqual(calls, ['GET', 'PATCH', 'PUT'])
+
+    def test_low_capacity_account_is_grown_without_enabling(self):
+        calls = []
+        def req(method, path, body=None):
+            calls.append((method, body))
+            return {'account': {'enabled': 0, 'capacity': 1, 'min_remaining': 5}} if method == 'GET' else {}
+        quse = {'claude': {'status': 'ok', 'windows': {'7d': {'percent_remaining': 9.0, 'reset_at': None}}}}
+        qp.publish(quse=quse, request=req, now_ms=5)
+        patch = [b for m, b in calls if m == 'PATCH'][0]
+        self.assertEqual((patch['capacity'], patch['enabled'], patch['min_remaining']), (qp.DEFAULT_CAPACITY, False, 5))
 
 
 if __name__ == '__main__':
