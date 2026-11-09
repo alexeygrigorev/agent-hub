@@ -86,7 +86,7 @@ class Bridge:
     def lookup(self, selector, expected=None):
         result = self.native("status", selector, "--json", allow_failure=True)
         if result.returncode:
-            return self.launcher.retired(selector, expected) if expected else None
+            return self.launcher.retired(selector, dict(expected)) if expected else None
         row = json.loads(result.stdout)
         if not isinstance(row, dict) or not isinstance(row.get("id"), str):
             raise RuntimeError("invalid_native_status")
