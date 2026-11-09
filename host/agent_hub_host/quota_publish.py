@@ -53,7 +53,7 @@ def evidence(entry, now_ms):
             'reset_at': _ms(reset) if isinstance(reset, str) else None, 'source': 'quse'}
 
 
-def publish(quse=None, request=intake.request, now_ms=None):
+def publish(quse=None, request=intake.request, now_ms=None, enable=False):
     quse = read_quse() if quse is None else quse
     now_ms = now_ms or int(time.time() * 1000)
     result = {'published': [], 'skipped': {}}
@@ -64,8 +64,12 @@ def publish(quse=None, request=intake.request, now_ms=None):
             continue
         base = f'/api/accounts/{account}/api/account'
         current = request('GET', base)
-        if not current.get('account'):  # first publish: register as non-routing until an operator enables it
-            request('PATCH', base, {'provider': provider, 'enabled': False, 'capacity': 1, 'min_remaining': 0})
+        existing = current.get('account')
+        if not existing or (enable and not existing.get('enabled')):
+            # Routable by default: pools Hub reports must be usable by engine pickers (model-roulette).
+            request('PATCH', base, {'provider': provider, 'enabled': True,
+                                    'capacity': (existing or {}).get('capacity') or 1,
+                                    'min_remaining': (existing or {}).get('min_remaining') or 0})
         request('PUT', base + '/quota', body)
         result['published'].append(account)
     if not result['published']:

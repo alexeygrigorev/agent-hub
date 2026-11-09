@@ -27,6 +27,7 @@ def add_commands(sub):
     parser.add_argument("--account", default=None, help="Limit to one account label")
     parser.add_argument("--admin-token-file", default=None, help="Use an existing private Hub operator token for this read")
     parser.add_argument("--json", action="store_true", help="Emit raw JSON instead of text")
+    parser.add_argument("--enable", action="store_true", help="publish: also enable existing disabled quota accounts for routing")
     parser.add_argument("tbm", nargs="?", default=None, choices=["history", "pacing", "metrics", "banked", "kill-switch", "publish"],
                         help="TBM view: pacing, metrics, banked, or kill-switch (fleet filters do not apply)")
     parser.add_argument("kill_action", nargs="?", default=None, choices=["on", "off"],
@@ -83,7 +84,7 @@ def execute(args):
         return fetch_quota(**kwargs)
     if tbm_view == 'publish':
         from . import quota_publish
-        return quota_publish.publish()
+        return quota_publish.publish(enable=getattr(args, 'enable', False))
     if tbm_view == 'history':
         if any(getattr(args, key, None) is not None for key in ('provider', 'engine', 'account', 'admin_token_file', 'kill_action', 'reason')):
             raise ValueError('History accepts --range, --kind and --host only')
