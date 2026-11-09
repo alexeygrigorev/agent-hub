@@ -1,4 +1,5 @@
 import { HttpError } from './http';
+import { isModelPolicyCandidateAllowed } from './model-policy';
 import type { Hub2Env } from './types';
 
 /**
@@ -22,9 +23,9 @@ type RoutingCandidate={id:string;engine:string;model:string;effort?:string;accou
  * heartbeat snapshot {mem_available_mb,observed_at} exactly as persisted, or
  * absent on hosts that have not reported one yet. */
 type MachineView={machine_id:string;available:boolean;capacity:number;occupied:number;engines:string[];capabilities:string[];resources?:{mem_available_mb:number;observed_at:number;cpu_load_pct?:number}};
-type AccountView={account:{enabled:number|boolean;capacity:number;occupied:number;min_remaining:number}|null;quota:{remaining:number;valid_until:number;captured_at?:number;reset_at?:number;source:string}|null;fresh:boolean;hosts:string[]};
+type AccountView={account:{enabled:number|boolean;capacity:number;occupied:number;min_remaining:number}|null;quota:{remaining:number;valid_until:number;captured_at?:number;reset_at?:number;source:string}|null;fresh:boolean;hosts:string[];credential_usable:boolean;credential_status:string};
 export type AdmissionPlan={machine_id:string;engine:string;model:string;effort?:string;account_id:string;policy_id:string;policy_version:unknown;override_reason:string|null;weight:number;quota_remaining:number;required_capabilities:string[]};
-export type HoldKind='quota_unknown'|'quota_stale'|'quota_exhausted'|'account_saturated'|'machine_unavailable'|'host_resources_unknown'|'host_resources_stale'|'host_resources_saturated'|'capability_unavailable'|'model_policy_unavailable'|'routing_policy_unavailable';
+export type HoldKind='credential_unavailable'|'quota_unknown'|'quota_stale'|'quota_exhausted'|'account_saturated'|'machine_unavailable'|'host_resources_unknown'|'host_resources_stale'|'host_resources_saturated'|'capability_unavailable'|'model_policy_unavailable'|'routing_policy_unavailable';
 export type AdmissionOutcome={ok:true;plan:AdmissionPlan}|{ok:false;code:HoldKind;hold:{retry_at:number|null;reason?:string}};
 type PolicyDocument={version:unknown;candidates:RoutingCandidate[]};
 const internalActor=JSON.stringify({id:'hub2-resource-manager',kind:'operator',scopes:['operator:admin','routing:read']});
@@ -90,7 +91,7 @@ export async function admitLaunch(env:Hub2Env,input:AdmissionRequest):Promise<Ad
   const policy=await read(env.CONTROL,'global','/_routing-policy') as PolicyDocument;
   if(!Array.isArray(policy.candidates)||!policy.candidates.length)throw new HttpError('routing_policy_unconfigured',409);
   if(policy.candidates.length>32)throw new HttpError('routing_policy_bound_exceeded',503);
-  const candidates=policy.candidates.filter(c=>c.enabled&&(!input.engine||input.engine===c.engine)&&(!input.model||input.model===c.model||input.model===c.id)&&(!input.effort||input.effort===c.effort));
+  const candidates=policy.candidates.filter(c=>c.enabled&&isModelPolicyCandidateAllowed(c)&&(!input.engine||input.engine===c.engine)&&(!input.model||input.model===c.model||input.model===c.id)&&(!input.effort||input.effort===c.effort));
   if(!candidates.length)throw new HttpError('model_policy_unavailable',409);
   const directory=await read(env.CONTROL,'global','/api/directory?kind=machines&limit=50');
   if(directory.next)throw new HttpError('routing_fleet_bound_exceeded',503);
@@ -105,11 +106,12 @@ export async function admitLaunch(env:Hub2Env,input:AdmissionRequest):Promise<Ad
   const accounts=new Map<string,AccountView|null>(await Promise.all(accountIds.map(async id=>{try{return [id,await read(env.ACCOUNTS,id,'/_internal/routing') as AccountView] as const;}catch{return [id,null] as const;}})));
   const options:AdmissionPlan[]=[];
   let worst:{code:HoldKind;retry_at:number|null}|null=null;
-  const rank=(code:HoldKind)=>['quota_unknown','quota_stale','quota_exhausted','account_saturated','host_resources_unknown','host_resources_stale','host_resources_saturated','capability_unavailable','machine_unavailable'].indexOf(code);
+  const rank=(code:HoldKind)=>['credential_unavailable','quota_unknown','quota_stale','quota_exhausted','account_saturated','host_resources_unknown','host_resources_stale','host_resources_saturated','capability_unavailable','machine_unavailable'].indexOf(code);
   const merge=(code:HoldKind,retry_at:number|null):{code:HoldKind;retry_at:number|null}=>!worst||rank(code)<rank(worst.code)?{code,retry_at}:worst;
   for(const c of candidates){
     const a=accounts.get(c.account_id);
     if(!a?.account?.enabled){worst=merge('quota_unknown',null);continue;}
+    if(a.credential_usable!==true){worst=merge('credential_unavailable',null);continue;}
     const hold=quotaHold(a.account,a.quota,a.fresh,now);
     if(hold){worst=merge(hold.code,hold.retry_at);continue;}
     if(!Number.isFinite(c.weight)||c.weight<=0)throw new HttpError('routing_policy_invalid',503);

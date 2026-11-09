@@ -527,7 +527,46 @@ test('zai configuration and policy refuse retired account aliases without bannin
  const control=new ControlDO(state().ctx,{} as any),candidate={id:'central',engine:'zcodex',model:'glm-flash',account_id:'zai-central',weight:1,capabilities:['interactive'],enabled:true};
  assert.equal((await control.fetch(request('/api/model-policy','PUT',{candidates:[{...candidate,account_id:'shared-zai'}]}))).status,400);
  assert.equal((await control.fetch(request('/api/model-policy','PUT',{candidates:[{...candidate,account_id:'zcodex'}]}))).status,400);
- assert.equal((await control.fetch(request('/api/model-policy','PUT',{candidates:[candidate]}))).status,200);
+ assert.equal((await control.fetch(request('/api/model-policy','PUT',{candidates:[candidate]}))).status,400,'zai-central must stay excluded even when paired with its maintained engine');
+ const claude={id:'claude-sonnet-medium',engine:'claude',model:'sonnet',effort:'medium',account_id:'claude',weight:1,capabilities:['interactive'],enabled:true};
+ assert.equal((await control.fetch(request('/api/model-policy','PUT',{candidates:[claude]}))).status,200);
+ for(const invalid of [
+  {...claude,model:'opus'},
+  {...claude,model:'haiku'},
+  {...claude,effort:'low'},
+  {...claude,engine:'codex',model:'gpt-6-luna',effort:'medium'},
+  {...claude,engine:'codex',model:'gpt-6-astra',effort:'max'},
+ ])assert.equal((await control.fetch(request('/api/model-policy','PUT',{candidates:[invalid]}))).status,400,JSON.stringify(invalid));
+});
+
+test('picker routing refreshes expiring Claude OAuth and alerts while excluding an expired credential',async()=>{
+ const s=state();let refreshAccepted=false,refreshCalls=0,usageCalls=0;
+ const provider=async(url:string)=>{
+  if(url==='https://platform.claude.com/v1/oauth/token'){
+   refreshCalls++;
+   return refreshAccepted
+    ?Response.json({access_token:'synthetic-rotated-access',refresh_token:'synthetic-rotated-refresh',expires_in:3600})
+    :new Response(JSON.stringify({error:'invalid_grant'}),{status:400});
+  }
+  if(url==='https://api.anthropic.com/api/oauth/usage'){
+   usageCalls++;
+   return Response.json({five_hour:{utilization:10,resets_at:new Date(Date.now()+3600000).toISOString()},seven_day:{utilization:20,resets_at:new Date(Date.now()+86400000).toISOString()}});
+  }
+  throw Error('unexpected deterministic Claude provider URL');
+ };
+ const account=new AccountDO(s.ctx,{HUB2_CREDENTIAL_KEY:'cc'.repeat(32),HUB2_PROVIDER_FETCH:provider as any});
+ await account.fetch(request('/api/account','PATCH',{provider:'claude',enabled:true,capacity:2,min_remaining:10}));
+ await account.fetch(request('/api/account/credentials','PUT',{expected_generation:0,files:{'.claude/.credentials.json':JSON.stringify({claudeAiOauth:{accessToken:'synthetic-expired-access',refreshToken:'synthetic-rejected-refresh',expiresAt:Date.now()-1000}})}}));
+ await account.fetch(request('/api/account/quota','PUT',{remaining:80,captured_at:Date.now(),valid_until:Date.now()+60000,source:'provider:claude:generation:1'}));
+ const expired=await data(await account.fetch(request('/_internal/routing')));
+ assert.equal(expired.credential_usable,false);assert.equal(expired.credential_status,'expired');assert.equal(refreshCalls,1);
+ const alerts=await data(await account.fetch(request('/api/account/alerts')));
+ assert(alerts.items.some((alert:any)=>alert.kind==='credential_expired'),'expired OAuth must create a durable operator alert');
+ refreshAccepted=true;
+ const refreshed=await data(await account.fetch(request('/_internal/routing')));
+ assert.equal(refreshed.credential_usable,true);assert.equal(refreshed.credential_status,'ready');assert.equal(refreshed.credential_generation,2);
+ assert.equal(refreshCalls,2);assert.equal(usageCalls,1,'a successful refresh re-collects quota under its new generation');
+ assert.equal(refreshed.quota.source,'provider:claude:generation:2');
 });
 
 test('concurrent global reroute retries share one operation and a no-change key cannot later mutate another target',async()=>{

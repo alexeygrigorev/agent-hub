@@ -27,6 +27,8 @@ const SCHEMA = [
 type Account={provider:string;enabled:number;capacity:number;occupied:number;min_remaining:number};
 type Quota={remaining:number;captured_at:number;valid_until:number;reset_at:number|null;source:string};
 type Reservation={operation_id:string;session_id:string;machine_id:string;epoch:number;digest:string;state:string;expires_at:number};
+type RoutingCredentialStatus={credential_usable:boolean;credential_status:'ready'|'expired'|'refresh_failed'|'missing'|'unknown'};
+const ROUTING_REFRESH_MINIMUM_MS=5*60_000;
 /** One provider account owns its capacity. Expiry never frees confirmed native work. */
 export class AccountDO {
  private collecting?:Promise<Response>;
@@ -45,7 +47,11 @@ export class AccountDO {
    if(p==='/api/account/hosts')return await this.hosts(request,a);
    if(p==='/api/account/discovery')return await this.discovery(request,a);
    if(p==='/api/account/alerts'&&method==='GET')return this.alerts(request,a);
-   if(p==='/_internal/routing'&&method==='GET'){await this.lazyQuota();return this.routingView();}
+   if(p==='/_internal/routing'&&method==='GET'){
+    const credential=await this.routingCredentialStatus();
+    if(credential.credential_usable)await this.lazyQuota();
+    return this.routingView(credential);
+   }
    if(p==='/_internal/release'&&method==='POST')return await this.transition(request,'released');
    if(p==='/api/account/release')return error('not_found',404);
    if(p==='/_metrics')return json({counts:this.db.snapshot()});
@@ -62,15 +68,57 @@ export class AccountDO {
    return error('not_found',404);
   }catch(e){return e instanceof HttpError?error(e.code,e.status):error('internal_error',500);}
  }
- private routingView():Response{
+ private async routingCredentialStatus():Promise<RoutingCredentialStatus>{
+  const account=this.db.one<Account>('SELECT * FROM account WHERE id=1');
+  const row=this.db.one<{generation:number;sealed:string}>('SELECT generation,sealed FROM credentials WHERE id=1');
+  if(!account||!row){
+   this.recordCredentialAlert('credential_missing',row?.generation??0);
+   return{credential_usable:false,credential_status:'missing'};
+  }
+  if(account.provider==='zai')return{credential_usable:true,credential_status:'ready'};
+  if(!['codex','claude','go'].includes(account.provider)){
+   this.recordCredentialAlert('credential_health_unknown',row.generation);
+   return{credential_usable:false,credential_status:'unknown'};
+  }
+  try{
+   let current=row;
+   let files=await this.unseal(current.sealed,account.provider,current.generation) as Record<string,string>;
+   let expires=this.accessExpiry(account.provider,files);
+   if(['codex','claude'].includes(account.provider)&&this.needsRefresh(account.provider,files,ROUTING_REFRESH_MINIMUM_MS)){
+    try{
+     await this.refresh(account.provider,files,current.generation);
+     current=this.db.one<{generation:number;sealed:string}>('SELECT generation,sealed FROM credentials WHERE id=1')!;
+     files=await this.unseal(current.sealed,account.provider,current.generation) as Record<string,string>;
+     expires=this.accessExpiry(account.provider,files);
+    }catch{
+     const expired=expires===null||expires<=Date.now();
+     this.recordCredentialAlert(expired?'credential_expired':'credential_refresh_failed',current.generation);
+     return{credential_usable:false,credential_status:expired?'expired':'refresh_failed'};
+    }
+   }
+   if((['codex','claude'].includes(account.provider)&&(expires===null||expires<=Date.now()))
+     ||(account.provider==='go'&&expires!==null&&expires<=Date.now())){
+    this.recordCredentialAlert('credential_expired',current.generation);
+    return{credential_usable:false,credential_status:'expired'};
+   }
+   return{credential_usable:true,credential_status:'ready'};
+  }catch{
+   this.recordCredentialAlert('credential_health_unknown',row.generation);
+   return{credential_usable:false,credential_status:'unknown'};
+  }
+ }
+ private recordCredentialAlert(kind:string,generation:number):void{
+  this.db.run('INSERT OR IGNORE INTO alerts(id,kind,observed_at) VALUES(?,?,?)',`credential:${generation}:${kind}`,kind,Date.now());
+ }
+ private routingView(credential:RoutingCredentialStatus):Response{
   const account=this.db.one<Account>('SELECT * FROM account WHERE id=1'),quota=this.db.one<Quota>('SELECT * FROM quota WHERE id=1');
-  const credential=this.db.one<{generation:number}>('SELECT generation FROM credentials WHERE id=1');
+  const generationRow=this.db.one<{generation:number}>('SELECT generation FROM credentials WHERE id=1');
   const approved=this.db.all<{id:string}>('SELECT id FROM approved_hosts ORDER BY id LIMIT 51');
   if(approved.length>50)return error('host_observation_limit',503);
-  const rejected=approved.length?this.db.all<{host_id:string}>('SELECT host_id FROM credential_rejections WHERE generation=? AND host_id IN ('+approved.map(()=>'?').join(',')+')',credential?.generation??-1,...approved.map(v=>v.id)):[];
+  const rejected=approved.length?this.db.all<{host_id:string}>('SELECT host_id FROM credential_rejections WHERE generation=? AND host_id IN ('+approved.map(()=>'?').join(',')+')',generationRow?.generation??-1,...approved.map(v=>v.id)):[];
   const hosts=approved.filter(v=>!rejected.some(r=>r.host_id===v.id));
   if(hosts.length>50)return error('host_observation_limit',503);
-  return json({account:account||null,quota:quota||null,fresh:!!quota&&quota.valid_until>Date.now(),hosts:hosts.map(v=>v.id),credential_generation:credential?.generation??null});
+  return json({account:account||null,quota:quota||null,fresh:!!quota&&quota.valid_until>Date.now(),hosts:hosts.map(v=>v.id),credential_generation:generationRow?.generation??null,...credential});
  }
  private async configure(r:Request,a:Actor|undefined):Promise<Response>{
   if(!hasScope(a,'operator:admin'))return error('forbidden',403);
@@ -377,6 +425,11 @@ export class AccountDO {
    this.db.run('UPDATE credential_candidates SET sealed=?,state=? WHERE id=?',sealed,'pending',attempt);
    this.db.transaction(this.ctx,()=>{const row=this.db.one<{generation:number;refresh_until:number}>('SELECT generation,refresh_until FROM credentials WHERE id=1');if(row?.generation!==generation||row.refresh_until!==until)throw new Error('refresh_superseded');this.db.run('UPDATE credentials SET sealed=?,generation=generation+1,refresh_until=0,refresh_owner=NULL,refresh_lease=NULL WHERE id=1',sealed);this.db.run('UPDATE quota SET valid_until=0 WHERE id=1');this.db.run('UPDATE credential_candidates SET state=? WHERE id=?','published',attempt);});return auth;
   }catch(e){
+   if(['codex','claude'].includes(provider)){
+    this.recordCredentialAlert('credential_refresh_failed',generation);
+    const expires=this.accessExpiry(provider,files);
+    if(expires===null||expires<=Date.now())this.recordCredentialAlert('credential_expired',generation);
+   }
    this.db.run('INSERT OR IGNORE INTO alerts(id,kind,observed_at) VALUES(?,?,?)','refresh:'+attempt,'refresh_publication_reconciliation_required',Date.now());throw e;
   }finally{this.db.run('UPDATE credentials SET refresh_until=0,refresh_owner=NULL,refresh_lease=NULL WHERE id=1 AND generation=? AND refresh_until=?',generation,until);}
  }

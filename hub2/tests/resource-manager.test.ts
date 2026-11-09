@@ -6,7 +6,7 @@ const {admitLaunch,advanceDispatch,releaseAccountCapacity}=await import('data:te
 function setup(){
  const policy={version:7,candidates:[{id:'configured-model',engine:'engine',model:'actual-model',account_id:'account',weight:2,capabilities:[],enabled:true}]};
  const machine={machine_id:'machine',available:true,capacity:1,occupied:0,engines:['engine'],capabilities:['headless'],resources:{mem_available_mb:42000,cpu_load_pct:12.5,observed_at:Date.now()}};
- const account={account:{enabled:true,capacity:2,occupied:0,min_remaining:10},quota:{remaining:70,valid_until:Date.now()+300000,source:'provider-observed'},fresh:true,hosts:['machine']};
+ const account={account:{enabled:true,capacity:2,occupied:0,min_remaining:10},quota:{remaining:70,valid_until:Date.now()+300000,source:'provider-observed'},fresh:true,hosts:['machine'],credential_usable:true,credential_status:'ready'};
  const calls=[];
  const ns=(kind,fn)=>({idFromName:id=>id,get:id=>({fetch:async url=>{calls.push([kind,id,new URL(url).pathname]);return Response.json(fn(new URL(url)));}})});
  const env={CONTROL:ns('control',url=>url.pathname==='/_routing-policy'?policy:{items:[{id:'machine'}],next:null}),MACHINES:ns('machine',()=>machine),ACCOUNTS:ns('account',()=>account)};
@@ -110,6 +110,52 @@ test('weighted quota distribution changes from observed headroom',async()=>{
  let first=0;
  for(let i=0;i<200;i++){const outcome=await admitLaunch(f.env,{...input,operation_id:String(i)});if(outcome.ok&&outcome.plan.model==='actual-model')first++;}
  assert.ok(first>25&&first<80,`configured 1:3 weights produced ${first}/200 first choices`);
+});
+test('quota headroom weights choices across different engine accounts',async()=>{
+ const f=setup();
+ f.policy.candidates=[
+  {id:'codex-sol-medium',engine:'codex',model:'gpt-6.1-sol',effort:'medium',account_id:'codex-account',weight:1,capabilities:[],enabled:true},
+  {id:'claude-sonnet-medium',engine:'claude',model:'sonnet',effort:'medium',account_id:'claude-account',weight:1,capabilities:[],enabled:true},
+ ];
+ f.machine.engines=['codex','claude'];
+ f.machine.capabilities.push('effort:codex','effort:claude');
+ const byAccount:any={
+  'codex-account':{...f.account,account:{...f.account.account},quota:{...f.account.quota,remaining:20},hosts:['machine']},
+  'claude-account':{...f.account,account:{...f.account.account},quota:{...f.account.quota,remaining:80},hosts:['machine']},
+ };
+ f.env.ACCOUNTS={idFromName:(id:string)=>id,get:(id:string)=>({fetch:async()=>Response.json(byAccount[id])})} as any;
+ let codex=0;
+ for(let i=0;i<200;i++){
+  const outcome=await admitLaunch(f.env,{...input,operation_id:'quota-weight-'+i});
+  assert.equal(outcome.ok,true,JSON.stringify(outcome));
+  if(outcome.ok&&outcome.plan.engine==='codex')codex++;
+ }
+ assert.ok(codex>8&&codex<45,`10% quota headroom should select codex far less often than 70% headroom; got ${codex}/200`);
+});
+test('expired credentials are excluded while a healthy account remains selectable',async()=>{
+ const f=setup();
+ f.policy.candidates.push({id:'other-engine',engine:'other',model:'other-model',account_id:'healthy-account',weight:1,capabilities:[],enabled:true});
+ f.machine.engines.push('other');
+ const expired={...f.account,credential_usable:false,credential_status:'expired'};
+ const healthy={...f.account};
+ f.env.ACCOUNTS={idFromName:(id:string)=>id,get:(id:string)=>({fetch:async()=>Response.json(id==='account'?expired:healthy)})} as any;
+ const selected=await admitLaunch(f.env,input);
+ assert.equal(selected.ok,true);
+ if(selected.ok){assert.equal(selected.plan.account_id,'healthy-account');assert.equal(selected.plan.engine,'other');}
+ const onlyExpired=setup();onlyExpired.account.credential_usable=false;onlyExpired.account.credential_status='expired';
+ const refused=await admitLaunch(onlyExpired.env,input);
+ assert.equal(refused.ok,false);
+ if(!refused.ok)assert.equal(refused.code,'credential_unavailable');
+});
+test('runtime filtering permanently skips ZAI and other policy-forbidden candidates',async()=>{
+ const f=setup();
+ f.policy.candidates=[
+  {id:'zai-central-glm',engine:'zcodex',model:'glm-5.3-flash',account_id:'zai-central',weight:10,capabilities:[],enabled:true},
+  f.policy.candidates[0],
+ ];
+ const selected=await admitLaunch(f.env,input);
+ assert.equal(selected.ok,true);
+ if(selected.ok)assert.equal(selected.plan.account_id,'account');
 });
 test('machine-unavailable input returns a typed hold instead of a bare error',async()=>{
  const f=setup();f.policy.candidates[0].engine='absent-engine';

@@ -5,6 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { modelPolicyCandidateViolation } from '../src/model-policy.ts';
 
 const root = resolve(import.meta.dirname, '../..');
 const policy = JSON.parse(readFileSync(resolve(root, 'config/model-policy.json'), 'utf8')) as {
@@ -39,6 +40,23 @@ test('policy candidates pass the model-policy wire validation', () => {
     assert.ok(!ids.has(candidate.id), 'candidate ids are unique');
     ids.add(candidate.id);
   }
+});
+
+test('the Hub policy validator accepts the committed pool and rejects banned candidates', () => {
+  for (const candidate of policy.candidates) {
+    assert.equal(modelPolicyCandidateViolation(candidate), null, `${candidate.id} must remain eligible`);
+  }
+  const route = (overrides: Partial<(typeof policy.candidates)[number]>) => ({
+    id: 'test-candidate', engine: 'codex', model: 'gpt-6.1-sol', account_id: 'codex', weight: 1,
+    capabilities: [], enabled: true, ...overrides,
+  });
+  assert.equal(modelPolicyCandidateViolation(route({id: 'zai-central', engine: 'zcodex', model: 'glm-flash', account_id: 'zai-central'})), 'zai_picker_route_forbidden');
+  assert.equal(modelPolicyCandidateViolation(route({engine: 'claude', model: 'haiku', effort: 'medium'})), 'haiku_picker_route_forbidden');
+  assert.equal(modelPolicyCandidateViolation(route({engine: 'claude', model: 'opus', effort: 'medium'})), 'claude_picker_route_forbidden');
+  assert.equal(modelPolicyCandidateViolation(route({model: 'gpt-6-luna', effort: 'medium'})), 'luna_effort_forbidden');
+  assert.equal(modelPolicyCandidateViolation(route({model: 'gpt-6.1-sol', effort: 'max'})), 'bounded_effort_required');
+  assert.equal(modelPolicyCandidateViolation(route({model: 'gpt-6-astra'})), 'bounded_effort_required');
+  assert.equal(modelPolicyCandidateViolation(route({model: 'gemini-4-argon-medium', effort: 'max'})), 'bounded_effort_required');
 });
 
 test('no zai-central: the picker never spends the shared zai route', () => {
