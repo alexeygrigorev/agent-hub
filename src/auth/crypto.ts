@@ -35,14 +35,19 @@ export function randomString(count = 32): string {
   return base64url(randomBytes(count));
 }
 
-// Generate 8-char human code without 0,O,1,I,L
+// Match DataTalksClub/auth and dapier device codes: four characters, a
+// separator, then four characters, using their ambiguity-resistant alphabet.
 export function generateUserCode(): string {
-  const alphabet = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+  const alphabet = 'BCDFGHJKLMNPQRSTVWXZ23456789';
+  const limit = Math.floor(256 / alphabet.length) * alphabet.length;
   let code = '';
-  const random = randomBytes(8);
-  for (let i = 0; i < 8; i++) {
-    if (i === 4) code += '-';
-    code += alphabet[random[i] % alphabet.length];
+  while (code.length < 8) {
+    for (const byte of randomBytes(16)) {
+      if (byte >= limit) continue;
+      code += alphabet[byte % alphabet.length];
+      if (code.length === 4) code += '-';
+      if (code.length === 9) return code;
+    }
   }
   return code;
 }

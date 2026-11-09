@@ -88,7 +88,7 @@ describe('Human/operator device credentials', () => {
     expect(res.status).toBe(200);
     const dto = (await res.json()) as any;
     expect(dto.device_code).toBeTruthy();
-    expect(dto.user_code).toMatch(/^[A-Z2-9]{4}-[A-Z2-9]{4}$/);
+    expect(dto.user_code).toMatch(/^[BCDFGHJKLMNPQRSTVWXZ23456789]{4}-[BCDFGHJKLMNPQRSTVWXZ23456789]{4}$/);
     expect(dto.verification_uri).toBe('http://example.com/device');
     expect(dto.verification_uri_complete).toContain('/device?code=');
     expect(dto.expires_in).toBe(600);
