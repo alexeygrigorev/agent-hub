@@ -20,6 +20,8 @@ def wait_for_confirmed_stop(session_ref, command_id, timeout, interval, *, wait_
             reason = 'stop_' + str(entry.get('state', 'unconfirmed'))
         raise ValueError(f'{reason}; command {command_id}; stop was not confirmed')
     view = request('GET', '/api/sessions/' + session_ref)
-    if view.get('state') != 'stopped':
+    # Hub2 wraps the row in `session` and reports a finished-after-stop session as failed + stop_confirmed.
+    view = view.get('session') if isinstance(view.get('session'), dict) else view
+    if view.get('state') != 'stopped' and view.get('stop_confirmed') is not True:
         raise ValueError(f'stop_state_unconfirmed; command {command_id}; reconcile with commands')
     return view

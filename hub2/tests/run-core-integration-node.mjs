@@ -189,6 +189,19 @@ try{
   const result=await api(`/api/sessions/${session.id}/admission`,'POST',{epoch:session.epoch,operation_id:session.attempt_operation_id},expiryToken);
   assert([404,409,410].includes(result.status),'expired offer became launch-authorized: HTTP'+result.status);
  });
+ await test('Hub1-shaped stop/send/capture paths reach the Hub2 command queue',async()=>{
+  const target='synthetic-legacy-machine';
+  const pair=expect(await api('/api/enrollments/pair','POST',{machine_id:target,alias:'Synthetic legacy-path fixture'}),201,'legacy pairing');
+  const legacyToken=expect(await api('/api/enrollments/complete','POST',{code:pair.pairing_code},null),201,'legacy enrollment').token;
+  expect(await api('/api/heartbeat','POST',{os:'synthetic',arch:'synthetic',labels:['fixture']},legacyToken),200,'legacy heartbeat');
+  const created=expect((await intake('intake-legacy')).response,201,'legacy intake').intake;
+  const session=expect(await start(created.id,'start-legacy',target,'shell'),201,'legacy start').session;
+  const refused=await api(`/api/sessions/${session.id}/stop`,'POST',{key:'legacy-stop-1'});
+  assert.equal(refused.status,409,'stop on an unstarted session is a typed refusal, not a 404');
+  assert.equal(refused.data.error,'session_not_running');
+  const listing=expect(await api(`/api/sessions/${session.id}/commands`),200,'command listing');
+  assert(Array.isArray(listing.commands),'listing has commands[]');
+ });
  await test('machine credential rotation fences its existing WebSocket',async()=>{
   const target='synthetic-rotation-machine';
   const pair=expect(await api('/api/enrollments/pair','POST',{machine_id:target,alias:'Synthetic rotation fixture'}),201,'rotation pairing');

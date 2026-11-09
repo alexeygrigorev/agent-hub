@@ -139,6 +139,10 @@ export class MachineDO {
       if (sessionView && request.method === 'GET') return this.sessionDetail(request, decodeURIComponent(sessionView[1]));
       const commandAck = url.pathname.match(/^\/api\/sessions\/([^/]+)\/commands\/([^/]+)\/ack$/);
       if (commandAck && request.method === 'POST') return await this.ackCommand(request, decodeURIComponent(commandAck[1]), decodeURIComponent(commandAck[2]));
+      const legacy = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(stop|send|capture)$/);
+      if (legacy && request.method === 'POST') return await this.legacyCommand(request, decodeURIComponent(legacy[1]), legacy[2]);
+      const commandList = url.pathname.match(/^\/api\/sessions\/([^/]+)\/commands$/);
+      if (commandList && request.method === 'GET') return this.commandListing(request, decodeURIComponent(commandList[1]));
       const commandSend = url.pathname.match(/^\/api\/sessions\/([^/]+)\/commands$/);
       if (commandSend && request.method === 'POST') return await this.createCommand(request, decodeURIComponent(commandSend[1]));
       const match = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(started|finish|admission|credentials)$/);
@@ -879,10 +883,38 @@ export class MachineDO {
     return json({items:rows.slice(0,limit).map(row=>this.sessionView(row)),next:rows.length>limit?rows[limit-1].id:null});
   }
 
+  /** Hub1-shaped `POST /api/sessions/:id/(stop|send|capture)` mapped onto the Hub2 command queue, so the CLI and MCP keep working. */
+  private async legacyCommand(request: Request, sessionId: string, kind: string): Promise<Response> {
+    const body = await bodyObject(request, 12_288);
+    const mapped: JsonRecord = { kind, key: body.key };
+    if (kind === 'send') mapped.text = body.body;
+    const response = await this.createCommand(new Request(request.url, { method: 'POST', headers: request.headers, body: JSON.stringify(mapped) }), sessionId);
+    if (!response.ok) return response;
+    const data = await response.json() as { command: { id: string } };
+    return json({ ...data, command_id: data.command.id, state: 'queued', delivery: 'queued' }, response.status);
+  }
+
+  /** Command receipts in the shape `sessions send/capture/stop --wait` polls: ack.capture, ack.outcome, ack.confirmed_exit. */
+  private commandListing(request: Request, sessionId: string): Response {
+    const actor = actorFrom(request), session = this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?', sessionId);
+    if (!session || (!hasScope(actor, 'operator:admin') && !(hasScope(actor, 'session:read') && [session.id, session.project_id].includes(actor?.resource_id || '')))) return error('session_not_found', 404);
+    const rows = this.db.all<CommandRow>('SELECT * FROM session_commands WHERE session_id=? ORDER BY created_at DESC,id LIMIT 100', sessionId);
+    return json({ commands: rows.map(row => {
+      const result = row.result_json ? JSON.parse(row.result_json) as JsonRecord : null;
+      const ack = result === null ? null : {
+        ...result,
+        ...(row.kind === 'capture' && typeof result.output === 'string' ? { capture: result.output } : {}),
+        ...(row.kind === 'stop' ? { outcome: 'delivered', confirmed_exit: result.stopped === true } : {}),
+      };
+      return { id: row.id, session_id: row.session_id, kind: row.kind, state: row.state, created_at: row.created_at, ack };
+    }), next_cursor: null });
+  }
+
   private sessionDetail(request: Request, id: string): Response {
     const actor=actorFrom(request),row=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',id);
     if (!row || (!hasScope(actor,'operator:admin') && !(hasScope(actor,'session:read') && [row.id,row.project_id].includes(actor?.resource_id||'')))) return error('session_not_found',404);
-    return json({session:this.sessionView(row)});
+    const stopped = this.db.one<{result_json: string | null}>("SELECT result_json FROM session_commands WHERE session_id=? AND kind='stop' AND state='acked' ORDER BY created_at DESC LIMIT 1", row.id);
+    return json({session:{...this.sessionView(row), ...(stopped?.result_json && (JSON.parse(stopped.result_json) as JsonRecord).stopped === true ? { stop_confirmed: true } : {})}});
   }
 
   private sessionView(row: SessionRow): JsonRecord {
