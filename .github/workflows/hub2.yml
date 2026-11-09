@@ -101,6 +101,16 @@ jobs:
         continue-on-error: true
         run: npm run test:resource-manager --prefix hub2
 
+      - name: Model policy config tests
+        id: model_policy
+        continue-on-error: true
+        run: npm run test:model-policy --prefix hub2
+
+      - name: Machine capacity label tests
+        id: machine_capacity
+        continue-on-error: true
+        run: npm run test:machine-capacity --prefix hub2
+
       - name: Mail retention and restart e2e on Node runtime
         id: accounts_mail_node
         continue-on-error: true
@@ -158,6 +168,8 @@ jobs:
           DB_METERING: ${{ steps.db_metering.outcome }}
           CONTROL: ${{ steps.control.outcome }}
           RESOURCE_MANAGER: ${{ steps.resource_manager.outcome }}
+          MODEL_POLICY: ${{ steps.model_policy.outcome }}
+          MACHINE_CAPACITY: ${{ steps.machine_capacity.outcome }}
           ACCOUNTS_MAIL_NODE: ${{ steps.accounts_mail_node.outcome }}
           AUTH_FLOWS: ${{ steps.auth_flows.outcome }}
           AUTH_GC: ${{ steps.auth_gc.outcome }}
@@ -175,6 +187,7 @@ jobs:
             "project_work:$PROJECT_WORK" "project_intake:$PROJECT_INTAKE" \
             "read_cache:$READ_CACHE" "db_metering:$DB_METERING" \
             "control:$CONTROL" "resource_manager:$RESOURCE_MANAGER" \
+            "model_policy:$MODEL_POLICY" "machine_capacity:$MACHINE_CAPACITY" \
             "accounts_mail_node:$ACCOUNTS_MAIL_NODE" "auth_flows:$AUTH_FLOWS" \
             "auth_gc:$AUTH_GC" "machine_socket_cap:$MACHINE_SOCKET_CAP" \
             "core_node:$CORE_NODE" "public_mail:$PUBLIC_MAIL" \

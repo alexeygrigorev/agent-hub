@@ -1,0 +1,53 @@
+{
+  "candidates": [
+    {
+      "id": "codex-luna-max",
+      "engine": "codex",
+      "model": "gpt-6-luna",
+      "effort": "max",
+      "account_id": "codex",
+      "weight": 1,
+      "capabilities": [],
+      "enabled": true
+    },
+    {
+      "id": "codex-sol-medium",
+      "engine": "codex",
+      "model": "gpt-6.1-sol",
+      "effort": "medium",
+      "account_id": "codex",
+      "weight": 1,
+      "capabilities": [],
+      "enabled": true
+    },
+    {
+      "id": "codex-astra-medium",
+      "engine": "codex",
+      "model": "gpt-6-astra",
+      "effort": "medium",
+      "account_id": "codex",
+      "weight": 1,
+      "capabilities": [],
+      "enabled": true
+    },
+    {
+      "id": "claude-sonnet-medium",
+      "engine": "claude",
+      "model": "sonnet",
+      "effort": "medium",
+      "account_id": "claude",
+      "weight": 1,
+      "capabilities": [],
+      "enabled": true
+    },
+    {
+      "id": "go-muse",
+      "engine": "go",
+      "model": "opencode-go/muse-spark-1.3-contributor",
+      "account_id": "shared-go",
+      "weight": 1,
+      "capabilities": [],
+      "enabled": true
+    }
+  ]
+}
