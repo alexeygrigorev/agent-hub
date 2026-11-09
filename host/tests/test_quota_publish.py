@@ -18,7 +18,7 @@ class QuotaPublishTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             qp.publish(quse={'claude': {'status': 'error', 'error': 'boom'}}, request=lambda *a: {}, now_ms=1)
 
-    def test_publish_registers_new_account_disabled_then_puts(self):
+    def test_publish_registers_new_account_enabled_then_puts(self):
         calls = []
         def req(method, path, body=None):
             calls.append((method, path, body)); return {}
@@ -26,8 +26,19 @@ class QuotaPublishTests(unittest.TestCase):
         out = qp.publish(quse=quse, request=req, now_ms=5)
         self.assertEqual(out['published'], ['claude'])
         self.assertEqual([c[0] for c in calls], ['GET', 'PATCH', 'PUT'])
-        self.assertFalse(calls[1][2]['enabled'])
+        self.assertTrue(calls[1][2]['enabled'])
         self.assertEqual(calls[2][2]['remaining'], 95.0)
+
+    def test_enable_flag_flips_existing_disabled_account(self):
+        calls = []
+        def req(method, path, body=None):
+            calls.append(method)
+            return {'account': {'enabled': 0, 'capacity': 3, 'min_remaining': 5}} if method == 'GET' else {}
+        quse = {'claude': {'status': 'ok', 'windows': {'7d': {'percent_remaining': 9.0, 'reset_at': None}}}}
+        qp.publish(quse=quse, request=req, now_ms=5)
+        self.assertEqual(calls, ['GET', 'PUT'])
+        calls.clear(); qp.publish(quse=quse, request=req, now_ms=5, enable=True)
+        self.assertEqual(calls, ['GET', 'PATCH', 'PUT'])
 
 
 if __name__ == '__main__':
