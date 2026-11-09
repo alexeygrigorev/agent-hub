@@ -1067,14 +1067,14 @@ def _execute(args):
                 )
         key = getattr(args, 'key', None) or str(uuid.uuid4())
         repo = getattr(args, 'repo', None)
-        if bool(repo) == bool(getattr(args, 'workspace', None)):
-            raise ValueError('Give exactly one of --workspace or --repo')
+        if not repo and not getattr(args, 'workspace', None):
+            raise ValueError('Give --workspace or --repo (Hub2 needs --workspace for placement; add --repo when several projects exist)')
         payload = {'key': key}
         if repo:
             if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}', repo):
                 raise ValueError('--repo must be owner/name')
             payload['repo'] = repo
-        else:
+        if getattr(args, 'workspace', None):
             payload['workspace'] = args.workspace
         for field in ('engine', 'machine', 'tier', 'cwd'):
             value = getattr(args, field, None)
