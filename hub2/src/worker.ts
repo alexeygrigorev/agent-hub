@@ -527,9 +527,23 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
     return error('workspace_required', 400, 'Hub2 does not clone repositories; pass --workspace with an absolute path on the target host');
   const interactive = body.mode === 'interactive';
   const brief = text('brief');
-  if (!interactive && !brief) return error('brief_required', 400, 'headless sessions need --prompt or --brief-file');
+  const taskRef = text('intake_task_id');
+  if (taskRef !== undefined && !/^[A-Za-z0-9._:-]{6,128}$/.test(taskRef)) return error('invalid_intake_task_id', 400);
+  if (!interactive && !brief && !taskRef) return error('brief_required', 400, 'headless sessions need --prompt or --brief-file');
   const control = env.CONTROL.get(env.CONTROL.idFromName('global'));
+  // An existing intake already knows its project; resolve it (full id or unique prefix) instead of guessing.
+  let existingIntake: string | undefined;
   let project = text('repo') ?? text('project') ?? env.HUB2_DEFAULT_PROJECT;
+  if (taskRef !== undefined) {
+    const routed = await control.fetch(new Request(`${CONTROL}/api/routes/intake/${encodeURIComponent(taskRef)}`, { headers: { 'x-hub2-actor': JSON.stringify(actor) } }));
+    if (!routed.ok) {
+      const code = ((await routed.json().catch(() => ({}))) as JsonRecord).error;
+      return error(typeof code === 'string' ? code : 'intake_not_found', routed.status === 403 ? 403 : routed.status === 400 ? 400 : 404, 'intake_task_id did not resolve to a Hub2 intake');
+    }
+    const { route } = (await routed.json()) as { route: { id: string; owner: string } };
+    existingIntake = route.id;
+    project = route.owner;
+  }
   if (!project) {
     const list = await control.fetch(new Request(`${CONTROL}/api/repos?limit=2`, { headers: { 'x-hub2-actor': JSON.stringify(actor) } }));
     const items = list.ok ? ((await list.json()) as { items?: { canonical_name: string }[] }).items ?? [] : [];
@@ -550,7 +564,7 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
   };
   const name = text('name');
   const title = (name ?? brief?.split('\n')[0] ?? 'Interactive session').slice(0, 200);
-  const intake = await call('/api/intakes', {
+  const intake = existingIntake ? { response: new Response(null, { status: 200 }), data: { id: existingIntake } as JsonRecord } : await call('/api/intakes', {
     key: `${key}:intake`, title,
     text: brief ?? 'Interactive session started with `hub sessions start`; await operator input.',
     acceptance_criteria: ['The session started on a host, did the requested work and ended cleanly.'],

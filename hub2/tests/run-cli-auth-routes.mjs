@@ -114,6 +114,15 @@ try {
     const refused = await start({ ...base, ...patch });
     assert.equal(refused.status, status); assert.equal((await refused.json()).error, code);
   }
+  // --intake-task-id resolves the project from the intake itself (no --repo, no default project).
+  const made = await call('/api/intakes?project=owner%2Frepo', 'POST', { key: 'intake-for-start-1', title: 't', text: 'x', acceptance_criteria: ['done'] });
+  assert.equal(made.status, 201); const intakeId = (await made.json()).intake.id;
+  const byTask = await start({ key: 'start-by-task-01', workspace: '/tmp/ws', mode: 'headless', intake_task_id: intakeId.slice(0, 8) });
+  const byTaskBody = await byTask.json();
+  assert.notEqual(byTaskBody.error, 'project_required'); assert.notEqual(byTask.status, 501);
+  if (byTaskBody.intake_id) assert.equal(byTaskBody.intake_id, intakeId);
+  const missingTask = await start({ key: 'start-by-task-02', workspace: '/tmp/ws', mode: 'headless', intake_task_id: 'deadbeef00' });
+  assert.equal(missingTask.status, 404);
   assert.equal((await fixture.fetch('/api/sessions', { method: 'POST', body: '{}' })).status, 401);
   // No machine is connected in this fixture: placement must refuse with a typed 4xx/5xx, never 501 or a hang.
   const unplaced = await start(base); const unplacedBody = await unplaced.json();
