@@ -363,7 +363,7 @@ export class ProjectDO {
         // Typed Resource Manager hold before any saga exists: refuse with the
         // wire-compatible code; the next start attempt re-runs selection after
         // the bounded refresh/backoff carried by the hold kind.
-        return error(holdWireCode(decision.code), 409, decision.code);
+        return json({ error: holdWireCode(decision.code), detail: decision.code, ...(decision.hold.reason ? { reason: decision.hold.reason } : {}) }, 409);
       }
       route = decision.plan;
     }

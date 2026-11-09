@@ -25,7 +25,7 @@ type MachineView={machine_id:string;available:boolean;capacity:number;occupied:n
 type AccountView={account:{enabled:number|boolean;capacity:number;occupied:number;min_remaining:number}|null;quota:{remaining:number;valid_until:number;captured_at?:number;reset_at?:number;source:string}|null;fresh:boolean;hosts:string[]};
 export type AdmissionPlan={machine_id:string;engine:string;model:string;effort?:string;account_id:string;policy_id:string;policy_version:unknown;override_reason:string|null;weight:number;quota_remaining:number;required_capabilities:string[]};
 export type HoldKind='quota_unknown'|'quota_stale'|'quota_exhausted'|'account_saturated'|'machine_unavailable'|'host_resources_unknown'|'host_resources_stale'|'host_resources_saturated'|'capability_unavailable'|'model_policy_unavailable'|'routing_policy_unavailable';
-export type AdmissionOutcome={ok:true;plan:AdmissionPlan}|{ok:false;code:HoldKind;hold:{retry_at:number|null}};
+export type AdmissionOutcome={ok:true;plan:AdmissionPlan}|{ok:false;code:HoldKind;hold:{retry_at:number|null;reason?:string}};
 type PolicyDocument={version:unknown;candidates:RoutingCandidate[]};
 const internalActor=JSON.stringify({id:'hub2-resource-manager',kind:'operator',scopes:['operator:admin','routing:read']});
 /** Bounded hold backoff while a triggered refresh runs; never a busy loop. */
@@ -97,6 +97,9 @@ export async function admitLaunch(env:Hub2Env,input:AdmissionRequest):Promise<Ad
   const ids=(directory.items as {id:string}[]).map(v=>v.id).filter(id=>!input.machine_id||input.machine_id===id);
   if(!ids.length)return{ok:false,code:'machine_unavailable',hold:{retry_at:null}};
   const machineResults=await Promise.all(ids.map(async id=>{try{return await read(env.MACHINES,id,'/_internal/routing') as MachineView;}catch{return null;}}));
+  // Say why a host was skipped (busy/offline) instead of a bare machine_unavailable.
+  const skipped=machineResults.filter((m):m is MachineView&{reason?:string}=>!!m&&!(m.available&&ids.includes(m.machine_id)));
+  let machineReason:string|undefined=skipped.some(m=>m.reason==='machine_capacity')?'machine_capacity':skipped[0]?.reason||(machineResults.some(m=>!m)?'machine_unreadable':undefined);
   const machines=machineResults.filter((m):m is MachineView=>!!m&&m.available&&ids.includes(m.machine_id));
   const accountIds=[...new Set(candidates.map(c=>c.account_id))];
   const accounts=new Map<string,AccountView|null>(await Promise.all(accountIds.map(async id=>{try{return [id,await read(env.ACCOUNTS,id,'/_internal/routing') as AccountView] as const;}catch{return [id,null] as const;}})));
@@ -111,7 +114,7 @@ export async function admitLaunch(env:Hub2Env,input:AdmissionRequest):Promise<Ad
     if(hold){worst=merge(hold.code,hold.retry_at);continue;}
     if(!Number.isFinite(c.weight)||c.weight<=0)throw new HttpError('routing_policy_invalid',503);
     for(const m of machines){
-      if(!a.hosts.includes(m.machine_id)){worst=merge('machine_unavailable',null);continue;}
+      if(!a.hosts.includes(m.machine_id)){machineReason='account_host_not_approved';worst=merge('machine_unavailable',null);continue;}
       const resources=hostHold(m.resources,now);
       if(resources){worst=merge(resources.code,resources.retry_at);continue;}
       if(!m.engines.includes(c.engine)||required.some(v=>!m.capabilities.includes(v)&&!m.capabilities.includes(v+':'+c.engine))||(c.effort&&!m.capabilities.includes('effort')&&!m.capabilities.includes('effort:'+c.engine))||required.filter(v=>!['headless','interactive'].includes(v)).some(v=>!c.capabilities.includes(v))){
@@ -123,8 +126,8 @@ export async function admitLaunch(env:Hub2Env,input:AdmissionRequest):Promise<Ad
     }
   }
   if(!options.length){
-    if(worst)return{ok:false,code:worst.code,hold:{retry_at:worst.retry_at}};
-    throw new HttpError('machine_unavailable',409);
+    const reason=!worst||worst.code==='machine_unavailable'?machineReason:undefined;
+    return{ok:false,code:worst?.code??'machine_unavailable',hold:{retry_at:worst?.retry_at??null,...(reason?{reason}:{})}};
   }
   options.sort((a,b)=>(a.policy_id+'\0'+a.machine_id).localeCompare(b.policy_id+'\0'+b.machine_id));
   const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(input.operation_id));

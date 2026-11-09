@@ -789,8 +789,10 @@ def main():
     if args.cmd in ('submit', 'jobs', 'job', 'task-result', 'routing-machines', 'device-pending', 'model-policy', 'task-artifact', 'artifact', 'host-release', 'launcher-release', 'host-goal'):
         try:
             print(json.dumps(routing.execute(args), indent=2))
-        except Exception:
-            print('Hub task operation failed; check inputs, authentication and host admission.', file=sys.stderr)
+        except Exception as exc:
+            from . import session_control
+            print('Hub task operation failed (%s): %s; check inputs, authentication and host admission.'
+                  % (args.cmd, session_control.diagnostic(exc)), file=sys.stderr)
             sys.exit(1)
         return
 

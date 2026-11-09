@@ -174,3 +174,15 @@ test('orchestration refusals carry typed reasons and account release requires qu
  const mismatch=await releaseAccountCapacity(renv,{account_id:'account',attempt_operation_id:'op:0',session_id:'s',machine_id:'m',epoch:3},{unclaimed_proof:{x:1}});
  assert.equal(mismatch.released,false,'identity mismatch must not count as released');
 });
+test('busy, offline and unapproved hosts are refused with a specific reason',async()=>{
+ const busy=setup();Object.assign(busy.machine,{available:false,occupied:1,reason:'machine_capacity'});
+ let outcome=await admitLaunch(busy.env,input);
+ assert.equal(outcome.ok,false);
+ if(!outcome.ok){assert.equal(outcome.code,'machine_unavailable');assert.equal(outcome.hold.reason,'machine_capacity');}
+ const off=setup();Object.assign(off.machine,{available:false,reason:'machine_offline'});
+ outcome=await admitLaunch(off.env,input);
+ if(!outcome.ok)assert.equal(outcome.hold.reason,'machine_offline');else assert.fail('offline host must refuse');
+ const unapproved=setup();unapproved.account.hosts=[];
+ outcome=await admitLaunch(unapproved.env,input);
+ if(!outcome.ok)assert.equal(outcome.hold.reason,'account_host_not_approved');else assert.fail('unapproved host must refuse');
+});
