@@ -464,6 +464,41 @@ class HostTests(unittest.TestCase):
         self.assertEqual(sent[0]["reason"], "command_fence_conflict")
         self.assertEqual(self.native.calls, [])
 
+    def insert_orphan_launch(self, session="session-orphan", operation="op-orphan:0", epoch=7):
+        with self.journal.db:
+            self.journal.db.execute(
+                "INSERT INTO launches(operation_id,session_id,epoch,digest,workspace,tag,native_id,state,interactive) "
+                "VALUES(?,?,?,?,?,?,NULL,'launching',0)",
+                (operation, session, epoch, "digest", str(self.root), "task-hub2-" + session))
+
+    def test_stop_acknowledged_for_launch_orphaned_before_native_id(self):
+        self.insert_orphan_launch()
+        self.bridge.dispatch({"type": "session.command", "command": {
+            "id": "stop-orphan", "session_id": "session-orphan", "epoch": 7, "kind": "stop"}},
+            type("S", (), {"send": lambda self, value: None})(), None)
+        self.assertEqual(self.native.calls, [])
+        self.journal.flush(self.client)
+        self.assertIn(("POST", "/api/sessions/session-orphan/commands/stop-orphan/ack?safety=operator_stop",
+                       {"epoch": 7, "result": {"stopped": True}}, "command:stop-orphan"), self.client.calls)
+
+    def test_reconcile_sweeps_launch_orphan_to_aborting(self):
+        self.insert_orphan_launch()
+        self.bridge.reconcile()
+        state = self.journal.db.execute(
+            "SELECT state FROM launches WHERE session_id='session-orphan'").fetchone()[0]
+        self.assertEqual(state, "aborting")
+
+    def test_non_stop_command_still_refused_for_launch_orphan(self):
+        self.insert_orphan_launch()
+        sent = []
+        class Socket:
+            def send(self, value):
+                sent.append(json.loads(value))
+        self.bridge.dispatch({"type": "session.command", "command": {
+            "id": "cap-orphan", "session_id": "session-orphan", "epoch": 7, "kind": "capture"}}, Socket(), None)
+        self.assertEqual(sent[0]["type"], "host.error")
+        self.assertEqual(sent[0]["reason"], "command_fence_conflict")
+
     def test_no_shell_flags_and_fenced_capture_stop(self):
         self.bridge.offer(self.offer())
         capture = self.bridge.command({"id": "capture-1", "session_id": "session-1", "epoch": 1, "kind": "capture"})

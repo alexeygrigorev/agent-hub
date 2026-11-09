@@ -265,10 +265,16 @@ class Bridge:
             self.journal.db.execute("UPDATE launches SET state='aborting' WHERE operation_id=? AND state='launching'",(operation,))
 
     def reconcile(self):
-        rows = self.journal.db.execute("SELECT * FROM launches WHERE state IN ('running','aborting') LIMIT 1001").fetchall()
+        rows = self.journal.db.execute("SELECT * FROM launches WHERE state IN ('running','aborting','launching') LIMIT 1001").fetchall()
         if len(rows) > 1000:
             raise RuntimeError("active_native_bound_exceeded")
         for row in rows:
+            if row['state']=='launching':
+                # reconcile runs on the same thread as offer(), so a launching row
+                # observed here lost its dispatch before a native id was recorded.
+                with self.journal.db:
+                    self.journal.db.execute("UPDATE launches SET state='aborting' WHERE operation_id=? AND state='launching'",(row['operation_id'],))
+                row = self.journal.db.execute("SELECT * FROM launches WHERE operation_id=?", (row['operation_id'],)).fetchone()
             if row['state']=='aborting' and not row['native_id']:
                 try:identity=self.launcher.aborted_identity('hub2-'+row['session_id'],row['workspace'])
                 except RuntimeError:identity=None
@@ -328,9 +334,22 @@ class Bridge:
                               {"epoch": command["epoch"], "result": result})
             return result
         row = db.execute("SELECT * FROM launches WHERE session_id=?", (command.get("session_id"),)).fetchone()
+        kind = command.get("kind")
+        if row and row["epoch"] == command.get("epoch") and row["state"] == "launching" and not row["native_id"]:
+            # command() and offer() run on the same thread, so a launching row seen
+            # here lost its dispatch before the native identity was recorded; there
+            # is no verified process to signal and the stop succeeds by construction.
+            if kind != "stop":
+                raise ValueError("command_fence_conflict")
+            result = {"stopped": True}
+            with db:
+                db.execute("INSERT INTO commands VALUES(?,?,'executing',NULL)", (identity, digest))
+                db.execute("UPDATE commands SET state='done',result=? WHERE id=?", (canonical(result), identity))
+            self.journal.emit(f"command:{identity}", f"/api/sessions/{command['session_id']}/commands/{identity}/ack?safety=operator_stop",
+                              {"epoch": command["epoch"], "result": result})
+            return result
         if not row or row["epoch"] != command.get("epoch") or not row["native_id"]:
             raise ValueError("command_fence_conflict")
-        kind = command.get("kind")
         if kind not in {"capture", "send", "stop"}:
             raise ValueError("command_not_allowed")
         if kind == "send" and row["interactive"] != 1:
