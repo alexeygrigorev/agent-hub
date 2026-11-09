@@ -21,11 +21,11 @@ type RoutingCandidate={id:string;engine:string;model:string;effort?:string;accou
 /** MachineDO /_internal/routing wire contract: resources is the bounded
  * heartbeat snapshot {mem_available_mb,observed_at} exactly as persisted, or
  * absent on hosts that have not reported one yet. */
-type MachineView={machine_id:string;available:boolean;capacity:number;occupied:number;engines:string[];capabilities:string[];resources?:{mem_available_mb:number;observed_at:number;cpu_load_pct?:number}};
+type MachineView={machine_id:string;available:boolean;reason?:string|null;capacity:number;occupied:number;engines:string[];capabilities:string[];resources?:{mem_available_mb:number;observed_at:number;cpu_load_pct?:number}};
 type AccountView={account:{enabled:number|boolean;capacity:number;occupied:number;min_remaining:number}|null;quota:{remaining:number;valid_until:number;captured_at?:number;reset_at?:number;source:string}|null;fresh:boolean;hosts:string[]};
 export type AdmissionPlan={machine_id:string;engine:string;model:string;effort?:string;account_id:string;policy_id:string;policy_version:unknown;override_reason:string|null;weight:number;quota_remaining:number;required_capabilities:string[]};
 export type HoldKind='quota_unknown'|'quota_stale'|'quota_exhausted'|'account_saturated'|'machine_unavailable'|'host_resources_unknown'|'host_resources_stale'|'host_resources_saturated'|'capability_unavailable'|'model_policy_unavailable'|'routing_policy_unavailable';
-export type AdmissionOutcome={ok:true;plan:AdmissionPlan}|{ok:false;code:HoldKind;hold:{retry_at:number|null}};
+export type AdmissionOutcome={ok:true;plan:AdmissionPlan}|{ok:false;code:HoldKind;hold:{retry_at:number|null;reason?:string}};
 type PolicyDocument={version:unknown;candidates:RoutingCandidate[]};
 const internalActor=JSON.stringify({id:'hub2-resource-manager',kind:'operator',scopes:['operator:admin','routing:read']});
 /** Bounded hold backoff while a triggered refresh runs; never a busy loop. */
@@ -98,6 +98,11 @@ export async function admitLaunch(env:Hub2Env,input:AdmissionRequest):Promise<Ad
   if(!ids.length)return{ok:false,code:'machine_unavailable',hold:{retry_at:null}};
   const machineResults=await Promise.all(ids.map(async id=>{try{return await read(env.MACHINES,id,'/_internal/routing') as MachineView;}catch{return null;}}));
   const machines=machineResults.filter((m):m is MachineView=>!!m&&m.available&&ids.includes(m.machine_id));
+  if(!machines.length){
+    // Name why: a machine runs one session at a time, so a busy host is machine_capacity, not a missing machine.
+    const why=machineResults.find(m=>m&&m.reason)?.reason;
+    return{ok:false,code:'machine_unavailable',hold:{retry_at:null,...(typeof why==='string'?{reason:why}:{})}};
+  }
   const accountIds=[...new Set(candidates.map(c=>c.account_id))];
   const accounts=new Map<string,AccountView|null>(await Promise.all(accountIds.map(async id=>{try{return [id,await read(env.ACCOUNTS,id,'/_internal/routing') as AccountView] as const;}catch{return [id,null] as const;}})));
   const options:AdmissionPlan[]=[];
