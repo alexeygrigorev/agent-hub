@@ -2818,12 +2818,16 @@ def execute():
     # Release the provisioning lock before any long-lived provider process.
     # Headless output must be retained before native automatic retirement;
     # native containment/exit receipts still determine the session outcome.
+    if os.name != 'nt' and not is_diagnostic and stdin_closed_for_exec(b['provider'], extra_argv):
+        devnull = os.open(os.devnull, os.O_RDONLY)
+        os.dup2(devnull, 0)
+        os.close(devnull)
     if os.name != 'nt' and not is_diagnostic:
         from . import headless_output
         if headless_output.identity(env, PACKAGES[b['provider']][2]) is not None:
             headless_output.exit_like_child(headless_output.run(argv, env, PACKAGES[b['provider']][2]))
     if os.name == 'nt':
-        res = subprocess.run(argv, env=env)
+        res = subprocess.run(argv, env=env, stdin=subprocess.DEVNULL if stdin_closed_for_exec(b['provider'], extra_argv) else None)
         sys.exit(res.returncode)
     else:
         os.execve(command[0], argv, env)
@@ -2831,24 +2835,53 @@ def execute():
 
 # Provider -> native credential file inside the managed home. Providers not
 # listed have no reliable file probe and are not judged here.
-LOGIN_FILES = {'codex': ('.codex/auth.json',)}
+LOGIN_FILES = {'codex': ('.codex/auth.json',), 'claude': ('.claude/.credentials.json',)}
+LOGIN_ENV = {'claude': ('CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY')}
 
 
 def profile_logged_in(bundle, dest):
-    """True unless the managed profile provably has no credential."""
+    """True unless the managed profile provably has no usable credential."""
     paths = LOGIN_FILES.get(bundle.get('provider'))
     if not paths:
+        return True
+    env = bundle.get('env') if isinstance(bundle.get('env'), dict) else {}
+    if any(env.get(name) for name in LOGIN_ENV.get(bundle.get('provider'), ())):
         return True
     files = bundle.get('files') if isinstance(bundle.get('files'), dict) else {}
     for rel in paths:
         if files.get(rel):
             return True
+        target = Path(dest) / 'home' / rel
         try:
-            if (Path(dest) / 'home' / rel).stat().st_size > 0:
+            # Unreadable (mode 000) counts as logged out: the engine cannot read it either.
+            if target.stat().st_size > 0 and os.access(target, os.R_OK):
                 return True
         except OSError:
             pass
     return False
+
+
+def stdin_closed_for_exec(provider, argv):
+    """True when a headless codex/zai `exec <prompt>` must not inherit an open stdin.
+
+    codex reads piped stdin to EOF and appends it to the prompt ("Reading
+    additional input from stdin..."); a parent that keeps the pipe open makes
+    the run hang after turn.started forever. A positional prompt (anything but
+    the '-' stdin marker) is complete on its own, so stdin goes to /dev/null.
+    """
+    if provider not in ('codex', 'zai') or 'exec' not in argv:
+        return False
+    rest = argv[argv.index('exec') + 1:]
+    positional, skip = [], False
+    for arg in rest:
+        if skip:
+            skip = False
+        elif arg in ('-m', '--model', '-c', '--config', '-C', '--cd', '-s', '--sandbox', '-p', '--profile',
+                     '--output-schema', '-o', '--output-last-message', '--color', '-i', '--image'):
+            skip = True
+        elif not arg.startswith('-') or arg == '-':
+            positional.append(arg)
+    return bool(positional) and positional[-1] != '-'
 
 
 def admission():
