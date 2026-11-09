@@ -27,7 +27,7 @@ def add_commands(sub):
     parser.add_argument("--account", default=None, help="Limit to one account label")
     parser.add_argument("--admin-token-file", default=None, help="Use an existing private Hub operator token for this read")
     parser.add_argument("--json", action="store_true", help="Emit raw JSON instead of text")
-    parser.add_argument("tbm", nargs="?", default=None, choices=["history", "pacing", "metrics", "banked", "kill-switch"],
+    parser.add_argument("tbm", nargs="?", default=None, choices=["history", "pacing", "metrics", "banked", "kill-switch", "publish"],
                         help="TBM view: pacing, metrics, banked, or kill-switch (fleet filters do not apply)")
     parser.add_argument("kill_action", nargs="?", default=None, choices=["on", "off"],
                         help="kill-switch write: on|off (read when omitted)")
@@ -81,6 +81,9 @@ def execute(args):
         if getattr(args, "kill_action", None) is not None or getattr(args, "reason", None) is not None:
             raise ValueError("Invalid quota arguments")
         return fetch_quota(**kwargs)
+    if tbm_view == 'publish':
+        from . import quota_publish
+        return quota_publish.publish()
     if tbm_view == 'history':
         if any(getattr(args, key, None) is not None for key in ('provider', 'engine', 'account', 'admin_token_file', 'kill_action', 'reason')):
             raise ValueError('History accepts --range, --kind and --host only')
@@ -148,7 +151,7 @@ def render_text(data):
             pool.get("state", "unknown") + (" [DISABLED: excluded from routing]" if pool.get("routing") == "disabled" else ""),
             left, pool.get("observed_at") or "never",
             ", ".join(pool.get("observed_by_hosts") or []) or "no host",
-            decision_suffix))
+            (decision_suffix + (", resets %s" % pool["reset_at"] if pool.get("reset_at") else ""))))
     coverage = data.get("coverage") if isinstance(data.get("coverage"), dict) else {}
     account_coverage = data.get("account_coverage")
     if isinstance(account_coverage, dict):

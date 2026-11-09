@@ -142,6 +142,11 @@ const router = {
       if (projectPath) {
         const url = requestUrl(request);
         let requested = url.searchParams.get('project');
+        if (!requested && request.method === 'POST' && (path === '/api/intakes' || path === '/api/intake/tasks')) {
+          // Intake create carries the project in its JSON body (CLI/MCP); accept it like the query form.
+          const body = (await request.clone().json().catch(() => null)) as { project?: unknown } | null;
+          if (typeof body?.project === 'string' && body.project) requested = body.project;
+        }
         const intakeId = path.match(/^\/api\/(?:intakes|intake\/tasks)\/([^/]+)/)?.[1];
         if (!requested && intakeId) {
           const response = await control.fetch(
@@ -167,7 +172,8 @@ const router = {
           const internalPath = url.pathname.replace('/api/intake/tasks','/api/intakes');
           return env.PROJECTS.get(env.PROJECTS.idFromName(route.owner)).fetch(await forwardRequest(request,'https://project.internal'+internalPath+url.search,actor));
         }
-        if (!requested || requested.length > 180) return error('project_required', 400);
+        if (!requested || requested.length > 180)
+          return error('project_required', 400, 'pass --project <owner/name> (a repo from `hub repos list`) or ?project=');
         const repoResponse = await control.fetch(
           new Request(`${CONTROL}/api/repos/${encodeURIComponent(requested)}`, {
             headers: { 'x-hub2-actor': JSON.stringify(actor) },
@@ -627,6 +633,12 @@ async function machineProjection(
 }
 
 
+/** Canonical quota account labels published by `hub quota publish`; unconfigured ones are skipped. */
+const QUOTA_ACCOUNT_ENGINES: Record<string, string[]> = {
+  claude: ['claude'], codex: ['codex'], 'codex-orin': ['codex'], gemini: ['gemini'],
+  grok: ['grok'], copilot: ['copilot'], 'shared-go': ['opencode'],
+};
+
 /** Bounded, usage-only view of the accounts referenced by the routing policy. */
 async function quotaProjection(request: Request, env: Hub2Env, actor: Actor): Promise<Response> {
   if (!admin(actor)) return error('forbidden', 403);
@@ -644,12 +656,12 @@ async function quotaProjection(request: Request, env: Hub2Env, actor: Actor): Pr
   if (response.ok) candidates = (await response.json() as { candidates: typeof candidates }).candidates;
   else if (response.status !== 404) return response;
   if (candidates.length > 32) return error('quota_projection_bound_exceeded', 503);
-  const ids = [...new Set([...candidates.map(c => c.account_id), ...(env.HUB2_DEFAULT_ACCOUNT_ID ? [env.HUB2_DEFAULT_ACCOUNT_ID] : [])])];
+  const ids = [...new Set([...candidates.map(c => c.account_id), ...Object.keys(QUOTA_ACCOUNT_ENGINES), ...(env.HUB2_DEFAULT_ACCOUNT_ID ? [env.HUB2_DEFAULT_ACCOUNT_ID] : [])])];
   const pools: JsonRecord[] = [];
   for (const id of ids) {
     if (!/^[A-Za-z0-9_.-]{1,80}$/.test(id) || ['shared-zai', 'zcodex'].includes(id))
       return error('invalid_account', 503);
-    const engines = [...new Set(candidates.filter(c => c.account_id === id).map(c => c.engine))];
+    const engines = [...new Set([...candidates.filter(c => c.account_id === id).map(c => c.engine), ...(QUOTA_ACCOUNT_ENGINES[id] ?? [])])];
     if ((q.has('account') && q.get('account') !== id) || (q.has('engine') && !engines.includes(q.get('engine')!))) continue;
     const r = await env.ACCOUNTS.get(env.ACCOUNTS.idFromName(id)).fetch(
       await forwardRequest(request, 'https://account.internal/api/account/quota', actor),
@@ -661,6 +673,7 @@ async function quotaProjection(request: Request, env: Hub2Env, actor: Actor): Pr
       fresh: boolean;
     };
     if (q.has('provider') && q.get('provider') !== data.account?.provider) continue;
+    if (!data.account && !data.quota) continue; // well-known account label never configured
     pools.push({
       provider: data.account?.provider || 'unknown', account: id, engines,
       routing: data.account?.enabled ? 'enabled' : 'disabled',
