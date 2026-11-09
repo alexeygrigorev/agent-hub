@@ -186,3 +186,18 @@ test('busy, offline and unapproved hosts are refused with a specific reason',asy
  outcome=await admitLaunch(unapproved.env,input);
  if(!outcome.ok)assert.equal(outcome.hold.reason,'account_host_not_approved');else assert.fail('unapproved host must refuse');
 });
+test('a pinned machine absent from the credential directory is refused as machine_not_enrolled',async()=>{
+ const f=setup();
+ const outcome=await admitLaunch(f.env,{...input,machine_id:'never-paired',override_reason:'desktop enrollment check'});
+ assert.equal(outcome.ok,false);
+ if(!outcome.ok){
+  assert.equal(outcome.code,'machine_unavailable');
+  assert.equal(outcome.hold.reason,'machine_not_enrolled');
+  assert.equal(f.calls.some(c=>c[0]==='machine'),false,'no machine DO probe for an unenrolled pin');
+ }
+ const g=setup();
+ g.env.CONTROL={idFromName:(id:string)=>id,get:(id:string)=>({fetch:async(url:string|Request)=>Response.json(new URL(url instanceof Request?url.url:url).pathname==='/_routing-policy'?g.policy:{items:[],next:null})})};
+ const bare=await admitLaunch(g.env,input);
+ assert.equal(bare.ok,false);
+ if(!bare.ok)assert.equal(bare.hold.reason,undefined,'an empty fleet without a pin stays a bare machine_unavailable');
+});
