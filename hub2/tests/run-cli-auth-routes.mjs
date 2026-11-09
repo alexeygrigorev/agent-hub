@@ -102,6 +102,25 @@ try {
   assert.equal((await call('/api/repos/owner%2Frepo', 'PATCH', { canonical_url: 'https://github.com/owner/repo', purpose: 'CLI route test', aliases: ['repo'] })).status, 200);
   assert.equal((await (await call('/api/repos')).json()).items[0].canonical_name, 'owner/repo');
 
+  // POST /api/sessions never answers 501 or a list: each refusal names its reason.
+  const start = (body) => call('/api/sessions', 'POST', body);
+  const base = { key: 'start-test-0001', workspace: '/tmp/ws', mode: 'headless', brief: 'do the thing', repo: 'owner/repo' };
+  for (const [patch, status, code] of [
+    [{ key: undefined }, 400, 'idempotency_key_required'],
+    [{ workspace: undefined }, 400, 'workspace_required'],
+    [{ brief: undefined }, 400, 'brief_required'],
+    [{ repo: 'owner/missing' }, 404, 'project_not_found_or_forbidden'],
+  ]) {
+    const refused = await start({ ...base, ...patch });
+    assert.equal(refused.status, status); assert.equal((await refused.json()).error, code);
+  }
+  assert.equal((await fixture.fetch('/api/sessions', { method: 'POST', body: '{}' })).status, 401);
+  // No machine is connected in this fixture: placement must refuse with a typed 4xx/5xx, never 501 or a hang.
+  const unplaced = await start(base); const unplacedBody = await unplaced.json();
+  assert(![200, 501].includes(unplaced.status), 'unplaced start status ' + unplaced.status);
+  assert(unplacedBody.error || unplacedBody.id, 'start answered neither a session nor an error');
+  if (unplacedBody.id) assert(unplacedBody.engine && unplacedBody.model, 'accepted start reports the chosen engine+model');
+
   const config = resolve(scratch, 'cli.json');
   await writeFile(config, JSON.stringify({ client_kind: 'human', access_token: token, base_url: fixture.origin }), { mode: 0o600 });
   const cliEnv = { HOME: scratch, XDG_CONFIG_HOME: scratch, HUB_CONFIG_FILE: config, PYTHONPATH: resolve(root, 'host'), HUB2_TOKEN: '', HUB_TOKEN: '' };

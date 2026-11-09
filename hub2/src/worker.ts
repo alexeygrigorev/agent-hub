@@ -98,7 +98,7 @@ const router = {
           ),
         );
       if (path === '/api/sessions' && request.method !== 'GET' && request.method !== 'HEAD')
-        return error('session_start_not_implemented', 501);
+        return request.method === 'POST' ? await startSession(request, env, actor) : error('method_not_allowed', 405);
       if (path === '/api/fleet' || path === '/api/fleet/machines' || path === '/api/sessions')
         return await machineProjection(request, env, actor, path === '/api/sessions');
       if (path === '/api/status') {
@@ -495,6 +495,78 @@ async function forwardRequest(
     headers,
     ...(body ? { body } : {}),
   });
+}
+
+/**
+ * POST /api/sessions: `hub sessions start`. Creates a project intake and starts
+ * it through the normal admission/saga path, so placement (capacity, quota,
+ * model policy) is chosen server-side when the caller gives no model.
+ * Every refusal names a reason; nothing here waits on a machine.
+ */
+async function startSession(request: Request, env: Hub2Env, actor: Actor): Promise<Response> {
+  if (!admin(actor) && !actor.scopes.includes('session:start')) return error('forbidden', 403);
+  let body: JsonRecord;
+  try {
+    const parsed = JSON.parse(await boundedText(request, 32_768));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return error('invalid_json_object', 400);
+    body = parsed as JsonRecord;
+  } catch (caught) {
+    if (caught instanceof HttpError) return error(caught.code, caught.status);
+    return error('invalid_json', 400);
+  }
+  const key = body.key;
+  if (typeof key !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}$/.test(key)) return error('idempotency_key_required', 400);
+  const text = (field: string): string | undefined => typeof body[field] === 'string' && (body[field] as string).trim() ? (body[field] as string).trim() : undefined;
+  if (typeof body.workspace !== 'string' || !body.workspace)
+    return error('workspace_required', 400, 'Hub2 does not clone repositories; pass --workspace with an absolute path on the target host');
+  const interactive = body.mode === 'interactive';
+  const brief = text('brief');
+  if (!interactive && !brief) return error('brief_required', 400, 'headless sessions need --prompt or --brief-file');
+  const control = env.CONTROL.get(env.CONTROL.idFromName('global'));
+  let project = text('repo') ?? text('project') ?? env.HUB2_DEFAULT_PROJECT;
+  if (!project) {
+    const list = await control.fetch(new Request(`${CONTROL}/api/repos?limit=2`, { headers: { 'x-hub2-actor': JSON.stringify(actor) } }));
+    const items = list.ok ? ((await list.json()) as { items?: { canonical_name: string }[] }).items ?? [] : [];
+    if (items.length !== 1) return error('project_required', 400, 'pass --repo owner/name (no unique default project)');
+    project = items[0].canonical_name;
+  }
+  const repoResponse = await control.fetch(new Request(`${CONTROL}/api/repos/${encodeURIComponent(project)}`, { headers: { 'x-hub2-actor': JSON.stringify(actor) } }));
+  if (!repoResponse.ok) return error('project_not_found_or_forbidden', repoResponse.status === 403 ? 403 : 404);
+  const repo = (await repoResponse.json()) as { repo?: { canonical_name?: string; status?: string } };
+  if (repo.repo?.status !== 'active' || !repo.repo.canonical_name) return error('project_inactive', 409);
+  const canonical = repo.repo.canonical_name;
+  const stub = env.PROJECTS.get(env.PROJECTS.idFromName(canonical));
+  const call = async (path: string, payload: JsonRecord): Promise<{ response: Response; data: JsonRecord }> => {
+    const response = await stub.fetch(await forwardRequest(
+      new Request(request.url, { method: 'POST', headers: request.headers, body: JSON.stringify(payload) }),
+      `https://project.hub2.internal${path}?project=${encodeURIComponent(canonical)}`, actor));
+    return { response, data: (await response.json().catch(() => ({}))) as JsonRecord };
+  };
+  const name = text('name');
+  const title = (name ?? brief?.split('\n')[0] ?? 'Interactive session').slice(0, 200);
+  const intake = await call('/api/intakes', {
+    key: `${key}:intake`, title,
+    text: brief ?? 'Interactive session started with `hub sessions start`; await operator input.',
+    acceptance_criteria: ['The session started on a host, did the requested work and ended cleanly.'],
+  });
+  const intakeId = (intake.data.intake as { id?: string } | undefined)?.id ?? (intake.data.id as string | undefined);
+  if (!intake.response.ok || !intakeId) return json({ ...intake.data, error: intake.data.error ?? 'intake_create_failed', stage: 'intake' }, intake.response.ok ? 502 : intake.response.status);
+  const start: JsonRecord = {
+    key, workspace: body.workspace, interactive, with_goal: body.with_goal === true,
+    ...(brief ? { prompt: brief } : {}),
+    ...(text('machine') ? { machine_id: text('machine') } : {}),
+    ...(text('engine') ? { engine: text('engine') } : {}),
+    ...(text('model') ? { model: text('model') } : {}),
+    ...(text('effort') ? { effort: text('effort') } : {}),
+    ...(text('engine_override_reason') ? { override_reason: text('engine_override_reason') } : {}),
+    ...(Array.isArray(body.needs) ? { required_capabilities: body.needs } : {}),
+  };
+  const started = await call(`/api/intakes/${encodeURIComponent(intakeId)}/start`, start);
+  const session = started.data.session as JsonRecord | undefined;
+  if (!started.response.ok || !session?.id)
+    return json({ ...started.data, error: started.data.error ?? 'session_start_failed', stage: 'start', intake_id: intakeId }, started.response.ok ? 502 : started.response.status);
+  // 201 = offered to the host; 202 = accepted but still placing (see held_reason).
+  return json({ ...session, project: canonical, intake_id: intakeId }, started.response.status);
 }
 
 function safetyModeForRequest(
