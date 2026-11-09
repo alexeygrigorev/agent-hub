@@ -6,6 +6,7 @@ import io
 import json
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -58,7 +59,7 @@ def test_codex_profile_with_bundle_or_home_credential_is_admitted(tmp_path, monk
 
 
 def test_providers_without_a_file_probe_are_not_judged():
-    assert p.profile_logged_in({'provider': 'claude', 'files': {}}, '/nonexistent') is True
+    assert p.profile_logged_in({'provider': 'go', 'files': {}}, '/nonexistent') is True
     assert p.profile_logged_in({'provider': 'codex', 'files': {}}, '/nonexistent') is False
 
 
@@ -80,3 +81,61 @@ def test_admission_projection_advertises_not_logged_in(monkeypatch):
     assert allowed is False and engines == set()
     assert {(r['mode'], r['reason'], r['profile']) for r in caps['fleet_route_rejections']} == {
         ('interactive', 'not_logged_in', 'hub-dummy-sync-5814'), ('headless', 'not_logged_in', 'hub-dummy-sync-5814')}
+
+
+def test_claude_profile_logged_out_unless_credential_readable(tmp_path):
+    cred = tmp_path / 'home/.claude/.credentials.json'
+    cred.parent.mkdir(parents=True)
+    claude = {'provider': 'claude', 'files': {}, 'env': {}}
+    assert p.profile_logged_in(claude, tmp_path) is False  # missing
+    cred.write_text('{"claudeAiOauth": {}}')
+    assert p.profile_logged_in(claude, tmp_path) is True
+    cred.chmod(0)  # hub-claude on 2026-11-09: owner cannot read it -> "Not logged in"
+    if os.access(cred, os.R_OK):
+        pytest.skip('running as root')
+    assert p.profile_logged_in(claude, tmp_path) is False
+    assert p.profile_logged_in({'provider': 'claude', 'files': {}, 'env': {'CLAUDE_CODE_OAUTH_TOKEN': 'x'}}, tmp_path) is True
+
+
+def test_claude_profile_without_credential_is_not_admitted(tmp_path, monkeypatch):
+    bundle = dict(label='hub-claude', provider='claude', version='2.1.304', revision=REV, files={}, env={}, args=[])
+    res = run_admission(tmp_path, monkeypatch, bundle)
+    assert res['launch_allowed'] is False
+    assert res['reason'] == 'not_logged_in'
+
+
+def test_reconcile_local_read_heals_mode_000(tmp_path):
+    from agent_hub_host import credentials
+    f = tmp_path / '.credentials.json'
+    f.write_text('{"a": 1}')
+    f.chmod(0)
+    assert credentials._local(f) == b'{"a": 1}'
+    assert (f.stat().st_mode & 0o777) == 0o600
+
+
+@pytest.mark.parametrize('argv,expected', [
+    (['exec', '--json', '-m', 'glm-5.3-flash', '-c', 'model_reasoning_effort=medium', 'do it'], True),
+    (['exec', '--skip-git-repo-check', 'prompt'], True),
+    (['exec', '-'], False),
+    (['exec', '--json'], False),
+    (['--version'], False),
+    (['resume'], False),
+])
+def test_exec_prompt_gets_closed_stdin(argv, expected):
+    assert p.stdin_closed_for_exec('zai', argv) is expected
+    assert p.stdin_closed_for_exec('claude', argv) is False
+
+
+def test_exec_hang_after_turn_started_is_gone_with_open_pipe_parent(tmp_path):
+    """A fake engine that waits for stdin EOF must finish when the wrapper closes stdin."""
+    import subprocess, sys
+    child = ("import sys,os; from agent_hub_host import provisioning as p; "
+             "p.stdin_closed_for_exec('codex', ['exec','x']) and os.dup2(os.open(os.devnull, os.O_RDONLY), 0); "
+             "print(len(sys.stdin.read()))")
+    proc = subprocess.Popen([sys.executable, '-c', child], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            env={**os.environ, 'PYTHONPATH': str(Path(p.__file__).parents[1])})
+    try:
+        assert proc.wait(timeout=20) == 0  # the parent keeps its stdin pipe open throughout
+    finally:
+        proc.kill()
+    assert proc.stdout.read().strip() == b'0'

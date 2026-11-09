@@ -79,15 +79,18 @@ def _write_file(target: Path, data: bytes):
 def _local(target: Path):
     # Engines rewrite these files themselves (possibly with their own umask);
     # read without the private-mode precondition, then re-tighten the mode.
-    try:
-        data = private_fs.read_bytes(target, MAX_FILE * 2, private=False)
-    except FileNotFoundError:
-        return None
+    # Re-tighten first: a mode-000 file (seen on hub-claude, 2026-11-09) is
+    # unreadable even by its owner, so reading before chmod fails reconcile and
+    # leaves the engine reporting "Not logged in".
     if os.name != 'nt':
         try:
             os.chmod(target, 0o600)
         except OSError:
             pass
+    try:
+        data = private_fs.read_bytes(target, MAX_FILE * 2, private=False)
+    except FileNotFoundError:
+        return None
     return data if data else None
 
 
