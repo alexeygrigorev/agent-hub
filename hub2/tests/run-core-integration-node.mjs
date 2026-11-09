@@ -223,6 +223,16 @@ try{
   const closed=expect(await api(base+q,'POST',{key:'compat-close-1',status:'done',expected_version:shown.task.control.version,reason:'verified'}),200,'close');
   assert.equal(closed.intake.status,'archived');
  });
+ await test('status carries the CLI snapshot keys and routing-machines shows placement numbers',async()=>{
+  const status=expect(await api('/api/status'),200,'status');
+  assert.equal(typeof status.snapshot_at,'string');assert(status.coverage&&Number.isInteger(status.coverage.sessions),'coverage.sessions');
+  assert(Array.isArray(status.coverage.missing_hosts)&&Array.isArray(status.needs_attention));
+  const routing=expect(await api('/api/fleet/routing/machines'),200,'routing machines');
+  assert(routing.machines.length>0,'enrolled machines listed');
+  const m=routing.machines.find(v=>v.machine_id==='synthetic-multi-machine')||routing.machines[0];
+  assert(Number.isInteger(m.capacity)&&Number.isInteger(m.occupied),'capacity and occupancy shown');
+  assert(['fresh','stale','unknown'].includes(m.resources_state),'resource freshness shown');
+ });
  await test('machine credential rotation fences its existing WebSocket',async()=>{
   const target='synthetic-rotation-machine';
   const pair=expect(await api('/api/enrollments/pair','POST',{machine_id:target,alias:'Synthetic rotation fixture'}),201,'rotation pairing');
