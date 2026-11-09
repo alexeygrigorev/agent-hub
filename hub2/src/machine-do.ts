@@ -2,6 +2,7 @@ import { nativeReturncode } from './native-exit';
 import { MeteredDb, initializeSchema } from './db';
 import { SqlReceiptMeter, SQL_PROBE_HEADER, wrapSqlNamespaces } from './sql-receipt';
 import { sha256Hex } from './crypto';
+import { machineCapacity } from './machine-capacity';
 import { actorFrom, bodyObject, boundedString, error, hasScope, HttpError, json } from './http';
 import type { Actor, Hub2Env, JsonRecord } from './types';
 
@@ -69,13 +70,7 @@ const MACHINE_ACTIVE_MIGRATION=[
   'INSERT OR IGNORE INTO machine_active(session_id,machine_id) SELECT active_session_id,machine_id FROM machines WHERE active_session_id IS NOT NULL',
   'UPDATE machines SET active_session_id=NULL',
 ];
-const DEFAULT_MACHINE_CAPACITY=3;
-const MAX_MACHINE_CAPACITY=8;
-function machineCapacity(labelsJson:string):number{
-  try{const n=Number((JSON.parse(labelsJson) as {capacity?:unknown}|null)?.capacity);
-    if(Number.isInteger(n)&&n>=1)return Math.min(n,MAX_MACHINE_CAPACITY);}catch{}
-  return DEFAULT_MACHINE_CAPACITY;
-}
+
 const LATEST_SCHEMA=SCHEMA.map(sql=>['machine_outbox','machine_session_operations','sessions'].some(table=>sql.startsWith(`CREATE TABLE ${table} (`))?sql+' WITHOUT ROWID':sql);
 
 type MachineRow = { machine_id: string; alias: string; os: string; arch: string; labels_json: string; last_seen: number; next_epoch: number; active_session_id: string | null };
