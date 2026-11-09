@@ -391,6 +391,21 @@ class TestCliUpdate(unittest.TestCase):
         self.assertIn('field: brief', output)
         self.assertNotIn('Session operation failed; check authentication', output)
 
+    def test_sessions_start_response_without_session_id_fails_loud(self):
+        from agent_hub_host import cli, session_control
+        from unittest.mock import patch
+        import io
+        err, out = io.StringIO(), io.StringIO()
+        # Hub2 once answered POST /api/sessions with the GET projection (200, no id).
+        with patch.object(sys, 'argv', ['hub', 'sessions', 'start', '--repo', 'o/r', '--prompt', 'x', '--key', 'k']), \
+             patch.object(session_control, 'request', return_value={'items': [], 'sessions': [], 'next': None}), \
+             patch.object(sys, 'stdout', out), patch.object(sys, 'stderr', err):
+            with self.assertRaises(SystemExit) as ctx:
+                cli.main()
+            self.assertEqual(ctx.exception.code, 1)
+        self.assertIn('returned no session id', err.getvalue())
+        self.assertNotIn('"sessions"', out.getvalue())
+
     def test_sessions_start_tbm_denial_surfaces_reason_code(self):
         from agent_hub_host import cli, session_control
         from unittest.mock import patch

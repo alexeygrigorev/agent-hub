@@ -1,0 +1,3 @@
+[console_scripts]
+hub = agent_hub_host.cli:main
+hub2 = agent_hub_host.cli:main

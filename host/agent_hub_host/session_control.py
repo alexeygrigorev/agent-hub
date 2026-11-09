@@ -88,7 +88,7 @@ def diagnostic(exc):
         msg = str(exc).strip()
         if msg:
             return msg
-    return 'Session operation failed; check authentication, grants, capacity and current versions.'
+    return f'Session operation failed ({type(exc).__name__}); check authentication, grants, capacity and current versions.'
 
 
 def hub_unavailable(exc):
@@ -1135,6 +1135,8 @@ def _execute(args):
             if key and f'reconcile with --key {key}' not in msg:
                 msg = f'{msg} (reconcile with --key {key} via show/commands)'
             raise ValueError(msg) from None
+        if not isinstance(created, dict) or (not created.get('id') and ('items' in created or 'sessions' in created)):
+            raise ValueError(f'Hub accepted the start but returned no session id (unexpected response shape); nothing was started (reconcile with --key {key} via show/commands)')
         created = dict(created, client_key=key)
         timeout, interval = check_wait_args(args)
         if timeout is not None:
