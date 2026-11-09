@@ -13,6 +13,14 @@ class QuotaPublishTests(unittest.TestCase):
         self.assertEqual(ev['reset_at'], 1794488280000)
         self.assertEqual(ev['valid_until'], 1000 + qp.VALID_MS)
 
+    def test_zai_central_account_is_published(self):
+        calls = []
+        def req(method, path, body=None):
+            calls.append((method, path)); return {'account': {'id': 1}}
+        quse = {'zai': {'status': 'ok', 'windows': {'7d': {'percent_remaining': 76.0, 'reset_at': None}}}}
+        self.assertEqual(qp.publish(quse=quse, request=req, now_ms=5)['published'], ['zai-central'])
+        self.assertIn(('PUT', '/api/accounts/zai-central/api/account/quota'), calls)
+
     def test_unmeasured_is_skipped_and_all_unmeasured_fails_loud(self):
         self.assertIsNone(qp.evidence({'status': 'error', 'windows': {}}, 1))
         with self.assertRaises(ValueError):

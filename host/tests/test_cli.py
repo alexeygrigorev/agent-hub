@@ -456,3 +456,14 @@ class TestHeartbeatCommand(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 cli.main()
         self.assertNotIn('MUST_NOT_LEAK', err.getvalue())
+
+
+class RepoFromWorkspaceTests(unittest.TestCase):
+    def test_github_origin_maps_to_owner_name(self):
+        import subprocess, tempfile
+        from agent_hub_host.session_control import _repo_from_workspace
+        with tempfile.TemporaryDirectory() as d:
+            subprocess.run(['git', 'init', '-q', d], check=True)
+            self.assertIsNone(_repo_from_workspace(d))
+            subprocess.run(['git', '-C', d, 'remote', 'add', 'origin', 'git@github.com:DataTalksClub/relay.git'], check=True)
+            self.assertEqual(_repo_from_workspace(d), 'DataTalksClub/relay')

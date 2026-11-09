@@ -14,7 +14,7 @@ from . import intake
 ACCOUNTS = {
     'claude': ('claude', 'claude'), 'codex': ('codex', 'codex'), 'codex-orin': ('codex-orin', 'codex'),
     'gemini': ('gemini', 'gemini'), 'grok': ('grok', 'grok'), 'copilot': ('copilot', 'copilot'),
-    'go': ('shared-go', 'go'),
+    'go': ('shared-go', 'go'), 'zai': ('zai-central', 'zai'),
 }
 VALID_MS = 15 * 60 * 1000
 QUSE_TIMEOUT = 90
