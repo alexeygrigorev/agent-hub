@@ -97,6 +97,8 @@ const router = {
             actor,
           ),
         );
+      if (path === '/api/sessions' && request.method !== 'GET' && request.method !== 'HEAD')
+        return error('session_start_not_implemented', 501);
       if (path === '/api/fleet' || path === '/api/fleet/machines' || path === '/api/sessions')
         return await machineProjection(request, env, actor, path === '/api/sessions');
       if (path === '/api/status') {
