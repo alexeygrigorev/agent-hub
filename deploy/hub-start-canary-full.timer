@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the Hub full model-less start canary every 30 minutes
+
+[Timer]
+OnBootSec=7min
+OnUnitActiveSec=30min
+AccuracySec=30s
+Persistent=true
+Unit=hub-start-canary-full.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=Hub live start canary (shell mode)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Runs as the account whose `hub` login and aplexer sessions the canary uses.
+# Installer rewrites User/Group/paths via drop-in-free sed of the placeholders.
+User=@CANARY_USER@
+Group=@CANARY_GROUP@
+ExecStart=/usr/local/sbin/hub-start-canary/hub-start-canary.sh --mode shell
+TimeoutStartSec=600
+NoNewPrivileges=yes
+PrivateTmp=yes
