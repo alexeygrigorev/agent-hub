@@ -249,7 +249,7 @@ grep -Fq 'Subject: [TEST] Resource Gate and Hub uptime monitor' "$MONITOR_MAIL_C
   || fail "test alert subject was not present"
 pass "safe test-alert mode exercises email and DataOps delivery without changing monitor state"
 
-grep -Fq 'ALERT_TO="${ALERT_TO:-orin@dtcdev.click}"' "$SCRIPT" \
-  || fail "production outage recipient default is not orin@dtcdev.click"
-pass "production outage and recovery recipient defaults to orin@dtcdev.click"
+grep -Fq 'ALERT_TO="${ALERT_TO:-dev@dtcdev.click}"' "$SCRIPT" \
+  || fail "production outage recipient default is not dev@dtcdev.click"
+pass "production outage and recovery recipient defaults to dev@dtcdev.click"
 printf 'Resource Gate and Hub monitor tests passed.\n'

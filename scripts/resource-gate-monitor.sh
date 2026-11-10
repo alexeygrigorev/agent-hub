@@ -25,7 +25,7 @@ export PATH
 HUB_HEALTH_URL="${HUB_HEALTH_URL:-https://hub.dtcdev.click/health}"
 STATE_DIR="${RESOURCE_GATE_STATE_DIR:-/var/lib/resource-gate-monitor}"
 STATE_FILE="$STATE_DIR/state"
-ALERT_TO="${ALERT_TO:-orin@dtcdev.click}"
+ALERT_TO="${ALERT_TO:-dev@dtcdev.click}"
 ALERT_OPS_TO="${ALERT_OPS_TO:-dev@dtcdev.click}"
 ALERT_FROM="${ALERT_FROM:-alerts@dtcdev.click}"
 ALERT_MSMTP_ACCOUNT="${ALERT_MSMTP_ACCOUNT:-alerts}"

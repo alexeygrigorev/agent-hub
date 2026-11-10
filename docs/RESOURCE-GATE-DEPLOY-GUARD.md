@@ -46,11 +46,14 @@ The existing `resource-gate-monitor.timer` runs on RMTHZ outside the GCP VM
 every minute. It checks the public gate TLS page, reads the authenticated
 desktop grant state, reads the authenticated Agent Browser `/browser/devices`
 health for the `desktop` device (DESKTOP-FP4OP26), and reads the Hub API health
-endpoint used by clients. It sends alerts to `orin@dtcdev.click` after two
-consecutive failed checks, creates one DataOps incident task, and adds a
-recovery note/email. Inactive grants are expected between approved browser
-tasks. The test command after installation is `sudo -u alexey /usr/local/sbin/resource-gate-monitor.sh --test-alert`;
-it sends a clearly labelled test email and creates/closes a test DataOps Task.
+endpoint used by clients. After two consecutive failed checks, it sends alerts
+to `dev@dtcdev.click`, whose Dapier `dev-mailbox` workflow posts to the
+Developer webhook. It creates one DataOps incident task and adds a recovery
+note/email. Inactive grants are expected between approved browser tasks. The
+test command after installation is `sudo -u alexey /usr/local/sbin/resource-gate-monitor.sh --test-alert`;
+it sends a clearly labelled test email to `dev@dtcdev.click`, which should
+produce a successful `http_request` run in Dapier's `dev-mailbox` workflow and
+wake Developer, and creates/closes a test DataOps Task.
 
 An install or smoke failure runs the fixed rollback operation. It checks out
 the previous commit, restores `.dev.vars`, reapplies that release's installer,
