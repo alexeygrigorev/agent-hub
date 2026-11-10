@@ -9,3 +9,5 @@ registerHooks({resolve(specifier,context,next){
  return next(specifier,context);
 }});
 await import('./model-picker.test.ts');
+await import('./routing-simulation.test.ts');
+await import('./machine-capabilities.test.ts');

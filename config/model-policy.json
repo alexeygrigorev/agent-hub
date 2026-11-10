@@ -67,6 +67,16 @@
       "weight": 1,
       "capabilities": [],
       "enabled": true
+    },
+    {
+      "id": "antigravity-argon-medium",
+      "engine": "antigravity",
+      "model": "gemini-4-argon-medium",
+      "effort": "medium",
+      "account_id": "gemini",
+      "weight": 1,
+      "capabilities": [],
+      "enabled": true
     }
   ]
 }

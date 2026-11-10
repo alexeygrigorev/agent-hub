@@ -683,3 +683,37 @@ for(const provider of ['codex','claude'])for(const rotated of [false,true])test(
  assert.equal(tokens[provider==='codex'?'refresh_token':'refreshToken'],rotated?'synthetic-new-refresh':'synthetic-old-refresh');
  if(provider==='codex')assert.equal(tokens.id_token,rotated?'synthetic-new-id':'synthetic-old-id');
 });
+
+
+test('passive account routing observes credentials without refresh, quota probes or alert writes',async()=>{
+ for(const variant of ['expired','near-expiry','gemini','zai-ready','zai-corrupt','missing']){
+  const s=state();let providerCalls=0;
+  if(variant.startsWith('zai-'))s.ctx.id={name:'zai-central',toString:()=> 'synthetic-zai-central'};
+  const account=new AccountDO(s.ctx,{HUB2_CREDENTIAL_KEY:'ca'.repeat(32),HUB2_PROVIDER_FETCH:async()=>{providerCalls++;throw Error('passive provider access forbidden');}});
+  try{
+   const provider=variant==='gemini'?'gemini':variant.startsWith('zai-')?'zai':'claude';
+   assert.equal((await account.fetch(request('/api/account','PATCH',{provider,enabled:true}))).status,200);
+   if(variant!=='missing'){
+    const files=provider==='gemini'?{'.gemini/oauth_creds.json':JSON.stringify({access_token:'synthetic-gemini'})}
+     :provider==='zai'?{'.config/goz/config.json':JSON.stringify({zai_token:'synthetic-zai'})}
+     :{'.claude/.credentials.json':JSON.stringify({claudeAiOauth:{accessToken:'synthetic-claude',refreshToken:'synthetic-refresh',expiresAt:Date.now()+(variant==='expired'?-10000:60000)}})};
+    assert.equal((await account.fetch(request('/api/account/credentials','PUT',{files,expected_generation:0}))).status,200);
+   }
+   assert.equal((await account.fetch(request('/api/account/quota','PUT',{remaining:80,captured_at:Date.now(),valid_until:Date.now()+60000,source:'synthetic-passive'}))).status,200);
+   s.database.exec('UPDATE quota SET captured_at=captured_at-120000,valid_until=valid_until-120000');clearFixtureCache(account);
+   if(variant==='zai-corrupt'){s.database.exec("UPDATE credentials SET sealed='corrupt-ciphertext'");clearFixtureCache(account);}
+   const before=(s.database.prepare('SELECT total_changes() AS n').get() as any).n;
+   const schema=s.database.prepare('SELECT name,sql FROM sqlite_master ORDER BY name').all();
+   const view=await data(await account.fetch(request('/_internal/routing-snapshot')));
+   assert.equal((s.database.prepare('SELECT total_changes() AS n').get() as any).n,before,variant+' must not write');
+   assert.deepEqual(s.database.prepare('SELECT name,sql FROM sqlite_master ORDER BY name').all(),schema);
+   assert.equal(providerCalls,0,variant+' must not probe or refresh');
+   assert.equal(view.fresh,false);assert.equal(view.quota.remaining,80);
+   assert.equal(view.credential_usable,variant==='near-expiry'||variant==='zai-ready');
+   assert.equal(view.credential_status,variant==='expired'?'expired':variant==='near-expiry'||variant==='zai-ready'?'ready':variant==='missing'?'missing':'unknown');
+   assert.equal((s.database.prepare('SELECT COUNT(*) AS n FROM alerts').get() as any).n,0);
+   assert.equal(view.credential_generation,variant==='missing'?null:1);
+   assert.deepEqual(view.hosts,[]);
+  }finally{s.database.close();}
+ }
+});
