@@ -36,7 +36,7 @@ function bootstrapRequestAllowed(request: Request): boolean {
   const method = request.method;
   if (bootstrapPublicMethods[path]?.includes(method)) return true;
   if (['/api/auth/me', '/api/quota'].includes(path)) return method === 'GET';
-  if (/^\/cli\/(?:manifest\.json|hub\.pyz(?:\.sha256)?|(?:host-)?install\.(?:sh|ps1))$/.test(path)) return method === 'GET' || method === 'HEAD';
+  if (/^\/cli\/(?:manifest\.json|host-release\.json|hub\.pyz(?:\.sha256)?|(?:host-)?install\.(?:sh|ps1)|hub2-(?:self-update|enroll)\.py|agent-hub2-host\.service|agent-hub2-host-update\.(?:service|timer)|agent_hub_host_v2-2\.0\.0\+g[0-9a-f]{40}-py3-none-any\.whl|websockets-16\.0-py3-none-any\.whl)$/.test(path)) return method === 'GET' || method === 'HEAD';
   if (path === '/api/repos') return method === 'GET';
   const repoPath = path.match(/^\/api\/repos\/([^/]+)$/);
   if (repoPath) {
