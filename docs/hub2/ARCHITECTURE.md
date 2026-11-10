@@ -1,6 +1,6 @@
 # Hub 2.0 architecture
 
-Status: 10 November 2026. Session starts use a quota-weighted model picker, a global cap of 50 live native sessions, and an inactive-session reaper. This source is awaiting CI, merge, production deployment, and live acceptance.
+Status: As of 10 November 2026, the quota-weighted model picker, global cap of 50 live native sessions, and inactive-session reaper described here are merged and deployed; end-to-end production acceptance evidence is tracked separately.
 
 ## Goal and boundaries
 
