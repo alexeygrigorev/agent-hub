@@ -330,31 +330,29 @@ class Bridge:
             self.journal.emit(f"command:{identity}", f"/api/sessions/{command['session_id']}/commands/{identity}/ack"+("?safety=operator_stop" if command.get("kind")=="stop" else ""),
                               {"epoch": command["epoch"], "result": result})
             return result
-        row = db.execute("SELECT * FROM launches WHERE session_id=?", (command.get("session_id"),)).fetchone()
         kind = command.get("kind")
+        if kind not in {"capture", "send", "stop"}:
+            raise ValueError("command_not_allowed")
+        row = db.execute("SELECT * FROM launches WHERE session_id=?", (command.get("session_id"),)).fetchone()
         if not row or row["epoch"] != command.get("epoch"):
+            if kind == "stop" and command.get("pre_native") is True:
+                return self.stop_pre_native_command(command, identity, digest)
             raise ValueError("command_fence_conflict")
         native_id, _status = self.resolve_launch_native(row)
-        if not native_id and row["state"] == "launching":
+        if not native_id and row["state"] in {"pending_admission", "launching", "aborting"}:
             # A stop for an interrupted launch is confirmed only after the
             # supervisor lookup by session tag finds no native process.
             if kind != "stop":
                 raise ValueError("command_fence_conflict")
+            self.begin_command(identity, digest)
             result = {"stopped": True}
-            with db:
-                db.execute("INSERT INTO commands VALUES(?,?,'executing',NULL)", (identity, digest))
-                db.execute("UPDATE commands SET state='done',result=? WHERE id=?", (canonical(result), identity))
-            self.journal.emit(f"command:{identity}", f"/api/sessions/{command['session_id']}/commands/{identity}/ack?safety=operator_stop",
-                              {"epoch": command["epoch"], "result": result})
+            self.finish_command(identity, command, result)
             return result
         if not native_id:
             raise ValueError("command_fence_conflict")
-        if kind not in {"capture", "send", "stop"}:
-            raise ValueError("command_not_allowed")
         if kind == "send" and row["interactive"] != 1:
             raise ValueError("headless_send_refused")
-        with db:
-            db.execute("INSERT INTO commands VALUES(?,?,'executing',NULL)", (identity, digest))
+        self.begin_command(identity, digest)
         if kind == "capture":
             result = {"output": self.native("capture", native_id, "--screen", "--plain").stdout[:16384]}
         elif kind == "stop":
@@ -368,11 +366,51 @@ class Bridge:
                 raise ValueError("invalid_command_text")
             self.native("send", native_id, "--stdin", "--enter", input=text, timeout=60)
             result = {"delivery": "native_acknowledged"}
-        with db:
-            db.execute("UPDATE commands SET state='done',result=? WHERE id=?", (canonical(result), identity))
-        self.journal.emit(f"command:{identity}", f"/api/sessions/{row['session_id']}/commands/{identity}/ack"+("?safety=operator_stop" if kind=="stop" else ""),
-                          {"epoch": row["epoch"], "result": result})
+        self.finish_command(identity, command, result)
         return result
+
+    def stop_pre_native_command(self, command, identity, digest):
+        session = command.get("session_id")
+        workspace = command.get("workspace")
+        tag = command.get("tag")
+        if (not isinstance(session, str) or not isinstance(workspace, str) or not workspace
+                or tag != "task-hub2-" + session):
+            raise ValueError("command_fence_conflict")
+        try:
+            resolved = Path(workspace).resolve(strict=True)
+        except OSError as error:
+            raise ValueError("command_fence_conflict") from error
+        if not resolved.is_dir() or not any(resolved.is_relative_to(root) for root in self.roots):
+            raise ValueError("command_fence_conflict")
+        workspace = str(resolved)
+        expected = {"tag": tag, "workspace": workspace}
+        self.begin_command(identity, digest)
+        status = self.launcher.status(f"{workspace}:{tag}", workspace=workspace)
+        if status:
+            if (status.get("tag") != tag or not same_workspace(status.get("workspace"), workspace)
+                    or not isinstance(status.get("id"), str)):
+                raise RuntimeError("native_abort_identity_mismatch")
+            native_id = status["id"]
+            if status.get("phase", status.get("state")) != "exited":
+                self.native("kill", native_id, allow_failure=True)
+                status = self.lookup(native_id, expected)
+            result = {"stopped": bool(status and status.get("phase", status.get("state")) == "exited"
+                                      and status.get("containment_empty") is True)}
+        else:
+            result = {"stopped": True}
+        self.finish_command(identity, command, result)
+        return result
+
+    def finish_command(self, identity, command, result):
+        with self.journal.db:
+            self.journal.db.execute("UPDATE commands SET state='done',result=? WHERE id=?", (canonical(result), identity))
+        self.journal.emit(f"command:{identity}", f"/api/sessions/{command['session_id']}/commands/{identity}/ack"
+                          + ("?safety=operator_stop" if command.get("kind") == "stop" else ""),
+                          {"epoch": command["epoch"], "result": result})
+
+    def begin_command(self, identity, digest):
+        with self.journal.db:
+            self.journal.db.execute("INSERT INTO commands VALUES(?,?,'executing',NULL)", (identity, digest))
 
     def drain(self, acknowledge=None):
         self.journal.flush(self.client)

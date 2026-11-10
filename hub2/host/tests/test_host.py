@@ -464,12 +464,12 @@ class HostTests(unittest.TestCase):
         self.assertEqual(sent[0]["reason"], "command_fence_conflict")
         self.assertEqual(self.native.calls, [])
 
-    def insert_orphan_launch(self, session="session-orphan", operation="op-orphan:0", epoch=7):
+    def insert_orphan_launch(self, session="session-orphan", operation="op-orphan:0", epoch=7, state="launching"):
         with self.journal.db:
             self.journal.db.execute(
                 "INSERT INTO launches(operation_id,session_id,epoch,digest,workspace,tag,native_id,state,interactive) "
-                "VALUES(?,?,?,?,?,?,NULL,'launching',0)",
-                (operation, session, epoch, "digest", str(self.root), "task-hub2-" + session))
+                "VALUES(?,?,?,?,?,?,NULL,?,0)",
+                (operation, session, epoch, "digest", str(self.root), "task-hub2-" + session, state))
 
     def test_stop_acknowledged_for_launch_orphaned_before_native_id(self):
         self.insert_orphan_launch()
@@ -480,6 +480,43 @@ class HostTests(unittest.TestCase):
         self.journal.flush(self.client)
         self.assertIn(("POST", "/api/sessions/session-orphan/commands/stop-orphan/ack?safety=operator_stop",
                        {"epoch": 7, "result": {"stopped": True}}, "command:stop-orphan"), self.client.calls)
+
+    def test_stop_acknowledged_when_pending_admission_or_aborting_has_no_native_id(self):
+        for state in ("pending_admission", "aborting"):
+            session = "session-" + state
+            operation = "op-" + state
+            command_id = "stop-" + state.replace("_", "-")
+            self.insert_orphan_launch(session, operation, 7, state)
+            result = self.bridge.command({"id": command_id, "session_id": session,
+                                          "epoch": 7, "kind": "stop"})
+            self.assertTrue(result["stopped"], state)
+            self.assertFalse(any(args[1] == "kill" for args, _ in self.native.calls), state)
+            self.journal.flush(self.client)
+            self.assertIn(("POST", f"/api/sessions/{session}/commands/{command_id}/ack?safety=operator_stop",
+                           {"epoch": 7, "result": {"stopped": True}}, f"command:{command_id}"), self.client.calls)
+
+    def test_pre_native_stop_without_local_launch_row_checks_session_tag_and_acks(self):
+        command = {"id": "stop-untracked", "session_id": "session-untracked", "epoch": 3,
+                   "kind": "stop", "pre_native": True, "workspace": str(self.root),
+                   "tag": "task-hub2-session-untracked"}
+        result = self.bridge.command(command)
+        self.assertTrue(result["stopped"])
+        self.assertIsNone(self.journal.db.execute("SELECT * FROM launches WHERE session_id='session-untracked'").fetchone())
+        self.journal.flush(self.client)
+        self.assertIn(("POST", "/api/sessions/session-untracked/commands/stop-untracked/ack?safety=operator_stop",
+                       {"epoch": 3, "result": {"stopped": True}}, "command:stop-untracked"), self.client.calls)
+
+    def test_pre_native_stop_without_local_row_kills_exact_tag_match(self):
+        self.native.process = {"id": "1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d",
+                               "tag": "task-hub2-session-untracked-live", "workspace": str(self.root),
+                               "phase": "running", "containment_empty": False}
+        result = self.bridge.command({"id": "stop-untracked-live", "session_id": "session-untracked-live",
+                                      "epoch": 3, "kind": "stop", "pre_native": True,
+                                      "workspace": str(self.root), "tag": "task-hub2-session-untracked-live"})
+        self.assertTrue(result["stopped"])
+        self.assertEqual(self.native.process["phase"], "exited")
+        self.assertTrue(any(args[1] == "kill" and args[2] == self.native.process["id"]
+                            for args, _ in self.native.calls))
 
     def test_stop_kills_native_process_recovered_by_session_tag(self):
         self.insert_orphan_launch()
