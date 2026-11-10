@@ -7,10 +7,13 @@ aplexer, reports pane activity, and handles confirmed stops; it does not run
 machine-capacity or placement checks.
 
 Run `python hub2/host/bootstrap.py` to install the host into its private user
-environment; bootstrap uses the current interpreter and installs dependencies.
-It supports Windows and Linux. The `hub2` entry point provides enrollment,
-serving, typed repository/intake/session/message/quota/schedule commands and a
-bounded `request METHOD /api/path --body-file input.json` escape hatch.
+environment; bootstrap uses the current interpreter and reinstalls the current
+package so an update replaces an already installed release. It supports Windows
+and Linux. Enrollment and CLI requests default to `https://hub.dtcdev.click`;
+`--server` selects another Hub explicitly. The `hub2` entry point provides
+enrollment, serving, typed repository/intake/session/message/quota/schedule
+commands and a bounded `request METHOD /api/path --body-file input.json` escape
+hatch.
 
 Human CLI authentication uses `hub2 --server https://hub.example auth login`.
 It opens a public device approval page, polls the one-use device code and saves
