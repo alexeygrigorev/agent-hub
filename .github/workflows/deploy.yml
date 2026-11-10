@@ -14,9 +14,14 @@ on:
         description: Production mode to deploy (bootstrap keeps dispatch disabled)
         type: choice
         options:
-          - bootstrap
           - active
-        default: bootstrap
+          - bootstrap
+        default: active
+      confirm_bootstrap:
+        description: Type DISABLE-HUB-DISPATCH to deploy release_mode=bootstrap (disables every intake/session route with 503)
+        type: string
+        required: false
+        default: ''
       rollback_pending:
         description: Restore the protected previous release after an interrupted deploy
         type: boolean
@@ -127,13 +132,17 @@ jobs:
         id: deploy_vm
         env:
           RELEASE_MODE: ${{ inputs.release_mode }}
+          CONFIRM_BOOTSTRAP: ${{ inputs.confirm_bootstrap }}
           VERIFY_GATE: ${{ inputs.verify_gate }}
           DEPLOY_SHA: ${{ github.sha }}
           SSH_TARGET: ${{ secrets.AGENT_HUB_VM_USER }}@${{ secrets.AGENT_HUB_VM_HOST }}
         run: |
           set -euo pipefail
           case "$RELEASE_MODE" in
-            bootstrap|active) ;;
+            active) ;;
+            bootstrap)
+              [[ "$CONFIRM_BOOTSTRAP" == "DISABLE-HUB-DISPATCH" ]] \
+                || { echo "release_mode=bootstrap disables Hub dispatch; set confirm_bootstrap=DISABLE-HUB-DISPATCH" >&2; exit 2; } ;;
             *) echo "invalid release mode" >&2; exit 2 ;;
           esac
           case "$VERIFY_GATE" in

@@ -27,6 +27,15 @@ grep -Fq 'rollback_pending:' "$WORKFLOW" || fail 'missing fixed rollback recover
 grep -Fq 'deploy-release-transaction.sh' "$WORKFLOW" || fail 'missing fixed transaction script'
 grep -Fq 'apply "$DEPLOY_SHA" "$RELEASE_MODE" "$gate_mode"' "$WORKFLOW" \
   || fail 'workflow does not select the full or isolated Hub-only transaction path'
+grep -Fq 'default: active' "$WORKFLOW" || fail 'release_mode must default to active'
+python3 - "$WORKFLOW" <<'PY' || fail 'release_mode default is not active'
+import re,sys
+t=open(sys.argv[1]).read()
+m=re.search(r'release_mode:\n(?:.*\n)*?\s+default: (\w+)',t)
+sys.exit(0 if m and m.group(1)=='active' else 1)
+PY
+grep -Fq 'confirm_bootstrap' "$WORKFLOW" && grep -Fq 'DISABLE-HUB-DISPATCH' "$WORKFLOW" \
+  || fail 'bootstrap must require a typed confirmation'
 pass 'workflow covers gate TLS, gate health, Hub health, and rollback'
 
 mkdir -p "$TEST_ROOT/bin" "$TEST_ROOT/etc"
