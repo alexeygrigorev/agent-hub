@@ -8,10 +8,12 @@ if [[ "${AGENT_HUB_DEPLOY_TEST_MODE:-0}" == 1 ]]; then
   REPO="${AGENT_HUB_TEST_REPO:?AGENT_HUB_TEST_REPO is required in test mode}"
   TRANSACTION_DIR="${AGENT_HUB_TEST_TRANSACTION_DIR:?AGENT_HUB_TEST_TRANSACTION_DIR is required in test mode}"
   CADDY_CONFIG="${AGENT_HUB_TEST_CADDY_CONFIG:?AGENT_HUB_TEST_CADDY_CONFIG is required in test mode}"
+  CADDY_SITE="${AGENT_HUB_TEST_CADDY_SITE:-$(dirname "$CADDY_CONFIG")/sites/hub.caddy}"
 else
   REPO=/opt/agent-hub
   TRANSACTION_DIR=/var/lib/agent-hub/deploy-rollback
   CADDY_CONFIG=/etc/caddy/Caddyfile
+  CADDY_SITE=/etc/caddy/sites/hub.caddy
 fi
 CADDY_BIN=caddy
 TMPDIR="$REPO/.local/tmp"
@@ -37,26 +39,17 @@ fail() {
   exit 1
 }
 
-validate_gate_caddyfile() {
+validate_hub_caddyfile() {
   local config="$1"
   [[ -s "$config" ]] || return 1
-  grep -Eq '^[[:space:]]*gate\.dtcdev\.click[[:space:]]*\{' "$config" \
-    || return 1
-  grep -Fq 'reverse_proxy 127.0.0.1:8791' "$config" \
-    || return 1
-  grep -Fq 'rewrite @desktop_health /v1/check?resource=browser&scope=desktop' "$config" \
-    || return 1
+  grep -Fq 'reverse_proxy 127.0.0.1:8787' "$config" || return 1
   run_root "$CADDY_BIN" validate --config "$config" --adapter caddyfile || return 1
 }
 
-validate_previous_caddyfile() {
-  local config="$1"
-  [[ -s "$config" ]] || return 1
-  grep -Eq '^[[:space:]]*gate\.dtcdev\.click[[:space:]]*\{' "$config" \
-    || return 1
-  grep -Fq 'reverse_proxy 127.0.0.1:8791' "$config" \
-    || return 1
-  run_root "$CADDY_BIN" validate --config "$config" --adapter caddyfile || return 1
+validate_shared_caddyfile() {
+  [[ -s "$CADDY_CONFIG" ]] || return 1
+  grep -Eq '^[[:space:]]*import[[:space:]]+/etc/caddy/sites/\*\.caddy[[:space:]]*$' "$CADDY_CONFIG" || return 1
+  run_root "$CADDY_BIN" validate --config "$CADDY_CONFIG" --adapter caddyfile || return 1
 }
 
 write_root_file() {
@@ -91,7 +84,7 @@ remove_transaction_state() {
 }
 
 restore_previous_release() {
-  local previous_sha vars_present gate_mode installer_args=()
+  local previous_sha vars_present gate_mode site_present
   if ! run_root test -f "$TRANSACTION_DIR/prepared"; then
     printf 'No pending deploy transaction; nothing to roll back.\n'
     return 0
@@ -114,7 +107,7 @@ restore_previous_release() {
   fi
   case "$gate_mode" in
     full) ;;
-    hub-only) installer_args+=(--hub-only) ;;
+    hub-only) ;;
     *) printf 'ERROR: rollback metadata has an invalid gate mode.\n' >&2; return 1 ;;
   esac
 
@@ -130,12 +123,20 @@ restore_previous_release() {
     *) printf 'ERROR: rollback metadata for .dev.vars is invalid.\n' >&2; return 1 ;;
   esac
 
-  run_root bash "$REPO/deploy/vm/install-hub2-node.sh" "${installer_args[@]}" || return 1
+  # Always suppress edge writes from old installers, which may own Caddyfile.
+  run_root bash "$REPO/deploy/vm/install-hub2-node.sh" --hub-only || return 1
 
   if [[ "$gate_mode" == full ]]; then
-    run_root install -o root -g root -m 644 \
-      "$TRANSACTION_DIR/Caddyfile.previous" "$CADDY_CONFIG" || return 1
-    validate_previous_caddyfile "$CADDY_CONFIG" || return 1
+    site_present="$(read_root_file "$TRANSACTION_DIR/hub-site-present")"
+    case "$site_present" in
+      yes)
+        run_root install -o root -g root -m 644 \
+          "$TRANSACTION_DIR/hub.caddy.previous" "$CADDY_SITE" || return 1
+        ;;
+      no) run_root rm -f -- "$CADDY_SITE" || return 1 ;;
+      *) printf 'ERROR: invalid Hub site rollback metadata.\n' >&2; return 1 ;;
+    esac
+    validate_shared_caddyfile || return 1
     run_root systemctl reload caddy || return 1
   fi
   run_root systemctl restart agent-hub-hub2.service || return 1
@@ -144,7 +145,7 @@ restore_previous_release() {
 
   remove_transaction_state || return 1
   if [[ "$gate_mode" == full ]]; then
-    printf 'Rollback completed: previous Hub2 release, .dev.vars, and Caddyfile restored.\n'
+    printf 'Rollback completed: previous Hub2 release, .dev.vars, and Hub site restored; shared Caddyfile untouched.\n'
   else
     printf 'Rollback completed: previous Hub2 release and .dev.vars restored; Caddy was left untouched.\n'
   fi
@@ -176,22 +177,27 @@ apply_release() {
   mkdir -p "$TMPDIR"
   chmod 750 "$TMPDIR"
   if [[ "$gate_mode" == full ]]; then
-    CANDIDATE_CADDY="$(mktemp "$TMPDIR/gate-hub-caddyfile.XXXXXX")"
-    git -C "$REPO" show "${deploy_sha}:deploy/Caddyfile" > "$CANDIDATE_CADDY" \
-      || fail "requested revision has no deploy/Caddyfile"
-    validate_gate_caddyfile "$CANDIDATE_CADDY" \
-      || fail "candidate Caddyfile must validate and retain the HTTPS gate.dtcdev.click site, /v1/health route, and 127.0.0.1:8791 upstream"
+    CANDIDATE_CADDY="$(mktemp "$TMPDIR/hub-caddy-site.XXXXXX")"
+    git -C "$REPO" show "${deploy_sha}:deploy/hub.caddy" > "$CANDIDATE_CADDY" \
+      || fail "requested revision has no deploy/hub.caddy"
+    validate_hub_caddyfile "$CANDIDATE_CADDY" \
+      || fail "candidate Hub site must validate and retain the Hub upstream"
   fi
 
   previous_sha="$(git -C "$REPO" rev-parse HEAD)"
   [[ "$previous_sha" =~ ^[0-9a-f]{40}$ ]] || fail "current VM revision is not a full commit SHA"
   if [[ "$gate_mode" == full ]]; then
-    [[ -s "$CADDY_CONFIG" ]] || fail "current Caddyfile is missing; refusing an unrollbackable deploy"
+    validate_shared_caddyfile || fail "shared Caddyfile must import /etc/caddy/sites/*.caddy; aws-infra owns that migration"
   fi
 
   run_root install -d -o root -g root -m 700 "$TRANSACTION_DIR"
   if [[ "$gate_mode" == full ]]; then
-    run_root cp -p -- "$CADDY_CONFIG" "$TRANSACTION_DIR/Caddyfile.previous"
+    if run_root test -f "$CADDY_SITE"; then
+      run_root cp -p -- "$CADDY_SITE" "$TRANSACTION_DIR/hub.caddy.previous"
+      write_root_file "$TRANSACTION_DIR/hub-site-present" yes
+    else
+      write_root_file "$TRANSACTION_DIR/hub-site-present" no
+    fi
   fi
   write_root_file "$TRANSACTION_DIR/previous.sha" "$previous_sha"
   write_root_file "$TRANSACTION_DIR/target.sha" "$deploy_sha"

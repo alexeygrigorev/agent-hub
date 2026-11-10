@@ -36,12 +36,18 @@ desktop tools ──HTTPS──> gate.dtcdev.click (Caddy TLS on the same VM :44
 | VM service, secrets, caddy, backups | GCP VM `agent-hub`, `/opt/agent-hub` checkout | `deploy/vm/install-hub2-node.sh` |
 | Deploy from CI | GitHub `deploy.yml` `production` environment | SSH key `AGENT_HUB_VM_DEPLOY_KEY` |
 
-The VM Caddyfile serves two separate sites. `:80` proxies the CloudFront Hub2
-origin to port 8787. `gate.dtcdev.click` terminates automatic HTTPS and proxies
-to the independent Resource Gate on port 8791. The Hub2 installer checks for
-both the gate hostname and upstream before replacing `/etc/caddy/Caddyfile`,
-so a Hub2 rollout fails closed if a later edit would remove the desktop TLS
-site. The Resource Gate process is not restarted by Hub2 deployment.
+Caddy ownership is split. The shared `/etc/caddy/Caddyfile` is owned by the
+aws-infra repo (the infra owner), not by Hub deploys, and must contain
+`import /etc/caddy/sites/*.caddy`. That import is a prerequisite: the Hub
+installer and the deploy transaction fail closed if it is missing, and the fix
+is an aws-infra change, never a manual edit by a Hub deploy. A Hub deploy
+installs only `/etc/caddy/sites/hub.caddy` (from `deploy/hub.caddy`: the `:80`
+site proxying the CloudFront Hub2 origin to port 8787), validates it and the
+shared config, then reloads Caddy. It never writes the shared Caddyfile or any
+other site file. Rollback restores only `hub.caddy` from the transaction
+snapshot. The `gate.dtcdev.click` site (automatic HTTPS, Resource Gate on port
+8791) lives with its owner in aws-infra and is not restarted or edited by Hub
+deployment. Hub-only releases (`verify_gate=false`) skip Caddy entirely.
 
 CI/CD needs **no GCP and no Cloudflare credentials**: deploys run `git fetch +
 npm ci + install + restart` over SSH, then verify

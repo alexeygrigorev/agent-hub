@@ -14,8 +14,11 @@ WORKFLOW="$ROOT/.github/workflows/deploy.yml"
 grep -Fq 'https://gate.dtcdev.click/' "$WORKFLOW" || fail 'missing public TLS smoke'
 grep -Fq 'https://gate.dtcdev.click/v1/health' "$WORKFLOW" \
   || fail 'missing authenticated, non-mutating desktop grant smoke'
-grep -Fq 'rewrite @desktop_health /v1/check?resource=browser&scope=desktop' "$ROOT/deploy/Caddyfile" \
-  || fail 'missing /v1/health rewrite to the authenticated, non-mutating desktop grant check'
+# Gate routing (incl. the /v1/health rewrite) is owned by aws-infra, not Hub.
+! grep -Eq 'gate\.dtcdev\.click|8791|desktop_health' "$ROOT/deploy/hub.caddy" \
+  || fail 'Hub site must not contain Gate routing'
+! grep -Fq 'install -m 644 "$DEPLOY_DIR/Caddyfile"' "$ROOT/deploy/vm/install-hub2-node.sh" \
+  || fail 'installer must not replace the shared Caddyfile'
 grep -Fq 'verify_gate:' "$WORKFLOW" || fail 'missing explicit Hub-only gate-probe exception'
 grep -Fq 'default: true' "$WORKFLOW" || fail 'gate probes are not enabled by default'
 [[ "$(grep -Fc 'if: inputs.verify_gate' "$WORKFLOW")" == 2 ]] \
@@ -38,7 +41,7 @@ grep -Fq 'confirm_bootstrap' "$WORKFLOW" && grep -Fq 'DISABLE-HUB-DISPATCH' "$WO
   || fail 'bootstrap must require a typed confirmation'
 pass 'workflow covers gate TLS, gate health, Hub health, and rollback'
 
-mkdir -p "$TEST_ROOT/bin" "$TEST_ROOT/etc"
+mkdir -p "$TEST_ROOT/bin" "$TEST_ROOT/etc/sites"
 git init --bare -q "$TEST_ROOT/remote.git"
 git clone -q "$TEST_ROOT/remote.git" "$TEST_ROOT/seed" 2>/dev/null
 git -C "$TEST_ROOT/seed" config user.name deploy-guard-test
@@ -68,8 +71,12 @@ shift
 [[ "$1" == --config ]] || exit 92
 config="$2"
 printf 'validate\n' >> "${CADDY_CAPTURE:?}"
-grep -Eq '^[[:space:]]*gate\.dtcdev\.click[[:space:]]*\{' "$config" || exit 93
-grep -Fq 'reverse_proxy 127.0.0.1:8791' "$config" || exit 94
+if [[ "$config" == "${AGENT_HUB_TEST_CADDY_CONFIG:?}" ]]; then
+  grep -Fq 'import /etc/caddy/sites/*.caddy' "$config" || exit 93
+  grep -Fq 'reverse_proxy 127.0.0.1:8791' "$config" || exit 94
+else
+  grep -Fq 'reverse_proxy 127.0.0.1:8787' "$config" || exit 94
+fi
 CADDY
 cat > "$TEST_ROOT/bin/systemctl" <<'SYSTEMCTL'
 #!/usr/bin/env bash
@@ -109,12 +116,9 @@ NPM
 chmod 755 "$TEST_ROOT/bin/"*
 
 mkdir -p "$TEST_ROOT/seed/deploy" "$TEST_ROOT/seed/.local/tmp"
-cat > "$TEST_ROOT/seed/deploy/Caddyfile" <<'CADDY_OLD'
+cat > "$TEST_ROOT/seed/deploy/hub.caddy" <<'CADDY_OLD'
 :80 {
   reverse_proxy 127.0.0.1:8787
-}
-gate.dtcdev.click {
-  reverse_proxy 127.0.0.1:8791
 }
 # previous
 CADDY_OLD
@@ -133,7 +137,7 @@ while (($#)); do
 done
 if [[ "${TEST_INSTALL_FAIL:-0}" == 1 && -n "$release_mode" ]]; then exit 23; fi
 if [[ "$hub_only" != true ]]; then
-  cp "$AGENT_HUB_TEST_REPO/deploy/Caddyfile" "$AGENT_HUB_TEST_CADDY_CONFIG"
+  cp "$AGENT_HUB_TEST_REPO/deploy/hub.caddy" "$AGENT_HUB_TEST_CADDY_SITE"
 fi
 if [[ -n "$release_mode" ]]; then printf 'HUB2_RELEASE_MODE=%s\n' "$release_mode" > "$AGENT_HUB_TEST_REPO/.dev.vars"; fi
 INSTALLER
@@ -148,20 +152,23 @@ git -C "$TEST_ROOT/seed" push -q "$TEST_ROOT/remote.git" main
 git --git-dir="$TEST_ROOT/remote.git" symbolic-ref HEAD refs/heads/main
 git clone -q "$TEST_ROOT/remote.git" "$TEST_ROOT/work"
 printf 'HUB2_RELEASE_MODE=bootstrap\nHUB2_CREDENTIAL_KEY=preserve-this\n' > "$TEST_ROOT/work/.dev.vars"
-cp "$TEST_ROOT/work/deploy/Caddyfile" "$TEST_ROOT/etc/Caddyfile"
+cp "$TEST_ROOT/work/deploy/hub.caddy" "$TEST_ROOT/etc/sites/hub.caddy"
+cat > "$TEST_ROOT/etc/Caddyfile" <<'SHARED'
+import /etc/caddy/sites/*.caddy
+gate.dtcdev.click {
+  reverse_proxy 127.0.0.1:8791
+}
+# aws-infra shared sentinel
+SHARED
+cp "$TEST_ROOT/etc/Caddyfile" "$TEST_ROOT/shared.original"
 
-cat > "$TEST_ROOT/seed/deploy/Caddyfile" <<'CADDY_NEW'
+cat > "$TEST_ROOT/seed/deploy/hub.caddy" <<'CADDY_NEW'
 :80 {
   reverse_proxy 127.0.0.1:8787
 }
-gate.dtcdev.click {
-  @desktop_health path /v1/health
-  rewrite @desktop_health /v1/check?resource=browser&scope=desktop
-  reverse_proxy 127.0.0.1:8791
-}
 # candidate
 CADDY_NEW
-git -C "$TEST_ROOT/seed" add deploy/Caddyfile
+git -C "$TEST_ROOT/seed" add deploy/hub.caddy
 git -C "$TEST_ROOT/seed" commit -qm 'candidate release'
 git -C "$TEST_ROOT/seed" push -q origin main
 CANDIDATE_SHA="$(git -C "$TEST_ROOT/seed" rev-parse HEAD)"
@@ -172,6 +179,7 @@ run_transaction() {
     AGENT_HUB_TEST_REPO="$TEST_ROOT/work" \
     AGENT_HUB_TEST_TRANSACTION_DIR="$TEST_ROOT/state" \
     AGENT_HUB_TEST_CADDY_CONFIG="$TEST_ROOT/etc/Caddyfile" \
+    AGENT_HUB_TEST_CADDY_SITE="$TEST_ROOT/etc/sites/hub.caddy" \
     CADDY_CAPTURE="$TEST_ROOT/caddy-calls" \
     SYSTEMCTL_CAPTURE="$TEST_ROOT/systemctl-calls" \
     NPM_CAPTURE="$TEST_ROOT/npm-calls" \
@@ -183,7 +191,7 @@ run_transaction() {
 
 run_transaction apply "$CANDIDATE_SHA" active >/dev/null
 [[ "$(git -C "$TEST_ROOT/work" rev-parse HEAD)" == "$CANDIDATE_SHA" ]] || fail 'apply did not select candidate'
-grep -Fq '# candidate' "$TEST_ROOT/etc/Caddyfile" || fail 'candidate Caddy config was not installed'
+grep -Fq '# candidate' "$TEST_ROOT/etc/sites/hub.caddy" || fail 'candidate Caddy config was not installed'
 grep -Fq 'HUB2_RELEASE_MODE=active' "$TEST_ROOT/work/.dev.vars" || fail 'release mode was not set'
 [[ -f "$TEST_ROOT/state/prepared" ]] || fail 'rollback state was removed before public smokes'
 pass 'apply retains rollback state until public smokes finish'
@@ -192,7 +200,7 @@ pass 'apply retains rollback state until public smokes finish'
 : > "$TEST_ROOT/sleep-calls"
 TEST_CURL_FAIL_FIRST=2 run_transaction rollback >/dev/null
 [[ "$(git -C "$TEST_ROOT/work" rev-parse HEAD)" == "$PREVIOUS_SHA" ]] || fail 'manual rollback missed old release'
-cmp -s "$TEST_ROOT/etc/Caddyfile" "$TEST_ROOT/work/deploy/Caddyfile" || fail 'manual rollback missed old Caddyfile'
+cmp -s "$TEST_ROOT/etc/sites/hub.caddy" "$TEST_ROOT/work/deploy/hub.caddy" || fail 'manual rollback missed old Caddyfile'
 grep -Fq 'HUB2_CREDENTIAL_KEY=preserve-this' "$TEST_ROOT/work/.dev.vars" || fail 'rollback missed private vars'
 [[ ! -e "$TEST_ROOT/state" ]] || fail 'successful rollback retained transaction state'
 [[ "$(cat "$TEST_ROOT/curl-count")" == 3 ]] || fail 'rollback did not retry transient Hub startup failures'
@@ -223,7 +231,7 @@ if TEST_NPM_FAIL_ONCE=1 run_transaction apply "$CANDIDATE_SHA" active >/dev/null
 fi
 [[ "$(git -C "$TEST_ROOT/work" rev-parse HEAD)" == "$PREVIOUS_SHA" ]] \
   || fail 'dependency installation failure did not restore old release'
-cmp -s "$TEST_ROOT/etc/Caddyfile" "$TEST_ROOT/work/deploy/Caddyfile" \
+cmp -s "$TEST_ROOT/etc/sites/hub.caddy" "$TEST_ROOT/work/deploy/hub.caddy" \
   || fail 'dependency installation failure did not restore old Caddyfile'
 [[ ! -e "$TEST_ROOT/state" ]] || fail 'successful dependency rollback retained transaction state'
 pass 'dependency installation failure automatically restores previous release and config'
@@ -232,43 +240,34 @@ if TEST_INSTALL_FAIL=1 run_transaction apply "$CANDIDATE_SHA" active >/dev/null 
   fail 'installer failure unexpectedly succeeded'
 fi
 [[ "$(git -C "$TEST_ROOT/work" rev-parse HEAD)" == "$PREVIOUS_SHA" ]] || fail 'automatic rollback missed old release'
-cmp -s "$TEST_ROOT/etc/Caddyfile" "$TEST_ROOT/work/deploy/Caddyfile" || fail 'automatic rollback missed old Caddyfile'
+cmp -s "$TEST_ROOT/etc/sites/hub.caddy" "$TEST_ROOT/work/deploy/hub.caddy" || fail 'automatic rollback missed old Caddyfile'
 [[ ! -e "$TEST_ROOT/state" ]] || fail 'automatic rollback retained transaction state'
 pass 'installer failure rolls back before returning failure'
 
-cat > "$TEST_ROOT/seed/deploy/Caddyfile" <<'CADDY_BAD'
+cat > "$TEST_ROOT/seed/deploy/hub.caddy" <<'CADDY_BAD'
 :80 {
-  reverse_proxy 127.0.0.1:8787
+  reverse_proxy 127.0.0.1:9999
 }
 CADDY_BAD
-git -C "$TEST_ROOT/seed" add deploy/Caddyfile
-git -C "$TEST_ROOT/seed" commit -qm 'invalid candidate without gate TLS site'
+git -C "$TEST_ROOT/seed" add deploy/hub.caddy
+git -C "$TEST_ROOT/seed" commit -qm 'invalid candidate without Hub upstream'
 git -C "$TEST_ROOT/seed" push -q origin main
 BAD_SHA="$(git -C "$TEST_ROOT/seed" rev-parse HEAD)"
 if run_transaction apply "$BAD_SHA" active >/dev/null 2>&1; then
-  fail 'candidate without TLS gate site passed pre-deploy validation'
+  fail 'candidate without Hub upstream passed pre-deploy validation'
 fi
 [[ "$(git -C "$TEST_ROOT/work" rev-parse HEAD)" == "$PREVIOUS_SHA" ]] || fail 'bad candidate changed checkout'
 [[ ! -e "$TEST_ROOT/state" ]] || fail 'bad candidate created rollback state'
 pass 'bad Caddy candidate is rejected before changing the live release'
 
-cat > "$TEST_ROOT/seed/deploy/Caddyfile" <<'CADDY_BAD_HEALTH'
-:80 {
-  reverse_proxy 127.0.0.1:8787
-}
-gate.dtcdev.click {
-  reverse_proxy 127.0.0.1:8791
-}
-CADDY_BAD_HEALTH
-git -C "$TEST_ROOT/seed" add deploy/Caddyfile
-git -C "$TEST_ROOT/seed" commit -qm 'candidate missing authenticated health alias'
-git -C "$TEST_ROOT/seed" push -q origin main
-BAD_HEALTH_SHA="$(git -C "$TEST_ROOT/seed" rev-parse HEAD)"
-if run_transaction apply "$BAD_HEALTH_SHA" active >/dev/null 2>&1; then
-  fail 'candidate without /v1/health alias passed pre-deploy validation'
+cmp -s "$TEST_ROOT/etc/Caddyfile" "$TEST_ROOT/shared.original" \
+  || fail 'Hub transaction changed shared Caddyfile'
+printf '# missing import\n' > "$TEST_ROOT/etc/Caddyfile"
+if run_transaction apply "$CANDIDATE_SHA" active >/dev/null 2>&1; then
+  fail 'shared config without sites import passed pre-deploy validation'
 fi
-[[ "$(git -C "$TEST_ROOT/work" rev-parse HEAD)" == "$PREVIOUS_SHA" ]] || fail 'bad health candidate changed checkout'
-[[ ! -e "$TEST_ROOT/state" ]] || fail 'bad health candidate created rollback state'
-pass 'candidate without /v1/health alias is rejected before changing the live release'
+[[ "$(git -C "$TEST_ROOT/work" rev-parse HEAD)" == "$PREVIOUS_SHA" ]] || fail 'missing import changed checkout'
+[[ ! -e "$TEST_ROOT/state" ]] || fail 'missing import created rollback state'
+pass 'shared Caddyfile is preserved and missing import fails before changing release'
 
 printf 'VM deploy guard tests passed.\n'
