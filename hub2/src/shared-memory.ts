@@ -52,6 +52,10 @@ export class SharedMemory {
   }
   private async ingest(request:Request):Promise<Response> {
     const actor=actorFrom(request)!,b=await bodyObject(request,98304);
+    const admin=hasScope(actor,'operator:admin');
+    if(!admin&&(actor.kind!=='machine'||!actor.resource_id))return error('forbidden',403);
+    if(!admin&&b.machine_id!=null&&b.machine_id!==actor.resource_id)return error('machine_mismatch',403);
+    const machineId=admin?(b.machine_id??null):actor.resource_id;
     if(!['bot','cli','backfill','grok-bot-replica','tabo-replica'].includes(String(b.source))||!Array.isArray(b.agents)||!b.agents.length||b.agents.length>32)return error('invalid_ingest',400);
     if(b.source==='backfill'&&!hasScope(actor,'operator:admin'))return error('backfill_requires_operator',403);
     const records:any[]=[];
@@ -64,7 +68,7 @@ export class SharedMemory {
         if(m.intake_id&&!hasScope(actor,'operator:admin'))return error('intake_hint_requires_operator',403);
         const ts=m.ts===undefined?Date.now():typeof m.ts==='number'?m.ts:/^\d+$/.test(String(m.ts))?Number(m.ts):Date.parse(m.ts);
         if(!Number.isSafeInteger(ts)||ts<0)return error('invalid_timestamp',400);
-        records.push({id:crypto.randomUUID(),agent_id:a.agent_id,agent_name:a.agent_name??null,t_id:ref,role,kind:m.kind??'message',text:m.text,text_hash:await sha256Hex(m.text),ts,received_at:Date.now(),source:b.source,actor:actor.id,intake_hint:m.intake_id??null});
+        records.push({id:crypto.randomUUID(),agent_id:a.agent_id,agent_name:a.agent_name??null,t_id:ref,role,kind:m.kind??'message',text:m.text,text_hash:await sha256Hex(m.text),ts,received_at:Date.now(),source:b.source,actor:actor.id,machine_id:machineId,intake_hint:m.intake_id??null});
       }
     }
     return this.db.transaction(this.ctx,()=>{
@@ -123,6 +127,10 @@ export class SharedMemory {
           if(!boundedString(id,180))throw new HttpError('invalid_import_identity',400);
           const old=this.db.one<any>(`SELECT data_json FROM ${table} WHERE id=?`,id);
           if(old&&old.data_json!==data)throw new HttpError('import_conflict',409);
+          if(table==='memory_messages'){
+            const alternate=this.db.one<{id:string}>('SELECT id FROM memory_messages WHERE agent_id=? AND t_id=?',...values);
+            if(alternate&&alternate.id!==id)throw new HttpError('import_conflict',409);
+          }
           const cols=table==='memory_rules'?'id,data_json':table==='memory_messages'?'id,agent_id,t_id,data_json':'id,message_id,state,intake_id,data_json';
           this.db.run(`INSERT OR IGNORE INTO ${table}(${cols}) VALUES(${Array(values.length+2).fill('?').join(',')})`,id,...values,data);
         }

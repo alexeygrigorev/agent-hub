@@ -125,3 +125,24 @@ test('schema v4 upgrades in place without changing existing control records',asy
  assert.equal((f.c.database.prepare('SELECT version FROM hub2_schema').get() as any).version,5);
  assert.equal((f.c.database.prepare("SELECT display_name FROM named_agents WHERE id='existing'").get() as any).display_name,'Existing');
 });
+
+test('import rejects alternate message identity collisions and rolls back the entire batch',async()=>{
+ const f=fixture(),message={id:'first',agent_id:'legacy',t_id:'t100u',text:'keep',role:'user'};
+ assert.equal((await f.call('/api/shared-memory/import','POST',{rows:[{table:'ask_messages',row:message}]})).status,200);
+ const result=await f.call('/api/shared-memory/import','POST',{rows:[{table:'ask_meta',row:{id:'must-rollback'}},{table:'ask_messages',row:{...message,id:'second'}},{table:'asks',row:{id:'hidden-ask',message_id:'second',state:'unmapped'}}]});
+ assert.equal(result.status,409);assert.equal((await data(result)).error,'import_conflict');
+ assert.equal((f.c.database.prepare('SELECT COUNT(*) AS n FROM memory_legacy').get() as any).n,1);
+ assert.equal((f.c.database.prepare('SELECT COUNT(*) AS n FROM memory_messages').get() as any).n,1);
+ assert.equal((f.c.database.prepare('SELECT COUNT(*) AS n FROM memory_asks').get() as any).n,0);
+});
+
+test('ingest requires an operator or a verified machine and preserves machine provenance',async()=>{
+ const f=fixture(),payload={source:'cli',agents:[{agent_id:'watcher',messages:[{msg_id:'t1u',text:'captured request'}]}]};
+ for(const actor of [{id:'agent:other',kind:'agent',scopes:[]},{id:'machine:fake',kind:'machine',scopes:[]}])assert.equal((await f.call('/api/asks/ingest','POST',payload,actor)).status,403);
+ const machine={id:'machine:host1',kind:'machine',resource_id:'host1',scopes:[]};
+ assert.equal((await f.call('/api/asks/ingest','POST',{...payload,machine_id:'host2'},machine)).status,403);
+ assert.equal((await f.call('/api/asks/ingest','POST',{...payload,source:'backfill'},machine)).status,403);
+ assert.equal((await f.call('/api/asks/ingest','POST',payload,machine)).status,200);
+ const message=(await data(await f.call('/api/asks/messages'))).messages[0];
+ assert.equal(message.machine_id,'host1');assert.equal(message.actor,'machine:host1');
+});
