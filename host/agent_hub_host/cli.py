@@ -253,11 +253,13 @@ def cmd_machines_revoke(args):
 
 def cmd_machines_available(args):
     try:
-        cfg = config.load_config()
-        if not cfg.get("base_url"):
-            print("Not logged in.", file=sys.stderr)
-            sys.exit(1)
-        machines = api.get_available_machines(cfg["base_url"])
+        # Machine availability is a normal Hub CLI request, not a host-agent
+        # operation. Use the shared user request path so it resolves the same
+        # profile, URL overrides and refresh behavior as sessions and bus
+        # commands. api.get_available_machines is intentionally host-profile
+        # scoped for host-agent callers.
+        from . import bus
+        machines = bus._do_request("GET", "/api/machines/available")
         
         # machines.py compatible output: {"reachable": [ {machine} ], "count": N}.
         # The Worker returns {"machines": [...]} (src/registry.ts); a bare list
@@ -281,7 +283,10 @@ def cmd_machines_available(args):
             for m in reachable:
                 print(m.get("id", m.get("hostname", "unknown")))
     except Exception as e:
-        print(f"Failed to get available machines: {e}", file=sys.stderr)
+        detail = str(e)
+        if detail == "Not logged in. Base URL not configured.":
+            detail = "Not logged in. Run `hub auth login` to sign in."
+        print(f"Failed to get available machines: {detail}", file=sys.stderr)
         sys.exit(1)
 
 def cmd_status(args):
