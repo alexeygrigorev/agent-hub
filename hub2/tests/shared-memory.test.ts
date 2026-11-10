@@ -82,10 +82,11 @@ test('legacy import preserves all raw values, original identities/history, is re
 });
 
 test('offline export extractor produces bounded private batches and matching server digest receipts',async()=>{
- const {mkdtempSync,writeFileSync,readFileSync,statSync,rmSync}=await import('node:fs');
+ const {mkdirSync,mkdtempSync,writeFileSync,readFileSync,statSync,rmSync}=await import('node:fs');
  const {gzipSync}=await import('node:zlib');const {spawnSync}=await import('node:child_process');
  const {fileURLToPath}=await import('node:url');
  const root=fileURLToPath(new URL('../../',import.meta.url));
+ mkdirSync(root+'.local',{recursive:true});
  const dir=mkdtempSync(root+'.local/shared-export-test-');
  try{
   const tables:any={ask_messages:[],asks:[],intake_rules:[],ask_meta:[{id:1,nullable:null}],unrelated:[{text:'unrelated'}]};
