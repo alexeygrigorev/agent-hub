@@ -878,6 +878,31 @@ def wait_until_bound(session_id, interval, timeout=BIND_WAIT_TIMEOUT):
         time.sleep(min(interval, remaining))
 
 
+def _session_page(page):
+    """Accept both Hub generations without turning an incomplete page into EOF."""
+    if not isinstance(page, dict):
+        raise ValueError('Invalid session list page')
+    rows = page.get('sessions', page.get('items'))
+    if not isinstance(rows, list) or any(
+            not isinstance(row, dict) or not isinstance(row.get('id'), str) or not row['id']
+            for row in rows):
+        raise ValueError('Invalid session list entries')
+    aliases = [page.get(key) for key in ('next_cursor', 'next')]
+    if any(value is not None and not isinstance(value, str) for value in aliases):
+        raise ValueError('Invalid session list cursor')
+    cursors = {value for value in aliases if value}
+    if len(cursors) > 1:
+        raise ValueError('Conflicting session list cursors')
+    cursor = next(iter(cursors), None)
+    if 'complete' in page and type(page['complete']) is not bool:
+        raise ValueError('Invalid session list completion flag')
+    if page.get('complete') is False and cursor is None:
+        raise ValueError('Incomplete session list has no continuation cursor')
+    if page.get('complete') is True and cursor is not None:
+        raise ValueError('Complete session list has a continuation cursor')
+    return rows, cursor
+
+
 def execute(args):
     # Capture's budget covers enqueue, every paginated HTTP request and sleep.
     # A context-local deadline cannot affect concurrent host receiver requests.
@@ -1005,12 +1030,12 @@ def _execute(args):
                 if cursor:
                     path += '&cursor=' + quote(cursor, safe='')
                 page = request('GET', threshold_path(args, path))
-                for entry in page.get('sessions', []):
+                entries, cursor = _session_page(page)
+                for entry in entries:
                     if not isinstance(entry, dict) or entry.get('id') in known:
                         continue
                     known.add(entry.get('id'))
                     sessions.append(entry)
-                cursor = page.get('next_cursor')
                 if not cursor:
                     break
                 if cursor in cursors:
@@ -1033,20 +1058,23 @@ def _execute(args):
         cursor = None
         cursors: set = set()
         first_page = None
-        page_size = min(100, total_limit) if total_limit is not None else 100
         # 3.2: live=1 is the default view; --all (or an explicitly terminal
         # --state) walks history. A --limit caps rows, it does not request
         # history.
         live_only = (not getattr(args, 'all', False)
                      and wanted not in ('stopped', 'failed', 'cancelled', 'refused', 'done'))
         while True:
+            page_size = min(100, total_limit - len(seen)) if total_limit is not None else 100
             path = '/api/sessions?%slimit=%d' % ('live=1&' if live_only else '', page_size)
             if cursor:
                 path += '&cursor=' + quote(cursor, safe='')
             page = request('GET', threshold_path(args, path))
             if first_page is None:
                 first_page = page
-            for entry in page.get('sessions', []):
+            entries, cursor = _session_page(page)
+            if len(entries) > page_size:
+                raise ValueError('Session list page exceeds the requested limit')
+            for entry in entries:
                 if entry.get('id') in known:
                     continue
                 known.add(entry.get('id'))
@@ -1054,15 +1082,20 @@ def _execute(args):
                     seen.append(entry)
                     if total_limit is not None and len(seen) >= total_limit:
                         break
-            cursor = page.get('next_cursor')
-            if (total_limit is not None and len(seen) >= total_limit) or not cursor:
-                break
             if cursor in cursors:
                 raise ValueError('Session list pagination repeated a cursor; retry the listing')
+            if (total_limit is not None and len(seen) >= total_limit) or not cursor:
+                break
             cursors.add(cursor)
         result = dict(first_page or {})
         result['sessions'] = seen
-        result['next_cursor'] = None
+        result['next_cursor'] = cursor
+        if 'items' in result:
+            result['items'] = seen
+        if 'next' in result:
+            result['next'] = cursor
+        if 'complete' in result:
+            result['complete'] = cursor is None
         return result
     if cmd == 'show':
         return request('GET', threshold_path(args, '/api/sessions/' + args.id))
