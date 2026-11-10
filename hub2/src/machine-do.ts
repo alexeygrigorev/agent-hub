@@ -89,6 +89,9 @@ type SessionRow = {
   evidence_json: string | null; evidence_digest: string | null; exit_code: number | null;
   created_at: number; updated_at: number;
 };
+// The server speaks version 1 of the host WebSocket protocol.
+const HOST_PROTOCOL_VERSION = 1;
+
 type HostRelease = { host_version: string; protocol_version: number };
 type SocketAttachment = { machine_id: string; actor_id: string; generation: string } & Partial<HostRelease>;
 
@@ -264,7 +267,10 @@ export class MachineDO {
       break;
     }
     const capabilities=this.db.one<{engines_json:string;capabilities_json:string}>('SELECT engines_json,capabilities_json FROM machine_capabilities WHERE machine_id=?',machine.machine_id);
-    return json({machine_id:machine.machine_id,connected,...release,last_seen:machine.last_seen,os:machine.os,arch:machine.arch,labels:JSON.parse(machine.labels_json),
+    // Report protocol skew for operators without changing socket admission or dispatch.
+    const versionMismatch = release && release.protocol_version !== HOST_PROTOCOL_VERSION;
+    return json({machine_id:machine.machine_id,connected,...release,version_mismatch:versionMismatch,
+      last_seen:machine.last_seen,os:machine.os,arch:machine.arch,labels:JSON.parse(machine.labels_json),
       engines:capabilities?JSON.parse(capabilities.engines_json):[],capabilities:capabilities?JSON.parse(capabilities.capabilities_json):[]});
   }
 

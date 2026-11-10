@@ -9,6 +9,7 @@ const root = resolve(import.meta.dirname, '../..');
 const token = 'synthetic-socket-cap-operator-token-0000000000000';
 const machine = 'socket-cap-machine';
 const sha = 'a'.repeat(40);
+const matching = '/api/connect?host_version='+sha+'&protocol_version=1';
 const reported = '/api/connect?host_version='+sha+'&protocol_version=2';
 const machineSource = resolve(root, 'hub2/src/machine-do.ts');
 const hash = () => readFile(machineSource).then(b => createHash('sha256').update(b).digest('hex'));
@@ -47,15 +48,18 @@ async function until(fn){for(let i=0;i<100;i++){if(await fn())return;await new P
   assert(row,'enrolled host appears in public routing');
   assert.equal(row.connected,connected);
   if(version===undefined){
-   assert(!Object.hasOwn(row,'host_version')&&!Object.hasOwn(row,'protocol_version'));
+   for(const key of ['host_version','protocol_version','version_mismatch'])assert(!Object.hasOwn(row,key));
   }else{
    assert.equal(row.host_version,version);
    assert.equal(row.protocol_version,protocol);
+   assert.equal(row.version_mismatch,protocol===2);
   }
  }
  const old=await enroll();
  await api('/api/heartbeat','POST',{os:'linux',arch:'x64',labels:[],engines:['shell'],capabilities:['headless'],host_version:sha,protocol_version:2},old);
  await expectRelease(false);
+ await socket(old,matching);
+ await expectRelease(true,sha,1);
  const beforeRestart=await socket(old,reported);
  await expectRelease(true,sha,2);
  beforeRestart.terminate();
