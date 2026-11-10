@@ -203,6 +203,66 @@ class HostTests(unittest.TestCase):
         self.assertEqual(self.client.calls[-1][2],body)
         self.assertFalse(self.journal.db.execute('SELECT 1 FROM outbox').fetchone())
 
+    def test_reconcile_reports_bound_deleted_workspace_retirement(self):
+        self.bridge.offer(self.offer())
+        with self.journal.db:
+            self.journal.db.execute("DELETE FROM outbox")
+        row = self.journal.db.execute("SELECT * FROM launches").fetchone()
+        workspace = Path(row["workspace"])
+        # Keep the journal and retired registry in their original private root.
+        missing = workspace / "deleted-worktree"
+        with self.journal.db:
+            self.journal.db.execute("UPDATE launches SET workspace=?", (str(missing),))
+        state_dir = self.root / "native-state"
+        retired = state_dir / "retired-sessions" / row["native_id"].lower()
+        retired.mkdir(parents=True)
+        self.bridge.launcher.state_dir = state_dir
+        exit_info = {"code": 0, "signal": None, "exited_at_ms": row["runtime_deadline"] - 1}
+        tombstone = {"id": row["native_id"], "tag": row["tag"], "workspace": str(missing) + " (deleted)",
+                     "cause": "finished", "exit": exit_info, "containment_empty": True}
+        self.native.process = None  # Active registry entry has already been removed.
+        for recreated in (False, True):
+            with self.subTest(recreated=recreated):
+                if recreated:
+                    missing.mkdir()
+                    with self.journal.db:
+                        self.journal.db.execute("DELETE FROM outbox")
+                        self.journal.db.execute("UPDATE launches SET state='running',runtime_deadline=NULL")
+                    tombstone.update(deadline_ms=row["runtime_deadline"], deadline_exceeded=False)
+                (retired / "tombstone.json").write_text(json.dumps(tombstone))
+                self.native.calls.clear()
+                self.bridge.reconcile()
+                self.bridge.reconcile()
+                commands = [argv[1] for argv, _ in self.native.calls]
+                self.assertEqual(commands, ["status"] if recreated else [])
+                self.assertEqual(self.journal.db.execute("SELECT state FROM launches").fetchone()[0], "exited")
+                receipts = self.journal.db.execute("SELECT path,payload FROM outbox").fetchall()
+                self.assertEqual(len(receipts), 1)
+                self.assertEqual(receipts[0]["path"], "/api/sessions/" + row["session_id"] + "/finish")
+                payload = json.loads(receipts[0]["payload"])
+                self.assertEqual(payload["operation_id"], row["operation_id"])
+                self.assertEqual(payload["epoch"], row["epoch"])
+                self.assertEqual(payload["native_id"], row["native_id"])
+                self.assertTrue(payload["native_exit_confirmed"])
+                self.assertEqual(payload["evidence"]["source"], "aplexer_retirement")
+                self.assertEqual(payload["evidence"]["native_identity"]["workspace"], str(missing))
+                self.assertEqual(payload["evidence"]["native_exit"], exit_info)
+                self.assertEqual(payload["evidence"]["native_deadline"],
+                                 {"deadline_ms": row["runtime_deadline"], "exceeded": False})
+
+    def test_missing_workspace_without_bound_retirement_remains_unresolved(self):
+        self.bridge.offer(self.offer())
+        with self.journal.db:
+            self.journal.db.execute("DELETE FROM outbox")
+            self.journal.db.execute("UPDATE launches SET workspace=?,state='aborting'",
+                                    (str(self.root / "deleted-worktree"),))
+        self.native.calls.clear()
+        self.bridge.launcher.state_dir = self.root / "empty-native-state"
+        self.bridge.reconcile()
+        self.assertEqual(self.native.calls, [])
+        self.assertEqual(self.journal.db.execute("SELECT state FROM launches").fetchone()[0], "aborting")
+        self.assertFalse(self.journal.db.execute("SELECT 1 FROM outbox").fetchone())
+
     def test_zero_native_exit_still_reports_failed_launch_without_fabricating_exit(self):
         self.failed_native(exit_code=0)
         self.bridge.reconcile()

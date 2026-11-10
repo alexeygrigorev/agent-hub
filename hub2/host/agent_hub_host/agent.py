@@ -373,7 +373,8 @@ class Bridge:
                 with self.journal.db:
                     self.journal.db.execute("UPDATE launches SET state='aborting' WHERE operation_id=? AND state='launching'",(row['operation_id'],))
                 row = self.journal.db.execute("SELECT * FROM launches WHERE operation_id=?", (row['operation_id'],)).fetchone()
-            if not self._workspace_is_available(row["workspace"]):
+            workspace_available = self._workspace_is_available(row["workspace"])
+            if not workspace_available and not row["native_id"]:
                 self._warn_unavailable_workspace(row)
                 continue
             if row['state'] in {'aborting','deadline_stopping'} and not row['native_id']:
@@ -389,8 +390,13 @@ class Bridge:
                 with self.journal.db:
                     self.journal.db.execute('UPDATE launches SET native_id=? WHERE operation_id=?',(identity,row['operation_id']))
                 row=self.journal.db.execute('SELECT * FROM launches WHERE operation_id=?',(row['operation_id'],)).fetchone()
-            native = self.lookup(row["native_id"], row)
+            if workspace_available:
+                native = self.lookup(row["native_id"], row)
+            else:
+                native = self.launcher.retired(row["native_id"], dict(row))
             if not native:
+                if not workspace_available:
+                    self._warn_unavailable_workspace(row)
                 continue  # Missing process is uncertain, never a successful finish.
             phase = native.get("phase", native.get("state"))
             deadline = row['runtime_deadline']
@@ -410,7 +416,10 @@ class Bridge:
             code = native_returncode(exit_info)
             if code is None:
                 continue
-            launcher_state=self.launcher.finalize(row["native_id"], {"tag": row["tag"], "workspace": row["workspace"]})
+            launcher_state = (
+                "retired-finished" if not workspace_available
+                else self.launcher.finalize(row["native_id"], {"tag": row["tag"], "workspace": row["workspace"]})
+            )
             payload = {"operation_id": row["operation_id"], "epoch": row["epoch"],
                        "native_id": row["native_id"], "exit_code": code,
                        "native_exit_confirmed": True,

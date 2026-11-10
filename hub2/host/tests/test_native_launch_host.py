@@ -177,6 +177,41 @@ class TombstoneTest(unittest.TestCase):
             self.tombstone(tmp, containment_empty=False)
             self.assertIsNone(adapter.retired(document['id'], {'tag': 'task-t1', 'workspace': tmp}))
 
+    def test_deleted_workspace_retirement_requires_exact_positive_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / 'work'
+            native_id = 'D6CF9872-8597-48A5-BE64-990CDEF4DB31'
+            deleted = str(workspace) + ' (deleted)'
+            exit_info = {'code': 0, 'signal': None, 'exited_at_ms': 1000}
+            state_dir, _ = self.tombstone(tmp, workspace=deleted, exit=exit_info)
+            adapter = nl.NativeLauncher({'aplexer_state_dir': state_dir})
+            expected = {'tag': 'task-t1', 'workspace': str(workspace)}
+            for recreated in (False, True):
+                with self.subTest(recreated=recreated):
+                    if recreated:
+                        workspace.mkdir()
+                    result = adapter.retired(native_id, expected)
+                    self.assertIsNotNone(result)
+                    self.assertEqual(result['workspace'], str(workspace))
+                    self.assertEqual(result['id'], native_id)
+                    self.assertEqual(result['exit'], exit_info)
+            for changes in (
+                {'id': 'A1B2C3D4-0000-4000-8000-000000000001'},
+                {'tag': 'task-t1 '},
+                {'workspace': str(workspace) + '-other (deleted)'},
+                {'workspace': deleted + ' (deleted)'},
+                {'containment_empty': False},
+                {'cause': 'forgotten'},
+                {'exit': {'code': 0, 'signal': None}},
+                {'exit': {'code': 0, 'signal': None, 'exited_at_ms': True}},
+                {'exit': {'code': 0, 'signal': 9, 'exited_at_ms': 1000}},
+            ):
+                with self.subTest(changes=changes):
+                    evidence = {'workspace': deleted, 'exit': exit_info}
+                    evidence.update(changes)
+                    self.tombstone(tmp, **evidence)
+                    self.assertIsNone(adapter.retired(native_id, expected))
+
     def test_oversize_and_symlink_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             state_dir, document = self.tombstone(tmp)
