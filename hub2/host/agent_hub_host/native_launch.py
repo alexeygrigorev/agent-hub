@@ -124,6 +124,20 @@ def command_effort(command):
     return values[0] if values and all(isinstance(v, str) and v == values[0] for v in values) else None
 
 
+def aplexer_prompt(value, *, windows=None):
+    """Keep command prompts safe for Windows batch-file engine wrappers.
+
+    cmd.exe cannot safely forward an argument containing line breaks to a
+    batch file. Flatten prompt line breaks on Windows while preserving the
+    original formatting on other platforms.
+    """
+    if not isinstance(value, str):
+        raise ValueError('native_prompt_invalid')
+    if windows is None:
+        windows = os.name == 'nt'
+    return re.sub(r'(?:\r\n|\r|\n)+', ' ', value) if windows else value
+
+
 def objective_hash(value):
     if not isinstance(value, str) or len(value.encode()) > 512 * 1024:
         raise ValueError('native_goal_objective_invalid')
@@ -451,6 +465,7 @@ class NativeLauncher:
         private_file(fa_path.parent)
         if provider in FIRST_ACTION_PROVIDERS:
             goal += FIRST_ACTION_INSTRUCTION.format(path=fa_path)
+        goal = aplexer_prompt(goal)
         local = provider == 'shell' or (not self.config.get("private_provider_homes", False) and not specification.get("interactive"))
         if local:
             child = self.profile_command(task_id, specification, route, goal)

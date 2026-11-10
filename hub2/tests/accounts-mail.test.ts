@@ -645,3 +645,23 @@ test('credential delivery still requires an approved host and recovers after gen
  await account.fetch(request('/api/account/hosts','PUT',{hosts:[]}));
  assert.equal((await account.fetch(request('/api/account/credentials','GET',undefined,host))).status,403);
 });
+
+test('failed central credential refresh maps to specific error rather than generic internal_error',async()=>{
+ const s=state();
+ const provider=async(url:string)=>{
+  if(url==='https://platform.claude.com/v1/oauth/token'){
+   return new Response(JSON.stringify({error:'invalid_grant'}),{status:400});
+  }
+  throw Error('unexpected test provider URL: '+url);
+ };
+ const account=new AccountDO(s.ctx,{HUB2_CREDENTIAL_KEY:'dd'.repeat(32),HUB2_PROVIDER_FETCH:provider as any}),host={id:'machine:h1',kind:'machine',resource_id:'h1',scopes:[]};
+ await account.fetch(request('/api/account','PATCH',{provider:'claude',enabled:true}));
+ const files={'.claude/.credentials.json':JSON.stringify({claudeAiOauth:{accessToken:'synthetic-expired-access',refreshToken:'synthetic-rejected-refresh',expiresAt:Date.now()-1000}})};
+ await account.fetch(request('/api/account/credentials','PUT',{expected_generation:0,files}));
+ await account.fetch(request('/api/account/hosts','PUT',{hosts:['h1']}));
+ const res=await account.fetch(request('/api/account/credentials?min_validity_ms=600000','GET',undefined,host));
+ assert.equal(res.status,409);
+ const body=await data(res);
+ assert.equal(body.error,'provider_refresh_invalid_grant');
+});
+
