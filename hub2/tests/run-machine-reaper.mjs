@@ -9,3 +9,4 @@ registerHooks({resolve(specifier,context,next){
  return next(specifier,context);
 }});
 await import('./machine-reaper.test.ts');
+await import('./machine-picker-evidence.test.ts');

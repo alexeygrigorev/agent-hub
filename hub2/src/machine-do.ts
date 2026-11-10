@@ -1,4 +1,5 @@
 import { nativeReturncode } from './native-exit';
+import { normalizeStartPickerEvidence } from './start-picker-evidence';
 import { MeteredDb, initializeSchema } from './db';
 import { SqlReceiptMeter, SQL_PROBE_HEADER, wrapSqlNamespaces } from './sql-receipt';
 import { sha256Hex } from './crypto';
@@ -252,7 +253,9 @@ export class MachineDO {
   }
 
   private async reserveInternal(request: Request): Promise<Response> {
-    const body = await bodyObject(request, 12_288);
+    // Diagnostics travel separately, so a full policy pool never consumes the
+    // user launch-spec allowance. Both fields retain their own bounded checks.
+    const body = await bodyObject(request, 65_536);
     const required = ['operation_id', 'dispatch_id', 'session_id', 'project_id', 'intake_id', 'machine_id', 'request_digest', 'title'];
     if (required.some(key => typeof body[key] !== 'string') || !Number.isSafeInteger(body.attempt) || Number(body.attempt) < 0) return error('invalid_reservation', 400);
     if (typeof body.machine_id !== 'string' || typeof body.operation_id !== 'string' || typeof body.session_id !== 'string') return error('invalid_reservation', 400);
@@ -262,6 +265,13 @@ export class MachineDO {
       || typeof (launch as JsonRecord).workspace !== 'string' || typeof (launch as JsonRecord).engine !== 'string'
       || typeof (launch as JsonRecord).prompt !== 'string' || typeof (launch as JsonRecord).interactive !== 'boolean') return error('invalid_launch_spec', 400);
     if (new TextEncoder().encode(JSON.stringify(launch)).byteLength > 12_000) return error('launch_spec_too_large', 413);
+    if (Object.hasOwn(launch, '_hub_picker')) return error('reserved_launch_field', 400);
+    const picker = normalizeStartPickerEvidence(body.picker);
+    if (body.picker !== undefined && (!picker || picker.machine_id !== body.machine_id || picker.attempt !== body.attempt
+      || picker.engine !== (launch as JsonRecord).engine || picker.model !== (launch as JsonRecord).model
+      || picker.effort !== ((launch as JsonRecord).effort ?? null))) return error('invalid_picker_evidence', 400);
+    // Use an existing JSON column; keep evidence out of the native launch wire.
+    const storedLaunch = { ...(launch as JsonRecord), ...(picker ? { _hub_picker: picker } : {}) };
     const now = Date.now();
     const deadline=(launch as JsonRecord).start_deadline_at;
     if(deadline!==undefined&&(!Number.isSafeInteger(deadline)||Number(deadline)>now+120_000))return error('invalid_start_deadline',400);
@@ -304,14 +314,14 @@ export class MachineDO {
             prior!.operation_id, prior!.id, prior!.epoch);
           this.db.run(`UPDATE sessions SET operation_id=?,attempt=?,epoch=?,account_id=?,launch_json=?,state='staged',offer_expires_at=NULL,
             native_id=NULL,evidence_json=NULL,evidence_digest=NULL,exit_code=NULL,updated_at=? WHERE id=? AND state='expired' AND epoch=?`,
-            body.operation_id, body.attempt, epoch, typeof body.account_id === 'string' ? body.account_id : null, JSON.stringify(launch), now, body.session_id, prior!.epoch);
+            body.operation_id, body.attempt, epoch, typeof body.account_id === 'string' ? body.account_id : null, JSON.stringify(storedLaunch), now, body.session_id, prior!.epoch);
         } else {
           this.db.run(`INSERT INTO sessions(id, operation_id, request_digest, dispatch_id, attempt, account_id, project_id, intake_id, machine_id, epoch, title,
             acceptance_criteria_json, launch_json, state, native_id, offer_expires_at, evidence_json, evidence_digest, exit_code, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'staged', NULL, NULL, NULL, NULL, NULL, ?, ?)`,
             body.session_id, body.operation_id, body.request_digest, body.dispatch_id, body.attempt, typeof body.account_id === 'string' ? body.account_id : null,
             body.project_id, body.intake_id, body.machine_id, epoch, body.title,
-            JSON.stringify(body.acceptance_criteria), JSON.stringify(launch), acceptedAt, now);
+            JSON.stringify(body.acceptance_criteria), JSON.stringify(storedLaunch), acceptedAt, now);
         }
         this.db.run("INSERT INTO machine_session_operations(operation_id,session_id,epoch,request_digest,state) VALUES(?,?,?,?, 'current')",
           body.operation_id, body.session_id, epoch, body.request_digest);
@@ -468,11 +478,12 @@ export class MachineDO {
   }
 
   private offerView(row: SessionRow): JsonRecord {
+    const { _hub_picker: _picker, ...launch } = this.parse(row.launch_json) as JsonRecord;
     return {
       session_id: row.id, operation_id: row.operation_id, intake_id: row.intake_id,
       project_id: row.project_id, account_id: row.account_id, epoch: row.epoch, title: row.title,
       acceptance_criteria: this.parse(row.acceptance_criteria_json),
-      launch: this.parse(row.launch_json), expires_at: row.offer_expires_at, claimed: row.state === 'claimed',
+      launch, expires_at: row.offer_expires_at, claimed: row.state === 'claimed',
     };
   }
 
@@ -1219,11 +1230,13 @@ export class MachineDO {
 
   private sessionView(row: SessionRow): JsonRecord {
     const launch=this.parse(row.launch_json) as JsonRecord;
+    const picker=normalizeStartPickerEvidence(launch._hub_picker);
     return {id:row.id,state:row.state,intake_id:row.intake_id,project_id:row.project_id,machine_id:row.machine_id,
       epoch:row.epoch,operation_id:row.operation_id,native_id:row.native_id,engine:launch.engine,model:launch.model,
       managed:true,host:row.machine_id,machine:row.machine_id,workspace:launch.workspace,
       start_deadline_at:launch.start_deadline_at??null,
       account_id:row.account_id,account:row.account_id,effort:launch.effort??null,
+      ...(picker ? { picker, policy_id: picker.policy_id, policy_version: picker.policy_version } : {}),
       mode:launch.interactive===true?'interactive':'headless',
       created_at:new Date(row.created_at).toISOString(),updated_at:new Date(row.updated_at).toISOString(),
       last_activity_at:this.db.one<{last_activity_at:number|null}>('SELECT last_activity_at FROM native_sessions WHERE session_id=?',row.id)?.last_activity_at??null,
