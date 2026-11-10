@@ -597,6 +597,10 @@ class NativeLauncher:
         with os.fdopen(fd, 'w') as stream:
             stream.write(prompt)
         profile = route.get('profile')
+        from .task_output import prepare_output
+        specification['_task_output'] = prepare_output(task_id, specification, profile, route.get('engine') if profile else route.get('engine', provider), prompt)
+        output = specification['_task_output']
+        output_args = ['--output-dir', str(Path(specification['workspace']).resolve().joinpath(*output['parts']))] if output else []
         selector = ['--profile', profile] if profile else ['--engine', route.get('engine', provider)]
         args = ['--model', model]
         effort = specification.get('effort')
@@ -604,7 +608,7 @@ class NativeLauncher:
             args += headless_effort_argv(provider, ['prompt'], effort)[:-1]
         return [self.native_binary, 'task', 'run', *selector, '--cwd', specification['workspace'],
                 '--prompt-file', str(path), '--timeout-secs', str(specification['timeout_seconds']),
-                '--no-notify', *['--engine-arg=' + arg for arg in args]]
+                '--no-notify', *output_args, *['--engine-arg=' + arg for arg in args]]
 
     def wait_first_action(self, fa_path, start_json, started, specification, poll=None, sleep=None):
         poll = poll or (lambda selector: self.status(selector, workspace=specification["workspace"]))
@@ -670,8 +674,9 @@ class NativeLauncher:
                         "first_action_validated_at": time.time() if receipt.get("first_action_verified") else None,
                         "interactive": bool(specification.get("interactive")),
                         "effort": specification.get("effort"), "with_goal": bool(specification.get("with_goal")),
-                        "goal_registration": receipt.get("goal_registration")}
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                        "goal_registration": receipt.get("goal_registration"),
+                        "task_output": specification.get("_task_output")}
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0), 0o600)
             with os.fdopen(fd, 'w', encoding='utf8') as stream:
                 stream.write(json.dumps(evidence))
                 stream.flush()

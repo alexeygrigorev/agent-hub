@@ -613,6 +613,27 @@ class HostTests(unittest.TestCase):
         self.assertEqual(sent[0]["type"], "host.error")
         self.assertEqual(sent[0]["reason"], "command_fence_conflict")
 
+    def test_capture_reads_bound_headless_stdout_through_existing_command_fence(self):
+        from agent_hub_host.task_output import prepare_output
+        self.bridge.offer(self.offer())
+        row=self.journal.db.execute('SELECT * FROM launches').fetchone()
+        spec={'workspace':row['workspace'],'operation_id':row['operation_id'],'epoch':row['epoch']}
+        task='hub2-'+row['session_id']
+        binding=prepare_output(task,spec,'synthetic-profile','codex','synthetic prompt')
+        directory=Path(row['workspace']).joinpath(*binding['parts'])
+        record={'session_id':row['native_id'],'tag':row['tag'],'workspace':row['workspace'],
+                'created_at_ms':1,'task_output':binding}
+        (Path(row['workspace'])/'.local'/('launch-'+task+'.json')).write_text(json.dumps(record))
+        start={'schema_version':1,'parent_session':{'id':row['native_id'],'tag':row['tag'],'workspace':row['workspace']},
+               'cwd':row['workspace'],'output_dir':str(directory),'profile':'synthetic-profile','engine':'codex',
+               'started_ms':int(time.time()*1000),'prompt_sha256':binding['prompt_sha256']}
+        (directory/'START.json').write_text(json.dumps(start))
+        (directory/'stdout.log').write_text('real child stdout')
+        result=self.bridge.command({'id':'bound-capture','session_id':row['session_id'],'epoch':row['epoch'],'kind':'capture'})
+        self.assertEqual(result['output'],'real child stdout')
+        with self.assertRaisesRegex(ValueError,'command_fence_conflict'):
+            self.bridge.command({'id':'wrong-epoch-capture','session_id':row['session_id'],'epoch':row['epoch']+1,'kind':'capture'})
+
     def test_no_shell_flags_and_fenced_capture_stop(self):
         self.bridge.offer(self.offer())
         capture = self.bridge.command({"id": "capture-1", "session_id": "session-1", "epoch": 1, "kind": "capture"})

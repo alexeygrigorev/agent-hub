@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Live start canary for Hub: start, observe, capture, stop, confirm gone.
 
-Drives the public CLIs only (`hub sessions start|list|stop`, `a capture`,
+Drives the public CLIs only (`hub sessions start|list|capture|stop`,
 `a list --json --running`). See docs/HUB-START-CANARY.md.
 """
 import argparse, datetime, fcntl, json, os, pathlib, re, shlex, subprocess, sys, time, uuid
@@ -192,19 +192,56 @@ class Canary:
         raise StageFailure(stage, ("timeout_" if stage == "running" else "") + reason)
 
     def output_has_marker(self, out):
-        return any(line.strip(" \t│┃>●•") == self.marker for line in out.splitlines())
+        def marker_in(text):
+            return isinstance(text, str) and any(line.strip(" \t│┃>●•") == self.marker for line in text.splitlines())
+        for line in out.splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                if marker_in(line):
+                    return True
+                continue
+            if not isinstance(event, dict):
+                continue
+            # Only completed tool output and assistant output; never arguments,
+            # prompts, reasoning or arbitrary nested JSON containing the nonce.
+            item = event.get('item')
+            if event.get('type') == 'item.completed' and isinstance(item, dict):
+                if item.get('type') == 'command_execution' and marker_in(item.get('aggregated_output')):
+                    return True
+                if item.get('type') == 'agent_message' and marker_in(item.get('text')):
+                    return True
+            if event.get('type') == 'result' and marker_in(event.get('result')):
+                return True
+            part = event.get('part')
+            if event.get('type') == 'text' and isinstance(part, dict) and marker_in(part.get('text')):
+                return True
+        return False
 
     def check_capture(self):
         deadline = time.monotonic() + self.capture_timeout
         reason = "no_output"
+        attempt = 0
         while time.monotonic() < deadline:
-            rc, out, _ = self.run([*self.a, "capture", self.native, "--bytes", "8192"], deadline=deadline)
+            attempt += 1
+            key = f"canary-capture-{self.run_id}-{attempt}"
+            rc, raw, _ = self.run([*self.hub, "sessions", "capture", self.session, "--key", key,
+                                   "--max-bytes", "4096", "--json"], deadline=deadline)
+            out = ''
+            if rc == 0:
+                try:
+                    entry = json.loads(raw).get('command_wait', {})
+                    out = entry.get('ack', {}).get('capture', '') if entry.get('state') == 'acked' else ''
+                    if not isinstance(out, str):
+                        out = ''
+                except (ValueError, AttributeError):
+                    out = ''
             if rc == 0:
                 if self.output_has_marker(out) and time.monotonic() < deadline:
                     return
                 reason = "no_output_beyond_prompt" if out.strip() else "empty_capture"
             elif rc != 124 or reason == "no_output":
-                reason = "a_capture_timeout" if rc == 124 else f"a_capture_exit_{rc}"
+                reason = "hub_capture_timeout" if rc == 124 else f"hub_capture_exit_{rc}"
             self.pause(deadline)
         raise StageFailure("capture", reason)
 

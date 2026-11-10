@@ -471,7 +471,11 @@ class Bridge:
             raise ValueError("headless_send_refused")
         self.begin_command(identity, digest)
         if kind == "capture":
-            result = {"output": self.native("capture", native_id, "--screen", "--plain").stdout[:16384]}
+            from .task_output import capture_task_output, bounded_capture
+            output = capture_task_output("hub2-" + row["session_id"], row, native_id)
+            if output is None:
+                output = self.native("capture", native_id, "--screen", "--plain").stdout[:16384]
+            result = {"output": bounded_capture(output)}
         elif kind == "stop":
             self.native("kill", native_id)
             status = self.lookup(native_id, row)
