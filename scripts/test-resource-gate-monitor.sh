@@ -151,6 +151,9 @@ grep -Fq 'PATH="$RUNUSER_PATH" DATAOPS_CONFIG_DIR=/home/alexey/.config/dataops' 
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 pass() { printf 'PASS: %s\n' "$*"; }
+grep -Fq 'ReadWritePaths=/home/alexey/.agent-browser/tools' "$ROOT/deploy/resource-gate-monitor.service" \
+  || fail "monitor service cannot persist controller credential refreshes"
+pass "monitor service can persist its refreshed controller credential"
 mail_count() { awk '/---MESSAGE-END---/ { n++ } END { print n+0 }' "$MONITOR_MAIL_CAPTURE"; }
 dataops_count() { awk -F '\t' -v action="$1" '$1 == action { n++ } END { print n+0 }' "$MONITOR_DATAOPS_CAPTURE"; }
 run_check() {

@@ -18,3 +18,5 @@ PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/var/lib/resource-gate-monitor
+# Device-bound controller token refreshes are persisted atomically here.
+ReadWritePaths=/home/alexey/.agent-browser/tools
