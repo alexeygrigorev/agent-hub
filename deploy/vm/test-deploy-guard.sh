@@ -61,7 +61,6 @@ config="$2"
 printf 'validate\n' >> "${CADDY_CAPTURE:?}"
 grep -Eq '^[[:space:]]*gate\.dtcdev\.click[[:space:]]*\{' "$config" || exit 93
 grep -Fq 'reverse_proxy 127.0.0.1:8791' "$config" || exit 94
-grep -Fq 'rewrite @desktop_health /v1/check?resource=browser&scope=desktop' "$config" || exit 95
 CADDY
 cat > "$TEST_ROOT/bin/systemctl" <<'SYSTEMCTL'
 #!/usr/bin/env bash
@@ -94,8 +93,6 @@ cat > "$TEST_ROOT/seed/deploy/Caddyfile" <<'CADDY_OLD'
   reverse_proxy 127.0.0.1:8787
 }
 gate.dtcdev.click {
-  @desktop_health path /v1/health
-  rewrite @desktop_health /v1/check?resource=browser&scope=desktop
   reverse_proxy 127.0.0.1:8791
 }
 # previous

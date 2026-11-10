@@ -49,6 +49,16 @@ validate_gate_caddyfile() {
   run_root "$CADDY_BIN" validate --config "$config" --adapter caddyfile || return 1
 }
 
+validate_previous_caddyfile() {
+  local config="$1"
+  [[ -s "$config" ]] || return 1
+  grep -Eq '^[[:space:]]*gate\.dtcdev\.click[[:space:]]*\{' "$config" \
+    || return 1
+  grep -Fq 'reverse_proxy 127.0.0.1:8791' "$config" \
+    || return 1
+  run_root "$CADDY_BIN" validate --config "$config" --adapter caddyfile || return 1
+}
+
 write_root_file() {
   local path="$1" contents="$2"
   printf '%s\n' "$contents" | run_root tee "$path" >/dev/null
@@ -112,7 +122,7 @@ restore_previous_release() {
   if [[ "$gate_mode" == full ]]; then
     run_root install -o root -g root -m 644 \
       "$TRANSACTION_DIR/Caddyfile.previous" "$CADDY_CONFIG" || return 1
-    validate_gate_caddyfile "$CADDY_CONFIG" || return 1
+    validate_previous_caddyfile "$CADDY_CONFIG" || return 1
     run_root systemctl reload caddy || return 1
   fi
   run_root systemctl restart agent-hub-hub2.service || return 1

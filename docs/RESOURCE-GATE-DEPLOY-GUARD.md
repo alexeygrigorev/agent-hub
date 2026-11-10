@@ -55,12 +55,16 @@ it sends a clearly labelled test email and creates/closes a test DataOps Task.
 An install or smoke failure runs the fixed rollback operation. It checks out
 the previous commit, restores `.dev.vars`, reapplies that release's installer,
 restores the exact prior Caddyfile, reloads Caddy and Hub2, and verifies local
-Hub health. The workflow remains failed after rollback so CI reports the
-release failure. If a runner is interrupted before it can roll back, the
-protected snapshot remains and the next deploy refuses to proceed; dispatch the
-same workflow with `rollback_pending=true` to restore it before trying another
-release.
+Hub health. Rollback validates that the saved Caddyfile is syntactically valid
+and retains the Gate TLS site and upstream. It permits an older snapshot that
+predates the `/v1/health` rewrite; every new deploy candidate must include that
+rewrite and pass the public authenticated smoke. The workflow remains failed
+after rollback so CI reports the release failure. If a runner is interrupted
+before it can roll back, the protected snapshot remains and the next deploy
+refuses to proceed; dispatch the same workflow with `rollback_pending=true` to
+restore it before trying another release.
 
 The focused transaction regression is `bash deploy/vm/test-deploy-guard.sh`.
-It exercises a successful staged apply, a manual rollback, automatic rollback
-after an installer failure, and rejection of a Caddyfile without the TLS site.
+It exercises a successful staged apply, a manual rollback from a prior Caddyfile
+without the new health alias, automatic rollback after dependency or installer
+failure, and rejection of a new candidate without the TLS site or health route.
