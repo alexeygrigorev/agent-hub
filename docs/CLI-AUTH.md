@@ -3,6 +3,10 @@
 Self-contained Developer CLI. No private GitHub keys, no Hetzner-local paths,
 no privileged install. Python >= 3.9 stdlib only.
 
+The default Hub URL is `https://hub.dtcdev.click`. The former
+`agent-hub.cloudflare-ai-agent-de9ca0.workers.dev` endpoint is a retired
+bootstrap stub and must not be used for CLI or MCP traffic.
+
 ## One-line install
 
 ```sh
@@ -50,6 +54,26 @@ hub auth logout
   human commands then check `client_kind == "human"` so a host token is never
   mistaken for human.
 
+### Migrating a stale workers.dev profile
+
+If `cli.json` still stores the retired workers.dev URL, human login without an
+override resolves that exact legacy origin to the Hub2 default. To migrate
+explicitly, run:
+
+```sh
+hub auth login --url https://hub.dtcdev.click
+```
+
+The CLI obtains a new device grant from the selected Hub. It replaces the old
+profile only after the Hub returns valid tokens, and does not carry old tokens
+or server-bound profile metadata across origins. A cancelled or failed login
+leaves the saved profile unchanged. Requests that still reach the retired
+endpoint report `503 release_bootstrap` with the replacement URL and login
+command.
+
+Hub MCP clients, including Grok bots, should use
+`https://hub.dtcdev.click/mcp` as their endpoint.
+
 ## Profiles
 
 - Human: `~/.config/agent-hub/cli.json` (`client_kind: "human"`).
@@ -74,10 +98,9 @@ hub auth logout
 - `GET /api/auth/me` → safe human identity/status (no tokens).
 - `POST /api/auth/logout {}` → revokes ONLY the human credential family.
 
-Today's Worker accepts the `human` kind, serves the two
-`/api/auth/*` routes, and allowlists the anonymous `/cli/*` assets
-(`install.sh`, `hub.pyz`, `hub.pyz.sha256`, `manifest.json`). Client filenames
-are coordinated exactly.
+The Hub2 service accepts the `human` kind, serves the human auth routes, and
+publishes the anonymous `/cli/*` assets (`install.sh`, `hub.pyz`,
+`hub.pyz.sha256`, `manifest.json`). Client filenames are coordinated exactly.
 
 ## Build (head before deploy)
 
@@ -87,12 +110,11 @@ python3 scripts/build-hub-cli.py --out-dir public/cli
 
 Writes deterministic stdlib zipapp `hub.pyz` (bundles `agent_hub_host` +
 vendored `dtc_device_login` loop, pinned commit `c8ffec3`) + `.sha256` +
-`manifest.json`. `install.sh` is tracked source; the three build outputs are
-gitignored and rebuilt before every `wrangler deploy` so `./public` publishes
-`/cli/*`.
+`manifest.json`. `install.sh` is tracked source; the VM installer builds these
+assets into `hub2/public/cli` before the Hub2 service restarts.
 
 ## Limits
 
-- No production auth/login/API/deploy calls from workers; mock-flow tests only.
+- Tests use mocked auth flows; the installed CLI talks to the configured Hub.
 - Session start/send/capture/stop UX is a separate followup (workspace is a
   logical label, `--brief-file` only); this doc does not advertise it.

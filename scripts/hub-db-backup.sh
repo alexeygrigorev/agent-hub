@@ -175,9 +175,9 @@ api_get() {
   printf '%s' "$code"
 }
 
-# The release_bootstrap worker is an intentional 503 safety stub while Hub is
-# disabled. Skip only when the response is HTTP 503 and its JSON body carries
-# an explicit disabled-stub marker; bare/unknown 503s still fail and alert.
+# A legacy release_bootstrap response means the configured Hub endpoint cannot
+# serve this client. Treat it as a failure so the cron log records the outage
+# and the same-run alert path pages instead of silently skipping the backup.
 skip_if_intentional_stub_503() {
   local code="$1" body="$2" context="$3"
   [[ "$code" == "503" ]] || return 0
@@ -198,8 +198,7 @@ is_stub = isinstance(body, dict) and (
 sys.exit(0 if is_stub else 1)
 PY
   then
-    log "SKIP: Hub stubbed / dispatch disabled; backup skipped (${context}, HTTP 503)"
-    exit 0
+    fail "legacy Hub release_bootstrap stub returned HTTP 503 (${context}); set HUB_BASE_URL to https://hub.dtcdev.click and reauthenticate"
   fi
 }
 
