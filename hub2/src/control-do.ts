@@ -1,3 +1,4 @@
+import {SharedMemory,SHARED_MEMORY_SCHEMA} from './shared-memory';
 import {WorkerCredentials,WORKER_CREDENTIAL_SCHEMA} from './worker-credentials';
 import {ControlAuth,CONTROL_AUTH_SCHEMA} from './control-auth';
 import {verifyKnownCredential} from './auth';
@@ -87,13 +88,15 @@ export class ControlDO {
   private readonly env: Hub2Env;
   private readonly auth:ControlAuth;
   private readonly workers:WorkerCredentials;
+  private readonly memory:SharedMemory;
   private readonly ready:Promise<void>;
 
   constructor(private readonly ctx: DurableObjectState, env: Hub2Env) {
     this.db = new MeteredDb(ctx.storage.sql);
     this.sqlReceipts = new SqlReceiptMeter(this.db);
     this.env = wrapSqlNamespaces(env, this.sqlReceipts) as Hub2Env;
-    this.ready=initializeSchema(ctx, this.db, 4, SCHEMA,[ONCALL_SCHEMA,['CREATE TABLE IF NOT EXISTS session_start_reservations(operation_id TEXT PRIMARY KEY,session_id TEXT NOT NULL,expires_at INTEGER NOT NULL) WITHOUT ROWID', ...ENGINE_SCHEMA],ENGINE_SCHEMA],async()=>{this.seedEngineRollout();await this.scheduleWake();});
+    this.ready=initializeSchema(ctx, this.db, 5, SCHEMA,[ONCALL_SCHEMA,['CREATE TABLE IF NOT EXISTS session_start_reservations(operation_id TEXT PRIMARY KEY,session_id TEXT NOT NULL,expires_at INTEGER NOT NULL) WITHOUT ROWID', ...ENGINE_SCHEMA],ENGINE_SCHEMA,SHARED_MEMORY_SCHEMA],async()=>{this.seedEngineRollout();await this.scheduleWake();});
+    this.memory=new SharedMemory(ctx,this.db,this.env);
     this.auth=new ControlAuth(ctx,this.db,this.env);this.workers=new WorkerCredentials(ctx,this.db,this.env);
   }
 
@@ -107,6 +110,7 @@ export class ControlDO {
       await this.ready;
       const workerResponse=await this.workers.fetch(request);if(workerResponse)return workerResponse;
       const authResponse=await this.auth.fetch(request);if(authResponse)return authResponse;
+      const memoryResponse=await this.memory.fetch(request);if(memoryResponse)return memoryResponse;
       if(url.pathname==='/_internal/session-cap/check'&&request.method==='POST')return await this.checkSessionCap(request);
       if(url.pathname==='/_internal/session-cap/release'&&request.method==='POST')return await this.releaseSessionStart(request);
       if (url.pathname === '/_oncall/config' && request.method === 'POST') return await this.configureOncall(request);
