@@ -23,9 +23,11 @@ BRIEF = "E2E start-path brief: print a marker and keep running"
 START_DEADLINE_S = 60      # accept -> running on an idle loopback host
 STOP_DEADLINE_S = 60       # stop -> native exit confirmed
 RECONNECT_DEADLINE_S = 45  # server restart -> host connected again
-# Plan 2.3: one 120 s start deadline from accept to native id; 30 s slack for
-# the alarm sweep and the CLI poll interval.
-START_FAIL_DEADLINE_S = 150
+# Plan 2.3: one 120 s start deadline from ACCEPTANCE (POST /api/sessions 2xx) to
+# native id. Measured from t0 = the server's accepted timestamp when the response
+# or session view carries one, else the client clock right after the 2xx.
+START_DEADLINE_FROM_ACCEPT_S = 120
+OBSERVE_SLACK_S = 5        # only for observing the row; the assertion uses the 120 s bound
 NO_HOST_REFUSAL_S = 2      # plan 2.3: no connected host -> 503 no_connected_host in <2 s
 
 
@@ -92,6 +94,7 @@ class Hub:
 
     def start_ok(self):
         result = self.start()
+        self.accepted_client_ms = int(time.time() * 1000)
         assert result.returncode == 0, "model-less start failed rc=%s\n%s\n%s" % (
             result.returncode, result.stdout[-2000:], result.stderr[-2000:])
         created = json.loads(result.stdout)
@@ -172,6 +175,52 @@ def test_model_less_start_list_show_capture_stop(hub):
     assert hub.native_row(session_id) is None, "native workload still listed after stop: %s" % hub.host.native_rows()
 
 
+def iso_ms(value):
+    from datetime import datetime
+    if isinstance(value, (int, float)) and value > 10**12:
+        return int(value)
+    if isinstance(value, str) and value:
+        try:
+            return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1000)
+        except ValueError:
+            return None
+    return None
+
+
+def acceptance_ms(hub, created):
+    """t0: server accepted timestamp from the start response or session view, else client time after the 2xx."""
+    for source in (created, hub.show(created["id"])):
+        for key in ("accepted_at", "created_at"):
+            stamp = iso_ms(source.get(key))
+            if stamp:
+                return stamp, "server:" + key
+    return hub.accepted_client_ms, "client_after_2xx"
+
+
+def assert_failed_within_start_deadline(hub, created, reason):
+    """Terminal `failed` with attention.reason == reason within 120 s of acceptance."""
+    session_id = created["id"]
+    t0, source = acceptance_ms(hub, created)
+    until = t0 / 1000 + START_DEADLINE_FROM_ACCEPT_S + OBSERVE_SLACK_S
+    row = hub.show(session_id)
+    while row.get("state") not in ("failed", "stopped", "lost", "running", "completed-awaiting-review") \
+            and time.time() < until:
+        time.sleep(1)
+        row = hub.show(session_id)
+    observed_ms = int(time.time() * 1000)
+    attention = row.get("attention") or {}
+    failed_at = iso_ms(attention.get("observed_at")) or iso_ms(row.get("updated_at")) or observed_ms
+    elapsed = (failed_at - t0) / 1000
+    detail = "t0=%s (%s) elapsed_from_accept=%.1fs row=%s\nhost log:\n%s\nserver log:\n%s" % (
+        t0, source, elapsed, json.dumps(row), hub.host.tail(), hub.server.tail())
+    assert row.get("state") == "failed", "not failed within %ss of acceptance: %s" % (START_DEADLINE_FROM_ACCEPT_S, detail)
+    assert attention.get("reason") == reason, "attention.reason != %s: %s" % (reason, detail)
+    assert elapsed <= START_DEADLINE_FROM_ACCEPT_S, "failed later than %ss after acceptance: %s" % (
+        START_DEADLINE_FROM_ACCEPT_S, detail)
+    print("%s: failed %s %.1fs after acceptance (%s)" % (session_id, reason, elapsed, source))
+    return row
+
+
 def test_list_shows_host_and_workspace_for_every_row(hub):
     session_id = hub.start_ok()["id"]
     hub.wait_state(session_id, {"running"}, START_DEADLINE_S)
@@ -194,6 +243,15 @@ def test_start_without_connected_host_is_refused_typed(hub_without_host):
                                                       "repo": "e2e-owner/e2e-repo", "brief": BRIEF})
     assert time.monotonic() - direct_started < NO_HOST_REFUSAL_S, "refusal took too long"
     assert direct.status == 503 and direct.body.get("error") == "no_connected_host", direct
+    shell = hub.start("--engine", "shell", "--reason", "e2e: explicit shell start must not bypass the connected-host check")
+    assert shell.returncode != 0, "explicit shell start accepted with no connected host:\n" + shell.stdout
+    assert "no_connected_host" in shell.stderr + shell.stdout, (shell.stdout[-2000:], shell.stderr[-2000:])
+    shell_started = time.monotonic()
+    direct_shell = hub.server.api("POST", "/api/sessions", {
+        "key": new_key(), "workspace": str(hub.host.workspace), "repo": "e2e-owner/e2e-repo", "brief": BRIEF,
+        "engine": "shell", "engine_override_reason": "e2e: explicit shell start must not bypass the connected check"})
+    assert time.monotonic() - shell_started < NO_HOST_REFUSAL_S, "shell refusal took too long"
+    assert direct_shell.status == 503 and direct_shell.body.get("error") == "no_connected_host", direct_shell
     assert hub.server.ok("GET", "/api/sessions?limit=100")["sessions"] == [], "a refused start left a session row"
 
 
@@ -203,22 +261,18 @@ def test_unclaimed_offer_fails_host_no_response(hub):
     created = hub.start_ok()
     session_id = created["id"]
     assert created.get("state") in ("offered", "staged", "pending"), created
-    row = hub.wait_state(session_id, {"failed", "stopped", "lost", "running", "claimed"}, START_FAIL_DEADLINE_S,
-                         check_host=False)
-    assert row["state"] == "failed", row
-    assert "host_no_response" in json.dumps(row), row
+    assert_failed_within_start_deadline(hub, created, "host_no_response")
 
 
 def test_host_killed_mid_launch_fails_typed(hub):
     # `a start` blocks inside the daemon, so the host dies before any native id exists.
     hub.host.control(start_delay_s=600)
-    session_id = hub.start_ok()["id"]
+    created = hub.start_ok()
+    session_id = created["id"]
     wait_for(lambda: (hub.host.state / "start-pending").exists(), START_DEADLINE_S, label="host inside `a start`")
     assert hub.show(session_id)["state"] in ("claimed", "admitted"), hub.show(session_id)
     hub.host.kill()
-    row = hub.wait_state(session_id, {"failed", "stopped", "lost", "running"}, START_FAIL_DEADLINE_S, check_host=False)
-    assert row["state"] == "failed", row
-    assert "launch_timeout_no_native" in json.dumps(row), row
+    assert_failed_within_start_deadline(hub, created, "launch_timeout_no_native")
     assert hub.native_row(session_id) is None, hub.host.native_rows()
 
 
