@@ -138,8 +138,8 @@ test('detailed pick reports the pool shares and credential exclusions',async()=>
 
 test('disconnected hosts are a typed refusal, including explicit host requests',async()=>{
  const {env}=envFor({codex:90},true);
- env.MACHINES={idFromName:(id:string)=>id,get:()=>({fetch:async()=>Response.json({machine_id:'h1',connected:false,engines:['codex']})})};
- await assert.rejects(pickModelRoute(env,{interactive:false}), (error:any)=>error.code==='no_connected_host'&&error.status===503);
+ env.MACHINES={idFromName:(id:string)=>id,get:()=>({fetch:async()=>Response.json({machine_id:'h1',connected:false,last_seen:Date.now()-120_000,engines:['codex']})})};
+ await assert.rejects(pickModelRoute(env,{interactive:false}), (error:any)=>error.code==='no_connected_host'&&error.status===503&&JSON.parse(error.detail).machines[0].age_ms>=120_000);
  await assert.rejects(pickModelRoute(env,{interactive:false,machine_id:'h1'}), (error:any)=>error.code==='no_connected_host');
 });
 

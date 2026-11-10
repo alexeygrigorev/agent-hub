@@ -48,7 +48,7 @@ export async function boundedText(request: Request, limit: number): Promise<stri
 }
 
 export class HttpError extends Error {
-  constructor(readonly code: string, readonly status: number) { super(code); }
+  constructor(readonly code: string, readonly status: number, readonly detail?: string) { super(code); }
 }
 
 export function actorFrom(request: Request): Actor | undefined {

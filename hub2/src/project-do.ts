@@ -133,7 +133,7 @@ export class ProjectDO {
       if(!match[2]&&request.method==='PATCH')return await this.editIntake(request,intakeId);
       return error('not_found', 404);
     } catch (caught) {
-      if (caught instanceof HttpError) return error(caught.code, caught.status);
+      if (caught instanceof HttpError) return error(caught.code, caught.status, caught.detail);
       return error('internal_error', 500);
     }
   }
@@ -454,7 +454,7 @@ export class ProjectDO {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ operation_id: operationId, session_id: sessionId }),
       }).catch(() => undefined);
-      if (caught instanceof HttpError) return error(caught.code, caught.status);
+      if (caught instanceof HttpError) return error(caught.code, caught.status, caught.detail);
       return error('dispatch_persist_failed', 503);
     }
     await this.scheduleNext();
@@ -534,15 +534,17 @@ export class ProjectDO {
 
   private async failDispatch(saga: SagaRow, reason: string): Promise<void> {
     const now=Date.now();
-    this.transaction(()=>{
+    const applied=this.transaction(()=>{
       const current=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?',saga.operation_id);
-      if(!current||current.state==='complete'||current.native_id)return;
+      if(!current||current.state==='complete'||current.native_id)return false;
       this.db.run("UPDATE dispatch_sagas SET state='complete',next_action_at=NULL,last_reason=?,updated_at=? WHERE operation_id=?",reason,now,saga.operation_id);
       this.db.run("UPDATE intakes SET status='failed',final_evidence_json=?,updated_at=? WHERE id=? AND session_id=?",
         JSON.stringify({launch_failed:true,native_id_absent:true,reason,session_id:saga.session_id,operation_id:saga.operation_id}),now,saga.intake_id,saga.session_id);
       this.appendEvent(saga.intake_id,`dispatch-failed:${saga.attempt_operation_id}`, 'hub2-dispatch','session_launch_failed',
         {session_id:saga.session_id,reason},now);
+      return true;
     });
+    if(!applied)return;
     await this.env.CONTROL.get(this.env.CONTROL.idFromName('global')).fetch('https://control.internal/_internal/session-cap/release',{
       method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({operation_id:saga.operation_id,session_id:saga.session_id}),
     }).catch(()=>undefined);

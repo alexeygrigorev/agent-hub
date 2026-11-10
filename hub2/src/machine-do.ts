@@ -236,7 +236,7 @@ export class MachineDO {
     let connected=false;
     for(const socket of this.machineSockets(`${machine.machine_id}`))if(socket.readyState===1&&!this.stopOnly(socket)&&await this.authorizedAttachment(socket,'machine:offer')){connected=true;break;}
     const capabilities=this.db.one<{engines_json:string;capabilities_json:string}>('SELECT engines_json,capabilities_json FROM machine_capabilities WHERE machine_id=?',machine.machine_id);
-    return json({machine_id:machine.machine_id,connected,os:machine.os,arch:machine.arch,labels:JSON.parse(machine.labels_json),
+    return json({machine_id:machine.machine_id,connected,last_seen:machine.last_seen,os:machine.os,arch:machine.arch,labels:JSON.parse(machine.labels_json),
       engines:capabilities?JSON.parse(capabilities.engines_json):[],capabilities:capabilities?JSON.parse(capabilities.capabilities_json):[]});
   }
 

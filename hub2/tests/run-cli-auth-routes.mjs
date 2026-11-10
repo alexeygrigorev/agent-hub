@@ -1,5 +1,6 @@
 // Real Node/SQLite routes plus the installed Python CLI, with synthetic credentials.
 import assert from 'node:assert/strict';
+import WebSocket from 'ws';
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { writeFile, rm } from 'node:fs/promises';
@@ -18,7 +19,7 @@ class SeedControl extends ControlDO {
       await super.fetch(new Request('https://internal/_metrics'));
       for (const [key, kind, resource, client] of [[token, 'operator', 'human:cli-user', 'hub-cli'], [browser, 'operator', 'human:cli-user', 'browser'], [machine, 'machine', 'a-empty', 'host']]) {
         this.ctx.storage.sql.exec('INSERT INTO credentials(actor_id,kind,resource_id,generation,token_hash,scopes_json,family_id,client_id,created_at,expires_at,principal_email,csrf_token) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
-          'credential:' + client, kind, resource, 'gen-' + client, hash(key), JSON.stringify(['operator:admin']), 'family-' + client, client, Date.now(), Date.now() + 3600000, 'cli@example.test', 'synthetic-csrf');
+          'credential:' + client, kind, resource, 'gen-' + client, hash(key), JSON.stringify(kind==='machine'?['machine:heartbeat','machine:offer','session:report']:['operator:admin']), 'family-' + client, client, Date.now(), Date.now() + 3600000, 'cli@example.test', 'synthetic-csrf');
       }
       this.ctx.storage.sql.exec("INSERT INTO credentials(actor_id,kind,resource_id,generation,token_hash,scopes_json,family_id,client_id,created_at) VALUES('credential:b','machine','b-full','gen-b','machine-hash-b','[]','family-b','host-b',?)", Date.now());
       this.seeded = true;
@@ -57,6 +58,7 @@ const fixture = await createFixture({ root, entry: wrappedEntry,
 const headers = { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' };
 const call = (path, method = 'GET', body) => fixture.fetch(path, { method, headers, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
 const scratch = await makeTempDir('cli-auth-routes-');
+let hostSocket;
 async function command(program, args, env = {}) {
   const child = spawn(program, args, { cwd: root, env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
   let out = '', err = '';
@@ -118,6 +120,15 @@ try {
   assert.equal(noWorkspace.status, 400); assert.equal(noWorkspaceBody.error, 'workspace_required');
   assert.match(noWorkspaceBody.detail, /--repo owner\/name/);
   assert.match(noWorkspaceBody.detail, /--workspace <registered label/);
+  const disconnected=await start({...base,key:'start-disconnected-01'});
+  assert.equal(disconnected.status,503);
+  assert.equal((await disconnected.json()).error,'no_connected_host');
+  // A heartbeat alone is not a connected host. Placement needs the real
+  // authenticated socket, including in this CLI-route fixture.
+  assert.equal((await fixture.fetch('/api/heartbeat',{method:'POST',headers:{Authorization:'Bearer '+machine,'Content-Type':'application/json'},
+    body:JSON.stringify({labels:[],engines:['codex'],capabilities:['headless'],native_sessions:[]})})).status,200);
+  hostSocket=new WebSocket(fixture.origin.replace('http:','ws:')+'/api/connect',{headers:{Authorization:'Bearer '+machine}});
+  await new Promise((resolve,reject)=>{hostSocket.once('open',resolve);hostSocket.once('error',reject);});
   // --repo owner/name supplies its repository workspace when --workspace is omitted.
   const repoOnly = await start({ ...base, key: 'start-repo-only-01', workspace: undefined });
   const repoOnlyBody = await repoOnly.json();
@@ -161,6 +172,7 @@ try {
   assert.equal(JSON.parse(await command('curl', ['-fsS', '-H', 'Authorization: Bearer ' + token, fixture.origin + '/api/auth/me'])).actor, 'human:cli-user');
   console.log('CLI auth/profile, quota, session pagination, canonical repo import and real Python CLI: passed');
 } finally {
+  hostSocket?.terminate();
   await fixture.dispose(); await rm(fixture.dataDir, { recursive: true, force: true }); await rm(scratch, { recursive: true, force: true });
 }
 
