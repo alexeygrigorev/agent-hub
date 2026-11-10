@@ -46,6 +46,20 @@ if args[:2] == ["sessions", "list"]:
         elif sc == "wrong_workspace": items.append(item("running", workspace="/wrong/workspace"))
         else: items.append(item("running"))
     print(json.dumps({"items": items[:1] if sc == "past_first_page" else items, "next": None, "complete": True, "sessions": items, "next_cursor": None})); sys.exit(0)
+if args[:2] == ["sessions", "capture"]:
+    if sc == "capture_fail": sys.exit(1)
+    if sc == "late_capture": time.sleep(0.5)
+    prompt, marker = (d / "prompt").read_text(), (d / "marker").read_text()
+    if sc == "capture_prompt_only": output = "$ " + prompt
+    elif sc == "wrapped_prompt_only": output = "Reply CANARY-OK\nand exit"
+    elif sc == "capture_empty": output = ""
+    elif sc == "json_command_output": output = json.dumps({"type":"item.completed","item":{"type":"command_execution","aggregated_output":marker+"\n","command":"echo"}})
+    elif sc == "json_prompt_only": output = json.dumps({"type":"item.started","item":{"type":"command_execution","command":"echo "+marker}})
+    elif sc == "json_message_output": output = json.dumps({"type":"item.completed","item":{"type":"agent_message","text":marker}})
+    elif sc == "json_result_output": output = json.dumps({"type":"result","result":marker})
+    elif sc == "json_arbitrary_marker": output = json.dumps({"command":marker,"prompt":marker,"output":marker})
+    else: output = "$ " + prompt + "\n" + marker
+    print(json.dumps({"command_wait":{"state":"acked","ack":{"capture":output}}})); sys.exit(0)
 if args[:2] == ["sessions", "stop"]:
     if sc == "stop_fail" or (sc == "cleanup_fail" and "cleanup" in " ".join(args)): sys.exit(1)
     if sc != "gone_fail": (d / "a_running").unlink(missing_ok=True)
@@ -139,7 +153,7 @@ class CanaryTest(unittest.TestCase):
         self.assertIn("sleep 30", c)
         self.assertIn("--prompt printf CANARY-OK; sleep 30", c)
         self.assertIn(str(self.tmp / "ws"), c)
-        self.assertIn("a capture " + NATIVE, c)
+        self.assertIn("sessions capture " + SID, c)
         self.assertEqual(r.stderr, "")
 
     def test_success_full_is_modelless(self):
@@ -192,7 +206,7 @@ class CanaryTest(unittest.TestCase):
     def test_stage_capture(self):
         self.assert_stage("capture_prompt_only", "capture", "no_output_beyond_prompt")
         self.assert_stage("capture_empty", "capture", "empty_capture")
-        self.assert_stage("capture_fail", "capture", "a_capture_exit_1")
+        self.assert_stage("capture_fail", "capture", "hub_capture_exit_1")
 
     def test_stage_stop(self):
         v = self.assert_stage("stop_fail", "stop", "hub_cli_exit_1")
@@ -368,6 +382,15 @@ class CanaryTest(unittest.TestCase):
         self.assertEqual((r.returncode, v["stage"]), (1, "capture"))
         self.assertEqual(self.mails(), [])
         self.assertFalse(self.state.exists())
+
+    def test_full_jsonl_capture_requires_actual_output_fields(self):
+        for scenario in ('json_command_output', 'json_message_output', 'json_result_output'):
+            with self.subTest(scenario=scenario):
+                r, value = self.run_canary(scenario, '--mode', 'full')
+                self.assertEqual((r.returncode, value['ok'], value['stage']), (0, True, None))
+        for scenario in ('json_prompt_only', 'json_arbitrary_marker'):
+            with self.subTest(scenario=scenario):
+                self.assert_stage(scenario, 'capture', 'no_output_beyond_prompt', mode='full')
 
     def test_shell_capture_requires_output_line_not_command_text(self):
         # command line only, even with the marker inside it, must fail
