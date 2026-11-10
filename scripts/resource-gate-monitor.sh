@@ -18,6 +18,8 @@ if [[ -z "$NODE_BIN" ]]; then
     NODE_BIN="$(command -v node || true)"
   fi
 fi
+PATH="$(dirname "$NODE_BIN"):/home/alexey/.local/bin:$PATH"
+export PATH
 HUB_HEALTH_URL="${HUB_HEALTH_URL:-https://hub.dtcdev.click/health}"
 STATE_DIR="${RESOURCE_GATE_STATE_DIR:-/var/lib/resource-gate-monitor}"
 STATE_FILE="$STATE_DIR/state"
