@@ -147,15 +147,25 @@ test('capture is refused before a claimed session has a native identity',async()
  assert.equal((f.database.prepare('SELECT COUNT(*) AS count FROM session_commands WHERE session_id=?').get('claimed-capture') as any).count,0);
 });
 
-test('stop refuses an unclaimed offered session',async()=>{
- const f=fixture();await startClaimed(f,'offered-stop',null);
- f.database.prepare("UPDATE sessions SET state='offered' WHERE id=?").run('offered-stop');
+test('stop immediately settles unclaimed offered and expired sessions without a host command',async()=>{
  const operator={id:'human:operator',kind:'operator',scopes:['operator:admin']};
- const response=await f.call('/api/sessions/offered-stop/commands','POST',{kind:'stop',key:'stop-before-claim'},
-  {'x-hub2-actor':JSON.stringify(operator)});
- assert.equal(response.status,409);assert.equal((await response.json() as any).error,'session_not_running');
- assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get('offered-stop') as any).state,'offered');
- assert.equal((f.database.prepare('SELECT COUNT(*) AS count FROM session_commands WHERE session_id=?').get('offered-stop') as any).count,0);
+ for(const state of ['offered','expired']){
+  const f=fixture(),sessionId=`${state}-stop`,epoch=await startClaimed(f,sessionId,null);
+  f.database.prepare('UPDATE sessions SET state=?,native_id=NULL,offer_expires_at=NULL WHERE id=?').run(state,sessionId);
+  f.clearCache();
+  const path=`/api/sessions/${sessionId}/commands`,headers={'x-hub2-actor':JSON.stringify(operator)};
+  const response=await f.call(path,'POST',{kind:'stop',key:'stop-before-native'},headers),data=await response.json() as any;
+  assert.equal(response.status,201,JSON.stringify(data));assert.equal(data.command.kind,'stop');
+  assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(sessionId) as any).state,'stopped');
+  const command=f.database.prepare('SELECT state,result_json,epoch FROM session_commands WHERE session_id=?').get(sessionId) as any;
+  assert.equal(command.state,'acked');assert.equal(command.epoch,epoch);assert.equal(JSON.parse(command.result_json).stopped,true);
+  assert.equal((f.database.prepare('SELECT phase FROM native_sessions WHERE session_id=?').get(sessionId) as any).phase,'missing');
+  assert.equal(f.events.at(-1)?.path,'/_internal/stopped');assert.equal(f.events.at(-1)?.body.reason,'stop_confirmed');
+  assert.equal(f.events.filter(event=>event.path==='/_internal/stopped').length,1);
+  const replay=await f.call(path,'POST',{kind:'stop',key:'stop-before-native'},headers);
+  assert.equal(replay.status,200);assert.equal((await replay.json() as any).replayed,true);
+  assert.equal((f.database.prepare('SELECT COUNT(*) AS count FROM session_commands WHERE session_id=?').get(sessionId) as any).count,1);
+ }
 });
 
 test('a native process absent from a fresh host snapshot is marked stopped without a pending stop command',async()=>{

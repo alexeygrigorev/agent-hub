@@ -200,9 +200,10 @@ try{
   expect(await api('/api/heartbeat','POST',{os:'synthetic',arch:'synthetic',labels:['fixture']},legacyToken),200,'legacy heartbeat');
   const created=expect((await intake('intake-legacy')).response,201,'legacy intake').intake;
   const session=expect(await start(created.id,'start-legacy',target,'shell'),201,'legacy start').session;
-  const refused=await api(`/api/sessions/${session.id}/stop`,'POST',{key:'legacy-stop-1'});
-  assert.equal(refused.status,409,'stop on an unstarted session is a typed refusal, not a 404');
-  assert.equal(refused.data.error,'session_not_running');
+  const stopped=await api(`/api/sessions/${session.id}/stop`,'POST',{key:'legacy-stop-1'});
+  assert.equal(stopped.status,201,'stop on an unclaimed offer is confirmed immediately');
+  assert.equal(stopped.data.state,'stopped');assert.equal(stopped.data.delivery,'confirmed');
+  assert.equal(stopped.data.command_id,stopped.data.command.id);
   const listing=expect(await api(`/api/sessions/${session.id}/commands`),200,'command listing');
   assert(Array.isArray(listing.commands),'listing has commands[]');
  });

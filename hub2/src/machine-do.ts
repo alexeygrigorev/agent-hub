@@ -736,14 +736,29 @@ export class MachineDO {
     const key = request.headers.get('Idempotency-Key') || body.key;
     if (typeof key !== 'string' || !/^[A-Za-z0-9_.:-]{1,120}$/.test(key)) return error('idempotency_key_required', 400);
     const digest = await sha256Hex(JSON.stringify({ kind, text: commandText ?? null, epoch: session.epoch }));
+    const immediateStop = kind === 'stop' && !session.native_id && ['offered', 'expired'].includes(session.state);
     const prior = this.db.one<CommandRow>('SELECT * FROM session_commands WHERE session_id=? AND request_key=?', sessionId, key);
     if (prior) {
       if (prior.request_digest !== digest) return error('idempotency_conflict', 409);
-      return json({ command: this.commandView(prior), replayed: true });
+      if (!immediateStop || prior.state !== 'pending') return json({ command: this.commandView(prior), replayed: true });
     }
-    if (kind === 'stop' ? !['running', 'claimed'].includes(session.state)
+    if (kind === 'stop' ? !immediateStop && !['running', 'claimed'].includes(session.state)
       : session.state !== 'running' || !session.native_id) return error('session_not_running', 409);
     const now = Date.now(), id = crypto.randomUUID();
+    if (immediateStop) {
+      const applied = await this.recordStopped(session, 'stop_confirmed', now, prior ? undefined : {
+        id, request_key: key, request_digest: digest,
+      });
+      if (!applied) {
+        const raced = this.db.one<CommandRow>('SELECT * FROM session_commands WHERE session_id=? AND request_key=?', sessionId, key);
+        if (raced?.request_digest === digest) return json({ command: this.commandView(raced), replayed: true });
+        return error('session_not_running', 409);
+      }
+      await this.scheduleNext();
+      const command = this.db.one<CommandRow>('SELECT * FROM session_commands WHERE session_id=? AND request_key=?', sessionId, key);
+      return command ? json({ command: this.commandView(command), ...(prior ? { replayed: true } : {}) }, prior ? 200 : 201)
+        : error('command_persist_failed', 503);
+    }
     try {
       this.db.transaction(this.ctx, () => {
         const current = this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?', sessionId);
@@ -1028,14 +1043,19 @@ export class MachineDO {
     try{return !!row?.result_json&&(JSON.parse(row.result_json) as JsonRecord).stopped===true;}catch{return false;}
   }
 
-  private async recordStopped(session:SessionRow,reason:string,observedAt:number):Promise<boolean>{
+  private async recordStopped(session:SessionRow,reason:string,observedAt:number,
+    stopCommand?:{id:string;request_key:string;request_digest:string}):Promise<boolean>{
     const now=Date.now(),payload={operation_id:session.dispatch_id,attempt_operation_id:session.operation_id,session_id:session.id,
       intake_id:session.intake_id,machine_id:session.machine_id,epoch:session.epoch,native_id:session.native_id,
       reason,observed_at:observedAt};
     const applied=this.db.transaction(this.ctx,()=>{
       const current=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',session.id);
+      const unclaimed=current&&['offered','expired'].includes(current.state)&&current.native_id===null;
       if(!current||current.epoch!==session.epoch||current.operation_id!==session.operation_id||current.native_id!==session.native_id
-        ||!['claimed','running'].includes(current.state))return false;
+        ||(!['claimed','running'].includes(current.state)&&!unclaimed))return false;
+      if(stopCommand)this.db.run(`INSERT INTO session_commands(id,session_id,machine_id,epoch,request_key,request_digest,kind,text,state,result_json,created_at,updated_at)
+        VALUES(?,?,?,?,?,?, 'stop',NULL,'pending',NULL,?,?)`,stopCommand.id,session.id,session.machine_id,session.epoch,
+        stopCommand.request_key,stopCommand.request_digest,now,now);
       this.db.run("UPDATE sessions SET state='stopped',updated_at=? WHERE id=?",now,session.id);
       this.db.run("UPDATE machine_session_operations SET state='stopped' WHERE operation_id=? AND session_id=? AND epoch=?",session.operation_id,session.id,session.epoch);
       this.settlePendingCommands(session,now,'stop_confirmed',true);
@@ -1126,7 +1146,12 @@ export class MachineDO {
     const response = await this.createCommand(new Request(request.url, { method: 'POST', headers: request.headers, body: JSON.stringify(mapped) }), sessionId);
     if (!response.ok) return response;
     const data = await response.json() as { command: { id: string } };
-    return json({ ...data, command_id: data.command.id, state: 'queued', delivery: 'queued' }, response.status);
+    const command=this.db.one<CommandRow>('SELECT * FROM session_commands WHERE id=?',data.command.id);
+    const result=this.parse(command?.result_json) as JsonRecord|null;
+    const stopped=kind==='stop'&&result?.stopped===true;
+    return json({ ...data, command_id: data.command.id,
+      state: stopped?'stopped':command?.state==='acked'?'acked':'queued',
+      delivery: stopped?'confirmed':command?.state==='acked'?'delivered':'queued' }, response.status);
   }
 
   /** Command receipts in the shape `sessions send/capture/stop --wait` polls: ack.capture, ack.outcome, ack.confirmed_exit. */
