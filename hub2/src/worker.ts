@@ -76,6 +76,7 @@ const router = {
         }, 200, noStore);
         return control.fetch(await forwardRequest(request, CONTROL + '/_auth/me'));
       }
+      if (path === '/api/resource-settings') return resourceSettings(request, env, actor);
       if (path === '/api/quota' && request.method === 'GET')
         return quotaProjection(request, env, actor);
       if (path === '/mcp') return mcp(request, env, (r, e) => router.fetch(r, e), actor);
@@ -906,6 +907,21 @@ async function machineProjection(
   }
   if (!sessions) next = page.next ? cursor({ directory_after: page.next }) : null;
   return json({ items, next, complete: next === null, ...(sessions ? { sessions: items, next_cursor: next } : {}) });
+}
+
+
+function resourceSettings(request: Request, env: Hub2Env, actor: Actor): Response {
+  if (actor.kind !== 'operator' || !admin(actor)) return json({ error: 'forbidden' }, 403, noStore);
+  if (request.method !== 'GET') return json({ error: 'method_not_allowed' }, 405, noStore);
+  const configured = env.HUB2_DISK_FLOOR_GB;
+  if (configured === undefined)
+    return json({ error: 'resource_settings_unconfigured' }, 503, noStore);
+  // Use the same fractional GiB range as the legacy placement setting, but
+  // require this deployment to configure it explicitly.
+  const floor = Number(configured);
+  if (!/^[0-9]+(?:\.[0-9]+)?$/.test(configured) || !Number.isFinite(floor) || floor < 1 || floor > 1048576)
+    return json({ error: 'invalid_resource_settings' }, 503, noStore);
+  return json({ resource_settings: { disk_floor_gb: floor } }, 200, noStore);
 }
 
 

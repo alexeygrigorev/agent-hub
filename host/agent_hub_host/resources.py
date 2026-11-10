@@ -1,6 +1,7 @@
 """Public `hub resources` client: utilization, per-session ledger, reaps.
 
 Read-only projections over the Hub resource-management endpoints:
+  GET /api/resource-settings         configured Hub2 disk floor (admin)
   GET /api/fleet/resources            overview (admin)
   GET /api/fleet/resources/sessions   per-session ledger with filters (admin)
   GET /api/fleet/resources/reaps      watchdog reap log (admin)
@@ -24,8 +25,8 @@ TASK_KINDS = ("implement", "review", "ask", "goal")
 
 def add_commands(sub) -> None:
     parser = sub.add_parser("resources", help="Show resource utilization, per-session usage and watchdog reaps")
-    parser.add_argument("view", nargs="?", choices=["sessions", "ledger", "headroom", "reaps", "throttles"], default=None,
-                        help="View: sessions (raw ledger), ledger (per-task resource ledger), headroom (per-machine headroom); default: utilization overview")
+    parser.add_argument("view", nargs="?", choices=["sessions", "ledger", "headroom", "reaps", "throttles", "settings"], default=None,
+                        help="View: sessions (raw ledger), ledger (per-task resource ledger), headroom (per-machine headroom), settings (configured Hub2 disk floor); default: utilization overview")
     parser.add_argument("--project", default=None, help="Filter sessions by project label or workspace absolute path")
     parser.add_argument("--engine", default=None, help="Filter sessions by engine")
     parser.add_argument("--kind", default=None, help="Filter sessions by task kind")
@@ -111,8 +112,19 @@ def fetch_throttles() -> dict:
     return bus._do_request("GET", "/api/fleet/resources/throttles")
 
 
+def _disk_floor(data: dict) -> float:
+    settings = data.get("resource_settings") if isinstance(data, dict) else None
+    floor = settings.get("disk_floor_gb") if isinstance(settings, dict) else None
+    if type(floor) not in (int, float) or not 1 <= floor <= 1048576:
+        raise ValueError("Hub2 disk floor is unavailable or invalid")
+    return floor
+
+
 def execute(args) -> dict:
     view = getattr(args, "view", None)
+    if view == "settings":
+        from . import bus
+        return {"resource_settings": {"disk_floor_gb": _disk_floor(bus._do_request("GET", "/api/resource-settings"))}}
     if view == "headroom":
         return fetch_overview()
     if view in ("sessions", "ledger"):
@@ -220,6 +232,8 @@ def render_headroom(hosts) -> str:
 def render_text(data: dict, view=None) -> str:
     if not isinstance(data, dict):
         raise ValueError("Invalid resources payload")
+    if view == "settings":
+        return f"Configured disk floor: {_disk_floor(data)} GiB"
     if view == "ledger":
         return render_ledger(data.get("sessions"))
     if view == "headroom":

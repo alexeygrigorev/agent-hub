@@ -4,3 +4,4 @@ registerHooks({resolve(s,c,n){if(s.startsWith('.')&&c.parentURL&&!s.endsWith('.t
 await import('./control-grants-directory.test.ts');
 await import('./shared-memory.test.ts');
 await import('./model-policy-recovery.test.ts');
+await import('./worker-resource-settings.test.ts');
