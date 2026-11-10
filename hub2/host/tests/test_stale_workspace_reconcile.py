@@ -75,7 +75,9 @@ class StaleWorkspaceReconcileTests(unittest.TestCase):
             bridge.runner = None
             bridge.lookup = Mock(side_effect=AssertionError("unavailable workspace must not be queried"))
 
-            with patch("agent_hub_host.agent.threading.Thread") as thread:
+            with patch("agent_hub_host.agent.threading.Thread") as thread, patch(
+                    "agent_hub_host.agent.time.sleep",
+                    side_effect=AssertionError("unexpected daemon reconnect")):
                 with self.assertLogs("agent_hub_host.agent", level="WARNING") as captured:
                     with self.assertRaises(_StopServe):
                         bridge.serve("machine-1", ["headless"])
@@ -107,12 +109,13 @@ class StaleWorkspaceReconcileTests(unittest.TestCase):
             journal = Journal(Path(temp) / "journal.sqlite")
             self.addCleanup(journal.db.close)
             missing_workspace = Path(temp) / "removed-worktree"
+            native_id = "d6cf9872-8597-48a5-be64-990cdef4db31"
             with journal.db:
                 journal.db.execute(
                     "INSERT INTO launches(operation_id,session_id,epoch,digest,workspace,tag,native_id,state,interactive) "
                     "VALUES(?,?,?,?,?,?,?,'running',0)",
                     ("running-operation", "running-session", 1, "digest", str(missing_workspace),
-                     "task-hub2-running-session", "native-123"),
+                     "task-hub2-running-session", native_id),
                 )
 
             socket = _Socket()
@@ -124,6 +127,7 @@ class StaleWorkspaceReconcileTests(unittest.TestCase):
                 capabilities=lambda: {"shell": {"headless"}},
                 aborted_identity=Mock(),
                 status=Mock(),
+                retired=Mock(return_value=None),
             )
             bridge.engines = {"shell"}
             bridge.machine_id = None
@@ -133,7 +137,9 @@ class StaleWorkspaceReconcileTests(unittest.TestCase):
             bridge.runner = None
             bridge.lookup = Mock(side_effect=AssertionError("unavailable workspace must not be queried"))
 
-            with patch("agent_hub_host.agent.threading.Thread") as thread:
+            with patch("agent_hub_host.agent.threading.Thread") as thread, patch(
+                    "agent_hub_host.agent.time.sleep",
+                    side_effect=AssertionError("unexpected daemon reconnect")):
                 with self.assertLogs("agent_hub_host.agent", level="WARNING") as captured:
                     with self.assertRaises(_StopServe):
                         bridge.serve("machine-1", ["headless"])
@@ -141,7 +147,7 @@ class StaleWorkspaceReconcileTests(unittest.TestCase):
             thread.return_value.start.assert_called_once_with()
             self.assertEqual(client.heartbeats[0][3], [{
                 "session_id": "running-session",
-                "native_id": "native-123",
+                "native_id": native_id,
                 "phase": "unknown",
                 "last_activity_at": None,
                 "exit_code": None,
@@ -153,6 +159,10 @@ class StaleWorkspaceReconcileTests(unittest.TestCase):
             bridge.launcher.aborted_identity.assert_not_called()
             bridge.launcher.status.assert_not_called()
             bridge.lookup.assert_not_called()
+            bridge.launcher.retired.assert_called_once()
+            selected, expected = bridge.launcher.retired.call_args.args
+            self.assertEqual(selected, native_id)
+            self.assertEqual(expected["workspace"], str(missing_workspace))
             state = journal.db.execute(
                 "SELECT state FROM launches WHERE session_id='running-session'"
             ).fetchone()[0]
