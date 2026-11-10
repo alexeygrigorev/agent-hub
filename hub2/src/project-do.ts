@@ -1,3 +1,4 @@
+import {listProjectIntakes} from './intake-list';
 import { MeteredDb, initializeSchema } from './db';
 import { SqlReceiptMeter, SQL_PROBE_HEADER, wrapSqlNamespaces } from './sql-receipt';
 import { sha256Hex } from './crypto';
@@ -197,31 +198,10 @@ export class ProjectDO {
   }
 
   private listIntakes(request: Request): Response {
-    const actor = actorFrom(request);
-    const query = new URL(request.url).searchParams;
+    const actor = actorFrom(request), query = new URL(request.url).searchParams;
     const project = query.get('project') || '';
-    if (!this.canProject(actor, project, 'intake:read')) return error('forbidden', 403);
-    const limit = Number(query.get('limit') || 25);
-    if (!Number.isInteger(limit) || limit < 1 || limit > 50) return error('invalid_limit', 400);
-    const status = query.get('status');
-    if (status && !['open', 'queued', 'running', 'completed-awaiting-review', 'failed', 'needs_attention', 'archived','accepted'].includes(status)) return error('invalid_status', 400);
-    let cursor: [number, string] = [Number.MAX_SAFE_INTEGER, '\uffff'];
-    const rawCursor = query.get('cursor');
-    if (rawCursor) {
-      try { cursor = JSON.parse(rawCursor) as [number, string]; } catch { return error('invalid_cursor', 400); }
-      if (!Array.isArray(cursor) || cursor.length !== 2 || !Number.isSafeInteger(cursor[0]) || typeof cursor[1] !== 'string' || cursor[1].length > 80) return error('invalid_cursor', 400);
-    }
-    const search=query.get('q')||'';if(search.length>128)return error('invalid_search',400);
-    const selected = 'id, project, title, status, assigned_machine_id, assigned_actor_id, session_id, created_at, updated_at,priority'+(search?',text,original_title,original_text':'');
-    const rows = status
-      ? this.db.all<IntakeRow>(`SELECT ${selected} FROM intakes WHERE project=? AND status=? AND (updated_at,id)<(?,?) ORDER BY updated_at DESC,id DESC LIMIT ?`, project, status, ...cursor, limit + 1)
-      : this.db.all<IntakeRow>(`SELECT ${selected} FROM intakes WHERE project=? AND (updated_at,id)<(?,?) ORDER BY updated_at DESC,id DESC LIMIT ?`, project, ...cursor, limit + 1);
-    const scanned=rows.slice(0,limit),needle=search.toLowerCase();
-    const shown=search?scanned.filter(v=>[v.title,v.text,v.original_title,v.original_text].some(t=>t?.toLowerCase().includes(needle))):scanned;
-    const last = scanned[scanned.length - 1];
-    return json({ items: shown.map(row => ({ id: row.id, project: row.project, title: row.title, status: row.status,
-      assigned_machine_id: row.assigned_machine_id, assigned_actor_id: row.assigned_actor_id, session_id: row.session_id,
-      created_at: row.created_at, updated_at: row.updated_at,priority:row.priority })),filtered_page:!!search, next: rows.length > limit && last ? JSON.stringify([last.updated_at, last.id]) : null });
+    if (!this.canProject(actor, project, 'intake:read')) return error('forbidden',403);
+    return listProjectIntakes(this.db,query,project);
   }
 
   private showIntake(request: Request, intakeId: string, status = 200): Response {
