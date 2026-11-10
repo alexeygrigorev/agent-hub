@@ -12,7 +12,7 @@ if [ -f "$quarantine" ]; then
     [ -n "$id" ] && deselect+=(--deselect "$id")
   done < <(sed -n 's/^- `\([^`]*\)`.*/\1/p' "$quarantine")
 fi
-echo "::notice::quarantined tests deselected from $quarantine: ${#deselect[@]}/2"
+echo "::notice::quarantined tests deselected from $quarantine: $(( ${#deselect[@]} / 2 ))"
 [ ${#deselect[@]} -gt 0 ] && printf 'QUARANTINED: %s\n' "${deselect[@]}" | grep -v -- '^QUARANTINED: --deselect$' || true
 repo=$(pwd)
 exec "$repo/scripts/with-temp-home.sh" -- env PYTHONPATH="$pythonpath" \
