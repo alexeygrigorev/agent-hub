@@ -29,7 +29,7 @@ TOMBSTONE_ENVELOPE_BYTES = 1048576
 TOMBSTONE_METADATA_BYTES = 65536
 # The only approved OpenCode subscription model; GLM never leaves the zai route.
 OPENCODE_MODEL = "opencode-go/muse-spark-1.3-contributor"
-PROVIDER_CAPABILITIES = {"zai": {"headless", "interactive", "goal", "effort"},
+PROVIDER_CAPABILITIES = {"shell": {"headless"}, "zai": {"headless", "interactive", "goal", "effort"},
                          "codex": {"headless", "interactive", "goal", "effort"},
                          "go": {"headless", "interactive"},
                          "claude": {"headless", "interactive", "effort"},
@@ -390,6 +390,7 @@ class NativeLauncher:
                 engine: {**LOCAL_ROUTES.get(engine, LOCAL_ROUTES.get(route.get("provider"), {})), **route}
                 for engine, route in configuration.get("routes", {}).items()
             }}
+        self.config.setdefault("routes", {})["shell"] = {"provider": "shell"}
         self.runner, self.journal = runner, journal
         self.native_binary = self.config.get("aplexer") or aplexer
         self.state_dir = self.config.get("aplexer_state_dir")
@@ -419,7 +420,7 @@ class NativeLauncher:
         return row if isinstance(row, dict) else None
 
     def capabilities(self):
-        result = {}
+        result = {"shell": {"headless"}}
         for engine, route in self.config.get("routes", {}).items():
             provider = route.get("provider") if isinstance(route, dict) else None
             supported = PROVIDER_CAPABILITIES.get(provider, set())
@@ -445,7 +446,7 @@ class NativeLauncher:
         private_file(fa_path.parent)
         if provider in FIRST_ACTION_PROVIDERS:
             goal += FIRST_ACTION_INSTRUCTION.format(path=fa_path)
-        local = not self.config.get("private_provider_homes", False) and not specification.get("interactive")
+        local = provider == 'shell' or (not self.config.get("private_provider_homes", False) and not specification.get("interactive"))
         if local:
             child = self.profile_command(task_id, specification, route, goal)
         else:
@@ -558,6 +559,13 @@ class NativeLauncher:
     def profile_command(self, task_id, specification, route, prompt):
         """Use the same local profile primitive as model-roulette, without shell parsing."""
         provider = route["provider"]
+        if provider == 'shell':
+            # Explicit operator-only jobs execute command text without a model.
+            # The aplexer containment and accepted runtime deadline still apply.
+            if specification.get('interactive') or specification.get('with_goal') or specification.get('effort') is not None:
+                raise RuntimeError('launcher_capability_unavailable')
+            return ([os.environ.get('COMSPEC', 'cmd.exe'), '/d', '/s', '/c', prompt] if os.name == 'nt'
+                    else ['/bin/sh', '-c', prompt])
         model = specification["model"]
         if model and 'glm' in model.lower() and provider != 'zai':
             raise ValueError('glm_model_route_refused')

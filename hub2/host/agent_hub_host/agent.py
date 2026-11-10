@@ -111,7 +111,7 @@ class Bridge:
     def __init__(self, client, journal, roots, engines, executable="a", runner=subprocess.run, launcher_config=None,machine_id=None):
         self.client, self.journal, self.runner = client, journal, runner
         self.roots = [Path(root).resolve(strict=True) for root in roots]
-        self.engines = set(engines)
+        self.engines = set(engines) | {"shell"}
         # The Hub picks a route; the host spawns it directly through aplexer.
         # The external launcher runtime is not consulted for admission or spawn.
         self.launcher = NativeLauncher(launcher_config or {}, runner, aplexer=executable, journal=journal)

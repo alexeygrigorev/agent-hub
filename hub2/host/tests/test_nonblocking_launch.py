@@ -118,6 +118,29 @@ class NonblockingLaunchTests(unittest.TestCase):
                     self.assertEqual(Path(child[child.index('--prompt-file') + 1]).read_text().splitlines()[0], 'Work')
                     launcher.wait_first_action.assert_not_called()
 
+    @unittest.skipUnless(__import__('os').name == 'posix', 'POSIX shell command contract')
+    def test_shell_job_uses_native_containment_without_provider_or_model(self):
+        with tempfile.TemporaryDirectory() as temp:
+            calls=[]
+            def runner(argv, **options):
+                calls.append(argv)
+                child=argv[argv.index('--')+1:]
+                ran=subprocess.run(child, capture_output=True, text=True, cwd=temp, timeout=3)
+                self.assertEqual(ran.returncode, 7)
+                self.assertEqual(ran.stdout, 'CANARY-OK')
+                return subprocess.CompletedProcess(argv,0,json.dumps({
+                    'id':'d6cf9872-8597-48a5-be64-990cdef4db31','tag':'task-hub2-shell',
+                    'workspace':temp,'command':child}), '')
+            launcher=NativeLauncher({'private_provider_homes':True},runner=runner)
+            self.assertEqual(launcher.capabilities()['shell'], {'headless'})
+            receipt=launcher.launch('hub2-shell',{'session_id':'shell','workspace':temp,'engine':'shell',
+                'model':'shell','effort':None,'prompt':"printf CANARY-OK; exit 7",'timeout_seconds':60})
+            self.assertEqual(receipt['session_id'],'d6cf9872-8597-48a5-be64-990cdef4db31')
+            self.assertIn('hub.managed=true',calls[0])
+            self.assertNotIn('task',calls[0][calls[0].index('--')+1:])
+            with self.assertRaisesRegex(RuntimeError,'capability'):
+                launcher.profile_command('bad',{'interactive':True}, {'provider':'shell'}, 'echo bad')
+
     def test_profile_task_effort_uses_the_same_quoted_native_mapping(self):
         with tempfile.TemporaryDirectory() as temp:
             launcher=NativeLauncher({})
