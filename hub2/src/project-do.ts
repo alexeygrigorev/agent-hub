@@ -826,6 +826,12 @@ export class ProjectDO {
     if(proof?.stopped===true&&proof.session_id===intake.session_id
       &&proof.machine_id===intake.assigned_machine_id&&Number.isSafeInteger(proof.epoch)
       &&['dead','idle','stop_confirmed'].includes(String(proof.reason)))return true;
+    if(prior&&prior.state==='complete'&&prior.last_reason==='launch_timeout_no_native'&&prior.native_id===null
+      &&prior.intake_id===intake.id&&prior.session_id===intake.session_id&&prior.machine_id===intake.assigned_machine_id
+      &&proof?.operation_id===prior.operation_id&&proof.attempt_operation_id===prior.attempt_operation_id
+      &&proof.session_id===prior.session_id&&proof.machine_id===prior.machine_id&&proof.epoch===prior.epoch
+      &&proof.reason==='launch_timeout_no_native'&&proof.launch_failed===true&&proof.native_id_absent===true
+      &&proof.reaped===true&&proof.native_id===null&&Number.isSafeInteger(proof.observed_at))return true;
     return !!prior&&prior.state==='complete'&&!!prior.native_id&&proof?.native_id===prior.native_id&&Number.isSafeInteger(proof.exit_code)&&(proof.exit_code!==0||proof.launch_failed===true||(proof.native_deadline as JsonRecord|undefined)?.exceeded===true)&&proof.native_exit_confirmed===true;
   }
 
