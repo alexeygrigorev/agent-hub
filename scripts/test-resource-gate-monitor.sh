@@ -6,10 +6,12 @@ SCRIPT="$ROOT/scripts/resource-gate-monitor.sh"
 TMP_ROOT="$ROOT/.local/tmp"
 mkdir -p "$TMP_ROOT"
 TMP="$(mktemp -d "$TMP_ROOT/resource-gate-monitor.XXXXXX")"
+TMP_PROD="$(mktemp -d "$ROOT/.resource-gate-monitor-prod-test.XXXXXX")"
 cleanup() {
-  python3 - "$TMP" <<'PY'
+  python3 - "$TMP" "$TMP_PROD" <<'PY'
 import shutil, sys
-shutil.rmtree(sys.argv[1])
+for path in sys.argv[1:]:
+    shutil.rmtree(path, ignore_errors=True)
 PY
 }
 trap cleanup EXIT
@@ -138,9 +140,7 @@ export AGENT_BROWSER_REMOTE_CONFIG="$TMP/remote-profile.json"
 export AGENT_BROWSER_CLI="$TMP/agent-browser.js"
 export HUB_HEALTH_URL='https://hub.dtcdev.click/health'
 export ALERT_TO='resource-gate-test@example.invalid'
-export ALERT_CC='orin@dtcdev.click'
 export ALERT_OPS_TO='resource-gate-ops@example.invalid'
-export RESOURCE_GATE_TEST_CC='resource-gate-oncall@example.invalid'
 export RESOURCE_GATE_TEST_ALLOW_DATAOPS=1
 
 grep -Fq 'PATH="$(dirname "$NODE_BIN"):/home/alexey/.local/bin:$PATH"' "$SCRIPT" \
@@ -152,8 +152,6 @@ grep -Fq 'PATH="$RUNUSER_PATH" DATAOPS_CONFIG_DIR=/home/alexey/.config/dataops' 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 pass() { printf 'PASS: %s\n' "$*"; }
 mail_count() { awk '/---MESSAGE-END---/ { n++ } END { print n+0 }' "$MONITOR_MAIL_CAPTURE"; }
-cc_count() { awk '/^Cc: resource-gate-oncall@example\.invalid$/ { n++ } END { print n+0 }' "$MONITOR_MAIL_CAPTURE"; }
-cc_envelope_count() { awk '/^ARGS/ && /resource-gate-ops@example\.invalid resource-gate-oncall@example\.invalid/ { n++ } END { print n+0 }' "$MONITOR_MAIL_CAPTURE"; }
 dataops_count() { awk -F '\t' -v action="$1" '$1 == action { n++ } END { print n+0 }' "$MONITOR_DATAOPS_CAPTURE"; }
 run_check() {
   local curl_mode="$1" remote_mode="$2" expected_rc="$3" actual_rc=0
@@ -185,10 +183,11 @@ grep -Fq 'Subject: [CRITICAL] Resource Gate and Hub availability is degraded' "$
   || fail "critical alert subject was not present"
 grep -Fq 'To: resource-gate-ops@example.invalid' "$MONITOR_MAIL_CAPTURE" \
   || fail "test path did not route mail to the ops-only recipient"
-grep -Fq 'Cc: resource-gate-oncall@example.invalid' "$MONITOR_MAIL_CAPTURE" \
-  || fail "test-safe CC recipient was not added to the alert"
-grep -Fq 'resource-gate-ops@example.invalid resource-gate-oncall@example.invalid' "$MONITOR_MAIL_CAPTURE" \
-  || fail "msmtp did not receive both test-safe mail recipients"
+grep -Fq 'ARGS	-a alerts -f alerts@dtcdev.click -- resource-gate-ops@example.invalid' "$MONITOR_MAIL_CAPTURE" \
+  || fail "test-path SMTP envelope did not contain only the ops recipient"
+if grep -Fq 'Cc:' "$MONITOR_MAIL_CAPTURE"; then
+  fail "test-path alert added a CC header"
+fi
 if grep -Fq 'resource-gate-test@example.invalid' "$MONITOR_MAIL_CAPTURE"; then
   fail "test-path guard allowed mail to the normal recipient"
 fi
@@ -289,28 +288,44 @@ fi
 [[ "$(mail_count)" -eq 7 ]] || fail "test alert mode did not send email"
 [[ "$(dataops_count create)" -eq 4 && "$(dataops_count done)" -eq 1 ]] \
   || fail "test alert mode did not create and close its DataOps test task"
-grep -Fq 'Cc: resource-gate-oncall@example.invalid' "$MONITOR_MAIL_CAPTURE" \
-  || fail "test alert did not include the configured test-safe CC recipient"
 if grep -Fq 'orin@dtcdev.click' "$MONITOR_MAIL_CAPTURE"; then
-  fail "test alert path sent to the production CC recipient"
+  fail "test alert path included the removed production recipient"
 fi
 grep -Fq 'Subject: [TEST] Resource Gate and Hub uptime monitor' "$MONITOR_MAIL_CAPTURE" \
   || fail "test alert subject was not present"
-[[ "$(cc_count)" -eq 7 && "$(cc_envelope_count)" -eq 7 ]] \
-  || fail "outage, recovery, or test messages did not include the test-safe CC in both header and SMTP envelope"
-pass "safe test-alert mode exercises email and DataOps delivery without changing monitor state"
-
-if PATH="$TMP/bin:$PATH" RESOURCE_GATE_STATE_DIR="$TMP/invalid-test-alert-state" \
-  RESOURCE_GATE_TEST_CC='orin@dtcdev.click' bash "$SCRIPT" --test-alert > "$TMP/invalid-test-cc-output" 2>&1; then
-  fail "test-path guard accepted a production address as a test CC override"
+grep -Fq 'ARGS	-a alerts -f alerts@dtcdev.click -- resource-gate-ops@example.invalid' "$MONITOR_MAIL_CAPTURE" \
+  || fail "test alert SMTP envelope did not contain only the ops recipient"
+if grep -Fq 'Cc:' "$MONITOR_MAIL_CAPTURE"; then
+  fail "test alert added a CC header"
 fi
-[[ "$(mail_count)" -eq 7 ]] || fail "invalid test CC override sent an email"
-grep -Fq 'test CC override must use an .invalid address' "$TMP/invalid-test-cc-output" \
-  || fail "invalid test CC override was not rejected with a clear error"
+pass "safe test-alert mode uses one test-safe recipient and exercises DataOps delivery"
 
 grep -Fq 'ALERT_TO="${ALERT_TO:-dev@dtcdev.click}"' "$SCRIPT" \
   || fail "production outage recipient default is not dev@dtcdev.click"
-grep -Fq 'ALERT_CC="${ALERT_CC:-orin@dtcdev.click}"' "$SCRIPT" \
-  || fail "production secondary alert recipient default is not orin@dtcdev.click"
-pass "production outage and recovery recipient defaults to dev@dtcdev.click with orin@dtcdev.click copied"
+if grep -Fq 'orin@dtcdev.click' "$SCRIPT" || grep -Fq 'ALERT_CC=' "$SCRIPT"; then
+  fail "production monitor still contains an Orin alert recipient"
+fi
+
+touch "$TMP_PROD/mailbox" "$TMP_PROD/dataops-capture"
+if PATH="$TMP/bin:$PATH" env -u ALERT_TO \
+  ALERT_OPS_TO='resource-gate-ops@example.invalid' \
+  RESOURCE_GATE_STATE_DIR="$TMP_PROD/state" \
+  DATAOPS_CONFIG_DIR="$TMP/dataops-config" \
+  MONITOR_MAIL_CAPTURE="$TMP_PROD/mailbox" \
+  MONITOR_DATAOPS_CAPTURE="$TMP_PROD/dataops-capture" \
+  bash "$SCRIPT" --test-alert > "$TMP_PROD/output" 2>&1; then
+  :
+else
+  fail "production-recipient test alert failed: $(cat "$TMP_PROD/output")"
+fi
+[[ "$(awk '/---MESSAGE-END---/ { n++ } END { print n+0 }' "$TMP_PROD/mailbox")" -eq 1 ]] \
+  || fail "production-recipient test alert did not send exactly one message"
+grep -Fxq 'To: dev@dtcdev.click' "$TMP_PROD/mailbox" \
+  || fail "production-recipient test alert did not default to dev@dtcdev.click"
+grep -Fq 'ARGS	-a alerts -f alerts@dtcdev.click -- dev@dtcdev.click' "$TMP_PROD/mailbox" \
+  || fail "production-recipient SMTP envelope did not contain only dev@dtcdev.click"
+if grep -Fq 'Cc:' "$TMP_PROD/mailbox" || grep -Fq 'orin@dtcdev.click' "$TMP_PROD/mailbox"; then
+  fail "production-recipient test alert was copied to another address"
+fi
+pass "production monitor test alert defaults to dev@dtcdev.click only"
 printf 'Resource Gate and Hub monitor tests passed.\n'
