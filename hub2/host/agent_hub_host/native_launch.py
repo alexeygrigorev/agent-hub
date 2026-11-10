@@ -1,7 +1,7 @@
 """Direct native launch adapter: Hub session plans spawn through aplexer.
 
-The Hub picks a model and host, then this adapter launches it, proves its first
-action and qualified exit, and never re-spawns an uncertain launch. The
+The Hub picks a model and host, then this adapter returns the native pane
+identity immediately and preserves evidence for qualified exit and recovery. The
 external Agent Quota Launcher remains untouched for its other consumers.
 """
 import hashlib
@@ -32,9 +32,17 @@ OPENCODE_MODEL = "opencode-go/muse-spark-1.3-contributor"
 PROVIDER_CAPABILITIES = {"zai": {"headless", "interactive", "goal", "effort"},
                          "codex": {"headless", "interactive", "goal", "effort"},
                          "go": {"headless", "interactive"},
-                         "claude": {"headless", "interactive", "effort"}}
-PROVIDER_BINARIES = {"zai": "zcodex", "codex": "codex", "go": "opencode", "claude": "claude"}
-FIRST_ACTION_PROVIDERS = {"zai", "go", "claude", "codex"}
+                         "claude": {"headless", "interactive", "effort"},
+                         "antigravity": {"headless", "interactive", "effort"}}
+PROVIDER_BINARIES = {"zai": "zcodex", "codex": "codex", "go": "opencode", "claude": "claude", "antigravity": "agy"}
+FIRST_ACTION_PROVIDERS = {"zai", "go", "claude", "codex", "antigravity"}
+LOCAL_ROUTES = {
+    "codex": {"provider": "codex", "profile": "hub-shared-codex"},
+    "go": {"provider": "go", "profile": "hub-shared-go"},
+    "zai": {"provider": "zai", "profile": "hub-zai-central"},
+    "claude": {"provider": "claude", "engine": "claude"},
+    "antigravity": {"provider": "antigravity", "profile": "hub-hub-antigravity"},
+}
 
 
 def native_returncode(value):
@@ -133,6 +141,8 @@ def adapter_argv(provider, goal, model):
                 '--disable', 'shell_snapshot', '-c', 'check_for_update_on_startup=false', '--json', goal]
     if provider == 'codex':
         return [binary, 'exec', '--model', str(model), '--dangerously-bypass-approvals-and-sandbox', '--json', goal]
+    if provider == 'antigravity':
+        return [binary, '--model', str(model), '--dangerously-skip-permissions', '-p', goal]
     if provider == 'go':
         return [binary, 'run', '--standalone', '--auto', '--model', str(model), goal]
     return [binary, '--dangerously-skip-permissions', '--model', str(model), '-p', goal]
@@ -144,7 +154,7 @@ def headless_effort_argv(provider, argv, effort):
         if value not in {'low', 'medium', 'high', 'xhigh'}:
             raise ValueError('headless_effort_unsupported')
         flags = ['-c', 'model_reasoning_effort=' + json.dumps(value)]
-    elif provider == 'claude' and effort in {'low', 'medium', 'high', 'max'}:
+    elif provider in {'claude', 'antigravity'} and effort in {'low', 'medium', 'high', 'max'}:
         flags = ['--effort', effort]
     else:
         raise ValueError('headless_effort_unsupported')
@@ -154,7 +164,7 @@ def headless_effort_argv(provider, argv, effort):
 def interactive_argv(provider, argv, prompt, *, model, effort=None, with_goal=False):
     if not isinstance(model, str) or not model.strip():
         raise ValueError('interactive_explicit_model_required')
-    if provider not in {'codex', 'zai', 'claude', 'go'}:
+    if provider not in {'codex', 'zai', 'claude', 'go', 'antigravity'}:
         raise ValueError('interactive_provider_unsupported')
     if with_goal and provider not in {'codex', 'zai'}:
         raise ValueError('native_goal_provider_unsupported')
@@ -173,7 +183,7 @@ def interactive_argv(provider, argv, prompt, *, model, effort=None, with_goal=Fa
             result += ['-c', 'model_reasoning_effort=' + json.dumps(mapped)]
         if not with_goal:
             result.append(prompt)
-    elif provider == 'claude':
+    elif provider in {'claude', 'antigravity'}:
         if '-p' not in result:
             raise ValueError('interactive_adapter_shape_unverified')
         result.remove('-p')
@@ -374,7 +384,13 @@ class NativeLauncher:
     """Same role the Launcher adapter played, without the external runtime."""
 
     def __init__(self, configuration, runner=subprocess.run, aplexer="a", journal=None):
-        self.config, self.runner, self.journal = configuration, runner, journal
+        self.config = {**configuration}
+        if not self.config.get("private_provider_homes", False):
+            self.config["routes"] = {**LOCAL_ROUTES, **{
+                engine: {**LOCAL_ROUTES.get(engine, LOCAL_ROUTES.get(route.get("provider"), {})), **route}
+                for engine, route in configuration.get("routes", {}).items()
+            }}
+        self.runner, self.journal = runner, journal
         self.native_binary = self.config.get("aplexer") or aplexer
         self.state_dir = self.config.get("aplexer_state_dir")
 
@@ -407,8 +423,9 @@ class NativeLauncher:
         for engine, route in self.config.get("routes", {}).items():
             provider = route.get("provider") if isinstance(route, dict) else None
             supported = PROVIDER_CAPABILITIES.get(provider, set())
-            available = provider_home.claude_install_available() if provider == 'claude' else bool(
-                shutil.which(PROVIDER_BINARIES.get(provider, "")))
+            available = bool(shutil.which(PROVIDER_BINARIES.get(provider, "")))
+            if self.config.get('private_provider_homes') and provider == 'claude':
+                available = provider_home.claude_install_available()
             if supported and available:
                 result[engine] = set(supported)
         return result
@@ -428,14 +445,18 @@ class NativeLauncher:
         private_file(fa_path.parent)
         if provider in FIRST_ACTION_PROVIDERS:
             goal += FIRST_ACTION_INSTRUCTION.format(path=fa_path)
-        child = adapter_argv(provider, goal, specification["model"])
+        local = not self.config.get("private_provider_homes", False) and not specification.get("interactive")
+        if local:
+            child = self.profile_command(task_id, specification, route, goal)
+        else:
+            child = adapter_argv(provider, goal, specification["model"])
         objective = None
-        if specification.get("interactive"):
+        if specification.get("interactive") and not local:
             child = interactive_argv(provider, child, goal, model=specification["model"],
                                      effort=specification.get("effort"), with_goal=specification.get("with_goal", False))
             if specification.get("with_goal"):
                 objective = goal_prompt(goal, specification["workspace"], task_id, str(fa_path))
-        elif specification.get("effort") is not None:
+        elif specification.get("effort") is not None and not local:
             child = headless_effort_argv(provider, child, specification["effort"])
         runtime_deadline = specification.get("runtime_deadline")
         if runtime_deadline is not None and (type(runtime_deadline) is not int or
@@ -470,6 +491,8 @@ class NativeLauncher:
                 "--pids", str(self.config.get("pids", 256)), "--startup-timeout-ms", "30000",
                 "--workspace", specification["workspace"], "--cwd", specification["workspace"],
                 "--tag", "task-" + task_id]
+        if specification.get("session_id"):
+            argv += ["--label", "hub.managed=true", "--label", "hub.session=" + specification["session_id"]]
         if runtime_deadline is not None:
             argv += ["--deadline-ms", str(runtime_deadline)]
         for key, value in child_env.items():
@@ -484,7 +507,7 @@ class NativeLauncher:
         # and is reconciled by identity, never re-spawned.
         try:
             result = self.runner(argv, text=True, capture_output=True,
-                                 timeout=max(30, specification["timeout_seconds"]), check=False,
+                                 timeout=35, check=False,
                                  env=env, cwd=specification["workspace"])
         except subprocess.TimeoutExpired:
             raise RuntimeError("native_start_uncertain") from None
@@ -503,18 +526,23 @@ class NativeLauncher:
             raise RuntimeError("native_start_identity_invalid")
         if runtime_deadline is not None and start_json.get("deadline_ms") != runtime_deadline:
             raise RuntimeError("native_runtime_deadline_mismatch")
-        if native_command_model(start_json.get("command")) != specification["model"]:
+        if not local and native_command_model(start_json.get("command")) != specification["model"]:
             raise RuntimeError("native_model_mismatch")
-        if specification.get("effort") is not None and command_effort(start_json.get("command")) != (
+        if not local and specification.get("effort") is not None and command_effort(start_json.get("command")) != (
                 'xhigh' if specification["effort"] == 'max' and provider in {'codex', 'zai'} else specification["effort"]):
             raise RuntimeError("native_effort_mismatch")
+        if local and start_json.get("command") != child:
+            raise RuntimeError("native_profile_command_mismatch")
         if specification.get("interactive") and start_json.get("command") != child:
             raise RuntimeError("native_interactive_command_mismatch")
         goal_registration = None
         if objective is not None:
             goal_registration = self.register_goal(start_json, specification, objective,
                                                    deadline=started + specification["timeout_seconds"])
-        receipt = self.wait_first_action(str(fa_path), start_json, started, specification)
+        # Pane creation is the start receipt. First-action proof is observed later;
+        # a slow model must not hold the native id behind the server deadline.
+        receipt = {"session_id": start_json["id"],
+                   "first_action_verified": validate_first_action(str(fa_path), start_json, started)}
         receipt.update({"model": specification["model"], "model_verified": True,
                         "mode": "interactive" if specification.get("interactive") else "headless"})
         if specification.get("interactive"):
@@ -526,6 +554,32 @@ class NativeLauncher:
             receipt["goal_registration"] = goal_registration
         self.record_evidence(task_id, specification, receipt, start_json)
         return receipt
+
+    def profile_command(self, task_id, specification, route, prompt):
+        """Use the same local profile primitive as model-roulette, without shell parsing."""
+        provider = route["provider"]
+        model = specification["model"]
+        if model and 'glm' in model.lower() and provider != 'zai':
+            raise ValueError('glm_model_route_refused')
+        if provider == 'go' and model != OPENCODE_MODEL:
+            raise ValueError('unsupported_opencode_model')
+        directory = Path(specification["workspace"]) / '.local' / 'hub2-prompts'
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if not directory.resolve().is_relative_to(Path(specification['workspace']).resolve()):
+            raise RuntimeError('prompt_path_untrusted')
+        path = directory / (task_id + '.txt')
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+        with os.fdopen(fd, 'w') as stream:
+            stream.write(prompt)
+        profile = route.get('profile')
+        selector = ['--profile', profile] if profile else ['--engine', route.get('engine', provider)]
+        args = ['--model', model]
+        effort = specification.get('effort')
+        if effort is not None:
+            args += ['-c', 'model_reasoning_effort=' + effort] if provider in {'codex', 'zai'} else ['--effort', effort]
+        return [self.native_binary, 'task', 'run', *selector, '--cwd', specification['workspace'],
+                '--prompt-file', str(path), '--timeout-secs', str(specification['timeout_seconds']),
+                '--no-notify', *['--engine-arg=' + arg for arg in args]]
 
     def wait_first_action(self, fa_path, start_json, started, specification, poll=None, sleep=None):
         poll = poll or (lambda selector: self.status(selector, workspace=specification["workspace"]))
@@ -587,7 +641,8 @@ class NativeLauncher:
             private_file(path.parent)
             evidence = {"task_id": task_id, "session_id": receipt["session_id"], "tag": "task-" + task_id,
                         "workspace": specification["workspace"], "created_at_ms": start_json.get("created_at_ms"),
-                        "engine": start_json.get("engine"), "first_action_validated_at": time.time(),
+                        "engine": start_json.get("engine"), "native_started_at": time.time(),
+                        "first_action_validated_at": time.time() if receipt.get("first_action_verified") else None,
                         "interactive": bool(specification.get("interactive")),
                         "effort": specification.get("effort"), "with_goal": bool(specification.get("with_goal")),
                         "goal_registration": receipt.get("goal_registration")}
@@ -598,7 +653,8 @@ class NativeLauncher:
                 os.fsync(stream.fileno())
             private_file(path)
         except OSError:
-            pass
+            import logging
+            logging.getLogger(__name__).exception('Native launch evidence write failed task=%s', task_id)
 
     def retired(self, native_id, expected):
         tombstone = read_tombstone(native_id, state_dir=self.state_dir)
@@ -633,7 +689,7 @@ class NativeLauncher:
         except ValueError:
             raise RuntimeError("native_launch_recovery_unverified") from None
         native_id = record.get('session_id')
-        if not isinstance(native_id, str) or not record.get('first_action_validated_at') \
+        if not isinstance(native_id, str) or not (record.get('native_started_at') or record.get('first_action_validated_at')) \
                 or record.get('tag') != 'task-' + task_id or not same_workspace(record.get('workspace'), workspace):
             raise RuntimeError("native_launch_recovery_unverified")
         if requirements:

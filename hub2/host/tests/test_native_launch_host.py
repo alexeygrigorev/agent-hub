@@ -210,7 +210,7 @@ class CapabilityTest(unittest.TestCase):
         self.assertNotIn('shell', caps)
 
     def test_claude_capability_can_install_without_global_claude(self):
-        config = {'routes': {'claude': {'provider': 'claude'}}}
+        config = {'private_provider_homes': True, 'routes': {'claude': {'provider': 'claude'}}}
         with mock.patch.object(nl.provider_home, 'claude_install_available', return_value=True), \
              mock.patch.object(nl.shutil, 'which', return_value=None):
             self.assertEqual(nl.NativeLauncher(config).capabilities()['claude'],
@@ -337,7 +337,7 @@ class SpawnEnvironmentTest(unittest.TestCase):
 
 class LaunchReceiptTest(unittest.TestCase):
     def test_launch_attempts_start_without_a_host_capacity_gate(self):
-        config = {'routes': {'codex': {'provider': 'zai'}}, 'min_free_mem_mb': 6000, 'memory_mb': 1500}
+        config = {'private_provider_homes': True, 'routes': {'codex': {'provider': 'zai'}}, 'min_free_mem_mb': 6000, 'memory_mb': 1500}
         with tempfile.TemporaryDirectory() as workspace:
             output = json.dumps({'id': 'd6cf9872-8597-48a5-be64-990cdef4db31', 'tag': 'task-t1',
                                  'workspace': workspace, 'command': ['zcodex', 'exec', '--model', 'glm-5.3-flash']})
@@ -348,12 +348,12 @@ class LaunchReceiptTest(unittest.TestCase):
             with (mock.patch.object(adapter, 'wait_first_action', return_value={'session_id': 'd6cf9872-8597-48a5-be64-990cdef4db31', 'first_action_verified': True}),
                   mock.patch.object(adapter, 'record_evidence')):
                 receipt = adapter.launch('t1', spec)
-            self.assertTrue(receipt['first_action_verified'])
+            self.assertFalse(receipt['first_action_verified'])
             command = runner.call_args.args[0]
             self.assertEqual(command[command.index('--memory') + 1], '1500M')
 
     def test_launch_refuses_unknown_route(self):
-        adapter = nl.NativeLauncher({'routes': {}})
+        adapter = nl.NativeLauncher({'private_provider_homes': True, 'routes': {}})
         with self.assertRaises(RuntimeError):
             adapter.launch('t1', {'engine': 'codex', 'workspace': '/', 'model': 'm', 'prompt': 'p',
                                   'interactive': False, 'timeout_seconds': 600})
@@ -373,7 +373,7 @@ class LaunchReceiptTest(unittest.TestCase):
                     'command': child, 'deadline_ms': deadline,
                 }), '')
 
-            adapter = nl.NativeLauncher({'routes': {'claude': {'provider': 'claude'}}, 'min_free_mem_mb': 0},
+            adapter = nl.NativeLauncher({'private_provider_homes': True, 'routes': {'claude': {'provider': 'claude'}}, 'min_free_mem_mb': 0},
                                         runner=runner)
             spec = {'workspace': workspace, 'engine': 'claude', 'model': 'fable', 'effort': 'medium',
                     'prompt': 'analyze safely', 'interactive': False, 'timeout_seconds': 600,
