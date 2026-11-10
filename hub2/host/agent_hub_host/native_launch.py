@@ -470,8 +470,6 @@ class NativeLauncher:
                 "--pids", str(self.config.get("pids", 256)), "--startup-timeout-ms", "30000",
                 "--workspace", specification["workspace"], "--cwd", specification["workspace"],
                 "--tag", "task-" + task_id]
-        if runtime_deadline is not None:
-            argv += ["--deadline-ms", str(runtime_deadline)]
         for key, value in child_env.items():
             argv += ["--env", f"{key}={value}"]
         argv += ["--"] + child
@@ -501,8 +499,6 @@ class NativeLauncher:
             raise RuntimeError("native_start_identity_invalid")
         if start_json.get("tag") != "task-" + task_id or not same_workspace(start_json.get("workspace"), specification["workspace"]):
             raise RuntimeError("native_start_identity_invalid")
-        if runtime_deadline is not None and start_json.get("deadline_ms") != runtime_deadline:
-            raise RuntimeError("native_runtime_deadline_mismatch")
         if native_command_model(start_json.get("command")) != specification["model"]:
             raise RuntimeError("native_model_mismatch")
         if specification.get("effort") is not None and command_effort(start_json.get("command")) != (

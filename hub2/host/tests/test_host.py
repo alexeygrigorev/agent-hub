@@ -2,6 +2,7 @@ import json
 import hashlib
 import io
 import os
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -29,8 +30,6 @@ class FakeNative:
             self.process = {"id": "1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d", "tag": tag,
                             "workspace": options["cwd"], "engine": "codex", "created_at_ms": created,
                             "command": child, "phase": "running"}
-            if "--deadline-ms" in args:
-                self.process["deadline_ms"] = int(args[args.index("--deadline-ms") + 1])
             # The native worker proves its first action with a whoami artifact.
             task = tag[len("task-"):]
             artifact = Path(options["cwd"]) / ".local" / f"first-action-{task}.json"
@@ -45,7 +44,7 @@ class FakeNative:
         if command[0] == "send" and self.fail_send:
             raise TimeoutError()
         if command[0] == "kill":
-            self.process.update(phase="exited", exit={"code": 143}, containment_empty=True)
+            self.process.update(phase="exited", exit={"code": 143, "exited_at_ms": int(time.time()*1000)}, containment_empty=True)
         return subprocess.CompletedProcess(args, 0, "hello", "")
 
 
@@ -59,7 +58,8 @@ class FakeClient:
             raise ApiError("unavailable")
         self.calls.append((method, path, body, key))
         if path.endswith("/admission"):
-            return {"launch_allowed": True, "epoch": body["epoch"]}
+            return {"launch_allowed": True, "epoch": body["epoch"],
+                    "runtime_deadline": int((time.time()+600)*1000)}
         if path.endswith('/credentials'):
             return {'token':'worker-token-'+'x'*40,'expires_at':int((time.time()+30)*1000),'session_id':path.split('/')[3],
                     'operation_id':body['operation_id'],'epoch':body['epoch'],'machine_id':'machine-1',
@@ -93,6 +93,18 @@ class HostTests(unittest.TestCase):
     def tearDown(self):
         self.journal.db.close()
         self.temp.cleanup()
+
+    def test_existing_journal_schema_adds_persistent_runtime_deadline(self):
+        path=self.root/'legacy-journal.sqlite'
+        db=sqlite3.connect(path)
+        db.execute("CREATE TABLE launches(operation_id TEXT PRIMARY KEY,session_id TEXT UNIQUE NOT NULL,epoch INTEGER NOT NULL,digest TEXT NOT NULL,workspace TEXT NOT NULL,tag TEXT NOT NULL,native_id TEXT,state TEXT NOT NULL,interactive INTEGER NOT NULL DEFAULT 0)")
+        db.close()
+        migrated=Journal(path)
+        try:
+            columns={row[1] for row in migrated.db.execute('PRAGMA table_info(launches)')}
+            self.assertIn('runtime_deadline',columns)
+        finally:
+            migrated.db.close()
 
     def test_provider_refusal_stays_unclaimed_and_later_epoch_replaces_only_unspawned_intent(self):
         offer=self.offer()
@@ -344,8 +356,8 @@ class HostTests(unittest.TestCase):
 
     def test_deadline_evidence_keeps_actual_zero_exit_through_durable_replay(self):
         self.bridge.offer(self.offer())
-        self.native.process.update(phase='exited',exit={'code':0},containment_empty=True,
-                                   deadline_ms=123456,deadline_exceeded=True)
+        self.journal.db.execute("UPDATE launches SET runtime_deadline=123456")
+        self.native.process.update(phase='exited',exit={'code':0,'exited_at_ms':123456},containment_empty=True)
         self.bridge.reconcile()
         self.client.fail=True
         with self.assertRaises(ApiError):self.journal.flush(self.client)
@@ -355,6 +367,16 @@ class HostTests(unittest.TestCase):
         self.assertEqual(finished['exit_code'],0)
         self.assertEqual(finished['evidence']['native_deadline'],{'deadline_ms':123456,'exceeded':True})
         self.assertTrue(finished['native_exit_confirmed'])
+
+    def test_running_process_is_killed_when_server_deadline_expires(self):
+        self.bridge.offer(self.offer())
+        deadline=int(time.time()*1000)-1
+        self.journal.db.execute("UPDATE launches SET runtime_deadline=?",(deadline,))
+        self.bridge.reconcile()
+        self.assertTrue(any(args[1]=='kill' and args[2]==self.native.process['id'] for args,_ in self.native.calls))
+        finish=json.loads(self.journal.db.execute("SELECT payload FROM outbox WHERE path LIKE '%/finish'").fetchone()[0])
+        self.assertEqual(finish['evidence']['native_deadline'],{'deadline_ms':deadline,'exceeded':True})
+        self.assertNotIn('launch_failed',finish)
 
     def test_missing_process_never_counts_as_finished(self):
         self.bridge.offer(self.offer())
