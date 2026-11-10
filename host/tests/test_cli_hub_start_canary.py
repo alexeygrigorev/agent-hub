@@ -2,7 +2,7 @@
 (captured read-only from `hub sessions list --json`, `a list --json --running`; ids/paths scrubbed).
 Mail renders to a sink; no real msmtp/sendmail is ever called.
 
-Run: scripts/capped-test-run.sh -- scripts/with-temp-home.sh -- python3 -m unittest host.tests.test_hub_start_canary
+Run: scripts/capped-test-run.sh -- scripts/with-temp-home.sh -- python3 -m unittest host.tests.test_cli_hub_start_canary
 """
 import json, os, pathlib, shutil, stat, subprocess, sys, tempfile, time, unittest
 
