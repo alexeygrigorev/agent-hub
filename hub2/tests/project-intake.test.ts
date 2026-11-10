@@ -93,6 +93,32 @@ test('failed task retry requires native exit and release evidence, preserves old
  assert.equal((await f.call('/_internal/finish','POST',{...binding,exit_code:1,native_exit_confirmed:true,evidence:{result:'failed'}})).status,200);
  assert.equal((f.sql.prepare('SELECT session_id FROM intakes WHERE id=?').get(own.id) as any).session_id,current.session_id);
 });
+test('terminal stop releases an intake for retry and no-native launch timeout is a visible failure',async()=>{
+ const f=fixture(),stoppedIntake=await intake(f,'stop-retry'),start={key:'stop-first',workspace:'/tmp/synthetic-stop-retry',engine:'shell',machine_id:'h1',override_reason:'Synthetic semantic test'};
+ assert.equal((await f.call('/api/intakes/'+stoppedIntake.id+'/start','POST',start)).status,201);
+ let saga=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(stoppedIntake.id) as any;
+ f.sql.prepare("UPDATE dispatch_sagas SET state='claimed' WHERE operation_id=?").run(saga.operation_id);
+ let result=await f.call('/_internal/stopped','POST',{operation_id:saga.operation_id,attempt_operation_id:saga.attempt_operation_id,
+  session_id:saga.session_id,machine_id:saga.machine_id,epoch:saga.epoch,reason:'stop_confirmed',observed_at:Date.now()});
+ assert.equal(result.status,200);assert.equal((await body(result)).stopped,true);
+ let intakeRow=f.sql.prepare('SELECT * FROM intakes WHERE id=?').get(stoppedIntake.id) as any;
+ assert.equal(intakeRow.status,'failed');assert.equal(JSON.parse(intakeRow.final_evidence_json).stopped,true);
+ assert.equal((await f.call('/api/intakes/'+stoppedIntake.id+'/start','POST',{...start,key:'stop-retry-again'})).status,201);
+ const timeoutIntake=await intake(f,'launch-timeout'),timeoutStart={key:'timeout-first',workspace:'/tmp/synthetic-launch-timeout',engine:'shell',machine_id:'h1',override_reason:'Synthetic semantic test'};
+ assert.equal((await f.call('/api/intakes/'+timeoutIntake.id+'/start','POST',timeoutStart)).status,201);
+ saga=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(timeoutIntake.id) as any;
+ f.sql.prepare("UPDATE dispatch_sagas SET state='claimed' WHERE operation_id=?").run(saga.operation_id);
+ result=await f.call('/_internal/reaped','POST',{operation_id:saga.operation_id,attempt_operation_id:saga.attempt_operation_id,
+  session_id:saga.session_id,machine_id:saga.machine_id,epoch:saga.epoch,native_id:null,reason:'launch_timeout_no_native',launch_failed:true,observed_at:Date.now()});
+ assert.equal(result.status,200);assert.equal((await body(result)).failed,true);
+ intakeRow=f.sql.prepare('SELECT * FROM intakes WHERE id=?').get(timeoutIntake.id) as any;
+ const proof=JSON.parse(intakeRow.final_evidence_json);
+ assert.equal(intakeRow.status,'failed');assert.equal(proof.launch_failed,true);assert.equal(proof.native_id_absent,true);
+ assert.equal(proof.reaped,true);assert.equal(proof.session_id,saga.session_id);assert.equal(proof.reason,'launch_timeout_no_native');
+ assert.equal(proof.native_id,null);assert.equal(Number.isSafeInteger(proof.observed_at),true);assert.equal(proof.stopped,undefined);
+ const history=await body(await f.call('/api/intakes/'+timeoutIntake.id+'/history'));
+ assert(history.events.some((event:any)=>event.kind==='session_launch_failed'&&event.body.reason==='launch_timeout_no_native'));
+});
 test('session admission checks the current saga without quota or account-capacity reads',async()=>{
  const f=fixture(),own=await intake(f,'admission-binding'),start={key:'admission-binding',workspace:'/tmp/synthetic-admission',engine:'shell',machine_id:'h1',override_reason:'Synthetic semantic test'};
  assert([201,202].includes((await f.call('/api/intakes/'+own.id+'/start','POST',start)).status));
