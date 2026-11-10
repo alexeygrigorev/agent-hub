@@ -101,7 +101,7 @@ try{
   const bad={epoch:offer.epoch+1,operation_id:offer.operation_id};expect(await api(`/api/sessions/${started.id}/admission`,'POST',bad,hostToken),409,'stale epoch');
   liveSocket.socket.send(JSON.stringify({type:'offer_ack',session_id:started.id,epoch:offer.epoch}));await liveSocket.wait(v=>v.type==='ack'&&v.session_id===started.id);
   const native='11111111-2222-4333-8444-555555555555';
-  expect(await api(`/api/sessions/${started.id}/started`,'POST',{operation_id:offer.operation_id,epoch:offer.epoch,native_id:native},hostToken),409,'started before admission');
+  // Claim is admission; this endpoint remains a compatibility view for older hosts.
   const admission=expect(await api(`/api/sessions/${started.id}/admission`,'POST',{epoch:offer.epoch,operation_id:offer.operation_id},hostToken),200,'host admission');assert.equal(admission.launch_allowed,true);assert.equal(admission.epoch,offer.epoch);assert(Number.isSafeInteger(admission.runtime_deadline)&&admission.runtime_deadline>Date.now(),'admission must expose its immutable synthetic deadline');
   expect(await api(`/api/sessions/${started.id}/started`,'POST',{operation_id:offer.operation_id,epoch:offer.epoch+1,native_id:native},hostToken),409,'stale started receipt');
   let workerCheck;if(process.env.HUB2_CORE_WORKER){const {prepareWorkerProof}=await import('./normal-day-worker-credentials.mjs');workerCheck=await prepareWorkerProof({api,expect,fixture,socket,intake,start,project,machine,hostToken,session:started,offer,intakeId:created.id,root,persist,base});}
@@ -172,6 +172,12 @@ try{
   const pair=expect(await api('/api/enrollments/pair','POST',{machine_id:target,alias:'Synthetic lost-response fixture'}),201,'fault pairing');
   const machineToken=expect(await api('/api/enrollments/complete','POST',{code:pair.pairing_code},null),201,'fault enrollment').token;
   expect(await api('/api/heartbeat','POST',{os:'synthetic',arch:'synthetic',labels:['fixture']},machineToken),200,'fault heartbeat');
+  const disconnectedIntake=expect((await intake('intake-disconnected')).response,201,'disconnected intake').intake;
+  const refused=await start(disconnectedIntake.id,'start-disconnected',target,'shell');
+  expect(refused,503,'heartbeat without connected socket');assert.equal(refused.data.error,'no_connected_host');
+  assert.equal(expect(await api('/api/offers','GET',undefined,machineToken),200,'no refused offer').offers.length,0);
+  const connection=await socket(machineToken);
+  try{
   expect(await fixture('machine',target,'fault',{paths:['/_internal/reserve','/_internal/activate']}),200,'arm lost responses');
   const created=expect((await intake('intake-fault')).response,201,'fault intake').intake;
   const first=expect(await start(created.id,'start-fault',target,'shell'),202,'lost reserve response').session;
@@ -180,24 +186,32 @@ try{
   const replay=expect(await start(created.id,'start-fault',target,'shell'),200,'stable replay').session;assert.equal(replay.id,first.id);
   const list=expect(await api('/api/offers','GET',undefined,machineToken),200,'one native offer');assert.equal(list.offers.length,1);assert.equal(list.offers[0].session_id,first.id);assert.equal(list.offers[0].epoch,1,'retry allocated a second epoch');
   measurements.lost_response_machine=expect(await fixture('machine',target),200,'fault state');
+  }finally{connection.socket.close();}
  });
  await test('expired unclaimed offer rejects stale native admission after alarm replay',async()=>{
   const target='synthetic-expiry-machine';
   const pair=expect(await api('/api/enrollments/pair','POST',{machine_id:target,alias:'Synthetic expiry fixture'}),201,'expiry pairing');
   const expiryToken=expect(await api('/api/enrollments/complete','POST',{code:pair.pairing_code},null),201,'expiry enrollment').token;
   expect(await api('/api/heartbeat','POST',{os:'synthetic',arch:'synthetic',labels:['fixture']},expiryToken),200,'expiry heartbeat');
+  const connection=await socket(expiryToken);
+  try{
   const created=expect((await intake('intake-expiry')).response,201,'expiry intake').intake;
   const session=expect(await start(created.id,'start-expiry',target,'shell'),201,'expiry start').session;
   expect(await fixture('machine',target,'expire-offer',{id:session.id}),200,'run real expiry alarm');
   expect(await fixture('machine',target,'alarm',{}),200,'duplicate alarm');
   const result=await api(`/api/sessions/${session.id}/admission`,'POST',{epoch:session.epoch,operation_id:session.attempt_operation_id},expiryToken);
   assert([404,409,410].includes(result.status),'expired offer became launch-authorized: HTTP'+result.status);
+  const expired=expect(await api(`/api/sessions/${session.id}?machine_id=${target}`),200,'expired session').session;
+  assert.equal(expired.state,'failed');assert.equal(expired.attention?.reason,'host_no_response');
+  }finally{connection.socket.close();}
  });
  await test('Hub1-shaped stop/send/capture paths reach the Hub2 command queue',async()=>{
   const target='synthetic-legacy-machine';
   const pair=expect(await api('/api/enrollments/pair','POST',{machine_id:target,alias:'Synthetic legacy-path fixture'}),201,'legacy pairing');
   const legacyToken=expect(await api('/api/enrollments/complete','POST',{code:pair.pairing_code},null),201,'legacy enrollment').token;
   expect(await api('/api/heartbeat','POST',{os:'synthetic',arch:'synthetic',labels:['fixture']},legacyToken),200,'legacy heartbeat');
+  const connection=await socket(legacyToken);
+  try{
   const created=expect((await intake('intake-legacy')).response,201,'legacy intake').intake;
   const session=expect(await start(created.id,'start-legacy',target,'shell'),201,'legacy start').session;
   const stopped=await api(`/api/sessions/${session.id}/stop`,'POST',{key:'legacy-stop-1'});
@@ -206,6 +220,7 @@ try{
   assert.equal(stopped.data.command_id,stopped.data.command.id);
   const listing=expect(await api(`/api/sessions/${session.id}/commands`),200,'command listing');
   assert(Array.isArray(listing.commands),'listing has commands[]');
+  }finally{connection.socket.close();}
  });
  await test('intake events/context/audit/close work on the Hub1-shaped task paths',async()=>{
   const created=expect((await intake('intake-compat')).response,201,'compat intake').intake;
@@ -263,8 +278,16 @@ try{
  });
  await test('pending saga recovers when alarm persistence fails after state commit',async()=>{
   const created=expect((await intake('intake-alarm-interruption')).response,201,'alarm interruption intake').intake;
+  if(liveSocket){liveSocket.socket.close();liveSocket=null;}
+  const connection=await socket(hostToken);
+  let interrupted;
+  try{
   expect(await fixture('project',project,'fail-next-alarm',{}),200,'arm alarm failure');
-  const interrupted=await start(created.id,'start-alarm-interruption',machine,'shell');
+  interrupted=await start(created.id,'start-alarm-interruption',machine,'shell');
+  expect(interrupted,500,'injected alarm write failure');
+  const beforeRestart=expect(await api(`/api/intakes/${created.id}?project=${encodeURIComponent(project)}`),200,'durable interrupted saga');
+  assert(beforeRestart.intake.dispatch?.operation_id,'injected failure must leave a durable saga');
+  }finally{connection.socket.close();}
   if(liveSocket){liveSocket.socket.close();liveSocket=null;}rt = await restartFixture(rt,spec); base = rt.origin;
   let restored=expect(await api(`/api/intakes/${created.id}?project=${encodeURIComponent(project)}`),200,'interrupted saga survived restart');
   let projection=expect(await fixture('project',project),200,'restarted deadline');

@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+"""Stub `codex` engine for the Hub2 start-path e2e test.
+
+`--version` reports the SDK version the host pins; `exec ... <prompt>` does
+what a real worker's first action does (runs `a whoami --json` into the path
+named by the Hub first-action instruction), prints a marker line for
+`a capture`, then stays alive until killed. Never contacts any provider.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+def main(argv):
+    if argv[:1] in (["--version"], ["-V"]):
+        print("codex-cli 0.166.0")
+        return 0
+    if not argv or argv[0] != "exec":
+        print("stub codex: only exec is supported", file=sys.stderr)
+        return 2
+    prompt = argv[-1]
+    model = argv[argv.index("--model") + 1] if "--model" in argv else "?"
+    control = Path(os.environ.get("APLEXER_STATE_DIR", "/nonexistent")) / "stub-control.json"
+    settings = json.loads(control.read_text()) if control.exists() else {}
+    delay = float(settings.get("first_action_delay_s", 0))
+    if delay:
+        print("STUB-CODEX delaying first action %.0fs" % delay, flush=True)
+        time.sleep(delay)
+    match = re.search(r"writing its complete stdout to (\S+) \(overwrite", prompt)
+    if match:
+        whoami = subprocess.run(["a", "whoami", "--json"], capture_output=True, text=True, timeout=10)
+        Path(match.group(1)).write_text(whoami.stdout)
+    print("STUB-CODEX-OK model=%s brief=%s" % (model, prompt.splitlines()[0][:80]), flush=True)
+    time.sleep(float(settings.get("run_seconds", 900)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

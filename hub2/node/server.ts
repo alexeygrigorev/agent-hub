@@ -135,6 +135,16 @@ export function startServer(
       },
     });
     serverSocket.accept();
+    let missedPongs=0;
+    wire.on('pong',()=>{missedPongs=0;});
+    const keepalive=setInterval(()=>{
+      if(wire.readyState!==1)return;
+      if(missedPongs>=2){wire.terminate();return;}
+      missedPongs++;
+      wire.ping();
+    },20_000);
+    keepalive.unref();
+    wire.once('close',()=>clearInterval(keepalive));
     wire.on('message', data => {
       const buffer = Array.isArray(data) ? Buffer.concat(data) : Buffer.from(data as Buffer);
       serverSocket.__deliver?.message(decodeFrame(buffer));

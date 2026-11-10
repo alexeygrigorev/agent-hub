@@ -176,14 +176,11 @@ export class MachineDO {
   async alarm(): Promise<void> {
     const now = Date.now();
     const expired = this.db.all<SessionRow>(
-      `SELECT * FROM sessions WHERE state='offered' AND offer_expires_at <= ? AND NOT EXISTS(SELECT 1 FROM machine_outbox b WHERE b.id='expiry:'||sessions.id||':'||sessions.epoch AND b.state='pending') ORDER BY offer_expires_at, id LIMIT 20`, now,
-    );
-    for (const session of expired) {
-      const id='expiry:'+session.id+':'+session.epoch;
-      this.insertOutbox(id,'expiry',session.operation_id,session.project_id,
-        {session_id:session.id,operation_id:session.operation_id,epoch:session.epoch},now);
-      await this.flushOne(id);
-    }
+      "SELECT * FROM sessions WHERE state IN ('staged','offered','claimed') AND native_id IS NULL AND created_at<=? ORDER BY created_at,id LIMIT 100",
+      now-CLAIMED_WITHOUT_NATIVE_GRACE_MS);
+    for (const session of expired) await this.recordLaunchTimeout(session, now);
+    this.db.run("UPDATE session_commands SET state='failed',result_json=?,updated_at=? WHERE kind='stop' AND state='pending' AND created_at<=?",
+      JSON.stringify({error:'stop_unconfirmed',stage:'host_stop'}),now,now-60_000);
     await this.reapInactive(false);
     await this.scheduleNext();
     await this.flushOutbox(now);
@@ -239,7 +236,7 @@ export class MachineDO {
     let connected=false;
     for(const socket of this.machineSockets(`${machine.machine_id}`))if(socket.readyState===1&&!this.stopOnly(socket)&&await this.authorizedAttachment(socket,'machine:offer')){connected=true;break;}
     const capabilities=this.db.one<{engines_json:string;capabilities_json:string}>('SELECT engines_json,capabilities_json FROM machine_capabilities WHERE machine_id=?',machine.machine_id);
-    return json({machine_id:machine.machine_id,connected,os:machine.os,arch:machine.arch,labels:JSON.parse(machine.labels_json),
+    return json({machine_id:machine.machine_id,connected,last_seen:machine.last_seen,os:machine.os,arch:machine.arch,labels:JSON.parse(machine.labels_json),
       engines:capabilities?JSON.parse(capabilities.engines_json):[],capabilities:capabilities?JSON.parse(capabilities.capabilities_json):[]});
   }
 
@@ -266,6 +263,10 @@ export class MachineDO {
       || typeof (launch as JsonRecord).prompt !== 'string' || typeof (launch as JsonRecord).interactive !== 'boolean') return error('invalid_launch_spec', 400);
     if (new TextEncoder().encode(JSON.stringify(launch)).byteLength > 12_000) return error('launch_spec_too_large', 413);
     const now = Date.now();
+    const deadline=(launch as JsonRecord).start_deadline_at;
+    if(deadline!==undefined&&(!Number.isSafeInteger(deadline)||Number(deadline)>now+120_000))return error('invalid_start_deadline',400);
+    if(deadline!==undefined&&Number(deadline)<=now)return error('host_no_response',409);
+    const acceptedAt=deadline===undefined?now:Number(deadline)-120_000;
     const priorOperation = this.db.one<{ session_id: string; epoch: number; request_digest: string; state: string }>(
       'SELECT session_id,epoch,request_digest,state FROM machine_session_operations WHERE operation_id=?', body.operation_id,
     );
@@ -310,7 +311,7 @@ export class MachineDO {
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'staged', NULL, NULL, NULL, NULL, NULL, ?, ?)`,
             body.session_id, body.operation_id, body.request_digest, body.dispatch_id, body.attempt, typeof body.account_id === 'string' ? body.account_id : null,
             body.project_id, body.intake_id, body.machine_id, epoch, body.title,
-            JSON.stringify(body.acceptance_criteria), JSON.stringify(launch), now, now);
+            JSON.stringify(body.acceptance_criteria), JSON.stringify(launch), acceptedAt, now);
         }
         this.db.run("INSERT INTO machine_session_operations(operation_id,session_id,epoch,request_digest,state) VALUES(?,?,?,?, 'current')",
           body.operation_id, body.session_id, epoch, body.request_digest);
@@ -329,7 +330,8 @@ export class MachineDO {
     if (row.state === 'offered' || row.state === 'claimed' || row.state === 'running') return json({ session_id: row.id, epoch: row.epoch, state: row.state }, 200);
     if (row.state !== 'staged') return error('reservation_not_activatable', 409);
     const now = Date.now();
-    const expires = now + 60_000;
+    const expires = row.created_at + CLAIMED_WITHOUT_NATIVE_GRACE_MS;
+    if(expires<=now){await this.recordLaunchTimeout(row,now);return error('host_no_response',409);}
     this.db.run("UPDATE sessions SET state='offered', offer_expires_at=?, updated_at=? WHERE id=? AND state='staged'", expires, now, row.id);
     await this.ensureDeadline(expires);
     await this.notifyOffer(row.id);
@@ -428,6 +430,7 @@ export class MachineDO {
       const now = Date.now();
       this.db.transaction(this.ctx, () => {
         this.db.run("UPDATE sessions SET state='claimed', offer_expires_at=NULL, updated_at=? WHERE id=? AND state='offered' AND epoch=?", now, row.id, row.epoch);
+        this.db.run('INSERT OR IGNORE INTO launch_admissions VALUES(?,?,?,?)', row.operation_id,row.id,row.epoch,now);
         this.insertOutbox(`claim:${row.operation_id}`, 'claim', row.operation_id, row.project_id,
           { operation_id: row.dispatch_id, attempt_operation_id: row.operation_id, session_id: row.id,
             machine_id: row.machine_id, epoch: row.epoch }, now);
@@ -676,6 +679,12 @@ export class MachineDO {
     } catch {
       const now = Date.now();
       const attempt = row.attempt + 1;
+      if(attempt>=10){
+        this.db.run("UPDATE machine_outbox SET state='dead_letter',attempt=?,updated_at=? WHERE id=? AND state='pending'",attempt,now,row.id);
+        if(typeof payload.session_id==='string')this.db.run('INSERT OR IGNORE INTO attention VALUES(?,?,?,?,?)',payload.session_id,'outbox_retries_exhausted',row.operation_id,null,now);
+        console.error('[hub2] MACHINE_OUTBOX_DEAD_LETTER',JSON.stringify({id:row.id,kind:row.kind,operation_id:row.operation_id,attempt}));
+        return false;
+      }
       const delay = Math.min(15 * 60_000, 1_000 * 2 ** Math.min(attempt, 9));
       this.db.run('UPDATE machine_outbox SET attempt=?, next_action_at=?, updated_at=? WHERE id=? AND state=\'pending\'', attempt, now + delay, now, row.id);
       return false;
@@ -693,7 +702,8 @@ export class MachineDO {
     const current = await this.ctx.storage.getAlarm();
     const next = this.db.one<{ due: number | null }>(`SELECT MIN(due) AS due FROM (
       SELECT MIN(offer_expires_at) AS due FROM sessions WHERE state='offered' AND offer_expires_at IS NOT NULL AND NOT EXISTS(SELECT 1 FROM machine_outbox b WHERE b.id='expiry:'||sessions.id||':'||sessions.epoch AND b.state='pending')
-      UNION ALL SELECT MIN(updated_at+?) AS due FROM sessions WHERE state='claimed' AND native_id IS NULL
+      UNION ALL SELECT MIN(created_at+?) AS due FROM sessions WHERE state IN ('staged','offered','claimed') AND native_id IS NULL
+      UNION ALL SELECT MIN(created_at+60000) AS due FROM session_commands WHERE kind='stop' AND state='pending'
       UNION ALL SELECT MIN(next_action_at) AS due FROM machine_outbox WHERE state='pending'
       UNION ALL SELECT ? AS due WHERE EXISTS(SELECT 1 FROM sessions WHERE state IN ('claimed','running'))
     )`,CLAIMED_WITHOUT_NATIVE_GRACE_MS,Date.now()+SESSION_REAP_INTERVAL_MS);
@@ -918,7 +928,7 @@ export class MachineDO {
       await this.ensureDeadline(now+1000);
       await this.flushOne(`auth-fallback:${row.operation_id}:${row.epoch}`);
       await this.scheduleNext();
-    } else if(row.state==='offered'&&!row.native_id&&operation===row.operation_id){
+    } else if(['offered','claimed'].includes(row.state)&&!row.native_id&&operation===row.operation_id){
       await this.recordLaunchRefusal(row,body.reason);
     }
   }
@@ -931,8 +941,8 @@ export class MachineDO {
     const key=`launch-refused:${session.operation_id}:${session.epoch}`;
     const applied=this.db.transaction(this.ctx,()=>{
       const current=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',session.id);
-      if(!current||current.state!=='offered'||current.native_id!==null||current.operation_id!==session.operation_id||current.epoch!==session.epoch)return false;
-      this.db.run("UPDATE sessions SET state='failed',updated_at=? WHERE id=? AND operation_id=? AND epoch=? AND state='offered'",
+      if(!current||!['offered','claimed'].includes(current.state)||current.native_id!==null||current.operation_id!==session.operation_id||current.epoch!==session.epoch)return false;
+      this.db.run("UPDATE sessions SET state='failed',updated_at=? WHERE id=? AND operation_id=? AND epoch=? AND state IN ('offered','claimed')",
         now,session.id,session.operation_id,session.epoch);
       this.db.run("UPDATE machine_session_operations SET state='failed' WHERE operation_id=? AND session_id=? AND epoch=? AND state='current'",
         session.operation_id,session.id,session.epoch);
@@ -1122,7 +1132,7 @@ export class MachineDO {
   }
 
   private async recordLaunchTimeout(session:SessionRow,observedAt:number):Promise<boolean>{
-    const now=Date.now(),reason='launch_timeout_no_native';
+    const now=Date.now(),reason=session.state==='claimed'?'launch_timeout_no_native':'host_no_response';
     const previousAttention=this.db.one<{reason:string}>('SELECT reason FROM attention WHERE session_id=?',session.id)?.reason??null;
     const payload={operation_id:session.dispatch_id,attempt_operation_id:session.operation_id,session_id:session.id,
       intake_id:session.intake_id,machine_id:session.machine_id,epoch:session.epoch,native_id:null,
@@ -1130,8 +1140,8 @@ export class MachineDO {
     const applied=this.db.transaction(this.ctx,()=>{
       const current=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',session.id);
       if(!current||current.epoch!==session.epoch||current.operation_id!==session.operation_id
-        ||current.state!=='claimed'||current.native_id!==null||Date.now()-current.updated_at<CLAIMED_WITHOUT_NATIVE_GRACE_MS)return false;
-      this.db.run("UPDATE sessions SET state='failed',updated_at=? WHERE id=? AND state='claimed' AND native_id IS NULL",now,session.id);
+        ||!['staged','offered','claimed'].includes(current.state)||current.native_id!==null||Date.now()-current.created_at<CLAIMED_WITHOUT_NATIVE_GRACE_MS)return false;
+      this.db.run("UPDATE sessions SET state='failed',updated_at=? WHERE id=? AND state IN ('staged','offered','claimed') AND native_id IS NULL",now,session.id);
       this.db.run("UPDATE machine_session_operations SET state='failed' WHERE operation_id=? AND session_id=? AND epoch=?",session.operation_id,session.id,session.epoch);
       this.settlePendingCommands(session,now,reason,false);
       this.db.run('INSERT INTO attention(session_id,reason,operation_id,message_id,observed_at) VALUES(?,?,?,NULL,?) ON CONFLICT(session_id) DO UPDATE SET reason=excluded.reason,operation_id=excluded.operation_id,message_id=NULL,observed_at=excluded.observed_at',
@@ -1207,6 +1217,12 @@ export class MachineDO {
     const launch=this.parse(row.launch_json) as JsonRecord;
     return {id:row.id,state:row.state,intake_id:row.intake_id,project_id:row.project_id,machine_id:row.machine_id,
       epoch:row.epoch,operation_id:row.operation_id,native_id:row.native_id,engine:launch.engine,model:launch.model,
+      managed:true,host:row.machine_id,machine:row.machine_id,workspace:launch.workspace,
+      start_deadline_at:launch.start_deadline_at??null,
+      account_id:row.account_id,account:row.account_id,effort:launch.effort??null,
+      mode:launch.interactive===true?'interactive':'headless',
+      created_at:new Date(row.created_at).toISOString(),updated_at:new Date(row.updated_at).toISOString(),
+      last_activity_at:this.db.one<{last_activity_at:number|null}>('SELECT last_activity_at FROM native_sessions WHERE session_id=?',row.id)?.last_activity_at??null,
       interactive:launch.interactive,evidence:this.parse(row.evidence_json),attention:this.db.one('SELECT reason,observed_at FROM attention WHERE session_id=?',row.id)||null};
   }
 
