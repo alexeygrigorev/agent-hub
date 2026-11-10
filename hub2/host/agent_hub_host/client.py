@@ -2,6 +2,7 @@
 import json
 import os
 import platform
+import re
 import subprocess
 import tempfile
 import time
@@ -70,6 +71,17 @@ def response_error(status, raw):
     return ApiError(f"Hub HTTP {status}",status=status,code=code,retry_at=retry_at)
 
 
+def _release_query():
+    try:
+        from ._release import HOST_VERSION, PROTOCOL_VERSION
+    except (ImportError, SyntaxError):
+        return ""
+    if (not isinstance(HOST_VERSION, str) or not re.fullmatch(r"[0-9a-f]{40}", HOST_VERSION)
+            or type(PROTOCOL_VERSION) is not int or not 1 <= PROTOCOL_VERSION <= 9007199254740991):
+        return ""
+    return urllib.parse.urlencode({"host_version": HOST_VERSION, "protocol_version": PROTOCOL_VERSION})
+
+
 class Client:
     def __init__(self, base_url, token="", timeout=30):
         parsed = urllib.parse.urlsplit(base_url)
@@ -114,8 +126,9 @@ class Client:
     def socket(self, machine_id, safety=False):
         from .transport import WebSocket
         parsed = urllib.parse.urlsplit(self.base_url)
+        query = "safety=operator_stop" if safety else _release_query()
         endpoint = urllib.parse.urlunsplit(("wss" if parsed.scheme == "https" else "ws",
-                                            parsed.netloc, parsed.path + "/api/connect", "safety=operator_stop" if safety else "", ""))
+                                            parsed.netloc, parsed.path + "/api/connect", query, ""))
         return WebSocket(endpoint, self.token, self.timeout)
 
     def heartbeat(self, labels, engines=None, capabilities=None, native_sessions=None):

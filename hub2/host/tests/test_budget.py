@@ -1,6 +1,7 @@
-import json,tempfile,threading,time,unittest
+import json,sys,tempfile,threading,time,unittest
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock,patch
 from agent_hub_host.agent import Bridge,Journal
 from agent_hub_host.client import Client,ApiError
@@ -69,12 +70,12 @@ class BudgetTests(unittest.TestCase):
         bridge.reconcile.assert_called_once();bridge.client.socket.assert_not_called()
         bridge.journal.flush.assert_not_called();bridge.heartbeat.assert_not_called()
 
-    def test_real_websocket_handshake_preserves_pause_and_exact_safety_query(self):
+    def test_real_websocket_handshake_reports_release_only_on_normal_socket(self):
         deadline=int(time.time()*1000)+60000;seen=[]
         class Handler(BaseHTTPRequestHandler):
             protocol_version='HTTP/1.1'
             def do_GET(self):
-                seen.append(self.path)
+                seen.append((self.path,self.headers.get("Authorization")))
                 body=json.dumps({'error':'budget_paused','retry_at':deadline}).encode()
                 self.send_response(429);self.send_header('Content-Length',str(len(body)))
                 self.send_header('Connection','close');self.end_headers();self.wfile.write(body)
@@ -82,11 +83,23 @@ class BudgetTests(unittest.TestCase):
         server=ThreadingHTTPServer(('127.0.0.1',0),Handler)
         thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
         try:
-            with self.assertRaises(ApiError) as caught:
-                Client(f'http://127.0.0.1:{server.server_port}','private-bearer').socket('machine-1',safety=True)
-            self.assertEqual(caught.exception.retry_at,deadline)
-            self.assertEqual(seen,['/api/connect?safety=operator_stop'])
-            self.assertNotIn('private-bearer',str(caught.exception))
+            client=Client(f'http://127.0.0.1:{server.server_port}','private-bearer')
+            sha='a'*40
+            release=SimpleNamespace(HOST_VERSION=sha,PROTOCOL_VERSION=2)
+            cases=[
+                (release,False,f'/api/connect?host_version={sha}&protocol_version=2'),
+                (release,True,'/api/connect?safety=operator_stop'),
+                (None,False,'/api/connect'),
+                (SimpleNamespace(HOST_VERSION=sha,PROTOCOL_VERSION=True),False,'/api/connect'),
+                (SimpleNamespace(HOST_VERSION='bad',PROTOCOL_VERSION=1),False,'/api/connect'),
+            ]
+            for module,safety,path in cases:
+                with self.subTest(path=path,module=module), patch.dict(sys.modules,{'agent_hub_host._release':module}):
+                    with self.assertRaises(ApiError) as caught:
+                        client.socket('machine-1',safety=safety)
+                    self.assertEqual(caught.exception.retry_at,deadline)
+                    self.assertNotIn('private-bearer',str(caught.exception))
+            self.assertEqual(seen,[(path,'Bearer private-bearer') for _,_,path in cases])
         finally:server.shutdown();server.server_close();thread.join()
 
     def test_dispatch_does_not_swallow_budget_pause(self):

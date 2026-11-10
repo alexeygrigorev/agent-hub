@@ -8,6 +8,8 @@ import { createFixture, restartFixture, makeTempDir } from './node-fixture.mjs';
 const root = resolve(import.meta.dirname, '../..');
 const token = 'synthetic-socket-cap-operator-token-0000000000000';
 const machine = 'socket-cap-machine';
+const sha = 'a'.repeat(40);
+const reported = '/api/connect?host_version='+sha+'&protocol_version=2';
 const machineSource = resolve(root, 'hub2/src/machine-do.ts');
 const hash = () => readFile(machineSource).then(b => createHash('sha256').update(b).digest('hex'));
 const before = await hash();
@@ -39,9 +41,31 @@ async function socket(auth,path='/api/connect'){
 }
 async function until(fn){for(let i=0;i<100;i++){if(await fn())return;await new Promise(r=>setTimeout(r,10));}throw Error('condition timeout; states='+sockets.map(s=>s.readyState+':'+s.closedCode).join(','));}
 
- const old=await enroll();await api('/api/heartbeat','POST',{os:'linux',arch:'x64',labels:[],engines:['shell'],capabilities:['headless']},old);
+ async function expectRelease(connected, version, protocol){
+  const {machines}=await api('/api/fleet/routing/machines');
+  const row=machines.find(item=>item.machine_id===machine);
+  assert(row,'enrolled host appears in public routing');
+  assert.equal(row.connected,connected);
+  if(version===undefined){
+   assert(!Object.hasOwn(row,'host_version')&&!Object.hasOwn(row,'protocol_version'));
+  }else{
+   assert.equal(row.host_version,version);
+   assert.equal(row.protocol_version,protocol);
+  }
+ }
+ const old=await enroll();
+ await api('/api/heartbeat','POST',{os:'linux',arch:'x64',labels:[],engines:['shell'],capabilities:['headless'],host_version:sha,protocol_version:2},old);
+ await expectRelease(false);
+ const beforeRestart=await socket(old,reported);
+ await expectRelease(true,sha,2);
+ beforeRestart.terminate();
+ await until(async()=>(await api('/_socket/state')).open===0);
+ fixture=await restartFixture(fixture,spec);
+ base=fixture.origin;
+ await expectRelease(false);
  await api('/_socket/seed','POST',{});const pending=await api('/_socket/queue');
  let prior=await socket(old);
+ await expectRelease(true);
  for(let i=0;i<12;i++){const next=await socket(old);await until(()=>prior.readyState!==WebSocket.OPEN);prior.terminate();prior=next;assert.equal((await api('/_socket/state')).open,1);}
  const legacy=await Promise.all(Array.from({length:8},()=>socket(token,'/_socket/legacy')));
  assert.equal((await api('/_socket/state')).open,9);
@@ -49,17 +73,46 @@ async function until(fn){for(let i=0;i<100;i++){if(await fn())return;await new P
  await api('/_socket/routing');assert.equal((await api('/_socket/count')).calls-count,1,'routing authenticates singleton once');
  assert.equal((await api('/_socket/state')).open,1,'legacy sockets pruned before auth fanout');
  for(const ws of legacy)ws.terminate();
- const fresh=await enroll();const current=await socket(fresh);
- await until(()=>prior.readyState!==WebSocket.OPEN);prior.terminate();assert.equal((await api('/_socket/state')).open,1);
+ prior=await socket(old,reported);
+ await expectRelease(true,sha,2);
+ for(const query of [
+  '?host_version='+sha,
+  '?host_version='+sha.toUpperCase()+'&protocol_version=2',
+  '?host_version='+sha+'&protocol_version=02',
+  '?host_version='+sha+'&protocol_version=9007199254740992',
+  '?host_version='+sha+'&protocol_version=2&protocol_version=2',
+  '?host_version='+sha+'&host_version='+sha+'&protocol_version=2',
+ ]){
+  prior=await socket(old,'/api/connect'+query);
+  await expectRelease(true);
+ }
+ prior=await socket(old,reported);
+ await expectRelease(true,sha,2);
+ const fresh=await enroll();
+ assert.equal(prior.readyState,WebSocket.OPEN,'retired generation remains open until routing authorization');
+ await expectRelease(false);
+ await until(()=>prior.readyState!==WebSocket.OPEN);prior.terminate();
+ const current=await socket(fresh,reported);
+ await expectRelease(true,sha,2);
+ assert.equal((await api('/_socket/state')).open,1);
  await assert.rejects(()=>socket(old),/401|Unauthorized/,'retired generation cannot replace new socket');
  assert.equal(current.readyState,WebSocket.OPEN);assert.equal((await api('/_socket/state')).open,1);
  const concurrent=await Promise.all(Array.from({length:8},()=>socket(fresh)));
  await until(()=>concurrent.filter(s=>s.readyState===WebSocket.OPEN).length===1);
  assert.equal((await api('/_socket/state')).open,1);
  assert.deepEqual(await api('/_socket/queue'),pending,'pending intent unchanged across reconnect/rotation');
- const safe=await socket(fresh,'/api/connect?safety=operator_stop');
+ const replacement=await socket(fresh,reported);
+ await expectRelease(true,sha,2);
+ const safe=await socket(fresh,reported+'&safety=operator_stop');
+ await until(()=>replacement.readyState!==WebSocket.OPEN);
  assert.equal((await api('/_socket/state')).open,1,'safety socket replaces normal singleton');
  assert.equal(safe.readyState,WebSocket.OPEN);
+ await expectRelease(false);
+ const last=await socket(fresh,reported);
+ await expectRelease(true,sha,2);
+ last.terminate();
+ await until(async()=>(await api('/_socket/state')).open===0);
+ await expectRelease(false);
  assert.equal(await hash(),before,'Machine source stable');
- console.log(JSON.stringify({passed:true,reconnects:12,concurrent:8,reenrollment:true,routing_authorizations:1,pending_preserved:true,safety_reconnect:true,machine_sha256:before}));
+ console.log(JSON.stringify({passed:true,reconnects:12,concurrent:8,reenrollment:true,routing_authorizations:1,pending_preserved:true,safety_reconnect:true,host_release_socket_only:true,machine_sha256:before}));
 }finally{for(const ws of sockets)ws.terminate();await fixture.dispose();await rm(persist,{recursive:true,force:true});}

@@ -89,6 +89,22 @@ type SessionRow = {
   evidence_json: string | null; evidence_digest: string | null; exit_code: number | null;
   created_at: number; updated_at: number;
 };
+type HostRelease = { host_version: string; protocol_version: number };
+type SocketAttachment = { machine_id: string; actor_id: string; generation: string } & Partial<HostRelease>;
+
+function hostRelease(hostVersion: unknown, protocolVersion: unknown): HostRelease | undefined {
+  if (typeof hostVersion !== 'string' || hostVersion.length !== 40 || !/^[0-9a-f]+$/.test(hostVersion)
+      || typeof protocolVersion !== 'number' || !Number.isSafeInteger(protocolVersion) || protocolVersion < 1) return undefined;
+  return { host_version: hostVersion, protocol_version: protocolVersion };
+}
+
+function reportedHostRelease(query: URLSearchParams): HostRelease | undefined {
+  const versions = query.getAll('host_version');
+  const protocols = query.getAll('protocol_version');
+  if (versions.length !== 1 || protocols.length !== 1 || !/^[1-9][0-9]{0,15}$/.test(protocols[0])) return undefined;
+  return hostRelease(versions[0], Number(protocols[0]));
+}
+
 type OutboxRow = { id: string; kind: string; operation_id: string; project_id: string; payload_json: string; attempt: number; next_action_at: number };
 type CommandRow = { id: string; session_id: string; machine_id: string; epoch: number; request_key: string; request_digest: string; kind: string; text: string | null; capture_mode: string | null; state: string; result_json: string | null; created_at: number; updated_at: number };
 type NativeMail = {message_id:string;epoch:number;operation_id:string;session_id:string;machine_id:string;recipient:string;body:string;digest:string;state:string;receipt_digest:string|null};
@@ -236,12 +252,19 @@ export class MachineDO {
     const machine=this.db.one<MachineRow>('SELECT * FROM machines LIMIT 1');
     if(!machine)return json({available:false,reason:'machine_not_enrolled'});
     let connected=false;
-    for(const socket of this.machineSockets(`${machine.machine_id}`,!passive)){
+    let release:HostRelease|undefined;
+    for(const socket of this.machineSockets(machine.machine_id,!passive)){
       if(passive){try{if(socket.deserializeAttachment()?.machine_id!==machine.machine_id)continue;}catch{continue;}}
-      if(socket.readyState===1&&!this.stopOnly(socket)&&await this.authorizedAttachment(socket,'machine:offer',!passive,this.env,!passive)){connected=true;break;}
+      if(socket.readyState!==1||this.stopOnly(socket))continue;
+      const attachment=await this.authorizedAttachment(socket,'machine:offer',!passive,this.env,!passive);
+      if(attachment?.machine_id!==machine.machine_id)continue;
+      connected=true;
+      // The running daemon reports these values. They are not an attestation.
+      release=hostRelease(attachment.host_version,attachment.protocol_version);
+      break;
     }
     const capabilities=this.db.one<{engines_json:string;capabilities_json:string}>('SELECT engines_json,capabilities_json FROM machine_capabilities WHERE machine_id=?',machine.machine_id);
-    return json({machine_id:machine.machine_id,connected,last_seen:machine.last_seen,os:machine.os,arch:machine.arch,labels:JSON.parse(machine.labels_json),
+    return json({machine_id:machine.machine_id,connected,...release,last_seen:machine.last_seen,os:machine.os,arch:machine.arch,labels:JSON.parse(machine.labels_json),
       engines:capabilities?JSON.parse(capabilities.engines_json):[],capabilities:capabilities?JSON.parse(capabilities.capabilities_json):[]});
   }
 
@@ -358,7 +381,8 @@ export class MachineDO {
     if (!machineId) return error('forbidden', 403);
     if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') return error('websocket_upgrade_required', 426);
     const stopOnly=request.headers.get('x-hub2-safety-mode')==='operator_stop';
-    if(new URL(request.url).searchParams.has('safety')&&!stopOnly)return error('untrusted_safety_mode',403);
+    const query=new URL(request.url).searchParams;
+    if(query.has('safety')&&!stopOnly)return error('untrusted_safety_mode',403);
     let client!:WebSocket,server!:WebSocket;
     const accepted=this.connectQueue.then(async()=>{
       const control=this.env.CONTROL.get(this.env.CONTROL.idFromName('global'));
@@ -372,7 +396,8 @@ export class MachineDO {
         try{old.close(1000,'connection superseded');}catch{}
       }
       server.serializeAttachment({machine_id:machineId,actor_id:actor!.id,generation:actor!.generation,
-        stop_only:stopOnly,connection_id:crypto.randomUUID(),connected_at:Date.now()});
+        stop_only:stopOnly,connection_id:crypto.randomUUID(),connected_at:Date.now(),
+        ...(!stopOnly?reportedHostRelease(query):undefined)});
       this.ctx.acceptWebSocket(server,['hub2:'+machineId]);
       return true;
     });
@@ -1273,9 +1298,9 @@ export class MachineDO {
 
   private stopOnly(socket:WebSocket):boolean{try{return socket.deserializeAttachment()?.stop_only===true;}catch{return false;}}
 
-  private async authorizedAttachment(socket: WebSocket, scope: string, closeOnRefusal = true,env:Hub2Env=this.env,prune=true): Promise<{ machine_id: string; actor_id: string; generation: string } | undefined> {
+  private async authorizedAttachment(socket: WebSocket, scope: string, closeOnRefusal = true,env:Hub2Env=this.env,prune=true): Promise<SocketAttachment | undefined> {
     if(!this.currentSocket(socket,prune))return undefined;
-    let attachment: { machine_id?: string; actor_id?: string; generation?: string } | null;
+    let attachment: Partial<SocketAttachment> | null;
     try { attachment = socket.deserializeAttachment(); } catch { attachment = null; }
     if (!attachment?.machine_id || !attachment.actor_id || !attachment.generation) return undefined;
     const control = env.CONTROL.get(env.CONTROL.idFromName('global'));
@@ -1288,7 +1313,7 @@ export class MachineDO {
       return undefined;
     }
     if(!this.currentSocket(socket,prune))return undefined;
-    return attachment as { machine_id: string; actor_id: string; generation: string };
+    return attachment as SocketAttachment;
   }
 
   private commandView(row: CommandRow): JsonRecord {
