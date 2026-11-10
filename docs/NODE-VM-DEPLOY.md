@@ -213,12 +213,12 @@ page, performs an authenticated read-only desktop grant check, checks the
 authenticated tools gateway and `DESKTOP-FP4OP26` health, and reads the Hub API
 health endpoint. After two consecutive failures it creates a DataOps task and
 sends one critical email per incident through RMTHZ's existing `msmtp` `alerts`
-account, to `dev@dtcdev.click` with `orin@dtcdev.click` copied. After two
-consecutive healthy checks it sends one recovery email and updates the DataOps
-task. To exercise live mail delivery and the DataOps test-task path after
-installation, run `sudo -u alexey /usr/local/sbin/resource-gate-monitor.sh
---test-alert`; this uses the production state directory and sends a clearly
-marked test message to both recipients. The monitor state stays under
+account, to `dev@dtcdev.click` only. After two consecutive healthy checks it
+sends one recovery email to `dev@dtcdev.click` and updates the DataOps task. To
+exercise live mail delivery and the DataOps test-task path after installation,
+run `sudo -u alexey /usr/local/sbin/resource-gate-monitor.sh --test-alert`; this
+uses the production state directory and sends a clearly marked test message to
+`dev@dtcdev.click` only. The monitor state stays under
 `/var/lib/resource-gate-monitor` on RMTHZ. The GCP VM has no MTA, so it does
 not own the email alert path.
 
