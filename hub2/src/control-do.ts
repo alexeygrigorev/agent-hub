@@ -6,7 +6,7 @@ import { MeteredDb, initializeSchema } from './db';
 import { SqlReceiptMeter, SQL_PROBE_HEADER, wrapSqlNamespaces } from './sql-receipt';
 import { randomToken, safeEqual, sha256Hex } from './crypto';
 import { credentialKey, openCredential, sealCredential } from './credential-crypto';
-import { actorFrom, bodyObject, boundedString, boundedText, error, hasScope, HttpError, json } from './http';
+import { actorFrom, bodyObject, boundedString, boundedText, error, hasScope, HttpError, HUB2_FORWARD_BODY_LIMIT, json } from './http';
 import { modelPolicyCandidateViolation, type ModelPolicyRoute } from './model-policy';
 import { isLiveActiveSession, MAX_ACTIVE_SESSIONS } from './session-liveness';
 import { CLAUDE_OAUTH, claudeAuthorization, claudeExchange } from '../../src/credentials';
@@ -1003,39 +1003,79 @@ export class ControlDO {
     this.db.run('INSERT INTO actor_directory(id,kind,enabled) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET enabled=excluded.enabled',b.id,b.kind,Number(b.enabled));return json({registered:true});
   }
 
+  private normalizeModelPolicy(input:unknown,allowEmpty=false):JsonRecord[]{
+    if(!Array.isArray(input)||input.length>32||!input.length&&!allowEmpty)throw new HttpError('invalid_model_policy',400);
+    const ids=new Set<string>(),candidates:JsonRecord[]=[];
+    for(const candidate of input){
+      if(!candidate||typeof candidate!=='object'||Array.isArray(candidate))throw new HttpError('invalid_model_candidate',400);
+      const c=candidate as JsonRecord;
+      if(Object.keys(c).some(k=>!['id','engine','model','effort','account_id','weight','capabilities','enabled'].includes(k)))throw new HttpError('unknown_model_candidate_field',400);
+      if(!['id','engine','model','account_id'].every(k=>boundedString(c[k],120)&&/^[A-Za-z0-9_.:/-]+$/.test(String(c[k])))||typeof c.weight!=='number'||!Number.isFinite(c.weight)||c.weight<=0||c.weight>1000000||typeof c.enabled!=='boolean'||!Array.isArray(c.capabilities)||c.capabilities.length>32||!c.capabilities.every(v=>boundedString(v,80))||(c.effort!==undefined&&!['low','medium','max'].includes(String(c.effort))))throw new HttpError('invalid_model_candidate',400);
+      if(['shared-zai','zcodex'].includes(String(c.account_id))||['zcodex','goz','zai'].includes(String(c.engine))&&c.account_id!=='zai-central')throw new HttpError('zai_central_account_required',400);
+      const policyViolation=modelPolicyCandidateViolation(c as unknown as ModelPolicyRoute);
+      if(policyViolation)throw new HttpError(policyViolation,400);
+      if(ids.has(String(c.id)))throw new HttpError('duplicate_model_candidate',400);ids.add(String(c.id));candidates.push({...c,capabilities:[...new Set(c.capabilities)].sort()});
+    }
+    return candidates;
+  }
+
+  private checkPolicyRecovery(prior:{version:number;candidates_json:string}|undefined,expected:unknown,desired:JsonRecord[]){
+    const version=prior?.version??0;
+    if(expected!==version)throw new HttpError('model_policy_version_conflict',409);
+    let candidates:JsonRecord[];
+    try{
+      candidates=this.normalizeModelPolicy(prior?JSON.parse(prior.candidates_json):[],true);
+    }catch{
+      throw new HttpError('model_policy_prior_unrestorable',409);
+    }
+    // Ignore object key order and compare the same normalized capabilities
+    // that PUT would restore. Candidate array order remains significant.
+    const keys=['id','engine','model','effort','account_id','weight','capabilities','enabled'];
+    const changed=JSON.stringify(candidates,keys)!==JSON.stringify(desired,keys);
+    if(changed){
+      if(version>Number.MAX_SAFE_INTEGER-2)throw new HttpError('model_policy_recovery_version_exhausted',409);
+      const rollback={candidates,expected_version:version+1,...(!candidates.length?{restore_unconfigured:true}:{})};
+      if(new TextEncoder().encode(JSON.stringify(rollback)).byteLength>HUB2_FORWARD_BODY_LIMIT)throw new HttpError('model_policy_rollback_body_too_large',409);
+    }
+    return {version,candidates,changed};
+  }
+
   private async modelPolicy(request:Request):Promise<Response>{
     const path=new URL(request.url).pathname,actor=actorFrom(request);
     if(path!=='/_routing-policy'&&!hasScope(actor,'operator:admin')&&!hasScope(actor,'model-policy:read')&&!hasScope(actor,'routing:read'))return error('forbidden',403);
-    const current=this.db.one<{version:number;candidates_json:string;digest:string}>('SELECT version,candidates_json,digest FROM model_policy WHERE id=1');
+    const readPolicy=()=>this.db.one<{version:number;candidates_json:string;digest:string}>('SELECT version,candidates_json,digest FROM model_policy WHERE id=1');
     if(request.method==='GET'){
-      const candidates=current?JSON.parse(current.candidates_json):[];
+      const current=readPolicy(),candidates=current?JSON.parse(current.candidates_json):[];
       return candidates.length?json({version:current!.version,candidates}):json({error:'model_policy_unconfigured',version:current?.version??0},404);
     }
-    if(path==='/_routing-policy'||request.method!=='PUT'||!hasScope(actor,'operator:admin'))return error('forbidden',403);
+    if(path==='/_routing-policy'||!['PUT','POST'].includes(request.method)||!hasScope(actor,'operator:admin'))return error('forbidden',403);
     const b=await bodyObject(request,128000);
+    const recovery=request.method==='POST';
+    const protocol='model-policy-recovery-v1';
+    if(recovery&&(b.protocol!==protocol||(b.action!=='validate_recovery'&&b.action!=='apply_recoverable')||Object.keys(b).some(key=>!['protocol','action','expected_version','candidates'].includes(key))))return error('invalid_model_policy_recovery',400);
     const restore=b.restore_unconfigured===true;
-    if(b.restore_unconfigured!==undefined&&!restore)return error('invalid_model_policy_restore',400);
-    if(b.expected_version!==undefined&&(!Number.isSafeInteger(b.expected_version)||Number(b.expected_version)<0))return error('invalid_model_policy_version',400);
+    if(b.restore_unconfigured!==undefined&&(!restore||recovery))return error('invalid_model_policy_restore',400);
+    if((recovery||b.expected_version!==undefined)&&(!Number.isSafeInteger(b.expected_version)||Number(b.expected_version)<0))return error('invalid_model_policy_version',400);
     if(restore&&(!Number.isSafeInteger(b.expected_version)||!Array.isArray(b.candidates)||b.candidates.length!==0))return error('invalid_model_policy_restore',400);
-    if(!Array.isArray(b.candidates)||b.candidates.length>32||!b.candidates.length&&!restore)return error('invalid_model_policy',400);
-    const ids=new Set<string>(),candidates:JsonRecord[]=[];
-    for(const candidate of b.candidates){
-      if(!candidate||typeof candidate!=='object'||Array.isArray(candidate))return error('invalid_model_candidate',400);
-      const c=candidate as JsonRecord;
-      if(Object.keys(c).some(k=>!['id','engine','model','effort','account_id','weight','capabilities','enabled'].includes(k)))return error('unknown_model_candidate_field',400);
-      if(!['id','engine','model','account_id'].every(k=>boundedString(c[k],120)&&/^[A-Za-z0-9_.:/-]+$/.test(String(c[k])))||typeof c.weight!=='number'||!Number.isFinite(c.weight)||c.weight<=0||c.weight>1000000||typeof c.enabled!=='boolean'||!Array.isArray(c.capabilities)||c.capabilities.length>32||!c.capabilities.every(v=>boundedString(v,80))||(c.effort!==undefined&&!['low','medium','max'].includes(String(c.effort))))return error('invalid_model_candidate',400);
-      if(['shared-zai','zcodex'].includes(String(c.account_id))||['zcodex','goz','zai'].includes(String(c.engine))&&c.account_id!=='zai-central')return error('zai_central_account_required',400);
-      const policyViolation=modelPolicyCandidateViolation(c as unknown as ModelPolicyRoute);
-      if(policyViolation)return error(policyViolation,400);
-      if(ids.has(String(c.id)))return error('duplicate_model_candidate',400);ids.add(String(c.id));candidates.push({...c,capabilities:[...new Set(c.capabilities)].sort()});
+    const candidates=this.normalizeModelPolicy(b.candidates,restore);
+    if(recovery&&b.action==='validate_recovery'){
+      return json({protocol,action:b.action,...this.checkPolicyRecovery(readPolicy(),b.expected_version,candidates)});
     }
     const encoded=JSON.stringify(candidates),digest=await sha256Hex(encoded);
     return this.db.transaction(this.ctx,()=>{
-      const prior=this.db.one<{version:number;digest:string}>('SELECT version,digest FROM model_policy WHERE id=1');
-      if(b.expected_version!==undefined&&b.expected_version!==(prior?.version??0))return error('model_policy_version_conflict',409);
-      if(prior?.digest===digest)return json({version:prior.version,candidates,unchanged:true});
-      if((prior?.version??0)>=Number.MAX_SAFE_INTEGER)return error('model_policy_version_exhausted',409);
-      const version=(prior?.version??0)+1;this.db.run('INSERT INTO model_policy(id,version,candidates_json,digest) VALUES(1,?,?,?) ON CONFLICT(id) DO UPDATE SET version=excluded.version,candidates_json=excluded.candidates_json,digest=excluded.digest',version,encoded,digest);return json({version,candidates});
+      const prior=readPolicy(),priorVersion=prior?.version??0;
+      const marker=recovery?{protocol,action:b.action}:{};
+      if(recovery){
+        const check=this.checkPolicyRecovery(prior,b.expected_version,candidates);
+        if(!check.changed)return json({...marker,version:priorVersion,candidates,unchanged:true});
+      }else{
+        if(b.expected_version!==undefined&&b.expected_version!==priorVersion)return error('model_policy_version_conflict',409);
+        if(prior?.digest===digest)return json({version:prior.version,candidates,unchanged:true});
+        if(priorVersion>=Number.MAX_SAFE_INTEGER)return error('model_policy_version_exhausted',409);
+      }
+      const version=priorVersion+1;
+      this.db.run('INSERT INTO model_policy(id,version,candidates_json,digest) VALUES(1,?,?,?) ON CONFLICT(id) DO UPDATE SET version=excluded.version,candidates_json=excluded.candidates_json,digest=excluded.digest',version,encoded,digest);
+      return json({...marker,version,candidates});
     });
   }
 

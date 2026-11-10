@@ -1,14 +1,13 @@
 import { mcp } from './mcp';
 import { publicAuthentication, cookieActor, noStore } from './auth';
 import { safeEqual } from './crypto';
-import { bodyObject, boundedText, error, HttpError, json } from './http';
+import { bodyObject, boundedText, error, HttpError, HUB2_FORWARD_BODY_LIMIT, json } from './http';
 import { pickModelRouteDetailed, simulateModelRoutes, type PickInput } from './model-picker';
 import { sessionPurpose } from './session-purpose';
 import { isLiveActiveSession, type LiveSession } from './session-liveness';
 import type { Actor, Hub2Env, JsonRecord } from './types';
 
 const CONTROL = 'https://control.hub2.internal';
-const BODY_LIMIT = 98_304;
 let devActorRegistration: Promise<boolean> | undefined;
 
 export default {
@@ -311,7 +310,7 @@ const router = {
         if (!as && request.method === 'POST') {
           let b: JsonRecord;
           try {
-            b = JSON.parse(await boundedText(request.clone(), BODY_LIMIT));
+            b = JSON.parse(await boundedText(request.clone(), HUB2_FORWARD_BODY_LIMIT));
           } catch (caught) {
             if (caught instanceof HttpError) throw caught;
             return error('invalid_json', 400);
@@ -351,7 +350,7 @@ const router = {
         if (actor.kind === 'machine' && /\/delivered$/.test(path) && request.method === 'POST') {
           if (!actor.resource_id || !actor.scopes.includes('message:delivery'))
             return error('forbidden', 403);
-          const body = JSON.parse(await boundedText(request.clone(), BODY_LIMIT)) as JsonRecord;
+          const body = JSON.parse(await boundedText(request.clone(), HUB2_FORWARD_BODY_LIMIT)) as JsonRecord;
           const id = path.split('/')[3];
           const response = await env.MACHINES.get(env.MACHINES.idFromName(actor.resource_id)).fetch(
             'https://machine.internal/_internal/mail-authorize',
@@ -524,7 +523,7 @@ async function forwardRequest(
   if (safetyMode === 'operator_stop') headers.set('x-hub2-safety-mode', safetyMode);
   let body: ArrayBuffer | undefined;
   if (!['GET', 'HEAD'].includes(request.method)) {
-    const text = await boundedText(request.clone(), BODY_LIMIT);
+    const text = await boundedText(request.clone(), HUB2_FORWARD_BODY_LIMIT);
     const encoded = new TextEncoder().encode(text);
     const copied = new Uint8Array(new ArrayBuffer(encoded.byteLength));
     copied.set(encoded);
