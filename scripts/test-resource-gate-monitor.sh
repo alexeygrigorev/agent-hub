@@ -41,7 +41,7 @@ case "$url" in
       body='<h1>Resource Gate</h1>'
     fi
     ;;
-  https://gate.dtcdev.click/v1/health)
+  'https://gate.dtcdev.click/v1/check?resource=browser&scope=desktop')
     if [[ -z "$config" ]] || ! grep -Fq 'Authorization: Bearer synthetic-monitor-token' "$config"; then
       code=401; body='{"error":"unauthorized"}'
     elif [[ "${CURL_MODE:-success}" == grant-fail || "${CURL_MODE:-success}" == all-fail ]]; then

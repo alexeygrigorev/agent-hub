@@ -4,7 +4,9 @@ set -euo pipefail
 
 HEALTH_URL="${RESOURCE_GATE_HEALTH_URL:-https://gate.dtcdev.click/}"
 HEALTH_MARKER="${RESOURCE_GATE_HEALTH_MARKER:-<h1>Resource Gate</h1>}"
-GATE_CHECK_URL="${RESOURCE_GATE_CHECK_URL:-https://gate.dtcdev.click/v1/health}"
+# Use the underlying read-only grant check so monitoring survives rollback to
+# a valid older Caddyfile; the deploy smoke separately enforces /v1/health.
+GATE_CHECK_URL="${RESOURCE_GATE_CHECK_URL:-https://gate.dtcdev.click/v1/check?resource=browser&scope=desktop}"
 GATE_TOKEN_FILE="${RESOURCE_GATE_TOKEN_FILE:-/var/lib/resource-gate-monitor/gate-token}"
 TOOLS_REMOTE_CONFIG="${AGENT_BROWSER_REMOTE_CONFIG:-/home/alexey/.agent-browser/remotes.json}"
 AGENT_BROWSER_CLI="${AGENT_BROWSER_CLI:-/home/alexey/opt/agent-browser/bin/cli.js}"
