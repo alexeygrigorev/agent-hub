@@ -14,6 +14,8 @@ FAKE_HUB = r'''
 import json, os, sys, pathlib, time
 d = pathlib.Path(os.environ["FAKE_DIR"]); sc = os.environ.get("FAKE_SCENARIO", "ok")
 args = sys.argv[1:]
+with open(d / "argv.jsonl", "a") as recorded:
+    recorded.write(json.dumps(args) + "\n")
 log = open(d / "calls.log", "a"); log.write(" ".join(args) + "\n"); log.close()
 SID = "%s"; NATIVE = "%s"
 def item(state, **kw):
@@ -137,6 +139,21 @@ class CanaryTest(unittest.TestCase):
 
     def calls(self):
         return (self.tmp / "calls.log").read_text()
+
+    def test_actual_canary_argv_is_accepted_by_the_maintained_cli(self):
+        import argparse
+        sys.path.insert(0, str(ROOT / 'host'))
+        from agent_hub_host import session_control
+        parser = argparse.ArgumentParser()
+        session_control.add_commands(parser.add_subparsers(dest='command'))
+        for mode in ('shell', 'full'):
+            result, _ = self.run_canary('ok', '--mode', mode)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        calls = [json.loads(line) for line in (self.tmp / 'argv.jsonl').read_text().splitlines()]
+        self.assertTrue(any(args[:2] == ['sessions', 'capture'] for args in calls))
+        for args in calls:
+            with self.subTest(argv=args[:3]):
+                parser.parse_args(args)
 
     def mails(self):
         return self.sink.read_text().split("---END---")[:-1] if self.sink.exists() else []

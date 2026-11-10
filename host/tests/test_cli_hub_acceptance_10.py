@@ -1,0 +1,433 @@
+"""Offline tests for scripts/hub_acceptance_10.py.
+
+Fake `hub`, `a` and alert-sample binaries are put on PATH; their responses model the maintained CLI contract with synthetic fixtures in
+host/tests/fixtures/acceptance/. No Hub access, no real session is started or stopped."""
+import importlib.util
+import io
+import json
+import os
+import shutil
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest import mock
+
+HERE = Path(__file__).resolve().parent
+FIX = HERE / 'fixtures' / 'acceptance'
+spec = importlib.util.spec_from_file_location('acc10', HERE.parents[1] / 'scripts/hub_acceptance_10.py')
+acc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(acc)
+
+SOL, GLM, MUSE, LUNA = 'gpt-6.1-sol', 'glm-5.3-flash', 'opencode-go/muse-spark-1.3-contributor', 'gpt-6-luna'  # fixture pool
+OK_MODELS = [SOL, GLM, MUSE, SOL, GLM, MUSE, SOL, GLM, LUNA, SOL]
+
+
+def fixture(name):
+    return json.loads((FIX / name).read_text())
+
+
+COMMIT = 'a' * 40
+WORKSPACE = '/home/user/work/acceptance'
+TMP = HERE.parents[1] / '.local/tmp'
+TMP.mkdir(parents=True, exist_ok=True)
+
+
+def evidence(commit=COMMIT, **kw):
+    ev = {'canary': 'success', 'canary_commit': commit, 'ci_e2e': 'success', 'ci_e2e_commit': commit}
+    ev.update(kw)
+    f = tempfile.NamedTemporaryFile('w', suffix='.json', delete=False, dir=TMP)
+    json.dump(ev, f)
+    f.close()
+    unittest.addModuleCleanup(os.unlink, f.name)
+    return f.name
+
+
+class Harness(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix='acc10-', dir=TMP))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.bin = self.tmp / 'bin'
+        self.bin.mkdir()
+        for name in ('hub', 'a', 'alerts'):
+            (self.bin / name).symlink_to(FIX / 'fake_hub.py')
+        self.cfg_path = self.tmp / 'cfg.json'
+        env = {'PATH': '%s:%s' % (self.bin, os.environ['PATH']), 'FAKE_CFG': str(self.cfg_path)}
+        patcher = mock.patch.dict(os.environ, env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name, val in (('CAPTURE_BUDGET_S', 0.5),):
+            p = mock.patch.object(acc, name, val)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def state(self):
+        path = Path(str(self.cfg_path) + '.state')
+        return json.loads(path.read_text()) if path.exists() else {'sessions': {}}
+
+    def go(self, **cfg):
+        cfg.setdefault('models', OK_MODELS)
+        Path(str(self.cfg_path) + '.state').unlink(missing_ok=True)
+        self.cfg_path.write_text(json.dumps(cfg))
+        out = io.StringIO()
+        r = acc.Runner(alerts_cmd=str(self.bin / 'alerts'))
+        rc = acc.run(r, evidence(), COMMIT, workspace=WORKSPACE, sleep=lambda s: time.sleep(0.01), out=out, intake='intake-1')
+        return rc, out.getvalue()
+
+    def assertAllStopped(self):
+        st = self.state()
+        self.assertTrue(st['sessions'])
+        for s in st['sessions'].values():
+            self.assertTrue(s['stopped'], 'leaked session %s' % s['id'])
+
+
+class AcceptanceTests(Harness):
+    def test_pass_prints_shares_stops_all_and_passes_intake(self):
+        rc, out = self.go()
+        self.assertEqual(rc, 0, out)
+        self.assertIn('ACCEPTANCE PASS', out)
+        self.assertEqual(out.count('shares(session.picker)='), 10)
+        self.assertAllStopped()
+        self.assertEqual(len(self.state()['sessions']), 10)
+        self.assertNotIn('pick', self.state()['log'])
+        summary = json.loads(out[out.index('{\n'):out.rindex('\nACCEPTANCE ')])
+        self.assertEqual(len(summary['starts'][0]['picker']['pool']), 4)
+        self.assertEqual(summary['starts'][0]['picker']['policy_version'], 7)
+        # Each capture/list proof is followed by stop before the next start.
+        sequence = [x for x in self.state()['log'] if x == 'start' or x.startswith('stop:')]
+        self.assertEqual(sequence[::2], ['start'] * 10)
+        self.assertEqual(self.state()['log'].count('start:--intake-task-id'), 10)
+
+    def test_same_attempt_snapshot_must_not_change(self):
+        rc, out = self.go(show_pool_changed=True)
+        self.assertEqual(rc, 1, out)
+        self.assertIn('same attempt picker evidence changed', out)
+        self.assertAllStopped()
+
+    def test_actual_current_fallback_pool_and_history(self):
+        rc, out = self.go(fallback=True)
+        self.assertEqual(rc, 0, out)
+        self.assertAllStopped()
+        rc, out = self.go(fallback=True, cross_attempt_pool=True)
+        self.assertEqual(rc, 1)
+        self.assertIn('current chosen model/policy not in the picker pool', out)
+        self.assertAllStopped()
+
+    def test_missing_or_mismatching_actual_evidence_fails_closed(self):
+        for knob, message in [('missing_picker', 'picker evidence missing'),
+                              ('show_missing_picker', 'picker evidence missing'),
+                              ('missing_version', 'policy version missing'),
+                              ('picker_model_mismatch', 'model mismatch'),
+                              ('initial_offered', 'default waited start did not return running')]:
+            with self.subTest(knob=knob):
+                rc, out = self.go(**{knob: True})
+                self.assertEqual(rc, 1, out)
+                self.assertIn(message, out)
+                self.assertAllStopped()
+                self.assertNotIn('pick', self.state()['log'])
+
+    def test_unacknowledged_capture_cannot_prove_output(self):
+        rc, out = self.go(capture_unacked=True)
+        self.assertEqual(rc, 1)
+        self.assertIn('no completed tool output', out)
+        self.assertAllStopped()
+
+    def test_refuses_without_ready_env(self):
+        os.environ.pop('HUB_ACCEPTANCE_READY', None)
+        self.assertEqual(acc.main(['--live']), 2)
+        self.assertEqual(acc.main([]), 2)
+
+    def test_acceptance_criteria_source_required(self):
+        self.cfg_path.write_text(json.dumps({'models': OK_MODELS}))
+        out = io.StringIO()
+        rc = acc.run(acc.Runner(alerts_cmd=str(self.bin / 'alerts')), evidence(), COMMIT, workspace=WORKSPACE, out=out)
+        self.assertEqual(rc, 1)
+        self.assertIn('acceptance criteria source missing', out.getvalue())
+        self.assertEqual(self.state()['sessions'], {}, 'must not start anything')
+
+    def test_start_failure_ends_run(self):
+        rc, out = self.go(fail_start_at=3)
+        self.assertEqual(rc, 1)
+        self.assertIn('start failed', out)
+        # A definite refusal ends the run and must not trigger a new launch via replay.
+        self.assertEqual(len(self.state()['sessions']), 3)
+        self.assertAllStopped()
+
+    def test_wait_failure_with_id_leaks_nothing(self):
+        rc, out = self.go(leak_at=2)
+        self.assertEqual(rc, 1)
+        self.assertIn('after creating session', out)
+        self.assertAllStopped()
+
+    def test_wait_failure_without_id_reconciled_by_key(self):
+        rc, out = self.go(leak_at=0, leak_with_id=False)
+        self.assertEqual(rc, 1)
+        self.assertEqual(len(self.state()['sessions']), 1)
+        self.assertAllStopped()
+
+    def test_every_ambiguous_start_recovers_using_only_original_key_and_request(self):
+        for knob in ('accepted_nonjson', 'accepted_502', 'initial_missing_id', 'initial_bad_id'):
+            with self.subTest(knob=knob):
+                rc, out = self.go(**{knob: True})
+                self.assertEqual(rc, 1, out)
+                self.assertAllStopped()
+                requests = self.state()['start_requests']
+                self.assertEqual(len(requests), 2)
+                self.assertEqual(requests[1], requests[0] + ['--no-wait'])
+                self.assertEqual(len(self.state()['sessions']), 1)
+                self.assertNotIn('cleanup uncertain', out)
+
+    def test_final_cleanup_retries_one_failed_recovery_receipt(self):
+        rc, out = self.go(accepted_nonjson=True, replay_failure_count=1)
+        self.assertEqual(rc, 1)
+        self.assertAllStopped()
+        requests = self.state()['start_requests']
+        self.assertEqual(len(requests), 3)
+        self.assertEqual(requests[1], requests[2])
+        self.assertEqual(requests[1], requests[0] + ['--no-wait'])
+        self.assertNotIn('cleanup uncertain', out)
+
+    def test_unrecoverable_receipts_report_uncertainty_and_original_key(self):
+        for config in ({'replay_failure_count': 2}, {'bad_recovered_id': True}):
+            with self.subTest(config=config):
+                rc, out = self.go(accepted_nonjson=True, **config)
+                self.assertEqual(rc, 1)
+                summary = json.loads(out[out.index('{\n'):out.rindex('\nACCEPTANCE ')])
+                record = summary['starts'][0]
+                self.assertTrue(record['cleanup_uncertain'])
+                self.assertIsNone(record.get('id'))
+                self.assertIn('cleanup uncertain', out)
+                self.assertIn('original key ' + record['key'], out)
+                requests = self.state()['start_requests']
+                self.assertEqual(len(requests), 3)
+                self.assertEqual(requests[1], requests[2])
+                self.assertEqual(requests[1], requests[0] + ['--no-wait'])
+                self.assertEqual(len(self.state()['sessions']), 1)
+                self.assertFalse(next(iter(self.state()['sessions'].values()))['stopped'])
+                self.assertFalse(any(x.startswith('stop:') for x in self.state()['log']))
+
+    def test_uncertain_later_receipt_preserves_cleanup_of_all_known_owned_sessions(self):
+        rc, out = self.go(accepted_nonjson_at=2, replay_failure_count=2)
+        self.assertEqual(rc, 1)
+        sessions = list(self.state()['sessions'].values())
+        self.assertEqual(len(sessions), 3)
+        self.assertTrue(all(s['stopped'] for s in sessions[:2]))
+        self.assertFalse(sessions[2]['stopped'])  # explicitly unknown to the client, never falsely reported clean
+        summary = json.loads(out[out.index('{\n'):out.rindex('\nACCEPTANCE ')])
+        self.assertTrue(summary['starts'][2]['cleanup_uncertain'])
+        self.assertEqual(len(self.state()['start_requests']), 5)  # two good, one lost, two same-key receipts
+
+    def test_blocking_start_hits_deadline_and_is_cleaned_up(self):
+        with mock.patch.object(acc, 'RUNNING_BUDGET_S', 1):
+            t0 = time.monotonic()
+            rc, out = self.go(hang_start_at=0)
+            self.assertLess(time.monotonic() - t0, 25)
+        self.assertEqual(rc, 1)
+        self.assertIn('timeout', out)
+        self.assertAllStopped()
+
+    def test_astra_picked(self):
+        rc, out = self.go(models=['astra-1'] + OK_MODELS[1:])
+        self.assertEqual(rc, 1)
+        self.assertIn('astra picked', out)
+
+    def test_luna_over_three(self):
+        rc, out = self.go(models=[LUNA] * 4 + [SOL, GLM, MUSE, SOL, GLM, MUSE])
+        self.assertEqual(rc, 1)
+        self.assertIn('luna 4 > 3', out)
+
+    def test_luna_on_degraded_pool(self):
+        one = [fixture('hub_sessions_pick.json')['pool'][0]]
+        one[0]['share'] = 1.0
+        rc, out = self.go(pool=one, models=[LUNA] * 10)
+        self.assertEqual(rc, 1)
+        self.assertIn('luna picked from a degraded one-model pool', out)
+
+    def test_too_few_distinct_models(self):
+        rc, out = self.go(models=[SOL, GLM] * 5)
+        self.assertEqual(rc, 1)
+        self.assertIn('2 distinct models < 3', out)
+
+    def test_missing_or_empty_pool_fails(self):
+        rc, out = self.go(pool=[{'policy_id': 'p', 'model': 'sol', 'share': 0}])
+        self.assertEqual(rc, 1)
+        self.assertIn('invalid or zero share', out)
+        rc, out = self.go(missing_picker=True)
+        self.assertEqual(rc, 1)
+        self.assertIn('picker evidence missing', out)
+
+    def test_model_not_in_pool_shares(self):
+        rc, out = self.go(models=['unlisted'] * 10)
+        self.assertEqual(rc, 1)
+        self.assertIn('not in the picker pool shares', out)
+
+    def test_missing_host_and_workspace(self):
+        rc, out = self.go(list_no_host=True)
+        self.assertIn("host None != hetzner-aplexer", out)
+        rc, out = self.go(list_no_workspace=True)
+        self.assertIn('workspace path missing', out)
+        self.assertEqual(rc, 1)
+        rc, out = self.go(host='other-host')
+        self.assertIn("host 'other-host'", out)
+
+    def test_flat_show_is_rejected(self):
+        rc, out = self.go(flat_show=True)
+        self.assertEqual(rc, 1)
+        self.assertIn('show response is not', out)
+
+    def test_capture_prompt_only(self):
+        rc, out = self.go(capture_prompt_only=True)
+        self.assertEqual(rc, 1)
+        self.assertIn('no completed tool output beyond the prompt', out)
+
+    def test_stop_not_confirmed(self):
+        rc, out = self.go(stop_not_confirmed=True)
+        self.assertEqual(rc, 1)
+        self.assertIn('!= stopped', out)
+
+    def test_native_lingers_after_stop_but_exited_rows_do_not_count(self):
+        with mock.patch.object(acc, 'STOP_BUDGET_S', 6):
+            rc, out = self.go(native_lingers=True, fail_start_at=1)
+        self.assertEqual(rc, 1)
+        self.assertIn('still listed', out)
+        rc, out = self.go(a_list_includes_exited=True)
+        self.assertEqual(rc, 0, out)
+
+    def test_alert_during_run(self):
+        rc, out = self.go(alert_during=True)
+        self.assertEqual(rc, 1)
+        self.assertIn('dev alert occurrences during run: 1', out)
+        self.assertNotIn('ACCEPTANCE PASS', out)
+
+    def test_transient_resolved_and_deduplicated_alert_occurrences_fail(self):
+        for knob in ('alert_transient', 'alert_dedup'):
+            with self.subTest(knob=knob):
+                rc, out = self.go(**{knob: True})
+                self.assertEqual(rc, 1)
+                self.assertIn('dev alert occurrences during run: 1', out)
+                self.assertAllStopped()
+                summary = json.loads(out[out.index('{\n'):out.rindex('\nACCEPTANCE ')])
+                self.assertEqual(summary['alert_watermarks']['before']['count'], 40)
+                self.assertEqual(summary['alert_watermarks']['after']['count'], 41)
+
+    def test_occurrence_contract_fails_closed_on_missing_active_only_or_stale_source(self):
+        for knob in ('active_ids_only', 'alert_stale', 'alert_missing_metadata', 'alert_wrong_recipient'):
+            with self.subTest(knob=knob):
+                rc, out = self.go(**{knob: True})
+                self.assertEqual(rc, 1)
+                self.assertIn('alert baseline unavailable', out)
+                self.assertEqual(self.state()['sessions'], {})
+        for knob in ('alert_reset', 'alert_generation_change', 'alert_post_stale'):
+            with self.subTest(knob=knob):
+                rc, out = self.go(**{knob: True})
+                self.assertEqual(rc, 1)
+                self.assertTrue('alert watermark' in out, out)
+                self.assertAllStopped()
+
+    def test_fresh_cached_post_watermark_must_cover_end_of_run(self):
+        rc, out = self.go(alert_cached_post=True)
+        self.assertEqual(rc, 1, out)
+        self.assertIn('post-run alert watermark predates end-of-run cutoff', out)
+        self.assertAllStopped()
+        summary = json.loads(out[out.index('{\n'):out.rindex('\nACCEPTANCE ')])
+        evidence = summary['alert_watermarks']
+        before, after = evidence['before'], evidence['after']
+        self.assertEqual(after['generation'], before['generation'])
+        self.assertEqual(after['count'], before['count'])
+        self.assertGreater(after['observed_at_ms'], before['observed_at_ms'])
+        self.assertLess(after['observed_at_ms'], evidence['required_post_observed_at_ms'])
+        self.assertLess(evidence['required_post_observed_at_ms'] - after['observed_at_ms'], acc.ALERT_SAMPLE_MAX_AGE_MS)
+        self.assertNotIn('stale or from the future', out)
+        self.assertNotIn('reset or observation time regressed', out)
+
+    def test_historical_occurrences_do_not_count_but_broken_sampler_fails_closed(self):
+        rc, out = self.go(alert_count_before=40)
+        self.assertEqual(rc, 0, out)
+        rc, out = self.go(alerts_broken=True)
+        self.assertEqual(rc, 1)
+        self.assertIn('alert baseline unavailable', out)
+        self.assertEqual(self.state()['sessions'], {})
+
+
+class ParserTests(unittest.TestCase):
+    """Synthetic fixtures use the actual CLI response schema, not live success evidence."""
+
+    def test_show_is_wrapped(self):
+        sess = acc.session_of(fixture('hub_sessions_show.json'))
+        self.assertEqual(sess['machine_id'], 'hetzner-aplexer')
+        self.assertEqual(acc.row_host(sess), 'hetzner-aplexer')
+        with self.assertRaises(RuntimeError):
+            acc.session_of(sess)  # flat shape
+
+    def test_list_rows_and_workspace_from_evidence(self):
+        rows = acc.list_rows(fixture('hub_sessions_list.json'))
+        self.assertEqual(acc.row_host(rows[0]), 'hetzner-aplexer')
+        self.assertTrue(acc.row_workspace(rows[0]).startswith('/'))
+        with self.assertRaises(RuntimeError):
+            acc.list_rows({'nothing': 1})
+
+    def test_pool_fixture_valid_and_bad_pools_rejected(self):
+        self.assertEqual(acc.pool_problems(fixture('hub_sessions_pick.json')['pool']), [])
+        for bad in (None, [], [{'share': 0}], [{'share': float('nan')}], [{'share': 0.2}, {'share': 0.2}]):
+            self.assertTrue(acc.pool_problems(bad), bad)
+
+    def test_live_natives_ignores_exited(self):
+        rows = fixture('a_list_running.json')
+        rows.append(dict(rows[0], id='gone', state='exited'))
+
+        class R:
+            def json(self, *a):
+                return rows
+        self.assertEqual(acc.live_natives(R(), 5), {rows[0]['id']})
+
+    def test_evidence_fail_closed(self):
+        for ev, commit, msg in [(None, 'abc', 'evidence'), (evidence(commit='zzz'), 'abc', '!='),
+                                (evidence(canary='failure'), 'abc', 'not green'),
+                                (evidence(), None, 'commit unknown'), ('/nonexistent', 'abc', 'unreadable')]:
+            problems = acc.check_evidence(ev, commit)
+            self.assertTrue(any(msg in p for p in problems), (msg, problems))
+        self.assertEqual(acc.check_evidence(evidence(), COMMIT), [])
+
+    def test_watermark_requires_fresh_strict_metadata_and_monotonic_observations(self):
+        good = dict(kind='dev_alert_occurrences_v1', recipient='dev@dtcdev.click',
+                    generation='synthetic-epoch', count=0, observed_at_ms=100000)
+        class R:
+            def __init__(self, data): self.data = data
+            def json(self, *args): return self.data
+        self.assertEqual(acc.sample_alerts(R(good), wall_clock=lambda: 100), good)
+        for patch in ({'count': True}, {'count': -1}, {'count': 0.5}, {'generation': ''},
+                      {'observed_at_ms': True}, {'observed_at_ms': 39000}, {'observed_at_ms': 105001}):
+            with self.subTest(patch=patch), self.assertRaises(RuntimeError):
+                acc.sample_alerts(R(dict(good, **patch)), wall_clock=lambda: 100)
+        self.assertEqual(acc.alert_changes(good, good), [])
+        self.assertTrue(acc.alert_changes(good, dict(good, observed_at_ms=99999)))
+
+    def test_probe_ignores_prompt_echo(self):
+        prompt, exp = acc.make_probe()
+        self.assertNotIn(exp, prompt)
+        self.assertFalse(acc.probe_output_ok(prompt, prompt, exp))
+        self.assertTrue(acc.probe_output_ok(prompt + '\n' + exp, prompt, exp))
+        for event in [
+            {'type': 'item.started', 'item': {'type': 'command_execution', 'aggregated_output': exp}},
+            {'type': 'item.completed', 'item': {'type': 'command_execution', 'command': exp}},
+            {'type': 'reasoning', 'text': exp}, {'prompt': exp},
+        ]:
+            self.assertFalse(acc.probe_output_ok(json.dumps(event), prompt, exp), event)
+        event = {'type': 'item.completed', 'item': {'type': 'command_execution', 'aggregated_output': exp + '\n'}}
+        self.assertTrue(acc.probe_output_ok(json.dumps(event), prompt, exp))
+
+    def test_current_picker_strict_contract(self):
+        import copy
+        row = fixture('hub_sessions_show.json')['session']
+        self.assertEqual(acc.picker_problems(row['picker'], row), [])
+        for mutate in [lambda p: p.update(attempt=1.0), lambda p: p.update(policy_version=None),
+                       lambda p: p['history'][0].update(machine_id=''),
+                       lambda p: p['pool'][0].update(share=0.8),
+                       lambda p: p['pool'][0].update(weight=float('inf'))]:
+            picker = copy.deepcopy(row['picker']); mutate(picker)
+            self.assertTrue(acc.picker_problems(picker, row))
+
+
+
+if __name__ == '__main__':
+    unittest.main()

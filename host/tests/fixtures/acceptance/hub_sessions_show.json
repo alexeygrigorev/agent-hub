@@ -1,0 +1,69 @@
+{
+  "session": {
+    "id": "00000000-0000-0000-0000-000000000001",
+    "native_id": "native-example",
+    "state": "running",
+    "machine_id": "hetzner-aplexer",
+    "workspace": "/home/user/work/acceptance",
+    "operation_id": "00000000-0000-0000-0000-000000000001:0",
+    "picker": {
+      "policy_id": "codex-sol-medium",
+      "engine": "codex",
+      "model": "gpt-6.1-sol",
+      "effort": "medium",
+      "policy_version": 7,
+      "machine_id": "hetzner-aplexer",
+      "attempt": 0,
+      "pool": [
+        {
+          "policy_id": "codex-luna-max",
+          "engine": "codex",
+          "model": "gpt-6-luna",
+          "effort": "max",
+          "weight": 60,
+          "share": 0.25
+        },
+        {
+          "policy_id": "codex-sol-medium",
+          "engine": "codex",
+          "model": "gpt-6.1-sol",
+          "effort": "medium",
+          "weight": 94,
+          "share": 0.39166666666666666
+        },
+        {
+          "policy_id": "go-muse",
+          "engine": "go",
+          "model": "opencode-go/muse-spark-1.3-contributor",
+          "effort": null,
+          "weight": 13,
+          "share": 0.05416666666666667
+        },
+        {
+          "policy_id": "zai-glm-flash",
+          "engine": "zai",
+          "model": "glm-5.3-flash",
+          "effort": null,
+          "weight": 73,
+          "share": 0.30416666666666664
+        }
+      ],
+      "history": [
+        {
+          "policy_id": "codex-sol-medium",
+          "engine": "codex",
+          "model": "gpt-6.1-sol",
+          "effort": "medium",
+          "policy_version": 7,
+          "machine_id": "hetzner-aplexer",
+          "attempt": 0
+        }
+      ]
+    },
+    "engine": "codex",
+    "model": "gpt-6.1-sol",
+    "effort": "medium",
+    "policy_id": "codex-sol-medium",
+    "policy_version": 7
+  }
+}
