@@ -227,7 +227,7 @@ class Canary:
             attempt += 1
             key = f"canary-capture-{self.run_id}-{attempt}"
             rc, raw, _ = self.run([*self.hub, "sessions", "capture", self.session, "--key", key,
-                                   "--max-bytes", "4096", "--json"], deadline=deadline)
+                                   "--max-bytes", "4096"], deadline=deadline)
             out = ''
             if rc == 0:
                 try:
