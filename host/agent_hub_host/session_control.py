@@ -40,12 +40,11 @@ _request_deadline = contextvars.ContextVar('session_request_deadline', default=N
 # Terminal command states: only these confirm an outcome. `transported` alone
 # is fetch/PTY bytes, never processing proof; waiting never treats it as done.
 TERMINAL_COMMAND = ('acked', 'refused', 'uncertain', 'failed')
-TERMINAL_SESSION = ('running', 'stopped', 'failed', 'refused', 'held', 'uncertain', 'cancelled')
+TERMINAL_SESSION = ('running', 'stopped', 'failed', 'refused', 'uncertain', 'cancelled')
 
 SAFE_ERROR = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
-# Match the normal JSON response bound in api.safe_http_json. A held-session
-# DTO can exceed 4 KiB when it includes per-route memory/admission evidence.
-MAX_ERROR_RESPONSE = 10 * 1024 * 1024
+# Error bodies are small; refuse unexpectedly large responses before parsing.
+MAX_ERROR_RESPONSE = 64 * 1024
 
 
 class SessionHTTPError(ValueError):
@@ -89,7 +88,7 @@ def diagnostic(exc):
         msg = str(exc).strip()
         if msg:
             return msg
-    return f'Session operation failed ({type(exc).__name__}); check authentication, grants, capacity and current versions.'
+    return f'Session operation failed ({type(exc).__name__}); check authentication, session permissions and current versions.'
 
 
 def hub_unavailable(exc):
@@ -118,9 +117,7 @@ def replay_notice(exc, delay):
 
 
 def http_error(exc, key=None):
-    # Surface the server error code (top-level or inside a 409 hold
-    # payload) plus the held session id, so the receiver can classify
-    # terminal vs retryable failures without a follow-up call.
+    # Surface the server error code and useful bounded details.
     # Best-effort: an unreadable body keeps the status-only form.
     name = ''
     code = 'request_failed'
@@ -129,10 +126,8 @@ def http_error(exc, key=None):
     reason = None
     pending = False
     pending_state = None
-    routes = ''
-    held_info = ''
     provider_guidance = ''
-    concurrency_guidance = ''
+    cap_guidance = ''
     try:
         raw = exc.read(MAX_ERROR_RESPONSE + 1) if hasattr(exc, 'read') else b''
         if len(raw) > MAX_ERROR_RESPONSE:
@@ -141,12 +136,7 @@ def http_error(exc, key=None):
             data = {}
         else:
             data = json.loads((raw or b'').decode('utf-8', 'replace'))
-        hold = data.get('hold') if isinstance(data, dict) else None
         err = data.get('error') if isinstance(data, dict) else None
-        if (not isinstance(err, str) or not err) and isinstance(hold, dict):
-            err = hold.get('error')
-        elif (not isinstance(err, str) or not err) and isinstance(hold, str):
-            err = hold
         if isinstance(err, str) and err and SAFE_ERROR.match(err):
             code = err
             name = ' (%s)' % err
@@ -169,18 +159,7 @@ def http_error(exc, key=None):
                 if ids:
                     name += ' matches: ' + ', '.join(ids[:100])
             if err == 'provider_disabled':
-                provider_guidance = ' requested provider disabled by model policy; choose an enabled engine/model or ask the policy owner to enable it and register a fresh host route with verified quota'
-        rejection = hold if isinstance(hold, dict) else data
-        if isinstance(rejection, dict) and isinstance(rejection.get('rejected'), list):
-            reasons = sorted({r['reason'] for r in rejection['rejected'][:100]
-                              if isinstance(r, dict) and isinstance(r.get('reason'), str)
-                              and re.fullmatch(r'[a-z][a-z_]{0,63}', r['reason'])})
-            if reasons:
-                routes = ' routes: ' + ', '.join(reasons)
-                if 'account_concurrency' in reasons:
-                    concurrency_guidance = '; configured account concurrency limit reached; quota is healthy'
-        if isinstance(hold, dict) and isinstance(data.get('id'), str) and data.get('id'):
-            held_info = ' held session %s state %s' % (data['id'], data.get('state'))
+                provider_guidance = ' requested engine/model is disabled by policy; choose an allowed model or ask the policy owner to change the model pool'
         if isinstance(data, dict):
             f = data.get('field')
             if isinstance(f, str) and SAFE_ERROR.match(f):
@@ -196,18 +175,18 @@ def http_error(exc, key=None):
                 st = data.get('state')
                 if isinstance(st, str) and SAFE_ERROR.match(st):
                     pending_state = st
+            if code == 'active_session_limit':
+                active, limit = data.get('active_count'), data.get('limit')
+                if type(active) is int and type(limit) is int and 0 <= active <= 10000 and 1 <= limit <= 10000:
+                    cap_guidance = f'; {active} live active sessions of {limit}; stop an active session and retry'
     except Exception:
         name = ''
 
     parts = [f'Session HTTP request failed with status {exc.code}{name}']
     if provider_guidance:
         parts.append(provider_guidance)
-    if routes:
-        parts.append(routes)
-    if concurrency_guidance:
-        parts.append(concurrency_guidance)
-    if held_info:
-        parts.append(held_info)
+    if cap_guidance:
+        parts.append(cap_guidance)
     if pending:
         parts.append(f'; session is {pending_state or "starting"} and not yet bound; retry shortly')
     if reason:
@@ -477,7 +456,7 @@ def wait_for_session(session_id, timeout, interval, *, stopping=False):
     deadline = time.monotonic() + timeout
     return wait_until(deadline, interval,
                      lambda: request('GET', '/api/sessions/' + session_id),
-                     lambda view: view.get('state') in (('stopped', 'failed', 'refused', 'held', 'uncertain') if stopping else TERMINAL_SESSION),
+                     lambda view: view.get('state') in (('stopped', 'failed', 'refused', 'uncertain') if stopping else TERMINAL_SESSION),
                      'Session wait')
 
 
@@ -580,7 +559,7 @@ def threshold_path(args, path):
 
 
 def add_commands(sub):
-    root = sub.add_parser('sessions', help='Hub session orchestration: grouped lifecycle listing by default; list/start/send/capture/stop/cleanup/observe')
+    root = sub.add_parser('sessions', help='Hub session orchestration: grouped lifecycle listing by default; list/start/send/capture/stop/reap/cleanup/observe')
     commands = root.add_subparsers(dest='sessions_cmd', required=False)
     listing = commands.add_parser('list', help='List sessions visible to this credential')
     listing.add_argument('--threshold', help='Long-running threshold (default 3h; HUB_SESSION_WARNING_THRESHOLD)')
@@ -593,6 +572,9 @@ def add_commands(sub):
     count.add_argument('--by', default='host,engine,account',
                        help='Comma-separated grouping: any of host,engine,account (default host,engine,account)')
     count.add_argument('--json', action='store_true', help='Output machine-readable JSON')
+    reap = commands.add_parser('reap', help='Find and stop inactive Hub sessions across hosts')
+    reap.add_argument('--dry-run', action='store_true', help='Show inactive sessions without stopping or marking them stopped')
+    reap.add_argument('--json', action='store_true', help='Output machine-readable JSON')
     first_try = commands.add_parser('first-attempt-report', help='First-attempt outcome ledger: per-cause counts and examples for one Berlin-day window (intake 95fd7f1a)')
     first_try.add_argument('--day', required=True, help='Berlin calendar day YYYY-MM-DD')
     first_try.add_argument('--examples', type=int, default=3, help='Example sessions per cause (0..10, default 3)')
@@ -610,7 +592,7 @@ def add_commands(sub):
                        help='Explanation for an explicit deep-tier or engine choice (required with --tier deep or --engine)')
     start.add_argument('--machine')
     start.add_argument('--needs', action='append', default=None,
-                       help='Label filter (repeatable, e.g. --needs os:windows --needs arch:arm64); eligible machines must satisfy all needs, else held with rejected[] reason needs_unmet')
+                       help='Capability hints passed with the launch request (repeatable)')
     start.add_argument('--workspace', default=None, help='Configured workspace label or absolute path on the target host (omit with --repo)')
     start.add_argument('--repo', default=None, help='Repository owner/name; the placed host (any OS) clones its own fresh work tree from origin/main, so no host path is needed')
     start.add_argument('--force', action='store_true', help='Operator only: start despite unresolved intake dependencies')
@@ -677,13 +659,13 @@ def add_commands(sub):
     capture.set_defaults(wait=True)
     capture.add_argument('--no-wait', dest='wait', action='store_false',
                          help='Return the queued command receipt without waiting for capture output')
-    stop = commands.add_parser('stop', help='Enqueue stop; the hub releases capacity only on confirmed native exit')
+    stop = commands.add_parser('stop', help='Stop a session; confirmed native exit frees a live-session slot immediately')
     stop.add_argument('id')
     stop.add_argument('--key', help='Stable idempotency key; printed back for safe retry after lost responses')
     add_wait(stop, timeout=30.0, interval=1.0)
     stop.set_defaults(wait=True)
     stop.add_argument('--no-wait', dest='wait', action='store_false', help='Record the stop intent without waiting for verified exit')
-    cancel = commands.add_parser('cancel', help='Cancel an owned held, queued or unclaimed offered intent before native start')
+    cancel = commands.add_parser('cancel', help='Cancel an owned queued or unclaimed offered intent before native start')
     cancel.add_argument('id')
     cancel.add_argument('--key', required=True, help='Stable cancellation key, reused exactly after a lost response')
     protect = commands.add_parser('protect', help='Permanently protect an owned session from automated cleanup; never stops it')
@@ -821,7 +803,7 @@ def wait_until_bound(session_id, interval, timeout=BIND_WAIT_TIMEOUT):
             state = row.get('state')
             if state == 'running':
                 return True
-            if state not in ('queued', 'held', 'offered', 'starting', 'uncertain'):
+            if state not in ('queued', 'offered', 'starting', 'uncertain'):
                 return False  # terminal or unknown: no bind is coming
         remaining = end - time.monotonic()
         if remaining <= 0:
@@ -923,6 +905,8 @@ def _execute(args):
         from urllib.parse import quote
         by = normalize_breakdown_dims(getattr(args, 'by', None))
         return request('GET', '/api/sessions?view=breakdown&by=' + quote(','.join(by), safe=','))
+    if cmd == 'reap':
+        return request('POST', '/api/sessions/reap', {'dry_run': bool(getattr(args, 'dry_run', False))})
     if cmd == 'first-attempt-report':
         from .first_attempt_outcome import berlin_day_range, report_for_day
         day = getattr(args, 'day', None)
@@ -1479,6 +1463,11 @@ def render_output(args, result):
         return render_tree(result)
     if cmd == 'count':
         return render_breakdown(result)
+    if cmd == 'reap':
+        mode = 'dry run' if result.get('dry_run') else 'applied'
+        return (f"Reaper {mode}: {result.get('reaped', 0)} sessions stopped; "
+                f"live active count {result.get('active_count_before', '?')} -> {result.get('active_count_after', '?')}; "
+                f"stop requests pending {result.get('stop_requested', 0)}.")
     if cmd == 'list':
         sessions = result.get('sessions', []) if isinstance(result, dict) else (result if isinstance(result, list) else [])
         text = render_table(sessions)

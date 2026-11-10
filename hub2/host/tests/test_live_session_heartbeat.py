@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from agent_hub_host.agent import Bridge, Journal, RESOURCE_HEARTBEAT_SECONDS
+from agent_hub_host.agent import Bridge, Journal, LIVE_SESSION_HEARTBEAT_SECONDS
 
 
 class _StopServe(BaseException):
@@ -36,8 +36,8 @@ class _Client:
         self.heartbeats = []
         self.requests = []
 
-    def heartbeat(self, labels, engines=None, capabilities=None, resources=None):
-        self.heartbeats.append((labels, engines, capabilities, resources))
+    def heartbeat(self, labels, engines=None, capabilities=None, native_sessions=None):
+        self.heartbeats.append((labels, engines, capabilities, native_sessions))
 
     def socket(self, machine_id):
         self.machine_id = machine_id
@@ -48,9 +48,9 @@ class _Client:
         return {}
 
 
-class ResourceHeartbeatTests(unittest.TestCase):
-    def test_idle_socket_wakes_for_bounded_resource_heartbeat_without_offer_polling(self):
-        self.assertEqual(RESOURCE_HEARTBEAT_SECONDS, 240)
+class LiveSessionHeartbeatTests(unittest.TestCase):
+    def test_idle_socket_refreshes_live_session_snapshot_without_offer_polling(self):
+        self.assertEqual(LIVE_SESSION_HEARTBEAT_SECONDS, 30)
         clock = [0.0]
         socket = _IdleSocket(clock)
         client = _Client(socket)
@@ -70,8 +70,6 @@ class ResourceHeartbeatTests(unittest.TestCase):
                 with (
                     patch("agent_hub_host.agent.time.monotonic", side_effect=lambda: clock[0]),
                     patch("agent_hub_host.agent.time.time", return_value=1000),
-                    patch("agent_hub_host.agent.native_launch.available_memory_mb", return_value=4096),
-                    patch("agent_hub_host.agent.native_launch.cpu_load_pct", return_value=12),
                     self.assertRaises(_StopServe),
                 ):
                     bridge.serve("machine-1", ["worker"])
@@ -79,12 +77,8 @@ class ResourceHeartbeatTests(unittest.TestCase):
                 bridge.journal.db.close()
 
         self.assertEqual(len(client.heartbeats), 2)
-        self.assertEqual(socket.timeouts[0], RESOURCE_HEARTBEAT_SECONDS)
-        self.assertEqual(client.heartbeats[1][3], {
-            "mem_available_mb": 4096,
-            "observed_at": 1_000_000,
-            "cpu_load_pct": 12,
-        })
+        self.assertEqual(socket.timeouts[0], LIVE_SESSION_HEARTBEAT_SECONDS)
+        self.assertEqual(client.heartbeats[1][3], [])
         self.assertNotIn(("GET", "/api/offers", None, None), client.requests)
 
 

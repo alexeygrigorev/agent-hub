@@ -14,14 +14,12 @@ from .client import ApiError, private_file, save_config
 from . import native_launch
 from .native_launch import NativeLauncher, canonical, native_returncode, same_workspace
 
-# The Hub treats a host snapshot older than 300 s as stale and refuses placement
-# (host_resources_stale), so beat well inside that window.
-RESOURCE_HEARTBEAT_SECONDS = 60
+# Keep the live native-session census fresh for the global Hub session limit.
+LIVE_SESSION_HEARTBEAT_SECONDS = 30
 
 
-def run_heartbeat_loop(beat, stop, interval=RESOURCE_HEARTBEAT_SECONDS):
-    """Keep the resource snapshot fresh while the serve loop is busy (a long launch or reconcile
-    otherwise blocks it past the Hub's staleness window). A failed beat is retried next interval."""
+def run_heartbeat_loop(beat, stop, interval=LIVE_SESSION_HEARTBEAT_SECONDS):
+    """Keep live native-session snapshots fresh while launch/reconcile work is busy."""
     while not stop.wait(interval):
         try:
             beat()
@@ -79,9 +77,8 @@ class Bridge:
         self.client, self.journal, self.runner = client, journal, runner
         self.roots = [Path(root).resolve(strict=True) for root in roots]
         self.engines = set(engines)
-        # Native launch path: the Hub Resource Manager owns admission; the host
-        # spawns admitted plans directly through aplexer. The external launcher
-        # runtime is no longer consulted for admission or spawn.
+        # The Hub picks a route; the host spawns it directly through aplexer.
+        # The external launcher runtime is not consulted for admission or spawn.
         self.launcher = NativeLauncher(launcher_config or {}, runner, aplexer=executable, journal=journal)
         self.machine_id=machine_id
         self.budget_paused_until=0
@@ -335,10 +332,12 @@ class Bridge:
             return result
         row = db.execute("SELECT * FROM launches WHERE session_id=?", (command.get("session_id"),)).fetchone()
         kind = command.get("kind")
-        if row and row["epoch"] == command.get("epoch") and row["state"] == "launching" and not row["native_id"]:
-            # command() and offer() run on the same thread, so a launching row seen
-            # here lost its dispatch before the native identity was recorded; there
-            # is no verified process to signal and the stop succeeds by construction.
+        if not row or row["epoch"] != command.get("epoch"):
+            raise ValueError("command_fence_conflict")
+        native_id, _status = self.resolve_launch_native(row)
+        if not native_id and row["state"] == "launching":
+            # A stop for an interrupted launch is confirmed only after the
+            # supervisor lookup by session tag finds no native process.
             if kind != "stop":
                 raise ValueError("command_fence_conflict")
             result = {"stopped": True}
@@ -348,7 +347,7 @@ class Bridge:
             self.journal.emit(f"command:{identity}", f"/api/sessions/{command['session_id']}/commands/{identity}/ack?safety=operator_stop",
                               {"epoch": command["epoch"], "result": result})
             return result
-        if not row or row["epoch"] != command.get("epoch") or not row["native_id"]:
+        if not native_id:
             raise ValueError("command_fence_conflict")
         if kind not in {"capture", "send", "stop"}:
             raise ValueError("command_not_allowed")
@@ -357,17 +356,17 @@ class Bridge:
         with db:
             db.execute("INSERT INTO commands VALUES(?,?,'executing',NULL)", (identity, digest))
         if kind == "capture":
-            result = {"output": self.native("capture", row["native_id"], "--screen", "--plain").stdout[:16384]}
+            result = {"output": self.native("capture", native_id, "--screen", "--plain").stdout[:16384]}
         elif kind == "stop":
-            self.native("kill", row["native_id"])
-            status = self.lookup(row["native_id"], row)
+            self.native("kill", native_id)
+            status = self.lookup(native_id, row)
             result = {"stopped": bool(status and status.get("phase", status.get("state")) == "exited"
                                       and status.get("containment_empty") is True)}
         else:
             text = command.get("text")
             if not isinstance(text, str) or len(text.encode()) > 16384:
                 raise ValueError("invalid_command_text")
-            self.native("send", row["native_id"], "--stdin", "--enter", input=text, timeout=60)
+            self.native("send", native_id, "--stdin", "--enter", input=text, timeout=60)
             result = {"delivery": "native_acknowledged"}
         with db:
             db.execute("UPDATE commands SET state='done',result=? WHERE id=?", (canonical(result), identity))
@@ -398,25 +397,50 @@ class Bridge:
         except (RuntimeError, ValueError) as error:
             if isinstance(error,ApiError) and error.retry_at:
                 raise
-            reason = str(error)
+            reason = error.code if isinstance(error,ApiError) and error.code else str(error)
             if not re.fullmatch(r"[a-z_]{1,80}", reason):
                 reason = "host_operation_failed"
             target = event.get("command") or event.get("message") or event.get("offer") or {}
             socket.send(canonical({"type": "host.error", "reason": reason,
                                    "session_id": target.get("session_id"), "operation_id": target.get("operation_id"),
                                    "message_id": target.get("id")}))
+    def live_sessions(self):
+        rows=self.journal.db.execute("SELECT session_id,epoch,native_id,tag,workspace,state FROM launches WHERE state IN ('launching','running','aborting') ORDER BY session_id LIMIT 100").fetchall()
+        result=[]
+        for row in rows:
+            native_id,status=self.resolve_launch_native(row)
+            phase=str((status or {}).get('phase',(status or {}).get('state',
+                'launching' if row['state']=='launching' else 'missing')))
+            activity=(status or {}).get('last_activity_ms',(status or {}).get('updated_at_ms',(status or {}).get('created_at_ms')))
+            if type(activity) is not int:activity=None
+            exit_code=native_returncode((status or {}).get('exit') or {}) if phase=='exited' else None
+            result.append({'session_id':row['session_id'],'native_id':native_id,'phase':phase,
+                           'last_activity_at':activity,'exit_code':exit_code,
+                           'containment_empty':(status or {}).get('containment_empty') is True})
+        return result
+
+    def resolve_launch_native(self,row):
+        expected={'tag':row['tag'],'workspace':row['workspace']}
+        if row['native_id']:
+            return row['native_id'],self.lookup(row['native_id'],expected)
+        selector=f"{row['workspace']}:{row['tag']}"
+        status=self.launcher.status(selector,workspace=row['workspace'])
+        native_id=status.get('id') if isinstance(status,dict) else None
+        if (not isinstance(native_id,str) or not native_id
+                or status.get('tag')!=row['tag']
+                or not same_workspace(status.get('workspace'),row['workspace'])):
+            return None,None
+        state='aborting' if row['state']=='aborting' else 'running'
+        with self.journal.db:
+            self.journal.db.execute("UPDATE launches SET native_id=?,state=? WHERE session_id=? AND epoch=? AND native_id IS NULL",
+                                    (native_id,state,row['session_id'],row['epoch']))
+        return native_id,status
+
     def heartbeat(self,labels):
         available=self.launcher.capabilities()
         engines=sorted(engine for engine in self.engines.intersection(available) if available[engine])
         capabilities=['headless']+[cap+':'+engine for engine in engines for cap in sorted(available[engine]-{'headless'})]
-        # Resource Manager collector input: one bounded physical snapshot per heartbeat.
-        memory=native_launch.available_memory_mb()
-        snapshot={'mem_available_mb':memory,'observed_at':int(time.time()*1000)} if memory is not None else None
-        if snapshot is not None:
-            cpu=native_launch.cpu_load_pct()
-            if cpu is not None:snapshot['cpu_load_pct']=cpu
-        resources=snapshot
-        self.client.heartbeat(labels,engines,capabilities,resources=resources)
+        self.client.heartbeat(labels,engines,capabilities,native_sessions=self.live_sessions())
 
     def safety_pause(self,machine_id):
         self.reconcile()
@@ -439,7 +463,7 @@ class Bridge:
     def serve(self, machine_id, labels):
         self.machine_id=machine_id
         threading.Thread(target=run_heartbeat_loop, args=(lambda: self.heartbeat(labels), threading.Event()),
-                         name='hub2-resource-heartbeat', daemon=True).start()
+                         name='hub2-live-session-heartbeat', daemon=True).start()
         delay = 1
         while True:
             safety=time.time()*1000 < self.budget_paused_until
@@ -450,7 +474,7 @@ class Bridge:
                 self.heartbeat(labels)
                 with self.client.socket(machine_id) as socket:
                     pending = []
-                    next_resource_heartbeat = time.monotonic() + RESOURCE_HEARTBEAT_SECONDS
+                    next_live_session_heartbeat = time.monotonic() + LIVE_SESSION_HEARTBEAT_SECONDS
                     def acknowledge(session, epoch):
                         socket.send(canonical({"type": "offer_ack", "session_id": session, "epoch": epoch}))
                         deadline = time.monotonic() + 15
@@ -471,13 +495,13 @@ class Bridge:
                     delay = 1
                     while True:
                         now = time.monotonic()
-                        if now >= next_resource_heartbeat:
+                        if now >= next_live_session_heartbeat:
                             self.heartbeat(labels)
-                            next_resource_heartbeat = time.monotonic() + RESOURCE_HEARTBEAT_SECONDS
+                            next_live_session_heartbeat = time.monotonic() + LIVE_SESSION_HEARTBEAT_SECONDS
                         active = self.journal.db.execute("SELECT 1 FROM launches WHERE state IN ('running','aborting','launching') LIMIT 1").fetchone()
                         recv_timeout = 5 if active else min(
-                            RESOURCE_HEARTBEAT_SECONDS,
-                            max(0.01, next_resource_heartbeat - now),
+                            LIVE_SESSION_HEARTBEAT_SECONDS,
+                            max(0.01, next_live_session_heartbeat - now),
                         )
                         try:
                             event = pending.pop(0) if pending else json.loads(socket.recv(timeout=recv_timeout))
@@ -485,9 +509,9 @@ class Bridge:
                         except TimeoutError:
                             pass
                         now = time.monotonic()
-                        if now >= next_resource_heartbeat:
+                        if now >= next_live_session_heartbeat:
                             self.heartbeat(labels)
-                            next_resource_heartbeat = time.monotonic() + RESOURCE_HEARTBEAT_SECONDS
+                            next_live_session_heartbeat = time.monotonic() + LIVE_SESSION_HEARTBEAT_SECONDS
                         self.reconcile()
                         self.journal.flush(self.client)
             except (ApiError, OSError, RuntimeError, ValueError) as error:

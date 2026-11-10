@@ -1,22 +1,9 @@
-"""Direct native launch adapter: Hub-admitted plans spawn through aplexer.
+"""Direct native launch adapter: Hub session plans spawn through aplexer.
 
-This module replaces the external Agent Quota Launcher CLI on the Hub2 launch
-path. Admission already happened in the Hub Resource Manager (account/model/
-machine selection, reservations); this adapter rechecks physical host
-resources, re-verifies the provider generation against the live admission
-endpoint, spawns the engine directly through the native aplexer supervisor,
-proves first action and qualified exit, and never re-spawns an uncertain
-launch. Local quota probing is deliberately absent: unknown or stale quota is
-a Hub admission hold, never a host decision.
-
-Central-home launches additionally require ``client``, ``session_id``,
-``operation_id`` and ``epoch`` on the specification so the final pre-spawn
-gate can re-verify the exact admitted generation. Spawn recipes and
-verification contracts are behavior-preserving ports of the maintained
-launcher's launch/interactive/native_lifecycle modules (the external package
-remains untouched for its other consumers).
+The Hub picks a model and host, then this adapter launches it, proves its first
+action and qualified exit, and never re-spawns an uncertain launch. The
+external Agent Quota Launcher remains untouched for its other consumers.
 """
-import ctypes
 import hashlib
 import json
 import os
@@ -27,7 +14,7 @@ import time
 from pathlib import Path
 
 from .client import private_file
-from .provider_home import clean_provider_environment, native_environment, provider_admission
+from .provider_home import clean_provider_environment, native_environment, session_binding
 
 FIRST_ACTION_INSTRUCTION = (
     "\n\nFirst action (required before any other work): prove this worker "
@@ -60,68 +47,6 @@ def native_returncode(value):
     return None
 
 
-def available_memory_mb():
-    if os.name == 'nt':
-        class Status(ctypes.Structure):
-            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
-                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
-                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
-                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
-                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
-        status = Status()
-        status.dwLength = ctypes.sizeof(Status)
-        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
-            return None
-        return int(status.ullAvailPhys // 1048576)
-    try:
-        with open('/proc/meminfo', 'rb') as stream:
-            for line in stream.read(65536).decode('utf8', 'replace').splitlines():
-                if line.startswith('MemAvailable:'):
-                    return int(line.split()[1]) // 1024
-    except (OSError, ValueError, IndexError):
-        return None
-    return None
-
-
-def cpu_load_pct(sample=None):
-    """Bounded normalized CPU load percentage, or None when unverifiable.
-
-    Linux reads /proc/loadavg normalized by the core count; Windows samples
-    GetSystemTimes twice over a short interval. Used as one bounded health
-    datum in the heartbeat snapshot; never a local quota probe."""
-    if os.name == 'nt':
-        import ctypes
-        import ctypes.wintypes
-        class Times(ctypes.Structure):
-            _fields_ = [("idle", ctypes.wintypes.FILETIME), ("kernel", ctypes.wintypes.FILETIME), ("user", ctypes.wintypes.FILETIME)]
-        kernel32 = ctypes.windll.kernel32
-        def busy():
-            times = Times()
-            if not kernel32.GetSystemTimes(ctypes.byref(times.idle), ctypes.byref(times.kernel), ctypes.byref(times.user)):
-                return None
-            to64 = lambda ft: (ft.dwHighDateTime << 32) | ft.dwLowDateTime
-            idle = to64(times.idle)
-            total = to64(times.kernel) + to64(times.user)
-            return idle, total
-        first = busy()
-        if first is None:
-            return None
-        time.sleep(0.25 if sample is None else sample)
-        second = busy()
-        if second is None:
-            return None
-        delta_total = second[1] - first[1]
-        if delta_total <= 0:
-            return None
-        return round(min(100.0, max(0.0, (1 - (second[0] - first[0]) / delta_total) * 100)), 1)
-    try:
-        load = os.getloadavg()[0]
-    except (OSError, AttributeError):
-        return None
-    cores = os.cpu_count() or 1
-    return round(min(100.0, max(0.0, load / cores * 100)), 1)
-
-
 # Inherited credentials that must never reach aplexer or the native SDK,
 # where the ambient value would override the central private home.
 INHERITED_SECRET_VARS = ('HUB2_LAUNCH_CONTEXT', 'HUB2_TOKEN', 'HUB2_SERVER', 'HUB2_CONFIG', 'HUB_TOKEN', 'HUB_JOB_TOKEN',
@@ -144,15 +69,6 @@ def spawn_environment(central_home):
     if central_home:
         env = clean_provider_environment(env)
     return env
-
-
-def physical_resources_ready(min_free_mb, requested_mb):
-    available = available_memory_mb()
-    if available is None:
-        return False, 'host_physical_resources_unknown'
-    if available < min_free_mb + requested_mb:
-        return False, 'host_physical_resources_insufficient'
-    return True, None
 
 
 def canonical(value):
@@ -503,9 +419,6 @@ class NativeLauncher:
         # validate_launch against the same capability table.
         workspace = Path(specification["workspace"])
         requested_mb = int(self.config.get("memory_mb", 1500))
-        ready, reason = physical_resources_ready(int(self.config.get("min_free_mem_mb", 6000)), requested_mb)
-        if not ready:
-            raise RuntimeError(reason)
         goal = specification["prompt"]
         fa_path = workspace / ".local" / f"first-action-{task_id}.json"
         fa_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -528,12 +441,11 @@ class NativeLauncher:
         child_env = {"TMPDIR": str(workspace / ".local" / "tmp" / task_id),
                      "APLEXER_RETAIN_RETIRED_OUTPUT": "1"}
         if specification.get("provider_home"):
-            # Final pre-spawn gate: the admitted generation and quota must still be live.
-            chosen, data = provider_admission(specification["provider_home"], specification["client"],
-                                              specification["session_id"], specification["operation_id"],
-                                              specification["epoch"])
-            if chosen["provider"] != provider or chosen["model"] != specification["model"]:
-                raise RuntimeError("central_provider_changed_before_spawn")
+            # Recheck only the current session binding. Quota and credential
+            # health choose/fallback routes; they do not block the start.
+            data = session_binding(specification["provider_home"], specification["client"],
+                                   specification["session_id"], specification["operation_id"],
+                                   specification["epoch"])
             runtime_deadline = data["runtime_deadline"]
             # Ambient credentials were already sanitized in spawn_environment
             # (client env) BEFORE the trusted home is added; the child dict is

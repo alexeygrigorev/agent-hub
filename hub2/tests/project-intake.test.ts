@@ -1,15 +1,39 @@
 import {test} from 'node:test';import assert from 'node:assert/strict';import {DatabaseSync} from 'node:sqlite';import {ProjectDO} from '../src/project-do';
 const admin={id:'human:admin',kind:'operator',scopes:['operator:admin']};
-function fixture(){const sql=new DatabaseSync(':memory:');let alarm:any=null;const storageValues=new Map<string,unknown>(),ctx:any={id:{toString:()=> 'synthetic-project'},storage:{sql:{exec(q:string,...a:any[]){const p=sql.prepare(q);const rows=p.columns().length?p.all(...a):(p.run(...a),[]);return{toArray:()=>rows};}},transactionSync(fn:any){sql.exec('BEGIN');try{const r=fn();sql.exec('COMMIT');return r;}catch(e){sql.exec('ROLLBACK');throw e;}},async getAlarm(){return alarm;},async setAlarm(at:number){alarm=at;},async deleteAlarm(){alarm=null;},async get(key:string){return storageValues.get(key);},async put(key:string,value:unknown){storageValues.set(key,value);},async delete(key:string){return storageValues.delete(key);}},blockConcurrencyWhile:(f:any)=>Promise.resolve(f())};
- const routes:any[]=[],machineCalls:string[]=[];
+function fixture(options:{modelCandidates?:any[];accountHosts?:Record<string,string[]>}={}){const sql=new DatabaseSync(':memory:');let alarm:any=null;const storageValues=new Map<string,unknown>(),ctx:any={id:{toString:()=> 'synthetic-project'},storage:{sql:{exec(q:string,...a:any[]){const p=sql.prepare(q);const rows=p.columns().length?p.all(...a):(p.run(...a),[]);return{toArray:()=>rows};}},transactionSync(fn:any){sql.exec('BEGIN');try{const r=fn();sql.exec('COMMIT');return r;}catch(e){sql.exec('ROLLBACK');throw e;}},async getAlarm(){return alarm;},async setAlarm(at:number){alarm=at;},async deleteAlarm(){alarm=null;},async get(key:string){return storageValues.get(key);},async put(key:string,value:unknown){storageValues.set(key,value);},async delete(key:string){return storageValues.delete(key);}},blockConcurrencyWhile:(f:any)=>Promise.resolve(f())};
+ const routes:any[]=[],machineCalls:string[]=[],accountCalls:string[]=[];
  const requestOf=(input:string|Request,init?:RequestInit)=>input instanceof Request?input:new Request(input,init);
- const CONTROL={idFromName:(id:any)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{const request=requestOf(input,init);routes.push(await request.json());return Response.json({registered:true});}})};
- const MACHINES={idFromName:(id:any)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{const request=requestOf(input,init);const path=new URL(request.url).pathname;machineCalls.push(path);return Response.json(path.endsWith('/reserve')?{state:'staged',epoch:1}:{state:'offered'});}})};
+ const CONTROL={idFromName:(id:any)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{const request=requestOf(input,init),path=new URL(request.url).pathname;const value=request.method==='GET'?{}:await request.json();routes.push(value);if(path==='/_routing-policy')return Response.json({version:1,candidates:options.modelCandidates||[]});if(path==='/api/directory')return Response.json({items:[{id:'h1'}],next:null});return Response.json({registered:true,accepted:true});}})};
+ const MACHINES={idFromName:(id:any)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{const request=requestOf(input,init);const path=new URL(request.url).pathname;machineCalls.push(path);if(path==='/_internal/routing')return Response.json({machine_id:'h1',engines:['codex','claude'],capabilities:['headless','interactive']});return Response.json(path.endsWith('/reserve')?{state:'staged',epoch:1}:{state:'offered'});}})};
  const unused={idFromName:(id:any)=>id,get:()=>({fetch:async()=>Response.json({ok:true})})};
- const env:any={CONTROL,PROJECTS:unused,MACHINES,ACCOUNTS:unused,MAILBOXES:unused};
- let project=new ProjectDO(ctx,env);const call=(p:string,m='GET',b?:unknown,a:any=admin)=>project.fetch(new Request('https://p.test'+p,{method:m,headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(a)},...(b===undefined?{}:{body:JSON.stringify(b)})}));return{sql,get project(){return project;},restart:()=>project=new ProjectDO(ctx,env),routes,machineCalls,call,getAlarm:()=>alarm,storageValues};}
+ const ACCOUNTS={idFromName:(id:any)=>id,get:(id:string)=>({fetch:async(input:string|Request)=>{const path=new URL(input instanceof Request?input.url:input).pathname;accountCalls.push(path);return Response.json({account:{enabled:true},quota:{remaining:id==='codex'?90:70},hosts:options.accountHosts?.[id]||['h1'],credential_usable:false});}})};
+ const env:any={CONTROL,PROJECTS:unused,MACHINES,ACCOUNTS,MAILBOXES:unused};
+ let project=new ProjectDO(ctx,env);const call=(p:string,m='GET',b?:unknown,a:any=admin)=>project.fetch(new Request('https://p.test'+p,{method:m,headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(a)},...(b===undefined?{}:{body:JSON.stringify(b)})}));return{sql,get project(){return project;},restart:()=>project=new ProjectDO(ctx,env),routes,machineCalls,accountCalls,call,getAlarm:()=>alarm,storageValues};}
 const body=async(r:Response)=>await r.json() as any;
 async function intake(f:ReturnType<typeof fixture>,key='task'){const result=await f.call('/api/intakes?project=org/a','POST',{key,title:'Original task',text:'Original requested behavior',acceptance_criteria:['Actual result']});assert.equal(result.status,201);return(await body(result)).intake;}
+test('model-less start falls back to another allowed model after an auth failure',async()=>{
+ const candidates=[
+  {id:'codex-sol',engine:'codex',model:'gpt-6.1-sol',effort:'medium',account_id:'codex',weight:1,capabilities:[],enabled:true},
+  {id:'claude-sonnet',engine:'claude',model:'sonnet',effort:'medium',account_id:'claude',weight:1,capabilities:[],enabled:true},
+ ];
+ const f=fixture({modelCandidates:candidates,accountHosts:{codex:['h1'],claude:['h2']}}),originalRandom=Math.random;Math.random=()=>0;
+ try{
+  const own=await intake(f,'auth-fallback'),start={key:'auth-fallback',workspace:'/tmp/synthetic-auth-fallback'};
+  const accepted=await f.call('/api/intakes/'+own.id+'/start','POST',start);assert.equal(accepted.status,201);
+  const first=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any;
+  assert.equal(JSON.parse(first.launch_spec_json).engine,'codex');
+  f.sql.prepare("UPDATE dispatch_sagas SET state='claimed' WHERE operation_id=?").run(first.operation_id);
+  const fallback=await f.call('/_internal/auth-fallback','POST',{operation_id:first.operation_id,
+   attempt_operation_id:first.attempt_operation_id,session_id:first.session_id,machine_id:first.machine_id,
+   epoch:first.epoch,reason:'provider_auth_failed'});
+  const fallbackBody=await body(fallback);assert.equal(fallback.status,200,JSON.stringify(fallbackBody));assert.equal(fallbackBody.fallback,true);
+  const next=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE operation_id=?').get(first.operation_id) as any;
+  assert.equal(next.attempt,1);assert.equal(next.state,'offered');
+  assert.equal(next.machine_id,'h2');
+  assert.equal((f.sql.prepare('SELECT assigned_machine_id FROM intakes WHERE id=?').get(own.id) as any).assigned_machine_id,'h2');
+  assert.equal(JSON.parse(next.launch_spec_json).engine,'claude');assert.equal(JSON.parse(next.launch_spec_json).model,'sonnet');
+ }finally{Math.random=originalRandom;}
+});
 test('intake edits preserve original ask and notes/history; archive search paginates retained data',async()=>{
  const f=fixture(),initial=await intake(f);
  const edited=await f.call('/api/intakes/'+initial.id,'PATCH',{key:'edit',expected_updated_at:initial.updated_at,title:'Revised title',text:'Revised behavior',priority:0,note:'Operator clarification',status:'archived'});assert.equal(edited.status,200);
@@ -69,40 +93,14 @@ test('failed task retry requires native exit and release evidence, preserves old
  assert.equal((await f.call('/_internal/finish','POST',{...binding,exit_code:1,native_exit_confirmed:true,evidence:{result:'failed'}})).status,200);
  assert.equal((f.sql.prepare('SELECT session_id FROM intakes WHERE id=?').get(own.id) as any).session_id,current.session_id);
 });
-test('old concurrent finish resuming after account release cannot overwrite a newly retried session',async()=>{
- const f=fixture(),own=await intake(f,'finish-race'),start={key:'first-race',workspace:'/tmp/synthetic-race',engine:'shell',machine_id:'h1',override_reason:'Synthetic semantic test'};
- await f.call('/api/intakes/'+own.id+'/start','POST',start);
- const first=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any,project=f.project as any;
- project.db.run("UPDATE dispatch_sagas SET state='admitted' WHERE operation_id=?",first.operation_id);
- const binding={operation_id:first.operation_id,attempt_operation_id:first.attempt_operation_id,session_id:first.session_id,machine_id:first.machine_id,epoch:first.epoch,native_id:'22222222-2222-4222-8222-222222222222'};
- assert.equal((await f.call('/_internal/started','POST',binding)).status,201);
- project.db.run('UPDATE dispatch_sagas SET account_id=? WHERE operation_id=?','synthetic-account',first.operation_id);
- let entered!:()=>void,release!:()=>void,calls=0;const started=new Promise<void>(r=>entered=r),gate=new Promise<void>(r=>release=r);
- project.releaseAccount=async()=>{if(++calls===1){entered();await gate;}return true;};
- const receipt={...binding,exit_code:1,native_exit_confirmed:true,evidence:{result:'failed'}},pending=f.call('/_internal/finish','POST',receipt);await started;
- assert.equal((await f.call('/_internal/finish','POST',receipt)).status,200);
- assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',{...start,key:'after-failure'})).status<300,true);
- const current=f.sql.prepare('SELECT * FROM intakes WHERE id=?').get(own.id) as any;assert.notEqual(current.session_id,first.session_id);
- release();const result=await pending;assert.equal(result.status,200);assert.equal((await body(result)).duplicate,true);
- const after=f.sql.prepare('SELECT * FROM intakes WHERE id=?').get(own.id) as any;assert.equal(after.session_id,current.session_id);assert.equal(after.status,'queued');assert.equal(after.final_evidence_json,null);
-});
-test('late AccountDO admission cannot authorize a completed attempt after the intake is retried',async()=>{
- const f=fixture(),own=await intake(f,'admission-race'),start={key:'first-admission-race',workspace:'/tmp/synthetic-admission-race',engine:'shell',machine_id:'h1',override_reason:'Synthetic semantic test'};
- await f.call('/api/intakes/'+own.id+'/start','POST',start);
- const first=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any,project=f.project as any;
- project.db.run("UPDATE dispatch_sagas SET state='admitted',account_id=? WHERE operation_id=?",'synthetic-account',first.operation_id);
- let entered!:()=>void,release!:()=>void;const admissionStarted=new Promise<void>(resolve=>entered=resolve),accountGate=new Promise<void>(resolve=>release=resolve);
- const env=project.env;env.ACCOUNTS={idFromName:(id:string)=>id,get:()=>({fetch:async()=>{entered();await accountGate;return Response.json({reservation:{operation_id:first.attempt_operation_id,session_id:first.session_id,machine_id:first.machine_id,epoch:first.epoch,state:'running'}});}})};
- const admission=f.call('/_internal/admission','POST',{operation_id:first.attempt_operation_id,session_id:first.session_id,machine_id:first.machine_id,epoch:first.epoch});await admissionStarted;
- project.releaseAccount=async()=>true;
- const native='66666666-6666-4666-8666-666666666666',failedProof={source:'aplexer_status',containment_empty:true,native_identity:{id:native,tag:'task-hub2-'+first.session_id,workspace:start.workspace},native_exit:{code:0}};
- assert.equal((await f.call('/_internal/finish','POST',{operation_id:first.operation_id,attempt_operation_id:first.attempt_operation_id,session_id:first.session_id,machine_id:first.machine_id,epoch:first.epoch,native_id:native,exit_code:0,native_exit_confirmed:true,launch_failed:true,evidence:failedProof})).status,200);
- assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',{...start,key:'retry-after-admission-race'})).status,201);
- const retried=f.sql.prepare('SELECT * FROM intakes WHERE id=?').get(own.id) as any,newSaga=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE session_id=?').get(retried.session_id) as any;
- assert.notEqual(retried.session_id,first.session_id);assert.equal(retried.status,'queued');assert.notEqual(newSaga.operation_id,first.operation_id);
- release();const stale=await admission;assert.equal(stale.status,409);const staleBody=await body(stale);assert.equal(staleBody.error,'stale_or_unoffered_admission');
- const after=f.sql.prepare('SELECT * FROM intakes WHERE id=?').get(own.id) as any,oldSaga=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE operation_id=?').get(first.operation_id) as any;
- assert.equal(after.session_id,retried.session_id);assert.equal(after.status,'queued');assert.equal(oldSaga.state,'complete');assert.equal(staleBody.launch_allowed,undefined);
+test('session admission checks the current saga without quota or account-capacity reads',async()=>{
+ const f=fixture(),own=await intake(f,'admission-binding'),start={key:'admission-binding',workspace:'/tmp/synthetic-admission',engine:'shell',machine_id:'h1',override_reason:'Synthetic semantic test'};
+ assert([201,202].includes((await f.call('/api/intakes/'+own.id+'/start','POST',start)).status));
+ const saga=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any;
+ const admission=await f.call('/_internal/admission','POST',{operation_id:saga.attempt_operation_id,session_id:saga.session_id,machine_id:saga.machine_id,epoch:saga.epoch});
+ assert.equal(admission.status,200);const view=await body(admission);assert.equal(view.launch_allowed,true);assert.equal(view.model,'shell');
+ assert.deepEqual(f.accountCalls,[],'launch admission must not read quota or reserve account capacity');
+ assert.equal((await f.call('/_internal/admission','POST',{operation_id:saga.attempt_operation_id,session_id:saga.session_id,machine_id:saga.machine_id,epoch:saga.epoch+1})).status,409);
 });
 test('qualified admitted launch failure binds actual native exit without fabricating started or a nonzero exit',async()=>{
  const f=fixture(),own=await intake(f,'launch-failed'),start={key:'failed-launch',workspace:'/tmp/synthetic-abort',engine:'shell',machine_id:'h1',override_reason:'Synthetic semantic test'};

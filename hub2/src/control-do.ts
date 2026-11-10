@@ -6,6 +6,7 @@ import { SqlReceiptMeter, SQL_PROBE_HEADER, wrapSqlNamespaces } from './sql-rece
 import { randomToken, safeEqual, sha256Hex } from './crypto';
 import { actorFrom, bodyObject, boundedString, boundedText, error, hasScope, HttpError, json } from './http';
 import { modelPolicyCandidateViolation, type ModelPolicyRoute } from './model-policy';
+import { isLiveActiveSession, MAX_ACTIVE_SESSIONS } from './session-liveness';
 import type { Actor, Hub2Env, JsonRecord } from './types';
 
 type CredentialActor=Actor&{family_id?:string;client_id?:string};
@@ -23,6 +24,7 @@ const SCHEMA = [
  'CREATE INDEX route_intake ON object_routes(bound_intake_id,kind,id) WHERE bound_intake_id IS NOT NULL',
  'CREATE INDEX route_resource ON object_routes(resource_id,kind,id)',
  'CREATE TABLE route_acl(actor_id TEXT NOT NULL,kind TEXT NOT NULL,id TEXT NOT NULL,PRIMARY KEY(actor_id,kind,id)) WITHOUT ROWID',
+ 'CREATE TABLE session_start_reservations(operation_id TEXT PRIMARY KEY,session_id TEXT NOT NULL,expires_at INTEGER NOT NULL) WITHOUT ROWID',
 
   `CREATE TABLE credentials (
     actor_id TEXT PRIMARY KEY, kind TEXT NOT NULL, resource_id TEXT, generation TEXT NOT NULL,
@@ -75,7 +77,7 @@ export class ControlDO {
     this.db = new MeteredDb(ctx.storage.sql);
     this.sqlReceipts = new SqlReceiptMeter(this.db);
     this.env = wrapSqlNamespaces(env, this.sqlReceipts) as Hub2Env;
-    this.ready=initializeSchema(ctx, this.db, 2, SCHEMA,[ONCALL_SCHEMA],()=>this.scheduleWake());
+    this.ready=initializeSchema(ctx, this.db, 3, SCHEMA,[ONCALL_SCHEMA,['CREATE TABLE IF NOT EXISTS session_start_reservations(operation_id TEXT PRIMARY KEY,session_id TEXT NOT NULL,expires_at INTEGER NOT NULL) WITHOUT ROWID']],()=>this.scheduleWake());
     this.auth=new ControlAuth(ctx,this.db,this.env);this.workers=new WorkerCredentials(ctx,this.db,this.env);
   }
 
@@ -89,6 +91,8 @@ export class ControlDO {
       await this.ready;
       const workerResponse=await this.workers.fetch(request);if(workerResponse)return workerResponse;
       const authResponse=await this.auth.fetch(request);if(authResponse)return authResponse;
+      if(url.pathname==='/_internal/session-cap/check'&&request.method==='POST')return await this.checkSessionCap(request);
+      if(url.pathname==='/_internal/session-cap/release'&&request.method==='POST')return await this.releaseSessionStart(request);
       if (url.pathname === '/_oncall/config' && request.method === 'POST') return await this.configureOncall(request);
       if (url.pathname === '/_oncall/ingest' && request.method === 'POST') return await this.ingestOncall(request);
       if (url.pathname === '/_oncall/offers' && request.method === 'GET') return await this.oncallOffers(request);
@@ -539,6 +543,60 @@ export class ControlDO {
     const rows=kind==='agents'?this.db.all<{id:string}>('SELECT id,display_name FROM named_agents WHERE enabled=1 AND id>? ORDER BY id LIMIT ?',after,limit+1)
       :this.db.all<{id:string}>("SELECT resource_id AS id FROM credentials WHERE kind='machine' AND revoked_at IS NULL AND resource_id>? ORDER BY resource_id LIMIT ?",after,limit+1).map(v=>({...v,credential_active:true,presence:'requires_machine_probe'}));
     return json({kind,items:rows.slice(0,limit),next:rows.length>limit?rows[limit-1].id:null});
+  }
+
+  private async checkSessionCap(request:Request):Promise<Response>{
+    const actor=actorFrom(request);
+    if(!hasScope(actor,'operator:admin')&&!hasScope(actor,'session:start'))return error('forbidden',403);
+    const body=await bodyObject(request,4096);
+    if(!boundedString(body.operation_id,180)||!boundedString(body.session_id,180))return error('invalid_session_start',400);
+    const operationId=body.operation_id,sessionId=body.session_id;
+    const machines:{id:string}[]=[];
+    let after='';
+    while(true){
+      const page=this.db.all<{id:string}>("SELECT resource_id AS id FROM credentials WHERE kind='machine' AND revoked_at IS NULL AND resource_id>? ORDER BY resource_id LIMIT 51",after);
+      machines.push(...page.slice(0,50));
+      if(page.length<=50)break;
+      after=page[49].id;
+    }
+    const snapshots=await Promise.all(machines.map(async row=>{
+      try{
+        const response=await this.env.MACHINES.get(this.env.MACHINES.idFromName(row.id)).fetch('https://machine.internal/_internal/live-sessions');
+        if(!response.ok)return null;
+        return await response.json() as {observed_at?:number;sessions?:Array<{session_id:string;native_id:string|null;phase:string;last_activity_at:number|null;observed_at:number}>};
+      }catch{return null;}
+    }));
+    const now=Date.now(),live=[...new Map(snapshots.flatMap(snapshot=>snapshot?.sessions||[])
+      .filter(session=>isLiveActiveSession(session,now)).map(session=>[session.session_id,session])).values()];
+    const liveIds=new Set(live.map(session=>session.session_id));
+    const reservation=this.db.transaction(this.ctx,()=>{
+      this.db.run('DELETE FROM session_start_reservations WHERE expires_at<=?',now);
+      const prior=this.db.one<{session_id:string}>('SELECT session_id FROM session_start_reservations WHERE operation_id=?',operationId);
+      if(prior)return prior.session_id===sessionId
+        ?{duplicate:true,starting_count:this.db.one<{n:number}>('SELECT COUNT(*) AS n FROM session_start_reservations')?.n||0}
+        :{conflict:true};
+      for(const row of this.db.all<{operation_id:string;session_id:string}>('SELECT operation_id,session_id FROM session_start_reservations'))
+        if(liveIds.has(row.session_id))this.db.run('DELETE FROM session_start_reservations WHERE operation_id=?',row.operation_id);
+      const starting=this.db.one<{n:number}>('SELECT COUNT(*) AS n FROM session_start_reservations')?.n||0;
+      if(liveIds.has(sessionId))return {duplicate:true,starting_count:starting};
+      if(live.length+starting>=MAX_ACTIVE_SESSIONS)return {full:true,starting_count:starting};
+      this.db.run('INSERT INTO session_start_reservations(operation_id,session_id,expires_at) VALUES(?,?,?)',operationId,sessionId,now+120_000);
+      return {starting_count:starting+1};
+    });
+    if('conflict'in reservation)return error('session_start_idempotency_conflict',409);
+    if('full'in reservation){
+      const detail=`Hub allows ${MAX_ACTIVE_SESSIONS} live active sessions; ${live.length} are active and ${reservation.starting_count} starts are in progress.`;
+      console.error('[hub2] ACTIVE_SESSION_LIMIT',JSON.stringify({active_count:live.length,starting_count:reservation.starting_count,limit:MAX_ACTIVE_SESSIONS}));
+      return json({error:'active_session_limit',detail,active_count:live.length,starting_count:reservation.starting_count,limit:MAX_ACTIVE_SESSIONS},429);
+    }
+    return json({accepted:true,duplicate:reservation.duplicate===true,active_count:live.length,starting_count:reservation.starting_count,limit:MAX_ACTIVE_SESSIONS});
+  }
+
+  private async releaseSessionStart(request:Request):Promise<Response>{
+    const body=await bodyObject(request,4096);
+    if(!boundedString(body.operation_id,180)||!boundedString(body.session_id,180))return error('invalid_session_start',400);
+    this.db.run('DELETE FROM session_start_reservations WHERE operation_id=? AND session_id=?',body.operation_id,body.session_id);
+    return json({released:true});
   }
 
   private async registerActor(request:Request):Promise<Response>{

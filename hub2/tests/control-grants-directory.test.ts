@@ -1,8 +1,40 @@
 import {test} from 'node:test';import assert from 'node:assert/strict';import {DatabaseSync} from 'node:sqlite';import {ControlDO} from '../src/control-do';
 const admin={id:'human:admin',kind:'operator',scopes:['operator:admin'],family_id:'operator-family',client_id:'phone'};
-function fixture(){const database=new DatabaseSync(':memory:');const state:any={storage:{async setAlarm(){},async deleteAlarm(){},sql:{exec(q:string,...a:any[]){const s=database.prepare(q);const rows=s.columns().length?s.all(...a):(s.run(...a),[]);return{toArray:()=>rows};}},transactionSync(fn:()=>unknown){database.exec('BEGIN');try{const v=fn();database.exec('COMMIT');return v;}catch(e){database.exec('ROLLBACK');throw e;}}},blockConcurrencyWhile:(fn:()=>unknown)=>Promise.resolve(fn())};const control=new ControlDO(state,{} as any);
- const call=(p:string,m='GET',b?:unknown,a:unknown=admin)=>control.fetch(new Request('https://control.test'+p,{method:m,headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(a)},...(b===undefined?{}:{body:JSON.stringify(b)})}));return{control,database,call};}
+function fixture(){const database=new DatabaseSync(':memory:'),snapshots=new Map<string,unknown[]>();const state:any={storage:{async setAlarm(){},async deleteAlarm(){},sql:{exec(q:string,...a:any[]){const s=database.prepare(q);const rows=s.columns().length?s.all(...a):(s.run(...a),[]);return{toArray:()=>rows};}},transactionSync(fn:()=>unknown){database.exec('BEGIN');try{const v=fn();database.exec('COMMIT');return v;}catch(e){database.exec('ROLLBACK');throw e;}}},blockConcurrencyWhile:(fn:()=>unknown)=>Promise.resolve(fn())};
+ const env:any={MACHINES:{idFromName:(id:string)=>id,get:(id:string)=>({fetch:async()=>Response.json({sessions:snapshots.get(id)||[]})})}};
+ const control=new ControlDO(state,env);
+ const call=(p:string,m='GET',b?:unknown,a:unknown=admin)=>control.fetch(new Request('https://control.test'+p,{method:m,headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(a)},...(b===undefined?{}:{body:JSON.stringify(b)})}));return{control,database,call,snapshots};}
 const data=async(r:Response)=>await r.json() as any;
+
+function addMachine(database:DatabaseSync,id:string){
+ database.prepare('INSERT INTO credentials(actor_id,kind,resource_id,generation,token_hash,scopes_json,family_id,client_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)')
+  .run('machine:'+id,'machine',id,'1','token-hash-'+id,'[]','family-'+id,'client-'+id,Date.now());
+}
+
+test('global session cap counts fresh live panes across every machine and logs the loud 429',async()=>{
+ const f=fixture();await f.call('/api/model-policy');
+ for(let i=0;i<51;i++)addMachine(f.database,'host-'+String(i).padStart(3,'0'));
+ const now=Date.now();f.snapshots.set('host-050',Array.from({length:50},(_,i)=>({session_id:'live-'+i,native_id:'native-'+i,phase:'running',last_activity_at:now-1000,observed_at:now})));
+ const original=console.error;let alert='';console.error=(...args:unknown[])=>{alert=args.map(String).join(' ');};
+ let response:Response;
+ try{response=await f.call('/_internal/session-cap/check','POST',{operation_id:'op-51',session_id:'session-51'});}
+ finally{console.error=original;}
+ assert.equal(response!.status,429);
+ const body=await data(response!);assert.equal(body.error,'active_session_limit');assert.equal(body.active_count,50);assert.equal(body.limit,50);
+ assert.match(body.detail,/50 live active sessions/);assert.match(alert,/ACTIVE_SESSION_LIMIT/);assert.match(alert,/"active_count":50/);
+});
+
+test('orphan, dead, exited, idle, and stale DB rows never consume live-session capacity',async()=>{
+ const f=fixture();await f.call('/api/model-policy');addMachine(f.database,'host-free');
+ const now=Date.now(),rows=Array.from({length:49},(_,i)=>({session_id:'live-'+i,native_id:'native-'+i,phase:'running',last_activity_at:now-1000,observed_at:now}));
+ rows.push({session_id:'orphan',native_id:null,phase:'missing',last_activity_at:null,observed_at:now});
+ rows.push({session_id:'stale',native_id:'native-stale',phase:'running',last_activity_at:now-7*60*60_000,observed_at:now});
+ rows.push({session_id:'exited',native_id:'native-exited',phase:'exited',last_activity_at:now-1000,observed_at:now});
+ f.snapshots.set('host-free',rows);
+ const response=await f.call('/_internal/session-cap/check','POST',{operation_id:'op-free',session_id:'session-free'});
+ assert.equal(response.status,200);const body=await data(response);assert.equal(body.active_count,49);assert.equal(body.starting_count,1);
+});
+
 test('named-agent delegation requires current explicit family/client/action grant; revocation removes phone inbox',async()=>{
  const {call}=fixture();assert.equal((await call('/api/named-agents','POST',{name:'orin',display_name:'Orin'})).status,200);
  const subject={id:'human:reader',kind:'operator',scopes:['intake:read'],family_id:'family-a',client_id:'client1'};

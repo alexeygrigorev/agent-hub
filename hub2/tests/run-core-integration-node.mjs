@@ -65,14 +65,14 @@ try{
   const enrolled=expect(await api('/api/enrollments/complete','POST',{code:pair.pairing_code},null),201,'complete pairing');hostToken=enrolled.token;assert.equal(typeof hostToken,'string');
   expect(await api('/api/enrollments/complete','POST',{code:pair.pairing_code},null),410,'one-use pairing');
   expect(await api('/api/heartbeat','POST',{os:'synthetic',arch:'synthetic',labels:['fixture'],engines:['opencode','shell'],capabilities:['headless','interactive'],resources:{mem_available_mb:42000,observed_at:Date.now()}},hostToken),200,'heartbeat');
-  expect(await api('/api/account','PATCH',{provider:'codex',enabled:true,capacity:2,min_remaining:10}),200,'configure synthetic account');
+  expect(await api('/api/account','PATCH',{provider:'codex',enabled:true,min_remaining:10}),200,'configure synthetic account');
   const access='fixture.'+Buffer.from(JSON.stringify({exp:Math.floor(Date.now()/1000)+864000})).toString('base64url')+'.signature';
   expect(await api('/api/account/credentials','PUT',{expected_generation:0,files:{'.codex/auth.json':JSON.stringify({tokens:{access_token:access,refresh_token:'synthetic-native-fixture',account_id:'fixture-id'},last_refresh:new Date().toISOString()})}}),200,'encrypted synthetic provider fixture');
   if(process.env.HUB2_CORE_PROVISION)expect(await api('/api/account/discovery','POST',{}),200,'actual provider collector over synthetic HTTP');
   else expect(await api('/api/account/quota','PUT',{remaining:80,captured_at:Date.now(),valid_until:Date.now()+300000,source:'synthetic-native-integration-fixture'}),200,'synthetic quota');
   expect(await api('/api/account/hosts','PUT',{hosts:[machine]}),200,'approve synthetic account host');
   expect(await api('/api/model-policy','PUT',{expected_version:0,candidates:[{id:'synthetic-model',engine:'opencode',model:'synthetic-test-model',account_id:account,weight:1,capabilities:[],enabled:true}]}),200,'configure actual synthetic model policy');
-  expect(await api('/api/account','PATCH',{provider:'forbidden',enabled:true,capacity:1},hostToken,{'x-hub2-actor':JSON.stringify({id:'forged',kind:'operator',scopes:['*']})}),403,'machine cannot edit account');
+  expect(await api('/api/account','PATCH',{provider:'forbidden',enabled:true},hostToken,{'x-hub2-actor':JSON.stringify({id:'forged',kind:'operator',scopes:['*']})}),403,'machine cannot edit account');
  });
  await test('intake idempotency and acceptance criteria guard',async()=>{
   const first=await intake('intake-dedup');const created=expect(first.response,201,'create intake');
@@ -97,7 +97,7 @@ try{
   const offered=await liveSocket.wait(v=>v.type==='session.offer'&&v.offer.session_id===started.id);const offer=offered.offer;
   assert.equal(offer.operation_id,started.attempt_operation_id);assert.equal(offer.epoch,started.epoch);assert(offer.acceptance_criteria.length);
   const again=expect(await start(created.id,'start-main'),200,'start retry');assert.equal(again.session.id,started.id);
-  const q=expect(await api('/api/account/quota'),200,'account reserved');assert.equal(q.account.occupied,1);
+  const q=expect(await api('/api/account/quota'),200,'quota view remains independent of starts');assert.equal('occupied' in q.account,false);
   const bad={epoch:offer.epoch+1,operation_id:offer.operation_id};expect(await api(`/api/sessions/${started.id}/admission`,'POST',bad,hostToken),409,'stale epoch');
   liveSocket.socket.send(JSON.stringify({type:'offer_ack',session_id:started.id,epoch:offer.epoch}));await liveSocket.wait(v=>v.type==='ack'&&v.session_id===started.id);
   const native='11111111-2222-4333-8444-555555555555';
@@ -123,7 +123,6 @@ try{
   expect(await api(`/api/sessions/${started.id}/finish`,'POST',{...finish,evidence:{...evidence,native_deadline:{...evidence.native_deadline,exceeded:true}}},hostToken),409,'deadline cannot be exceeded before it expires');
   expect(await api(`/api/sessions/${started.id}/finish`,'POST',{...finish,epoch:finish.epoch+1},hostToken),409,'stale finish epoch');
   expect(await api(`/api/sessions/${started.id}/finish`,'POST',{...finish,operation_id:'stale-attempt'},hostToken),409,'stale finish operation');
-  assert.equal(expect(await api('/api/account/quota'),200,'unqualified exit retains reservation').account.occupied,1);
   expect(await fixture('project',project,'fault',{paths:['/_internal/finish']}),200,'lose successful finish forwarding response');
   expect(await api(`/api/sessions/${started.id}/finish`,'POST',finish,hostToken),202,'finish durable pending response');
   expect(await fixture('machine',machine,'due-outbox',{id:'finish:'+offer.operation_id}),200,'retry finish durable journal');
@@ -132,12 +131,15 @@ try{
   expect(await api(`/api/sessions/${started.id}/finish`,'POST',{...finish,exit_code:1},hostToken),409,'finish conflict');
   if(workerCheck)measurements.worker_credentials=await workerCheck.afterFinish();
   const final=expect(await api(`/api/intakes/${created.id}?project=${encodeURIComponent(project)}`),200,'final intake');assert.equal(final.intake.status,'completed-awaiting-review');assert.notEqual(final.intake.status,'done');completedIntakeId=created.id;
-  assert.equal(expect(await api('/api/account/quota'),200,'account released').account.occupied,0,'native completion must release exact reservation');
-  const offers=expect(await api('/api/offers','GET',undefined,hostToken),200,'no finished offer');assert.equal(offers.offers.length,0);
+  assert.equal('occupied' in expect(await api('/api/account/quota'),200,'account view has no per-session slots').account,false);
+  const offers=expect(await api('/api/offers','GET',undefined,hostToken),200,'no finished offer');
+  assert.equal(offers.offers.some(offer=>offer.session_id===started.id),false,'finished session must not remain offered');
   liveSocket.socket.close();liveSocket=null;
   const after=await snapshots();measurements.complete_flow=delta(before,after);measurements.quiescent=after;const total=Object.values(measurements.complete_flow).reduce((n,v)=>n+v.reads+v.writes,0);assert(total<2000,'warm core flow exceeds2000row guard');
   measurements.machine_deadlines=expect(await fixture('machine',machine,'machine-deadlines'),200,'exact machine pending work diagnostics');
-  assert.equal(after.project.alarm,null,'finished project has no pending alarm');assert.equal(after.machine.alarm,null,'finished machine has no pending alarm');assert.equal(after.account.alarm,null,'released account has no pending alarm');
+  assert.equal(after.project.alarm,null,'finished project has no pending alarm');
+  assert.equal(after.machine.alarm===null,!offers.offers.some(offer=>offer.session_id!==started.id),'machine alarm reflects only unrelated open offers');
+  assert.equal(after.account.alarm,null,'released account has no pending alarm');
   const quietBefore=await snapshots();await sleep(120);const quietAfter=await snapshots();for(const k of Object.keys(quietBefore)){assert.equal(quietAfter[k].counts.rows_read,quietBefore[k].counts.rows_read,k+' idle reads');assert.equal(quietAfter[k].counts.rows_written,quietBefore[k].counts.rows_written,k+' idle writes');}
  });
  await test('late successful native exit is durably failed by the immutable admission deadline',async()=>{
@@ -161,7 +163,7 @@ try{
   finally{expect(await fixture('control','global','clock',{offset:0}),200,'restore synthetic finish clock');}
   const failed=expect(await api(`/api/intakes/${created.id}?project=${encodeURIComponent(project)}`),200,'late exit intake state');
   assert.equal(failed.intake.status,'failed','late native exit must not be certified complete');
-  assert.equal(expect(await api('/api/account/quota'),200,'late exit reservation released').account.occupied,0,'qualified late exit frees only its own reservation');
+  assert.equal('occupied' in expect(await api('/api/account/quota'),200,'late exit keeps quota view independent').account,false);
   liveSocket.socket.close();liveSocket=null;
  });
  if(process.env.HUB2_CORE_ABORT!=='0')await test('qualified admitted abort preserves zero exit, revocation and retry binding',async()=>{const{admittedAbort}=await import('./normal-day-abort.mjs');measurements.admitted_abort=await admittedAbort({api,expect,fixture,socket,intake,start,project,machine,hostToken});});
@@ -225,15 +227,14 @@ try{
   const closed=expect(await api(base+q,'POST',{key:'compat-close-1',status:'done',expected_version:shown.task.control.version,reason:'verified'}),200,'close');
   assert.equal(closed.intake.status,'archived');
  });
- await test('status carries the CLI snapshot keys and routing-machines shows placement numbers',async()=>{
+ await test('status carries the CLI snapshot keys and routing-machines shows enrolled hosts',async()=>{
   const status=expect(await api('/api/status'),200,'status');
   assert.equal(typeof status.snapshot_at,'string');assert(status.coverage&&Number.isInteger(status.coverage.sessions),'coverage.sessions');
   assert(Array.isArray(status.coverage.missing_hosts)&&Array.isArray(status.needs_attention));
   const routing=expect(await api('/api/fleet/routing/machines'),200,'routing machines');
   assert(routing.machines.length>0,'enrolled machines listed');
   const m=routing.machines.find(v=>v.machine_id==='synthetic-multi-machine')||routing.machines[0];
-  assert(Number.isInteger(m.capacity)&&Number.isInteger(m.occupied),'capacity and occupancy shown');
-  assert(['fresh','stale','unknown'].includes(m.resources_state),'resource freshness shown');
+  assert.equal('capacity' in m,false);assert.equal('occupied' in m,false);assert.equal('resources_state' in m,false);
  });
  await test('machine credential rotation fences its existing WebSocket',async()=>{
   const target='synthetic-rotation-machine';
@@ -278,13 +279,14 @@ try{
   assert(completedIntakeId,'completed lifecycle prerequisite did not pass');const restored=expect(await api(`/api/intakes/${completedIntakeId}?project=${encodeURIComponent(project)}`),200,'restored terminal intake');assert.equal(restored.intake.status,'completed-awaiting-review');assert.equal(restored.intake.final_evidence.exit_code,0);
   const snap=await snapshots();for(const v of Object.values(snap))assert.equal(v.counts.measurement_valid,true);measurements.restart=snap;
  });
- await test('one machine hosts several sessions at once (account capacity is the next limit)',async()=>{
+ await test('one machine accepts multiple sessions below the global live-session cap',async()=>{
   liveSocket=await socket();
   const one=expect(await start((await intake('intake-multi-1')).response.data.intake.id,'start-multi-1'),201,'first concurrent start').session;
   const two=expect(await start((await intake('intake-multi-2')).response.data.intake.id,'start-multi-2'),201,'second concurrent start on the same machine').session;
   assert.notEqual(one.id,two.id);assert.equal(one.machine_id||machine,two.machine_id||machine);
   const third=await start((await intake('intake-multi-3')).response.data.intake.id,'start-multi-3');
-  assert.equal(third.status,409);assert.notEqual(third.data.reason,'machine_capacity','a third start is refused by account capacity 2, not by a one-session machine');
+  assert([201,202].includes(third.status),'third start must be accepted below the global cap: '+JSON.stringify(third.data));
+  assert.notEqual(third.data.error,'active_session_limit');
  });
 }finally{
  if(liveSocket)liveSocket.socket.close();await rt.dispose();

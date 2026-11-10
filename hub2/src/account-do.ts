@@ -16,26 +16,24 @@ const SCHEMA = [
  'CREATE TABLE discovery(id INTEGER PRIMARY KEY CHECK(id=1),enabled INTEGER NOT NULL,interval_ms INTEGER NOT NULL,next_at INTEGER NOT NULL,status TEXT NOT NULL)',
  'CREATE TABLE alerts(id TEXT PRIMARY KEY,kind TEXT NOT NULL,grant_id TEXT,expires_at INTEGER,observed_at INTEGER NOT NULL,remaining_ms INTEGER)',
 
- `CREATE TABLE account(id INTEGER PRIMARY KEY CHECK(id=1),provider TEXT NOT NULL,enabled INTEGER NOT NULL,capacity INTEGER NOT NULL,occupied INTEGER NOT NULL DEFAULT 0,min_remaining REAL NOT NULL DEFAULT 0)`,
+ `CREATE TABLE account(id INTEGER PRIMARY KEY CHECK(id=1),provider TEXT NOT NULL,enabled INTEGER NOT NULL,min_remaining REAL NOT NULL DEFAULT 0)`,
  `CREATE TABLE quota(id INTEGER PRIMARY KEY CHECK(id=1),remaining REAL NOT NULL,captured_at INTEGER NOT NULL,valid_until INTEGER NOT NULL,reset_at INTEGER,source TEXT NOT NULL)`,
- `CREATE TABLE reservations(operation_id TEXT PRIMARY KEY,session_id TEXT NOT NULL,machine_id TEXT NOT NULL,epoch INTEGER NOT NULL,digest TEXT NOT NULL,state TEXT NOT NULL,expires_at INTEGER NOT NULL,released_at INTEGER) WITHOUT ROWID`,
- 'CREATE INDEX reservation_due ON reservations(state,expires_at,operation_id)',
  `CREATE TABLE reset_grants(id TEXT PRIMARY KEY,expires_at INTEGER NOT NULL,available INTEGER NOT NULL,source TEXT NOT NULL,observed_at INTEGER NOT NULL) WITHOUT ROWID`,
  'CREATE INDEX reset_expiry ON reset_grants(available,expires_at,id)',
  'CREATE INDEX reset_page ON reset_grants(available,id)',
 ];
-type Account={provider:string;enabled:number;capacity:number;occupied:number;min_remaining:number};
+type Account={provider:string;enabled:number;min_remaining:number};
 type Quota={remaining:number;captured_at:number;valid_until:number;reset_at:number|null;source:string};
-type Reservation={operation_id:string;session_id:string;machine_id:string;epoch:number;digest:string;state:string;expires_at:number};
 type RoutingCredentialStatus={credential_usable:boolean;credential_status:'ready'|'expired'|'refresh_failed'|'missing'|'unknown'};
 const ROUTING_REFRESH_MINIMUM_MS=5*60_000;
-/** One provider account owns its capacity. Expiry never frees confirmed native work. */
+const DROP_SESSION_CAPACITY = ['DROP TABLE IF EXISTS reservations', 'ALTER TABLE account DROP COLUMN capacity', 'ALTER TABLE account DROP COLUMN occupied'];
+/** Provider credentials and quota only; Hub session capacity is global and measured on hosts. */
 export class AccountDO {
  private collecting?:Promise<Response>;
  private readonly db:MeteredDb;
  private readonly sqlReceipts:SqlReceiptMeter;
  private readonly env:AccountEnv;
- constructor(private readonly ctx:DurableObjectState,env:AccountEnv={}){this.db=new MeteredDb(ctx.storage.sql);this.sqlReceipts=new SqlReceiptMeter(this.db);this.env=wrapSqlNamespaces(env,this.sqlReceipts) as AccountEnv;initializeSchema(ctx,this.db,1,SCHEMA);}
+ constructor(private readonly ctx:DurableObjectState,env:AccountEnv={}){this.db=new MeteredDb(ctx.storage.sql);this.sqlReceipts=new SqlReceiptMeter(this.db);this.env=wrapSqlNamespaces(env,this.sqlReceipts) as AccountEnv;initializeSchema(ctx,this.db,2,SCHEMA,[DROP_SESSION_CAPACITY],undefined,2);}
  async fetch(request:Request):Promise<Response>{
   return this.sqlReceipts.measure(()=>this.handleFetch(request),request.headers.get(SQL_PROBE_HEADER));
  }
@@ -52,19 +50,11 @@ export class AccountDO {
     if(credential.credential_usable)await this.lazyQuota();
     return this.routingView(credential);
    }
-   if(p==='/_internal/release'&&method==='POST')return await this.transition(request,'released');
-   if(p==='/api/account/release')return error('not_found',404);
    if(p==='/_metrics')return json({counts:this.db.snapshot()});
    if(p==='/api/account'&&method==='PATCH')return await this.configure(request,a);
    if(p==='/api/account/quota'&&method==='PUT')return await this.quota(request,a);
    if(p==='/api/account/resets')return await this.resets(request,a);
    if((p==='/api/account'||p==='/api/account/quota')&&method==='GET'){if(this.canReadQuota(a))await this.lazyQuota();return this.view(a);}
-   if(!hasScope(a,'account:reserve')&&!hasScope(a,'operator:admin'))return error('forbidden',403);
-   if(method!=='POST')return error('not_found',404);
-   if(p==='/api/account/reserve')return await this.reserve(request);
-   if(p==='/api/account/confirm')return await this.transition(request,'confirmed');
-   if(p==='/api/account/start')return await this.transition(request,'running');
-   
    return error('not_found',404);
   }catch(e){return e instanceof HttpError?error(e.code,e.status):error('internal_error',500);}
  }
@@ -123,10 +113,10 @@ export class AccountDO {
  private async configure(r:Request,a:Actor|undefined):Promise<Response>{
   if(!hasScope(a,'operator:admin'))return error('forbidden',403);
   const b=await bodyObject(r,4096);
-  if(!boundedString(b.provider,80)||!Number.isInteger(b.capacity)||Number(b.capacity)<1||Number(b.capacity)>1000||typeof b.enabled!=='boolean'||!percent(b.min_remaining??0))return error('invalid_account',400);
+  if(!boundedString(b.provider,80)||typeof b.enabled!=='boolean'||!percent(b.min_remaining??0))return error('invalid_account',400);
   if(['shared-zai','zcodex','zai-central'].includes(String(b.provider))||b.provider==='zai'&&(this.ctx.id?.name??r.headers.get('x-hub2-account-id'))!=='zai-central')return error('zai_central_account_required',400);
   const prior=this.db.one<{provider:string}>('SELECT provider FROM account WHERE id=1');if(prior&&prior.provider!==b.provider&&this.db.one('SELECT generation FROM credentials WHERE id=1'))return error('provider_change_requires_new_account',409);
-  this.db.run(`INSERT INTO account(id,provider,enabled,capacity,min_remaining) VALUES(1,?,?,?,?) ON CONFLICT(id) DO UPDATE SET provider=excluded.provider,enabled=excluded.enabled,capacity=excluded.capacity,min_remaining=excluded.min_remaining`,b.provider,Number(b.enabled),b.capacity,b.min_remaining??0);
+  this.db.run(`INSERT INTO account(id,provider,enabled,min_remaining) VALUES(1,?,?,?) ON CONFLICT(id) DO UPDATE SET provider=excluded.provider,enabled=excluded.enabled,min_remaining=excluded.min_remaining`,b.provider,Number(b.enabled),b.min_remaining??0);
   return this.view(a);
  }
  private async quota(r:Request,a:Actor|undefined):Promise<Response>{
@@ -144,72 +134,8 @@ export class AccountDO {
   const account=this.db.one<Account>('SELECT * FROM account WHERE id=1'),quota=this.db.one<Quota>('SELECT * FROM quota WHERE id=1');
   return json({account:account||null,quota:quota||null,fresh:!!quota&&quota.valid_until>Date.now()});
  }
- private admissionHost(machine:string):void{
-  const credential=this.db.one<{generation:number}>('SELECT generation FROM credentials WHERE id=1');
-  if(!credential)return;
-  if(!this.db.one('SELECT id FROM approved_hosts WHERE id=?',machine))throw new HttpError('host_not_approved',409);
-  if(this.db.one('SELECT host_id FROM credential_rejections WHERE host_id=? AND generation=?',machine,credential.generation))throw new HttpError('credential_generation_rejected',409);
- }
- private async reserve(r:Request):Promise<Response>{
-  const b=await bodyObject(r,4096),ttl=Number(b.ttl_ms??60000);
-  if(!boundedString(b.operation_id,120)||!boundedString(b.session_id,120)||!boundedString(b.machine_id,120)||!boundedString(b.request_digest,128)||!Number.isSafeInteger(b.epoch)||Number(b.epoch)<1||!Number.isSafeInteger(ttl)||ttl<1000||ttl>600000)return error('invalid_reservation',400);
-  const reservation=this.db.transaction(this.ctx,()=>{
-   this.admissionHost(String(b.machine_id));
-   this.expire(Date.now());
-   const prior=this.db.one<Reservation>('SELECT * FROM reservations WHERE operation_id=?',b.operation_id);
-   if(prior){if(prior.session_id!==b.session_id||prior.machine_id!==b.machine_id||prior.digest!==b.request_digest)throw new HttpError('idempotency_conflict',409);if(prior.epoch!==b.epoch)throw new HttpError('stale_epoch',409);return prior;}
-   const a=this.db.one<Account>('SELECT * FROM account WHERE id=1'),q=this.db.one<Quota>('SELECT * FROM quota WHERE id=1');
-   if(!a||!a.enabled)throw new HttpError('account_disabled',409);
-   if(!q||q.valid_until<=Date.now())throw new HttpError('quota_evidence_unavailable',503);
-   if(q.remaining<=a.min_remaining)throw new HttpError('quota_reserve',409);
-   if(a.occupied>=a.capacity)throw new HttpError('account_capacity',409);
-   const expires=Date.now()+ttl;
-   this.db.run('INSERT INTO reservations(operation_id,session_id,machine_id,epoch,digest,state,expires_at) VALUES(?,?,?,?,?,?,?)',b.operation_id,b.session_id,b.machine_id,b.epoch,b.request_digest,'offered',expires);
-   this.db.run('UPDATE account SET occupied=occupied+1 WHERE id=1');
-   return this.db.one<Reservation>('SELECT * FROM reservations WHERE operation_id=?',b.operation_id)!;
-  });
-  await this.schedule();return json({reservation});
- }
- private async transition(r:Request,target:'confirmed'|'running'|'released'):Promise<Response>{
-  const b=await bodyObject(r,4096);
-  if(!boundedString(b.operation_id,120)||!Number.isSafeInteger(b.epoch))return error('invalid_reservation',400);
-  if(target==='released'&&(!boundedString(b.session_id,120)||!boundedString(b.machine_id,120)))return error('release_binding_required',400);
-  const reservation=this.db.transaction(this.ctx,()=>{
-   const row=this.db.one<Reservation>('SELECT * FROM reservations WHERE operation_id=?',b.operation_id);
-   if(!row)throw new HttpError('reservation_not_found',404);
-   if(row.epoch!==b.epoch)throw new HttpError('stale_epoch',409);
-   if(target==='released'&&(row.session_id!==b.session_id||row.machine_id!==b.machine_id))throw new HttpError('release_binding_mismatch',409);
-   if(target!=='released')this.admissionHost(row.machine_id);
-   if(row.state===target){if(target==='running'&&(row.session_id!==b.session_id||row.machine_id!==b.machine_id))throw new HttpError('admission_binding_mismatch',409);return row;}
-   if(row.state==='released')throw new HttpError('reservation_terminal',409);
-   if(target==='confirmed'){
-    if(row.state!=='offered'||row.expires_at<=Date.now())throw new HttpError('offer_expired',409);
-    this.db.run('UPDATE reservations SET state=? WHERE operation_id=?','confirmed',row.operation_id);
-   }else if(target==='running'){
-    if(row.session_id!==b.session_id||row.machine_id!==b.machine_id)throw new HttpError('admission_binding_mismatch',409);
-    if(!['confirmed','awaiting-unclaimed-proof'].includes(row.state))throw new HttpError('reservation_not_confirmed',409);
-    const quota=this.db.one<Quota>('SELECT * FROM quota WHERE id=1'),account=this.db.one<Account>('SELECT * FROM account WHERE id=1');
-    if(!quota||quota.valid_until<=Date.now()||!account?.enabled)throw new HttpError('quota_evidence_unavailable',503);
-    if(quota.remaining<=account.min_remaining)throw new HttpError('quota_reserve',409);
-    this.db.run('UPDATE reservations SET state=?,expires_at=? WHERE operation_id=?','running',Date.now()+120000,row.operation_id);
-   }else{
-    const proof=b.unclaimed_proof as Record<string,unknown>|undefined;
-    const unclaimed=['confirmed','awaiting-unclaimed-proof'].includes(row.state)&&proof&&['offer-expired-unclaimed','offer-never-activated'].includes(String(proof.kind))&&proof.operation_id===row.operation_id&&proof.session_id===row.session_id&&proof.machine_id===row.machine_id&&proof.epoch===row.epoch&&Number.isSafeInteger(proof.observed_at)&&Number(proof.observed_at)<=Date.now()+5000&&(proof.kind==='offer-never-activated'||Number.isSafeInteger(proof.offer_expires_at)&&Number(proof.observed_at)>=Number(proof.offer_expires_at));
-    if(row.state!=='offered'&&b.native_exit_confirmed!==true&&!unclaimed)throw new HttpError('native_exit_or_unclaimed_proof_required',409);
-    this.db.run('UPDATE reservations SET state=?,released_at=? WHERE operation_id=?','released',Date.now(),row.operation_id);
-    this.db.run('UPDATE account SET occupied=occupied-1 WHERE id=1 AND occupied>0');
-   }
-   return {...row,state:target};
-  });await this.schedule();return json({reservation});
- }
- private expire(now:number):void{
-  for(const state of ['offered','confirmed','running']){
-   const rows=this.db.all<Reservation>('SELECT * FROM reservations WHERE state=? AND expires_at<=? ORDER BY expires_at,operation_id LIMIT 32',state,now);
-   for(const row of rows){this.db.run('UPDATE reservations SET state=? WHERE operation_id=?',state==='offered'?'released':state==='confirmed'?'awaiting-unclaimed-proof':'uncertain',row.operation_id);if(state==='offered')this.db.run('UPDATE account SET occupied=occupied-1 WHERE id=1 AND occupied>0');}
-  }
- }
  private async schedule():Promise<void>{
-  const due=['offered','confirmed','running'].map(s=>this.db.one<{expires_at:number}>('SELECT expires_at FROM reservations WHERE state=? ORDER BY expires_at,operation_id LIMIT 1',s)?.expires_at).filter((v):v is number=>v!==undefined);
+  const due:number[]=[];
   this.db.alarmOperation();const discovery=this.db.one<{next_at:number}>('SELECT next_at FROM discovery WHERE id=1 AND enabled=1');if(discovery)due.push(discovery.next_at);
   const grants=this.db.all<{id:string;expires_at:number}>('SELECT id,expires_at FROM reset_grants WHERE available=1 ORDER BY expires_at,id LIMIT 33');
   if(grants.length>32)throw new HttpError('reset_observation_limit',503);
@@ -217,7 +143,7 @@ export class AccountDO {
   if(due.length)await this.ctx.storage.setAlarm(Math.max(Date.now()+100,Math.min(...due)));else await this.ctx.storage.deleteAlarm();
  }
  async alarm():Promise<void>{
-  this.db.transaction(this.ctx,()=>{this.expire(Date.now());this.resetAlerts();});
+  this.resetAlerts();
   const d=this.db.one<{next_at:number;interval_ms:number}>('SELECT next_at,interval_ms FROM discovery WHERE id=1 AND enabled=1');
   if(d&&d.next_at<=Date.now()){this.db.run('UPDATE discovery SET next_at=? WHERE id=1',Date.now()+d.interval_ms);await this.collect();}
   await this.schedule();
@@ -251,15 +177,6 @@ export class AccountDO {
    let files=await this.unseal(row.sealed,account.provider,row.generation) as Record<string,string>;
    if(!repairLease&&account&&['codex','claude'].includes(account.provider)&&this.needsRefresh(account.provider,files,minimum)){
     await this.refresh(account.provider,files,row.generation);row=this.db.one<{generation:number;sealed:string}>('SELECT generation,sealed FROM credentials WHERE id=1')!;files=await this.unseal(row.sealed,account.provider,row.generation) as Record<string,string>;
-   }
-   if(!repairLease&&minimum>0){
-    const source='provider:'+account.provider+':generation:'+row.generation;
-    let quota=this.db.one<Quota>('SELECT * FROM quota WHERE id=1');
-    if(!quota||quota.valid_until<=Date.now()||quota.source!==source){
-     const collected=await this.collect(false);if(collected.status===429)return collected;
-     quota=this.db.one<Quota>('SELECT * FROM quota WHERE id=1');
-    }
-    if(!quota||quota.valid_until<=Date.now()||quota.source!==source)return error('quota_unavailable',503);
    }
    if(!this.db.one('SELECT id FROM approved_hosts WHERE id=?',machine))return error('host_not_approved',403);
    const latest=this.db.one<{generation:number;refresh_owner:string|null;refresh_lease:string|null}>('SELECT generation,refresh_owner,refresh_lease FROM credentials WHERE id=1');if(latest?.generation!==row.generation)return error('generation_conflict',409);

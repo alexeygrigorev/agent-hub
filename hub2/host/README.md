@@ -1,8 +1,10 @@
 # Hub 2 host bridge
 
 Python 3.11+. The host uses one pinned runtime dependency, `websockets==16.0`,
-for the maintained TLS/framing implementation. Model admission, OS resource
-locking and native lifecycle verification remain in Agent Quota Launcher.
+for TLS and framing. Hub selects a quota-weighted model route and enforces one
+global limit of 50 live sessions. The host launches the accepted work through
+aplexer, reports pane activity, and handles confirmed stops; it does not run
+machine-capacity or placement checks.
 
 Run `python hub2/host/bootstrap.py` to install the host into its private user
 environment; bootstrap uses the current interpreter and installs dependencies.
@@ -18,61 +20,25 @@ and `auth logout` perform server rotation/revocation. A lost refresh reply stays
 uncertain rather than replaying a single-use refresh token.
 
 Machine enrollment takes a one-use code from `HUB2_PAIRING_CODE` or a hidden
-prompt. Its private configuration records the enrolled machine, workspace roots
-and engine allowlist. The trusted installation registry supplies the maintained
-launcher paths, resource policy and configured provider routes; tasks cannot
-choose executable commands or credential homes. For example:
-
-```json
-{
-  "launcher": {
-    "argv": ["/installed/python", "-m", "launcher"],
-    "repository": "/installed/agent-quota-launcher",
-    "config_dir": "/private/launcher-state",
-    "resource_config": "/private/resource-policy.json",
-    "capabilities_manifest": "/private/native-capabilities.json",
-    "routes": {
-      "opencode": {
-        "provider": "go",
-        "model_requirements": {"providers": ["opencode"]}
-      },
-      "codex": {
-        "provider": "zai",
-        "account_profile": "hub-zai-central",
-        "model_requirements": {"providers": ["zai"]}
-      }
-    }
-  }
-}
-```
-
-Routing policy supplies the account and exact native model. A human route ID
-such as `glm-flash` is distinct from its configured SDK model. The only ZAI
-account is `zai-central`, through the Codex harness profile `hub-zai-central`.
-There is no retired-account fallback or legacy Hub host-package import.
+prompt. Its private configuration records the enrolled machine, workspace roots,
+engine allowlist and installed provider routes. Hub policy supplies the allowed
+account, exact native model and effort; tasks cannot choose executable commands
+or credential homes. Model policy excludes `zai-central`, Sol/Argon/Astra high,
+Claude models other than Sonnet medium, and Luna models other than max.
 
 Before spawning, the host downloads its approved Account generation, atomically
-materializes a private SDK home, verifies the SDK-selected credential source
-and acknowledges that exact generation. Ordinary OAuth homes contain access
-material only; shared refresh tokens remain central. Actual access expiry and
-the verified SDK proactive-refresh cutoff must exceed the bounded job timeout
-plus clock/dispatch margin. Unknown expiry or an unsupported SDK policy refuses
-admission. Static ZAI credentials do not use OAuth refresh permits.
+materializes a private SDK home, verifies the selected credential source and
+acknowledges that generation. Ordinary OAuth homes contain access material only;
+shared refresh tokens remain central. Authentication failure is reported to Hub
+so it can try another allowed route; quota and host-resource checks do not refuse
+the start.
 
-The launcher repeats authenticated session/account/generation/quota checks in
-its parent process and keeps its OS resource admission lock. The private parent
-controller config never enters native argv, environment, task brief or Store
-payload. Native metadata receives only the provider-home path and a separate
-private worker config path. The worker token can read/append its assigned intake
-and use its own claims/mailbox; it cannot start work or edit project/admin state.
-Verified completion durably revokes it before forwarding finish.
-
-Capabilities use manifest version 3 with native_sha256 bound to the resolved native aplexer executable, plus SHA-256 bindings for exactly
-`launcher/launch.py`, `launcher/cli.py`, `launcher/interactive.py` and
-`launcher/provider_home.py`. Per-provider capabilities explicitly include
-`headless`, `interactive`, `effort` or `goal`. Missing/changed source removes
-advertisement; a goal capability requires real proof for that provider/account
-route. Evidence from a different account does not qualify.
+The private parent configuration never enters native argv, environment, task
+brief or Store payload. Native metadata receives only the provider-home path and
+a separate private worker config path. The worker token can read/append its
+assigned intake and use its own claims/mailbox; it cannot start work or edit
+project/admin state. Verified completion durably revokes it before forwarding
+finish.
 
 `hub2 --config private/v2.json serve` maintains an authenticated WebSocket with
 bounded frames, no idle application polling or pings. Reconnection drains

@@ -446,7 +446,7 @@ class HostTests(unittest.TestCase):
             value = Socket(len(connections))
             connections.append(value)
             return value
-        self.client.socket, self.client.heartbeat = socket, lambda labels, engines, capabilities, resources=None: None
+        self.client.socket, self.client.heartbeat = socket, lambda labels, engines, capabilities, native_sessions=None: None
         with patch("agent_hub_host.agent.time.sleep"), self.assertRaises(StopServe):
             self.bridge.serve("machine-1", [])
         self.assertEqual(len(connections), 3)
@@ -476,10 +476,34 @@ class HostTests(unittest.TestCase):
         self.bridge.dispatch({"type": "session.command", "command": {
             "id": "stop-orphan", "session_id": "session-orphan", "epoch": 7, "kind": "stop"}},
             type("S", (), {"send": lambda self, value: None})(), None)
-        self.assertEqual(self.native.calls, [])
+        self.assertFalse(any(args[1] == "kill" for args, _ in self.native.calls))
         self.journal.flush(self.client)
         self.assertIn(("POST", "/api/sessions/session-orphan/commands/stop-orphan/ack?safety=operator_stop",
                        {"epoch": 7, "result": {"stopped": True}}, "command:stop-orphan"), self.client.calls)
+
+    def test_stop_kills_native_process_recovered_by_session_tag(self):
+        self.insert_orphan_launch()
+        self.native.process = {"id": "1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d",
+                              "tag": "task-hub2-session-orphan", "workspace": str(self.root),
+                              "phase": "running", "containment_empty": False}
+        result = self.bridge.command({"id": "stop-orphan-live", "session_id": "session-orphan",
+                                      "epoch": 7, "kind": "stop"})
+        self.assertTrue(result["stopped"])
+        self.assertEqual(self.native.process["phase"], "exited")
+        self.assertTrue(any(args[1] == "kill" and args[2] == self.native.process["id"]
+                            for args, _ in self.native.calls))
+
+    def test_live_snapshot_recovers_native_id_by_session_tag(self):
+        self.insert_orphan_launch()
+        self.native.process = {"id": "1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d",
+                              "tag": "task-hub2-session-orphan", "workspace": str(self.root),
+                              "phase": "running", "last_activity_ms": int(time.time() * 1000),
+                              "containment_empty": False}
+        sessions = self.bridge.live_sessions()
+        self.assertEqual(sessions[0]["native_id"], self.native.process["id"])
+        self.assertEqual(sessions[0]["phase"], "running")
+        saved = self.journal.db.execute("SELECT native_id FROM launches WHERE session_id='session-orphan'").fetchone()[0]
+        self.assertEqual(saved, self.native.process["id"])
 
     def test_reconcile_sweeps_launch_orphan_to_aborting(self):
         self.insert_orphan_launch()
@@ -594,5 +618,5 @@ class ResourceHeartbeatLoopTest(unittest.TestCase):
         self.assertGreaterEqual(len(calls), 3)
 
     def test_interval_is_well_inside_the_hub_staleness_window(self):
-        from agent_hub_host.agent import RESOURCE_HEARTBEAT_SECONDS
-        self.assertLessEqual(RESOURCE_HEARTBEAT_SECONDS * 4, 300)
+        from agent_hub_host.agent import LIVE_SESSION_HEARTBEAT_SECONDS
+        self.assertLessEqual(LIVE_SESSION_HEARTBEAT_SECONDS * 4, 300)
