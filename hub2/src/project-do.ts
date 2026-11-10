@@ -251,10 +251,13 @@ export class ProjectDO {
     if (typeof body.expected_version === 'number') mapped.expected_updated_at = body.expected_version;
     for (const field of ['title', 'priority', 'acceptance_criteria']) if (body[field] !== undefined) mapped[field] = body[field];
     if (body.status !== undefined) {
+      // A cancelled or superseded intake is archived (never deleted); the replacement id stays in the note.
       mapped.status = body.status === 'done' || body.status === 'closed'
-        ? (row.status === 'completed-awaiting-review' ? 'accepted' : 'archived') : body.status;
+        ? (row.status === 'completed-awaiting-review' ? 'accepted' : 'archived')
+        : ['cancelled', 'canceled', 'superseded'].includes(String(body.status)) ? 'archived' : body.status;
     }
-    const why = [body.outcome, body.reason].filter(v => typeof v === 'string' && v).join(': ');
+    if (body.superseded_by !== undefined && (typeof body.superseded_by !== 'string' || !/^[A-Za-z0-9._:-]{6,128}$/.test(body.superseded_by))) return error('invalid_superseded_by', 400);
+    const why = [body.outcome, body.superseded_by ? `superseded by ${body.superseded_by}` : undefined, body.reason, body.note].filter(v => typeof v === 'string' && v).join(': ');
     if (why) mapped.note = why.slice(0, 4000);
     return await this.editIntake(new Request(request.url, { method: 'PATCH', headers: request.headers, body: JSON.stringify(mapped) }), intakeId);
   }
@@ -420,7 +423,7 @@ export class ProjectDO {
           ...(typeof effortInput === 'string' ? { effort: effortInput } : {}),
           ...(typeof body.tier === 'string' ? { tier: body.tier } : {}),
           ...(overrideReason ? { override_reason: overrideReason } : {}),
-          interactive, purpose, with_goal: withGoal, required_capabilities: requiredCapabilities,
+          interactive, purpose, with_goal: withGoal, required_capabilities: requiredCapabilities, workspace,
         });
     }
     const raced = this.idempotent(scope, key, digest);
@@ -446,7 +449,10 @@ export class ProjectDO {
     try {
       this.transaction(() => {
         const current = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?', intakeId);
-        if (!current || (current.status !== 'open' && !(current.status === 'queued' && current.session_id === null)&&!this.retryableFailure(current))) throw new HttpError('intake_already_assigned', 409);
+        if (!current || (current.status !== 'open' && !(current.status === 'queued' && current.session_id === null)&&!this.retryableFailure(current)))
+          throw new HttpError('intake_already_assigned', 409, !current ? undefined : ['queued','running'].includes(current.status)||current.status==='failed'
+            ? `intake is ${current.status} with session ${current.session_id}; stop it first (hub sessions stop ${current.session_id}), then start again on this intake`
+            : `intake is ${current.status}; reopen it first (hub intake update ${current.id} --status open), then start again on this intake`);
         this.db.run(`INSERT INTO dispatch_sagas(operation_id, request_digest, request_key, intake_id, session_id, machine_id, account_id, attempt_operation_id, launch_spec_json, routing_json, epoch, state, attempt, next_action_at, last_reason, created_at, updated_at)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending_machine', 0, ?, NULL, ?, ?)`, operationId, digest, key, intakeId, sessionId, machineId, accountId, `${operationId}:0`, JSON.stringify(launchSpec), JSON.stringify({...route,attempted_policy_ids:[route.policy_id]}), now + 30_000, now, now);
         this.db.run("UPDATE intakes SET status = 'queued', assigned_machine_id = ?, assigned_actor_id = ?, session_id = ?, final_evidence_json=NULL, updated_at = ? WHERE id = ?", machineId, actor?.id || 'operator', sessionId, now, intakeId);
@@ -705,6 +711,7 @@ export class ProjectDO {
     try{
       const launch=this.parse(saga.launch_spec_json) as JsonRecord;
       next=await pickModelRoute(this.env,{interactive:launch.interactive===true,
+        ...(typeof launch.workspace==='string'?{workspace:launch.workspace}:{}),
         purpose: sessionPurpose(launch.purpose),
         with_goal:launch.with_goal===true,required_capabilities:route.required_capabilities,exclude_policy_ids:tried});
     }catch(caught){

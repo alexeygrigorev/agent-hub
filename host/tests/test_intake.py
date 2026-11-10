@@ -929,3 +929,57 @@ class TestIntakeReviewRegressions(unittest.TestCase):
         assert 'stage: host_launch' in str(result)
         assert 'detail: missing workspace' in str(result)
         assert '\x1b' not in str(result)
+
+
+class TestIntakeNoteAndSupersedeCli(unittest.TestCase):
+    """Intake abf8e6d2: one-command notes and closing a superseded intake with a note."""
+    run_cli = TestIntakeCli.run_cli
+
+    def test_note_appends_plain_text_with_automatic_key(self):
+        with patch.object(intake, 'request', return_value={'appended': True}) as transport:
+            code, _, error = self.run_cli('intake', 'append', 'task-1', '--note', 'DONE abc1234\nLive check: x\nResult: ok')
+        self.assertEqual(code, 0, error)
+        method, path, payload = transport.call_args.args
+        self.assertEqual((method, path), ('POST', '/api/intake/tasks/task-1/events'))
+        self.assertTrue(payload.pop('key').startswith('append-'))
+        self.assertEqual(payload, {'note': 'DONE abc1234\nLive check: x\nResult: ok'})
+
+    def test_note_reads_file_and_refuses_empty_oversized_or_ambiguous_input(self):
+        with tempfile.NamedTemporaryFile(dir=ROOT/'.local/tmp', mode='w', encoding='utf-8') as tf:
+            tf.write('from a file')
+            tf.flush()
+            with patch.object(intake, 'request', return_value={'appended': True}) as transport:
+                code, _, error = self.run_cli('intake', 'append', 'task-1', '--note-file', tf.name, '--key', 'note-k1')
+            self.assertEqual(code, 0, error)
+            self.assertEqual(transport.call_args.args[2], {'key': 'note-k1', 'note': 'from a file'})
+            with patch.object(intake, 'request') as transport:
+                for args in (('task-1',), ('task-1', '--note', 'text', '--note-file', tf.name), ('task-1', '--note', '   '),
+                             ('task-1', '--note', 'x' * 4001), ('task-1', '--event-file', tf.name, '--key', 'k')):
+                    code, _, error = self.run_cli('intake', 'append', *args)
+                    self.assertNotEqual(code, 0, args)
+                transport.assert_not_called()
+
+    def test_update_with_only_note_is_a_note_append(self):
+        with patch.object(intake, 'request', return_value={'appended': True}) as transport:
+            code, _, error = self.run_cli('intake', 'update', 'task-1', '--note', 'still waiting on CI')
+        self.assertEqual(code, 0, error)
+        method, path, payload = transport.call_args.args
+        self.assertEqual((method, path), ('POST', '/api/intake/tasks/task-1/events'))
+        self.assertEqual(payload['note'], 'still waiting on CI')
+        transport.assert_called_once()
+
+    def test_update_status_with_note_sends_both(self):
+        with patch.object(intake, 'request', return_value={}) as transport:
+            code, _, error = self.run_cli('intake', 'update', 'task-1', '--version', '2', '--key', 'u1', '--status', 'open', '--note', 'reopened')
+        self.assertEqual(code, 0, error)
+        transport.assert_called_once_with('POST', '/api/intake/tasks/task-1',
+                                          {'key': 'u1', 'expected_version': 2, 'note': 'reopened', 'status': 'open'})
+
+    def test_close_superseded_with_note(self):
+        with patch.object(intake, 'request', return_value={}) as transport:
+            code, _, error = self.run_cli('intake', 'close', 'task-1', '--version', '3', '--key', 'c1',
+                                          '--superseded-by', 'abf8e6d2', '--note', 'start failed; work moved')
+        self.assertEqual(code, 0, error)
+        transport.assert_called_once_with('POST', '/api/intake/tasks/task-1',
+                                          {'key': 'c1', 'expected_version': 3, 'status': 'done',
+                                           'note': 'start failed; work moved', 'superseded_by': 'abf8e6d2'})
