@@ -118,6 +118,16 @@ class NonblockingLaunchTests(unittest.TestCase):
                     self.assertEqual(Path(child[child.index('--prompt-file') + 1]).read_text().splitlines()[0], 'Work')
                     launcher.wait_first_action.assert_not_called()
 
+    def test_profile_task_effort_uses_the_same_quoted_native_mapping(self):
+        with tempfile.TemporaryDirectory() as temp:
+            launcher=NativeLauncher({})
+            for provider in ('codex','zai'):
+                for effort,expected in (('medium','medium'),('max','xhigh')):
+                    with self.subTest(provider=provider,effort=effort):
+                        command=launcher.profile_command('effort',{'workspace':temp,'model':'model','effort':effort,'timeout_seconds':600},LOCAL_ROUTES[provider],'prompt')
+                        self.assertIn('--engine-arg=-c',command)
+                        self.assertIn('--engine-arg=model_reasoning_effort='+json.dumps(expected),command)
+
     def test_stop_for_another_session_and_ack_are_received_during_slow_launch(self):
         with tempfile.TemporaryDirectory() as temp:
             journal = Journal(Path(temp) / 'journal.sqlite')
