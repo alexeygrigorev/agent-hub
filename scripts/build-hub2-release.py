@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import tomllib
 
 REPO = Path(__file__).resolve().parent.parent
 UNITS = ('agent-hub2-host.service', 'agent-hub2-host-update.service', 'agent-hub2-host-update.timer')
@@ -37,7 +38,7 @@ def export_source(repo, revision, target):
                    'config/model-routing.json', 'scripts/build-hub-cli.py',
                    'scripts/session-host-supervisor.py', 'scripts/hub2-self-update.py', 'scripts/hub2-enroll.py',
                    'deploy/agent-hub2-host.service', 'deploy/agent-hub2-host-update.service',
-                   'deploy/agent-hub2-host-update.timer', 'deploy/host-install.sh'])
+                   'deploy/agent-hub2-host-update.timer', 'deploy/host-install.sh', 'uv.lock'])
     with tarfile.open(fileobj=io.BytesIO(archive)) as bundle:
         for entry in bundle:
             name = Path(entry.name)
@@ -69,14 +70,22 @@ def build(repo, revision, output):
         (package / '_release.py').write_text(f'HOST_VERSION = {sha!r}\nPROTOCOL_VERSION = 1\n')
         # Distinct wheel versions avoid pip treating different commits as 2.0.0.
         project = source / 'hub2/host/pyproject.toml'
-        project.write_text(project.read_text().replace('version = "2.0.0"', f'version = "2.0.0+g{sha}"'))
+        contents = project.read_text()
+        if contents.count('version = "2.0.0"') != 1:
+            raise ValueError('host package version changed; update the reviewed release contract')
+        project.write_text(contents.replace('version = "2.0.0"', f'version = "2.0.0+g{sha}"'))
         artifacts = Path(temporary) / 'artifacts'
         artifacts.mkdir()
         run([sys.executable, '-m', 'pip', 'wheel', '--no-deps', '--wheel-dir', str(artifacts), str(project.parent)])
         # Pure Python transport wheel installs on all supported host platforms.
+        lock = tomllib.loads((source / 'uv.lock').read_text())
+        package_record = next(item for item in lock['package'] if item['name'] == 'websockets' and item['version'] == '16.0')
+        wheel_record = next(item for item in package_record['wheels'] if item['url'].endswith('/websockets-16.0-py3-none-any.whl'))
+        requirements = Path(temporary) / 'transport.txt'
+        requirements.write_text('websockets==16.0 --hash=' + wheel_record['hash'] + '\n')
         run([sys.executable, '-m', 'pip', 'download', '--only-binary=:all:', '--no-deps',
              '--platform', 'any', '--implementation', 'py', '--abi', 'none',
-             '--dest', str(artifacts), 'websockets==16.0'])
+             '--require-hashes', '--dest', str(artifacts), '--requirement', str(requirements)])
         spec = importlib.util.spec_from_file_location('hub_cli_release_builder', source / 'scripts/build-hub-cli.py')
         cli = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cli)

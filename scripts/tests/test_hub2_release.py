@@ -38,6 +38,7 @@ class ReleaseTests(unittest.TestCase):
                       (HOST, 'websockets-16.0-py3-none-any.whl', 'hub.pyz',
                        'hub2-self-update.py', 'hub2-enroll.py', 'host-install.sh', *updater.UNITS)}
         self.manifest = {'schema_version': 1, 'protocol_version': 1, 'host_version': SHA,
+                         'python_requires': '>=3.11',
                          'artifacts': {name: {'sha256': hashlib.sha256(data).hexdigest(), 'size': len(data)}
                                        for name, data in self.files.items()}}
         self.calls = []
@@ -56,7 +57,8 @@ class ReleaseTests(unittest.TestCase):
         return old
 
     def install(self, **kwargs):
-        with patch.object(updater, 'fetch', self.fetch), patch.object(updater, 'command', self.command):
+        with patch.object(updater, 'fetch', self.fetch), patch.object(updater, 'command', self.command), \
+             patch.object(updater.time, 'sleep'), patch.object(Path, 'home', return_value=Path(self.temporary.name)):
             updater.install('https://example.invalid', self.root, **kwargs)
 
     def test_valid_update_is_offline_and_keeps_previous(self):
@@ -96,6 +98,93 @@ class ReleaseTests(unittest.TestCase):
         self.assertFalse((self.root / 'releases' / SHA).exists())
         self.assertEqual(sum('restart' in args for args in self.calls), 2)
 
+    def test_delayed_service_failure_rolls_back_and_next_tick_backs_off(self):
+        old = self.old_release()
+        checks = 0
+        def delayed(args):
+            nonlocal checks
+            self.calls.append([str(value) for value in args])
+            if 'is-active' in args:
+                checks += 1
+                if checks == 5:
+                    raise RuntimeError('post-start crash')
+        self.command = delayed
+        with self.assertRaises(RuntimeError):
+            self.install()
+        self.assertEqual(checks, 5)
+        self.assertEqual((self.root / 'current').resolve(), old)
+        self.calls.clear()
+        self.install()
+        self.assertEqual(self.calls, [])
+        self.assertEqual(json.loads((self.root / 'failed-releases.json').read_text())[SHA]['attempts'], 1)
+
+    def test_interrupted_marked_install_and_pending_link_are_recovered(self):
+        old = self.old_release()
+        partial = self.root / 'releases' / SHA
+        partial.mkdir()
+        (partial / '.installing').write_text(SHA)
+        (self.root / 'current.next').symlink_to(partial)
+        self.install()
+        self.assertFalse(partial.exists())
+        self.assertFalse((self.root / 'current.next').is_symlink())
+        self.assertEqual((self.root / 'current').resolve(), old)
+        self.assertTrue((self.root / 'failed-releases.json').exists())
+
+    def test_installed_units_refresh_on_timer_update(self):
+        self.old_release()
+        units = Path(self.temporary.name) / '.config/systemd/user'
+        units.mkdir(parents=True)
+        (units / updater.UNITS[0]).write_text('old unit')
+        self.install()
+        self.assertEqual((units / updater.UNITS[0]).read_bytes(), self.files[updater.UNITS[0]])
+        self.assertTrue(any('daemon-reload' in args for args in self.calls))
+
+    def test_failed_activation_restores_unit_contents(self):
+        self.old_release()
+        units = Path(self.temporary.name) / '.config/systemd/user'
+        units.mkdir(parents=True)
+        (units / updater.UNITS[0]).write_text('original unit')
+        def failure(args):
+            if 'is-active' in args:
+                raise RuntimeError('failed activation')
+        self.command = failure
+        with self.assertRaises(RuntimeError):
+            self.install()
+        self.assertEqual((units / updater.UNITS[0]).read_text(), 'original unit')
+        self.assertFalse((units / updater.UNITS[1]).exists())
+
+    def test_interrupted_activation_reverts_current_before_retry(self):
+        old = self.old_release()
+        partial = self.root / 'releases' / SHA
+        partial.mkdir()
+        (partial / '.installing').write_text(SHA)
+        (self.root / 'previous').symlink_to(old)
+        (self.root / 'current').unlink()
+        (self.root / 'current').symlink_to(partial)
+        self.install()
+        self.assertEqual((self.root / 'current').resolve(), old)
+        self.assertTrue(any('restart' in args for args in self.calls))
+        self.assertFalse(partial.exists())
+
+    def test_new_protocol_is_installed_when_manifest_and_wheel_match(self):
+        self.manifest['protocol_version'] = 2
+        self.install()
+        check = next(args for args in self.calls if '-c' in args)
+        self.assertIn('PROTOCOL_VERSION == 2', check[-1])
+
+    def test_prune_keeps_three_owned_releases_and_unmanaged_directory(self):
+        self.old_release()
+        for letter in ('c', 'd', 'e', 'f'):
+            path = self.root / 'releases' / (letter * 40)
+            path.mkdir()
+            (path / 'release.json').write_text(json.dumps({'host_version': path.name}))
+        unmanaged = self.root / 'releases/owner-work'
+        unmanaged.mkdir()
+        self.install()
+        managed = [path for path in (self.root / 'releases').iterdir() if path.name != 'owner-work']
+        self.assertEqual(len(managed), 3)
+        self.assertTrue(unmanaged.exists())
+
     def test_first_install_failure_removes_current_and_new_environment(self):
         def failure(args):
             if 'restart' in args:
@@ -112,7 +201,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertFalse(any('start' in args or 'restart' in args for args in self.calls))
 
     def test_reject_unsafe_manifest_and_protocol_before_install(self):
-        for key, value in [('protocol_version', 2), ('host_version', '../invalid')]:
+        for key, value in [('protocol_version', 0), ('host_version', '../invalid'), ('python_requires', '>=99.0')]:
             with self.subTest(key=key):
                 invalid = dict(self.manifest, **{key: value})
                 with self.assertRaises(ValueError):

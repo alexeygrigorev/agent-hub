@@ -24,6 +24,7 @@ fi
 if [ ! -e "$HOME/.local/bin/hub" ] && [ ! -L "$HOME/.local/bin/hub" ]; then
     ln -s "$ROOT/current/hub.pyz" "$HOME/.local/bin/hub"
 fi
+loginctl enable-linger "$(id -un)"
 systemctl --user start agent-hub2-host.service agent-hub2-host-update.timer
 systemctl --user is-active --quiet agent-hub2-host.service
 printf '%s\n' 'Hub2 host installed and enrolled.'
