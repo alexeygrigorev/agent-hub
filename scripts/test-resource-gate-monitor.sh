@@ -55,7 +55,7 @@ case "$url" in
   https://hub.dtcdev.click/health)
     case "${CURL_MODE:-success}" in
       hub-fail|all-fail) code=503; body='unavailable' ;;
-      wrong-hub) body='{"ok":false,"service":"hub2"}' ;;
+      bootstrap) body='{"status":"bootstrap","dispatch_enabled":false}' ;;
       *) body='{"ok":true,"service":"hub2"}' ;;
     esac
     ;;
@@ -170,6 +170,22 @@ run_check success grant-inactive 0
 grep -Fq 'authenticated Resource Gate browser grant check for DESKTOP-FP4OP26: inactive' "$TMP/output" \
   || fail "inactive time-limited grant was not treated as a healthy read"
 pass "gate, desktop grant-state, and Hub reads pass while no user grant is active"
+
+run_check bootstrap grant-inactive 1
+[[ "$(mail_count)" -eq 0 && "$(dataops_count create)" -eq 0 ]] \
+  || fail "one HTTP 200 bootstrap response alerted before the two-check threshold"
+grep -Fq 'Hub API health read failed (HTTP 200)' "$TMP/output" \
+  || fail "the disabled bootstrap JSON response was not rejected as unhealthy"
+run_check bootstrap grant-inactive 1
+[[ "$(mail_count)" -eq 1 && "$(dataops_count create)" -eq 1 ]] \
+  || fail "two HTTP 200 bootstrap responses did not create one critical alert and DataOps task"
+grep -Fq 'Subject: [CRITICAL] Resource Gate and Hub availability is degraded' "$MONITOR_MAIL_CAPTURE" \
+  || fail "bootstrap health failure did not use the critical alert subject"
+pass "HTTP 200 disabled-bootstrap responses fail Hub health and alert after two checks"
+
+printf 'ok 0 0 - - 0 0 0 0\n' > "$RESOURCE_GATE_STATE_DIR/state"
+: > "$MONITOR_MAIL_CAPTURE"
+: > "$MONITOR_DATAOPS_CAPTURE"
 
 run_check gate-fail grant-inactive 1
 [[ "$(mail_count)" -eq 0 && "$(dataops_count create)" -eq 0 ]] \
