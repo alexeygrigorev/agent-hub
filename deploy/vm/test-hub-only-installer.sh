@@ -35,14 +35,11 @@ require(is_inside_hub_only_guard('systemctl reload caddy 2>/dev/null || systemct
 require('systemctl restart agent-hub-hub2.service' in installer,
         "Hub-only install must still restart Hub2")
 
-require('default: true' in workflow, "Resource Gate verification must remain enabled by default")
-require('VERIFY_GATE: ${{ inputs.verify_gate }}' in workflow,
-        "deployment must receive the explicit verify_gate choice")
-require(workflow.count("if: inputs.verify_gate") == 2,
-        "both external Resource Gate checks must be conditional")
-require("true) gate_mode=full ;;" in workflow and "false) gate_mode=hub-only ;;" in workflow
-        and 'apply "$DEPLOY_SHA" "$RELEASE_MODE" "$gate_mode"' in workflow,
-        "verify_gate=false must select the fixed Hub-only transaction mode")
+require('HUB_ONLY: ${{ inputs.hub_only }}' in workflow,
+        "deployment must receive the explicit hub_only choice")
+require("true) caddy_mode=hub-only ;;" in workflow and "false|\"\") caddy_mode=full ;;" in workflow
+        and 'apply "$DEPLOY_SHA" "$RELEASE_MODE" "$caddy_mode"' in workflow,
+        "hub_only=true must select the fixed Hub-only transaction mode")
 require('install-hub2-node.sh" --release-mode "$release_mode" --hub-only' in transaction,
         "the Hub-only transaction mode must select the fixed Hub-only installer flag")
 

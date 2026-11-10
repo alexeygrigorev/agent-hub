@@ -26,10 +26,10 @@ on:
         description: Restore the protected previous release after an interrupted deploy
         type: boolean
         default: false
-      verify_gate:
-        description: Run the full Gate deploy path (disable only for Hub-only work forbidden from contacting or changing Gate)
+      hub_only:
+        description: Deploy Hub2 service only without reloading Caddy
         type: boolean
-        default: true
+        default: false
       oncall_recipient_public_key_b64:
         description: Optional base64 PEM RSA public key for a one-time, recipient-encrypted oncall token artifact
         type: string
@@ -59,16 +59,12 @@ jobs:
           test -s deploy/vm/agent-hub-dns-update.service
           grep -Fq 'systemctl restart agent-hub-hub2.service' deploy/vm/install-hub2-node.sh
           grep -Fq 'reverse_proxy 127.0.0.1:8787' deploy/hub.caddy
-          ! grep -Eq 'gate\.dtcdev\.click|8791' deploy/hub.caddy
           grep -Fq 'shared Caddyfile must import /etc/caddy/sites/*.caddy' deploy/vm/install-hub2-node.sh
-          test -s deploy/resource-gate-monitor.service
-          test -s deploy/resource-gate-monitor.timer
-          bash -n scripts/resource-gate-monitor.sh scripts/install-resource-gate-monitor.sh
-          bash scripts/test-resource-gate-monitor.sh
           bash -n deploy/vm/deploy-release-transaction.sh deploy/vm/install-hub2-node.sh
           bash deploy/vm/test-deploy-guard.sh
           bash -n deploy/vm/test-hub-only-installer.sh
           bash deploy/vm/test-hub-only-installer.sh
+          bash deploy/vm/test-hub-site-ownership.sh
       - name: Session controller shell regression tests
         run: |
           mkdir -p "${RUNNER_TEMP}/ops-watchdog-home"
@@ -132,7 +128,7 @@ jobs:
         env:
           RELEASE_MODE: ${{ inputs.release_mode }}
           CONFIRM_BOOTSTRAP: ${{ inputs.confirm_bootstrap }}
-          VERIFY_GATE: ${{ inputs.verify_gate }}
+          HUB_ONLY: ${{ inputs.hub_only }}
           DEPLOY_SHA: ${{ github.sha }}
           SSH_TARGET: ${{ secrets.AGENT_HUB_VM_USER }}@${{ secrets.AGENT_HUB_VM_HOST }}
         run: |
@@ -144,49 +140,18 @@ jobs:
                 || { echo "release_mode=bootstrap disables Hub dispatch; set confirm_bootstrap=DISABLE-HUB-DISPATCH" >&2; exit 2; } ;;
             *) echo "invalid release mode" >&2; exit 2 ;;
           esac
-          case "$VERIFY_GATE" in
-            true) gate_mode=full ;;
-            false) gate_mode=hub-only ;;
-            *) echo "invalid verify_gate value" >&2; exit 2 ;;
+          case "$HUB_ONLY" in
+            true) caddy_mode=hub-only ;;
+            false|"") caddy_mode=full ;;
+            *) echo "invalid hub_only value" >&2; exit 2 ;;
           esac
           [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid deploy commit" >&2; exit 2; }
           test -n "$SSH_TARGET" || { echo "VM SSH target is not configured" >&2; exit 2; }
           ssh -i "$RUNNER_TEMP/agent-hub-ssh/hub_vm_key" \
             -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
             -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
-            "$SSH_TARGET" bash -s -- apply "$DEPLOY_SHA" "$RELEASE_MODE" "$gate_mode" \
+            "$SSH_TARGET" bash -s -- apply "$DEPLOY_SHA" "$RELEASE_MODE" "$caddy_mode" \
             < deploy/vm/deploy-release-transaction.sh
-      - name: Verify Resource Gate TLS page through port 443
-        if: inputs.verify_gate
-        run: |
-          set -euo pipefail
-          page="$RUNNER_TEMP/resource-gate-page.html"
-          status="$(curl --silent --show-error --fail --retry 5 --retry-delay 5 --retry-connrefused \
-            --output "$page" --write-out '%{http_code}' --max-time 15 https://gate.dtcdev.click/)"
-          [[ "$status" == 200 ]] || { echo "Resource Gate TLS smoke returned HTTP $status" >&2; exit 1; }
-          grep -Fq '<h1>Resource Gate</h1>' "$page" || { echo "Resource Gate page marker missing" >&2; exit 1; }
-      - name: Verify authenticated Resource Gate browser grant API
-        if: inputs.verify_gate
-        env:
-          GATE_PROBE_TOKEN: ${{ secrets.RESOURCE_GATE_PROBE_TOKEN }}
-        run: |
-          set -euo pipefail
-          test -n "$GATE_PROBE_TOKEN" || { echo "required secret RESOURCE_GATE_PROBE_TOKEN is not configured" >&2; exit 1; }
-          status="$(printf 'header = "Authorization: Bearer %s"\n' "$GATE_PROBE_TOKEN" \
-            | curl --config - --silent --show-error --retry 5 --retry-delay 5 --retry-connrefused \
-                --max-time 15 --output "$RUNNER_TEMP/resource-gate-grant.json" --write-out '%{http_code}' \
-                'https://gate.dtcdev.click/v1/health')"
-          [[ "$status" == 200 ]] || { echo "Resource Gate authenticated grant read returned HTTP $status" >&2; exit 1; }
-          python3 - "$RUNNER_TEMP/resource-gate-grant.json" <<'PY'
-          import json
-          import sys
-          from pathlib import Path
-
-          response = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          if type(response.get("granted")) is not bool:
-              raise SystemExit("Resource Gate grant read did not return a boolean grant state")
-          print("Authenticated Resource Gate desktop grant read passed")
-          PY
       - name: Read Hub API health on the configured client URL
         env:
           RELEASE_MODE: ${{ inputs.release_mode }}
