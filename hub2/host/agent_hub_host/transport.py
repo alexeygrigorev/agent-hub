@@ -20,7 +20,7 @@ class WebSocket:
             if hasattr(socket,'TCP_KEEPIDLE'):raw.setsockopt(socket.IPPROTO_TCP,socket.TCP_KEEPIDLE,60)
             if hasattr(socket,'SIO_KEEPALIVE_VALS'):raw.ioctl(socket.SIO_KEEPALIVE_VALS,(1,60000,10000))
             self.connection=connect(endpoint,sock=raw,additional_headers={'Authorization':'Bearer '+token},
-                compression=None,proxy=None,ping_interval=None,open_timeout=timeout,close_timeout=1,
+                compression=None,proxy=None,ping_interval=20,ping_timeout=40,open_timeout=timeout,close_timeout=1,
                 max_size=65536,max_queue=4,logger=logging.Logger('hub2.transport',level=logging.CRITICAL+1))
         except InvalidStatus as error:
             raw.close()

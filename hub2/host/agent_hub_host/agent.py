@@ -8,6 +8,7 @@ import shutil
 import sqlite3
 import subprocess
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
 from pathlib import Path
 
@@ -25,7 +26,7 @@ def run_heartbeat_loop(beat, stop, interval=LIVE_SESSION_HEARTBEAT_SECONDS):
         try:
             beat()
         except Exception:
-            pass
+            logging.getLogger(__name__).exception("Host heartbeat failed")
 
 
 
@@ -38,10 +39,9 @@ class Journal:
         fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
         os.close(fd)
         private_file(path)
-        self.db = sqlite3.connect(path)
-        self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA journal_mode=DELETE")
-        self.db.execute("PRAGMA synchronous=FULL")
+        self.path = path
+        self._connections = threading.local()
+        self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript("""
           CREATE TABLE IF NOT EXISTS launches(
             operation_id TEXT PRIMARY KEY, session_id TEXT UNIQUE NOT NULL,
@@ -49,12 +49,31 @@ class Journal:
             tag TEXT NOT NULL, native_id TEXT, state TEXT NOT NULL, interactive INTEGER NOT NULL DEFAULT 0);
           CREATE TABLE IF NOT EXISTS outbox(
             key TEXT PRIMARY KEY, path TEXT NOT NULL, payload TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS outbox_dead_letters(
+            key TEXT PRIMARY KEY, path TEXT NOT NULL, payload TEXT NOT NULL,
+            status INTEGER NOT NULL, reason TEXT NOT NULL, observed_at INTEGER NOT NULL);
           CREATE TABLE IF NOT EXISTS commands(
             id TEXT PRIMARY KEY, digest TEXT NOT NULL, state TEXT NOT NULL, result TEXT);
         """)
         if "interactive" not in {row[1] for row in self.db.execute("PRAGMA table_info(launches)")}:
             self.db.execute("ALTER TABLE launches ADD COLUMN interactive INTEGER NOT NULL DEFAULT 0")
         self.db.execute("CREATE INDEX IF NOT EXISTS launches_active ON launches(state,operation_id)")
+
+    @property
+    def db(self):
+        """A connection and transaction context belong to exactly one thread."""
+        if not hasattr(self._connections, 'db'):
+            connection = sqlite3.connect(self.path, timeout=10)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA synchronous=FULL")
+            self._connections.db = connection
+        return self._connections.db
+
+    def close_thread(self):
+        connection = getattr(self._connections, 'db', None)
+        if connection is not None:
+            connection.close()
+            del self._connections.db
 
     def emit(self, key, path, payload):
         with self.db:
@@ -68,9 +87,24 @@ class Journal:
         for row in self.db.execute(query+" ORDER BY rowid LIMIT 100").fetchall():
             if safety_only and not re.fullmatch(r"/api/sessions/[A-Za-z0-9-]{1,80}/(?:finish|started|commands/[A-Za-z0-9-]{1,80}/ack\?safety=operator_stop)",row["path"]):
                 continue
-            client.request("POST", row["path"], json.loads(row["payload"]), row["key"])
+            try:
+                client.request("POST", row["path"], json.loads(row["payload"]), row["key"])
+            except ApiError as error:
+                # Authentication, budget pauses, timeouts and server failures
+                # can recover. A rejected payload/retired fence cannot: retain
+                # its complete receipt privately without blocking the socket.
+                if error.retry_at or error.status not in {400, 404, 409, 410, 422}:
+                    raise
+                reason = error.code or 'http_' + str(error.status)
+                with self.db:
+                    self.db.execute("INSERT OR REPLACE INTO outbox_dead_letters VALUES(?,?,?,?,?,?)",
+                                    (row['key'], row['path'], row['payload'], error.status, reason, int(time.time()*1000)))
+                    self.db.execute("DELETE FROM outbox WHERE key=? AND payload=?", (row['key'], row['payload']))
+                logging.getLogger(__name__).error('Host receipt dead-lettered key=%s status=%s reason=%s',
+                                                 row['key'], error.status, reason)
+                continue
             with self.db:
-                self.db.execute("DELETE FROM outbox WHERE key=?", (row["key"],))
+                self.db.execute("DELETE FROM outbox WHERE key=? AND payload=?", (row["key"], row['payload']))
 
 
 class Bridge:
@@ -81,6 +115,11 @@ class Bridge:
         # The Hub picks a route; the host spawns it directly through aplexer.
         # The external launcher runtime is not consulted for admission or spawn.
         self.launcher = NativeLauncher(launcher_config or {}, runner, aplexer=executable, journal=journal)
+        if not self.launcher.config.get('private_provider_homes'):
+            self.engines.add('antigravity')
+        self._session_locks = {}
+        self._inflight = set()
+        self._inflight_lock = threading.Lock()
         self.machine_id=machine_id
         self.budget_paused_until=0
         self.budget_safety_paused_until=0
@@ -252,7 +291,7 @@ class Bridge:
             task_id, tag = "hub2-" + session, "task-hub2-" + session
             launch['worker_context']={key:offer[key] for key in ('session_id','epoch','intake_id','project_id')}
             launch['worker_context']['machine_id']=self.machine_id
-            if launch['engine']!='shell':
+            if launch['engine']!='shell' and self.launcher.config.get('private_provider_homes', False):
                 from .providers import provision
                 launch['provider_home']=provision(self.client,offer,launch,self.journal.directory,self.launcher.config.get('routes'))
             if acknowledge:
@@ -278,8 +317,8 @@ class Bridge:
                     raise RuntimeError("launch_outcome_uncertain")
             except (RuntimeError,ValueError,subprocess.SubprocessError,OSError) as error:
                 self.abort_launch(operation)
-                # Keep the stable refusal slug; chain the typed cause for diagnostics.
-                raise RuntimeError('native_launch_unverified') from error
+                logging.getLogger(__name__).exception('Native launch failed session=%s', session)
+                raise
             with db:
                 db.execute("UPDATE launches SET native_id=?,state='running' WHERE operation_id=?",
                            (native["id"], operation))
@@ -325,9 +364,10 @@ class Bridge:
         if len(rows) > 1000:
             raise RuntimeError("active_native_bound_exceeded")
         for row in rows:
+            if row['session_id'] in getattr(self, '_inflight', set()):
+                continue
             if row['state']=='launching':
-                # reconcile runs on the same thread as offer(), so a launching row
-                # observed here lost its dispatch before a native id was recorded.
+                # In-flight launches were excluded above; this is an interrupted dispatch.
                 with self.journal.db:
                     self.journal.db.execute("UPDATE launches SET state='aborting' WHERE operation_id=? AND state='launching'",(row['operation_id'],))
                 row = self.journal.db.execute("SELECT * FROM launches WHERE operation_id=?", (row['operation_id'],)).fetchone()
@@ -498,14 +538,16 @@ class Bridge:
             elif event.get("type") == "resync":
                 self.reconcile()
                 self.journal.flush(self.client)
-        except (RuntimeError, ValueError) as error:
+        except Exception as error:
+            logging.getLogger(__name__).exception('Host event failed type=%s', event.get('type'))
             if isinstance(error,ApiError) and error.retry_at:
+                self.budget_paused_until = max(getattr(self, 'budget_paused_until', 0), error.retry_at)
                 raise
             reason = error.code if isinstance(error,ApiError) and error.code else str(error)
             if not re.fullmatch(r"[a-z_]{1,80}", reason):
                 reason = "host_operation_failed"
             target = event.get("command") or event.get("message") or event.get("offer") or {}
-            socket.send(canonical({"type": "host.error", "reason": reason,
+            socket.send(canonical({"type": "host.error", "reason": reason, "stage": "host_launch" if event.get("type") == "session.offer" else "host_command", "detail": reason[:200],
                                    "session_id": target.get("session_id"), "operation_id": target.get("operation_id"),
                                    "message_id": target.get("id")}))
     def live_sessions(self):
@@ -575,9 +617,31 @@ class Bridge:
                 self.journal.flush(self.client,safety_only=True)
 
     def serve(self, machine_id, labels):
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s %(message)s')
+        self._launch_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix='hub2-launch')
+        self._command_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix='hub2-command')
+        self._worker_slots = threading.BoundedSemaphore(32)
+        stop = threading.Event()
+        def beats():
+            try:
+                run_heartbeat_loop(lambda: self.heartbeat(labels), stop)
+            finally:
+                self.journal.close_thread()
+        thread = threading.Thread(target=beats, name='hub2-live-session-heartbeat', daemon=True)
+        thread.start()
+        try:
+            self._serve(machine_id, labels)
+        finally:
+            stop.set()
+            thread.join(timeout=1)
+            self._launch_pool.shutdown(wait=False)
+            self._command_pool.shutdown(wait=False)
+
+    def _serve(self, machine_id, labels):
         self.machine_id=machine_id
-        threading.Thread(target=run_heartbeat_loop, args=(lambda: self.heartbeat(labels), threading.Event()),
-                         name='hub2-live-session-heartbeat', daemon=True).start()
+        if not hasattr(self, '_inflight'):
+            self._inflight, self._inflight_lock = set(), threading.Lock()
+        self._session_locks = getattr(self, '_session_locks', {})
         delay = 1
         while True:
             safety=time.time()*1000 < self.budget_paused_until
@@ -587,27 +651,42 @@ class Bridge:
                     continue
                 self.heartbeat(labels)
                 with self.client.socket(machine_id) as socket:
-                    pending = []
+                    logging.getLogger(__name__).info('Host connected machine=%s', machine_id)
+                    waiters, waiter_lock = {}, threading.Lock()
+                    pool, commands, slots = self._launch_pool, self._command_pool, self._worker_slots
+                    def acknowledge(session, epoch, _socket=socket, _waiters=waiters, _lock=waiter_lock):
+                        ready = threading.Event()
+                        with _lock:
+                            _waiters[(session, epoch)] = ready
+                        try:
+                            _socket.send(canonical({"type": "offer_ack", "session_id": session, "epoch": epoch}))
+                            if not ready.wait(15):
+                                raise RuntimeError("claim_ack_unverified")
+                        finally:
+                            with _lock:
+                                _waiters.pop((session, epoch), None)
+                    def execute(event, session, _socket=socket, _acknowledge=acknowledge, _slots=slots):
+                        try:
+                            logging.getLogger(__name__).info('Host event type=%s session=%s', event.get('type'), session)
+                            with self._session_locks[session]:
+                                self.dispatch(event, _socket, _acknowledge)
+                            self.journal.flush(self.client)
+                            logging.getLogger(__name__).info('Host event complete session=%s', session)
+                        except Exception:
+                            logging.getLogger(__name__).exception('Host worker failed session=%s', session)
+                        finally:
+                            with self._inflight_lock:
+                                if event.get('type') == 'session.offer':
+                                    self._inflight.discard(session)
+                            _slots.release()
+                            self.journal.close_thread()
                     next_live_session_heartbeat = time.monotonic() + LIVE_SESSION_HEARTBEAT_SECONDS
-                    def acknowledge(session, epoch):
-                        socket.send(canonical({"type": "offer_ack", "session_id": session, "epoch": epoch}))
-                        deadline = time.monotonic() + 15
-                        while time.monotonic() < deadline:
-                            try:
-                                frame = json.loads(socket.recv(timeout=max(0.01, deadline-time.monotonic())))
-                            except TimeoutError:
-                                break
-                            if frame.get("type") == "ack" and frame.get("session_id") == session and frame.get("epoch") == epoch:
-                                return
-                            if len(pending) >= 100:
-                                raise RuntimeError("claim_ack_backlog_exceeded")
-                            pending.append(frame)
-                        socket.send(canonical({"type": "resync"}))
-                        raise RuntimeError("claim_ack_unverified")
                     self.journal.flush(self.client)
                     self.reconcile()
                     delay = 1
                     while True:
+                        if time.time() * 1000 < self.budget_paused_until:
+                            break
                         now = time.monotonic()
                         if now >= next_live_session_heartbeat:
                             self.heartbeat(labels)
@@ -618,8 +697,29 @@ class Bridge:
                             max(0.01, next_live_session_heartbeat - now),
                         )
                         try:
-                            event = pending.pop(0) if pending else json.loads(socket.recv(timeout=recv_timeout))
-                            self.dispatch(event, socket, acknowledge)
+                            event = json.loads(socket.recv(timeout=recv_timeout))
+                            if event.get('type') == 'ack':
+                                with waiter_lock:
+                                    ready = waiters.get((event.get('session_id'), event.get('epoch')))
+                                    if ready:
+                                        ready.set()
+                            elif event.get('type') == 'session.offer':
+                                session = event.get('offer', {}).get('session_id')
+                                with self._inflight_lock:
+                                    if session in self._inflight:
+                                        continue
+                                    if not slots.acquire(blocking=False):
+                                        raise RuntimeError('host_launch_queue_full')
+                                    self._inflight.add(session)
+                                    self._session_locks.setdefault(session, threading.RLock())
+                                pool.submit(execute, event, session)
+                            elif event.get('type') == 'session.command' and event.get('command', {}).get('session_id') in self._inflight:
+                                session = event['command']['session_id']
+                                if not slots.acquire(blocking=False):
+                                    raise RuntimeError('host_command_queue_full')
+                                commands.submit(execute, event, session)
+                            else:
+                                self.dispatch(event, socket, acknowledge)
                         except TimeoutError:
                             pass
                         now = time.monotonic()
@@ -628,7 +728,8 @@ class Bridge:
                             next_live_session_heartbeat = time.monotonic() + LIVE_SESSION_HEARTBEAT_SECONDS
                         self.reconcile()
                         self.journal.flush(self.client)
-            except (ApiError, OSError, RuntimeError, ValueError) as error:
+            except Exception as error:
+                logging.getLogger(__name__).exception('Host disconnected machine=%s', machine_id)
                 if isinstance(error,ApiError) and error.retry_at:
                     self.budget_paused_until=max(self.budget_paused_until,error.retry_at)
                     if safety:self.budget_safety_paused_until=max(self.budget_safety_paused_until,error.retry_at)

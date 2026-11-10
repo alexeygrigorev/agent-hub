@@ -75,7 +75,7 @@ class HostTests(unittest.TestCase):
         self.native, self.client = FakeNative(), FakeClient()
         self.bridge = Bridge(self.client, self.journal, [self.root], ["codex"],
                              executable=os.sys.executable, runner=self.native,
-                             launcher_config={"argv": [os.sys.executable], "config_dir": str(self.root / "launcher"),
+                             launcher_config={"private_provider_homes": True, "argv": [os.sys.executable], "config_dir": str(self.root / "launcher"),
                                               "routes": {"codex": {"provider": "codex"}}},machine_id='machine-1')
         # This synthetic native fixture explicitly implements both modes.
         self.bridge.launcher.capabilities=lambda:{'codex':{'headless','interactive'}}
@@ -118,7 +118,7 @@ class HostTests(unittest.TestCase):
             raise RuntimeError('maintained_launcher_receipt_unverified')
         self.bridge.launcher.launch=launch
         self.bridge.launcher.aborted_identity=lambda task,workspace:identity
-        with self.assertRaisesRegex(RuntimeError,'native_launch_unverified'):
+        with self.assertRaisesRegex(RuntimeError,'maintained_launcher_receipt_unverified'):
             self.bridge.offer(self.offer())
         return identity
 
