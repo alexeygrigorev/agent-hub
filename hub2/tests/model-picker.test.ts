@@ -185,3 +185,38 @@ test('invalid purposes fail with typed errors rather than weakening Astra protec
  for(const purpose of [null,'Review','',{},'fix '] as any[])
   await assert.rejects(pickModelRoute(env,{interactive:false,purpose}), (e:any)=>e.code==='invalid_purpose'&&e.status===400);
 });
+
+function fleetEnv(hosts:Record<string,{os?:string;connected?:boolean}>){
+ const policy=[{id:'codex',engine:'codex',model:'gpt-6.1-sol',effort:'medium',account_id:'codex',weight:1,capabilities:[],enabled:true}];
+ const namespace=(kind:string)=>({idFromName:(id:string)=>id,get:(id:string)=>({fetch:async(url:string)=>{
+  const parsed=new URL(url);
+  if(kind==='control'&&parsed.pathname==='/_routing-policy')return Response.json({version:1,candidates:policy});
+  if(kind==='control'&&parsed.pathname==='/api/directory')return Response.json({items:Object.keys(hosts).map(id=>({id})),next:null});
+  if(kind==='accounts')return Response.json({account:{enabled:true},quota:{remaining:80},hosts:[],credential_usable:true});
+  if(kind==='machines')return Response.json({machine_id:id,connected:hosts[id]?.connected??true,engines:['codex'],...(hosts[id]?.os?{os:hosts[id].os}:{})});
+  return Response.json({}, {status:404});
+ }})});
+ return {CONTROL:namespace('control'),ACCOUNTS:namespace('accounts'),MACHINES:namespace('machines')} as any;
+}
+
+test('an absolute workspace path is placed only on hosts of its path family',async()=>{
+ const env=fleetEnv({'win-desktop':{os:'windows'},'linux-box':{os:'linux'}});
+ for(const draw of [0,0.25,0.5,0.75,0.999999]){
+  assert.equal((await pickModelRoute(env,{interactive:false,workspace:'/home/user/work/2026-11-10-task'},()=>draw)).machine_id,'linux-box');
+  assert.equal((await pickModelRoute(env,{interactive:false,workspace:'C:\\Users\\user\\work\\task'},()=>draw)).machine_id,'win-desktop');
+ }
+ const byLabel=new Set<string>();
+ for(const draw of [0,0.999999])byLabel.add((await pickModelRoute(env,{interactive:false,workspace:'agent-hub'},()=>draw)).machine_id);
+ assert.deepEqual([...byLabel].sort(),['linux-box','win-desktop'],'a label says nothing about the host');
+});
+
+test('workspace path narrowing never refuses a start and never overrides an explicit host',async()=>{
+ const onlyWindows=fleetEnv({'win-desktop':{os:'windows'}});
+ assert.equal((await pickModelRoute(onlyWindows,{interactive:false,workspace:'/home/user/work/task'},()=>0)).machine_id,'win-desktop');
+ const mixed=fleetEnv({'win-desktop':{os:'windows'},'linux-box':{os:'linux'},'unknown-os':{}});
+ const explicit=await pickModelRoute(mixed,{interactive:false,workspace:'/home/user/work/task',machine_id:'win-desktop'},()=>0);
+ assert.equal(explicit.machine_id,'win-desktop');
+ const seen=new Set<string>();
+ for(const draw of [0,0.4,0.6,0.999999])seen.add((await pickModelRoute(mixed,{interactive:false,workspace:'/home/user/work/task'},()=>draw)).machine_id);
+ assert.deepEqual([...seen].sort(),['linux-box','unknown-os'],'a host with unknown OS stays eligible');
+});

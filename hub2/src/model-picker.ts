@@ -5,7 +5,7 @@ import { allowsAstra, sessionPurpose, type SessionPurpose } from './session-purp
 
 type Candidate = { id: string; engine: string; model: string; effort?: string; account_id: string; weight: number; capabilities: string[]; enabled: boolean };
 type AccountView = { credential_status?: string; account?: { min_remaining?: number; enabled?: boolean } | null; quota?: { remaining?: number } | null; hosts?: string[]; credential_usable?: boolean };
-type MachineView = { machine_id?: string; engines?: string[]; connected?: boolean; last_seen?: number };
+type MachineView = { machine_id?: string; engines?: string[]; connected?: boolean; last_seen?: number; os?: string };
 export type PickedRoute = {
   machine_id: string; engine: string; model: string; effort?: string; account_id: string;
   policy_id: string; policy_version: unknown; override_reason: string | null;
@@ -24,6 +24,8 @@ export type PickInput = {
   purpose?: SessionPurpose;
   machine_id?: string; engine?: string; model?: string; effort?: string; override_reason?: string;
   tier?: string; interactive: boolean; with_goal?: boolean; required_capabilities?: string[]; exclude_policy_ids?: string[];
+  /** Launch workspace: a label or an absolute path on the target host. */
+  workspace?: string;
 };
 
 const internalActor = JSON.stringify({ id: 'hub2-model-picker', kind: 'operator', scopes: ['operator:admin', 'routing:read'] });
@@ -109,6 +111,17 @@ export async function pickModelRouteDetailed(env: Hub2Env, input: PickInput, ran
   for (const id of ids) if (machines.get(id)?.connected !== true) ids.delete(id);
   if (input.machine_id && !ids.has(input.machine_id) || !ids.size)
     throw new HttpError('no_connected_host', 503, JSON.stringify({machines:[...machines].map(([id,machine])=>({machine_id:id,connected:machine.connected===true,last_seen:machine.last_seen??null,age_ms:typeof machine.last_seen==='number'?Math.max(0,Date.now()-machine.last_seen):null}))}));
+
+  // An absolute workspace path exists only on hosts of its own path family: never offer /home/... to a
+  // Windows host or C:\... to a Linux one. Like the other observations this narrows and never refuses.
+  const family = !input.workspace ? null : /^[A-Za-z]:\\/.test(input.workspace) ? 'windows' : input.workspace.startsWith('/') ? 'posix' : null;
+  if (family && !input.machine_id) {
+    const fits = [...ids].filter(id => {
+      const os = (machines.get(id)?.os || '').toLowerCase();
+      return !os || (os === 'windows') === (family === 'windows');
+    });
+    if (fits.length) for (const id of [...ids]) if (!fits.includes(id)) ids.delete(id);
+  }
 
   // Headroom weight per candidate; luna is one option among many, so it never outweighs the mean of the others.
   const deep = DEEP_TIERS.has((input.tier || '').toLowerCase());

@@ -557,7 +557,13 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
   const requestedProject = text('repo') ?? text('project');
   const repoWorkspace = requestedProject && /^[A-Za-z0-9_.-]{1,80}\/[A-Za-z0-9_.-]{1,100}$/.test(requestedProject)
     ? requestedProject.split('/').at(-1) : undefined;
-  const workspace = text('workspace') ?? repoWorkspace;
+  const label = text('workspace') ?? repoWorkspace;
+  // `--cwd` is the directory the session must run in (a task worktree). It is the launch workspace;
+  // the label only names the project. Dropping it started sessions in the repository's label directory.
+  const cwd = text('cwd');
+  if (cwd !== undefined && (cwd.length > 1024 || cwd.includes('\0') || !(cwd.startsWith('/') || /^[A-Za-z]:\\/.test(cwd))))
+    return error('invalid_cwd', 400, '--cwd must be an absolute path on the target host');
+  const workspace = cwd ?? label;
   if (!workspace)
     return error('workspace_required', 400, 'pass --repo owner/name to use that repository workspace, or --workspace <registered label or absolute target-host path>');
   const interactive = body.mode === 'interactive';
@@ -579,9 +585,9 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
     existingIntake = route.id;
     project = route.owner;
   }
-  const workspaceIsPath = workspace.startsWith('/') || /^[A-Za-z]:\\/.test(workspace);
-  if (!project && !workspaceIsPath) {
-    const byWorkspace = await control.fetch(new Request(`${CONTROL}/api/repos/${encodeURIComponent(workspace)}`, {
+  const labelIsPath = !label || label.startsWith('/') || /^[A-Za-z]:\\/.test(label);
+  if (!project && label && !labelIsPath) {
+    const byWorkspace = await control.fetch(new Request(`${CONTROL}/api/repos/${encodeURIComponent(label)}`, {
       headers: { 'x-hub2-actor': JSON.stringify(actor) },
     }));
     if (byWorkspace.ok) {

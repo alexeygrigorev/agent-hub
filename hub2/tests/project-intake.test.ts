@@ -282,3 +282,29 @@ test('project starts enforce Astra purpose even through non-Astra policy ids',as
   }
  }
 });
+test('a superseded intake closes with its replacement and note; a busy intake names the session to stop',async()=>{
+ const f=fixture(),old=await intake(f,'superseded-old');
+ const closed=await f.call('/api/intakes/'+old.id,'POST',{key:'supersede-1',status:'cancelled',superseded_by:'abf8e6d2-00f5-49b8-89df-d4eeaef444cf',reason:'start failed, work moved',note:'worktree kept'});
+ assert.equal(closed.status,200,JSON.stringify(await closed.clone().json()));
+ assert.equal((await body(await f.call('/api/intakes/'+old.id))).intake.status,'archived');
+ const history=await body(await f.call('/api/intakes/'+old.id+'/history'));
+ assert(history.events.some((e:any)=>e.body.note==='superseded by abf8e6d2-00f5-49b8-89df-d4eeaef444cf: start failed, work moved: worktree kept'));
+ assert.equal((await f.call('/api/intakes/'+old.id,'POST',{key:'supersede-bad',status:'cancelled',superseded_by:'../x'})).status,400);
+ const busy=await intake(f,'busy-intake'),start={key:'busy-first',workspace:'/tmp/synthetic-busy',engine:'shell',machine_id:'h1'};
+ assert.equal((await f.call('/api/intakes/'+busy.id+'/start','POST',start)).status,201);
+ const saga=f.sql.prepare('SELECT session_id FROM dispatch_sagas WHERE intake_id=?').get(busy.id) as any;
+ const again=await f.call('/api/intakes/'+busy.id+'/start','POST',{...start,key:'busy-second'}),refusal=await body(again);
+ assert.equal(again.status,409);assert.equal(refusal.error,'intake_already_assigned');
+ assert.match(refusal.detail,new RegExp('hub sessions stop '+saga.session_id));
+});
+test('project intake pages clamp to 50 rows and follow the cursor under either spelling',async()=>{
+ const f=fixture();for(let i=0;i<53;i++)await intake(f,'page-'+String(i).padStart(2,'0'));
+ const first=await body(await f.call('/api/intakes?project=org/a&limit=100'));
+ assert.equal(first.items.length,50);assert.ok(first.next);
+ const viaCursor=await body(await f.call('/api/intakes?project=org/a&limit=100&cursor='+encodeURIComponent(first.next)));
+ const viaAfter=await body(await f.call('/api/intakes?project=org/a&limit=100&after='+encodeURIComponent(first.next)));
+ assert.equal(viaCursor.items.length,3);assert.equal(viaCursor.next,null);
+ assert.deepEqual(viaAfter.items.map((i:any)=>i.id),viaCursor.items.map((i:any)=>i.id));
+ assert.equal(new Set([...first.items,...viaCursor.items].map((i:any)=>i.id)).size,53);
+ assert.equal((await f.call('/api/intakes?project=org/a&limit=101')).status,400);
+});

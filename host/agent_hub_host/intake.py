@@ -480,12 +480,15 @@ def add_commands(sub):
     update.add_argument('--reason', help='Reason for close, cancellation or reopen')
     update.add_argument('--superseded-by', help='Replacement intake id; required for cancel unless dropped by Alexey')
     update.add_argument('--force', action='store_true', help='Override the worktree close gate when closing; requires --reason')
+    update.add_argument('--note', help='Note recorded with this update (max 4000 characters); given alone it appends a plain note')
     close = commands.add_parser('close', help='CAS status done; refused while intake worktrees are present or unmerged unless --force --reason')
     close.add_argument('id')
     close.add_argument('--version', type=int, help='Explicit CAS version; otherwise fetch and retry version conflicts up to three times')
     close.add_argument('--key', help='Stable retry key; generated automatically when omitted')
     close.add_argument('--force', action='store_true', help='Override the worktree close gate; requires --reason')
     close.add_argument('--reason', help='Close reason; required with --force or --outcome')
+    close.add_argument('--note', help='Note recorded with the close (max 4000 characters)')
+    close.add_argument('--superseded-by', help='Replacement intake id; recorded in the close note of a superseded intake')
     close.add_argument('--outcome', choices=['closed_unverified'],
                        help='Operator only: close without DONE evidence, recorded as closed_unverified with --reason (never counted as verified)')
     merge_check = commands.add_parser('merge-check', help='Collect git ancestry + Deploy evidence for this intake and record it in Hub (merge gate)')
@@ -496,11 +499,13 @@ def add_commands(sub):
     merge_check.add_argument('--dry-run', action='store_true', help='Print the evidence without recording it')
     merge_state = commands.add_parser('merge-state', help='Merge state of one intake, or the list of unmerged intakes')
     merge_state.add_argument('id', nargs='?')
-    event = commands.add_parser('append', help='Append intake/note/session/report/commit/followup/blocker/decision/rule reference as JSON; approval decisions require operator')
+    event = commands.add_parser('append', help='Append a note in one command (--note TEXT or --note-file F; key and version are automatic), or an intake/note/session/report/commit/followup/blocker/decision/rule reference as JSON with --event-file; approval decisions require operator')
     event.add_argument('id')
-    event.add_argument('--version', type=int, required=True)
-    event.add_argument('--key', required=True)
-    event.add_argument('--event-file', required=True, help='Bounded UTF-8 JSON event file, or - for stdin. Register an aplexer session with {"kind":"session","native_id":"FULL_UUID","host":"MACHINE_ID","verify_live":true}; operator-only, requires fresh host census')
+    event.add_argument('--version', type=int, help='CAS version for --event-file appends; not needed for a plain note')
+    event.add_argument('--key', help='Stable retry key; generated automatically when omitted')
+    event.add_argument('--note', help='Plain note text (max 4000 characters)')
+    event.add_argument('--note-file', help='Read the plain note from a UTF-8 file, or - for stdin')
+    event.add_argument('--event-file', help='Bounded UTF-8 JSON event file, or - for stdin. Register an aplexer session with {"kind":"session","native_id":"FULL_UUID","host":"MACHINE_ID","verify_live":true}; operator-only, requires fresh host census')
     assign = commands.add_parser('assign', help='Assign work: create the canonical Hub session for a task and record its real id automatically')
     assign.add_argument('id')
     assign.add_argument('--version', type=int, required=True)
@@ -834,8 +839,17 @@ def execute(args):
         return result
     if command == 'revoke':
         return request('POST', BASE + '/grants/' + safe_id(args.id) + '/revoke', json_file(args.payload_file))
-    key = args.key or (command + '-' + _random_hex() if command in ('update', 'close', 'promote') else None)
+    plain_note = (command == 'update' and _note_only(args)) or (
+        command == 'append' and (args.note is not None or args.note_file is not None))
+    if command == 'append' and sum(value is not None for value in (args.note, args.note_file, args.event_file)) != 1:
+        _usage_error('hub intake append: give exactly one of --note, --note-file or --event-file')
+    if command == 'append' and not plain_note and (args.version is None or args.key is None):
+        _usage_error('hub intake append: --event-file needs --version (from hub intake context) and --key')
+    key = args.key or (command + '-' + _random_hex() if plain_note or command in ('update', 'close', 'promote') else None)
     valid_key(key)
+    if plain_note:
+        text = args.note if args.note is not None else read_file(args.note_file, 16000, '--note-file')
+        return request('POST', path + '/events', {'key': key, 'note': _note_text(text)})
     payload = {'key': key, 'expected_version': args.version}
     if command == 'continue':
         return request('POST', path + '/continue', payload)
@@ -895,10 +909,16 @@ def execute(args):
             payload['outcome'] = args.outcome
         if getattr(args, 'reason', None) is not None:
             payload['reason'] = args.reason
+        if getattr(args, 'note', None) is not None:
+            payload['note'] = _note_text(args.note)
+        if getattr(args, 'superseded_by', None) is not None:
+            payload['superseded_by'] = safe_id(args.superseded_by)
         return cas_update(path, payload, args.version is None, key)
     if command == 'update':
         if args.status == 'closed':
             args.status = 'done'
+        if getattr(args, 'note', None) is not None:
+            payload['note'] = _note_text(args.note)
         for field in ('project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'priority', 'verification', 'reason', 'superseded_by'):
             if getattr(args, field, None) is not None:
                 if field == 'acceptance_criteria' and len(args.acceptance_criteria.encode('utf-8')) > 8192:
@@ -910,6 +930,29 @@ def execute(args):
             payload[field] = None
         return cas_update(path, payload, args.version is None, key)
     raise IntakeInputError('Unknown intake operation')
+
+
+UPDATE_FIELDS = ('project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'priority', 'verification', 'reason', 'superseded_by')
+
+
+def _usage_error(message):
+    """Conditional argument requirements keep argparse's usage-error exit code."""
+    print(message, file=sys.stderr)
+    raise SystemExit(2)
+
+
+def _note_only(args):
+    """`hub intake update <id> --note TEXT` with nothing else is a plain note append."""
+    return (getattr(args, 'note', None) is not None and not getattr(args, 'clear', None) and not getattr(args, 'force', False)
+            and all(getattr(args, field, None) is None for field in UPDATE_FIELDS))
+
+
+def _note_text(text):
+    if not isinstance(text, str) or not text.strip():
+        raise IntakeInputError('Note is empty')
+    if len(text) > 4000:
+        raise IntakeInputError('Note exceeds 4000 characters; split it into several notes')
+    return text
 
 
 def cas_update(path, payload, automatic, key, read_path=None):
