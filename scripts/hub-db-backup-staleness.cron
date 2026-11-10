@@ -1,8 +1,3 @@
-# Hub DB backup staleness watch: every 15 min (see scripts/hub-db-backup-staleness.sh).
-# Alerts (msmtp/sendmail) only when the newest export is older than 36h;
-# repeat pages are deduped to at most one per 24h per host.
-# Runs as user alexey (same reason as hub-db-backup.cron: Storagebox access).
-SHELL=/bin/bash
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-TZ=Europe/Berlin
-15 * * * * alexey /usr/local/sbin/hub-db-backup-staleness.sh >> /var/log/hub-db-backup-staleness.log 2>&1
+# Retired 2026-11-08: Hub1 export API removed after Hub2 cutover.
+# Replacement: hub2-backup-pull and hub2-backup-staleness.
+# See docs/HUB-DB-BACKUP.md. Preserve historical Hub1 exports.

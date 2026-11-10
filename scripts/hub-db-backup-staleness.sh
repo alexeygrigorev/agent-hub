@@ -98,6 +98,12 @@ done
 if [[ "$BACKUP_FAILED" -eq 1 && "$HUB_DB_STALE_DRILL" == "1" ]]; then
   FAIL_DRILL=1
 fi
+# Explicit source checks are drills even if the caller forgot --drill.
+# The 2026-11-10 source check used empty fixture trees with a real MTA;
+# neither its fabricated failure nor its "none found" result may page.
+if [[ "$BACKUP_FAILED" -eq 1 && "$BACKUP_FAILED_REASON" =~ ^[[:space:]]*\[TEST\]([[:space:]]|$) ]]; then
+  FAIL_DRILL=1
+fi
 if [[ "$FAIL_DRILL" -eq 1 && "$BACKUP_FAILED" -ne 1 ]]; then
   echo "--drill is only valid with --backup-failed (use HUB_DB_STALE_DRILL=1 for the staleness drill)" >&2
   exit 1

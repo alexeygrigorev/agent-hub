@@ -50,6 +50,41 @@ Independent restores from RMTHZ and Storagebox both passed: 1 database,
 20 tables, 89 rows, integrity OK and exact manifest counts.
 All manual verification suppresses mail; scheduled real failures retain alerts.
 
+## 2026-11-10 false FAIL investigation (intake 341ccbcc)
+
+Hub1 exports are historical recovery artifacts after the Hub2 cutover; the
+removed Hub1 status/export API must not be repaired or scheduled again.
+The live `/etc/cron.d/hub-db-backup` and `hub-db-backup-staleness` were
+already comment-only on November 8. Their repository templates are now
+comment-only too, and `install-hub-db-backup.sh` refuses before making any
+changes, so an old install command cannot recreate the obsolete jobs.
+Existing exports, credentials and logs remain in place.
+
+The November 10 13:24:05Z FAIL was a manual alert-source test, not a backup
+run. The `alerts-to-dev` session called the installed staleness notifier
+with `--backup-failed "[TEST] alerts-to-dev source check"`, an empty temporary
+local tree, an empty temporary Storagebox tree, and
+`HUB_DB_BACKUP_ENV_FILE=/dev/null`. The notifier invoked msmtp at 13:24:07Z.
+It inspected those fixtures, so its "Last good export: none found" did not
+refer to production. The direct notifier invocation also explains why
+there is no corresponding entry in `/var/log/hub-db-backup.log`.
+The real Storagebox `2026/11/03/hub-do-20261103T0420+0100.json.gz`
+remains present (mode 600, 261949658 bytes).
+
+A failure reason starting with `[TEST]` is now treated as a drill even if
+its caller omits `--drill`: log-only, no mail and no dedupe-state changes.
+Ordinary failure and staleness pages remain enabled for Hub2. Manual checks
+must still use `--check-only`, `--no-mail`, or stub MTAs; a test marker is
+not a substitute for isolating verification from real recipients.
+
+Live verification on November 10: `hub2-db-20261110T0520+0100.tar.gz`
+and `hub2-db-20261110T0535+0100.tar.gz` exist in VM primary, VM mirror,
+RMTHZ and Storagebox. Each timestamp's SHA-256 matches across all four
+trees. The latest Storagebox restore drill passed integrity and exact
+manifest counts for 70 databases, 815 tables and 1437 rows. The active
+RMTHZ Hub2 staleness check returned fresh at 13:27:32Z (age 31940 seconds,
+threshold 36 hours); its 15-minute monitor and 05:35 daily pull remain active.
+
 ## Historical Hub1 runbook (retired; do not execute)
 
 # Hub DB backup (intake c1241bea)

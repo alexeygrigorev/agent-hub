@@ -194,6 +194,18 @@ set +e; out="$(run_stale --backup-failed "drill reason" --drill)"; rc8e=$?; set 
   && pass "S8e backup-failed drill: one [DRILL] line, no mail" || fail "S8e (rc=$rc8e) -- $out"
 unset HUB_DB_STALE_DRILL
 
+# Explicit [TEST] source checks must not invoke either MTA or alter dedupe.
+new_tree empty ""; new_state s8f
+reset_mail
+out="$(run_stale --backup-failed "[TEST] alerts-to-dev source check")"
+[[ "$(mail_count)" -eq 0 && "$(drill_count "$out")" -eq 1 && ! -e "$STATE_DIR/staleness.state" ]] \
+  && pass "S8f explicit test reason is log-only without flags or state changes" || fail "S8f -- $out"
+# An ordinary real failure must still page immediately after a source check.
+reset_mail
+out="$(run_stale --backup-failed "status fetch failed HTTP 503")"
+[[ "$(mail_count)" -eq 1 ]] && grep -q 'Subject: \[FAIL\] Hub DB backup run failed' "$mailbox" \
+  && pass "S8g real backup failure still pages" || fail "S8g -- $out"
+
 # ---- S9: drill must not suppress a real stale page ----
 new_tree old 172800; new_state s9
 ( export HUB_DB_STALE_DRILL=1; run_stale ) >/dev/null 2>&1 || true
@@ -240,6 +252,18 @@ if grep -q 'ALERT_TO:-dev@dtcdev.click' "$SCRIPT" \
 else
   fail "S10b prod defaults"
 fi
+
+# Retired Hub1 entry points must never recreate scheduled jobs.
+set +e; out="$(bash "$INSTALLER" --prefix "$WORK_ROOT/unused" 2>&1)"; retired_rc=$?; set -e
+[[ $retired_rc -eq 1 && "$out" == *RETIRED* && ! -e "$WORK_ROOT/unused" ]] \
+  && pass "S11 retired installer refuses before writing" || fail "S11 -- $out"
+for cron in hub-db-backup.cron hub-db-backup-staleness.cron; do
+  if grep -Eq '^[[:space:]]*[^#[:space:]]' "$HERE/$cron"; then
+    fail "S11 active legacy schedule in $cron"
+  else
+    pass "S11 $cron has no active schedule"
+  fi
+done
 
 echo "---- $PASS passed, $FAILN failed ----"
 [[ "$FAILN" -eq 0 ]]
