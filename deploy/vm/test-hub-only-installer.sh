@@ -28,8 +28,8 @@ def is_inside_hub_only_guard(needle: str) -> bool:
 require('HUB_ONLY=false' in installer, "installer must default to the full edge setup")
 require('--hub-only)' in installer and 'HUB_ONLY=true' in installer,
         "installer must recognize the fixed --hub-only flag")
-require(is_inside_hub_only_guard('install -m 644 "$DEPLOY_DIR/Caddyfile" /etc/caddy/Caddyfile'),
-        "Hub-only install must skip Caddyfile installation")
+require(is_inside_hub_only_guard('install -m 644 "$DEPLOY_DIR/hub.caddy" "$CADDY_SITE"'),
+        "Hub-only install must skip Hub site installation")
 require(is_inside_hub_only_guard('systemctl reload caddy 2>/dev/null || systemctl restart caddy'),
         "Hub-only install must skip Caddy reload/restart")
 require('systemctl restart agent-hub-hub2.service' in installer,
