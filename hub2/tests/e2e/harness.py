@@ -10,6 +10,7 @@ a provider, or the real aplexer.
 import base64
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -192,10 +193,11 @@ class Host:
         self.config.chmod(0o600)
         self.log_path = root / "host.log"
         self.process = None
+        self.source = REPO / "hub2/host"
 
     def env(self):
         env = dict(os.environ, PATH=str(STUB_BIN) + os.pathsep + os.environ.get("PATH", ""),
-                   PYTHONPATH=os.pathsep.join(filter(None, [str(REPO / "hub2/host"), os.environ.get("PYTHONPATH")])), APLEXER_STATE_DIR=str(self.state), PYTHONUNBUFFERED="1")
+                   PYTHONPATH=os.pathsep.join(filter(None, [str(self.source), os.environ.get("PYTHONPATH")])), APLEXER_STATE_DIR=str(self.state), PYTHONUNBUFFERED="1")
         for name in ("HUB_TOKEN", "HUB_CONFIG_FILE", "HUB2_TOKEN", "HUB_URL"):
             env.pop(name, None)
         return env
@@ -208,6 +210,10 @@ class Host:
 
     def alive(self):
         return self.process is not None and self.process.poll() is None
+
+    def freeze(self):
+        """SIGSTOP the daemon: its socket stays open but nothing is received or claimed."""
+        os.killpg(self.process.pid, signal.SIGSTOP)
 
     def kill(self):
         if self.alive():
@@ -231,6 +237,22 @@ class Host:
             return "\n".join(self.log_path.read_text(errors="replace").splitlines()[-lines:])
         except OSError:
             return ""
+
+
+def stale_heartbeat_host_copy(root):
+    """Copy of hub2/host whose Client.heartbeat has the stale `resources=` signature of the
+    tracked build/lib copy (RC2), for the harness mutation test. Never touches the source tree."""
+    target = root / "stale-host"
+    shutil.copytree(REPO / "hub2/host/agent_hub_host", target / "agent_hub_host",
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    client = target / "agent_hub_host" / "client.py"
+    text = client.read_text()
+    mutated = text.replace("capabilities=None, native_sessions=None):", "capabilities=None, resources=None):")
+    mutated = mutated.replace('if native_sessions is not None:\n            body["native_sessions"] = native_sessions',
+                              'if resources is not None:\n            body["resources"] = resources')
+    assert mutated != text and "native_sessions" not in mutated, "heartbeat signature changed; update the mutation"
+    client.write_text(mutated)
+    return target
 
 
 def build_cli(out):

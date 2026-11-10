@@ -6,9 +6,9 @@ Real Node server (hub2/node/main.ts) + real Python host daemon (hub2/host)
 the other instead of against a hand-written fake, so protocol drift such as
 a `heartbeat(resources=...)` vs `native_sessions=` mismatch turns this red.
 
-Assertions that depend on later plan items go through `later_plan_item` or
-`xfail(strict=False)` with the plan item: they xfail today and pass once fixed.
-Plan: ~/tmp/agent-reports/2026-11-10-fable-hub-audit.md.
+Every assertion is strict and states the target behaviour of fix plan
+items 2.3 (typed, bounded start failures) and 3.2 (HOST/WORKSPACE in the
+list); there is no xfail or skip. Plan: ~/tmp/agent-reports/2026-11-10-fable-hub-audit.md.
 """
 import json
 import shutil
@@ -17,15 +17,16 @@ import time
 import pytest
 
 from harness import (MACHINE, MODEL, Cli, Host, Server, build_cli, configure_hub, new_key, scratch_root,
-                     wait_for)
+                     stale_heartbeat_host_copy, wait_for)
 
 BRIEF = "E2E start-path brief: print a marker and keep running"
 START_DEADLINE_S = 60      # accept -> running on an idle loopback host
 STOP_DEADLINE_S = 60       # stop -> native exit confirmed
 RECONNECT_DEADLINE_S = 45  # server restart -> host connected again
-# Server rule today: a claimed session without a native id fails after 120 s
-# (session-liveness.ts); plan 2.3 keeps one 120 s start deadline.
-LAUNCH_FAIL_DEADLINE_S = 150
+# Plan 2.3: one 120 s start deadline from accept to native id; 30 s slack for
+# the alarm sweep and the CLI poll interval.
+START_FAIL_DEADLINE_S = 150
+NO_HOST_REFUSAL_S = 2      # plan 2.3: no connected host -> 503 no_connected_host in <2 s
 
 
 @pytest.fixture(scope="session")
@@ -171,73 +172,67 @@ def test_model_less_start_list_show_capture_stop(hub):
     assert hub.native_row(session_id) is None, "native workload still listed after stop: %s" % hub.host.native_rows()
 
 
-def later_plan_item(item, reason, check):
-    """Run an assertion that only a later plan item makes true: pass when it holds, else xfail (non-strict)."""
-    try:
-        check()
-    except AssertionError as error:
-        pytest.xfail("plan %s: %s (%s)" % (item, reason, str(error).splitlines()[0][:300]))
-
-
-def test_list_shows_host_and_workspace(hub):
+def test_list_shows_host_and_workspace_for_every_row(hub):
     session_id = hub.start_ok()["id"]
     hub.wait_state(session_id, {"running"}, START_DEADLINE_S)
     cells = list_table_row(hub, session_id)
-
-    def columns_filled():
-        assert cells["HOST"] == MACHINE, cells
-        assert cells["WORKSPACE"] not in ("", "-"), cells
-    later_plan_item("3.2", "`hub sessions list` HOST/WORKSPACE are empty for Hub2 rows (CLI reads machine/workspace)",
-                    columns_filled)
-
-
-def test_start_wait_without_connected_host_fails_within_deadline(hub_without_host):
-    hub = hub_without_host
-    assert hub.machine().get("connected") is not True
-    result = hub.start("--wait", "--timeout", "20", "--interval", "2")
-    assert result.returncode != 0, "start --wait reported success with no connected host:\n" + result.stdout
-    assert result.elapsed < 40, "start --wait did not give up within its deadline: %.1fs" % result.elapsed
-    # Today the CLI only says its wait timed out; the typed reason is plan 2.3/2.4 (next test).
-    assert "session_start_failed" in result.stderr or "timed out" in result.stderr, result.stderr[-2000:]
+    assert cells["HOST"] == MACHINE, cells
+    assert cells["WORKSPACE"] not in ("", "-"), cells
+    for row in hub.cli.json("sessions", "list", "--json")["sessions"]:
+        assert row.get("machine") == MACHINE or row.get("machine_id") == MACHINE, row
+        assert row.get("workspace"), row
 
 
-@pytest.mark.xfail(strict=False, reason="plan 2.3: POST /api/sessions must refuse immediately with 503 no_connected_host instead of offering to a disconnected host")
 def test_start_without_connected_host_is_refused_typed(hub_without_host):
     hub = hub_without_host
+    assert hub.machine().get("connected") is not True
     result = hub.start()
-    assert result.elapsed < 10, result.elapsed
     assert result.returncode != 0, "start accepted with no connected host:\n" + result.stdout
-    assert "no_connected_host" in result.stderr + result.stdout, result.stderr[-2000:]
+    assert "no_connected_host" in result.stderr + result.stdout, (result.stdout[-2000:], result.stderr[-2000:])
+    direct_started = time.monotonic()
+    direct = hub.server.api("POST", "/api/sessions", {"key": new_key(), "workspace": str(hub.host.workspace),
+                                                      "repo": "e2e-owner/e2e-repo", "brief": BRIEF})
+    assert time.monotonic() - direct_started < NO_HOST_REFUSAL_S, "refusal took too long"
+    assert direct.status == 503 and direct.body.get("error") == "no_connected_host", direct
+    assert hub.server.ok("GET", "/api/sessions?limit=100")["sessions"] == [], "a refused start left a session row"
 
 
-def test_unclaimed_offer_reaches_terminal_failure(hub_without_host):
-    hub = hub_without_host
-    result = hub.start()
-    if result.returncode != 0:
-        assert "no_connected_host" in result.stderr + result.stdout, result.stderr[-2000:]
-        return  # plan 2.3 refusal path: nothing was offered at all
-    session_id = json.loads(result.stdout)["id"]
-
-    def terminal():
-        row = hub.wait_state(session_id, {"failed"}, LAUNCH_FAIL_DEADLINE_S, check_host=False)
-        assert "host_no_response" in json.dumps(row), row
-    later_plan_item("2.3", "an unclaimed offer must end failed host_no_response within the start deadline "
-                    "(today it loops offered/expired)", terminal)
+def test_unclaimed_offer_fails_host_no_response(hub):
+    # A hung daemon: socket stays open, nothing claims the offer.
+    hub.host.freeze()
+    created = hub.start_ok()
+    session_id = created["id"]
+    assert created.get("state") in ("offered", "staged", "pending"), created
+    row = hub.wait_state(session_id, {"failed", "stopped", "lost", "running", "claimed"}, START_FAIL_DEADLINE_S,
+                         check_host=False)
+    assert row["state"] == "failed", row
+    assert "host_no_response" in json.dumps(row), row
 
 
-def test_host_killed_mid_launch_fails_within_deadline(hub):
+def test_host_killed_mid_launch_fails_typed(hub):
     # The stub engine holds its first action, so the host is inside launch when it dies.
     hub.host.control(first_action_delay_s=600)
     session_id = hub.start_ok()["id"]
     wait_for(lambda: hub.native_row(session_id), START_DEADLINE_S, label="native workload spawned")
-    assert hub.show(session_id)["state"] in ("claimed", "offered"), hub.show(session_id)
     hub.host.kill()
+    row = hub.wait_state(session_id, {"failed", "stopped", "lost", "running"}, START_FAIL_DEADLINE_S, check_host=False)
+    assert row["state"] == "failed", row
+    assert "launch_timeout_no_native" in json.dumps(row) or "host_no_response" in json.dumps(row), row
 
-    def failed_in_time():
-        row = hub.wait_state(session_id, {"failed", "stopped", "lost"}, LAUNCH_FAIL_DEADLINE_S, check_host=False)
-        assert row["state"] == "failed", row
-    later_plan_item("2.3", "a claimed session whose host died mid-launch must fail (launch_timeout_no_native) "
-                    "within the 120 s start deadline; it stays claimed", failed_in_time)
+
+def test_stale_heartbeat_signature_is_caught(zipapp):
+    """Mutation proof: a host whose Client.heartbeat lost `native_sessions=` (the stale
+    build/lib copy) must fail this harness, so the start-path test cannot silently pass."""
+    hub = Hub(zipapp, start_host=False)
+    try:
+        hub.host.source = stale_heartbeat_host_copy(hub.root)
+        hub.host.start()
+        with pytest.raises(AssertionError, match="host daemon exited"):
+            hub.wait_connected()
+        assert "unexpected keyword argument 'native_sessions'" in hub.host.tail(), hub.host.tail()
+        assert hub.machine().get("connected") is not True
+    finally:
+        hub.close()
 
 
 def test_server_restart_mid_session_host_reconnects(hub):
