@@ -56,10 +56,20 @@ async function until(fn){for(let i=0;i<100;i++){if(await fn())return;await new P
   }
  }
  const old=await enroll();
+ const selfPath='/api/fleet/routing/self';
+ const selfConnection=auth=>api(selfPath,'GET',undefined,auth);
+ const rejected=async(path,auth,method='GET')=>(await fetch(base+path,{method,headers:{Authorization:'Bearer '+auth}})).status;
+ assert.equal(await rejected(selfPath,token),403);
+ assert.equal(await rejected(selfPath,old,'POST'),405);
+ assert.equal(await rejected(selfPath+'?machine_id=another-machine',old),400);
+ assert.deepEqual(await selfConnection(old),{machine_id:machine,connected:false});
  await api('/api/heartbeat','POST',{os:'linux',arch:'x64',labels:[],engines:['shell'],capabilities:['headless'],host_version:sha,protocol_version:2},old);
  await expectRelease(false);
  await socket(old,matching);
  await expectRelease(true,sha,1);
+ assert.deepEqual(await selfConnection(old),{
+  machine_id:machine,connected:true,host_version:sha,protocol_version:1,version_mismatch:false,
+ });
  const beforeRestart=await socket(old,reported);
  await expectRelease(true,sha,2);
  beforeRestart.terminate();
@@ -93,6 +103,8 @@ async function until(fn){for(let i=0;i<100;i++){if(await fn())return;await new P
  prior=await socket(old,reported);
  await expectRelease(true,sha,2);
  const fresh=await enroll();
+ assert.equal(await rejected(selfPath,old),401);
+ assert.deepEqual(await selfConnection(fresh),{machine_id:machine,connected:false});
  assert.equal(prior.readyState,WebSocket.OPEN,'retired generation remains open until routing authorization');
  await expectRelease(false);
  await until(()=>prior.readyState!==WebSocket.OPEN);prior.terminate();
@@ -111,6 +123,7 @@ async function until(fn){for(let i=0;i<100;i++){if(await fn())return;await new P
  await until(()=>replacement.readyState!==WebSocket.OPEN);
  assert.equal((await api('/_socket/state')).open,1,'safety socket replaces normal singleton');
  assert.equal(safe.readyState,WebSocket.OPEN);
+ assert.deepEqual(await selfConnection(fresh),{machine_id:machine,connected:false});
  await expectRelease(false);
  const last=await socket(fresh,reported);
  await expectRelease(true,sha,2);

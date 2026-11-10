@@ -142,6 +142,11 @@ const router = {
           }))),
         });
       }
+      if (path === '/api/fleet/routing/self') {
+        if (request.method !== 'GET') return error('method_not_allowed', 405);
+        if (requestUrl(request).search) return error('unexpected_query', 400);
+        return await ownMachineConnection(env, actor);
+      }
       if (path === '/api/fleet/routing/machines' && request.method === 'GET')
         return await routingMachines(env, actor);
       if (path === '/api/fleet/routing/policy' && request.method === 'GET')
@@ -749,6 +754,17 @@ function readCursor(value: string | null): any {
     throw new HttpError('invalid_cursor', 400);
   }
 }
+/** The enrolled host can verify its own running daemon without an operator credential. */
+async function ownMachineConnection(env: Hub2Env, actor: Actor): Promise<Response> {
+  if (actor.kind !== 'machine' || !actor.resource_id || !actor.scopes.includes('machine:offer'))
+    return error('forbidden', 403);
+  const machine = env.MACHINES.get(env.MACHINES.idFromName(actor.resource_id));
+  const response = await machine.fetch('https://routing.internal/_internal/routing-snapshot');
+  if (!response.ok) return error('routing_view_unavailable', 503);
+  const { connected, host_version, protocol_version, version_mismatch } = await response.json() as JsonRecord;
+  return json({ machine_id: actor.resource_id, connected: connected === true, host_version, protocol_version, version_mismatch }, 200, noStore);
+}
+
 /** `hub routing-machines`: registered host routing information. */
 async function routingMachines(env: Hub2Env, actor: Actor): Promise<Response> {
   if (!admin(actor)) return error('forbidden', 403);

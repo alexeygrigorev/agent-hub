@@ -102,13 +102,53 @@ def failure(root, version):
     write_json(path, records)
 
 
+def read_release_receipt(target):
+    receipt = target / 'release.json'
+    if receipt.is_symlink() or not receipt.is_file():
+        raise ValueError('invalid installed release receipt')
+    with receipt.open('rb') as stream:
+        raw = stream.read(MAX_MANIFEST + 1)
+    if len(raw) > MAX_MANIFEST:
+        raise ValueError('invalid installed release receipt')
+    installed = json.loads(raw)
+    validate_manifest(installed)
+    return installed
+
+
 def check_service_ready(target):
+    target = target.resolve(strict=True)
+    installed = read_release_receipt(target)
+    if installed['host_version'] != target.name:
+        raise ValueError('installed release receipt does not match release directory')
+    config = Path.home() / '.config/agent-hub/v2.json'
+    if not config.is_file():
+        raise ValueError('missing enrollment config')
+    with config.open('rb') as stream:
+        raw = stream.read(MAX_MANIFEST + 1)
+    enrollment = json.loads(raw) if len(raw) <= MAX_MANIFEST else None
+    machine_id = enrollment.get('machine_id') if isinstance(enrollment, dict) else None
+    if not isinstance(machine_id, str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,80}', machine_id):
+        raise ValueError('invalid enrolled machine identity')
+
     # Type=simple reports active before imports/connect complete.
     active = ['systemctl', '--user', 'is-active', '--quiet', UNITS[0]]
     for _ in range(6):
         time.sleep(5)
         command(active)
-    command([target / 'bin/hub2', 'heartbeat'])
+
+    # The CLI handles authentication; credentials are never command arguments.
+    try:
+        result = subprocess.run([str(target / 'bin/hub2'), '--config', str(config), 'request', 'GET', '/api/fleet/routing/self'],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15)
+        status = json.loads(result.stdout) if result.returncode == 0 and len(result.stdout) <= 4096 else None
+    except (ValueError, OSError, subprocess.TimeoutExpired):
+        raise RuntimeError('host daemon connection not verified') from None
+    if (not isinstance(status, dict) or status.get('machine_id') != machine_id
+            or status.get('connected') is not True or status.get('version_mismatch') is not False
+            or status.get('host_version') != installed['host_version']
+            or type(status.get('protocol_version')) is not int
+            or status['protocol_version'] != installed['protocol_version']):
+        raise RuntimeError('host daemon connection not verified')
     command(active)
 
 
@@ -144,15 +184,7 @@ def matches_installed_artifact(path, record):
 def repair_service_files(base, manifest, root, target):
     # The release is already committed. Do not create a new environment or
     # mark it as an interrupted activation, which would make recovery remove it.
-    receipt = target / 'release.json'
-    if receipt.is_symlink() or not receipt.is_file():
-        raise ValueError('invalid installed release receipt')
-    with receipt.open('rb') as stream:
-        raw = stream.read(MAX_MANIFEST + 1)
-    if len(raw) > MAX_MANIFEST:
-        raise ValueError('invalid installed release receipt')
-    installed = json.loads(raw)
-    validate_manifest(installed)
+    installed = read_release_receipt(target)
     if (installed['host_version'] != manifest['host_version']
             or installed['protocol_version'] != manifest['protocol_version']):
         raise ValueError('installed release identity does not match the published manifest')
@@ -376,7 +408,7 @@ def main():
     parser.add_argument('--install-service', action='store_true', help='Install user units; enable after readiness when restarting')
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--no-restart', action='store_true', help='Stage initial installation before enrollment')
-    mode.add_argument('--check-service-ready', action='store_true', help='Observe the started service and verify its enrollment')
+    mode.add_argument('--check-service-ready', action='store_true', help='Verify the started service is connected with its installed release')
     args = parser.parse_args()
     if args.check_service_ready and args.install_service:
         parser.error('--check-service-ready does not install a service')
