@@ -62,7 +62,7 @@ jobs:
           bash -n scripts/resource-gate-monitor.sh scripts/install-resource-gate-monitor.sh
           bash scripts/test-resource-gate-monitor.sh
           bash -n deploy/vm/deploy-release-transaction.sh deploy/vm/install-hub2-node.sh
-          bash scripts/test-deploy-guard.sh
+          bash deploy/vm/test-deploy-guard.sh
           bash -n deploy/vm/test-hub-only-installer.sh
           bash deploy/vm/test-hub-only-installer.sh
       - name: Session controller shell regression tests
