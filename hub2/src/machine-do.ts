@@ -1207,6 +1207,11 @@ export class MachineDO {
     const launch=this.parse(row.launch_json) as JsonRecord;
     return {id:row.id,state:row.state,intake_id:row.intake_id,project_id:row.project_id,machine_id:row.machine_id,
       epoch:row.epoch,operation_id:row.operation_id,native_id:row.native_id,engine:launch.engine,model:launch.model,
+      managed:true,host:row.machine_id,machine:row.machine_id,workspace:launch.workspace,
+      account_id:row.account_id,account:row.account_id,effort:launch.effort??null,
+      mode:launch.interactive===true?'interactive':'headless',
+      created_at:new Date(row.created_at).toISOString(),updated_at:new Date(row.updated_at).toISOString(),
+      last_activity_at:this.db.one<{last_activity_at:number|null}>('SELECT last_activity_at FROM native_sessions WHERE session_id=?',row.id)?.last_activity_at??null,
       interactive:launch.interactive,evidence:this.parse(row.evidence_json),attention:this.db.one('SELECT reason,observed_at FROM attention WHERE session_id=?',row.id)||null};
   }
 
