@@ -121,10 +121,11 @@ export class ProjectDO {
       }
       if (url.pathname === '/api/intakes' && request.method === 'POST') return await this.createIntake(request);
       if (url.pathname === '/api/intakes' && request.method === 'GET') return this.listIntakes(request);
-      const match = url.pathname.match(/^\/api\/intakes\/([^/]+)(?:\/(start|history|append|events|context|audit))?$/);
+      const match = url.pathname.match(/^\/api\/intakes\/([^/]+)(?:\/(start|history|append|events|context|audit|discard))?$/);
       if (!match) return error('not_found', 404);
       const intakeId = decodeURIComponent(match[1]);
       if (match[2] === 'start' && request.method === 'POST') return await this.startIntake(request, intakeId);
+      if (match[2] === 'discard' && request.method === 'POST') return await this.discardUnused(request, intakeId);
       if (match[2] === 'history' && request.method === 'GET') return this.history(request, intakeId);
       if(match[2]==='append'&&request.method==='POST')return await this.appendIntake(request,intakeId);
       if(match[2]==='events'&&request.method==='POST')return await this.eventsCompat(request,intakeId);
@@ -276,6 +277,33 @@ export class ProjectDO {
     const hasMore = rows.length > 100;
     const page = rows.slice(0, 100).map(row => ({ seq: row.seq, actor_id: row.actor_id, kind: row.kind, at: row.at, body: this.parse(row.body_json) }));
     return json({ events: page, next: hasMore ? page[page.length - 1]?.seq : null });
+  }
+
+  /**
+   * Archive an intake that never carried work. `hub sessions start` creates an intake and then starts it;
+   * when that start is refused the intake would stay open forever. The fence is atomic and strict: only an
+   * `open` intake with no session, no host, no dispatch saga and no event besides its creation is discarded.
+   * Internal to the session-start path (the public router does not expose it).
+   */
+  private async discardUnused(request: Request, intakeId: string): Promise<Response> {
+    const actor = actorFrom(request), body = await bodyObject(request, 4096), key = this.idempotencyKey(request, body);
+    if (!key || typeof body.reason !== 'string' || !body.reason.trim() || body.reason.length > 200) return error('invalid_discard', 400);
+    const reason = body.reason.trim(), eventKey = 'discard:' + intakeId + ':' + key;
+    return this.transaction(() => {
+      const row = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?', intakeId);
+      if (!row) return error('intake_not_found', 404);
+      if (!this.canProject(actor, row.project, 'intake:write')) return error('forbidden', 403);
+      if (this.db.one('SELECT seq FROM intake_events WHERE event_key=?', eventKey))
+        return json({ discarded: row.status === 'archived', duplicate: true, intake: { id: row.id, status: row.status } });
+      const used = row.status !== 'open' || row.session_id !== null || row.assigned_machine_id !== null
+        || !!this.db.one('SELECT operation_id FROM dispatch_sagas WHERE intake_id=? LIMIT 1', row.id)
+        || !!this.db.one("SELECT seq FROM intake_events WHERE task_id=? AND kind<>'created' LIMIT 1", row.id);
+      if (used) return error('intake_in_use', 409);
+      const at = Date.now();
+      this.db.run("UPDATE intakes SET status='archived',updated_at=? WHERE id=? AND status='open' AND session_id IS NULL", at, row.id);
+      this.appendEvent(row.id, eventKey, actor!.id, 'intake_updated', { status: 'archived', note: reason }, at);
+      return json({ discarded: true, intake: { id: row.id, status: 'archived' } });
+    });
   }
 
   private async appendIntake(request:Request,intakeId:string):Promise<Response>{

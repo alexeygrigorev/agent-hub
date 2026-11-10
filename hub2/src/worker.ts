@@ -631,6 +631,7 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
   });
   const intakeId = (intake.data.intake as { id?: string } | undefined)?.id ?? (intake.data.id as string | undefined);
   if (!intake.response.ok || !intakeId) return json({ ...intake.data, error: intake.data.error ?? 'intake_create_failed', stage: 'intake' }, intake.response.ok ? 502 : intake.response.status);
+  const createdHere = !existingIntake && intake.response.status === 201;
   const start: JsonRecord = {
     key, workspace, interactive, purpose, with_goal: body.with_goal === true,
     ...(brief ? { prompt: brief } : {}),
@@ -645,14 +646,21 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
   const started = await call(`/api/intakes/${encodeURIComponent(intakeId)}/start`, start);
   const session = started.data.session as JsonRecord | undefined;
   if (!started.response.ok || !session?.id) {
-    // The intake above exists only to carry this start. A definitive refusal (4xx) must not leave it
-    // open: every refused `hub sessions start` used to add one orphan intake. 5xx keeps it for a keyed retry.
-    const refused = !existingIntake && started.response.status >= 400 && started.response.status < 500;
-    const archived = refused && (await call(`/api/intakes/${encodeURIComponent(intakeId)}`, {
-      key: `${key}:refused`, status: 'closed', reason: `start refused: ${String(started.data.error ?? 'session_start_failed').slice(0, 80)}`,
-    }).catch(() => undefined))?.response.ok === true;
+    // The intake above exists only to carry this start; a refused start used to leave it open forever.
+    // Discard it only when this very request created it (HTTP 201, never an idempotent replay) and the
+    // refusal is definitive: 408/409/429 and 5xx are retried with the same key on the same intake.
+    // ProjectDO applies the atomic fence (open, no session, no saga, no other event) and reports the state.
+    const definitive = [400, 403, 404].includes(started.response.status);
+    let discarded = false;
+    if (createdHere && definitive) {
+      const outcome = await call(`/api/intakes/${encodeURIComponent(intakeId)}/discard`, {
+        key: `${key}:refused`, reason: `start refused: ${String(started.data.error ?? 'session_start_failed').slice(0, 80)}`,
+      }).catch(() => undefined);
+      discarded = outcome?.response.ok === true && outcome.data.discarded === true
+        && (outcome.data.intake as JsonRecord | undefined)?.status === 'archived';
+    }
     return json({ ...started.data, error: started.data.error ?? 'session_start_failed', stage: 'start', intake_id: intakeId,
-      ...(archived ? { intake_archived: true } : {}) }, started.response.ok ? 502 : started.response.status);
+      ...(discarded ? { intake_archived: true } : {}) }, started.response.ok ? 502 : started.response.status);
   }
   // 201 = offered to the host; 202 = accepted and dispatching.
   return json({ ...session, project: canonical, intake_id: intakeId }, started.response.status);

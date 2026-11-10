@@ -4,7 +4,7 @@ import worker from '../src/worker';
 
 const token = 'synthetic-session-start-token-00000000000';
 
-function fixture(startRefusal?: { status: number; error: string }) {
+function fixture(options: { refusal?: { status: number; error: string }; createStatus?: number; discard?: { status: number; body: unknown } } = {}) {
   const projectCalls: Array<{ path: string; project: string | null; body: any }> = [];
   const control = {
     idFromName: (name: string) => name,
@@ -27,19 +27,24 @@ function fixture(startRefusal?: { status: number; error: string }) {
         const url = new URL(request.url);
         const body = await request.json();
         projectCalls.push({ path: url.pathname, project: url.searchParams.get('project'), body });
-        if (url.pathname === '/api/intakes') return Response.json({ intake: { id: 'intake-0001' } }, { status: 201 });
-        if (!url.pathname.endsWith('/start')) return Response.json({ intake: { id: 'intake-0001', status: 'archived' } });
-        if (startRefusal) return Response.json({ error: startRefusal.error }, { status: startRefusal.status });
+        if (url.pathname === '/api/intakes') return Response.json({ intake: { id: 'intake-0001' } }, { status: options.createStatus ?? 201 });
+        if (url.pathname.endsWith('/discard')) {
+          const discard = options.discard ?? { status: 200, body: { discarded: true, intake: { id: 'intake-0001', status: 'archived' } } };
+          return Response.json(discard.body, { status: discard.status });
+        }
+        if (options.refusal) return Response.json({ error: options.refusal.error }, { status: options.refusal.status });
         return Response.json({ session: { id: 'session-0001', state: 'offered' } }, { status: 201 });
       },
     }),
   };
-  const start = (body: Record<string, unknown>) => worker.fetch(new Request('https://hub.test/api/sessions', {
+  const env = { CONTROL: control, PROJECTS: projects, HUB2_DEV_OPERATOR_TOKEN: token } as any;
+  const post = (path: string, body: Record<string, unknown>) => worker.fetch(new Request('https://hub.test' + path, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', Origin: 'https://hub.test' },
-    body: JSON.stringify({ key: 'start-key-00000001', mode: 'headless', brief: 'Do the task', ...body }),
-  }), { CONTROL: control, PROJECTS: projects, HUB2_DEV_OPERATOR_TOKEN: token } as any);
-  return { projectCalls, start };
+    body: JSON.stringify(body),
+  }), env);
+  const start = (body: Record<string, unknown>) => post('/api/sessions', { key: 'start-key-00000001', mode: 'headless', brief: 'Do the task', ...body });
+  return { projectCalls, start, post };
 }
 
 test('--cwd is the launch workspace; the repository only names the project', async () => {
@@ -68,22 +73,56 @@ test('--cwd wins over a workspace label and a relative --cwd is refused before a
   assert.equal(g.projectCalls.length, 0);
 });
 
-test('a refused start archives the intake it created, keeps one it was given, and keeps it on a transient error', async () => {
-  const refused = fixture({ status: 400, error: 'astra_not_for_implementation' });
-  const response = await refused.start({ repo: 'org/app', cwd: '/home/user/work/task' });
+test('a definitively refused start discards the intake this request created', async () => {
+  const f = fixture({ refusal: { status: 400, error: 'astra_not_for_implementation' } });
+  const response = await f.start({ repo: 'org/app', cwd: '/home/user/work/task' });
   assert.equal(response.status, 400);
   assert.deepEqual(await response.json(), { error: 'astra_not_for_implementation', stage: 'start', intake_id: 'intake-0001', intake_archived: true });
-  const cleanup = refused.projectCalls.at(-1)!;
-  assert.equal(cleanup.path, '/api/intakes/intake-0001');
-  assert.deepEqual(cleanup.body, { key: 'start-key-00000001:refused', status: 'closed', reason: 'start refused: astra_not_for_implementation' });
+  const cleanup = f.projectCalls.at(-1)!;
+  assert.equal(cleanup.path, '/api/intakes/intake-0001/discard');
+  assert.deepEqual(cleanup.body, { key: 'start-key-00000001:refused', reason: 'start refused: astra_not_for_implementation' });
+});
 
-  const given = fixture({ status: 409, error: 'intake_already_assigned' });
-  const kept = await given.start({ repo: 'org/app', intake_task_id: 'intake-given' });
-  assert.equal(kept.status, 409);
-  assert.equal(((await kept.json()) as any).intake_archived, undefined);
-  assert.deepEqual(given.projectCalls.map(call => call.path), ['/api/intakes/intake-given/start'], 'an existing intake is never archived by a refusal');
+test('no discard for a replayed or caller-supplied intake, nor for a retryable refusal', async () => {
+  const replayed = fixture({ createStatus: 200, refusal: { status: 400, error: 'invalid_model' } });
+  const replayBody = (await (await replayed.start({ repo: 'org/app' })).json()) as any;
+  assert.equal(replayBody.intake_archived, undefined);
+  assert.ok(replayed.projectCalls.at(-1)!.path.endsWith('/start'), 'an idempotent replay returned an existing intake');
 
-  const transient = fixture({ status: 503, error: 'no_connected_host' });
-  assert.equal((await transient.start({ repo: 'org/app' })).status, 503);
-  assert.ok(transient.projectCalls.at(-1)!.path.endsWith('/start'), 'a 5xx keeps the intake for a keyed retry');
+  const given = fixture({ refusal: { status: 400, error: 'invalid_model' } });
+  assert.equal((await given.start({ repo: 'org/app', intake_task_id: 'intake-given' })).status, 400);
+  assert.deepEqual(given.projectCalls.map(call => call.path), ['/api/intakes/intake-given/start']);
+
+  for (const status of [408, 409, 429, 500, 503]) {
+    const retryable = fixture({ refusal: { status, error: 'try_again' } });
+    const response = await retryable.start({ repo: 'org/app' });
+    assert.equal(response.status, status);
+    assert.equal(((await response.json()) as any).intake_archived, undefined);
+    assert.ok(retryable.projectCalls.at(-1)!.path.endsWith('/start'), `HTTP ${status} keeps the intake for a keyed retry`);
+  }
+});
+
+test('intake_archived is reported only when the project confirms the archived state', async () => {
+  for (const discard of [
+    { status: 409, body: { error: 'intake_in_use' } },
+    { status: 500, body: { error: 'internal_error' } },
+    { status: 200, body: { discarded: false, duplicate: true, intake: { id: 'intake-0001', status: 'open' } } },
+    { status: 200, body: { discarded: true, intake: { id: 'intake-0001', status: 'accepted' } } },
+  ]) {
+    const f = fixture({ refusal: { status: 400, error: 'invalid_model' }, discard });
+    const response = await f.start({ repo: 'org/app' });
+    assert.equal(response.status, 400, 'the refusal itself is still reported');
+    const body = (await response.json()) as any;
+    assert.equal(body.error, 'invalid_model');
+    assert.equal(body.intake_archived, undefined, JSON.stringify(discard));
+  }
+});
+
+test('the discard route is not reachable through the public API', async () => {
+  const f = fixture();
+  for (const path of ['/api/intakes/intake-0001/discard?project=org/app', '/api/intake/tasks/intake-0001/discard?project=org/app']) {
+    const response = await f.post(path, { key: 'outside-key-0001', reason: 'start refused: x' });
+    assert.ok(response.status >= 400, path);
+  }
+  assert.equal(f.projectCalls.length, 0);
 });
