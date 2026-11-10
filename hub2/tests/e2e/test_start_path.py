@@ -31,7 +31,6 @@ START_DEADLINE_FROM_ACCEPT_S = 120
 # acceptance, and the typed terminal state is recorded when it expires; the alarm may
 # fire after the deadline but no later than deadline + ALARM_SLACK_S.
 ALARM_SLACK_S = 5
-DEADLINE_FIELDS = ("start_deadline_at", "start_deadline", "deadline_at", "deadline_ms")
 NO_HOST_REFUSAL_S = 2      # plan 2.3: no connected host -> 503 no_connected_host in <2 s
 
 
@@ -201,46 +200,55 @@ def acceptance_ms(hub, created):
     return hub.accepted_client_ms, "client_after_2xx"
 
 
-def stated_deadline_ms(*sources):
-    for source in sources:
-        for container in (source, source.get("attention") or {}, source.get("launch") or {}):
-            for key in DEADLINE_FIELDS:
-                stamp = iso_ms(container.get(key))
-                if stamp:
-                    return stamp, key
-    return None, None
-
-
 def assert_failed_within_start_deadline(hub, created, reason):
-    """Deadline = acceptance + 120 s exactly; failed with attention.reason == reason in [deadline, deadline + 5 s]."""
+    """Published start_deadline_at = acceptance + 120 s; failed with attention.reason == reason in [deadline, deadline + 5 s]."""
     session_id = created["id"]
     t0, source = acceptance_ms(hub, created)
-    until = t0 / 1000 + START_DEADLINE_FROM_ACCEPT_S + ALARM_SLACK_S + 3
-    row = hub.show(session_id)
+    first = hub.show(session_id)
+    assert "start_deadline_at" in first, "session view does not publish start_deadline_at: %s" % json.dumps(first)
+    deadline = iso_ms(first["start_deadline_at"])
+    assert deadline, "start_deadline_at is not a timestamp: %r" % first["start_deadline_at"]
+    assert abs(deadline - t0 - START_DEADLINE_FROM_ACCEPT_S * 1000) < 1000, \
+        "start_deadline_at=%s is not acceptance t0=%s (%s) + 120 s" % (deadline, t0, source)
+    until = deadline / 1000 + ALARM_SLACK_S + 3
+    row = first
     while row.get("state") not in ("failed", "stopped", "lost", "running", "completed-awaiting-review") \
             and time.time() < until:
         time.sleep(1)
         row = hub.show(session_id)
     attention = row.get("attention") or {}
     observed = iso_ms(attention.get("observed_at"))
-    deadline, field = stated_deadline_ms(created, row)
-    detail = "t0=%s (%s) deadline=%s (%s) observed_at=%s row=%s\nhost log:\n%s\nserver log:\n%s" % (
-        t0, source, deadline, field, observed, json.dumps(row), hub.host.tail(), hub.server.tail())
+    detail = "t0=%s (%s) start_deadline_at=%s observed_at=%s row=%s\nhost log:\n%s\nserver log:\n%s" % (
+        t0, source, deadline, observed, json.dumps(row), hub.host.tail(), hub.server.tail())
     assert row.get("state") == "failed", "not failed by deadline + %ss: %s" % (ALARM_SLACK_S, detail)
     assert attention.get("reason") == reason, "attention.reason != %s: %s" % (reason, detail)
     assert observed, "failed row has no attention.observed_at: " + detail
-    if deadline is not None:
-        assert abs(deadline - t0 - START_DEADLINE_FROM_ACCEPT_S * 1000) < 1000, \
-            "server deadline is not acceptance + 120 s: " + detail
-    else:
-        # GAP: the API does not expose the start deadline; pin it to acceptance + 120 s instead.
-        print("GAP: no start deadline field (%s) on the start response or session view" % ", ".join(DEADLINE_FIELDS))
-        deadline = t0 + START_DEADLINE_FROM_ACCEPT_S * 1000
     assert deadline <= observed <= deadline + ALARM_SLACK_S * 1000, \
         "terminal observation outside [deadline, deadline + %ss]: %s" % (ALARM_SLACK_S, detail)
-    print("%s: failed %s at deadline%+.3fs (deadline field=%s, t0 %s)" % (
-        session_id, reason, (observed - deadline) / 1000, field or "GAP", source))
+    print("%s: failed %s at start_deadline_at%+.3fs (t0 %s)" % (session_id, reason, (observed - deadline) / 1000, source))
     return row
+
+
+def test_free_shell_start_runs_literal_command(hub):
+    """Shell contract: engine=shell, the prompt is the literal command run via /bin/sh -c, headless, no provider home."""
+    result = hub.cli.run("sessions", "start", "--engine", "shell", "--workspace", str(hub.host.workspace),
+                         "--prompt", "printf CANARY-OK; sleep 30", "--key", new_key())
+    assert result.returncode == 0, "free shell start failed rc=%s\n%s\n%s" % (
+        result.returncode, result.stdout[-2000:], result.stderr[-2000:])
+    created = json.loads(result.stdout)
+    assert created.get("engine") == "shell", created
+    session_id = created["id"]
+    hub.wait_state(session_id, {"running"}, START_DEADLINE_S)
+    native = hub.native_row(session_id)
+    assert native and native["command"] == ["/bin/sh", "-c", "printf CANARY-OK; sleep 30"], native
+    assert not any(key in native.get("env", {}) for key in ("CODEX_HOME", "CLAUDE_CONFIG_DIR", "OPENCODE_DB")), native
+    capture = hub.cli.run("sessions", "capture", session_id, "--timeout", "60")
+    assert capture.returncode == 0, (capture.stdout[-2000:], capture.stderr[-2000:])
+    assert "CANARY-OK" in capture.stdout, capture.stdout[-2000:]
+    stop = hub.cli.run("sessions", "stop", session_id, "--timeout", str(STOP_DEADLINE_S))
+    assert stop.returncode == 0, (stop.stdout[-2000:], stop.stderr[-2000:])
+    assert hub.wait_state(session_id, {"stopped", "failed"}, STOP_DEADLINE_S)["state"] == "stopped"
+    assert hub.native_row(session_id) is None, hub.host.native_rows()
 
 
 def test_list_shows_host_and_workspace_for_every_row(hub):
@@ -274,6 +282,12 @@ def test_start_without_connected_host_is_refused_typed(hub_without_host):
         "engine": "shell", "engine_override_reason": "e2e: explicit shell start must not bypass the connected check"})
     assert time.monotonic() - shell_started < NO_HOST_REFUSAL_S, "shell refusal took too long"
     assert direct_shell.status == 503 and direct_shell.body.get("error") == "no_connected_host", direct_shell
+    bare_started = time.monotonic()
+    bare_shell = hub.server.api("POST", "/api/sessions", {
+        "key": new_key(), "workspace": str(hub.host.workspace), "repo": "e2e-owner/e2e-repo", "brief": "printf CANARY-OK",
+        "engine": "shell", "machine": MACHINE})
+    assert time.monotonic() - bare_started < NO_HOST_REFUSAL_S, "no-reason shell refusal took too long"
+    assert bare_shell.status == 503 and bare_shell.body.get("error") == "no_connected_host", bare_shell
     assert hub.server.ok("GET", "/api/sessions?limit=100")["sessions"] == [], "a refused start left a session row"
 
 
