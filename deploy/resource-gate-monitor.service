@@ -1,0 +1,16 @@
+[Unit]
+Description=Check Resource Gate TLS and send outage email
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=alexey
+Group=alexey
+ExecStart=/usr/local/sbin/resource-gate-monitor.sh
+TimeoutStartSec=30
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/resource-gate-monitor
