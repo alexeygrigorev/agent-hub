@@ -20,6 +20,7 @@ import tomllib
 
 REPO = Path(__file__).resolve().parent.parent
 UNITS = ('agent-hub2-host.service', 'agent-hub2-host-update.service', 'agent-hub2-host-update.timer')
+CLI_INSTALLERS = ('install.sh', 'install.ps1')
 
 
 def run(args, **kwargs):
@@ -38,7 +39,8 @@ def export_source(repo, revision, target):
                    'config/model-routing.json', 'scripts/build-hub-cli.py',
                    'scripts/session-host-supervisor.py', 'scripts/hub2-self-update.py', 'scripts/hub2-enroll.py',
                    'deploy/agent-hub2-host.service', 'deploy/agent-hub2-host-update.service',
-                   'deploy/agent-hub2-host-update.timer', 'deploy/host-install.sh', 'uv.lock'])
+                   'deploy/agent-hub2-host-update.timer', 'deploy/host-install.sh', 'uv.lock',
+                   *(f'public/cli/{name}' for name in CLI_INSTALLERS)])
     with tarfile.open(fileobj=io.BytesIO(archive)) as bundle:
         for entry in bundle:
             name = Path(entry.name)
@@ -91,6 +93,8 @@ def build(repo, revision, output):
         spec.loader.exec_module(cli)
         cli.git_sha = lambda: sha
         cli.build(artifacts, '2.0.0+g' + sha)
+        for installer in CLI_INSTALLERS:
+            shutil.copyfile(source / 'public/cli' / installer, artifacts / installer)
         shutil.copyfile(source / 'scripts/hub2-self-update.py', artifacts / 'hub2-self-update.py')
         shutil.copyfile(source / 'scripts/hub2-enroll.py', artifacts / 'hub2-enroll.py')
         shutil.copyfile(source / 'deploy/host-install.sh', artifacts / 'host-install.sh')
