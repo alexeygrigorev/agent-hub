@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Stub aplexer `a` for the Hub2 start-path e2e test.
 
-Implements start/status/list/kill/capture/whoami over $APLEXER_STATE_DIR with
+Implements start/status/list/kill/capture/whoami/task run over $APLEXER_STATE_DIR with
 the JSON shapes captured from the real binary (fixtures/aplexer.json). The
 workload really runs as a detached child process, so kill, exit codes and
 captured output are genuine; only cgroups, PTYs and the resident daemon are
@@ -78,6 +78,33 @@ def take(args, flag, default=None):
     return default
 
 
+def control():
+    path = STATE / "stub-control.json"
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+# Profile -> engine binary, as `a profiles` reports them on Hetzner (hub-shared-codex engine=codex).
+PROFILE_ENGINES = {"hub-shared-codex": "codex", "hub-shared-go": "opencode", "hub-zai-central": "zcodex",
+                   "hub-hub-antigravity": "agy"}
+
+
+def cmd_task_run(args):
+    """`a task run`: prompt file in, engine exec out (worker side of `a start -- a task run ...`)."""
+    engine_args = [a.split("=", 1)[1] for a in args if a.startswith("--engine-arg=")]
+    args = [a for a in args if not a.startswith("--engine-arg=")]
+    while "--engine-arg" in args:
+        engine_args.append(take(args, "--engine-arg"))
+    profile, engine = take(args, "--profile"), take(args, "--engine")
+    cwd, prompt_file = take(args, "--cwd", os.getcwd()), take(args, "--prompt-file")
+    binary = PROFILE_ENGINES.get(profile) if profile else engine
+    if not binary or not prompt_file:
+        return fail("stub a task run: --profile/--engine and --prompt-file required", 2)
+    prompt = Path(prompt_file).read_text()
+    os.chdir(cwd)
+    argv = [binary, "exec", *engine_args, "--dangerously-bypass-approvals-and-sandbox", "--json", prompt]
+    os.execvp(binary, argv)
+
+
 def cmd_start(args):
     child = args[args.index("--") + 1:] if "--" in args else []
     args = args[:args.index("--")] if "--" in args else args
@@ -92,6 +119,11 @@ def cmd_start(args):
     take(args, "--startup-timeout-ms")
     if not child:
         return fail("stub a start needs -- <command>", 2)
+    delay = float(control().get("start_delay_s", 0))
+    if delay:
+        # Daemon handshake that has not returned yet: no session exists until it does.
+        (STATE / "start-pending").write_text(tag)
+        time.sleep(delay)
     if resolve(workspace + ":" + tag):
         return fail("tag %s already exists in %s" % (tag, workspace))
     created = now_ms()
@@ -194,6 +226,8 @@ def main(argv):
         return cmd_supervise(args[0])
     if command == "start":
         return cmd_start(args)
+    if command == "task" and args[:1] == ["run"]:
+        return cmd_task_run(args[1:])
     if command in ("status", "show"):
         selector = next((a for a in args if not a.startswith("-")), None)
         row = resolve(selector) if selector else None

@@ -210,14 +210,16 @@ def test_unclaimed_offer_fails_host_no_response(hub):
 
 
 def test_host_killed_mid_launch_fails_typed(hub):
-    # The stub engine holds its first action, so the host is inside launch when it dies.
-    hub.host.control(first_action_delay_s=600)
+    # `a start` blocks inside the daemon, so the host dies before any native id exists.
+    hub.host.control(start_delay_s=600)
     session_id = hub.start_ok()["id"]
-    wait_for(lambda: hub.native_row(session_id), START_DEADLINE_S, label="native workload spawned")
+    wait_for(lambda: (hub.host.state / "start-pending").exists(), START_DEADLINE_S, label="host inside `a start`")
+    assert hub.show(session_id)["state"] in ("claimed", "admitted"), hub.show(session_id)
     hub.host.kill()
     row = hub.wait_state(session_id, {"failed", "stopped", "lost", "running"}, START_FAIL_DEADLINE_S, check_host=False)
     assert row["state"] == "failed", row
-    assert "launch_timeout_no_native" in json.dumps(row) or "host_no_response" in json.dumps(row), row
+    assert "launch_timeout_no_native" in json.dumps(row), row
+    assert hub.native_row(session_id) is None, hub.host.native_rows()
 
 
 def test_stale_heartbeat_signature_is_caught(zipapp):
@@ -227,10 +229,11 @@ def test_stale_heartbeat_signature_is_caught(zipapp):
     try:
         hub.host.source = stale_heartbeat_host_copy(hub.root)
         hub.host.start()
-        with pytest.raises(AssertionError, match="host daemon exited"):
-            hub.wait_connected()
-        assert "unexpected keyword argument 'native_sessions'" in hub.host.tail(), hub.host.tail()
-        assert hub.machine().get("connected") is not True
+        wait_for(lambda: "unexpected keyword argument 'native_sessions'" in hub.host.tail(200), 30,
+                 label="stale heartbeat TypeError in the host log")
+        with pytest.raises(AssertionError):
+            hub.wait_connected(timeout=20)
+        assert hub.machine().get("connected") is not True, hub.host.tail()
     finally:
         hub.close()
 

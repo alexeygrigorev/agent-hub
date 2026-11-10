@@ -68,6 +68,21 @@ jobs:
           mkdir -p "$TMPDIR"
           scripts/with-temp-home.sh -- python -m pytest hub2/tests/e2e -v -rxXs -p no:cacheprovider --durations=0
 
+  # Always-run gate for branch protection: fails explicitly unless the e2e job
+  # succeeded (a skipped or cancelled e2e is a failure, never a pass).
+  e2e-start-path-gate:
+    if: always()
+    needs: [e2e-start-path]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require e2e-start-path success
+        env:
+          RESULT: ${{ needs.e2e-start-path.result }}
+        run: |
+          echo "e2e-start-path: $RESULT"
+          [ "$RESULT" = "success" ] || { echo "::error::e2e-start-path result is $RESULT"; exit 1; }
+
   checks:
     runs-on: ubuntu-latest
     timeout-minutes: 35
