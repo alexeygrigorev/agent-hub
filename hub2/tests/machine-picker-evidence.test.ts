@@ -2,6 +2,7 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {DatabaseSync} from 'node:sqlite';
 import {MachineDO} from '../src/machine-do';
+import worker from '../src/worker';
 import {advanceDispatch} from '../src/dispatch';
 import {spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
@@ -93,5 +94,46 @@ test('separate evidence allowance cannot bypass launch size, identity binding or
   assert.equal((await f.call('/_internal/reserve','POST',reservation(evidence(),'x'.repeat(12_000)))).status,413);
   const huge:any=reservation();huge.picker.extra='x'.repeat(65_536);assert.equal((await f.call('/_internal/reserve','POST',huge)).status,413);
   assert.equal(f.database.prepare('SELECT * FROM sessions').all().length,0);
+ }finally{f.database.close();}
+});
+
+
+test('public live session pages filter terminal rows before pagination, for one machine and the fleet',async()=>{
+ const f=fixture();try{
+  await beat(f);
+  const states=[['a','failed'],['b','running'],['c','expired'],['d','offered'],['e','stopped']];
+  for(const [id,state] of states){
+   const input={...reservation(),session_id:id,operation_id:'op-'+id,dispatch_id:'dispatch-'+id};
+   assert.equal((await f.call('/_internal/reserve','POST',input)).status,201);
+   f.database.prepare('UPDATE sessions SET state=? WHERE id=?').run(state,id);
+  }
+  const env={...f.env,CONTROL:{idFromName:(id:string)=>id,get:()=>({fetch:async(request:Request)=>{
+   const path=new URL(request.url).pathname;
+   if(path==='/_verify')return Response.json({actor:admin});
+   if(path==='/api/directory')return Response.json({items:[{id:'h1'}],next:null});
+   throw new Error('unexpected control route '+path);
+  }})}};
+  const page=async(query:URLSearchParams)=>{
+   const response=await worker.fetch(new Request('https://hub.test/api/sessions?'+query,{
+    headers:{Authorization:'Bearer '+'test-token'.repeat(4)},
+   }),env);
+   assert.equal(response.status,200);
+   return await response.json() as {sessions:{id:string;host:string;workspace:string}[];next_cursor:string|null;complete:boolean};
+  };
+  for(const machine of ['', 'h1']){
+   const query=new URLSearchParams({live:'1',limit:'1'});
+   if(machine)query.set('machine_id',machine);
+   const first=await page(query);
+   assert.deepEqual(first.sessions.map(row=>[row.id,row.host,row.workspace]),[['b','h1','/synthetic']]);
+   assert.equal(first.complete,false);
+   assert(first.next_cursor);
+   query.set('after',first.next_cursor);
+   const last=await page(query);
+   assert.deepEqual(last.sessions.map(row=>row.id),['d']);
+   assert.equal(last.complete,true);
+   assert.equal(last.next_cursor,null);
+   query.delete('after');query.delete('live');query.set('limit','10');
+   assert.deepEqual((await page(query)).sessions.map(row=>row.id),states.map(([id])=>id));
+  }
  }finally{f.database.close();}
 });

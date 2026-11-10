@@ -1062,7 +1062,8 @@ def _execute(args):
         # --state) walks history. A --limit caps rows, it does not request
         # history.
         live_only = (not getattr(args, 'all', False)
-                     and wanted not in ('stopped', 'failed', 'cancelled', 'refused', 'done'))
+                     and wanted not in ('stopped', 'failed', 'cancelled', 'refused', 'done',
+                                        'expired', 'completed-awaiting-review'))
         while True:
             page_size = min(100, total_limit - len(seen)) if total_limit is not None else 100
             path = '/api/sessions?%slimit=%d' % ('live=1&' if live_only else '', page_size)
