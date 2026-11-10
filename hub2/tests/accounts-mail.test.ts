@@ -486,7 +486,7 @@ test('zai configuration and policy refuse retired account aliases without bannin
  const claude={id:'claude-sonnet-medium',engine:'claude',model:'sonnet',effort:'medium',account_id:'claude',weight:1,capabilities:['interactive'],enabled:true};
  assert.equal((await control.fetch(request('/api/model-policy','PUT',{candidates:[claude]}))).status,200);
  for(const invalid of [
-  {...claude,model:'opus'},
+  {...claude,model:'opus',effort:'max'},
   {...claude,model:'haiku'},
   {...claude,effort:'low'},
   {...claude,engine:'codex',model:'gpt-6-luna',effort:'medium'},
