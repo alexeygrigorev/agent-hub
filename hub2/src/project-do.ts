@@ -4,7 +4,8 @@ import { SqlReceiptMeter, SQL_PROBE_HEADER, wrapSqlNamespaces } from './sql-rece
 import { sha256Hex } from './crypto';
 import { actorFrom, bodyObject, error, hasScope, HttpError, json } from './http';
 import { advanceDispatch } from './dispatch';
-import { pickModelRoute, type PickedRoute } from './model-picker';
+import { pickModelRouteDetailed, type PickedRoute, type PickDiagnostics } from './model-picker';
+import {buildStartPickerEvidence, normalizeStartPickerEvidence} from './start-picker-evidence';
 import { sessionPurpose } from './session-purpose';
 import { nativeReturncode } from './native-exit';
 import { PROJECT_WORK_SCHEMA, ProjectWork, type ProjectWorkHooks } from './project-work';
@@ -73,6 +74,7 @@ export class ProjectDO {
   private constructorMs = 0;
   private readonly eventSequences=new Map<string,number>();
   private pendingSequences:Map<string,number>|undefined;
+  private routingQueue:Promise<void>=Promise.resolve();
 
   constructor(private readonly ctx: DurableObjectState, env: Hub2Env) {
     const started = performance.now();
@@ -347,6 +349,26 @@ export class ProjectDO {
   }
 
   private async startIntake(request: Request, intakeId: string): Promise<Response> {
+    const accepted=await this.serializeRouting(()=>this.prepareStartIntake(request,intakeId));
+    if(accepted instanceof Response)return accepted;
+    // Routing decisions are serialized only until their durable receipt exists;
+    // dispatch and host launch do not hold the picker queue.
+    await this.scheduleNext();
+    await this.dispatchSaga(accepted);
+    await this.scheduleNext();
+    const saga=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?',accepted);
+    return saga?this.startResponse(saga,['offered','claimed','running'].includes(saga.state)?201:202):error('dispatch_state_unavailable',503);
+  }
+
+  private async serializeRouting<T>(action:()=>Promise<T>):Promise<T>{
+    const previous=this.routingQueue;
+    let release!:()=>void;
+    this.routingQueue=new Promise<void>(resolve=>{release=resolve;});
+    await previous;
+    try{return await action();}finally{release();}
+  }
+
+  private async prepareStartIntake(request: Request, intakeId: string): Promise<Response|string> {
     const actor = actorFrom(request);
     const body = await bodyObject(request, 16_384);
     const key = this.idempotencyKey(request, body);
@@ -404,11 +426,12 @@ export class ProjectDO {
     if (prior instanceof Response) return prior;
     if (prior) {
       const saga = this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id = ?', prior.operation_id as string);
-      return saga ? json({ session: this.sagaView(saga) }, 200) : error('dispatch_state_unavailable', 503);
+      return saga ? this.startResponse(saga,200) : error('dispatch_state_unavailable', 503);
     }
 
     const operationId = crypto.randomUUID();
     let route: PickedRoute;
+    let diagnostics:PickDiagnostics;
     if (typeof engineInput === 'string' && engineInput.toLowerCase() === 'shell') {
       if (!hasScope(actor, 'operator:admin')) return error('forbidden', 403);
       const hostIds = new Set<string>();
@@ -443,8 +466,10 @@ export class ProjectDO {
         policy_version: 1, override_reason: overrideReason ?? null, weight: 1, quota_remaining: 0,
         required_capabilities: [interactive ? 'interactive' : 'headless', ...requiredCapabilities],
       };
+      diagnostics={pool:[{policy_id:route.policy_id,engine:route.engine,model:route.model,
+        effort:route.effort??null,weight:1,share:1}],excluded:[]};
     } else {
-      route = await pickModelRoute(this.env, {
+      const picked = await pickModelRouteDetailed(this.env, {
           ...(typeof machineInput === 'string' ? { machine_id: machineInput } : {}),
           ...(typeof engineInput === 'string' ? { engine: engineInput } : {}),
           ...(typeof modelInput === 'string' ? { model: modelInput } : {}),
@@ -453,12 +478,14 @@ export class ProjectDO {
           ...(overrideReason ? { override_reason: overrideReason } : {}),
           interactive, purpose, with_goal: withGoal, required_capabilities: requiredCapabilities, workspace,
         });
+      route=picked.route;diagnostics=picked.diagnostics;
     }
+    const picker=buildStartPickerEvidence(route,diagnostics);
     const raced = this.idempotent(scope, key, digest);
     if (raced instanceof Response) return raced;
     if (raced) {
       const saga = this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id = ?', raced.operation_id as string);
-      return saga ? json({ session: this.sagaView(saga) }, 200) : error('dispatch_state_unavailable', 503);
+      return saga ? this.startResponse(saga,200) : error('dispatch_state_unavailable', 503);
     }
     const accountId = route.engine.toLowerCase() === 'shell' ? null : route.account_id;
     const launchSpec = {
@@ -482,7 +509,7 @@ export class ProjectDO {
             ? `intake is ${current.status} with session ${current.session_id}; stop it first (hub sessions stop ${current.session_id}), then start again on this intake`
             : `intake is ${current.status}; reopen it first (hub intake update ${current.id} --status open), then start again on this intake`);
         this.db.run(`INSERT INTO dispatch_sagas(operation_id, request_digest, request_key, intake_id, session_id, machine_id, account_id, attempt_operation_id, launch_spec_json, routing_json, epoch, state, attempt, next_action_at, last_reason, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending_machine', 0, ?, NULL, ?, ?)`, operationId, digest, key, intakeId, sessionId, machineId, accountId, `${operationId}:0`, JSON.stringify(launchSpec), JSON.stringify({...route,attempted_policy_ids:[route.policy_id]}), now + 30_000, now, now);
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending_machine', 0, ?, NULL, ?, ?)`, operationId, digest, key, intakeId, sessionId, machineId, accountId, `${operationId}:0`, JSON.stringify(launchSpec), JSON.stringify({...route,attempted_policy_ids:[route.policy_id],picker,initial_picker:picker}), now + 30_000, now, now);
         this.db.run("UPDATE intakes SET status = 'queued', assigned_machine_id = ?, assigned_actor_id = ?, session_id = ?, final_evidence_json=NULL, updated_at = ? WHERE id = ?", machineId, actor?.id || 'operator', sessionId, now, intakeId);
         this.appendEvent(intakeId, `start:${operationId}:requested`, actor?.id || 'operator', 'session_start_requested', {
           operation_id: operationId, session_id: sessionId, machine_id: machineId, account_id: accountId, routing_decision: route,...(current.status==='failed'?{retry_of_session:current.session_id}:{}),
@@ -498,11 +525,7 @@ export class ProjectDO {
       if (caught instanceof HttpError) return error(caught.code, caught.status, caught.detail);
       return error('dispatch_persist_failed', 503);
     }
-    await this.scheduleNext();
-    await this.dispatchSaga(operationId);
-    await this.scheduleNext();
-    const saga = this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id = ?', operationId);
-    return saga ? json({ session: this.sagaView(saga) }, ['offered', 'claimed', 'running'].includes(saga.state) ? 201 : 202) : error('dispatch_state_unavailable', 503);
+    return operationId;
   }
 
   private async dispatchSaga(operationId: string): Promise<boolean> {
@@ -550,6 +573,7 @@ export class ProjectDO {
           request_digest: saga.request_digest, project_id: intake.project, intake_id: intake.id,
           title: intake.title, acceptance_criteria: this.parse(intake.acceptance_criteria_json),
           launch: this.parse(saga.launch_spec_json),
+          picker: normalizeStartPickerEvidence((this.parse(saga.routing_json) as JsonRecord|null)?.picker),
         });
         if (!outcome.ok) { await this.deferSaga(saga, outcome.reason); return; }
         const now = Date.now();
@@ -706,26 +730,38 @@ export class ProjectDO {
   }
 
   private async authFallbackInternal(request:Request):Promise<Response>{
+    const prepared=await this.serializeRouting(()=>this.prepareAuthFallback(request));
+    if(prepared instanceof Response)return prepared;
+    await this.scheduleNext();
+    await this.dispatchSaga(prepared.operation_id);
+    await this.scheduleNext();
+    return json({fallback:true,session_id:prepared.session_id,engine:prepared.engine,model:prepared.model});
+  }
+
+  private async prepareAuthFallback(request:Request):Promise<Response|{operation_id:string;session_id:string;engine:string;model:string}>{
     const body=await bodyObject(request,4096);
     if(typeof body.operation_id!=='string'||typeof body.attempt_operation_id!=='string'||typeof body.session_id!=='string'
       ||typeof body.machine_id!=='string'||!Number.isSafeInteger(body.epoch)||typeof body.reason!=='string')return error('invalid_auth_fallback',400);
     const saga=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?',body.operation_id);
     if(!saga||saga.session_id!==body.session_id||saga.machine_id!==body.machine_id||saga.attempt_operation_id!==body.attempt_operation_id
       ||saga.epoch!==body.epoch||!['offered','claimed'].includes(saga.state)||saga.native_id)return error('stale_auth_fallback',409);
-    const route=this.parse(saga.routing_json) as (PickedRoute&{attempted_policy_ids?:string[]})|null;
+    const route=this.parse(saga.routing_json) as (PickedRoute&{attempted_policy_ids?:string[];picker?:unknown;initial_picker?:unknown})|null;
     const tried=[...new Set([...(route?.attempted_policy_ids||[]),route?.policy_id].filter((id):id is string=>typeof id==='string'))];
     const intake=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',saga.intake_id);
     if(!intake||intake.session_id!==saga.session_id||intake.assigned_machine_id!==saga.machine_id)return error('fallback_intake_binding_mismatch',409);
     const fail=async(reason:string):Promise<Response>=>{
       const now=Date.now();
-      this.transaction(()=>{
-        this.db.run("UPDATE dispatch_sagas SET state='complete',next_action_at=NULL,last_reason=?,updated_at=? WHERE operation_id=? AND state=? AND attempt_operation_id=? AND epoch=?",
+      const applied=this.transaction(()=>{
+        if(!this.fallbackCurrent(saga,intake))return false;
+        this.db.run("UPDATE dispatch_sagas SET state='complete',next_action_at=NULL,last_reason=?,updated_at=? WHERE operation_id=? AND state=? AND attempt_operation_id=? AND epoch=? AND native_id IS NULL",
           reason,now,saga.operation_id,saga.state,saga.attempt_operation_id,saga.epoch);
         this.db.run("UPDATE intakes SET status='failed',final_evidence_json=?,updated_at=? WHERE id=? AND session_id=?",
           JSON.stringify({error:'provider_auth_failed',reason,attempted_policy_ids:tried}),now,intake.id,saga.session_id);
         this.appendEvent(intake.id,`auth-fallback-exhausted:${saga.attempt_operation_id}:${saga.epoch}`,'hub2-dispatch','model_routes_auth_failed',
           {session_id:saga.session_id,attempted_policy_ids:tried,reason},now);
+        return true;
       });
+      if(!applied)return error('stale_auth_fallback',409);
       await this.env.CONTROL.get(this.env.CONTROL.idFromName('global')).fetch('https://control.internal/_internal/session-cap/release',{
         method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({operation_id:saga.operation_id,session_id:saga.session_id}),
       }).catch(()=>undefined);
@@ -736,12 +772,14 @@ export class ProjectDO {
     if(saga.attempt>=1)return await fail('model_attempts_exhausted');
     if(!route||route.override_reason!==null)return await fail('explicit_route_auth_failed');
     let next:PickedRoute;
+    let diagnostics:PickDiagnostics;
     try{
       const launch=this.parse(saga.launch_spec_json) as JsonRecord;
-      next=await pickModelRoute(this.env,{interactive:launch.interactive===true,
+      const picked=await pickModelRouteDetailed(this.env,{interactive:launch.interactive===true,
         ...(typeof launch.workspace==='string'?{workspace:launch.workspace}:{}),
         purpose: sessionPurpose(launch.purpose),
         with_goal:launch.with_goal===true,required_capabilities:route.required_capabilities,exclude_policy_ids:tried});
+      next=picked.route;diagnostics=picked.diagnostics;
     }catch(caught){
       if(caught instanceof HttpError&&caught.code==='model_policy_unavailable')return await fail('all_model_routes_auth_failed');
       if(caught instanceof HttpError)return error(caught.code,caught.status);
@@ -750,22 +788,37 @@ export class ProjectDO {
     const launch=this.parse(saga.launch_spec_json) as JsonRecord,nextAttempt=saga.attempt+1,now=Date.now();
     const launchSpec:JsonRecord={...launch,engine:next.engine,model:next.model,...(next.effort?{effort:next.effort}:{})};
     if(!next.effort)delete launchSpec.effort;
-    const routeState={...next,attempted_policy_ids:[...tried,next.policy_id]};
-    this.transaction(()=>{
+    const picker=buildStartPickerEvidence(next,diagnostics,1,route.picker);
+    const routeState={...next,attempted_policy_ids:[...tried,next.policy_id],picker,
+      initial_picker:normalizeStartPickerEvidence(route.initial_picker)??normalizeStartPickerEvidence(route.picker)};
+    const applied=this.transaction(()=>{
+      if(!this.fallbackCurrent(saga,intake))return false;
       this.db.run(`UPDATE dispatch_sagas SET state='pending_machine',attempt=?,attempt_operation_id=?,machine_id=?,account_id=?,
         launch_spec_json=?,routing_json=?,next_action_at=?,last_reason='provider_auth_fallback',updated_at=?
-        WHERE operation_id=? AND state=? AND attempt_operation_id=? AND epoch=?`,
+        WHERE operation_id=? AND state=? AND attempt_operation_id=? AND epoch=? AND native_id IS NULL`,
         nextAttempt,`${saga.operation_id}:${nextAttempt}`,next.machine_id,next.account_id,JSON.stringify(launchSpec),JSON.stringify(routeState),now,now,
         saga.operation_id,saga.state,saga.attempt_operation_id,saga.epoch);
       this.db.run('UPDATE intakes SET assigned_machine_id=?,updated_at=? WHERE id=? AND session_id=? AND assigned_machine_id=?',
         next.machine_id,now,intake.id,saga.session_id,saga.machine_id);
       this.appendEvent(intake.id,`auth-fallback:${saga.attempt_operation_id}:${saga.epoch}`,'hub2-dispatch','model_route_auth_fallback',
         {session_id:saga.session_id,failed_policy_id:route.policy_id,next_policy_id:next.policy_id,engine:next.engine,model:next.model},now);
+      return true;
     });
-    await this.scheduleNext();
-    await this.dispatchSaga(saga.operation_id);
-    await this.scheduleNext();
-    return json({fallback:true,session_id:saga.session_id,engine:next.engine,model:next.model});
+    if(!applied)return error('stale_auth_fallback',409);
+    return {operation_id:saga.operation_id,session_id:saga.session_id,engine:next.engine,model:next.model};
+  }
+
+  private fallbackCurrent(saga:SagaRow,intake:IntakeRow):boolean{
+    // The actual picker awaits namespace reads. A claim/stop may commit during
+    // that await; fence the receipt and intake again inside the write transaction.
+    // No await separates this check from UPDATE, so its predicates remain true
+    // until commit. MeteredDb.run's cumulative billing counters are not a CAS API.
+    const current=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?',saga.operation_id);
+    const assigned=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',intake.id);
+    return !!current&&current.state===saga.state&&current.epoch===saga.epoch
+      &&current.attempt_operation_id===saga.attempt_operation_id&&current.machine_id===saga.machine_id
+      &&current.session_id===saga.session_id&&current.native_id===null&&!!assigned
+      &&assigned.session_id===saga.session_id&&assigned.assigned_machine_id===saga.machine_id;
   }
 
   private async admissionInternal(request: Request): Promise<Response> {
@@ -1016,16 +1069,23 @@ export class ProjectDO {
   }
 
   private sagaView(saga: SagaRow): JsonRecord {
+    const picker=normalizeStartPickerEvidence((this.parse(saga.routing_json) as JsonRecord|null)?.picker);
     return {
       id: saga.session_id, operation_id: saga.operation_id, attempt_operation_id: saga.attempt_operation_id, intake_id: saga.intake_id,
       machine_id: saga.machine_id, epoch: saga.epoch, state: saga.state, native_id: saga.native_id,
       attempt: saga.attempt, next_action_at: saga.next_action_at,
+      picker,policy_id:picker?.policy_id??null,policy_version:picker?.policy_version??null,
       ...(() => {
         const launch = this.parse(saga.launch_spec_json) as JsonRecord | null;
         return launch ? { engine: launch.engine, model: launch.model, effort: launch.effort ?? null,
           route: [launch.engine, launch.model, launch.effort ?? 'default'].join('/') } : {};
       })(),
     };
+  }
+
+  private startResponse(saga:SagaRow,status:number):Response{
+    const session=this.sagaView(saga);
+    return json({session,picker:session.picker},status);
   }
 
   private parse(value: unknown): unknown {
