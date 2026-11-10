@@ -26,6 +26,7 @@ HUB_HEALTH_URL="${HUB_HEALTH_URL:-https://hub.dtcdev.click/health}"
 STATE_DIR="${RESOURCE_GATE_STATE_DIR:-/var/lib/resource-gate-monitor}"
 STATE_FILE="$STATE_DIR/state"
 ALERT_TO="${ALERT_TO:-dev@dtcdev.click}"
+ALERT_CC="${ALERT_CC:-orin@dtcdev.click}"
 ALERT_OPS_TO="${ALERT_OPS_TO:-dev@dtcdev.click}"
 ALERT_FROM="${ALERT_FROM:-alerts@dtcdev.click}"
 ALERT_MSMTP_ACCOUNT="${ALERT_MSMTP_ACCOUNT:-alerts}"
@@ -118,22 +119,40 @@ case "$STATE_DIR" in
   /tmp|/tmp/*|/var/tmp|/var/tmp/*|*/.local/tmp|*/.local/tmp/*) TEST_PATH_GUARD=1 ;;
 esac
 EFFECTIVE_TO="$ALERT_TO"
+EFFECTIVE_CC="$ALERT_CC"
 DATAOPS_ENABLED=1
 if (( TEST_PATH_GUARD )); then
   EFFECTIVE_TO="$ALERT_OPS_TO"
+  EFFECTIVE_CC=""
+  if [[ -n "${RESOURCE_GATE_TEST_CC:-}" ]]; then
+    [[ "$RESOURCE_GATE_TEST_CC" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.invalid$ ]] \
+      || fail "test CC override must use an .invalid address"
+    EFFECTIVE_CC="$RESOURCE_GATE_TEST_CC"
+  fi
   [[ "${RESOURCE_GATE_TEST_ALLOW_DATAOPS:-0}" == 1 ]] || DATAOPS_ENABLED=0
-  log "GUARD test state path: routing mail to ops recipient only"
+  log "GUARD test state path: routing mail through test-safe recipients"
+fi
+ALERT_RECIPIENT_SUMMARY="$EFFECTIVE_TO"
+if [[ -n "$EFFECTIVE_CC" ]]; then
+  ALERT_RECIPIENT_SUMMARY+=", $EFFECTIVE_CC"
 fi
 
 send_alert() {
   local subject="$1" body="$2"
+  local -a recipients=("$EFFECTIVE_TO")
+  if [[ -n "$EFFECTIVE_CC" ]]; then
+    recipients+=("$EFFECTIVE_CC")
+  fi
   {
     printf 'From: %s\n' "$ALERT_FROM"
     printf 'To: %s\n' "$EFFECTIVE_TO"
+    if [[ -n "$EFFECTIVE_CC" ]]; then
+      printf 'Cc: %s\n' "$EFFECTIVE_CC"
+    fi
     printf 'Subject: %s\n' "$subject"
     printf 'Date: %s\n\n' "$(date -R)"
     printf '%s\n' "$body"
-  } | msmtp -a "$ALERT_MSMTP_ACCOUNT" -f "$ALERT_FROM" -- "$EFFECTIVE_TO" 2>/dev/null
+  } | msmtp -a "$ALERT_MSMTP_ACCOUNT" -f "$ALERT_FROM" -- "${recipients[@]}" 2>/dev/null
 }
 
 create_dataops_task() {
@@ -164,16 +183,16 @@ if [[ "${1:-}" == --test-alert ]]; then
   printf -v TEST_BODY 'TEST ALERT: Resource Gate and Hub monitor email delivery was tested at %s UTC.\n\nThis message confirms the configured alert route; no outage was declared.' \
     "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   send_alert "[TEST] Resource Gate and Hub uptime monitor" "$TEST_BODY" \
-    || fail "test alert email failed to send to $EFFECTIVE_TO"
+    || fail "test alert email failed to send to $ALERT_RECIPIENT_SUMMARY"
   TEST_TASK_ID="$(create_dataops_task \
     "TEST: Resource Gate and Hub uptime alert delivery" \
-    "Monitor test at $(date -u '+%Y-%m-%dT%H:%M:%SZ'): alert email accepted by msmtp for $EFFECTIVE_TO.")" \
+    "Monitor test at $(date -u '+%Y-%m-%dT%H:%M:%SZ'): alert email accepted by msmtp for $ALERT_RECIPIENT_SUMMARY.")" \
     || fail "test alert email was sent, but DataOps test task creation failed"
   DATAOPS_CONFIG_DIR="$DATAOPS_CONFIG_DIR" "$DATAOPS_BIN" tasks done "$TEST_TASK_ID" \
-    --comment "Closed after confirming the Resource Gate and Hub test alert was sent to $EFFECTIVE_TO." \
+    --comment "Closed after confirming the Resource Gate and Hub test alert was sent to $ALERT_RECIPIENT_SUMMARY." \
     >/dev/null 2>&1 \
     || fail "test alert was sent and task $TEST_TASK_ID was created, but the test task could not be closed"
-  log "TEST alert email sent to $EFFECTIVE_TO; DataOps test task $TEST_TASK_ID created and closed"
+  log "TEST alert email sent to $ALERT_RECIPIENT_SUMMARY; DataOps test task $TEST_TASK_ID created and closed"
   exit 0
 fi
 [[ $# -eq 0 ]] || fail "usage: resource-gate-monitor.sh [--test-alert]"
