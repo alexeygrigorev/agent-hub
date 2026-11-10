@@ -252,10 +252,10 @@ class HostTests(unittest.TestCase):
             self.bridge.validate_launch(offer)
         self.assertFalse(any(call[1] == "start" for call, _ in self.native.calls))
 
-    def test_dispatch_attempt_operation_id_preserved_in_admission_and_receipt(self):
+    def test_dispatch_attempt_operation_id_preserved_in_receipt(self):
         operation = "d04dedbf-951e-4eaf-a41f-03eeb8514135:0"
         self.bridge.offer(self.offer(operation_id=operation))
-        self.assertEqual(self.client.calls[0][2]["operation_id"], operation)
+        self.assertFalse(any(path.endswith("/admission") for _, path, _, _ in self.client.calls))
         self.journal.flush(self.client)
         self.assertEqual(self.client.calls[-1][2]["operation_id"], operation)
 
@@ -305,20 +305,18 @@ class HostTests(unittest.TestCase):
             self.bridge.offer(self.offer())
         self.assertIsNone(self.native.process)
 
-    def test_server_admission_refusal_or_wrong_epoch_never_spawns(self):
-        self.client.request = lambda *args: {"launch_allowed": True, "epoch": 99}
-        with self.assertRaisesRegex(RuntimeError, "server_admission"):
-            self.bridge.offer(self.offer())
-        self.assertIsNone(self.native.process)
-        self.assertFalse(any(call[1] == "start" for call, _ in self.native.calls))
-
-    def test_claimed_reconnect_resumes_only_existing_durable_intent_with_fresh_admission(self):
+    def test_accepted_claim_spawns_without_another_admission_rpc(self):
         real_request = self.client.request
-        self.client.request = lambda *args: {"launch_allowed": False}
-        with self.assertRaisesRegex(RuntimeError, "server_admission"):
-            self.bridge.offer(self.offer())
-        self.assertIsNone(self.native.process)
-        self.client.request = real_request
+        def request(method, path, *args):
+            if path.endswith('/admission'):
+                raise AssertionError('claim must be sufficient for launch')
+            return real_request(method, path, *args)
+        self.client.request = request
+        self.bridge.offer(self.offer())
+        self.assertIsNotNone(self.native.process)
+
+    def test_claimed_reconnect_requires_local_intent_and_does_not_relaunch(self):
+        self.bridge.offer(self.offer())
         self.bridge.offer(self.offer(claimed=True, expires_at=None))
         self.assertEqual(sum(call[1] == "start" for call, _ in self.native.calls), 1)
         with self.assertRaisesRegex(ValueError, "local_intent"):

@@ -109,7 +109,7 @@ export class ProjectDO {
         const actor=actorFrom(request),body=await bodyObject(request.clone(),32768);
         const parent=typeof body.intake_id==='string'?this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',body.intake_id):undefined;
         const payload=body.payload as JsonRecord|undefined,launch=payload?.start as JsonRecord|undefined||payload;
-        if(launch?.engine==='shell'&&!hasScope(actor,'operator:admin'))return error('shell_reason_required',403);
+        if(launch?.engine==='shell'&&!hasScope(actor,'operator:admin'))return error('forbidden',403);
         if(parent&&(['root','writer'].includes(String(body.kind))?!this.canProject(actor,parent.project,'session:start'):!hasScope(actor,'operator:admin')&&!hasScope(actor,'message:send')))return error('schedule_effect_forbidden',403);
       }
       const workResponse = await this.work.fetch(request);
@@ -342,7 +342,6 @@ export class ProjectDO {
     const intake = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id = ?', intakeId);
     if (!intake) return error('intake_not_found', 404);
     if (!this.canProject(actor, intake.project, 'session:start')) return error('forbidden', 403);
-    if(intake.status==='failed'&&!this.qualifiedFailure(intake))return error('retry_requires_qualified_failure',409);
     if (intake.route_registered !== 1 && !await this.registerIntakeRoute(intake)) {
       await this.scheduleNext();
       return error('route_registration_pending', 503);
@@ -397,12 +396,21 @@ export class ProjectDO {
     const operationId = crypto.randomUUID();
     let route: PickedRoute;
     if (typeof engineInput === 'string' && engineInput.toLowerCase() === 'shell') {
-      if (typeof machineInput !== 'string' || !hasScope(actor, 'operator:admin') || !overrideReason || overrideReason.length < 8) {
-        return error('shell_reason_required', 403);
+      if (typeof machineInput !== 'string' || !hasScope(actor, 'operator:admin')) {
+        return error('forbidden', 403);
       }
+      const hostResponse = await this.env.MACHINES.get(this.env.MACHINES.idFromName(machineInput)).fetch('https://machine.internal/_internal/routing', {
+        headers: { 'x-hub2-actor': JSON.stringify(actor) },
+      });
+      if (!hostResponse.ok) return error('no_connected_host', 503);
+      const host = await hostResponse.json() as { connected?: boolean; last_seen?: number };
+      if (host.connected !== true) return error('no_connected_host', 503, JSON.stringify({ machines: [{
+        machine_id: machineInput, connected: false, last_seen: host.last_seen ?? null,
+        age_ms: typeof host.last_seen === 'number' ? Math.max(0, Date.now() - host.last_seen) : null,
+      }] }));
       route = {
         machine_id: machineInput, engine: 'shell', model: 'shell', account_id: '', policy_id: 'operator-shell',
-        policy_version: 1, override_reason: overrideReason, weight: 1, quota_remaining: 0,
+        policy_version: 1, override_reason: overrideReason ?? null, weight: 1, quota_remaining: 0,
         required_capabilities: [interactive ? 'interactive' : 'headless', ...requiredCapabilities],
       };
     } else {
@@ -439,7 +447,7 @@ export class ProjectDO {
     try {
       this.transaction(() => {
         const current = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?', intakeId);
-        if (!current || (current.status !== 'open' && !(current.status === 'queued' && current.session_id === null)&&!this.qualifiedFailure(current))) throw new HttpError('intake_already_assigned', 409);
+        if (!current || (current.status !== 'open' && !(current.status === 'queued' && current.session_id === null)&&!this.retryableFailure(current))) throw new HttpError('intake_already_assigned', 409);
         this.db.run(`INSERT INTO dispatch_sagas(operation_id, request_digest, request_key, intake_id, session_id, machine_id, account_id, attempt_operation_id, launch_spec_json, routing_json, epoch, state, attempt, next_action_at, last_reason, created_at, updated_at)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending_machine', 0, ?, NULL, ?, ?)`, operationId, digest, key, intakeId, sessionId, machineId, accountId, `${operationId}:0`, JSON.stringify(launchSpec), JSON.stringify({...route,attempted_policy_ids:[route.policy_id]}), now + 30_000, now, now);
         this.db.run("UPDATE intakes SET status = 'queued', assigned_machine_id = ?, assigned_actor_id = ?, session_id = ?, final_evidence_json=NULL, updated_at = ? WHERE id = ?", machineId, actor?.id || 'operator', sessionId, now, intakeId);
@@ -846,21 +854,12 @@ export class ProjectDO {
     }).catch(()=>undefined);
   }
 
-  private qualifiedFailure(intake:IntakeRow):boolean{
-    if(intake.status!=='failed'||!intake.session_id)return false;
-    const prior=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id=?',intake.session_id),proof=this.parse(intake.final_evidence_json) as JsonRecord|null;
-    if(proof?.stopped===true&&proof.session_id===intake.session_id
-      &&proof.machine_id===intake.assigned_machine_id&&Number.isSafeInteger(proof.epoch)
-      &&['dead','idle','stop_confirmed'].includes(String(proof.reason)))return true;
-    if(prior&&prior.state==='complete'&&prior.native_id===null
-      &&prior.intake_id===intake.id&&prior.session_id===intake.session_id&&prior.machine_id===intake.assigned_machine_id
-      &&proof?.operation_id===prior.operation_id&&proof.attempt_operation_id===prior.attempt_operation_id
-      &&proof.session_id===prior.session_id&&proof.machine_id===prior.machine_id&&proof.epoch===prior.epoch
-      &&proof.reason==='launch_timeout_no_native'&&proof.launch_failed===true&&proof.native_id_absent===true
-      &&proof.reaped===true&&proof.native_id===null&&Number.isSafeInteger(proof.observed_at))return true;
-    return !!prior&&prior.state==='complete'&&!!prior.native_id&&proof?.native_id===prior.native_id&&Number.isSafeInteger(proof.exit_code)&&(proof.exit_code!==0||proof.launch_failed===true||(proof.native_deadline as JsonRecord|undefined)?.exceeded===true)&&proof.native_exit_confirmed===true;
+  private retryableFailure(intake:IntakeRow):boolean{
+    if(intake.status!=='failed')return false;
+    // Keep the active-session fence, but do not require a special failure proof.
+    const prior=intake.session_id?this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id=?',intake.session_id):undefined;
+    return !prior||prior.state==='complete';
   }
-
 
   private workAuthorized(actor:Actor,intakeId:string):boolean{
     const intake=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',intakeId);

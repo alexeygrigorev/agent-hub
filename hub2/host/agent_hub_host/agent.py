@@ -296,14 +296,11 @@ class Bridge:
                 launch['provider_home']=provision(self.client,offer,launch,self.journal.directory,self.launcher.config.get('routes'))
             if acknowledge:
                 acknowledge(session, epoch)
-            admission = self.client.request("POST", f"/api/sessions/{session}/admission",
-                                            {"epoch": epoch, "operation_id": operation})
-            if admission.get("launch_allowed") is not True or admission.get("epoch") != epoch:
-                raise RuntimeError("server_admission_refused")
+            # The acknowledged claim already admitted this generation. Do not
+            # insert a second network gate between acceptance and native spawn.
             launch['child_config_file']=self.child_context(offer,launch)
             launch['runtime_deadline']=round(json.loads(Path(launch['child_config_file']).read_text())['expires_at']*1000)
-            # The adapter's final gate re-verifies the admitted generation against
-            # this live admission view immediately before spawn.
+            # Optional managed-provider homes retain their binding metadata.
             launch['client']=self.client
             launch['session_id']=session
             launch['operation_id']=operation
