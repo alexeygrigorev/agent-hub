@@ -333,7 +333,26 @@ def verify_tombstone(tombstone, expected_id, expected_tag, expected_workspace):
         return False, 'UUID mismatch'
     if str(tombstone.get("tag") or "").strip() != str(expected_tag or "").strip():
         return False, 'tag mismatch'
-    if not same_workspace(tombstone.get("workspace"), expected_workspace):
+    workspace = tombstone.get("workspace")
+    deleted_workspace = isinstance(expected_workspace, str) and workspace == expected_workspace + " (deleted)"
+    if deleted_workspace:
+        # Aplexer can record the kernel's deleted-directory spelling even
+        # after that path has been recreated. Only a qualified retirement
+        # for the journal's exact UUID and tag can use this spelling.
+        exit_info = tombstone.get("exit")
+        exited_at = exit_info.get("exited_at_ms") if isinstance(exit_info, dict) else None
+        if not (
+            isinstance(expected_workspace, str) and Path(expected_workspace).is_absolute()
+            and isinstance(tombstone.get("id"), str) and UUID_RE.fullmatch(tombstone["id"])
+            and UUID_RE.fullmatch(expected_id)
+            and tombstone.get("tag") == expected_tag
+            and tombstone.get("cause") == "finished"
+            and tombstone.get("containment_empty") is True
+            and native_returncode(exit_info) is not None
+            and type(exited_at) is int and exited_at > 0
+        ):
+            return False, 'unqualified deleted-workspace retirement'
+    elif not same_workspace(workspace, expected_workspace):
         return False, 'workspace mismatch'
     return True, None
 
@@ -696,7 +715,7 @@ class NativeLauncher:
         code = native_returncode(tombstone.get('exit'))
         if code is None:
             return None
-        return {'id': tombstone['id'], 'tag': tombstone['tag'], 'workspace': tombstone['workspace'],
+        return {'id': native_id, 'tag': tombstone['tag'], 'workspace': expected['workspace'],
                 'phase': 'exited', 'containment_empty': True, 'exit': tombstone['exit'],
                 'deadline_ms': tombstone.get('deadline_ms'), 'deadline_exceeded': tombstone.get('deadline_exceeded'),
                 'retirement': 'verified_finished'}
