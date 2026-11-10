@@ -28,38 +28,72 @@ class RecoveryTests(unittest.TestCase):
   self.temp=tempfile.TemporaryDirectory(prefix='policy-recovery-',dir=parent);self.addCleanup(self.temp.cleanup)
   self.directory=Path(self.temp.name);self.receipt=self.directory/'receipt.json';self.config=self.directory/'policy.json'
   self.config.write_text(json.dumps({'candidates':[CANDIDATE]}))
-  self.current={'version':0,'candidates':[]};self.calls=[];self.drop=False;self.compete=False;self.drop_rollback=False;self.operator_after_rollback_loss=False;self.conflicts=0;self.old_unconfigured=False;self.lock=threading.Lock()
+  self.current={'version':0,'candidates':[]};self.calls=[];self.request_bytes=[];self.drop=False;self.compete=False;self.drop_rollback=False;self.operator_after_rollback_loss=False;self.conflicts=0;self.old_unconfigured=False;self.legacy_recovery=False;self.bad_preflight=False;self.lock=threading.Lock()
   outer=self
   class Handler(BaseHTTPRequestHandler):
    def log_message(self,*args): pass
    def reply(self,status,value):
-    raw=json.dumps(value).encode();self.send_response(status);self.send_header('Content-Length',str(len(raw)));self.end_headers();self.wfile.write(raw)
+    raw=json.dumps(value,ensure_ascii=False,separators=(',',':')).encode();self.send_response(status);self.send_header('Content-Length',str(len(raw)));self.end_headers();self.wfile.write(raw)
    def do_GET(self):
     with outer.lock:
      outer.calls.append(('GET',None))
      if outer.current['candidates']:self.reply(200,outer.current)
      else:self.reply(404,{'error':'model_policy_unconfigured'} if outer.old_unconfigured else dict(error='model_policy_unconfigured',version=outer.current['version']))
-   def do_PUT(self):
-    value=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+   def read_mutation(self):
+    raw=self.rfile.read(int(self.headers['Content-Length']))
+    outer.request_bytes.append(raw)
+    if len(raw)>98_304:
+     self.reply(413,{'error':'body_too_large'});return None
+    return json.loads(raw)
+   def do_POST(self):
+    value=self.read_mutation()
+    if value is None:return
     with outer.lock:
-     outer.calls.append(('PUT',value));on_disk=json.loads(outer.receipt.read_text()) if outer.receipt.exists() else None
-     if on_disk is not None:assert on_disk['phase'] in ('applying','rolling_back')
-     if outer.compete:
-      outer.compete=False;outer.current={'version':outer.current['version']+1,'candidates':value['candidates']}
-      assert value['expected_version']!=outer.current['version'];outer.conflicts+=1
-      self.connection.shutdown(socket.SHUT_RDWR);self.connection.close();return
-     if 'expected_version' in value and value['expected_version']!=outer.current['version']:
+     outer.calls.append(('POST',value))
+     if outer.legacy_recovery:
+      self.reply(403,{'error':'forbidden'});return
+     action=value['action']
+     assert value['protocol']==helper.RECOVERY_PROTOCOL
+     if value['expected_version']!=outer.current['version']:
       self.reply(409,{'error':'model_policy_version_conflict'});return
-     if not value['candidates'] and value.get('restore_unconfigured') is not True:
-      self.reply(400,{'error':'invalid_model_policy'});return
-     unchanged=value['candidates']==outer.current['candidates']
-     outer.current={'version':outer.current['version']+int(not unchanged),'candidates':value['candidates']}
-     if outer.drop or outer.drop_rollback and on_disk and on_disk['phase']=='rolling_back':
-      outer.drop=False;outer.drop_rollback=False
-      if outer.operator_after_rollback_loss:
-       outer.current={'version':outer.current['version']+1,'candidates':[dict(CANDIDATE,weight=19)]}
-      self.connection.shutdown(socket.SHUT_RDWR);self.connection.close();return
-     self.reply(200,dict(outer.current,unchanged=unchanged))
+     prior=helper.candidates(outer.current['candidates'],empty=True)
+     if any('astra' in row['model'] and 'review-only' not in row['capabilities'] for row in prior):
+      self.reply(409,{'error':'model_policy_prior_unrestorable'});return
+     marker=dict(protocol=helper.RECOVERY_PROTOCOL,action=action)
+     if action=='validate_recovery':
+      if outer.bad_preflight:
+       prior=[dict(CANDIDATE,weight=73)]
+      self.reply(200,dict(marker,version=outer.current['version'],candidates=prior,
+                          changed=prior!=value['candidates']))
+      return
+     assert action=='apply_recoverable'
+     self.mutate(value,marker,prior)
+   def do_PUT(self):
+    value=self.read_mutation()
+    if value is None:return
+    with outer.lock:
+     outer.calls.append(('PUT',value))
+     self.mutate(value,{},outer.current['candidates'])
+   def mutate(self,value,marker,prior):
+    on_disk=json.loads(outer.receipt.read_text()) if outer.receipt.exists() else None
+    if on_disk is not None:assert on_disk['phase'] in ('applying','rolling_back')
+    if outer.compete:
+     outer.compete=False;outer.current={'version':outer.current['version']+1,'candidates':value['candidates']}
+     assert value['expected_version']!=outer.current['version'];outer.conflicts+=1
+     self.connection.shutdown(socket.SHUT_RDWR);self.connection.close();return
+    if 'expected_version' in value and value['expected_version']!=outer.current['version']:
+     self.reply(409,{'error':'model_policy_version_conflict'});return
+    if not value['candidates'] and value.get('restore_unconfigured') is not True:
+     self.reply(400,{'error':'invalid_model_policy'});return
+    unchanged=value['candidates']==prior
+    if not unchanged:
+     outer.current={'version':outer.current['version']+1,'candidates':value['candidates']}
+    if outer.drop or outer.drop_rollback and on_disk and on_disk['phase']=='rolling_back':
+     outer.drop=False;outer.drop_rollback=False
+     if outer.operator_after_rollback_loss:
+      outer.current={'version':outer.current['version']+1,'candidates':[dict(CANDIDATE,weight=19)]}
+     self.connection.shutdown(socket.SHUT_RDWR);self.connection.close();return
+    self.reply(200,dict(marker,version=outer.current['version'],candidates=value['candidates'],unchanged=unchanged))
   self.server=ThreadingHTTPServer(('127.0.0.1',0),Handler);self.server.daemon_threads=True
   self.thread=threading.Thread(target=self.server.serve_forever,daemon=True);self.thread.start()
   self.addCleanup(self.server.server_close);self.addCleanup(self.server.shutdown)
@@ -71,6 +105,91 @@ class RecoveryTests(unittest.TestCase):
   result=subprocess.run(args+list(extra),capture_output=True,text=True,timeout=5,env={**os.environ,'HUB2_TOKEN':'synthetic-secret-token-'+'x'*40})
   self.assertEqual(result.stderr,'',result.stderr);self.assertNotIn('synthetic-secret-token',result.stdout)
   return result.returncode,json.loads(result.stdout)
+
+ def mutation_count(self):
+  return sum(method=='PUT' or method=='POST' and value['action']=='apply_recoverable'
+             for method,value in self.calls)
+
+ def test_large_unicode_policies_round_trip_and_keep_the_applied_receipt_readable(self):
+  prior=helper.candidates([
+   dict(CANDIDATE,id=f'sol-{i}',capabilities=['🌐'*19+f'{j:02}' for j in range(32)])
+   for i in range(32)
+  ])
+  desired=[dict(row,weight=2) for row in prior]
+  self.current={'version':4,'candidates':prior}
+  self.config.write_bytes(helper.compact_utf8({'candidates':desired}))
+  rollback={'candidates':prior,'expected_version':5}
+  self.assertGreater(len(helper.canonical(rollback)),128000)
+  self.assertLessEqual(len(helper.compact_utf8(rollback)),98_304)
+  self.assertEqual(self.run_helper('prepare')[0],0)
+  self.assertEqual(self.run_helper('apply')[0],0)
+  saved=helper.saved(self.receipt)
+  self.assertEqual(saved['phase'],'applied')
+  self.assertEqual(saved['source_digest'],helper.hashlib.sha256(helper.canonical(desired).encode()).hexdigest())
+  self.assertGreater(len(helper.canonical(saved)),helper.LIMIT)
+  self.assertEqual(self.run_helper('rollback')[0],0)
+  self.assertEqual(self.current,{'version':6,'candidates':prior})
+  self.assertIn('🌐'.encode(),self.request_bytes[-1])
+  self.assertEqual(self.request_bytes[-1],helper.compact_utf8(rollback))
+
+ def test_oversized_rollback_refuses_new_and_legacy_prepared_receipts(self):
+  prior=[dict(CANDIDATE,id=f'sol-{i}',capabilities=[f'cap-{j}' for j in range(32)]) for i in range(32)]
+  remaining=98_304-len(helper.compact_utf8({'candidates':prior}))
+  for row in prior:
+   for j in range(len(row['capabilities'])):
+    escapes=min(70,remaining//6)
+    suffix=(remaining-escapes*6)%6
+    row['capabilities'][j]+='\0'*escapes+'x'*suffix
+    remaining-=escapes*6+suffix
+  prior=helper.candidates(prior)
+  self.assertEqual(len(helper.compact_utf8({'candidates':prior})),98_304)
+  self.current={'version':4,'candidates':prior}
+  self.assertEqual(self.run_helper('prepare')[1]['error'],'rollback_policy_body_too_large')
+  self.assertFalse(self.receipt.exists())
+  # An older helper could save this before checking the actual rollback envelope.
+  old_receipt=dict(format=1,source_sha=SHA,url=self.url,desired=[CANDIDATE],before=self.current,
+                   source_digest=helper.hashlib.sha256(helper.canonical([CANDIDATE]).encode()).hexdigest(),
+                   phase='prepared',applied=None,changed=True)
+  self.receipt.write_text(helper.canonical(old_receipt))
+  self.receipt.chmod(0o600)
+  for action in ('prepare','apply'):
+   self.assertEqual(self.run_helper(action)[1]['error'],'rollback_policy_body_too_large')
+   self.assertEqual(helper.saved(self.receipt),old_receipt)
+  self.assertEqual(self.request_bytes,[])
+  self.assertEqual(self.current['version'],4)
+
+ def test_wire_encoder_rejects_unpaired_surrogates(self):
+  with self.assertRaisesRegex(helper.Problem,'invalid_wire_json'):
+   helper.wire_body({'candidates':['\ud800']})
+
+ def test_prepare_refuses_invalid_legacy_prior_without_saving_receipt_or_mutating(self):
+  self.current={'version':4,'candidates':[dict(CANDIDATE,id='astra',model='gpt-6.1-astra')]}
+  code,result=self.run_helper('prepare')
+  self.assertEqual(code,1)
+  self.assertEqual(result['error'],'rollback_policy_unrestorable')
+  self.assertFalse(self.receipt.exists())
+  self.assertEqual(self.mutation_count(),0)
+  self.assertEqual(self.current['version'],4)
+
+ def test_legacy_server_cannot_prepare_or_apply_a_recovery_receipt(self):
+  self.legacy_recovery=True
+  self.assertEqual(self.run_helper('prepare')[0],1)
+  self.assertFalse(self.receipt.exists())
+  self.assertEqual(self.mutation_count(),0)
+  self.legacy_recovery=False
+  self.assertEqual(self.run_helper('prepare')[0],0)
+  self.legacy_recovery=True
+  self.assertEqual(self.run_helper('apply')[0],1)
+  self.assertEqual(self.current,{'version':0,'candidates':[]})
+  self.assertFalse(any(method=='PUT' for method,_ in self.calls))
+  self.assertIsNone(json.loads(self.receipt.read_text())['applied'])
+
+ def test_prepare_requires_the_same_normalized_baseline_at_the_same_version(self):
+  self.current={'version':4,'candidates':[CANDIDATE]}
+  self.bad_preflight=True
+  self.assertEqual(self.run_helper('prepare')[0],1)
+  self.assertFalse(self.receipt.exists())
+  self.assertEqual(self.mutation_count(),0)
 
  def test_initial_apply_restore_reapply_and_replays_have_no_aba(self):
   self.assertEqual(self.run_helper('prepare')[0],0);self.assertEqual(self.receipt.stat().st_mode&0o777,0o600)
@@ -87,9 +206,9 @@ class RecoveryTests(unittest.TestCase):
   self.current={'version':5,'candidates':[CANDIDATE]}
   self.run_helper('prepare');self.assertEqual(self.run_helper('apply')[0],0)
   self.current={'version':6,'candidates':[dict(CANDIDATE,weight=7)]}
-  puts=sum(method=='PUT' for method,_ in self.calls)
+  writes=self.mutation_count()
   self.assertEqual(self.run_helper('rollback')[0],0)
-  self.assertEqual(self.current['version'],6);self.assertEqual(sum(method=='PUT' for method,_ in self.calls),puts)
+  self.assertEqual(self.current['version'],6);self.assertEqual(self.mutation_count(),writes)
 
  def test_operator_change_after_apply_is_preserved(self):
   self.run_helper('prepare');self.run_helper('apply')
@@ -114,18 +233,18 @@ class RecoveryTests(unittest.TestCase):
  def test_lost_rollback_response_is_resolved_without_another_write(self):
   self.run_helper('prepare');self.run_helper('apply');self.drop_rollback=True
   self.assertEqual(self.run_helper('rollback')[0],0)
-  puts=sum(method=='PUT' for method,_ in self.calls)
+  writes=self.mutation_count()
   self.assertEqual(self.run_helper('rollback')[0],0)
-  self.assertEqual(sum(method=='PUT' for method,_ in self.calls),puts)
+  self.assertEqual(self.mutation_count(),writes)
   self.assertEqual(self.current,{'version':2,'candidates':[]})
 
  def test_lost_rollback_followed_by_operator_write_never_reissues_restore(self):
   self.run_helper('prepare');self.run_helper('apply');self.drop_rollback=True;self.operator_after_rollback_loss=True
   self.assertEqual(self.run_helper('rollback')[0],1)
   self.assertEqual(self.current,{'version':3,'candidates':[dict(CANDIDATE,weight=19)]})
-  puts=sum(method=='PUT' for method,_ in self.calls)
+  writes=self.mutation_count()
   self.assertEqual(self.run_helper('rollback')[0],1)
-  self.assertEqual(sum(method=='PUT' for method,_ in self.calls),puts)
+  self.assertEqual(self.mutation_count(),writes)
   self.assertEqual(self.current['candidates'][0]['weight'],19)
 
  def test_receipt_write_failure_before_put_prevents_mutation(self):
@@ -133,7 +252,7 @@ class RecoveryTests(unittest.TestCase):
   args=SimpleNamespace(action='apply',receipt=self.receipt,source_sha=SHA,url=self.url,file=self.config)
   with mock.patch.object(helper,'save',side_effect=OSError('synthetic disk failure')):
    with self.assertRaises(OSError):helper.recovery(args,'synthetic-token-'+'x'*40)
-  self.assertFalse(any(method=='PUT' for method,_ in self.calls))
+  self.assertEqual(self.mutation_count(),0)
   self.assertEqual(self.current['version'],0)
 
  def test_crash_after_success_before_receipt_persistence_cannot_claim_ownership(self):
@@ -154,8 +273,8 @@ class RecoveryTests(unittest.TestCase):
   self.assertEqual(self.run_helper('apply')[0],0)
   record=json.loads(self.receipt.read_text());record['phase']='rolling_back';self.receipt.write_text(json.dumps(record))
   self.current={'version':2,'candidates':[]}
-  puts=sum(method=='PUT' for method,_ in self.calls)
-  self.assertEqual(self.run_helper('rollback')[0],0);self.assertEqual(sum(method=='PUT' for method,_ in self.calls),puts)
+  writes=self.mutation_count()
+  self.assertEqual(self.run_helper('rollback')[0],0);self.assertEqual(self.mutation_count(),writes)
 
  def test_identity_corruption_and_unsafe_receipts_refuse_before_put(self):
   self.run_helper('prepare');original=self.receipt.read_text()
@@ -177,7 +296,7 @@ class RecoveryTests(unittest.TestCase):
   for thread in threads:thread.start()
   for thread in threads:thread.join(timeout=5);self.assertFalse(thread.is_alive())
   self.assertEqual(results,[0,0]);self.assertEqual(self.current['version'],1)
-  self.assertEqual(sum(method=='PUT' for method,_ in self.calls),1)
+  self.assertEqual(self.mutation_count(),1)
 
  def test_old_unconfigured_response_without_version_cannot_prepare_recovery(self):
   self.old_unconfigured=True

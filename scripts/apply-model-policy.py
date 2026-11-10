@@ -22,6 +22,8 @@ import urllib.request
 
 DEFAULT_URL = 'https://hub.dtcdev.click'
 DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / 'config/model-policy.json'
+# Public Hub2 Worker forwarding limit. Control accepts a larger internal body.
+WIRE_LIMIT = 98_304
 HTTP_LIMIT = 128000
 LIMIT = 4 * HTTP_LIMIT
 SAFE_INT = 9007199254740991
@@ -48,6 +50,19 @@ def parse(raw, limit=LIMIT):
 
 def canonical(value):
     return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(',', ':'), allow_nan=False)
+
+
+def compact_utf8(value):
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False).encode('utf-8')
+    except (ValueError, TypeError):
+        raise Problem('invalid_wire_json') from None
+
+
+def wire_body(value, too_large='policy_request_body_too_large'):
+    raw = compact_utf8(value)
+    if len(raw) > WIRE_LIMIT: raise Problem(too_large)
+    return raw
 
 
 def candidates(value, empty=False):
@@ -89,7 +104,7 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def request(base, token, method, body=None):
-    req = urllib.request.Request(base+'/api/model-policy', data=None if body is None else canonical(body).encode(), method=method,
+    req = urllib.request.Request(base+'/api/model-policy', data=None if body is None else wire_body(body), method=method,
                                 headers={'Authorization':'Bearer '+token,'Content-Type':'application/json'})
     try:
         response = urllib.request.build_opener(NoRedirect).open(req, timeout=10)
@@ -141,12 +156,19 @@ def lock(path):
     finally: os.close(fd)
 
 
+def receipt_bytes(data):
+    raw = compact_utf8(data)
+    if len(raw) > LIMIT: raise Problem('receipt_too_large')
+    return raw
+
+
 def save(path, data):
+    raw = receipt_bytes(data)
     if path.is_symlink() or path.exists() and not stat.S_ISREG(path.lstat().st_mode): raise Problem('receipt_untrusted')
     fd, temporary = tempfile.mkstemp(prefix='.'+path.name+'-',dir=path.parent)
     try:
-        with os.fdopen(fd,'w') as stream:
-            stream.write(canonical(data)); stream.flush(); os.fsync(stream.fileno())
+        with os.fdopen(fd,'wb') as stream:
+            stream.write(raw); stream.flush(); os.fsync(stream.fileno())
         os.replace(temporary,path)
         directory=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY)
         try: os.fsync(directory)
@@ -182,33 +204,85 @@ def saved(path):
     return data
 
 
+RECOVERY_PROTOCOL = 'model-policy-recovery-v1'
+
+
+def recovery_body(action, before, target):
+    return {'protocol': RECOVERY_PROTOCOL, 'action': action,
+            'expected_version': before['version'], 'candidates': target}
+
+
+def recovery_request(args, token, action, before, target):
+    status, payload = request(args.url, token, 'POST', recovery_body(action, before, target))
+    if status == 409 and isinstance(payload, dict):
+        if payload.get('error') == 'model_policy_prior_unrestorable':
+            raise Problem('rollback_policy_unrestorable')
+        if payload.get('error') == 'model_policy_rollback_body_too_large':
+            raise Problem('rollback_policy_body_too_large')
+    if (status != 200 or not isinstance(payload, dict) or payload.get('protocol') != RECOVERY_PROTOCOL
+            or payload.get('action') != action):
+        raise Problem('policy_recovery_protocol_unverified')
+    return payload
+
+
+def validate_recovery(args, token, before, target):
+    payload = recovery_request(args, token, 'validate_recovery', before, target)
+    validated = {'version': version(payload.get('version')), 'candidates': candidates(payload.get('candidates'), empty=True)}
+    if validated != before or payload.get('changed') is not (before['candidates'] != target):
+        raise Problem('policy_recovery_preflight_mismatch')
+
+
+def rollback_body(before, applied_version):
+    body = {'candidates': before['candidates'], 'expected_version': applied_version}
+    if not before['candidates']: body['restore_unconfigured'] = True
+    return body
+
+
+def check_recovery_sizes(data):
+    applied_version = version(data['before']['version'] + int(data['changed']))
+    if data['changed']:
+        version(applied_version + 1)
+        wire_body(rollback_body(data['before'], applied_version), 'rollback_policy_body_too_large')
+    # The longest later phase also stores a second copy of the desired policy.
+    applied = {'version': applied_version, 'candidates': data['desired']}
+    receipt_bytes({**data, 'phase': 'rolling_back', 'applied': applied})
+
+
 def recovery(args, token):
     if not args.receipt or not args.source_sha or not re.fullmatch('[0-9a-f]{40}',args.source_sha): raise Problem('recovery_identity_required')
     with lock(args.receipt):
         if args.receipt.is_symlink() or args.receipt.exists() and not stat.S_ISREG(args.receipt.lstat().st_mode): raise Problem('receipt_untrusted')
-        if args.action=='prepare' and not args.receipt.exists():
+        new_receipt = args.action=='prepare' and not args.receipt.exists()
+        if new_receipt:
             target=desired(args); before=read_policy(args,token)
             data={'format':1,'source_sha':args.source_sha,'source_digest':hashlib.sha256(canonical(target).encode()).hexdigest(),
                   'url':args.url,'desired':target,'before':before,'phase':'prepared','applied':None,'changed':before['candidates']!=target}
-            save(args.receipt,data)
         else: data=saved(args.receipt)
         if data['source_sha']!=args.source_sha or data['url']!=args.url: raise Problem('recovery_identity_mismatch')
         if args.action in ('prepare','apply') and desired(args)!=data['desired']: raise Problem('source_policy_changed')
-        if args.action=='prepare': return {'status':data['phase'],'version':data['before']['version']}
+        if args.action=='prepare':
+            if data['phase']=='prepared':
+                check_recovery_sizes(data)
+                validate_recovery(args, token, data['before'], data['desired'])
+            if new_receipt:
+                save(args.receipt,data)
+            return {'status':data['phase'],'version':data['before']['version']}
         if args.action=='apply':
             if data['phase']=='applied':
                 if read_policy(args,token)!=data['applied']: raise Problem('apply_policy_conflict_manual_reconciliation_required')
                 return {'status':'applied','version':data['applied']['version']}
             if data['phase']=='uncertain': raise Problem('apply_uncertain_manual_reconciliation_required')
             if data['phase'] not in ('prepared','applying'): raise Problem('receipt_phase_conflict')
+            check_recovery_sizes(data)
+            wire_body(recovery_body('apply_recoverable', data['before'], data['desired']))
             current=read_policy(args,token)
             if current!=data['before']:
                 data['phase']='uncertain'; save(args.receipt,data); raise Problem('apply_uncertain_manual_reconciliation_required')
             data['phase']='applying'; save(args.receipt,data)  # durable before any mutation
             try:
-                status,payload=request(args.url,token,'PUT',{'candidates':data['desired'],'expected_version':data['before']['version']})
-                applied=snapshot(status,payload)
-                if status!=200 or applied!={'version':data['before']['version']+int(data['changed']),'candidates':data['desired']}: raise Problem('apply_response_invalid')
+                payload=recovery_request(args,token,'apply_recoverable',data['before'],data['desired'])
+                applied=snapshot(200,payload)
+                if applied!={'version':data['before']['version']+int(data['changed']),'candidates':data['desired']}: raise Problem('apply_response_invalid')
             except Problem:
                 # Observe, but NEVER acquire ownership through GET equality.
                 try: observed=read_policy(args,token)
@@ -228,8 +302,7 @@ def recovery(args, token):
             data['phase']='rolled_back'; save(args.receipt,data); return {'status':'rolled_back','observed_restored':True}
         if current!=data['applied']: raise Problem('rollback_policy_conflict_manual_reconciliation_required')
         data['phase']='rolling_back'; save(args.receipt,data)
-        body={'candidates':restored['candidates'],'expected_version':data['applied']['version']}
-        if not restored['candidates']: body['restore_unconfigured']=True
+        body=rollback_body(data['before'],data['applied']['version'])
         try:
             status,payload=request(args.url,token,'PUT',body)
             if status!=200 or snapshot(status,payload)!=restored: raise Problem('rollback_response_invalid')

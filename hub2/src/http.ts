@@ -1,5 +1,7 @@
 import type { Actor, JsonRecord } from './types';
 
+export const HUB2_FORWARD_BODY_LIMIT = 98_304;
+
 export function json(body: JsonRecord, status = 200, headers?: HeadersInit): Response {
   const out = new Headers(headers);
   out.set('Content-Type', 'application/json; charset=utf-8');
