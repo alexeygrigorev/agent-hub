@@ -457,8 +457,7 @@ class CentralSpawnEnvironmentTest(unittest.TestCase):
                 tag = argv[argv.index('--tag') + 1]
                 cwd = options['cwd']
                 process = {'id': native_id, 'tag': tag, 'workspace': cwd, 'engine': 'codex',
-                           'created_at_ms': created, 'command': child, 'phase': 'running',
-                           'deadline_ms': int(argv[argv.index('--deadline-ms') + 1])}
+                           'created_at_ms': created, 'command': child, 'phase': 'running'}
                 task = tag[len('task-'):]
                 artifact = Path(cwd) / '.local' / ('first-action-' + task + '.json')
                 artifact.parent.mkdir(parents=True, exist_ok=True)
@@ -480,6 +479,7 @@ class CentralSpawnEnvironmentTest(unittest.TestCase):
                 receipt = adapter.launch('task-env', spec)
             self.assertEqual(receipt['session_id'], native_id)
             argv, options = calls[0]
+            self.assertNotIn('--deadline-ms', argv)
             env_pairs = {argv[i + 1].split('=', 1)[0]: argv[i + 1].split('=', 1)[1]
                          for i in range(len(argv) - 1) if argv[i] == '--env'}
             # Trusted native home paths survive and point at the materialized home.

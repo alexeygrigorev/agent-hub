@@ -54,6 +54,8 @@ class Journal:
         """)
         if "interactive" not in {row[1] for row in self.db.execute("PRAGMA table_info(launches)")}:
             self.db.execute("ALTER TABLE launches ADD COLUMN interactive INTEGER NOT NULL DEFAULT 0")
+        if "runtime_deadline" not in {row[1] for row in self.db.execute("PRAGMA table_info(launches)")}:
+            self.db.execute("ALTER TABLE launches ADD COLUMN runtime_deadline INTEGER")
         self.db.execute("CREATE INDEX IF NOT EXISTS launches_active ON launches(state,operation_id)")
 
     def emit(self, key, path, payload):
@@ -214,7 +216,7 @@ class Bridge:
             if previous['state']!='pending_admission' or previous['native_id'] or epoch<=previous['epoch']:
                 raise ValueError('native_reconciliation_required')
             with db:
-                db.execute('UPDATE launches SET operation_id=?,epoch=?,digest=?,workspace=?,tag=?,interactive=? WHERE session_id=?',
+                db.execute('UPDATE launches SET operation_id=?,epoch=?,digest=?,workspace=?,tag=?,interactive=?,runtime_deadline=NULL WHERE session_id=?',
                            (operation,epoch,digest,launch['workspace'],'task-hub2-'+session,int(launch['interactive']),session))
         prior = db.execute("SELECT * FROM launches WHERE operation_id=?", (operation,)).fetchone()
         if prior:
@@ -246,7 +248,7 @@ class Bridge:
             task_id = "hub2-" + session
             tag = "task-" + task_id
             with db:
-                db.execute("INSERT INTO launches(operation_id,session_id,epoch,digest,workspace,tag,native_id,state,interactive) VALUES(?,?,?,?,?,?,NULL,'pending_admission',?)",
+                db.execute("INSERT INTO launches(operation_id,session_id,epoch,digest,workspace,tag,native_id,state,interactive,runtime_deadline) VALUES(?,?,?,?,?,?,NULL,'pending_admission',?,NULL)",
                            (operation, session, epoch, digest, launch["workspace"], tag, int(launch["interactive"])))
         if not prior or prior["state"] == "pending_admission":
             task_id, tag = "hub2-" + session, "task-hub2-" + session
@@ -261,8 +263,14 @@ class Bridge:
                                             {"epoch": epoch, "operation_id": operation})
             if admission.get("launch_allowed") is not True or admission.get("epoch") != epoch:
                 raise RuntimeError("server_admission_refused")
+            runtime_deadline = admission.get('runtime_deadline')
+            if type(runtime_deadline) is not int or not int(time.time()*1000)<runtime_deadline<=int((time.time()+launch['timeout_seconds'])*1000)+5000:
+                raise RuntimeError('server_runtime_deadline_unverified')
             launch['child_config_file']=self.child_context(offer,launch)
-            launch['runtime_deadline']=round(json.loads(Path(launch['child_config_file']).read_text())['expires_at']*1000)
+            launch['runtime_deadline']=runtime_deadline
+            with db:
+                db.execute("UPDATE launches SET runtime_deadline=? WHERE operation_id=? AND epoch=?",
+                           (launch['runtime_deadline'],operation,epoch))
             # The adapter's final gate re-verifies the admitted generation against
             # this live admission view immediately before spawn.
             launch['client']=self.client
@@ -321,7 +329,7 @@ class Bridge:
         )
 
     def reconcile(self):
-        rows = self.journal.db.execute("SELECT * FROM launches WHERE state IN ('running','aborting','launching') LIMIT 1001").fetchall()
+        rows = self.journal.db.execute("SELECT * FROM launches WHERE state IN ('running','aborting','deadline_stopping','launching') LIMIT 1001").fetchall()
         if len(rows) > 1000:
             raise RuntimeError("active_native_bound_exceeded")
         for row in rows:
@@ -334,7 +342,7 @@ class Bridge:
             if not self._workspace_is_available(row["workspace"]):
                 self._warn_unavailable_workspace(row)
                 continue
-            if row['state']=='aborting' and not row['native_id']:
+            if row['state'] in {'aborting','deadline_stopping'} and not row['native_id']:
                 try:identity=self.launcher.aborted_identity('hub2-'+row['session_id'],row['workspace'])
                 except RuntimeError:identity=None
                 if not identity:
@@ -350,8 +358,15 @@ class Bridge:
             native = self.lookup(row["native_id"], row)
             if not native:
                 continue  # Missing process is uncertain, never a successful finish.
-            if native.get("phase", native.get("state")) != "exited":
-                if row['state']=='aborting':
+            phase = native.get("phase", native.get("state"))
+            deadline = row['runtime_deadline']
+            if row['state']=='running' and type(deadline) is int and int(time.time()*1000)>=deadline and phase!='exited':
+                with self.journal.db:
+                    self.journal.db.execute("UPDATE launches SET state='deadline_stopping' WHERE operation_id=? AND state='running'",
+                                            (row['operation_id'],))
+                row = self.journal.db.execute("SELECT * FROM launches WHERE operation_id=?",(row['operation_id'],)).fetchone()
+            if phase != "exited":
+                if row['state'] in {'aborting','deadline_stopping'}:
                     self.native('kill',row['native_id'],allow_failure=True)
                     native=self.lookup(row['native_id'],row)
                 if not native or native.get('phase',native.get('state'))!='exited':continue
@@ -368,7 +383,11 @@ class Bridge:
                        "evidence": {"source": "aplexer_retirement" if native.get("retirement") else "aplexer_status",
                                     "native_identity": {key: native[key] for key in ("id", "tag", "workspace")},
                                     "containment_empty": True, "native_exit": exit_info,"launcher_state":launcher_state}}
-            if type(native.get('deadline_ms')) is int:
+            if type(row['runtime_deadline']) is int:
+                exited_at = exit_info.get('exited_at_ms')
+                exceeded = native.get('deadline_exceeded') is True or (type(exited_at) is int and exited_at >= row['runtime_deadline'])
+                payload['evidence']['native_deadline']={'deadline_ms':row['runtime_deadline'],'exceeded':exceeded}
+            elif type(native.get('deadline_ms')) is int:
                 payload['evidence']['native_deadline']={'deadline_ms':native['deadline_ms'],'exceeded':native.get('deadline_exceeded') is True}
             if row['state']=='aborting':payload['launch_failed']=True
             with self.journal.db:
@@ -403,7 +422,7 @@ class Bridge:
         if row["epoch"] != command.get("epoch"):
             raise ValueError("command_fence_conflict")
         native_id, _status = self.resolve_launch_native(row)
-        if not native_id and row["state"] in {"pending_admission", "launching", "aborting"}:
+        if not native_id and row["state"] in {"pending_admission", "launching", "aborting", "deadline_stopping"}:
             # A stop for an interrupted launch is confirmed only after the
             # supervisor lookup by session tag finds no native process.
             if kind != "stop":
@@ -509,7 +528,7 @@ class Bridge:
                                    "session_id": target.get("session_id"), "operation_id": target.get("operation_id"),
                                    "message_id": target.get("id")}))
     def live_sessions(self):
-        rows=self.journal.db.execute("SELECT session_id,epoch,native_id,tag,workspace,state FROM launches WHERE state IN ('launching','running','aborting') ORDER BY session_id LIMIT 100").fetchall()
+        rows=self.journal.db.execute("SELECT session_id,epoch,native_id,tag,workspace,state FROM launches WHERE state IN ('launching','running','aborting','deadline_stopping') ORDER BY session_id LIMIT 100").fetchall()
         result=[]
         for row in rows:
             if not self._workspace_is_available(row['workspace']):
@@ -564,7 +583,7 @@ class Bridge:
         self.journal.flush(self.client,safety_only=True)
         with self.client.socket(machine_id,safety=True) as socket:
             while time.time()*1000 < self.budget_paused_until:
-                active=self.journal.db.execute("SELECT 1 FROM launches WHERE state IN ('running','aborting','launching') LIMIT 1").fetchone()
+                active=self.journal.db.execute("SELECT 1 FROM launches WHERE state IN ('running','aborting','deadline_stopping','launching') LIMIT 1").fetchone()
                 try:
                     event=json.loads(socket.recv(timeout=min(5 if active else 60,max(0.01,self.budget_paused_until/1000-time.time()))))
                     if event.get('type')=='session.command' and event.get('command',{}).get('kind')=='stop':
@@ -612,7 +631,7 @@ class Bridge:
                         if now >= next_live_session_heartbeat:
                             self.heartbeat(labels)
                             next_live_session_heartbeat = time.monotonic() + LIVE_SESSION_HEARTBEAT_SECONDS
-                        active = self.journal.db.execute("SELECT 1 FROM launches WHERE state IN ('running','aborting','launching') LIMIT 1").fetchone()
+                        active = self.journal.db.execute("SELECT 1 FROM launches WHERE state IN ('running','aborting','deadline_stopping','launching') LIMIT 1").fetchone()
                         recv_timeout = 5 if active else min(
                             LIVE_SESSION_HEARTBEAT_SECONDS,
                             max(0.01, next_live_session_heartbeat - now),
