@@ -234,9 +234,9 @@ if grep -q "datatalks\.club" "$mailbox" 2>/dev/null; then
 else
   pass "S10 no real recipient ever configured in the suite"
 fi
-if grep -q 'ALERT_TO:-alexey@datatalks' "$SCRIPT" \
+if grep -q 'ALERT_TO:-dev@dtcdev.click' "$SCRIPT" \
   && grep -q 'ALERT_OPS_TO="${ALERT_OPS_TO:-dev@dtcdev.click}"' "$SCRIPT"; then
-  pass "S10b prod defaults intact in script (alexey@ real path, ops dev@)"
+  pass "S10b prod and ops defaults route only to dev"
 else
   fail "S10b prod defaults"
 fi
