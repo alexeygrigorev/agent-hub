@@ -935,6 +935,10 @@ export class MachineDO {
         row.id,body.reason,operation,message,Date.now());
       console.error('[hub2] MACHINE_SESSION_ATTENTION',JSON.stringify({session_id:row.id,machine_id:row.machine_id,reason:body.reason,operation_id:operation}));
     }
+    // Command and mailbox failures are diagnostics, even if they carry the
+    // same operation ID. Older daemons omit stage but include the command or
+    // message ID; their launch refusals carry neither.
+    if((body.stage!=null&&body.stage!=='host_launch')||body.message_id!=null)return;
     if(AUTH_FALLBACK_REASONS.has(body.reason)&&['offered','claimed'].includes(row.state)&&!row.native_id&&operation===row.operation_id){
       const now=Date.now(),payload={operation_id:row.dispatch_id,attempt_operation_id:row.operation_id,session_id:row.id,
         machine_id:row.machine_id,epoch:row.epoch,reason:body.reason};
