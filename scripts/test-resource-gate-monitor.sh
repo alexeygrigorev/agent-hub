@@ -92,6 +92,7 @@ cat > "$TMP/bin/dataops" <<'DATAOPS'
 #!/usr/bin/env bash
 set -euo pipefail
 [[ -n "${MONITOR_DATAOPS_CAPTURE:-}" ]] || exit 92
+[[ "$(command -v node)" == "$NODE_BIN" ]] || exit 94
 case "$1 $2" in
   'tasks create')
     printf 'create\t%s\n' "$*" >> "$MONITOR_DATAOPS_CAPTURE"
@@ -140,6 +141,12 @@ export ALERT_TO='resource-gate-test@example.invalid'
 export ALERT_OPS_TO='resource-gate-ops@example.invalid'
 export ALERT_REPEAT_SECONDS=900
 export RESOURCE_GATE_TEST_ALLOW_DATAOPS=1
+
+grep -Fq 'PATH="$(dirname "$NODE_BIN"):/home/alexey/.local/bin:$PATH"' "$SCRIPT" \
+  || fail "Node.js and DataOps runtime directories are not available in the monitor service PATH"
+grep -Fq 'PATH="$RUNUSER_PATH" DATAOPS_CONFIG_DIR=/home/alexey/.config/dataops' \
+  "$ROOT/scripts/install-resource-gate-monitor.sh" \
+  || fail "installer does not expose Node.js to the DataOps secret preflight"
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 pass() { printf 'PASS: %s\n' "$*"; }

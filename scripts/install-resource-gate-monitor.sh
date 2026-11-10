@@ -15,6 +15,8 @@ NVM_DIR=/home/alexey/.nvm
 NODE_BIN="$(NVM_DIR="$NVM_DIR" /bin/bash -c '. "$NVM_DIR/nvm.sh" >/dev/null 2>&1 && nvm which default' 2>/dev/null)" \
   || { echo "Node.js default cannot be resolved from alexey's NVM installation" >&2; exit 2; }
 [[ -x "$NODE_BIN" ]] || { echo "Node.js is unavailable at the configured NVM default" >&2; exit 2; }
+NODE_DIR="$(dirname "$NODE_BIN")"
+RUNUSER_PATH="$NODE_DIR:/home/alexey/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STATE_DIR=/var/lib/resource-gate-monitor
@@ -30,7 +32,7 @@ install -d -o alexey -g alexey -m 750 "$STATE_DIR"
 # `--out` writes the DataOps value directly to a mode-0600 file and never to
 # stdout. The monitor reads this file; no token is stored in the repository or
 # passed through a unit environment variable.
-runuser -u alexey -- env DATAOPS_CONFIG_DIR=/home/alexey/.config/dataops \
+runuser -u alexey -- env PATH="$RUNUSER_PATH" DATAOPS_CONFIG_DIR=/home/alexey/.config/dataops \
   /home/alexey/.local/bin/dataops secrets get resource-gate.agent-token \
   --field value --out "$GATE_TOKEN_FILE" >/dev/null
 chown alexey:alexey "$GATE_TOKEN_FILE"
