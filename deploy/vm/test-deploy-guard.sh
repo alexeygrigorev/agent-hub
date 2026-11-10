@@ -78,7 +78,13 @@ printf '%s\n' '{"ok":true,"service":"hub2"}'
 CURL
 cat > "$TEST_ROOT/bin/npm" <<'NPM'
 #!/usr/bin/env bash
-[[ "${TEST_NPM_FAIL:-0}" != 1 ]]
+[[ "$1" == --prefix && "$2" == "${AGENT_HUB_TEST_REPO:?}" ]] || exit 97
+[[ "$3" == ci && "$4" == --omit=dev ]] || exit 98
+printf '%s\n' "$*" >> "${NPM_CAPTURE:?}"
+if [[ "${TEST_NPM_FAIL_ONCE:-0}" == 1 && ! -e "${NPM_FAIL_MARKER:?}" ]]; then
+  : > "$NPM_FAIL_MARKER"
+  exit 99
+fi
 NPM
 chmod 755 "$TEST_ROOT/bin/"*
 
@@ -149,6 +155,8 @@ run_transaction() {
     AGENT_HUB_TEST_CADDY_CONFIG="$TEST_ROOT/etc/Caddyfile" \
     CADDY_CAPTURE="$TEST_ROOT/caddy-calls" \
     SYSTEMCTL_CAPTURE="$TEST_ROOT/systemctl-calls" \
+    NPM_CAPTURE="$TEST_ROOT/npm-calls" \
+    NPM_FAIL_MARKER="$TEST_ROOT/npm-failed-once" \
     PATH="$TEST_ROOT/bin:$PATH" "$TRANSACTION" "$@"
 }
 
@@ -164,6 +172,8 @@ run_transaction rollback >/dev/null
 cmp -s "$TEST_ROOT/etc/Caddyfile" "$TEST_ROOT/work/deploy/Caddyfile" || fail 'manual rollback missed old Caddyfile'
 grep -Fq 'HUB2_CREDENTIAL_KEY=preserve-this' "$TEST_ROOT/work/.dev.vars" || fail 'rollback missed private vars'
 [[ ! -e "$TEST_ROOT/state" ]] || fail 'successful rollback retained transaction state'
+grep -Fq -- "--prefix $TEST_ROOT/work ci --omit=dev" "$TEST_ROOT/npm-calls" \
+  || fail 'dependency installation did not target the transactional repository'
 pass 'manual rollback restores release, Caddy config, and .dev.vars'
 
 ORIGINAL_CADDY_SHA256="$(sha256sum "$TEST_ROOT/etc/Caddyfile" | cut -d' ' -f1)"
@@ -182,6 +192,16 @@ if grep -Eq '(^| )(reload|restart) caddy($| )' "$TEST_ROOT/systemctl-calls"; the
   fail 'Hub-only apply or rollback reloaded/restarted Caddy'
 fi
 pass 'Hub-only apply and rollback leave the Gate Caddy configuration untouched'
+
+if TEST_NPM_FAIL_ONCE=1 run_transaction apply "$CANDIDATE_SHA" active >/dev/null 2>&1; then
+  fail 'dependency installation failure unexpectedly succeeded'
+fi
+[[ "$(git -C "$TEST_ROOT/work" rev-parse HEAD)" == "$PREVIOUS_SHA" ]] \
+  || fail 'dependency installation failure did not restore old release'
+cmp -s "$TEST_ROOT/etc/Caddyfile" "$TEST_ROOT/work/deploy/Caddyfile" \
+  || fail 'dependency installation failure did not restore old Caddyfile'
+[[ ! -e "$TEST_ROOT/state" ]] || fail 'successful dependency rollback retained transaction state'
+pass 'dependency installation failure automatically restores previous release and config'
 
 if TEST_INSTALL_FAIL=1 run_transaction apply "$CANDIDATE_SHA" active >/dev/null 2>&1; then
   fail 'installer failure unexpectedly succeeded'
