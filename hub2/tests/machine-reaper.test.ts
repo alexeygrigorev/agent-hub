@@ -52,7 +52,7 @@ test('host launch refusal terminally fails an unclaimed offer with a visible rea
  const socket={readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'socket'}),send:(value:string)=>frames.push(JSON.parse(value))};
  f.sockets.push(socket);
  await f.machine.webSocketMessage(socket as any,JSON.stringify({type:'host.error',session_id:sessionId,
-  operation_id:'op-'+sessionId,reason:'workspace_label_unavailable'}));
+  operation_id:'op-'+sessionId,stage:'host_launch',reason:'workspace_label_unavailable'}));
  const row=f.database.prepare('SELECT state,native_id FROM sessions WHERE id=?').get(sessionId) as any;
  assert.equal(row.state,'failed');assert.equal(row.native_id,null);
  assert.equal((f.database.prepare('SELECT reason FROM attention WHERE session_id=?').get(sessionId) as any).reason,'workspace_label_unavailable');
@@ -72,6 +72,25 @@ test('authentication refusal from an unclaimed offer routes to model fallback',a
  assert.equal((f.database.prepare('SELECT state FROM machine_session_operations WHERE operation_id=?').get('op-'+sessionId) as any).state,'expired');
  assert.equal(f.events.at(-1)?.path,'/_internal/auth-fallback');
  assert.equal(f.events.at(-1)?.body.reason,'provider_auth_failed');
+});
+
+test('command and mailbox diagnostics never settle a matching launch attempt',async()=>{
+ const f=fixture(),sessionId='command-error-on-claim',epoch=await startClaimed(f,sessionId,null);
+ const socket={readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'socket'}),send:()=>{}};
+ f.sockets.push(socket);
+ const before=f.events.length;
+ for(const diagnostic of [
+  {stage:'host_command',reason:'provider_auth_failed'},
+  {message_id:'legacy-mail-id',reason:'workspace_label_unavailable'},
+  {stage:'future_stage',reason:'host_operation_failed'},
+ ]){
+  await f.machine.webSocketMessage(socket as any,JSON.stringify({type:'host.error',session_id:sessionId,
+   operation_id:'op-'+sessionId,...diagnostic}));
+  assert.deepEqual({...f.database.prepare('SELECT state,epoch,native_id FROM sessions WHERE id=?').get(sessionId)},
+   {state:'claimed',epoch,native_id:null});
+  assert.equal((f.database.prepare('SELECT reason FROM attention WHERE session_id=?').get(sessionId) as any).reason,diagnostic.reason);
+  assert.equal(f.events.length,before);
+ }
 });
 
 test('live reaper fails an expired claimed no-native launch without slot accounting',async()=>{
