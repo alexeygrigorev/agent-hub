@@ -10,7 +10,7 @@ ALERT_TO = "dev@dtcdev.click"  # fixed on purpose: never configurable, never ori
 ALERT_FROM = "alerts@dtcdev.click"
 MSMTP_ACCOUNT = "alerts"
 MARKER = "CANARY-OK"
-PROMPTS = {"full": "Reply CANARY-OK and exit", "shell": "echo CANARY-OK; exit"}
+PROMPTS = {"full": "Reply CANARY-OK and exit", "shell": "printf CANARY-OK; sleep 30"}
 STAGES = ("start", "running", "list_host_workspace", "capture", "stop", "gone")
 FAIL_THRESHOLD = 2
 RECOVER_THRESHOLD = 2
@@ -95,7 +95,7 @@ class Canary:
         args = ["sessions", "start", "--workspace", self.workspace, "--name", self.name,
                 "--key", self.key, "--prompt", self.prompt]
         if self.mode == "shell":
-            args += ["--engine", "shell", "--reason", "hub-start-canary shell probe (no model)"]
+            args += ["--engine", "shell"]
         data = self.hub_json("start", *args)
         node = data.get("session") if isinstance(data, dict) and isinstance(data.get("session"), dict) else data
         sid = node.get("id") if isinstance(node, dict) else None
@@ -133,13 +133,19 @@ class Canary:
                 raise StageFailure("running", "timeout_" + reason)
             time.sleep(self.poll)
 
+    def output_has_marker(self, out):
+        if self.mode == "shell":
+            # The prompt is the command text; only an output line that is not the command line counts.
+            return any(ln.strip().endswith(MARKER) and "printf" not in ln for ln in out.splitlines())
+        return MARKER in out.replace(self.prompt, "")
+
     def check_capture(self):
         deadline = time.monotonic() + self.capture_timeout
         reason = "no_output"
         while True:
             rc, out, _ = self.run([*self.a, "capture", self.native, "--bytes", "8192"])
             if rc == 0:
-                if MARKER in out.replace(self.prompt, ""):
+                if self.output_has_marker(out):
                     return
                 reason = "no_output_beyond_prompt" if out.strip() else "empty_capture"
             else:
@@ -265,10 +271,10 @@ def apply_alerting(result):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--mode", choices=("shell", "full"), default="full")
-    p.add_argument("--deploy-gate", action="store_true", help="run the full canary once, no mail, JSON verdict")
+    p.add_argument("--mode", choices=("shell", "full"), default=None)
+    p.add_argument("--deploy-gate", action="store_true", help="run the canary once (default mode full, or --mode shell), no mail, JSON verdict")
     args = p.parse_args()
-    mode = "full" if args.deploy_gate else args.mode
+    mode = args.mode or "full"
     result = Canary(mode, uuid.uuid4().hex[:12]).execute()
     if args.deploy_gate:
         result["deploy_gate"] = True

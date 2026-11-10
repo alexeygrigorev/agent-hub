@@ -57,8 +57,8 @@ if args[:1] == ["list"]:
     print(json.dumps(rows)); sys.exit(0)
 if args[:1] == ["capture"]:
     if sc == "capture_fail": sys.exit(1)
-    prompt = os.environ.get("FAKE_PROMPT", "echo CANARY-OK; exit")
-    if sc == "capture_prompt_only": print("$ " + prompt)
+    prompt = os.environ.get("FAKE_PROMPT", "printf CANARY-OK; sleep 30")
+    if sc == "capture_prompt_only": print("$ " + prompt if "printf" not in prompt else prompt)
     elif sc == "capture_empty": pass
     else: print("$ " + prompt + "\nCANARY-OK")
     sys.exit(0)
@@ -97,7 +97,7 @@ class CanaryTest(unittest.TestCase):
             HUB_CANARY_POLL_S="0.02", HUB_CANARY_RUNNING_TIMEOUT_S="0.3", HUB_CANARY_CAPTURE_TIMEOUT_S="0.2",
             HUB_CANARY_STOP_TIMEOUT_S="0.3", HUB_CANARY_CMD_TIMEOUT_S="10",
         )
-        env["FAKE_PROMPT"] = mode_prompt or ("Reply CANARY-OK and exit" if ("full" in args or "--deploy-gate" in args) else "echo CANARY-OK; exit")
+        env["FAKE_PROMPT"] = mode_prompt or ("Reply CANARY-OK and exit" if ("full" in args or "--deploy-gate" in args) else "printf CANARY-OK; sleep 30")
         env.update(extra)
         for f in ("started", "a_running", "stopped"):
             (self.tmp / f).unlink(missing_ok=True)
@@ -120,8 +120,9 @@ class CanaryTest(unittest.TestCase):
         self.assertEqual(v["mode"], "shell")
         c = self.calls()
         self.assertIn("--engine shell", c)
-        self.assertIn("--reason", c)
-        self.assertIn("--prompt echo CANARY-OK; exit", c)
+        self.assertNotIn("--reason", c)
+        self.assertIn("sleep 30", c)
+        self.assertIn("--prompt printf CANARY-OK; sleep 30", c)
         self.assertIn(str(self.tmp / "ws"), c)
         self.assertIn("a capture " + NATIVE, c)
         self.assertEqual(r.stderr, "")
@@ -299,9 +300,19 @@ class CanaryTest(unittest.TestCase):
         self.assertEqual(self.mails(), [])
         self.assertFalse(self.state.exists())
 
-    def test_deploy_gate_ignores_mode_flag(self):
+    def test_deploy_gate_shell_mode(self):
         r, v = self.run_canary("ok", "--deploy-gate", "--mode", "shell")
-        self.assertEqual(v["mode"], "full")
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual((v["mode"], v["deploy_gate"]), ("shell", True))
+        self.assertIn("--engine shell", self.calls())
+        r, v = self.run_canary("capture_prompt_only", "--deploy-gate", "--mode", "shell")
+        self.assertEqual((r.returncode, v["stage"]), (1, "capture"))
+        self.assertEqual(self.mails(), [])
+        self.assertFalse(self.state.exists())
+
+    def test_shell_capture_requires_output_line_not_command_text(self):
+        # command line only, even with the marker inside it, must fail
+        self.assert_stage("capture_prompt_only", "capture", "no_output_beyond_prompt")
 
 
 if __name__ == "__main__":
