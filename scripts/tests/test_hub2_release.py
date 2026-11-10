@@ -72,6 +72,17 @@ class ReleaseTests(unittest.TestCase):
         self.assertIn('--no-deps', pip)
         self.assertFalse(any('systemctl' in args and 'stop' in args for args in self.calls))
 
+    def test_existing_uv_creates_venv_without_system_ensurepip(self):
+        with patch.object(updater.shutil, 'which', return_value='/mock/uv'):
+            self.install()
+        self.assertTrue(any(args[:3] == ['/mock/uv', 'venv', '--allow-existing'] for args in self.calls))
+        self.assertTrue(any(args[:3] == ['/mock/uv', 'pip', 'install'] and '--no-index' in args for args in self.calls))
+
+    def test_stdlib_fallback_when_uv_unavailable(self):
+        with patch.object(updater.shutil, 'which', return_value=None):
+            self.install()
+        self.assertTrue(any(args[1:3] == ['-m', 'venv'] for args in self.calls))
+
     def test_corrupt_artifact_never_touches_current_or_installs(self):
         old = self.old_release()
         self.files[HOST] = b'tampered'

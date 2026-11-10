@@ -213,9 +213,15 @@ def install(base_url, root, *, install_service=False, restart=True):
             (prepared / '.installing').write_text(version)
             prepared.rename(target)
             try:
-                command([sys.executable, '-m', 'venv', target])
                 python = target / 'bin/python'
-                command([python, '-m', 'pip', 'install', '--no-index', '--no-deps',
+                uv = shutil.which('uv')
+                if uv:
+                    command([uv, 'venv', '--allow-existing', '--python', sys.executable, target])
+                    installer = [uv, 'pip', 'install', '--python', python]
+                else:
+                    command([sys.executable, '-m', 'venv', target])
+                    installer = [python, '-m', 'pip', 'install']
+                command([*installer, '--no-index', '--no-deps',
                          download / 'websockets-16.0-py3-none-any.whl', download / host_wheel])
                 command([python, '-c', 'from agent_hub_host._release import HOST_VERSION, PROTOCOL_VERSION; '
                          f'assert HOST_VERSION == {version!r} and PROTOCOL_VERSION == {manifest["protocol_version"]}; '

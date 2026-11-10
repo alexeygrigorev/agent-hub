@@ -14,7 +14,7 @@ The manifest is published last. HTTPS authenticates downloads; hashes detect
 partial or mixed releases. Host heartbeat and routing-machine responses expose
 the host version and protocol mismatch separately.
 
-On Linux with Python 3.11+, curl, venv/pip, aplexer and a running systemd user
+On Linux with Python 3.11+, curl, uv (or working stdlib venv/pip), aplexer and a running systemd user
 manager, installation is:
 
 ```sh
