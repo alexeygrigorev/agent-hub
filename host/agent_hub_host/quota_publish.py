@@ -5,6 +5,7 @@ and reset times only; nothing from quse's private details is forwarded.
 """
 import datetime as dt
 import json
+import math
 import subprocess
 import time
 
@@ -40,30 +41,59 @@ def read_quse():
 
 
 def _ms(value):
-    return int(dt.datetime.fromisoformat(value.replace('Z', '+00:00')).timestamp() * 1000)
+    stamp = dt.datetime.fromisoformat(value.replace('Z', '+00:00'))
+    if stamp.tzinfo is None or stamp.utcoffset() is None:
+        raise ValueError('quota_reset_timezone_required')
+    return int(stamp.timestamp() * 1000)
 
 
 def evidence(entry, now_ms):
-    """Binding window = lowest percent_remaining among measured windows; None if nothing measured."""
-    windows = entry.get('windows') if isinstance(entry, dict) and entry.get('status') == 'ok' else None
-    measured = [w for w in (windows or {}).values()
-                if isinstance(w, dict) and isinstance(w.get('percent_remaining'), (int, float))]
-    if not measured:
+    """Lowest measured remaining, or zero for an explicit current provider limit."""
+    if not isinstance(entry, dict) or entry.get('status') != 'ok' or entry.get('error'):
         return None
-    low = min(measured, key=lambda w: w['percent_remaining'])
-    reset = low.get('reset_at')
-    return {'remaining': float(low['percent_remaining']), 'captured_at': now_ms, 'valid_until': now_ms + VALID_MS,
-            'reset_at': _ms(reset) if isinstance(reset, str) else None, 'source': 'quse'}
+    exhausted = isinstance(entry.get('details'), dict) and entry['details'].get('limit_reached') is True
+    windows = entry.get('windows')
+    if windows is None and exhausted:
+        windows = {}
+    if not isinstance(windows, dict) or len(windows) > 32:
+        return None
+    measured = []
+    for window in windows.values():
+        if not isinstance(window, dict):
+            return None
+        left = window.get('percent_remaining')
+        if left is None:
+            continue
+        if type(left) not in (int, float) or not 0 <= left <= 100 or not math.isfinite(left):
+            return None
+        measured.append(window)
+    if not measured and not exhausted:
+        return None
+    low = min(measured, key=lambda w: w['percent_remaining']) if measured else None
+    reset = low.get('reset_at') if low else None
+    try:
+        reset_ms = _ms(reset) if isinstance(reset, str) else None
+    except (ValueError, OverflowError, OSError):
+        return None
+    if (reset is not None and not isinstance(reset, str)) or (reset_ms is not None and reset_ms <= now_ms):
+        return None
+    return {'remaining': 0.0 if exhausted else float(low['percent_remaining']), 'captured_at': now_ms,
+            'valid_until': min(now_ms + VALID_MS, reset_ms) if reset_ms is not None else now_ms + VALID_MS,
+            'reset_at': reset_ms, 'source': 'quse'}
 
 
 def publish(quse=None, request=intake.request, now_ms=None, enable=False):
     quse = read_quse() if quse is None else quse
-    now_ms = now_ms or int(time.time() * 1000)
+    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    if not isinstance(quse, dict) or type(now_ms) is not int or now_ms < 0:
+        raise ValueError('invalid_quota_snapshot')
     result = {'published': [], 'skipped': {}}
     for key, (account, provider) in ACCOUNTS.items():
         body = evidence(quse.get(key), now_ms)
         if body is None:
-            result['skipped'][account] = (quse.get(key) or {}).get('error') or 'no measured window'
+            entry = quse.get(key)
+            state = entry.get('status') if isinstance(entry, dict) else None
+            result['skipped'][account] = 'quota_' + (state if state in {'stale', 'error', 'unavailable'} else 'unmeasured')
             continue
         base = f'/api/accounts/{account}/api/account'
         current = request('GET', base)

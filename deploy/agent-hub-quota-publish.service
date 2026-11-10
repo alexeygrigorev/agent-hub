@@ -1,0 +1,8 @@
+[Unit]
+Description=Publish measured Hub account quota (preserve disabled accounts)
+
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=/usr/bin/python3 %h/.local/lib/agent-hub-quota-publisher/current/hub-quota-publish.py
+TimeoutStartSec=135s

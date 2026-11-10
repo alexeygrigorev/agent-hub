@@ -4,21 +4,23 @@ import type { Hub2Env } from './types';
 import { allowsAstra, sessionPurpose, type SessionPurpose } from './session-purpose';
 
 type Candidate = { id: string; engine: string; model: string; effort?: string; account_id: string; weight: number; capabilities: string[]; enabled: boolean };
-type AccountView = { credential_status?: string; account?: { min_remaining?: number; enabled?: boolean } | null; quota?: { remaining?: number } | null; hosts?: string[]; credential_usable?: boolean };
+type AccountView = { credential_status?: string; account?: { min_remaining?: number; enabled?: boolean } | null; quota?: { remaining?: number; captured_at?: number; valid_until?: number } | null; fresh?: boolean; hosts?: string[]; credential_usable?: boolean };
 type MachineView = { machine_id?: string; engines?: string[]; connected?: boolean; last_seen?: number; os?: string };
 export type PickedRoute = {
   machine_id: string; engine: string; model: string; effort?: string; account_id: string;
   policy_id: string; policy_version: unknown; override_reason: string | null;
-  weight: number; quota_remaining: number; required_capabilities: string[];
+  weight: number; quota_remaining: number | null; required_capabilities: string[];
 };
 export type PickDiagnostics = {
   pool: Array<{ policy_id: string; engine: string; model: string; effort: string | null; weight: number; share: number }>;
   excluded: Array<{ policy_id: string; account_id: string; reason: string }>;
+  warnings?: Array<{ account_id: string; reason: 'quota_stale'; captured_at: number | null }>;
 };
 // Weighting knobs, kept identical to ~/bin/model-roulette so both pools behave the same.
 const MIN_HEADROOM = 5;      // % quota left below which a pool has no headroom
 const DEEP_BIAS = 3;         // opus/sol multiplier for tier deep/complex/serious
-const NEUTRAL_QUOTA = 50;    // pools without a collector reading (zai) get a neutral weight
+const NEUTRAL_QUOTA = 50;    // unknown observations get a neutral weight, never fabricated quota
+const QUOTA_MAX_AGE_MS = 30 * 60 * 1000;
 const DEEP_TIERS = new Set(['deep', 'complex', 'serious']);
 export type PickInput = {
   purpose?: SessionPurpose;
@@ -29,6 +31,18 @@ export type PickInput = {
 };
 
 const internalActor = JSON.stringify({ id: 'hub2-model-picker', kind: 'operator', scopes: ['operator:admin', 'routing:read'] });
+
+/** Expired, invalidated or unproved observations never become current headroom. */
+function currentQuota(view: AccountView | undefined, now: number): number | null {
+  const quota = view?.quota;
+  if (view?.fresh !== true || !quota || typeof quota.remaining !== 'number'
+      || !Number.isFinite(quota.remaining) || quota.remaining < 0 || quota.remaining > 100
+      || !Number.isSafeInteger(quota.captured_at) || !Number.isSafeInteger(quota.valid_until)
+      || quota.captured_at! < 0 || quota.captured_at! > now + 5000
+      || now - quota.captured_at! >= QUOTA_MAX_AGE_MS || quota.valid_until! <= now
+      || quota.valid_until! < quota.captured_at! || quota.valid_until! > quota.captured_at! + 3600000) return null;
+  return quota.remaining;
+}
 
 async function read(namespace: DurableObjectNamespace, id: string, path: string): Promise<any> {
   const response = await namespace.get(namespace.idFromName(id)).fetch('https://picker.internal' + path, {
@@ -125,11 +139,14 @@ export async function pickModelRouteDetailed(env: Hub2Env, input: PickInput, ran
 
   // Headroom weight per candidate; luna is one option among many, so it never outweighs the mean of the others.
   const deep = DEEP_TIERS.has((input.tier || '').toLowerCase());
-  const headroom = (candidate: Candidate): number | null => {
-    const quota = accounts.get(candidate.account_id)?.quota?.remaining;
-    if (Number.isFinite(quota)) return Math.max(0, Number(quota));
-    return candidate.engine === 'zai' ? NEUTRAL_QUOTA : null;
-  };
+  const quotaNow = Date.now();
+  const observations = new Map(accountIds.map(id => [id, currentQuota(accounts.get(id), quotaNow)]));
+  const warnings: NonNullable<PickDiagnostics['warnings']> = accountIds.filter(id => observations.get(id) === null).map(id => {
+    const captured = accounts.get(id)?.quota?.captured_at;
+    return { account_id: id, reason: 'quota_stale', captured_at: Number.isSafeInteger(captured) && captured! >= 0 ? captured! : null };
+  });
+  if (warnings.length) console.error('[hub2] QUOTA_STALE alert=dev@dtcdev.click', JSON.stringify(warnings));
+  const headroom = (candidate: Candidate): number | null => observations.get(candidate.account_id) ?? null;
   const dropped: PickDiagnostics['excluded'] = [];
   const ready = (candidate: Candidate): boolean => {
     const view = accounts.get(candidate.account_id);
@@ -138,7 +155,7 @@ export async function pickModelRouteDetailed(env: Hub2Env, input: PickInput, ran
   const advertised = (candidate: Candidate): boolean => [...ids].some(id => machines.get(id)?.engines?.includes(candidate.engine));
   const scored = candidates.map(candidate => {
     const left = headroom(candidate);
-    const base = Math.max(0.0001, candidate.weight) * (left === null ? 0.1 : Math.max(0.01, left)) * (deep && isDeepWorkModel(candidate) ? DEEP_BIAS : 1);
+    const base = Math.max(0.0001, candidate.weight) * (left === null ? NEUTRAL_QUOTA : Math.max(0.01, left)) * (deep && isDeepWorkModel(candidate) ? DEEP_BIAS : 1);
     return { candidate, left, base };
   });
   // Auth/quota/advertisement observations narrow the pool, but never turn into a refusal when nothing survives.
@@ -173,7 +190,7 @@ export async function pickModelRouteDetailed(env: Hub2Env, input: PickInput, ran
         ...(candidate.effort ? { effort: candidate.effort } : {}), account_id: candidate.account_id,
         policy_id: candidate.id, policy_version: policy.version,
         override_reason: override ? input.override_reason?.trim() || 'explicit_route' : null,
-        weight, quota_remaining: left ?? 0, required_capabilities: required,
+        weight, quota_remaining: left, required_capabilities: required,
       }, weight });
     }
   }
@@ -185,7 +202,7 @@ export async function pickModelRouteDetailed(env: Hub2Env, input: PickInput, ran
     const row = byPolicy.get(value.policy_id) || { policy_id: value.policy_id, engine: value.engine, model: value.model, effort: value.effort ?? null, weight: 0, share: 0 };
     row.weight += weight; row.share = row.weight / total; byPolicy.set(value.policy_id, row);
   }
-  return { route, diagnostics: { pool: [...byPolicy.values()], excluded: dropped } };
+  return { route, diagnostics: { pool: [...byPolicy.values()], excluded: dropped, warnings } };
 }
 
 export { weightedChoice };
