@@ -57,7 +57,7 @@ type SagaRow = {
   session_id: string; machine_id: string; account_id: string | null; attempt_operation_id: string;
   launch_spec_json: string; epoch: number | null; state: string;
   attempt: number; retry_count: number; next_action_at: number | null; last_reason: string | null; native_id: string | null;
-  routing_json: string | null;route_registered:number;
+  routing_json: string | null;route_registered:number;created_at:number;
 };
 type IntakeEventRow = { seq: number; actor_id: string; kind: string; body_json: string; at: number };
 
@@ -425,7 +425,7 @@ export class ProjectDO {
     const accountId = route.engine.toLowerCase() === 'shell' ? null : route.account_id;
     const launchSpec = {
       workspace, engine: route.engine, model: route.model, ...(route.effort ? { effort: route.effort } : {}),
-      prompt, interactive,with_goal:withGoal, timeout_seconds: Number(timeoutSeconds),
+      prompt, interactive,with_goal:withGoal, timeout_seconds: Number(timeoutSeconds), start_deadline_at: Date.now()+120_000,
       ...(route.engine.toLowerCase() === 'shell' ? { shell_reason: overrideReason } : {}),
     };
     const now = Date.now();
@@ -532,13 +532,34 @@ export class ProjectDO {
     }
   }
 
+  private async failDispatch(saga: SagaRow, reason: string): Promise<void> {
+    const now=Date.now();
+    this.transaction(()=>{
+      const current=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?',saga.operation_id);
+      if(!current||current.state==='complete'||current.native_id)return;
+      this.db.run("UPDATE dispatch_sagas SET state='complete',next_action_at=NULL,last_reason=?,updated_at=? WHERE operation_id=?",reason,now,saga.operation_id);
+      this.db.run("UPDATE intakes SET status='failed',final_evidence_json=?,updated_at=? WHERE id=? AND session_id=?",
+        JSON.stringify({launch_failed:true,native_id_absent:true,reason,session_id:saga.session_id,operation_id:saga.operation_id}),now,saga.intake_id,saga.session_id);
+      this.appendEvent(saga.intake_id,`dispatch-failed:${saga.attempt_operation_id}`, 'hub2-dispatch','session_launch_failed',
+        {session_id:saga.session_id,reason},now);
+    });
+    await this.env.CONTROL.get(this.env.CONTROL.idFromName('global')).fetch('https://control.internal/_internal/session-cap/release',{
+      method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({operation_id:saga.operation_id,session_id:saga.session_id}),
+    }).catch(()=>undefined);
+    console.error('[hub2] DISPATCH_FAILED',JSON.stringify({session_id:saga.session_id,reason}));
+  }
+
   private async deferSaga(saga: SagaRow, reason: string): Promise<void> {
     const now = Date.now();
     const retryCount = saga.retry_count + 1;
+    if(retryCount>=10||now-saga.created_at>=120_000){
+      await this.failDispatch(saga,now-saga.created_at>=120_000?'host_no_response':'dispatch_retries_exhausted');
+      return;
+    }
     const delayMs = Math.min(15 * 60_000, 1_000 * 2 ** Math.min(retryCount, 9));
     this.transaction(() => {
       this.db.run('UPDATE dispatch_sagas SET retry_count=?, next_action_at=?, last_reason=?, updated_at=? WHERE operation_id=? AND state=?',
-        retryCount, now + delayMs, reason.slice(0, 100), now, saga.operation_id, saga.state);
+        retryCount, Math.min(now + delayMs,saga.created_at+120_000), reason.slice(0, 100), now, saga.operation_id, saga.state);
     });
   }
 
@@ -565,16 +586,9 @@ export class ProjectDO {
       || saga.attempt_operation_id !== body.attempt_operation_id || saga.epoch !== body.epoch || saga.state !== 'offered') {
       return error('stale_offer_expiry', 409);
     }
-    const now = Date.now();
-    this.transaction(() => {
-      const current = this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?', body.operation_id);
-      if (!current || current.state !== 'offered' || current.attempt_operation_id !== body.attempt_operation_id || current.epoch !== body.epoch) return;
-      const nextAttempt = current.attempt + 1;
-      this.db.run(`UPDATE dispatch_sagas SET state='pending_machine', attempt=?, retry_count=0, attempt_operation_id=?, next_action_at=?, last_reason=?, updated_at=?
-        WHERE operation_id=? AND state='offered'`, nextAttempt, `${current.operation_id}:${nextAttempt}`, now, 'offer_expired_unclaimed', now, current.operation_id);
-    });
+    await this.failDispatch(saga,'host_no_response');
     await this.scheduleNext();
-    return json({ ok: true, retry_scheduled: true });
+    return json({ok:true,retry_scheduled:false,failed:true,reason:'host_no_response'});
   }
 
   private async claimInternal(request: Request): Promise<Response> {
@@ -588,7 +602,7 @@ export class ProjectDO {
     if (saga.state !== 'offered') return error('offer_not_claimable', 409);
     const now = Date.now();
     this.transaction(() => {
-      this.db.run("UPDATE dispatch_sagas SET state='claimed', next_action_at=NULL, updated_at=? WHERE operation_id=? AND state='offered' AND attempt_operation_id=? AND epoch=?",
+      this.db.run("UPDATE dispatch_sagas SET state='admitted', next_action_at=NULL, updated_at=? WHERE operation_id=? AND state='offered' AND attempt_operation_id=? AND epoch=?",
         now, saga.operation_id, saga.attempt_operation_id, saga.epoch);
       this.appendEvent(saga.intake_id, `claim:${saga.attempt_operation_id}:${saga.epoch}`, `machine:${saga.machine_id}`, 'session_claimed',
         { session_id: saga.session_id, machine_id: saga.machine_id, epoch: saga.epoch }, now);
@@ -600,9 +614,9 @@ export class ProjectDO {
     const reaped=new URL(request.url).pathname.endsWith('/reaped');
     const body=await bodyObject(request,4096);
     if(typeof body.operation_id!=='string'||typeof body.attempt_operation_id!=='string'||typeof body.session_id!=='string'
-      ||typeof body.machine_id!=='string'||!Number.isSafeInteger(body.epoch)||!['dead','idle','stop_confirmed','launch_timeout_no_native','host_launch_refused'].includes(String(body.reason)))
+      ||typeof body.machine_id!=='string'||!Number.isSafeInteger(body.epoch)||!['dead','idle','stop_confirmed','launch_timeout_no_native','host_no_response','host_launch_refused'].includes(String(body.reason)))
       return error('invalid_stopped_receipt',400);
-    const launchTimedOut=body.reason==='launch_timeout_no_native';
+    const launchTimedOut=['launch_timeout_no_native','host_no_response'].includes(String(body.reason));
     const launchRefused=body.reason==='host_launch_refused';
     const launchFailed=launchTimedOut||launchRefused;
     const saga=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?',body.operation_id);
@@ -614,19 +628,19 @@ export class ProjectDO {
     const duplicateRetryStop=!launchTimedOut&&body.reason==='stop_confirmed'&&body.native_id==null&&saga.native_id===null
       &&saga.state==='complete'&&saga.last_reason==='stop_confirmed'&&previousAttempt;
     if(!exactAttempt&&!pendingRetryStop&&!duplicateRetryStop)return error('stale_stopped_receipt',409);
-    if(saga.state==='complete')return ['launch_timeout_no_native','host_launch_refused'].includes(String(saga.last_reason))
+    if(saga.state==='complete')return ['launch_timeout_no_native','host_no_response','host_launch_refused'].includes(String(saga.last_reason))
       ?json({failed:true,duplicate:true,session_id:saga.session_id,reason:saga.last_reason}):json({stopped:true,duplicate:true});
-    if(launchTimedOut&&(!['offered','claimed','admitted'].includes(saga.state)||saga.native_id!==null||body.native_id!==null||body.launch_failed!==true))return error('invalid_launch_timeout_receipt',409);
-    if(launchRefused&&(!reaped||saga.state!=='offered'||saga.native_id!==null||body.native_id!==null||body.launch_failed!==true
+    if(launchTimedOut&&(!['staged','offered','claimed','admitted'].includes(saga.state)||saga.native_id!==null||body.native_id!==null||body.launch_failed!==true))return error('invalid_launch_timeout_receipt',409);
+    if(launchRefused&&(!reaped||!['offered','claimed','admitted'].includes(saga.state)||saga.native_id!==null||body.native_id!==null||body.launch_failed!==true
       ||typeof body.failure_reason!=='string'||!/^[a-z_]{1,80}$/.test(body.failure_reason)))return error('invalid_launch_refusal_receipt',409);
-    if(!['offered','claimed','admitted','running'].includes(saga.state)&&!pendingRetryStop)return error('session_not_active',409);
+    if(!['staged','offered','claimed','admitted','running'].includes(saga.state)&&!pendingRetryStop)return error('session_not_active',409);
     const intake=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',saga.intake_id);
     if(!intake||intake.session_id!==saga.session_id||intake.assigned_machine_id!==saga.machine_id)return error('stopped_intake_binding_mismatch',409);
     const now=Date.now(),eventKey=`stopped:${saga.attempt_operation_id}:${saga.epoch}`;
     const applied=this.transaction(()=>{
       const current=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?',saga.operation_id);
       if(!current||current.state!==saga.state||current.attempt_operation_id!==saga.attempt_operation_id||current.epoch!==saga.epoch)return false;
-      if(!['offered','claimed','admitted','running'].includes(current.state)&&!pendingRetryStop)return false;
+      if(!['staged','offered','claimed','admitted','running'].includes(current.state)&&!pendingRetryStop)return false;
       this.db.run("UPDATE dispatch_sagas SET state='complete',native_id=COALESCE(native_id,?),next_action_at=NULL,last_reason=?,updated_at=? WHERE operation_id=? AND state=? AND attempt_operation_id=? AND epoch=?",
         typeof body.native_id==='string'?body.native_id:null,String(body.reason),now,saga.operation_id,saga.state,saga.attempt_operation_id,saga.epoch);
       this.db.run("UPDATE intakes SET status='failed',final_evidence_json=?,updated_at=? WHERE id=?",
@@ -676,6 +690,7 @@ export class ProjectDO {
       await this.scheduleNext();
       return json({fallback:false,reason:'all_model_routes_auth_failed'});
     };
+    if(saga.attempt>=1)return await fail('model_attempts_exhausted');
     if(!route||route.override_reason!==null)return await fail('explicit_route_auth_failed');
     let next:PickedRoute;
     try{

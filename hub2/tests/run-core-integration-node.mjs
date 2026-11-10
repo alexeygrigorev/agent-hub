@@ -101,7 +101,7 @@ try{
   const bad={epoch:offer.epoch+1,operation_id:offer.operation_id};expect(await api(`/api/sessions/${started.id}/admission`,'POST',bad,hostToken),409,'stale epoch');
   liveSocket.socket.send(JSON.stringify({type:'offer_ack',session_id:started.id,epoch:offer.epoch}));await liveSocket.wait(v=>v.type==='ack'&&v.session_id===started.id);
   const native='11111111-2222-4333-8444-555555555555';
-  expect(await api(`/api/sessions/${started.id}/started`,'POST',{operation_id:offer.operation_id,epoch:offer.epoch,native_id:native},hostToken),409,'started before admission');
+  // Claim is admission; this endpoint remains a compatibility view for older hosts.
   const admission=expect(await api(`/api/sessions/${started.id}/admission`,'POST',{epoch:offer.epoch,operation_id:offer.operation_id},hostToken),200,'host admission');assert.equal(admission.launch_allowed,true);assert.equal(admission.epoch,offer.epoch);assert(Number.isSafeInteger(admission.runtime_deadline)&&admission.runtime_deadline>Date.now(),'admission must expose its immutable synthetic deadline');
   expect(await api(`/api/sessions/${started.id}/started`,'POST',{operation_id:offer.operation_id,epoch:offer.epoch+1,native_id:native},hostToken),409,'stale started receipt');
   let workerCheck;if(process.env.HUB2_CORE_WORKER){const {prepareWorkerProof}=await import('./normal-day-worker-credentials.mjs');workerCheck=await prepareWorkerProof({api,expect,fixture,socket,intake,start,project,machine,hostToken,session:started,offer,intakeId:created.id,root,persist,base});}

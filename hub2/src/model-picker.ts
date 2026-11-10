@@ -4,7 +4,7 @@ import type { Hub2Env } from './types';
 
 type Candidate = { id: string; engine: string; model: string; effort?: string; account_id: string; weight: number; capabilities: string[]; enabled: boolean };
 type AccountView = { credential_status?: string; account?: { min_remaining?: number; enabled?: boolean } | null; quota?: { remaining?: number } | null; hosts?: string[]; credential_usable?: boolean };
-type MachineView = { machine_id?: string; engines?: string[] };
+type MachineView = { machine_id?: string; engines?: string[]; connected?: boolean };
 export type PickedRoute = {
   machine_id: string; engine: string; model: string; effort?: string; account_id: string;
   policy_id: string; policy_version: unknown; override_reason: string | null;
@@ -52,8 +52,8 @@ export async function pickModelRoute(env: Hub2Env, input: PickInput, random = Ma
 export async function pickModelRouteDetailed(env: Hub2Env, input: PickInput, random = Math.random): Promise<{ route: PickedRoute; diagnostics: PickDiagnostics }> {
   if (input.with_goal && !input.interactive) throw new HttpError('goal_requires_interactive', 400);
   const override = !!(input.machine_id || input.engine || input.model || input.effort);
-  if (override && (!input.override_reason?.trim() || input.override_reason.length > 500))
-    throw new HttpError('override_reason_required', 400);
+  if (input.override_reason && input.override_reason.length > 500)
+    throw new HttpError('invalid_override_reason', 400);
   const required = [...new Set([input.interactive ? 'interactive' : 'headless', ...(input.with_goal ? ['goal'] : []), ...(input.required_capabilities || [])])];
   if (required.length > 32 || required.some(value => typeof value !== 'string' || !value || value.length > 80))
     throw new HttpError('invalid_required_capabilities', 400);
@@ -89,13 +89,17 @@ export async function pickModelRouteDetailed(env: Hub2Env, input: PickInput, ran
     catch { accounts.set(id, {}); }
   }));
   for (const account of accounts.values()) for (const host of account.hosts || []) ids.add(host);
-  if (!ids.size) throw new HttpError('machine_route_unavailable', 503);
+  if (!ids.size) throw new HttpError('no_connected_host', 503);
 
   const machines = new Map<string, MachineView>();
   await Promise.all([...ids].map(async id => {
     try { machines.set(id, await read(env.MACHINES, id, '/_internal/routing') as MachineView); }
     catch { machines.set(id, { machine_id: id, engines: [] }); }
   }));
+
+  for (const id of ids) if (machines.get(id)?.connected !== true) ids.delete(id);
+  if (input.machine_id && !ids.has(input.machine_id) || !ids.size)
+    throw new HttpError('no_connected_host', 503);
 
   // Headroom weight per candidate; luna is one option among many, so it never outweighs the mean of the others.
   const deep = DEEP_TIERS.has((input.tier || '').toLowerCase());
@@ -146,7 +150,7 @@ export async function pickModelRouteDetailed(env: Hub2Env, input: PickInput, ran
         machine_id: machineId, engine: candidate.engine, model: candidate.model,
         ...(candidate.effort ? { effort: candidate.effort } : {}), account_id: candidate.account_id,
         policy_id: candidate.id, policy_version: policy.version,
-        override_reason: override ? input.override_reason!.trim() : null,
+        override_reason: override ? input.override_reason?.trim() || 'explicit_route' : null,
         weight, quota_remaining: left ?? 0, required_capabilities: required,
       }, weight });
     }
