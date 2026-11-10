@@ -606,7 +606,7 @@ export class ProjectDO {
     if(saga.state==='complete')return saga.last_reason==='launch_timeout_no_native'
       ?json({failed:true,duplicate:true,session_id:saga.session_id,reason:'launch_timeout_no_native'}):json({stopped:true,duplicate:true});
     if(launchTimedOut&&(!['offered','claimed','admitted'].includes(saga.state)||saga.native_id!==null||body.native_id!==null||body.launch_failed!==true))return error('invalid_launch_timeout_receipt',409);
-    if(!['staged','offered','claimed','admitted','running'].includes(saga.state))return error('session_not_active',409);
+    if(!['offered','claimed','admitted','running'].includes(saga.state))return error('session_not_active',409);
     const intake=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',saga.intake_id);
     if(!intake||intake.session_id!==saga.session_id||intake.assigned_machine_id!==saga.machine_id)return error('stopped_intake_binding_mismatch',409);
     const now=Date.now(),eventKey=`stopped:${saga.attempt_operation_id}:${saga.epoch}`;

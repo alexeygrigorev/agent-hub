@@ -297,6 +297,8 @@ export class MachineDO {
         epoch=fresh.next_epoch+1;
         this.db.run('UPDATE machines SET next_epoch=? WHERE machine_id=?', epoch, body.machine_id);
         if (retrying) {
+          this.db.run("UPDATE session_commands SET state='failed',result_json=?,updated_at=? WHERE session_id=? AND machine_id=? AND epoch=? AND state='pending'",
+            JSON.stringify({error:'session_epoch_superseded'}),now,body.session_id,body.machine_id,prior!.epoch);
           this.db.run("UPDATE machine_session_operations SET state='expired' WHERE operation_id=? AND session_id=? AND epoch=?",
             prior!.operation_id, prior!.id, prior!.epoch);
           this.db.run(`UPDATE sessions SET operation_id=?,attempt=?,epoch=?,account_id=?,launch_json=?,state='staged',offer_expires_at=NULL,
@@ -727,8 +729,6 @@ export class MachineDO {
     const scope = kind === 'send' ? 'session:send' : kind === 'capture' ? 'session:capture' : 'session:stop';
     if (!hasScope(actor, 'operator:admin') && (!hasScope(actor, scope)
       || (actor.resource_id !== sessionId && actor.resource_id !== session.project_id))) return error('forbidden', 403);
-    if (kind === 'stop' ? !['staged','offered','running', 'claimed'].includes(session.state)
-      : session.state !== 'running' || !session.native_id) return error('session_not_running', 409);
     if (kind === 'send' && (this.parse(session.launch_json) as JsonRecord).interactive !== true) return error('headless_send_refused', 409);
     const commandText = body.text;
     if (kind === 'send' && (typeof commandText !== 'string' || !commandText.trim() || new TextEncoder().encode(commandText).byteLength > 8192)) return error('invalid_command_text', 400);
@@ -741,12 +741,14 @@ export class MachineDO {
       if (prior.request_digest !== digest) return error('idempotency_conflict', 409);
       return json({ command: this.commandView(prior), replayed: true });
     }
+    if (kind === 'stop' ? !['running', 'claimed'].includes(session.state)
+      : session.state !== 'running' || !session.native_id) return error('session_not_running', 409);
     const now = Date.now(), id = crypto.randomUUID();
     try {
       this.db.transaction(this.ctx, () => {
         const current = this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?', sessionId);
         if (!current || current.epoch !== session.epoch || !(kind==='stop'
-          ? ['staged','offered','running','claimed'].includes(current.state)
+          ? ['running','claimed'].includes(current.state)
           : current.state==='running'&&!!current.native_id)) throw new HttpError('session_not_running', 409);
         this.db.run(`INSERT INTO session_commands(id,session_id,machine_id,epoch,request_key,request_digest,kind,text,state,result_json,created_at,updated_at)
           VALUES(?,?,?,?,?,?,?,?,'pending',NULL,?,?)`, id, sessionId, session.machine_id, session.epoch, key, digest, kind, commandText ?? null, now, now);
@@ -755,11 +757,7 @@ export class MachineDO {
       if (caught instanceof HttpError) return error(caught.code, caught.status);
       return error('command_persist_failed', 503);
     }
-    const current=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',sessionId);
-    if(kind==='stop'&&current&&current.epoch===session.epoch&&!current.native_id&&['staged','offered'].includes(current.state)){
-      await this.recordStopped(current,'stop_confirmed',now,true);
-      await this.scheduleNext();
-    }else await this.notifyPendingCommands(session.machine_id);
+    await this.notifyPendingCommands(session.machine_id);
     const command = this.db.one<CommandRow>('SELECT * FROM session_commands WHERE id=?', id);
     return command ? json({ command: this.commandView(command) }, 201) : error('command_persist_failed', 503);
   }
@@ -791,7 +789,7 @@ export class MachineDO {
 
   private async sendPendingCommands(socket:WebSocket,machineId:string,env:Hub2Env=this.env):Promise<void>{
     const stop=this.stopOnly(socket);
-    const command=this.db.one<CommandRow>("SELECT c.* FROM session_commands c JOIN sessions s ON s.id=c.session_id AND s.machine_id=c.machine_id WHERE c.machine_id=? AND s.state IN ('claimed','running') AND c.state='pending' "+(stop?"AND c.kind='stop' ":"")+"ORDER BY CASE WHEN c.kind='stop' THEN 0 ELSE 1 END,c.created_at,c.id LIMIT 1",machineId);
+    const command=this.db.one<CommandRow>("SELECT c.* FROM session_commands c JOIN sessions s ON s.id=c.session_id AND s.machine_id=c.machine_id AND c.epoch=s.epoch WHERE c.machine_id=? AND s.state IN ('claimed','running') AND c.state='pending' "+(stop?"AND c.kind='stop' ":"")+"ORDER BY CASE WHEN c.kind='stop' THEN 0 ELSE 1 END,c.created_at,c.id LIMIT 1",machineId);
     if(!command)return;
     if(!await this.authorizedAttachment(socket,'machine:offer',true,env))return;
     try{
@@ -1030,15 +1028,14 @@ export class MachineDO {
     try{return !!row?.result_json&&(JSON.parse(row.result_json) as JsonRecord).stopped===true;}catch{return false;}
   }
 
-  private async recordStopped(session:SessionRow,reason:string,observedAt:number,allowUnclaimed=false):Promise<boolean>{
+  private async recordStopped(session:SessionRow,reason:string,observedAt:number):Promise<boolean>{
     const now=Date.now(),payload={operation_id:session.dispatch_id,attempt_operation_id:session.operation_id,session_id:session.id,
       intake_id:session.intake_id,machine_id:session.machine_id,epoch:session.epoch,native_id:session.native_id,
       reason,observed_at:observedAt};
     const applied=this.db.transaction(this.ctx,()=>{
       const current=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',session.id);
-      const allowed=allowUnclaimed?['staged','offered','claimed','running']:['claimed','running'];
       if(!current||current.epoch!==session.epoch||current.operation_id!==session.operation_id||current.native_id!==session.native_id
-        ||!allowed.includes(current.state)||(allowUnclaimed&&current.native_id!==null))return false;
+        ||!['claimed','running'].includes(current.state))return false;
       this.db.run("UPDATE sessions SET state='stopped',updated_at=? WHERE id=?",now,session.id);
       this.db.run("UPDATE machine_session_operations SET state='stopped' WHERE operation_id=? AND session_id=? AND epoch=?",session.operation_id,session.id,session.epoch);
       this.settlePendingCommands(session,now,'stop_confirmed',true);

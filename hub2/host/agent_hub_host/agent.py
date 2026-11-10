@@ -334,9 +334,11 @@ class Bridge:
         if kind not in {"capture", "send", "stop"}:
             raise ValueError("command_not_allowed")
         row = db.execute("SELECT * FROM launches WHERE session_id=?", (command.get("session_id"),)).fetchone()
-        if not row or row["epoch"] != command.get("epoch"):
+        if not row:
             if kind == "stop" and command.get("pre_native") is True:
                 return self.stop_pre_native_command(command, identity, digest)
+            raise ValueError("command_fence_conflict")
+        if row["epoch"] != command.get("epoch"):
             raise ValueError("command_fence_conflict")
         native_id, _status = self.resolve_launch_native(row)
         if not native_id and row["state"] in {"pending_admission", "launching", "aborting"}:
@@ -375,6 +377,8 @@ class Bridge:
         tag = command.get("tag")
         if (not isinstance(session, str) or not isinstance(workspace, str) or not workspace
                 or tag != "task-hub2-" + session):
+            raise ValueError("command_fence_conflict")
+        if self.journal.db.execute("SELECT 1 FROM launches WHERE session_id=?", (session,)).fetchone():
             raise ValueError("command_fence_conflict")
         try:
             resolved = Path(workspace).resolve(strict=True)

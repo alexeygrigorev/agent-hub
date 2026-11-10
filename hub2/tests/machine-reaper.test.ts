@@ -23,7 +23,7 @@ function fixture(){
  };
  const machine=new MachineDO(ctx,env);
  const call=(path:string,method='GET',body?:unknown,headers:Record<string,string>={})=>machine.fetch(new Request('https://machine.test'+path,{method,headers:{...header,...headers},...(body===undefined?{}:{body:JSON.stringify(body)})}));
- return{database,machine,call,events,sockets,get alarm(){return alarm;}};
+ return{database,machine,call,events,sockets,clearCache:()=>((machine as any).db.cache.clear()),get alarm(){return alarm;}};
 }
 
 async function startClaimed(f:ReturnType<typeof fixture>,sessionId:string,nativeId:string|null){
@@ -96,10 +96,46 @@ test('stop bypasses a pending fenced capture and settles it after terminal confi
  const stop=frames.at(-1).command;
  assert.equal((await f.call(`/api/sessions/${sessionId}/commands/${stop.id}/ack`,'POST',{epoch,result:{stopped:true}})).status,200);
  assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(sessionId) as any).state,'stopped');
+ const replay=await f.call(`/api/sessions/${sessionId}/commands`,'POST',{kind:'stop',key:'operator-stop'},
+  {'x-hub2-actor':JSON.stringify(operator)}),replayed=await replay.json() as any;
+ assert.equal(replay.status,200);assert.equal(replayed.replayed,true);assert.equal(replayed.command.id,stop.id);assert.equal(frames.length,1);
  const capture=f.database.prepare('SELECT state,result_json FROM session_commands WHERE id=?').get('pending-capture') as any;
  assert.equal(capture.state,'failed');assert.equal(JSON.parse(capture.result_json).error,'session_ended_before_command_execution');
  assert.equal((f.database.prepare('SELECT state FROM session_commands WHERE id=?').get(stop.id) as any).state,'acked');
  assert.equal(f.events.at(-1)?.path,'/_internal/stopped');assert.equal(f.events.at(-1)?.body.reason,'stop_confirmed');
+});
+
+test('a retry supersedes old commands and only sends stops fenced to the current epoch',async()=>{
+ const f=fixture(),sessionId='stop-epoch',oldEpoch=await startClaimed(f,sessionId,null),oldNow=Date.now();
+ const operator={id:'human:operator',kind:'operator',scopes:['operator:admin']};
+ const oldStop=await f.call(`/api/sessions/${sessionId}/commands`,'POST',{kind:'stop',key:'old-stop'},
+  {'x-hub2-actor':JSON.stringify(operator)});
+ assert.equal(oldStop.status,201);const oldCommand=(await oldStop.json() as any).command;
+ f.database.prepare('UPDATE session_commands SET created_at=?,updated_at=? WHERE id=?').run(oldNow-1000,oldNow-1000,oldCommand.id);
+ f.database.prepare("UPDATE sessions SET state='expired' WHERE id=?").run(sessionId);
+ f.clearCache();
+ const prior=f.database.prepare('SELECT state,dispatch_id,request_digest,machine_id,attempt,epoch FROM sessions WHERE id=?').get(sessionId) as any;
+ assert.equal(prior.state,'expired');assert.equal(prior.dispatch_id,'dispatch-'+sessionId);assert.equal(prior.request_digest,'digest-'+sessionId);
+ assert.equal(prior.machine_id,'h1');assert.equal(prior.attempt+1,1);assert.equal(prior.epoch,oldEpoch);
+ const retried=await f.call('/_internal/reserve','POST',{operation_id:'op-'+sessionId+':1',dispatch_id:'dispatch-'+sessionId,
+  attempt:1,session_id:sessionId,project_id:'project-test',intake_id:'intake-'+sessionId,machine_id:'h1',
+  request_digest:'digest-'+sessionId,title:'test session',acceptance_criteria:['test'],account_id:'codex',retry_epoch:oldEpoch,
+  launch:{workspace:'/tmp',engine:'codex',model:'gpt-6.1-sol',prompt:'test work',interactive:false}});
+ assert.equal(retried.status,200,JSON.stringify(await retried.clone().json()));const retryEpoch=(await retried.json() as any).epoch;
+ assert(retryEpoch>oldEpoch);
+ assert.equal((f.database.prepare('SELECT state FROM session_commands WHERE id=?').get(oldCommand.id) as any).state,'failed');
+ assert.equal(JSON.parse((f.database.prepare('SELECT result_json FROM session_commands WHERE id=?').get(oldCommand.id) as any).result_json).error,'session_epoch_superseded');
+ f.database.prepare("UPDATE sessions SET state='claimed' WHERE id=?").run(sessionId);
+ f.clearCache();
+ const frames:any[]=[];f.sockets.push({readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'socket'}),send:(value:string)=>frames.push(JSON.parse(value))});
+ const reusedKey=await f.call(`/api/sessions/${sessionId}/commands`,'POST',{kind:'stop',key:'old-stop'},
+  {'x-hub2-actor':JSON.stringify(operator)});
+ assert.equal(reusedKey.status,409);assert.equal((await reusedKey.json() as any).error,'idempotency_conflict');
+ const response=await f.call(`/api/sessions/${sessionId}/commands`,'POST',{kind:'stop',key:'current-epoch-stop'},
+  {'x-hub2-actor':JSON.stringify(operator)});
+ assert.equal(response.status,201);const created=(await response.json() as any).command;
+ assert.equal(frames.at(-1)?.command?.id,created.id);assert.equal(frames.at(-1)?.command?.epoch,retryEpoch);
+ assert.equal(frames.at(-1)?.command?.pre_native,true);
 });
 
 test('capture is refused before a claimed session has a native identity',async()=>{
@@ -109,6 +145,17 @@ test('capture is refused before a claimed session has a native identity',async()
   {'x-hub2-actor':JSON.stringify(operator)});
  assert.equal(response.status,409);assert.equal((await response.json() as any).error,'session_not_running');
  assert.equal((f.database.prepare('SELECT COUNT(*) AS count FROM session_commands WHERE session_id=?').get('claimed-capture') as any).count,0);
+});
+
+test('stop refuses an unclaimed offered session',async()=>{
+ const f=fixture();await startClaimed(f,'offered-stop',null);
+ f.database.prepare("UPDATE sessions SET state='offered' WHERE id=?").run('offered-stop');
+ const operator={id:'human:operator',kind:'operator',scopes:['operator:admin']};
+ const response=await f.call('/api/sessions/offered-stop/commands','POST',{kind:'stop',key:'stop-before-claim'},
+  {'x-hub2-actor':JSON.stringify(operator)});
+ assert.equal(response.status,409);assert.equal((await response.json() as any).error,'session_not_running');
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get('offered-stop') as any).state,'offered');
+ assert.equal((f.database.prepare('SELECT COUNT(*) AS count FROM session_commands WHERE session_id=?').get('offered-stop') as any).count,0);
 });
 
 test('a native process absent from a fresh host snapshot is marked stopped without a pending stop command',async()=>{
