@@ -354,8 +354,8 @@ export class AccountDO {
     throw new HttpError(refusedCode,409);
    }
    const b=await this.boundedJson(response);if(typeof b.access_token!=='string')throw new HttpError('provider_refresh_invalid',502);
-   if(provider==='codex'){auth.tokens.access_token=b.access_token;if(typeof b.refresh_token!=='string')auth.tokens.refresh_token=b.refresh_token;if(typeof b.id_token!=='string')auth.tokens.id_token=b.id_token;auth.last_refresh=new Date().toISOString();}
-   else{auth.claudeAiOauth.accessToken=b.access_token;if(typeof b.refresh_token!=='string')auth.claudeAiOauth.refreshToken=b.refresh_token;auth.claudeAiOauth.expiresAt=Date.now()+Number(b.expires_in||3600)*1000;}
+   if(provider==='codex'){auth.tokens.access_token=b.access_token;if(typeof b.refresh_token==='string')auth.tokens.refresh_token=b.refresh_token;if(typeof b.id_token==='string')auth.tokens.id_token=b.id_token;auth.last_refresh=new Date().toISOString();}
+   else{auth.claudeAiOauth.accessToken=b.access_token;if(typeof b.refresh_token==='string')auth.claudeAiOauth.refreshToken=b.refresh_token;auth.claudeAiOauth.expiresAt=Date.now()+Number(b.expires_in||3600)*1000;}
    files[path]=JSON.stringify(auth);const sealed=await this.seal(files,provider,generation+1);
    this.db.run('UPDATE credential_candidates SET sealed=?,state=? WHERE id=?',sealed,'pending',attempt);
    this.db.transaction(this.ctx,()=>{const row=this.db.one<{generation:number;refresh_until:number}>('SELECT generation,refresh_until FROM credentials WHERE id=1');if(row?.generation!==generation||row.refresh_until!==until)throw new HttpError('provider_refresh_superseded',409);this.db.run('UPDATE credentials SET sealed=?,generation=generation+1,refresh_until=0,refresh_owner=NULL,refresh_lease=NULL WHERE id=1',sealed);this.db.run('UPDATE quota SET valid_until=0 WHERE id=1');this.db.run('UPDATE credential_candidates SET state=? WHERE id=?','published',attempt);});return auth;

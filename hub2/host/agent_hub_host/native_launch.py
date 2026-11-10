@@ -465,7 +465,8 @@ class NativeLauncher:
         private_file(fa_path.parent)
         if provider in FIRST_ACTION_PROVIDERS:
             goal += FIRST_ACTION_INSTRUCTION.format(path=fa_path)
-        goal = aplexer_prompt(goal)
+        if provider != 'shell':
+            goal = aplexer_prompt(goal)
         local = provider == 'shell' or (not self.config.get("private_provider_homes", False) and not specification.get("interactive"))
         if local:
             child = self.profile_command(task_id, specification, route, goal)

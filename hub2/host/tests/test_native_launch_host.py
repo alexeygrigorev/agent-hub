@@ -348,6 +348,22 @@ class SpawnEnvironmentTest(unittest.TestCase):
 
 
 class LaunchReceiptTest(unittest.TestCase):
+    def test_literal_shell_prompt_never_uses_model_prompt_normalization(self):
+        prompt = 'echo first\necho second'
+        with tempfile.TemporaryDirectory() as workspace:
+            child = (['cmd.exe', '/d', '/s', '/c', prompt] if os.name == 'nt' else ['/bin/sh', '-c', prompt])
+            output = json.dumps({'id': 'd6cf9872-8597-48a5-be64-990cdef4db31', 'tag': 'task-t1',
+                                 'workspace': workspace, 'command': child})
+            runner = mock.Mock(return_value=mock.Mock(returncode=0, stdout=output))
+            adapter = nl.NativeLauncher({'routes': {'shell': {'provider': 'shell'}}}, runner=runner)
+            with mock.patch.object(nl, 'aplexer_prompt', return_value='echo first echo second') as normalize, \
+                 mock.patch.object(adapter, 'record_evidence'):
+                adapter.launch('t1', {'workspace': workspace, 'engine': 'shell', 'model': 'shell',
+                                     'prompt': prompt, 'interactive': False, 'timeout_seconds': 60})
+            normalize.assert_not_called()
+            command = runner.call_args.args[0]
+            self.assertEqual(command[command.index('--') + 1:], child)
+
     def test_launch_attempts_start_without_a_host_capacity_gate(self):
         config = {'private_provider_homes': True, 'routes': {'codex': {'provider': 'zai'}}, 'min_free_mem_mb': 6000, 'memory_mb': 1500}
         with tempfile.TemporaryDirectory() as workspace:
