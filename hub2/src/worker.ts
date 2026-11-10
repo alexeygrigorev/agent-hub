@@ -22,7 +22,7 @@ const router = {
       if (!path) return error('internal_route_forbidden', 404);
       // Install/update clients have no credential yet. Only the published CLI
       // artifacts and dashboard are public; API routes still authenticate.
-      const cliAsset = /^\/cli\/(?:manifest\.json|hub\.pyz(?:\.sha256)?|(?:host-)?install\.(?:sh|ps1))$/.test(path);
+      const cliAsset = /^\/cli\/(?:manifest\.json|host-release\.json|hub\.pyz(?:\.sha256)?|(?:host-)?install\.(?:sh|ps1)|hub2-(?:self-update|enroll)\.py|agent-hub2-host\.service|agent-hub2-host-update\.(?:service|timer)|agent_hub_host_v2-2\.0\.0\+g[0-9a-f]{40}-py3-none-any\.whl|websockets-16\.0-py3-none-any\.whl)$/.test(path);
       if (env.ASSETS && ['GET', 'HEAD'].includes(request.method) && (path === '/' || cliAsset))
         return secureStatic(await env.ASSETS.fetch(request));
       const authResponse = await publicAuthentication(request, env);

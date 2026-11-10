@@ -47,11 +47,11 @@ every minute. It checks the public gate TLS page, reads the authenticated
 desktop grant state, reads the authenticated Agent Browser `/browser/devices`
 health for the `desktop` device (DESKTOP-FP4OP26), and reads the Hub API health
 endpoint used by clients. After two consecutive failed checks, it sends alerts
-to `dev@dtcdev.click`, whose Dapier `dev-mailbox` workflow posts to the
+to `dev@dtcdev.click` and copies `orin@dtcdev.click`. Dev’s Dapier `dev-mailbox` workflow posts to the
 Developer webhook. It creates one DataOps incident task and adds a recovery
 note/email. Inactive grants are expected between approved browser tasks. The
 test command after installation is `sudo -u alexey /usr/local/sbin/resource-gate-monitor.sh --test-alert`;
-it sends a clearly labelled test email to `dev@dtcdev.click`, which should
+it sends a clearly labelled test email to Dev and Orin, which should
 produce a successful `http_request` run in Dapier's `dev-mailbox` workflow and
 wake Developer, and creates/closes a test DataOps Task.
 
@@ -72,3 +72,50 @@ The focused transaction regression is `bash deploy/vm/test-deploy-guard.sh`.
 It exercises a successful staged apply, a manual rollback from a prior Caddyfile
 without the new health alias, automatic rollback after dependency or installer
 failure, and rejection of a new candidate without the TLS site or health route.
+
+
+## Desktop grant and independent recovery
+
+A grant-state health read with `granted=false` proves only that the API responds.
+Prove real access by requesting `browser` with scope `desktop` through
+`POST /v1/grants`, waiting for human approval, then running the authenticated
+Agent Browser remote command `--remote desktop --browser orin call browser.info`.
+Never approve an agent’s own request. A pending grant is not usable access.
+Report the HTTP status and grant state on the intake; never include tokens.
+
+The desktop browser daemon connects outbound to the tools gateway, independently
+of the Hub host. Hub2 routing requires separate machine enrollment: its machine
+directory includes active Hub2 machine credentials. A desktop missing from that
+directory cannot be restored by reconnecting the Hetzner host alone. Coordinate
+its local enrollment with the Hub host owner; a browser grant does not authorize
+shell execution or enrollment through browser scripts.
+
+An existing desktop-to-Hetzner reverse SSH tunnel can provide an independent
+recovery route when Gate or Hub is unavailable. Use it only for an explicitly
+authorized recovery task, with the intended Orin browser selected. This is a
+separate trusted transport; the HTTPS gateway still requires Gate approval.
+Do not automatically switch to it after an authorization denial.
+
+From Hetzner, verify the loopback listener is owned by `sshd`, then make bounded,
+non-mutating reads through the existing tunnel:
+
+```bash
+sudo ss -ltnp '( sport = :19333 )'
+timeout 15 node /home/alexey/opt/agent-browser/bin/cli.js --no-autostart status
+timeout 15 node /home/alexey/opt/agent-browser/bin/cli.js --no-autostart --browser orin call browser.info '{}'
+timeout 15 node /home/alexey/opt/agent-browser/bin/cli.js --no-autostart --browser orin extension info
+```
+
+Require a connected Orin identity and a matching extension code hash. Record
+sanitized results on the intake. Any missing listener, wrong identity, error or
+timeout is a failed recovery check: stop and report to Dev and Orin plus the
+DataOps incident. Never autostart an unrelated local bridge, expose the listener
+publicly, switch profiles, or alter a shared tunnel. Browser access does not
+provide a desktop shell.
+
+If the existing tunnel is absent, a reachable desktop owner can restore it under
+Windows account `User` using the maintained Agent Browser
+`skills/remote-browser-control/SKILL.md` and `node bin/cli.js tunnel hetzner`.
+This requires execution on the desktop; an unreachable inbound SSH address is
+not a way to bootstrap an outbound tunnel. Keep the listener on loopback and
+coordinate shared tunnel ownership before stopping it.

@@ -55,7 +55,7 @@ case "$url" in
   https://hub.dtcdev.click/health)
     case "${CURL_MODE:-success}" in
       hub-fail|all-fail) code=503; body='unavailable' ;;
-      wrong-hub) body='{"ok":false,"service":"hub2"}' ;;
+      bootstrap) body='{"status":"bootstrap","dispatch_enabled":false}' ;;
       *) body='{"ok":true,"service":"hub2"}' ;;
     esac
     ;;
@@ -151,6 +151,9 @@ grep -Fq 'PATH="$RUNUSER_PATH" DATAOPS_CONFIG_DIR=/home/alexey/.config/dataops' 
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 pass() { printf 'PASS: %s\n' "$*"; }
+grep -Fq 'ReadWritePaths=/home/alexey/.agent-browser/tools' "$ROOT/deploy/resource-gate-monitor.service" \
+  || fail "monitor service cannot persist controller credential refreshes"
+pass "monitor service can persist its refreshed controller credential"
 mail_count() { awk '/---MESSAGE-END---/ { n++ } END { print n+0 }' "$MONITOR_MAIL_CAPTURE"; }
 dataops_count() { awk -F '\t' -v action="$1" '$1 == action { n++ } END { print n+0 }' "$MONITOR_DATAOPS_CAPTURE"; }
 run_check() {
@@ -170,6 +173,22 @@ run_check success grant-inactive 0
 grep -Fq 'authenticated Resource Gate browser grant check for DESKTOP-FP4OP26: inactive' "$TMP/output" \
   || fail "inactive time-limited grant was not treated as a healthy read"
 pass "gate, desktop grant-state, and Hub reads pass while no user grant is active"
+
+run_check bootstrap grant-inactive 1
+[[ "$(mail_count)" -eq 0 && "$(dataops_count create)" -eq 0 ]] \
+  || fail "one HTTP 200 bootstrap response alerted before the two-check threshold"
+grep -Fq 'Hub API health read failed (HTTP 200)' "$TMP/output" \
+  || fail "the disabled bootstrap JSON response was not rejected as unhealthy"
+run_check bootstrap grant-inactive 1
+[[ "$(mail_count)" -eq 1 && "$(dataops_count create)" -eq 1 ]] \
+  || fail "two HTTP 200 bootstrap responses did not create one critical alert and DataOps task"
+grep -Fq 'Subject: [CRITICAL] Resource Gate and Hub availability is degraded' "$MONITOR_MAIL_CAPTURE" \
+  || fail "bootstrap health failure did not use the critical alert subject"
+pass "HTTP 200 disabled-bootstrap responses fail Hub health and alert after two checks"
+
+printf 'ok 0 0 - - 0 0 0 0\n' > "$RESOURCE_GATE_STATE_DIR/state"
+: > "$MONITOR_MAIL_CAPTURE"
+: > "$MONITOR_DATAOPS_CAPTURE"
 
 run_check gate-fail grant-inactive 1
 [[ "$(mail_count)" -eq 0 && "$(dataops_count create)" -eq 0 ]] \
@@ -302,12 +321,11 @@ pass "safe test-alert mode uses one test-safe recipient and exercises DataOps de
 
 grep -Fq 'ALERT_TO="${ALERT_TO:-dev@dtcdev.click}"' "$SCRIPT" \
   || fail "production outage recipient default is not dev@dtcdev.click"
-if grep -Fq 'orin@dtcdev.click' "$SCRIPT" || grep -Fq 'ALERT_CC=' "$SCRIPT"; then
-  fail "production monitor still contains an Orin alert recipient"
-fi
+grep -Fq 'ALERT_CC="${ALERT_CC:-orin@dtcdev.click}"' "$SCRIPT" \
+  || fail "production secondary recipient default is not orin@dtcdev.click"
 
 touch "$TMP_PROD/mailbox" "$TMP_PROD/dataops-capture"
-if PATH="$TMP/bin:$PATH" env -u ALERT_TO \
+if PATH="$TMP/bin:$PATH" env -u ALERT_TO -u ALERT_CC \
   ALERT_OPS_TO='resource-gate-ops@example.invalid' \
   RESOURCE_GATE_STATE_DIR="$TMP_PROD/state" \
   DATAOPS_CONFIG_DIR="$TMP/dataops-config" \
@@ -322,10 +340,9 @@ fi
   || fail "production-recipient test alert did not send exactly one message"
 grep -Fxq 'To: dev@dtcdev.click' "$TMP_PROD/mailbox" \
   || fail "production-recipient test alert did not default to dev@dtcdev.click"
-grep -Fq 'ARGS	-a alerts -f alerts@dtcdev.click -- dev@dtcdev.click' "$TMP_PROD/mailbox" \
-  || fail "production-recipient SMTP envelope did not contain only dev@dtcdev.click"
-if grep -Fq 'Cc:' "$TMP_PROD/mailbox" || grep -Fq 'orin@dtcdev.click' "$TMP_PROD/mailbox"; then
-  fail "production-recipient test alert was copied to another address"
-fi
-pass "production monitor test alert defaults to dev@dtcdev.click only"
+grep -Fq 'ARGS	-a alerts -f alerts@dtcdev.click -- dev@dtcdev.click orin@dtcdev.click' "$TMP_PROD/mailbox" \
+  || fail "production-recipient SMTP envelope did not contain dev and Orin"
+grep -Fxq 'Cc: orin@dtcdev.click' "$TMP_PROD/mailbox" \
+  || fail "production-recipient test alert did not copy Orin"
+pass "production monitor test alert delivers to dev and Orin"
 printf 'Resource Gate and Hub monitor tests passed.\n'

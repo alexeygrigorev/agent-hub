@@ -1,0 +1,11 @@
+[Unit]
+Description=Check for an Agent Hub2 release every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Update the Agent Hub2 versioned release
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=-%h/.config/agent-hub/host.env
+ExecStart=/usr/bin/python3 %h/.local/share/agent-hub2/updater.py
+TimeoutStartSec=300
