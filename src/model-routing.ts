@@ -36,7 +36,8 @@ export function heavyModelEffortAllowed(model: any, effort: unknown): boolean {
   // Claude has a strict route contract independent of the heavy-model tiers.
   if (model && typeof model === 'object' &&
       (model.provider === 'claude' || model.engine === 'claude')) {
-    return model.id === 'sonnet' && model.model === 'sonnet' && effort === 'medium';
+    return (model.id === 'sonnet' && model.model === 'sonnet' ||
+      model.id === 'claude-fable-5-2' && model.model === 'fable') && effort === 'medium';
   }
   if (!isHeavyModel(model)) return true;
   if (typeof effort !== 'string' || !effort.trim()) return false;

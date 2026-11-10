@@ -96,9 +96,12 @@ def configured_selection(selection, engine, provider):
     # Hub's routing policy can arrive from an older server before the host
     # updates its vendored policy. Keep the Claude model contract invariant at
     # the host boundary so stale Haiku/Opus offers cannot reach a native launch.
-    if family == 'claude' and (selection.get('model') != 'sonnet' or
-                               selection.get('effort') != 'medium'):
-        raise ValueError('model_unsupported: Claude routes require Sonnet at medium effort')
+    if family == 'claude' and not (
+            selection.get('id') == 'sonnet' and selection.get('model') == 'sonnet' and
+            selection.get('effort') == 'medium' or
+            selection.get('id') == 'claude-fable-5-2' and selection.get('model') == 'fable' and
+            selection.get('effort') == 'medium'):
+        raise ValueError('model_unsupported: Claude routes require Sonnet or explicitly requested Fable at medium effort')
     # Native ZCode uses engine=zcodex; managed ZAI uses codex/profile=zcodex.
     # The policy lists both shapes (glm-flash: codex, glm-flash-zcodex: zcodex);
     # mapping zcodex only to codex made the native entry unmatchable, so Hub's

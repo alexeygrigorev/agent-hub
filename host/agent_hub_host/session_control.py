@@ -591,6 +591,8 @@ def add_commands(sub):
     link.add_argument('--key')
     start = commands.add_parser('start', help='Start a model-routed session; use --wait to require a live native binding before success')
     start.add_argument('--engine', help='Engine override (operators only; requires --reason explaining why)')
+    start.add_argument('--model', choices=['fable', 'claude-fable-5-2'],
+                       help='Explicit Claude Fable 5.2 model (operators only; requires --engine claude and --reason)')
     start.add_argument('--reason', default=None,
                        help='Explanation for an explicit deep-tier or engine choice (required with --tier deep or --engine)')
     start.add_argument('--machine')
@@ -1049,7 +1051,10 @@ def _execute(args):
         return request('GET', '/api/sessions/' + args.id + '/commands')
     if cmd in ('start', 'override'):
         engine = getattr(args, 'engine', None)
+        model = getattr(args, 'model', None)
         reason = getattr(args, 'reason', None)
+        if model and engine != 'claude':
+            raise ValueError('--model fable requires --engine claude')
         if cmd == 'override':
             if not engine:
                 raise ValueError('--engine is required for dedicated engine override command')
@@ -1058,6 +1063,8 @@ def _execute(args):
         elif cmd == 'start' and engine:
             if not reason or not reason.strip():
                 raise ValueError('Engine override requires an explanation why this specific model/engine must be chosen (use --reason). Casual use should prefer auto/policy without --engine.')
+        elif cmd == 'start' and model and (not reason or not reason.strip()):
+            raise ValueError('Explicit model starts require an explanation why this model is needed (use --reason)')
         elif cmd == 'start' and getattr(args, 'tier', None) == 'deep':
             if not reason or not reason.strip():
                 raise ValueError(
@@ -1081,6 +1088,8 @@ def _execute(args):
             value = getattr(args, field, None)
             if value:
                 payload[field] = value
+        if model:
+            payload['model'] = model
         if getattr(args, 'effort', None) is not None:
             payload['effort'] = args.effort
         if getattr(args, 'intake_worktree', None):

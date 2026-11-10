@@ -87,6 +87,8 @@ const router = {
         return control.fetch(
           await forwardRequest(request, CONTROL + path + requestUrl(request).search, actor),
         );
+      if (path === '/api/engines' || path.startsWith('/api/engines/'))
+        return control.fetch(await forwardRequest(request, CONTROL + path + requestUrl(request).search, actor));
       if (path === '/api/mailboxes')
         return control.fetch(
           await forwardRequest(

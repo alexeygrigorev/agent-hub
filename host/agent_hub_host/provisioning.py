@@ -2654,12 +2654,12 @@ def managed_codex_effort_args(bundle, extra_argv):
 
 
 def managed_claude_route_args(bundle, bypass_flags, extra_argv):
-    """Force managed Claude invocations to the Hub Sonnet/medium contract.
+    """Force managed Claude invocations to a Hub Sonnet or explicit Fable route.
 
     Bundle and session argv can both contain old model/effort defaults. Remove
     those flags and place the authoritative route arguments after other
     options, before print-mode prompts. Hub's adapter marker is accepted only
-    for medium; all other values fail closed.
+    for medium; unsupported models and efforts fail closed.
     """
     if bundle.get('provider') != 'claude':
         return []
@@ -2667,7 +2667,29 @@ def managed_claude_route_args(bundle, bypass_flags, extra_argv):
     session_efforts = [arg[len(marker):] for arg in extra_argv
                        if isinstance(arg, str) and arg.startswith(marker)]
     if len(set(session_efforts)) > 1 or any(e != 'medium' for e in session_efforts):
-        raise ValueError('Claude routes require Sonnet at medium effort')
+        raise ValueError('Claude routes require medium effort')
+
+    def requested_model(argv):
+        requested = []
+        i = 0
+        while i < len(argv):
+            arg = argv[i]
+            if arg in ('--model', '-m') and i + 1 < len(argv):
+                requested.append(argv[i + 1])
+                i += 2
+            elif arg.startswith('--model='):
+                requested.append(arg.split('=', 1)[1])
+                i += 1
+            else:
+                i += 1
+        if len(set(requested)) > 1:
+            raise ValueError('Claude route model conflict')
+        return requested[-1] if requested else None
+
+    model = (requested_model(extra_argv) or requested_model(bypass_flags or [])
+             or requested_model(bundle.get('args') or []) or 'sonnet')
+    if model not in ('sonnet', 'fable', 'claude-fable-5-2'):
+        raise ValueError('Claude routes allow Sonnet or explicitly requested Fable')
 
     def strip_route_flags(args):
         result = []
@@ -2695,7 +2717,7 @@ def managed_claude_route_args(bundle, bypass_flags, extra_argv):
         return result
 
     args = strip_route_flags(list(bundle.get('args') or []) + list(bypass_flags or []) + list(extra_argv))
-    route_args = ['--model', 'sonnet', '--effort', 'medium']
+    route_args = ['--model', model, '--effort', 'medium']
     prompt_index = next((i for i, arg in enumerate(args) if arg in ('-p', '--print')), len(args))
     return args[:prompt_index] + route_args + args[prompt_index:]
 
@@ -3202,20 +3224,20 @@ def engine_update_command(args):
     only = getattr(args, 'engine', None)
     engines = [only] if only else list(engine_rollout.ENGINE_ORDER)
     machine = getattr(args, 'machine', None)
+    try:
+        import socket
+        local_names = {socket.gethostname()}
+    except Exception:
+        local_names = set()
+    try:
+        from . import config as _config
+        local_id = (_config.load_host_config() or {}).get('machine_id')
+        if local_id:
+            local_names.add(str(local_id))
+    except Exception:
+        pass
     if machine:
-        try:
-            import socket
-            local_names = {socket.gethostname()}
-        except Exception:
-            local_names = set()
-        try:
-            from . import config as _config
-            local_id = (_config.load_host_config() or {}).get('machine_id')
-            if local_id:
-                local_names.add(str(local_id))
-        except Exception:
-            pass
-        if machine not in local_names:
+        if machine.casefold() not in {name.casefold() for name in local_names}:
             body: dict = {}
             if only:
                 body['engine'] = only
@@ -3246,6 +3268,13 @@ def engine_update_command(args):
         if only:
             check['engines'] = {only: check['engines'].get(only, {})}
         return check
+    canary_host = getattr(args, 'canary', None)
+    if canary_host:
+        if only != 'claude':
+            raise ValueError('Canary rollout currently requires --engine claude')
+        if canary_host.casefold() not in {name.casefold() for name in local_names}:
+            return bus._do_request('POST', '/api/engines/update', {'engine': only, 'canary': canary_host})
+        bus._do_request('POST', '/api/engines/update', {'engine': only, 'canary': canary_host})
     # Converge to Hub's current bundles (side-by-side; live sessions keep the
     # old revision until they drain). Best-effort: report sync errors sanitized.
     sync_result: dict = {}
@@ -3254,6 +3283,15 @@ def engine_update_command(args):
     except Exception as exc:
         sync_result = {'status': 'held', 'error': type(exc).__name__}
     check['sync'] = sync_result
+    if sync_result.get('status') == 'synced':
+        # The pre-sync check reports the old binary. Canary acceptance and the
+        # fleet version report must describe the newly installed side-by-side
+        # revision, before any smoke is used to promote it.
+        refreshed = engine_rollout.check_host()
+        if only:
+            refreshed['engines'] = {only: refreshed['engines'].get(only, {})}
+        check['engines'] = refreshed.get('engines', check.get('engines', {}))
+        check['checked_at'] = refreshed.get('checked_at', check.get('checked_at'))
     # One real smoke session per engine (AC3): version + a real prompt.
     live = engine_rollout.live_engines()
     check['live_engines_deferred'] = sorted(live)
@@ -3273,7 +3311,6 @@ def engine_update_command(args):
                               'deferred': engine in live}
         check['smokes'] = smokes
         # Canary gate: with --canary, decide fleet rollout vs rollback + 1 alert.
-        canary_host = getattr(args, 'canary', None)
         if canary_host:
             rest = []
             try:

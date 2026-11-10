@@ -151,6 +151,13 @@ def test_smoke_argv_bounded_no_shell():
         assert '|' not in ''.join(argv) and '&&' not in ''.join(argv)
 
 
+def test_claude_smoke_requires_the_explicit_fable_route():
+    argv = er.smoke_argv('claude', ['/managed/claude'], 'claude')
+    assert argv[argv.index('--model') + 1] == 'claude-fable-5-2'
+    assert argv[argv.index('--effort') + 1] == 'medium'
+    assert argv[-2:] == ['-p', er.SMOKE_PROMPT]
+
+
 def test_check_host_shape(monkeypatch):
     monkeypatch.setattr(er, 'installed_version', lambda engine, timeout=30: '0.166.0')
     monkeypatch.setattr(er, 'latest_available', lambda engine, timeout=15: '0.166.0')

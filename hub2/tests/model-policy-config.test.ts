@@ -53,6 +53,8 @@ test('the Hub policy validator accepts the committed pool and rejects banned can
   assert.equal(modelPolicyCandidateViolation(route({id: 'zai-central', engine: 'zcodex', model: 'glm-flash', account_id: 'zai-central'})), 'zai_picker_route_forbidden');
   assert.equal(modelPolicyCandidateViolation(route({engine: 'claude', model: 'haiku', effort: 'medium'})), 'haiku_picker_route_forbidden');
   assert.equal(modelPolicyCandidateViolation(route({engine: 'claude', model: 'opus', effort: 'medium'})), 'claude_picker_route_forbidden');
+  assert.equal(modelPolicyCandidateViolation(route({id: 'claude-fable-5-2', engine: 'claude', model: 'fable', effort: 'medium', account_id: 'claude'})), null);
+  assert.equal(modelPolicyCandidateViolation(route({engine: 'claude', model: 'fable', effort: 'medium'})), 'claude_picker_route_forbidden');
   assert.equal(modelPolicyCandidateViolation(route({model: 'gpt-6-luna', effort: 'medium'})), 'luna_effort_forbidden');
   assert.equal(modelPolicyCandidateViolation(route({model: 'gpt-6.1-sol', effort: 'max'})), 'bounded_effort_required');
   assert.equal(modelPolicyCandidateViolation(route({model: 'gpt-6-astra'})), 'bounded_effort_required');
@@ -70,13 +72,12 @@ test('no haiku anywhere in the pool', () => {
   for (const candidate of policy.candidates) assert.ok(!/haiku/i.test(candidate.model + ' ' + candidate.id));
 });
 
-test('claude appears only as sonnet at medium effort', () => {
+test('claude keeps Sonnet default and exposes Fable only under its explicit policy id', () => {
   const claude = policy.candidates.filter(candidate => candidate.engine === 'claude');
-  assert.ok(claude.length > 0, 'claude sonnet must be part of the pool');
-  for (const candidate of claude) {
-    assert.equal(candidate.model, 'sonnet');
-    assert.equal(candidate.effort, 'medium');
-  }
+  assert.deepEqual(claude.map(candidate => [candidate.id, candidate.model, candidate.effort]), [
+    ['claude-sonnet-medium', 'sonnet', 'medium'],
+    ['claude-fable-5-2', 'fable', 'medium'],
+  ]);
 });
 
 test('luna is max-only and one option among many, never the default', () => {

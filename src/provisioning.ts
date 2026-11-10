@@ -94,7 +94,7 @@ export class ProvisioningService {
   // version (release tag ``zcode-<runtime>-codex-<version>``). Update both
   // places in the same change.
   private rolloutDesired(): Record<string, string> {
-    return { codex: '0.166.0', claude: '2.1.312', opencode: '1.19.5', agy: '1.4.10', zcodex: '0.166.0' };
+    return { codex: '0.166.0', claude: '2.1.322', opencode: '1.19.5', agy: '1.4.10', zcodex: '0.166.0' };
   }
   private rolloutProvider(engine: string): string | null {
     return { codex: 'codex', claude: 'claude', opencode: 'go', agy: 'antigravity', zcodex: 'zai' }[engine] ?? null;

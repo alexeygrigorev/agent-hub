@@ -13,6 +13,7 @@ const candidates=[
  {id:'zai-central',engine:'zcodex',model:'glm-flash',account_id:'zai-central',weight:100,capabilities:[],enabled:true},
  {id:'haiku',engine:'claude',model:'haiku',effort:'medium',account_id:'claude',weight:100,capabilities:[],enabled:true},
  {id:'claude-sonnet-high',engine:'claude',model:'sonnet',effort:'max',account_id:'claude',weight:100,capabilities:[],enabled:true},
+ {id:'claude-fable-5-2',engine:'claude',model:'fable',effort:'medium',account_id:'claude',weight:100,capabilities:[],enabled:true},
 ];
 
 function envFor(quota:Record<string,number>,credentialUsable=false){
@@ -44,6 +45,16 @@ test('unhealthy credentials and missing quota do not become placement refusals',
  const route=await pickModelRoute(env,{interactive:true,model:'gpt-6.1-sol',override_reason:'test explicit model'},()=>0);
  assert.equal(route.policy_id,'codex');
  assert.equal(route.quota_remaining,0);
+});
+
+test('Fable is excluded from automatic picks and available only when explicitly pinned',async()=>{
+ const {env}=envFor({codex:10,claude:90},false);
+ const automatic=await pickModelRoute(env,{interactive:true},()=>0.999999);
+ assert.notEqual(automatic.policy_id,'claude-fable-5-2');
+ const explicit=await pickModelRoute(env,{interactive:true,model:'claude-fable-5-2',override_reason:'Explicit request for Claude Fable 5.2'},()=>0);
+ assert.equal(explicit.policy_id,'claude-fable-5-2');
+ assert.equal(explicit.model,'fable');
+ assert.equal(explicit.effort,'medium');
 });
 
 test('fallback can exclude failed candidates while enforcing model policy',async()=>{

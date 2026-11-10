@@ -58,7 +58,7 @@ class NativeAdmissionTest(unittest.TestCase):
     def test_claude_routes_reject_non_sonnet_or_non_medium_even_if_policy_is_stale(self):
         for model, effort in [('haiku', None), ('claude-haiku-5-5', None), ('opus', 'high'), ('sonnet', 'high')]:
             with self.subTest(model=model, effort=effort):
-                with self.assertRaisesRegex(ValueError, 'Claude routes require Sonnet at medium effort'):
+                with self.assertRaisesRegex(ValueError, 'Claude routes require'):
                     configured_selection(dict(id=model, model=model, engine='claude', provider='claude', effort=effort),
                                          'claude', 'claude')
 

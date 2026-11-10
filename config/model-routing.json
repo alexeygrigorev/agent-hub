@@ -173,6 +173,14 @@
       "effort": "medium"
     },
     {
+      "id": "claude-fable-5-2",
+      "model": "fable",
+      "provider": "claude",
+      "engine": "claude",
+      "profile": null,
+      "effort": "medium"
+    },
+    {
       "id": "glm-flash",
       "model": "glm-5.3-flash",
       "provider": "zai",
