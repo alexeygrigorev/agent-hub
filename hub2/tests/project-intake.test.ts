@@ -308,3 +308,57 @@ test('project intake pages clamp to 50 rows and follow the cursor under either s
  assert.equal(new Set([...first.items,...viaCursor.items].map((i:any)=>i.id)).size,53);
  assert.equal((await f.call('/api/intakes?project=org/a&limit=101')).status,400);
 });
+test('discard archives only an untouched open intake and is fenced against any work',async()=>{
+ const f=fixture(),history=async(id:string)=>(await body(await f.call('/api/intakes/'+id+'/history'))).events,status=async(id:string)=>(await body(await f.call('/api/intakes/'+id))).intake.status;
+ const unused=await intake(f,'discard-unused');
+ const done=await f.call('/api/intakes/'+unused.id+'/discard','POST',{key:'discard-1',reason:'start refused: invalid_model'});
+ assert.equal(done.status,200);assert.deepEqual(await body(done),{discarded:true,intake:{id:unused.id,status:'archived'}});
+ assert.equal(await status(unused.id),'archived');
+ assert((await history(unused.id)).some((e:any)=>e.kind==='intake_updated'&&e.body.note==='start refused: invalid_model'&&e.body.status==='archived'));
+ const replay=await body(await f.call('/api/intakes/'+unused.id+'/discard','POST',{key:'discard-1',reason:'start refused: invalid_model'}));
+ assert.equal(replay.discarded,true);assert.equal(replay.duplicate,true);
+ assert.equal((await history(unused.id)).filter((e:any)=>e.kind==='intake_updated').length,1);
+ assert.equal((await f.call('/api/intakes/'+unused.id+'/discard','POST',{key:'discard-2',reason:'again'})).status,409,'an archived intake is not open');
+
+ const started=await intake(f,'discard-started'),start={key:'discard-start',workspace:'/tmp/synthetic-discard',engine:'shell',machine_id:'h1'};
+ assert.equal((await f.call('/api/intakes/'+started.id+'/start','POST',start)).status,201);
+ const busy=await f.call('/api/intakes/'+started.id+'/discard','POST',{key:'discard-busy',reason:'start refused: x'});
+ assert.equal(busy.status,409);assert.equal((await body(busy)).error,'intake_in_use');assert.equal(await status(started.id),'queued');
+
+ const reviewed=await intake(f,'discard-reviewed');
+ f.sql.prepare("UPDATE intakes SET status='completed-awaiting-review' WHERE id=?").run(reviewed.id);
+ assert.equal((await f.call('/api/intakes/'+reviewed.id+'/discard','POST',{key:'discard-reviewed',reason:'start refused: x'})).status,409);
+ assert.equal(await status(reviewed.id),'completed-awaiting-review','finished work is never accepted or archived by a discard');
+
+ const failed=await intake(f,'discard-failed');
+ f.sql.prepare("UPDATE intakes SET status='failed',session_id='old-session',assigned_machine_id='h1' WHERE id=?").run(failed.id);
+ assert.equal((await f.call('/api/intakes/'+failed.id+'/discard','POST',{key:'discard-failed',reason:'start refused: x'})).status,409);
+ assert.equal(await status(failed.id),'failed');
+
+ const reopened=await intake(f,'discard-reopened');
+ f.sql.prepare('UPDATE intakes SET session_id=? WHERE id=?').run('earlier-session',reopened.id);
+ assert.equal((await f.call('/api/intakes/'+reopened.id+'/discard','POST',{key:'discard-reopened',reason:'start refused: x'})).status,409,'open again after earlier work');
+
+ const noted=await intake(f,'discard-noted');
+ assert.equal((await f.call('/api/intakes/'+noted.id+'/append','POST',{key:'note-1',note:'operator context'})).status,201);
+ assert.equal((await f.call('/api/intakes/'+noted.id+'/discard','POST',{key:'discard-noted',reason:'start refused: x'})).status,409);
+ assert.equal(await status(noted.id),'open');
+
+ const fresh=await intake(f,'discard-authz');
+ assert.equal((await f.call('/api/intakes/'+fresh.id+'/discard','POST',{key:'discard-foreign',reason:'x'},{id:'agent:x',kind:'agent',resource_id:'other',scopes:['intake:write']})).status,403);
+ assert.equal((await f.call('/api/intakes/'+fresh.id+'/discard','POST',{key:'discard-empty',reason:' '})).status,400);
+ assert.equal((await f.call('/api/intakes/missing/discard','POST',{key:'discard-missing',reason:'x'})).status,404);
+ assert.equal(await status(fresh.id),'open');
+});
+test('a start racing a discard leaves exactly one outcome: used intakes stay, discarded intakes refuse the start',async()=>{
+ const f=fixture(),start={workspace:'/tmp/synthetic-race',engine:'shell',machine_id:'h1'};
+ const first=await intake(f,'race-start-first');
+ assert.equal((await f.call('/api/intakes/'+first.id+'/start','POST',{...start,key:'race-start-1'})).status,201);
+ assert.equal((await f.call('/api/intakes/'+first.id+'/discard','POST',{key:'race-discard-1',reason:'start refused: x'})).status,409);
+ assert.equal((f.sql.prepare('SELECT COUNT(*) AS n FROM dispatch_sagas WHERE intake_id=?').get(first.id) as any).n,1);
+ const second=await intake(f,'race-discard-first');
+ assert.equal((await f.call('/api/intakes/'+second.id+'/discard','POST',{key:'race-discard-2',reason:'start refused: x'})).status,200);
+ const late=await f.call('/api/intakes/'+second.id+'/start','POST',{...start,key:'race-start-2'});
+ assert.equal(late.status,409);assert.equal((await body(late)).error,'intake_already_assigned');
+ assert.equal((f.sql.prepare('SELECT COUNT(*) AS n FROM dispatch_sagas WHERE intake_id=?').get(second.id) as any).n,0);
+});
