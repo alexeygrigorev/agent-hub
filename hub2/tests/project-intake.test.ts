@@ -4,7 +4,7 @@ function fixture(options:{modelCandidates?:any[];accountHosts?:Record<string,str
  const routes:any[]=[],machineCalls:string[]=[],accountCalls:string[]=[];
  const requestOf=(input:string|Request,init?:RequestInit)=>input instanceof Request?input:new Request(input,init);
  const CONTROL={idFromName:(id:any)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{const request=requestOf(input,init),path=new URL(request.url).pathname;const value=request.method==='GET'?{}:await request.json();routes.push(value);if(path==='/_routing-policy')return Response.json({version:1,candidates:options.modelCandidates||[]});if(path==='/api/directory')return Response.json({items:[{id:'h1'}],next:null});return Response.json({registered:true,accepted:true});}})};
- const MACHINES={idFromName:(id:any)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{const request=requestOf(input,init);const path=new URL(request.url).pathname;machineCalls.push(path);if(path==='/_internal/routing')return Response.json({machine_id:'h1',engines:['codex','claude'],capabilities:['headless','interactive']});return Response.json(path.endsWith('/reserve')?{state:'staged',epoch:1}:{state:'offered'});}})};
+ const MACHINES={idFromName:(id:any)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{const request=requestOf(input,init);const path=new URL(request.url).pathname;machineCalls.push(path);if(path==='/_internal/routing')return Response.json({machine_id:'h1',connected:true,engines:['codex','claude'],capabilities:['headless','interactive']});return Response.json(path.endsWith('/reserve')?{state:'staged',epoch:1}:{state:'offered'});}})};
  const unused={idFromName:(id:any)=>id,get:()=>({fetch:async()=>Response.json({ok:true})})};
  const ACCOUNTS={idFromName:(id:any)=>id,get:(id:string)=>({fetch:async(input:string|Request)=>{const path=new URL(input instanceof Request?input.url:input).pathname;accountCalls.push(path);return Response.json({account:{enabled:true},quota:{remaining:id==='codex'?90:70},hosts:options.accountHosts?.[id]||['h1'],credential_usable:false});}})};
  const env:any={CONTROL,PROJECTS:unused,MACHINES,ACCOUNTS,MAILBOXES:unused};
@@ -138,34 +138,23 @@ test('pre-claim host launch refusal fails clearly and is not silently re-offered
  assert.equal(retry.status,409);assert.equal((await body(retry)).error,'retry_requires_qualified_failure');
  assert.equal((f.sql.prepare('SELECT COUNT(*) AS n FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any).n,1);
 });
-test('stop receipt for an expired offer cancels its already-requeued retry',async()=>{
+test('an expired unclaimed offer terminates instead of scheduling an unbounded retry',async()=>{
  const f=fixture(),own=await intake(f,'expired-offer-stop'),start={key:'expired-offer-stop',workspace:'/tmp/synthetic-expired-stop',engine:'shell',machine_id:'h1',override_reason:'Synthetic semantic test'};
  assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',start)).status,201);
  const first=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any;
- assert.equal(first.state,'offered');assert.equal(first.attempt,0);
- const expiredAt=Date.now()-1000,observedAt=expiredAt+1;
- const requeued=await f.call('/_internal/requeue','POST',{operation_id:first.operation_id,attempt_operation_id:first.attempt_operation_id,
+ const expiredAt=Date.now()-1000,proof={operation_id:first.operation_id,attempt_operation_id:first.attempt_operation_id,
   session_id:first.session_id,machine_id:first.machine_id,epoch:first.epoch,proof_kind:'offer-expired-unclaimed',
-  offer_expires_at:expiredAt,observed_at:observedAt});
- assert.equal(requeued.status,200,JSON.stringify(await requeued.clone().json()));
- let saga=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE operation_id=?').get(first.operation_id) as any;
- assert.equal(saga.state,'pending_machine');assert.equal(saga.attempt,1);assert.equal(saga.attempt_operation_id,`${first.operation_id}:1`);
- assert.equal(saga.epoch,first.epoch);
- const machineCallsBeforeStop=f.machineCalls.length;
- const stop={operation_id:first.operation_id,attempt_operation_id:first.attempt_operation_id,session_id:first.session_id,
-  machine_id:first.machine_id,epoch:first.epoch,native_id:null,reason:'stop_confirmed',observed_at:Date.now()};
- const response=await f.call('/_internal/stopped','POST',stop),result=await body(response);
- assert.equal(response.status,200,JSON.stringify(result));assert.equal(result.stopped,true);
- saga=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE operation_id=?').get(first.operation_id) as any;
- assert.equal(saga.state,'complete');assert.equal(saga.last_reason,'stop_confirmed');
+  offer_expires_at:expiredAt,observed_at:expiredAt+1};
+ const result=await f.call('/_internal/requeue','POST',proof);
+ assert.equal(result.status,200);assert.equal((await body(result)).retry_scheduled,false);
+ const saga=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE operation_id=?').get(first.operation_id) as any;
+ assert.equal(saga.state,'complete');assert.equal(saga.attempt,0);assert.equal(saga.last_reason,'host_no_response');
  const intakeRow=f.sql.prepare('SELECT * FROM intakes WHERE id=?').get(own.id) as any;
- assert.equal(intakeRow.status,'failed');assert.equal(JSON.parse(intakeRow.final_evidence_json).stopped,true);
- const replay=await f.call('/_internal/stopped','POST',stop);
- assert.equal(replay.status,200);assert.equal((await body(replay)).duplicate,true);
- await f.project.alarm();
- assert.equal(f.machineCalls.length,machineCallsBeforeStop);
- assert.equal(f.getAlarm(),null);
+ assert.equal(intakeRow.status,'failed');assert.equal(JSON.parse(intakeRow.final_evidence_json).reason,'host_no_response');
+ const calls=f.machineCalls.length;
+ await f.project.alarm();assert.equal(f.machineCalls.length,calls);assert.equal(f.getAlarm(),null);
 });
+
 test('session admission checks the current saga without quota or account-capacity reads',async()=>{
  const f=fixture(),own=await intake(f,'admission-binding'),start={key:'admission-binding',workspace:'/tmp/synthetic-admission',engine:'shell',machine_id:'h1',override_reason:'Synthetic semantic test'};
  assert([201,202].includes((await f.call('/api/intakes/'+own.id+'/start','POST',start)).status));

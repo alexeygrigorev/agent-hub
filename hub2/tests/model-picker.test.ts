@@ -25,7 +25,7 @@ function envFor(quota:Record<string,number>,credentialUsable=false){
   if(kind==='accounts'){
    return Response.json({account:{enabled:true},quota:{remaining:quota[id]??0},hosts:['h1'],credential_usable:credentialUsable});
   }
-  if(kind==='machines')return Response.json({machine_id:'h1',engines:['codex','claude','zcodex']});
+  if(kind==='machines')return Response.json({machine_id:'h1',connected:true,engines:['codex','claude','zcodex']});
   return Response.json({}, {status:404});
  }})});
  return {env:{CONTROL:namespace('control'),ACCOUNTS:namespace('accounts'),MACHINES:namespace('machines')} as any,requests};
@@ -92,7 +92,7 @@ function poolEnv(usable:Record<string,boolean>,quota:Record<string,number>,engin
   if(kind==='control'&&parsed.pathname==='/_routing-policy')return Response.json({version:3,candidates:pool});
   if(kind==='control')return Response.json({items:[{id:'h1'}],next:null});
   if(kind==='accounts')return Response.json({account:{enabled:true},quota:id in quota?{remaining:quota[id]}:null,hosts:['h1'],credential_usable:usable[id]===true,credential_status:usable[id]?'ready':'expired'});
-  return Response.json({machine_id:'h1',engines});
+  return Response.json({machine_id:'h1',connected:true,engines});
  }})});
  return {CONTROL:namespace('control'),ACCOUNTS:namespace('accounts'),MACHINES:namespace('machines')} as any;
 }
@@ -133,4 +133,18 @@ test('detailed pick reports the pool shares and credential exclusions',async()=>
  const {diagnostics}=await pickModelRouteDetailed(poolEnv({...healthy,claude:false},left),{interactive:false},()=>0.5);
  assert.deepEqual(diagnostics.excluded.map(row=>row.policy_id).sort(),['claude-opus-medium','claude-sonnet-medium']);
  assert.ok(Math.abs(diagnostics.pool.reduce((sum,row)=>sum+row.share,0)-1)<1e-9);
+});
+
+
+test('disconnected hosts are a typed refusal, including explicit host requests',async()=>{
+ const {env}=envFor({codex:90},true);
+ env.MACHINES={idFromName:(id:string)=>id,get:()=>({fetch:async()=>Response.json({machine_id:'h1',connected:false,last_seen:Date.now()-120_000,engines:['codex']})})};
+ await assert.rejects(pickModelRoute(env,{interactive:false}), (error:any)=>error.code==='no_connected_host'&&error.status===503&&JSON.parse(error.detail).machines[0].age_ms>=120_000);
+ await assert.rejects(pickModelRoute(env,{interactive:false,machine_id:'h1'}), (error:any)=>error.code==='no_connected_host');
+});
+
+test('an explicit connected route does not require an override explanation',async()=>{
+ const {env}=envFor({codex:90},true);
+ const route=await pickModelRoute(env,{interactive:false,model:'gpt-6.1-sol'},()=>0);
+ assert.equal(route.model,'gpt-6.1-sol');assert.equal(route.override_reason,'explicit_route');
 });
