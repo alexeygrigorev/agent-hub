@@ -39,10 +39,27 @@ The host user unit runs `~/.local/share/agent-hub2/current/bin/hub2 serve`.
 Its update timer checks every five minutes, downloads all artifacts, verifies
 their hashes, builds a new environment under `releases/<commit>` offline from
 the shipped wheels, checks the heartbeat signature, then switches `current`
-atomically and restarts the daemon. `previous` retains the old environment;
-an immediate restart failure switches back and restarts it. No existing
+atomically and restarts the daemon. It observes the service for 30 seconds and
+requires an authenticated heartbeat before accepting activation. `previous`
+retains the old environment; a failed activation switches back and restarts it.
+Failed versions have persistent exponential retry backoff (up to six hours).
+Interrupted installations carry an ownership marker and are recovered under
+the updater lock; venvs are created at their final path to preserve shebangs.
+Installed user units refresh with each release and restore on rollback. The
+updater is syntax/help checked before self replacement. Retention keeps three
+managed releases, including current and previous; unrelated directories are
+preserved. Python requirements are checked before installation, and newer host
+protocols are accepted only when the installed wheel reports the manifest's
+protocol. No existing
 environment, legacy CLI or unrelated service is replaced. The full CLI from
 the same commit is `current/hub.pyz`.
+
+The transport wheel is downloaded in CI with `--require-hashes` against the
+reviewed root `uv.lock`; installs have no package-index access. Artifact trust
+uses the existing authenticated HTTPS origin, with checksums for integrity;
+this release format does not claim a detached signature. The Linux installer
+enables user lingering so the host can run without an interactive login; the
+OS must permit that operation for the installing user.
 
 Live adoption belongs to the deployment owner. Migrating an existing hand-made
 service requires that owner's acknowledged handoff; repository tooling does

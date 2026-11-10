@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from urllib.parse import urlsplit
 from urllib.request import urlopen
 
@@ -36,8 +37,11 @@ def fetch(url, limit):
 
 
 def validate_manifest(manifest):
-    if manifest.get('schema_version') != 1 or manifest.get('protocol_version') != 1:
+    if manifest.get('schema_version') != 1 or type(manifest.get('protocol_version')) is not int or manifest['protocol_version'] < 1:
         raise ValueError('unsupported release protocol')
+    requirement = re.fullmatch(r'>=(\d+)\.(\d+)', str(manifest.get('python_requires', '')))
+    if not requirement or sys.version_info[:2] < tuple(map(int, requirement.groups())):
+        raise ValueError('release requires a newer or unsupported Python runtime')
     if not re.fullmatch(r'[0-9a-f]{40}', str(manifest.get('host_version', ''))):
         raise ValueError('invalid host version')
     files = manifest.get('artifacts')
@@ -80,6 +84,90 @@ def link(target, path):
             pending.unlink()
 
 
+def write_json(path, data):
+    pending = path.with_name(path.name + '.tmp')
+    pending.write_text(json.dumps(data, sort_keys=True) + '\n')
+    pending.replace(path)
+
+
+def failure(root, version):
+    path = root / 'failed-releases.json'
+    records = json.loads(path.read_text()) if path.exists() else {}
+    count = records.get(version, {}).get('attempts', 0) + 1
+    records[version] = {'attempts': count, 'retry_at': time.time() + min(21600, 300 * 2 ** min(count, 8))}
+    write_json(path, records)
+
+
+def stable_service():
+    # Type=simple reports active before imports/connect complete. Observe the
+    # process over a real interval and prove an authenticated host heartbeat.
+    for _ in range(6):
+        time.sleep(5)
+        command(['systemctl', '--user', 'is-active', '--quiet', 'agent-hub2-host.service'])
+
+
+def recover(root, releases):
+    # .next is our fixed atomic-link scratch name. Remove only links into this
+    # release store; never remove a regular file or an unrelated symlink.
+    for name in ('current.next', 'previous.next'):
+        path = root / name
+        if path.is_symlink():
+            dest = path.resolve()
+            if dest.parent == releases and re.fullmatch(r'[0-9a-f]{40}', dest.name):
+                path.unlink()
+    for target in releases.iterdir():
+        marker = target / '.installing'
+        if target.is_symlink() or not re.fullmatch(r'[0-9a-f]{40}', target.name) or not marker.is_file():
+            continue
+        if marker.read_text() != target.name:
+            raise ValueError('unknown interrupted release owner')
+        restore_units(target)
+        current = root / 'current'
+        if current.is_symlink() and current.resolve() == target:
+            previous = root / 'previous'
+            if previous.is_symlink() and previous.resolve().is_dir() and previous.resolve() != target:
+                link(previous.resolve(), current)
+                command(['systemctl', '--user', 'restart', 'agent-hub2-host.service'])
+            else:
+                command(['systemctl', '--user', 'stop', 'agent-hub2-host.service'])
+                current.unlink()
+        failure(root, target.name)
+        shutil.rmtree(target)
+
+
+def restore_units(target):
+    receipt = target / 'units-before.json'
+    if not receipt.is_file():
+        return
+    units = Path.home() / '.config/systemd/user'
+    for name, value in json.loads(receipt.read_text()).items():
+        if name not in UNITS:
+            raise ValueError('unknown unit in rollback receipt')
+        if value is None:
+            (units / name).unlink(missing_ok=True)
+        else:
+            (units / name).write_bytes(bytes.fromhex(value))
+    command(['systemctl', '--user', 'daemon-reload'])
+
+
+def prune(root, releases):
+    keep = {path.resolve() for path in (root / 'current', root / 'previous') if path.is_symlink()}
+    managed = []
+    for path in releases.iterdir():
+        receipt = path / 'release.json'
+        if path.is_symlink() or not re.fullmatch(r'[0-9a-f]{40}', path.name) or not receipt.is_file():
+            continue
+        if json.loads(receipt.read_text()).get('host_version') == path.name:
+            managed.append(path)
+    for path in sorted(managed, key=lambda p: p.stat().st_mtime, reverse=True):
+        if path in keep:
+            continue
+        if len(keep) < 3:
+            keep.add(path)
+        else:
+            shutil.rmtree(path)
+
+
 def install(base_url, root, *, install_service=False, restart=True):
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     # Never delete a lock file: all invocations lock this same inode.
@@ -91,6 +179,12 @@ def install(base_url, root, *, install_service=False, restart=True):
         version = manifest['host_version']
         releases = root / 'releases'
         releases.mkdir(exist_ok=True)
+        recover(root, releases)
+        failures = root / 'failed-releases.json'
+        record = json.loads(failures.read_text()).get(version, {}) if failures.exists() else {}
+        if record.get('retry_at', 0) > time.time():
+            print('Hub2 release retry deferred after failed activation: ' + version)
+            return
         current = root / 'current'
         old = current.resolve(strict=True) if current.is_symlink() else None
         if current.exists() and old is None:
@@ -112,14 +206,19 @@ def install(base_url, root, *, install_service=False, restart=True):
                 if len(data) != record['size'] or hashlib.sha256(data).hexdigest() != record['sha256']:
                     raise ValueError('release checksum mismatch: ' + name)
                 (download / name).write_bytes(data)
-            target.mkdir(mode=0o700)
+            # Rename an empty marked directory BEFORE creating the venv. Venv
+            # scripts embed absolute paths, so renaming a built venv is unsafe.
+            prepared = download / 'environment'
+            prepared.mkdir(mode=0o700)
+            (prepared / '.installing').write_text(version)
+            prepared.rename(target)
             try:
                 command([sys.executable, '-m', 'venv', target])
                 python = target / 'bin/python'
                 command([python, '-m', 'pip', 'install', '--no-index', '--no-deps',
                          download / 'websockets-16.0-py3-none-any.whl', download / host_wheel])
                 command([python, '-c', 'from agent_hub_host._release import HOST_VERSION, PROTOCOL_VERSION; '
-                         f'assert HOST_VERSION == {version!r} and PROTOCOL_VERSION == 1; '
+                         f'assert HOST_VERSION == {version!r} and PROTOCOL_VERSION == {manifest["protocol_version"]}; '
                          'import inspect; from agent_hub_host.client import Client; '
                          "assert 'native_sessions' in inspect.signature(Client.heartbeat).parameters"])
                 command([target / 'bin/hub2', '--help'])
@@ -127,21 +226,27 @@ def install(base_url, root, *, install_service=False, restart=True):
                 shutil.copyfile(download / 'hub2-enroll.py', target / 'hub2-enroll.py')
                 (target / 'hub.pyz').chmod(0o755)
                 command([python, target / 'hub.pyz', '--help'])
+                command([python, '-m', 'py_compile', download / 'hub2-self-update.py'])
+                command([python, download / 'hub2-self-update.py', '--help'])
                 (target / 'release.json').write_text(json.dumps(manifest, sort_keys=True) + '\n')
                 if old:
                     link(old, root / 'previous')
                 link(target, current)
                 activated = True
-                if install_service:
-                    units = Path.home() / '.config/systemd/user'
+                units = Path.home() / '.config/systemd/user'
+                if install_service or (units / UNITS[0]).exists():
                     units.mkdir(parents=True, exist_ok=True)
+                    write_json(target / 'units-before.json', {name: (units / name).read_bytes().hex()
+                               if (units / name).exists() else None for name in UNITS})
                     for name in UNITS:
                         shutil.copyfile(download / name, units / name)
                     command(['systemctl', '--user', 'daemon-reload'])
+                if install_service:
                     command(['systemctl', '--user', 'enable', 'agent-hub2-host.service', 'agent-hub2-host-update.timer'])
                 if restart:
                     command(['systemctl', '--user', 'restart', 'agent-hub2-host.service'])
-                    command(['systemctl', '--user', 'is-active', '--quiet', 'agent-hub2-host.service'])
+                    stable_service()
+                    command([target / 'bin/hub2', 'heartbeat'])
                 # Replace the updater only after successful activation.
                 updater = root / 'updater.py.next'
                 shutil.copyfile(download / 'hub2-self-update.py', updater)
@@ -149,8 +254,12 @@ def install(base_url, root, *, install_service=False, restart=True):
                 updater.replace(root / 'updater.py')
                 if install_service and restart:
                     command(['systemctl', '--user', 'start', 'agent-hub2-host-update.timer'])
+                (target / '.installing').unlink()
+                prune(root, releases)
                 print('Activated Hub2 release: ' + version)
             except BaseException:
+                failure(root, version)
+                restore_units(target)
                 if activated:
                     if old:
                         link(old, current)

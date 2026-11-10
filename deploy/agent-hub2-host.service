@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 EnvironmentFile=-%h/.config/agent-hub/host.env
-ExecStartPre=%h/.local/share/agent-hub2/current/bin/python -c "from agent_hub_host._release import HOST_VERSION, PROTOCOL_VERSION; assert len(HOST_VERSION) == 40 and PROTOCOL_VERSION == 1"
+ExecStartPre=%h/.local/share/agent-hub2/current/bin/python -c "from agent_hub_host._release import HOST_VERSION, PROTOCOL_VERSION; assert len(HOST_VERSION) == 40 and isinstance(PROTOCOL_VERSION, int) and PROTOCOL_VERSION >= 1"
 ExecStart=%h/.local/share/agent-hub2/current/bin/hub2 serve
 Restart=on-failure
 RestartSec=10
