@@ -1,0 +1,74 @@
+name: Resource Gate VM probe
+on:
+  push:
+    branches: [ci/resource-gate-vm-probe-20261110]
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Install VM deploy key
+        run: |
+          install -m 700 -d ~/.ssh
+          install -m 600 /dev/stdin ~/.ssh/hub_vm_key <<< "${{ secrets.AGENT_HUB_VM_DEPLOY_KEY }}"
+      - name: Probe VM
+        env:
+          SSH_USER: ${{ secrets.AGENT_HUB_VM_USER }}
+          SSH_HOST: ${{ secrets.AGENT_HUB_VM_HOST }}
+        run: |
+          set -euo pipefail
+          cat > /tmp/probe.sh <<'REMOTE'
+          set +e
+          date -Is
+          hostname
+          whoami
+          echo '=== engines ==='
+          for c in a claude codex agy hub caddy python3 node git systemctl; do
+            printf '%s: ' "$c"
+            if command -v "$c" >/dev/null 2>&1; then
+              command -v "$c"
+              "$c" --version 2>/dev/null | head -1
+            else
+              echo MISSING
+            fi
+          done
+          echo '=== listeners ==='
+          ss -lntup 2>/dev/null || netstat -lntup
+          echo '=== systemd is-active ==='
+          for u in caddy resource-gate agent-hub-hub2; do
+            printf '%s: ' "$u"
+            systemctl is-active "$u" 2>&1
+          done
+          echo '=== systemd status ==='
+          systemctl status caddy resource-gate agent-hub-hub2 --no-pager -L 2>&1 | head -160
+          echo '=== caddy paths ==='
+          ls -la /etc/caddy /etc/caddy/Caddyfile /etc/caddy/conf.d /etc/caddy/Caddyfile.d 2>&1 | head -80
+          echo '=== Caddyfile (redacted) ==='
+          if [ -f /etc/caddy/Caddyfile ]; then
+            sed -E 's/(token|secret|password|authorization|bearer)[^[:space:]]*/\1=<redacted>/Ig' /etc/caddy/Caddyfile
+          else
+            echo 'NO Caddyfile'
+          fi
+          echo '=== resource-gate unit ==='
+          systemctl cat resource-gate 2>&1 | head -100
+          echo '=== local health ==='
+          echo -n 'hub2-8787: '; curl -sS -m 5 http://127.0.0.1:8787/health; echo
+          echo -n 'gate-8791: '; curl -sS -m 5 http://127.0.0.1:8791/health; echo
+          echo -n 'local-80-host-gate: '; curl -sS -m 5 -H 'Host: gate.dtcdev.click' http://127.0.0.1/health; echo
+          echo -n 'local-443: '; curl -skS -m 5 https://127.0.0.1/health; echo
+          echo '=== journal caddy/resource-gate (redacted, last 80) ==='
+          journalctl -u caddy -u resource-gate -n 80 --no-pager 2>&1 | sed -E 's/(token|secret|password|authorization|bearer)[^[:space:]]*/\1=<redacted>/Ig'
+          REMOTE
+          ssh -i ~/.ssh/hub_vm_key -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10 \
+            "${SSH_USER}@${SSH_HOST}" 'bash -s' < /tmp/probe.sh | tee /tmp/vm-probe.txt
+      - name: Upload probe log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resource-gate-vm-probe
+          path: /tmp/vm-probe.txt
+          if-no-files-found: warn
+          retention-days: 1
+      - name: Remove deploy key
+        if: always()
+        run: shred -u ~/.ssh/hub_vm_key 2>/dev/null || rm -f ~/.ssh/hub_vm_key
