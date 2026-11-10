@@ -1,0 +1,6 @@
+# Hub owns this site only. aws-infra owns the shared Caddyfile and its import.
+:80 {
+	reverse_proxy 127.0.0.1:8787 {
+		header_up X-Forwarded-Host {http.request.header.X-Forwarded-Host}
+	}
+}

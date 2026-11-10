@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Idempotent VM setup for the Node-based agent hub (no Cloudflare, no GCP SDK).
 # Run ON the VM as a sudo-capable user, with sibling deploy/ files present:
-#   agent-hub-hub2.service  Caddyfile
+#   agent-hub-hub2.service  hub.caddy
 # Secrets: /opt/agent-hub/.dev.vars is preserved if present; on first run it is
 # created with a fresh HUB2_CREDENTIAL_KEY (64 hex) and HUB2_BOOTSTRAP_TOKEN.
 # Optional --release-mode updates only HUB2_RELEASE_MODE in the existing file.
@@ -47,22 +47,22 @@ systemctl disable --now agent-hub-worker.service agent-hub-cron.timer agent-hub-
 rm -f /etc/systemd/system/agent-hub-worker.service /etc/systemd/system/agent-hub-cron.service /etc/systemd/system/agent-hub-cron.timer
 
 if [[ "$HUB_ONLY" != true ]]; then
-  echo "== edge (Caddy :80 -> Hub2 :8787; gate.dtcdev.click TLS -> Resource Gate :8791)"
-  if ! grep -Eq '^[[:space:]]*gate\.dtcdev\.click[[:space:]]*\{' "$DEPLOY_DIR/Caddyfile" \
-    || ! grep -Fq 'reverse_proxy 127.0.0.1:8791' "$DEPLOY_DIR/Caddyfile" \
-    || ! grep -Fq 'rewrite @desktop_health /v1/check?resource=browser&scope=desktop' "$DEPLOY_DIR/Caddyfile"; then
-    echo "refusing to replace Caddyfile: Resource Gate TLS site and authenticated /v1/health route are required" >&2
+  echo "== Hub edge site (shared Caddyfile is owned by aws-infra)"
+  CADDY_CONFIG=/etc/caddy/Caddyfile
+  CADDY_SITE=/etc/caddy/sites/hub.caddy
+  if [[ "${AGENT_HUB_DEPLOY_TEST_MODE:-0}" == 1 ]]; then
+    CADDY_CONFIG="${AGENT_HUB_TEST_CADDY_CONFIG:?}"
+    CADDY_SITE="${AGENT_HUB_TEST_CADDY_SITE:?}"
+  fi
+  if ! grep -Eq '^[[:space:]]*import[[:space:]]+/etc/caddy/sites/\*\.caddy[[:space:]]*$' "$CADDY_CONFIG"; then
+    echo "shared Caddyfile must import /etc/caddy/sites/*.caddy; request aws-infra migration" >&2
     exit 1
   fi
-  if ! caddy validate --config "$DEPLOY_DIR/Caddyfile" --adapter caddyfile; then
-    echo "refusing to deploy: candidate Caddyfile failed caddy validate" >&2
-    exit 1
-  fi
-  install -m 644 "$DEPLOY_DIR/Caddyfile" /etc/caddy/Caddyfile
-  if ! caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile; then
-    echo "installed Caddyfile failed caddy validate; deploy transaction must roll back" >&2
-    exit 1
-  fi
+  caddy validate --config "$DEPLOY_DIR/hub.caddy" --adapter caddyfile
+  install -d -m 755 "$(dirname "$CADDY_SITE")"
+  # The deploy transaction retains this site's previous contents for rollback.
+  install -m 644 "$DEPLOY_DIR/hub.caddy" "$CADDY_SITE"
+  caddy validate --config "$CADDY_CONFIG" --adapter caddyfile
 else
   echo "== edge unchanged (Hub-only deploy)"
 fi

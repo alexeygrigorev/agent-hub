@@ -108,7 +108,8 @@ exit 0, 23/23 staleness suite + 7/7 new regression tests
 2. DNS: `hub.dtcdev.click` is on **AWS Route 53** (awsdns NS). Point its A
    record at the VM (direct, or via the Cloudflare proxy). This is DTC AWS
    and is deliberately not changed by this port.
-3. Caddy: replace the `:80` site in `/etc/caddy/Caddyfile` with the
+3. Caddy: ask the aws-infra owner to change the shared Caddyfile (Hub deploys
+   own only `/etc/caddy/sites/hub.caddy`); replace the `:80` site with the
    hostname (e.g. `hub.dtcdev.click`) → automatic ACME + HTTP→HTTPS
    redirect; `systemctl reload caddy`.
 4. Complete bootstrap→active (above), verify `/health`, `/api/status`,
