@@ -25,3 +25,5 @@ public/cli/manifest.json
 
 # CLI artifacts built into the Hub2 static asset root by the VM installer.
 hub2/public/cli/
+hub2/host/build/
+hub2/host/*.egg-info/
