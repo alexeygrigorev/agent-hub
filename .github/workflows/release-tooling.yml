@@ -40,3 +40,10 @@ jobs:
           out="$RUNNER_TEMP/release-build"
           python scripts/build-hub2-release.py --rev HEAD --out-dir "$out"
           test -s "$out/host-release.json"
+      - name: Retain matched host release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hub2-release-${{ github.sha }}
+          path: ${{ runner.temp }}/release-build/
+          if-no-files-found: error
+          retention-days: 7
