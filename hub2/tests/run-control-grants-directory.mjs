@@ -3,3 +3,4 @@ import {registerHooks} from 'node:module';import {existsSync} from 'node:fs';imp
 registerHooks({resolve(s,c,n){if(s.startsWith('.')&&c.parentURL&&!s.endsWith('.ts')){const u=new URL(s+'.ts',c.parentURL);if(existsSync(fileURLToPath(u)))return n(u.href,c);}return n(s,c);}});
 await import('./control-grants-directory.test.ts');
 await import('./shared-memory.test.ts');
+await import('./model-policy-recovery.test.ts');

@@ -1,0 +1,198 @@
+"""Standalone helper against disposable loopback HTTP, never production Hub."""
+import contextlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import socket
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import subprocess
+import sys
+import tempfile
+import threading
+import unittest
+from unittest import mock
+from types import SimpleNamespace
+
+ROOT=Path(__file__).resolve().parents[1]
+SCRIPT=ROOT/'scripts/apply-model-policy.py'
+spec=importlib.util.spec_from_file_location('policy_recovery_helper',SCRIPT)
+helper=importlib.util.module_from_spec(spec);spec.loader.exec_module(helper)
+SHA='a'*40
+CANDIDATE=dict(id='sol',engine='codex',model='gpt-6.1-sol',effort='medium',account_id='codex',weight=1,capabilities=[],enabled=True)
+
+
+class RecoveryTests(unittest.TestCase):
+ def setUp(self):
+  parent=ROOT/'.local/tmp';parent.mkdir(parents=True,exist_ok=True)
+  self.temp=tempfile.TemporaryDirectory(prefix='policy-recovery-',dir=parent);self.addCleanup(self.temp.cleanup)
+  self.directory=Path(self.temp.name);self.receipt=self.directory/'receipt.json';self.config=self.directory/'policy.json'
+  self.config.write_text(json.dumps({'candidates':[CANDIDATE]}))
+  self.current={'version':0,'candidates':[]};self.calls=[];self.drop=False;self.compete=False;self.drop_rollback=False;self.operator_after_rollback_loss=False;self.conflicts=0;self.old_unconfigured=False;self.lock=threading.Lock()
+  outer=self
+  class Handler(BaseHTTPRequestHandler):
+   def log_message(self,*args): pass
+   def reply(self,status,value):
+    raw=json.dumps(value).encode();self.send_response(status);self.send_header('Content-Length',str(len(raw)));self.end_headers();self.wfile.write(raw)
+   def do_GET(self):
+    with outer.lock:
+     outer.calls.append(('GET',None))
+     if outer.current['candidates']:self.reply(200,outer.current)
+     else:self.reply(404,{'error':'model_policy_unconfigured'} if outer.old_unconfigured else dict(error='model_policy_unconfigured',version=outer.current['version']))
+   def do_PUT(self):
+    value=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+    with outer.lock:
+     outer.calls.append(('PUT',value));on_disk=json.loads(outer.receipt.read_text()) if outer.receipt.exists() else None
+     if on_disk is not None:assert on_disk['phase'] in ('applying','rolling_back')
+     if outer.compete:
+      outer.compete=False;outer.current={'version':outer.current['version']+1,'candidates':value['candidates']}
+      assert value['expected_version']!=outer.current['version'];outer.conflicts+=1
+      self.connection.shutdown(socket.SHUT_RDWR);self.connection.close();return
+     if 'expected_version' in value and value['expected_version']!=outer.current['version']:
+      self.reply(409,{'error':'model_policy_version_conflict'});return
+     if not value['candidates'] and value.get('restore_unconfigured') is not True:
+      self.reply(400,{'error':'invalid_model_policy'});return
+     unchanged=value['candidates']==outer.current['candidates']
+     outer.current={'version':outer.current['version']+int(not unchanged),'candidates':value['candidates']}
+     if outer.drop or outer.drop_rollback and on_disk and on_disk['phase']=='rolling_back':
+      outer.drop=False;outer.drop_rollback=False
+      if outer.operator_after_rollback_loss:
+       outer.current={'version':outer.current['version']+1,'candidates':[dict(CANDIDATE,weight=19)]}
+      self.connection.shutdown(socket.SHUT_RDWR);self.connection.close();return
+     self.reply(200,dict(outer.current,unchanged=unchanged))
+  self.server=ThreadingHTTPServer(('127.0.0.1',0),Handler);self.server.daemon_threads=True
+  self.thread=threading.Thread(target=self.server.serve_forever,daemon=True);self.thread.start()
+  self.addCleanup(self.server.server_close);self.addCleanup(self.server.shutdown)
+  self.url='http://127.0.0.1:'+str(self.server.server_port)
+
+ def run_helper(self,action,extra=(),receipt=True):
+  args=[sys.executable,str(SCRIPT),action,'--url',self.url,'--file',str(self.config)]
+  if receipt:args+=['--receipt',str(self.receipt),'--source-sha',SHA]
+  result=subprocess.run(args+list(extra),capture_output=True,text=True,timeout=5,env={**os.environ,'HUB2_TOKEN':'synthetic-secret-token-'+'x'*40})
+  self.assertEqual(result.stderr,'',result.stderr);self.assertNotIn('synthetic-secret-token',result.stdout)
+  return result.returncode,json.loads(result.stdout)
+
+ def test_initial_apply_restore_reapply_and_replays_have_no_aba(self):
+  self.assertEqual(self.run_helper('prepare')[0],0);self.assertEqual(self.receipt.stat().st_mode&0o777,0o600)
+  self.assertNotIn('synthetic-secret-token',self.receipt.read_text())
+  self.assertEqual(self.run_helper('apply')[0],0);self.assertEqual(self.current['version'],1)
+  self.assertEqual(self.run_helper('apply')[0],0);self.assertEqual(self.current['version'],1)
+  self.assertEqual(self.run_helper('rollback')[0],0);self.assertEqual(self.current,{'version':2,'candidates':[]})
+  self.assertEqual(self.run_helper('rollback')[0],0);self.assertEqual(self.current['version'],2)
+  self.receipt=self.directory/'second.json'
+  self.assertEqual(self.run_helper('prepare')[0],0);self.assertEqual(self.run_helper('apply')[0],0)
+  self.assertEqual(self.current['version'],3)
+
+ def test_unchanged_candidate_never_rolls_back_an_operator_change(self):
+  self.current={'version':5,'candidates':[CANDIDATE]}
+  self.run_helper('prepare');self.assertEqual(self.run_helper('apply')[0],0)
+  self.current={'version':6,'candidates':[dict(CANDIDATE,weight=7)]}
+  puts=sum(method=='PUT' for method,_ in self.calls)
+  self.assertEqual(self.run_helper('rollback')[0],0)
+  self.assertEqual(self.current['version'],6);self.assertEqual(sum(method=='PUT' for method,_ in self.calls),puts)
+
+ def test_operator_change_after_apply_is_preserved(self):
+  self.run_helper('prepare');self.run_helper('apply')
+  self.current={'version':2,'candidates':[dict(CANDIDATE,weight=9)]}
+  self.assertEqual(self.run_helper('rollback')[0],1);self.assertEqual(self.current['candidates'][0]['weight'],9)
+  self.assertEqual(json.loads(self.receipt.read_text())['phase'],'applied')
+
+ def test_lost_apply_response_observes_without_acquiring_write_ownership(self):
+  self.run_helper('prepare');self.drop=True
+  rc,result=self.run_helper('apply');self.assertEqual(rc,1);self.assertTrue(result['manual_reconciliation_required'])
+  self.assertEqual(self.current['version'],1);self.assertEqual(json.loads(self.receipt.read_text())['phase'],'uncertain')
+  self.assertEqual(self.run_helper('rollback')[0],1);self.assertEqual(self.current['version'],1)
+
+ def test_competing_identical_write_and_lost_conflict_never_grants_ownership(self):
+  self.current={'version':1,'candidates':[dict(CANDIDATE,weight=2)]}
+  self.run_helper('prepare');self.compete=True
+  self.assertEqual(self.run_helper('apply')[0],1)
+  self.assertEqual(self.current,{'version':2,'candidates':[CANDIDATE]})
+  self.assertEqual(self.run_helper('rollback')[0],1)
+  self.assertEqual(self.current['version'],2);self.assertEqual(self.conflicts,1)
+
+ def test_lost_rollback_response_is_resolved_without_another_write(self):
+  self.run_helper('prepare');self.run_helper('apply');self.drop_rollback=True
+  self.assertEqual(self.run_helper('rollback')[0],0)
+  puts=sum(method=='PUT' for method,_ in self.calls)
+  self.assertEqual(self.run_helper('rollback')[0],0)
+  self.assertEqual(sum(method=='PUT' for method,_ in self.calls),puts)
+  self.assertEqual(self.current,{'version':2,'candidates':[]})
+
+ def test_lost_rollback_followed_by_operator_write_never_reissues_restore(self):
+  self.run_helper('prepare');self.run_helper('apply');self.drop_rollback=True;self.operator_after_rollback_loss=True
+  self.assertEqual(self.run_helper('rollback')[0],1)
+  self.assertEqual(self.current,{'version':3,'candidates':[dict(CANDIDATE,weight=19)]})
+  puts=sum(method=='PUT' for method,_ in self.calls)
+  self.assertEqual(self.run_helper('rollback')[0],1)
+  self.assertEqual(sum(method=='PUT' for method,_ in self.calls),puts)
+  self.assertEqual(self.current['candidates'][0]['weight'],19)
+
+ def test_receipt_write_failure_before_put_prevents_mutation(self):
+  self.run_helper('prepare')
+  args=SimpleNamespace(action='apply',receipt=self.receipt,source_sha=SHA,url=self.url,file=self.config)
+  with mock.patch.object(helper,'save',side_effect=OSError('synthetic disk failure')):
+   with self.assertRaises(OSError):helper.recovery(args,'synthetic-token-'+'x'*40)
+  self.assertFalse(any(method=='PUT' for method,_ in self.calls))
+  self.assertEqual(self.current['version'],0)
+
+ def test_crash_after_success_before_receipt_persistence_cannot_claim_ownership(self):
+  self.run_helper('prepare');save=helper.save
+  def fault(path,data):
+   if data['phase']=='applied':raise OSError('synthetic lost durable receipt')
+   return save(path,data)
+  args=SimpleNamespace(action='apply',receipt=self.receipt,source_sha=SHA,url=self.url,file=self.config)
+  with mock.patch.object(helper,'save',side_effect=fault):
+   with self.assertRaises(OSError):helper.recovery(args,'synthetic-token-'+'x'*40)
+  self.assertEqual(self.current['version'],1)
+  self.assertEqual(self.run_helper('apply')[0],1)
+  self.assertEqual(self.run_helper('rollback')[0],1)
+  self.assertEqual(self.current['version'],1)
+
+ def test_crash_replays_before_mutation_and_after_confirmed_response(self):
+  self.run_helper('prepare');record=json.loads(self.receipt.read_text());record['phase']='applying';self.receipt.write_text(json.dumps(record))
+  self.assertEqual(self.run_helper('apply')[0],0)
+  record=json.loads(self.receipt.read_text());record['phase']='rolling_back';self.receipt.write_text(json.dumps(record))
+  self.current={'version':2,'candidates':[]}
+  puts=sum(method=='PUT' for method,_ in self.calls)
+  self.assertEqual(self.run_helper('rollback')[0],0);self.assertEqual(sum(method=='PUT' for method,_ in self.calls),puts)
+
+ def test_identity_corruption_and_unsafe_receipts_refuse_before_put(self):
+  self.run_helper('prepare');original=self.receipt.read_text()
+  for extras in (['--source-sha','b'*40],['--url','http://127.0.0.1:1']):
+   self.assertEqual(self.run_helper('apply',extras)[0],1)
+  self.config.write_text(json.dumps({'candidates':[dict(CANDIDATE,weight=4)]}))
+  self.assertEqual(self.run_helper('apply')[0],1)
+  self.receipt.write_text('{bad');self.assertEqual(self.run_helper('rollback')[0],1)
+  self.receipt.unlink();outside=self.directory/'untouched';outside.write_text(original);self.receipt.symlink_to(outside)
+  self.assertEqual(self.run_helper('prepare')[0],1);self.assertEqual(outside.read_text(),original)
+  self.receipt.unlink();os.mkfifo(self.receipt,0o600)
+  self.assertEqual(self.run_helper('prepare')[0],1)
+  self.assertFalse(any(method=='PUT' for method,_ in self.calls))
+
+ def test_concurrent_helper_invocations_do_not_duplicate_apply(self):
+  self.run_helper('prepare')
+  results=[]
+  threads=[threading.Thread(target=lambda:results.append(self.run_helper('apply')[0])) for _ in range(2)]
+  for thread in threads:thread.start()
+  for thread in threads:thread.join(timeout=5);self.assertFalse(thread.is_alive())
+  self.assertEqual(results,[0,0]);self.assertEqual(self.current['version'],1)
+  self.assertEqual(sum(method=='PUT' for method,_ in self.calls),1)
+
+ def test_old_unconfigured_response_without_version_cannot_prepare_recovery(self):
+  self.old_unconfigured=True
+  rc,result=self.run_helper('prepare')
+  self.assertEqual(rc,1);self.assertTrue(result['manual_reconciliation_required'])
+  self.assertFalse(self.receipt.exists())
+  self.assertFalse(any(method=='PUT' for method,_ in self.calls))
+  self.assertEqual(self.run_helper('show',receipt=False)[0],1)
+  self.assertEqual(self.run_helper('apply',receipt=False)[0],0)
+
+ def test_legacy_show_apply_and_url_validation(self):
+  self.assertEqual(self.run_helper('apply',receipt=False)[0],0)
+  self.assertEqual(self.run_helper('show',receipt=False)[0],0)
+  for value in ('https://token@hub.example','https://hub.example/path','https://hub.example?token=x','http://hub.example'):
+   with self.assertRaises(helper.Problem):helper.url(value)
+
+
+if __name__=='__main__':unittest.main()
