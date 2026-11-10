@@ -46,6 +46,11 @@ class AdapterArgvTest(unittest.TestCase):
 
 
 class EffortAndInteractiveTest(unittest.TestCase):
+    def test_aplexer_prompt_flattens_windows_line_breaks_only(self):
+        prompt = 'First line\r\n\r\nSecond line\nThird line'
+        self.assertEqual(nl.aplexer_prompt(prompt, windows=True), 'First line Second line Third line')
+        self.assertEqual(nl.aplexer_prompt(prompt, windows=False), prompt)
+
     def test_command_effort_accepts_aplexer_normalized_config(self):
         self.assertEqual(nl.command_effort(['codex', 'exec', '-c', 'model_reasoning_effort=medium']), 'medium')
 
