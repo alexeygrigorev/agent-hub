@@ -1,5 +1,14 @@
 # Repository registry
 
+## Hub2 status
+
+Hub2 serves the curated registry through `GET /api/repos` and
+`GET /api/repos/{name}`; operator edits use `PATCH /api/repos/{name}`. The
+Hub2 Worker has no `POST /api/repos/refresh` route. The legacy refresh command
+and `agent-hub-repos-refresh.timer` target the Hub1 API and must remain disabled
+on Hub2-managed hosts. `hub repos list` is the read-only Hub2 registry check;
+it does not scan local Git checkouts or refresh metadata.
+
 Hub keeps the private repository map in its SQLite Durable Object. Each entry
 has a unique name, label, aliases, per-host checkout paths, origin
 (`org/repo`), org, purpose, stack, key folders, workflows, URLs, default branch,
@@ -7,9 +16,9 @@ active/archived/duplicate status, canonical duplicate target, last commit SHA/da
 and discovery flags. Repository paths and descriptions are private authenticated
 data; do not check a seed or raw registry output into Git.
 
-## Seed and daily refresh
+## Legacy Hub1 seed and daily refresh
 
-Use the operator CLI profile for the one-time seed:
+For Hub1 deployments only, use the operator CLI profile for the one-time seed:
 
 ```sh
 hub repos seed --machine MACHINE_ID --root "$HOME/git" --file "$HOME/tmp/projects-map-2026-10-12.md"
@@ -29,8 +38,8 @@ systemctl --user status agent-hub-repos-refresh.timer
 journalctl --user -u agent-hub-repos-refresh.service -n 100 --no-pager
 ```
 
-The user timer runs daily with persistent missed-run catchup. It invokes the
-installed `hub` binary, so ordinary CLI updates also update the refresh code.
+The legacy user timer runs daily with persistent missed-run catchup. It invokes
+the installed `hub` binary, so ordinary CLI updates also update the refresh code.
 The service uses the existing host profile and never obtains credentials.
 Refresh scans immediate children of the configured root, skipping symlinks and
 `.git` files (worktrees). It uses Git for origin/last commit, lists YAML workflow
@@ -65,7 +74,7 @@ The target must already exist and be active; self-links, missing/inactive target
 and duplicate cycles are rejected without changing the entry. Setting status to
 `active` or `archived` clears its canonical link. Edit/seed require an operator. A host can
 refresh only checkout rows bound to its authenticated machine; another host may report the same repository. Authorized host and
-agent readers can list/show. API routes are `GET /api/repos`,
+agent readers can list/show. Legacy Hub1 API routes are `GET /api/repos`,
 `GET /api/repos/{name}`, `PATCH /api/repos/{name}`, `POST /api/repos/seed`,
 `POST /api/repos/refresh`; list filters are `org`, `status`, `flagged=true`, `host`, `missing_on`.
 Seed/refresh accept `{"repos": [...]}` in bounded batches. MCP tools `repos_list`,

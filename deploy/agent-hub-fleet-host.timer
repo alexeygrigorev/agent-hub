@@ -1,5 +1,5 @@
 [Unit]
-Description=Run the Agent Hub host cycle every minute
+Description=Run the Hub2 host heartbeat cycle every minute
 
 [Timer]
 OnBootSec=1min

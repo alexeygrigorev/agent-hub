@@ -1,5 +1,5 @@
 [Unit]
-Description=Refresh Hub account quota independently of fleet machines
+Description=Legacy Hub1 quota-publisher timer (do not install on Hub2)
 
 [Timer]
 OnBootSec=30s

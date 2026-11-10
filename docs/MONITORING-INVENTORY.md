@@ -18,9 +18,24 @@ The objective is to establish an exact baseline of what was monitored, how signa
 
 ## 2. Source Environment & Installed Infrastructure (Hetzner)
 
-### 2.1 Installed Systemd User Timers & Services
+### 2.0 Hub2 migration status (2026-11-10)
 
-The Hetzner host actively maintains the following user-level timers and services (sanitized, omitting private tokens and addresses):
+The table below is the historical Hub1-era installation inventory. On the
+Hub2-managed Hetzner host, `agent-hub2-host.service` is the persistent WebSocket
+host for `hetzner-aplexer`; its live Hub2 connection is the fleet signal and it
+owns session work. `agent-hub-fleet-host.timer` runs a bounded heartbeat-only
+Hub2 cycle through the enrolled host config. It does not fetch or claim offers,
+or reconcile native sessions; systemd suppresses its response body. The
+legacy `agent-hub-quota-server.timer` and `agent-hub-repos-refresh.timer` target
+Hub1 routes or credentials and remain disabled. Hub2 quota is read with
+`hub quota --json` (projection `hub2_accounts`). Hub2 repository refresh is not
+implemented; `hub repos list` checks registry read access without scanning or
+changing repository metadata.
+
+### 2.1 Historical Hub1-era Systemd User Timers & Services
+
+The following table records the source inventory from the original audit. These
+entries are not the current Hub2-managed service state described above.
 
 | Timer Unit | Service Unit | Schedule / Cadence | Target Executable / Script | Description |
 | :--- | :--- | :--- | :--- | :--- |

@@ -263,8 +263,8 @@ class ImmutableReleaseTest(unittest.TestCase):
         self.assertIn(str(self.root.parent / self.target), effective)
         self.assertEqual(self.template.with_suffix('.conf.disabled').read_text(), self.text)
 
-    def test_release_bump_moves_fleet_host_and_quota_server_drop_ins(self):
-        """Scratch simulation: one switch moves every managed companion unit to the new release."""
+    def test_release_bump_switches_fleet_to_hub2_heartbeat_and_moves_quota_dropin(self):
+        """The fleet timer uses Hub2; the disabled Hub1 quota service follows its release."""
         self.template = self.unit_dir / ('zz~~~~' + self.before[:8] + '-switch-release.conf')
         self.template.write_text(self.text)
         user_dir = self.unit_dir.parent
@@ -277,11 +277,16 @@ class ImmutableReleaseTest(unittest.TestCase):
         unmanaged.write_text('[Service]\nExecStart=' + str(self.root) + '/x\n')
         self.assertEqual(self.manual_switch(), 0)
         new_release = str(self.root.parent / self.target)
-        for name in ('agent-hub-fleet-host.service.d', 'agent-hub-quota-server.service.d'):
-            text = (user_dir / name / update.DROPIN).read_text()
-            self.assertIn(new_release, text)
-            self.assertNotIn(str(self.root), text)
-            self.assertIn('--config /keep/quota.json', text)
+        fleet_text = (user_dir / 'agent-hub-fleet-host.service.d' / update.DROPIN).read_text()
+        self.assertIn('hub2-host.json', fleet_text)
+        self.assertIn('heartbeat', fleet_text)
+        self.assertIn('StandardOutput=null', fleet_text)
+        self.assertNotIn('fleet-host --cycles', fleet_text)
+        self.assertNotIn(str(self.root), fleet_text)
+        quota_text = (user_dir / 'agent-hub-quota-server.service.d' / update.DROPIN).read_text()
+        self.assertIn(new_release, quota_text)
+        self.assertNotIn(str(self.root), quota_text)
+        self.assertIn('--config /keep/quota.json', quota_text)
         self.assertIn(str(self.root), unmanaged.read_text())
 
     def test_manual_bootstrap_refuses_foreign_later_override(self):
