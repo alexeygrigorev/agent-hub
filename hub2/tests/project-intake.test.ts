@@ -209,3 +209,34 @@ test('signal-only native exit preserves raw tombstone and derives a negative fai
  assert.equal((await f.call('/_internal/finish','POST',receipt)).status,200,'exact signal receipt replay');
  assert.equal((await f.call('/_internal/finish','POST',{...receipt,evidence:{...evidence,native_exit:{...evidence.native_exit,signal:2}}})).status,400,'changed raw signal cannot reuse normalized code');
 });
+test('no-native launch timeout permits retry only with a proof bound to the completed prior saga',async()=>{
+ const f=fixture(),own=await intake(f,'timeout-retry-proof'),start={key:'timeout-proof-first',workspace:'/tmp/synthetic-timeout-proof',engine:'shell',machine_id:'h1',override_reason:'Synthetic semantic test'};
+ assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',start)).status,201);
+ const prior=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any;
+ f.sql.prepare("UPDATE dispatch_sagas SET state='claimed' WHERE operation_id=?").run(prior.operation_id);
+ const failed=await f.call('/_internal/reaped','POST',{operation_id:prior.operation_id,attempt_operation_id:prior.attempt_operation_id,
+  session_id:prior.session_id,machine_id:prior.machine_id,epoch:prior.epoch,native_id:null,reason:'launch_timeout_no_native',
+  launch_failed:true,observed_at:Date.now()});
+ assert.equal(failed.status,200,JSON.stringify(await failed.clone().json()));
+ const intakeRow=f.sql.prepare('SELECT * FROM intakes WHERE id=?').get(own.id) as any,proof=JSON.parse(intakeRow.final_evidence_json);
+ assert.equal(intakeRow.status,'failed');assert.equal(prior.native_id,null);
+ for(const [field,value] of Object.entries({operation_id:'foreign-operation',attempt_operation_id:'foreign-attempt',session_id:'foreign-session',
+  machine_id:'foreign-machine',epoch:prior.epoch+1,reason:'dead',launch_failed:false,native_id_absent:false,reaped:false,native_id:'foreign-native'})){
+  f.sql.prepare('UPDATE intakes SET final_evidence_json=? WHERE id=?').run(JSON.stringify({...proof,[field]:value}),own.id);
+  const refused=await f.call('/api/intakes/'+own.id+'/start','POST',{...start,key:`bad-timeout-proof-${field}`});
+  const refusedBody=await body(refused);assert.equal(refused.status,409,`${field}: ${JSON.stringify(refusedBody)}`);
+  assert.equal(refusedBody.error,'retry_requires_qualified_failure');
+ }
+ f.sql.prepare("UPDATE dispatch_sagas SET last_reason='unrelated-failure' WHERE operation_id=?").run(prior.operation_id);
+ f.sql.prepare('UPDATE intakes SET final_evidence_json=? WHERE id=?').run(JSON.stringify(proof),own.id);
+ assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',{...start,key:'bad-timeout-saga'})).status,409);
+ f.sql.prepare("UPDATE dispatch_sagas SET last_reason='launch_timeout_no_native' WHERE operation_id=?").run(prior.operation_id);
+ const retried=await f.call('/api/intakes/'+own.id+'/start','POST',{...start,key:'timeout-proof-retry'});
+ assert.equal(retried.status,201,JSON.stringify(await retried.clone().json()));
+ const rows=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=? ORDER BY created_at,operation_id').all(own.id) as any[];
+ const priorAfterRetry=rows.find(row=>row.operation_id===prior.operation_id),retrySaga=rows.find(row=>row.operation_id!==prior.operation_id);
+ assert.equal(rows.length,2);assert.equal(priorAfterRetry.state,'complete');
+ assert.equal(priorAfterRetry.last_reason,'launch_timeout_no_native');assert.equal(priorAfterRetry.native_id,null);assert.notEqual(retrySaga.session_id,prior.session_id);
+ const history=await body(await f.call('/api/intakes/'+own.id+'/history'));
+ assert(history.events.some((event:any)=>event.kind==='session_launch_failed'&&event.body.reason==='launch_timeout_no_native'));
+});
