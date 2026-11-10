@@ -36,7 +36,19 @@ def main(argv=None):
     request.add_argument("--body-file", type=Path)
     request.add_argument("--key")
     add_commands(commands)
+    updater = commands.add_parser("self-update", help="Install the verified published host release")
+    updater.add_argument("--base-url")
+    updater.add_argument("--root", type=Path, default=Path.home() / ".local/share/agent-hub2")
+    updater.add_argument("--no-restart", action="store_true")
     args = parser.parse_args(argv)
+    if args.command == "self-update":
+        import subprocess
+        command = [sys.executable, str(args.root / "updater.py"), "--root", str(args.root)]
+        if args.base_url:
+            command.extend(["--base-url", args.base_url])
+        if args.no_restart:
+            command.append("--no-restart")
+        return subprocess.run(command).returncode
     try:
         config = json.loads(args.config.read_text()) if args.config.exists() else {}
         server = args.server or config.get("server") or DEFAULT_SERVER
