@@ -283,6 +283,8 @@ class TestSessionControlCli(unittest.TestCase):
             result = session_control.execute(args)
         self.assertEqual(result['client_key'], 'k1')
         self.assertEqual(result['binding_wait']['session']['state'], 'running')
+        self.assertEqual(result['state'], 'running')
+        self.assertEqual(result['native_id'], 'native-1')
         self.assertEqual(transport.call_args.args[:2], ('GET', '/api/sessions/s1'))
 
     def test_start_wait_reports_prelaunch_refusal_instead_of_returning_accepted(self):
@@ -781,9 +783,13 @@ class TestSessionControlCli(unittest.TestCase):
         args = self.parse('start', '--workspace', 'demo', '--prompt', 'wait for me', '--key', 'k-wait')
         self.assertEqual(session_control.check_wait_args(args), (session_control.START_WAIT_TIMEOUT, 5.0))
         self.assertEqual(session_control.START_WAIT_TIMEOUT, 150.0)
-        with patch.object(session_control, 'request', return_value={'id': 's-wait'}) as transport, \
+        with patch.object(session_control, 'request', return_value={'session': {'id': 's-wait', 'state': 'offered'}, 'picker': {'pool': []}}) as transport, \
                 patch.object(session_control, 'wait_for_session', return_value={'session': {'id': 's-wait', 'state': 'running'}}) as wait:
-            session_control.execute(args)
+            result = session_control.execute(args)
+        self.assertEqual(result['state'], 'running')
+        self.assertEqual(result['session']['state'], 'running')
+        self.assertEqual(result['picker'], {'pool': []})
+        self.assertEqual(result['client_key'], 'k-wait')
         wait.assert_called_once_with('s-wait', 150.0, 5.0)
         self.assertEqual(transport.call_args.args[:2], ('POST', '/api/sessions'))
         no_wait = self.parse('start', '--workspace', 'demo', '--prompt', 'receipt only', '--key', 'k-nowrap', '--no-wait')
