@@ -269,3 +269,12 @@ test('claim records admission so native started needs no separate admission requ
  assert.equal(result.status,201,await result.clone().text());
  assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'running');
 });
+
+test('session projections carry host workspace route and timestamp columns for the CLI',async()=>{
+ const f=fixture(),session='projection';await startClaimed(f,session,'native-projection');
+ const response=await f.call('/api/sessions/'+session,'GET',undefined,{'x-hub2-actor':JSON.stringify({id:'admin',kind:'operator',scopes:['operator:admin']})});
+ assert.equal(response.status,200);const view=(await response.json() as any).session;
+ assert.equal(view.host,'h1');assert.equal(view.machine,'h1');assert.equal(view.workspace,'/tmp');
+ assert.equal(view.account_id,'codex');assert.equal(view.account,'codex');assert.equal(view.mode,'headless');
+ assert.equal(view.managed,true);assert.ok(Number.isFinite(Date.parse(view.created_at)));assert.ok(Number.isFinite(Date.parse(view.updated_at)));
+});
