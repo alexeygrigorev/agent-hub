@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 
 class TestMachinesAvailable(unittest.TestCase):
-    """Regression for audit e2501fde: the Worker returns {"machines": [...]}."""
+    """Regression for the authenticated Hub2 routing-machines projection."""
 
     def run_cli(self, response, *extra):
         from agent_hub_host import cli, bus
@@ -22,34 +22,39 @@ class TestMachinesAvailable(unittest.TestCase):
                 code = 0
             except SystemExit as exc:
                 code = exc.code or 0
-        request.assert_called_once_with("GET", "/api/machines/available")
+        request.assert_called_once_with("GET", "/api/fleet/routing/machines")
         return code, out.getvalue(), err.getvalue()
 
-    def test_worker_machines_shape_renders_plain_ids(self):
-        code, out, err = self.run_cli({"machines": [{"id": "hetzner"}, {"hostname": "desktop"}]})
+    def test_connected_machines_shape_renders_plain_ids(self):
+        code, out, err = self.run_cli({"machines": [
+            {"machine_id": "hetzner", "connected": True},
+            {"machine_id": "desktop", "connected": False},
+        ]})
         self.assertEqual(code, 0)
-        self.assertEqual(out.splitlines(), ["hetzner", "desktop"])
+        self.assertEqual(out.splitlines(), ["hetzner"])
         self.assertNotIn("reachable: none", err)
 
-    def test_worker_machines_shape_json(self):
-        code, out, _ = self.run_cli({"machines": [{"id": "hetzner"}]}, "--json")
+    def test_connected_machines_shape_json(self):
+        code, out, _ = self.run_cli({"machines": [
+            {"machine_id": "hetzner", "connected": True, "os": "linux"},
+            {"machine_id": "offline", "connected": False},
+        ]}, "--json")
         self.assertEqual(code, 0)
-        self.assertEqual(json.loads(out), {"count": 1, "reachable": [{"id": "hetzner"}]})
+        result = json.loads(out)
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["reachable"][0]["id"], "hetzner")
+        self.assertEqual(result["reachable"][0]["machine_id"], "hetzner")
 
     def test_empty_machines_reports_none(self):
-        code, out, err = self.run_cli({"machines": []})
+        code, out, err = self.run_cli({"machines": [{"machine_id": "offline", "connected": False}]})
         self.assertEqual(code, 0)
         self.assertEqual(out, "")
         self.assertIn("reachable: none", err)
 
-    def test_list_and_reachable_shapes_still_accepted(self):
-        self.assertEqual(self.run_cli([{"id": "a"}])[1].splitlines(), ["a"])
-        self.assertEqual(self.run_cli({"reachable": [{"id": "b"}], "count": 1})[1].splitlines(), ["b"])
-
     def test_unknown_shape_fails_loudly(self):
         code, _, err = self.run_cli({"unexpected": True})
         self.assertEqual(code, 1)
-        self.assertIn("unexpected /api/machines/available response shape", err)
+        self.assertIn("unexpected /api/fleet/routing/machines response shape", err)
 
     def test_human_auth_sessions_and_machines_share_the_user_profile(self):
         from agent_hub_host import api, cli, config, worker_auth
@@ -62,8 +67,8 @@ class TestMachinesAvailable(unittest.TestCase):
                 return {"kind": "human", "email": "orin@datatalks.club"}
             if "/api/sessions?" in req.full_url:
                 return {"sessions": [], "next_cursor": None}
-            if req.full_url.endswith("/api/machines/available"):
-                return {"machines": [{"id": "grok"}]}
+            if req.full_url.endswith("/api/fleet/routing/machines"):
+                return {"machines": [{"machine_id": "grok", "connected": True}]}
             raise AssertionError("unexpected Hub request path")
 
         def invoke(*argv):
@@ -107,7 +112,7 @@ class TestMachinesAvailable(unittest.TestCase):
             [
                 ("https://hub.test/api/auth/me", "Bearer human-token"),
                 ("https://hub.test/api/sessions?live=1&limit=100", "Bearer human-token"),
-                ("https://hub.test/api/machines/available", "Bearer human-token"),
+                ("https://hub.test/api/fleet/routing/machines", "Bearer human-token"),
             ],
         )
 
