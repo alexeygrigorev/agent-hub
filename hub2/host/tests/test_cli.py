@@ -159,6 +159,35 @@ class CliTests(unittest.TestCase):
         saved = json.loads(self.config.read_text())
         self.assertEqual(saved["server"], f"http://127.0.0.1:{self.server.server_port}")
 
+    def test_heartbeat_command_only_posts_machine_heartbeat(self):
+        save_config(self.config, {
+            "server": f"http://127.0.0.1:{self.server.server_port}",
+            "token": "synthetic-token",
+            "machine_id": "test-machine",
+            "roots": [self.temp.name],
+            "engines": ["shell"],
+            "refresh_token": "synthetic-refresh-token",
+            "expires_at": 0,
+        })
+        saved_config = self.config.read_bytes()
+        with patch("agent_hub_host.cli.Journal") as journal, \
+             patch("agent_hub_host.auth.refresh") as refresh:
+            code, result = self.invoke("heartbeat", "--label", "fleet-cycle", "--aplexer", os.sys.executable)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(len(Handler.calls), 1)
+        method, path, body, auth = Handler.calls[0]
+        self.assertEqual((method, urlsplit(path).path), ("POST", "/api/heartbeat"))
+        self.assertEqual(auth, "Bearer synthetic-token")
+        self.assertEqual(body["labels"], ["fleet-cycle"])
+        self.assertEqual(body["engines"], [])
+        self.assertEqual(body["capabilities"], ["headless"])
+        self.assertNotIn("native_sessions", body)
+        journal.assert_not_called()
+        refresh.assert_not_called()
+        self.assertEqual(self.config.read_bytes(), saved_config)
+
 
 if __name__ == "__main__":
     unittest.main()

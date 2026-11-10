@@ -27,6 +27,9 @@ def main(argv=None):
     serve.add_argument("--once", action="store_true")
     serve.add_argument("--aplexer", default="a")
     serve.add_argument("--label", action="append", default=[])
+    heartbeat = commands.add_parser("heartbeat", help="Report machine health without reading offers or changing sessions")
+    heartbeat.add_argument("--aplexer", default="a")
+    heartbeat.add_argument("--label", action="append", default=[])
     request = commands.add_parser("request")
     request.add_argument("method", choices=["GET", "POST", "PATCH", "DELETE"])
     request.add_argument("path")
@@ -38,7 +41,7 @@ def main(argv=None):
         config = json.loads(args.config.read_text()) if args.config.exists() else {}
         server = args.server or config.get("server") or DEFAULT_SERVER
         client = Client(server, os.environ.get("HUB2_TOKEN") or config.get("token", ""))
-        if args.command!='auth' and not os.environ.get('HUB2_TOKEN') and config.get('refresh_token') and config.get('expires_at',float('inf'))<=time.time()+30:
+        if args.command not in ('auth', 'heartbeat') and not os.environ.get('HUB2_TOKEN') and config.get('refresh_token') and config.get('expires_at',float('inf'))<=time.time()+30:
             from .auth import refresh
             client=refresh(config,args.config,server)
         if args.command == "enroll":
@@ -52,6 +55,11 @@ def main(argv=None):
         elif args.command == "request":
             body = json.loads(args.body_file.read_text()) if args.body_file else None
             print(json.dumps(client.request(args.method, args.path, body, args.key)))
+        elif args.command == "heartbeat":
+            bridge = Bridge(client, None, config["roots"], config["engines"], args.aplexer,
+                            launcher_config=config.get("launcher"), machine_id=config["machine_id"])
+            bridge.heartbeat(args.label, include_native_sessions=False)
+            print(json.dumps({"ok": True}))
         elif args.command == "serve":
             bridge = Bridge(client, Journal(args.config.parent / "v2-journal.sqlite"),
                             config["roots"], config["engines"], args.aplexer,

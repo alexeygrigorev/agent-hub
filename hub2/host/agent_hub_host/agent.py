@@ -1,6 +1,7 @@
 """Native process receipts are journaled before delivery and replayed on reconnect."""
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -83,6 +84,7 @@ class Bridge:
         self.machine_id=machine_id
         self.budget_paused_until=0
         self.budget_safety_paused_until=0
+        self._unavailable_workspace_warnings=set()
         self.executable = shutil.which(executable) or str(Path(executable).resolve(strict=True))
 
     def native(self, *args, input=None, allow_failure=False, timeout=30):
@@ -294,6 +296,30 @@ class Bridge:
         with self.journal.db:
             self.journal.db.execute("UPDATE launches SET state='aborting' WHERE operation_id=? AND state='launching'",(operation,))
 
+    @staticmethod
+    def _workspace_is_available(workspace):
+        if not isinstance(workspace, str) or not workspace:
+            return False
+        try:
+            path = Path(workspace)
+            return path.is_absolute() and path.is_dir()
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return False
+
+    def _warn_unavailable_workspace(self, row):
+        session_id = row["session_id"]
+        warnings = getattr(self, "_unavailable_workspace_warnings", None)
+        if warnings is None:
+            warnings = set()
+            self._unavailable_workspace_warnings = warnings
+        if session_id in warnings:
+            return
+        warnings.add(session_id)
+        logging.getLogger(__name__).warning(
+            "Hub2 host journal session %s has an unavailable workspace; leaving native state unresolved",
+            session_id,
+        )
+
     def reconcile(self):
         rows = self.journal.db.execute("SELECT * FROM launches WHERE state IN ('running','aborting','launching') LIMIT 1001").fetchall()
         if len(rows) > 1000:
@@ -305,6 +331,9 @@ class Bridge:
                 with self.journal.db:
                     self.journal.db.execute("UPDATE launches SET state='aborting' WHERE operation_id=? AND state='launching'",(row['operation_id'],))
                 row = self.journal.db.execute("SELECT * FROM launches WHERE operation_id=?", (row['operation_id'],)).fetchone()
+            if not self._workspace_is_available(row["workspace"]):
+                self._warn_unavailable_workspace(row)
+                continue
             if row['state']=='aborting' and not row['native_id']:
                 try:identity=self.launcher.aborted_identity('hub2-'+row['session_id'],row['workspace'])
                 except RuntimeError:identity=None
@@ -483,9 +512,13 @@ class Bridge:
         rows=self.journal.db.execute("SELECT session_id,epoch,native_id,tag,workspace,state FROM launches WHERE state IN ('launching','running','aborting') ORDER BY session_id LIMIT 100").fetchall()
         result=[]
         for row in rows:
-            native_id,status=self.resolve_launch_native(row)
-            phase=str((status or {}).get('phase',(status or {}).get('state',
-                'launching' if row['state']=='launching' else 'missing')))
+            if not self._workspace_is_available(row['workspace']):
+                self._warn_unavailable_workspace(row)
+                native_id,status,phase=row['native_id'],None,'unknown'
+            else:
+                native_id,status=self.resolve_launch_native(row)
+                phase=str((status or {}).get('phase',(status or {}).get('state',
+                    'launching' if row['state']=='launching' else 'missing')))
             activity=(status or {}).get('last_activity_ms',(status or {}).get('updated_at_ms',(status or {}).get('created_at_ms')))
             if type(activity) is not int:activity=None
             exit_code=native_returncode((status or {}).get('exit') or {}) if phase=='exited' else None
@@ -498,6 +531,9 @@ class Bridge:
         expected={'tag':row['tag'],'workspace':row['workspace']}
         if row['native_id']:
             return row['native_id'],self.lookup(row['native_id'],expected)
+        if not self._workspace_is_available(row['workspace']):
+            self._warn_unavailable_workspace(row)
+            return None,None
         selector=f"{row['workspace']}:{row['tag']}"
         status=self.launcher.status(selector,workspace=row['workspace'])
         native_id=status.get('id') if isinstance(status,dict) else None
@@ -511,11 +547,14 @@ class Bridge:
                                     (native_id,state,row['session_id'],row['epoch']))
         return native_id,status
 
-    def heartbeat(self,labels):
+    def heartbeat(self,labels,include_native_sessions=True):
         available=self.launcher.capabilities()
         engines=sorted(engine for engine in self.engines.intersection(available) if available[engine])
         capabilities=['headless']+[cap+':'+engine for engine in engines for cap in sorted(available[engine]-{'headless'})]
-        self.client.heartbeat(labels,engines,capabilities,native_sessions=self.live_sessions())
+        if include_native_sessions:
+            self.client.heartbeat(labels,engines,capabilities,native_sessions=self.live_sessions())
+        else:
+            self.client.heartbeat(labels,engines,capabilities)
 
     def safety_pause(self,machine_id):
         self.reconcile()
