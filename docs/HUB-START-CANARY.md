@@ -55,8 +55,8 @@ Units: `deploy/hub-start-canary.{service,timer}` (shell, 5 min), `deploy/hub-sta
 
 ## Tests
 
-`host/tests/test_hub_start_canary.py`; fake `hub` and `a` replay real output shapes. Run:
-`scripts/capped-test-run.sh -- scripts/with-temp-home.sh -- env PYTHONPATH=host python3 -m unittest host.tests.test_hub_start_canary`.
+`host/tests/test_cli_hub_start_canary.py`; fake `hub` and `a` replay real output shapes. Run:
+`scripts/capped-test-run.sh -- scripts/with-temp-home.sh -- env PYTHONPATH=host python3 -m unittest host.tests.test_cli_hub_start_canary`.
 
 ## OPEN QUESTIONS
 
