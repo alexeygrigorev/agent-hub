@@ -122,9 +122,7 @@ class Bridge:
         launch = offer.get("launch")
         if not isinstance(launch, dict):
             raise ValueError("launch_specification_required")
-        workspace = Path(str(launch.get("workspace", ""))).resolve(strict=True)
-        if not workspace.is_dir() or not any(workspace.is_relative_to(root) for root in self.roots):
-            raise ValueError("workspace_outside_allowlist")
+        workspace = self.resolve_workspace(launch.get("workspace"))
         engine = launch.get("engine")
         if engine not in self.engines:
             raise ValueError("engine_not_allowed")
@@ -146,6 +144,41 @@ class Bridge:
         return {"workspace": str(workspace), "engine": engine, "model": model,
                 "prompt": prompt, "interactive": bool(launch.get("interactive", False)), "timeout_seconds": timeout,
                 'with_goal':with_goal,'effort':effort}
+
+    def resolve_workspace(self, value):
+        if not isinstance(value, str) or not value or len(value) > 1024 or "\0" in value:
+            raise ValueError("invalid_workspace")
+        candidate = Path(value)
+        if candidate.is_absolute() or re.match(r"^[A-Za-z]:\\", value):
+            try:
+                workspace = candidate.resolve(strict=True)
+            except OSError:
+                raise ValueError("workspace_unavailable") from None
+            if not workspace.is_dir():
+                raise ValueError("workspace_unavailable")
+            if not any(workspace.is_relative_to(root) for root in self.roots):
+                raise ValueError("workspace_outside_allowlist")
+            return workspace
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value):
+            raise ValueError("invalid_workspace")
+
+        # Enrolled roots may name one workspace directly or contain several
+        # named workspace directories. Prefer an exact root label when present.
+        exact = [root for root in self.roots if root.name.casefold() == value.casefold()]
+        candidates = exact or [root / value for root in self.roots]
+        matches = {}
+        for path in candidates:
+            try:
+                workspace = path.resolve(strict=True)
+            except OSError:
+                continue
+            if workspace.is_dir() and any(workspace.is_relative_to(root) for root in self.roots):
+                matches[str(workspace)] = workspace
+        if len(matches) > 1:
+            raise ValueError("workspace_label_ambiguous")
+        if not matches:
+            raise ValueError("workspace_label_unavailable")
+        return next(iter(matches.values()))
 
     def child_context(self,offer,launch):
         if not self.machine_id:raise RuntimeError('host_identity_required')

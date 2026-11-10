@@ -542,8 +542,12 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
   const key = body.key;
   if (typeof key !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}$/.test(key)) return error('idempotency_key_required', 400);
   const text = (field: string): string | undefined => typeof body[field] === 'string' && (body[field] as string).trim() ? (body[field] as string).trim() : undefined;
-  if (typeof body.workspace !== 'string' || !body.workspace)
-    return error('workspace_required', 400, 'Hub2 does not clone repositories; pass --workspace with an absolute path on the target host');
+  const requestedProject = text('repo') ?? text('project');
+  const repoWorkspace = requestedProject && /^[A-Za-z0-9_.-]{1,80}\/[A-Za-z0-9_.-]{1,100}$/.test(requestedProject)
+    ? requestedProject.split('/').at(-1) : undefined;
+  const workspace = text('workspace') ?? repoWorkspace;
+  if (!workspace)
+    return error('workspace_required', 400, 'pass --repo owner/name to use that repository workspace, or --workspace <registered label or absolute target-host path>');
   const interactive = body.mode === 'interactive';
   const brief = text('brief');
   const taskRef = text('intake_task_id');
@@ -552,7 +556,7 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
   const control = env.CONTROL.get(env.CONTROL.idFromName('global'));
   // An existing intake already knows its project; resolve it (full id or unique prefix) instead of guessing.
   let existingIntake: string | undefined;
-  let project = text('repo') ?? text('project') ?? env.HUB2_DEFAULT_PROJECT;
+  let project = requestedProject ?? env.HUB2_DEFAULT_PROJECT;
   if (taskRef !== undefined) {
     const routed = await control.fetch(new Request(`${CONTROL}/api/routes/intake/${encodeURIComponent(taskRef)}`, { headers: { 'x-hub2-actor': JSON.stringify(actor) } }));
     if (!routed.ok) {
@@ -562,6 +566,16 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
     const { route } = (await routed.json()) as { route: { id: string; owner: string } };
     existingIntake = route.id;
     project = route.owner;
+  }
+  const workspaceIsPath = workspace.startsWith('/') || /^[A-Za-z]:\\/.test(workspace);
+  if (!project && !workspaceIsPath) {
+    const byWorkspace = await control.fetch(new Request(`${CONTROL}/api/repos/${encodeURIComponent(workspace)}`, {
+      headers: { 'x-hub2-actor': JSON.stringify(actor) },
+    }));
+    if (byWorkspace.ok) {
+      const match = (await byWorkspace.json()) as { repo?: { canonical_name?: string } };
+      project = match.repo?.canonical_name;
+    }
   }
   if (!project) {
     const list = await control.fetch(new Request(`${CONTROL}/api/repos?limit=2`, { headers: { 'x-hub2-actor': JSON.stringify(actor) } }));
@@ -600,7 +614,7 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
   const intakeId = (intake.data.intake as { id?: string } | undefined)?.id ?? (intake.data.id as string | undefined);
   if (!intake.response.ok || !intakeId) return json({ ...intake.data, error: intake.data.error ?? 'intake_create_failed', stage: 'intake' }, intake.response.ok ? 502 : intake.response.status);
   const start: JsonRecord = {
-    key, workspace: body.workspace, interactive, with_goal: body.with_goal === true,
+    key, workspace, interactive, with_goal: body.with_goal === true,
     ...(brief ? { prompt: brief } : {}),
     ...(text('machine') ? { machine_id: text('machine') } : {}),
     ...(text('engine') ? { engine: text('engine') } : {}),

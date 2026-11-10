@@ -453,10 +453,13 @@ def _observe_cleanup_trees(args, applied):
 
 
 def wait_for_session(session_id, timeout, interval, *, stopping=False):
+    def session_state(view):
+        session = view.get('session') if isinstance(view, dict) else None
+        return (session if isinstance(session, dict) else view).get('state') if isinstance(view, dict) else None
     deadline = time.monotonic() + timeout
     return wait_until(deadline, interval,
                      lambda: request('GET', '/api/sessions/' + session_id),
-                     lambda view: view.get('state') in (('stopped', 'failed', 'refused', 'uncertain') if stopping else TERMINAL_SESSION),
+                     lambda view: session_state(view) in (('stopped', 'failed', 'refused', 'uncertain') if stopping else TERMINAL_SESSION),
                      'Session wait')
 
 
@@ -586,7 +589,7 @@ def add_commands(sub):
     link.add_argument('session')
     link.add_argument('--intake-task-id', required=True)
     link.add_argument('--key')
-    start = commands.add_parser('start', help='Record a start intent using auto/policy routing (default). Casual use should prefer auto/policy.')
+    start = commands.add_parser('start', help='Start a model-routed session; use --wait to require a live native binding before success')
     start.add_argument('--engine', help='Engine override (operators only; requires --reason explaining why)')
     start.add_argument('--reason', default=None,
                        help='Explanation for an explicit deep-tier or engine choice (required with --tier deep or --engine)')
@@ -594,7 +597,7 @@ def add_commands(sub):
     start.add_argument('--needs', action='append', default=None,
                        help='Capability hints passed with the launch request (repeatable)')
     start.add_argument('--workspace', default=None, help='Configured workspace label or absolute path on the target host (omit with --repo)')
-    start.add_argument('--repo', default=None, help='Repository owner/name; the placed host (any OS) clones its own fresh work tree from origin/main, so no host path is needed')
+    start.add_argument('--repo', default=None, help='Repository owner/name; selects that project and the same-named workspace under the placed host’s enrolled roots')
     start.add_argument('--force', action='store_true', help='Operator only: start despite unresolved intake dependencies')
     start.add_argument('--task-kind', choices=['implement','review','ask','goal'], help='Task kind for measured resource placement and session statistics')
     start.add_argument('--tier', choices=TIERS, help='deep/daily/quick task tier; --tier deep requires --reason')
@@ -1138,7 +1141,19 @@ def _execute(args):
         created = dict(created, client_key=key)
         timeout, interval = check_wait_args(args)
         if timeout is not None:
-            created['binding_wait'] = wait_for_session(created['id'], timeout, interval)
+            binding = wait_for_session(created['id'], timeout, interval)
+            created['binding_wait'] = binding
+            bound = binding.get('session') if isinstance(binding, dict) else None
+            bound = bound if isinstance(bound, dict) else binding
+            if not isinstance(bound, dict) or bound.get('state') != 'running':
+                state = bound.get('state') if isinstance(bound, dict) else None
+                attention = bound.get('attention') if isinstance(bound, dict) else None
+                reason = attention.get('reason') if isinstance(attention, dict) else None
+                detail = f' ({reason})' if isinstance(reason, str) and SAFE_ERROR.fullmatch(reason) else ''
+                raise SessionInputError(
+                    f'session_start_failed; session {created["id"]} reached {state or "an unconfirmed state"}{detail}; '
+                    f'reconcile with --key {key} via show/events'
+                )
         return created
     if cmd in ('cancel', 'protect'):
         from urllib.parse import quote
