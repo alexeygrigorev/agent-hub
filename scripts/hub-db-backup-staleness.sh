@@ -2,7 +2,7 @@
 # Hub DB backup staleness alert (intake c1241bea; mail hygiene 9806fc14).
 #
 # Newest export older than STALE_AFTER_HOURS (default 36) -> email to ALERT_TO
-# (default "alexey@datatalks.club,dev@dtcdev.click") via the working msmtp
+# (default "dev@dtcdev.click") via the working msmtp
 # alerts path (sendmail first, msmtp fallback — same order as
 # machine-management monitors/coolify-healthcheck.sh).
 #
@@ -55,7 +55,7 @@ log() { printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
 BACKUP_DIR="${BACKUP_DIR:-/var/backups/hub-do}"
 STORAGEBOX_DIR="${STORAGEBOX_DIR:-/home/alexey/storagebox/backups/hub-do}"
 STALE_AFTER_HOURS="${STALE_AFTER_HOURS:-36}"
-ALERT_TO="${ALERT_TO:-alexey@datatalks.club,dev@dtcdev.click}"
+ALERT_TO="${ALERT_TO:-dev@dtcdev.click}"
 ALERT_OPS_TO="${ALERT_OPS_TO:-dev@dtcdev.click}"
 ALERT_FROM="${ALERT_FROM:-noreply@datatalks.club}"
 ALERT_REPEAT_HOURS="${ALERT_REPEAT_HOURS:-24}"
