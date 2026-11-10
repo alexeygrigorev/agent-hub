@@ -5,6 +5,7 @@ export type ModelPolicyRoute = {
   model: string;
   effort?: string;
   account_id: string;
+  capabilities?: string[];
 };
 
 // Z.ai GLM is a pool member only through the canonical `zai` engine on the zai-central account.
@@ -36,6 +37,8 @@ export function modelPolicyCandidateViolation(candidate: ModelPolicyRoute): stri
   if (/luna/i.test(model) && candidate.effort !== 'max') return 'luna_effort_forbidden';
   if (requiresBoundedEffort(model) && candidate.effort !== 'low' && candidate.effort !== 'medium')
     return 'bounded_effort_required';
+  if (isExplicitOnlyModel(candidate) && !candidate.capabilities?.includes('review-only'))
+    return 'astra_review_only_required';
 
   return null;
 }

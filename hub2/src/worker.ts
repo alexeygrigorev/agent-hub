@@ -3,6 +3,7 @@ import { publicAuthentication, cookieActor, noStore } from './auth';
 import { safeEqual } from './crypto';
 import { bodyObject, boundedText, error, HttpError, json } from './http';
 import { pickModelRouteDetailed } from './model-picker';
+import { sessionPurpose } from './session-purpose';
 import { isLiveActiveSession, type LiveSession } from './session-liveness';
 import type { Actor, Hub2Env, JsonRecord } from './types';
 
@@ -546,6 +547,7 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
   }
   const key = body.key;
   if (typeof key !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}$/.test(key)) return error('idempotency_key_required', 400);
+  const purpose = sessionPurpose(body.purpose);
   const text = (field: string): string | undefined => typeof body[field] === 'string' && (body[field] as string).trim() ? (body[field] as string).trim() : undefined;
   const requestedProject = text('repo') ?? text('project');
   const repoWorkspace = requestedProject && /^[A-Za-z0-9_.-]{1,80}\/[A-Za-z0-9_.-]{1,100}$/.test(requestedProject)
@@ -619,7 +621,7 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
   const intakeId = (intake.data.intake as { id?: string } | undefined)?.id ?? (intake.data.id as string | undefined);
   if (!intake.response.ok || !intakeId) return json({ ...intake.data, error: intake.data.error ?? 'intake_create_failed', stage: 'intake' }, intake.response.ok ? 502 : intake.response.status);
   const start: JsonRecord = {
-    key, workspace, interactive, with_goal: body.with_goal === true,
+    key, workspace, interactive, purpose, with_goal: body.with_goal === true,
     ...(brief ? { prompt: brief } : {}),
     ...(text('machine') ? { machine_id: text('machine') } : {}),
     ...(text('engine') ? { engine: text('engine') } : {}),
@@ -649,6 +651,7 @@ async function dryRunPick(request: Request, env: Hub2Env, actor: Actor): Promise
   const text = (field: string): string | undefined => typeof body[field] === 'string' && (body[field] as string).trim() ? (body[field] as string).trim() : undefined;
   try {
     const { route, diagnostics } = await pickModelRouteDetailed(env, {
+      purpose: sessionPurpose(body.purpose),
       interactive: body.mode === 'interactive', with_goal: body.with_goal === true,
       ...(text('tier') ? { tier: text('tier') } : {}),
       ...(Array.isArray(body.needs) ? { required_capabilities: body.needs as string[] } : {}),

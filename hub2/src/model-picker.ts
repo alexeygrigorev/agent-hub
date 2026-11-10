@@ -1,6 +1,7 @@
 import { HttpError } from './http';
 import { isDeepWorkModel, isExplicitOnlyModel, isModelPolicyCandidateAllowed } from './model-policy';
 import type { Hub2Env } from './types';
+import { allowsAstra, sessionPurpose, type SessionPurpose } from './session-purpose';
 
 type Candidate = { id: string; engine: string; model: string; effort?: string; account_id: string; weight: number; capabilities: string[]; enabled: boolean };
 type AccountView = { credential_status?: string; account?: { min_remaining?: number; enabled?: boolean } | null; quota?: { remaining?: number } | null; hosts?: string[]; credential_usable?: boolean };
@@ -20,6 +21,7 @@ const DEEP_BIAS = 3;         // opus/sol multiplier for tier deep/complex/seriou
 const NEUTRAL_QUOTA = 50;    // pools without a collector reading (zai) get a neutral weight
 const DEEP_TIERS = new Set(['deep', 'complex', 'serious']);
 export type PickInput = {
+  purpose?: SessionPurpose;
   machine_id?: string; engine?: string; model?: string; effort?: string; override_reason?: string;
   tier?: string; interactive: boolean; with_goal?: boolean; required_capabilities?: string[]; exclude_policy_ids?: string[];
 };
@@ -50,6 +52,9 @@ export async function pickModelRoute(env: Hub2Env, input: PickInput, random = Ma
 }
 
 export async function pickModelRouteDetailed(env: Hub2Env, input: PickInput, random = Math.random): Promise<{ route: PickedRoute; diagnostics: PickDiagnostics }> {
+  const purpose = sessionPurpose(input.purpose);
+  if (input.model && /astra/i.test(input.model) && !allowsAstra(purpose))
+    throw new HttpError('astra_not_for_implementation', 400);
   if (input.with_goal && !input.interactive) throw new HttpError('goal_requires_interactive', 400);
   const override = !!(input.machine_id || input.engine || input.model || input.effort);
   if (override && (!input.override_reason?.trim() || input.override_reason.length > 500))
@@ -61,8 +66,12 @@ export async function pickModelRouteDetailed(env: Hub2Env, input: PickInput, ran
   const policy = await read(env.CONTROL, 'global', '/_routing-policy') as { version: unknown; candidates: Candidate[] };
   if (!Array.isArray(policy.candidates) || !policy.candidates.length || policy.candidates.length > 32)
     throw new HttpError('model_policy_unconfigured', 503);
+  if (input.model && !allowsAstra(purpose) && policy.candidates.some(candidate =>
+    (input.model === candidate.id || input.model === candidate.model) && isExplicitOnlyModel(candidate)))
+    throw new HttpError('astra_not_for_implementation', 400);
   const excluded=new Set(input.exclude_policy_ids||[]);
   const candidates = policy.candidates.filter(candidate => candidate.enabled && !excluded.has(candidate.id)
+    && (!isExplicitOnlyModel(candidate) || allowsAstra(purpose))
     && (candidate.id !== 'claude-fable-5-2' || input.model === candidate.id || input.model === candidate.model)
     && (!isExplicitOnlyModel(candidate) || (override && !!input.model && (input.model === candidate.model || input.model === candidate.id)))
     && isModelPolicyCandidateAllowed(candidate)

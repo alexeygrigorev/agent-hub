@@ -110,3 +110,13 @@ test('the pool spreads across several engines and quota accounts', () => {
   assert.ok(engines.size >= 3, `pool needs >=3 engines, has ${[...engines].join(',')}`);
   assert.ok(accounts.size >= 3, `pool needs >=3 quota accounts, has ${[...accounts].join(',')}`);
 });
+
+
+test('Astra policy writes require review-only capability for both id and model aliases',()=>{
+ const base={id:'review-route',engine:'codex',model:'gpt-6-astra',effort:'medium',account_id:'codex'};
+ for(const route of [base,{...base,id:'ASTRA-review',model:'synthetic'}]){
+  assert.equal(modelPolicyCandidateViolation(route),'astra_review_only_required');
+  assert.equal(modelPolicyCandidateViolation({...route,capabilities:['headless']}),'astra_review_only_required');
+  assert.equal(modelPolicyCandidateViolation({...route,capabilities:['review-only']}),null);
+ }
+});

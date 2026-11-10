@@ -4,6 +4,7 @@ import { sha256Hex } from './crypto';
 import { actorFrom, bodyObject, error, hasScope, HttpError, json } from './http';
 import { advanceDispatch } from './dispatch';
 import { pickModelRoute, type PickedRoute } from './model-picker';
+import { sessionPurpose } from './session-purpose';
 import { nativeReturncode } from './native-exit';
 import { PROJECT_WORK_SCHEMA, ProjectWork, type ProjectWorkHooks } from './project-work';
 import type { Actor, Hub2Env, JsonRecord } from './types';
@@ -354,6 +355,7 @@ export class ProjectDO {
     const engineInput = body.engine;
     const modelInput = body.model;
     const effortInput = body.effort;
+    const purpose = sessionPurpose(body.purpose);
     const reasonInput = body.override_reason === undefined ? body.reason : body.override_reason;
     const prompt = typeof body.prompt === 'string' ? body.prompt : intake.text;
     const interactive = body.interactive === undefined ? false : body.interactive;
@@ -382,6 +384,7 @@ export class ProjectDO {
       machine_id: machineInput ?? null, engine: engineInput ?? null, model: modelInput ?? null,
       effort: effortInput ?? null, override_reason: overrideReason ?? null,
       required_capabilities: requiredCapabilities, with_goal: withGoal,
+      ...(purpose !== 'implement' ? { purpose } : {}),
     };
     const digest = await sha256Hex(JSON.stringify({
       intake_id: intakeId, criteria, workspace, prompt, interactive,with_goal:withGoal, timeout_seconds: Number(timeoutSeconds), route: requestedRoute,
@@ -413,7 +416,7 @@ export class ProjectDO {
           ...(typeof effortInput === 'string' ? { effort: effortInput } : {}),
           ...(typeof body.tier === 'string' ? { tier: body.tier } : {}),
           ...(overrideReason ? { override_reason: overrideReason } : {}),
-          interactive, with_goal: withGoal, required_capabilities: requiredCapabilities,
+          interactive, purpose, with_goal: withGoal, required_capabilities: requiredCapabilities,
         });
     }
     const raced = this.idempotent(scope, key, digest);
@@ -425,7 +428,7 @@ export class ProjectDO {
     const accountId = route.engine.toLowerCase() === 'shell' ? null : route.account_id;
     const launchSpec = {
       workspace, engine: route.engine, model: route.model, ...(route.effort ? { effort: route.effort } : {}),
-      prompt, interactive,with_goal:withGoal, timeout_seconds: Number(timeoutSeconds),
+      prompt, interactive, purpose, with_goal:withGoal, timeout_seconds: Number(timeoutSeconds),
       ...(route.engine.toLowerCase() === 'shell' ? { shell_reason: overrideReason } : {}),
     };
     const now = Date.now();
@@ -681,6 +684,7 @@ export class ProjectDO {
     try{
       const launch=this.parse(saga.launch_spec_json) as JsonRecord;
       next=await pickModelRoute(this.env,{interactive:launch.interactive===true,
+        purpose: sessionPurpose(launch.purpose),
         with_goal:launch.with_goal===true,required_capabilities:route.required_capabilities,exclude_policy_ids:tried});
     }catch(caught){
       if(caught instanceof HttpError&&caught.code==='model_policy_unavailable')return await fail('all_model_routes_auth_failed');
