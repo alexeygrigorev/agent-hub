@@ -575,6 +575,9 @@ def add_commands(sub):
     count.add_argument('--by', default='host,engine,account',
                        help='Comma-separated grouping: any of host,engine,account (default host,engine,account)')
     count.add_argument('--json', action='store_true', help='Output machine-readable JSON')
+    pick = commands.add_parser('pick', help='Dry run: show the engine/model/effort the Hub picker would choose now (starts nothing)')
+    pick.add_argument('--tier', choices=TIERS, help='deep/complex tasks bias toward opus/sol')
+    pick.add_argument('--json', action='store_true', help='Output machine-readable JSON')
     reap = commands.add_parser('reap', help='Find and stop inactive Hub sessions across hosts')
     reap.add_argument('--dry-run', action='store_true', help='Show inactive sessions without stopping or marking them stopped')
     reap.add_argument('--json', action='store_true', help='Output machine-readable JSON')
@@ -906,6 +909,8 @@ def _execute(args):
         if getattr(args, 'export', False):
             return request('GET', '/api/sessions/audit/export?limit=%d' % max(1, min(20000, int(getattr(args, 'limit', None) or 5000))))
         return request('GET', '/api/sessions/audit?last=%d' % max(1, min(50, int(getattr(args, 'last', None) or 5))))
+    if cmd == 'pick':
+        return request('POST', '/api/model-picker/pick', {'tier': args.tier} if getattr(args, 'tier', None) else {})
     if cmd == 'count':
         from urllib.parse import quote
         by = normalize_breakdown_dims(getattr(args, 'by', None))
@@ -1498,6 +1503,14 @@ def render_output(args, result):
         if isinstance(result, dict) and 'active_count' in result:
             text += f"\nActive sessions: {result['active_count']}"
         return text
+    if cmd == 'pick':
+        lines = [f"Picked route: {result.get('route')} (policy {result.get('policy_id')}, host {result.get('machine_id')})"]
+        lines += [f"  pool  {row['policy_id']:<24} {row['share'] * 100:5.1f}%" for row in result.get('pool', [])]
+        lines += [f"  EXCLUDED {row['policy_id']} ({row['reason']})" for row in result.get('excluded', [])]
+        return '\n'.join(lines)
+    if cmd == 'start' and isinstance(result, dict) and result.get('route'):
+        print(f"Picked route: {result['route']} (engine={result.get('engine')} model={result.get('model')} effort={result.get('effort') or 'default'})", file=sys.stderr)
+        return result
     if cmd == 'warnings':
         lines = []
         for row in result.get('warnings', []):

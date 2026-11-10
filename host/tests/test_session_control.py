@@ -238,6 +238,23 @@ class TestSessionControlCli(unittest.TestCase):
         self.assertIs(actual, result)
         self.assertIn('live active count 12 -> 12', session_control.render_output(args, result))
 
+    def test_pick_is_a_dry_run_and_start_reports_the_chosen_route(self):
+        args = self.parse('pick', '--tier', 'deep')
+        result = {'route': 'claude/opus/medium', 'policy_id': 'claude-opus-medium', 'machine_id': 'h1',
+                  'pool': [{'policy_id': 'claude-opus-medium', 'share': 0.25}],
+                  'excluded': [{'policy_id': 'x', 'reason': 'credential_expired'}]}
+        with patch.object(session_control, 'request', return_value=result) as transport:
+            actual = session_control.execute(args)
+        transport.assert_called_once_with('POST', '/api/model-picker/pick', {'tier': 'deep'})
+        text = session_control.render_output(args, actual)
+        self.assertIn('Picked route: claude/opus/medium', text)
+        self.assertIn('EXCLUDED x (credential_expired)', text)
+        started = {'route': 'codex/gpt-6-luna/max', 'engine': 'codex', 'model': 'gpt-6-luna', 'effort': 'max'}
+        err = io.StringIO()
+        with patch.object(sys, 'stderr', err):
+            self.assertIs(session_control.render_output(argparse.Namespace(sessions_cmd='start', json=False), started), started)
+        self.assertIn('Picked route: codex/gpt-6-luna/max', err.getvalue())
+
     def test_inputs_are_bounded(self):
         with self.assertRaises(ValueError):
             session_control.read_file(__file__, limit=10)

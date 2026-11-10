@@ -2,6 +2,7 @@ import { mcp } from './mcp';
 import { publicAuthentication, cookieActor, noStore } from './auth';
 import { safeEqual } from './crypto';
 import { bodyObject, boundedText, error, HttpError, json } from './http';
+import { pickModelRouteDetailed } from './model-picker';
 import { isLiveActiveSession, type LiveSession } from './session-liveness';
 import type { Actor, Hub2Env, JsonRecord } from './types';
 
@@ -102,6 +103,8 @@ const router = {
         );
       if (path === '/api/sessions' && request.method !== 'GET' && request.method !== 'HEAD')
         return request.method === 'POST' ? await startSession(request, env, actor) : error('method_not_allowed', 405);
+      if (path === '/api/model-picker/pick')
+        return request.method === 'POST' ? await dryRunPick(request, env, actor) : error('method_not_allowed', 405);
       if (path === '/api/sessions/reap')
         return request.method === 'POST' ? await reapSessions(request, env, actor) : error('method_not_allowed', 405);
       if (path === '/api/fleet' || path === '/api/fleet/machines' || path === '/api/sessions')
@@ -622,6 +625,7 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
     ...(text('engine') ? { engine: text('engine') } : {}),
     ...(text('model') ? { model: text('model') } : {}),
     ...(text('effort') ? { effort: text('effort') } : {}),
+    ...(text('tier') ? { tier: text('tier') } : {}),
     ...(text('engine_override_reason') ? { override_reason: text('engine_override_reason') } : {}),
     ...(Array.isArray(body.needs) ? { required_capabilities: body.needs } : {}),
   };
@@ -631,6 +635,30 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
     return json({ ...started.data, error: started.data.error ?? 'session_start_failed', stage: 'start', intake_id: intakeId }, started.response.ok ? 502 : started.response.status);
   // 201 = offered to the host; 202 = accepted and dispatching.
   return json({ ...session, project: canonical, intake_id: intakeId }, started.response.status);
+}
+
+/** `POST /api/model-picker/pick`: what the picker would choose right now (nothing is started). */
+async function dryRunPick(request: Request, env: Hub2Env, actor: Actor): Promise<Response> {
+  if (!admin(actor) && !actor.scopes.includes('session:start')) return error('forbidden', 403);
+  let body: JsonRecord = {};
+  try {
+    const raw = await boundedText(request, 4096);
+    if (raw.trim()) body = JSON.parse(raw) as JsonRecord;
+  } catch { return error('invalid_json', 400); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return error('invalid_json_object', 400);
+  const text = (field: string): string | undefined => typeof body[field] === 'string' && (body[field] as string).trim() ? (body[field] as string).trim() : undefined;
+  try {
+    const { route, diagnostics } = await pickModelRouteDetailed(env, {
+      interactive: body.mode === 'interactive', with_goal: body.with_goal === true,
+      ...(text('tier') ? { tier: text('tier') } : {}),
+      ...(Array.isArray(body.needs) ? { required_capabilities: body.needs as string[] } : {}),
+    });
+    return json({ route: [route.engine, route.model, route.effort ?? 'default'].join('/'), engine: route.engine, model: route.model,
+      effort: route.effort ?? null, policy_id: route.policy_id, machine_id: route.machine_id, ...diagnostics });
+  } catch (caught) {
+    if (caught instanceof HttpError) return error(caught.code, caught.status);
+    throw caught;
+  }
 }
 
 function safetyModeForRequest(

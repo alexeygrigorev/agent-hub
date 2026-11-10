@@ -51,8 +51,11 @@ test('the Hub policy validator accepts the committed pool and rejects banned can
     capabilities: [], enabled: true, ...overrides,
   });
   assert.equal(modelPolicyCandidateViolation(route({id: 'zai-central', engine: 'zcodex', model: 'glm-flash', account_id: 'zai-central'})), 'zai_picker_route_forbidden');
+  assert.equal(modelPolicyCandidateViolation(route({id: 'zai-glm', engine: 'zai', model: 'glm-5.3-flash', account_id: 'shared-zai'})), 'zai_picker_route_forbidden');
+  assert.equal(modelPolicyCandidateViolation(route({id: 'zai-glm', engine: 'zai', model: 'glm-5.3-flash', account_id: 'zai-central'})), null);
   assert.equal(modelPolicyCandidateViolation(route({engine: 'claude', model: 'haiku', effort: 'medium'})), 'haiku_picker_route_forbidden');
-  assert.equal(modelPolicyCandidateViolation(route({engine: 'claude', model: 'opus', effort: 'medium'})), 'claude_picker_route_forbidden');
+  assert.equal(modelPolicyCandidateViolation(route({engine: 'claude', model: 'opus', effort: 'medium'})), null);
+  assert.equal(modelPolicyCandidateViolation(route({engine: 'claude', model: 'opus', effort: 'max'})), 'claude_picker_route_forbidden');
   assert.equal(modelPolicyCandidateViolation(route({id: 'claude-fable-5-2', engine: 'claude', model: 'fable', effort: 'medium', account_id: 'claude'})), null);
   assert.equal(modelPolicyCandidateViolation(route({engine: 'claude', model: 'fable', effort: 'medium'})), 'claude_picker_route_forbidden');
   assert.equal(modelPolicyCandidateViolation(route({model: 'gpt-6-luna', effort: 'medium'})), 'luna_effort_forbidden');
@@ -61,22 +64,25 @@ test('the Hub policy validator accepts the committed pool and rejects banned can
   assert.equal(modelPolicyCandidateViolation(route({model: 'gemini-4-argon-medium', effort: 'max'})), 'bounded_effort_required');
 });
 
-test('no zai-central: the picker never spends the shared zai route', () => {
+test('zai appears only as the canonical zai engine on zai-central; astra stays out of the default pool', () => {
   for (const candidate of policy.candidates) {
-    assert.notEqual(candidate.account_id, 'zai-central');
-    assert.ok(!['zai', 'zcodex', 'goz'].includes(candidate.engine), `candidate ${candidate.id} routes through zai`);
+    assert.ok(!['zcodex', 'goz'].includes(candidate.engine), `candidate ${candidate.id} routes through a legacy zai engine`);
+    if (candidate.engine === 'zai') assert.equal(candidate.account_id, 'zai-central');
+    assert.ok(!/astra/i.test(candidate.model + ' ' + candidate.id), 'astra is explicit-only, never a default candidate');
   }
+  assert.ok(policy.candidates.some(candidate => candidate.engine === 'zai'), 'Z.ai GLM is part of the pool');
 });
 
 test('no haiku anywhere in the pool', () => {
   for (const candidate of policy.candidates) assert.ok(!/haiku/i.test(candidate.model + ' ' + candidate.id));
 });
 
-test('claude keeps Sonnet default and exposes Fable only under its explicit policy id', () => {
+test('claude exposes Sonnet and Opus by default and Fable only under its explicit policy id', () => {
   const claude = policy.candidates.filter(candidate => candidate.engine === 'claude');
   assert.deepEqual(claude.map(candidate => [candidate.id, candidate.model, candidate.effort]), [
     ['claude-sonnet-medium', 'sonnet', 'medium'],
     ['claude-fable-5-2', 'fable', 'medium'],
+    ['claude-opus-medium', 'opus', 'medium'],
   ]);
 });
 
