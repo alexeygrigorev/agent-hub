@@ -12,6 +12,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from agent_hub_host import task_output as output
 from agent_hub_host import native_launch
+from agent_hub_host.client import Client
 
 
 class TaskOutputTest(unittest.TestCase):
@@ -105,7 +106,22 @@ class TaskOutputTest(unittest.TestCase):
     def test_ack_payload_including_escaped_controls_is_bounded(self):
         for data in ['x'*20000,'\x00'*20000,'😀'*20000]:
             bounded=output.bounded_capture(data)
-            self.assertLessEqual(len(json.dumps({'output':bounded},ensure_ascii=False).encode()),8000)
+            self.assertLessEqual(len(json.dumps({'output':bounded},ensure_ascii=True).encode()),8000)
+            self.assertLess(len(json.dumps({'epoch':2,'result':{'output':bounded}}).encode()),12288)
+
+    def test_actual_client_serialization_fits_command_ack_limits(self):
+        for text in ['😀'*20000, '\x00'*20000, 'я'*20000]:
+            with self.subTest(text_type=text[0]):
+                payload={'epoch':2,'result':{'output':output.bounded_capture(text)}}
+                response=mock.MagicMock()
+                response.__enter__.return_value.read.return_value=b'{"ok":true}'
+                opener=mock.MagicMock();opener.open.return_value=response
+                with mock.patch('urllib.request.build_opener',return_value=opener):
+                    Client('https://hub.test').request('POST','/api/sessions/s/commands/c/ack',payload)
+                request=opener.open.call_args.args[0]
+                self.assertLess(len(request.data),12288)
+                decoded=json.loads(request.data)
+                self.assertLess(len(json.dumps(decoded['result'],ensure_ascii=False).encode()),8192)
 
     def test_profile_launch_passes_exact_output_directory_and_records_binding(self):
         config={'routes':{'codex':{'provider':'codex','profile':'local-codex'}}}
@@ -118,3 +134,4 @@ class TaskOutputTest(unittest.TestCase):
     def test_unsupported_platform_keeps_existing_launch_path(self):
         with mock.patch.object(os,'supports_dir_fd',set()):
             self.assertIsNone(output.prepare_output(self.task,self.spec,'local','codex','prompt'))
+            self.assertIsNone(self.capture())

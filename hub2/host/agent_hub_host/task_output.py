@@ -80,6 +80,8 @@ def same_path(value, expected):
 
 def capture_task_output(task_id, expected, native_id, limit=16384):
     """None selects legacy/interactive PTY capture; empty means task not ready yet."""
+    if os.open not in os.supports_dir_fd or not hasattr(os, 'O_NOFOLLOW'):
+        return None
     workspace = expected['workspace']
     try:
         record = json.loads(read_beneath(workspace, ('.local', 'launch-' + task_id + '.json'), 65536))
@@ -124,6 +126,6 @@ def capture_task_output(task_id, expected, native_id, limit=16384):
 def bounded_capture(output):
     # Command acknowledgements have an 8192-byte JSON ceiling, including escapes.
     output = output.encode('utf8', errors='replace')[-4096:].decode('utf8', errors='replace')
-    while len(json.dumps({'output': output}, ensure_ascii=False).encode()) > 8000:
+    while len(json.dumps({'output': output}, ensure_ascii=True).encode()) > 8000:
         output = output[max(1, len(output) // 4):]
     return output

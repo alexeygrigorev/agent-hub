@@ -56,8 +56,9 @@ class Canary:
         # The complete expected output never occurs in the model prompt. A
         # wrapped echo of the prompt therefore cannot count as execution.
         self.prompt = PROMPTS["shell"] if mode == "shell" else (
-            f'Run one shell command that prints the concatenation of "CANARY-", "OK:", and "{run_id}" '
-            'as one output line, then sleeps for 60 seconds so the orchestrator can stop this session. '
+            f'Use two sequential tool calls. First run a shell command that prints the concatenation of "CANARY-", "OK:", and "{run_id}" '
+            'as one output line and exits immediately. After that tool call completes, use a separate tool call to run sleep 60 '
+            'so the orchestrator can stop this session. Do not combine printing and sleeping in one tool call. '
             'Do not edit files or start another agent.')
         self.session = self.native = None
         self.started_at = self.running_deadline = None

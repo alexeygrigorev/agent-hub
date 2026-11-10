@@ -472,7 +472,8 @@ class Bridge:
         self.begin_command(identity, digest)
         if kind == "capture":
             from .task_output import capture_task_output, bounded_capture
-            output = capture_task_output("hub2-" + row["session_id"], row, native_id)
+            output = (None if command.get("mode") == "screen" else
+                      capture_task_output("hub2-" + row["session_id"], row, native_id))
             if output is None:
                 output = self.native("capture", native_id, "--screen", "--plain").stdout[:16384]
             result = {"output": bounded_capture(output)}
