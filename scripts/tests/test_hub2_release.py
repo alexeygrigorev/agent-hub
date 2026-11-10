@@ -53,14 +53,17 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
         self.files = {name: ('artifact:' + name).encode() for name in
                       (HOST, 'websockets-16.0-py3-none-any.whl', 'hub.pyz',
                        'hub2-self-update.py', 'hub2-enroll.py', 'host-install.sh', *updater.UNITS)}
+        self.files['manifest.json'] = json.dumps({'built_at_ms': 1000}).encode()
         self.manifest = {'schema_version': 1, 'protocol_version': 1, 'host_version': SHA,
                          'python_requires': '>=3.11',
                          'artifacts': {name: {'sha256': hashlib.sha256(data).hexdigest(), 'size': len(data)}
                                        for name, data in self.files.items()}}
         self.calls = []
+        self.downloads = []
 
     def fetch(self, url, limit):
         name = url.rsplit('/', 1)[1]
+        self.downloads.append(name)
         return json.dumps(self.manifest).encode() if name == 'host-release.json' else self.files[name]
 
     def command(self, args):
@@ -222,10 +225,272 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
         self.assertFalse((self.root / 'current').is_symlink())
         self.assertFalse((self.root / 'releases' / SHA).exists())
 
-    def test_initial_staging_does_not_start_timer_before_enrollment(self):
-        with patch.object(Path, 'home', return_value=Path(self.temporary.name)):
+    def test_initial_staging_writes_units_without_enabling_or_starting_them(self):
+        self.install(install_service=True, restart=False)
+        units = Path(self.temporary.name) / '.config/systemd/user'
+        self.assertEqual([path.name for path in sorted(units.iterdir())], sorted(updater.UNITS))
+        self.assertEqual([args for args in self.calls if args[0] == 'systemctl'],
+                         [['systemctl', '--user', 'daemon-reload']])
+
+    def test_direct_install_restarts_for_new_release_before_enabling_timer(self):
+        old = self.old_release()
+        self.install(install_service=True)
+        self.assertEqual((self.root / 'previous').resolve(), old)
+        self.assertEqual((self.root / 'current').resolve().name, SHA)
+        self.assertTrue(any(args[2:] == ['restart', updater.UNITS[0]] for args in self.calls))
+        heartbeat = next(i for i, args in enumerate(self.calls) if args[-1] == 'heartbeat')
+        daemon_enabled = self.calls.index(['systemctl', '--user', 'enable', updater.UNITS[0]])
+        timer_enabled = self.calls.index(['systemctl', '--user', 'enable', '--now', updater.UNITS[2]])
+        self.assertLess(heartbeat, daemon_enabled)
+        self.assertLess(daemon_enabled, timer_enabled)
+        self.assertEqual(self.calls[heartbeat + 1], ['systemctl', '--user', 'is-active', '--quiet', updater.UNITS[0]])
+
+    def test_direct_install_heartbeat_failure_leaves_timer_unenabled(self):
+        def failed_heartbeat(args):
+            self.calls.append([str(value) for value in args])
+            if args[-1] == 'heartbeat':
+                raise RuntimeError('unauthorized heartbeat')
+        self.command = failed_heartbeat
+        with self.assertRaisesRegex(RuntimeError, 'unauthorized heartbeat'):
+            self.install(install_service=True)
+        self.assertFalse(any('enable' in args for args in self.calls))
+        self.assertFalse((self.root / 'current').is_symlink())
+
+    def test_explicit_install_fails_during_backoff_but_normal_update_defers(self):
+        old = self.old_release()
+        (self.root / 'failed-releases.json').write_text(json.dumps({SHA: {'retry_at': 4102444800}}))
+        for restart in (True, False):
+            with self.subTest(restart=restart), self.assertRaisesRegex(RuntimeError, 'activation backoff'):
+                self.install(install_service=True, restart=restart)
+        self.install()
+        self.assertEqual(self.calls, [])
+        self.assertEqual((self.root / 'current').resolve(), old)
+        self.assertFalse((self.root / 'releases' / SHA).exists())
+
+    def test_updater_replacement_failure_rolls_back_without_enabling_timer(self):
+        old = self.old_release()
+        installed_updater = self.root / 'updater.py'
+        installed_updater.write_bytes(b'old updater')
+        replace = Path.replace
+
+        def fail_replace(path, target):
+            if target == installed_updater:
+                raise OSError('updater publication failed')
+            return replace(path, target)
+
+        with patch.object(Path, 'replace', fail_replace), self.assertRaisesRegex(OSError, 'publication failed'):
+            self.install(install_service=True)
+        self.assertEqual((self.root / 'current').resolve(), old)
+        self.assertEqual(installed_updater.read_bytes(), b'old updater')
+        self.assertFalse(any('enable' in args for args in self.calls))
+
+    def test_timer_enable_failure_leaves_committed_release_for_no_restart_retry(self):
+        old = self.old_release()
+        timer_enable = ['systemctl', '--user', 'enable', '--now', updater.UNITS[2]]
+        record_command = self.command
+
+        def fail_enable(args):
+            record_command(args)
+            if args == timer_enable:
+                raise RuntimeError('timer enable failed')
+
+        self.command = fail_enable
+        with self.assertRaisesRegex(RuntimeError, 'timer enable failed'):
+            self.install(install_service=True)
+        target = (self.root / 'current').resolve()
+        self.assertEqual(target.name, SHA)
+        self.assertEqual((self.root / 'previous').resolve(), old)
+        self.assertFalse((target / '.installing').exists())
+        self.assertFalse((self.root / 'failed-releases.json').exists())
+        self.assertEqual((self.root / 'updater.py').read_bytes(), self.files['hub2-self-update.py'])
+        self.command = record_command
+        self.calls.clear()
+        self.install(install_service=True)
+        self.assertIn(['systemctl', '--user', 'start', updater.UNITS[0]], self.calls)
+        self.assertIn(timer_enable, self.calls)
+        self.assertFalse(any('restart' in args for args in self.calls))
+        self.assertEqual((self.root / 'current').resolve(), target)
+
+    def test_same_version_rebuild_repairs_only_shared_artifacts_without_restart(self):
+        self.install(install_service=True, restart=False)
+        target = (self.root / 'current').resolve()
+        old_receipt = (target / 'release.json').read_bytes()
+        old_cli = (target / 'hub.pyz').read_bytes()
+        old_enroller = (target / 'hub2-enroll.py').read_bytes()
+        rebuilt = {'hub.pyz': b'rebuilt cli', HOST: b'rebuilt host wheel',
+                   'manifest.json': json.dumps({'built_at_ms': 123456}).encode()}
+        for name, data in rebuilt.items():
+            self.files[name] = data
+            self.manifest['artifacts'][name] = {'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+        units = Path(self.temporary.name) / '.config/systemd/user'
+        (units / updater.UNITS[1]).write_text('outdated')
+        (units / updater.UNITS[2]).unlink()
+        (self.root / 'updater.py').unlink()
+        self.calls.clear()
+        self.downloads.clear()
+        self.install(install_service=True, restart=False)
+        self.assertCountEqual(self.downloads, ['host-release.json', 'hub2-self-update.py', *updater.UNITS[1:]])
+        self.assertEqual((target / 'release.json').read_bytes(), old_receipt)
+        self.assertEqual((target / 'hub.pyz').read_bytes(), old_cli)
+        self.assertEqual((target / 'hub2-enroll.py').read_bytes(), old_enroller)
+        for name in updater.UNITS:
+            self.assertEqual((units / name).read_bytes(), self.files[name])
+        self.assertEqual((self.root / 'updater.py').read_bytes(), self.files['hub2-self-update.py'])
+        self.assertEqual((self.root / 'current').resolve(), target)
+        self.assertFalse((target / '.installing').exists())
+        self.assertFalse(any('venv' in args for args in self.calls))
+        self.assertEqual([args for args in self.calls if args[0] == 'systemctl'],
+                         [['systemctl', '--user', 'daemon-reload']])
+        self.calls.clear()
+        self.install()
+        self.assertEqual(self.calls, [])
+
+    def test_same_version_stage_rejects_changed_protocol_or_service_records(self):
+        self.install(install_service=True, restart=False)
+        units = Path(self.temporary.name) / '.config/systemd/user'
+        timer = units / updater.UNITS[2]
+        timer.unlink()
+        artifacts = self.manifest['artifacts']
+        cases = [
+            ('protocol', {'protocol_version': 2}, 'release identity'),
+            ('timer checksum', {'artifacts': {**artifacts, updater.UNITS[2]: {**artifacts[updater.UNITS[2]], 'sha256': '0' * 64}}},
+             'service artifact mismatch'),
+            ('updater size', {'artifacts': {**artifacts, 'hub2-self-update.py': {**artifacts['hub2-self-update.py'], 'size': 1}}},
+             'service artifact mismatch'),
+        ]
+        for case, fields, error in cases:
+            with self.subTest(case=case), patch.dict(self.manifest, fields):
+                self.calls.clear()
+                self.downloads.clear()
+                with self.assertRaisesRegex(ValueError, error):
+                    self.install(install_service=True, restart=False)
+                self.assertEqual(self.downloads, ['host-release.json'])
+                self.assertEqual(self.calls, [])
+                self.assertFalse(timer.exists())
+
+    def test_same_version_stage_requires_a_valid_local_receipt_and_enroller(self):
+        self.install(install_service=True, restart=False)
+        target = (self.root / 'current').resolve()
+        receipt = target / 'release.json'
+        original = receipt.read_bytes()
+        receipt.write_text('[]')
+        with self.assertRaisesRegex(ValueError, 'unsupported release protocol'):
             self.install(install_service=True, restart=False)
-        self.assertFalse(any('start' in args or 'restart' in args for args in self.calls))
+        receipt.write_bytes(original)
+        (target / 'hub2-enroll.py').write_bytes(b'tampered')
+        with self.assertRaisesRegex(ValueError, 'installed release artifact mismatch: hub2-enroll.py'):
+            self.install(install_service=True, restart=False)
+
+    def test_same_version_stage_refuses_corrupt_repair_before_writing_units(self):
+        self.install(install_service=True, restart=False)
+        units = Path(self.temporary.name) / '.config/systemd/user'
+        (units / updater.UNITS[1]).unlink()
+        (units / updater.UNITS[2]).unlink()
+        self.files[updater.UNITS[2]] = b'corrupt'
+        self.calls.clear()
+        with self.assertRaisesRegex(ValueError, 'checksum mismatch'):
+            self.install(install_service=True, restart=False)
+        self.assertFalse((units / updater.UNITS[1]).exists())
+        self.assertFalse((units / updater.UNITS[2]).exists())
+        self.assertFalse(any(args[0] == 'systemctl' for args in self.calls))
+
+    def test_shell_starts_only_daemon_until_enrollment_and_readiness_succeed(self):
+        for scenario in ('fresh', 'enroll', 'start', 'is-active', 'heartbeat', 'enrolled', 'backoff'):
+            enrolled = scenario in ('enrolled', 'backoff')
+            failure = '' if scenario in ('fresh', 'enrolled') else scenario
+            with self.subTest(scenario=scenario):
+                home = Path(self.temporary.name) / ('shell-' + scenario)
+                root = home / '.local/share/agent-hub2'
+                current = root / 'current'
+                target = root / 'releases' / OLD_SHA
+                current_bin = target / 'bin'
+                current_bin.mkdir(parents=True)
+                (target / 'release.json').write_text(json.dumps({'host_version': OLD_SHA}))
+                current.symlink_to(target)
+                fake_bin = home / 'fake-bin'
+                fake_bin.mkdir()
+                log = home / 'commands.jsonl'
+                config = home / '.config/agent-hub/v2.json'
+                if enrolled:
+                    config.parent.mkdir(parents=True)
+                    config.write_text('{}')
+                shim = home / 'downloaded.py'
+                shim.write_text(f"""
+import json, os, runpy, sys, time
+if '--no-restart' in sys.argv:
+    assert '--install-service' in sys.argv
+    with open(os.environ['INSTALL_TEST_LOG'], 'a') as stream:
+        stream.write(json.dumps(['stage']) + '\\n')
+elif '--install-service' in sys.argv:
+    with open(os.environ['INSTALL_TEST_LOG'], 'a') as stream:
+        stream.write(json.dumps(['restart-install']) + '\\n')
+    if os.environ['INSTALL_TEST_FAIL'] == 'backoff':
+        sys.exit(1)
+else:
+    time.sleep = lambda _: None
+    runpy.run_path({str(REPO / 'scripts/hub2-self-update.py')!r}, run_name='__main__')
+""")
+                stub = fake_bin / 'stub'
+                stub.write_text(f"""#!{sys.executable}
+import json, os, shutil, sys
+from pathlib import Path
+name = Path(sys.argv[0]).name
+args = sys.argv[1:]
+config = Path(os.environ['INSTALL_TEST_CONFIG'])
+if name == 'curl':
+    shutil.copyfile(os.environ['INSTALL_TEST_UPDATER'], args[args.index('-o')+1])
+    sys.exit(0)
+if name == 'hub2-enroll.py':
+    event = 'enroll'
+elif name == 'systemctl':
+    event = args[1]
+    assert args[0] == '--user'
+elif name == 'hub2':
+    assert args == ['heartbeat']
+    event = 'heartbeat'
+else:
+    assert name == 'loginctl'
+    event = name
+with open(os.environ['INSTALL_TEST_LOG'], 'a') as stream:
+    stream.write(json.dumps([event, *args]) + '\\n')
+if event == os.environ['INSTALL_TEST_FAIL']:
+    sys.exit(1)
+if event == 'enroll':
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text('{{}}')
+elif event in ('start', 'heartbeat', 'enable'):
+    assert config.is_file()
+""")
+                stub.chmod(0o700)
+                for name in ('curl', 'loginctl', 'systemctl'):
+                    (fake_bin / name).symlink_to(stub)
+                (fake_bin / 'python3').symlink_to(sys.executable)
+                (current_bin / 'python').symlink_to(sys.executable)
+                (current_bin / 'hub2').symlink_to(stub)
+                (current / 'hub2-enroll.py').symlink_to(stub)
+                result = subprocess.run(['/bin/sh', str(REPO / 'deploy/host-install.sh')],
+                                        env={**os.environ, 'HOME': str(home), 'PATH': str(fake_bin)+':/usr/bin:/bin',
+                                             'HUB_BASE_URL': 'https://example.invalid', 'HUB_WORKSPACE_ROOT': str(home),
+                                             'INSTALL_TEST_LOG': str(log), 'INSTALL_TEST_CONFIG': str(config),
+                                             'INSTALL_TEST_UPDATER': str(shim), 'INSTALL_TEST_FAIL': failure},
+                                        capture_output=True, text=True, timeout=10)
+                commands = [json.loads(line) for line in log.read_text().splitlines()]
+                events = [args[0] for args in commands]
+                if enrolled:
+                    self.assertEqual(events, ['loginctl', 'restart-install'])
+                    self.assertEqual(result.returncode, 1 if failure else 0, result.stderr)
+                    self.assertEqual('installed and enrolled' in result.stdout, not failure)
+                elif failure:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(events[-1], failure)
+                    self.assertNotIn('enable', events)
+                    self.assertFalse(any(updater.UNITS[2] in args for args in commands))
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(events, ['stage', 'enroll', 'loginctl', 'start', *(['is-active'] * 6),
+                                              'heartbeat', 'is-active', 'enable', 'enable'])
+                    self.assertEqual(commands[3], ['start', '--user', 'start', updater.UNITS[0]])
+                    self.assertEqual(commands[-1], ['enable', '--user', 'enable', '--now', updater.UNITS[2]])
 
     def test_reject_unsafe_manifest_and_protocol_before_install(self):
         for key, value in [('protocol_version', 0), ('host_version', '../invalid'), ('python_requires', '>=99.0')]:
