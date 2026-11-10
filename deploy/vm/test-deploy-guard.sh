@@ -14,8 +14,11 @@ WORKFLOW="$ROOT/.github/workflows/deploy.yml"
 grep -Fq 'https://gate.dtcdev.click/' "$WORKFLOW" || fail 'missing public TLS smoke'
 grep -Fq 'https://gate.dtcdev.click/v1/health' "$WORKFLOW" \
   || fail 'missing authenticated, non-mutating desktop grant smoke'
-grep -Fq 'rewrite @desktop_health /v1/check?resource=browser&scope=desktop' "$ROOT/deploy/Caddyfile" \
-  || fail 'missing /v1/health rewrite to the authenticated, non-mutating desktop grant check'
+# Gate routing (incl. the /v1/health rewrite) is owned by aws-infra, not Hub.
+! grep -Eq 'gate\.dtcdev\.click|8791|desktop_health' "$ROOT/deploy/hub.caddy" \
+  || fail 'Hub site must not contain Gate routing'
+! grep -Fq 'install -m 644 "$DEPLOY_DIR/Caddyfile"' "$ROOT/deploy/vm/install-hub2-node.sh" \
+  || fail 'installer must not replace the shared Caddyfile'
 grep -Fq 'verify_gate:' "$WORKFLOW" || fail 'missing explicit Hub-only gate-probe exception'
 grep -Fq 'default: true' "$WORKFLOW" || fail 'gate probes are not enabled by default'
 [[ "$(grep -Fc 'if: inputs.verify_gate' "$WORKFLOW")" == 2 ]] \

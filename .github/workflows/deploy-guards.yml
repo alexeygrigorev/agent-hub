@@ -1,0 +1,21 @@
+name: deploy-guards
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  deploy-guards:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy guard tests
+        run: |
+          set -euo pipefail
+          bash -n deploy/vm/*.sh
+          bash deploy/vm/test-hub-site-ownership.sh
+          bash deploy/vm/test-hub-only-installer.sh
+          bash deploy/vm/test-deploy-guard.sh
