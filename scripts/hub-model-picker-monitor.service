@@ -1,0 +1,6 @@
+[Unit]
+Description=Mail dev@ when the Hub model picker excludes a candidate for expired credentials
+
+[Service]
+Type=oneshot
+ExecStart=%h/git/agent-hub/scripts/hub-model-picker-monitor.sh

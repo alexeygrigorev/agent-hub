@@ -411,6 +411,7 @@ export class ProjectDO {
           ...(typeof engineInput === 'string' ? { engine: engineInput } : {}),
           ...(typeof modelInput === 'string' ? { model: modelInput } : {}),
           ...(typeof effortInput === 'string' ? { effort: effortInput } : {}),
+          ...(typeof body.tier === 'string' ? { tier: body.tier } : {}),
           ...(overrideReason ? { override_reason: overrideReason } : {}),
           interactive, with_goal: withGoal, required_capabilities: requiredCapabilities,
         });
@@ -970,7 +971,8 @@ export class ProjectDO {
       attempt: saga.attempt, next_action_at: saga.next_action_at,
       ...(() => {
         const launch = this.parse(saga.launch_spec_json) as JsonRecord | null;
-        return launch ? { engine: launch.engine, model: launch.model, effort: launch.effort ?? null } : {};
+        return launch ? { engine: launch.engine, model: launch.model, effort: launch.effort ?? null,
+          route: [launch.engine, launch.model, launch.effort ?? 'default'].join('/') } : {};
       })(),
     };
   }
