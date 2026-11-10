@@ -12,8 +12,6 @@
   process and pane activity. DB session state alone does not count as active.
 - Reap dead, exited, and six-hour-idle sessions every three minutes. Confirmed
   stops release the live count immediately. Provide `hub sessions reap --dry-run`.
-- Keep the desktop Resource Gate, its VM, Caddy/TLS, and its systemd service
-  outside this change.
 
 ## Consequences
 

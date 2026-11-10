@@ -84,7 +84,7 @@ remove_transaction_state() {
 }
 
 restore_previous_release() {
-  local previous_sha vars_present gate_mode site_present
+  local previous_sha vars_present caddy_mode site_present
   if ! run_root test -f "$TRANSACTION_DIR/prepared"; then
     printf 'No pending deploy transaction; nothing to roll back.\n'
     return 0
@@ -101,14 +101,14 @@ restore_previous_release() {
   git -C "$REPO" checkout --detach --force "$previous_sha" || return 1
   install_release_dependencies || return 1
 
-  gate_mode=full
-  if run_root test -f "$TRANSACTION_DIR/gate-mode"; then
-    gate_mode="$(read_root_file "$TRANSACTION_DIR/gate-mode")"
+  caddy_mode=full
+  if run_root test -f "$TRANSACTION_DIR/caddy-mode"; then
+    caddy_mode="$(read_root_file "$TRANSACTION_DIR/caddy-mode")"
   fi
-  case "$gate_mode" in
+  case "$caddy_mode" in
     full) ;;
     hub-only) ;;
-    *) printf 'ERROR: rollback metadata has an invalid gate mode.\n' >&2; return 1 ;;
+    *) printf 'ERROR: rollback metadata has an invalid caddy mode.\n' >&2; return 1 ;;
   esac
 
   vars_present="$(read_root_file "$TRANSACTION_DIR/dev-vars-present")"
@@ -126,7 +126,7 @@ restore_previous_release() {
   # Always suppress edge writes from old installers, which may own Caddyfile.
   run_root bash "$REPO/deploy/vm/install-hub2-node.sh" --hub-only || return 1
 
-  if [[ "$gate_mode" == full ]]; then
+  if [[ "$caddy_mode" == full ]]; then
     site_present="$(read_root_file "$TRANSACTION_DIR/hub-site-present")"
     case "$site_present" in
       yes)
@@ -144,7 +144,7 @@ restore_previous_release() {
   wait_for_hub_health || return 1
 
   remove_transaction_state || return 1
-  if [[ "$gate_mode" == full ]]; then
+  if [[ "$caddy_mode" == full ]]; then
     printf 'Rollback completed: previous Hub2 release, .dev.vars, and Hub site restored; shared Caddyfile untouched.\n'
   else
     printf 'Rollback completed: previous Hub2 release and .dev.vars restored; Caddy was left untouched.\n'
@@ -152,12 +152,12 @@ restore_previous_release() {
 }
 
 apply_release() {
-  local deploy_sha="$1" release_mode="$2" gate_mode="$3" previous_sha local_status
+  local deploy_sha="$1" release_mode="$2" caddy_mode="$3" previous_sha local_status
   [[ "$deploy_sha" =~ ^[0-9a-f]{40}$ ]] || fail "deploy SHA must be a full lowercase Git commit SHA"
   [[ "$release_mode" == bootstrap || "$release_mode" == active ]] \
     || fail "release mode must be bootstrap or active"
-  [[ "$gate_mode" == full || "$gate_mode" == hub-only ]] \
-    || fail "gate mode must be full or hub-only"
+  [[ "$caddy_mode" == full || "$caddy_mode" == hub-only ]] \
+    || fail "caddy mode must be full or hub-only"
   [[ -d "$REPO/.git" ]] || fail "Hub repository checkout is missing: $REPO"
   cd "$REPO" || fail "cannot enter Hub repository checkout: $REPO"
   [[ -f "$REPO/.dev.vars" ]] \
@@ -176,7 +176,7 @@ apply_release() {
 
   mkdir -p "$TMPDIR"
   chmod 750 "$TMPDIR"
-  if [[ "$gate_mode" == full ]]; then
+  if [[ "$caddy_mode" == full ]]; then
     CANDIDATE_CADDY="$(mktemp "$TMPDIR/hub-caddy-site.XXXXXX")"
     git -C "$REPO" show "${deploy_sha}:deploy/hub.caddy" > "$CANDIDATE_CADDY" \
       || fail "requested revision has no deploy/hub.caddy"
@@ -186,12 +186,12 @@ apply_release() {
 
   previous_sha="$(git -C "$REPO" rev-parse HEAD)"
   [[ "$previous_sha" =~ ^[0-9a-f]{40}$ ]] || fail "current VM revision is not a full commit SHA"
-  if [[ "$gate_mode" == full ]]; then
+  if [[ "$caddy_mode" == full ]]; then
     validate_shared_caddyfile || fail "shared Caddyfile must import /etc/caddy/sites/*.caddy; aws-infra owns that migration"
   fi
 
   run_root install -d -o root -g root -m 700 "$TRANSACTION_DIR"
-  if [[ "$gate_mode" == full ]]; then
+  if [[ "$caddy_mode" == full ]]; then
     if run_root test -f "$CADDY_SITE"; then
       run_root cp -p -- "$CADDY_SITE" "$TRANSACTION_DIR/hub.caddy.previous"
       write_root_file "$TRANSACTION_DIR/hub-site-present" yes
@@ -201,7 +201,7 @@ apply_release() {
   fi
   write_root_file "$TRANSACTION_DIR/previous.sha" "$previous_sha"
   write_root_file "$TRANSACTION_DIR/target.sha" "$deploy_sha"
-  write_root_file "$TRANSACTION_DIR/gate-mode" "$gate_mode"
+  write_root_file "$TRANSACTION_DIR/caddy-mode" "$caddy_mode"
   if [[ -f "$REPO/.dev.vars" ]]; then
     run_root cp -p -- "$REPO/.dev.vars" "$TRANSACTION_DIR/dev.vars.previous"
     write_root_file "$TRANSACTION_DIR/dev-vars-present" yes
@@ -230,7 +230,7 @@ apply_release() {
 
   git -C "$REPO" checkout --detach --force "$deploy_sha"
   install_release_dependencies
-  if [[ "$gate_mode" == full ]]; then
+  if [[ "$caddy_mode" == full ]]; then
     run_root bash "$REPO/deploy/vm/install-hub2-node.sh" --release-mode "$release_mode"
   else
     run_root bash "$REPO/deploy/vm/install-hub2-node.sh" --release-mode "$release_mode" --hub-only

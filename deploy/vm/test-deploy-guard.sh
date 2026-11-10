@@ -11,24 +11,15 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 pass() { printf 'PASS: %s\n' "$*"; }
 
 WORKFLOW="$ROOT/.github/workflows/deploy.yml"
-grep -Fq 'https://gate.dtcdev.click/' "$WORKFLOW" || fail 'missing public TLS smoke'
-grep -Fq 'https://gate.dtcdev.click/v1/health' "$WORKFLOW" \
-  || fail 'missing authenticated, non-mutating desktop grant smoke'
-# Gate routing (incl. the /v1/health rewrite) is owned by aws-infra, not Hub.
-! grep -Eq 'gate\.dtcdev\.click|8791|desktop_health' "$ROOT/deploy/hub.caddy" \
-  || fail 'Hub site must not contain Gate routing'
 ! grep -Fq 'install -m 644 "$DEPLOY_DIR/Caddyfile"' "$ROOT/deploy/vm/install-hub2-node.sh" \
   || fail 'installer must not replace the shared Caddyfile'
-grep -Fq 'verify_gate:' "$WORKFLOW" || fail 'missing explicit Hub-only gate-probe exception'
-grep -Fq 'default: true' "$WORKFLOW" || fail 'gate probes are not enabled by default'
-[[ "$(grep -Fc 'if: inputs.verify_gate' "$WORKFLOW")" == 2 ]] \
-  || fail 'both external gate probes must use the same explicit opt-out'
+grep -Fq 'hub_only:' "$WORKFLOW" || fail 'missing explicit Hub-only deploy option'
 grep -Fq 'https://hub.dtcdev.click/health' "$WORKFLOW" || fail 'missing Hub API read'
 grep -Fq 'always() && steps.finalize_deploy.outcome' "$WORKFLOW" \
   || fail 'missing rollback step that also handles runner cancellation'
 grep -Fq 'rollback_pending:' "$WORKFLOW" || fail 'missing fixed rollback recovery action'
 grep -Fq 'deploy-release-transaction.sh' "$WORKFLOW" || fail 'missing fixed transaction script'
-grep -Fq 'apply "$DEPLOY_SHA" "$RELEASE_MODE" "$gate_mode"' "$WORKFLOW" \
+grep -Fq 'apply "$DEPLOY_SHA" "$RELEASE_MODE" "$caddy_mode"' "$WORKFLOW" \
   || fail 'workflow does not select the full or isolated Hub-only transaction path'
 grep -Fq 'default: active' "$WORKFLOW" || fail 'release_mode must default to active'
 python3 - "$WORKFLOW" <<'PY' || fail 'release_mode default is not active'
@@ -39,7 +30,7 @@ sys.exit(0 if m and m.group(1)=='active' else 1)
 PY
 grep -Fq 'confirm_bootstrap' "$WORKFLOW" && grep -Fq 'DISABLE-HUB-DISPATCH' "$WORKFLOW" \
   || fail 'bootstrap must require a typed confirmation'
-pass 'workflow covers gate TLS, gate health, Hub health, and rollback'
+pass 'workflow covers Hub health and rollback'
 
 mkdir -p "$TEST_ROOT/bin" "$TEST_ROOT/etc/sites"
 git init --bare -q "$TEST_ROOT/remote.git"
@@ -73,7 +64,6 @@ config="$2"
 printf 'validate\n' >> "${CADDY_CAPTURE:?}"
 if [[ "$config" == "${AGENT_HUB_TEST_CADDY_CONFIG:?}" ]]; then
   grep -Fq 'import /etc/caddy/sites/*.caddy' "$config" || exit 93
-  grep -Fq 'reverse_proxy 127.0.0.1:8791' "$config" || exit 94
 else
   grep -Fq 'reverse_proxy 127.0.0.1:8787' "$config" || exit 94
 fi
@@ -155,9 +145,6 @@ printf 'HUB2_RELEASE_MODE=bootstrap\nHUB2_CREDENTIAL_KEY=preserve-this\n' > "$TE
 cp "$TEST_ROOT/work/deploy/hub.caddy" "$TEST_ROOT/etc/sites/hub.caddy"
 cat > "$TEST_ROOT/etc/Caddyfile" <<'SHARED'
 import /etc/caddy/sites/*.caddy
-gate.dtcdev.click {
-  reverse_proxy 127.0.0.1:8791
-}
 # aws-infra shared sentinel
 SHARED
 cp "$TEST_ROOT/etc/Caddyfile" "$TEST_ROOT/shared.original"
@@ -215,7 +202,7 @@ ORIGINAL_CADDY_SHA256="$(sha256sum "$TEST_ROOT/etc/Caddyfile" | cut -d' ' -f1)"
 run_transaction apply "$CANDIDATE_SHA" active hub-only >/dev/null
 [[ "$(sha256sum "$TEST_ROOT/etc/Caddyfile" | cut -d' ' -f1)" == "$ORIGINAL_CADDY_SHA256" ]] \
   || fail 'Hub-only apply changed the Caddyfile'
-[[ "$(cat "$TEST_ROOT/state/gate-mode")" == hub-only ]] || fail 'Hub-only transaction mode was not recorded'
+[[ "$(cat "$TEST_ROOT/state/caddy-mode")" == hub-only ]] || fail 'Hub-only transaction mode was not recorded'
 [[ ! -s "$TEST_ROOT/caddy-calls" ]] || fail 'Hub-only apply ran Caddy validation'
 run_transaction rollback >/dev/null
 [[ "$(git -C "$TEST_ROOT/work" rev-parse HEAD)" == "$PREVIOUS_SHA" ]] || fail 'Hub-only rollback missed old release'
@@ -224,7 +211,7 @@ run_transaction rollback >/dev/null
 if grep -Eq '(^| )(reload|restart) caddy($| )' "$TEST_ROOT/systemctl-calls"; then
   fail 'Hub-only apply or rollback reloaded/restarted Caddy'
 fi
-pass 'Hub-only apply and rollback leave the Gate Caddy configuration untouched'
+pass 'Hub-only apply and rollback leave the shared Caddy configuration untouched'
 
 if TEST_NPM_FAIL_ONCE=1 run_transaction apply "$CANDIDATE_SHA" active >/dev/null 2>&1; then
   fail 'dependency installation failure unexpectedly succeeded'

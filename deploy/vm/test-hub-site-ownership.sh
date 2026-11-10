@@ -29,8 +29,8 @@ with tempfile.TemporaryDirectory(prefix='hub-site-', dir=scratch) as temporary:
     shared = work / 'Caddyfile'
     original = b'import /etc/caddy/sites/*.caddy\n# infra owned\n'
     shared.write_bytes(original)
-    other = sites / 'gate.caddy'
-    other.write_bytes(b'gate.example.invalid {\n reverse_proxy localhost:8791\n}\n')
+    other = sites / 'other.caddy'
+    other.write_bytes(b'other.example.invalid {\n reverse_proxy localhost:9090\n}\n')
     other_before = other.read_bytes()
     hub = sites / 'hub.caddy'
     hub.write_bytes(b'# old hub site\n')

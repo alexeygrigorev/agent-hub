@@ -23,10 +23,6 @@ browser/host ──HTTPS──> CloudFront (EYWL8OW5EM1UL, ACM hub.dtcdev.click)
                             │
                             ▼
                         /var/lib/agent-hub/hub2-db/*.sqlite   (one file per DO)
-
-desktop tools ──HTTPS──> gate.dtcdev.click (Caddy TLS on the same VM :443)
-                            ▼  reverse proxy
-                         resource-gate.service (127.0.0.1:8791)
 ```
 
 | Piece | Where | IaC |
@@ -45,9 +41,7 @@ installs only `/etc/caddy/sites/hub.caddy` (from `deploy/hub.caddy`: the `:80`
 site proxying the CloudFront Hub2 origin to port 8787), validates it and the
 shared config, then reloads Caddy. It never writes the shared Caddyfile or any
 other site file. Rollback restores only `hub.caddy` from the transaction
-snapshot. The `gate.dtcdev.click` site (automatic HTTPS, Resource Gate on port
-8791) lives with its owner in aws-infra and is not restarted or edited by Hub
-deployment. Hub-only releases (`verify_gate=false`) skip Caddy entirely.
+snapshot. Hub-only releases (`hub_only=true`) skip Caddy entirely.
 
 CI/CD needs **no GCP and no Cloudflare credentials**: deploys run `git fetch +
 npm ci + install + restart` over SSH, then verify
@@ -209,29 +203,3 @@ CI deploys over the SSH deploy key, so routine operation needs neither.
    runs `npm ci --omit=dev` and `deploy/vm/install-hub2-node.sh`, and checks
    `https://hub.dtcdev.click/health`.
 4. Verify from anywhere with `curl https://hub.dtcdev.click/health`.
-
-## Resource Gate outage monitoring
-
-`scripts/install-resource-gate-monitor.sh` installs the RMTHZ systemd service
-and one-minute timer from `deploy/resource-gate-monitor.service` and
-`deploy/resource-gate-monitor.timer`. The external check verifies the Gate TLS
-page, performs an authenticated read-only desktop grant check, checks the
-authenticated tools gateway and `DESKTOP-FP4OP26` health, and reads the Hub API
-health endpoint. After two consecutive failures it creates a DataOps task and
-sends one critical email per incident through RMTHZ's existing `msmtp` `alerts`
-account, to `dev@dtcdev.click` only. After two consecutive healthy checks it
-sends one recovery email to `dev@dtcdev.click` and updates the DataOps task. To
-exercise live mail delivery and the DataOps test-task path after installation,
-run `sudo -u alexey /usr/local/sbin/resource-gate-monitor.sh --test-alert`; this
-uses the production state directory and sends a clearly marked test message to
-`dev@dtcdev.click` only. The monitor state stays under
-`/var/lib/resource-gate-monitor` on RMTHZ. The GCP VM has no MTA, so it does
-not own the email alert path.
-
-Install or refresh the monitor on RMTHZ after merging its code:
-
-```sh
-sudo bash scripts/install-resource-gate-monitor.sh
-systemctl status resource-gate-monitor.timer
-journalctl -u resource-gate-monitor.service --since '10 minutes ago' --no-pager
-```
