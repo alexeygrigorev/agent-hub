@@ -46,6 +46,13 @@ class AdapterArgvTest(unittest.TestCase):
 
 
 class EffortAndInteractiveTest(unittest.TestCase):
+    def test_command_effort_accepts_aplexer_normalized_config(self):
+        self.assertEqual(nl.command_effort(['codex', 'exec', '-c', 'model_reasoning_effort=medium']), 'medium')
+
+    def test_command_effort_keeps_json_and_rejects_unknown_bare_values(self):
+        self.assertEqual(nl.command_effort(['codex', 'exec', '-c', 'model_reasoning_effort="medium"']), 'medium')
+        self.assertIsNone(nl.command_effort(['codex', 'exec', '-c', 'model_reasoning_effort=unverified']))
+
     def test_headless_effort_codex_maps_max_to_xhigh(self):
         base = nl.adapter_argv('zai', 'goal', 'glm-5.3-flash')
         argv = nl.headless_effort_argv('zai', base, 'max')

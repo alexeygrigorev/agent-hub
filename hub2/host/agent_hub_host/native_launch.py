@@ -104,10 +104,15 @@ def command_effort(command):
     values = [command[i + 1] for i, v in enumerate(command[:-1]) if v == '--effort']
     for arg in command:
         if arg.startswith('model_reasoning_effort='):
+            raw_value = arg.split('=', 1)[1]
             try:
-                values.append(json.loads(arg.split('=', 1)[1]))
+                values.append(json.loads(raw_value))
             except ValueError:
-                return None
+                # Aplexer versions may normalize the JSON-quoted config value
+                # into a bare enum in the returned native command.
+                if raw_value not in {'low', 'medium', 'high', 'xhigh'}:
+                    return None
+                values.append(raw_value)
     return values[0] if values and all(isinstance(v, str) and v == values[0] for v in values) else None
 
 
