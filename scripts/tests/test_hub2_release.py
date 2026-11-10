@@ -27,6 +27,8 @@ builder = module('build-hub2-release')
 enrollment = module('hub2-enroll')
 SHA = 'a' * 40
 OLD_SHA = 'b' * 40
+MACHINE = 'release-test-machine'
+STATUS_PATH = '/api/fleet/routing/self'
 HOST = f'agent_hub_host_v2-2.0.0+g{SHA}-py3-none-any.whl'
 
 
@@ -60,6 +62,14 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
                                        for name, data in self.files.items()}}
         self.calls = []
         self.downloads = []
+        self.config = Path(self.temporary.name) / '.config/agent-hub/v2.json'
+        self.config.parent.mkdir(parents=True)
+        self.config.write_text(json.dumps({'machine_id': MACHINE, 'token': 'synthetic-enrollment-token'}))
+        self.status = {'machine_id': MACHINE, 'connected': True, 'host_version': SHA,
+                       'protocol_version': 1, 'version_mismatch': False}
+        self.status_rc = 0
+        self.status_output = None
+        self.status_timeout = False
 
     def fetch(self, url, limit):
         name = url.rsplit('/', 1)[1]
@@ -69,6 +79,18 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
     def command(self, args):
         self.calls.append([str(value) for value in args])
 
+    def status_command(self, args, *, stdout, stderr, timeout):
+        self.calls.append(args)
+        self.assertEqual(args, [str(self.root / 'releases' / SHA / 'bin/hub2'), '--config', str(self.config),
+                                'request', 'GET', STATUS_PATH])
+        self.assertEqual(stdout, subprocess.PIPE)
+        self.assertEqual(stderr, subprocess.DEVNULL)
+        self.assertEqual(timeout, 15)
+        if self.status_timeout:
+            raise subprocess.TimeoutExpired(args, timeout, output=b'synthetic-sensitive-output')
+        raw = json.dumps(self.status).encode() if self.status_output is None else self.status_output
+        return subprocess.CompletedProcess(args, self.status_rc, stdout=raw)
+
     def old_release(self):
         old = self.root / 'releases' / OLD_SHA
         old.mkdir(parents=True)
@@ -77,7 +99,8 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
 
     def install(self, **kwargs):
         with patch.object(updater, 'fetch', self.fetch), patch.object(updater, 'command', self.command), \
-             patch.object(updater.time, 'sleep'), patch.object(Path, 'home', return_value=Path(self.temporary.name)):
+             patch.object(updater.time, 'sleep'), patch.object(Path, 'home', return_value=Path(self.temporary.name)), \
+             patch.object(updater.subprocess, 'run', self.status_command):
             updater.install('https://example.invalid', self.root, **kwargs)
 
     def test_valid_update_is_offline_and_keeps_previous(self):
@@ -198,6 +221,7 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
 
     def test_new_protocol_is_installed_when_manifest_and_wheel_match(self):
         self.manifest['protocol_version'] = 2
+        self.status['protocol_version'] = 2
         self.install()
         check = next(args for args in self.calls if '-c' in args)
         self.assertIn('PROTOCOL_VERSION == 2', check[-1])
@@ -238,23 +262,57 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
         self.assertEqual((self.root / 'previous').resolve(), old)
         self.assertEqual((self.root / 'current').resolve().name, SHA)
         self.assertTrue(any(args[2:] == ['restart', updater.UNITS[0]] for args in self.calls))
-        heartbeat = next(i for i, args in enumerate(self.calls) if args[-1] == 'heartbeat')
+        observation = next(i for i, args in enumerate(self.calls) if args[-1] == STATUS_PATH)
         daemon_enabled = self.calls.index(['systemctl', '--user', 'enable', updater.UNITS[0]])
         timer_enabled = self.calls.index(['systemctl', '--user', 'enable', '--now', updater.UNITS[2]])
-        self.assertLess(heartbeat, daemon_enabled)
+        self.assertLess(observation, daemon_enabled)
         self.assertLess(daemon_enabled, timer_enabled)
-        self.assertEqual(self.calls[heartbeat + 1], ['systemctl', '--user', 'is-active', '--quiet', updater.UNITS[0]])
+        active = ['systemctl', '--user', 'is-active', '--quiet', updater.UNITS[0]]
+        self.assertEqual(self.calls[observation - 6:observation], [active] * 6)
+        self.assertEqual(self.calls[observation + 1], active)
 
-    def test_direct_install_heartbeat_failure_leaves_timer_unenabled(self):
-        def failed_heartbeat(args):
-            self.calls.append([str(value) for value in args])
-            if args[-1] == 'heartbeat':
-                raise RuntimeError('unauthorized heartbeat')
-        self.command = failed_heartbeat
-        with self.assertRaisesRegex(RuntimeError, 'unauthorized heartbeat'):
+    def test_direct_install_old_server_rolls_back_without_enabling_timer(self):
+        old = self.old_release()
+        (self.root / 'updater.py').write_bytes(b'old updater')
+        self.status_rc = 1
+        self.status_output = b'synthetic-sensitive-output'
+        with self.assertRaisesRegex(RuntimeError, '^host daemon connection not verified$'):
             self.install(install_service=True)
         self.assertFalse(any('enable' in args for args in self.calls))
-        self.assertFalse((self.root / 'current').is_symlink())
+        self.assertEqual((self.root / 'current').resolve(), old)
+        self.assertEqual((self.root / 'updater.py').read_bytes(), b'old updater')
+        self.assertFalse((self.root / 'releases' / SHA).exists())
+
+    def test_readiness_rejects_wrong_socket_status_and_sanitizes_failed_transport(self):
+        self.install(install_service=True, restart=False)
+        correct = dict(self.status)
+        cases = [
+            ('wrong machine', {'machine_id': 'other-machine'}, None, False),
+            ('disconnected', {'connected': False}, None, False),
+            ('invalid connected flag', {'connected': 1}, None, False),
+            ('reported stale release', {'host_version': OLD_SHA}, None, False),
+            ('wrong protocol', {'protocol_version': 2}, None, False),
+            ('invalid protocol type', {'protocol_version': True}, None, False),
+            ('server mismatch', {'version_mismatch': True}, None, False),
+            ('missing mismatch', {}, json.dumps({k: v for k, v in correct.items() if k != 'version_mismatch'}).encode(), False),
+            ('oversized', {}, json.dumps(correct).encode() + b' ' * 4096, False),
+            ('malformed', {}, b'synthetic-sensitive-output', False),
+            ('timed out', {}, None, True),
+        ]
+        with patch.object(updater, 'command', self.command), patch.object(updater.time, 'sleep'), \
+             patch.object(Path, 'home', return_value=Path(self.temporary.name)), \
+             patch.object(updater.subprocess, 'run', self.status_command):
+            for name, changes, raw, timeout in cases:
+                with self.subTest(name=name):
+                    self.status = {**correct, **changes}
+                    self.status_output = raw
+                    self.status_timeout = timeout
+                    self.calls.clear()
+                    with self.assertRaisesRegex(RuntimeError, '^host daemon connection not verified$') as failure:
+                        updater.check_service_ready(self.root / 'current')
+                    self.assertIsNone(failure.exception.__cause__)
+                    self.assertEqual(sum('is-active' in args for args in self.calls), 6)
+                    self.assertEqual(self.calls[-1][-1], STATUS_PATH)
 
     def test_explicit_install_fails_during_backoff_but_normal_update_defers(self):
         old = self.old_release()
@@ -395,25 +453,26 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
         self.assertFalse(any(args[0] == 'systemctl' for args in self.calls))
 
     def test_shell_starts_only_daemon_until_enrollment_and_readiness_succeed(self):
-        for scenario in ('fresh', 'enroll', 'start', 'is-active', 'heartbeat', 'enrolled', 'backoff'):
+        for scenario in ('fresh', 'enroll', 'start', 'is-active', 'routing', 'enrolled', 'backoff'):
             enrolled = scenario in ('enrolled', 'backoff')
             failure = '' if scenario in ('fresh', 'enrolled') else scenario
             with self.subTest(scenario=scenario):
                 home = Path(self.temporary.name) / ('shell-' + scenario)
                 root = home / '.local/share/agent-hub2'
                 current = root / 'current'
-                target = root / 'releases' / OLD_SHA
+                target = root / 'releases' / SHA
                 current_bin = target / 'bin'
                 current_bin.mkdir(parents=True)
-                (target / 'release.json').write_text(json.dumps({'host_version': OLD_SHA}))
+                (target / 'release.json').write_text(json.dumps(self.manifest))
                 current.symlink_to(target)
                 fake_bin = home / 'fake-bin'
                 fake_bin.mkdir()
                 log = home / 'commands.jsonl'
                 config = home / '.config/agent-hub/v2.json'
+                enrollment = json.dumps({'machine_id': MACHINE, 'token': 'synthetic-enrollment-token'})
                 if enrolled:
                     config.parent.mkdir(parents=True)
-                    config.write_text('{}')
+                    config.write_text(enrollment)
                 shim = home / 'downloaded.py'
                 shim.write_text(f"""
 import json, os, runpy, sys, time
@@ -446,8 +505,9 @@ elif name == 'systemctl':
     event = args[1]
     assert args[0] == '--user'
 elif name == 'hub2':
-    assert args == ['heartbeat']
-    event = 'heartbeat'
+    assert args == ['--config', str(config), 'request', 'GET', {STATUS_PATH!r}]
+    assert os.environ['HUB2_TOKEN'] == 'synthetic-override-token'
+    event = 'routing'
 else:
     assert name == 'loginctl'
     event = name
@@ -457,9 +517,11 @@ if event == os.environ['INSTALL_TEST_FAIL']:
     sys.exit(1)
 if event == 'enroll':
     config.parent.mkdir(parents=True, exist_ok=True)
-    config.write_text('{{}}')
-elif event in ('start', 'heartbeat', 'enable'):
+    config.write_text({enrollment!r})
+elif event in ('start', 'routing', 'enable'):
     assert config.is_file()
+    if event == 'routing':
+        print({json.dumps(self.status)!r})
 """)
                 stub.chmod(0o700)
                 for name in ('curl', 'loginctl', 'systemctl'):
@@ -471,7 +533,7 @@ elif event in ('start', 'heartbeat', 'enable'):
                 result = subprocess.run(['/bin/sh', str(REPO / 'deploy/host-install.sh')],
                                         env={**os.environ, 'HOME': str(home), 'PATH': str(fake_bin)+':/usr/bin:/bin',
                                              'HUB_BASE_URL': 'https://example.invalid', 'HUB_WORKSPACE_ROOT': str(home),
-                                             'INSTALL_TEST_LOG': str(log), 'INSTALL_TEST_CONFIG': str(config),
+                                             'HUB2_TOKEN': 'synthetic-override-token', 'INSTALL_TEST_LOG': str(log), 'INSTALL_TEST_CONFIG': str(config),
                                              'INSTALL_TEST_UPDATER': str(shim), 'INSTALL_TEST_FAIL': failure},
                                         capture_output=True, text=True, timeout=10)
                 commands = [json.loads(line) for line in log.read_text().splitlines()]
@@ -488,7 +550,7 @@ elif event in ('start', 'heartbeat', 'enable'):
                 else:
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(events, ['stage', 'enroll', 'loginctl', 'start', *(['is-active'] * 6),
-                                              'heartbeat', 'is-active', 'enable', 'enable'])
+                                              'routing', 'is-active', 'enable', 'enable'])
                     self.assertEqual(commands[3], ['start', '--user', 'start', updater.UNITS[0]])
                     self.assertEqual(commands[-1], ['enable', '--user', 'enable', '--now', updater.UNITS[2]])
 
