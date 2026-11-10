@@ -50,7 +50,7 @@ sensitive commits that reach it without a valid final trailer.
 - `hub2/public/`: dashboard and generated `/cli/` release artifacts.
 - `hub2/host/`: Python Hub2 daemon and native administration CLI; isolated release environments pin the approved `websockets==16.0` transport. No other unpinned dependencies are authorized.
 - `host/agent_hub_host/`: maintained stdlib CLI zipapp source and legacy Hub1 modules pending reviewed retirement. Both packages currently share an import name; keep their environments isolated.
-- `hub2/tests/`, `hub2/host/tests/`, `host/tests/`: server, daemon and CLI tests; integrated end-to-end coverage runs in CI.
+- `hub2/tests/`, `hub2/host/tests/`, `host/tests/`: server, daemon and CLI tests; integrated end-to-end coverage is required in CI for start-path acceptance.
 - `src/`, `test/`, `public/`: legacy Hub1 code/assets retained until acknowledged retirement; `public/cli/` includes maintained CLI installers.
 - `scripts/`, `deploy/`: release tooling, user/system units, and VM deployment. Hub owns only `/etc/caddy/sites/hub.caddy`; aws-infra owns the shared Caddyfile and its sites import.
 - `docs/`: spec and runbooks, including [host releases](docs/HUB2-RELEASES.md).
