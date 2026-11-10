@@ -102,6 +102,62 @@ class StaleWorkspaceReconcileTests(unittest.TestCase):
             self.assertEqual(state, "aborting")
             self.assertFalse(journal.db.execute("SELECT 1 FROM outbox").fetchone())
 
+    def test_missing_workspace_does_not_report_native_process_stopped(self):
+        with tempfile.TemporaryDirectory() as temp:
+            journal = Journal(Path(temp) / "journal.sqlite")
+            self.addCleanup(journal.db.close)
+            missing_workspace = Path(temp) / "removed-worktree"
+            with journal.db:
+                journal.db.execute(
+                    "INSERT INTO launches(operation_id,session_id,epoch,digest,workspace,tag,native_id,state,interactive) "
+                    "VALUES(?,?,?,?,?,?,?,'running',0)",
+                    ("running-operation", "running-session", 1, "digest", str(missing_workspace),
+                     "task-hub2-running-session", "native-123"),
+                )
+
+            socket = _Socket()
+            client = _Client(socket)
+            bridge = Bridge.__new__(Bridge)
+            bridge.client = client
+            bridge.journal = journal
+            bridge.launcher = SimpleNamespace(
+                capabilities=lambda: {"shell": {"headless"}},
+                aborted_identity=Mock(),
+                status=Mock(),
+            )
+            bridge.engines = {"shell"}
+            bridge.machine_id = None
+            bridge.budget_paused_until = 0
+            bridge.budget_safety_paused_until = 0
+            bridge.executable = "unused"
+            bridge.runner = None
+            bridge.lookup = Mock(side_effect=AssertionError("unavailable workspace must not be queried"))
+
+            with patch("agent_hub_host.agent.threading.Thread") as thread:
+                with self.assertLogs("agent_hub_host.agent", level="WARNING") as captured:
+                    with self.assertRaises(_StopServe):
+                        bridge.serve("machine-1", ["headless"])
+
+            thread.return_value.start.assert_called_once_with()
+            self.assertEqual(client.heartbeats[0][3], [{
+                "session_id": "running-session",
+                "native_id": "native-123",
+                "phase": "unknown",
+                "last_activity_at": None,
+                "exit_code": None,
+                "containment_empty": False,
+            }])
+            self.assertEqual(client.socket_calls, ["machine-1"])
+            self.assertTrue(socket.entered)
+            self.assertEqual(len(captured.records), 1)
+            bridge.launcher.aborted_identity.assert_not_called()
+            bridge.launcher.status.assert_not_called()
+            bridge.lookup.assert_not_called()
+            state = journal.db.execute(
+                "SELECT state FROM launches WHERE session_id='running-session'"
+            ).fetchone()[0]
+            self.assertEqual(state, "running")
+
 
 if __name__ == "__main__":
     unittest.main()
