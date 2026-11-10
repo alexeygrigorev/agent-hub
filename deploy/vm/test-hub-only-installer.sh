@@ -11,6 +11,7 @@ import sys
 
 installer = Path(sys.argv[1]).read_text(encoding="utf-8")
 workflow = Path(sys.argv[2]).read_text(encoding="utf-8")
+transaction = (Path(sys.argv[1]).parent / "deploy-release-transaction.sh").read_text(encoding="utf-8")
 
 def require(condition: bool, message: str) -> None:
     if not condition:
@@ -37,14 +38,13 @@ require('systemctl restart agent-hub-hub2.service' in installer,
 require('default: true' in workflow, "Resource Gate verification must remain enabled by default")
 require('VERIFY_GATE: ${{ inputs.verify_gate }}' in workflow,
         "deployment must receive the explicit verify_gate choice")
-require("if: inputs.verify_gate\n        run:" in workflow,
-        "only the external Resource Gate check is conditional")
-branch_start = workflow.find('if [ \'"$VERIFY_GATE"\' = true ]; then')
-branch_end = workflow.find("\n            fi", branch_start)
-hub_only_branch = workflow[branch_start:branch_end] if branch_start >= 0 and branch_end > branch_start else ""
-require("else\n" in hub_only_branch and "install-hub2-node.sh --release-mode" in hub_only_branch
-        and "--hub-only" in hub_only_branch,
-        "verify_gate=false must select the fixed Hub-only installer flag")
+require(workflow.count("if: inputs.verify_gate") == 2,
+        "both external Resource Gate checks must be conditional")
+require("true) gate_mode=full ;;" in workflow and "false) gate_mode=hub-only ;;" in workflow
+        and 'apply "$DEPLOY_SHA" "$RELEASE_MODE" "$gate_mode"' in workflow,
+        "verify_gate=false must select the fixed Hub-only transaction mode")
+require('install-hub2-node.sh" --release-mode "$release_mode" --hub-only' in transaction,
+        "the Hub-only transaction mode must select the fixed Hub-only installer flag")
 
 print("Hub-only installer guard checks passed.")
 PY

@@ -1,5 +1,5 @@
 [Unit]
-Description=Check Resource Gate TLS and send outage email
+Description=Check Resource Gate, desktop grant path, and Hub API uptime
 After=network-online.target
 Wants=network-online.target
 
@@ -8,7 +8,11 @@ Type=oneshot
 User=alexey
 Group=alexey
 ExecStart=/usr/local/sbin/resource-gate-monitor.sh
-TimeoutStartSec=30
+Environment=DATAOPS_BIN=/home/alexey/.local/bin/dataops
+Environment=DATAOPS_CONFIG_DIR=/home/alexey/.config/dataops
+Environment=AGENT_BROWSER_REMOTE_CONFIG=/home/alexey/.agent-browser/remotes.json
+Environment=NVM_DIR=/home/alexey/.nvm
+TimeoutStartSec=120
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict

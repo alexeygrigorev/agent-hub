@@ -49,11 +49,20 @@ rm -f /etc/systemd/system/agent-hub-worker.service /etc/systemd/system/agent-hub
 if [[ "$HUB_ONLY" != true ]]; then
   echo "== edge (Caddy :80 -> Hub2 :8787; gate.dtcdev.click TLS -> Resource Gate :8791)"
   if ! grep -Eq '^[[:space:]]*gate\.dtcdev\.click[[:space:]]*\{' "$DEPLOY_DIR/Caddyfile" \
-    || ! grep -Fq 'reverse_proxy 127.0.0.1:8791' "$DEPLOY_DIR/Caddyfile"; then
-    echo "refusing to replace Caddyfile: Resource Gate TLS site for gate.dtcdev.click is required" >&2
+    || ! grep -Fq 'reverse_proxy 127.0.0.1:8791' "$DEPLOY_DIR/Caddyfile" \
+    || ! grep -Fq 'rewrite @desktop_health /v1/check?resource=browser&scope=desktop' "$DEPLOY_DIR/Caddyfile"; then
+    echo "refusing to replace Caddyfile: Resource Gate TLS site and authenticated /v1/health route are required" >&2
+    exit 1
+  fi
+  if ! caddy validate --config "$DEPLOY_DIR/Caddyfile" --adapter caddyfile; then
+    echo "refusing to deploy: candidate Caddyfile failed caddy validate" >&2
     exit 1
   fi
   install -m 644 "$DEPLOY_DIR/Caddyfile" /etc/caddy/Caddyfile
+  if ! caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile; then
+    echo "installed Caddyfile failed caddy validate; deploy transaction must roll back" >&2
+    exit 1
+  fi
 else
   echo "== edge unchanged (Hub-only deploy)"
 fi

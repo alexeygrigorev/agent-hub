@@ -17,8 +17,12 @@ on:
           - bootstrap
           - active
         default: bootstrap
+      rollback_pending:
+        description: Restore the protected previous release after an interrupted deploy
+        type: boolean
+        default: false
       verify_gate:
-        description: Verify the Resource Gate after a Hub-only deploy
+        description: Run the full Gate deploy path (disable only for Hub-only work forbidden from contacting or changing Gate)
         type: boolean
         default: true
       oncall_recipient_public_key_b64:
@@ -51,11 +55,14 @@ jobs:
           grep -Fq 'systemctl restart agent-hub-hub2.service' deploy/vm/install-hub2-node.sh
           grep -Eq '^[[:space:]]*gate\.dtcdev\.click[[:space:]]*\{' deploy/Caddyfile
           grep -Fq 'reverse_proxy 127.0.0.1:8791' deploy/Caddyfile
+          grep -Fq 'rewrite @desktop_health /v1/check?resource=browser&scope=desktop' deploy/Caddyfile
           grep -Fq 'refusing to replace Caddyfile: Resource Gate TLS site' deploy/vm/install-hub2-node.sh
           test -s deploy/resource-gate-monitor.service
           test -s deploy/resource-gate-monitor.timer
           bash -n scripts/resource-gate-monitor.sh scripts/install-resource-gate-monitor.sh
           bash scripts/test-resource-gate-monitor.sh
+          bash -n deploy/vm/deploy-release-transaction.sh deploy/vm/install-hub2-node.sh
+          bash scripts/test-deploy-guard.sh
           bash -n deploy/vm/test-hub-only-installer.sh
           bash deploy/vm/test-hub-only-installer.sh
       - name: Session controller shell regression tests
@@ -93,84 +100,128 @@ jobs:
       - run: npm run build
   deploy:
     needs: [hub2, distribution]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && !inputs.dry_run
+    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && !inputs.dry_run && !inputs.rollback_pending
     concurrency:
       group: agent-hub-production
       cancel-in-progress: false
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     environment: production
     steps:
       - uses: actions/checkout@v4
       - name: Install VM deploy key
+        env:
+          VM_DEPLOY_KEY: ${{ secrets.AGENT_HUB_VM_DEPLOY_KEY }}
         run: |
-          install -m 700 -d ~/.ssh
-          install -m 600 /dev/stdin ~/.ssh/hub_vm_key <<< "${{ secrets.AGENT_HUB_VM_DEPLOY_KEY }}"
-      - name: Deploy validated revision to the hub VM (SSH only; no cloud credentials)
+          set -euo pipefail
+          install -m 700 -d "$RUNNER_TEMP/agent-hub-ssh"
+          umask 077
+          printf '%s' "$VM_DEPLOY_KEY" > "$RUNNER_TEMP/agent-hub-ssh/hub_vm_key"
+      - name: Deploy validated revision through the fixed VM transaction script
+        id: deploy_vm
         env:
           RELEASE_MODE: ${{ inputs.release_mode }}
           VERIFY_GATE: ${{ inputs.verify_gate }}
-          SSH: ssh -i ~/.ssh/hub_vm_key -o StrictHostKeyChecking=accept-new -o BatchMode=yes ${{ secrets.AGENT_HUB_VM_USER }}@${{ secrets.AGENT_HUB_VM_HOST }}
+          DEPLOY_SHA: ${{ github.sha }}
+          SSH_TARGET: ${{ secrets.AGENT_HUB_VM_USER }}@${{ secrets.AGENT_HUB_VM_HOST }}
         run: |
+          set -euo pipefail
           case "$RELEASE_MODE" in
             bootstrap|active) ;;
             *) echo "invalid release mode" >&2; exit 2 ;;
           esac
           case "$VERIFY_GATE" in
-            true|false) ;;
+            true) gate_mode=full ;;
+            false) gate_mode=hub-only ;;
             *) echo "invalid verify_gate value" >&2; exit 2 ;;
           esac
-          $SSH 'set -eu
-            cd /opt/agent-hub
-            git fetch origin main
-            git checkout --detach --force origin/main
-            export TMPDIR=/opt/agent-hub/.local/tmp
-            mkdir -p "$TMPDIR"
-            npm ci --omit=dev
-            if [ '"$VERIFY_GATE"' = true ]; then
-              sudo bash deploy/vm/install-hub2-node.sh --release-mode '"$RELEASE_MODE"'
-            else
-              sudo bash deploy/vm/install-hub2-node.sh --release-mode '"$RELEASE_MODE"' --hub-only
-            fi
-            systemctl is-active --quiet agent-hub-hub2.service
-            curl -fsS --max-time 10 http://127.0.0.1:8787/health'
-      - name: Verify public health through the edge
+          [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid deploy commit" >&2; exit 2; }
+          test -n "$SSH_TARGET" || { echo "VM SSH target is not configured" >&2; exit 2; }
+          ssh -i "$RUNNER_TEMP/agent-hub-ssh/hub_vm_key" \
+            -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+            -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+            "$SSH_TARGET" bash -s -- apply "$DEPLOY_SHA" "$RELEASE_MODE" "$gate_mode" \
+            < deploy/vm/deploy-release-transaction.sh
+      - name: Verify Resource Gate TLS page through port 443
+        if: inputs.verify_gate
+        run: |
+          set -euo pipefail
+          page="$RUNNER_TEMP/resource-gate-page.html"
+          status="$(curl --silent --show-error --fail --retry 5 --retry-delay 5 --retry-connrefused \
+            --output "$page" --write-out '%{http_code}' --max-time 15 https://gate.dtcdev.click/)"
+          [[ "$status" == 200 ]] || { echo "Resource Gate TLS smoke returned HTTP $status" >&2; exit 1; }
+          grep -Fq '<h1>Resource Gate</h1>' "$page" || { echo "Resource Gate page marker missing" >&2; exit 1; }
+      - name: Verify authenticated Resource Gate browser grant API
+        if: inputs.verify_gate
+        env:
+          GATE_PROBE_TOKEN: ${{ secrets.RESOURCE_GATE_PROBE_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$GATE_PROBE_TOKEN" || { echo "required secret RESOURCE_GATE_PROBE_TOKEN is not configured" >&2; exit 1; }
+          status="$(printf 'header = "Authorization: Bearer %s"\n' "$GATE_PROBE_TOKEN" \
+            | curl --config - --silent --show-error --retry 5 --retry-delay 5 --retry-connrefused \
+                --max-time 15 --output "$RUNNER_TEMP/resource-gate-grant.json" --write-out '%{http_code}' \
+                'https://gate.dtcdev.click/v1/health')"
+          [[ "$status" == 200 ]] || { echo "Resource Gate authenticated grant read returned HTTP $status" >&2; exit 1; }
+          python3 - "$RUNNER_TEMP/resource-gate-grant.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          response = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if type(response.get("granted")) is not bool:
+              raise SystemExit("Resource Gate grant read did not return a boolean grant state")
+          print("Authenticated Resource Gate desktop grant read passed")
+          PY
+      - name: Read Hub API health on the configured client URL
         env:
           RELEASE_MODE: ${{ inputs.release_mode }}
         run: |
-          case "$RELEASE_MODE" in
-            bootstrap) expected='"status":"bootstrap"' ;;
-            active) expected='"ok":true' ;;
-            *) echo "invalid release mode" >&2; exit 2 ;;
-          esac
+          set -euo pipefail
           for attempt in 1 2 3 4 5 6; do
-            payload="$(curl -fsS --max-time 15 https://hub.dtcdev.click/health 2>/dev/null || true)"
-            case "$payload" in
-              *"$expected"*) echo "$payload"; exit 0 ;;
-            esac
-            sleep 10
-          done
-          echo "public health did not report requested release mode: $RELEASE_MODE" >&2
-          exit 1
-      - name: Verify Resource Gate TLS site
-        if: inputs.verify_gate
-        run: |
-          for attempt in 1 2 3 4 5 6; do
-            payload="$(curl -fsS --max-time 15 https://gate.dtcdev.click/ 2>/dev/null || true)"
-            if grep -Fq '<h1>Resource Gate</h1>' <<<"$payload"; then
-              echo "Resource Gate TLS check passed: expected page marker is present"
-              exit 0
+            if curl --silent --show-error --fail --max-time 15 \
+              https://hub.dtcdev.click/health --output "$RUNNER_TEMP/hub-health.json"; then
+              if python3 - "$RUNNER_TEMP/hub-health.json" "$RELEASE_MODE" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          mode = sys.argv[2]
+          if mode == "bootstrap":
+              healthy = payload.get("status") == "bootstrap" and payload.get("dispatch_enabled") is False
+          elif mode == "active":
+              healthy = payload.get("ok") is True and payload.get("service") == "hub2"
+          else:
+              raise SystemExit("invalid release mode")
+          if not healthy:
+              raise SystemExit("Hub API health read did not report the requested healthy release mode")
+          print("Hub API health read passed on hub.dtcdev.click")
+          PY
+              then
+                exit 0
+              fi
             fi
             sleep 10
           done
-          echo "Resource Gate TLS check failed: expected page marker was not returned" >&2
+          echo "Hub API health read did not report the requested healthy release mode: $RELEASE_MODE" >&2
           exit 1
+      - name: Finalize deploy after all public smokes pass
+        id: finalize_deploy
+        env:
+          SSH_TARGET: ${{ secrets.AGENT_HUB_VM_USER }}@${{ secrets.AGENT_HUB_VM_HOST }}
+        run: |
+          set -euo pipefail
+          ssh -i "$RUNNER_TEMP/agent-hub-ssh/hub_vm_key" \
+            -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+            -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+            "$SSH_TARGET" bash -s -- commit < deploy/vm/deploy-release-transaction.sh
       - name: Provision oncall tokens into a recipient-encrypted artifact
         if: inputs.oncall_recipient_public_key_b64 != ''
         env:
           ONCALL_RECIPIENT_PUBLIC_KEY_B64: ${{ inputs.oncall_recipient_public_key_b64 }}
           ONCALL_ROTATE: ${{ inputs.oncall_rotate }}
-          SSH: ssh -i ~/.ssh/hub_vm_key -o StrictHostKeyChecking=accept-new -o BatchMode=yes ${{ secrets.AGENT_HUB_VM_USER }}@${{ secrets.AGENT_HUB_VM_HOST }}
+          SSH_TARGET: ${{ secrets.AGENT_HUB_VM_USER }}@${{ secrets.AGENT_HUB_VM_HOST }}
         run: |
           set -euo pipefail
           recipient_key="${RUNNER_TEMP}/oncall-recipient.pub"
@@ -179,7 +230,10 @@ jobs:
           chmod 600 "$recipient_key"
           rotate_args=()
           if [ "$ONCALL_ROTATE" = true ]; then rotate_args+=(--rotate); fi
-          $SSH "sudo python3 /opt/agent-hub/deploy/vm/provision-oncall-alerts.py ${rotate_args[*]}" < "$recipient_key" > "$envelope"
+          ssh -i "$RUNNER_TEMP/agent-hub-ssh/hub_vm_key" \
+            -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+            "$SSH_TARGET" "sudo python3 /opt/agent-hub/deploy/vm/provision-oncall-alerts.py ${rotate_args[*]}" \
+            < "$recipient_key" > "$envelope"
           base64 --decode "$envelope" >/dev/null
           chmod 600 "$envelope"
       - name: Upload encrypted oncall token artifact
@@ -190,3 +244,50 @@ jobs:
           path: ${{ runner.temp }}/oncall-token-envelope.b64
           if-no-files-found: error
           retention-days: 1
+      - name: Automatically restore the previous release and Caddy config after a failed deploy or smoke
+        if: always() && steps.finalize_deploy.outcome != 'success'
+        env:
+          SSH_TARGET: ${{ secrets.AGENT_HUB_VM_USER }}@${{ secrets.AGENT_HUB_VM_HOST }}
+        run: |
+          set -euo pipefail
+          test -s "$RUNNER_TEMP/agent-hub-ssh/hub_vm_key" || {
+            echo "automatic rollback unavailable because the scoped VM key was not installed" >&2
+            exit 1
+          }
+          ssh -i "$RUNNER_TEMP/agent-hub-ssh/hub_vm_key" \
+            -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+            -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+            "$SSH_TARGET" bash -s -- rollback < deploy/vm/deploy-release-transaction.sh
+      - name: Remove the temporary SSH key
+        if: always()
+        run: rm -f -- "$RUNNER_TEMP/agent-hub-ssh/hub_vm_key"
+  rollback_pending:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.rollback_pending
+    concurrency:
+      group: agent-hub-production
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install scoped VM deploy key
+        env:
+          VM_DEPLOY_KEY: ${{ secrets.AGENT_HUB_VM_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d "$RUNNER_TEMP/agent-hub-ssh"
+          umask 077
+          printf '%s' "$VM_DEPLOY_KEY" > "$RUNNER_TEMP/agent-hub-ssh/hub_vm_key"
+      - name: Restore the protected previous release using the fixed script
+        env:
+          SSH_TARGET: ${{ secrets.AGENT_HUB_VM_USER }}@${{ secrets.AGENT_HUB_VM_HOST }}
+        run: |
+          set -euo pipefail
+          ssh -i "$RUNNER_TEMP/agent-hub-ssh/hub_vm_key" \
+            -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+            -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+            "$SSH_TARGET" bash -s -- rollback < deploy/vm/deploy-release-transaction.sh
+      - name: Remove the temporary SSH key
+        if: always()
+        run: rm -f -- "$RUNNER_TEMP/agent-hub-ssh/hub_vm_key"

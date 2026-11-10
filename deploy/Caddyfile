@@ -6,5 +6,7 @@
 
 gate.dtcdev.click {
 	header Strict-Transport-Security "max-age=31536000"
+	@desktop_health path /v1/health
+	rewrite @desktop_health /v1/check?resource=browser&scope=desktop
 	reverse_proxy 127.0.0.1:8791
 }
