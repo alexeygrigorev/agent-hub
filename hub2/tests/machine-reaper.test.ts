@@ -274,6 +274,7 @@ test('session projections carry host workspace route and timestamp columns for t
  const f=fixture(),session='projection';await startClaimed(f,session,'native-projection');
  const response=await f.call('/api/sessions/'+session,'GET',undefined,{'x-hub2-actor':JSON.stringify({id:'admin',kind:'operator',scopes:['operator:admin']})});
  assert.equal(response.status,200);const view=(await response.json() as any).session;
+ assert.equal(view.start_deadline_at,Date.parse(view.created_at)+120_000);
  assert.equal(view.host,'h1');assert.equal(view.machine,'h1');assert.equal(view.workspace,'/tmp');
  assert.equal(view.account_id,'codex');assert.equal(view.account,'codex');assert.equal(view.mode,'headless');
  assert.equal(view.managed,true);assert.ok(Number.isFinite(Date.parse(view.created_at)));assert.ok(Number.isFinite(Date.parse(view.updated_at)));

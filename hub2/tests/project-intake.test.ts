@@ -229,6 +229,9 @@ test('failed intake can retry without qualified failure proof once prior saga is
  const intakeRow=f.sql.prepare('SELECT * FROM intakes WHERE id=?').get(own.id) as any,proof=JSON.parse(intakeRow.final_evidence_json);
  assert.equal(intakeRow.status,'failed');assert.equal(prior.native_id,null);
  f.sql.prepare('UPDATE intakes SET final_evidence_json=? WHERE id=?').run('{}',own.id);
+ f.sql.prepare("UPDATE dispatch_sagas SET state='needs_attention' WHERE operation_id=?").run(prior.operation_id);
+ const activeRetry=await f.call('/api/intakes/'+own.id+'/start','POST',{...start,key:'incomplete-prior'});
+ assert.equal(activeRetry.status,409);assert.equal((await body(activeRetry)).error,'intake_already_assigned');
  f.sql.prepare("UPDATE dispatch_sagas SET state='complete',last_reason='retry_bookkeeping' WHERE operation_id=?").run(prior.operation_id);
  const retried=await f.call('/api/intakes/'+own.id+'/start','POST',{...start,key:'timeout-proof-retry'});
  assert.equal(retried.status,201,JSON.stringify(await retried.clone().json()));
