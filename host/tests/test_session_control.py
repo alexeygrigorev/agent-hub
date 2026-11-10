@@ -356,6 +356,78 @@ class TestSessionControlCli(unittest.TestCase):
         self.assertEqual([s['id'] for s in result['sessions']], ['b'])
         self.assertEqual(transport.call_count, 2)
 
+    def test_list_reads_500_old_hub2_rows_and_normalizes_completion(self):
+        pages = []
+        for start in range(0, 500, 100):
+            cursor = 'page/%d+next' % (start + 100) if start < 400 else None
+            pages.append({'items': [{'id': str(i), 'state': 'running'} for i in range(start, start + 100)],
+                          'next': cursor, 'complete': cursor is None})
+        with patch.object(session_control, 'request', side_effect=pages) as transport:
+            result = session_control.execute(self.parse('list', '--json'))
+        self.assertEqual(len(result['sessions']), 500)
+        self.assertEqual(result['sessions'], result['items'])
+        self.assertEqual(result['sessions'][-1]['id'], '499')
+        self.assertTrue(result['complete'])
+        self.assertIsNone(result['next'])
+        self.assertIsNone(result['next_cursor'])
+        self.assertEqual(transport.call_count, 5)
+        self.assertIn('cursor=page%2F100%2Bnext', transport.call_args_list[1].args[1])
+
+    def test_hub2_next_is_followed_when_legacy_alias_is_null(self):
+        pages = [
+            {'sessions': [{'id': 'a'}], 'next_cursor': None, 'next': 'second', 'complete': False},
+            {'sessions': [{'id': 'a'}, {'id': 'b'}], 'next_cursor': None, 'next': None, 'complete': True},
+        ]
+        with patch.object(session_control, 'request', side_effect=pages):
+            result = session_control.execute(self.parse('list'))
+        self.assertEqual([row['id'] for row in result['sessions']], ['a', 'b'])
+        self.assertTrue(result['complete'])
+
+    def test_limited_filtered_list_keeps_honest_continuation(self):
+        pages = [
+            {'items': [{'id': 'a', 'state': 'offered'}, {'id': 'b', 'state': 'running'},
+                       {'id': 'c', 'state': 'running'}], 'next': 'second', 'complete': False},
+            {'items': [{'id': 'd', 'state': 'running'}], 'next': 'third', 'complete': False},
+        ]
+        with patch.object(session_control, 'request', side_effect=pages) as transport:
+            result = session_control.execute(self.parse('list', '--state', 'running', '--limit', '3'))
+        self.assertEqual([row['id'] for row in result['sessions']], ['b', 'c', 'd'])
+        self.assertFalse(result['complete'])
+        self.assertEqual(result['next'], 'third')
+        self.assertEqual(result['next_cursor'], 'third')
+        self.assertIn('limit=1&cursor=second', transport.call_args_list[1].args[1])
+
+    def test_malformed_or_unqualified_session_pages_fail_loudly(self):
+        for page in [
+            {},
+            {'items': [], 'complete': 'false'},
+            {'sessions': [], 'complete': False},
+            {'sessions': [], 'complete': True, 'next': 'more'},
+            {'sessions': [], 'next_cursor': 'one', 'next': 'two'},
+            {'sessions': [], 'next': False},
+            {'sessions': [{'state': 'running'}]},
+            {'sessions': 'not-a-list'},
+        ]:
+            with self.subTest(page=page), patch.object(session_control, 'request', return_value=page):
+                with self.assertRaises(ValueError):
+                    session_control.execute(self.parse('list'))
+
+    def test_repeated_old_hub2_cursor_does_not_loop_or_claim_complete(self):
+        page = {'items': [{'id': 'a'}], 'next': 'repeat', 'complete': False}
+        with patch.object(session_control, 'request', side_effect=[page, page]) as transport:
+            with self.assertRaisesRegex(ValueError, 'repeated a cursor'):
+                session_control.execute(self.parse('list'))
+        self.assertEqual(transport.call_count, 2)
+
+    def test_repeated_cursor_is_rejected_even_when_limit_is_filled(self):
+        pages = [
+            {'items': [{'id': 'a'}], 'next': 'repeat', 'complete': False},
+            {'items': [{'id': 'b'}], 'next': 'repeat', 'complete': False},
+        ]
+        with patch.object(session_control, 'request', side_effect=pages):
+            with self.assertRaisesRegex(ValueError, 'repeated a cursor'):
+                session_control.execute(self.parse('list', '--limit', '2'))
+
     def test_start_prompt_inline_with_brief_boundaries(self):
         with patch.object(session_control, 'request', return_value={'id':'fixture-session','state':'running'}) as transport:
             session_control.execute(self.parse('start', '--no-wait', '--workspace', 'demo', '--prompt', 'do the thing', '--key', 'k'))

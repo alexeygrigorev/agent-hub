@@ -20,7 +20,8 @@ class LongRunningTests(unittest.TestCase):
             request.assert_called_with('POST', '/api/sessions/session/ack?threshold=7200', {'snooze': 10800})
             sc.execute(parse('show', 'session', '--threshold', '1h'))
             request.assert_called_with('GET', '/api/sessions/session?threshold=3600')
-        with patch.dict(os.environ, {'HUB_SESSION_WARNING_THRESHOLD': '4h'}), patch.object(sc, 'request', return_value={}) as request:
+        with patch.dict(os.environ, {'HUB_SESSION_WARNING_THRESHOLD': '4h'}), \
+                patch.object(sc, 'request', return_value={'sessions': [], 'next_cursor': None}) as request:
             sc.execute(parse('list'))
             self.assertIn('threshold=14400', request.call_args.args[1])
         for bad in ('0h', '-1h', 'nan', '1.5h', '366d', '3h;kill'):
