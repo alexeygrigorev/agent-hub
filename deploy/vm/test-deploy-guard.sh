@@ -73,8 +73,20 @@ SYSTEMCTL
 cat > "$TEST_ROOT/bin/curl" <<'CURL'
 #!/usr/bin/env bash
 [[ "$*" == *'http://127.0.0.1:8787/health'* ]] || exit 96
+if [[ "${TEST_CURL_FAIL_FIRST:-0}" =~ ^[0-9]+$ ]] && ((TEST_CURL_FAIL_FIRST > 0)); then
+  count=0
+  [[ ! -s "${CURL_COUNT_FILE:?}" ]] || read -r count < "$CURL_COUNT_FILE"
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$CURL_COUNT_FILE"
+  if ((count <= TEST_CURL_FAIL_FIRST)); then exit 7; fi
+fi
 printf '%s\n' '{"ok":true,"service":"hub2"}'
 CURL
+cat > "$TEST_ROOT/bin/sleep" <<'SLEEP'
+#!/usr/bin/env bash
+[[ "$#" == 1 && "$1" == 1 ]] || exit 100
+printf '%s\n' "$1" >> "${SLEEP_CAPTURE:?}"
+SLEEP
 cat > "$TEST_ROOT/bin/npm" <<'NPM'
 #!/usr/bin/env bash
 [[ "$1" == --prefix && "$2" == "${AGENT_HUB_TEST_REPO:?}" ]] || exit 97
@@ -154,6 +166,8 @@ run_transaction() {
     CADDY_CAPTURE="$TEST_ROOT/caddy-calls" \
     SYSTEMCTL_CAPTURE="$TEST_ROOT/systemctl-calls" \
     NPM_CAPTURE="$TEST_ROOT/npm-calls" \
+    CURL_COUNT_FILE="$TEST_ROOT/curl-count" \
+    SLEEP_CAPTURE="$TEST_ROOT/sleep-calls" \
     NPM_FAIL_MARKER="$TEST_ROOT/npm-failed-once" \
     PATH="$TEST_ROOT/bin:$PATH" "$TRANSACTION" "$@"
 }
@@ -165,11 +179,15 @@ grep -Fq 'HUB2_RELEASE_MODE=active' "$TEST_ROOT/work/.dev.vars" || fail 'release
 [[ -f "$TEST_ROOT/state/prepared" ]] || fail 'rollback state was removed before public smokes'
 pass 'apply retains rollback state until public smokes finish'
 
-run_transaction rollback >/dev/null
+: > "$TEST_ROOT/curl-count"
+: > "$TEST_ROOT/sleep-calls"
+TEST_CURL_FAIL_FIRST=2 run_transaction rollback >/dev/null
 [[ "$(git -C "$TEST_ROOT/work" rev-parse HEAD)" == "$PREVIOUS_SHA" ]] || fail 'manual rollback missed old release'
 cmp -s "$TEST_ROOT/etc/Caddyfile" "$TEST_ROOT/work/deploy/Caddyfile" || fail 'manual rollback missed old Caddyfile'
 grep -Fq 'HUB2_CREDENTIAL_KEY=preserve-this' "$TEST_ROOT/work/.dev.vars" || fail 'rollback missed private vars'
 [[ ! -e "$TEST_ROOT/state" ]] || fail 'successful rollback retained transaction state'
+[[ "$(cat "$TEST_ROOT/curl-count")" == 3 ]] || fail 'rollback did not retry transient Hub startup failures'
+[[ "$(wc -l < "$TEST_ROOT/sleep-calls")" == 2 ]] || fail 'rollback did not wait between Hub health retries'
 grep -Fq -- "--prefix $TEST_ROOT/work ci --omit=dev" "$TEST_ROOT/npm-calls" \
   || fail 'dependency installation did not target the transactional repository'
 pass 'manual rollback restores release, Caddy config, and .dev.vars'

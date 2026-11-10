@@ -69,6 +69,19 @@ read_root_file() {
   run_root cat "$1"
 }
 
+wait_for_hub_health() {
+  local attempt
+  for ((attempt = 1; attempt <= 15; attempt++)); do
+    if curl -fsS --max-time 3 http://127.0.0.1:8787/health >/dev/null 2>&1; then
+      printf 'Hub health check passed on attempt %s/15.\n' "$attempt"
+      return 0
+    fi
+    if ((attempt < 15)); then sleep 1; fi
+  done
+  printf 'ERROR: Hub API did not pass its local health check after 15 attempts.\n' >&2
+  return 1
+}
+
 install_release_dependencies() {
   TMPDIR="$TMPDIR" npm --prefix "$REPO" ci --omit=dev
 }
@@ -127,7 +140,7 @@ restore_previous_release() {
   fi
   run_root systemctl restart agent-hub-hub2.service || return 1
   run_root systemctl is-active --quiet agent-hub-hub2.service || return 1
-  curl -fsS --max-time 10 http://127.0.0.1:8787/health >/dev/null || return 1
+  wait_for_hub_health || return 1
 
   remove_transaction_state || return 1
   if [[ "$gate_mode" == full ]]; then
@@ -217,7 +230,7 @@ apply_release() {
     run_root bash "$REPO/deploy/vm/install-hub2-node.sh" --release-mode "$release_mode" --hub-only
   fi
   run_root systemctl is-active --quiet agent-hub-hub2.service
-  curl -fsS --max-time 10 http://127.0.0.1:8787/health >/dev/null
+  wait_for_hub_health
   write_root_file "$TRANSACTION_DIR/applied" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   trap - ERR
   printf 'Hub2 candidate %s installed; rollback state retained until public smoke checks pass.\n' "$deploy_sha"

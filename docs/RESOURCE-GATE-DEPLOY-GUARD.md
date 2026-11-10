@@ -55,7 +55,8 @@ it sends a clearly labelled test email and creates/closes a test DataOps Task.
 An install or smoke failure runs the fixed rollback operation. It checks out
 the previous commit, restores `.dev.vars`, reapplies that release's installer,
 restores the exact prior Caddyfile, reloads Caddy and Hub2, and verifies local
-Hub health. Rollback validates that the saved Caddyfile is syntactically valid
+Hub health with a bounded readiness retry for service startup. Rollback validates
+that the saved Caddyfile is syntactically valid
 and retains the Gate TLS site and upstream. It permits an older snapshot that
 predates the `/v1/health` rewrite; every new deploy candidate must include that
 rewrite and pass the public authenticated smoke. The workflow remains failed
