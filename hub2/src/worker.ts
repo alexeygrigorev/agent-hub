@@ -155,6 +155,9 @@ const router = {
           ),
         );
 
+      if (path === '/api/intake/rules' || path === '/api/asks' || path.startsWith('/api/asks/') || path === '/api/shared-memory/import')
+        return control.fetch(await forwardRequest(request, CONTROL + path + requestUrl(request).search, actor));
+
       const projectPath =
         path === '/api/claims' ||
         /^\/api\/claims\/[^/]+(?:\/(?:renew|release))?$/.test(path) ||
@@ -197,6 +200,8 @@ const router = {
           const internalPath = url.pathname.replace('/api/intake/tasks','/api/intakes');
           return env.PROJECTS.get(env.PROJECTS.idFromName(route.owner)).fetch(await forwardRequest(request,'https://project.internal'+internalPath+url.search,actor));
         }
+        if (!requested && !intakeId && request.method === 'GET' && (path === '/api/intakes' || path === '/api/intake/tasks'))
+          return control.fetch(await forwardRequest(request, CONTROL + '/api/intakes' + url.search, actor));
         if (!requested || requested.length > 180)
           return error('project_required', 400, 'pass --project <owner/name> (a repo from `hub repos list`) or ?project=');
         const repoResponse = await control.fetch(
