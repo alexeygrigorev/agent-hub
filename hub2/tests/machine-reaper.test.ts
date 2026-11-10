@@ -62,6 +62,15 @@ test('stale host snapshots never claim an orphan was killed',async()=>{
  assert.equal((await f.call('/_internal/live-sessions')).status,200);
 });
 
+test('a native process absent from a fresh host snapshot is marked stopped without a pending stop command',async()=>{
+ const f=fixture();await startClaimed(f,'missing-native-session','native-missing');
+ const response=await f.call('/_internal/reap','POST',{dry_run:false}),report=await response.json() as any;
+ assert.equal(response.status,200);assert.equal(report.reaped,1);assert.equal(report.stop_requested,0,JSON.stringify(report));
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get('missing-native-session') as any).state,'stopped');
+ assert.equal((f.database.prepare("SELECT COUNT(*) AS count FROM session_commands WHERE session_id=? AND kind='stop'").get('missing-native-session') as any).count,0);
+ assert.equal(f.events.at(-1)?.path,'/_internal/reaped');
+});
+
 test('dead native pane receives a stop command and confirmed exit releases state immediately',async()=>{
  const f=fixture(),epoch=await startClaimed(f,'dead-session','native-dead'),now=Date.now();
  assert.equal((await f.call('/api/heartbeat','POST',{labels:[],engines:['codex'],capabilities:['headless'],native_sessions:[{

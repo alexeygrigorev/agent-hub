@@ -960,6 +960,12 @@ export class MachineDO {
     }
     for(const candidate of candidates){
       const {session,reason,live}=candidate;
+      if(!live){
+        if(await this.recordReaped(session,reason,inventory.observed_at)){
+          reaped++;actions.push({session_id:session.id,action:'marked_stopped',reason});
+        }
+        continue;
+      }
       if(live&&['exited','missing','dead','stopped'].includes(live.phase)&&live.containment_empty===true){
         if(await this.recordReaped(session,reason,live.observed_at)){reaped++;actions.push({session_id:session.id,action:'marked_stopped',reason});}
         continue;
