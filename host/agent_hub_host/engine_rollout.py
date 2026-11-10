@@ -343,7 +343,7 @@ def smoke_argv(engine: str, managed_argv: list[str], provider: str) -> list[str]
         flag = '--dangerously-skip-permissions'
         if flag not in base:
             base.append(flag)
-        return base + ['-p', SMOKE_PROMPT]
+        return base + ['--model', 'claude-fable-5-2', '--effort', 'medium', '-p', SMOKE_PROMPT]
     if engine == 'opencode':
         return base + ['run', SMOKE_PROMPT]
     if engine == 'agy':

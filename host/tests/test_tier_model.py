@@ -16,6 +16,7 @@ from agent_hub_host.session_control import render_table
     ('codex', 'zai', 'glm-flash'),
     ('codex', 'codex', 'sol'), ('codex', 'codex', 'luna'),
     ('claude', 'claude', 'sonnet'),
+    ('claude', 'claude', 'claude-fable-5-2'),
 ])
 @pytest.mark.parametrize('mode', ['headless', 'interactive'])
 def test_model_survives_default_subscription(engine, provider, model_id, mode):
@@ -140,13 +141,15 @@ def test_interactive_unsupported_adapter_refused_before_claim(tmp_path):
     assert len(calls) == 2
 
 
-def test_claude_routes_are_sonnet_medium_never_haiku():
+def test_claude_routes_keep_sonnet_default_and_allow_only_explicit_fable():
     config = json.loads((Path(__file__).resolve().parents[2] / 'config' / 'model-routing.json').read_text())
     claude = [m for m in config['models']
               if m.get('provider') == 'claude' or m.get('engine') == 'claude'
               or 'claude' in (m['id'] + ' ' + m['model']).lower()]
-    assert [(m['model'], m['effort']) for m in claude] == [('sonnet', 'medium')]
-    assert all(m['id'] == 'sonnet' and m['model'] == 'sonnet' for m in claude)
+    assert [(m['id'], m['model'], m['effort']) for m in claude] == [
+        ('sonnet', 'sonnet', 'medium'), ('claude-fable-5-2', 'fable', 'medium')]
+    assert 'claude-fable-5-2' not in {model for ids in config['tiers'].values() for model in ids}
+    assert 'claude-fable-5-2' not in config['rules'].get('auto_start_models', [])
     assert not [m for m in config['models'] if 'haiku' in (m['id'] + ' ' + m['model']).lower()]
     for ids in config['tiers'].values():
         assert not [i for i in ids if 'haiku' in i]

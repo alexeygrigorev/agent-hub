@@ -49,7 +49,9 @@ export async function pickModelRoute(env: Hub2Env, input: PickInput, random = Ma
   if (!Array.isArray(policy.candidates) || !policy.candidates.length || policy.candidates.length > 32)
     throw new HttpError('model_policy_unconfigured', 503);
   const excluded=new Set(input.exclude_policy_ids||[]);
-  const candidates = policy.candidates.filter(candidate => candidate.enabled && !excluded.has(candidate.id) && isModelPolicyCandidateAllowed(candidate)
+  const candidates = policy.candidates.filter(candidate => candidate.enabled && !excluded.has(candidate.id)
+    && (candidate.id !== 'claude-fable-5-2' || input.model === candidate.id || input.model === candidate.model)
+    && isModelPolicyCandidateAllowed(candidate)
     && (!input.engine || input.engine === candidate.engine)
     && (!input.model || input.model === candidate.model || input.model === candidate.id)
     && (!input.effort || input.effort === candidate.effort));

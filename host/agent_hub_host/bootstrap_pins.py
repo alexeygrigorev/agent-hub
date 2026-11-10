@@ -67,7 +67,7 @@ ANTIGRAVITY_RELEASES = {'darwin_amd64': {'sha512': '6e5c1f534d7c9d68cb90afc7cdce
                    'url': 'https://storage.googleapis.com/antigravity-public/antigravity-cli/1.4.10-5501573669978112/windows-arm/cli_windows_arm64.exe',
                    'version': '1.4.10'}}
 
-ENGINE_PACKAGES = {'claude': '@anthropic-ai/claude-code@2.1.312',
+ENGINE_PACKAGES = {'claude': '@anthropic-ai/claude-code@2.1.322',
  'codex': '@openai/codex@0.166.0',
  'gemini': '@google/gemini-cli@0.66.0',
  'grok': '@xai-official/grok@1.0.70',

@@ -25,7 +25,10 @@ export function modelPolicyCandidateViolation(candidate: ModelPolicyRoute): stri
   if (FORBIDDEN_ZAI_ENGINES.has(engine) || FORBIDDEN_ZAI_ACCOUNTS.has(account) || id.includes('zai-central'))
     return 'zai_picker_route_forbidden';
   if (/haiku/i.test(`${id} ${model}`)) return 'haiku_picker_route_forbidden';
-  if (engine === 'claude' && (model !== 'sonnet' || candidate.effort !== 'medium'))
+  if (engine === 'claude' && !(
+    model === 'sonnet' && candidate.effort === 'medium'
+    || id === 'claude-fable-5-2' && model === 'fable' && candidate.effort === 'medium'
+  ))
     return 'claude_picker_route_forbidden';
   if (/luna/i.test(model) && candidate.effort !== 'max') return 'luna_effort_forbidden';
   if (requiresBoundedEffort(model) && candidate.effort !== 'low' && candidate.effort !== 'medium')

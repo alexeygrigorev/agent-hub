@@ -4,9 +4,11 @@ import {verifyKnownCredential} from './auth';
 import { MeteredDb, initializeSchema } from './db';
 import { SqlReceiptMeter, SQL_PROBE_HEADER, wrapSqlNamespaces } from './sql-receipt';
 import { randomToken, safeEqual, sha256Hex } from './crypto';
+import { credentialKey, openCredential, sealCredential } from './credential-crypto';
 import { actorFrom, bodyObject, boundedString, boundedText, error, hasScope, HttpError, json } from './http';
 import { modelPolicyCandidateViolation, type ModelPolicyRoute } from './model-policy';
 import { isLiveActiveSession, MAX_ACTIVE_SESSIONS } from './session-liveness';
+import { CLAUDE_OAUTH, claudeAuthorization, claudeExchange } from '../../src/credentials';
 import type { Actor, Hub2Env, JsonRecord } from './types';
 
 type CredentialActor=Actor&{family_id?:string;client_id?:string};
@@ -61,6 +63,20 @@ const ONCALL_SCHEMA = [
  'CREATE INDEX oncall_alerts_due ON oncall_alert_deliveries(status,available_at,lease_until,created_at)',
 ];
 
+const ENGINE_SCHEMA = [
+ 'CREATE TABLE IF NOT EXISTS hub2_engine_credential_logins(id TEXT PRIMARY KEY,label TEXT NOT NULL,provider TEXT NOT NULL,sealed TEXT NOT NULL,expires_at INTEGER NOT NULL) WITHOUT ROWID',
+ 'CREATE INDEX IF NOT EXISTS hub2_engine_login_expiry ON hub2_engine_credential_logins(expires_at,id)',
+ 'CREATE TABLE IF NOT EXISTS hub2_engine_rollout(engine TEXT PRIMARY KEY,desired_version TEXT NOT NULL,latest TEXT NOT NULL,rollout_id TEXT,target_version TEXT,previous_version TEXT,canary_machine TEXT,state TEXT NOT NULL,updated_at INTEGER NOT NULL) WITHOUT ROWID',
+ 'CREATE TABLE IF NOT EXISTS hub2_engine_version_reports(machine_id TEXT NOT NULL,engine TEXT NOT NULL,installed TEXT,latest TEXT,result TEXT,updated_at INTEGER NOT NULL,PRIMARY KEY(machine_id,engine)) WITHOUT ROWID',
+ 'CREATE TABLE IF NOT EXISTS hub2_engine_sync_reports(machine_id TEXT NOT NULL,label TEXT NOT NULL,revision TEXT NOT NULL,state TEXT NOT NULL,error TEXT,credential_generation INTEGER,updated_at INTEGER NOT NULL,PRIMARY KEY(machine_id,label)) WITHOUT ROWID',
+];
+
+const CLAUDE_ENGINE_LABEL = 'hub-claude';
+const CLAUDE_ACCOUNT_ID = 'claude';
+const CLAUDE_BASELINE_VERSION = '2.1.312';
+const CLAUDE_LATEST_VERSION = '2.1.322';
+const ENGINE_LOGIN_TTL_MS = 10 * 60_000;
+
 type PairingRow = { id: string; machine_id: string; alias: string; code_hash: string; scopes_json: string; expires_at: number; used_at: number | null };
 type CredentialRow = { actor_id: string; kind: Actor['kind']; resource_id: string | null; generation: string; scopes_json: string;family_id:string;client_id:string;expires_at:number|null;principal_email:string|null;revoked_at:number|null };
 
@@ -77,7 +93,7 @@ export class ControlDO {
     this.db = new MeteredDb(ctx.storage.sql);
     this.sqlReceipts = new SqlReceiptMeter(this.db);
     this.env = wrapSqlNamespaces(env, this.sqlReceipts) as Hub2Env;
-    this.ready=initializeSchema(ctx, this.db, 3, SCHEMA,[ONCALL_SCHEMA,['CREATE TABLE IF NOT EXISTS session_start_reservations(operation_id TEXT PRIMARY KEY,session_id TEXT NOT NULL,expires_at INTEGER NOT NULL) WITHOUT ROWID']],()=>this.scheduleWake());
+    this.ready=initializeSchema(ctx, this.db, 4, SCHEMA,[ONCALL_SCHEMA,['CREATE TABLE IF NOT EXISTS session_start_reservations(operation_id TEXT PRIMARY KEY,session_id TEXT NOT NULL,expires_at INTEGER NOT NULL) WITHOUT ROWID', ...ENGINE_SCHEMA],ENGINE_SCHEMA],async()=>{this.seedEngineRollout();await this.scheduleWake();});
     this.auth=new ControlAuth(ctx,this.db,this.env);this.workers=new WorkerCredentials(ctx,this.db,this.env);
   }
 
@@ -101,6 +117,7 @@ export class ControlDO {
         return await this.finishOncallDelivery(request, oncallDelivery[1], oncallDelivery[2] as 'ack' | 'nack');
       if (url.pathname === '/_actors/register' && request.method === 'POST') return await this.registerActor(request);
       if(url.pathname==='/api/model-policy'||url.pathname==='/_routing-policy')return await this.modelPolicy(request);
+      if(url.pathname==='/api/engines'||url.pathname.startsWith('/api/engines/'))return await this.engines(request,url.pathname);
       if (url.pathname === '/_routes/register' && request.method === 'POST') return await this.registerRoute(request);
       if (url.pathname === '/_delegate' && request.method === 'POST') return await this.delegate(request);
       if (url.pathname === '/_mailboxes' && request.method === 'POST') return this.delegatedMailboxes(request);
@@ -124,6 +141,380 @@ export class ControlDO {
       if (caught instanceof HttpError) return error(caught.code, caught.status);
       return error('internal_error', 500);
     }
+  }
+
+  private seedEngineRollout(): void {
+    this.db.run(
+      "INSERT OR IGNORE INTO hub2_engine_rollout(engine,desired_version,latest,state,updated_at) VALUES('claude',?,?, 'stable',?)",
+      CLAUDE_BASELINE_VERSION, CLAUDE_LATEST_VERSION, Date.now(),
+    );
+  }
+
+  private async accountRequest(path: string, method: string, actor: Actor, body?: unknown): Promise<Response> {
+    const url = 'https://account.hub2.internal' + path;
+    const headers = new Headers({ 'x-hub2-actor': JSON.stringify(actor), 'x-hub2-account-id': CLAUDE_ACCOUNT_ID });
+    if (body !== undefined) headers.set('Content-Type', 'application/json');
+    return this.env.ACCOUNTS.get(this.env.ACCOUNTS.idFromName(CLAUDE_ACCOUNT_ID)).fetch(new Request(url, {
+      method, headers, ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    }));
+  }
+
+  private async engineCredentialKey(): Promise<CryptoKey> {
+    try { return await credentialKey(this.env.HUB2_CREDENTIAL_KEY || ''); }
+    catch { throw new HttpError('credential_key_unavailable', 503); }
+  }
+
+  private async sealEngineLogin(id: string, value: unknown): Promise<string> {
+    const sealed = await sealCredential(await this.engineCredentialKey(),
+      new TextEncoder().encode(JSON.stringify(value)), new TextEncoder().encode('hub2-engine-login:' + id));
+    return JSON.stringify({ iv: Array.from(sealed.iv), data: Array.from(sealed.data) });
+  }
+
+  private async openEngineLogin(id: string, value: string): Promise<any> {
+    try {
+      const sealed = JSON.parse(value);
+      const plain = await openCredential(await this.engineCredentialKey(), new Uint8Array(sealed.iv),
+        new Uint8Array(sealed.data), new TextEncoder().encode('hub2-engine-login:' + id));
+      return JSON.parse(new TextDecoder().decode(plain));
+    } catch (caught) {
+      if (caught instanceof HttpError) throw caught;
+      throw new HttpError('credential_decryption_failed', 503);
+    }
+  }
+
+  private async engineRevision(version: string): Promise<string> {
+    const digest = await sha256Hex(CLAUDE_ENGINE_LABEL + ':' + version);
+    return `${digest.slice(0, 8)}-${digest.slice(8, 12)}-${digest.slice(12, 16)}-${digest.slice(16, 20)}-${digest.slice(20, 32)}`;
+  }
+
+  private engineRollout(): any {
+    return this.db.one<any>("SELECT * FROM hub2_engine_rollout WHERE engine='claude'") || {
+      engine: 'claude', desired_version: CLAUDE_BASELINE_VERSION, latest: CLAUDE_LATEST_VERSION,
+      rollout_id: null, target_version: null, previous_version: null, canary_machine: null,
+      state: 'stable', updated_at: Date.now(),
+    };
+  }
+
+  private engineVersionFor(machineId?: string): string {
+    const rollout = this.engineRollout();
+    if (rollout.state === 'canary_pending' && machineId === rollout.canary_machine && rollout.target_version)
+      return rollout.target_version;
+    return rollout.desired_version;
+  }
+
+  private async engines(request: Request, path: string): Promise<Response> {
+    const actor = actorFrom(request);
+    if (path === '/api/engines' && request.method === 'GET') return await this.listManagedEngines(actor);
+    if (path === '/api/engines/sync' && request.method === 'GET') return await this.syncManagedEngines(actor);
+    if (path === '/api/engines/admission' && request.method === 'POST') return await this.engineAdmission(request, actor);
+    if (path === '/api/engines/credential-logins' || /^\/api\/engines\/credential-logins\/[0-9a-f-]{36}$/i.test(path))
+      return await this.engineCredentialLogin(request, path, actor);
+    if (path === '/api/engines/update' && request.method === 'POST') return await this.startClaudeRollout(request, actor);
+    if (path === '/api/engines/versions' && request.method === 'GET') return await this.engineVersions(request, actor);
+    if (path === '/api/engines/version-report' && request.method === 'POST') return await this.reportEngineVersions(request, actor);
+    if (path === '/api/engines/sync-report' && request.method === 'POST') return await this.reportEngineSync(request, actor);
+    if (path === '/api/engines/' + CLAUDE_ENGINE_LABEL && request.method === 'POST') return await this.acknowledgeEngine(request, actor);
+    const credentialRoute = path.match(/^\/api\/engines\/hub-claude\/(credential|rejection)$/);
+    if (credentialRoute) return await this.engineCredential(request, credentialRoute[1] as 'credential' | 'rejection', actor);
+    return error('not_found', 404);
+  }
+
+  private async listManagedEngines(actor?: Actor): Promise<Response> {
+    if (!hasScope(actor, 'operator:admin')) return error('forbidden', 403);
+    const account = await this.accountRequest('/_internal/routing', 'GET', actor!);
+    if (!account.ok) return account;
+    const routing = await account.json() as any;
+    const hostsResponse = await this.accountRequest('/api/account/hosts', 'GET', actor!);
+    if (!hostsResponse.ok) return hostsResponse;
+    const hostsBody = await hostsResponse.json() as any;
+    const hosts = Array.isArray(hostsBody.items) ? hostsBody.items : [];
+    const rollout = this.engineRollout();
+    const reports = this.db.all<any>('SELECT * FROM hub2_engine_sync_reports ORDER BY machine_id,label');
+    const byHost = new Map(reports.map(row => [row.machine_id, row]));
+    const version = rollout.desired_version;
+    const revision = await this.engineRevision(version);
+    return json({
+      logins: this.db.all<any>('SELECT id,label,provider,expires_at FROM hub2_engine_credential_logins WHERE expires_at>? ORDER BY expires_at', Date.now()),
+      engines: [{ label: CLAUDE_ENGINE_LABEL, provider: 'claude', version, revision, status: routing.credential_status || 'unknown', supports_goal: true }],
+      installations: hosts.map((host: any) => ({ machine_id: host.id, label: CLAUDE_ENGINE_LABEL,
+        revision: this.engineVersionFor(host.id) === version ? revision : null })),
+      sync_status: hosts.map((host: any) => {
+        const report = byHost.get(host.id);
+        return { machine_id: host.id, machine: host.id, online: null, host_state: report?.state || 'unknown',
+          last_sync_at: report?.updated_at ? new Date(report.updated_at).toISOString() : null,
+          accounts: [{ label: CLAUDE_ENGINE_LABEL, state: report?.state || 'unknown',
+            ...(report?.error ? { error: report.error } : {}), credential_generation: routing.credential_generation,
+            acked_generation: host.ack_generation ?? null }] };
+      }),
+      credentials: [{ label: CLAUDE_ENGINE_LABEL, provider: 'claude', generation: routing.credential_generation ?? null,
+        status: routing.credential_status || 'unknown', hosts: hosts.map((host: any) => host.id) }],
+      credential_rejections: [], account_migrations: [],
+    });
+  }
+
+  private async syncManagedEngines(actor?: Actor): Promise<Response> {
+    if (!actor || actor.kind !== 'machine' || !actor.resource_id) return error('forbidden', 403);
+    const credentialResponse = await this.accountRequest('/api/account/credentials?min_validity_ms=10800000', 'GET', actor);
+    if (!credentialResponse.ok) return credentialResponse;
+    const credential = await credentialResponse.json() as any;
+    if (credential.provider !== 'claude' || !Number.isSafeInteger(credential.generation)
+      || !credential.files || typeof credential.files !== 'object' || Array.isArray(credential.files))
+      return error('managed_credential_unavailable', 503);
+    const version = this.engineVersionFor(actor.resource_id);
+    const revision = await this.engineRevision(version);
+    return json({ engines: [{ label: CLAUDE_ENGINE_LABEL, provider: 'claude', version, revision,
+      files: credential.files, env: {}, args: [], credential_generation: credential.generation,
+      credential_paths: ['.claude/.credentials.json'] }], logins: [], latest_version: this.engineRollout().latest });
+  }
+
+  private async engineAdmission(request: Request, actor?: Actor): Promise<Response> {
+    if (!actor || actor.kind !== 'machine' || !actor.resource_id) return error('forbidden', 403);
+    const body = await bodyObject(request, 4096);
+    if (body.label !== CLAUDE_ENGINE_LABEL || body.native !== true) return error('invalid_label', 400);
+    const response = await this.accountRequest('/_internal/routing', 'GET', actor);
+    if (!response.ok) return response;
+    const routing = await response.json() as any;
+    const account = routing.account;
+    const eligible = Array.isArray(routing.hosts) && routing.hosts.includes(actor.resource_id);
+    let reason: string | null = null;
+    const accountMapped = account?.provider === 'claude' && (account.enabled === true || account.enabled === 1);
+    if (!accountMapped) reason = 'account_unmapped';
+    else if (!eligible) reason = 'host_not_approved';
+    else if (routing.credential_usable !== true) reason = typeof routing.credential_status === 'string'
+      ? 'credential_' + routing.credential_status : 'credential_unavailable';
+    const quota = routing.quota;
+    const remaining = quota && typeof quota.remaining === 'number' && Number.isFinite(quota.remaining)
+      ? quota.remaining : null;
+    const minimum = typeof account?.min_remaining === 'number' && Number.isFinite(account.min_remaining)
+      ? account.min_remaining : 0;
+    if (!reason && routing.fresh === true && remaining !== null && remaining <= minimum) reason = 'quota_exhausted';
+    return json({ launch_allowed: reason === null, profile_supported: accountMapped,
+      ...(reason ? { reason } : {}), ...(routing.fresh === true ? {} : { quota_warning: 'quota_probe_unavailable' }),
+      ...(Number.isSafeInteger(routing.credential_generation) ? { credential_generation: routing.credential_generation } : {}),
+      account_label: CLAUDE_ENGINE_LABEL, observed_at: new Date(Date.now() - 5000).toISOString(),
+      server_observed_at: new Date().toISOString() });
+  }
+
+  private async engineCredential(request: Request, route: 'credential' | 'rejection', actor?: Actor): Promise<Response> {
+    if (!actor || actor.kind !== 'machine' || !actor.resource_id) return error('forbidden', 403);
+    if (route === 'credential' && request.method === 'GET') {
+      const current = await this.accountRequest('/api/account/credentials?min_validity_ms=0', 'GET', actor);
+      if (!current.ok) return current;
+      const credential = await current.json() as any;
+      return json({ label: CLAUDE_ENGINE_LABEL, generation: credential.generation, status: 'ready', files: credential.files });
+    }
+    if (request.method !== 'POST') return error('method_not_allowed', 405);
+    const body = await bodyObject(request, 98_304);
+    if (route === 'rejection') {
+      if (!Number.isSafeInteger(body.generation) || !['provider_unauthorized', 'credential_rejected'].includes(String(body.reason)))
+        return error('invalid_rejection', 400);
+      const routingResponse = await this.accountRequest('/_internal/routing', 'GET', actor);
+      if (!routingResponse.ok) return routingResponse;
+      const routing = await routingResponse.json() as any;
+      if (body.generation !== routing.credential_generation)
+        return json({ status: 'superseded', generation: routing.credential_generation });
+      return await this.accountRequest('/api/account/credential-rejection', 'POST', actor, body);
+    }
+    const baseGeneration = Number.isSafeInteger(body.base_generation) ? Number(body.base_generation) : null;
+    if (baseGeneration === null || !body.files || typeof body.files !== 'object'
+      || Array.isArray(body.files) || Object.keys(body.files).length > 8
+      || !Object.entries(body.files).every(([path, value]) => path === '.claude/.credentials.json'
+        && typeof value === 'string' && value.length > 0 && value.length <= 16_000)) return error('invalid_credential', 400);
+    const currentResponse = await this.accountRequest('/api/account/credentials?min_validity_ms=0', 'GET', actor);
+    if (!currentResponse.ok) return currentResponse;
+    const current = await currentResponse.json() as any;
+    if (baseGeneration !== current.generation || baseGeneration < 1)
+      return json({ label: CLAUDE_ENGINE_LABEL, generation: current.generation, status: 'ready', files: current.files, accepted: false });
+    const published = await this.accountRequest('/api/account/rotation', 'POST', actor, {
+      expected_generation: baseGeneration, files: body.files,
+    });
+    if (!published.ok) {
+      if (published.status !== 409) return published;
+      const latestResponse = await this.accountRequest('/api/account/credentials?min_validity_ms=0', 'GET', actor);
+      if (!latestResponse.ok) return latestResponse;
+      const latest = await latestResponse.json() as any;
+      return json({ label: CLAUDE_ENGINE_LABEL, generation: latest.generation, status: 'ready', files: latest.files, accepted: false });
+    }
+    const result = await published.json() as any;
+    return json({ label: CLAUDE_ENGINE_LABEL, generation: result.generation, status: 'ready',
+      files: body.files, accepted: true });
+  }
+
+  private async engineCredentialLogin(request: Request, path: string, actor?: Actor): Promise<Response> {
+    if (!hasScope(actor, 'operator:admin')) return error('forbidden', 403);
+    if (request.method !== 'POST') return error('method_not_allowed', 405);
+    const idMatch = path.match(/^\/api\/engines\/credential-logins\/([0-9a-f-]{36})$/i);
+    const body = await bodyObject(request, 98_304);
+    if (!idMatch) {
+      if (body.provider !== 'claude' || body.label !== CLAUDE_ENGINE_LABEL
+        || (body.version !== undefined && (typeof body.version !== 'string' || !/^\d+\.\d+\.\d+$/.test(body.version))))
+        return error('invalid_login', 400);
+      const accountResponse = await this.accountRequest('/_internal/routing', 'GET', actor!);
+      if (!accountResponse.ok) return accountResponse;
+      const routing = await accountResponse.json() as any;
+      if (routing.account?.provider !== 'claude') return error('account_provider_mismatch', 409);
+      this.db.run('DELETE FROM hub2_engine_credential_logins WHERE expires_at<=?', Date.now());
+      if (Number(this.db.one<{ total: number }>('SELECT COUNT(*) AS total FROM hub2_engine_credential_logins')?.total || 0) >= 32)
+        return error('login_capacity', 409);
+      const id = crypto.randomUUID();
+      const auth = await claudeAuthorization();
+      const sealed = await this.sealEngineLogin(id, { verifier: auth.verifier, state: auth.state });
+      const expiresAt = Date.now() + ENGINE_LOGIN_TTL_MS;
+      this.db.run('INSERT INTO hub2_engine_credential_logins(id,label,provider,sealed,expires_at) VALUES(?,?,?,?,?)',
+        id, CLAUDE_ENGINE_LABEL, 'claude', sealed, expiresAt);
+      return json({ id, url: auth.url, expires_in: ENGINE_LOGIN_TTL_MS / 1000,
+        expires_at: new Date(expiresAt).toISOString() }, 201);
+    }
+
+    const row = this.db.one<{ id: string; label: string; provider: string; sealed: string; expires_at: number }>(
+      'SELECT * FROM hub2_engine_credential_logins WHERE id=?', idMatch[1]);
+    if (!row || row.expires_at <= Date.now()) {
+      if (row) this.db.run('DELETE FROM hub2_engine_credential_logins WHERE id=?', row.id);
+      return error('login_expired', 410);
+    }
+    const login = await this.openEngineLogin(row.id, row.sealed);
+    const publish = async (files: unknown): Promise<Response> => {
+      const currentResponse = await this.accountRequest('/_internal/routing', 'GET', actor!);
+      if (!currentResponse.ok) return currentResponse;
+      const current = await currentResponse.json() as any;
+      const expected = Number.isSafeInteger(current.credential_generation) ? current.credential_generation : 0;
+      const saved = await this.accountRequest('/api/account/credentials', 'PUT', actor!, {
+        provider: 'claude', expected_generation: expected, files,
+      });
+      if (!saved.ok) return saved;
+      const result = await saved.json() as any;
+      this.db.run('DELETE FROM hub2_engine_credential_logins WHERE id=?', row.id);
+      return json({ status: 'configured', label: CLAUDE_ENGINE_LABEL, credential_generation: result.generation });
+    };
+    if (body.files !== undefined) return await publish(body.files);
+    if (typeof body.code !== 'string' || body.code.length > 4096 || !/^[A-Za-z0-9_\-#.~]+$/.test(body.code.trim()))
+      return error('invalid_code', 400);
+    const result = await claudeExchange(body.code, login.verifier, login.state, (input, init) => fetch(input, init), Date.now());
+    if (result.ok) return await publish(result.files);
+    if (result.blocked && body.host_fallback === true) {
+      return json({ status: 'host_exchange_required', provider_status: result.providerStatus ?? null,
+        reason: result.detail ?? 'egress_blocked', expires_at: new Date(row.expires_at).toISOString(),
+        exchange: { token_url: CLAUDE_OAUTH.token, profile_url: CLAUDE_OAUTH.profile,
+          client_id: CLAUDE_OAUTH.client, redirect_uri: CLAUDE_OAUTH.redirect,
+          scopes: CLAUDE_OAUTH.scopes, state: login.state, code_verifier: login.verifier } }, 202);
+    }
+    if (!result.blocked) this.db.run('DELETE FROM hub2_engine_credential_logins WHERE id=?', row.id);
+    return json({ error: result.blocked ? 'login_exchange_blocked' : result.reason,
+      provider_status: result.providerStatus ?? null, reason: result.detail ?? null }, result.blocked ? 502 : 400);
+  }
+
+  private async startClaudeRollout(request: Request, actor?: Actor): Promise<Response> {
+    const body = await bodyObject(request, 16_384);
+    if (body.engine !== 'claude') return error('invalid_engine', 400);
+    const canary = typeof body.canary === 'string' && /^[A-Za-z0-9_.-]{1,120}$/.test(body.canary)
+      ? body.canary : typeof body.machine === 'string' && /^[A-Za-z0-9_.-]{1,120}$/.test(body.machine) ? body.machine : 'RMTHZ';
+    const admin = hasScope(actor, 'operator:admin');
+    const canaryHost = actor?.kind === 'machine' && actor.resource_id === canary;
+    if (!admin && !canaryHost) return error('forbidden', 403);
+    if (admin) {
+      const hostsResponse = await this.accountRequest('/api/account/hosts', 'GET', actor!);
+      if (!hostsResponse.ok) return hostsResponse;
+      const hostsBody = await hostsResponse.json() as any;
+      const enrolled = Array.isArray(hostsBody.items) && hostsBody.items.some((host: any) => host?.id === canary);
+      if (!enrolled) return error('unknown_canary', 400);
+    }
+    const current = this.engineRollout();
+    if (current.state === 'canary_pending') {
+      if (current.target_version === CLAUDE_LATEST_VERSION && current.canary_machine === canary)
+        return json({ status: current.state, engine: 'claude', target_version: current.target_version,
+          canary: canary, rollout_id: current.rollout_id });
+      return error('rollout_in_progress', 409);
+    }
+    if (current.state === 'rolling') return error('rollout_in_progress', 409);
+    if (current.desired_version === CLAUDE_LATEST_VERSION && current.state === 'stable')
+      return json({ status: 'already_current', engine: 'claude', desired_version: current.desired_version });
+    const id = crypto.randomUUID();
+    const now = Date.now();
+    this.db.run("UPDATE hub2_engine_rollout SET rollout_id=?,target_version=?,previous_version=desired_version,canary_machine=?,state='canary_pending',latest=?,updated_at=? WHERE engine='claude'",
+      id, CLAUDE_LATEST_VERSION, canary, CLAUDE_LATEST_VERSION, now);
+    return json({ status: 'canary_pending', engine: 'claude', target_version: CLAUDE_LATEST_VERSION,
+      canary, rollout_id: id }, 202);
+  }
+
+  private async engineVersions(request: Request, actor?: Actor): Promise<Response> {
+    if (!actor || (!hasScope(actor, 'operator:admin') && actor.kind !== 'machine')) return error('forbidden', 403);
+    const machine = hasScope(actor, 'operator:admin') ? new URL(request.url).searchParams.get('machine') : actor.resource_id;
+    const rollout = this.engineRollout();
+    const reports = machine
+      ? this.db.all<any>('SELECT * FROM hub2_engine_version_reports WHERE machine_id=? ORDER BY engine', machine)
+      : this.db.all<any>('SELECT * FROM hub2_engine_version_reports ORDER BY machine_id,engine');
+    return json({ desired: { claude: { version: rollout.desired_version, latest: rollout.latest, updated_at: rollout.updated_at } },
+      reports, rollouts: [{ id: rollout.rollout_id, engine: 'claude', target_version: rollout.target_version,
+        canary_machine: rollout.canary_machine, state: rollout.state, updated_at: rollout.updated_at,
+        detail: { previous_version: rollout.previous_version } }] });
+  }
+
+  private async reportEngineVersions(request: Request, actor?: Actor): Promise<Response> {
+    if (!actor || actor.kind !== 'machine' || !actor.resource_id) return error('forbidden', 403);
+    const body = await bodyObject(request, 16_384);
+    const engines = body.engines;
+    if (!engines || typeof engines !== 'object' || Array.isArray(engines) || Object.keys(engines).length > 8)
+      return error('invalid_report', 400);
+    const row = (engines as Record<string, any>).claude;
+    if (!row || typeof row !== 'object' || Array.isArray(row)) return json({ status: 'recorded', engines: [] });
+    const semver = (value: unknown) => typeof value === 'string' && /^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$/.test(value) ? value : null;
+    const installed = semver(row.installed);
+    const latest = semver(row.latest);
+    const result = typeof row.result === 'string' && /^[A-Za-z0-9_]{1,32}$/.test(row.result) ? row.result : null;
+    const now = Date.now();
+    this.db.run('INSERT OR REPLACE INTO hub2_engine_version_reports(machine_id,engine,installed,latest,result,updated_at) VALUES(?,?,?,?,?,?)',
+      actor.resource_id, 'claude', installed, latest, result, now);
+    const rollout = this.engineRollout();
+    if (rollout.state === 'canary_pending' && rollout.canary_machine === actor.resource_id) {
+      if (result === 'green' && installed === rollout.target_version) {
+        this.db.run("UPDATE hub2_engine_rollout SET desired_version=target_version,state='rolling',updated_at=? WHERE engine='claude'", now);
+      } else if (result !== null) {
+        this.db.run("UPDATE hub2_engine_rollout SET state='rolled_back',target_version=NULL,updated_at=? WHERE engine='claude'", now);
+      }
+    } else if (rollout.state === 'rolling' && latest === rollout.desired_version && result === 'failed') {
+      this.db.run("UPDATE hub2_engine_rollout SET desired_version=COALESCE(previous_version,desired_version),state='rolled_back',target_version=NULL,updated_at=? WHERE engine='claude'", now);
+    } else if (rollout.state === 'rolling' && installed === rollout.desired_version && result === 'green') {
+      const hostsResponse = await this.accountRequest('/api/account/hosts', 'GET', { id: 'hub2-engine-rollout', kind: 'operator', scopes: ['operator:admin'] });
+      if (hostsResponse.ok) {
+        const hostsBody = await hostsResponse.json() as any;
+        const hosts = Array.isArray(hostsBody.items) ? hostsBody.items.map((host: any) => host.id).filter((id: unknown) => typeof id === 'string') : [];
+        const ready = hosts.length > 0 && hosts.every((host: string) => {
+          const report = this.db.one<any>('SELECT installed,result FROM hub2_engine_version_reports WHERE machine_id=? AND engine=?', host, 'claude');
+          return report?.installed === rollout.desired_version && report?.result === 'green';
+        });
+        if (ready) this.db.run("UPDATE hub2_engine_rollout SET state='stable',target_version=NULL,previous_version=NULL,canary_machine=NULL,updated_at=? WHERE engine='claude'", now);
+      }
+    }
+    return json({ status: 'recorded', engines: ['claude'] });
+  }
+
+  private async reportEngineSync(request: Request, actor?: Actor): Promise<Response> {
+    if (!actor || actor.kind !== 'machine' || !actor.resource_id) return error('forbidden', 403);
+    const body = await bodyObject(request, 16_384);
+    if (!['synced', 'held'].includes(String(body.state)) || !Array.isArray(body.items) || body.items.length > 32)
+      return error('invalid_report', 400);
+    const item = body.items.find((value: any) => value?.label === CLAUDE_ENGINE_LABEL);
+    if (!item || typeof item.revision !== 'string' || !/^[a-f0-9-]{36}$/.test(item.revision)
+      || !['installed', 'failed'].includes(item.state)) return json({ status: 'recorded' });
+    const currentRevision = await this.engineRevision(this.engineVersionFor(actor.resource_id));
+    if (item.revision !== currentRevision) return error('revision_changed', 409);
+    const errorCode = item.state === 'failed' && typeof item.error === 'string' && /^[A-Za-z0-9_]{1,64}$/.test(item.error) ? item.error : null;
+    const generation = Number.isSafeInteger(item.credential_generation) ? Number(item.credential_generation) : null;
+    if (item.state === 'installed' && generation !== null) {
+      const ack = await this.accountRequest('/api/account/credentials', 'POST', actor, { generation });
+      if (!ack.ok) return ack;
+    }
+    this.db.run('INSERT OR REPLACE INTO hub2_engine_sync_reports(machine_id,label,revision,state,error,credential_generation,updated_at) VALUES(?,?,?,?,?,?,?)',
+      actor.resource_id, CLAUDE_ENGINE_LABEL, item.revision, item.state, errorCode, generation, Date.now());
+    return json({ status: 'recorded' });
+  }
+
+  private async acknowledgeEngine(request: Request, actor?: Actor): Promise<Response> {
+    if (!actor || actor.kind !== 'machine' || !actor.resource_id) return error('forbidden', 403);
+    const body = await bodyObject(request, 4096);
+    const current = await this.engineRevision(this.engineVersionFor(actor.resource_id));
+    if (body.revision !== current) return error('revision_changed', 409);
+    return json({ status: 'installed', label: CLAUDE_ENGINE_LABEL });
   }
 
   private bearer(request: Request): string | undefined {

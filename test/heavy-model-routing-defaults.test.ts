@@ -49,6 +49,21 @@ describe('heavy model routing defaults', () => {
     }
   });
 
+  it('keeps Claude Fable out of automatic tiers while admitting an explicit Fable pin', () => {
+    const fable = models.get('claude-fable-5-2');
+    expect(fable).toMatchObject({ model: 'fable', provider: 'claude', engine: 'claude', effort: 'medium' });
+    expect(Object.values(policy.tiers as any).flat()).not.toContain('claude-fable-5-2');
+    expect((policy.rules as any).auto_start_models).not.toContain('claude-fable-5-2');
+    const route = routeFor(fable);
+    const advertisement = [{ engine: fable.engine, profile: route.profile, model: fable.model,
+      effort: fable.effort, account: route.account }];
+    expect(modelCandidates({}, route, advertisement, quota, NOW).map(candidate => candidate.id))
+      .not.toContain('claude-fable-5-2');
+    const [selected] = modelCandidates({ model: 'claude-fable-5-2',
+      engine_override_reason: 'Explicit request for Claude Fable 5.2.' }, route, advertisement, quota, NOW);
+    expect(selected).toMatchObject({ id: 'claude-fable-5-2', model: 'fable', effort: 'medium' });
+  });
+
   it('keeps every heavy model at medium effort and uses the non-high Argon model id', () => {
     for (const id of REQUIRED_HEAVY_MODEL_IDS) {
       const model = models.get(id);

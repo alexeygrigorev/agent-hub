@@ -209,6 +209,13 @@ class CapabilityTest(unittest.TestCase):
         self.assertNotIn('claude', caps)
         self.assertNotIn('shell', caps)
 
+    def test_claude_capability_can_install_without_global_claude(self):
+        config = {'routes': {'claude': {'provider': 'claude'}}}
+        with mock.patch.object(nl.provider_home, 'claude_install_available', return_value=True), \
+             mock.patch.object(nl.shutil, 'which', return_value=None):
+            self.assertEqual(nl.NativeLauncher(config).capabilities()['claude'],
+                             {'headless', 'interactive', 'effort'})
+
 
 class ProviderHomeTest(unittest.TestCase):
     zai_bundle = {'config': {'schemaVersion': 1}, 'zai_token': 'test-token-value-no-spaces',
@@ -350,6 +357,39 @@ class LaunchReceiptTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             adapter.launch('t1', {'engine': 'codex', 'workspace': '/', 'model': 'm', 'prompt': 'p',
                                   'interactive': False, 'timeout_seconds': 600})
+
+    def test_managed_claude_launch_uses_absolute_versioned_binary(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as workspace:
+            native_id = 'd6cf9872-8597-48a5-be64-990cdef4db31'
+            deadline = int(time.time() * 1000) + 500000
+            captured = {}
+
+            def runner(argv, **options):
+                child = argv[argv.index('--') + 1:]
+                captured['child'] = child
+                return subprocess.CompletedProcess(argv, 0, json.dumps({
+                    'id': native_id, 'tag': 'task-managed-claude', 'workspace': workspace,
+                    'command': child, 'deadline_ms': deadline,
+                }), '')
+
+            adapter = nl.NativeLauncher({'routes': {'claude': {'provider': 'claude'}}, 'min_free_mem_mb': 0},
+                                        runner=runner)
+            spec = {'workspace': workspace, 'engine': 'claude', 'model': 'fable', 'effort': 'medium',
+                    'prompt': 'analyze safely', 'interactive': False, 'timeout_seconds': 600,
+                    'provider_home': '/private/manifest.json', 'client': mock.Mock(),
+                    'session_id': 'session-managed', 'operation_id': 'operation-managed', 'epoch': 1}
+            binding = {'runtime_deadline': deadline,
+                       'engine_binary_path': '/private/engines/claude-2.1.322/claude'}
+            with mock.patch.object(nl, 'session_binding', return_value=binding), \
+                 mock.patch.object(nl, 'native_environment', return_value={'CLAUDE_CONFIG_DIR': '/private/home/.claude'}), \
+                 mock.patch.object(adapter, 'wait_first_action', return_value={'session_id': native_id,
+                                                                               'first_action_verified': True}), \
+                 mock.patch.object(adapter, 'record_evidence'):
+                adapter.launch('managed-claude', spec)
+            self.assertEqual(captured['child'][0], binding['engine_binary_path'])
+            self.assertEqual(captured['child'][captured['child'].index('--model') + 1], 'fable')
+            self.assertEqual(captured['child'][captured['child'].index('--effort') + 1], 'medium')
 
     def test_wait_first_action_success_without_poll(self):
         with tempfile.TemporaryDirectory() as tmp:

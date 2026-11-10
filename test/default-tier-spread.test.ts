@@ -27,12 +27,15 @@ const metered = (at: string, pct: number, now: number) => JSON.stringify({
 const broken = (at: string) => JSON.stringify({ status: 'unknown', error: 'unavailable', observed_at: at, details: { limit_reached: null }, windows: {} });
 
 describe('default tier policy', () => {
-  it('routes Claude only through Sonnet at medium effort in every tier', () => {
+  it('keeps Sonnet as the default and exposes Fable only as an explicit route', () => {
     const claudeModels = (policy.models as any[]).filter(model =>
       model.provider === 'claude' || model.engine === 'claude' ||
       /claude/i.test(`${model.id} ${model.model}`));
     expect(claudeModels.map(({ id, model, effort }) => ({ id, model, effort })))
-      .toEqual([{ id: 'sonnet', model: 'sonnet', effort: 'medium' }]);
+      .toEqual([
+        { id: 'sonnet', model: 'sonnet', effort: 'medium' },
+        { id: 'claude-fable-5-2', model: 'fable', effort: 'medium' },
+      ]);
 
     const byId = new Map((policy.models as any[]).map(model => [model.id, model]));
     for (const model of policy.models as any[]) {
@@ -55,6 +58,8 @@ describe('default tier policy', () => {
       ...((Array.isArray((policy.rules as any).fallback_models)
         ? (policy.rules as any).fallback_models : []) as string[]),
     ];
+    expect(defaultRouteIds).not.toContain('claude-fable-5-2');
+    expect(Object.values(policy.tiers).flat()).not.toContain('claude-fable-5-2');
     for (const id of defaultRouteIds) {
       expect(String(id).toLowerCase()).not.toContain('haiku');
       const model: any = byId.get(id);

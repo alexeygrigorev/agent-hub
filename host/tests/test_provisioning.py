@@ -58,6 +58,8 @@ def test_managed_codex_orin_reports_canonical_codex_service(monkeypatch):
 
 
 def test_add_rotate_remove_and_preserve_operator_profile(monkeypatch):
+    from agent_hub_host import engine_rollout
+    monkeypatch.setattr(engine_rollout, 'deferred_labels', lambda: set())
     requests = []
     desired = [bundle()]
     def request(method, path, payload=None):
@@ -1659,9 +1661,18 @@ def test_managed_claude_execution_argv_forces_sonnet_medium(tmp_path, monkeypatc
 
 
 def test_managed_claude_effort_marker_rejects_non_medium():
-    with pytest.raises(ValueError, match='Claude routes require Sonnet at medium effort'):
+    with pytest.raises(ValueError, match='Claude routes require medium effort'):
         p.managed_claude_route_args(
             {'provider': 'claude', 'args': []}, [], ['--hub-session-effort=high'])
+
+
+def test_managed_claude_route_preserves_explicit_fable_model():
+    args = p.managed_claude_route_args(
+        {'provider': 'claude', 'args': ['--model', 'sonnet']}, [],
+        ['--model', 'fable', '--hub-session-effort=medium', '-p', 'say ok'])
+    assert args[args.index('--model') + 1] == 'fable'
+    assert args[args.index('--effort') + 1] == 'medium'
+    assert args[-2:] == ['-p', 'say ok']
 
 
 def test_antigravity_environment_drops_user_proxy_variables(tmp_path, monkeypatch):

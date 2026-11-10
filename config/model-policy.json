@@ -41,6 +41,16 @@
       "enabled": true
     },
     {
+      "id": "claude-fable-5-2",
+      "engine": "claude",
+      "model": "fable",
+      "effort": "medium",
+      "account_id": "claude",
+      "weight": 1,
+      "capabilities": [],
+      "enabled": true
+    },
+    {
       "id": "go-muse",
       "engine": "go",
       "model": "opencode-go/muse-spark-1.3-contributor",

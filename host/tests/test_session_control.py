@@ -742,6 +742,25 @@ class TestSessionControlCli(unittest.TestCase):
             payload = transport.call_args.args[2]
             self.assertTrue(payload.get('require_ready'))
 
+    def test_start_explicit_fable_model_requires_claude_and_forwards_exact_request(self):
+        for model in ('fable', 'claude-fable-5-2'):
+            with patch.object(session_control, 'request', return_value={'id': 'fable-session'}) as transport:
+                session_control.execute(self.parse(
+                    'start', '--workspace', 'demo', '--engine', 'claude', '--model', model,
+                    '--reason', 'The task explicitly requests Fable 5.2', '--prompt', 'analyze this', '--key', 'fable-key'))
+            payload = transport.call_args.args[2]
+            self.assertEqual(payload['engine'], 'claude')
+            self.assertEqual(payload['model'], model)
+            self.assertEqual(payload['engine_override_reason'], 'The task explicitly requests Fable 5.2')
+
+        with patch.object(session_control, 'request') as transport:
+            with self.assertRaisesRegex(ValueError, '--model fable requires --engine claude'):
+                session_control.execute(self.parse('start', '--workspace', 'demo', '--model', 'fable', '--prompt', 'work'))
+            with self.assertRaisesRegex(ValueError, 'Engine override requires an explanation'):
+                session_control.execute(self.parse('start', '--workspace', 'demo', '--engine', 'claude',
+                                                    '--model', 'fable', '--prompt', 'work'))
+        transport.assert_not_called()
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 
 from .client import private_file
+from . import provider_home
 from .provider_home import clean_provider_environment, native_environment, session_binding
 
 FIRST_ACTION_INSTRUCTION = (
@@ -406,7 +407,9 @@ class NativeLauncher:
         for engine, route in self.config.get("routes", {}).items():
             provider = route.get("provider") if isinstance(route, dict) else None
             supported = PROVIDER_CAPABILITIES.get(provider, set())
-            if supported and shutil.which(PROVIDER_BINARIES.get(provider, "")):
+            available = provider_home.claude_install_available() if provider == 'claude' else bool(
+                shutil.which(PROVIDER_BINARIES.get(provider, "")))
+            if supported and available:
                 result[engine] = set(supported)
         return result
 
@@ -447,6 +450,11 @@ class NativeLauncher:
                                    specification["session_id"], specification["operation_id"],
                                    specification["epoch"])
             runtime_deadline = data["runtime_deadline"]
+            if provider == 'claude':
+                binary = data.get('engine_binary_path')
+                if not isinstance(binary, str) or not Path(binary).is_absolute():
+                    raise RuntimeError('native_managed_engine_unverified')
+                child[0] = binary
             # Ambient credentials were already sanitized in spawn_environment
             # (client env) BEFORE the trusted home is added; the child dict is
             # built fresh and must keep the trusted CODEX_HOME/CLAUDE_CONFIG_DIR/
