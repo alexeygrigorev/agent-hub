@@ -259,19 +259,24 @@ def cmd_machines_available(args):
         # commands. api.get_available_machines is intentionally host-profile
         # scoped for host-agent callers.
         from . import bus
-        machines = bus._do_request("GET", "/api/machines/available")
-        
-        # machines.py compatible output: {"reachable": [ {machine} ], "count": N}.
-        # The Worker returns {"machines": [...]} (src/registry.ts); a bare list
-        # and an already-shaped {"reachable": [...]} are accepted too.
-        if isinstance(machines, list):
-            reachable = machines
-        elif isinstance(machines, dict) and isinstance(machines.get("reachable"), list):
-            reachable = machines["reachable"]
-        elif isinstance(machines, dict) and isinstance(machines.get("machines"), list):
-            reachable = machines["machines"]
-        else:
-            raise RuntimeError("unexpected /api/machines/available response shape")
+        machines = bus._do_request("GET", "/api/fleet/routing/machines")
+
+        # Hub2 exposes routing connectivity here. Keep the CLI's established
+        # {"reachable": [...], "count": N} output while filtering disconnected
+        # hosts and translating machine_id to the legacy display id.
+        if not isinstance(machines, dict) or not isinstance(machines.get("machines"), list):
+            raise RuntimeError("unexpected /api/fleet/routing/machines response shape")
+        reachable = []
+        for machine in machines["machines"]:
+            if not isinstance(machine, dict):
+                raise RuntimeError("unexpected /api/fleet/routing/machines response shape")
+            if machine.get("connected") is True and machine.get("available") is not False:
+                machine_id = machine.get("machine_id")
+                if not isinstance(machine_id, str) or not machine_id:
+                    raise RuntimeError("unexpected /api/fleet/routing/machines response shape")
+                available = dict(machine)
+                available["id"] = machine_id
+                reachable.append(available)
         output = {"reachable": reachable, "count": len(reachable)}
 
         if args.json:
