@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { pickModelRoute, weightedChoice } from '../src/model-picker.ts';
+import { pickModelRoute, pickModelRouteDetailed, weightedChoice } from '../src/model-picker.ts';
 
 const candidates=[
  {id:'codex',engine:'codex',model:'gpt-6.1-sol',effort:'medium',account_id:'codex',weight:1,capabilities:[],enabled:true},
@@ -23,7 +23,7 @@ function envFor(quota:Record<string,number>,credentialUsable=false){
   if(kind==='control'&&parsed.pathname==='/_routing-policy')return Response.json({version:1,candidates});
   if(kind==='control'&&parsed.pathname==='/api/directory')return Response.json({items:[{id:'h1'}],next:null});
   if(kind==='accounts'){
-   return Response.json({account:{enabled:true},quota:{remaining:quota[id]??0},hosts:['h1'],credential_usable:credentialUsable});
+   return Response.json({account:{enabled:true},quota:id in quota?{remaining:quota[id],captured_at:Date.now(),valid_until:Date.now()+900000}:null,fresh:true,hosts:['h1'],credential_usable:credentialUsable});
   }
   if(kind==='machines')return Response.json({machine_id:'h1',connected:true,engines:['codex','claude','zcodex']});
   return Response.json({}, {status:404});
@@ -44,7 +44,7 @@ test('unhealthy credentials and missing quota do not become placement refusals',
  const {env}=envFor({},false);
  const route=await pickModelRoute(env,{interactive:true,model:'gpt-6.1-sol',override_reason:'test explicit model'},()=>0);
  assert.equal(route.policy_id,'codex');
- assert.equal(route.quota_remaining,0);
+ assert.equal(route.quota_remaining,null);
 });
 
 test('Fable is excluded from automatic picks and available only when explicitly pinned',async()=>{
@@ -91,11 +91,65 @@ function poolEnv(usable:Record<string,boolean>,quota:Record<string,number>,engin
   const parsed=new URL(url);
   if(kind==='control'&&parsed.pathname==='/_routing-policy')return Response.json({version:3,candidates:policy});
   if(kind==='control')return Response.json({items:[{id:'h1'}],next:null});
-  if(kind==='accounts')return Response.json({account:{enabled:true},quota:id in quota?{remaining:quota[id]}:null,hosts:['h1'],credential_usable:usable[id]===true,credential_status:usable[id]?'ready':'expired'});
+  if(kind==='accounts')return Response.json({account:{enabled:true},quota:id in quota?{remaining:quota[id],captured_at:Date.now(),valid_until:Date.now()+900000}:null,fresh:true,hosts:['h1'],credential_usable:usable[id]===true,credential_status:usable[id]?'ready':'expired'});
   return Response.json({machine_id:'h1',connected:true,engines});
  }})});
  return {CONTROL:namespace('control'),ACCOUNTS:namespace('accounts'),MACHINES:namespace('machines')} as any;
 }
+
+function observationEnv(codex:any,claude:any){
+ const env=poolEnv(healthy,left,['codex','claude'],pool.filter(row=>['codex-sol-medium','claude-sonnet-medium'].includes(row.id)));
+ env.ACCOUNTS={idFromName:(id:string)=>id,get:(id:string)=>({fetch:async()=>Response.json({
+  account:{enabled:true},credential_usable:true,hosts:['h1'],...(id==='codex'?codex:claude),
+ })})};
+ return env;
+}
+function observed(remaining:number,now=Date.now()){
+ return {fresh:true,quota:{remaining,captured_at:now,valid_until:now+900000}};
+}
+
+test('fresh quota affects weight, but expired quota never preserves stale preference',async()=>{
+ const now=Date.now(),other=observed(50,now);
+ const fresh=await pickModelRouteDetailed(observationEnv(observed(100,now),other),{interactive:false},()=>0);
+ assert.ok(Math.abs(fresh.diagnostics.pool[0].share-2/3)<1e-9);
+ assert.deepEqual(fresh.diagnostics.warnings,[]);
+ const stale=await pickModelRouteDetailed(observationEnv({fresh:true,quota:{remaining:100,captured_at:now-31*60000,valid_until:now+60000}},other),{interactive:false},()=>0);
+ assert.equal(stale.diagnostics.pool[0].share,0.5);
+ assert.equal(stale.route.quota_remaining,null,'neutral weight is not a measured balance');
+ assert.equal(stale.diagnostics.warnings?.[0].reason,'quota_stale');
+});
+
+test('missing, invalidated, expired and malformed quota use equal neutral weights without refusing starts',async()=>{
+ const now=Date.now(),fresh=observed(50,now);
+ const cases=[{}, {fresh:true}, {fresh:true,quota:null}, {...observed(1,now),fresh:false},
+  {quota:observed(1,now).quota},
+  {fresh:true,quota:{remaining:1,captured_at:now-30000,valid_until:now-1}},
+  {fresh:true,quota:{remaining:99,captured_at:now+60000,valid_until:now+900000}},
+  {fresh:true,quota:{remaining:99,captured_at:now-30*60000,valid_until:now+60000}},
+  {fresh:true,quota:{remaining:99,captured_at:now,valid_until:now+3600001}},
+  ...[-1,101,'99',true].map(remaining=>({fresh:true,quota:{remaining,captured_at:now,valid_until:now+900000}})),
+  {fresh:true,quota:{remaining:99,captured_at:now+0.5,valid_until:now+900000}},
+  {fresh:true,quota:{remaining:99,captured_at:now,valid_until:now+900000.5}},
+ ];
+ for(const row of cases){
+  const result=await pickModelRouteDetailed(observationEnv(row,fresh),{interactive:false},()=>0);
+  assert.equal(result.route.quota_remaining,null,JSON.stringify(row));
+  assert.equal(result.diagnostics.pool[0].share,0.5,JSON.stringify(row));
+  assert.deepEqual(result.diagnostics.warnings?.map(x=>[x.account_id,x.reason]),[['codex','quota_stale']]);
+ }
+ const allUnknown=await pickModelRouteDetailed(observationEnv({},{}),{interactive:false},()=>0.9);
+ assert.equal(allUnknown.route.engine,'claude');
+ assert.equal(allUnknown.diagnostics.pool.length,2);
+ assert.equal(allUnknown.diagnostics.warnings?.length,2);
+});
+
+test('quota freshness expires at the earlier provider validity or thirty-minute limit',async()=>{
+ const now=Date.now();
+ const near=await pickModelRouteDetailed(observationEnv({fresh:true,quota:{remaining:80,captured_at:now-29*60000,valid_until:now+60000}},observed(50,now)),{interactive:false},()=>0);
+ assert.equal(near.route.quota_remaining,80);
+ const providerExpired=await pickModelRouteDetailed(observationEnv({fresh:false,quota:{remaining:80,captured_at:now-60000,valid_until:now+60000}},observed(50,now)),{interactive:false},()=>0);
+ assert.equal(providerExpired.route.quota_remaining,null);
+});
 const healthy={codex:true,claude:true,'shared-go':true,'zai-central':true,gemini:true};
 const left={codex:95,claude:87,'shared-go':40,'zai-central':73,gemini:90};
 
