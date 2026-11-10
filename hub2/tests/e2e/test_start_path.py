@@ -27,7 +27,11 @@ RECONNECT_DEADLINE_S = 45  # server restart -> host connected again
 # native id. Measured from t0 = the server's accepted timestamp when the response
 # or session view carries one, else the client clock right after the 2xx.
 START_DEADLINE_FROM_ACCEPT_S = 120
-OBSERVE_SLACK_S = 5        # only for observing the row; the assertion uses the 120 s bound
+# Ruling (plan owner for 1.1, 2026-11-10): the server deadline is exactly 120 s after
+# acceptance, and the typed terminal state is recorded when it expires; the alarm may
+# fire after the deadline but no later than deadline + ALARM_SLACK_S.
+ALARM_SLACK_S = 5
+DEADLINE_FIELDS = ("start_deadline_at", "start_deadline", "deadline_at", "deadline_ms")
 NO_HOST_REFUSAL_S = 2      # plan 2.3: no connected host -> 503 no_connected_host in <2 s
 
 
@@ -197,27 +201,45 @@ def acceptance_ms(hub, created):
     return hub.accepted_client_ms, "client_after_2xx"
 
 
+def stated_deadline_ms(*sources):
+    for source in sources:
+        for container in (source, source.get("attention") or {}, source.get("launch") or {}):
+            for key in DEADLINE_FIELDS:
+                stamp = iso_ms(container.get(key))
+                if stamp:
+                    return stamp, key
+    return None, None
+
+
 def assert_failed_within_start_deadline(hub, created, reason):
-    """Terminal `failed` with attention.reason == reason within 120 s of acceptance."""
+    """Deadline = acceptance + 120 s exactly; failed with attention.reason == reason in [deadline, deadline + 5 s]."""
     session_id = created["id"]
     t0, source = acceptance_ms(hub, created)
-    until = t0 / 1000 + START_DEADLINE_FROM_ACCEPT_S + OBSERVE_SLACK_S
+    until = t0 / 1000 + START_DEADLINE_FROM_ACCEPT_S + ALARM_SLACK_S + 3
     row = hub.show(session_id)
     while row.get("state") not in ("failed", "stopped", "lost", "running", "completed-awaiting-review") \
             and time.time() < until:
         time.sleep(1)
         row = hub.show(session_id)
-    observed_ms = int(time.time() * 1000)
     attention = row.get("attention") or {}
-    failed_at = iso_ms(attention.get("observed_at")) or iso_ms(row.get("updated_at")) or observed_ms
-    elapsed = (failed_at - t0) / 1000
-    detail = "t0=%s (%s) elapsed_from_accept=%.1fs row=%s\nhost log:\n%s\nserver log:\n%s" % (
-        t0, source, elapsed, json.dumps(row), hub.host.tail(), hub.server.tail())
-    assert row.get("state") == "failed", "not failed within %ss of acceptance: %s" % (START_DEADLINE_FROM_ACCEPT_S, detail)
+    observed = iso_ms(attention.get("observed_at"))
+    deadline, field = stated_deadline_ms(created, row)
+    detail = "t0=%s (%s) deadline=%s (%s) observed_at=%s row=%s\nhost log:\n%s\nserver log:\n%s" % (
+        t0, source, deadline, field, observed, json.dumps(row), hub.host.tail(), hub.server.tail())
+    assert row.get("state") == "failed", "not failed by deadline + %ss: %s" % (ALARM_SLACK_S, detail)
     assert attention.get("reason") == reason, "attention.reason != %s: %s" % (reason, detail)
-    assert elapsed <= START_DEADLINE_FROM_ACCEPT_S, "failed later than %ss after acceptance: %s" % (
-        START_DEADLINE_FROM_ACCEPT_S, detail)
-    print("%s: failed %s %.1fs after acceptance (%s)" % (session_id, reason, elapsed, source))
+    assert observed, "failed row has no attention.observed_at: " + detail
+    if deadline is not None:
+        assert abs(deadline - t0 - START_DEADLINE_FROM_ACCEPT_S * 1000) < 1000, \
+            "server deadline is not acceptance + 120 s: " + detail
+    else:
+        # GAP: the API does not expose the start deadline; pin it to acceptance + 120 s instead.
+        print("GAP: no start deadline field (%s) on the start response or session view" % ", ".join(DEADLINE_FIELDS))
+        deadline = t0 + START_DEADLINE_FROM_ACCEPT_S * 1000
+    assert deadline <= observed <= deadline + ALARM_SLACK_S * 1000, \
+        "terminal observation outside [deadline, deadline + %ss]: %s" % (ALARM_SLACK_S, detail)
+    print("%s: failed %s at deadline%+.3fs (deadline field=%s, t0 %s)" % (
+        session_id, reason, (observed - deadline) / 1000, field or "GAP", source))
     return row
 
 
