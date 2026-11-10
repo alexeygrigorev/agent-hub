@@ -64,7 +64,7 @@ def main():
     body = {"candidates": candidates}
     if args.expected_version is not None:
         body["expected_version"] = args.expected_version
-    status, payload = request(args.url, token, "POST", body)
+    status, payload = request(args.url, token, "PUT", body)
     print(json.dumps(payload, indent=2))
     sys.exit(0 if status == 200 else 1)
 
