@@ -6,6 +6,8 @@ import shutil
 import sys
 import venv
 
+PACKAGE_NAME = 'agent-hub-host-v2'
+
 
 def main():
     base=Path(os.environ.get('LOCALAPPDATA') or Path.home()/'.local/share')/'agent-hub2/venv'
@@ -13,10 +15,12 @@ def main():
     uv=shutil.which('uv')
     if uv:
         subprocess.run([uv,'venv','--python',sys.executable,'--allow-existing',str(base)],check=True,capture_output=True)
-        installer=[uv,'pip','install','--python',str(python)]
+        installer=[uv,'pip','install','--python',str(python),
+                   '--reinstall-package',PACKAGE_NAME]
     else:
         if not python.exists():venv.EnvBuilder(with_pip=True).create(base)
-        installer=[str(python),'-m','pip','install','--disable-pip-version-check']
+        installer=[str(python),'-m','pip','install','--force-reinstall',
+                   '--disable-pip-version-check']
     result=subprocess.run([*installer,str(Path(__file__).parent.resolve())],capture_output=True,text=True)
     if result.returncode:
         print('Host installation failed; no working release recorded.',file=sys.stderr)

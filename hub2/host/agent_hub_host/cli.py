@@ -11,6 +11,8 @@ from .agent import Bridge, Journal
 from .client import ApiError, Client, save_config
 from .commands import add_commands, execute
 
+DEFAULT_SERVER = "https://hub.dtcdev.click"
+
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="hub2")
@@ -34,9 +36,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         config = json.loads(args.config.read_text()) if args.config.exists() else {}
-        server = args.server or config.get("server")
-        if not server:
-            parser.error("--server is required for enrollment")
+        server = args.server or config.get("server") or DEFAULT_SERVER
         client = Client(server, os.environ.get("HUB2_TOKEN") or config.get("token", ""))
         if args.command!='auth' and not os.environ.get('HUB2_TOKEN') and config.get('refresh_token') and config.get('expires_at',float('inf'))<=time.time()+30:
             from .auth import refresh

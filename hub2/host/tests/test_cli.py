@@ -1,11 +1,13 @@
 import contextlib
 import io
 import json
+import os
 import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 from agent_hub_host.cli import main
@@ -26,6 +28,8 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/repos":
             response = {"items": [{"name": "second" if "after" in parse_qs(parsed.query) else "first"}],
                         "next": None if "after" in parse_qs(parsed.query) else "first"}
+        if parsed.path == "/api/enrollments/complete":
+            response = {"token": "synthetic-machine-token", "machine_id": "test-machine"}
         if parsed.path == "/api/messages/message-1":
             response = {"message": {"id": "message-1", "sender": "agent:other", "epoch": 3}}
         if parsed.path=='/api/intakes':
@@ -138,6 +142,22 @@ class CliTests(unittest.TestCase):
         self.assertEqual(self.invoke("intake", "list")[0], 1)
         self.assertEqual(self.invoke("repos", "list", "--limit", "101")[0], 1)
         self.assertEqual(Handler.calls, [])
+
+    def test_enrollment_defaults_to_live_server_when_config_has_no_server(self):
+        from agent_hub_host import cli
+
+        save_config(self.config, {})
+        with patch.object(cli, "DEFAULT_SERVER", f"http://127.0.0.1:{self.server.server_port}"), \
+             patch.dict(os.environ, {"HUB2_PAIRING_CODE": "synthetic-pairing-code"}):
+            code, result = self.invoke("enroll", "--root", self.temp.name, "--engine", "codex")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(result, {"enrolled": "test-machine"})
+        method, path, body, _ = Handler.calls[-1]
+        self.assertEqual((method, urlsplit(path).path), ("POST", "/api/enrollments/complete"))
+        self.assertEqual(body, {"code": "synthetic-pairing-code"})
+        saved = json.loads(self.config.read_text())
+        self.assertEqual(saved["server"], f"http://127.0.0.1:{self.server.server_port}")
 
 
 if __name__ == "__main__":
