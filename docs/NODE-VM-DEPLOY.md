@@ -212,9 +212,11 @@ and one-minute timer from `deploy/resource-gate-monitor.service` and
 `https://gate.dtcdev.click/` over verified TLS and requires the Resource Gate
 page marker; the gate application does not expose a `/health` route. A failed
 check sends a critical email to `dev@dtcdev.click` through RMTHZ's existing
-`msmtp` `alerts` account, repeats every 15 minutes while down, and emails a
-recovery notice. Its state stays under `/var/lib/resource-gate-monitor` on
-RMTHZ. The GCP VM has no MTA, so it does not own the email alert path.
+`msmtp` `alerts` account after two consecutive failures. It sends one critical
+email per incident without periodic repeats, then sends one recovery email and
+updates the DataOps task after two consecutive healthy checks. Its state stays
+under `/var/lib/resource-gate-monitor` on RMTHZ. The GCP VM has no MTA, so it
+does not own the email alert path.
 
 Install or refresh the monitor on RMTHZ after merging its code:
 
