@@ -26,6 +26,7 @@ HUB_HEALTH_URL="${HUB_HEALTH_URL:-https://hub.dtcdev.click/health}"
 STATE_DIR="${RESOURCE_GATE_STATE_DIR:-/var/lib/resource-gate-monitor}"
 STATE_FILE="$STATE_DIR/state"
 ALERT_TO="${ALERT_TO:-dev@dtcdev.click}"
+ALERT_CC="${ALERT_CC:-orin@dtcdev.click}"
 ALERT_OPS_TO="${ALERT_OPS_TO:-dev@dtcdev.click}"
 ALERT_FROM="${ALERT_FROM:-alerts@dtcdev.click}"
 ALERT_MSMTP_ACCOUNT="${ALERT_MSMTP_ACCOUNT:-alerts}"
@@ -118,23 +119,28 @@ case "$STATE_DIR" in
   /tmp|/tmp/*|/var/tmp|/var/tmp/*|*/.local/tmp|*/.local/tmp/*) TEST_PATH_GUARD=1 ;;
 esac
 EFFECTIVE_TO="$ALERT_TO"
+EFFECTIVE_CC="$ALERT_CC"
 DATAOPS_ENABLED=1
 if (( TEST_PATH_GUARD )); then
   EFFECTIVE_TO="$ALERT_OPS_TO"
+  EFFECTIVE_CC=""
   [[ "${RESOURCE_GATE_TEST_ALLOW_DATAOPS:-0}" == 1 ]] || DATAOPS_ENABLED=0
   log "GUARD test state path: routing mail to ops recipient only"
 fi
-ALERT_RECIPIENT_SUMMARY="$EFFECTIVE_TO"
+ALERT_RECIPIENT_SUMMARY="$EFFECTIVE_TO${EFFECTIVE_CC:+, $EFFECTIVE_CC}"
 
 send_alert() {
   local subject="$1" body="$2"
+  local recipients=("$EFFECTIVE_TO")
+  [[ -z "$EFFECTIVE_CC" ]] || recipients+=("$EFFECTIVE_CC")
   {
     printf 'From: %s\n' "$ALERT_FROM"
     printf 'To: %s\n' "$EFFECTIVE_TO"
+    [[ -z "$EFFECTIVE_CC" ]] || printf 'Cc: %s\n' "$EFFECTIVE_CC"
     printf 'Subject: %s\n' "$subject"
     printf 'Date: %s\n\n' "$(date -R)"
     printf '%s\n' "$body"
-  } | msmtp -a "$ALERT_MSMTP_ACCOUNT" -f "$ALERT_FROM" -- "$EFFECTIVE_TO" 2>/dev/null
+  } | msmtp -a "$ALERT_MSMTP_ACCOUNT" -f "$ALERT_FROM" -- "${recipients[@]}" 2>/dev/null
 }
 
 create_dataops_task() {

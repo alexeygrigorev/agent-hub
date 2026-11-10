@@ -321,12 +321,11 @@ pass "safe test-alert mode uses one test-safe recipient and exercises DataOps de
 
 grep -Fq 'ALERT_TO="${ALERT_TO:-dev@dtcdev.click}"' "$SCRIPT" \
   || fail "production outage recipient default is not dev@dtcdev.click"
-if grep -Fq 'orin@dtcdev.click' "$SCRIPT" || grep -Fq 'ALERT_CC=' "$SCRIPT"; then
-  fail "production monitor still contains an Orin alert recipient"
-fi
+grep -Fq 'ALERT_CC="${ALERT_CC:-orin@dtcdev.click}"' "$SCRIPT" \
+  || fail "production secondary recipient default is not orin@dtcdev.click"
 
 touch "$TMP_PROD/mailbox" "$TMP_PROD/dataops-capture"
-if PATH="$TMP/bin:$PATH" env -u ALERT_TO \
+if PATH="$TMP/bin:$PATH" env -u ALERT_TO -u ALERT_CC \
   ALERT_OPS_TO='resource-gate-ops@example.invalid' \
   RESOURCE_GATE_STATE_DIR="$TMP_PROD/state" \
   DATAOPS_CONFIG_DIR="$TMP/dataops-config" \
@@ -341,10 +340,9 @@ fi
   || fail "production-recipient test alert did not send exactly one message"
 grep -Fxq 'To: dev@dtcdev.click' "$TMP_PROD/mailbox" \
   || fail "production-recipient test alert did not default to dev@dtcdev.click"
-grep -Fq 'ARGS	-a alerts -f alerts@dtcdev.click -- dev@dtcdev.click' "$TMP_PROD/mailbox" \
-  || fail "production-recipient SMTP envelope did not contain only dev@dtcdev.click"
-if grep -Fq 'Cc:' "$TMP_PROD/mailbox" || grep -Fq 'orin@dtcdev.click' "$TMP_PROD/mailbox"; then
-  fail "production-recipient test alert was copied to another address"
-fi
-pass "production monitor test alert defaults to dev@dtcdev.click only"
+grep -Fq 'ARGS	-a alerts -f alerts@dtcdev.click -- dev@dtcdev.click orin@dtcdev.click' "$TMP_PROD/mailbox" \
+  || fail "production-recipient SMTP envelope did not contain dev and Orin"
+grep -Fxq 'Cc: orin@dtcdev.click' "$TMP_PROD/mailbox" \
+  || fail "production-recipient test alert did not copy Orin"
+pass "production monitor test alert delivers to dev and Orin"
 printf 'Resource Gate and Hub monitor tests passed.\n'

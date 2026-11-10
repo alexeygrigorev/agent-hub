@@ -1,0 +1,42 @@
+name: Release tooling
+
+# Plan item 5.1 (release tooling): always-run, no path filter, so the check is reported on every PR
+# and can be required. Runs the release safety tests and a clean-snapshot build check.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-tooling-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  release-tooling:
+    name: release-tooling
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: python -m pip install pytest uv "websockets==16.0"
+      - name: Release safety tests (updater, installer, manifest)
+        run: python -m pytest -q scripts/tests/test_hub2_release.py
+      - name: Release asset allowlist tests (production + bootstrap workers)
+        run: node --experimental-transform-types hub2/tests/release-assets.test.mjs
+      - name: Clean-snapshot release build check
+        run: |
+          out="$RUNNER_TEMP/release-build"
+          python scripts/build-hub2-release.py --rev HEAD --out-dir "$out"
+          test -s "$out/host-release.json"
