@@ -9,7 +9,7 @@ const env = {
   CONTROL: { idFromName: () => 'global', get: () => ({ fetch: async () => Response.json({ error: 'unauthorized' }, { status: 401 }) }) },
 };
 const names = ['host-release.json', 'hub.pyz', 'hub.pyz.sha256', 'manifest.json',
-  'host-install.sh', 'hub2-self-update.py', 'hub2-enroll.py',
+  'install.sh', 'install.ps1', 'host-install.sh', 'hub2-self-update.py', 'hub2-enroll.py',
   'agent-hub2-host.service', 'agent-hub2-host-update.service', 'agent-hub2-host-update.timer',
   `agent_hub_host_v2-2.0.0+g${'a'.repeat(40)}-py3-none-any.whl`, 'websockets-16.0-py3-none-any.whl'];
 for (const name of names) {
