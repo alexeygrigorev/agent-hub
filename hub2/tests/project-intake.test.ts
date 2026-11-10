@@ -18,10 +18,11 @@ test('model-less start falls back to another allowed model after an auth failure
  ];
  const f=fixture({modelCandidates:candidates,accountHosts:{codex:['h1'],claude:['h2']}}),originalRandom=Math.random;Math.random=()=>0;
  try{
-  const own=await intake(f,'auth-fallback'),start={key:'auth-fallback',workspace:'/tmp/synthetic-auth-fallback'};
+  const own=await intake(f,'auth-fallback'),start={key:'auth-fallback',workspace:'/tmp/synthetic-auth-fallback',purpose:'think'};
   const accepted=await f.call('/api/intakes/'+own.id+'/start','POST',start);assert.equal(accepted.status,201);
   const first=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any;
   assert.equal(JSON.parse(first.launch_spec_json).engine,'codex');
+  assert.equal(JSON.parse(first.launch_spec_json).purpose,'think');
   assert.equal(first.state,'offered');
   const fallback=await f.call('/_internal/auth-fallback','POST',{operation_id:first.operation_id,
    attempt_operation_id:first.attempt_operation_id,session_id:first.session_id,machine_id:first.machine_id,
@@ -31,6 +32,7 @@ test('model-less start falls back to another allowed model after an auth failure
   assert.equal(next.attempt,1);assert.equal(next.state,'offered');
   assert.equal(next.machine_id,'h2');
   assert.equal((f.sql.prepare('SELECT assigned_machine_id FROM intakes WHERE id=?').get(own.id) as any).assigned_machine_id,'h2');
+  assert.equal(JSON.parse(next.launch_spec_json).purpose,'think');
   assert.equal(JSON.parse(next.launch_spec_json).engine,'claude');assert.equal(JSON.parse(next.launch_spec_json).model,'sonnet');
  }finally{Math.random=originalRandom;}
 });
@@ -249,5 +251,34 @@ test('operator shell start needs no reason but requires a connected host',async(
   const result=await f.call('/api/intakes/'+own.id+'/start','POST',{key:'shell-connected',workspace:'relay',engine:'shell',...(explicitMachine?{machine_id:'h1'}:{})});
   assert.equal(result.status,connected?201:503,JSON.stringify(await result.clone().json()));
   if(!connected){const resultBody=await body(result);assert.equal(resultBody.error,'no_connected_host');assert.equal(f.sql.prepare('SELECT COUNT(*) AS n FROM dispatch_sagas').get().n,0);}
+ }
+});
+
+test('start purpose is validated and bound to launch and idempotency',async()=>{
+ const f=fixture(),own=await intake(f,'purpose'),start={key:'purpose-start',workspace:'/tmp/synthetic-purpose',engine:'shell',machine_id:'h1',override_reason:'Synthetic purpose test'};
+ for(const purpose of [null,'Review',false]){
+  const refused=await f.call('/api/intakes/'+own.id+'/start','POST',{...start,purpose});
+  assert.equal(refused.status,400);assert.equal((await body(refused)).error,'invalid_purpose');
+ }
+ assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',start)).status,201);
+ const saga=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any;
+ assert.equal(JSON.parse(saga.launch_spec_json).purpose,'implement');
+ assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',{...start,purpose:'implement'})).status,200);
+ const conflict=await f.call('/api/intakes/'+own.id+'/start','POST',{...start,purpose:'review'});
+ assert.equal(conflict.status,409);assert.equal((await body(conflict)).error,'idempotency_conflict');
+});
+
+test('project starts enforce Astra purpose even through non-Astra policy ids',async()=>{
+ const astra={id:'review-route',engine:'codex',model:'gpt-6-astra',effort:'medium',account_id:'codex',weight:1,capabilities:['review-only'],enabled:true};
+ for(const purpose of [undefined,'fix','implement','review','think']){
+  const f=fixture({modelCandidates:[astra]}),own=await intake(f,'astra-purpose');
+  const response=await f.call('/api/intakes/'+own.id+'/start','POST',{key:'astra-purpose',workspace:'/tmp/synthetic-purpose',model:'review-route',override_reason:'Synthetic review test',purpose});
+  if(purpose==='review'||purpose==='think'){
+   assert.equal(response.status,201,JSON.stringify(await body(response)));
+   const saga=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any;
+   assert.equal(JSON.parse(saga.launch_spec_json).purpose,purpose);
+  }else{
+   assert.equal(response.status,400);assert.equal((await body(response)).error,'astra_not_for_implementation');
+  }
  }
 });

@@ -110,6 +110,8 @@ try {
   for (const [patch, status, code] of [
     [{ key: undefined }, 400, 'idempotency_key_required'],
     [{ brief: undefined }, 400, 'brief_required'],
+    [{ purpose: 'Review' }, 400, 'invalid_purpose'],
+    [{ purpose: null }, 400, 'invalid_purpose'],
     [{ repo: 'not-a-repo-name' }, 404, 'project_not_found_or_forbidden'],
   ]) {
     const refused = await start({ ...base, ...patch });
@@ -154,9 +156,18 @@ try {
   assert.equal((await call('/api/repos/owner%2Fzzz-new')).status, 200);
   assert.equal((await fixture.fetch('/api/sessions', { method: 'POST', body: '{}' })).status, 401);
   // No machine is connected: Hub still accepts the start with a selected model and queues it for the host.
-  const unplaced = await start(base); const unplacedBody = await unplaced.json();
+  const astra = { id: 'review-route', engine: 'codex', model: 'gpt-6-astra', effort: 'medium', account_id: 'test-account', weight: 1, capabilities: ['review-only'], enabled: true };
+  const invalidPolicy = await call('/api/model-policy', 'PUT', { candidates: [{ ...astra, capabilities: [] }] });
+  assert.equal(invalidPolicy.status, 400);
+  assert.equal((await invalidPolicy.json()).error, 'astra_review_only_required');
+  assert.equal((await call('/api/model-policy', 'PUT', { candidates: [astra] })).status, 200);
+  const astraDenied = await start({ ...base, key: 'start-astra-denied', model: 'review-route', engine_override_reason: 'Purpose guard test' });
+  assert.equal(astraDenied.status, 400); assert.equal((await astraDenied.json()).error, 'astra_not_for_implementation');
+  const unplaced = await start({ ...base, purpose: 'review', model: 'review-route', engine_override_reason: 'Purpose guard test' }); const unplacedBody = await unplaced.json();
   assert([201, 202].includes(unplaced.status), 'offline-host start status ' + unplaced.status);
   assert(unplacedBody.id && unplacedBody.engine && unplacedBody.model, 'accepted start reports the chosen engine+model');
+  assert.equal(unplacedBody.model, 'gpt-6-astra', 'public start preserves explicit review purpose');
+  assert.equal((await call('/api/model-policy', 'PUT', { candidates })).status, 200);
 
   const config = resolve(scratch, 'cli.json');
   await writeFile(config, JSON.stringify({ client_kind: 'human', access_token: token, base_url: fixture.origin }), { mode: 0o600 });
