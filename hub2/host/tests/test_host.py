@@ -518,6 +518,19 @@ class HostTests(unittest.TestCase):
         self.assertTrue(any(args[1] == "kill" and args[2] == self.native.process["id"]
                             for args, _ in self.native.calls))
 
+    def test_stale_pre_native_stop_cannot_kill_a_newer_epoch_launch(self):
+        session = "session-epoch-fence"
+        self.insert_orphan_launch(session, "op-epoch-2", epoch=2, state="launching")
+        self.native.process = {"id": "1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d",
+                               "tag": "task-hub2-" + session, "workspace": str(self.root),
+                               "phase": "running", "containment_empty": False}
+        with self.assertRaisesRegex(ValueError, "command_fence_conflict"):
+            self.bridge.command({"id": "old-stop-epoch-1", "session_id": session,
+                                 "epoch": 1, "kind": "stop", "pre_native": True,
+                                 "workspace": str(self.root), "tag": "task-hub2-" + session})
+        self.assertEqual(self.native.process["phase"], "running")
+        self.assertEqual(self.native.calls, [])
+
     def test_stop_kills_native_process_recovered_by_session_tag(self):
         self.insert_orphan_launch()
         self.native.process = {"id": "1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d",
