@@ -1,23 +1,22 @@
 [Unit]
-Description=Agent Hub host: one bounded heartbeat, subscription and session report cycle
+Description=Agent Hub Hub2 heartbeat cycle
 After=network-online.target
 Wants=network-online.target
 
-# Sequential admission, catalog, reconciliation and dispatch can exceed 240s
-# under load. Give the bounded cycle 600s; retain the cycle lock and timer.
-# Preserve installed release/configuration drop-ins during rollout. Reload
-# systemd and let any active cycle finish; do not restart native work sessions.
+# The persistent Hub2 host service owns the WebSocket and session work. This
+# bounded cycle refreshes the enrolled machine heartbeat through Hub2 without
+# fetching or claiming offers, reconciling native sessions, or writing the
+# response body to the journal.
 
 [Service]
 Type=oneshot
-WorkingDirectory=%h/git/agent-hub/host
-Environment=PATH=%h/.local/bin:%h/.nvm/versions/node/v24.13.1/bin:/usr/local/bin:/usr/bin:/bin
-Environment=HUB_CONFIG_FILE=%h/git/agent-hub/.local/platform-runtime/host.json
-Environment=PYTHONPATH=%h/git/agent-hub/host
-ExecStart=/usr/bin/python3 -m agent_hub_host.cli fleet-host --cycles 1 --config %h/git/agent-hub/.local/platform-runtime/subscriptions.json
-TimeoutStartSec=600
-TimeoutStopSec=90
-MemoryMax=512M
+WorkingDirectory=%h
+UMask=0077
+ExecStart=%h/.local/share/agent-hub2/venv/bin/hub2 heartbeat --aplexer a
+StandardOutput=null
+TimeoutStartSec=60
+TimeoutStopSec=10
+MemoryMax=256M
 
 [Install]
 WantedBy=default.target

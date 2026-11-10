@@ -158,6 +158,13 @@ more tildes to override precedence. The switcher inspects both systemd's
 DropInPaths and files on disk before mutation, so the bootstrap works even
 when the old running host cannot migrate its own overrides.
 
+During a verified host-release switch, the managed
+`agent-hub-fleet-host.service` companion is set to the separately installed
+Hub2 `heartbeat` command. Its timer refreshes the authenticated machine
+heartbeat without fetching offers or reconciling native sessions. The Hub1
+quota companion still follows the release for legacy deployments, and its
+timer remains disabled on Hub2-managed hosts.
+
 Both paths recognize legacy `zz~<7-to-40-hex-sha>-switch-release.conf`
 names (including repeated tildes) only for regular, user-owned files in the
 unit's user drop-in directory, referencing a single manifested release whose

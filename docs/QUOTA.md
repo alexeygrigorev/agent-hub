@@ -1,13 +1,28 @@
 # Account Quota and Host Snapshot API
 
-## Primary collection: Hub server
+## Hub2 quota path
 
-Provider accounts are probed by the Hub backend on Hetzner through the maintained
-`quse` adapters. `agent-hub-quota-server.timer` runs independently of the fleet
-host agent, enrolled machine availability and PocketShell, every five minutes.
-The Worker stores only sanitized observations, never provider credentials.
+Hub2 exposes sanitized account quota through `hub quota --json`; the current
+projection is `hub2_accounts`. Hub2 owns the account probes, so a separate
+host-side quota publisher is not required for Hub2-managed accounts. On a
+Hub2-managed host, check freshness with `hub quota --json` and keep the legacy
+`agent-hub-quota-server.service` and `.timer` disabled. The bounded
+`agent-hub-fleet-host.timer` cycle posts a Hub2 machine heartbeat and does not
+collect or publish quota.
 
-Install the `host/agent_hub_host` package in
+The legacy publisher posts to `POST /api/quota/server`, which the Hub2 Worker
+does not implement. Pointing its old Hub1 token or origin at Hub2 cannot make
+that collector work.
+
+## Legacy Hub1 server collector
+
+For Hub1 installations only, provider accounts are probed by the Hub backend on
+Hetzner through the maintained `quse` adapters. `agent-hub-quota-server.timer`
+runs independently of the fleet host agent, enrolled machine availability and
+PocketShell, every five minutes.
+The Hub1 Worker stores only sanitized observations, never provider credentials.
+
+For that legacy deployment, install the `host/agent_hub_host` package in
 `~/.local/lib/agent-hub-quota-server/host/agent_hub_host`, and install the service
 and timer from `deploy/`. Configure `~/.config/agent-hub/quota-server.json` with
 `base_url`, `admin_token_file` (the existing private Hub bootstrap token), `quse`

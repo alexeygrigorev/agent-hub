@@ -1,7 +1,8 @@
 [Unit]
-Description=Agent Hub server-side provider account quota probes
+Description=Legacy Hub1 server-side quota publisher (do not install on Hub2)
 After=network-online.target
 
+# Hub2 owns account quota probes and does not implement /api/quota/server.
 [Service]
 Type=oneshot
 WorkingDirectory=%h/.local/lib/agent-hub-quota-server

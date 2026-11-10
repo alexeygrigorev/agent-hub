@@ -54,15 +54,25 @@ def substitute_release(template_text, new_release):
     return new_text
 
 
-# Units that run host code next to the session host and must follow the same
-# release: their own managed drop-in is rewritten in the same switch, so the
-# next timer run (oneshot, picked up by the daemon-reload below) uses the new
-# release. A companion without a managed drop-in is left alone.
+# Companion units with managed drop-ins are updated during the same switch.
+# The fleet timer is a Hub2 heartbeat-only cycle and uses the separately
+# installed Hub2 host package; the legacy quota publisher still follows the
+# verified Hub1 host release but remains disabled on Hub2-managed hosts.
 COMPANION_SERVICES = ("agent-hub-fleet-host.service", "agent-hub-quota-server.service")
 
 
+def hub2_fleet_cycle_dropin():
+    """Keep the managed fleet unit on the Hub2-only heartbeat path."""
+    return (MARKER + "[Service]\n"
+            "WorkingDirectory=%h\n"
+            "ExecStart=\n"
+            "ExecStart=%h/.local/share/agent-hub2/venv/bin/hub2 heartbeat --aplexer a\n"
+            "StandardOutput=null\n"
+            "TimeoutStartSec=60\n")
+
+
 def refresh_companions(dropin, release):
-    """Point each companion unit's managed drop-in at ``release``; returns the paths written."""
+    """Refresh managed companion drop-ins; returns the paths written."""
     written = []
     for service in COMPANION_SERVICES:
         path = dropin.parent.parent / (service + ".d") / DROPIN
@@ -71,10 +81,13 @@ def refresh_companions(dropin, release):
         text = path.read_text(encoding="utf-8")
         if not text.startswith(MARKER):
             continue
-        try:
-            new_text = substitute_release(text, str(release))
-        except SystemExit:
-            continue
+        if service == "agent-hub-fleet-host.service":
+            new_text = hub2_fleet_cycle_dropin()
+        else:
+            try:
+                new_text = substitute_release(text, str(release))
+            except SystemExit:
+                continue
         temporary = path.with_name(path.name + ".tmp")
         temporary.write_text(new_text, encoding="utf-8")
         temporary.replace(path)
