@@ -3,8 +3,10 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -29,6 +31,20 @@ HOST = f'agent_hub_host_v2-2.0.0+g{SHA}-py3-none-any.whl'
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_native_self_update_bypasses_config_and_propagates_exit(self):
+        code = '''
+from types import SimpleNamespace
+from unittest.mock import patch
+from agent_hub_host.cli import main
+with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
+    assert main(['--config','/missing/config','self-update','--root','/isolated/root','--no-restart']) == 7
+    args = run.call_args.args[0]
+    assert args[1] == '/isolated/root/updater.py' and '--no-restart' in args
+'''
+        subprocess.run([sys.executable, '-c', code], check=True,
+                       env=dict(os.environ, PYTHONPATH=str(REPO / 'hub2/host')),
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
     def setUp(self):
         (REPO / '.local/tmp').mkdir(parents=True, exist_ok=True)
         self.temporary = tempfile.TemporaryDirectory(dir=REPO / '.local/tmp', prefix='test-release-')
