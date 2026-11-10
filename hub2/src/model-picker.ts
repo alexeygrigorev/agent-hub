@@ -1,48 +1,11 @@
 import { HttpError } from './http';
-import { isDeepWorkModel, isExplicitOnlyModel, isModelPolicyCandidateAllowed } from './model-policy';
 import type { Hub2Env } from './types';
-import { allowsAstra, sessionPurpose, type SessionPurpose } from './session-purpose';
-
-type Candidate = { id: string; engine: string; model: string; effort?: string; account_id: string; weight: number; capabilities: string[]; enabled: boolean };
-type AccountView = { credential_status?: string; account?: { min_remaining?: number; enabled?: boolean } | null; quota?: { remaining?: number; captured_at?: number; valid_until?: number } | null; fresh?: boolean; hosts?: string[]; credential_usable?: boolean };
-type MachineView = { machine_id?: string; engines?: string[]; connected?: boolean; last_seen?: number; os?: string };
-export type PickedRoute = {
-  machine_id: string; engine: string; model: string; effort?: string; account_id: string;
-  policy_id: string; policy_version: unknown; override_reason: string | null;
-  weight: number; quota_remaining: number | null; required_capabilities: string[];
-};
-export type PickDiagnostics = {
-  pool: Array<{ policy_id: string; engine: string; model: string; effort: string | null; weight: number; share: number }>;
-  excluded: Array<{ policy_id: string; account_id: string; reason: string }>;
-  warnings?: Array<{ account_id: string; reason: 'quota_stale'; captured_at: number | null }>;
-};
-// Weighting knobs, kept identical to ~/bin/model-roulette so both pools behave the same.
-const MIN_HEADROOM = 5;      // % quota left below which a pool has no headroom
-const DEEP_BIAS = 3;         // opus/sol multiplier for tier deep/complex/serious
-const NEUTRAL_QUOTA = 50;    // unknown observations get a neutral weight, never fabricated quota
-const QUOTA_MAX_AGE_MS = 30 * 60 * 1000;
-const DEEP_TIERS = new Set(['deep', 'complex', 'serious']);
-export type PickInput = {
-  purpose?: SessionPurpose;
-  machine_id?: string; engine?: string; model?: string; effort?: string; override_reason?: string;
-  tier?: string; interactive: boolean; with_goal?: boolean; required_capabilities?: string[]; exclude_policy_ids?: string[];
-  /** Launch workspace: a label or an absolute path on the target host. */
-  workspace?: string;
-};
+import { buildRoutingPool, eligibleCandidates, weightedChoice, type AccountView, type MachineView,
+  type RoutingPolicy, type RoutingSnapshot, type PickInput, type PickedRoute, type PickDiagnostics } from './routing-pool';
+export { weightedChoice, buildRoutingPool } from './routing-pool';
+export type { PickInput, PickedRoute, PickDiagnostics, RoutingSnapshot } from './routing-pool';
 
 const internalActor = JSON.stringify({ id: 'hub2-model-picker', kind: 'operator', scopes: ['operator:admin', 'routing:read'] });
-
-/** Expired, invalidated or unproved observations never become current headroom. */
-function currentQuota(view: AccountView | undefined, now: number): number | null {
-  const quota = view?.quota;
-  if (view?.fresh !== true || !quota || typeof quota.remaining !== 'number'
-      || !Number.isFinite(quota.remaining) || quota.remaining < 0 || quota.remaining > 100
-      || !Number.isSafeInteger(quota.captured_at) || !Number.isSafeInteger(quota.valid_until)
-      || quota.captured_at! < 0 || quota.captured_at! > now + 5000
-      || now - quota.captured_at! >= QUOTA_MAX_AGE_MS || quota.valid_until! <= now
-      || quota.valid_until! < quota.captured_at! || quota.valid_until! > quota.captured_at! + 3600000) return null;
-  return quota.remaining;
-}
 
 async function read(namespace: DurableObjectNamespace, id: string, path: string): Promise<any> {
   const response = await namespace.get(namespace.idFromName(id)).fetch('https://picker.internal' + path, {
@@ -52,50 +15,9 @@ async function read(namespace: DurableObjectNamespace, id: string, path: string)
   return response.json();
 }
 
-function weightedChoice<T>(values: Array<{ value: T; weight: number }>, random = Math.random): T {
-  const total = values.reduce((sum, row) => sum + row.weight, 0);
-  if (!values.length || !Number.isFinite(total) || total <= 0) throw new HttpError('model_policy_unavailable', 503);
-  let draw = random() * total;
-  for (const row of values) {
-    draw -= row.weight;
-    if (draw < 0) return row.value;
-  }
-  return values[values.length - 1].value;
-}
-
-export async function pickModelRoute(env: Hub2Env, input: PickInput, random = Math.random): Promise<PickedRoute> {
-  return (await pickModelRouteDetailed(env, input, random)).route;
-}
-
-export async function pickModelRouteDetailed(env: Hub2Env, input: PickInput, random = Math.random): Promise<{ route: PickedRoute; diagnostics: PickDiagnostics }> {
-  const purpose = sessionPurpose(input.purpose);
-  if (input.model && /astra/i.test(input.model) && !allowsAstra(purpose))
-    throw new HttpError('astra_not_for_implementation', 400);
-  if (input.with_goal && !input.interactive) throw new HttpError('goal_requires_interactive', 400);
-  const override = !!(input.machine_id || input.engine || input.model || input.effort);
-  if (input.override_reason && input.override_reason.length > 500)
-    throw new HttpError('invalid_override_reason', 400);
-  const required = [...new Set([input.interactive ? 'interactive' : 'headless', ...(input.with_goal ? ['goal'] : []), ...(input.required_capabilities || [])])];
-  if (required.length > 32 || required.some(value => typeof value !== 'string' || !value || value.length > 80))
-    throw new HttpError('invalid_required_capabilities', 400);
-
-  const policy = await read(env.CONTROL, 'global', '/_routing-policy') as { version: unknown; candidates: Candidate[] };
-  if (!Array.isArray(policy.candidates) || !policy.candidates.length || policy.candidates.length > 32)
-    throw new HttpError('model_policy_unconfigured', 503);
-  if (input.model && !allowsAstra(purpose) && policy.candidates.some(candidate =>
-    (input.model === candidate.id || input.model === candidate.model) && isExplicitOnlyModel(candidate)))
-    throw new HttpError('astra_not_for_implementation', 400);
-  const excluded=new Set(input.exclude_policy_ids||[]);
-  const candidates = policy.candidates.filter(candidate => candidate.enabled && !excluded.has(candidate.id)
-    && (!isExplicitOnlyModel(candidate) || allowsAstra(purpose))
-    && (candidate.id !== 'claude-fable-5-2' || input.model === candidate.id || input.model === candidate.model)
-    && (!isExplicitOnlyModel(candidate) || (override && !!input.model && (input.model === candidate.model || input.model === candidate.id)))
-    && isModelPolicyCandidateAllowed(candidate)
-    && (!input.engine || input.engine === candidate.engine)
-    && (!input.model || input.model === candidate.model || input.model === candidate.id)
-    && (!input.effort || input.effort === candidate.effort));
-  if (!candidates.length) throw new HttpError('model_policy_unavailable', 503);
-
+export async function loadRoutingSnapshot(env: Hub2Env, input: PickInput, passive = false): Promise<RoutingSnapshot> {
+  const policy = await read(env.CONTROL, 'global', '/_routing-policy') as RoutingPolicy;
+  const candidates = eligibleCandidates(policy, input);
   const ids = new Set<string>();
   let after='';
   do {
@@ -110,7 +32,7 @@ export async function pickModelRouteDetailed(env: Hub2Env, input: PickInput, ran
   const accountIds = [...new Set(candidates.map(candidate => candidate.account_id))];
   const accounts = new Map<string, AccountView>();
   await Promise.all(accountIds.map(async id => {
-    try { accounts.set(id, await read(env.ACCOUNTS, id, '/_internal/routing') as AccountView); }
+    try { accounts.set(id, await read(env.ACCOUNTS, id, passive ? '/_internal/routing-snapshot' : '/_internal/routing') as AccountView); }
     catch { accounts.set(id, {}); }
   }));
   for (const account of accounts.values()) for (const host of account.hosts || []) ids.add(host);
@@ -118,91 +40,31 @@ export async function pickModelRouteDetailed(env: Hub2Env, input: PickInput, ran
 
   const machines = new Map<string, MachineView>();
   await Promise.all([...ids].map(async id => {
-    try { machines.set(id, await read(env.MACHINES, id, '/_internal/routing') as MachineView); }
+    try { machines.set(id, await read(env.MACHINES, id, passive ? '/_internal/routing-snapshot' : '/_internal/routing') as MachineView); }
     catch { machines.set(id, { machine_id: id, engines: [] }); }
   }));
 
-  for (const id of ids) if (machines.get(id)?.connected !== true) ids.delete(id);
-  if (input.machine_id && !ids.has(input.machine_id) || !ids.size)
-    throw new HttpError('no_connected_host', 503, JSON.stringify({machines:[...machines].map(([id,machine])=>({machine_id:id,connected:machine.connected===true,last_seen:machine.last_seen??null,age_ms:typeof machine.last_seen==='number'?Math.max(0,Date.now()-machine.last_seen):null}))}));
-
-  // An absolute workspace path exists only on hosts of its own path family: never offer /home/... to a
-  // Windows host or C:\... to a Linux one. Like the other observations this narrows and never refuses.
-  const family = !input.workspace ? null : /^[A-Za-z]:\\/.test(input.workspace) ? 'windows' : input.workspace.startsWith('/') ? 'posix' : null;
-  if (family && !input.machine_id) {
-    const fits = [...ids].filter(id => {
-      const os = (machines.get(id)?.os || '').toLowerCase();
-      return !os || (os === 'windows') === (family === 'windows');
-    });
-    if (fits.length) for (const id of [...ids]) if (!fits.includes(id)) ids.delete(id);
-  }
-
-  // Headroom weight per candidate; luna is one option among many, so it never outweighs the mean of the others.
-  const deep = DEEP_TIERS.has((input.tier || '').toLowerCase());
-  const quotaNow = Date.now();
-  const observations = new Map(accountIds.map(id => [id, currentQuota(accounts.get(id), quotaNow)]));
-  const warnings: NonNullable<PickDiagnostics['warnings']> = accountIds.filter(id => observations.get(id) === null).map(id => {
-    const captured = accounts.get(id)?.quota?.captured_at;
-    return { account_id: id, reason: 'quota_stale', captured_at: Number.isSafeInteger(captured) && captured! >= 0 ? captured! : null };
-  });
-  if (warnings.length) console.error('[hub2] QUOTA_STALE alert=dev@dtcdev.click', JSON.stringify(warnings));
-  const headroom = (candidate: Candidate): number | null => observations.get(candidate.account_id) ?? null;
-  const dropped: PickDiagnostics['excluded'] = [];
-  const ready = (candidate: Candidate): boolean => {
-    const view = accounts.get(candidate.account_id);
-    return view?.credential_usable === true && view.account?.enabled !== false;
-  };
-  const advertised = (candidate: Candidate): boolean => [...ids].some(id => machines.get(id)?.engines?.includes(candidate.engine));
-  const scored = candidates.map(candidate => {
-    const left = headroom(candidate);
-    const base = Math.max(0.0001, candidate.weight) * (left === null ? NEUTRAL_QUOTA : Math.max(0.01, left)) * (deep && isDeepWorkModel(candidate) ? DEEP_BIAS : 1);
-    return { candidate, left, base };
-  });
-  // Auth/quota/advertisement observations narrow the pool, but never turn into a refusal when nothing survives.
-  const narrow = <T,>(rows: T[], keep: (row: T) => boolean): T[] => { const kept = rows.filter(keep); return kept.length ? kept : rows; };
-  let pool = scored;
-  for (const row of pool) if (!ready(row.candidate)) {
-    const status = accounts.get(row.candidate.account_id)?.credential_status || 'unavailable';
-    dropped.push({ policy_id: row.candidate.id, account_id: row.candidate.account_id, reason: 'credential_' + status });
-  }
-  pool = narrow(pool, row => ready(row.candidate));
-  pool = narrow(pool, row => row.left === null || row.left >= MIN_HEADROOM);
-  pool = narrow(pool, row => advertised(row.candidate));
-  if (dropped.length)
-    console.error('[hub2] MODEL_PICKER_CREDENTIAL_EXCLUDED alert=dev@dtcdev.click', JSON.stringify(dropped));
-  const others = pool.filter(row => !/luna/i.test(row.candidate.model)).map(row => row.base);
-  const cap = others.length ? others.reduce((sum, weight) => sum + weight, 0) / others.length : Infinity;
-  const weights = new Map(pool.map(row => [row.candidate.id, /luna/i.test(row.candidate.model) ? Math.min(row.base, cap) : row.base]));
-
-  const options: Array<{ value: PickedRoute; weight: number }> = [];
-  for (const { candidate, left } of pool) {
-    const account = accounts.get(candidate.account_id) || {};
-    const approved = (account.hosts || []).filter(id => ids.has(id));
-    const hostIds = input.machine_id ? [input.machine_id] : (approved.length ? approved : [...ids]);
-    const matching = hostIds.filter(id => machines.get(id)?.engines?.includes(candidate.engine));
-    // A missing/offline engine advertisement does not hold a start. Try a host
-    // anyway; its native launch result will decide whether the route works.
-    const selectedHosts = matching.length ? matching : hostIds;
-    for (const machineId of selectedHosts) {
-      const weight = weights.get(candidate.id)! / selectedHosts.length;
-      options.push({ value: {
-        machine_id: machineId, engine: candidate.engine, model: candidate.model,
-        ...(candidate.effort ? { effort: candidate.effort } : {}), account_id: candidate.account_id,
-        policy_id: candidate.id, policy_version: policy.version,
-        override_reason: override ? input.override_reason?.trim() || 'explicit_route' : null,
-        weight, quota_remaining: left, required_capabilities: required,
-      }, weight });
-    }
-  }
-  if(!options.length)throw new HttpError('model_policy_unavailable',503);
-  const total = options.reduce((sum, option) => sum + option.weight, 0);
-  const route = weightedChoice(options, random);
-  const byPolicy = new Map<string, PickDiagnostics['pool'][number]>();
-  for (const { value, weight } of options) {
-    const row = byPolicy.get(value.policy_id) || { policy_id: value.policy_id, engine: value.engine, model: value.model, effort: value.effort ?? null, weight: 0, share: 0 };
-    row.weight += weight; row.share = row.weight / total; byPolicy.set(value.policy_id, row);
-  }
-  return { route, diagnostics: { pool: [...byPolicy.values()], excluded: dropped, warnings } };
+  return {policy, accounts, machines, observed_at: Date.now()};
 }
 
-export { weightedChoice };
+export async function pickModelRoute(env: Hub2Env, input: PickInput, random = Math.random): Promise<PickedRoute> {
+  return (await pickModelRouteDetailed(env, input, random)).route;
+}
+
+export async function pickModelRouteDetailed(env: Hub2Env, input: PickInput, random = Math.random): Promise<{route: PickedRoute; diagnostics: PickDiagnostics}> {
+  const {options, diagnostics} = buildRoutingPool(await loadRoutingSnapshot(env, input), input);
+  if (diagnostics.excluded.length) console.error('[hub2] MODEL_PICKER_EXCLUDED alert=dev@dtcdev.click', JSON.stringify(diagnostics.excluded));
+  if (diagnostics.warnings?.length) console.error('[hub2] QUOTA_STALE alert=dev@dtcdev.click', JSON.stringify(diagnostics.warnings));
+  return {route: weightedChoice(options, random), diagnostics};
+}
+
+/** One passive observation set; all draws are in memory and cannot advance live counters. */
+export async function simulateModelRoutes(env: Hub2Env, input: PickInput, draws: number, random = Math.random) {
+  if (!Number.isInteger(draws) || draws < 1 || draws > 1000) throw new HttpError('invalid_simulation_count', 400);
+  const snapshot = await loadRoutingSnapshot(env, input, true);
+  const {options, diagnostics} = buildRoutingPool(snapshot, input);
+  const counts: Record<string, number> = Object.create(null);
+  for (const row of diagnostics.pool) counts[row.policy_id] = 0;
+  for (let n = 0; n < draws; n++) counts[weightedChoice(options, random).policy_id]++;
+  return {observed_at: snapshot.observed_at, policy_version: snapshot.policy.version, draws, counts, ...diagnostics};
+}

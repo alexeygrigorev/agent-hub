@@ -141,6 +141,7 @@ export class MachineDO {
         return json({authorized:true,message_id:row.message_id,epoch:row.epoch,operation_id:row.operation_id,recipient:row.recipient,machine_id:row.machine_id,session_id:row.session_id});
       }
       if (url.pathname === '/_internal/status' && request.method === 'GET') return this.machineView();
+      if (url.pathname === '/_internal/routing-snapshot' && request.method === 'GET') return await this.routingView(true);
       if (url.pathname === '/_internal/routing' && request.method === 'GET') return await this.routingView();
       if (url.pathname === '/_internal/live-sessions' && request.method === 'GET') return this.liveSessionView();
       if (url.pathname === '/_internal/reap' && request.method === 'POST') return await this.reap(request);
@@ -231,11 +232,14 @@ export class MachineDO {
     return json({ ok: true, machine_id: machineId, last_seen: now });
   }
 
-  private async routingView():Promise<Response>{
+  private async routingView(passive=false):Promise<Response>{
     const machine=this.db.one<MachineRow>('SELECT * FROM machines LIMIT 1');
     if(!machine)return json({available:false,reason:'machine_not_enrolled'});
     let connected=false;
-    for(const socket of this.machineSockets(`${machine.machine_id}`))if(socket.readyState===1&&!this.stopOnly(socket)&&await this.authorizedAttachment(socket,'machine:offer')){connected=true;break;}
+    for(const socket of this.machineSockets(`${machine.machine_id}`,!passive)){
+      if(passive){try{if(socket.deserializeAttachment()?.machine_id!==machine.machine_id)continue;}catch{continue;}}
+      if(socket.readyState===1&&!this.stopOnly(socket)&&await this.authorizedAttachment(socket,'machine:offer',!passive,this.env,!passive)){connected=true;break;}
+    }
     const capabilities=this.db.one<{engines_json:string;capabilities_json:string}>('SELECT engines_json,capabilities_json FROM machine_capabilities WHERE machine_id=?',machine.machine_id);
     return json({machine_id:machine.machine_id,connected,last_seen:machine.last_seen,os:machine.os,arch:machine.arch,labels:JSON.parse(machine.labels_json),
       engines:capabilities?JSON.parse(capabilities.engines_json):[],capabilities:capabilities?JSON.parse(capabilities.capabilities_json):[]});
@@ -1244,27 +1248,27 @@ export class MachineDO {
   }
 
   /** Hibernation attachments retain selection across eviction; prune legacy duplicates before RPCs. */
-  private machineSockets(machineId:string):WebSocket[]{
+  private machineSockets(machineId:string,prune=true):WebSocket[]{
     const sockets=this.ctx.getWebSockets('hub2:'+machineId).filter(socket=>socket.readyState===1);
     const rank=(socket:WebSocket):string=>{
       try{const a=socket.deserializeAttachment();return String(a?.connected_at??0).padStart(16,'0')+':'+String(a?.connection_id??'');}
       catch{return '';}
     };
     sockets.sort((a,b)=>rank(b).localeCompare(rank(a)));
-    for(const old of sockets.slice(1)){try{old.close(1000,'connection superseded');}catch{}}
+    if(prune)for(const old of sockets.slice(1)){try{old.close(1000,'connection superseded');}catch{}}
     return sockets.slice(0,1);
   }
 
-  private currentSocket(socket:WebSocket):boolean{
+  private currentSocket(socket:WebSocket,prune=true):boolean{
     try{const machine=socket.deserializeAttachment()?.machine_id;
-      return typeof machine==='string'&&this.machineSockets(machine)[0]===socket;
+      return typeof machine==='string'&&this.machineSockets(machine,prune)[0]===socket;
     }catch{return false;}
   }
 
   private stopOnly(socket:WebSocket):boolean{try{return socket.deserializeAttachment()?.stop_only===true;}catch{return false;}}
 
-  private async authorizedAttachment(socket: WebSocket, scope: string, closeOnRefusal = true,env:Hub2Env=this.env): Promise<{ machine_id: string; actor_id: string; generation: string } | undefined> {
-    if(!this.currentSocket(socket))return undefined;
+  private async authorizedAttachment(socket: WebSocket, scope: string, closeOnRefusal = true,env:Hub2Env=this.env,prune=true): Promise<{ machine_id: string; actor_id: string; generation: string } | undefined> {
+    if(!this.currentSocket(socket,prune))return undefined;
     let attachment: { machine_id?: string; actor_id?: string; generation?: string } | null;
     try { attachment = socket.deserializeAttachment(); } catch { attachment = null; }
     if (!attachment?.machine_id || !attachment.actor_id || !attachment.generation) return undefined;
@@ -1277,7 +1281,7 @@ export class MachineDO {
       if (closeOnRefusal) { try { socket.close(1008, 'credential revoked'); } catch {} }
       return undefined;
     }
-    if(!this.currentSocket(socket))return undefined;
+    if(!this.currentSocket(socket,prune))return undefined;
     return attachment as { machine_id: string; actor_id: string; generation: string };
   }
 

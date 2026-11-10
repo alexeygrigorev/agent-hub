@@ -14,7 +14,7 @@ from pathlib import Path
 
 from .client import ApiError, private_file, save_config
 from . import native_launch
-from .native_launch import NativeLauncher, canonical, native_returncode, same_workspace
+from .native_launch import NativeLauncher, LOCAL_ROUTES, canonical, native_returncode, same_workspace
 
 # Keep the live native-session census fresh for the global Hub session limit.
 LIVE_SESSION_HEARTBEAT_SECONDS = 30
@@ -611,6 +611,19 @@ class Bridge:
         available=self.launcher.capabilities()
         engines=sorted(engine for engine in self.engines.intersection(available) if available[engine])
         capabilities=['headless']+[cap+':'+engine for engine in engines for cap in sorted(available[engine]-{'headless'})]
+        configuration = getattr(self.launcher, 'config', {})
+        if not configuration.get('private_provider_homes', False):
+            # Execution-source hints only, never login/account health proof.
+            # Custom routes cannot inherit a canonical account association.
+            accounts = {'codex': 'codex', 'claude': 'claude', 'go': 'shared-go',
+                        'zai': 'zai-central', 'antigravity': 'gemini'}
+            for engine in engines:
+                if engine not in accounts or configuration.get('routes', {}).get(engine) != LOCAL_ROUTES[engine]:
+                    continue
+                for mode in ('headless', 'interactive'):
+                    if mode in available[engine]:
+                        capabilities.append('credentials:local:' + mode + ':' + engine + ':' + accounts[engine])
+        capabilities = capabilities[:32]
         if include_native_sessions:
             self.client.heartbeat(labels,engines,capabilities,native_sessions=self.live_sessions())
         else:

@@ -209,6 +209,17 @@ test('normalization projects only safe fields and rejects mismatched or oversize
   const diagnostics:PickDiagnostics={pool:[{policy_id:route.policy_id,engine:route.engine,model:route.model,effort:'medium',weight:1,share:1}],
     excluded:[{policy_id:'hidden',account_id:'private-account',reason:'private credential status'}]};
   const picker=buildStartPickerEvidence(route,diagnostics);
+  assert.equal(picker.pool_degraded,true);
+  assert.equal(normalizeStartPickerEvidence({...picker,pool_degraded:false}),null);
+  const {pool_degraded: _legacyAbsent,...legacy}=picker;
+  assert.deepEqual(normalizeStartPickerEvidence(legacy),legacy);
+  const diverse=buildStartPickerEvidence(route,{pool:[
+    {...diagnostics.pool[0],share:1/3},
+    {...diagnostics.pool[0],policy_id:'second',model:'second-model',share:1/3},
+    {...diagnostics.pool[0],policy_id:'third',model:'third-model',share:1/3},
+  ],excluded:[]});
+  assert.equal(diverse.pool_degraded,false);
+  assert.equal(normalizeStartPickerEvidence({...diverse,pool_degraded:true}),null);
   const dirty={...picker,account_id:'private-account',credential:'secret',override_reason:'private rationale',excluded:diagnostics.excluded,
     pool:picker.pool.map(row=>({...row,account_id:'private-account'})),history:picker.history.map(row=>({...row,credential:'secret'}))};
   assert.deepEqual(normalizeStartPickerEvidence(dirty),picker);

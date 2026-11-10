@@ -9,7 +9,7 @@ export type PickerAttempt = {
   policy_id: string; policy_version: number | string | null; machine_id: string;
   attempt: 0 | 1; model: string; engine: string; effort: string | null;
 };
-export type StartPickerEvidence = PickerAttempt & {pool: PickerPoolRow[]; history: PickerAttempt[]};
+export type StartPickerEvidence = PickerAttempt & {pool: PickerPoolRow[]; history: PickerAttempt[]; pool_degraded?: boolean};
 
 function record(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
@@ -59,7 +59,9 @@ export function normalizeStartPickerEvidence(value: unknown): StartPickerEvidenc
     history.push(attempt);
   }
   if(JSON.stringify(history[history.length-1])!==JSON.stringify(selected))return null;
-  const result={...selected,pool,history};
+  const degraded=new Set(pool.map(row=>row.model)).size<3;
+  if(v.pool_degraded!==undefined&&(typeof v.pool_degraded!=='boolean'||v.pool_degraded!==degraded))return null;
+  const result={...selected,pool,history,...(v.pool_degraded===undefined?{}:{pool_degraded:degraded})};
   return new TextEncoder().encode(JSON.stringify(result)).length<=MAX_PICKER_BYTES?result:null;
 }
 
@@ -70,7 +72,8 @@ export function buildStartPickerEvidence(route: PickedRoute, diagnostics: PickDi
     machine_id:route.machine_id,attempt,model:route.model,engine:route.engine,effort:route.effort??null};
   const prior=normalizeStartPickerEvidence(previous);
   const history=prior?prior.history.filter(row=>row.attempt<attempt):[];
-  const evidence=normalizeStartPickerEvidence({...selected,pool:diagnostics.pool,history:[...history,selected].slice(-2)});
+  const evidence=normalizeStartPickerEvidence({...selected,pool:diagnostics.pool,
+    pool_degraded:new Set(diagnostics.pool.map(row=>row.model)).size<3,history:[...history,selected].slice(-2)});
   if(!evidence)throw new Error('invalid_start_picker_evidence');
   return evidence;
 }

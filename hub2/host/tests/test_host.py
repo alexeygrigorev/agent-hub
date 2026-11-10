@@ -94,6 +94,57 @@ class HostTests(unittest.TestCase):
         self.journal.db.close()
         self.temp.cleanup()
 
+    def test_heartbeat_local_source_is_mode_engine_account_bound_and_canonical_only(self):
+        from agent_hub_host.native_launch import LOCAL_ROUTES
+        captured = []
+        self.client.heartbeat = lambda *args, **kw: captured.append((args, kw))
+        self.bridge.launcher.config = {'routes': {k: dict(v) for k, v in LOCAL_ROUTES.items()}}
+        self.bridge.engines = {'codex', 'claude', 'go', 'zai', 'antigravity', 'shell', 'unavailable'}
+        self.bridge.launcher.capabilities = lambda: {'codex': {'headless', 'interactive'}, 'claude': {'headless'},
+            'go': {'headless'}, 'zai': {'headless'}, 'antigravity': {'headless', 'interactive'}, 'shell': {'headless'}, 'codex-orin': {'headless', 'interactive'}}
+        self.bridge.heartbeat(['worker'], include_native_sessions=False)
+        flags = {v for v in captured[-1][0][2] if v.startswith('credentials:')}
+        self.assertEqual(flags, {'credentials:local:headless:codex:codex', 'credentials:local:interactive:codex:codex',
+            'credentials:local:headless:claude:claude', 'credentials:local:headless:go:shared-go',
+            'credentials:local:headless:zai:zai-central', 'credentials:local:headless:antigravity:gemini',
+            'credentials:local:interactive:antigravity:gemini'})
+        self.assertNotIn('codex-orin', str(flags))
+        self.assertLessEqual(len(captured[-1][0][2]), 32)
+        self.bridge.launcher.config['private_provider_homes'] = True
+        self.bridge.heartbeat([], include_native_sessions=False)
+        self.assertFalse(any(v.startswith('credentials:') for v in captured[-1][0][2]))
+        self.bridge.launcher.config['private_provider_homes'] = False
+        self.bridge.launcher.config['routes']['codex']['profile'] = 'custom-secret-profile'
+        self.bridge.launcher.config['routes']['antigravity']['account_id'] = 'custom-account'
+        self.bridge.heartbeat([], include_native_sessions=False)
+        flags = [v for v in captured[-1][0][2] if v.startswith('credentials:')]
+        self.assertFalse(any(':codex:' in v or ':antigravity:' in v for v in flags))
+        self.assertNotIn('custom-secret-profile', json.dumps(captured[-1]))
+        self.assertNotIn('custom-account', json.dumps(captured[-1]))
+
+    def test_local_source_modes_launch_without_central_home_injection(self):
+        from agent_hub_host.native_launch import LOCAL_ROUTES
+        for interactive in (False, True):
+            with self.subTest(interactive=interactive):
+                self.bridge.launcher.config = {'routes': {k: dict(v) for k, v in LOCAL_ROUTES.items()}}
+                offer = self.offer()
+                offer['session_id'] += '-interactive' if interactive else '-headless'
+                offer['operation_id'] += '-interactive' if interactive else '-headless'
+                offer['launch']['interactive'] = interactive
+                with patch('agent_hub_host.providers.provision', side_effect=AssertionError('central home must not be provisioned')):
+                    self.bridge.offer(offer)
+                argv, options = next((args, kw) for args, kw in reversed(self.native.calls) if args[1] == 'start')
+                child = argv[argv.index('--') + 1:]
+                self.assertNotIn('CODEX_HOME=', ' '.join(argv))
+                self.assertNotIn('CLAUDE_CONFIG_DIR=', ' '.join(argv))
+                self.assertNotIn('HUB2_LAUNCH_CONTEXT', options['env'])
+                if interactive:
+                    self.assertEqual(child[0], 'codex')
+                    self.assertNotIn('exec', child)
+                else:
+                    self.assertIn('task', child); self.assertIn('run', child)
+                    self.assertEqual(child[child.index('--profile') + 1], 'hub-shared-codex')
+
     def test_existing_journal_schema_adds_persistent_runtime_deadline(self):
         path=self.root/'legacy-journal.sqlite'
         db=sqlite3.connect(path)

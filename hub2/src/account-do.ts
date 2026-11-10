@@ -45,6 +45,7 @@ export class AccountDO {
    if(p==='/api/account/hosts')return await this.hosts(request,a);
    if(p==='/api/account/discovery')return await this.discovery(request,a);
    if(p==='/api/account/alerts'&&method==='GET')return this.alerts(request,a);
+   if(p==='/_internal/routing-snapshot'&&method==='GET')return this.routingView(await this.routingCredentialStatus(true));
    if(p==='/_internal/routing'&&method==='GET'){
     const credential=await this.routingCredentialStatus();
     if(credential.credential_usable)await this.lazyQuota();
@@ -63,23 +64,26 @@ export class AccountDO {
     return error('internal_error',500);
   }
  }
- private async routingCredentialStatus():Promise<RoutingCredentialStatus>{
+ private async routingCredentialStatus(passive=false):Promise<RoutingCredentialStatus>{
   const account=this.db.one<Account>('SELECT * FROM account WHERE id=1');
   const row=this.db.one<{generation:number;sealed:string}>('SELECT generation,sealed FROM credentials WHERE id=1');
   if(!account||!row){
-   this.recordCredentialAlert('credential_missing',row?.generation??0);
+   if(!passive)this.recordCredentialAlert('credential_missing',row?.generation??0);
    return{credential_usable:false,credential_status:'missing'};
   }
-  if(account.provider==='zai')return{credential_usable:true,credential_status:'ready'};
+  if(account.provider==='zai'){
+   if(passive){try{if(!this.validFiles('zai',await this.unseal(row.sealed,'zai',row.generation)))return{credential_usable:false,credential_status:'unknown'};}catch{return{credential_usable:false,credential_status:'unknown'};}}
+   return{credential_usable:true,credential_status:'ready'};
+  }
   if(!['codex','claude','go'].includes(account.provider)){
-   this.recordCredentialAlert('credential_health_unknown',row.generation);
+   if(!passive)this.recordCredentialAlert('credential_health_unknown',row.generation);
    return{credential_usable:false,credential_status:'unknown'};
   }
   try{
    let current=row;
    let files=await this.unseal(current.sealed,account.provider,current.generation) as Record<string,string>;
    let expires=this.accessExpiry(account.provider,files);
-   if(['codex','claude'].includes(account.provider)&&this.needsRefresh(account.provider,files,ROUTING_REFRESH_MINIMUM_MS)){
+   if(!passive&&['codex','claude'].includes(account.provider)&&this.needsRefresh(account.provider,files,ROUTING_REFRESH_MINIMUM_MS)){
     try{
      await this.refresh(account.provider,files,current.generation);
      current=this.db.one<{generation:number;sealed:string}>('SELECT generation,sealed FROM credentials WHERE id=1')!;
@@ -87,18 +91,18 @@ export class AccountDO {
      expires=this.accessExpiry(account.provider,files);
     }catch{
      const expired=expires===null||expires<=Date.now();
-     this.recordCredentialAlert(expired?'credential_expired':'credential_refresh_failed',current.generation);
+     if(!passive)this.recordCredentialAlert(expired?'credential_expired':'credential_refresh_failed',current.generation);
      return{credential_usable:false,credential_status:expired?'expired':'refresh_failed'};
     }
    }
    if((['codex','claude'].includes(account.provider)&&(expires===null||expires<=Date.now()))
      ||(account.provider==='go'&&expires!==null&&expires<=Date.now())){
-    this.recordCredentialAlert('credential_expired',current.generation);
+    if(!passive)this.recordCredentialAlert('credential_expired',current.generation);
     return{credential_usable:false,credential_status:'expired'};
    }
    return{credential_usable:true,credential_status:'ready'};
   }catch{
-   this.recordCredentialAlert('credential_health_unknown',row.generation);
+   if(!passive)this.recordCredentialAlert('credential_health_unknown',row.generation);
    return{credential_usable:false,credential_status:'unknown'};
   }
  }

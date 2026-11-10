@@ -2,7 +2,7 @@ import { mcp } from './mcp';
 import { publicAuthentication, cookieActor, noStore } from './auth';
 import { safeEqual } from './crypto';
 import { bodyObject, boundedText, error, HttpError, json } from './http';
-import { pickModelRouteDetailed } from './model-picker';
+import { pickModelRouteDetailed, simulateModelRoutes, type PickInput } from './model-picker';
 import { sessionPurpose } from './session-purpose';
 import { isLiveActiveSession, type LiveSession } from './session-liveness';
 import type { Actor, Hub2Env, JsonRecord } from './types';
@@ -106,6 +106,8 @@ const router = {
         return request.method === 'POST' ? await startSession(request, env, actor) : error('method_not_allowed', 405);
       if (path === '/api/model-picker/pick')
         return request.method === 'POST' ? await dryRunPick(request, env, actor) : error('method_not_allowed', 405);
+      if (path === '/api/fleet/routing/simulate')
+        return request.method === 'GET' ? await routingSimulation(request, env, actor) : error('method_not_allowed', 405);
       if (path === '/api/sessions/reap')
         return request.method === 'POST' ? await reapSessions(request, env, actor) : error('method_not_allowed', 405);
       if (path === '/api/fleet' || path === '/api/fleet/machines' || path === '/api/sessions')
@@ -684,11 +686,33 @@ async function dryRunPick(request: Request, env: Hub2Env, actor: Actor): Promise
       ...(Array.isArray(body.needs) ? { required_capabilities: body.needs as string[] } : {}),
     });
     return json({ route: [route.engine, route.model, route.effort ?? 'default'].join('/'), engine: route.engine, model: route.model,
-      effort: route.effort ?? null, policy_id: route.policy_id, machine_id: route.machine_id, ...diagnostics });
+      effort: route.effort ?? null, policy_id: route.policy_id, machine_id: route.machine_id, ...diagnostics,
+      // Preserve the credential-monitor contract; the simulation reports every actual exclusion.
+      excluded:[...diagnostics.excluded,...(diagnostics.advisories??[])].filter(row=>row.reason.startsWith('credential_')) });
   } catch (caught) {
     if (caught instanceof HttpError) return error(caught.code, caught.status);
     throw caught;
   }
+}
+
+async function routingSimulation(request: Request, env: Hub2Env, actor: Actor): Promise<Response> {
+  if (!admin(actor) && !actor.scopes.includes('routing:read')) return error('forbidden',403);
+  const params=requestUrl(request).searchParams;
+  const fields=['n','purpose','tier','mode','machine_id','engine','model','effort','workspace'];
+  if([...params.keys()].some(key=>!fields.includes(key)||params.getAll(key).length!==1))return error('invalid_simulation_parameters',400);
+  const raw=params.get('n')??'1000';
+  if(!/^[1-9][0-9]{0,3}$/.test(raw)||Number(raw)>1000)return error('invalid_simulation_count',400);
+  if(params.has('mode')&&!['headless','interactive'].includes(params.get('mode')!))return error('invalid_session_mode',400);
+  if(params.has('effort')&&!['low','medium','max'].includes(params.get('effort')!))return error('invalid_effort',400);
+  const input:PickInput={interactive:params.get('mode')==='interactive',purpose:sessionPurpose(params.get('purpose')??undefined)};
+  for(const key of ['tier','machine_id','engine','model','effort','workspace'] as const){
+    const value=params.get(key);
+    if(value!==null){
+      if(!value.trim()||value.length>(key==='workspace'?2048:120)||/[\x00-\x1f\x7f]/.test(value))return error('invalid_simulation_parameters',400);
+      input[key]=value;
+    }
+  }
+  return json(await simulateModelRoutes(env,input,Number(raw)));
 }
 
 function safetyModeForRequest(
