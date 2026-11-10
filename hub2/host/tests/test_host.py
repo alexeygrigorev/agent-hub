@@ -631,8 +631,16 @@ class HostTests(unittest.TestCase):
         (directory/'stdout.log').write_text('real child stdout')
         result=self.bridge.command({'id':'bound-capture','session_id':row['session_id'],'epoch':row['epoch'],'kind':'capture'})
         self.assertEqual(result['output'],'real child stdout')
+        screen=self.bridge.command({'id':'screen-capture','session_id':row['session_id'],'epoch':row['epoch'],'kind':'capture','mode':'screen'})
+        self.assertEqual(screen['output'],'hello')
         with self.assertRaisesRegex(ValueError,'command_fence_conflict'):
             self.bridge.command({'id':'wrong-epoch-capture','session_id':row['session_id'],'epoch':row['epoch']+1,'kind':'capture'})
+
+    def test_capture_on_platform_without_safe_file_reads_uses_native_pane(self):
+        self.bridge.offer(self.offer())
+        with patch.object(os,'supports_dir_fd',set()):
+            captured=self.bridge.command({'id':'fallback-capture','session_id':'session-1','epoch':1,'kind':'capture'})
+        self.assertEqual(captured['output'],'hello')
 
     def test_no_shell_flags_and_fenced_capture_stop(self):
         self.bridge.offer(self.offer())

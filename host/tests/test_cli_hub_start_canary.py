@@ -53,7 +53,7 @@ if args[:2] == ["sessions", "capture"]:
     if sc == "capture_prompt_only": output = "$ " + prompt
     elif sc == "wrapped_prompt_only": output = "Reply CANARY-OK\nand exit"
     elif sc == "capture_empty": output = ""
-    elif sc == "json_command_output": output = json.dumps({"type":"item.completed","item":{"type":"command_execution","aggregated_output":marker+"\n","command":"echo"}})
+    elif sc == "json_command_output": output = json.dumps({"type":"item.completed","item":{"type":"command_execution","aggregated_output":marker+"\n","command":"echo"}}) + "\n" + json.dumps({"type":"item.started","item":{"type":"command_execution","command":"sleep 60"}})
     elif sc == "json_prompt_only": output = json.dumps({"type":"item.started","item":{"type":"command_execution","command":"echo "+marker}})
     elif sc == "json_message_output": output = json.dumps({"type":"item.completed","item":{"type":"agent_message","text":marker}})
     elif sc == "json_result_output": output = json.dumps({"type":"result","result":marker})
@@ -162,7 +162,7 @@ class CanaryTest(unittest.TestCase):
         c = self.calls()
         self.assertNotIn("--engine", c)
         self.assertNotIn("--model", c)
-        self.assertIn("--prompt Run one shell command", c)
+        self.assertIn("--prompt Use two sequential tool calls.", c)
         self.assertIn("--repo owner/repo", c)
         self.assertIn("--machine HOST-1", c)
         self.assertIn("--no-wait", c)
@@ -388,6 +388,9 @@ class CanaryTest(unittest.TestCase):
             with self.subTest(scenario=scenario):
                 r, value = self.run_canary(scenario, '--mode', 'full')
                 self.assertEqual((r.returncode, value['ok'], value['stage']), (0, True, None))
+                prompt=(self.tmp/'prompt').read_text()
+                self.assertIn('two sequential tool calls',prompt)
+                self.assertIn('separate tool call to run sleep 60',prompt)
         for scenario in ('json_prompt_only', 'json_arbitrary_marker'):
             with self.subTest(scenario=scenario):
                 self.assert_stage(scenario, 'capture', 'no_output_beyond_prompt', mode='full')

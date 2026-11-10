@@ -89,7 +89,7 @@ type SessionRow = {
   created_at: number; updated_at: number;
 };
 type OutboxRow = { id: string; kind: string; operation_id: string; project_id: string; payload_json: string; attempt: number; next_action_at: number };
-type CommandRow = { id: string; session_id: string; machine_id: string; epoch: number; request_key: string; request_digest: string; kind: string; text: string | null; state: string; result_json: string | null; created_at: number; updated_at: number };
+type CommandRow = { id: string; session_id: string; machine_id: string; epoch: number; request_key: string; request_digest: string; kind: string; text: string | null; capture_mode: string | null; state: string; result_json: string | null; created_at: number; updated_at: number };
 type NativeMail = {message_id:string;epoch:number;operation_id:string;session_id:string;machine_id:string;recipient:string;body:string;digest:string;state:string;receipt_digest:string|null};
 const AUTH_FALLBACK_REASONS=new Set(['provider_auth_failed','provider_unauthorized','provider_route_mismatch','provider_account_required',
   'provider_materialization_refused','provider_generation_ack_unverified','credential_generation_rejected','credential_generation_conflict',
@@ -112,11 +112,11 @@ export class MachineDO {
     this.db = new MeteredDb(ctx.storage.sql);
     this.sqlReceipts = new SqlReceiptMeter(this.db);
     this.env = wrapSqlNamespaces(env, this.sqlReceipts) as Hub2Env;
-    initializeSchema(ctx, this.db, 6, LATEST_SCHEMA, [[SCHEMA[0]],COMPACT_KEYS,['ALTER TABLE machine_capabilities ADD COLUMN resources_json TEXT'],MACHINE_ACTIVE_MIGRATION,[
+    initializeSchema(ctx, this.db, 7, LATEST_SCHEMA, [[SCHEMA[0]],COMPACT_KEYS,['ALTER TABLE machine_capabilities ADD COLUMN resources_json TEXT'],MACHINE_ACTIVE_MIGRATION,[
       'CREATE TABLE IF NOT EXISTS machine_liveness(singleton INTEGER PRIMARY KEY CHECK(singleton=1),observed_at INTEGER NOT NULL)',
       'CREATE TABLE IF NOT EXISTS native_sessions(session_id TEXT PRIMARY KEY,native_id TEXT,phase TEXT NOT NULL,last_activity_at INTEGER,exit_code INTEGER,containment_empty INTEGER NOT NULL,observed_at INTEGER NOT NULL) WITHOUT ROWID',
       'DROP TABLE IF EXISTS machine_active','ALTER TABLE machine_capabilities DROP COLUMN resources_json','ALTER TABLE machines DROP COLUMN active_session_id',
-    ]],()=>this.scheduleNext(),6);
+    ],['ALTER TABLE session_commands ADD COLUMN capture_mode TEXT']],()=>this.scheduleNext(),6);
     this.constructorMs = performance.now() - started;
   }
 
@@ -740,12 +740,15 @@ export class MachineDO {
     if (!hasScope(actor, 'operator:admin') && (!hasScope(actor, scope)
       || (actor.resource_id !== sessionId && actor.resource_id !== session.project_id))) return error('forbidden', 403);
     if (kind === 'send' && (this.parse(session.launch_json) as JsonRecord).interactive !== true) return error('headless_send_refused', 409);
+    const captureMode = kind === 'capture' ? body.mode : undefined;
+    if (captureMode !== undefined && captureMode !== 'screen') return error('invalid_capture_mode', 400);
+    if (kind !== 'capture' && body.mode !== undefined) return error('unexpected_capture_mode', 400);
     const commandText = body.text;
     if (kind === 'send' && (typeof commandText !== 'string' || !commandText.trim() || new TextEncoder().encode(commandText).byteLength > 8192)) return error('invalid_command_text', 400);
     if (kind !== 'send' && commandText !== undefined) return error('unexpected_command_text', 400);
     const key = request.headers.get('Idempotency-Key') || body.key;
     if (typeof key !== 'string' || !/^[A-Za-z0-9_.:-]{1,120}$/.test(key)) return error('idempotency_key_required', 400);
-    const digest = await sha256Hex(JSON.stringify({ kind, text: commandText ?? null, epoch: session.epoch }));
+    const digest = await sha256Hex(JSON.stringify({ kind, text: commandText ?? null, epoch: session.epoch, ...(captureMode ? {mode:captureMode} : {}) }));
     const immediateStop = kind === 'stop' && !session.native_id && ['offered', 'expired'].includes(session.state);
     const prior = this.db.one<CommandRow>('SELECT * FROM session_commands WHERE session_id=? AND request_key=?', sessionId, key);
     if (prior) {
@@ -775,8 +778,8 @@ export class MachineDO {
         if (!current || current.epoch !== session.epoch || !(kind==='stop'
           ? ['running','claimed'].includes(current.state)
           : current.state==='running'&&!!current.native_id)) throw new HttpError('session_not_running', 409);
-        this.db.run(`INSERT INTO session_commands(id,session_id,machine_id,epoch,request_key,request_digest,kind,text,state,result_json,created_at,updated_at)
-          VALUES(?,?,?,?,?,?,?,?,'pending',NULL,?,?)`, id, sessionId, session.machine_id, session.epoch, key, digest, kind, commandText ?? null, now, now);
+        this.db.run(`INSERT INTO session_commands(id,session_id,machine_id,epoch,request_key,request_digest,kind,text,capture_mode,state,result_json,created_at,updated_at)
+          VALUES(?,?,?,?,?,?,?,?,?,'pending',NULL,?,?)`, id, sessionId, session.machine_id, session.epoch, key, digest, kind, commandText ?? null, captureMode ?? null, now, now);
       });
     } catch (caught) {
       if (caught instanceof HttpError) return error(caught.code, caught.status);
@@ -1179,6 +1182,7 @@ export class MachineDO {
     const body = await bodyObject(request, 12_288);
     const mapped: JsonRecord = { kind, key: body.key };
     if (kind === 'send') mapped.text = body.body;
+    if (kind === 'capture' && body.mode !== undefined) mapped.mode = body.mode;
     const response = await this.createCommand(new Request(request.url, { method: 'POST', headers: request.headers, body: JSON.stringify(mapped) }), sessionId);
     if (!response.ok) return response;
     const data = await response.json() as { command: { id: string } };
@@ -1266,6 +1270,7 @@ export class MachineDO {
 
   private commandView(row: CommandRow): JsonRecord {
     return { id: row.id, session_id: row.session_id, epoch: row.epoch, kind: row.kind,
+      ...(row.capture_mode ? {mode:row.capture_mode} : {}),
       ...(row.text === null ? {} : { text: row.text }) };
   }
 

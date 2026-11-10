@@ -284,3 +284,34 @@ test('session projections carry host workspace route and timestamp columns for t
  assert.equal(view.account_id,'codex');assert.equal(view.account,'codex');assert.equal(view.mode,'headless');
  assert.equal(view.managed,true);assert.ok(Number.isFinite(Date.parse(view.created_at)));assert.ok(Number.isFinite(Date.parse(view.updated_at)));
 });
+
+
+test('explicit screen capture survives the durable command queue and remains idempotency bound',async()=>{
+ const f=fixture();await startClaimed(f,'screen-session','11111111-1111-4111-8111-111111111111');
+ const admin={'x-hub2-actor':JSON.stringify({id:'operator',kind:'operator',scopes:['operator:admin']})};
+ const receipt=await f.call('/api/sessions/screen-session/capture','POST',{key:'screen-key',mode:'screen'},admin);
+ assert.equal(receipt.status,201);const value=await receipt.json() as any;
+ assert.equal(value.command.mode,'screen');
+ const row=f.database.prepare('SELECT * FROM session_commands WHERE id=?').get(value.command_id) as any;
+ assert.equal(row.capture_mode,'screen');assert.equal((f.machine as any).commandView(row).mode,'screen');
+ assert.equal((await f.call('/api/sessions/screen-session/capture','POST',{key:'screen-key',mode:'screen'},admin)).status,200);
+ assert.equal((await f.call('/api/sessions/screen-session/capture','POST',{key:'screen-key'},admin)).status,409);
+ assert.equal((await f.call('/api/sessions/screen-session/capture','POST',{key:'bad-mode',mode:'file'},admin)).status,400);
+ const tail=await f.call('/api/sessions/screen-session/capture','POST',{key:'tail-key'},admin);
+ assert.equal(tail.status,201);assert.equal((await tail.json() as any).command.mode,undefined);
+});
+
+test('schema seven preserves pending version-six commands and adds capture mode',async()=>{
+ const f=fixture();await startClaimed(f,'old-command','22222222-2222-4222-8222-222222222222');
+ const admin={'x-hub2-actor':JSON.stringify({id:'operator',kind:'operator',scopes:['operator:admin']})};
+ const response=await f.call('/api/sessions/old-command/capture','POST',{key:'before-upgrade'},admin);
+ const created=await response.json() as any;
+ f.database.exec('ALTER TABLE session_commands DROP COLUMN capture_mode; UPDATE hub2_schema SET version=6');
+ const prior=f.machine as any;
+ const upgraded=new MachineDO(prior.ctx,prior.env);
+ const listed=await upgraded.fetch(new Request('https://machine.test/api/sessions/old-command/commands',{headers:{...header,...admin}}));
+ assert.equal(listed.status,200);assert.equal((await listed.json() as any).commands[0].id,created.command_id);
+ const row=f.database.prepare('SELECT * FROM session_commands WHERE id=?').get(created.command_id) as any;
+ assert.equal(row.capture_mode,null);assert.equal(row.state,'pending');
+ assert.equal((f.database.prepare('SELECT version FROM hub2_schema').get() as any).version,7);
+});
