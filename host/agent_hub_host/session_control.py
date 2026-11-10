@@ -1225,6 +1225,9 @@ def _execute(args):
                     f'session_start_failed; session {created["id"]} reached {state or "an unconfirmed state"}{detail}; '
                     f'reconcile with --key {key} via show/events'
                 )
+            created.update(bound)
+            if isinstance(created.get('session'), dict):
+                created['session'] = {**created['session'], **bound}
         return created
     if cmd in ('cancel', 'protect'):
         from urllib.parse import quote

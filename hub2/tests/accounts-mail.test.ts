@@ -665,3 +665,21 @@ test('failed central credential refresh maps to specific error rather than gener
  assert.equal(body.error,'provider_refresh_invalid_grant');
 });
 
+
+for(const provider of ['codex','claude'])for(const rotated of [false,true])test(`${provider} refresh ${rotated?'rotates supplied':'retains omitted'} refresh and ID tokens durably`,async()=>{
+ const s=state(),path=provider==='codex'?'.codex/auth.json':'.claude/.credentials.json';
+ const original=provider==='codex'?{tokens:{access_token:'synthetic-old-access',refresh_token:'synthetic-old-refresh',id_token:'synthetic-old-id'},last_refresh:'2000-01-01T00:00:00Z'}
+  :{claudeAiOauth:{accessToken:'synthetic-old-access',refreshToken:'synthetic-old-refresh',expiresAt:1}};
+ const files={[path]:JSON.stringify(original)},reply={access_token:'synthetic-new-access',expires_in:3600,...(rotated?{refresh_token:'synthetic-new-refresh',id_token:'synthetic-new-id'}:{})};
+ const account=new AccountDO(s.ctx,{HUB2_CREDENTIAL_KEY:'ee'.repeat(32),HUB2_PROVIDER_FETCH:async()=>Response.json(reply)});
+ assert.equal((await account.fetch(request('/api/account','PATCH',{provider,enabled:true}))).status,200);
+ assert.equal((await account.fetch(request('/api/account/credentials','PUT',{files,expected_generation:0}))).status,200);
+ await (account as any).refreshProvider(provider,files,1);
+ const stored=s.database.prepare('SELECT sealed,generation FROM credentials WHERE id=1').get() as any;
+ assert.equal(stored.generation,2);
+ const restored=await(account as any).unseal(stored.sealed,provider,stored.generation),auth=JSON.parse(restored[path]);
+ const tokens=provider==='codex'?auth.tokens:auth.claudeAiOauth;
+ assert.equal(tokens[provider==='codex'?'access_token':'accessToken'],'synthetic-new-access');
+ assert.equal(tokens[provider==='codex'?'refresh_token':'refreshToken'],rotated?'synthetic-new-refresh':'synthetic-old-refresh');
+ if(provider==='codex')assert.equal(tokens.id_token,rotated?'synthetic-new-id':'synthetic-old-id');
+});

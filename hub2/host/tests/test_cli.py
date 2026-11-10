@@ -171,7 +171,8 @@ class CliTests(unittest.TestCase):
         })
         saved_config = self.config.read_bytes()
         with patch("agent_hub_host.cli.Journal") as journal, \
-             patch("agent_hub_host.auth.refresh") as refresh:
+             patch("agent_hub_host.auth.refresh") as refresh, \
+             patch("agent_hub_host.native_launch.shutil.which", return_value=None):
             code, result = self.invoke("heartbeat", "--label", "fleet-cycle", "--aplexer", os.sys.executable)
 
         self.assertEqual(code, 0)
@@ -181,7 +182,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual((method, urlsplit(path).path), ("POST", "/api/heartbeat"))
         self.assertEqual(auth, "Bearer synthetic-token")
         self.assertEqual(body["labels"], ["fleet-cycle"])
-        self.assertEqual(body["engines"], [])
+        self.assertEqual(body["engines"], ["shell"])
         self.assertEqual(body["capabilities"], ["headless"])
         self.assertNotIn("native_sessions", body)
         journal.assert_not_called()

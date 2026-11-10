@@ -25,7 +25,7 @@ async function dispatch(request:Request,ctx:DurableObjectState,core:Core,kind:st
  }
  if(path==='/_fixture/expire-offer'&&request.method==='POST'&&kind==='machine'){
   const b=await request.json() as {id:string};
-  ctx.storage.sql.exec('UPDATE sessions SET offer_expires_at=? WHERE id=? AND state=?',Date.now()-1,b.id,'offered').toArray();
+  ctx.storage.sql.exec("UPDATE sessions SET offer_expires_at=?,created_at=?,launch_json=json_set(launch_json,'$.start_deadline_at',?) WHERE id=? AND state=?",Date.now()-1,Date.now()-120001,Date.now()-1,b.id,'offered').toArray();
   (core as any).db.cache.clear(); // Test-only raw deadline mutation must invalidate instance data.
   await core.alarm!();return Response.json({forced_due:true});
  }

@@ -1,10 +1,10 @@
 import {test} from 'node:test';import assert from 'node:assert/strict';import {DatabaseSync} from 'node:sqlite';import {ProjectDO} from '../src/project-do';
 const admin={id:'human:admin',kind:'operator',scopes:['operator:admin']};
-function fixture(options:{modelCandidates?:any[];accountHosts?:Record<string,string[]>}={}){const sql=new DatabaseSync(':memory:');let alarm:any=null;const storageValues=new Map<string,unknown>(),ctx:any={id:{toString:()=> 'synthetic-project'},storage:{sql:{exec(q:string,...a:any[]){const p=sql.prepare(q);const rows=p.columns().length?p.all(...a):(p.run(...a),[]);return{toArray:()=>rows};}},transactionSync(fn:any){sql.exec('BEGIN');try{const r=fn();sql.exec('COMMIT');return r;}catch(e){sql.exec('ROLLBACK');throw e;}},async getAlarm(){return alarm;},async setAlarm(at:number){alarm=at;},async deleteAlarm(){alarm=null;},async get(key:string){return storageValues.get(key);},async put(key:string,value:unknown){storageValues.set(key,value);},async delete(key:string){return storageValues.delete(key);}},blockConcurrencyWhile:(f:any)=>Promise.resolve(f())};
+function fixture(options:{modelCandidates?:any[];accountHosts?:Record<string,string[]>;connected?:boolean}={}){const sql=new DatabaseSync(':memory:');let alarm:any=null;const storageValues=new Map<string,unknown>(),ctx:any={id:{toString:()=> 'synthetic-project'},storage:{sql:{exec(q:string,...a:any[]){const p=sql.prepare(q);const rows=p.columns().length?p.all(...a):(p.run(...a),[]);return{toArray:()=>rows};}},transactionSync(fn:any){sql.exec('BEGIN');try{const r=fn();sql.exec('COMMIT');return r;}catch(e){sql.exec('ROLLBACK');throw e;}},async getAlarm(){return alarm;},async setAlarm(at:number){alarm=at;},async deleteAlarm(){alarm=null;},async get(key:string){return storageValues.get(key);},async put(key:string,value:unknown){storageValues.set(key,value);},async delete(key:string){return storageValues.delete(key);}},blockConcurrencyWhile:(f:any)=>Promise.resolve(f())};
  const routes:any[]=[],machineCalls:string[]=[],accountCalls:string[]=[];
  const requestOf=(input:string|Request,init?:RequestInit)=>input instanceof Request?input:new Request(input,init);
  const CONTROL={idFromName:(id:any)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{const request=requestOf(input,init),path=new URL(request.url).pathname;const value=request.method==='GET'?{}:await request.json();routes.push(value);if(path==='/_routing-policy')return Response.json({version:1,candidates:options.modelCandidates||[]});if(path==='/api/directory')return Response.json({items:[{id:'h1'}],next:null});return Response.json({registered:true,accepted:true});}})};
- const MACHINES={idFromName:(id:any)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{const request=requestOf(input,init);const path=new URL(request.url).pathname;machineCalls.push(path);if(path==='/_internal/routing')return Response.json({machine_id:'h1',engines:['codex','claude'],capabilities:['headless','interactive']});return Response.json(path.endsWith('/reserve')?{state:'staged',epoch:1}:{state:'offered'});}})};
+ const MACHINES={idFromName:(id:any)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{const request=requestOf(input,init);const path=new URL(request.url).pathname;machineCalls.push(path);if(path==='/_internal/routing')return Response.json({machine_id:'h1',connected:options.connected??true,engines:['codex','claude'],capabilities:['headless','interactive']});return Response.json(path.endsWith('/reserve')?{state:'staged',epoch:1}:{state:'offered'});}})};
  const unused={idFromName:(id:any)=>id,get:()=>({fetch:async()=>Response.json({ok:true})})};
  const ACCOUNTS={idFromName:(id:any)=>id,get:(id:string)=>({fetch:async(input:string|Request)=>{const path=new URL(input instanceof Request?input.url:input).pathname;accountCalls.push(path);return Response.json({account:{enabled:true},quota:{remaining:id==='codex'?90:70},hosts:options.accountHosts?.[id]||['h1'],credential_usable:false});}})};
  const env:any={CONTROL,PROJECTS:unused,MACHINES,ACCOUNTS,MAILBOXES:unused};
@@ -135,37 +135,26 @@ test('pre-claim host launch refusal fails clearly and is not silently re-offered
  const history=await body(await f.call('/api/intakes/'+own.id+'/history'));
  assert(history.events.some((event:any)=>event.kind==='session_launch_failed'&&event.body.failure_reason==='workspace_label_unavailable'));
  const retry=await f.call('/api/intakes/'+own.id+'/start','POST',{...start,key:'host-refused-retry'});
- assert.equal(retry.status,409);assert.equal((await body(retry)).error,'retry_requires_qualified_failure');
- assert.equal((f.sql.prepare('SELECT COUNT(*) AS n FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any).n,1);
+ assert.equal(retry.status,201,JSON.stringify(await retry.clone().json()));
+ assert.equal((f.sql.prepare('SELECT COUNT(*) AS n FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any).n,2);
 });
-test('stop receipt for an expired offer cancels its already-requeued retry',async()=>{
+test('an expired unclaimed offer terminates instead of scheduling an unbounded retry',async()=>{
  const f=fixture(),own=await intake(f,'expired-offer-stop'),start={key:'expired-offer-stop',workspace:'/tmp/synthetic-expired-stop',engine:'shell',machine_id:'h1',override_reason:'Synthetic semantic test'};
  assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',start)).status,201);
  const first=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any;
- assert.equal(first.state,'offered');assert.equal(first.attempt,0);
- const expiredAt=Date.now()-1000,observedAt=expiredAt+1;
- const requeued=await f.call('/_internal/requeue','POST',{operation_id:first.operation_id,attempt_operation_id:first.attempt_operation_id,
+ const expiredAt=Date.now()-1000,proof={operation_id:first.operation_id,attempt_operation_id:first.attempt_operation_id,
   session_id:first.session_id,machine_id:first.machine_id,epoch:first.epoch,proof_kind:'offer-expired-unclaimed',
-  offer_expires_at:expiredAt,observed_at:observedAt});
- assert.equal(requeued.status,200,JSON.stringify(await requeued.clone().json()));
- let saga=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE operation_id=?').get(first.operation_id) as any;
- assert.equal(saga.state,'pending_machine');assert.equal(saga.attempt,1);assert.equal(saga.attempt_operation_id,`${first.operation_id}:1`);
- assert.equal(saga.epoch,first.epoch);
- const machineCallsBeforeStop=f.machineCalls.length;
- const stop={operation_id:first.operation_id,attempt_operation_id:first.attempt_operation_id,session_id:first.session_id,
-  machine_id:first.machine_id,epoch:first.epoch,native_id:null,reason:'stop_confirmed',observed_at:Date.now()};
- const response=await f.call('/_internal/stopped','POST',stop),result=await body(response);
- assert.equal(response.status,200,JSON.stringify(result));assert.equal(result.stopped,true);
- saga=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE operation_id=?').get(first.operation_id) as any;
- assert.equal(saga.state,'complete');assert.equal(saga.last_reason,'stop_confirmed');
+  offer_expires_at:expiredAt,observed_at:expiredAt+1};
+ const result=await f.call('/_internal/requeue','POST',proof);
+ assert.equal(result.status,200);assert.equal((await body(result)).retry_scheduled,false);
+ const saga=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE operation_id=?').get(first.operation_id) as any;
+ assert.equal(saga.state,'complete');assert.equal(saga.attempt,0);assert.equal(saga.last_reason,'host_no_response');
  const intakeRow=f.sql.prepare('SELECT * FROM intakes WHERE id=?').get(own.id) as any;
- assert.equal(intakeRow.status,'failed');assert.equal(JSON.parse(intakeRow.final_evidence_json).stopped,true);
- const replay=await f.call('/_internal/stopped','POST',stop);
- assert.equal(replay.status,200);assert.equal((await body(replay)).duplicate,true);
- await f.project.alarm();
- assert.equal(f.machineCalls.length,machineCallsBeforeStop);
- assert.equal(f.getAlarm(),null);
+ assert.equal(intakeRow.status,'failed');assert.equal(JSON.parse(intakeRow.final_evidence_json).reason,'host_no_response');
+ const calls=f.machineCalls.length;
+ await f.project.alarm();assert.equal(f.machineCalls.length,calls);assert.equal(f.getAlarm(),null);
 });
+
 test('session admission checks the current saga without quota or account-capacity reads',async()=>{
  const f=fixture(),own=await intake(f,'admission-binding'),start={key:'admission-binding',workspace:'/tmp/synthetic-admission',engine:'shell',machine_id:'h1',override_reason:'Synthetic semantic test'};
  assert([201,202].includes((await f.call('/api/intakes/'+own.id+'/start','POST',start)).status));
@@ -228,7 +217,7 @@ test('signal-only native exit preserves raw tombstone and derives a negative fai
  assert.equal((await f.call('/_internal/finish','POST',receipt)).status,200,'exact signal receipt replay');
  assert.equal((await f.call('/_internal/finish','POST',{...receipt,evidence:{...evidence,native_exit:{...evidence.native_exit,signal:2}}})).status,400,'changed raw signal cannot reuse normalized code');
 });
-test('no-native launch timeout permits retry only with a proof bound to the completed prior saga',async()=>{
+test('failed intake can retry without qualified failure proof once prior saga is complete',async()=>{
  const f=fixture(),own=await intake(f,'timeout-retry-proof'),start={key:'timeout-proof-first',workspace:'/tmp/synthetic-timeout-proof',engine:'shell',machine_id:'h1',override_reason:'Synthetic semantic test'};
  assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',start)).status,201);
  const prior=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any;
@@ -239,16 +228,10 @@ test('no-native launch timeout permits retry only with a proof bound to the comp
  assert.equal(failed.status,200,JSON.stringify(await failed.clone().json()));
  const intakeRow=f.sql.prepare('SELECT * FROM intakes WHERE id=?').get(own.id) as any,proof=JSON.parse(intakeRow.final_evidence_json);
  assert.equal(intakeRow.status,'failed');assert.equal(prior.native_id,null);
- for(const [field,value] of Object.entries({operation_id:'foreign-operation',attempt_operation_id:'foreign-attempt',session_id:'foreign-session',
-  machine_id:'foreign-machine',epoch:prior.epoch+1,reason:'dead',launch_failed:false,native_id_absent:false,reaped:false,native_id:'foreign-native'})){
-  f.sql.prepare('UPDATE intakes SET final_evidence_json=? WHERE id=?').run(JSON.stringify({...proof,[field]:value}),own.id);
-  const refused=await f.call('/api/intakes/'+own.id+'/start','POST',{...start,key:`bad-timeout-proof-${field}`});
-  const refusedBody=await body(refused);assert.equal(refused.status,409,`${field}: ${JSON.stringify(refusedBody)}`);
-  assert.equal(refusedBody.error,'retry_requires_qualified_failure');
- }
+ f.sql.prepare('UPDATE intakes SET final_evidence_json=? WHERE id=?').run('{}',own.id);
  f.sql.prepare("UPDATE dispatch_sagas SET state='needs_attention' WHERE operation_id=?").run(prior.operation_id);
- f.sql.prepare('UPDATE intakes SET final_evidence_json=? WHERE id=?').run(JSON.stringify(proof),own.id);
- assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',{...start,key:'incomplete-timeout-saga'})).status,409);
+ const activeRetry=await f.call('/api/intakes/'+own.id+'/start','POST',{...start,key:'incomplete-prior'});
+ assert.equal(activeRetry.status,409);assert.equal((await body(activeRetry)).error,'intake_already_assigned');
  f.sql.prepare("UPDATE dispatch_sagas SET state='complete',last_reason='retry_bookkeeping' WHERE operation_id=?").run(prior.operation_id);
  const retried=await f.call('/api/intakes/'+own.id+'/start','POST',{...start,key:'timeout-proof-retry'});
  assert.equal(retried.status,201,JSON.stringify(await retried.clone().json()));
@@ -258,4 +241,13 @@ test('no-native launch timeout permits retry only with a proof bound to the comp
  assert.equal(priorAfterRetry.last_reason,'retry_bookkeeping');assert.equal(priorAfterRetry.native_id,null);assert.notEqual(retrySaga.session_id,prior.session_id);
  const history=await body(await f.call('/api/intakes/'+own.id+'/history'));
  assert(history.events.some((event:any)=>event.kind==='session_launch_failed'&&event.body.reason==='launch_timeout_no_native'));
+});
+
+test('operator shell start needs no reason but requires a connected host',async()=>{
+ for(const connected of [true,false])for(const explicitMachine of [true,false]){
+  const f=fixture({connected}),own=await intake(f,'shell-connected');
+  const result=await f.call('/api/intakes/'+own.id+'/start','POST',{key:'shell-connected',workspace:'relay',engine:'shell',...(explicitMachine?{machine_id:'h1'}:{})});
+  assert.equal(result.status,connected?201:503,JSON.stringify(await result.clone().json()));
+  if(!connected){const resultBody=await body(result);assert.equal(resultBody.error,'no_connected_host');assert.equal(f.sql.prepare('SELECT COUNT(*) AS n FROM dispatch_sagas').get().n,0);}
+ }
 });

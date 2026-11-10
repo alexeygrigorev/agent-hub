@@ -2,7 +2,8 @@
 // per (class, name), namespaces that route stub.fetch to instances, a periodic
 // alarm sweep, and the WebSocket registry backing ctx.getWebSockets.
 
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, readdirSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { NodeDurableStorage, NodeSqlStorage } from './sqlite-storage.ts';
@@ -35,7 +36,6 @@ class Container {
   private instance: DoHandler | undefined;
   private sql: NodeSqlStorage | undefined;
   private storage: NodeDurableStorage | undefined;
-  private alarmAt: number | null | undefined; // undefined = not loaded yet
   private alarmRunning = false;
   readonly sockets = new Set<ServerSideSocket>();
 
@@ -50,6 +50,8 @@ class Container {
   private ensure(): { handler: DoHandler; storage: NodeDurableStorage } {
     if (!this.instance) {
       const sql = new NodeSqlStorage(join(this.dataDir, safeFileName(this.cls, this.name)));
+      sql.exec('CREATE TABLE IF NOT EXISTS hub2_identity (singleton INTEGER PRIMARY KEY CHECK(singleton=1), binding TEXT NOT NULL, name TEXT NOT NULL)');
+      sql.exec('INSERT OR REPLACE INTO hub2_identity VALUES(1,?,?)',this.cls,this.name);
       const storage = new NodeDurableStorage(sql);
       const state = {
         // Node constructs each instance inside ensure() before any event can be
@@ -98,13 +100,11 @@ class Container {
    * preserved; a crashed alarm surfaces in logs, never silently. */
   async pollAlarm(now: number): Promise<void> {
     const { handler, storage } = this.ensure();
-    if (this.alarmAt === undefined) this.alarmAt = await storage.getAlarm();
-    if (this.alarmAt === null || this.alarmAt > now || this.alarmRunning) return;
-    const due = this.alarmAt;
-    this.alarmAt = null;
-    await storage.deleteAlarm();
+    const due = await storage.getAlarm();
+    if (due === null || due > now || this.alarmRunning) return;
     this.alarmRunning = true;
     try {
+      await storage.deleteAlarm();
       await handler.alarm?.(due);
     } catch (error) {
       console.error(`[hub2-node] ${this.cls}/${this.name} alarm failed:`, error);
@@ -139,8 +139,38 @@ export class Hub2Runtime {
       namespaces[binding] = this.makeNamespace(binding, doClass);
     }
     this.env = { ...options.env, ...namespaces };
+    this.restoreAlarms();
     this.timer = setInterval(() => void this.sweepAlarms(), 1000);
     this.timer.unref();
+  }
+
+  private restoreAlarms(): void {
+    for(const file of readdirSync(this.options.dataDir).filter(name=>name.endsWith('.sqlite'))){
+      const sql=new DatabaseSync(join(this.options.dataDir,file),{readOnly:true});
+      try{
+        const tables=new Set((sql.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{name:string}>).map(row=>row.name));
+        if(!tables.has('hub2_alarm')||!sql.prepare('SELECT due FROM hub2_alarm WHERE singleton=1 AND due IS NOT NULL').get())continue;
+        let identity=tables.has('hub2_identity')?sql.prepare('SELECT binding,name FROM hub2_identity WHERE singleton=1').get() as {binding:string;name:string}|undefined:undefined;
+        if(!identity){
+          // Migrate existing files only when their exact hashed filename proves
+          // the full name. Project names can also be read from retained intakes.
+          for(const binding of Object.keys(this.options.classes)){
+            const simple=file.slice(binding.length+1,-18);
+            const names=[simple];
+            if(binding==='PROJECTS'&&tables.has('intakes'))names.push(...(sql.prepare('SELECT DISTINCT project FROM intakes').all() as Array<{project:string}>).map(row=>row.project));
+            if(binding==='MACHINES'&&tables.has('machines'))names.push(...(sql.prepare('SELECT machine_id FROM machines').all() as Array<{machine_id:string}>).map(row=>row.machine_id));
+            const name=names.find(name=>safeFileName(binding,name)===file);
+            if(name!==undefined){identity={binding,name};break;}
+          }
+        }
+        if(!identity||!this.options.classes[identity.binding]||safeFileName(identity.binding,identity.name)!==file){
+          console.error('[hub2-node] cannot recover alarm identity',file);
+          continue;
+        }
+        // Construction is deferred until the sweep, after the read handle closes.
+        this.container(identity.binding,this.options.classes[identity.binding],identity.name);
+      }finally{sql.close();}
+    }
   }
 
   private makeNamespace(binding: string, doClass: DoClass): Namespace {
