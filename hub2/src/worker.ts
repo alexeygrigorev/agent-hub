@@ -644,8 +644,16 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
   };
   const started = await call(`/api/intakes/${encodeURIComponent(intakeId)}/start`, start);
   const session = started.data.session as JsonRecord | undefined;
-  if (!started.response.ok || !session?.id)
-    return json({ ...started.data, error: started.data.error ?? 'session_start_failed', stage: 'start', intake_id: intakeId }, started.response.ok ? 502 : started.response.status);
+  if (!started.response.ok || !session?.id) {
+    // The intake above exists only to carry this start. A definitive refusal (4xx) must not leave it
+    // open: every refused `hub sessions start` used to add one orphan intake. 5xx keeps it for a keyed retry.
+    const refused = !existingIntake && started.response.status >= 400 && started.response.status < 500;
+    const archived = refused && (await call(`/api/intakes/${encodeURIComponent(intakeId)}`, {
+      key: `${key}:refused`, status: 'closed', reason: `start refused: ${String(started.data.error ?? 'session_start_failed').slice(0, 80)}`,
+    }).catch(() => undefined))?.response.ok === true;
+    return json({ ...started.data, error: started.data.error ?? 'session_start_failed', stage: 'start', intake_id: intakeId,
+      ...(archived ? { intake_archived: true } : {}) }, started.response.ok ? 502 : started.response.status);
+  }
   // 201 = offered to the host; 202 = accepted and dispatching.
   return json({ ...session, project: canonical, intake_id: intakeId }, started.response.status);
 }
