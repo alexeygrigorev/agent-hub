@@ -29,16 +29,14 @@ ALERT_TO="${ALERT_TO:-dev@dtcdev.click}"
 ALERT_OPS_TO="${ALERT_OPS_TO:-dev@dtcdev.click}"
 ALERT_FROM="${ALERT_FROM:-alerts@dtcdev.click}"
 ALERT_MSMTP_ACCOUNT="${ALERT_MSMTP_ACCOUNT:-alerts}"
-ALERT_REPEAT_SECONDS="${ALERT_REPEAT_SECONDS:-900}"
 DATAOPS_BIN="${DATAOPS_BIN:-/home/alexey/.local/bin/dataops}"
 DATAOPS_CONFIG_DIR="${DATAOPS_CONFIG_DIR:-/home/alexey/.config/dataops}"
 FAILURE_THRESHOLD=2
+RECOVERY_THRESHOLD=2
 
 log() { printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
 fail() { log "ERROR: $*" >&2; exit 2; }
 
-[[ "$ALERT_REPEAT_SECONDS" =~ ^[0-9]+$ ]] && (( ALERT_REPEAT_SECONDS > 0 )) \
-  || fail "ALERT_REPEAT_SECONDS must be a positive integer"
 for command_name in curl msmtp flock date python3 timeout "$NODE_BIN"; do
   command -v "$command_name" >/dev/null 2>&1 || fail "required command is missing: $command_name"
 done
@@ -62,6 +60,7 @@ DATAOPS_TASK_ID=-
 ALERT_SENT=0
 RECOVERY_MAIL_SENT=0
 RECOVERY_TASK_NOTED=0
+RECOVERY_OK_COUNT=0
 
 if [[ -e "$STATE_FILE" ]]; then
   read -r -a STATE_FIELDS < "$STATE_FILE" || fail "monitor state cannot be read"
@@ -77,7 +76,7 @@ if [[ -e "$STATE_FILE" ]]; then
       FAILURE_COUNT=0
       LAST_STATUS=ok
     fi
-  elif (( ${#STATE_FIELDS[@]} == 8 )); then
+  elif (( ${#STATE_FIELDS[@]} == 8 || ${#STATE_FIELDS[@]} == 9 )); then
     LAST_STATUS="${STATE_FIELDS[0]}"
     FAILURE_COUNT="${STATE_FIELDS[1]}"
     LAST_ALERT="${STATE_FIELDS[2]}"
@@ -86,6 +85,9 @@ if [[ -e "$STATE_FILE" ]]; then
     ALERT_SENT="${STATE_FIELDS[5]}"
     RECOVERY_MAIL_SENT="${STATE_FIELDS[6]}"
     RECOVERY_TASK_NOTED="${STATE_FIELDS[7]}"
+    if (( ${#STATE_FIELDS[@]} == 9 )); then
+      RECOVERY_OK_COUNT="${STATE_FIELDS[8]}"
+    fi
   else
     fail "monitor state has an unsupported format"
   fi
@@ -93,17 +95,19 @@ if [[ -e "$STATE_FILE" ]]; then
     || fail "monitor state status is invalid"
   [[ "$FAILURE_COUNT" =~ ^[0-9]+$ && "$LAST_ALERT" =~ ^[0-9]+$ ]] \
     || fail "monitor state counters are invalid"
+  [[ "$RECOVERY_OK_COUNT" =~ ^[0-9]+$ ]] \
+    || fail "monitor recovery counter is invalid"
   [[ "$ALERT_SENT" =~ ^[01]$ && "$RECOVERY_MAIL_SENT" =~ ^[01]$ && "$RECOVERY_TASK_NOTED" =~ ^[01]$ ]] \
     || fail "monitor state delivery flags are invalid"
 fi
 
 write_state() {
   local status="$1" failures="$2" last_alert="$3" incident="$4" task_id="$5"
-  local alert_sent="$6" recovery_mail_sent="$7" recovery_task_noted="$8"
+  local alert_sent="$6" recovery_mail_sent="$7" recovery_task_noted="$8" recovery_ok_count="$9"
   local temporary="$STATE_FILE.tmp.$$"
-  printf '%s %s %s %s %s %s %s %s\n' \
+  printf '%s %s %s %s %s %s %s %s %s\n' \
     "$status" "$failures" "$last_alert" "$incident" "$task_id" \
-    "$alert_sent" "$recovery_mail_sent" "$recovery_task_noted" > "$temporary" \
+    "$alert_sent" "$recovery_mail_sent" "$recovery_task_noted" "$recovery_ok_count" > "$temporary" \
     || fail "cannot write monitor state"
   chmod 600 "$temporary"
   mv -f -- "$temporary" "$STATE_FILE" || fail "cannot install monitor state"
@@ -302,9 +306,16 @@ else
   record_failure "Hub API health read failed (HTTP ${HTTP_CODE:-no response})"
 fi
 
-NOW="$(date +%s)"
 if (( ${#FAILURES[@]} == 0 )); then
   if [[ "$LAST_STATUS" == fail ]]; then
+    RECOVERY_OK_COUNT=$((RECOVERY_OK_COUNT + 1))
+    if (( RECOVERY_OK_COUNT < RECOVERY_THRESHOLD )); then
+      write_state fail "$FAILURE_COUNT" "$LAST_ALERT" "$INCIDENT_ID" "$DATAOPS_TASK_ID" \
+        "$ALERT_SENT" "$RECOVERY_MAIL_SENT" "$RECOVERY_TASK_NOTED" "$RECOVERY_OK_COUNT"
+      log "RECOVERY_PENDING healthy check $RECOVERY_OK_COUNT/$RECOVERY_THRESHOLD; incident remains open"
+      exit 0
+    fi
+
     if (( RECOVERY_MAIL_SENT == 0 )); then
       printf -v BODY 'Resource Gate, desktop grant path, and Hub API recovered at %s UTC.\nIncident: %s' \
         "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$INCIDENT_ID"
@@ -334,22 +345,23 @@ if (( ${#FAILURES[@]} == 0 )); then
       fi
     fi
     if (( RECOVERY_MAIL_SENT == 1 && RECOVERY_TASK_NOTED == 1 )); then
-      write_state ok 0 "$LAST_ALERT" - - 0 0 0
+      write_state ok 0 "$LAST_ALERT" - - 0 0 0 0
       log "OK Resource Gate, desktop grant path, and Hub API are healthy"
       exit 0
     fi
     write_state fail "$FAILURE_COUNT" "$LAST_ALERT" "$INCIDENT_ID" "$DATAOPS_TASK_ID" \
-      "$ALERT_SENT" "$RECOVERY_MAIL_SENT" "$RECOVERY_TASK_NOTED"
+      "$ALERT_SENT" "$RECOVERY_MAIL_SENT" "$RECOVERY_TASK_NOTED" "$RECOVERY_OK_COUNT"
     exit 2
   fi
 
-  write_state ok 0 "$LAST_ALERT" - - 0 0 0
+  write_state ok 0 "$LAST_ALERT" - - 0 0 0 0
   log "OK Resource Gate, desktop grant path, and Hub API are healthy"
   exit 0
 fi
 
 FAILURE_SUMMARY="$(printf '%s; ' "${FAILURES[@]}")"
 FAILURE_SUMMARY="${FAILURE_SUMMARY%; }"
+RECOVERY_OK_COUNT=0
 if [[ "$LAST_STATUS" == pending || "$LAST_STATUS" == fail ]]; then
   FAILURE_COUNT=$((FAILURE_COUNT + 1))
 else
@@ -357,7 +369,7 @@ else
 fi
 
 if (( FAILURE_COUNT < FAILURE_THRESHOLD )); then
-  write_state pending "$FAILURE_COUNT" "$LAST_ALERT" - - 0 0 0
+  write_state pending "$FAILURE_COUNT" "$LAST_ALERT" - - 0 0 0 0
   log "SUSPECT external health check failure 1/$FAILURE_THRESHOLD: $FAILURE_SUMMARY"
   exit 1
 fi
@@ -371,12 +383,12 @@ if [[ "$LAST_STATUS" != fail ]]; then
 fi
 
 DELIVERY_FAILED=0
-if (( ALERT_SENT == 0 || NOW - LAST_ALERT >= ALERT_REPEAT_SECONDS )); then
+if (( ALERT_SENT == 0 )); then
   printf -v BODY 'CRITICAL: external Resource Gate, desktop grant path, or Hub API checks failed at %s UTC.\nConsecutive failed checks: %s\nIncident: %s\nFailures: %s' \
     "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$FAILURE_COUNT" "$INCIDENT_ID" "$FAILURE_SUMMARY"
   if send_alert "[CRITICAL] Resource Gate and Hub availability is degraded" "$BODY"; then
     ALERT_SENT=1
-    LAST_ALERT="$NOW"
+    LAST_ALERT="$(date +%s)"
     log "CRITICAL outage email sent to $EFFECTIVE_TO after $FAILURE_COUNT consecutive failures"
   else
     DELIVERY_FAILED=1
@@ -399,7 +411,7 @@ if [[ "$DATAOPS_TASK_ID" == - ]]; then
 fi
 
 write_state fail "$FAILURE_COUNT" "$LAST_ALERT" "$INCIDENT_ID" "$DATAOPS_TASK_ID" \
-  "$ALERT_SENT" "$RECOVERY_MAIL_SENT" "$RECOVERY_TASK_NOTED"
+  "$ALERT_SENT" "$RECOVERY_MAIL_SENT" "$RECOVERY_TASK_NOTED" "$RECOVERY_OK_COUNT"
 if (( DELIVERY_FAILED )); then
   exit 2
 fi

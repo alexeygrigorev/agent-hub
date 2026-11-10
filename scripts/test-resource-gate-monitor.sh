@@ -139,7 +139,6 @@ export AGENT_BROWSER_CLI="$TMP/agent-browser.js"
 export HUB_HEALTH_URL='https://hub.dtcdev.click/health'
 export ALERT_TO='resource-gate-test@example.invalid'
 export ALERT_OPS_TO='resource-gate-ops@example.invalid'
-export ALERT_REPEAT_SECONDS=900
 export RESOURCE_GATE_TEST_ALLOW_DATAOPS=1
 
 grep -Fq 'PATH="$(dirname "$NODE_BIN"):/home/alexey/.local/bin:$PATH"' "$SCRIPT" \
@@ -187,43 +186,74 @@ if grep -Fq 'To: resource-gate-test@example.invalid' "$MONITOR_MAIL_CAPTURE"; th
 fi
 pass "two consecutive failures send one email and open one DataOps incident task"
 
+for ((failure_number=3; failure_number<=32; failure_number++)); do
+  run_check gate-fail grant-inactive 1
+done
+# Simulate an outage that has lasted past the old 15-minute repeat deadline.
+# A future accidental ALERT_REPEAT_SECONDS branch must not pass this test just
+# because these fixture invocations happen within a few seconds.
+read -r _status _failures _last_alert incident_id task_id _alert _recovery_mail _recovery_note _recovery_ok \
+  < "$RESOURCE_GATE_STATE_DIR/state"
+printf 'fail %s 1 %s %s 1 0 0 %s\n' \
+  "$_failures" "$incident_id" "$task_id" "${_recovery_ok:-0}" > "$RESOURCE_GATE_STATE_DIR/state"
 run_check gate-fail grant-inactive 1
 [[ "$(mail_count)" -eq 1 && "$(dataops_count create)" -eq 1 ]] \
-  || fail "ongoing outage was not deduplicated"
-pass "ongoing outage does not repeat mail or DataOps task before the repeat interval"
+  || fail "long outage repeated its critical email or duplicated its DataOps task"
+pass "one outage through 33 failures and an expired repeat deadline sends one critical email and creates one task"
 
-read -r _status _failures _last_alert incident_id task_id _alert _recovery_mail _recovery_note < "$RESOURCE_GATE_STATE_DIR/state"
-printf 'fail 3 1 %s %s 1 0 0\n' "$incident_id" "$task_id" > "$RESOURCE_GATE_STATE_DIR/state"
+# Migrate the currently deployed eight-field state, then keep one healthy
+# probe and a following failure inside the same incident.
+read -r _status _failures last_alert incident_id task_id _alert _recovery_mail _recovery_note _recovery_ok \
+  < "$RESOURCE_GATE_STATE_DIR/state"
+printf 'fail %s %s %s %s 1 0 0\n' "$_failures" "$last_alert" "$incident_id" "$task_id" \
+  > "$RESOURCE_GATE_STATE_DIR/state"
+run_check success grant-inactive 0
+[[ "$(mail_count)" -eq 1 && "$(dataops_count note)" -eq 0 ]] \
+  || fail "one healthy probe prematurely closed the incident"
+grep -Fq 'RECOVERY_PENDING healthy check 1/2' "$TMP/output" \
+  || fail "the first healthy probe was not held by recovery hysteresis"
+pass "a single healthy probe stays within the open incident"
+
 run_check gate-fail grant-inactive 1
-[[ "$(mail_count)" -eq 2 && "$(dataops_count create)" -eq 1 ]] \
-  || fail "long outage did not repeat email without duplicating the task"
-pass "ongoing outage repeats the alert after the configured interval"
+[[ "$(mail_count)" -eq 1 && "$(dataops_count create)" -eq 1 ]] \
+  || fail "a flapping failure created a second critical alert or DataOps task"
+pass "a failed probe resets recovery hysteresis without starting a second incident"
 
 run_check success grant-inactive 0
-[[ "$(mail_count)" -eq 3 ]] || fail "recovery did not send one email"
+[[ "$(mail_count)" -eq 1 && "$(dataops_count note)" -eq 0 ]] \
+  || fail "one of two recovery probes sent a premature recovery"
+run_check success grant-inactive 0
+[[ "$(mail_count)" -eq 2 ]] || fail "two consecutive healthy probes did not send one recovery email"
 [[ "$(dataops_count note)" -eq 1 ]] || fail "recovery was not appended to the incident task"
 grep -Fq 'Subject: [RECOVERED] Resource Gate and Hub API are healthy' "$MONITOR_MAIL_CAPTURE" \
   || fail "recovery subject was not present"
 run_check success grant-inactive 0
-[[ "$(mail_count)" -eq 3 && "$(dataops_count note)" -eq 1 ]] \
+[[ "$(mail_count)" -eq 2 && "$(dataops_count note)" -eq 1 ]] \
   || fail "steady healthy state repeated the recovery"
-pass "recovery sends one email, updates the DataOps task, and then stays quiet"
+pass "two healthy probes send one recovery, update the DataOps task, and then stay quiet"
 
-printf 'ok 0 0 - - 0 0 0\n' > "$RESOURCE_GATE_STATE_DIR/state"
+printf 'ok 0 0 - - 0 0 0 0\n' > "$RESOURCE_GATE_STATE_DIR/state"
 run_check hub-fail grant-inactive 1
 run_check success grant-inactive 0
-[[ "$(mail_count)" -eq 3 && "$(dataops_count create)" -eq 1 ]] \
+[[ "$(mail_count)" -eq 2 && "$(dataops_count create)" -eq 1 ]] \
   || fail "one-off Hub API failure was not cleared without alert"
 pass "a one-check Hub API failure clears without an alert"
 
-printf 'ok 0 0 - - 0 0 0\n' > "$RESOURCE_GATE_STATE_DIR/state"
+printf 'ok 0 0 - - 0 0 0 0\n' > "$RESOURCE_GATE_STATE_DIR/state"
 run_check grant-fail grant-inactive 1
 run_check grant-fail grant-inactive 1
-[[ "$(mail_count)" -eq 4 && "$(dataops_count create)" -eq 2 ]] \
+[[ "$(mail_count)" -eq 3 && "$(dataops_count create)" -eq 2 ]] \
   || fail "authenticated grant API failure did not trigger the two-failure alert"
 pass "authenticated grant API failures trigger the same two-check alert policy"
 
-printf 'ok 0 0 - - 0 0 0\n' > "$RESOURCE_GATE_STATE_DIR/state"
+run_check success grant-inactive 0
+[[ "$(mail_count)" -eq 3 && "$(dataops_count note)" -eq 1 ]] \
+  || fail "a single healthy probe recovered the grant endpoint incident"
+run_check success grant-inactive 0
+[[ "$(mail_count)" -eq 4 && "$(dataops_count note)" -eq 2 ]] \
+  || fail "two healthy probes did not recover the grant endpoint incident"
+
+printf 'ok 0 0 - - 0 0 0 0\n' > "$RESOURCE_GATE_STATE_DIR/state"
 run_check success desktop-offline 1
 run_check success desktop-offline 1
 [[ "$(mail_count)" -eq 5 && "$(dataops_count create)" -eq 3 ]] \
@@ -231,7 +261,10 @@ run_check success desktop-offline 1
 pass "the authenticated desktop health probe detects the selected desktop offline"
 
 run_check success grant-active 0
-[[ "$(mail_count)" -eq 6 && "$(dataops_count note)" -eq 2 ]] \
+[[ "$(mail_count)" -eq 5 && "$(dataops_count note)" -eq 2 ]] \
+  || fail "one healthy probe recovered the offline desktop incident"
+run_check success grant-active 0
+[[ "$(mail_count)" -eq 6 && "$(dataops_count note)" -eq 3 ]] \
   || fail "recovery after desktop availability did not notify once"
 run_check success grant-active 0
 [[ "$(mail_count)" -eq 6 ]] || fail "healthy active grant sent an alert"
