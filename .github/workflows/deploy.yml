@@ -54,14 +54,13 @@ jobs:
         run: |
           bash -n deploy/vm/install-hub2-node.sh
           test -s deploy/agent-hub-hub2.service
-          test -s deploy/Caddyfile
+          test -s deploy/hub.caddy
           test -s deploy/vm/hub2-dns-update.sh
           test -s deploy/vm/agent-hub-dns-update.service
           grep -Fq 'systemctl restart agent-hub-hub2.service' deploy/vm/install-hub2-node.sh
-          grep -Eq '^[[:space:]]*gate\.dtcdev\.click[[:space:]]*\{' deploy/Caddyfile
-          grep -Fq 'reverse_proxy 127.0.0.1:8791' deploy/Caddyfile
-          grep -Fq 'rewrite @desktop_health /v1/check?resource=browser&scope=desktop' deploy/Caddyfile
-          grep -Fq 'refusing to replace Caddyfile: Resource Gate TLS site' deploy/vm/install-hub2-node.sh
+          grep -Fq 'reverse_proxy 127.0.0.1:8787' deploy/hub.caddy
+          ! grep -Eq 'gate\.dtcdev\.click|8791' deploy/hub.caddy
+          grep -Fq 'shared Caddyfile must import /etc/caddy/sites/*.caddy' deploy/vm/install-hub2-node.sh
           test -s deploy/resource-gate-monitor.service
           test -s deploy/resource-gate-monitor.timer
           bash -n scripts/resource-gate-monitor.sh scripts/install-resource-gate-monitor.sh

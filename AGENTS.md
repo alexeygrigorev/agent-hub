@@ -1,6 +1,6 @@
 # Agent Hub
 
-Serverless coordination hub for Alexey's multi-agent project: 30-minute headless root runs on a random available host, the daily writer job, machine registry, message bus, health and dashboard. The spec is [docs/SPEC.md](docs/SPEC.md); it is the source of truth for scope and milestones.
+Node/SQLite coordination hub for Alexey's multi-agent project: 30-minute headless root runs on a random available host, the daily writer job, machine registry, message bus, health and dashboard. The spec is [docs/SPEC.md](docs/SPEC.md); it is the source of truth for scope and milestones.
 
 ## Read first
 
@@ -14,13 +14,12 @@ Serverless coordination hub for Alexey's multi-agent project: 30-minute headless
 
 ## Process
 
-0. Tests run in CI (Alexey 2026-11-02, t2558u, intake 178ec5bb; supersedes rules 4-5 where they conflict): «тесты запускать на CI/CD, пушим, делаем PR, тесты проходят, мерджим». Locally run only targeted unit tests for the files you changed; never run `scripts/test-full-local.sh` or any full suite on Hetzner. Flow: worktree from origin/main, push the branch, open a PR, CI runs the full suite, then `gh pr merge --auto --rebase`.
-1. Work through Agent Branches, the project's own tool (`~/git/agent-branches`, CLI `agent-branches`). Each implementer works in its own Agent Branches workspace. No git worktrees or long-lived git branches.
-2. Claim edit scope on the agents bus before editing; release when done. Claims are never written into documents.
-3. A task is done when a reviewer (same model allowed) approved the exact version and the head integrated it.
-4. Verification before every push (Alexey 2026-10-31, supersedes the 2026-10-17 full-suite-per-push rule; intake cb5c362e): run `scripts/test-affected-local.sh` on Hetzner. It runs scope guard, typecheck, workflow validation when touched, dry-run build, and only the Vitest/pytest files affected by the diff vs origin/main (disposable HOME, one short heavy-test slot, ~40 s). Do NOT run `scripts/test-full-local.sh` before every push: 12 sessions queued behind 2 slots for 10+ min each blocked all pushes. The FULL suite runs once per push in the deploy CI job (and in `scripts/test-full-local.sh`, which you run only when the selector reports BROAD: dependencies, vitest/pytest config, conftest, the admission gate; or when a reviewer or the head asks for a final gate). Investigate and report all failures honestly; required CI checks must pass with zero new regressions, and documented pre-existing debt is tracked rather than silently excluded. A red post-push CI full suite is fixed forward immediately by the pusher. See [docs/PREPUSH-TARGETED-TESTS.md](docs/PREPUSH-TARGETED-TESTS.md).
-5. Batch related commits into one finished feature. Nondeploy/docs/checkpoint commits must use `[skip ci]`. Exactly ONE deploy push for the finished feature, only after required CI test suites pass on the exact final source. Normal fast-forward integration, no force pushes, no PRs. Keep Agent Branches and GitHub main in sync after every integration.
-6. Post each milestone's accepted result on the tracking issue (see the issue labelled `tracking`).
+1. Start from `origin/main` in an isolated task worktree and short-lived PR branch. Preserve other agents' work; never push directly to main or force-push. This Git/PR flow supersedes older Agent Branches-only and no-PR instructions in inherited process documents.
+2. Claim exact edit scope on the agents bus before editing and release it after handoff. Shared files require an acknowledged ownership handoff. Claims are never written into documents.
+3. Run only targeted tests for changed files locally. Before pushing, run `scripts/test-affected-local.sh`; if its selector requires a broad/full suite, run that suite in CI. Never run `scripts/test-full-local.sh` or broad suites on Hetzner. Use the heavy-test admission controls below for targeted commands that require them. See [targeted checks](docs/PREPUSH-TARGETED-TESTS.md).
+4. Push the finished feature branch and open a PR. CI runs the required full suites and Python host/CLI checks. Start-path acceptance additionally requires the integrated real-server/daemon/CLI end-to-end harness to be wired as a required CI check. Report every failure honestly and fix new regressions. Do not skip required CI on a mergeable PR.
+5. Obtain independent review of the exact final head SHA (same model allowed). Any source change invalidates the earlier review. After review and green required CI, enable rebase auto-merge with `gh pr merge --auto --rebase --match-head-commit <reviewed-sha>`. The head owns integration and accepted-result tracking; implementation is not done until the reviewed version is integrated.
+6. Deployment is a separate CI operation owned by the designated deploy owner. Deploy only the accepted main commit, check the live start canary and roll back on failure. Workers do not dispatch deploys, install from worktrees into live environments or replace live units. Post each accepted milestone result on the tracking issue.
 
 ## Commit scope trailers
 
@@ -44,14 +43,17 @@ sensitive commits that reach it without a valid final trailer.
 - Do not stop, edit or replace the services the hub will retire (Agent Bus adapter :8788, desktop-orchestrator, supervision, principal-ping, agent-dashboard). Migration happens per docs/SPEC.md §12 with acknowledged handoffs.
 - Heads own their commits; never overwrite, reset or delete another agent's work.
 
-## Layout (target)
+## Layout
 
-- `src/` Worker + `Hub` Durable Object (TypeScript)
-- `public/` dashboard (static)
-- `host/` Python host agent and CLI. Hub 1 remains stdlib-only; Hub 2's host pins the operator-approved `websockets==16.0` transport and installs it in its isolated user environment through `hub2/host/bootstrap.py`. This exception does not permit other unpinned dependencies.
-- `test/`, `host/tests/` tests
-- `scripts/` deploy kit (prepared, not run), registry import
-- `docs/` spec, deploy runbook
+- `hub2/src/`: Hub2 API and coordination objects (TypeScript).
+- `hub2/node/`: production Node 24 runtime, HTTP/WebSocket edge and SQLite persistence.
+- `hub2/public/`: dashboard and generated `/cli/` release artifacts.
+- `hub2/host/`: Python Hub2 daemon and native administration CLI; isolated release environments pin the approved `websockets==16.0` transport. No other unpinned dependencies are authorized.
+- `host/agent_hub_host/`: maintained stdlib CLI zipapp source and legacy Hub1 modules pending reviewed retirement. Both packages currently share an import name; keep their environments isolated.
+- `hub2/tests/`, `hub2/host/tests/`, `host/tests/`: server, daemon and CLI tests; integrated end-to-end coverage is required in CI for start-path acceptance.
+- `src/`, `test/`, `public/`: legacy Hub1 code/assets retained until acknowledged retirement; `public/cli/` includes maintained CLI installers.
+- `scripts/`, `deploy/`: release tooling, user/system units, and VM deployment. Hub owns only `/etc/caddy/sites/hub.caddy`; aws-infra owns the shared Caddyfile and its sites import.
+- `docs/`: spec and runbooks, including [host releases](docs/HUB2-RELEASES.md).
 
 ## Model routing rule (2026-10-14)
 
