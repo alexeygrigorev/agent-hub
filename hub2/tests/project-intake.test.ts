@@ -22,7 +22,7 @@ test('model-less start falls back to another allowed model after an auth failure
   const accepted=await f.call('/api/intakes/'+own.id+'/start','POST',start);assert.equal(accepted.status,201);
   const first=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any;
   assert.equal(JSON.parse(first.launch_spec_json).engine,'codex');
-  f.sql.prepare("UPDATE dispatch_sagas SET state='claimed' WHERE operation_id=?").run(first.operation_id);
+  assert.equal(first.state,'offered');
   const fallback=await f.call('/_internal/auth-fallback','POST',{operation_id:first.operation_id,
    attempt_operation_id:first.attempt_operation_id,session_id:first.session_id,machine_id:first.machine_id,
    epoch:first.epoch,reason:'provider_auth_failed'});
@@ -118,6 +118,25 @@ test('terminal stop releases an intake for retry and no-native launch timeout is
  assert.equal(proof.native_id,null);assert.equal(Number.isSafeInteger(proof.observed_at),true);assert.equal(proof.stopped,undefined);
  const history=await body(await f.call('/api/intakes/'+timeoutIntake.id+'/history'));
  assert(history.events.some((event:any)=>event.kind==='session_launch_failed'&&event.body.reason==='launch_timeout_no_native'));
+});
+test('pre-claim host launch refusal fails clearly and is not silently re-offered',async()=>{
+ const f=fixture(),own=await intake(f,'host-launch-refused'),start={key:'host-refused-first',workspace:'relay',engine:'shell',machine_id:'h1',override_reason:'Synthetic semantic test'};
+ assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',start)).status,201);
+ const saga=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any;
+ assert.equal(saga.state,'offered');assert.equal(saga.native_id,null);
+ const response=await f.call('/_internal/reaped','POST',{operation_id:saga.operation_id,attempt_operation_id:saga.attempt_operation_id,
+  session_id:saga.session_id,machine_id:saga.machine_id,epoch:saga.epoch,native_id:null,reason:'host_launch_refused',
+  failure_reason:'workspace_label_unavailable',launch_failed:true,observed_at:Date.now()});
+ assert.equal(response.status,200);const receipt=await body(response);
+ assert.equal(receipt.failed,true);assert.equal(receipt.reason,'host_launch_refused');
+ const intakeRow=f.sql.prepare('SELECT * FROM intakes WHERE id=?').get(own.id) as any,proof=JSON.parse(intakeRow.final_evidence_json);
+ assert.equal(intakeRow.status,'failed');assert.equal(proof.launch_failed,true);assert.equal(proof.native_id_absent,true);
+ assert.equal(proof.failure_reason,'workspace_label_unavailable');assert.equal(proof.session_id,saga.session_id);
+ const history=await body(await f.call('/api/intakes/'+own.id+'/history'));
+ assert(history.events.some((event:any)=>event.kind==='session_launch_failed'&&event.body.failure_reason==='workspace_label_unavailable'));
+ const retry=await f.call('/api/intakes/'+own.id+'/start','POST',{...start,key:'host-refused-retry'});
+ assert.equal(retry.status,409);assert.equal((await body(retry)).error,'retry_requires_qualified_failure');
+ assert.equal((f.sql.prepare('SELECT COUNT(*) AS n FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any).n,1);
 });
 test('stop receipt for an expired offer cancels its already-requeued retry',async()=>{
  const f=fixture(),own=await intake(f,'expired-offer-stop'),start={key:'expired-offer-stop',workspace:'/tmp/synthetic-expired-stop',engine:'shell',machine_id:'h1',override_reason:'Synthetic semantic test'};
@@ -227,16 +246,16 @@ test('no-native launch timeout permits retry only with a proof bound to the comp
   const refusedBody=await body(refused);assert.equal(refused.status,409,`${field}: ${JSON.stringify(refusedBody)}`);
   assert.equal(refusedBody.error,'retry_requires_qualified_failure');
  }
- f.sql.prepare("UPDATE dispatch_sagas SET last_reason='unrelated-failure' WHERE operation_id=?").run(prior.operation_id);
+ f.sql.prepare("UPDATE dispatch_sagas SET state='needs_attention' WHERE operation_id=?").run(prior.operation_id);
  f.sql.prepare('UPDATE intakes SET final_evidence_json=? WHERE id=?').run(JSON.stringify(proof),own.id);
- assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',{...start,key:'bad-timeout-saga'})).status,409);
- f.sql.prepare("UPDATE dispatch_sagas SET last_reason='launch_timeout_no_native' WHERE operation_id=?").run(prior.operation_id);
+ assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',{...start,key:'incomplete-timeout-saga'})).status,409);
+ f.sql.prepare("UPDATE dispatch_sagas SET state='complete',last_reason='retry_bookkeeping' WHERE operation_id=?").run(prior.operation_id);
  const retried=await f.call('/api/intakes/'+own.id+'/start','POST',{...start,key:'timeout-proof-retry'});
  assert.equal(retried.status,201,JSON.stringify(await retried.clone().json()));
  const rows=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=? ORDER BY created_at,operation_id').all(own.id) as any[];
  const priorAfterRetry=rows.find(row=>row.operation_id===prior.operation_id),retrySaga=rows.find(row=>row.operation_id!==prior.operation_id);
  assert.equal(rows.length,2);assert.equal(priorAfterRetry.state,'complete');
- assert.equal(priorAfterRetry.last_reason,'launch_timeout_no_native');assert.equal(priorAfterRetry.native_id,null);assert.notEqual(retrySaga.session_id,prior.session_id);
+ assert.equal(priorAfterRetry.last_reason,'retry_bookkeeping');assert.equal(priorAfterRetry.native_id,null);assert.notEqual(retrySaga.session_id,prior.session_id);
  const history=await body(await f.call('/api/intakes/'+own.id+'/history'));
  assert(history.events.some((event:any)=>event.kind==='session_launch_failed'&&event.body.reason==='launch_timeout_no_native'));
 });

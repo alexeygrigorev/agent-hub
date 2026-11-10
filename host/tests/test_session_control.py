@@ -138,6 +138,23 @@ class TestSessionControlCli(unittest.TestCase):
             with self.assertRaises(ValueError):
                 session_control.execute(conflicting)
 
+    def test_start_repo_only_sends_repo_without_client_host_path(self):
+        args = self.parse('start', '--repo', 'DataTalksClub/relay', '--prompt', 'do relay work', '--key', 'repo-key')
+        with patch.object(session_control, 'request', return_value={'id': 'session-repo', 'state': 'offered'}) as transport:
+            session_control.execute(args)
+        payload = transport.call_args.args[2]
+        self.assertEqual(payload['repo'], 'DataTalksClub/relay')
+        self.assertNotIn('workspace', payload)
+
+    def test_start_workspace_label_is_forwarded_for_target_host_resolution(self):
+        args = self.parse('start', '--workspace', 'relay', '--prompt', 'do relay work', '--key', 'label-key')
+        with patch.object(session_control, '_repo_from_workspace', return_value=None), \
+                patch.object(session_control, 'request', return_value={'id': 'session-label', 'state': 'offered'}) as transport:
+            session_control.execute(args)
+        payload = transport.call_args.args[2]
+        self.assertEqual(payload['workspace'], 'relay')
+        self.assertNotIn('repo', payload)
+
     def test_start_links_intake_task_for_acceptance_gate(self):
         with patch.object(session_control, 'read_file', return_value='synthetic goal'), \
                 patch.object(session_control, 'request', return_value={}) as transport:
@@ -237,13 +254,22 @@ class TestSessionControlCli(unittest.TestCase):
 
     def test_start_wait_polls_binding_to_running(self):
         args = self.parse('start', '--workspace', 'demo', '--key', 'k1', '--wait', '--timeout', '30', '--interval', '1')
-        views = [{'id': 's1', 'state': 'offered'}, {'id': 's1', 'state': 'running'}]
+        views = [{'session': {'id': 's1', 'state': 'offered'}}, {'session': {'id': 's1', 'state': 'running', 'native_id': 'native-1'}}]
         with patch.object(session_control, 'request', side_effect=[{'id': 's1', 'state': 'offered'}, *views]) as transport, \
                 patch.object(session_control.time, 'sleep', return_value=None):
             result = session_control.execute(args)
         self.assertEqual(result['client_key'], 'k1')
-        self.assertEqual(result['binding_wait']['state'], 'running')
+        self.assertEqual(result['binding_wait']['session']['state'], 'running')
         self.assertEqual(transport.call_args.args[:2], ('GET', '/api/sessions/s1'))
+
+    def test_start_wait_reports_prelaunch_refusal_instead_of_returning_accepted(self):
+        args = self.parse('start', '--workspace', 'relay', '--key', 'k-refused', '--wait', '--timeout', '30', '--interval', '1')
+        refused = {'session': {'id': 's-refused', 'state': 'failed', 'native_id': None,
+                               'attention': {'reason': 'workspace_label_unavailable'}}}
+        with patch.object(session_control, 'request', side_effect=[{'id': 's-refused', 'state': 'offered'}, refused]), \
+                patch.object(session_control.time, 'sleep', return_value=None):
+            with self.assertRaisesRegex(ValueError, 'workspace_label_unavailable'):
+                session_control.execute(args)
 
     def test_send_wait_ignores_transport_until_correlated_ack(self):
         args = self.parse('send', 's1', '--body-file', 'p.txt', '--key', 'k2', '--wait', '--timeout', '30', '--interval', '1')

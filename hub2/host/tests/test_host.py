@@ -232,6 +232,26 @@ class HostTests(unittest.TestCase):
         self.assertFalse(any(call[1] == "send" for call, _ in self.native.calls))
         self.assertEqual(len(self.journal.db.execute("SELECT * FROM outbox").fetchall()), 1)
 
+    def test_registered_workspace_label_resolves_and_launches_native_process(self):
+        workspace = self.root / "relay"
+        workspace.mkdir()
+        offer = self.offer()
+        offer["launch"]["workspace"] = "relay"
+        self.bridge.offer(offer)
+        row = self.journal.db.execute("SELECT * FROM launches WHERE session_id=?", (offer["session_id"],)).fetchone()
+        self.assertEqual(row["state"], "running")
+        self.assertEqual(row["native_id"], self.native.process["id"])
+        self.assertEqual(row["workspace"], str(workspace.resolve()))
+        self.assertEqual(self.native.process["workspace"], str(workspace.resolve()))
+        self.assertTrue(any(call[1] == "start" for call, _ in self.native.calls))
+
+    def test_unavailable_workspace_label_fails_with_a_stable_reason(self):
+        offer = self.offer()
+        offer["launch"]["workspace"] = "missing-repo"
+        with self.assertRaisesRegex(ValueError, "workspace_label_unavailable"):
+            self.bridge.validate_launch(offer)
+        self.assertFalse(any(call[1] == "start" for call, _ in self.native.calls))
+
     def test_dispatch_attempt_operation_id_preserved_in_admission_and_receipt(self):
         operation = "d04dedbf-951e-4eaf-a41f-03eeb8514135:0"
         self.bridge.offer(self.offer(operation_id=operation))

@@ -358,8 +358,10 @@ export class ProjectDO {
     const prompt = typeof body.prompt === 'string' ? body.prompt : intake.text;
     const interactive = body.interactive === undefined ? false : body.interactive;
     const timeoutSeconds = body.timeout_seconds === undefined ? 1800 : body.timeout_seconds;
+    const absoluteWorkspace = typeof workspace === 'string' && (workspace.startsWith('/') || /^[A-Za-z]:\\/.test(workspace));
+    const workspaceLabel = typeof workspace === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(workspace);
     if (typeof workspace !== 'string' || workspace.length > 1024
-      || !(workspace.startsWith('/') || /^[A-Za-z]:\\/.test(workspace)) || workspace.includes('\0')) return error('invalid_workspace', 400);
+      || (!absoluteWorkspace && !workspaceLabel) || workspace.includes('\0')) return error('invalid_workspace', 400);
     if (machineInput !== undefined && (typeof machineInput !== 'string' || !/^[A-Za-z0-9_.-]{1,80}$/.test(machineInput))) return error('invalid_machine_id', 400);
     if (engineInput !== undefined && (typeof engineInput !== 'string' || !/^[A-Za-z0-9_.-]{1,48}$/.test(engineInput))) return error('invalid_engine', 400);
     if (modelInput !== undefined && (typeof modelInput !== 'string' || modelInput.length < 1 || modelInput.length > 128)) return error('invalid_model', 400);
@@ -597,9 +599,11 @@ export class ProjectDO {
     const reaped=new URL(request.url).pathname.endsWith('/reaped');
     const body=await bodyObject(request,4096);
     if(typeof body.operation_id!=='string'||typeof body.attempt_operation_id!=='string'||typeof body.session_id!=='string'
-      ||typeof body.machine_id!=='string'||!Number.isSafeInteger(body.epoch)||!['dead','idle','stop_confirmed','launch_timeout_no_native'].includes(String(body.reason)))
+      ||typeof body.machine_id!=='string'||!Number.isSafeInteger(body.epoch)||!['dead','idle','stop_confirmed','launch_timeout_no_native','host_launch_refused'].includes(String(body.reason)))
       return error('invalid_stopped_receipt',400);
     const launchTimedOut=body.reason==='launch_timeout_no_native';
+    const launchRefused=body.reason==='host_launch_refused';
+    const launchFailed=launchTimedOut||launchRefused;
     const saga=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?',body.operation_id);
     if(!saga||saga.session_id!==body.session_id||saga.machine_id!==body.machine_id)return error('stale_stopped_receipt',409);
     const exactAttempt=saga.attempt_operation_id===body.attempt_operation_id&&saga.epoch===body.epoch;
@@ -609,9 +613,11 @@ export class ProjectDO {
     const duplicateRetryStop=!launchTimedOut&&body.reason==='stop_confirmed'&&body.native_id==null&&saga.native_id===null
       &&saga.state==='complete'&&saga.last_reason==='stop_confirmed'&&previousAttempt;
     if(!exactAttempt&&!pendingRetryStop&&!duplicateRetryStop)return error('stale_stopped_receipt',409);
-    if(saga.state==='complete')return saga.last_reason==='launch_timeout_no_native'
-      ?json({failed:true,duplicate:true,session_id:saga.session_id,reason:'launch_timeout_no_native'}):json({stopped:true,duplicate:true});
+    if(saga.state==='complete')return ['launch_timeout_no_native','host_launch_refused'].includes(String(saga.last_reason))
+      ?json({failed:true,duplicate:true,session_id:saga.session_id,reason:saga.last_reason}):json({stopped:true,duplicate:true});
     if(launchTimedOut&&(!['offered','claimed','admitted'].includes(saga.state)||saga.native_id!==null||body.native_id!==null||body.launch_failed!==true))return error('invalid_launch_timeout_receipt',409);
+    if(launchRefused&&(!reaped||saga.state!=='offered'||saga.native_id!==null||body.native_id!==null||body.launch_failed!==true
+      ||typeof body.failure_reason!=='string'||!/^[a-z_]{1,80}$/.test(body.failure_reason)))return error('invalid_launch_refusal_receipt',409);
     if(!['offered','claimed','admitted','running'].includes(saga.state)&&!pendingRetryStop)return error('session_not_active',409);
     const intake=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',saga.intake_id);
     if(!intake||intake.session_id!==saga.session_id||intake.assigned_machine_id!==saga.machine_id)return error('stopped_intake_binding_mismatch',409);
@@ -623,12 +629,13 @@ export class ProjectDO {
       this.db.run("UPDATE dispatch_sagas SET state='complete',native_id=COALESCE(native_id,?),next_action_at=NULL,last_reason=?,updated_at=? WHERE operation_id=? AND state=? AND attempt_operation_id=? AND epoch=?",
         typeof body.native_id==='string'?body.native_id:null,String(body.reason),now,saga.operation_id,saga.state,saga.attempt_operation_id,saga.epoch);
       this.db.run("UPDATE intakes SET status='failed',final_evidence_json=?,updated_at=? WHERE id=?",
-        JSON.stringify({...(launchTimedOut?{launch_failed:true,native_id_absent:true}:{stopped:true}),reaped,
+        JSON.stringify({...(launchFailed?{launch_failed:true,native_id_absent:true}: {stopped:true}),...(launchRefused?{failure_reason:body.failure_reason}:{}),reaped,
           operation_id:saga.operation_id,attempt_operation_id:saga.attempt_operation_id,
           session_id:saga.session_id,machine_id:saga.machine_id,epoch:saga.epoch,reason:body.reason,
           native_id:body.native_id??null,observed_at:body.observed_at}),now,intake.id);
-      this.appendEvent(intake.id,eventKey,`machine:${saga.machine_id}`,launchTimedOut?'session_launch_failed':reaped?'session_reaped':'session_stopped',
-        {session_id:saga.session_id,machine_id:saga.machine_id,epoch:saga.epoch,reason:body.reason,native_id:body.native_id??null},now);
+      this.appendEvent(intake.id,eventKey,`machine:${saga.machine_id}`,launchFailed?'session_launch_failed':reaped?'session_reaped':'session_stopped',
+        {session_id:saga.session_id,machine_id:saga.machine_id,epoch:saga.epoch,reason:body.reason,native_id:body.native_id??null,
+          ...(launchRefused?{failure_reason:body.failure_reason}:{})},now);
       return true;
     });
     if(!applied)return error('stale_stopped_receipt',409);
@@ -636,7 +643,8 @@ export class ProjectDO {
       method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({operation_id:saga.operation_id,session_id:saga.session_id}),
     }).catch(()=>undefined);
     await this.scheduleNext();
-    return launchTimedOut?json({failed:true,reaped,session_id:saga.session_id,reason:body.reason}):json({stopped:true,reaped,session_id:saga.session_id});
+    return launchFailed?json({failed:true,reaped,session_id:saga.session_id,reason:body.reason,
+      ...(launchRefused?{failure_reason:body.failure_reason}:{})}):json({stopped:true,reaped,session_id:saga.session_id});
   }
 
   private async authFallbackInternal(request:Request):Promise<Response>{
@@ -645,7 +653,7 @@ export class ProjectDO {
       ||typeof body.machine_id!=='string'||!Number.isSafeInteger(body.epoch)||typeof body.reason!=='string')return error('invalid_auth_fallback',400);
     const saga=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?',body.operation_id);
     if(!saga||saga.session_id!==body.session_id||saga.machine_id!==body.machine_id||saga.attempt_operation_id!==body.attempt_operation_id
-      ||saga.epoch!==body.epoch||saga.state!=='claimed'||saga.native_id)return error('stale_auth_fallback',409);
+      ||saga.epoch!==body.epoch||!['offered','claimed'].includes(saga.state)||saga.native_id)return error('stale_auth_fallback',409);
     const route=this.parse(saga.routing_json) as (PickedRoute&{attempted_policy_ids?:string[]})|null;
     const tried=[...new Set([...(route?.attempted_policy_ids||[]),route?.policy_id].filter((id):id is string=>typeof id==='string'))];
     const intake=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',saga.intake_id);
@@ -653,8 +661,8 @@ export class ProjectDO {
     const fail=async(reason:string):Promise<Response>=>{
       const now=Date.now();
       this.transaction(()=>{
-        this.db.run("UPDATE dispatch_sagas SET state='complete',next_action_at=NULL,last_reason=?,updated_at=? WHERE operation_id=? AND state='claimed'",
-          reason,now,saga.operation_id);
+        this.db.run("UPDATE dispatch_sagas SET state='complete',next_action_at=NULL,last_reason=?,updated_at=? WHERE operation_id=? AND state=? AND attempt_operation_id=? AND epoch=?",
+          reason,now,saga.operation_id,saga.state,saga.attempt_operation_id,saga.epoch);
         this.db.run("UPDATE intakes SET status='failed',final_evidence_json=?,updated_at=? WHERE id=? AND session_id=?",
           JSON.stringify({error:'provider_auth_failed',reason,attempted_policy_ids:tried}),now,intake.id,saga.session_id);
         this.appendEvent(intake.id,`auth-fallback-exhausted:${saga.attempt_operation_id}:${saga.epoch}`,'hub2-dispatch','model_routes_auth_failed',
@@ -685,9 +693,9 @@ export class ProjectDO {
     this.transaction(()=>{
       this.db.run(`UPDATE dispatch_sagas SET state='pending_machine',attempt=?,attempt_operation_id=?,machine_id=?,account_id=?,
         launch_spec_json=?,routing_json=?,next_action_at=?,last_reason='provider_auth_fallback',updated_at=?
-        WHERE operation_id=? AND state='claimed' AND attempt_operation_id=? AND epoch=?`,
+        WHERE operation_id=? AND state=? AND attempt_operation_id=? AND epoch=?`,
         nextAttempt,`${saga.operation_id}:${nextAttempt}`,next.machine_id,next.account_id,JSON.stringify(launchSpec),JSON.stringify(routeState),now,now,
-        saga.operation_id,saga.attempt_operation_id,saga.epoch);
+        saga.operation_id,saga.state,saga.attempt_operation_id,saga.epoch);
       this.db.run('UPDATE intakes SET assigned_machine_id=?,updated_at=? WHERE id=? AND session_id=? AND assigned_machine_id=?',
         next.machine_id,now,intake.id,saga.session_id,saga.machine_id);
       this.appendEvent(intake.id,`auth-fallback:${saga.attempt_operation_id}:${saga.epoch}`,'hub2-dispatch','model_route_auth_fallback',
@@ -826,7 +834,7 @@ export class ProjectDO {
     if(proof?.stopped===true&&proof.session_id===intake.session_id
       &&proof.machine_id===intake.assigned_machine_id&&Number.isSafeInteger(proof.epoch)
       &&['dead','idle','stop_confirmed'].includes(String(proof.reason)))return true;
-    if(prior&&prior.state==='complete'&&prior.last_reason==='launch_timeout_no_native'&&prior.native_id===null
+    if(prior&&prior.state==='complete'&&prior.native_id===null
       &&prior.intake_id===intake.id&&prior.session_id===intake.session_id&&prior.machine_id===intake.assigned_machine_id
       &&proof?.operation_id===prior.operation_id&&proof.attempt_operation_id===prior.attempt_operation_id
       &&proof.session_id===prior.session_id&&proof.machine_id===prior.machine_id&&proof.epoch===prior.epoch

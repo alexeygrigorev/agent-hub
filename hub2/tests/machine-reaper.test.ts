@@ -37,6 +37,43 @@ async function startClaimed(f:ReturnType<typeof fixture>,sessionId:string,native
  return reserved.epoch as number;
 }
 
+async function startOffered(f:ReturnType<typeof fixture>,sessionId:string){
+ const beat=await f.call('/api/heartbeat','POST',{labels:[],engines:['codex'],capabilities:['headless'],native_sessions:[]});assert.equal(beat.status,200);
+ const reservation=await f.call('/_internal/reserve','POST',{operation_id:'op-'+sessionId,dispatch_id:'dispatch-'+sessionId,attempt:0,
+  session_id:sessionId,project_id:'project-test',intake_id:'intake-'+sessionId,machine_id:'h1',request_digest:'digest-'+sessionId,
+  title:'test session',acceptance_criteria:['test'],account_id:'codex',launch:{workspace:'relay',engine:'codex',model:'gpt-6.1-sol',prompt:'test work',interactive:false}});
+ assert.equal(reservation.status,201);const reserved=await reservation.json() as any;
+ assert.equal((await f.call('/_internal/activate','POST',{operation_id:'op-'+sessionId,session_id:sessionId,epoch:reserved.epoch})).status,201);
+ return reserved.epoch as number;
+}
+
+test('host launch refusal terminally fails an unclaimed offer with a visible reason',async()=>{
+ const f=fixture(),sessionId='workspace-label-refused',epoch=await startOffered(f,sessionId),frames:any[]=[];
+ const socket={readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'socket'}),send:(value:string)=>frames.push(JSON.parse(value))};
+ f.sockets.push(socket);
+ await f.machine.webSocketMessage(socket as any,JSON.stringify({type:'host.error',session_id:sessionId,
+  operation_id:'op-'+sessionId,reason:'workspace_label_unavailable'}));
+ const row=f.database.prepare('SELECT state,native_id FROM sessions WHERE id=?').get(sessionId) as any;
+ assert.equal(row.state,'failed');assert.equal(row.native_id,null);
+ assert.equal((f.database.prepare('SELECT reason FROM attention WHERE session_id=?').get(sessionId) as any).reason,'workspace_label_unavailable');
+ assert.equal(f.events.at(-1)?.path,'/_internal/reaped');
+ assert.equal(f.events.at(-1)?.body.epoch,epoch);assert.equal(f.events.at(-1)?.body.reason,'host_launch_refused');
+ assert.equal(f.events.at(-1)?.body.failure_reason,'workspace_label_unavailable');
+ assert.equal(f.events.at(-1)?.body.launch_failed,true);
+});
+
+test('authentication refusal from an unclaimed offer routes to model fallback',async()=>{
+ const f=fixture(),sessionId='auth-refused-offer';await startOffered(f,sessionId);
+ const socket={readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'socket'}),send:()=>{}};
+ f.sockets.push(socket);
+ await f.machine.webSocketMessage(socket as any,JSON.stringify({type:'host.error',session_id:sessionId,
+  operation_id:'op-'+sessionId,reason:'provider_auth_failed'}));
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(sessionId) as any).state,'expired');
+ assert.equal((f.database.prepare('SELECT state FROM machine_session_operations WHERE operation_id=?').get('op-'+sessionId) as any).state,'expired');
+ assert.equal(f.events.at(-1)?.path,'/_internal/auth-fallback');
+ assert.equal(f.events.at(-1)?.body.reason,'provider_auth_failed');
+});
+
 test('live reaper fails an expired claimed no-native launch without slot accounting',async()=>{
  const f=fixture(),epoch=await startClaimed(f,'orphan-session',null);
  f.database.prepare('UPDATE sessions SET updated_at=? WHERE id=?').run(Date.now()-3*60_000,'orphan-session');

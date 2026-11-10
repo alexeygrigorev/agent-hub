@@ -907,18 +907,44 @@ export class MachineDO {
         row.id,body.reason,operation,message,Date.now());
       console.error('[hub2] MACHINE_SESSION_ATTENTION',JSON.stringify({session_id:row.id,machine_id:row.machine_id,reason:body.reason,operation_id:operation}));
     }
-    if(AUTH_FALLBACK_REASONS.has(body.reason)&&row.state==='claimed'&&!row.native_id&&operation===row.operation_id){
+    if(AUTH_FALLBACK_REASONS.has(body.reason)&&['offered','claimed'].includes(row.state)&&!row.native_id&&operation===row.operation_id){
       const now=Date.now(),payload={operation_id:row.dispatch_id,attempt_operation_id:row.operation_id,session_id:row.id,
         machine_id:row.machine_id,epoch:row.epoch,reason:body.reason};
       this.db.transaction(this.ctx,()=>{
-        this.db.run("UPDATE sessions SET state='expired',updated_at=? WHERE id=? AND operation_id=? AND epoch=? AND state='claimed'",now,row.id,row.operation_id,row.epoch);
+        this.db.run("UPDATE sessions SET state='expired',updated_at=? WHERE id=? AND operation_id=? AND epoch=? AND state IN ('offered','claimed')",now,row.id,row.operation_id,row.epoch);
         this.db.run("UPDATE machine_session_operations SET state='expired' WHERE operation_id=? AND session_id=? AND epoch=? AND state='current'",row.operation_id,row.id,row.epoch);
         this.insertOutbox(`auth-fallback:${row.operation_id}:${row.epoch}`,'auth-fallback',row.operation_id,row.project_id,payload,now);
       });
       await this.ensureDeadline(now+1000);
       await this.flushOne(`auth-fallback:${row.operation_id}:${row.epoch}`);
       await this.scheduleNext();
+    } else if(row.state==='offered'&&!row.native_id&&operation===row.operation_id){
+      await this.recordLaunchRefusal(row,body.reason);
     }
+  }
+
+  private async recordLaunchRefusal(session:SessionRow,failureReason:string):Promise<void>{
+    const now=Date.now(),reason='host_launch_refused',payload={operation_id:session.dispatch_id,
+      attempt_operation_id:session.operation_id,session_id:session.id,intake_id:session.intake_id,
+      machine_id:session.machine_id,epoch:session.epoch,native_id:null,reason,failure_reason:failureReason,
+      launch_failed:true,observed_at:now};
+    const key=`launch-refused:${session.operation_id}:${session.epoch}`;
+    const applied=this.db.transaction(this.ctx,()=>{
+      const current=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',session.id);
+      if(!current||current.state!=='offered'||current.native_id!==null||current.operation_id!==session.operation_id||current.epoch!==session.epoch)return false;
+      this.db.run("UPDATE sessions SET state='failed',updated_at=? WHERE id=? AND operation_id=? AND epoch=? AND state='offered'",
+        now,session.id,session.operation_id,session.epoch);
+      this.db.run("UPDATE machine_session_operations SET state='failed' WHERE operation_id=? AND session_id=? AND epoch=? AND state='current'",
+        session.operation_id,session.id,session.epoch);
+      this.settlePendingCommands(current,now,reason,false);
+      this.insertOutbox(key,'reaped',session.operation_id,session.project_id,payload,now);
+      return true;
+    });
+    if(!applied)return;
+    await this.flushOne(key);
+    await this.scheduleNext();
+    console.error('[hub2] SESSION_LAUNCH_REFUSED',JSON.stringify({session_id:session.id,machine_id:session.machine_id,
+      intake_id:session.intake_id,epoch:session.epoch,reason:failureReason}));
   }
 
   private machineView(): Response {

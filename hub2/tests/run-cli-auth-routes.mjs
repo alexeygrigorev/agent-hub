@@ -107,13 +107,27 @@ try {
   const base = { key: 'start-test-0001', workspace: '/tmp/ws', mode: 'headless', brief: 'do the thing', repo: 'owner/repo' };
   for (const [patch, status, code] of [
     [{ key: undefined }, 400, 'idempotency_key_required'],
-    [{ workspace: undefined }, 400, 'workspace_required'],
     [{ brief: undefined }, 400, 'brief_required'],
     [{ repo: 'not-a-repo-name' }, 404, 'project_not_found_or_forbidden'],
   ]) {
     const refused = await start({ ...base, ...patch });
     assert.equal(refused.status, status); assert.equal((await refused.json()).error, code);
   }
+  const noWorkspace = await start({ ...base, key: 'start-no-workspace', workspace: undefined, repo: undefined });
+  const noWorkspaceBody = await noWorkspace.json();
+  assert.equal(noWorkspace.status, 400); assert.equal(noWorkspaceBody.error, 'workspace_required');
+  assert.match(noWorkspaceBody.detail, /--repo owner\/name/);
+  assert.match(noWorkspaceBody.detail, /--workspace <registered label/);
+  // --repo owner/name supplies its repository workspace when --workspace is omitted.
+  const repoOnly = await start({ ...base, key: 'start-repo-only-01', workspace: undefined });
+  const repoOnlyBody = await repoOnly.json();
+  assert([201, 202].includes(repoOnly.status), 'repo-only start status ' + repoOnly.status);
+  assert.equal(repoOnlyBody.project, 'owner/repo');
+  assert(repoOnlyBody.id && repoOnlyBody.state, 'repo-only accepted start has session identity and state');
+  // A configured workspace label is accepted and left for the placed host to resolve under its roots.
+  const byLabel = await start({ ...base, key: 'start-workspace-label-01', workspace: 'repo', repo: undefined });
+  assert([201, 202].includes(byLabel.status), 'workspace-label start status ' + byLabel.status);
+  assert.equal((await byLabel.json()).project, 'owner/repo');
   // --intake-task-id resolves the project from the intake itself (no --repo, no default project).
   const made = await call('/api/intakes?project=owner%2Frepo', 'POST', { key: 'intake-for-start-1', title: 't', text: 'x', acceptance_criteria: ['done'] });
   assert.equal(made.status, 201); const intakeId = (await made.json()).intake.id;
@@ -141,7 +155,7 @@ try {
   assert.equal(JSON.parse(await cli('auth', 'status', '--json')).isAdmin, true);
   assert.match(await cli('quota'), /72%/);
   const listed = JSON.parse(await cli('sessions', 'list', '--json'));
-  assert.equal(listed.sessions.length, 5, 'two seeded sessions and three accepted starts are listed');
+  assert.equal(listed.sessions.length, 7, 'two seeded sessions and five accepted starts are listed');
   assert.equal(JSON.parse(await cli('repos', 'list')).items[0].canonical_name, 'owner/repo');
   // curl exercises the same HTTP front used by the CLI.
   assert.equal(JSON.parse(await command('curl', ['-fsS', '-H', 'Authorization: Bearer ' + token, fixture.origin + '/api/auth/me'])).actor, 'human:cli-user');
