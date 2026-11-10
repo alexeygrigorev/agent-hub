@@ -22,6 +22,10 @@ test('production deploy is dispatch-gated, SSH-only and health verified', () => 
   assert.doesNotMatch(flow, /CLOUDFLARE_API_TOKEN|CLOUDFLARE_ACCOUNT_ID/);
   assert.doesNotMatch(flow, /wrangler|gcloud|GOOGLE_APPLICATION_CREDENTIALS/);
   assert.match(flow, /AGENT_HUB_VM_DEPLOY_KEY/);
+  assert.equal((flow.match(/printf '%s\\n' "\$VM_DEPLOY_KEY"/g) ?? []).length, 2,
+    'both deploy and rollback key installs must terminate the private-key file with a newline');
+  assert.equal((flow.match(/ssh-keygen -y -P '' -f/g) ?? []).length, 2,
+    'both deploy and rollback must parse-check the private key before SSH');
   assert.match(flow, /agent-hub-hub2\.service/);
   assert.match(flow, /hub\.dtcdev\.click\/health/);
 });

@@ -116,7 +116,13 @@ jobs:
           set -euo pipefail
           install -m 700 -d "$RUNNER_TEMP/agent-hub-ssh"
           umask 077
-          printf '%s' "$VM_DEPLOY_KEY" > "$RUNNER_TEMP/agent-hub-ssh/hub_vm_key"
+          key_file="$RUNNER_TEMP/agent-hub-ssh/hub_vm_key"
+          printf '%s\n' "$VM_DEPLOY_KEY" > "$key_file"
+          unset VM_DEPLOY_KEY
+          if ! ssh-keygen -y -P '' -f "$key_file" >/dev/null 2>&1; then
+            echo "VM deploy key is not a valid unencrypted private key" >&2
+            exit 1
+          fi
       - name: Deploy validated revision through the fixed VM transaction script
         id: deploy_vm
         env:
@@ -278,7 +284,13 @@ jobs:
           set -euo pipefail
           install -m 700 -d "$RUNNER_TEMP/agent-hub-ssh"
           umask 077
-          printf '%s' "$VM_DEPLOY_KEY" > "$RUNNER_TEMP/agent-hub-ssh/hub_vm_key"
+          key_file="$RUNNER_TEMP/agent-hub-ssh/hub_vm_key"
+          printf '%s\n' "$VM_DEPLOY_KEY" > "$key_file"
+          unset VM_DEPLOY_KEY
+          if ! ssh-keygen -y -P '' -f "$key_file" >/dev/null 2>&1; then
+            echo "VM deploy key is not a valid unencrypted private key" >&2
+            exit 1
+          fi
       - name: Restore the protected previous release using the fixed script
         env:
           SSH_TARGET: ${{ secrets.AGENT_HUB_VM_USER }}@${{ secrets.AGENT_HUB_VM_HOST }}
