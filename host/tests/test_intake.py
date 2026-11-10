@@ -41,7 +41,7 @@ class TestIntakeCli(unittest.TestCase):
         from urllib.parse import urlparse, parse_qs
         query = parse_qs(urlparse(transport.call_args_list[1].args[1]).query)
         self.assertEqual(query, {'all': ['true'], 'project': ['demo'], 'limit': ['1'],
-                                'after': ['a'], 'revision': ['7'], 'authorization_valid_until': ['12345']})
+                                'cursor': ['a'], 'revision': ['7'], 'authorization_valid_until': ['12345']})
 
     def test_summary_is_one_history_free_request(self):
         with patch.object(intake, 'request', return_value={'total': 1083, 'counts': {'open': 42}}) as transport:
@@ -52,7 +52,7 @@ class TestIntakeCli(unittest.TestCase):
 
     def test_complete_export_uses_maximum_default_page_but_preserves_explicit_limit(self):
         page = {'items': [], 'next': None, 'snapshot_version': 1, 'total': 0}
-        for arguments, limit in [(('--all',), 100), (('--all', '--limit', '25'), 25), ((), 25)]:
+        for arguments, limit in [(('--all',), 50), (('--all', '--limit', '25'), 25), ((), 25)]:
             with patch.object(intake, 'request', return_value=page) as transport:
                 code, out, error = self.run_cli('intake', 'list', *arguments)
             self.assertEqual(code, 0, error)
@@ -94,7 +94,7 @@ class TestIntakeCli(unittest.TestCase):
         self.assertEqual(result['effective_limit'], 50)
         self.assertTrue(result['page_size_reduced'])
         retry = parse_qs(urlparse(transport.call_args_list[2].args[1]).query)
-        self.assertEqual(retry, {'limit': ['50'], 'all': ['true'], 'after': ['a'], 'revision': ['7'],
+        self.assertEqual(retry, {'limit': ['50'], 'all': ['true'], 'cursor': ['a'], 'revision': ['7'],
                                  'authorization_valid_until': ['12345']})
         with patch.object(intake, 'request', side_effect=[too_large, dict(last, items=[{'id': 'a'}, {'id': 'b'}])]) as transport:
             self.assertEqual(intake.list_all({'limit': 100})['total'], 2)
@@ -127,7 +127,7 @@ class TestIntakeCli(unittest.TestCase):
         self.assertEqual(first_query.get('list_token'), ['new'])
         second_query = parse_qs(urlparse(transport.call_args_list[1].args[1]).query)
         self.assertEqual(second_query.get('list_token'), ['11111111-1111-4111-8111-111111111111'])
-        self.assertEqual(second_query.get('after'), ['a'])
+        self.assertEqual(second_query.get('cursor'), ['a'])
         self.assertNotIn('revision', second_query)
 
     def test_list_all_restarts_once_on_expired_token(self):
@@ -912,3 +912,20 @@ class TestIntakeCloseGateCli(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestIntakeReviewRegressions(unittest.TestCase):
+    def test_empty_continuation_pages_advance_until_items_are_found(self):
+        pages=[{'items':[],'next':'opaque-page2'}, {'items':[{'id':'found'}],'next':None}]
+        with patch.object(intake,'request',side_effect=pages):
+            result=intake.list_all({'limit':50})
+        assert [row['id'] for row in result['items']]==['found']
+
+
+    def test_intake_error_retains_bounded_detail_and_stage_without_controls(self):
+        body=json.dumps({'error':'workspace_label_unavailable','stage':'host_launch','detail':'missing workspace\x1b[31m'}).encode()
+        exc=urllib.error.HTTPError('https://fixture.test',400,'private',{},io.BytesIO(body))
+        result=intake.http_error(exc,'POST',{'key':'key'})
+        assert 'stage: host_launch' in str(result)
+        assert 'detail: missing workspace' in str(result)
+        assert '\x1b' not in str(result)

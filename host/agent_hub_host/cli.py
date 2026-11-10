@@ -56,6 +56,66 @@ def format_version() -> str:
     return f"{info['version']} ({commit_str}, {info['build_date']})"
 
 
+STALE_MANIFEST_TTL = 3600
+
+
+def warn_if_cli_stale(base_url=None, cache_path=None):
+    """One stderr line when the deployed CLI differs from this build (5.2).
+
+    Best-effort: bounded 3 s fetch, manifest cached on disk for an hour, and
+    every failure mode (no build commit, offline, cache unreadable) is silent
+    so normal commands never break on the check. HUB_CLI_SKIP_STALE_CHECK=1
+    disables it. `cache_path` overrides the on-disk manifest cache (tests).
+    """
+    if os.environ.get("HUB_CLI_SKIP_STALE_CHECK"):
+        return
+    try:
+        info = get_build_info()
+        commit = info.get("commit")
+        if not isinstance(commit, str) or len(commit) != 40:
+            return
+        import time
+        from pathlib import Path
+
+        if cache_path is None:
+            cache_path = Path.home() / ".config" / "agent-hub" / "cli-manifest-cache.json"
+        manifest = None
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if isinstance(cached, dict) and time.time() - cached.get("fetched_at", 0) < STALE_MANIFEST_TTL:
+                manifest = cached.get("manifest")
+        except (OSError, ValueError):
+            manifest = None
+        if not isinstance(manifest, dict):
+            import urllib.request
+            clean = (
+                base_url
+                or os.environ.get("HUB_URL")
+                or os.environ.get("HUB_BASE_URL")
+                or config.DEFAULT_BASE_URL
+            ).rstrip("/")
+            api.check_url(clean)
+            req = urllib.request.Request(clean + "/cli/manifest.json", headers={"User-Agent": "hub-cli"})
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                if resp.status != 200:
+                    return
+                manifest = json.loads(resp.read().decode("utf-8"))
+            try:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                cache_path.write_text(json.dumps({"fetched_at": time.time(), "manifest": manifest}), encoding="utf-8")
+            except OSError:
+                pass
+        server_commit = str((manifest or {}).get("built_from_commit") or "")
+        if len(server_commit) == 40 and server_commit.lower() != commit.lower():
+            print(
+                f"Note: this hub CLI build ({commit[:12]}) differs from the deployed CLI ({server_commit[:12]}); "
+                "run 'hub update'.",
+                file=sys.stderr,
+            )
+    except Exception:
+        pass
+
+
 def cmd_update(args):
     import hashlib
     import urllib.request
@@ -648,6 +708,8 @@ def main():
     p_workclaim.add_argument("--dry-run", action="store_true", help="Scan and redact without POSTing to Hub")
 
     args = parser.parse_args()
+    if not (args.cmd == 'update' or (args.cmd == 'auth' and getattr(args, 'auth_cmd', None) in ('login', 'logout'))):
+        warn_if_cli_stale(getattr(args, 'url', None) or getattr(args, 'base_url', None))
     if args.cmd in ("run", "fleet-host", "bridge"):
         # Long-running host commands: no console window for any child process.
         from . import windows_no_window

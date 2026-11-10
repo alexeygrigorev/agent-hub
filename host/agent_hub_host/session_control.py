@@ -28,10 +28,14 @@ MAX_BRIEF_CHARS = 8000
 MAX_BODY = 16384
 SESSION_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 TIERS = ('quick', 'daily', 'deep')
+PURPOSES = ('fix', 'implement', 'review', 'think')
 WAIT_DEFAULT_TIMEOUT = 300.0
 WAIT_MAX_TIMEOUT = 600.0
 WAIT_MIN_INTERVAL = 1.0
 CAPTURE_TIMEOUT = 30.0
+# 2.4: `hub sessions start` waits by default, bounded at 150 s, so a start
+# either reaches `running` or prints the typed failure; --no-wait opts out.
+START_WAIT_TIMEOUT = 150.0
 # A capture sent while the session is still offered/starting waits this long for its native
 # binding (Hub target: offered -> bound under 60 s) before it is enqueued; the ack wait
 # then gets its own full --timeout.
@@ -45,6 +49,45 @@ TERMINAL_SESSION = ('running', 'stopped', 'failed', 'refused', 'uncertain', 'can
 SAFE_ERROR = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 # Error bodies are small; refuse unexpectedly large responses before parsing.
 MAX_ERROR_RESPONSE = 64 * 1024
+
+# Hub1-only route families the Hub2 worker never serves (verified against
+# hub2/src/worker.ts routing). Requests fail here with a typed slug instead of
+# a remote 404/traceback. Unknown paths stay allowed so new server routes and
+# coordinated patches never false-block; HUB_ALLOW_LEGACY_ROUTES=1 bypasses
+# the gate for Hub1-only test environments.
+HUB2_UNSUPPORTED_PREFIXES = (
+    '/api/bus/', '/api/device/', '/api/ops/', '/api/webhooks', '/api/prompts',
+    '/api/session-schedules', '/api/driver', '/api/conversations',
+    '/api/fleet/tasks', '/api/fleet/plan', '/api/fleet/launches', '/api/fleet/probe',
+    '/api/fleet/reservations', '/api/fleet/accounts', '/api/fleet/limits',
+    '/api/fleet/resources', '/api/fleet/routing/host-goal',
+    '/api/fleet/routing/policy/grok', '/api/fleet/machines/',
+)
+HUB2_UNSUPPORTED_HINTS = {
+    '/api/bus/': 'messaging moved to native mailboxes; `hub sessions send` covers bound sessions',
+    '/api/webhooks': 'webhooks retired with Hub1',
+    '/api/prompts': 'prompt library retired with Hub1',
+}
+
+
+def ensure_hub2_supported(method, path):
+    """Raise a typed client-side refusal for Hub1-only routes (5.2c)."""
+    if os.environ.get('HUB_ALLOW_LEGACY_ROUTES') == '1':
+        return
+    clean = str(path).split('?', 1)[0].rstrip('/')
+    for prefix in HUB2_UNSUPPORTED_PREFIXES:
+        base = prefix.rstrip('/')
+        # A prefix written with a trailing slash (e.g. '/api/fleet/machines/')
+        # refuses only its subpaths; the bare route itself stays allowed.
+        if prefix.endswith('/'):
+            hit = clean.startswith(base + '/')
+        else:
+            hit = clean == base or clean.startswith(base + '/')
+        if hit:
+            hint = HUB2_UNSUPPORTED_HINTS.get(prefix, 'this route exists only on the retired Hub1 server')
+            raise SessionInputError(
+                f'not_supported_on_hub2; {clean} is not served by Hub2 ({hint})'
+            )
 
 
 class SessionHTTPError(ValueError):
@@ -124,6 +167,7 @@ def http_error(exc, key=None):
     field = None
     detail = None
     reason = None
+    stage = None
     pending = False
     pending_state = None
     provider_guidance = ''
@@ -164,12 +208,18 @@ def http_error(exc, key=None):
             f = data.get('field')
             if isinstance(f, str) and SAFE_ERROR.match(f):
                 field = f
+            # Human-readable server detail/reason print bounded and
+            # control-char-free instead of being swallowed by the slug
+            # filter (2.4); slugs stay exact.
             d = data.get('detail')
-            if isinstance(d, str) and SAFE_ERROR.match(d):
-                detail = d
+            if isinstance(d, str) and d.strip():
+                detail = ' '.join(re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', d).split())[:300]
             r = data.get('reason')
-            if isinstance(r, str) and SAFE_ERROR.match(r):
-                reason = r
+            if isinstance(r, str) and r.strip():
+                reason = ' '.join(re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', r).split())[:300]
+            st = data.get('stage')
+            if isinstance(st, str) and SAFE_ERROR.match(st):
+                stage = st
             if code == 'session_not_bound' and data.get('pending') is True:
                 pending = True
                 st = data.get('state')
@@ -191,6 +241,8 @@ def http_error(exc, key=None):
         parts.append(f'; session is {pending_state or "starting"} and not yet bound; retry shortly')
     if reason:
         parts.append(f'; reason: {reason}')
+    if stage:
+        parts.append(f'; stage: {stage}')
     if field:
         parts.append(f'; field: {field}')
     if detail:
@@ -213,6 +265,7 @@ def _repo_from_workspace(workspace):
 
 
 def request(method, path, payload=None):
+    ensure_hub2_supported(method, path)
     cfg = config.load_config()
     base = os.environ.get('HUB_URL') or os.environ.get('HUB_BASE_URL') or cfg.get('base_url')
     api.check_url(base)
@@ -592,12 +645,13 @@ def add_commands(sub):
     link.add_argument('session')
     link.add_argument('--intake-task-id', required=True)
     link.add_argument('--key')
-    start = commands.add_parser('start', help='Start a model-routed session; use --wait to require a live native binding before success')
-    start.add_argument('--engine', help='Engine override (operators only; requires --reason explaining why)')
-    start.add_argument('--model', choices=['fable', 'claude-fable-5-2'],
-                       help='Explicit Claude Fable 5.2 model (operators only; requires --engine claude and --reason)')
+    start = commands.add_parser('start', help='Start a model-routed session; waits (bounded 150s) until running or a typed failure; --no-wait returns the receipt only')
+    start.add_argument('--engine', help='Engine override (operators only)')
+    start.add_argument('--model', help='Explicit model label, e.g. fable or gpt-6.1-sol (operators only)')
+    start.add_argument('--purpose', choices=PURPOSES, default='implement',
+                       help='Start purpose for model policy: fix|implement|review|think (default implement; astra is drawn only for review/think)')
     start.add_argument('--reason', default=None,
-                       help='Explanation for an explicit deep-tier or engine choice (required with --tier deep or --engine)')
+                       help='Optional explanation for an explicit deep-tier, model or engine choice')
     start.add_argument('--machine')
     start.add_argument('--needs', action='append', default=None,
                        help='Capability hints passed with the launch request (repeatable)')
@@ -605,7 +659,7 @@ def add_commands(sub):
     start.add_argument('--repo', default=None, help='Repository owner/name; selects that project and the same-named workspace under the placed host’s enrolled roots')
     start.add_argument('--force', action='store_true', help='Operator only: start despite unresolved intake dependencies')
     start.add_argument('--task-kind', choices=['implement','review','ask','goal'], help='Task kind for measured resource placement and session statistics')
-    start.add_argument('--tier', choices=TIERS, help='deep/daily/quick task tier; --tier deep requires --reason')
+    start.add_argument('--tier', choices=TIERS, help='deep/daily/quick task tier')
     start.add_argument('--effort', choices=['low', 'medium', 'high', 'max'], help='Per-session model reasoning effort')
     start.add_argument('--cwd')
     start.add_argument('--intake-worktree', dest='intake_worktree', choices=['detached', 'successor'], default=None,
@@ -624,10 +678,13 @@ def add_commands(sub):
     mode.add_argument('--prompt', default=None, help='Inline UTF-8 goal text for headless work (max 8 KiB; same boundaries as --brief-file)')
     mode.add_argument('--interactive', action='store_true', help='Start at an empty native prompt')
     start.add_argument('--key', help='Stable idempotency key; printed back for safe retry after lost responses')
-    add_wait(start)
-    override = commands.add_parser('override', help='Dedicated command for engine override. REQUIRES --engine and --reason.')
+    add_wait(start, timeout=START_WAIT_TIMEOUT)
+    start.set_defaults(wait=True)
+    start.add_argument('--no-wait', dest='wait', action='store_false',
+                       help='Return the start receipt without waiting for a running binding')
+    override = commands.add_parser('override', help='Dedicated command for engine override. Requires --engine.')
     override.add_argument('--engine', required=True, help='Specific model/engine to run')
-    override.add_argument('--reason', required=True, help='Explanation why this specific model/engine must be chosen')
+    override.add_argument('--reason', default=None, help='Explanation why this specific model/engine must be chosen')
     override.add_argument('--machine')
     override.add_argument('--needs', action='append', default=None,
                           help='Label filter (repeatable, e.g. --needs os:windows --needs arch:arm64)')
@@ -645,6 +702,8 @@ def add_commands(sub):
     override_mode.add_argument('--prompt', default=None, help='Inline UTF-8 goal text for headless work (max 8 KiB)')
     override_mode.add_argument('--interactive', action='store_true', help='Start at an empty native prompt')
     override.add_argument('--key', help='Stable idempotency key')
+    override.add_argument('--purpose', choices=PURPOSES, default='implement',
+                          help='Start purpose for model policy (default implement)')
     add_wait(override)
     send = commands.add_parser('send', help='Enqueue one prompt delivery on a bound session')
     send.add_argument('id')
@@ -975,7 +1034,10 @@ def _execute(args):
         cursors: set = set()
         first_page = None
         page_size = min(100, total_limit) if total_limit is not None else 100
-        live_only = (total_limit is None and not getattr(args, 'all', False)
+        # 3.2: live=1 is the default view; --all (or an explicitly terminal
+        # --state) walks history. A --limit caps rows, it does not request
+        # history.
+        live_only = (not getattr(args, 'all', False)
                      and wanted not in ('stopped', 'failed', 'cancelled', 'refused', 'done'))
         while True:
             path = '/api/sessions?%slimit=%d' % ('live=1&' if live_only else '', page_size)
@@ -1058,24 +1120,10 @@ def _execute(args):
         engine = getattr(args, 'engine', None)
         model = getattr(args, 'model', None)
         reason = getattr(args, 'reason', None)
-        if model and engine != 'claude':
+        if model and model in ('fable', 'claude-fable-5-2') and engine not in (None, 'claude'):
             raise ValueError('--model fable requires --engine claude')
-        if cmd == 'override':
-            if not engine:
-                raise ValueError('--engine is required for dedicated engine override command')
-            if not reason or not reason.strip():
-                raise ValueError('Dedicated engine override requires an explanation why this specific model/engine must be chosen (use --reason)')
-        elif cmd == 'start' and engine:
-            if not reason or not reason.strip():
-                raise ValueError('Engine override requires an explanation why this specific model/engine must be chosen (use --reason). Casual use should prefer auto/policy without --engine.')
-        elif cmd == 'start' and model and (not reason or not reason.strip()):
-            raise ValueError('Explicit model starts require an explanation why this model is needed (use --reason)')
-        elif cmd == 'start' and getattr(args, 'tier', None) == 'deep':
-            if not reason or not reason.strip():
-                raise ValueError(
-                    'Explicit deep-tier starts require an explanation why deep reasoning is needed '
-                    '(use --reason). Casual use should prefer auto/policy without --tier deep.'
-                )
+        if cmd == 'override' and not engine:
+            raise ValueError('--engine is required for dedicated engine override command')
         key = getattr(args, 'key', None) or str(uuid.uuid4())
         repo = getattr(args, 'repo', None)
         if not repo and not getattr(args, 'workspace', None):
@@ -1111,6 +1159,7 @@ def _execute(args):
             payload['needs'] = list(needs)
         if getattr(args, 'task_kind', None) is not None:
             payload['task_kind'] = args.task_kind
+        payload['purpose'] = getattr(args, 'purpose', None) or 'implement'
         if getattr(args, 'force', False):
             payload['force'] = True
         if getattr(args, 'intake_task_id', None):
@@ -1150,8 +1199,13 @@ def _execute(args):
             if key and f'reconcile with --key {key}' not in msg:
                 msg = f'{msg} (reconcile with --key {key} via show/commands)'
             raise ValueError(msg) from None
-        if not isinstance(created, dict) or (not created.get('id') and ('items' in created or 'sessions' in created)):
-            raise ValueError(f'Hub accepted the start but returned no session id (unexpected response shape); nothing was started (reconcile with --key {key} via show/commands)')
+        # 2.4: the server may answer with the picker envelope
+        # {session: {...}, picker: {...}}; hoist the session id/state so both
+        # the flat and nested shapes drive the same wait and rendering.
+        if isinstance(created, dict) and not created.get('id') and isinstance(created.get('session'), dict):
+            created = {**created, **created['session']}
+        if not isinstance(created, dict) or not isinstance(created.get('id'), str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}', created['id']):
+            raise ValueError(f'Hub accepted the start but returned no session id (unexpected response shape); start outcome unconfirmed (reconcile with --key {key} via show/commands)')
         created = dict(created, client_key=key)
         timeout, interval = check_wait_args(args)
         if timeout is not None:
@@ -1164,6 +1218,9 @@ def _execute(args):
                 attention = bound.get('attention') if isinstance(bound, dict) else None
                 reason = attention.get('reason') if isinstance(attention, dict) else None
                 detail = f' ({reason})' if isinstance(reason, str) and SAFE_ERROR.fullmatch(reason) else ''
+                stage = bound.get('stage') if isinstance(bound, dict) else None
+                if isinstance(stage, str) and SAFE_ERROR.fullmatch(stage):
+                    detail += f' (stage={stage})'
                 raise SessionInputError(
                     f'session_start_failed; session {created["id"]} reached {state or "an unconfirmed state"}{detail}; '
                     f'reconcile with --key {key} via show/events'
@@ -1325,6 +1382,20 @@ def format_duration(seconds):
     return f'{seconds // 3600}h{seconds % 3600 // 60:02d}m{seconds % 60:02d}s'
 
 
+def _format_timestamp(value):
+    """UTC 'YYYY-MM-DD HH:MM:SS' from an ISO string or numeric epoch (s or ms)."""
+    if isinstance(value, (int, float)) and value > 0:
+        from datetime import datetime, timezone
+        seconds = value / 1000 if value > 10 ** 12 else value
+        try:
+            return datetime.fromtimestamp(seconds, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        except (OverflowError, OSError, ValueError):
+            return str(value)
+    if not isinstance(value, str) or not value:
+        return '-'
+    return value[:19].replace('T', ' ')
+
+
 BREAKDOWN_DIMS = ('host', 'engine', 'account')
 
 
@@ -1382,10 +1453,14 @@ def render_table(sessions):
     """
     if not sessions:
         return 'No sessions found.'
-    headers = ['TYPE', 'NAME', 'HOST', 'ENGINE', 'ACCOUNT', 'MODEL', 'EFFORT', 'STATE', 'WORKSPACE', 'UPDATED', 'LONG_RUNNING', 'RUNTIME', 'IDLE_FOR', 'ACTIVITY']
+    headers = ['TYPE', 'NAME', 'HOST', 'ENGINE', 'ACCOUNT', 'MODEL', 'EFFORT', 'STATE', 'WORKSPACE', 'UPDATED', 'NATIVE', 'LONG_RUNNING', 'RUNTIME', 'IDLE_FOR', 'ACTIVITY']
     rows = []
     for s in sessions:
-        stype = s.get('session_type') or ('aplexer' if s.get('mode') == 'interactive' else 'headless')
+        # 3.2: Hub2 projections use machine_id/account_id/interactive and
+        # numeric epoch timestamps; Hub1 names stay as fallbacks so one CLI
+        # renders both server generations.
+        mode = s.get('mode') or ('interactive' if s.get('interactive') is True else 'headless')
+        stype = s.get('session_type') or ('aplexer' if mode == 'interactive' else 'headless')
         name = s.get('qualified_alias') or s.get('name') or s.get('id') or '-'
         engine = s.get('engine') or '-'
         state = s.get('state') or '-'
@@ -1396,10 +1471,13 @@ def render_table(sessions):
         elif s.get('agent_state') == 'idle' and state == 'running':
             state = 'idle'
         ws = s.get('workspace') or '-'
-        upd = (s.get('updated_at') or '')[:19].replace('T', ' ')
-        host = s.get('machine') or '-'
-        account = s.get('account') or '-'
-        rows.append([stype, name, host, engine, account, s.get('model_id') or s.get('model') or '-', s.get('effort') or '-', state, ws, upd, str(s.get('long_running', False)).lower(),
+        upd = _format_timestamp(s.get('updated_at') or s.get('last_activity_at'))
+        host = s.get('machine') or s.get('machine_id') or '-'
+        account = s.get('account') or s.get('account_id') or '-'
+        # Native pane identity: Hub1 binds carry native_tag, Hub2 projections
+        # carry native_id; both are the aplexer session id for `a capture`/send.
+        native = s.get('native_tag') or s.get('native_id') or '-'
+        rows.append([stype, name, host, engine, account, s.get('model_id') or s.get('model') or '-', s.get('effort') or '-', state, ws, upd, native, str(s.get('long_running', False)).lower(),
                      format_duration(s.get('runtime')), format_duration(s.get('idle_for')), s.get('activity_state', '-')])
 
     widths = [len(h) for h in headers]
@@ -1508,8 +1586,35 @@ def render_output(args, result):
         lines += [f"  pool  {row['policy_id']:<24} {row['share'] * 100:5.1f}%" for row in result.get('pool', [])]
         lines += [f"  EXCLUDED {row['policy_id']} ({row['reason']})" for row in result.get('excluded', [])]
         return '\n'.join(lines)
-    if cmd == 'start' and isinstance(result, dict) and result.get('route'):
-        print(f"Picked route: {result['route']} (engine={result.get('engine')} model={result.get('model')} effort={result.get('effort') or 'default'})", file=sys.stderr)
+    if cmd == 'start' and isinstance(result, dict):
+        # 2.4/native-tag: once bound, name the native pane (Hub1 native_tag /
+        # Hub2 native_id) so `a capture`/`a send` have the exact target.
+        binding = result.get('binding_wait') if isinstance(result.get('binding_wait'), dict) else None
+        bound = binding.get('session') if isinstance(binding, dict) else None
+        bound = bound if isinstance(bound, dict) else binding
+        native = None
+        if isinstance(bound, dict):
+            native = bound.get('native_tag') or bound.get('native_id')
+        if native:
+            print(f"Native pane: {native}", file=sys.stderr)
+    if cmd == 'start' and isinstance(result, dict) and (result.get('route') or result.get('engine') or result.get('model')):
+        route = result.get('route') or '/'.join([
+            str(result.get('engine') or '-'), str(result.get('model') or '-'),
+            str(result.get('effort') or 'default')])
+        line = f"Picked route: {route}"
+        if result.get('policy_id'):
+            line += f" (policy {result['policy_id']}"
+            if result.get('machine_id'):
+                line += f", host {result['machine_id']}"
+            line += ')'
+        print(line, file=sys.stderr)
+        picker = result.get('picker') if isinstance(result.get('picker'), dict) else {}
+        pool = picker.get('pool') if isinstance(picker.get('pool'), list) else []
+        for row in pool:
+            if isinstance(row, dict) and row.get('policy_id'):
+                share = row.get('share')
+                share_text = f"{share * 100:5.1f}%" if isinstance(share, (int, float)) else '    - %'
+                print(f"  pool  {str(row['policy_id']):<24} {share_text}", file=sys.stderr)
         return result
     if cmd == 'warnings':
         lines = []

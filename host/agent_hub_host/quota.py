@@ -147,11 +147,19 @@ def render_text(data):
         harness = pool.get("harness") or pool.get("engines") or []
         harness_text = ", ".join(h for h in harness if isinstance(h, str)) if isinstance(harness, list) else "unknown"
         decision_suffix = (" — %s" % pool["decision_reason"]) if pool.get("decision_reason") else ""
-        lines.append("%s/%s/%s: %s (%s left, observed %s by %s)%s" % (
+        # 4.3: print the real observer or nothing; "by no host" was noise when
+        # no host reported the reading.
+        observers = ", ".join(pool.get("observed_by_hosts") or [])
+        if observers:
+            observation = "observed %s by %s" % (pool.get("observed_at") or "never", observers)
+        elif pool.get("observed_at"):
+            observation = "observed %s" % pool["observed_at"]
+        else:
+            observation = "not observed"
+        lines.append("%s/%s/%s: %s (%s left, %s)%s" % (
             harness_text or "unknown", pool.get("provider", "?"), pool.get("account", "?"),
             pool.get("state", "unknown") + (" [DISABLED: excluded from routing]" if pool.get("routing") == "disabled" else ""),
-            left, pool.get("observed_at") or "never",
-            ", ".join(pool.get("observed_by_hosts") or []) or "no host",
+            left, observation,
             (decision_suffix + (", resets %s" % pool["reset_at"] if pool.get("reset_at") else ""))))
     coverage = data.get("coverage") if isinstance(data.get("coverage"), dict) else {}
     account_coverage = data.get("account_coverage")

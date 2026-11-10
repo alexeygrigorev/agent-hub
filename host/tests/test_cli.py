@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import subprocess
@@ -428,11 +429,86 @@ class TestCliUpdate(unittest.TestCase):
     def test_sessions_start_effort_is_sent_to_hub(self):
         from agent_hub_host import cli, session_control
         from unittest.mock import patch
-        with patch.object(sys, 'argv', ['hub', 'sessions', 'start', '--workspace', '/test', '--prompt', 'do something', '--effort', 'low', '--key', 'effort-key']), \
+        with patch.object(sys, 'argv', ['hub', 'sessions', 'start', '--workspace', '/test', '--prompt', 'do something', '--effort', 'low', '--key', 'effort-key', '--no-wait']), \
              patch.object(session_control, 'request', return_value={'id': 'session-1'}) as request:
             cli.main()
         payload = request.call_args.args[2]
         self.assertEqual(payload['effort'], 'low')
+
+
+class TestCliStaleCheck(unittest.TestCase):
+    """5.2: one-line stale-build notice; every failure mode stays silent."""
+
+    BUILD = {'version': '1.0', 'commit': 'a' * 40, 'build_date': '2026-11-10'}
+
+    def _cache(self, tmp):
+        import pathlib
+        return pathlib.Path(tmp) / 'cli-manifest-cache.json'
+
+    def test_stale_deployed_cli_prints_one_stderr_line_and_caches_manifest(self):
+        import tempfile
+        from agent_hub_host import cli
+        from unittest.mock import patch, MagicMock
+        import urllib.request
+
+        # Real context-manager closure catches reads attempted after __exit__.
+        response = io.BytesIO(json.dumps({'built_from_commit': 'b' * 40}).encode())
+        response.status = 200
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.dict(os.environ, {'HUB_CLI_SKIP_STALE_CHECK': '', 'HUB_URL': 'https://hub.test'}), \
+                patch.object(cli, 'get_build_info', return_value=dict(self.BUILD)), \
+                patch('urllib.request.urlopen', return_value=response) as fetch, \
+                patch.object(sys, 'stderr') as err:
+            cli.warn_if_cli_stale(cache_path=self._cache(tmp))
+            self.assertEqual(fetch.call_count, 1)
+            lines = [c for c in err.write.call_args_list if 'differs from the deployed CLI' in str(c)]
+            self.assertEqual(len(lines), 1)
+            self.assertIn("run 'hub update'", lines[0].args[0])
+            # The manifest is cached for the TTL; a second call refetches nothing.
+            err.write.call_args_list.clear()
+            cli.warn_if_cli_stale(cache_path=self._cache(tmp))
+        self.assertEqual(fetch.call_count, 1)
+
+    def test_matching_commit_and_skip_env_stay_silent(self):
+        import tempfile
+        from agent_hub_host import cli
+        from unittest.mock import patch, MagicMock
+        import urllib.request
+
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.status = 200
+        response.read.return_value = json.dumps({'built_from_commit': 'a' * 40}).encode()
+
+        # The documented off-switch never touches the network.
+        with tempfile.TemporaryDirectory() as tmp_off, \
+                patch.dict(os.environ, {'HUB_CLI_SKIP_STALE_CHECK': '1'}), \
+                patch('urllib.request.urlopen') as fetch, \
+                patch.object(cli, 'get_build_info') as build:
+            cli.warn_if_cli_stale(cache_path=self._cache(tmp_off))
+        fetch.assert_not_called()
+        build.assert_not_called()
+
+    def test_offline_fetch_and_missing_commit_fail_silent(self):
+        import tempfile
+        from agent_hub_host import cli
+        from unittest.mock import patch
+        import urllib.request
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.dict(os.environ, {'HUB_CLI_SKIP_STALE_CHECK': '', 'HUB_URL': 'https://hub.test'}), \
+                patch.object(cli, 'get_build_info', return_value=dict(self.BUILD)), \
+                patch('urllib.request.urlopen', side_effect=OSError('offline')), \
+                patch.object(sys, 'stderr') as err:
+            cli.warn_if_cli_stale(cache_path=self._cache(tmp))  # must not raise
+        err.write.assert_not_called()
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.dict(os.environ, {'HUB_CLI_SKIP_STALE_CHECK': ''}), \
+                patch.object(cli, 'get_build_info', return_value={'version': 'dev'}), \
+                patch('urllib.request.urlopen') as fetch:
+            cli.warn_if_cli_stale(cache_path=self._cache(tmp))
+        fetch.assert_not_called()
 
 
 

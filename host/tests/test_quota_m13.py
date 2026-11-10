@@ -223,6 +223,17 @@ class QuotaCliTests(unittest.TestCase):
         self.assertIn('unknown', text)
         self.assertNotIn('0%', text)
 
+    def test_render_text_names_observing_hosts_instead_of_by_no_host(self):
+        text = quota_cli.render_text({'pools': [
+            {'provider': 'codex', 'account': 'shared-codex', 'state': 'fresh',
+             'remaining_percent': 80.0, 'observed_at': '2026-11-10T01:00:00Z', 'observed_by_hosts': ['m1', 'm2']},
+            {'provider': 'zai', 'account': 'shared-zai', 'state': 'unknown',
+             'remaining_percent': None, 'observed_at': None, 'observed_by_hosts': []}],
+            'coverage': {'machines_total': 2, 'fresh': ['m1'], 'stale': [], 'missing': ['m2']}})
+        self.assertIn('observed 2026-11-10T01:00:00Z by m1, m2', text)
+        self.assertIn('not observed', text)
+        self.assertNotIn('by no host', text)
+
     def test_render_text_exposes_harness_provider_account(self):
         text = quota_cli.render_text({'pools': [
             {'provider': 'codex', 'account': 'codex-orin', 'harness': ['codex'], 'state': 'fresh',

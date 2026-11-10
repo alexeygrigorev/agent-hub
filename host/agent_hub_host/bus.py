@@ -58,7 +58,10 @@ def _do_request(method, path, payload=None):
     base_url = os.environ.get("HUB_URL") or os.environ.get("HUB_BASE_URL") or cfg.get("base_url")
     if not base_url:
         raise ValueError("Not logged in. Base URL not configured.")
-    
+
+    from .session_control import ensure_hub2_supported
+    ensure_hub2_supported(method, path)
+
     from .api import check_url, safe_http_json
     check_url(base_url)
     

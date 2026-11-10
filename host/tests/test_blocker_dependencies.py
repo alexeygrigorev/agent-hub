@@ -36,7 +36,7 @@ class BlockerCommands(unittest.TestCase):
 
     def test_force_start_is_forwarded_and_standing_prompt_requires_blocker_intake(self):
         with patch.object(session_control, 'request', return_value={'id': 'fixture', 'state': 'queued'}) as request:
-            self.run_cli('sessions', 'start', '--workspace', 'repo', '--intake-task', 'original-task', '--prompt', 'Inspect', '--force')
+            self.run_cli('sessions', 'start', '--workspace', 'repo', '--intake-task', 'original-task', '--prompt', 'Inspect', '--force', '--no-wait')
             self.assertTrue(request.call_args.args[2]['force'])
         prompt = compose_prompt('Complete work')
         self.assertIn('hub intake blocker', prompt)
