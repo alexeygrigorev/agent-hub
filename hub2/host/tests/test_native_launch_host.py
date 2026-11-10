@@ -1,4 +1,4 @@
-"""Native launch adapter and provider home tests (Hub2 Resource Manager redesign)."""
+"""Native launch adapter and provider home tests."""
 import json
 import os
 import stat
@@ -210,31 +210,6 @@ class CapabilityTest(unittest.TestCase):
         self.assertNotIn('shell', caps)
 
 
-class PhysicalResourceTest(unittest.TestCase):
-    def test_refusal_when_below_floor(self):
-        with mock.patch.object(nl, 'available_memory_mb', return_value=1000):
-            ready, reason = nl.physical_resources_ready(6000, 1500)
-            self.assertFalse(ready)
-            self.assertEqual(reason, 'host_physical_resources_insufficient')
-
-    def test_unknown_memory_fails_closed(self):
-        with mock.patch.object(nl, 'available_memory_mb', return_value=None):
-            ready, reason = nl.physical_resources_ready(6000, 1500)
-            self.assertFalse(ready)
-            self.assertEqual(reason, 'host_physical_resources_unknown')
-
-    def test_available_memory_reads_host_platform(self):
-        value = nl.available_memory_mb()
-        self.assertIsInstance(value, int)
-        self.assertGreater(value, 0)
-
-    def test_cpu_load_pct_is_bounded_percentage(self):
-        value = nl.cpu_load_pct(sample=0.05)
-        self.assertIsInstance(value, float)
-        self.assertGreaterEqual(value, 0.0)
-        self.assertLessEqual(value, 100.0)
-
-
 class ProviderHomeTest(unittest.TestCase):
     zai_bundle = {'config': {'schemaVersion': 1}, 'zai_token': 'test-token-value-no-spaces',
                   'zai_base_url': 'https://api.z.ai/api/anthropic'}
@@ -293,55 +268,40 @@ class ProviderHomeTest(unittest.TestCase):
                 ph.materialize(str(tmp) + '/p', 'zai-central', 'shell', 1, files, 'glm-5.3-flash')
 
 
-class ProviderAdmissionTest(unittest.TestCase):
-    def test_provider_admission_validates_live_generation_and_quota(self):
+class SessionBindingTest(unittest.TestCase):
+    def test_session_binding_does_not_gate_on_quota_or_credential_health(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / 'providers'
             files = {ph.PATHS['zai']: json.dumps(ProviderHomeTest.zai_bundle)}
             manifest = ph.materialize(str(root), 'zai-central', 'zai', 3, files, 'glm-5.3-flash')
             now = time.time() * 1000
             result = {'session_id': 's1', 'operation_id': 'op1', 'epoch': 2, 'account_id': 'zai-central',
-                      'launch_allowed': True, 'provider': 'zai', 'credential_generation': 3,
-                      'model': 'glm-5.3-flash', 'runtime_deadline': int(now + 600000),
-                      'quota': {'source': 'provider:zai:generation:3', 'captured_at': int(now) - 1000,
-                                'valid_until': int(now) + 60000, 'remaining': 88.0}}
+                      'launch_allowed': True, 'model': 'glm-5.3-flash', 'runtime_deadline': int(now + 600000),
+                      'quota': {'remaining': 0, 'captured_at': 0, 'valid_until': 0}, 'credential_usable': False}
             client = mock.Mock()
             client.request.return_value = result
-            chosen, data = ph.provider_admission(manifest, client, 's1', 'op1', 2)
-            self.assertEqual(chosen, {'provider': 'zai', 'model': 'glm-5.3-flash'})
+            data = ph.session_binding(manifest, client, 's1', 'op1', 2)
             self.assertEqual(data['runtime_deadline'], result['runtime_deadline'])
             client.request.assert_called_once_with('POST', '/api/sessions/s1/admission', mock.ANY)
             body = client.request.call_args[0][2]
-            self.assertEqual(body, {'operation_id': 'op1', 'epoch': 2, 'provider_check': True})
+            self.assertEqual(body, {'operation_id': 'op1', 'epoch': 2})
 
-    def test_provider_admission_refuses_stale_quota_or_generation(self):
+    def test_session_binding_still_checks_accepted_session_identity(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / 'providers'
             files = {ph.PATHS['zai']: json.dumps(ProviderHomeTest.zai_bundle)}
             manifest = ph.materialize(str(root), 'zai-central', 'zai', 3, files, 'glm-5.3-flash')
             now = time.time() * 1000
             base = {'session_id': 's1', 'operation_id': 'op1', 'epoch': 2, 'account_id': 'zai-central',
-                    'launch_allowed': True, 'provider': 'zai', 'credential_generation': 3,
-                    'model': 'glm-5.3-flash', 'runtime_deadline': int(now + 600000),
-                    'quota': {'source': 'provider:zai:generation:3', 'captured_at': int(now) - 1000,
-                              'valid_until': int(now) + 60000, 'remaining': 88.0}}
+                    'launch_allowed': True, 'model': 'glm-5.3-flash', 'runtime_deadline': int(now + 600000)}
             client = mock.Mock()
-            client.request.return_value = base | {'credential_generation': 2}
+            client.request.return_value = base | {'account_id': 'other'}
             with self.assertRaises(ValueError):
-                ph.provider_admission(manifest, client, 's1', 'op1', 2)
-            stale = base | {'quota': base['quota'] | {'captured_at': int(now) - 400000}}
-            client.request.return_value = stale
-            with self.assertRaises(ValueError):
-                ph.provider_admission(manifest, client, 's1', 'op1', 2)
-            # The codex floor is provider-scoped; a zai account below it still admits.
-            below = base | {'quota': base['quota'] | {'remaining': 10.0}}
-            client.request.return_value = below
-            chosen, _ = ph.provider_admission(manifest, client, 's1', 'op1', 2)
-            self.assertEqual(chosen['model'], 'glm-5.3-flash')
+                ph.session_binding(manifest, client, 's1', 'op1', 2)
             binding = base | {'epoch': 9}
             client.request.return_value = binding
             with self.assertRaises(ValueError):
-                ph.provider_admission(manifest, client, 's1', 'op1', 2)
+                ph.session_binding(manifest, client, 's1', 'op1', 2)
 
 
 class SpawnEnvironmentTest(unittest.TestCase):
@@ -369,14 +329,21 @@ class SpawnEnvironmentTest(unittest.TestCase):
 
 
 class LaunchReceiptTest(unittest.TestCase):
-    def test_launch_builds_aplexer_argv_and_rejects_unready_resources(self):
+    def test_launch_attempts_start_without_a_host_capacity_gate(self):
         config = {'routes': {'codex': {'provider': 'zai'}}, 'min_free_mem_mb': 6000, 'memory_mb': 1500}
-        adapter = nl.NativeLauncher(config)
-        spec = {'workspace': '/nonexistent-ws', 'engine': 'codex', 'model': 'glm-5.3-flash',
-                'prompt': 'p', 'interactive': False, 'timeout_seconds': 600}
-        with mock.patch.object(nl, 'physical_resources_ready', return_value=(False, 'host_physical_resources_insufficient')):
-            with self.assertRaises(RuntimeError):
-                adapter.launch('t1', spec)
+        with tempfile.TemporaryDirectory() as workspace:
+            output = json.dumps({'id': 'd6cf9872-8597-48a5-be64-990cdef4db31', 'tag': 'task-t1',
+                                 'workspace': workspace, 'command': ['zcodex', 'exec', '--model', 'glm-5.3-flash']})
+            runner = mock.Mock(return_value=mock.Mock(returncode=0, stdout=output))
+            adapter = nl.NativeLauncher(config, runner=runner)
+            spec = {'workspace': workspace, 'engine': 'codex', 'model': 'glm-5.3-flash',
+                    'prompt': 'p', 'interactive': False, 'timeout_seconds': 600}
+            with (mock.patch.object(adapter, 'wait_first_action', return_value={'session_id': 'd6cf9872-8597-48a5-be64-990cdef4db31', 'first_action_verified': True}),
+                  mock.patch.object(adapter, 'record_evidence')):
+                receipt = adapter.launch('t1', spec)
+            self.assertTrue(receipt['first_action_verified'])
+            command = runner.call_args.args[0]
+            self.assertEqual(command[command.index('--memory') + 1], '1500M')
 
     def test_launch_refuses_unknown_route(self):
         adapter = nl.NativeLauncher({'routes': {}})

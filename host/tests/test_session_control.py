@@ -71,25 +71,25 @@ class TestSessionControlCli(unittest.TestCase):
                 session_control.execute(self.parse('protect', 'owned-worker', '--key', 'bad/key'))
         transport.assert_not_called()
 
-    def test_cancel_held_intent_uses_a_stable_key_without_native_stop(self):
+    def test_cancel_queued_intent_uses_a_stable_key_without_native_stop(self):
         with patch.object(session_control, 'request', return_value={'state': 'cancelled'}) as transport:
-            result = session_control.execute(self.parse('cancel', 'held-fixture', '--key', 'cancel-once'))
+            result = session_control.execute(self.parse('cancel', 'queued-fixture', '--key', 'cancel-once'))
         self.assertEqual(result['state'], 'cancelled')
-        transport.assert_called_once_with('POST', '/api/sessions/held-fixture/cancel', {'key': 'cancel-once'})
+        transport.assert_called_once_with('POST', '/api/sessions/queued-fixture/cancel', {'key': 'cancel-once'})
 
         with patch.object(session_control, 'request') as transport:
             with self.assertRaises(ValueError):
                 session_control.execute(self.parse('cancel', '../other', '--key', 'cancel-once'))
             with self.assertRaises(ValueError):
-                session_control.execute(self.parse('cancel', 'held-fixture', '--key', 'invalid/key'))
+                session_control.execute(self.parse('cancel', 'queued-fixture', '--key', 'invalid/key'))
         transport.assert_not_called()
 
     def test_stop_wait_accepts_atomic_no_start_cancellation_without_host_command(self):
         receipt = {'state': 'cancelled', 'cancellation': {'effect': 'no_native_start'}}
         with patch.object(session_control, 'request', return_value=receipt) as transport:
-            result = session_control.execute(self.parse('stop', 'held-fixture', '--key', 'stop-held', '--wait', '--timeout', '5'))
+            result = session_control.execute(self.parse('stop', 'queued-fixture', '--key', 'stop-queued', '--wait', '--timeout', '5'))
         self.assertEqual(result['stop_wait']['effect'], 'no_native_start')
-        transport.assert_called_once_with('POST', '/api/sessions/held-fixture/stop', {'key': 'stop-held'})
+        transport.assert_called_once_with('POST', '/api/sessions/queued-fixture/stop', {'key': 'stop-queued'})
 
     def test_stop_wait_does_not_accept_running(self):
         with patch.object(session_control, 'request', side_effect=[{'state': 'running'}, {'state': 'stopped'}]) as fetch, patch.object(session_control.time, 'sleep'):
@@ -184,34 +184,19 @@ class TestSessionControlCli(unittest.TestCase):
         wait.assert_called_once_with('sid', 'c1', 30.0, 1.0)
         self.assertEqual(result['command_wait']['ack']['capture'], 'screen')
 
-    def test_route_rejections_are_bounded_codes_without_provider_details(self):
+    def test_disabled_provider_error_has_actionable_policy_guidance(self):
         import os
         import urllib.error
-        payload = {'error': 'no_eligible_route', 'rejected': [
-            {'reason': 'capability_unavailable'}, {'reason': 'account_capacity'},
-            {'reason': 'private error with secret'}, {'reason': 'account_capacity'}]}
-        failure = urllib.error.HTTPError('https://hub.test/api/fleet/launches', 409, 'held', {}, io.BytesIO(json.dumps(payload).encode()))
-        with patch.object(session_control.config, 'load_config', return_value={'base_url': 'https://hub.test'}), \
-                patch.dict(os.environ, {'HUB_TOKEN': 'fixture-env-token'}), \
-                patch.object(session_control.api, 'safe_http_json', side_effect=failure):
-            with self.assertRaises(ValueError) as raised:
-                session_control.request('POST', '/api/fleet/launches', {})
-        self.assertIn('account_capacity, capability_unavailable', str(raised.exception))
-        self.assertNotIn('private', str(raised.exception))
-
-    def test_disabled_provider_hold_has_actionable_local_guidance(self):
-        import os
-        import urllib.error
-        payload = {'id': 'held-opus', 'state': 'held', 'hold': {'error': 'provider_disabled', 'detail': 'private server body'}}
-        failure = urllib.error.HTTPError('https://hub.test/api/sessions', 409, 'held', {}, io.BytesIO(json.dumps(payload).encode()))
+        payload = {'error': 'provider_disabled', 'detail': 'private server body'}
+        failure = urllib.error.HTTPError('https://hub.test/api/sessions', 400, 'disabled', {}, io.BytesIO(json.dumps(payload).encode()))
         with patch.object(session_control.config, 'load_config', return_value={'base_url': 'https://hub.test'}), \
                 patch.dict(os.environ, {'HUB_TOKEN': 'fixture-env-token'}), \
                 patch.object(session_control.api, 'safe_http_json', side_effect=failure):
             with self.assertRaises(ValueError) as raised:
                 session_control.request('POST', '/api/sessions', {})
         self.assertIn('provider_disabled', str(raised.exception))
-        self.assertIn('choose an enabled engine/model', str(raised.exception))
-        self.assertIn('fresh host route with verified quota', str(raised.exception))
+        self.assertIn('choose an allowed model', str(raised.exception))
+        self.assertIn('change the model pool', str(raised.exception))
         self.assertNotIn('private server body', str(raised.exception))
 
     def test_request_errors_hide_server_bodies(self):
@@ -226,21 +211,15 @@ class TestSessionControlCli(unittest.TestCase):
         self.assertNotIn('secret', str(raised.exception))
         self.assertNotIn('boom', str(raised.exception))
 
-    def test_hold_payload_surfaces_code_and_held_session(self):
-        import os
-        import urllib.error
-        body = json.dumps({'id': 'held-session-1', 'state': 'held',
-                           'hold': {'error': 'no_eligible_route'}}).encode('utf-8')
-        failure = urllib.error.HTTPError('https://hub.test/api/sessions', 409, 'held', {}, io.BytesIO(body))
-        with patch.object(session_control.config, 'load_config', return_value={'base_url': 'https://hub.test'}), \
-                patch.dict(os.environ, {'HUB_TOKEN': 'fixture-env-token'}), \
-                patch.object(session_control.api, 'safe_http_json', side_effect=failure):
-            with self.assertRaises(ValueError) as raised:
-                session_control.request('POST', '/api/sessions', {'key': 'k'})
-        message = str(raised.exception)
-        self.assertIn('status 409', message)
-        self.assertIn('no_eligible_route', message)
-        self.assertIn('held-session-1', message)
+    def test_reaper_dry_run_calls_the_hub_and_renders_live_counts(self):
+        args = self.parse('reap', '--dry-run')
+        result = {'dry_run': True, 'reaped': 0, 'stop_requested': 0,
+                  'active_count_before': 12, 'active_count_after': 12}
+        with patch.object(session_control, 'request', return_value=result) as transport:
+            actual = session_control.execute(args)
+        transport.assert_called_once_with('POST', '/api/sessions/reap', {'dry_run': True})
+        self.assertIs(actual, result)
+        self.assertIn('live active count 12 -> 12', session_control.render_output(args, result))
 
     def test_inputs_are_bounded(self):
         with self.assertRaises(ValueError):

@@ -118,10 +118,10 @@ class Client:
                                             parsed.netloc, parsed.path + "/api/connect", "safety=operator_stop" if safety else "", ""))
         return WebSocket(endpoint, self.token, self.timeout)
 
-    def heartbeat(self, labels, engines=None, capabilities=None, resources=None):
+    def heartbeat(self, labels, engines=None, capabilities=None, native_sessions=None):
         body = {"os": platform.system().lower(),
                 "arch": platform.machine().lower(), "labels": labels,
                 "engines": engines or [], "capabilities": capabilities or []}
-        if resources is not None:
-            body["resources"] = resources
+        if native_sessions is not None:
+            body["native_sessions"] = native_sessions
         return self.request("POST", "/api/heartbeat", body)

@@ -35,12 +35,6 @@ async function dispatch(request:Request,ctx:DurableObjectState,core:Core,kind:st
   (core as any).db.cache.clear(); // Test-only raw deadline mutation must invalidate instance data.
   await core.alarm!();return Response.json({forced_due:true});
  }
- if(path==='/_fixture/expire-account'&&request.method==='POST'&&kind==='account'){
-  const b=await request.json() as {operation_id:string};
-  ctx.storage.sql.exec('UPDATE reservations SET expires_at=? WHERE operation_id=? AND state=?',Date.now()-1,b.operation_id,'running').toArray();
-  (core as any).db.cache.clear(); // Test-only raw deadline mutation must invalidate instance data.
-  await core.alarm!();return Response.json({forced_due:true});
- }
  if(path==='/_fixture/due-saga'&&request.method==='POST'&&kind==='project'){
   const b=await request.json() as {operation_id:string};
   ctx.storage.sql.exec('UPDATE dispatch_sagas SET next_action_at=? WHERE operation_id=? AND next_action_at IS NOT NULL',Date.now()-1,b.operation_id).toArray();
@@ -94,7 +88,7 @@ export class CoreMachine{
  webSocketError(s:WebSocket,e:unknown){return this.core.webSocketError(s,e);}
 }
 export default {async fetch(request:Request,env:any):Promise<Response>{
- const u=new URL(request.url),m=u.pathname.match(/^\/_fixture\/(control|project|machine|account|mailbox)\/([^/]+)\/(state|pause-normal|provider-failure|expire-quota|hold-finish-response|finish-response-state|release-finish-response|machine-deadlines|meter-invalid|outbound-fault|fault|fail-next-alarm|alarm|expire-offer|expire-account|due-saga|due-outbox|clock|worker-storage|hold-worker-crypt|worker-crypt-state|release-worker-crypt|revoke-worker)$/);
+ const u=new URL(request.url),m=u.pathname.match(/^\/_fixture\/(control|project|machine|account|mailbox)\/([^/]+)\/(state|pause-normal|provider-failure|expire-quota|hold-finish-response|finish-response-state|release-finish-response|machine-deadlines|meter-invalid|outbound-fault|fault|fail-next-alarm|alarm|expire-offer|due-saga|due-outbox|clock|worker-storage|hold-worker-crypt|worker-crypt-state|release-worker-crypt|revoke-worker)$/);
  if(!m)return worker.fetch(request,{...env,ASSETS:{fetch:async()=>new Response(env.HUB2_FIXTURE_ASSET_HTML,{headers:{'Content-Type':'text/html; charset=utf-8'}})}});
  if(request.headers.get('Authorization')!=='Bearer '+env.HUB2_DEV_OPERATOR_TOKEN)return Response.json({error:'unauthorized'},{status:401});
  const ns=({control:env.CONTROL,project:env.PROJECTS,machine:env.MACHINES,account:env.ACCOUNTS,mailbox:env.MAILBOXES} as any)[m[1]];

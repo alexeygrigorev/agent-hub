@@ -96,20 +96,25 @@ jobs:
         continue-on-error: true
         run: npm run test:control --prefix hub2
 
-      - name: Resource Manager admission and routing tests
-        id: resource_manager
+      - name: Quota-weighted model picker tests
+        id: model_picker
         continue-on-error: true
-        run: npm run test:resource-manager --prefix hub2
+        run: npm run test:model-picker --prefix hub2
+
+      - name: Live session semantics
+        id: session_liveness
+        continue-on-error: true
+        run: npm run test:session-liveness --prefix hub2
+
+      - name: Inactive session reaper tests
+        id: machine_reaper
+        continue-on-error: true
+        run: npm run test:machine-reaper --prefix hub2
 
       - name: Model policy config tests
         id: model_policy
         continue-on-error: true
         run: npm run test:model-policy --prefix hub2
-
-      - name: Machine capacity label tests
-        id: machine_capacity
-        continue-on-error: true
-        run: npm run test:machine-capacity --prefix hub2
 
       - name: Mail retention and restart e2e on Node runtime
         id: accounts_mail_node
@@ -167,9 +172,10 @@ jobs:
           READ_CACHE: ${{ steps.read_cache.outcome }}
           DB_METERING: ${{ steps.db_metering.outcome }}
           CONTROL: ${{ steps.control.outcome }}
-          RESOURCE_MANAGER: ${{ steps.resource_manager.outcome }}
+          MODEL_PICKER: ${{ steps.model_picker.outcome }}
+          SESSION_LIVENESS: ${{ steps.session_liveness.outcome }}
+          MACHINE_REAPER: ${{ steps.machine_reaper.outcome }}
           MODEL_POLICY: ${{ steps.model_policy.outcome }}
-          MACHINE_CAPACITY: ${{ steps.machine_capacity.outcome }}
           ACCOUNTS_MAIL_NODE: ${{ steps.accounts_mail_node.outcome }}
           AUTH_FLOWS: ${{ steps.auth_flows.outcome }}
           AUTH_GC: ${{ steps.auth_gc.outcome }}
@@ -186,8 +192,9 @@ jobs:
             "account_provider_timeout:$ACCOUNT_PROVIDER_TIMEOUT" \
             "project_work:$PROJECT_WORK" "project_intake:$PROJECT_INTAKE" \
             "read_cache:$READ_CACHE" "db_metering:$DB_METERING" \
-            "control:$CONTROL" "resource_manager:$RESOURCE_MANAGER" \
-            "model_policy:$MODEL_POLICY" "machine_capacity:$MACHINE_CAPACITY" \
+            "control:$CONTROL" "model_picker:$MODEL_PICKER" \
+            "session_liveness:$SESSION_LIVENESS" "machine_reaper:$MACHINE_REAPER" \
+            "model_policy:$MODEL_POLICY" \
             "accounts_mail_node:$ACCOUNTS_MAIL_NODE" "auth_flows:$AUTH_FLOWS" \
             "auth_gc:$AUTH_GC" "machine_socket_cap:$MACHINE_SOCKET_CAP" \
             "core_node:$CORE_NODE" "public_mail:$PUBLIC_MAIL" \

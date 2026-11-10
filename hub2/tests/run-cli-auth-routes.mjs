@@ -77,7 +77,7 @@ try {
   assert.deepEqual((await (await call('/api/quota?view=fleet')).json()).pools, []);
   const candidates = [{ id: 'codex', engine: 'codex', model: 'synthetic', account_id: 'test-account', weight: 1, capabilities: [], enabled: true }];
   assert.equal((await call('/api/model-policy', 'PUT', { candidates })).status, 200);
-  assert.equal((await call('/api/accounts/test-account/api/account', 'PATCH', { provider: 'codex', enabled: true, capacity: 1 })).status, 200);
+  assert.equal((await call('/api/accounts/test-account/api/account', 'PATCH', { provider: 'codex', enabled: true })).status, 200);
   let pools = (await (await call('/api/quota?view=fleet')).json()).pools;
   assert.equal(pools[0].state, 'unknown'); assert.equal(pools[0].remaining_percent, null);
   const now = Date.now();

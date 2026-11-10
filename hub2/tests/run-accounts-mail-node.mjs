@@ -39,12 +39,11 @@ try{
  // This gate measures retained-history query growth and restart semantics, not
  // the production daily ceiling. Use the real audited override only inside this
  // disposable Workerd namespace so 100 synthetic sends do not stop midway;
- await call('accounts','a1','/api/account','PATCH',{provider:'synthetic',enabled:true,capacity:1});
+ await call('accounts','a1','/api/account','PATCH',{provider:'synthetic',enabled:true});
  await call('accounts','a1','/api/account/quota','PUT',{remaining:80,captured_at:Date.now(),valid_until:Date.now()+60000,source:'synthetic-local-evidence'});
- const beforeAccount=await count('accounts','a1'),reservation={operation_id:'op1',session_id:'s1',machine_id:'h1',epoch:1,request_digest:'synthetic-digest'};
- for(const [path,body] of [['reserve',reservation],['confirm',{operation_id:'op1',epoch:1}],['start',{operation_id:'op1',session_id:'s1',machine_id:'h1',epoch:1}],['release',{operation_id:'op1',session_id:'s1',machine_id:'h1',epoch:1,native_exit_confirmed:true}]]){
-  assert.equal((await call('accounts','a1',path==='release'?'/_internal/release':'/api/account/'+path,'POST',body)).response.status,200);
- }
+ const beforeAccount=await count('accounts','a1');
+ for(const path of ['/api/account/reserve','/api/account/confirm','/api/account/start','/_internal/release'])
+  assert.equal((await call('accounts','a1',path,'POST',{})).response.status,404);
  const accountFlow=delta(beforeAccount,await count('accounts','a1'));
  const first=await call('mailboxes','agent:a','/api/messages','POST',{recipient:'agent:b',body:'synthetic',key:'first'},a);assert.equal(first.response.status,201);await completeNative(first.result.message.id);
  assert.equal((await call('mailboxes','agent:c','/api/messages/'+first.result.message.id,'GET',undefined,{id:'agent:c',kind:'agent',scopes:[]})).response.status,404);
@@ -61,6 +60,6 @@ try{
  const reactivation={mailbox:await count('mailboxes','global'),account:await count('accounts','a1'),control:await count('control','global')};
  const after=await call('mailboxes','agent:a','/api/messages/'+warm.result.message.id+'/status','GET',undefined,a);assert(after.result.message.completed_at);assert(after.result.message.native_receipt);
  const profile=(await call('mailboxes','global','/_fixture/profile')).result;
- console.log(JSON.stringify({passed:true,engine:'node sqlite',physical_mailbox_authorities:1,mailbox_id:'global',accountFlow,warmFullMessage:{...flow,total,alarm_operations:alarms},smallPage,largePage,reactivation,profile,note:'Actual SQL and alarm calls, one global Mailbox authority counted once. Synthetic running-session precondition and native receipts; not provider/live-process or whole-day proof.'}));
+ console.log(JSON.stringify({passed:true,engine:'node sqlite',physical_mailbox_authorities:1,mailbox_id:'global',accountFlow,warmFullMessage:{...flow,total,alarm_operations:alarms},smallPage,largePage,reactivation,profile,note:'Actual SQL and alarm calls, one global Mailbox authority counted once. Account session reservation routes are absent. Synthetic running-session precondition and native receipts; not provider/live-process or whole-day proof.'}));
 }finally{await fixture.dispose();}
 

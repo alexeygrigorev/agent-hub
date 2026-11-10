@@ -1,7 +1,8 @@
 import { mcp } from './mcp';
 import { publicAuthentication, cookieActor, noStore } from './auth';
 import { safeEqual } from './crypto';
-import { boundedText, error, HttpError, json } from './http';
+import { bodyObject, boundedText, error, HttpError, json } from './http';
+import { isLiveActiveSession, type LiveSession } from './session-liveness';
 import type { Actor, Hub2Env, JsonRecord } from './types';
 
 const CONTROL = 'https://control.hub2.internal';
@@ -99,6 +100,8 @@ const router = {
         );
       if (path === '/api/sessions' && request.method !== 'GET' && request.method !== 'HEAD')
         return request.method === 'POST' ? await startSession(request, env, actor) : error('method_not_allowed', 405);
+      if (path === '/api/sessions/reap')
+        return request.method === 'POST' ? await reapSessions(request, env, actor) : error('method_not_allowed', 405);
       if (path === '/api/fleet' || path === '/api/fleet/machines' || path === '/api/sessions')
         return await machineProjection(request, env, actor, path === '/api/sessions');
       if (path === '/api/status') {
@@ -522,8 +525,7 @@ async function forwardRequest(
 
 /**
  * POST /api/sessions: `hub sessions start`. Creates a project intake and starts
- * it through the normal admission/saga path, so placement (capacity, quota,
- * model policy) is chosen server-side when the caller gives no model.
+ * it through the normal model-picker and dispatch path.
  * Every refusal names a reason; nothing here waits on a machine.
  */
 async function startSession(request: Request, env: Hub2Env, actor: Actor): Promise<Response> {
@@ -611,7 +613,7 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
   const session = started.data.session as JsonRecord | undefined;
   if (!started.response.ok || !session?.id)
     return json({ ...started.data, error: started.data.error ?? 'session_start_failed', stage: 'start', intake_id: intakeId }, started.response.ok ? 502 : started.response.status);
-  // 201 = offered to the host; 202 = accepted but still placing (see held_reason).
+  // 201 = offered to the host; 202 = accepted and dispatching.
   return json({ ...session, project: canonical, intake_id: intakeId }, started.response.status);
 }
 
@@ -649,26 +651,67 @@ function readCursor(value: string | null): any {
     throw new HttpError('invalid_cursor', 400);
   }
 }
-/** `hub routing-machines`: per machine the numbers placement judges (capacity, resource freshness, engines). */
+/** `hub routing-machines`: registered host routing information. */
 async function routingMachines(env: Hub2Env, actor: Actor): Promise<Response> {
   if (!admin(actor)) return error('forbidden', 403);
   const control = env.CONTROL.get(env.CONTROL.idFromName('global'));
-  const directory = await control.fetch(new Request(CONTROL + '/api/directory?kind=machines&limit=50', {
-    headers: { 'x-hub2-actor': JSON.stringify(actor) },
-  }));
-  if (!directory.ok) return directory;
-  const ids = ((await directory.json()) as { items: { id: string }[] }).items.map(m => m.id);
+  const ids:string[]=[];let after='';
+  do{
+    const directory=await control.fetch(new Request(CONTROL+'/api/directory?kind=machines&limit=50'+(after?'&after='+encodeURIComponent(after):''),{
+      headers:{'x-hub2-actor':JSON.stringify(actor)},
+    }));
+    if(!directory.ok)return directory;
+    const page=await directory.json() as {items?:Array<{id:string}>;next?:string|null};
+    ids.push(...(page.items||[]).map(machine=>machine.id));
+    const next=page.next||'';if(next&&next<=after)return error('machine_directory_invalid_cursor',503);after=next;
+  }while(after);
   const now = Date.now();
   const machines = await Promise.all(ids.map(async id => {
     const reply = await env.MACHINES.get(env.MACHINES.idFromName(id)).fetch('https://routing.internal/_internal/routing', {
       headers: { 'x-hub2-actor': JSON.stringify(actor) },
     });
     if (!reply.ok) return { machine_id: id, available: false, reason: 'routing_view_unavailable' };
-    const view = (await reply.json()) as { resources?: { observed_at: number } } & Record<string, unknown>;
-    const age = view.resources ? Math.round((now - view.resources.observed_at) / 1000) : null;
-    return { ...view, resources_age_seconds: age, resources_state: age === null ? 'unknown' : age > 300 ? 'stale' : 'fresh' };
+    return await reply.json() as Record<string, unknown>;
   }));
   return json({ machines, observed_at: now });
+}
+
+async function reapSessions(request:Request,env:Hub2Env,actor:Actor):Promise<Response>{
+  if(!admin(actor))return error('forbidden',403);
+  const body=await bodyObject(request,4096);
+  if(body.dry_run!==undefined&&typeof body.dry_run!=='boolean')return error('invalid_reap_request',400);
+  const dryRun=body.dry_run===true,control=env.CONTROL.get(env.CONTROL.idFromName('global'));
+  const headers={'x-hub2-actor':JSON.stringify(actor)},machines:string[]=[];
+  let after='';
+  do{
+    const path=CONTROL+'/api/directory?kind=machines&limit=50'+(after?'&after='+encodeURIComponent(after):'');
+    const response=await control.fetch(new Request(path,{headers}));
+    if(!response.ok)return error('machine_directory_unavailable',503);
+    const page=await response.json() as {items?:Array<{id:string}>;next?:string|null};
+    machines.push(...(page.items||[]).map(row=>row.id));after=page.next||'';
+  }while(after);
+  const activeCount=async():Promise<number>=>{
+    const snapshots=await Promise.all(machines.map(async machineId=>{
+      try{
+        const response=await env.MACHINES.get(env.MACHINES.idFromName(machineId)).fetch('https://machine.internal/_internal/live-sessions');
+        if(!response.ok)return [];
+        const view=await response.json() as {sessions?:LiveSession[]};
+        return view.sessions||[];
+      }catch{return [];}
+    }));
+    return new Set(snapshots.flat().filter(row=>isLiveActiveSession(row)).map(row=>row.session_id)).size;
+  };
+  const before=await activeCount(),results:JsonRecord[]=[];
+  for(const machineId of machines){
+    const response=await env.MACHINES.get(env.MACHINES.idFromName(machineId)).fetch('https://machine.internal/_internal/reap',{
+      method:'POST',headers:{'Content-Type':'application/json',...headers},body:JSON.stringify({dry_run:dryRun}),
+    });
+    if(!response.ok)return json({error:'session_reap_failed',machine_id:machineId,status:response.status},503);
+    results.push(await response.json() as JsonRecord);
+  }
+  return json({dry_run:dryRun,active_count_before:before,active_count_after:await activeCount(),
+    reaped:results.reduce((sum,row)=>sum+(Number(row.reaped)||0),0),
+    stop_requested:results.reduce((sum,row)=>sum+(Number(row.stop_requested)||0),0),machines:results});
 }
 
 async function machineProjection(

@@ -27,7 +27,6 @@ function request(path:string,method='GET',body?:unknown,actor:unknown=admin,mail
  const headers:Record<string,string>={'Content-Type':'application/json','x-hub2-actor':JSON.stringify(actor)};
  if(mailbox)headers['x-hub2-mailbox']=mailbox;
  if((actor as any)?.kind==='machine')headers['x-hub2-delivery-session']='session-test';
- if(path==='/_internal/release'&&body&&typeof body==='object')body={session_id:'s1',machine_id:'h1',...body as object};
  if(path.startsWith('/api/messages/')&&method==='POST'&&body&&typeof body==='object'){body={epoch:1,...body as object};if(path.endsWith('/readdress'))body={key:'test-readdress-'+(body as any).recipient,...body as object};}
  return new Request('https://hub2.test'+path,{method,headers,...(body===undefined?{}:{body:JSON.stringify(body)})});
 }
@@ -36,47 +35,33 @@ const clearFixtureCache=(core:any)=>core.db.cache.clear();
 async function data(r:Response){return await r.json() as any;}
 async function configuredAccount(){
  const s=state(),account=new AccountDO(s.ctx);
- assert.equal((await account.fetch(request('/api/account','PATCH',{provider:'synthetic',enabled:true,capacity:1,min_remaining:10}))).status,200);
+ assert.equal((await account.fetch(request('/api/account','PATCH',{provider:'synthetic',enabled:true,min_remaining:10}))).status,200);
  return {...s,account};
 }
 async function quota(account:AccountDO){return account.fetch(request('/api/account/quota','PUT',{remaining:80,captured_at:Date.now(),valid_until:Date.now()+60000,source:'synthetic-test'}));}
-const reserve={operation_id:'op1',session_id:'s1',machine_id:'h1',epoch:1,request_digest:'digest1',ttl_ms:1000};
-
-test('account refuses unknown/stale quota, enforces capacity and immutable reservation idempotency',async()=>{
- const {account}=await configuredAccount();
- assert.equal((await account.fetch(request('/api/account/reserve','POST',reserve))).status,503);
+test('account has no session reservation API or occupied-slot state',async()=>{
+ const {account,database}=await configuredAccount();
+ assert.equal((await account.fetch(request('/api/account/reserve','POST',{operation_id:'op',session_id:'s',machine_id:'m',epoch:1,request_digest:'d'}))).status,404);
+ assert.equal((await account.fetch(request('/api/account/confirm','POST',{operation_id:'op',epoch:1}))).status,404);
+ assert.equal((await account.fetch(request('/api/account/start','POST',{operation_id:'op',epoch:1}))).status,404);
+ assert.equal((await account.fetch(request('/_internal/release','POST',{operation_id:'op',epoch:1}))).status,404);
+ const view=await data(await account.fetch(request('/api/account','PATCH',{provider:'synthetic',enabled:true,min_remaining:10})));
+ assert.equal('occupied' in view.account,false);assert.equal('capacity' in view.account,false);
+ const columns=database.prepare('PRAGMA table_info(account)').all().map((row:any)=>row.name);
+ assert.equal(columns.includes('occupied'),false);assert.equal(columns.includes('capacity'),false);
+ assert.equal(database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='reservations'").get(),undefined);
  assert.equal((await quota(account)).status,200);
- const first=await data(await account.fetch(request('/api/account/reserve','POST',reserve)));
- assert.equal(first.reservation.state,'offered');
- assert.deepEqual(await data(await account.fetch(request('/api/account/reserve','POST',reserve))),first);
- assert.equal((await account.fetch(request('/api/account/reserve','POST',{...reserve,request_digest:'changed'}))).status,409);
- assert.equal((await account.fetch(request('/api/account/reserve','POST',{...reserve,epoch:2}))).status,409);
- assert.equal((await account.fetch(request('/api/account/reserve','POST',{...reserve,operation_id:'op2',session_id:'s2'}))).status,409);
- assert.equal((await account.fetch(request('/api/account/reserve','POST',reserve,{id:'agent:bad',kind:'agent',scopes:[]}))).status,403);
-});
-test('expired confirmed work retains account capacity until exact-epoch native exit proof',async()=>{
- const {account,database,ctx}=await configuredAccount();await quota(account);
- await account.fetch(request('/api/account/reserve','POST',reserve));
- assert.equal((await account.fetch(request('/api/account/confirm','POST',{operation_id:'op1',epoch:1}))).status,200);
- assert.equal((await account.fetch(request('/api/account/start','POST',{operation_id:'op1',session_id:'s1',machine_id:'h1',epoch:1}))).status,200);
- database.prepare('UPDATE reservations SET expires_at=? WHERE operation_id=?').run(Date.now()-1,'op1');clearFixtureCache(account);
- await account.alarm();assert.equal(ctx.alarm,null);
- assert.equal((database.prepare('SELECT state FROM reservations WHERE operation_id=?').get('op1') as any).state,'uncertain');
- assert.equal((await account.fetch(request('/_internal/release','POST',{operation_id:'op1',epoch:1}))).status,409);
- assert.equal((await account.fetch(request('/_internal/release','POST',{operation_id:'op1',epoch:2,native_exit_confirmed:true}))).status,409);
- assert.equal((await account.fetch(request('/api/account/reserve','POST',{...reserve,operation_id:'op2'}))).status,409);
- assert.equal((await account.fetch(request('/_internal/release','POST',{operation_id:'op1',epoch:1,native_exit_confirmed:true}))).status,200);
- assert.equal((await account.fetch(request('/_internal/release','POST',{operation_id:'op1',epoch:1,native_exit_confirmed:true}))).status,200);
- assert.equal((database.prepare('SELECT occupied FROM account WHERE id=1').get() as any).occupied,0);
-});
-test('unclaimed account hold expiry frees once; invalid quota evidence and unauthorized reset writes refuse',async()=>{
- const {account,database}=await configuredAccount();await quota(account);
- await account.fetch(request('/api/account/reserve','POST',reserve));
- database.prepare('UPDATE reservations SET expires_at=?').run(Date.now()-1);clearFixtureCache(account);await account.alarm();await account.alarm();
- assert.equal((database.prepare('SELECT occupied FROM account WHERE id=1').get() as any).occupied,0);
- assert.equal((await account.fetch(request('/api/account/confirm','POST',{operation_id:'op1',epoch:1}))).status,409);
  assert.equal((await account.fetch(request('/api/account/quota','PUT',{remaining:null,captured_at:Date.now(),valid_until:Date.now()+1000,source:'test'}))).status,400);
  assert.equal((await account.fetch(request('/api/account/resets','PUT',{id:'r1',expires_at:Date.now()+10000,available:true,source:'test'},{id:'bad',scopes:[]}))).status,403);
+});
+test('version-one account slot schema is dropped during upgrade',()=>{
+ const s=state();
+ s.database.exec("CREATE TABLE hub2_schema(singleton INTEGER PRIMARY KEY,version INTEGER NOT NULL); INSERT INTO hub2_schema VALUES(1,1); CREATE TABLE account(id INTEGER PRIMARY KEY,provider TEXT NOT NULL,enabled INTEGER NOT NULL,capacity INTEGER NOT NULL,occupied INTEGER NOT NULL DEFAULT 0,min_remaining REAL NOT NULL DEFAULT 0); CREATE TABLE reservations(operation_id TEXT PRIMARY KEY,session_id TEXT NOT NULL,machine_id TEXT NOT NULL,epoch INTEGER NOT NULL,digest TEXT NOT NULL,state TEXT NOT NULL,expires_at INTEGER NOT NULL,released_at INTEGER) WITHOUT ROWID;");
+ new AccountDO(s.ctx);
+ const columns=s.database.prepare('PRAGMA table_info(account)').all().map((row:any)=>row.name);
+ assert.equal(columns.includes('capacity'),false);assert.equal(columns.includes('occupied'),false);
+ assert.equal(s.database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='reservations'").get(),undefined);
+ assert.equal((s.database.prepare('SELECT version FROM hub2_schema WHERE singleton=1').get() as any).version,2);
 });
 function mailboxes(){
  const flags={blockReceipts:false,blockDirectory:false,blockMachine:false,failWakeAfterEffect:false,afterRecipient:undefined as undefined|(()=>Promise<void>)};
@@ -143,7 +128,7 @@ test('central credential generations are encrypted, CAS fenced and provisioned o
   throw new Error('unexpected test provider URL');
  };
  const account=new AccountDO(s.ctx,{HUB2_CREDENTIAL_KEY:'11'.repeat(32),HUB2_PROVIDER_FETCH:provider as any});
- await account.fetch(request('/api/account','PATCH',{provider:'codex',enabled:true,capacity:1}));
+ await account.fetch(request('/api/account','PATCH',{provider:'codex',enabled:true}));
  const files={'.codex/auth.json':JSON.stringify({tokens:{access_token:'synthetic-access',refresh_token:'synthetic-refresh'},last_refresh:'2000-01-01T00:00:00Z'})};
  assert.equal((await account.fetch(request('/api/account/credentials','PUT',{files,expected_generation:0}))).status,200);
  const stored=(s.database.prepare('SELECT sealed FROM credentials WHERE id=1').get() as any).sealed;assert.equal(stored.includes('synthetic-access'),false);
@@ -155,7 +140,7 @@ test('central credential generations are encrypted, CAS fenced and provisioned o
  assert.equal((await account.fetch(request('/api/account/credentials','POST',{generation:1},host))).status,409);
  assert.equal((await account.fetch(request('/api/account/credentials','POST',{generation:2},host))).status,200);
  await account.fetch(request('/api/account/hosts','PUT',{hosts:[]}));assert.equal((await account.fetch(request('/api/account/credentials','GET',undefined,host))).status,403);
- assert.equal((await account.fetch(request('/api/account','PATCH',{provider:'claude',enabled:true,capacity:1}))).status,409);
+ assert.equal((await account.fetch(request('/api/account','PATCH',{provider:'claude',enabled:true}))).status,409);
 });
 test('scheduled provider discovery records real quota, reset expiry alerts, and deduplicates alert stages',async()=>{
  const s=state();const called:string[]=[];const expiry=Date.now()+40*3600000;
@@ -165,7 +150,7 @@ test('scheduled provider discovery records real quota, reset expiry alerts, and 
   throw new Error('unexpected URL');
  };
  const account=new AccountDO(s.ctx,{HUB2_CREDENTIAL_KEY:'22'.repeat(32),HUB2_PROVIDER_FETCH:provider as any});
- await account.fetch(request('/api/account','PATCH',{provider:'codex',enabled:true,capacity:1}));
+ await account.fetch(request('/api/account','PATCH',{provider:'codex',enabled:true}));
  await account.fetch(request('/api/account/credentials','PUT',{files:{'.codex/auth.json':JSON.stringify({tokens:{access_token:'synthetic-access',refresh_token:'synthetic-refresh'}})},expected_generation:0}));
  await account.fetch(request('/api/account/discovery','PUT',{enabled:true,interval_ms:21600000}));
  s.database.prepare('UPDATE discovery SET next_at=? WHERE id=1').run(Date.now()-1);clearFixtureCache(account);await account.alarm();assert.equal(called.length,2);
@@ -178,7 +163,7 @@ test('scheduled provider discovery records real quota, reset expiry alerts, and 
 });
 test('unknown provider collector fails closed with an explicit discovery alert, never a fabricated quota',async()=>{
  const s=state(),account=new AccountDO(s.ctx,{HUB2_CREDENTIAL_KEY:'33'.repeat(32)});
- await account.fetch(request('/api/account','PATCH',{provider:'gemini',enabled:true,capacity:1}));
+ await account.fetch(request('/api/account','PATCH',{provider:'gemini',enabled:true}));
  await account.fetch(request('/api/account/credentials','PUT',{files:{'.gemini/oauth_creds.json':'{"access_token":"synthetic"}'},expected_generation:0}));
  const result=await account.fetch(request('/api/account/discovery','POST',{}));assert.equal(result.status,503);
  const observed=await data(await account.fetch(request('/api/account/quota')));assert.equal(observed.quota,null);assert.equal(observed.fresh,false);
@@ -203,7 +188,7 @@ test('refresh has one owner and a host revoked during refresh receives no creden
  const gate=new Promise<void>(resolve=>{release=resolve;}),seen=new Promise<void>(resolve=>{started=resolve;});
  const provider=async(url:string)=>{assert.equal(url,'https://auth.openai.com/oauth/token');refreshes++;started();await gate;return Response.json({access_token:'rotated-synthetic',refresh_token:'rotated-refresh'});};
  const account=new AccountDO(s.ctx,{HUB2_CREDENTIAL_KEY:'44'.repeat(32),HUB2_PROVIDER_FETCH:provider as any});
- await account.fetch(request('/api/account','PATCH',{provider:'codex',enabled:true,capacity:1}));
+ await account.fetch(request('/api/account','PATCH',{provider:'codex',enabled:true}));
  await account.fetch(request('/api/account/credentials','PUT',{files:{'.codex/auth.json':JSON.stringify({tokens:{access_token:'synthetic-old',refresh_token:'synthetic-refresh'}})},expected_generation:0}));
  await account.fetch(request('/api/account/hosts','PUT',{hosts:['h1']}));const host={id:'machine:h1',kind:'machine',resource_id:'h1',scopes:[]};
  const first=account.fetch(request('/api/account/credentials','GET',undefined,host));await seen;
@@ -211,20 +196,20 @@ test('refresh has one owner and a host revoked during refresh receives no creden
  assert.equal((await account.fetch(request('/api/account/credentials','PUT',{files:{'.codex/auth.json':JSON.stringify({tokens:{access_token:'other',refresh_token:'other'}})},expected_generation:1}))).status,409);
  await account.fetch(request('/api/account/hosts','PUT',{hosts:[]}));release();const response=await first;assert.equal(response.status,403);assert.equal(refreshes,1);assert.equal((await response.text()).includes('rotated-synthetic'),false);
 });
-test('failed provider quota invalidates a prior fresh observation and refuses admission',async()=>{
+test('failed quota collection invalidates the weight observation but does not block credential delivery',async()=>{
  const s=state(),account=new AccountDO(s.ctx,{HUB2_CREDENTIAL_KEY:'55'.repeat(32),HUB2_PROVIDER_FETCH:(async()=>new Response('{}',{status:503})) as any});
- await account.fetch(request('/api/account','PATCH',{provider:'codex',enabled:true,capacity:1}));
- await account.fetch(request('/api/account/credentials','PUT',{files:{'.codex/auth.json':JSON.stringify({tokens:{access_token:'synthetic',refresh_token:'synthetic'}})},expected_generation:0}));await quota(account);
+ await account.fetch(request('/api/account','PATCH',{provider:'go',enabled:true}));
+ await account.fetch(request('/api/account/credentials','PUT',{files:{'.local/share/opencode-hub/device-auth.json':JSON.stringify([{active:true,value:{access:'synthetic'}}])},expected_generation:0}));await quota(account);
  await account.fetch(request('/api/account/hosts','PUT',{hosts:['h1']}));
  assert.equal((await account.fetch(request('/api/account/discovery','POST',{}))).status,503);
  assert.equal((await data(await account.fetch(request('/api/account/quota')))).fresh,false);
- assert.equal((await account.fetch(request('/api/account/reserve','POST',reserve))).status,503);
+ assert.equal((await account.fetch(request('/api/account/credentials','GET',undefined,{id:'machine:h1',kind:'machine',resource_id:'h1',scopes:[]}))).status,200);
 });
 test('an older failed probe cannot invalidate a newer successful observation',async()=>{
  const s=state();let release!:()=>void,started!:()=>void;const gate=new Promise<void>(r=>{release=r;}),seen=new Promise<void>(r=>{started=r;});let calls=0;
  const provider=async(url:string)=>{if(url.endsWith('/usage')){calls++;if(calls===1){started();await gate;return new Response('{}',{status:503});}return Response.json({rate_limit:{primary_window:{used_percent:10}}});}return Response.json({credits:[]});};
  const account=new AccountDO(s.ctx,{HUB2_CREDENTIAL_KEY:'66'.repeat(32),HUB2_PROVIDER_FETCH:provider as any});
- await account.fetch(request('/api/account','PATCH',{provider:'codex',enabled:true,capacity:1}));
+ await account.fetch(request('/api/account','PATCH',{provider:'codex',enabled:true}));
  await account.fetch(request('/api/account/credentials','PUT',{files:{'.codex/auth.json':JSON.stringify({tokens:{access_token:'synthetic',refresh_token:'synthetic'}})},expected_generation:0}));
  const older=account.fetch(request('/api/account/discovery','POST',{}));await seen;
  assert.equal((await account.fetch(request('/api/account/discovery','POST',{}))).status,200);release();assert.equal((await older).status,409);
@@ -240,7 +225,7 @@ test('reset-only transport and parsing failures preserve separately proved provi
  for(const failure of ['transport','json','oversize']){
   const s=state(),provider=async(url:string)=>{if(url.endsWith('/usage'))return Response.json({rate_limit:{primary_window:{used_percent:5}}});if(failure==='transport')throw new Error('synthetic transport failure');return failure==='json'?new Response('invalid json'):new Response('x'.repeat(131073));};
   const account=new AccountDO(s.ctx,{HUB2_CREDENTIAL_KEY:'77'.repeat(32),HUB2_PROVIDER_FETCH:provider as any});
-  await account.fetch(request('/api/account','PATCH',{provider:'codex',enabled:true,capacity:1}));
+  await account.fetch(request('/api/account','PATCH',{provider:'codex',enabled:true}));
   await account.fetch(request('/api/account/credentials','PUT',{files:{'.codex/auth.json':JSON.stringify({tokens:{access_token:'synthetic',refresh_token:'synthetic'}})},expected_generation:0}));
   assert.equal((await account.fetch(request('/api/account/discovery','POST',{}))).status,503);
   const current=await data(await account.fetch(request('/api/account/quota')));assert.equal(current.fresh,true,failure);assert.equal(current.quota.remaining,95);
@@ -249,7 +234,7 @@ test('reset-only transport and parsing failures preserve separately proved provi
 test('approved host refresh lease supports blocked-egress repair, CAS writeback, rejection, and candidate reconciliation',async()=>{
  const s=state();let providerCalls=0;const provider=async(url:string)=>{providerCalls++;assert.equal(url,'https://chatgpt.com/backend-api/wham/usage');return Response.json({rate_limit:{primary_window:{used_percent:10}}});};
  const account=new AccountDO(s.ctx,{HUB2_CREDENTIAL_KEY:'88'.repeat(32),HUB2_PROVIDER_FETCH:provider as any});
- await account.fetch(request('/api/account','PATCH',{provider:'codex',enabled:true,capacity:1}));
+ await account.fetch(request('/api/account','PATCH',{provider:'codex',enabled:true}));
  const auth=(stamp:string,token:string)=>({'.codex/auth.json':JSON.stringify({tokens:{access_token:token,refresh_token:'synthetic-refresh'},last_refresh:stamp})});
  await account.fetch(request('/api/account/credentials','PUT',{files:auth('2000-01-01T00:00:00Z','synthetic-old'),expected_generation:0}));await account.fetch(request('/api/account/hosts','PUT',{hosts:['h1','h2']}));
  const h1={id:'machine:h1',kind:'machine',resource_id:'h1',scopes:[]},h2={id:'machine:h2',kind:'machine',resource_id:'h2',scopes:[]};
@@ -268,48 +253,29 @@ test('approved host refresh lease supports blocked-egress repair, CAS writeback,
 });
 test('credential ciphertext authenticates provider and generation as well as object identity',async()=>{
  const s=state(),account=new AccountDO(s.ctx,{HUB2_CREDENTIAL_KEY:'99'.repeat(32)});
- await account.fetch(request('/api/account','PATCH',{provider:'gemini',enabled:true,capacity:1}));
+ await account.fetch(request('/api/account','PATCH',{provider:'gemini',enabled:true}));
  await account.fetch(request('/api/account/credentials','PUT',{files:{'.gemini/oauth_creds.json':'{"access_token":"synthetic"}'},expected_generation:0}));await account.fetch(request('/api/account/hosts','PUT',{hosts:['h1']}));
  const host={id:'machine:h1',kind:'machine',resource_id:'h1',scopes:[]};
  s.database.prepare('UPDATE credentials SET generation=2 WHERE id=1').run();clearFixtureCache(account);assert.equal((await account.fetch(request('/api/account/credentials','GET',undefined,host))).status,503);
  s.database.prepare('UPDATE credentials SET generation=1 WHERE id=1').run();clearFixtureCache(account);s.database.prepare('UPDATE account SET provider=? WHERE id=1').run('zai');clearFixtureCache(account);assert.equal((await account.fetch(request('/api/account/credentials','GET',undefined,host))).status,503);
 });
-test('provider limit_reached overrides apparently positive quota and preserves actual reset timestamp',async()=>{
+test('provider limit_reached updates quota for picker weighting without a reservation gate',async()=>{
  const s=state(),reset=Math.floor(Date.now()/1000)+3600;
  const provider=async(url:string)=>url.endsWith('/usage')?Response.json({rate_limit:{limit_reached:true,primary_window:{used_percent:5,reset_at:reset}}}):Response.json({credits:[]});
  const account=new AccountDO(s.ctx,{HUB2_CREDENTIAL_KEY:'aa'.repeat(32),HUB2_PROVIDER_FETCH:provider as any});
- await account.fetch(request('/api/account','PATCH',{provider:'codex',enabled:true,capacity:1}));
+ await account.fetch(request('/api/account','PATCH',{provider:'codex',enabled:true}));
  await account.fetch(request('/api/account/credentials','PUT',{files:{'.codex/auth.json':JSON.stringify({tokens:{access_token:'synthetic',refresh_token:'synthetic'}})},expected_generation:0}));
  assert.equal((await account.fetch(request('/api/account/discovery','POST',{}))).status,200);const observed=await data(await account.fetch(request('/api/account/quota')));assert.equal(observed.quota.remaining,0);assert.equal(observed.quota.reset_at,reset*1000);
- assert.equal((await account.fetch(request('/api/account/reserve','POST',reserve))).status,409);
+ assert.equal((await account.fetch(request('/api/account/reserve','POST',{}))).status,404);
 });
 test('OpenCode Go central collector accepts maintained active-device array and real usage shape',async()=>{
  const s=state();let calls=0;const provider=async(url:string,init:any)=>{calls++;assert.equal(url,'https://opencode.ai/zen/go/v1/usage');assert.equal(init.headers['User-Agent'],'opencode/1.19');return Response.json({usage:{rolling:{percent:10,resetsAt:'2026-11-05T00:00:00Z'},weekly:{usagePercent:30},monthly:{percent:60}}});};
  const account=new AccountDO(s.ctx,{HUB2_CREDENTIAL_KEY:'bb'.repeat(32),HUB2_PROVIDER_FETCH:provider as any});
- await account.fetch(request('/api/account','PATCH',{provider:'go',enabled:true,capacity:1}));
+ await account.fetch(request('/api/account','PATCH',{provider:'go',enabled:true}));
  const files={'.local/share/opencode-hub/device-auth.json':JSON.stringify([{active:false,value:{access:'unused'}},{active:true,value:{access:'synthetic-active'}}])};
  assert.equal((await account.fetch(request('/api/account/credentials','PUT',{files,expected_generation:0}))).status,200);
  assert.equal((await account.fetch(request('/api/account/discovery','POST',{}))).status,200);
  const observed=await data(await account.fetch(request('/api/account/quota')));assert.equal(observed.quota.remaining,40);assert.equal(observed.fresh,true);assert.equal(calls,1);
-});
-test('confirmed pre-offer reservation survives restart until exact unclaimed expiry proof; start replay is fenced',async()=>{
- const {account,database,ctx}=await configuredAccount();await quota(account);await account.fetch(request('/api/account/reserve','POST',reserve));
- assert.equal((await data(await account.fetch(request('/api/account/confirm','POST',{operation_id:'op1',epoch:1})))).reservation.state,'confirmed');
- assert.equal((await account.fetch(request('/api/account/confirm','POST',{operation_id:'op1',epoch:1}))).status,200);
- database.prepare('UPDATE reservations SET expires_at=?').run(Date.now()-1);clearFixtureCache(account);await account.alarm();assert.equal((database.prepare('SELECT state FROM reservations').get() as any).state,'awaiting-unclaimed-proof');
- const restarted=new AccountDO(ctx);const proof={kind:'offer-expired-unclaimed',operation_id:'op1',session_id:'s1',machine_id:'h1',epoch:1,observed_at:Date.now(),offer_expires_at:Date.now()-1000};
- assert.equal((await restarted.fetch(request('/_internal/release','POST',{operation_id:'op1',epoch:1,unclaimed_proof:{...proof,machine_id:'wrong'}}))).status,409);
- assert.equal((database.prepare('SELECT occupied FROM account').get() as any).occupied,1);
- assert.equal((await restarted.fetch(request('/_internal/release','POST',{operation_id:'op1',epoch:1,unclaimed_proof:proof}))).status,200);
- assert.equal((await restarted.fetch(request('/_internal/release','POST',{operation_id:'op1',epoch:1,unclaimed_proof:proof}))).status,200);
- assert.equal((database.prepare('SELECT occupied FROM account').get() as any).occupied,0);
- const next={...reserve,operation_id:'op2',session_id:'s2'};await restarted.fetch(request('/api/account/reserve','POST',next));
- assert.equal((await restarted.fetch(request('/api/account/start','POST',{operation_id:'op2',session_id:'s2',machine_id:'h1',epoch:1}))).status,409);
- await restarted.fetch(request('/api/account/confirm','POST',{operation_id:'op2',epoch:1}));const start={operation_id:'op2',session_id:'s2',machine_id:'h1',epoch:1};
- assert.equal((await restarted.fetch(request('/api/account/start','POST',start))).status,200);
- assert.equal((await restarted.fetch(request('/api/account/start','POST',start))).status,200);
- assert.equal((await restarted.fetch(request('/api/account/start','POST',{...start,session_id:'other'}))).status,409);
- assert.equal((database.prepare('SELECT occupied FROM account').get() as any).occupied,1);
 });
 test('caller epoch and readdress keys prevent stale receipts and delayed retries undoing a newer route',async()=>{
  const m=mailboxes(),sent=(await data(await m.fetch('agent:a','/api/messages','POST',{recipient:'agent:b',body:'route',key:'route-fence'}))).message;
@@ -341,7 +307,7 @@ test('native delivery claim is intent only, blocks readdress under uncertainty, 
 test('refresh response not safely published stays reconciliable and is never blindly reissued',async()=>{
  const s=state();let refreshes=0;const env:any={HUB2_CREDENTIAL_KEY:'cc'.repeat(32)};
  env.HUB2_PROVIDER_FETCH=async(url:string)=>{assert.equal(url,'https://auth.openai.com/oauth/token');refreshes++;env.HUB2_CREDENTIAL_KEY='invalid-key';return Response.json({access_token:'synthetic-rotated',refresh_token:'synthetic-rotated-refresh'});};
- const account=new AccountDO(s.ctx,env);await account.fetch(request('/api/account','PATCH',{provider:'codex',enabled:true,capacity:1}));
+ const account=new AccountDO(s.ctx,env);await account.fetch(request('/api/account','PATCH',{provider:'codex',enabled:true}));
  await account.fetch(request('/api/account/credentials','PUT',{files:{'.codex/auth.json':JSON.stringify({tokens:{access_token:'synthetic',refresh_token:'synthetic'}})},expected_generation:0}));await account.fetch(request('/api/account/hosts','PUT',{hosts:['h1']}));const host={id:'machine:h1',kind:'machine',resource_id:'h1',scopes:[]};
  assert.equal((await account.fetch(request('/api/account/credentials','GET',undefined,host))).status,503);assert.equal(refreshes,1);
  const attempt=s.database.prepare('SELECT state,sealed FROM credential_candidates WHERE base_generation=1').get() as any;assert.equal(attempt.state,'issued');assert.equal(attempt.sealed,'');
@@ -351,7 +317,7 @@ test('refresh response not safely published stays reconciliable and is never bli
 });
 test('expired host refresh permit remains uncertain until its exact owner proves no request occurred',async()=>{
  const s=state(),account=new AccountDO(s.ctx,{HUB2_CREDENTIAL_KEY:'dd'.repeat(32)});
- await account.fetch(request('/api/account','PATCH',{provider:'gemini',enabled:true,capacity:1}));await account.fetch(request('/api/account/credentials','PUT',{files:{'.gemini/oauth_creds.json':'{"access_token":"synthetic"}'},expected_generation:0}));await account.fetch(request('/api/account/hosts','PUT',{hosts:['h1','h2']}));
+ await account.fetch(request('/api/account','PATCH',{provider:'gemini',enabled:true}));await account.fetch(request('/api/account/credentials','PUT',{files:{'.gemini/oauth_creds.json':'{"access_token":"synthetic"}'},expected_generation:0}));await account.fetch(request('/api/account/hosts','PUT',{hosts:['h1','h2']}));
  const h1={id:'machine:h1',kind:'machine',resource_id:'h1',scopes:[]},h2={...h1,id:'machine:h2',resource_id:'h2'};
  const lease=await data(await account.fetch(request('/api/account/refresh-lease','POST',{generation:1},h1)));
  s.database.prepare('UPDATE credentials SET refresh_until=?').run(Date.now()-1);clearFixtureCache(account);
@@ -364,7 +330,7 @@ test('expired host refresh permit remains uncertain until its exact owner proves
 });
 test('host rotation rejects primitive GO JSON instead of publishing a broken generation',async()=>{
  const s=state(),account=new AccountDO(s.ctx,{HUB2_CREDENTIAL_KEY:'ee'.repeat(32)});
- await account.fetch(request('/api/account','PATCH',{provider:'go',enabled:true,capacity:1}));
+ await account.fetch(request('/api/account','PATCH',{provider:'go',enabled:true}));
  const files={'.local/share/opencode-hub/device-auth.json':JSON.stringify([{active:true,value:{access:'synthetic'}}])};await account.fetch(request('/api/account/credentials','PUT',{files,expected_generation:0}));await account.fetch(request('/api/account/hosts','PUT',{hosts:['h1']}));
  const host={id:'machine:h1',kind:'machine',resource_id:'h1',scopes:[]};assert.equal((await account.fetch(request('/api/account/rotation','POST',{files:{'.local/share/opencode-hub/device-auth.json':'1'},expected_generation:1},host))).status,400);
  assert.equal((s.database.prepare('SELECT generation FROM credentials').get() as any).generation,1);
@@ -422,17 +388,6 @@ test('unrouted native producer is idle until explicit durable directory wake, th
  assert.equal((store.database.prepare('SELECT state FROM native_outbox').get() as any).state,'queued');
  assert.equal(m.nativeCalls.filter(c=>c.path.endsWith('/mail')&&c.body.message_id===sent.id).length,1);
 });
-test('account public release is unavailable and internal release binds exact machine/session even on replay',async()=>{
- const {account,database}=await configuredAccount();await quota(account);await account.fetch(request('/api/account/reserve','POST',reserve));await account.fetch(request('/api/account/confirm','POST',{operation_id:'op1',epoch:1}));await account.fetch(request('/api/account/start','POST',{operation_id:'op1',session_id:'s1',machine_id:'h1',epoch:1}));
- const proof={operation_id:'op1',session_id:'s1',machine_id:'h1',epoch:1,native_exit_confirmed:true};
- assert.equal((await account.fetch(request('/api/account/release','POST',proof))).status,404);
- assert.equal((await account.fetch(request('/_internal/release','POST',{...proof,machine_id:'other'}))).status,409);
- assert.equal((database.prepare('SELECT occupied FROM account').get() as any).occupied,1);
- assert.equal((await account.fetch(request('/_internal/release','POST',proof))).status,200);
- assert.equal((await account.fetch(request('/_internal/release','POST',{...proof,session_id:'other'}))).status,409);
- assert.equal((await account.fetch(request('/_internal/release','POST',proof))).status,200);
-});
-
 test('actual forward update atomically journals wake and effect-then503 survives Control restart',async()=>{
  const m=mailboxes();m.controlState.database.prepare("UPDATE named_agents SET forward_session=NULL WHERE id='agent:b'").run();clearFixtureCache(m.control);
  await m.fetch('agent:a','/api/messages','POST',{recipient:'agent:b',body:'wake via control',key:'actual-forward'});
@@ -506,7 +461,7 @@ test('zai-central imports plaintext coding-plan key, collects maintained token w
  const s=state();s.ctx.id={name:'zai-central',toString:()=> 'synthetic-zai-central'};const calls:string[]=[];let unauthorized=false,invalid=false;
  const provider=async(url:string,init:any)=>{calls.push(url);assert.equal(url,'https://api.z.ai/api/monitor/usage/quota/limit');assert.equal(init.headers.Authorization,'Bearer synthetic-zai-coding-key');return unauthorized?new Response('{}',{status:401}):Response.json(invalid?{data:{limits:[{type:'TOKENS_LIMIT',unit:3}]}}:{data:{limits:[{type:'TOKENS_LIMIT',unit:3,percentage:12,nextResetTime:Date.now()+18000000},{type:'TOKENS_LIMIT',unit:6,percentage:41,nextResetTime:Date.now()+604800000},{type:'TIME_LIMIT',unit:5,percentage:0}]}});};
  const account=new AccountDO(s.ctx,{HUB2_CREDENTIAL_KEY:'44'.repeat(32),HUB2_PROVIDER_FETCH:provider as any});
- assert.equal((await account.fetch(request('/api/account','PATCH',{provider:'zai',capacity:1,enabled:true}))).status,200);
+ assert.equal((await account.fetch(request('/api/account','PATCH',{provider:'zai',enabled:true}))).status,200);
  const files={'.config/goz/config.json':JSON.stringify({zai_token:'synthetic-zai-coding-key'})};
  assert.equal((await account.fetch(request('/api/account/credentials','PUT',{files,expected_generation:0,account_id:'shared-zai',provider:'zai'}))).status,400);
  assert.equal((await account.fetch(request('/api/account/credentials','PUT',{files:{'.config/goz/config.json':'{"zai_token":"enc:v1:encrypted"}'},expected_generation:0}))).status,400);
@@ -523,7 +478,7 @@ test('zai-central imports plaintext coding-plan key, collects maintained token w
 });
 test('zai configuration and policy refuse retired account aliases without banning the maintained engine name',async()=>{
  const s=state();s.ctx.id={name:'shared-zai',toString:()=> 'synthetic-retired'};const account=new AccountDO(s.ctx);
- assert.equal((await account.fetch(request('/api/account','PATCH',{provider:'zai',capacity:1,enabled:true}))).status,400);
+ assert.equal((await account.fetch(request('/api/account','PATCH',{provider:'zai',enabled:true}))).status,400);
  const control=new ControlDO(state().ctx,{} as any),candidate={id:'central',engine:'zcodex',model:'glm-flash',account_id:'zai-central',weight:1,capabilities:['interactive'],enabled:true};
  assert.equal((await control.fetch(request('/api/model-policy','PUT',{candidates:[{...candidate,account_id:'shared-zai'}]}))).status,400);
  assert.equal((await control.fetch(request('/api/model-policy','PUT',{candidates:[{...candidate,account_id:'zcodex'}]}))).status,400);
@@ -555,7 +510,7 @@ test('picker routing refreshes expiring Claude OAuth and alerts while excluding 
   throw Error('unexpected deterministic Claude provider URL');
  };
  const account=new AccountDO(s.ctx,{HUB2_CREDENTIAL_KEY:'cc'.repeat(32),HUB2_PROVIDER_FETCH:provider as any});
- await account.fetch(request('/api/account','PATCH',{provider:'claude',enabled:true,capacity:2,min_remaining:10}));
+ await account.fetch(request('/api/account','PATCH',{provider:'claude',enabled:true,min_remaining:10}));
  await account.fetch(request('/api/account/credentials','PUT',{expected_generation:0,files:{'.claude/.credentials.json':JSON.stringify({claudeAiOauth:{accessToken:'synthetic-expired-access',refreshToken:'synthetic-rejected-refresh',expiresAt:Date.now()-1000}})}}));
  await account.fetch(request('/api/account/quota','PUT',{remaining:80,captured_at:Date.now(),valid_until:Date.now()+60000,source:'provider:claude:generation:1'}));
  const expired=await data(await account.fetch(request('/_internal/routing')));
@@ -592,7 +547,7 @@ test('stale authorized views and placement coalesce with actual scheduled collec
  const s=state();let calls=0,release!:()=>void,entered!:()=>void;const waiting=new Promise<void>(r=>entered=r),gate=new Promise<void>(r=>release=r);
  const provider=async()=>{calls++;entered();await gate;return Response.json({usage:{rolling:{percent:20},weekly:{usagePercent:30}}});};
  const account=new AccountDO(s.ctx,{HUB2_CREDENTIAL_KEY:'55'.repeat(32),HUB2_PROVIDER_FETCH:provider as any});
- await account.fetch(request('/api/account','PATCH',{provider:'go',capacity:1,enabled:true}));
+ await account.fetch(request('/api/account','PATCH',{provider:'go',enabled:true}));
  await account.fetch(request('/api/account/credentials','PUT',{expected_generation:0,files:{'.local/share/opencode-hub/device-auth.json':JSON.stringify([{active:true,value:{access:'synthetic-go-token'}}])}}));
  await account.fetch(request('/api/account/discovery','PUT',{enabled:true,interval_ms:21600000}));
  (account as any).db.run('UPDATE discovery SET next_at=?',Date.now()-1);
@@ -605,7 +560,7 @@ test('stale authorized views and placement coalesce with actual scheduled collec
 });
 test('failed lazy probe has durable backoff while explicit operator probe can repair immediately',async()=>{
  const s=state();let calls=0,fail=true;const account=new AccountDO(s.ctx,{HUB2_CREDENTIAL_KEY:'66'.repeat(32),HUB2_PROVIDER_FETCH:(async()=>{calls++;return fail?new Response('{}',{status:503}):Response.json({usage:{rolling:{percent:10}}});}) as any});
- await account.fetch(request('/api/account','PATCH',{provider:'go',capacity:1,enabled:true}));
+ await account.fetch(request('/api/account','PATCH',{provider:'go',enabled:true}));
  await account.fetch(request('/api/account/credentials','PUT',{expected_generation:0,files:{'.local/share/opencode-hub/device-auth.json':JSON.stringify([{active:true,value:{access:'synthetic-go-token'}}])}}));
  assert.equal((await data(await account.fetch(request('/api/account/quota')))).fresh,false);
  assert.equal((await data(await account.fetch(request('/_internal/routing')))).fresh,false);assert.equal(calls,1);
@@ -617,7 +572,7 @@ test('failed lazy probe has durable backoff while explicit operator probe can re
 
 test('default native homes receive access-only material and approved host metadata is account scoped',async()=>{
  const s=state(),expiry=Math.floor(Date.now()/1000)+864000,token='e30.'+btoa(JSON.stringify({exp:expiry})).replaceAll('=','')+'.synthetic',account=new AccountDO(s.ctx,{HUB2_CREDENTIAL_KEY:'77'.repeat(32),HUB2_PROVIDER_FETCH:(async(url:any)=>Response.json(String(url).includes('resetcredits')?{credits:[]}:{rate_limit:{primary_window:{used_percent:20,reset_at:expiry},secondary_window:{used_percent:30,reset_at:expiry}}})) as any});
- await account.fetch(request('/api/account','PATCH',{provider:'codex',capacity:1,enabled:true}));
+ await account.fetch(request('/api/account','PATCH',{provider:'codex',enabled:true}));
  const files={'.codex/auth.json':JSON.stringify({tokens:{access_token:token,refresh_token:'synthetic-controller-refresh'},last_refresh:new Date().toISOString()})};
  await account.fetch(request('/api/account/credentials','PUT',{expected_generation:0,files}));
  const host={id:'machine:h1',kind:'machine',resource_id:'h1',scopes:[]};
@@ -633,7 +588,7 @@ test('default native homes receive access-only material and approved host metada
 });
 test('expired issued refresh permit still fences a different host rotation and wrong material retrieval',async()=>{
  const s=state(),account=new AccountDO(s.ctx,{HUB2_CREDENTIAL_KEY:'88'.repeat(32)}),h1={id:'machine:h1',kind:'machine',resource_id:'h1',scopes:[]},h2={...h1,id:'machine:h2',resource_id:'h2'};
- await account.fetch(request('/api/account','PATCH',{provider:'codex',capacity:1,enabled:true}));
+ await account.fetch(request('/api/account','PATCH',{provider:'codex',enabled:true}));
  const auth=(stamp:string)=>({'.codex/auth.json':JSON.stringify({tokens:{access_token:'synthetic-access',refresh_token:'synthetic-refresh'},last_refresh:stamp})});
  await account.fetch(request('/api/account/credentials','PUT',{expected_generation:0,files:auth('2026-11-01T00:00:00Z')}));
  await account.fetch(request('/api/account/hosts','PUT',{hosts:['h1','h2']}));
@@ -646,7 +601,7 @@ test('expired issued refresh permit still fences a different host rotation and w
 });
 test('refresh material export rechecks the exact permit after real decrypt completes asynchronously',async()=>{
  const s=state(),account=new AccountDO(s.ctx,{HUB2_CREDENTIAL_KEY:'99'.repeat(32)}),h1={id:'machine:h1',kind:'machine',resource_id:'h1',scopes:[]},h2={...h1,id:'machine:h2',resource_id:'h2'};
- await account.fetch(request('/api/account','PATCH',{provider:'codex',capacity:1,enabled:true}));
+ await account.fetch(request('/api/account','PATCH',{provider:'codex',enabled:true}));
  await account.fetch(request('/api/account/credentials','PUT',{expected_generation:0,files:{'.codex/auth.json':JSON.stringify({tokens:{access_token:'synthetic-access',refresh_token:'synthetic-refresh'},last_refresh:new Date().toISOString()})}}));
  await account.fetch(request('/api/account/hosts','PUT',{hosts:['h1','h2']}));
  const lease=await data(await account.fetch(request('/api/account/refresh-lease','POST',{generation:1},h1)));
@@ -657,7 +612,7 @@ test('refresh material export rechecks the exact permit after real decrypt compl
  assert.equal((await account.fetch(request('/api/account/refresh-lease','POST',{generation:1},h2))).status,200);
  release();const refused=await pending;assert.equal(refused.status,409);assert.equal((await data(refused)).files,undefined);
 });
-test('minimum-validity provisioning collects genuine same-generation quota after central refresh and fails before launch if unavailable',async()=>{
+test('credential provisioning remains independent of quota freshness',async()=>{
  const s=state(),exp=Math.floor(Date.now()/1000)+14400,jwt=(expiry:number)=>'e30.'+btoa(JSON.stringify({exp:expiry})).replaceAll('=','')+'.synthetic';let refreshes=0,usage=0,fail=true;
  const provider=async(url:string)=>{
   if(url==='https://auth.openai.com/oauth/token'){refreshes++;return Response.json({access_token:jwt(exp),refresh_token:'synthetic-new-controller'});}
@@ -666,32 +621,27 @@ test('minimum-validity provisioning collects genuine same-generation quota after
   throw Error('unexpected deterministic provider URL');
  };
  const account=new AccountDO(s.ctx,{HUB2_CREDENTIAL_KEY:'aa'.repeat(32),HUB2_PROVIDER_FETCH:provider as any}),host={id:'machine:h1',kind:'machine',resource_id:'h1',scopes:[]};
- await account.fetch(request('/api/account','PATCH',{provider:'codex',enabled:true,capacity:1}));
+ await account.fetch(request('/api/account','PATCH',{provider:'codex',enabled:true}));
  await account.fetch(request('/api/account/credentials','PUT',{expected_generation:0,files:{'.codex/auth.json':JSON.stringify({tokens:{access_token:jwt(1),refresh_token:'synthetic-old-controller'},last_refresh:'2000-01-01T00:00:00Z'})}}));
  await account.fetch(request('/api/account/hosts','PUT',{hosts:['h1']}));
- const path='/api/account/credentials?min_validity_ms=7560000',denied=await account.fetch(request(path,'GET',undefined,host));assert.equal(denied.status,503);assert.equal((await data(denied)).files,undefined);assert.equal(refreshes,1);assert.equal(usage,1);
- fail=false;assert.equal((await account.fetch(request('/api/account/discovery','POST',{}))).status,200);
- const granted=await data(await account.fetch(request(path,'GET',undefined,host)));assert.equal(granted.generation,2);assert.equal(granted.refresh_material,false);assert.equal(refreshes,1);
+ const path='/api/account/credentials?min_validity_ms=7560000';
+ assert.equal((await account.fetch(request('/api/account/discovery','POST',{}))).status,503);assert.equal(usage,1);
+ const granted=await data(await account.fetch(request(path,'GET',undefined,host)));assert.equal(granted.generation,2);assert.equal(granted.refresh_material,false);assert.equal(refreshes,1);assert.equal(usage,1);
+ fail=false;assert.equal((await account.fetch(request('/api/account/discovery','POST',{}))).status,200);assert.equal(usage,2);
  const quota=await data(await account.fetch(request('/api/account/quota')));assert.equal(quota.fresh,true);assert.equal(quota.quota.source,'provider:codex:generation:2');
 });
-test('current host approval and credential generation rejection fence reserve confirm and admission without freeing uncertain effects',async()=>{
+test('credential delivery still requires an approved host and recovers after generation rotation',async()=>{
  const s=state(),account=new AccountDO(s.ctx,{HUB2_CREDENTIAL_KEY:'bb'.repeat(32)}),host={id:'machine:h1',kind:'machine',resource_id:'h1',scopes:[]};
- await account.fetch(request('/api/account','PATCH',{provider:'go',enabled:true,capacity:2}));
+ await account.fetch(request('/api/account','PATCH',{provider:'go',enabled:true}));
  const files=(token:string)=>({'.local/share/opencode-hub/device-auth.json':JSON.stringify([{active:true,value:{access:token}}])});
  await account.fetch(request('/api/account/credentials','PUT',{expected_generation:0,files:files('synthetic-one')}));
- const quota=()=>account.fetch(request('/api/account/quota','PUT',{remaining:80,source:'synthetic admission fixture',captured_at:Date.now(),valid_until:Date.now()+60000}));
- await quota();const binding={operation_id:'host-policy-op',session_id:'host-policy-session',machine_id:'h1',request_digest:'synthetic',epoch:1};
- assert.equal((await account.fetch(request('/api/account/reserve','POST',binding))).status,409);
- await account.fetch(request('/api/account/hosts','PUT',{hosts:['h1']}));assert.equal((await account.fetch(request('/api/account/reserve','POST',binding))).status,200);
- await account.fetch(request('/api/account/hosts','PUT',{hosts:[]}));assert.equal((await account.fetch(request('/api/account/confirm','POST',binding))).status,409);
- assert.equal((s.database.prepare('SELECT occupied FROM account').get() as any).occupied,1);
- await account.fetch(request('/api/account/hosts','PUT',{hosts:['h1']}));assert.equal((await account.fetch(request('/api/account/confirm','POST',binding))).status,200);
- assert.equal((await account.fetch(request('/api/account/credential-rejection','POST',{generation:1,reason:'credential_rejected'},host))).status,200);
- assert.equal((await account.fetch(request('/api/account/start','POST',binding))).status,409);
- assert.equal((s.database.prepare('SELECT occupied FROM account').get() as any).occupied,1);
- await account.fetch(request('/api/account/credentials','PUT',{expected_generation:1,files:files('synthetic-two')}));await quota();
- assert.equal((await account.fetch(request('/api/account/start','POST',binding))).status,200);
- await account.fetch(request('/api/account/hosts','PUT',{hosts:[]}));assert.equal((await account.fetch(request('/api/account/start','POST',binding))).status,409);
- assert.equal((await account.fetch(request('/_internal/release','POST',{...binding,native_exit_confirmed:true}))).status,200);
- assert.equal((s.database.prepare('SELECT occupied FROM account').get() as any).occupied,0);
+ assert.equal((await account.fetch(request('/api/account/credentials','GET',undefined,host))).status,403);
+ await account.fetch(request('/api/account/hosts','PUT',{hosts:['h1']}));
+ assert.equal((await account.fetch(request('/api/account/credentials','GET',undefined,host))).status,200);
+ assert.equal((await account.fetch(request('/api/account/credential-rejection','POST',{generation:1,reason:'provider_unauthorized'},host))).status,200);
+ assert.equal((await account.fetch(request('/api/account/credentials','GET',undefined,host))).status,409);
+ await account.fetch(request('/api/account/credentials','PUT',{expected_generation:1,files:files('synthetic-two')}));
+ assert.equal((await account.fetch(request('/api/account/credentials','GET',undefined,host))).status,200);
+ await account.fetch(request('/api/account/hosts','PUT',{hosts:[]}));
+ assert.equal((await account.fetch(request('/api/account/credentials','GET',undefined,host))).status,403);
 });

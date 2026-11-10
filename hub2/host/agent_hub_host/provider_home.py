@@ -1,12 +1,13 @@
-"""Private central provider homes materialized from Hub account generations.
+"""Private provider homes materialized from Hub account credentials.
 
 This module is the minimal adapter moved into the Hub repository from the
 maintained Agent Quota Launcher's ``launcher.provider_home`` (the external
 package remains untouched for its other consumers). It materializes and
 verifies per-session private provider homes from AccountDO credential bundles
 so the Hub2 host can launch native engines directly without the external
-launcher runtime. The final pre-spawn admission gate lives in
-``native_launch`` and reuses the host's authenticated client.
+launcher runtime. The final pre-spawn check verifies the current session
+binding only; quota and credential health are handled by model choice and
+authentication fallback.
 
 No tokens are logged; failures raise typed ``ValueError`` slugs only.
 """
@@ -14,7 +15,6 @@ import base64
 import datetime
 import hashlib
 import json
-import math
 import os
 import re
 import shutil
@@ -28,8 +28,6 @@ from pathlib import Path
 PATHS = {'codex': '.codex/auth.json', 'claude': '.claude/.credentials.json',
          'go': '.local/share/opencode-hub/device-auth.json', 'zai': '.config/goz/config.json'}
 SDK_VERSIONS = {'codex': '0.166.0', 'claude': '2.1.289', 'go': '2.0.32'}
-# Matches the maintained launcher's admission floor for codex-family accounts.
-CODEX_MIN_REMAINING = 15.0
 ZAI_BASE_URL = 'https://api.z.ai/api/anthropic'
 
 
@@ -388,35 +386,20 @@ def native_environment(manifest):
     return home_environment(Path(manifest).parent / 'home', data['provider'])
 
 
-def provider_admission(manifest, client, session_id, operation_id, epoch):
-    """Final pre-spawn gate: re-verify the home and the account's live admission.
-
-    Reuses the host's authenticated client against the session admission
-    endpoint, preserving the provider generation, quota freshness and runtime
-    deadline checks between host admission and native spawn (TOCTOU guard).
-    """
+def session_binding(manifest, client, session_id, operation_id, epoch):
+    """Recheck that this accepted session is still the one being launched."""
     data = verify(manifest)
     binding = {'session_id': session_id, 'operation_id': operation_id, 'epoch': epoch,
                'account_id': data['account_id']}
     result = client.request('POST', '/api/sessions/' + session_id + '/admission',
-                            {'operation_id': operation_id, 'epoch': epoch, 'provider_check': True})
+                            {'operation_id': operation_id, 'epoch': epoch})
     if any(result.get(key) != value for key, value in binding.items()):
         raise ValueError('central_provider_binding_mismatch')
-    quota = result.get('quota', {})
     now = time.time() * 1000
-    if (result.get('launch_allowed') is not True or result.get('provider') != data['provider']
-            or result.get('credential_generation') != data['generation'] or result.get('model') != data['model']
-            or quota.get('source') != 'provider:' + data['provider'] + ':generation:' + str(data['generation'])
-            or not now - 300000 <= quota.get('captured_at', 0) <= now + 5000
-            or not now < quota.get('valid_until', 0) <= quota.get('captured_at', 0) + 300000
-            or type(quota.get('remaining')) not in (int, float) or not 0 < quota['remaining'] <= 100 or not math.isfinite(quota['remaining'])):
-        raise ValueError('central_provider_evidence_unverified')
+    if result.get('launch_allowed') is not True or result.get('model') != data['model']:
+        raise ValueError('central_provider_binding_mismatch')
     deadline = result.get('runtime_deadline')
     if type(deadline) is not int or not now < deadline <= now + 7200000:
         raise ValueError('central_runtime_deadline_unverified')
     data['runtime_deadline'] = deadline
-    if data['provider'] == 'codex' and quota['remaining'] <= CODEX_MIN_REMAINING:
-        raise ValueError('central_provider_quota_floor')
-    # The raw manifest provider is returned: the launcher adapter compares it
-    # against the route's provider field, where a go route is 'go'.
-    return {'provider': data['provider'], 'model': data['model']}, data
+    return data
