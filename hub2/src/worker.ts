@@ -823,6 +823,7 @@ async function machineProjection(
     limit = Number(q.get('limit') || 25);
   if (!Number.isInteger(limit) || limit < 1 || limit > (sessions ? 100 : 50)) return error('invalid_page', 400);
   const selectedMachine = q.get('machine_id');
+  const live = q.get('live') === '1' ? '&live=1' : '';
   if (sessions && selectedMachine) {
     if (!/^[A-Za-z0-9_.-]{1,80}$/.test(selectedMachine)) return error('invalid_machine', 400);
     const response = await env.MACHINES.get(env.MACHINES.idFromName(selectedMachine)).fetch(
@@ -831,13 +832,13 @@ async function machineProjection(
         'https://machine.internal/api/sessions?limit=' +
           limit +
           '&after=' +
-          encodeURIComponent(q.get('after') || q.get('cursor') || ''),
+          encodeURIComponent(q.get('after') || q.get('cursor') || '') + live,
         actor,
       ),
     );
     if (!response.ok) return response;
     const page = await response.json() as { items: unknown[]; next: string | null };
-    return json({ ...page, sessions: page.items, next_cursor: page.next });
+    return json({ ...page, sessions: page.items, next_cursor: page.next, complete: page.next === null });
   }
   const position = readCursor(q.get('after') || q.get('cursor'));
   if (
@@ -873,7 +874,7 @@ async function machineProjection(
         ? '/api/sessions?limit=' +
           limit +
           '&after=' +
-          encodeURIComponent(position.session_after || '')
+          encodeURIComponent(position.session_after || '') + live
         : '/_internal/status';
     const r = await stub.fetch(new Request('https://machine.internal' + path, { headers }));
     if (!r.ok) return error('machine_projection_unavailable', 503);

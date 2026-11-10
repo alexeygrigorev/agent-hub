@@ -113,6 +113,18 @@ class TestSessionControlCli(unittest.TestCase):
             session_control.execute(self.parse('commands', 's'))
         self.assertEqual(transport.call_args.args[:2], ('GET', '/api/sessions/s/commands'))
 
+    def test_hub2_terminal_state_queries_include_history(self):
+        for state in ('expired', 'completed-awaiting-review'):
+            with self.subTest(state=state):
+                row = {'id': 'historic', 'state': state}
+
+                def history_only(_method, path):
+                    return {'sessions': [] if 'live=1' in path else [row], 'next_cursor': None}
+
+                with patch.object(session_control, 'request', side_effect=history_only):
+                    result = session_control.execute(self.parse('list', '--limit', '10', '--state', state))
+                self.assertEqual(result['sessions'], [row])
+
     def test_sessions_show_cli_displays_routed_model_and_effort(self):
         row = {'id': 'session-fixture', 'state': 'running', 'engine': 'claude',
                'model_id': 'sonnet', 'model': 'sonnet', 'effort': 'medium'}

@@ -1188,7 +1188,9 @@ export class MachineDO {
     if (!hasScope(actor,'operator:admin')) return error('forbidden',403);
     const query=new URL(request.url).searchParams,after=query.get('after')||'',limit=Number(query.get('limit')||25);
     if (!Number.isInteger(limit)||limit<1||limit>100||after.length>120) return error('invalid_page',400);
-    const rows=this.db.all<SessionRow>('SELECT * FROM sessions WHERE id>? ORDER BY id LIMIT ?',after,limit+1);
+    const rows=this.db.all<SessionRow>(query.get('live')==='1'
+      ? "SELECT * FROM sessions WHERE id>? AND state IN ('staged','offered','claimed','running') ORDER BY id LIMIT ?"
+      : 'SELECT * FROM sessions WHERE id>? ORDER BY id LIMIT ?',after,limit+1);
     return json({items:rows.slice(0,limit).map(row=>this.sessionView(row)),next:rows.length>limit?rows[limit-1].id:null});
   }
 
