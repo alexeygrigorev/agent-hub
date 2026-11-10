@@ -1,0 +1,99 @@
+{
+ "items": [
+  {
+   "id": "00000000-0000-4000-8000-000000000001",
+   "state": "completed-awaiting-review",
+   "intake_id": "00000000-0000-4000-8000-000000000001",
+   "project_id": "alexeygrigorev/agent-hub",
+   "machine_id": "hetzner-aplexer",
+   "epoch": 66,
+   "operation_id": "00000000-0000-4000-8000-000000000001:0",
+   "native_id": "00000000-0000-4000-8000-000000000001",
+   "engine": "codex",
+   "model": "gpt-6.1-sol",
+   "interactive": false,
+   "evidence": {
+    "operation_id": "00000000-0000-4000-8000-000000000001",
+    "attempt_operation_id": "00000000-0000-4000-8000-000000000001:0",
+    "session_id": "00000000-0000-4000-8000-000000000001",
+    "machine_id": "hetzner-aplexer",
+    "intake_id": "00000000-0000-4000-8000-000000000001",
+    "epoch": 66,
+    "native_id": "00000000-0000-4000-8000-000000000001",
+    "exit_code": 0,
+    "native_exit_confirmed": true,
+    "evidence": {
+     "containment_empty": true,
+     "launcher_state": "retired-finished",
+     "native_deadline": {
+      "deadline_ms": 1794326728608,
+      "exceeded": false
+     },
+     "native_exit": {
+      "code": 0,
+      "exited_at_ms": 1794326601786,
+      "oom_killed": false,
+      "signal": null
+     },
+     "native_identity": {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "tag": "task-hub2-00000000-0000-4000-8000-000000000001",
+      "workspace": "/home/user/work/2026-11-10-hub-releases"
+     },
+     "source": "aplexer_retirement"
+    },
+    "evidence_digest": "70a45a7f742d11d384a9e88386d36b9c3bc23db9a513988e95698b7f347f006b"
+   },
+   "attention": null
+  }
+ ],
+ "sessions": [
+  {
+   "id": "00000000-0000-4000-8000-000000000001",
+   "state": "completed-awaiting-review",
+   "intake_id": "00000000-0000-4000-8000-000000000001",
+   "project_id": "alexeygrigorev/agent-hub",
+   "machine_id": "hetzner-aplexer",
+   "epoch": 66,
+   "operation_id": "00000000-0000-4000-8000-000000000001:0",
+   "native_id": "00000000-0000-4000-8000-000000000001",
+   "engine": "codex",
+   "model": "gpt-6.1-sol",
+   "interactive": false,
+   "evidence": {
+    "operation_id": "00000000-0000-4000-8000-000000000001",
+    "attempt_operation_id": "00000000-0000-4000-8000-000000000001:0",
+    "session_id": "00000000-0000-4000-8000-000000000001",
+    "machine_id": "hetzner-aplexer",
+    "intake_id": "00000000-0000-4000-8000-000000000001",
+    "epoch": 66,
+    "native_id": "00000000-0000-4000-8000-000000000001",
+    "exit_code": 0,
+    "native_exit_confirmed": true,
+    "evidence": {
+     "containment_empty": true,
+     "launcher_state": "retired-finished",
+     "native_deadline": {
+      "deadline_ms": 1794326728608,
+      "exceeded": false
+     },
+     "native_exit": {
+      "code": 0,
+      "exited_at_ms": 1794326601786,
+      "oom_killed": false,
+      "signal": null
+     },
+     "native_identity": {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "tag": "task-hub2-00000000-0000-4000-8000-000000000001",
+      "workspace": "/home/user/work/2026-11-10-hub-releases"
+     },
+     "source": "aplexer_retirement"
+    },
+    "evidence_digest": "70a45a7f742d11d384a9e88386d36b9c3bc23db9a513988e95698b7f347f006b"
+   },
+   "attention": null
+  }
+ ],
+ "complete": false
+}

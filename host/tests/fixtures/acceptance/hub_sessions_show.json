@@ -1,0 +1,18 @@
+{
+ "session": {
+  "id": "00000000-0000-4000-8000-000000000001",
+  "state": "stopped",
+  "intake_id": "00000000-0000-4000-8000-000000000001",
+  "project_id": "alexeygrigorev/agent-hub",
+  "machine_id": "hetzner-aplexer",
+  "epoch": 72,
+  "operation_id": "00000000-0000-4000-8000-000000000001:0",
+  "native_id": null,
+  "engine": "go",
+  "model": "opencode-go/muse-spark-1.3-contributor",
+  "interactive": false,
+  "evidence": null,
+  "attention": null,
+  "stop_confirmed": true
+ }
+}

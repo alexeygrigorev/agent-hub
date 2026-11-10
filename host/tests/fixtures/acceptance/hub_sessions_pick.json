@@ -1,0 +1,54 @@
+{
+ "route": "codex/gpt-6.1-sol/medium",
+ "engine": "codex",
+ "model": "gpt-6.1-sol",
+ "effort": "medium",
+ "policy_id": "codex-sol-medium",
+ "machine_id": "hetzner-aplexer",
+ "pool": [
+  {
+   "policy_id": "codex-luna-max",
+   "engine": "codex",
+   "model": "gpt-6-luna",
+   "effort": "max",
+   "weight": 60,
+   "share": 0.25
+  },
+  {
+   "policy_id": "codex-sol-medium",
+   "engine": "codex",
+   "model": "gpt-6.1-sol",
+   "effort": "medium",
+   "weight": 94,
+   "share": 0.39166666666666666
+  },
+  {
+   "policy_id": "go-muse",
+   "engine": "go",
+   "model": "opencode-go/muse-spark-1.3-contributor",
+   "effort": null,
+   "weight": 13,
+   "share": 0.05416666666666667
+  },
+  {
+   "policy_id": "zai-glm-flash",
+   "engine": "zai",
+   "model": "glm-5.3-flash",
+   "effort": null,
+   "weight": 73,
+   "share": 0.30416666666666664
+  }
+ ],
+ "excluded": [
+  {
+   "policy_id": "claude-sonnet-medium",
+   "account_id": "claude",
+   "reason": "credential_expired"
+  },
+  {
+   "policy_id": "claude-opus-medium",
+   "account_id": "claude",
+   "reason": "credential_expired"
+  }
+ ]
+}
