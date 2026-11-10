@@ -32,10 +32,7 @@ if name=='a':
         else: sys.exit(1)
     elif cmd=='forget':
         s['sessions']=[x for x in s['sessions'] if x['id']!=args[1]];save()
-    elif cmd=='start':
-        if s.get('start_error'): sys.exit(1)
-        s['sessions'].append(dict(id='new',tag='orchestrator-main',workspace=str(p/'git/agent-hub-wt-orchestrator-run/ops/orchestrator'),phase='running',worker_alive=True,worker_pid=os.getppid(),workload_pid=os.getppid()))
-        save()
+    elif cmd=='start': sys.exit(90)  # Direct native starts must never be called.
     elif cmd=='capture': print(s.get('capture_prompt', '❯'))
     elif cmd=='send':
         if s.get('capture_prompt'):
@@ -46,6 +43,16 @@ elif name=='systemd-run':
     # Proof timers (--on-active) are only recorded; scope launches run their command.
     sys.exit(subprocess.call(args[args.index('--')+1:]) if '--' in args else 0)
 elif name=='hub':
+    if args[:2]==['sessions','start']:
+        if s.get('start_error'): sys.exit(1)
+        def arg(flag): return args[args.index(flag)+1]
+        assert arg('--purpose')=='implement'
+        assert '--interactive' in args and '--wait' in args
+        assert arg('--name')==arg('--tag')
+        s['sessions'].append(dict(id='new',tag=arg('--tag'),workspace=arg('--workspace'),phase='running',worker_alive=True,worker_pid=os.getppid(),workload_pid=os.getppid()))
+        save()
+        print(json.dumps({'binding_wait': {'session': {'state': 'running', 'native_id': 'new'}}}))
+        sys.exit(0)
     if args and args[0]=='quota':
         default={'pools': [
             {'provider': 'gemini', 'harness': ['antigravity'], 'state': 'fresh', 'remaining_percent': 80, 'limit_reached': False},
@@ -93,6 +100,9 @@ class OpsWatchdogTest(unittest.TestCase):
         }
         self.env = {**os.environ, 'HOME': str(self.home), 'PATH': str(self.bin)+':'+os.environ['PATH'], 'LOOP_INTERVAL': 'off', 'MIN_RESTART_GAP': '0', 'OPS_LOCK_DIR': str(self.home)}
         self.env.update({'ORCH_ENGINE': 'gemini', 'ORCH_FALLBACK_ENGINE': 'opencode'})
+
+    def tearDown(self):
+        self.assertNotIn('a start', self.calls())
 
     def session(self, alive=False, pid=2147483647):
         return dict(id='old', tag='orchestrator-main', workspace=str(self.workspace), phase='running', worker_alive=alive, worker_pid=pid, workload_pid=pid)
@@ -148,7 +158,7 @@ class OpsWatchdogTest(unittest.TestCase):
         ]}
         result = self.run_ctl('start')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn('--engine opencode', self.starts()[-1])
+        self.assertIn('--engine go', self.starts()[-1])
         self.assertNotIn('--engine claude', self.starts()[-1])
         self.assertNotIn('--engine sonnet', self.starts()[-1])
 
@@ -175,7 +185,7 @@ class OpsWatchdogTest(unittest.TestCase):
         result = self.run_ctl()
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn('a forget', self.calls())
-        self.assertNotIn('a start', self.calls())
+        self.assertNotIn('hub sessions start', self.calls())
 
     def test_unknown_pid_blocks_forget(self):
         session = self.session()
@@ -209,12 +219,12 @@ class OpsWatchdogTest(unittest.TestCase):
     def test_census_error_never_starts_duplicate(self):
         self.data['census_error'] = True
         self.assertNotEqual(self.run_ctl().returncode, 0)
-        self.assertNotIn('a start', self.calls())
+        self.assertNotIn('hub sessions start', self.calls())
 
     def test_stop_failure_propagates_manual_restart(self):
         self.data['sessions'] = [self.session(True, os.getpid())]
         self.assertNotEqual(self.run_ctl('restart').returncode, 0)
-        self.assertNotIn('a start', self.calls())
+        self.assertNotIn('hub sessions start', self.calls())
 
     def test_live_session_after_old_dead_record_selected(self):
         self.data['sessions'] = [self.session(), {**self.session(True), 'id': 'live'}]
@@ -286,7 +296,7 @@ class OpsWatchdogTest(unittest.TestCase):
         result = self.run_ctl()
         self.assertIn('recovery proof FAILED (path 1)', result.stdout)
         self.assertIn('recovery path 2 started', result.stdout)
-        self.assertIn('--engine opencode', self.starts()[-1])
+        self.assertIn('--engine go', self.starts()[-1])
         self.assertEqual((self.state / 'restart_failures').read_text().strip(), '1')
 
     def test_on_time_tick_in_history_proves_even_after_a_later_tick(self):
@@ -324,13 +334,13 @@ class OpsWatchdogTest(unittest.TestCase):
         self.assertRegex(self.run_ctl().stdout, r'STALLED session=live: no tick for 180[0-2]s')
 
     def test_detached_children_never_inherit_the_role_lock(self):
-        # Real systemd --scope and aplexer's setsid worker spawn keep inherited fds
-        # (Codex round-3 repro). Make the adapters do the same, then require that
+        # A detached child of the Hub CLI can retain inherited file descriptors.
+        # Make its adapter do the same, then require that
         # the next check still gets the lock and no detached child holds fd 9.
         run = self.bin / 'systemd-run'
         run.write_text(run.read_text().replace("subprocess.call(args[args.index('--')+1:])", "subprocess.call(args[args.index('--')+1:], close_fds=False)"))
-        a = self.bin / 'a'
-        a.write_text(a.read_text().replace("    elif cmd=='start':\n", "    elif cmd=='start':\n        import subprocess\n        child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(20)'],close_fds=False,start_new_session=True,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\n        (p/'detached_pid').write_text(str(child.pid))\n"))
+        hub = self.bin / 'hub'
+        hub.write_text(hub.read_text().replace("    if args[:2]==['sessions','start']:\n", "    if args[:2]==['sessions','start']:\n        import subprocess\n        child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(20)'],close_fds=False,start_new_session=True,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\n        (p/'detached_pid').write_text(str(child.pid))\n"))
         self.env['ROLE_LOCK_WAIT'] = '1'
         self.data['sessions'] = [self.session()]
         first = self.run_ctl()
@@ -345,7 +355,7 @@ class OpsWatchdogTest(unittest.TestCase):
         self.assertNotIn('role lock busy', second.stdout)
 
     def starts(self):
-        return [line for line in self.calls().splitlines() if line.startswith('a start')]
+        return [line for line in self.calls().splitlines() if line.startswith('hub sessions start')]
 
     def test_29_oct_live_session_without_ticks_is_restarted_not_ok(self):
         self.data['sessions'] = [{**self.session(True, os.getpid()), 'id': 'live'}]
@@ -393,7 +403,7 @@ class OpsWatchdogTest(unittest.TestCase):
         result = self.run_ctl()
         self.assertIn('recovery proof FAILED (path 1)', result.stdout)
         self.assertIn('recovery path 2 started', result.stdout)
-        self.assertIn('--engine opencode', self.starts()[-1])
+        self.assertIn('--engine go', self.starts()[-1])
         needs = self.home / 'tmp/agent-reports/orchestrator/NEEDS_ALEXEY.md'
         self.assertFalse(needs.exists())  # one failed recovery is not an alert
         self.assertIn('--state proof_failed --recovery-failures 1', self.calls())
