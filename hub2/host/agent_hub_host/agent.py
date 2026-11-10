@@ -523,7 +523,7 @@ class Bridge:
         except Exception as error:
             logging.getLogger(__name__).exception('Host event failed type=%s', event.get('type'))
             if isinstance(error,ApiError) and error.retry_at:
-                self.budget_paused_until = max(self.budget_paused_until, error.retry_at)
+                self.budget_paused_until = max(getattr(self, 'budget_paused_until', 0), error.retry_at)
                 raise
             reason = error.code if isinstance(error,ApiError) and error.code else str(error)
             if not re.fullmatch(r"[a-z_]{1,80}", reason):
@@ -667,6 +667,8 @@ class Bridge:
                     self.reconcile()
                     delay = 1
                     while True:
+                        if time.time() * 1000 < self.budget_paused_until:
+                            break
                         now = time.monotonic()
                         if now >= next_live_session_heartbeat:
                             self.heartbeat(labels)
