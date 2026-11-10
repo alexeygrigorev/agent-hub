@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from agent_hub_host.agent import Bridge, Journal
+from agent_hub_host.client import ApiError
 from agent_hub_host.native_launch import NativeLauncher, LOCAL_ROUTES
 
 
@@ -18,6 +19,57 @@ class StopServe(BaseException):
 
 
 class NonblockingLaunchTests(unittest.TestCase):
+    def test_poison_receipt_is_preserved_and_does_not_block_socket_or_later_receipts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            journal = Journal(Path(temp) / 'journal.sqlite')
+            journal.emit('poison', '/api/sessions/stopped/finish', {'native_exit_confirmed': True})
+            journal.emit('good', '/api/sessions/live/started', {'native_id': 'native'})
+            delivered = []
+            def request(method, path, body, key):
+                if key == 'poison':
+                    raise ApiError('Hub HTTP 409', 409, 'stale_session_fence')
+                delivered.append(key)
+                return {}
+            socket = Mock()
+            socket.__enter__ = Mock(return_value=socket)
+            socket.__exit__ = Mock(return_value=False)
+            socket.recv.side_effect = StopServe()
+            bridge = Bridge.__new__(Bridge)
+            bridge.client = SimpleNamespace(socket=lambda _: socket, request=request)
+            bridge.journal = journal
+            bridge.budget_paused_until = bridge.budget_safety_paused_until = 0
+            bridge.heartbeat, bridge.reconcile = Mock(), Mock()
+            try:
+                with self.assertLogs('agent_hub_host.agent', level='ERROR') as logs:
+                    with self.assertRaises(StopServe):
+                        bridge.serve('machine', [])
+                self.assertTrue(socket.recv.called, 'poison receipt prevented socket processing')
+                self.assertEqual(delivered, ['good'])
+                self.assertFalse(journal.db.execute('SELECT 1 FROM outbox').fetchone())
+                dead = journal.db.execute('SELECT * FROM outbox_dead_letters').fetchone()
+                self.assertEqual(dead['key'], 'poison')
+                self.assertEqual(dead['status'], 409)
+                self.assertEqual(dead['reason'], 'stale_session_fence')
+                self.assertEqual(json.loads(dead['payload']), {'native_exit_confirmed': True})
+                self.assertIn('stale_session_fence', logs.output[0])
+            finally:
+                journal.close_thread()
+
+    def test_auth_budget_timeout_and_server_errors_remain_retryable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            journal = Journal(Path(temp) / 'journal.sqlite')
+            try:
+                for status in (401, 403, 408, 429, 500, 503):
+                    with self.subTest(status=status):
+                        journal.emit('retry', '/api/sessions/s/finish', {})
+                        client = SimpleNamespace(request=Mock(side_effect=ApiError('retry', status)))
+                        with self.assertRaises(ApiError):
+                            journal.flush(client)
+                        self.assertTrue(journal.db.execute('SELECT 1 FROM outbox').fetchone())
+                        self.assertFalse(journal.db.execute('SELECT 1 FROM outbox_dead_letters').fetchone())
+            finally:
+                journal.close_thread()
+
     def test_journal_heartbeat_thread_can_read_and_emit_without_shared_transaction(self):
         with tempfile.TemporaryDirectory() as temp:
             journal = Journal(Path(temp) / 'journal.sqlite')

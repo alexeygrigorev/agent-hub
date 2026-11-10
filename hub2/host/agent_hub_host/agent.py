@@ -49,6 +49,9 @@ class Journal:
             tag TEXT NOT NULL, native_id TEXT, state TEXT NOT NULL, interactive INTEGER NOT NULL DEFAULT 0);
           CREATE TABLE IF NOT EXISTS outbox(
             key TEXT PRIMARY KEY, path TEXT NOT NULL, payload TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS outbox_dead_letters(
+            key TEXT PRIMARY KEY, path TEXT NOT NULL, payload TEXT NOT NULL,
+            status INTEGER NOT NULL, reason TEXT NOT NULL, observed_at INTEGER NOT NULL);
           CREATE TABLE IF NOT EXISTS commands(
             id TEXT PRIMARY KEY, digest TEXT NOT NULL, state TEXT NOT NULL, result TEXT);
         """)
@@ -84,9 +87,24 @@ class Journal:
         for row in self.db.execute(query+" ORDER BY rowid LIMIT 100").fetchall():
             if safety_only and not re.fullmatch(r"/api/sessions/[A-Za-z0-9-]{1,80}/(?:finish|started|commands/[A-Za-z0-9-]{1,80}/ack\?safety=operator_stop)",row["path"]):
                 continue
-            client.request("POST", row["path"], json.loads(row["payload"]), row["key"])
+            try:
+                client.request("POST", row["path"], json.loads(row["payload"]), row["key"])
+            except ApiError as error:
+                # Authentication, budget pauses, timeouts and server failures
+                # can recover. A rejected payload/retired fence cannot: retain
+                # its complete receipt privately without blocking the socket.
+                if error.retry_at or error.status not in {400, 404, 409, 410, 422}:
+                    raise
+                reason = error.code or 'http_' + str(error.status)
+                with self.db:
+                    self.db.execute("INSERT OR REPLACE INTO outbox_dead_letters VALUES(?,?,?,?,?,?)",
+                                    (row['key'], row['path'], row['payload'], error.status, reason, int(time.time()*1000)))
+                    self.db.execute("DELETE FROM outbox WHERE key=? AND payload=?", (row['key'], row['payload']))
+                logging.getLogger(__name__).error('Host receipt dead-lettered key=%s status=%s reason=%s',
+                                                 row['key'], error.status, reason)
+                continue
             with self.db:
-                self.db.execute("DELETE FROM outbox WHERE key=?", (row["key"],))
+                self.db.execute("DELETE FROM outbox WHERE key=? AND payload=?", (row["key"], row['payload']))
 
 
 class Bridge:
