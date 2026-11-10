@@ -105,7 +105,7 @@ class NeedsCliTest(unittest.TestCase):
         self.assertEqual(args.needs, ['os:windows', 'arch:arm64'])
 
     def test_start_forwards_needs(self):
-        args = self.parse('start', '--workspace', 'demo', '--needs', 'os:windows')
+        args = self.parse('start', '--workspace', 'demo', '--needs', 'os:windows', '--no-wait')
         with patch.object(session_control, 'request', return_value={'id': 's'}) as transport:
             session_control.execute(args)
         payload = transport.call_args.args[2]

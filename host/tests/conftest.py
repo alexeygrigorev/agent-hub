@@ -12,6 +12,17 @@ from agent_hub_host._test_isolation import isolate as _isolate_hermetic_home
 
 _isolate_hermetic_home()
 
+# The 5.2 CLI stale-manifest check must never fetch the network from tests;
+# stale-check behavior itself is covered by dedicated tests that clear this.
+os.environ.setdefault('HUB_CLI_SKIP_STALE_CHECK', '1')
+
+# The not_supported_on_hub2 gate must refuse Hub1-only routes in real use, but
+# most host CLI tests still exercise Hub1-shaped client code (bus, ops,
+# webhooks, driver). Tests default to the documented HUB_ALLOW_LEGACY_ROUTES=1
+# escape hatch; the gate itself is proven by dedicated tests that blank the
+# variable so the refusal path runs for real.
+os.environ.setdefault('HUB_ALLOW_LEGACY_ROUTES', '1')
+
 
 def _native_launch_identity_vars():
     """All env selectors that resolve the live per-launch worker profile.

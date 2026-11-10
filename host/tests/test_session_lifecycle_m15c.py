@@ -126,7 +126,8 @@ class TestSessionsDefaultAndCleanup(unittest.TestCase):
     def test_existing_list_start_send_capture_stop_preserved(self):
         with patch.object(session_control, "request", return_value={"sessions": []}) as transport:
             session_control.execute(parse("list", "--limit", "10"))
-        self.assertEqual(transport.call_args.args[:2], ("GET", "/api/sessions?limit=10"))
+        # 3.2: live=1 is the default list view.
+        self.assertEqual(transport.call_args.args[:2], ("GET", "/api/sessions?live=1&limit=10"))
 
 
 if __name__ == "__main__":

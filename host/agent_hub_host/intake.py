@@ -1,4 +1,5 @@
 """Private durable task context. Task text is data; this client never executes it."""
+import argparse
 import socket
 import json
 import os
@@ -172,6 +173,13 @@ def http_error(exc, method, payload):
     result = IntakeHTTPError(exc.code, code, key, gate)
     detail = ''
     if isinstance(body, dict):
+        stage = body.get('stage')
+        if isinstance(stage, str) and re.fullmatch(r'[a-z][a-z0-9_]{0,63}', stage):
+            detail += f'; stage: {stage}'
+        server_detail = body.get('detail')
+        if isinstance(server_detail, str) and server_detail.strip():
+            safe_detail = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', server_detail)
+            detail += '; detail: ' + ' '.join(safe_detail.split())[:300]
         reason = body.get('reason')
         if isinstance(reason, str) and SAFE_ERROR.match(reason):
             detail += f'; reason: {reason}'
@@ -182,7 +190,7 @@ def http_error(exc, method, payload):
             if type(limit) is int and 0 < limit <= MAX_REQUEST:
                 detail += f'; max {limit} UTF-8 bytes'
     if code in ('invalid_limit', 'limit_out_of_range'):
-        detail += '; limit must be a positive integer; min 1, max 100 (larger values clamp)'
+        detail += '; limit must be a positive integer; min 1, max 50 (larger values clamp)'
     if code == 'invalid_search':
         detail += '; search must be 1-128 characters'
     if code == 'done_evidence_required':
@@ -431,10 +439,11 @@ def add_commands(sub):
     listing.add_argument('--status', default=None)
     listing.add_argument('--project')
     listing.add_argument('--search', help='Server-side dedup filter: case-insensitive substring over title, project, original text and context (max 128 chars)')
-    listing.add_argument('--after')
+    listing.add_argument('--cursor', help='Opaque next-page cursor from the previous list page (legacy alias: --after)')
+    listing.add_argument('--after', dest='cursor', help=argparse.SUPPRESS)
     listing.add_argument('--revision', type=int)
     listing.add_argument('--authorization-valid-until', type=int)
-    listing.add_argument('--limit', type=int, default=None, help='Positive integer; default 25 (100 with --all), server clamps above max 100')
+    listing.add_argument('--limit', type=int, default=None, help='Positive integer; default 25 (50 with --all), server clamps above max 50')
     listing.add_argument('--all', action='store_true', help='Follow all pages with a pinned snapshot; restart if it changes')
     listing.add_argument('--archived', action='store_true', help='List archived intakes')
     summary = commands.add_parser('summary', help='Current authorized task counts and five recent tasks; no histories')
@@ -596,9 +605,11 @@ def list_all(params):
     """Follow all pages of one pinned listing. The server pins the matching id
     set behind list_token, so pages survive intake create/close churn; on the
     rare expiry (410) the whole walk restarts, bounded like the handoff loop.
-    Servers without a token fall back to the revision-pinned walk."""
-    if 'after' in params:
-        raise IntakeInputError('--all cannot be combined with --after')
+    Servers without a token fall back to the revision-pinned walk; servers
+    with neither pin (plain keyset pages) are walked with cursor-uniqueness
+    and duplicate-id guards only."""
+    if 'after' in params or 'cursor' in params:
+        raise IntakeInputError('--all cannot be combined with --cursor')
     for _ in range(3):
         try:
             return _list_all_once(params)
@@ -633,15 +644,15 @@ def _list_all_once(params):
         elif first is None:
             page_params['list_token'] = 'new'
         if after:
-            page_params['after'] = after
+            page_params['cursor'] = after
             if first.get('authorization_valid_until') is not None:
                 page_params['authorization_valid_until'] = first['authorization_valid_until']
-            if token is None:
+            if token is None and isinstance(first.get('snapshot_version'), int):
                 # Tokenless fallback: the classic revision-pinned page walk.
                 page_params['revision'] = first['snapshot_version']
         if 'limit' not in page_params:
-            page_params['limit'] = 100
-            params['limit'] = 100
+            page_params['limit'] = 50
+            params['limit'] = 50
         before_limit = page_params.get('limit')
         page = _request_page(page_params, params)
         if page_params.get('limit') != before_limit:
@@ -649,7 +660,8 @@ def _list_all_once(params):
         if first is None:
             first = page
             token = page.get('list_token')
-        elif token is None and (page['snapshot_version'] != first['snapshot_version'] or
+        elif token is None and isinstance(first.get('snapshot_version'), int) and (
+                                page['snapshot_version'] != first['snapshot_version'] or
                                 page.get('authorization_valid_until') != first.get('authorization_valid_until') or
                                 page['total'] != first['total']):
             raise StaleSnapshot('Snapshot changed')
@@ -660,13 +672,13 @@ def _list_all_once(params):
             items.append(task)
         after = page['next']
         if not after:
-            if token is None and len(items) != first['total']:
+            if token is None and isinstance(first.get('total'), int) and len(items) != first['total']:
                 raise IntakeInputError('Incomplete snapshot; retry the command')
             result = dict(first, items=items, next=None, total=len(items))
             if reduced:
-                result.update(effective_limit=page.get('effective_limit', min(params.get('limit', 100), 100)), page_size_reduced=True)
+                result.update(effective_limit=page.get('effective_limit', min(params.get('limit', 50), 50)), page_size_reduced=True)
             return result
-        if after in cursors or not page['items']:
+        if after in cursors:
             raise IntakeInputError('Invalid snapshot cursor; retry the command')
         cursors.add(after)
     raise IntakeInputError('Snapshot page bound exceeded')
@@ -712,7 +724,7 @@ def execute(args):
         params = {'project': args.project} if args.project is not None else {}
         return request('GET', BASE + '/summary?' + urlencode(params))
     if command == 'list':
-        params = {'limit': args.limit if args.limit is not None else (100 if args.all else 25)}
+        params = {'limit': args.limit if args.limit is not None else (50 if args.all else 25)}
         if args.status is not None:
             params['status'] = args.status
         if args.search is not None:
@@ -726,9 +738,15 @@ def execute(args):
             params['archived'] = 'true'
         elif args.all:
             params['all'] = 'true'
-        for field in ('project', 'after', 'revision', 'authorization_valid_until'):
+        for field in ('project', 'revision', 'authorization_valid_until'):
             if getattr(args, field) is not None:
                 params[field] = getattr(args, field)
+        # The wire pagination parameter is `cursor` (Hub2 keyset pages carry an
+        # opaque JSON cursor in `next`); `--after` stays as a hidden alias.
+        if getattr(args, 'cursor', None) is not None:
+            if args.all:
+                raise IntakeInputError('--all cannot be combined with --cursor')
+            params['cursor'] = args.cursor
         if args.all:
             return list_all(params)
         return request('GET', BASE + '/tasks?' + urlencode(params))

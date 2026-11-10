@@ -23,8 +23,8 @@ def parse(*args):
 
 def test_goal_cli_implies_interactive_and_preserves_prompt():
     with patch.object(session_control, 'request', return_value={'id': 's'}) as req:
-        session_control.execute(parse('--with-goal', '--prompt', 'Fix flaky binding', '--key', 'goal-1'))
-    assert req.call_args.args[2] == {'key': 'goal-1', 'workspace': 'demo', 'mode': 'interactive', 'with_goal': True, 'brief': 'Fix flaky binding'}
+        session_control.execute(parse('--with-goal', '--prompt', 'Fix flaky binding', '--key', 'goal-1', '--no-wait'))
+    assert req.call_args.args[2] == {'key': 'goal-1', 'workspace': 'demo', 'mode': 'interactive', 'with_goal': True, 'brief': 'Fix flaky binding', 'purpose': 'implement'}
 
 
 @pytest.mark.parametrize('args', [('--with-goal', '--headless', '--prompt', 'fix'), ('--with-goal',)])

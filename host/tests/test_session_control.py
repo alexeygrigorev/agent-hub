@@ -101,6 +101,10 @@ class TestSessionControlCli(unittest.TestCase):
         with patch.object(session_control, 'request', return_value={'sessions': [], 'next_cursor': None}) as transport:
             result = session_control.execute(self.parse('list', '--limit', '10'))
         self.assertEqual(result, {'sessions': [], 'next_cursor': None})
+        # 3.2: live=1 is the default list view; a terminal --state walks history.
+        self.assertEqual(transport.call_args.args[:2], ('GET', '/api/sessions?live=1&limit=10'))
+        with patch.object(session_control, 'request', return_value={'sessions': [], 'next_cursor': None}) as transport:
+            session_control.execute(self.parse('list', '--limit', '10', '--state', 'failed'))
         self.assertEqual(transport.call_args.args[:2], ('GET', '/api/sessions?limit=10'))
         with patch.object(session_control, 'request', return_value={'id': 's'}) as transport:
             session_control.execute(self.parse('show', 's'))
@@ -123,23 +127,23 @@ class TestSessionControlCli(unittest.TestCase):
 
     def test_start_headless_brief_and_interactive_empty(self):
         with patch.object(session_control, 'read_file', return_value='synthetic goal'), \
-                patch.object(session_control, 'request', return_value={}) as transport:
-            session_control.execute(self.parse('start', '--workspace', 'demo', '--engine', 'codex', '--reason', 'codex required for test', '--brief-file', 'goal.txt', '--key', 'k'))
+                patch.object(session_control, 'request', return_value={'id':'fixture-session','state':'running'}) as transport:
+            session_control.execute(self.parse('start', '--no-wait', '--workspace', 'demo', '--engine', 'codex', '--reason', 'codex required for test', '--brief-file', 'goal.txt', '--key', 'k'))
         payload = transport.call_args.args[2]
         self.assertEqual(payload['brief'], 'synthetic goal')
         self.assertEqual(payload['mode'], 'headless')
-        with patch.object(session_control, 'request', return_value={}) as transport:
-            session_control.execute(self.parse('start', '--workspace', 'demo', '--interactive', '--key', 'k'))
+        with patch.object(session_control, 'request', return_value={'id':'fixture-session','state':'running'}) as transport:
+            session_control.execute(self.parse('start', '--no-wait', '--workspace', 'demo', '--interactive', '--key', 'k'))
         self.assertEqual(transport.call_args.args[2]['mode'], 'interactive')
         self.assertNotIn('brief', transport.call_args.args[2])
-        conflicting = self.parse('start', '--workspace', 'demo', '--interactive', '--key', 'k')
+        conflicting = self.parse('start', '--no-wait', '--workspace', 'demo', '--interactive', '--key', 'k')
         conflicting.brief_file = 'goal.txt'
         with patch.object(session_control, 'read_file', return_value='x'):
             with self.assertRaises(ValueError):
                 session_control.execute(conflicting)
 
     def test_start_repo_only_sends_repo_without_client_host_path(self):
-        args = self.parse('start', '--repo', 'DataTalksClub/relay', '--prompt', 'do relay work', '--key', 'repo-key')
+        args = self.parse('start', '--no-wait', '--repo', 'DataTalksClub/relay', '--prompt', 'do relay work', '--key', 'repo-key', '--no-wait')
         with patch.object(session_control, 'request', return_value={'id': 'session-repo', 'state': 'offered'}) as transport:
             session_control.execute(args)
         payload = transport.call_args.args[2]
@@ -147,7 +151,7 @@ class TestSessionControlCli(unittest.TestCase):
         self.assertNotIn('workspace', payload)
 
     def test_start_workspace_label_is_forwarded_for_target_host_resolution(self):
-        args = self.parse('start', '--workspace', 'relay', '--prompt', 'do relay work', '--key', 'label-key')
+        args = self.parse('start', '--no-wait', '--workspace', 'relay', '--prompt', 'do relay work', '--key', 'label-key', '--no-wait')
         with patch.object(session_control, '_repo_from_workspace', return_value=None), \
                 patch.object(session_control, 'request', return_value={'id': 'session-label', 'state': 'offered'}) as transport:
             session_control.execute(args)
@@ -157,21 +161,21 @@ class TestSessionControlCli(unittest.TestCase):
 
     def test_start_links_intake_task_for_acceptance_gate(self):
         with patch.object(session_control, 'read_file', return_value='synthetic goal'), \
-                patch.object(session_control, 'request', return_value={}) as transport:
-            session_control.execute(self.parse('start', '--workspace', 'demo', '--brief-file', 'goal.txt',
+                patch.object(session_control, 'request', return_value={'id':'fixture-session','state':'running'}) as transport:
+            session_control.execute(self.parse('start', '--no-wait', '--workspace', 'demo', '--brief-file', 'goal.txt',
                                                '--key', 'k', '--intake-task-id', 'task-1'))
         self.assertEqual(transport.call_args.args[2]['intake_task_id'], 'task-1')
         with patch.object(session_control, 'read_file', return_value='synthetic goal'), \
-                patch.object(session_control, 'request', return_value={}) as transport:
-            session_control.execute(self.parse('start', '--workspace', 'demo', '--brief-file', 'goal.txt', '--key', 'k'))
+                patch.object(session_control, 'request', return_value={'id':'fixture-session','state':'running'}) as transport:
+            session_control.execute(self.parse('start', '--no-wait', '--workspace', 'demo', '--brief-file', 'goal.txt', '--key', 'k'))
         self.assertNotIn('intake_task_id', transport.call_args.args[2])
 
     def test_start_retry_and_goal_keep_intake_link_and_key(self):
         for mode in ([], ['--with-goal']):
             with patch.object(session_control, 'read_file', return_value='synthetic goal'), \
                     patch.object(session_control, 'request', return_value={'id': 'session-fixture'}) as transport:
-                args = self.parse('start', '--workspace', 'demo', '--brief-file', 'goal.txt',
-                                  '--key', 'same-key', '--intake-task-id', 'task-fixture', *mode)
+                args = self.parse('start', '--no-wait', '--workspace', 'demo', '--brief-file', 'goal.txt',
+                                  '--key', 'same-key', '--intake-task-id', 'task-fixture', '--no-wait', *mode)
                 for _ in range(2):
                     session_control.execute(args)
                 self.assertEqual(transport.call_count, 2)
@@ -214,7 +218,9 @@ class TestSessionControlCli(unittest.TestCase):
         self.assertIn('provider_disabled', str(raised.exception))
         self.assertIn('choose an allowed model', str(raised.exception))
         self.assertIn('change the model pool', str(raised.exception))
-        self.assertNotIn('private server body', str(raised.exception))
+        # 2.4: human-readable server detail is printed (bounded to 300 chars,
+        # whitespace-collapsed) instead of being swallowed by the slug filter.
+        self.assertIn('detail: private server body', str(raised.exception))
 
     def test_request_errors_hide_server_bodies(self):
         import os
@@ -349,24 +355,24 @@ class TestSessionControlCli(unittest.TestCase):
         self.assertEqual(transport.call_count, 2)
 
     def test_start_prompt_inline_with_brief_boundaries(self):
-        with patch.object(session_control, 'request', return_value={}) as transport:
-            session_control.execute(self.parse('start', '--workspace', 'demo', '--prompt', 'do the thing', '--key', 'k'))
+        with patch.object(session_control, 'request', return_value={'id':'fixture-session','state':'running'}) as transport:
+            session_control.execute(self.parse('start', '--no-wait', '--workspace', 'demo', '--prompt', 'do the thing', '--key', 'k'))
         payload = transport.call_args.args[2]
         self.assertEqual(payload['brief'], 'do the thing')
         self.assertEqual(payload['mode'], 'headless')
         # Mutually exclusive with --brief-file and --interactive.
         with self.assertRaises(SystemExit):
-            self.parse('start', '--workspace', 'demo', '--prompt', 'x', '--brief-file', 'goal.txt')
+            self.parse('start', '--no-wait', '--workspace', 'demo', '--prompt', 'x', '--brief-file', 'goal.txt')
         with self.assertRaises(SystemExit):
-            self.parse('start', '--workspace', 'demo', '--prompt', 'x', '--interactive')
+            self.parse('start', '--no-wait', '--workspace', 'demo', '--prompt', 'x', '--interactive')
         # Same 8 KiB UTF-8 boundaries as --brief-file, never executed locally.
-        with patch.object(session_control, 'request', return_value={}):
+        with patch.object(session_control, 'request', return_value={'id':'fixture-session','state':'running'}):
             with self.assertRaises(ValueError):
-                session_control.execute(self.parse('start', '--workspace', 'demo', '--prompt', '   ', '--key', 'k'))
+                session_control.execute(self.parse('start', '--no-wait', '--workspace', 'demo', '--prompt', '   ', '--key', 'k'))
             with self.assertRaises(ValueError):
-                session_control.execute(self.parse('start', '--workspace', 'demo', '--prompt', 'é' * 5000, '--key', 'k'))
+                session_control.execute(self.parse('start', '--no-wait', '--workspace', 'demo', '--prompt', 'é' * 5000, '--key', 'k'))
             with self.assertRaises(ValueError):
-                session_control.execute(self.parse('start', '--workspace', 'demo', '--prompt', 'x' * 8001, '--key', 'k'))
+                session_control.execute(self.parse('start', '--no-wait', '--workspace', 'demo', '--prompt', 'x' * 8001, '--key', 'k'))
 
     def test_send_prompt_inline_with_body_boundaries(self):
         with patch.object(session_control, 'request', return_value={'command_id': 'c1'}) as transport:
@@ -410,15 +416,15 @@ class TestSessionControlCli(unittest.TestCase):
             session_control.execute(missing)
 
     def test_start_name_stored_and_validated(self):
-        with patch.object(session_control, 'request', return_value={}) as transport:
-            session_control.execute(self.parse('start', '--workspace', 'demo', '--prompt', 'goal', '--name', 'friendly', '--key', 'k'))
+        with patch.object(session_control, 'request', return_value={'id':'fixture-session','state':'running'}) as transport:
+            session_control.execute(self.parse('start', '--no-wait', '--workspace', 'demo', '--prompt', 'goal', '--name', 'friendly', '--key', 'k'))
         self.assertEqual(transport.call_args.args[2]['name'], 'friendly')
-        with patch.object(session_control, 'request', return_value={}):
-            session_control.execute(self.parse('start', '--workspace', 'demo', '--interactive', '--name', 'empty-ok', '--key', 'k'))
+        with patch.object(session_control, 'request', return_value={'id':'fixture-session','state':'running'}):
+            session_control.execute(self.parse('start', '--no-wait', '--workspace', 'demo', '--interactive', '--name', 'empty-ok', '--key', 'k'))
             with self.assertRaises(ValueError):
-                session_control.execute(self.parse('start', '--workspace', 'demo', '--name', '../escape', '--key', 'k'))
+                session_control.execute(self.parse('start', '--no-wait', '--workspace', 'demo', '--name', '../escape', '--key', 'k'))
             with self.assertRaises(ValueError):
-                session_control.execute(self.parse('start', '--workspace', 'demo', '--name', '', '--key', 'k'))
+                session_control.execute(self.parse('start', '--no-wait', '--workspace', 'demo', '--name', '', '--key', 'k'))
 
     def test_host_receive_requires_once_and_machine(self):
         args = self.parse('host-receive', '--once', '--machine-id', 'hetzner1')
@@ -462,7 +468,7 @@ class TestSessionControlCli(unittest.TestCase):
 
     def test_start_lineage_parent_and_headless_flags(self):
         with patch.object(session_control, 'request', return_value={'id': 's-child'}) as transport:
-            session_control.execute(self.parse('start', '--workspace', 'demo', '--parent', 'parent-123', '--headless', '--key', 'k-lineage'))
+            session_control.execute(self.parse('start', '--no-wait', '--workspace', 'demo', '--parent', 'parent-123', '--headless', '--key', 'k-lineage', '--no-wait'))
         payload = transport.call_args.args[2]
         self.assertEqual(payload['parent_id'], 'parent-123')
         self.assertEqual(payload['mode'], 'headless')
@@ -544,40 +550,23 @@ class TestSessionControlCli(unittest.TestCase):
         self.assertIsInstance(out_plain, str)
         self.assertIn('dataops:batching', out_plain)
 
-    def test_start_engine_override_reason_required(self):
-        args = self.parse('start', '--workspace', 'demo', '--engine', 'codex', '--key', 'k')
-        with self.assertRaises(ValueError) as ctx:
-            session_control.execute(args)
-        self.assertIn('Engine override requires an explanation', str(ctx.exception))
+    def test_start_overrides_do_not_require_a_reason(self):
+        for options in [('--engine','codex'),('--tier','deep'),('--model','gpt-6-astra')]:
+            with self.subTest(options=options), patch.object(session_control,'request',return_value={'id':'fixture-session'}) as transport:
+                session_control.execute(self.parse('start', '--no-wait','--workspace','demo','--no-wait',*options,'--key','k'))
+                self.assertNotIn('engine_override_reason',transport.call_args.args[2])
 
-    def test_start_deep_tier_reason_required_and_forwarded(self):
-        for reason_args in ([], ['--reason', '   ']):
-            args = self.parse('start', '--workspace', 'demo', '--tier', 'deep', *reason_args, '--key', 'k')
-            with self.assertRaises(ValueError) as ctx:
-                session_control.execute(args)
-            self.assertIn('Explicit deep-tier starts require an explanation', str(ctx.exception))
-
-        with patch.object(session_control, 'request', return_value={}) as transport:
-            session_control.execute(self.parse(
-                'start', '--workspace', 'demo', '--tier', 'deep', '--reason',
-                'This task needs deeper reasoning', '--key', 'k',
-            ))
-        payload = transport.call_args.args[2]
-        self.assertEqual(payload['tier'], 'deep')
-        self.assertEqual(payload['engine_override_reason'], 'This task needs deeper reasoning')
-
-    def test_dedicated_override_requires_engine_and_reason(self):
+    def test_dedicated_override_requires_engine_but_reason_is_optional(self):
         with self.assertRaises(SystemExit):
-            self.parse('override', '--workspace', 'demo', '--reason', 'some reason')
+            self.parse('override','--workspace','demo')
+        with patch.object(session_control,'request',return_value={'id':'fixture-session'}) as transport:
+            session_control.execute(self.parse('override','--workspace','demo','--engine','codex','--reason','need codex','--key','k'))
+        self.assertEqual(transport.call_args.args[2]['engine_override_reason'],'need codex')
 
-        with self.assertRaises(SystemExit):
-            self.parse('override', '--workspace', 'demo', '--engine', 'codex')
-
-        with patch.object(session_control, 'request', return_value={}) as transport:
-            session_control.execute(self.parse('override', '--workspace', 'demo', '--engine', 'codex', '--reason', 'need codex', '--key', 'k'))
-        payload = transport.call_args.args[2]
-        self.assertEqual(payload['engine'], 'codex')
-        self.assertEqual(payload['engine_override_reason'], 'need codex')
+    def test_start_rejects_every_idless_receipt_even_with_no_wait(self):
+        for receipt in [{},{'ok':True},{'session':{}},{'id':42},{'id':' '},{'id':'bad/path'}]:
+            with self.subTest(receipt=receipt), patch.object(session_control,'request',return_value=receipt), self.assertRaisesRegex(ValueError,'no session id'):
+                session_control.execute(self.parse('start','--workspace','demo','--no-wait','--key','k'))
 
     def test_list_state_filtering_waiting_and_idle(self):
         raw_sessions = [
@@ -600,7 +589,7 @@ class TestSessionControlCli(unittest.TestCase):
             self.assertEqual({s['id'] for s in idle_res['sessions']}, {'s2', 's3'})
 
     def test_missing_brief_file_raises_session_input_error(self):
-        args = self.parse('start', '--workspace', 'demo', '--brief-file', '/nonexistent/brief.txt', '--key', 'k')
+        args = self.parse('start', '--no-wait', '--workspace', 'demo', '--brief-file', '/nonexistent/brief.txt', '--key', 'k')
         with self.assertRaises(session_control.SessionInputError) as ctx:
             session_control.execute(args)
         self.assertIn('Brief file: file not found', str(ctx.exception))
@@ -613,7 +602,7 @@ class TestSessionControlCli(unittest.TestCase):
             tf.write('x' * (session_control.MAX_BRIEF_CHARS + 10))
             tf_path = tf.name
         try:
-            args = self.parse('start', '--workspace', 'demo', '--brief-file', tf_path, '--key', 'k')
+            args = self.parse('start', '--no-wait', '--workspace', 'demo', '--brief-file', tf_path, '--key', 'k')
             with self.assertRaises(session_control.SessionInputError) as ctx:
                 session_control.execute(args)
             self.assertIn('character limit', str(ctx.exception))
@@ -623,14 +612,14 @@ class TestSessionControlCli(unittest.TestCase):
             os.unlink(tf_path)
 
     def test_prompt_character_limit(self):
-        args = self.parse('start', '--workspace', 'demo', '--prompt', 'do task', '--key', 'k')
-        with patch.object(session_control, 'request', return_value={}) as transport:
+        args = self.parse('start', '--no-wait', '--workspace', 'demo', '--prompt', 'do task', '--key', 'k')
+        with patch.object(session_control, 'request', return_value={'id':'fixture-session','state':'running'}) as transport:
             session_control.execute(args)
         payload = transport.call_args.args[2]
         self.assertEqual(payload['brief'], 'do task')
 
         long_prompt = 'y' * (session_control.MAX_BRIEF_CHARS + 5)
-        bad_args = self.parse('start', '--workspace', 'demo', '--prompt', long_prompt, '--key', 'k')
+        bad_args = self.parse('start', '--no-wait', '--workspace', 'demo', '--prompt', long_prompt, '--key', 'k')
         with self.assertRaises(session_control.SessionInputError) as ctx:
             session_control.execute(bad_args)
         self.assertIn('character limit', str(ctx.exception))
@@ -684,8 +673,8 @@ class TestSessionControlCli(unittest.TestCase):
         self.assertIn('Expected JSON response', session_control.diagnostic(json_err))
 
     def test_start_extracts_id_from_intake_url(self):
-        args = self.parse('start', '--workspace', 'demo', '--intake-task-id', 'https://hub.test/#/intake/task-url-1234', '--key', 'k')
-        with patch.object(session_control, 'request', return_value={}) as transport:
+        args = self.parse('start', '--no-wait', '--workspace', 'demo', '--intake-task-id', 'https://hub.test/#/intake/task-url-1234', '--key', 'k')
+        with patch.object(session_control, 'request', return_value={'id':'fixture-session','state':'running'}) as transport:
             session_control.execute(args)
         payload = transport.call_args.args[2]
         self.assertEqual(payload['intake_task_id'], 'task-url-1234')
@@ -693,18 +682,18 @@ class TestSessionControlCli(unittest.TestCase):
     def test_start_intake_worktree_flags(self):
         # afab8367: a successor start replaces a live predecessor; Hub plans the
         # fresh sibling worktree, so a named cwd is refused client-side.
-        args = self.parse('start', '--workspace', 'demo', '--intake-task-id', 'task-1',
+        args = self.parse('start', '--no-wait', '--workspace', 'demo', '--intake-task-id', 'task-1',
                           '--intake-worktree', 'successor', '--key', 'k-succ')
-        with patch.object(session_control, 'request', return_value={}) as transport:
+        with patch.object(session_control, 'request', return_value={'id':'fixture-session','state':'running'}) as transport:
             session_control.execute(args)
         self.assertEqual(transport.call_args.args[2]['intake_worktree'], 'successor')
         self.assertNotIn('cwd', transport.call_args.args[2])
-        args = self.parse('start', '--workspace', 'demo', '--intake-task-id', 'task-1',
+        args = self.parse('start', '--no-wait', '--workspace', 'demo', '--intake-task-id', 'task-1',
                           '--intake-worktree', 'detached', '--key', 'k-det')
-        with patch.object(session_control, 'request', return_value={}) as transport:
+        with patch.object(session_control, 'request', return_value={'id':'fixture-session','state':'running'}) as transport:
             session_control.execute(args)
         self.assertEqual(transport.call_args.args[2]['intake_worktree'], 'detached')
-        args = self.parse('start', '--workspace', 'demo', '--intake-task-id', 'task-1',
+        args = self.parse('start', '--no-wait', '--workspace', 'demo', '--intake-task-id', 'task-1',
                           '--intake-worktree', 'successor', '--cwd', 'sub/dir', '--key', 'k-bad')
         with self.assertRaisesRegex(ValueError, 'drop --cwd'):
             session_control.execute(args)
@@ -764,7 +753,8 @@ class TestSessionControlCli(unittest.TestCase):
             with patch.object(session_control, 'request', return_value={'id': 'fable-session'}) as transport:
                 session_control.execute(self.parse(
                     'start', '--workspace', 'demo', '--engine', 'claude', '--model', model,
-                    '--reason', 'The task explicitly requests Fable 5.2', '--prompt', 'analyze this', '--key', 'fable-key'))
+                    '--reason', 'The task explicitly requests Fable 5.2', '--prompt', 'analyze this',
+                    '--key', 'fable-key', '--no-wait'))
             payload = transport.call_args.args[2]
             self.assertEqual(payload['engine'], 'claude')
             self.assertEqual(payload['model'], model)
@@ -772,11 +762,181 @@ class TestSessionControlCli(unittest.TestCase):
 
         with patch.object(session_control, 'request') as transport:
             with self.assertRaisesRegex(ValueError, '--model fable requires --engine claude'):
-                session_control.execute(self.parse('start', '--workspace', 'demo', '--model', 'fable', '--prompt', 'work'))
-            with self.assertRaisesRegex(ValueError, 'Engine override requires an explanation'):
-                session_control.execute(self.parse('start', '--workspace', 'demo', '--engine', 'claude',
-                                                    '--model', 'fable', '--prompt', 'work'))
+                session_control.execute(self.parse('start', '--no-wait', '--workspace', 'demo', '--engine', 'codex',
+                                                    '--model', 'fable', '--reason', 'needs fable', '--prompt', 'work'))
         transport.assert_not_called()
+
+    def test_start_purpose_defaults_to_implement_and_is_forwarded(self):
+        with patch.object(session_control, 'request', return_value={'id':'fixture-session','state':'running'}) as transport:
+            session_control.execute(self.parse('start', '--no-wait', '--workspace', 'demo', '--prompt', 'fix it', '--key', 'k-purpose'))
+        self.assertEqual(transport.call_args.args[2]['purpose'], 'implement')
+        with patch.object(session_control, 'request', return_value={'id':'fixture-session','state':'running'}) as transport:
+            session_control.execute(self.parse('start', '--no-wait', '--workspace', 'demo', '--prompt', 'review it',
+                                                '--purpose', 'review', '--key', 'k-purpose-review'))
+        self.assertEqual(transport.call_args.args[2]['purpose'], 'review')
+        with self.assertRaises(SystemExit):
+            self.parse('start', '--no-wait', '--workspace', 'demo', '--prompt', 'x', '--purpose', 'deploy')
+
+    def test_start_waits_by_default_with_bounded_150s_and_no_wait_skips(self):
+        args = self.parse('start', '--workspace', 'demo', '--prompt', 'wait for me', '--key', 'k-wait')
+        self.assertEqual(session_control.check_wait_args(args), (session_control.START_WAIT_TIMEOUT, 5.0))
+        self.assertEqual(session_control.START_WAIT_TIMEOUT, 150.0)
+        with patch.object(session_control, 'request', return_value={'id': 's-wait'}) as transport, \
+                patch.object(session_control, 'wait_for_session', return_value={'session': {'id': 's-wait', 'state': 'running'}}) as wait:
+            session_control.execute(args)
+        wait.assert_called_once_with('s-wait', 150.0, 5.0)
+        self.assertEqual(transport.call_args.args[:2], ('POST', '/api/sessions'))
+        no_wait = self.parse('start', '--workspace', 'demo', '--prompt', 'receipt only', '--key', 'k-nowrap', '--no-wait')
+        self.assertIsNone(session_control.check_wait_args(no_wait)[0])
+        with patch.object(session_control, 'request', return_value={'id': 's-nowrap'}) as transport, \
+                patch.object(session_control, 'wait_for_session') as wait:
+            session_control.execute(no_wait)
+        wait.assert_not_called()
+
+    def test_start_wait_failure_reports_stage(self):
+        args = self.parse('start', '--workspace', 'demo', '--key', 'k-stage', '--timeout', '5', '--interval', '1')
+        failed = {'session': {'id': 's-stage', 'state': 'failed', 'stage': 'admission',
+                              'attention': {'reason': 'no_machine_for_constraints'}}}
+        with patch.object(session_control, 'request', side_effect=[{'id': 's-stage'}, failed]), \
+                patch.object(session_control.time, 'sleep', return_value=None):
+            with self.assertRaisesRegex(ValueError, 'stage=admission'):
+                session_control.execute(args)
+
+    def test_list_table_maps_hub2_session_view_fields(self):
+        hub2_rows = [
+            {'id': 'hub2-1', 'state': 'running', 'engine': 'claude', 'model': 'fable',
+             'machine_id': 'hetzner-01', 'account_id': 'acct-fable', 'interactive': True,
+             'native_id': 'd4762b81-9a0a-46fb-b6d0-79c4f382a0f7',
+             'updated_at': 1773000000000},
+            {'id': 'hub1-1', 'state': 'running', 'engine': 'codex', 'model': 'gpt-6',
+             'machine': 'host-a', 'account': 'shared-codex', 'interactive': False,
+             'native_tag': 'hub-offer-42', 'updated_at': '2026-11-10T12:34:56Z'},
+            {'id': 'legacy-1', 'state': 'offered', 'updated_at': None},
+        ]
+        table = session_control.render_table(hub2_rows)
+        self.assertIn('HOST', table)
+        self.assertIn('ACCOUNT', table)
+        self.assertIn('NATIVE', table)
+        self.assertIn('hetzner-01', table)
+        self.assertIn('acct-fable', table)
+        self.assertIn('aplexer', table)
+        self.assertIn('host-a', table)
+        self.assertIn('shared-codex', table)
+        self.assertIn('headless', table)
+        self.assertIn('2026-11-10 12:34:56', table)
+        self.assertIn('2026-', table)  # numeric epoch rendered as UTC timestamp
+        self.assertIn('d4762b81-9a0a-46fb-b6d0-79c4f382a0f7', table)  # Hub2 native_id
+        self.assertIn('hub-offer-42', table)  # Hub1 native_tag
+        self.assertNotIn('by no host', table)
+
+    def test_start_output_prints_native_pane_after_wait(self):
+        args = self.parse('start', '--workspace', 'demo', '--prompt', 'bind me', '--key', 'k-native')
+        result = {'id': 's-native', 'state': 'running', 'engine': 'claude', 'model': 'fable',
+                  'binding_wait': {'session': {'id': 's-native', 'state': 'running',
+                                               'native_id': 'd4762b81-9a0a-46fb-b6d0-79c4f382a0f7'}}}
+        err = io.StringIO()
+        with patch.object(sys, 'stderr', err):
+            session_control.render_output(args, result)
+        self.assertIn('Native pane: d4762b81-9a0a-46fb-b6d0-79c4f382a0f7', err.getvalue())
+        # Hub1 binding shape: flat view with native_tag.
+        result_hub1 = {'id': 's-hub1', 'binding_wait': {'native_tag': 'hub-offer-42'}}
+        err = io.StringIO()
+        with patch.object(sys, 'stderr', err):
+            session_control.render_output(args, result_hub1)
+        self.assertIn('Native pane: hub-offer-42', err.getvalue())
+        # No binding yet (--no-wait or unbound): no pane line.
+        err = io.StringIO()
+        with patch.object(sys, 'stderr', err):
+            session_control.render_output(args, {'id': 's-unbound', 'state': 'offered'})
+        self.assertNotIn('Native pane:', err.getvalue())
+
+    def test_start_output_surfaces_picker_pool_shares(self):
+        args = self.parse('start', '--no-wait', '--workspace', 'demo', '--prompt', 'route me', '--key', 'k-picker', '--no-wait')
+        result = {'id': 's-picker', 'state': 'offered', 'engine': 'claude', 'model': 'fable',
+                  'effort': 'medium', 'policy_id': 'claude-fable-medium', 'machine_id': 'hetzner-01',
+                  'picker': {'pool': [{'policy_id': 'claude-fable-medium', 'share': 0.25},
+                                      {'policy_id': 'codex-gpt6-medium', 'share': 0.5}]}}
+        err = io.StringIO()
+        with patch.object(sys, 'stderr', err):
+            session_control.render_output(args, result)
+        self.assertIn('claude/fable/medium', err.getvalue())
+        self.assertIn('claude-fable-medium', err.getvalue())
+        self.assertIn('hetzner-01', err.getvalue())
+        self.assertIn('25.0%', err.getvalue())
+
+    def test_http_error_surfaces_stage_slug(self):
+        import urllib.error
+        payload = {'error': 'start_refused', 'detail': 'no machine matches needs', 'stage': 'placement'}
+        failure = urllib.error.HTTPError('https://hub.test/api/sessions', 409, 'Conflict', {}, io.BytesIO(json.dumps(payload).encode()))
+        with patch.object(session_control.config, 'load_config', return_value={'base_url': 'https://hub.test'}), \
+                patch.dict(os.environ, {'HUB_TOKEN': 'fixture-env-token'}), \
+                patch.object(session_control.api, 'safe_http_json', side_effect=failure):
+            with self.assertRaises(session_control.SessionHTTPError) as ctx:
+                session_control.request('POST', '/api/sessions', {'key': 'k-stage-err'})
+        msg = str(ctx.exception)
+        self.assertIn('start_refused', msg)
+        self.assertIn('stage: placement', msg)
+        self.assertIn('no machine matches needs', msg)
+
+    def test_hub2_unsupported_routes_fail_typed_and_legacy_escape_hatch(self):
+        # conftest defaults tests to the legacy escape hatch; blank it here so
+        # the production refusal path runs for real.
+        refusals = [
+            ('POST', '/api/bus/send'),
+            ('GET', '/api/bus/claims'),
+            ('GET', '/api/webhooks'),
+            ('POST', '/api/prompts'),
+            ('GET', '/api/conversations'),
+            ('GET', '/api/fleet/tasks'),
+            ('POST', '/api/fleet/plan'),
+            ('GET', '/api/fleet/launches'),
+            ('GET', '/api/fleet/accounts'),
+            ('GET', '/api/fleet/resources'),
+            ('POST', '/api/fleet/routing/host-goal'),
+            ('GET', '/api/fleet/routing/policy/grok'),
+            ('GET', '/api/fleet/machines/machine-1'),
+            ('GET', '/api/ops/status'),
+            ('GET', '/api/device/pair'),
+            ('GET', '/api/session-schedules'),
+            ('GET', '/api/driver/sessions'),
+            ('GET', '/api/fleet/machines/machine-1?verbose=true'),
+            ('GET', '/api/fleet/tasks/'),
+        ]
+        for method, path in refusals:
+            with self.subTest(path=path), patch.dict(os.environ, {'HUB_ALLOW_LEGACY_ROUTES': ''}):
+                with self.assertRaises(session_control.SessionInputError) as ctx:
+                    session_control.ensure_hub2_supported(method, path)
+                self.assertIn('not_supported_on_hub2', str(ctx.exception))
+        allowed = [
+            ('GET', '/api/sessions'),
+            ('POST', '/api/sessions'),
+            ('GET', '/api/sessions/s1'),
+            ('GET', '/api/intake/tasks?project=demo'),
+            ('GET', '/api/fleet'),
+            ('GET', '/api/fleet/machines'),
+            ('GET', '/api/fleet/machines?verbose=true'),
+            ('GET', '/api/fleet/routing/machines'),
+            ('GET', '/api/fleet/routing/policy'),
+            ('GET', '/api/status'),
+            ('POST', '/api/model-picker/pick'),
+            ('GET', '/api/claims'),
+            ('GET', '/api/quota'),
+            ('GET', '/api/heartbeat'),
+        ]
+        for method, path in allowed:
+            with self.subTest(path=path), patch.dict(os.environ, {'HUB_ALLOW_LEGACY_ROUTES': ''}):
+                session_control.ensure_hub2_supported(method, path)
+        with patch.dict(os.environ, {'HUB_ALLOW_LEGACY_ROUTES': '1'}):
+            session_control.ensure_hub2_supported('POST', '/api/bus/send')
+
+    def test_bus_request_gate_refuses_hub1_routes(self):
+        from agent_hub_host import bus
+        with patch.object(bus.config, 'load_config', return_value={'base_url': 'https://hub.test'}), \
+                patch.dict(os.environ, {'HUB_URL': 'https://hub.test', 'HUB_TOKEN': 'fixture-env-token',
+                                        'HUB_ALLOW_LEGACY_ROUTES': ''}):
+            with self.assertRaises(ValueError) as ctx:
+                bus._do_request('POST', '/api/bus/send', {'topic': 't'})
+        self.assertIn('not_supported_on_hub2', str(ctx.exception))
 
 
 if __name__ == '__main__':
