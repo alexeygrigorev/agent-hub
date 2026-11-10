@@ -17,6 +17,10 @@ on:
           - bootstrap
           - active
         default: bootstrap
+      verify_gate:
+        description: Verify the Resource Gate after a Hub-only deploy
+        type: boolean
+        default: true
       oncall_recipient_public_key_b64:
         description: Optional base64 PEM RSA public key for a one-time, recipient-encrypted oncall token artifact
         type: string
@@ -52,6 +56,8 @@ jobs:
           test -s deploy/resource-gate-monitor.timer
           bash -n scripts/resource-gate-monitor.sh scripts/install-resource-gate-monitor.sh
           bash scripts/test-resource-gate-monitor.sh
+          bash -n deploy/vm/test-hub-only-installer.sh
+          bash deploy/vm/test-hub-only-installer.sh
       - name: Session controller shell regression tests
         run: |
           mkdir -p "${RUNNER_TEMP}/ops-watchdog-home"
@@ -103,11 +109,16 @@ jobs:
       - name: Deploy validated revision to the hub VM (SSH only; no cloud credentials)
         env:
           RELEASE_MODE: ${{ inputs.release_mode }}
+          VERIFY_GATE: ${{ inputs.verify_gate }}
           SSH: ssh -i ~/.ssh/hub_vm_key -o StrictHostKeyChecking=accept-new -o BatchMode=yes ${{ secrets.AGENT_HUB_VM_USER }}@${{ secrets.AGENT_HUB_VM_HOST }}
         run: |
           case "$RELEASE_MODE" in
             bootstrap|active) ;;
             *) echo "invalid release mode" >&2; exit 2 ;;
+          esac
+          case "$VERIFY_GATE" in
+            true|false) ;;
+            *) echo "invalid verify_gate value" >&2; exit 2 ;;
           esac
           $SSH 'set -eu
             cd /opt/agent-hub
@@ -116,7 +127,11 @@ jobs:
             export TMPDIR=/opt/agent-hub/.local/tmp
             mkdir -p "$TMPDIR"
             npm ci --omit=dev
-            sudo bash deploy/vm/install-hub2-node.sh --release-mode '"$RELEASE_MODE"'
+            if [ '"$VERIFY_GATE"' = true ]; then
+              sudo bash deploy/vm/install-hub2-node.sh --release-mode '"$RELEASE_MODE"'
+            else
+              sudo bash deploy/vm/install-hub2-node.sh --release-mode '"$RELEASE_MODE"' --hub-only
+            fi
             systemctl is-active --quiet agent-hub-hub2.service
             curl -fsS --max-time 10 http://127.0.0.1:8787/health'
       - name: Verify public health through the edge
@@ -138,6 +153,7 @@ jobs:
           echo "public health did not report requested release mode: $RELEASE_MODE" >&2
           exit 1
       - name: Verify Resource Gate TLS site
+        if: inputs.verify_gate
         run: |
           for attempt in 1 2 3 4 5 6; do
             payload="$(curl -fsS --max-time 15 https://gate.dtcdev.click/ 2>/dev/null || true)"

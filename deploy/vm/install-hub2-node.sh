@@ -9,6 +9,7 @@
 set -euo pipefail
 
 RELEASE_MODE=""
+HUB_ONLY=false
 while (($#)); do
   case "$1" in
     --release-mode)
@@ -18,6 +19,10 @@ while (($#)); do
       fi
       RELEASE_MODE="$2"
       shift 2
+      ;;
+    --hub-only)
+      HUB_ONLY=true
+      shift
       ;;
     *)
       echo "unknown argument: $1" >&2
@@ -41,13 +46,17 @@ install -m 644 "$DEPLOY_DIR/agent-hub-hub2.service" /etc/systemd/system/agent-hu
 systemctl disable --now agent-hub-worker.service agent-hub-cron.timer agent-hub-cron.service 2>/dev/null || true
 rm -f /etc/systemd/system/agent-hub-worker.service /etc/systemd/system/agent-hub-cron.service /etc/systemd/system/agent-hub-cron.timer
 
-echo "== edge (Caddy :80 -> Hub2 :8787; gate.dtcdev.click TLS -> Resource Gate :8791)"
-if ! grep -Eq '^[[:space:]]*gate\.dtcdev\.click[[:space:]]*\{' "$DEPLOY_DIR/Caddyfile" \
-  || ! grep -Fq 'reverse_proxy 127.0.0.1:8791' "$DEPLOY_DIR/Caddyfile"; then
-  echo "refusing to replace Caddyfile: Resource Gate TLS site for gate.dtcdev.click is required" >&2
-  exit 1
+if [[ "$HUB_ONLY" != true ]]; then
+  echo "== edge (Caddy :80 -> Hub2 :8787; gate.dtcdev.click TLS -> Resource Gate :8791)"
+  if ! grep -Eq '^[[:space:]]*gate\.dtcdev\.click[[:space:]]*\{' "$DEPLOY_DIR/Caddyfile" \
+    || ! grep -Fq 'reverse_proxy 127.0.0.1:8791' "$DEPLOY_DIR/Caddyfile"; then
+    echo "refusing to replace Caddyfile: Resource Gate TLS site for gate.dtcdev.click is required" >&2
+    exit 1
+  fi
+  install -m 644 "$DEPLOY_DIR/Caddyfile" /etc/caddy/Caddyfile
+else
+  echo "== edge unchanged (Hub-only deploy)"
 fi
-install -m 644 "$DEPLOY_DIR/Caddyfile" /etc/caddy/Caddyfile
 
 echo "== state directories"
 install -d -m 750 -o alexey -g alexey "$DB_DIR" "$REPO/.local/tmp"
@@ -146,7 +155,9 @@ echo "== services"
 systemctl daemon-reload
 systemctl enable agent-hub-hub2.service
 systemctl restart agent-hub-hub2.service
-systemctl reload caddy 2>/dev/null || systemctl restart caddy
+if [[ "$HUB_ONLY" != true ]]; then
+  systemctl reload caddy 2>/dev/null || systemctl restart caddy
+fi
 
 sleep 3
 systemctl is-active --quiet agent-hub-hub2.service
