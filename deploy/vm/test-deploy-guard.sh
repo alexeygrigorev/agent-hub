@@ -103,6 +103,7 @@ CADDY_OLD
 cat > "$TEST_ROOT/seed/deploy/vm/install-hub2-node.sh" <<'INSTALLER'
 #!/usr/bin/env bash
 set -euo pipefail
+[[ "$PWD" == "${AGENT_HUB_TEST_REPO:?}" ]] || exit 89
 hub_only=false
 release_mode=""
 while (($#)); do

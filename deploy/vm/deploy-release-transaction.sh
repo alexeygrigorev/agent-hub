@@ -73,6 +73,7 @@ restore_previous_release() {
     printf 'No pending deploy transaction; nothing to roll back.\n'
     return 0
   fi
+  cd "$REPO" || return 1
 
   previous_sha="$(read_root_file "$TRANSACTION_DIR/previous.sha")"
   [[ "$previous_sha" =~ ^[0-9a-f]{40}$ ]] \
@@ -134,6 +135,7 @@ apply_release() {
   [[ "$gate_mode" == full || "$gate_mode" == hub-only ]] \
     || fail "gate mode must be full or hub-only"
   [[ -d "$REPO/.git" ]] || fail "Hub repository checkout is missing: $REPO"
+  cd "$REPO" || fail "cannot enter Hub repository checkout: $REPO"
   [[ -f "$REPO/.dev.vars" ]] \
     || fail "refusing an unrollbackable deploy because the existing Hub release vars are missing"
 
