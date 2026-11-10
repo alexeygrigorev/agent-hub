@@ -35,3 +35,11 @@ test('rollback validation stays read-only and Cloudflare-free', () => {
   assert.doesNotMatch(rollback, /CLOUDFLARE_API_TOKEN|versions deploy/);
   assert.match(rollback, /contents: read/);
 });
+
+test('policy recovery helper protocol tests pass offline', {timeout: 45000}, async () => {
+  const {spawnSync} = await import('node:child_process');
+  const result = spawnSync('python3', ['-m', 'unittest', 'discover', '-s', 'test', '-p', 'test_apply_model_policy.py'],
+    {cwd: new URL('..', import.meta.url), encoding: 'utf8', timeout: 40000});
+  assert.equal(result.error, undefined);
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+});

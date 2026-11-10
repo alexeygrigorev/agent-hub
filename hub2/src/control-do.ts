@@ -1007,10 +1007,17 @@ export class ControlDO {
     const path=new URL(request.url).pathname,actor=actorFrom(request);
     if(path!=='/_routing-policy'&&!hasScope(actor,'operator:admin')&&!hasScope(actor,'model-policy:read')&&!hasScope(actor,'routing:read'))return error('forbidden',403);
     const current=this.db.one<{version:number;candidates_json:string;digest:string}>('SELECT version,candidates_json,digest FROM model_policy WHERE id=1');
-    if(request.method==='GET')return current?json({version:current.version,candidates:JSON.parse(current.candidates_json)}):error('model_policy_unconfigured',404);
+    if(request.method==='GET'){
+      const candidates=current?JSON.parse(current.candidates_json):[];
+      return candidates.length?json({version:current!.version,candidates}):json({error:'model_policy_unconfigured',version:current?.version??0},404);
+    }
     if(path==='/_routing-policy'||request.method!=='PUT'||!hasScope(actor,'operator:admin'))return error('forbidden',403);
     const b=await bodyObject(request,128000);
-    if(!Array.isArray(b.candidates)||b.candidates.length>32||!b.candidates.length)return error('invalid_model_policy',400);
+    const restore=b.restore_unconfigured===true;
+    if(b.restore_unconfigured!==undefined&&!restore)return error('invalid_model_policy_restore',400);
+    if(b.expected_version!==undefined&&(!Number.isSafeInteger(b.expected_version)||Number(b.expected_version)<0))return error('invalid_model_policy_version',400);
+    if(restore&&(!Number.isSafeInteger(b.expected_version)||!Array.isArray(b.candidates)||b.candidates.length!==0))return error('invalid_model_policy_restore',400);
+    if(!Array.isArray(b.candidates)||b.candidates.length>32||!b.candidates.length&&!restore)return error('invalid_model_policy',400);
     const ids=new Set<string>(),candidates:JsonRecord[]=[];
     for(const candidate of b.candidates){
       if(!candidate||typeof candidate!=='object'||Array.isArray(candidate))return error('invalid_model_candidate',400);
@@ -1027,6 +1034,7 @@ export class ControlDO {
       const prior=this.db.one<{version:number;digest:string}>('SELECT version,digest FROM model_policy WHERE id=1');
       if(b.expected_version!==undefined&&b.expected_version!==(prior?.version??0))return error('model_policy_version_conflict',409);
       if(prior?.digest===digest)return json({version:prior.version,candidates,unchanged:true});
+      if((prior?.version??0)>=Number.MAX_SAFE_INTEGER)return error('model_policy_version_exhausted',409);
       const version=(prior?.version??0)+1;this.db.run('INSERT INTO model_policy(id,version,candidates_json,digest) VALUES(1,?,?,?) ON CONFLICT(id) DO UPDATE SET version=excluded.version,candidates_json=excluded.candidates_json,digest=excluded.digest',version,encoded,digest);return json({version,candidates});
     });
   }
