@@ -601,18 +601,27 @@ export class ProjectDO {
       return error('invalid_stopped_receipt',400);
     const launchTimedOut=body.reason==='launch_timeout_no_native';
     const saga=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?',body.operation_id);
-    if(!saga||saga.session_id!==body.session_id||saga.machine_id!==body.machine_id||saga.attempt_operation_id!==body.attempt_operation_id
-      ||saga.epoch!==body.epoch)return error('stale_stopped_receipt',409);
+    if(!saga||saga.session_id!==body.session_id||saga.machine_id!==body.machine_id)return error('stale_stopped_receipt',409);
+    const exactAttempt=saga.attempt_operation_id===body.attempt_operation_id&&saga.epoch===body.epoch;
+    const previousAttempt=saga.attempt>0&&body.attempt_operation_id===`${saga.operation_id}:${saga.attempt-1}`&&saga.epoch===body.epoch;
+    const pendingRetryStop=!launchTimedOut&&body.reason==='stop_confirmed'&&body.native_id==null&&saga.native_id===null
+      &&saga.state==='pending_machine'&&previousAttempt;
+    const duplicateRetryStop=!launchTimedOut&&body.reason==='stop_confirmed'&&body.native_id==null&&saga.native_id===null
+      &&saga.state==='complete'&&saga.last_reason==='stop_confirmed'&&previousAttempt;
+    if(!exactAttempt&&!pendingRetryStop&&!duplicateRetryStop)return error('stale_stopped_receipt',409);
     if(saga.state==='complete')return saga.last_reason==='launch_timeout_no_native'
       ?json({failed:true,duplicate:true,session_id:saga.session_id,reason:'launch_timeout_no_native'}):json({stopped:true,duplicate:true});
     if(launchTimedOut&&(!['offered','claimed','admitted'].includes(saga.state)||saga.native_id!==null||body.native_id!==null||body.launch_failed!==true))return error('invalid_launch_timeout_receipt',409);
-    if(!['offered','claimed','admitted','running'].includes(saga.state))return error('session_not_active',409);
+    if(!['offered','claimed','admitted','running'].includes(saga.state)&&!pendingRetryStop)return error('session_not_active',409);
     const intake=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',saga.intake_id);
     if(!intake||intake.session_id!==saga.session_id||intake.assigned_machine_id!==saga.machine_id)return error('stopped_intake_binding_mismatch',409);
     const now=Date.now(),eventKey=`stopped:${saga.attempt_operation_id}:${saga.epoch}`;
-    this.transaction(()=>{
-      this.db.run("UPDATE dispatch_sagas SET state='complete',native_id=COALESCE(native_id,?),next_action_at=NULL,last_reason=?,updated_at=? WHERE operation_id=?",
-        typeof body.native_id==='string'?body.native_id:null,String(body.reason),now,saga.operation_id);
+    const applied=this.transaction(()=>{
+      const current=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?',saga.operation_id);
+      if(!current||current.state!==saga.state||current.attempt_operation_id!==saga.attempt_operation_id||current.epoch!==saga.epoch)return false;
+      if(!['offered','claimed','admitted','running'].includes(current.state)&&!pendingRetryStop)return false;
+      this.db.run("UPDATE dispatch_sagas SET state='complete',native_id=COALESCE(native_id,?),next_action_at=NULL,last_reason=?,updated_at=? WHERE operation_id=? AND state=? AND attempt_operation_id=? AND epoch=?",
+        typeof body.native_id==='string'?body.native_id:null,String(body.reason),now,saga.operation_id,saga.state,saga.attempt_operation_id,saga.epoch);
       this.db.run("UPDATE intakes SET status='failed',final_evidence_json=?,updated_at=? WHERE id=?",
         JSON.stringify({...(launchTimedOut?{launch_failed:true,native_id_absent:true}:{stopped:true}),reaped,
           operation_id:saga.operation_id,attempt_operation_id:saga.attempt_operation_id,
@@ -620,7 +629,9 @@ export class ProjectDO {
           native_id:body.native_id??null,observed_at:body.observed_at}),now,intake.id);
       this.appendEvent(intake.id,eventKey,`machine:${saga.machine_id}`,launchTimedOut?'session_launch_failed':reaped?'session_reaped':'session_stopped',
         {session_id:saga.session_id,machine_id:saga.machine_id,epoch:saga.epoch,reason:body.reason,native_id:body.native_id??null},now);
+      return true;
     });
+    if(!applied)return error('stale_stopped_receipt',409);
     await this.env.CONTROL.get(this.env.CONTROL.idFromName('global')).fetch('https://control.internal/_internal/session-cap/release',{
       method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({operation_id:saga.operation_id,session_id:saga.session_id}),
     }).catch(()=>undefined);
