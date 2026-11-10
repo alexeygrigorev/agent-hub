@@ -59,6 +59,10 @@ read_root_file() {
   run_root cat "$1"
 }
 
+install_release_dependencies() {
+  TMPDIR="$TMPDIR" npm --prefix "$REPO" ci --omit=dev
+}
+
 remove_transaction_state() {
   run_root rm -rf -- "$TRANSACTION_DIR"
 }
@@ -78,7 +82,7 @@ restore_previous_release() {
 
   printf 'Rolling Hub2 back to %s\n' "$previous_sha"
   git -C "$REPO" checkout --detach --force "$previous_sha" || return 1
-  TMPDIR="$TMPDIR" npm ci --omit=dev || return 1
+  install_release_dependencies || return 1
 
   gate_mode=full
   if run_root test -f "$TRANSACTION_DIR/gate-mode"; then
@@ -194,7 +198,7 @@ apply_release() {
   write_root_file "$TRANSACTION_DIR/prepared" yes
 
   git -C "$REPO" checkout --detach --force "$deploy_sha"
-  TMPDIR="$TMPDIR" npm ci --omit=dev
+  install_release_dependencies
   if [[ "$gate_mode" == full ]]; then
     run_root bash "$REPO/deploy/vm/install-hub2-node.sh" --release-mode "$release_mode"
   else
