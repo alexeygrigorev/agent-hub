@@ -3,6 +3,19 @@
 Status: implemented source (2026-10-26). Release gates are the full local suite, independent exact-version review, and green CI/dev before production. Live acceptance evidence belongs in the intake DONE note and operator report. Intake: `4fcd3139-fb34-435c-86ec-5a24ddf6c3ee`.
 Keep this doc updated as each part lands.
 
+## Hub2 placement setting
+
+The deploy owner sets `HUB2_DISK_FLOOR_GB` in the Hub2 VM's existing runtime configuration.
+Use the operator-selected value in GiB, including a decimal fraction if needed. For a deployment
+that uses the default placement policy, set it explicitly to 15. Before a reviewer launch, use
+`hub resources settings --json` with an administrator profile. This reads the running server;
+an unavailable or invalid result cannot authorize placement. Continue to apply the maintained
+launcher's memory, reservation, and disk checks on the actual working and scratch filesystems.
+
+This read reports the configured placement floor. It does not measure free space, attest
+native daemon admission, or bring back the Hub1 watchdog. The rest of this document
+describes the retained Hub1 implementation.
+
 ## Goal
 
 Use Hetzner to the max (Alexey t1475u, 2026-10-26: «34 это очень много памяти,

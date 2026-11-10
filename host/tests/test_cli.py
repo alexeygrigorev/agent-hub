@@ -8,6 +8,28 @@ import unittest
 HOST_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 class TestCliIsolated(unittest.TestCase):
+    def test_hub2_resource_settings_require_a_valid_floor(self):
+        from agent_hub_host import cli
+        from contextlib import redirect_stderr, redirect_stdout
+        from unittest.mock import patch
+
+        argv = ["hub", "resources", "settings", "--json"]
+        valid = {"resource_settings": {"disk_floor_gb": 27.5}}
+        with patch.object(sys, "argv", argv), patch("agent_hub_host.bus._do_request",
+                return_value=valid) as transport, redirect_stdout(io.StringIO()) as output:
+            cli.main()
+        transport.assert_called_once_with("GET", "/api/resource-settings")
+        self.assertEqual(json.loads(output.getvalue()), valid)
+        for value in (None, True, "15", 0, float("nan"), float("inf")):
+            with self.subTest(value=value), patch.object(sys, "argv", argv), patch(
+                    "agent_hub_host.bus._do_request",
+                    return_value={"resource_settings": {"disk_floor_gb": value}}), redirect_stdout(
+                    io.StringIO()) as output, redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as failed:
+                    cli.main()
+                self.assertEqual(failed.exception.code, 1)
+                self.assertEqual(output.getvalue(), "")
+
     def test_interactive_prompt_is_sent_after_binding(self):
         from agent_hub_host import cli, session_control
         from unittest.mock import patch, mock_open
