@@ -208,15 +208,19 @@ CI deploys over the SSH deploy key, so routine operation needs neither.
 
 `scripts/install-resource-gate-monitor.sh` installs the RMTHZ systemd service
 and one-minute timer from `deploy/resource-gate-monitor.service` and
-`deploy/resource-gate-monitor.timer`. The check requests
-`https://gate.dtcdev.click/` over verified TLS and requires the Resource Gate
-page marker; the gate application does not expose a `/health` route. A failed
-check sends a critical email to `dev@dtcdev.click` through RMTHZ's existing
-`msmtp` `alerts` account after two consecutive failures. It sends one critical
-email per incident without periodic repeats, then sends one recovery email and
-updates the DataOps task after two consecutive healthy checks. Its state stays
-under `/var/lib/resource-gate-monitor` on RMTHZ. The GCP VM has no MTA, so it
-does not own the email alert path.
+`deploy/resource-gate-monitor.timer`. The external check verifies the Gate TLS
+page, performs an authenticated read-only desktop grant check, checks the
+authenticated tools gateway and `DESKTOP-FP4OP26` health, and reads the Hub API
+health endpoint. After two consecutive failures it creates a DataOps task and
+sends one critical email per incident through RMTHZ's existing `msmtp` `alerts`
+account, to `dev@dtcdev.click` with `orin@dtcdev.click` copied. After two
+consecutive healthy checks it sends one recovery email and updates the DataOps
+task. To exercise live mail delivery and the DataOps test-task path after
+installation, run `sudo -u alexey /usr/local/sbin/resource-gate-monitor.sh
+--test-alert`; this uses the production state directory and sends a clearly
+marked test message to both recipients. The monitor state stays under
+`/var/lib/resource-gate-monitor` on RMTHZ. The GCP VM has no MTA, so it does
+not own the email alert path.
 
 Install or refresh the monitor on RMTHZ after merging its code:
 
