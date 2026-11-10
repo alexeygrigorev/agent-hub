@@ -1,3 +1,4 @@
+import io
 import urllib.request
 import urllib.error
 import sys, os
@@ -21,6 +22,48 @@ class MockRNG:
         return b"x" * n
 
 class TestApi(unittest.TestCase):
+    def test_release_bootstrap_503_logs_actionable_hub2_url(self):
+        url = api.config.LEGACY_WORKERS_BASE_URL + "/api/sessions"
+        body = b'{"error":"release_bootstrap","dispatch_enabled":false}'
+        error = urllib.error.HTTPError(
+            url, 503, "Service unavailable", {"Content-Length": str(len(body))}, io.BytesIO(body)
+        )
+        opener = MagicMock()
+        opener.open.side_effect = error
+        request = urllib.request.Request(url, headers={"Authorization": "Bearer synthetic-secret"})
+        logged = io.StringIO()
+
+        with patch.object(api, "_get_opener", return_value=opener), \
+             patch("agent_hub_host._prod_guard.assert_request_allowed"), \
+             patch("sys.stderr", logged):
+            with self.assertRaises(api.LegacyHubEndpointError) as ctx:
+                api.safe_http_json(request)
+
+        message = str(ctx.exception)
+        self.assertIn("HTTP 503 release_bootstrap", message)
+        self.assertIn("https://hub.dtcdev.click", message)
+        self.assertIn("hub auth login --url https://hub.dtcdev.click", message)
+        self.assertIn('"event": "hub_endpoint_misconfigured"', logged.getvalue())
+        self.assertIn('"replacement_url": "https://hub.dtcdev.click"', logged.getvalue())
+        self.assertNotIn("synthetic-secret", logged.getvalue())
+
+    def test_non_bootstrap_503_preserves_its_error_body(self):
+        url = "https://hub.example.test/api/sessions"
+        body = b'{"error":"temporarily_unavailable"}'
+        error = urllib.error.HTTPError(
+            url, 503, "Service unavailable", {"Content-Length": str(len(body))}, io.BytesIO(body)
+        )
+        opener = MagicMock()
+        opener.open.side_effect = error
+        request = urllib.request.Request(url)
+
+        with patch.object(api, "_get_opener", return_value=opener), \
+             patch("agent_hub_host._prod_guard.assert_request_allowed"):
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                api.safe_http_json(request)
+
+        self.assertEqual(ctx.exception.read(), body)
+
     @patch("agent_hub_host.gate.get_gate_status", return_value={"launch_allowed": True})
     @patch("agent_hub_host.cpu_resources.sample_cpu_usage", return_value={"observed_at": "2026-11-03T00:00:00Z"})
     @patch("agent_hub_host.host_memory.read_host_swap_used_percent", return_value=81.5)

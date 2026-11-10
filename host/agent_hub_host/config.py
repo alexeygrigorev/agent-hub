@@ -27,6 +27,7 @@ def get_config_path() -> Path:
 # Baked default hub base URL for fresh human installs (overridable via
 # --url, stored base_url, HUB_URL/HUB_BASE_URL, or HUB_CONFIG_FILE).
 DEFAULT_BASE_URL = "https://hub.dtcdev.click"
+LEGACY_WORKERS_BASE_URL = "https://agent-hub.cloudflare-ai-agent-de9ca0.workers.dev"
 
 
 def get_human_config_path() -> Path:
@@ -107,7 +108,8 @@ def same_origin(url_a: str, url_b: str) -> bool:
 class _TokenExchange:
     """One local login/refresh receipt; never ambient config-update authority."""
 
-    def __init__(self, base_url, path, starting_config, *, _load_fn=None, _save_fn=None):
+    def __init__(self, base_url, path, starting_config, *, _load_fn=None, _save_fn=None,
+                 allow_origin_change=False):
         if path not in ("/api/device/token", "/api/token/refresh"):
             raise ValueError("Invalid token endpoint")
         canonical_origin(base_url)
@@ -115,10 +117,17 @@ class _TokenExchange:
         parsed = urllib.parse.urlparse(self.url)
         if parsed.path != path or parsed.query or parsed.params:
             raise ValueError("Invalid token endpoint")
-        if starting_config.get("base_url") and not same_origin(base_url, starting_config["base_url"]):
+        stored_base = starting_config.get("base_url")
+        origin_changed = bool(stored_base and not same_origin(base_url, stored_base))
+        if type(allow_origin_change) is not bool:
+            raise TypeError("allow_origin_change must be boolean")
+        if origin_changed and (
+            not allow_origin_change or path != "/api/device/token"
+        ):
             raise ValueError("Authentication origin mismatch")
         self.base_url = base_url
         self.path = path
+        self._replace_profile_on_commit = origin_changed
         self.starting_config = copy.deepcopy(starting_config)
         self._load_fn = _load_fn or load_config
         self._save_fn = _save_fn or save_config
@@ -164,7 +173,10 @@ class _TokenExchange:
             raise ValueError("Invalid authentication metadata")
         if self._load_fn() != self.starting_config:
             raise ValueError("Config changed during authentication; retry login")
-        cfg = copy.deepcopy(self.starting_config)
+        # A device login on a different origin is an explicit credential
+        # migration. Never carry access/refresh tokens or other server-bound
+        # metadata from the old origin into the new profile.
+        cfg = {} if self._replace_profile_on_commit else copy.deepcopy(self.starting_config)
         cfg.update(metadata)
         cfg["access_token"] = data["access_token"]
         # Requested scopes describe login intent, not the approver's consent.

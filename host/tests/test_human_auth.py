@@ -214,6 +214,56 @@ class TestHumanLogin(unittest.TestCase):
         self.assertEqual(human.get("client_name"), "grove-box")
         self.assertEqual(human.get("requested_scopes"), ["admin"])
 
+    def test_login_migrates_a_stale_workers_profile_without_reusing_its_tokens(self):
+        stale = {
+            "base_url": config.LEGACY_WORKERS_BASE_URL,
+            "access_token": "stale-access-secret",
+            "refresh_token": "stale-refresh-secret",
+            "machine_id": "stale-machine",
+            "client_kind": "human",
+            "client_name": "old-cli",
+            "granted_scopes": ["old-scope"],
+        }
+        config.save_human_config(stale)
+        with patch.dict(os.environ, {"HUB_URL": "", "HUB_BASE_URL": ""}):
+            self.assertEqual(human_auth.resolve_base_url(), config.DEFAULT_BASE_URL)
+
+        seen = []
+
+        def opener(req, timeout=None):
+            seen.append({
+                "url": req.full_url,
+                "authorization": req.get_header("Authorization"),
+                "body": req.data.decode("utf-8") if req.data else "",
+            })
+            if req.full_url.endswith("/api/device/code"):
+                return _code_response(url=config.DEFAULT_BASE_URL)
+            if req.full_url.endswith("/api/device/token"):
+                return _token_response("new-access", "new-refresh")
+            raise AssertionError(req.full_url)
+
+        with patch("urllib.request.OpenerDirector.open", side_effect=opener), \
+             patch("agent_hub_host._prod_guard.assert_request_allowed"):
+            with patch.object(sys, "stdout", io.StringIO()):
+                human_auth.human_login(config.DEFAULT_BASE_URL, "orin-box")
+
+        self.assertEqual(
+            [row["url"] for row in seen],
+            [
+                config.DEFAULT_BASE_URL + "/api/device/code",
+                config.DEFAULT_BASE_URL + "/api/device/token",
+            ],
+        )
+        self.assertTrue(all(row["authorization"] is None for row in seen))
+        self.assertNotIn("stale-access-secret", json.dumps(seen))
+        self.assertNotIn("stale-refresh-secret", json.dumps(seen))
+        saved = config.load_human_config()
+        self.assertEqual(saved["base_url"], config.DEFAULT_BASE_URL)
+        self.assertEqual(saved["access_token"], "new-access")
+        self.assertEqual(saved["refresh_token"], "new-refresh")
+        self.assertNotIn("machine_id", saved)
+        self.assertNotIn("old-scope", json.dumps(saved))
+
 
 class TestHumanStatusLogout(unittest.TestCase):
     def setUp(self):

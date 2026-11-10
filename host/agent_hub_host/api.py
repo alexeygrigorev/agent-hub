@@ -6,6 +6,8 @@ import random
 import socket
 import ssl
 import struct
+import io
+import sys
 import time
 import urllib.request
 import urllib.error
@@ -18,6 +20,52 @@ class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 # Cloudflare rejects urllib's default "Python-urllib/x.y" User-Agent (error 1010) before the
 # Worker runs, so every hub request identifies the client explicitly.
 USER_AGENT = "agent-hub-host/1"
+HUB2_BASE_URL = "https://hub.dtcdev.click"
+
+
+class LegacyHubEndpointError(RuntimeError):
+    """A request reached the retired workers.dev bootstrap endpoint."""
+
+
+def _legacy_bootstrap_error(req, response):
+    """Return the actionable legacy-endpoint error, preserving other bodies."""
+    if response.code != 503:
+        return None
+    length = response.headers.get("Content-Length") if response.headers else None
+    try:
+        size = int(length)
+    except (TypeError, ValueError):
+        return None
+    if size < 0 or size > 8192:
+        return None
+    raw = b""
+    try:
+        raw = response.read(size)
+        payload = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        payload = None
+    if not isinstance(payload, dict) or payload.get("error") != "release_bootstrap":
+        # Rebuild the HTTPError around the bytes we inspected. HTTPError's
+        # inherited read() method may retain the original closed file object.
+        raise urllib.error.HTTPError(
+            response.url, response.code, response.msg, response.headers, io.BytesIO(raw)
+        )
+
+    host = urllib.parse.urlsplit(req.full_url).hostname or "unknown"
+    message = (
+        f"Agent Hub endpoint {host} is the retired workers.dev bootstrap stub "
+        f"(HTTP 503 release_bootstrap). Use {HUB2_BASE_URL}; to sign in and "
+        f"replace a stale profile, run `hub auth login --url {HUB2_BASE_URL}`."
+    )
+    print(json.dumps({
+        "event": "hub_endpoint_misconfigured",
+        "status": 503,
+        "error": "release_bootstrap",
+        "endpoint_host": host,
+        "replacement_url": HUB2_BASE_URL,
+    }, sort_keys=True), file=sys.stderr, flush=True)
+    print(message, file=sys.stderr, flush=True)
+    raise LegacyHubEndpointError(message) from None
 
 def _get_opener():
     # Never route Hub traffic through HTTP(S)_PROXY from the user environment: a
@@ -158,6 +206,7 @@ def safe_http_json(req: urllib.request.Request, timeout: float = 10.0, *, _token
             return data
     except urllib.error.HTTPError as e:
         _note_hub_success()  # the Hub answered
+        _legacy_bootstrap_error(req, e)
         raise
     except (urllib.error.URLError, OSError) as e:
         _note_hub_failure(e)

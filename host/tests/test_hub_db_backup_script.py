@@ -336,7 +336,7 @@ class HubDbBackupScriptTest(unittest.TestCase):
         self.assertIn("chunk fetch failed table=claims", alerts[0][1])
         self.assertIn("HTTP 404", alerts[0][1])
 
-    def test_release_bootstrap_503_skips_without_alert(self) -> None:
+    def test_release_bootstrap_503_fails_and_alerts_with_hub2_url(self) -> None:
         for body in (
             {"error": "release_bootstrap"},
             {"dispatch_enabled": False},
@@ -344,13 +344,19 @@ class HubDbBackupScriptTest(unittest.TestCase):
             with self.subTest(body=body):
                 hub = FakeHub()
                 hub.status_override = (503, body)
+                alerts_before = len(self.alerts())
 
                 res = self.run_backup(hub)
 
-                self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
-                self.assertIn("SKIP: Hub stubbed / dispatch disabled; backup skipped", res.stdout)
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn("legacy Hub release_bootstrap stub returned HTTP 503", res.stdout)
+                self.assertIn("https://hub.dtcdev.click", res.stdout)
                 self.assertEqual(hub.requests, ["/api/backup/status"])
-                self.assertEqual(self.alerts(), [])
+                alerts = self.alerts()
+                self.assertEqual(len(alerts), alerts_before + 1, alerts)
+                self.assertEqual(alerts[-1][0], "--backup-failed")
+                self.assertIn("release_bootstrap", alerts[-1][1])
+                self.assertIn("https://hub.dtcdev.click", alerts[-1][1])
                 self.assertEqual(self.exports("local"), [])
                 self.assertEqual(self.exports("box"), [])
 

@@ -42,6 +42,8 @@ def resolve_base_url(explicit=None) -> str:
             return val
     human = config.load_human_config()
     if isinstance(human.get("base_url"), str) and human["base_url"]:
+        if config.same_origin(human["base_url"], config.LEGACY_WORKERS_BASE_URL):
+            return config.DEFAULT_BASE_URL
         return human["base_url"]
     # Fresh Linux default (baked, configurable via --url or env).
     return config.DEFAULT_BASE_URL
@@ -69,9 +71,23 @@ def human_login(base_url=None, label=None):
     # no name/hostname/requested_scopes are read for human starts.
     scopes = list(HUMAN_SCOPES)
     starting = config.load_human_config()
+    stored_base = starting.get("base_url")
+    origin_changed = bool(stored_base and not config.same_origin(base, stored_base))
+    # An explicit --url is the operator's authority to move this human profile
+    # to another Hub. The known retired workers.dev profile also migrates to
+    # the baked Hub2 default when the user runs login without --url. The token
+    # exchange replaces the profile only after the new endpoint grants tokens.
+    allow_origin_change = origin_changed and (
+        base_url is not None
+        or (
+            config.same_origin(stored_base, config.LEGACY_WORKERS_BASE_URL)
+            and config.same_origin(base, config.DEFAULT_BASE_URL)
+        )
+    )
     exchange = config._TokenExchange(
         base, "/api/device/token", starting,
         _load_fn=config.load_human_config, _save_fn=config.save_human_config,
+        allow_origin_change=allow_origin_change,
     )
     flow = _flow()
     try:
