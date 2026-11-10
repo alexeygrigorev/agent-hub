@@ -23,6 +23,10 @@ browser/host ──HTTPS──> CloudFront (EYWL8OW5EM1UL, ACM hub.dtcdev.click)
                             │
                             ▼
                         /var/lib/agent-hub/hub2-db/*.sqlite   (one file per DO)
+
+desktop tools ──HTTPS──> gate.dtcdev.click (Caddy TLS on the same VM :443)
+                            ▼  reverse proxy
+                         resource-gate.service (127.0.0.1:8791)
 ```
 
 | Piece | Where | IaC |
@@ -31,6 +35,13 @@ browser/host ──HTTPS──> CloudFront (EYWL8OW5EM1UL, ACM hub.dtcdev.click)
 | CloudFront distribution + ACM cert, origin = VM | aws-infra `sandbox/hub-edge` (CloudFormation, us-east-1) | change-set only |
 | VM service, secrets, caddy, backups | GCP VM `agent-hub`, `/opt/agent-hub` checkout | `deploy/vm/install-hub2-node.sh` |
 | Deploy from CI | GitHub `deploy.yml` `production` environment | SSH key `AGENT_HUB_VM_DEPLOY_KEY` |
+
+The VM Caddyfile serves two separate sites. `:80` proxies the CloudFront Hub2
+origin to port 8787. `gate.dtcdev.click` terminates automatic HTTPS and proxies
+to the independent Resource Gate on port 8791. The Hub2 installer checks for
+both the gate hostname and upstream before replacing `/etc/caddy/Caddyfile`,
+so a Hub2 rollout fails closed if a later edit would remove the desktop TLS
+site. The Resource Gate process is not restarted by Hub2 deployment.
 
 CI/CD needs **no GCP and no Cloudflare credentials**: deploys run `git fetch +
 npm ci + install + restart` over SSH, then verify
@@ -192,3 +203,23 @@ CI deploys over the SSH deploy key, so routine operation needs neither.
    runs `npm ci --omit=dev` and `deploy/vm/install-hub2-node.sh`, and checks
    `https://hub.dtcdev.click/health`.
 4. Verify from anywhere with `curl https://hub.dtcdev.click/health`.
+
+## Resource Gate outage monitoring
+
+`scripts/install-resource-gate-monitor.sh` installs the RMTHZ systemd service
+and one-minute timer from `deploy/resource-gate-monitor.service` and
+`deploy/resource-gate-monitor.timer`. The check requests
+`https://gate.dtcdev.click/` over verified TLS and requires the Resource Gate
+page marker; the gate application does not expose a `/health` route. A failed
+check sends a critical email to `dev@dtcdev.click` through RMTHZ's existing
+`msmtp` `alerts` account, repeats every 15 minutes while down, and emails a
+recovery notice. Its state stays under `/var/lib/resource-gate-monitor` on
+RMTHZ. The GCP VM has no MTA, so it does not own the email alert path.
+
+Install or refresh the monitor on RMTHZ after merging its code:
+
+```sh
+sudo bash scripts/install-resource-gate-monitor.sh
+systemctl status resource-gate-monitor.timer
+journalctl -u resource-gate-monitor.service --since '10 minutes ago' --no-pager
+```

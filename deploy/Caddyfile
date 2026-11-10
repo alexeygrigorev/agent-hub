@@ -3,3 +3,8 @@
 		header_up X-Forwarded-Host {http.request.header.X-Forwarded-Host}
 	}
 }
+
+gate.dtcdev.click {
+	header Strict-Transport-Security "max-age=31536000"
+	reverse_proxy 127.0.0.1:8791
+}
