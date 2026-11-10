@@ -43,43 +43,29 @@ class TestNoCasualEngine(unittest.TestCase):
         # 3. fleet.js enforces that engine override requires a non-empty explanation
         self.assertIn('Engine override requires an explanation', fleet_js)
 
-    def test_cli_sessions_override_requires_engine_and_reason(self):
-        # Dedicated sessions override command exists and requires engine, reason, and workspace
-        args = self.parse('override', '--workspace', 'demo', '--engine', 'flash', '--reason', 'Specific model verification')
+    def test_cli_sessions_override_requires_engine_and_allows_optional_reason(self):
+        args = self.parse('override', '--workspace', 'demo', '--engine', 'flash')
         self.assertEqual(args.workspace, 'demo')
         self.assertEqual(args.engine, 'flash')
-        self.assertEqual(args.reason, 'Specific model verification')
-
-        # Missing --reason fails
-        with self.assertRaises(SystemExit):
-            self.parse('override', '--workspace', 'demo', '--engine', 'flash')
-
-        # Missing --engine fails
+        self.assertIsNone(args.reason)
+        explained = self.parse('override', '--workspace', 'demo', '--engine', 'flash', '--reason', 'Specific model verification')
+        self.assertEqual(explained.reason, 'Specific model verification')
         with self.assertRaises(SystemExit):
             self.parse('override', '--workspace', 'demo', '--reason', 'Missing engine')
 
-    def test_cli_sessions_start_requires_reason_if_engine_provided(self):
-        # Default start without engine uses policy / tier and requires no reason
-        with patch.object(session_control, 'request', return_value={}) as transport:
-            session_control.execute(self.parse('start', '--workspace', 'demo', '--prompt', 'default start', '--key', 'k1'))
-        self.assertNotIn('engine', transport.call_args.args[2])
-
-        with patch.object(session_control, 'request', return_value={}) as transport:
-            session_control.execute(self.parse('start', '--workspace', 'demo', '--tier', 'quick', '--prompt', 'quick start', '--key', 'k1-quick'))
-        self.assertEqual(transport.call_args.args[2]['tier'], 'quick')
-
-        # Providing --engine WITHOUT --reason must fail with ValueError
-        with self.assertRaises(ValueError) as cm:
-            session_control.execute(self.parse('start', '--workspace', 'demo', '--prompt', 'override start', '--engine', 'flash', '--key', 'k2'))
-        self.assertIn('requires an explanation', str(cm.exception))
-        self.assertIn('--reason', str(cm.exception))
-
-        # Providing --engine WITH --reason passes and forwards both
-        with patch.object(session_control, 'request', return_value={}) as transport:
-            session_control.execute(self.parse('start', '--workspace', 'demo', '--prompt', 'override start', '--engine', 'flash', '--reason', 'Benchmark test', '--key', 'k3'))
-        payload = transport.call_args.args[2]
-        self.assertEqual(payload['engine'], 'flash')
-        self.assertEqual(payload['engine_override_reason'], 'Benchmark test')
+    def test_cli_sessions_start_forwards_overrides_without_explanation_gate(self):
+        for extra in ((), ('--tier', 'quick'), ('--tier', 'deep'), ('--engine', 'flash'),
+                      ('--machine', 'hetzner-aplexer'), ('--model', 'gpt-6.1-sol', '--effort', 'medium')):
+            with self.subTest(extra=extra), patch.object(session_control, 'request', return_value={'id': 's1'}) as transport:
+                session_control.execute(self.parse('start', '--no-wait', '--workspace', 'demo', '--prompt', 'start', '--key', 'k1', *extra))
+            payload = transport.call_args.args[2]
+            self.assertNotIn('engine_override_reason', payload)
+            for index in range(0, len(extra), 2):
+                self.assertEqual(payload[extra[index][2:]], extra[index + 1])
+        with patch.object(session_control, 'request', return_value={'id': 's1'}) as transport:
+            session_control.execute(self.parse('start', '--no-wait', '--workspace', 'demo', '--prompt', 'override start', '--engine', 'flash', '--reason', 'Benchmark test', '--key', 'k3'))
+        self.assertEqual(transport.call_args.args[2]['engine'], 'flash')
+        self.assertEqual(transport.call_args.args[2]['engine_override_reason'], 'Benchmark test')
 
     def test_cli_sessions_list_filter_waiting_and_idle(self):
         sessions = [

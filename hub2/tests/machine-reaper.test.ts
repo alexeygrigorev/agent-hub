@@ -76,7 +76,7 @@ test('authentication refusal from an unclaimed offer routes to model fallback',a
 
 test('live reaper fails an expired claimed no-native launch without slot accounting',async()=>{
  const f=fixture(),epoch=await startClaimed(f,'orphan-session',null);
- f.database.prepare('UPDATE sessions SET updated_at=? WHERE id=?').run(Date.now()-3*60_000,'orphan-session');
+ f.database.prepare('UPDATE sessions SET created_at=?,updated_at=? WHERE id=?').run(Date.now()-3*60_000,Date.now()-3*60_000,'orphan-session');
  const dry=await f.call('/_internal/reap','POST',{dry_run:true});assert.equal(dry.status,200);
  const preview=await dry.json() as any;assert.equal(preview.reaped,0);assert.equal(preview.candidates[0].session_id,'orphan-session');
  assert.equal((f.database.prepare('SELECT state,epoch FROM sessions WHERE id=?').get('orphan-session') as any).state,'claimed');
@@ -92,7 +92,7 @@ test('live reaper fails an expired claimed no-native launch without slot account
 
 test('stale host snapshots still time out a claimed launch without a native identity visibly',async()=>{
  const f=fixture();await startClaimed(f,'orphan-on-stale-host',null);
- f.database.prepare('UPDATE sessions SET updated_at=? WHERE id=?').run(Date.now()-10*60_000,'orphan-on-stale-host');
+ f.database.prepare('UPDATE sessions SET created_at=?,updated_at=? WHERE id=?').run(Date.now()-10*60_000,Date.now()-10*60_000,'orphan-on-stale-host');
  f.database.prepare('UPDATE machine_liveness SET observed_at=? WHERE singleton=1').run(Date.now()-LIVE_SNAPSHOT_TTL_MS-1);
  const response=await f.call('/_internal/reap','POST',{dry_run:false}),report=await response.json() as any;
  assert.equal(report.skipped,'host_liveness_stale');assert.equal(report.reaped,1);
@@ -109,7 +109,7 @@ test('a claimed launch snapshot with no native id times out instead of queuing a
  }]})).status,200);
  f.database.prepare("INSERT INTO session_commands(id,session_id,machine_id,epoch,request_key,request_digest,kind,text,state,result_json,created_at,updated_at) VALUES('expired-capture','launching-without-native','h1',1,'capture-old','capture-digest','capture',NULL,'pending',NULL,?,?)").run(now-10_000,now-10_000);
  f.database.prepare("INSERT INTO session_commands(id,session_id,machine_id,epoch,request_key,request_digest,kind,text,state,result_json,created_at,updated_at) VALUES('expired-stop','launching-without-native','h1',1,'stop-old','stop-digest','stop',NULL,'pending',NULL,?,?)").run(now-5_000,now-5_000);
- f.database.prepare('UPDATE sessions SET updated_at=? WHERE id=?').run(now-3*60_000,'launching-without-native');
+ f.database.prepare('UPDATE sessions SET created_at=?,updated_at=? WHERE id=?').run(now-3*60_000,now-3*60_000,'launching-without-native');
  const response=await f.call('/_internal/reap','POST',{dry_run:false}),report=await response.json() as any;
  assert.equal(response.status,200);assert.equal(report.reaped,1);assert.equal(report.stop_requested,0);
  assert.equal(report.actions[0].action,'marked_failed');assert.equal(report.actions[0].reason,'launch_timeout_no_native');
@@ -226,4 +226,61 @@ test('dead native pane receives a stop command and confirmed exit releases state
  const ack=await f.call(`/api/sessions/dead-session/commands/${command.id}/ack`,'POST',{epoch, result:{stopped:true}});
  assert.equal(ack.status,200);assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get('dead-session') as any).state,'stopped');
  assert.equal(f.events.at(-1)?.path,'/_internal/stopped');assert.equal(f.events.at(-1)?.body.reason,'stop_confirmed');
+});
+
+
+test('an unclaimed offer has one terminal acceptance deadline and never requeues',async()=>{
+ const f=fixture(),session='silent-host';await startOffered(f,session);
+ const accepted=Date.now()-120_001;
+ f.database.prepare('UPDATE sessions SET created_at=?,offer_expires_at=? WHERE id=?').run(accepted,accepted+120_000,session);
+ await f.machine.alarm();
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'failed');
+ assert.equal(f.events.at(-1)?.body.reason,'host_no_response');
+ assert.ok(!f.events.some(event=>event.path==='/_internal/requeue'));
+});
+
+test('claim timestamps cannot extend the original start deadline',async()=>{
+ const f=fixture(),session='late-claim';await startClaimed(f,session,null);
+ f.database.prepare('UPDATE sessions SET created_at=?,updated_at=? WHERE id=?').run(Date.now()-120_001,Date.now(),session);
+ await f.machine.alarm();
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'failed');
+ assert.equal(f.events.at(-1)?.body.reason,'launch_timeout_no_native');
+});
+
+
+test('a pending stop ends as stop_unconfirmed after sixty seconds',async()=>{
+ const f=fixture(),session='stop-deadline';await startClaimed(f,session,'native-stop');
+ const actor={'x-hub2-actor':JSON.stringify({id:'admin',kind:'operator',scopes:['operator:admin']})};
+ const response=await f.call('/api/sessions/'+session+'/commands','POST',{key:'stop-deadline',kind:'stop'},actor);
+ assert.equal(response.status,201);const receipt=await response.json() as any;
+ f.database.prepare('UPDATE session_commands SET created_at=? WHERE id=?').run(Date.now()-60_001,receipt.command.id);
+ await f.machine.alarm();
+ const row=f.database.prepare('SELECT state,result_json FROM session_commands WHERE session_id=?').get(session) as any;
+ assert.equal(row.state,'failed');assert.equal(JSON.parse(row.result_json).error,'stop_unconfirmed');
+});
+
+
+test('claim records admission so native started needs no separate admission request',async()=>{
+ const f=fixture(),session='claim-is-admission',epoch=await startOffered(f,session);
+ const socket={readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'socket'}),send:()=>{}};
+ f.sockets.push(socket);
+ await f.machine.webSocketMessage(socket as any,JSON.stringify({type:'offer_ack',session_id:session,epoch}));
+ const result=await f.call('/api/sessions/'+session+'/started','POST',{operation_id:'op-'+session,epoch,native_id:'native-new'});
+ assert.equal(result.status,201,await result.clone().text());
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'running');
+});
+
+test('session projections carry host workspace route and timestamp columns for the CLI',async()=>{
+ const f=fixture(),session='projection';await startClaimed(f,session,'native-projection');
+ const response=await f.call('/api/sessions/'+session,'GET',undefined,{'x-hub2-actor':JSON.stringify({id:'admin',kind:'operator',scopes:['operator:admin']})});
+ assert.equal(response.status,200);const view=(await response.json() as any).session;
+ assert.equal(view.start_deadline_at,null,'legacy row must not fabricate a stored deadline');
+ const storedDeadline=Date.now()+75_000;
+ f.database.prepare("UPDATE sessions SET launch_json=json_set(launch_json,'$.start_deadline_at',?) WHERE id=?").run(storedDeadline,session);
+ f.clearCache();
+ const stored=await f.call('/api/sessions/'+session,'GET',undefined,{'x-hub2-actor':JSON.stringify({id:'admin',kind:'operator',scopes:['operator:admin']})});
+ assert.equal((await stored.json() as any).session.start_deadline_at,storedDeadline);
+ assert.equal(view.host,'h1');assert.equal(view.machine,'h1');assert.equal(view.workspace,'/tmp');
+ assert.equal(view.account_id,'codex');assert.equal(view.account,'codex');assert.equal(view.mode,'headless');
+ assert.equal(view.managed,true);assert.ok(Number.isFinite(Date.parse(view.created_at)));assert.ok(Number.isFinite(Date.parse(view.updated_at)));
 });

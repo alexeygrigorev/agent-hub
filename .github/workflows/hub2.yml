@@ -4,6 +4,9 @@ on:
   push:
     paths:
       - "hub2/**"
+      - "host/**"
+      - "scripts/build-hub-cli.py"
+      - "scripts/with-temp-home.sh"
       - "docs/hub2/**"
       - "package.json"
       - "package-lock.json"
@@ -12,6 +15,9 @@ on:
   pull_request:
     paths:
       - "hub2/**"
+      - "host/**"
+      - "scripts/build-hub-cli.py"
+      - "scripts/with-temp-home.sh"
       - "docs/hub2/**"
       - "package.json"
       - "package-lock.json"
@@ -28,6 +34,55 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Fix plan 1.1 (RC1): one integrated start through the real server, the real
+  # host daemon and the real `hub` CLI zipapp; only `a` and `codex` are stubs.
+  # Self-contained on purpose: keep it separate from the `checks` job.
+  e2e-start-path:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install locked toolchain
+        run: npm ci
+
+      - name: Install host daemon and test dependencies
+        run: python -m pip install websockets==16.0 pytest==9.2.0
+
+      - name: Durable alarm recovery after restart (Node runtime)
+        run: node --experimental-transform-types --test hub2/tests/node-alarm-recovery.test.ts
+
+      - name: Start path e2e (server + host daemon + hub CLI)
+        env:
+          TMPDIR: ${{ github.workspace }}/.local/tmp
+        run: |
+          mkdir -p "$TMPDIR"
+          scripts/with-temp-home.sh -- python -m pytest hub2/tests/e2e -v -rxXs -p no:cacheprovider --durations=0
+
+  # Always-run gate for branch protection: fails explicitly unless the e2e job
+  # succeeded (a skipped or cancelled e2e is a failure, never a pass).
+  e2e-start-path-gate:
+    if: always()
+    needs: [e2e-start-path]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require e2e-start-path success
+        env:
+          RESULT: ${{ needs.e2e-start-path.result }}
+        run: |
+          echo "e2e-start-path: $RESULT"
+          [ "$RESULT" = "success" ] || { echo "::error::e2e-start-path result is $RESULT"; exit 1; }
+
   checks:
     runs-on: ubuntu-latest
     timeout-minutes: 35
