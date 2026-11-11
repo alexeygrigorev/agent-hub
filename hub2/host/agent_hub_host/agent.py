@@ -483,7 +483,10 @@ class Bridge:
                 try:
                     if not inventory_failed:
                         if inventory is None or not inventory.fresh():
-                            inventory = self.launcher.inventory()
+                            collect_inventory = getattr(self.launcher, 'inventory', None)
+                            if not callable(collect_inventory):
+                                raise RuntimeError('native_census_unavailable')
+                            inventory = collect_inventory()
                         self.settle_legacy_unobserved_launch(row, inventory)
                 except (RuntimeError, OSError, subprocess.SubprocessError):
                     inventory_failed = True
