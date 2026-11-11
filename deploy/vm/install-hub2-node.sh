@@ -59,6 +59,7 @@ VM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO=/opt/agent-hub
 STATE=/var/lib/agent-hub
 DB_DIR=$STATE/hub2-db
+CREDENTIAL_MONITOR_EVIDENCE_ROOT=$STATE/credential-monitor-evidence
 
 echo "== systemd units"
 install -m 644 "$DEPLOY_DIR/agent-hub-hub2.service" /etc/systemd/system/agent-hub-hub2.service
@@ -88,6 +89,9 @@ fi
 
 echo "== state directories"
 install -d -m 750 -o alexey -g alexey "$DB_DIR" "$REPO/.local/tmp"
+if [[ "$RELEASE_MODE" == active ]]; then
+  install -d -m 700 -o alexey -g alexey "$CREDENTIAL_MONITOR_EVIDENCE_ROOT"
+fi
 
 if [[ "$KEEP_CLI_ASSETS" != true ]]; then
   echo "== public CLI artifacts"
@@ -111,15 +115,24 @@ fi
 
 if [[ -n "$RELEASE_MODE" || -n "$SCHEMA_MIGRATIONS" ]]; then
   echo "== release configuration"
-  python3 - "$REPO/.dev.vars" "$RELEASE_MODE" "$SCHEMA_MIGRATIONS" <<'PY'
+  python3 - "$REPO/.dev.vars" "$RELEASE_MODE" "$SCHEMA_MIGRATIONS" "$REPO" "$CREDENTIAL_MONITOR_EVIDENCE_ROOT" <<'PY'
+import hashlib
+import json
 import os
+import re
 import stat
+import subprocess
 import sys
 import tempfile
+import uuid
 from pathlib import Path
+
+ARTIFACTS = ("hub2/node/alert-evidence.ts", "hub2/node/main.ts", "hub2/src/worker.ts")
 
 path = Path(sys.argv[1])
 mode, schema_mode = sys.argv[2:4]
+repo_arg = sys.argv[4] if len(sys.argv) >= 5 else ""
+evidence_root_arg = sys.argv[5] if len(sys.argv) >= 6 else ""
 if mode and mode not in {"bootstrap", "active"}:
     raise SystemExit("invalid release mode")
 if schema_mode and schema_mode not in {"defer", "apply"}:
@@ -129,6 +142,94 @@ if mode:
     updates["HUB2_RELEASE_MODE"] = mode
 if schema_mode:
     updates["HUB2_SCHEMA_MIGRATIONS"] = schema_mode
+
+if mode == "active" and (repo_arg or evidence_root_arg):
+    if not repo_arg or not evidence_root_arg:
+        raise SystemExit("credential_monitor_staging_failed")
+    try:
+        repo = Path(repo_arg)
+        evidence_root = Path(evidence_root_arg)
+        root_stat = os.lstat(evidence_root)
+        if not stat.S_ISDIR(root_stat.st_mode) or stat.S_IMODE(root_stat.st_mode) != 0o700:
+            raise ValueError("evidence root must be a 0700 directory")
+        git_env = {
+            "PATH": os.defpath,
+            "HOME": "/nonexistent",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+        head_proc = subprocess.run(
+            ["/usr/bin/git", "--no-optional-locks", "-C", str(repo), "rev-parse", "--verify", "HEAD"],
+            env=git_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+        if head_proc.returncode != 0 or len(head_proc.stdout) > 64:
+            raise ValueError("unable to resolve checkout HEAD")
+        expected_commit = head_proc.stdout.decode("ascii").strip()
+        if not re.fullmatch(r"[0-9a-f]{40}", expected_commit):
+            raise ValueError("invalid checkout HEAD")
+        hashes = {}
+        for rel in ARTIFACTS:
+            artifact_path = repo / rel
+            st = os.lstat(artifact_path)
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or (st.st_mode & 0o022):
+                raise ValueError(f"untrusted authority artifact: {rel}")
+            hashes[rel] = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+        destination = evidence_root / f"{expected_commit}-{uuid.uuid4().hex}"
+        owner_uid, owner_gid = root_stat.st_uid, root_stat.st_gid
+
+        def _drop_privileges():
+            if os.geteuid() == 0 and (owner_uid != 0 or owner_gid != 0):
+                os.setgroups([owner_gid])
+                os.setresgid(owner_gid, owner_gid, owner_gid)
+                os.setresuid(owner_uid, owner_uid, owner_uid)
+
+        stage_cmd = [
+            sys.executable,
+            "-I",
+            "-S",
+            str(repo / "scripts/stage-credential-monitor.py"),
+            "--checkout",
+            str(repo),
+            "--destination",
+            str(destination),
+            "--expected-commit",
+            expected_commit,
+            "--observer-sha256",
+            hashes["hub2/node/alert-evidence.ts"],
+            "--main-sha256",
+            hashes["hub2/node/main.ts"],
+            "--worker-sha256",
+            hashes["hub2/src/worker.ts"],
+        ]
+        stage_proc = subprocess.run(
+            stage_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=15,
+            check=False,
+            preexec_fn=_drop_privileges if os.geteuid() == 0 and (owner_uid != 0 or owner_gid != 0) else None,
+        )
+        if stage_proc.returncode != 0:
+            raise ValueError("stage-credential-monitor refused")
+        receipt = json.loads(stage_proc.stdout.decode("utf-8"))
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("kind") != "credential_monitor_staged_boundary_v1"
+            or receipt.get("destination") != str(destination)
+            or receipt.get("release_sha") != expected_commit
+            or receipt.get("activated") is not False
+            or not (destination / "enrollment.json").is_file()
+            or not (destination / "journal.json").is_file()
+        ):
+            raise ValueError("invalid staged boundary receipt")
+        updates["HUB2_ALERT_EVIDENCE_DIR"] = str(destination)
+    except Exception as exc:
+        raise SystemExit(f"credential_monitor_staging_failed: {exc}") from None
 
 original_stat = path.stat()
 lines = path.read_text(encoding="utf-8").splitlines()
@@ -145,7 +246,10 @@ for line in lines:
     updated.append(line)
 for key, value in updates.items():
     if key not in inserted:
-        updated.insert(0, f"{key}={value}")
+        if key == "HUB2_ALERT_EVIDENCE_DIR":
+            updated.append(f"{key}={value}")
+        else:
+            updated.insert(0, f"{key}={value}")
 contents = "\n".join(updated) + "\n"
 
 fd, temporary_name = tempfile.mkstemp(prefix=".dev.vars.", dir=path.parent)
