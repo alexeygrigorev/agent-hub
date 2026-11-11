@@ -117,10 +117,14 @@ def request(base, token, method, body=None):
 
 
 def snapshot(status, payload):
+    if status!=200:
+        if status==404 and isinstance(payload,dict) and payload.get('error')=='model_policy_unconfigured':
+            return {'version':version(payload.get('version')),'candidates':[]}
+        if type(status) is int and 100<=status<=599: raise Problem(f'policy_read_failed:{status}')
+        raise Problem('policy_request_failed')
     if not isinstance(payload,dict): raise Problem('invalid_policy_response')
     at = version(payload.get('version'))
-    if status==404 and payload.get('error')=='model_policy_unconfigured': return {'version':at,'candidates':[]}
-    if status!=200 or at==0: raise Problem('policy_request_failed')
+    if at==0: raise Problem('policy_request_failed')
     return {'version':at,'candidates':candidates(payload.get('candidates'),empty=True)}
 
 
@@ -353,7 +357,7 @@ def main(argv=None):
             if type(payload.get('unchanged')) is bool: result['unchanged']=payload['unchanged']
         print(json.dumps(result,sort_keys=True)); return 0
     except (Problem,OSError,ValueError,TypeError,KeyError) as error:
-        slug=str(error) if isinstance(error,Problem) and re.fullmatch('[a-z_]{1,100}',str(error)) else 'policy_recovery_failed'
+        slug=str(error) if isinstance(error,Problem) and re.fullmatch(r'(?:[a-z_]{1,100}|policy_read_failed:[1-5][0-9]{2})',str(error)) else 'policy_recovery_failed'
         print(json.dumps({'error':slug,'manual_reconciliation_required':True})); return 1
 
 

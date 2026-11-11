@@ -180,8 +180,9 @@ CADDY_NEW
 # The active candidate includes the actual reviewed canonical policy helper.
 mkdir -p "$TEST_ROOT/seed/config"
 cp "$ROOT/scripts/apply-model-policy.py" "$TEST_ROOT/seed/scripts/apply-model-policy.py"
+cp "$ROOT/scripts/prepare-model-policy-service-credential.py" "$TEST_ROOT/seed/scripts/prepare-model-policy-service-credential.py"
 cp "$ROOT/config/model-policy.json" "$TEST_ROOT/seed/config/model-policy.json"
-git -C "$TEST_ROOT/seed" add deploy/hub.caddy scripts/apply-model-policy.py config/model-policy.json
+git -C "$TEST_ROOT/seed" add deploy/hub.caddy scripts/apply-model-policy.py scripts/prepare-model-policy-service-credential.py config/model-policy.json
 git -C "$TEST_ROOT/seed" commit -qm 'candidate release'
 git -C "$TEST_ROOT/seed" push -q origin main
 CANDIDATE_SHA="$(git -C "$TEST_ROOT/seed" rev-parse HEAD)"
@@ -194,13 +195,15 @@ cat > "$TEST_ROOT/policy-server.py" <<'PY'
 import copy, importlib.util, json, os, signal, subprocess, sys, threading
 from pathlib import Path
 from types import SimpleNamespace
-root, temporary = map(Path, sys.argv[1:])
+root, temporary = map(Path, sys.argv[1:3])
+candidate = sys.argv[3]
 spec = importlib.util.spec_from_file_location('deploy_guard_policy_fixture', root / 'test/test_schema_release_transaction.py')
 fixture = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fixture)
 stop = threading.Event()
 signal.signal(signal.SIGTERM, lambda *_: stop.set())
 peer = fixture.PolicyAPI(SimpleNamespace(repo=temporary / 'work', state=temporary / 'state',
+    candidate=candidate, credential=temporary / 'credentials/model-policy-admin.json',
     health_log=temporary / 'health-seen', git=lambda repo, *args: subprocess.check_output(
         ['git', '-C', str(repo), *args], text=True).strip()))
 prior = copy.deepcopy(peer.current['candidates'])
@@ -209,8 +212,8 @@ peer.current = {'version': 5, 'candidates': prior}
 try:
     credentials = temporary / 'credentials'
     credentials.mkdir(mode=0o700)
-    credential = credentials / 'admin.json'
-    credential.write_text(json.dumps({'access_token': fixture.POLICY_TOKEN}))
+    credential = credentials / 'model-policy-admin.json'
+    credential.write_text(json.dumps(fixture.service_document(target_sha=candidate)))
     credential.chmod(0o600)
     (temporary / 'policy-url.pending').write_text(peer.url)
     os.replace(temporary / 'policy-url.pending', temporary / 'policy-url')
@@ -219,9 +222,9 @@ try:
 finally:
     peer.close()
     (temporary / 'policy-observations.json').write_text(json.dumps({
-        'current': peer.current, 'prior': prior, 'writes': peer.writes()}))
+        'current': peer.current, 'prior': prior, 'writes': peer.writes(), 'issuances': peer.issuances}))
 PY
-python3 "$TEST_ROOT/policy-server.py" "$ROOT" "$TEST_ROOT" > "$TEST_ROOT/policy-server.log" 2>&1 &
+python3 "$TEST_ROOT/policy-server.py" "$ROOT" "$TEST_ROOT" "$CANDIDATE_SHA" > "$TEST_ROOT/policy-server.log" 2>&1 &
 POLICY_SERVER_PID=$!
 python3 - "$TEST_ROOT/policy-url" <<'PY'
 from pathlib import Path
@@ -242,7 +245,7 @@ run_transaction() {
     AGENT_HUB_TEST_CADDY_CONFIG="$TEST_ROOT/etc/Caddyfile" \
     AGENT_HUB_TEST_CADDY_SITE="$TEST_ROOT/etc/sites/hub.caddy" \
     AGENT_HUB_TEST_POLICY_URL="$POLICY_URL" \
-    AGENT_HUB_TEST_POLICY_CREDENTIAL="$TEST_ROOT/credentials/admin.json" \
+    AGENT_HUB_TEST_POLICY_CREDENTIAL="$TEST_ROOT/credentials/model-policy-admin.json" \
     HUB2_TOKEN=ambient-token-must-not-be-used \
     HEALTH_CAPTURE="$TEST_ROOT/health-seen" \
     CADDY_CAPTURE="$TEST_ROOT/caddy-calls" \
@@ -350,6 +353,7 @@ python3 - "$TEST_ROOT/policy-observations.json" "$CANDIDATE_SHA" <<'PY'
 import json, sys
 observed = json.load(open(sys.argv[1]))
 assert observed['current'] == {'version': 9, 'candidates': observed['prior']}
+assert observed['issuances'] == 0, 'existing service must never be replaced by a new issuance'
 assert [row[0] for row in observed['writes']] == ['POST', 'PUT', 'POST', 'PUT']
 assert all(row[2] == sys.argv[2] for row in observed['writes']), 'policy restore must precede old checkout'
 PY

@@ -1,6 +1,6 @@
 import type { DurableObjectNamespace } from '@cloudflare/workers-types';
 
-export type ActorKind = 'operator' | 'machine' | 'agent';
+export type ActorKind = 'operator' | 'machine' | 'agent' | 'service';
 
 export interface Actor {
   id: string;
@@ -10,6 +10,26 @@ export interface Actor {
   generation?: string;
   family_id?: string;
   client_id?: string;
+}
+
+
+export const DEPLOYMENT_POLICY_SCOPES = ['model-policy:read', 'model-policy:write'] as const;
+export const DEPLOYMENT_REQUEST_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+export const DEPLOYMENT_LABEL = /^[A-Za-z0-9][A-Za-z0-9 ._:-]{0,79}$/;
+
+/** A service actor never acquires human, host, or caller-selected authority. */
+export function isDeploymentActor(value: unknown): value is Actor {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const actor = value as Record<string, unknown>;
+  return Object.keys(actor).every(key => ['id','kind','scopes','resource_id','generation','family_id','client_id'].includes(key))
+    && actor.kind === 'service' && typeof actor.id === 'string'
+    && actor.id.startsWith('deployment:') && DEPLOYMENT_REQUEST_ID.test(actor.id.slice(11))
+    && actor.resource_id === 'model-policy'
+    && typeof actor.generation === 'string' && DEPLOYMENT_REQUEST_ID.test(actor.generation)
+    && typeof actor.family_id === 'string' && DEPLOYMENT_REQUEST_ID.test(actor.family_id)
+    && typeof actor.client_id === 'string' && DEPLOYMENT_LABEL.test(actor.client_id)
+    && Array.isArray(actor.scopes) && actor.scopes.length === 2
+    && DEPLOYMENT_POLICY_SCOPES.every(scope => (actor.scopes as unknown[]).includes(scope));
 }
 
 export interface Hub2Env {
