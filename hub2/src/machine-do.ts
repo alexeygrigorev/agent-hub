@@ -1146,6 +1146,9 @@ export class MachineDO {
       ? this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND machine_id=? AND epoch=?',sessionId,machineId,row.epoch)
       : null;
     let result=body.result as JsonRecord;
+    const captureFailed=row.kind==='capture'&&result.error!==undefined;
+    if(captureFailed&&(typeof result.error!=='string'||!/^[a-z_]{1,80}$/.test(result.error)
+      ||result.output!==undefined))return error('invalid_command_ack',400);
     const captureBinding=row.kind==='capture'?(this.parse(row.result_json) as JsonRecord|null)?.capture_binding as JsonRecord|undefined:undefined;
     if(captureBinding){
       const current=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND machine_id=? AND epoch=?',sessionId,machineId,row.epoch);
@@ -1177,7 +1180,7 @@ export class MachineDO {
     const resultJson = JSON.stringify(result);
     if(new TextEncoder().encode(resultJson).length>8192)return error('command_ack_too_large',413);
     const unconfirmed=row.kind==='stop'&&result.stopped===false&&result.error==='stop_unconfirmed';
-    if (row.state === 'acked' || (row.state === 'failed' && (unconfirmed||captureBinding) && row.result_json === resultJson)) {
+    if (row.state === 'acked' || (row.state === 'failed' && (unconfirmed||captureBinding||captureFailed) && row.result_json === resultJson)) {
       return row.result_json === resultJson ? json({ acknowledged: true, duplicate: true }) : error('command_ack_conflict', 409);
     }
     if (row.state !== 'pending') return error('command_not_pending', 409);
@@ -1185,7 +1188,7 @@ export class MachineDO {
       const current=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND machine_id=? AND epoch=?',sessionId,machineId,row.epoch);
       const echo=(body.result as JsonRecord).capture_binding as JsonRecord|undefined;
       if(!current||current.state!=='running'&&(!this.retainedCaptureReady(current)||!echo
-        ||(body.result as JsonRecord).capture_source!=='retained_task_output'))return error('unqualified_retained_capture',409);
+        ||!captureFailed&&(body.result as JsonRecord).capture_source!=='retained_task_output'))return error('unqualified_retained_capture',409);
     }
     const now=Date.now();
     if (row.kind === 'stop' && result.stopped === true) {
@@ -1195,7 +1198,7 @@ export class MachineDO {
       }
     } else {
       this.db.run("UPDATE session_commands SET state=?,result_json=?,updated_at=? WHERE id=? AND state='pending' AND epoch=?",
-        unconfirmed||captureBinding&&result.error?'failed':'acked', resultJson, now, commandId, row.epoch);
+        unconfirmed||captureFailed?'failed':'acked', resultJson, now, commandId, row.epoch);
     }
     await this.notifyPendingCommands(machineId);
     return json({ acknowledged: true });

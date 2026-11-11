@@ -742,6 +742,14 @@ class Bridge:
             if old["digest"] != digest:
                 raise ValueError("command_id_conflict")
             if old["state"] != "done":
+                if old['state']=='executing' and command.get('kind')=='capture':
+                    # Capture is read-only. Resolve interruption as failure, never
+                    # repeat the read or weaken input/stop uncertainty fences.
+                    result=self.capture_failure(command,'capture_outcome_uncertain')
+                    with db:
+                        self.finish_command(identity,command,result)
+                    logging.getLogger(__name__).warning('Capture interrupted command_id=%s',identity)
+                    return result
                 raise RuntimeError("command_outcome_uncertain")
             result = json.loads(old["result"])
             self.journal.emit(f"command:{identity}", f"/api/sessions/{command['session_id']}/commands/{identity}/ack"+("?safety=operator_stop" if command.get("kind")=="stop" else ""),
@@ -773,12 +781,24 @@ class Bridge:
                 self.begin_command(identity, digest)
                 self.finish_command(identity, command, result)
             return result
-        if kind == 'capture' and command.get('capture_binding') is not None:
+        if kind == 'capture':
+            if not row['native_id']:
+                native_id,_status=self.resolve_launch_native(row)
+                if not native_id:
+                    raise ValueError('command_fence_conflict')
+                current=db.execute('SELECT * FROM launches WHERE session_id=?',(command['session_id'],)).fetchone()
+                if not current or any(current[key]!=row[key] for key in ['epoch','operation_id']) or current['native_id']!=native_id:
+                    raise ValueError('command_fence_conflict')
+                row=current
             # This envelope is frozen at enqueue, so a completion race cannot
             # change the command digest on replay or introduce a native effect.
             with db:
                 self.begin_command(identity,digest)
-            result = self.bound_capture(command,row)
+            try:
+                result = self.bound_capture(command,row) if command.get('capture_binding') is not None else self.legacy_capture(command,row)
+            except Exception:
+                result = self.capture_failure(command,'capture_failed')
+                logging.getLogger(__name__).warning('Capture failed command_id=%s',identity)
             with db:
                 self.finish_command(identity,command,result)
             return result
@@ -795,14 +815,7 @@ class Bridge:
             raise ValueError("headless_send_refused")
         with db:
             self.begin_command(identity, digest)
-        if kind == "capture":
-            from .task_output import capture_task_output, bounded_capture
-            output = (None if command.get("mode") == "screen" else
-                      capture_task_output("hub2-" + row["session_id"], row, native_id))
-            if output is None:
-                output = self.native("capture", native_id, "--screen", "--plain").stdout[:16384]
-            result = {"output": bounded_capture(output)}
-        elif kind == "stop":
+        if kind == "stop":
             self.native("kill", native_id)
             status = self.lookup(native_id, row)
             if status and status.get("phase", status.get("state")) == "exited" and status.get("containment_empty") is True:
@@ -891,6 +904,24 @@ class Bridge:
             self.finish_command(identity, command, result)
         return result
 
+    def legacy_capture(self, command, row):
+        from .task_output import capture_task_output, bounded_capture
+        native_id, _status = self.resolve_launch_native(row)
+        if not native_id:
+            raise RuntimeError('capture_identity_unavailable')
+        output = (None if command.get('mode') == 'screen' else
+                  capture_task_output('hub2-' + row['session_id'], row, native_id))
+        if output is None:
+            output = self.native('capture', native_id, '--screen', '--plain').stdout[:16384]
+        return {'output': bounded_capture(output)}
+
+    @staticmethod
+    def capture_failure(command, reason):
+        result={'error':reason,'reason':reason}
+        if command.get('capture_binding') is not None:
+            result.update(capture_binding=command['capture_binding'],capture_source='unavailable')
+        return result
+
     def finish_command(self, identity, command, result):
         self.journal.db.execute("UPDATE commands SET state='done',result=? WHERE id=?", (canonical(result), identity))
         self.journal.enqueue(f"command:{identity}", f"/api/sessions/{command['session_id']}/commands/{identity}/ack"
@@ -921,7 +952,11 @@ class Bridge:
                 self.reconcile()
                 self.journal.flush(self.client)
         except Exception as error:
-            logging.getLogger(__name__).exception('Host event failed type=%s', event.get('type'))
+            command=event.get('command')
+            command_id=command.get('id') if event.get('type')=='session.command' and isinstance(command,dict) else None
+            if not isinstance(command_id,str) or not re.fullmatch('[A-Za-z0-9-]{1,80}',command_id):
+                command_id=None
+            logging.getLogger(__name__).exception('Host event failed type=%s command_id=%s', event.get('type'),command_id)
             if isinstance(error,ApiError) and error.retry_at:
                 self.budget_paused_until = max(getattr(self, 'budget_paused_until', 0), error.retry_at)
                 raise
