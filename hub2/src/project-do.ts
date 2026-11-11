@@ -925,13 +925,19 @@ export class ProjectDO {
     if(body.launch_failed!==undefined&&typeof body.launch_failed!=='boolean')return error('invalid_completion',400);
     const launchFailed=body.launch_failed===true;
     const saga = this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id = ?', body.operation_id);
+    const failureEvent=launchFailed&&saga?.state==='complete'&&saga.native_id===null
+      ? this.db.one<{kind:string;body_json:string}>('SELECT kind,body_json FROM intake_events WHERE task_id=? AND event_key=?',
+        saga.intake_id,`stopped:${saga.attempt_operation_id}:${saga.epoch}`) : undefined;
+    const failureReason=failureEvent ? (this.parse(failureEvent.body_json) as JsonRecord).reason : undefined;
+    const lateLaunchFailure=failureEvent?.kind==='session_launch_failed'
+      &&['launch_timeout_no_native','host_no_response','host_launch_refused'].includes(String(failureReason));
     if (!saga || saga.session_id !== body.session_id || saga.machine_id !== body.machine_id
       || saga.attempt_operation_id !== body.attempt_operation_id || saga.epoch !== body.epoch
-      || (saga.native_id !== body.native_id&&!(launchFailed&&saga.state==='admitted'&&saga.native_id===null&&/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(body.native_id)))) return error('dispatch_not_found', 404);
+      || (saga.native_id !== body.native_id&&!(launchFailed&&(saga.state==='admitted'||lateLaunchFailure)&&saga.native_id===null&&/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(body.native_id)))) return error('dispatch_not_found', 404);
     const intake = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id = ?', saga.intake_id);
     if (!intake) return error('intake_not_found', 404);
-    const alreadyFinished = saga.state === 'complete';
-    if (!alreadyFinished && ((launchFailed?saga.state!=='admitted':saga.state!=='running')||intake.session_id!==saga.session_id||intake.assigned_machine_id!==saga.machine_id)) return error('dispatch_not_found', 404);
+    const alreadyFinished = saga.state === 'complete'&&!lateLaunchFailure;
+    if (!alreadyFinished&&!lateLaunchFailure && ((launchFailed?saga.state!=='admitted':saga.state!=='running')||intake.session_id!==saga.session_id||intake.assigned_machine_id!==saga.machine_id)) return error('dispatch_not_found', 404);
     const evidence = body.evidence && typeof body.evidence === 'object' && !Array.isArray(body.evidence) ? body.evidence as JsonRecord : undefined;
     if (!evidence) return error('native_exit_evidence_required', 400);
     const normalizedExit = evidence.native_exit === undefined ? undefined : nativeReturncode(evidence.native_exit);
@@ -958,8 +964,21 @@ export class ProjectDO {
     const finishedStatus = body.exit_code === 0 && !launchFailed && !deadlineExceeded ? 'completed-awaiting-review' : 'failed';
     const duplicate=this.transaction(() => {
       const currentSaga=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?',saga.operation_id);
-      if(currentSaga?.state==='complete'){replay();return true;}
+      if(currentSaga?.state==='complete'&&currentSaga.native_id!==null){replay();return true;}
       const current=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',intake.id);
+      if(lateLaunchFailure){
+        if(currentSaga?.state!=='complete'||currentSaga.native_id!==null||currentSaga.attempt_operation_id!==saga.attempt_operation_id||currentSaga.epoch!==saga.epoch)
+          throw new HttpError('completion_binding_changed',409);
+        this.appendEvent(intake.id, `finish:${saga.operation_id}`, 'hub2-host', 'finish_evidence_received',
+          {session_id:saga.session_id,native_id:body.native_id,exit_code:body.exit_code,evidence,completion_digest:completionDigest,launch_failed:true},now);
+        this.db.run('UPDATE dispatch_sagas SET native_id=?,updated_at=? WHERE operation_id=?',body.native_id,now,saga.operation_id);
+        if(current?.status==='failed'&&current.session_id===saga.session_id&&current.assigned_machine_id===saga.machine_id){
+          const previous=this.parse(current.final_evidence_json??'{}') as JsonRecord;
+          this.db.run('UPDATE intakes SET final_evidence_json=?,updated_at=? WHERE id=?',
+            JSON.stringify({...previous,...evidence,native_id:body.native_id,exit_code:body.exit_code,native_exit_confirmed:true,launch_failed:true,native_id_absent:false}),now,intake.id);
+        }
+        return false;
+      }
       if((launchFailed?currentSaga?.state!=='admitted':currentSaga?.state!=='running')||current?.session_id!==saga.session_id||current.assigned_machine_id!==saga.machine_id)throw new HttpError('completion_binding_changed',409);
       this.db.run('UPDATE intakes SET status=?, final_evidence_json=?, updated_at=? WHERE id=?', finishedStatus, JSON.stringify({ ...evidence, native_id: body.native_id, exit_code: body.exit_code,native_exit_confirmed:true,...(launchFailed?{launch_failed:true}:{}) }), now, intake.id);
       this.db.run("UPDATE dispatch_sagas SET state='complete', native_id=?, next_action_at=NULL, last_reason=NULL, updated_at=? WHERE operation_id=?", body.native_id, now, saga.operation_id);

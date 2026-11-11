@@ -641,7 +641,8 @@ export class MachineDO {
     if (!['aplexer_status', 'aplexer_retirement'].includes(String(evidence.source)) || evidence.containment_empty !== true
       || !identity || identity.id !== body.native_id || identity.tag !== `task-hub2-${row.id}`
       || identity.workspace !== launch.workspace || !nativeExit || nativeReturncode(nativeExit) !== body.exit_code) return error('unqualified_native_exit_evidence', 409);
-    if (row.state === 'completed-awaiting-review' || row.state === 'failed') {
+    const lateLaunchFailure=launchFailed&&row.state==='failed'&&row.native_id===null&&row.evidence_digest===null;
+    if (row.state === 'completed-awaiting-review' || (row.state === 'failed'&&!lateLaunchFailure)) {
       return row.evidence_digest === evidenceDigest ? json({ ok: true, duplicate: true, state: row.state }) : error('finish_conflict', 409);
     }
     const nativeDeadline=evidence.native_deadline as JsonRecord|undefined;
@@ -652,15 +653,21 @@ export class MachineDO {
       ||(Number(nativeExit.exited_at_ms)>=Number(nativeDeadline.deadline_ms)&&nativeDeadline.exceeded!==true)
       ||(nativeDeadline.exceeded&&Number(nativeDeadline.deadline_ms)>Date.now()))return error('native_deadline_unverified',409);
     const lateLost=row.state==='lost'&&row.native_id===body.native_id&&!launchFailed;
-    const admittedAbort=launchFailed&&row.state==='claimed'&&row.native_id===null
+    const admittedAbort=launchFailed&&(row.state==='claimed'||lateLaunchFailure)&&row.native_id===null
       &&/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(body.native_id)
       &&this.db.one('SELECT operation_id FROM launch_admissions WHERE operation_id=? AND session_id=? AND epoch=?',row.operation_id,row.id,row.epoch);
     if (!lateLost&&!admittedAbort&&(launchFailed||row.state!=='running'||row.native_id!==body.native_id))return error('stale_or_unmatched_finish',409);
+    const failureNotification=lateLaunchFailure
+      ? this.db.one<{id:string}>("SELECT id FROM machine_outbox WHERE operation_id=? AND id IN (?,?)",
+        row.operation_id,`reaped:${row.operation_id}:${row.epoch}`,`launch-refused:${row.operation_id}:${row.epoch}`)
+      : undefined;
+    if(lateLaunchFailure&&!failureNotification)return error('launch_failure_notification_missing',409);
     const now = Date.now();
     const state = !launchFailed&&nativeDeadline?.exceeded!==true&&Number(body.exit_code) === 0 ? 'completed-awaiting-review' : 'failed';
     const payload = { operation_id: row.dispatch_id, attempt_operation_id: row.operation_id, session_id: row.id,
       machine_id: row.machine_id,intake_id:row.intake_id, epoch: row.epoch, native_id: body.native_id,
       ...(launchFailed?{launch_failed:true}:{}),
+      ...(failureNotification?{after_notification:failureNotification.id}:{}),
       exit_code: Number(body.exit_code), native_exit_confirmed: true, evidence, evidence_digest: evidenceDigest };
     if (lateLost) {
       if (row.evidence_digest !== null) return row.evidence_digest===evidenceDigest
@@ -683,6 +690,8 @@ export class MachineDO {
         state, JSON.stringify(payload), evidenceDigest, Number(body.exit_code), now, body.native_id,row.id, row.state);
       this.db.run("UPDATE native_sessions SET phase='exited',last_activity_at=?,exit_code=?,containment_empty=1,observed_at=? WHERE session_id=?",
         now,Number(body.exit_code),now,row.id);
+      if(failureNotification)this.db.run("UPDATE machine_outbox SET state='pending',attempt=0,next_action_at=?,updated_at=? WHERE id=? AND state='dead_letter'",
+        now,now,failureNotification.id);
       this.insertOutbox(`finish:${row.operation_id}`, 'finish', row.operation_id, row.project_id, payload, now);
     });
     await this.ensureDeadline(now+30_000);
@@ -768,6 +777,14 @@ export class MachineDO {
             operation_id:payload.attempt_operation_id,epoch:payload.epoch,machine_id:payload.machine_id,
             intake_id:payload.intake_id,project_id:row.project_id,reason:revocationReason})});
         if(!revoked.ok||(await revoked.json() as JsonRecord).revoked!==true)throw new Error('child_revocation_pending');
+      }
+      if(row.kind==='finish'&&typeof payload.after_notification==='string'){
+        const notification=this.db.one<{state:string}>('SELECT state FROM machine_outbox WHERE id=?',payload.after_notification);
+        if(notification?.state!=='delivered'){
+          if(notification?.state==='pending')await this.flushOneRaw(payload.after_notification,env);
+          if(this.db.one<{state:string}>('SELECT state FROM machine_outbox WHERE id=?',payload.after_notification)?.state!=='delivered')
+            throw new Error('launch_failure_notification_pending');
+        }
       }
       if(row.kind==='no-dispatch-revoke'){
         this.db.run("UPDATE machine_outbox SET state='delivered',updated_at=? WHERE id=? AND state='pending'",Date.now(),row.id);

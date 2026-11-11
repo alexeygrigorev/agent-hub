@@ -7,7 +7,7 @@ import { HOST_INVENTORY_LOST_MS, LIVE_SNAPSHOT_TTL_MS, isLiveActiveSession } fro
 const machineActor={id:'machine:h1',kind:'machine',resource_id:'h1',generation:'1',scopes:['machine:heartbeat','session:report']};
 const header={'Content-Type':'application/json','x-hub2-actor':JSON.stringify(machineActor)};
 
-function fixture(revokeFailures=0){
+function fixture(revokeFailures=0,projectFailures=0){
  const database=new DatabaseSync(':memory:'),events:Array<{path:string;body:any}>=[],sockets:any[]=[];
  const revocations:any[]=[];
  let alarm:number|null=null;
@@ -29,7 +29,11 @@ function fixture(revokeFailures=0){
    return Response.json({authorized:true});
   }})},
   MACHINES:{idFromName:(id:string)=>id,get:()=>({fetch:async()=>Response.json({})})},
-  PROJECTS:{idFromName:(id:string)=>id,get:()=>({fetch:async(request:Request)=>{events.push({path:new URL(request.url).pathname,body:await request.json()});return Response.json({ok:true});}})},
+  PROJECTS:{idFromName:(id:string)=>id,get:()=>({fetch:async(request:Request)=>{
+   const path=new URL(request.url).pathname;
+   if(path==='/_internal/reaped'&&projectFailures>0){projectFailures--;return Response.json({error:'unavailable'},{status:503});}
+   events.push({path,body:await request.json()});return Response.json({ok:true});
+  }})},
  };
  const machine=new MachineDO(ctx,env);
  const call=(path:string,method='GET',body?:unknown,headers:Record<string,string>={})=>machine.fetch(new Request('https://machine.test'+path,{method,headers:{...header,...headers},...(body===undefined?{}:{body:JSON.stringify(body)})}));
@@ -546,4 +550,55 @@ test('schema seven preserves pending version-six commands and adds capture mode'
  const row=f.database.prepare('SELECT * FROM session_commands WHERE id=?').get(created.command_id) as any;
  assert.equal(row.capture_mode,null);assert.equal(row.state,'pending');
  assert.equal((f.database.prepare('SELECT version FROM hub2_schema').get() as any).version,7);
+});
+
+
+test('qualified exit after an admitted launch timeout records failure evidence and revokes before forwarding',async()=>{
+ const f=fixture(1),session='late-admitted-exit',epoch=await startClaimed(f,session,null),started=Date.now()-120_000;
+ f.database.prepare('INSERT INTO launch_admissions VALUES(?,?,?,?)').run('op-'+session,session,epoch,started);
+ f.database.prepare("UPDATE sessions SET updated_at=?,created_at=? WHERE id=?").run(started,started,session);
+ f.clearCache();
+ await f.call('/_internal/reap','POST',{dry_run:false});
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'failed');
+ const launch=JSON.parse((f.database.prepare('SELECT launch_json FROM sessions WHERE id=?').get(session) as any).launch_json);
+ const timeout=1800;
+ f.database.prepare('UPDATE sessions SET launch_json=? WHERE id=?').run(JSON.stringify({...launch,timeout_seconds:timeout}),session);
+ f.clearCache();
+ const native='33333333-3333-4333-8333-333333333333';
+ const evidence={source:'aplexer_status',containment_empty:true,native_identity:{id:native,tag:'task-hub2-'+session,workspace:'/tmp'},
+   native_exit:{code:0,exited_at_ms:Date.now()},native_deadline:{deadline_ms:started+timeout*1000,exceeded:false}};
+ const receipt={operation_id:'op-'+session,epoch,native_id:native,exit_code:0,native_exit_confirmed:true,launch_failed:true,evidence};
+ assert.equal((await f.call('/api/sessions/'+session+'/finish','POST',{...receipt,evidence:{...evidence,containment_empty:false}})).status,409);
+ const finishResponse=await f.call('/api/sessions/'+session+'/finish','POST',receipt);
+ assert.equal(finishResponse.status,202,await finishResponse.text());
+ assert.equal(f.events.filter(e=>e.path==='/_internal/finish').length,0);
+ f.database.prepare("UPDATE machine_outbox SET next_action_at=? WHERE state='pending'").run(Date.now()-1);
+ f.clearCache();
+ await f.machine.alarm();
+ assert.equal(f.events.filter(e=>e.path==='/_internal/finish').length,1);
+ const row=f.database.prepare('SELECT state,native_id,exit_code FROM sessions WHERE id=?').get(session);
+ assert.deepEqual({...row},{state:'failed',native_id:native,exit_code:0});
+ assert.equal((await f.call('/api/sessions/'+session+'/finish','POST',receipt)).status,200);
+ assert.equal((await f.call('/api/sessions/'+session+'/finish','POST',{...receipt,exit_code:1})).status,409);
+});
+
+
+test('a pending timeout notification cannot delay exact worker revocation after qualified native exit',async()=>{
+ const f=fixture(0,3),session='late-exit-project-offline',epoch=await startClaimed(f,session,null),started=Date.now()-120_000;
+ f.database.prepare('INSERT INTO launch_admissions VALUES(?,?,?,?)').run('op-'+session,session,epoch,started);
+ const launch=JSON.parse((f.database.prepare('SELECT launch_json FROM sessions WHERE id=?').get(session) as any).launch_json);
+ f.database.prepare('UPDATE sessions SET updated_at=?,created_at=?,launch_json=? WHERE id=?')
+   .run(started,started,JSON.stringify({...launch,timeout_seconds:1800}),session);
+ f.clearCache();
+ await f.call('/_internal/reap','POST',{dry_run:false});
+ const native='33333333-3333-4333-8333-333333333333';
+ const evidence={source:'aplexer_status',containment_empty:true,native_identity:{id:native,tag:'task-hub2-'+session,workspace:'/tmp'},
+   native_exit:{code:0,exited_at_ms:Date.now()},native_deadline:{deadline_ms:started+1800_000,exceeded:false}};
+ const response=await f.call('/api/sessions/'+session+'/finish','POST',{
+   operation_id:'op-'+session,epoch,native_id:native,exit_code:0,native_exit_confirmed:true,launch_failed:true,evidence});
+ assert.equal(response.status,202,await response.text());
+ assert.deepEqual(f.revocations.map(row=>[row.operation_id,row.epoch]),[['op-'+session,epoch]]);
+ assert.equal(f.events.some(event=>event.path==='/_internal/finish'),false);
+ const notification=f.database.prepare('SELECT state FROM machine_outbox WHERE id=?').get('finish:op-'+session) as any;
+ assert.equal(notification.state,'pending');
 });
