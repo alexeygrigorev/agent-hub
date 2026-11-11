@@ -1,15 +1,18 @@
 """Targeted release safety checks; no network, live service or live venv writes."""
+import fcntl
 import hashlib
 import importlib.util
 import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
 import unittest
+import zipfile
 from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parents[2]
@@ -607,6 +610,311 @@ elif event in ('start', 'routing', 'enable'):
         with self.assertRaisesRegex(ValueError, 'refusing to replace'):
             enrollment.enroll(client, lambda *_: self.fail('must not save'), path,
                               [self.temporary.name], ['codex'], 'new-code')
+
+
+def publication_bundle(directory, commit, label='fixture'):
+    directory.mkdir()
+    wheel = f'agent_hub_host_v2-2.0.0+g{commit}-py3-none-any.whl'
+    with zipfile.ZipFile(directory / wheel, 'w') as archive:
+        archive.writestr('agent_hub_host/_release.py', f'HOST_VERSION = {commit!r}\nPROTOCOL_VERSION = 1\n')
+    with zipfile.ZipFile(directory / 'hub.pyz', 'w') as archive:
+        archive.writestr('agent_hub_host/_build_info.py', f'BUILD_COMMIT = "{commit}"\n')
+        archive.writestr('__main__.py', 'raise RuntimeError("staged code must never run")\n')
+    cli_digest = hashlib.sha256((directory / 'hub.pyz').read_bytes()).hexdigest()
+    (directory / 'hub.pyz.sha256').write_text(f'{cli_digest}  hub.pyz\n')
+    (directory / 'manifest.json').write_text(json.dumps(
+        {'built_from_commit': commit, 'sha256': cli_digest, 'build_label': label}))
+    for name in ('websockets-16.0-py3-none-any.whl', 'host-install.sh', 'hub2-enroll.py',
+                 *builder.CLI_INSTALLERS, *builder.UNITS):
+        (directory / name).write_text('artifact:' + name)
+    (directory / 'hub2-self-update.py').write_text('raise RuntimeError("staged updater must never run")\n')
+    records = {}
+    for path in directory.iterdir():
+        data = path.read_bytes()
+        records[path.name] = {'sha256': hashlib.sha256(data).hexdigest(), 'size': len(data)}
+    manifest = {'host_version': commit, 'protocol_version': 1, 'schema_version': 1,
+                'python_requires': '>=3.11', 'artifacts': records}
+    raw = json.dumps(manifest, sort_keys=True).encode()
+    (directory / 'host-release.json').write_bytes(raw)
+    return directory, hashlib.sha256(raw).hexdigest()
+
+
+class PublicationTests(unittest.TestCase):
+    def setUp(self):
+        scratch = REPO / '.local/tmp'
+        scratch.mkdir(parents=True, exist_ok=True)
+        temporary = tempfile.TemporaryDirectory(dir=scratch, prefix='test-publication-')
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        self.root = self.directory / 'published'
+        self.current = self.root / 'current'
+        self.receipt = self.directory / 'publication.json'
+
+    def publish(self, action, commit=None, digest=None, bundle=None, *, receipt=None, token=None, error=None):
+        args = ['--root', str(self.root), action]
+        if commit is not None:
+            args += ['--commit', commit, '--manifest-sha256', digest]
+        if action == 'stage':
+            args += ['--bundle', str(bundle)]
+        else:
+            args += ['--receipt', str(receipt or self.receipt)]
+        if token is not None:
+            args += ['--transaction-token', token]
+        result = subprocess.run([sys.executable, str(REPO / 'scripts/publish-hub2-release.py'), *args],
+                                capture_output=True, text=True, timeout=10)
+        if error is None:
+            self.assertEqual(result.returncode, 0, result.stderr)
+        else:
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn(error, result.stderr)
+
+    def stage(self, commit, label):
+        bundle, digest = publication_bundle(self.directory / label, commit, label)
+        self.publish('stage', commit, digest, bundle)
+        return bundle, digest
+
+    def test_stage_is_immutable_and_reuses_only_exact_bundle(self):
+        bundle, digest = self.stage(SHA, 'original')
+        release = self.root / 'releases' / SHA
+        inode = release.stat().st_ino
+        self.assertEqual(release.stat().st_mode & 0o777, 0o555)
+        self.assertTrue(all(path.stat().st_mode & 0o777 == 0o444 for path in release.iterdir()))
+        self.assertFalse(self.current.is_symlink())
+        self.publish('stage', SHA, digest, bundle)
+        self.assertEqual(release.stat().st_ino, inode)
+        rebuilt, rebuilt_digest = publication_bundle(self.directory / 'rebuilt', SHA, 'rebuilt')
+        self.publish('stage', SHA, rebuilt_digest, rebuilt, error='manifest differs')
+        self.assertEqual(release.stat().st_ino, inode)
+        self.assertEqual((release / 'host-release.json').read_bytes(), (bundle / 'host-release.json').read_bytes())
+
+    def test_stage_refuses_non_regular_files_from_the_upload_directory(self):
+        bundle, digest = publication_bundle(self.directory / 'untrusted', SHA)
+        installer = bundle / 'install.sh'
+        installer.unlink()
+        os.mkfifo(installer)
+        self.publish('stage', SHA, digest, bundle, error='not a bounded regular file')
+        self.assertFalse((self.root / 'releases' / SHA).exists())
+        installer.unlink()
+        installer.symlink_to(bundle / 'install.ps1')
+        self.publish('stage', SHA, digest, bundle, error='publication failed')
+        self.assertFalse((self.root / 'releases' / SHA).exists())
+
+    def test_activate_and_rollback_initial_absence_are_idempotent(self):
+        _, digest = self.stage(SHA, 'first')
+        self.publish('activate', SHA, digest)
+        self.assertEqual(os.readlink(self.current), f'releases/{SHA}')
+        original_receipt = self.receipt.read_bytes()
+        self.assertIsNone(json.loads(original_receipt)['previous'])
+        self.assertEqual(self.receipt.stat().st_mode & 0o777, 0o600)
+        self.publish('activate', SHA, digest)
+        self.assertEqual(self.receipt.read_bytes(), original_receipt)
+        self.publish('rollback')
+        self.assertFalse(os.path.lexists(self.current))
+        self.assertEqual(json.loads(self.receipt.read_bytes())['phase'], 'rolled_back')
+        self.publish('rollback')
+        self.publish('activate', SHA, digest, error='receipt cannot activate')
+
+    def test_delayed_root_activation_is_fenced_even_before_a_receipt_exists(self):
+        _, digest = self.stage(SHA, 'first')
+        old_token, new_token = '1' * 32, '2' * 32
+        token_file = self.receipt.parent / 'transaction-token'
+        token_file.write_text(old_token + '\n')
+        self.publish('rollback', token=old_token)
+        self.assertFalse(self.receipt.exists())
+        self.publish('activate', SHA, digest, token=old_token, error='cancelled publication')
+        self.assertFalse(self.current.is_symlink())
+
+        (token_file.parent / 'cli-publication-cancelled').unlink()
+        token_file.write_text(new_token + '\n')
+        self.publish('activate', SHA, digest, token=old_token, error='another deploy transaction')
+        self.assertFalse(self.current.is_symlink())
+        self.publish('activate', SHA, digest, token=new_token)
+        self.assertEqual(os.readlink(self.current), f'releases/{SHA}')
+        self.publish('commit', token=old_token, error='another deploy transaction')
+        self.current.unlink()
+        self.publish('commit', token=new_token, error='matched CLI assets are not active')
+        self.current.symlink_to(f'releases/{SHA}')
+        self.publish('commit', token=new_token)
+        self.publish('commit', token=new_token)
+        self.publish('rollback', token=new_token, error='already committed')
+        self.assertEqual(os.readlink(self.current), f'releases/{SHA}')
+
+    def test_receipt_precedes_switch_and_crash_retries_preserve_previous(self):
+        _, old_digest = self.stage(OLD_SHA, 'old')
+        self.publish('activate', OLD_SHA, old_digest, receipt=self.directory / 'old.json')
+        _, digest = self.stage(SHA, 'next')
+        publisher = module('publish-hub2-release')
+        switch_pointer = publisher.switch_pointer
+
+        def interrupted(root, pointer):
+            pending = json.loads(self.receipt.read_bytes())
+            self.assertEqual(pending['previous'], f'releases/{OLD_SHA}')
+            self.assertEqual(pending['previous_manifest_sha256'], old_digest)
+            self.assertEqual(pending['phase'], 'prepared')
+            self.assertEqual(os.readlink(self.current), pending['previous'])
+            switch_pointer(root, pointer)
+            raise OSError('interrupted after atomic switch')
+
+        with patch.object(publisher, 'switch_pointer', interrupted), self.assertRaisesRegex(OSError, 'interrupted'):
+            publisher.activate(self.root, SHA, digest, self.receipt)
+        self.assertEqual(os.readlink(self.current), f'releases/{SHA}')
+        self.publish('activate', SHA, digest)
+        self.assertEqual(json.loads(self.receipt.read_bytes())['phase'], 'active')
+        self.publish('rollback')
+        self.assertEqual(os.readlink(self.current), f'releases/{OLD_SHA}')
+        self.publish('rollback')
+
+    def test_corrupt_candidate_never_activates_and_does_not_prevent_rollback(self):
+        _, digest = self.stage(SHA, 'candidate')
+        artifact = self.root / 'releases' / SHA / 'hub2-enroll.py'
+        original = artifact.read_bytes()
+        artifact.chmod(0o644)
+        artifact.write_bytes(b'x' * len(original))
+        self.publish('activate', SHA, digest, error='unsafe ownership or permissions')
+        artifact.chmod(0o444)
+        self.publish('activate', SHA, digest, error='checksum mismatch')
+        self.assertFalse(self.receipt.exists())
+        self.assertFalse(self.current.is_symlink())
+        artifact.chmod(0o644)
+        artifact.write_bytes(original)
+        artifact.chmod(0o444)
+        self.publish('activate', SHA, digest)
+        artifact.chmod(0o644)
+        artifact.write_bytes(b'x' * len(original))
+        self.publish('rollback')
+        self.assertFalse(os.path.lexists(self.current))
+
+    def test_rollback_refuses_unrelated_and_unmanaged_current(self):
+        _, digest = self.stage(SHA, 'candidate')
+        _, other_digest = self.stage(OLD_SHA, 'other')
+        self.publish('activate', SHA, digest)
+        self.publish('activate', OLD_SHA, other_digest, receipt=self.directory / 'other.json')
+        before = self.receipt.read_bytes()
+        self.publish('rollback', error='current does not belong')
+        self.assertEqual(os.readlink(self.current), f'releases/{OLD_SHA}')
+        self.current.unlink()
+        self.current.write_text('unmanaged')
+        self.publish('rollback', error='not a managed release pointer')
+        self.assertEqual(self.current.read_text(), 'unmanaged')
+        self.assertEqual(self.receipt.read_bytes(), before)
+
+    def test_rollback_refuses_previous_same_sha_bundle_substitution(self):
+        _, old_digest = self.stage(OLD_SHA, 'old')
+        self.publish('activate', OLD_SHA, old_digest, receipt=self.directory / 'old.json')
+        _, digest = self.stage(SHA, 'candidate')
+        self.publish('activate', SHA, digest)
+        substituted, _ = publication_bundle(self.directory / 'substituted', OLD_SHA, 'substituted')
+        old = self.root / 'releases' / OLD_SHA
+        old.chmod(0o755)
+        old.rename(self.directory / 'retained-original')
+        substituted.rename(old)
+        for artifact in old.iterdir():
+            artifact.chmod(0o444)
+        old.chmod(0o555)
+        self.publish('rollback', error='manifest differs')
+        self.assertEqual(os.readlink(self.current), f'releases/{SHA}')
+
+    def test_vm_transaction_publishes_applied_release_and_rolls_back_before_checkout(self):
+        vm = self.directory / 'vm'
+        vm.mkdir()
+
+        def git(*args):
+            return subprocess.check_output(['git', '-C', str(vm), *args], text=True).strip()
+
+        git('init', '--quiet')
+        git('config', 'user.name', 'Release Fixture')
+        git('config', 'user.email', 'release@example.invalid')
+        git('config', 'core.hooksPath', '/dev/null')
+        installer = vm / 'deploy/vm/install-hub2-node.sh'
+        installer.parent.mkdir(parents=True)
+        installer.write_text('set -eu\n[ "$1" = --hub-only ]\n[ ! -L .local/cli-releases/current ]\n'
+                             'printf rebuilt > hub2/public/cli/manifest.json\n')
+        (vm / '.gitignore').write_text('/.local/\n/.dev.vars\n/hub2/public/cli/\n')
+        git('add', 'deploy', '.gitignore')
+        git('commit', '--quiet', '-m', 'old release without publisher')
+        previous = git('rev-parse', 'HEAD')
+        git('branch', '-M', 'main')
+        installer.write_text('set -eu\n[ "$*" = "--release-mode active --hub-only --keep-cli-assets" ]\n'
+                             '[ "$(cat hub2/public/cli/manifest.json)" = legacy ]\n')
+        (vm / 'scripts').mkdir()
+        for script in ('publish-hub2-release.py', 'build-hub2-release.py', 'hub2-self-update.py'):
+            shutil.copyfile(REPO / 'scripts' / script, vm / 'scripts' / script)
+        git('add', 'scripts', 'deploy')
+        git('commit', '--quiet', '-m', 'candidate release')
+        candidate = git('rev-parse', 'HEAD')
+        git('remote', 'add', 'origin', str(vm))
+        git('checkout', '--quiet', '--detach', previous)
+        (vm / '.dev.vars').write_text('HUB2_RELEASE_MODE=active\n')
+        legacy_manifest = vm / 'hub2/public/cli/manifest.json'
+        legacy_manifest.parent.mkdir(parents=True)
+        legacy_manifest.write_text('legacy')
+        upload_parent = vm / '.local/tmp'
+        upload_parent.mkdir(parents=True)
+        _, digest = publication_bundle(upload_parent / f'ci-cli-release-{candidate}', candidate)
+
+        state = self.directory / 'deploy-state'
+        fake_bin = self.directory / 'fake-bin'
+        fake_bin.mkdir()
+        commands = {'sudo': 'exec "$@"', 'systemctl': 'exit 0', 'npm': 'exit 0',
+                    'install': 'if [ "$1:$2" = -d:-o ]; then shift 5; set -- -d "$@"; '
+                               'elif [ "$1" = -o ]; then shift 4; fi; exec "$MOCK_INSTALL" "$@"',
+                    'python3': 'if [ "$1:$2" = "-:$MOCK_STATE" ]; then cat > "$MOCK_RETIRE"; '
+                               'exec "$MOCK_PYTHON" "$@" < "$MOCK_RETIRE"; fi; exec "$MOCK_PYTHON" "$@"',
+                    'curl': 'printf "%s\\n" "$MOCK_HEALTH"'}
+        for name, body in commands.items():
+            path = fake_bin / name
+            path.write_text('#!/bin/sh\n' + body + '\n')
+            path.chmod(0o755)
+        env = {**os.environ, 'PATH': f'{fake_bin}:{os.environ["PATH"]}', 'AGENT_HUB_DEPLOY_TEST_MODE': '1',
+               'AGENT_HUB_TEST_REPO': str(vm), 'AGENT_HUB_TEST_TRANSACTION_DIR': str(state),
+               'AGENT_HUB_TEST_CADDY_CONFIG': str(self.directory / 'unused-Caddyfile'),
+               'MOCK_INSTALL': shutil.which('install'),
+               'MOCK_STATE': str(state), 'MOCK_RETIRE': str(self.directory / 'retire.py'), 'MOCK_PYTHON': sys.executable,
+               'MOCK_HEALTH': '{"ok":true,"service":"hub2"}'}
+
+        def transaction(*args, expected_error=None, overrides=None):
+            result = subprocess.run(['bash', str(REPO / 'deploy/vm/deploy-release-transaction.sh'), *args],
+                                    env={**env, **(overrides or {})}, capture_output=True, text=True, timeout=10)
+            if expected_error is None:
+                self.assertEqual(result.returncode, 0, result.stderr)
+            else:
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected_error, result.stderr)
+
+        pointer = vm / '.local/cli-releases/current'
+        transaction('apply', candidate, 'active', 'hub-only', 'matched-cli')
+        self.assertEqual(legacy_manifest.read_text(), 'legacy')
+        self.assertEqual((state / 'cli-legacy.previous/manifest.json').read_text(), 'legacy')
+        with (upload_parent / '.deploy-transaction.lock').open('ab') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            transaction('rollback', expected_error='another Hub2 deploy transaction')
+        transaction('publish', candidate, digest, expected_error='active Hub2 API',
+                    overrides={'MOCK_HEALTH': '{"status":"bootstrap","dispatch_enabled":false}'})
+        self.assertFalse((state / 'cli-assets.json').exists())
+        transaction('publish', candidate, 'f' * 64, expected_error='manifest differs')
+        transaction('commit', expected_error='matched CLI assets were not published')
+        self.assertFalse(pointer.is_symlink())
+        transaction('publish', candidate, digest)
+        transaction('publish', candidate, digest)
+        self.assertEqual(os.readlink(pointer), f'releases/{candidate}')
+        self.assertEqual(json.loads((state / 'cli-assets.json').read_text())['phase'], 'active')
+        old_token = (state / 'transaction-token').read_text().strip()
+        transaction('rollback')
+        self.assertFalse(pointer.is_symlink())
+        self.assertFalse(state.exists())
+        self.assertEqual(git('rev-parse', 'HEAD'), previous)
+        self.assertEqual(legacy_manifest.read_text(), 'legacy')
+        transaction('apply', candidate, 'active', 'hub-only', 'matched-cli')
+        new_token = (state / 'transaction-token').read_text().strip()
+        stale = subprocess.run([sys.executable, env['MOCK_RETIRE'], str(state), old_token],
+                               capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(stale.returncode, 0)
+        self.assertIn('different deploy transaction', stale.stderr)
+        self.assertEqual((state / 'transaction-token').read_text().strip(), new_token)
+        transaction('publish', candidate, digest)
+        transaction('commit')
+        self.assertFalse(state.exists())
+        self.assertEqual(os.readlink(pointer), f'releases/{candidate}')
 
 
 if __name__ == '__main__':

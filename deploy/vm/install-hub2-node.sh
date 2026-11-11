@@ -10,6 +10,7 @@ set -euo pipefail
 
 RELEASE_MODE=""
 HUB_ONLY=false
+KEEP_CLI_ASSETS=false
 while (($#)); do
   case "$1" in
     --release-mode)
@@ -22,6 +23,10 @@ while (($#)); do
       ;;
     --hub-only)
       HUB_ONLY=true
+      shift
+      ;;
+    --keep-cli-assets)
+      KEEP_CLI_ASSETS=true
       shift
       ;;
     *)
@@ -70,8 +75,10 @@ fi
 echo "== state directories"
 install -d -m 750 -o alexey -g alexey "$DB_DIR" "$REPO/.local/tmp"
 
-echo "== public CLI artifacts"
-(cd "$REPO" && python3 scripts/build-hub-cli.py --out-dir hub2/public/cli)
+if [[ "$KEEP_CLI_ASSETS" != true ]]; then
+  echo "== public CLI artifacts"
+  (cd "$REPO" && python3 scripts/build-hub-cli.py --out-dir hub2/public/cli)
+fi
 
 echo "== secrets (.dev.vars, generated on this VM, never leave it)"
 if [[ ! -f "$REPO/.dev.vars" ]]; then

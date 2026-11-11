@@ -12,7 +12,7 @@ WorkingDirectory=/opt/agent-hub
 Environment=NODE_ENV=production
 Environment=TMPDIR=/opt/agent-hub/.local/tmp
 Environment=HOME=/home/alexey
-ExecStart=/usr/bin/node --experimental-transform-types hub2/node/main.ts --host 127.0.0.1 --port 8787 --data-dir /var/lib/agent-hub/hub2-db --dev-vars /opt/agent-hub/.dev.vars
+ExecStart=/usr/bin/node --experimental-transform-types hub2/node/main.ts --host 127.0.0.1 --port 8787 --data-dir /var/lib/agent-hub/hub2-db --dev-vars /opt/agent-hub/.dev.vars --cli-release-root /var/lib/agent-hub/cli-releases
 Restart=on-failure
 RestartSec=10
 KillMode=mixed
