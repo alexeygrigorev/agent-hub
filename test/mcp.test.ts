@@ -425,6 +425,11 @@ describe('Hub MCP protocol and parity', () => {
     const covered = new Set(MCP_ROUTES.flatMap(r => r.cli));
     for (const command of cliCommands) expect(covered.has(command) || Boolean(CLI_EXCLUSIONS[command]), command).toBe(true);
   });
+  it('keeps native credential collection in the host-local operator CLI', () => {
+    expect(cliCommands).toContain('engines import-native');
+    expect(CLI_EXCLUSIONS['engines import-native']).toContain('private native Claude credentials');
+    expect(MCP_ROUTES.flatMap(route => route.cli)).not.toContain('engines import-native');
+  });
   it('passes the exact bearer into real API routes and preserves errors', async () => {
     const direct = await doFetch(new Request(origin + '/api/sessions/tree', { headers: { Authorization: 'Bearer ' + bearer } }));
     const mcp: any = await (await rpc('tools/call', { name: 'sessions_tree' })).json();
