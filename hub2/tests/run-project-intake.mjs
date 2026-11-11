@@ -4,3 +4,4 @@ registerHooks({resolve(s,c,n){if(s.startsWith('.')&&c.parentURL&&!s.endsWith('.t
 await import('./project-intake.test.ts');
 await import('./session-start-cwd.test.ts');
 await import('./start-picker-evidence.test.ts');
+await import('./session-link.test.ts');

@@ -1,3 +1,4 @@
+import { linkSession } from './session-intake-link';
 import {MachineNativeCommands,NATIVE_COMMAND_SCHEMA} from './machine-native-commands';
 import {boundWorkspace,mergeWorkspaceBinding,WORKSPACE_BINDING_FIELD,WORKSPACE_REPAIR_FIELD,WORKSPACE_RECOVERY_TURN_FIELD} from './workspace-binding';
 import {MachineNativeInventory, NATIVE_INVENTORY_SCHEMA} from './machine-native-inventory';
@@ -214,6 +215,8 @@ export class MachineDO {
       if (sessionView && request.method === 'GET') return this.sessionDetail(request, decodeURIComponent(sessionView[1]));
       const commandAck = url.pathname.match(/^\/api\/sessions\/([^/]+)\/commands\/([^/]+)\/ack$/);
       if (commandAck && request.method === 'POST') return await this.ackCommand(request, decodeURIComponent(commandAck[1]), decodeURIComponent(commandAck[2]));
+      const link = url.pathname.match(/^\/api\/sessions\/([^/]+)\/link$/);
+      if (link && request.method === 'POST') return await linkSession(request, this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?', decodeURIComponent(link[1])), this.env);
       const legacy = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(stop|send|capture)$/);
       if (legacy && request.method === 'POST') return await this.legacyCommand(request, decodeURIComponent(legacy[1]), legacy[2]);
       const commandList = url.pathname.match(/^\/api\/sessions\/([^/]+)\/commands$/);

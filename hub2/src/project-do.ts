@@ -1,3 +1,4 @@
+import { SessionIntakeLink } from './session-intake-link';
 import {listProjectIntakes} from './intake-list';
 import {boundWorkspace,mergeWorkspaceBinding,type WorkspaceBinding} from './workspace-binding';
 import { MeteredDb, initializeSchema } from './db';
@@ -72,6 +73,7 @@ export class ProjectDO {
   private readonly sqlReceipts: SqlReceiptMeter;
   private readonly env: Hub2Env;
   private readonly work: ProjectWork;
+  private readonly sessionLinks: SessionIntakeLink;
   private readonly ready: Promise<void>;
   private constructorMs = 0;
   private readonly eventSequences=new Map<string,number>();
@@ -81,6 +83,7 @@ export class ProjectDO {
   constructor(private readonly ctx: DurableObjectState, env: Hub2Env) {
     const started = performance.now();
     this.db = new MeteredDb(ctx.storage.sql);
+    this.sessionLinks = new SessionIntakeLink(this.db, callback => this.transaction(callback), (...args) => this.appendEvent(...args));
     this.sqlReceipts = new SqlReceiptMeter(this.db);
     this.env = wrapSqlNamespaces(env, this.sqlReceipts) as Hub2Env;
     this.work = new ProjectWork(ctx, this.db, {
@@ -123,6 +126,7 @@ export class ProjectDO {
         if (!['GET', 'HEAD'].includes(request.method) && workResponse.status < 400) await this.scheduleNext();
         return workResponse;
       }
+      if (url.pathname === '/_internal/session-link' && request.method === 'POST') return await this.sessionLinks.receive(request);
       if (url.pathname === '/api/intakes' && request.method === 'POST') return await this.createIntake(request);
       if (url.pathname === '/api/intakes' && request.method === 'GET') return this.listIntakes(request);
       const match = url.pathname.match(/^\/api\/intakes\/([^/]+)(?:\/(start|history|append|events|context|audit|discard))?$/);
@@ -1211,6 +1215,7 @@ export class ProjectDO {
       id: row.id, project: row.project, title: row.title, text: row.text,
       acceptance_criteria: this.parse(row.acceptance_criteria_json), status: row.status,
       assigned_machine_id: row.assigned_machine_id, session_id: row.session_id,
+      linked_sessions: this.sessionLinks.links(row.id),
       dispatch: saga ? this.sagaView(saga) : undefined,
       priority:row.priority??2,original_ask:{title:row.original_title??row.title,text:row.original_text??row.text},provenance:this.parse(row.source_json),parent_intake_id:row.parent_intake_id??null,schedule_id:row.schedule_id??null,occurrence_id:row.occurrence_id??null,final_evidence: this.parse(row.final_evidence_json), created_at: row.created_at, updated_at: row.updated_at,
     };
