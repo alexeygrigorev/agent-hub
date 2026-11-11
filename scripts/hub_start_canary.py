@@ -303,7 +303,6 @@ class Canary:
         self.host_updater_triggered = False
         self.host_updater_trigger = "not_needed"
         self.host_updater_trigger_error = None
-        self.prior_pending_failed = False
         self.pyz_fd = None
         self.hub_pass_fds = ()
         self.lock_fd = None
@@ -779,12 +778,6 @@ class Canary:
                     raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
                 native_id = native_id or resolved_native
         if not sid:
-            if rec.get("candidate_sha") is None and raw_sid is None and items is not None and not conflict:
-                try:
-                    durable_unlink(pfile)
-                except OSError:
-                    raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
-                return
             raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
         if self.stop_session(sid, f"{key}-reconcile", deadline) != 0:
             raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
@@ -805,17 +798,11 @@ class Canary:
             return
         self.current_stage = "cleanup"
         pending_files = sorted(self.pending_dir.glob("*.json"))
-        self.prior_pending_failed = False
         for pfile in pending_files:
             if self.pending_path is not None and pfile == self.pending_path:
                 continue
             deadline = self.stage_deadline(self.stop_timeout)
-            try:
-                self._reconcile_one_pending_file(pfile, deadline)
-            except StageFailure:
-                if self.candidate_sha is not None:
-                    raise
-                self.prior_pending_failed = True
+            self._reconcile_one_pending_file(pfile, deadline)
 
     def run(self, argv, timeout=None, *, deadline=None, env=None):
         limit = self.cmd_timeout if timeout is None else timeout
@@ -1227,17 +1214,6 @@ class Canary:
                     result["cleanup"] = "FAILED_needs_reconciliation"
                     if result["ok"]:
                         result.update(ok=False, stage="cleanup", reason="pending_state_clear_failed")
-            if self.durable_pending_enabled and self.prior_pending_failed and (
-                self.stopped or result["cleanup"] == "stopped"
-            ):
-                try:
-                    self.reconcile_prior_pending()
-                except BaseException:
-                    self.prior_pending_failed = True
-                if self.prior_pending_failed:
-                    result["cleanup"] = "FAILED_needs_reconciliation"
-                    if result["ok"]:
-                        result.update(ok=False, stage="cleanup", reason="prior_pending_reconciliation_failed")
             if self.pyz_fd is not None:
                 try:
                     os.close(self.pyz_fd)
