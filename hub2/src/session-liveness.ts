@@ -1,5 +1,6 @@
 export const MAX_ACTIVE_SESSIONS = 50;
 export const LIVE_SNAPSHOT_TTL_MS = 90_000;
+export const HOST_INVENTORY_LOST_MS = 5 * 60_000;
 export const SESSION_IDLE_MS = 6 * 60 * 60_000;
 export const SESSION_REAP_INTERVAL_MS = 3 * 60_000;
 export const CLAIMED_WITHOUT_NATIVE_GRACE_MS = 2 * 60_000;
@@ -8,6 +9,7 @@ export type LiveSession = {
   session_id: string;
   native_id: string | null;
   phase: string;
+  managed_state?: string | null;
   last_activity_at: number | null;
   observed_at: number;
   containment_empty?: boolean;
