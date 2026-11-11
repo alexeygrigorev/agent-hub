@@ -1473,19 +1473,20 @@ class CanaryTest(unittest.TestCase):
         self.assertEqual(v_open["host_updater_trigger_error"], "host_updater_xdg_runtime_dir_not_private")
         self.assertEqual(self.systemctl_calls(), [])
 
-        # Non-zero systemctl exit records typed trigger error.
+        # Observe the fake command's non-zero exit, rather than timing out its startup.
         r_fail, v_fail = self.run_canary(
             "ok", "--deploy-gate", "--mode", "shell",
             "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_CANARY_HOST_RELEASE_ROOT=str(unconv_root),
-            HUB_CANARY_CONVERGE_TIMEOUT_S="0.05",
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.3",
             FAKE_SYSTEMCTL_ACTION="fail_exit_1",
         )
         self.assertEqual(r_fail.returncode, 1)
         self.assertEqual(v_fail["host_updater_trigger"], "failed")
         self.assertEqual(v_fail["host_updater_trigger_error"], "host_updater_trigger_exit_1")
         self.assertIn("host_updater_trigger_exit_1", v_fail["reason"])
+        self.assertEqual(len(self.systemctl_calls()), 1)
 
     def test_periodic_mode_serializes_pending_state_archives_intake_and_ignores_lock_busy_for_alerts(self):
         import fcntl
