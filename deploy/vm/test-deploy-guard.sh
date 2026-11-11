@@ -61,10 +61,11 @@ for required in (
     "--print-helper-sha256",
     "StrictHostKeyChecking=yes",
     "UserKnownHostsFile=\"$canary_known_hosts\"",
-    "hub-deploy-gate --candidate-sha $DEPLOY_SHA --run-token $run_token --helper-sha256 $helper_sha256",
+    "hub-deploy-gate --candidate-sha $DEPLOY_SHA --candidate-cli-sha256 $cli_sha256 --run-token $run_token --helper-sha256 $helper_sha256",
     "verdict.get(\"candidate_sha\") != deploy_sha or verdict.get(\"host_version\") != deploy_sha",
     "verdict.get(\"run_token\") != run_token",
     "verdict.get(\"helper_sha256\") != helper_sha256",
+    "verdict.get(\"hub_pyz_sha256\") != cli_sha256",
     "verdict.get(\"intake_archived\") is not True",
 ):
     if required not in canary_block:

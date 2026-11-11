@@ -23,12 +23,13 @@ if (($# != 0)); then
 fi
 
 ORIG_CMD="${SSH_ORIGINAL_COMMAND:-}"
-if [[ ! "$ORIG_CMD" =~ ^hub-deploy-gate\ --candidate-sha\ ([0-9a-f]{40})\ --run-token\ ([0-9a-f]{32,64})\ --helper-sha256\ ([0-9a-f]{64})$ ]]; then
+if [[ ! "$ORIG_CMD" =~ ^hub-deploy-gate\ --candidate-sha\ ([0-9a-f]{40})\ --candidate-cli-sha256\ ([0-9a-f]{64})\ --run-token\ ([0-9a-f]{32,64})\ --helper-sha256\ ([0-9a-f]{64})$ ]]; then
   emit_reject "forced_command" "invalid_forced_command" 2
 fi
 CANDIDATE_SHA="${BASH_REMATCH[1]}"
-RUN_TOKEN="${BASH_REMATCH[2]}"
-HELPER_SHA256="${BASH_REMATCH[3]}"
+CANDIDATE_CLI_SHA256="${BASH_REMATCH[2]}"
+RUN_TOKEN="${BASH_REMATCH[3]}"
+HELPER_SHA256="${BASH_REMATCH[4]}"
 
 USER_UID="$(/usr/bin/id -u)"
 USER_NAME="$(/usr/bin/id -un)"
@@ -41,9 +42,11 @@ A_BIN="$USER_HOME/.local/bin/a"
 HOST_RELEASE_ROOT="$USER_HOME/.local/share/agent-hub2"
 WORKSPACE_DIR="$USER_HOME/work/hub-canary"
 STATE_DIR="$USER_HOME/.local/state/agent-hub-canary"
+DEPLOY_GATE_TIMEOUT_S=360
+DEPLOY_GATE_LOCK_WAIT_S=5
 EXTRA_ENV=()
 
-if [[ "$HERE" != "$PROD_LIB" && -f "$HERE/.test-harness.env" ]]; then
+if [[ "$HERE" != "$PROD_LIB" && ! -L "$HERE/.test-harness.env" && -f "$HERE/.test-harness.env" ]]; then
   # Offline unit tests copy the scripts into an isolated temp directory and
   # write .test-harness.env there so env -i still purges caller variables
   # without touching the real user home. Unreachable in /usr/local/sbin/hub-start-canary.
@@ -51,13 +54,7 @@ if [[ "$HERE" != "$PROD_LIB" && -f "$HERE/.test-harness.env" ]]; then
   source "$HERE/.test-harness.env"
 fi
 
-/usr/bin/install -d -m 700 "$STATE_DIR"
-exec 9>"$STATE_DIR/deploy-gate.lock"
-if ! /usr/bin/flock -w "${DEPLOY_GATE_LOCK_WAIT_S:-5}" 9; then
-  emit_reject "lock" "deploy_gate_lock_busy" 1
-fi
-
-exec /usr/bin/timeout --kill-after=10s "${DEPLOY_GATE_TIMEOUT_S:-360}s" \
+exec /usr/bin/timeout --kill-after=10s "${DEPLOY_GATE_TIMEOUT_S}s" \
   /usr/bin/env -i \
   HOME="$USER_HOME" \
   USER="$USER_NAME" \
@@ -68,10 +65,12 @@ exec /usr/bin/timeout --kill-after=10s "${DEPLOY_GATE_TIMEOUT_S:-360}s" \
   HUB_CANARY_HOST_RELEASE_ROOT="$HOST_RELEASE_ROOT" \
   HUB_CANARY_WORKSPACE="$WORKSPACE_DIR" \
   HUB_CANARY_STATE_DIR="$STATE_DIR" \
+  HUB_CANARY_LOCK_WAIT_S="$DEPLOY_GATE_LOCK_WAIT_S" \
   "${EXTRA_ENV[@]}" \
-  /usr/bin/python3 "$HERE/hub_start_canary.py" \
+  /usr/bin/python3 -I -S "$HERE/hub_start_canary.py" \
   --mode shell \
   --deploy-gate \
   --candidate-sha "$CANDIDATE_SHA" \
+  --candidate-cli-sha256 "$CANDIDATE_CLI_SHA256" \
   --run-token "$RUN_TOKEN" \
   --helper-sha256 "$HELPER_SHA256"
