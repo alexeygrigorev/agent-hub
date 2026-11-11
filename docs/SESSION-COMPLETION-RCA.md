@@ -101,7 +101,9 @@ Pending actions live in the intake's own `final_evidence.completion`. The existi
 ### Known limits
 
 - The project cannot tell a reaper idle-stop of a live interactive session (`stop_confirmed` issued by `hub2-session-reaper`) from an operator stop. Both are reported, not continued. Telling them apart needs the stop actor in the Machine receipt.
-- Claims are correlated by the Hub session id in the contract, not by credential. Native sessions use the host's operator CLI profile (`HUB_CONFIG_FILE`/`cli.json`); the per-session `HUB2_CONFIG` worker credential is not read by the maintained `hub` CLI.
+- A claim counts only for the session it names, only if written after that session's start, and only if written by that session's own scoped credential (`session:<id>`) or an `operator:admin` actor. Native sessions currently append under the host's operator CLI profile (`HUB_CONFIG_FILE`/`cli.json`), because the maintained `hub` CLI does not read the per-session `HUB2_CONFIG` worker credential. So in practice the binding is the session id in the contract plus ordering. Wiring the CLI to the worker credential would make claims session-authenticated.
+- Host-supplied finish evidence can never carry a completion record. Hub acts only on records for the intake's current controlled attempt.
+- Every controlled terminal path delivers, including auth-fallback exhaustion and legacy unobserved launches. A continuation keeps the original requester as the assigned actor and is fenced to the attempt it continues.
 - Launch-start failures stay with their existing owners: 06d135ab (explicit-model start `internal_error`) and 8faad246 / 217342ab (Windows `native_launch_unverified`). abf8e6d2 covers the Hub usage audit and recurring start failures. Hub now reports these failures to the owner instead of letting them sit silently.
 
 ### Linked owners (not duplicated)

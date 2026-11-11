@@ -14,7 +14,9 @@ export const MAX_DELIVERY_TRIES = 5;
 /** Pending completion actions are found only among recently updated intakes. */
 export const COMPLETION_ACTION_WINDOW_MS = 24 * 60 * 60_000;
 const PROMPT_LIMIT = 8192;
-const LAUNCH_LIMIT = 11_500;
+/** The Machine rejects a launch whose JSON exceeds this many bytes. */
+export const LAUNCH_SPEC_LIMIT = 12_000;
+const LAUNCH_MARGIN = 300;
 
 export type CompletionClaim = { summary: string; met: number };
 export type CompletionAction = {
@@ -28,16 +30,31 @@ export type CompletionRecord = {
 };
 
 const bytes = (value: string) => new TextEncoder().encode(value).byteLength;
+/** Bytes a string occupies inside JSON (quotes, backslashes, newlines and
+ * control characters grow when escaped), which is what the Machine counts. */
+const jsonBytes = (value: string) => bytes(JSON.stringify(value)) - 2;
 
-function clip(value: string, limit: number): string {
-  if (bytes(value) <= limit) return value;
-  let result = value.slice(0, limit);
-  while (result && bytes(result + '…') > limit) result = result.slice(0, -1);
-  return result + '…';
+/** Clip on code points so a surrogate pair is never split. */
+function clip(value: string, limit: number, measure: (v: string) => number = bytes, suffix = '…'): string {
+  if (measure(value) <= limit) return value;
+  const points = Array.from(value);
+  let low = 0, high = points.length;
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    if (measure(points.slice(0, mid).join('') + suffix) <= limit) low = mid; else high = mid - 1;
+  }
+  return points.slice(0, low).join('') + suffix;
 }
 
-/** The contract appended to a controlled session's prompt, sized so the whole
- * launch spec stays under the Machine's 12 KB launch limit. */
+/** Host-supplied evidence never carries a Hub completion record. */
+export function stripCompletion<T>(value: T): T {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || !('completion' in (value as object))) return value;
+  const { completion: _dropped, ...rest } = value as Record<string, unknown>;
+  return rest as T;
+}
+
+/** The contract appended to a controlled session's prompt. `budget` is in
+ * escaped-JSON bytes so the whole launch spec stays under the Machine limit. */
 export function completionContract(intakeId: string, sessionId: string, criteria: string[], budget: number): string {
   const head = `Hub intake ${intakeId}, Hub session ${sessionId}. Process exit is not task completion: Hub marks this task finished only from your completion record, and a session that exits without one is treated as unfinished.\n`;
   const tail = `When every criterion is met with proof, before you exit write the completion record:\n`
@@ -45,16 +62,16 @@ export function completionContract(intakeId: string, sessionId: string, criteria
     + `with <file> containing {"kind":"task_complete","session_id":"${sessionId}","summary":"<what was delivered>","acceptance":[{"status":"met","proof":"<commit, PR, CI, deploy or live evidence>"}]} and exactly one acceptance entry per criterion, in order.\n`
     + `If you cannot finish, do not write that record: append a note with the current state and the next step (hub intake append ${intakeId} --note "...") and exit. Hub continues unfinished tasks itself (bounded) and delivers the outcome to the requester.`;
   const header = `Acceptance criteria (${criteria.length}; full text: hub intake show ${intakeId}):\n`;
-  const fixed = bytes(CONTRACT_MARKER + head + header + tail);
+  const fixed = jsonBytes(CONTRACT_MARKER + head + header + tail);
   let room = budget - fixed;
-  if (room < 0) return CONTRACT_MARKER + head + tail;
+  if (room < 0) return CONTRACT_MARKER + head + tail;  // the caller still verifies the final launch size
   const lines: string[] = [];
   for (const [index, criterion] of criteria.entries()) {
     const prefix = `${index + 1}. `, left = criteria.length - index;
-    const share = Math.max(0, Math.floor(room / left) - bytes(prefix) - 1);
-    const line = prefix + clip(criterion.replace(/\s+/g, ' ').trim(), share) + '\n';
-    if (share < 16 || bytes(line) > room) break;
-    lines.push(line); room -= bytes(line);
+    const share = Math.max(0, Math.floor(room / left) - jsonBytes(prefix) - 2);
+    const line = prefix + clip(criterion.replace(/\s+/g, ' ').trim(), share, jsonBytes) + '\n';
+    if (share < 16 || jsonBytes(line) > room) break;
+    lines.push(line); room -= jsonBytes(line);
   }
   return CONTRACT_MARKER + head + header + lines.join('') + tail;
 }
@@ -62,8 +79,7 @@ export function completionContract(intakeId: string, sessionId: string, criteria
 /** Attach the contract to the prompt within the launch budget. */
 export function promptWithContract(prompt: string, launchWithoutPrompt: unknown, intakeId: string, sessionId: string, criteria: string[]): string {
   const base = bytes(JSON.stringify({ ...(launchWithoutPrompt as object), prompt }));
-  // JSON escaping can grow multi-byte or control characters; keep a margin.
-  const budget = Math.min(6000, Math.floor((LAUNCH_LIMIT - base) / 1.2));
+  const budget = Math.min(6000, LAUNCH_SPEC_LIMIT - LAUNCH_MARGIN - base);
   return prompt + completionContract(intakeId, sessionId, criteria, budget);
 }
 
@@ -84,7 +100,7 @@ export function continuationPrompt(intakeId: string, depth: number, previousSess
     + `Hub started this session automatically (continuation ${depth} of at most ${MAX_AUTO_CONTINUATIONS}) because session ${previousSession} ended without completing intake ${intakeId} (${reason}). `
     + `First read the intake history (hub intake history ${intakeId}) and the current workspace state, then continue the remaining work; do not redo finished steps.`
     + CONTINUATION_END;
-  return preamble + clip(original, PROMPT_LIMIT - bytes(preamble));
+  return preamble + clip(original, PROMPT_LIMIT - bytes(preamble), bytes, `\n[truncated by Hub; full task: hub intake show ${intakeId}]`);
 }
 
 /** A completion claim counts only for this exact session and covers every criterion. */
