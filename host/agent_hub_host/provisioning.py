@@ -2139,13 +2139,20 @@ def scoped_profile(bundle):
         text='version = 1\n'
     if text.count(BEGIN)!=text.count(END) or text.count(BEGIN)>1:
         raise ValueError('Invalid managed profile block')
+    original=tomllib.loads(text)
     name='hub-'+bundle['label']
     table=re.compile(r'(?m)^\s*\[profiles\.'+re.escape(name)+r'(?:\]|\.)')
     before,marked,after=text,'',''
     if BEGIN in text:
         before,rest=text.split(BEGIN);marked,after=rest.split(END)
-    if table.search(before+after):
+    outside=tomllib.loads(before+after)
+    operator_profiles=outside.get('profiles',{})
+    if isinstance(operator_profiles,dict) and name in operator_profiles:
         raise ValueError('Operator profile collision')
+    managed=tomllib.loads(marked).get('profiles',{})
+    if (isinstance(managed,dict) and name in managed
+            and (not isinstance(managed[name],dict) or set(managed[name])-{'engine','command'})):
+        raise ValueError('Invalid scoped managed profile')
     # Generated tables are flat. Refuse unexpected nested target syntax rather
     # than consume another table or rewrite operator content.
     heading='[profiles.'+name+']'
@@ -2165,8 +2172,25 @@ def scoped_profile(bundle):
             raise ValueError('Invalid scoped managed profile')
         kept.append(section)
     addition='' if found else '\n'+rendered+'\n'
+    if isinstance(managed,dict) and name in managed and not found:
+        raise ValueError('Unrecognized scoped managed profile table')
     updated=(before+BEGIN+''.join(kept)+addition+END+after if BEGIN in text
              else text+'\n'+BEGIN+addition+END)
+    # TOML table names may be quoted, dotted or implicit. Validate the entire
+    # proposed document before any atomic publication, not just textual headers.
+    proposed=tomllib.loads(updated)
+    def unrelated(document):
+        result=dict(document)
+        entries=result.get('profiles')
+        if isinstance(entries,dict):
+            entries=dict(entries);entries.pop(name,None)
+            if entries:
+                result['profiles']=entries
+            else:
+                result.pop('profiles',None)
+        return result
+    if unrelated(original)!=unrelated(proposed):
+        raise ValueError('Scoped profile would change unrelated TOML semantics')
     with private_fs.parent(path,create=True):
         pass
     private_fs.atomic_write(path,updated.encode(),262144)
