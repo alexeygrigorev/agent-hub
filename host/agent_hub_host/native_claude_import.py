@@ -82,15 +82,18 @@ def command(args):
             response = dict(response, logins=[])
         return response
 
-    provisioning.sync(request=current_only)
-    verified = bus._do_request('GET', '/api/engines')
-    states = [account for row in verified.get('sync_status', [])
-              if row.get('machine_id') == host['machine_id']
-              for account in row.get('accounts', []) if account.get('label') == args.label]
-    if (len(states) != 1 or type(states[0].get('acked_generation')) is not int
-            or states[0]['acked_generation'] < published
-            or states[0]['acked_generation'] != states[0].get('credential_generation')):
-        raise ValueError('Native import saved; managed host acknowledgement is pending')
+    try:
+        provisioning.sync(request=current_only)
+        verified = bus._do_request('GET', '/api/engines')
+        states = [account for row in verified.get('sync_status', [])
+                  if row.get('machine_id') == host['machine_id']
+                  for account in row.get('accounts', []) if account.get('label') == args.label]
+        if (len(states) != 1 or type(states[0].get('acked_generation')) is not int
+                or states[0]['acked_generation'] < published
+                or states[0]['acked_generation'] != states[0].get('credential_generation')):
+            raise ValueError()
+    except Exception:
+        raise ValueError('Native import saved at generation %d; managed sync or acknowledgement is pending. Check hub engines list and verify managed Opus health before retrying import' % published) from None
     return {'status': 'imported', 'provider': 'claude', 'label': args.label,
             'credential_generation': published, 'machine_id': host['machine_id'],
             'acked_generation': states[0]['acked_generation']}

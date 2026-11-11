@@ -19,6 +19,11 @@ using the existing account credential store and advances its generation with a
 compare-and-swap check. A concurrent refresh or import refuses the stale write.
 The native source file is never modified.
 
+An older native access expiry normally refuses replacement of a fresher central
+credential. Recovery from recorded central authentication or refresh failure also
+requires the uploaded native credential to pass a live provider authentication
+probe. This probe does not clear an authentication incident or prove Opus health.
+
 After upload, the command reconciles the managed Claude installation and verifies
 the enrolled host has acknowledged the current generation. It refuses a sync
 response older than the import and ignores pending login work. Output contains
