@@ -30,6 +30,9 @@ def main(argv=None):
     heartbeat = commands.add_parser("heartbeat", help="Report machine health without reading offers or changing sessions")
     heartbeat.add_argument("--aplexer", default="a")
     heartbeat.add_argument("--label", action="append", default=[])
+    configure_host = commands.add_parser("configure-host", help="Replace resource tags and workspace aliases in an existing host enrollment")
+    configure_host.add_argument("--capability", action="append", default=[])
+    configure_host.add_argument("--workspace", action="append", default=[], metavar="LABEL=PATH")
     request = commands.add_parser("request")
     request.add_argument("method", choices=["GET", "POST", "PATCH", "DELETE"])
     request.add_argument("path")
@@ -51,6 +54,12 @@ def main(argv=None):
         return subprocess.run(command).returncode
     try:
         config = json.loads(args.config.read_text()) if args.config.exists() else {}
+        if args.command == "configure-host":
+            from .advertisement import configure
+            updated = configure(config, args.capability, args.workspace)
+            save_config(args.config, updated)
+            print(json.dumps({"configured": True, "restart_required": True}))
+            return 0
         server = args.server or config.get("server") or DEFAULT_SERVER
         client = Client(server, os.environ.get("HUB2_TOKEN") or config.get("token", ""))
         if args.command not in ('auth', 'heartbeat') and not os.environ.get('HUB2_TOKEN') and config.get('refresh_token') and config.get('expires_at',float('inf'))<=time.time()+30:
@@ -69,13 +78,15 @@ def main(argv=None):
             print(json.dumps(client.request(args.method, args.path, body, args.key)))
         elif args.command == "heartbeat":
             bridge = Bridge(client, None, config["roots"], config["engines"], args.aplexer,
-                            launcher_config=config.get("launcher"), machine_id=config["machine_id"])
+                            launcher_config=config.get("launcher"), machine_id=config["machine_id"],
+                            capabilities=config.get("capabilities"), workspaces=config.get("workspaces"))
             bridge.heartbeat(args.label, include_native_sessions=False)
             print(json.dumps({"ok": True}))
         elif args.command == "serve":
             bridge = Bridge(client, Journal(args.config.parent / "v2-journal.sqlite"),
                             config["roots"], config["engines"], args.aplexer,
-                            launcher_config=config.get("launcher"),machine_id=config['machine_id'])
+                            launcher_config=config.get("launcher"),machine_id=config['machine_id'],
+                            capabilities=config.get("capabilities"), workspaces=config.get("workspaces"))
             if args.once:
                 bridge.heartbeat(args.label)
                 bridge.drain()

@@ -180,9 +180,12 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
   // bring back an account/host already removed by credential or quota preference.
   const compatibleHosts = (row: typeof scored[number]) => row.hosts.filter(id => {
     const machine = machines.get(id), engine = row.candidate.engine;
-    const needed = [...required, ...(row.candidate.effort ? ['effort'] : [])];
+    const label = input.workspace && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(input.workspace)
+      ? `workspace:${input.workspace.toLowerCase()}` : null;
+    const needed = [...required, ...(row.candidate.effort ? ['effort'] : []), ...(label ? [label] : [])];
     return machine?.engines?.includes(engine) && needed.every(capability =>
-      machine.capabilities?.includes(capability) || machine.capabilities?.includes(`${capability}:${engine}`));
+      capability.startsWith('os:') ? machine.os?.toLowerCase() === capability.slice(3).toLowerCase()
+        : machine.capabilities?.includes(capability) || machine.capabilities?.includes(`${capability}:${engine}`));
   });
   const compatible = new Map(pool.map(row => [row.candidate.id, compatibleHosts(row)]));
   pool = narrow(pool, row => compatible.get(row.candidate.id)!.length > 0, () => 'capability_not_advertised');
