@@ -148,6 +148,7 @@ export const CLI_EXCLUSIONS: Record<string, string> = {
   'sessions events': 'Warning acknowledgement history is CLI-only by product scope.',
   'sessions first-attempt-report': 'First-attempt outcome ledger is a client-side aggregation over the sessions listing; MCP callers use sessions_list and compute the same normalized outcomes.',
   'engines add': 'Operator credential import reads private native files; never expose provider credentials through model tools.',
+  'engines import-native': 'Host-local operator action reads private native Claude credentials; never expose credential collection through model tools.',
   'engines login': 'Hub-central provider login needs a human browser consent and a pasted one-time code; never through model tools.',
   'engines maintain': 'Operator trigger for Hub credential refresh and direct provider quota; the cron already runs it.',
   'engines list': 'Operator credential-management inventory is inspected through the CLI or dedicated account UI.',

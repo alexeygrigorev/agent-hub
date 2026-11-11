@@ -236,6 +236,30 @@ export class AccountDO {
    if(account.provider==='claude'&&typeof auth?.claudeAiOauth?.accessToken!=='string')return error('invalid_credentials',400);
   }
   if(!Number.isSafeInteger(b.expected_generation)||Number(b.expected_generation)<0)return error('invalid_generation',400);
+  if(b.native_import===true){
+   if(account.provider!=='claude')return error('invalid_native_import',400);
+   const prior=this.db.one<{generation:number;sealed:string}>('SELECT generation,sealed FROM credentials WHERE id=1');
+   if((prior?.generation||0)!==b.expected_generation)return error('generation_conflict',409);
+   const incoming=this.freshness(account.provider,files as Record<string,string>);
+   if(incoming===null||incoming<=Date.now())return error('invalid_native_import',400);
+   if(prior){
+    const previous=await this.unseal(prior.sealed,account.provider,prior.generation) as Record<string,string>;
+    const existing=this.freshness(account.provider,previous);
+    if(existing!==null&&incoming<=existing){
+     const failed=this.db.one('SELECT host_id FROM credential_rejections WHERE generation=? LIMIT 1',prior.generation)
+      ||this.db.one('SELECT id FROM alerts WHERE id IN (?,?)',`credential:${prior.generation}:credential_refresh_failed`,`credential:${prior.generation}:credential_expired`);
+     if(!failed)return error('native_credential_not_newer',409);
+     // A revoked token can expire later than a working native login. Recovery
+     // requires current-generation failure evidence plus live native auth proof.
+     // This is not an Opus health result and never clears an auth incident.
+     try{
+      const probe=await this.providerQuota('claude',JSON.parse(String((files as Record<string,string>)[PATHS.claude[0]])));
+      if(!probe.ok)return error('native_credential_unverified',409);
+      await this.boundedJson(probe);
+     }catch{return error('native_credential_unverified',503);}
+    }
+   }
+  }
   const sealed=await this.seal(files,account.provider,Number(b.expected_generation)+1);
   const generation=this.db.transaction(this.ctx,()=>{
    const current=this.db.one<Account>('SELECT * FROM account WHERE id=1');if(current?.provider!==account.provider)throw new HttpError('provider_changed',409);

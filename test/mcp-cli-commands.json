@@ -43,6 +43,7 @@
   "driver stop",
   "engines add",
   "engines cancel",
+  "engines import-native",
   "engines list",
   "engines login",
   "engines maintain",
