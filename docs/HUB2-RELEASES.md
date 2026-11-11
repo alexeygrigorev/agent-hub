@@ -52,7 +52,11 @@ preserved. Python requirements are checked before installation, and newer host
 protocols are accepted only when the installed wheel reports the manifest's
 protocol. No existing
 environment, legacy CLI or unrelated service is replaced. The full CLI from
-the same commit is `current/hub.pyz`.
+the same commit is `current/hub.pyz`, exposed as `current/bin/hub` in an
+activated release shell. `hub --version` and `hub sessions list` use that
+operator CLI; `hub2` remains the host administration command. Same-version
+updater checks repair older wheel-generated `bin/hub` entry points after
+verifying the zipapp against the installed release receipt.
 
 The transport wheel is downloaded in CI with `--require-hashes` against the
 reviewed root `uv.lock`; installs have no package-index access. Artifact trust

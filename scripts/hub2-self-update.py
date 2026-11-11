@@ -185,6 +185,24 @@ def matches_installed_artifact(path, record):
     return path.is_file() and path.stat().st_size == record['size'] and artifact_matches(path.read_bytes(), record)
 
 
+def install_operator_cli(target, manifest):
+    # The wheel owns hub2 (daemon administration); hub is the full operator
+    # zipapp. Both packages use agent_hub_host, so importing the operator CLI
+    # through the host venv would select the wrong package.
+    archive = target / 'hub.pyz'
+    if not matches_installed_artifact(archive, manifest['artifacts']['hub.pyz']):
+        raise ValueError('installed release artifact mismatch: hub.pyz')
+    entry = target / 'bin/hub'
+    if entry.is_symlink() and os.readlink(entry) == '../hub.pyz':
+        return
+    command([target / 'bin/python', archive, '--version'])
+    entry.parent.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='.operator-cli-', dir=entry.parent) as temporary:
+        pending = Path(temporary) / 'hub'
+        pending.symlink_to('../hub.pyz')
+        os.replace(pending, entry)
+
+
 def repair_service_files(base, manifest, root, target):
     # The release is already committed. Do not create a new environment or
     # mark it as an interrupted activation, which would make recovery remove it.
@@ -277,6 +295,7 @@ def prepare_environment(target, download, manifest, host_wheel):
     shutil.copyfile(download / 'hub2-enroll.py', target / 'hub2-enroll.py')
     (target / 'hub.pyz').chmod(0o755)
     command([python, target / 'hub.pyz', '--help'])
+    install_operator_cli(target, manifest)
     write_json(target / 'release.json', manifest)
 
 
@@ -606,6 +625,14 @@ def install(base_url, root, *, install_service=False, restart=True):
         if install_service:
             preserve_provider_path()
         if old == target and (target / 'release.json').is_file():
+            installed = read_release_receipt(target)
+            if (installed['host_version'] != version
+                    or installed['protocol_version'] != manifest['protocol_version']):
+                raise ValueError('installed release identity does not match the published manifest')
+            # Older updaters install the wheel's hub shim even for a release
+            # containing this fix. Repair it on the next same-version check,
+            # using the original receipt if a rebuild changed zipapp bytes.
+            install_operator_cli(target, installed)
             if install_service:
                 repair_service_files(base, manifest, root, target)
                 if restart:
