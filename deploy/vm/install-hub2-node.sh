@@ -181,7 +181,6 @@ def ensure_private_evidence_root(target_root: Path, owner_uid: int, owner_gid: i
             box_fd = None
             child_fd = None
             box_identity = None
-            published = False
             try:
                 old_umask = os.umask(0o077)
                 try:
@@ -241,26 +240,15 @@ def ensure_private_evidence_root(target_root: Path, owner_uid: int, owner_gid: i
                     raise ValueError("staged evidence root ownership verification failed")
                 os.fsync(child_fd)
                 _publish_directory(box_fd, child_name, fd, leaf)
-                published = True
                 os.fsync(fd)
                 expected_identity = (cinfo.st_dev, cinfo.st_ino)
             finally:
+                # Retain the 0700 caller-owned .stage-box-<uuid> container as a deliberate
+                # artifact rather than performing name-based directory removal under parent.
                 if child_fd is not None:
                     os.close(child_fd)
                 if box_fd is not None:
-                    if not published:
-                        try:
-                            os.rmdir(child_name, dir_fd=box_fd)
-                        except OSError:
-                            pass
                     os.close(box_fd)
-                if box_identity is not None:
-                    try:
-                        cur_box = os.stat(box, dir_fd=fd, follow_symlinks=False)
-                        if stat.S_ISDIR(cur_box.st_mode) and (cur_box.st_dev, cur_box.st_ino) == box_identity:
-                            os.rmdir(box, dir_fd=fd)
-                    except OSError:
-                        pass
             linfo = os.stat(leaf, dir_fd=fd, follow_symlinks=False)
         if not stat.S_ISDIR(linfo.st_mode):
             raise ValueError("evidence root must be a 0700 directory")
