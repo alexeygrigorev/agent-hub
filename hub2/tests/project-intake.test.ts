@@ -1,11 +1,12 @@
+import {MachineDO} from '../src/machine-do';
 import {test} from 'node:test';import assert from 'node:assert/strict';import {DatabaseSync} from 'node:sqlite';import {ProjectDO} from '../src/project-do';
 const admin={id:'human:admin',kind:'operator',scopes:['operator:admin']};
-function fixture(options:{modelCandidates?:any[];accountHosts?:Record<string,string[]>;connected?:boolean;lostReleaseFailures?:number}={}){const sql=new DatabaseSync(':memory:');let alarm:any=null;const storageValues=new Map<string,unknown>(),ctx:any={id:{toString:()=> 'synthetic-project'},storage:{sql:{exec(q:string,...a:any[]){const p=sql.prepare(q);const rows=p.columns().length?p.all(...a):(p.run(...a),[]);return{toArray:()=>rows};}},transactionSync(fn:any){sql.exec('BEGIN');try{const r=fn();sql.exec('COMMIT');return r;}catch(e){sql.exec('ROLLBACK');throw e;}},async getAlarm(){return alarm;},async setAlarm(at:number){alarm=at;},async deleteAlarm(){alarm=null;},async get(key:string){return storageValues.get(key);},async put(key:string,value:unknown){storageValues.set(key,value);},async delete(key:string){return storageValues.delete(key);}},blockConcurrencyWhile:(f:any)=>Promise.resolve(f())};
+function fixture(options:{modelCandidates?:any[];accountHosts?:Record<string,string[]>;connected?:boolean;lostReleaseFailures?:number;machineFetch?:(request:Request)=>Promise<Response>}={}){const sql=new DatabaseSync(':memory:');let alarm:any=null;const storageValues=new Map<string,unknown>(),ctx:any={id:{toString:()=> 'synthetic-project'},storage:{sql:{exec(q:string,...a:any[]){const p=sql.prepare(q);const rows=p.columns().length?p.all(...a):(p.run(...a),[]);return{toArray:()=>rows};}},transactionSync(fn:any){sql.exec('BEGIN');try{const r=fn();sql.exec('COMMIT');return r;}catch(e){sql.exec('ROLLBACK');throw e;}},async getAlarm(){return alarm;},async setAlarm(at:number){alarm=at;},async deleteAlarm(){alarm=null;},async get(key:string){return storageValues.get(key);},async put(key:string,value:unknown){storageValues.set(key,value);},async delete(key:string){return storageValues.delete(key);}},blockConcurrencyWhile:(f:any)=>Promise.resolve(f())};
  const routes:any[]=[],machineCalls:string[]=[],accountCalls:string[]=[],capReleases:any[]=[];
  let remainingReleaseFailures=options.lostReleaseFailures??0;
  const requestOf=(input:string|Request,init?:RequestInit)=>input instanceof Request?input:new Request(input,init);
  const CONTROL={idFromName:(id:any)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{const request=requestOf(input,init),path=new URL(request.url).pathname;const value=request.method==='GET'?{}:await request.json();routes.push(value);if(path==='/_internal/session-cap/release'){capReleases.push(value);if(remainingReleaseFailures>0){remainingReleaseFailures--;return Response.json({error:'unavailable'},{status:503});}}if(path==='/_routing-policy')return Response.json({version:1,candidates:options.modelCandidates||[]});if(path==='/api/directory')return Response.json({items:[{id:'h1'}],next:null});return Response.json({registered:true,accepted:true});}})};
- const MACHINES={idFromName:(id:any)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{const request=requestOf(input,init);const path=new URL(request.url).pathname;machineCalls.push(path);if(path==='/_internal/routing')return Response.json({machine_id:'h1',connected:options.connected??true,engines:['codex','claude'],capabilities:['headless','interactive']});return Response.json(path.endsWith('/reserve')?{state:'staged',epoch:1}:{state:'offered'});}})};
+ const MACHINES={idFromName:(id:any)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{const request=requestOf(input,init);const path=new URL(request.url).pathname;machineCalls.push(path);if(options.machineFetch&&path!=='/_internal/routing')return options.machineFetch(request);if(path==='/_internal/routing')return Response.json({machine_id:'h1',connected:options.connected??true,engines:['codex','claude'],capabilities:['headless','interactive']});return Response.json(path.endsWith('/reserve')?{state:'staged',epoch:1}:{state:'offered'});}})};
  const unused={idFromName:(id:any)=>id,get:()=>({fetch:async()=>Response.json({ok:true})})};
  const ACCOUNTS={idFromName:(id:any)=>id,get:(id:string)=>({fetch:async(input:string|Request)=>{const path=new URL(input instanceof Request?input.url:input).pathname;accountCalls.push(path);return Response.json({account:{enabled:true},quota:{remaining:id==='codex'?90:70},hosts:options.accountHosts?.[id]||['h1'],credential_usable:false});}})};
  const env:any={CONTROL,PROJECTS:unused,MACHINES,ACCOUNTS,MAILBOXES:unused};
@@ -394,4 +395,96 @@ test('a start racing a discard leaves exactly one outcome: used intakes stay, di
  const late=await f.call('/api/intakes/'+second.id+'/start','POST',{...start,key:'race-start-2'});
  assert.equal(late.status,409);assert.equal((await body(late)).error,'intake_already_assigned');
  assert.equal((f.sql.prepare('SELECT COUNT(*) AS n FROM dispatch_sagas WHERE intake_id=?').get(second.id) as any).n,0);
+});
+
+
+test('late qualified exit preserves timeout failure and cannot overwrite a retry intake',async()=>{
+ for(const retryBeforeReceipt of [false,true]){
+  const f=fixture(),own=await intake(f,'late-abort-'+retryBeforeReceipt);
+  const start={key:'late-abort',workspace:'/tmp/synthetic-late-abort',engine:'shell',machine_id:'h1'};
+  await f.call('/api/intakes/'+own.id+'/start','POST',start);
+  const first=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any;
+  (f.project as any).db.run("UPDATE dispatch_sagas SET state='admitted' WHERE operation_id=?",first.operation_id);
+  const binding={operation_id:first.operation_id,attempt_operation_id:first.attempt_operation_id,session_id:first.session_id,machine_id:first.machine_id,epoch:first.epoch};
+  assert.equal((await f.call('/_internal/reaped','POST',{...binding,native_id:null,reason:'launch_timeout_no_native',launch_failed:true,observed_at:Date.now()})).status,200);
+  if(retryBeforeReceipt)assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',{...start,key:'late-abort-retry'})).status,201);
+  const native='33333333-3333-4333-8333-333333333333';
+  const evidence={source:'aplexer_status',containment_empty:true,native_identity:{id:native,tag:'task-hub2-'+first.session_id,workspace:start.workspace},native_exit:{code:0}};
+  const receipt={...binding,native_id:native,exit_code:0,native_exit_confirmed:true,launch_failed:true,evidence};
+  assert.equal((await f.call('/_internal/finish','POST',receipt)).status,200);
+  assert.equal((await f.call('/_internal/finish','POST',receipt)).status,200);
+  const current=f.sql.prepare('SELECT * FROM intakes WHERE id=?').get(own.id) as any;
+  assert.equal(current.status,retryBeforeReceipt?'queued':'failed');
+  if(!retryBeforeReceipt){
+   const proof=JSON.parse(current.final_evidence_json);
+   assert.equal(proof.reason,'launch_timeout_no_native');assert.equal(proof.exit_code,0);
+   assert.equal(proof.native_exit_confirmed,true);assert.equal(proof.native_id_absent,false);
+  }else assert.notEqual(current.session_id,first.session_id);
+  assert.equal((await f.call('/_internal/finish','POST',{...receipt,evidence:{...evidence,changed:true}})).status,409);
+ }
+});
+
+
+test('late exit forwards the timeout before completion when the first timeout transport fails',async()=>{
+ const database=new DatabaseSync(':memory:');
+ let alarm:number|null=null;
+ const machineContext:any={
+  id:{toString:()=> 'h1'},
+  storage:{
+   sql:{exec(query:string,...args:any[]){
+    const statement=database.prepare(query);
+    const rows=statement.columns().length?statement.all(...args):(statement.run(...args),[]);
+    return {toArray:()=>rows};
+   }},
+   transactionSync(callback:()=>unknown){
+    database.exec('BEGIN');
+    try{const result=callback();database.exec('COMMIT');return result;}
+    catch(error){database.exec('ROLLBACK');throw error;}
+   },
+   async getAlarm(){return alarm;},async setAlarm(at:number){alarm=at;},async deleteAlarm(){alarm=null;},
+  },
+  blockConcurrencyWhile:(callback:()=>unknown)=>Promise.resolve(callback()),getWebSockets:()=>[],
+ };
+ let machine:MachineDO;
+ const f=fixture({machineFetch:request=>machine.fetch(request)});
+ let timeoutFailures=1;
+ const delivered:string[]=[];
+ const environment:any={
+  CONTROL:{idFromName:(id:string)=>id,get:()=>({fetch:async()=>Response.json({authorized:true,revoked:true})})},
+  PROJECTS:{idFromName:(id:string)=>id,get:()=>({fetch:async(request:Request)=>{
+   const path=new URL(request.url).pathname;
+   if(path==='/_internal/reaped'&&timeoutFailures-->0){delivered.push('timeout-failed');return Response.json({error:'unavailable'},{status:503});}
+   delivered.push(path);
+   return f.project.fetch(request);
+  }})},
+ };
+ machine=new MachineDO(machineContext,environment);
+ const own=await intake(f,'late-exit-ordering');
+ await f.call('/api/intakes/'+own.id+'/start','POST',{key:'late-exit-ordering',workspace:'/tmp/synthetic-late-order',engine:'shell',machine_id:'h1'});
+ const saga=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any;
+ assert(saga);
+ const started=Date.now()-120_000;
+ const machineDb=(machine as any).db;
+ machineDb.run("UPDATE sessions SET state='claimed',updated_at=?,created_at=? WHERE id=?",started,started,saga.session_id);
+ machineDb.run('INSERT INTO launch_admissions VALUES(?,?,?,?)',saga.attempt_operation_id,saga.session_id,saga.epoch,started);
+ (f.project as any).db.run("UPDATE dispatch_sagas SET state='admitted' WHERE operation_id=?",saga.operation_id);
+ const machineActor={id:'machine:h1',kind:'machine',resource_id:'h1',scopes:['session:report']};
+ const call=(path:string,body:unknown)=>machine.fetch(new Request('https://machine.test'+path,{
+  method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(machineActor)},body:JSON.stringify(body)}));
+ await call('/_internal/reap',{dry_run:false});
+ assert(delivered.includes('timeout-failed'));
+ const launch=JSON.parse(saga.launch_spec_json),native='33333333-3333-4333-8333-333333333333';
+ const evidence={source:'aplexer_status',containment_empty:true,
+  native_identity:{id:native,tag:'task-hub2-'+saga.session_id,workspace:launch.workspace},
+  native_exit:{code:0,exited_at_ms:Date.now()},native_deadline:{deadline_ms:started+launch.timeout_seconds*1000,exceeded:false}};
+ const receipt={operation_id:saga.attempt_operation_id,epoch:saga.epoch,native_id:native,exit_code:0,native_exit_confirmed:true,launch_failed:true,evidence};
+ const response=await call('/api/sessions/'+saga.session_id+'/finish',receipt);
+ assert.equal(response.status,201,await response.text());
+ const timeoutIndex=delivered.indexOf('/_internal/reaped'),finishIndex=delivered.indexOf('/_internal/finish');
+ assert(timeoutIndex>=0&&finishIndex>timeoutIndex);
+ const result=f.sql.prepare('SELECT * FROM intakes WHERE id=?').get(own.id) as any;
+ assert.equal(result.status,'failed');
+ const proof=JSON.parse(result.final_evidence_json);
+ assert.equal(proof.reason,'launch_timeout_no_native');
+ assert.equal(proof.native_exit_confirmed,true);assert.equal(proof.native_id,native);assert.equal(proof.exit_code,0);
 });
