@@ -49,6 +49,8 @@ if args[:2] == ["sessions", "start"]:
         os.kill(parent_pid, signal.SIGTERM)
         time.sleep(2)
         sys.exit(1)
+    if sc in ("same_name_unrelated_key", "client_key_only_recovery", "conflicting_key_rows"):
+        print("lost accepted response"); sys.exit(0)
     if sc == "start_lost_response" and first: print("lost accepted response"); sys.exit(0)
     if sc == "start_slow" and first: time.sleep(1)
     print(json.dumps({"id": SID, "state": "queued", "operation_id": "op:0"})); sys.exit(0)
@@ -69,7 +71,7 @@ if args[:2] == ["intake", "update"]:
     (d / "archived_intake").write_text(" ".join(args)); sys.exit(0)
 if args[:2] == ["sessions", "list"]:
     if sc == "late_running": time.sleep(0.5)
-    items = [item("failed", id="other", native_id=None, attention={"reason": "engine_not_allowed", "observed_at": 1})]
+    items = [item("failed", id="other", name="other-session", key="other-key", native_id=None, attention={"reason": "engine_not_allowed", "observed_at": 1})]
     if (d / "started").exists():
         if sc == "never_running": items.append(item("claimed", native_id=None, attention={"reason": "native_launch_unverified", "observed_at": 1}))
         elif sc == "failed_state": items.append(item("failed", native_id=None, attention={"reason": "engine_not_allowed", "observed_at": 1}))
@@ -77,6 +79,15 @@ if args[:2] == ["sessions", "list"]:
         elif sc == "no_host": items.append(item("running", machine_id=None, workspace="/w/hub-canary"))
         elif sc == "wrong_host": items.append(item("running", machine_id="desktop"))
         elif sc == "wrong_workspace": items.append(item("running", workspace="/wrong/workspace"))
+        elif sc == "same_name_unrelated_key":
+            items.append(item("running", id="UNRELATED-SID", key="different-key", client_key="different-key", native_id="unrelated-native"))
+        elif sc == "client_key_only_recovery":
+            items.append(item("running", id="UNRELATED-SID", key="different-key", client_key="different-key", native_id="unrelated-native"))
+            items.append(item("running", id=SID, key=None, client_key=(d / "session_key").read_text(), native_id=NATIVE))
+        elif sc == "conflicting_key_rows":
+            ck = (d / "session_key").read_text()
+            items.append(item("running", id=SID, key=None, client_key=ck, native_id=NATIVE))
+            items.append(item("running", id="CONFLICT-SID-2", key=None, client_key=ck, native_id="conflict-native-2"))
         else: items.append(item("running"))
     print(json.dumps({"items": items[:1] if sc == "past_first_page" else items, "next": None, "complete": True, "sessions": items, "next_cursor": None})); sys.exit(0)
 if args[:2] == ["sessions", "capture"]:
@@ -833,6 +844,279 @@ class CanaryTest(unittest.TestCase):
         self.assertEqual(r_locked.returncode, 1)
         v_locked = json.loads(r_locked.stdout.strip())
         self.assertEqual((v_locked["ok"], v_locked["stage"], v_locked["reason"]), (False, "lock", "deploy_gate_lock_busy"))
+
+    def test_r1_cleanup_and_prior_reconcile_never_match_by_name_or_borrow_unrelated_native_id_and_reject_conflicts(self):
+        from scripts import hub_start_canary as mod
+
+        sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
+        token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        helper_sha = self.helper_sha256()
+        rel_root, pyz_sha = self.prepare_candidate_release(sha)
+        ws = str((self.tmp / "ws").resolve())
+
+        # 1. Same name, different key + failed key replay -> must NEVER stop or archive UNRELATED-SID.
+        r_name, v_name = self.run_canary(
+            "same_name_unrelated_key", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
+            FAKE_HOST_VERSION=sha,
+        )
+        self.assertEqual(r_name.returncode, 1)
+        self.assertEqual(v_name["session_id"], None)
+        self.assertEqual(v_name["cleanup"], "FAILED_needs_reconciliation")
+        self.assertEqual(v_name["intake_archived"], False)
+        self.assertNotIn("sessions stop", self.calls())
+        self.assertNotIn("intake update", self.calls())
+        # Pending file remains on disk because cleanup could not reconcile.
+        for pfile in (self.state / "pending").glob("*.json"):
+            pfile.unlink()
+
+        # 2. Unambiguous client_key alias + matching project/machine/workspace -> recovers SID, stops, archives, clears pending.
+        (self.tmp / "archived_intake").unlink(missing_ok=True)
+        r_ck, v_ck = self.run_canary(
+            "client_key_only_recovery", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
+            FAKE_HOST_VERSION=sha,
+        )
+        self.assertEqual(r_ck.returncode, 1)
+        self.assertEqual(v_ck["session_id"], SID)
+        self.assertEqual(v_ck["cleanup"], "stopped")
+        self.assertEqual(v_ck["intake_archived"], True)
+        self.assertIn("sessions stop " + SID, self.calls())
+        self.assertNotIn("UNRELATED-SID", self.calls())
+        self.assertEqual(list((self.state / "pending").glob("*.json")), [])
+
+        # 3. Conflicting client_key rows (two distinct SIDs for the same key) -> stays FAILED_needs_reconciliation, no stop/archive.
+        (self.tmp / "archived_intake").unlink(missing_ok=True)
+        r_conf, v_conf = self.run_canary(
+            "conflicting_key_rows", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
+            FAKE_HOST_VERSION=sha,
+        )
+        self.assertEqual(r_conf.returncode, 1)
+        self.assertEqual(v_conf["session_id"], None)
+        self.assertEqual(v_conf["cleanup"], "FAILED_needs_reconciliation")
+        self.assertEqual(v_conf["intake_archived"], False)
+        self.assertNotIn("sessions stop", self.calls())
+        self.assertNotIn("intake update", self.calls())
+        for pfile in (self.state / "pending").glob("*.json"):
+            pfile.unlink()
+
+        # 4. Direct unit verification of resolve_owned_session:
+        # Known SID never borrows native_id from an earlier same-name row and rejects conflicting rows.
+        items_borrow_test = [
+            {
+                "id": "UNRELATED-SID",
+                "name": "same-name",
+                "key": "other-key",
+                "project_id": "owner/repo",
+                "machine_id": "HOST-1",
+                "workspace": ws,
+                "native_id": "unrelated-native-must-not-be-borrowed",
+            },
+            {
+                "id": SID,
+                "name": "same-name",
+                "client_key": "expected-key",
+                "project_id": "owner/repo",
+                "machine_id": "HOST-1",
+                "workspace": ws,
+                "native_id": NATIVE,
+            },
+        ]
+        res_sid, res_nat, conflict = mod.Canary.resolve_owned_session(
+            items_borrow_test,
+            expected_sid=SID,
+            expected_key="expected-key",
+            expected_repo="owner/repo",
+            expected_machine="HOST-1",
+            expected_workspace=ws,
+        )
+        self.assertEqual((res_sid, res_nat, conflict), (SID, NATIVE, False))
+
+        # Known SID with another row claiming the same key -> conflict.
+        items_key_hijack = [
+            {
+                "id": "HIJACK-SID",
+                "client_key": "expected-key",
+                "project_id": "owner/repo",
+                "machine_id": "HOST-1",
+                "workspace": ws,
+                "native_id": "hijack-native",
+            },
+            {
+                "id": SID,
+                "client_key": "expected-key",
+                "project_id": "owner/repo",
+                "machine_id": "HOST-1",
+                "workspace": ws,
+                "native_id": NATIVE,
+            },
+        ]
+        self.assertEqual(
+            mod.Canary.resolve_owned_session(
+                items_key_hijack,
+                expected_sid=SID,
+                expected_key="expected-key",
+                expected_repo="owner/repo",
+                expected_machine="HOST-1",
+                expected_workspace=ws,
+            ),
+            (None, None, True),
+        )
+
+        # Unknown SID with mismatched scope (wrong workspace or machine or project) -> conflict.
+        for bad_field in (
+            {"project_id": "wrong/repo"},
+            {"machine_id": "WRONG-HOST"},
+            {"workspace": str(self.tmp / "wrong-ws")},
+            {"key": "disagreeing-key", "client_key": "expected-key"},
+        ):
+            row = {
+                "id": SID,
+                "client_key": "expected-key",
+                "project_id": "owner/repo",
+                "machine_id": "HOST-1",
+                "workspace": ws,
+                "native_id": NATIVE,
+            }
+            row.update(bad_field)
+            self.assertEqual(
+                mod.Canary.resolve_owned_session(
+                    [row],
+                    expected_sid=None,
+                    expected_key="expected-key",
+                    expected_repo="owner/repo",
+                    expected_machine="HOST-1",
+                    expected_workspace=ws,
+                ),
+                (None, None, True),
+                bad_field,
+            )
+
+    def test_r2_directory_fsync_and_durable_pending_publish_before_post_and_durable_unlink(self):
+        import errno
+        from unittest import mock
+        from scripts import hub_start_canary as mod
+
+        sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
+        token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        helper_sha = self.helper_sha256()
+        rel_root, pyz_sha = self.prepare_candidate_release(sha)
+
+        fsynced_dirs = []
+        real_fsync_dir = mod.fsync_dir
+
+        def record_fsync_dir(path):
+            fsynced_dirs.append(pathlib.Path(path).resolve())
+            return real_fsync_dir(path)
+
+        fresh_state = self.tmp / "r2-state" / "nested"
+        fresh_ws = self.tmp / "r2-ws"
+        env_patch = {
+            "HUB_CANARY_STATE_DIR": str(fresh_state),
+            "HUB_CANARY_WORKSPACE": str(fresh_ws),
+            "HUB_CANARY_HOST_RELEASE_ROOT": str(rel_root),
+            "HUB_CANARY_MACHINE": "HOST-1",
+            "HUB_CANARY_REPO": "owner/repo",
+            "HUB_CANARY_POLL_S": "0.02",
+            "HUB_CANARY_CONVERGE_TIMEOUT_S": "0.2",
+            "HUB_CANARY_RUNNING_TIMEOUT_S": "0.3",
+            "HUB_CANARY_CAPTURE_TIMEOUT_S": "0.2",
+            "HUB_CANARY_STOP_TIMEOUT_S": "0.3",
+            "A_BIN": f"{sys.executable} {self.tmp / 'fake_a.py'}",
+            "FAKE_DIR": str(self.tmp),
+            "FAKE_SCENARIO": "ok",
+            "FAKE_HOST_VERSION": sha,
+        }
+
+        with mock.patch.dict(os.environ, env_patch), mock.patch.object(mod, "fsync_dir", side_effect=record_fsync_dir):
+            canary = mod.Canary(
+                "shell",
+                f"{sha[:12]}-{token[:12]}",
+                candidate_sha=sha,
+                candidate_cli_sha256=pyz_sha,
+                run_token=token,
+                expected_helper_sha256=helper_sha,
+            )
+            orig_run = canary.run
+            pending_observed_before_post = []
+
+            def check_pending_before_post(argv, *a, **kw):
+                if argv[4:6] == ["sessions", "start"]:
+                    # At the moment POST (sessions start) is invoked, the pending file
+                    # must already exist on disk and pending_dir must already be fsynced.
+                    pending_observed_before_post.append(
+                        (
+                            canary.pending_path.is_file(),
+                            (fresh_state / "pending").resolve() in fsynced_dirs,
+                        )
+                    )
+                return orig_run(argv, *a, **kw)
+
+            with mock.patch.object(canary, "run", side_effect=check_pending_before_post):
+                verdict = canary.execute()
+
+        self.assertTrue(verdict["ok"], verdict)
+        self.assertEqual(pending_observed_before_post, [(True, True)])
+        self.assertIn(fresh_state.parent.resolve(), fsynced_dirs)
+        self.assertIn(fresh_state.resolve(), fsynced_dirs)
+        self.assertIn((fresh_state / "pending").resolve(), fsynced_dirs)
+        self.assertIn(fresh_ws.resolve(), fsynced_dirs)
+        self.assertFalse(canary.pending_path.exists())
+
+        # Pre-POST fsync failure on pending write must abort BEFORE invoking sessions start.
+        (self.tmp / "calls.log").write_text("")
+        with mock.patch.dict(os.environ, env_patch):
+            canary_fail_pre = mod.Canary(
+                "shell",
+                f"{sha[:12]}-{token[:12]}",
+                candidate_sha=sha,
+                candidate_cli_sha256=pyz_sha,
+                run_token=token,
+                expected_helper_sha256=helper_sha,
+            )
+            with mock.patch.object(
+                canary_fail_pre,
+                "write_pending_state",
+                side_effect=OSError(errno.EIO, "simulated pre-post dir fsync failure"),
+            ):
+                verdict_pre = canary_fail_pre.execute()
+        self.assertEqual(
+            (verdict_pre["ok"], verdict_pre["stage"], verdict_pre["reason"], verdict_pre["cleanup"]),
+            (False, "start", "pending_state_write_failed", "not_needed"),
+        )
+        self.assertFalse(canary_fail_pre.start_attempted)
+        self.assertNotIn("sessions start", self.calls())
+
+        # Directory fsync failure during durable_unlink at cleanup must fail closed.
+        with mock.patch.dict(os.environ, env_patch):
+            canary_fail_unlink = mod.Canary(
+                "shell",
+                f"{sha[:12]}-{token[:12]}",
+                candidate_sha=sha,
+                candidate_cli_sha256=pyz_sha,
+                run_token=token,
+                expected_helper_sha256=helper_sha,
+            )
+            with mock.patch.object(
+                mod,
+                "durable_unlink",
+                side_effect=OSError(errno.EIO, "simulated unlink dir fsync failure"),
+            ):
+                verdict_unlink = canary_fail_unlink.execute()
+        self.assertEqual(
+            (verdict_unlink["ok"], verdict_unlink["stage"], verdict_unlink["reason"], verdict_unlink["cleanup"]),
+            (False, "cleanup", "pending_state_clear_failed", "FAILED_needs_reconciliation"),
+        )
 
 
 if __name__ == "__main__":

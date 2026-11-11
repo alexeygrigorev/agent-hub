@@ -115,14 +115,41 @@ def raw_state_dir_path():
     return pathlib.Path(base)
 
 
+def fsync_dir(path):
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def ensure_private_dir(path, *, stage="lock", prefix="state_dir"):
     target = pathlib.Path(path)
     try:
         st = os.lstat(target)
     except FileNotFoundError:
+        missing = []
+        cur = target
+        while True:
+            try:
+                os.lstat(cur)
+                break
+            except FileNotFoundError:
+                missing.append(cur)
+                parent = cur.parent
+                if parent == cur:
+                    break
+                cur = parent
+            except OSError:
+                raise StageFailure(stage, f"{prefix}_stat_failed")
         try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            os.mkdir(target, 0o700)
+            for directory in reversed(missing):
+                mode = 0o700 if directory == target else 0o755
+                os.mkdir(directory, mode)
+                fsync_dir(directory)
+                if directory.parent != directory:
+                    fsync_dir(directory.parent)
             st = os.lstat(target)
         except OSError:
             raise StageFailure(stage, f"{prefix}_create_failed")
@@ -181,12 +208,22 @@ def atomic_write_private_json(path, payload):
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, target)
+        fsync_dir(target.parent)
     except BaseException:
         try:
             os.unlink(tmp)
         except OSError:
             pass
         raise
+
+
+def durable_unlink(path):
+    target = pathlib.Path(path)
+    try:
+        os.unlink(target)
+    except FileNotFoundError:
+        return
+    fsync_dir(target.parent)
 
 
 def env_num(name, default):
@@ -341,10 +378,147 @@ class Canary:
     def clear_pending_state(self):
         if self.pending_path is None:
             return
+        durable_unlink(self.pending_path)
+
+    @staticmethod
+    def valid_session_id(value):
+        return isinstance(value, str) and bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", value))
+
+    @staticmethod
+    def row_authoritative_key(item):
+        ck = item.get("client_key")
+        k = item.get("key")
+        has_ck = isinstance(ck, str) and bool(ck)
+        has_k = isinstance(k, str) and bool(k)
+        if has_ck and has_k and ck != k:
+            return None, True
+        if has_ck:
+            return ck, False
+        if has_k:
+            return k, False
+        return None, False
+
+    @staticmethod
+    def row_matches_scope(item, expected_repo, expected_machine, expected_workspace):
+        repo = item.get("project_id") or item.get("repo") or item.get("project")
+        machine = item.get("host") or item.get("machine_id") or item.get("machine")
+        workspace = item.get("workspace")
+        if repo != expected_repo or machine != expected_machine:
+            return False
+        if not isinstance(workspace, str) or not workspace:
+            return False
         try:
-            self.pending_path.unlink()
-        except FileNotFoundError:
-            pass
+            return pathlib.Path(workspace).resolve() == pathlib.Path(expected_workspace).resolve()
+        except OSError:
+            return False
+
+    @staticmethod
+    def row_conflicts_scope(item, expected_repo, expected_machine, expected_workspace):
+        repo = item.get("project_id") or item.get("repo") or item.get("project")
+        machine = item.get("host") or item.get("machine_id") or item.get("machine")
+        workspace = item.get("workspace")
+        if repo is not None and repo != expected_repo:
+            return True
+        if machine is not None and machine != expected_machine:
+            return True
+        if workspace is not None:
+            if not isinstance(workspace, str) or not workspace:
+                return True
+            try:
+                if pathlib.Path(workspace).resolve() != pathlib.Path(expected_workspace).resolve():
+                    return True
+            except OSError:
+                return True
+        return False
+
+    @classmethod
+    def resolve_owned_session(
+        cls,
+        items,
+        *,
+        expected_sid,
+        expected_key,
+        expected_repo,
+        expected_machine,
+        expected_workspace,
+    ):
+        if not isinstance(items, list):
+            return None, None, True
+        valid_sid = expected_sid if cls.valid_session_id(expected_sid) else None
+        valid_key = expected_key if isinstance(expected_key, str) and expected_key else None
+        if valid_sid is not None:
+            sid_rows = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                row_sid = item.get("id")
+                row_key, key_conflict = cls.row_authoritative_key(item)
+                if key_conflict and (
+                    row_sid == valid_sid
+                    or (valid_key and (item.get("client_key") == valid_key or item.get("key") == valid_key))
+                ):
+                    return None, None, True
+                if valid_key and row_key == valid_key and row_sid != valid_sid:
+                    return None, None, True
+                if row_sid == valid_sid:
+                    if valid_key and row_key is not None and row_key != valid_key:
+                        return None, None, True
+                    if cls.row_conflicts_scope(item, expected_repo, expected_machine, expected_workspace):
+                        return None, None, True
+                    sid_rows.append(item)
+            native_ids = {
+                item.get("native_id")
+                for item in sid_rows
+                if isinstance(item.get("native_id"), str) and item.get("native_id")
+            }
+            if len(native_ids) > 1:
+                return None, None, True
+            resolved_native = next(iter(native_ids), None)
+            if resolved_native is not None:
+                for item in items:
+                    if isinstance(item, dict) and item.get("id") != valid_sid and item.get("native_id") == resolved_native:
+                        return None, None, True
+            return valid_sid, resolved_native, False
+
+        if valid_key is None:
+            return None, None, False
+        key_rows = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            row_key, key_conflict = cls.row_authoritative_key(item)
+            if key_conflict and (item.get("client_key") == valid_key or item.get("key") == valid_key):
+                return None, None, True
+            if row_key == valid_key:
+                row_sid = item.get("id")
+                if not cls.valid_session_id(row_sid):
+                    return None, None, True
+                if not cls.row_matches_scope(item, expected_repo, expected_machine, expected_workspace):
+                    return None, None, True
+                key_rows.append(item)
+        if not key_rows:
+            return None, None, False
+        sids = {item.get("id") for item in key_rows}
+        native_ids = {
+            item.get("native_id")
+            for item in key_rows
+            if isinstance(item.get("native_id"), str) and item.get("native_id")
+        }
+        if len(sids) != 1 or len(native_ids) > 1:
+            return None, None, True
+        resolved_sid = next(iter(sids))
+        resolved_native = next(iter(native_ids), None)
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            row_key, _ = cls.row_authoritative_key(item)
+            if row_key == valid_key:
+                continue
+            if item.get("id") == resolved_sid:
+                return None, None, True
+            if resolved_native is not None and item.get("native_id") == resolved_native:
+                return None, None, True
+        return resolved_sid, resolved_native, False
 
     def verify_candidate_host_release(self):
         if not self.candidate_sha:
@@ -460,30 +634,17 @@ class Canary:
                 raise StageFailure("cleanup", "prior_pending_corrupt")
             if not isinstance(rec, dict):
                 raise StageFailure("cleanup", "prior_pending_corrupt")
-            sid = rec.get("session_id") if isinstance(rec.get("session_id"), str) else None
-            native_id = rec.get("native_id") if isinstance(rec.get("native_id"), str) else None
-            key = rec.get("key") if isinstance(rec.get("key"), str) else None
-            name = rec.get("name") if isinstance(rec.get("name"), str) else None
-            if not sid or not native_id:
-                try:
-                    items = self.list_items("cleanup", deadline)
-                except StageFailure:
-                    items = []
-                matched = next(
-                    (
-                        item for item in items
-                        if isinstance(item, dict)
-                        and (
-                            (sid and item.get("id") == sid)
-                            or (name and item.get("name") == name)
-                            or (key and item.get("key") == key)
-                        )
-                    ),
-                    None,
-                )
-                if matched is not None:
-                    sid = sid or matched.get("id")
-                    native_id = native_id or matched.get("native_id")
+            raw_sid = rec.get("session_id")
+            if raw_sid is not None and not self.valid_session_id(raw_sid):
+                raise StageFailure("cleanup", "prior_pending_corrupt")
+            sid = raw_sid if self.valid_session_id(raw_sid) else None
+            native_id = rec.get("native_id") if isinstance(rec.get("native_id"), str) and rec.get("native_id") else None
+            key = rec.get("key") if isinstance(rec.get("key"), str) and rec.get("key") else None
+            repo = rec.get("repo") if isinstance(rec.get("repo"), str) and rec.get("repo") else None
+            machine = rec.get("machine") if isinstance(rec.get("machine"), str) and rec.get("machine") else None
+            workspace = rec.get("workspace") if isinstance(rec.get("workspace"), str) and rec.get("workspace") else None
+            if not key or not repo or not machine or not workspace:
+                raise StageFailure("cleanup", "prior_pending_corrupt")
             if not sid and all(isinstance(rec.get(k), str) and rec.get(k) for k in ("repo", "machine", "workspace", "name", "key", "prompt", "mode")):
                 replay_args = [
                     *self.hub, "sessions", "start", "--no-wait",
@@ -495,7 +656,27 @@ class Canary:
                     replay_args += ["--engine", "shell"]
                 _, out, _ = self.run(replay_args, deadline=deadline)
                 sid = self.extract_session_id(out)
-            if not sid or not key:
+            if not sid or not native_id:
+                try:
+                    items = self.list_items("cleanup", deadline)
+                except StageFailure:
+                    items = None
+                if items is not None:
+                    resolved_sid, resolved_native, conflict = self.resolve_owned_session(
+                        items,
+                        expected_sid=sid,
+                        expected_key=key,
+                        expected_repo=repo,
+                        expected_machine=machine,
+                        expected_workspace=workspace,
+                    )
+                    if conflict:
+                        raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
+                    sid = sid or resolved_sid
+                    if native_id and resolved_native and native_id != resolved_native:
+                        raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
+                    native_id = native_id or resolved_native
+            if not sid:
                 raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
             if self.stop_session(sid, f"{key}-reconcile", deadline) != 0:
                 raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
@@ -507,7 +688,7 @@ class Canary:
             if rec.get("candidate_sha") and not self.archive_intake_for(sid, deadline):
                 raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
             try:
-                pfile.unlink()
+                durable_unlink(pfile)
             except OSError:
                 raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
 
@@ -619,7 +800,11 @@ class Canary:
         if not sid:
             return False
         self.session = sid
-        self.write_pending_state()
+        try:
+            self.write_pending_state()
+        except OSError:
+            if not self.in_cleanup:
+                raise StageFailure("start", "pending_state_write_failed")
         return True
 
     def start(self):
@@ -627,8 +812,11 @@ class Canary:
         ensure_private_dir(self.workspace, stage="start", prefix="workspace")
         self.started_at = time.monotonic()
         self.running_deadline = self.stage_deadline(self.running_timeout)
+        try:
+            self.write_pending_state()
+        except OSError:
+            raise StageFailure("start", "pending_state_write_failed")
         self.start_attempted = True
-        self.write_pending_state()
         rc, out, err = self.run(self.start_args(), deadline=self.running_deadline)
         identified = self.remember_receipt(out)
         if rc != 0:
@@ -670,7 +858,10 @@ class Canary:
                         raise StageFailure("list_host_workspace", "host_workspace_mismatch")
                     elif time.monotonic() < deadline:
                         self.native = item["native_id"]
-                        self.write_pending_state()
+                        try:
+                            self.write_pending_state()
+                        except OSError:
+                            raise StageFailure("running", "pending_state_write_failed")
                         return
                 else:
                     reason = f"state_{clean(state)}" + (f":{clean(att['reason'])}" if att.get("reason") else "")
@@ -787,26 +978,31 @@ class Canary:
         limit_deadline = deadline if deadline is not None else (time.monotonic() + self.stop_timeout)
         if not self.session and self.start_attempted:
             # A lost or interrupted response is reconciled first with the identical
-            # idempotent key and payload, then by listing sessions for our name/key.
+            # idempotent key and payload, then by unambiguous client_key/key + scope.
             _, out, _ = self.run(self.start_args(), deadline=limit_deadline)
             self.remember_receipt(out)
             if not self.session:
                 try:
                     items = self.list_items("cleanup", limit_deadline)
                 except StageFailure:
-                    items = []
-                matched = next(
-                    (
-                        item for item in items
-                        if isinstance(item, dict)
-                        and (item.get("name") == self.name or item.get("key") == self.key)
-                    ),
-                    None,
-                )
-                if matched is not None and isinstance(matched.get("id"), str):
-                    self.session = matched["id"]
-                    self.native = self.native or matched.get("native_id")
-                    self.write_pending_state()
+                    items = None
+                if items is not None:
+                    resolved_sid, resolved_native, conflict = self.resolve_owned_session(
+                        items,
+                        expected_sid=None,
+                        expected_key=self.key,
+                        expected_repo=self.repo,
+                        expected_machine=self.machine,
+                        expected_workspace=self.workspace,
+                    )
+                    if conflict or not resolved_sid:
+                        return "FAILED_needs_reconciliation"
+                    self.session = resolved_sid
+                    self.native = self.native or resolved_native
+                    try:
+                        self.write_pending_state()
+                    except OSError:
+                        pass
         if not self.session:
             return "FAILED_needs_reconciliation" if self.start_attempted else "not_needed"
         if self.stop(limit_deadline, "cleanup") != 0:
@@ -867,7 +1063,9 @@ class Canary:
                     result["cleanup"] = self.cleanup(deadline=cleanup_deadline)
                 except BaseException:
                     result["cleanup"] = "FAILED_needs_reconciliation"
-            if self.candidate_sha is not None and self.session:
+            if self.candidate_sha is not None and self.session and (
+                self.stopped or result["cleanup"] == "stopped"
+            ):
                 try:
                     self.intake_archived = self.archive_intake(deadline=cleanup_deadline)
                 except BaseException:
@@ -877,7 +1075,12 @@ class Canary:
             if (self.stopped or result["cleanup"] == "stopped") and (
                 self.candidate_sha is None or self.intake_archived is True
             ):
-                self.clear_pending_state()
+                try:
+                    self.clear_pending_state()
+                except OSError:
+                    result["cleanup"] = "FAILED_needs_reconciliation"
+                    if result["ok"]:
+                        result.update(ok=False, stage="cleanup", reason="pending_state_clear_failed")
             if self.pyz_fd is not None:
                 try:
                     os.close(self.pyz_fd)
