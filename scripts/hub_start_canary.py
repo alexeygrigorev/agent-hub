@@ -163,6 +163,23 @@ def ensure_private_dir(path, *, stage="lock", prefix="state_dir"):
         raise StageFailure(stage, f"{prefix}_wrong_owner")
     if (st.st_mode & 0o077) != 0:
         raise StageFailure(stage, f"{prefix}_not_private")
+    try:
+        home = pathlib.Path.home()
+        chain = [target]
+        cur = target
+        while cur.parent != cur and cur != home:
+            parent = cur.parent
+            pst = os.lstat(parent)
+            if stat.S_ISLNK(pst.st_mode) or not stat.S_ISDIR(pst.st_mode):
+                break
+            chain.append(parent)
+            if pst.st_uid != os.geteuid() or parent == home:
+                break
+            cur = parent
+        for directory in reversed(chain):
+            fsync_dir(directory)
+    except OSError:
+        raise StageFailure(stage, f"{prefix}_create_failed")
     return target
 
 
@@ -1140,6 +1157,14 @@ def send_mail(subject, body):
     return r.returncode == 0
 
 
+def record_dev_alert_occurrence(sdir, mode, result, state, *, decision):
+    """Reserved integration hook for the finite Hub dev@ occurrence counter
+    (dev_alert_occurrences_v1; invoked before dedup/SMTP on alert decisions,
+    including deduplicated failures and recovery).
+    """
+    _ = (sdir, mode, result, state, decision)
+
+
 def apply_alerting(result):
     sdir = state_dir()
     lock_fd = acquire_lock_fd(sdir / f"{result['mode']}.lock", 30.0, stage="lock", busy_reason="alert_state_lock_busy")
@@ -1152,24 +1177,38 @@ def apply_alerting(result):
             if st.get("incident_open"):
                 st["successes"] = st.get("successes", 0) + 1
                 if st["successes"] >= RECOVER_THRESHOLD:
+                    record_dev_alert_occurrence(sdir, mode, result, st, decision="recovery")
                     body = (f"Hub start canary ({mode}) recovered at {result['timestamp']}.\n"
                             f"Run id: {result['run_id']}\nIncident: {st.get('incident_id')}\n")
                     if send_mail(f"[RECOVERED] Hub start canary ({mode}) is passing again", body):
                         st.update(incident_open=False, successes=0, incident_id="-")
+                else:
+                    record_dev_alert_occurrence(sdir, mode, result, st, decision="recovering")
             else:
                 st["successes"] = 0
+                record_dev_alert_occurrence(sdir, mode, result, st, decision="pass")
         else:
             st["successes"] = 0
             st["failures"] = st.get("failures", 0) + 1
-            if st["failures"] >= FAIL_THRESHOLD and not st.get("incident_open"):
-                incident = st.get("incident_id") if st.get("incident_id", "-") != "-" else result["run_id"]
-                body = (f"CRITICAL: Hub cannot start sessions (canary mode {mode}).\n"
-                        f"Failing stage: {result['stage']}\nReason: {result['reason']}\n"
-                        f"Timestamp: {result['timestamp']}\nRun id: {result['run_id']}\n"
-                        f"Consecutive failures: {st['failures']}\nIncident: {incident}\n"
-                        f"Session cleanup: {result['cleanup']}\n")
-                if send_mail(f"[CRITICAL] Hub start canary ({mode}) failing at stage {result['stage']}: {result['reason']}", body):
-                    st.update(incident_open=True, incident_id=incident)
+            if st["failures"] >= FAIL_THRESHOLD:
+                record_dev_alert_occurrence(
+                    sdir,
+                    mode,
+                    result,
+                    st,
+                    decision="critical_dedup" if st.get("incident_open") else "critical",
+                )
+                if not st.get("incident_open"):
+                    incident = st.get("incident_id") if st.get("incident_id", "-") != "-" else result["run_id"]
+                    body = (f"CRITICAL: Hub cannot start sessions (canary mode {mode}).\n"
+                            f"Failing stage: {result['stage']}\nReason: {result['reason']}\n"
+                            f"Timestamp: {result['timestamp']}\nRun id: {result['run_id']}\n"
+                            f"Consecutive failures: {st['failures']}\nIncident: {incident}\n"
+                            f"Session cleanup: {result['cleanup']}\n")
+                    if send_mail(f"[CRITICAL] Hub start canary ({mode}) failing at stage {result['stage']}: {result['reason']}", body):
+                        st.update(incident_open=True, incident_id=incident)
+            else:
+                record_dev_alert_occurrence(sdir, mode, result, st, decision="failure_below_threshold")
         st["last"] = {k: result[k] for k in ("ok", "stage", "reason", "timestamp", "run_id")}
         save_state(path, st)
     finally:
