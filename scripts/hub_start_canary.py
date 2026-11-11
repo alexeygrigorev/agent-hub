@@ -4,16 +4,28 @@
 Drives the public CLIs only (`hub sessions start|list|capture|stop`,
 `a list --json --running`). See docs/HUB-START-CANARY.md.
 """
-import argparse, datetime, fcntl, json, os, pathlib, re, shlex, subprocess, sys, time, uuid
+import argparse, datetime, fcntl, hashlib, json, os, pathlib, re, shlex, subprocess, sys, time, uuid
 
 ALERT_TO = "dev@dtcdev.click"  # fixed on purpose: never configurable, never orin@
 ALERT_FROM = "alerts@dtcdev.click"
 MSMTP_ACCOUNT = "alerts"
 MARKER = "CANARY-OK"
 PROMPTS = {"full": "Reply CANARY-OK and exit", "shell": "printf CANARY-OK; sleep 30"}
-STAGES = ("start", "running", "list_host_workspace", "capture", "stop", "gone")
+STAGES = ("helper_version", "host_release", "start", "running", "list_host_workspace", "capture", "stop", "gone", "cleanup")
 FAIL_THRESHOLD = 2
 RECOVER_THRESHOLD = 2
+HELPER_FILES = ("hub-deploy-gate-forced.sh", "hub-start-canary.sh", "hub_start_canary.py")
+
+
+def compute_helper_sha256(directory=None):
+    base = pathlib.Path(directory) if directory else pathlib.Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    for name in HELPER_FILES:
+        data = (base / name).read_bytes()
+        digest.update(f"{name}\0{len(data)}\0".encode("utf-8"))
+        digest.update(data)
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 class StageFailure(Exception):
@@ -38,31 +50,156 @@ def clean(text, limit=80):
 
 
 class Canary:
-    def __init__(self, mode, run_id):
+    def __init__(self, mode, run_id, *, candidate_sha=None, run_token=None, expected_helper_sha256=None):
         self.mode, self.run_id = mode, run_id
+        self.candidate_sha = candidate_sha
+        self.run_token = run_token
+        self.expected_helper_sha256 = expected_helper_sha256
+        self.helper_sha256 = None
+        self.host_version = None
+        self.hub_pyz_sha256 = None
+        self.intake_archived = None
         self.hub = shlex.split(os.environ.get("HUB_BIN", "hub"))
         self.a = shlex.split(os.environ.get("A_BIN", "a"))
         self.poll = env_num("HUB_CANARY_POLL_S", 2)
+        self.converge_timeout = env_num("HUB_CANARY_CONVERGE_TIMEOUT_S", 120)
         self.running_timeout = env_num("HUB_CANARY_RUNNING_TIMEOUT_S", 180)
         self.capture_timeout = env_num("HUB_CANARY_CAPTURE_TIMEOUT_S", 120 if mode == "full" else 30)
         self.stop_timeout = env_num("HUB_CANARY_STOP_TIMEOUT_S", 60)
         self.cmd_timeout = env_num("HUB_CANARY_CMD_TIMEOUT_S", 90)
         self.workspace = os.environ.get("HUB_CANARY_WORKSPACE") or str(pathlib.Path.home() / "work" / "hub-canary")
+        self.host_release_root = pathlib.Path(
+            os.environ.get("HUB_CANARY_HOST_RELEASE_ROOT") or (pathlib.Path.home() / ".local" / "share" / "agent-hub2")
+        )
         self.machine = os.environ.get("HUB_CANARY_MACHINE", "hetzner-aplexer")
         self.repo = os.environ.get("HUB_CANARY_REPO", "alexeygrigorev/agent-hub")
         self.key = f"canary-{run_id}"
         self.name = f"hub-canary-{mode}-{run_id}"
-        self.marker = MARKER if mode == "shell" else f"{MARKER}:{run_id}"
-        # The complete expected output never occurs in the model prompt. A
-        # wrapped echo of the prompt therefore cannot count as execution.
-        self.prompt = PROMPTS["shell"] if mode == "shell" else (
-            f'Use two sequential tool calls. First run a shell command that prints the concatenation of "CANARY-", "OK:", and "{run_id}" '
-            'as one output line and exits immediately. After that tool call completes, use a separate tool call to run sleep 60 '
-            'so the orchestrator can stop this session. Do not combine printing and sleeping in one tool call. '
-            'Do not edit files or start another agent.')
+        if candidate_sha and run_token:
+            sha12 = candidate_sha[:12]
+            self.marker = f"{MARKER}:{sha12}:{run_token}"
+            # The complete expected output never occurs in the command or prompt text.
+            self.prompt = (
+                f"printf '%s:%s:%s\\n' CANARY-OK {sha12} {run_token}; sleep 30"
+                if mode == "shell"
+                else (
+                    f'Use two sequential tool calls. First run a shell command that prints the concatenation of "CANARY-", "OK:", and "{sha12}:{run_token}" '
+                    "as one output line and exits immediately. After that tool call completes, use a separate tool call to run sleep 60 "
+                    "so the orchestrator can stop this session. Do not combine printing and sleeping in one tool call. "
+                    "Do not edit files or start another agent."
+                )
+            )
+        else:
+            self.marker = MARKER if mode == "shell" else f"{MARKER}:{run_id}"
+            # The complete expected output never occurs in the model prompt. A
+            # wrapped echo of the prompt therefore cannot count as execution.
+            self.prompt = PROMPTS["shell"] if mode == "shell" else (
+                f'Use two sequential tool calls. First run a shell command that prints the concatenation of "CANARY-", "OK:", and "{run_id}" '
+                'as one output line and exits immediately. After that tool call completes, use a separate tool call to run sleep 60 '
+                'so the orchestrator can stop this session. Do not combine printing and sleeping in one tool call. '
+                'Do not edit files or start another agent.')
         self.session = self.native = None
         self.started_at = self.running_deadline = None
         self.start_attempted = self.stopped = False
+
+    def verify_helper_digest(self):
+        try:
+            self.helper_sha256 = compute_helper_sha256()
+        except OSError:
+            raise StageFailure("helper_version", "helper_bundle_unreadable")
+        if self.expected_helper_sha256 is not None and self.helper_sha256 != self.expected_helper_sha256:
+            raise StageFailure("helper_version", "helper_sha256_mismatch")
+
+    def verify_candidate_host_release(self):
+        if not self.candidate_sha:
+            return
+        deadline = time.monotonic() + self.converge_timeout
+        reason = "candidate_release_not_installed"
+        release_dir = self.host_release_root / "releases" / self.candidate_sha
+        current_link = self.host_release_root / "current"
+        verified_pyz = None
+        verified_pyz_sha = None
+        while time.monotonic() < deadline:
+            if not release_dir.is_dir():
+                reason = "candidate_release_not_installed"
+                self.pause(deadline)
+                continue
+            try:
+                is_current = current_link.is_symlink() and current_link.resolve() == release_dir.resolve()
+            except OSError:
+                is_current = False
+            if not is_current:
+                reason = "current_release_not_converged"
+                self.pause(deadline)
+                continue
+            if verified_pyz is None:
+                try:
+                    meta = json.loads((release_dir / "release.json").read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    raise StageFailure("host_release", "candidate_release_json_invalid")
+                if not isinstance(meta, dict) or meta.get("host_version") != self.candidate_sha:
+                    raise StageFailure("host_release", "candidate_release_version_mismatch")
+                artifacts = meta.get("artifacts") if isinstance(meta.get("artifacts"), dict) else {}
+                pyz_meta = artifacts.get("hub.pyz") if isinstance(artifacts.get("hub.pyz"), dict) else {}
+                expected_sha = pyz_meta.get("sha256")
+                expected_size = pyz_meta.get("size")
+                if not isinstance(expected_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_sha):
+                    raise StageFailure("host_release", "candidate_hub_pyz_metadata_invalid")
+                if not isinstance(expected_size, int) or expected_size <= 0:
+                    raise StageFailure("host_release", "candidate_hub_pyz_metadata_invalid")
+                hub_pyz = release_dir / "hub.pyz"
+                try:
+                    if hub_pyz.is_symlink() or not hub_pyz.is_file():
+                        raise StageFailure("host_release", "candidate_hub_pyz_missing")
+                    data = hub_pyz.read_bytes()
+                except OSError:
+                    raise StageFailure("host_release", "candidate_hub_pyz_missing")
+                if len(data) != expected_size or hashlib.sha256(data).hexdigest() != expected_sha:
+                    raise StageFailure("host_release", "candidate_hub_pyz_digest_mismatch")
+                verified_pyz = hub_pyz
+                verified_pyz_sha = expected_sha
+                # Execute the verified immutable candidate hub.pyz directly via Python
+                # without mutating the global ~/.local/bin/hub operator CLI before commit.
+                self.hub = [sys.executable, str(verified_pyz)]
+                self.hub_pyz_sha256 = verified_pyz_sha
+            rc, out, err = self.run([*self.hub, "routing-machines"], deadline=deadline)
+            if rc != 0:
+                if rc != 124 or reason in ("candidate_release_not_installed", "current_release_not_converged"):
+                    reason = self.failure_reason(rc, err)
+                self.pause(deadline)
+                continue
+            try:
+                payload = json.loads(out)
+            except ValueError:
+                reason = "routing_machines_unparseable_json"
+                self.pause(deadline)
+                continue
+            entries = payload.get("hosts", payload.get("machines")) if isinstance(payload, dict) else None
+            if not isinstance(entries, list):
+                reason = "routing_machines_unparseable_json"
+                self.pause(deadline)
+                continue
+            host_entry = next(
+                (
+                    entry for entry in entries
+                    if isinstance(entry, dict)
+                    and (entry.get("machine_id") == self.machine or entry.get("id") == self.machine)
+                ),
+                None,
+            )
+            if host_entry is None:
+                reason = "host_not_listed"
+            elif host_entry.get("connected") is not True:
+                reason = "host_disconnected"
+            elif host_entry.get("host_version") != self.candidate_sha:
+                reason = f"host_version_mismatch:{clean(host_entry.get('host_version'))}"
+            elif host_entry.get("version_mismatch") is not False:
+                reason = "host_version_mismatch_flag"
+            elif time.monotonic() < deadline:
+                self.host_version = self.candidate_sha
+                return
+            self.pause(deadline)
+        raise StageFailure("host_release", f"timeout_{reason}")
 
     def run(self, argv, timeout=None, *, deadline=None):
         limit = self.cmd_timeout if timeout is None else timeout
@@ -265,6 +402,27 @@ class Canary:
             self.pause(deadline)
         raise StageFailure("gone", "still_listed_in_a_running")
 
+    def archive_intake(self):
+        if not self.session:
+            return False
+        deadline = time.monotonic() + min(self.cmd_timeout, 30)
+        rc, out, _ = self.run([*self.hub, "sessions", "show", self.session, "--json"], deadline=deadline)
+        if rc != 0:
+            return False
+        try:
+            payload = json.loads(out)
+        except ValueError:
+            return False
+        node = payload.get("session", payload) if isinstance(payload, dict) else None
+        intake_id = node.get("intake_id") if isinstance(node, dict) else None
+        if not isinstance(intake_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", intake_id):
+            return False
+        rc, _, _ = self.run(
+            [*self.hub, "intake", "update", intake_id, "--status", "archived", "--reason", "deploy_gate_shell_canary"],
+            deadline=deadline,
+        )
+        return rc == 0
+
     def cleanup(self):
         deadline = time.monotonic() + self.stop_timeout
         if not self.session and self.start_attempted:
@@ -287,6 +445,8 @@ class Canary:
         result = {"ok": False, "mode": self.mode, "run_id": self.run_id, "timestamp": now_iso(),
                   "stage": None, "reason": None, "session_id": None, "cleanup": "not_needed"}
         try:
+            self.verify_helper_digest()
+            self.verify_candidate_host_release()
             self.start()
             self.wait_running()
             self.check_capture()
@@ -307,7 +467,22 @@ class Canary:
                     result["cleanup"] = self.cleanup()
                 except Exception:
                     result["cleanup"] = "FAILED_needs_reconciliation"
+            if self.candidate_sha is not None and self.session:
+                try:
+                    self.intake_archived = self.archive_intake()
+                except Exception:
+                    self.intake_archived = False
+                if result["ok"] and not self.intake_archived:
+                    result.update(ok=False, stage="cleanup", reason="intake_archive_failed")
         result["session_id"] = self.session
+        if self.helper_sha256 is not None:
+            result["helper_sha256"] = self.helper_sha256
+        if self.candidate_sha is not None:
+            result["candidate_sha"] = self.candidate_sha
+            result["run_token"] = self.run_token
+            result["host_version"] = self.host_version
+            result["hub_pyz_sha256"] = self.hub_pyz_sha256
+            result["intake_archived"] = bool(self.intake_archived)
         return result
 
 
@@ -390,9 +565,33 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--mode", choices=("shell", "full"), default=None)
     p.add_argument("--deploy-gate", action="store_true", help="run the canary once (default mode full, or --mode shell), no mail, JSON verdict")
+    p.add_argument("--candidate-sha", default=None, help="40-hex candidate commit SHA for pre-commit deploy gate")
+    p.add_argument("--run-token", default=None, help="32..64-hex run token binding the pre-commit deploy gate verdict")
+    p.add_argument("--helper-sha256", default=None, help="64-hex expected SHA-256 of the installed canary helper bundle")
+    p.add_argument("--print-helper-sha256", action="store_true", help="print canonical helper bundle SHA-256 and exit")
     args = p.parse_args()
+    if args.print_helper_sha256:
+        print(compute_helper_sha256())
+        return 0
+    bound_args = (args.candidate_sha, args.run_token, args.helper_sha256)
+    if any(v is not None for v in bound_args):
+        if not args.deploy_gate or not all(v is not None for v in bound_args):
+            p.error("--candidate-sha, --run-token, and --helper-sha256 must be provided together with --deploy-gate")
+        if not re.fullmatch(r"[0-9a-f]{40}", args.candidate_sha):
+            p.error("--candidate-sha must be a 40-character lowercase hex SHA")
+        if not re.fullmatch(r"[0-9a-f]{32,64}", args.run_token):
+            p.error("--run-token must be a 32..64-character lowercase hex token")
+        if not re.fullmatch(r"[0-9a-f]{64}", args.helper_sha256):
+            p.error("--helper-sha256 must be a 64-character lowercase hex SHA-256")
     mode = args.mode or "full"
-    result = Canary(mode, uuid.uuid4().hex[:12]).execute()
+    run_id = f"{args.candidate_sha[:12]}-{args.run_token[:12]}" if args.candidate_sha else uuid.uuid4().hex[:12]
+    result = Canary(
+        mode,
+        run_id,
+        candidate_sha=args.candidate_sha,
+        run_token=args.run_token,
+        expected_helper_sha256=args.helper_sha256,
+    ).execute()
     if args.deploy_gate:
         result["deploy_gate"] = True
     else:

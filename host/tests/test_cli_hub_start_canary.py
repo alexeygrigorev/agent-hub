@@ -30,12 +30,29 @@ if args[:2] == ["sessions", "start"]:
     if sc == "start_noid": print(json.dumps({"state": "queued"})); sys.exit(0)
     first = not (d / "started").exists()
     (d / "started").write_text("1"); (d / "a_running").write_text("1")
-    (d / "prompt").write_text(args[args.index("--prompt") + 1])
+    prompt_text = args[args.index("--prompt") + 1]
+    (d / "prompt").write_text(prompt_text)
     run_id = args[args.index("--name") + 1].rsplit("-", 1)[-1]
-    (d / "marker").write_text("CANARY-OK" + (":" + run_id if "--engine" not in args else ""))
+    if "printf '%%s:%%s:%%s\\n' CANARY-OK " in prompt_text:
+        parts = prompt_text.split(";")[0].split()
+        (d / "marker").write_text(f"CANARY-OK:{parts[-2]}:{parts[-1]}")
+    else:
+        (d / "marker").write_text("CANARY-OK" + (":" + run_id if "--engine" not in args else ""))
     if sc == "start_lost_response" and first: print("lost accepted response"); sys.exit(0)
     if sc == "start_slow" and first: time.sleep(1)
     print(json.dumps({"id": SID, "state": "queued", "operation_id": "op:0"})); sys.exit(0)
+if args[:1] == ["routing-machines"]:
+    host_ver = os.environ.get("FAKE_HOST_VERSION", "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7")
+    connected = sc != "host_disconnected"
+    mismatch = sc == "host_version_mismatch_flag"
+    print(json.dumps({"hosts": [{"machine_id": os.environ.get("HUB_CANARY_MACHINE", "HOST-1"), "connected": connected, "host_version": host_ver, "version_mismatch": mismatch, "protocol_version": 1}]}))
+    sys.exit(0)
+if args[:2] == ["sessions", "show"]:
+    if sc == "archive_show_fail": sys.exit(1)
+    print(json.dumps({"session": {"id": SID, "intake_id": "intake-canary-1"}})); sys.exit(0)
+if args[:2] == ["intake", "update"]:
+    if sc == "archive_update_fail": sys.exit(1)
+    (d / "archived_intake").write_text(" ".join(args)); sys.exit(0)
 if args[:2] == ["sessions", "list"]:
     if sc == "late_running": time.sleep(0.5)
     items = [item("failed", id="other", native_id=None, attention={"reason": "engine_not_allowed", "observed_at": 1})]
@@ -415,6 +432,204 @@ class CanaryTest(unittest.TestCase):
     def test_shell_capture_requires_output_line_not_command_text(self):
         # command line only, even with the marker inside it, must fail
         self.assert_stage("capture_prompt_only", "capture", "no_output_beyond_prompt")
+
+    def prepare_candidate_release(self, sha, *, converge=True, tamper_pyz=False):
+        root = self.tmp / "host-releases"
+        rel = root / "releases" / sha
+        rel.mkdir(parents=True, exist_ok=True)
+        pyz = rel / "hub.pyz"
+        pyz_bytes = (self.tmp / "fake_hub.py").read_bytes()
+        pyz.write_bytes(pyz_bytes)
+        import hashlib
+        digest = hashlib.sha256(pyz_bytes).hexdigest()
+        if tamper_pyz:
+            pyz.write_bytes(pyz_bytes + b"\n# tampered\n")
+        meta = {
+            "host_version": sha,
+            "protocol_version": 1,
+            "schema_version": 1,
+            "artifacts": {"hub.pyz": {"sha256": digest, "size": len(pyz_bytes)}},
+        }
+        (rel / "release.json").write_text(json.dumps(meta))
+        current = root / "current"
+        if current.exists() or current.is_symlink():
+            current.unlink()
+        if converge:
+            current.symlink_to(rel)
+        return root, digest
+
+    def helper_sha256(self):
+        out = subprocess.check_output(
+            [sys.executable, str(ROOT / "scripts" / "hub_start_canary.py"), "--print-helper-sha256"],
+            text=True,
+        ).strip()
+        self.assertRegex(out, r"^[0-9a-f]{64}$")
+        return out
+
+    def test_precommit_deploy_gate_binds_candidate_sha_run_token_helper_and_hub_pyz(self):
+        sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
+        token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        helper_sha = self.helper_sha256()
+        rel_root, pyz_sha = self.prepare_candidate_release(sha)
+        # Set HUB_BIN to a broken path to prove verify_candidate_host_release
+        # switches self.hub to the verified immutable candidate hub.pyz without mutating ~/.local/bin/hub.
+        r, v = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_BIN="/nonexistent/global-hub-must-not-be-used",
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
+            FAKE_HOST_VERSION=sha,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(v["ok"])
+        self.assertEqual(v["deploy_gate"], True)
+        self.assertEqual(v["mode"], "shell")
+        self.assertEqual(v["candidate_sha"], sha)
+        self.assertEqual(v["run_token"], token)
+        self.assertEqual(v["helper_sha256"], helper_sha)
+        self.assertEqual(v["host_version"], sha)
+        self.assertEqual(v["hub_pyz_sha256"], pyz_sha)
+        self.assertEqual(v["intake_archived"], True)
+        self.assertEqual(
+            (self.tmp / "archived_intake").read_text(),
+            "intake update intake-canary-1 --status archived --reason deploy_gate_shell_canary",
+        )
+        prompt = (self.tmp / "prompt").read_text()
+        self.assertNotIn(f"CANARY-OK:{sha[:12]}:{token}", prompt)
+        self.assertIn(f"printf '%s:%s:%s\\n' CANARY-OK {sha[:12]} {token}; sleep 30", prompt)
+
+    def test_precommit_deploy_gate_rejects_helper_digest_mismatch(self):
+        sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
+        token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        rel_root, _ = self.prepare_candidate_release(sha)
+        r, v = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--run-token", token, "--helper-sha256", "0" * 64,
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
+        )
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual((v["ok"], v["stage"], v["reason"]), (False, "helper_version", "helper_sha256_mismatch"))
+        self.assertEqual(self.calls(), "")
+
+    def test_precommit_deploy_gate_rejects_unconverged_or_tampered_host_release(self):
+        sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
+        token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        helper_sha = self.helper_sha256()
+        rel_root, _ = self.prepare_candidate_release(sha, converge=False)
+        r, v = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.1",
+        )
+        self.assertEqual((r.returncode, v["stage"], v["reason"]), (1, "host_release", "timeout_current_release_not_converged"))
+
+        rel_root, _ = self.prepare_candidate_release(sha, tamper_pyz=True)
+        r, v = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.1",
+        )
+        self.assertEqual((r.returncode, v["stage"], v["reason"]), (1, "host_release", "candidate_hub_pyz_digest_mismatch"))
+
+        rel_root, _ = self.prepare_candidate_release(sha)
+        r, v = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.1",
+            FAKE_HOST_VERSION="ad0b8a0b2276303c2b13762a614fe49a63514ae7",
+        )
+        self.assertEqual((r.returncode, v["stage"]), (1, "host_release"))
+        self.assertIn("timeout_host_version_mismatch", v["reason"])
+
+    def test_precommit_deploy_gate_fails_when_intake_archival_fails(self):
+        sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
+        token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        helper_sha = self.helper_sha256()
+        rel_root, _ = self.prepare_candidate_release(sha)
+        r, v = self.run_canary(
+            "archive_update_fail", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
+            FAKE_HOST_VERSION=sha,
+        )
+        self.assertEqual((r.returncode, v["ok"], v["stage"], v["reason"], v["intake_archived"]),
+                         (1, False, "cleanup", "intake_archive_failed", False))
+
+    def test_forced_command_wrapper_validates_ssh_original_command_purges_env_and_locks(self):
+        sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
+        token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        helper_sha = self.helper_sha256()
+        rel_root, pyz_sha = self.prepare_candidate_release(sha)
+        lib = self.tmp / "canary-lib"
+        lib.mkdir()
+        for name in ("hub-deploy-gate-forced.sh", "hub-start-canary.sh", "hub_start_canary.py"):
+            dst = lib / name
+            shutil.copy2(ROOT / "scripts" / name, dst)
+            dst.chmod(0o755)
+        (lib / ".test-harness.env").write_text(
+            f'USER_HOME="{self.tmp}"\n'
+            f'A_BIN="{sys.executable} {self.tmp / "fake_a.py"}"\n'
+            f'HOST_RELEASE_ROOT="{rel_root}"\n'
+            f'WORKSPACE_DIR="{self.tmp / "ws"}"\n'
+            f'STATE_DIR="{self.state}"\n'
+            f'DEPLOY_GATE_LOCK_WAIT_S="0"\n'
+            f'EXTRA_ENV=(FAKE_DIR="{self.tmp}" FAKE_SCENARIO="ok" FAKE_HOST_VERSION="{sha}" '
+            f'HUB_CANARY_MACHINE="HOST-1" HUB_CANARY_REPO="owner/repo" '
+            f'HUB_CANARY_POLL_S="0.02" HUB_CANARY_CONVERGE_TIMEOUT_S="0.2" '
+            f'HUB_CANARY_RUNNING_TIMEOUT_S="0.3" HUB_CANARY_CAPTURE_TIMEOUT_S="0.2" '
+            f'HUB_CANARY_STOP_TIMEOUT_S="0.3")\n'
+        )
+        forced = str(lib / "hub-deploy-gate-forced.sh")
+        for bad_cmd in (
+            "",
+            "hub-deploy-gate",
+            f"hub-deploy-gate --candidate-sha {sha} --run-token {token}",
+            f"hub-deploy-gate --candidate-sha {sha} --run-token {token} --helper-sha256 {helper_sha}; id",
+            f"hub-deploy-gate --candidate-sha NOT_HEX --run-token {token} --helper-sha256 {helper_sha}",
+        ):
+            r = subprocess.run([forced], env={"SSH_ORIGINAL_COMMAND": bad_cmd}, capture_output=True, text=True, timeout=10)
+            self.assertEqual(r.returncode, 2, bad_cmd)
+            v = json.loads(r.stdout.strip())
+            self.assertEqual((v["ok"], v["stage"]), (False, "forced_command"))
+
+        r_pos = subprocess.run(
+            [forced, "extra"],
+            env={"SSH_ORIGINAL_COMMAND": f"hub-deploy-gate --candidate-sha {sha} --run-token {token} --helper-sha256 {helper_sha}"},
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(r_pos.returncode, 2)
+
+        valid_cmd = f"hub-deploy-gate --candidate-sha {sha} --run-token {token} --helper-sha256 {helper_sha}"
+        # Pass a poisoned caller HUB_BIN; env -i must purge it and use the candidate hub.pyz.
+        r_ok = subprocess.run(
+            [forced],
+            env={"SSH_ORIGINAL_COMMAND": valid_cmd, "HUB_BIN": "/nonexistent/poisoned-by-caller"},
+            capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(r_ok.returncode, 0, r_ok.stderr)
+        verdict = json.loads(r_ok.stdout.strip())
+        self.assertEqual(verdict["ok"], True)
+        self.assertEqual(verdict["candidate_sha"], sha)
+        self.assertEqual(verdict["run_token"], token)
+        self.assertEqual(verdict["helper_sha256"], helper_sha)
+        self.assertEqual(verdict["hub_pyz_sha256"], pyz_sha)
+        self.assertEqual(verdict["intake_archived"], True)
+
+        # Hold the deploy-gate lock and verify concurrent forced-command execution fails closed.
+        import fcntl
+        lock_file = open(self.state / "deploy-gate.lock", "w")
+        self.addCleanup(lock_file.close)
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        r_locked = subprocess.run([forced], env={"SSH_ORIGINAL_COMMAND": valid_cmd}, capture_output=True, text=True, timeout=10)
+        self.assertEqual(r_locked.returncode, 1)
+        v_locked = json.loads(r_locked.stdout.strip())
+        self.assertEqual((v_locked["ok"], v_locked["stage"], v_locked["reason"]), (False, "lock", "deploy_gate_lock_busy"))
 
 
 if __name__ == "__main__":
