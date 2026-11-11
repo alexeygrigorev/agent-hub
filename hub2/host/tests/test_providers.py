@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -237,6 +238,53 @@ class ProvisionTests(unittest.TestCase):
             self.assertEqual(sync_report['state'], 'synced')
             self.assertEqual(sync_report['items'][0]['credential_generation'], 8)
             self.assertNotIn('synthetic-claude', json.dumps(calls))
+
+    def test_noncanonical_claude_account_refused_before_fixed_sync_or_ack(self):
+        client = mock.Mock()
+        client.request.return_value = {'account': {'provider': 'claude'}}
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(provider_home, 'materialize') as materialize, \
+             mock.patch.object(provider_home, 'install_managed_claude') as install:
+            with self.assertRaisesRegex(RuntimeError, 'provider_claude_account_mismatch'):
+                provision(client, {'account_id': 'another-claude'}, {'engine': 'claude'}, directory,
+                          {'claude': {'provider': 'claude'}})
+            client.request.assert_called_once_with('GET', '/api/accounts/another-claude/api/account')
+            materialize.assert_not_called()
+            install.assert_not_called()
+
+    def test_typed_central_refusals_never_materialize_or_ack(self):
+        from agent_hub_host.client import ApiError
+        for provider, account in (('claude', 'claude'), ('go', 'shared-go')):
+            for error in (ApiError('host_not_approved', status=403, code='host_not_approved'),
+                          ApiError('invalid_grant', status=409, code='provider_refresh_invalid_grant')):
+                with self.subTest(provider=provider, code=error.code), tempfile.TemporaryDirectory() as directory, \
+                     mock.patch.object(provider_home, 'materialize') as materialize, \
+                     mock.patch.object(provider_home, 'install_managed_claude') as install:
+                    client = mock.Mock()
+                    client.request.side_effect = [{'account': {'provider': provider}}, error]
+                    with self.assertRaises(ApiError) as caught:
+                        provision(client, {'account_id': account}, {'engine': provider, 'timeout_seconds': 600},
+                                  directory, {provider: {'provider': provider}})
+                    self.assertIs(caught.exception, error)
+                    self.assertEqual([call.args[0] for call in client.request.call_args_list], ['GET', 'GET'])
+                    materialize.assert_not_called()
+                    install.assert_not_called()
+
+    def test_go_keeps_canonical_account_generation_and_attempt_fence(self):
+        client = mock.Mock()
+        client.request.side_effect = [{'account': {'provider': 'go'}},
+                                     {'generation': 12, 'files': {'synthetic': 'access-only'}},
+                                     {'acknowledged': True}]
+        offer = {'account_id': 'shared-go', 'session_id': 'session', 'operation_id': 'operation', 'epoch': 3}
+        launch = {'engine': 'go', 'model': 'opencode-go/muse-spark-1.3-contributor', 'timeout_seconds': 600}
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(provider_home, 'materialize', return_value='scoped-manifest') as materialize:
+            self.assertEqual(provision(client, offer, launch, directory, {'go': {'provider': 'go'}}), 'scoped-manifest')
+            self.assertEqual(materialize.call_args.args[1:5], ('shared-go', 'go', 12, {'synthetic': 'access-only'}))
+            expected_fence = hashlib.sha256(b'["session","operation",3]').hexdigest()
+            self.assertEqual(Path(materialize.call_args.args[0]).name, expected_fence)
+        client.request.assert_any_call('GET', '/api/accounts/shared-go/api/account/credentials?min_validity_ms=960000')
+        client.request.assert_called_with('POST', '/api/accounts/shared-go/api/account/credentials', {'generation': 12})
 
     def test_failed_claude_fable_smoke_reports_failure_and_blocks_launch(self):
         with tempfile.TemporaryDirectory() as directory:

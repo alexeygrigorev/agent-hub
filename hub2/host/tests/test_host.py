@@ -148,6 +148,64 @@ class HostTests(unittest.TestCase):
                     self.assertIn('task', child); self.assertIn('run', child)
                     self.assertEqual(child[child.index('--profile') + 1], 'hub-shared-codex')
 
+    def test_mixed_sources_heartbeat_retains_only_local_credential_hints(self):
+        from agent_hub_host.native_launch import NativeLauncher, PROVIDER_CAPABILITIES
+        captured = []
+        self.client.heartbeat = lambda *args, **kw: captured.append(args)
+        self.bridge.launcher = NativeLauncher({'private_provider_homes': True,
+            'provider_credential_sources': {'claude': 'central', 'go': 'central', 'antigravity': 'local',
+                                            'codex': 'local', 'zai': 'local'},
+            'routes': {'claude': {'provider': 'claude'}, 'go': {'provider': 'go'}}})
+        self.bridge.engines = set(PROVIDER_CAPABILITIES)
+        self.bridge.launcher.capabilities = lambda: PROVIDER_CAPABILITIES
+        self.bridge.heartbeat([], include_native_sessions=False)
+        hints = {v for v in captured[-1][2] if v.startswith('credentials:')}
+        self.assertEqual(hints, {'credentials:local:' + mode + ':' + engine + ':' + account
+            for mode in ('headless', 'interactive')
+            for engine, account in (('antigravity', 'gemini'), ('codex', 'codex'), ('zai', 'zai-central'))})
+
+    def test_mixed_offer_source_choice_both_modes_and_central_errors_never_fallback(self):
+        from agent_hub_host.native_launch import NativeLauncher, PROVIDER_CAPABILITIES
+        config = {'provider_credential_sources': {'claude': 'central', 'go': 'central'},
+                  'routes': {'claude': {'provider': 'claude'}, 'go': {'provider': 'go'}}}
+        self.bridge.launcher = NativeLauncher(config, self.native, aplexer=os.sys.executable)
+        self.bridge.launcher.capabilities = lambda: PROVIDER_CAPABILITIES
+        self.bridge.engines = set(PROVIDER_CAPABILITIES)
+        for engine in ('claude', 'go', 'codex', 'zai', 'antigravity'):
+            for interactive in (False, True):
+                with self.subTest(engine=engine, interactive=interactive):
+                    offer = self.offer()
+                    suffix = engine + str(interactive)
+                    offer.update(session_id='session-' + suffix, operation_id='op-' + suffix)
+                    offer['launch'].update(engine=engine, interactive=interactive,
+                        model='opencode-go/muse-spark-1.3-contributor' if engine == 'go' else 'test-model')
+                    with patch('agent_hub_host.providers.provision', return_value=None) as provision:
+                        self.bridge.offer(offer)
+                    self.assertEqual(provision.call_count, int(engine in ('claude', 'go')))
+        for error in (RuntimeError('host_not_approved'), RuntimeError('provider_engine_bundle_invalid'),
+                      ApiError('invalid_grant', status=409, code='provider_refresh_invalid_grant')):
+            with self.subTest(error=error):
+                offer = self.offer()
+                offer['launch']['engine'] = 'claude'
+                acknowledgements = []
+                self.native.calls.clear()
+                self.client.calls.clear()
+                with patch('agent_hub_host.providers.provision', side_effect=error):
+                    with self.assertRaises(type(error)) as caught:
+                        self.bridge.offer(offer, lambda *args: acknowledgements.append(args))
+                self.assertIs(caught.exception, error)
+                self.assertFalse(acknowledgements)
+                self.assertFalse(any(args[1] == 'start' for args, _ in self.native.calls))
+                self.assertFalse(any(path.endswith('/admission') for _, path, _, _ in self.client.calls))
+
+    def test_local_antigravity_override_enables_bridge_under_legacy_central_default(self):
+        bridge = Bridge(self.client, self.journal, [self.root], ['claude'],
+                        executable=os.sys.executable, runner=self.native,
+                        launcher_config={'private_provider_homes': True,
+                                         'provider_credential_sources': {'antigravity': 'local'}})
+        self.assertIn('antigravity', bridge.engines)
+        self.assertEqual(bridge.launcher.config['routes']['antigravity']['profile'], 'hub-hub-antigravity')
+
     def test_existing_journal_schema_adds_persistent_runtime_deadline(self):
         path=self.root/'legacy-journal.sqlite'
         db=sqlite3.connect(path)
