@@ -177,8 +177,8 @@ class Bridge:
             raise RuntimeError("native_response_too_large")
         return result
 
-    def lookup(self, selector, expected=None):
-        result = self.native("status", selector, "--json", allow_failure=True)
+    def lookup(self, selector, expected=None, *, timeout=30):
+        result = self.native("status", selector, "--json", allow_failure=True, timeout=timeout)
         if result.returncode:
             return self.launcher.retired(selector, dict(expected)) if expected else None
         row = json.loads(result.stdout)
@@ -740,7 +740,14 @@ class Bridge:
         old = db.execute("SELECT * FROM commands WHERE id=?", (identity,)).fetchone()
         if old:
             if old["digest"] != digest:
-                raise ValueError("command_id_conflict")
+                # A server upgrade annotates legacy stop envelopes with their
+                # original deadline. Match only that exact old envelope; never
+                # repeat an executing stop or weaken any other identity field.
+                legacy = {key: value for key, value in command.items() if key != 'deadline_ms'}
+                legacy_digest = hashlib.sha256(canonical(legacy).encode()).hexdigest()
+                if not (command.get('kind') == 'stop' and type(command.get('deadline_ms')) is int
+                        and old['digest'] == legacy_digest):
+                    raise ValueError("command_id_conflict")
             if old["state"] != "done":
                 if old['state']=='executing' and command.get('kind')=='capture':
                     # Capture is read-only. Resolve interruption as failure, never
@@ -802,7 +809,32 @@ class Bridge:
             with db:
                 self.finish_command(identity,command,result)
             return result
-        native_id, _status = self.resolve_launch_native(row)
+        deadline = command.get('deadline_ms')
+        bounded_stop = kind == 'stop' and type(deadline) is int
+        until = time.monotonic() + min(5, max(0, (deadline - time.time() * 1000) / 1000)) if bounded_stop else None
+
+        def remaining_stop():
+            left = min(until - time.monotonic(), (deadline - time.time() * 1000) / 1000)
+            if left <= 0:
+                raise subprocess.TimeoutExpired('native_stop', 0)
+            return left
+
+        def unconfirmed_stop():
+            return {'stopped': False, 'error': 'stop_unconfirmed', 'reason': 'stop_unconfirmed', 'stage': 'host_stop'}
+
+        try:
+            native_id, _status = (self.resolve_launch_native(row, timeout=remaining_stop())
+                                  if bounded_stop else self.resolve_launch_native(row))
+            if bounded_stop:
+                remaining_stop()
+        except subprocess.TimeoutExpired:
+            if not bounded_stop:
+                raise
+            result = unconfirmed_stop()
+            with db:
+                self.begin_command(identity, digest)
+                self.finish_command(identity, command, result)
+            return result
         if not native_id and kind == 'stop' and row['state'] in {'launching', 'aborting', 'deadline_stopping'}:
             result = {'stopped': False, 'error': 'stop_unconfirmed', 'reason': 'stop_unconfirmed', 'stage': 'host_stop'}
             with db:
@@ -816,36 +848,36 @@ class Bridge:
         with db:
             self.begin_command(identity, digest)
         if kind == "stop":
-            deadline = command.get('deadline_ms')
-            if type(deadline) is int and deadline <= time.time() * 1000:
-                result = {'stopped': False, 'error': 'stop_unconfirmed', 'reason': 'stop_unconfirmed', 'stage': 'host_stop'}
-                with db:
-                    self.finish_command(identity, command, result)
-                return result
-            self.native("kill", native_id)
-            # Kill can return before the native worker writes its qualified
-            # retirement. Wait briefly inside the server's original deadline;
-            # legacy envelopes without a deadline retain their immediate check.
-            remaining = max(0, (deadline - time.time() * 1000) / 1000) if type(deadline) is int else 0
-            until = time.monotonic() + min(5, remaining)
-            birth = (_status or {}).get('created_at_ms')
-            while True:
-                status = self.lookup(native_id, row)
-                if (status and status.get("phase", status.get("state")) == "exited"
-                        and status.get("containment_empty") is True and native_returncode(status.get('exit')) is not None):
-                    observed_birth = status.get('created_at_ms')
-                    if type(birth) is int and status.get('retirement') == 'verified_finished':
-                        tombstone = native_launch.read_tombstone(native_id, state_dir=self.launcher.state_dir)
-                        observed_birth = (tombstone or {}).get('created_at_ms')
-                    if type(birth) is int and observed_birth != birth:
-                        raise RuntimeError('native_identity_mismatch')
-                    result = {'stopped': True, 'evidence': 'native_exit', 'native_id': native_id}
-                    break
-                left = min(until - time.monotonic(), (deadline - time.time() * 1000) / 1000 if type(deadline) is int else 0)
-                if left <= 0:
-                    result = {'stopped': False, 'error': 'stop_unconfirmed', 'reason': 'stop_unconfirmed', 'stage': 'host_stop'}
-                    break
-                time.sleep(min(.1, left))
+            try:
+                if bounded_stop:
+                    self.native("kill", native_id, timeout=remaining_stop())
+                    remaining_stop()
+                else:
+                    self.native("kill", native_id)
+                birth = (_status or {}).get('created_at_ms')
+                while True:
+                    status = (self.lookup(native_id, row, timeout=remaining_stop())
+                              if bounded_stop else self.lookup(native_id, row))
+                    if bounded_stop:
+                        remaining_stop()
+                    if (status and status.get("phase", status.get("state")) == "exited"
+                            and status.get("containment_empty") is True and native_returncode(status.get('exit')) is not None):
+                        observed_birth = status.get('created_at_ms')
+                        if type(birth) is int and status.get('retirement') == 'verified_finished':
+                            tombstone = native_launch.read_tombstone(native_id, state_dir=self.launcher.state_dir)
+                            observed_birth = (tombstone or {}).get('created_at_ms')
+                        if type(birth) is int and observed_birth != birth:
+                            raise RuntimeError('native_identity_mismatch')
+                        if bounded_stop:
+                            remaining_stop()
+                        result = {'stopped': True, 'evidence': 'native_exit', 'native_id': native_id}
+                        break
+                    if not bounded_stop:
+                        result = unconfirmed_stop()
+                        break
+                    time.sleep(min(.1, remaining_stop()))
+            except subprocess.TimeoutExpired:
+                result = unconfirmed_stop()
         else:
             text = command.get("text")
             if not isinstance(text, str) or len(text.encode()) > 16384:
@@ -1020,17 +1052,18 @@ class Bridge:
                            'containment_empty':(status or {}).get('containment_empty') is True})
         return result
 
-    def resolve_launch_native(self,row):
+    def resolve_launch_native(self,row, *, timeout=None):
         expected={'tag':row['tag'],'workspace':row['workspace']}
+        timeout_args = {} if timeout is None else {'timeout': timeout}
         if row['native_id']:
-            return row['native_id'],self.lookup(row['native_id'],expected)
+            return row['native_id'],self.lookup(row['native_id'],expected, **timeout_args)
         if not self._workspace_is_available(row['workspace']):
             self._warn_unavailable_workspace(row)
             return None,None
         if row['native_dispatch_started'] != 1:
             return None,None
         selector=f"{row['workspace']}:{row['tag']}"
-        status=self.launcher.status(selector,workspace=row['workspace'])
+        status=self.launcher.status(selector,workspace=row['workspace'], **timeout_args)
         native_id=status.get('id') if isinstance(status,dict) else None
         if (not isinstance(native_id,str) or not UUID_RE.fullmatch(native_id)
                 or not isinstance(status.get('labels'),dict)
