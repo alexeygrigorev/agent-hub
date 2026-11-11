@@ -8,12 +8,17 @@
 // hashes, not a cryptographic deployment attestation. Local/remote enrollment
 // must separately pin the installed Hetzner monitor and authenticated VM origin.
 // Every process birth changes the interval generation; no interval may cross a
-// restart/offline gap. A pending/crash journal is refused. At most128 requests
+// restart/offline gap. An invalid initialized sentinel is refused; old process
+// snapshots are never used to claim continuity. At most128 requests
 // per incarnation are observed; capacity/error never evicts or heals evidence,
-// and all primary responses continue. This is credential_monitor only; the
+// and all primary responses continue. journal.json is an immutable initialized
+// sentinel. Up to256 immutable chained snapshots are retained per incarnation;
+// no automatic old-generation deletion or mutable current pointer is used.
+// Source owners must manage retention only outside an accepted interval.
+// This is credential_monitor only; the
 // existing PickerControl durable occurrence counter remains its own authority.
 import { constants } from 'node:fs';
-import { open, lstat, rename, unlink, type FileHandle } from 'node:fs/promises';
+import { open, lstat, type FileHandle } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { isAbsolute, resolve } from 'node:path';
 import { fileURLToPath, URL } from 'node:url';
@@ -32,6 +37,9 @@ type Enrollment = { kind: string; producer: string; recipient: string; enrollmen
   source_id: string; release_sha: string; artifacts: Artifact[] };
 type Journal = { kind: string; source_id: string; enrollment_id: string;
   occurrence_count: number; started_total: number; finished_total: number };
+// Test-only IO injection writes an already O_EXCL-opened record; production
+// always uses the default file + directory fsync implementation below.
+type SnapshotWriter = (value: JsonRecord, handle: FileHandle) => Promise<void>;
 export function canonical(value: unknown): string {
   if (Array.isArray(value)) return '[' + value.map(canonical).join(',') + ']';
   if (value !== null && typeof value === 'object') return '{' + Object.keys(value).sort()
@@ -46,6 +54,8 @@ function exact(value: object, keys: string[]) { check(Object.keys(value).sort().
 class PrivateStore {
   readonly handles: FileHandle[] = [];
   private journalBaseline: string | undefined;
+  readonly boot = randomUUID().replaceAll('-', '');
+  private commits: { name: string; bytes: string; digest: string; journal: string }[] = [];
   private constructor(readonly path: string) {}
   static async load(path: string) {
     check(process.platform === 'linux' && isAbsolute(path) && resolve(path) === path);
@@ -91,28 +101,38 @@ class PrivateStore {
     check(this.journalBaseline === undefined);
     this.journalBaseline = canonical(value);
   }
-  async write(value: Journal) {
+  async write(value: Journal, writer?: SnapshotWriter) {
     await this.identity();
-    // Only our last durably persisted state may be replaced. Valid canonical
-    // JSON is not sufficient: external corruption/reset must never heal merely
-    // because another marked request arrived before the first nonce barrier.
+    check(this.journalBaseline !== undefined && this.commits.length < MAX_REQUESTS * 2
+      && canonical(await this.read('journal.json')) === this.journalBaseline);
+    const sequence = this.commits.length + 1;
+    const name = `snapshot-${this.boot}-${sequence}.json`;
+    const previous = this.commits.at(-1)?.digest ?? hash(this.journalBaseline);
+    const record = {kind: 'hub_credential_monitor_snapshot_v1', controller_id: this.boot,
+      sequence, previous_sha256: previous, journal: value};
+    const bytes = canonical(record);
+    const handle = await open(this.name(name),
+      constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+    try {
+      if (writer) await writer(record, handle);
+      else {
+        await handle.writeFile(bytes + '\n', 'utf8');
+        await handle.sync();
+      }
+    } finally { await handle.close(); }
+    if (!writer) for (const directory of [...this.handles].reverse()) await directory.sync();
+    // No current pointer, rename, overwrite or eviction. Even if a later append
+    // succeeds, every older record and the initialized sentinel remain required
+    // evidence. A failed partial file is retained; this generation stays dirty.
+    this.commits.push({name, bytes, digest: hash(bytes), journal: canonical(value)});
+  }
+  async verify(): Promise<string> {
+    await this.identity();
     check(this.journalBaseline !== undefined
       && canonical(await this.read('journal.json')) === this.journalBaseline);
-    const name = '.journal-' + randomUUID();
-    let handle: FileHandle | undefined;
-    try {
-      handle = await open(this.name(name), constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
-      await handle.writeFile(canonical(value) + '\n', 'utf8');
-      await handle.sync();
-      await handle.close(); handle = undefined;
-      await rename(this.name(name), this.name('journal.json'));
-      // Existing directories must not hide a past unsynced directory entry.
-      for (const directory of [...this.handles].reverse()) await directory.sync();
-      this.journalBaseline = canonical(value);
-    } finally {
-      await handle?.close();
-      await unlink(this.name(name)).catch(() => {});
-    }
+    for (const record of this.commits)
+      check(canonical(await this.read(record.name)) === record.bytes);
+    return this.commits.at(-1)?.journal ?? this.journalBaseline;
   }
   async close() { await Promise.all(this.handles.splice(0).map(handle => handle.close())); }
 }
@@ -141,7 +161,7 @@ async function verifyArtifacts(entry: Enrollment, loaded: Record<string, string>
 
 /** One live Node incarnation. No clean sample is possible after any observer error. */
 export class AlertEvidence implements CredentialMonitorEvidence {
-  readonly boot = randomUUID().replaceAll('-', '');
+  readonly boot: string;
   private dirty = false;
   private pending = 0;
   private active = new Set<number>();
@@ -149,10 +169,10 @@ export class AlertEvidence implements CredentialMonitorEvidence {
   private queue: Promise<void> = Promise.resolve();
   private nextSnapshot: Journal | undefined;
   private constructor(private store: PrivateStore, readonly enrollment: Enrollment, private journal: Journal,
-    private writer: (value: Journal) => Promise<void>, private readonly timeoutMs: number,
-    private readonly loaded: Record<string, string>) {}
+    private writer: SnapshotWriter | undefined, private readonly timeoutMs: number,
+    private readonly loaded: Record<string, string>) { this.boot = store.boot; }
 
-  static async load(directory: string, options: { loadedArtifacts: Record<string, string>; writer?: (value: Journal) => Promise<void>; timeoutMs?: number }) {
+  static async load(directory: string, options: { loadedArtifacts: Record<string, string>; writer?: SnapshotWriter; timeoutMs?: number }) {
     const store = await PrivateStore.load(directory);
     try {
       const entry = await store.read('enrollment.json') as Enrollment;
@@ -168,7 +188,7 @@ export class AlertEvidence implements CredentialMonitorEvidence {
         && integer(journal.started_total) && integer(journal.finished_total)
         && journal.occurrence_count <= journal.finished_total && journal.finished_total === journal.started_total);
       store.bindJournal(journal);
-      return new AlertEvidence(store, entry, journal, options.writer ?? (value => store.write(value)), options.timeoutMs ?? TIMEOUT_MS, Object.freeze({ ...options.loadedArtifacts }));
+      return new AlertEvidence(store, entry, journal, options.writer, options.timeoutMs ?? TIMEOUT_MS, Object.freeze({ ...options.loadedArtifacts }));
     } catch { await store.close(); throw new Error('evidence_unavailable'); }
   }
   invalidate() { this.dirty = true; }
@@ -194,7 +214,7 @@ export class AlertEvidence implements CredentialMonitorEvidence {
           this.nextSnapshot = undefined;
           await this.bounded((async () => {
             await verifyArtifacts(this.enrollment, this.loaded);
-            await this.writer(value);
+            await this.store.write(value, this.writer);
           })());
         }
       } catch { this.invalidate(); }
@@ -239,9 +259,9 @@ export class AlertEvidence implements CredentialMonitorEvidence {
     const version = canonical(this.journal);
     try {
       let stored: unknown;
-      await this.bounded(this.store.read('journal.json').then(value => { stored = value; }));
+      await this.bounded(this.store.verify().then(value => { stored = value; }));
       if (this.pending || this.active.size || canonical(this.journal) !== version) return unavailable();
-      check(canonical(stored) === version);
+      check(stored === version);
     } catch { this.invalidate(); }
     if (this.dirty) return unavailable();
     return { kind: 'hub_controller_coverage_v1', producer: PRODUCER, recipient: RECIPIENT,

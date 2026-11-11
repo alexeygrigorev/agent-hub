@@ -1,7 +1,8 @@
 import { test } from 'node:test';
+import { open as openFile } from 'node:fs/promises';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn } from 'node:child_process';
@@ -20,6 +21,12 @@ function canonical(value: any): string {
   return JSON.stringify(value);
 }
 function privateJson(path: string, value: any) { writeFileSync(path, canonical(value) + '\n', { mode: 0o600 }); chmodSync(path, 0o600); }
+// Only semantic fixtures omit fsync latency. The store still owns exclusive
+// record creation, immutable names and verification of every committed record.
+async function semanticWriter(value:any,handle:any){writeFileSync(handle.fd,canonical(value)+'\n');}
+function snapshotFiles(state:string){return readdirSync(state).filter(name=>/^snapshot-[0-9a-f]{32}-[0-9]+\.json$/.test(name))
+  .sort((a,b)=>Number(a.split('-').at(-1)!.split('.')[0])-Number(b.split('-').at(-1)!.split('.')[0])).map(name=>join(state,name));}
+
 function syntheticEnvironment(home: string): NodeJS.ProcessEnv {
   const env = {...process.env,HOME:home,TMPDIR:join(ROOT,'.local/tmp')};
   for(const key of Object.keys(env)) if(/^(?:HUB_|HUB2_|APLEXER_|DTC_|XDG_)/.test(key) || /TOKEN|SECRET|PASSWORD|CREDENTIAL|API_KEY/.test(key)) delete env[key];
@@ -78,7 +85,7 @@ async function serverMode(directory:string,fail:boolean,port=0) {
   // These HTTP/aggregate fixtures test transport and decision semantics, not
   // host fsync latency. Dedicated default-writer tests exercise real durability.
   const f=await fixture(directory,fail?{writer:async()=>{throw new Error('synthetic write fault');}}:
-    {timeoutMs:2000,writer:async(value:any)=>privateJson(join(directory,'state/journal.json'),value)});
+    {timeoutMs:2000,writer:semanticWriter});
   const server=createServer(async(req,res)=>{
     if(req.url==='/__fixture/healthy'){f.model.unhealthy=false;res.writeHead(200);res.end('{}');return;}
     const chunks:Buffer[]=[]; for await(const chunk of req)chunks.push(Buffer.from(chunk));
@@ -106,7 +113,9 @@ async function stop(child:ReturnType<typeof spawn>, signal:any='SIGTERM') {
 async function defineTests() {
   test('exact final exclusion criterion counts marked decisions; unmarked and healthy do not count',async t=>{
     const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
-    const f=await fixture(directory);t.after(()=>f.observer.close());
+    // Decision/queue semantics use a deterministic writer; real durability is
+    // exercised separately without assuming a 200 HTTP receipt means fsync.
+    const f=await fixture(directory,{timeoutMs:2000,writer:semanticWriter});t.after(()=>f.observer.close());
     const plain=await (await f.post(false)).json() as any;
     const marked=await (await f.post()).json() as any;
     assert.ok(marked.excluded.length>0);assert.deepEqual(marked.excluded,plain.excluded);
@@ -129,15 +138,20 @@ async function defineTests() {
     assert.equal((await (await f.sample()).json() as any).available,false);
   });
   test('canonical corruption before a marked POST cannot heal the persisted journal',async t=>{
-    for (const corruption of ['empty','source','stale']) {
+    for (const corruption of ['empty','source','stale','prior']) {
       const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
-      const f=await fixture(directory);t.after(()=>f.observer.close());
-      // Establish a nonzero durable baseline without sampling a barrier.
-      assert.equal((await f.post()).status,200);
-      const journal=join(f.state,'journal.json');
+      const f=await fixture(directory,{timeoutMs:2000});t.after(()=>f.observer.close());
+      // A successful fail-open HTTP receipt is not a durability barrier. Use
+      // the actual writer directly with a fixture IO budget, then require a
+      // complete idle snapshot before injecting independent corruption.
+      await f.observer.finish(f.observer.begin(),'alert');
+      const baseline=await f.observer.snapshot(NONCE);
+      assert.equal(baseline.complete,true);assert.equal(baseline.finished_total,1);
+      const files=snapshotFiles(f.state);
+      const journal=corruption==='stale'?files.at(-1)!:corruption==='prior'?files[0]:join(f.state,'journal.json');
       const original=JSON.parse(readFileSync(journal,'utf8'));
-      const replacement=corruption==='empty'?{}:corruption==='source'?{...original,source_id:'f'.repeat(64)}:
-        {...original,started_total:0,finished_total:0,occurrence_count:0};
+      const replacement=corruption==='empty'||corruption==='prior'?{}:corruption==='source'?{...original,source_id:'f'.repeat(64)}:
+        {...original,journal:{...original.journal,started_total:0,finished_total:0,occurrence_count:0}};
       privateJson(journal,replacement);
       assert.equal((await f.post()).status,200);
       assert.equal((await (await f.sample()).json() as any).available,false);
@@ -146,6 +160,74 @@ async function defineTests() {
       assert.equal((await f.post()).status,200);
       assert.equal((await (await f.sample()).json() as any).available,false);
     }
+  });
+  test('corruption after the last good sentinel bytes were captured cannot be healed',{timeout:5000},async t=>{
+    const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
+    const f=await fixture(directory,{timeoutMs:2000});
+    const file=await openFile(join(directory,'prototype'),'w',0o600);
+    const prototype=Object.getPrototypeOf(file),originalRead=prototype.read;await file.close();
+    let enteredResolve!:()=>void,releaseResolve!:()=>void;
+    const entered=new Promise<void>(r=>enteredResolve=r),held=new Promise<void>(r=>releaseResolve=r);
+    let once=true;
+    prototype.read=async function(...args:any[]){
+      const result=await originalRead.apply(this,args);
+      if(once&&Buffer.isBuffer(args[0])&&args[0].subarray(0,result.bytesRead).toString().includes('"kind":"hub_credential_monitor_journal_v1"')){
+        once=false;enteredResolve();await held;
+      }
+      return result;
+    };
+    t.after(async()=>{releaseResolve();prototype.read=originalRead;await f.observer.close();});
+    const identity=f.observer.begin();await entered;
+    privateJson(join(f.state,'journal.json'),{});
+    releaseResolve();await f.observer.finish(identity,'alert');
+    assert.equal((await f.observer.snapshot(NONCE)).available,false);
+    assert.deepEqual(JSON.parse(readFileSync(join(f.state,'journal.json'),'utf8')),{});
+    assert.equal((await f.post()).status,200);
+    assert.equal((await f.observer.snapshot(NONCE)).available,false);
+  });
+  test('corruption during real temp-file sync cannot heal before the first barrier',{timeout:5000},async t=>{
+    const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
+    const f=await fixture(directory,{timeoutMs:2000});
+    const file=await openFile(join(directory,'prototype'),'w',0o600);
+    const prototype=Object.getPrototypeOf(file),originalSync=prototype.sync;await file.close();
+    let enteredResolve!:()=>void,releaseResolve!:()=>void;
+    const entered=new Promise<void>(r=>enteredResolve=r),held=new Promise<void>(r=>releaseResolve=r);
+    let once=true;
+    prototype.sync=async function(){if(once){once=false;enteredResolve();await held;}return originalSync.call(this);};
+    t.after(async()=>{releaseResolve();prototype.sync=originalSync;await f.observer.close();});
+    const identity=f.observer.begin();await entered;
+    privateJson(join(f.state,'journal.json'),{});
+    releaseResolve();await f.observer.finish(identity,'alert');
+    assert.equal((await f.observer.snapshot(NONCE)).available,false);
+    assert.deepEqual(JSON.parse(readFileSync(join(f.state,'journal.json'),'utf8')),{});
+    // Subsequent marked requests must stay available without repairing or
+    // clearing the fault; this process generation is permanently unknown.
+    assert.equal((await f.post()).status,200);
+    assert.equal((await f.observer.snapshot(NONCE)).available,false);
+    assert.deepEqual(JSON.parse(readFileSync(join(f.state,'journal.json'),'utf8')),{});
+  });
+  test('fail-open POST can precede a timed-out physical journal write',{timeout:5000},async t=>{
+    const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
+    let enteredResolve!:()=>void,releaseResolve!:()=>void,doneResolve!:()=>void,writes=0;
+    const entered=new Promise<void>(r=>enteredResolve=r),held=new Promise<void>(r=>releaseResolve=r),done=new Promise<void>(r=>doneResolve=r);
+    const journal=join(directory,'state/journal.json');
+    const f=await fixture(directory,{timeoutMs:2000,writer:async(value:any,handle:any)=>{
+      if(++writes===2){enteredResolve();await held;await semanticWriter(value,handle);doneResolve();}
+      else await semanticWriter(value,handle);
+    }});
+    t.after(async()=>{releaseResolve();await f.observer.close();});
+    const response=f.post();await entered;assert.equal((await response).status,200);
+    const partial=JSON.parse(readFileSync(snapshotFiles(f.state)[0],'utf8')).journal;
+    assert.equal(partial.started_total,1);assert.equal(partial.finished_total,0);
+    assert.equal((await f.observer.snapshot(NONCE)).available,false);
+    privateJson(journal,{...partial,source_id:'f'.repeat(64)});
+    releaseResolve();await done;
+    // This deliberately injected writer reproduces the CI setup race: a
+    // request's 200 did not mean its previous IO was finished. It is not used
+    // for the production corruption test above or as evidence of durability.
+    assert.equal(JSON.parse(readFileSync(snapshotFiles(f.state).at(-1)!,'utf8')).journal.finished_total,1);
+    assert.equal(JSON.parse(readFileSync(journal,'utf8')).source_id,'f'.repeat(64));
+    assert.equal((await f.observer.snapshot(NONCE)).available,false);
   });
   test('pending writer timeout is bounded and stays unknown after late completion',async t=>{
     const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
@@ -157,7 +239,9 @@ async function defineTests() {
   });
   test('inflight and concurrent requests cannot yield a complete nonce barrier',async t=>{
     const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
-    const f=await fixture(directory);t.after(()=>f.observer.close());
+    // Decision/queue semantics use a deterministic writer; real durability is
+    // exercised separately without assuming a 200 HTTP receipt means fsync.
+    const f=await fixture(directory,{timeoutMs:2000,writer:semanticWriter});t.after(()=>f.observer.close());
     const identity=f.observer.begin();
     assert.equal((await f.observer.snapshot(NONCE)).available,false);
     await f.observer.finish(identity,'observation');
@@ -188,12 +272,14 @@ async function defineTests() {
   test('128-request horizon never evicts a receipt or silently resets coverage',async t=>{
     const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
     let journal='';
-    const f=await fixture(directory,{timeoutMs:2000,writer:async(value:any)=>privateJson(journal,value)});t.after(()=>f.observer.close());
+    const f=await fixture(directory,{timeoutMs:2000,writer:semanticWriter});t.after(()=>f.observer.close());
     journal=join(f.state,'journal.json');
     for(let n=0;n<128;n++){const identity=f.observer.begin();await f.observer.finish(identity,'observation');}
     const before=await f.observer.snapshot(NONCE);assert.equal(before.complete,true);assert.equal(before.started_total,128);
     assert.equal(f.observer.begin(),null);assert.equal((await f.observer.snapshot(NONCE)).available,false);
-    assert.equal((await f.post()).status,200);assert.equal(JSON.parse(readFileSync(journal,'utf8')).started_total,128);
+    assert.equal((await f.post()).status,200);assert.equal(JSON.parse(readFileSync(journal,'utf8')).started_total,0);
+    const files=snapshotFiles(f.state);assert.equal(files.length,256);
+    assert.equal(JSON.parse(readFileSync(files.at(-1)!,'utf8')).journal.started_total,128);
   });
   test('private journal symlink, FIFO, hardlink and duplicate keys cannot produce clean evidence',async t=>{
     for(const fault of ['symlink','fifo','hardlink','duplicate']){
@@ -212,6 +298,35 @@ async function defineTests() {
       }
       assert.equal((await f.observer.snapshot(NONCE)).available,false,fault);
       assert.equal((await f.post()).status,200,fault);
+    }
+  });
+  test('immutable snapshot identity and exclusive names cannot be replaced or healed',async t=>{
+    for(const fault of ['symlink','hardlink','mode','missing','collision']){
+      const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
+      const f=await fixture(directory,{timeoutMs:2000,writer:semanticWriter});t.after(()=>f.observer.close());
+      const {symlinkSync,linkSync}=await import('node:fs');
+      if(fault==='collision'){
+        const record=join(f.state,`snapshot-${f.observer.boot}-1.json`);privateJson(record,{});
+        assert.equal((await f.post()).status,200);
+        assert.deepEqual(JSON.parse(readFileSync(record,'utf8')),{});
+      }else{
+        await f.observer.finish(f.observer.begin(),'observation');
+        assert.equal((await f.observer.snapshot(NONCE)).complete,true);
+        const record=snapshotFiles(f.state)[0],bytes=readFileSync(record);
+        if(fault==='mode')chmodSync(record,0o644);
+        else {
+          rmSync(record);
+          if(fault!=='missing'){
+            const outside=join(directory,'outside');writeFileSync(outside,bytes,{mode:0o600});
+            if(fault==='symlink')symlinkSync(outside,record);else linkSync(outside,record);
+          }
+        }
+        // A later successful append cannot erase this older required evidence.
+        assert.equal((await f.post()).status,200);
+      }
+      assert.equal((await f.observer.snapshot(NONCE)).available,false,fault);
+      assert.equal((await f.post()).status,200);
+      assert.equal((await f.observer.snapshot(NONCE)).available,false,fault);
     }
   });
   test('enrollment assertion cannot replace actual load-time artifact identity',async t=>{
