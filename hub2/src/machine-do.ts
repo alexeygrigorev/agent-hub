@@ -1071,7 +1071,9 @@ export class MachineDO {
     const key = request.headers.get('Idempotency-Key') || body.key;
     if (typeof key !== 'string' || !/^[A-Za-z0-9_.:-]{1,120}$/.test(key)) return error('idempotency_key_required', 400);
     const digest = await sha256Hex(JSON.stringify({ kind, text: commandText ?? null, epoch: session.epoch, ...(captureMode ? {mode:captureMode} : {}) }));
-    const retained = kind==='capture'&&captureMode===undefined&&actor.kind==='operator'
+    // Schema6 is the first rollout bridge: keep its legacy command wire and
+    // running-only behavior intact until the compatible schema7 bridge is active.
+    const retained = this.db.schemaVersion>=7&&kind==='capture'&&captureMode===undefined&&actor.kind==='operator'
       &&(this.parse(session.launch_json) as JsonRecord).interactive===false&&!!session.native_id;
     const binding=retained?{native_id:session.native_id,operation_id:session.operation_id,request_digest:digest}:null;
     const immediateStop = kind === 'stop' && this.unclaimedWithoutNative(session);

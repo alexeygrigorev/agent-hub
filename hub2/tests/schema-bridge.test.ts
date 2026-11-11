@@ -66,6 +66,7 @@ test('first bridge keeps legacy capture contract; upgraded bridge preserves scre
  // Legacy schema6 hashes exactly these fields and emits the same capture wire payload.
  const legacyDigest=Buffer.from(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(JSON.stringify({kind:'capture',text:null,epoch:old.epoch})))).toString('hex');
  assert.equal(old.request_digest,legacyDigest);
+ assert.equal(old.result_json,null);
  assert.deepEqual(command,{id:old.id,session_id:old.session_id,epoch:old.epoch,kind:'capture'});
  const due=Date.now()+2000;
  bridge.database.prepare("INSERT INTO machine_outbox VALUES('pending-receipt','finish','op-bridge','project-test','{}','pending',2,?,?,?)").run(due,Date.now(),Date.now());
@@ -76,7 +77,7 @@ test('first bridge keeps legacy capture contract; upgraded bridge preserves scre
  const row=applied.database.prepare('SELECT * FROM session_commands WHERE id=?').get(command.id) as any;
  assert.equal(row.capture_mode,null);assert.equal(row.text,null);assert.equal(row.request_digest,old.request_digest);
  const replay=await applied.call('/api/sessions/bridge-session/capture','POST',{key:'capture-before-upgrade'});
- assert.equal(replay.status,200);assert.equal((await data(replay)).command.id,command.id);
+ assert.equal(replay.status,200);assert.deepEqual((await data(replay)).command,command);
  assert.equal((await applied.call('/api/sessions/bridge-session/capture','POST',{key:'capture-before-upgrade',mode:'screen'})).status,409);
  assert.equal((await applied.call('/api/sessions/bridge-session/capture','POST',{key:'after-upgrade',mode:'screen'})).status,201);
  const rollback=fixture('machine','defer',applied);
@@ -86,6 +87,30 @@ test('first bridge keeps legacy capture contract; upgraded bridge preserves scre
  const commands=rollback.database.prepare('SELECT * FROM session_commands').all();
  const again=fixture('machine','apply',rollback);assert.equal((await again.call('/api/sessions/bridge-session')).status,200);
  assert.deepEqual(again.database.prepare('SELECT * FROM session_commands').all(),commands);
+});
+test('legacy capture ACK remains unchanged across deferred, applied and rollback readers',async()=>{
+ const bridge=fixture('machine');const epoch=await running(bridge);
+ bridge.database.exec('DROP TABLE native_inventory_meta; DROP TABLE native_inventory_rows; DROP TABLE native_inventory_upload; DROP TABLE native_inventory_chunks; ALTER TABLE session_commands DROP COLUMN capture_mode; UPDATE hub2_schema SET version=6');
+ (bridge.instance as any).db.schemaVersion=6;
+ const machine={id:'machine:h1',kind:'machine',resource_id:'h1',generation:'1',scopes:['session:report']};
+ const path='/api/sessions/bridge-session/commands';
+ const queued=await data(await bridge.call(path,'POST',{kind:'capture',key:'legacy-host-capture'}));
+ assert.equal(queued.command.capture_binding,undefined);
+ const ack={epoch,result:{output:'retained legacy host output'}};
+ const ackPath=path+'/'+queued.command.id+'/ack';
+ assert.equal((await bridge.call(ackPath,'POST',ack,machine)).status,200);
+ const before=bridge.database.prepare('SELECT * FROM session_commands WHERE id=?').get(queued.command.id) as any;
+ assert.deepEqual(JSON.parse(before.result_json),ack.result);
+ const applied=fixture('machine','apply',bridge);
+ assert.equal((await applied.call(ackPath,'POST',ack,machine)).status,200);
+ const fresh=await data(await applied.call(path,'POST',{kind:'capture',key:'upgraded-host-capture'}));
+ assert.deepEqual(fresh.command.capture_binding,{native_id:'11111111-1111-4111-8111-111111111111',operation_id:'op-bridge',request_digest:before.request_digest});
+ const rollback=fixture('machine','defer',applied);
+ assert.equal((await rollback.call(ackPath,'POST',ack,machine)).status,200);
+ assert.equal((await rollback.call(path+'/'+fresh.command.id+'/ack','POST',ack,machine)).status,200,'upgraded bound running capture accepts an old host without an echo');
+ assert.equal(version(rollback),9);
+ const after=rollback.database.prepare('SELECT * FROM session_commands WHERE id=?').get(queued.command.id) as any;
+ assert.equal(after.request_digest,before.request_digest);assert.equal(after.result_json,before.result_json);
 });
 test('a bound stop survives the schema-six to schema-seven bridge with its dispatch evidence',async()=>{
  const bridge=fixture('machine'),epoch=await running(bridge);
