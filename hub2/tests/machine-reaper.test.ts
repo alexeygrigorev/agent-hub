@@ -150,7 +150,7 @@ test('stop bypasses a pending fenced capture and settles it after terminal confi
  assert.equal(response.status,201);
  assert.equal(frames.at(-1)?.type,'session.command');assert.equal(frames.at(-1)?.command?.kind,'stop');
  const stop=frames.at(-1).command;
- assert.equal((await f.call(`/api/sessions/${sessionId}/commands/${stop.id}/ack`,'POST',{epoch,result:{stopped:true}})).status,200);
+ assert.equal((await f.call(`/api/sessions/${sessionId}/commands/${stop.id}/ack`,'POST',{epoch,result:{stopped:true,evidence:'dispatch_fenced'}})).status,200);
  assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(sessionId) as any).state,'stopped');
  const replay=await f.call(`/api/sessions/${sessionId}/commands`,'POST',{kind:'stop',key:'operator-stop'},
   {'x-hub2-actor':JSON.stringify(operator)}),replayed=await replay.json() as any;
@@ -266,6 +266,86 @@ test('claim timestamps cannot extend the original start deadline',async()=>{
  assert.equal(f.events.at(-1)?.body.reason,'launch_timeout_no_native');
 });
 
+
+test('pre-native stop accepts only qualified evidence and keeps an unconfirmed session live',async()=>{
+ const actor={'x-hub2-actor':JSON.stringify({id:'admin',kind:'operator',scopes:['operator:admin']})};
+ const cases=[
+  {result:{stopped:true},state:'failed',sessionState:'claimed'},
+  {result:{stopped:false,error:'stop_unconfirmed',reason:'stop_unconfirmed',stage:'host_stop'},state:'failed',sessionState:'claimed'},
+  {result:{stopped:true,evidence:'dispatch_fenced'},state:'acked',sessionState:'stopped'},
+  {result:{stopped:true,evidence:'native_exit',native_id:'native-qualified'},state:'acked',sessionState:'stopped'},
+ ];
+ for (const [index,expected] of cases.entries()) {
+  const f=fixture(),session='stop-proof-'+index,epoch=await startClaimed(f,session,null);
+  const base='/api/sessions/'+session+'/commands';
+  const queued=await f.call(base,'POST',{key:'stop-proof',kind:'stop'},actor);
+  assert.equal(queued.status,201);
+  const {command}=await queued.json() as any;
+  const ackPath=base+'/'+command.id+'/ack';
+  const body={epoch,result:expected.result};
+  assert.equal((await f.call(ackPath,'POST',body)).status,200);
+  assert.deepEqual(await (await f.call(ackPath,'POST',body)).json(),{acknowledged:true,duplicate:true});
+  const list=await f.call(base,'GET',undefined,actor);
+  const {commands}=await list.json() as any;
+  assert.equal(commands[0].state,expected.state);
+  assert.equal(commands[0].ack.confirmed_exit,expected.state==='acked');
+  if (expected.state==='failed') assert.equal(commands[0].ack.reason,'stop_unconfirmed');
+  assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,expected.sessionState);
+  assert.equal(f.events.some(event=>event.body?.reason==='stop_confirmed'),expected.state==='acked');
+ }
+});
+
+test('a legacy pre-native acknowledgment stays unconfirmed after the native ID binds',async()=>{
+ const f=fixture(),session='legacy-stop-late-bind',epoch=await startClaimed(f,session,null);
+ f.database.prepare('INSERT INTO launch_admissions VALUES(?,?,?,?)').run('op-'+session,session,epoch,Date.now());
+ const actor={'x-hub2-actor':JSON.stringify({id:'admin',kind:'operator',scopes:['operator:admin']})};
+ const base='/api/sessions/'+session;
+ const queued=await f.call(base+'/commands','POST',{key:'stop-late-bind',kind:'stop'},actor);
+ assert.equal(queued.status,201);
+ const {command}=await queued.json() as any;
+ const started=await f.call(base+'/started','POST',{operation_id:'op-'+session,epoch,native_id:'native-after-delivery'});
+ assert.equal(started.status,201);
+ assert.equal((await f.call(base+'/commands/'+command.id+'/ack','POST',{epoch,result:{stopped:true}})).status,200);
+ const listed=await f.call(base+'/commands','GET',undefined,actor);
+ const {commands}=await listed.json() as any;
+ assert.equal(commands[0].state,'failed');
+ assert.equal(commands[0].ack.confirmed_exit,false);
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'running');
+});
+
+test('a fresh snapshot missing the native process does not confirm a pending stop',async()=>{
+ const f=fixture(),session='stop-absent-from-snapshot';await startClaimed(f,session,'native-missing');
+ const actor={'x-hub2-actor':JSON.stringify({id:'admin',kind:'operator',scopes:['operator:admin']})};
+ const base='/api/sessions/'+session;
+ const queued=await f.call(base+'/commands','POST',{key:'stop-snapshot-omission',kind:'stop'},actor);
+ assert.equal(queued.status,201);
+ assert.equal((await f.call('/_internal/reap','POST',{dry_run:false})).status,200);
+ const listed=await f.call(base+'/commands','GET',undefined,actor);
+ const {commands}=await listed.json() as any;
+ assert.equal(commands[0].state,'failed');
+ assert.equal(commands[0].ack.reason,'stop_unconfirmed');
+ assert.equal(commands[0].ack.confirmed_exit,false);
+ const native=f.database.prepare('SELECT phase,containment_empty FROM native_sessions WHERE session_id=?').get(session);
+ assert.deepEqual({...native},{phase:'missing',containment_empty:0});
+});
+
+test('a formerly admitted expired attempt receives a host stop instead of immediate confirmation',async()=>{
+ const f=fixture(),session='expired-admitted',epoch=await startClaimed(f,session,null);
+ f.database.prepare("UPDATE sessions SET state='expired' WHERE id=?").run(session);
+ f.database.prepare('INSERT INTO launch_admissions VALUES(?,?,?,?)').run('op-'+session,session,epoch,Date.now());
+ const messages:any[]=[];
+ f.sockets.push({readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'socket'}),
+  send:(value:string)=>messages.push(JSON.parse(value))});
+ const actor={'x-hub2-actor':JSON.stringify({id:'admin',kind:'operator',scopes:['operator:admin']})};
+ const queued=await f.call('/api/sessions/'+session+'/commands','POST',{key:'stop-expired',kind:'stop'},actor);
+ assert.equal(queued.status,201);
+ const {command}=await queued.json() as any;
+ assert.equal((f.database.prepare('SELECT state FROM session_commands WHERE id=?').get(command.id) as any).state,'pending');
+ assert(messages.some(message=>message.type==='session.command'&&message.command.pre_native===true&&message.command.id===command.id));
+ const ack=await f.call('/api/sessions/'+session+'/commands/'+command.id+'/ack','POST',{epoch,result:{stopped:true,evidence:'dispatch_fenced'}});
+ assert.equal(ack.status,200);
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'stopped');
+});
 
 test('a pending stop ends as stop_unconfirmed after sixty seconds',async()=>{
  const f=fixture(),session='stop-deadline';await startClaimed(f,session,'native-stop');

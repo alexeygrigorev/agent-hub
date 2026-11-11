@@ -52,6 +52,8 @@ class Journal:
           CREATE TABLE IF NOT EXISTS outbox_dead_letters(
             key TEXT PRIMARY KEY, path TEXT NOT NULL, payload TEXT NOT NULL,
             status INTEGER NOT NULL, reason TEXT NOT NULL, observed_at INTEGER NOT NULL);
+          CREATE TABLE IF NOT EXISTS stop_fences(
+            session_id TEXT PRIMARY KEY, epoch INTEGER NOT NULL);
           CREATE TABLE IF NOT EXISTS commands(
             id TEXT PRIMARY KEY, digest TEXT NOT NULL, state TEXT NOT NULL, result TEXT);
         """)
@@ -79,8 +81,11 @@ class Journal:
 
     def emit(self, key, path, payload):
         with self.db:
-            self.db.execute("INSERT INTO outbox VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET path=excluded.path,payload=excluded.payload",
-                            (key, path, canonical(payload)))
+            self.enqueue(key, path, payload)
+
+    def enqueue(self, key, path, payload):
+        self.db.execute("INSERT INTO outbox VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET path=excluded.path,payload=excluded.payload",
+                        (key, path, canonical(payload)))
 
     def flush(self, client, safety_only=False):
         query="SELECT * FROM outbox"
@@ -246,21 +251,32 @@ class Bridge:
         return str(path)
 
     def offer(self, offer, acknowledge=None):
+        db = self.journal.db
+        session, epoch = offer.get('session_id'), offer.get('epoch')
+        if isinstance(session, str) and type(epoch) is int and 1 <= epoch <= 2**63 - 1:
+            if db.execute('SELECT 1 FROM stop_fences WHERE session_id=? AND epoch>=?', (session, epoch)).fetchone():
+                return None
         launch = self.validate_launch(offer)
         digest = hashlib.sha256(canonical(launch).encode()).hexdigest()
         operation, session, epoch = offer["operation_id"], offer["session_id"], offer["epoch"]
-        db = self.journal.db
         previous=db.execute('SELECT * FROM launches WHERE session_id=?',(session,)).fetchone()
         if previous and previous['operation_id']!=operation:
             if previous['state']!='pending_admission' or previous['native_id'] or epoch<=previous['epoch']:
                 raise ValueError('native_reconciliation_required')
             with db:
-                db.execute('UPDATE launches SET operation_id=?,epoch=?,digest=?,workspace=?,tag=?,interactive=?,runtime_deadline=NULL WHERE session_id=?',
-                           (operation,epoch,digest,launch['workspace'],'task-hub2-'+session,int(launch['interactive']),session))
+                changed = db.execute(
+                    "UPDATE launches SET operation_id=?,epoch=?,digest=?,workspace=?,tag=?,interactive=?,runtime_deadline=NULL "
+                    "WHERE session_id=? AND operation_id=? AND epoch=? AND state='pending_admission' AND native_id IS NULL",
+                    (operation, epoch, digest, launch['workspace'], 'task-hub2-'+session, int(launch['interactive']),
+                     session, previous['operation_id'], previous['epoch']))
+                if changed.rowcount != 1:
+                    return None
         prior = db.execute("SELECT * FROM launches WHERE operation_id=?", (operation,)).fetchone()
         if prior:
             if prior["session_id"] != session or prior["digest"] != digest or epoch < prior["epoch"]:
                 raise ValueError("offer_fence_conflict")
+            if prior['state'] == 'stopped_before_dispatch':
+                return None
             if prior['state']=='exited':
                 return prior['native_id']
             if epoch > prior["epoch"]:
@@ -287,8 +303,13 @@ class Bridge:
             task_id = "hub2-" + session
             tag = "task-" + task_id
             with db:
-                db.execute("INSERT INTO launches(operation_id,session_id,epoch,digest,workspace,tag,native_id,state,interactive,runtime_deadline) VALUES(?,?,?,?,?,?,NULL,'pending_admission',?,NULL)",
-                           (operation, session, epoch, digest, launch["workspace"], tag, int(launch["interactive"])))
+                changed = db.execute(
+                    "INSERT INTO launches(operation_id,session_id,epoch,digest,workspace,tag,native_id,state,interactive,runtime_deadline) "
+                    "SELECT ?,?,?,?,?,?,NULL,'pending_admission',?,NULL "
+                    "WHERE NOT EXISTS(SELECT 1 FROM stop_fences WHERE session_id=? AND epoch>=?)",
+                    (operation, session, epoch, digest, launch["workspace"], tag, int(launch["interactive"]), session, epoch))
+                if changed.rowcount != 1:
+                    return None
         if not prior or prior["state"] == "pending_admission":
             task_id, tag = "hub2-" + session, "task-hub2-" + session
             launch['worker_context']={key:offer[key] for key in ('session_id','epoch','intake_id','project_id')}
@@ -303,15 +324,18 @@ class Bridge:
             # containment without an additional admission RPC or CLI flag.
             launch['child_config_file']=self.child_context(offer,launch)
             launch['runtime_deadline']=round(json.loads(Path(launch['child_config_file']).read_text())['expires_at']*1000)
-            with db:
-                db.execute("UPDATE launches SET runtime_deadline=? WHERE operation_id=? AND epoch=?",
-                           (launch['runtime_deadline'],operation,epoch))
             launch['client']=self.client
             launch['session_id']=session
             launch['operation_id']=operation
             launch['epoch']=epoch
             with db:
-                db.execute("UPDATE launches SET state='launching' WHERE operation_id=?", (operation,))
+                changed = db.execute(
+                    "UPDATE launches SET state='launching',runtime_deadline=? "
+                    "WHERE operation_id=? AND session_id=? AND epoch=? AND state='pending_admission' AND native_id IS NULL "
+                    "AND NOT EXISTS(SELECT 1 FROM stop_fences WHERE session_id=? AND epoch>=?)",
+                    (launch['runtime_deadline'], operation, session, epoch, session, epoch))
+                if changed.rowcount != 1:
+                    return None
             try:
                 receipt = self.launcher.launch(task_id, launch)
                 native = self.lookup(receipt["session_id"], {"tag": tag, "workspace": launch["workspace"]})
@@ -464,21 +488,32 @@ class Bridge:
             raise ValueError("command_fence_conflict")
         if row["epoch"] != command.get("epoch"):
             raise ValueError("command_fence_conflict")
+        if kind == 'stop' and not row['native_id'] and row['state'] in {'pending_admission', 'stopped_before_dispatch'}:
+            with db:
+                changed = db.execute(
+                    "UPDATE launches SET state='stopped_before_dispatch' "
+                    "WHERE operation_id=? AND session_id=? AND epoch=? AND native_id IS NULL "
+                    "AND state IN ('pending_admission','stopped_before_dispatch')",
+                    (row['operation_id'], row['session_id'], row['epoch']))
+                if changed.rowcount != 1:
+                    raise ValueError('command_fence_conflict')
+                result = {'stopped': True, 'evidence': 'dispatch_fenced'}
+                self.begin_command(identity, digest)
+                self.finish_command(identity, command, result)
+            return result
         native_id, _status = self.resolve_launch_native(row)
-        if not native_id and row["state"] in {"pending_admission", "launching", "aborting", "deadline_stopping"}:
-            # A stop for an interrupted launch is confirmed only after the
-            # supervisor lookup by session tag finds no native process.
-            if kind != "stop":
-                raise ValueError("command_fence_conflict")
-            self.begin_command(identity, digest)
-            result = {"stopped": True}
-            self.finish_command(identity, command, result)
+        if not native_id and kind == 'stop' and row['state'] in {'launching', 'aborting', 'deadline_stopping'}:
+            result = {'stopped': False, 'error': 'stop_unconfirmed', 'reason': 'stop_unconfirmed', 'stage': 'host_stop'}
+            with db:
+                self.begin_command(identity, digest)
+                self.finish_command(identity, command, result)
             return result
         if not native_id:
             raise ValueError("command_fence_conflict")
         if kind == "send" and row["interactive"] != 1:
             raise ValueError("headless_send_refused")
-        self.begin_command(identity, digest)
+        with db:
+            self.begin_command(identity, digest)
         if kind == "capture":
             from .task_output import capture_task_output, bounded_capture
             output = (None if command.get("mode") == "screen" else
@@ -489,61 +524,50 @@ class Bridge:
         elif kind == "stop":
             self.native("kill", native_id)
             status = self.lookup(native_id, row)
-            result = {"stopped": bool(status and status.get("phase", status.get("state")) == "exited"
-                                      and status.get("containment_empty") is True)}
+            if status and status.get("phase", status.get("state")) == "exited" and status.get("containment_empty") is True:
+                result = {'stopped': True, 'evidence': 'native_exit', 'native_id': native_id}
+            else:
+                result = {'stopped': False, 'error': 'stop_unconfirmed', 'reason': 'stop_unconfirmed', 'stage': 'host_stop'}
         else:
             text = command.get("text")
             if not isinstance(text, str) or len(text.encode()) > 16384:
                 raise ValueError("invalid_command_text")
             self.native("send", native_id, "--stdin", "--enter", input=text, timeout=60)
             result = {"delivery": "native_acknowledged"}
-        self.finish_command(identity, command, result)
+        with db:
+            self.finish_command(identity, command, result)
         return result
 
     def stop_pre_native_command(self, command, identity, digest):
-        session = command.get("session_id")
-        workspace = command.get("workspace")
-        tag = command.get("tag")
-        if (not isinstance(session, str) or not isinstance(workspace, str) or not workspace
-                or tag != "task-hub2-" + session):
-            raise ValueError("command_fence_conflict")
-        if self.journal.db.execute("SELECT 1 FROM launches WHERE session_id=?", (session,)).fetchone():
-            raise ValueError("command_fence_conflict")
-        try:
-            resolved = Path(workspace).resolve(strict=True)
-        except OSError as error:
-            raise ValueError("command_fence_conflict") from error
-        if not resolved.is_dir() or not any(resolved.is_relative_to(root) for root in self.roots):
-            raise ValueError("command_fence_conflict")
-        workspace = str(resolved)
-        expected = {"tag": tag, "workspace": workspace}
-        self.begin_command(identity, digest)
-        status = self.launcher.status(f"{workspace}:{tag}", workspace=workspace)
-        if status:
-            if (status.get("tag") != tag or not same_workspace(status.get("workspace"), workspace)
-                    or not isinstance(status.get("id"), str)):
-                raise RuntimeError("native_abort_identity_mismatch")
-            native_id = status["id"]
-            if status.get("phase", status.get("state")) != "exited":
-                self.native("kill", native_id, allow_failure=True)
-                status = self.lookup(native_id, expected)
-            result = {"stopped": bool(status and status.get("phase", status.get("state")) == "exited"
-                                      and status.get("containment_empty") is True)}
-        else:
-            result = {"stopped": True}
-        self.finish_command(identity, command, result)
+        session = command.get('session_id')
+        epoch = command.get('epoch')
+        if (not isinstance(session, str) or not re.fullmatch(r'[A-Za-z0-9-]{1,80}', session)
+                or type(epoch) is not int or epoch < 1 or command.get('tag') != 'task-hub2-' + session):
+            raise ValueError('command_fence_conflict')
+        # A lost journal row cannot attest to an older dispatch. Fence any
+        # queued offer for this epoch without killing a process by an unbound tag.
+        result = {'stopped': False, 'error': 'stop_unconfirmed', 'reason': 'stop_unconfirmed', 'stage': 'host_stop'}
+        db = self.journal.db
+        with db:
+            changed = db.execute(
+                'INSERT INTO stop_fences(session_id,epoch) SELECT ?,? '
+                'WHERE NOT EXISTS(SELECT 1 FROM launches WHERE session_id=?) '
+                'ON CONFLICT(session_id) DO UPDATE SET epoch=MAX(stop_fences.epoch,excluded.epoch)',
+                (session, epoch, session))
+            if changed.rowcount != 1:
+                raise ValueError('command_fence_conflict')
+            self.begin_command(identity, digest)
+            self.finish_command(identity, command, result)
         return result
 
     def finish_command(self, identity, command, result):
-        with self.journal.db:
-            self.journal.db.execute("UPDATE commands SET state='done',result=? WHERE id=?", (canonical(result), identity))
-        self.journal.emit(f"command:{identity}", f"/api/sessions/{command['session_id']}/commands/{identity}/ack"
-                          + ("?safety=operator_stop" if command.get("kind") == "stop" else ""),
-                          {"epoch": command["epoch"], "result": result})
+        self.journal.db.execute("UPDATE commands SET state='done',result=? WHERE id=?", (canonical(result), identity))
+        self.journal.enqueue(f"command:{identity}", f"/api/sessions/{command['session_id']}/commands/{identity}/ack"
+                             + ("?safety=operator_stop" if command.get("kind") == "stop" else ""),
+                             {"epoch": command["epoch"], "result": result})
 
     def begin_command(self, identity, digest):
-        with self.journal.db:
-            self.journal.db.execute("INSERT INTO commands VALUES(?,?,'executing',NULL)", (identity, digest))
+        self.journal.db.execute("INSERT INTO commands VALUES(?,?,'executing',NULL)", (identity, digest))
 
     def drain(self, acknowledge=None):
         self.journal.flush(self.client)

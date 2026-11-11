@@ -795,13 +795,13 @@ export class MachineDO {
     const key = request.headers.get('Idempotency-Key') || body.key;
     if (typeof key !== 'string' || !/^[A-Za-z0-9_.:-]{1,120}$/.test(key)) return error('idempotency_key_required', 400);
     const digest = await sha256Hex(JSON.stringify({ kind, text: commandText ?? null, epoch: session.epoch, ...(captureMode ? {mode:captureMode} : {}) }));
-    const immediateStop = kind === 'stop' && !session.native_id && ['offered', 'expired'].includes(session.state);
+    const immediateStop = kind === 'stop' && this.unclaimedWithoutNative(session);
     const prior = this.db.one<CommandRow>('SELECT * FROM session_commands WHERE session_id=? AND request_key=?', sessionId, key);
     if (prior) {
       if (prior.request_digest !== digest) return error('idempotency_conflict', 409);
       if (!immediateStop || prior.state !== 'pending') return json({ command: this.commandView(prior), replayed: true });
     }
-    if (kind === 'stop' ? !immediateStop && !['running', 'claimed'].includes(session.state)
+    if (kind === 'stop' ? !immediateStop && !this.canDispatchStop(session)
       : session.state !== 'running' || !session.native_id) return error('session_not_running', 409);
     const now = Date.now(), id = crypto.randomUUID();
     if (immediateStop) {
@@ -822,10 +822,13 @@ export class MachineDO {
       this.db.transaction(this.ctx, () => {
         const current = this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?', sessionId);
         if (!current || current.epoch !== session.epoch || !(kind==='stop'
-          ? ['running','claimed'].includes(current.state)
+          ? this.canDispatchStop(current)
           : current.state==='running'&&!!current.native_id)) throw new HttpError('session_not_running', 409);
         this.db.run(`INSERT INTO session_commands(id,session_id,machine_id,epoch,request_key,request_digest,kind,text,capture_mode,state,result_json,created_at,updated_at)
-          VALUES(?,?,?,?,?,?,?,?,?,'pending',NULL,?,?)`, id, sessionId, session.machine_id, session.epoch, key, digest, kind, commandText ?? null, captureMode ?? null, now, now);
+          VALUES(?,?,?,?,?,?,?,?,?,'pending',?,?,?)`, id, sessionId, session.machine_id, session.epoch, key, digest, kind, commandText ?? null, captureMode ?? null,
+          // Before delivery, retain the bound ID in the pending result slot.
+          // A late start must not qualify a previously unbound legacy stop.
+          kind === 'stop' && current.native_id ? JSON.stringify({dispatch_native_id:current.native_id}) : null,now,now);
       });
     } catch (caught) {
       if (caught instanceof HttpError) return error(caught.code, caught.status);
@@ -843,19 +846,40 @@ export class MachineDO {
     if(new URL(request.url).searchParams.has('safety')&&!safety)return error('untrusted_safety_mode',403);
     const body = await bodyObject(request, 12_288);
     if (!Number.isSafeInteger(body.epoch) || !body.result || typeof body.result !== 'object' || Array.isArray(body.result)) return error('invalid_command_ack', 400);
-    const resultJson = JSON.stringify(body.result);
-    if (new TextEncoder().encode(resultJson).byteLength > 8192) return error('command_ack_too_large', 413);
+    if (new TextEncoder().encode(JSON.stringify(body.result)).byteLength > 8192) return error('command_ack_too_large', 413);
     const row = this.db.one<CommandRow>('SELECT * FROM session_commands WHERE id=? AND session_id=? AND machine_id=?', commandId, sessionId, machineId);
     if (!row || row.epoch !== body.epoch) return error('stale_command', 409);
     if(safety&&row.kind!=='stop')return error('safety_command_refused',403);
-    if (row.state === 'acked') return row.result_json === resultJson ? json({ acknowledged: true, duplicate: true }) : error('command_ack_conflict', 409);
+    const session = row.kind === 'stop'
+      ? this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND machine_id=? AND epoch=?',sessionId,machineId,row.epoch)
+      : null;
+    let result=body.result as JsonRecord;
+    if (session) {
+      const priorResult=this.parse(row.result_json) as JsonRecord|null;
+      const legacyBoundStop = result.stopped === true && result.evidence === undefined && !!session.native_id
+        && (row.state === 'pending' && priorResult?.dispatch_native_id === session.native_id
+          || row.state === 'acked' && priorResult?.evidence === 'legacy_bound_exit' && priorResult?.native_id === session.native_id);
+      if (legacyBoundStop) {
+        result = {...result,evidence:'legacy_bound_exit',native_id:session.native_id};
+      } else if (result.evidence === 'legacy_bound_exit' || !this.qualifiedStopResult(session,result)) {
+        result = {stopped:false,error:'stop_unconfirmed',reason:'stop_unconfirmed',stage:'host_stop'};
+      }
+    }
+    const resultJson = JSON.stringify(result);
+    const unconfirmed=row.kind==='stop'&&result.stopped===false&&result.error==='stop_unconfirmed';
+    if (row.state === 'acked' || (row.state === 'failed' && unconfirmed && row.result_json === resultJson)) {
+      return row.result_json === resultJson ? json({ acknowledged: true, duplicate: true }) : error('command_ack_conflict', 409);
+    }
     if (row.state !== 'pending') return error('command_not_pending', 409);
     const now=Date.now();
-    this.db.run("UPDATE session_commands SET state='acked',result_json=?,updated_at=? WHERE id=? AND state='pending' AND epoch=?",
-      resultJson, now, commandId, row.epoch);
-    if(row.kind==='stop'&&(body.result as JsonRecord).stopped===true){
-      const session=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND machine_id=? AND epoch=?',sessionId,machineId,row.epoch);
-      if(session)await this.recordStopped(session,'stop_confirmed',now);
+    if (row.kind === 'stop' && result.stopped === true) {
+      const nativeId = result.evidence === 'native_exit' ? result.native_id as string : undefined;
+      if (!session || !await this.recordStopped(session,'stop_confirmed',now,{id:commandId,result_json:resultJson,native_id:nativeId})) {
+        return error('stale_command',409);
+      }
+    } else {
+      this.db.run("UPDATE session_commands SET state=?,result_json=?,updated_at=? WHERE id=? AND state='pending' AND epoch=?",
+        unconfirmed?'failed':'acked', resultJson, now, commandId, row.epoch);
     }
     await this.notifyPendingCommands(machineId);
     return json({ acknowledged: true });
@@ -863,13 +887,13 @@ export class MachineDO {
 
   private async sendPendingCommands(socket:WebSocket,machineId:string,env:Hub2Env=this.env):Promise<void>{
     const stop=this.stopOnly(socket);
-    const command=this.db.one<CommandRow>("SELECT c.* FROM session_commands c JOIN sessions s ON s.id=c.session_id AND s.machine_id=c.machine_id AND c.epoch=s.epoch WHERE c.machine_id=? AND s.state IN ('claimed','running') AND c.state='pending' "+(stop?"AND c.kind='stop' ":"")+"ORDER BY CASE WHEN c.kind='stop' THEN 0 ELSE 1 END,c.created_at,c.id LIMIT 1",machineId);
+    const command=this.db.one<CommandRow>("SELECT c.* FROM session_commands c JOIN sessions s ON s.id=c.session_id AND s.machine_id=c.machine_id AND c.epoch=s.epoch WHERE c.machine_id=? AND (s.state IN ('claimed','running') OR (s.state='expired' AND c.kind='stop' AND EXISTS(SELECT 1 FROM launch_admissions a WHERE a.operation_id=s.operation_id AND a.session_id=s.id AND a.epoch=s.epoch))) AND c.state='pending' "+(stop?"AND c.kind='stop' ":"")+"ORDER BY CASE WHEN c.kind='stop' THEN 0 ELSE 1 END,c.created_at,c.id LIMIT 1",machineId);
     if(!command)return;
     if(!await this.authorizedAttachment(socket,'machine:offer',true,env))return;
     try{
       const view=this.commandView(command);
       const session=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND machine_id=?',command.session_id,machineId);
-      if(session?.state==='claimed'&&!session.native_id){
+      if (session && !session.native_id && (session.state === 'claimed' || session.state === 'expired')) {
         const launch=this.parse(session.launch_json) as JsonRecord;
         view.pre_native=true;view.workspace=launch.workspace;view.tag=`task-hub2-${session.id}`;
       }
@@ -999,7 +1023,7 @@ export class MachineDO {
         now,session.id,session.operation_id,session.epoch);
       this.db.run("UPDATE machine_session_operations SET state='failed' WHERE operation_id=? AND session_id=? AND epoch=? AND state='current'",
         session.operation_id,session.id,session.epoch);
-      this.settlePendingCommands(current,now,reason,false);
+      this.settlePendingCommands(current,now,reason,null);
       this.insertOutbox(key,'reaped',session.operation_id,session.project_id,payload,now);
       return true;
     });
@@ -1100,7 +1124,8 @@ export class MachineDO {
         continue;
       }
       if(live&&['exited','missing','dead','stopped'].includes(live.phase)&&live.containment_empty===true){
-        if(await this.recordReaped(session,reason,live.observed_at)){reaped++;actions.push({session_id:session.id,action:'marked_stopped',reason});}
+        const qualifiedExit=live.phase==='exited'&&!!session.native_id&&live.native_id===session.native_id;
+        if(await this.recordReaped(session,reason,live.observed_at,qualifiedExit)){reaped++;actions.push({session_id:session.id,action:'marked_stopped',reason});}
         continue;
       }
       if(session.native_id||live?.native_id||!!(live&&['launching','starting'].includes(live.phase))){
@@ -1126,32 +1151,61 @@ export class MachineDO {
       active_count_after:this.liveSessions().filter(row=>isLiveActiveSession(row)).length,reaped,stop_requested:stopRequested,actions};
   }
 
+  private qualifiedStopResult(session: SessionRow, result: JsonRecord): boolean {
+    if (result.stopped !== true) return false;
+    if (result.evidence === 'dispatch_fenced') return !session.native_id && result.native_id === undefined;
+    if (result.evidence === 'native_exit') return typeof result.native_id === 'string'
+      && /^[A-Za-z0-9-]{1,120}$/.test(result.native_id) && (!session.native_id || session.native_id === result.native_id);
+    return result.evidence === 'legacy_bound_exit' && !!session.native_id && result.native_id === session.native_id;
+  }
+
   private stopConfirmed(session:SessionRow):boolean{
     const row=this.db.one<{result_json:string|null}>("SELECT result_json FROM session_commands WHERE session_id=? AND machine_id=? AND epoch=? AND kind='stop' AND state='acked' ORDER BY created_at DESC LIMIT 1",
       session.id,session.machine_id,session.epoch);
-    try{return !!row?.result_json&&(JSON.parse(row.result_json) as JsonRecord).stopped===true;}catch{return false;}
+    try{return !!row?.result_json&&this.qualifiedStopResult(session,JSON.parse(row.result_json) as JsonRecord);}catch{return false;}
+  }
+
+  private hasLaunchAdmission(session: SessionRow): boolean {
+    return !!this.db.one('SELECT operation_id FROM launch_admissions WHERE operation_id=? AND session_id=? AND epoch=?',
+      session.operation_id,session.id,session.epoch);
+  }
+
+  private unclaimedWithoutNative(session: SessionRow): boolean {
+    return session.native_id === null && ['offered', 'expired'].includes(session.state) && !this.hasLaunchAdmission(session);
+  }
+
+  private canDispatchStop(session: SessionRow): boolean {
+    return ['claimed', 'running'].includes(session.state) || (session.state === 'expired' && this.hasLaunchAdmission(session));
   }
 
   private async recordStopped(session:SessionRow,reason:string,observedAt:number,
-    stopCommand?:{id:string;request_key:string;request_digest:string}):Promise<boolean>{
+    stopCommand?:{id:string;request_key:string;request_digest:string}|{id:string;result_json:string;native_id?:string}):Promise<boolean>{
+    const nativeId = session.native_id ?? (stopCommand && 'result_json' in stopCommand ? stopCommand.native_id ?? null : null);
     const now=Date.now(),payload={operation_id:session.dispatch_id,attempt_operation_id:session.operation_id,session_id:session.id,
-      intake_id:session.intake_id,machine_id:session.machine_id,epoch:session.epoch,native_id:session.native_id,
+      intake_id:session.intake_id,machine_id:session.machine_id,epoch:session.epoch,native_id:nativeId,
       reason,observed_at:observedAt};
     const applied=this.db.transaction(this.ctx,()=>{
       const current=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',session.id);
-      const unclaimed=current&&['offered','expired'].includes(current.state)&&current.native_id===null;
+      const unclaimed=current&&this.unclaimedWithoutNative(current);
       if(!current||current.epoch!==session.epoch||current.operation_id!==session.operation_id||current.native_id!==session.native_id
-        ||(!['claimed','running'].includes(current.state)&&!unclaimed))return false;
-      if(stopCommand)this.db.run(`INSERT INTO session_commands(id,session_id,machine_id,epoch,request_key,request_digest,kind,text,state,result_json,created_at,updated_at)
+        ||(!this.canDispatchStop(current)&&!unclaimed))return false;
+      if (stopCommand && 'result_json' in stopCommand) {
+        const pending=this.db.one("SELECT id FROM session_commands WHERE id=? AND session_id=? AND machine_id=? AND epoch=? AND kind='stop' AND state='pending'",
+          stopCommand.id,session.id,session.machine_id,session.epoch);
+        if(!pending)return false;
+        this.db.run("UPDATE session_commands SET state='acked',result_json=?,updated_at=? WHERE id=?",
+          stopCommand.result_json,now,stopCommand.id);
+      } else if(stopCommand)this.db.run(`INSERT INTO session_commands(id,session_id,machine_id,epoch,request_key,request_digest,kind,text,state,result_json,created_at,updated_at)
         VALUES(?,?,?,?,?,?, 'stop',NULL,'pending',NULL,?,?)`,stopCommand.id,session.id,session.machine_id,session.epoch,
         stopCommand.request_key,stopCommand.request_digest,now,now);
-      this.db.run("UPDATE sessions SET state='stopped',updated_at=? WHERE id=?",now,session.id);
+      this.db.run("UPDATE sessions SET state='stopped',native_id=?,updated_at=? WHERE id=?",nativeId,now,session.id);
       this.db.run("UPDATE machine_session_operations SET state='stopped' WHERE operation_id=? AND session_id=? AND epoch=?",session.operation_id,session.id,session.epoch);
-      this.settlePendingCommands(session,now,'stop_confirmed',true);
+      this.settlePendingCommands(session,now,'stop_confirmed',nativeId
+        ? {evidence:'native_exit',native_id:nativeId} : {evidence:'dispatch_fenced'});
       this.db.run(`INSERT INTO native_sessions(session_id,native_id,phase,last_activity_at,exit_code,containment_empty,observed_at)
         VALUES(?,?,?, ?,NULL,1,?) ON CONFLICT(session_id) DO UPDATE SET native_id=excluded.native_id,
         phase=excluded.phase,last_activity_at=excluded.last_activity_at,containment_empty=1,observed_at=excluded.observed_at`,
-        session.id,session.native_id,session.native_id?'exited':'missing',observedAt,now);
+        session.id,nativeId,nativeId?'exited':'missing',observedAt,now);
       this.db.run('INSERT INTO machine_liveness(singleton,observed_at) VALUES(1,?) ON CONFLICT(singleton) DO UPDATE SET observed_at=excluded.observed_at',now);
       this.insertOutbox(`stopped:${session.operation_id}:${session.epoch}`,'stopped',session.operation_id,session.project_id,payload,now);
       return true;
@@ -1161,20 +1215,21 @@ export class MachineDO {
     return applied;
   }
 
-  private async recordReaped(session:SessionRow,reason:'dead'|'idle',observedAt:number):Promise<boolean>{
+  private async recordReaped(session:SessionRow,reason:'dead'|'idle',observedAt:number,qualifiedExit=false):Promise<boolean>{
     const now=Date.now(),payload={operation_id:session.dispatch_id,attempt_operation_id:session.operation_id,session_id:session.id,
       intake_id:session.intake_id,machine_id:session.machine_id,epoch:session.epoch,native_id:session.native_id,
       reason,observed_at:observedAt,stopped:true,reaped:true};
     const applied=this.db.transaction(this.ctx,()=>{
       const current=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',session.id);
-      if(!current||current.epoch!==session.epoch||current.operation_id!==session.operation_id||!['claimed','running'].includes(current.state))return false;
+      if(!current||current.epoch!==session.epoch||current.operation_id!==session.operation_id||current.native_id!==session.native_id||!['claimed','running'].includes(current.state))return false;
       this.db.run("UPDATE sessions SET state='stopped',updated_at=? WHERE id=?",now,session.id);
       this.db.run("UPDATE machine_session_operations SET state='reaped' WHERE operation_id=? AND session_id=? AND epoch=?",session.operation_id,session.id,session.epoch);
-      this.settlePendingCommands(session,now,reason,true);
+      this.settlePendingCommands(session,now,reason,qualifiedExit
+        ? {evidence:'native_exit',native_id:session.native_id} : null);
       this.db.run(`INSERT INTO native_sessions(session_id,native_id,phase,last_activity_at,exit_code,containment_empty,observed_at)
-        VALUES(?,?,'missing',?,NULL,1,?) ON CONFLICT(session_id) DO UPDATE SET native_id=excluded.native_id,
-        phase='missing',last_activity_at=excluded.last_activity_at,containment_empty=1,observed_at=excluded.observed_at`,
-        session.id,session.native_id,observedAt,now);
+        VALUES(?,?,?,?,NULL,?,?) ON CONFLICT(session_id) DO UPDATE SET native_id=excluded.native_id,
+        phase=excluded.phase,last_activity_at=excluded.last_activity_at,containment_empty=excluded.containment_empty,observed_at=excluded.observed_at`,
+        session.id,session.native_id,qualifiedExit?'exited':'missing',observedAt,qualifiedExit?1:0,now);
       this.db.run('INSERT INTO machine_liveness(singleton,observed_at) VALUES(1,?) ON CONFLICT(singleton) DO UPDATE SET observed_at=excluded.observed_at',now);
       this.insertOutbox(`reaped:${session.operation_id}:${session.epoch}`,'reaped',session.operation_id,session.project_id,payload,now);
       return true;
@@ -1196,7 +1251,7 @@ export class MachineDO {
         ||!['staged','offered','claimed'].includes(current.state)||current.native_id!==null||Date.now()-current.created_at<CLAIMED_WITHOUT_NATIVE_GRACE_MS)return false;
       this.db.run("UPDATE sessions SET state='failed',updated_at=? WHERE id=? AND state IN ('staged','offered','claimed') AND native_id IS NULL",now,session.id);
       this.db.run("UPDATE machine_session_operations SET state='failed' WHERE operation_id=? AND session_id=? AND epoch=?",session.operation_id,session.id,session.epoch);
-      this.settlePendingCommands(session,now,reason,false);
+      this.settlePendingCommands(session,now,reason,null);
       this.db.run('INSERT INTO attention(session_id,reason,operation_id,message_id,observed_at) VALUES(?,?,?,NULL,?) ON CONFLICT(session_id) DO UPDATE SET reason=excluded.reason,operation_id=excluded.operation_id,message_id=NULL,observed_at=excluded.observed_at',
         session.id,reason,session.operation_id,now);
       this.insertOutbox(`reaped:${session.operation_id}:${session.epoch}`,'reaped',session.operation_id,session.project_id,payload,now);
@@ -1208,14 +1263,14 @@ export class MachineDO {
     return applied;
   }
 
-  private settlePendingCommands(session:SessionRow,now:number,reason:string,stopConfirmed:boolean):void{
-    const stopResult=JSON.stringify({stopped:true,reason});
-    const unconfirmedStopResult=JSON.stringify({error:'stop_unconfirmed',reason});
+  private settlePendingCommands(session:SessionRow,now:number,reason:string,stopEvidence:JsonRecord|null):void{
+    const stopResult=JSON.stringify({stopped:true,reason,...stopEvidence});
+    const unconfirmedStopResult=JSON.stringify({stopped:false,error:'stop_unconfirmed',reason:'stop_unconfirmed',detail:reason});
     const failedResult=JSON.stringify({error:'session_ended_before_command_execution',reason});
     this.db.run(`UPDATE session_commands SET state=CASE WHEN kind='stop' AND ? THEN 'acked' ELSE 'failed' END,
       result_json=CASE WHEN kind='stop' AND ? THEN ? WHEN kind='stop' THEN ? ELSE ? END,updated_at=?
       WHERE session_id=? AND machine_id=? AND epoch=? AND state='pending'`,
-      stopConfirmed?1:0,stopConfirmed?1:0,stopResult,unconfirmedStopResult,failedResult,now,session.id,session.machine_id,session.epoch);
+      stopEvidence?1:0,stopEvidence?1:0,stopResult,unconfirmedStopResult,failedResult,now,session.id,session.machine_id,session.epoch);
   }
 
   private sessionList(request: Request): Response {
@@ -1240,10 +1295,12 @@ export class MachineDO {
     const data = await response.json() as { command: { id: string } };
     const command=this.db.one<CommandRow>('SELECT * FROM session_commands WHERE id=?',data.command.id);
     const result=this.parse(command?.result_json) as JsonRecord|null;
-    const stopped=kind==='stop'&&result?.stopped===true;
+    const session=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',sessionId);
+    const stopped=kind==='stop'&&command?.state==='acked'&&!!result&&!!session
+      && this.qualifiedStopResult(session,result);
     return json({ ...data, command_id: data.command.id,
-      state: stopped?'stopped':command?.state==='acked'?'acked':'queued',
-      delivery: stopped?'confirmed':command?.state==='acked'?'delivered':'queued' }, response.status);
+      state: stopped?'stopped':command?.state==='acked'?'acked':command?.state==='failed'?'failed':'queued',
+      delivery: stopped?'confirmed':command?.state==='acked'?'delivered':command?.state==='failed'?'unconfirmed':'queued' }, response.status);
   }
 
   /** Command receipts in the shape `sessions send/capture/stop --wait` polls: ack.capture, ack.outcome, ack.confirmed_exit. */
@@ -1252,11 +1309,12 @@ export class MachineDO {
     if (!session || (!hasScope(actor, 'operator:admin') && !(hasScope(actor, 'session:read') && [session.id, session.project_id].includes(actor?.resource_id || '')))) return error('session_not_found', 404);
     const rows = this.db.all<CommandRow>('SELECT * FROM session_commands WHERE session_id=? ORDER BY created_at DESC,id LIMIT 100', sessionId);
     return json({ commands: rows.map(row => {
-      const result = row.result_json ? JSON.parse(row.result_json) as JsonRecord : null;
+      const result = row.state !== 'pending' && row.result_json ? JSON.parse(row.result_json) as JsonRecord : null;
       const ack = result === null ? null : {
         ...result,
         ...(row.kind === 'capture' && typeof result.output === 'string' ? { capture: result.output } : {}),
-        ...(row.kind === 'stop' ? { outcome: 'delivered', confirmed_exit: result.stopped === true } : {}),
+        ...(row.kind === 'stop' ? { outcome: row.state === 'failed' ? 'failed' : 'delivered',
+          confirmed_exit: row.state==='acked'&&this.qualifiedStopResult(session,result) } : {}),
       };
       return { id: row.id, session_id: row.session_id, kind: row.kind, state: row.state, created_at: row.created_at, ack };
     }), next_cursor: null });
@@ -1265,8 +1323,7 @@ export class MachineDO {
   private sessionDetail(request: Request, id: string): Response {
     const actor=actorFrom(request),row=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',id);
     if (!row || (!hasScope(actor,'operator:admin') && !(hasScope(actor,'session:read') && [row.id,row.project_id].includes(actor?.resource_id||'')))) return error('session_not_found',404);
-    const stopped = this.db.one<{result_json: string | null}>("SELECT result_json FROM session_commands WHERE session_id=? AND kind='stop' AND state='acked' ORDER BY created_at DESC LIMIT 1", row.id);
-    return json({session:{...this.sessionView(row), ...(stopped?.result_json && (JSON.parse(stopped.result_json) as JsonRecord).stopped === true ? { stop_confirmed: true } : {})}});
+    return json({session:{...this.sessionView(row), ...(this.stopConfirmed(row) ? { stop_confirmed: true } : {})}});
   }
 
   private sessionView(row: SessionRow): JsonRecord {
