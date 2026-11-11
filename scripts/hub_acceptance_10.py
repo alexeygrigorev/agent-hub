@@ -9,6 +9,7 @@ the offline tests never reach the network.
 """
 import argparse
 import base64
+import datetime
 import json
 import hashlib
 import stat
@@ -162,7 +163,7 @@ def validate_evidence(ev, path, commit):
     host_sha = validation.get('target_commit')
     transports = validation.get('capture_transports')
     if (not isinstance(host_sha, str) or not re.fullmatch(r'[0-9a-f]{40}', host_sha)
-            or not isinstance(transports, dict) or not 1 <= len(transports) <= 3
+            or not isinstance(transports, dict) or not 1 <= len(transports) <= len(CAPTURE_FORMATS)
             or any(not capture_transport_ok(engine, record, host_sha) for engine, record in transports.items())):
         problems.append('verified engine/host/stream capture transport records required')
         return problems
@@ -229,12 +230,15 @@ def make_probe():
     encoded = base64.b64encode(marker.encode()).decode()
     prompt = ('Use two sequential shell tool calls. First run `python3 -c '
               "'import base64; print(base64.b64decode(\"%s\").decode())'` and let it finish. "
-              'Then use a separate shell tool call to run `sleep 60` so the orchestrator can stop this session. '
-              'Do not combine printing and sleeping. Do not edit files, start another agent, or exit early.' % encoded)
+              'Then use the provider-native background tool facility for a separate bounded60-second hold, '
+              'monitoring it internally so the orchestrator can stop this session. '
+              'Do not chain the print with a foreground sleep or wait externally; external waits require a Hub wake. '
+              'Do not edit files, start another agent, or exit early.' % encoded)
     return prompt, marker
 
 
-CAPTURE_FORMATS = {'codex': 'codex_jsonl_v1', 'zai': 'codex_jsonl_v1', 'go': 'opencode_json_v1'}
+CAPTURE_FORMATS = {'codex': 'codex_jsonl_v1', 'zai': 'codex_jsonl_v1', 'go': 'opencode_json_v1',
+                   'claude': 'claude_stream_json_v1', 'antigravity': 'argon_stream_json_v1'}
 CAPTURE_KEYS = {'engine', 'machine_id', 'format', 'host_release_sha', 'provider_version',
                 'profile_set_sha256', 'reference', 'sha256', 'path'}
 
@@ -253,15 +257,130 @@ def capture_transport_ok(engine, record, host_sha):
                     for key in ('profile_set_sha256', 'sha256')))
 
 
+def paired_stream_output_ok(captured, expected, engine):
+    """Complete provider frames from ONE capture only; never repair clipped JSON."""
+    if len(captured.encode()) > 65536:
+        return False
+    events = []
+    for index, line in enumerate(captured.splitlines()):
+        try:
+            event = json.loads(line, object_pairs_hook=unique_object)
+        except (ValueError, TypeError):
+            if index == 0:  # A bounded tail may start inside an earlier frame.
+                continue
+            return False
+        if not isinstance(event, dict):
+            return False
+        events.append(event)
+    if len(events) > 128:
+        return False
+    uses, results = {}, set()
+    proven = False
+
+    def marker_in(text):
+        return isinstance(text, str) and any(line.strip() == expected for line in text.splitlines())
+
+    def provider_id(value):
+        return isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9_-]{1,100}', value) is not None
+
+    for event in events:
+        if engine == 'claude':
+            message = event.get('message')
+            if event.get('type') not in ('assistant', 'user') or not isinstance(message, dict):
+                continue
+            blocks = message.get('content')
+            if not isinstance(blocks, list):
+                continue
+            session = event.get('session_id')
+            for block in blocks:
+                if not isinstance(block, dict):
+                    continue
+                if event['type'] == 'assistant' and block.get('type') == 'tool_use':
+                    identity = block.get('id')
+                    if not provider_id(identity) or not valid_native_id(session):
+                        return False
+                    if identity in uses:
+                        return False
+                    params = block.get('input')
+                    if (message.get('role') != 'assistant' or block.get('name') != 'Bash'
+                            or not isinstance(params, dict) or not isinstance(params.get('command'), str)):
+                        continue
+                    uses[identity] = session
+                elif event['type'] == 'user' and block.get('type') == 'tool_result':
+                    identity = block.get('tool_use_id')
+                    if not provider_id(identity) or identity in results:
+                        return False
+                    results.add(identity)
+                    if identity not in uses:  # An orphan alone can never prove output.
+                        continue
+                    detail = event.get('tool_use_result')
+                    if (session != uses[identity] or message.get('role') != 'user'
+                            or block.get('is_error') is not False or not isinstance(detail, dict)
+                            or detail.get('interrupted') is not False or detail.get('stderr') != ''
+                            or not isinstance(block.get('content'), str)
+                            or detail.get('stdout') != block['content']):
+                        return False
+                    proven = proven or marker_in(block['content'])
+        else:
+            step = event.get('step_update')
+            if event.get('event') != 'step_update' or not isinstance(step, dict) or step.get('step_type') != 'tool':
+                continue
+            conversation, index = step.get('conversation_id'), step.get('step_index')
+            info = step.get('tool_info')
+            if (not valid_native_id(conversation) or type(index) is not int or not 0 <= index <= 2**31 - 1
+                    or step.get('tool_name') != 'run_command' or not isinstance(info, dict)
+                    or info.get('name') != 'run_command'):
+                return False
+            if any(part.get(key) not in (None, False, '') for part in (event, step, info)
+                   for key in ('error', 'is_error', 'interrupted')):
+                return False
+            params = info.get('parameters')
+            if (not isinstance(params, dict) or set(params) != {'CommandLine'}
+                    or not isinstance(params['CommandLine'], str) or not params['CommandLine']):
+                return False
+            identity = (conversation, index)
+            if step.get('state') == 'ACTIVE':
+                if identity in uses or identity in results or 'output' in info:
+                    return False
+                uses[identity] = params
+            elif step.get('state') == 'DONE':
+                if identity in results:
+                    return False
+                results.add(identity)
+                if identity not in uses:
+                    continue
+                if params != uses[identity] or not isinstance(info.get('output'), str):
+                    return False
+                # Only the native wrapper's anchored zero status counts. A fake
+                # zero status embedded inside command output cannot override it.
+                match = re.fullmatch(r'Created At: ([^\n]+)\nCompleted At: ([^\n]+)\n'
+                                     r'Command exited with code 0\.\n\nCommand output:\n([\s\S]*)', info['output'])
+                if not match:
+                    continue
+                try:
+                    created, completed = (datetime.datetime.fromisoformat(match[group]) for group in (1, 2))
+                    if created.tzinfo is None or completed.tzinfo is None or completed < created:
+                        return False
+                except ValueError:
+                    return False
+                proven = proven or marker_in(match[3])
+            else:
+                return False
+    return proven
+
+
 def probe_output_ok(captured, prompt, expected, engine=None, transport=None):
     """Parse only the Root-verified engine's stream; plaintext JSON is not proof.
 
-    Claude/Antigravity remain unsupported even with forged stream-shaped text.
+    Claude/Argon require complete matching provider pairs, not isolated result JSON.
     The caller supplies a record extracted from the same validated evidence bytes.
     """
     if (not capture_transport_ok(engine, transport, (transport.get('host_release_sha') if isinstance(transport, dict) else None))
             or expected in prompt or not isinstance(captured, str)):
         return False
+
+    if engine in ('claude', 'antigravity'):
+        return paired_stream_output_ok(captured, expected, engine)
 
     def marker_in(text):
         return isinstance(text, str) and any(line.strip() == expected for line in text.splitlines())

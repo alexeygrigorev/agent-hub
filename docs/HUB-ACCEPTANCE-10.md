@@ -86,9 +86,10 @@ The probe asks for a completed print tool call followed by a separate hold call.
 JSON shape alone cannot prove a tool ran: a plaintext assistant can print a fake
 JSON event. Root must attest the actual effective launch transport before the
 run, using `operator_validation.capture_transports`. The map contains at most
-three records, keyed only by `codex`, `zai`, or `go`. Every drawn engine needs its
+five records, keyed only by `codex`, `zai`, `go`, `claude`, or `antigravity`. Every drawn engine needs its
 own record. Codex and ZAI require `codex_jsonl_v1`; Go requires
-`opencode_json_v1`. Parsers accept only the corresponding engine's completed
+`opencode_json_v1`. Claude requires `claude_stream_json_v1`, and Antigravity
+requires `argon_stream_json_v1`. Parsers accept only the corresponding engine's completed
 tool-output event. A Codex event cannot prove Go output, or the reverse.
 
 Each record requires the exact engine, `hetzner-aplexer` machine, known format,
@@ -96,7 +97,7 @@ full host release SHA equal to `operator_validation.target_commit`, actual
 provider version, `profile_set_sha256`, and receipt reference plus SHA256.
 `path` is optional and, when supplied, uses the same bounded local-receipt hash
 checks. The example includes Codex only; Root must supply separately verified
-ZAI/Go records if those engines can be selected. A missing record ends proof and
+records for every other engine that can be selected. A missing record ends proof and
 cleans up the owned session; it does not change production model routing.
 
 Root computes `profile_set_sha256` over canonical JSON (UTF-8, sorted keys,
@@ -112,13 +113,40 @@ script cannot measure these facts from a session show response; the records are
 explicit trusted operator attestations, not remote authentication. Both the
 transport map and evidence digest come from the same validated byte buffer.
 
-Current plaintext Claude and Antigravity captures are **always refused**, even
-if they contain synthetic `tool_use`, `tool_result` or command-execution JSON.
-Neither engine can be added through an evidence-file override. A separately
-reviewed native format-support change and explicit parser support are required.
-Assistant messages, final result prose, prompt echoes, reasoning, tool inputs,
-unfinished events and plain text never count. Do not force a model or weaken
-this check to make live acceptance pass.
+Claude and Argon support is based on independently reviewed genuine, qualified
+same-release Hub captures. Raw private captures are not committed. Offline
+fixtures use synthetic identities, commands and paths. Provider-shaped JSON in
+plain text remains insufficient without the verified effective stream transport.
+
+For Claude, one capture must contain a complete assistant Bash `tool_use` and a
+later user `tool_result` with the same tool ID and provider session. The result
+must explicitly report `is_error:false` and `interrupted:false`, empty stderr,
+and exactly equal structured stdout/content containing the standalone nonce.
+Orphan results, mismatched/reused IDs, errors, interruptions and text/input echoes
+cannot prove output.
+
+For Argon, one capture must contain complete `step_update` tool/run_command
+ACTIVE and DONE frames with the same conversation, step and exact parameters.
+DONE alone is insufficient. Its output must have the native wrapper's anchored
+Created At / Completed At timestamps, `Command exited with code 0.` status, and
+`Command output:` block containing the standalone nonce. A fake zero status
+inside the output cannot replace a missing/nonzero native header. Error states,
+changed parameters and reused identities fail proof.
+
+A leading clipped line is discarded without repair; complete paired frames
+must remain in the same capture. Later malformed or partial JSON fails proof.
+No state is carried between capture requests to reconstruct a missing pair.
+Existing Codex/ZAI JSONL and Go parsing stay unchanged. A custom ZAI bridge's new
+format remains unsupported until a genuine trace and separate source review;
+an evidence-file override cannot enable an unknown format.
+
+The hold request uses a separate bounded provider-native background tool and
+internal monitoring. It does not chain printing with foreground sleeps or
+request an external waiter without a Hub wake. Capture/ACK limits remain
+unchanged: `--max-bytes` does not make this change deliver a larger stream. A
+clipped capture lacking a complete pair fails proof even if the full private
+native log contains it. Do not force a model or weaken checks to make acceptance
+pass. Production start/stop behavior and the150s/90s/60s limits are unchanged.
 
 Picker evidence remains tied to each actual current draw, including its bounded
 fallback history and normalized pool shares. No independent picker samples prove
