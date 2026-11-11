@@ -1155,3 +1155,79 @@ payload=json.loads(journal.db.execute('SELECT payload FROM outbox').fetchone()[0
   assert(!JSON.stringify(result).includes('synthetic private prompt'));
  }finally{f.database.close();rmSync(directory,{recursive:true});}
 });
+
+test('managed Claude opt-in needs current socket heartbeat, not stale persisted capabilities',async()=>{
+ const f=fixture(),frames:any[]=[];
+ const cap='managed:hub-claude:opus:medium:v1';
+ const makeSocket=(id:string)=>{
+  let attachment:any={machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:Date.now(),connection_id:id};
+  return{readyState:1,deserializeAttachment:()=>attachment,serializeAttachment:(next:any)=>{attachment=next;},
+   send:(raw:string)=>frames.push(JSON.parse(raw)),close(){this.readyState=3;}};
+ };
+ const survivingOld=makeSocket('surviving-old');f.sockets.push(survivingOld);
+ const beat=()=>f.call('/api/heartbeat','POST',{labels:[],engines:['claude'],capabilities:['headless',cap]});
+ assert.equal((await beat()).status,200);
+ const reservation=(id:string,extra:any={})=>f.call('/_internal/reserve','POST',{
+  operation_id:'op-'+id,dispatch_id:'dispatch-'+id,attempt:0,session_id:id,project_id:'project-test',
+  intake_id:'intake-'+id,machine_id:'h1',request_digest:'digest-'+id,title:'managed proof',
+  acceptance_criteria:['proof'],account_id:'claude',launch:{workspace:'/tmp',engine:'claude',model:'opus',
+   effort:'medium',prompt:'do real work',interactive:false,managed_credential_label:'hub-claude',...extra}});
+ // A new daemon's HTTP heartbeat must never bless the surviving old socket.
+ assert.equal((await reservation('pre-handshake')).status,409);
+ assert.notEqual(survivingOld.deserializeAttachment().managed_claude_ready,true);
+ const first=makeSocket('managed-first');f.sockets.splice(0,1,first);
+ const frame={type:'managed.claude.ready',protocol:'hub2-managed-claude-exec-v1',ready:true};
+ await f.machine.webSocketMessage(survivingOld as any,JSON.stringify(frame));
+ assert.equal((await reservation('stale-socket-frame')).status,409);
+ await f.machine.webSocketMessage(first as any,JSON.stringify({...frame,ready:'true'}));
+ assert.equal((await reservation('malformed-frame')).status,409);
+ await f.machine.webSocketMessage(first as any,JSON.stringify(frame));frames.length=0;
+ const accepted=await reservation('managed-one');assert.equal(accepted.status,201);
+ const epoch=(await accepted.json() as any).epoch;
+ assert.equal((await f.call('/_internal/activate','POST',{operation_id:'op-managed-one',session_id:'managed-one',epoch})).status,201);
+ assert.equal(frames.filter(frame=>frame.type==='session.offer').length,1);
+ const poll=await f.call('/api/offers','GET',undefined,{'x-hub2-actor':JSON.stringify({...machineActor,scopes:['machine:offer']})});
+ assert.deepEqual((await poll.json() as any).offers,[],'old REST pollers cannot receive the new selector');
+ // Rollback/reconnect has no capability observation even though DB still has it.
+ f.sockets.splice(0);const old=makeSocket('old-host');f.sockets.push(old);frames.length=0;
+ const oldRouting=await (await f.call('/_internal/routing')).json() as any;
+ assert(!oldRouting.capabilities.includes(cap));
+ assert.equal((await reservation('managed-two')).status,409);
+ await (f.machine as any).sendOffers(old,'h1');assert.equal(frames.length,0);
+ await f.machine.webSocketMessage(old as any,JSON.stringify({type:'offer_ack',session_id:'managed-one',epoch}));
+ assert.equal(frames.at(-1).error,'managed_exec_unavailable');
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get('managed-one') as any).state,'offered');
+ // Source upgrade + scoped repin are observed by ordinary heartbeat, no restart.
+ assert.equal((await beat()).status,200);
+ assert.equal((await reservation('managed-two')).status,409,'HTTP alone cannot enable this socket');
+ await f.machine.webSocketMessage(old as any,JSON.stringify(frame));
+ assert.equal((await reservation('managed-two')).status,201);
+ frames.length=0;await (f.machine as any).sendOffers(old,'h1');
+ assert(frames.some(frame=>frame.offer.launch.managed_credential_label==='hub-claude'));
+ assert.equal((await reservation('bad-model',{model:'sonnet'})).status,400);
+ assert.equal((await reservation('bad-mode',{interactive:true})).status,400);
+ assert.equal((await reservation('bad-label',{managed_credential_label:'other'})).status,400);
+ // Withdrawal is also a normal heartbeat and immediately stops opt-in dispatch.
+ await f.call('/api/heartbeat','POST',{labels:[],engines:['claude'],capabilities:['headless']});
+ assert.equal((await reservation('managed-three')).status,409);
+ // More than one whole offer page may remain pending across a rollback.
+ await beat();await f.machine.webSocketMessage(old as any,JSON.stringify(frame));
+ for(let i=0;i<10;i++){
+  const id='held-'+i,r=await reservation(id);assert.equal(r.status,201);
+  const value=await r.json() as any;
+  assert.equal((await f.call('/_internal/activate','POST',{operation_id:'op-'+id,session_id:id,epoch:value.epoch})).status,201);
+ }
+ f.sockets.splice(0);const legacy=makeSocket('legacy-after-rollback');f.sockets.push(legacy);frames.length=0;
+ const normal=await f.call('/_internal/reserve','POST',{operation_id:'op-normal',dispatch_id:'dispatch-normal',attempt:0,
+  session_id:'ordinary-after-managed',project_id:'project-test',intake_id:'ordinary-intake',machine_id:'h1',request_digest:'c'.repeat(64),
+  title:'ordinary start',acceptance_criteria:['proof'],account_id:'codex',launch:{workspace:'/tmp',engine:'codex',model:'gpt-6.1-sol',
+   prompt:'normal work',interactive:false}});
+ assert.equal(normal.status,201);const normalEpoch=(await normal.json() as any).epoch;
+ assert.equal((await f.call('/_internal/activate','POST',{operation_id:'op-normal',session_id:'ordinary-after-managed',epoch:normalEpoch})).status,201);
+ await (f.machine as any).sendOffers(legacy,'h1');
+ assert(frames.some(value=>value.type==='session.offer'&&value.offer.session_id==='ordinary-after-managed'));
+ assert(!frames.some(value=>value.type==='session.offer'&&value.offer.launch.managed_credential_label));
+ const ordinaryPoll=await f.call('/api/offers','GET',undefined,{'x-hub2-actor':JSON.stringify({...machineActor,scopes:['machine:offer']})});
+ assert.deepEqual((await ordinaryPoll.json() as any).offers.map((offer:any)=>offer.session_id),['ordinary-after-managed']);
+ f.database.close();
+});

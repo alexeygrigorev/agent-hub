@@ -338,6 +338,23 @@ class NativeImportTest(unittest.TestCase):
                 self.assertEqual(exc.exception.code, 302)
                 transport.assert_called_once()
 
+    def test_managed_exec_binder_is_current_only_and_narrow(self):
+        with patch.object(h.api, 'safe_http_json', return_value={'status': 'recorded'}) as request:
+            machine, send=h.bind_managed_claude('https://hub.test')
+            self.assertEqual(machine,'test-host')
+            send('GET','/api/engines/hub-claude/credential')
+            send('POST','/api/engines/admission',{'label':'hub-claude','native':True})
+            for method,path,body in [('GET','/api/engines/sync',None),
+                    ('POST','/api/engines/hub-claude',{}),('POST','/api/engines/login',{}),
+                    ('GET','/api/engines/other/credential',None),
+                    ('POST','/api/engines/admission',{'label':'hub-claude'}),
+                    ('POST','/api/engines/sync-report',{'state':'synced','items':[]}),
+                    ('POST','/api/engines/sync-report',{'state':'synced','items':[{'label':'other','state':'installed'}]})]:
+                with self.subTest(path=path,body=body),self.assertRaises(ValueError):send(method,path,body)
+            self.assertEqual(request.call_count,2)
+        self.v2.unlink()
+        with self.assertRaises(ValueError):h.bind_managed_claude('https://hub.test')
+
     def test_cli_dispatch(self):
         parser = argparse.ArgumentParser()
         p.add_commands(parser.add_subparsers(dest='cmd'))

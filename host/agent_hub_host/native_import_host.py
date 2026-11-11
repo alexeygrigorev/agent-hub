@@ -17,7 +17,7 @@ def _https_origin(base):
         raise ValueError(_ENROLLMENT_ERROR)
 
 
-def bind(operator_base):
+def _bind(operator_base, *, execution=False):
     """Pin host identity and transport separately from the operator profile.
 
     HUB2_CONFIG is a per-worker selector, never host enrollment authority.
@@ -41,6 +41,8 @@ def bind(operator_base):
                     pass  # Only proven absence permits the legacy profile.
                 else:
                     current_selected = True
+        if execution and (not current_selected or explicit):
+            raise ValueError(_ENROLLMENT_ERROR)
         path = current if current_selected else config.get_host_config_path()
         host = config._load_from(path)  # bounded, owned, private, no-follow
         is_v2 = current_selected or 'server' in host or 'token' in host
@@ -61,14 +63,39 @@ def bind(operator_base):
     base = base.rstrip('/')
 
     def request(method, path, payload=None):
-        if (method, path) not in (
-                ('GET', '/api/engines/sync'),
-                ('POST', '/api/engines/hub-claude'),
-                ('POST', '/api/engines/sync-report')):
+        allowed = ((('GET', '/api/engines/hub-claude/credential'),
+                    ('POST', '/api/engines/hub-claude/credential'),
+                    ('POST', '/api/engines/admission'),
+                    ('POST', '/api/engines/sync-report')) if execution else (
+                    ('GET', '/api/engines/sync'), ('POST', '/api/engines/hub-claude'),
+                    ('POST', '/api/engines/sync-report')))
+        if (method, path) not in allowed:
             raise ValueError('Native import host engine API path required')
+        if execution and method == 'POST':
+            if path.endswith('/admission') and payload != {'label': 'hub-claude', 'native': True}:
+                raise ValueError('Managed execution binding required')
+            if path.endswith('/sync-report') and (not isinstance(payload, dict)
+                    or payload.get('state') != 'synced' or set(payload) != {'state', 'items'}
+                    or not isinstance(payload.get('items'), list) or len(payload['items']) != 1
+                    or not isinstance(payload['items'][0], dict)
+                    or set(payload['items'][0]) != {'label', 'revision', 'state', 'credential_generation'}
+                    or type(payload['items'][0].get('credential_generation')) is not int
+                    or payload['items'][0].get('label') != 'hub-claude'
+                    or payload['items'][0].get('state') != 'installed'):
+                raise ValueError('Managed execution binding required')
         req = urllib.request.Request(base + path, method=method,
             data=None if payload is None else json.dumps(payload).encode(),
             headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'})
         return api.safe_http_json(req)
 
     return machine, request
+
+
+def bind(operator_base):
+    """Existing native import authority, unchanged endpoint scope."""
+    return _bind(operator_base)
+
+
+def bind_managed_claude(operator_base):
+    """Current enrolled v2 host only; no import, login or refresh authority."""
+    return _bind(operator_base, execution=True)

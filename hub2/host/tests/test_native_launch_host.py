@@ -867,3 +867,131 @@ class HeadlessStreamOutputTests(unittest.TestCase):
                     prefix = (['claude', '--dangerously-skip-permissions', '--model', 'opus'] if provider == 'claude'
                               else ['agy', '--model', self.MODELS[provider], '--dangerously-skip-permissions'])
                     self.assertEqual(child, [*prefix, *(['--effort', effort] if effort else []), *(['--prompt-interactive'] if provider == 'antigravity' else []), prompt])
+
+
+class ManagedClaudeReadinessTests(unittest.TestCase):
+    def test_actual_bundled_protocol_rejects_old_pin_then_accepts_exact_repin(self):
+        if sys.platform != 'linux':
+            self.assertIsNone(nl.NativeLauncher({}).managed_claude_readiness())
+            return
+        import hashlib
+        import zipfile
+        with tempfile.TemporaryDirectory(dir=os.environ['TMPDIR']) as temporary:
+            root=Path(temporary)
+            release=root/('a'*40);release.mkdir(mode=0o700)
+            (release/'bin').mkdir(mode=0o700)
+            (release/'bin/python').symlink_to(sys.executable)
+            current=root/'current';current.symlink_to(release,target_is_directory=True)
+            archive=release/'hub.pyz'
+            package=Path(__file__).resolve().parents[3]/'host/agent_hub_host'
+            with zipfile.ZipFile(archive,'w') as out:
+                for file in package.glob('*.py'):
+                    out.write(file,'agent_hub_host/'+file.name)
+                out.writestr('__main__.py','raise RuntimeError("CLI main must never run")')
+            archive.chmod(0o600)
+            raw=archive.read_bytes()
+            receipt={'host_version':release.name,'artifacts':{'hub.pyz':{'size':len(raw),'sha256':hashlib.sha256(raw).hexdigest()}}}
+            (release/'release.json').write_text(json.dumps(receipt))
+            (release/'release.json').chmod(0o600)
+            profile=root/'profiles/config.toml';profile.parent.mkdir(mode=0o700)
+            env={'APLEXER_CONFIG':str(profile)}
+            with mock.patch.dict(os.environ,env):
+                code=('import sys,json;sys.path.insert(0,sys.argv[1]);'
+                      'from agent_hub_host.provisioning import module_command;'
+                      'sys.argv[0]=sys.argv[1];print(json.dumps(module_command("execute","hub-claude")))')
+                command=json.loads(subprocess.check_output([str(current/'bin/python'),'-I','-S','-c',code,str(archive)],text=True))
+                self.assertEqual(command[0],str(release/'bin/python'))
+                self.assertEqual(command[1:3],['-I','-S'])
+                user_site=root/'untrusted-site';user_site.mkdir()
+                sentinel=root/'site-executed'
+                (user_site/'sitecustomize.py').write_text('from pathlib import Path;Path('+repr(str(sentinel))+').write_text("unexpected")')
+                harmless=[command[0],*command[1:command.index('-c')],'-c','print("isolated-owned-test")']
+                probe=subprocess.run(harmless,capture_output=True,text=True,timeout=3,
+                                     env={**os.environ,'PYTHONPATH':str(user_site),'HOME':str(root)})
+                self.assertEqual(probe.stdout.strip(),'isolated-owned-test');self.assertEqual(probe.returncode,0)
+                self.assertFalse(sentinel.exists())
+                def publish(argv):
+                    profile.write_text('[profiles."hub-hub-claude"]\nengine="claude"\ncommand='+json.dumps(argv)+'\n')
+                    profile.chmod(0o600)
+                results=[]
+                def probe(argv,**kwargs):
+                    result=subprocess.run(argv,**kwargs);results.append(result);return result
+                adapter=nl.NativeLauncher({},runner=probe)
+                publish([sys.executable,'-c','raise RuntimeError("old18c")','hub-claude'])
+                self.assertIsNone(adapter.managed_claude_readiness(release))
+                publish(command)
+                ready=adapter.managed_claude_readiness(release)
+                self.assertIsNotNone(ready,results[-1].stderr if results else 'probe not reached')
+                self.assertEqual(ready['sha256'],receipt['artifacts']['hub.pyz']['sha256'])
+                context={'protocol':'hub2-managed-claude-exec-v1','label':'hub-claude','profile':'hub-hub-claude',
+                    'account_id':'claude','engine':'claude','model':'opus','effort':'medium','session_id':'packaged',
+                    'operation_id':'op-packaged:0','epoch':2,'workspace':str(root),'task_id':'hub2-packaged',
+                    'server':'https://hub.test','runtime_deadline':int(time.time()*1000)+60000,'request_digest':'b'*64,
+                    'machine_id':'host','exec_archive_sha256':ready['sha256']}
+                intent=root/'context.json'
+                def check_context():
+                    intent.write_text(json.dumps(context));intent.chmod(0o600)
+                    code=('import sys;sys.path.insert(0,sys.argv[1]);'
+                          'from agent_hub_host.provisioning import managed_claude_context;'
+                          'managed_claude_context(["--hub-managed-claude-context="+sys.argv[2]])')
+                    return subprocess.run([str(release/'bin/python'),'-I','-S','-c',code,str(archive),str(intent)],
+                                          cwd=root,capture_output=True,text=True,timeout=3)
+                self.assertEqual(check_context().returncode,0)
+                context['exec_archive_sha256']='0'*64
+                self.assertNotEqual(check_context().returncode,0)
+                publish(command[:-1]+['wrong-label'])
+                self.assertIsNone(adapter.managed_claude_readiness(release))
+                publish(command)
+                archive.write_bytes(raw+b'corruption')
+                self.assertIsNone(adapter.managed_claude_readiness(release))
+
+    def test_opt_in_uses_fixed_profile_and_private_context_without_changing_default(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory(dir=os.environ['TMPDIR']) as temporary:
+            workspace=Path(temporary);journal=SimpleNamespace(directory=workspace/'journal')
+            journal.directory.mkdir(mode=0o700)
+            adapter=nl.NativeLauncher({},journal=journal,aplexer='synthetic-a')
+            spec={'workspace':str(workspace),'operation_id':'op-managed:0','session_id':'managed',
+                  'epoch':4,'timeout_seconds':1800,'model':'opus','engine':'claude','effort':'medium',
+                  'runtime_deadline':int(time.time()*1000)+60000,'request_digest':'b'*64,'account_id':'claude',
+                  'client':SimpleNamespace(base_url='https://hub.test'),'managed_credential_label':'hub-claude','machine_id':'host'}
+            with mock.patch.object(adapter,'managed_claude_readiness',return_value={'sha256':'a'*64}):
+                argv=adapter.profile_command('hub2-managed',spec,{'provider':'claude','profile':'hub-hub-claude'},'prompt')
+            self.assertEqual(argv[argv.index('--profile')+1],'hub-hub-claude')
+            markers=[v for v in argv if v.startswith('--engine-arg=--hub-managed-claude-context=')]
+            self.assertEqual(len(markers),1)
+            path=Path(markers[0].split('=',2)[2]);context=json.loads(path.read_text())
+            self.assertEqual(context['account_id'],'claude');self.assertEqual(context['epoch'],4)
+            self.assertEqual(path.stat().st_mode&0o777,0o600)
+            self.assertNotIn('token',repr(context))
+            self.assertNotIn('managed_credential_label',adapter.config['routes']['claude'])
+
+    def test_opt_in_remains_profile_based_with_global_private_homes_enabled(self):
+        from types import SimpleNamespace
+        for private in (False,True):
+            with self.subTest(private=private), tempfile.TemporaryDirectory(dir=os.environ['TMPDIR']) as temporary:
+                workspace=Path(temporary);journal=SimpleNamespace(directory=workspace/'journal')
+                journal.directory.mkdir(mode=0o700)
+                captured=[]
+                def runner(argv,**kwargs):
+                    self.assertNotIn('CLAUDE_CODE_OAUTH_TOKEN',kwargs['env'])
+                    self.assertNotIn('ANTHROPIC_CUSTOM_KEY',kwargs['env'])
+                    self.assertNotIn('HUB2_TOKEN',kwargs['env'])
+                    child=argv[argv.index('--')+1:];captured.append(child)
+                    return subprocess.CompletedProcess(argv,0,json.dumps({'id':'11111111-2222-4333-8444-555555555555',
+                        'tag':'task-hub2-managed','workspace':str(workspace),'command':child}), '')
+                adapter=nl.NativeLauncher({'private_provider_homes':private,'routes':{'claude':{'provider':'claude','engine':'claude'}}},
+                                         runner=runner,journal=journal,aplexer='synthetic-a')
+                spec={'workspace':str(workspace),'operation_id':'op-managed:0','session_id':'managed','epoch':4,
+                      'timeout_seconds':1800,'model':'opus','engine':'claude','effort':'medium','prompt':'real task',
+                      'interactive':False,'runtime_deadline':int(time.time()*1000)+60000,'request_digest':'b'*64,
+                      'account_id':'claude','machine_id':'host','client':SimpleNamespace(base_url='https://hub.test'),
+                      'managed_credential_label':'hub-claude'}
+                with mock.patch.object(adapter,'managed_claude_readiness',return_value={'sha256':'a'*64}), mock.patch.dict(
+                        os.environ,{'CLAUDE_CODE_OAUTH_TOKEN':'synthetic-secret','ANTHROPIC_CUSTOM_KEY':'synthetic-secret','HUB2_TOKEN':'synthetic-host'}):
+                    receipt=adapter.launch('hub2-managed',spec)
+                self.assertEqual(receipt['session_id'],'11111111-2222-4333-8444-555555555555')
+                self.assertEqual(captured[0][:3],['synthetic-a','task','run'])
+                self.assertEqual(captured[0][captured[0].index('--profile')+1],'hub-hub-claude')
+                self.assertIn('--engine-arg=opus',captured[0])
+                self.assertNotIn('provider_home',spec)

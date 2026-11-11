@@ -445,17 +445,26 @@ export class ProjectDO {
     const continuationOf = actor?.id === COMPLETION_ACTOR && typeof body.continuation_of === 'string' ? body.continuation_of : undefined;
     const withGoal = body.with_goal === undefined ? false : body.with_goal;
     if (typeof withGoal !== 'boolean') return error('invalid_with_goal', 400);
+    const managedLabel=body.managed_credential_label;
+    if(managedLabel!==undefined){
+      if(!hasScope(actor,'operator:admin'))return error('forbidden',403);
+      if(managedLabel!=='hub-claude'||engineInput!=='claude'||modelInput!=='opus'||effortInput!=='medium'
+        ||interactive||withGoal)return error('invalid_managed_credential_route',400);
+    }
     if (withGoal&&typeof engineInput==='string'&&engineInput.toLowerCase()==='shell') return error('goal_unavailable', 409);
     const capabilities = body.required_capabilities === undefined ? [] : body.required_capabilities;
     if (!Array.isArray(capabilities) || capabilities.length > 32
       || capabilities.some(value => typeof value !== 'string' || value.length < 1 || value.length > 80)) return error('invalid_required_capabilities', 400);
-    const requiredCapabilities = [...new Set(capabilities as string[])].sort();
+    const requiredCapabilities = [...new Set([...(capabilities as string[]),
+      ...(managedLabel!==undefined?['managed:hub-claude:opus:medium:v1']:[])])].sort();
+    if(requiredCapabilities.length>32)return error('invalid_required_capabilities',400);
     const overrideReason = typeof reasonInput === 'string' ? reasonInput.trim() : undefined;
     const requestedRoute = {
       machine_id: machineInput ?? null, engine: engineInput ?? null, model: modelInput ?? null,
       effort: effortInput ?? null, override_reason: overrideReason ?? null,
       required_capabilities: requiredCapabilities, with_goal: withGoal,
       ...(purpose !== 'implement' ? { purpose } : {}),
+      ...(managedLabel!==undefined?{managed_credential_label:managedLabel}:{}),
     };
     const digest = await sha256Hex(JSON.stringify({
       intake_id: intakeId, criteria, workspace, prompt, interactive,with_goal:withGoal, timeout_seconds: Number(timeoutSeconds), route: requestedRoute,
@@ -519,8 +528,21 @@ export class ProjectDO {
           ...(typeof body.tier === 'string' ? { tier: body.tier } : {}),
           ...(overrideReason ? { override_reason: overrideReason } : {}),
           interactive, purpose, with_goal: withGoal, required_capabilities: requiredCapabilities, workspace,
+          ...(managedLabel!==undefined?{managed_credential_label:'hub-claude' as const}:{}),
         }, {project_id:intake.project,operation_id:operationId,attempt:0});
       route=picked.route;diagnostics=picked.diagnostics;
+    }
+    if(managedLabel!==undefined){
+      if(route.engine!=='claude'||route.model!=='opus'||route.effort!=='medium'||route.account_id!=='claude')
+        return error('invalid_managed_credential_route',400);
+      // General picker capabilities are preferences. This explicit delivery
+      // contract cannot fall back to a host that silently drops the selector.
+      const response=await this.env.MACHINES.get(this.env.MACHINES.idFromName(route.machine_id)).fetch(
+        'https://machine.internal/_internal/routing',{headers:{'x-hub2-actor':JSON.stringify(actor)}});
+      if(!response.ok)return error('managed_exec_unavailable',503);
+      const host=await response.json() as JsonRecord;
+      if(host.connected!==true||!Array.isArray(host.capabilities)||!host.capabilities.includes('managed:hub-claude:opus:medium:v1'))
+        return error('managed_exec_unavailable',409);
     }
     const picker=buildStartPickerEvidence(route,diagnostics);
     const raced = this.idempotent(scope, key, digest);
@@ -537,6 +559,7 @@ export class ProjectDO {
       workspace, engine: route.engine, model: route.model, ...(route.effort ? { effort: route.effort } : {}),
       prompt, interactive, purpose, with_goal:withGoal, timeout_seconds: Number(timeoutSeconds), start_deadline_at: Date.now()+120_000,
       ...(route.engine.toLowerCase() === 'shell' ? { shell_reason: overrideReason } : {}),
+      ...(managedLabel!==undefined?{managed_credential_label:managedLabel}:{}),
     };
     let contractOmitted = false;
     if (completionControlled) {
@@ -949,6 +972,8 @@ export class ProjectDO {
       await this.scheduleNext();
       return json({fallback:false,reason:'all_model_routes_auth_failed'});
     };
+    if((this.parse(saga.launch_spec_json) as JsonRecord)?.managed_credential_label!==undefined)
+      return await fail('managed_credential_auth_failed');
     if(saga.attempt>=1)return await fail('model_attempts_exhausted');
     if(!route||route.override_reason!==null)return await fail('explicit_route_auth_failed');
     let next:PickedRoute;
@@ -1287,6 +1312,7 @@ export class ProjectDO {
       const body:JsonRecord={key:action.key,workspace:boundWorkspace(launch,this.workspaceBinding(saga)),machine_id:saga.machine_id,engine:launch.engine,model:launch.model,
         ...(typeof launch.effort==='string'?{effort:launch.effort}:{}),interactive:launch.interactive===true,with_goal:launch.with_goal===true,
         purpose:launch.purpose??'implement',override_reason:'hub_completion_continuation',continuation_of:record.session_id,
+        ...(launch.managed_credential_label!==undefined?{managed_credential_label:launch.managed_credential_label}:{}),
         ...(Array.isArray(route?.required_capabilities)?{required_capabilities:route!.required_capabilities}:{}),
         // A session killed at its deadline gets more time, within the start limit.
         timeout_seconds:record.reason==='deadline_exceeded'?Math.min(7200,timeout*2):timeout,
@@ -1481,6 +1507,7 @@ export class ProjectDO {
       ...(() => {
         const launch = this.parse(saga.launch_spec_json) as JsonRecord | null;
         return launch ? { engine: launch.engine, model: launch.model, effort: launch.effort ?? null,
+          ...(launch.managed_credential_label?{managed_credential_label:launch.managed_credential_label}:{}),
           workspace:boundWorkspace(launch,this.workspaceBinding(saga)),requested_workspace:launch.workspace,
           route: [launch.engine, launch.model, launch.effort ?? 'default'].join('/') } : {};
       })(),
