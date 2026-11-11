@@ -80,6 +80,10 @@ def provision(client, offer, launch, directory, routes, runner=None):
     claude_bundle = None
     latest = None
     if provider == 'claude':
+        # The managed sync label is bound to AccountDO claude, regardless of
+        # which other Claude accounts the registry may contain.
+        if account != 'claude':
+            raise RuntimeError('provider_claude_account_mismatch')
         claude_bundle, latest = _claude_sync_bundle(client)
         bundle = {'generation': claude_bundle['credential_generation'], 'files': claude_bundle['files']}
         try:

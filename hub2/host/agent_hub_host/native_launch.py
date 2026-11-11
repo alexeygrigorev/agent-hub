@@ -45,6 +45,24 @@ LOCAL_ROUTES = {
 }
 
 
+def provider_credential_source(configuration, provider):
+    """Resolve a provider's explicit source, preserving the legacy global default."""
+    overrides = configuration.get('provider_credential_sources', {})
+    if (not isinstance(overrides, dict)
+            or any(key not in PROVIDER_BINARIES or value not in ('local', 'central')
+                   for key, value in overrides.items())):
+        raise ValueError('invalid_provider_credential_sources')
+    if provider == 'shell':
+        return 'local'
+    return overrides.get(provider, 'central' if configuration.get('private_provider_homes', False) else 'local')
+
+
+def unsupported_central_provider(configuration, provider):
+    # Legacy True retains its original availability behavior. Only an explicit
+    # unsupported enrollment must disappear from advertised routes.
+    return provider == 'antigravity' and configuration.get('provider_credential_sources', {}).get(provider) == 'central'
+
+
 def native_returncode(value):
     if not isinstance(value, dict):
         return None
@@ -423,11 +441,16 @@ class NativeLauncher:
 
     def __init__(self, configuration, runner=subprocess.run, aplexer="a", journal=None):
         self.config = {**configuration}
-        if not self.config.get("private_provider_homes", False):
-            self.config["routes"] = {**LOCAL_ROUTES, **{
-                engine: {**LOCAL_ROUTES.get(engine, LOCAL_ROUTES.get(route.get("provider"), {})), **route}
-                for engine, route in configuration.get("routes", {}).items()
-            }}
+        local_routes = {engine: dict(route) for engine, route in LOCAL_ROUTES.items()
+                        if provider_credential_source(self.config, route['provider']) == 'local'}
+        explicit_central_routes = {provider: {'provider': provider}
+                                   for provider, source in self.config.get('provider_credential_sources', {}).items()
+                                   if source == 'central'}
+        self.config['routes'] = {**local_routes, **explicit_central_routes, **{
+            engine: {**(LOCAL_ROUTES.get(engine, LOCAL_ROUTES.get(route.get('provider'), {}))
+                        if provider_credential_source(self.config, route.get('provider')) == 'local' else {}), **route}
+            for engine, route in configuration.get('routes', {}).items()
+        }}
         self.config.setdefault("routes", {})["shell"] = {"provider": "shell"}
         self.runner, self.journal = runner, journal
         self.native_binary = self.config.get("aplexer") or aplexer
@@ -528,9 +551,12 @@ class NativeLauncher:
         result = {"shell": {"headless"}}
         for engine, route in self.config.get("routes", {}).items():
             provider = route.get("provider") if isinstance(route, dict) else None
+            source = provider_credential_source(self.config, provider)
+            if unsupported_central_provider(self.config, provider):
+                continue
             supported = PROVIDER_CAPABILITIES.get(provider, set())
             available = bool(shutil.which(PROVIDER_BINARIES.get(provider, "")))
-            if self.config.get('private_provider_homes') and provider == 'claude':
+            if source == 'central' and provider == 'claude':
                 available = provider_home.claude_install_available()
             if supported and available:
                 result[engine] = set(supported)
@@ -541,6 +567,9 @@ class NativeLauncher:
         if not isinstance(route, dict) or route.get("provider") not in PROVIDER_CAPABILITIES:
             raise RuntimeError("native_launch_route_missing")
         provider = route["provider"]
+        source = provider_credential_source(self.config, provider)
+        if unsupported_central_provider(self.config, provider):
+            raise RuntimeError('provider_central_unsupported')
         # Mode/effort/goal capability gating already happened in the Bridge's
         # validate_launch against the same capability table.
         workspace = Path(specification["workspace"])
@@ -553,7 +582,7 @@ class NativeLauncher:
             goal += FIRST_ACTION_INSTRUCTION.format(path=fa_path)
         if provider != 'shell':
             goal = aplexer_prompt(goal)
-        local = provider == 'shell' or (not self.config.get("private_provider_homes", False) and not specification.get("interactive"))
+        local = provider == 'shell' or (source == 'local' and not specification.get("interactive"))
         if local:
             child = self.profile_command(task_id, specification, route, goal)
         else:

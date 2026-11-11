@@ -127,7 +127,7 @@ class Bridge:
         # The Hub picks a route; the host spawns it directly through aplexer.
         # The external launcher runtime is not consulted for admission or spawn.
         self.launcher = NativeLauncher(launcher_config or {}, runner, aplexer=executable, journal=journal)
-        if not self.launcher.config.get('private_provider_homes'):
+        if native_launch.provider_credential_source(self.launcher.config, 'antigravity') == 'local':
             self.engines.add('antigravity')
         self._session_locks = {}
         self._inflight = set()
@@ -317,7 +317,8 @@ class Bridge:
             task_id, tag = "hub2-" + session, "task-hub2-" + session
             launch['worker_context']={key:offer[key] for key in ('session_id','epoch','intake_id','project_id')}
             launch['worker_context']['machine_id']=self.machine_id
-            if launch['engine']!='shell' and self.launcher.config.get('private_provider_homes', False):
+            provider = self.launcher.config.get('routes', {}).get(launch['engine'], {}).get('provider')
+            if launch['engine']!='shell' and native_launch.provider_credential_source(self.launcher.config, provider) == 'central':
                 from .providers import provision
                 launch['provider_home']=provision(self.client,offer,launch,self.journal.directory,self.launcher.config.get('routes'))
             if acknowledge:
@@ -806,17 +807,19 @@ class Bridge:
         engines=sorted(engine for engine in self.engines.intersection(available) if available[engine])
         capabilities=['headless']+[cap+':'+engine for engine in engines for cap in sorted(available[engine]-{'headless'})]
         configuration = getattr(self.launcher, 'config', {})
-        if not configuration.get('private_provider_homes', False):
-            # Execution-source hints only, never login/account health proof.
-            # Custom routes cannot inherit a canonical account association.
-            accounts = {'codex': 'codex', 'claude': 'claude', 'go': 'shared-go',
-                        'zai': 'zai-central', 'antigravity': 'gemini'}
-            for engine in engines:
-                if engine not in accounts or configuration.get('routes', {}).get(engine) != LOCAL_ROUTES[engine]:
-                    continue
-                for mode in ('headless', 'interactive'):
-                    if mode in available[engine]:
-                        capabilities.append('credentials:local:' + mode + ':' + engine + ':' + accounts[engine])
+        # Execution-source hints only, never login/account health proof.
+        # Custom routes cannot inherit a canonical account association.
+        accounts = {'codex': 'codex', 'claude': 'claude', 'go': 'shared-go',
+                    'zai': 'zai-central', 'antigravity': 'gemini'}
+        for engine in engines:
+            provider = configuration.get('routes', {}).get(engine, {}).get('provider')
+            if native_launch.provider_credential_source(configuration, provider) != 'local':
+                continue
+            if engine not in accounts or configuration.get('routes', {}).get(engine) != LOCAL_ROUTES[engine]:
+                continue
+            for mode in ('headless', 'interactive'):
+                if mode in available[engine]:
+                    capabilities.append('credentials:local:' + mode + ':' + engine + ':' + accounts[engine])
         capabilities = capabilities[:32]
         if include_native_sessions:
             self.client.heartbeat(labels,engines,capabilities,native_sessions=self.live_sessions())

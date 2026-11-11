@@ -368,6 +368,99 @@ class TombstoneTest(unittest.TestCase):
 
 
 class CapabilityTest(unittest.TestCase):
+    def test_source_and_mode_keep_local_profile_and_direct_command_shapes(self):
+        cases = [({}, False), ({'private_provider_homes': True}, True),
+                 ({'provider_credential_sources': {'claude': 'central', 'go': 'central'}}, None),
+                 ({'private_provider_homes': True, 'provider_credential_sources': {'antigravity': 'local'}}, None)]
+        for configuration, legacy_central in cases:
+            for provider in ('codex', 'zai', 'claude', 'go', 'antigravity'):
+                for interactive in (False, True):
+                    with self.subTest(configuration=configuration, provider=provider, interactive=interactive), \
+                         tempfile.TemporaryDirectory() as workspace:
+                        runner = mock.Mock(side_effect=OSError('synthetic dispatch refusal'))
+                        adapter = nl.NativeLauncher({**configuration, 'routes': {provider: {'provider': provider}}}, runner)
+                        central = nl.provider_credential_source(configuration, provider) == 'central'
+                        if legacy_central is not None:
+                            self.assertEqual(central, legacy_central)
+                        model = nl.OPENCODE_MODEL if provider == 'go' else 'test-model'
+                        spec = {'engine': provider, 'workspace': workspace, 'model': model, 'prompt': 'test',
+                                'interactive': interactive, 'timeout_seconds': 600}
+                        if central:
+                            spec.update(provider_home='synthetic-home', client=mock.Mock(), session_id='s', operation_id='o', epoch=1)
+                        with mock.patch.object(nl, 'session_binding', return_value={
+                                'runtime_deadline': int(time.time() * 1000) + 500000,
+                                'engine_binary_path': '/managed/claude'}), \
+                             mock.patch.object(nl, 'native_environment', return_value={'HOME': '/scoped/home'}):
+                            with self.assertRaisesRegex(RuntimeError, 'native_start_refused'):
+                                adapter.launch('shape-test', spec)
+                        argv = runner.call_args.args[0]
+                        child = argv[argv.index('--') + 1:]
+                        if not central and not interactive:
+                            self.assertEqual(child[:3], ['a', 'task', 'run'])
+                            selector = nl.LOCAL_ROUTES[provider].get('profile')
+                            if selector:
+                                self.assertEqual(child[child.index('--profile') + 1], selector)
+                        else:
+                            self.assertNotIn('task', child)
+                            self.assertEqual(nl.native_command_model(child), model)
+                        self.assertEqual('HOME=/scoped/home' in argv, central)
+
+    def test_credential_source_validation_and_legacy_defaults(self):
+        for legacy in (False, True):
+            for provider in nl.PROVIDER_BINARIES:
+                self.assertEqual(nl.provider_credential_source({'private_provider_homes': legacy}, provider),
+                                 'central' if legacy else 'local')
+            self.assertEqual(nl.provider_credential_source({'private_provider_homes': legacy}, 'shell'), 'local')
+        for invalid in (None, [], 'central', {'go': True}, {'go': 'CENTRAL'}, {'shared-go': 'central'}, {'shell': 'central'}):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, 'invalid_provider_credential_sources'):
+                nl.NativeLauncher({'provider_credential_sources': invalid})
+        self.assertEqual(nl.NativeLauncher({}).config['routes'], {**nl.LOCAL_ROUTES, 'shell': {'provider': 'shell'}})
+        self.assertEqual(nl.NativeLauncher({'private_provider_homes': True}).config['routes'], {'shell': {'provider': 'shell'}})
+
+    def test_explicit_local_claude_uses_local_binary_availability(self):
+        config = {'private_provider_homes': True, 'provider_credential_sources': {'claude': 'local'}}
+        with mock.patch.object(nl.provider_home, 'claude_install_available') as managed, \
+             mock.patch.object(nl.shutil, 'which', return_value=None):
+            adapter = nl.NativeLauncher(config)
+            self.assertNotIn('claude', adapter.capabilities())
+            managed.assert_not_called()
+        with mock.patch.object(nl.shutil, 'which', return_value='/bin/claude'):
+            self.assertEqual(adapter.capabilities()['claude'], nl.PROVIDER_CAPABILITIES['claude'])
+
+    def test_mixed_route_defaults_and_capabilities_follow_provider_source(self):
+        default_mixed = nl.NativeLauncher({'provider_credential_sources': {'claude': 'central', 'go': 'central'}})
+        for provider in ('claude', 'go'):
+            self.assertEqual(default_mixed.config['routes'][provider], {'provider': provider})
+        for provider in ('codex', 'zai', 'antigravity'):
+            self.assertEqual(default_mixed.config['routes'][provider], nl.LOCAL_ROUTES[provider])
+        for legacy in (False, True):
+            config = {'private_provider_homes': legacy,
+                      'provider_credential_sources': {'antigravity': 'local', 'claude': 'central', 'go': 'central'},
+                      'routes': {'claude': {'provider': 'claude'}, 'go': {'provider': 'go'},
+                                 'another-claude': {'provider': 'claude'}}}
+            with mock.patch.object(nl.shutil, 'which', side_effect=lambda b: '/bin/' + b if b != 'claude' else None), \
+                 mock.patch.object(nl.provider_home, 'claude_install_available', return_value=True):
+                adapter = nl.NativeLauncher(config)
+                caps = adapter.capabilities()
+            self.assertEqual(adapter.config['routes']['antigravity'], nl.LOCAL_ROUTES['antigravity'])
+            self.assertEqual(adapter.config['routes']['go'], {'provider': 'go'})
+            self.assertEqual(caps['antigravity'], nl.PROVIDER_CAPABILITIES['antigravity'])
+            self.assertEqual(caps['another-claude'], nl.PROVIDER_CAPABILITIES['claude'])
+            self.assertIn('go', caps)
+            self.assertEqual(config['routes']['go'], {'provider': 'go'})
+
+    def test_explicit_central_antigravity_not_available_or_launchable(self):
+        config = {'private_provider_homes': True, 'routes': {'antigravity': {'provider': 'antigravity'}}}
+        with mock.patch.object(nl.shutil, 'which', return_value='/bin/agy'):
+            self.assertIn('antigravity', nl.NativeLauncher(config).capabilities())
+            config['provider_credential_sources'] = {'antigravity': 'central'}
+            runner = mock.Mock()
+            adapter = nl.NativeLauncher(config, runner)
+            self.assertNotIn('antigravity', adapter.capabilities())
+            with self.assertRaisesRegex(RuntimeError, 'provider_central_unsupported'):
+                adapter.launch('unsupported', {'engine': 'antigravity'})
+            runner.assert_not_called()
+
     def test_capabilities_follow_provider_and_binary_presence(self):
         config = {'routes': {'codex': {'provider': 'zai'}, 'opencode': {'provider': 'go'},
                              'claude': {'provider': 'claude'}, 'shell': {'provider': 'shell'}}}
