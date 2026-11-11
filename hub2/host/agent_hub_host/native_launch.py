@@ -10,6 +10,8 @@ import os
 import re
 import shutil
 import subprocess
+import stat
+import sys
 import time
 from pathlib import Path
 
@@ -640,11 +642,78 @@ class NativeLauncher:
                 result[engine] = set(supported)
         return result
 
+    def managed_claude_readiness(self, release=None):
+        """Exact installed release and actual profile code; no credential probe."""
+        if os.name != 'posix':
+            return None
+        try:
+            if release is None:
+                from ._release import HOST_VERSION
+                base = Path.home() / '.local/share/agent-hub2'
+                release = base / 'releases' / HOST_VERSION
+                if (base / 'current').resolve(strict=True) != release:
+                    return None
+            release = Path(release)
+            info = release.lstat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
+                return None
+            def read(path, limit):
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                with os.fdopen(fd, 'rb') as stream:
+                    meta = os.fstat(stream.fileno())
+                    if (not stat.S_ISREG(meta.st_mode) or meta.st_uid != os.geteuid() or meta.st_nlink != 1
+                            or meta.st_mode & 0o022 or meta.st_size > limit):
+                        raise ValueError('managed_exec_unavailable')
+                    raw = stream.read(limit+1)
+                    if len(raw) > limit:
+                        raise ValueError('managed_exec_unavailable')
+                    return raw
+            receipt = json.loads(read(release / 'release.json', 65536))
+            if receipt.get('host_version') != release.name or not re.fullmatch('[0-9a-f]{40}', release.name):
+                return None
+            record = receipt['artifacts']['hub.pyz']
+            archive = release / 'hub.pyz'
+            raw = read(archive, 16777216)
+            digest = hashlib.sha256(raw).hexdigest()
+            if type(record['size']) is not int or record['size'] != len(raw) or record['sha256'] != digest:
+                return None
+            python = release / 'bin/python'
+            if not python.is_file():
+                return None
+            # -I -S prevents user-site startup; import only the verified bundled
+            # CLI, never this daemon's duplicate package or CLI main/network.
+            code = ('import sys,json; sys.path.insert(0,sys.argv[1]); '
+                    'from agent_hub_host.provisioning import managed_exec_readiness; '
+                    'print(json.dumps(managed_exec_readiness(sys.argv[1])))')
+            result = self.runner([str(python), '-I', '-S', '-c', code, str(archive)],
+                capture_output=True, text=True, check=False, timeout=3,
+                env=spawn_environment(True))
+            if result.returncode or len(result.stdout) > 1024:
+                return None
+            proof = json.loads(result.stdout)
+            if proof != {'protocol': 'hub2-managed-claude-exec-v1', 'label': 'hub-claude', 'profile': 'hub-hub-claude'}:
+                return None
+            # Repeat the archive check after the helper; immutable owner release
+            # storage is the existing installer trust boundary.
+            if hashlib.sha256(read(archive, 16777216)).hexdigest() != digest:
+                return None
+            return dict(proof, archive=str(archive), sha256=digest)
+        except (OSError, ValueError, TypeError, KeyError, ImportError, subprocess.SubprocessError):
+            return None
+
     def launch(self, task_id, specification):
         route = self.config.get("routes", {}).get(specification["engine"])
         if not isinstance(route, dict) or route.get("provider") not in PROVIDER_CAPABILITIES:
             raise RuntimeError("native_launch_route_missing")
         provider = route["provider"]
+        if specification.get('managed_credential_label') is not None:
+            if (specification['managed_credential_label'] != 'hub-claude' or specification['engine'] != 'claude'
+                    or provider != 'claude' or specification.get('model') != 'opus'
+                    or specification.get('effort') != 'medium' or specification.get('interactive')
+                    or specification.get('with_goal') or specification.get('account_id') != 'claude'
+                    or not self.managed_claude_readiness()):
+                raise RuntimeError('managed_exec_unavailable')
+            route = {'provider': 'claude', 'profile': 'hub-hub-claude'}
         # Mode/effort/goal capability gating already happened in the Bridge's
         # validate_launch against the same capability table.
         workspace = Path(specification["workspace"])
@@ -657,7 +726,7 @@ class NativeLauncher:
             goal += FIRST_ACTION_INSTRUCTION.format(path=fa_path)
         if provider != 'shell':
             goal = aplexer_prompt(goal)
-        local = provider == 'shell' or (not self.config.get("private_provider_homes", False) and not specification.get("interactive"))
+        local = provider == 'shell' or bool(specification.get('managed_credential_label')) or (not self.config.get("private_provider_homes", False) and not specification.get("interactive"))
         if local:
             child = self.profile_command(task_id, specification, route, goal)
         else:
@@ -811,6 +880,23 @@ class NativeLauncher:
         args += HEADLESS_OUTPUT_FLAGS.get(provider, ())
         if provider == 'go':
             args += ['--format', 'json']
+        if specification.get('managed_credential_label'):
+            if self.journal is None:
+                raise RuntimeError('managed_exec_unavailable')
+            from .client import save_config
+            ready = self.managed_claude_readiness()
+            if not ready:
+                raise RuntimeError('managed_exec_unavailable')
+            context = {key: specification[key] for key in ('engine', 'model', 'effort', 'session_id',
+                       'operation_id', 'epoch', 'workspace', 'runtime_deadline', 'request_digest', 'account_id', 'machine_id')}
+            context.update(protocol='hub2-managed-claude-exec-v1', label='hub-claude',
+                           profile='hub-hub-claude', task_id=task_id, server=specification['client'].base_url,
+                           exec_archive_sha256=ready['sha256'])
+            token = hashlib.sha256(canonical(context).encode()).hexdigest()
+            path = self.journal.directory / 'managed-claude' / (token + '.json')
+            save_config(path, context)
+            specification['_managed_exec_context'] = str(path)
+            args.append('--hub-managed-claude-context=' + str(path))
         effort = specification.get('effort')
         if effort is not None:
             args += headless_effort_argv(provider, ['prompt'], effort)[:-1]
@@ -883,7 +969,8 @@ class NativeLauncher:
                         "interactive": bool(specification.get("interactive")),
                         "effort": specification.get("effort"), "with_goal": bool(specification.get("with_goal")),
                         "goal_registration": receipt.get("goal_registration"),
-                        "task_output": specification.get("_task_output")}
+                        "task_output": specification.get("_task_output"),
+                        "managed_exec_context": specification.get("_managed_exec_context")}
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0), 0o600)
             with os.fdopen(fd, 'w', encoding='utf8') as stream:
                 stream.write(json.dumps(evidence))

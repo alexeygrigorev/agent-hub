@@ -1,6 +1,7 @@
 """Managed engine installation. No credentials in argv, profile TOML, logs or receipts."""
 from __future__ import annotations
 import contextlib
+import hashlib
 import datetime as dt
 import json
 import uuid
@@ -2813,7 +2814,7 @@ def managed_codex_effort_args(bundle, extra_argv):
     return ['-c', 'model_reasoning_effort=' + json.dumps(effort)] if effort else []
 
 
-def managed_claude_route_args(bundle, bypass_flags, extra_argv):
+def managed_claude_route_args(bundle, bypass_flags, extra_argv, *, managed=None):
     """Force managed Claude invocations to a Hub Sonnet or explicit Fable route.
 
     Bundle and session argv can both contain old model/effort defaults. Remove
@@ -2848,7 +2849,7 @@ def managed_claude_route_args(bundle, bypass_flags, extra_argv):
 
     model = (requested_model(extra_argv) or requested_model(bypass_flags or [])
              or requested_model(bundle.get('args') or []) or 'sonnet')
-    if model not in ('sonnet', 'fable', 'claude-fable-5-2'):
+    if model not in ('sonnet', 'fable', 'claude-fable-5-2') and not (managed and model == 'opus'):
         raise ValueError('Claude routes allow Sonnet or explicitly requested Fable')
 
     def strip_route_flags(args):
@@ -2890,10 +2891,136 @@ def normalize_engine_argv(argv):
     return argv
 
 
+# Versioned code support, not credential-health or account-approval evidence.
+MANAGED_CLAUDE_PROTOCOL = 'hub2-managed-claude-exec-v1'
+MANAGED_CONTEXT_FLAG = '--hub-managed-claude-context='
+
+
+def managed_exec_readiness(archive):
+    """Read-only exact-profile readiness; never install, sync or inspect tokens."""
+    archive = Path(archive).resolve(strict=True)
+    if not archive.is_file() or not zipfile.is_zipfile(archive):
+        raise ValueError('managed_exec_unavailable')
+    document = tomllib.loads(private_fs.read_bytes(profile_path(), 262144).decode('utf8'))
+    profiles = document.get('profiles')
+    profile = profiles.get('hub-hub-claude') if isinstance(profiles, dict) else None
+    # Compare semantic TOML and the entire generated argv, including interpreter,
+    # import order, fixed managed root and handler. Unknown is never current.
+    previous = sys.argv[0]
+    try:
+        sys.argv[0] = str(archive)
+        expected = module_command('execute', 'hub-claude')
+    finally:
+        sys.argv[0] = previous
+    if (not isinstance(profile, dict) or set(profile) != {'engine', 'command'}
+            or profile['engine'] != 'claude' or profile['command'] != expected
+            or str(archive) not in expected[2]):
+        raise ValueError('managed_exec_unavailable')
+    return {'protocol': MANAGED_CLAUDE_PROTOCOL, 'label': 'hub-claude', 'profile': 'hub-hub-claude'}
+
+
+def managed_claude_context(extra_argv):
+    """Consume one private attempt record; this is never a general argv escape."""
+    markers = [v for v in extra_argv if v.startswith(MANAGED_CONTEXT_FLAG)]
+    if not markers:
+        return None, extra_argv
+    if len(markers) != 1:
+        raise ValueError('managed_exec_binding_invalid')
+    path = Path(markers[0][len(MANAGED_CONTEXT_FLAG):])
+    if not path.is_absolute():
+        raise ValueError('managed_exec_binding_invalid')
+    context = json.loads(private_fs.read_bytes(path, 16384))
+    required = {'protocol', 'label', 'profile', 'account_id', 'engine', 'model', 'effort', 'session_id',
+                'operation_id', 'epoch', 'workspace', 'task_id', 'server', 'runtime_deadline', 'request_digest',
+                'machine_id', 'exec_archive_sha256'}
+    if (not isinstance(context, dict) or set(context) != required
+            or context['protocol'] != MANAGED_CLAUDE_PROTOCOL or context['label'] != 'hub-claude'
+            or context['profile'] != 'hub-hub-claude' or context['account_id'] != 'claude'
+            or context['engine'] != 'claude' or context['model'] != 'opus' or context['effort'] != 'medium'
+            or type(context['epoch']) is not int or context['epoch'] < 1
+            or not all(isinstance(context[k], str) and re.fullmatch(r'[A-Za-z0-9_.:-]{1,120}', context[k])
+                       for k in ('session_id', 'operation_id', 'task_id', 'machine_id'))
+            or context['task_id'] != 'hub2-' + context['session_id']
+            or not isinstance(context['request_digest'], str) or not re.fullmatch('[0-9a-f]{64}', context['request_digest'])
+            or not isinstance(context['workspace'], str) or Path(context['workspace']).resolve() != Path.cwd().resolve()
+            or type(context['runtime_deadline']) is not int or context['runtime_deadline'] <= time.time()*1000):
+        raise ValueError('managed_exec_binding_invalid')
+    archive = Path(__file__).resolve().parents[1]
+    managed_exec_readiness(archive)
+    archive_digest = hashlib.sha256(private_fs.read_bytes(archive, 16777216, private=False)).hexdigest()
+    if context['exec_archive_sha256'] != archive_digest:
+        raise ValueError('managed_exec_binding_invalid')
+    context = dict(context, _path=path)
+    return context, [v for v in extra_argv if not v.startswith(MANAGED_CONTEXT_FLAG)]
+
+
+def managed_claude_materialize(context, bundle, home, dest, request):
+    """Fresh materialization and normal generation ACK, with no refresh owner."""
+    outcome = refresh_launch_credential('hub-claude', bundle, home, dest, request)
+    if (not isinstance(outcome, dict) or outcome.get('status') not in ('in_step', 'materialized', 'written_back', 'adopted_hub')
+            or type(outcome.get('generation')) is not int or outcome['generation'] < 0):
+        raise ValueError('managed_credential_unverified')
+    generation = outcome['generation']
+    # Do not use report_sync's best-effort cache. A concurrent rotation must
+    # reject this exact materialization rather than acknowledge another version.
+    report = request('POST', '/api/engines/sync-report', {'state': 'synced', 'items': [{
+        'label': 'hub-claude', 'revision': bundle['revision'], 'state': 'installed',
+        'credential_generation': generation}]})
+    if not isinstance(report, dict) or report.get('status') != 'recorded':
+        raise ValueError('managed_generation_ack_unverified')
+    return generation
+
+
+def managed_claude_receipt(context, generation, bundle):
+    """Bind proof to the actual native parent, never merely to a managed flag."""
+    result = subprocess.run(['a', 'whoami', '--json'], capture_output=True, text=True, timeout=5, check=False)
+    if result.returncode or len(result.stdout.encode('utf8')) > 65536:
+        raise ValueError('managed_native_identity_unverified')
+    row = json.loads(result.stdout)
+    if (not isinstance(row, dict) or not isinstance(row.get('id'), str)
+            or not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', row['id'])
+            or row.get('phase') != 'running'
+            or row.get('tag') != 'task-' + context['task_id']
+            or row.get('workspace') != context['workspace']
+            or type(row.get('created_at_ms')) is not int or not 0 < row['created_at_ms'] <= time.time()*1000+5000
+            or context['runtime_deadline'] <= time.time()*1000):
+        raise ValueError('managed_native_identity_unverified')
+    command = row.get('command')
+    if (not isinstance(command, list) or command.count('--profile') != 1
+            or command[command.index('--profile')+1:command.index('--profile')+2] != ['hub-hub-claude']
+            or '--engine-arg='+MANAGED_CONTEXT_FLAG+str(context['_path']) not in command):
+        raise ValueError('managed_native_identity_unverified')
+    receipt = {k: v for k, v in context.items() if k not in ('_path', 'server', 'runtime_deadline')}
+    receipt.update(stage='ready_to_exec', native_id=row['id'], tag=row['tag'], created_at_ms=row['created_at_ms'],
+                   credential_generation=generation, revision=bundle['revision'], observed_at_ms=int(time.time()*1000))
+    path = context['_path'].with_suffix('.receipt.json')
+    private_fs.atomic_write(path, json.dumps(receipt).encode('utf8'), 16384)
+
+
 def execute():
+    # Only this explicit adapter mode adds a structured failure receipt. Legacy
+    # managed execution keeps its existing errors and admission behavior.
+    selected = any(isinstance(arg, str) and arg.startswith(MANAGED_CONTEXT_FLAG) for arg in sys.argv[2:])
+    try:
+        return _execute()
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError, subprocess.SubprocessError) as caught:
+        if not selected:
+            raise
+        allowed = {'managed_exec_binding_invalid', 'managed_credential_unverified', 'managed_generation_ack_unverified',
+                   'managed_admission_refused', 'managed_generation_changed', 'managed_native_identity_unverified', 'managed_exec_unavailable'}
+        reason = str(caught) if isinstance(caught, ValueError) and str(caught) in allowed else 'managed_exec_refused'
+        print(json.dumps({'provider': 'claude', 'launch_allowed': False, 'reason': reason}), file=sys.stderr)
+        raise SystemExit(75) from None
+
+
+def _execute():
     # `a task run --engine opencode --profile X` hands over `run <label> ...` (see _posix_engine_launcher).
     sys.argv[:] = normalize_engine_argv(sys.argv)
     label = sys.argv[1]
+    managed, extra = managed_claude_context(list(sys.argv[2:]))
+    if managed and label != 'hub-claude':
+        raise ValueError('managed_exec_binding_invalid')
+    sys.argv[2:] = extra
     if not LABEL.fullmatch(label):
         raise ValueError('Invalid managed label')
     with lock():
@@ -2905,8 +3032,20 @@ def execute():
         b = load_bundle(dest)
         validate(b)
         home = dest / 'home'
+        managed_request = None
+        managed_generation = None
+        if managed:
+            from .native_import_host import bind_managed_claude
+            machine, managed_request = bind_managed_claude(managed['server'])
+            if machine != managed['machine_id']:
+                raise ValueError('managed_exec_binding_invalid')
+            if b.get('provider') != 'claude' or b.get('label') != 'hub-claude' or b.get('env') != {} or b.get('args') != []:
+                raise ValueError('managed_exec_binding_invalid')
         provision_managed_home(b, home, dest)
-        refresh_launch_credential(label, b, home, dest)
+        if managed:
+            managed_generation = managed_claude_materialize(managed, b, home, dest, managed_request)
+        else:
+            refresh_launch_credential(label, b, home, dest)
         cwd = str(Path(os.getcwd()).resolve())
         p = Path(cwd)
         git_root = str(p)
@@ -2918,13 +3057,19 @@ def execute():
         _, binary, _ = PACKAGES[b['provider']]
         command = engine_argv(b, dest)
         env = engine_environment(b, home, dest)
+        if managed:
+            env = {k: v for k, v in env.items() if not k.startswith(('CLAUDE_', 'ANTHROPIC_', 'AWS_'))
+                   and k not in ('HUB2_TOKEN', 'HUB_TOKEN', 'HUB_JOB_TOKEN')}
+            env['CLAUDE_CONFIG_DIR'] = str(home / '.claude')
         extra_argv = list(sys.argv[2:])
         # An admitted per-session model overrides bundle startup defaults.
         from .model_contract import native_model
         requested_model = native_model(extra_argv)
+        if managed and requested_model != 'opus':
+            raise ValueError('managed_exec_binding_invalid')
         if requested_model and b['provider'] != 'go':
             from .model_contract import replace_model_args, policy_models
-            if not managed_model_allowed(b['provider'], requested_model, policy_models()):
+            if not (managed and requested_model == 'opus') and not managed_model_allowed(b['provider'], requested_model, policy_models()):
                 raise ValueError('model_unsupported: managed provider model')
             b = dict(b, args=replace_model_args(b['args'], requested_model)[:-2])
         if b.get('provider') == 'go' and extra_argv and extra_argv[0] == 'run':
@@ -2979,7 +3124,7 @@ def execute():
                         bypass_flags = ['--dangerously-skip-permissions']
             from .codex_interactive import isolated_argv
             if b['provider'] == 'claude' and not is_diagnostic:
-                claude_args = managed_claude_route_args(b, bypass_flags, extra_argv)
+                claude_args = managed_claude_route_args(b, bypass_flags, extra_argv, managed=managed)
                 argv = command + isolated_argv(b['provider'], claude_args)
             else:
                 effort_args = managed_codex_effort_args(b, extra_argv)
@@ -2997,7 +3142,16 @@ def execute():
             print(json.dumps({'provider': b['provider'], 'launch_allowed': False, 'reason': 'not_logged_in'}), file=sys.stderr)
             sys.exit(75)
         if not is_diagnostic:
-            allowed, reason = hub_launch_gate(label)
+            if managed:
+                admission = managed_request('POST', '/api/engines/admission', {'label': 'hub-claude', 'native': True})
+                if not isinstance(admission, dict) or admission.get('launch_allowed') is not True:
+                    raise ValueError('managed_admission_refused')
+                if type(admission.get('credential_generation')) is not int or admission['credential_generation'] != managed_generation:
+                    raise ValueError('managed_generation_changed')
+                allowed, reason = True, 'ok'
+                managed_claude_receipt(managed, managed_generation, b)
+            else:
+                allowed, reason = hub_launch_gate(label)
             if allowed and reason != 'ok':
                 print(json.dumps({'provider': b['provider'], 'quota_warning': reason}), file=sys.stderr)
             if not allowed:

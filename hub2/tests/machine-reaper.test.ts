@@ -1155,3 +1155,44 @@ payload=json.loads(journal.db.execute('SELECT payload FROM outbox').fetchone()[0
   assert(!JSON.stringify(result).includes('synthetic private prompt'));
  }finally{f.database.close();rmSync(directory,{recursive:true});}
 });
+
+test('managed Claude opt-in needs current socket heartbeat, not stale persisted capabilities',async()=>{
+ const f=fixture(),frames:any[]=[];
+ const cap='managed:hub-claude:opus:medium:v1';
+ const makeSocket=(id:string)=>{
+  let attachment:any={machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:Date.now(),connection_id:id};
+  return{readyState:1,deserializeAttachment:()=>attachment,serializeAttachment:(next:any)=>{attachment=next;},
+   send:(raw:string)=>frames.push(JSON.parse(raw)),close(){this.readyState=3;}};
+ };
+ const first=makeSocket('managed-first');f.sockets.push(first);
+ const beat=()=>f.call('/api/heartbeat','POST',{labels:[],engines:['claude'],capabilities:['headless',cap]});
+ assert.equal((await beat()).status,200);
+ const reservation=(id:string,extra:any={})=>f.call('/_internal/reserve','POST',{
+  operation_id:'op-'+id,dispatch_id:'dispatch-'+id,attempt:0,session_id:id,project_id:'project-test',
+  intake_id:'intake-'+id,machine_id:'h1',request_digest:'digest-'+id,title:'managed proof',
+  acceptance_criteria:['proof'],account_id:'claude',launch:{workspace:'/tmp',engine:'claude',model:'opus',
+   effort:'medium',prompt:'do real work',interactive:false,managed_credential_label:'hub-claude',...extra}});
+ const accepted=await reservation('managed-one');assert.equal(accepted.status,201);
+ const epoch=(await accepted.json() as any).epoch;
+ assert.equal((await f.call('/_internal/activate','POST',{operation_id:'op-managed-one',session_id:'managed-one',epoch})).status,201);
+ assert.equal(frames.filter(frame=>frame.type==='session.offer').length,1);
+ // Rollback/reconnect has no capability observation even though DB still has it.
+ f.sockets.splice(0);const old=makeSocket('old-host');f.sockets.push(old);frames.length=0;
+ assert.equal((await reservation('managed-two')).status,409);
+ await (f.machine as any).sendOffers(old,'h1');assert.equal(frames.length,0);
+ await f.machine.webSocketMessage(old as any,JSON.stringify({type:'offer_ack',session_id:'managed-one',epoch}));
+ assert.equal(frames.at(-1).error,'managed_exec_unavailable');
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get('managed-one') as any).state,'offered');
+ // Source upgrade + scoped repin are observed by ordinary heartbeat, no restart.
+ assert.equal((await beat()).status,200);
+ assert.equal((await reservation('managed-two')).status,201);
+ frames.length=0;await (f.machine as any).sendOffers(old,'h1');
+ assert(frames.some(frame=>frame.offer.launch.managed_credential_label==='hub-claude'));
+ assert.equal((await reservation('bad-model',{model:'sonnet'})).status,400);
+ assert.equal((await reservation('bad-mode',{interactive:true})).status,400);
+ assert.equal((await reservation('bad-label',{managed_credential_label:'other'})).status,400);
+ // Withdrawal is also a normal heartbeat and immediately stops opt-in dispatch.
+ await f.call('/api/heartbeat','POST',{labels:[],engines:['claude'],capabilities:['headless']});
+ assert.equal((await reservation('managed-three')).status,409);
+ f.database.close();
+});

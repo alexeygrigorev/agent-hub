@@ -110,6 +110,7 @@ type SessionRow = {
 };
 // The server speaks version 1 of the host WebSocket protocol.
 const HOST_PROTOCOL_VERSION = 1;
+const MANAGED_CLAUDE_CAPABILITY = 'managed:hub-claude:opus:medium:v1';
 
 type HostRelease = { host_version: string; protocol_version: number };
 type SocketAttachment = { machine_id: string; actor_id: string; generation: string } & Partial<HostRelease>;
@@ -293,6 +294,15 @@ export class MachineDO {
       }
       this.db.run('INSERT INTO machine_liveness(singleton,observed_at) VALUES(1,?) ON CONFLICT(singleton) DO UPDATE SET observed_at=excluded.observed_at',now);
     });
+    // New connections start false. Only a normal authenticated heartbeat can
+    // bind execution readiness to the current socket, including after rollback.
+    for(const socket of this.machineSockets(machineId)){
+      try{
+        const attachment=socket.deserializeAttachment();
+        if(attachment?.machine_id===machineId&&this.currentSocket(socket))
+          socket.serializeAttachment({...attachment,managed_claude_ready:(capabilities as string[]).includes(MANAGED_CLAUDE_CAPABILITY)});
+      }catch{}
+    }
     await this.scheduleNext();
     return json({ ok: true, machine_id: machineId, last_seen: now });
   }
@@ -320,12 +330,25 @@ export class MachineDO {
       engines:capabilities?JSON.parse(capabilities.engines_json):[],capabilities:capabilities?JSON.parse(capabilities.capabilities_json):[]});
   }
 
+  private managedClaudeSocket(socket:WebSocket):boolean {
+    try{return socket.readyState===1&&!this.stopOnly(socket)&&socket.deserializeAttachment()?.managed_claude_ready===true;}
+    catch{return false;}
+  }
+
+  private managedClaudeAvailable(machineId:string):boolean {
+    return this.machineSockets(machineId).some(socket=>this.managedClaudeSocket(socket));
+  }
+
+  private managedClaudeLaunch(launch:unknown):boolean {
+    return !!launch&&typeof launch==='object'&&!Array.isArray(launch)&&(launch as JsonRecord).managed_credential_label!==undefined;
+  }
+
   private offers(request: Request): Response {
     const actor = actorFrom(request);
     const machineId = this.machineActor(actor, 'machine:offer');
     if (!machineId) return error('forbidden', 403);
     const now = Date.now();
-    const rows = this.offerRows(machineId,now);
+    const rows = this.offerRows(machineId,now).filter(row=>!this.managedClaudeLaunch(this.parse(row.launch_json))||this.managedClaudeAvailable(machineId));
     return json({ offers: rows.map(row => this.offerView(row)) });
   }
 
@@ -380,6 +403,13 @@ export class MachineDO {
     if (new TextEncoder().encode(JSON.stringify(launch)).byteLength > 12_000) return error('launch_spec_too_large', 413);
     if (Object.hasOwn(launch, '_hub_picker') || Object.hasOwn(launch,WORKSPACE_BINDING_FIELD)
       ||Object.hasOwn(launch,WORKSPACE_REPAIR_FIELD)||Object.hasOwn(launch,WORKSPACE_RECOVERY_TURN_FIELD)) return error('reserved_launch_field', 400);
+    const managed=(launch as JsonRecord).managed_credential_label;
+    if(managed!==undefined){
+      if(managed!=='hub-claude'||(launch as JsonRecord).engine!=='claude'||(launch as JsonRecord).model!=='opus'
+        ||(launch as JsonRecord).effort!=='medium'||(launch as JsonRecord).interactive!==false
+        ||(launch as JsonRecord).with_goal===true||body.account_id!=='claude')return error('invalid_managed_credential_route',400);
+      if(!this.managedClaudeAvailable(String(body.machine_id)))return error('managed_exec_unavailable',409);
+    }
     const picker = normalizeStartPickerEvidence(body.picker);
     if (body.picker !== undefined && (!picker || picker.machine_id !== body.machine_id || picker.attempt !== body.attempt
       || picker.engine !== (launch as JsonRecord).engine || picker.model !== (launch as JsonRecord).model
@@ -548,6 +578,9 @@ export class MachineDO {
         return;
       }
       const launch=this.parse(row.launch_json) as JsonRecord;
+      if(this.managedClaudeLaunch(launch)&&!this.managedClaudeSocket(socket)){
+        socket.send(JSON.stringify({type:'error',error:'managed_exec_unavailable'}));return;
+      }
       const binding=mergeWorkspaceBinding(launch.workspace,launch[WORKSPACE_BINDING_FIELD],body.workspace_binding);
       const newlyBound=binding!==undefined&&launch[WORKSPACE_BINDING_FIELD]===undefined;
       const claim={operation_id:row.dispatch_id,attempt_operation_id:row.operation_id,session_id:row.id,
@@ -600,6 +633,7 @@ export class MachineDO {
     const now = Date.now();
     const rows = this.offerRows(machineId,now);
     for (const row of rows) {
+      if(this.managedClaudeLaunch(this.parse(row.launch_json))&&!this.managedClaudeSocket(socket))continue;
       try { socket.send(JSON.stringify({ type: 'session.offer', offer: this.offerView(row) })); } catch { return; }
     }
   }
@@ -610,7 +644,7 @@ export class MachineDO {
     const frame = JSON.stringify({ type: 'session.offer', offer: this.offerView(row) });
     for (const socket of this.machineSockets(`${row.machine_id}`)) {
       try {
-        if(this.stopOnly(socket))continue;
+        if(this.stopOnly(socket)||this.managedClaudeLaunch(this.parse(row.launch_json))&&!this.managedClaudeSocket(socket))continue;
         if(await this.authorizedAttachment(socket,'machine:offer',true,this.env))socket.send(frame);
       } catch {}
     }
@@ -623,6 +657,7 @@ export class MachineDO {
       session_id: row.id, operation_id: row.operation_id, intake_id: row.intake_id,
       project_id: row.project_id, account_id: row.account_id, epoch: row.epoch, title: row.title,
       acceptance_criteria: this.parse(row.acceptance_criteria_json),
+      ...(launch.managed_credential_label?{request_digest:row.request_digest}:{}),
       launch, expires_at: row.offer_expires_at, claimed: row.state === 'claimed'||row.state==='running',
       ...(row.state==='running'?{recovery_native_id:row.native_id}:{}),
     };
@@ -644,6 +679,7 @@ export class MachineDO {
     if (!response.ok) return error('launch_admission_refused', response.status === 503 ? 503 : 409);
     const result = await response.json() as JsonRecord;
     const launch = this.parse(row.launch_json) as JsonRecord;
+    if(this.managedClaudeLaunch(launch)&&!this.managedClaudeAvailable(machineId))return error('managed_exec_unavailable',409);
     if (result.launch_allowed !== true || result.epoch !== row.epoch || result.engine !== launch.engine
       || (result.model ?? null) !== (launch.model ?? null) || !Number.isSafeInteger(result.observed_at)) return error('launch_admission_unverified', 503);
     const recorded = this.db.transaction(this.ctx, () => {
@@ -1744,6 +1780,7 @@ export class MachineDO {
       managed:true,host:row.machine_id,machine:row.machine_id,workspace:boundWorkspace(launch),requested_workspace:launch.workspace,
       start_deadline_at:launch.start_deadline_at??null,
       account_id:row.account_id,account:row.account_id,effort:launch.effort??null,
+      ...(launch.managed_credential_label?{managed_credential_label:launch.managed_credential_label}:{}),
       ...(picker ? { picker, policy_id: picker.policy_id, policy_version: picker.policy_version } : {}),
       mode:launch.interactive===true?'interactive':'headless',
       created_at:new Date(row.created_at).toISOString(),updated_at:new Date(row.updated_at).toISOString(),

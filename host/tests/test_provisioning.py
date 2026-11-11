@@ -1910,3 +1910,134 @@ def test_scoped_profile_never_moves_unrelated_continuation_keys_to_new_target(tm
     assert tomllib.loads(before.decode())['profiles']['keep']['args']==['preserve']
     with pytest.raises(ValueError):p.scoped_profile({'label':'hub-claude','provider':'claude'})
     assert path.read_bytes()==before
+
+
+def test_managed_exec_readiness_requires_exact_semantic_profile(tmp_path, monkeypatch):
+    import zipfile
+    archive=tmp_path/'hub.pyz'
+    with zipfile.ZipFile(archive,'w') as z: z.writestr('synthetic','owned fixture')
+    monkeypatch.setattr(p.sys,'argv',[str(archive)])
+    command=p.module_command('execute','hub-claude')
+    path=p.profile_path();path.parent.mkdir(parents=True,mode=0o700)
+    def publish(command,engine='claude'):
+        path.write_text('[profiles."hub-hub-claude"]\nengine = '+json.dumps(engine)+'\ncommand = '+json.dumps(command)+'\n')
+        path.chmod(0o600)
+    publish(command)
+    assert p.managed_exec_readiness(archive)['protocol']=='hub2-managed-claude-exec-v1'
+    publish([*command[:-1],'other-label'])
+    with pytest.raises(ValueError,match='unavailable'): p.managed_exec_readiness(archive)
+    publish(command,'shell')
+    with pytest.raises(ValueError,match='unavailable'): p.managed_exec_readiness(archive)
+    path.write_text('version = 1\n');path.chmod(0o600)
+    with pytest.raises(ValueError,match='unavailable'): p.managed_exec_readiness(archive)
+
+
+def test_managed_opus_exception_is_context_only_and_medium(monkeypatch):
+    b=dict(bundle(),label='hub-claude',provider='claude',args=[])
+    with pytest.raises(ValueError): p.managed_claude_route_args(b,[],['--model','opus'])
+    context={'model':'opus','effort':'medium'}
+    assert p.managed_claude_route_args(b,[],['--model','opus','--hub-session-effort=medium'],managed=context)==['--model','opus','--effort','medium']
+    for model in ('haiku','arbitrary','glm-5.3-flash'):
+        with pytest.raises(ValueError): p.managed_claude_route_args(b,[],['--model',model],managed=context)
+    with pytest.raises(ValueError): p.managed_claude_route_args(b,[],['--model','opus','--hub-session-effort=high'],managed=context)
+
+
+def test_managed_generation_uses_materialized_cas_winner_and_strict_ack(tmp_path,monkeypatch):
+    monkeypatch.setattr(p,'refresh_launch_credential',lambda *a:{'status':'adopted_hub','generation':6})
+    calls=[]
+    def request(method,path,body):
+        calls.append((method,path,body));return {'status':'recorded'}
+    b=dict(bundle(),label='hub-claude',provider='claude',credential_generation=5)
+    assert p.managed_claude_materialize({},b,tmp_path,tmp_path,request)==6
+    assert calls[0][2]['items'][0]['credential_generation']==6
+    for status in ('hub_unreachable','writeback_pending','unmanaged'):
+        monkeypatch.setattr(p,'refresh_launch_credential',lambda *a:{'status':status,'generation':5})
+        with pytest.raises(ValueError,match='unverified'):p.managed_claude_materialize({},b,tmp_path,tmp_path,request)
+    assert len(calls)==1
+    monkeypatch.setattr(p,'refresh_launch_credential',lambda *a:{'status':'materialized','generation':6})
+    def rotated(*a):raise ValueError('generation_conflict')
+    with pytest.raises(ValueError,match='generation_conflict'):p.managed_claude_materialize({},b,tmp_path,tmp_path,rotated)
+
+
+@pytest.mark.parametrize('admission_generation',[6,7])
+def test_explicit_managed_claude_execute_binds_actual_attempt_generation_and_child(tmp_path,monkeypatch,admission_generation,capsys):
+    from agent_hub_host import native_import_host
+    managed=tmp_path/'managed';managed.mkdir(mode=0o700)
+    monkeypatch.setattr(p,'root',lambda:managed)
+    monkeypatch.chdir(tmp_path)
+    context={'protocol':p.MANAGED_CLAUDE_PROTOCOL,'label':'hub-claude','profile':'hub-hub-claude',
+             'account_id':'claude','engine':'claude','model':'opus','effort':'medium','session_id':'proof',
+             'operation_id':'op-proof:0','epoch':3,'workspace':str(tmp_path),'task_id':'hub2-proof',
+             'server':'https://hub.test','runtime_deadline':int(p.time.time()*1000)+60000,'request_digest':'b'*64,
+             'machine_id':'host','exec_archive_sha256':'a'*64}
+    archive=tmp_path/'synthetic.pyz';archive.write_bytes(b'synthetic reviewed archive')
+    context['exec_archive_sha256']=p.hashlib.sha256(archive.read_bytes()).hexdigest()
+    monkeypatch.setattr(p,'__file__',str(archive/'agent_hub_host/provisioning.py'))
+    monkeypatch.setattr(p,'managed_exec_readiness',lambda archive:{'protocol':p.MANAGED_CLAUDE_PROTOCOL})
+    record=managed/'attempt.json';p.write_json(record,context)
+    b={'label':'hub-claude','provider':'claude','version':'1.0.0','revision':'22222222-2222-4222-8222-222222222222',
+       'files':{},'env':{},'args':[]}
+    dest=managed/(b['label']+'-'+b['revision']);dest.mkdir(mode=0o700)
+    p.write_json(dest/'bundle.json',b);p.write_json(managed/'state.json',[{k:b[k] for k in ('label','provider','revision')}])
+    monkeypatch.setattr(p,'provision_managed_home',lambda *a:None)
+    monkeypatch.setattr(p,'install_managed_engine_permissions',lambda *a,**kw:None)
+    monkeypatch.setattr(p,'engine_argv',lambda *a:['/synthetic/claude'])
+    monkeypatch.setattr(p,'engine_environment',lambda *a:{'PATH':'synthetic','CLAUDE_CODE_USE_BEDROCK':'1',
+                          'ANTHROPIC_AUTH_TOKEN':'must-not-inherit','AWS_SESSION_TOKEN':'must-not-inherit','HUB2_TOKEN':'must-not-inherit'})
+    monkeypatch.setattr(p,'profile_logged_in',lambda *a:True)
+    monkeypatch.setattr(p,'refresh_launch_credential',lambda *a:{'status':'adopted_hub','generation':6})
+    requests=[]
+    def request(method,path,body):
+        requests.append((method,path,body))
+        return {'status':'recorded'} if path.endswith('sync-report') else {'launch_allowed':True,'credential_generation':admission_generation}
+    monkeypatch.setattr(native_import_host,'bind_managed_claude',lambda base:('host',request))
+    native={'id':'11111111-2222-4333-8444-555555555555','tag':'task-hub2-proof','workspace':str(tmp_path),
+            'created_at_ms':int(p.time.time()*1000)-1000,'phase':'running','command':['a','task','run','--profile','hub-hub-claude',
+            '--engine-arg='+p.MANAGED_CONTEXT_FLAG+str(record)]}
+    monkeypatch.setattr(p.subprocess,'run',lambda *a,**kw:subprocess.CompletedProcess(a,0,json.dumps(native),''))
+    calls=[];monkeypatch.setattr(p.os,'execve',lambda command,argv,env:calls.append((command,argv,env)))
+    monkeypatch.setattr(sys,'argv',['hub','hub-claude',p.MANAGED_CONTEXT_FLAG+str(record),'--model','opus',
+                                  '--hub-session-effort=medium','--output-format','stream-json','-p','synthetic prompt'])
+    if admission_generation != 6:
+        with pytest.raises(SystemExit) as refused:p.execute()
+        assert refused.value.code==75 and calls==[]
+        assert json.loads(capsys.readouterr().err)['reason']=='managed_generation_changed'
+        assert not record.with_suffix('.receipt.json').exists()
+        return
+    p.execute()
+    assert len(calls)==1
+    assert calls[0][2]['CLAUDE_CONFIG_DIR']==str(dest/'home/.claude')
+    assert not any(k.startswith(('ANTHROPIC_','AWS_')) or k in ('CLAUDE_CODE_USE_BEDROCK','HUB2_TOKEN') for k in calls[0][2])
+    assert calls[0][1][calls[0][1].index('--model')+1]=='opus'
+    assert calls[0][1][calls[0][1].index('--effort')+1]=='medium'
+    assert not any(v.startswith(p.MANAGED_CONTEXT_FLAG) for v in calls[0][1])
+    assert requests[0][1].endswith('sync-report') and requests[0][2]['items'][0]['credential_generation']==6
+    assert requests[1][2]=={'label':'hub-claude','native':True}
+    receipt=json.loads(record.with_suffix('.receipt.json').read_text())
+    assert receipt['native_id']==native['id'] and receipt['epoch']==3 and receipt['credential_generation']==6
+    assert receipt['request_digest']=='b'*64 and receipt['profile']=='hub-hub-claude'
+    assert 'token' not in repr(receipt) and 'server' not in receipt
+    assert record.with_suffix('.receipt.json').stat().st_mode&0o777==0o600
+
+
+@pytest.mark.parametrize('change',[{'model':'sonnet'},{'account_id':'other'},{'epoch':True},{'runtime_deadline':1}])
+def test_managed_context_refuses_unqualified_attempt_before_any_request(tmp_path,monkeypatch,change):
+    monkeypatch.chdir(tmp_path)
+    context={'protocol':p.MANAGED_CLAUDE_PROTOCOL,'label':'hub-claude','profile':'hub-hub-claude',
+             'account_id':'claude','engine':'claude','model':'opus','effort':'medium','session_id':'proof',
+             'operation_id':'op-proof:0','epoch':3,'workspace':str(tmp_path),'task_id':'hub2-proof',
+             'server':'https://hub.test','runtime_deadline':int(p.time.time()*1000)+60000,'request_digest':'b'*64,
+             'machine_id':'host','exec_archive_sha256':'a'*64,**change}
+    path=tmp_path/'private/attempt.json';p.write_json(path,context)
+    with pytest.raises(ValueError,match='binding_invalid'):p.managed_claude_context([p.MANAGED_CONTEXT_FLAG+str(path)])
+
+
+def test_managed_failure_is_typed_without_echoing_exception_payload(monkeypatch,capsys):
+    monkeypatch.setattr(sys,'argv',['hub','hub-claude',p.MANAGED_CONTEXT_FLAG+'/private/context.json'])
+    def refuse(*args):raise OSError('synthetic-secret-must-not-print')
+    monkeypatch.setattr(p,'managed_claude_context',refuse)
+    with pytest.raises(SystemExit) as result:p.execute()
+    assert result.value.code==75
+    output=capsys.readouterr()
+    assert json.loads(output.err)=={'provider':'claude','launch_allowed':False,'reason':'managed_exec_refused'}
+    assert 'synthetic-secret' not in output.err+output.out
