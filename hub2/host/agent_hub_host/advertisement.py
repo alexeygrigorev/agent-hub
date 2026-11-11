@@ -18,12 +18,16 @@ class Advertisement:
                 or any(not isinstance(label, str) or not LABEL.fullmatch(label) for label in workspaces)
                 or len({label.casefold() for label in workspaces}) != len(workspaces)):
             raise ValueError('invalid_workspace_aliases')
+        if any(not isinstance(path, str) or not Path(path).is_absolute()
+               for path in workspaces.values()):
+            raise ValueError('invalid_workspace_alias_path')
+        # Alias identity is retained without probing the filesystem: a missing
+        # or deleted directory stays enrolled, is omitted from heartbeat tags,
+        # and refuses only launches that request it.
         self.capabilities = sorted(set(capabilities))
         self.workspaces = dict(workspaces)
         if len(self.capabilities) + len(self.workspaces) > 31:
             raise ValueError('advertisement_capacity_exceeded')
-        for path in self.workspaces.values():
-            self.allowed_path(path)
 
     def allowed_path(self, value):
         if not isinstance(value, str) or not Path(value).is_absolute():
@@ -37,7 +41,12 @@ class Advertisement:
         for name, path in self.workspaces.items():
             if name.casefold() == label.casefold():
                 # Recheck symlinks and existence at every launch/heartbeat.
-                return self.allowed_path(path)
+                # An enrolled but unavailable alias refuses only the launch
+                # that requests it; basename lookup never applies to it.
+                try:
+                    return self.allowed_path(path)
+                except OSError:
+                    raise ValueError('workspace_unavailable') from None
         return None
 
     def tags(self):

@@ -45,6 +45,16 @@ recheck existence and root containment; an unavailable or escaped alias is omitt
 from heartbeat and refused at launch. Unconfigured labels retain legacy basename
 resolution but have no explicit advertisement. There is no implicit `home` alias.
 
+A missing or deleted alias directory never fails host startup. The alias identity
+stays enrolled in the configuration, it is omitted from heartbeat advertisement,
+and only a launch explicitly requesting that alias is refused; basename lookup
+never applies to an enrolled alias.
+
+Accepted resource tags lead the 32-slot heartbeat capability payload. When derived
+engine hints overflow that payload, the hints are shed and the heartbeat still
+connects; accepted tags are never truncated and capability overflow never blocks
+the host connection with an exception.
+
 Routing prefers a single engine/host pair satisfying all required capabilities
 and the workspace label. `os:windows` is matched against the host's reported OS.
 Absolute paths retain path-family handling and need no workspace label tag.
