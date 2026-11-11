@@ -3,7 +3,16 @@
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import test from 'node:test';
+import {spawnSync} from 'node:child_process';
+import {fileURLToPath} from 'node:url';
 const read = path => readFileSync(new URL('../' + path, import.meta.url), 'utf8');
+
+test('schema rollback and transaction regressions execute in the required release check', () => {
+  const result = spawnSync('python3', ['-m', 'unittest', 'discover', '-s', 'test', '-p', 'test_schema_*.py', '-v'], {
+    cwd: fileURLToPath(new URL('../', import.meta.url)), encoding: 'utf8', timeout: 120_000,
+  });
+  assert.equal(result.status, 0, result.stderr || String(result.error));
+});
 
 test('hub2 entry and production manifest select the Node runtime only', () => {
   const production = read('hub2/production-worker.ts');

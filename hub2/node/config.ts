@@ -35,14 +35,31 @@ export function parseDevVars(text: string): Record<string, string> {
   return out;
 }
 
-export async function loadEnvironment(devVarsPath: string | undefined): Promise<Record<string, string>> {
+export async function loadEnvironment(
+  devVarsPath: string | undefined,
+  requireDevVars = false,
+): Promise<Record<string, string>> {
   const env: Record<string, string> = { ...WRANGLER_VARS };
   if (devVarsPath) {
     try {
       Object.assign(env, parseDevVars(await readFile(devVarsPath, 'utf8')));
-    } catch {
-      // Missing .dev.vars keeps the wrangler.jsonc defaults.
+    } catch (error) {
+      if (requireDevVars || (error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw new Error('could not read Hub2 environment file');
+      }
+      // An absent implicit local .dev.vars keeps the non-secret defaults.
     }
+  }
+  // The installer persists the mode selected by rollback preflight. A
+  // conflicting systemd override must fail before SQLite is opened.
+  const persistedMode = env.HUB2_SCHEMA_MIGRATIONS;
+  const inheritedMode = process.env.HUB2_SCHEMA_MIGRATIONS;
+  if (persistedMode !== undefined && inheritedMode !== undefined && persistedMode !== inheritedMode) {
+    throw new Error('conflicting HUB2_SCHEMA_MIGRATIONS in .dev.vars and process environment');
+  }
+  const migrationMode = inheritedMode ?? persistedMode;
+  if (migrationMode !== undefined && migrationMode !== 'defer' && migrationMode !== 'apply') {
+    throw new Error('invalid HUB2_SCHEMA_MIGRATIONS');
   }
   for (const [key, value] of Object.entries(process.env)) {
     if (key.startsWith('HUB2_') || key.startsWith('AUTH_') || key.startsWith('HUB_')) env[key] = value!;

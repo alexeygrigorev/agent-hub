@@ -2,7 +2,7 @@ import {SharedMemory,SHARED_MEMORY_SCHEMA} from './shared-memory';
 import {WorkerCredentials,WORKER_CREDENTIAL_SCHEMA} from './worker-credentials';
 import {ControlAuth,CONTROL_AUTH_SCHEMA} from './control-auth';
 import {verifyKnownCredential} from './auth';
-import { MeteredDb, initializeSchema } from './db';
+import { MeteredDb, initializeSchema, schemaMigrationCeiling } from './db';
 import { SqlReceiptMeter, SQL_PROBE_HEADER, wrapSqlNamespaces } from './sql-receipt';
 import { randomToken, safeEqual, sha256Hex } from './crypto';
 import { credentialKey, openCredential, sealCredential } from './credential-crypto';
@@ -95,7 +95,7 @@ export class ControlDO {
     this.db = new MeteredDb(ctx.storage.sql);
     this.sqlReceipts = new SqlReceiptMeter(this.db);
     this.env = wrapSqlNamespaces(env, this.sqlReceipts) as Hub2Env;
-    this.ready=initializeSchema(ctx, this.db, 5, SCHEMA,[ONCALL_SCHEMA,['CREATE TABLE IF NOT EXISTS session_start_reservations(operation_id TEXT PRIMARY KEY,session_id TEXT NOT NULL,expires_at INTEGER NOT NULL) WITHOUT ROWID', ...ENGINE_SCHEMA],ENGINE_SCHEMA,SHARED_MEMORY_SCHEMA],async()=>{this.seedEngineRollout();await this.scheduleWake();});
+    this.ready=initializeSchema(ctx, this.db, 5, SCHEMA,[ONCALL_SCHEMA,['CREATE TABLE IF NOT EXISTS session_start_reservations(operation_id TEXT PRIMARY KEY,session_id TEXT NOT NULL,expires_at INTEGER NOT NULL) WITHOUT ROWID', ...ENGINE_SCHEMA],ENGINE_SCHEMA,SHARED_MEMORY_SCHEMA],async()=>{this.seedEngineRollout();await this.scheduleWake();},1,schemaMigrationCeiling(env.HUB2_SCHEMA_MIGRATIONS,4,5));
     this.memory=new SharedMemory(ctx,this.db,this.env);
     this.auth=new ControlAuth(ctx,this.db,this.env);this.workers=new WorkerCredentials(ctx,this.db,this.env);
   }

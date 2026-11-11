@@ -16,3 +16,6 @@ registerHooks({
 await import('./db-metering.test.ts');
 
 await import('./sql-receipt.test.ts');
+
+await import("./schema-bridge.test.ts");
+await import('./schema-readiness.test.ts');

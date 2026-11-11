@@ -122,6 +122,7 @@ while (($#)); do
   case "$1" in
     --hub-only) hub_only=true; shift ;;
     --release-mode) release_mode="$2"; shift 2 ;;
+    --schema-migrations) [[ "$2" == apply || "$2" == defer ]] || exit 87; shift 2 ;;
     *) exit 88 ;;
   esac
 done
@@ -136,11 +137,17 @@ cat > "$TEST_ROOT/seed/.gitignore" <<'IGNORE'
 .dev.vars
 .local/
 IGNORE
+mkdir -p "$TEST_ROOT/seed/scripts" "$TEST_ROOT/seed/hub2/src"
+cp "$ROOT/scripts/schema-rollback-preflight.py" "$TEST_ROOT/seed/scripts/schema-rollback-preflight.py"
+for schema_file in control-do machine-do project-do account-do mailbox-do; do
+  printf 'initializeSchema(ctx,this.db,1,[])\n' > "$TEST_ROOT/seed/hub2/src/$schema_file.ts"
+done
 git -C "$TEST_ROOT/seed" add .
 git -C "$TEST_ROOT/seed" commit -qm 'previous release'
 git -C "$TEST_ROOT/seed" push -q "$TEST_ROOT/remote.git" main
 git --git-dir="$TEST_ROOT/remote.git" symbolic-ref HEAD refs/heads/main
 git clone -q "$TEST_ROOT/remote.git" "$TEST_ROOT/work"
+mkdir -p "$TEST_ROOT/work/.local/hub2-db"
 printf 'HUB2_RELEASE_MODE=bootstrap\nHUB2_CREDENTIAL_KEY=preserve-this\n' > "$TEST_ROOT/work/.dev.vars"
 cp "$TEST_ROOT/work/deploy/hub.caddy" "$TEST_ROOT/etc/sites/hub.caddy"
 cat > "$TEST_ROOT/etc/Caddyfile" <<'SHARED'

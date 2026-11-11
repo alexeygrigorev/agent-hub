@@ -23,9 +23,14 @@ export class SharedMemory {
     if(path!=='/api/intake/rules'&&!path.startsWith('/api/asks')&&path!=='/api/shared-memory/import')return null;
     if(!actor)return error('unauthorized',401);
     const admin=hasScope(actor,'operator:admin');
-    if(path==='/api/asks/ingest'&&request.method==='POST')return this.ingest(request);
+    if(path==='/api/asks/ingest'&&request.method==='POST'){
+      if(!admin&&(actor.kind!=='machine'||!actor.resource_id))return error('forbidden',403);
+      if(this.db.schemaVersion<5)return error('schema_migration_deferred',503);
+      return this.ingest(request);
+    }
     // Same authority as the Hub1 operator rule/ask ledger; no new scope gates.
     if(!admin)return error('forbidden',403);
+    if(this.db.schemaVersion<5)return error('schema_migration_deferred',503);
     if(path==='/api/shared-memory/import'&&request.method==='POST')return this.importLegacy(request);
     if(path==='/api/intake/rules') {
       if(request.method==='GET')return json({operator_rules:this.db.all<{data_json:string}>('SELECT data_json FROM memory_rules ORDER BY id').map(r=>JSON.parse(r.data_json)),data_notice:notice});

@@ -23,6 +23,7 @@ export interface Hub2Env {
   MAILBOXES: DurableObjectNamespace;
   HUB2_RELEASE_MODE?: string;
   HUB2_DISK_FLOOR_GB?: string;
+  HUB2_SCHEMA_MIGRATIONS?: string;
   HUB_ALERT_WEBHOOK?: string;
   HUB_ALERT_WEBHOOK_TOKEN?: string;
   HUB2_BOOTSTRAP_TOKEN?: string;

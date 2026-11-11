@@ -10,19 +10,25 @@ if [[ "${AGENT_HUB_DEPLOY_TEST_MODE:-0}" == 1 ]]; then
   CADDY_CONFIG="${AGENT_HUB_TEST_CADDY_CONFIG:?AGENT_HUB_TEST_CADDY_CONFIG is required in test mode}"
   CADDY_SITE="${AGENT_HUB_TEST_CADDY_SITE:-$(dirname "$CADDY_CONFIG")/sites/hub.caddy}"
   CLI_RELEASE_ROOT="$REPO/.local/cli-releases"
+  DB_DIR="${AGENT_HUB_TEST_DB_DIR:-$REPO/.local/hub2-db}"
 else
   REPO=/opt/agent-hub
   TRANSACTION_DIR=/var/lib/agent-hub/deploy-rollback
   CADDY_CONFIG=/etc/caddy/Caddyfile
   CADDY_SITE=/etc/caddy/sites/hub.caddy
   CLI_RELEASE_ROOT=/var/lib/agent-hub/cli-releases
+  DB_DIR=/var/lib/agent-hub/hub2-db
 fi
 CADDY_BIN=caddy
 TMPDIR="$REPO/.local/tmp"
 LEGACY_CLI_DIR="$REPO/hub2/public/cli"
 CANDIDATE_CADDY=""
+SCHEMA_PREFLIGHT=""
 
 cleanup_candidate() {
+  if [[ -n "$SCHEMA_PREFLIGHT" ]]; then
+    rm -f -- "$SCHEMA_PREFLIGHT"
+  fi
   if [[ -n "$CANDIDATE_CADDY" ]]; then
     rm -f -- "$CANDIDATE_CADDY"
   fi
@@ -138,6 +144,13 @@ restore_previous_release() {
   git -C "$REPO" cat-file -e "${previous_sha}^{commit}" \
     || { printf 'ERROR: previous release commit is unavailable locally: %s\n' "$previous_sha" >&2; return 1; }
 
+  if ! run_root test -f "$TRANSACTION_DIR/schema-preflight.py"; then
+    printf 'ERROR: rollback_schema_proof_missing; keep live databases unchanged and prepare a compatible rollback build.\n' >&2
+    return 1
+  fi
+  run_root python3 "$TRANSACTION_DIR/schema-preflight.py" --repo "$REPO" \
+    --previous "$previous_sha" --candidate "$previous_sha" --data-dir "$DB_DIR" --print-mode >/dev/null || return 1
+
   if run_root test -f "$TRANSACTION_DIR/transaction-token"; then
     publication_token="$(read_root_file "$TRANSACTION_DIR/transaction-token")" || return 1
     publisher_dir="$(publisher_directory "$publication_token")" || return 1
@@ -218,7 +231,7 @@ restore_previous_release() {
 }
 
 apply_release() {
-  local deploy_sha="$1" release_mode="$2" caddy_mode="$3" cli_mode="$4" previous_sha local_status publication_token
+  local deploy_sha="$1" release_mode="$2" caddy_mode="$3" cli_mode="$4" previous_sha local_status publication_token schema_mode
   local -a asset_args=()
   [[ "$deploy_sha" =~ ^[0-9a-f]{40}$ ]] || fail "deploy SHA must be a full lowercase Git commit SHA"
   [[ "$release_mode" == bootstrap || "$release_mode" == active ]] \
@@ -259,9 +272,21 @@ apply_release() {
     validate_shared_caddyfile || fail "shared Caddyfile must import /etc/caddy/sites/*.caddy; aws-infra owns that migration"
   fi
 
+  SCHEMA_PREFLIGHT="$(mktemp "$TMPDIR/hub-schema-preflight.XXXXXX")"
+  git -C "$REPO" show "${deploy_sha}:scripts/schema-rollback-preflight.py" > "$SCHEMA_PREFLIGHT" \
+    || fail "candidate has no reviewed schema rollback preflight"
+  chmod 600 "$SCHEMA_PREFLIGHT"
+  schema_mode="$(run_root python3 "$SCHEMA_PREFLIGHT" --repo "$REPO" \
+    --previous "$previous_sha" --candidate "$deploy_sha" --data-dir "$DB_DIR" --print-mode)" \
+    || fail "candidate cannot be safely rolled back against the current databases"
+  [[ "$schema_mode" == defer || "$schema_mode" == apply ]] || fail "invalid schema preflight result"
+  printf 'Schema rollback preflight passed; migration mode=%s.\n' "$schema_mode"
+
   run_root install -d -o root -g root -m 700 "$TRANSACTION_DIR"
   publication_token="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
   write_root_file "$TRANSACTION_DIR/transaction-token" "$publication_token"
+  run_root install -o root -g root -m 600 "$SCHEMA_PREFLIGHT" "$TRANSACTION_DIR/schema-preflight.py"
+  write_root_file "$TRANSACTION_DIR/schema-mode" "$schema_mode"
   if [[ "$caddy_mode" == full ]]; then
     if run_root test -f "$CADDY_SITE"; then
       run_root cp -p -- "$CADDY_SITE" "$TRANSACTION_DIR/hub.caddy.previous"
@@ -321,14 +346,19 @@ apply_release() {
   install_release_dependencies
   if [[ "$cli_mode" == matched-cli ]]; then asset_args+=(--keep-cli-assets); fi
   if [[ "$caddy_mode" == full ]]; then
-    run_root bash "$REPO/deploy/vm/install-hub2-node.sh" --release-mode "$release_mode" "${asset_args[@]}"
+    run_root bash "$REPO/deploy/vm/install-hub2-node.sh" --release-mode "$release_mode" --schema-migrations "$schema_mode" "${asset_args[@]}"
   else
-    run_root bash "$REPO/deploy/vm/install-hub2-node.sh" --release-mode "$release_mode" --hub-only "${asset_args[@]}"
+    run_root bash "$REPO/deploy/vm/install-hub2-node.sh" --release-mode "$release_mode" --hub-only --schema-migrations "$schema_mode" "${asset_args[@]}"
   fi
   run_root systemctl is-active --quiet agent-hub-hub2.service
   wait_for_hub_health
+  run_root python3 "$TRANSACTION_DIR/schema-preflight.py" --repo "$REPO" \
+    --previous "$previous_sha" --candidate "$deploy_sha" --data-dir "$DB_DIR" --print-mode >/dev/null
   write_root_file "$TRANSACTION_DIR/applied" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   trap - ERR
+  if [[ "$schema_mode" == defer ]]; then
+    printf 'Compatible bridge installed without the new schema migrations; a subsequent verified deploy can enable them.\n'
+  fi
   printf 'Hub2 candidate %s installed; rollback state retained until public smoke checks pass.\n' "$deploy_sha"
 }
 

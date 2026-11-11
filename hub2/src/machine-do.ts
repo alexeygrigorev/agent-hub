@@ -1,6 +1,6 @@
 import { nativeReturncode } from './native-exit';
 import { normalizeStartPickerEvidence } from './start-picker-evidence';
-import { MeteredDb, initializeSchema } from './db';
+import { MeteredDb, initializeSchema, schemaMigrationCeiling } from './db';
 import { SqlReceiptMeter, SQL_PROBE_HEADER, wrapSqlNamespaces } from './sql-receipt';
 import { sha256Hex } from './crypto';
 import { actorFrom, bodyObject, boundedString, error, hasScope, HttpError, json } from './http';
@@ -126,17 +126,18 @@ export class MachineDO {
   private readonly sqlReceipts: SqlReceiptMeter;
   private readonly env: Hub2Env;
   private readonly constructorMs: number;
+  private readonly ready:Promise<void>;
 
   constructor(private readonly ctx: DurableObjectState, env: Hub2Env) {
     const started = performance.now();
     this.db = new MeteredDb(ctx.storage.sql);
     this.sqlReceipts = new SqlReceiptMeter(this.db);
     this.env = wrapSqlNamespaces(env, this.sqlReceipts) as Hub2Env;
-    initializeSchema(ctx, this.db, 7, LATEST_SCHEMA, [[SCHEMA[0]],COMPACT_KEYS,['ALTER TABLE machine_capabilities ADD COLUMN resources_json TEXT'],MACHINE_ACTIVE_MIGRATION,[
+    this.ready=initializeSchema(ctx, this.db, 7, LATEST_SCHEMA, [[SCHEMA[0]],COMPACT_KEYS,['ALTER TABLE machine_capabilities ADD COLUMN resources_json TEXT'],MACHINE_ACTIVE_MIGRATION,[
       'CREATE TABLE IF NOT EXISTS machine_liveness(singleton INTEGER PRIMARY KEY CHECK(singleton=1),observed_at INTEGER NOT NULL)',
       'CREATE TABLE IF NOT EXISTS native_sessions(session_id TEXT PRIMARY KEY,native_id TEXT,phase TEXT NOT NULL,last_activity_at INTEGER,exit_code INTEGER,containment_empty INTEGER NOT NULL,observed_at INTEGER NOT NULL) WITHOUT ROWID',
       'DROP TABLE IF EXISTS machine_active','ALTER TABLE machine_capabilities DROP COLUMN resources_json','ALTER TABLE machines DROP COLUMN active_session_id',
-    ],['ALTER TABLE session_commands ADD COLUMN capture_mode TEXT']],()=>this.scheduleNext(),6);
+    ],['ALTER TABLE session_commands ADD COLUMN capture_mode TEXT']],()=>this.scheduleNext(),6,schemaMigrationCeiling(env.HUB2_SCHEMA_MIGRATIONS,6,7));
     this.constructorMs = performance.now() - started;
   }
 
@@ -147,6 +148,7 @@ export class MachineDO {
   private async handleFetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     try {
+      await this.ready;
       if (url.pathname === '/_internal/reserve' && request.method === 'POST') return await this.reserveInternal(request);
       if (url.pathname === '/_internal/activate' && request.method === 'POST') return await this.activateInternal(request);
       if (url.pathname === '/_internal/mail' && request.method === 'POST') return await this.queueMail(request);
@@ -195,6 +197,7 @@ export class MachineDO {
   }
 
   async alarm(): Promise<void> {
+    await this.ready;
     const now = Date.now();
     const expired = this.db.all<SessionRow>(
       "SELECT * FROM sessions WHERE state IN ('staged','offered','claimed') AND native_id IS NULL AND created_at<=? ORDER BY created_at,id LIMIT 100",
@@ -417,6 +420,7 @@ export class MachineDO {
   }
 
   async webSocketMessage(socket:WebSocket,message:string|ArrayBuffer):Promise<void>{
+    await this.ready;
     if(!this.currentSocket(socket))return;
     await this.webSocketMessageRaw(socket, message, this.env);
   }
@@ -448,11 +452,12 @@ export class MachineDO {
     try { socket.send(JSON.stringify({ type: 'error', error: 'unsupported_message' })); } catch {}
   }
 
-  webSocketClose(socket:WebSocket,code:number,reason:string,_wasClean:boolean):void{
+  async webSocketClose(socket:WebSocket,code:number,reason:string,_wasClean:boolean):Promise<void>{
+    await this.ready;
     try{socket.close(code===1005||code===1006?1000:code,reason);}catch{}
   }
 
-  webSocketError(_socket: WebSocket, _error: unknown): void {}
+  async webSocketError(_socket: WebSocket, _error: unknown): Promise<void> { await this.ready; }
 
   private async ackOffer(socket: WebSocket, body: JsonRecord,env:Hub2Env): Promise<void> {
     if (typeof body.session_id !== 'string' || !Number.isInteger(body.epoch)) return;
@@ -809,6 +814,9 @@ export class MachineDO {
     const captureMode = kind === 'capture' ? body.mode : undefined;
     if (captureMode !== undefined && captureMode !== 'screen') return error('invalid_capture_mode', 400);
     if (kind !== 'capture' && body.mode !== undefined) return error('unexpected_capture_mode', 400);
+    // The first bridge must remain wire-compatible with the legacy schema6 reader.
+    // Explicit screen capture becomes available after the compatible bridge is the rollback target.
+    if (captureMode === 'screen' && this.db.schemaVersion < 7) return error('schema_migration_deferred', 503);
     const commandText = body.text;
     if (kind === 'send' && (typeof commandText !== 'string' || !commandText.trim() || new TextEncoder().encode(commandText).byteLength > 8192)) return error('invalid_command_text', 400);
     if (kind !== 'send' && commandText !== undefined) return error('unexpected_command_text', 400);
@@ -844,11 +852,17 @@ export class MachineDO {
         if (!current || current.epoch !== session.epoch || !(kind==='stop'
           ? this.canDispatchStop(current)
           : current.state==='running'&&!!current.native_id)) throw new HttpError('session_not_running', 409);
-        this.db.run(`INSERT INTO session_commands(id,session_id,machine_id,epoch,request_key,request_digest,kind,text,capture_mode,state,result_json,created_at,updated_at)
-          VALUES(?,?,?,?,?,?,?,?,?,'pending',?,?,?)`, id, sessionId, session.machine_id, session.epoch, key, digest, kind, commandText ?? null, captureMode ?? null,
-          // Before delivery, retain the bound ID in the pending result slot.
-          // A late start must not qualify a previously unbound legacy stop.
-          kind === 'stop' && current.native_id ? JSON.stringify({dispatch_native_id:current.native_id}) : null,now,now);
+        // Preserve the pre-delivery native binding in both schema readers.
+        const pendingResult = kind === 'stop' && current.native_id ? JSON.stringify({dispatch_native_id:current.native_id}) : null;
+        if(this.db.schemaVersion>=7){
+          this.db.run(`INSERT INTO session_commands(id,session_id,machine_id,epoch,request_key,request_digest,kind,text,capture_mode,state,result_json,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,'pending',?,?,?)`, id, sessionId, session.machine_id, session.epoch, key, digest, kind,
+            commandText ?? null,captureMode ?? null,pendingResult,now,now);
+        }else{
+          this.db.run(`INSERT INTO session_commands(id,session_id,machine_id,epoch,request_key,request_digest,kind,text,state,result_json,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,'pending',?,?,?)`, id, sessionId, session.machine_id, session.epoch, key, digest, kind,
+            commandText ?? null,pendingResult,now,now);
+        }
       });
     } catch (caught) {
       if (caught instanceof HttpError) return error(caught.code, caught.status);
@@ -1441,7 +1455,7 @@ export class MachineDO {
   private commandView(row: CommandRow): JsonRecord {
     return { id: row.id, session_id: row.session_id, epoch: row.epoch, kind: row.kind,
       ...(row.capture_mode ? {mode:row.capture_mode} : {}),
-      ...(row.text === null ? {} : { text: row.text }) };
+      ...(row.kind==='send'&&row.text!==null ? {text:row.text} : {}) };
   }
 
   private machineActor(actor: Actor | undefined, scope: string): string | undefined {
