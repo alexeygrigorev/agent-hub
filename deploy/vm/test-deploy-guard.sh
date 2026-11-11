@@ -352,7 +352,8 @@ pass 'Hub-only apply and rollback leave the shared Caddy configuration untouched
 if TEST_CURL_FAIL_FIRST=15 run_transaction apply "$CANDIDATE_SHA" active hub-only >/dev/null 2>"$TEST_ROOT/readiness-fail.err"; then
   fail 'permanent installer readiness failure unexpectedly succeeded'
 fi
-grep -Fq 'ERROR: Hub2 local health check http://127.0.0.1:8787/health did not become ready after 15 attempts (last curl exit=7)' "$TEST_ROOT/readiness-fail.err" \
+grep -Fq 'ERROR: Hub2 local health check http://127.0.0.1:8787/health did not become ready after 15 attempts /' "$TEST_ROOT/readiness-fail.err" \
+  && grep -Fq '(last curl exit=7)' "$TEST_ROOT/readiness-fail.err" \
   || fail 'permanent installer readiness failure did not log loud diagnostic error'
 [[ "$(git -C "$TEST_ROOT/work" rev-parse HEAD)" == "$PREVIOUS_SHA" ]] \
   || fail 'permanent installer readiness failure did not restore old release'
