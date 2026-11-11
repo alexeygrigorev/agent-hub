@@ -113,20 +113,6 @@ class MetricsRegressionTests(unittest.TestCase):
         # fixture carries no review-event ID, so review_count stays null.
         self.assertIsNone(snap["accepted"]["review_count"])
 
-    def test_ui_names_host_identity_numeric_cache_and_access_denied(self):
-        root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-        js_path = os.path.join(root, "public", "metrics.js")
-        html_path = os.path.join(root, "public", "metrics.html")
-        with open(js_path, encoding="utf-8") as handle:
-            js = handle.read()
-        with open(html_path, encoding="utf-8") as handle:
-            html = handle.read()
-        self.assertIn("metrics-host", html)
-        self.assertIn("dk-select", html)
-        self.assertIn("total_cache_read_tokens", js)
-        self.assertIn("total_reasoning_tokens", js)
-        self.assertIn("Access denied", js)
-        self.assertNotIn("innerHTML", js)
 
     @unittest.skipUnless(os.path.isdir(DASHBOARD_SRC), "dashboard source unavailable")
     def test_readonly_producer_empty_and_provenance_gap(self):

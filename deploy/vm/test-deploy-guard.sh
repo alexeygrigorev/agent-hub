@@ -197,7 +197,7 @@ from pathlib import Path
 from types import SimpleNamespace
 root, temporary = map(Path, sys.argv[1:3])
 candidate = sys.argv[3]
-spec = importlib.util.spec_from_file_location('deploy_guard_policy_fixture', root / 'test/test_schema_release_transaction.py')
+spec = importlib.util.spec_from_file_location('deploy_guard_policy_fixture', root / 'scripts/tests/test_schema_release_transaction.py')
 fixture = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fixture)
 stop = threading.Event()

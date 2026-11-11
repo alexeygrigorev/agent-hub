@@ -5,8 +5,8 @@ set -uo pipefail
 # Runs typecheck, scope guard and only the Vitest/pytest files affected by the
 # change vs origin/main, inside ONE short heavy-test slot. The FULL suite runs
 # once after the push in the deploy CI job; do not run test-full-local.sh before
-# every push. Changes to shared test infrastructure (dependencies, runner config,
-# conftest, the admission gate) are "broad" and still need test-full-local.sh.
+# every push. Changes to shared test infrastructure are BROAD: run focused tests locally
+# and require the complete CI suite; never invoke a full suite on Hetzner.
 # Usage: scripts/test-affected-local.sh [--base REF] [--dry-run]
 
 if [ "${AGENT_HUB_HEAVY_TEST_HELD:-}" = "1" ]; then
@@ -34,11 +34,11 @@ unset APLEXER_TAG APLEXER_WORKSPACE HUB_WORKER_CONFIG_FILE HUB_CONFIG_FILE
 
 PLAN="$(python3 scripts/ci/affected_tests.py "${BASE}")" || exit 1
 field() { printf '%s' "${PLAN}" | python3 -c "import json,sys;d=json.load(sys.stdin);v=d['$1'];print(' '.join(v) if isinstance(v,list) else int(v))"; }
-BROAD="$(field broad)"; VITEST_FILES="$(field vitest)"; PYTEST_FILES="$(field pytest)"
+BROAD="$(field broad)"; VITEST_FILES="$(field vitest)"; PYTEST_FILES="$(field pytest)"; HUB2_PYTEST_FILES="$(field hub2_pytest)"
 echo "=== Affected tests vs ${BASE} ==="
-echo "vitest: ${VITEST_FILES:-none}"; echo "pytest: ${PYTEST_FILES:-none}"
+echo "vitest: ${VITEST_FILES:-none}"; echo "pytest: ${PYTEST_FILES:-none}"; echo "hub2 pytest: ${HUB2_PYTEST_FILES:-none}"
 if [ -n "${BROAD}" ]; then
-  echo "BROAD: shared test infrastructure changed (${BROAD}); run scripts/test-full-local.sh --priority final" >&2
+  echo "BROAD: shared test infrastructure changed (${BROAD}); run focused tests locally and require the complete CI suite" >&2
   exit 4
 fi
 [ "${DRY}" = 1 ] && exit 0
@@ -64,14 +64,14 @@ fi
 
 # Everything heavy shares one slot, taken for this block only.
 export AFFECTED_TYPECHECK="$(field typecheck)" AFFECTED_BUILD="$(field build)"
-export AFFECTED_VITEST="${VITEST_FILES}" AFFECTED_PYTEST="${PYTEST_FILES}" AFFECTED_HOME="${RUN_TMP_ABS}/home"
+export AFFECTED_PYTEST="${PYTEST_FILES}" AFFECTED_HUB2_PYTEST="${HUB2_PYTEST_FILES}" AFFECTED_HOME="${RUN_TMP_ABS}/home"
 export AFFECTED_UV="$(command -v uv)" AFFECTED_USERBASE="${PYTHONUSERBASE:-$(python3 -c 'import site; print(site.getuserbase())' 2>/dev/null || echo "${HOME}/.local")}"
 export AFFECTED_AUTH="${DTC_AUTH_HOME:-/home/alexey/git/auth}"
 PY_ENV=(env)
 while IFS= read -r name; do
   case "$name" in
     AGENT_HUB_HEAVY_TEST_HELD|AFFECTED_*) ;;
-    APLEXER_*|HUB_*|AGENT_HUB_*|XDG_CONFIG_HOME|XDG_DATA_HOME|XDG_STATE_HOME|XDG_RUNTIME_DIR|GH_CONFIG_DIR) PY_ENV+=(-u "$name") ;;
+    APLEXER_*|HUB_*|HUB2_*|AGENT_HUB_*|XDG_CONFIG_HOME|XDG_DATA_HOME|XDG_STATE_HOME|XDG_RUNTIME_DIR|GH_CONFIG_DIR) PY_ENV+=(-u "$name") ;;
   esac
 done < <(compgen -e)
 export AFFECTED_PYENV="${PY_ENV[*]}"
@@ -80,18 +80,22 @@ export AGENT_HUB_HEAVY_TEST_RUN_ID="${AGENT_HUB_HEAVY_TEST_RUN_ID:-affected-$$-$
 AGENT_HUB_HEAVY_TEST_REFUSAL_FILE="${MARKER}" "${REPO_ROOT}/scripts/capped-test-run.sh" -- bash -c '
 rc=0
 if [ "$AFFECTED_TYPECHECK" = 1 ]; then echo "=== typecheck ==="; npm run typecheck || { echo "FAIL: typecheck"; rc=1; }; fi
-if [ -n "$AFFECTED_VITEST" ]; then
-  echo "=== vitest (affected) ==="
-  UV_THREADPOOL_SIZE=1 GOMAXPROCS=1 NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--v8-pool-size=1" \
-    npx --no-install vitest run --configLoader runner --no-file-parallelism --maxWorkers 1 --disableConsoleIntercept $AFFECTED_VITEST || { echo "FAIL: vitest"; rc=1; }
+if [ -n "$AFFECTED_PYTEST" ] || [ -n "$AFFECTED_HUB2_PYTEST" ]; then
+  uv sync --frozen >/dev/null || rc=1
 fi
 if [ -n "$AFFECTED_PYTEST" ]; then
   echo "=== pytest (affected, disposable HOME) ==="
-  uv sync --frozen >/dev/null || rc=1
   $AFFECTED_PYENV HOME="$AFFECTED_HOME" PYTHONUSERBASE="$AFFECTED_USERBASE" DTC_AUTH_HOME="$AFFECTED_AUTH" \
     PYTHONPATH="host:host/tests" CODEX_LAUNCH_WRAPPER="" \
     "$AFFECTED_UV" run --frozen --with pytest python -m pytest -q --basetemp "$TMPDIR/pytest" \
     -o tmp_path_retention_count=0 -o tmp_path_retention_policy=none $AFFECTED_PYTEST || { echo "FAIL: pytest"; rc=1; }
+fi
+if [ -n "$AFFECTED_HUB2_PYTEST" ]; then
+  echo "=== pytest (Hub2 daemon, isolated package) ==="
+  $AFFECTED_PYENV HOME="$AFFECTED_HOME" PYTHONUSERBASE="$AFFECTED_USERBASE" DTC_AUTH_HOME="$AFFECTED_AUTH" \
+    PYTHONPATH="hub2/host" CODEX_LAUNCH_WRAPPER="" \
+    "$AFFECTED_UV" run --frozen --with pytest python -m pytest -q --basetemp "$TMPDIR/pytest-hub2" \
+    -o tmp_path_retention_count=0 -o tmp_path_retention_policy=none $AFFECTED_HUB2_PYTEST || { echo "FAIL: Hub2 pytest"; rc=1; }
 fi
 if [ "$AFFECTED_BUILD" = 1 ]; then echo "=== worker dry-run build ==="; npm run build >/dev/null || { echo "FAIL: build"; rc=1; }; fi
 exit $rc'

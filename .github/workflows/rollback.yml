@@ -21,7 +21,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: node --test test/release-contract.test.mjs
+      - run: node --test scripts/tests/release-contract.test.mjs
       - run: npm run typecheck
       - run: npm run build  # typecheck + Node clean-start boot, no Cloudflare toolchain
       - name: Activation contract

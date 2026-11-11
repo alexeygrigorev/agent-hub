@@ -24,15 +24,10 @@ def _gate_runner(argv, **kw):
     return {'active_mem_mb': 512}
 
 
-def _hub_stale_ms():
-    text = (REPO / 'src' / 'fleet.ts').read_text()
-    match = re.search(r'export const LAUNCHER_TELEMETRY_STALE_MS = (\d+);', text)
-    assert match, 'LAUNCHER_TELEMETRY_STALE_MS missing from src/fleet.ts'
-    return int(match.group(1))
 
 
 def test_refresh_interval_fits_hub_stale_window_with_margin():
-    stale_s = _hub_stale_ms() / 1000
+    stale_s = 180  # Retained host telemetry contract; retired Hub1 server no longer defines it.
     assert fleet.HUB_TELEMETRY_STALE_S == stale_s
     # Two missed refreshes must still leave the telemetry fresh.
     assert fleet.TELEMETRY_REFRESH_S * 3 <= stale_s, (fleet.TELEMETRY_REFRESH_S, stale_s)

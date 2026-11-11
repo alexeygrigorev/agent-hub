@@ -1424,7 +1424,7 @@ class PublicationTests(unittest.TestCase):
         # Reuse the offline protocol peer; execute the real protected policy
         # helper while retaining this fixture's CLI publication/rollback checks.
         from types import SimpleNamespace
-        spec = importlib.util.spec_from_file_location('release_policy_transaction_fixture', REPO / 'test/test_schema_release_transaction.py')
+        spec = importlib.util.spec_from_file_location('release_policy_transaction_fixture', REPO / 'scripts/tests/test_schema_release_transaction.py')
         policy_fixture = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(policy_fixture)
         health_log = self.directory / 'health.log'

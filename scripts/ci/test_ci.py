@@ -18,7 +18,7 @@ DEPLOY_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "deploy.yml"
 
 class TestCICD(unittest.TestCase):
     def test_canonical_release_contract(self):
-        result = subprocess.run(["node", "--test", "test/release-contract.test.mjs"],
+        result = subprocess.run(["node", "--test", "scripts/tests/release-contract.test.mjs"],
                                 cwd=REPO_ROOT, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 

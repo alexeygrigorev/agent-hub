@@ -6,7 +6,7 @@
     "doc": "docs"
   },
   "scripts": {
-    "test": "node --test test/release-contract.test.mjs",
+    "test": "node --test scripts/tests/release-contract.test.mjs",
     "typecheck": "tsc --noEmit",
     "build": "npm run typecheck && node --experimental-transform-types hub2/tests/production-clean-start.test.mjs",
     "test:distribution": "python3 scripts/ci/test_root_distribution.py"
