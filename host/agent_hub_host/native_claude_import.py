@@ -3,9 +3,8 @@ import json
 import os
 from pathlib import Path
 import time
-import urllib.parse
 
-from . import bus, config, private_fs, provisioning
+from . import bus, config, native_import_host, private_fs, provisioning
 
 AUTH_PATH = '.claude/.credentials.json'
 
@@ -49,17 +48,14 @@ def command(args):
     if args.provider != 'claude' or args.label != 'hub-claude':
         raise ValueError('Unsupported native import')
     operator = config.load_config()
-    host = config.load_host_config()
     base = os.environ.get('HUB_URL') or os.environ.get('HUB_BASE_URL') or operator.get('base_url')
-    if (not isinstance(base, str) or urllib.parse.urlsplit(base).scheme != 'https'
-            or not config.same_origin(base, host.get('base_url')) or not host.get('machine_id')):
-        raise ValueError('Native import requires HTTPS and an enrolled host on the same Hub')
+    machine, host_request = native_import_host.bind(base)
     listing = bus._do_request('GET', '/api/engines')
     rows = [row for row in listing.get('credentials', []) if row.get('label') == args.label]
     if len(rows) != 1 or type(rows[0].get('generation')) is not int or rows[0]['generation'] < 0:
         raise ValueError('Central credential generation unavailable')
     generation = rows[0]['generation']
-    if host['machine_id'] not in rows[0].get('hosts', []):
+    if machine not in rows[0].get('hosts', []):
         raise ValueError('This host is not approved for the managed Claude account')
     files = collect()
     saved = bus._do_request('POST', '/api/engines/import-native', {
@@ -70,7 +66,7 @@ def command(args):
         raise ValueError('Import receipt did not confirm the next generation; no sync attempted')
 
     def current_only(method, path, payload=None):
-        response = provisioning.host_request(method, path, payload)
+        response = host_request(method, path, payload)
         if method == 'GET' and path == '/api/engines/sync':
             bundles = response.get('engines')
             if (not isinstance(bundles, list) or len(bundles) != 1
@@ -86,7 +82,7 @@ def command(args):
         provisioning.sync(request=current_only)
         verified = bus._do_request('GET', '/api/engines')
         states = [account for row in verified.get('sync_status', [])
-                  if row.get('machine_id') == host['machine_id']
+                  if row.get('machine_id') == machine
                   for account in row.get('accounts', []) if account.get('label') == args.label]
         if (len(states) != 1 or type(states[0].get('acked_generation')) is not int
                 or states[0]['acked_generation'] < published
@@ -95,5 +91,5 @@ def command(args):
     except Exception:
         raise ValueError('Native import saved at generation %d; managed sync or acknowledgement is pending. Check hub engines list and verify managed Opus health before retrying import' % published) from None
     return {'status': 'imported', 'provider': 'claude', 'label': args.label,
-            'credential_generation': published, 'machine_id': host['machine_id'],
+            'credential_generation': published, 'machine_id': machine,
             'acked_generation': states[0]['acked_generation']}
