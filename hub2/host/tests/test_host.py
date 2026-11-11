@@ -1657,3 +1657,63 @@ class RetainedManagedCaptureTests(unittest.TestCase):
 
     def test_terminal_capture_allows_owned_group_writable_parents_and_private_attempt(self):
         self.group_writable_parent_capture(terminal=True)
+
+
+class ManagedClaudeHostTests(unittest.TestCase):
+    setUp=HostTests.setUp
+    tearDown=HostTests.tearDown
+    offer=HostTests.offer
+
+    def configure(self):
+        from agent_hub_host.native_launch import LOCAL_ROUTES
+        self.bridge.engines={'claude'}
+        self.bridge.launcher.config={'private_provider_homes':True,'routes':{'claude':dict(LOCAL_ROUTES['claude'])}}
+        self.bridge.launcher.capabilities=lambda:{'claude':{'headless','effort'}}
+        self.bridge.launcher.managed_claude_readiness=lambda:{'sha256':'a'*64}
+        self.client.base_url='https://hub.test'
+
+    def managed_offer(self,**changes):
+        result=self.offer(account_id='claude',request_digest='b'*64)
+        result['launch'].update(engine='claude',model='opus',effort='medium',managed_credential_label='hub-claude')
+        result.update(changes)
+        return result
+
+    def test_selector_survives_validation_with_exact_account_and_original_request_digest(self):
+        self.configure();offer=self.managed_offer()
+        launch=self.bridge.validate_launch(offer)
+        self.assertEqual(launch['managed_credential_label'],'hub-claude')
+        self.assertEqual(launch['account_id'],'claude')
+        self.assertEqual(launch['request_digest'],'b'*64)
+        for changed in ({'account_id':'other'},{'request_digest':'not-a-digest'}):
+            with self.subTest(changed=changed),self.assertRaises(ValueError):self.bridge.validate_launch(self.managed_offer(**changed))
+        self.bridge.launcher.managed_claude_readiness=lambda:None
+        with self.assertRaisesRegex(ValueError,'managed_exec_unavailable'):self.bridge.validate_launch(offer)
+
+    def test_normal_heartbeat_rechecks_profile_readiness_without_restart_or_changing_base_caps(self):
+        self.configure();captured=[]
+        self.client.heartbeat=lambda *args,**kw:captured.append(args)
+        marker='managed:hub-claude:opus:medium:v1'
+        self.bridge.launcher.managed_claude_readiness=lambda:None
+        self.bridge.heartbeat([],include_native_sessions=False)
+        before=captured[-1][2];self.assertNotIn(marker,before)
+        self.bridge.launcher.managed_claude_readiness=lambda:{'sha256':'a'*64}
+        self.bridge.heartbeat([],include_native_sessions=False)
+        self.assertIn(marker,captured[-1][2]);self.assertEqual(set(captured[-1][2])-{marker},set(before))
+        self.bridge.launcher.managed_claude_readiness=lambda:None
+        self.bridge.heartbeat([],include_native_sessions=False);self.assertNotIn(marker,captured[-1][2])
+
+    def test_explicit_managed_attempt_uses_fixed_profile_without_global_private_home_or_replay(self):
+        self.configure();offer=self.managed_offer()
+        with patch('agent_hub_host.providers.provision') as provision:
+            self.bridge.offer(offer);self.bridge.offer(offer)
+        provision.assert_not_called()
+        starts=[args for args,kw in self.native.calls if args[1]=='start']
+        self.assertEqual(len(starts),1)
+        child=starts[0][starts[0].index('--')+1:]
+        self.assertEqual(child[child.index('--profile')+1],'hub-hub-claude')
+        context_args=[a for a in child if a.startswith('--engine-arg=--hub-managed-claude-context=')]
+        self.assertEqual(len(context_args),1)
+        intent=json.loads(Path(context_args[0].split('=',2)[2]).read_text())
+        self.assertEqual(intent['machine_id'],'machine-1');self.assertEqual(intent['request_digest'],'b'*64)
+        self.assertEqual(intent['session_id'],offer['session_id']);self.assertEqual(intent['epoch'],offer['epoch'])
+        self.assertNotIn('worker-token',repr(intent));self.assertNotIn('token',repr(intent))
