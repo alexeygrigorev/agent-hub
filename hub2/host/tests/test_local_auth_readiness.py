@@ -16,7 +16,12 @@ from agent_hub_host.local_auth_readiness import _default_claude_auth_state, loca
 @unittest.skipUnless(sys.platform == 'linux', 'known-negative backend is deliberately Linux-only')
 class LocalAuthReadinessTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
+        # CI's disposable TMPDIR can be below world-writable /tmp, which the
+        # production reader correctly refuses. Keep fixture ancestry trusted
+        # without relaxing that guard or inspecting real operator files.
+        temporary_root = Path(__file__).resolve().parents[3] / '.local/tmp'
+        temporary_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(prefix='local-auth-readiness-', dir=temporary_root)
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name)
         binary = self.home / 'bin/claude'
@@ -112,6 +117,24 @@ class LocalAuthReadinessTests(unittest.TestCase):
             self.assertLess(time.monotonic()-started, 1)
             if kind == 'directory': self.credentials.rmdir()
             else: self.credentials.unlink()
+
+    def test_untrusted_ambient_temp_does_not_change_fixture_or_reader_trust(self):
+        unsafe = self.home/'world-writable'
+        unsafe.mkdir(mode=0o700)
+        unsafe.chmod(0o777)  # Only this owned fixture, never a shared temp dir.
+        with patch.object(tempfile, 'tempdir', str(unsafe)):
+            nested = LocalAuthReadinessTests('test_absent_or_empty_oauth_is_negative_and_observation_never_creates_files')
+            try:
+                nested.setUp()
+                self.assertFalse(nested.home.is_relative_to(unsafe))
+                self.assertEqual(nested.observe(), MISSING)
+            finally:
+                nested.doCleanups()
+        # Actual observations still refuse even a private leaf below an
+        # untrusted writable ancestor; fixture relocation is not a bypass.
+        with self.assertRaisesRegex(ValueError, 'untrusted_auth_location'):
+            from agent_hub_host.local_auth_readiness import _read
+            _read(unsafe/'absent.json')
 
     def test_observer_failure_is_unknown_and_never_logs_exception_or_contents(self):
         output = io.StringIO()
