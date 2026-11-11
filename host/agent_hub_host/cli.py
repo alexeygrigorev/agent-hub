@@ -56,16 +56,53 @@ def format_version() -> str:
     return f"{info['version']} ({commit_str}, {info['build_date']})"
 
 
-STALE_MANIFEST_TTL = 3600
+# This credential-free subprocess can be killed and reaped after a TOTAL three
+# seconds, including DNS, redirects and trickling bodies. Socket timeouts alone
+# do not bound an entire read, and a detached thread would leak its connection.
+_CLI_MANIFEST_PROBE = r"""
+import json, re, sys, urllib.request
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+request = urllib.request.Request(sys.argv[1], headers={'User-Agent': 'hub-cli', 'Cache-Control': 'no-cache'})
+try:
+    with opener.open(request, timeout=3) as response:
+        if response.status != 200:
+            raise ValueError()
+        raw = response.read(65537)
+    if len(raw) > 65536:
+        raise ValueError()
+    manifest = json.loads(raw)
+    commit = manifest.get('built_from_commit') if isinstance(manifest, dict) else None
+    if not isinstance(commit, str) or re.fullmatch('[0-9a-fA-F]{40}', commit) is None:
+        raise ValueError()
+    sys.stdout.write(commit)
+except Exception:
+    sys.exit(1)
+"""
+
+
+def _deployed_cli_commit(url):
+    import re
+    import subprocess
+    # No Hub imports, user site/PYTHONPATH, proxies, tokens or operator HOME.
+    # Windows needs its system directory variables to initialize Python/SSL.
+    environment = {key: os.environ[key] for key in ('SYSTEMROOT', 'WINDIR') if key in os.environ}
+    result = subprocess.run([sys.executable, '-I', '-S', '-c', _CLI_MANIFEST_PROBE, url],
+                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, timeout=3, env=environment,
+                            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    # run() kills and waits for the owned child on timeout, on Unix and Windows.
+    if result.returncode or re.fullmatch(b'[0-9a-fA-F]{40}', result.stdout) is None:
+        raise ValueError('manifest probe unavailable')
+    return result.stdout.decode('ascii')
 
 
 def warn_if_cli_stale(base_url=None, cache_path=None):
-    """One stderr line when the deployed CLI differs from this build (5.2).
+    """Compare this build to a fresh public manifest on each invocation (5.2).
 
-    Best-effort: bounded 3 s fetch, manifest cached on disk for an hour, and
-    every failure mode (no build commit, offline, cache unreadable) is silent
-    so normal commands never break on the check. HUB_CLI_SKIP_STALE_CHECK=1
-    disables it. `cache_path` overrides the on-disk manifest cache (tests).
+    The isolated read has a total 3 s deadline and 64 KiB body cap. Any failure
+    is silent so commands proceed.
+    HUB_CLI_SKIP_STALE_CHECK=1 disables it. The legacy cache_path keyword is
+    accepted for compatibility but ignored; disk caches never prove deployment.
     """
     if os.environ.get("HUB_CLI_SKIP_STALE_CHECK"):
         return
@@ -74,38 +111,14 @@ def warn_if_cli_stale(base_url=None, cache_path=None):
         commit = info.get("commit")
         if not isinstance(commit, str) or len(commit) != 40:
             return
-        import time
-        from pathlib import Path
-
-        if cache_path is None:
-            cache_path = Path.home() / ".config" / "agent-hub" / "cli-manifest-cache.json"
-        manifest = None
-        try:
-            cached = json.loads(cache_path.read_text(encoding="utf-8"))
-            if isinstance(cached, dict) and time.time() - cached.get("fetched_at", 0) < STALE_MANIFEST_TTL:
-                manifest = cached.get("manifest")
-        except (OSError, ValueError):
-            manifest = None
-        if not isinstance(manifest, dict):
-            import urllib.request
-            clean = (
-                base_url
-                or os.environ.get("HUB_URL")
-                or os.environ.get("HUB_BASE_URL")
-                or config.DEFAULT_BASE_URL
-            ).rstrip("/")
-            api.check_url(clean)
-            req = urllib.request.Request(clean + "/cli/manifest.json", headers={"User-Agent": "hub-cli"})
-            with urllib.request.urlopen(req, timeout=3) as resp:
-                if resp.status != 200:
-                    return
-                manifest = json.loads(resp.read().decode("utf-8"))
-            try:
-                cache_path.parent.mkdir(parents=True, exist_ok=True)
-                cache_path.write_text(json.dumps({"fetched_at": time.time(), "manifest": manifest}), encoding="utf-8")
-            except OSError:
-                pass
-        server_commit = str((manifest or {}).get("built_from_commit") or "")
+        clean = (
+            base_url
+            or os.environ.get("HUB_URL")
+            or os.environ.get("HUB_BASE_URL")
+            or config.DEFAULT_BASE_URL
+        ).rstrip("/")
+        api.check_url(clean)
+        server_commit = _deployed_cli_commit(clean + "/cli/manifest.json")
         if len(server_commit) == 40 and server_commit.lower() != commit.lower():
             print(
                 f"Note: this hub CLI build ({commit[:12]}) differs from the deployed CLI ({server_commit[:12]}); "

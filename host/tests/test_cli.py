@@ -459,79 +459,257 @@ class TestCliUpdate(unittest.TestCase):
 
 
 class TestCliStaleCheck(unittest.TestCase):
-    """5.2: one-line stale-build notice; every failure mode stays silent."""
+    """5.2: each notice uses a fresh public read; failures never gate commands."""
 
     BUILD = {'version': '1.0', 'commit': 'a' * 40, 'build_date': '2026-11-10'}
 
-    def _cache(self, tmp):
-        import pathlib
-        return pathlib.Path(tmp) / 'cli-manifest-cache.json'
+    def private_cache(self, temporary, commit):
+        from pathlib import Path
+        import time
+        path = Path(temporary) / 'cli-manifest-cache.json'
+        path.write_text(json.dumps({'fetched_at': time.time(), 'manifest': {'built_from_commit': commit}}))
+        return path
 
-    def test_stale_deployed_cli_prints_one_stderr_line_and_caches_manifest(self):
+    def temporary_directory(self):
+        from pathlib import Path
         import tempfile
-        from agent_hub_host import cli
-        from unittest.mock import patch, MagicMock
-        import urllib.request
+        directory = Path(__file__).resolve().parents[2] / '.local/tmp'
+        directory.mkdir(parents=True, exist_ok=True)
+        return tempfile.TemporaryDirectory(dir=directory, prefix='cli-fresh-manifest-')
 
-        # Real context-manager closure catches reads attempted after __exit__.
-        response = io.BytesIO(json.dumps({'built_from_commit': 'b' * 40}).encode())
-        response.status = 200
-        with tempfile.TemporaryDirectory() as tmp, \
-                patch.dict(os.environ, {'HUB_CLI_SKIP_STALE_CHECK': '', 'HUB_URL': 'https://hub.test'}), \
-                patch.object(cli, 'get_build_info', return_value=dict(self.BUILD)), \
-                patch('urllib.request.urlopen', return_value=response) as fetch, \
-                patch.object(sys, 'stderr') as err:
-            cli.warn_if_cli_stale(cache_path=self._cache(tmp))
-            self.assertEqual(fetch.call_count, 1)
-            lines = [c for c in err.write.call_args_list if 'differs from the deployed CLI' in str(c)]
-            self.assertEqual(len(lines), 1)
-            self.assertIn("run 'hub update'", lines[0].args[0])
-            # The manifest is cached for the TTL; a second call refetches nothing.
-            err.write.call_args_list.clear()
-            cli.warn_if_cli_stale(cache_path=self._cache(tmp))
-        self.assertEqual(fetch.call_count, 1)
-
-    def test_matching_commit_and_skip_env_stay_silent(self):
-        import tempfile
-        from agent_hub_host import cli
-        from unittest.mock import patch, MagicMock
-        import urllib.request
-
-        response = MagicMock()
-        response.__enter__.return_value = response
-        response.status = 200
-        response.read.return_value = json.dumps({'built_from_commit': 'a' * 40}).encode()
-
-        # The documented off-switch never touches the network.
-        with tempfile.TemporaryDirectory() as tmp_off, \
-                patch.dict(os.environ, {'HUB_CLI_SKIP_STALE_CHECK': '1'}), \
-                patch('urllib.request.urlopen') as fetch, \
-                patch.object(cli, 'get_build_info') as build:
-            cli.warn_if_cli_stale(cache_path=self._cache(tmp_off))
-        fetch.assert_not_called()
-        build.assert_not_called()
-
-    def test_offline_fetch_and_missing_commit_fail_silent(self):
-        import tempfile
+    def test_every_invocation_observes_changed_deployed_manifest(self):
         from agent_hub_host import cli
         from unittest.mock import patch
-        import urllib.request
+        responses = ['a' * 40, 'b' * 40, 'c' * 40]
+        with patch.dict(os.environ, {'HUB_CLI_SKIP_STALE_CHECK': '', 'HUB_URL': 'https://hub.test'}), \
+             patch.object(cli, 'get_build_info', return_value=dict(self.BUILD)), \
+             patch.object(cli, '_deployed_cli_commit', side_effect=responses) as fetch, \
+             patch.object(sys, 'stderr', new_callable=io.StringIO) as err:
+            cli.warn_if_cli_stale()
+            self.assertEqual(err.getvalue(), '')
+            cli.warn_if_cli_stale()
+            self.assertIn('deployed CLI (' + 'b' * 12 + ')', err.getvalue())
+            err.seek(0); err.truncate(0)
+            cli.warn_if_cli_stale()
+            self.assertIn('deployed CLI (' + 'c' * 12 + ')', err.getvalue())
+            self.assertEqual(len(err.getvalue().splitlines()), 1)
+            self.assertIn("run 'hub update'", err.getvalue())
+        self.assertEqual(fetch.call_count, 3)
+        self.assertEqual([call.args for call in fetch.call_args_list],
+                         [('https://hub.test/cli/manifest.json',)] * 3)
 
-        with tempfile.TemporaryDirectory() as tmp, \
-                patch.dict(os.environ, {'HUB_CLI_SKIP_STALE_CHECK': '', 'HUB_URL': 'https://hub.test'}), \
-                patch.object(cli, 'get_build_info', return_value=dict(self.BUILD)), \
-                patch('urllib.request.urlopen', side_effect=OSError('offline')), \
-                patch.object(sys, 'stderr') as err:
-            cli.warn_if_cli_stale(cache_path=self._cache(tmp))  # must not raise
-        err.write.assert_not_called()
+    def test_newly_updated_cli_ignores_old_cache_false_warning(self):
+        from agent_hub_host import cli
+        from unittest.mock import patch
+        with self.temporary_directory() as tmp:
+            cache = self.private_cache(tmp, 'b' * 40)
+            original = cache.read_bytes()
+            with patch.dict(os.environ, {'HUB_CLI_SKIP_STALE_CHECK': '', 'HUB_URL': 'https://hub.test'}), \
+                 patch.object(cli, 'get_build_info', return_value=dict(self.BUILD)), \
+                 patch.object(cli, '_deployed_cli_commit', return_value='a' * 40) as fetch, \
+                 patch.object(sys, 'stderr', new_callable=io.StringIO) as err:
+                cli.warn_if_cli_stale(cache_path=cache)
+                self.assertEqual(err.getvalue(), '')
+            fetch.assert_called_once()
+            self.assertEqual(cache.read_bytes(), original)
 
-        with tempfile.TemporaryDirectory() as tmp, \
-                patch.dict(os.environ, {'HUB_CLI_SKIP_STALE_CHECK': ''}), \
-                patch.object(cli, 'get_build_info', return_value={'version': 'dev'}), \
-                patch('urllib.request.urlopen') as fetch:
-            cli.warn_if_cli_stale(cache_path=self._cache(tmp))
+    def test_old_matching_cache_does_not_hide_new_deployment(self):
+        from agent_hub_host import cli
+        from unittest.mock import patch
+        with self.temporary_directory() as tmp:
+            cache = self.private_cache(tmp, 'a' * 40)
+            with patch.dict(os.environ, {'HUB_CLI_SKIP_STALE_CHECK': '', 'HUB_URL': 'https://hub.test'}), \
+                 patch.object(cli, 'get_build_info', return_value=dict(self.BUILD)), \
+                 patch.object(cli, '_deployed_cli_commit', return_value='b' * 40) as fetch, \
+                 patch.object(sys, 'stderr', new_callable=io.StringIO) as err:
+                cli.warn_if_cli_stale(cache_path=cache)
+                self.assertIn('deployed CLI (' + 'b' * 12 + ')', err.getvalue())
+            fetch.assert_called_once()
+
+    def test_network_failure_never_warns_from_old_cache_or_prints_exception(self):
+        from agent_hub_host import cli
+        from unittest.mock import patch
+        with self.temporary_directory() as tmp:
+            cache = self.private_cache(tmp, 'b' * 40)
+            with patch.dict(os.environ, {'HUB_CLI_SKIP_STALE_CHECK': '', 'HUB_URL': 'https://hub.test'}), \
+                 patch.object(cli, 'get_build_info', return_value=dict(self.BUILD)), \
+                 patch.object(cli, '_deployed_cli_commit', side_effect=TimeoutError('synthetic-private-detail')) as fetch, \
+                 patch.object(sys, 'stderr', new_callable=io.StringIO) as err:
+                cli.warn_if_cli_stale(cache_path=cache)
+                self.assertEqual(err.getvalue(), '')
+            fetch.assert_called_once_with('https://hub.test/cli/manifest.json')
+
+    def test_network_failure_does_not_block_normal_api_command(self):
+        from agent_hub_host import cli, bus
+        from unittest.mock import patch
+        expected = {'resource_settings': {'disk_floor_gb': 27.5}}
+        with patch.dict(os.environ, {'HUB_CLI_SKIP_STALE_CHECK': '', 'HUB_URL': 'https://hub.test'}), \
+             patch.object(cli, 'get_build_info', return_value=dict(self.BUILD)), \
+             patch.object(cli, '_deployed_cli_commit', side_effect=OSError('synthetic-private-detail')), \
+             patch.object(bus, '_do_request', return_value=expected) as request, \
+             patch.object(sys, 'argv', ['hub', 'resources', 'settings', '--json']), \
+             patch.object(sys, 'stdout', new_callable=io.StringIO) as out, \
+             patch.object(sys, 'stderr', new_callable=io.StringIO) as err:
+            cli.main()
+            self.assertEqual(json.loads(out.getvalue()), expected)
+            self.assertEqual(err.getvalue(), '')
+        request.assert_called_once_with('GET', '/api/resource-settings')
+
+    def test_skip_env_and_missing_build_never_touch_network(self):
+        from agent_hub_host import cli
+        from unittest.mock import patch
+        with patch.dict(os.environ, {'HUB_CLI_SKIP_STALE_CHECK': '1'}), \
+             patch.object(cli, '_deployed_cli_commit') as fetch, patch.object(cli, 'get_build_info') as build:
+            cli.warn_if_cli_stale()
+        fetch.assert_not_called()
+        build.assert_not_called()
+        with patch.dict(os.environ, {'HUB_CLI_SKIP_STALE_CHECK': ''}), \
+             patch.object(cli, 'get_build_info', return_value={'version': 'dev'}), \
+             patch.object(cli, '_deployed_cli_commit') as fetch:
+            cli.warn_if_cli_stale()
         fetch.assert_not_called()
 
+    def test_help_and_version_do_not_fetch_manifest(self):
+        from agent_hub_host import cli
+        from unittest.mock import patch
+        for flag in ('--help', '--version'):
+            with self.subTest(flag=flag), patch.object(sys, 'argv', ['hub', flag]), \
+                 patch.object(cli, '_deployed_cli_commit') as fetch, \
+                 patch.object(sys, 'stdout', new_callable=io.StringIO):
+                with self.assertRaises(SystemExit) as exit:
+                    cli.main()
+                self.assertEqual(exit.exception.code, 0)
+                fetch.assert_not_called()
+
+
+    def test_probe_process_has_total_deadline_and_no_operator_environment(self):
+        from agent_hub_host import cli
+        from unittest.mock import patch
+        with patch.dict(os.environ, {'HUB2_TOKEN': 'synthetic-secret', 'PYTHONPATH': '/synthetic/private',
+                                     'HOME': '/synthetic/operator'}), \
+             patch('subprocess.run', return_value=subprocess.CompletedProcess([], 0, b'b' * 40)) as run:
+            self.assertEqual(cli._deployed_cli_commit('https://hub.test/cli/manifest.json'), 'b' * 40)
+        args = run.call_args.args[0]
+        self.assertEqual(args[:4], [sys.executable, '-I', '-S', '-c'])
+        self.assertEqual(args[4], cli._CLI_MANIFEST_PROBE)
+        self.assertEqual(args[5:], ['https://hub.test/cli/manifest.json'])
+        options = run.call_args.kwargs
+        self.assertEqual(options['timeout'], 3)
+        self.assertEqual(options['stdin'], subprocess.DEVNULL)
+        self.assertEqual(options['stderr'], subprocess.DEVNULL)
+        self.assertEqual(options['stdout'], subprocess.PIPE)
+        self.assertTrue(set(options['env']).issubset({'SYSTEMROOT', 'WINDIR'}))
+
+    def test_probe_rejects_non_revision_or_extra_output(self):
+        from agent_hub_host import cli
+        from unittest.mock import patch
+        for output in (b'bad', b'b' * 40 + b'\nprivate detail', b'g' * 40):
+            with self.subTest(output=output), patch('subprocess.run', return_value=subprocess.CompletedProcess([], 0, output)):
+                with self.assertRaises(ValueError):
+                    cli._deployed_cli_commit('https://hub.test/cli/manifest.json')
+
+    def manifest_server(self, body, trickle=False):
+        from contextlib import contextmanager
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        import threading
+
+        @contextmanager
+        def serving():
+            stopped, disconnected = threading.Event(), threading.Event()
+            observed = {}
+
+            class Handler(BaseHTTPRequestHandler):
+                def log_message(self, *args):
+                    pass
+
+                def do_GET(self):
+                    observed.update(path=self.path, headers=dict(self.headers))
+                    self.send_response(200)
+                    self.send_header('Content-Length', str(len(body)))
+                    self.end_headers()
+                    try:
+                        if trickle:
+                            for byte in body:
+                                if stopped.wait(0.03):
+                                    break
+                                self.wfile.write(bytes([byte]))
+                                self.wfile.flush()
+                        else:
+                            self.wfile.write(body)
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        pass
+                    finally:
+                        disconnected.set()
+
+            server = HTTPServer(('127.0.0.1', 0), Handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            # Cleanup is installed before the server starts handling requests.
+            try:
+                thread.start()
+                yield 'http://127.0.0.1:%d' % server.server_address[1], disconnected, observed
+            finally:
+                stopped.set()
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+                self.assertFalse(thread.is_alive(), 'owned loopback server leaked')
+
+        return serving()
+
+    def test_real_isolated_probe_reads_only_public_revision_and_closes(self):
+        from agent_hub_host import cli
+        body = json.dumps({'built_from_commit': 'b' * 40}).encode()
+        with self.manifest_server(body) as (base, disconnected, observed):
+            self.assertEqual(cli._deployed_cli_commit(base + '/cli/manifest.json'), 'b' * 40)
+            self.assertTrue(disconnected.wait(2))
+            self.assertEqual(observed['path'], '/cli/manifest.json')
+            self.assertEqual(observed['headers'].get('User-Agent'), 'hub-cli')
+            self.assertEqual(observed['headers'].get('Cache-Control'), 'no-cache')
+            self.assertNotIn('Authorization', observed['headers'])
+            self.assertNotIn('Cookie', observed['headers'])
+
+    def test_real_isolated_probe_rejects_oversized_response(self):
+        from agent_hub_host import cli
+        # Still valid JSON with a valid revision: only the size cap rejects it.
+        body = json.dumps({'built_from_commit': 'b' * 40, 'padding': 'x' * 65536}).encode()
+        with self.manifest_server(body) as (base, disconnected, observed):
+            with self.assertRaises(ValueError):
+                cli._deployed_cli_commit(base + '/cli/manifest.json')
+            self.assertTrue(disconnected.wait(2))
+
+    def test_trickling_probe_hits_total_deadline_kills_reaps_and_does_not_gate_api(self):
+        from agent_hub_host import cli, bus
+        from unittest.mock import patch
+        import time
+        children = []
+        real_popen = subprocess.Popen
+
+        def owned_child(*args, **kwargs):
+            child = real_popen(*args, **kwargs)
+            children.append(child)
+            return child
+
+        expected = {'resource_settings': {'disk_floor_gb': 27.5}}
+        with self.manifest_server(b' ' * 65537, trickle=True) as (base, disconnected, observed), \
+             patch.dict(os.environ, {'HUB_CLI_SKIP_STALE_CHECK': '', 'HUB_URL': base}), \
+             patch.object(cli, 'get_build_info', return_value=dict(self.BUILD)), \
+             patch('subprocess.Popen', side_effect=owned_child), \
+             patch.object(bus, '_do_request', return_value=expected) as request, \
+             patch.object(sys, 'argv', ['hub', 'resources', 'settings', '--json']), \
+             patch.object(sys, 'stdout', new_callable=io.StringIO) as out, \
+             patch.object(sys, 'stderr', new_callable=io.StringIO) as err:
+            started = time.monotonic()
+            cli.main()
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 6, 'socket trickle exceeded bounded probe deadline')
+            self.assertEqual(json.loads(out.getvalue()), expected)
+            self.assertEqual(err.getvalue(), '')
+            self.assertEqual(len(children), 1)
+            self.assertIsNotNone(children[0].poll(), 'probe child not reaped')
+            self.assertIsNotNone(children[0].returncode)
+            self.assertTrue(children[0].stdout.closed, 'probe pipe leaked')
+            self.assertTrue(disconnected.wait(2), 'probe connection remained open after timeout')
+        request.assert_called_once_with('GET', '/api/resource-settings')
 
 
 class TestHeartbeatCommand(unittest.TestCase):
