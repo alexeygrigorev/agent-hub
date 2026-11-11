@@ -6,6 +6,10 @@ import importlib.util
 import io
 import json
 import os
+import runpy
+import selectors
+import subprocess
+import sys
 import shutil
 import tempfile
 import time
@@ -79,6 +83,61 @@ class Harness(unittest.TestCase):
         self.assertTrue(st['sessions'])
         for s in st['sessions'].values():
             self.assertTrue(s['stopped'], 'leaked session %s' % s['id'])
+
+
+class FixtureStateTests(Harness):
+    def seed_state(self):
+        self.cfg_path.write_text('{}')
+        state = {'n': 0, 'sessions': {}, 'keys': {}, 'log': []}
+        path = Path(str(self.cfg_path) + '.state')
+        path.write_text(json.dumps(state))
+        return path, path.read_bytes()
+
+    def test_failed_atomic_publication_preserves_previous_state_and_removes_temporary(self):
+        path, previous = self.seed_state()
+        with mock.patch.object(os, 'replace', side_effect=OSError('synthetic publication failure')):
+            with self.assertRaisesRegex(OSError, 'synthetic publication failure'):
+                runpy.run_path(str(FIX / 'fake_hub.py'))
+        self.assertEqual(path.read_bytes(), previous)
+        self.assertEqual(self.state()['sessions'], {})
+        self.assertEqual(list(path.parent.glob(path.name + '.*')), [])
+
+    def test_killed_publication_preserves_readable_state_for_next_cli_invocation(self):
+        path, previous = self.seed_state()
+        # Block exactly after the complete temporary is closed, before replace.
+        # The pipe handshake removes timing guesses and needs no slow/hung CLI.
+        code = """
+import os, runpy, signal, sys
+
+def interrupted_replace(source, destination):
+    print('publication-ready', flush=True)
+    signal.pause()
+
+os.replace = interrupted_replace
+runpy.run_path(sys.argv[1])
+"""
+        child = subprocess.Popen([sys.executable, '-c', code, str(FIX / 'fake_hub.py')],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(child.stdout, selectors.EVENT_READ)
+                self.assertTrue(selector.select(timeout=5), 'fixture did not reach publication barrier')
+            self.assertEqual(child.stdout.readline().strip(), 'publication-ready')
+            self.assertEqual(path.read_bytes(), previous)
+            self.assertEqual(self.state()['sessions'], {})
+            child.kill()
+            child.wait(timeout=5)
+            self.assertEqual(path.read_bytes(), previous)
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.communicate(timeout=5)
+        result = subprocess.run([sys.executable, str(FIX / 'fake_hub.py')],
+                                capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)['count'], 40)
+        self.assertEqual(len(self.state()['watermarks']), 1)
+        self.assertNotEqual(path.read_bytes(), previous)
 
 
 class AcceptanceTests(Harness):

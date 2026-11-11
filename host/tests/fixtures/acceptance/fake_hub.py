@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -16,7 +17,18 @@ ST = json.loads(STATE_PATH.read_text()) if STATE_PATH.exists() else {'n': 0, 'se
 
 
 def save():
-    STATE_PATH.write_text(json.dumps(ST))
+    # Capture subprocesses can be killed at their deadline. Never truncate the
+    # last complete state that later cleanup commands must still be able to read.
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile('w', dir=STATE_PATH.parent,
+                                         prefix=STATE_PATH.name + '.', delete=False) as stream:
+            temporary = Path(stream.name)
+            json.dump(ST, stream)
+        os.replace(temporary, STATE_PATH)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def out(obj):
