@@ -35,12 +35,12 @@ async function ready(mode='apply'){const f=fixture(mode);assert.equal((await f.b
 async function receipt(f:ReturnType<typeof fixture>,kind='stop',key='once',extra={}){const r=await f.create(kind,key,extra);assert.equal(r.status,201,await r.clone().text());return(await r.json() as any).command;}
 function proof(c:any,extra:any={}){return {stopped:true,evidence:{source:'aplexer_status',native_id:native,workspace:'/work/peer',tag:'peer',phase:'exited',containment_empty:true,exit:{code:143,exited_at_ms:Date.now()},observed_at_ms:Math.max(Date.now(),c.created_at),...extra}};}
 
-test('native controls require exact operator admin; send never queues',async()=>{
+test('native controls require exact operator admin; send without text never queues',async()=>{
  const f=await ready();for(const actor of [host,{...host,kind:'agent',scopes:['operator:admin']},{...admin,scopes:['session:stop']},{id:'service:fake',kind:'service',scopes:['operator:admin']}]){
   assert.equal((await f.call(f.path,'POST',{kind:'stop',key:'x'},actor)).status,403);
   assert.equal((await f.call(f.path,'GET',undefined,actor)).status,403);
  }
- assert.equal((await f.create('send')).status,409);assert.equal(f.db.prepare('SELECT COUNT(*) n FROM native_commands').get()!.n,0);f.db.close();
+ assert.equal((await f.create('send')).status,400);assert.equal(f.db.prepare('SELECT COUNT(*) n FROM native_commands').get()!.n,0);f.db.close();
 });
 test('fresh exact unmanaged target required; pending receipt survives census loss and key replay does not redraw identity',async()=>{
  const f=fixture();await f.boot();assert.equal((await f.create()).status,409);await f.publish();
@@ -176,9 +176,135 @@ test('maximum accepted Unicode workspace remains ACK-able with actual ASCII host
 
 
 test('target bound to a managed row after enqueue is cancelled before native delivery',async()=>{
- const f=await ready(),c=await receipt(f);
+ for(const kind of ['stop','send']){
+ const f=await ready(),c=await receipt(f,kind,'managed-race',kind==='send'?{text:'owned synthetic input'}:{});
  assert.equal((await f.call('/_internal/reserve','POST',{operation_id:'op-late',dispatch_id:'dispatch-late',attempt:0,session_id:'managed-late',project_id:'org/repo',intake_id:'i',machine_id:'h1',request_digest:'d',title:'work',acceptance_criteria:['result'],account_id:'codex',launch:{workspace:'/work',engine:'codex',model:'m',prompt:'private',interactive:false}})).status,201);
  f.db.prepare("UPDATE sessions SET native_id=? WHERE id='managed-late'").run(native);(f.machine as any).db.cache.clear();
  const socket=f.socket();await (f.machine as any).sendPendingCommands(socket.socket,'h1');assert.equal(socket.sent.length,0);
- assert.equal((await f.view(c.id)).ack.error,'native_target_managed');assert.equal(f.db.prepare('SELECT COUNT(*) n FROM machine_outbox').get()!.n,0);f.db.close();
+ assert.equal((await f.view(c.id)).ack.error,'native_target_managed');if(kind==='send')assert.equal((await f.view(c.id)).ack.consumed,null);assert.equal(f.db.prepare('SELECT COUNT(*) n FROM machine_outbox').get()!.n,0);f.db.close();
+ }
+});
+
+
+function sendWire(f:ReturnType<typeof fixture>,id:string){
+ const row=f.db.prepare('SELECT * FROM native_commands WHERE id=?').get(id);
+ return (f.machine as any).nativeCommands.envelope(row);
+}
+function sendProof(wire:any,changes:any={}){return {submission:{version:1,session_id:wire.native_id,operation_id:wire.id,
+ request_sha256:wire.submission.request_sha256,deadline_ms:wire.deadline_ms,status:'submitted_verified',
+ mutation:true,landed:true,submitted:true,consumed:null,reason:'submission_observed',...changes}};}
+
+test('strict native send persists immutable text separately from exact identity and exposes only qualified receipt',async()=>{
+ const f=await ready(),text='owned π input\nnext line';
+ const c=await receipt(f,'send','strict-once',{text}),wire=sendWire(f,c.id);
+ assert.deepEqual(wire.identity,{id:native,workspace:'/work/peer',tag:'peer'});
+ assert.equal(wire.submission.operation_id,c.id);assert.equal(wire.submission.text,text);
+ assert.equal(wire.submission.deadline_ms,c.deadline_ms);
+ assert.equal(wire.submission.request_sha256,await sha256Hex(JSON.stringify([native,c.id,'peer','/work/peer',1,c.deadline_ms,text])));
+ assert(!JSON.stringify(c).includes(text));
+ assert.equal((await f.create('send','strict-once',{text})).status,200);
+ assert.equal((await f.create('send','strict-once',{text:'changed'})).status,409);
+ assert.equal((await f.ack(c,sendProof(wire,{private_text:text}))).status,200);
+ const view=await f.view(c.id);assert.equal(view.state,'acked');assert.equal(view.ack.submitted,true);
+ assert.equal(view.ack.outcome,'submitted_verified');assert.equal(view.ack.consumed,null);
+ assert(!JSON.stringify(view).includes(text));assert(!Object.hasOwn(view.ack.submission,'private_text'));
+ assert.equal((await f.ack(c,sendProof(wire))).status,200);
+ assert.equal(f.db.prepare('SELECT COUNT(*) n FROM sessions').get()!.n,0);f.db.close();
+});
+
+test('strict send rejects unqualified or consuming receipts and binds negative outcomes without retry',async()=>{
+ const f=await ready(),c=await receipt(f,'send','proof',{text:'owned'}),wire=sendWire(f,c.id);
+ for(const changes of [{version:true},{version:2},{session_id:crypto.randomUUID()},{operation_id:crypto.randomUUID()},
+  {request_sha256:'0'.repeat(64)},{deadline_ms:1},{consumed:true},{consumed:undefined},{landed:false},{mutation:false},{reason:'not_observed'}]){
+  assert.equal((await f.ack(c,sendProof(wire,changes))).status,400,JSON.stringify(changes));
+  assert.equal((await f.view(c.id)).state,'pending');
+ }
+ assert.equal((await f.ack(c,sendProof(wire,{status:'uncertain',mutation:null,landed:null,submitted:null,reason:'strict_transport_uncertain'}))).status,200);
+ const failed=await f.view(c.id);assert.equal(failed.state,'failed');assert.equal(failed.ack.error,'native_send_uncertain');assert.equal(failed.ack.consumed,null);
+ assert.equal((await f.create('send','proof',{text:'owned'})).status,200);
+ const socket=f.socket();await (f.machine as any).sendPendingCommands(socket.socket,'h1');assert.equal(socket.sent.length,0);
+ assert.equal((await f.ack(c,sendProof(wire))).status,409);f.db.close();
+});
+
+test('strict native send validates text bytes and fresh running incarnation before enqueue',async()=>{
+ const f=await ready();
+ for(const text of ['', ' ','a'.repeat(8193),'界'.repeat(2731),'x\u0000','x\u001b','x\u0080','\ud800'])
+  assert.equal((await f.create('send','invalid',{text})).status,400);
+ assert.equal(f.db.prepare('SELECT COUNT(*) n FROM native_commands').get()!.n,0);
+ const max=await receipt(f,'send','max',{text:'a'.repeat(8192)});assert(!JSON.stringify(max).includes('a'.repeat(8192)));
+ for(const changes of [{created_at_ms:null},{created_at_ms:0},{state:'exited'},{worker_alive:false},{phase:'starting'}]){
+  const row=JSON.parse(f.db.prepare('SELECT row_json FROM native_inventory_rows').get()!.row_json as string);
+  f.db.prepare('UPDATE native_inventory_rows SET row_json=?').run(JSON.stringify({...row,...changes}));(f.machine as any).db.cache.clear();
+  assert.equal((await f.create('send','not-running-'+Object.keys(changes)[0],{text:'owned'})).status,409);
+  f.db.prepare('UPDATE native_inventory_rows SET row_json=?').run(JSON.stringify(row));(f.machine as any).db.cache.clear();
+ }
+ f.db.close();
+});
+
+test('pending strict send requalifies census freshness and incarnation before socket delivery',async()=>{
+ for(const change of ['stale','creation','tag']){
+  const f=await ready(),c=await receipt(f,'send','pending',{text:'owned'});
+  if(change==='stale')f.db.exec('DELETE FROM native_inventory_meta');
+  else{
+   const row=JSON.parse(f.db.prepare('SELECT row_json FROM native_inventory_rows').get()!.row_json as string);
+   f.db.prepare('UPDATE native_inventory_rows SET row_json=?').run(JSON.stringify({...row,...(change==='creation'?{created_at_ms:2}:{tag:'other'})}));
+  }
+  (f.machine as any).db.cache.clear();const socket=f.socket();await (f.machine as any).sendPendingCommands(socket.socket,'h1');
+  assert.equal(socket.sent.length,0);assert.equal((await f.view(c.id)).state,'failed');assert.equal((await f.view(c.id)).ack.consumed,null);f.db.close();
+ }
+});
+
+test('concurrent strict sends with one request key share the durable operation and changed text conflicts',async()=>{
+ const f=await ready();const responses=await Promise.all([f.create('send','race',{text:'owned'}),f.create('send','race',{text:'owned'})]);
+ assert.deepEqual(responses.map(r=>r.status).sort(),[200,201]);
+ const values=await Promise.all(responses.map(r=>r.json() as Promise<any>));assert.equal(values[0].command.id,values[1].command.id);
+ assert.equal(f.db.prepare('SELECT COUNT(*) n FROM native_commands').get()!.n,1);
+ assert.equal((await f.create('send','race',{text:'new text'})).status,409);f.db.close();
+});
+
+
+test('real Python strict adapter journal and fresh census compose with Machine SEND ACK without duplicate effect',async()=>{
+ const f=fixture();await f.boot();
+ const base=resolve(import.meta.dirname,'../../.local/tmp');mkdirSync(base,{recursive:true});const dir=mkdtempSync(join(base,'strict-send-wire-'));
+ try{
+  await f.publish(dir);const c=await receipt(f,'send','composed',{text:'owned synthetic π input'}),wire=sendWire(f,c.id);
+  const script=`import json,sys,subprocess,time,hashlib
+from pathlib import Path
+from agent_hub_host.agent import Bridge,Journal
+command=json.loads(sys.stdin.read());root=Path(command['identity']['workspace']);journal=Journal(root/'private/journal.sqlite')
+row={'id':command['native_id'],'tag':command['identity']['tag'],'workspace':str(root),'phase':'running','state':'running','worker_alive':True,'created_at_ms':1,'schema_version':1}
+calls=[]
+def runner(args,**kwargs):
+ calls.append(args[1])
+ if args[1]=='list':return subprocess.CompletedProcess(args,0,json.dumps([row]),'')
+ if args[1]=='status':return subprocess.CompletedProcess(args,0,json.dumps(row),'')
+ assert args[1]=='send' and '--strict' in args and '--enter' in args and '--stdin' in args
+ assert journal.db.execute('SELECT state FROM commands WHERE id=?',(command['id'],)).fetchone()['state']=='executing'
+ assert command['submission']['text'] not in args
+ operation=args[args.index('--idempotency-key')+1];deadline=int(args[args.index('--deadline-ms')+1])
+ digest=hashlib.sha256(json.dumps([args[2],operation,args[args.index('--expect-tag')+1],args[args.index('--expect-workspace')+1],int(args[args.index('--expect-created-at-ms')+1]),deadline,kwargs['input']],ensure_ascii=False,separators=(',',':')).encode()).hexdigest()
+ return subprocess.CompletedProcess(args,0,json.dumps({'version':1,'session_id':args[2],'operation_id':operation,'request_sha256':digest,'deadline_ms':deadline,'status':'submitted_verified','mutation':True,'landed':True,'submitted':True,'consumed':None,'reason':'submission_observed'}),'')
+bridge=Bridge(None,journal,[root],['codex'],executable=sys.executable,runner=runner,machine_id='h1',launcher_config={'private_provider_homes':True})
+bridge.command(command);journal.db.close();journal=Journal(root/'private/journal.sqlite');bridge.journal=journal;bridge.launcher.journal=journal
+bridge.command(command)
+assert calls.count('send')==1 and calls.count('list')==1
+payload=json.loads(journal.db.execute('SELECT payload FROM outbox').fetchone()[0]);journal.db.close()
+print(json.dumps(payload))
+`;
+  const child=spawnSync('python3',['-c',script],{input:JSON.stringify(wire),encoding:'utf8',timeout:15000,maxBuffer:16384,
+   env:{...process.env,PYTHONPATH:resolve(import.meta.dirname,'../host')}});
+  assert.equal(child.status,0,child.stderr);const payload=JSON.parse(child.stdout);
+  assert.equal((await f.call(f.path+'/'+c.id+'/ack','POST',payload,host)).status,200);
+  const view=await f.view(c.id);assert.equal(view.ack.submitted,true);assert.equal(view.ack.consumed,null);
+  assert(!JSON.stringify(view).includes(wire.submission.text));
+ }finally{f.db.close();rmSync(dir,{recursive:true});}
+});
+
+test('strict send keeps maximum Unicode wire identity private while receipt remains bounded',async()=>{
+ const f=fixture();await f.boot();const workspace='/'+'界'.repeat(2730),text='界'.repeat(2730);await f.publish(workspace);
+ const c=await receipt(f,'send','unicode',{text}),wire=sendWire(f,c.id);
+ assert.equal(wire.identity.workspace,workspace);assert.equal(wire.submission.text,text);
+ assert.equal((await f.ack(c,sendProof(wire))).status,200);
+ const view=await f.view(c.id);assert(!JSON.stringify(view).includes(workspace));assert(!JSON.stringify(view).includes(text));
+ assert(new TextEncoder().encode(JSON.stringify(view)).length<2048);f.db.close();
 });

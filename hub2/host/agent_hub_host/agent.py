@@ -776,6 +776,8 @@ class Bridge:
                 or type(command.get('deadline_ms')) is not int
                 or command.get('kind') not in {'stop', 'capture', 'send'}):
             raise ValueError('invalid_native_command')
+        if command['kind'] == 'send':
+            native_launch.native_submission(command)
         digest = hashlib.sha256(canonical(command).encode()).hexdigest()
         path = f"/api/machines/{self.machine_id}/native/{native_id}/commands/{identity}/ack"
         db = self.journal.db
@@ -798,8 +800,6 @@ class Bridge:
                               else {'error': 'native_command_outcome_uncertain'})
             with db:
                 self.begin_command(identity, digest)
-            if command['kind'] == 'send':
-                return finish({'error': 'native_send_unsupported_safe_input'})
             if command['deadline_ms'] <= time.time()*1000 or command['deadline_ms'] > time.time()*1000+90000:
                 return finish({'error': 'native_command_deadline'})
             if db.execute('SELECT 1 FROM launches WHERE native_id=?', (native_id,)).fetchone():

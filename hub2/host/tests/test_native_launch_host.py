@@ -680,3 +680,101 @@ class CentralSpawnEnvironmentTest(unittest.TestCase):
             # The spawn client itself carries no ambient provider credential.
             self.assertNotIn('CODEX_HOME', options['env'])
             client.request.assert_called_once_with('POST', '/api/sessions/session-env/admission', mock.ANY)
+
+
+class StrictNativeSendTests(unittest.TestCase):
+    def setUp(self):
+        import sqlite3
+        from types import SimpleNamespace
+        self.temp=tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.workspace=self.temp.name
+        self.db=sqlite3.connect(':memory:');self.addCleanup(self.db.close)
+        self.db.execute('CREATE TABLE launches(native_id TEXT)')
+        self.native='11111111-1111-4111-8111-111111111111'
+        self.operation='22222222-2222-4222-8222-222222222222'
+        self.row={'id':self.native,'tag':'synthetic-peer','workspace':self.workspace,'schema_version':1,
+            'phase':'running','state':'running','worker_alive':True,'created_at_ms':42}
+        self.calls=[];self.changes={};self.returncode=0;self.raw=None
+        self.adapter=nl.NativeLauncher({'aplexer':'synthetic-a'},runner=self.runner,journal=SimpleNamespace(db=self.db))
+
+    def command(self,text='synthetic π input\nline\t2'):
+        deadline=round(time.time()*1000)+60000
+        digest=__import__('hashlib').sha256(json.dumps([self.native,self.operation,self.row['tag'],self.workspace,42,deadline,text],
+            ensure_ascii=False,separators=(',',':')).encode()).hexdigest()
+        return {'id':self.operation,'kind':'send','native_id':self.native,'deadline_ms':deadline,
+            'identity':{key:self.row[key] for key in ('id','tag','workspace')},
+            'submission':{'operation_id':self.operation,'created_at_ms':42,'deadline_ms':deadline,'text':text,'request_sha256':digest}}
+
+    def runner(self,args,**kw):
+        self.calls.append((args,kw))
+        if args[1]=='status':return subprocess.CompletedProcess(args,0,json.dumps(self.row),'')
+        if args[1]=='list':return subprocess.CompletedProcess(args,0,json.dumps([self.row]),'')
+        self.assertEqual(args[1],'send')
+        deadline=int(args[args.index('--deadline-ms')+1])
+        digest=__import__('hashlib').sha256(json.dumps([args[2],args[args.index('--idempotency-key')+1],
+            args[args.index('--expect-tag')+1],args[args.index('--expect-workspace')+1],int(args[args.index('--expect-created-at-ms')+1]),deadline,kw['input']],
+            ensure_ascii=False,separators=(',',':')).encode()).hexdigest()
+        result={'version':1,'session_id':self.native,'operation_id':self.operation,'request_sha256':digest,
+            'deadline_ms':deadline,'status':'submitted_verified','mutation':True,'landed':True,'submitted':True,
+            'consumed':None,'reason':'submission_observed','untrusted_text':'must-never-leak',**self.changes}
+        return subprocess.CompletedProcess(args,self.returncode,json.dumps(result) if self.raw is None else self.raw,'private stderr never exposed')
+
+    def test_exact_strict_argv_stdin_deadline_and_whitelisted_positive_receipt(self):
+        command=self.command();result=self.adapter.native_control(command)
+        args,kw=self.calls[-1]
+        self.assertEqual(args,['synthetic-a','send',self.native,'--strict','--enter','--expect-tag','synthetic-peer',
+            '--expect-workspace',self.workspace,'--expect-created-at-ms','42','--idempotency-key',self.operation,'--deadline-ms',str(command['deadline_ms']),'--stdin','--json'])
+        self.assertEqual(kw['input'],command['submission']['text'])
+        self.assertNotIn(command['submission']['text'],' '.join(args))
+        self.assertLessEqual(kw['timeout'],13)
+        self.assertEqual(result['submission']['request_sha256'],command['submission']['request_sha256'])
+        self.assertIsNone(result['submission']['consumed'])
+        self.assertNotIn('untrusted_text',result['submission'])
+        self.assertEqual([args[1] for args,_ in self.calls],['status','list','send'])
+
+    def test_foreign_missing_or_malformed_receipts_are_unverified_and_never_fallback(self):
+        for changes in ({'version':True},{'version':2},{'session_id':self.operation},{'operation_id':self.native},
+                        {'request_sha256':'0'*64},{'deadline_ms':1},{'deadline_ms':True},{'consumed':False},
+                        {'landed':False},{'mutation':1},{'reason':'unsafe_detail private'}, {'reason':'preflight_refused'}):
+            self.changes=changes;self.calls=[]
+            result=self.adapter.native_control(self.command())
+            self.assertEqual(result['error'],'native_send_receipt_unverified',changes)
+            self.assertEqual(sum(args[1]=='send' for args,_ in self.calls),1)
+        for raw,code in (('',2),('{bad',0),('{"version":1,"version":2}',0)):
+            self.raw=raw;self.returncode=code;self.calls=[]
+            self.assertEqual(self.adapter.native_control(self.command())['error'],'native_send_receipt_unverified')
+            self.assertEqual(sum(args[1]=='send' for args,_ in self.calls),1)
+
+    def test_structured_refusal_and_uncertainty_do_not_claim_consumption(self):
+        for status in ('refused','uncertain'):
+            self.changes={'status':status,'mutation':False if status=='refused' else None,
+                'landed':False,'submitted':False,'reason':'strict_platform_unsupported' if status=='refused' else 'strict_transport_uncertain'}
+            self.returncode=4
+            result=self.adapter.native_control(self.command())['submission']
+            self.assertEqual(result['status'],status);self.assertIsNone(result['consumed'])
+
+    def test_invalid_text_digest_or_incarnation_has_zero_send_effect(self):
+        for text in ('','  ','x\x1b[200~','\x00','\u0080','界'*2731):
+            with self.assertRaisesRegex(ValueError,'invalid_native_send'):self.adapter.native_control(self.command(text))
+        command=self.command();command['submission']['request_sha256']='0'*64
+        with self.assertRaisesRegex(ValueError,'invalid_native_send'):self.adapter.native_control(command)
+        for value in (43,True,None):
+            self.row['created_at_ms']=value
+            with self.assertRaisesRegex(RuntimeError,'identity_mismatch'):self.adapter.native_control(self.command())
+        self.assertFalse(any(args[1]=='send' for args,_ in self.calls))
+
+    def test_fresh_census_liveness_and_deadline_are_rechecked_before_strict_input(self):
+        from types import SimpleNamespace
+        for changes in ({'created_at_ms':43},{'workspace':'/foreign'},{'worker_alive':False},{'phase':'exited'},{'state':'unknown'}):
+            self.adapter.inventory=lambda:SimpleNamespace(rows=[{**self.row,**changes}],fresh=lambda:True)
+            with self.assertRaisesRegex(RuntimeError,'identity_mismatch'):self.adapter.native_control(self.command())
+        self.adapter.inventory=lambda:SimpleNamespace(rows=[self.row],fresh=lambda:False)
+        with self.assertRaisesRegex(RuntimeError,'native_census_stale'):self.adapter.native_control(self.command())
+        self.adapter.inventory=lambda:SimpleNamespace(rows=[self.row],fresh=lambda:True)
+        command=self.command();command['deadline_ms']=round(time.time()*1000)+1000
+        command['submission']['deadline_ms']=command['deadline_ms']
+        command['submission']['request_sha256']=__import__('hashlib').sha256(json.dumps([self.native,self.operation,self.row['tag'],self.workspace,42,
+            command['deadline_ms'],command['submission']['text']],ensure_ascii=False,separators=(',',':')).encode()).hexdigest()
+        with self.assertRaisesRegex(RuntimeError,'native_command_deadline'):self.adapter.native_control(command)
+        self.assertFalse(any(args[1]=='send' for args,_ in self.calls))

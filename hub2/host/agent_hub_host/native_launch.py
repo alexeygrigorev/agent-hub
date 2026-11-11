@@ -25,6 +25,31 @@ FIRST_ACTION_INSTRUCTION = (
 )
 REQUIRED_WHOAMI_FIELDS = {"id", "tag", "workspace", "command", "phase", "schema_version", "worker_pid"}
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+def native_submission(command):
+    """Validate the private immutable strict-SEND wire intent, without effects."""
+    submission = command.get('submission')
+    if (not isinstance(submission, dict) or set(submission) != {'operation_id', 'created_at_ms', 'deadline_ms', 'text', 'request_sha256'}
+            or submission.get('operation_id') != command.get('id')
+            or any(not isinstance(command.get(key), str) or not UUID_RE.fullmatch(command[key])
+                   or command[key] != command[key].lower() for key in ('id', 'native_id'))
+            or type(submission.get('created_at_ms')) is not int or not 0 < submission['created_at_ms'] <= 2**53-1
+            or type(submission.get('deadline_ms')) is not int or submission['deadline_ms'] != command.get('deadline_ms')
+            or not 0 < submission['deadline_ms'] <= 2**53-1):
+        raise ValueError('invalid_native_send')
+    text = submission.get('text')
+    try:
+        valid = (isinstance(text, str) and bool(text.strip()) and len(text.encode('utf8')) <= 8192
+                 and not any((ord(c) < 32 or 127 <= ord(c) <= 159) and c not in '\n\r\t' for c in text))
+        target = command['identity']
+        digest = hashlib.sha256(json.dumps([command['native_id'], command['id'], target['tag'], target['workspace'],
+            submission['created_at_ms'], submission['deadline_ms'], text], ensure_ascii=False, separators=(',', ':')).encode('utf8')).hexdigest()
+    except (KeyError, TypeError, UnicodeError):
+        raise ValueError('invalid_native_send') from None
+    if not valid or submission.get('request_sha256') != digest:
+        raise ValueError('invalid_native_send')
+    return submission
+
+
 TOMBSTONE_ENVELOPE_BYTES = 1048576
 TOMBSTONE_METADATA_BYTES = 65536
 # The only approved OpenCode subscription model; GLM never leaves the zai route.
@@ -462,6 +487,72 @@ class NativeLauncher:
             return None
         return row if isinstance(row, dict) else None
 
+    def strict_native_send(self, command, row):
+        submission = native_submission(command)
+        expected, native_id = command['identity'], command['native_id']
+        if (row.get('workspace') != expected['workspace'] or type(row.get('created_at_ms')) is not int
+                or row.get('created_at_ms') != submission['created_at_ms']
+                or row.get('phase', row.get('state')) != 'running'):
+            raise RuntimeError('native_target_identity_mismatch')
+        # A newly collected complete census, not a cached heartbeat, requalifies
+        # the exact incarnation. Strict native RPC repeats its own worker fence.
+        observation = self.inventory()
+        if not observation.fresh():
+            raise RuntimeError('native_census_stale')
+        matches = [item for item in observation.rows if item.get('id') == native_id]
+        if (len(matches) != 1 or any(matches[0].get(key) != value for key, value in expected.items())
+                or type(matches[0].get('created_at_ms')) is not int or matches[0].get('created_at_ms') != submission['created_at_ms']
+                or matches[0].get('state') != 'running' or matches[0].get('phase') != 'running'
+                or matches[0].get('worker_alive') is not True):
+            raise RuntimeError('native_target_identity_mismatch')
+        if self.journal is None:
+            raise RuntimeError('native_target_ownership_unavailable')
+        if self.journal.db.execute('SELECT 1 FROM launches WHERE native_id=?', (native_id,)).fetchone():
+            raise RuntimeError('native_target_managed')
+        remaining = (command['deadline_ms'] - time.time()*1000)/1000
+        if remaining < 12:
+            raise RuntimeError('native_command_deadline')
+        try:
+            response = self.native('send', native_id, '--strict', '--enter', '--expect-tag', expected['tag'],
+                '--expect-workspace', expected['workspace'], '--expect-created-at-ms', str(submission['created_at_ms']),
+                '--idempotency-key', command['id'],
+                '--deadline-ms', str(command['deadline_ms']), '--stdin', '--json', input=submission['text'],
+                allow_failure=True, timeout=min(remaining, 13), output_limit=16384)
+        except subprocess.TimeoutExpired:
+            return {'error': 'native_send_uncertain', 'consumed': None}
+        def unique(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError('duplicate_receipt_field')
+                result[key] = value
+            return result
+        try:
+            receipt = json.loads(response.stdout, object_pairs_hook=unique)
+            if (not isinstance(receipt, dict) or type(receipt.get('version')) is not int or receipt['version'] != 1
+                    or receipt.get('session_id') != native_id or receipt.get('operation_id') != command['id']
+                    or receipt.get('request_sha256') != submission['request_sha256']
+                    or type(receipt.get('deadline_ms')) is not int or receipt['deadline_ms'] != command['deadline_ms']
+                    or 'consumed' not in receipt or receipt['consumed'] is not None
+                    or not isinstance(receipt.get('reason'), str) or not re.fullmatch('[a-z_]{1,80}', receipt['reason'])):
+                raise ValueError('unverified_receipt')
+            verified = (response.returncode == 0 and receipt.get('status') == 'submitted_verified'
+                and all(receipt.get(key) is True for key in ('mutation', 'landed', 'submitted'))
+                and receipt['reason'] == 'submission_observed')
+            refused = (response.returncode == 4 and receipt.get('status') == 'refused'
+                and all(receipt.get(key) is False for key in ('mutation', 'landed', 'submitted')))
+            uncertain = (response.returncode == 4 and receipt.get('status') == 'uncertain'
+                and all(receipt.get(key) is None or type(receipt[key]) is bool for key in ('mutation', 'landed', 'submitted')))
+            if not (verified or refused or uncertain):
+                raise ValueError('unverified_receipt')
+            proof = {key: receipt.get(key) for key in ('version', 'session_id', 'operation_id', 'request_sha256',
+                'deadline_ms', 'status', 'mutation', 'landed', 'submitted', 'consumed', 'reason')}
+            if receipt.get('replayed') is True:
+                proof['replayed'] = True
+            return {'submission': proof}
+        except (ValueError, TypeError):
+            return {'error': 'native_send_receipt_unverified', 'consumed': None}
+
     def native_control(self, command):
         """Exact UUID only. Missing registry rows never prove native exit."""
         kind, native_id, expected = command['kind'], command['native_id'], command['identity']
@@ -515,8 +606,10 @@ class NativeLauncher:
                 return proof(retired, 'aplexer_retirement') or {'stopped': False, 'error': 'stop_unconfirmed'}
             result = proof(status(), 'aplexer_status')
             return result or {'stopped': False, 'error': 'stop_unconfirmed'}
+        if kind == 'send':
+            return self.strict_native_send(command, row)
         if kind != 'capture':
-            raise RuntimeError('native_send_unsupported_safe_input')
+            raise RuntimeError('invalid_native_command')
         args = ('--screen', '--plain') if command.get('mode') == 'screen' else ('--bytes', '4096')
         raw = self.native('capture', native_id, *args, timeout=remaining()).stdout
         # Operator-only bounded output. Strip terminal controls, not just ANSI colour.

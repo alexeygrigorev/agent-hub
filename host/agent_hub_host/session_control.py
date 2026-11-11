@@ -1303,11 +1303,28 @@ def _execute(args):
         return request('POST', '/api/sessions/' + quote(args.id, safe='') + '/' + cmd, {'key': args.key})
     if cmd in ('send', 'capture', 'stop') and _native_command_path(args.id):
         native = _native_command_path(args.id)
-        if cmd == 'send':
-            raise SessionInputError('native_send_unsupported_safe_input; native input safety is not verified')
         timeout, interval = check_wait_args(args)
         key = getattr(args, 'key', None) or str(uuid.uuid4())
         payload = {'kind': cmd, 'key': key}
+        if cmd == 'send':
+            if getattr(args, 'prompt', None) is not None and getattr(args, 'body_file', None):
+                raise SessionInputError('Cannot specify both --body-file and --prompt')
+            if getattr(args, 'prompt_id', None):
+                from .prompt_schedules import parse_vars
+                rendered = request('POST', '/api/prompts/' + __import__('urllib.parse').parse.quote(args.prompt_id, safe='@') + '/render',
+                                   {'vars': parse_vars(getattr(args, 'var', None)) or {}})
+                text = rendered.get('text')
+            elif getattr(args, 'body_file', None):
+                text = read_file(args.body_file, limit=8192, field='Body file')
+            else:
+                text = getattr(args, 'prompt', None)
+            try:
+                text = read_prompt_text(text, limit=8192, max_chars=8192, field='Prompt')
+            except UnicodeError:
+                raise SessionInputError('invalid_native_send_text') from None
+            if re.search(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', text):
+                raise SessionInputError('invalid_native_send_text')
+            payload['text'] = text
         if cmd == 'capture' and getattr(args, 'screen', False):
             payload['mode'] = 'screen'
         def enqueue_native():
@@ -1320,6 +1337,9 @@ def _execute(args):
         if (not isinstance(command, dict) or not isinstance(command.get('id'), str)
                 or not re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', command['id']) or command.get('target_kind') != 'native'):
             raise SessionInputError(f'invalid_native_command_receipt; reconcile with --key {key} via commands')
+        if cmd == 'send' and (command.get('kind') != 'send' or command.get('machine_id') != args.id.split(':')[1]
+                                  or command.get('native_id') != args.id.split(':')[2] or type(command.get('deadline_ms')) is not int):
+            raise SessionInputError(f'invalid_native_command_receipt; reconcile with --key {key} via commands')
         queued = dict(queued, client_key=key, command_id=command['id'])
         if timeout is not None:
             entry = wait_for_command(args.id, command['id'], timeout, interval)
@@ -1329,7 +1349,22 @@ def _execute(args):
                 if not isinstance(reason, str) or not SAFE_ERROR.fullmatch(reason):
                     reason = 'native_command_unconfirmed'
                 raise SessionInputError(f'{reason}; command {command["id"]}; reconcile with commands')
-            queued['command_wait' if cmd == 'capture' else 'stop_wait'] = entry
+            if cmd == 'send':
+                if not isinstance(ack, dict):
+                    raise SessionInputError(f'native_send_unconfirmed; command {command["id"]}; reconcile with commands')
+                proof = ack.get('submission') if isinstance(ack, dict) else None
+                if not isinstance(proof, dict):
+                    proof = {}
+                if (entry.get('id') != command['id'] or entry.get('native_id') != command['native_id']
+                        or ack.get('submitted') is not True or 'consumed' not in ack or ack['consumed'] is not None
+                        or type(proof.get('version')) is not int or proof.get('version') != 1 or proof.get('operation_id') != command['id']
+                        or proof.get('session_id') != command['native_id'] or proof.get('status') != 'submitted_verified'
+                        or proof.get('landed') is not True or proof.get('submitted') is not True or proof.get('mutation') is not True
+                        or proof.get('deadline_ms') != command['deadline_ms'] or proof.get('reason') != 'submission_observed'
+                        or not isinstance(proof.get('request_sha256'), str) or not re.fullmatch('[0-9a-f]{64}', proof['request_sha256'])
+                        or 'consumed' not in proof or proof['consumed'] is not None):
+                    raise SessionInputError(f'native_send_unconfirmed; command {command["id"]}; reconcile with commands')
+            queued['stop_wait' if cmd == 'stop' else 'command_wait'] = entry
         return queued
     if cmd in ('send', 'capture', 'stop'):
         timeout, interval = check_wait_args(args)
