@@ -5,6 +5,7 @@ host/tests/fixtures/acceptance/. No Hub access, no real session is started or st
 import importlib.util
 import io
 import json
+import hashlib
 import os
 import runpy
 import selectors
@@ -38,7 +39,12 @@ TMP.mkdir(parents=True, exist_ok=True)
 
 
 def evidence(commit=COMMIT, **kw):
-    ev = {'canary': 'success', 'canary_commit': commit, 'ci_e2e': 'success', 'ci_e2e_commit': commit}
+    ev = {'kind': 'phase7_operator_validated_evidence_v1',
+          'canary': 'success', 'canary_commit': commit, 'ci_e2e': 'success', 'ci_e2e_commit': commit,
+          'operator_validation': {'actor': 'offline-fixture', 'target_commit': commit, 'receipts': {
+              name: {'commit': commit, 'reference': 'synthetic://' + name + '/receipt',
+                     'sha256': hashlib.sha256(('offline-' + name).encode()).hexdigest()}
+              for name in ('deployment', 'canary', 'ci_e2e')}}}
     ev.update(kw)
     f = tempfile.NamedTemporaryFile('w', suffix='.json', delete=False, dir=TMP)
     json.dump(ev, f)
@@ -156,6 +162,55 @@ class AcceptanceTests(Harness):
         sequence = [x for x in self.state()['log'] if x == 'start' or x.startswith('stop:')]
         self.assertEqual(sequence[::2], ['start'] * 10)
         self.assertEqual(self.state()['log'].count('start:--intake-task-id'), 10)
+
+    def test_wrong_show_identity_is_refused_and_known_start_is_stopped(self):
+        rc, out = self.go(wrong_show_id=True)
+        self.assertEqual(rc, 1, out)
+        self.assertIn('show session id mismatch', out)
+        self.assertAllStopped()
+        self.assertEqual(self.state()['n'], 1)
+
+    def test_malformed_native_uuid_never_proves_presence_or_cleanup_absence(self):
+        for value in ('native-placeholder', '1234', 'AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE', None, [], {'id': 'untrusted'}):
+            with self.subTest(value=value):
+                rc, out = self.go(native_id=value)
+                self.assertEqual(rc, 1, out)
+                self.assertIn('no canonical native UUID', out)
+                self.assertAllStopped()
+                self.assertEqual(self.state()['n'], 1)
+
+    def test_reused_session_and_native_identities_end_the_consecutive_run(self):
+        for knob, message in [('reuse_session_id', 'session id reused'), ('reuse_native_id', 'native UUID reused')]:
+            with self.subTest(knob=knob):
+                rc, out = self.go(**{knob: True})
+                self.assertEqual(rc, 1, out)
+                self.assertIn(message, out)
+                self.assertAllStopped()
+                self.assertEqual(self.state()['n'], 2)
+
+    def test_assistant_or_result_nonce_is_not_completed_tool_output(self):
+        for knob in ('capture_assistant_only', 'capture_result_only'):
+            with self.subTest(knob=knob):
+                rc, out = self.go(**{knob: True})
+                self.assertEqual(rc, 1, out)
+                self.assertIn('no completed tool output', out)
+                self.assertAllStopped()
+
+    def test_operator_bundle_must_not_change_during_acceptance(self):
+        original = acc.check_evidence
+        calls = []
+        def check(path, commit):
+            calls.append(path)
+            if len(calls) == 2:
+                data = json.loads(Path(path).read_text())
+                data['operator_validation']['actor'] = 'different-offline-validator'
+                Path(path).write_text(json.dumps(data))
+            return original(path, commit)
+        with mock.patch.object(acc, 'check_evidence', side_effect=check):
+            rc, out = self.go()
+        self.assertEqual(rc, 1, out)
+        self.assertIn('evidence bundle changed during run', out)
+        self.assertAllStopped()
 
     def test_same_attempt_snapshot_must_not_change(self):
         rc, out = self.go(show_pool_changed=True)
@@ -465,15 +520,78 @@ class ParserTests(unittest.TestCase):
         prompt, exp = acc.make_probe()
         self.assertNotIn(exp, prompt)
         self.assertFalse(acc.probe_output_ok(prompt, prompt, exp))
-        self.assertTrue(acc.probe_output_ok(prompt + '\n' + exp, prompt, exp))
+        self.assertFalse(acc.probe_output_ok(prompt + '\n' + exp, prompt, exp))
         for event in [
             {'type': 'item.started', 'item': {'type': 'command_execution', 'aggregated_output': exp}},
             {'type': 'item.completed', 'item': {'type': 'command_execution', 'command': exp}},
             {'type': 'reasoning', 'text': exp}, {'prompt': exp},
+            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': exp}},
+            {'type': 'result', 'result': exp},
+            {'type': 'tool_use', 'part': {'type': 'tool', 'tool': 'bash', 'state': {'status': 'running', 'output': exp}}},
+            {'type': 'tool_result', 'tool_use_id': 'synthetic-tool', 'content': exp, 'is_error': True},
         ]:
             self.assertFalse(acc.probe_output_ok(json.dumps(event), prompt, exp), event)
         event = {'type': 'item.completed', 'item': {'type': 'command_execution', 'aggregated_output': exp + '\n'}}
         self.assertTrue(acc.probe_output_ok(json.dumps(event), prompt, exp))
+
+    def test_completed_tool_output_formats_and_failed_statuses(self):
+        prompt, marker = acc.make_probe()
+        positive = [
+            {'type': 'item.completed', 'item': {'type': 'command_execution', 'status': 'completed', 'exit_code': 0, 'aggregated_output': marker}},
+            {'type': 'tool_use', 'part': {'type': 'tool', 'tool': 'bash', 'state': {'status': 'completed', 'output': marker}}},
+            {'type': 'user', 'message': {'role': 'user', 'content': [{'type': 'tool_result', 'tool_use_id': 'synthetic-tool', 'content': marker}]}},
+            {'type': 'tool_result', 'tool_use_id': 'synthetic-tool', 'content': [{'type': 'text', 'text': marker}]},
+        ]
+        for event in positive:
+            self.assertTrue(acc.probe_output_ok(json.dumps(event), prompt, marker), event)
+        contradictory = {'type': 'user', 'message': {'role': 'assistant', 'content': [{'type': 'tool_result', 'tool_use_id': 'synthetic-tool', 'content': marker}]}}
+        self.assertFalse(acc.probe_output_ok(json.dumps(contradictory), prompt, marker))
+        for status in ('in_progress', 'failed', False):
+            event = {'type': 'item.completed', 'item': {'type': 'command_execution', 'status': status, 'aggregated_output': marker}}
+            self.assertFalse(acc.probe_output_ok(json.dumps(event), prompt, marker), event)
+        event = {'type': 'item.completed', 'item': {'type': 'command_execution', 'exit_code': False, 'aggregated_output': marker}}
+        self.assertFalse(acc.probe_output_ok(json.dumps(event), prompt, marker))
+
+    def test_operator_validation_cannot_be_replaced_by_four_green_strings(self):
+        path = Path(evidence())
+        original = json.loads(path.read_text())
+        for mutation in [lambda ev: ev.pop('kind'), lambda ev: ev.pop('operator_validation'),
+                         lambda ev: ev.update(operator_validation=True),
+                         lambda ev: ev['operator_validation'].update(actor=''),
+                         lambda ev: ev['operator_validation'].update(target_commit='b' * 40),
+                         lambda ev: ev['operator_validation']['receipts'].pop('deployment'),
+                         lambda ev: ev['operator_validation']['receipts']['ci_e2e'].update(commit='b' * 40),
+                         lambda ev: ev['operator_validation']['receipts']['canary'].update(sha256='forged'),
+                         lambda ev: ev['operator_validation']['receipts']['deployment'].update(reference='unsafe\nreference')]:
+            import copy
+            ev = copy.deepcopy(original); mutation(ev); path.write_text(json.dumps(ev))
+            self.assertTrue(acc.check_evidence(path, COMMIT), ev)
+
+    def test_local_receipt_bytes_must_match_operator_sha_pin(self):
+        path = Path(evidence());ev = json.loads(path.read_text())
+        receipt = path.with_suffix('.receipt');receipt.write_bytes(b'nonsecret offline deployment receipt')
+        self.addCleanup(receipt.unlink)
+        pin = ev['operator_validation']['receipts']['deployment']
+        pin.update(path=receipt.name, sha256=hashlib.sha256(receipt.read_bytes()).hexdigest())
+        path.write_text(json.dumps(ev));self.assertEqual(acc.check_evidence(path, COMMIT), [])
+        receipt.write_bytes(b'changed receipt')
+        self.assertTrue(any('hash mismatch' in error for error in acc.check_evidence(path, COMMIT)))
+        receipt.unlink()
+        self.assertTrue(any('unreadable' in error for error in acc.check_evidence(path, COMMIT)))
+        receipt.write_bytes(b'restored')
+
+    def test_evidence_and_local_receipts_are_bounded_regular_files(self):
+        path = Path(evidence());original = path.read_bytes()
+        path.write_bytes(b' ' * (acc.EVIDENCE_LIMIT + 1))
+        self.assertTrue(acc.check_evidence(path, COMMIT))
+        path.write_bytes(original)
+        ev = json.loads(original)
+        receipt = path.with_suffix('.receipt');receipt.write_bytes(b'x' * (acc.RECEIPT_LIMIT + 1))
+        self.addCleanup(receipt.unlink)
+        ev['operator_validation']['receipts']['deployment'].update(path=receipt.name)
+        path.write_text(json.dumps(ev));self.assertTrue(acc.check_evidence(path, COMMIT))
+        receipt.unlink();receipt.symlink_to(path)
+        self.assertTrue(acc.check_evidence(path, COMMIT))
 
     def test_current_picker_strict_contract(self):
         import copy

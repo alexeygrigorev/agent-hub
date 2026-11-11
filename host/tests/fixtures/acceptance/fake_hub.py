@@ -115,11 +115,11 @@ def hub(argv):
         model = CFG['models'][i % len(CFG['models'])]
         pool = copy.deepcopy(CFG.get('pool', json.loads((HERE / 'hub_sessions_pick.json').read_text())['pool']))
         chosen = next((x for x in pool if x['model'] == model), dict(policy_id='unknown', model=model, engine='codex', effort='medium'))
-        sid = str(uuid.UUID(int=i + 1))
+        sid = str(uuid.UUID(int=1 if CFG.get('reuse_session_id') else i + 1))
         picker = dict(chosen, policy_version=7, machine_id=CFG.get('host', 'hetzner-aplexer'), attempt=0, pool=pool)
         picker.pop('weight', None); picker.pop('share', None)
         picker['history'] = [choice(picker)]
-        s = dict(id=sid, native_id='native-' + sid, engine=chosen['engine'], model=model, effort=chosen['effort'],
+        s = dict(id=sid, native_id=CFG['native_id'] if 'native_id' in CFG else str(uuid.UUID(int=1001 if CFG.get('reuse_native_id') else i + 1001)), engine=chosen['engine'], model=model, effort=chosen['effort'],
                  workspace=CFG.get('workspace', value(argv, '--cwd')), host=picker['machine_id'], prompt=prompt,
                  stopped=False, picker=picker, policy_id=chosen['policy_id'], policy_version=7)
         ST['sessions'][sid] = s; ST['keys'][key] = sid
@@ -140,6 +140,7 @@ def hub(argv):
         out(dict(row, client_key=key, binding_wait={'session': row_for(s)}))
     if sub == 'show':
         row = row_for(ST['sessions'][argv[2]], show=True)
+        if CFG.get('wrong_show_id'): row['id'] = str(uuid.UUID(int=999999))
         out(row if CFG.get('flat_show') else {'session': row})
     if sub == 'list':
         rows = []
@@ -158,6 +159,10 @@ def hub(argv):
         marker = base64.b64decode(encoded).decode()
         if CFG.get('capture_prompt_only'):
             event = {'type': 'item.started', 'item': {'type': 'command_execution', 'command': s['prompt'], 'aggregated_output': marker}}
+        elif CFG.get('capture_assistant_only'):
+            event = {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': marker}}
+        elif CFG.get('capture_result_only'):
+            event = {'type': 'result', 'result': marker}
         else:
             event = {'type': 'item.completed', 'item': {'type': 'command_execution', 'aggregated_output': marker + '\n'}}
         out({'command_wait': {'state': 'pending' if CFG.get('capture_unacked') else 'acked', 'ack': {'capture': json.dumps(event)}}})
