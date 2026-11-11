@@ -7,6 +7,22 @@ export type { PickInput, PickedRoute, PickDiagnostics, RoutingSnapshot } from '.
 
 const internalActor = JSON.stringify({ id: 'hub2-model-picker', kind: 'operator', scopes: ['operator:admin', 'routing:read'] });
 
+export type CommittedPickIdentity = {
+  project_id: string; operation_id: string; attempt: 0 | 1; previous_picker?: unknown;
+};
+
+/** Real starts and auth fallback share the global Control draw sequence. */
+export async function pickCommittedModelRoute(env: Hub2Env, input: PickInput, identity: CommittedPickIdentity): Promise<{
+  route: PickedRoute; diagnostics: PickDiagnostics;
+}> {
+  const response = await env.CONTROL.get(env.CONTROL.idFromName('global')).fetch('https://picker.internal/_internal/picker/draw', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...identity, input }),
+  });
+  const value = await response.json() as { route: PickedRoute; diagnostics: PickDiagnostics; error?: string; detail?: string };
+  if (!response.ok) throw new HttpError(value.error ?? 'model_picker_data_unavailable', response.status, value.detail);
+  return value;
+}
+
 async function read(namespace: DurableObjectNamespace, id: string, path: string): Promise<any> {
   const response = await namespace.get(namespace.idFromName(id)).fetch('https://picker.internal' + path, {
     headers: { 'x-hub2-actor': internalActor },

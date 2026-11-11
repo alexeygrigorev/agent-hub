@@ -1,16 +1,21 @@
+import {ControlDO} from '../src/control-do';
 import {MachineDO} from '../src/machine-do';
 import {test} from 'node:test';import assert from 'node:assert/strict';import {DatabaseSync} from 'node:sqlite';import {ProjectDO} from '../src/project-do';
 const admin={id:'human:admin',kind:'operator',scopes:['operator:admin']};
-function fixture(options:{modelCandidates?:any[];accountHosts?:Record<string,string[]>;connected?:boolean;lostReleaseFailures?:number;machineFetch?:(request:Request)=>Promise<Response>}={}){const sql=new DatabaseSync(':memory:');let alarm:any=null;const storageValues=new Map<string,unknown>(),ctx:any={id:{toString:()=> 'synthetic-project'},storage:{sql:{exec(q:string,...a:any[]){const p=sql.prepare(q);const rows=p.columns().length?p.all(...a):(p.run(...a),[]);return{toArray:()=>rows};}},transactionSync(fn:any){sql.exec('BEGIN');try{const r=fn();sql.exec('COMMIT');return r;}catch(e){sql.exec('ROLLBACK');throw e;}},async getAlarm(){return alarm;},async setAlarm(at:number){alarm=at;},async deleteAlarm(){alarm=null;},async get(key:string){return storageValues.get(key);},async put(key:string,value:unknown){storageValues.set(key,value);},async delete(key:string){return storageValues.delete(key);}},blockConcurrencyWhile:(f:any)=>Promise.resolve(f())};
+function fixture(options:{modelCandidates?:any[];accountHosts?:Record<string,string[]>;connected?:boolean;lostReleaseFailures?:number;machineFetch?:(request:Request)=>Promise<Response>;lostDrawResponse?:boolean;schemaMode?:string;denyCapacity?:boolean;lostCapResponse?:boolean}={}){const sql=new DatabaseSync(':memory:');let alarm:any=null;const storageValues=new Map<string,unknown>(),ctx:any={id:{toString:()=> 'synthetic-project'},storage:{sql:{exec(q:string,...a:any[]){const p=sql.prepare(q);const rows=p.columns().length?p.all(...a):(p.run(...a),[]);return{toArray:()=>rows};}},transactionSync(fn:any){sql.exec('BEGIN');try{const r=fn();sql.exec('COMMIT');return r;}catch(e){sql.exec('ROLLBACK');throw e;}},async getAlarm(){return alarm;},async setAlarm(at:number){alarm=at;},async deleteAlarm(){alarm=null;},async get(key:string){return storageValues.get(key);},async put(key:string,value:unknown){storageValues.set(key,value);},async delete(key:string){return storageValues.delete(key);}},blockConcurrencyWhile:(f:any)=>Promise.resolve(f())};
+ const collectorSql=new DatabaseSync(':memory:');
+ const collectorContext:any={...ctx,storage:{...ctx.storage,sql:{exec(q:string,...a:any[]){const statement=collectorSql.prepare(q);const rows=statement.columns().length?statement.all(...a):(statement.run(...a),[]);return{toArray:()=>rows};}},transactionSync(fn:any){collectorSql.exec('BEGIN');try{const result=fn();collectorSql.exec('COMMIT');return result;}catch(error){collectorSql.exec('ROLLBACK');throw error;}}}};
+ let control:ControlDO;let loseDraw=options.lostDrawResponse,loseCap=options.lostCapResponse;
  const routes:any[]=[],machineCalls:string[]=[],accountCalls:string[]=[],capReleases:any[]=[];
  let remainingReleaseFailures=options.lostReleaseFailures??0;
  const requestOf=(input:string|Request,init?:RequestInit)=>input instanceof Request?input:new Request(input,init);
- const CONTROL={idFromName:(id:any)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{const request=requestOf(input,init),path=new URL(request.url).pathname;const value=request.method==='GET'?{}:await request.json();routes.push(value);if(path==='/_internal/session-cap/release'){capReleases.push(value);if(remainingReleaseFailures>0){remainingReleaseFailures--;return Response.json({error:'unavailable'},{status:503});}}if(path==='/_routing-policy')return Response.json({version:1,candidates:options.modelCandidates||[]});if(path==='/api/directory')return Response.json({items:[{id:'h1'}],next:null});return Response.json({registered:true,accepted:true});}})};
+ const CONTROL={idFromName:(id:any)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{const request=requestOf(input,init),path=new URL(request.url).pathname;const value=request.method==='GET'?{}:await request.clone().json();routes.push(value);if(path==='/_internal/session-cap/check'&&options.lostCapResponse){const response=await control.fetch(request);if(loseCap&&response.ok){loseCap=false;throw new Error('synthetic_crash_after_capacity_reservation');}return response;}if(path==='/_internal/session-cap/check'&&options.denyCapacity)return Response.json({error:'active_session_limit'},{status:429});if(path==='/_internal/picker/draw'){const response=await control.fetch(request);if(loseDraw&&response.ok){loseDraw=false;throw new Error('synthetic_lost_draw_response');}return response;}if(path==='/_internal/session-cap/release'){capReleases.push(value);if(remainingReleaseFailures>0){remainingReleaseFailures--;return Response.json({error:'unavailable'},{status:503});}}if(path==='/_routing-policy')return Response.json({version:1,candidates:options.modelCandidates||[]});if(path==='/api/directory')return Response.json({items:[{id:'h1'}],next:null});return Response.json({registered:true,accepted:true});}})};
  const MACHINES={idFromName:(id:any)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{const request=requestOf(input,init);const path=new URL(request.url).pathname;machineCalls.push(path);if(options.machineFetch&&path!=='/_internal/routing')return options.machineFetch(request);if(path==='/_internal/routing')return Response.json({machine_id:'h1',connected:options.connected??true,engines:['codex','claude'],capabilities:['headless','interactive']});return Response.json(path.endsWith('/reserve')?{state:'staged',epoch:1}:{state:'offered'});}})};
  const unused={idFromName:(id:any)=>id,get:()=>({fetch:async()=>Response.json({ok:true})})};
  const ACCOUNTS={idFromName:(id:any)=>id,get:(id:string)=>({fetch:async(input:string|Request)=>{const path=new URL(input instanceof Request?input.url:input).pathname;accountCalls.push(path);return Response.json({account:{enabled:true},quota:{remaining:id==='codex'?90:70},hosts:options.accountHosts?.[id]||['h1'],credential_usable:false});}})};
- const env:any={CONTROL,PROJECTS:unused,MACHINES,ACCOUNTS,MAILBOXES:unused};
- let project=new ProjectDO(ctx,env);const call=(p:string,m='GET',b?:unknown,a:any=admin)=>project.fetch(new Request('https://p.test'+p,{method:m,headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(a)},...(b===undefined?{}:{body:JSON.stringify(b)})}));return{sql,get project(){return project;},restart:()=>project=new ProjectDO(ctx,env),routes,machineCalls,accountCalls,capReleases,call,getAlarm:()=>alarm,storageValues};}
+ const env:any={CONTROL,PROJECTS:unused,MACHINES,ACCOUNTS,MAILBOXES:unused,HUB2_SCHEMA_MIGRATIONS:options.schemaMode};
+ control=new ControlDO(collectorContext,env);
+ let project=new ProjectDO(ctx,env);const call=(p:string,m='GET',b?:unknown,a:any=admin)=>project.fetch(new Request('https://p.test'+p,{method:m,headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(a)},...(b===undefined?{}:{body:JSON.stringify(b)})}));return{sql,collectorSql,get project(){return project;},restart:()=>project=new ProjectDO(ctx,env),routes,machineCalls,accountCalls,capReleases,call,getAlarm:()=>alarm,storageValues};}
 const body=async(r:Response)=>await r.json() as any;
 async function intake(f:ReturnType<typeof fixture>,key='task'){const result=await f.call('/api/intakes?project=org/a','POST',{key,title:'Original task',text:'Original requested behavior',acceptance_criteria:['Actual result']});assert.equal(result.status,201);return(await body(result)).intake;}
 test('model-less start falls back to another allowed model after an auth failure',async()=>{
@@ -487,4 +492,57 @@ test('late exit forwards the timeout before completion when the first timeout tr
  const proof=JSON.parse(result.final_evidence_json);
  assert.equal(proof.reason,'launch_timeout_no_native');
  assert.equal(proof.native_exit_confirmed,true);assert.equal(proof.native_id,native);assert.equal(proof.exit_code,0);
+});
+
+
+test('a lost central draw response replays the same draw before creating a saga',async()=>{
+ const candidates=[{id:'codex-sol',engine:'codex',model:'gpt-6.1-sol',effort:'medium',account_id:'codex',weight:1,capabilities:[],enabled:true}];
+ const f=fixture({modelCandidates:candidates,lostDrawResponse:true}),own=await intake(f,'lost-draw');
+ const start={key:'lost-draw',workspace:'/tmp/synthetic-picker'};
+ assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',start)).status,500);
+ assert.equal(f.collectorSql.prepare('SELECT COUNT(*) AS n FROM picker_draws').get()!.n,1);
+ assert.equal(f.sql.prepare('SELECT COUNT(*) AS n FROM dispatch_sagas').get()!.n,0);
+ assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',start)).status,201);
+ assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',start)).status,200);
+ assert.equal(f.collectorSql.prepare('SELECT total_picks FROM picker_alert_counters').get()!.total_picks,1);
+ assert.equal(f.sql.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE name='picker_outbox'").get()!.n,0);
+ assert.equal(f.sql.prepare('SELECT version FROM hub2_schema').get()!.version,4);
+});
+
+
+test('a real centrally committed draw stays counted when downstream capacity refuses the start',async()=>{
+ const candidates=[{id:'codex-sol',engine:'codex',model:'gpt-6.1-sol',effort:'medium',account_id:'codex',weight:1,capabilities:[],enabled:true}];
+ const f=fixture({modelCandidates:candidates,denyCapacity:true}),own=await intake(f,'capacity-refusal');
+ const start={key:'capacity-refusal',workspace:'/tmp/synthetic-picker'};
+ assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',start)).status,429);
+ assert.equal(f.collectorSql.prepare('SELECT total_picks FROM picker_alert_counters').get()!.total_picks,1);
+ assert.equal(f.sql.prepare('SELECT COUNT(*) AS n FROM dispatch_sagas').get()!.n,0);
+ assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',start)).status,429);
+ assert.equal(f.collectorSql.prepare('SELECT total_picks FROM picker_alert_counters').get()!.total_picks,1);
+});
+
+
+test('crash after actual capacity acceptance reuses stable operation and session identities on retry',async()=>{
+ const candidates=[{id:'codex-sol',engine:'codex',model:'gpt-6.1-sol',effort:'medium',account_id:'codex',weight:1,capabilities:[],enabled:true}];
+ const f=fixture({modelCandidates:candidates,lostCapResponse:true}),own=await intake(f,'lost-capacity');
+ const start={key:'lost-capacity',workspace:'/tmp/synthetic-capacity'};
+ assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',start)).status,500);
+ const reservation=f.collectorSql.prepare('SELECT operation_id,session_id FROM session_start_reservations').get()!;
+ assert(reservation.operation_id);assert(reservation.session_id);assert.notEqual(reservation.operation_id,reservation.session_id);
+ assert.equal(f.sql.prepare('SELECT COUNT(*) AS n FROM dispatch_sagas').get()!.n,0);
+ f.restart();
+ assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',start)).status,201);
+ const saga=f.sql.prepare('SELECT operation_id,session_id FROM dispatch_sagas').get()!;
+ assert.deepEqual({...saga},{...reservation});
+ assert.equal(f.collectorSql.prepare('SELECT COUNT(*) AS n FROM session_start_reservations').get()!.n,1);
+ assert.equal(f.collectorSql.prepare('SELECT total_picks FROM picker_alert_counters').get()!.total_picks,1);
+});
+
+test('a collector SQL failure does not refuse a normally routable Project start',async()=>{
+ const candidates=[{id:'codex-sol',engine:'codex',model:'gpt-6.1-sol',effort:'medium',account_id:'codex',weight:1,capabilities:[],enabled:true}];
+ const f=fixture({modelCandidates:candidates}),own=await intake(f,'observer-failure');
+ f.collectorSql.exec("CREATE TRIGGER reject_collector BEFORE INSERT ON picker_draws BEGIN SELECT RAISE(ABORT,'synthetic collector write failure'); END");
+ assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',{key:'observer-failure',workspace:'/tmp/synthetic-picker'})).status,201);
+ assert.equal(f.sql.prepare('SELECT COUNT(*) AS n FROM dispatch_sagas').get()!.n,1);
+ assert.equal(f.collectorSql.prepare('SELECT COUNT(*) AS n FROM picker_draws').get()!.n,0);
 });
