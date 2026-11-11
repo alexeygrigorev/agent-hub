@@ -1,3 +1,5 @@
+import { DeploymentCredentials } from './deployment-credentials';
+import { isDeploymentActor } from './types';
 import {PickerAlerts,PICKER_ALERT_SCHEMA} from './picker-alerts';
 import {pickModelRouteDetailed,type PickInput} from './model-picker';
 import {buildStartPickerEvidence} from './start-picker-evidence';
@@ -102,6 +104,7 @@ export class ControlDO {
   private readonly auth:ControlAuth;
   private readonly workers:WorkerCredentials;
   private readonly memory:SharedMemory;
+  private readonly deploymentCredentials:DeploymentCredentials;
   private readonly pickerAlerts:PickerAlerts;
   private readonly ready:Promise<void>;
   private pickerQueue:Promise<void> = Promise.resolve();
@@ -122,6 +125,7 @@ export class ControlDO {
       await this.scheduleWake();
     },1,schemaMigrationCeiling(env.HUB2_SCHEMA_MIGRATIONS,4,6));
     this.memory=new SharedMemory(ctx,this.db,this.env);
+    this.deploymentCredentials=new DeploymentCredentials(ctx,this.db,this.env);
     this.auth=new ControlAuth(ctx,this.db,this.env);this.workers=new WorkerCredentials(ctx,this.db,this.env);
   }
 
@@ -138,6 +142,7 @@ export class ControlDO {
       const workerResponse=await this.workers.fetch(request);if(workerResponse)return workerResponse;
       const authResponse=await this.auth.fetch(request);if(authResponse)return authResponse;
       const memoryResponse=await this.memory.fetch(request);if(memoryResponse)return memoryResponse;
+      const deploymentResponse=await this.deploymentCredentials.fetch(request);if(deploymentResponse)return deploymentResponse;
       if(url.pathname==='/_internal/session-cap/check'&&request.method==='POST')return await this.checkSessionCap(request);
       if(url.pathname==='/_internal/session-cap/release'&&request.method==='POST')return await this.releaseSessionStart(request);
       if (url.pathname === '/_oncall/config' && request.method === 'POST') return await this.configureOncall(request);
@@ -736,6 +741,7 @@ export class ControlDO {
     );
     if (!row){const actor=this.workers.verifyHash(tokenHash);return actor?json({actor}):error('invalid_credentials',401);}
     if(row.kind==='operator'){const actor=verifyKnownCredential(row,this.env);return actor?json({actor}):error('invalid_credentials',401);}
+    if(row.kind==='service'){const actor=this.deploymentCredentials.verifyHash(tokenHash);return actor?json({actor}):error('invalid_credentials',401);}
     if(row.kind!=='machine')return error('invalid_credentials',401);
     let scopes: unknown;
     try { scopes = JSON.parse(row.scopes_json); } catch { return error('credential_corrupt', 503); }
@@ -745,6 +751,7 @@ export class ControlDO {
 
   private async authorizeCurrent(request: Request): Promise<Response> {
     const body = await bodyObject(request.clone(), 4096);
+    if(typeof body.actor_id==='string'&&body.actor_id.startsWith('deployment:'))return this.deploymentCredentials.authorize(body);
     if(typeof body.actor_id==='string'&&body.actor_id.startsWith('session:'))return this.workers.authorize(body);
     if(typeof body.actor_id==='string'&&body.actor_id.startsWith('human:'))return (await this.auth.fetch(new Request('https://control.internal/_auth/authorize',{method:'POST',headers:request.headers,body:JSON.stringify(body)})))||error('forbidden',403);
     if (typeof body.actor_id !== 'string' || typeof body.generation !== 'string' || typeof body.scope !== 'string') return error('invalid_authorization_check', 400);
@@ -1152,7 +1159,7 @@ export class ControlDO {
       const current=readPolicy(),candidates=current?JSON.parse(current.candidates_json):[];
       return candidates.length?json({version:current!.version,candidates}):json({error:'model_policy_unconfigured',version:current?.version??0},404);
     }
-    if(path==='/_routing-policy'||!['PUT','POST'].includes(request.method)||!hasScope(actor,'operator:admin'))return error('forbidden',403);
+    if(path==='/_routing-policy'||!['PUT','POST'].includes(request.method)||!(hasScope(actor,'operator:admin')||isDeploymentActor(actor)))return error('forbidden',403);
     const b=await bodyObject(request,128000);
     const recovery=request.method==='POST';
     const protocol='model-policy-recovery-v1';

@@ -1,3 +1,4 @@
+import { isDeploymentActor } from './types';
 import type { Actor, JsonRecord } from './types';
 
 export const HUB2_FORWARD_BODY_LIMIT = 98_304;
@@ -58,10 +59,11 @@ export function actorFrom(request: Request): Actor | undefined {
     const value = request.headers.get('x-hub2-actor');
     if (!value || value.length > 2_048) return undefined;
     const parsed = JSON.parse(value) as Actor;
-    if (!parsed || typeof parsed.id !== 'string' || !['operator', 'machine', 'agent'].includes(parsed.kind)
+    if (!parsed || typeof parsed.id !== 'string' || !['operator', 'machine', 'agent', 'service'].includes(parsed.kind)
       || !Array.isArray(parsed.scopes) || !parsed.scopes.every(scope => typeof scope === 'string')
       || (parsed.resource_id !== undefined && typeof parsed.resource_id !== 'string')
       || (parsed.generation !== undefined && typeof parsed.generation !== 'string')) return undefined;
+    if (parsed.kind === 'service' && !isDeploymentActor(parsed)) return undefined;
     return parsed;
   } catch { return undefined; }
 }
