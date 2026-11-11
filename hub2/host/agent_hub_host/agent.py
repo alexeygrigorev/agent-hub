@@ -14,6 +14,7 @@ from pathlib import Path
 
 from .client import ApiError, private_file, save_config
 from . import native_launch
+from .advertisement import Advertisement
 from .native_launch import NativeLauncher, LOCAL_ROUTES, UUID_RE, canonical, native_returncode, same_workspace, spawn_environment
 from .local_auth_readiness import local_claude_missing_contexts
 
@@ -148,9 +149,10 @@ class OfferAcknowledgement:
 
 
 class Bridge:
-    def __init__(self, client, journal, roots, engines, executable="a", runner=subprocess.run, launcher_config=None,machine_id=None):
+    def __init__(self, client, journal, roots, engines, executable="a", runner=subprocess.run, launcher_config=None,machine_id=None,capabilities=None,workspaces=None):
         self.client, self.journal, self.runner = client, journal, runner
         self.roots = [Path(root).resolve(strict=True) for root in roots]
+        self.advertisement = Advertisement(self.roots, capabilities, workspaces)
         self.engines = set(engines) | {"shell"}
         # The Hub picks a route; the host spawns it directly through aplexer.
         # The external launcher runtime is not consulted for admission or spawn.
@@ -242,6 +244,10 @@ class Bridge:
             return workspace
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value):
             raise ValueError("invalid_workspace")
+
+        alias = self.advertisement.resolve_alias(value)
+        if alias is not None:
+            return alias
 
         # Enrolled roots may name one workspace directly or contain several
         # named workspace directories. Prefer an exact root label when present.
@@ -931,6 +937,11 @@ class Bridge:
         available=self.launcher.capabilities()
         engines=sorted(engine for engine in self.engines.intersection(available) if available[engine])
         capabilities=['headless']+[cap+':'+engine for engine in engines for cap in sorted(available[engine]-{'headless'})]
+        advertisement = getattr(self, 'advertisement', None)
+        resource_tags = advertisement.tags() if advertisement is not None else []
+        capabilities = list(dict.fromkeys(capabilities + resource_tags))
+        if resource_tags and len(capabilities) > 32:
+            raise ValueError('advertisement_capacity_exceeded')
         configuration = getattr(self.launcher, 'config', {})
         if not configuration.get('private_provider_homes', False):
             # Execution-source hints only, never login/account health proof.
