@@ -3,6 +3,10 @@
 # candidate because its provider credential is expired/unusable. An "expires in N
 # days" warning is not an exclusion: the picker only drops unusable credentials.
 # Reads the dry-run endpoint (nothing is started); never prints token values.
+# Primary work executes once in this shell. The same POST carries a fixed
+# nonsecret producer marker; optional evidence never launches/replays this job.
+# Enrollment requires owner verification that all maintained production callers
+# use this source/marker. Alternate callers are not automatically covered.
 set -euo pipefail
 BASE_URL="${HUB_BASE_URL:-https://hub.dtcdev.click}"
 CLI_JSON="${HUB_CLI_JSON:-$HOME/.config/agent-hub/cli.json}"
@@ -16,6 +20,7 @@ python3 "$script_dir/hub-picker-alerts.py" --base-url "$BASE_URL" --cli-json "$C
 mkdir -p "$(dirname "$STATE")"
 token="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["access_token"])' "$CLI_JSON")"
 excluded="$(curl -fsS --max-time 30 -X POST -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+  -H 'X-Hub-Alert-Producer: credential_monitor' \
   -d '{}' "$BASE_URL/api/model-picker/pick" \
   | python3 -I -c 'import json,sys; print(",".join(sorted("%s=%s" % (r["policy_id"], r["reason"]) for r in json.load(sys.stdin).get("excluded", []))))')"
 now="$(date +%s)"

@@ -32,6 +32,14 @@ export function isDeploymentActor(value: unknown): value is Actor {
     && DEPLOYMENT_POLICY_SCOPES.every(scope => (actor.scopes as unknown[]).includes(scope));
 }
 
+/** Optional Node ingress authority; failures never authorize or refuse primary work. */
+export interface CredentialMonitorEvidence {
+  begin(): unknown;
+  finish(identity: unknown, decision: 'alert' | 'observation' | null): Promise<void>;
+  invalidate(): void;
+  snapshot(nonce: string): Promise<JsonRecord>;
+}
+
 export interface Hub2Env {
   // This worker-types release brands RPC-capable DO classes. These DOs use
   // fetch-only stubs, so keep bindings unbranded instead of asserting an
@@ -42,6 +50,8 @@ export interface Hub2Env {
   ACCOUNTS: DurableObjectNamespace;
   MAILBOXES: DurableObjectNamespace;
   HUB2_RELEASE_MODE?: string;
+  HUB2_ALERT_EVIDENCE_DIR?: string;
+  CREDENTIAL_MONITOR_EVIDENCE?: CredentialMonitorEvidence;
   HUB2_DISK_FLOOR_GB?: string;
   HUB2_SCHEMA_MIGRATIONS?: string;
   HUB_ALERT_WEBHOOK?: string;
