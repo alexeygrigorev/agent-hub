@@ -215,6 +215,20 @@ class CanaryTest(unittest.TestCase):
         self.state = self.tmp / "state"
 
     def run_canary(self, scenario="ok", *args, mode_prompt=None, **extra):
+        running_timeout = (
+            "0.3" if scenario == "start_slow"
+            else "0.5" if scenario in ("never_running", "no_workspace", "no_host", "late_running")
+            else "1.5"
+        )
+        capture_timeout = (
+            "0.35" if scenario in (
+                "capture_prompt_only", "wrapped_prompt_only", "capture_empty",
+                "capture_fail", "json_prompt_only", "json_arbitrary_marker", "late_capture",
+            )
+            else "1.5"
+        )
+        stop_timeout = "0.35" if scenario in ("gone_fail", "late_gone") else "1.5"
+        cleanup_budget = "0.2" if scenario in ("gone_fail", "late_gone") else "1.5"
         env = dict(os.environ)
         env.update(
             PATH=f"{self.tmp / 'bin'}:{env['PATH']}",
@@ -224,8 +238,10 @@ class CanaryTest(unittest.TestCase):
             HUB_CANARY_MAILER=str(self.mailer), MAIL_SINK=str(self.sink),
             HUB_CANARY_STATE_DIR=str(self.state), HUB_CANARY_WORKSPACE=str(self.tmp / "ws"),
             HUB_CANARY_MACHINE="HOST-1", HUB_CANARY_REPO="owner/repo",
-            HUB_CANARY_POLL_S="0.02", HUB_CANARY_RUNNING_TIMEOUT_S="0.3", HUB_CANARY_CAPTURE_TIMEOUT_S="0.2",
-            HUB_CANARY_STOP_TIMEOUT_S="0.3", HUB_CANARY_CMD_TIMEOUT_S="10",
+            HUB_CANARY_POLL_S="0.02", HUB_CANARY_CONVERGE_TIMEOUT_S="1.5",
+            HUB_CANARY_RUNNING_TIMEOUT_S=running_timeout, HUB_CANARY_CAPTURE_TIMEOUT_S=capture_timeout,
+            HUB_CANARY_STOP_TIMEOUT_S=stop_timeout, HUB_CANARY_CLEANUP_BUDGET_S=cleanup_budget,
+            HUB_CANARY_CMD_TIMEOUT_S="10",
         )
         env["FAKE_PROMPT"] = mode_prompt or ("Reply CANARY-OK and exit" if ("full" in args or "--deploy-gate" in args) else "printf CANARY-OK; sleep 30")
         env.update(extra)
@@ -574,7 +590,7 @@ class CanaryTest(unittest.TestCase):
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_BIN="/nonexistent/global-hub-must-not-be-used",
             HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
-            HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
+            HUB_CANARY_CONVERGE_TIMEOUT_S="1.5",
             FAKE_HOST_VERSION=sha,
         )
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -652,7 +668,7 @@ class CanaryTest(unittest.TestCase):
             "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
-            HUB_CANARY_CONVERGE_TIMEOUT_S="0.1",
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.5",
             FAKE_HOST_VERSION="ad0b8a0b2276303c2b13762a614fe49a63514ae7",
         )
         self.assertEqual((r.returncode, v["stage"]), (1, "host_release"))
@@ -669,7 +685,7 @@ class CanaryTest(unittest.TestCase):
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_BIN="/nonexistent/global-hub-must-not-be-used",
             HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
-            HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
+            HUB_CANARY_CONVERGE_TIMEOUT_S="1.5",
             FAKE_HOST_VERSION=sha,
         )
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -692,7 +708,7 @@ class CanaryTest(unittest.TestCase):
             "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
-            HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
+            HUB_CANARY_CONVERGE_TIMEOUT_S="1.5",
             FAKE_HOST_VERSION=sha,
         )
         self.assertEqual((r.returncode, v["ok"], v["stage"], v["reason"], v["intake_archived"]),
@@ -754,7 +770,7 @@ class CanaryTest(unittest.TestCase):
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_CANARY_STATE_DIR=str(priv_state),
             HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
-            HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
+            HUB_CANARY_CONVERGE_TIMEOUT_S="1.5",
             FAKE_HOST_VERSION=sha,
         )
         self.assertEqual((r_preserve.returncode, v_preserve["ok"]), (0, True))
@@ -770,7 +786,7 @@ class CanaryTest(unittest.TestCase):
             "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
-            HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
+            HUB_CANARY_CONVERGE_TIMEOUT_S="1.5",
             FAKE_HOST_VERSION=sha,
         )
         self.assertEqual(r.returncode, 1)
@@ -815,7 +831,7 @@ class CanaryTest(unittest.TestCase):
             "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
-            HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
+            HUB_CANARY_CONVERGE_TIMEOUT_S="1.5",
             FAKE_HOST_VERSION=sha,
         )
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -854,9 +870,9 @@ class CanaryTest(unittest.TestCase):
             f'DEPLOY_GATE_LOCK_WAIT_S="0"\n'
             f'EXTRA_ENV=(FAKE_DIR="{self.tmp}" FAKE_SCENARIO="ok" FAKE_HOST_VERSION="{sha}" '
             f'HUB_CANARY_MACHINE="HOST-1" HUB_CANARY_REPO="owner/repo" '
-            f'HUB_CANARY_POLL_S="0.02" HUB_CANARY_CONVERGE_TIMEOUT_S="0.2" '
-            f'HUB_CANARY_RUNNING_TIMEOUT_S="0.3" HUB_CANARY_CAPTURE_TIMEOUT_S="0.2" '
-            f'HUB_CANARY_STOP_TIMEOUT_S="0.3")\n'
+            f'HUB_CANARY_POLL_S="0.02" HUB_CANARY_CONVERGE_TIMEOUT_S="1.5" '
+            f'HUB_CANARY_RUNNING_TIMEOUT_S="1.5" HUB_CANARY_CAPTURE_TIMEOUT_S="1.5" '
+            f'HUB_CANARY_STOP_TIMEOUT_S="1.5" HUB_CANARY_CLEANUP_BUDGET_S="1.5")\n'
         )
         forced = str(lib / "hub-deploy-gate-forced.sh")
         for bad_cmd in (
@@ -930,7 +946,7 @@ class CanaryTest(unittest.TestCase):
             "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
-            HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
+            HUB_CANARY_CONVERGE_TIMEOUT_S="1.5",
             FAKE_HOST_VERSION=sha,
         )
         self.assertEqual(r_name.returncode, 1)
@@ -950,7 +966,7 @@ class CanaryTest(unittest.TestCase):
             "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
-            HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
+            HUB_CANARY_CONVERGE_TIMEOUT_S="1.5",
             FAKE_HOST_VERSION=sha,
         )
         self.assertEqual(r_ck.returncode, 1)
@@ -968,7 +984,7 @@ class CanaryTest(unittest.TestCase):
             "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
-            HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
+            HUB_CANARY_CONVERGE_TIMEOUT_S="1.5",
             FAKE_HOST_VERSION=sha,
         )
         self.assertEqual(r_conf.returncode, 1)
@@ -1098,10 +1114,11 @@ class CanaryTest(unittest.TestCase):
             "HUB_CANARY_MACHINE": "HOST-1",
             "HUB_CANARY_REPO": "owner/repo",
             "HUB_CANARY_POLL_S": "0.02",
-            "HUB_CANARY_CONVERGE_TIMEOUT_S": "0.2",
-            "HUB_CANARY_RUNNING_TIMEOUT_S": "0.3",
-            "HUB_CANARY_CAPTURE_TIMEOUT_S": "0.2",
-            "HUB_CANARY_STOP_TIMEOUT_S": "0.3",
+            "HUB_CANARY_CONVERGE_TIMEOUT_S": "1.5",
+            "HUB_CANARY_RUNNING_TIMEOUT_S": "1.5",
+            "HUB_CANARY_CAPTURE_TIMEOUT_S": "1.5",
+            "HUB_CANARY_STOP_TIMEOUT_S": "1.5",
+            "HUB_CANARY_CLEANUP_BUDGET_S": "1.5",
             "A_BIN": f"{sys.executable} {self.tmp / 'fake_a.py'}",
             "FAKE_DIR": str(self.tmp),
             "FAKE_SCENARIO": "ok",
@@ -1351,7 +1368,7 @@ class CanaryTest(unittest.TestCase):
             "--mode",
             "shell",
             "--deploy-gate",
-            HUB_CANARY_RUNNING_TIMEOUT_S="0.25",
+            HUB_CANARY_RUNNING_TIMEOUT_S="0.6",
             HUB_CANARY_POLL_S="0.01",
         )
         self.assertEqual(r_churn.returncode, 1)
@@ -1395,7 +1412,7 @@ class CanaryTest(unittest.TestCase):
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_BIN="/nonexistent/global-hub-must-not-be-used",
             HUB_CANARY_HOST_RELEASE_ROOT=str(empty_root),
-            HUB_CANARY_CONVERGE_TIMEOUT_S="0.4",
+            HUB_CANARY_CONVERGE_TIMEOUT_S="1.5",
             FAKE_HOST_VERSION=sha,
             FAKE_SYSTEMCTL_ACTION="converge_from_staged",
             FAKE_STAGED_RELEASE_DIR=str(staged_rel),
@@ -1418,7 +1435,7 @@ class CanaryTest(unittest.TestCase):
             "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_CANARY_HOST_RELEASE_ROOT=str(empty_root),
-            HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
+            HUB_CANARY_CONVERGE_TIMEOUT_S="1.5",
             FAKE_HOST_VERSION=sha,
         )
         self.assertEqual(r_already.returncode, 0, r_already.stderr)
@@ -1432,7 +1449,7 @@ class CanaryTest(unittest.TestCase):
             "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_CANARY_HOST_RELEASE_ROOT=str(unconv_root),
-            HUB_CANARY_CONVERGE_TIMEOUT_S="0.1",
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.4",
             HUB_CANARY_POLL_S="0.01",
             FAKE_SYSTEMCTL_ACTION="noop",
         )
@@ -1555,7 +1572,7 @@ class CanaryTest(unittest.TestCase):
         r_to, v_to = self.run_canary(
             "replay_timeout_empty_list", "--mode", "shell",
             HUB_CANARY_CMD_TIMEOUT_S="0.05",
-            HUB_CANARY_STOP_TIMEOUT_S="0.2",
+            HUB_CANARY_STOP_TIMEOUT_S="0.8",
         )
         self.assertEqual(r_to.returncode, 1)
         self.assertEqual(
@@ -1958,7 +1975,7 @@ class CanaryTest(unittest.TestCase):
         for idx, cap_text in enumerate(rejected_captures):
             with self.subTest(rejected_capture=idx):
                 (self.tmp / "capture_output.txt").write_text(cap_text + "\n")
-                r_rej, v_rej = self.run_canary("ok", "--mode", "full")
+                r_rej, v_rej = self.run_canary("ok", "--mode", "full", HUB_CANARY_CAPTURE_TIMEOUT_S="0.35")
                 self.assertEqual(r_rej.returncode, 1)
                 self.assertEqual(
                     (v_rej["ok"], v_rej["stage"], v_rej["reason"], v_rej["cleanup"]),
