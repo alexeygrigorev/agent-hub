@@ -1211,6 +1211,53 @@ class CanaryTest(unittest.TestCase):
         self.assertIn((retry_state / "pending").resolve(), retry_fsynced_before_post)
         self.assertIn(retry_ws.resolve(), retry_fsynced_before_post)
 
+        # Real ancestor-symlink alias retry regression (no injected fsync_dir mock needed):
+        # ensure_private_dir(alias/private) where alias -> real-parent must fail closed
+        # before creating real-parent/private on Attempt 1, on retry Attempt 2, and even
+        # if real-parent/private already exists on disk (Attempt 3), never invoking POST.
+        real_parent = self.tmp / "real-parent"
+        real_parent.mkdir(mode=0o700)
+        alias_parent = self.tmp / "alias-parent"
+        alias_parent.symlink_to(real_parent)
+        alias_state = alias_parent / "private"
+        alias_env = dict(env_patch, HUB_CANARY_STATE_DIR=str(alias_state), HUB_CANARY_WORKSPACE=str(retry_ws))
+        (self.tmp / "calls.log").write_text("")
+
+        with mock.patch.dict(os.environ, alias_env):
+            verdict_alias_1 = mod.Canary(
+                "shell",
+                f"{sha[:12]}-{token[:12]}",
+                candidate_sha=sha,
+                candidate_cli_sha256=pyz_sha,
+                run_token=token,
+                expected_helper_sha256=helper_sha,
+            ).execute()
+            self.assertFalse((real_parent / "private").exists())
+            verdict_alias_2 = mod.Canary(
+                "shell",
+                f"{sha[:12]}-{token[:12]}",
+                candidate_sha=sha,
+                candidate_cli_sha256=pyz_sha,
+                run_token=token,
+                expected_helper_sha256=helper_sha,
+            ).execute()
+            (real_parent / "private").mkdir(mode=0o700)
+            verdict_alias_3 = mod.Canary(
+                "shell",
+                f"{sha[:12]}-{token[:12]}",
+                candidate_sha=sha,
+                candidate_cli_sha256=pyz_sha,
+                run_token=token,
+                expected_helper_sha256=helper_sha,
+            ).execute()
+
+        for verdict_alias in (verdict_alias_1, verdict_alias_2, verdict_alias_3):
+            self.assertEqual(
+                (verdict_alias["ok"], verdict_alias["stage"], verdict_alias["reason"], verdict_alias["cleanup"]),
+                (False, "lock", "state_dir_symlink", "not_needed"),
+            )
+        self.assertNotIn("sessions start", self.calls())
+
 
 if __name__ == "__main__":
     unittest.main()
