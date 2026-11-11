@@ -6,6 +6,7 @@ against partial/mixed downloads; it does not replace transport authentication.
 """
 import argparse
 import contextlib
+from contextvars import ContextVar
 import fcntl
 import hashlib
 import json
@@ -23,6 +24,7 @@ from urllib.request import urlopen
 UNITS = ('agent-hub2-host.service', 'agent-hub2-host-update.service', 'agent-hub2-host-update.timer')
 MAX_MANIFEST = 128 * 1024
 MAX_ARTIFACT = 32 * 1024 * 1024
+UPDATE_LOCK_FD = ContextVar("update_lock_fd", default=None)
 
 
 def fetch(url, limit):
@@ -68,8 +70,10 @@ def validate_manifest(manifest):
 
 
 def command(args):
+    lock_fd = UPDATE_LOCK_FD.get()
     result = subprocess.run([str(value) for value in args], stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL, timeout=120)
+                            stderr=subprocess.DEVNULL, timeout=120,
+                            pass_fds=() if lock_fd is None else (lock_fd,))
     if result.returncode:
         raise RuntimeError('release command failed: ' + Path(args[0]).name)
 
@@ -320,6 +324,10 @@ def restore_retained_switch(root, releases, journal):
     if set(state['units']) != set(UNITS):
         raise ValueError('invalid retained unit snapshot')
     files = {name: None if data is None else bytes.fromhex(data) for name, data in state['units'].items()}
+    # Once activation began, stop even if recovery already moved the link.
+    # The candidate must not import from the retained environment we restore.
+    if state.get('switching') is True:
+        command(['systemctl', '--user', 'stop', UNITS[0]])
     if current_link.resolve() != old:
         link(old, current_link)
     sync_directory(root)
@@ -328,7 +336,7 @@ def restore_retained_switch(root, releases, journal):
         if target.exists() or target.is_symlink():
             shutil.rmtree(require_release_directory(target))
         backup.rename(target)
-        sync_directory(releases)
+    sync_directory(releases)
     if previous is None:
         previous_link.unlink(missing_ok=True)
     else:
@@ -351,7 +359,7 @@ def finish_retained_switch(root, releases, journal):
     backup = releases / ('.retained-' + target.name)
     if backup.exists() or backup.is_symlink():
         shutil.rmtree(require_release_directory(backup))
-        sync_directory(releases)
+    sync_directory(releases)
     journal.unlink()
     sync_directory(root)
 
@@ -410,6 +418,9 @@ def reactivate_retained_release(base, manifest, host_wheel, root, releases, old,
             sync_directory(releases)
             if replacements:
                 replace_units(units, replacements)
+            state['switching'] = True
+            durable_write(journal, json.dumps(state, sort_keys=True).encode(), 0o600)
+            sync_directory(root)
             link(target, root / 'current')
             command(['systemctl', '--user', 'restart', UNITS[0]])
             check_service_ready(target)
@@ -495,11 +506,22 @@ def prune(root, releases):
             shutil.rmtree(path)
 
 
-def install(base_url, root, *, install_service=False, restart=True):
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    # Never delete a lock file: all invocations lock this same inode.
+@contextlib.contextmanager
+def update_lock(root):
+    # Never delete the shared inode. Child installers inherit this descriptor
+    # so a killed updater cannot race their writes during the next recovery.
     with (root / 'update.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        token = UPDATE_LOCK_FD.set(lock.fileno())
+        try:
+            yield
+        finally:
+            UPDATE_LOCK_FD.reset(token)
+
+
+def install(base_url, root, *, install_service=False, restart=True):
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with update_lock(root):
         base = base_url.rstrip('/') + '/cli/'
         releases = root / 'releases'
         releases.mkdir(exist_ok=True)
