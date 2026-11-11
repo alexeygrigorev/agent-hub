@@ -13,7 +13,7 @@ test('official CLI context update persists, clears and rejects stale or unknown 
  try{
   const created=await call('/api/intakes?project=owner/repo','POST',{key:'context-create',project:'owner/repo',title:'Context smoke',text:'Request',acceptance_criteria:['Check context']});
   assert.equal(created.status,201);const initial:any=await created.json();const id=initial.intake.id,path='/api/intakes/'+id;
-  const update={key:'context-update',expected_version:initial.intake.updated_at,current_state:'Started live smoke',next_step:'Check note',owner:'smoke-owner',uncertainty:'Stop proof pending'};
+  const update={project:'owner/repo',verification:'auto',key:'context-update',expected_version:initial.intake.updated_at,current_state:'Started live smoke',next_step:'Check note',owner:'smoke-owner',uncertainty:'Stop proof pending'};
   const response=await call(path,'POST',update);assert.equal(response.status,200,await response.clone().text());
   const result:any=await response.json();assert.equal(result.intake.current_state,update.current_state);assert.equal(result.intake.next_step,update.next_step);
   const replay=await call(path,'POST',update);assert.equal(replay.status,200);assert.equal((await replay.json() as any).duplicate,true);
@@ -25,7 +25,7 @@ test('official CLI context update persists, clears and rejects stale or unknown 
   assert.equal((await call(path,'PATCH',{key:'context-unknown-patch',unexpected:'field'})).status,400);
   const final:any=await(await call(path+'/context')).json();assert.equal(final.intake.current_state,update.current_state);assert.equal(final.intake.uncertainty,update.uncertainty);
   assert.equal((await call(path,'POST',{key:'context-note',note:'Ordinary note'})).status,200);
-  assert.equal((await call(path,'POST',{key:'context-close',status:'done',reason:'Disposable smoke complete'})).status,200);
+  assert.equal((await call(path,'POST',{key:'context-close',status:'done',force:true,reason:'Disposable smoke complete'})).status,200);
   assert.equal((await(await call(path)).json() as any).intake.status,'archived');
  }finally{sql.close();}
 });
