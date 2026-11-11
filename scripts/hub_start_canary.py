@@ -277,6 +277,151 @@ def clean(text, limit=80):
     return re.sub(r"[^A-Za-z0-9_.:-]", "_", str(text))[:limit] or "unknown"
 
 
+def unique_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON field")
+        value[key] = item
+    return value
+
+
+def paired_stream_output_ok(captured, expected, engine):
+    """Complete provider frames from ONE capture only; never repair clipped JSON."""
+    if len(captured.encode()) > 65536:
+        return False
+    events = []
+    for index, line in enumerate(captured.splitlines()):
+        try:
+            event = json.loads(line, object_pairs_hook=unique_object)
+        except (ValueError, TypeError):
+            if index == 0:  # A bounded tail may start inside an earlier frame.
+                continue
+            return False
+        if not isinstance(event, dict):
+            return False
+        events.append(event)
+    if len(events) > 128:
+        return False
+    uses, results = {}, set()
+    proven = False
+
+    def marker_in(text):
+        return isinstance(text, str) and any(line.strip() == expected for line in text.splitlines())
+
+    def provider_id(value):
+        return isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,100}", value) is not None
+
+    for event in events:
+        if engine == "claude":
+            message = event.get("message")
+            if event.get("type") not in ("assistant", "user") or not isinstance(message, dict):
+                continue
+            blocks = message.get("content")
+            if not isinstance(blocks, list):
+                continue
+            session = event.get("session_id")
+            for block in blocks:
+                if not isinstance(block, dict):
+                    continue
+                if event["type"] == "assistant" and block.get("type") == "tool_use":
+                    identity = block.get("id")
+                    if not provider_id(identity) or not Canary.valid_native_id(session):
+                        return False
+                    if identity in uses:
+                        return False
+                    params = block.get("input")
+                    if (
+                        message.get("role") != "assistant"
+                        or block.get("name") != "Bash"
+                        or not isinstance(params, dict)
+                        or not isinstance(params.get("command"), str)
+                    ):
+                        continue
+                    uses[identity] = session
+                elif event["type"] == "user" and block.get("type") == "tool_result":
+                    identity = block.get("tool_use_id")
+                    if not provider_id(identity) or identity in results:
+                        return False
+                    results.add(identity)
+                    if identity not in uses:  # An orphan alone can never prove output.
+                        continue
+                    detail = event.get("tool_use_result")
+                    if (
+                        session != uses[identity]
+                        or message.get("role") != "user"
+                        or block.get("is_error") is not False
+                        or not isinstance(detail, dict)
+                        or detail.get("interrupted") is not False
+                        or detail.get("stderr") != ""
+                        or not isinstance(block.get("content"), str)
+                        or detail.get("stdout") != block["content"]
+                    ):
+                        return False
+                    proven = proven or marker_in(block["content"])
+        else:
+            step = event.get("step_update")
+            if event.get("event") != "step_update" or not isinstance(step, dict) or step.get("step_type") != "tool":
+                continue
+            conversation, index = step.get("conversation_id"), step.get("step_index")
+            info = step.get("tool_info")
+            if (
+                not Canary.valid_native_id(conversation)
+                or type(index) is not int
+                or not 0 <= index <= 2**31 - 1
+                or step.get("tool_name") != "run_command"
+                or not isinstance(info, dict)
+                or info.get("name") != "run_command"
+            ):
+                return False
+            if any(
+                part.get(key) not in (None, False, "")
+                for part in (event, step, info)
+                for key in ("error", "is_error", "interrupted")
+            ):
+                return False
+            params = info.get("parameters")
+            if (
+                not isinstance(params, dict)
+                or set(params) != {"CommandLine"}
+                or not isinstance(params["CommandLine"], str)
+                or not params["CommandLine"]
+            ):
+                return False
+            identity = (conversation, index)
+            if step.get("state") == "ACTIVE":
+                if identity in uses or identity in results or "output" in info:
+                    return False
+                uses[identity] = params
+            elif step.get("state") == "DONE":
+                if identity in results:
+                    return False
+                results.add(identity)
+                if identity not in uses:
+                    continue
+                if params != uses[identity] or not isinstance(info.get("output"), str):
+                    return False
+                # Only the native wrapper's anchored zero status counts. A fake
+                # zero status embedded inside command output cannot override it.
+                match = re.fullmatch(
+                    r"Created At: ([^\n]+)\nCompleted At: ([^\n]+)\n"
+                    r"Command exited with code 0\.\n\nCommand output:\n([\s\S]*)",
+                    info["output"],
+                )
+                if not match:
+                    continue
+                try:
+                    created, completed = (datetime.datetime.fromisoformat(match[group]) for group in (1, 2))
+                    if created.tzinfo is None or completed.tzinfo is None or completed < created:
+                        return False
+                except ValueError:
+                    return False
+                proven = proven or marker_in(match[3])
+            else:
+                return False
+    return proven
+
+
 class Canary:
     def __init__(
         self,
@@ -350,10 +495,11 @@ class Canary:
                 f"printf '%s:%s:%s\\n' CANARY-OK {sha12} {run_token}; sleep 30"
                 if mode == "shell"
                 else (
-                    f'Use two sequential tool calls. First run a shell command that prints the concatenation of "CANARY-", "OK:", and "{sha12}:{run_token}" '
-                    "as one output line and exits immediately. After that tool call completes, use a separate tool call to run sleep 60 "
-                    "so the orchestrator can stop this session. Do not combine printing and sleeping in one tool call. "
-                    "Do not edit files or start another agent."
+                    f'Use two sequential shell tool calls. First run a shell command that prints the concatenation of "CANARY-", "OK:", and "{sha12}:{run_token}" '
+                    "as one output line and let it finish. Then use the provider-native background tool facility for a separate bounded 60-second hold, "
+                    "monitoring it internally so the orchestrator can stop this session. "
+                    "Do not chain the print with a foreground sleep or wait externally; external waits require a Hub wake. "
+                    "Do not edit files, start another agent, or exit early."
                 )
             )
         else:
@@ -361,11 +507,13 @@ class Canary:
             # The complete expected output never occurs in the model prompt. A
             # wrapped echo of the prompt therefore cannot count as execution.
             self.prompt = PROMPTS["shell"] if mode == "shell" else (
-                f'Use two sequential tool calls. First run a shell command that prints the concatenation of "CANARY-", "OK:", and "{run_id}" '
-                'as one output line and exits immediately. After that tool call completes, use a separate tool call to run sleep 60 '
-                'so the orchestrator can stop this session. Do not combine printing and sleeping in one tool call. '
-                'Do not edit files or start another agent.')
-        self.session = self.native = None
+                f'Use two sequential shell tool calls. First run a shell command that prints the concatenation of "CANARY-", "OK:", and "{run_id}" '
+                "as one output line and let it finish. Then use the provider-native background tool facility for a separate bounded 60-second hold, "
+                "monitoring it internally so the orchestrator can stop this session. "
+                "Do not chain the print with a foreground sleep or wait externally; external waits require a Hub wake. "
+                "Do not edit files, start another agent, or exit early."
+            )
+        self.session = self.native = self.engine = None
         self.started_at = self.running_deadline = None
         self.start_attempted = self.stopped = False
 
@@ -1011,6 +1159,8 @@ class Canary:
                         raise StageFailure("list_host_workspace", "host_workspace_mismatch")
                     elif time.monotonic() < deadline:
                         self.native = item["native_id"]
+                        eng = item.get("engine")
+                        self.engine = eng.strip() if isinstance(eng, str) and eng.strip() else None
                         try:
                             self.write_pending_state()
                         except OSError:
@@ -1021,39 +1171,61 @@ class Canary:
             self.pause(deadline)
         raise StageFailure(stage, ("timeout_" if stage == "running" else "") + reason)
 
-    def output_has_marker(self, out):
+    def output_has_marker(self, out, engine=None):
+        if not isinstance(out, str):
+            return False
+        if self.mode == "shell":
+            for line in out.splitlines():
+                try:
+                    json.loads(line)
+                except ValueError:
+                    if line.strip(" \t│┃>●•") == self.marker:
+                        return True
+            return False
+        if self.prompt and self.marker in self.prompt:
+            return False
+        eng = engine if engine is not None else self.engine
+        if eng not in ("codex", "zai", "go", "claude", "antigravity"):
+            return False
+        if eng in ("claude", "antigravity"):
+            return paired_stream_output_ok(out, self.marker, eng)
+
         def marker_in(text):
-            return isinstance(text, str) and any(line.strip(" \t│┃>●•") == self.marker for line in text.splitlines())
+            return isinstance(text, str) and any(line.strip() == self.marker for line in text.splitlines())
+
         for line in out.splitlines():
             try:
-                event = json.loads(line)
-            except ValueError:
-                if marker_in(line):
-                    return True
+                event = json.loads(line, object_pairs_hook=unique_object)
+            except (ValueError, TypeError):
                 continue
             if not isinstance(event, dict):
                 continue
-            # Only completed tool output and assistant output; never arguments,
-            # prompts, reasoning or arbitrary nested JSON containing the nonce.
-            item = event.get('item')
-            if event.get('type') == 'item.completed' and isinstance(item, dict):
-                if item.get('type') == 'command_execution' and marker_in(item.get('aggregated_output')):
-                    return True
-                if item.get('type') == 'agent_message' and marker_in(item.get('text')):
-                    return True
-            if event.get('type') == 'result' and marker_in(event.get('result')):
-                return True
-            part = event.get('part')
+            # Only completed tool output for the running session's engine; never
+            # assistant prose, result summaries, arguments, prompts or reasoning.
+            item = event.get("item")
             if (
-                event.get('type') == 'tool_use'
-                and isinstance(part, dict)
-                and part.get('type') == 'tool'
-                and isinstance(part.get('tool'), str)
-                and bool(part.get('tool').strip())
+                eng in ("codex", "zai")
+                and event.get("type") == "item.completed"
+                and isinstance(item, dict)
+                and item.get("type") == "command_execution"
+                and item.get("status") in (None, "completed")
+                and (item.get("exit_code") is None or type(item.get("exit_code")) is int and item["exit_code"] == 0)
+                and marker_in(item.get("aggregated_output"))
             ):
-                state = part.get('state')
-                if isinstance(state, dict) and state.get('status') == 'completed' and marker_in(state.get('output')):
-                    return True
+                return True
+            part = event.get("part")
+            if (
+                eng == "go"
+                and event.get("type") == "tool_use"
+                and isinstance(part, dict)
+                and part.get("type") == "tool"
+                and isinstance(part.get("tool"), str)
+                and bool(part.get("tool").strip())
+                and isinstance(part.get("state"), dict)
+                and part["state"].get("status") == "completed"
+                and marker_in(part["state"].get("output"))
+            ):
+                return True
         return False
 
     def check_capture(self):
