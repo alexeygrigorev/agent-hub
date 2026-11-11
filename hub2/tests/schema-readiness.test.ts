@@ -102,7 +102,7 @@ for (const {setup, name, diagnostic} of startupFailures) {
         if (setup === 'mode-conflict') writeFileSync(devVars, 'HUB2_SCHEMA_MIGRATIONS=defer\n');
       }
       const before = readFileSync(file);
-      child=spawn(process.execPath,['--experimental-transform-types',resolve('hub2/node/main.ts'),
+      child=spawn(process.execPath,['--experimental-transform-types',resolve(import.meta.dirname, '../node/main.ts'),
         '--host','127.0.0.1','--port',String(port),'--data-dir',dir,'--dev-vars',devVars],
         {env:{...process.env,HUB2_SCHEMA_MIGRATIONS:'apply'},stdio:['ignore','pipe','pipe']});
       let stdout='',stderr='';
