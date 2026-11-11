@@ -9,7 +9,7 @@
 // No Cloudflare package is imported; node:sqlite, undici globals and ws are
 // the only runtime pieces beyond the hub2 source itself.
 
-import { dirname, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { registerTypeScriptResolveHook, installCompatGlobals } from './compat.ts';
 
@@ -42,6 +42,10 @@ const port = Number(args.port ?? process.env.HUB2_BIND_PORT ?? 8787);
 const dataDir = resolve(args['data-dir'] ?? '/var/lib/agent-hub/hub2-db');
 const devVars = args['dev-vars'] ?? join(here, '../../.dev.vars');
 const publicDir = resolve(args.public ?? join(here, '../public'));
+const cliReleaseRoot = args['cli-release-root'];
+if (cliReleaseRoot !== undefined && !isAbsolute(cliReleaseRoot)) {
+  throw new Error('--cli-release-root requires an absolute path');
+}
 
 const [{ default: entry, ControlDO, ProjectDO, MachineDO, AccountDO, MailboxDO }, { Hub2Runtime }, { assetFetcher }, { loadEnvironment }, { startServer }] =
   await Promise.all([
@@ -56,7 +60,7 @@ const envVars = await loadEnvironment(devVars === 'none' ? undefined : devVars);
 const runtime = new Hub2Runtime({
   classes: { CONTROL: ControlDO, PROJECTS: ProjectDO, MACHINES: MachineDO, ACCOUNTS: AccountDO, MAILBOXES: MailboxDO } as never,
   entry,
-  env: { ...envVars, ASSETS: assetFetcher(publicDir) },
+  env: { ...envVars, ASSETS: assetFetcher(publicDir, cliReleaseRoot) },
   dataDir,
 });
 

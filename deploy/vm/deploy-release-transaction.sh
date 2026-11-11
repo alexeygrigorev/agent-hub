@@ -9,14 +9,17 @@ if [[ "${AGENT_HUB_DEPLOY_TEST_MODE:-0}" == 1 ]]; then
   TRANSACTION_DIR="${AGENT_HUB_TEST_TRANSACTION_DIR:?AGENT_HUB_TEST_TRANSACTION_DIR is required in test mode}"
   CADDY_CONFIG="${AGENT_HUB_TEST_CADDY_CONFIG:?AGENT_HUB_TEST_CADDY_CONFIG is required in test mode}"
   CADDY_SITE="${AGENT_HUB_TEST_CADDY_SITE:-$(dirname "$CADDY_CONFIG")/sites/hub.caddy}"
+  CLI_RELEASE_ROOT="$REPO/.local/cli-releases"
 else
   REPO=/opt/agent-hub
   TRANSACTION_DIR=/var/lib/agent-hub/deploy-rollback
   CADDY_CONFIG=/etc/caddy/Caddyfile
   CADDY_SITE=/etc/caddy/sites/hub.caddy
+  CLI_RELEASE_ROOT=/var/lib/agent-hub/cli-releases
 fi
 CADDY_BIN=caddy
 TMPDIR="$REPO/.local/tmp"
+LEGACY_CLI_DIR="$REPO/hub2/public/cli"
 CANDIDATE_CADDY=""
 
 cleanup_candidate() {
@@ -62,6 +65,11 @@ read_root_file() {
   run_root cat "$1"
 }
 
+publisher_directory() {
+  [[ "$1" =~ ^[0-9a-f]{32}$ ]] || return 1
+  printf '%s/publisher-%s\n' "$TRANSACTION_DIR" "$1"
+}
+
 wait_for_hub_health() {
   local attempt
   for ((attempt = 1; attempt <= 15; attempt++)); do
@@ -80,11 +88,44 @@ install_release_dependencies() {
 }
 
 remove_transaction_state() {
-  run_root rm -rf -- "$TRANSACTION_DIR"
+  local token="${1:-}"
+  if [[ -z "$token" ]]; then
+    # Pending deploys created before transaction tokens still need recovery.
+    run_root rm -rf -- "$TRANSACTION_DIR"
+    return
+  fi
+  run_root python3 - "$TRANSACTION_DIR" "$token" <<'PY'
+import fcntl
+import os
+from pathlib import Path
+import re
+import shutil
+import sys
+
+state = Path(sys.argv[1])
+token = sys.argv[2]
+if not re.fullmatch(r'[0-9a-f]{32}', token):
+    raise SystemExit('invalid deploy transaction token')
+retired = state.with_name(state.name + '.retired-' + token)
+fd = os.open(state.parent / '.deploy-retire.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+with os.fdopen(fd, 'rb') as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    if state.exists():
+        if state.is_symlink() or (state / 'transaction-token').read_bytes() != (token + '\n').encode():
+            raise SystemExit('refusing to retire a different deploy transaction')
+        state.rename(retired)
+        parent = os.open(state.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+    if retired.exists():
+        shutil.rmtree(retired)
+PY
 }
 
 restore_previous_release() {
-  local previous_sha vars_present caddy_mode site_present
+  local previous_sha vars_present caddy_mode site_present legacy_snapshot restore_dir publication_token publisher_dir=''
   if ! run_root test -f "$TRANSACTION_DIR/prepared"; then
     printf 'No pending deploy transaction; nothing to roll back.\n'
     return 0
@@ -96,6 +137,17 @@ restore_previous_release() {
     || { printf 'ERROR: rollback metadata has an invalid previous commit.\n' >&2; return 1; }
   git -C "$REPO" cat-file -e "${previous_sha}^{commit}" \
     || { printf 'ERROR: previous release commit is unavailable locally: %s\n' "$previous_sha" >&2; return 1; }
+
+  if run_root test -f "$TRANSACTION_DIR/transaction-token"; then
+    publication_token="$(read_root_file "$TRANSACTION_DIR/transaction-token")" || return 1
+    publisher_dir="$(publisher_directory "$publication_token")" || return 1
+  fi
+  if [[ -n "$publisher_dir" ]] && run_root test -f "$publisher_dir/ready"; then
+    # The prior revision may lack this helper. Keep the candidate copy with the
+    # rollback receipt so retry also works after restoring the prior checkout.
+    run_root python3 "$publisher_dir/scripts/publish-hub2-release.py" --root "$CLI_RELEASE_ROOT" \
+      rollback --receipt "$TRANSACTION_DIR/cli-assets.json" --transaction-token "$publication_token" || return 1
+  fi
 
   printf 'Rolling Hub2 back to %s\n' "$previous_sha"
   git -C "$REPO" checkout --detach --force "$previous_sha" || return 1
@@ -125,6 +177,20 @@ restore_previous_release() {
 
   # Always suppress edge writes from old installers, which may own Caddyfile.
   run_root bash "$REPO/deploy/vm/install-hub2-node.sh" --hub-only || return 1
+  if run_root test -f "$TRANSACTION_DIR/cli-legacy-present"; then
+    legacy_snapshot="$(read_root_file "$TRANSACTION_DIR/cli-legacy-present")" || return 1
+    case "$legacy_snapshot" in
+      yes)
+        restore_dir="$(run_root mktemp -d "$TMPDIR/cli-rollback.XXXXXXXX")" || return 1
+        run_root cp -a -- "$TRANSACTION_DIR/cli-legacy.previous" "$restore_dir/cli" || return 1
+        run_root rm -rf -- "$LEGACY_CLI_DIR" || return 1
+        run_root mv -T -- "$restore_dir/cli" "$LEGACY_CLI_DIR" || return 1
+        run_root rmdir -- "$restore_dir" || return 1
+        ;;
+      no) run_root rm -rf -- "$LEGACY_CLI_DIR" || return 1 ;;
+      *) printf 'ERROR: invalid legacy CLI rollback metadata.\n' >&2; return 1 ;;
+    esac
+  fi
 
   if [[ "$caddy_mode" == full ]]; then
     site_present="$(read_root_file "$TRANSACTION_DIR/hub-site-present")"
@@ -143,7 +209,7 @@ restore_previous_release() {
   run_root systemctl is-active --quiet agent-hub-hub2.service || return 1
   wait_for_hub_health || return 1
 
-  remove_transaction_state || return 1
+  remove_transaction_state "${publication_token:-}" || return 1
   if [[ "$caddy_mode" == full ]]; then
     printf 'Rollback completed: previous Hub2 release, .dev.vars, and Hub site restored; shared Caddyfile untouched.\n'
   else
@@ -152,12 +218,15 @@ restore_previous_release() {
 }
 
 apply_release() {
-  local deploy_sha="$1" release_mode="$2" caddy_mode="$3" previous_sha local_status
+  local deploy_sha="$1" release_mode="$2" caddy_mode="$3" cli_mode="$4" previous_sha local_status publication_token
+  local -a asset_args=()
   [[ "$deploy_sha" =~ ^[0-9a-f]{40}$ ]] || fail "deploy SHA must be a full lowercase Git commit SHA"
   [[ "$release_mode" == bootstrap || "$release_mode" == active ]] \
     || fail "release mode must be bootstrap or active"
   [[ "$caddy_mode" == full || "$caddy_mode" == hub-only ]] \
     || fail "caddy mode must be full or hub-only"
+  [[ "$cli_mode" == legacy || ( "$cli_mode" == matched-cli && "$release_mode" == active ) ]] \
+    || fail "matched CLI publication requires an active deploy"
   [[ -d "$REPO/.git" ]] || fail "Hub repository checkout is missing: $REPO"
   cd "$REPO" || fail "cannot enter Hub repository checkout: $REPO"
   [[ -f "$REPO/.dev.vars" ]] \
@@ -191,6 +260,8 @@ apply_release() {
   fi
 
   run_root install -d -o root -g root -m 700 "$TRANSACTION_DIR"
+  publication_token="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+  write_root_file "$TRANSACTION_DIR/transaction-token" "$publication_token"
   if [[ "$caddy_mode" == full ]]; then
     if run_root test -f "$CADDY_SITE"; then
       run_root cp -p -- "$CADDY_SITE" "$TRANSACTION_DIR/hub.caddy.previous"
@@ -213,7 +284,7 @@ apply_release() {
     local original_status=$?
     trap - ERR
     if ! run_root test -f "$TRANSACTION_DIR/prepared"; then
-      remove_transaction_state || true
+      remove_transaction_state "$publication_token" || true
       exit "$original_status"
     fi
     printf 'ERROR: deploy failed; restoring the previous Hub2 release and protected configuration.\n' >&2
@@ -226,14 +297,33 @@ apply_release() {
     exit "$original_status"
   }
   trap on_apply_error ERR
+  if [[ "$cli_mode" == matched-cli ]]; then
+    write_root_file "$TRANSACTION_DIR/cli-assets-required" yes
+    if ! run_root test -L "$CLI_RELEASE_ROOT/current"; then
+      if run_root test -L "$LEGACY_CLI_DIR"; then
+        printf 'ERROR: legacy CLI directory is a symlink.\n' >&2
+        false
+      elif run_root test -d "$LEGACY_CLI_DIR"; then
+        run_root cp -a -- "$LEGACY_CLI_DIR" "$TRANSACTION_DIR/cli-legacy.previous"
+        write_root_file "$TRANSACTION_DIR/cli-legacy-present" yes
+      elif run_root test -e "$LEGACY_CLI_DIR"; then
+        printf 'ERROR: legacy CLI path is not a directory.\n' >&2
+        false
+      else
+        write_root_file "$TRANSACTION_DIR/cli-legacy-present" no
+      fi
+    fi
+  fi
   write_root_file "$TRANSACTION_DIR/prepared" yes
+  if [[ "$cli_mode" == matched-cli ]]; then run_root sync -f "$TRANSACTION_DIR"; fi
 
   git -C "$REPO" checkout --detach --force "$deploy_sha"
   install_release_dependencies
+  if [[ "$cli_mode" == matched-cli ]]; then asset_args+=(--keep-cli-assets); fi
   if [[ "$caddy_mode" == full ]]; then
-    run_root bash "$REPO/deploy/vm/install-hub2-node.sh" --release-mode "$release_mode"
+    run_root bash "$REPO/deploy/vm/install-hub2-node.sh" --release-mode "$release_mode" "${asset_args[@]}"
   else
-    run_root bash "$REPO/deploy/vm/install-hub2-node.sh" --release-mode "$release_mode" --hub-only
+    run_root bash "$REPO/deploy/vm/install-hub2-node.sh" --release-mode "$release_mode" --hub-only "${asset_args[@]}"
   fi
   run_root systemctl is-active --quiet agent-hub-hub2.service
   wait_for_hub_health
@@ -242,8 +332,40 @@ apply_release() {
   printf 'Hub2 candidate %s installed; rollback state retained until public smoke checks pass.\n' "$deploy_sha"
 }
 
+publish_cli_release() {
+  local deploy_sha="$1" digest="$2" publication_token publisher_dir
+  [[ "$deploy_sha" =~ ^[0-9a-f]{40}$ && "$digest" =~ ^[0-9a-f]{64}$ ]] \
+    || fail "publication requires a full commit and CI manifest SHA-256"
+  run_root test -f "$TRANSACTION_DIR/applied" || fail "no applied Hub2 deploy to publish"
+  run_root test -f "$TRANSACTION_DIR/cli-assets-required" || fail "the applied deploy did not request matched CLI assets"
+  [[ "$(read_root_file "$TRANSACTION_DIR/target.sha")" == "$deploy_sha" && "$(git -C "$REPO" rev-parse HEAD)" == "$deploy_sha" ]] \
+    || fail "publication commit must match the applied Hub2 deploy"
+  run_root systemctl is-active --quiet agent-hub-hub2.service
+  curl -fsS --max-time 3 http://127.0.0.1:8787/health | python3 -c '
+import json, sys
+health = json.load(sys.stdin)
+sys.exit(0 if health.get("ok") is True and health.get("service") == "hub2" else 1)
+' || fail "the active Hub2 API must be healthy before release publication"
+
+  publication_token="$(read_root_file "$TRANSACTION_DIR/transaction-token")"
+  publisher_dir="$(publisher_directory "$publication_token")"
+  if ! run_root test -f "$publisher_dir/ready"; then
+    run_root install -d -m 700 "$publisher_dir/scripts"
+    run_root install -m 600 -t "$publisher_dir/scripts" \
+      "$REPO/scripts/"{publish-hub2-release.py,build-hub2-release.py,hub2-self-update.py}
+    # Rollback can fence a delayed publisher even before it writes a receipt.
+    write_root_file "$publisher_dir/ready" yes
+    run_root sync -f "$TRANSACTION_DIR"
+  fi
+  run_root python3 "$publisher_dir/scripts/publish-hub2-release.py" --root "$CLI_RELEASE_ROOT" \
+    stage --bundle "$TMPDIR/ci-cli-release-$deploy_sha" --commit "$deploy_sha" --manifest-sha256 "$digest"
+  run_root python3 "$publisher_dir/scripts/publish-hub2-release.py" --root "$CLI_RELEASE_ROOT" \
+    activate --commit "$deploy_sha" --manifest-sha256 "$digest" --receipt "$TRANSACTION_DIR/cli-assets.json" \
+    --transaction-token "$publication_token"
+}
+
 commit_release() {
-  local target_sha current_sha
+  local target_sha current_sha publication_token='' publisher_dir
   run_root test -f "$TRANSACTION_DIR/prepared" \
     || fail "no pending deploy transaction to finalize"
   run_root test -f "$TRANSACTION_DIR/target.sha" \
@@ -252,25 +374,51 @@ commit_release() {
   current_sha="$(git -C "$REPO" rev-parse HEAD)"
   [[ "$target_sha" == "$current_sha" ]] \
     || fail "current revision does not match the pending deploy transaction"
-  remove_transaction_state
+  if run_root test -f "$TRANSACTION_DIR/transaction-token"; then
+    publication_token="$(read_root_file "$TRANSACTION_DIR/transaction-token")"
+  fi
+  if run_root test -f "$TRANSACTION_DIR/cli-assets-required"; then
+    publisher_dir="$(publisher_directory "$publication_token")"
+    run_root test -f "$publisher_dir/ready" || fail "the matched CLI assets were not published"
+    run_root python3 "$publisher_dir/scripts/publish-hub2-release.py" --root "$CLI_RELEASE_ROOT" \
+      commit --receipt "$TRANSACTION_DIR/cli-assets.json" --transaction-token "$publication_token" \
+      || fail "the matched CLI assets were not published or are no longer active"
+  fi
+  remove_transaction_state "$publication_token"
   printf 'Public smokes passed; deploy rollback state released for %s.\n' "$target_sha"
 }
 
 operation="${1:-}"
+if [[ "$operation" =~ ^(apply|publish|rollback|commit)$ ]]; then
+  [[ -d "$REPO/.git" ]] || fail "Hub repository checkout is missing: $REPO"
+  mkdir -p "$TMPDIR"
+  exec 9>>"$TMPDIR/.deploy-transaction.lock"
+  flock -n 9 || fail "another Hub2 deploy transaction operation is running"
+  # Bash defers these traps while waiting for a synchronous child. In
+  # particular, an SSH disconnect must not release the lock while sudo's
+  # installer or publisher is still writing.
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+fi
 case "$operation" in
   apply)
-    [[ $# == 3 || $# == 4 ]] || fail "usage: $0 apply <full-commit-sha> <bootstrap|active> [full|hub-only]"
-    apply_release "$2" "$3" "${4:-full}"
+    [[ $# -ge 3 && $# -le 5 ]] || fail "usage: $0 apply <full-commit-sha> <bootstrap|active> [full|hub-only] [matched-cli]"
+    apply_release "$2" "$3" "${4:-full}" "${5:-legacy}"
     ;;
   rollback)
     [[ $# == 1 ]] || fail "usage: $0 rollback"
     restore_previous_release
+    ;;
+  publish)
+    [[ $# == 3 ]] || fail "usage: $0 publish <full-commit-sha> <CI-manifest-sha256>"
+    publish_cli_release "$2" "$3"
     ;;
   commit)
     [[ $# == 1 ]] || fail "usage: $0 commit"
     commit_release
     ;;
   *)
-    fail "operation must be apply, rollback, or commit"
+    fail "operation must be apply, publish, rollback, or commit"
     ;;
 esac
