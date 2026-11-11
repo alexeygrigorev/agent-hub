@@ -110,6 +110,40 @@ class RecoveryTests(unittest.TestCase):
   return sum(method=='PUT' or method=='POST' and value['action']=='apply_recoverable'
              for method,value in self.calls)
 
+ def test_commit_seals_receipt_without_policy_write_and_refuses_late_rollback(self):
+  self.assertEqual(self.run_helper('prepare')[0],0)
+  self.assertEqual(self.run_helper('apply')[0],0)
+  writes=self.mutation_count()
+  self.assertEqual(self.run_helper('commit')[0],0)
+  self.assertEqual(helper.saved(self.receipt)['phase'],'committed')
+  self.assertEqual(self.run_helper('commit')[0],0)
+  self.assertEqual(self.run_helper('rollback')[0],1)
+  self.assertEqual(self.run_helper('apply')[0],1)
+  self.assertEqual(self.mutation_count(),writes)
+
+ def test_commit_refuses_prepared_or_superseded_policy_without_writing(self):
+  self.assertEqual(self.run_helper('prepare')[0],0)
+  self.assertEqual(self.run_helper('commit')[0],1)
+  self.assertEqual(self.mutation_count(),0)
+  self.assertEqual(self.run_helper('apply')[0],0)
+  self.current['version']+=1
+  writes=self.mutation_count()
+  self.assertEqual(self.run_helper('commit')[0],1)
+  self.assertEqual(helper.saved(self.receipt)['phase'],'applied')
+  self.assertEqual(self.mutation_count(),writes)
+
+ def test_optional_transaction_binding_preserves_old_receipts_and_refuses_other_token(self):
+  a=('--transaction-token','a'*32);b=('--transaction-token','b'*32)
+  self.assertEqual(self.run_helper('prepare',a)[0],0)
+  self.assertEqual(helper.saved(self.receipt)['transaction_token'],'a'*32)
+  for action in ('prepare','apply','rollback','commit'):
+   for extra in (b,()):
+    self.assertEqual(self.run_helper(action,extra)[1]['error'],'recovery_transaction_mismatch')
+  self.assertEqual(self.mutation_count(),0)
+  self.assertEqual(self.run_helper('apply',a)[0],0)
+  self.assertEqual(self.run_helper('commit',a)[0],0)
+  self.assertEqual(self.run_helper('rollback',a)[0],1)
+
  def test_large_unicode_policies_round_trip_and_keep_the_applied_receipt_readable(self):
   prior=helper.candidates([
    dict(CANDIDATE,id=f'sol-{i}',capabilities=['🌐'*19+f'{j:02}' for j in range(32)])

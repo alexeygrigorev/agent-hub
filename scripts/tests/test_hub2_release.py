@@ -1309,12 +1309,14 @@ class PublicationTests(unittest.TestCase):
                              '[ "$(cat hub2/public/cli/manifest.json)" = legacy ]\n')
         (vm / 'scripts').mkdir()
         for script in ('publish-hub2-release.py', 'build-hub2-release.py', 'hub2-self-update.py',
-                       'schema-rollback-preflight.py'):
+                       'schema-rollback-preflight.py', 'apply-model-policy.py'):
             shutil.copyfile(REPO / 'scripts' / script, vm / 'scripts' / script)
         shutil.copyfile(schema_contract, vm / 'deploy' / schema_contract.name)
         for path in checker.SOURCES.values():
             shutil.copyfile(REPO / path, vm / path)
-        git('add', 'scripts', 'deploy', 'hub2')
+        (vm / 'config').mkdir()
+        shutil.copyfile(REPO / 'config/model-policy.json', vm / 'config/model-policy.json')
+        git('add', 'scripts', 'deploy', 'hub2', 'config')
         git('commit', '--quiet', '-m', 'candidate release')
         candidate = git('rev-parse', 'HEAD')
         git('remote', 'add', 'origin', str(vm))
@@ -1328,6 +1330,31 @@ class PublicationTests(unittest.TestCase):
         _, digest = publication_bundle(upload_parent / f'ci-cli-release-{candidate}', candidate)
 
         state = self.directory / 'deploy-state'
+        # Reuse the offline protocol peer; execute the real protected policy
+        # helper while retaining this fixture's CLI publication/rollback checks.
+        from types import SimpleNamespace
+        spec = importlib.util.spec_from_file_location('release_policy_transaction_fixture', REPO / 'test/test_schema_release_transaction.py')
+        policy_fixture = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(policy_fixture)
+        health_log = self.directory / 'health.log'
+        policy_request_pointers = []
+
+        def observe_commit(repo, *args):
+            current = vm / '.local/cli-releases/current'
+            policy_request_pointers.append(os.readlink(current) if current.is_symlink() else None)
+            return git(*args)
+
+        policy = policy_fixture.PolicyAPI(SimpleNamespace(repo=vm, state=state, health_log=health_log,
+                                                         git=observe_commit))
+        self.addCleanup(policy.close)
+        prior = json.loads(json.dumps(policy.current['candidates']))
+        prior[0]['weight'] = 37
+        policy.current = {'version': 5, 'candidates': prior}
+        credentials = self.directory / 'deploy-credentials'
+        credentials.mkdir(mode=0o700)
+        credential = credentials / 'admin.json'
+        credential.write_text(json.dumps({'access_token': policy_fixture.POLICY_TOKEN}))
+        credential.chmod(0o600)
         fake_bin = self.directory / 'fake-bin'
         fake_bin.mkdir()
         commands = {'sudo': 'exec "$@"', 'systemctl': 'exit 0', 'npm': 'exit 0',
@@ -1335,7 +1362,7 @@ class PublicationTests(unittest.TestCase):
                                'elif [ "$1" = -o ]; then shift 4; fi; exec "$MOCK_INSTALL" "$@"',
                     'python3': 'if [ "$1:$2" = "-:$MOCK_STATE" ]; then cat > "$MOCK_RETIRE"; '
                                'exec "$MOCK_PYTHON" "$@" < "$MOCK_RETIRE"; fi; exec "$MOCK_PYTHON" "$@"',
-                    'curl': 'printf "%s\\n" "$MOCK_HEALTH"'}
+                    'curl': 'printf healthy >> "$MOCK_HEALTH_LOG"; printf "%s\\n" "$MOCK_HEALTH"'}
         for name, body in commands.items():
             path = fake_bin / name
             path.write_text('#!/bin/sh\n' + body + '\n')
@@ -1343,6 +1370,8 @@ class PublicationTests(unittest.TestCase):
         env = {**os.environ, 'PATH': f'{fake_bin}:{os.environ["PATH"]}', 'AGENT_HUB_DEPLOY_TEST_MODE': '1',
                'AGENT_HUB_TEST_REPO': str(vm), 'AGENT_HUB_TEST_TRANSACTION_DIR': str(state),
                'AGENT_HUB_TEST_CADDY_CONFIG': str(self.directory / 'unused-Caddyfile'),
+               'AGENT_HUB_TEST_POLICY_URL': policy.url, 'AGENT_HUB_TEST_POLICY_CREDENTIAL': str(credential),
+               'MOCK_HEALTH_LOG': str(health_log), 'HUB2_TOKEN': 'ambient-token-must-not-be-used',
                'MOCK_INSTALL': shutil.which('install'),
                'MOCK_STATE': str(state), 'MOCK_RETIRE': str(self.directory / 'retire.py'), 'MOCK_PYTHON': sys.executable,
                'MOCK_HEALTH': '{"ok":true,"service":"hub2"}'}
@@ -1358,6 +1387,8 @@ class PublicationTests(unittest.TestCase):
 
         pointer = vm / '.local/cli-releases/current'
         transaction('apply', candidate, 'active', 'hub-only', 'matched-cli')
+        self.assertEqual(policy.current['version'], 6)
+        self.assertEqual(json.loads((policy_fixture.policy_directory(state) / 'receipt.json').read_text())['phase'], 'applied')
         self.assertEqual(legacy_manifest.read_text(), 'legacy')
         self.assertEqual((state / 'schema-mode').read_text().strip(), 'defer')
         self.assertEqual((state / 'cli-legacy.previous/manifest.json').read_text(), 'legacy')
@@ -1369,6 +1400,8 @@ class PublicationTests(unittest.TestCase):
         self.assertFalse((state / 'cli-assets.json').exists())
         transaction('publish', candidate, 'f' * 64, expected_error='manifest differs')
         transaction('commit', expected_error='matched CLI assets were not published')
+        self.assertEqual(json.loads((policy_fixture.policy_directory(state) / 'receipt.json').read_text())['phase'], 'applied',
+                         'a premature finalize must not seal policy before CLI publication')
         self.assertFalse(pointer.is_symlink())
         transaction('publish', candidate, digest)
         transaction('publish', candidate, digest)
@@ -1380,6 +1413,12 @@ class PublicationTests(unittest.TestCase):
         self.assertFalse(state.exists())
         self.assertEqual(git('rev-parse', 'HEAD'), previous)
         self.assertEqual(legacy_manifest.read_text(), 'legacy')
+        self.assertEqual(policy.current, {'version': 7, 'candidates': prior})
+        self.assertEqual(policy.writes()[-1][0], 'PUT')
+        self.assertEqual(policy.writes()[-1][2], candidate, 'policy restoration precedes checkout')
+        restore_index = next(i for i, call in enumerate(policy.calls) if call[0] == 'PUT')
+        self.assertEqual(policy_request_pointers[restore_index], f'releases/{candidate}',
+                         'policy restoration precedes published CLI pointer rollback')
         transaction('apply', candidate, 'active', 'hub-only', 'matched-cli')
         new_token = (state / 'transaction-token').read_text().strip()
         stale = subprocess.run([sys.executable, env['MOCK_RETIRE'], str(state), old_token],
@@ -1391,6 +1430,8 @@ class PublicationTests(unittest.TestCase):
         transaction('commit')
         self.assertFalse(state.exists())
         self.assertEqual(os.readlink(pointer), f'releases/{candidate}')
+        self.assertEqual(policy.current['version'], 8)
+        self.assertEqual([call[0] for call in policy.writes()], ['POST', 'PUT', 'POST'])
 
 
 if __name__ == '__main__':

@@ -11,6 +11,8 @@ if [[ "${AGENT_HUB_DEPLOY_TEST_MODE:-0}" == 1 ]]; then
   CADDY_SITE="${AGENT_HUB_TEST_CADDY_SITE:-$(dirname "$CADDY_CONFIG")/sites/hub.caddy}"
   CLI_RELEASE_ROOT="$REPO/.local/cli-releases"
   DB_DIR="${AGENT_HUB_TEST_DB_DIR:-$REPO/.local/hub2-db}"
+  POLICY_URL="${AGENT_HUB_TEST_POLICY_URL:-http://127.0.0.1:8787}"
+  POLICY_CREDENTIAL="${AGENT_HUB_TEST_POLICY_CREDENTIAL:-$REPO/.local/deploy-credentials/model-policy-admin.json}"
 else
   REPO=/opt/agent-hub
   TRANSACTION_DIR=/var/lib/agent-hub/deploy-rollback
@@ -18,12 +20,16 @@ else
   CADDY_SITE=/etc/caddy/sites/hub.caddy
   CLI_RELEASE_ROOT=/var/lib/agent-hub/cli-releases
   DB_DIR=/var/lib/agent-hub/hub2-db
+  POLICY_URL=http://127.0.0.1:8787
+  POLICY_CREDENTIAL=/var/lib/agent-hub/deploy-credentials/model-policy-admin.json
 fi
 CADDY_BIN=caddy
 TMPDIR="$REPO/.local/tmp"
 LEGACY_CLI_DIR="$REPO/hub2/public/cli"
 CANDIDATE_CADDY=""
 SCHEMA_PREFLIGHT=""
+POLICY_TRANSACTION_TOKEN=""
+POLICY_SOURCE_SHA=""
 
 cleanup_candidate() {
   if [[ -n "$SCHEMA_PREFLIGHT" ]]; then
@@ -69,6 +75,61 @@ write_root_file() {
 
 read_root_file() {
   run_root cat "$1"
+}
+
+validate_policy_credential() {
+  # The helper supports --token-file, but intentionally also supports ambient
+  # HUB2_TOKEN. Deploys require this explicit private credential instead.
+  run_root python3 - "$POLICY_CREDENTIAL" <<'PY'
+import json, os, pathlib, re, stat, sys
+try:
+    path = pathlib.Path(sys.argv[1])
+    if not path.is_absolute() or path.parent.resolve() != path.parent:
+        raise ValueError()
+    parent = path.parent.stat()
+    if parent.st_uid != os.getuid() or not stat.S_ISDIR(parent.st_mode) or parent.st_mode & 0o077:
+        raise ValueError()
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_nlink != 1 or info.st_size > 16384:
+            raise ValueError()
+        value = json.load(stream)
+    if not isinstance(value, dict) or not isinstance(value.get('access_token'), str) or not re.fullmatch(r'[^\s]{32,4096}', value['access_token']):
+        raise ValueError()
+except (OSError, ValueError, TypeError):
+    raise SystemExit('policy_admin_credential_unavailable_or_untrusted') from None
+PY
+}
+
+policy_directory() {
+  [[ "$POLICY_TRANSACTION_TOKEN" =~ ^[0-9a-f]{32}$ ]] || return 1
+  printf '%s/model-policy-%s\n' "$TRANSACTION_DIR" "$POLICY_TRANSACTION_TOKEN"
+}
+
+policy_recovery() {
+  local action="$1" directory
+  directory="$(policy_directory)" || return 1
+  [[ "$POLICY_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || return 1
+  validate_policy_credential || return 1
+  run_root env -u HUB2_TOKEN python3 "$directory/apply-model-policy.py" "$action" \
+    --url "$POLICY_URL" --token-file "$POLICY_CREDENTIAL" \
+    --file "$directory/candidates.json" --source-sha "$POLICY_SOURCE_SHA" \
+    --receipt "$directory/receipt.json" --transaction-token "$POLICY_TRANSACTION_TOKEN"
+}
+
+apply_canonical_policy() {
+  local directory
+  directory="$(policy_directory)"
+  run_root install -d -m 700 "$directory"
+  run_root install -m 600 "$REPO/scripts/apply-model-policy.py" "$directory/apply-model-policy.py"
+  run_root install -m 600 "$REPO/config/model-policy.json" "$directory/candidates.json"
+  policy_recovery prepare
+  # If the process/transport dies after this durable intent, only a validated
+  # receipt can authorize recovery. Never infer ownership from policy equality.
+  write_root_file "$TRANSACTION_DIR/policy-apply-started" yes
+  run_root sync -f "$TRANSACTION_DIR"
+  policy_recovery apply
 }
 
 publisher_directory() {
@@ -150,6 +211,13 @@ restore_previous_release() {
   fi
   run_root python3 "$TRANSACTION_DIR/schema-preflight.py" --repo "$REPO" \
     --previous "$previous_sha" --candidate "$previous_sha" --data-dir "$DB_DIR" --print-mode >/dev/null || return 1
+
+  if run_root test -f "$TRANSACTION_DIR/policy-apply-started"; then
+    policy_recovery rollback || {
+      printf 'ERROR: policy rollback unconfirmed; retaining candidate code and protected recovery state.\n' >&2
+      return 1
+    }
+  fi
 
   if run_root test -f "$TRANSACTION_DIR/transaction-token"; then
     publication_token="$(read_root_file "$TRANSACTION_DIR/transaction-token")" || return 1
@@ -247,6 +315,7 @@ apply_release() {
 
   run_root test ! -e "$TRANSACTION_DIR" \
     || fail "an earlier deploy transaction is still pending; resolve its rollback first"
+  if [[ "$release_mode" == active ]]; then validate_policy_credential; fi
   git -C "$REPO" fetch --quiet --no-tags origin main
   git -C "$REPO" cat-file -e "${deploy_sha}^{commit}" \
     || fail "requested deploy commit is unavailable: $deploy_sha"
@@ -284,6 +353,8 @@ apply_release() {
 
   run_root install -d -o root -g root -m 700 "$TRANSACTION_DIR"
   publication_token="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+  POLICY_TRANSACTION_TOKEN="$publication_token"
+  POLICY_SOURCE_SHA="$deploy_sha"
   write_root_file "$TRANSACTION_DIR/transaction-token" "$publication_token"
   run_root install -o root -g root -m 600 "$SCHEMA_PREFLIGHT" "$TRANSACTION_DIR/schema-preflight.py"
   write_root_file "$TRANSACTION_DIR/schema-mode" "$schema_mode"
@@ -298,6 +369,7 @@ apply_release() {
   write_root_file "$TRANSACTION_DIR/previous.sha" "$previous_sha"
   write_root_file "$TRANSACTION_DIR/target.sha" "$deploy_sha"
   write_root_file "$TRANSACTION_DIR/caddy-mode" "$caddy_mode"
+  if [[ "$release_mode" == active ]]; then write_root_file "$TRANSACTION_DIR/policy-required" yes; fi
   if [[ -f "$REPO/.dev.vars" ]]; then
     run_root cp -p -- "$REPO/.dev.vars" "$TRANSACTION_DIR/dev.vars.previous"
     write_root_file "$TRANSACTION_DIR/dev-vars-present" yes
@@ -354,6 +426,7 @@ apply_release() {
   wait_for_hub_health
   run_root python3 "$TRANSACTION_DIR/schema-preflight.py" --repo "$REPO" \
     --previous "$previous_sha" --candidate "$deploy_sha" --data-dir "$DB_DIR" --print-mode >/dev/null
+  if [[ "$release_mode" == active ]]; then apply_canonical_policy; fi
   write_root_file "$TRANSACTION_DIR/applied" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   trap - ERR
   if [[ "$schema_mode" == defer ]]; then
@@ -410,6 +483,16 @@ commit_release() {
   if run_root test -f "$TRANSACTION_DIR/cli-assets-required"; then
     publisher_dir="$(publisher_directory "$publication_token")"
     run_root test -f "$publisher_dir/ready" || fail "the matched CLI assets were not published"
+    run_root test -f "$TRANSACTION_DIR/cli-assets.json" || fail "the matched CLI assets were not published"
+  fi
+  if run_root test -f "$TRANSACTION_DIR/policy-required"; then
+    run_root test -f "$TRANSACTION_DIR/policy-apply-started" || fail "canonical policy application was not verified"
+    # The helper seals a durable committed fence under its receipt lock. Any
+    # later finalization failure is forward-only: retain candidate and retry
+    # commit, rather than permit a delayed privileged rollback to undo policy.
+    policy_recovery commit || fail "canonical policy could not be committed; recovery state retained"
+  fi
+  if run_root test -f "$TRANSACTION_DIR/cli-assets-required"; then
     run_root python3 "$publisher_dir/scripts/publish-hub2-release.py" --root "$CLI_RELEASE_ROOT" \
       commit --receipt "$TRANSACTION_DIR/cli-assets.json" --transaction-token "$publication_token" \
       || fail "the matched CLI assets were not published or are no longer active"
@@ -424,6 +507,12 @@ if [[ "$operation" =~ ^(apply|publish|rollback|commit)$ ]]; then
   mkdir -p "$TMPDIR"
   exec 9>>"$TMPDIR/.deploy-transaction.lock"
   flock -n 9 || fail "another Hub2 deploy transaction operation is running"
+  # Capture identity once. A privileged child surviving this shell must never
+  # read a later same-SHA transaction's token/receipt from the reused directory.
+  if run_root test -f "$TRANSACTION_DIR/transaction-token"; then
+    POLICY_TRANSACTION_TOKEN="$(read_root_file "$TRANSACTION_DIR/transaction-token")"
+    POLICY_SOURCE_SHA="$(read_root_file "$TRANSACTION_DIR/target.sha")"
+  fi
   # Bash defers these traps while waiting for a synchronous child. In
   # particular, an SSH disconnect must not release the lock while sudo's
   # installer or publisher is still writing.
