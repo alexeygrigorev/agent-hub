@@ -46,4 +46,4 @@ jobs:
         run: |
           scripts/ci/run-python-tests.sh host/tests/QUARANTINE-cli.md \
             "$PWD/host:$PWD/host/tests" -- \
-            host/tests/test_cli*.py host/tests/test_session_control.py host/tests/test_intake*.py
+            host/tests/test_cli*.py host/tests/test_session_control.py host/tests/test_intake*.py host/tests/test_native_claude_import.py
