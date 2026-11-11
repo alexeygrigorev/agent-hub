@@ -87,10 +87,13 @@ evidence before any separately authorized action.
 
 Before an active deploy, the deployment owner must provision an existing active
 Hub operator credential with `operator:admin` into
-`/var/lib/agent-hub/deploy-credentials/model-policy-admin.json`, containing an
+`/etc/agent-hub/deploy-credentials/model-policy-admin.json`, containing an
 `access_token` string. The directory must be root-owned and private (0700), and
 the regular, single-link JSON file root-owned and private (0600). Symlinks and
-nonprivate files are refused. Provision it through the established private
+nonprivate files are refused. Keep this credential under the root-owned
+`/etc/agent-hub` configuration tree, separate from service-owned database and
+transaction storage. Do not change ownership of existing service data to install
+a deploy credential. Provision it through the established private
 credential channel; never put tokens in Git, workflow output, command arguments,
 or this document. The deploy transaction neither creates nor enrolls an admin.
 An absent or untrusted credential refuses an active deploy before checkout.
