@@ -866,4 +866,4 @@ class HeadlessStreamOutputTests(unittest.TestCase):
                     child, prompt = self.launch(provider, effort=effort, interactive=True)
                     prefix = (['claude', '--dangerously-skip-permissions', '--model', 'opus'] if provider == 'claude'
                               else ['agy', '--model', self.MODELS[provider], '--dangerously-skip-permissions'])
-                    self.assertEqual(child, [*prefix, *(['--effort', effort] if effort else []), prompt])
+                    self.assertEqual(child, [*prefix, *(['--effort', effort] if effort else []), *(['--prompt-interactive'] if provider == 'antigravity' else []), prompt])
