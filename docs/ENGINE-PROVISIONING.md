@@ -443,6 +443,8 @@ Keep the previous pinned artifact until this repin succeeds. Other profiles,
 shims and provider homes remain untouched. The normal 30-second host heartbeat
 publishes the changed capability; no additional restart is needed. Capability
 presence proves code support, not login validity or quota availability.
+The initial readiness protocol supports POSIX installed releases. Windows keeps
+its existing native defaults and advertises no new managed-execution capability.
 
 At execution, the enrolled v2 host fetches and materializes the current central
 generation, retains the existing CAS rotation behavior, and acknowledges the
@@ -454,7 +456,9 @@ unrelated accounts are outside this execution binding.
 The private attempt context and its adjacent `.receipt.json` identify the Hub
 session, operation, epoch, original request digest, workspace, native UUID/tag/
 birth time, canonical account, fixed profile, execution archive hash and actual
-credential generation. They contain no bearer or credential contents. A
+credential generation. The receipt's `ready_to_exec` stage proves the checked
+configuration immediately before provider execution; it alone is not proof of
+provider work. These files contain no bearer or credential contents. A
 `managed: true` native label or a successful default-Claude task alone does not
 prove this central profile was used. Acceptance still requires the exact-attempt
 receipt, genuine first-action/tool output and qualified completion evidence.
