@@ -37,17 +37,114 @@ def git_file(repo, revision, path, optional=False):
     return done.stdout.decode('utf8')
 
 
+def split_top_level(expr):
+    items, cur, depth, quote_char, escape = [], [], 0, None, False
+    for ch in expr:
+        if quote_char:
+            cur.append(ch)
+            if escape:
+                escape = False
+            elif ch == '\\':
+                escape = True
+            elif ch == quote_char:
+                quote_char = None
+            continue
+        if ch in ("'", '"', '`'):
+            quote_char = ch
+            cur.append(ch)
+        elif ch in ('(', '[', '{'):
+            depth += 1
+            cur.append(ch)
+        elif ch in (')', ']', '}'):
+            depth -= 1
+            if depth < 0:
+                raise ValueError('unbalanced_delimiters')
+            cur.append(ch)
+        elif ch == ',' and depth == 0:
+            item = ''.join(cur).strip()
+            if not item:
+                raise ValueError('empty_argument')
+            items.append(item)
+            cur = []
+        else:
+            cur.append(ch)
+    if quote_char or depth != 0:
+        raise ValueError('unterminated_expression')
+    tail = ''.join(cur).strip()
+    if tail:
+        items.append(tail)
+    return items
+
+
+def legacy_schema_bounds(source, binding):
+    matches = list(re.finditer(r'initializeSchema\s*\(', source))
+    if len(matches) != 1:
+        raise Incompatible('legacy_schema_source_unrecognized:' + binding)
+    start = matches[0].end()
+    depth, quote_char, escape, pos = 1, None, False, start
+    while pos < len(source) and depth > 0:
+        ch = source[pos]
+        if quote_char:
+            if escape:
+                escape = False
+            elif ch == '\\':
+                escape = True
+            elif ch == quote_char:
+                quote_char = None
+        elif ch in ("'", '"', '`'):
+            quote_char = ch
+        elif ch in ('(', '[', '{'):
+            depth += 1
+        elif ch in (')', ']', '}'):
+            depth -= 1
+        pos += 1
+    if depth != 0:
+        raise Incompatible('legacy_schema_source_unrecognized:' + binding)
+    try:
+        args = split_top_level(source[start:pos - 1])
+    except ValueError:
+        raise Incompatible('legacy_schema_source_unrecognized:' + binding) from None
+    if len(args) < 4 or args[0] not in ('ctx', 'this.ctx') or args[1] != 'this.db' or not re.fullmatch(r'\d+', args[2]):
+        raise Incompatible('legacy_schema_source_unrecognized:' + binding)
+    target = int(args[2])
+    if not 1 <= target <= 100:
+        raise Incompatible('legacy_schema_source_unrecognized:' + binding)
+    if len(args) < 5:
+        return target, target
+    migrations_expr = args[4].strip()
+    if not (migrations_expr.startswith('[') and migrations_expr.endswith(']')):
+        raise Incompatible('legacy_schema_source_unrecognized:' + binding)
+    inner = migrations_expr[1:-1].strip()
+    if not inner:
+        return target, target
+    try:
+        steps = split_top_level(inner)
+    except ValueError:
+        raise Incompatible('legacy_schema_source_unrecognized:' + binding) from None
+    if target < 2 or len(steps) != target - 1 or any(step in ('[]', 'null', 'undefined') for step in steps):
+        raise Incompatible('legacy_schema_source_unrecognized:' + binding)
+    return 1, target
+
+
 def manifest(repo, revision):
     raw = git_file(repo, revision, 'deploy/schema-compatibility.json', optional=True)
     if raw is None:
         schemas = {}
+        needs_migration_runner = False
         for binding, path in SOURCES.items():
             source = git_file(repo, revision, path)
-            versions = re.findall(r'initializeSchema\(\s*(?:ctx|this\.ctx)\s*,\s*this\.db\s*,\s*(\d+)\s*,', source)
-            if len(versions) != 1:
-                raise Incompatible('legacy_schema_source_unrecognized:' + binding)
-            target = int(versions[0])
-            schemas[binding] = {'min_read': target, 'max_read': target, 'bridge_write': target, 'active_write': target}
+            min_read, target = legacy_schema_bounds(source, binding)
+            if min_read < target:
+                needs_migration_runner = True
+            schemas[binding] = {'min_read': min_read, 'max_read': target, 'bridge_write': target, 'active_write': target}
+        if needs_migration_runner:
+            db_source = git_file(repo, revision, 'hub2/src/db.ts', optional=True)
+            if db_source is None or not re.search(
+                r'while\s*\(\s*applied\s*<\s*version\s*\).*?migrations\s*\[\s*applied\s*-\s*1\s*\]',
+                db_source,
+                re.DOTALL,
+            ):
+                raise Incompatible('legacy_schema_migration_runner_unrecognized')
         return {'format': 1, 'bridge': False, 'schemas': schemas}
     try:
         value = json.loads(raw)
