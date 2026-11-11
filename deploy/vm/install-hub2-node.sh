@@ -89,9 +89,6 @@ fi
 
 echo "== state directories"
 install -d -m 750 -o alexey -g alexey "$DB_DIR" "$REPO/.local/tmp"
-if [[ "$RELEASE_MODE" == active ]]; then
-  install -d -m 700 -o alexey -g alexey "$CREDENTIAL_MONITOR_EVIDENCE_ROOT"
-fi
 
 if [[ "$KEEP_CLI_ASSETS" != true ]]; then
   echo "== public CLI artifacts"
@@ -137,11 +134,68 @@ if mode and mode not in {"bootstrap", "active"}:
     raise SystemExit("invalid release mode")
 if schema_mode and schema_mode not in {"defer", "apply"}:
     raise SystemExit("invalid schema migration mode")
+original_stat = os.lstat(path)
+if not stat.S_ISREG(original_stat.st_mode):
+    raise SystemExit("invalid .dev.vars file")
 updates = {}
 if mode:
     updates["HUB2_RELEASE_MODE"] = mode
 if schema_mode:
     updates["HUB2_SCHEMA_MIGRATIONS"] = schema_mode
+
+
+def ensure_private_evidence_root(target_root: Path, owner_uid: int, owner_gid: int) -> None:
+    raw = os.fspath(target_root)
+    if not os.path.isabs(raw) or os.path.normpath(raw) != raw or "\x00" in raw or len(target_root.parts) < 2:
+        raise ValueError("invalid evidence root path")
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in target_root.parent.parts[1:]:
+            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+            info = os.fstat(fd)
+            if info.st_uid not in (0, owner_uid) or (info.st_mode & 0o002):
+                raise ValueError("untrusted evidence root ancestor")
+        leaf = target_root.name
+        created = False
+        old_umask = os.umask(0o077)
+        try:
+            try:
+                os.mkdir(leaf, 0o700, dir_fd=fd)
+                created = True
+            except FileExistsError:
+                created = False
+        finally:
+            os.umask(old_umask)
+        linfo = os.stat(leaf, dir_fd=fd, follow_symlinks=False)
+        if not stat.S_ISDIR(linfo.st_mode):
+            raise ValueError("evidence root must be a 0700 directory")
+        ev_fd = os.open(leaf, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+        try:
+            finfo = os.fstat(ev_fd)
+            if not stat.S_ISDIR(finfo.st_mode) or (linfo.st_dev, linfo.st_ino) != (finfo.st_dev, finfo.st_ino):
+                raise ValueError("evidence root identity mismatch")
+            if created:
+                if (
+                    finfo.st_uid != os.geteuid()
+                    or finfo.st_nlink != 2
+                    or stat.S_IMODE(finfo.st_mode) != 0o700
+                    or os.listdir(ev_fd)
+                ):
+                    raise ValueError("newly created evidence root failed identity check")
+                if os.geteuid() == 0 and (owner_uid != 0 or owner_gid != 0):
+                    os.fchown(ev_fd, owner_uid, owner_gid)
+                os.fsync(ev_fd)
+                os.fsync(fd)
+                finfo = os.fstat(ev_fd)
+            if finfo.st_uid != owner_uid or finfo.st_gid != owner_gid or stat.S_IMODE(finfo.st_mode) != 0o700:
+                raise ValueError("evidence root must be a 0700 directory owned by service user")
+        finally:
+            os.close(ev_fd)
+    finally:
+        os.close(fd)
+
 
 if mode == "active" and (repo_arg or evidence_root_arg):
     if not repo_arg or not evidence_root_arg:
@@ -149,9 +203,8 @@ if mode == "active" and (repo_arg or evidence_root_arg):
     try:
         repo = Path(repo_arg)
         evidence_root = Path(evidence_root_arg)
-        root_stat = os.lstat(evidence_root)
-        if not stat.S_ISDIR(root_stat.st_mode) or stat.S_IMODE(root_stat.st_mode) != 0o700:
-            raise ValueError("evidence root must be a 0700 directory")
+        owner_uid, owner_gid = original_stat.st_uid, original_stat.st_gid
+        ensure_private_evidence_root(evidence_root, owner_uid, owner_gid)
         git_env = {
             "PATH": os.defpath,
             "HOME": "/nonexistent",
@@ -180,7 +233,6 @@ if mode == "active" and (repo_arg or evidence_root_arg):
                 raise ValueError(f"untrusted authority artifact: {rel}")
             hashes[rel] = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
         destination = evidence_root / f"{expected_commit}-{uuid.uuid4().hex}"
-        owner_uid, owner_gid = root_stat.st_uid, root_stat.st_gid
 
         def _drop_privileges():
             if os.geteuid() == 0 and (owner_uid != 0 or owner_gid != 0):
@@ -231,7 +283,6 @@ if mode == "active" and (repo_arg or evidence_root_arg):
     except Exception as exc:
         raise SystemExit(f"credential_monitor_staging_failed: {exc}") from None
 
-original_stat = path.stat()
 lines = path.read_text(encoding="utf-8").splitlines()
 updated = []
 inserted = set()
