@@ -170,12 +170,35 @@ or include either token in reports.
    applied via a reviewed change set (no replacement).
 3. Verified `https://hub.dtcdev.click/health`, then bootstrap→active.
 
-Rollback of traffic = revert the hub-edge change set (origin back to the
-Cloudflare Workers endpoint, which stays deployed but idle). Rollback of code
-= revert the bad change on `main` through a PR, then run the production
-workflow again (see "Shipping an update"); never edit the VM by hand. The DB
-schema is additive per hub2's schema versions, and
-`deploy/vm/install-hub2-node.sh` is idempotent.
+Code rollback preserves the live SQLite databases. Additive DDL still needs a
+compatible reader: an older binary rejects unknown `hub2_schema` versions.
+Never restore a predeploy database as an application rollback, because that
+would discard later user writes, credentials, commands and outbox receipts.
+
+The deployment transaction reads the actual schema singleton in every existing
+namespace database before changing the checkout. It checks the candidate and
+previous revisions against `deploy/schema-compatibility.json` and the source
+schema targets. Legacy revisions without the manifest are treated conservatively.
+Missing metadata, unknown namespaces, symlinks and unsupported versions refuse
+deployment or rollback before checkout. The census is read-only and prints no
+user rows or environment values.
+
+A first compatible bridge deploy selects `HUB2_SCHEMA_MIGRATIONS=defer` when
+the previous reader supports only Control4 / Machine6. Starts and normal task
+capture retain their existing contracts; new shared-memory APIs and explicit
+screen capture return `schema_migration_deferred` until their schemas are enabled.
+Commit and verify that bridge before a subsequent deploy enables Control5 /
+Machine7 with `apply`. The bridge reads both versions and retains new writes on
+rollback. The installer persists the selected mode atomically without replacing
+unrelated configuration or file permissions. Unknown future versions still fail
+closed. Never enable migrations manually to bypass the transaction.
+
+A successful `/health` alone does not prove that object migrations succeeded.
+The Node startup readiness check must finish existing object initialization
+before listening. Public authenticated API and canary verification remain
+required before finalizing the transaction. Failure keeps protected transaction
+state for recovery; rollback rechecks the current databases before selecting the
+previous binary and restores only Hub-owned configuration.
 
 ## Static VM IP
 

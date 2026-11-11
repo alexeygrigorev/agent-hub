@@ -9,6 +9,7 @@
 set -euo pipefail
 
 RELEASE_MODE=""
+SCHEMA_MIGRATIONS=""
 HUB_ONLY=false
 KEEP_CLI_ASSETS=false
 while (($#)); do
@@ -19,6 +20,14 @@ while (($#)); do
         exit 2
       fi
       RELEASE_MODE="$2"
+      shift 2
+      ;;
+    --schema-migrations)
+      if (($# < 2)); then
+        echo "--schema-migrations requires defer or apply" >&2
+        exit 2
+      fi
+      SCHEMA_MIGRATIONS="$2"
       shift 2
       ;;
     --hub-only)
@@ -37,6 +46,11 @@ while (($#)); do
 done
 if [[ -n "$RELEASE_MODE" && "$RELEASE_MODE" != bootstrap && "$RELEASE_MODE" != active ]]; then
   echo "--release-mode must be bootstrap or active" >&2
+  exit 2
+fi
+
+if [[ -n "$SCHEMA_MIGRATIONS" && "$SCHEMA_MIGRATIONS" != defer && "$SCHEMA_MIGRATIONS" != apply ]]; then
+  echo "--schema-migrations must be defer or apply" >&2
   exit 2
 fi
 
@@ -95,9 +109,9 @@ else
   echo "   keeping existing .dev.vars"
 fi
 
-if [[ -n "$RELEASE_MODE" ]]; then
-  echo "== release mode ($RELEASE_MODE)"
-  python3 - "$REPO/.dev.vars" "$RELEASE_MODE" <<'PY'
+if [[ -n "$RELEASE_MODE" || -n "$SCHEMA_MIGRATIONS" ]]; then
+  echo "== release configuration"
+  python3 - "$REPO/.dev.vars" "$RELEASE_MODE" "$SCHEMA_MIGRATIONS" <<'PY'
 import os
 import stat
 import sys
@@ -105,24 +119,33 @@ import tempfile
 from pathlib import Path
 
 path = Path(sys.argv[1])
-mode = sys.argv[2]
-if mode not in {"bootstrap", "active"}:
+mode, schema_mode = sys.argv[2:4]
+if mode and mode not in {"bootstrap", "active"}:
     raise SystemExit("invalid release mode")
+if schema_mode and schema_mode not in {"defer", "apply"}:
+    raise SystemExit("invalid schema migration mode")
+updates = {}
+if mode:
+    updates["HUB2_RELEASE_MODE"] = mode
+if schema_mode:
+    updates["HUB2_SCHEMA_MIGRATIONS"] = schema_mode
 
 original_stat = path.stat()
 lines = path.read_text(encoding="utf-8").splitlines()
 updated = []
-inserted = False
+inserted = set()
 for line in lines:
     key, separator, _value = line.partition("=")
-    if separator and key.strip() == "HUB2_RELEASE_MODE":
-        if not inserted:
-            updated.append(f"HUB2_RELEASE_MODE={mode}")
-            inserted = True
+    key = key.strip()
+    if separator and key in updates:
+        if key not in inserted:
+            updated.append(f"{key}={updates[key]}")
+            inserted.add(key)
         continue
     updated.append(line)
-if not inserted:
-    updated.insert(0, f"HUB2_RELEASE_MODE={mode}")
+for key, value in updates.items():
+    if key not in inserted:
+        updated.insert(0, f"{key}={value}")
 contents = "\n".join(updated) + "\n"
 
 fd, temporary_name = tempfile.mkstemp(prefix=".dev.vars.", dir=path.parent)

@@ -15,6 +15,7 @@ export interface RowCounts {
 /** Materializes every cursor before sampling rowsRead/rowsWritten. The values
  * include constructor, authorization, alarm, and route SQL for this instance. */
 export class MeteredDb {
+  schemaVersion = 0;
   private readonly cache = new ReadCache();
   private totals: RowCounts = {
     sql_calls: 0, rows_read: 0, rows_written: 0, schema_calls: 0,
@@ -131,13 +132,18 @@ export function initializeSchema(
   migrations: string[][] = [],
   afterInitialize?: () => void | Promise<void>,
   initialVersion = 1,
+  migrationCeiling = version,
 ): Promise<void> {
   if (!Number.isSafeInteger(initialVersion) || initialVersion < 1 || initialVersion > version) {
     return Promise.reject(new Error('invalid_initial_schema_version'));
   }
+  if (!Number.isSafeInteger(migrationCeiling) || migrationCeiling < initialVersion || migrationCeiling > version) {
+    return Promise.reject(new Error('invalid_schema_migration_ceiling'));
+  }
   return state.blockConcurrencyWhile(async () => {
+    try {
     assertCacheSchema([...statements, ...migrations.flat()]);
-    db.transaction(state, () => {
+    const storedVersion = db.transaction(state, () => {
       db.run('CREATE TABLE IF NOT EXISTS hub2_schema (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), version INTEGER NOT NULL)');
       const row = db.one<{ version: number }>('SELECT version FROM hub2_schema WHERE singleton = 1');
       if (row && row.version > version) throw new Error('schema_version_newer_than_code');
@@ -147,15 +153,31 @@ export function initializeSchema(
         db.run('INSERT INTO hub2_schema(singleton, version) VALUES (1, ?)', initialVersion);
         applied = initialVersion;
       }
-      while (applied < version) {
+      while (applied < migrationCeiling) {
         const migration = migrations[applied - 1];
         if (!migration) throw new Error(`schema_migration_missing:${applied}->${applied + 1}`);
         for (const statement of migration) db.run(statement);
         applied++;
         db.run('UPDATE hub2_schema SET version=? WHERE singleton=1', applied);
       }
+      return applied;
     });
+    db.schemaVersion = storedVersion;
     await afterInitialize?.();
     db.initialized();
+    } catch(caught) {
+    const message=caught instanceof Error?caught.message:'';
+    const code=message==='schema_version_newer_than_code'||/^schema_migration_missing:\d+->\d+$/.test(message)
+      ?message:'schema_initialization_failed';
+    console.error('[hub2] schema initialization failed',{code,supported_version:version,migration_ceiling:migrationCeiling});
+    throw caught;
+    }
   });
+}
+
+/** A bridge can read the current schema while deferring only the next upgrade. */
+export function schemaMigrationCeiling(mode: string | undefined, bridgeVersion: number, version: number): number {
+  if (mode === undefined || mode === 'apply') return version;
+  if (mode === 'defer') return bridgeVersion;
+  throw new Error('invalid_schema_migration_mode');
 }

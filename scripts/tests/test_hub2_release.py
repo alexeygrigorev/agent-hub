@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tarfile
@@ -1075,21 +1076,38 @@ class PublicationTests(unittest.TestCase):
         git('config', 'user.name', 'Release Fixture')
         git('config', 'user.email', 'release@example.invalid')
         git('config', 'core.hooksPath', '/dev/null')
+        checker = module('schema-rollback-preflight')
+        schema_contract = REPO / 'deploy/schema-compatibility.json'
+        schemas = json.loads(schema_contract.read_text())['schemas']
+        db_dir = vm / '.local/hub2-db'
+        db_dir.mkdir(parents=True)
+        for binding, path in checker.SOURCES.items():
+            source = vm / path
+            source.parent.mkdir(parents=True, exist_ok=True)
+            version = schemas[binding]['bridge_write']
+            source.write_text(f'initializeSchema(ctx, this.db, {version}, SCHEMA);\n')
+            with sqlite3.connect(db_dir / f'{binding}-fixture.sqlite') as db:
+                db.execute('CREATE TABLE hub2_schema(singleton INTEGER PRIMARY KEY, version INTEGER)')
+                db.execute('INSERT INTO hub2_schema VALUES(1, ?)', (version,))
         installer = vm / 'deploy/vm/install-hub2-node.sh'
         installer.parent.mkdir(parents=True)
         installer.write_text('set -eu\n[ "$1" = --hub-only ]\n[ ! -L .local/cli-releases/current ]\n'
                              'printf rebuilt > hub2/public/cli/manifest.json\n')
         (vm / '.gitignore').write_text('/.local/\n/.dev.vars\n/hub2/public/cli/\n')
-        git('add', 'deploy', '.gitignore')
+        git('add', 'deploy', '.gitignore', 'hub2')
         git('commit', '--quiet', '-m', 'old release without publisher')
         previous = git('rev-parse', 'HEAD')
         git('branch', '-M', 'main')
-        installer.write_text('set -eu\n[ "$*" = "--release-mode active --hub-only --keep-cli-assets" ]\n'
+        installer.write_text('set -eu\n[ "$*" = "--release-mode active --hub-only --schema-migrations defer --keep-cli-assets" ]\n'
                              '[ "$(cat hub2/public/cli/manifest.json)" = legacy ]\n')
         (vm / 'scripts').mkdir()
-        for script in ('publish-hub2-release.py', 'build-hub2-release.py', 'hub2-self-update.py'):
+        for script in ('publish-hub2-release.py', 'build-hub2-release.py', 'hub2-self-update.py',
+                       'schema-rollback-preflight.py'):
             shutil.copyfile(REPO / 'scripts' / script, vm / 'scripts' / script)
-        git('add', 'scripts', 'deploy')
+        shutil.copyfile(schema_contract, vm / 'deploy' / schema_contract.name)
+        for path in checker.SOURCES.values():
+            shutil.copyfile(REPO / path, vm / path)
+        git('add', 'scripts', 'deploy', 'hub2')
         git('commit', '--quiet', '-m', 'candidate release')
         candidate = git('rev-parse', 'HEAD')
         git('remote', 'add', 'origin', str(vm))
@@ -1134,6 +1152,7 @@ class PublicationTests(unittest.TestCase):
         pointer = vm / '.local/cli-releases/current'
         transaction('apply', candidate, 'active', 'hub-only', 'matched-cli')
         self.assertEqual(legacy_manifest.read_text(), 'legacy')
+        self.assertEqual((state / 'schema-mode').read_text().strip(), 'defer')
         self.assertEqual((state / 'cli-legacy.previous/manifest.json').read_text(), 'legacy')
         with (upload_parent / '.deploy-transaction.lock').open('ab') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)

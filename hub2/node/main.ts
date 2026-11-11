@@ -11,6 +11,7 @@
 
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { mkdirSync } from 'node:fs';
 import { registerTypeScriptResolveHook, installCompatGlobals } from './compat.ts';
 
 registerTypeScriptResolveHook();
@@ -56,11 +57,18 @@ const [{ default: entry, ControlDO, ProjectDO, MachineDO, AccountDO, MailboxDO }
     import('./server.ts'),
   ]);
 
-const envVars = await loadEnvironment(devVars === 'none' ? undefined : devVars);
+const envVars = await loadEnvironment(devVars === 'none' ? undefined : devVars, args['dev-vars'] !== undefined);
+const classes = { CONTROL: ControlDO, PROJECTS: ProjectDO, MACHINES: MachineDO, ACCOUNTS: AccountDO, MAILBOXES: MailboxDO };
+const runtimeEnv = { ...envVars, ASSETS: assetFetcher(publicDir, cliReleaseRoot) };
+// Do not serve /health before existing object migrations and recovery finish.
+// This runs before Hub2Runtime starts its alarm sweep.
+mkdirSync(dataDir, { recursive: true });
+const { probeSchemaReadiness } = await import('./schema-readiness.ts');
+await probeSchemaReadiness({ classes: classes as never, env: runtimeEnv, dataDir });
 const runtime = new Hub2Runtime({
-  classes: { CONTROL: ControlDO, PROJECTS: ProjectDO, MACHINES: MachineDO, ACCOUNTS: AccountDO, MAILBOXES: MailboxDO } as never,
+  classes: classes as never,
   entry,
-  env: { ...envVars, ASSETS: assetFetcher(publicDir, cliReleaseRoot) },
+  env: runtimeEnv,
   dataDir,
 });
 
