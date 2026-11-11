@@ -231,6 +231,24 @@ class NativeImportTest(unittest.TestCase):
         self.assert_enrollment_refused()
 
     @unittest.skipIf(os.name == 'nt', 'POSIX directory links')
+    def test_inaccessible_current_enrollment_never_selects_separate_legacy(self):
+        separate = self.home / 'legacy-config' / 'agent-hub'
+        separate.mkdir(parents=True, mode=0o700)
+        self.profile(separate / 'host.json', {
+            'base_url': 'https://hub.test', 'access_token': 'synthetic-legacy-token',
+            'machine_id': 'legacy-host',
+        })
+        # Python 3.14 Path.exists() suppresses permission errors. Such an
+        # inaccessible current enrollment is not proof that it is absent.
+        self.profiles.chmod(0)
+        try:
+            with patch.dict(os.environ, {'XDG_CONFIG_HOME': str(separate.parent)}):
+                with self.assertRaisesRegex(ValueError, 'HTTPS and an enrolled host'):
+                    h.bind('https://hub.test')
+        finally:
+            self.profiles.chmod(0o700)
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX directory links')
     def test_current_enrollment_never_follows_parent_symlink(self):
         relocated = self.home / 'relocated'
         self.profiles.rename(relocated)
