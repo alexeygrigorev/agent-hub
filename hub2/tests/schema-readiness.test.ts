@@ -60,7 +60,7 @@ test('real legacy Control and Machine constructors defer, apply and reopen upgra
     assert.equal(await probeSchemaReadiness({classes,env:{HUB2_SCHEMA_MIGRATIONS:'defer'},dataDir:dir}),2);
     assert.equal(inspect(control).version,4);assert.equal(inspect(machine).version,6);
     assert.equal(await probeSchemaReadiness({classes,env:{HUB2_SCHEMA_MIGRATIONS:'apply'},dataDir:dir}),2);
-    assert.equal(inspect(control).version,5);assert.equal(inspect(machine).version,7);
+    assert.equal(inspect(control).version,6);assert.equal(inspect(machine).version,7);
     const db=new DatabaseSync(control);db.exec("INSERT INTO retained VALUES('after-upgrade','concurrent write')");db.close();
     const before=inspect(control).rows;
     const newControl=pathFor(dir,'CONTROL','new-object'),newMachine=pathFor(dir,'MACHINES','new-host');
@@ -69,7 +69,7 @@ test('real legacy Control and Machine constructors defer, apply and reopen upgra
     assert.deepEqual(inspect(control).rows,before);assert.equal(inspect(machine).version,7);
     assert.equal(inspect(newControl).version,4);assert.equal(inspect(newMachine).version,6);
     assert.equal(await probeSchemaReadiness({classes,env:{HUB2_SCHEMA_MIGRATIONS:'apply'},dataDir:dir}),4);
-    assert.equal(inspect(newControl).version,5);assert.equal(inspect(newMachine).version,7);
+    assert.equal(inspect(newControl).version,6);assert.equal(inspect(newMachine).version,7);
     const check=new DatabaseSync(control);
     assert.equal(check.prepare("SELECT name FROM sqlite_master WHERE name='hub2_identity'").all().length,0);check.close();
   }finally{rmSync(dir,{recursive:true});}

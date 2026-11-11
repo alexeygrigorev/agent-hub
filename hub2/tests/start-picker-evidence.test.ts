@@ -18,6 +18,8 @@ const parsed=async(response:Response)=>await response.json() as any;
 function fixture(){
   const parent=resolve('.local/tmp');mkdirSync(parent,{recursive:true});
   const directory=mkdtempSync(join(parent,'picker-evidence-')),file=join(directory,'project.sqlite');
+  const controlSql=new NodeSqlStorage(join(directory,'control.sqlite'));
+  let control:ControlDO;
   let sql:NodeSqlStorage,project:ProjectDO,policy=structuredClone(candidates),version=1,policyReads=0;
   let engines=['codex','claude'];
   let policyGate:{entered:()=>void;wait:Promise<void>}|undefined;
@@ -27,6 +29,7 @@ function fixture(){
   const env:any={
     CONTROL:namespace(async(_id,r)=>{
       const path=new URL(r.url).pathname;
+      if(path==='/_internal/picker/draw')return control.fetch(r);
       if(path==='/_routing-policy'){
         policyReads++;
         const gate=policyGate;policyGate=undefined;
@@ -52,6 +55,8 @@ function fixture(){
     ACCOUNTS:namespace(async(id)=>Response.json({account:{enabled:true,min_remaining:0},credential_usable:true,
       credential_status:'ready',quota:{remaining:80},hosts:[id==='codex-private'?'h1':'h2']})),
   };
+  control=new ControlDO({storage:new NodeDurableStorage(controlSql),
+    blockConcurrencyWhile:(callback:any)=>Promise.resolve().then(callback)} as any,env);
   const open=()=>{
     sql=new NodeSqlStorage(file);
     const storage=new NodeDurableStorage(sql);
@@ -72,7 +77,7 @@ function fixture(){
       return {entered:enteredPromise,release};
     },
     clearCache(){(project as any).db.cache.clear();},
-    reopen(){sql.close();open();},close(){sql.close();rmSync(directory,{recursive:true});}};
+    reopen(){sql.close();open();},close(){sql.close();controlSql.close();rmSync(directory,{recursive:true});}};
 }
 async function intake(f:ReturnType<typeof fixture>,key:string){
   const response=await f.call('/api/intakes?project=org/picker','POST',{

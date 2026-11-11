@@ -104,6 +104,10 @@ const router = {
         );
       if (path === '/api/sessions' && request.method !== 'GET' && request.method !== 'HEAD')
         return request.method === 'POST' ? await startSession(request, env, actor) : error('method_not_allowed', 405);
+      if (/^\/api\/picker-alerts\/(?:counters|offers|[1-9][0-9]*\/(?:ack|nack))$/.test(path)) {
+        if(!admin(actor))return error('forbidden',403);
+        return control.fetch(await forwardRequest(request, CONTROL + path, actor));
+      }
       if (path === '/api/model-picker/pick')
         return request.method === 'POST' ? await dryRunPick(request, env, actor) : error('method_not_allowed', 405);
       if (path === '/api/fleet/routing/simulate')

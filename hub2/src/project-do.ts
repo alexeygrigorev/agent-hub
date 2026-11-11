@@ -4,7 +4,7 @@ import { SqlReceiptMeter, SQL_PROBE_HEADER, wrapSqlNamespaces } from './sql-rece
 import { sha256Hex } from './crypto';
 import { actorFrom, bodyObject, error, hasScope, HttpError, json } from './http';
 import { advanceDispatch } from './dispatch';
-import { pickModelRouteDetailed, type PickedRoute, type PickDiagnostics } from './model-picker';
+import { pickCommittedModelRoute, type PickedRoute, type PickDiagnostics } from './model-picker';
 import {buildStartPickerEvidence, normalizeStartPickerEvidence} from './start-picker-evidence';
 import { sessionPurpose } from './session-purpose';
 import { nativeReturncode } from './native-exit';
@@ -430,7 +430,10 @@ export class ProjectDO {
       return saga ? this.startResponse(saga,200) : error('dispatch_state_unavailable', 503);
     }
 
-    const operationId = crypto.randomUUID();
+    const operationHash = await sha256Hex(JSON.stringify(['hub2-start-operation-v1',intake.project,intakeId,key]));
+    const operationId = `${operationHash.slice(0,8)}-${operationHash.slice(8,12)}-5${operationHash.slice(13,16)}-a${operationHash.slice(17,20)}-${operationHash.slice(20,32)}`;
+    const sessionHash = await sha256Hex(JSON.stringify(['hub2-start-session-v1',intake.project,intakeId,key]));
+    const sessionId = `${sessionHash.slice(0,8)}-${sessionHash.slice(8,12)}-5${sessionHash.slice(13,16)}-a${sessionHash.slice(17,20)}-${sessionHash.slice(20,32)}`;
     let route: PickedRoute;
     let diagnostics:PickDiagnostics;
     if (typeof engineInput === 'string' && engineInput.toLowerCase() === 'shell') {
@@ -470,7 +473,7 @@ export class ProjectDO {
       diagnostics={pool:[{policy_id:route.policy_id,engine:route.engine,model:route.model,
         effort:route.effort??null,weight:1,share:1}],excluded:[]};
     } else {
-      const picked = await pickModelRouteDetailed(this.env, {
+      const picked = await pickCommittedModelRoute(this.env, {
           ...(typeof machineInput === 'string' ? { machine_id: machineInput } : {}),
           ...(typeof engineInput === 'string' ? { engine: engineInput } : {}),
           ...(typeof modelInput === 'string' ? { model: modelInput } : {}),
@@ -478,7 +481,7 @@ export class ProjectDO {
           ...(typeof body.tier === 'string' ? { tier: body.tier } : {}),
           ...(overrideReason ? { override_reason: overrideReason } : {}),
           interactive, purpose, with_goal: withGoal, required_capabilities: requiredCapabilities, workspace,
-        });
+        }, {project_id:intake.project,operation_id:operationId,attempt:0});
       route=picked.route;diagnostics=picked.diagnostics;
     }
     const picker=buildStartPickerEvidence(route,diagnostics);
@@ -495,7 +498,6 @@ export class ProjectDO {
       ...(route.engine.toLowerCase() === 'shell' ? { shell_reason: overrideReason } : {}),
     };
     const now = Date.now();
-    const sessionId = crypto.randomUUID();
     const machineId = route.machine_id;
     const cap = await this.env.CONTROL.get(this.env.CONTROL.idFromName('global')).fetch('https://control.internal/_internal/session-cap/check', {
       method: 'POST', headers: { 'Content-Type': 'application/json', 'x-hub2-actor': JSON.stringify(actor) },
@@ -806,10 +808,11 @@ export class ProjectDO {
     let diagnostics:PickDiagnostics;
     try{
       const launch=this.parse(saga.launch_spec_json) as JsonRecord;
-      const picked=await pickModelRouteDetailed(this.env,{interactive:launch.interactive===true,
+      const picked=await pickCommittedModelRoute(this.env,{interactive:launch.interactive===true,
         ...(typeof launch.workspace==='string'?{workspace:launch.workspace}:{}),
         purpose: sessionPurpose(launch.purpose),
-        with_goal:launch.with_goal===true,required_capabilities:route.required_capabilities,exclude_policy_ids:tried});
+        with_goal:launch.with_goal===true,required_capabilities:route.required_capabilities,exclude_policy_ids:tried},
+        {project_id:intake.project,operation_id:saga.operation_id,attempt:1,previous_picker:route.picker});
       next=picked.route;diagnostics=picked.diagnostics;
     }catch(caught){
       if(caught instanceof HttpError&&caught.code==='model_policy_unavailable')return await fail('all_model_routes_auth_failed');
