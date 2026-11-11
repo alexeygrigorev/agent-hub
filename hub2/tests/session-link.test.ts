@@ -74,7 +74,7 @@ function context(){
  const ctx:any={storage:{sql:{exec(q:string,...args:any[]){const s=sql.prepare(q);return {toArray:()=>s.columns().length?s.all(...args):(s.run(...args),[])};}},transactionSync(fn:()=>unknown){sql.exec('BEGIN');try{const value=fn();sql.exec('COMMIT');return value;}catch(e){sql.exec('ROLLBACK');throw e;}},async getAlarm(){return alarm;},async setAlarm(value:number){alarm=value;},async deleteAlarm(){alarm=null;}},blockConcurrencyWhile:(fn:()=>unknown)=>Promise.resolve(fn()),getWebSockets:()=>[]};
  return {ctx,sql};
 }
-test('official public route links a second intake through real Machine and Project stores',async()=>{
+test('official public route links a second intake through real stores and a hermetic CLI child',async()=>{
  const m=context(),p=context();let machine:MachineDO,project:ProjectDO;
  const routes=new Map<string,{id:string;owner:string;resource_id:string}>();
  const control={idFromName:(id:string)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{
@@ -128,9 +128,9 @@ test('official public route links a second intake through real Machine and Proje
   const address=server.address() as {port:number};
   const config=resolve(scratch,'cli.json');
   await writeFile(config,JSON.stringify({client_kind:'human',access_token:token,base_url:'http://127.0.0.1:'+address.port}),{mode:0o600});
-  const cli=async(...args:string[])=>{
+  const cli=async(parentEnv:typeof process.env,...args:string[])=>{
   const child=spawn('python3',['-m','agent_hub_host.cli',...args],{
-   cwd:cliRoot,env:{...process.env,HOME:scratch,XDG_CONFIG_HOME:scratch,HUB_CONFIG_FILE:config,PYTHONPATH:resolve(cliRoot,'host'),HUB2_TOKEN:'',HUB_TOKEN:''},stdio:['ignore','pipe','pipe'],
+   cwd:cliRoot,env:{PATH:parentEnv.PATH||'/usr/bin:/bin',HOME:scratch,XDG_CONFIG_HOME:scratch,TMPDIR:tempRoot,HUB_CONFIG_FILE:config,PYTHONPATH:resolve(cliRoot,'host')},stdio:['ignore','pipe','pipe'],
   });
   let stdout='',stderr='';child.stdout.on('data',v=>stdout+=v);child.stderr.on('data',v=>stderr+=v);
   const timeout=setTimeout(()=>child.kill(),15000);
@@ -139,8 +139,10 @@ test('official public route links a second intake through real Machine and Proje
    assert.equal(code,0,stderr);return JSON.parse(stdout);
   }finally{clearTimeout(timeout);}
   };
-  assert.equal((await cli('sessions','link',sessionId,'--intake-task-id',target,'--key','official-cli-link')).link.session_id,sessionId);
-  assert.equal((await cli('intake','show',target)).intake.linked_sessions[0].session_id,sessionId);
+  // A synthetic polluted parent must not redirect the child away from its fixture or supply auth.
+  const pollutedParentEnv={...process.env,HUB_URL:'https://ambient.invalid',HUB_BASE_URL:'https://ambient-base.invalid',HUB_TOKEN:'ambient-user-token',HUB_JOB_TOKEN:'ambient-job-token'};
+  assert.equal((await cli(pollutedParentEnv,'sessions','link',sessionId,'--intake-task-id',target,'--key','official-cli-link')).link.session_id,sessionId);
+  assert.equal((await cli(pollutedParentEnv,'intake','show',target)).intake.linked_sessions[0].session_id,sessionId);
  }finally{
   await new Promise<void>(done=>server.close(()=>done()));await rm(scratch,{recursive:true,force:true});
  }
