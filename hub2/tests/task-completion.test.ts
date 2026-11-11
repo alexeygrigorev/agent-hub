@@ -461,7 +461,8 @@ function machineFixture(f:F,loseFirstReply=false){
     async running(id:string){
       assert((await call('/api/heartbeat',{labels:[],engines:['codex'],capabilities:['headless'],native_sessions:[]})).ok);
       const reservation=f.reservations.find(r=>r.intake_id===id);assert(reservation);
-      const response=await call('/_internal/reserve',reservation);assert(response.ok,await response.text());
+      const response=await call('/_internal/reserve',reservation),reserved=await json(response);assert(response.ok,JSON.stringify(reserved));
+      f.db().run('UPDATE dispatch_sagas SET epoch=? WHERE intake_id=? AND session_id=?',reserved.epoch,id,reservation.session_id);
       const binding=await run(f,id),now=Date.now();
       (machine as any).db.run("UPDATE sessions SET state='running',native_id=? WHERE id=?",binding.native_id,binding.session_id);
       (machine as any).db.run('INSERT INTO launch_admissions VALUES(?,?,?,?)',binding.attempt_operation_id,binding.session_id,binding.epoch,now-100);
@@ -525,4 +526,53 @@ test('unexpected continuation errors exhaust bounded retries and durably deliver
     f.reopen();await f.project.alarm();assert.equal(f.mail.length,1);assert.match(f.mail[0].body,/NOT finished/);assert.match(f.mail[0].body,/internal_error/);
     assert.equal(completion(f,id).delivery.state,'delivered');f.reopen();await f.project.alarm();assert.equal(f.mail.length,1);assert.equal(sagas(f,id).length,1);
   }finally{f.close();}
+});
+
+
+for(const stopOutcome of ['unconfirmed','timeout']){
+  test('accepted STOP intent survives '+stopOutcome+' before the first qualified finish',async()=>{
+    const f=fixture(),m=machineFixture(f);
+    try{
+      const id=await createIntake(f,'stop-before-finish-'+stopOutcome);await start(f,id,'first');const {binding,body}=await m.running(id),base='/api/sessions/'+binding.session_id;
+      const stopped=await m.call(base+'/commands',{kind:'stop',key:'accepted-stop'},admin);assert.equal(stopped.status,201);const command=(await json(stopped)).command;
+      if(stopOutcome==='unconfirmed'){
+        assert.equal((await m.call(base+'/commands/'+command.id+'/ack',{epoch:binding.epoch,result:{stopped:false,error:'stop_unconfirmed',reason:'stop_unconfirmed'}})).status,200);
+      }else{
+        m.db().run('UPDATE session_commands SET created_at=? WHERE id=?',Date.now()-60001,command.id);await m.machine.alarm();
+      }
+      const before=m.db().one('SELECT state,result_json FROM session_commands WHERE id=?',command.id);
+      assert.equal(before.state,'failed');assert.equal(JSON.parse(before.result_json).stopped,false);assert.equal(JSON.parse(before.result_json).error,'stop_unconfirmed');
+      assert.equal(m.db().one('SELECT state FROM sessions WHERE id=?',binding.session_id).state,'running');
+      const response=await m.call(base+'/finish',body);assert(response.ok,await response.text());
+      assert.equal(m.forwards.at(-1).stop_requested,true);assert.equal(completion(f,id).continuation,undefined);
+      assert.equal(m.db().one('SELECT result_json FROM session_commands WHERE id=?',command.id).result_json,before.result_json,'finish must not turn a failed STOP into confirmation');
+      await f.project.alarm();assert.equal(sagas(f,id).length,1);assert.equal(f.mail.length,1);assert.match(f.mail[0].body,/NOT finished/);
+    }finally{m.close();f.close();}
+  });
+}
+
+test('a STOP accepted for another session does not inhibit the current attempt',async()=>{
+  const f=fixture(),m=machineFixture(f);
+  try{
+    const target=await createIntake(f,'stop-other-target');await start(f,target,'first');const current=await m.running(target);
+    const other=await createIntake(f,'stop-other-session');await start(f,other,'first');const prior=await m.running(other);
+    const response=await m.call('/api/sessions/'+prior.binding.session_id+'/commands',{kind:'stop',key:'other-attempt-stop'},admin);assert.equal(response.status,201);
+    const finished=await m.call('/api/sessions/'+current.binding.session_id+'/finish',current.body);assert(finished.ok,await finished.text());
+    assert.equal(m.forwards.at(-1).stop_requested,false);await f.project.alarm();assert.equal(sagas(f,target).length,2);assert.equal(sagas(f,other).length,1);
+  }finally{m.close();f.close();}
+});
+
+test('a historical STOP epoch does not inhibit the current attempt',async()=>{
+  const f=fixture(),m=machineFixture(f);
+  try{
+    const id=await createIntake(f,'stop-old-epoch');await start(f,id,'first');
+    assert((await m.call('/api/heartbeat',{labels:[],engines:['codex'],capabilities:['headless'],native_sessions:[]})).ok);
+    m.db().run('UPDATE machines SET next_epoch=1');
+    const {binding,body}=await m.running(id),base='/api/sessions/'+binding.session_id;assert.equal(binding.epoch,2);
+    const response=await m.call(base+'/commands',{kind:'stop',key:'historical-stop'},admin);assert.equal(response.status,201);const command=(await json(response)).command;
+    // Represent retained command history from the previous Machine epoch.
+    m.db().run('UPDATE session_commands SET epoch=? WHERE id=?',binding.epoch-1,command.id);
+    const finished=await m.call(base+'/finish',body);assert(finished.ok,await finished.text());assert.equal(m.forwards.at(-1).stop_requested,false);
+    await f.project.alarm();assert.equal(sagas(f,id).length,2);
+  }finally{m.close();f.close();}
 });
