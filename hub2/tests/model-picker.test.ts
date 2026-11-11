@@ -407,7 +407,7 @@ test('goal capability preference spans candidates and the actual weighted draw',
  assert.equal(result.diagnostics.pool[0].share,1);
  assert.deepEqual(result.options.map(row=>[row.value.engine,row.value.machine_id]),[['codex','h1']]);
  for(const draw of [0,0.5,0.999999])assert.equal(weightedChoice(result.options,()=>draw).engine,'codex');
- assert.ok(result.diagnostics.excluded.some(row=>row.policy_id==='claude-opus-medium'&&row.reason==='capability_not_advertised'));
+ assert.ok(result.diagnostics.excluded.some(row=>row.policy_id==='claude-opus-medium'&&row.reason==='goal_not_advertised'));
  assert.deepEqual(result.options[0].value.required_capabilities,['interactive','goal']);
 });
 
@@ -417,7 +417,7 @@ test('unknown workspace labels do not mask observed goal capability or explicit 
   const result=buildRoutingPool(snapshot,{interactive:true,with_goal:true,workspace:'agent-hub',required_capabilities});
   assert.deepEqual(result.options.map(row=>row.value.engine),['codex']);
   for(const draw of [0,0.5,0.999999])assert.equal(weightedChoice(result.options,()=>draw).engine,'codex');
-  assert.ok(result.diagnostics.excluded.some(row=>row.policy_id==='claude-opus-medium'&&row.reason==='capability_not_advertised'));
+  assert.ok(result.diagnostics.excluded.some(row=>row.policy_id==='claude-opus-medium'&&row.reason==='goal_not_advertised'));
  }
 });
 
@@ -440,14 +440,55 @@ test('ordinary starts retain model diversity when both engines advertise launch 
  assert.equal(weightedChoice(result.options,()=>0.999999).engine,'claude');
 });
 
-test('missing or universally incompatible capability observations remain advisory',()=>{
+test('missing or universally incompatible capability observations remain advisory without --with-goal',()=>{
  for(const capabilities of [undefined,[],['interactive:codex','interactive:claude','effort:codex','effort:claude']]){
-  const result=buildRoutingPool(capabilitySnapshot(capabilities),{interactive:true,with_goal:true});
+  const result=buildRoutingPool(capabilitySnapshot(capabilities),{interactive:true,required_capabilities:['goal']});
   assert.equal(result.options.length,2);
   assert.deepEqual(result.diagnostics.excluded,[]);
   assert.deepEqual(result.diagnostics.advisories?.filter(row=>row.reason==='capability_not_advertised').map(row=>row.policy_id),
    ['codex-sol-medium','claude-opus-medium']);
  }
+});
+
+test('--with-goal never places an engine whose host lacks goal:<engine> (intake baab076a)',()=>{
+ for(const capabilities of [undefined,[],['interactive:codex','interactive:claude','effort:codex','effort:claude'],
+  ['goal','interactive:claude','effort:claude']]){
+  assert.throws(()=>buildRoutingPool(capabilitySnapshot(capabilities),{interactive:true,with_goal:true}),
+   (caught:any)=>caught.code==='goal_capability_unavailable'&&caught.status===503);
+ }
+});
+
+test('--with-goal on the live hetzner-aplexer advertisement only draws goal-capable engines',()=>{
+ const now=Date.now();
+ const live=['credentials:local:headless:antigravity:gemini','credentials:local:headless:claude:claude','credentials:local:headless:codex:codex',
+  'credentials:local:headless:go:shared-go','credentials:local:interactive:antigravity:gemini','credentials:local:interactive:claude:claude',
+  'credentials:local:interactive:codex:codex','credentials:local:interactive:go:shared-go','effort:antigravity','effort:claude','effort:codex',
+  'effort:zai','goal:codex','goal:zai','headless','interactive:antigravity','interactive:claude','interactive:codex','interactive:go','interactive:zai'];
+ const policy={version:5,candidates:[
+  {id:'codex-sol-medium',engine:'codex',model:'gpt-6.1-sol',effort:'medium',account_id:'codex',weight:1,capabilities:[],enabled:true},
+  {id:'claude-opus-medium',engine:'claude',model:'opus',effort:'medium',account_id:'claude',weight:1,capabilities:[],enabled:true},
+  {id:'claude-sonnet-medium',engine:'claude',model:'sonnet',effort:'medium',account_id:'claude',weight:1,capabilities:[],enabled:true},
+  {id:'go-muse',engine:'go',model:'opencode-go/muse-spark-1.3-contributor',account_id:'shared-go',weight:1,capabilities:[],enabled:true},
+  {id:'zai-glm-flash',engine:'zai',model:'glm-5.3-flash',account_id:'zai',weight:1,capabilities:[],enabled:true},
+  {id:'antigravity-argon-medium',engine:'antigravity',model:'gemini-4-argon-medium',effort:'medium',account_id:'gemini',weight:1,capabilities:[],enabled:true},
+ ]};
+ const accounts=new Map(['codex','claude','shared-go','zai','gemini'].map(id=>[id,{account:{enabled:true},credential_usable:true,hosts:['hetzner-aplexer'],...observed(80,now)}]));
+ // Claude has the most headroom; a quota-only preference must still not revive it for a goal start.
+ accounts.get('codex')!.quota!.remaining=1;
+ const machines=new Map([['hetzner-aplexer',{connected:true,os:'linux',engines:['antigravity','claude','codex','go','shell','zai'],capabilities:live}]]);
+ for(const input of [{interactive:true,with_goal:true,tier:'deep',workspace:'agent-hub'},
+  {interactive:true,with_goal:true,tier:'deep',workspace:'agent-hub',machine_id:'hetzner-aplexer'}]){
+  const result=buildRoutingPool({policy,accounts,machines,observed_at:now},input);
+  const engines=new Set(result.options.map(row=>row.value.engine));
+  assert.ok([...engines].every(engine=>live.includes(`goal:${engine}`)),[...engines].join(','));
+  assert.ok(engines.has('codex'),JSON.stringify(result.diagnostics));
+  for(const draw of [0,0.25,0.5,0.75,0.999999])assert.ok(['codex','zai'].includes(weightedChoice(result.options,()=>draw).engine));
+  for(const id of ['claude-opus-medium','claude-sonnet-medium','go-muse','antigravity-argon-medium'])
+   assert.ok(result.diagnostics.excluded.some(row=>row.policy_id===id&&row.reason==='goal_not_advertised'),id);
+  assert.ok(result.options.every(row=>row.value.machine_id==='hetzner-aplexer'));
+ }
+ // Without --with-goal the same host keeps every interactive engine.
+ assert.ok(buildRoutingPool({policy,accounts,machines,observed_at:now},{interactive:true,tier:'deep'}).options.some(row=>row.value.engine==='claude'));
 });
 
 test('explicit unsupported engine/model stays explicit with advisory capability observations',()=>{
@@ -483,10 +524,18 @@ test('effective policy effort needs same-host support alongside goal, even witho
 });
 
 test('capability preference cannot revive a candidate excluded by fresh quota observations',()=>{
- const snapshot=capabilitySnapshot(['interactive:codex','goal:codex','effort:codex']);
+ const snapshot=capabilitySnapshot(['interactive:codex','headless','effort:codex','effort:claude']);
  snapshot.accounts.get('codex')!.quota!.remaining=1;
- const result=buildRoutingPool(snapshot,{interactive:true,with_goal:true});
+ const result=buildRoutingPool(snapshot,{interactive:true});
  assert.deepEqual(result.options.map(row=>row.value.engine),['claude']);
  assert.ok(result.diagnostics.excluded.some(row=>row.policy_id==='codex-sol-medium'&&row.reason==='quota_below_minimum'));
  assert.ok(result.diagnostics.advisories?.some(row=>row.policy_id==='claude-opus-medium'&&row.reason==='capability_not_advertised'));
+});
+
+test('--with-goal keeps a low-quota goal-capable engine instead of an incapable one',()=>{
+ const snapshot=capabilitySnapshot(['interactive:codex','goal:codex','effort:codex']);
+ snapshot.accounts.get('codex')!.quota!.remaining=1;
+ const result=buildRoutingPool(snapshot,{interactive:true,with_goal:true});
+ assert.deepEqual(result.options.map(row=>row.value.engine),['codex']);
+ assert.ok(result.diagnostics.excluded.some(row=>row.policy_id==='claude-opus-medium'&&row.reason==='goal_not_advertised'));
 });

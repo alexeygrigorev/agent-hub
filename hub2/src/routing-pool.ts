@@ -172,6 +172,25 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
     return kept.length ? kept : rows;
   };
   let pool = scored;
+  // --with-goal is a launch requirement, not a preference (intake baab076a): a picked
+  // engine must run where the host advertises goal:<engine>, or the host refuses it with
+  // launcher_capability_unavailable. Filter before the advisory narrows so quota/credential
+  // preferences choose only among goal-capable routes. Explicit engine/model stay explicit.
+  if (input.with_goal === true && !input.engine && !input.model) {
+    const goalHosts = (row: typeof scored[number]) => row.hosts.filter(id => {
+      const machine = machines.get(id);
+      return machine?.engines?.includes(row.candidate.engine) === true
+        && machine.capabilities?.includes(`goal:${row.candidate.engine}`) === true;
+    });
+    const capable = pool.map(row => ({ ...row, hosts: goalHosts(row) })).filter(row => row.hosts.length > 0);
+    if (!capable.length) throw new HttpError('goal_capability_unavailable', 503, JSON.stringify({
+      candidates: pool.map(row => ({ policy_id: row.candidate.id, engine: row.candidate.engine, hosts: row.hosts })),
+    }));
+    const kept = new Set(capable.map(row => row.candidate.id));
+    for (const row of pool) if (!kept.has(row.candidate.id))
+      dropped.push({ policy_id: row.candidate.id, account_id: row.candidate.account_id, reason: 'goal_not_advertised' });
+    pool = capable;
+  }
   pool = narrow(pool, row => row.credentialObserved, row => row.knownLocalMissing?'local_credentials_missing'
     :'credential_' + (accounts.get(row.candidate.account_id)?.credential_status || 'unavailable'));
   pool = narrow(pool, row => row.left === null || row.left >= MIN_HEADROOM, () => 'quota_below_minimum');
