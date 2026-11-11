@@ -163,6 +163,8 @@ def hub(argv):
             event = {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': marker}}
         elif CFG.get('capture_result_only'):
             event = {'type': 'result', 'result': marker}
+        elif CFG.get('capture_format_override', row_for(s, show=True)['engine']) == 'go':
+            event = {'type': 'tool_use', 'part': {'type': 'tool', 'tool': 'bash', 'state': {'status': 'completed', 'output': marker + '\n'}}}
         else:
             event = {'type': 'item.completed', 'item': {'type': 'command_execution', 'aggregated_output': marker + '\n'}}
         out({'command_wait': {'state': 'pending' if CFG.get('capture_unacked') else 'acked', 'ack': {'capture': json.dumps(event)}}})
