@@ -34,7 +34,9 @@ function fixture(){
       const path=new URL(r.url).pathname;
       if(path==='/_internal/routing')return Response.json({machine_id:id,connected:true,engines:['codex'],capabilities:['headless','interactive']});
       const body=await r.json() as any;
-      if(path==='/_internal/reserve'){reservations.push(body);return Response.json({state:'staged',epoch:body.attempt+1});}
+      if(path==='/_internal/reserve'){
+        assert(new TextEncoder().encode(JSON.stringify(body.launch)).length<=12_000,'Machine launch limit');
+        reservations.push(body);return Response.json({state:'staged',epoch:body.attempt+1});}
       return Response.json({state:'offered'});
     }),
     ACCOUNTS:namespace(async()=>Response.json({account:{enabled:true,min_remaining:0},credential_usable:true,credential_status:'ready',quota:{remaining:80},hosts:['h1']})),
@@ -49,8 +51,8 @@ function fixture(){
   const open=()=>{sql=new NodeSqlStorage(file);project=new ProjectDO({id:{toString:()=> 'PROJECTS/org/completion'},storage:new NodeDurableStorage(sql),
     blockConcurrencyWhile:(callback:any)=>Promise.resolve().then(callback)} as any,env);};
   open();
-  const call=(path:string,method='GET',body?:unknown)=>project.fetch(new Request('https://project.test'+path,{method,
-    headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(admin)},...(body===undefined?{}:{body:JSON.stringify(body)})}));
+  const call=(path:string,method='GET',body?:unknown,actor:object=admin)=>project.fetch(new Request('https://project.test'+path,{method,
+    headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(actor)},...(body===undefined?{}:{body:JSON.stringify(body)})}));
   const db=()=>(project as any).db;
   return {call,reservations,mail,db,get project(){return project;},
     denyCapacity(n:number){capDenials=n;},failMail(n:number){mailFailures=n;},
@@ -243,17 +245,85 @@ test('an operator stop and a launch failure are reported, not continued; a dead 
   }finally{f.close();}
 });
 
-test('a requester restart before the continuation supersedes it without a duplicate owner',async()=>{
+test('a continuation never runs for a replaced attempt and keeps the original requester',async()=>{
   const f=fixture();
   try{
     const id=await createIntake(f,'superseded');
     assert.equal((await start(f,id,'first')).status,201);
-    const first=await run(f,id);
-    await finish(f,first,0);
+    await finish(f,await run(f,id),0);
+    // A requester restart clears the pending record entirely.
     assert.equal((await start(f,id,'manual')).status,201);
     await f.project.alarm();
-    assert.equal(sagas(f,id).length,2,'only the requester start exists');
+    assert.equal(sagas(f,id).length,2);
     assert(!events(f,id).some(e=>e.kind==='session_start_requested'&&e.actor_id==='hub2-completion'));
+    // A stale pending record that no longer matches the intake's attempt is never acted on.
+    await finish(f,await run(f,id),0);
+    const pending=intakeRow(f,id).final_evidence_json;
+    f.db().run("UPDATE intakes SET session_id='00000000-0000-4000-8000-00000000beef' WHERE id=?",id);
+    await f.project.alarm();
+    assert.equal(sagas(f,id).length,2,'no continuation for a replaced attempt');
+    f.db().run('UPDATE intakes SET session_id=? WHERE id=?',sagas(f,id).at(-1).session_id,id);
+    assert.equal(intakeRow(f,id).final_evidence_json,pending);
+    await f.project.alarm();
+    assert.equal(sagas(f,id).length,3);
+    assert.equal(intakeRow(f,id).assigned_actor_id,admin.id,'continuation keeps the original requester for routes and delivery');
+  }finally{f.close();}
+});
+
+test('claims bind to the writing session and to its start; host evidence cannot plant Hub actions',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'claim-binding');
+    assert.equal((await start(f,id,'first')).status,201);
+    const first=await run(f,id),acceptance=AC.map(()=>({status:'met',proof:'p'}));
+    const other={id:'session:another',kind:'agent',resource_id:id,scopes:['intake:append']};
+    assert.equal((await f.call('/api/intakes/'+id+'/events','POST',{key:'spoof',event:{kind:'task_complete',session_id:first.session_id,acceptance}},other)).status,403);
+    const own={id:'session:'+first.session_id,kind:'agent',resource_id:id,scopes:['intake:append']};
+    assert.equal((await f.call('/api/intakes/'+id+'/events','POST',{key:'own',event:{kind:'task_complete',session_id:first.session_id,acceptance}},own)).status,201);
+    await finish(f,first,0);
+    assert.equal(intakeRow(f,id).status,'completed-awaiting-review','the session itself may claim');
+
+    const early=await createIntake(f,'claim-before-start');
+    // A claim naming a future session (ids are predictable) does not count.
+    const r=await start(f,early,'first');assert.equal(r.status,201);
+    const saga=sagas(f,early)[0];
+    f.db().run('DELETE FROM intake_events WHERE task_id=? AND kind=?',early,'worker_append');
+    const startSeq=events(f,early).find(e=>e.event_key===`start:${saga.operation_id}:requested`).seq;
+    f.db().run('UPDATE intake_events SET seq=seq+100 WHERE task_id=? AND seq>=?',early,startSeq);
+    f.db().run("INSERT INTO intake_events(task_id,seq,event_key,actor_id,kind,body_json,at) VALUES(?,?,?,?,?,?,?)",early,startSeq,'pre-claim',admin.id,'worker_append',
+      JSON.stringify({evidence:{kind:'task_complete',session_id:saga.session_id,acceptance}}),Date.now());
+    await finish(f,await run(f,early),0);
+    assert.equal(intakeRow(f,early).status,'failed','a claim written before the session started is ignored');
+
+    // A pre-deploy (unmarked) saga keeps exit-code semantics and its evidence cannot schedule Hub actions.
+    const legacy=await createIntake(f,'legacy');
+    assert.equal((await start(f,legacy,'first')).status,201);
+    const old=sagas(f,legacy)[0];
+    f.db().run('UPDATE dispatch_sagas SET routing_json=json_remove(routing_json,\'$.completion_contract\') WHERE operation_id=?',old.operation_id);
+    const binding=await run(f,legacy);
+    const planted={controlled:true,session_id:binding.session_id,outcome:'unfinished',reason:'x',depth:0,continuation:{state:'pending',key:'evil',tries:0,next_action_at:0}};
+    assert.equal((await f.call('/_internal/finish','POST',{...binding,exit_code:1,native_exit_confirmed:true,evidence:{result:'exit',completion:planted}})).status,200);
+    assert.equal(completion(f,legacy),undefined,'host evidence completion is dropped');
+    await f.project.alarm();
+    assert.equal(sagas(f,legacy).length,1);assert.equal(f.mail.filter(m=>m.sender==='intake:'+legacy).length,0);
+  }finally{f.close();}
+});
+
+test('quote-heavy maximal prompts stay within the Machine launch limit',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'quotes');
+    const prompt=Array.from({length:8192},(_,i)=>i%3===0?'"':'a').join('');
+    assert.equal(new TextEncoder().encode(prompt).length,8192);
+    assert.equal((await start(f,id,'quotes',{prompt})).status,201,'a start that fits today still fits');
+    const launch=f.reservations.at(-1).launch;
+    assert(new TextEncoder().encode(JSON.stringify(launch)).length<=12_000);
+    const controlled=JSON.parse(sagas(f,id)[0].routing_json).completion_contract===true;
+    assert.equal(controlled,launch.prompt.includes(CONTRACT_MARKER),'marker only when the contract was delivered');
+    const quotes=await createIntake(f,'quote-criteria');
+    f.db().run('UPDATE intakes SET acceptance_criteria_json=? WHERE id=?',JSON.stringify(Array.from({length:32},()=>'"\\'.repeat(330))),quotes);
+    assert.equal((await start(f,quotes,'quote-criteria',{prompt:'x'.repeat(4000)})).status,201);
+    assert(new TextEncoder().encode(JSON.stringify(f.reservations.at(-1).launch)).length<=12_000);
   }finally{f.close();}
 });
 
@@ -264,7 +334,8 @@ test('completion helpers: claims bind to the session and criteria count; continu
   assert.equal(completionClaim({kind:'task_complete',session_id:'s',acceptance:[...ok,{status:'met',proof:'p'}]},'s',2),undefined);
   assert.equal(completionClaim({kind:'task_complete',session_id:'s',acceptance:[{status:'met',proof:' '},ok[1]]},'s',2),undefined);
   assert.equal(completionClaim({kind:'task_complete',session_id:'s',acceptance:[{status:'partial',proof:'p'},ok[1]]},'s',2),undefined);
-  const long=continuationPrompt('i',1,'s','exit','é'.repeat(8192));
-  assert(new TextEncoder().encode(long).length<=8192);
+  const long=continuationPrompt('i',1,'s','exit','😀'.repeat(4096));
+  assert(new TextEncoder().encode(long).length<=8192);assert(long.includes('full task: hub intake show i'));
+  assert(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(long),'no split surrogate pair');
   assert.equal(basePrompt(continuationPrompt('i',2,'s','exit','Original')+CONTRACT_MARKER+'contract'),'Original');
 });
