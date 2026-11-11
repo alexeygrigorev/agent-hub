@@ -1565,10 +1565,62 @@ class RetainedManagedCaptureTests(unittest.TestCase):
         for key,value in [('native_id','foreign'),('operation_id','foreign'),('request_digest','0'*64)]:
             wrong={**command,'id':'44444444-4444-4444-8444-'+str(len(self.native.calls)).zfill(12),'capture_binding':{**command['capture_binding'],key:value}}
             self.journal.db.execute('DELETE FROM commands')
-            with self.assertRaisesRegex(ValueError,'capture_fence_conflict'):self.bridge.command(wrong)
+            self.assertEqual(self.bridge.command(wrong)['error'],'capture_failed')
         self.journal.db.execute('DELETE FROM commands')
         with self.assertRaisesRegex(ValueError,'command_fence_conflict'):self.bridge.command({**command,'epoch':command['epoch']+1})
-        with self.assertRaisesRegex(ValueError,'capture_fence_conflict'):self.bridge.command({**command,'mode':'screen'})
+        self.assertEqual(self.bridge.command({**command,'mode':'screen'})['error'],'capture_failed')
+        self.assertEqual(self.native.calls,[])
+
+    def test_interrupted_screen_capture_fails_once_without_native_retry_or_input_relaxation(self):
+        from agent_hub_host.native_launch import canonical
+        command=self.seed(terminal=False);command.pop('capture_binding');command['mode']='screen'
+        digest=hashlib.sha256(canonical(command).encode()).hexdigest()
+        with self.journal.db:self.bridge.begin_command(command['id'],digest)
+        result=self.bridge.command(command)
+        self.assertEqual(result,{'error':'capture_outcome_uncertain','reason':'capture_outcome_uncertain'})
+        self.assertEqual(self.bridge.command(command),result)
+        self.assertEqual(self.native.calls,[])
+        self.assertEqual(self.journal.db.execute('SELECT state FROM commands').fetchone()[0],'done')
+        self.assertEqual(json.loads(self.journal.db.execute('SELECT payload FROM outbox WHERE key=?',('command:'+command['id'],)).fetchone()[0])['result'],result)
+        with self.assertRaisesRegex(ValueError,'command_id_conflict'):
+            self.bridge.command({**command,'mode':None})
+        for kind in ['send','stop']:
+            other={**command,'id':'uncertain-'+kind,'kind':kind}
+            with self.journal.db:self.bridge.begin_command(other['id'],hashlib.sha256(canonical(other).encode()).hexdigest())
+            with self.assertRaisesRegex(RuntimeError,'command_outcome_uncertain'):self.bridge.command(other)
+        self.assertEqual(self.native.calls,[])
+
+    def test_initial_screen_capture_exception_is_durable_failure_and_replay_never_calls_native(self):
+        command=self.seed(terminal=False);command.pop('capture_binding');command['mode']='screen'
+        original=self.bridge.native;captures=[]
+        def failing_capture(*args,**kwargs):
+            if args[0]=='capture':
+                captures.append(args);raise RuntimeError('private native error must not leak')
+            return original(*args,**kwargs)
+        self.bridge.native=failing_capture
+        result=self.bridge.command(command)
+        self.assertEqual(result,{'error':'capture_failed','reason':'capture_failed'})
+        calls=list(self.native.calls)
+        self.assertEqual(self.bridge.command(command),result)
+        self.assertEqual(self.native.calls,calls);self.assertEqual(len(captures),1)
+
+    def test_capture_lookup_failure_is_durable_and_never_retried(self):
+        command=self.seed(terminal=False);command.pop('capture_binding');command['mode']='screen'
+        with patch.object(self.bridge,'resolve_launch_native',side_effect=RuntimeError('private lookup error')) as lookup:
+            self.assertEqual(self.bridge.command(command)['error'],'capture_failed')
+            self.assertEqual(self.bridge.command(command)['error'],'capture_failed')
+            self.assertEqual(lookup.call_count,1)
+        self.assertEqual(self.native.calls,[])
+
+    def test_interrupted_bound_terminal_capture_has_no_read_and_preserves_exact_binding(self):
+        from agent_hub_host.native_launch import canonical
+        command=self.seed();self.stdout.unlink()
+        with self.journal.db:self.bridge.begin_command(command['id'],hashlib.sha256(canonical(command).encode()).hexdigest())
+        with patch('agent_hub_host.task_output.capture_task_output',side_effect=AssertionError('must not reread')):
+            result=self.bridge.command(command)
+        self.assertEqual(result['error'],'capture_outcome_uncertain')
+        self.assertEqual(result['capture_binding'],command['capture_binding'])
+        self.assertEqual(result['capture_source'],'unavailable');self.assertNotIn('output',result)
         self.assertEqual(self.native.calls,[])
 
     def test_running_legacy_output_keeps_qualified_pane_capture_without_reexecution(self):

@@ -1014,6 +1014,35 @@ test('qualified completed headless capture is retained-only and never requires a
 
 
 const captureOperator={'x-hub2-actor':JSON.stringify({id:'operator',kind:'operator',scopes:['operator:admin']})};
+test('failed legacy screen capture releases the machine queue without changing send or stop fences',async()=>{
+ const f=fixture(),first='poison-screen',next='starved-capture';
+ await completedHeadless(f,first,undefined,false);await completedHeadless(f,next,'22222222-2222-4222-8222-222222222222',false);
+ const {socket,frames}=captureSocket(f);
+ const enqueue=async(session:string,key:string)=>(await (await f.call('/api/sessions/'+session+'/commands','POST',{kind:'capture',key,mode:'screen'},captureOperator)).json() as any).command;
+ const poison=await enqueue(first,'poison');
+ const waiting=await enqueue(next,'waiting');
+ f.database.prepare('UPDATE session_commands SET created_at=? WHERE id=?').run(1,poison.id);
+ frames.length=0;await (f.machine as any).sendPendingCommands(socket,'h1');assert.equal(frames.at(-1).command.id,poison.id);
+ const path='/api/sessions/'+first+'/commands/'+poison.id+'/ack';
+ const receipt={epoch:poison.epoch,result:{error:'capture_outcome_uncertain',reason:'capture_outcome_uncertain'}};
+ assert.equal((await f.call(path,'POST',receipt)).status,200);
+ assert.equal((f.database.prepare('SELECT state FROM session_commands WHERE id=?').get(poison.id) as any).state,'failed');
+ assert.equal(frames.at(-1).command.id,waiting.id);
+ assert.equal((await f.call(path,'POST',receipt)).status,200,'failed receipt replay is idempotent');
+ assert.equal((await f.call(path,'POST',{...receipt,result:{error:'different'}})).status,409);
+});
+
+test('interrupted terminal capture accepts only exact failure binding and never reports output',async()=>{
+ const f=fixture(),session='terminal-capture-interrupted';await completedHeadless(f,session);
+ const made=await f.call('/api/sessions/'+session+'/commands','POST',{kind:'capture',key:'interrupted'},captureOperator);
+ const command=(await made.json() as any).command;
+ const path='/api/sessions/'+session+'/commands/'+command.id+'/ack';
+ const result={error:'capture_outcome_uncertain',reason:'capture_outcome_uncertain',capture_binding:command.capture_binding,capture_source:'unavailable'};
+ assert.equal((await f.call(path,'POST',{epoch:command.epoch,result:{...result,output:'invented'}})).status,400);
+ assert.equal((await f.call(path,'POST',{epoch:command.epoch,result:{...result,capture_binding:{...command.capture_binding,native_id:'foreign'}}})).status,409);
+ assert.equal((await f.call(path,'POST',{epoch:command.epoch,result})).status,200);
+ assert.equal((f.database.prepare('SELECT state FROM session_commands WHERE id=?').get(command.id) as any).state,'failed');
+});
 function captureSocket(f:ReturnType<typeof fixture>){const frames:any[]=[];const socket={readyState:1,
  deserializeAttachment:()=>({machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'capture-test'}),
  send:(raw:string)=>frames.push(JSON.parse(raw))};f.sockets.push(socket);return{socket,frames};}
