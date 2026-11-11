@@ -503,6 +503,214 @@ with api['update_lock'](Path(sys.argv[2])):
         self.assertFalse((self.root / 'current').is_symlink())
         self.assertFalse((self.root / 'releases' / SHA).exists())
 
+    def provider_bin(self, directory, *commands):
+        directory = Path(self.temporary.name) / directory
+        directory.mkdir(parents=True)
+        for name in commands:
+            executable = directory / name
+            executable.write_text('#!/bin/sh\nexit 0\n')
+            executable.chmod(0o700)
+        return directory
+
+    def test_service_install_preserves_discovered_provider_and_runtime_directories(self):
+        versioned = self.provider_bin('nvm/versions/node/v99.12.3/bin', 'codex', 'claude', 'opencode', 'node', 'npm')
+        wrappers = self.provider_bin('provider wrappers', 'zcodex', 'agy', 'a', 'aplexer')
+        irrelevant = self.provider_bin('unrelated', 'unrelated-command')
+        path = os.pathsep.join(map(str, (wrappers, irrelevant, versioned, wrappers)))
+        env = Path(self.temporary.name) / '.config/agent-hub/host.env'
+        original_command = self.command
+
+        def check_before_restart(args):
+            if 'restart' in args:
+                self.assertTrue(env.is_file())
+            original_command(args)
+
+        self.command = check_before_restart
+        with patch.dict(os.environ, PATH=path, SYNTHETIC_PRIVATE_TOKEN='do-not-copy'):
+            self.install(install_service=True)
+        expected = [str(wrappers), str(versioned), str(Path(self.temporary.name) / '.local/bin'),
+                    '/usr/local/bin', '/usr/bin', '/bin']
+        text = env.read_text()
+        self.assertIn('PATH="' + os.pathsep.join(expected) + '"\n', text)
+        self.assertNotIn(str(irrelevant), text)
+        self.assertNotIn('SYNTHETIC_PRIVATE_TOKEN', text)
+        self.assertNotIn('do-not-copy', text)
+        self.assertEqual(env.stat().st_mode & 0o777, 0o600)
+        for name in updater.PROVIDER_PATH_COMMANDS:
+            self.assertIsNotNone(shutil.which(name, path=os.pathsep.join(expected)))
+
+    def test_service_install_discovers_isolated_default_native_a_executable(self):
+        native = self.provider_bin('native-only/bin', 'a')
+        with patch.dict(os.environ, PATH=str(native)):
+            self.install(install_service=True, restart=False)
+        text = (self.config.parent / 'host.env').read_text()
+        self.assertIn('PATH="' + str(native) + ':', text)
+        self.assertIsNotNone(shutil.which('a', path=str(native)))
+        self.assertIsNone(shutil.which('aplexer', path=str(native)))
+
+    def test_current_service_restarts_when_environment_is_first_published(self):
+        self.install()
+        self.calls.clear()
+        self.install(install_service=True)
+        restart = ['systemctl', '--user', 'restart', updater.UNITS[0]]
+        self.assertIn(restart, self.calls)
+        self.assertNotIn(['systemctl', '--user', 'start', updater.UNITS[0]], self.calls)
+        observation = next(i for i, args in enumerate(self.calls) if args[-1] == STATUS_PATH)
+        self.assertLess(self.calls.index(restart), observation)
+
+    def test_current_service_restarts_without_changing_existing_environment(self):
+        self.install()
+        env = self.config.parent / 'host.env'
+        env.write_bytes(b'PATH=/operator/bin:/usr/bin\n')
+        self.calls.clear()
+        self.install(install_service=True)
+        self.assertIn(['systemctl', '--user', 'restart', updater.UNITS[0]], self.calls)
+        self.assertNotIn(['systemctl', '--user', 'start', updater.UNITS[0]], self.calls)
+        self.assertEqual(env.read_bytes(), b'PATH=/operator/bin:/usr/bin\n')
+
+    def test_current_service_environment_can_be_staged_without_restart(self):
+        self.install()
+        self.calls.clear()
+        self.install(install_service=True, restart=False)
+        self.assertTrue((self.config.parent / 'host.env').is_file())
+        self.assertFalse(any(args[0] == 'systemctl' and ('start' in args or 'restart' in args or 'enable' in args)
+                             for args in self.calls))
+        self.assertFalse(any(args[-1] == STATUS_PATH for args in self.calls))
+
+    def test_staged_current_service_environment_is_loaded_on_later_explicit_install(self):
+        self.install()
+        self.install(install_service=True, restart=False)
+        env = self.config.parent / 'host.env'
+        staged = env.read_bytes()
+        self.calls.clear()
+        self.install(install_service=True)
+        restart = ['systemctl', '--user', 'restart', updater.UNITS[0]]
+        self.assertIn(restart, self.calls)
+        observation = next(i for i, args in enumerate(self.calls) if args[-1] == STATUS_PATH)
+        self.assertLess(self.calls.index(restart), observation)
+        self.assertEqual(env.read_bytes(), staged)
+
+    def test_current_service_retries_restart_after_environment_publication_then_repair_failure(self):
+        self.install()
+        self.calls.clear()
+        with patch.object(updater, 'repair_service_files', side_effect=RuntimeError('synthetic repair failure')):
+            with self.assertRaisesRegex(RuntimeError, 'synthetic repair failure'):
+                self.install(install_service=True)
+        env = self.config.parent / 'host.env'
+        published = env.read_bytes()
+        self.assertFalse(any(args[0] == 'systemctl' for args in self.calls))
+        self.calls.clear()
+        self.install(install_service=True)
+        restart = ['systemctl', '--user', 'restart', updater.UNITS[0]]
+        self.assertIn(restart, self.calls)
+        observation = next(i for i, args in enumerate(self.calls) if args[-1] == STATUS_PATH)
+        self.assertLess(self.calls.index(restart), observation)
+        self.assertEqual(env.read_bytes(), published)
+
+    def test_provider_symlink_keeps_bin_directory_and_quotes_environment_file(self):
+        versioned = self.provider_bin('node versions/quoted"bin\\dir', 'node')
+        target = self.provider_bin('package/libexec', 'codex') / 'codex'
+        (versioned / 'codex').symlink_to(target)
+        with patch.object(Path, 'home', return_value=Path(self.temporary.name)), \
+             patch.dict(os.environ, PATH=str(versioned)):
+            updater.preserve_provider_path()
+        text = (self.config.parent / 'host.env').read_text()
+        escaped = str(versioned).replace('\\', '\\\\').replace('"', '\\"')
+        self.assertIn(escaped + ':', text)
+        self.assertNotIn(str(target.parent), text)
+
+    def test_explicit_environment_override_is_untouched_during_service_upgrade_and_failure(self):
+        self.old_release()
+        env = self.config.parent / 'host.env'
+        original = b'PATH=/operator/explicit/bin:/usr/bin\nEXPLICIT_SETTING=keep\n'
+        env.write_bytes(original)
+        env.chmod(0o640)
+        self.status_rc = 1
+        with self.assertRaisesRegex(RuntimeError, 'connection not verified'):
+            self.install(install_service=True)
+        self.assertEqual(env.read_bytes(), original)
+        self.assertEqual(env.stat().st_mode & 0o777, 0o640)
+        (self.root / 'failed-releases.json').unlink()
+        self.status_rc = 0
+        self.install(install_service=True)
+        self.assertEqual(env.read_bytes(), original)
+
+    def test_existing_empty_or_symlink_environment_is_not_replaced(self):
+        env = self.config.parent / 'host.env'
+        target = self.config.parent / 'operator.env'
+        target.write_bytes(b'PATH=/operator/bin\n')
+        with patch.object(Path, 'home', return_value=Path(self.temporary.name)):
+            env.touch()
+            updater.preserve_provider_path()
+            self.assertEqual(env.read_bytes(), b'')
+            env.unlink()
+            for destination in (target, self.config.parent / 'missing-operator.env'):
+                env.symlink_to(destination)
+                updater.preserve_provider_path()
+                self.assertTrue(env.is_symlink())
+                self.assertEqual(env.readlink(), destination)
+                env.unlink()
+        self.assertEqual(target.read_bytes(), b'PATH=/operator/bin\n')
+
+    def test_provider_environment_publication_does_not_clobber_concurrent_override(self):
+        env = self.config.parent / 'host.env'
+        real_link = os.link
+
+        def operator_wins(source, destination):
+            env.write_bytes(b'PATH=/concurrent/operator/bin\n')
+            real_link(source, destination)
+
+        with patch.object(Path, 'home', return_value=Path(self.temporary.name)), \
+             patch.object(updater.os, 'link', side_effect=operator_wins):
+            updater.preserve_provider_path()
+        self.assertEqual(env.read_bytes(), b'PATH=/concurrent/operator/bin\n')
+        self.assertEqual(list(self.config.parent.glob('host.env.*')), [])
+
+    def test_generated_provider_environment_survives_normal_update_and_repair(self):
+        versioned = self.provider_bin('versioned/bin', 'codex', 'node')
+        with patch.dict(os.environ, PATH=str(versioned)):
+            self.install(install_service=True, restart=False)
+        env = self.config.parent / 'host.env'
+        original = env.read_bytes()
+        with patch.dict(os.environ, PATH='/usr/bin:/bin'):
+            self.install(install_service=True, restart=False)
+            # Exercise normal new-release activation with the generated config.
+            old = self.root / 'releases' / OLD_SHA
+            old.mkdir()
+            updater.link(old, self.root / 'current')
+            shutil.rmtree(self.root / 'releases' / SHA)
+            self.install()
+        self.assertEqual(env.read_bytes(), original)
+        self.assertIn(str(versioned), env.read_text())
+
+    def test_failed_install_leaves_complete_provider_config_for_recovery(self):
+        self.status_rc = 1
+        with self.assertRaisesRegex(RuntimeError, 'connection not verified'):
+            self.install(install_service=True)
+        env = self.config.parent / 'host.env'
+        original = env.read_bytes()
+        self.assertFalse((self.root / 'current').is_symlink())
+        self.assertFalse(any('enable' in args for args in self.calls))
+        self.assertEqual(env.stat().st_mode & 0o777, 0o600)
+        with self.assertRaisesRegex(RuntimeError, 'activation backoff'):
+            self.install(install_service=True)
+        self.assertEqual(env.read_bytes(), original)
+
+    def test_provider_environment_write_failure_does_not_activate_or_enable_service(self):
+        old = self.old_release()
+        with patch.object(updater.os, 'link', side_effect=OSError('synthetic publication failure')):
+            with self.assertRaisesRegex(OSError, 'synthetic publication failure'):
+                self.install(install_service=True)
+        self.assertEqual((self.root / 'current').resolve(), old)
+        self.assertFalse((self.root / 'releases' / SHA).exists())
+        self.assertFalse((self.config.parent / 'host.env').exists())
+        self.assertEqual(list(self.config.parent.glob('host.env.*')), [])
+        self.assertFalse(any(args[0] == 'systemctl' for args in self.calls))
+
+    def test_normal_update_does_not_import_ambient_provider_environment(self):
+        self.install()
+        self.assertFalse((self.config.parent / 'host.env').exists())
+
     def test_initial_staging_writes_units_without_enabling_or_starting_them(self):
         self.install(install_service=True, restart=False)
         units = Path(self.temporary.name) / '.config/systemd/user'
@@ -596,7 +804,7 @@ with api['update_lock'](Path(sys.argv[2])):
         self.assertEqual(installed_updater.read_bytes(), b'old updater')
         self.assertFalse(any('enable' in args for args in self.calls))
 
-    def test_timer_enable_failure_leaves_committed_release_for_no_restart_retry(self):
+    def test_timer_enable_failure_leaves_committed_release_for_explicit_install_retry(self):
         old = self.old_release()
         timer_enable = ['systemctl', '--user', 'enable', '--now', updater.UNITS[2]]
         record_command = self.command
@@ -618,9 +826,8 @@ with api['update_lock'](Path(sys.argv[2])):
         self.command = record_command
         self.calls.clear()
         self.install(install_service=True)
-        self.assertIn(['systemctl', '--user', 'start', updater.UNITS[0]], self.calls)
+        self.assertIn(['systemctl', '--user', 'restart', updater.UNITS[0]], self.calls)
         self.assertIn(timer_enable, self.calls)
-        self.assertFalse(any('restart' in args for args in self.calls))
         self.assertEqual((self.root / 'current').resolve(), target)
 
     def test_same_version_rebuild_repairs_only_shared_artifacts_without_restart(self):
