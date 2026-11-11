@@ -5,14 +5,17 @@
 
 export const COMPLETION_ACTOR = 'hub2-completion';
 export const CONTRACT_MARKER = '\n\n--- Hub task completion contract ---\n';
-export const CONTINUATION_MARKER = '--- Hub continuation ---\n';
-export const CONTINUATION_END = '\n--- Original task ---\n';
+// Engines take the prompt as a positional argument (`claude -p … <prompt>`), so
+// a Hub-generated prompt must never begin with '-' or the CLI parses it as an
+// option and exits 1 before the task starts (live probe 0acaad70, 2026-11-11).
+export const CONTINUATION_MARKER = 'Hub continuation:\n';
+export const CONTINUATION_END = '\n=== Original task ===\n';
+/** Markers of continuation prompts recorded before the marker change. */
+const LEGACY_CONTINUATION = ['--- Hub continuation ---\n', '\n--- Original task ---\n'] as const;
 /** Consecutive Hub-started continuations after one requester start. */
 export const MAX_AUTO_CONTINUATIONS = 2;
 export const MAX_CONTINUATION_TRIES = 3;
 export const MAX_DELIVERY_TRIES = 5;
-/** Pending completion actions are found only among recently updated intakes. */
-export const COMPLETION_ACTION_WINDOW_MS = 24 * 60 * 60_000;
 const PROMPT_LIMIT = 8192;
 /** The Machine rejects a launch whose JSON exceeds this many bytes. */
 export const LAUNCH_SPEC_LIMIT = 12_000;
@@ -88,9 +91,10 @@ export function basePrompt(prompt: string): string {
   let value = prompt;
   const contract = value.indexOf(CONTRACT_MARKER);
   if (contract >= 0) value = value.slice(0, contract);
-  if (value.startsWith(CONTINUATION_MARKER)) {
-    const end = value.indexOf(CONTINUATION_END);
-    if (end >= 0) value = value.slice(end + CONTINUATION_END.length);
+  for (const [marker, end] of [[CONTINUATION_MARKER, CONTINUATION_END], LEGACY_CONTINUATION]) {
+    if (!value.startsWith(marker)) continue;
+    const at = value.indexOf(end);
+    if (at >= 0) value = value.slice(at + end.length);
   }
   return value;
 }
