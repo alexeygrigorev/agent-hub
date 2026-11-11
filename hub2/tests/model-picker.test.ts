@@ -411,6 +411,26 @@ test('goal capability preference spans candidates and the actual weighted draw',
  assert.deepEqual(result.options[0].value.required_capabilities,['interactive','goal']);
 });
 
+test('unknown workspace labels do not mask observed goal capability or explicit needs',()=>{
+ for(const required_capabilities of [[],['goal:codex']]){
+  const snapshot=capabilitySnapshot(['interactive:codex','interactive:claude','effort:codex','effort:claude','goal:codex']);
+  const result=buildRoutingPool(snapshot,{interactive:true,with_goal:true,workspace:'agent-hub',required_capabilities});
+  assert.deepEqual(result.options.map(row=>row.value.engine),['codex']);
+  for(const draw of [0,0.5,0.999999])assert.equal(weightedChoice(result.options,()=>draw).engine,'codex');
+  assert.ok(result.diagnostics.excluded.some(row=>row.policy_id==='claude-opus-medium'&&row.reason==='capability_not_advertised'));
+ }
+});
+
+test('workspace hints only narrow hosts that survived goal capability selection',()=>{
+ const snapshot=capabilitySnapshot(['interactive:codex','interactive:claude','effort:codex','effort:claude','goal:codex']);
+ for(const account of snapshot.accounts.values())account.hosts.push('h2');
+ snapshot.machines.set('h2',{connected:true,engines:['claude'],capabilities:['interactive:claude','effort:claude','workspace:agent-hub']});
+ const input={interactive:true,with_goal:true,workspace:'agent-hub'};
+ assert.deepEqual(buildRoutingPool(snapshot,input).options.map(row=>[row.value.engine,row.value.machine_id]),[['codex','h1']]);
+ snapshot.machines.set('h2',{connected:true,engines:['codex','claude'],capabilities:['interactive:codex','effort:codex','goal:codex','workspace:agent-hub']});
+ assert.deepEqual(buildRoutingPool(snapshot,input).options.map(row=>[row.value.engine,row.value.machine_id]),[['codex','h2']]);
+});
+
 test('ordinary starts retain model diversity when both engines advertise launch capabilities',()=>{
  const snapshot=capabilitySnapshot(['interactive:codex','interactive:claude','effort:codex','effort:claude','goal:codex']);
  const result=buildRoutingPool(snapshot,{interactive:true,effort:'medium'});

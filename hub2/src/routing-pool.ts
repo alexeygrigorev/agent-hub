@@ -182,9 +182,7 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
   // bring back an account/host already removed by credential or quota preference.
   const compatibleHosts = (row: typeof scored[number]) => row.hosts.filter(id => {
     const machine = machines.get(id), engine = row.candidate.engine;
-    const label = input.workspace && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(input.workspace)
-      ? `workspace:${input.workspace.toLowerCase()}` : null;
-    const needed = [...required, ...(row.candidate.effort ? ['effort'] : []), ...(label ? [label] : [])];
+    const needed = [...required, ...(row.candidate.effort ? ['effort'] : [])];
     return machine?.engines?.includes(engine) && needed.every(capability =>
       capability.startsWith('os:') ? machine.os?.toLowerCase() === capability.slice(3).toLowerCase()
         : machine.capabilities?.includes(capability) || machine.capabilities?.includes(`${capability}:${engine}`));
@@ -193,6 +191,18 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
   pool = narrow(pool, row => compatible.get(row.candidate.id)!.length > 0, () => 'capability_not_advertised');
   if (pool.some(row => compatible.get(row.candidate.id)!.length > 0))
     pool = pool.map(row => ({...row, hosts: compatible.get(row.candidate.id)!}));
+  // Workspace advertisements are optional placement hints. A missing label
+  // must not make every launch capability look unknown and restore an engine
+  // already excluded because another engine can satisfy the requested goal.
+  const label = input.workspace && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(input.workspace)
+    ? `workspace:${input.workspace.toLowerCase()}` : null;
+  if (label) {
+    const workspaceHosts = new Map(pool.map(row => [row.candidate.id,
+      row.hosts.filter(id => machines.get(id)?.capabilities?.includes(label))]));
+    pool = narrow(pool, row => workspaceHosts.get(row.candidate.id)!.length > 0, () => 'capability_not_advertised');
+    if (pool.some(row => workspaceHosts.get(row.candidate.id)!.length > 0))
+      pool = pool.map(row => ({...row, hosts: workspaceHosts.get(row.candidate.id)!}));
+  }
   for (const row of pool) if (row.localHosts.length) advisories.push({policy_id:row.candidate.id, account_id:row.candidate.account_id, reason:'local_login_unverified'});
   const others = pool.filter(row => !/luna/i.test(row.candidate.model)).map(row => row.base);
   const cap = others.length ? others.reduce((sum, weight) => sum + weight, 0) / others.length : Infinity;
