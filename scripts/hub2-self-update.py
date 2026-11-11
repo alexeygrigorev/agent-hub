@@ -356,6 +356,9 @@ def finish_retained_switch(root, releases, journal):
     target = require_release_directory(release_path(releases, state['target']))
     if not (root / 'current').is_symlink() or (root / 'current').resolve() != target:
         raise ValueError('current release changed after retained activation')
+    # The committed journal must survive a power loss before we discard the
+    # only backup, including when cleanup resumes after the journal rename.
+    sync_directory(root)
     backup = releases / ('.retained-' + target.name)
     if backup.exists() or backup.is_symlink():
         shutil.rmtree(require_release_directory(backup))
@@ -434,7 +437,6 @@ def reactivate_retained_release(base, manifest, host_wheel, root, releases, old,
         # Keep the updater that understands this journal available after rollback.
         committed = root / 'retained-switch-committed.json'
         journal.rename(committed)
-        sync_directory(root)
         finish_retained_switch(root, releases, committed)
 
 

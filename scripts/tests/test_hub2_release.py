@@ -240,6 +240,35 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
         self.assertFalse(journal.exists())
         self.assertEqual(self.calls, [])
 
+    def test_resumed_cleanup_syncs_committed_decision_before_discarding_backup(self):
+        _, retained, _ = self.prepare_retained_switch()
+        journal = self.root / 'retained-switch-committed.json'
+        backup = retained.with_name('.retained-' + retained.name)
+        sync = updater.sync_directory
+
+        def interrupt_sync(directory):
+            if directory == self.root and journal.exists():
+                self.assertTrue(backup.is_dir())
+                raise OSError('interrupted commit sync')
+            sync(directory)
+
+        with patch.object(updater, 'sync_directory', side_effect=interrupt_sync):
+            with self.assertRaisesRegex(OSError, 'interrupted commit sync'):
+                self.install()
+        self.assertTrue(journal.exists())
+        self.assertTrue(backup.is_dir())
+        observed = []
+
+        def track_sync(directory):
+            observed.append((directory, backup.is_dir()))
+            sync(directory)
+
+        with patch.object(updater, 'sync_directory', side_effect=track_sync):
+            self.install()
+        self.assertEqual(observed[0], (self.root, True))
+        self.assertIn((retained.parent, False), observed)
+        self.assertFalse(journal.exists())
+
     def test_committed_cleanup_resyncs_releases_if_backup_is_already_removed(self):
         _, retained, _ = self.prepare_retained_switch()
         sync = updater.sync_directory
