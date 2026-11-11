@@ -14,7 +14,8 @@ from pathlib import Path
 
 from .client import ApiError, private_file, save_config
 from . import native_launch
-from .native_launch import NativeLauncher, LOCAL_ROUTES, UUID_RE, canonical, native_returncode, same_workspace
+from .native_launch import NativeLauncher, LOCAL_ROUTES, UUID_RE, canonical, native_returncode, same_workspace, spawn_environment
+from .local_auth_readiness import local_claude_missing_contexts
 
 # Keep the live native-session census fresh for the global Hub session limit.
 LIVE_SESSION_HEARTBEAT_SECONDS = 30
@@ -943,6 +944,22 @@ class Bridge:
                     if mode in available[engine]:
                         capabilities.append('credentials:local:' + mode + ':' + engine + ':' + accounts[engine])
         capabilities = capabilities[:32]
+        if (len(capabilities) < 32 and 'claude' in engines and not configuration.get('private_provider_homes', False)
+                and configuration.get('routes', {}).get('claude') == LOCAL_ROUTES['claude']):
+            try:
+                # Bounded known contexts only; a cold/label context stays unknown.
+                contexts = []
+                journal = getattr(self, 'journal', None)
+                if journal is not None:
+                    contexts = [row[0] for row in journal.db.execute(
+                        'SELECT workspace FROM launches ORDER BY rowid DESC LIMIT 16').fetchall()]
+                contexts += [str(root) for root in getattr(self, 'roots', [])[:4]]
+                contexts = list(dict.fromkeys(value for value in contexts if isinstance(value, str) and value.startswith('/')))[:4]
+                modes = [short for mode, short in (('headless', 'h'), ('interactive', 'i')) if mode in available['claude']]
+                markers = local_claude_missing_contexts(contexts, modes, spawn_environment(False))
+                capabilities.extend(markers[:32-len(capabilities)])
+            except Exception:
+                pass  # Read-only observation is never a heartbeat/start gate.
         if include_native_sessions:
             self.client.heartbeat(labels,engines,capabilities,native_sessions=self.live_sessions())
             # Observation transport is independent of managed lifecycle/admission.
