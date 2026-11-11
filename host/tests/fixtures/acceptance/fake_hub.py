@@ -157,17 +157,38 @@ def hub(argv):
         s = ST['sessions'][argv[2]]
         encoded = re.search(r'b64decode\("([A-Za-z0-9+/=]+)"\)', s['prompt'])[1]
         marker = base64.b64decode(encoded).decode()
+        engine = CFG.get('capture_format_override', row_for(s, show=True)['engine'])
         if CFG.get('capture_prompt_only'):
-            event = {'type': 'item.started', 'item': {'type': 'command_execution', 'command': s['prompt'], 'aggregated_output': marker}}
+            events = [{'type': 'item.started', 'item': {'type': 'command_execution', 'command': s['prompt'], 'aggregated_output': marker}}]
         elif CFG.get('capture_assistant_only'):
-            event = {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': marker}}
+            events = [{'type': 'item.completed', 'item': {'type': 'agent_message', 'text': marker}}]
         elif CFG.get('capture_result_only'):
-            event = {'type': 'result', 'result': marker}
-        elif CFG.get('capture_format_override', row_for(s, show=True)['engine']) == 'go':
-            event = {'type': 'tool_use', 'part': {'type': 'tool', 'tool': 'bash', 'state': {'status': 'completed', 'output': marker + '\n'}}}
+            events = [{'type': 'result', 'result': marker}]
+        elif engine == 'go':
+            events = [{'type': 'tool_use', 'part': {'type': 'tool', 'tool': 'bash', 'state': {'status': 'completed', 'output': marker + '\n'}}}]
+        elif engine == 'claude':
+            provider = '11111111-2222-4333-8444-555555555555'
+            events = [
+                {'type': 'assistant', 'session_id': provider, 'message': {'role': 'assistant', 'content': [
+                    {'type': 'tool_use', 'id': 'toolu_fixture_print', 'name': 'Bash', 'input': {'command': 'python3 synthetic_print.py'}}]}},
+                {'type': 'user', 'session_id': provider, 'message': {'role': 'user', 'content': [
+                    {'type': 'tool_result', 'tool_use_id': 'toolu_fixture_print', 'content': marker + '\n', 'is_error': False}]},
+                 'tool_use_result': {'stdout': marker + '\n', 'stderr': '', 'interrupted': False}},
+            ]
+        elif engine == 'antigravity':
+            step = {'conversation_id': '11111111-2222-4333-8444-555555555555', 'step_index': 7,
+                    'step_type': 'tool', 'tool_name': 'run_command'}
+            params = {'CommandLine': 'python3 synthetic_print.py'}
+            events = [
+                {'event': 'step_update', 'step_update': dict(step, state='ACTIVE', tool_info={'name': 'run_command', 'parameters': params})},
+                {'event': 'step_update', 'step_update': dict(step, state='DONE', tool_info={'name': 'run_command', 'parameters': params,
+                    'output': 'Created At: 2026-01-01T00:00:00+00:00\nCompleted At: 2026-01-01T00:00:01+00:00\n'
+                              'Command exited with code 0.\n\nCommand output:\n' + marker + '\n'})},
+            ]
         else:
-            event = {'type': 'item.completed', 'item': {'type': 'command_execution', 'aggregated_output': marker + '\n'}}
-        out({'command_wait': {'state': 'pending' if CFG.get('capture_unacked') else 'acked', 'ack': {'capture': json.dumps(event)}}})
+            events = [{'type': 'item.completed', 'item': {'type': 'command_execution', 'aggregated_output': marker + '\n'}}]
+        out({'command_wait': {'state': 'pending' if CFG.get('capture_unacked') else 'acked',
+                              'ack': {'capture': '\n'.join(json.dumps(event) for event in events)}}})
     if sub == 'stop':
         s = ST['sessions'][argv[2]]; s['stopped'] = True
         ST['log'].append('stop:' + s['id'])

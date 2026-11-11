@@ -48,6 +48,31 @@ def transport(engine='codex', commit=COMMIT):
             'sha256': hashlib.sha256(('offline-capture-receipt-' + engine).encode()).hexdigest()}
 
 
+def provider_frames(engine, marker):
+    session = '11111111-2222-4333-8444-555555555555'
+    if engine == 'claude':
+        return [
+            {'type': 'assistant', 'session_id': session, 'message': {'role': 'assistant', 'content': [
+                {'type': 'tool_use', 'id': 'toolu_synthetic_print', 'name': 'Bash', 'input': {'command': 'python3 synthetic_print.py'}}]}},
+            {'type': 'user', 'session_id': session, 'message': {'role': 'user', 'content': [
+                {'type': 'tool_result', 'tool_use_id': 'toolu_synthetic_print', 'content': marker + '\n', 'is_error': False}]},
+             'tool_use_result': {'stdout': marker + '\n', 'stderr': '', 'interrupted': False}},
+        ]
+    params = {'CommandLine': 'python3 synthetic_print.py'}
+    return [
+        {'event': 'step_update', 'step_update': {'conversation_id': session, 'step_index': 7, 'step_type': 'tool',
+         'state': 'ACTIVE', 'tool_name': 'run_command', 'tool_info': {'name': 'run_command', 'parameters': dict(params)}}},
+        {'event': 'step_update', 'step_update': {'conversation_id': session, 'step_index': 7, 'step_type': 'tool',
+         'state': 'DONE', 'tool_name': 'run_command', 'tool_info': {'name': 'run_command', 'parameters': dict(params),
+         'output': 'Created At: 2026-01-01T00:00:00+00:00\nCompleted At: 2026-01-01T00:00:01+00:00\n'
+                   'Command exited with code 0.\n\nCommand output:\n' + marker + '\n'}}},
+    ]
+
+
+def jsonl(events):
+    return '\n'.join(json.dumps(event) for event in events)
+
+
 def evidence(commit=COMMIT, **kw):
     ev = {'kind': 'phase7_operator_validated_evidence_v1',
           'canary': 'success', 'canary_commit': commit, 'ci_e2e': 'success', 'ci_e2e_commit': commit,
@@ -211,14 +236,14 @@ class AcceptanceTests(Harness):
                 self.assertIn('no completed tool output', out)
                 self.assertAllStopped()
 
-    def test_unsupported_plaintext_json_and_missing_attestation_fail_with_cleanup(self):
+    def test_foreign_plaintext_json_and_missing_attestation_fail_with_cleanup(self):
         for engine in ('claude', 'antigravity'):
             pool = [{'policy_id': 'synthetic-' + engine, 'model': 'synthetic-model', 'engine': engine,
                      'effort': None, 'weight': 1, 'share': 1}]
             with self.subTest(engine=engine):
                 rc, out = self.go(pool=pool, models=['synthetic-model'] * 10, capture_format_override='go')
                 self.assertEqual(rc, 1, out)
-                self.assertIn('no verified stream transport for engine ' + engine, out)
+                self.assertIn('no completed tool output', out)
                 self.assertAllStopped()
         path = Path(evidence()); ev = json.loads(path.read_text())
         ev['operator_validation']['capture_transports'].pop('codex'); path.write_text(json.dumps(ev))
@@ -229,6 +254,17 @@ class AcceptanceTests(Harness):
     def test_wrong_stream_for_current_engine_is_not_proof(self):
         rc, out = self.go(capture_format_override='go')
         self.assertEqual(rc, 1, out); self.assertIn('no completed tool output', out)
+        self.assertAllStopped()
+
+    def test_model_less_run_with_claude_and_argon_paired_streams(self):
+        pool = [
+            {'policy_id': 'synthetic-claude', 'model': 'synthetic-claude-model', 'engine': 'claude', 'effort': None, 'weight': 1, 'share': 1/3},
+            {'policy_id': 'synthetic-argon', 'model': 'synthetic-argon-model', 'engine': 'antigravity', 'effort': None, 'weight': 1, 'share': 1/3},
+            {'policy_id': 'synthetic-codex', 'model': SOL, 'engine': 'codex', 'effort': 'medium', 'weight': 1, 'share': 1/3},
+        ]
+        rc, out = self.go(pool=pool, models=['synthetic-claude-model', 'synthetic-argon-model', SOL] * 3 + [SOL])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.state()['n'], 10)
         self.assertAllStopped()
 
     def test_operator_bundle_must_not_change_during_acceptance(self):
@@ -594,7 +630,7 @@ class ParserTests(unittest.TestCase):
         prompt, marker = acc.make_probe()
         codex = {'type': 'item.completed', 'item': {'type': 'command_execution', 'status': 'completed', 'exit_code': 0, 'aggregated_output': marker}}
         go = {'type': 'tool_use', 'part': {'type': 'tool', 'tool': 'bash', 'state': {'status': 'completed', 'output': marker}}}
-        for engine in acc.CAPTURE_FORMATS:
+        for engine in ('codex', 'zai', 'go'):
             matching, foreign = (go, codex) if engine == 'go' else (codex, go)
             self.assertTrue(acc.probe_output_ok(json.dumps(matching), prompt, marker, engine, transport(engine)))
             self.assertFalse(acc.probe_output_ok(json.dumps(foreign), prompt, marker, engine, transport(engine)))
@@ -614,14 +650,93 @@ class ParserTests(unittest.TestCase):
         event = dict(codex, item=dict(codex['item'], exit_code=False))
         self.assertFalse(acc.probe_output_ok(json.dumps(event), prompt, marker, 'codex', transport()))
 
+    def test_claude_and_argon_require_complete_pairs_in_one_capture_and_attestation(self):
+        prompt, marker = acc.make_probe()
+        for engine in ('claude', 'antigravity'):
+            frames = provider_frames(engine, marker)
+            with self.subTest(engine=engine):
+                self.assertTrue(acc.probe_output_ok(jsonl(frames), prompt, marker, engine, transport(engine)))
+                self.assertTrue(acc.probe_output_ok('clipped earlier frame\n' + jsonl(frames), prompt, marker, engine, transport(engine)))
+                for text in (jsonl(frames[:1]), jsonl(frames[1:]), jsonl(frames)[:-2],
+                             json.dumps({'type': 'assistant', 'message': {'role': 'assistant', 'content': [{'type': 'text', 'text': jsonl(frames)}]}}),
+                             jsonl(frames[:1]) + '\nmalformed middle\n' + jsonl(frames[1:])):
+                    self.assertFalse(acc.probe_output_ok(text, prompt, marker, engine, transport(engine)), text)
+                self.assertFalse(acc.probe_output_ok(jsonl(frames), prompt, marker, engine, None))
+                for record in (dict(transport(engine), format='codex_jsonl_v1'), dict(transport(engine), provider_version=''),
+                               dict(transport(engine), profile_set_sha256='bad')):
+                    self.assertFalse(acc.probe_output_ok(jsonl(frames), prompt, marker, engine, record))
+
+    def test_claude_pair_identity_failure_interruption_and_echo_matrix(self):
+        import copy
+        prompt, marker = acc.make_probe()
+        changes = [
+            lambda f: f[1].update(session_id='99999999-2222-4333-8444-555555555555'),
+            lambda f: f[0].update(session_id='not-provider-session'),
+            lambda f: f[0]['message']['content'][0].update(name='Read'),
+            lambda f: f[1]['message']['content'][0].update(tool_use_id='toolu_other'),
+            lambda f: f[1]['message']['content'][0].update(is_error=True),
+            lambda f: f[1]['message']['content'][0].pop('is_error'),
+            lambda f: f[1]['tool_use_result'].update(interrupted=True),
+            lambda f: f[1]['tool_use_result'].pop('interrupted'),
+            lambda f: f[1]['tool_use_result'].update(stdout='different output'),
+            lambda f: f[1]['tool_use_result'].update(stderr='synthetic error'),
+            lambda f: f[1]['message'].update(role='assistant'),
+            lambda f: f[1].pop('tool_use_result'),
+            lambda f: f.append(copy.deepcopy(f[0])),
+            lambda f: f.append(copy.deepcopy(f[1])),
+            lambda f: f[1]['message']['content'][0].update(type='text', text=marker),
+        ]
+        for change in changes:
+            frames = provider_frames('claude', marker); change(frames)
+            self.assertFalse(acc.probe_output_ok(jsonl(frames), prompt, marker, 'claude', transport('claude')), frames)
+        # The marker in tool INPUT without a real result is never output proof.
+        frames = provider_frames('claude', marker)[:1]
+        frames[0]['message']['content'][0]['input']['command'] = marker
+        self.assertFalse(acc.probe_output_ok(jsonl(frames), prompt, marker, 'claude', transport('claude')))
+
+    def test_argon_pair_identity_params_and_native_exit_wrapper_matrix(self):
+        import copy
+        prompt, marker = acc.make_probe()
+        changes = [
+            lambda f: f[1]['step_update'].update(conversation_id='99999999-2222-4333-8444-555555555555'),
+            lambda f: f[1]['step_update'].update(step_index=8),
+            lambda f: f[1]['step_update'].update(step_index=True),
+            lambda f: f[1]['step_update'].update(tool_name='other_provider_tool'),
+            lambda f: f[1]['step_update']['tool_info'].update(name='other_tool'),
+            lambda f: f[1]['step_update']['tool_info']['parameters'].update(CommandLine='different command'),
+            lambda f: f[1]['step_update'].update(state='ERROR'),
+            lambda f: f[1]['step_update'].update(error='synthetic error'),
+            lambda f: f[1]['step_update']['tool_info'].update(interrupted=True),
+            lambda f: f[0]['step_update']['tool_info'].update(output=marker),
+            lambda f: f.append(copy.deepcopy(f[0])),
+            lambda f: f.append(copy.deepcopy(f[1])),
+        ]
+        for change in changes:
+            frames = provider_frames('antigravity', marker); change(frames)
+            self.assertFalse(acc.probe_output_ok(jsonl(frames), prompt, marker, 'antigravity', transport('antigravity')), frames)
+        valid = provider_frames('antigravity', marker)[1]['step_update']['tool_info']['output']
+        outputs = [marker, 'Command exited with code 0.\n\nCommand output:\n' + marker,
+                   valid.replace('code 0.', 'code 1.') + '\nCommand exited with code 0.\n' + marker,
+                   valid.replace('Command output:', 'Assistant output:'),
+                   valid.replace('Created At: 2026-01-01T00:00:00+00:00', 'Created At: invalid'),
+                   valid.replace('Completed At: 2026-01-01T00:00:01+00:00', 'Completed At: 2025-01-01T00:00:01+00:00')]
+        for output in outputs:
+            frames = provider_frames('antigravity', marker)
+            frames[1]['step_update']['tool_info']['output'] = output
+            self.assertFalse(acc.probe_output_ok(jsonl(frames), prompt, marker, 'antigravity', transport('antigravity')), output)
+        frames = provider_frames('antigravity', marker)[:1]
+        frames[0]['step_update']['tool_info']['parameters']['CommandLine'] = marker
+        self.assertFalse(acc.probe_output_ok(jsonl(frames), prompt, marker, 'antigravity', transport('antigravity')))
+
     def test_transport_attestation_bounds_and_same_release_are_required(self):
         import copy
         path = Path(evidence()); original = json.loads(path.read_text())
         mutations = [lambda x: x.pop('capture_transports'), lambda x: x.update(capture_transports={}),
-                     lambda x: x['capture_transports'].update(claude=transport('claude')),
+                     lambda x: x['capture_transports'].update(unknown=transport('unknown')),
                      lambda x: x['capture_transports']['go'].update(host_release_sha='b' * 40),
                      lambda x: x['capture_transports']['codex'].update(format='opencode_json_v1'),
                      lambda x: x['capture_transports']['zai'].update(provider_version=''),
+                     lambda x: x['capture_transports']['zai'].update(format='zcode_jsonl_v1'),
                      lambda x: x['capture_transports']['go'].update(profile_set_sha256='bad')]
         for mutate in mutations:
             ev = copy.deepcopy(original); mutate(ev['operator_validation']); path.write_text(json.dumps(ev))
