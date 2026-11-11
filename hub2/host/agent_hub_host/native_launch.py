@@ -534,6 +534,8 @@ class NativeLauncher:
                 "--tag", "task-" + task_id]
         if specification.get("session_id"):
             argv += ["--label", "hub.managed=true", "--label", "hub.session=" + specification["session_id"]]
+        if specification.get('attempt_label'):
+            argv += ['--label', 'hub.attempt=' + specification['attempt_label']]
         for key, value in child_env.items():
             argv += ["--env", f"{key}={value}"]
         argv += ["--"] + child
@@ -544,6 +546,9 @@ class NativeLauncher:
         # under the aplexer supervisor, so the runner timeout bounds the handshake
         # alone. A killed handshake with a created session stays launch-uncertain
         # and is reconciled by identity, never re-spawned.
+        before_dispatch = specification.get('before_native_dispatch')
+        if before_dispatch:
+            before_dispatch()
         try:
             result = self.runner(argv, text=True, capture_output=True,
                                  timeout=35, check=False,
@@ -559,10 +564,13 @@ class NativeLauncher:
         except ValueError:
             raise RuntimeError("native_start_ambiguous") from None
         if not isinstance(start_json, dict) or not isinstance(start_json.get("id"), str) \
-                or not UUID_RE.fullmatch(start_json["id"].strip()):
+                or not UUID_RE.fullmatch(start_json["id"]):
             raise RuntimeError("native_start_identity_invalid")
         if start_json.get("tag") != "task-" + task_id or not same_workspace(start_json.get("workspace"), specification["workspace"]):
             raise RuntimeError("native_start_identity_invalid")
+        identity_observed = specification.get('native_identity_observed')
+        if identity_observed:
+            identity_observed(start_json['id'])
         if not local and native_command_model(start_json.get("command")) != specification["model"]:
             raise RuntimeError("native_model_mismatch")
         if not local and specification.get("effort") is not None and command_effort(start_json.get("command")) != (
@@ -756,11 +764,13 @@ class NativeLauncher:
             raise RuntimeError("native_launch_recovery_unverified")
         return native_id
 
-    def aborted_identity(self, task_id, workspace):
+    def aborted_identity(self, task_id, workspace, attempt):
         for selector in (f"{workspace}:task-{task_id}", "task-" + task_id):
             row = self.status(selector, workspace=workspace)
+            labels = row.get('labels') if row else None
             if row and same_workspace(row.get("workspace"), workspace) and row.get("tag") == "task-" + task_id \
-                    and isinstance(row.get("id"), str):
+                    and isinstance(row.get("id"), str) and UUID_RE.fullmatch(row["id"]) \
+                    and isinstance(labels,dict) and labels.get('hub.attempt')==attempt:
                 return row["id"]
         return None
 
