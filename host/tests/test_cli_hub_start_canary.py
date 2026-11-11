@@ -71,6 +71,17 @@ if args[:2] == ["intake", "update"]:
     (d / "archived_intake").write_text(" ".join(args)); sys.exit(0)
 if args[:2] == ["sessions", "list"]:
     if sc == "late_running": time.sleep(0.5)
+    list_count = int((d / "list_count").read_text()) if (d / "list_count").exists() else 0
+    (d / "list_count").write_text(str(list_count + 1))
+    if sc == "transient_inventory_changed_409" and list_count == 0:
+        sys.stderr.write("Session HTTP request failed with status 409 (native_inventory_changed)\n")
+        sys.exit(1)
+    if sc == "persistent_inventory_changed_409":
+        sys.stderr.write("Session HTTP request failed with status 409 (native_inventory_changed)\n")
+        sys.exit(1)
+    if sc == "list_auth_401":
+        sys.stderr.write("Session HTTP request failed with status 401 (unauthorized)\n")
+        sys.exit(1)
     items = [item("failed", id="other", name="other-session", key="other-key", native_id=None, attention={"reason": "engine_not_allowed", "observed_at": 1})]
     if (d / "started").exists():
         if sc == "never_running": items.append(item("claimed", native_id=None, attention={"reason": "native_launch_unverified", "observed_at": 1}))
@@ -172,7 +183,7 @@ class CanaryTest(unittest.TestCase):
         )
         env["FAKE_PROMPT"] = mode_prompt or ("Reply CANARY-OK and exit" if ("full" in args or "--deploy-gate" in args) else "printf CANARY-OK; sleep 30")
         env.update(extra)
-        for f in ("started", "a_running", "stopped"):
+        for f in ("started", "a_running", "stopped", "list_count"):
             (self.tmp / f).unlink(missing_ok=True)
         (self.tmp / "calls.log").write_text("")
         r = subprocess.run([str(SCRIPT), *args], env=env, capture_output=True, text=True, timeout=60)
@@ -1257,6 +1268,56 @@ class CanaryTest(unittest.TestCase):
                 (False, "lock", "state_dir_symlink", "not_needed"),
             )
         self.assertNotIn("sessions start", self.calls())
+
+    def test_running_retries_transient_native_inventory_changed_409_and_cleans_up_persistent_409(self):
+        # 1. Transient first-list 409 (native_inventory_changed) followed by a valid
+        # complete snapshot must succeed within the SAME running deadline, retaining
+        # the exact session/key and issuing only ONE sessions start (POST).
+        r_ok, v_ok = self.run_canary("transient_inventory_changed_409", "--mode", "shell", "--deploy-gate")
+        self.assertEqual(r_ok.returncode, 0, r_ok.stderr)
+        self.assertEqual(
+            (v_ok["ok"], v_ok["stage"], v_ok["reason"], v_ok["cleanup"], v_ok["session_id"]),
+            (True, None, None, "not_needed", SID),
+        )
+        calls_ok = self.calls().splitlines()
+        self.assertEqual(sum(1 for line in calls_ok if line.startswith("sessions start ")), 1)
+        self.assertEqual(sum(1 for line in calls_ok if line == "sessions list --all --json"), 2)
+
+        # 2. Persistent 409 (native_inventory_changed) churn until running deadline
+        # must time out at running/timeout_native_inventory_changed after retrying
+        # fresh complete listings within the same deadline, never issuing a second POST,
+        # and perform owned cleanup (stop + wait_gone).
+        r_churn, v_churn = self.run_canary(
+            "persistent_inventory_changed_409",
+            "--mode",
+            "shell",
+            "--deploy-gate",
+            HUB_CANARY_RUNNING_TIMEOUT_S="0.25",
+            HUB_CANARY_POLL_S="0.01",
+        )
+        self.assertEqual(r_churn.returncode, 1)
+        self.assertEqual(
+            (v_churn["ok"], v_churn["stage"], v_churn["reason"], v_churn["cleanup"], v_churn["session_id"]),
+            (False, "running", "timeout_native_inventory_changed", "stopped", SID),
+        )
+        calls_churn = self.calls().splitlines()
+        self.assertEqual(sum(1 for line in calls_churn if line.startswith("sessions start ")), 1)
+        self.assertGreaterEqual(sum(1 for line in calls_churn if line == "sessions list --all --json"), 2)
+        self.assertTrue(
+            any(line.startswith(f"sessions stop {SID} --key canary-{v_churn['run_id']}-cleanup") for line in calls_churn)
+        )
+
+        # 3. Non-409 failures (e.g. 401 unauthorized) must still fail immediately and
+        # truthfully without retrying.
+        r_auth, v_auth = self.run_canary("list_auth_401", "--mode", "shell", "--deploy-gate")
+        self.assertEqual(r_auth.returncode, 1)
+        self.assertEqual(
+            (v_auth["ok"], v_auth["stage"], v_auth["reason"], v_auth["cleanup"]),
+            (False, "running", "unauthorized", "stopped"),
+        )
+        calls_auth = self.calls().splitlines()
+        self.assertEqual(sum(1 for line in calls_auth if line.startswith("sessions start ")), 1)
+        self.assertEqual(sum(1 for line in calls_auth if line == "sessions list --all --json"), 1)
 
 
 if __name__ == "__main__":

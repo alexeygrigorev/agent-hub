@@ -867,7 +867,13 @@ class Canary:
         while time.monotonic() < deadline:
             try:
                 items = self.list_items("running", deadline)
-            except StageFailure:
+            except StageFailure as failure:
+                if failure.reason == "native_inventory_changed":
+                    stage, reason = "running", "native_inventory_changed"
+                    if time.monotonic() >= deadline:
+                        break
+                    self.pause(deadline)
+                    continue
                 if time.monotonic() >= deadline:
                     break
                 raise
