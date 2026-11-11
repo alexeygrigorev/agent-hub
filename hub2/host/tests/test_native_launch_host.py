@@ -881,6 +881,7 @@ class ManagedClaudeReadinessTests(unittest.TestCase):
             release=root/('a'*40);release.mkdir(mode=0o700)
             (release/'bin').mkdir(mode=0o700)
             (release/'bin/python').symlink_to(sys.executable)
+            current=root/'current';current.symlink_to(release,target_is_directory=True)
             archive=release/'hub.pyz'
             package=Path(__file__).resolve().parents[3]/'host/agent_hub_host'
             with zipfile.ZipFile(archive,'w') as out:
@@ -898,7 +899,8 @@ class ManagedClaudeReadinessTests(unittest.TestCase):
                 code=('import sys,json;sys.path.insert(0,sys.argv[1]);'
                       'from agent_hub_host.provisioning import module_command;'
                       'sys.argv[0]=sys.argv[1];print(json.dumps(module_command("execute","hub-claude")))')
-                command=json.loads(subprocess.check_output([str(release/'bin/python'),'-I','-S','-c',code,str(archive)],text=True))
+                command=json.loads(subprocess.check_output([str(current/'bin/python'),'-I','-S','-c',code,str(archive)],text=True))
+                self.assertEqual(command[0],str(release/'bin/python'))
                 def publish(argv):
                     profile.write_text('[profiles."hub-hub-claude"]\nengine="claude"\ncommand='+json.dumps(argv)+'\n')
                     profile.chmod(0o600)

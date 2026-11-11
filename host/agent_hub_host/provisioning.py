@@ -1436,12 +1436,21 @@ def module_command(handler, label, managed_dir=None):
     # <release>/package/host on PYTHONPATH (intake 608a2f9a): without an
     # embedded path the -c import dies with ModuleNotFoundError on Windows.
     prefix = 'import sys; sys.path.insert(0, ' + repr(str(Path(__file__).resolve().parents[1])) + '); '
+    python = sys.executable
     if Path(sys.argv[0]).is_file() and zipfile.is_zipfile(sys.argv[0]):
         # The frozen zipapp stays ahead of the checkout copy on sys.path.
-        prefix += 'sys.path.insert(0, ' + repr(str(Path(sys.argv[0]).resolve())) + '); '
+        archive = Path(sys.argv[0]).resolve()
+        prefix += 'sys.path.insert(0, ' + repr(str(archive)) + '); '
+        release = archive.parent
+        if (label == 'hub-claude' and sys.platform == 'linux' and re.fullmatch('[0-9a-f]{40}', release.name)
+                and (release / 'release.json').is_file() and Path(sys.executable).parent.parent.resolve() == release
+                and (release / 'bin/python').is_file() and (release / 'bin/python').samefile(sys.executable)):
+            # Preserve the release venv, not the resolved base interpreter, and
+            # never leave a scoped repin attached to the mutable current link.
+            python = str(release / 'bin/python')
     m_dir = str(managed_dir or root())
     prefix += 'import os; os.environ["AGENT_HUB_MANAGED_DIR"] = ' + repr(m_dir) + '; '
-    return [sys.executable, '-c', prefix + 'from agent_hub_host.provisioning import ' + handler + '; ' + handler + '()', label]
+    return [python, '-c', prefix + 'from agent_hub_host.provisioning import ' + handler + '; ' + handler + '()', label]
 
 
 def _opencode_engine_pin(bundles, is_windows=None):
