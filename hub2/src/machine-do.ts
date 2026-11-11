@@ -294,15 +294,6 @@ export class MachineDO {
       }
       this.db.run('INSERT INTO machine_liveness(singleton,observed_at) VALUES(1,?) ON CONFLICT(singleton) DO UPDATE SET observed_at=excluded.observed_at',now);
     });
-    // New connections start false. Only a normal authenticated heartbeat can
-    // bind execution readiness to the current socket, including after rollback.
-    for(const socket of this.machineSockets(machineId)){
-      try{
-        const attachment=socket.deserializeAttachment();
-        if(attachment?.machine_id===machineId&&this.currentSocket(socket))
-          socket.serializeAttachment({...attachment,managed_claude_ready:(capabilities as string[]).includes(MANAGED_CLAUDE_CAPABILITY)});
-      }catch{}
-    }
     await this.scheduleNext();
     return json({ ok: true, machine_id: machineId, last_seen: now });
   }
@@ -339,7 +330,10 @@ export class MachineDO {
   }
 
   private managedClaudeAvailable(machineId:string):boolean {
-    return this.machineSockets(machineId).some(socket=>this.managedClaudeSocket(socket));
+    const row=this.db.one<{capabilities_json:string}>('SELECT capabilities_json FROM machine_capabilities WHERE machine_id=?',machineId);
+    const caps=this.parse(row?.capabilities_json);
+    return Array.isArray(caps)&&caps.includes(MANAGED_CLAUDE_CAPABILITY)
+      &&this.machineSockets(machineId).some(socket=>this.managedClaudeSocket(socket));
   }
 
   private managedClaudeLaunch(launch:unknown):boolean {
@@ -550,6 +544,23 @@ export class MachineDO {
       try { socket.send(JSON.stringify({ type: 'pong', nonce: typeof body.nonce === 'string' ? body.nonce.slice(0, 80) : undefined })); } catch {}
       return;
     }
+    if(body.type==='managed.claude.ready'){
+      if(Object.keys(body).some(key=>!['type','protocol','ready'].includes(key))
+        ||body.protocol!=='hub2-managed-claude-exec-v1'||typeof body.ready!=='boolean'){
+        try{socket.send(JSON.stringify({type:'error',error:'invalid_managed_exec_readiness'}));}catch{}return;
+      }
+      try{
+        const attachment=await this.authorizedAttachment(socket,'machine:offer',true,env);
+        if(!attachment?.machine_id)return;
+        const row=this.db.one<{capabilities_json:string}>('SELECT capabilities_json FROM machine_capabilities WHERE machine_id=?',attachment.machine_id);
+        const caps=this.parse(row?.capabilities_json);
+        const ready=body.ready&&Array.isArray(caps)&&caps.includes(MANAGED_CLAUDE_CAPABILITY);
+        const prior=socket.deserializeAttachment()?.managed_claude_ready===true;
+        socket.serializeAttachment({...attachment,managed_claude_ready:ready});
+        if(ready&&!prior)await this.sendOffers(socket,attachment.machine_id,env);
+      }catch{} // Optional code observation cannot poison the normal socket.
+      return;
+    }
     if (body.type === 'resync') {
       try {
         const attachment = await this.authorizedAttachment(socket, 'machine:offer',true,env);
@@ -583,7 +594,7 @@ export class MachineDO {
         return;
       }
       const launch=this.parse(row.launch_json) as JsonRecord;
-      if(this.managedClaudeLaunch(launch)&&!this.managedClaudeSocket(socket)){
+      if(this.managedClaudeLaunch(launch)&&(!this.managedClaudeSocket(socket)||!this.managedClaudeAvailable(row.machine_id))){
         socket.send(JSON.stringify({type:'error',error:'managed_exec_unavailable'}));return;
       }
       const binding=mergeWorkspaceBinding(launch.workspace,launch[WORKSPACE_BINDING_FIELD],body.workspace_binding);
@@ -638,7 +649,7 @@ export class MachineDO {
     const now = Date.now();
     const rows = this.offerRows(machineId,now);
     for (const row of rows) {
-      if(this.managedClaudeLaunch(this.parse(row.launch_json))&&!this.managedClaudeSocket(socket))continue;
+      if(this.managedClaudeLaunch(this.parse(row.launch_json))&&(!this.managedClaudeSocket(socket)||!this.managedClaudeAvailable(machineId)))continue;
       try { socket.send(JSON.stringify({ type: 'session.offer', offer: this.offerView(row) })); } catch { return; }
     }
   }
@@ -649,7 +660,7 @@ export class MachineDO {
     const frame = JSON.stringify({ type: 'session.offer', offer: this.offerView(row) });
     for (const socket of this.machineSockets(`${row.machine_id}`)) {
       try {
-        if(this.stopOnly(socket)||this.managedClaudeLaunch(this.parse(row.launch_json))&&!this.managedClaudeSocket(socket))continue;
+        if(this.stopOnly(socket)||this.managedClaudeLaunch(this.parse(row.launch_json))&&(!this.managedClaudeSocket(socket)||!this.managedClaudeAvailable(row.machine_id)))continue;
         if(await this.authorizedAttachment(socket,'machine:offer',true,this.env))socket.send(frame);
       } catch {}
     }

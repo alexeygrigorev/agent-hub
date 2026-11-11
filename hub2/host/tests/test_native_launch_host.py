@@ -871,6 +871,9 @@ class HeadlessStreamOutputTests(unittest.TestCase):
 
 class ManagedClaudeReadinessTests(unittest.TestCase):
     def test_actual_bundled_protocol_rejects_old_pin_then_accepts_exact_repin(self):
+        if sys.platform != 'linux':
+            self.assertIsNone(nl.NativeLauncher({}).managed_claude_readiness())
+            return
         import hashlib
         import zipfile
         with tempfile.TemporaryDirectory(dir=os.environ['TMPDIR']) as temporary:

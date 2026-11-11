@@ -443,15 +443,19 @@ Keep the previous pinned artifact until this repin succeeds. Other profiles,
 shims and provider homes remain untouched. The normal 30-second host heartbeat
 publishes the changed capability; no additional restart is needed. Capability
 presence proves code support, not login validity or quota availability.
-The initial readiness protocol supports POSIX installed releases. Windows keeps
-its existing native defaults and advertises no new managed-execution capability.
+The initial readiness protocol supports Linux installed releases. Other hosts keep
+their existing native defaults and advertise no new managed-execution capability.
 
 At execution, the enrolled v2 host fetches and materializes the current central
 generation, retains the existing CAS rotation behavior, and acknowledges the
 actual materialized generation through the normal exact-label sync report.
 A concurrent generation change, unavailable Hub or unconfirmed ACK cannot
 produce verified central execution evidence. Import, login, refresh leases and
-unrelated accounts are outside this execution binding.
+unrelated accounts are outside this execution binding. The explicit path pins
+`--setting-sources user` on the reviewed Claude CLI, excluding workspace project
+and local settings. Conflicting settings argv, alternate auth in the controlled
+managed user home, and unverified system managed-settings policy refuse the
+explicit attempt. No global or project settings file is edited or helper run.
 
 The private attempt context and its adjacent `.receipt.json` identify the Hub
 session, operation, epoch, original request digest, workspace, native UUID/tag/

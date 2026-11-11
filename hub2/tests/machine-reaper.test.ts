@@ -1164,7 +1164,7 @@ test('managed Claude opt-in needs current socket heartbeat, not stale persisted 
   return{readyState:1,deserializeAttachment:()=>attachment,serializeAttachment:(next:any)=>{attachment=next;},
    send:(raw:string)=>frames.push(JSON.parse(raw)),close(){this.readyState=3;}};
  };
- const first=makeSocket('managed-first');f.sockets.push(first);
+ const survivingOld=makeSocket('surviving-old');f.sockets.push(survivingOld);
  const beat=()=>f.call('/api/heartbeat','POST',{labels:[],engines:['claude'],capabilities:['headless',cap]});
  assert.equal((await beat()).status,200);
  const reservation=(id:string,extra:any={})=>f.call('/_internal/reserve','POST',{
@@ -1172,6 +1172,16 @@ test('managed Claude opt-in needs current socket heartbeat, not stale persisted 
   intake_id:'intake-'+id,machine_id:'h1',request_digest:'digest-'+id,title:'managed proof',
   acceptance_criteria:['proof'],account_id:'claude',launch:{workspace:'/tmp',engine:'claude',model:'opus',
    effort:'medium',prompt:'do real work',interactive:false,managed_credential_label:'hub-claude',...extra}});
+ // A new daemon's HTTP heartbeat must never bless the surviving old socket.
+ assert.equal((await reservation('pre-handshake')).status,409);
+ assert.notEqual(survivingOld.deserializeAttachment().managed_claude_ready,true);
+ const first=makeSocket('managed-first');f.sockets.splice(0,1,first);
+ const frame={type:'managed.claude.ready',protocol:'hub2-managed-claude-exec-v1',ready:true};
+ await f.machine.webSocketMessage(survivingOld as any,JSON.stringify(frame));
+ assert.equal((await reservation('stale-socket-frame')).status,409);
+ await f.machine.webSocketMessage(first as any,JSON.stringify({...frame,ready:'true'}));
+ assert.equal((await reservation('malformed-frame')).status,409);
+ await f.machine.webSocketMessage(first as any,JSON.stringify(frame));frames.length=0;
  const accepted=await reservation('managed-one');assert.equal(accepted.status,201);
  const epoch=(await accepted.json() as any).epoch;
  assert.equal((await f.call('/_internal/activate','POST',{operation_id:'op-managed-one',session_id:'managed-one',epoch})).status,201);
@@ -1189,6 +1199,8 @@ test('managed Claude opt-in needs current socket heartbeat, not stale persisted 
  assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get('managed-one') as any).state,'offered');
  // Source upgrade + scoped repin are observed by ordinary heartbeat, no restart.
  assert.equal((await beat()).status,200);
+ assert.equal((await reservation('managed-two')).status,409,'HTTP alone cannot enable this socket');
+ await f.machine.webSocketMessage(old as any,JSON.stringify(frame));
  assert.equal((await reservation('managed-two')).status,201);
  frames.length=0;await (f.machine as any).sendOffers(old,'h1');
  assert(frames.some(frame=>frame.offer.launch.managed_credential_label==='hub-claude'));

@@ -903,6 +903,7 @@ test('real Project and Machine carry the immutable managed selection only on a q
  const beat=await machine.fetch(new Request('https://machine.test/api/heartbeat',{method:'POST',headers,
   body:JSON.stringify({labels:[],engines:['claude'],capabilities:['headless','effort:claude','managed:hub-claude:opus:medium:v1']})}));
  assert.equal(beat.status,200);
+ await machine.webSocketMessage(socket as any,JSON.stringify({type:'managed.claude.ready',protocol:'hub2-managed-claude-exec-v1',ready:true}));
  const own=await intake(f,'real-managed'),request={key:'real-managed',workspace:'/tmp/proof',engine:'claude',model:'opus',
   effort:'medium',managed_credential_label:'hub-claude'};
  const result=await f.call('/api/intakes/'+own.id+'/start','POST',request);assert.equal(result.status,201);

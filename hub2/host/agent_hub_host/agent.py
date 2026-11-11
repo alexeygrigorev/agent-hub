@@ -1091,6 +1091,18 @@ class Bridge:
                                     (native_id,row['session_id'],row['epoch']))
         return native_id,status
 
+    def publish_managed_readiness(self, socket=None):
+        """Bind optional code readiness to this daemon's actual current socket."""
+        socket = socket if socket is not None else getattr(self, '_managed_socket', None)
+        ready = getattr(self, '_managed_code_ready', False)
+        if socket is None or not (ready or getattr(self, '_managed_ready_published', False)):
+            return
+        try:
+            socket.send(canonical({'type':'managed.claude.ready','protocol':'hub2-managed-claude-exec-v1','ready':ready}))
+            self._managed_ready_published = ready
+        except Exception:
+            pass  # A reconnect/observation failure never blocks normal host work.
+
     def heartbeat(self,labels,include_native_sessions=True):
         available=self.launcher.capabilities()
         engines=sorted(engine for engine in self.engines.intersection(available) if available[engine])
@@ -1131,14 +1143,17 @@ class Bridge:
                 capabilities.extend(markers[:32-len(capabilities)])
             except Exception:
                 pass  # Read-only observation is never a heartbeat/start gate.
+        self._managed_code_ready = False
         if len(capabilities) < 32 and 'claude' in engines:
             try:
                 if self.launcher.managed_claude_readiness():
                     capabilities.append('managed:hub-claude:opus:medium:v1')
+                    self._managed_code_ready = True
             except Exception:
                 pass  # Code readiness is an optional observation, never a heartbeat gate.
         if include_native_sessions:
             self.client.heartbeat(labels,engines,capabilities,native_sessions=self.live_sessions())
+            self.publish_managed_readiness()
             # Observation transport is independent of managed lifecycle/admission.
             # Failed/unsupported collection never publishes an empty replacement.
             inventory = getattr(self.launcher, 'inventory', None)
@@ -1166,6 +1181,7 @@ class Bridge:
                         self._native_inventory_thread.start()
         else:
             self.client.heartbeat(labels,engines,capabilities)
+            self.publish_managed_readiness()
 
     def safety_pause(self,machine_id):
         self.reconcile()
@@ -1225,8 +1241,11 @@ class Bridge:
                 if safety:
                     self.safety_pause(machine_id)
                     continue
+                self._managed_socket = None
                 self.heartbeat(labels)
                 with self.client.socket(machine_id) as socket:
+                    self._managed_socket = socket
+                    self.publish_managed_readiness(socket)
                     logging.getLogger(__name__).info('Host connected machine=%s', machine_id)
                     waiters, waiter_lock = {}, threading.Lock()
                     pool, commands, slots = self._launch_pool, self._command_pool, self._worker_slots
@@ -1311,6 +1330,7 @@ class Bridge:
                         self.reconcile()
                         self.journal.flush(self.client)
             except Exception as error:
+                self._managed_socket = None
                 logging.getLogger(__name__).exception('Host disconnected machine=%s', machine_id)
                 if isinstance(error,ApiError) and error.retry_at:
                     self.budget_paused_until=max(self.budget_paused_until,error.retry_at)

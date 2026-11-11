@@ -2877,8 +2877,22 @@ def managed_claude_route_args(bundle, bypass_flags, extra_argv, *, managed=None)
                 i += 1
         return result
 
+    if managed:
+        skip_prompt = False
+        for arg in extra_argv:
+            if skip_prompt:
+                skip_prompt = False
+                continue
+            if arg in ('-p', '--print'):
+                skip_prompt = True
+            elif arg in ('--settings', '--setting-sources') or arg.startswith(('--settings=', '--setting-sources=')):
+                raise ValueError('managed_settings_unverified')
     args = strip_route_flags(list(bundle.get('args') or []) + list(bypass_flags or []) + list(extra_argv))
     route_args = ['--model', model, '--effort', 'medium']
+    if managed:
+        # Supported by the pinned Claude 2.1.322 CLI. Project/local settings
+        # must never substitute apiKeyHelper/env credentials for this home.
+        route_args += ['--setting-sources', 'user']
     prompt_index = next((i for i, arg in enumerate(args) if arg in ('-p', '--print')), len(args))
     return args[:prompt_index] + route_args + args[prompt_index:]
 
@@ -2926,6 +2940,8 @@ def managed_claude_context(extra_argv):
         return None, extra_argv
     if len(markers) != 1:
         raise ValueError('managed_exec_binding_invalid')
+    if sys.platform != 'linux':
+        raise ValueError('managed_exec_unavailable')
     path = Path(markers[0][len(MANAGED_CONTEXT_FLAG):])
     if not path.is_absolute():
         raise ValueError('managed_exec_binding_invalid')
@@ -2952,6 +2968,35 @@ def managed_claude_context(extra_argv):
         raise ValueError('managed_exec_binding_invalid')
     context = dict(context, _path=path)
     return context, [v for v in extra_argv if not v.startswith(MANAGED_CONTEXT_FLAG)]
+
+
+MANAGED_CLAUDE_SYSTEM_SETTINGS = ('/etc/claude-code/managed-settings.json', '/etc/claude-code/managed-settings.d')
+
+
+def managed_claude_settings(home, *, system_settings=None):
+    """Refuse alternate user auth; project/local settings are disabled in argv.
+
+    Enterprise settings cannot be disabled by --setting-sources. Their presence
+    stays unsupported for this explicit proof rather than guessing precedence.
+    No settings/helper is executed, copied, logged or modified here.
+    """
+    if system_settings is None:
+        system_settings = MANAGED_CLAUDE_SYSTEM_SETTINGS
+    if any(os.path.lexists(path) for path in system_settings):
+        raise ValueError('managed_settings_unverified')
+    auth_keys = {'apiKeyHelper', 'primaryApiKey', 'awsAuthRefresh', 'awsCredentialExport',
+                 'forceLoginMethod', 'forceLoginOrgUUID'}
+    for parts in (('.claude', 'settings.json'), ('.claude', 'settings.local.json'),
+                  ('.claude', '.claude.json'), ('.claude.json',)):
+        path = Path(home).joinpath(*parts)
+        try:
+            settings = json.loads(private_fs.read_bytes(path, 65536))
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError):
+            raise ValueError('managed_settings_unverified') from None
+        if not isinstance(settings, dict) or auth_keys.intersection(settings) or settings.get('env', {}) != {}:
+            raise ValueError('managed_settings_unverified')
 
 
 def managed_claude_materialize(context, bundle, home, dest, request):
@@ -2991,8 +3036,9 @@ def managed_claude_receipt(context, generation, bundle):
             or '--engine-arg='+MANAGED_CONTEXT_FLAG+str(context['_path']) not in command):
         raise ValueError('managed_native_identity_unverified')
     receipt = {k: v for k, v in context.items() if k not in ('_path', 'server', 'runtime_deadline')}
-    receipt.update(stage='ready_to_exec', native_id=row['id'], tag=row['tag'], created_at_ms=row['created_at_ms'],
-                   credential_generation=generation, revision=bundle['revision'], observed_at_ms=int(time.time()*1000))
+    receipt.update(stage='ready_to_exec', settings_sources=['user'], native_id=row['id'], tag=row['tag'], created_at_ms=row['created_at_ms'],
+                   credential_generation=generation, revision=bundle['revision'], engine_version=bundle['version'],
+                   observed_at_ms=int(time.time()*1000))
     path = context['_path'].with_suffix('.receipt.json')
     private_fs.atomic_write(path, json.dumps(receipt).encode('utf8'), 16384)
 
@@ -3007,7 +3053,8 @@ def execute():
         if not selected:
             raise
         allowed = {'managed_exec_binding_invalid', 'managed_credential_unverified', 'managed_generation_ack_unverified',
-                   'managed_admission_refused', 'managed_generation_changed', 'managed_native_identity_unverified', 'managed_exec_unavailable'}
+                   'managed_admission_refused', 'managed_generation_changed', 'managed_native_identity_unverified',
+                   'managed_settings_unverified', 'managed_exec_unavailable'}
         reason = str(caught) if isinstance(caught, ValueError) and str(caught) in allowed else 'managed_exec_refused'
         print(json.dumps({'provider': 'claude', 'launch_allowed': False, 'reason': reason}), file=sys.stderr)
         raise SystemExit(75) from None
@@ -3039,12 +3086,11 @@ def _execute():
             machine, managed_request = bind_managed_claude(managed['server'])
             if machine != managed['machine_id']:
                 raise ValueError('managed_exec_binding_invalid')
-            if b.get('provider') != 'claude' or b.get('label') != 'hub-claude' or b.get('env') != {} or b.get('args') != []:
+            if (b.get('provider') != 'claude' or b.get('label') != 'hub-claude' or b.get('env') != {} or b.get('args') != []
+                    or b.get('version') != engine_versions.package_version('claude')):
                 raise ValueError('managed_exec_binding_invalid')
         provision_managed_home(b, home, dest)
-        if managed:
-            managed_generation = managed_claude_materialize(managed, b, home, dest, managed_request)
-        else:
+        if not managed:
             refresh_launch_credential(label, b, home, dest)
         cwd = str(Path(os.getcwd()).resolve())
         p = Path(cwd)
@@ -3054,6 +3100,9 @@ def _execute():
                 git_root = str(parent)
                 break
         install_managed_engine_permissions(b, home, trusted_paths=[cwd, git_root])
+        if managed:
+            managed_claude_settings(home)
+            managed_generation = managed_claude_materialize(managed, b, home, dest, managed_request)
         _, binary, _ = PACKAGES[b['provider']]
         command = engine_argv(b, dest)
         env = engine_environment(b, home, dest)

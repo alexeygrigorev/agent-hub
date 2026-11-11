@@ -13,6 +13,7 @@ from agent_hub_host import provisioning as p
 @pytest.fixture(autouse=True)
 def isolated_aplexer(tmp_path, monkeypatch):
     monkeypatch.setenv('APLEXER_CONFIG', str(tmp_path / 'aplexer' / 'config.toml'))
+    monkeypatch.setattr(p,'MANAGED_CLAUDE_SYSTEM_SETTINGS',())
 
 
 def bundle(revision='11111111-1111-4111-8111-111111111111'):
@@ -1936,7 +1937,7 @@ def test_managed_opus_exception_is_context_only_and_medium(monkeypatch):
     b=dict(bundle(),label='hub-claude',provider='claude',args=[])
     with pytest.raises(ValueError): p.managed_claude_route_args(b,[],['--model','opus'])
     context={'model':'opus','effort':'medium'}
-    assert p.managed_claude_route_args(b,[],['--model','opus','--hub-session-effort=medium'],managed=context)==['--model','opus','--effort','medium']
+    assert p.managed_claude_route_args(b,[],['--model','opus','--hub-session-effort=medium'],managed=context)==['--model','opus','--effort','medium','--setting-sources','user']
     for model in ('haiku','arbitrary','glm-5.3-flash'):
         with pytest.raises(ValueError): p.managed_claude_route_args(b,[],['--model',model],managed=context)
     with pytest.raises(ValueError): p.managed_claude_route_args(b,[],['--model','opus','--hub-session-effort=high'],managed=context)
@@ -1975,7 +1976,7 @@ def test_explicit_managed_claude_execute_binds_actual_attempt_generation_and_chi
     monkeypatch.setattr(p,'__file__',str(archive/'agent_hub_host/provisioning.py'))
     monkeypatch.setattr(p,'managed_exec_readiness',lambda archive:{'protocol':p.MANAGED_CLAUDE_PROTOCOL})
     record=managed/'attempt.json';p.write_json(record,context)
-    b={'label':'hub-claude','provider':'claude','version':'1.0.0','revision':'22222222-2222-4222-8222-222222222222',
+    b={'label':'hub-claude','provider':'claude','version':p.engine_versions.package_version('claude'),'revision':'22222222-2222-4222-8222-222222222222',
        'files':{},'env':{},'args':[]}
     dest=managed/(b['label']+'-'+b['revision']);dest.mkdir(mode=0o700)
     p.write_json(dest/'bundle.json',b);p.write_json(managed/'state.json',[{k:b[k] for k in ('label','provider','revision')}])
@@ -1995,7 +1996,20 @@ def test_explicit_managed_claude_execute_binds_actual_attempt_generation_and_chi
             'created_at_ms':int(p.time.time()*1000)-1000,'phase':'running','command':['a','task','run','--profile','hub-hub-claude',
             '--engine-arg='+p.MANAGED_CONTEXT_FLAG+str(record)]}
     monkeypatch.setattr(p.subprocess,'run',lambda *a,**kw:subprocess.CompletedProcess(a,0,json.dumps(native),''))
-    calls=[];monkeypatch.setattr(p.os,'execve',lambda command,argv,env:calls.append((command,argv,env)))
+    # Actual workspace alternative auth must remain outside the selected CLI
+    # sources. This stub implements the pinned documented option contract and
+    # fails if the generated argv would select a project helper; no helper runs.
+    project=tmp_path/'.claude';project.mkdir(mode=0o700)
+    project_settings={'apiKeyHelper':'printf synthetic-project-key','env':{'ANTHROPIC_AUTH_TOKEN':'project-key'}}
+    (project/'settings.json').write_text(json.dumps(project_settings))
+    before_project=(project/'settings.json').read_bytes()
+    calls=[]
+    def provider(command,argv,env):
+        sources=argv[argv.index('--setting-sources')+1].split(',') if '--setting-sources' in argv else ['user','project','local']
+        assert sources==['user'], 'project apiKeyHelper would be selected'
+        assert (project/'settings.json').read_bytes()==before_project
+        calls.append((command,argv,env))
+    monkeypatch.setattr(p.os,'execve',provider)
     monkeypatch.setattr(sys,'argv',['hub','hub-claude',p.MANAGED_CONTEXT_FLAG+str(record),'--model','opus',
                                   '--hub-session-effort=medium','--output-format','stream-json','-p','synthetic prompt'])
     if admission_generation != 6:
@@ -2041,3 +2055,29 @@ def test_managed_failure_is_typed_without_echoing_exception_payload(monkeypatch,
     output=capsys.readouterr()
     assert json.loads(output.err)=={'provider':'claude','launch_allowed':False,'reason':'managed_exec_refused'}
     assert 'synthetic-secret' not in output.err+output.out
+
+
+@pytest.mark.parametrize('settings',[{'apiKeyHelper':'must-not-run'}, {'primaryApiKey':'must-not-use'},
+    {'env':{'ANTHROPIC_AUTH_TOKEN':'must-not-use'}}, {'awsCredentialExport':'must-not-run'}])
+def test_managed_user_auth_overrides_refuse_without_running_helpers(tmp_path,monkeypatch,settings):
+    path=tmp_path/'.claude/settings.json';p.write_json(path,settings);before=path.read_bytes()
+    with patch.object(p.subprocess,'run') as run,pytest.raises(ValueError,match='managed_settings_unverified'):
+        p.managed_claude_settings(tmp_path,system_settings=())
+    run.assert_not_called();assert path.read_bytes()==before
+
+
+def test_managed_settings_keep_private_generated_hooks_and_refuse_system_policy(tmp_path):
+    path=tmp_path/'.claude/settings.json'
+    p.write_json(path,{'hooks':{'Stop':[{'hooks':[{'type':'command','command':'a reported-state idle'}]}]},
+                       'permissions':{'defaultMode':'bypassPermissions'},'autoUpdates':False})
+    before=path.read_bytes();p.managed_claude_settings(tmp_path,system_settings=())
+    assert path.read_bytes()==before
+    system=tmp_path/'system-managed.json';system.write_text('{}')
+    with pytest.raises(ValueError,match='managed_settings_unverified'):
+        p.managed_claude_settings(tmp_path,system_settings=(system,))
+
+
+@pytest.mark.parametrize('override',[['--settings','/not-read.json'],['--setting-sources','project'],['--setting-sources=local']])
+def test_managed_settings_source_cannot_be_overridden(override):
+    with pytest.raises(ValueError,match='managed_settings_unverified'):
+        p.managed_claude_route_args({'provider':'claude','args':[]},[],['--model','opus',*override],managed={'model':'opus'})

@@ -644,7 +644,7 @@ class NativeLauncher:
 
     def managed_claude_readiness(self, release=None):
         """Exact installed release and actual profile code; no credential probe."""
-        if os.name != 'posix':
+        if sys.platform != 'linux':
             return None
         try:
             if release is None:

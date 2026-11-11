@@ -1690,7 +1690,7 @@ class ManagedClaudeHostTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'managed_exec_unavailable'):self.bridge.validate_launch(offer)
 
     def test_normal_heartbeat_rechecks_profile_readiness_without_restart_or_changing_base_caps(self):
-        self.configure();captured=[]
+        self.configure();captured=[];frames=[]
         self.client.heartbeat=lambda *args,**kw:captured.append(args)
         marker='managed:hub-claude:opus:medium:v1'
         self.bridge.launcher.managed_claude_readiness=lambda:None
@@ -1698,9 +1698,16 @@ class ManagedClaudeHostTests(unittest.TestCase):
         before=captured[-1][2];self.assertNotIn(marker,before)
         self.bridge.launcher.managed_claude_readiness=lambda:{'sha256':'a'*64}
         self.bridge.heartbeat([],include_native_sessions=False)
+        self.assertEqual(frames,[],'preconnect HTTP heartbeat owns no socket to bless')
+        from types import SimpleNamespace
+        socket=SimpleNamespace(send=lambda raw:frames.append(json.loads(raw)))
+        self.bridge._managed_socket=socket
+        self.bridge.publish_managed_readiness(socket)
+        self.assertEqual(frames[-1],{'type':'managed.claude.ready','protocol':'hub2-managed-claude-exec-v1','ready':True})
         self.assertIn(marker,captured[-1][2]);self.assertEqual(set(captured[-1][2])-{marker},set(before))
         self.bridge.launcher.managed_claude_readiness=lambda:None
         self.bridge.heartbeat([],include_native_sessions=False);self.assertNotIn(marker,captured[-1][2])
+        self.assertFalse(frames[-1]['ready'])
 
     def test_explicit_managed_attempt_uses_fixed_profile_without_global_private_home_or_replay(self):
         self.configure();offer=self.managed_offer()
