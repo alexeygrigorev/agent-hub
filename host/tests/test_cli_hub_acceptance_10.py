@@ -66,7 +66,10 @@ class Harness(unittest.TestCase):
         patcher = mock.patch.dict(os.environ, env)
         patcher.start()
         self.addCleanup(patcher.stop)
-        for name, val in (('CAPTURE_BUDGET_S', 0.5),):
+        # Fake CLI processes import the real command parser; their cold startup
+        # can exceed0.5s under the shared lane. Keep proof assertions unchanged
+        # with an offline budget well below the production90s capture budget.
+        for name, val in (('CAPTURE_BUDGET_S', 2),):
             p = mock.patch.object(acc, name, val)
             p.start()
             self.addCleanup(p.stop)
@@ -197,7 +200,7 @@ class AcceptanceTests(Harness):
                 self.assertAllStopped()
 
     def test_operator_bundle_must_not_change_during_acceptance(self):
-        original = acc.check_evidence
+        original = acc.checked_evidence
         calls = []
         def check(path, commit):
             calls.append(path)
@@ -206,10 +209,32 @@ class AcceptanceTests(Harness):
                 data['operator_validation']['actor'] = 'different-offline-validator'
                 Path(path).write_text(json.dumps(data))
             return original(path, commit)
-        with mock.patch.object(acc, 'check_evidence', side_effect=check):
+        with mock.patch.object(acc, 'checked_evidence', side_effect=check):
             rc, out = self.go()
         self.assertEqual(rc, 1, out)
         self.assertIn('evidence bundle changed during run', out)
+        self.assertAllStopped()
+
+    def test_replacement_after_validation_cannot_become_the_baseline_hash(self):
+        original = acc.validate_evidence
+        pins = {}
+        def validate_then_replace(data, path, commit):
+            problems = original(data, path, commit)
+            if not pins:
+                pins['validated'] = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                replacement = json.loads(Path(path).read_text())
+                replacement['operator_validation']['actor'] = 'replacement-after-prevalidation'
+                Path(path).write_text(json.dumps(replacement))
+                pins['replacement'] = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+            return problems
+        with mock.patch.object(acc, 'validate_evidence', side_effect=validate_then_replace):
+            rc, out = self.go()
+        self.assertEqual(rc, 1, out)
+        self.assertIn('evidence bundle changed during run', out)
+        summary = json.loads(out[out.index('{\n'):out.rindex('\nACCEPTANCE ')])
+        self.assertEqual(summary['evidence_sha256'], pins['validated'])
+        self.assertNotEqual(pins['validated'], pins['replacement'])
+        self.assertEqual(self.state()['n'], 10)
         self.assertAllStopped()
 
     def test_same_attempt_snapshot_must_not_change(self):
@@ -551,6 +576,15 @@ class ParserTests(unittest.TestCase):
             self.assertFalse(acc.probe_output_ok(json.dumps(event), prompt, marker), event)
         event = {'type': 'item.completed', 'item': {'type': 'command_execution', 'exit_code': False, 'aggregated_output': marker}}
         self.assertFalse(acc.probe_output_ok(json.dumps(event), prompt, marker))
+
+    def test_checked_evidence_hashes_the_single_validated_buffer(self):
+        path = evidence()
+        raw = Path(path).read_bytes()
+        with mock.patch.object(acc, 'bounded_file', return_value=raw) as read:
+            problems, digest = acc.checked_evidence(path, COMMIT)
+        self.assertEqual(problems, [])
+        self.assertEqual(digest, hashlib.sha256(raw).hexdigest())
+        read.assert_called_once_with(path, acc.EVIDENCE_LIMIT)
 
     def test_operator_validation_cannot_be_replaced_by_four_green_strings(self):
         path = Path(evidence())

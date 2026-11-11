@@ -51,8 +51,9 @@ nonsecret receipt bytes. Every reference, commit and SHA256 is required; `path`
 is optional. When supplied, a path is absolute or relative to the evidence file,
 and its bytes must match the SHA256. Files must be regular, single-link and not
 symlinks. Evidence is bounded to128000 bytes and each local receipt to2MiB.
-The bundle is checked before and after the run; its digest must remain unchanged
-and is included in the report.
+Each pre/post check validates and hashes the same bounded byte buffer, without
+reopening the file for its digest. The digest must remain unchanged and is
+included in the report.
 
 These fields explicitly record Root's validation. An actor string or hash does
 not authenticate a remote system, establish deployment provenance or verify a CI

@@ -114,19 +114,31 @@ def evidence_text(value, bound):
 
 
 def check_evidence(path, commit):
-    """Validate Root-supplied receipt pins, not remote-system authenticity.
+    """Compatibility view for callers interested only in validation errors."""
+    return checked_evidence(path, commit)[0]
 
-    Root independently checks actual deployment, canary and CI before supplying
-    this private bundle. Hashes bind optional local bytes, not their provenance.
-    Alerts are sampled live separately; this file can never prove zero alerts.
+
+def checked_evidence(path, commit):
+    """Validate and hash the SAME bounded byte buffer, never reopen for its pin.
+
+    Remote authenticity remains Root's responsibility. A concurrent replacement
+    cannot become the baseline unless those exact replacement bytes were read
+    and validated together on this invocation.
     """
-    problems = []
     if not path:
-        return ['evidence file missing (--evidence)']
+        return ['evidence file missing (--evidence)'], None
     try:
-        ev = json.loads(bounded_file(path, EVIDENCE_LIMIT), object_pairs_hook=unique_object)
-    except (OSError, ValueError, UnicodeError):
-        return ['evidence unreadable or invalid']
+        raw = bounded_file(path, EVIDENCE_LIMIT)
+        ev = json.loads(raw, object_pairs_hook=unique_object)
+    except (OSError, ValueError, UnicodeError, TypeError):
+        return ['evidence unreadable or invalid'], None
+    problems = validate_evidence(ev, path, commit)
+    return problems, hashlib.sha256(raw).hexdigest()
+
+
+def validate_evidence(ev, path, commit):
+    """Check the parsed Root-supplied receipt pins, not remote authenticity."""
+    problems = []
     if not isinstance(ev, dict):
         return ['evidence is not an object']
     if not isinstance(commit, str) or not re.fullmatch(r'[0-9a-f]{40}', commit):
@@ -612,12 +624,8 @@ def summarize(recs, evidence_problems):
 def run(r, evidence_path, commit, clock=time.monotonic, sleep=time.sleep, out=sys.stdout,
         intake=None, synthetic_ac=False, workspace=None):
     window = {'start': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
-    problems = list(check_evidence(evidence_path, commit))
-    evidence_digest = None
-    try:
-        evidence_digest = hashlib.sha256(bounded_file(evidence_path, EVIDENCE_LIMIT)).hexdigest()
-    except (OSError, ValueError, TypeError):
-        problems.append('evidence receipt bytes unavailable')
+    evidence_problems, evidence_digest = checked_evidence(evidence_path, commit)
+    problems = list(evidence_problems)
     if not isinstance(workspace, str) or not workspace.startswith('/') or '\x00' in workspace:
         problems.append('explicit absolute --cwd workspace required')
     if not intake and not synthetic_ac:
@@ -665,12 +673,10 @@ def run(r, evidence_path, commit, clock=time.monotonic, sleep=time.sleep, out=sy
             if rec.get('cleanup_uncertain'):
                 rec['errors'].append('cleanup uncertain: could not determine whether start was accepted; original key ' + rec['key'])
     window['end'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-    post_problems = list(check_evidence(evidence_path, commit))
-    try:
-        if hashlib.sha256(bounded_file(evidence_path, EVIDENCE_LIMIT)).hexdigest() != evidence_digest:
-            post_problems.append('operator-validated evidence bundle changed during run')
-    except (OSError, ValueError, TypeError):
-        post_problems.append('post-run evidence receipt bytes unavailable')
+    evidence_problems, post_digest = checked_evidence(evidence_path, commit)
+    post_problems = list(evidence_problems)
+    if post_digest != evidence_digest:
+        post_problems.append('operator-validated evidence bundle changed during run')
     after = None
     post_cutoff_ms = int(time.time() * 1000)
     try:
