@@ -125,24 +125,30 @@ def fsync_dir(path):
 
 
 def ensure_private_dir(path, *, stage="lock", prefix="state_dir"):
-    target = pathlib.Path(path)
-    try:
-        st = os.lstat(target)
-    except FileNotFoundError:
-        missing = []
-        cur = target
-        while True:
-            try:
-                os.lstat(cur)
-                break
-            except FileNotFoundError:
-                missing.append(cur)
-                parent = cur.parent
-                if parent == cur:
-                    break
-                cur = parent
-            except OSError:
+    target = pathlib.Path(os.path.abspath(path))
+    missing = []
+    seen_existing = False
+    cur = target
+    while True:
+        try:
+            cst = os.lstat(cur)
+        except FileNotFoundError:
+            if seen_existing:
                 raise StageFailure(stage, f"{prefix}_stat_failed")
+            missing.append(cur)
+        except OSError:
+            raise StageFailure(stage, f"{prefix}_stat_failed")
+        else:
+            if stat.S_ISLNK(cst.st_mode):
+                raise StageFailure(stage, f"{prefix}_symlink")
+            if not stat.S_ISDIR(cst.st_mode):
+                raise StageFailure(stage, f"{prefix}_not_directory")
+            seen_existing = True
+        parent = cur.parent
+        if parent == cur:
+            break
+        cur = parent
+    if missing:
         try:
             for directory in reversed(missing):
                 mode = 0o700 if directory == target else 0o755
@@ -150,9 +156,10 @@ def ensure_private_dir(path, *, stage="lock", prefix="state_dir"):
                 fsync_dir(directory)
                 if directory.parent != directory:
                     fsync_dir(directory.parent)
-            st = os.lstat(target)
         except OSError:
             raise StageFailure(stage, f"{prefix}_create_failed")
+    try:
+        st = os.lstat(target)
     except OSError:
         raise StageFailure(stage, f"{prefix}_stat_failed")
     if stat.S_ISLNK(st.st_mode):
@@ -164,20 +171,24 @@ def ensure_private_dir(path, *, stage="lock", prefix="state_dir"):
     if (st.st_mode & 0o077) != 0:
         raise StageFailure(stage, f"{prefix}_not_private")
     try:
-        home = pathlib.Path.home()
+        home = pathlib.Path(os.path.abspath(pathlib.Path.home()))
         chain = [target]
         cur = target
         while cur.parent != cur and cur != home:
             parent = cur.parent
             pst = os.lstat(parent)
-            if stat.S_ISLNK(pst.st_mode) or not stat.S_ISDIR(pst.st_mode):
-                break
+            if stat.S_ISLNK(pst.st_mode):
+                raise StageFailure(stage, f"{prefix}_symlink")
+            if not stat.S_ISDIR(pst.st_mode):
+                raise StageFailure(stage, f"{prefix}_not_directory")
             chain.append(parent)
             if pst.st_uid != os.geteuid() or parent == home:
                 break
             cur = parent
         for directory in reversed(chain):
             fsync_dir(directory)
+    except StageFailure:
+        raise
     except OSError:
         raise StageFailure(stage, f"{prefix}_create_failed")
     return target
@@ -1159,8 +1170,9 @@ def send_mail(subject, body):
 
 def record_dev_alert_occurrence(sdir, mode, result, state, *, decision):
     """Reserved integration hook for the finite Hub dev@ occurrence counter
-    (dev_alert_occurrences_v1; invoked before dedup/SMTP on alert decisions,
-    including deduplicated failures and recovery).
+    (dev_alert_occurrences_v1; invoked before dedup/SMTP on alert decisions:
+    critical/critical_dedup/recovery increment cumulative occurrences, while
+    pass/recovering/failure_below_threshold update observation coverage only).
     """
     _ = (sdir, mode, result, state, decision)
 
