@@ -1,3 +1,4 @@
+import {MachineNativeCommands,NATIVE_COMMAND_SCHEMA} from './machine-native-commands';
 import {MachineNativeInventory, NATIVE_INVENTORY_SCHEMA} from './machine-native-inventory';
 import { nativeReturncode } from './native-exit';
 import { normalizeStartPickerEvidence } from './start-picker-evidence';
@@ -129,6 +130,7 @@ export class MachineDO {
   private readonly constructorMs: number;
   private readonly ready:Promise<void>;
   private readonly nativeInventory:MachineNativeInventory;
+  private readonly nativeCommands:MachineNativeCommands;
 
   constructor(private readonly ctx: DurableObjectState, env: Hub2Env) {
     const started = performance.now();
@@ -136,11 +138,12 @@ export class MachineDO {
     this.sqlReceipts = new SqlReceiptMeter(this.db);
     this.env = wrapSqlNamespaces(env, this.sqlReceipts) as Hub2Env;
     this.nativeInventory=new MachineNativeInventory(this.db,ctx);
-    this.ready=initializeSchema(ctx, this.db, 8, LATEST_SCHEMA, [[SCHEMA[0]],COMPACT_KEYS,['ALTER TABLE machine_capabilities ADD COLUMN resources_json TEXT'],MACHINE_ACTIVE_MIGRATION,[
+    this.nativeCommands=new MachineNativeCommands(this.db,ctx,this.nativeInventory);
+    this.ready=initializeSchema(ctx, this.db, 9, LATEST_SCHEMA, [[SCHEMA[0]],COMPACT_KEYS,['ALTER TABLE machine_capabilities ADD COLUMN resources_json TEXT'],MACHINE_ACTIVE_MIGRATION,[
       'CREATE TABLE IF NOT EXISTS machine_liveness(singleton INTEGER PRIMARY KEY CHECK(singleton=1),observed_at INTEGER NOT NULL)',
       'CREATE TABLE IF NOT EXISTS native_sessions(session_id TEXT PRIMARY KEY,native_id TEXT,phase TEXT NOT NULL,last_activity_at INTEGER,exit_code INTEGER,containment_empty INTEGER NOT NULL,observed_at INTEGER NOT NULL) WITHOUT ROWID',
       'DROP TABLE IF EXISTS machine_active','ALTER TABLE machine_capabilities DROP COLUMN resources_json','ALTER TABLE machines DROP COLUMN active_session_id',
-    ],['ALTER TABLE session_commands ADD COLUMN capture_mode TEXT'],NATIVE_INVENTORY_SCHEMA],()=>this.scheduleNext(),6,schemaMigrationCeiling(env.HUB2_SCHEMA_MIGRATIONS,7,8));
+    ],['ALTER TABLE session_commands ADD COLUMN capture_mode TEXT'],NATIVE_INVENTORY_SCHEMA,NATIVE_COMMAND_SCHEMA],()=>this.scheduleNext(),6,schemaMigrationCeiling(env.HUB2_SCHEMA_MIGRATIONS,8,9));
     this.constructorMs = performance.now() - started;
   }
 
@@ -179,6 +182,16 @@ export class MachineDO {
         if (this.db.schemaVersion<8) return error('inventory_schema_pending',503);
         return json(await this.nativeInventory.receive(await bodyObject(request,65_536)));
       }
+      const nativeCommand=url.pathname.match(/^\/api\/native\/([^/]+)\/commands(?:\/([^/]+)(\/ack)?)?$/);
+      if(nativeCommand){
+        const response=await this.nativeCommands.handle(request,nativeCommand[1],nativeCommand[2],!!nativeCommand[3]);
+        if(response.ok&&request.method==='POST'){
+          await this.scheduleNext();
+          const machine=this.db.one<MachineRow>('SELECT * FROM machines LIMIT 1');
+          if(machine)await this.notifyPendingCommands(machine.machine_id);
+        }
+        return response;
+      }
       if (url.pathname === '/api/offers' && request.method === 'GET') return this.offers(request);
       if (url.pathname === '/api/sessions' && request.method === 'GET') return this.sessionList(request);
       const sessionView = url.pathname.match(/^\/api\/sessions\/([^/]+)$/);
@@ -209,6 +222,7 @@ export class MachineDO {
   async alarm(): Promise<void> {
     await this.ready;
     const now = Date.now();
+    this.nativeCommands.expire(now);
     const expired = this.db.all<SessionRow>(
       "SELECT * FROM sessions WHERE state IN ('staged','offered','claimed') AND native_id IS NULL AND created_at<=? ORDER BY created_at,id LIMIT 100",
       now-CLAIMED_WITHOUT_NATIVE_GRACE_MS);
@@ -902,15 +916,17 @@ export class MachineDO {
     const pending=this.alarmQueue.catch(()=>{}).then(async()=>{
     this.db.alarmOperation();
     const current = await this.ctx.storage.getAlarm();
+    const nativeDue=this.db.schemaVersion>=9?this.db.one<{due:number|null}>("SELECT MIN(deadline_ms) AS due FROM native_commands WHERE state='pending'")?.due:null;
     const next = this.db.one<{ due: number | null }>(`SELECT MIN(due) AS due FROM (
       SELECT MIN(offer_expires_at) AS due FROM sessions WHERE state='offered' AND offer_expires_at IS NOT NULL AND NOT EXISTS(SELECT 1 FROM machine_outbox b WHERE b.id='expiry:'||sessions.id||':'||sessions.epoch AND b.state='pending')
       UNION ALL SELECT MIN(created_at+?) AS due FROM sessions WHERE state IN ('staged','offered','claimed') AND native_id IS NULL
       UNION ALL SELECT MIN(MAX(updated_at,COALESCE((SELECT observed_at FROM machine_liveness WHERE singleton=1),0))+?) AS due
         FROM sessions WHERE state='running' AND native_id IS NOT NULL
       UNION ALL SELECT MIN(created_at+60000) AS due FROM session_commands WHERE kind='stop' AND state='pending'
+      UNION ALL SELECT ? AS due
       UNION ALL SELECT MIN(next_action_at) AS due FROM machine_outbox WHERE state='pending'
       UNION ALL SELECT ? AS due WHERE EXISTS(SELECT 1 FROM sessions WHERE state IN ('claimed','running'))
-    )`,CLAIMED_WITHOUT_NATIVE_GRACE_MS,HOST_INVENTORY_LOST_MS,Date.now()+SESSION_REAP_INTERVAL_MS);
+    )`,CLAIMED_WITHOUT_NATIVE_GRACE_MS,HOST_INVENTORY_LOST_MS,nativeDue??null,Date.now()+SESSION_REAP_INTERVAL_MS);
     if (next?.due !== null && next?.due !== undefined) {
       if (current !== next.due) { this.db.alarmOperation(); await this.ctx.storage.setAlarm(next.due); }
     } else if (current !== null) {
@@ -1065,6 +1081,12 @@ export class MachineDO {
         ))
       ) ${stop?"AND c.kind='stop'":''}
       ORDER BY CASE WHEN c.kind='stop' THEN 0 ELSE 1 END,c.created_at,c.id LIMIT 1`,machineId);
+    if(!stop){
+      const native=this.nativeCommands.next();
+      if(native&&await this.authorizedAttachment(socket,'machine:offer',true,env)){
+        try{socket.send(JSON.stringify({type:'session.command',command:native}));}catch{}
+      }
+    }
     if(!command)return;
     if(!await this.authorizedAttachment(socket,'machine:offer',true,env))return;
     try{

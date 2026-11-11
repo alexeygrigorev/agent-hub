@@ -1022,3 +1022,114 @@ class ResourceHeartbeatLoopTest(unittest.TestCase):
     def test_interval_is_well_inside_the_hub_staleness_window(self):
         from agent_hub_host.agent import LIVE_SESSION_HEARTBEAT_SECONDS
         self.assertLessEqual(LIVE_SESSION_HEARTBEAT_SECONDS * 4, 300)
+
+class NativeControlTests(unittest.TestCase):
+    setUp = HostTests.setUp
+    tearDown = HostTests.tearDown
+
+    def command(self, kind='stop', **changes):
+        native = '11111111-1111-4111-8111-111111111111'
+        self.native.process = {'id': native, 'tag': 'unmanaged', 'workspace': str(self.root),
+                               'phase': 'running', 'schema_version': 1}
+        return {'id': '22222222-2222-4222-8222-222222222222', 'target_kind': 'native',
+                'protocol': 1, 'machine_id': 'machine-1', 'native_id': native, 'kind': kind,
+                'identity': {'id': native, 'tag': 'unmanaged', 'workspace': str(self.root)},
+                'deadline_ms': round(time.time()*1000)+60000, **changes}
+
+    def test_stop_positive_exit_replays_after_lost_ack_without_second_kill(self):
+        command = self.command()
+        result = self.bridge.command(command)
+        self.assertTrue(result['stopped'])
+        self.assertEqual(result['evidence']['native_id'], command['native_id'])
+        self.assertTrue(result['evidence']['containment_empty'])
+        self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM launches').fetchone()[0], 0)
+        self.client.fail = True
+        with self.assertRaises(ApiError):
+            self.journal.flush(self.client)
+        self.assertEqual(self.bridge.command(command), result)
+        self.assertEqual(sum(args[1] == 'kill' for args, _ in self.native.calls), 1)
+        self.client.fail = False
+        self.journal.flush(self.client)
+        path = self.client.calls[-1][1]
+        self.assertEqual(path, f"/api/machines/machine-1/native/{command['native_id']}/commands/{command['id']}/ack")
+        self.assertNotIn('/api/sessions/', path)
+
+    def test_unknown_uuid_and_wrong_workspace_never_kill(self):
+        for case in ['absent', 'wrong-workspace', 'wrong-tag', 'wrong-uuid']:
+            command = self.command(id='33333333-3333-4333-8333-33333333333' + str(len(self.native.calls) % 10))
+            if case == 'absent':
+                self.native.process = None
+            elif case == 'wrong-workspace':
+                self.native.process['workspace'] = '/unrelated-workspace'
+            elif case == 'wrong-tag':
+                self.native.process['tag'] = 'other'
+            else:
+                self.native.process['id'] = '44444444-4444-4444-8444-444444444444'
+            result = self.bridge.command(command)
+            self.assertIn('error', result)
+        self.assertFalse(any(args[1] == 'kill' for args, _ in self.native.calls))
+
+    def test_no_containment_proof_is_unconfirmed_not_stopped(self):
+        command = self.command()
+        original = self.native.__call__
+        def runner(args, **kw):
+            if args[1] == 'kill':
+                return subprocess.CompletedProcess(args, 0, '', '')
+            return original(args, **kw)
+        self.bridge.launcher.runner = runner
+        result = self.bridge.command(command)
+        self.assertFalse(result['stopped'])
+        self.assertEqual(result['error'], 'stop_unconfirmed')
+
+    def test_capture_sanitized_bounded_and_does_not_create_managed_launch(self):
+        command = self.command('capture', mode='screen')
+        original = self.native.__call__
+        def runner(args, **kw):
+            if args[1] == 'capture':
+                self.native.calls.append((args, kw))
+                return subprocess.CompletedProcess(args, 0, '\x1b[31mhello\x00\x07\n' + 'é'*5000, '')
+            return original(args, **kw)
+        self.bridge.launcher.runner = runner
+        result = self.bridge.command(command)
+        self.assertLessEqual(len(result['output'].encode()), 4096)
+        self.assertTrue(result['output'].startswith('hello\n'))
+        self.assertNotIn('\x1b', result['output'])
+        self.assertIn('--screen', self.native.calls[-1][0])
+        self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM launches').fetchone()[0], 0)
+
+    def test_send_expiry_and_managed_native_have_no_native_effect(self):
+        for kind, extra, reason in [('send', {}, 'native_send_unsupported_safe_input'),
+                                    ('stop', {'deadline_ms': 1}, 'native_command_deadline')]:
+            command = self.command(kind, **extra)
+            result = self.bridge.command(command)
+            self.assertEqual(result['error'], reason)
+            self.journal.db.execute('DELETE FROM commands')
+        command = self.command()
+        self.journal.db.execute("INSERT INTO launches(operation_id,session_id,epoch,digest,workspace,tag,native_id,state) VALUES('op','managed',1,'digest',?,?,?,'running')", (str(self.root), 'managed', command['native_id']))
+        result = self.bridge.command(command)
+        self.assertEqual(result['error'], 'native_target_managed')
+        self.assertEqual(self.native.calls, [])
+
+    def test_executing_receipt_after_restart_is_uncertain_without_redispatch(self):
+        command = self.command()
+        from agent_hub_host.native_launch import canonical
+        digest = hashlib.sha256(canonical(command).encode()).hexdigest()
+        with self.journal.db:
+            self.bridge.begin_command(command['id'], digest)
+        self.journal.db.close()
+        self.journal = Journal(self.root / 'private/journal.sqlite')
+        self.bridge.journal = self.journal
+        result = self.bridge.command(command)
+        self.assertEqual(result['error'], 'native_command_outcome_uncertain')
+        self.assertEqual(self.native.calls, [])
+        self.assertEqual(self.bridge.command(command), result)
+
+    def test_machine_and_command_digest_identity_fences(self):
+        command = self.command(machine_id='other-host')
+        with self.assertRaisesRegex(ValueError, 'invalid_native_command'):
+            self.bridge.command(command)
+        command = self.command('capture')
+        self.bridge.command(command)
+        with self.assertRaisesRegex(ValueError, 'command_id_conflict'):
+            self.bridge.command({**command, 'kind': 'stop'})
+        self.assertFalse(any(args[1] == 'kill' for args, _ in self.native.calls))

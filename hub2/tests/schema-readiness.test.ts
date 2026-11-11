@@ -59,18 +59,18 @@ test('real legacy Control and Machine constructors defer, apply and reopen upgra
   const classes={CONTROL:ControlDO,MACHINES:MachineDO} as any;
   try{
     assert.equal(await probeSchemaReadiness({classes,env:{HUB2_SCHEMA_MIGRATIONS:'defer'},dataDir:dir}),2);
-    assert.equal(inspect(control).version,4);assert.equal(inspect(machine).version,7);
+    assert.equal(inspect(control).version,4);assert.equal(inspect(machine).version,8);
     assert.equal(await probeSchemaReadiness({classes,env:{HUB2_SCHEMA_MIGRATIONS:'apply'},dataDir:dir}),2);
-    assert.equal(inspect(control).version,6);assert.equal(inspect(machine).version,8);
+    assert.equal(inspect(control).version,6);assert.equal(inspect(machine).version,9);
     const db=new DatabaseSync(control);db.exec("INSERT INTO retained VALUES('after-upgrade','concurrent write')");db.close();
     const before=inspect(control).rows;
     const newControl=pathFor(dir,'CONTROL','new-object'),newMachine=pathFor(dir,'MACHINES','new-host');
     seed(newControl);seed(newMachine);
     assert.equal(await probeSchemaReadiness({classes,env:{HUB2_SCHEMA_MIGRATIONS:'defer'},dataDir:dir}),4);
-    assert.deepEqual(inspect(control).rows,before);assert.equal(inspect(machine).version,8);
-    assert.equal(inspect(newControl).version,4);assert.equal(inspect(newMachine).version,7);
+    assert.deepEqual(inspect(control).rows,before);assert.equal(inspect(machine).version,9);
+    assert.equal(inspect(newControl).version,4);assert.equal(inspect(newMachine).version,8);
     assert.equal(await probeSchemaReadiness({classes,env:{HUB2_SCHEMA_MIGRATIONS:'apply'},dataDir:dir}),4);
-    assert.equal(inspect(newControl).version,6);assert.equal(inspect(newMachine).version,8);
+    assert.equal(inspect(newControl).version,6);assert.equal(inspect(newMachine).version,9);
     const check=new DatabaseSync(control);
     assert.equal(check.prepare("SELECT name FROM sqlite_master WHERE name='hub2_identity'").all().length,0);check.close();
   }finally{rmSync(dir,{recursive:true});}
@@ -210,18 +210,18 @@ test('real MachineDO readiness accepts pending stop commands overdue by more tha
   const staleCreatedAt=Date.now()-36*3600_000;
   try{
     assert.equal(await probeSchemaReadiness({classes,env:{HUB2_SCHEMA_MIGRATIONS:'defer'},dataDir:dir}),1);
-    assert.equal(inspect(machine).version,7);
+    assert.equal(inspect(machine).version,8);
     const db=new DatabaseSync(machine);
     db.prepare(`INSERT INTO session_commands(id,session_id,machine_id,epoch,request_key,request_digest,kind,text,state,result_json,created_at,updated_at)
       VALUES('cmd-stale-stop','sess-stale','hetzner-aplexer',1,'stop-1','digest-1','stop',NULL,'pending',NULL,?,?)`).run(staleCreatedAt,staleCreatedAt);
     db.close();
     assert.equal(await probeSchemaReadiness({classes,env:{HUB2_SCHEMA_MIGRATIONS:'defer'},dataDir:dir}),1);
-    assert.equal(inspect(machine).version,7);
+    assert.equal(inspect(machine).version,8);
     const afterDefer=new DatabaseSync(machine);
     assert.equal((afterDefer.prepare('SELECT due FROM hub2_alarm WHERE singleton=1').get() as any)?.due,staleCreatedAt+60_000);
     afterDefer.close();
     assert.equal(await probeSchemaReadiness({classes,env:{HUB2_SCHEMA_MIGRATIONS:'apply'},dataDir:dir}),1);
-    assert.equal(inspect(machine).version,8);
+    assert.equal(inspect(machine).version,9);
 
     const sql=new NodeSqlStorage(join(dir,'alarm-bounds.sqlite'));
     const storage=new NodeDurableStorage(sql);

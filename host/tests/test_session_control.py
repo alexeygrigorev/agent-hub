@@ -1065,3 +1065,49 @@ class TestSessionControlCli(unittest.TestCase):
 if __name__ == '__main__':
     unittest.main()
 
+
+class TestNativeControlCli(unittest.TestCase):
+    native = 'native:host-one:11111111-1111-4111-8111-111111111111'
+    command = '22222222-2222-4222-8222-222222222222'
+    path = '/api/machines/host-one/native/11111111-1111-4111-8111-111111111111/commands'
+
+    def parse(self, *args):
+        return parser().parse_args(['sessions', *args])
+
+    def test_exact_native_capture_route_and_receipt_poll(self):
+        receipt = {'command': {'id': self.command, 'target_kind': 'native'}, 'command_id': self.command}
+        entry = {'id': self.command, 'state': 'acked', 'ack': {'capture': 'safe output'}}
+        with patch.object(session_control, 'request', side_effect=[receipt, {'command': entry}]) as call:
+            result = session_control.execute(self.parse('capture', self.native, '--screen', '--key', 'capture-one'))
+        self.assertEqual(call.call_args_list[0].args, ('POST', self.path, {'kind': 'capture', 'key': 'capture-one', 'mode': 'screen'}))
+        self.assertEqual(call.call_args_list[1].args, ('GET', self.path + '/' + self.command))
+        self.assertEqual(result['command_wait']['ack']['capture'], 'safe output')
+
+    def test_native_stop_wait_uses_exact_receipt_not_synthetic_session(self):
+        receipt = {'command': {'id': self.command, 'target_kind': 'native'}}
+        entry = {'id': self.command, 'state': 'acked', 'ack': {'confirmed_exit': True}}
+        with patch.object(session_control, 'request', side_effect=[receipt, {'command': entry}]) as call:
+            result = session_control.execute(self.parse('stop', self.native, '--key', 'stop-one'))
+        self.assertEqual(result['stop_wait'], entry)
+        self.assertEqual(call.call_count, 2)
+        self.assertTrue(all('/api/sessions/' not in c.args[1] for c in call.call_args_list))
+
+    def test_native_send_and_invalid_composite_never_call_api(self):
+        with patch.object(session_control, 'request') as call:
+            with self.assertRaisesRegex(ValueError, 'native_send_unsupported_safe_input'):
+                session_control.execute(self.parse('send', self.native, '--prompt', 'do not paste'))
+            with self.assertRaisesRegex(ValueError, 'invalid_native_target'):
+                session_control.execute(self.parse('stop', 'native:host-one:tag-ambiguous'))
+        call.assert_not_called()
+
+    def test_native_unconfirmed_stop_is_not_success(self):
+        receipt = {'command': {'id': self.command, 'target_kind': 'native'}}
+        entry = {'id': self.command, 'state': 'failed', 'ack': {'confirmed_exit': False, 'error': 'stop_unconfirmed'}}
+        with patch.object(session_control, 'request', side_effect=[receipt, {'command': entry}]):
+            with self.assertRaisesRegex(ValueError, 'stop_unconfirmed'):
+                session_control.execute(self.parse('stop', self.native))
+
+    def test_native_commands_listing_uses_machine_uuid_route(self):
+        with patch.object(session_control, 'request', return_value={'commands': []}) as call:
+            session_control.execute(self.parse('commands', self.native))
+        call.assert_called_once_with('GET', self.path)

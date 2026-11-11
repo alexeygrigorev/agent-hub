@@ -462,6 +462,68 @@ class NativeLauncher:
             return None
         return row if isinstance(row, dict) else None
 
+    def native_control(self, command):
+        """Exact UUID only. Missing registry rows never prove native exit."""
+        kind, native_id, expected = command['kind'], command['native_id'], command['identity']
+        deadline = command['deadline_ms']
+        def remaining():
+            seconds = (deadline - time.time() * 1000) / 1000
+            if seconds <= 0:
+                raise RuntimeError('native_command_deadline')
+            return min(seconds, 10)
+        def proof(row, source):
+            if (row and row.get('id') == native_id and row.get('tag') == expected['tag']
+                    and row.get('phase', row.get('state')) == 'exited'
+                    and row.get('containment_empty') is True and native_returncode(row.get('exit')) is not None
+                    and type(row['exit'].get('exited_at_ms')) is int and row['exit']['exited_at_ms'] > 0
+                    and row['exit']['exited_at_ms'] <= time.time()*1000+30000):
+                return {'stopped': True, 'evidence': {'source': source, 'native_id': native_id,
+                    'tag': expected['tag'], 'workspace': expected['workspace'], 'phase': 'exited',
+                    'containment_empty': True, 'exit': {k: row['exit'][k] for k in ('code', 'signal', 'exited_at_ms') if k in row['exit']},
+                    'observed_at_ms': round(time.time()*1000)}}
+            return None
+        remaining()
+        if kind == 'stop':
+            retired = self.retired(native_id, expected)
+            if retired:
+                return proof(retired, 'aplexer_retirement') or {'stopped': False, 'error': 'stop_unconfirmed'}
+        # A missing/deleted workspace permits only positive tombstone proof.
+        if not Path(expected['workspace']).is_dir():
+            raise RuntimeError('native_target_workspace_unavailable')
+        def status():
+            result = self.native('status', native_id, '--json', allow_failure=True, timeout=remaining())
+            if result.returncode:
+                return None
+            try:
+                row = json.loads(result.stdout)
+            except ValueError:
+                return None
+            if (not isinstance(row, dict) or row.get('id') != native_id or row.get('tag') != expected['tag']
+                    or not same_workspace(row.get('workspace'), expected['workspace'])):
+                raise RuntimeError('native_target_identity_mismatch')
+            return row
+        row = status()
+        if row is None:
+            raise RuntimeError('native_target_unavailable')
+        if kind == 'stop':
+            result = proof(row, 'aplexer_status')
+            if result:
+                return result
+            self.native('kill', native_id, timeout=remaining())
+            retired = self.retired(native_id, expected)
+            if retired:
+                return proof(retired, 'aplexer_retirement') or {'stopped': False, 'error': 'stop_unconfirmed'}
+            result = proof(status(), 'aplexer_status')
+            return result or {'stopped': False, 'error': 'stop_unconfirmed'}
+        if kind != 'capture':
+            raise RuntimeError('native_send_unsupported_safe_input')
+        args = ('--screen', '--plain') if command.get('mode') == 'screen' else ('--bytes', '4096')
+        raw = self.native('capture', native_id, *args, timeout=remaining()).stdout
+        # Operator-only bounded output. Strip terminal controls, not just ANSI colour.
+        raw = re.sub(r'\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))', '', raw)
+        clean = ''.join(c for c in raw if c in '\n\t' or ord(c) >= 32 and not 127 <= ord(c) <= 159)
+        return {'output': clean.encode('utf8')[:4096].decode('utf8', errors='ignore')}
+
     def capabilities(self):
         result = {"shell": {"headless"}}
         for engine, route in self.config.get("routes", {}).items():

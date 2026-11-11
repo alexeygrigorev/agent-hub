@@ -421,12 +421,27 @@ def wait_until(deadline, interval, fetch, done, label):
                    if _request_deadline.get() is not None else interval)
 
 
+def _native_command_path(reference):
+    if not isinstance(reference, str) or not reference.startswith('native:'):
+        return None
+    match = re.fullmatch(r'native:([A-Za-z0-9_.-]{1,80}):([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', reference)
+    if not match:
+        raise SessionInputError('invalid_native_target; use the exact machine and UUID from sessions list')
+    return '/api/machines/' + match[1] + '/native/' + match[2] + '/commands'
+
+
 def _fetch_command_entry(session_id, command_id):
     """Fetch ONE command entry (bounded cursor walk, no polling).
 
     Raises ValueError when the command is missing from the server listing;
     callers reconcile via commands listing instead of blind-retrying.
     """
+    native = _native_command_path(session_id)
+    if native:
+        result = request('GET', native + '/' + command_id)
+        if not isinstance(result.get('command'), dict) or result['command'].get('id') != command_id:
+            raise SessionInputError('invalid_native_command_receipt')
+        return result['command']
     from urllib.parse import quote
     cursor = None
     for _ in range(10):
@@ -1165,7 +1180,7 @@ def _execute(args):
             list(pool.map(capture_warning, result.get('warnings', [])))
         return result
     if cmd == 'commands':
-        return request('GET', '/api/sessions/' + args.id + '/commands')
+        return request('GET', _native_command_path(args.id) or '/api/sessions/' + args.id + '/commands')
     if cmd in ('start', 'override'):
         engine = getattr(args, 'engine', None)
         model = getattr(args, 'model', None)
@@ -1286,6 +1301,36 @@ def _execute(args):
         if not isinstance(args.key, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}', args.key):
             raise ValueError('Invalid protection key' if cmd == 'protect' else 'Invalid cancellation key')
         return request('POST', '/api/sessions/' + quote(args.id, safe='') + '/' + cmd, {'key': args.key})
+    if cmd in ('send', 'capture', 'stop') and _native_command_path(args.id):
+        native = _native_command_path(args.id)
+        if cmd == 'send':
+            raise SessionInputError('native_send_unsupported_safe_input; native input safety is not verified')
+        timeout, interval = check_wait_args(args)
+        key = getattr(args, 'key', None) or str(uuid.uuid4())
+        payload = {'kind': cmd, 'key': key}
+        if cmd == 'capture' and getattr(args, 'screen', False):
+            payload['mode'] = 'screen'
+        def enqueue_native():
+            return request('POST', native, payload)
+        try:
+            queued = api.replay_keyed(enqueue_native, hub_unavailable, delays=replay_delays(), notify=replay_notice)
+        except ValueError as exc:
+            raise SessionInputError(f'{exc}; reconcile with --key {key} via commands') from None
+        command = queued.get('command')
+        if (not isinstance(command, dict) or not isinstance(command.get('id'), str)
+                or not re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', command['id']) or command.get('target_kind') != 'native'):
+            raise SessionInputError(f'invalid_native_command_receipt; reconcile with --key {key} via commands')
+        queued = dict(queued, client_key=key, command_id=command['id'])
+        if timeout is not None:
+            entry = wait_for_command(args.id, command['id'], timeout, interval)
+            ack = entry.get('ack') or {}
+            if entry.get('state') != 'acked' or cmd == 'stop' and ack.get('confirmed_exit') is not True:
+                reason = ack.get('error')
+                if not isinstance(reason, str) or not SAFE_ERROR.fullmatch(reason):
+                    reason = 'native_command_unconfirmed'
+                raise SessionInputError(f'{reason}; command {command["id"]}; reconcile with commands')
+            queued['command_wait' if cmd == 'capture' else 'stop_wait'] = entry
+        return queued
     if cmd in ('send', 'capture', 'stop'):
         timeout, interval = check_wait_args(args)
         key = getattr(args, 'key', None) or str(uuid.uuid4())

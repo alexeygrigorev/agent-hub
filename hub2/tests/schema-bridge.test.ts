@@ -55,7 +55,7 @@ async function running(f:ReturnType<typeof fixture>){
 }
 test('first bridge keeps legacy capture contract; upgraded bridge preserves screen commands, replay, outbox and alarms',async()=>{
  const bridge=fixture('machine');await running(bridge);
- bridge.database.exec('ALTER TABLE session_commands DROP COLUMN capture_mode; UPDATE hub2_schema SET version=6');
+ bridge.database.exec('DROP TABLE native_inventory_meta; DROP TABLE native_inventory_rows; DROP TABLE native_inventory_upload; DROP TABLE native_inventory_chunks; ALTER TABLE session_commands DROP COLUMN capture_mode; UPDATE hub2_schema SET version=6');
  (bridge.instance as any).db.schemaVersion=6;assert.equal(version(bridge),6);
  assert.equal((await bridge.call('/api/sessions/bridge-session/capture','POST',{key:'screen-deferred',mode:'screen'})).status,503);
  assert.equal(bridge.database.prepare('SELECT * FROM session_commands').all().length,0);
@@ -72,7 +72,7 @@ test('first bridge keeps legacy capture contract; upgraded bridge preserves scre
  await bridge.ctx.storage.setAlarm(due);
  const outboxes=bridge.database.prepare('SELECT * FROM machine_outbox').all();
  const applied=fixture('machine','apply',bridge);
- assert.equal((await applied.call('/api/sessions/bridge-session/commands')).status,200);assert.equal(version(applied),8);
+ assert.equal((await applied.call('/api/sessions/bridge-session/commands')).status,200);assert.equal(version(applied),9);
  const row=applied.database.prepare('SELECT * FROM session_commands WHERE id=?').get(command.id) as any;
  assert.equal(row.capture_mode,null);assert.equal(row.text,null);assert.equal(row.request_digest,old.request_digest);
  const replay=await applied.call('/api/sessions/bridge-session/capture','POST',{key:'capture-before-upgrade'});
@@ -82,14 +82,14 @@ test('first bridge keeps legacy capture contract; upgraded bridge preserves scre
  const rollback=fixture('machine','defer',applied);
  const listed=await rollback.call('/api/sessions/bridge-session/commands');assert.equal(listed.status,200);assert.equal((await data(listed)).commands.length,2);
  assert.equal(await rollback.ctx.storage.getAlarm(),due);
- assert.equal(version(rollback),8);assert.deepEqual(rollback.database.prepare('SELECT * FROM machine_outbox').all(),outboxes);
+ assert.equal(version(rollback),9);assert.deepEqual(rollback.database.prepare('SELECT * FROM machine_outbox').all(),outboxes);
  const commands=rollback.database.prepare('SELECT * FROM session_commands').all();
  const again=fixture('machine','apply',rollback);assert.equal((await again.call('/api/sessions/bridge-session')).status,200);
  assert.deepEqual(again.database.prepare('SELECT * FROM session_commands').all(),commands);
 });
 test('a bound stop survives the schema-six to schema-seven bridge with its dispatch evidence',async()=>{
  const bridge=fixture('machine'),epoch=await running(bridge);
- bridge.database.exec('ALTER TABLE session_commands DROP COLUMN capture_mode; UPDATE hub2_schema SET version=6');(bridge.instance as any).db.schemaVersion=6;
+ bridge.database.exec('DROP TABLE native_inventory_meta; DROP TABLE native_inventory_rows; DROP TABLE native_inventory_upload; DROP TABLE native_inventory_chunks; ALTER TABLE session_commands DROP COLUMN capture_mode; UPDATE hub2_schema SET version=6');(bridge.instance as any).db.schemaVersion=6;
  const machine={id:'machine:h1',kind:'machine',resource_id:'h1',generation:'1',scopes:['session:report']};
  const path='/api/sessions/bridge-session/commands';
  const queued=await bridge.call(path,'POST',{key:'stop-before-upgrade',kind:'stop'});
@@ -101,7 +101,7 @@ test('a bound stop survives the schema-six to schema-seven bridge with its dispa
  const applied=fixture('machine','apply',bridge);
  const receipt=await applied.call(path+'/'+command.id+'/ack','POST',{epoch,result:{stopped:true}},machine);
  assert.equal(receipt.status,200);
- assert.equal(version(applied),8);
+ assert.equal(version(applied),9);
  const after=await data(await applied.call(path));
  assert.equal(after.commands[0].ack.confirmed_exit,true);
  assert.equal(after.commands[0].ack.native_id,'11111111-1111-4111-8111-111111111111');
