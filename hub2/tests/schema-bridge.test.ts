@@ -29,12 +29,12 @@ test('control bridge defers shared-memory migration, then rollback preserves pos
  const preserved=(bridge.database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all() as any[]).map(row=>row.name);
  const applied=fixture('control','apply',bridge);
  const rule={id:'after-migration',key:'rule-bridge-1',expected_version:0,text:'Preserve this operator rule',source:{type:'user',reference:'synthetic'},decision:'Apply'};
- assert.equal((await applied.call('/api/intake/rules','POST',rule)).status,200);assert.equal(version(applied),5);
+ assert.equal((await applied.call('/api/intake/rules','POST',rule)).status,200);assert.equal(version(applied),6);
  const ingest={source:'cli',agents:[{agent_id:'bridge-writer',messages:[{msg_id:'t1u',role:'user',text:'Preserve this ask after rollback'}]}]};
  assert.equal((await applied.call('/api/asks/ingest','POST',ingest)).status,200);
  const before=applied.database.prepare('SELECT * FROM memory_messages').all();
  const rollback=fixture('control','defer',applied);
- assert.equal((await rollback.call('/api/intake/rules')).status,200);assert.equal(version(rollback),5);
+ assert.equal((await rollback.call('/api/intake/rules')).status,200);assert.equal(version(rollback),6);
  assert.equal((await data(await rollback.call('/api/intake/rules'))).operator_rules[0].text,undefined);
  assert.equal((await data(await rollback.call('/api/asks'))).asks[0].text,'Preserve this ask after rollback');
  assert.deepEqual(rollback.database.prepare('SELECT * FROM memory_messages').all(),before);

@@ -1,9 +1,15 @@
 import {test} from 'node:test';import assert from 'node:assert/strict';import {DatabaseSync} from 'node:sqlite';import {ControlDO} from '../src/control-do';
+import {pickModelRouteDetailed,simulateModelRoutes} from '../src/model-picker';
+import {setImmediate as nextTurn} from 'node:timers/promises';
 const admin={id:'human:admin',kind:'operator',scopes:['operator:admin'],family_id:'operator-family',client_id:'phone'};
-function fixture(){const database=new DatabaseSync(':memory:'),snapshots=new Map<string,unknown[]>();const state:any={storage:{async setAlarm(){},async deleteAlarm(){},sql:{exec(q:string,...a:any[]){const s=database.prepare(q);const rows=s.columns().length?s.all(...a):(s.run(...a),[]);return{toArray:()=>rows};}},transactionSync(fn:()=>unknown){database.exec('BEGIN');try{const v=fn();database.exec('COMMIT');return v;}catch(e){database.exec('ROLLBACK');throw e;}}},blockConcurrencyWhile:(fn:()=>unknown)=>Promise.resolve(fn())};
- const env:any={MACHINES:{idFromName:(id:string)=>id,get:(id:string)=>({fetch:async()=>Response.json({sessions:snapshots.get(id)||[]})})}};
- const control=new ControlDO(state,env);
- const call=(p:string,m='GET',b?:unknown,a:unknown=admin)=>control.fetch(new Request('https://control.test'+p,{method:m,headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(a)},...(b===undefined?{}:{body:JSON.stringify(b)})}));return{control,database,call,snapshots};}
+function fixture(options:{beforeAccount?:()=>Promise<void>;schemaMode?:string}={}){const database=new DatabaseSync(':memory:'),snapshots=new Map<string,unknown[]>();const state:any={storage:{async setAlarm(){},async deleteAlarm(){},sql:{exec(q:string,...a:any[]){const s=database.prepare(q);const rows=s.columns().length?s.all(...a):(s.run(...a),[]);return{toArray:()=>rows};}},transactionSync(fn:()=>unknown){database.exec('BEGIN');try{const v=fn();database.exec('COMMIT');return v;}catch(e){database.exec('ROLLBACK');throw e;}}},blockConcurrencyWhile:(fn:()=>unknown)=>Promise.resolve(fn())};
+ let control:ControlDO;
+ const env:any={HUB2_SCHEMA_MIGRATIONS:options.schemaMode,
+ CONTROL:{idFromName:(id:string)=>id,get:()=>({fetch:(input:string|Request,init?:RequestInit)=>control.fetch(input instanceof Request?input:new Request(input,init))})},
+ ACCOUNTS:{idFromName:(id:string)=>id,get:()=>({fetch:async()=>{await options.beforeAccount?.();return Response.json({account:{enabled:true},hosts:['host-picker']});}})},
+ MACHINES:{idFromName:(id:string)=>id,get:(id:string)=>({fetch:async(input:string|Request)=>new URL(input instanceof Request?input.url:input).pathname.includes('routing')?Response.json({machine_id:id,connected:true,engines:['codex','claude'],capabilities:['headless']}):Response.json({sessions:snapshots.get(id)||[]})})}};
+ control=new ControlDO(state,env);
+ const call=(p:string,m='GET',b?:unknown,a:unknown=admin)=>control.fetch(new Request('https://control.test'+p,{method:m,headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(a)},...(b===undefined?{}:{body:JSON.stringify(b)})}));return{control,database,call,snapshots,env,restart:()=>{control=new ControlDO(state,env);}};}
 const data=async(r:Response)=>await r.json() as any;
 
 function addMachine(database:DatabaseSync,id:string){
@@ -127,4 +133,140 @@ test('canonical project route resource keeps bound intake and related session au
  assert.equal((await call('/api/routes/intake/intake-shared-001','GET',undefined,{...reader,scopes:['intake:read']})).status,404);
  assert.equal((await call('/api/routes/intake/intake-shared-001','GET',undefined,{...reader,scopes:['project:org/a']})).status,404);
  assert.equal((await call('/_routes/register','POST',{kind:'session',id:'session-shared-001',owner:'machine1',resource_id:'org/a',bound_intake_id:'intake-shared-002',participants:[],epoch:2})).status,409);
+});
+
+
+const pickerCandidates=[
+ {id:'sol',model:'gpt-6.1-sol',engine:'codex',effort:'medium',account_id:'codex',weight:1,capabilities:[],enabled:true},
+ {id:'sonnet',model:'sonnet',engine:'claude',effort:'medium',account_id:'claude',weight:1,capabilities:[],enabled:true},
+ {id:'opus',model:'opus',engine:'claude',effort:'medium',account_id:'claude',weight:1,capabilities:[],enabled:true},
+];
+async function configurePicker(f:ReturnType<typeof fixture>){
+ await f.call('/api/model-policy');
+ addMachine(f.database,'host-picker');
+ (f.control as any).db.run('INSERT OR REPLACE INTO model_policy VALUES(1,?,?,?)',1,JSON.stringify(pickerCandidates),'synthetic');
+}
+function draw(operation:string,model:string|undefined='gpt-6.1-sol'){
+ return {project_id:'org/a',operation_id:operation,attempt:0,input:{interactive:false,...(model?{model}:{})}};
+}
+
+test('central real draws commit once and operator delivery consumes their occurrences',async()=>{
+ const f=fixture();await configurePicker(f);
+ let first:any;
+ for(let index=0;index<3;index++){
+  const response=await f.call('/_internal/picker/draw','POST',draw('operation-'+index));
+  assert.equal(response.status,200);const result=await data(response);if(index===0)first=result;
+ }
+ f.restart();
+ assert.deepEqual(await data(await f.call('/_internal/picker/draw','POST',draw('operation-0'))),first);
+ assert.equal((await f.call('/_internal/picker/draw','POST',draw('operation-0','sonnet'))).status,409);
+ const counters=await data(await f.call('/api/picker-alerts/counters'));
+ assert.equal(counters.total_picks,3);assert.equal(counters.occurrence_watermark,1);assert.equal(counters.coverage.available,true);
+ const machine={id:'machine:h1',kind:'machine',resource_id:'h1',scopes:['session:report']};
+ assert.equal((await f.call('/api/picker-alerts/offers','GET',undefined,machine)).status,403);
+ const offers=await data(await f.call('/api/picker-alerts/offers'));
+ assert.equal(offers.offers.length,1);const offered=offers.offers[0];assert.equal(offered.recipient,'dev@dtcdev.click');
+ assert.equal((await f.call('/api/picker-alerts/1/ack','POST',{lease_token:'a'.repeat(64)})).status,409);
+ assert.equal((await f.call('/api/picker-alerts/1/ack','POST',{lease_token:offered.lease_token})).status,200);
+ assert.equal((await f.call('/api/picker-alerts/1/ack','POST',{lease_token:offered.lease_token})).status,200);
+ assert.equal((await data(await f.call('/api/picker-alerts/offers'))).offers.length,0);
+ assert.equal((await f.call('/_internal/picker/record','POST',{})).status,404);
+});
+
+test('a delayed healthy actual draw resets the global streak before a subsequent degraded draw',async()=>{
+ let block=false,blocked=false,entered!:()=>void,release!:()=>void;
+ const started=new Promise<void>(resolve=>{entered=resolve;});
+ const gate=new Promise<void>(resolve=>{release=resolve;});
+ const f=fixture({beforeAccount:async()=>{if(block&&!blocked){blocked=true;entered();await gate;}}});await configurePicker(f);
+ await f.call('/_internal/picker/draw','POST',draw('degraded-1'));
+ await f.call('/_internal/picker/draw','POST',draw('degraded-2'));
+ block=true;
+ const healthy=f.call('/_internal/picker/draw','POST',{...draw('healthy'),project_id:'org/b',input:{interactive:false}});
+ await started;
+ const degraded=f.call('/_internal/picker/draw','POST',{...draw('degraded-3'),project_id:'org/c'});
+ await nextTurn();
+ assert.equal((await data(await f.call('/api/picker-alerts/counters'))).total_picks,2);
+ release();
+ assert.equal((await healthy).status,200);assert.equal((await degraded).status,200);
+ const counters=await data(await f.call('/api/picker-alerts/counters'));
+ assert.equal(counters.total_picks,4);assert.equal(counters.consecutive_degraded,1);assert.equal(counters.occurrence_watermark,0);
+ const receipts=f.database.prepare('SELECT operation_id FROM picker_receipts ORDER BY receipt_seq').all();
+ assert.deepEqual(receipts.map(row=>row.operation_id),['degraded-1','degraded-2','healthy','degraded-3']);
+});
+
+test('schema four draws continue with explicit unavailable coverage',async()=>{
+ const f=fixture({schemaMode:'defer'});await configurePicker(f);
+ const response=await data(await f.call('/_internal/picker/draw','POST',draw('bridge')));
+ assert.equal(response.route.model,'gpt-6.1-sol');assert.deepEqual(response.coverage,{available:false});
+ assert.equal(f.database.prepare('SELECT version FROM hub2_schema').get()!.version,4);
+ assert.equal(f.database.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE name='picker_draws'").get()!.n,0);
+});
+
+test('preview and simulation draws do not advance actual draw counters',async()=>{
+ const f=fixture();await configurePicker(f);
+ await f.call('/_internal/picker/draw','POST',draw('actual'));
+ const before=await data(await f.call('/api/picker-alerts/counters'));
+ await pickModelRouteDetailed(f.env,{interactive:false});
+ await simulateModelRoutes(f.env,{interactive:false},20);
+ assert.deepEqual(await data(await f.call('/api/picker-alerts/counters')),before);
+});
+
+test('collector write failures return the real route and reset the interrupted streak before recovery',async()=>{
+ const f=fixture();await configurePicker(f);
+ await f.call('/_internal/picker/draw','POST',draw('before-gap-1'));
+ await f.call('/_internal/picker/draw','POST',draw('before-gap-2'));
+ f.database.exec("CREATE TRIGGER reject_draw BEFORE INSERT ON picker_draws BEGIN SELECT RAISE(ABORT,'synthetic collector failure'); END");
+ const healthy=await f.call('/_internal/picker/draw','POST',{...draw('unobserved-healthy'),input:{interactive:false}});
+ assert.equal(healthy.status,200);
+ const actual=await data(healthy);
+ assert(actual.route.model);assert.equal(actual.diagnostics.pool.length,3);
+ assert.deepEqual(actual.coverage,{available:false,reason:'picker_observer_unavailable'});
+ let counters=await data(await f.call('/api/picker-alerts/counters'));
+ assert.equal(counters.total_picks,2);assert.equal(counters.coverage.available,false);
+ f.database.exec('DROP TRIGGER reject_draw');
+ f.database.exec("CREATE TRIGGER reject_gap_reset BEFORE UPDATE ON picker_coverage BEGIN SELECT RAISE(ABORT,'synthetic coverage failure'); END");
+ const stillUnavailable=await f.call('/_internal/picker/draw','POST',draw('reset-write-fails'));
+ assert.equal(stillUnavailable.status,200);assert.equal((await data(stillUnavailable)).coverage.available,false);
+ assert.equal((await data(await f.call('/api/picker-alerts/counters'))).total_picks,2);
+ f.database.exec('DROP TRIGGER reject_gap_reset');
+ assert.equal((await f.call('/_internal/picker/draw','POST',draw('after-gap'))).status,200);
+ counters=await data(await f.call('/api/picker-alerts/counters'));
+ assert.equal(counters.total_picks,3);assert.equal(counters.consecutive_degraded,1);
+ assert.equal(counters.occurrence_watermark,0);assert.equal(counters.coverage.available,true);
+});
+
+test('collector replay read failures are visible and fail open while actual routing errors remain errors',async()=>{
+ const f=fixture();await configurePicker(f);
+ const db=(f.control as any).db,read=db.all.bind(db);
+ db.all=(query:string,...args:unknown[])=>{
+  if(query.startsWith('SELECT input_digest,response_json FROM picker_draws'))throw Error('synthetic collector read failure');
+  return read(query,...args);
+ };
+ const response=await f.call('/_internal/picker/draw','POST',draw('unobserved'));
+ assert.equal(response.status,200);
+ assert.equal((await data(response)).coverage.available,false);
+ db.all=read;
+ const invalid=await f.call('/_internal/picker/draw','POST',draw('invalid-model','unconfigured-model'));
+ assert.equal(invalid.status,503);assert.equal((await data(invalid)).error,'model_policy_unavailable');
+ assert.equal((await f.call('/_internal/picker/draw','POST',draw('recovered'))).status,200);
+ const counters=await data(await f.call('/api/picker-alerts/counters'));
+ assert.equal(counters.total_picks,1);assert.equal(counters.consecutive_degraded,1);
+});
+
+test('observer gap recovery changes coverage identity even within the same millisecond',async t=>{
+ t.mock.method(Date,'now',()=>1700000000000);
+ const f=fixture();await configurePicker(f);
+ await f.call('/_internal/picker/draw','POST',draw('before-same-clock-gap'));
+ const before=(await data(await f.call('/api/picker-alerts/counters'))).coverage;
+ f.database.exec("CREATE TRIGGER reject_same_clock_draw BEFORE INSERT ON picker_draws BEGIN SELECT RAISE(ABORT,'synthetic gap'); END");
+ const failed=await f.call('/_internal/picker/draw','POST',draw('same-clock-gap'));
+ assert.equal(failed.status,200);assert.equal((await data(failed)).coverage.available,false);
+ f.database.exec('DROP TRIGGER reject_same_clock_draw');
+ await f.call('/_internal/picker/draw','POST',draw('after-same-clock-gap'));
+ const after=(await data(await f.call('/api/picker-alerts/counters'))).coverage;
+ assert.equal(after.available,true);assert.equal(after.since,before.since);
+ assert.notEqual(after.epoch,before.epoch);
+ f.restart();
+ const recreated=await data(await f.call('/api/picker-alerts/counters'));
+ assert.deepEqual(recreated.coverage,after);assert.equal(recreated.consecutive_degraded,1);
 });

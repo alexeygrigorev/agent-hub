@@ -2,7 +2,7 @@
   "format": 1,
   "bridge": true,
   "schemas": {
-    "CONTROL": {"min_read": 1, "max_read": 5, "bridge_write": 4, "active_write": 5},
+    "CONTROL": {"min_read": 1, "max_read": 6, "bridge_write": 4, "active_write": 6},
     "MACHINES": {"min_read": 1, "max_read": 7, "bridge_write": 6, "active_write": 7},
     "PROJECTS": {"min_read": 4, "max_read": 4, "bridge_write": 4, "active_write": 4},
     "ACCOUNTS": {"min_read": 1, "max_read": 2, "bridge_write": 2, "active_write": 2},

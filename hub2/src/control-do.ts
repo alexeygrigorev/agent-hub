@@ -1,3 +1,6 @@
+import {PickerAlerts,PICKER_ALERT_SCHEMA} from './picker-alerts';
+import {pickModelRouteDetailed,type PickInput} from './model-picker';
+import {buildStartPickerEvidence} from './start-picker-evidence';
 import {SharedMemory,SHARED_MEMORY_SCHEMA} from './shared-memory';
 import {WorkerCredentials,WORKER_CREDENTIAL_SCHEMA} from './worker-credentials';
 import {ControlAuth,CONTROL_AUTH_SCHEMA} from './control-auth';
@@ -13,6 +16,16 @@ import { CLAUDE_OAUTH, claudeAuthorization, claudeExchange } from '../../src/cre
 import type { Actor, Hub2Env, JsonRecord } from './types';
 
 type CredentialActor=Actor&{family_id?:string;client_id?:string};
+const PICKER_COVERAGE_EPOCH = crypto.randomUUID();
+
+function canonicalDraw(value: unknown): string {
+  if (Array.isArray(value)) return '[' + value.map(canonicalDraw).join(',') + ']';
+  if (value !== null && typeof value === 'object') {
+    const object=value as Record<string,unknown>;
+    return '{'+Object.keys(object).sort().map(key=>JSON.stringify(key)+':'+canonicalDraw(object[key])).join(',')+'}';
+  }
+  return JSON.stringify(value);
+}
 const SCHEMA = [
  'CREATE TABLE mailbox_wakes(owner TEXT PRIMARY KEY,revision INTEGER NOT NULL,after_id TEXT NOT NULL,next_attempt INTEGER NOT NULL,attempt INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID',
  'CREATE INDEX mailbox_wake_due ON mailbox_wakes(next_attempt,owner)',
@@ -89,13 +102,25 @@ export class ControlDO {
   private readonly auth:ControlAuth;
   private readonly workers:WorkerCredentials;
   private readonly memory:SharedMemory;
+  private readonly pickerAlerts:PickerAlerts;
   private readonly ready:Promise<void>;
+  private pickerQueue:Promise<void> = Promise.resolve();
+  private pickerObserverDirty = false;
+  private pickerObserverEpoch = PICKER_COVERAGE_EPOCH;
 
   constructor(private readonly ctx: DurableObjectState, env: Hub2Env) {
     this.db = new MeteredDb(ctx.storage.sql);
     this.sqlReceipts = new SqlReceiptMeter(this.db);
     this.env = wrapSqlNamespaces(env, this.sqlReceipts) as Hub2Env;
-    this.ready=initializeSchema(ctx, this.db, 5, SCHEMA,[ONCALL_SCHEMA,['CREATE TABLE IF NOT EXISTS session_start_reservations(operation_id TEXT PRIMARY KEY,session_id TEXT NOT NULL,expires_at INTEGER NOT NULL) WITHOUT ROWID', ...ENGINE_SCHEMA],ENGINE_SCHEMA,SHARED_MEMORY_SCHEMA],async()=>{this.seedEngineRollout();await this.scheduleWake();},1,schemaMigrationCeiling(env.HUB2_SCHEMA_MIGRATIONS,4,5));
+    this.pickerAlerts=new PickerAlerts(this.db,ctx);
+    this.ready=initializeSchema(ctx, this.db, 6, SCHEMA,[ONCALL_SCHEMA,['CREATE TABLE IF NOT EXISTS session_start_reservations(operation_id TEXT PRIMARY KEY,session_id TEXT NOT NULL,expires_at INTEGER NOT NULL) WITHOUT ROWID', ...ENGINE_SCHEMA],ENGINE_SCHEMA,SHARED_MEMORY_SCHEMA,PICKER_ALERT_SCHEMA],async()=>{
+      this.seedEngineRollout();
+      if(this.db.schemaVersion>=6){
+        try{this.pickerAlerts.beginCoverage(PICKER_COVERAGE_EPOCH);}
+        catch{this.invalidatePickerCoverage();}
+      }
+      await this.scheduleWake();
+    },1,schemaMigrationCeiling(env.HUB2_SCHEMA_MIGRATIONS,4,6));
     this.memory=new SharedMemory(ctx,this.db,this.env);
     this.auth=new ControlAuth(ctx,this.db,this.env);this.workers=new WorkerCredentials(ctx,this.db,this.env);
   }
@@ -108,6 +133,8 @@ export class ControlDO {
     const url = new URL(request.url);
     try {
       await this.ready;
+      if(url.pathname==='/_internal/picker/draw'&&request.method==='POST')return await this.committedPickerDraw(request);
+      if(url.pathname.startsWith('/api/picker-alerts'))return await this.pickerAlertRequest(request,url);
       const workerResponse=await this.workers.fetch(request);if(workerResponse)return workerResponse;
       const authResponse=await this.auth.fetch(request);if(authResponse)return authResponse;
       const memoryResponse=await this.memory.fetch(request);if(memoryResponse)return memoryResponse;
@@ -152,6 +179,60 @@ export class ControlDO {
       "INSERT OR IGNORE INTO hub2_engine_rollout(engine,desired_version,latest,state,updated_at) VALUES('claude',?,?, 'stable',?)",
       CLAUDE_BASELINE_VERSION, CLAUDE_LATEST_VERSION, Date.now(),
     );
+  }
+
+  private async committedPickerDraw(request:Request):Promise<Response> {
+    const body=await bodyObject(request,32768);
+    if(!boundedString(body.project_id,180)||!boundedString(body.operation_id,180)
+      ||(body.attempt!==0&&body.attempt!==1)||!body.input||typeof body.input!=='object'||Array.isArray(body.input))
+      return error('invalid_picker_draw',400);
+    const previous=this.pickerQueue;
+    let release!:()=>void;
+    this.pickerQueue=new Promise<void>(resolve=>{release=resolve;});
+    await previous;
+    try {
+      const digest=await sha256Hex(canonicalDraw({input:body.input,previous_picker:body.previous_picker??null}));
+      let collect=this.db.schemaVersion>=6;
+      if(collect){
+        try{
+          const replay=this.pickerAlerts.replayDraw(body.project_id as string,body.operation_id as string,body.attempt,digest);
+          if(replay!==undefined)return json(replay);
+        }catch(caught){
+          if(caught instanceof HttpError&&caught.code==='picker_draw_conflict')throw caught;
+          this.invalidatePickerCoverage();
+          collect=false;
+        }
+      }
+      const picked=await pickModelRouteDetailed(this.env,body.input as PickInput);
+      const picker=buildStartPickerEvidence(picked.route,picked.diagnostics,body.attempt,body.previous_picker);
+      const response={...picked,picker,coverage:{available:false} as Record<string,unknown>};
+      if(collect){
+        try{
+          if(this.pickerObserverDirty)this.pickerAlerts.beginCoverage(PICKER_COVERAGE_EPOCH,Date.now(),true,this.pickerObserverEpoch);
+          response.coverage=this.pickerAlerts.coverage();
+          this.pickerAlerts.commitDraw({project_id:body.project_id,operation_id:body.operation_id,
+            attempt:body.attempt,committed_at:Date.now(),picker},digest,response);
+          this.pickerObserverDirty=false;
+        }catch{
+          this.invalidatePickerCoverage();
+          response.coverage={available:false,reason:'picker_observer_unavailable'};
+        }
+      }else if(this.pickerObserverDirty){
+        response.coverage={available:false,reason:'picker_observer_unavailable'};
+      }
+      return json(response);
+    }catch(caught){
+      if(caught instanceof HttpError)return error(caught.code,caught.status,caught.detail);
+      throw caught;
+    }finally{release();}
+  }
+
+  private invalidatePickerCoverage():void{
+    if(!this.pickerObserverDirty){
+      this.pickerObserverEpoch=crypto.randomUUID();
+      console.warn('[hub2] PICKER_OBSERVER_UNAVAILABLE');
+    }
+    this.pickerObserverDirty=true;
   }
 
   private async accountRequest(path: string, method: string, actor: Actor, body?: unknown): Promise<Response> {
@@ -693,6 +774,29 @@ export class ControlDO {
         id, machineId, alias.trim(), codeHash, JSON.stringify(scopes), now, now + 10 * 60_000);
     });
     return json({ pairing_id: id, machine_id: machineId, pairing_code: pairingCode, expires_at: new Date(now + 10 * 60_000).toISOString() }, 201);
+  }
+
+  private async pickerAlertRequest(request:Request,url:URL):Promise<Response>{
+    const actor=actorFrom(request);
+    if(!actor||!hasScope(actor,'operator:admin'))return error('forbidden',403);
+    if(this.db.schemaVersion<6)return error('schema_migration_deferred',503);
+    if(url.pathname==='/api/picker-alerts/counters'&&request.method==='GET'){
+      try{
+        return json({recipient:'dev@dtcdev.click',...this.pickerAlerts.counters(),coverage:this.pickerObserverDirty
+          ?{available:false,reason:'picker_observer_unavailable'}:this.pickerAlerts.coverage()});
+      }catch{
+        this.invalidatePickerCoverage();
+        return json({recipient:'dev@dtcdev.click',coverage:{available:false,reason:'picker_observer_unavailable'}});
+      }
+    }
+    if(url.pathname==='/api/picker-alerts/offers'&&request.method==='GET')
+      return json({offers:await this.pickerAlerts.offers(Date.now())});
+    const delivery=url.pathname.match(/^\/api\/picker-alerts\/([1-9][0-9]*)\/(ack|nack)$/);
+    if(delivery&&request.method==='POST'){
+      const body=await bodyObject(request,2048);
+      return json(await this.pickerAlerts.settle(Number(delivery[1]),body.lease_token as string,delivery[2] as 'ack'|'nack',Date.now()));
+    }
+    return error('not_found',404);
   }
 
   private async completePairing(request: Request): Promise<Response> {
