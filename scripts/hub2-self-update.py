@@ -8,7 +8,6 @@ import argparse
 import contextlib
 import fcntl
 import hashlib
-from io import BytesIO
 import json
 import os
 from pathlib import Path
@@ -20,7 +19,6 @@ import tempfile
 import time
 from urllib.parse import urlsplit
 from urllib.request import urlopen
-from zipfile import BadZipFile, ZipFile
 
 UNITS = ('agent-hub2-host.service', 'agent-hub2-host-update.service', 'agent-hub2-host-update.timer')
 MAX_MANIFEST = 128 * 1024
@@ -225,13 +223,16 @@ def repair_service_files(base, manifest, root, target):
     command(['systemctl', '--user', 'daemon-reload'])
 
 
-def managed_release(releases, name):
+def release_path(releases, name):
     if not isinstance(name, str) or not re.fullmatch(r'[0-9a-f]{40}', name):
         raise ValueError('invalid retained release identity')
-    target = releases / name
-    if target.is_symlink() or not target.is_dir():
+    return releases / name
+
+
+def require_release_directory(path):
+    if path.is_symlink() or not path.is_dir():
         raise ValueError('retained release is not a managed directory')
-    return target
+    return path
 
 
 def sync_directory(directory):
@@ -255,31 +256,35 @@ def durable_write(path, data, mode):
         Path(temporary).unlink(missing_ok=True)
 
 
-def verify_retained_packages(base, target, manifest, host_wheel):
-    locations = list((target / 'lib').glob('python*/site-packages'))
-    if len(locations) != 1 or locations[0].resolve() != locations[0]:
-        raise ValueError('retained release has no managed site-packages')
-    site_packages = locations[0]
-    for name in (host_wheel, 'websockets-16.0-py3-none-any.whl'):
-        data = verified_artifact(base, name, manifest['artifacts'][name])
-        try:
-            with ZipFile(BytesIO(data)) as wheel:
-                members = wheel.infolist()
-                if sum(member.file_size for member in members) > MAX_ARTIFACT:
-                    raise ValueError('retained wheel payload exceeds size limit')
-                for member in members:
-                    relative = Path(member.filename)
-                    if relative.is_absolute() or '..' in relative.parts:
-                        raise ValueError('unsafe retained wheel member')
-                    if member.is_dir() or (relative.parent.suffix == '.dist-info' and relative.name == 'RECORD'):
-                        continue  # The installer rewrites RECORD for the installed layout.
-                    installed = site_packages / relative
-                    if (installed.resolve() != installed or not installed.is_file()
-                            or installed.stat().st_size != member.file_size
-                            or installed.read_bytes() != wheel.read(member)):
-                        raise ValueError('retained installed package does not match published wheel: ' + name)
-        except BadZipFile:
-            raise ValueError('invalid published wheel') from None
+def prepare_environment(target, download, manifest, host_wheel):
+    python = target / 'bin/python'
+    uv = shutil.which('uv')
+    if uv:
+        command([uv, 'venv', '--allow-existing', '--python', sys.executable, target])
+        installer = [uv, 'pip', 'install', '--python', python]
+    else:
+        command([sys.executable, '-m', 'venv', target])
+        installer = [python, '-m', 'pip', 'install']
+    command([*installer, '--no-index', '--no-deps',
+             download / 'websockets-16.0-py3-none-any.whl', download / host_wheel])
+    check_host_package(target, manifest)
+    command([target / 'bin/hub2', '--help'])
+    shutil.copyfile(download / 'hub.pyz', target / 'hub.pyz')
+    shutil.copyfile(download / 'hub2-enroll.py', target / 'hub2-enroll.py')
+    (target / 'hub.pyz').chmod(0o755)
+    command([python, target / 'hub.pyz', '--help'])
+    write_json(target / 'release.json', manifest)
+
+
+def sync_environment(target):
+    for directory, _, names in os.walk(target, topdown=False, followlinks=False):
+        directory = Path(directory)
+        for name in names:
+            path = directory / name
+            if not path.is_symlink():
+                with path.open('rb') as stream:
+                    os.fsync(stream.fileno())
+        sync_directory(directory)
 
 
 def replace_units(units, files):
@@ -300,11 +305,12 @@ def restore_retained_switch(root, releases, journal):
     if journal.is_symlink() or not journal.is_file():
         raise ValueError('invalid retained release journal')
     state = json.loads(journal.read_text())
-    old = managed_release(releases, state['current'])
-    target = managed_release(releases, state['target'])
+    old = require_release_directory(release_path(releases, state['current']))
+    target = release_path(releases, state['target'])
+    backup = releases / ('.retained-' + target.name)
     previous = state['previous']
     if previous is not None:
-        previous = managed_release(releases, previous)
+        previous = release_path(releases, previous)
     current_link, previous_link = root / 'current', root / 'previous'
     if not current_link.is_symlink() or current_link.resolve() not in (old, target):
         raise ValueError('current release changed during retained activation')
@@ -314,12 +320,20 @@ def restore_retained_switch(root, releases, journal):
     if set(state['units']) != set(UNITS):
         raise ValueError('invalid retained unit snapshot')
     files = {name: None if data is None else bytes.fromhex(data) for name, data in state['units'].items()}
-    replace_units(Path.home() / '.config/systemd/user', files)
-    link(old, current_link)
+    if current_link.resolve() != old:
+        link(old, current_link)
+    sync_directory(root)
+    if backup.exists() or backup.is_symlink():
+        require_release_directory(backup)
+        if target.exists() or target.is_symlink():
+            shutil.rmtree(require_release_directory(target))
+        backup.rename(target)
+        sync_directory(releases)
     if previous is None:
         previous_link.unlink(missing_ok=True)
     else:
-        link(previous, previous_link)
+        link(require_release_directory(previous), previous_link)
+    replace_units(Path.home() / '.config/systemd/user', files)
     command(['systemctl', '--user', 'restart', UNITS[0]])
     failure(root, target.name)
     sync_directory(root)
@@ -327,21 +341,29 @@ def restore_retained_switch(root, releases, journal):
     sync_directory(root)
 
 
+def finish_retained_switch(root, releases, journal):
+    if journal.is_symlink() or not journal.is_file():
+        raise ValueError('invalid committed retained release journal')
+    state = json.loads(journal.read_text())
+    target = require_release_directory(release_path(releases, state['target']))
+    if not (root / 'current').is_symlink() or (root / 'current').resolve() != target:
+        raise ValueError('current release changed after retained activation')
+    backup = releases / ('.retained-' + target.name)
+    if backup.exists() or backup.is_symlink():
+        shutil.rmtree(require_release_directory(backup))
+        sync_directory(releases)
+    journal.unlink()
+    sync_directory(root)
+
+
 def reactivate_retained_release(base, manifest, host_wheel, root, releases, old, target):
-    managed_release(releases, target.name)
+    require_release_directory(target)
     receipt = target / 'release.json'
     if receipt.is_symlink() or not receipt.is_file():
         raise ValueError('release directory exists; explicit recovery required')
     if (target / '.installing').exists() or read_release_receipt(target) != manifest:
         raise ValueError('retained release does not match the published manifest')
-    for name in ('hub.pyz', 'hub2-enroll.py'):
-        if not matches_installed_artifact(target / name, manifest['artifacts'][name]):
-            raise ValueError('retained release artifact mismatch: ' + name)
-    verify_retained_packages(base, target, manifest, host_wheel)
-    check_host_package(target, manifest)
-    command([target / 'bin/hub2', '--help'])
-
-    if old is None or managed_release(releases, old.name) != old:
+    if old is None or require_release_directory(release_path(releases, old.name)) != old:
         raise ValueError('current release is unmanaged')
     previous_link = root / 'previous'
     previous = None
@@ -349,9 +371,12 @@ def reactivate_retained_release(base, manifest, host_wheel, root, releases, old,
         if not previous_link.is_symlink():
             raise ValueError('previous release is unmanaged')
         previous = previous_link.resolve(strict=True)
-        if managed_release(releases, previous.name) != previous:
+        if require_release_directory(release_path(releases, previous.name)) != previous:
             raise ValueError('previous release is unmanaged')
 
+    backup = releases / ('.retained-' + target.name)
+    if backup.exists() or backup.is_symlink():
+        raise ValueError('retained backup already exists; explicit recovery required')
     units = Path.home() / '.config/systemd/user'
     replacements = {}
     snapshot = {}
@@ -362,27 +387,44 @@ def reactivate_retained_release(base, manifest, host_wheel, root, releases, old,
         snapshot[name] = path.read_bytes().hex() if path.is_file() else None
         if not matches:
             replacements[name] = verified_artifact(base, name, record)
-    journal = root / 'retained-switch.json'
-    state = {'current': old.name, 'target': target.name,
-             'previous': previous.name if previous else None, 'units': snapshot}
-    durable_write(journal, json.dumps(state, sort_keys=True).encode(), 0o600)
-    sync_directory(root)
-    try:
-        if replacements:
-            replace_units(units, replacements)
-        link(target, root / 'current')
-        command(['systemctl', '--user', 'restart', UNITS[0]])
-        check_service_ready(target)
-        if json.loads(fetch(base + 'host-release.json', MAX_MANIFEST)) != manifest:
-            raise ValueError('published host release changed during retained activation')
-        link(old, previous_link)
+
+    scratch = root / 'tmp'
+    scratch.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='download-', dir=scratch) as temporary:
+        download = Path(temporary)
+        for name in (host_wheel, 'websockets-16.0-py3-none-any.whl', 'hub.pyz', 'hub2-enroll.py'):
+            (download / name).write_bytes(verified_artifact(base, name, manifest['artifacts'][name]))
+        journal = root / 'retained-switch.json'
+        state = {'current': old.name, 'target': target.name,
+                 'previous': previous.name if previous else None, 'units': snapshot}
+        durable_write(journal, json.dumps(state, sort_keys=True).encode(), 0o600)
         sync_directory(root)
-    except BaseException:
-        restore_retained_switch(root, releases, journal)
-        raise
-    # Keep the updater that understands this journal available after rollback.
-    journal.unlink()
-    sync_directory(root)
+        try:
+            # Venv entry points embed this absolute directory. Build at its
+            # final path without running any executable from the retained copy.
+            target.rename(backup)
+            sync_directory(releases)
+            target.mkdir(mode=0o700)
+            prepare_environment(target, download, manifest, host_wheel)
+            sync_environment(target)
+            sync_directory(releases)
+            if replacements:
+                replace_units(units, replacements)
+            link(target, root / 'current')
+            command(['systemctl', '--user', 'restart', UNITS[0]])
+            check_service_ready(target)
+            if json.loads(fetch(base + 'host-release.json', MAX_MANIFEST)) != manifest:
+                raise ValueError('published host release changed during retained activation')
+            link(old, previous_link)
+            sync_directory(root)
+        except BaseException:
+            restore_retained_switch(root, releases, journal)
+            raise
+        # Keep the updater that understands this journal available after rollback.
+        committed = root / 'retained-switch-committed.json'
+        journal.rename(committed)
+        sync_directory(root)
+        finish_retained_switch(root, releases, committed)
 
 
 def recover(root, releases):
@@ -397,6 +439,9 @@ def recover(root, releases):
     journal = root / 'retained-switch.json'
     if journal.exists() or journal.is_symlink():
         restore_retained_switch(root, releases, journal)
+    committed = root / 'retained-switch-committed.json'
+    if committed.exists() or committed.is_symlink():
+        finish_retained_switch(root, releases, committed)
     for target in releases.iterdir():
         marker = target / '.installing'
         if target.is_symlink() or not re.fullmatch(r'[0-9a-f]{40}', target.name) or not marker.is_file():
@@ -506,25 +551,10 @@ def install(base_url, root, *, install_service=False, restart=True):
             (prepared / '.installing').write_text(version)
             prepared.rename(target)
             try:
+                prepare_environment(target, download, manifest, host_wheel)
                 python = target / 'bin/python'
-                uv = shutil.which('uv')
-                if uv:
-                    command([uv, 'venv', '--allow-existing', '--python', sys.executable, target])
-                    installer = [uv, 'pip', 'install', '--python', python]
-                else:
-                    command([sys.executable, '-m', 'venv', target])
-                    installer = [python, '-m', 'pip', 'install']
-                command([*installer, '--no-index', '--no-deps',
-                         download / 'websockets-16.0-py3-none-any.whl', download / host_wheel])
-                check_host_package(target, manifest)
-                command([target / 'bin/hub2', '--help'])
-                shutil.copyfile(download / 'hub.pyz', target / 'hub.pyz')
-                shutil.copyfile(download / 'hub2-enroll.py', target / 'hub2-enroll.py')
-                (target / 'hub.pyz').chmod(0o755)
-                command([python, target / 'hub.pyz', '--help'])
                 command([python, '-m', 'py_compile', download / 'hub2-self-update.py'])
                 command([python, download / 'hub2-self-update.py', '--help'])
-                (target / 'release.json').write_text(json.dumps(manifest, sort_keys=True) + '\n')
                 if old:
                     link(old, root / 'previous')
                 link(target, current)

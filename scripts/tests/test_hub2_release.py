@@ -118,22 +118,12 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
         self.assertFalse(any('systemctl' in args and 'stop' in args for args in self.calls))
 
     def prepare_retained_switch(self):
-        transport_wheel = 'websockets-16.0-py3-none-any.whl'
-        sources = {HOST: 'agent_hub_host/agent.py', transport_wheel: 'websockets/__init__.py'}
-        for name, member in sources.items():
-            wheel_bytes = io.BytesIO()
-            with zipfile.ZipFile(wheel_bytes, 'w') as wheel:
-                wheel.writestr(member, b'published package source')
-            self.files[name] = wheel_bytes.getvalue()
-            self.manifest['artifacts'][name] = {'sha256': hashlib.sha256(self.files[name]).hexdigest(),
-                                                'size': len(self.files[name])}
         current = self.old_release()
         self.install(install_service=True)
         retained = (self.root / 'current').resolve()
-        for member in sources.values():
-            installed = retained / 'lib/python3.11/site-packages' / member
-            installed.parent.mkdir(parents=True)
-            installed.write_bytes(b'published package source')
+        startup = retained / 'lib/python3.11/site-packages/retained.pth'
+        startup.parent.mkdir(parents=True)
+        startup.write_text('import unverified_retained_code')
         updater.link(current, self.root / 'current')
         updater.link(retained, self.root / 'previous')
         units = Path(self.temporary.name) / '.config/systemd/user'
@@ -143,20 +133,33 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
         self.downloads.clear()
         return current, retained, units
 
-    def test_reactivates_exact_retained_release_without_rebuilding_or_replacing_updater(self):
+    def test_rebuilds_retained_release_without_executing_it_or_replacing_updater(self):
         current, retained, units = self.prepare_retained_switch()
         receipt = (retained / 'release.json').read_bytes()
+        startup = retained / 'lib/python3.11/site-packages/retained.pth'
+        previous_command = self.command
+
+        def assert_clean_command(args):
+            if Path(args[0]).is_relative_to(retained):
+                self.assertFalse(startup.exists())
+            previous_command(args)
+
+        self.command = assert_clean_command
         self.install()
+        self.assertFalse(startup.exists())
         self.assertEqual((self.root / 'current').resolve(), retained)
         self.assertEqual((self.root / 'previous').resolve(), current)
         self.assertEqual((retained / 'release.json').read_bytes(), receipt)
         self.assertEqual((self.root / 'updater.py').read_bytes(), b'current updater')
         self.assertEqual((units / updater.UNITS[0]).read_bytes(), self.files[updater.UNITS[0]])
-        self.assertEqual(self.downloads, ['host-release.json', HOST, 'websockets-16.0-py3-none-any.whl',
-                                          updater.UNITS[0], 'host-release.json'])
+        self.assertEqual(self.downloads, ['host-release.json', updater.UNITS[0], HOST,
+                                          'websockets-16.0-py3-none-any.whl', 'hub.pyz', 'hub2-enroll.py',
+                                          'host-release.json'])
         self.assertEqual(sum('restart' in args for args in self.calls), 1)
-        self.assertFalse(any('venv' in args for args in self.calls))
+        self.assertTrue(any('venv' in args for args in self.calls))
         self.assertFalse((self.root / 'retained-switch.json').exists())
+        self.assertFalse((self.root / 'retained-switch-committed.json').exists())
+        self.assertFalse(retained.with_name('.retained-' + retained.name).exists())
 
     def test_retained_release_readiness_failure_restores_units_and_both_links(self):
         current, retained, units = self.prepare_retained_switch()
@@ -166,7 +169,7 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
         self.assertEqual((self.root / 'current').resolve(), current)
         self.assertEqual((self.root / 'previous').resolve(), retained)
         self.assertEqual((units / updater.UNITS[0]).read_bytes(), b'active service unit')
-        self.assertTrue(retained.is_dir())
+        self.assertTrue((retained / 'lib/python3.11/site-packages/retained.pth').is_file())
         self.assertEqual(sum('restart' in args for args in self.calls), 2)
         self.assertFalse((self.root / 'retained-switch.json').exists())
         self.assertIn(SHA, json.loads((self.root / 'failed-releases.json').read_text()))
@@ -176,6 +179,8 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
         journal = self.root / 'retained-switch.json'
         updater.write_json(journal, {'current': current.name, 'target': retained.name, 'previous': retained.name,
                                      'units': {name: (units / name).read_bytes().hex() for name in updater.UNITS}})
+        retained.rename(retained.with_name('.retained-' + retained.name))
+        retained.mkdir()
         updater.link(retained, self.root / 'current')
         updater.link(current, self.root / 'previous')
         (units / updater.UNITS[0]).write_bytes(b'interrupted service unit')
@@ -190,32 +195,49 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
         self.assertEqual((self.root / 'previous').resolve(), retained)
         self.assertEqual((units / updater.UNITS[0]).read_bytes(), b'active service unit')
         self.assertFalse(journal.exists())
-        self.assertTrue(retained.is_dir())
+        self.assertTrue((retained / 'lib/python3.11/site-packages/retained.pth').is_file())
 
-    def test_retained_release_refuses_different_receipt_or_tampered_cli(self):
+    def test_retained_build_failure_restores_original_environment(self):
+        current, retained, units = self.prepare_retained_switch()
+        with patch.object(updater, 'prepare_environment', side_effect=RuntimeError('venv build failed')):
+            with self.assertRaisesRegex(RuntimeError, 'venv build failed'):
+                self.install()
+        self.assertEqual((self.root / 'current').resolve(), current)
+        self.assertEqual((self.root / 'previous').resolve(), retained)
+        self.assertEqual((units / updater.UNITS[0]).read_bytes(), b'active service unit')
+        self.assertTrue((retained / 'lib/python3.11/site-packages/retained.pth').is_file())
+
+    def test_committed_retained_switch_resumes_backup_cleanup_without_restarting(self):
+        current, retained, _ = self.prepare_retained_switch()
+        cleanup = updater.finish_retained_switch
+        with patch.object(updater, 'finish_retained_switch', side_effect=OSError('cleanup interrupted')):
+            with self.assertRaisesRegex(OSError, 'cleanup interrupted'):
+                self.install()
+        journal = self.root / 'retained-switch-committed.json'
+        backup = retained.with_name('.retained-' + retained.name)
+        self.assertTrue(journal.is_file())
+        self.assertTrue(backup.is_dir())
+        self.calls.clear()
+        with patch.object(updater, 'finish_retained_switch', wraps=cleanup) as resumed:
+            self.install()
+        resumed.assert_called_once()
+        self.assertEqual((self.root / 'current').resolve(), retained)
+        self.assertEqual((self.root / 'previous').resolve(), current)
+        self.assertFalse(backup.exists())
+        self.assertFalse(journal.exists())
+        self.assertEqual(self.calls, [])
+
+    def test_retained_release_refuses_different_receipt_or_tampered_download(self):
         current, retained, _ = self.prepare_retained_switch()
         with patch.dict(self.manifest, {'protocol_version': 2}):
             with self.assertRaisesRegex(ValueError, 'does not match the published manifest'):
                 self.install()
-        (retained / 'hub.pyz').write_bytes(b'tampered')
-        with self.assertRaisesRegex(ValueError, 'artifact mismatch: hub.pyz'):
+        self.files['hub.pyz'] = b'tampered'
+        with self.assertRaisesRegex(ValueError, 'checksum mismatch: hub.pyz'):
             self.install()
         self.assertEqual((self.root / 'current').resolve(), current)
         self.assertEqual((self.root / 'previous').resolve(), retained)
         self.assertEqual(self.calls, [])
-
-    def test_retained_release_refuses_tampered_host_and_transport_modules(self):
-        current, retained, _ = self.prepare_retained_switch()
-        for member in ('agent_hub_host/agent.py', 'websockets/__init__.py'):
-            with self.subTest(member=member):
-                installed = retained / 'lib/python3.11/site-packages' / member
-                original = installed.read_bytes()
-                installed.write_bytes(b'changed package source')
-                with self.assertRaisesRegex(ValueError, 'installed package does not match published wheel'):
-                    self.install()
-                self.assertEqual((self.root / 'current').resolve(), current)
-                self.assertEqual(self.calls, [])
-                installed.write_bytes(original)
 
     def test_retained_activation_rechecks_published_manifest_after_socket_readiness(self):
         current, retained, units = self.prepare_retained_switch()
