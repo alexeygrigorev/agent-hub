@@ -18,6 +18,7 @@ from .native_launch import NativeLauncher, LOCAL_ROUTES, UUID_RE, canonical, nat
 
 # Keep the live native-session census fresh for the global Hub session limit.
 LIVE_SESSION_HEARTBEAT_SECONDS = 30
+_NATIVE_INVENTORY_START_LOCK = threading.Lock()
 
 
 def run_heartbeat_loop(beat, stop, interval=LIVE_SESSION_HEARTBEAT_SECONDS):
@@ -767,6 +768,31 @@ class Bridge:
         capabilities = capabilities[:32]
         if include_native_sessions:
             self.client.heartbeat(labels,engines,capabilities,native_sessions=self.live_sessions())
+            # Observation transport is independent of managed lifecycle/admission.
+            # Failed/unsupported collection never publishes an empty replacement.
+            inventory = getattr(self.launcher, 'inventory', None)
+            publish = getattr(self.client, 'publish_native_inventory', None)
+            if self.machine_id and callable(inventory) and callable(publish):
+                # One observational worker per bridge; collection/upload must not
+                # delay connection, offers, managed heartbeats or safety stops.
+                with _NATIVE_INVENTORY_START_LOCK:
+                    stopped = getattr(self, '_native_inventory_stop', None)
+                    if stopped is None:
+                        stopped = self._native_inventory_stop = threading.Event()
+                    if stopped.is_set():
+                        return
+                    previous = getattr(self, '_native_inventory_thread', None)
+                    if previous is None or not previous.is_alive():
+                        machine_id = self.machine_id
+                        def publish_observation():
+                            try:
+                                observation = inventory()
+                                if not stopped.is_set():
+                                    publish(machine_id, observation, stop_event=stopped)
+                            except Exception:
+                                logging.getLogger(__name__).warning('Native inventory publication unavailable')
+                        self._native_inventory_thread = threading.Thread(target=publish_observation, name='hub2-native-inventory', daemon=True)
+                        self._native_inventory_thread.start()
         else:
             self.client.heartbeat(labels,engines,capabilities)
 
@@ -790,6 +816,11 @@ class Bridge:
 
     def serve(self, machine_id, labels):
         logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s %(message)s')
+        with _NATIVE_INVENTORY_START_LOCK:
+            previous_stop = getattr(self, '_native_inventory_stop', None)
+            if previous_stop is not None:
+                previous_stop.set()
+            self._native_inventory_stop = threading.Event()
         self._launch_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix='hub2-launch')
         self._command_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix='hub2-command')
         self._worker_slots = threading.BoundedSemaphore(32)
@@ -804,6 +835,8 @@ class Bridge:
         try:
             self._serve(machine_id, labels)
         finally:
+            with _NATIVE_INVENTORY_START_LOCK:
+                self._native_inventory_stop.set()
             stop.set()
             thread.join(timeout=1)
             self._launch_pool.shutdown(wait=False)

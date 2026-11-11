@@ -10,3 +10,5 @@ registerHooks({resolve(specifier,context,next){
 }});
 await import('./machine-reaper.test.ts');
 await import('./machine-picker-evidence.test.ts');
+
+await import('./native-inventory.test.ts');

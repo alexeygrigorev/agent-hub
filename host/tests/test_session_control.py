@@ -359,6 +359,39 @@ class TestSessionControlCli(unittest.TestCase):
         self.assertEqual(transport.call_args_list[0].args[:2], ('GET', '/api/sessions?live=1&limit=100'))
         self.assertEqual(transport.call_args_list[1].args[:2], ('GET', '/api/sessions?live=1&limit=100&cursor=cursor-1'))
 
+    def test_inventory_metadata_survives_all_pages_including_empty_and_repeated_snapshots(self):
+        args = self.parse('list', '--json')
+        fresh = {'machine_id': 'h1', 'snapshot_id': 'snap1', 'complete': True, 'fresh': True}
+        pending = {'machine_id': 'h2', 'complete': False, 'fresh': False, 'error': 'inventory_schema_pending'}
+        changed = {**fresh, 'machine_id': 'h3', 'snapshot_id': 'snap2', 'fresh': False}
+        pages = [
+            {'sessions': [{'id': 'native:h1:a', 'managed': False}], 'next_cursor': 'one', 'native_inventories': [fresh]},
+            {'sessions': [], 'next_cursor': 'two', 'native_inventories': [pending]},
+            {'sessions': [], 'next_cursor': 'three', 'native_inventories': [fresh]},
+            {'sessions': [{'id': 'native:h1:b', 'managed': False}], 'next_cursor': None, 'native_inventories': [changed]},
+        ]
+        with patch.object(session_control, 'request', side_effect=pages):
+            result = session_control.execute(args)
+        self.assertEqual(result['native_inventories'], [fresh, pending, changed])
+        self.assertEqual([row['id'] for row in result['sessions']], ['native:h1:a', 'native:h1:b'])
+        self.assertIsNone(result['next_cursor'])
+        # Single-machine projections carry singular metadata instead of an array.
+        with patch.object(session_control, 'request', return_value={'items': [], 'next': None, 'native_inventory': pending}):
+            result = session_control.execute(args)
+        self.assertEqual(result['native_inventories'], [pending])
+
+    def test_inventory_generation_changes_refuse_a_false_complete_listing(self):
+        args = self.parse('list', '--json')
+        first = {'machine_id': 'h1', 'snapshot_id': 'snap1', 'complete': True, 'fresh': True}
+        for changed in ({**first, 'snapshot_id': 'snap2'}, {**first, 'fresh': False},
+                        {'machine_id': 'h1', 'complete': False, 'fresh': False, 'error': 'inventory_schema_pending'}):
+            with self.subTest(changed=changed), patch.object(session_control, 'request', side_effect=[
+                {'sessions': [{'id': 'native:h1:2'}], 'next_cursor': 'next', 'native_inventories': [first]},
+                {'sessions': [{'id': 'native:h1:3'}], 'next_cursor': None, 'native_inventories': [changed]},
+            ]):
+                with self.assertRaisesRegex(ValueError, 'Native inventory changed during pagination'):
+                    session_control.execute(args)
+
     def test_state_filter_walks_pages_until_all_matches_are_found(self):
         args = self.parse('list', '--state', 'running')
         first = {'sessions': [{'id': 'a', 'state': 'offered'}], 'next_cursor': 'page-two'}
