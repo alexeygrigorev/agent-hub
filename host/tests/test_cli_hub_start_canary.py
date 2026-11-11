@@ -30,6 +30,7 @@ if args[:2] == ["sessions", "start"]:
     if sc == "typed_start_fail": sys.stderr.write("Session HTTP request failed with status 503 (no_connected_host)\n"); sys.exit(1)
     if sc == "start_garbage": print("not json"); sys.exit(0)
     if sc == "start_noid": print(json.dumps({"state": "queued"})); sys.exit(0)
+    if sc == "replay_timeout_empty_list": time.sleep(2); sys.exit(0)
     first = not (d / "started").exists()
     (d / "started").write_text("1"); (d / "a_running").write_text("1")
     prompt_text = args[args.index("--prompt") + 1]
@@ -302,7 +303,11 @@ class CanaryTest(unittest.TestCase):
 
     def test_stage_start_garbage_and_no_id(self):
         self.assert_stage("start_garbage", "start", "unparseable_json")
+        self.assertEqual(len(list((self.state / "pending").glob("*.json"))), 1)
+        for p in (self.state / "pending").glob("*.json"):
+            p.unlink()
         self.assert_stage("start_noid", "start", "no_session_id")
+        self.assertEqual(len(list((self.state / "pending").glob("*.json"))), 1)
 
     def test_stage_running_never(self):
         v = self.assert_stage("never_running", "running", "native_launch_unverified")
@@ -1509,6 +1514,94 @@ class CanaryTest(unittest.TestCase):
         self.assertTrue(v_rec["ok"])
         self.assertFalse(prior_periodic.exists())
         self.assertIn("sessions stop " + SID + " --key canary-prior-periodic-reconcile", self.calls())
+
+        # Ambiguous prior periodic pending record (session_id=None, candidate_sha=None) must be RETAINED
+        # and fail closed at stage=cleanup/prior_pending_reconciliation_failed BEFORE minting any new start
+        # when same-key replay times out (rc=124) or returns unparseable output and list[] is empty.
+        prior_ambiguous = pending_dir / "prior-ambiguous.json"
+        prior_ambiguous.write_text(
+            json.dumps(
+                {
+                    "run_id": "prior-ambiguous",
+                    "mode": "shell",
+                    "name": "hub-canary-shell-prior-ambiguous",
+                    "key": "canary-prior-ambiguous",
+                    "repo": "owner/repo",
+                    "machine": "HOST-1",
+                    "workspace": str((self.tmp / "ws").resolve()),
+                    "prompt": "printf CANARY-OK; sleep 30",
+                    "candidate_sha": None,
+                    "session_id": None,
+                    "native_id": None,
+                }
+            )
+        )
+        os.chmod(prior_ambiguous, 0o600)
+
+        (self.tmp / "calls.log").write_text("")
+        r_to, v_to = self.run_canary(
+            "replay_timeout_empty_list", "--mode", "shell",
+            HUB_CANARY_CMD_TIMEOUT_S="0.05",
+            HUB_CANARY_STOP_TIMEOUT_S="0.2",
+        )
+        self.assertEqual(r_to.returncode, 1)
+        self.assertEqual(
+            (v_to["ok"], v_to["stage"], v_to["reason"], v_to["session_id"]),
+            (False, "cleanup", "prior_pending_reconciliation_failed", None),
+        )
+        self.assertTrue(prior_ambiguous.exists())
+        to_starts = [ln for ln in self.calls().splitlines() if ln.startswith("sessions start ")]
+        self.assertEqual(len(to_starts), 1)
+        self.assertIn("--key canary-prior-ambiguous", to_starts[0])
+
+        (self.tmp / "calls.log").write_text("")
+        r_garb, v_garb = self.run_canary("start_garbage", "--mode", "shell")
+        self.assertEqual(r_garb.returncode, 1)
+        self.assertEqual(
+            (v_garb["ok"], v_garb["stage"], v_garb["reason"], v_garb["session_id"]),
+            (False, "cleanup", "prior_pending_reconciliation_failed", None),
+        )
+        self.assertTrue(prior_ambiguous.exists())
+        garb_starts = [ln for ln in self.calls().splitlines() if ln.startswith("sessions start ")]
+        self.assertEqual(len(garb_starts), 1)
+        self.assertIn("--key canary-prior-ambiguous", garb_starts[0])
+        prior_ambiguous.unlink()
+
+        # Prior periodic pending record with exact session_id whose stop fails must abort BEFORE any fresh start.
+        prior_stop_fail = pending_dir / "prior-stop-fail.json"
+        prior_stop_fail.write_text(
+            json.dumps(
+                {
+                    "run_id": "prior-stop-fail",
+                    "mode": "shell",
+                    "name": "hub-canary-shell-prior-stop-fail",
+                    "key": "canary-prior-stop-fail",
+                    "repo": "owner/repo",
+                    "machine": "HOST-1",
+                    "workspace": str((self.tmp / "ws").resolve()),
+                    "prompt": "printf CANARY-OK; sleep 30",
+                    "candidate_sha": None,
+                    "session_id": SID,
+                    "native_id": NATIVE,
+                }
+            )
+        )
+        os.chmod(prior_stop_fail, 0o600)
+        (self.tmp / "calls.log").write_text("")
+        r_sf, v_sf = self.run_canary("stop_fail", "--mode", "shell")
+        self.assertEqual(r_sf.returncode, 1)
+        self.assertEqual(
+            (v_sf["ok"], v_sf["stage"], v_sf["reason"], v_sf["session_id"]),
+            (False, "cleanup", "prior_pending_reconciliation_failed", None),
+        )
+        self.assertTrue(prior_stop_fail.exists())
+        sf_starts = [ln for ln in self.calls().splitlines() if ln.startswith("sessions start ")]
+        self.assertEqual(sf_starts, [])
+        prior_stop_fail.unlink()
+
+        (self.state / "state-shell.json").unlink(missing_ok=True)
+        if self.sink.exists():
+            self.sink.unlink()
 
         # Lock contention on deploy-gate.lock in periodic mode must NOT increment failures or send CRITICAL mail.
         lock_fd = os.open(self.state / "deploy-gate.lock", os.O_RDWR)
