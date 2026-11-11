@@ -258,7 +258,7 @@ export class ProjectDO {
     const body = await bodyObject(request.clone(), 16384);
     const row = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id = ?', intakeId);
     if (!row) return error('intake_not_found', 404);
-    const supported = ['key', 'expected_version', 'title', 'priority', 'acceptance_criteria', 'status', 'reason', 'note', 'outcome', 'superseded_by', ...INTAKE_CONTEXT_FIELDS];
+    const supported = ['key', 'expected_version', 'title', 'priority', 'acceptance_criteria', 'status', 'reason', 'note', 'outcome', 'superseded_by', 'force', 'verification', 'project', ...INTAKE_CONTEXT_FIELDS];
     if (Object.keys(body).some(field => !supported.includes(field))) return error('unknown_intake_field', 400);
     const mapped: JsonRecord = { key: body.key };
     if (typeof body.expected_version === 'number') mapped.expected_updated_at = body.expected_version;
