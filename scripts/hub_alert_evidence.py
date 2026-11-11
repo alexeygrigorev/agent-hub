@@ -245,10 +245,12 @@ def verify_source(entry):
 
 def remote_spec(name, entry):
     remote = entry.get('remote')
-    require(name == 'credential_monitor' and entry.get('mode') == 'external'
+    expected_kind = {'credential_monitor': 'credential_monitor_post_v1',
+                     'picker_excluded': 'picker_diagnostic_v1', 'picker_quota_stale': 'picker_diagnostic_v1'}.get(name)
+    require(expected_kind is not None and entry.get('mode') == 'external'
             and 'witness_path' not in entry and isinstance(remote, dict)
             and set(remote) == {'kind', 'base_url', 'credential_path', 'source_id', 'release_sha'}
-            and remote.get('kind') == 'credential_monitor_post_v1', 'invalid_remote_authority')
+            and remote.get('kind') == expected_kind, 'invalid_remote_authority')
     value = remote.get('base_url')
     require(isinstance(value, str) and len(value) <= 2048 and not any(ord(c) <= 32 for c in value), 'invalid_remote_origin')
     url = urllib.parse.urlsplit(value)
@@ -299,7 +301,9 @@ def remote_witness(name, entry):
     require(isinstance(token, str) and 32 <= len(token) <= 8192
             and all(33 <= ord(c) < 127 for c in token), 'invalid_remote_credential')
     nonce = uuid.uuid4().hex
-    url = remote['base_url'].rstrip('/') + '/api/model-picker/credential-monitor-evidence?nonce=' + nonce
+    endpoint = ('/api/model-picker/credential-monitor-evidence?nonce=' if name == 'credential_monitor' else
+                '/api/model-picker/diagnostic-evidence?producer=' + name + '&nonce=')
+    url = remote['base_url'].rstrip('/') + endpoint + nonce
     try:
         result = subprocess.run([sys.executable, '-I', '-S', '-c', REMOTE_FETCH],
             input=canonical({'url': url, 'token': token}), stdout=subprocess.PIPE,

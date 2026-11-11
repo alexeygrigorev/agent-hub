@@ -37,21 +37,23 @@ function temp() {
   return mkdtempSync(join(parent, 'ingress-'));
 }
 async function fixture(directory: string, options: any = {}) {
+  const producer = options.producer ?? 'credential_monitor', diagnostic = producer !== 'credential_monitor';
+  const artifactNames = ['node/alert-evidence.ts','node/main.ts','src/worker.ts', ...(diagnostic ? ['src/model-picker.ts','src/routing-pool.ts'] : [])];
   const installed = join(directory, 'installed'), state = join(directory, 'state');
   if (!existsSync(installed)) {
     mkdirSync(join(installed, 'node'), {recursive:true, mode:0o700});
     cpSync(join(ROOT, 'hub2/src'), join(installed, 'src'), {recursive:true});
     for (const name of ['alert-evidence.ts','main.ts']) copyFileSync(join(ROOT,'hub2/node',name),join(installed,'node',name));
-    for (const name of ['node/alert-evidence.ts','node/main.ts','src/worker.ts']) chmodSync(join(installed,name),0o600);
+    for (const name of artifactNames) chmodSync(join(installed,name),0o600);
   }
-  const paths = ['node/alert-evidence.ts','node/main.ts','src/worker.ts'].map(name=>join(installed,name));
+  const paths = artifactNames.map(name=>join(installed,name));
   const artifacts = paths.map(path=>({path,sha256:sha(readFileSync(path))}));
   const source_id = sha(canonical(artifacts));
   if (!existsSync(state)) {
     mkdirSync(state,{mode:0o700});
-    privateJson(join(state,'enrollment.json'),{kind:'hub_credential_monitor_enrollment_v1',producer:'credential_monitor',recipient:'dev@dtcdev.click',
+    privateJson(join(state,'enrollment.json'),{kind:diagnostic?'hub_picker_diagnostic_enrollment_v1':'hub_credential_monitor_enrollment_v1',producer,recipient:'dev@dtcdev.click',
       enrollment_id:'2'.repeat(32),source_id,release_sha:RELEASE,artifacts});
-    privateJson(join(state,'journal.json'),{kind:'hub_credential_monitor_journal_v1',source_id,enrollment_id:'2'.repeat(32),
+    privateJson(join(state,'journal.json'),{kind:diagnostic?'hub_picker_diagnostic_journal_v1':'hub_credential_monitor_journal_v1',...(diagnostic?{producer}:{}),source_id,enrollment_id:'2'.repeat(32),
       occurrence_count:0,started_total:0,finished_total:0});
   }
   const loadedArtifacts = Object.fromEntries(artifacts.map(a=>[a.path,a.sha256]));
@@ -61,39 +63,41 @@ async function fixture(directory: string, options: any = {}) {
   const policy=JSON.parse(readFileSync(join(ROOT,'config/model-policy.json'),'utf8'));
   const candidates=policy.candidates.filter((row:any)=>['codex-sol-medium','claude-sonnet-medium'].includes(row.id));
   assert.equal(candidates.length,2);
-  const model={unhealthy:true,actor:{id:'synthetic-observer',kind:'operator',scopes:['operator:admin']}};
+  const model:{unhealthy:boolean;excludeOne:boolean;stale:boolean;failRouting:boolean;beforeRead?:()=>Promise<void>;actor:any}={unhealthy:true,excludeOne:diagnostic,stale:false,failRouting:false,actor:{id:'synthetic-observer',kind:'operator',scopes:['operator:admin']}};
   const namespace=(kind:string)=>({idFromName:(id:string)=>id,get:(id:string)=>({fetch:async(input:any,init?:any)=>{
     const req=input instanceof Request?input:new Request(input,init),url=new URL(req.url);
     if(kind==='control'){
       if(url.pathname==='/_verify')return Response.json({actor:model.actor});
-      if(url.pathname==='/_routing-policy')return Response.json({version:17,candidates});
+      if(url.pathname==='/_routing-policy'){if(model.beforeRead)await model.beforeRead();if(model.failRouting)throw new Error('synthetic routing failure');return Response.json({version:17,candidates});}
       if(url.pathname==='/api/directory')return Response.json({items:[{id:'h1'}],next:null});
     }
-    if(kind==='accounts')return Response.json({account:{enabled:true},credential_usable:!model.unhealthy,credential_status:model.unhealthy?'missing':'ready',
-      quota:{remaining:60,captured_at:Date.now(),valid_until:Date.now()+900000},fresh:true,hosts:['h1']});
+    if(kind==='accounts')return Response.json({account:{enabled:true},credential_usable:!model.unhealthy||model.excludeOne&&id==='codex',credential_status:model.unhealthy&&!(model.excludeOne&&id==='codex')?'missing':'ready',
+      quota:{remaining:60,captured_at:Date.now()-1000,valid_until:Date.now()+(model.stale?-1:900000)},fresh:!model.stale,hosts:['h1']});
     if(kind==='machines')return Response.json({machine_id:'h1',connected:true,os:'linux',engines:['codex','claude'],capabilities:['headless:codex','headless:claude','effort:codex','effort:claude']});
     throw new Error('unexpected synthetic route');
   }})});
-  const env:any={CONTROL:namespace('control'),ACCOUNTS:namespace('accounts'),MACHINES:namespace('machines'),CREDENTIAL_MONITOR_EVIDENCE:observer};
+  const env:any={CONTROL:namespace('control'),ACCOUNTS:namespace('accounts'),MACHINES:namespace('machines'),...(diagnostic?{PICKER_DIAGNOSTIC_EVIDENCE:{[producer]:observer}}:{CREDENTIAL_MONITOR_EVIDENCE:observer})};
   const post=(marked=true)=>worker.fetch(new Request('http://127.0.0.1/api/model-picker/pick',{method:'POST',
     headers:{Authorization:'Bearer '+TOKEN,'Content-Type':'application/json',...(marked?{'X-Hub-Alert-Producer':'credential_monitor'}:{})},body:'{}'}),env);
-  const sample=(nonce=NONCE,method='GET')=>worker.fetch(new Request('http://127.0.0.1/api/model-picker/credential-monitor-evidence?nonce='+nonce,
+  const sample=(nonce=NONCE,method='GET')=>worker.fetch(new Request('http://127.0.0.1/api/model-picker/'+(diagnostic?'diagnostic-evidence?producer='+producer+'&nonce=':'credential-monitor-evidence?nonce=')+nonce,
     {method,headers:{Authorization:'Bearer '+TOKEN}}),env);
   return {observer,worker,env,post,sample,state,installed,loadedArtifacts,source_id,model};
 }
-async function serverMode(directory:string,fail:boolean,port=0) {
+async function serverMode(directory:string,fail:boolean,port=0,producer='credential_monitor') {
   // These HTTP/aggregate fixtures test transport and decision semantics, not
   // host fsync latency. Dedicated default-writer tests exercise real durability.
-  const f=await fixture(directory,fail?{writer:async()=>{throw new Error('synthetic write fault');}}:
-    {timeoutMs:2000,writer:semanticWriter});
+  const f=await fixture(directory,fail?{producer,writer:async()=>{throw new Error('synthetic write fault');}}:
+    {producer,timeoutMs:2000,writer:semanticWriter});
   const server=createServer(async(req,res)=>{
+    if(req.url==='/__fixture/idle'){await (f.observer as any).queue;res.writeHead(200);res.end('{}');return;}
+    if(req.url==='/__fixture/stale'){f.model.stale=true;f.model.unhealthy=false;res.writeHead(200);res.end('{}');return;}
     if(req.url==='/__fixture/healthy'){f.model.unhealthy=false;res.writeHead(200);res.end('{}');return;}
     const chunks:Buffer[]=[]; for await(const chunk of req)chunks.push(Buffer.from(chunk));
     const result=await f.worker.fetch(new Request('http://127.0.0.1'+req.url,{method:req.method,
       headers:req.headers as any,...(req.method==='POST'?{body:Buffer.concat(chunks)}:{})}),f.env);
     res.writeHead(result.status,Object.fromEntries(result.headers));res.end(Buffer.from(await result.arrayBuffer()));
   });
-  server.listen(port,'127.0.0.1',()=>console.log(JSON.stringify({port:(server.address() as any).port,source_id:f.source_id,release_sha:RELEASE})));
+  server.listen(port,'127.0.0.1',()=>console.log(JSON.stringify({port:(server.address() as any).port,source_id:f.source_id,release_sha:RELEASE,producer})));
   process.on('SIGTERM',()=>server.close(()=>process.exit(0)));
 }
 async function startServerChild(directory:string,fail=false) {
@@ -111,6 +115,114 @@ async function stop(child:ReturnType<typeof spawn>, signal:any='SIGTERM') {
   await new Promise<void>(resolveDone=>{child.once('exit',()=>resolveDone());child.kill(signal);});
 }
 async function defineTests() {
+  test('diagnostic authorities observe real picker decisions without a marked monitor POST or redraw',async t=>{
+    for(const producer of ['picker_excluded','picker_quota_stale']){
+      const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
+      const f=await fixture(directory,{producer,timeoutMs:2000,writer:semanticWriter});t.after(()=>f.observer.close());
+      f.model.stale=producer==='picker_quota_stale';
+      const primary=await f.post(false);assert.equal(primary.status,200);
+      const body=await primary.json() as any;
+      assert.ok(producer==='picker_excluded'?body.excluded.length:body.warnings.length);
+      await (f.observer as any).queue;
+      let proof=await (await f.sample()).json() as any;
+      assert.equal(proof.complete,true);assert.equal(proof.producer,producer);assert.equal(proof.occurrence_count,1);
+      assert.equal(proof.started_total,1);assert.equal(proof.finished_total,1);
+      // A direct call uses the exact same hook as Control's serialized draw.
+      const {pickModelRouteDetailed}=await import(pathToFileURL(join(f.installed,'src/model-picker.ts')).href);
+      let draws=0;await pickModelRouteDetailed(f.env,{},()=>{draws++;return 0.5;});
+      assert.equal(draws,1,'proof must not take an independent model sample');
+      await (f.observer as any).queue;
+      proof=await (await f.sample()).json() as any;assert.equal(proof.occurrence_count,2);
+      f.model.unhealthy=false;f.model.stale=false;
+      assert.equal((await f.post(false)).status,200);await (f.observer as any).queue;
+      proof=await (await f.sample()).json() as any;assert.equal(proof.complete,true);
+      assert.equal(proof.started_total,3);assert.equal(proof.occurrence_count,2,'healthy completion never counts an alert');
+    }
+  });
+  test('diagnostic excluded counter follows console exclusions, not monitor advisory projection',async t=>{
+    const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
+    const f=await fixture(directory,{producer:'picker_excluded',timeoutMs:2000,writer:semanticWriter});t.after(()=>f.observer.close());
+    f.model.excludeOne=false; // All unusable credentials use the existing advisory fallback.
+    const body=await (await f.post(false)).json() as any;assert.ok(body.excluded.length>0);
+    await (f.observer as any).queue;
+    const proof=await (await f.sample()).json() as any;assert.equal(proof.complete,true);assert.equal(proof.occurrence_count,0);
+    assert.equal(proof.finished_total,1);
+  });
+  test('diagnostic pending IO never delays primary response; barriers fail closed until durable',async t=>{
+    const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
+    let release!:()=>void,entered!:()=>void;
+    const started=new Promise<void>(yes=>entered=yes),gate=new Promise<void>(yes=>release=yes);
+    const f=await fixture(directory,{producer:'picker_excluded',timeoutMs:2000,writer:async(value:any,handle:any)=>{
+      entered();await gate;await semanticWriter(value,handle);
+    }});t.after(async()=>{release();await f.observer.close();});
+    const response=f.post(false);await started;
+    // An IO gate, not a sleeping fast-path assertion. If the business path
+    // awaits proof IO this test cannot receive a response before release.
+    let timer:ReturnType<typeof setTimeout>|undefined;
+    let result:Response;
+    try{result=await Promise.race([response,new Promise<never>((_,no)=>{timer=setTimeout(()=>no(new Error('primary awaited proof IO')),1000);})]);}
+    finally{clearTimeout(timer);}
+    assert.equal(result.status,200);assert.equal((await (await f.sample()).json() as any).available,false);
+    release();await (f.observer as any).queue;
+    const proof=await (await f.sample()).json() as any;assert.equal(proof.complete,true);assert.equal(proof.occurrence_count,1);
+  });
+  test('diagnostic uncertain decision or failed writer cannot heal; primary semantics unchanged',async t=>{
+    for(const fault of ['decision','writer']){
+      const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
+      let broken=true;
+      const f=await fixture(directory,{producer:'picker_quota_stale',timeoutMs:2000,writer:async(value:any,handle:any)=>{
+        if(fault==='writer'&&broken)throw new Error('synthetic fault');await semanticWriter(value,handle);
+      }});t.after(()=>f.observer.close());
+      f.model.failRouting=fault==='decision';f.model.stale=true;
+      assert.equal((await f.post(false)).status,fault==='decision'?500:200);
+      await (f.observer as any).queue;
+      broken=false;f.model.failRouting=false;
+      assert.equal((await f.post(false)).status,200);await (f.observer as any).queue;
+      assert.equal((await (await f.sample()).json() as any).available,false);
+    }
+  });
+  test('diagnostic decisions remain counted when selection fails after the console decisions',async t=>{
+    const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
+    const f=await fixture(directory,{producer:'picker_excluded',timeoutMs:2000,writer:semanticWriter});t.after(()=>f.observer.close());
+    const {pickModelRouteDetailed}=await import(pathToFileURL(join(f.installed,'src/model-picker.ts')).href);
+    await assert.rejects(pickModelRouteDetailed(f.env,{},()=>{throw new Error('synthetic post-decision failure');}),/post-decision/);
+    await (f.observer as any).queue;
+    const proof=await f.observer.snapshot(NONCE);assert.equal(proof.complete,true);assert.equal(proof.occurrence_count,1);
+  });
+  test('diagnostic inflight calls, nonce authorization and missing configuration remain explicit',async t=>{
+    const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
+    const f=await fixture(directory,{producer:'picker_excluded',timeoutMs:2000,writer:semanticWriter});t.after(()=>f.observer.close());
+    let release!:()=>void,entered!:()=>void;const gate=new Promise<void>(yes=>release=yes),started=new Promise<void>(yes=>entered=yes);
+    f.model.beforeRead=async()=>{entered();await gate;};t.after(()=>release());
+    const request=f.post(false);await started;
+    const during=await (await f.sample('2'.repeat(32))).json() as any;
+    assert.equal(during.available,false);assert.equal(during.nonce,'2'.repeat(32));
+    release();assert.equal((await request).status,200);await (f.observer as any).queue;
+    assert.equal((await f.sample('bad')).status,400);assert.equal((await f.sample(NONCE,'POST')).status,405);
+    f.model.actor={id:'synthetic-reader',kind:'operator',scopes:['session:start']};assert.equal((await f.sample()).status,403);
+    f.model.actor={id:'synthetic-machine',kind:'machine',resource_id:'h1',scopes:['machine:heartbeat']};assert.equal((await f.sample()).status,403);
+    f.model.actor={id:'synthetic-admin',kind:'operator',scopes:['operator:admin']};
+    delete f.env.PICKER_DIAGNOSTIC_EVIDENCE;
+    assert.equal((await (await f.sample()).json() as any).available,false);
+    assert.equal((await f.post(false)).status,200);
+  });
+  test('diagnostic enrollment identity, five loaded artifacts, immutable history and restart fencing',async t=>{
+    const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
+    const f=await fixture(directory,{producer:'picker_excluded',timeoutMs:2000,writer:semanticWriter});
+    await f.post(false);await (f.observer as any).queue;
+    const before=await f.observer.snapshot(NONCE);assert.equal(before.complete,true);
+    const {AlertEvidence}=await import(pathToFileURL(join(f.installed,'node/alert-evidence.ts')).href);
+    await f.observer.close();
+    // Same immutable state, new incarnation: never continuity across restarts.
+    const again=await AlertEvidence.load(f.state,{producer:'picker_excluded',loadedArtifacts:f.loadedArtifacts,timeoutMs:2000});
+    t.after(()=>again.close());const after=await again.snapshot(NONCE);assert.equal(after.complete,true);assert.notEqual(after.epoch,before.epoch);
+    await assert.rejects(AlertEvidence.load(f.state,{producer:'picker_quota_stale',loadedArtifacts:f.loadedArtifacts}),/unavailable/);
+    await assert.rejects(AlertEvidence.load(f.state,{loadedArtifacts:f.loadedArtifacts}),/unavailable/);
+    const bad={...f.loadedArtifacts,[join(f.installed,'src/model-picker.ts')]:'f'.repeat(64)};
+    await assert.rejects(AlertEvidence.load(f.state,{producer:'picker_excluded',loadedArtifacts:bad}),/unavailable/);
+    privateJson(join(f.state,'journal.json'),{});
+    await again.finish(again.begin(),'alert');assert.equal((await again.snapshot(NONCE)).available,false);
+  });
   test('exact final exclusion criterion counts marked decisions; unmarked and healthy do not count',async t=>{
     const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
     // Decision/queue semantics use a deterministic writer; real durability is
@@ -360,6 +472,50 @@ async function defineTests() {
     assert.equal(code,0,output);
     const count=output.match(/Ran (\d+) tests/);assert.ok(count&&Number(count[1])>=28,'required Python cases must execute, not collect zero: '+output);
   });
+  test('actual main loads diagnostic opt-ins independently of absent credential or broken sibling',async t=>{
+    for(const fault of ['credential-missing','diagnostic-corrupt']){
+      const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
+      const hub=join(directory,'hub2');mkdirSync(hub);
+      cpSync(join(ROOT,'hub2/node'),join(hub,'node'),{recursive:true});cpSync(join(ROOT,'hub2/src'),join(hub,'src'),{recursive:true});
+      copyFileSync(join(ROOT,'hub2/production-worker.ts'),join(hub,'production-worker.ts'));
+      const create=(producer:string)=>{
+        const diagnostic=producer!=='credential_monitor',state=join(directory,producer);mkdirSync(state,{mode:0o700});
+        const names=['node/alert-evidence.ts','node/main.ts','src/worker.ts',...(diagnostic?['src/model-picker.ts','src/routing-pool.ts']:[])];
+        const artifacts=names.map(name=>{const path=join(hub,name);chmodSync(path,0o600);return {path,sha256:sha(readFileSync(path))};});
+        const source_id=sha(canonical(artifacts));
+        privateJson(join(state,'enrollment.json'),{kind:diagnostic?'hub_picker_diagnostic_enrollment_v1':'hub_credential_monitor_enrollment_v1',producer,recipient:'dev@dtcdev.click',
+          enrollment_id:'3'.repeat(32),source_id,release_sha:RELEASE,artifacts});
+        privateJson(join(state,'journal.json'),{kind:diagnostic?'hub_picker_diagnostic_journal_v1':'hub_credential_monitor_journal_v1',...(diagnostic?{producer}:{}),
+          source_id,enrollment_id:'3'.repeat(32),occurrence_count:0,started_total:0,finished_total:0});
+        return state;
+      };
+      const excluded=create('picker_excluded'),quota=create('picker_quota_stale');
+      const credential=fault==='credential-missing'?join(directory,'missing'):create('credential_monitor');
+      if(fault==='diagnostic-corrupt')privateJson(join(excluded,'journal.json'),{});
+      const vars=join(directory,'vars');writeFileSync(vars,'HUB2_DEV_OPERATOR_TOKEN='+TOKEN+'\nHUB2_ALERT_EVIDENCE_DIR='+credential+
+        '\nHUB2_PICKER_EXCLUDED_EVIDENCE_DIR='+excluded+'\nHUB2_PICKER_QUOTA_STALE_EVIDENCE_DIR='+quota+'\n');
+      const child=spawn(process.execPath,['--experimental-transform-types',join(hub,'node/main.ts'),'--host','127.0.0.1','--port','0','--data-dir',join(directory,'db'),'--dev-vars',vars],
+        {stdio:['ignore','pipe','pipe'],env:syntheticEnvironment(directory)});t.after(()=>stop(child));let output='',errors='';child.stderr!.on('data',b=>errors+=b);
+      const port=await new Promise<string>((yes,no)=>{const timer=setTimeout(()=>{child.kill('SIGKILL');no(new Error('diagnostic main timeout '+errors));},6000);
+        child.stdout!.on('data',b=>{output+=b;const found=output.match(/listening http:\/\/127\.0\.0\.1:(\d+)/);if(found){clearTimeout(timer);yes(found[1]);}});
+        child.once('exit',()=>{clearTimeout(timer);no(new Error('diagnostic main exited '+errors));});});
+      const base='http://127.0.0.1:'+port,headers={Authorization:'Bearer '+TOKEN};
+      assert.equal((await fetch(base+'/health')).status,200);assert.equal((await fetch(base+'/api/repos',{headers})).status,200);
+      const credentialProof=await (await fetch(base+'/api/model-picker/credential-monitor-evidence?nonce='+NONCE,{headers})).json() as any;
+      assert.equal(credentialProof.complete===true,fault!=='credential-missing');
+      for(const producer of ['picker_excluded','picker_quota_stale']){
+        const response=await fetch(base+'/api/model-picker/diagnostic-evidence?producer='+producer+'&nonce='+NONCE,{headers});
+        assert.equal(response.headers.get('cache-control'),'no-store');const proof=await response.json() as any;
+        assert.equal(proof.complete===true,!(fault==='diagnostic-corrupt'&&producer==='picker_excluded'));
+      }
+      assert.equal((await fetch(base+'/api/model-picker/diagnostic-evidence?producer=backup&nonce='+NONCE,{headers})).status,400);
+      const primary=await fetch(base+'/api/model-picker/pick',{method:'POST',headers:{...headers,'Content-Type':'application/json'},body:'{}'});
+      assert.equal(primary.status,503,'optional authority never changes missing-policy behavior');
+      const after=await (await fetch(base+'/api/model-picker/diagnostic-evidence?producer=picker_quota_stale&nonce='+NONCE,{headers})).json() as any;
+      assert.equal(after.available,false,'uncertain pre-decision invocation cannot become healthy zero');
+      await stop(child);
+    }
+  });
   test('actual main optional missing/import-broken observer never prevents primary startup/routes',async t=>{
     for(const fault of ['configured','missing','broken']){
       const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
@@ -396,5 +552,5 @@ async function defineTests() {
   });
 }
 if(process.argv.includes('--fixture-server')){
-  const index=process.argv.indexOf('--fixture-server');await serverMode(resolve(process.argv[index+1]),process.argv[index+2]==='fail',Number(process.argv[index+3] || 0));
+  const index=process.argv.indexOf('--fixture-server');await serverMode(resolve(process.argv[index+1]),process.argv[index+2]==='fail',Number(process.argv[index+3] || 0),process.argv[index+4] || 'credential_monitor');
 }else await defineTests();

@@ -40,6 +40,8 @@ export interface CredentialMonitorEvidence {
   snapshot(nonce: string): Promise<JsonRecord>;
 }
 
+export type PickerDiagnosticProducer = 'picker_excluded' | 'picker_quota_stale';
+
 export interface Hub2Env {
   // This worker-types release brands RPC-capable DO classes. These DOs use
   // fetch-only stubs, so keep bindings unbranded instead of asserting an
@@ -52,6 +54,9 @@ export interface Hub2Env {
   HUB2_RELEASE_MODE?: string;
   HUB2_ALERT_EVIDENCE_DIR?: string;
   CREDENTIAL_MONITOR_EVIDENCE?: CredentialMonitorEvidence;
+  HUB2_PICKER_EXCLUDED_EVIDENCE_DIR?: string;
+  HUB2_PICKER_QUOTA_STALE_EVIDENCE_DIR?: string;
+  PICKER_DIAGNOSTIC_EVIDENCE?: Partial<Record<PickerDiagnosticProducer, CredentialMonitorEvidence>>;
   HUB2_DISK_FLOOR_GB?: string;
   HUB2_SCHEMA_MIGRATIONS?: string;
   HUB_ALERT_WEBHOOK?: string;
