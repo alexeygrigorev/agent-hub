@@ -787,7 +787,7 @@ class NativeLauncher:
             argv += ["--env", f"{key}={value}"]
         argv += ["--"] + child
         started = time.time()
-        env = spawn_environment(bool(specification.get("provider_home")))
+        env = spawn_environment(bool(specification.get("provider_home") or specification.get("managed_credential_label")))
         env["PWD"] = str(Path(specification["workspace"]).resolve())
         # `a start` is only the daemon handshake client: the spawned session lives
         # under the aplexer supervisor, so the runner timeout bounds the handshake

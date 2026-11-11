@@ -974,6 +974,9 @@ class ManagedClaudeReadinessTests(unittest.TestCase):
                 journal.directory.mkdir(mode=0o700)
                 captured=[]
                 def runner(argv,**kwargs):
+                    self.assertNotIn('CLAUDE_CODE_OAUTH_TOKEN',kwargs['env'])
+                    self.assertNotIn('ANTHROPIC_CUSTOM_KEY',kwargs['env'])
+                    self.assertNotIn('HUB2_TOKEN',kwargs['env'])
                     child=argv[argv.index('--')+1:];captured.append(child)
                     return subprocess.CompletedProcess(argv,0,json.dumps({'id':'11111111-2222-4333-8444-555555555555',
                         'tag':'task-hub2-managed','workspace':str(workspace),'command':child}), '')
@@ -984,7 +987,8 @@ class ManagedClaudeReadinessTests(unittest.TestCase):
                       'interactive':False,'runtime_deadline':int(time.time()*1000)+60000,'request_digest':'b'*64,
                       'account_id':'claude','machine_id':'host','client':SimpleNamespace(base_url='https://hub.test'),
                       'managed_credential_label':'hub-claude'}
-                with mock.patch.object(adapter,'managed_claude_readiness',return_value={'sha256':'a'*64}):
+                with mock.patch.object(adapter,'managed_claude_readiness',return_value={'sha256':'a'*64}), mock.patch.dict(
+                        os.environ,{'CLAUDE_CODE_OAUTH_TOKEN':'synthetic-secret','ANTHROPIC_CUSTOM_KEY':'synthetic-secret','HUB2_TOKEN':'synthetic-host'}):
                     receipt=adapter.launch('hub2-managed',spec)
                 self.assertEqual(receipt['session_id'],'11111111-2222-4333-8444-555555555555')
                 self.assertEqual(captured[0][:3],['synthetic-a','task','run'])
