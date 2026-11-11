@@ -112,6 +112,18 @@ const router = {
         if(!admin(actor))return error('forbidden',403);
         return control.fetch(await forwardRequest(request, CONTROL + path, actor));
       }
+      if (path === '/api/model-picker/credential-monitor-evidence') {
+        if (!admin(actor)) return error('forbidden', 403);
+        if (request.method !== 'GET') return error('method_not_allowed', 405);
+        const nonce = new URL(request.url).searchParams.get('nonce');
+        if (!nonce || !/^[0-9a-f]{32}$/.test(nonce)) return error('invalid_nonce', 400);
+        try {
+          if (env.CREDENTIAL_MONITOR_EVIDENCE) return json(await observerBound(
+            env.CREDENTIAL_MONITOR_EVIDENCE.snapshot(nonce)), 200, { 'Cache-Control': 'no-store' });
+        } catch { try { env.CREDENTIAL_MONITOR_EVIDENCE?.invalidate(); } catch {} }
+        return json({kind:'hub_alert_evidence_unavailable_v1',available:false,reason:'coverage_unknown',nonce},
+          200, {'Cache-Control':'no-store'});
+      }
       if (path === '/api/model-picker/pick')
         return request.method === 'POST' ? await dryRunPick(request, env, actor) : error('method_not_allowed', 405);
       if (path === '/api/fleet/routing/simulate')
@@ -698,6 +710,14 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
   return json({ ...session, project: canonical, intake_id: intakeId }, started.response.status);
 }
 
+/** Optional observation never becomes a second dispatch/authorization dependency. */
+async function observerBound<T>(work: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try { return await Promise.race([work, new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error('observer_unavailable')), 250);
+  })]); } finally { if (timer !== undefined) clearTimeout(timer); }
+}
+
 /** `POST /api/model-picker/pick`: what the picker would choose right now (nothing is started). */
 async function dryRunPick(request: Request, env: Hub2Env, actor: Actor): Promise<Response> {
   if (!admin(actor) && !actor.scopes.includes('session:start')) return error('forbidden', 403);
@@ -708,6 +728,18 @@ async function dryRunPick(request: Request, env: Hub2Env, actor: Actor): Promise
   } catch { return error('invalid_json', 400); }
   if (!body || typeof body !== 'object' || Array.isArray(body)) return error('invalid_json_object', 400);
   const text = (field: string): string | undefined => typeof body[field] === 'string' && (body[field] as string).trim() ? (body[field] as string).trim() : undefined;
+  // This exact response is already mandatory before the monitor may decide to
+  // mail. No extra RPC or local observer bootstrap is inserted into that path.
+  let observer = request.headers.get('X-Hub-Alert-Producer') === 'credential_monitor'
+    ? env.CREDENTIAL_MONITOR_EVIDENCE : undefined;
+  let identity: unknown;
+  try { identity = observer?.begin(); }
+  catch { try { observer?.invalidate(); } catch {} observer = undefined; }
+  const observed = async (decision: 'alert' | 'observation' | null) => {
+    if (!observer) return;
+    try { await observerBound(observer.finish(identity, decision)); }
+    catch { try { observer.invalidate(); } catch {} }
+  };
   try {
     const { route, diagnostics } = await pickModelRouteDetailed(env, {
       purpose: sessionPurpose(body.purpose),
@@ -715,11 +747,14 @@ async function dryRunPick(request: Request, env: Hub2Env, actor: Actor): Promise
       ...(text('tier') ? { tier: text('tier') } : {}),
       ...(Array.isArray(body.needs) ? { required_capabilities: body.needs as string[] } : {}),
     });
+    // Use precisely the existing public criterion, including credential
+    // advisories. Observation never filters a primary notification to get zero.
+    const excluded = [...diagnostics.excluded,...(diagnostics.advisories??[])].filter(row=>row.reason.startsWith('credential_'));
+    await observed(excluded.length ? 'alert' : 'observation');
     return json({ route: [route.engine, route.model, route.effort ?? 'default'].join('/'), engine: route.engine, model: route.model,
-      effort: route.effort ?? null, policy_id: route.policy_id, machine_id: route.machine_id, ...diagnostics,
-      // Preserve the credential-monitor contract; the simulation reports every actual exclusion.
-      excluded:[...diagnostics.excluded,...(diagnostics.advisories??[])].filter(row=>row.reason.startsWith('credential_')) });
+      effort: route.effort ?? null, policy_id: route.policy_id, machine_id: route.machine_id, ...diagnostics, excluded });
   } catch (caught) {
+    await observed(null);
     if (caught instanceof HttpError) return error(caught.code, caught.status);
     throw caught;
   }

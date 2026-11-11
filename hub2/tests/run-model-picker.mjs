@@ -11,3 +11,5 @@ registerHooks({resolve(specifier,context,next){
 await import('./model-picker.test.ts');
 await import('./routing-simulation.test.ts');
 await import('./machine-capabilities.test.ts');
+
+await import('./alert-evidence.test.ts');
