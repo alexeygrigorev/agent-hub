@@ -242,6 +242,13 @@ const router = {
         );
       }
 
+      const nativeInventory=path.match(/^\/api\/machines\/([A-Za-z0-9_.-]{1,80})\/native-inventory$/);
+      if(nativeInventory){
+        if(request.method!=='POST')return error('method_not_allowed',405);
+        if(actor.kind!=='machine'||actor.resource_id!==nativeInventory[1]||!actor.scopes.includes('machine:heartbeat'))return error('forbidden',403);
+        const machine=env.MACHINES.get(env.MACHINES.idFromName(nativeInventory[1]));
+        return machine.fetch(await forwardRequest(request,'https://machine.hub2.internal/api/native-inventory',actor));
+      }
       if (path === '/api/heartbeat' || path === '/api/offers' || path === '/api/connect') {
         if (actor.kind !== 'machine' || !actor.resource_id) return error('forbidden', 403);
         const machine = env.MACHINES.get(env.MACHINES.idFromName(actor.resource_id));
@@ -887,7 +894,9 @@ async function machineProjection(
       next: string | null;
     },
     items: unknown[] = [];
+  const inventories:JsonRecord[]=[];
   let next: string | null = null;
+  if(sessions&&position.session_after&&(page.items.length!==1||position.session_machine!==page.items[0].id))return error('native_inventory_changed',409);
   for (const machine of page.items) {
     const stub = env.MACHINES.get(env.MACHINES.idFromName(machine.id)),
       path = sessions
@@ -897,6 +906,7 @@ async function machineProjection(
           encodeURIComponent(position.session_after || '') + live
         : '/_internal/status';
     const r = await stub.fetch(new Request('https://machine.internal' + path, { headers }));
+    if (r.status===409) return r;
     if (!r.ok) return error('machine_projection_unavailable', 503);
     const data = (await r.json()) as {
       items?: unknown[];
@@ -904,13 +914,16 @@ async function machineProjection(
       machine?: JsonRecord;
       sessions?: unknown[];
       attention?: unknown[];
+      native_inventory?: JsonRecord;
     };
     if (sessions) {
       items.push(...(data.items || []));
+      inventories.push({machine_id:machine.id,...(data.native_inventory??{complete:false,fresh:false,error:'inventory_unavailable'})});
       next = data.next
         ? cursor({
             directory_after: position.directory_after || '',
             session_after: data.next,
+            session_machine: machine.id,
           })
         : page.next
           ? cursor({ directory_after: page.next })
@@ -925,7 +938,7 @@ async function machineProjection(
     }
   }
   if (!sessions) next = page.next ? cursor({ directory_after: page.next }) : null;
-  return json({ items, next, complete: next === null, ...(sessions ? { sessions: items, next_cursor: next } : {}) });
+  return json({ items, next, complete: next === null, ...(sessions ? { sessions: items, next_cursor: next, native_inventories:inventories } : {}) });
 }
 
 

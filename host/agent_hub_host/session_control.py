@@ -1058,6 +1058,8 @@ def _execute(args):
         cursor = None
         cursors: set = set()
         first_page = None
+        native_inventories = {}
+        inventory_generations = {}
         # 3.2: live=1 is the default view; --all (or an explicitly terminal
         # --state) walks history. A --limit caps rows, it does not request
         # history.
@@ -1073,6 +1075,18 @@ def _execute(args):
             if first_page is None:
                 first_page = page
             entries, cursor = _session_page(page)
+            observations = page.get('native_inventories', []) if isinstance(page, dict) else []
+            if isinstance(page, dict) and isinstance(page.get('native_inventory'), dict):
+                observations = [*observations, page['native_inventory']]
+            for observation in observations:
+                if isinstance(observation, dict):
+                    machine = observation.get('machine_id')
+                    generation = (observation.get('snapshot_id'), observation.get('fresh'), observation.get('complete'), observation.get('error'))
+                    if machine in inventory_generations and inventory_generations[machine] != generation:
+                        raise ValueError('Native inventory changed during pagination; restart the listing')
+                    inventory_generations[machine] = generation
+                    identity = (machine, observation.get('snapshot_id'))
+                    native_inventories[identity] = observation
             if len(entries) > page_size:
                 raise ValueError('Session list page exceeds the requested limit')
             for entry in entries:
@@ -1090,6 +1104,8 @@ def _execute(args):
             cursors.add(cursor)
         result = dict(first_page or {})
         result['sessions'] = seen
+        if native_inventories:
+            result['native_inventories'] = list(native_inventories.values())
         result['next_cursor'] = cursor
         if 'items' in result:
             result['items'] = seen

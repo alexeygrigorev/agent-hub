@@ -1,3 +1,4 @@
+import {MachineNativeInventory, NATIVE_INVENTORY_SCHEMA} from './machine-native-inventory';
 import { nativeReturncode } from './native-exit';
 import { normalizeStartPickerEvidence } from './start-picker-evidence';
 import { MeteredDb, initializeSchema, schemaMigrationCeiling } from './db';
@@ -127,17 +128,19 @@ export class MachineDO {
   private readonly env: Hub2Env;
   private readonly constructorMs: number;
   private readonly ready:Promise<void>;
+  private readonly nativeInventory:MachineNativeInventory;
 
   constructor(private readonly ctx: DurableObjectState, env: Hub2Env) {
     const started = performance.now();
     this.db = new MeteredDb(ctx.storage.sql);
     this.sqlReceipts = new SqlReceiptMeter(this.db);
     this.env = wrapSqlNamespaces(env, this.sqlReceipts) as Hub2Env;
-    this.ready=initializeSchema(ctx, this.db, 7, LATEST_SCHEMA, [[SCHEMA[0]],COMPACT_KEYS,['ALTER TABLE machine_capabilities ADD COLUMN resources_json TEXT'],MACHINE_ACTIVE_MIGRATION,[
+    this.nativeInventory=new MachineNativeInventory(this.db,ctx);
+    this.ready=initializeSchema(ctx, this.db, 8, LATEST_SCHEMA, [[SCHEMA[0]],COMPACT_KEYS,['ALTER TABLE machine_capabilities ADD COLUMN resources_json TEXT'],MACHINE_ACTIVE_MIGRATION,[
       'CREATE TABLE IF NOT EXISTS machine_liveness(singleton INTEGER PRIMARY KEY CHECK(singleton=1),observed_at INTEGER NOT NULL)',
       'CREATE TABLE IF NOT EXISTS native_sessions(session_id TEXT PRIMARY KEY,native_id TEXT,phase TEXT NOT NULL,last_activity_at INTEGER,exit_code INTEGER,containment_empty INTEGER NOT NULL,observed_at INTEGER NOT NULL) WITHOUT ROWID',
       'DROP TABLE IF EXISTS machine_active','ALTER TABLE machine_capabilities DROP COLUMN resources_json','ALTER TABLE machines DROP COLUMN active_session_id',
-    ],['ALTER TABLE session_commands ADD COLUMN capture_mode TEXT']],()=>this.scheduleNext(),6,schemaMigrationCeiling(env.HUB2_SCHEMA_MIGRATIONS,6,7));
+    ],['ALTER TABLE session_commands ADD COLUMN capture_mode TEXT'],NATIVE_INVENTORY_SCHEMA],()=>this.scheduleNext(),6,schemaMigrationCeiling(env.HUB2_SCHEMA_MIGRATIONS,7,8));
     this.constructorMs = performance.now() - started;
   }
 
@@ -169,6 +172,13 @@ export class MachineDO {
       if (url.pathname === '/_metrics' && request.method === 'GET') return json({ counts: this.db.snapshot(), constructor_ms: this.constructorMs });
       if (url.pathname === '/api/connect' && request.method === 'GET') return await this.connect(request);
       if (url.pathname === '/api/heartbeat' && request.method === 'POST') return await this.heartbeat(request);
+      if (url.pathname === '/api/native-inventory' && request.method === 'POST') {
+        const machineId=this.machineActor(actorFrom(request),'machine:heartbeat');
+        const registered=this.db.one<MachineRow>('SELECT * FROM machines LIMIT 1');
+        if (!machineId||!registered||registered.machine_id!==machineId) return error('forbidden',403);
+        if (this.db.schemaVersion<8) return error('inventory_schema_pending',503);
+        return json(await this.nativeInventory.receive(await bodyObject(request,65_536)));
+      }
       if (url.pathname === '/api/offers' && request.method === 'GET') return this.offers(request);
       if (url.pathname === '/api/sessions' && request.method === 'GET') return this.sessionList(request);
       const sessionView = url.pathname.match(/^\/api\/sessions\/([^/]+)$/);
@@ -1476,12 +1486,50 @@ export class MachineDO {
   private sessionList(request: Request): Response {
     const actor=actorFrom(request);
     if (!hasScope(actor,'operator:admin')) return error('forbidden',403);
-    const query=new URL(request.url).searchParams,after=query.get('after')||'',limit=Number(query.get('limit')||25);
-    if (!Number.isInteger(limit)||limit<1||limit>100||after.length>120) return error('invalid_page',400);
-    const rows=this.db.all<SessionRow>(query.get('live')==='1'
-      ? "SELECT * FROM sessions WHERE id>? AND state IN ('staged','offered','claimed','running') ORDER BY id LIMIT ?"
-      : 'SELECT * FROM sessions WHERE id>? ORDER BY id LIMIT ?',after,limit+1);
-    return json({items:rows.slice(0,limit).map(row=>this.sessionView(row)),next:rows.length>limit?rows[limit-1].id:null});
+    const query=new URL(request.url).searchParams,rawAfter=query.get('after')||'',limit=Number(query.get('limit')||25);
+    let after=rawAfter;
+    if (!Number.isInteger(limit)||limit<1||limit>100||rawAfter.length>1024) return error('invalid_page',400);
+    if(this.db.schemaVersion<8){
+      const rows=this.db.all<SessionRow>(query.get('live')==='1'
+        ? "SELECT * FROM sessions WHERE id>? AND state IN ('staged','offered','claimed','running') ORDER BY id LIMIT ?"
+        : 'SELECT * FROM sessions WHERE id>? ORDER BY id LIMIT ?',after,limit+1);
+      return json({items:rows.slice(0,limit).map(row=>this.sessionView(row)),next:rows.length>limit?rows[limit-1].id:null,native_inventory:{complete:false,fresh:false,error:'inventory_schema_pending'}});
+    }
+    const inventory:JsonRecord={machine_id:this.db.one<MachineRow>('SELECT * FROM machines LIMIT 1')?.machine_id??null,...this.nativeInventory.status()},live=query.get('live')==='1';
+    const generation=String(inventory.snapshot_id??'none')+':'+(inventory.fresh?'fresh':'stale')+':'+(live?'live':'history');
+    if(rawAfter){
+      try{
+        if(!rawAfter.startsWith('ni1.'))return error('native_inventory_changed',409);
+        const token=JSON.parse(decodeURIComponent(rawAfter.slice(4))) as {generation?:unknown;after?:unknown};
+        if(token.generation!==generation)return error('native_inventory_changed',409);
+        if(typeof token.after!=='string'||token.after.length>180)return error('invalid_page',400);
+        after=token.after;
+      }catch{return error('invalid_page',400);}
+    }
+    const rows=this.db.all<{page_key:string;session_id:string|null;native_json:string|null}>(`SELECT * FROM (
+      SELECT s.id AS page_key,s.id AS session_id,n.row_json AS native_json FROM sessions s
+      LEFT JOIN native_inventory_rows n ON n.native_id=s.native_id
+      ${live?"WHERE s.state IN ('staged','offered','claimed','running')":''}
+      UNION ALL
+      SELECT '~native:'||n.native_id AS page_key,NULL AS session_id,n.row_json AS native_json FROM native_inventory_rows n
+      WHERE NOT EXISTS(SELECT 1 FROM sessions s WHERE s.native_id=n.native_id)
+      ${live?"AND ?=1 AND json_extract(n.row_json,'$.state') IN ('starting','running','exiting') AND json_extract(n.row_json,'$.worker_alive')=1":''}
+    ) WHERE page_key>? ORDER BY page_key LIMIT ?`,...(live?[inventory.fresh?1:0]:[]),after,limit+1);
+    const machine=this.db.one<MachineRow>('SELECT * FROM machines LIMIT 1');
+    const items=rows.slice(0,limit).map(item=>{
+      const native=item.native_json?JSON.parse(item.native_json) as JsonRecord:null;
+      if(item.session_id){
+        const session=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',item.session_id)!;
+        return {...this.sessionView(session),...(native?{native_observation:{...native,observed_at:inventory.observed_at_ms,fresh:inventory.fresh}}:{})};
+      }
+      return {id:'native:'+machine?.machine_id+':'+native!.id,managed:false,native_id:native!.id,
+        machine_id:machine?.machine_id,machine:machine?.machine_id,host:machine?.machine_id,
+        name:native!.tag,session_type:'native',mode:'unknown',workspace:native!.workspace,cwd:native!.cwd,engine:native!.engine,
+        agent:native!.agent,profile:native!.profile,agent_profile:native!.agent_profile,state:native!.state??'unknown',worker_alive:native!.worker_alive??null,
+        phase:native!.phase,last_activity_at:native!.last_activity_ms,created_at:native!.created_at_ms,
+        observed_at:inventory.observed_at_ms,inventory_fresh:inventory.fresh};
+    });
+    return json({items,next:rows.length>limit?'ni1.'+encodeURIComponent(JSON.stringify({generation,after:rows[limit-1].page_key})):null,native_inventory:inventory});
   }
 
   /** Hub1-shaped `POST /api/sessions/:id/(stop|send|capture)` mapped onto the Hub2 command queue, so the CLI and MCP keep working. */

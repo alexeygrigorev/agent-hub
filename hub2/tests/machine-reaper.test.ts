@@ -537,19 +537,19 @@ test('explicit screen capture survives the durable command queue and remains ide
  assert.equal(tail.status,201);assert.equal((await tail.json() as any).command.mode,undefined);
 });
 
-test('schema seven preserves pending version-six commands and adds capture mode',async()=>{
+test('latest schema preserves pending version-six commands and adds capture mode',async()=>{
  const f=fixture();await startClaimed(f,'old-command','22222222-2222-4222-8222-222222222222');
  const admin={'x-hub2-actor':JSON.stringify({id:'operator',kind:'operator',scopes:['operator:admin']})};
  const response=await f.call('/api/sessions/old-command/capture','POST',{key:'before-upgrade'},admin);
  const created=await response.json() as any;
- f.database.exec('ALTER TABLE session_commands DROP COLUMN capture_mode; UPDATE hub2_schema SET version=6');
+ f.database.exec('DROP TABLE native_inventory_meta; DROP TABLE native_inventory_rows; DROP TABLE native_inventory_upload; DROP TABLE native_inventory_chunks; ALTER TABLE session_commands DROP COLUMN capture_mode; UPDATE hub2_schema SET version=6');
  const prior=f.machine as any;
  const upgraded=new MachineDO(prior.ctx,prior.env);
  const listed=await upgraded.fetch(new Request('https://machine.test/api/sessions/old-command/commands',{headers:{...header,...admin}}));
  assert.equal(listed.status,200);assert.equal((await listed.json() as any).commands[0].id,created.command_id);
  const row=f.database.prepare('SELECT * FROM session_commands WHERE id=?').get(created.command_id) as any;
  assert.equal(row.capture_mode,null);assert.equal(row.state,'pending');
- assert.equal((f.database.prepare('SELECT version FROM hub2_schema').get() as any).version,7);
+ assert.equal((f.database.prepare('SELECT version FROM hub2_schema').get() as any).version,8);
 });
 
 
