@@ -3071,6 +3071,9 @@ def add_commands(sub):
     add.add_argument('--adopt', action='store_true', help='Attach the import to an existing unmanaged quota pool with this label (limits are preserved, never reset)')
     add.add_argument('--version', help='Exact pinned engine version (defaults to tested version)')
     list_cmd = commands.add_parser('list')
+    native = commands.add_parser('import-native', help='Securely collect this host native Claude login into Hub, then acknowledge the managed generation')
+    native.add_argument('--provider', choices=['claude'], required=True)
+    native.add_argument('--label', choices=['hub-claude'], required=True)
     list_cmd.add_argument('--view', choices=['worker'], default=None, help='Sanitized read-only verification view (worker sessions): engine, account, host, health, quota state')
     commands.add_parser('quota', help='Sanitized managed account observations for the server collector')
     remove = commands.add_parser('remove')
@@ -3379,6 +3382,9 @@ def render_recommend(result):
 
 
 def command(args):
+    if args.engines_cmd == 'import-native':
+        from . import native_claude_import
+        return native_claude_import.command(args)
     if args.engines_cmd == 'recommend':
         import urllib.parse
         if getattr(args, 'engine', None) and not (getattr(args, 'reason', None) and str(args.reason).strip()):

@@ -294,6 +294,7 @@ export class ControlDO {
 
   private async engines(request: Request, path: string): Promise<Response> {
     const actor = actorFrom(request);
+    if (path === '/api/engines/import-native') return await this.engineNativeImport(request, actor);
     if (path === '/api/engines' && request.method === 'GET') return await this.listManagedEngines(actor);
     if (path === '/api/engines/maintain' && request.method === 'POST') {
       if (!hasScope(actor, 'operator:admin')) return error('forbidden', 403);
@@ -313,6 +314,36 @@ export class ControlDO {
     const credentialRoute = path.match(/^\/api\/engines\/hub-claude\/(credential|rejection)$/);
     if (credentialRoute) return await this.engineCredential(request, credentialRoute[1] as 'credential' | 'rejection', actor);
     return error('not_found', 404);
+  }
+
+  private async engineNativeImport(request: Request, actor?: Actor): Promise<Response> {
+    if (!hasScope(actor, 'operator:admin')) return error('forbidden', 403);
+    if (request.method !== 'POST') return error('method_not_allowed', 405);
+    const body = await bodyObject(request, 24_000);
+    if (body.provider !== 'claude' || body.label !== CLAUDE_ENGINE_LABEL
+      || !Number.isSafeInteger(body.expected_generation) || Number(body.expected_generation) < 0
+      || !body.files || typeof body.files !== 'object' || Array.isArray(body.files)
+      || Object.keys(body.files).length !== 1) return error('invalid_native_import', 400);
+    const raw = (body.files as Record<string, unknown>)['.claude/.credentials.json'];
+    if (typeof raw !== 'string' || raw.length > 16_000) return error('invalid_native_import', 400);
+    let parsed: any;
+    try { parsed = JSON.parse(raw); } catch { return error('invalid_native_import', 400); }
+    const oauth = parsed?.claudeAiOauth;
+    if (!oauth || typeof oauth !== 'object' || Array.isArray(oauth)
+      || !['accessToken', 'refreshToken'].every(key => typeof oauth[key] === 'string' && oauth[key].trim())
+      || typeof oauth.expiresAt !== 'number' || !Number.isFinite(oauth.expiresAt)
+      || oauth.expiresAt <= Date.now() || oauth.expiresAt >= 1e15) return error('invalid_native_import', 400);
+    // Discard unrelated native credentials even for a direct API caller.
+    const fields = ['accessToken', 'refreshToken', 'expiresAt', 'refreshTokenExpiresAt',
+      'scopes', 'subscriptionType', 'subscriptionTypeSource', 'rateLimitTier'];
+    const files = { '.claude/.credentials.json': JSON.stringify({ claudeAiOauth:
+      Object.fromEntries(fields.filter(key => key in oauth).map(key => [key, oauth[key]])) }) };
+    const saved = await this.accountRequest('/api/account/credentials', 'PUT', actor!, {
+      provider: 'claude', expected_generation: body.expected_generation, files, native_import: true,
+    });
+    if (!saved.ok) return saved;
+    const result = await saved.json() as any;
+    return json({ status: 'configured', label: CLAUDE_ENGINE_LABEL, credential_generation: result.generation });
   }
 
   private async listManagedEngines(actor?: Actor): Promise<Response> {

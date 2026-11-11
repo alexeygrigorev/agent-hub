@@ -278,3 +278,58 @@ test('public authenticated engine maintain reaches the real ControlDO and Accoun
   assert.equal(response.status, 200);
   assert.deepEqual(await response.json(), { results: [{ label: 'hub-claude', generation: 2, status: 'ready', quota: 'observed' }] });
 });
+
+const nativeBody = (expected = 1, expiry = Date.now() + 86400000) => ({ provider: 'claude', label: 'hub-claude', expected_generation: expected,
+  files: { '.claude/.credentials.json': JSON.stringify({ claudeAiOauth: { accessToken: 'synthetic-native-access', refreshToken: 'synthetic-native-refresh', expiresAt: expiry },
+    mcpOAuth: { secret: 'synthetic-unrelated-mcp-secret' } }) } });
+
+test('native import replaces expired central auth, seals secrets and exposes only generation receipt', async () => {
+  const f = await maintenanceFixture({ expired: true, refuseRefresh: true });
+  const response = await f.call('/api/engines/import-native', 'POST', nativeBody());
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { status: 'configured', label: 'hub-claude', credential_generation: 2 });
+  assert.equal(f.calls.length, 0, 'native import must not try an expired central refresh');
+  const listed = await (await f.call('/api/engines')).json() as any;
+  assert.equal(listed.credentials[0].generation, 2);
+  assert.equal(listed.credentials[0].status, 'ready');
+  assert.ok(!JSON.stringify(listed).includes('synthetic-native'));
+  await f.callAccount('/api/account/hosts', 'PUT', { hosts: ['RMTHZ'] });
+  const sync = await (await f.call('/api/engines/sync', 'GET', undefined, machine)).json() as any;
+  const file = JSON.parse(sync.engines[0].files['.claude/.credentials.json']);
+  assert.deepEqual(Object.keys(file), ['claudeAiOauth']);
+  assert.equal(file.claudeAiOauth.accessToken, 'synthetic-native-access');
+  assert.equal(file.claudeAiOauth.refreshToken, '', 'hosts never receive central refresh material');
+  assert.equal((await f.call('/api/engines/sync-report', 'POST', { state: 'synced', items: [{ label: 'hub-claude',
+    revision: sync.engines[0].revision, state: 'installed', credential_generation: 2 }] }, machine)).status, 200);
+  const after = await (await f.call('/api/engines')).json() as any;
+  assert.equal(after.sync_status[0].accounts[0].acked_generation, 2);
+});
+
+test('native import refuses stale generation, older native credential and an active refresh', async () => {
+  const f = await maintenanceFixture();
+  assert.equal((await f.call('/api/engines/import-native', 'POST', nativeBody(0))).status, 409);
+  const stale = await f.call('/api/engines/import-native', 'POST', nativeBody(1, Date.now() + 3600000));
+  assert.equal(stale.status, 409);
+  assert.equal((await stale.json() as any).error, 'native_credential_not_newer');
+  await f.callAccount('/api/account/hosts', 'PUT', { hosts: ['RMTHZ'] });
+  assert.equal((await f.callAccount('/api/account/refresh-lease', 'POST', { generation: 1 }, machine)).status, 200);
+  const blocked = await f.call('/api/engines/import-native', 'POST', nativeBody(1, Date.now() + 172800000));
+  assert.equal(blocked.status, 409);
+  assert.equal((await blocked.json() as any).error, 'refresh_in_progress');
+});
+
+test('native import enforces operator rights, payload bounds and OAuth validation', async () => {
+  const f = await maintenanceFixture({ expired: true });
+  for (const actor of [machine, { id: 'agent:test', kind: 'agent', scopes: ['quota:write'] }, null])
+    assert.equal((await f.call('/api/engines/import-native', 'POST', nativeBody(), actor)).status, 403);
+  assert.equal((await f.call('/api/engines/import-native')).status, 405);
+  for (const body of [nativeBody(1, 1), { ...nativeBody(), label: 'other' }, { ...nativeBody(), expected_generation: -1 },
+    { ...nativeBody(), files: { '.claude/.credentials.json': 'invalid-json' } },
+    { ...nativeBody(), files: { '.claude/.credentials.json': JSON.stringify({ claudeAiOauth: { accessToken: 'synthetic-secret', expiresAt: Date.now() + 999999 } }) } },
+    { ...nativeBody(), files: { '.claude/.credentials.json': '{}', 'browser.json': 'private' } }]) {
+    const response = await f.call('/api/engines/import-native', 'POST', body);
+    assert.equal(response.status, 400);
+    assert.ok(!(await response.text()).includes('synthetic-secret'));
+  }
+  assert.equal((await f.call('/api/engines/import-native', 'POST', { ...nativeBody(), padding: 'x'.repeat(25000) })).status, 413);
+});
