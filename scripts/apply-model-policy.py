@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Show/apply policy, or prepare/apply/rollback a private CAS recovery receipt.
+"""Show/apply policy, or prepare/apply/rollback/commit a private CAS recovery receipt.
 
 Recovery requires --receipt and --source-sha. Ambiguous apply responses never
 establish rollback ownership merely because the candidate is observed active.
@@ -27,7 +27,7 @@ WIRE_LIMIT = 98_304
 HTTP_LIMIT = 128000
 LIMIT = 4 * HTTP_LIMIT
 SAFE_INT = 9007199254740991
-PHASES = {'prepared', 'applying', 'applied', 'uncertain', 'rolling_back', 'rolled_back'}
+PHASES = {'prepared', 'applying', 'applied', 'uncertain', 'rolling_back', 'rolled_back', 'committed'}
 
 
 class Problem(Exception):
@@ -185,10 +185,11 @@ def saved(path):
             fd=None; data=parse(stream.read(LIMIT+1))
     finally:
         if fd is not None: os.close(fd)
-    if (not isinstance(data,dict) or set(data)!={'format','source_sha','source_digest','url','desired','before','phase','applied','changed'}
+    if (not isinstance(data,dict) or set(data)-{'transaction_token'}!={'format','source_sha','source_digest','url','desired','before','phase','applied','changed'}
         or type(data['format']) is not int or data['format']!=1 or data['phase'] not in PHASES
         or not isinstance(data['source_sha'],str) or not re.fullmatch('[0-9a-f]{40}',data['source_sha'])
         or type(data['changed']) is not bool): raise Problem('receipt_invalid')
+    if 'transaction_token' in data and (not isinstance(data['transaction_token'],str) or not re.fullmatch('[0-9a-f]{32}',data['transaction_token'])): raise Problem('receipt_invalid')
     data['desired']=candidates(data['desired'])
     if data['source_digest']!=hashlib.sha256(canonical(data['desired']).encode()).hexdigest() or url(data['url'])!=data['url']: raise Problem('receipt_invalid')
     for field in ('before','applied'):
@@ -199,7 +200,7 @@ def saved(path):
         if row['version']==0 and row['candidates']: raise Problem('receipt_invalid')
     if data['changed']!=(data['before']['candidates']!=data['desired']): raise Problem('receipt_invalid')
     if data['applied'] is not None and (data['applied']['candidates']!=data['desired'] or data['applied']['version']!=data['before']['version']+int(data['changed'])): raise Problem('receipt_invalid')
-    if data['phase'] in ('applied','rolling_back','rolled_back') and data['applied'] is None: raise Problem('receipt_invalid')
+    if data['phase'] in ('applied','rolling_back','rolled_back','committed') and data['applied'] is None: raise Problem('receipt_invalid')
     if data['phase'] in ('prepared','applying','uncertain') and data['applied'] is not None: raise Problem('receipt_invalid')
     return data
 
@@ -250,6 +251,8 @@ def check_recovery_sizes(data):
 
 def recovery(args, token):
     if not args.receipt or not args.source_sha or not re.fullmatch('[0-9a-f]{40}',args.source_sha): raise Problem('recovery_identity_required')
+    transaction_token=getattr(args,'transaction_token',None)
+    if transaction_token is not None and not re.fullmatch('[0-9a-f]{32}',transaction_token): raise Problem('invalid_transaction_token')
     with lock(args.receipt):
         if args.receipt.is_symlink() or args.receipt.exists() and not stat.S_ISREG(args.receipt.lstat().st_mode): raise Problem('receipt_untrusted')
         new_receipt = args.action=='prepare' and not args.receipt.exists()
@@ -257,9 +260,11 @@ def recovery(args, token):
             target=desired(args); before=read_policy(args,token)
             data={'format':1,'source_sha':args.source_sha,'source_digest':hashlib.sha256(canonical(target).encode()).hexdigest(),
                   'url':args.url,'desired':target,'before':before,'phase':'prepared','applied':None,'changed':before['candidates']!=target}
+            if transaction_token is not None: data['transaction_token']=transaction_token
         else: data=saved(args.receipt)
+        if data.get('transaction_token')!=transaction_token: raise Problem('recovery_transaction_mismatch')
         if data['source_sha']!=args.source_sha or data['url']!=args.url: raise Problem('recovery_identity_mismatch')
-        if args.action in ('prepare','apply') and desired(args)!=data['desired']: raise Problem('source_policy_changed')
+        if args.action in ('prepare','apply','commit') and desired(args)!=data['desired']: raise Problem('source_policy_changed')
         if args.action=='prepare':
             if data['phase']=='prepared':
                 check_recovery_sizes(data)
@@ -267,6 +272,11 @@ def recovery(args, token):
             if new_receipt:
                 save(args.receipt,data)
             return {'status':data['phase'],'version':data['before']['version']}
+        if args.action=='commit':
+            if data['phase'] not in ('applied','committed'): raise Problem('commit_ownership_unproved')
+            if read_policy(args,token)!=data['applied']: raise Problem('commit_policy_conflict_manual_reconciliation_required')
+            data['phase']='committed'; save(args.receipt,data)
+            return {'status':'committed','version':data['applied']['version']}
         if args.action=='apply':
             if data['phase']=='applied':
                 if read_policy(args,token)!=data['applied']: raise Problem('apply_policy_conflict_manual_reconciliation_required')
@@ -316,15 +326,15 @@ def recovery(args, token):
 
 def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action',choices=['show','prepare','apply','rollback'],nargs='?',default='show')
+    parser.add_argument('action',choices=['show','prepare','apply','rollback','commit'],nargs='?',default='show')
     parser.add_argument('--url',default=DEFAULT_URL); parser.add_argument('--file',type=Path,default=DEFAULT_CONFIG)
     parser.add_argument('--token-file',type=Path); parser.add_argument('--expected-version',type=int)
-    parser.add_argument('--receipt',type=Path); parser.add_argument('--source-sha')
+    parser.add_argument('--receipt',type=Path); parser.add_argument('--source-sha'); parser.add_argument('--transaction-token')
     args=parser.parse_args(argv)
     try:
         args.url=url(args.url); token=load_token(args)
-        if args.source_sha and not args.receipt: raise Problem('receipt_required_for_source_identity')
-        if args.receipt or args.action in ('prepare','rollback'):
+        if (args.source_sha or args.transaction_token) and not args.receipt: raise Problem('receipt_required_for_source_identity')
+        if args.receipt or args.action in ('prepare','rollback','commit'):
             if args.expected_version is not None: raise Problem('recovery_uses_receipt_cas')
             result=recovery(args,token)
         elif args.action=='show':
