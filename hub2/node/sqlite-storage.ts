@@ -113,7 +113,7 @@ export class NodeDurableStorage {
 
   async setAlarm(due: number): Promise<void> {
     if (!Number.isSafeInteger(due)) throw new TypeError('alarm_due_not_safe_integer');
-    if (due < Date.now() - 86_400_000 || due > Date.now() + ALARM_LIMIT_MS) throw new RangeError('alarm_due_out_of_range');
+    if (due < 0 || due > Date.now() + ALARM_LIMIT_MS) throw new RangeError('alarm_due_out_of_range');
     this.sql.exec('INSERT OR REPLACE INTO hub2_alarm (singleton, due) VALUES (1, ?)', due);
   }
 
