@@ -7,4 +7,5 @@ await import('./model-policy-recovery.test.ts');
 await import('./worker-resource-settings.test.ts');
 
 await import('./claude-oauth.test.ts');
+await import('./engine-compat.test.ts');
 await import('./deployment-credentials.test.ts');
