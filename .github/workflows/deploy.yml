@@ -101,6 +101,9 @@ jobs:
   deploy:
     needs: [hub2, distribution]
     if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && !inputs.dry_run && !inputs.rollback_pending
+    permissions:
+      contents: read
+      actions: read
     concurrency:
       group: agent-hub-production
       cancel-in-progress: false
@@ -109,6 +112,146 @@ jobs:
     environment: production
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prepare and verify matched CLI release bundle
+        if: inputs.release_mode == 'active'
+        id: prepare_cli_bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid deploy commit" >&2; exit 2; }
+          bundle_root="$RUNNER_TEMP/matched-cli-release"
+          bundle_dir="$bundle_root/$DEPLOY_SHA"
+          archive_path="$bundle_root/hub2-release-$DEPLOY_SHA.zip"
+          runs_path="$bundle_root/runs-$DEPLOY_SHA.json"
+          artifacts_path="$bundle_root/artifacts-$DEPLOY_SHA.json"
+          rm -rf -- "$bundle_root"
+          mkdir -m 700 -p "$bundle_root"
+          run_id=""
+          for attempt in $(seq 1 18); do
+            gh api "repos/$REPO/actions/workflows/release-tooling.yml/runs?branch=main&event=push&head_sha=$DEPLOY_SHA&per_page=20" > "$runs_path"
+            if run_id="$(python3 - "$runs_path" "$DEPLOY_SHA" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          sha = sys.argv[2]
+          matches = [
+              r for r in payload.get("workflow_runs", [])
+              if r.get("head_sha") == sha
+              and r.get("event") == "push"
+              and r.get("head_branch") == "main"
+          ]
+          completed = [
+              r for r in matches
+              if r.get("status") == "completed" and r.get("conclusion") == "success"
+          ]
+          if completed:
+              completed.sort(key=lambda r: int(r["id"]))
+              print(completed[-1]["id"])
+              raise SystemExit(0)
+          in_progress = [r for r in matches if r.get("status") != "completed"]
+          if in_progress:
+              raise SystemExit(1)
+          raise SystemExit(2)
+          PY
+            )"; then
+              break
+            else
+              rc=$?
+              if ((rc == 1 && attempt < 18)); then
+                sleep 10
+                continue
+              fi
+              echo "no successful main release-tooling push run for $DEPLOY_SHA" >&2
+              exit 1
+            fi
+          done
+          test -n "$run_id" || { echo "no release-tooling run id resolved for $DEPLOY_SHA" >&2; exit 1; }
+          gh api "repos/$REPO/actions/runs/$run_id/artifacts?per_page=100" > "$artifacts_path"
+          read -r artifact_id expected_digest < <(python3 - "$artifacts_path" "hub2-release-$DEPLOY_SHA" <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          name = sys.argv[2]
+          matches = [
+              a for a in payload.get("artifacts", [])
+              if a.get("name") == name and not a.get("expired")
+          ]
+          if len(matches) != 1:
+              raise SystemExit(f"expected exactly one active artifact {name}, found {len(matches)}")
+          digest = str(matches[0].get("digest") or "")
+          if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+              raise SystemExit("artifact is missing a sha256 digest")
+          print(matches[0]["id"], digest.split(":", 1)[1])
+          PY
+          )
+          gh api "repos/$REPO/actions/artifacts/$artifact_id/zip" > "$archive_path"
+          actual_digest="$(sha256sum "$archive_path" | awk '{print $1}')"
+          [[ "$actual_digest" == "$expected_digest" ]] \
+            || { echo "artifact archive digest mismatch for $DEPLOY_SHA" >&2; exit 1; }
+          manifest_sha256="$(python3 - "$archive_path" "$bundle_dir" "$DEPLOY_SHA" <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path, PurePosixPath
+          import re
+          import stat
+          import sys
+          import zipfile
+
+          archive = Path(sys.argv[1])
+          dest = Path(sys.argv[2])
+          dest.mkdir(parents=True, mode=0o700)
+          seen = set()
+          max_bytes = 64 * 1024 * 1024
+          with zipfile.ZipFile(archive) as zf:
+              infos = zf.infolist()
+              if not infos or len(infos) > 32:
+                  raise SystemExit("unexpected release archive entry count")
+              for info in infos:
+                  pure = PurePosixPath(info.filename)
+                  if info.is_dir() or pure.is_absolute() or len(pure.parts) != 1:
+                      raise SystemExit(f"unsafe archive entry: {info.filename}")
+                  name = pure.name
+                  if name in {"", ".", ".."} or not re.fullmatch(r"[A-Za-z0-9._+-]+", name):
+                      raise SystemExit(f"invalid release filename: {name}")
+                  mode = (info.external_attr >> 16) & 0o170000
+                  if mode and mode != stat.S_IFREG:
+                      raise SystemExit(f"non-regular archive entry: {name}")
+                  if name in seen or info.file_size > max_bytes:
+                      raise SystemExit(f"duplicate or oversized archive entry: {name}")
+                  seen.add(name)
+                  data = zf.read(info)
+                  if len(data) != info.file_size:
+                      raise SystemExit(f"truncated archive entry: {name}")
+                  out = dest / name
+                  with open(out, "wb") as handle:
+                      handle.write(data)
+                      handle.flush()
+                      os.fsync(handle.fileno())
+                  os.chmod(out, 0o600)
+          manifest_bytes = (dest / "host-release.json").read_bytes()
+          manifest = json.loads(manifest_bytes.decode("utf-8"))
+          if manifest.get("host_version") != sys.argv[3]:
+              raise SystemExit("extracted host-release.json does not match deploy commit")
+          print(hashlib.sha256(manifest_bytes).hexdigest())
+          PY
+          )"
+          python3 scripts/build-hub2-release.py \
+            --rev "$DEPLOY_SHA" \
+            --verify-dir "$bundle_dir" \
+            --manifest-sha256 "$manifest_sha256"
+          printf 'bundle_dir=%s\nmanifest_sha256=%s\n' "$bundle_dir" "$manifest_sha256" >> "$GITHUB_OUTPUT"
       - name: Install VM deploy key
         env:
           VM_DEPLOY_KEY: ${{ secrets.AGENT_HUB_VM_DEPLOY_KEY }}
@@ -123,6 +266,35 @@ jobs:
             echo "VM deploy key is not a valid unencrypted private key" >&2
             exit 1
           fi
+      - name: Stage verified matched CLI release bundle on VM
+        if: inputs.release_mode == 'active'
+        env:
+          DEPLOY_SHA: ${{ github.sha }}
+          BUNDLE_DIR: ${{ steps.prepare_cli_bundle.outputs.bundle_dir }}
+          SSH_TARGET: ${{ secrets.AGENT_HUB_VM_USER }}@${{ secrets.AGENT_HUB_VM_HOST }}
+        run: |
+          set -euo pipefail
+          [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid deploy commit" >&2; exit 2; }
+          test -d "$BUNDLE_DIR" || { echo "verified CLI bundle directory is missing" >&2; exit 2; }
+          test -n "$SSH_TARGET" || { echo "VM SSH target is not configured" >&2; exit 2; }
+          tar -C "$BUNDLE_DIR" -cf - . | ssh -i "$RUNNER_TEMP/agent-hub-ssh/hub_vm_key" \
+            -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+            -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+            "$SSH_TARGET" bash -s -- "$DEPLOY_SHA" <<'STAGE_EOF'
+          set -euo pipefail
+          deploy_sha="$1"
+          [[ "$deploy_sha" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid deploy commit" >&2; exit 2; }
+          tmp_root="/opt/agent-hub/.local/tmp"
+          target_dir="$tmp_root/ci-cli-release-$deploy_sha"
+          stage_dir="$tmp_root/ci-cli-release-$deploy_sha.stage-$$"
+          mkdir -p "$tmp_root"
+          chmod 750 "$tmp_root"
+          rm -rf -- "$stage_dir"
+          mkdir -m 700 "$stage_dir"
+          tar -C "$stage_dir" --no-same-owner --no-same-permissions -xf -
+          rm -rf -- "$target_dir"
+          mv -T -- "$stage_dir" "$target_dir"
+          STAGE_EOF
       - name: Deploy validated revision through the fixed VM transaction script
         id: deploy_vm
         env:
@@ -133,8 +305,9 @@ jobs:
           SSH_TARGET: ${{ secrets.AGENT_HUB_VM_USER }}@${{ secrets.AGENT_HUB_VM_HOST }}
         run: |
           set -euo pipefail
+          cli_mode_args=()
           case "$RELEASE_MODE" in
-            active) ;;
+            active) cli_mode_args=(matched-cli) ;;
             bootstrap)
               [[ "$CONFIRM_BOOTSTRAP" == "DISABLE-HUB-DISPATCH" ]] \
                 || { echo "release_mode=bootstrap disables Hub dispatch; set confirm_bootstrap=DISABLE-HUB-DISPATCH" >&2; exit 2; } ;;
@@ -150,7 +323,7 @@ jobs:
           ssh -i "$RUNNER_TEMP/agent-hub-ssh/hub_vm_key" \
             -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
             -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
-            "$SSH_TARGET" bash -s -- apply "$DEPLOY_SHA" "$RELEASE_MODE" "$caddy_mode" \
+            "$SSH_TARGET" bash -s -- apply "$DEPLOY_SHA" "$RELEASE_MODE" "$caddy_mode" "${cli_mode_args[@]}" \
             < deploy/vm/deploy-release-transaction.sh
       - name: Read Hub API health on the configured client URL
         env:
@@ -185,6 +358,73 @@ jobs:
           done
           echo "Hub API health read did not report the requested healthy release mode: $RELEASE_MODE" >&2
           exit 1
+      - name: Publish matched CLI and host release assets
+        if: inputs.release_mode == 'active'
+        env:
+          DEPLOY_SHA: ${{ github.sha }}
+          MANIFEST_SHA256: ${{ steps.prepare_cli_bundle.outputs.manifest_sha256 }}
+          SSH_TARGET: ${{ secrets.AGENT_HUB_VM_USER }}@${{ secrets.AGENT_HUB_VM_HOST }}
+        run: |
+          set -euo pipefail
+          [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid deploy commit" >&2; exit 2; }
+          [[ "$MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "invalid manifest digest" >&2; exit 2; }
+          ssh -i "$RUNNER_TEMP/agent-hub-ssh/hub_vm_key" \
+            -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+            -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+            "$SSH_TARGET" bash -s -- publish "$DEPLOY_SHA" "$MANIFEST_SHA256" \
+            < deploy/vm/deploy-release-transaction.sh
+      - name: Verify public CLI and host release assets against CI bundle
+        if: inputs.release_mode == 'active'
+        env:
+          DEPLOY_SHA: ${{ github.sha }}
+          BUNDLE_DIR: ${{ steps.prepare_cli_bundle.outputs.bundle_dir }}
+          MANIFEST_SHA256: ${{ steps.prepare_cli_bundle.outputs.manifest_sha256 }}
+        run: |
+          set -euo pipefail
+          public_dir="$RUNNER_TEMP/public-cli-release/$DEPLOY_SHA"
+          rm -rf -- "$public_dir"
+          mkdir -m 700 -p "$public_dir"
+          python3 - "$BUNDLE_DIR" "$public_dir" "$DEPLOY_SHA" <<'PY'
+          import hashlib
+          import json
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          bundle = Path(sys.argv[1])
+          public_dir = Path(sys.argv[2])
+          deploy_sha = sys.argv[3]
+          files = sorted(p for p in bundle.iterdir() if p.is_file())
+          if not files:
+              raise SystemExit("verified bundle is empty")
+          for expected_path in files:
+              name = expected_path.name
+              url = f"https://hub.dtcdev.click/cli/{name}"
+              proc = subprocess.run(
+                  ["curl", "--silent", "--show-error", "--fail", "--max-time", "20", url],
+                  capture_output=True,
+              )
+              if proc.returncode != 0:
+                  raise SystemExit(f"failed to fetch public asset {url}: {proc.stderr.decode('utf-8', 'replace')}")
+              expected_bytes = expected_path.read_bytes()
+              if proc.stdout != expected_bytes:
+                  actual_sha = hashlib.sha256(proc.stdout).hexdigest()
+                  expected_sha = hashlib.sha256(expected_bytes).hexdigest()
+                  raise SystemExit(
+                      f"public asset {name} mismatch: expected sha256={expected_sha} ({len(expected_bytes)}B), "
+                      f"got sha256={actual_sha} ({len(proc.stdout)}B)"
+                  )
+              (public_dir / name).write_bytes(proc.stdout)
+          manifest = json.loads((public_dir / "manifest.json").read_text(encoding="utf-8"))
+          host_release = json.loads((public_dir / "host-release.json").read_text(encoding="utf-8"))
+          if manifest.get("built_from_commit") != deploy_sha or host_release.get("host_version") != deploy_sha:
+              raise SystemExit("public release metadata does not match deploy commit")
+          print(f"Verified {len(files)} public /cli/ release assets for {deploy_sha}")
+          PY
+          python3 scripts/build-hub2-release.py \
+            --rev "$DEPLOY_SHA" \
+            --verify-dir "$public_dir" \
+            --manifest-sha256 "$MANIFEST_SHA256"
       - name: Finalize deploy after all public smokes pass
         id: finalize_deploy
         env:
