@@ -16,8 +16,6 @@ const LEGACY_CONTINUATION = ['--- Hub continuation ---\n', '\n--- Original task 
 export const MAX_AUTO_CONTINUATIONS = 2;
 export const MAX_CONTINUATION_TRIES = 3;
 export const MAX_DELIVERY_TRIES = 5;
-/** Pending completion actions are found only among recently updated intakes. */
-export const COMPLETION_ACTION_WINDOW_MS = 24 * 60 * 60_000;
 const PROMPT_LIMIT = 8192;
 /** The Machine rejects a launch whose JSON exceeds this many bytes. */
 export const LAUNCH_SPEC_LIMIT = 12_000;
