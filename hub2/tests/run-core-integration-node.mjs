@@ -112,6 +112,9 @@ try{
   expect(await api(`/api/sessions/${started.id}/started`,'POST',{operation_id:offer.operation_id,epoch:offer.epoch,native_id:native},hostToken),200,'started retry');
   const live=expect(await api(`/api/intakes/${created.id}?project=${encodeURIComponent(project)}`),200,'running intake');assert.equal(live.intake.status,'running');
   if(process.env.HUB2_CORE_PUBLIC_MAIL){const {publicNativeMail}=await import('./normal-day-public-mail.mjs');measurements.public_mail=await publicNativeMail({api,expect,connection:liveSocket,session:started,hostToken,intakeId:created.id});}
+  // Process exit is not task completion: the session records its completion claim first.
+  assert(offer.launch.prompt.includes('--- Hub task completion contract ---')&&offer.launch.prompt.includes(started.id),'task session receives the completion contract');
+  expect(await api(`/api/intakes/${created.id}/events`,'POST',{key:'complete-main',event:{kind:'task_complete',session_id:started.id,summary:'synthetic lifecycle',acceptance:offer.acceptance_criteria.map(()=>({status:'met',proof:'synthetic-artifact.txt'}))}}),201,'completion claim');
   const evidence={source:'aplexer_retirement',fixture:true,artifact:'synthetic-artifact.txt',independent_acceptance:false,native_identity:{id:native,tag:'task-hub2-'+started.id,workspace:offer.launch.workspace},containment_empty:true,native_deadline:{deadline_ms:admission.runtime_deadline,exceeded:false},native_exit:{code:0,exited_at_ms:Date.now()}};
   const finish={operation_id:offer.operation_id,epoch:offer.epoch,native_id:native,exit_code:0,evidence,native_exit_confirmed:true};
   expect(await api(`/api/sessions/${started.id}/finish`,'POST',{...finish,native_exit_confirmed:false},hostToken),400,'unproved exit');
@@ -135,6 +138,11 @@ try{
   const offers=expect(await api('/api/offers','GET',undefined,hostToken),200,'no finished offer');
   assert.equal(offers.offers.some(offer=>offer.session_id===started.id),false,'finished session must not remain offered');
   liveSocket.socket.close();liveSocket=null;
+  // Hub itself delivers the terminal outcome to the intake owner; then the alarm settles.
+  expect(await fixture('project',project,'alarm',{}),200,'project completion alarm');
+  const completionHistory=expect(await api(`/api/intakes/${created.id}/history`),200,'completion history').events;
+  assert(completionHistory.some(e=>e.kind==='task_completion_claimed'),'completion claim recorded');
+  assert.equal(completionHistory.filter(e=>e.kind==='task_outcome_delivered').length,1,'terminal outcome delivered once: '+JSON.stringify(completionHistory.filter(e=>e.kind.startsWith('task_')).map(e=>[e.kind,e.body])));
   const after=await snapshots();measurements.complete_flow=delta(before,after);measurements.quiescent=after;const total=Object.values(measurements.complete_flow).reduce((n,v)=>n+v.reads+v.writes,0);assert(total<2000,'warm core flow exceeds2000row guard');
   measurements.machine_deadlines=expect(await fixture('machine',machine,'machine-deadlines'),200,'exact machine pending work diagnostics');
   assert.equal(after.project.alarm,null,'finished project has no pending alarm');

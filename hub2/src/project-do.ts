@@ -12,6 +12,11 @@ import { sessionPurpose } from './session-purpose';
 import { nativeReturncode } from './native-exit';
 import { HOST_INVENTORY_LOST_MS } from './session-liveness';
 import { PROJECT_WORK_SCHEMA, ProjectWork, type ProjectWorkHooks } from './project-work';
+import {
+  COMPLETION_ACTION_WINDOW_MS, COMPLETION_ACTOR, MAX_AUTO_CONTINUATIONS, MAX_CONTINUATION_TRIES, MAX_DELIVERY_TRIES,
+  LAUNCH_SPEC_LIMIT, basePrompt, completionClaim, continuationPrompt, deliveryBody, promptWithContract, retryDelay, stripCompletion,
+  type CompletionClaim, type CompletionRecord,
+} from './task-completion';
 import type { Actor, Hub2Env, JsonRecord } from './types';
 
 const SCHEMA = [
@@ -163,6 +168,7 @@ export class ProjectDO {
       for (const row of due) {
         if (!await this.dispatchSaga(row.operation_id)) break;
       }
+      await this.runCompletionActions(now);
     } catch (caught) {
       console.error('[hub2] project alarm failed:', caught);
     } finally {
@@ -326,6 +332,9 @@ export class ProjectDO {
     return this.transaction(()=>{
       const intake=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',intakeId);if(!intake)return error('intake_not_found',404);
       if(!actor||!hasScope(actor,'operator:admin')&&!(actor.resource_id===intake.id&&hasScope(actor,'intake:append')))return error('forbidden',403);
+      // A completion claim may come only from that session itself or an operator.
+      const claimed=(body.evidence as JsonRecord|undefined)?.kind==='task_complete'?(body.evidence as JsonRecord).session_id:undefined;
+      if(claimed!==undefined&&!hasScope(actor,'operator:admin')&&actor.id!=='session:'+String(claimed))return error('completion_claim_forbidden',403);
       const previous=this.db.one<{body_json:string}>('SELECT body_json FROM intake_events WHERE event_key=?',eventKey);
       if(previous)return (JSON.parse(previous.body_json) as JsonRecord).request_digest===digest?json({appended:true,duplicate:true,intake_id:intakeId}):error('idempotency_conflict',409);
       this.appendEvent(intake.id,eventKey,actor.id,'worker_append',{...(body.note?{note:body.note}:{}),...(body.evidence?{evidence:body.evidence}:{}),request_digest:digest},Date.now());
@@ -420,6 +429,7 @@ export class ProjectDO {
     if (typeof prompt !== 'string' || prompt.trim().length < 1 || new TextEncoder().encode(prompt).byteLength > 8192) return error('invalid_prompt', 400);
     if (typeof interactive !== 'boolean') return error('invalid_interactive', 400);
     if (!Number.isInteger(timeoutSeconds) || Number(timeoutSeconds) < 60 || Number(timeoutSeconds) > 7200) return error('invalid_timeout', 400);
+    const continuationOf = actor?.id === COMPLETION_ACTOR && typeof body.continuation_of === 'string' ? body.continuation_of : undefined;
     const withGoal = body.with_goal === undefined ? false : body.with_goal;
     if (typeof withGoal !== 'boolean') return error('invalid_with_goal', 400);
     const managedLabel=body.managed_credential_label;
@@ -528,12 +538,21 @@ export class ProjectDO {
       return saga ? this.startResponse(saga,200) : error('dispatch_state_unavailable', 503);
     }
     const accountId = route.engine.toLowerCase() === 'shell' ? null : route.account_id;
+    // Task sessions (not operator shells or scheduled runs) carry Hub's
+    // completion contract; their outcome is decided by a completion claim.
+    const completionControlled = route.engine.toLowerCase() !== 'shell' && !intake.schedule_id;
     const launchSpec = {
       workspace, engine: route.engine, model: route.model, ...(route.effort ? { effort: route.effort } : {}),
       prompt, interactive, purpose, with_goal:withGoal, timeout_seconds: Number(timeoutSeconds), start_deadline_at: Date.now()+120_000,
       ...(route.engine.toLowerCase() === 'shell' ? { shell_reason: overrideReason } : {}),
       ...(managedLabel!==undefined?{managed_credential_label:managedLabel}:{}),
     };
+    let controlled = completionControlled;
+    if (controlled) {
+      launchSpec.prompt = promptWithContract(prompt, { ...launchSpec, prompt: '' }, intakeId, sessionId, criteria as string[]);
+      // The Machine counts the escaped JSON; a start that fits today must still fit.
+      if (new TextEncoder().encode(JSON.stringify(launchSpec)).byteLength > LAUNCH_SPEC_LIMIT) { launchSpec.prompt = prompt; controlled = false; }
+    }
     const now = Date.now();
     const machineId = route.machine_id;
     const cap = await this.env.CONTROL.get(this.env.CONTROL.idFromName('global')).fetch('https://control.internal/_internal/session-cap/check', {
@@ -544,13 +563,16 @@ export class ProjectDO {
     try {
       this.transaction(() => {
         const current = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?', intakeId);
+        if (current && continuationOf !== undefined && current.session_id !== continuationOf)
+          throw new HttpError('intake_already_assigned', 409, 'continuation superseded');
         if (!current || (current.status !== 'open' && !(current.status === 'queued' && current.session_id === null)&&!this.retryableFailure(current)))
           throw new HttpError('intake_already_assigned', 409, !current ? undefined : ['queued','running'].includes(current.status)||current.status==='failed'
             ? `intake is ${current.status} with session ${current.session_id}; stop it first (hub sessions stop ${current.session_id}), then start again on this intake`
             : `intake is ${current.status}; reopen it first (hub intake update ${current.id} --status open), then start again on this intake`);
         this.db.run(`INSERT INTO dispatch_sagas(operation_id, request_digest, request_key, intake_id, session_id, machine_id, account_id, attempt_operation_id, launch_spec_json, routing_json, epoch, state, attempt, next_action_at, last_reason, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending_machine', 0, ?, NULL, ?, ?)`, operationId, digest, key, intakeId, sessionId, machineId, accountId, `${operationId}:0`, JSON.stringify(launchSpec), JSON.stringify({...route,attempted_policy_ids:[route.policy_id],picker,initial_picker:picker}), now + 30_000, now, now);
-        this.db.run("UPDATE intakes SET status = 'queued', assigned_machine_id = ?, assigned_actor_id = ?, session_id = ?, final_evidence_json=NULL, updated_at = ? WHERE id = ?", machineId, actor?.id || 'operator', sessionId, now, intakeId);
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending_machine', 0, ?, NULL, ?, ?)`, operationId, digest, key, intakeId, sessionId, machineId, accountId, `${operationId}:0`, JSON.stringify(launchSpec), JSON.stringify({...route,attempted_policy_ids:[route.policy_id],picker,initial_picker:picker,...(controlled?{completion_contract:true}:{})}), now + 30_000, now, now);
+        // A Hub continuation keeps the original requester as the assigned actor.
+        this.db.run("UPDATE intakes SET status = 'queued', assigned_machine_id = ?, assigned_actor_id = ?, session_id = ?, final_evidence_json=NULL, updated_at = ? WHERE id = ?", machineId, continuationOf !== undefined ? current.assigned_actor_id ?? actor?.id ?? 'operator' : actor?.id || 'operator', sessionId, now, intakeId);
         this.appendEvent(intakeId, `start:${operationId}:requested`, actor?.id || 'operator', 'session_start_requested', {
           operation_id: operationId, session_id: sessionId, machine_id: machineId, account_id: accountId, routing_decision: route,...(current.status==='failed'?{retry_of_session:current.session_id}:{}),
         }, now);
@@ -643,8 +665,10 @@ export class ProjectDO {
       const current=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?',saga.operation_id);
       if(!current||current.state==='complete'||current.native_id)return false;
       this.db.run("UPDATE dispatch_sagas SET state='complete',next_action_at=NULL,last_reason=?,updated_at=? WHERE operation_id=?",reason,now,saga.operation_id);
+      const intake=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=? AND session_id=?',saga.intake_id,saga.session_id);
+      const completion=intake&&this.completionControlled(current)?this.completionOutcome(intake,saga,undefined,'launch_failed',false,true,now):undefined;
       this.db.run("UPDATE intakes SET status='failed',final_evidence_json=?,updated_at=? WHERE id=? AND session_id=?",
-        JSON.stringify({launch_failed:true,native_id_absent:true,reason,session_id:saga.session_id,operation_id:saga.operation_id}),now,saga.intake_id,saga.session_id);
+        JSON.stringify({launch_failed:true,native_id_absent:true,reason,session_id:saga.session_id,operation_id:saga.operation_id,...(completion?{completion}:{})}),now,saga.intake_id,saga.session_id);
       this.appendEvent(saga.intake_id,`dispatch-failed:${saga.attempt_operation_id}`, 'hub2-dispatch','session_launch_failed',
         {session_id:saga.session_id,reason},now);
       return true;
@@ -779,8 +803,10 @@ export class ProjectDO {
         }
         if(!historical){
           const previous=this.parse(intake.final_evidence_json) as JsonRecord|null;
+          const completion=active&&intake.session_id===saga.session_id&&this.completionControlled(current)
+            ?this.completionOutcome(intake,saga,undefined,'launch_failed',false,true,now):undefined;
           this.db.run('UPDATE intakes SET status=?,final_evidence_json=?,updated_at=? WHERE id=?',active?'failed':intake.status,
-            JSON.stringify({...previous,...payload,operation_id:saga.operation_id}),now,intake.id);
+            JSON.stringify({...stripCompletion(previous),...stripCompletion(payload),operation_id:saga.operation_id,...(completion?{completion}:{})}),now,intake.id);
         }else if(terminalObservation&&intakeMatches){
           const previous=this.parse(intake.final_evidence_json) as JsonRecord|null;
           this.db.run('UPDATE intakes SET final_evidence_json=?,updated_at=? WHERE id=?',
@@ -844,11 +870,21 @@ export class ProjectDO {
       if(!['staged','offered','claimed','admitted','running'].includes(current.state)&&!pendingRetryStop)return false;
       this.db.run("UPDATE dispatch_sagas SET state='complete',native_id=COALESCE(native_id,?),next_action_at=NULL,last_reason=?,updated_at=? WHERE operation_id=? AND state=? AND attempt_operation_id=? AND epoch=?",
         typeof body.native_id==='string'?body.native_id:null,String(body.reason),now,saga.operation_id,saga.state,saga.attempt_operation_id,saga.epoch);
-      this.db.run("UPDATE intakes SET status='failed',final_evidence_json=?,updated_at=? WHERE id=?",
+      // A claimed task stays finished even if its process is reaped; an
+      // exited (dead/idle) unclaimed session is continued, a lost or
+      // operator-stopped one is only reported.
+      let status='failed',completion:CompletionRecord|undefined;
+      if(this.completionControlled(current)){
+        const claim=launchFailed?undefined:this.findCompletionClaim(intake,saga);
+        if(claim)status='completed-awaiting-review';
+        completion=this.completionOutcome(intake,saga,claim,launchFailed?'launch_failed':'session_'+String(body.reason),
+          !launchFailed&&!lost&&['dead','idle'].includes(String(body.reason)),true,now);
+      }
+      this.db.run("UPDATE intakes SET status=?,final_evidence_json=?,updated_at=? WHERE id=?",status,
         JSON.stringify({...(launchFailed?{launch_failed:true,native_id_absent:true}:lost?{lost:true,inventory_observed_at:body.inventory_observed_at}:{stopped:true}),...(launchRefused?{failure_reason:body.failure_reason}:{}),reaped,
           operation_id:saga.operation_id,attempt_operation_id:saga.attempt_operation_id,
           session_id:saga.session_id,machine_id:saga.machine_id,epoch:saga.epoch,reason:body.reason,
-          native_id:body.native_id??null,observed_at:body.observed_at}),now,intake.id);
+          native_id:body.native_id??null,observed_at:body.observed_at,...(completion?{completion}:{})}),now,intake.id);
       this.appendEvent(intake.id,eventKey,`machine:${saga.machine_id}`,launchFailed?'session_launch_failed':lost?'session_lost':reaped?'session_reaped':'session_stopped',
         {session_id:saga.session_id,machine_id:saga.machine_id,epoch:saga.epoch,reason:body.reason,native_id:body.native_id??null,
           ...(launchRefused?{failure_reason:body.failure_reason}:{})},now);
@@ -906,8 +942,10 @@ export class ProjectDO {
         if(!this.fallbackCurrent(saga,intake))return false;
         this.db.run("UPDATE dispatch_sagas SET state='complete',next_action_at=NULL,last_reason=?,updated_at=? WHERE operation_id=? AND state=? AND attempt_operation_id=? AND epoch=? AND native_id IS NULL",
           reason,now,saga.operation_id,saga.state,saga.attempt_operation_id,saga.epoch);
+        const row=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=? AND session_id=?',intake.id,saga.session_id);
+        const completion=row&&this.completionControlled(saga)?this.completionOutcome(row,saga,undefined,'auth_failed',false,true,now):undefined;
         this.db.run("UPDATE intakes SET status='failed',final_evidence_json=?,updated_at=? WHERE id=? AND session_id=?",
-          JSON.stringify({error:'provider_auth_failed',reason,attempted_policy_ids:tried}),now,intake.id,saga.session_id);
+          JSON.stringify({error:'provider_auth_failed',reason,attempted_policy_ids:tried,...(completion?{completion}:{})}),now,intake.id,saga.session_id);
         this.appendEvent(intake.id,`auth-fallback-exhausted:${saga.attempt_operation_id}:${saga.epoch}`,'hub2-dispatch','model_routes_auth_failed',
           {session_id:saga.session_id,attempted_policy_ids:tried,reason},now);
         return true;
@@ -944,7 +982,8 @@ export class ProjectDO {
     if(!next.effort)delete launchSpec.effort;
     const picker=buildStartPickerEvidence(next,diagnostics,1,route.picker);
     const routeState={...next,attempted_policy_ids:[...tried,next.policy_id],picker,
-      initial_picker:normalizeStartPickerEvidence(route.initial_picker)??normalizeStartPickerEvidence(route.picker)};
+      initial_picker:normalizeStartPickerEvidence(route.initial_picker)??normalizeStartPickerEvidence(route.picker),
+      ...((route as JsonRecord).completion_contract===true?{completion_contract:true}:{})};
     const applied=this.transaction(()=>{
       if(!this.fallbackCurrent(saga,intake))return false;
       this.db.run(`UPDATE dispatch_sagas SET state='pending_machine',attempt=?,attempt_operation_id=?,machine_id=?,account_id=?,
@@ -1106,13 +1145,22 @@ export class ProjectDO {
         if(current?.status==='failed'&&current.session_id===saga.session_id&&current.assigned_machine_id===saga.machine_id){
           const previous=this.parse(current.final_evidence_json??'{}') as JsonRecord;
           this.db.run('UPDATE intakes SET final_evidence_json=?,updated_at=? WHERE id=?',
-            JSON.stringify({...previous,...evidence,native_id:body.native_id,exit_code:body.exit_code,native_exit_confirmed:true,
+            JSON.stringify({...previous,...stripCompletion(evidence),native_id:body.native_id,exit_code:body.exit_code,native_exit_confirmed:true,
               ...(previous.native_outcome==='unconfirmed'?{native_outcome:'exit_confirmed'}:{}),launch_failed:true,native_id_absent:false}),now,intake.id);
         }
         return false;
       }
       if((launchFailed?currentSaga?.state!=='admitted':currentSaga?.state!=='running')||current?.session_id!==saga.session_id||current.assigned_machine_id!==saga.machine_id)throw new HttpError('completion_binding_changed',409);
-      this.db.run('UPDATE intakes SET status=?, final_evidence_json=?, updated_at=? WHERE id=?', finishedStatus, JSON.stringify({ ...evidence, native_id: body.native_id, exit_code: body.exit_code,native_exit_confirmed:true,...(launchFailed?{launch_failed:true}:{}) }), now, intake.id);
+      // Process exit is not task completion: a controlled session finishes the
+      // task only with its own completion claim, whatever the exit code.
+      let status:string=finishedStatus,completion:CompletionRecord|undefined;
+      if(this.completionControlled(currentSaga)){
+        const claim=launchFailed?undefined:this.findCompletionClaim(current,saga);
+        status=claim?'completed-awaiting-review':'failed';
+        completion=this.completionOutcome(current,saga,claim,launchFailed?'launch_failed':deadlineExceeded?'deadline_exceeded'
+          :body.exit_code===0?'exit_without_completion_claim':'native_exit_'+String(body.exit_code),!launchFailed,true,now);
+      }
+      this.db.run('UPDATE intakes SET status=?, final_evidence_json=?, updated_at=? WHERE id=?', status, JSON.stringify({ ...stripCompletion(evidence), native_id: body.native_id, exit_code: body.exit_code,native_exit_confirmed:true,...(launchFailed?{launch_failed:true}:{}),...(completion?{completion}:{}) }), now, intake.id);
       this.db.run("UPDATE dispatch_sagas SET state='complete', native_id=?, next_action_at=NULL, last_reason=NULL, updated_at=? WHERE operation_id=?", body.native_id, now, saga.operation_id);
       this.appendEvent(intake.id, `finish:${saga.operation_id}`, 'hub2-host', 'finish_evidence_received', { session_id: saga.session_id, native_id: body.native_id, exit_code: body.exit_code, evidence,completion_digest:completionDigest,...(launchFailed?{launch_failed:true}:{}) }, now);
       return false;
@@ -1133,6 +1181,167 @@ export class ProjectDO {
     // Keep the active-session fence, but do not require a special failure proof.
     const prior=intake.session_id?this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id=?',intake.session_id):undefined;
     return !prior||prior.state==='complete';
+  }
+
+  private completionControlled(saga:SagaRow|undefined):boolean{
+    return !!saga&&(this.parse(saga.routing_json) as JsonRecord|null)?.completion_contract===true;
+  }
+
+  /** The newest completion claim for exactly this session, written after its
+   * start (by the session itself or an operator, enforced at append) and
+   * covering every criterion. */
+  private findCompletionClaim(intake:IntakeRow,saga:SagaRow):CompletionClaim|undefined{
+    const criteria=this.parse(intake.acceptance_criteria_json),count=Array.isArray(criteria)?criteria.length:0;
+    const started=this.db.one<{seq:number}>('SELECT seq FROM intake_events WHERE task_id=? AND event_key=?',intake.id,`start:${saga.operation_id}:requested`)?.seq;
+    if(started===undefined)return undefined;
+    for(const row of this.db.all<{body_json:string}>("SELECT body_json FROM intake_events WHERE task_id=? AND kind='worker_append' AND seq>? ORDER BY seq DESC LIMIT 200",intake.id,started)){
+      const claim=completionClaim((this.parse(row.body_json) as JsonRecord|null)?.evidence,saga.session_id,count);
+      if(claim)return claim;
+    }
+    return undefined;
+  }
+
+  /** Consecutive Hub-started continuations since the last requester start. */
+  private continuationDepth(intakeId:string):number{
+    let depth=0;
+    for(const row of this.db.all<{actor_id:string}>("SELECT actor_id FROM intake_events WHERE task_id=? AND kind='session_start_requested' ORDER BY seq DESC LIMIT ?",intakeId,MAX_AUTO_CONTINUATIONS+1)){
+      if(row.actor_id!==COMPLETION_ACTOR)break;
+      depth++;
+    }
+    return depth;
+  }
+
+  /** Records the task outcome of a terminal attempt (inside its transaction) and
+   * schedules at most one follow-up action: a continuation or a delivery. */
+  private completionOutcome(intake:IntakeRow,saga:SagaRow,claim:CompletionClaim|undefined,reason:string,continuable:boolean,deliver:boolean,now:number):CompletionRecord{
+    const depth=this.continuationDepth(intake.id);
+    const record:CompletionRecord={controlled:true,session_id:saga.session_id,outcome:claim?'claimed':'unfinished',
+      reason:claim?'completion_claimed':reason,depth,...(claim?.summary?{summary:claim.summary}:{})};
+    if(!claim&&continuable&&depth<MAX_AUTO_CONTINUATIONS)record.continuation={state:'pending',key:'continue:'+saga.operation_id,tries:0,next_action_at:now};
+    else if(deliver)record.delivery={state:'pending',key:'terminal:'+saga.operation_id,tries:0,next_action_at:now};
+    this.appendEvent(intake.id,'completion:'+saga.operation_id,COMPLETION_ACTOR,claim?'task_completion_claimed':'task_unfinished',
+      {session_id:saga.session_id,reason:record.reason,depth,next:record.continuation?'continue':record.delivery?'deliver':'none',
+        ...(claim?{criteria_met:claim.met,...(claim.summary?{summary:claim.summary}:{})}:{})},now);
+    return record;
+  }
+
+  private completionDue(now:number):IntakeRow[]{
+    return this.db.all<IntakeRow>(`SELECT * FROM intakes WHERE status IN ('failed','completed-awaiting-review') AND updated_at>=?
+      AND COALESCE(json_extract(final_evidence_json,'$.completion.continuation.next_action_at'),json_extract(final_evidence_json,'$.completion.delivery.next_action_at'))<=?
+      ORDER BY updated_at,id LIMIT 8`,now-COMPLETION_ACTION_WINDOW_MS,now);
+  }
+
+  private completionNextDeadline(now:number):number|undefined{
+    return this.db.one<{due:number|null}>(`SELECT MIN(COALESCE(json_extract(final_evidence_json,'$.completion.continuation.next_action_at'),
+      json_extract(final_evidence_json,'$.completion.delivery.next_action_at'))) AS due FROM intakes
+      WHERE status IN ('failed','completed-awaiting-review') AND updated_at>=?`,now-COMPLETION_ACTION_WINDOW_MS)?.due??undefined;
+  }
+
+  /** CAS-update the completion record of the attempt that is still current. */
+  private saveCompletion(intake:IntakeRow,update:(record:CompletionRecord)=>void,event?:{key:string;kind:string;body:JsonRecord}):boolean{
+    return this.transaction(()=>{
+      const current=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',intake.id);
+      if(!current||current.updated_at!==intake.updated_at||current.final_evidence_json!==intake.final_evidence_json)return false;
+      const evidence=this.parse(current.final_evidence_json??'{}') as JsonRecord;
+      const record=evidence.completion as CompletionRecord;update(record);
+      const now=Math.max(Date.now(),current.updated_at+1);
+      this.db.run('UPDATE intakes SET final_evidence_json=?,updated_at=? WHERE id=?',JSON.stringify({...evidence,completion:record}),now,current.id);
+      if(event)this.appendEvent(current.id,event.key,COMPLETION_ACTOR,event.kind,event.body,now);
+      return true;
+    });
+  }
+
+  /** Bounded, durable follow-up of terminal attempts, driven by the project alarm. */
+  private async runCompletionActions(now:number):Promise<void>{
+    for(const intake of this.completionDue(now)){
+      const record=(this.parse(intake.final_evidence_json??'{}') as JsonRecord).completion as CompletionRecord|undefined;
+      if(!record||record.controlled!==true||record.session_id!==intake.session_id
+        ||!this.completionControlled(this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id=?',record.session_id)))continue;
+      try{
+        if(record.continuation?.state==='pending')await this.continueTask(intake,record);
+        else if(record.delivery?.state==='pending')await this.deliverOutcome(intake,record);
+      }catch(caught){
+        // Never let one record spin the alarm: back off, then give up bounded.
+        console.error('[hub2] completion action failed:',caught);
+        const fresh=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',intake.id);
+        if(fresh)this.saveCompletion(fresh,next=>{
+          const action=next.continuation?.state==='pending'?next.continuation:next.delivery;
+          if(!action)return;
+          action.tries++;action.last_reason='internal_error';
+          const limit=action===next.continuation?MAX_CONTINUATION_TRIES:MAX_DELIVERY_TRIES;
+          if(action.tries>=limit){action.state=action===next.continuation?'refused':'failed';action.next_action_at=null;}
+          else action.next_action_at=Date.now()+retryDelay(action.tries);
+        });
+      }
+    }
+  }
+
+  private async continueTask(intake:IntakeRow,record:CompletionRecord):Promise<void>{
+    const action=record.continuation!,saga=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id=?',record.session_id);
+    const launch=saga?this.parse(saga.launch_spec_json) as JsonRecord:undefined;
+    let outcome:{state:'started'|'superseded'|'retry'|'refused';reason?:string;session_id?:string};
+    if(!saga||!launch||intake.session_id!==record.session_id)outcome={state:'superseded',reason:'attempt_replaced'};
+    else{
+      const route=this.parse(saga.routing_json) as JsonRecord|null;
+      const timeout=Number(launch.timeout_seconds)||1800,depth=record.depth+1;
+      const body:JsonRecord={key:action.key,workspace:launch.workspace,machine_id:saga.machine_id,engine:launch.engine,model:launch.model,
+        ...(typeof launch.effort==='string'?{effort:launch.effort}:{}),interactive:launch.interactive===true,with_goal:launch.with_goal===true,
+        purpose:launch.purpose??'implement',override_reason:'hub_completion_continuation',continuation_of:record.session_id,
+        ...(Array.isArray(route?.required_capabilities)?{required_capabilities:route!.required_capabilities}:{}),
+        // A session killed at its deadline gets more time, within the start limit.
+        timeout_seconds:record.reason==='deadline_exceeded'?Math.min(7200,timeout*2):timeout,
+        prompt:continuationPrompt(intake.id,depth,record.session_id,record.reason,basePrompt(String(launch.prompt??''))||intake.text)};
+      const actor:Actor={id:COMPLETION_ACTOR,kind:'agent',resource_id:intake.project,scopes:['session:start','intake:read','project:'+intake.project]};
+      try{
+        const response=await this.startIntake(new Request('https://project.internal/api/intakes/'+encodeURIComponent(intake.id)+'/start',{method:'POST',
+          headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(actor)},body:JSON.stringify(body)}),intake.id);
+        const result=await response.json().catch(()=>({})) as JsonRecord;
+        if(response.ok)outcome={state:'started',session_id:String((result.session as JsonRecord|undefined)?.id??'')};
+        else if(result.error==='intake_already_assigned')outcome={state:'superseded',reason:'intake_already_assigned'};
+        else outcome={state:response.status>=500||response.status===429?'retry':'refused',reason:String(result.error??response.status)};
+      }catch{outcome={state:'retry',reason:'continuation_start_uncertain'};}
+    }
+    if(outcome.state==='started'){
+      // The start transaction replaced the intake's terminal record; the event keeps it.
+      this.transaction(()=>this.appendEvent(intake.id,action.key,COMPLETION_ACTOR,'task_continuation_started',
+        {previous_session_id:record.session_id,session_id:outcome.session_id??null,depth:record.depth+1,reason:record.reason},Date.now()));
+      return;
+    }
+    const tries=action.tries+1,exhausted=outcome.state==='refused'||(outcome.state==='retry'&&tries>=MAX_CONTINUATION_TRIES);
+    const fresh=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',intake.id);
+    if(outcome.state==='superseded'){
+      if(fresh&&fresh.final_evidence_json===intake.final_evidence_json)this.saveCompletion(fresh,next=>{next.continuation={...action,state:'superseded',next_action_at:null,last_reason:outcome.reason};},
+        {key:action.key+':superseded',kind:'task_continuation_superseded',body:{session_id:record.session_id,reason:outcome.reason??null}});
+      return;
+    }
+    if(fresh)this.saveCompletion(fresh,next=>{
+      next.continuation={...action,tries,state:exhausted?'refused':'pending',next_action_at:exhausted?null:Date.now()+retryDelay(tries),last_reason:outcome.reason};
+      if(exhausted)next.delivery={state:'pending',key:'terminal:'+(saga?.operation_id??record.session_id),tries:0,next_action_at:Date.now()};
+    },exhausted?{key:action.key+':refused',kind:'task_continuation_refused',body:{session_id:record.session_id,reason:outcome.reason??null,tries}}:undefined);
+  }
+
+  private async deliverOutcome(intake:IntakeRow,record:CompletionRecord):Promise<void>{
+    const action=record.delivery!,recipient=intake.owner_actor_id;
+    let state:'delivered'|'failed'|'skipped'|'retry',reason:string|undefined,messageId:string|undefined;
+    if(!recipient){state='skipped';reason='owner_unknown';}
+    else{
+      const sender='intake:'+intake.id,actor:Actor={id:sender,kind:'agent',resource_id:intake.project,scopes:['message:send']};
+      const text=deliveryBody({intake_id:intake.id,title:intake.title,outcome:record.outcome,reason:record.reason,session_id:record.session_id,
+        ...(record.summary?{summary:record.summary}:{}),...(record.continuation?{continuation:record.continuation}:{}),depth:record.depth});
+      try{
+        const response=await this.env.MAILBOXES.get(this.env.MAILBOXES.idFromName('global')).fetch('https://mailbox.internal/api/messages',{method:'POST',
+          headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(actor),'x-hub2-mailbox':sender},body:JSON.stringify({key:action.key,recipient,body:text})});
+        const result=await response.json().catch(()=>({})) as JsonRecord;
+        if(response.ok){state='delivered';messageId=String((result.message as JsonRecord|undefined)?.id??'');}
+        else{state=response.status>=500||response.status===429?'retry':'failed';reason=String(result.error??response.status);}
+      }catch{state='retry';reason='delivery_uncertain';}
+    }
+    const tries=action.tries+1,final=state==='retry'&&tries>=MAX_DELIVERY_TRIES?'failed':state;
+    this.saveCompletion(intake,next=>{
+      next.delivery={...action,tries,state:final==='retry'?'pending':final,next_action_at:final==='retry'?Date.now()+retryDelay(tries):null,
+        last_reason:reason??null,...(recipient?{recipient}:{}),...(messageId?{message_id:messageId}:{})};
+    },final==='retry'?undefined:{key:action.key+':'+final,kind:final==='delivered'?'task_outcome_delivered':'task_outcome_delivery_failed',
+      body:{session_id:record.session_id,outcome:record.outcome,recipient:recipient??null,...(messageId?{message_id:messageId}:{}),...(reason?{reason}:{})}});
   }
 
   private workAuthorized(actor:Actor,intakeId:string):boolean{
@@ -1197,6 +1406,7 @@ export class ProjectDO {
       this.db.one<{ due: number }>('SELECT next_action_at AS due FROM dispatch_sagas WHERE due=1 ORDER BY next_action_at,operation_id LIMIT 1')?.due,
       this.db.one<{ due: number }>('SELECT route_next_action_at AS due FROM intakes WHERE route_registered=0 ORDER BY route_next_action_at,id LIMIT 1')?.due,
       this.work.nextDeadline() ?? undefined,
+      this.completionNextDeadline(Date.now()),
     ].filter((value): value is number => typeof value === 'number' && Number.isSafeInteger(value));
     const due = deadlines.length ? Math.min(...deadlines) : null;
     this.db.alarmOperation();
