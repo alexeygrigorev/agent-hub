@@ -1,3 +1,7 @@
+/// <reference types="node" />
+// Production SHA-256 uses the Node builtin; the standalone Hub2 typecheck
+// otherwise loads only Workers globals. @types/node is already a dependency.
+import { createHash } from 'node:crypto';
 import { HttpError } from './http';
 import { isDeepWorkModel, isExplicitOnlyModel, isModelPolicyCandidateAllowed } from './model-policy';
 import { allowsAstra, sessionPurpose, type SessionPurpose } from './session-purpose';
@@ -124,7 +128,19 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
     const view = accounts.get(candidate.account_id);
     return view?.credential_usable === true && view.account?.enabled !== false && view.account?.enabled !== 0;
   };
-  const local = (candidate: Candidate, id: string): boolean => machines.get(id)?.engines?.includes(candidate.engine) === true
+  // A host observation is scoped to the exact checked Linux cwd, never to
+  // every project using an installed engine. Labels and cold contexts are unknown.
+  const contextHash = input.workspace?.startsWith('/') ? createHash('sha256').update(
+    JSON.stringify(['hub2-local-auth-context-v1',input.workspace])).digest('base64url') : null;
+  const localMissing = (candidate:Candidate,id:string):boolean => !!contextHash
+    && candidate.engine==='claude' && candidate.account_id==='claude'
+    && (machines.get(id)?.capabilities || []).some(flag => {
+      const match = /^auth:missing:l:([hi]):claude:([A-Za-z0-9_-]{43}):([1-9][0-9]{0,9})$/.exec(flag);
+      if (!match || match[1] !== (input.interactive?'i':'h') || match[2] !== contextHash) return false;
+      const age = snapshot.observed_at - Number(match[3])*1000;
+      return Number.isFinite(age) && age >= -5000 && age <= 60000;
+    });
+  const local = (candidate: Candidate, id: string): boolean => !localMissing(candidate,id) && machines.get(id)?.engines?.includes(candidate.engine) === true
     && machines.get(id)?.capabilities?.includes(`credentials:local:${input.interactive ? 'interactive' : 'headless'}:${candidate.engine}:${candidate.account_id}`) === true;
   const hostsFor = (candidate: Candidate): string[] => {
     const approved = (accounts.get(candidate.account_id)?.hosts || []).filter(id => ids.has(id));
@@ -137,10 +153,13 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
   const scored = candidates.map(candidate => {
     const left = headroom(candidate);
     const base = Math.max(0.0001, candidate.weight) * (left === null ? NEUTRAL_QUOTA : Math.max(0.01, left)) * (deep && isDeepWorkModel(candidate) ? DEEP_BIAS : 1);
-    const hosts = hostsFor(candidate), localHosts = hosts.filter(id => local(candidate,id));
+    const originalHosts = hostsFor(candidate), observedHosts = originalHosts.filter(id=>!localMissing(candidate,id));
+    const hosts = observedHosts.length ? observedHosts : originalHosts;
+    const localHosts = observedHosts.filter(id => local(candidate,id));
+    const knownLocalMissing = originalHosts.length>0 && observedHosts.length===0;
     const enabled = accounts.get(candidate.account_id)?.account?.enabled;
     return { candidate, left, base, hosts: !centralReady(candidate) && localHosts.length ? localHosts : hosts,
-      credentialObserved: enabled !== false && enabled !== 0 && (centralReady(candidate) || localHosts.length > 0), localHosts };
+      credentialObserved: !knownLocalMissing && enabled !== false && enabled !== 0 && (centralReady(candidate) || localHosts.length > 0), localHosts,knownLocalMissing };
   });
   // Auth/quota/advertisement observations narrow the pool, but never turn into a refusal when nothing survives.
   const narrow = (rows: typeof scored, keep: (row: typeof scored[number]) => boolean, reason: (row: typeof scored[number]) => string) => {
@@ -151,7 +170,8 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
     return kept.length ? kept : rows;
   };
   let pool = scored;
-  pool = narrow(pool, row => row.credentialObserved, row => 'credential_' + (accounts.get(row.candidate.account_id)?.credential_status || 'unavailable'));
+  pool = narrow(pool, row => row.credentialObserved, row => row.knownLocalMissing?'local_credentials_missing'
+    :'credential_' + (accounts.get(row.candidate.account_id)?.credential_status || 'unavailable'));
   pool = narrow(pool, row => row.left === null || row.left >= MIN_HEADROOM, () => 'quota_below_minimum');
   pool = narrow(pool, row => row.hosts.some(id => machines.get(id)?.engines?.includes(row.candidate.engine)), () => 'engine_not_advertised');
   // Capability preference is global: a candidate without a capable host must not
