@@ -154,6 +154,20 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
   pool = narrow(pool, row => row.credentialObserved, row => 'credential_' + (accounts.get(row.candidate.account_id)?.credential_status || 'unavailable'));
   pool = narrow(pool, row => row.left === null || row.left >= MIN_HEADROOM, () => 'quota_below_minimum');
   pool = narrow(pool, row => row.hosts.some(id => machines.get(id)?.engines?.includes(row.candidate.engine)), () => 'engine_not_advertised');
+  // Capability preference is global: a candidate without a capable host must not
+  // survive its own advisory fallback when another candidate can satisfy launch.
+  // Apply after the other eligibility observations, so capability hints cannot
+  // bring back an account/host already removed by credential or quota preference.
+  const compatibleHosts = (row: typeof scored[number]) => row.hosts.filter(id => {
+    const machine = machines.get(id), engine = row.candidate.engine;
+    const needed = [...required, ...(row.candidate.effort ? ['effort'] : [])];
+    return machine?.engines?.includes(engine) && needed.every(capability =>
+      machine.capabilities?.includes(capability) || machine.capabilities?.includes(`${capability}:${engine}`));
+  });
+  const compatible = new Map(pool.map(row => [row.candidate.id, compatibleHosts(row)]));
+  pool = narrow(pool, row => compatible.get(row.candidate.id)!.length > 0, () => 'capability_not_advertised');
+  if (pool.some(row => compatible.get(row.candidate.id)!.length > 0))
+    pool = pool.map(row => ({...row, hosts: compatible.get(row.candidate.id)!}));
   for (const row of pool) if (row.localHosts.length) advisories.push({policy_id:row.candidate.id, account_id:row.candidate.account_id, reason:'local_login_unverified'});
   const others = pool.filter(row => !/luna/i.test(row.candidate.model)).map(row => row.base);
   const cap = others.length ? others.reduce((sum, weight) => sum + weight, 0) / others.length : Infinity;
