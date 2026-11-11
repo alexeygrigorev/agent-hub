@@ -2,13 +2,15 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { MachineDO } from '../src/machine-do.ts';
-import { LIVE_SNAPSHOT_TTL_MS } from '../src/session-liveness.ts';
+import { HOST_INVENTORY_LOST_MS, LIVE_SNAPSHOT_TTL_MS, isLiveActiveSession } from '../src/session-liveness.ts';
 
 const machineActor={id:'machine:h1',kind:'machine',resource_id:'h1',generation:'1',scopes:['machine:heartbeat','session:report']};
 const header={'Content-Type':'application/json','x-hub2-actor':JSON.stringify(machineActor)};
 
-function fixture(){
- const database=new DatabaseSync(':memory:'),events:Array<{path:string;body:any}>=[],sockets:any[]=[];let alarm:number|null=null;
+function fixture(revokeFailures=0){
+ const database=new DatabaseSync(':memory:'),events:Array<{path:string;body:any}>=[],sockets:any[]=[];
+ const revocations:any[]=[];
+ let alarm:number|null=null;
  const ctx:any={id:{toString:()=> 'machine-h1'},storage:{sql:{exec(query:string,...args:unknown[]){
   const statement=database.prepare(query);let rows:unknown[]=[],rowsRead=0,rowsWritten=0;
   if(statement.columns().length){rows=statement.all(...args as any);rowsRead=rows.length;}
@@ -17,13 +19,21 @@ function fixture(){
  }},async getAlarm(){return alarm;},async setAlarm(value:number){alarm=value;},async deleteAlarm(){alarm=null;},transactionSync<T>(fn:()=>T):T{database.exec('BEGIN');try{const result=fn();database.exec('COMMIT');return result;}catch(error){database.exec('ROLLBACK');throw error;}}},
   blockConcurrencyWhile(fn:()=>unknown){return Promise.resolve(fn());},getWebSockets(){return sockets;}};
  const env:any={
-  CONTROL:{idFromName:(id:string)=>id,get:()=>({fetch:async()=>Response.json({authorized:true})})},
+  CONTROL:{idFromName:(id:string)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{
+   const request=input instanceof Request?input:new Request(input,init);
+   if(new URL(request.url).pathname==='/_worker/revoke'){
+    revocations.push(await request.json());
+    if(revokeFailures>0){revokeFailures--;return Response.json({error:'unavailable'},{status:503});}
+    return Response.json({revoked:true});
+   }
+   return Response.json({authorized:true});
+  }})},
   MACHINES:{idFromName:(id:string)=>id,get:()=>({fetch:async()=>Response.json({})})},
   PROJECTS:{idFromName:(id:string)=>id,get:()=>({fetch:async(request:Request)=>{events.push({path:new URL(request.url).pathname,body:await request.json()});return Response.json({ok:true});}})},
  };
  const machine=new MachineDO(ctx,env);
  const call=(path:string,method='GET',body?:unknown,headers:Record<string,string>={})=>machine.fetch(new Request('https://machine.test'+path,{method,headers:{...header,...headers},...(body===undefined?{}:{body:JSON.stringify(body)})}));
- return{database,machine,call,events,sockets,clearCache:()=>((machine as any).db.cache.clear()),get alarm(){return alarm;}};
+ return{database,machine,call,events,sockets,revocations,clearCache:()=>((machine as any).db.cache.clear()),get alarm(){return alarm;}};
 }
 
 async function startClaimed(f:ReturnType<typeof fixture>,sessionId:string,nativeId:string|null){
@@ -224,13 +234,89 @@ test('stop immediately settles unclaimed offered and expired sessions without a 
  }
 });
 
-test('a native process absent from a fresh host snapshot is marked stopped without a pending stop command',async()=>{
+test('a bounded fresh snapshot does not close an omitted running session',async()=>{
  const f=fixture();await startClaimed(f,'missing-native-session','native-missing');
  const response=await f.call('/_internal/reap','POST',{dry_run:false}),report=await response.json() as any;
- assert.equal(response.status,200);assert.equal(report.reaped,1);assert.equal(report.stop_requested,0,JSON.stringify(report));
- assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get('missing-native-session') as any).state,'stopped');
+ assert.equal(response.status,200);assert.equal(report.reaped,0);assert.equal(report.stop_requested,0,JSON.stringify(report));
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get('missing-native-session') as any).state,'running');
  assert.equal((f.database.prepare("SELECT COUNT(*) AS count FROM session_commands WHERE session_id=? AND kind='stop'").get('missing-native-session') as any).count,0);
+ assert.equal(f.events.some(event=>event.path==='/_internal/reaped'),false);
+});
+
+test('a running attempt becomes lost only after five minutes without host inventory',async()=>{
+ const f=fixture(1),session='lost-running',nativeId='native-lost',epoch=await startClaimed(f,session,nativeId);
+ const actor={'x-hub2-actor':JSON.stringify({id:'admin',kind:'operator',scopes:['operator:admin']})};
+ const started=Date.now()-HOST_INVENTORY_LOST_MS-100;
+ const launch=JSON.parse((f.database.prepare('SELECT launch_json FROM sessions WHERE id=?').get(session) as any).launch_json);
+ f.database.prepare('UPDATE sessions SET updated_at=?,launch_json=? WHERE id=?').run(started,JSON.stringify({...launch,timeout_seconds:1800}),session);
+ f.database.prepare('INSERT INTO launch_admissions VALUES(?,?,?,?)').run('op-'+session,session,epoch,started);
+ f.database.prepare('UPDATE machine_liveness SET observed_at=? WHERE singleton=1').run(started+15_000);
+ f.clearCache();
+ const before=await f.call('/_internal/reap','POST',{dry_run:false});
+ assert.equal((await before.json() as any).lost,0);
+ await f.machine.alarm();
+ assert.equal(f.alarm,started+15_000+HOST_INVENTORY_LOST_MS);
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'running');
+
+ f.database.prepare('UPDATE machine_liveness SET observed_at=? WHERE singleton=1').run(started);
+ f.clearCache();
+ const pending=await f.call('/api/sessions/'+session+'/commands','POST',{key:'stop-before-loss',kind:'stop'},actor);
+ assert.equal(pending.status,201);
+ const dry=await f.call('/_internal/reap','POST',{dry_run:true});
+ assert((await dry.json() as any).candidates.some((entry:any)=>entry.session_id===session&&entry.reason==='host_inventory_stale'));
+ const result=await f.call('/_internal/reap','POST',{dry_run:false});
+ assert.equal((await result.json() as any).lost,1);
+ const view=await f.call('/api/sessions/'+session,'GET',undefined,actor);
+ assert.equal((await view.json() as any).session.state,'lost');
+ assert.equal(f.events.some(event=>event.path==='/_internal/reaped'),false);
+ const replay=await f.call('/api/sessions/'+session+'/started','POST',{operation_id:'op-'+session,epoch,native_id:nativeId});
+ assert.deepEqual(await replay.json(),{ok:true,duplicate:true,state:'lost'});
+ const commands=await f.call('/api/sessions/'+session+'/commands','GET',undefined,actor);
+ assert.equal((await commands.json() as any).commands[0].ack.confirmed_exit,false);
+ assert.equal((await f.call('/api/heartbeat','POST',{labels:[],engines:['codex'],capabilities:['headless'],native_sessions:[{
+  session_id:session,native_id:nativeId,phase:'running',last_activity_at:Date.now(),exit_code:null,containment_empty:false,
+ }]})).status,200);
+ const snapshot=await f.call('/_internal/live-sessions');
+ const nativeView=(await snapshot.json() as any).sessions[0];
+ assert.equal(nativeView.phase,'running');
+ assert.equal(nativeView.managed_state,'lost');
+ assert.equal(isLiveActiveSession(nativeView),true);
+ const frames:any[]=[];
+ f.sockets.push({readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'socket'}),
+  send:(value:string)=>frames.push(JSON.parse(value))});
+ const stopUrl='/api/sessions/'+session+'/commands';
+ const stopping=await f.call(stopUrl,'POST',{key:'stop-after-reconnect',kind:'stop'},actor);
+ assert.equal(stopping.status,201);
+ const {command}=await stopping.json() as any;
+ assert(frames.some(frame=>frame.type==='session.command'&&frame.command.id===command.id));
+ const stopAck=await f.call(stopUrl+'/'+command.id+'/ack','POST',{epoch,result:{stopped:true,evidence:'native_exit',native_id:nativeId}});
+ assert.equal(stopAck.status,200);
+ const confirmed=await f.call('/api/sessions/'+session,'GET',undefined,actor);
+ assert.deepEqual((({state,stop_confirmed})=>({state,stop_confirmed}))((await confirmed.json() as any).session),
+  {state:'lost',stop_confirmed:true});
+ assert.equal(f.events.some(event=>event.path==='/_internal/stopped'),false);
+ const finish={operation_id:'op-'+session,epoch,native_id:nativeId,exit_code:0,native_exit_confirmed:true,evidence:{
+  source:'aplexer_retirement',containment_empty:true,native_identity:{id:nativeId,tag:'task-hub2-'+session,workspace:launch.workspace},
+  native_deadline:{deadline_ms:started+1800_000,exceeded:false},native_exit:{code:0,exited_at_ms:Date.now()},
+ }};
+ f.database.prepare("UPDATE machine_outbox SET state='dead_letter',attempt=10 WHERE kind='lost'").run();
+ f.clearCache();
+ assert.equal((await f.call('/api/sessions/'+session+'/finish','POST',finish)).status,200);
+ const revived=f.database.prepare("SELECT state,attempt FROM machine_outbox WHERE kind='lost'").get();
+ assert.deepEqual({...revived},{state:'pending',attempt:0});
+ assert.equal((await (await f.call('/api/sessions/'+session+'/finish','POST',finish)).json() as any).duplicate,true);
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'lost');
+ assert.equal(f.events.some(event=>event.path==='/_internal/finish'),false);
+ assert.equal(f.revocations.length,1);
+ f.database.prepare("UPDATE machine_outbox SET next_action_at=? WHERE kind='lost'").run(Date.now()-1);
+ f.clearCache();
+ await f.machine.alarm();
+ assert.equal(f.revocations.length,2);
+ assert.equal(f.revocations[1].reason,'host_inventory_stale');
  assert.equal(f.events.at(-1)?.path,'/_internal/reaped');
+ assert.equal(f.events.at(-1)?.body.lost,true);
+ assert.equal(f.events.at(-1)?.body.stopped,undefined);
+ assert.equal(f.events.at(-1)?.body.epoch,epoch);
 });
 
 test('dead native pane receives a stop command and confirmed exit releases state immediately',async()=>{

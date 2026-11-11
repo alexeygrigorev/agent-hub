@@ -1,14 +1,15 @@
 import {test} from 'node:test';import assert from 'node:assert/strict';import {DatabaseSync} from 'node:sqlite';import {ProjectDO} from '../src/project-do';
 const admin={id:'human:admin',kind:'operator',scopes:['operator:admin']};
-function fixture(options:{modelCandidates?:any[];accountHosts?:Record<string,string[]>;connected?:boolean}={}){const sql=new DatabaseSync(':memory:');let alarm:any=null;const storageValues=new Map<string,unknown>(),ctx:any={id:{toString:()=> 'synthetic-project'},storage:{sql:{exec(q:string,...a:any[]){const p=sql.prepare(q);const rows=p.columns().length?p.all(...a):(p.run(...a),[]);return{toArray:()=>rows};}},transactionSync(fn:any){sql.exec('BEGIN');try{const r=fn();sql.exec('COMMIT');return r;}catch(e){sql.exec('ROLLBACK');throw e;}},async getAlarm(){return alarm;},async setAlarm(at:number){alarm=at;},async deleteAlarm(){alarm=null;},async get(key:string){return storageValues.get(key);},async put(key:string,value:unknown){storageValues.set(key,value);},async delete(key:string){return storageValues.delete(key);}},blockConcurrencyWhile:(f:any)=>Promise.resolve(f())};
- const routes:any[]=[],machineCalls:string[]=[],accountCalls:string[]=[];
+function fixture(options:{modelCandidates?:any[];accountHosts?:Record<string,string[]>;connected?:boolean;lostReleaseFailures?:number}={}){const sql=new DatabaseSync(':memory:');let alarm:any=null;const storageValues=new Map<string,unknown>(),ctx:any={id:{toString:()=> 'synthetic-project'},storage:{sql:{exec(q:string,...a:any[]){const p=sql.prepare(q);const rows=p.columns().length?p.all(...a):(p.run(...a),[]);return{toArray:()=>rows};}},transactionSync(fn:any){sql.exec('BEGIN');try{const r=fn();sql.exec('COMMIT');return r;}catch(e){sql.exec('ROLLBACK');throw e;}},async getAlarm(){return alarm;},async setAlarm(at:number){alarm=at;},async deleteAlarm(){alarm=null;},async get(key:string){return storageValues.get(key);},async put(key:string,value:unknown){storageValues.set(key,value);},async delete(key:string){return storageValues.delete(key);}},blockConcurrencyWhile:(f:any)=>Promise.resolve(f())};
+ const routes:any[]=[],machineCalls:string[]=[],accountCalls:string[]=[],capReleases:any[]=[];
+ let remainingReleaseFailures=options.lostReleaseFailures??0;
  const requestOf=(input:string|Request,init?:RequestInit)=>input instanceof Request?input:new Request(input,init);
- const CONTROL={idFromName:(id:any)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{const request=requestOf(input,init),path=new URL(request.url).pathname;const value=request.method==='GET'?{}:await request.json();routes.push(value);if(path==='/_routing-policy')return Response.json({version:1,candidates:options.modelCandidates||[]});if(path==='/api/directory')return Response.json({items:[{id:'h1'}],next:null});return Response.json({registered:true,accepted:true});}})};
+ const CONTROL={idFromName:(id:any)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{const request=requestOf(input,init),path=new URL(request.url).pathname;const value=request.method==='GET'?{}:await request.json();routes.push(value);if(path==='/_internal/session-cap/release'){capReleases.push(value);if(remainingReleaseFailures>0){remainingReleaseFailures--;return Response.json({error:'unavailable'},{status:503});}}if(path==='/_routing-policy')return Response.json({version:1,candidates:options.modelCandidates||[]});if(path==='/api/directory')return Response.json({items:[{id:'h1'}],next:null});return Response.json({registered:true,accepted:true});}})};
  const MACHINES={idFromName:(id:any)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{const request=requestOf(input,init);const path=new URL(request.url).pathname;machineCalls.push(path);if(path==='/_internal/routing')return Response.json({machine_id:'h1',connected:options.connected??true,engines:['codex','claude'],capabilities:['headless','interactive']});return Response.json(path.endsWith('/reserve')?{state:'staged',epoch:1}:{state:'offered'});}})};
  const unused={idFromName:(id:any)=>id,get:()=>({fetch:async()=>Response.json({ok:true})})};
  const ACCOUNTS={idFromName:(id:any)=>id,get:(id:string)=>({fetch:async(input:string|Request)=>{const path=new URL(input instanceof Request?input.url:input).pathname;accountCalls.push(path);return Response.json({account:{enabled:true},quota:{remaining:id==='codex'?90:70},hosts:options.accountHosts?.[id]||['h1'],credential_usable:false});}})};
  const env:any={CONTROL,PROJECTS:unused,MACHINES,ACCOUNTS,MAILBOXES:unused};
- let project=new ProjectDO(ctx,env);const call=(p:string,m='GET',b?:unknown,a:any=admin)=>project.fetch(new Request('https://p.test'+p,{method:m,headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(a)},...(b===undefined?{}:{body:JSON.stringify(b)})}));return{sql,get project(){return project;},restart:()=>project=new ProjectDO(ctx,env),routes,machineCalls,accountCalls,call,getAlarm:()=>alarm,storageValues};}
+ let project=new ProjectDO(ctx,env);const call=(p:string,m='GET',b?:unknown,a:any=admin)=>project.fetch(new Request('https://p.test'+p,{method:m,headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(a)},...(b===undefined?{}:{body:JSON.stringify(b)})}));return{sql,get project(){return project;},restart:()=>project=new ProjectDO(ctx,env),routes,machineCalls,accountCalls,capReleases,call,getAlarm:()=>alarm,storageValues};}
 const body=async(r:Response)=>await r.json() as any;
 async function intake(f:ReturnType<typeof fixture>,key='task'){const result=await f.call('/api/intakes?project=org/a','POST',{key,title:'Original task',text:'Original requested behavior',acceptance_criteria:['Actual result']});assert.equal(result.status,201);return(await body(result)).intake;}
 test('model-less start falls back to another allowed model after an auth failure',async()=>{
@@ -95,6 +96,38 @@ test('failed task retry requires native exit and release evidence, preserves old
  assert.equal((await f.call('/_internal/finish','POST',{...binding,exit_code:1,native_exit_confirmed:true,evidence:{result:'failed'}})).status,200);
  assert.equal((f.sql.prepare('SELECT session_id FROM intakes WHERE id=?').get(own.id) as any).session_id,current.session_id);
 });
+test('an exact lost receipt closes capacity and records loss without claiming stop',async()=>{
+ const f=fixture({lostReleaseFailures:1}),task=await intake(f,'host-inventory-loss');
+ const start={key:'start-before-loss',workspace:'/tmp/synthetic-loss',engine:'shell',machine_id:'h1',override_reason:'Synthetic semantic test'};
+ assert.equal((await f.call('/api/intakes/'+task.id+'/start','POST',start)).status,201);
+ const saga=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(task.id) as any;
+ f.sql.prepare("UPDATE dispatch_sagas SET state='admitted' WHERE operation_id=?").run(saga.operation_id);
+ const nativeId='native-historical-id';
+ const receipt={operation_id:saga.operation_id,attempt_operation_id:saga.attempt_operation_id,
+  session_id:saga.session_id,machine_id:saga.machine_id,epoch:saga.epoch,native_id:nativeId,
+  reason:'host_inventory_stale',lost:true,observed_at:Date.now(),inventory_observed_at:Date.now()-301_000};
+ assert.equal((await f.call('/_internal/reaped','POST',{...receipt,epoch:receipt.epoch+1})).status,409);
+ assert.equal((await f.call('/_internal/reaped','POST',{...receipt,inventory_observed_at:Date.now()})).status,400);
+ const result=await f.call('/_internal/reaped','POST',receipt);
+ assert.equal(result.status,503);
+ assert.equal((await body(result)).error,'session_cap_release_pending');
+ f.restart();
+ const duplicate=await f.call('/_internal/reaped','POST',receipt);
+ assert.equal(duplicate.status,200);
+ assert.deepEqual(await body(duplicate),{lost:true,duplicate:true,session_id:saga.session_id});
+ const delayedStart=await f.call('/_internal/started','POST',receipt);
+ assert.deepEqual(await body(delayedStart),{started:false,lost:true,duplicate:true});
+ const delayedClaim=await f.call('/_internal/claim','POST',receipt);
+ assert.deepEqual(await body(delayedClaim),{claimed:false,lost:true,duplicate:true});
+ const finished=f.sql.prepare('SELECT status,final_evidence_json FROM intakes WHERE id=?').get(task.id) as any;
+ assert.equal(finished.status,'failed');
+ assert.equal(JSON.parse(finished.final_evidence_json).lost,true);
+ assert.equal(JSON.parse(finished.final_evidence_json).stopped,undefined);
+ const history=await body(await f.call('/api/intakes/'+task.id+'/history'));
+ assert.equal(history.events.filter((event:any)=>event.kind==='session_lost').length,1);
+ assert.deepEqual(f.capReleases,Array.from({length:2},()=>({operation_id:saga.operation_id,session_id:saga.session_id})));
+});
+
 test('terminal stop releases an intake for retry and no-native launch timeout is a visible failure',async()=>{
  const f=fixture(),stoppedIntake=await intake(f,'stop-retry'),start={key:'stop-first',workspace:'/tmp/synthetic-stop-retry',engine:'shell',machine_id:'h1',override_reason:'Synthetic semantic test'};
  assert.equal((await f.call('/api/intakes/'+stoppedIntake.id+'/start','POST',start)).status,201);

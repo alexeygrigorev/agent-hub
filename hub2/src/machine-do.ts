@@ -4,7 +4,7 @@ import { MeteredDb, initializeSchema } from './db';
 import { SqlReceiptMeter, SQL_PROBE_HEADER, wrapSqlNamespaces } from './sql-receipt';
 import { sha256Hex } from './crypto';
 import { actorFrom, bodyObject, boundedString, error, hasScope, HttpError, json } from './http';
-import { CLAIMED_WITHOUT_NATIVE_GRACE_MS, inactiveReason, isLiveActiveSession, LIVE_SNAPSHOT_TTL_MS, SESSION_REAP_INTERVAL_MS, type LiveSession } from './session-liveness';
+import { CLAIMED_WITHOUT_NATIVE_GRACE_MS, HOST_INVENTORY_LOST_MS, inactiveReason, isLiveActiveSession, LIVE_SNAPSHOT_TTL_MS, SESSION_REAP_INTERVAL_MS, type LiveSession } from './session-liveness';
 import type { Actor, Hub2Env, JsonRecord } from './types';
 
 const SCHEMA = [
@@ -583,6 +583,9 @@ export class MachineDO {
     if (typeof body.operation_id !== 'string' || typeof body.native_id !== 'string' || body.native_id.length < 8 || body.native_id.length > 128 || !Number.isSafeInteger(body.epoch)) return error('invalid_native_receipt', 400);
     const row = this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND machine_id=?', sessionId, machineId);
     if (!row) return error('session_not_found', 404);
+    if (row.state==='lost' && row.operation_id===body.operation_id && row.native_id===body.native_id && row.epoch===body.epoch) {
+      return json({ok:true,duplicate:true,state:'lost'});
+    }
     if (row.state === 'running' && row.operation_id === body.operation_id && row.native_id === body.native_id && row.epoch === body.epoch) {
       const sent=this.db.one<{state:string}>('SELECT state FROM machine_outbox WHERE id=?',`started:${row.operation_id}`);
       const forwarded=sent?.state==='delivered'||await this.flushOne(`started:${row.operation_id}`);
@@ -599,7 +602,6 @@ export class MachineDO {
         VALUES(?,?,'running',?,NULL,0,?) ON CONFLICT(session_id) DO UPDATE SET native_id=excluded.native_id,
         phase='running',last_activity_at=excluded.last_activity_at,exit_code=NULL,containment_empty=0,observed_at=excluded.observed_at`,
         sessionId,body.native_id,now,now);
-      this.db.run('INSERT INTO machine_liveness(singleton,observed_at) VALUES(1,?) ON CONFLICT(singleton) DO UPDATE SET observed_at=excluded.observed_at',now);
       this.insertOutbox(`started:${row.operation_id}`,'started',row.operation_id,row.project_id,
         {operation_id:row.dispatch_id,attempt_operation_id:row.operation_id,session_id:row.id,machine_id:row.machine_id,epoch:row.epoch,native_id:body.native_id},now);
     });
@@ -643,22 +645,38 @@ export class MachineDO {
       ||!Number.isSafeInteger(nativeExit.exited_at_ms)||Number(nativeExit.exited_at_ms)<admission.observed_at||Number(nativeExit.exited_at_ms)>Date.now()+5000
       ||(Number(nativeExit.exited_at_ms)>=Number(nativeDeadline.deadline_ms)&&nativeDeadline.exceeded!==true)
       ||(nativeDeadline.exceeded&&Number(nativeDeadline.deadline_ms)>Date.now()))return error('native_deadline_unverified',409);
+    const lateLost=row.state==='lost'&&row.native_id===body.native_id&&!launchFailed;
     const admittedAbort=launchFailed&&row.state==='claimed'&&row.native_id===null
       &&/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(body.native_id)
       &&this.db.one('SELECT operation_id FROM launch_admissions WHERE operation_id=? AND session_id=? AND epoch=?',row.operation_id,row.id,row.epoch);
-    if (!admittedAbort&&(launchFailed||row.state!=='running'||row.native_id!==body.native_id))return error('stale_or_unmatched_finish',409);
+    if (!lateLost&&!admittedAbort&&(launchFailed||row.state!=='running'||row.native_id!==body.native_id))return error('stale_or_unmatched_finish',409);
     const now = Date.now();
     const state = !launchFailed&&nativeDeadline?.exceeded!==true&&Number(body.exit_code) === 0 ? 'completed-awaiting-review' : 'failed';
     const payload = { operation_id: row.dispatch_id, attempt_operation_id: row.operation_id, session_id: row.id,
       machine_id: row.machine_id,intake_id:row.intake_id, epoch: row.epoch, native_id: body.native_id,
       ...(launchFailed?{launch_failed:true}:{}),
       exit_code: Number(body.exit_code), native_exit_confirmed: true, evidence, evidence_digest: evidenceDigest };
+    if (lateLost) {
+      if (row.evidence_digest !== null) return row.evidence_digest===evidenceDigest
+        ? json({ok:true,duplicate:true,state:'lost'}) : error('finish_conflict',409);
+      this.db.transaction(this.ctx,()=>{
+        this.db.run("UPDATE sessions SET evidence_json=?,evidence_digest=?,exit_code=? WHERE id=? AND state='lost' AND evidence_digest IS NULL",
+          JSON.stringify({...payload,lost:true}),evidenceDigest,Number(body.exit_code),row.id);
+        this.db.run("UPDATE native_sessions SET phase='exited',exit_code=?,containment_empty=1,observed_at=? WHERE session_id=? AND native_id=?",
+          Number(body.exit_code),now,row.id,row.native_id);
+        // A newly qualified exit can retry the same loss notification if its
+        // earlier revocation ran out of retries. Duplicate finishes cannot reset it.
+        this.db.run("UPDATE machine_outbox SET state='pending',attempt=0,next_action_at=?,updated_at=? WHERE id=? AND state='dead_letter'",
+          now,now,`lost:${row.operation_id}:${row.epoch}`);
+      });
+      await this.scheduleNext();
+      return json({ok:true,state:'lost',native_exit_recorded:true});
+    }
     this.db.transaction(this.ctx, () => {
       this.db.run('UPDATE sessions SET state=?, evidence_json=?, evidence_digest=?, exit_code=?, updated_at=?,native_id=? WHERE id=? AND state=?',
         state, JSON.stringify(payload), evidenceDigest, Number(body.exit_code), now, body.native_id,row.id, row.state);
       this.db.run("UPDATE native_sessions SET phase='exited',last_activity_at=?,exit_code=?,containment_empty=1,observed_at=? WHERE session_id=?",
         now,Number(body.exit_code),now,row.id);
-      this.db.run('INSERT INTO machine_liveness(singleton,observed_at) VALUES(1,?) ON CONFLICT(singleton) DO UPDATE SET observed_at=excluded.observed_at',now);
       this.insertOutbox(`finish:${row.operation_id}`, 'finish', row.operation_id, row.project_id, payload, now);
     });
     await this.ensureDeadline(now+30_000);
@@ -704,17 +722,17 @@ export class MachineDO {
         this.db.run("UPDATE machine_outbox SET state='delivered',updated_at=? WHERE id=? AND state='pending'",Date.now(),row.id);
         return true;
       }
-      if(row.kind==='finish'){
+      if(row.kind==='finish'||row.kind==='lost'){
         const revoked=await env.CONTROL.get(env.CONTROL.idFromName('global')).fetch('https://control.internal/_worker/revoke',{
           method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:payload.session_id,
             operation_id:payload.attempt_operation_id,epoch:payload.epoch,machine_id:payload.machine_id,
-            intake_id:payload.intake_id,project_id:row.project_id,reason:'native_exit_confirmed'})});
+            intake_id:payload.intake_id,project_id:row.project_id,reason:row.kind==='lost'?'host_inventory_stale':'native_exit_confirmed'})});
         if(!revoked.ok||(await revoked.json() as JsonRecord).revoked!==true)throw new Error('child_revocation_pending');
       }
       const stub = env.PROJECTS.get(env.PROJECTS.idFromName(row.project_id));
       const path = row.kind === 'finish' ? '/_internal/finish' : row.kind === 'started' ? '/_internal/started'
         : row.kind === 'auth-fallback' ? '/_internal/auth-fallback'
-        : row.kind === 'stopped' ? '/_internal/stopped' : row.kind === 'reaped' ? '/_internal/reaped'
+        : row.kind === 'stopped' ? '/_internal/stopped' : (row.kind === 'reaped' || row.kind === 'lost') ? '/_internal/reaped'
         : row.kind === 'claim' ? '/_internal/claim' : '/_internal/requeue';
       const response = await stub.fetch(`https://project.internal${path}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
@@ -749,10 +767,12 @@ export class MachineDO {
     const next = this.db.one<{ due: number | null }>(`SELECT MIN(due) AS due FROM (
       SELECT MIN(offer_expires_at) AS due FROM sessions WHERE state='offered' AND offer_expires_at IS NOT NULL AND NOT EXISTS(SELECT 1 FROM machine_outbox b WHERE b.id='expiry:'||sessions.id||':'||sessions.epoch AND b.state='pending')
       UNION ALL SELECT MIN(created_at+?) AS due FROM sessions WHERE state IN ('staged','offered','claimed') AND native_id IS NULL
+      UNION ALL SELECT MIN(MAX(updated_at,COALESCE((SELECT observed_at FROM machine_liveness WHERE singleton=1),0))+?) AS due
+        FROM sessions WHERE state='running' AND native_id IS NOT NULL
       UNION ALL SELECT MIN(created_at+60000) AS due FROM session_commands WHERE kind='stop' AND state='pending'
       UNION ALL SELECT MIN(next_action_at) AS due FROM machine_outbox WHERE state='pending'
       UNION ALL SELECT ? AS due WHERE EXISTS(SELECT 1 FROM sessions WHERE state IN ('claimed','running'))
-    )`,CLAIMED_WITHOUT_NATIVE_GRACE_MS,Date.now()+SESSION_REAP_INTERVAL_MS);
+    )`,CLAIMED_WITHOUT_NATIVE_GRACE_MS,HOST_INVENTORY_LOST_MS,Date.now()+SESSION_REAP_INTERVAL_MS);
     if (next?.due !== null && next?.due !== undefined) {
       if (current !== next.due) { this.db.alarmOperation(); await this.ctx.storage.setAlarm(next.due); }
     } else if (current !== null) {
@@ -856,7 +876,7 @@ export class MachineDO {
     let result=body.result as JsonRecord;
     if (session) {
       const priorResult=this.parse(row.result_json) as JsonRecord|null;
-      const legacyBoundStop = result.stopped === true && result.evidence === undefined && !!session.native_id
+      const legacyBoundStop = session.state!=='lost' && result.stopped === true && result.evidence === undefined && !!session.native_id
         && (row.state === 'pending' && priorResult?.dispatch_native_id === session.native_id
           || row.state === 'acked' && priorResult?.evidence === 'legacy_bound_exit' && priorResult?.native_id === session.native_id);
       if (legacyBoundStop) {
@@ -887,7 +907,17 @@ export class MachineDO {
 
   private async sendPendingCommands(socket:WebSocket,machineId:string,env:Hub2Env=this.env):Promise<void>{
     const stop=this.stopOnly(socket);
-    const command=this.db.one<CommandRow>("SELECT c.* FROM session_commands c JOIN sessions s ON s.id=c.session_id AND s.machine_id=c.machine_id AND c.epoch=s.epoch WHERE c.machine_id=? AND (s.state IN ('claimed','running') OR (s.state='expired' AND c.kind='stop' AND EXISTS(SELECT 1 FROM launch_admissions a WHERE a.operation_id=s.operation_id AND a.session_id=s.id AND a.epoch=s.epoch))) AND c.state='pending' "+(stop?"AND c.kind='stop' ":"")+"ORDER BY CASE WHEN c.kind='stop' THEN 0 ELSE 1 END,c.created_at,c.id LIMIT 1",machineId);
+    const command=this.db.one<CommandRow>(`
+      SELECT c.* FROM session_commands c
+      JOIN sessions s ON s.id=c.session_id AND s.machine_id=c.machine_id AND c.epoch=s.epoch
+      WHERE c.machine_id=? AND c.state='pending' AND (
+        s.state IN ('claimed','running') OR (c.kind='stop' AND (
+          (s.state='lost' AND s.native_id IS NOT NULL) OR
+          (s.state='expired' AND EXISTS(SELECT 1 FROM launch_admissions a
+            WHERE a.operation_id=s.operation_id AND a.session_id=s.id AND a.epoch=s.epoch))
+        ))
+      ) ${stop?"AND c.kind='stop'":''}
+      ORDER BY CASE WHEN c.kind='stop' THEN 0 ELSE 1 END,c.created_at,c.id LIMIT 1`,machineId);
     if(!command)return;
     if(!await this.authorizedAttachment(socket,'machine:offer',true,env))return;
     try{
@@ -1046,7 +1076,9 @@ export class MachineDO {
 
   private liveSessions():LiveSession[]{
     return this.db.all<Omit<LiveSession,'containment_empty'>&{containment_empty:number}>(
-      'SELECT session_id,native_id,phase,last_activity_at,observed_at,containment_empty FROM native_sessions ORDER BY session_id LIMIT 100')
+      `SELECT n.session_id,n.native_id,n.phase,s.state AS managed_state,
+        n.last_activity_at,n.observed_at,n.containment_empty FROM native_sessions n
+        LEFT JOIN sessions s ON s.id=n.session_id ORDER BY n.session_id LIMIT 100`)
       .map(row=>({...row,containment_empty:row.containment_empty===1}));
   }
 
@@ -1071,9 +1103,12 @@ export class MachineDO {
     const timedOutClaims=rows.filter(session=>session.state==='claimed'&&!session.native_id
       &&now-session.updated_at>=CLAIMED_WITHOUT_NATIVE_GRACE_MS&&!this.stopConfirmed(session));
     if(!machine||!inventory||inventory.observed_at>now+5_000||now-inventory.observed_at>LIVE_SNAPSHOT_TTL_MS){
+      const lostSessions=rows.filter(session=>session.state==='running'&&session.native_id&&!this.stopConfirmed(session)
+        &&now-Math.max(session.updated_at,inventory?.observed_at??0)>=HOST_INVENTORY_LOST_MS);
       if(dryRun)return {machine_id:machine?.machine_id??null,dry_run:true,active_count:active,reaped:0,stop_requested:0,
         skipped:'host_liveness_stale',candidates:[...confirmedStops.map(session=>({session_id:session.id,native_id:session.native_id,reason:'stop_confirmed'})),
-          ...timedOutClaims.map(session=>({session_id:session.id,native_id:null,reason:'launch_timeout_no_native'}))]};
+          ...timedOutClaims.map(session=>({session_id:session.id,native_id:null,reason:'launch_timeout_no_native'})),
+          ...lostSessions.map(session=>({session_id:session.id,native_id:session.native_id,reason:'host_inventory_stale'}))]};
       let reaped=0;
       for(const session of confirmedStops)if(await this.recordStopped(session,'stop_confirmed',now))reaped++;
       for(const session of rows){
@@ -1081,8 +1116,10 @@ export class MachineDO {
           ||now-session.updated_at<CLAIMED_WITHOUT_NATIVE_GRACE_MS)continue;
         if(await this.recordLaunchTimeout(session,now))reaped++;
       }
+      let lost=0;
+      for(const session of lostSessions)if(await this.recordLost(session,now))lost++;
       return {machine_id:machine?.machine_id??null,dry_run:false,active_count:active,active_count_after:this.liveSessions().filter(row=>isLiveActiveSession(row)).length,
-        reaped,stop_requested:0,skipped:'host_liveness_stale'};
+        reaped,lost,stop_requested:0,skipped:'host_liveness_stale'};
     }
     const bySession=new Map(sessions.map(row=>[row.session_id,row]));
     const candidates:Array<{session:SessionRow;reason:'dead'|'idle';live:LiveSession|null}> = [];
@@ -1095,7 +1132,7 @@ export class MachineDO {
         if(now-session.updated_at>=CLAIMED_WITHOUT_NATIVE_GRACE_MS)candidates.push({session,reason:'dead',live});
         continue;
       }
-      if(session.native_id&&!live){candidates.push({session,reason:'dead',live:null});continue;}
+      if(session.native_id&&!live)continue;  // The host snapshot is bounded.
       if(live){
         const reason=inactiveReason({...live,last_activity_at:live.last_activity_at??session.created_at},now);
         if(reason)candidates.push({session,reason,live});
@@ -1117,15 +1154,9 @@ export class MachineDO {
         }
         continue;
       }
-      if(!live){
-        if(await this.recordReaped(session,reason,inventory.observed_at)){
-          reaped++;actions.push({session_id:session.id,action:'marked_stopped',reason});
-        }
-        continue;
-      }
-      if(live&&['exited','missing','dead','stopped'].includes(live.phase)&&live.containment_empty===true){
-        const qualifiedExit=live.phase==='exited'&&!!session.native_id&&live.native_id===session.native_id;
-        if(await this.recordReaped(session,reason,live.observed_at,qualifiedExit)){reaped++;actions.push({session_id:session.id,action:'marked_stopped',reason});}
+      if(!live)continue;
+      if(live.phase==='exited'&&live.containment_empty===true&&!!session.native_id&&live.native_id===session.native_id){
+        if(await this.recordReaped(session,reason,live.observed_at)){reaped++;actions.push({session_id:session.id,action:'marked_stopped',reason});}
         continue;
       }
       if(session.native_id||live?.native_id||!!(live&&['launching','starting'].includes(live.phase))){
@@ -1145,7 +1176,6 @@ export class MachineDO {
         }
         continue;
       }
-      if(await this.recordReaped(session,reason,live?.observed_at??inventory.observed_at)){reaped++;actions.push({session_id:session.id,action:'marked_stopped',reason});}
     }
     return {machine_id:machine.machine_id,dry_run:false,active_count:active,
       active_count_after:this.liveSessions().filter(row=>isLiveActiveSession(row)).length,reaped,stop_requested:stopRequested,actions};
@@ -1175,7 +1205,8 @@ export class MachineDO {
   }
 
   private canDispatchStop(session: SessionRow): boolean {
-    return ['claimed', 'running'].includes(session.state) || (session.state === 'expired' && this.hasLaunchAdmission(session));
+    return ['claimed', 'running'].includes(session.state) || (session.state === 'expired' && this.hasLaunchAdmission(session))
+      || (session.state==='lost' && !!session.native_id);
   }
 
   private async recordStopped(session:SessionRow,reason:string,observedAt:number,
@@ -1189,6 +1220,8 @@ export class MachineDO {
       const unclaimed=current&&this.unclaimedWithoutNative(current);
       if(!current||current.epoch!==session.epoch||current.operation_id!==session.operation_id||current.native_id!==session.native_id
         ||(!this.canDispatchStop(current)&&!unclaimed))return false;
+      const lost=current.state==='lost';
+      if (lost && (!stopCommand || !('result_json' in stopCommand) || stopCommand.native_id!==current.native_id)) return false;
       if (stopCommand && 'result_json' in stopCommand) {
         const pending=this.db.one("SELECT id FROM session_commands WHERE id=? AND session_id=? AND machine_id=? AND epoch=? AND kind='stop' AND state='pending'",
           stopCommand.id,session.id,session.machine_id,session.epoch);
@@ -1198,47 +1231,65 @@ export class MachineDO {
       } else if(stopCommand)this.db.run(`INSERT INTO session_commands(id,session_id,machine_id,epoch,request_key,request_digest,kind,text,state,result_json,created_at,updated_at)
         VALUES(?,?,?,?,?,?, 'stop',NULL,'pending',NULL,?,?)`,stopCommand.id,session.id,session.machine_id,session.epoch,
         stopCommand.request_key,stopCommand.request_digest,now,now);
-      this.db.run("UPDATE sessions SET state='stopped',native_id=?,updated_at=? WHERE id=?",nativeId,now,session.id);
-      this.db.run("UPDATE machine_session_operations SET state='stopped' WHERE operation_id=? AND session_id=? AND epoch=?",session.operation_id,session.id,session.epoch);
+      if (!lost) {
+        this.db.run("UPDATE sessions SET state='stopped',native_id=?,updated_at=? WHERE id=?",nativeId,now,session.id);
+        this.db.run("UPDATE machine_session_operations SET state='stopped' WHERE operation_id=? AND session_id=? AND epoch=?",session.operation_id,session.id,session.epoch);
+      }
       this.settlePendingCommands(session,now,'stop_confirmed',nativeId
         ? {evidence:'native_exit',native_id:nativeId} : {evidence:'dispatch_fenced'});
       this.db.run(`INSERT INTO native_sessions(session_id,native_id,phase,last_activity_at,exit_code,containment_empty,observed_at)
         VALUES(?,?,?, ?,NULL,1,?) ON CONFLICT(session_id) DO UPDATE SET native_id=excluded.native_id,
         phase=excluded.phase,last_activity_at=excluded.last_activity_at,containment_empty=1,observed_at=excluded.observed_at`,
         session.id,nativeId,nativeId?'exited':'missing',observedAt,now);
-      this.db.run('INSERT INTO machine_liveness(singleton,observed_at) VALUES(1,?) ON CONFLICT(singleton) DO UPDATE SET observed_at=excluded.observed_at',now);
-      this.insertOutbox(`stopped:${session.operation_id}:${session.epoch}`,'stopped',session.operation_id,session.project_id,payload,now);
+      if (!lost) this.insertOutbox(`stopped:${session.operation_id}:${session.epoch}`,'stopped',session.operation_id,session.project_id,payload,now);
       return true;
     });
-    if(applied)await this.flushOne(`stopped:${session.operation_id}:${session.epoch}`);
-    if(applied)console.info('[hub2] SESSION_REAPED',JSON.stringify({session_id:session.id,machine_id:session.machine_id,reason:'stop_confirmed'}));
+    if(applied && session.state!=='lost')await this.flushOne(`stopped:${session.operation_id}:${session.epoch}`);
+    if(applied && session.state!=='lost')console.info('[hub2] SESSION_REAPED',JSON.stringify({session_id:session.id,machine_id:session.machine_id,reason:'stop_confirmed'}));
     return applied;
   }
 
-  private async recordReaped(session:SessionRow,reason:'dead'|'idle',observedAt:number,qualifiedExit=false):Promise<boolean>{
+  private async recordLost(session:SessionRow,now:number):Promise<boolean>{
+    const reason='host_inventory_stale',key=`lost:${session.operation_id}:${session.epoch}`;
+    const applied=this.db.transaction(this.ctx,()=>{
+      const current=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',session.id);
+      const inventory=this.db.one<{observed_at:number}>('SELECT observed_at FROM machine_liveness WHERE singleton=1');
+      if(!current||current.state!=='running'||!current.native_id||current.native_id!==session.native_id
+        ||current.epoch!==session.epoch||current.operation_id!==session.operation_id
+        ||now-Math.max(current.updated_at,inventory?.observed_at??0)<HOST_INVENTORY_LOST_MS)return false;
+      const payload={operation_id:current.dispatch_id,attempt_operation_id:current.operation_id,session_id:current.id,
+        intake_id:current.intake_id,machine_id:current.machine_id,epoch:current.epoch,native_id:current.native_id,
+        reason,lost:true,observed_at:now,inventory_observed_at:inventory?.observed_at??null};
+      this.db.run("UPDATE sessions SET state='lost',updated_at=? WHERE id=?",now,current.id);
+      this.db.run("UPDATE machine_session_operations SET state='lost' WHERE operation_id=? AND session_id=? AND epoch=?",
+        current.operation_id,current.id,current.epoch);
+      this.settlePendingCommands(current,now,reason,null);
+      this.db.run('INSERT INTO attention(session_id,reason,operation_id,message_id,observed_at) VALUES(?,?,?,NULL,?) ON CONFLICT(session_id) DO UPDATE SET reason=excluded.reason,operation_id=excluded.operation_id,message_id=NULL,observed_at=excluded.observed_at',
+        current.id,reason,current.operation_id,now);
+      this.insertOutbox(key,'lost',current.operation_id,current.project_id,payload,now);
+      return true;
+    });
+    if(applied){
+      await this.flushOne(key);
+      await this.scheduleNext();
+    }
+    return applied;
+  }
+
+  private async recordReaped(session:SessionRow,reason:'dead'|'idle',observedAt:number):Promise<boolean>{
     const now=Date.now(),payload={operation_id:session.dispatch_id,attempt_operation_id:session.operation_id,session_id:session.id,
       intake_id:session.intake_id,machine_id:session.machine_id,epoch:session.epoch,native_id:session.native_id,
       reason,observed_at:observedAt,stopped:true,reaped:true};
     const applied=this.db.transaction(this.ctx,()=>{
       const current=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',session.id);
       if(!current||current.epoch!==session.epoch||current.operation_id!==session.operation_id||current.native_id!==session.native_id||!['claimed','running'].includes(current.state))return false;
-      if (!qualifiedExit && this.db.one(`SELECT id FROM session_commands
-        WHERE session_id=? AND machine_id=? AND epoch=? AND kind='stop'
-        AND (state='pending' OR (state='failed' AND json_extract(result_json,'$.error')='stop_unconfirmed')) LIMIT 1`,
-        current.id,current.machine_id,current.epoch)) {
-        // A bounded snapshot can omit a live process. Keep this attempt
-        // routable so the operator can retry or the host can report its exit.
-        return false;
-      }
       this.db.run("UPDATE sessions SET state='stopped',updated_at=? WHERE id=?",now,session.id);
       this.db.run("UPDATE machine_session_operations SET state='reaped' WHERE operation_id=? AND session_id=? AND epoch=?",session.operation_id,session.id,session.epoch);
-      this.settlePendingCommands(session,now,reason,qualifiedExit
-        ? {evidence:'native_exit',native_id:session.native_id} : null);
+      this.settlePendingCommands(session,now,reason,{evidence:'native_exit',native_id:session.native_id});
       this.db.run(`INSERT INTO native_sessions(session_id,native_id,phase,last_activity_at,exit_code,containment_empty,observed_at)
         VALUES(?,?,?,?,NULL,?,?) ON CONFLICT(session_id) DO UPDATE SET native_id=excluded.native_id,
         phase=excluded.phase,last_activity_at=excluded.last_activity_at,containment_empty=excluded.containment_empty,observed_at=excluded.observed_at`,
-        session.id,session.native_id,qualifiedExit?'exited':'missing',observedAt,qualifiedExit?1:0,now);
-      this.db.run('INSERT INTO machine_liveness(singleton,observed_at) VALUES(1,?) ON CONFLICT(singleton) DO UPDATE SET observed_at=excluded.observed_at',now);
+        session.id,session.native_id,'exited',observedAt,1,now);
       this.insertOutbox(`reaped:${session.operation_id}:${session.epoch}`,'reaped',session.operation_id,session.project_id,payload,now);
       return true;
     });

@@ -44,7 +44,7 @@ _request_deadline = contextvars.ContextVar('session_request_deadline', default=N
 # Terminal command states: only these confirm an outcome. `transported` alone
 # is fetch/PTY bytes, never processing proof; waiting never treats it as done.
 TERMINAL_COMMAND = ('acked', 'refused', 'uncertain', 'failed')
-TERMINAL_SESSION = ('running', 'stopped', 'failed', 'refused', 'uncertain', 'cancelled')
+TERMINAL_SESSION = ('running', 'stopped', 'lost', 'failed', 'refused', 'uncertain', 'cancelled')
 
 SAFE_ERROR = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 # Error bodies are small; refuse unexpectedly large responses before parsing.
@@ -512,7 +512,7 @@ def wait_for_session(session_id, timeout, interval, *, stopping=False):
     deadline = time.monotonic() + timeout
     return wait_until(deadline, interval,
                      lambda: request('GET', '/api/sessions/' + session_id),
-                     lambda view: session_state(view) in (('stopped', 'failed', 'refused', 'uncertain') if stopping else TERMINAL_SESSION),
+                     lambda view: session_state(view) in (('stopped', 'lost', 'failed', 'refused', 'uncertain') if stopping else TERMINAL_SESSION),
                      'Session wait')
 
 
