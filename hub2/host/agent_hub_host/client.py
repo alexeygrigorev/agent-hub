@@ -92,7 +92,7 @@ class Client:
             raise ValueError("invalid server URL")
         self.base_url, self.token, self.timeout = base_url.rstrip("/"), token, timeout
 
-    def request(self, method, path, body=None, key=None):
+    def request(self, method, path, body=None, key=None, timeout=None):
         if not path.startswith("/api/") or "\r" in path or "\n" in path:
             raise ValueError("API path required")
         headers = {"Accept": "application/json", "User-Agent": "agent-hub2-host/2.0"}
@@ -111,7 +111,7 @@ class Client:
             def redirect_request(self, *args, **kwargs):
                 return None
         try:
-            with urllib.request.build_opener(NoRedirect).open(request, timeout=self.timeout) as response:
+            with urllib.request.build_opener(NoRedirect).open(request, timeout=self.timeout if timeout is None else min(self.timeout, timeout)) as response:
                 data = response.read(1_048_577)
             if len(data) > 1_048_576:
                 raise ApiError("response too large")
@@ -130,6 +130,21 @@ class Client:
         endpoint = urllib.parse.urlunsplit(("wss" if parsed.scheme == "https" else "ws",
                                             parsed.netloc, parsed.path + "/api/connect", query, ""))
         return WebSocket(endpoint, self.token, self.timeout)
+
+    def publish_native_inventory(self, machine_id, inventory, stop_event=None):
+        if not isinstance(machine_id, str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,80}', machine_id):
+            raise ValueError('invalid machine identity')
+        # Elapsed budget between chunks plus socket inactivity timeouts; an
+        # in-flight urllib read is not a hard wall-clock deadline.
+        deadline = time.monotonic() + 20
+        for chunk in inventory.upload_chunks():
+            if stop_event is not None and stop_event.is_set():
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ApiError('native inventory publication deadline exceeded')
+            self.request('POST', '/api/machines/' + machine_id + '/native-inventory', chunk,
+                         timeout=min(5, remaining))
 
     def heartbeat(self, labels, engines=None, capabilities=None, native_sessions=None):
         body = {"os": platform.system().lower(),

@@ -57,7 +57,7 @@ class SchemaRollbackPreflightTest(unittest.TestCase):
         return path
 
     def test_old_reader_requires_bridge_then_verified_bridge_can_roll_back_migration(self):
-        self.sqlite('CONTROL',4);self.sqlite('MACHINES',6)
+        self.sqlite('CONTROL',4);self.sqlite('MACHINES',7)
         old=preflight.manifest(self.repo,self.previous);new=preflight.manifest(self.repo,self.candidate)
         self.assertEqual(preflight.choose_mode(new,old,preflight.live_schemas(self.db)),'defer')
         self.assertEqual(preflight.choose_mode(new,new,preflight.live_schemas(self.db)),'apply')
@@ -145,7 +145,12 @@ class SchemaRollbackPreflightTest(unittest.TestCase):
                 db.commit()
 
         live = preflight.live_schemas(self.db)
-        self.assertEqual(preflight.choose_mode(new, old, live), 'defer')
+        # Census bridge writes7: a legacy max6 rollback reader is insufficient.
+        with self.assertRaisesRegex(preflight.Incompatible, 'rollback_cannot_read_candidate_schemas'):
+            preflight.choose_mode(new, old, live)
+        prior7 = copy.deepcopy(old)
+        prior7['schemas']['MACHINES'].update(max_read=7, bridge_write=7, active_write=7)
+        self.assertEqual(preflight.choose_mode(new, prior7, live), 'defer')
 
         with self.assertRaisesRegex(preflight.Incompatible, 'candidate_cannot_read_live_schema:ACCOUNTS'):
             preflight.choose_mode(new, old, [*live, ('ACCOUNTS', 3)])
