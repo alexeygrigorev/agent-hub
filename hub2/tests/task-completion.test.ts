@@ -128,6 +128,7 @@ test('false completion: exit 0 without a completion claim keeps the task unfinis
     assert.equal(all.length,2);assert.equal(row.session_id,next.session_id);assert(['queued','running'].includes(row.status));
     const launch=JSON.parse(next.launch_spec_json);
     assert(launch.prompt.startsWith(CONTINUATION_MARKER));
+    assert(!launch.prompt.startsWith('-'),'a prompt starting with - is parsed as a CLI option by the engine');
     assert(launch.prompt.includes(first.session_id)&&launch.prompt.includes('hub intake history '+id));
     assert(launch.prompt.includes('Implement the requested feature end to end.'+CONTRACT_MARKER),'original task and a fresh contract');
     assert(launch.prompt.includes(next.session_id),'contract binds the continuation session');
@@ -338,4 +339,6 @@ test('completion helpers: claims bind to the session and criteria count; continu
   assert(new TextEncoder().encode(long).length<=8192);assert(long.includes('full task: hub intake show i'));
   assert(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(long),'no split surrogate pair');
   assert.equal(basePrompt(continuationPrompt('i',2,'s','exit','Original')+CONTRACT_MARKER+'contract'),'Original');
+  assert(!continuationPrompt('i',1,'s','exit','- bullet task').startsWith('-'));
+  assert.equal(basePrompt('--- Hub continuation ---\nold preamble\n--- Original task ---\nOriginal'+CONTRACT_MARKER+'c'),'Original','legacy continuation prompts still unwrap');
 });
