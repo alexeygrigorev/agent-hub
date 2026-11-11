@@ -1,6 +1,7 @@
 """Targeted release safety checks; no network, live service or live venv writes."""
 import fcntl
 import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
 import io
 import json
@@ -13,6 +14,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import threading
 import unittest
 import zipfile
 from unittest.mock import patch
@@ -118,6 +120,95 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
         self.assertIn('--no-index', pip)
         self.assertIn('--no-deps', pip)
         self.assertFalse(any('systemctl' in args and 'stop' in args for args in self.calls))
+        self.assertEqual(os.readlink(self.root / 'current/bin/hub'), '../hub.pyz')
+
+    def test_same_version_repairs_wheel_operator_shim_without_restart(self):
+        self.install()
+        target = (self.root / 'current').resolve()
+        entry = target / 'bin/hub'
+        entry.unlink()
+        entry.write_text('old wheel entry point')
+        host_entry = target / 'bin/hub2'
+        host_entry.write_text('host entry point')
+        self.calls.clear()
+        self.install()
+        self.assertEqual(os.readlink(entry), '../hub.pyz')
+        self.assertEqual(host_entry.read_text(), 'host entry point')
+        self.assertFalse(any('systemctl' in args or 'pip' in args for args in self.calls))
+        self.calls.clear()
+        self.install()
+        self.assertEqual(self.calls, [])
+
+    def test_same_version_refuses_corrupt_zipapp_before_replacing_shim(self):
+        self.install()
+        target = (self.root / 'current').resolve()
+        entry = target / 'bin/hub'
+        entry.unlink()
+        entry.write_text('old wheel entry point')
+        (target / 'hub.pyz').write_bytes(b'corrupt')
+        self.calls.clear()
+        with self.assertRaisesRegex(ValueError, 'installed release artifact mismatch: hub.pyz'):
+            self.install()
+        self.assertEqual(entry.read_text(), 'old wheel entry point')
+        self.assertEqual(self.calls, [])
+
+    def test_activated_shell_uses_operator_zipapp_with_host_package_present(self):
+        target = self.root / 'releases' / SHA
+        target.parent.mkdir(parents=True)
+        subprocess.run([sys.executable, '-m', 'venv', '--without-pip', str(target)], check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # Build the real operator CLI, then reproduce the host wheel's entry
+        # points. PYTHONPATH supplies the actual host package to this venv.
+        with patch('sys.stdout', new=io.StringIO()):
+            module('build-hub-cli').build(target, '0.2.0')
+        for name in ('hub', 'hub2'):
+            entry = target / 'bin' / name
+            entry.write_text(f'#!{target}/bin/python\nfrom agent_hub_host.cli import main\nraise SystemExit(main())\n')
+            entry.chmod(0o755)
+        data = (target / 'hub.pyz').read_bytes()
+        manifest = {'artifacts': {'hub.pyz': {'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}}}
+        updater.install_operator_cli(target, manifest)
+        (self.root / 'current').symlink_to(target)
+        requests = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                requests.append((self.path, self.headers.get('Authorization')))
+                payload = {'sessions': [], 'has_more': False} if self.path.startswith('/api/sessions') else {}
+                body = json.dumps(payload).encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            profile = Path(self.temporary.name) / 'operator.json'
+            profile.write_text('{}')
+            profile.chmod(0o600)
+            env = dict(os.environ, HOME=self.temporary.name, HUB_CONFIG_FILE=str(profile),
+                       HUB_URL=f'http://127.0.0.1:{server.server_port}', HUB_TOKEN='synthetic-operator-token',
+                       PYTHONPATH=str(REPO / 'hub2/host'))
+            result = subprocess.run(['/bin/sh', '-ec',
+                                     '. "$1/bin/activate"; command -v hub; hub --version; hub sessions list; hub2 --help',
+                                     'activated-shell', str(self.root / 'current')],
+                                    env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(str(target / 'bin/hub'), result.stdout)
+            self.assertIn('hub 0.2.0', result.stdout)
+            self.assertIn('usage: hub2', result.stdout)
+            self.assertTrue(any(path.startswith('/api/sessions') and token == 'Bearer synthetic-operator-token'
+                                for path, token in requests), requests)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
 
     def prepare_retained_switch(self):
         current = self.old_release()
