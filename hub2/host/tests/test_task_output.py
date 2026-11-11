@@ -135,3 +135,63 @@ class TaskOutputTest(unittest.TestCase):
         with mock.patch.object(os,'supports_dir_fd',set()):
             self.assertIsNone(output.prepare_output(self.task,self.spec,'local','codex','prompt'))
             self.assertIsNone(self.capture())
+
+    def retained(self):
+        for path in (self.root/'.local'/('launch-'+self.task+'.json'),self.directory/'START.json'):
+            if path.exists() and not path.is_symlink():path.chmod(0o600)
+        # Actual aplexer stdout is 0664 inside the private 0700 attempt dir.
+        if (self.directory/'stdout.log').exists():(self.directory/'stdout.log').chmod(0o664)
+        return output.capture_task_output(self.task,self.expected,self.native,retained_only=True)
+
+    def test_retained_read_uses_private_attempt_without_requiring_stdout_mode_600(self):
+        self.assertEqual(self.retained(),'actual child output\n')
+        self.assertEqual((self.directory.stat().st_mode & 0o777),0o700)
+
+    def test_missing_retained_records_never_select_native_pane_fallback(self):
+        for path in (self.root/'.local'/('launch-'+self.task+'.json'),self.directory/'START.json',self.directory/'stdout.log'):
+            saved=path.read_bytes();path.unlink()
+            with self.subTest(path=path.name),self.assertRaisesRegex(RuntimeError,'task_output_unavailable'):
+                self.retained()
+            path.write_bytes(saved)
+        self.record.pop('task_output');self.save()
+        with self.assertRaisesRegex(RuntimeError,'task_output_unavailable'):self.retained()
+
+    def test_retained_attempt_directory_hardlinks_and_duplicate_metadata_fail_closed(self):
+        self.retained();self.directory.chmod(0o755)
+        with self.assertRaisesRegex(RuntimeError,'private_path_required'):self.retained()
+        self.directory.chmod(0o700)
+        os.link(self.directory/'stdout.log',self.root/'outside-output-link')
+        with self.assertRaisesRegex(RuntimeError,'file_invalid'):self.retained()
+        (self.root/'outside-output-link').unlink()
+        manifest=self.root/'.local'/('launch-'+self.task+'.json')
+        manifest.write_text('{"session_id":"foreign",'+manifest.read_text()[1:]);manifest.chmod(0o600)
+        with self.assertRaisesRegex(RuntimeError,'record_invalid'):self.retained()
+
+    def test_bound_capture_metadata_and_output_together_fit_ack_budget(self):
+        meta={'capture_binding':{'native_id':self.native,'operation_id':'op-'+('x'*100),'request_digest':'a'*64},'capture_source':'retained_task_output'}
+        for text in ('\x00'*20000,'😀'*20000,'plain'*10000):
+            raw=output.bounded_capture(text,meta)
+            self.assertLessEqual(len(json.dumps({**meta,'output':raw},ensure_ascii=True).encode()),8000)
+        with self.assertRaisesRegex(RuntimeError,'capture_fence_conflict'):
+            output.bounded_capture('content',{'invalid':'x'*2000})
+
+
+    def test_missing_or_malformed_prompt_digest_and_boolean_schema_never_qualify_retained_output(self):
+        original_start=copy.deepcopy(self.start);original_binding=copy.deepcopy(self.binding)
+        for digest in (None,'','not-a-hash'):
+            self.binding['prompt_sha256']=digest;self.start['prompt_sha256']=digest;self.save()
+            with self.assertRaisesRegex(RuntimeError,'task_output_start_conflict'):self.retained()
+        self.binding=original_binding;self.start=original_start;self.start['schema_version']=True;self.save()
+        with self.assertRaisesRegex(RuntimeError,'task_output_start_conflict'):self.retained()
+
+    def test_owned_group_writable_parents_allow_only_the_private_attempt_boundary(self):
+        (self.root/'.local').chmod(0o775)
+        (self.root/'.local/hub2-output').chmod(0o775)
+        self.assertEqual(self.retained(),'actual child output\n')
+        for mode in (0o770,0o775,0o777):
+            self.directory.chmod(mode)
+            with self.subTest(attempt_mode=oct(mode)),self.assertRaisesRegex(RuntimeError,'private_path_required'):
+                self.retained()
+        self.directory.chmod(0o700)
+        (self.root/'.local').chmod(0o777)
+        with self.assertRaisesRegex(RuntimeError,'private_path_required'):self.retained()

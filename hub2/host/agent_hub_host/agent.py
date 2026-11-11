@@ -687,6 +687,48 @@ class Bridge:
                 self.journal.db.execute("INSERT OR REPLACE INTO outbox VALUES(?,?,?)",
                                        (f'finish:{row["operation_id"]}', f'/api/sessions/{row["session_id"]}/finish', canonical(payload)))
 
+    def bound_capture(self, command, row):
+        """Read only this exact attempt; a finished task never falls back to a pane."""
+        from .task_output import capture_task_output, bounded_capture
+        binding = command.get('capture_binding')
+        expected_digest = hashlib.sha256(json.dumps({'kind':'capture','text':None,'epoch':command['epoch']},
+            separators=(',',':')).encode()).hexdigest()
+        if (not isinstance(binding, dict) or set(binding) != {'native_id','operation_id','request_digest'}
+                or type(command.get('epoch')) is not int or command.get('mode') is not None or row['interactive'] != 0
+                or binding.get('native_id') != row['native_id'] or not row['native_id']
+                or binding.get('operation_id') != row['operation_id'] or binding.get('request_digest') != expected_digest
+                or row['state'] not in {'running','exited'}):
+            raise ValueError('capture_fence_conflict')
+        terminal = row['state'] == 'exited'
+        metadata = {'capture_binding':binding,'capture_source':'retained_task_output'}
+        try:
+            try:
+                # Use private retained-file guards even if completion races the
+                # journal snapshot taken above.
+                output = capture_task_output('hub2-'+row['session_id'],row,row['native_id'],retained_only=True)
+            except RuntimeError as exc:
+                if not terminal and str(exc)=='task_output_unavailable':
+                    output = None
+                else:
+                    raise
+            if output is None:
+                # Running legacy/central launches retain their existing native
+                # capture path. Completion never reaches this branch.
+                if not self._workspace_is_available(row['workspace']):
+                    raise RuntimeError('task_output_unavailable')
+                native_id,status = self.resolve_launch_native(row)
+                current=self.journal.db.execute('SELECT state,epoch,native_id,operation_id FROM launches WHERE session_id=?',(row['session_id'],)).fetchone()
+                if (not native_id or not status or status.get('phase',status.get('state'))!='running'
+                        or not current or current['state']!='running' or current['epoch']!=row['epoch']
+                        or current['native_id']!=row['native_id'] or current['operation_id']!=row['operation_id']):
+                    raise RuntimeError('task_output_unavailable')
+                output = self.native('capture',native_id,'--screen','--plain').stdout[:16384]
+                metadata['capture_source'] = 'native_pane'
+            return {**metadata,'output':bounded_capture(output,metadata)}
+        except (OSError,ValueError,RuntimeError) as exc:
+            reason = str(exc) if isinstance(exc,RuntimeError) and re.fullmatch('[a-z_]{1,80}',str(exc)) else 'task_output_unavailable'
+            return {**metadata,'error':reason,'reason':reason}
+
     def command(self, command):
         if command.get("target_kind") == "native":
             return self.native_command(command)
@@ -730,6 +772,15 @@ class Bridge:
                 result = {'stopped': True, 'evidence': 'dispatch_fenced'}
                 self.begin_command(identity, digest)
                 self.finish_command(identity, command, result)
+            return result
+        if kind == 'capture' and command.get('capture_binding') is not None:
+            # This envelope is frozen at enqueue, so a completion race cannot
+            # change the command digest on replay or introduce a native effect.
+            with db:
+                self.begin_command(identity,digest)
+            result = self.bound_capture(command,row)
+            with db:
+                self.finish_command(identity,command,result)
             return result
         native_id, _status = self.resolve_launch_native(row)
         if not native_id and kind == 'stop' and row['state'] in {'launching', 'aborting', 'deadline_stopping'}:

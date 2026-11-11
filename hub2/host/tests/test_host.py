@@ -1515,3 +1515,93 @@ class NativeControlTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'command_id_conflict'):
             self.bridge.command({**command, 'kind': 'stop'})
         self.assertFalse(any(args[1] == 'kill' for args, _ in self.native.calls))
+
+
+class RetainedManagedCaptureTests(unittest.TestCase):
+    setUp=HostTests.setUp
+    tearDown=HostTests.tearDown
+
+    def seed(self,terminal=True):
+        from agent_hub_host import task_output
+        self.bridge.offer(HostTests.offer(self))
+        row=self.journal.db.execute('SELECT * FROM launches').fetchone()
+        task='hub2-'+row['session_id'];created=int(time.time()*1000)-1000
+        spec={'workspace':str(self.root),'operation_id':row['operation_id'],'epoch':row['epoch']}
+        binding=task_output.prepare_output(task,spec,'local-codex','codex','synthetic prompt')
+        directory=self.root.joinpath(*binding['parts'])
+        record={'session_id':row['native_id'],'workspace':str(self.root),'tag':row['tag'],'created_at_ms':created,'task_output':binding}
+        start={'schema_version':1,'parent_session':{'id':row['native_id'],'workspace':str(self.root),'tag':row['tag']},
+            'cwd':str(self.root),'output_dir':str(directory),'started_ms':created+1,'profile':'local-codex','engine':'codex','prompt_sha256':binding['prompt_sha256']}
+        self.manifest=self.root/'.local'/('launch-'+task+'.json');self.manifest.write_text(json.dumps(record));self.manifest.chmod(0o600)
+        (directory/'START.json').write_text(json.dumps(start));(directory/'START.json').chmod(0o600)
+        self.stdout=directory/'stdout.log';self.stdout.write_text('retained actual synthetic output\n');self.stdout.chmod(0o664)
+        if terminal:self.journal.db.execute("UPDATE launches SET state='exited'")
+        request_digest=hashlib.sha256(json.dumps({'kind':'capture','text':None,'epoch':row['epoch']},separators=(',',':')).encode()).hexdigest()
+        command={'id':'33333333-3333-4333-8333-333333333333','session_id':row['session_id'],'kind':'capture','epoch':row['epoch'],
+            'capture_binding':{'native_id':row['native_id'],'operation_id':row['operation_id'],'request_digest':request_digest}}
+        self.native.calls=[]
+        return command
+
+    def test_positive_finished_attempt_reads_retained_output_with_no_native_call_and_replays(self):
+        command=self.seed();result=self.bridge.command(command)
+        self.assertEqual(result['output'],'retained actual synthetic output\n')
+        self.assertEqual(result['capture_binding'],command['capture_binding'])
+        self.assertEqual(result['capture_source'],'retained_task_output')
+        self.assertEqual(self.native.calls,[])
+        self.stdout.write_text('changed after receipt')
+        self.assertEqual(self.bridge.command(command),result)
+        self.assertEqual(self.native.calls,[])
+        self.assertEqual(self.journal.db.execute('SELECT state FROM launches').fetchone()[0],'exited')
+
+    def test_missing_terminal_output_is_typed_and_never_falls_back_to_old_native_pane(self):
+        command=self.seed();self.stdout.unlink()
+        result=self.bridge.command(command)
+        self.assertEqual(result['error'],'task_output_unavailable')
+        self.assertNotIn('output',result);self.assertEqual(self.native.calls,[])
+        self.assertEqual(self.bridge.command(command),result)
+
+    def test_foreign_binding_epoch_and_screen_fail_before_any_native_or_output_read(self):
+        command=self.seed()
+        for key,value in [('native_id','foreign'),('operation_id','foreign'),('request_digest','0'*64)]:
+            wrong={**command,'id':'44444444-4444-4444-8444-'+str(len(self.native.calls)).zfill(12),'capture_binding':{**command['capture_binding'],key:value}}
+            self.journal.db.execute('DELETE FROM commands')
+            with self.assertRaisesRegex(ValueError,'capture_fence_conflict'):self.bridge.command(wrong)
+        self.journal.db.execute('DELETE FROM commands')
+        with self.assertRaisesRegex(ValueError,'command_fence_conflict'):self.bridge.command({**command,'epoch':command['epoch']+1})
+        with self.assertRaisesRegex(ValueError,'capture_fence_conflict'):self.bridge.command({**command,'mode':'screen'})
+        self.assertEqual(self.native.calls,[])
+
+    def test_running_legacy_output_keeps_qualified_pane_capture_without_reexecution(self):
+        command=self.seed(terminal=False);self.manifest.unlink()
+        result=self.bridge.command(command)
+        self.assertEqual(result['capture_source'],'native_pane')
+        self.assertEqual([args[1] for args,_ in self.native.calls],['status','capture'])
+
+    def test_completion_racing_running_snapshot_never_falls_back_to_retired_pane(self):
+        command=self.seed(terminal=False);self.manifest.unlink()
+        self.native.process['phase']='exited'
+        result=self.bridge.command(command)
+        self.assertEqual(result['error'],'task_output_unavailable')
+        self.assertEqual([args[1] for args,_ in self.native.calls],['status'])
+
+    def test_private_attempt_failure_never_uses_native_fallback_even_while_running(self):
+        command=self.seed(terminal=False);self.stdout.parent.chmod(0o755)
+        result=self.bridge.command(command)
+        self.assertEqual(result['error'],'task_output_private_path_required')
+        self.assertEqual(self.native.calls,[])
+
+    def group_writable_parent_capture(self,terminal):
+        command=self.seed(terminal=terminal)
+        (self.root/'.local').chmod(0o775)
+        (self.root/'.local/hub2-output').chmod(0o775)
+        self.assertEqual(self.stdout.parent.stat().st_mode & 0o777,0o700)
+        result=self.bridge.command(command)
+        self.assertEqual(result.get('output'),'retained actual synthetic output\n')
+        self.assertEqual(result['capture_source'],'retained_task_output')
+        self.assertEqual(self.native.calls,[])
+
+    def test_running_capture_allows_owned_group_writable_parents_and_private_attempt(self):
+        self.group_writable_parent_capture(terminal=False)
+
+    def test_terminal_capture_allows_owned_group_writable_parents_and_private_attempt(self):
+        self.group_writable_parent_capture(terminal=True)
