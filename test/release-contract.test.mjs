@@ -54,6 +54,11 @@ test('matched CLI release staging streams tar archive over SSH stdin without her
     /- name: Stage verified matched CLI release bundle on VM[\s\S]*?run: \|\n((?:          .*\n)+)/
   );
   assert.ok(stepMatch, 'deploy.yml must define the matched CLI staging step');
+  assert.match(
+    flow,
+    /if: always\(\) && steps\.finalize_deploy\.outcome != 'success' && steps\.deploy_vm\.outcome != 'skipped'/,
+    'automatic rollback must only run when deploy_vm was attempted'
+  );
   const script = stepMatch[1].replace(/^          /gm, '');
   assert.doesNotMatch(script, /<<['"]?STAGE_EOF/, 'ssh staging command must not override tar pipe stdin with a heredoc');
 

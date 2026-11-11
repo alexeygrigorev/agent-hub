@@ -451,7 +451,7 @@ jobs:
           if-no-files-found: error
           retention-days: 1
       - name: Automatically restore the previous release and Caddy config after a failed deploy or smoke
-        if: always() && steps.finalize_deploy.outcome != 'success'
+        if: always() && steps.finalize_deploy.outcome != 'success' && steps.deploy_vm.outcome != 'skipped'
         env:
           SSH_TARGET: ${{ secrets.AGENT_HUB_VM_USER }}@${{ secrets.AGENT_HUB_VM_HOST }}
         run: |
