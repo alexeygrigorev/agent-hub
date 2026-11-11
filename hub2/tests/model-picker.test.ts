@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { pickModelRoute, pickModelRouteDetailed, weightedChoice } from '../src/model-picker.ts';
+import { pickModelRoute, pickModelRouteDetailed, weightedChoice, buildRoutingPool } from '../src/model-picker.ts';
 
 const candidates=[
  {id:'codex',engine:'codex',model:'gpt-6.1-sol',effort:'medium',account_id:'codex',weight:1,capabilities:[],enabled:true},
@@ -273,4 +273,86 @@ test('workspace path narrowing never refuses a start and never overrides an expl
  const seen=new Set<string>();
  for(const draw of [0,0.4,0.6,0.999999])seen.add((await pickModelRoute(mixed,{interactive:false,workspace:'/home/user/work/task'},()=>draw)).machine_id);
  assert.deepEqual([...seen].sort(),['linux-box','unknown-os'],'a host with unknown OS stays eligible');
+});
+
+
+function capabilitySnapshot(capabilities: string[] | undefined) {
+ const now=Date.now();
+ return {
+  policy:{version:17,candidates:pool.filter(row=>['codex-sol-medium','claude-opus-medium'].includes(row.id))},
+  accounts:new Map(['codex','claude'].map(id=>[id,{account:{enabled:true},credential_usable:true,
+   hosts:['h1'],...observed(80,now)}])),
+  machines:new Map([['h1',{connected:true,engines:['codex','claude'],capabilities}]]),observed_at:now,
+ };
+}
+
+test('goal capability preference spans candidates and the actual weighted draw',()=>{
+ const snapshot=capabilitySnapshot(['interactive:codex','interactive:claude','effort:codex','effort:claude','goal:codex','goal:zai']);
+ const result=buildRoutingPool(snapshot,{interactive:true,with_goal:true,effort:'medium',machine_id:'h1'});
+ assert.deepEqual(result.diagnostics.pool.map(row=>row.policy_id),['codex-sol-medium']);
+ assert.equal(result.diagnostics.pool[0].share,1);
+ assert.deepEqual(result.options.map(row=>[row.value.engine,row.value.machine_id]),[['codex','h1']]);
+ for(const draw of [0,0.5,0.999999])assert.equal(weightedChoice(result.options,()=>draw).engine,'codex');
+ assert.ok(result.diagnostics.excluded.some(row=>row.policy_id==='claude-opus-medium'&&row.reason==='capability_not_advertised'));
+ assert.deepEqual(result.options[0].value.required_capabilities,['interactive','goal']);
+});
+
+test('ordinary starts retain model diversity when both engines advertise launch capabilities',()=>{
+ const snapshot=capabilitySnapshot(['interactive:codex','interactive:claude','effort:codex','effort:claude','goal:codex']);
+ const result=buildRoutingPool(snapshot,{interactive:true,effort:'medium'});
+ assert.deepEqual(result.diagnostics.pool.map(row=>row.policy_id),['codex-sol-medium','claude-opus-medium']);
+ assert.deepEqual(result.diagnostics.pool.map(row=>row.share),[0.5,0.5]);
+ assert.equal(weightedChoice(result.options,()=>0).engine,'codex');
+ assert.equal(weightedChoice(result.options,()=>0.999999).engine,'claude');
+});
+
+test('missing or universally incompatible capability observations remain advisory',()=>{
+ for(const capabilities of [undefined,[],['interactive:codex','interactive:claude','effort:codex','effort:claude']]){
+  const result=buildRoutingPool(capabilitySnapshot(capabilities),{interactive:true,with_goal:true});
+  assert.equal(result.options.length,2);
+  assert.deepEqual(result.diagnostics.excluded,[]);
+  assert.deepEqual(result.diagnostics.advisories?.filter(row=>row.reason==='capability_not_advertised').map(row=>row.policy_id),
+   ['codex-sol-medium','claude-opus-medium']);
+ }
+});
+
+test('explicit unsupported engine/model stays explicit with advisory capability observations',()=>{
+ const snapshot=capabilitySnapshot(['interactive:codex','interactive:claude','effort:codex','effort:claude','goal:codex']);
+ for(const explicit of [{engine:'claude'},{model:'claude-opus-medium'}]){
+  const result=buildRoutingPool(snapshot,{interactive:true,with_goal:true,...explicit});
+  assert.equal(result.options.length,1);
+  assert.equal(result.options[0].value.engine,'claude');
+  assert.equal(result.options[0].value.override_reason,'explicit_route');
+  assert.deepEqual(result.diagnostics.excluded,[]);
+  assert.ok(result.diagnostics.advisories?.some(row=>row.reason==='capability_not_advertised'));
+ }
+});
+
+test('capability preference removes unsupported hosts within a surviving candidate before weighting',()=>{
+ const snapshot=capabilitySnapshot(['interactive:codex','goal:codex','effort:codex']);
+ snapshot.accounts.get('codex')!.hosts.push('h2');
+ snapshot.machines.set('h2',{connected:true,engines:['codex','claude'],capabilities:['interactive:codex','effort:codex']});
+ const result=buildRoutingPool(snapshot,{interactive:true,with_goal:true});
+ assert.deepEqual(result.options.map(row=>[row.value.policy_id,row.value.machine_id]),[['codex-sol-medium','h1']]);
+ assert.equal(result.diagnostics.pool[0].share,1);
+});
+
+
+test('effective policy effort needs same-host support alongside goal, even without an effort override',()=>{
+ const snapshot=capabilitySnapshot(['interactive:codex','interactive:claude','goal:codex','goal:claude','effort:codex']);
+ const supported=buildRoutingPool(snapshot,{interactive:true,with_goal:true});
+ assert.deepEqual(supported.diagnostics.pool.map(row=>row.policy_id),['codex-sol-medium']);
+ snapshot.machines.get('h1')!.capabilities=['interactive:codex','interactive:claude','goal:codex','goal:claude'];
+ const advisory=buildRoutingPool(snapshot,{interactive:true,with_goal:true});
+ assert.equal(advisory.options.length,2,'no effort observations must not refuse the launch');
+ assert.equal(advisory.diagnostics.excluded.length,0);
+});
+
+test('capability preference cannot revive a candidate excluded by fresh quota observations',()=>{
+ const snapshot=capabilitySnapshot(['interactive:codex','goal:codex','effort:codex']);
+ snapshot.accounts.get('codex')!.quota!.remaining=1;
+ const result=buildRoutingPool(snapshot,{interactive:true,with_goal:true});
+ assert.deepEqual(result.options.map(row=>row.value.engine),['claude']);
+ assert.ok(result.diagnostics.excluded.some(row=>row.policy_id==='codex-sol-medium'&&row.reason==='quota_below_minimum'));
+ assert.ok(result.diagnostics.advisories?.some(row=>row.policy_id==='claude-opus-medium'&&row.reason==='capability_not_advertised'));
 });
