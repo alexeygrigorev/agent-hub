@@ -319,14 +319,22 @@ test('a fresh snapshot missing the native process does not confirm a pending sto
  const base='/api/sessions/'+session;
  const queued=await f.call(base+'/commands','POST',{key:'stop-snapshot-omission',kind:'stop'},actor);
  assert.equal(queued.status,201);
+ const {command}=await queued.json() as any;
  assert.equal((await f.call('/_internal/reap','POST',{dry_run:false})).status,200);
+ assert.equal((f.database.prepare('SELECT state FROM session_commands WHERE id=?').get(command.id) as any).state,'pending');
+ f.database.prepare('UPDATE session_commands SET created_at=? WHERE id=?').run(Date.now()-60_001,command.id);
+ await f.machine.alarm();
  const listed=await f.call(base+'/commands','GET',undefined,actor);
  const {commands}=await listed.json() as any;
  assert.equal(commands[0].state,'failed');
  assert.equal(commands[0].ack.reason,'stop_unconfirmed');
  assert.equal(commands[0].ack.confirmed_exit,false);
- const native=f.database.prepare('SELECT phase,containment_empty FROM native_sessions WHERE session_id=?').get(session);
- assert.deepEqual({...native},{phase:'missing',containment_empty:0});
+ assert.equal(f.database.prepare('SELECT phase FROM native_sessions WHERE session_id=?').get(session),undefined);
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'running');
+ assert.equal((await f.call('/_internal/reap','POST',{dry_run:false})).status,200);
+ assert.equal(f.events.some(event=>event.path==='/_internal/stopped'||event.path==='/_internal/reaped'),false);
+ const retry=await f.call(base+'/commands','POST',{key:'retry-snapshot-omission',kind:'stop'},actor);
+ assert.equal(retry.status,201);
 });
 
 test('a formerly admitted expired attempt receives a host stop instead of immediate confirmation',async()=>{

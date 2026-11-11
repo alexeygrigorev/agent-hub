@@ -201,7 +201,7 @@ export class MachineDO {
       now-CLAIMED_WITHOUT_NATIVE_GRACE_MS);
     for (const session of expired) await this.recordLaunchTimeout(session, now);
     this.db.run("UPDATE session_commands SET state='failed',result_json=?,updated_at=? WHERE kind='stop' AND state='pending' AND created_at<=?",
-      JSON.stringify({error:'stop_unconfirmed',stage:'host_stop'}),now,now-60_000);
+      JSON.stringify({stopped:false,error:'stop_unconfirmed',reason:'stop_unconfirmed',stage:'host_stop'}),now,now-60_000);
     await this.reapInactive(false);
     await this.scheduleNext();
     await this.flushOutbox(now);
@@ -1222,6 +1222,14 @@ export class MachineDO {
     const applied=this.db.transaction(this.ctx,()=>{
       const current=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',session.id);
       if(!current||current.epoch!==session.epoch||current.operation_id!==session.operation_id||current.native_id!==session.native_id||!['claimed','running'].includes(current.state))return false;
+      if (!qualifiedExit && this.db.one(`SELECT id FROM session_commands
+        WHERE session_id=? AND machine_id=? AND epoch=? AND kind='stop'
+        AND (state='pending' OR (state='failed' AND json_extract(result_json,'$.error')='stop_unconfirmed')) LIMIT 1`,
+        current.id,current.machine_id,current.epoch)) {
+        // A bounded snapshot can omit a live process. Keep this attempt
+        // routable so the operator can retry or the host can report its exit.
+        return false;
+      }
       this.db.run("UPDATE sessions SET state='stopped',updated_at=? WHERE id=?",now,session.id);
       this.db.run("UPDATE machine_session_operations SET state='reaped' WHERE operation_id=? AND session_id=? AND epoch=?",session.operation_id,session.id,session.epoch);
       this.settlePendingCommands(session,now,reason,qualifiedExit
