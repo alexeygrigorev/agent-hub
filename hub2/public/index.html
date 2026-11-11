@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-e4JXokFInCEmxaWDx5VwfxjGssAavfVzgWe7YsuGBww='; style-src 'sha256-TVlA0VLccCTkG5+NUmq9uVRqKKoie5ZEuClO8RoPfMM='; connect-src 'self'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-MZbLy5KjI/UDUqgRMUuvLzER7NTn27ofgIsfEQNUXKo='; style-src 'sha256-TVlA0VLccCTkG5+NUmq9uVRqKKoie5ZEuClO8RoPfMM='; connect-src 'self'; base-uri 'none'; form-action 'none'">
 <title>Hub 2 · Work and conversations</title><style>
 :root{color-scheme:light dark;font:16px/1.5 system-ui,sans-serif;--bg:#f4f6f9;--card:#fff;--ink:#172334;--muted:#536275;--line:#ccd5df;--accent:#075ac4;--danger:#a51d30}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink)}main{max-width:1060px;margin:auto;padding:20px}header,.bar,nav,.actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap}header{justify-content:space-between}h1{font-size:1.6rem;margin:0}h2{font-size:1.25rem}h3{font-size:1.05rem;margin:0 0 8px}.muted,small{color:var(--muted)}button,input,textarea,select{font:inherit}button{cursor:pointer;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink);padding:9px 14px;min-height:44px}button.primary,nav button[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:#fff}button:disabled{opacity:.6;cursor:wait}input,textarea{width:100%;border:1px solid var(--line);border-radius:6px;padding:10px;background:var(--card);color:var(--ink)}textarea{min-height:100px;resize:vertical}label{display:block;font-weight:600;margin:8px 0}label small{display:block;font-weight:400}.fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px}.card,form.box,details{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin:12px 0}.card p{margin:7px 0;overflow-wrap:anywhere}.pre,pre{white-space:pre-wrap;overflow-wrap:anywhere}pre{font:14px/1.5 ui-monospace,monospace;max-height:55vh;overflow:auto}nav{margin:20px 0 12px;gap:6px}nav button{flex:1}#notice{min-height:26px;margin:12px 0;overflow-wrap:anywhere}#notice[data-error=true]{color:var(--danger)}summary{cursor:pointer;font-weight:600;min-height:30px}.badge{border:1px solid var(--line);border-radius:20px;padding:4px 10px;font-size:.85rem}a.skip{position:absolute;left:-9999px}a.skip:focus{left:12px;top:8px;background:var(--card);padding:8px;z-index:5}:focus-visible{outline:3px solid #e29913;outline-offset:3px}[hidden]{display:none!important}.grow{flex:1}.meta{font-size:.9rem;color:var(--muted)}
@@ -23,6 +23,7 @@
 <section id="content" aria-labelledby="title" tabindex="-1"><h2 id="title">Intakes</h2>
 <details id="createIntake"><summary>Create intake</summary><form id="intakeForm"><label>Title<input name="title" maxlength="240" required></label><label>Request<textarea name="text" required></textarea></label><label>Acceptance criteria<small>One requirement per line.</small><textarea name="criteria" required></textarea></label><button class="primary" type="submit">Create intake</button></form></details>
 <details id="compose" hidden><summary>New message</summary><form id="messageForm"><label>Recipient identity<input name="recipient" required maxlength="180"></label><label>Message<textarea name="body" required></textarea></label><button class="primary" type="submit">Send message</button></form></details>
+<details id="startSession" hidden><summary>Start session</summary><form id="sessionForm"><label>Mode<select name="mode"><option value="interactive">Interactive</option><option value="goal">With goal</option></select></label><label>Goal<textarea name="brief" maxlength="8192"></textarea></label><p>Hub chooses the model and a compatible host. Goal starts require an advertised goal capability.</p><button class="primary" type="submit">Start session</button></form></details>
 <div id="results" aria-busy="false"></div><div class="actions"><button id="first" type="button">First page</button><button id="next" type="button" hidden>Next page</button></div>
 <details id="details" hidden><summary>Record details</summary><div id="detail"></div></details></section></section>
 </main><script type="module">
@@ -50,13 +51,13 @@ function stamp(value){if(value===null||value===undefined)return 'Not reported';c
 function card(title,meta,body){const c=node('article',undefined,'card');c.append(node('h3',title),node('p',meta,'meta'));if(body!==undefined)c.append(node('p',body,'pre'));return c;}
 function detail(title,data){$('detail').replaceChildren(node('h3',title),node('pre',JSON.stringify(data,null,2)));$('details').hidden=false;$('details').open=true;$('details').scrollIntoView({block:'nearest'});}
 async function projects(after=null){const data=await api('/api/repos?'+params({status:'active',limit:50,after}));if(!Array.isArray(data.items))throw new ApiError('invalid_project_page');if(!after)$('projects').replaceChildren();for(const r of data.items){const o=node('option');o.value=r.canonical_name;$('projects').append(o);}projectsNext=data.next??null;$('moreProjects').hidden=!projectsNext;if(!$('project').value&&data.items[0])$('project').value=data.items[0].canonical_name;}
-function select(view){tab=view;page=null;for(const b of document.querySelectorAll('nav button'))b.setAttribute('aria-pressed',String(b.dataset.view===tab));$('title').textContent=names[tab];$('createIntake').hidden=tab!=='intakes';$('compose').hidden=tab!=='inbox';$('details').hidden=true;return load();}
+function select(view){tab=view;page=null;for(const b of document.querySelectorAll('nav button'))b.setAttribute('aria-pressed',String(b.dataset.view===tab));$('title').textContent=names[tab];$('createIntake').hidden=tab!=='intakes';$('compose').hidden=tab!=='inbox';$('startSession').hidden=tab!=='sessions';$('details').hidden=true;return load();}
 function draw(items){
  if(!items.length){$('results').append(node('p','No records in this page.','muted'));return;}
  for(const item of items){
   let c;
-  if(tab==='intakes'){c=card(item.title||item.id,`${item.status||'Unreported'} · ${stamp(item.updated_at)}`,item.session_id?'Session: '+item.session_id:undefined);c.append(button('Open intake',async()=>detail('Intake',await api(`/api/intakes/${encodeURIComponent(item.id)}?`+params({project:context().project})))));}
-  if(tab==='sessions'){c=card(item.title||item.id,`${item.state||'Unreported'} · ${item.engine||'Engine unreported'} · ${stamp(item.updated_at)}`,item.id);c.append(button('Open session',async()=>detail('Session',await api(`/api/sessions/${encodeURIComponent(item.id)}?`+params({machine_id:context().machine})))));}
+  if(tab==='intakes'){c=card(item.title||item.id,`${item.status||'Unreported'} · ${stamp(item.updated_at)}`,item.session_id?'Session: '+item.session_id:undefined);c.append(button('Open intake',async()=>openIntake(item.id)));}
+  if(tab==='sessions'){c=card(item.title||item.id,`${item.state||'Unreported'} · ${item.engine||'Engine unreported'} · ${stamp(item.updated_at)}`,item.id);c.append(button('Open session',async()=>openSession(item.id)));}
   if(tab==='fleet'){c=card(item.alias||item.id,`${item.connected===true?'Connected':item.connected===false?'Disconnected':'State unreported'} · ${item.os||''} ${item.arch||''}`,`Last seen: ${stamp(item.last_seen)}`);c.append(button('View sessions',async()=>{$('machine').value=item.id;await select('sessions');}));}
   if(tab==='inbox'){c=card(item.sender||'Sender unreported',`${item.state||'Unreported'} · ${stamp(item.created_at)}`,item.body);const actions=node('div',undefined,'actions');for(const [stage,label] of [['read','Mark read'],['ack','Acknowledge'],['accept','Accept'],['complete','Complete']])actions.append(button(label,async()=>{if(!Number.isSafeInteger(item.epoch))throw new ApiError('invalid_message_epoch');await api(`/api/messages/${encodeURIComponent(item.id)}/${stage}?`+params({mailbox:context().mailbox}),'POST',{epoch:item.epoch});await load();}));actions.append(button('Delivery status',async()=>detail('Message status',await api(`/api/messages/${encodeURIComponent(item.id)}/status?`+params({mailbox:context().mailbox})))));c.append(actions);}
   if(c)$('results').append(c);
@@ -69,16 +70,57 @@ async function load(){
  say('Loading '+names[view].toLowerCase()+'...');$('results').setAttribute('aria-busy','true');
  try{
   if(view==='quota'){
-   const data=await api(accountPath('/quota'));if(request!==revision)return;
-   const a=data.account,q=data.quota;
-   $('results').append(card(a?.provider||'Account',data.fresh?'Fresh quota observation':'Quota unavailable or stale',q?`${q.remaining}% remaining · captured ${stamp(q.captured_at)} · valid until ${stamp(q.valid_until)}`:'No quota observation available.'));
-   if(a)$('results').append(card('Capacity',`${a.occupied} occupied / ${a.capacity} total`,a.enabled?'Enabled':'Disabled'));
-   const actions=node('div',undefined,'actions');actions.append(button('Reset grants',async()=>detail('Reset grants',await api(accountPath('/resets')))),button('Quota alerts',async()=>detail('Quota alerts',await api(accountPath('/alerts')))));$('results').append(actions);say('Loaded quota.');return true;
+   const data=await api('/api/quota');if(request!==revision)return;
+   if(!Array.isArray(data.pools))throw new ApiError('invalid_quota_response');
+   for(const q of data.pools)$('results').append(card(q.provider+' · '+q.account,q.state,q.remaining_percent===null?'Quota unavailable':`${q.remaining_percent}% remaining · observed ${stamp(q.observed_at)} · reset ${stamp(q.reset_at)}`));
+   say('Loaded quota.');return true;
   }
   const paths={intakes:'/api/intakes?'+params({project:ctx.project,limit:25,cursor:page}),sessions:'/api/sessions?'+params({machine_id:ctx.machine,limit:25,after:page}),fleet:'/api/fleet?'+params({limit:25,after:page}),inbox:'/api/messages?'+params({mailbox:ctx.mailbox,limit:25,cursor:page})};
-  const data=await api(paths[view]);if(request!==revision)return;if(!Array.isArray(data.items))throw new ApiError('invalid_list_response');draw(data.items);$('next').hidden=!data.next;$('next').dataset.cursor=data.next??'';say(`${data.items.length} ${names[view].toLowerCase()} loaded${data.next?' · more available':''}.`);return true;
+  const data=await api(paths[view]);if(request!==revision)return;if(!Array.isArray(data.items))throw new ApiError('invalid_list_response');draw(data.items);if(view==='fleet')$('results').append(button('Routing machines',async()=>detail('Routing machines',await api('/api/fleet/routing/machines'))));$('next').hidden=!data.next;$('next').dataset.cursor=data.next??'';say(`${data.items.length} ${names[view].toLowerCase()} loaded${data.next?' · more available':''}.`);return true;
  }catch(e){if(request===revision)report(e);return false;}finally{if(request===revision)$('results').setAttribute('aria-busy','false');}
 }
+function field(form,label,name,value='',multiline=false){const l=node('label',label),input=node(multiline?'textarea':'input');input.name=name;input.value=value??'';l.append(input);form.append(l);return input;}
+function submit(form,label,action){const b=node('button',label,'primary');b.type='submit';form.append(b);form.addEventListener('input',()=>delete form.dataset.key);form.addEventListener('submit',event=>{event.preventDefault();run(b,()=>action(form.dataset.key||(form.dataset.key=crypto.randomUUID())));});}
+function intakePath(id,suffix=''){return `/api/intakes/${encodeURIComponent(id)}${suffix}?`+params({project:context().project});}
+async function openIntake(id){
+ const data=await api(intakePath(id)),item=data.intake;if(!item)throw new ApiError('invalid_intake_response');detail('Intake',data);
+ const edit=node('form');field(edit,'Title','title',item.title);field(edit,'Current state','current_state',item.current_state,true);field(edit,'Next step','next_step',item.next_step,true);
+ submit(edit,'Update intake',async key=>{await api(intakePath(id),'POST',{key,expected_version:item.updated_at,...(edit.elements.title.value!==item.title?{title:edit.elements.title.value}:{}),current_state:edit.elements.current_state.value||null,next_step:edit.elements.next_step.value||null});await openIntake(id);say('Intake updated.');});
+ const note=node('form');const noteInput=field(note,'Note','note','',true);noteInput.required=true;noteInput.maxLength=4000;submit(note,'Append note',async key=>{await api(intakePath(id,'/append'),'POST',{key,note:noteInput.value});await openIntake(id);say('Note appended.');});
+ const close=node('form');const reason=field(close,'Close reason','reason');reason.required=true;submit(close,'Close intake',async key=>{await api(intakePath(id),'POST',{key,expected_version:item.updated_at,status:'done',reason:reason.value});await openIntake(id);say('Intake closed.');});$('detail').append(edit,note,close);
+}
+function sessionPath(id,suffix=''){return `/api/sessions/${encodeURIComponent(id)}${suffix}?`+params({machine_id:context().machine});}
+async function waitForSession(id){
+ const until=Date.now()+150000;
+ while(Date.now()<until){const data=await api(sessionPath(id)),session=data.session??data;if(session.state==='running'&&session.native_id){say('Session running: '+id);await openSession(id);return;}if(['failed','stopped','cancelled','completed','complete'].includes(session.state))throw new ApiError('session_start_'+session.state);say('Session '+session.state+': '+id);await new Promise(resolve=>setTimeout(resolve,1000));}
+ throw new ApiError('session_start_timeout');
+}
+async function sessionCommand(id,kind,body,key){
+ const receipt=await api(sessionPath(id,'/'+kind),'POST',{key,...body});detail('Command recorded; awaiting host acknowledgement',receipt);say('Command queued; waiting for host acknowledgement.');
+ const commandId=receipt.command?.id??receipt.command_id??receipt.id;if(!commandId)throw new ApiError('invalid_command_receipt');
+ const until=Date.now()+90000;
+ while(Date.now()<until){
+  const data=await api(sessionPath(id,'/commands')),command=(data.commands??data.items??[]).find(c=>c.id===commandId||c.command_id===commandId);
+  if(command){detail('Command '+command.state,command);if(command.state==='acked'){
+   if(command.ack?.outcome==='unconfirmed'||command.ack?.error)throw new ApiError(command.ack.error??'command_unconfirmed');
+   if(kind==='send'&&command.ack?.outcome!=='delivered'&&command.ack?.delivery!=='native_acknowledged'||kind==='stop'&&command.ack?.confirmed_exit!==true||kind==='capture'&&typeof command.ack?.capture!=='string')throw new ApiError('command_evidence_missing');
+   say(kind+' acknowledged by host.');return;
+  }if(['failed','refused','uncertain','expired'].includes(command.state))throw new ApiError(command.ack?.reason??command.reason??'command_'+command.state);}
+  await new Promise(resolve=>setTimeout(resolve,1000));
+ }
+ throw new ApiError('command_ack_timeout');
+}
+async function openSession(id){
+ const data=await api(sessionPath(id));detail('Session',data);const controls=node('div',undefined,'actions');
+ controls.append(button('Capture session',()=>sessionCommand(id,'capture',{max_bytes:4096,mode:'screen'},crypto.randomUUID())),button('Stop session',()=>sessionCommand(id,'stop',{},crypto.randomUUID())));
+ const form=node('form'),prompt=field(form,'Steer message','body','',true);prompt.required=true;prompt.maxLength=8192;submit(form,'Send steer',key=>sessionCommand(id,'send',{body:prompt.value},key));$('detail').append(controls,form);
+}
+$('sessionForm').addEventListener('input',()=>delete $('sessionForm').dataset.key);
+$('sessionForm').addEventListener('submit',event=>{event.preventDefault();const form=event.currentTarget;run(form.querySelector('button'),async()=>{
+ const ctx=context();if(!ctx.project)throw new ApiError('project_required');const goal=form.elements.mode.value==='goal',brief=form.elements.brief.value.trim();if(goal&&!brief)throw new ApiError('goal_required');
+ const key=form.dataset.key||(form.dataset.key=crypto.randomUUID()),body={key,repo:ctx.project,mode:'interactive',...(ctx.machine?{machine_id:ctx.machine}:{}),...(goal?{with_goal:true,brief}:{})};
+ const data=await api('/api/sessions','POST',body);if(!data.id)throw new ApiError('invalid_session_receipt');detail('Session queued',data);await waitForSession(data.id);delete form.dataset.key;
+});});
 $('connect').addEventListener('submit',async event=>{
  event.preventDefault();const candidate=$('token').value.trim();if(!/^[^\s]{32,256}$/.test(candidate)){say('Enter a valid access token (32-256 characters).',true);return;}
  cookieAuth=false;csrf='';token=candidate;$('token').value='';await run($('connectButton'),async()=>{try{await projects();$('connection').hidden=true;$('dashboard').hidden=false;$('state').textContent='Connected';await select(tab);}catch(e){disconnect();throw e;}});
