@@ -438,7 +438,46 @@ test('a formerly admitted expired attempt receives a host stop instead of immedi
  assert(messages.some(message=>message.type==='session.command'&&message.command.pre_native===true&&message.command.id===command.id));
  const ack=await f.call('/api/sessions/'+session+'/commands/'+command.id+'/ack','POST',{epoch,result:{stopped:true,evidence:'dispatch_fenced'}});
  assert.equal(ack.status,200);
+ assert.deepEqual(f.revocations.map(row=>[row.operation_id,row.epoch,row.reason]),
+   [['op-'+session,epoch,'native_dispatch_not_started']]);
  assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'stopped');
+});
+
+test('an authenticated no-dispatch receipt fails the exact admitted launch without native exit evidence',async()=>{
+ const f=fixture(),session='no-native-dispatch',epoch=await startClaimed(f,session,null);
+ const path='/api/sessions/'+session+'/finish';
+ const receipt={operation_id:'op-'+session,epoch,native_id:null,launch_failed:true,no_dispatch:true};
+ assert.equal((await f.call(path,'POST',receipt)).status,409);
+ f.database.prepare('INSERT INTO launch_admissions VALUES(?,?,?,?)').run(receipt.operation_id,session,epoch,Date.now());
+ f.clearCache();
+ assert.equal((await f.call(path,'POST',{...receipt,epoch:epoch+1})).status,409);
+ assert.equal((await f.call(path,'POST',{...receipt,native_exit_confirmed:true})).status,400);
+ assert.equal((await f.call(path,'POST',receipt)).status,200);
+ assert.equal((await f.call(path,'POST',receipt)).status,200);
+ const row=f.database.prepare('SELECT state,native_id FROM sessions WHERE id=?').get(session);
+ assert.deepEqual({...row},{state:'failed',native_id:null});
+ const events=f.events.filter(event=>event.path==='/_internal/reaped');
+ assert.equal(events.length,1);
+ assert.equal(events[0].body.failure_reason,'native_dispatch_not_started');
+ assert.equal(events[0].body.no_dispatch,true);
+ assert.equal(events[0].body.native_exit_confirmed,undefined);
+});
+
+test('a delayed no-dispatch receipt revokes a superseded admitted attempt without touching its successor',async()=>{
+ const f=fixture(),session='no-dispatch-superseded',epoch=await startClaimed(f,session,null);
+ const oldOperation='op-'+session;
+ f.database.prepare('INSERT INTO launch_admissions VALUES(?,?,?,?)').run(oldOperation,session,epoch,Date.now());
+ f.database.prepare("UPDATE machine_session_operations SET state='expired' WHERE operation_id=?").run(oldOperation);
+ f.database.prepare("UPDATE sessions SET operation_id='successor',epoch=?,state='running',native_id='successor-native' WHERE id=?").run(epoch+1,session);
+ f.clearCache();
+ const path='/api/sessions/'+session+'/finish';
+ const receipt={operation_id:oldOperation,epoch,native_id:null,launch_failed:true,no_dispatch:true};
+ assert.equal((await f.call(path,'POST',receipt)).status,200);
+ assert.equal((await f.call(path,'POST',receipt)).status,200);
+ assert.deepEqual(f.revocations.map(row=>[row.operation_id,row.epoch]),[[oldOperation,epoch]]);
+ assert.equal(f.events.some(event=>event.path==='/_internal/reaped'),false);
+ assert.deepEqual({...f.database.prepare('SELECT state,native_id FROM sessions WHERE id=?').get(session)},
+   {state:'running',native_id:'successor-native'});
 });
 
 test('a pending stop ends as stop_unconfirmed after sixty seconds',async()=>{

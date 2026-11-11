@@ -621,6 +621,7 @@ export class MachineDO {
     const machineId = this.machineActor(actor, 'session:report');
     if (!machineId) return error('forbidden', 403);
     const body = await bodyObject(request, 12_288);
+    if(body.no_dispatch!==undefined)return await this.finishWithoutDispatch(machineId,sessionId,body);
     const launchFailed=body.launch_failed===true;
     if(body.launch_failed!==undefined&&typeof body.launch_failed!=='boolean')return error('invalid_launch_failure',400);
     if (typeof body.operation_id !== 'string' || !Number.isSafeInteger(body.epoch) || typeof body.exit_code !== 'number'
@@ -690,6 +691,38 @@ export class MachineDO {
     return json({ ok: true, session_id: sessionId, state, forwarded }, forwarded ? 201 : 202);
   }
 
+  private async finishWithoutDispatch(machineId:string,sessionId:string,body:JsonRecord):Promise<Response>{
+    if(body.no_dispatch!==true||body.launch_failed!==true||body.native_id!==null||body.exit_code!==undefined
+      ||body.native_exit_confirmed!==undefined||typeof body.operation_id!=='string'||!Number.isSafeInteger(body.epoch))
+      return error('invalid_no_dispatch_receipt',400);
+    const row=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND machine_id=?',sessionId,machineId);
+    const operationId=body.operation_id,epoch=body.epoch as number;
+    const admission=this.db.one('SELECT operation_id FROM launch_admissions WHERE operation_id=? AND session_id=? AND epoch=?',
+      operationId,sessionId,epoch);
+    if(!row||!admission)return error('stale_no_dispatch_receipt',409);
+    const current=row.operation_id===operationId&&row.epoch===epoch;
+    if(current&&row.native_id!==null)return error('stale_no_dispatch_receipt',409);
+    if(current&&row.state==='claimed'){
+      await this.recordLaunchRefusal(row,'native_dispatch_not_started',true);
+    }else{
+      const settled=current ? ['failed','stopped','expired'].includes(row.state)
+        : epoch<row.epoch&&!!this.db.one("SELECT operation_id FROM machine_session_operations WHERE operation_id=? AND session_id=? AND epoch=? AND state='expired'",
+          operationId,sessionId,epoch);
+      if(!settled)return error('stale_no_dispatch_receipt',409);
+      const refusal=this.db.one("SELECT id FROM machine_outbox WHERE id=? AND json_extract(payload_json,'$.no_dispatch')=1",
+        `launch-refused:${operationId}:${epoch}`);
+      if(!refusal){
+        const now=Date.now(),key=`no-dispatch-revoke:${operationId}:${epoch}`;
+        this.insertOutbox(key,'no-dispatch-revoke',operationId,row.project_id,{
+          session_id:row.id,attempt_operation_id:operationId,epoch,machine_id:row.machine_id,
+          intake_id:row.intake_id,no_dispatch:true},now);
+        await this.flushOne(key);
+        await this.scheduleNext();
+      }
+    }
+    return json({ok:true,no_dispatch:true});
+  }
+
   private async flushOutbox(now: number): Promise<void> {
     const rows = this.db.all<OutboxRow>(
       `SELECT * FROM machine_outbox WHERE state='pending' AND next_action_at <= ? ORDER BY next_action_at, id LIMIT 20`, now,
@@ -727,12 +760,18 @@ export class MachineDO {
         this.db.run("UPDATE machine_outbox SET state='delivered',updated_at=? WHERE id=? AND state='pending'",Date.now(),row.id);
         return true;
       }
-      if(row.kind==='finish'||row.kind==='lost'){
+      const revocationReason = payload.no_dispatch===true ? 'native_dispatch_not_started'
+        : row.kind==='lost' ? 'host_inventory_stale' : row.kind==='finish' ? 'native_exit_confirmed' : null;
+      if(revocationReason){
         const revoked=await env.CONTROL.get(env.CONTROL.idFromName('global')).fetch('https://control.internal/_worker/revoke',{
           method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:payload.session_id,
             operation_id:payload.attempt_operation_id,epoch:payload.epoch,machine_id:payload.machine_id,
-            intake_id:payload.intake_id,project_id:row.project_id,reason:row.kind==='lost'?'host_inventory_stale':'native_exit_confirmed'})});
+            intake_id:payload.intake_id,project_id:row.project_id,reason:revocationReason})});
         if(!revoked.ok||(await revoked.json() as JsonRecord).revoked!==true)throw new Error('child_revocation_pending');
+      }
+      if(row.kind==='no-dispatch-revoke'){
+        this.db.run("UPDATE machine_outbox SET state='delivered',updated_at=? WHERE id=? AND state='pending'",Date.now(),row.id);
+        return true;
       }
       const stub = env.PROJECTS.get(env.PROJECTS.idFromName(row.project_id));
       const path = row.kind === 'finish' ? '/_internal/finish' : row.kind === 'started' ? '/_internal/started'
@@ -1054,11 +1093,11 @@ export class MachineDO {
     }
   }
 
-  private async recordLaunchRefusal(session:SessionRow,failureReason:string):Promise<void>{
+  private async recordLaunchRefusal(session:SessionRow,failureReason:string,noDispatch=false):Promise<void>{
     const now=Date.now(),reason='host_launch_refused',payload={operation_id:session.dispatch_id,
       attempt_operation_id:session.operation_id,session_id:session.id,intake_id:session.intake_id,
       machine_id:session.machine_id,epoch:session.epoch,native_id:null,reason,failure_reason:failureReason,
-      launch_failed:true,observed_at:now};
+      launch_failed:true,...(noDispatch?{no_dispatch:true}:{}),observed_at:now};
     const key=`launch-refused:${session.operation_id}:${session.epoch}`;
     const applied=this.db.transaction(this.ctx,()=>{
       const current=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',session.id);
@@ -1067,7 +1106,7 @@ export class MachineDO {
         now,session.id,session.operation_id,session.epoch);
       this.db.run("UPDATE machine_session_operations SET state='failed' WHERE operation_id=? AND session_id=? AND epoch=? AND state='current'",
         session.operation_id,session.id,session.epoch);
-      this.settlePendingCommands(current,now,reason,null);
+      this.settlePendingCommands(current,now,reason,noDispatch?{evidence:'dispatch_fenced'}:null);
       this.insertOutbox(key,'reaped',session.operation_id,session.project_id,payload,now);
       return true;
     });
@@ -1255,7 +1294,11 @@ export class MachineDO {
         VALUES(?,?,?, ?,NULL,1,?) ON CONFLICT(session_id) DO UPDATE SET native_id=excluded.native_id,
         phase=excluded.phase,last_activity_at=excluded.last_activity_at,containment_empty=1,observed_at=excluded.observed_at`,
         session.id,nativeId,nativeId?'exited':'missing',observedAt,now);
-      if (!lost) this.insertOutbox(`stopped:${session.operation_id}:${session.epoch}`,'stopped',session.operation_id,session.project_id,payload,now);
+      if (!lost) {
+        const dispatchFenced=nativeId===null&&!unclaimed;
+        this.insertOutbox(`stopped:${session.operation_id}:${session.epoch}`,'stopped',session.operation_id,session.project_id,
+          {...payload,...(dispatchFenced?{no_dispatch:true}:{})},now);
+      }
       return true;
     });
     if(applied && session.state!=='lost')await this.flushOne(`stopped:${session.operation_id}:${session.epoch}`);

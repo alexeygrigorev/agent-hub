@@ -175,12 +175,13 @@ class HostTests(unittest.TestCase):
     def failed_native(self,exit_code=None,wrong_tag=False):
         identity='11111111-1111-4111-8111-111111111111'
         def launch(task,specification):
+            specification['before_native_dispatch']()
             self.native.process={'id':identity,'tag':'foreign' if wrong_tag else 'task-'+task,'workspace':str(self.root),
                                  'phase':'running' if exit_code is None else 'exited','containment_empty':exit_code is not None}
             if exit_code is not None:self.native.process['exit']={'code':exit_code}
             raise RuntimeError('maintained_launcher_receipt_unverified')
         self.bridge.launcher.launch=launch
-        self.bridge.launcher.aborted_identity=lambda task,workspace:identity
+        self.bridge.launcher.aborted_identity=lambda task,workspace,attempt=None:identity
         with self.assertRaisesRegex(RuntimeError,'maintained_launcher_receipt_unverified'):
             self.bridge.offer(self.offer())
         return identity
@@ -410,7 +411,10 @@ class HostTests(unittest.TestCase):
         self.bridge.offer(offer)
         with self.journal.db:
             self.journal.db.execute("UPDATE launches SET native_id=NULL,state='launching'")
-        self.bridge.offer(offer)
+        with self.assertRaisesRegex(RuntimeError, 'native_abort_pending'):
+            self.bridge.offer(offer)
+        state = self.journal.db.execute("SELECT state FROM launches").fetchone()[0]
+        self.assertEqual(state, 'aborting')
         self.assertEqual(sum(call[1] == "start" for call, _ in self.native.calls), 1)
 
     def test_crash_before_native_launch_remains_uncertain_not_duplicated(self):
@@ -422,11 +426,35 @@ class HostTests(unittest.TestCase):
             self.bridge.offer(self.offer())
         self.assertEqual(sum(call[1] == "start" for call, _ in self.native.calls), 1)
 
+    def test_adapter_preparation_failure_dispatches_only_the_durable_receipt(self):
+        offer = self.offer()
+        sent = []
+        socket = type("Socket", (), {"send": lambda _, data: sent.append(json.loads(data))})()
+        with patch.object(self.bridge.launcher, "launch", side_effect=TypeError("adapter_preparation_failed")):
+            self.bridge.dispatch({"type": "session.offer", "offer": offer}, socket, None)
+        self.assertEqual(sent, [])
+        self.assertEqual(self.native.calls, [])
+        receipt = self.journal.db.execute("SELECT payload FROM outbox").fetchone()
+        self.assertEqual(json.loads(receipt[0]), {"operation_id": offer["operation_id"], "epoch": offer["epoch"],
+                                                "native_id": None, "launch_failed": True, "no_dispatch": True})
+
+    def test_adapter_preparation_throttle_keeps_budget_pause_and_dispatch_proof(self):
+        offer = self.offer()
+        retry_at = int(time.time() * 1000) + 60000
+        error = ApiError("budget throttled", status=429, code="budget_paused", retry_at=retry_at)
+        with patch.object(self.bridge.launcher, "launch", side_effect=error):
+            with self.assertRaises(ApiError):
+                self.bridge.dispatch({"type": "session.offer", "offer": offer}, None, None)
+        self.assertEqual(self.bridge.budget_paused_until, retry_at)
+        self.assertEqual(self.native.calls, [])
+        receipt = self.journal.db.execute("SELECT payload FROM outbox").fetchone()
+        self.assertTrue(json.loads(receipt[0])["no_dispatch"])
+
     def test_missing_maintained_launcher_refuses_before_native_spawn(self):
         self.bridge.launcher.config = {}
-        with self.assertRaises(RuntimeError):
-            self.bridge.offer(self.offer())
+        self.assertIsNone(self.bridge.offer(self.offer()))
         self.assertIsNone(self.native.process)
+        self.assertTrue(json.loads(self.journal.db.execute("SELECT payload FROM outbox").fetchone()[0])["no_dispatch"])
 
     def test_accepted_claim_spawns_without_another_admission_rpc(self):
         real_request = self.client.request
@@ -622,6 +650,43 @@ class HostTests(unittest.TestCase):
                 "VALUES(?,?,?,?,?,?,NULL,?,0)",
                 (operation, session, epoch, "digest", str(self.root), "task-hub2-" + session, state))
 
+    def test_interrupted_pre_dispatch_emits_one_durable_failure_without_native_exit(self):
+        session, operation, epoch = 'session-no-dispatch', 'op-no-dispatch', 7
+        self.insert_orphan_launch(session, operation, epoch)
+        with self.journal.db:
+            self.journal.db.execute("UPDATE launches SET native_dispatch_started=0 WHERE operation_id=?", (operation,))
+        self.bridge.reconcile()
+        self.bridge.reconcile()
+        row = self.journal.db.execute("SELECT state,native_id FROM launches WHERE operation_id=?", (operation,)).fetchone()
+        self.assertEqual(tuple(row), ('stopped_before_dispatch', None))
+        receipts = self.journal.db.execute("SELECT key,path,payload FROM outbox").fetchall()
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(receipts[0]['key'], f'no-dispatch:{operation}:{epoch}')
+        self.assertEqual(receipts[0]['path'], f'/api/sessions/{session}/finish')
+        self.assertEqual(json.loads(receipts[0]['payload']), {'operation_id':operation,'epoch':epoch,'native_id':None,
+                         'launch_failed':True,'no_dispatch':True})
+        self.assertEqual(self.native.calls, [])
+
+    def test_ambiguous_dispatched_attempt_does_not_adopt_a_different_attempt_label(self):
+        session, operation, epoch = 'session-attempt-label', 'op-attempt-label', 7
+        self.insert_orphan_launch(session, operation, epoch, 'aborting')
+        with self.journal.db:
+            self.journal.db.execute("UPDATE launches SET native_dispatch_started=1 WHERE operation_id=?", (operation,))
+        self.native.process = {'id':'11111111-1111-4111-8111-111111111111','tag':'task-hub2-'+session,
+                               'workspace':str(self.root),'phase':'running','containment_empty':False,
+                               'labels':{'hub.attempt':'previous-attempt'}}
+        self.bridge.reconcile()
+        row = self.journal.db.execute("SELECT state,native_id FROM launches WHERE operation_id=?", (operation,)).fetchone()
+        self.assertEqual(tuple(row), ('aborting', None))
+        self.assertFalse(any(args[1]=='kill' for args,_ in self.native.calls))
+        self.assertEqual(self.journal.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0],0)
+
+        self.native.process['labels']['hub.attempt'] = self.bridge.attempt_label(session, operation, epoch)
+        self.bridge.reconcile()
+        row = self.journal.db.execute("SELECT state,native_id FROM launches WHERE operation_id=?", (operation,)).fetchone()
+        self.assertEqual(tuple(row), ('exited', self.native.process['id']))
+        self.assertTrue(any(args[1:3] == ['kill', self.native.process['id']] for args, _ in self.native.calls))
+
     def test_stop_without_native_evidence_is_unconfirmed(self):
         for state in ("launching", "aborting", "deadline_stopping"):
             with self.subTest(state=state):
@@ -658,6 +723,23 @@ class HostTests(unittest.TestCase):
                    {"epoch": offer["epoch"], "result": result}, "command:stop-pending")
         self.assertEqual(self.client.calls.count(receipt), 2)
 
+    def test_stop_can_fence_while_native_launcher_is_preparing(self):
+        offer = self.offer()
+        command = {"id": "stop-during-preparation", "session_id": offer["session_id"],
+                   "epoch": offer["epoch"], "kind": "stop"}
+        launch = self.bridge.launcher.launch
+
+        def stop_then_launch(task_id, specification):
+            result = self.bridge.command(command)
+            self.assertEqual(result, {"stopped": True, "evidence": "dispatch_fenced"})
+            return launch(task_id, specification)
+
+        with patch.object(self.bridge.launcher, "launch", side_effect=stop_then_launch):
+            self.assertIsNone(self.bridge.offer(offer))
+        state = self.journal.db.execute("SELECT state FROM launches").fetchone()[0]
+        self.assertEqual(state, "stopped_before_dispatch")
+        self.assertFalse(any(args[1] in {"start", "kill"} for args, _ in self.native.calls))
+
     def test_stop_without_local_launch_fences_replayed_offer_and_leaves_tagged_process_alone(self):
         offer = self.offer()
         session, epoch = offer["session_id"], offer["epoch"]
@@ -691,29 +773,20 @@ class HostTests(unittest.TestCase):
         self.assertEqual(self.native.process["phase"], "running")
         self.assertEqual(self.native.calls, [])
 
-    def test_stop_kills_native_process_recovered_by_session_tag(self):
+    def test_legacy_unbound_launch_does_not_claim_or_stop_process_by_tag(self):
         self.insert_orphan_launch()
         self.native.process = {"id": "1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d",
-                              "tag": "task-hub2-session-orphan", "workspace": str(self.root),
-                              "phase": "running", "containment_empty": False}
+                               "tag": "task-hub2-session-orphan", "workspace": str(self.root),
+                               "phase": "running", "containment_empty": False}
+        self.assertIsNone(self.bridge.live_sessions()[0]["native_id"])
         result = self.bridge.command({"id": "stop-orphan-live", "session_id": "session-orphan",
                                       "epoch": 7, "kind": "stop"})
-        self.assertTrue(result["stopped"])
-        self.assertEqual(self.native.process["phase"], "exited")
-        self.assertTrue(any(args[1] == "kill" and args[2] == self.native.process["id"]
-                            for args, _ in self.native.calls))
-
-    def test_live_snapshot_recovers_native_id_by_session_tag(self):
-        self.insert_orphan_launch()
-        self.native.process = {"id": "1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d",
-                              "tag": "task-hub2-session-orphan", "workspace": str(self.root),
-                              "phase": "running", "last_activity_ms": int(time.time() * 1000),
-                              "containment_empty": False}
-        sessions = self.bridge.live_sessions()
-        self.assertEqual(sessions[0]["native_id"], self.native.process["id"])
-        self.assertEqual(sessions[0]["phase"], "running")
-        saved = self.journal.db.execute("SELECT native_id FROM launches WHERE session_id='session-orphan'").fetchone()[0]
-        self.assertEqual(saved, self.native.process["id"])
+        self.assertEqual(result["error"], "stop_unconfirmed")
+        self.bridge.reconcile()
+        row = self.journal.db.execute("SELECT state,native_id FROM launches WHERE session_id='session-orphan'").fetchone()
+        self.assertEqual(tuple(row), ("aborting", None))
+        self.assertEqual(self.native.process["phase"], "running")
+        self.assertEqual(self.native.calls, [])
 
     def test_reconcile_sweeps_launch_orphan_to_aborting(self):
         self.insert_orphan_launch()

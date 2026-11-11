@@ -14,7 +14,7 @@ from pathlib import Path
 
 from .client import ApiError, private_file, save_config
 from . import native_launch
-from .native_launch import NativeLauncher, LOCAL_ROUTES, canonical, native_returncode, same_workspace
+from .native_launch import NativeLauncher, LOCAL_ROUTES, UUID_RE, canonical, native_returncode, same_workspace
 
 # Keep the live native-session census fresh for the global Hub session limit.
 LIVE_SESSION_HEARTBEAT_SECONDS = 30
@@ -61,6 +61,8 @@ class Journal:
             self.db.execute("ALTER TABLE launches ADD COLUMN interactive INTEGER NOT NULL DEFAULT 0")
         if "runtime_deadline" not in {row[1] for row in self.db.execute("PRAGMA table_info(launches)")}:
             self.db.execute("ALTER TABLE launches ADD COLUMN runtime_deadline INTEGER")
+        if "native_dispatch_started" not in {row[1] for row in self.db.execute("PRAGMA table_info(launches)")}:
+            self.db.execute("ALTER TABLE launches ADD COLUMN native_dispatch_started INTEGER")
         self.db.execute("CREATE INDEX IF NOT EXISTS launches_active ON launches(state,operation_id)")
 
     @property
@@ -282,21 +284,19 @@ class Bridge:
             if epoch > prior["epoch"]:
                 # A new fence cannot adopt a process under the old fence automatically.
                 raise ValueError("native_reconciliation_required")
+            if prior['state'] == 'launching':
+                if prior['native_dispatch_started'] == 0:
+                    self.settle_undispatched_launch(prior)
+                    return None
+                self.abort_launch(operation)
+                raise RuntimeError('native_abort_pending')
             if acknowledge and prior['state']!='pending_admission':
                 acknowledge(session, epoch)
             native = None
             if prior['state']=='aborting':
                 raise RuntimeError('native_abort_pending')
-            if prior["state"] != "pending_admission":
-                try:
-                    native_id = prior["native_id"] or self.launcher.recover("hub2-" + session, prior["workspace"],launch)
-                except RuntimeError:
-                    if prior['state']=='launching':self.abort_launch(operation)
-                    raise
-                native = self.lookup(native_id, prior)
-                if native and not prior["native_id"]:
-                    with db:
-                        db.execute("UPDATE launches SET native_id=?,state='running' WHERE operation_id=?", (native_id, operation))
+            if prior["state"] != "pending_admission" and prior["native_id"]:
+                native = self.lookup(prior["native_id"], prior)
             if not native and prior["state"] != "pending_admission":
                 raise RuntimeError("launch_outcome_uncertain")
         else:
@@ -328,9 +328,12 @@ class Bridge:
             launch['session_id']=session
             launch['operation_id']=operation
             launch['epoch']=epoch
+            launch['attempt_label'] = self.attempt_label(session, operation, epoch)
+            launch['before_native_dispatch'] = lambda: self.mark_native_dispatch(operation, session, epoch)
+            launch['native_identity_observed'] = lambda native_id: self.bind_dispatched_native(operation, session, epoch, native_id)
             with db:
                 changed = db.execute(
-                    "UPDATE launches SET state='launching',runtime_deadline=? "
+                    "UPDATE launches SET state='launching',runtime_deadline=?,native_dispatch_started=0 "
                     "WHERE operation_id=? AND session_id=? AND epoch=? AND state='pending_admission' AND native_id IS NULL "
                     "AND NOT EXISTS(SELECT 1 FROM stop_fences WHERE session_id=? AND epoch>=?)",
                     (launch['runtime_deadline'], operation, session, epoch, session, epoch))
@@ -341,9 +344,20 @@ class Bridge:
                 native = self.lookup(receipt["session_id"], {"tag": tag, "workspace": launch["workspace"]})
                 if not native or native["id"] != receipt["session_id"]:
                     raise RuntimeError("launch_outcome_uncertain")
-            except (RuntimeError,ValueError,subprocess.SubprocessError,OSError) as error:
-                self.abort_launch(operation)
+            except Exception as error:
+                current = db.execute("SELECT * FROM launches WHERE operation_id=? AND epoch=?", (operation,epoch)).fetchone()
+                throttled = isinstance(error, ApiError) and error.retry_at
+                if current and current['state']=='stopped_before_dispatch':
+                    if throttled:
+                        raise
+                    return None
                 logging.getLogger(__name__).exception('Native launch failed session=%s', session)
+                if current and current['native_dispatch_started']==0:
+                    self.settle_undispatched_launch(current)
+                    if throttled:
+                        raise
+                    return None
+                self.abort_launch(operation)
                 raise
             with db:
                 db.execute("UPDATE launches SET native_id=?,state='running' WHERE operation_id=?",
@@ -356,6 +370,40 @@ class Bridge:
         self.journal.emit(f"started:{operation}:{epoch}", f"/api/sessions/{session}/started",
                           {"operation_id": operation, "epoch": epoch, "native_id": native["id"]})
         return native["id"]
+
+    def attempt_label(self, session, operation, epoch):
+        return hashlib.sha256(canonical([self.machine_id, session, operation, epoch]).encode()).hexdigest()
+
+    def mark_native_dispatch(self, operation, session, epoch):
+        with self.journal.db as db:
+            changed = db.execute(
+                "UPDATE launches SET native_dispatch_started=1 WHERE operation_id=? AND session_id=? AND epoch=? "
+                "AND state='launching' AND native_dispatch_started=0 AND native_id IS NULL",
+                (operation, session, epoch))
+            if changed.rowcount != 1:
+                raise RuntimeError('native_dispatch_fence_conflict')
+
+    def bind_dispatched_native(self, operation, session, epoch, native_id):
+        with self.journal.db as db:
+            changed = db.execute(
+                "UPDATE launches SET native_id=? WHERE operation_id=? AND session_id=? AND epoch=? "
+                "AND state='launching' AND native_dispatch_started=1 AND native_id IS NULL",
+                (native_id, operation, session, epoch))
+            if changed.rowcount != 1:
+                raise RuntimeError('native_dispatch_fence_conflict')
+
+    def settle_undispatched_launch(self, row):
+        operation, session, epoch = row['operation_id'], row['session_id'], row['epoch']
+        with self.journal.db as db:
+            changed = db.execute(
+                "UPDATE launches SET state='stopped_before_dispatch' WHERE operation_id=? AND session_id=? AND epoch=? "
+                "AND state IN ('launching','aborting') AND native_dispatch_started=0 AND native_id IS NULL",
+                (operation, session, epoch))
+            if changed.rowcount != 1:
+                return
+            self.journal.enqueue(f"no-dispatch:{operation}:{epoch}", f"/api/sessions/{session}/finish",
+                                 {"operation_id": operation, "epoch": epoch, "native_id": None,
+                                  "launch_failed": True, "no_dispatch": True})
 
     def abort_launch(self,operation):
         with self.journal.db:
@@ -392,6 +440,9 @@ class Bridge:
         for row in rows:
             if row['session_id'] in getattr(self, '_inflight', set()):
                 continue
+            if row['state'] in {'launching','aborting'} and row['native_dispatch_started'] == 0 and not row['native_id']:
+                self.settle_undispatched_launch(row)
+                continue
             if row['state']=='launching':
                 # In-flight launches were excluded above; this is an interrupted dispatch.
                 with self.journal.db:
@@ -402,14 +453,11 @@ class Bridge:
                 self._warn_unavailable_workspace(row)
                 continue
             if row['state'] in {'aborting','deadline_stopping'} and not row['native_id']:
-                try:identity=self.launcher.aborted_identity('hub2-'+row['session_id'],row['workspace'])
+                if row['native_dispatch_started'] != 1:
+                    continue
+                attempt = self.attempt_label(row['session_id'], row['operation_id'], row['epoch'])
+                try:identity=self.launcher.aborted_identity('hub2-'+row['session_id'],row['workspace'],attempt)
                 except RuntimeError:identity=None
-                if not identity:
-                    candidate=self.lookup(row['workspace']+':'+row['tag'])
-                    if candidate:
-                        if candidate.get('tag')!=row['tag'] or not same_workspace(candidate.get('workspace'),row['workspace']):
-                            raise RuntimeError('native_abort_identity_mismatch')
-                        identity=candidate['id']
                 if not identity:continue
                 with self.journal.db:
                     self.journal.db.execute('UPDATE launches SET native_id=? WHERE operation_id=?',(identity,row['operation_id']))
@@ -488,12 +536,15 @@ class Bridge:
             raise ValueError("command_fence_conflict")
         if row["epoch"] != command.get("epoch"):
             raise ValueError("command_fence_conflict")
-        if kind == 'stop' and not row['native_id'] and row['state'] in {'pending_admission', 'stopped_before_dispatch'}:
+        pre_dispatch = row['state'] in {'pending_admission','stopped_before_dispatch'} or (
+            row['state'] in {'launching','aborting'} and row['native_dispatch_started']==0)
+        if kind == 'stop' and not row['native_id'] and pre_dispatch:
             with db:
                 changed = db.execute(
                     "UPDATE launches SET state='stopped_before_dispatch' "
                     "WHERE operation_id=? AND session_id=? AND epoch=? AND native_id IS NULL "
-                    "AND state IN ('pending_admission','stopped_before_dispatch')",
+                    "AND (state IN ('pending_admission','stopped_before_dispatch') "
+                    "OR (state IN ('launching','aborting') AND native_dispatch_started=0))",
                     (row['operation_id'], row['session_id'], row['epoch']))
                 if changed.rowcount != 1:
                     raise ValueError('command_fence_conflict')
@@ -598,14 +649,24 @@ class Bridge:
             if not re.fullmatch(r"[a-z_]{1,80}", reason):
                 reason = "host_operation_failed"
             target = event.get("command") or event.get("message") or event.get("offer") or {}
-            socket.send(canonical({"type": "host.error", "reason": reason, "stage": "host_launch" if event.get("type") == "session.offer" else "host_command", "detail": reason[:200],
+            stage = 'host_command'
+            if event.get('type') == 'session.offer':
+                stage = 'host_launch'
+                row = self.journal.db.execute(
+                    "SELECT state,native_dispatch_started FROM launches WHERE operation_id=? AND session_id=? AND epoch=?",
+                    (target.get('operation_id'),target.get('session_id'),target.get('epoch'))).fetchone()
+                if row and row['state'] in {'launching','running','aborting','deadline_stopping'} and row['native_dispatch_started'] != 0:
+                    stage = 'host_launch_uncertain'
+            socket.send(canonical({"type": "host.error", "reason": reason, "stage": stage, "detail": reason[:200],
                                    "session_id": target.get("session_id"), "operation_id": target.get("operation_id"),
                                    "message_id": target.get("id")}))
     def live_sessions(self):
-        rows=self.journal.db.execute("SELECT session_id,epoch,native_id,tag,workspace,state FROM launches WHERE state IN ('launching','running','aborting','deadline_stopping') ORDER BY session_id LIMIT 100").fetchall()
+        rows=self.journal.db.execute("SELECT session_id,operation_id,epoch,native_id,tag,workspace,state,native_dispatch_started FROM launches WHERE state IN ('launching','running','aborting','deadline_stopping') ORDER BY session_id LIMIT 100").fetchall()
         result=[]
         for row in rows:
-            if not self._workspace_is_available(row['workspace']):
+            if row['session_id'] in self._inflight and row['state']=='launching':
+                native_id,status,phase=None,None,'launching'
+            elif not self._workspace_is_available(row['workspace']):
                 self._warn_unavailable_workspace(row)
                 native_id,status,phase=row['native_id'],None,'unknown'
             else:
@@ -627,17 +688,20 @@ class Bridge:
         if not self._workspace_is_available(row['workspace']):
             self._warn_unavailable_workspace(row)
             return None,None
+        if row['native_dispatch_started'] != 1:
+            return None,None
         selector=f"{row['workspace']}:{row['tag']}"
         status=self.launcher.status(selector,workspace=row['workspace'])
         native_id=status.get('id') if isinstance(status,dict) else None
-        if (not isinstance(native_id,str) or not native_id
+        if (not isinstance(native_id,str) or not UUID_RE.fullmatch(native_id)
+                or not isinstance(status.get('labels'),dict)
+                or status['labels'].get('hub.attempt') != self.attempt_label(row['session_id'],row['operation_id'],row['epoch'])
                 or status.get('tag')!=row['tag']
                 or not same_workspace(status.get('workspace'),row['workspace'])):
             return None,None
-        state='aborting' if row['state']=='aborting' else 'running'
         with self.journal.db:
-            self.journal.db.execute("UPDATE launches SET native_id=?,state=? WHERE session_id=? AND epoch=? AND native_id IS NULL",
-                                    (native_id,state,row['session_id'],row['epoch']))
+            self.journal.db.execute("UPDATE launches SET native_id=? WHERE session_id=? AND epoch=? AND native_id IS NULL",
+                                    (native_id,row['session_id'],row['epoch']))
         return native_id,status
 
     def heartbeat(self,labels,include_native_sessions=True):
