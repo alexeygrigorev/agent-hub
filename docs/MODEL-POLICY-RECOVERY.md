@@ -85,8 +85,8 @@ evidence before any separately authorized action.
 
 ## VM deployment transaction
 
-Before an active deploy, the deployment owner must provision an existing active
-Hub operator credential with `operator:admin` into
+The standing deployment credential is an independently revocable model-policy
+service credential, provisioned by the deployment owner into
 `/etc/agent-hub/deploy-credentials/model-policy-admin.json`, containing an
 `access_token` string. The directory must be root-owned and private (0700), and
 the regular, single-link JSON file root-owned and private (0600). Symlinks and
@@ -95,13 +95,15 @@ nonprivate files are refused. Keep this credential under the root-owned
 transaction storage. Do not change ownership of existing service data to install
 a deploy credential. Provision it through the established private
 credential channel; never put tokens in Git, workflow output, command arguments,
-or this document. The deploy transaction neither creates nor enrolls an admin.
-An absent or untrusted credential refuses an active deploy before checkout.
+or this document. The service credential has only `model-policy:read` and `model-policy:write`;
+it is not a human login, host enrollment, or general administrator. An absent or
+untrusted standing credential requires the separately reviewed bootstrap flow
+before policy application; the service API alone does not install that flow.
 There is no assumption that this credential is already provisioned on the VM.
 
 The transaction deliberately clears ambient `HUB2_TOKEN` for helper invocations
-and passes this explicit `--token-file`. Neither the bootstrap token nor root's
-default CLI login is a substitute. Requests use the authenticated API on fixed
+and passes this explicit `--token-file`. Neither `HUB2_BOOTSTRAP_TOKEN` nor
+root's default CLI login is a substitute. Requests use the authenticated API on fixed
 loopback `http://127.0.0.1:8787`; no new authorization bypass is introduced.
 
 After candidate health and schema compatibility checks, while automatic recovery
@@ -146,6 +148,110 @@ operations; policy CAS still protects against external operator changes. Tokens
 are not copied into the transaction directory. The protected helper, canonical
 configuration and receipt are removed only after successful final verification
 or completed rollback.
+
+## Deployment service credential API
+
+An authenticated, currently allowlisted human administrator can issue a dedicated
+credential with `POST /api/deployment-credentials`. Both normal admin bearer
+and browser-cookie authorization are supported; cookies retain their existing
+same-origin and CSRF checks. The exact body is
+`{"request_id":"<canonical lowercase UUIDv4>","label":"vm-policy-deploy"}`.
+Labels contain 1–80 ASCII letters, digits, spaces, dots, underscores, colons or
+hyphens and begin with a letter or digit. Caller-selected scopes, principals,
+purpose, expiry and other fields are refused.
+
+The 201 response has `Cache-Control: no-store`, `token_type: "Bearer"`, a single
+64-character hexadecimal `access_token`, and `credential` metadata:
+`id: "deployment:<request_id>"`, `request_id`, `kind: "service"`,
+`purpose: "model-policy"`, the label, fixed scopes
+`["model-policy:read","model-policy:write"]`, `expires_at: null`, `created_at`
+and `revoked: false`. Tokens are random, independently hashed in the existing
+credentials table, and have no refresh credential or shared human family.
+Ordinary CLI refresh does not rotate them. They are non-expiring, explicitly
+revocable credentials; removing the issuing principal's email from the admin
+allowlist also invalidates them on the next request. Their owner must rotate or
+revoke them when deployment authority is retired.
+
+A service token can use only `GET`, `PUT` and recovery `POST` on
+`/api/model-policy`, subject to all existing validation and CAS rules. It cannot
+start sessions, enroll hosts, mint credentials, use MCP or refresh itself.
+`GET /api/model-policy` is a read-only credential verification request: HTTP200
+returns the configured policy; typed HTTP404 `model_policy_unconfigured` with
+an integer version is a valid unconfigured policy. No private internal route
+is required. Other API authority is never inferred from this capability.
+
+Persist a token-free issuance intent before POST. A repeated request ID never
+returns a secret again: it yields HTTP409
+`deployment_credential_already_issued` with the deterministic credential ID.
+A conflicting label or issuing principal yields
+`deployment_credential_request_conflict`. After a lost creation response, an
+administrator must revoke that deterministic ID before trying a new request ID;
+never blindly mint another credential or claim the lost token was recovered.
+`POST /api/deployment-credentials/deployment:<request_id>/revoke` with `{}`
+returns `{id,revoked:true,replay:false}`; repeat revocation returns `replay:true`.
+An unknown ID returns HTTP404. A retired request ID is never resurrected.
+
+Admin `GET /api/deployment-credentials` returns at most 32 metadata items and a
+`next` cursor, accepted as `?after=<deployment:id>`. Responses contain no tokens
+or hashes. At most 32 credentials can be active. Revoked rows remain as durable
+idempotency tombstones; retained storage grows with explicit operator issuance,
+not session starts. No schema migration or direct database minting is needed.
+Older code without service verification rejects these tokens; policy recovery
+must finish before checking out such a release.
+The required Control Node test runner exercises the real Worker/auth/Control
+path and SQLite state, including misuse and lost-response cases.
+
+## One-time bootstrap handoff
+
+The standing service file is separate from the temporary operator bootstrap
+file `/etc/agent-hub/deploy-credentials/model-policy-bootstrap.json`.
+The latter is root-owned/private and carries the approved interface:
+`schema: "hub2-model-policy-bootstrap-v1"`,
+`intent: "exchange_model_policy_service_credential"`, a canonical UUID
+`request_id`, full `target_sha`, `access_token`, `refreshed_at_ms`,
+`expires_at_ms`, and `ttl_seconds` from the actual one-time refresh result.
+It must be explicitly prepared by the authorized deployment owner; the VM must
+not automatically refresh or recopy an ordinary shared human login.
+
+The transaction streams the credential helper from the verified candidate Git
+object for precheckout structural preflight. This step performs no HTTP request:
+the old server may not understand service credentials. A valid standing service
+needs no bootstrap. A historical access-token-only file is never treated as a
+service and needs a fresh, explicitly bound bootstrap handoff to proceed.
+
+After candidate health and schema compatibility checks, the transaction verifies
+candidate HEAD and copies the reviewed helper into its protected transaction
+directory. It then invokes `exchange --post-health --target-sha <candidate>`
+before canonical-policy preparation or apply intent. Production uses the fixed
+loopback URL and root-private paths; the disposable test mode alone invokes the
+same helper core with an owned directory, loopback fixture and current test UID.
+Ambient bearer/config environment variables are cleared. The VM never refreshes
+the human bootstrap credential. An existing service is only verified, never
+reissued or replaced through bootstrap fallback.
+
+Before issuance, the helper fsyncs a token-free intent binding request ID, target
+SHA, API URL, label, purpose and the old output digest. It writes any received
+service candidate privately before validating its read authority and atomically
+replacing the standing file. The old forensic file is preserved on uncertainty.
+Creation receipts, bootstrap files and received candidates stay in the private
+credential directory; neither service nor human tokens enter deploy metadata,
+command arguments or output. Their retention/reconciliation is owner-managed.
+
+The transaction also records exchange start before launching its privileged
+helper. The privileged launcher records completion only after its actual child
+exits. A killed shell/sudo/launcher cannot manufacture that receipt. Before any
+rollback transition, the transaction checks these records and inspects private
+issuance intent, received candidate and installed output under the helper lock.
+A confirmed pre-issuance failure can roll back normally. An incomplete process,
+unknown issuance, malformed evidence or busy helper keeps candidate code and
+protected metadata in place, preserving the supported revoke API for explicit
+operator recovery. This also covers SIGKILL after server issuance and before a
+response reaches the helper; no JSON error response is required to detect it.
+The transaction never automatically remints, revokes or force-clears this state.
+
+Required release checks run the helper regressions and composed transaction
+cases. These are source/offline guarantees; provisioning and live exchange still
+require the deployment owner's reviewed handoff and release verification.
 
 ## Compatibility boundary
 

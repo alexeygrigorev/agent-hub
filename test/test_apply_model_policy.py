@@ -28,7 +28,7 @@ class RecoveryTests(unittest.TestCase):
   self.temp=tempfile.TemporaryDirectory(prefix='policy-recovery-',dir=parent);self.addCleanup(self.temp.cleanup)
   self.directory=Path(self.temp.name);self.receipt=self.directory/'receipt.json';self.config=self.directory/'policy.json'
   self.config.write_text(json.dumps({'candidates':[CANDIDATE]}))
-  self.current={'version':0,'candidates':[]};self.calls=[];self.request_bytes=[];self.drop=False;self.compete=False;self.drop_rollback=False;self.operator_after_rollback_loss=False;self.conflicts=0;self.old_unconfigured=False;self.legacy_recovery=False;self.bad_preflight=False;self.lock=threading.Lock()
+  self.current={'version':0,'candidates':[]};self.calls=[];self.request_bytes=[];self.drop=False;self.compete=False;self.drop_rollback=False;self.operator_after_rollback_loss=False;self.conflicts=0;self.old_unconfigured=False;self.get_response=None;self.legacy_recovery=False;self.bad_preflight=False;self.lock=threading.Lock()
   outer=self
   class Handler(BaseHTTPRequestHandler):
    def log_message(self,*args): pass
@@ -37,6 +37,8 @@ class RecoveryTests(unittest.TestCase):
    def do_GET(self):
     with outer.lock:
      outer.calls.append(('GET',None))
+     if outer.get_response is not None:
+      self.reply(*outer.get_response);return
      if outer.current['candidates']:self.reply(200,outer.current)
      else:self.reply(404,{'error':'model_policy_unconfigured'} if outer.old_unconfigured else dict(error='model_policy_unconfigured',version=outer.current['version']))
    def read_mutation(self):
@@ -331,6 +333,38 @@ class RecoveryTests(unittest.TestCase):
   for thread in threads:thread.join(timeout=5);self.assertFalse(thread.is_alive())
   self.assertEqual(results,[0,0]);self.assertEqual(self.current['version'],1)
   self.assertEqual(self.mutation_count(),1)
+
+ def test_prepare_http_errors_refuse_before_success_payload_validation(self):
+  for status,error in ((401,'unauthorized'),(403,'forbidden'),(503,'unavailable')):
+   with self.subTest(status=status):
+    self.calls.clear();self.get_response=(status,{'error':error})
+    rc,result=self.run_helper('prepare')
+    self.assertEqual(rc,1)
+    self.assertEqual(result,{'error':f'policy_read_failed:{status}','manual_reconciliation_required':True})
+    self.assertEqual(self.calls,[('GET',None)])
+    self.assertEqual(self.request_bytes,[])
+    self.assertFalse(self.receipt.exists())
+    self.assertEqual(self.current,{'version':0,'candidates':[]})
+
+ def test_prepare_success_with_malformed_version_still_refuses_without_receipt(self):
+  for bad in (None,True,-1,'1'):
+   with self.subTest(version=bad):
+    self.calls.clear();self.get_response=(200,{'version':bad,'candidates':[CANDIDATE]})
+    rc,result=self.run_helper('prepare')
+    self.assertEqual(rc,1)
+    self.assertEqual(result['error'],'invalid_version')
+    self.assertEqual(self.calls,[('GET',None)])
+    self.assertEqual(self.request_bytes,[])
+    self.assertFalse(self.receipt.exists())
+    self.assertEqual(self.current,{'version':0,'candidates':[]})
+
+ def test_only_exact_unconfigured_404_retains_versioned_empty_snapshot(self):
+  self.assertEqual(helper.snapshot(404,{'error':'model_policy_unconfigured','version':3}),
+                   {'version':3,'candidates':[]})
+  for status,payload in ((401,{'error':'model_policy_unconfigured','version':0}),
+                         (404,{'error':'unauthorized'}),(503,None)):
+   with self.subTest(status=status,payload=payload),self.assertRaisesRegex(helper.Problem,f'^policy_read_failed:{status}$'):
+    helper.snapshot(status,payload)
 
  def test_old_unconfigured_response_without_version_cannot_prepare_recovery(self):
   self.old_unconfigured=True

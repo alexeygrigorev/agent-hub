@@ -117,3 +117,11 @@ test('policy recovery helper protocol tests pass offline', {timeout: 45000}, asy
   assert.equal(result.error, undefined);
   assert.equal(result.status, 0, result.stdout + result.stderr);
 });
+
+
+test('deployment service credential bootstrap regressions execute in the required release check', {timeout: 45000}, () => {
+  const result = spawnSync('python3', ['-m', 'unittest', 'discover', '-s', 'test', '-p', 'test_prepare_model_policy_service_credential.py'],
+    {cwd: fileURLToPath(new URL('../', import.meta.url)), encoding: 'utf8', timeout: 40000});
+  assert.equal(result.error, undefined);
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+});
