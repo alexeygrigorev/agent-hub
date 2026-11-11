@@ -64,6 +64,8 @@ import {createServer} from 'node:http';
 import {spawn} from 'node:child_process';
 import {mkdtemp,writeFile,rm,mkdir} from 'node:fs/promises';
 import {resolve} from 'node:path';
+import {fileURLToPath} from 'node:url';
+const cliRoot=fileURLToPath(new URL('../../',import.meta.url));
 const token='synthetic-session-link-token-0000000000';
 const routeAdmin={id:'human:dev',kind:'operator',scopes:['operator:admin']};
 const sessionId='cb75b9bc-27f7-589a-a5e0-75f6cd6ebf60';
@@ -119,7 +121,7 @@ test('official public route links a second intake through real Machine and Proje
    const response=await worker.fetch(request,env);res.writeHead(response.status,Object.fromEntries(response.headers));res.end(await response.text());
   }catch{res.writeHead(500);res.end('{"error":"fixture_error"}');}
  });
- const tempRoot=resolve(process.env.TMPDIR||'.local/tmp');await mkdir(tempRoot,{recursive:true});
+ const tempRoot=resolve(process.env.TMPDIR||resolve(cliRoot,'.local/tmp'));await mkdir(tempRoot,{recursive:true});
  const scratch=await mkdtemp(resolve(tempRoot,'session-link-cli-'));
  try{
   await new Promise<void>(done=>server.listen(0,'127.0.0.1',done));
@@ -128,7 +130,7 @@ test('official public route links a second intake through real Machine and Proje
   await writeFile(config,JSON.stringify({client_kind:'human',access_token:token,base_url:'http://127.0.0.1:'+address.port}),{mode:0o600});
   const cli=async(...args:string[])=>{
   const child=spawn('python3',['-m','agent_hub_host.cli',...args],{
-   env:{...process.env,HOME:scratch,XDG_CONFIG_HOME:scratch,HUB_CONFIG_FILE:config,PYTHONPATH:resolve('host'),HUB2_TOKEN:'',HUB_TOKEN:''},stdio:['ignore','pipe','pipe'],
+   cwd:cliRoot,env:{...process.env,HOME:scratch,XDG_CONFIG_HOME:scratch,HUB_CONFIG_FILE:config,PYTHONPATH:resolve(cliRoot,'host'),HUB2_TOKEN:'',HUB_TOKEN:''},stdio:['ignore','pipe','pipe'],
   });
   let stdout='',stderr='';child.stdout.on('data',v=>stdout+=v);child.stderr.on('data',v=>stderr+=v);
   const timeout=setTimeout(()=>child.kill(),15000);
