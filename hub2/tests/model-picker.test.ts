@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { pickModelRoute, pickModelRouteDetailed, weightedChoice, buildRoutingPool } from '../src/model-picker.ts';
@@ -96,6 +97,119 @@ function poolEnv(usable:Record<string,boolean>,quota:Record<string,number>,engin
  }})});
  return {CONTROL:namespace('control'),ACCOUNTS:namespace('accounts'),MACHINES:namespace('machines')} as any;
 }
+
+const checkedWorkspace='/work/checked';
+const missingMarker=(workspace=checkedWorkspace,mode='h',observed=Math.floor(Date.now()/1000))=>
+ `auth:missing:l:${mode}:claude:${createHash('sha256').update(JSON.stringify(['hub2-local-auth-context-v1',workspace])).digest('base64url')}:${observed}`;
+
+test('actual picker excludes known-missing LOCAL Claude despite installed engine, stale hint or healthy central account',async()=>{
+ for(const centralReady of [false,true]){
+  const env=poolEnv({codex:true,claude:centralReady},{codex:80,claude:80},['claude','codex'],pool.filter(row=>['codex-sol-medium','claude-sonnet-medium','claude-opus-medium'].includes(row.id)));
+  env.MACHINES={idFromName:(id:string)=>id,get:()=>({fetch:async()=>Response.json({machine_id:'h1',connected:true,engines:['claude','codex'],
+   capabilities:['headless','effort:claude','effort:codex','credentials:local:headless:claude:claude',
+    missingMarker()]})})};
+  const picked=await pickModelRouteDetailed(env,{interactive:false,workspace:checkedWorkspace},()=>0.9);
+  assert.equal(picked.route.engine,'codex');
+  assert.deepEqual(picked.diagnostics.pool.map(row=>row.policy_id),['codex-sol-medium']);
+  assert.equal(picked.diagnostics.excluded.filter(row=>row.reason==='local_credentials_missing').length,2);
+  const explicit=await pickModelRouteDetailed(env,{interactive:false,model:'sonnet',workspace:checkedWorkspace},()=>0);
+  assert.equal(explicit.route.engine,'claude','negative observation must not create an explicit start gate');
+  assert(explicit.diagnostics.advisories?.some(row=>row.reason==='local_credentials_missing'));
+ }
+});
+
+test('actual Python heartbeat with empty local auth composes with the normal model picker',{skip:process.platform!=='linux'},async()=>{
+ const {spawnSync}=await import('node:child_process'),{fileURLToPath}=await import('node:url');
+ const {mkdtempSync,mkdirSync,rmSync}=await import('node:fs'),{join}=await import('node:path');
+ const temp=fileURLToPath(new URL('../../.local/tmp/',import.meta.url));mkdirSync(temp,{recursive:true});
+ const home=mkdtempSync(join(temp,'hub-local-auth-'));
+ try{
+  const script=`import sys,os,json,pathlib,types
+sys.path.insert(0,sys.argv[1])
+from agent_hub_host.agent import Bridge
+import agent_hub_host.agent as agent_module
+from agent_hub_host.local_auth_readiness import local_claude_missing_contexts
+from agent_hub_host.native_launch import NativeLauncher
+home=pathlib.Path(sys.argv[2]);binary=home/'bin';binary.mkdir(mode=0o700)
+for name in ('claude','codex'):
+ path=binary/name;path.write_bytes(bytes([127,69,76,70])+bytes(60));path.chmod(0o700)
+(home/'.claude').mkdir(mode=0o700)
+credentials=home/'.claude/.credentials.json';credentials.write_text('{"claudeAiOauth":{"accessToken":"","refreshToken":""}}');credentials.chmod(0o600)
+os.environ.clear();os.environ.update(HOME=str(home),PATH=str(binary))
+workspace=home/'project-测试';workspace.mkdir()
+agent_module.local_claude_missing_contexts=lambda contexts,modes,environment:local_claude_missing_contexts(contexts,modes,environment,filesystem_root=home)
+bridge=Bridge.__new__(Bridge);bridge.roots=[workspace];bridge.engines={'claude','codex'};bridge.launcher=NativeLauncher({'private_provider_homes':False})
+def heartbeat(labels,engines,capabilities):print(json.dumps({'machine_id':'h1','connected':True,'engines':engines,'capabilities':capabilities,'workspace':str(workspace)}))
+bridge.client=types.SimpleNamespace(heartbeat=heartbeat)
+bridge.heartbeat([],include_native_sessions=False)
+(workspace/'.claude').mkdir(mode=0o700)
+settings=workspace/'.claude/settings.json';settings.write_text('{"apiKeyHelper":"synthetic-never-executed"}');settings.chmod(0o600)
+bridge.heartbeat([],include_native_sessions=False)
+settings.unlink()
+config=home/'.config/aplexer/config.toml';config.parent.mkdir(parents=True,mode=0o700)
+config.write_text('[engines.shell]'+chr(10)+'command=["/bin/sh"]'+chr(10)+'[engines.shell.env]'+chr(10)+'CLAUDE_CONFIG_DIR="/synthetic/alternate-login"'+chr(10));config.chmod(0o600)
+bridge.heartbeat([],include_native_sessions=False)
+`;
+  const child=spawnSync('python3',['-I','-c',script,fileURLToPath(new URL('../host',import.meta.url)),home],{encoding:'utf8',timeout:10000});
+  assert.equal(child.status,0,child.stderr);
+  const [machine,projectHelperMachine,outerOverrideMachine]=child.stdout.trim().split('\n').map(row=>JSON.parse(row));
+  assert(machine.engines.includes('claude'));
+  const expectedMarker=missingMarker(machine.workspace);
+  assert(machine.capabilities.some((flag:string)=>flag.startsWith(expectedMarker.slice(0,expectedMarker.lastIndexOf(':')+1))));
+  assert(machine.capabilities.includes('credentials:local:headless:claude:claude'));
+  assert(!projectHelperMachine.capabilities.some((flag:string)=>flag.startsWith('auth:missing:')));
+  const env=poolEnv({codex:true,claude:true},{codex:80,claude:80},['claude','codex'],pool.filter(row=>['codex-sol-medium','claude-sonnet-medium','claude-opus-medium'].includes(row.id)));
+  env.MACHINES={idFromName:(id:string)=>id,get:()=>({fetch:async()=>Response.json(machine)})};
+  const result=await pickModelRouteDetailed(env,{interactive:false,workspace:machine.workspace},()=>0.99);
+  assert.equal(result.route.engine,'codex');assert(result.diagnostics.pool.every(row=>row.engine!=='claude'));
+  const explicit=await pickModelRouteDetailed(env,{interactive:false,model:'opus',workspace:machine.workspace},()=>0);
+  assert.equal(explicit.route.engine,'claude');
+  env.MACHINES={idFromName:(id:string)=>id,get:()=>({fetch:async()=>Response.json(projectHelperMachine)})};
+  const alternative=await pickModelRouteDetailed(env,{interactive:false,workspace:machine.workspace},()=>0.99);
+  assert(alternative.diagnostics.pool.some(row=>row.engine==='claude'),'project helper must retain Claude among healthy alternatives');
+  assert(!outerOverrideMachine.capabilities.some((flag:string)=>flag.startsWith('auth:missing:')));
+  env.MACHINES={idFromName:(id:string)=>id,get:()=>({fetch:async()=>Response.json(outerOverrideMachine)})};
+  for(const interactive of [false,true]){
+   const outer=await pickModelRouteDetailed(env,{interactive,workspace:machine.workspace},()=>0.99);
+   assert(outer.diagnostics.pool.some(row=>row.engine==='claude'),'outer shell config override stays unknown in both modes');
+  }
+ }finally{rmSync(home,{recursive:true,force:true});}
+});
+
+test('local negative is exact mode/account scoped; unknown and old hosts retain unverified behavior',async()=>{
+ for(const extra of [[],[missingMarker(checkedWorkspace,'i')],[missingMarker('/other')],
+  [missingMarker(checkedWorkspace,'h',Math.floor(Date.now()/1000)-61)],
+  [missingMarker(checkedWorkspace,'h',Math.floor(Date.now()/1000)+10)],
+  [missingMarker().replace(':claude:',':other:')],['credentials:missing:local:headless:claude:claude']]){
+  const env=poolEnv({codex:true,claude:false},{codex:80,claude:80},['claude','codex'],pool.filter(row=>['codex-sol-medium','claude-sonnet-medium'].includes(row.id)));
+  env.MACHINES={idFromName:(id:string)=>id,get:()=>({fetch:async()=>Response.json({machine_id:'h1',connected:true,engines:['claude','codex'],
+   capabilities:['headless','effort:claude','effort:codex','credentials:local:headless:claude:claude',...extra]})})};
+  const result=await pickModelRouteDetailed(env,{interactive:false,workspace:checkedWorkspace},()=>0.99);
+  assert(result.diagnostics.pool.some(row=>row.engine==='claude'));
+  assert(result.diagnostics.advisories?.some(row=>row.reason==='local_login_unverified'));
+ }
+});
+
+test('known missing local home cannot borrow central readiness but another approved host can serve Claude',async()=>{
+ const env=poolEnv({claude:true},{claude:80},['claude'],pool.filter(row=>row.id==='claude-sonnet-medium'));
+ env.ACCOUNTS={idFromName:(id:string)=>id,get:()=>({fetch:async()=>Response.json({account:{enabled:true},hosts:['h1','h2'],credential_usable:true})})};
+ env.MACHINES={idFromName:(id:string)=>id,get:(id:string)=>({fetch:async()=>Response.json({machine_id:id,connected:true,engines:['claude'],
+  capabilities:['headless','effort:claude',...(id==='h1'?[missingMarker()]:[])]})})};
+ for(const draw of [0,0.99])assert.equal((await pickModelRoute(env,{interactive:false,workspace:checkedWorkspace},()=>draw)).machine_id,'h2');
+ const explicit=await pickModelRouteDetailed(env,{interactive:false,model:'sonnet',machine_id:'h1',workspace:checkedWorkspace},()=>0);
+ assert.equal(explicit.route.machine_id,'h1');assert(explicit.diagnostics.advisories?.some(row=>row.reason==='local_credentials_missing'));
+});
+
+test('scoped negatives never apply to absent, label, alternate or unknown workspace contexts',()=>{
+ const now=Date.now();
+ const snapshot={policy:{version:1,candidates:pool.filter(row=>['codex-sol-medium','claude-sonnet-medium'].includes(row.id))},
+  accounts:new Map(['codex','claude'].map(id=>[id,{account:{enabled:true},credential_usable:true}])),
+  machines:new Map([['h1',{connected:true,engines:['claude','codex'],capabilities:['headless','effort:claude','effort:codex',missingMarker()]}]]),observed_at:now};
+ for(const workspace of [undefined,'checked','/work/checked/','/work/cold']){
+  const result=buildRoutingPool(snapshot,{interactive:false,workspace});
+  assert(result.diagnostics.pool.some(row=>row.engine==='claude'));
+ }
+});
 
 function observationEnv(codex:any,claude:any){
  const env=poolEnv(healthy,left,['codex','claude'],pool.filter(row=>['codex-sol-medium','claude-sonnet-medium'].includes(row.id)));
