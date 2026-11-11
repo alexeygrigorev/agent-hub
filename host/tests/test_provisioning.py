@@ -1854,3 +1854,59 @@ def test_scoped_lock_does_not_change_existing_start_lock_behavior(tmp_path,monke
     with p.lock(timeout=2):pass
     with p.lock(timeout=2,bounded=True):pass
     assert operations==[fcntl.LOCK_EX,fcntl.LOCK_EX|fcntl.LOCK_NB]
+
+
+@pytest.mark.parametrize('operator_target',[
+    '[profiles."hub-hub-claude"]\nengine = "shell"\n',
+    "[profiles.'hub-hub-claude']\nengine = 'shell'\n",
+    '[profiles."hub-hub-claude".env]\nUNRELATED = "keep"\n',
+    '[profiles]\n"hub-hub-claude" = { engine = "shell" }\n',
+])
+def test_scoped_profile_refuses_semantic_operator_target_without_changing_bytes(tmp_path,monkeypatch,operator_target):
+    import tomllib
+    path=tmp_path/'config.toml';path.write_text('version = 1\n'+operator_target);path.chmod(0o600)
+    monkeypatch.setattr(p,'profile_path',lambda:path)
+    before=path.read_bytes();tomllib.loads(before.decode())
+    with pytest.raises(ValueError,match='Operator profile collision'):
+        p.scoped_profile({'label':'hub-claude','provider':'claude'})
+    assert path.read_bytes()==before
+    tomllib.loads(path.read_text())
+
+
+@pytest.mark.parametrize('target',[
+    '[profiles."hub-hub-claude"]\nengine = "claude"\n',
+    '[profiles."hub-hub-claude".env]\nKEY = "value"\n',
+    '[profiles.hub-hub-claude]\nengine = "claude"\n[profiles."hub-hub-claude".env]\nKEY = "value"\n',
+])
+def test_scoped_profile_refuses_unrecognized_managed_target_tables(tmp_path,monkeypatch,target):
+    import tomllib
+    path=tmp_path/'config.toml';path.write_text('version = 1\n'+p.BEGIN+target+p.END);path.chmod(0o600)
+    monkeypatch.setattr(p,'profile_path',lambda:path)
+    before=path.read_bytes();tomllib.loads(before.decode())
+    with pytest.raises(ValueError):p.scoped_profile({'label':'hub-claude','provider':'claude'})
+    assert path.read_bytes()==before
+    tomllib.loads(path.read_text())
+
+
+def test_scoped_profile_parses_proposed_toml_before_publication(tmp_path,monkeypatch):
+    import tomllib
+    path=tmp_path/'config.toml';path.write_text('version = 1\n[profiles.keep]\nengine = "shell"\n');path.chmod(0o600)
+    monkeypatch.setattr(p,'profile_path',lambda:path)
+    # One unescaped table delimiter would make generated output invalid. This
+    # injects formatting corruption without weakening any production label gate.
+    monkeypatch.setattr(p.json,'dumps',lambda value:'"unterminated')
+    before=path.read_bytes();tomllib.loads(before.decode())
+    with pytest.raises(ValueError):p.scoped_profile({'label':'hub-claude','provider':'claude'})
+    assert path.read_bytes()==before
+    tomllib.loads(path.read_text())
+
+
+def test_scoped_profile_never_moves_unrelated_continuation_keys_to_new_target(tmp_path,monkeypatch):
+    import tomllib
+    path=tmp_path/'config.toml'
+    path.write_text('version = 1\n'+p.BEGIN+'[profiles.keep]\nengine = "shell"\n'+p.END+'args = ["preserve"]\n')
+    path.chmod(0o600);monkeypatch.setattr(p,'profile_path',lambda:path)
+    before=path.read_bytes()
+    assert tomllib.loads(before.decode())['profiles']['keep']['args']==['preserve']
+    with pytest.raises(ValueError):p.scoped_profile({'label':'hub-claude','provider':'claude'})
+    assert path.read_bytes()==before
