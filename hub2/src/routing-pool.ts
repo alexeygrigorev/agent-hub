@@ -1,3 +1,6 @@
+/// <reference types="node" />
+// Production SHA-256 uses the Node builtin; the standalone Hub2 typecheck
+// otherwise loads only Workers globals. @types/node is already a dependency.
 import { createHash } from 'node:crypto';
 import { HttpError } from './http';
 import { isDeepWorkModel, isExplicitOnlyModel, isModelPolicyCandidateAllowed } from './model-policy';
