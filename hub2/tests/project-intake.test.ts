@@ -823,6 +823,7 @@ test('managed Claude selector is immutable, operator-only and never falls back t
  const launch=JSON.parse(saga.launch_spec_json),route=JSON.parse(saga.routing_json);
  assert.equal(launch.managed_credential_label,'hub-claude');assert.equal(saga.account_id,'claude');
  assert(route.required_capabilities.includes(cap));
+ assert.equal(f.routes.find(draw=>draw.input?.engine==='claude')?.input.managed_credential_label,'hub-claude');
  assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',start)).status,200);
  const without={...start};delete (without as any).managed_credential_label;
  assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',without)).status,409);

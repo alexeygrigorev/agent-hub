@@ -515,6 +515,7 @@ export class ProjectDO {
           ...(typeof body.tier === 'string' ? { tier: body.tier } : {}),
           ...(overrideReason ? { override_reason: overrideReason } : {}),
           interactive, purpose, with_goal: withGoal, required_capabilities: requiredCapabilities, workspace,
+          ...(managedLabel!==undefined?{managed_credential_label:'hub-claude' as const}:{}),
         }, {project_id:intake.project,operation_id:operationId,attempt:0});
       route=picked.route;diagnostics=picked.diagnostics;
     }

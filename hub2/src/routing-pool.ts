@@ -31,6 +31,8 @@ const QUOTA_MAX_AGE_MS = 30 * 60 * 1000;
 const DEEP_TIERS = new Set(['deep', 'complex', 'serious']);
 export type PickInput = {
   purpose?: SessionPurpose;
+  /** Server-authorized explicit central delivery, never inferred from a capability hint. */
+  managed_credential_label?: 'hub-claude';
   machine_id?: string; engine?: string; model?: string; effort?: string; override_reason?: string;
   tier?: string; interactive: boolean; with_goal?: boolean; required_capabilities?: string[]; exclude_policy_ids?: string[];
   /** Launch workspace: a label or an absolute path on the target host. */
@@ -65,6 +67,9 @@ export function weightedChoice<T>(values: Array<{ value: T; weight: number }>, r
 
 export function eligibleCandidates(policy: RoutingPolicy, input: PickInput): Candidate[] {
   const purpose = sessionPurpose(input.purpose);
+  if(input.managed_credential_label!==undefined&&(input.managed_credential_label!=='hub-claude'
+    ||input.engine!=='claude'||input.model!=='opus'||input.effort!=='medium'||input.interactive||input.with_goal))
+    throw new HttpError('invalid_managed_credential_route',400);
   if (input.model && /astra/i.test(input.model) && !allowsAstra(purpose))
     throw new HttpError('astra_not_for_implementation', 400);
   if (input.with_goal && !input.interactive) throw new HttpError('goal_requires_interactive', 400);
@@ -86,6 +91,7 @@ export function eligibleCandidates(policy: RoutingPolicy, input: PickInput): Can
     && (candidate.id !== 'claude-fable-5-2' || input.model === candidate.id || input.model === candidate.model)
     && (!isExplicitOnlyModel(candidate) || (override && !!input.model && (input.model === candidate.model || input.model === candidate.id)))
     && isModelPolicyCandidateAllowed(candidate)
+    && (input.managed_credential_label===undefined||candidate.account_id==='claude')
     && (!input.engine || input.engine === candidate.engine)
     && (!input.model || input.model === candidate.model || input.model === candidate.id)
     && (!input.effort || input.effort === candidate.effort));
@@ -125,6 +131,7 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
     return { account_id: id, reason: 'quota_stale', captured_at: Number.isSafeInteger(captured) && captured! >= 0 ? captured! : null };
   });
   const headroom = (candidate: Candidate): number | null => observations.get(candidate.account_id) ?? null;
+  const managedCentral=input.managed_credential_label==='hub-claude';
   const dropped: PickDiagnostics['excluded'] = [], advisories: NonNullable<PickDiagnostics['advisories']> = [];
   const centralReady = (candidate: Candidate): boolean => {
     const view = accounts.get(candidate.account_id);
@@ -134,7 +141,7 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
   // every project using an installed engine. Labels and cold contexts are unknown.
   const contextHash = input.workspace?.startsWith('/') ? createHash('sha256').update(
     JSON.stringify(['hub2-local-auth-context-v1',input.workspace])).digest('base64url') : null;
-  const localMissing = (candidate:Candidate,id:string):boolean => !!contextHash
+  const localMissing = (candidate:Candidate,id:string):boolean => !managedCentral && !!contextHash
     && candidate.engine==='claude' && candidate.account_id==='claude'
     && (machines.get(id)?.capabilities || []).some(flag => {
       const match = /^auth:missing:l:([hi]):claude:([A-Za-z0-9_-]{43}):([1-9][0-9]{0,9})$/.exec(flag);
@@ -142,13 +149,13 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
       const age = snapshot.observed_at - Number(match[3])*1000;
       return Number.isFinite(age) && age >= -5000 && age <= 60000;
     });
-  const local = (candidate: Candidate, id: string): boolean => !localMissing(candidate,id) && machines.get(id)?.engines?.includes(candidate.engine) === true
+  const local = (candidate: Candidate, id: string): boolean => !managedCentral && !localMissing(candidate,id) && machines.get(id)?.engines?.includes(candidate.engine) === true
     && machines.get(id)?.capabilities?.includes(`credentials:local:${input.interactive ? 'interactive' : 'headless'}:${candidate.engine}:${candidate.account_id}`) === true;
   const hostsFor = (candidate: Candidate): string[] => {
     const approved = (accounts.get(candidate.account_id)?.hosts || []).filter(id => ids.has(id));
     // Central credential delivery approval does not constrain host-owned logins.
     const hosts = input.machine_id ? [input.machine_id] : approved.length
-      ? [...new Set([...approved,...[...ids].filter(id=>local(candidate,id))])] : [...ids];
+      ? managedCentral ? approved : [...new Set([...approved,...[...ids].filter(id=>local(candidate,id))])] : [...ids];
     const matching = hosts.filter(id => machines.get(id)?.engines?.includes(candidate.engine));
     return matching.length ? matching : hosts;
   };
@@ -161,7 +168,9 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
     const knownLocalMissing = originalHosts.length>0 && observedHosts.length===0;
     const enabled = accounts.get(candidate.account_id)?.account?.enabled;
     return { candidate, left, base, hosts: !centralReady(candidate) && localHosts.length ? localHosts : hosts,
-      credentialObserved: !knownLocalMissing && enabled !== false && enabled !== 0 && (centralReady(candidate) || localHosts.length > 0), localHosts,knownLocalMissing };
+      credentialObserved: managedCentral
+        ? centralReady(candidate)&&hosts.some(id=>(accounts.get(candidate.account_id)?.hosts||[]).includes(id))
+        : !knownLocalMissing && enabled !== false && enabled !== 0 && (centralReady(candidate) || localHosts.length > 0), localHosts,knownLocalMissing };
   });
   // Auth/quota/advertisement observations narrow the pool, but never turn into a refusal when nothing survives.
   const narrow = (rows: typeof scored, keep: (row: typeof scored[number]) => boolean, reason: (row: typeof scored[number]) => string) => {
@@ -191,7 +200,9 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
       dropped.push({ policy_id: row.candidate.id, account_id: row.candidate.account_id, reason: 'goal_not_advertised' });
     pool = capable;
   }
-  pool = narrow(pool, row => row.credentialObserved, row => row.knownLocalMissing?'local_credentials_missing'
+  pool = narrow(pool, row => row.credentialObserved, row => managedCentral
+    ? centralReady(row.candidate)?'central_host_not_approved':'central_credentials_unavailable'
+    : row.knownLocalMissing?'local_credentials_missing'
     :'credential_' + (accounts.get(row.candidate.account_id)?.credential_status || 'unavailable'));
   pool = narrow(pool, row => row.left === null || row.left >= MIN_HEADROOM, () => 'quota_below_minimum');
   pool = narrow(pool, row => row.hosts.some(id => machines.get(id)?.engines?.includes(row.candidate.engine)), () => 'engine_not_advertised');

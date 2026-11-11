@@ -539,3 +539,49 @@ test('--with-goal keeps a low-quota goal-capable engine instead of an incapable 
  assert.deepEqual(result.options.map(row=>row.value.engine),['codex']);
  assert.ok(result.diagnostics.excluded.some(row=>row.policy_id==='claude-opus-medium'&&row.reason==='goal_not_advertised'));
 });
+
+function managedClaudeSnapshot(ready=true,approved=['h1','h2']){
+ const now=Date.now(),workspace='/synthetic/central-worker';
+ const context=createHash('sha256').update(JSON.stringify(['hub2-local-auth-context-v1',workspace])).digest('base64url');
+ const caps=['headless','effort:claude','managed:hub-claude:opus:medium:v1','credentials:local:headless:claude:claude'];
+ return{workspace,snapshot:{observed_at:now,
+  policy:{version:1,candidates:[{id:'claude-opus',engine:'claude',model:'opus',effort:'medium',account_id:'claude',weight:1,enabled:true,capabilities:[]}]},
+  accounts:new Map([['claude',{account:{enabled:true},credential_usable:ready,credential_status:ready?'ready':'unavailable',hosts:approved,
+    fresh:true,quota:{remaining:80,captured_at:now,valid_until:now+600000}}]]),
+  machines:new Map([['h1',{machine_id:'h1',connected:true,last_seen:now,engines:['claude'],
+    capabilities:[...caps,`auth:missing:l:h:claude:${context}:${Math.floor(now/1000)}`]}],
+    ['h2',{machine_id:'h2',connected:true,last_seen:now,engines:['claude'],capabilities:[...caps]}]])}};
+}
+
+test('explicit managed Claude uses central readiness and approved hosts, not local missing markers',()=>{
+ const {snapshot,workspace}=managedClaudeSnapshot();
+ const input={interactive:false,workspace,engine:'claude',model:'opus',effort:'medium',required_capabilities:['managed:hub-claude:opus:medium:v1']};
+ const native=buildRoutingPool(snapshot,input);
+ assert.deepEqual(native.options.map(row=>row.value.machine_id),['h2'],'capability alone cannot opt out of local auth evidence');
+ const managed=buildRoutingPool(snapshot,{...input,managed_credential_label:'hub-claude'});
+ assert.deepEqual(managed.options.map(row=>row.value.machine_id).sort(),['h1','h2']);
+ assert(!managed.diagnostics.advisories?.some(row=>['local_credentials_missing','local_login_unverified','central_credentials_unavailable'].includes(row.reason)));
+ // This feature does not redefine the existing <3-model degraded-pool rule.
+ assert.equal(managed.diagnostics.pool_degraded,true);
+});
+
+test('explicit managed Claude cannot borrow a local login when central auth or approval is absent',()=>{
+ for(const [ready,approved,reason] of [[false,['h1','h2'],'central_credentials_unavailable'],[true,['h1'],'central_host_not_approved']] as const){
+  const {snapshot,workspace}=managedClaudeSnapshot(ready,[...approved]);
+  const input={interactive:false,workspace,engine:'claude',model:'opus',effort:'medium',machine_id:'h2',required_capabilities:['managed:hub-claude:opus:medium:v1']};
+  const native=buildRoutingPool(snapshot,input);
+  assert(!native.diagnostics.advisories?.some(row=>row.reason===reason));
+  const managed=buildRoutingPool(snapshot,{...input,managed_credential_label:'hub-claude'});
+  assert(managed.diagnostics.advisories?.some(row=>row.reason===reason));
+  assert(!managed.diagnostics.advisories?.some(row=>row.reason==='local_login_unverified'));
+ }
+});
+
+test('managed picker mode validates exact selector, Opus/medium/headless and canonical account',()=>{
+ const {snapshot,workspace}=managedClaudeSnapshot();
+ const input={interactive:false,workspace,engine:'claude',model:'opus',effort:'medium',managed_credential_label:'hub-claude' as const};
+ for(const changed of [{managed_credential_label:'other'},{model:'sonnet'},{engine:'codex'},{effort:'max'},{interactive:true},{with_goal:true}])
+  assert.throws(()=>buildRoutingPool(snapshot,{...input,...changed} as any),/invalid_managed_credential_route/);
+ snapshot.policy.candidates[0].account_id='foreign-claude';
+ assert.throws(()=>buildRoutingPool(snapshot,input),/model_policy_unavailable/);
+});
