@@ -1118,6 +1118,99 @@ class CanaryTest(unittest.TestCase):
             (False, "cleanup", "pending_state_clear_failed", "FAILED_needs_reconciliation"),
         )
 
+        # R2 retry durability: if Attempt 1 fails during parent/ancestor fsync_dir AFTER
+        # os.mkdir has already created the target directory and its ancestors on disk,
+        # Attempt 2 (hitting the existing-path branch of ensure_private_dir) must still
+        # repair/validate durability across the existing directory and ancestor chain
+        # before POST (and fail closed before POST if fsync_dir still fails on retry).
+        retry_state = self.tmp / "r2-retry-state" / "nested" / "sub"
+        retry_ws = self.tmp / "r2-retry-ws"
+        retry_env = dict(env_patch, HUB_CANARY_STATE_DIR=str(retry_state), HUB_CANARY_WORKSPACE=str(retry_ws))
+        (self.tmp / "calls.log").write_text("")
+
+        def fail_on_parent_fsync_attempt1(path):
+            resolved = pathlib.Path(path).resolve()
+            if resolved == retry_state.parent.resolve() and retry_state.exists():
+                raise OSError(errno.EIO, "simulated parent dir fsync failure after mkdir")
+            return real_fsync_dir(path)
+
+        with mock.patch.dict(os.environ, retry_env), mock.patch.object(
+            mod, "fsync_dir", side_effect=fail_on_parent_fsync_attempt1
+        ):
+            canary_retry_1 = mod.Canary(
+                "shell",
+                f"{sha[:12]}-{token[:12]}",
+                candidate_sha=sha,
+                candidate_cli_sha256=pyz_sha,
+                run_token=token,
+                expected_helper_sha256=helper_sha,
+            )
+            verdict_retry_1 = canary_retry_1.execute()
+        self.assertEqual(
+            (verdict_retry_1["ok"], verdict_retry_1["stage"], verdict_retry_1["reason"], verdict_retry_1["cleanup"]),
+            (False, "lock", "state_dir_create_failed", "not_needed"),
+        )
+        # The directory now already exists on disk from Attempt 1's os.mkdir, even though
+        # its parent/ancestor fsync failed.
+        self.assertTrue(retry_state.is_dir())
+        self.assertNotIn("sessions start", self.calls())
+
+        # Attempt 2a: existing path still fails fsync_dir -> must reject before POST.
+        with mock.patch.dict(os.environ, retry_env), mock.patch.object(
+            mod, "fsync_dir", side_effect=fail_on_parent_fsync_attempt1
+        ):
+            canary_retry_2a = mod.Canary(
+                "shell",
+                f"{sha[:12]}-{token[:12]}",
+                candidate_sha=sha,
+                candidate_cli_sha256=pyz_sha,
+                run_token=token,
+                expected_helper_sha256=helper_sha,
+            )
+            verdict_retry_2a = canary_retry_2a.execute()
+        self.assertEqual(
+            (verdict_retry_2a["ok"], verdict_retry_2a["stage"], verdict_retry_2a["reason"], verdict_retry_2a["cleanup"]),
+            (False, "lock", "state_dir_create_failed", "not_needed"),
+        )
+        self.assertNotIn("sessions start", self.calls())
+
+        # Attempt 2b: existing path retry succeeds -> must fsync the existing directory
+        # and its ancestor leftovers BEFORE POST (sessions start).
+        retry_fsynced_before_post = []
+        retry_fsynced_now = []
+
+        def record_retry_fsync(path):
+            retry_fsynced_now.append(pathlib.Path(path).resolve())
+            return real_fsync_dir(path)
+
+        with mock.patch.dict(os.environ, retry_env), mock.patch.object(
+            mod, "fsync_dir", side_effect=record_retry_fsync
+        ):
+            canary_retry_2b = mod.Canary(
+                "shell",
+                f"{sha[:12]}-{token[:12]}",
+                candidate_sha=sha,
+                candidate_cli_sha256=pyz_sha,
+                run_token=token,
+                expected_helper_sha256=helper_sha,
+            )
+            orig_run_2b = canary_retry_2b.run
+
+            def capture_fsyncs_before_post(argv, *a, **kw):
+                if argv[4:6] == ["sessions", "start"]:
+                    retry_fsynced_before_post.extend(retry_fsynced_now)
+                return orig_run_2b(argv, *a, **kw)
+
+            with mock.patch.object(canary_retry_2b, "run", side_effect=capture_fsyncs_before_post):
+                verdict_retry_2b = canary_retry_2b.execute()
+
+        self.assertTrue(verdict_retry_2b["ok"], verdict_retry_2b)
+        self.assertIn((self.tmp / "r2-retry-state").resolve(), retry_fsynced_before_post)
+        self.assertIn(retry_state.parent.resolve(), retry_fsynced_before_post)
+        self.assertIn(retry_state.resolve(), retry_fsynced_before_post)
+        self.assertIn((retry_state / "pending").resolve(), retry_fsynced_before_post)
+        self.assertIn(retry_ws.resolve(), retry_fsynced_before_post)
+
 
 if __name__ == "__main__":
     unittest.main()
