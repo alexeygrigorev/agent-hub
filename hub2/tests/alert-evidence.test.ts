@@ -1,0 +1,285 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { spawn } from 'node:child_process';
+import { createServer } from 'node:http';
+import { registerTypeScriptResolveHook, installCompatGlobals } from '../node/compat.ts';
+registerTypeScriptResolveHook(); installCompatGlobals();
+const ROOT = resolve(fileURLToPath(new URL('../..', import.meta.url)));
+const SELF = fileURLToPath(import.meta.url);
+const TOKEN = 'synthetic-credential-monitor-operator-token-000000000';
+const NONCE = '1'.repeat(32);
+const RELEASE = 'a'.repeat(40);
+const sha = (data: string | Uint8Array) => createHash('sha256').update(data).digest('hex');
+function canonical(value: any): string {
+  if (Array.isArray(value)) return '[' + value.map(canonical).join(',') + ']';
+  if (value && typeof value === 'object') return '{' + Object.keys(value).sort().map(k => JSON.stringify(k) + ':' + canonical(value[k])).join(',') + '}';
+  return JSON.stringify(value);
+}
+function privateJson(path: string, value: any) { writeFileSync(path, canonical(value) + '\n', { mode: 0o600 }); chmodSync(path, 0o600); }
+function syntheticEnvironment(home: string): NodeJS.ProcessEnv {
+  const env = {...process.env,HOME:home,TMPDIR:join(ROOT,'.local/tmp')};
+  for(const key of Object.keys(env)) if(/^(?:HUB_|HUB2_|APLEXER_|DTC_|XDG_)/.test(key) || /TOKEN|SECRET|PASSWORD|CREDENTIAL|API_KEY/.test(key)) delete env[key];
+  return env;
+}
+function temp() {
+  const parent = join(ROOT, '.local/tmp'); mkdirSync(parent, {recursive:true});
+  return mkdtempSync(join(parent, 'ingress-'));
+}
+async function fixture(directory: string, options: any = {}) {
+  const installed = join(directory, 'installed'), state = join(directory, 'state');
+  if (!existsSync(installed)) {
+    mkdirSync(join(installed, 'node'), {recursive:true, mode:0o700});
+    cpSync(join(ROOT, 'hub2/src'), join(installed, 'src'), {recursive:true});
+    for (const name of ['alert-evidence.ts','main.ts']) copyFileSync(join(ROOT,'hub2/node',name),join(installed,'node',name));
+    for (const name of ['node/alert-evidence.ts','node/main.ts','src/worker.ts']) chmodSync(join(installed,name),0o600);
+  }
+  const paths = ['node/alert-evidence.ts','node/main.ts','src/worker.ts'].map(name=>join(installed,name));
+  const artifacts = paths.map(path=>({path,sha256:sha(readFileSync(path))}));
+  const source_id = sha(canonical(artifacts));
+  if (!existsSync(state)) {
+    mkdirSync(state,{mode:0o700});
+    privateJson(join(state,'enrollment.json'),{kind:'hub_credential_monitor_enrollment_v1',producer:'credential_monitor',recipient:'dev@dtcdev.click',
+      enrollment_id:'2'.repeat(32),source_id,release_sha:RELEASE,artifacts});
+    privateJson(join(state,'journal.json'),{kind:'hub_credential_monitor_journal_v1',source_id,enrollment_id:'2'.repeat(32),
+      occurrence_count:0,started_total:0,finished_total:0});
+  }
+  const loadedArtifacts = Object.fromEntries(artifacts.map(a=>[a.path,a.sha256]));
+  const {AlertEvidence} = await import(pathToFileURL(join(installed,'node/alert-evidence.ts')).href);
+  const observer = await AlertEvidence.load(state,{loadedArtifacts,...options});
+  const {default:worker} = await import(pathToFileURL(join(installed,'src/worker.ts')).href);
+  const policy=JSON.parse(readFileSync(join(ROOT,'config/model-policy.json'),'utf8'));
+  const candidates=policy.candidates.filter((row:any)=>['codex-sol-medium','claude-sonnet-medium'].includes(row.id));
+  assert.equal(candidates.length,2);
+  const model={unhealthy:true,actor:{id:'synthetic-observer',kind:'operator',scopes:['operator:admin']}};
+  const namespace=(kind:string)=>({idFromName:(id:string)=>id,get:(id:string)=>({fetch:async(input:any,init?:any)=>{
+    const req=input instanceof Request?input:new Request(input,init),url=new URL(req.url);
+    if(kind==='control'){
+      if(url.pathname==='/_verify')return Response.json({actor:model.actor});
+      if(url.pathname==='/_routing-policy')return Response.json({version:17,candidates});
+      if(url.pathname==='/api/directory')return Response.json({items:[{id:'h1'}],next:null});
+    }
+    if(kind==='accounts')return Response.json({account:{enabled:true},credential_usable:!model.unhealthy,credential_status:model.unhealthy?'missing':'ready',
+      quota:{remaining:60,captured_at:Date.now(),valid_until:Date.now()+900000},fresh:true,hosts:['h1']});
+    if(kind==='machines')return Response.json({machine_id:'h1',connected:true,os:'linux',engines:['codex','claude'],capabilities:['headless:codex','headless:claude','effort:codex','effort:claude']});
+    throw new Error('unexpected synthetic route');
+  }})});
+  const env:any={CONTROL:namespace('control'),ACCOUNTS:namespace('accounts'),MACHINES:namespace('machines'),CREDENTIAL_MONITOR_EVIDENCE:observer};
+  const post=(marked=true)=>worker.fetch(new Request('http://127.0.0.1/api/model-picker/pick',{method:'POST',
+    headers:{Authorization:'Bearer '+TOKEN,'Content-Type':'application/json',...(marked?{'X-Hub-Alert-Producer':'credential_monitor'}:{})},body:'{}'}),env);
+  const sample=(nonce=NONCE,method='GET')=>worker.fetch(new Request('http://127.0.0.1/api/model-picker/credential-monitor-evidence?nonce='+nonce,
+    {method,headers:{Authorization:'Bearer '+TOKEN}}),env);
+  return {observer,worker,env,post,sample,state,installed,loadedArtifacts,source_id,model};
+}
+async function serverMode(directory:string,fail:boolean,port=0) {
+  // These HTTP/aggregate fixtures test transport and decision semantics, not
+  // host fsync latency. Dedicated default-writer tests exercise real durability.
+  const f=await fixture(directory,fail?{writer:async()=>{throw new Error('synthetic write fault');}}:
+    {timeoutMs:2000,writer:async(value:any)=>privateJson(join(directory,'state/journal.json'),value)});
+  const server=createServer(async(req,res)=>{
+    if(req.url==='/__fixture/healthy'){f.model.unhealthy=false;res.writeHead(200);res.end('{}');return;}
+    const chunks:Buffer[]=[]; for await(const chunk of req)chunks.push(Buffer.from(chunk));
+    const result=await f.worker.fetch(new Request('http://127.0.0.1'+req.url,{method:req.method,
+      headers:req.headers as any,...(req.method==='POST'?{body:Buffer.concat(chunks)}:{})}),f.env);
+    res.writeHead(result.status,Object.fromEntries(result.headers));res.end(Buffer.from(await result.arrayBuffer()));
+  });
+  server.listen(port,'127.0.0.1',()=>console.log(JSON.stringify({port:(server.address() as any).port,source_id:f.source_id,release_sha:RELEASE})));
+  process.on('SIGTERM',()=>server.close(()=>process.exit(0)));
+}
+async function startServerChild(directory:string,fail=false) {
+  const child=spawn(process.execPath,['--experimental-transform-types',SELF,'--fixture-server',directory,fail?'fail':'good'],{stdio:['ignore','pipe','pipe'],env:syntheticEnvironment(directory)});
+  let log='',errors='';child.stderr!.on('data',b=>errors+=b);
+  const info=await new Promise<any>((resolveInfo,reject)=>{
+    const timer=setTimeout(()=>{child.kill('SIGKILL');reject(new Error('fixture startup timed out '+errors));},6000);
+    child.stdout!.on('data',b=>{log+=b;const line=log.split('\n')[0];try{const value=JSON.parse(line);clearTimeout(timer);resolveInfo(value);}catch{}});
+    child.once('exit',()=>{clearTimeout(timer);reject(new Error('fixture exited '+errors));});
+  });
+  return {child,info,base:'http://127.0.0.1:'+info.port};
+}
+async function stop(child:ReturnType<typeof spawn>, signal:any='SIGTERM') {
+  if(child.exitCode!==null || child.signalCode!==null)return;
+  await new Promise<void>(resolveDone=>{child.once('exit',()=>resolveDone());child.kill(signal);});
+}
+async function defineTests() {
+  test('exact final exclusion criterion counts marked decisions; unmarked and healthy do not count',async t=>{
+    const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
+    const f=await fixture(directory);t.after(()=>f.observer.close());
+    const plain=await (await f.post(false)).json() as any;
+    const marked=await (await f.post()).json() as any;
+    assert.ok(marked.excluded.length>0);assert.deepEqual(marked.excluded,plain.excluded);
+    let proof=await (await f.sample()).json() as any;
+    assert.equal(proof.occurrence_count,1);assert.equal(proof.started_total,1);assert.equal(proof.finished_total,1);
+    assert.equal(proof.artifact_proof,'loaded_and_current_v1');assert.equal(proof.nonce,NONCE);
+    f.model.unhealthy=false;
+    const healthy=await (await f.post()).json() as any;assert.deepEqual(healthy.excluded,[]);
+    proof=await (await f.sample()).json() as any;
+    assert.equal(proof.occurrence_count,1);assert.equal(proof.started_total,2);
+  });
+  test('write failure then recovery before first barrier never heals the process generation',async t=>{
+    const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
+    let broken=true;
+    const f=await fixture(directory,{writer:async()=>{if(broken)throw new Error('synthetic');}});t.after(()=>f.observer.close());
+    const response=await f.post();assert.equal(response.status,200);assert.ok((await response.json() as any).excluded.length);
+    broken=false;
+    assert.equal((await (await f.sample()).json() as any).available,false);
+    assert.equal((await f.post()).status,200);
+    assert.equal((await (await f.sample()).json() as any).available,false);
+  });
+  test('canonical corruption before a marked POST cannot heal the persisted journal',async t=>{
+    for (const corruption of ['empty','source','stale']) {
+      const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
+      const f=await fixture(directory);t.after(()=>f.observer.close());
+      // Establish a nonzero durable baseline without sampling a barrier.
+      assert.equal((await f.post()).status,200);
+      const journal=join(f.state,'journal.json');
+      const original=JSON.parse(readFileSync(journal,'utf8'));
+      const replacement=corruption==='empty'?{}:corruption==='source'?{...original,source_id:'f'.repeat(64)}:
+        {...original,started_total:0,finished_total:0,occurrence_count:0};
+      privateJson(journal,replacement);
+      assert.equal((await f.post()).status,200);
+      assert.equal((await (await f.sample()).json() as any).available,false);
+      assert.deepEqual(JSON.parse(readFileSync(journal,'utf8')),replacement);
+      privateJson(journal,original);
+      assert.equal((await f.post()).status,200);
+      assert.equal((await (await f.sample()).json() as any).available,false);
+    }
+  });
+  test('pending writer timeout is bounded and stays unknown after late completion',async t=>{
+    const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
+    let release!:()=>void;
+    const held=new Promise<void>(r=>release=r);
+    const f=await fixture(directory,{writer:()=>held,timeoutMs:25});t.after(()=>f.observer.close());
+    const before=Date.now();assert.equal((await f.post()).status,200);assert.ok(Date.now()-before<1500);
+    release();await Promise.resolve();assert.equal((await (await f.sample()).json() as any).available,false);
+  });
+  test('inflight and concurrent requests cannot yield a complete nonce barrier',async t=>{
+    const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
+    const f=await fixture(directory);t.after(()=>f.observer.close());
+    const identity=f.observer.begin();
+    assert.equal((await f.observer.snapshot(NONCE)).available,false);
+    await f.observer.finish(identity,'observation');
+    await Promise.all([f.post(),f.post(),f.post()]);
+    const proof=await (await f.sample()).json() as any;
+    assert.equal(proof.complete,true);assert.equal(proof.started_total,4);assert.equal(proof.finished_total,4);assert.equal(proof.occurrence_count,3);
+  });
+  test('auth, method and nonce fences do not create producer observations',async t=>{
+    const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
+    const f=await fixture(directory);t.after(()=>f.observer.close());
+    assert.equal((await f.sample('bad')).status,400);assert.equal((await f.sample(NONCE,'POST')).status,405);
+    f.model.actor.scopes=['session:start'];assert.equal((await f.sample()).status,403);
+    f.model.actor.scopes=['operator:admin'];
+    assert.equal((await (await f.sample()).json() as any).started_total,0);
+    delete f.env.CREDENTIAL_MONITOR_EVIDENCE;
+    assert.equal((await f.post()).status,200);assert.equal((await (await f.sample()).json() as any).available,false);
+  });
+  test('artifact changes and unsafe journal fail unknown without refusing preview',async t=>{
+    for(const fault of ['source','journal']){
+      const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
+      const f=await fixture(directory);t.after(()=>f.observer.close());
+      if(fault==='source')writeFileSync(join(f.installed,'src/worker.ts'),'changed artifact');
+      if(fault==='journal')writeFileSync(join(f.state,'journal.json'),'{broken');
+      assert.equal((await (await f.sample()).json() as any).available,false,fault);
+      assert.equal((await f.post()).status,200,fault);
+    }
+  });
+  test('128-request horizon never evicts a receipt or silently resets coverage',async t=>{
+    const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
+    let journal='';
+    const f=await fixture(directory,{timeoutMs:2000,writer:async(value:any)=>privateJson(journal,value)});t.after(()=>f.observer.close());
+    journal=join(f.state,'journal.json');
+    for(let n=0;n<128;n++){const identity=f.observer.begin();await f.observer.finish(identity,'observation');}
+    const before=await f.observer.snapshot(NONCE);assert.equal(before.complete,true);assert.equal(before.started_total,128);
+    assert.equal(f.observer.begin(),null);assert.equal((await f.observer.snapshot(NONCE)).available,false);
+    assert.equal((await f.post()).status,200);assert.equal(JSON.parse(readFileSync(journal,'utf8')).started_total,128);
+  });
+  test('private journal symlink, FIFO, hardlink and duplicate keys cannot produce clean evidence',async t=>{
+    for(const fault of ['symlink','fifo','hardlink','duplicate']){
+      const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
+      const f=await fixture(directory);t.after(()=>f.observer.close());
+      const journal=join(f.state,'journal.json'),original=readFileSync(journal);
+      const {symlinkSync,linkSync}=await import('node:fs');
+      if(fault==='duplicate')writeFileSync(journal,'{"kind":"duplicate",'+original.toString().trim().slice(1));
+      else {
+        const outside=join(directory,'outside');writeFileSync(outside,original,{mode:0o600});rmSync(journal);
+        if(fault==='symlink')symlinkSync(outside,journal);
+        if(fault==='hardlink')linkSync(outside,journal);
+        if(fault==='fifo'){
+          const {execFileSync}=await import('node:child_process');execFileSync('mkfifo',['-m','600',journal]);
+        }
+      }
+      assert.equal((await f.observer.snapshot(NONCE)).available,false,fault);
+      assert.equal((await f.post()).status,200,fault);
+    }
+  });
+  test('enrollment assertion cannot replace actual load-time artifact identity',async t=>{
+    const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
+    const f=await fixture(directory);t.after(()=>f.observer.close());
+    const {AlertEvidence}=await import(pathToFileURL(join(f.installed,'node/alert-evidence.ts')).href);
+    const wrong={...f.loadedArtifacts,[join(f.installed,'src/worker.ts')]:'f'.repeat(64)};
+    await assert.rejects(AlertEvidence.load(f.state,{loadedArtifacts:wrong}),/unavailable/);
+  });
+  test('live HTTP response succeeds despite write fault; SIGKILL/new process changes generation',async t=>{
+    const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
+    const one=await startServerChild(directory,true);t.after(()=>stop(one.child));
+    const headers={Authorization:'Bearer '+TOKEN,'X-Hub-Alert-Producer':'credential_monitor','Content-Type':'application/json'};
+    const before=await (await fetch(one.base+'/api/model-picker/credential-monitor-evidence?nonce='+NONCE,{headers})).json() as any;
+    assert.equal(before.complete,true);
+    const response=await fetch(one.base+'/api/model-picker/pick',{method:'POST',headers,body:'{}'});
+    assert.equal(response.status,200);assert.ok((await response.json() as any).excluded.length);
+    await stop(one.child,'SIGKILL');
+    const two=await startServerChild(directory);t.after(()=>stop(two.child));
+    const after=await (await fetch(two.base+'/api/model-picker/credential-monitor-evidence?nonce='+NONCE,{headers})).json() as any;
+    assert.equal(after.complete,true);assert.notEqual(before.controller_id,after.controller_id);assert.notEqual(before.epoch,after.epoch);
+    // An acceptance interval cannot substitute this new epoch for its baseline.
+  });
+  test('required Node24 lane executes both targeted Python ingress/evidence suites',async()=>{
+    const child=spawn('python3',['-m','unittest','host.tests.test_hub_alert_controller','host.tests.test_hub_alert_evidence'],
+      {cwd:ROOT,env:{...process.env,PYTHONPATH:join(ROOT,'host'),TMPDIR:join(ROOT,'.local/tmp')},stdio:['ignore','pipe','pipe']});
+    let output='';child.stdout!.on('data',b=>output+=b);child.stderr!.on('data',b=>output+=b);
+    const code=await new Promise<number|null>((yes,no)=>{
+      const timer=setTimeout(()=>{child.kill('SIGTERM');no(new Error('targeted Python contracts timed out'));},90000);
+      child.once('error',error=>{clearTimeout(timer);no(error);});child.once('exit',code=>{clearTimeout(timer);yes(code);});});
+    assert.equal(code,0,output);
+    const count=output.match(/Ran (\d+) tests/);assert.ok(count&&Number(count[1])>=28,'required Python cases must execute, not collect zero: '+output);
+  });
+  test('actual main optional missing/import-broken observer never prevents primary startup/routes',async t=>{
+    for(const fault of ['configured','missing','broken']){
+      const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
+      const hub=join(directory,'hub2');mkdirSync(hub);
+      cpSync(join(ROOT,'hub2/node'),join(hub,'node'),{recursive:true});cpSync(join(ROOT,'hub2/src'),join(hub,'src'),{recursive:true});
+      copyFileSync(join(ROOT,'hub2/production-worker.ts'),join(hub,'production-worker.ts'));
+      const module=join(hub,'node/alert-evidence.ts');
+      if(fault==='missing')rmSync(module);else if(fault==='broken')writeFileSync(module,"throw new Error('synthetic import fault'); export const AlertEvidence = null;\n");
+      const observerDir=join(directory,'observer');
+      if(fault==='configured'){
+        mkdirSync(observerDir,{mode:0o700});
+        const artifacts=['node/alert-evidence.ts','node/main.ts','src/worker.ts'].map(name=>{
+          const path=join(hub,name);chmodSync(path,0o600);return {path,sha256:sha(readFileSync(path))};});
+        const source_id=sha(canonical(artifacts));
+        privateJson(join(observerDir,'enrollment.json'),{kind:'hub_credential_monitor_enrollment_v1',producer:'credential_monitor',recipient:'dev@dtcdev.click',
+          enrollment_id:'2'.repeat(32),source_id,release_sha:RELEASE,artifacts});
+        privateJson(join(observerDir,'journal.json'),{kind:'hub_credential_monitor_journal_v1',source_id,enrollment_id:'2'.repeat(32),occurrence_count:0,started_total:0,finished_total:0});
+      }
+      const vars=join(directory,'vars');writeFileSync(vars,'HUB2_DEV_OPERATOR_TOKEN='+TOKEN+'\nHUB2_ALERT_EVIDENCE_DIR='+observerDir+'\n');
+      const child=spawn(process.execPath,['--experimental-transform-types',join(hub,'node/main.ts'),'--host','127.0.0.1','--port','0','--data-dir',join(directory,'db'),'--dev-vars',vars],{stdio:['ignore','pipe','pipe'],env:syntheticEnvironment(directory)});
+      t.after(()=>stop(child));let output='',errors='';child.stderr!.on('data',b=>errors+=b);
+      const port=await new Promise<string>((yes,no)=>{const timer=setTimeout(()=>{child.kill('SIGKILL');no(new Error('main timeout '+errors));},6000);
+        child.stdout!.on('data',b=>{output+=b;const match=output.match(/listening http:\/\/127\.0\.0\.1:(\d+)/);if(match){clearTimeout(timer);yes(match[1]);}});
+        child.once('exit',()=>{clearTimeout(timer);no(new Error('main exited '+errors));});});
+      const base='http://127.0.0.1:'+port,headers={Authorization:'Bearer '+TOKEN};
+      assert.equal((await fetch(base+'/health')).status,200);
+      assert.equal((await fetch(base+'/api/repos',{headers})).status,200);
+      const proof=await (await fetch(base+'/api/model-picker/credential-monitor-evidence?nonce='+NONCE,{headers})).json() as any;
+      if(fault==='configured')assert.equal(proof.complete,true);else assert.equal(proof.available,false);
+      const primary=await fetch(base+'/api/model-picker/pick',{method:'POST',headers:{...headers,'X-Hub-Alert-Producer':'credential_monitor','Content-Type':'application/json'},body:'{}'});
+      assert.equal(primary.status,503,'no configured policy has the same primary refusal with optional observer present or absent');
+      await stop(child);
+    }
+  });
+}
+if(process.argv.includes('--fixture-server')){
+  const index=process.argv.indexOf('--fixture-server');await serverMode(resolve(process.argv[index+1]),process.argv[index+2]==='fail',Number(process.argv[index+3] || 0));
+}else await defineTests();

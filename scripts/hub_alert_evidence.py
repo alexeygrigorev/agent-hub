@@ -27,6 +27,8 @@ import os
 from pathlib import Path
 import re
 import stat
+import subprocess
+import urllib.parse
 import sys
 import time
 import uuid
@@ -241,6 +243,86 @@ def verify_source(entry):
     require(entry.get('source_id') == digest(normalized), 'source_identity_mismatch')
 
 
+def remote_spec(name, entry):
+    remote = entry.get('remote')
+    require(name == 'credential_monitor' and entry.get('mode') == 'external'
+            and 'witness_path' not in entry and isinstance(remote, dict)
+            and set(remote) == {'kind', 'base_url', 'credential_path', 'source_id', 'release_sha'}
+            and remote.get('kind') == 'credential_monitor_post_v1', 'invalid_remote_authority')
+    value = remote.get('base_url')
+    require(isinstance(value, str) and len(value) <= 2048 and not any(ord(c) <= 32 for c in value), 'invalid_remote_origin')
+    url = urllib.parse.urlsplit(value)
+    require(url.scheme == 'https' or (url.scheme == 'http' and url.hostname in ('127.0.0.1', '::1', 'localhost')), 'invalid_remote_origin')
+    require(url.hostname and not url.username and not url.password and not url.query and not url.fragment
+            and url.path in ('', '/'), 'invalid_remote_origin')
+    require(url.port is None or 1 <= url.port <= 65535, 'invalid_remote_origin')
+    require(isinstance(remote.get('credential_path'), str) and Path(remote['credential_path']).is_absolute()
+            and re.fullmatch(r'[0-9a-f]{64}', str(remote.get('source_id')))
+            and re.fullmatch(r'[0-9a-f]{40}', str(remote.get('release_sha'))), 'invalid_remote_pin')
+    return remote
+
+
+# Network work is in a bounded, isolated child. Socket timeouts alone permit a
+# slow-drip response to run forever. No bearer enters argv, logs, disk or output.
+REMOTE_FETCH = r"""
+import json, sys, urllib.request
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs): return None
+def unique(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value: raise ValueError()
+        value[key] = item
+    return value
+try:
+    args = json.loads(sys.stdin.buffer.read(131073))
+    request = urllib.request.Request(args['url'], headers={'Authorization': 'Bearer ' + args['token']}, method='GET')
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    with opener.open(request, timeout=1.5) as response:
+        if response.status != 200: raise ValueError()
+        raw = response.read(131073)
+    if len(raw) > 131072: raise ValueError()
+    json.loads(raw, object_pairs_hook=unique)
+    sys.stdout.buffer.write(raw)
+except Exception:
+    raise SystemExit(2)
+"""
+
+
+def remote_witness(name, entry):
+    remote = remote_spec(name, entry)
+    credential = read_private(remote['credential_path'])
+    # Never forward a Hub credential to an unrelated configured HTTPS origin.
+    require(isinstance(credential.get('base_url'), str)
+            and credential['base_url'].rstrip('/') == remote['base_url'].rstrip('/'), 'credential_origin_mismatch')
+    token = credential.get('access_token')
+    require(isinstance(token, str) and 32 <= len(token) <= 8192
+            and all(33 <= ord(c) < 127 for c in token), 'invalid_remote_credential')
+    nonce = uuid.uuid4().hex
+    url = remote['base_url'].rstrip('/') + '/api/model-picker/credential-monitor-evidence?nonce=' + nonce
+    try:
+        result = subprocess.run([sys.executable, '-I', '-S', '-c', REMOTE_FETCH],
+            input=canonical({'url': url, 'token': token}), stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, timeout=3, check=False,
+            env={'PATH': os.defpath, 'LANG': 'C.UTF-8'})
+    except (OSError, subprocess.TimeoutExpired):
+        raise EvidenceUnavailable('remote_authority_unavailable') from None
+    require(result.returncode == 0 and len(result.stdout) <= LIMIT, 'remote_authority_unavailable')
+    value = json.loads(result.stdout, object_pairs_hook=unique_object)
+    allowed = {'kind', 'producer', 'recipient', 'source_id', 'epoch', 'controller_id', 'limitations', 'complete',
+               'started_total', 'finished_total', 'baseline_count', 'baseline_invocations', 'occurrence_count',
+               'observed_at_ms', 'nonce', 'release_sha', 'artifact_proof'}
+    require(isinstance(value, dict) and set(value) == allowed and value.get('nonce') == nonce
+            and value.get('kind') == 'hub_controller_coverage_v1'
+            and value.get('producer') == name and value.get('recipient') == RECIPIENT
+            and value.get('artifact_proof') == 'loaded_and_current_v1'
+            and value.get('source_id') == remote['source_id']
+            and value.get('release_sha') == remote['release_sha'], 'remote_authority_identity_mismatch')
+    # Local installed producer/fetcher pins and the remote VM pins are separate.
+    # Enrollment/generation binds both; no local file claims to cover the VM.
+    return dict(value, source_id=entry['source_id'])
+
+
 def enrollment(value):
     require(value.get('kind') == 'hub_alert_enrollment_v1' and value.get('recipient') == RECIPIENT,
             'invalid_enrollment')
@@ -249,13 +331,15 @@ def enrollment(value):
             and set(entries) <= REQUIRED_PRODUCERS | OPTIONAL_PRODUCERS, 'producer_set_incomplete')
     for name, entry in entries.items():
         require(isinstance(entry, dict) and entry.get('mode') in ('ledger', 'external')
-                and isinstance(entry.get('witness_path'), str), 'producer_not_enrolled')
+                and ('remote' in entry or isinstance(entry.get('witness_path'), str)), 'producer_not_enrolled')
+        if 'remote' in entry:
+            remote_spec(name, entry)
         verify_source(entry)
     return entries
 
 
-def witness(name, entry, *, now_ms):
-    value = read_private(entry['witness_path'])
+def witness(name, entry, *, now_ms, remote_value=None):
+    value = (remote_value if remote_value is not None else remote_witness(name, entry)) if 'remote' in entry else read_private(entry['witness_path'])
     require(value.get('kind') == 'hub_controller_coverage_v1' and value.get('producer') == name
             and value.get('source_id') == entry['source_id'], 'coverage_source_mismatch')
     require(identifier(value.get('epoch')) and identifier(value.get('controller_id')),
@@ -406,11 +490,19 @@ def aggregate(directory, *, now_ms=None):
     """Read-only accepted contract, or explicit unavailable; never a fabricated zero."""
     now_ms = int(time.time() * 1000) if now_ms is None else now_ms
     try:
+        # Do network barriers outside the shared ledger lock: a slow remote
+        # must not starve local producers' bounded exclusive writes.
         with PrivateDirectory(directory) as state, state.lock():
-            entries = enrollment(state.read('enrollment.json'))
+            original = state.read('enrollment.json')
+            entries = enrollment(original)
+        remote_values = {name: remote_witness(name, entry) for name, entry in entries.items() if 'remote' in entry}
+        with PrivateDirectory(directory) as state, state.lock():
+            current = state.read('enrollment.json')
+            require(current == original, 'enrollment_changed_during_barrier')
+            entries = enrollment(current)
             total, times, generations = 0, [], []
             for name, entry in sorted(entries.items()):
-                proof = witness(name, entry, now_ms=now_ms)
+                proof = witness(name, entry, now_ms=now_ms, remote_value=remote_values.get(name))
                 if entry['mode'] == 'external':
                     count = proof['occurrence_count']
                 else:
