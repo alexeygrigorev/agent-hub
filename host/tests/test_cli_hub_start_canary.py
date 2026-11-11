@@ -21,8 +21,9 @@ SID = "%s"; NATIVE = "%s"
 def item(state, **kw):
     name = (d / "session_name").read_text() if (d / "session_name").exists() else None
     key = (d / "session_key").read_text() if (d / "session_key").exists() else None
+    eng = (d / "session_engine").read_text() if (d / "session_engine").exists() else os.environ.get("FAKE_ENGINE", "shell")
     base = {"id": SID, "state": state, "intake_id": None, "project_id": "owner/repo", "machine_id": "HOST-1", "workspace": os.environ["HUB_CANARY_WORKSPACE"],
-            "epoch": 1, "operation_id": "op:0", "native_id": NATIVE, "engine": "shell", "model": None,
+            "epoch": 1, "operation_id": "op:0", "native_id": NATIVE, "engine": eng, "model": None,
             "name": name, "key": key, "interactive": False, "evidence": None, "attention": None}
     base.update(kw); return base
 if args[:2] == ["sessions", "start"]:
@@ -39,6 +40,7 @@ if args[:2] == ["sessions", "start"]:
     session_key = args[args.index("--key") + 1]
     (d / "session_name").write_text(session_name)
     (d / "session_key").write_text(session_key)
+    (d / "session_engine").write_text("shell" if "--engine" in args else os.environ.get("FAKE_ENGINE", "codex"))
     run_id = session_name.rsplit("-", 1)[-1]
     if "printf '%%s:%%s:%%s\\n' CANARY-OK " in prompt_text:
         parts = prompt_text.split(";")[0].split()
@@ -111,7 +113,13 @@ if args[:2] == ["sessions", "capture"]:
         sys.exit(1)
     if sc == "late_capture": time.sleep(0.5)
     prompt, marker = (d / "prompt").read_text(), (d / "marker").read_text()
-    if (d / "capture_output.txt").exists():
+    if (d / "capture_seq.json").exists():
+        seq = json.loads((d / "capture_seq.json").read_text())
+        idx = int((d / "capture_idx").read_text()) if (d / "capture_idx").exists() else 0
+        (d / "capture_idx").write_text(str(idx + 1))
+        raw = seq[min(idx, len(seq) - 1)]
+        output = raw.replace("__MARKER__", marker)
+    elif (d / "capture_output.txt").exists():
         output = (d / "capture_output.txt").read_text().replace("__MARKER__", marker)
     elif sc == "capture_prompt_only": output = "$ " + prompt
     elif sc == "wrapped_prompt_only": output = "Reply CANARY-OK\nand exit"
@@ -121,6 +129,8 @@ if args[:2] == ["sessions", "capture"]:
     elif sc == "json_message_output": output = json.dumps({"type":"item.completed","item":{"type":"agent_message","text":marker}})
     elif sc == "json_result_output": output = json.dumps({"type":"result","result":marker})
     elif sc == "json_arbitrary_marker": output = json.dumps({"command":marker,"prompt":marker,"output":marker})
+    elif ((d / "session_engine").read_text() if (d / "session_engine").exists() else "shell") != "shell":
+        output = json.dumps({"type":"item.completed","item":{"type":"command_execution","status":"completed","exit_code":0,"aggregated_output":marker+"\n","command":"echo"}})
     else: output = "$ " + prompt + "\n" + marker
     print(json.dumps({"command_wait":{"state":"acked","ack":{"capture":output}}})); sys.exit(0)
 if args[:2] == ["sessions", "stop"]:
@@ -223,7 +233,8 @@ class CanaryTest(unittest.TestCase):
         capture_timeout = (
             "0.35" if scenario in (
                 "capture_prompt_only", "wrapped_prompt_only", "capture_empty",
-                "capture_fail", "json_prompt_only", "json_arbitrary_marker", "late_capture",
+                "capture_fail", "json_prompt_only", "json_message_output",
+                "json_result_output", "json_arbitrary_marker", "late_capture",
             )
             else "1.5"
         )
@@ -245,7 +256,7 @@ class CanaryTest(unittest.TestCase):
         )
         env["FAKE_PROMPT"] = mode_prompt or ("Reply CANARY-OK and exit" if ("full" in args or "--deploy-gate" in args) else "printf CANARY-OK; sleep 30")
         env.update(extra)
-        for f in ("started", "a_running", "stopped", "list_count", "systemctl.jsonl"):
+        for f in ("started", "a_running", "stopped", "list_count", "systemctl.jsonl", "session_engine", "capture_idx"):
             (self.tmp / f).unlink(missing_ok=True)
         (self.tmp / "calls.log").write_text("")
         r = subprocess.run([str(SCRIPT), *args], env=env, capture_output=True, text=True, timeout=60)
@@ -301,7 +312,7 @@ class CanaryTest(unittest.TestCase):
         c = self.calls()
         self.assertNotIn("--engine", c)
         self.assertNotIn("--model", c)
-        self.assertIn("--prompt Use two sequential tool calls.", c)
+        self.assertIn("--prompt Use two sequential shell tool calls.", c)
         self.assertIn("--repo owner/repo", c)
         self.assertIn("--machine HOST-1", c)
         self.assertIn("--no-wait", c)
@@ -529,14 +540,14 @@ class CanaryTest(unittest.TestCase):
         self.assertFalse(self.state.exists())
 
     def test_full_jsonl_capture_requires_actual_output_fields(self):
-        for scenario in ('json_command_output', 'json_message_output', 'json_result_output'):
-            with self.subTest(scenario=scenario):
-                r, value = self.run_canary(scenario, '--mode', 'full')
-                self.assertEqual((r.returncode, value['ok'], value['stage']), (0, True, None))
-                prompt=(self.tmp/'prompt').read_text()
-                self.assertIn('two sequential tool calls',prompt)
-                self.assertIn('separate tool call to run sleep 60',prompt)
-        for scenario in ('json_prompt_only', 'json_arbitrary_marker'):
+        r, value = self.run_canary('json_command_output', '--mode', 'full')
+        self.assertEqual((r.returncode, value['ok'], value['stage']), (0, True, None))
+        prompt = (self.tmp / 'prompt').read_text()
+        self.assertIn('two sequential shell tool calls', prompt)
+        self.assertIn('provider-native background tool facility for a separate bounded 60-second hold', prompt)
+        self.assertIn('monitoring it internally so the orchestrator can stop this session', prompt)
+        self.assertIn('Do not chain the print with a foreground sleep or wait externally', prompt)
+        for scenario in ('json_prompt_only', 'json_message_output', 'json_result_output', 'json_arbitrary_marker'):
             with self.subTest(scenario=scenario):
                 self.assert_stage(scenario, 'capture', 'no_output_beyond_prompt', mode='full')
 
@@ -1906,7 +1917,7 @@ class CanaryTest(unittest.TestCase):
             )
             + "\n"
         )
-        r_tool_ok, v_tool_ok = self.run_canary("ok", "--mode", "full")
+        r_tool_ok, v_tool_ok = self.run_canary("ok", "--mode", "full", FAKE_ENGINE="go")
         self.assertEqual(r_tool_ok.returncode, 0, r_tool_ok.stderr)
         self.assertTrue(v_tool_ok["ok"])
 
@@ -1975,13 +1986,220 @@ class CanaryTest(unittest.TestCase):
         for idx, cap_text in enumerate(rejected_captures):
             with self.subTest(rejected_capture=idx):
                 (self.tmp / "capture_output.txt").write_text(cap_text + "\n")
-                r_rej, v_rej = self.run_canary("ok", "--mode", "full", HUB_CANARY_CAPTURE_TIMEOUT_S="0.35")
+                r_rej, v_rej = self.run_canary("ok", "--mode", "full", FAKE_ENGINE="go", HUB_CANARY_CAPTURE_TIMEOUT_S="0.35")
                 self.assertEqual(r_rej.returncode, 1)
                 self.assertEqual(
                     (v_rej["ok"], v_rej["stage"], v_rej["reason"], v_rej["cleanup"]),
                     (False, "capture", "no_output_beyond_prompt", "stopped"),
                 )
         (self.tmp / "capture_output.txt").unlink(missing_ok=True)
+
+    def test_claude_and_argon_paired_streams_and_engine_isolation(self):
+        import copy
+        from scripts import hub_acceptance_10 as acc
+        from scripts import hub_start_canary as mod
+
+        def provider_frames(engine, marker):
+            session = "11111111-2222-4333-8444-555555555555"
+            if engine == "claude":
+                return [
+                    {
+                        "type": "assistant",
+                        "session_id": session,
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "toolu_synthetic_print",
+                                    "name": "Bash",
+                                    "input": {"command": "python3 synthetic_print.py"},
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "type": "user",
+                        "session_id": session,
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "toolu_synthetic_print",
+                                    "content": marker + "\n",
+                                    "is_error": False,
+                                }
+                            ],
+                        },
+                        "tool_use_result": {"stdout": marker + "\n", "stderr": "", "interrupted": False},
+                    },
+                ]
+            params = {"CommandLine": "python3 synthetic_print.py"}
+            return [
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "conversation_id": session,
+                        "step_index": 7,
+                        "step_type": "tool",
+                        "state": "ACTIVE",
+                        "tool_name": "run_command",
+                        "tool_info": {"name": "run_command", "parameters": dict(params)},
+                    },
+                },
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "conversation_id": session,
+                        "step_index": 7,
+                        "step_type": "tool",
+                        "state": "DONE",
+                        "tool_name": "run_command",
+                        "tool_info": {
+                            "name": "run_command",
+                            "parameters": dict(params),
+                            "output": (
+                                "Created At: 2026-01-01T00:00:00+00:00\n"
+                                "Completed At: 2026-01-01T00:00:01+00:00\n"
+                                "Command exited with code 0.\n\n"
+                                "Command output:\n" + marker + "\n"
+                            ),
+                        },
+                    },
+                },
+            ]
+
+        def jsonl(events):
+            return "\n".join(json.dumps(event) for event in events)
+
+        # 1. End-to-end CLI canary passes for Claude and Argon with complete paired frames
+        # (including a clipped leading line at index 0), and fails when stitched across two captures.
+        for engine in ("claude", "antigravity"):
+            frames = provider_frames(engine, "__MARKER__")
+            with self.subTest(engine=engine, case="complete_pair_e2e"):
+                (self.tmp / "capture_output.txt").write_text("clipped earlier frame\n" + jsonl(frames) + "\n")
+                r_ok, v_ok = self.run_canary("ok", "--mode", "full", FAKE_ENGINE=engine)
+                self.assertEqual(r_ok.returncode, 0, r_ok.stderr)
+                self.assertTrue(v_ok["ok"])
+            (self.tmp / "capture_output.txt").unlink(missing_ok=True)
+            with self.subTest(engine=engine, case="stitched_across_captures_rejected"):
+                (self.tmp / "capture_seq.json").write_text(json.dumps([jsonl(frames[:1]), jsonl(frames[1:])]))
+                r_st, v_st = self.run_canary(
+                    "ok", "--mode", "full", FAKE_ENGINE=engine, HUB_CANARY_CAPTURE_TIMEOUT_S="0.35"
+                )
+                self.assertEqual(r_st.returncode, 1)
+                self.assertEqual((v_st["ok"], v_st["stage"], v_st["reason"]), (False, "capture", "no_output_beyond_prompt"))
+            (self.tmp / "capture_seq.json").unlink(missing_ok=True)
+
+        # 2. Direct parser parity with scripts.hub_acceptance_10.paired_stream_output_ok and strict engine isolation.
+        c_full = mod.Canary("full", "pair-check")
+        marker = c_full.marker
+        codex_ev = json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"type": "command_execution", "status": "completed", "exit_code": 0, "aggregated_output": marker},
+            }
+        )
+        go_ev = json.dumps(
+            {"type": "tool_use", "part": {"type": "tool", "tool": "bash", "state": {"status": "completed", "output": marker}}}
+        )
+        claude_ev = jsonl(provider_frames("claude", marker))
+        argon_ev = jsonl(provider_frames("antigravity", marker))
+        by_engine = {
+            "codex": codex_ev,
+            "zai": codex_ev,
+            "go": go_ev,
+            "claude": claude_ev,
+            "antigravity": argon_ev,
+        }
+        for eng, matching in by_engine.items():
+            self.assertTrue(c_full.output_has_marker(matching, engine=eng), eng)
+            self.assertFalse(c_full.output_has_marker(marker, engine=eng), eng)
+            for other_eng, other_payload in by_engine.items():
+                if {eng, other_eng} == {"codex", "zai"} or other_eng == eng:
+                    continue
+                self.assertFalse(c_full.output_has_marker(other_payload, engine=eng), (eng, other_eng))
+
+        c_shell = mod.Canary("shell", "shell-check")
+        self.assertTrue(c_shell.output_has_marker("CANARY-OK\n"))
+        self.assertFalse(c_shell.output_has_marker(json.dumps({"type": "result", "result": "CANARY-OK"})))
+
+        # 3. Claude rejection matrix (orphans, reused IDs, errors, interruptions, prose/result, malformed middle).
+        claude_changes = [
+            lambda f: f[:1],
+            lambda f: f[1:],
+            lambda f: (f[1].update(session_id="99999999-2222-4333-8444-555555555555") or f),
+            lambda f: (f[0].update(session_id="not-provider-session") or f),
+            lambda f: (f[0]["message"]["content"][0].update(name="Read") or f),
+            lambda f: (f[1]["message"]["content"][0].update(tool_use_id="toolu_other") or f),
+            lambda f: (f[1]["message"]["content"][0].update(is_error=True) or f),
+            lambda f: (f[1]["message"]["content"][0].pop("is_error", None), f)[1],
+            lambda f: (f[1]["tool_use_result"].update(interrupted=True) or f),
+            lambda f: (f[1]["tool_use_result"].pop("interrupted", None), f)[1],
+            lambda f: (f[1]["tool_use_result"].update(stdout="different output") or f),
+            lambda f: (f[1]["tool_use_result"].update(stderr="synthetic error") or f),
+            lambda f: (f[1]["message"].update(role="assistant") or f),
+            lambda f: (f[1].pop("tool_use_result") and f),
+            lambda f: (f.append(copy.deepcopy(f[0])) or f),
+            lambda f: (f.append(copy.deepcopy(f[1])) or f),
+            lambda f: (f[1]["message"]["content"][0].update(type="text", text=marker) or f),
+            lambda f: [{"type": "result", "result": marker}],
+        ]
+        for change in claude_changes:
+            mutated = change(provider_frames("claude", marker))
+            text = jsonl(mutated)
+            self.assertFalse(c_full.output_has_marker(text, engine="claude"), text)
+            self.assertEqual(
+                mod.paired_stream_output_ok(text, marker, "claude"),
+                acc.paired_stream_output_ok(text, marker, "claude"),
+            )
+        base_claude = provider_frames("claude", marker)
+        malformed_claude = jsonl(base_claude[:1]) + "\nmalformed middle\n" + jsonl(base_claude[1:])
+        self.assertFalse(c_full.output_has_marker(malformed_claude, engine="claude"))
+
+        # 4. Argon rejection matrix (DONE-only, ACTIVE-only, mismatched identity/params, non-zero/fake exit wrapper).
+        argon_changes = [
+            lambda f: f[:1],
+            lambda f: f[1:],
+            lambda f: (f[1]["step_update"].update(conversation_id="99999999-2222-4333-8444-555555555555") or f),
+            lambda f: (f[1]["step_update"].update(step_index=8) or f),
+            lambda f: (f[1]["step_update"].update(step_index=True) or f),
+            lambda f: (f[1]["step_update"].update(tool_name="other_provider_tool") or f),
+            lambda f: (f[1]["step_update"]["tool_info"].update(name="other_tool") or f),
+            lambda f: (f[1]["step_update"]["tool_info"]["parameters"].update(CommandLine="different command") or f),
+            lambda f: (f[1]["step_update"].update(state="ERROR") or f),
+            lambda f: (f[1]["step_update"].update(error="synthetic error") or f),
+            lambda f: (f[1]["step_update"]["tool_info"].update(interrupted=True) or f),
+            lambda f: (f[0]["step_update"]["tool_info"].update(output=marker) or f),
+            lambda f: (f.append(copy.deepcopy(f[0])) or f),
+            lambda f: (f.append(copy.deepcopy(f[1])) or f),
+        ]
+        for change in argon_changes:
+            mutated = change(provider_frames("antigravity", marker))
+            text = jsonl(mutated)
+            self.assertFalse(c_full.output_has_marker(text, engine="antigravity"), text)
+            self.assertEqual(
+                mod.paired_stream_output_ok(text, marker, "antigravity"),
+                acc.paired_stream_output_ok(text, marker, "antigravity"),
+            )
+        valid_out = provider_frames("antigravity", marker)[1]["step_update"]["tool_info"]["output"]
+        for bad_out in (
+            marker,
+            "Command exited with code 0.\n\nCommand output:\n" + marker,
+            valid_out.replace("code 0.", "code 1.") + "\nCommand exited with code 0.\n" + marker,
+            valid_out.replace("Command output:", "Assistant output:"),
+            valid_out.replace("Created At: 2026-01-01T00:00:00+00:00", "Created At: invalid"),
+            valid_out.replace("Completed At: 2026-01-01T00:00:01+00:00", "Completed At: 2025-01-01T00:00:01+00:00"),
+        ):
+            frames = provider_frames("antigravity", marker)
+            frames[1]["step_update"]["tool_info"]["output"] = bad_out
+            text = jsonl(frames)
+            self.assertFalse(c_full.output_has_marker(text, engine="antigravity"), bad_out)
+            self.assertEqual(
+                mod.paired_stream_output_ok(text, marker, "antigravity"),
+                acc.paired_stream_output_ok(text, marker, "antigravity"),
+            )
 
 
 if __name__ == "__main__":
