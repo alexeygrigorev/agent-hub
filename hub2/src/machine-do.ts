@@ -621,6 +621,7 @@ export class MachineDO {
     const machineId = this.machineActor(actor, 'session:report');
     if (!machineId) return error('forbidden', 403);
     const body = await bodyObject(request, 12_288);
+    if(body.failure_kind!==undefined||body.native_outcome!==undefined)return await this.finishLegacyUnobserved(machineId,sessionId,body);
     if(body.no_dispatch!==undefined)return await this.finishWithoutDispatch(machineId,sessionId,body);
     const launchFailed=body.launch_failed===true;
     if(body.launch_failed!==undefined&&typeof body.launch_failed!=='boolean')return error('invalid_launch_failure',400);
@@ -658,8 +659,8 @@ export class MachineDO {
       &&this.db.one('SELECT operation_id FROM launch_admissions WHERE operation_id=? AND session_id=? AND epoch=?',row.operation_id,row.id,row.epoch);
     if (!lateLost&&!admittedAbort&&(launchFailed||row.state!=='running'||row.native_id!==body.native_id))return error('stale_or_unmatched_finish',409);
     const failureNotification=lateLaunchFailure
-      ? this.db.one<{id:string}>("SELECT id FROM machine_outbox WHERE operation_id=? AND id IN (?,?)",
-        row.operation_id,`reaped:${row.operation_id}:${row.epoch}`,`launch-refused:${row.operation_id}:${row.epoch}`)
+      ? this.db.one<{id:string}>("SELECT id FROM machine_outbox WHERE operation_id=? AND id IN (?,?,?)",
+        row.operation_id,`reaped:${row.operation_id}:${row.epoch}`,`launch-refused:${row.operation_id}:${row.epoch}`,`legacy-unobserved:${row.operation_id}:${row.epoch}`)
       : undefined;
     if(lateLaunchFailure&&!failureNotification)return error('launch_failure_notification_missing',409);
     const now = Date.now();
@@ -698,6 +699,68 @@ export class MachineDO {
     const forwarded = await this.flushOne(`finish:${row.operation_id}`);
     await this.scheduleNext();
     return json({ ok: true, session_id: sessionId, state, forwarded }, forwarded ? 201 : 202);
+  }
+
+  private async finishLegacyUnobserved(machineId:string,sessionId:string,body:JsonRecord):Promise<Response>{
+    if(body.failure_kind!=='legacy_census_absent'||body.native_outcome!=='unconfirmed'||body.launch_failed!==true
+      ||body.native_id!==null||typeof body.operation_id!=='string'||!Number.isSafeInteger(body.epoch)
+      ||Object.keys(body).some(key=>!['failure_kind','native_outcome','launch_failed','native_id','operation_id','epoch','evidence'].includes(key)))
+      return error('invalid_legacy_launch_failure',400);
+    const value=body.evidence;
+    if(!value||typeof value!=='object'||Array.isArray(value))return error('invalid_legacy_census',400);
+    const e=value as JsonRecord;
+    if(Object.keys(e).some(key=>!['source','started_at_ms','observed_at_ms','row_count','sha256','complete','match_count','workspace','tag','dispatch_provenance'].includes(key))
+      ||e.source!=='aplexer_all_registry_census'||e.dispatch_provenance!=='legacy_unknown'||e.complete!==true||e.match_count!==0
+      ||!Number.isSafeInteger(e.started_at_ms)||!Number.isSafeInteger(e.observed_at_ms)||Number(e.started_at_ms)<1
+      ||Number(e.observed_at_ms)<Number(e.started_at_ms)||Number(e.observed_at_ms)-Number(e.started_at_ms)>6000
+      ||Number(e.observed_at_ms)>Date.now()+5000||!Number.isSafeInteger(e.row_count)||Number(e.row_count)<0||Number(e.row_count)>5000
+      ||typeof e.sha256!=='string'||!/^[0-9a-f]{64}$/.test(e.sha256)||!boundedString(e.workspace,1024)||e.tag!=='task-hub2-'+sessionId)
+      return error('invalid_legacy_census',400);
+    const evidence={source:e.source,started_at_ms:e.started_at_ms,observed_at_ms:e.observed_at_ms,row_count:e.row_count,
+      sha256:e.sha256,complete:true,match_count:0,workspace:e.workspace,tag:e.tag,dispatch_provenance:e.dispatch_provenance};
+    const operation=body.operation_id,epoch=body.epoch as number,key='legacy-unobserved:'+operation+':'+epoch;
+    const digest=await sha256Hex(JSON.stringify(evidence));
+    this.db.transaction(this.ctx,()=>{
+      const row=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND machine_id=?',sessionId,machineId);
+      const admission=this.db.one<{observed_at:number}>('SELECT observed_at FROM launch_admissions WHERE operation_id=? AND session_id=? AND epoch=?',operation,sessionId,epoch);
+      const attempt=this.db.one<{state:string}>('SELECT state FROM machine_session_operations WHERE operation_id=? AND session_id=? AND epoch=?',operation,sessionId,epoch);
+      if(!row||!admission||!attempt||Number(evidence.started_at_ms)<admission.observed_at-5000)
+        throw new HttpError('stale_legacy_launch_failure',409);
+      const prior=this.db.one<{payload_json:string}>('SELECT payload_json FROM machine_outbox WHERE id=?',key);
+      if(prior){
+        if((this.parse(prior.payload_json) as JsonRecord).evidence_digest!==digest)throw new HttpError('legacy_launch_failure_conflict',409);
+        return;
+      }
+      const current=row.operation_id===operation&&row.epoch===epoch;
+      // Only the current attempt retains its launch specification. A prior
+      // accepted receipt above is the replay proof for superseded attempts.
+      const launch=this.parse(row.launch_json) as JsonRecord|null;
+      if(!current||!launch||!boundedString(launch.workspace,1024)||launch.workspace!==evidence.workspace)
+        throw new HttpError('legacy_launch_workspace_unverified',409);
+      if(row.native_id!==null)
+        throw new HttpError('stale_legacy_launch_failure',409);
+      if(current&&!['offered','claimed','expired','failed','stopped'].includes(row.state))
+        throw new HttpError('stale_legacy_launch_failure',409);
+      const now=Date.now();
+      const payload={operation_id:row.dispatch_id,attempt_operation_id:operation,session_id:sessionId,intake_id:row.intake_id,
+        machine_id:machineId,epoch,native_id:null,reason:'legacy_launch_unobserved',launch_failed:true,
+        native_outcome:'unconfirmed',failure_kind:'legacy_census_absent',historical_only:row.state==='expired',
+        evidence,evidence_digest:digest,observed_at:evidence.observed_at_ms};
+      if(current){
+        const active=['offered','claimed'].includes(row.state);
+        const previous=this.parse(row.evidence_json) as JsonRecord|null;
+        const storedEvidence=active?payload:{...previous,legacy_launch_recovery:payload};
+        this.db.run('UPDATE sessions SET state=?,evidence_json=?,updated_at=? WHERE id=?',active?'failed':row.state,JSON.stringify(storedEvidence),now,sessionId);
+        if(active){
+          this.db.run("UPDATE machine_session_operations SET state='failed' WHERE operation_id=? AND session_id=? AND epoch=?",operation,sessionId,epoch);
+          this.settlePendingCommands(row,now,'legacy_launch_unobserved',null);
+        }
+      }
+      this.insertOutbox(key,'legacy-launch-failure',operation,row.project_id,payload,now);
+    });
+    const forwarded=await this.flushOne(key)||!!this.db.one("SELECT id FROM machine_outbox WHERE id=? AND state='delivered'",key);
+    await this.scheduleNext();
+    return json({ok:true,launch_failed:true,native_outcome:'unconfirmed',forwarded},forwarded?200:202);
   }
 
   private async finishWithoutDispatch(machineId:string,sessionId:string,body:JsonRecord):Promise<Response>{
@@ -769,7 +832,8 @@ export class MachineDO {
         this.db.run("UPDATE machine_outbox SET state='delivered',updated_at=? WHERE id=? AND state='pending'",Date.now(),row.id);
         return true;
       }
-      const revocationReason = payload.no_dispatch===true ? 'native_dispatch_not_started'
+      const revocationReason = row.kind==='legacy-launch-failure' ? 'legacy_launch_unobserved'
+        : payload.no_dispatch===true ? 'native_dispatch_not_started'
         : row.kind==='lost' ? 'host_inventory_stale' : row.kind==='finish' ? 'native_exit_confirmed' : null;
       if(revocationReason){
         const revoked=await env.CONTROL.get(env.CONTROL.idFromName('global')).fetch('https://control.internal/_worker/revoke',{
@@ -786,14 +850,17 @@ export class MachineDO {
             throw new Error('launch_failure_notification_pending');
         }
       }
-      if(row.kind==='no-dispatch-revoke'){
+      // An expired attempt may already have fallen back on another Machine.
+      // Its original launch metadata remains here, so retain and revoke its
+      // history without requiring the successor Project to adopt that spec.
+      if(row.kind==='no-dispatch-revoke'||row.kind==='legacy-launch-failure'&&payload.historical_only===true){
         this.db.run("UPDATE machine_outbox SET state='delivered',updated_at=? WHERE id=? AND state='pending'",Date.now(),row.id);
         return true;
       }
       const stub = env.PROJECTS.get(env.PROJECTS.idFromName(row.project_id));
       const path = row.kind === 'finish' ? '/_internal/finish' : row.kind === 'started' ? '/_internal/started'
         : row.kind === 'auth-fallback' ? '/_internal/auth-fallback'
-        : row.kind === 'stopped' ? '/_internal/stopped' : (row.kind === 'reaped' || row.kind === 'lost') ? '/_internal/reaped'
+        : row.kind === 'stopped' ? '/_internal/stopped' : (row.kind === 'reaped' || row.kind === 'lost' || row.kind === 'legacy-launch-failure') ? '/_internal/reaped'
         : row.kind === 'claim' ? '/_internal/claim' : '/_internal/requeue';
       const response = await stub.fetch(`https://project.internal${path}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),

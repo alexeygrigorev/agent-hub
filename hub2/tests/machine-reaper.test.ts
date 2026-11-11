@@ -602,3 +602,117 @@ test('a pending timeout notification cannot delay exact worker revocation after 
  const notification=f.database.prepare('SELECT state FROM machine_outbox WHERE id=?').get('finish:op-'+session) as any;
  assert.equal(notification.state,'pending');
 });
+
+function legacyUnobserved(session:string,epoch:number){
+ const now=Date.now();
+ return {operation_id:'op-'+session,epoch,native_id:null,launch_failed:true,failure_kind:'legacy_census_absent',
+  native_outcome:'unconfirmed',evidence:{source:'aplexer_all_registry_census',started_at_ms:now-10,observed_at_ms:now,
+   row_count:77,sha256:'a'.repeat(64),complete:true,match_count:0,workspace:'/tmp',
+   tag:'task-hub2-'+session,dispatch_provenance:'legacy_unknown'}};
+}
+
+test('legacy census absence fails a bound attempt as unconfirmed and revokes before notifying Project',async()=>{
+ const f=fixture(1),session='legacy-unobserved',epoch=await startClaimed(f,session,null),receipt=legacyUnobserved(session,epoch);
+ receipt.evidence.workspace='/deleted/worktree';
+ f.database.prepare("UPDATE sessions SET launch_json=json_set(launch_json,'$.workspace',?) WHERE id=?").run(receipt.evidence.workspace,session);
+ f.clearCache();
+ f.database.prepare('INSERT INTO launch_admissions VALUES(?,?,?,?)').run(receipt.operation_id,session,epoch,Date.now()-100);
+ const path='/api/sessions/'+session+'/finish';
+ assert.equal((await f.call(path,'POST',receipt)).status,202);
+ assert.equal(f.events.some(event=>event.path==='/_internal/reaped'),false);
+ const row=f.database.prepare('SELECT state,native_id,evidence_json FROM sessions WHERE id=?').get(session) as any;
+ assert.equal(row.state,'failed');assert.equal(row.native_id,null);
+ assert.equal(JSON.parse(row.evidence_json).native_outcome,'unconfirmed');
+ assert.equal((await f.call(path,'POST',receipt)).status,200);
+ const event=f.events.find(event=>event.path==='/_internal/reaped')!;
+ assert.equal(event.body.reason,'legacy_launch_unobserved');
+ assert.equal(event.body.native_outcome,'unconfirmed');
+ assert.equal(event.body.evidence.workspace,'/deleted/worktree');
+ assert.equal(event.body.no_dispatch,undefined);assert.equal(event.body.native_exit_confirmed,undefined);
+ assert.equal(f.revocations.at(-1).operation_id,receipt.operation_id);assert.equal(f.revocations.at(-1).epoch,epoch);
+ assert.equal((await f.call(path,'POST',receipt)).status,200);
+ assert.equal(f.events.filter(event=>event.path==='/_internal/reaped').length,1);
+ assert.equal((await f.call(path,'POST',{...receipt,evidence:{...receipt.evidence,sha256:'b'.repeat(64)}})).status,409);
+ assert.equal(f.database.prepare('SELECT * FROM native_sessions WHERE session_id=?').get(session),undefined);
+});
+
+test('legacy absence receipt rejects invented exit, incomplete census and identity mismatches',async()=>{
+ const f=fixture(),session='legacy-invalid',epoch=await startClaimed(f,session,null),receipt=legacyUnobserved(session,epoch);
+ const path='/api/sessions/'+session+'/finish';
+ assert.equal((await f.call(path,'POST',receipt)).status,409);
+ f.database.prepare('INSERT INTO launch_admissions VALUES(?,?,?,?)').run(receipt.operation_id,session,epoch,Date.now()-100);
+ f.clearCache();
+ for(const invalid of [
+  {...receipt,native_exit_confirmed:true},{...receipt,no_dispatch:true},{...receipt,exit_code:0},
+  {...receipt,evidence:{...receipt.evidence,complete:false}},
+  {...receipt,evidence:{...receipt.evidence,row_count:5001}},
+  {...receipt,evidence:{...receipt.evidence,match_count:1}},
+  {...receipt,evidence:{...receipt.evidence,tag:'other-session'}},
+  {...receipt,evidence:{...receipt.evidence,secret:'must not persist'}},
+ ]){
+  assert.equal((await f.call(path,'POST',invalid)).status,400);
+ }
+ assert.equal((await f.call(path,'POST',{...receipt,epoch:epoch+1})).status,409);
+ const before=f.database.prepare('SELECT * FROM sessions WHERE id=?').get(session);
+ const operations=f.database.prepare('SELECT * FROM machine_session_operations WHERE session_id=?').all(session);
+ const outboxes=f.database.prepare('SELECT * FROM machine_outbox').all();
+ assert.equal((await f.call(path,'POST',{...receipt,evidence:{...receipt.evidence,workspace:'/wrong-worktree'}})).status,409);
+ assert.deepEqual(f.database.prepare('SELECT * FROM sessions WHERE id=?').get(session),before);
+ assert.deepEqual(f.database.prepare('SELECT * FROM machine_session_operations WHERE session_id=?').all(session),operations);
+ assert.deepEqual(f.database.prepare('SELECT * FROM machine_outbox').all(),outboxes);
+ assert.equal(f.revocations.length,0);
+ assert.equal(f.events.some(event=>event.path==='/_internal/reaped'),false);
+ f.database.prepare("UPDATE sessions SET launch_json='{}' WHERE id=?").run(session);
+ f.clearCache();
+ assert.equal((await f.call(path,'POST',receipt)).status,409);
+ assert.equal(f.revocations.length,0);
+ f.database.prepare("UPDATE sessions SET launch_json=?,state='running',native_id='bound-native' WHERE id=?").run((before as any).launch_json,session);
+ f.clearCache();
+ assert.equal((await f.call(path,'POST',receipt)).status,409);
+ assert.equal(f.revocations.length,0);
+ assert.equal(f.events.some(event=>event.path==='/_internal/reaped'),false);
+});
+
+test('a first legacy receipt for a superseded attempt refuses unavailable launch metadata without effects',async()=>{
+ const f=fixture(),session='legacy-superseded',epoch=await startClaimed(f,session,null),receipt=legacyUnobserved(session,epoch);
+ f.database.prepare('INSERT INTO launch_admissions VALUES(?,?,?,?)').run(receipt.operation_id,session,epoch,Date.now()-100);
+ f.database.prepare("UPDATE machine_session_operations SET state='expired' WHERE operation_id=?").run(receipt.operation_id);
+ f.database.prepare("UPDATE sessions SET operation_id='successor',epoch=?,state='running',native_id='successor-native' WHERE id=?").run(epoch+1,session);
+ f.clearCache();
+ const before=f.database.prepare('SELECT * FROM sessions WHERE id=?').get(session);
+ const outboxes=f.database.prepare('SELECT * FROM machine_outbox').all();
+ assert.equal((await f.call('/api/sessions/'+session+'/finish','POST',receipt)).status,409);
+ assert.deepEqual(f.database.prepare('SELECT * FROM sessions WHERE id=?').get(session),before);
+ assert.deepEqual(f.database.prepare('SELECT * FROM machine_outbox').all(),outboxes);
+ assert.equal(f.revocations.length,0);
+ assert.equal(f.events.some(event=>event.path==='/_internal/reaped'),false);
+});
+
+test('an already accepted legacy receipt remains replayable after its attempt is superseded',async()=>{
+ const f=fixture(),session='legacy-replayed-successor',epoch=await startClaimed(f,session,null),receipt=legacyUnobserved(session,epoch);
+ f.database.prepare('INSERT INTO launch_admissions VALUES(?,?,?,?)').run(receipt.operation_id,session,epoch,Date.now()-100);
+ assert.equal((await f.call('/api/sessions/'+session+'/finish','POST',receipt)).status,200);
+ f.database.prepare("UPDATE sessions SET operation_id='successor',epoch=?,state='running',native_id='successor-native',launch_json=? WHERE id=?")
+  .run(epoch+1,JSON.stringify({workspace:'/different-successor'}),session);
+ f.clearCache();
+ const before=f.database.prepare('SELECT * FROM sessions WHERE id=?').get(session);
+ assert.equal((await f.call('/api/sessions/'+session+'/finish','POST',receipt)).status,200);
+ assert.deepEqual(f.database.prepare('SELECT * FROM sessions WHERE id=?').get(session),before);
+ assert.deepEqual(f.revocations.map(value=>[value.operation_id,value.epoch]),[[receipt.operation_id,epoch]]);
+ assert.equal(f.events.filter(event=>event.path==='/_internal/reaped').length,1);
+});
+
+test('an expired legacy attempt retains its verified history and revokes without notifying a successor Project',async()=>{
+ const f=fixture(),session='legacy-expired-history',epoch=await startClaimed(f,session,null),receipt=legacyUnobserved(session,epoch);
+ f.database.prepare('INSERT INTO launch_admissions VALUES(?,?,?,?)').run(receipt.operation_id,session,epoch,Date.now()-100);
+ f.database.prepare("UPDATE sessions SET state='expired' WHERE id=?").run(session);
+ f.clearCache();
+ assert.equal((await f.call('/api/sessions/'+session+'/finish','POST',receipt)).status,200);
+ const current=f.database.prepare('SELECT state,evidence_json FROM sessions WHERE id=?').get(session) as any;
+ assert.equal(current.state,'expired');
+ assert.equal(JSON.parse(current.evidence_json).legacy_launch_recovery.native_outcome,'unconfirmed');
+ assert.deepEqual(f.revocations.map(value=>[value.operation_id,value.epoch]),[[receipt.operation_id,epoch]]);
+ assert.equal(f.events.some(event=>event.path==='/_internal/reaped'),false);
+ const outbox=f.database.prepare("SELECT state FROM machine_outbox WHERE kind='legacy-launch-failure'").get() as any;
+ assert.equal(outbox.state,'delivered');
+});
