@@ -280,21 +280,8 @@ jobs:
           tar -C "$BUNDLE_DIR" -cf - . | ssh -i "$RUNNER_TEMP/agent-hub-ssh/hub_vm_key" \
             -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
             -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
-            "$SSH_TARGET" bash -s -- "$DEPLOY_SHA" <<'STAGE_EOF'
-          set -euo pipefail
-          deploy_sha="$1"
-          [[ "$deploy_sha" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid deploy commit" >&2; exit 2; }
-          tmp_root="/opt/agent-hub/.local/tmp"
-          target_dir="$tmp_root/ci-cli-release-$deploy_sha"
-          stage_dir="$tmp_root/ci-cli-release-$deploy_sha.stage-$$"
-          mkdir -p "$tmp_root"
-          chmod 750 "$tmp_root"
-          rm -rf -- "$stage_dir"
-          mkdir -m 700 "$stage_dir"
-          tar -C "$stage_dir" --no-same-owner --no-same-permissions -xf -
-          rm -rf -- "$target_dir"
-          mv -T -- "$stage_dir" "$target_dir"
-          STAGE_EOF
+            "$SSH_TARGET" \
+            "set -euo pipefail; deploy_sha='$DEPLOY_SHA'; [[ \"\$deploy_sha\" =~ ^[0-9a-f]{40}\$ ]]; tmp_root=/opt/agent-hub/.local/tmp; target_dir=\"\$tmp_root/ci-cli-release-\$deploy_sha\"; stage_dir=\"\$tmp_root/ci-cli-release-\$deploy_sha.stage-\$\$\"; mkdir -p \"\$tmp_root\"; chmod 750 \"\$tmp_root\"; rm -rf -- \"\$stage_dir\"; mkdir -m 700 \"\$stage_dir\"; trap 'rm -rf -- \"\$stage_dir\"' EXIT; tar -C \"\$stage_dir\" --no-same-owner --no-same-permissions -xf -; rm -rf -- \"\$target_dir\"; mv -T -- \"\$stage_dir\" \"\$target_dir\"; trap - EXIT"
       - name: Deploy validated revision through the fixed VM transaction script
         id: deploy_vm
         env:
