@@ -21,7 +21,7 @@ else
   CLI_RELEASE_ROOT=/var/lib/agent-hub/cli-releases
   DB_DIR=/var/lib/agent-hub/hub2-db
   POLICY_URL=http://127.0.0.1:8787
-  POLICY_CREDENTIAL=/var/lib/agent-hub/deploy-credentials/model-policy-admin.json
+  POLICY_CREDENTIAL=/etc/agent-hub/deploy-credentials/model-policy-admin.json
 fi
 CADDY_BIN=caddy
 TMPDIR="$REPO/.local/tmp"

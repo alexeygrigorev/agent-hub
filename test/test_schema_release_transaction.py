@@ -545,6 +545,15 @@ print('{"ok":true}')
         self.assertEqual(self.policy.current, before)
         self.assertEqual(self.git(self.repo, 'rev-parse', 'HEAD'), self.previous)
 
+    def test_production_policy_credential_default_is_under_root_configuration_tree(self):
+        expected = '/etc/agent-hub/deploy-credentials/model-policy-admin.json'
+        # Read only the production branch: test-mode overrides must not hide a
+        # drift back into the service-owned database/transaction directory.
+        production = TRANSACTION.read_text().split('\nelse\n', 1)[1].split('\nfi\n', 1)[0]
+        self.assertIn('  POLICY_CREDENTIAL=' + expected, production.splitlines())
+        self.assertNotIn('/var/lib/agent-hub/deploy-credentials', production)
+        self.assertIn('`' + expected + '`', (ROOT / 'docs/MODEL-POLICY-RECOVERY.md').read_text())
+
     def test_explicit_private_admin_credential_required_before_checkout(self):
         for kind in ('missing', 'public', 'symlink'):
             with self.subTest(kind=kind):
