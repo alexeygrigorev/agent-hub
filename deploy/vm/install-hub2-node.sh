@@ -122,7 +122,6 @@ import stat
 import subprocess
 import sys
 import tempfile
-import time
 import uuid
 from pathlib import Path
 
@@ -146,52 +145,14 @@ if schema_mode:
     updates["HUB2_SCHEMA_MIGRATIONS"] = schema_mode
 
 
-class _CapHeader(ctypes.Structure):
-    _fields_ = [("version", ctypes.c_uint32), ("pid", ctypes.c_int)]
-
-
-class _CapData(ctypes.Structure):
-    _fields_ = [("effective", ctypes.c_uint32), ("permitted", ctypes.c_uint32), ("inheritable", ctypes.c_uint32)]
-
-
-def _mkdir_as_service_uid(parent_fd: int, name: str, owner_uid: int, owner_gid: int) -> None:
-    old_umask = os.umask(0o077)
-    switched = False
-    libc = ctypes.CDLL(None, use_errno=True)
-    try:
-        if os.geteuid() == 0 and (owner_uid != 0 or owner_gid != 0):
-            if libc.prctl(8, 1, 0, 0, 0) != 0:
-                raise OSError(ctypes.get_errno(), "prctl PR_SET_KEEPCAPS failed")
-            os.setegid(owner_gid)
-            os.seteuid(owner_uid)
-            switched = True
-            hdr = _CapHeader(0x20080522, 0)
-            data = (_CapData * 2)()
-            # Keep only CAP_DAC_OVERRIDE (bit 1) while creating the service-owned directory inside root-owned parent.
-            data[0].effective = 1 << 1
-            data[0].permitted = 1 << 1
-            data[0].inheritable = 0
-            if libc.capset(ctypes.byref(hdr), ctypes.byref(data)) != 0:
-                raise OSError(ctypes.get_errno(), "capset CAP_DAC_OVERRIDE failed")
-        os.mkdir(name, 0o700, dir_fd=parent_fd)
-    finally:
-        if switched:
-            try:
-                os.seteuid(0)
-                os.setegid(0)
-            finally:
-                libc.prctl(8, 0, 0, 0, 0)
-        os.umask(old_umask)
-
-
-def _publish_directory(parent_fd: int, staging: str, target: str) -> None:
+def _publish_directory(src_dir_fd: int, src_name: str, dst_dir_fd: int, dst_name: str) -> None:
     libc = ctypes.CDLL(None, use_errno=True)
     rename = getattr(libc, "renameat2", None)
     if rename is None:
         raise ValueError("renameat2 unavailable")
     rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
     rename.restype = ctypes.c_int
-    if rename(parent_fd, os.fsencode(staging), parent_fd, os.fsencode(target), 1) != 0:
+    if rename(src_dir_fd, os.fsencode(src_name), dst_dir_fd, os.fsencode(dst_name), 1) != 0:
         raise OSError(ctypes.get_errno(), "exclusive evidence root publication refused")
 
 
@@ -199,6 +160,8 @@ def ensure_private_evidence_root(target_root: Path, owner_uid: int, owner_gid: i
     raw = os.fspath(target_root)
     if not os.path.isabs(raw) or os.path.normpath(raw) != raw or "\x00" in raw or len(target_root.parts) < 2:
         raise ValueError("invalid evidence root path")
+    caller_uid = os.geteuid()
+    caller_gid = os.getegid()
     fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
     try:
         for part in target_root.parent.parts[1:]:
@@ -213,43 +176,91 @@ def ensure_private_evidence_root(target_root: Path, owner_uid: int, owner_gid: i
         try:
             linfo = os.stat(leaf, dir_fd=fd, follow_symlinks=False)
         except FileNotFoundError:
-            scan_fd = os.dup(fd)
+            box = ".stage-box-" + uuid.uuid4().hex
+            child_name = "evidence-root"
+            box_fd = None
+            child_fd = None
+            box_identity = None
+            published = False
             try:
-                with os.scandir(scan_fd) as entries:
-                    existing_inodes = {entry.inode() for entry in entries}
-            finally:
-                os.close(scan_fd)
-            # Sleep across a kernel timestamp tick so any pre-existing directory renamed into
-            # staging during a raced mkdir has st_mtime_ns < st_ctime_ns and is rejected.
-            time.sleep(0.01)
-            staging = ".stage-root-" + uuid.uuid4().hex
-            staging_fd = None
-            try:
-                _mkdir_as_service_uid(fd, staging, owner_uid, owner_gid)
-                slinfo = os.stat(staging, dir_fd=fd, follow_symlinks=False)
-                if not stat.S_ISDIR(slinfo.st_mode):
-                    raise ValueError("staging evidence root must be a real directory")
-                staging_fd = os.open(staging, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
-                sinfo = os.fstat(staging_fd)
+                old_umask = os.umask(0o077)
+                try:
+                    os.mkdir(box, 0o700, dir_fd=fd)
+                finally:
+                    os.umask(old_umask)
+                blinfo = os.stat(box, dir_fd=fd, follow_symlinks=False)
+                if not stat.S_ISDIR(blinfo.st_mode):
+                    raise ValueError("staging container must be a real directory")
+                box_fd = os.open(box, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                binfo = os.fstat(box_fd)
                 if (
-                    not stat.S_ISDIR(sinfo.st_mode)
-                    or (slinfo.st_dev, slinfo.st_ino) != (sinfo.st_dev, sinfo.st_ino)
-                    or sinfo.st_ino in existing_inodes
-                    or sinfo.st_uid != owner_uid
-                    or sinfo.st_gid != owner_gid
-                    or stat.S_IMODE(sinfo.st_mode) != 0o700
-                    or sinfo.st_nlink != 2
-                    or sinfo.st_mtime_ns != sinfo.st_ctime_ns
-                    or os.listdir(staging_fd)
+                    not stat.S_ISDIR(binfo.st_mode)
+                    or (blinfo.st_dev, blinfo.st_ino) != (binfo.st_dev, binfo.st_ino)
+                    or binfo.st_uid != caller_uid
+                    or binfo.st_gid != caller_gid
+                    or stat.S_IMODE(binfo.st_mode) != 0o700
+                    or binfo.st_nlink != 2
+                    or os.listdir(box_fd)
                 ):
-                    raise ValueError("staging evidence root failed provenance verification")
-                os.fsync(staging_fd)
-                _publish_directory(fd, staging, leaf)
+                    raise ValueError("staging container failed verification")
+                box_identity = (binfo.st_dev, binfo.st_ino)
+                old_umask = os.umask(0o077)
+                try:
+                    os.mkdir(child_name, 0o700, dir_fd=box_fd)
+                finally:
+                    os.umask(old_umask)
+                clinfo = os.stat(child_name, dir_fd=box_fd, follow_symlinks=False)
+                if not stat.S_ISDIR(clinfo.st_mode):
+                    raise ValueError("staged evidence root must be a real directory")
+                child_fd = os.open(child_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=box_fd)
+                cinfo = os.fstat(child_fd)
+                if (
+                    not stat.S_ISDIR(cinfo.st_mode)
+                    or (clinfo.st_dev, clinfo.st_ino) != (cinfo.st_dev, cinfo.st_ino)
+                    or cinfo.st_uid != caller_uid
+                    or cinfo.st_gid != caller_gid
+                    or stat.S_IMODE(cinfo.st_mode) != 0o700
+                    or cinfo.st_nlink != 2
+                    or os.listdir(child_fd)
+                    or os.listdir(box_fd) != [child_name]
+                    or os.fstat(box_fd).st_nlink != 3
+                ):
+                    raise ValueError("staged evidence root failed verification")
+                if (cinfo.st_uid, cinfo.st_gid) != (owner_uid, owner_gid):
+                    os.fchown(child_fd, owner_uid, owner_gid)
+                    cinfo = os.fstat(child_fd)
+                cur_box = os.stat(box, dir_fd=fd, follow_symlinks=False)
+                if (
+                    (cur_box.st_dev, cur_box.st_ino) != box_identity
+                    or cinfo.st_uid != owner_uid
+                    or cinfo.st_gid != owner_gid
+                    or stat.S_IMODE(cinfo.st_mode) != 0o700
+                    or cinfo.st_nlink != 2
+                    or os.listdir(child_fd)
+                ):
+                    raise ValueError("staged evidence root ownership verification failed")
+                os.fsync(child_fd)
+                _publish_directory(box_fd, child_name, fd, leaf)
+                published = True
                 os.fsync(fd)
-                expected_identity = (sinfo.st_dev, sinfo.st_ino)
+                expected_identity = (cinfo.st_dev, cinfo.st_ino)
             finally:
-                if staging_fd is not None:
-                    os.close(staging_fd)
+                if child_fd is not None:
+                    os.close(child_fd)
+                if box_fd is not None:
+                    if not published:
+                        try:
+                            os.rmdir(child_name, dir_fd=box_fd)
+                        except OSError:
+                            pass
+                    os.close(box_fd)
+                if box_identity is not None:
+                    try:
+                        cur_box = os.stat(box, dir_fd=fd, follow_symlinks=False)
+                        if stat.S_ISDIR(cur_box.st_mode) and (cur_box.st_dev, cur_box.st_ino) == box_identity:
+                            os.rmdir(box, dir_fd=fd)
+                    except OSError:
+                        pass
             linfo = os.stat(leaf, dir_fd=fd, follow_symlinks=False)
         if not stat.S_ISDIR(linfo.st_mode):
             raise ValueError("evidence root must be a 0700 directory")
