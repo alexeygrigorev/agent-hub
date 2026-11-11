@@ -1094,8 +1094,8 @@ class TestNativeControlCli(unittest.TestCase):
 
     def test_native_send_and_invalid_composite_never_call_api(self):
         with patch.object(session_control, 'request') as call:
-            with self.assertRaisesRegex(ValueError, 'native_send_unsupported_safe_input'):
-                session_control.execute(self.parse('send', self.native, '--prompt', 'do not paste'))
+            with self.assertRaisesRegex(ValueError, 'invalid_native_send_text'):
+                session_control.execute(self.parse('send', self.native, '--prompt', 'bad\x1b[200~'))
             with self.assertRaisesRegex(ValueError, 'invalid_native_target'):
                 session_control.execute(self.parse('stop', 'native:host-one:tag-ambiguous'))
         call.assert_not_called()
@@ -1111,3 +1111,45 @@ class TestNativeControlCli(unittest.TestCase):
         with patch.object(session_control, 'request', return_value={'commands': []}) as call:
             session_control.execute(self.parse('commands', self.native))
         call.assert_called_once_with('GET', self.path)
+
+    def send_receipts(self):
+        public={'id':self.command,'target_kind':'native','kind':'send','machine_id':'host-one',
+            'native_id':self.native.split(':')[2],'deadline_ms':1800000000000}
+        proof={'version':1,'session_id':public['native_id'],'operation_id':self.command,
+            'request_sha256':'a'*64,'deadline_ms':public['deadline_ms'],'status':'submitted_verified',
+            'reason':'submission_observed','mutation':True,'landed':True,'submitted':True,'consumed':None}
+        return {'command':public},{'command':{**public,'state':'acked','ack':{'submitted':True,'consumed':None,'submission':proof}}}
+
+    def test_native_strict_send_delegates_text_and_reports_submission_without_consumption(self):
+        receipt,entry=self.send_receipts()
+        with patch.object(session_control,'request',side_effect=[receipt,entry]) as call:
+            result=session_control.execute(self.parse('send',self.native,'--prompt','owned π text','--key','send-once','--wait'))
+        self.assertEqual(call.call_args_list[0].args,('POST',self.path,{'kind':'send','key':'send-once','text':'owned π text'}))
+        self.assertEqual(call.call_args_list[1].args,('GET',self.path+'/'+self.command))
+        self.assertIsNone(result['command_wait']['ack']['consumed'])
+        self.assertNotIn('owned π text',json.dumps(result))
+
+    def test_native_send_byte_limits_controls_and_missing_text_refuse_before_api(self):
+        for text in ('',' ','a'*8193,'界'*2731,'x\x1b','x\x00','x\u0080','\ud800'):
+            with self.subTest(size=len(text)),patch.object(session_control,'request') as call:
+                with self.assertRaises(ValueError):session_control.execute(self.parse('send',self.native,'--prompt',text))
+                call.assert_not_called()
+        receipt,_=self.send_receipts()
+        with patch.object(session_control,'request',return_value=receipt) as call:
+            session_control.execute(self.parse('send',self.native,'--prompt','a'*8192,'--key','max-ascii'))
+        self.assertEqual(len(call.call_args.args[2]['text'].encode()),8192)
+
+    def test_native_send_uncertain_refused_or_wrong_positive_receipt_never_reports_success(self):
+        for changes in ({'status':'uncertain'},{'consumed':True},{'mutation':False},{'session_id':self.command},
+                        {'operation_id':'33333333-3333-4333-8333-333333333333'}, {'deadline_ms':1},
+                        {'version':True}, {'request_sha256':'not-a-digest'}):
+            receipt,entry=self.send_receipts();entry['command']['ack']['submission'].update(changes)
+            with self.subTest(changes=changes),patch.object(session_control,'request',side_effect=[receipt,entry]) as call:
+                with self.assertRaisesRegex(ValueError,'native_send_unconfirmed'):
+                    session_control.execute(self.parse('send',self.native,'--prompt','owned text','--wait','--key','once'))
+                self.assertEqual(sum(c.args[0]=='POST' for c in call.call_args_list),1)
+        receipt,entry=self.send_receipts();entry['command'].update(state='failed',ack={'error':'native_send_uncertain','consumed':None})
+        with patch.object(session_control,'request',side_effect=[receipt,entry]) as call:
+            with self.assertRaisesRegex(ValueError,'native_send_uncertain'):
+                session_control.execute(self.parse('send',self.native,'--prompt','owned text','--wait','--key','same'))
+            self.assertEqual(call.call_count,2)

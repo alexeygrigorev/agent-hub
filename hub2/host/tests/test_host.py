@@ -44,6 +44,18 @@ class FakeNative:
             return subprocess.CompletedProcess(args, 0, json.dumps(rows), "")
         if command[0] == "status":
             return subprocess.CompletedProcess(args, 0 if self.process else 1, json.dumps(self.process), "")
+        if command[0] == 'send' and '--strict' in command:
+            if self.fail_send:
+                raise subprocess.TimeoutExpired(args, options['timeout'])
+            operation = command[command.index('--idempotency-key')+1]
+            deadline = int(command[command.index('--deadline-ms')+1])
+            digest = hashlib.sha256(json.dumps([command[1], operation,
+                command[command.index('--expect-tag')+1], command[command.index('--expect-workspace')+1],
+                int(command[command.index('--expect-created-at-ms')+1]), deadline, options['input']], ensure_ascii=False, separators=(',', ':')).encode()).hexdigest()
+            receipt = {'version':1,'session_id':command[1],'operation_id':operation,'request_sha256':digest,
+                'deadline_ms':deadline,'status':'submitted_verified','mutation':True,'landed':True,'submitted':True,
+                'consumed':None,'reason':'submission_observed',**getattr(self,'strict_changes',{})}
+            return subprocess.CompletedProcess(args, 0 if receipt['status']=='submitted_verified' else 4, json.dumps(receipt), '')
         if command[0] == "send" and self.fail_send:
             raise TimeoutError()
         if command[0] == "kill":
@@ -1341,11 +1353,19 @@ class NativeControlTests(unittest.TestCase):
     def command(self, kind='stop', **changes):
         native = '11111111-1111-4111-8111-111111111111'
         self.native.process = {'id': native, 'tag': 'unmanaged', 'workspace': str(self.root),
-                               'phase': 'running', 'schema_version': 1}
-        return {'id': '22222222-2222-4222-8222-222222222222', 'target_kind': 'native',
+            'phase': 'running', 'state':'running', 'worker_alive':True, 'created_at_ms':42, 'schema_version': 1}
+        command = {'id': '22222222-2222-4222-8222-222222222222', 'target_kind': 'native',
                 'protocol': 1, 'machine_id': 'machine-1', 'native_id': native, 'kind': kind,
                 'identity': {'id': native, 'tag': 'unmanaged', 'workspace': str(self.root)},
                 'deadline_ms': round(time.time()*1000)+60000, **changes}
+        if kind == 'send':
+            text=changes.get('text','owned synthetic input')
+            command.pop('text',None)
+            digest=hashlib.sha256(json.dumps([native,command['id'],'unmanaged',str(self.root),42,command['deadline_ms'],text],
+                ensure_ascii=False,separators=(',',':')).encode()).hexdigest()
+            command['submission']={'operation_id':command['id'],'created_at_ms':42,'deadline_ms':command['deadline_ms'],
+                'text':text,'request_sha256':digest}
+        return command
 
     def test_stop_positive_exit_replays_after_lost_ack_without_second_kill(self):
         command = self.command()
@@ -1409,7 +1429,7 @@ class NativeControlTests(unittest.TestCase):
         self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM launches').fetchone()[0], 0)
 
     def test_send_expiry_and_managed_native_have_no_native_effect(self):
-        for kind, extra, reason in [('send', {}, 'native_send_unsupported_safe_input'),
+        for kind, extra, reason in [('send', {'deadline_ms': 1}, 'native_command_deadline'),
                                     ('stop', {'deadline_ms': 1}, 'native_command_deadline')]:
             command = self.command(kind, **extra)
             result = self.bridge.command(command)
@@ -1420,6 +1440,57 @@ class NativeControlTests(unittest.TestCase):
         result = self.bridge.command(command)
         self.assertEqual(result['error'], 'native_target_managed')
         self.assertEqual(self.native.calls, [])
+
+    def test_strict_send_is_journaled_before_effect_and_replay_after_restart_never_sends_twice(self):
+        command=self.command('send',text='owned π input\nsecond line')
+        original=self.native.__call__
+        def checked_runner(args,**kw):
+            if args[1]=='send':
+                row=self.journal.db.execute('SELECT state FROM commands WHERE id=?',(command['id'],)).fetchone()
+                self.assertEqual(row['state'],'executing')
+                self.assertNotIn(command['submission']['text'],' '.join(args))
+            return original(args,**kw)
+        self.bridge.launcher.runner=checked_runner
+        result=self.bridge.command(command)
+        self.assertEqual(result['submission']['status'],'submitted_verified')
+        self.assertIsNone(result['submission']['consumed'])
+        self.assertEqual(set(command['identity']),{'id','tag','workspace'})
+        self.client.fail=True
+        with self.assertRaises(ApiError):self.journal.flush(self.client)
+        self.journal.db.close()
+        self.journal=Journal(self.root/'private/journal.sqlite');self.bridge.journal=self.journal
+        self.bridge.launcher.journal=self.journal
+        self.assertEqual(self.bridge.command(command),result)
+        self.assertEqual(sum(args[1]=='send' for args,_ in self.native.calls),1)
+        changed=self.command('send',text='changed immutable text')
+        with self.assertRaisesRegex(ValueError,'command_id_conflict'):self.bridge.command(changed)
+        self.client.fail=False;self.journal.flush(self.client)
+        self.assertNotIn(command['submission']['text'],json.dumps(self.client.calls))
+
+    def test_uncertain_strict_send_is_terminal_and_executing_restart_never_dispatches(self):
+        command=self.command('send');self.native.fail_send=True
+        result=self.bridge.command(command)
+        self.assertEqual(result['error'],'native_send_uncertain')
+        self.native.fail_send=False
+        self.assertEqual(self.bridge.command(command),result)
+        self.assertEqual(sum(args[1]=='send' for args,_ in self.native.calls),1)
+        second=self.command('send',id='33333333-3333-4333-8333-333333333333')
+        from agent_hub_host.native_launch import canonical
+        with self.journal.db:self.bridge.begin_command(second['id'],hashlib.sha256(canonical(second).encode()).hexdigest())
+        self.journal.db.close();self.journal=Journal(self.root/'private/journal.sqlite')
+        self.bridge.journal=self.journal;self.bridge.launcher.journal=self.journal
+        self.assertEqual(self.bridge.command(second)['error'],'native_command_outcome_uncertain')
+        self.assertEqual(sum(args[1]=='send' for args,_ in self.native.calls),1)
+
+    def test_strict_send_rechecks_managed_transition_after_census(self):
+        command=self.command('send');collect=self.bridge.launcher.inventory
+        def raced():
+            observed=collect()
+            self.journal.db.execute("INSERT INTO launches(operation_id,session_id,epoch,digest,workspace,tag,native_id,state) VALUES('op','managed',1,'digest',?,?,?,'running')",(str(self.root),'managed',command['native_id']))
+            return observed
+        self.bridge.launcher.inventory=raced
+        self.assertEqual(self.bridge.command(command)['error'],'native_target_managed')
+        self.assertFalse(any(args[1]=='send' for args,_ in self.native.calls))
 
     def test_executing_receipt_after_restart_is_uncertain_without_redispatch(self):
         command = self.command()
