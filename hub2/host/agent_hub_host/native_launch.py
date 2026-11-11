@@ -68,6 +68,10 @@ LOCAL_ROUTES = {
     "claude": {"provider": "claude", "engine": "claude"},
     "antigravity": {"provider": "antigravity", "profile": "hub-hub-antigravity"},
 }
+HEADLESS_OUTPUT_FLAGS = {
+    'claude': ('--output-format', 'stream-json', '--verbose'),
+    'antigravity': ('--output-format', 'stream-json'),
+}
 
 
 def native_returncode(value):
@@ -192,6 +196,13 @@ def adapter_argv(provider, goal, model):
     return [binary, '--dangerously-skip-permissions', '--model', str(model), '-p', goal]
 
 
+def _headless_insert_flags(provider, argv, flags):
+    # Agy consumes the argument immediately after -p as its prompt. Options
+    # belong before that pair. Profile callers use a single prompt placeholder.
+    index = -2 if provider == 'antigravity' and len(argv) >= 2 and argv[-2] == '-p' else -1
+    return [*argv[:index], *flags, *argv[index:]]
+
+
 def headless_effort_argv(provider, argv, effort):
     if provider in {'codex', 'zai'}:
         value = 'xhigh' if effort == 'max' else effort
@@ -202,7 +213,7 @@ def headless_effort_argv(provider, argv, effort):
         flags = ['--effort', effort]
     else:
         raise ValueError('headless_effort_unsupported')
-    return [*argv[:-1], *flags, argv[-1]]
+    return _headless_insert_flags(provider, argv, flags)
 
 
 def interactive_argv(provider, argv, prompt, *, model, effort=None, with_goal=False):
@@ -657,8 +668,10 @@ class NativeLauncher:
                                      effort=specification.get("effort"), with_goal=specification.get("with_goal", False))
             if specification.get("with_goal"):
                 objective = goal_prompt(goal, specification["workspace"], task_id, str(fa_path))
-        elif specification.get("effort") is not None and not local:
-            child = headless_effort_argv(provider, child, specification["effort"])
+        elif not local:
+            if specification.get("effort") is not None:
+                child = headless_effort_argv(provider, child, specification["effort"])
+            child = _headless_insert_flags(provider, child, HEADLESS_OUTPUT_FLAGS.get(provider, ()))
         runtime_deadline = specification.get("runtime_deadline")
         if runtime_deadline is not None and (type(runtime_deadline) is not int or
                 not time.time() * 1000 < runtime_deadline <= (time.time() + specification["timeout_seconds"]) * 1000 + 5000):
@@ -795,6 +808,7 @@ class NativeLauncher:
         output_args = ['--output-dir', str(Path(specification['workspace']).resolve().joinpath(*output['parts']))] if output else []
         selector = ['--profile', profile] if profile else ['--engine', route.get('engine', provider)]
         args = ['--model', model]
+        args += HEADLESS_OUTPUT_FLAGS.get(provider, ())
         if provider == 'go':
             args += ['--format', 'json']
         effort = specification.get('effort')

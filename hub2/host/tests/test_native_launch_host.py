@@ -576,6 +576,8 @@ class LaunchReceiptTest(unittest.TestCase):
             self.assertEqual(captured['child'][0], binding['engine_binary_path'])
             self.assertEqual(captured['child'][captured['child'].index('--model') + 1], 'fable')
             self.assertEqual(captured['child'][captured['child'].index('--effort') + 1], 'medium')
+            self.assertEqual(captured['child'][captured['child'].index('--output-format') + 1], 'stream-json')
+            self.assertIn('--verbose', captured['child'])
 
     def test_wait_first_action_success_without_poll(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -794,3 +796,74 @@ class GoJsonOutputTests(unittest.TestCase):
             self.assertIn('--engine-arg=--format',argv);self.assertIn('--engine-arg=json',argv)
             self.assertIn('--engine-arg='+nl.OPENCODE_MODEL,argv)
             self.assertEqual(argv[argv.index('--profile')+1],nl.LOCAL_ROUTES['go']['profile'])
+
+
+class HeadlessStreamOutputTests(unittest.TestCase):
+    MODELS = {'claude': 'opus', 'antigravity': 'gemini-4-argon-medium'}
+
+    def launch(self, provider, *, effort=None, interactive=False, local=False):
+        parent = Path(__file__).resolve().parents[3] / '.local/tmp'
+        parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=parent, prefix='headless-stream-') as workspace:
+            captured = {}
+            native_id = 'd6cf9872-8597-48a5-be64-990cdef4db31'
+
+            def runner(argv, **options):
+                child = argv[argv.index('--') + 1:]
+                captured['child'] = child
+                captured['prompt'] = (Path(child[child.index('--prompt-file') + 1]).read_text()
+                                      if local else child[-1])
+                return subprocess.CompletedProcess(argv, 0, json.dumps({
+                    'id': native_id, 'tag': 'task-stream-test', 'workspace': workspace, 'command': child,
+                }), '')
+
+            adapter = nl.NativeLauncher({'private_provider_homes': not local,
+                                         'routes': {provider: nl.LOCAL_ROUTES[provider]}},
+                                        aplexer='synthetic-aplexer', runner=runner)
+            spec = {'workspace': workspace, 'engine': provider, 'model': self.MODELS[provider],
+                    'prompt': 'use the tool safely', 'interactive': interactive, 'timeout_seconds': 90,
+                    'operation_id': 'stream-operation', 'epoch': 1}
+            if effort is not None:
+                spec['effort'] = effort
+            with mock.patch.object(adapter, 'record_evidence'):
+                receipt = adapter.launch('stream-test', spec)
+            self.assertEqual(receipt['mode'], 'interactive' if interactive else 'headless')
+            self.assertEqual(captured['prompt'], nl.aplexer_prompt(spec['prompt'] + nl.FIRST_ACTION_INSTRUCTION.format(
+                path=Path(workspace) / '.local/first-action-stream-test.json')))
+            return captured['child'], captured['prompt']
+
+    def test_direct_headless_stream_flags_preserve_model_effort_and_argon_print_argument(self):
+        for effort in (None, 'medium'):
+            with self.subTest(provider='claude', effort=effort):
+                child, prompt = self.launch('claude', effort=effort)
+                self.assertEqual(child, ['claude', '--dangerously-skip-permissions', '--model', 'opus', '-p',
+                                        *(['--effort', effort] if effort else []),
+                                        '--output-format', 'stream-json', '--verbose', prompt])
+            with self.subTest(provider='antigravity', effort=effort):
+                child, prompt = self.launch('antigravity', effort=effort)
+                self.assertEqual(child, ['agy', '--model', self.MODELS['antigravity'], '--dangerously-skip-permissions',
+                                        *(['--effort', effort] if effort else []),
+                                        '--output-format', 'stream-json', '-p', prompt])
+
+    def test_local_profile_launch_forwards_stream_flags_and_preserves_first_action(self):
+        for provider in self.MODELS:
+            for effort in (None, 'medium'):
+                with self.subTest(provider=provider, effort=effort):
+                    child, _ = self.launch(provider, effort=effort, local=True)
+                    flags = [arg.split('=', 1)[1] for arg in child if arg.startswith('--engine-arg=')]
+                    self.assertEqual(flags, ['--model', self.MODELS[provider], '--output-format', 'stream-json',
+                                             *(['--verbose'] if provider == 'claude' else []),
+                                             *(['--effort', effort] if effort else [])])
+                    self.assertEqual(child[:3], ['synthetic-aplexer', 'task', 'run'])
+                    selector = '--profile' if provider == 'antigravity' else '--engine'
+                    self.assertEqual(child[child.index(selector) + 1],
+                                     'hub-hub-antigravity' if provider == 'antigravity' else 'claude')
+
+    def test_interactive_provider_argv_keeps_exact_original_bytes(self):
+        for effort in (None, 'medium'):
+            for provider in self.MODELS:
+                with self.subTest(provider=provider, effort=effort):
+                    child, prompt = self.launch(provider, effort=effort, interactive=True)
+                    prefix = (['claude', '--dangerously-skip-permissions', '--model', 'opus'] if provider == 'claude'
+                              else ['agy', '--model', self.MODELS[provider], '--dangerously-skip-permissions'])
+                    self.assertEqual(child, [*prefix, *(['--effort', effort] if effort else []), prompt])
