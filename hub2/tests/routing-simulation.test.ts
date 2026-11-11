@@ -32,6 +32,83 @@ function fixture(){
  return{env,get,state,calls,machines,accountRows};
 }
 
+function skewedFixture(){
+ const f=fixture();
+ for(const [id,remaining] of Object.entries({codex:56,claude:76,'shared-go':7,'zai-central':65,gemini:81.45}))
+  f.accountRows.get(id).quota.remaining=remaining;
+ return f;
+}
+
+test('skewed headroom keeps Go above three percent in the real simulation and draw',async()=>{
+ const f=skewedFixture();let index=0;
+ const result=await simulateModelRoutes(f.env,{interactive:false},1000,()=>((index++)+.5)/1000);
+ assert.deepEqual(result.share_floor,{minimum_share:.03,applied:true,reason:null});
+ assert.equal(result.pool.length,7);assert.equal(result.pool_degraded,false);
+ assert.ok(result.pool.every(row=>row.share>.03));
+ assert.ok(Math.abs(result.pool.reduce((sum,row)=>sum+row.share,0)-1)<1e-12);
+ const go=result.pool.find(row=>row.policy_id==='go-muse')!;
+ assert.ok(Math.abs(go.share-(.03+.79*7/417.45))<1e-12);
+ assert.deepEqual({...result.counts},{'codex-luna-max':136,'codex-sol-medium':136,'claude-sonnet-medium':174,
+  'go-muse':43,'claude-opus-medium':174,'zai-glm-flash':153,'antigravity-argon-medium':184});
+ // The actual start draw uses the same transformed weights, not just diagnostics.
+ const start=await pickModelRouteDetailed(f.env,{interactive:false},()=>.47);
+ assert.equal(start.route.policy_id,'go-muse');
+ assert.deepEqual(start.diagnostics.pool,result.pool);
+ const luna=result.pool.find(row=>row.policy_id==='codex-luna-max')!;
+ const others=result.pool.filter(row=>row!==luna);
+ assert.ok(luna.share<=others.reduce((sum,row)=>sum+row.share,0)/others.length);
+});
+
+test('exploration retains the five-percent eligibility boundary and cannot restore a depleted route',async()=>{
+ const f=skewedFixture();f.accountRows.get('shared-go').quota.remaining=5;
+ const atBoundary=await simulateModelRoutes(f.env,{interactive:false},1,()=>0);
+ assert.ok(atBoundary.pool.some(row=>row.policy_id==='go-muse'&&row.share>.03));
+ f.accountRows.get('shared-go').quota.remaining=4.99;
+ const below=await simulateModelRoutes(f.env,{interactive:false},1000,()=>.5);
+ assert.ok(!below.pool.some(row=>row.policy_id==='go-muse'));
+ assert.equal(below.counts['go-muse'],undefined);
+ assert.ok(below.excluded.some(row=>row.policy_id==='go-muse'&&row.reason==='quota_below_minimum'));
+ assert.ok(below.pool.every(row=>row.share>.03));
+});
+
+test('exploration preserves stale-neutral headroom, quota influence and underlying deep multipliers',async()=>{
+ const f=skewedFixture();f.accountRows.get('shared-go').fresh=false;
+ const stale=await simulateModelRoutes(f.env,{interactive:false},1,()=>0);
+ assert.ok(Math.abs(stale.pool.find(row=>row.policy_id==='go-muse')!.share-(.03+.79*50/460.45))<1e-12);
+ assert.ok(stale.warnings.some(row=>row.account_id==='shared-go'&&row.reason==='quota_stale'));
+ f.accountRows.get('shared-go').fresh=true;
+ const ordinary=await simulateModelRoutes(f.env,{interactive:false},1,()=>0);
+ assert.ok(stale.pool.find(row=>row.policy_id==='go-muse')!.share>ordinary.pool.find(row=>row.policy_id==='go-muse')!.share);
+ const deep=await simulateModelRoutes(f.env,{interactive:false,tier:'deep'},1,()=>0);
+ assert.ok(deep.pool.every(row=>row.share>.03));
+ assert.ok(Math.abs(deep.pool.find(row=>row.policy_id==='codex-sol-medium')!.share-(.03+.79*168/681.45))<1e-12);
+ assert.ok(Math.abs(deep.pool.find(row=>row.policy_id==='claude-opus-medium')!.share-(.03+.79*228/681.45))<1e-12);
+});
+
+test('Luna mean clipping and candidate shares survive skew and additional hosts',async()=>{
+ const f=skewedFixture();
+ for(const [id,row] of f.accountRows)row.quota.remaining=id==='codex'?100:5;
+ const original=await simulateModelRoutes(f.env,{interactive:false},1,()=>0);
+ const luna=original.pool.find(row=>row.policy_id==='codex-luna-max')!;
+ assert.ok(Math.abs(luna.share-1/7)<1e-12,'clipped Luna equals the other six candidates mean');
+ f.machines.set('h2',{machine_id:'h2',connected:true,engines:['codex'],capabilities:[flags()[0]]});
+ const expanded=await simulateModelRoutes(f.env,{interactive:false},1,()=>0);
+ assert.deepEqual(expanded.pool,original.pool);
+ assert.deepEqual(expanded.share_floor,original.share_floor);
+});
+
+test('exploration remains feasible at the existing maximum policy size and for an eight-member pool',async()=>{
+ const f=skewedFixture(),go=f.state.policies.find((row:any)=>row.id==='go-muse');
+ // Additional distinct policy routes, without changing the production policy.
+ for(const size of [8,32]){
+  f.state.policies=Array.from({length:size},(_,i)=>({...go,id:`synthetic-route-${i}`,weight:i===0?.001:1}));
+  const result=await simulateModelRoutes(f.env,{interactive:false},1,()=>0);
+  assert.equal(result.pool.length,size);assert.equal(result.share_floor.applied,true);
+  assert.ok(result.pool.every(row=>row.share>.03));
+  assert.ok(Math.abs(result.pool.reduce((sum,row)=>sum+row.share,0)-1)<1e-12);
+ }
+});
+
 test('1000 simulated draws use one passive observation set and the committed Argon pool',async()=>{
  const f=fixture();let index=0;
  const result=await simulateModelRoutes(f.env,{interactive:false},1000,()=>((index++)+.5)/1000);

@@ -20,11 +20,13 @@ export type PickDiagnostics = {
   warnings?: Array<{ account_id: string; reason: 'quota_stale'; captured_at: number | null }>;
   advisories?: Array<{policy_id: string; account_id: string; reason: string}>;
   pool_degraded?: boolean;
+  share_floor?: { minimum_share: number; applied: boolean; reason: 'pool_too_large' | null };
 };
-// Weighting knobs, kept identical to ~/bin/model-roulette so both pools behave the same.
+// Base headroom knobs follow model-roulette; Hub adds exploration after Luna clipping.
 const MIN_HEADROOM = 5;      // % quota left below which a pool has no headroom
 const DEEP_BIAS = 3;         // opus/sol multiplier for tier deep/complex/serious
 const NEUTRAL_QUOTA = 50;    // unknown observations get a neutral weight, never fabricated quota
+const MIN_SHARE = 0.03;     // per eligible candidate; the remaining mass follows headroom
 const QUOTA_MAX_AGE_MS = 30 * 60 * 1000;
 const DEEP_TIERS = new Set(['deep', 'complex', 'serious']);
 export type PickInput = {
@@ -195,6 +197,17 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
   const others = pool.filter(row => !/luna/i.test(row.candidate.model)).map(row => row.base);
   const cap = others.length ? others.reduce((sum, weight) => sum + weight, 0) / others.length : Infinity;
   const weights = new Map(pool.map(row => [row.candidate.id, /luna/i.test(row.candidate.model) ? Math.min(row.base, cap) : row.base]));
+  // p_i = MIN_SHARE + (1 - N * MIN_SHARE) * q_i. Apply once per
+  // candidate, before host splitting. The affine mix preserves Luna's mean
+  // bound and quota ordering, but deliberately replaces exact proportionality.
+  // An oversized future pool cannot satisfy the floor: keep starts allowed,
+  // retain the original weights, and report that the guarantee is unavailable.
+  const residual = 1 - pool.length * MIN_SHARE;
+  const shareFloorApplied = residual > 0;
+  if (shareFloorApplied) {
+    const total = [...weights.values()].reduce((sum, weight) => sum + weight, 0);
+    for (const [id, weight] of weights) weights.set(id, MIN_SHARE * total + residual * weight);
+  }
 
   const options: Array<{ value: PickedRoute; weight: number }> = [];
   for (const { candidate, left, hosts: selectedHosts } of pool) {
@@ -217,5 +230,6 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
     row.weight += weight; row.share = row.weight / total; byPolicy.set(value.policy_id, row);
   }
   return { options, diagnostics: { pool: [...byPolicy.values()], excluded: dropped, warnings, advisories,
+    share_floor: { minimum_share: MIN_SHARE, applied: shareFloorApplied, reason: shareFloorApplied ? null : 'pool_too_large' as const },
     pool_degraded:new Set([...byPolicy.values()].map(row=>row.model)).size < 3 } };
 }
