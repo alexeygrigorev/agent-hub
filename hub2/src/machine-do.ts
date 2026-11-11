@@ -325,9 +325,12 @@ export class MachineDO {
     const capabilities=this.db.one<{engines_json:string;capabilities_json:string}>('SELECT engines_json,capabilities_json FROM machine_capabilities WHERE machine_id=?',machine.machine_id);
     // Report protocol skew for operators without changing socket admission or dispatch.
     const versionMismatch = release && release.protocol_version !== HOST_PROTOCOL_VERSION;
+    const visibleCapabilities=(capabilities?JSON.parse(capabilities.capabilities_json):[]) as string[];
+    const currentCapabilities=visibleCapabilities.filter(cap=>cap!==MANAGED_CLAUDE_CAPABILITY
+      ||connected&&this.managedClaudeAvailable(machine.machine_id));
     return json({machine_id:machine.machine_id,connected,...release,version_mismatch:versionMismatch,
       last_seen:machine.last_seen,os:machine.os,arch:machine.arch,labels:JSON.parse(machine.labels_json),
-      engines:capabilities?JSON.parse(capabilities.engines_json):[],capabilities:capabilities?JSON.parse(capabilities.capabilities_json):[]});
+      engines:capabilities?JSON.parse(capabilities.engines_json):[],capabilities:currentCapabilities});
   }
 
   private managedClaudeSocket(socket:WebSocket):boolean {

@@ -2,7 +2,7 @@ import {ControlDO} from '../src/control-do';
 import {MachineDO} from '../src/machine-do';
 import {test} from 'node:test';import assert from 'node:assert/strict';import {DatabaseSync} from 'node:sqlite';import {ProjectDO} from '../src/project-do';
 const admin={id:'human:admin',kind:'operator',scopes:['operator:admin']};
-function fixture(options:{modelCandidates?:any[];accountHosts?:Record<string,string[]>;connected?:boolean;lostReleaseFailures?:number;machineFetch?:(request:Request)=>Promise<Response>;lostDrawResponse?:boolean;schemaMode?:string;denyCapacity?:boolean;lostCapResponse?:boolean}={}){const sql=new DatabaseSync(':memory:');let alarm:any=null;const storageValues=new Map<string,unknown>(),ctx:any={id:{toString:()=> 'synthetic-project'},storage:{sql:{exec(q:string,...a:any[]){const p=sql.prepare(q);const rows=p.columns().length?p.all(...a):(p.run(...a),[]);return{toArray:()=>rows};}},transactionSync(fn:any){sql.exec('BEGIN');try{const r=fn();sql.exec('COMMIT');return r;}catch(e){sql.exec('ROLLBACK');throw e;}},async getAlarm(){return alarm;},async setAlarm(at:number){alarm=at;},async deleteAlarm(){alarm=null;},async get(key:string){return storageValues.get(key);},async put(key:string,value:unknown){storageValues.set(key,value);},async delete(key:string){return storageValues.delete(key);}},blockConcurrencyWhile:(f:any)=>Promise.resolve(f())};
+function fixture(options:{machineCapabilities?:string[];modelCandidates?:any[];accountHosts?:Record<string,string[]>;connected?:boolean;lostReleaseFailures?:number;machineFetch?:(request:Request)=>Promise<Response>;lostDrawResponse?:boolean;schemaMode?:string;denyCapacity?:boolean;lostCapResponse?:boolean}={}){const sql=new DatabaseSync(':memory:');let alarm:any=null;const storageValues=new Map<string,unknown>(),ctx:any={id:{toString:()=> 'synthetic-project'},storage:{sql:{exec(q:string,...a:any[]){const p=sql.prepare(q);const rows=p.columns().length?p.all(...a):(p.run(...a),[]);return{toArray:()=>rows};}},transactionSync(fn:any){sql.exec('BEGIN');try{const r=fn();sql.exec('COMMIT');return r;}catch(e){sql.exec('ROLLBACK');throw e;}},async getAlarm(){return alarm;},async setAlarm(at:number){alarm=at;},async deleteAlarm(){alarm=null;},async get(key:string){return storageValues.get(key);},async put(key:string,value:unknown){storageValues.set(key,value);},async delete(key:string){return storageValues.delete(key);}},blockConcurrencyWhile:(f:any)=>Promise.resolve(f())};
  const collectorSql=new DatabaseSync(':memory:');
  const collectorContext:any={...ctx,storage:{...ctx.storage,sql:{exec(q:string,...a:any[]){const statement=collectorSql.prepare(q);const rows=statement.columns().length?statement.all(...a):(statement.run(...a),[]);return{toArray:()=>rows};}},transactionSync(fn:any){collectorSql.exec('BEGIN');try{const result=fn();collectorSql.exec('COMMIT');return result;}catch(error){collectorSql.exec('ROLLBACK');throw error;}}}};
  let control:ControlDO;let loseDraw=options.lostDrawResponse,loseCap=options.lostCapResponse;
@@ -10,7 +10,7 @@ function fixture(options:{modelCandidates?:any[];accountHosts?:Record<string,str
  let remainingReleaseFailures=options.lostReleaseFailures??0;
  const requestOf=(input:string|Request,init?:RequestInit)=>input instanceof Request?input:new Request(input,init);
  const CONTROL={idFromName:(id:any)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{const request=requestOf(input,init),path=new URL(request.url).pathname;const value=request.method==='GET'?{}:await request.clone().json();routes.push(value);if(path==='/_internal/session-cap/check'&&options.lostCapResponse){const response=await control.fetch(request);if(loseCap&&response.ok){loseCap=false;throw new Error('synthetic_crash_after_capacity_reservation');}return response;}if(path==='/_internal/session-cap/check'&&options.denyCapacity)return Response.json({error:'active_session_limit'},{status:429});if(path==='/_internal/picker/draw'){const response=await control.fetch(request);if(loseDraw&&response.ok){loseDraw=false;throw new Error('synthetic_lost_draw_response');}return response;}if(path==='/_internal/session-cap/release'){capReleases.push(value);if(remainingReleaseFailures>0){remainingReleaseFailures--;return Response.json({error:'unavailable'},{status:503});}}if(path==='/_routing-policy')return Response.json({version:1,candidates:options.modelCandidates||[]});if(path==='/api/directory')return Response.json({items:[{id:'h1'}],next:null});return Response.json({registered:true,accepted:true});}})};
- const MACHINES={idFromName:(id:any)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{const request=requestOf(input,init);const path=new URL(request.url).pathname;machineCalls.push(path);if(options.machineFetch&&path!=='/_internal/routing')return options.machineFetch(request);if(path==='/_internal/routing')return Response.json({machine_id:'h1',connected:options.connected??true,engines:['codex','claude'],capabilities:['headless','interactive']});return Response.json(path.endsWith('/reserve')?{state:'staged',epoch:1}:{state:'offered'});}})};
+ const MACHINES={idFromName:(id:any)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{const request=requestOf(input,init);const path=new URL(request.url).pathname;machineCalls.push(path);if(options.machineFetch&&path!=='/_internal/routing')return options.machineFetch(request);if(path==='/_internal/routing')return Response.json({machine_id:'h1',connected:options.connected??true,engines:['codex','claude'],capabilities:options.machineCapabilities||['headless','interactive']});return Response.json(path.endsWith('/reserve')?{state:'staged',epoch:1}:{state:'offered'});}})};
  const unused={idFromName:(id:any)=>id,get:()=>({fetch:async()=>Response.json({ok:true})})};
  const ACCOUNTS={idFromName:(id:any)=>id,get:(id:string)=>({fetch:async(input:string|Request)=>{const path=new URL(input instanceof Request?input.url:input).pathname;accountCalls.push(path);return Response.json({account:{enabled:true},quota:{remaining:id==='codex'?90:70},hosts:options.accountHosts?.[id]||['h1'],credential_usable:false});}})};
  const env:any={CONTROL,PROJECTS:unused,MACHINES,ACCOUNTS,MAILBOXES:unused,HUB2_SCHEMA_MIGRATIONS:options.schemaMode};
@@ -809,4 +809,76 @@ test('a collector SQL failure does not refuse a normally routable Project start'
  assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',{key:'observer-failure',workspace:'/tmp/synthetic-picker'})).status,201);
  assert.equal(f.sql.prepare('SELECT COUNT(*) AS n FROM dispatch_sagas').get()!.n,1);
  assert.equal(f.collectorSql.prepare('SELECT COUNT(*) AS n FROM picker_draws').get()!.n,0);
+});
+
+test('managed Claude selector is immutable, operator-only and never falls back to native',async()=>{
+ const cap='managed:hub-claude:opus:medium:v1';
+ const candidate={id:'claude-opus',engine:'claude',model:'opus',effort:'medium',account_id:'claude',weight:1,capabilities:[],enabled:true};
+ const f=fixture({modelCandidates:[candidate],machineCapabilities:['headless','effort:claude',cap]});
+ const own=await intake(f,'managed-claude');
+ const start={key:'managed-start',workspace:'/tmp/managed-proof',engine:'claude',model:'opus',effort:'medium',
+              machine_id:'h1',managed_credential_label:'hub-claude'};
+ assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',start)).status,201);
+ const saga=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any;
+ const launch=JSON.parse(saga.launch_spec_json),route=JSON.parse(saga.routing_json);
+ assert.equal(launch.managed_credential_label,'hub-claude');assert.equal(saga.account_id,'claude');
+ assert(route.required_capabilities.includes(cap));
+ assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',start)).status,200);
+ const without={...start};delete (without as any).managed_credential_label;
+ assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',without)).status,409);
+ assert.equal((f.sql.prepare('SELECT COUNT(*) AS n FROM dispatch_sagas').get() as any).n,1);
+ assert.equal((f.sql.prepare('SELECT request_digest FROM dispatch_sagas WHERE operation_id=?').get(saga.operation_id) as any).request_digest,saga.request_digest);
+ f.restart();
+ assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',start)).status,200);
+ const failure=await f.call('/_internal/auth-fallback','POST',{operation_id:saga.operation_id,attempt_operation_id:saga.attempt_operation_id,
+  session_id:saga.session_id,machine_id:saga.machine_id,epoch:saga.epoch,reason:'provider_auth_failed'});
+ assert.equal(failure.status,200);
+ const after=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE operation_id=?').get(saga.operation_id) as any;
+ assert.equal(after.attempt,0);assert.equal(JSON.parse(after.launch_spec_json).managed_credential_label,'hub-claude');
+ assert.equal(after.state,'complete');
+ f.sql.close();f.collectorSql.close();
+});
+
+test('managed Claude selector rejects unsupported host and mismatched route without reserving starts',async()=>{
+ const candidate={id:'claude-opus',engine:'claude',model:'opus',effort:'medium',account_id:'claude',weight:1,capabilities:[],enabled:true};
+ const variants=[{managed_credential_label:null},{managed_credential_label:'other'}, {engine:'codex'}, {model:'sonnet'},
+                 {effort:'max'}, {interactive:true},{with_goal:true}];
+ for(const [i,changed] of variants.entries()){
+  const f=fixture({modelCandidates:[candidate]}),own=await intake(f,'invalid-managed-'+i);
+  const result=await f.call('/api/intakes/'+own.id+'/start','POST',{key:'managed-'+i,workspace:'/tmp/proof',engine:'claude',
+   model:'opus',effort:'medium',managed_credential_label:'hub-claude',...changed});
+  assert.equal(result.status,400,JSON.stringify(changed));
+  assert.equal((f.sql.prepare('SELECT COUNT(*) AS n FROM dispatch_sagas').get() as any).n,0);
+  assert(!f.machineCalls.includes('/_internal/reserve'));f.sql.close();f.collectorSql.close();
+ }
+ const f=fixture({modelCandidates:[candidate]}),own=await intake(f,'unsupported-managed');
+ const result=await f.call('/api/intakes/'+own.id+'/start','POST',{key:'managed-unsupported',workspace:'/tmp/proof',engine:'claude',
+  model:'opus',effort:'medium',managed_credential_label:'hub-claude'});
+ assert.equal((await body(result)).error,'managed_exec_unavailable');
+ assert(!f.machineCalls.includes('/_internal/reserve'));f.sql.close();f.collectorSql.close();
+});
+
+test('managed Claude selector does not inherit project-only start authority',async()=>{
+ const candidate={id:'claude-opus',engine:'claude',model:'opus',effort:'medium',account_id:'claude',weight:1,capabilities:[],enabled:true};
+ const f=fixture({modelCandidates:[candidate],machineCapabilities:['headless','managed:hub-claude:opus:medium:v1']});
+ const own=await intake(f,'managed-non-admin');
+ const actor={id:'worker:project-owner',kind:'worker',resource_id:'org/a',scopes:['session:start']};
+ const result=await f.call('/api/intakes/'+own.id+'/start','POST',{key:'managed-non-admin',workspace:'/tmp/proof',engine:'claude',
+  model:'opus',effort:'medium',managed_credential_label:'hub-claude'},actor);
+ assert.equal(result.status,403);assert.equal((await body(result)).error,'forbidden');
+ assert(!f.machineCalls.includes('/_internal/reserve'));f.sql.close();f.collectorSql.close();
+});
+
+test('ordinary Claude start preserves exact pre-selector request digest',async()=>{
+ const candidate={id:'claude-opus',engine:'claude',model:'opus',effort:'medium',account_id:'claude',weight:1,capabilities:[],enabled:true};
+ const f=fixture({modelCandidates:[candidate]}),own=await intake(f,'native-digest');
+ const start={key:'native-digest',workspace:'/tmp/native-digest',engine:'claude',model:'opus',effort:'medium',machine_id:'h1'};
+ assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',start)).status,201);
+ const saga=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any;
+ const {createHash}=await import('node:crypto');
+ const prior=createHash('sha256').update(JSON.stringify({intake_id:own.id,criteria:['Actual result'],workspace:start.workspace,
+  prompt:'Original requested behavior',interactive:false,with_goal:false,timeout_seconds:1800,
+  route:{machine_id:'h1',engine:'claude',model:'opus',effort:'medium',override_reason:null,required_capabilities:[],with_goal:false}})).digest('hex');
+ assert.equal(saga.request_digest,prior);assert(!Object.hasOwn(JSON.parse(saga.launch_spec_json),'managed_credential_label'));
+ f.sql.close();f.collectorSql.close();
 });
