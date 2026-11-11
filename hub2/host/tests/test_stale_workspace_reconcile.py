@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from itertools import count
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -45,6 +46,14 @@ class _Client:
 
 class StaleWorkspaceReconcileTests(unittest.TestCase):
     def test_missing_workspace_row_does_not_block_heartbeat_or_websocket(self):
+        self.assert_unbound_workspace_stays_connected()
+
+    def test_unavailable_native_census_does_not_block_heartbeat_or_websocket(self):
+        inventory = Mock(side_effect=RuntimeError('native_census_unavailable'))
+        self.assert_unbound_workspace_stays_connected(inventory)
+        inventory.assert_called_once_with()
+
+    def assert_unbound_workspace_stays_connected(self, inventory=None):
         with tempfile.TemporaryDirectory() as temp:
             journal = Journal(Path(temp) / "journal.sqlite")
             self.addCleanup(journal.db.close)
@@ -67,6 +76,8 @@ class StaleWorkspaceReconcileTests(unittest.TestCase):
                 aborted_identity=Mock(side_effect=FileNotFoundError),
                 status=Mock(side_effect=FileNotFoundError),
             )
+            if inventory is not None:
+                bridge.launcher.inventory = inventory
             bridge.engines = {"shell"}
             bridge.machine_id = None
             bridge.budget_paused_until = 0
@@ -75,7 +86,9 @@ class StaleWorkspaceReconcileTests(unittest.TestCase):
             bridge.runner = None
             bridge.lookup = Mock(side_effect=AssertionError("unavailable workspace must not be queried"))
 
-            with patch("agent_hub_host.agent.threading.Thread") as thread, patch(
+            ticks = count(0, 31)
+            with patch("agent_hub_host.agent.time.monotonic", side_effect=lambda: next(ticks)), patch(
+                    "agent_hub_host.agent.threading.Thread") as thread, patch(
                     "agent_hub_host.agent.time.sleep",
                     side_effect=AssertionError("unexpected daemon reconnect")):
                 with self.assertLogs("agent_hub_host.agent", level="WARNING") as captured:
@@ -83,6 +96,7 @@ class StaleWorkspaceReconcileTests(unittest.TestCase):
                         bridge.serve("machine-1", ["headless"])
 
             thread.return_value.start.assert_called_once_with()
+            self.assertGreaterEqual(len(client.heartbeats), 2)
             self.assertEqual(client.heartbeats[0][3], [{
                 "session_id": "stale-session",
                 "native_id": None,
@@ -93,15 +107,16 @@ class StaleWorkspaceReconcileTests(unittest.TestCase):
             }])
             self.assertEqual(client.socket_calls, ["machine-1"])
             self.assertTrue(socket.entered)
-            self.assertEqual(len(captured.records), 1)
+            self.assertEqual(len(captured.records), 2)
             self.assertIn("unavailable workspace", captured.output[0])
+            self.assertIn("Native census unavailable", captured.output[1])
             bridge.launcher.aborted_identity.assert_not_called()
             bridge.launcher.status.assert_not_called()
             bridge.lookup.assert_not_called()
             state = journal.db.execute(
-                "SELECT state FROM launches WHERE session_id='stale-session'"
-            ).fetchone()[0]
-            self.assertEqual(state, "aborting")
+                "SELECT state,native_id,legacy_failure_json FROM launches WHERE session_id='stale-session'"
+            ).fetchone()
+            self.assertEqual(tuple(state), ("aborting", None, None))
             self.assertFalse(journal.db.execute("SELECT 1 FROM outbox").fetchone())
 
     def test_missing_workspace_does_not_report_native_process_stopped(self):

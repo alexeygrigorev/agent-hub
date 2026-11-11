@@ -2,7 +2,7 @@ import {listProjectIntakes} from './intake-list';
 import { MeteredDb, initializeSchema } from './db';
 import { SqlReceiptMeter, SQL_PROBE_HEADER, wrapSqlNamespaces } from './sql-receipt';
 import { sha256Hex } from './crypto';
-import { actorFrom, bodyObject, error, hasScope, HttpError, json } from './http';
+import { actorFrom, bodyObject, boundedString, error, hasScope, HttpError, json } from './http';
 import { advanceDispatch } from './dispatch';
 import { pickCommittedModelRoute, type PickedRoute, type PickDiagnostics } from './model-picker';
 import {buildStartPickerEvidence, normalizeStartPickerEvidence} from './start-picker-evidence';
@@ -681,9 +681,83 @@ export class ProjectDO {
     return json({ claimed: true });
   }
 
+  private async legacyLaunchUnobserved(body:JsonRecord,reaped:boolean):Promise<Response>{
+    if(!reaped||body.launch_failed!==true||body.native_outcome!=='unconfirmed'||body.failure_kind!=='legacy_census_absent'
+      ||body.native_id!==null||body.native_exit_confirmed!==undefined||body.no_dispatch!==undefined||body.exit_code!==undefined
+      ||typeof body.operation_id!=='string'||typeof body.attempt_operation_id!=='string'||typeof body.session_id!=='string'
+      ||typeof body.machine_id!=='string'||!Number.isSafeInteger(body.epoch)
+      ||typeof body.evidence_digest!=='string'||!/^[0-9a-f]{64}$/.test(body.evidence_digest))
+      return error('invalid_legacy_launch_failure',400);
+    const evidence=body.evidence;
+    if(!evidence||typeof evidence!=='object'||Array.isArray(evidence)
+      ||(evidence as JsonRecord).source!=='aplexer_all_registry_census'||(evidence as JsonRecord).complete!==true
+      ||(evidence as JsonRecord).match_count!==0||(evidence as JsonRecord).dispatch_provenance!=='legacy_unknown')
+      return error('invalid_legacy_census',400);
+    const saga=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?',body.operation_id);
+    if(!saga||saga.session_id!==body.session_id||saga.intake_id!==body.intake_id)return error('stale_legacy_launch_failure',409);
+    const exact=saga.attempt_operation_id===body.attempt_operation_id&&saga.epoch===body.epoch&&saga.machine_id===body.machine_id;
+    const attemptText=body.attempt_operation_id.startsWith(saga.operation_id+':')?body.attempt_operation_id.slice(saga.operation_id.length+1):'';
+    const olderAttempt=!exact&&/^(0|[1-9][0-9]*)$/.test(attemptText)&&Number(attemptText)<saga.attempt;
+    if(!exact&&!olderAttempt||exact&&saga.native_id!==null)return error('stale_legacy_launch_failure',409);
+    const intake=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',saga.intake_id);
+    if(!intake)return error('intake_not_found',404);
+    const terminalObservation=exact&&saga.state==='complete'
+      &&['legacy_launch_unobserved','host_no_response','launch_timeout_no_native','host_launch_refused','stop_confirmed','dead','idle'].includes(String(saga.last_reason));
+    const intakeMatches=intake.session_id===saga.session_id&&intake.assigned_machine_id===saga.machine_id;
+    const historical=olderAttempt||!intakeMatches||terminalObservation;
+    const key='legacy-unobserved:'+body.attempt_operation_id+':'+body.epoch;
+    const accepted=this.db.one<{body_json:string}>('SELECT body_json FROM intake_events WHERE task_id=? AND event_key=?',saga.intake_id,key);
+    if(!accepted){
+      const launch=this.parse(saga.launch_spec_json) as JsonRecord|null;
+      if(!exact||!launch||!boundedString(launch.workspace,1024)||launch.workspace!==(evidence as JsonRecord).workspace)
+        return error('legacy_launch_workspace_unverified',409);
+    }
+    const payload={session_id:body.session_id,machine_id:body.machine_id,attempt_operation_id:body.attempt_operation_id,
+      epoch:body.epoch,reason:'legacy_launch_unobserved',launch_failed:true,native_outcome:'unconfirmed',
+      failure_kind:'legacy_census_absent',native_id:null,evidence,evidence_digest:body.evidence_digest,historical};
+    const encoded=JSON.stringify(payload),now=Date.now();
+    this.transaction(()=>{
+      const current=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?',saga.operation_id);
+      if(!current||current.attempt_operation_id!==saga.attempt_operation_id||current.epoch!==saga.epoch||current.state!==saga.state
+        ||current.machine_id!==saga.machine_id||current.native_id!==saga.native_id||current.launch_spec_json!==saga.launch_spec_json)
+        throw new HttpError('stale_legacy_launch_failure',409);
+      const prior=this.db.one<{body_json:string}>('SELECT body_json FROM intake_events WHERE task_id=? AND event_key=?',saga.intake_id,key);
+      if(prior){
+        if(JSON.stringify({...this.parse(prior.body_json) as JsonRecord,historical})!==encoded)
+          throw new HttpError('legacy_launch_failure_conflict',409);
+        return;
+      }
+      if(exact){
+        const active=['offered','claimed','admitted'].includes(current.state);
+        if(!active&&!terminalObservation)throw new HttpError('stale_legacy_launch_failure',409);
+        if(active){
+          this.db.run("UPDATE dispatch_sagas SET state='complete',next_action_at=NULL,last_reason='legacy_launch_unobserved',updated_at=? WHERE operation_id=?",now,saga.operation_id);
+        }
+        if(!historical){
+          const previous=this.parse(intake.final_evidence_json) as JsonRecord|null;
+          this.db.run('UPDATE intakes SET status=?,final_evidence_json=?,updated_at=? WHERE id=?',active?'failed':intake.status,
+            JSON.stringify({...previous,...payload,operation_id:saga.operation_id}),now,intake.id);
+        }else if(terminalObservation&&intakeMatches){
+          const previous=this.parse(intake.final_evidence_json) as JsonRecord|null;
+          this.db.run('UPDATE intakes SET final_evidence_json=?,updated_at=? WHERE id=?',
+            JSON.stringify({...previous,legacy_launch_recovery:payload}),now,intake.id);
+        }
+      }
+      this.appendEvent(intake.id,key,'machine:'+body.machine_id,'session_launch_failed',payload,now);
+    });
+    if(exact){
+      const released=await this.env.CONTROL.get(this.env.CONTROL.idFromName('global')).fetch('https://control.internal/_internal/session-cap/release',{
+        method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({operation_id:saga.operation_id,session_id:saga.session_id})});
+      if(!released.ok)return error('session_cap_release_pending',503);
+    }
+    await this.scheduleNext();
+    return json({failed:true,native_outcome:'unconfirmed',historical,session_id:saga.session_id});
+  }
+
   private async stoppedInternal(request: Request): Promise<Response> {
     const reaped=new URL(request.url).pathname.endsWith('/reaped');
     const body=await bodyObject(request,4096);
+    if(body.reason==='legacy_launch_unobserved')return this.legacyLaunchUnobserved(body,reaped);
     if(typeof body.operation_id!=='string'||typeof body.attempt_operation_id!=='string'||typeof body.session_id!=='string'
       ||typeof body.machine_id!=='string'||!Number.isSafeInteger(body.epoch)||!['dead','idle','stop_confirmed','launch_timeout_no_native','host_no_response','host_launch_refused','host_inventory_stale'].includes(String(body.reason)))
       return error('invalid_stopped_receipt',400);
@@ -930,10 +1004,12 @@ export class ProjectDO {
     const saga = this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id = ?', body.operation_id);
     const failureEvent=launchFailed&&saga?.state==='complete'&&saga.native_id===null
       ? this.db.one<{kind:string;body_json:string}>('SELECT kind,body_json FROM intake_events WHERE task_id=? AND event_key=?',
-        saga.intake_id,`stopped:${saga.attempt_operation_id}:${saga.epoch}`) : undefined;
+        saga.intake_id,`stopped:${saga.attempt_operation_id}:${saga.epoch}`)
+        || this.db.one<{kind:string;body_json:string}>('SELECT kind,body_json FROM intake_events WHERE task_id=? AND event_key=?',
+          saga.intake_id,`legacy-unobserved:${saga.attempt_operation_id}:${saga.epoch}`) : undefined;
     const failureReason=failureEvent ? (this.parse(failureEvent.body_json) as JsonRecord).reason : undefined;
     const lateLaunchFailure=failureEvent?.kind==='session_launch_failed'
-      &&['launch_timeout_no_native','host_no_response','host_launch_refused'].includes(String(failureReason));
+      &&['launch_timeout_no_native','host_no_response','host_launch_refused','legacy_launch_unobserved'].includes(String(failureReason));
     if (!saga || saga.session_id !== body.session_id || saga.machine_id !== body.machine_id
       || saga.attempt_operation_id !== body.attempt_operation_id || saga.epoch !== body.epoch
       || (saga.native_id !== body.native_id&&!(launchFailed&&(saga.state==='admitted'||lateLaunchFailure)&&saga.native_id===null&&/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(body.native_id)))) return error('dispatch_not_found', 404);
@@ -978,7 +1054,8 @@ export class ProjectDO {
         if(current?.status==='failed'&&current.session_id===saga.session_id&&current.assigned_machine_id===saga.machine_id){
           const previous=this.parse(current.final_evidence_json??'{}') as JsonRecord;
           this.db.run('UPDATE intakes SET final_evidence_json=?,updated_at=? WHERE id=?',
-            JSON.stringify({...previous,...evidence,native_id:body.native_id,exit_code:body.exit_code,native_exit_confirmed:true,launch_failed:true,native_id_absent:false}),now,intake.id);
+            JSON.stringify({...previous,...evidence,native_id:body.native_id,exit_code:body.exit_code,native_exit_confirmed:true,
+              ...(previous.native_outcome==='unconfirmed'?{native_outcome:'exit_confirmed'}:{}),launch_failed:true,native_id_absent:false}),now,intake.id);
         }
         return false;
       }
