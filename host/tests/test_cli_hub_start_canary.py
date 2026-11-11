@@ -66,6 +66,8 @@ if args[:1] == ["routing-machines"]:
     sys.exit(0)
 if args[:2] == ["sessions", "show"]:
     if sc == "archive_show_fail": sys.exit(1)
+    if (d / "show_payload.json").exists():
+        print((d / "show_payload.json").read_text()); sys.exit(0)
     print(json.dumps({"session": {"id": SID, "intake_id": "intake-canary-1"}})); sys.exit(0)
 if args[:2] == ["intake", "update"]:
     if sc == "archive_update_fail": sys.exit(1)
@@ -103,7 +105,10 @@ if args[:2] == ["sessions", "list"]:
         else: items.append(item("running"))
     print(json.dumps({"items": items[:1] if sc == "past_first_page" else items, "next": None, "complete": True, "sessions": items, "next_cursor": None})); sys.exit(0)
 if args[:2] == ["sessions", "capture"]:
-    if sc == "capture_fail": sys.exit(1)
+    if sc in ("capture_fail", "capture_fail_stop_409_retired", "capture_fail_stop_409_still_running"):
+        if sc == "capture_fail_stop_409_retired":
+            (d / "a_running").unlink(missing_ok=True)
+        sys.exit(1)
     if sc == "late_capture": time.sleep(0.5)
     prompt, marker = (d / "prompt").read_text(), (d / "marker").read_text()
     if sc == "capture_prompt_only": output = "$ " + prompt
@@ -118,6 +123,9 @@ if args[:2] == ["sessions", "capture"]:
     print(json.dumps({"command_wait":{"state":"acked","ack":{"capture":output}}})); sys.exit(0)
 if args[:2] == ["sessions", "stop"]:
     if sc == "stop_fail" or (sc == "cleanup_fail" and "cleanup" in " ".join(args)): sys.exit(1)
+    if sc in ("capture_fail_stop_409_retired", "capture_fail_stop_409_still_running") or (sc == "reconcile_stop_409" and "reconcile" in " ".join(args)):
+        sys.stderr.write("hub error: HTTP 409 at http://127.0.0.1:8787/api/sessions/" + args[2] + "/stop: status 409 (session_not_running): session is completed-awaiting-review\n")
+        sys.exit(1)
     if sc != "gone_fail": (d / "a_running").unlink(missing_ok=True)
     (d / "stopped").write_text(" ".join(args)); sys.exit(0)
 sys.exit(2)
@@ -1630,6 +1638,192 @@ class CanaryTest(unittest.TestCase):
         self.assertNotIn("Traceback", r.stderr)
         err_verdict = json.loads(r.stderr.strip().splitlines()[-1])
         self.assertEqual(err_verdict["alert_state_error"], "lock:lock_file_symlink")
+
+    def test_session_not_running_409_requires_positive_retirement_or_stop_evidence(self):
+        ws = str((self.tmp / "ws").resolve())
+
+        def make_retired_show(
+            *,
+            state="completed-awaiting-review",
+            native_exit_confirmed=True,
+            containment_empty=True,
+            source="aplexer_retirement",
+            tag=f"task-hub2-{SID}",
+            nid_ws=ws,
+            exited_at_ms=1794410797372,
+            created_at="2026-11-11T15:25:12.727Z",
+            epoch=167,
+            ev_epoch=167,
+            operation_id="1ae2c72b-edf1-52dd-a22b-c8964afd4a8f:0",
+            ev_operation_id="1ae2c72b-edf1-52dd-a22b-c8964afd4a8f",
+            ev_attempt_operation_id="1ae2c72b-edf1-52dd-a22b-c8964afd4a8f:0",
+            stop_confirmed=None,
+            include_evidence=True,
+        ):
+            sess = {
+                "id": SID,
+                "state": state,
+                "intake_id": "09717ebe-e742-4403-80a9-2c6d9cb2d845",
+                "project_id": "owner/repo",
+                "machine_id": "HOST-1",
+                "host": "HOST-1",
+                "machine": "HOST-1",
+                "workspace": ws,
+                "requested_workspace": ws,
+                "epoch": epoch,
+                "operation_id": operation_id,
+                "native_id": NATIVE,
+                "created_at": created_at,
+                "updated_at": "2026-11-11T15:26:37.604Z",
+            }
+            if stop_confirmed is not None:
+                sess["stop_confirmed"] = stop_confirmed
+            if include_evidence:
+                sess["evidence"] = {
+                    "attempt_operation_id": ev_attempt_operation_id,
+                    "epoch": ev_epoch,
+                    "evidence": {
+                        "containment_empty": containment_empty,
+                        "launcher_state": "retired-finished",
+                        "native_deadline": {"deadline_ms": 1794412512811, "exceeded": False},
+                        "native_exit": {
+                            "code": 0,
+                            "exited_at_ms": exited_at_ms,
+                            "oom_killed": False,
+                            "signal": None,
+                        },
+                        "native_identity": {
+                            "id": NATIVE,
+                            "tag": tag,
+                            "workspace": nid_ws,
+                        },
+                        "source": source,
+                    },
+                    "evidence_digest": "8ecec98d6d55929b09bd7a1557e7b2c9e689bf8dec9339a4cb107c8f2b6d71c3",
+                    "exit_code": 0,
+                    "intake_id": "09717ebe-e742-4403-80a9-2c6d9cb2d845",
+                    "machine_id": "HOST-1",
+                    "native_exit_confirmed": native_exit_confirmed,
+                    "native_id": NATIVE,
+                    "operation_id": ev_operation_id,
+                    "session_id": SID,
+                }
+            else:
+                sess["evidence"] = None
+            return {"session": sess}
+
+        # 1. Active run fails at capture after native session already exited 0 and retired:
+        # cleanup stop receives 409 (session_not_running), verifies positive aplexer_retirement
+        # + fresh gone check, archives intake, unlinks pending file, and keeps ok=False at stage=capture.
+        (self.tmp / "show_payload.json").write_text(json.dumps(make_retired_show()))
+        r_cap, v_cap = self.run_canary("capture_fail_stop_409_retired", "--mode", "full")
+        self.assertEqual(r_cap.returncode, 1)
+        self.assertEqual(
+            (v_cap["ok"], v_cap["stage"], v_cap["reason"], v_cap["cleanup"], v_cap["intake_archived"]),
+            (False, "capture", "hub_capture_exit_1", "stopped", True),
+        )
+        self.assertEqual(list((self.state / "pending").glob("*.json")), [])
+        self.assertEqual(
+            (self.tmp / "archived_intake").read_text(),
+            "intake update 09717ebe-e742-4403-80a9-2c6d9cb2d845 --status archived --note periodic_full_canary",
+        )
+
+        # 2. If native is still listed in `a list --json --running`, even valid retirement evidence
+        # must fail closed (FAILED_needs_reconciliation) and retain the pending file.
+        r_still, v_still = self.run_canary("capture_fail_stop_409_still_running", "--mode", "full")
+        self.assertEqual(r_still.returncode, 1)
+        self.assertEqual(
+            (v_still["ok"], v_still["stage"], v_still["reason"], v_still["cleanup"]),
+            (False, "capture", "hub_capture_exit_1", "FAILED_needs_reconciliation"),
+        )
+        pending_files = list((self.state / "pending").glob("*.json"))
+        self.assertEqual(len(pending_files), 1)
+
+        # 3. Next run reconciles that prior pending file when stop returns 409 (session_not_running)
+        # and positive aplexer_retirement + fresh gone check pass.
+        (self.tmp / "a_running").unlink(missing_ok=True)
+        r_rec, v_rec = self.run_canary("reconcile_stop_409", "--mode", "shell")
+        self.assertEqual(r_rec.returncode, 0, r_rec.stderr)
+        self.assertTrue(v_rec["ok"])
+        self.assertFalse(pending_files[0].exists())
+        self.assertEqual(list((self.state / "pending").glob("*.json")), [])
+
+        # 4. Prior pending reconciliation also accepts state="stopped" with stop_confirmed=True + fresh gone check.
+        prior_stopped = (self.state / "pending") / "prior-stopped.json"
+        prior_stopped.write_text(
+            json.dumps(
+                {
+                    "run_id": "prior-stopped",
+                    "mode": "shell",
+                    "name": "hub-canary-shell-prior-stopped",
+                    "key": "canary-prior-stopped",
+                    "repo": "owner/repo",
+                    "machine": "HOST-1",
+                    "workspace": ws,
+                    "prompt": "printf CANARY-OK; sleep 30",
+                    "candidate_sha": None,
+                    "session_id": SID,
+                    "native_id": NATIVE,
+                }
+            )
+        )
+        os.chmod(prior_stopped, 0o600)
+        (self.tmp / "show_payload.json").write_text(
+            json.dumps(make_retired_show(state="stopped", stop_confirmed=True, include_evidence=False))
+        )
+        r_sc, v_sc = self.run_canary("reconcile_stop_409", "--mode", "shell")
+        self.assertEqual(r_sc.returncode, 0, r_sc.stderr)
+        self.assertTrue(v_sc["ok"])
+        self.assertFalse(prior_stopped.exists())
+
+        # 5. Terminal states without positive confirmation (or with tampered bindings/timestamps)
+        # MUST fail closed on 409 even when `a list --json --running` is empty.
+        invalid_payloads = [
+            make_retired_show(state="failed", include_evidence=False),
+            make_retired_show(state="lost", include_evidence=False),
+            make_retired_show(state="cancelled", include_evidence=False),
+            make_retired_show(state="stopped", stop_confirmed=False, include_evidence=False),
+            make_retired_show(native_exit_confirmed=False),
+            make_retired_show(containment_empty=False),
+            make_retired_show(source="unverified_observer"),
+            make_retired_show(tag="task-hub2-wrong-session"),
+            make_retired_show(nid_ws="/wrong/workspace"),
+            make_retired_show(exited_at_ms=1700000000000),  # before created_at
+            make_retired_show(ev_epoch=999),
+            make_retired_show(ev_attempt_operation_id="different-op:0"),
+        ]
+        for idx, bad_payload in enumerate(invalid_payloads):
+            with self.subTest(bad_case=idx):
+                pfile = (self.state / "pending") / f"prior-bad-{idx}.json"
+                pfile.write_text(
+                    json.dumps(
+                        {
+                            "run_id": f"prior-bad-{idx}",
+                            "mode": "full",
+                            "name": f"hub-canary-full-prior-bad-{idx}",
+                            "key": f"canary-prior-bad-{idx}",
+                            "repo": "owner/repo",
+                            "machine": "HOST-1",
+                            "workspace": ws,
+                            "prompt": "Reply CANARY-OK and exit",
+                            "candidate_sha": None,
+                            "session_id": SID,
+                            "native_id": NATIVE,
+                        }
+                    )
+                )
+                os.chmod(pfile, 0o600)
+                (self.tmp / "show_payload.json").write_text(json.dumps(bad_payload))
+                (self.tmp / "calls.log").write_text("")
+                r_bad, v_bad = self.run_canary("reconcile_stop_409", "--mode", "shell")
+                self.assertEqual(r_bad.returncode, 1)
+                self.assertEqual(
+                    (v_bad["ok"], v_bad["stage"], v_bad["reason"], v_bad["session_id"]),
+                    (False, "cleanup", "prior_pending_reconciliation_failed", None),
+                )
+                self.assertTrue(pfile.exists())
+                self.assertEqual([ln for ln in self.calls().splitlines() if ln.startswith("sessions start ")], [])
+                pfile.unlink()
 
 
 if __name__ == "__main__":
