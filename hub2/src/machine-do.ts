@@ -351,7 +351,9 @@ export class MachineDO {
     const machineId = this.machineActor(actor, 'machine:offer');
     if (!machineId) return error('forbidden', 403);
     const now = Date.now();
-    const rows = this.offerRows(machineId,now).filter(row=>!this.managedClaudeLaunch(this.parse(row.launch_json))||this.managedClaudeAvailable(machineId));
+    // The selector is delivered only on the readiness-qualified socket. An
+    // older REST poller sharing this machine identity cannot silently ignore it.
+    const rows = this.offerRows(machineId,now).filter(row=>!this.managedClaudeLaunch(this.parse(row.launch_json)));
     return json({ offers: rows.map(row => this.offerView(row)) });
   }
 

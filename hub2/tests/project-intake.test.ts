@@ -2,7 +2,7 @@ import {ControlDO} from '../src/control-do';
 import {MachineDO} from '../src/machine-do';
 import {test} from 'node:test';import assert from 'node:assert/strict';import {DatabaseSync} from 'node:sqlite';import {ProjectDO} from '../src/project-do';
 const admin={id:'human:admin',kind:'operator',scopes:['operator:admin']};
-function fixture(options:{machineCapabilities?:string[];modelCandidates?:any[];accountHosts?:Record<string,string[]>;connected?:boolean;lostReleaseFailures?:number;machineFetch?:(request:Request)=>Promise<Response>;lostDrawResponse?:boolean;schemaMode?:string;denyCapacity?:boolean;lostCapResponse?:boolean}={}){const sql=new DatabaseSync(':memory:');let alarm:any=null;const storageValues=new Map<string,unknown>(),ctx:any={id:{toString:()=> 'synthetic-project'},storage:{sql:{exec(q:string,...a:any[]){const p=sql.prepare(q);const rows=p.columns().length?p.all(...a):(p.run(...a),[]);return{toArray:()=>rows};}},transactionSync(fn:any){sql.exec('BEGIN');try{const r=fn();sql.exec('COMMIT');return r;}catch(e){sql.exec('ROLLBACK');throw e;}},async getAlarm(){return alarm;},async setAlarm(at:number){alarm=at;},async deleteAlarm(){alarm=null;},async get(key:string){return storageValues.get(key);},async put(key:string,value:unknown){storageValues.set(key,value);},async delete(key:string){return storageValues.delete(key);}},blockConcurrencyWhile:(f:any)=>Promise.resolve(f())};
+function fixture(options:{realMachineRouting?:boolean;machineCapabilities?:string[];modelCandidates?:any[];accountHosts?:Record<string,string[]>;connected?:boolean;lostReleaseFailures?:number;machineFetch?:(request:Request)=>Promise<Response>;lostDrawResponse?:boolean;schemaMode?:string;denyCapacity?:boolean;lostCapResponse?:boolean}={}){const sql=new DatabaseSync(':memory:');let alarm:any=null;const storageValues=new Map<string,unknown>(),ctx:any={id:{toString:()=> 'synthetic-project'},storage:{sql:{exec(q:string,...a:any[]){const p=sql.prepare(q);const rows=p.columns().length?p.all(...a):(p.run(...a),[]);return{toArray:()=>rows};}},transactionSync(fn:any){sql.exec('BEGIN');try{const r=fn();sql.exec('COMMIT');return r;}catch(e){sql.exec('ROLLBACK');throw e;}},async getAlarm(){return alarm;},async setAlarm(at:number){alarm=at;},async deleteAlarm(){alarm=null;},async get(key:string){return storageValues.get(key);},async put(key:string,value:unknown){storageValues.set(key,value);},async delete(key:string){return storageValues.delete(key);}},blockConcurrencyWhile:(f:any)=>Promise.resolve(f())};
  const collectorSql=new DatabaseSync(':memory:');
  const collectorContext:any={...ctx,storage:{...ctx.storage,sql:{exec(q:string,...a:any[]){const statement=collectorSql.prepare(q);const rows=statement.columns().length?statement.all(...a):(statement.run(...a),[]);return{toArray:()=>rows};}},transactionSync(fn:any){collectorSql.exec('BEGIN');try{const result=fn();collectorSql.exec('COMMIT');return result;}catch(error){collectorSql.exec('ROLLBACK');throw error;}}}};
  let control:ControlDO;let loseDraw=options.lostDrawResponse,loseCap=options.lostCapResponse;
@@ -10,7 +10,7 @@ function fixture(options:{machineCapabilities?:string[];modelCandidates?:any[];a
  let remainingReleaseFailures=options.lostReleaseFailures??0;
  const requestOf=(input:string|Request,init?:RequestInit)=>input instanceof Request?input:new Request(input,init);
  const CONTROL={idFromName:(id:any)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{const request=requestOf(input,init),path=new URL(request.url).pathname;const value=request.method==='GET'?{}:await request.clone().json();routes.push(value);if(path==='/_internal/session-cap/check'&&options.lostCapResponse){const response=await control.fetch(request);if(loseCap&&response.ok){loseCap=false;throw new Error('synthetic_crash_after_capacity_reservation');}return response;}if(path==='/_internal/session-cap/check'&&options.denyCapacity)return Response.json({error:'active_session_limit'},{status:429});if(path==='/_internal/picker/draw'){const response=await control.fetch(request);if(loseDraw&&response.ok){loseDraw=false;throw new Error('synthetic_lost_draw_response');}return response;}if(path==='/_internal/session-cap/release'){capReleases.push(value);if(remainingReleaseFailures>0){remainingReleaseFailures--;return Response.json({error:'unavailable'},{status:503});}}if(path==='/_routing-policy')return Response.json({version:1,candidates:options.modelCandidates||[]});if(path==='/api/directory')return Response.json({items:[{id:'h1'}],next:null});return Response.json({registered:true,accepted:true});}})};
- const MACHINES={idFromName:(id:any)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{const request=requestOf(input,init);const path=new URL(request.url).pathname;machineCalls.push(path);if(options.machineFetch&&path!=='/_internal/routing')return options.machineFetch(request);if(path==='/_internal/routing')return Response.json({machine_id:'h1',connected:options.connected??true,engines:['codex','claude'],capabilities:options.machineCapabilities||['headless','interactive']});return Response.json(path.endsWith('/reserve')?{state:'staged',epoch:1}:{state:'offered'});}})};
+ const MACHINES={idFromName:(id:any)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{const request=requestOf(input,init);const path=new URL(request.url).pathname;machineCalls.push(path);if(options.machineFetch&&(path!=='/_internal/routing'||options.realMachineRouting))return options.machineFetch(request);if(path==='/_internal/routing')return Response.json({machine_id:'h1',connected:options.connected??true,engines:['codex','claude'],capabilities:options.machineCapabilities||['headless','interactive']});return Response.json(path.endsWith('/reserve')?{state:'staged',epoch:1}:{state:'offered'});}})};
  const unused={idFromName:(id:any)=>id,get:()=>({fetch:async()=>Response.json({ok:true})})};
  const ACCOUNTS={idFromName:(id:any)=>id,get:(id:string)=>({fetch:async(input:string|Request)=>{const path=new URL(input instanceof Request?input.url:input).pathname;accountCalls.push(path);return Response.json({account:{enabled:true},quota:{remaining:id==='codex'?90:70},hosts:options.accountHosts?.[id]||['h1'],credential_usable:false});}})};
  const env:any={CONTROL,PROJECTS:unused,MACHINES,ACCOUNTS,MAILBOXES:unused,HUB2_SCHEMA_MIGRATIONS:options.schemaMode};
@@ -881,4 +881,38 @@ test('ordinary Claude start preserves exact pre-selector request digest',async()
   route:{machine_id:'h1',engine:'claude',model:'opus',effort:'medium',override_reason:null,required_capabilities:[],with_goal:false}})).digest('hex');
  assert.equal(saga.request_digest,prior);assert(!Object.hasOwn(JSON.parse(saga.launch_spec_json),'managed_credential_label'));
  f.sql.close();f.collectorSql.close();
+});
+
+test('real Project and Machine carry the immutable managed selection only on a qualified socket',async()=>{
+ const database=new DatabaseSync(':memory:'),sockets:any[]=[],frames:any[]=[];
+ const ctx:any={storage:{sql:{exec(query:string,...args:any[]){const statement=database.prepare(query);
+  return{toArray:()=>statement.columns().length?statement.all(...args):(statement.run(...args),[])};}},
+  transactionSync(callback:()=>unknown){database.exec('BEGIN');try{const result=callback();database.exec('COMMIT');return result;}
+   catch(error){database.exec('ROLLBACK');throw error;}},async getAlarm(){return null;},async setAlarm(){},async deleteAlarm(){}},
+  blockConcurrencyWhile:(callback:()=>unknown)=>Promise.resolve(callback()),getWebSockets:()=>sockets};
+ let machine:MachineDO;
+ const candidate={id:'claude-opus',engine:'claude',model:'opus',effort:'medium',account_id:'claude',weight:1,capabilities:[],enabled:true};
+ const f=fixture({modelCandidates:[candidate],realMachineRouting:true,machineFetch:request=>machine.fetch(request)});
+ machine=new MachineDO(ctx,{CONTROL:{idFromName:(id:string)=>id,get:()=>({fetch:async()=>Response.json({authorized:true})})},
+  PROJECTS:{idFromName:(id:string)=>id,get:()=>({fetch:(request:Request)=>f.project.fetch(request)})}} as any);
+ let attachment:any={machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'managed-integration'};
+ const socket={readyState:1,deserializeAttachment:()=>attachment,serializeAttachment:(next:any)=>{attachment=next;},
+               send:(raw:string)=>frames.push(JSON.parse(raw))};sockets.push(socket);
+ const headers={'Content-Type':'application/json','x-hub2-actor':JSON.stringify({id:'machine:h1',kind:'machine',resource_id:'h1',
+                generation:'1',scopes:['machine:heartbeat','machine:offer','session:report']})};
+ const beat=await machine.fetch(new Request('https://machine.test/api/heartbeat',{method:'POST',headers,
+  body:JSON.stringify({labels:[],engines:['claude'],capabilities:['headless','effort:claude','managed:hub-claude:opus:medium:v1']})}));
+ assert.equal(beat.status,200);
+ const own=await intake(f,'real-managed'),request={key:'real-managed',workspace:'/tmp/proof',engine:'claude',model:'opus',
+  effort:'medium',managed_credential_label:'hub-claude'};
+ const result=await f.call('/api/intakes/'+own.id+'/start','POST',request);assert.equal(result.status,201);
+ const saga=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any;
+ const offered=frames.find(frame=>frame.type==='session.offer').offer;
+ assert.equal(offered.request_digest,saga.request_digest);assert.equal(offered.launch.managed_credential_label,'hub-claude');
+ assert.equal(offered.account_id,'claude');assert.equal(offered.operation_id,saga.attempt_operation_id);
+ await machine.webSocketMessage(socket as any,JSON.stringify({type:'offer_ack',session_id:saga.session_id,epoch:saga.epoch}));
+ assert.equal(frames.at(-1).type,'ack');
+ assert.equal((f.sql.prepare('SELECT state FROM dispatch_sagas WHERE operation_id=?').get(saga.operation_id) as any).state,'admitted');
+ assert.equal((database.prepare('SELECT state FROM sessions WHERE id=?').get(saga.session_id) as any).state,'claimed');
+ f.sql.close();f.collectorSql.close();database.close();
 });

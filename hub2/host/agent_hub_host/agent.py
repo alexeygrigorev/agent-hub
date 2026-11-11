@@ -224,9 +224,24 @@ class Bridge:
         if effort is not None and effort not in {'low','medium','high','xhigh','max'}:raise ValueError('invalid_effort')
         supported=self.launcher.capabilities().get(engine,set())
         if any(needed and capability not in supported for capability,needed in [('headless',not launch.get('interactive')),('interactive',launch.get('interactive')),('goal',with_goal),('effort',effort is not None)]):raise ValueError('launcher_capability_unavailable')
+        managed = {}
+        if 'managed_credential_label' in launch:
+            if (launch['managed_credential_label'] != 'hub-claude' or engine != 'claude' or model != 'opus'
+                    or effort != 'medium' or launch.get('interactive') or with_goal or offer.get('account_id') != 'claude'
+                    or not isinstance(offer.get('request_digest'), str) or not re.fullmatch('[0-9a-f]{64}',offer['request_digest'])
+                    or not isinstance(self.machine_id,str) or not self.machine_id):
+                raise ValueError('invalid_managed_credential_route')
+            try:
+                ready = self.launcher.managed_claude_readiness()
+            except Exception:
+                ready = None
+            if not ready:
+                raise ValueError('managed_exec_unavailable')
+            managed = {'managed_credential_label':'hub-claude','account_id':'claude',
+                       'request_digest':offer['request_digest'],'machine_id':self.machine_id}
         return {"workspace": str(workspace), "engine": engine, "model": model,
                 "prompt": prompt, "interactive": bool(launch.get("interactive", False)), "timeout_seconds": timeout,
-                'with_goal':with_goal,'effort':effort}
+                'with_goal':with_goal,'effort':effort,**managed}
 
     def resolve_workspace(self, value):
         if not isinstance(value, str) or not value or len(value) > 1024 or "\0" in value:
@@ -375,7 +390,7 @@ class Bridge:
             task_id, tag = "hub2-" + session, "task-hub2-" + session
             launch['worker_context']={key:offer[key] for key in ('session_id','epoch','intake_id','project_id')}
             launch['worker_context']['machine_id']=self.machine_id
-            if launch['engine']!='shell' and self.launcher.config.get('private_provider_homes', False):
+            if launch['engine']!='shell' and self.launcher.config.get('private_provider_homes', False) and not launch.get('managed_credential_label'):
                 from .providers import provision
                 launch['provider_home']=provision(self.client,offer,launch,self.journal.directory,self.launcher.config.get('routes'))
             if acknowledge:
@@ -1116,6 +1131,12 @@ class Bridge:
                 capabilities.extend(markers[:32-len(capabilities)])
             except Exception:
                 pass  # Read-only observation is never a heartbeat/start gate.
+        if len(capabilities) < 32 and 'claude' in engines:
+            try:
+                if self.launcher.managed_claude_readiness():
+                    capabilities.append('managed:hub-claude:opus:medium:v1')
+            except Exception:
+                pass  # Code readiness is an optional observation, never a heartbeat gate.
         if include_native_sessions:
             self.client.heartbeat(labels,engines,capabilities,native_sessions=self.live_sessions())
             # Observation transport is independent of managed lifecycle/admission.

@@ -1176,6 +1176,8 @@ test('managed Claude opt-in needs current socket heartbeat, not stale persisted 
  const epoch=(await accepted.json() as any).epoch;
  assert.equal((await f.call('/_internal/activate','POST',{operation_id:'op-managed-one',session_id:'managed-one',epoch})).status,201);
  assert.equal(frames.filter(frame=>frame.type==='session.offer').length,1);
+ const poll=await f.call('/api/offers','GET',undefined,{'x-hub2-actor':JSON.stringify({...machineActor,scopes:['machine:offer']})});
+ assert.deepEqual((await poll.json() as any).offers,[],'old REST pollers cannot receive the new selector');
  // Rollback/reconnect has no capability observation even though DB still has it.
  f.sockets.splice(0);const old=makeSocket('old-host');f.sockets.push(old);frames.length=0;
  const oldRouting=await (await f.call('/_internal/routing')).json() as any;

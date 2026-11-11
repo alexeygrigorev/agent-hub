@@ -1717,3 +1717,12 @@ class ManagedClaudeHostTests(unittest.TestCase):
         self.assertEqual(intent['machine_id'],'machine-1');self.assertEqual(intent['request_digest'],'b'*64)
         self.assertEqual(intent['session_id'],offer['session_id']);self.assertEqual(intent['epoch'],offer['epoch'])
         self.assertNotIn('worker-token',repr(intent));self.assertNotIn('token',repr(intent))
+
+    def test_capability_budget_preserves_existing_tags_and_does_not_probe_when_full(self):
+        self.configure();captured=[]
+        self.client.heartbeat=lambda *args,**kw:captured.append(args)
+        tags=['reserved-'+str(i) for i in range(32)]
+        self.bridge.advertisement.tags=lambda:tags
+        with patch.object(self.bridge.launcher,'managed_claude_readiness') as ready:
+            self.bridge.heartbeat([],include_native_sessions=False)
+        self.assertEqual(captured[-1][2],tags);ready.assert_not_called()
