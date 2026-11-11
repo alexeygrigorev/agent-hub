@@ -521,6 +521,66 @@ def update_lock(root):
             UPDATE_LOCK_FD.reset(token)
 
 
+# Keep this list aligned with native_launch.PROVIDER_BINARIES. node/npm support
+# provider entry points and provider-home preparation; the native bridge uses a
+# by default, with aplexer also supported as an explicit executable override.
+PROVIDER_PATH_COMMANDS = ('codex', 'claude', 'opencode', 'zcodex', 'agy', 'a', 'aplexer', 'node', 'npm')
+
+
+def preserve_provider_path():
+    """Return whether service PATH was newly published, importing no other env.
+
+    This is configuration, not a release artifact: retain it through rollback and
+    normal upgrades. Existing files (including explicit empty files or symlinks)
+    always belong to the operator and are never rewritten.
+    """
+    directory = Path.home() / '.config/agent-hub'
+    path = directory / 'host.env'
+    if path.exists() or path.is_symlink():
+        return False
+    ambient = os.environ.get('PATH', os.defpath)
+    found = set()
+    for name in PROVIDER_PATH_COMMANDS:
+        executable = shutil.which(name, path=ambient)
+        if executable and Path(executable).is_absolute():
+            # Do not resolve the executable symlink: npm entry points live in
+            # the versioned bin directory alongside their interpreter.
+            found.add(str(Path(executable).parent))
+    directories = []
+    for entry in ambient.split(os.pathsep):
+        if not entry or not Path(entry).is_absolute():
+            continue
+        entry = str(Path(entry))
+        if entry in found and entry not in directories:
+            directories.append(entry)
+    for entry in (str(Path.home() / '.local/bin'), '/usr/local/bin', '/usr/bin', '/bin'):
+        if entry not in directories:
+            directories.append(entry)
+    value = os.pathsep.join(directories)
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError('provider executable directory contains unsupported characters')
+    value = value.replace('\\', '\\\\').replace('"', '\\"')
+    data = ('# Provider executable directories discovered during service installation.\n'
+            'PATH="' + value + '"\n').encode()
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, temporary = tempfile.mkstemp(prefix='host.env.', dir=directory)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            # Publish complete bytes without racing an operator-created file.
+            os.link(temporary, path)
+        except FileExistsError:
+            return False
+        sync_directory(directory)
+        return True
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
 def install(base_url, root, *, install_service=False, restart=True):
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     with update_lock(root):
@@ -543,11 +603,15 @@ def install(base_url, root, *, install_service=False, restart=True):
         if current.exists() and old is None:
             raise ValueError('current release is unmanaged')
         target = releases / version
+        if install_service:
+            preserve_provider_path()
         if old == target and (target / 'release.json').is_file():
             if install_service:
                 repair_service_files(base, manifest, root, target)
                 if restart:
-                    command(['systemctl', '--user', 'start', UNITS[0]])
+                    # Explicit setup must load staged/repaired host.env even if
+                    # this same release is already running with the old PATH.
+                    command(['systemctl', '--user', 'restart', UNITS[0]])
                     check_service_ready(target)
                     enable_service_timer()
             print('Hub2 release already current: ' + version)
