@@ -430,6 +430,12 @@ class Canary:
         return isinstance(value, str) and bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", value))
 
     @staticmethod
+    def valid_native_id(value):
+        return isinstance(value, str) and bool(
+            re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", value)
+        )
+
+    @staticmethod
     def row_authoritative_key(item):
         ck = item.get("client_key")
         k = item.get("key")
@@ -511,11 +517,13 @@ class Canary:
                     if cls.row_conflicts_scope(item, expected_repo, expected_machine, expected_workspace):
                         return None, None, True
                     sid_rows.append(item)
-            native_ids = {
-                item.get("native_id")
-                for item in sid_rows
-                if isinstance(item.get("native_id"), str) and item.get("native_id")
-            }
+            native_ids = set()
+            for item in sid_rows:
+                row_nat = item.get("native_id")
+                if row_nat is not None:
+                    if not cls.valid_native_id(row_nat):
+                        return None, None, True
+                    native_ids.add(row_nat)
             if len(native_ids) > 1:
                 return None, None, True
             resolved_native = next(iter(native_ids), None)
@@ -544,11 +552,13 @@ class Canary:
         if not key_rows:
             return None, None, False
         sids = {item.get("id") for item in key_rows}
-        native_ids = {
-            item.get("native_id")
-            for item in key_rows
-            if isinstance(item.get("native_id"), str) and item.get("native_id")
-        }
+        native_ids = set()
+        for item in key_rows:
+            row_nat = item.get("native_id")
+            if row_nat is not None:
+                if not cls.valid_native_id(row_nat):
+                    return None, None, True
+                native_ids.add(row_nat)
         if len(sids) != 1 or len(native_ids) > 1:
             return None, None, True
         resolved_sid = next(iter(sids))
@@ -737,7 +747,10 @@ class Canary:
         if raw_sid is not None and not self.valid_session_id(raw_sid):
             raise StageFailure("cleanup", "prior_pending_corrupt")
         sid = raw_sid if self.valid_session_id(raw_sid) else None
-        native_id = rec.get("native_id") if isinstance(rec.get("native_id"), str) and rec.get("native_id") else None
+        raw_native = rec.get("native_id")
+        if raw_native is not None and not self.valid_native_id(raw_native):
+            raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
+        native_id = raw_native if self.valid_native_id(raw_native) else None
         key = rec.get("key") if isinstance(rec.get("key"), str) and rec.get("key") else None
         repo = rec.get("repo") if isinstance(rec.get("repo"), str) and rec.get("repo") else None
         machine = rec.get("machine") if isinstance(rec.get("machine"), str) and rec.get("machine") else None
@@ -779,14 +792,35 @@ class Canary:
                 native_id = native_id or resolved_native
         if not sid:
             raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
-        if self.stop_session(sid, f"{key}-reconcile", deadline) != 0:
+        confirmed, resolved_native = self.stop_or_confirm_retired(
+            sid,
+            f"{key}-reconcile",
+            deadline,
+            expected_native_id=native_id,
+            expected_key=key,
+            expected_repo=repo,
+            expected_machine=machine,
+            expected_workspace=workspace,
+        )
+        if not confirmed:
+            raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
+        native_id = native_id or resolved_native
+        if native_id is not None and not self.valid_native_id(native_id):
             raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
         if native_id:
             try:
                 self.wait_gone_for(native_id, deadline)
             except StageFailure:
                 raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
-        if not self.archive_intake_for(sid, deadline, candidate_sha=rec.get("candidate_sha"), mode=rec.get("mode")):
+        if not self.archive_intake_for(
+            sid,
+            deadline,
+            candidate_sha=rec.get("candidate_sha"),
+            mode=rec.get("mode"),
+            expected_repo=repo,
+            expected_machine=machine,
+            expected_workspace=workspace,
+        ):
             raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
         try:
             durable_unlink(pfile)
@@ -1010,8 +1044,16 @@ class Canary:
             if event.get('type') == 'result' and marker_in(event.get('result')):
                 return True
             part = event.get('part')
-            if event.get('type') == 'text' and isinstance(part, dict) and marker_in(part.get('text')):
-                return True
+            if (
+                event.get('type') == 'tool_use'
+                and isinstance(part, dict)
+                and part.get('type') == 'tool'
+                and isinstance(part.get('tool'), str)
+                and bool(part.get('tool').strip())
+            ):
+                state = part.get('state')
+                if isinstance(state, dict) and state.get('status') == 'completed' and marker_in(state.get('output')):
+                    return True
         return False
 
     def check_capture(self):
@@ -1042,11 +1084,188 @@ class Canary:
             self.pause(deadline)
         raise StageFailure("capture", reason)
 
+    @staticmethod
+    def parse_timestamp_ms(val):
+        if isinstance(val, int) and not isinstance(val, bool) and val > 0:
+            return val
+        if isinstance(val, str) and val.strip():
+            raw = val.strip()
+            if raw.endswith("Z"):
+                raw = raw[:-1] + "+00:00"
+            try:
+                dt = datetime.datetime.fromisoformat(raw)
+            except ValueError:
+                return None
+            if dt.tzinfo is None:
+                return None
+            return int(dt.timestamp() * 1000)
+        return None
+
+    def verify_terminal_session_retired(
+        self,
+        session_id,
+        deadline,
+        *,
+        expected_native_id,
+        expected_key,
+        expected_repo,
+        expected_machine,
+        expected_workspace,
+    ):
+        if not self.valid_session_id(session_id):
+            return False, None
+        rc, out, _ = self.run([*self.hub, "sessions", "show", session_id, "--json"], deadline=deadline)
+        if rc != 0:
+            return False, None
+        try:
+            payload = json.loads(out)
+        except ValueError:
+            return False, None
+        node = payload.get("session", payload) if isinstance(payload, dict) else None
+        if not isinstance(node, dict) or node.get("id") != session_id:
+            return False, None
+        if not self.row_matches_scope(node, expected_repo, expected_machine, expected_workspace):
+            return False, None
+        if self.row_conflicts_scope(node, expected_repo, expected_machine, expected_workspace):
+            return False, None
+        req_ws = node.get("requested_workspace")
+        if req_ws is not None:
+            if not isinstance(req_ws, str) or not req_ws:
+                return False, None
+            try:
+                if pathlib.Path(req_ws).resolve() != pathlib.Path(expected_workspace).resolve():
+                    return False, None
+            except OSError:
+                return False, None
+        row_key, key_conflict = self.row_authoritative_key(node)
+        if key_conflict or (expected_key and row_key is not None and row_key != expected_key):
+            return False, None
+        if expected_native_id is not None and not self.valid_native_id(expected_native_id):
+            return False, None
+        session_native = node.get("native_id")
+        if not self.valid_native_id(session_native):
+            return False, None
+        if expected_native_id is not None and session_native != expected_native_id:
+            return False, None
+        intake_id = node.get("intake_id")
+        if not isinstance(intake_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", intake_id):
+            return False, None
+        created_at_ms = self.parse_timestamp_ms(node.get("created_at"))
+        if created_at_ms is None:
+            return False, None
+        state = node.get("state")
+        if state == "stopped" and node.get("stop_confirmed") is True:
+            updated_at = node.get("updated_at")
+            if updated_at is not None:
+                updated_at_ms = self.parse_timestamp_ms(updated_at)
+                if updated_at_ms is None or updated_at_ms < created_at_ms:
+                    return False, None
+            return True, session_native
+        if state not in ("completed-awaiting-review", "completed", "failed", "stopped"):
+            return False, None
+        ev = node.get("evidence")
+        if not isinstance(ev, dict) or ev.get("native_exit_confirmed") is not True:
+            return False, None
+        if (
+            ev.get("session_id") != session_id
+            or ev.get("machine_id") != expected_machine
+            or ev.get("intake_id") != intake_id
+            or ev.get("native_id") != session_native
+        ):
+            return False, None
+        epoch = node.get("epoch")
+        if not isinstance(epoch, int) or isinstance(epoch, bool) or ev.get("epoch") != epoch:
+            return False, None
+        sess_op = node.get("operation_id")
+        ev_op = ev.get("operation_id")
+        ev_attempt_op = ev.get("attempt_operation_id")
+        if not all(isinstance(x, str) and x for x in (sess_op, ev_op, ev_attempt_op)):
+            return False, None
+        if ev_attempt_op != sess_op or not (ev_attempt_op == ev_op or ev_attempt_op.startswith(f"{ev_op}:")):
+            return False, None
+        digest = ev.get("evidence_digest")
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            return False, None
+        exit_code = ev.get("exit_code")
+        if not isinstance(exit_code, int) or isinstance(exit_code, bool):
+            return False, None
+        inner = ev.get("evidence")
+        if (
+            not isinstance(inner, dict)
+            or inner.get("containment_empty") is not True
+            or inner.get("source") != "aplexer_retirement"
+        ):
+            return False, None
+        nid_obj = inner.get("native_identity")
+        if (
+            not isinstance(nid_obj, dict)
+            or nid_obj.get("id") != session_native
+            or nid_obj.get("tag") != f"task-hub2-{session_id}"
+        ):
+            return False, None
+        nid_ws = nid_obj.get("workspace")
+        if not isinstance(nid_ws, str) or not nid_ws:
+            return False, None
+        try:
+            if pathlib.Path(nid_ws).resolve() != pathlib.Path(expected_workspace).resolve():
+                return False, None
+        except OSError:
+            return False, None
+        nexit = inner.get("native_exit")
+        if not isinstance(nexit, dict):
+            return False, None
+        ncode = nexit.get("code")
+        exited_at_ms = nexit.get("exited_at_ms")
+        if not isinstance(ncode, int) or isinstance(ncode, bool) or ncode != exit_code:
+            return False, None
+        if not isinstance(exited_at_ms, int) or isinstance(exited_at_ms, bool) or exited_at_ms < created_at_ms:
+            return False, None
+        return True, session_native
+
+    def stop_session_with_output(self, session_id, key, deadline):
+        return self.run(
+            [
+                *self.hub, "sessions", "stop", session_id, "--key", key,
+                "--wait", "--timeout", str(max(1, int(self.stop_timeout))), "--interval", "1",
+            ],
+            deadline=deadline,
+        )
+
     def stop_session(self, session_id, key, deadline):
-        rc, _, _ = self.run([*self.hub, "sessions", "stop", session_id, "--key", key,
-                             "--wait", "--timeout", str(max(1, int(self.stop_timeout))), "--interval", "1"],
-                            deadline=deadline)
+        rc, _, _ = self.stop_session_with_output(session_id, key, deadline)
         return rc
+
+    def stop_or_confirm_retired(
+        self,
+        session_id,
+        stop_key,
+        deadline,
+        *,
+        expected_native_id,
+        expected_key,
+        expected_repo,
+        expected_machine,
+        expected_workspace,
+    ):
+        rc, _, err = self.stop_session_with_output(session_id, stop_key, deadline)
+        if rc == 0:
+            if expected_native_id is not None and not self.valid_native_id(expected_native_id):
+                return False, None
+            return True, expected_native_id
+        if self.failure_reason(rc, err) == "session_not_running":
+            verified, resolved_native = self.verify_terminal_session_retired(
+                session_id,
+                deadline,
+                expected_native_id=expected_native_id,
+                expected_key=expected_key,
+                expected_repo=expected_repo,
+                expected_machine=expected_machine,
+                expected_workspace=expected_workspace,
+            )
+            if not verified or not self.valid_native_id(resolved_native):
+                return False, None
+            return True, resolved_native
+        return False, expected_native_id
 
     def stop(self, deadline, suffix="stop"):
         self.current_stage = "stop"
@@ -1069,7 +1288,17 @@ class Canary:
         self.current_stage = "gone"
         self.wait_gone_for(self.native, deadline)
 
-    def archive_intake_for(self, session_id, deadline, *, candidate_sha=None, mode=None):
+    def archive_intake_for(
+        self,
+        session_id,
+        deadline,
+        *,
+        candidate_sha=None,
+        mode=None,
+        expected_repo=None,
+        expected_machine=None,
+        expected_workspace=None,
+    ):
         if not session_id:
             return False
         rc, out, _ = self.run([*self.hub, "sessions", "show", session_id, "--json"], deadline=deadline)
@@ -1080,7 +1309,14 @@ class Canary:
         except ValueError:
             return False
         node = payload.get("session", payload) if isinstance(payload, dict) else None
-        intake_id = node.get("intake_id") if isinstance(node, dict) else None
+        if not isinstance(node, dict) or node.get("id") != session_id:
+            return False
+        eff_repo = self.repo if expected_repo is None else expected_repo
+        eff_machine = self.machine if expected_machine is None else expected_machine
+        eff_workspace = self.workspace if expected_workspace is None else expected_workspace
+        if self.row_conflicts_scope(node, eff_repo, eff_machine, eff_workspace):
+            return False
+        intake_id = node.get("intake_id")
         if not isinstance(intake_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", intake_id):
             return False
         eff_candidate = self.candidate_sha if candidate_sha is None else candidate_sha
@@ -1105,6 +1341,9 @@ class Canary:
             limit_deadline,
             candidate_sha=self.candidate_sha,
             mode=self.mode,
+            expected_repo=self.repo,
+            expected_machine=self.machine,
+            expected_workspace=self.workspace,
         )
 
     def cleanup(self, deadline=None):
@@ -1138,7 +1377,20 @@ class Canary:
                         pass
         if not self.session:
             return "FAILED_needs_reconciliation" if self.start_attempted else "not_needed"
-        if self.stop(limit_deadline, "cleanup") != 0:
+        confirmed, resolved_native = self.stop_or_confirm_retired(
+            self.session,
+            f"{self.key}-cleanup",
+            limit_deadline,
+            expected_native_id=self.native,
+            expected_key=self.key,
+            expected_repo=self.repo,
+            expected_machine=self.machine,
+            expected_workspace=self.workspace,
+        )
+        if not confirmed:
+            return "FAILED_needs_reconciliation"
+        self.native = self.native or resolved_native
+        if self.native is not None and not self.valid_native_id(self.native):
             return "FAILED_needs_reconciliation"
         if self.native:
             try:
@@ -1203,8 +1455,11 @@ class Canary:
                     self.intake_archived = self.archive_intake(deadline=cleanup_deadline)
                 except BaseException:
                     self.intake_archived = False
-                if result["ok"] and not self.intake_archived:
-                    result.update(ok=False, stage="cleanup", reason="intake_archive_failed")
+                if not self.intake_archived:
+                    if not self.stopped:
+                        result["cleanup"] = "FAILED_needs_reconciliation"
+                    if result["ok"]:
+                        result.update(ok=False, stage="cleanup", reason="intake_archive_failed")
             if self.durable_pending_enabled and (self.stopped or result["cleanup"] == "stopped") and (
                 self.intake_archived is True
             ):
