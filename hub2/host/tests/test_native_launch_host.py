@@ -2,6 +2,7 @@
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -86,6 +87,91 @@ class EffortAndInteractiveTest(unittest.TestCase):
         base = nl.adapter_argv('go', 'goal', nl.OPENCODE_MODEL)
         with self.assertRaises(ValueError):
             nl.interactive_argv('go', base, 'goal', model=nl.OPENCODE_MODEL, with_goal=True)
+
+
+class GoalNativeEngineTest(unittest.TestCase):
+    def temporary_workspace(self):
+        directory = Path(__file__).resolve().parents[3] / '.local/tmp'
+        directory.mkdir(parents=True, exist_ok=True)
+        return tempfile.TemporaryDirectory(dir=directory, prefix='native-goal-engine-')
+
+    def goal_launch(self, provider, *, returned_engine=None, conflicting_proof=False):
+        with self.temporary_workspace() as workspace:
+            task_id = 'goal-native-engine'
+            created = int(time.time() * 1000)
+            captured = {}
+            native_id = 'd6cf9872-8597-48a5-be64-990cdef4db31'
+            model = 'glm-5.3-flash' if provider == 'zai' else 'gpt-6.1-sol'
+            spec = {'workspace': workspace, 'engine': 'codex', 'model': model,
+                    'prompt': 'complete the exact scoped objective', 'interactive': True,
+                    'with_goal': True, 'effort': 'medium', 'timeout_seconds': 600,
+                    'provider_home': '/synthetic/private-provider', 'client': mock.Mock(),
+                    'session_id': 'session-goal', 'operation_id': 'operation-goal', 'epoch': 1}
+            prompt = nl.aplexer_prompt(spec['prompt'] + nl.FIRST_ACTION_INSTRUCTION.format(
+                path=Path(workspace) / '.local' / ('first-action-' + task_id + '.json')))
+            expected_child = nl.interactive_argv(provider, nl.adapter_argv(provider, prompt, model), prompt,
+                                                 model=model, effort='medium', with_goal=True)
+            row = {}
+
+            def runner(argv, **options):
+                captured.update(argv=argv, options=options)
+                # Match aplexer's actual contract: explicit argv does not imply
+                # its engine; engine defaults to shell without --engine/profile.
+                prefix = argv[:argv.index('--')]
+                engine = prefix[prefix.index('--engine') + 1] if '--engine' in prefix else 'shell'
+                child = argv[argv.index('--') + 1:]
+                row.update(id=native_id, tag='task-' + task_id, workspace=workspace,
+                           engine=returned_engine or engine, command=child,
+                           created_at_ms=created, phase='running')
+                return subprocess.CompletedProcess(argv, 0, json.dumps(row), '')
+
+            adapter = nl.NativeLauncher({'private_provider_homes': True,
+                                         'routes': {'codex': {'provider': provider}}}, runner=runner)
+            proof = {'thread_id': 'synthetic-exact-thread'}
+            original_goal_prompt = nl.goal_prompt
+
+            def make_goal(*args):
+                goal = original_goal_prompt(*args)
+                captured['objective'] = goal
+                proof['objective_hash'] = nl.objective_hash('conflicting goal' if conflicting_proof else goal)
+                return goal
+            delivery = {'id': native_id, 'delivery': {'engine': 'codex', 'ready': True,
+                        'landed': True, 'submitted': True, 'status': 'submitted', 'sends': 1, 'enter_presses': 1}}
+            with mock.patch.object(nl, 'goal_prompt', side_effect=make_goal), \
+                 mock.patch.object(nl, 'session_binding', return_value={
+                    'runtime_deadline': int(time.time() * 1000) + 500000}), \
+                 mock.patch.object(nl, 'native_environment', return_value={'CODEX_HOME': '/synthetic/trusted-codex'}), \
+                 mock.patch.object(adapter, 'status', side_effect=lambda *args, **kw: dict(row)), \
+                 mock.patch.object(nl, 'goal_store', side_effect=[None, proof]) as store, \
+                 mock.patch.object(adapter, 'native', return_value=subprocess.CompletedProcess([], 0, json.dumps(delivery), '')) as send, \
+                 mock.patch.object(adapter, 'record_evidence'):
+                receipt = adapter.launch(task_id, spec)
+            expected_goal = captured['objective']
+            self.assertEqual(receipt['goal_registration'], proof)
+            self.assertEqual(captured['argv'][captured['argv'].index('--') + 1:], expected_child)
+            self.assertNotIn(expected_goal, expected_child, 'goal must use guarded send, not CLI prompt')
+            self.assertIn('CODEX_HOME=/synthetic/trusted-codex', captured['argv'])
+            self.assertNotIn('--profile', captured['argv'][:captured['argv'].index('--')])
+            self.assertEqual(send.call_args.args[:3], ('send', native_id, '/goal ' + expected_goal))
+            self.assertEqual(send.call_count, 1)
+            self.assertEqual(store.call_count, 2)
+            return captured
+
+    def test_codex_and_zai_goals_pin_native_codex_family_without_rewriting_child(self):
+        for provider in ('codex', 'zai'):
+            with self.subTest(provider=provider):
+                captured = self.goal_launch(provider)
+                prefix = captured['argv'][:captured['argv'].index('--')]
+                self.assertEqual(prefix[prefix.index('--engine') + 1], 'codex')
+
+    def test_shell_receipt_is_still_rejected_for_goal_registration(self):
+        with self.assertRaisesRegex(RuntimeError, '^native_goal_provider_unsupported$'):
+            self.goal_launch('codex', returned_engine='shell')
+
+    def test_wrong_objective_proof_is_still_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, '^native_goal_objective_conflict$'):
+            self.goal_launch('codex', conflicting_proof=True)
+
 
 
 class FirstActionTest(unittest.TestCase):
