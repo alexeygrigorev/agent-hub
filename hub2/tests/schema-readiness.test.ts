@@ -7,6 +7,7 @@ import {mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, 
 import {join, resolve} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 import {probeSchemaReadiness} from '../node/schema-readiness.ts';
+import {NodeDurableStorage, NodeSqlStorage} from '../node/sqlite-storage.ts';
 import {MeteredDb, initializeSchema} from '../src/db';
 import {ControlDO} from '../src/control-do';
 import {MachineDO} from '../src/machine-do';
@@ -200,5 +201,36 @@ test('missing constructor dependency is refused without creating a new database'
   try{
     await assert.rejects(probeSchemaReadiness({classes:{CONTROL:Control,MACHINES:Machine},env:{},dataDir:dir}),/^Error: schema_readiness_failed$/);
     assert.equal(readdirSync(dir).filter(file=>file.endsWith('.sqlite')).length,1);
+  }finally{rmSync(dir,{recursive:true});}
+});
+
+test('real MachineDO readiness accepts pending stop commands overdue by more than 24h while preserving alarm range guards',async()=>{
+  const dir=directory(),machine=pathFor(dir,'MACHINES','hetzner-aplexer');seed(machine);
+  const classes={MACHINES:MachineDO} as any;
+  const staleCreatedAt=Date.now()-36*3600_000;
+  try{
+    assert.equal(await probeSchemaReadiness({classes,env:{HUB2_SCHEMA_MIGRATIONS:'defer'},dataDir:dir}),1);
+    assert.equal(inspect(machine).version,6);
+    const db=new DatabaseSync(machine);
+    db.prepare(`INSERT INTO session_commands(id,session_id,machine_id,epoch,request_key,request_digest,kind,text,state,result_json,created_at,updated_at)
+      VALUES('cmd-stale-stop','sess-stale','hetzner-aplexer',1,'stop-1','digest-1','stop',NULL,'pending',NULL,?,?)`).run(staleCreatedAt,staleCreatedAt);
+    db.close();
+    assert.equal(await probeSchemaReadiness({classes,env:{HUB2_SCHEMA_MIGRATIONS:'defer'},dataDir:dir}),1);
+    assert.equal(inspect(machine).version,6);
+    const afterDefer=new DatabaseSync(machine);
+    assert.equal((afterDefer.prepare('SELECT due FROM hub2_alarm WHERE singleton=1').get() as any)?.due,staleCreatedAt+60_000);
+    afterDefer.close();
+    assert.equal(await probeSchemaReadiness({classes,env:{HUB2_SCHEMA_MIGRATIONS:'apply'},dataDir:dir}),1);
+    assert.equal(inspect(machine).version,7);
+
+    const sql=new NodeSqlStorage(join(dir,'alarm-bounds.sqlite'));
+    const storage=new NodeDurableStorage(sql);
+    try{
+      await storage.setAlarm(0);
+      assert.equal(await storage.getAlarm(),0);
+      await assert.rejects(storage.setAlarm(1.5),/^TypeError: alarm_due_not_safe_integer$/);
+      await assert.rejects(storage.setAlarm(-1),/^RangeError: alarm_due_out_of_range$/);
+      await assert.rejects(storage.setAlarm(Date.now()+5*365*24*60*60*1000+60_000),/^RangeError: alarm_due_out_of_range$/);
+    }finally{sql.close();}
   }finally{rmSync(dir,{recursive:true});}
 });
