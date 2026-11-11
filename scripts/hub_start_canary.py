@@ -25,6 +25,14 @@ TRUSTED_CMD_TIMEOUT_S = 45.0
 TRUSTED_ACTIVE_BUDGET_S = 240.0
 TRUSTED_CLEANUP_BUDGET_S = 60.0
 TRUSTED_LOCK_WAIT_S = 5.0
+PERIODIC_DEFAULT_LOCK_WAIT_S = 120.0
+HOST_UPDATER_TRIGGER_ARGV = (
+    "systemctl",
+    "--user",
+    "start",
+    "--no-block",
+    "agent-hub2-host-update.service",
+)
 
 
 class StageFailure(Exception):
@@ -275,20 +283,27 @@ class Canary:
         mode,
         run_id,
         *,
+        deploy_gate=False,
         candidate_sha=None,
         candidate_cli_sha256=None,
         run_token=None,
         expected_helper_sha256=None,
     ):
         self.mode, self.run_id = mode, run_id
+        self.deploy_gate = bool(deploy_gate)
         self.candidate_sha = candidate_sha
         self.candidate_cli_sha256 = candidate_cli_sha256
         self.run_token = run_token
         self.expected_helper_sha256 = expected_helper_sha256
+        self.durable_pending_enabled = (not self.deploy_gate) or (self.candidate_sha is not None)
         self.helper_sha256 = None
         self.host_version = None
         self.hub_pyz_sha256 = None
         self.intake_archived = None
+        self.host_updater_triggered = False
+        self.host_updater_trigger = "not_needed"
+        self.host_updater_trigger_error = None
+        self.prior_pending_failed = False
         self.pyz_fd = None
         self.hub_pass_fds = ()
         self.lock_fd = None
@@ -318,7 +333,7 @@ class Canary:
             self.cmd_timeout = env_num("HUB_CANARY_CMD_TIMEOUT_S", 90)
             self.active_budget = env_num("HUB_CANARY_ACTIVE_BUDGET_S", 300)
             self.cleanup_budget = env_num("HUB_CANARY_CLEANUP_BUDGET_S", self.stop_timeout)
-            self.lock_wait = max(0.0, env_num("HUB_CANARY_LOCK_WAIT_S", TRUSTED_LOCK_WAIT_S))
+            self.lock_wait = max(0.0, env_num("HUB_CANARY_LOCK_WAIT_S", PERIODIC_DEFAULT_LOCK_WAIT_S))
         self.active_deadline = None
         self.workspace = os.environ.get("HUB_CANARY_WORKSPACE") or str(pathlib.Path.home() / "work" / "hub-canary")
         self.host_release_root = pathlib.Path(
@@ -371,13 +386,16 @@ class Canary:
             raise StageFailure("helper_version", "helper_sha256_mismatch")
 
     def acquire_deploy_gate_lock(self):
-        if self.candidate_sha is None:
+        if not self.durable_pending_enabled:
             return
         self.current_stage = "lock"
         self.state_dir_path = ensure_private_dir(raw_state_dir_path(), stage="lock", prefix="state_dir")
+        wait_s = self.lock_wait
+        if self.active_deadline is not None:
+            wait_s = min(wait_s, max(0.0, self.active_deadline - time.monotonic()))
         self.lock_fd = acquire_lock_fd(
             self.state_dir_path / "deploy-gate.lock",
-            self.lock_wait,
+            wait_s,
             stage="lock",
             busy_reason="deploy_gate_lock_busy",
         )
@@ -548,6 +566,57 @@ class Canary:
                 return None, None, True
         return resolved_sid, resolved_native, False
 
+    @staticmethod
+    def resolve_updater_xdg_runtime_dir():
+        raw = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+        candidate = pathlib.Path(raw) if raw else pathlib.Path(f"/run/user/{os.geteuid()}")
+        if not candidate.is_absolute():
+            return None, "host_updater_xdg_runtime_dir_relative"
+        try:
+            st = os.lstat(candidate)
+        except FileNotFoundError:
+            return None, "host_updater_xdg_runtime_dir_missing"
+        except OSError:
+            return None, "host_updater_xdg_runtime_dir_stat_failed"
+        if stat.S_ISLNK(st.st_mode):
+            return None, "host_updater_xdg_runtime_dir_symlink"
+        if not stat.S_ISDIR(st.st_mode):
+            return None, "host_updater_xdg_runtime_dir_not_directory"
+        if st.st_uid != os.geteuid():
+            return None, "host_updater_xdg_runtime_dir_wrong_owner"
+        if (st.st_mode & 0o077) != 0:
+            return None, "host_updater_xdg_runtime_dir_not_private"
+        return str(candidate), None
+
+    def trigger_host_updater(self, deadline):
+        if self.host_updater_triggered:
+            return
+        self.host_updater_triggered = True
+        effective_deadline = deadline
+        if not self.in_cleanup and self.active_deadline is not None:
+            effective_deadline = min(effective_deadline, self.active_deadline)
+        if effective_deadline - time.monotonic() <= 0:
+            self.host_updater_trigger = "timeout"
+            self.host_updater_trigger_error = "host_updater_trigger_timeout"
+            return
+        xdg_dir, xdg_err = self.resolve_updater_xdg_runtime_dir()
+        if xdg_err is not None:
+            self.host_updater_trigger = "failed"
+            self.host_updater_trigger_error = xdg_err
+            return
+        updater_env = dict(os.environ)
+        updater_env["XDG_RUNTIME_DIR"] = xdg_dir
+        rc, _, _ = self.run(list(HOST_UPDATER_TRIGGER_ARGV), deadline=deadline, env=updater_env)
+        if rc == 0:
+            self.host_updater_trigger = "triggered"
+            self.host_updater_trigger_error = None
+        elif rc == 124:
+            self.host_updater_trigger = "timeout"
+            self.host_updater_trigger_error = "host_updater_trigger_timeout"
+        else:
+            self.host_updater_trigger = "failed"
+            self.host_updater_trigger_error = f"host_updater_trigger_exit_{rc}"
+
     def verify_candidate_host_release(self):
         if not self.candidate_sha:
             return
@@ -565,6 +634,8 @@ class Canary:
                 is_rel_dir = False
             if not is_rel_dir:
                 reason = "candidate_release_not_installed"
+                if not self.host_updater_triggered:
+                    self.trigger_host_updater(deadline)
                 self.pause(deadline)
                 continue
             try:
@@ -573,6 +644,8 @@ class Canary:
                 is_current = False
             if not is_current:
                 reason = "current_release_not_converged"
+                if not self.host_updater_triggered:
+                    self.trigger_host_updater(deadline)
                 self.pause(deadline)
                 continue
             if not verified_pyz:
@@ -646,81 +719,105 @@ class Canary:
             elif time.monotonic() < deadline:
                 self.host_version = self.candidate_sha
                 return
+            if not self.host_updater_triggered:
+                self.trigger_host_updater(deadline)
             self.pause(deadline)
-        raise StageFailure("host_release", f"timeout_{reason}")
+        failure_reason = f"timeout_{reason}"
+        if self.host_updater_trigger_error:
+            failure_reason = f"{failure_reason}:{self.host_updater_trigger_error}"
+        raise StageFailure("host_release", failure_reason)
+
+    def _reconcile_one_pending_file(self, pfile, deadline):
+        try:
+            rec = json.loads(read_regular_nofollow(pfile, max_bytes=65536).decode("utf-8"))
+        except (OSError, ValueError):
+            raise StageFailure("cleanup", "prior_pending_corrupt")
+        if not isinstance(rec, dict):
+            raise StageFailure("cleanup", "prior_pending_corrupt")
+        raw_sid = rec.get("session_id")
+        if raw_sid is not None and not self.valid_session_id(raw_sid):
+            raise StageFailure("cleanup", "prior_pending_corrupt")
+        sid = raw_sid if self.valid_session_id(raw_sid) else None
+        native_id = rec.get("native_id") if isinstance(rec.get("native_id"), str) and rec.get("native_id") else None
+        key = rec.get("key") if isinstance(rec.get("key"), str) and rec.get("key") else None
+        repo = rec.get("repo") if isinstance(rec.get("repo"), str) and rec.get("repo") else None
+        machine = rec.get("machine") if isinstance(rec.get("machine"), str) and rec.get("machine") else None
+        workspace = rec.get("workspace") if isinstance(rec.get("workspace"), str) and rec.get("workspace") else None
+        if not key or not repo or not machine or not workspace:
+            raise StageFailure("cleanup", "prior_pending_corrupt")
+        if not sid and all(isinstance(rec.get(k), str) and rec.get(k) for k in ("repo", "machine", "workspace", "name", "key", "prompt", "mode")):
+            replay_args = [
+                *self.hub, "sessions", "start", "--no-wait",
+                "--repo", rec["repo"], "--machine", rec["machine"],
+                "--workspace", rec["workspace"], "--name", rec["name"],
+                "--key", rec["key"], "--prompt", rec["prompt"],
+            ]
+            if rec["mode"] == "shell":
+                replay_args += ["--engine", "shell"]
+            _, out, _ = self.run(replay_args, deadline=deadline)
+            sid = self.extract_session_id(out)
+        items = None
+        conflict = False
+        if not sid or not native_id:
+            try:
+                items = self.list_items("cleanup", deadline)
+            except StageFailure:
+                items = None
+            if items is not None:
+                resolved_sid, resolved_native, conflict = self.resolve_owned_session(
+                    items,
+                    expected_sid=sid,
+                    expected_key=key,
+                    expected_repo=repo,
+                    expected_machine=machine,
+                    expected_workspace=workspace,
+                )
+                if conflict:
+                    raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
+                sid = sid or resolved_sid
+                if native_id and resolved_native and native_id != resolved_native:
+                    raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
+                native_id = native_id or resolved_native
+        if not sid:
+            if rec.get("candidate_sha") is None and raw_sid is None and items is not None and not conflict:
+                try:
+                    durable_unlink(pfile)
+                except OSError:
+                    raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
+                return
+            raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
+        if self.stop_session(sid, f"{key}-reconcile", deadline) != 0:
+            raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
+        if native_id:
+            try:
+                self.wait_gone_for(native_id, deadline)
+            except StageFailure:
+                raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
+        if not self.archive_intake_for(sid, deadline, candidate_sha=rec.get("candidate_sha"), mode=rec.get("mode")):
+            raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
+        try:
+            durable_unlink(pfile)
+        except OSError:
+            raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
 
     def reconcile_prior_pending(self):
         if self.pending_dir is None:
             return
         self.current_stage = "cleanup"
         pending_files = sorted(self.pending_dir.glob("*.json"))
+        self.prior_pending_failed = False
         for pfile in pending_files:
+            if self.pending_path is not None and pfile == self.pending_path:
+                continue
             deadline = self.stage_deadline(self.stop_timeout)
             try:
-                rec = json.loads(read_regular_nofollow(pfile, max_bytes=65536).decode("utf-8"))
-            except (OSError, ValueError):
-                raise StageFailure("cleanup", "prior_pending_corrupt")
-            if not isinstance(rec, dict):
-                raise StageFailure("cleanup", "prior_pending_corrupt")
-            raw_sid = rec.get("session_id")
-            if raw_sid is not None and not self.valid_session_id(raw_sid):
-                raise StageFailure("cleanup", "prior_pending_corrupt")
-            sid = raw_sid if self.valid_session_id(raw_sid) else None
-            native_id = rec.get("native_id") if isinstance(rec.get("native_id"), str) and rec.get("native_id") else None
-            key = rec.get("key") if isinstance(rec.get("key"), str) and rec.get("key") else None
-            repo = rec.get("repo") if isinstance(rec.get("repo"), str) and rec.get("repo") else None
-            machine = rec.get("machine") if isinstance(rec.get("machine"), str) and rec.get("machine") else None
-            workspace = rec.get("workspace") if isinstance(rec.get("workspace"), str) and rec.get("workspace") else None
-            if not key or not repo or not machine or not workspace:
-                raise StageFailure("cleanup", "prior_pending_corrupt")
-            if not sid and all(isinstance(rec.get(k), str) and rec.get(k) for k in ("repo", "machine", "workspace", "name", "key", "prompt", "mode")):
-                replay_args = [
-                    *self.hub, "sessions", "start", "--no-wait",
-                    "--repo", rec["repo"], "--machine", rec["machine"],
-                    "--workspace", rec["workspace"], "--name", rec["name"],
-                    "--key", rec["key"], "--prompt", rec["prompt"],
-                ]
-                if rec["mode"] == "shell":
-                    replay_args += ["--engine", "shell"]
-                _, out, _ = self.run(replay_args, deadline=deadline)
-                sid = self.extract_session_id(out)
-            if not sid or not native_id:
-                try:
-                    items = self.list_items("cleanup", deadline)
-                except StageFailure:
-                    items = None
-                if items is not None:
-                    resolved_sid, resolved_native, conflict = self.resolve_owned_session(
-                        items,
-                        expected_sid=sid,
-                        expected_key=key,
-                        expected_repo=repo,
-                        expected_machine=machine,
-                        expected_workspace=workspace,
-                    )
-                    if conflict:
-                        raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
-                    sid = sid or resolved_sid
-                    if native_id and resolved_native and native_id != resolved_native:
-                        raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
-                    native_id = native_id or resolved_native
-            if not sid:
-                raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
-            if self.stop_session(sid, f"{key}-reconcile", deadline) != 0:
-                raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
-            if native_id:
-                try:
-                    self.wait_gone_for(native_id, deadline)
-                except StageFailure:
-                    raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
-            if rec.get("candidate_sha") and not self.archive_intake_for(sid, deadline):
-                raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
-            try:
-                durable_unlink(pfile)
-            except OSError:
-                raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
+                self._reconcile_one_pending_file(pfile, deadline)
+            except StageFailure:
+                if self.candidate_sha is not None:
+                    raise
+                self.prior_pending_failed = True
 
-    def run(self, argv, timeout=None, *, deadline=None):
+    def run(self, argv, timeout=None, *, deadline=None, env=None):
         limit = self.cmd_timeout if timeout is None else timeout
         effective_deadline = deadline
         if not self.in_cleanup and self.active_deadline is not None:
@@ -738,6 +835,7 @@ class Canary:
                 text=True,
                 start_new_session=True,
                 pass_fds=pass_fds,
+                env=env,
             )
         except OSError as error:
             return 127, "", type(error).__name__
@@ -984,7 +1082,7 @@ class Canary:
         self.current_stage = "gone"
         self.wait_gone_for(self.native, deadline)
 
-    def archive_intake_for(self, session_id, deadline):
+    def archive_intake_for(self, session_id, deadline, *, candidate_sha=None, mode=None):
         if not session_id:
             return False
         rc, out, _ = self.run([*self.hub, "sessions", "show", session_id, "--json"], deadline=deadline)
@@ -998,15 +1096,29 @@ class Canary:
         intake_id = node.get("intake_id") if isinstance(node, dict) else None
         if not isinstance(intake_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", intake_id):
             return False
-        rc, _, _ = self.run(
-            [*self.hub, "intake", "update", intake_id, "--status", "archived", "--reason", "deploy_gate_shell_canary"],
-            deadline=deadline,
-        )
+        eff_candidate = self.candidate_sha if candidate_sha is None else candidate_sha
+        eff_mode = self.mode if mode is None else mode
+        if eff_candidate:
+            archive_args = [
+                *self.hub, "intake", "update", intake_id,
+                "--status", "archived", "--reason", "deploy_gate_shell_canary",
+            ]
+        else:
+            archive_args = [
+                *self.hub, "intake", "update", intake_id,
+                "--status", "archived", "--note", f"periodic_{clean(eff_mode, 16)}_canary",
+            ]
+        rc, _, _ = self.run(archive_args, deadline=deadline)
         return rc == 0
 
     def archive_intake(self, deadline=None):
         limit_deadline = deadline if deadline is not None else (time.monotonic() + min(self.cmd_timeout, 30))
-        return self.archive_intake_for(self.session, limit_deadline)
+        return self.archive_intake_for(
+            self.session,
+            limit_deadline,
+            candidate_sha=self.candidate_sha,
+            mode=self.mode,
+        )
 
     def cleanup(self, deadline=None):
         limit_deadline = deadline if deadline is not None else (time.monotonic() + self.stop_timeout)
@@ -1097,7 +1209,7 @@ class Canary:
                     result["cleanup"] = self.cleanup(deadline=cleanup_deadline)
                 except BaseException:
                     result["cleanup"] = "FAILED_needs_reconciliation"
-            if self.candidate_sha is not None and self.session and (
+            if self.durable_pending_enabled and self.session and (
                 self.stopped or result["cleanup"] == "stopped"
             ):
                 try:
@@ -1106,8 +1218,8 @@ class Canary:
                     self.intake_archived = False
                 if result["ok"] and not self.intake_archived:
                     result.update(ok=False, stage="cleanup", reason="intake_archive_failed")
-            if (self.stopped or result["cleanup"] == "stopped") and (
-                self.candidate_sha is None or self.intake_archived is True
+            if self.durable_pending_enabled and (self.stopped or result["cleanup"] == "stopped") and (
+                self.intake_archived is True
             ):
                 try:
                     self.clear_pending_state()
@@ -1115,6 +1227,17 @@ class Canary:
                     result["cleanup"] = "FAILED_needs_reconciliation"
                     if result["ok"]:
                         result.update(ok=False, stage="cleanup", reason="pending_state_clear_failed")
+            if self.durable_pending_enabled and self.prior_pending_failed and (
+                self.stopped or result["cleanup"] == "stopped"
+            ):
+                try:
+                    self.reconcile_prior_pending()
+                except BaseException:
+                    self.prior_pending_failed = True
+                if self.prior_pending_failed:
+                    result["cleanup"] = "FAILED_needs_reconciliation"
+                    if result["ok"]:
+                        result.update(ok=False, stage="cleanup", reason="prior_pending_reconciliation_failed")
             if self.pyz_fd is not None:
                 try:
                     os.close(self.pyz_fd)
@@ -1136,12 +1259,17 @@ class Canary:
         result["session_id"] = self.session
         if self.helper_sha256 is not None:
             result["helper_sha256"] = self.helper_sha256
+        if self.intake_archived is not None:
+            result["intake_archived"] = bool(self.intake_archived)
         if self.candidate_sha is not None:
             result["candidate_sha"] = self.candidate_sha
             result["run_token"] = self.run_token
             result["host_version"] = self.host_version
             result["hub_pyz_sha256"] = self.hub_pyz_sha256
             result["intake_archived"] = bool(self.intake_archived)
+            result["host_updater_trigger"] = self.host_updater_trigger
+            if self.host_updater_trigger_error is not None:
+                result["host_updater_trigger_error"] = self.host_updater_trigger_error
         return result
 
 
@@ -1190,6 +1318,10 @@ def apply_alerting(result):
         path = sdir / f"state-{result['mode']}.json"
         st = load_state(path)
         mode = result["mode"]
+        if not result["ok"] and result.get("stage") == "lock" and result.get("reason") == "deploy_gate_lock_busy":
+            st["last_lock_busy"] = {k: result[k] for k in ("ok", "stage", "reason", "timestamp", "run_id")}
+            save_state(path, st)
+            return
         if result["ok"]:
             st["failures"] = 0
             if st.get("incident_open"):
@@ -1263,6 +1395,7 @@ def main():
     result = Canary(
         mode,
         run_id,
+        deploy_gate=args.deploy_gate,
         candidate_sha=args.candidate_sha,
         candidate_cli_sha256=args.candidate_cli_sha256,
         run_token=args.run_token,
@@ -1271,7 +1404,16 @@ def main():
     if args.deploy_gate:
         result["deploy_gate"] = True
     else:
-        apply_alerting(result)
+        try:
+            apply_alerting(result)
+        except StageFailure as failure:
+            result["alert_state_error"] = f"{failure.stage}:{failure.reason}"
+            if result["ok"]:
+                result.update(ok=False, stage=failure.stage, reason=failure.reason)
+        except OSError:
+            result["alert_state_error"] = "lock:alert_state_write_failed"
+            if result["ok"]:
+                result.update(ok=False, stage="lock", reason="alert_state_write_failed")
     line = json.dumps(result, sort_keys=True)
     print(line, flush=True)
     if not result["ok"]:
