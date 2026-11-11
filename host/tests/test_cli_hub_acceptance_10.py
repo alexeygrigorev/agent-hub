@@ -38,10 +38,21 @@ TMP = HERE.parents[1] / '.local/tmp'
 TMP.mkdir(parents=True, exist_ok=True)
 
 
+def transport(engine='codex', commit=COMMIT):
+    # Synthetic attestations only: no claim about an installed provider/host.
+    return {'engine': engine, 'machine_id': acc.HOST,
+            'format': acc.CAPTURE_FORMATS.get(engine, 'plaintext'), 'host_release_sha': commit,
+            'provider_version': 'offline-fixture-v1',
+            'profile_set_sha256': hashlib.sha256(('nonsecret-offline-argv-' + engine).encode()).hexdigest(),
+            'reference': 'synthetic://capture/' + engine,
+            'sha256': hashlib.sha256(('offline-capture-receipt-' + engine).encode()).hexdigest()}
+
+
 def evidence(commit=COMMIT, **kw):
     ev = {'kind': 'phase7_operator_validated_evidence_v1',
           'canary': 'success', 'canary_commit': commit, 'ci_e2e': 'success', 'ci_e2e_commit': commit,
-          'operator_validation': {'actor': 'offline-fixture', 'target_commit': commit, 'receipts': {
+          'operator_validation': {'actor': 'offline-fixture', 'target_commit': commit,
+              'capture_transports': {engine: transport(engine, commit) for engine in acc.CAPTURE_FORMATS}, 'receipts': {
               name: {'commit': commit, 'reference': 'synthetic://' + name + '/receipt',
                      'sha256': hashlib.sha256(('offline-' + name).encode()).hexdigest()}
               for name in ('deployment', 'canary', 'ci_e2e')}}}
@@ -79,12 +90,13 @@ class Harness(unittest.TestCase):
         return json.loads(path.read_text()) if path.exists() else {'sessions': {}}
 
     def go(self, **cfg):
+        bundle = cfg.pop('evidence_bundle', None)
         cfg.setdefault('models', OK_MODELS)
         Path(str(self.cfg_path) + '.state').unlink(missing_ok=True)
         self.cfg_path.write_text(json.dumps(cfg))
         out = io.StringIO()
         r = acc.Runner(alerts_cmd=str(self.bin / 'alerts'))
-        rc = acc.run(r, evidence(), COMMIT, workspace=WORKSPACE, sleep=lambda s: time.sleep(0.01), out=out, intake='intake-1')
+        rc = acc.run(r, bundle or evidence(), COMMIT, workspace=WORKSPACE, sleep=lambda s: time.sleep(0.01), out=out, intake='intake-1')
         return rc, out.getvalue()
 
     def assertAllStopped(self):
@@ -198,6 +210,26 @@ class AcceptanceTests(Harness):
                 self.assertEqual(rc, 1, out)
                 self.assertIn('no completed tool output', out)
                 self.assertAllStopped()
+
+    def test_unsupported_plaintext_json_and_missing_attestation_fail_with_cleanup(self):
+        for engine in ('claude', 'antigravity'):
+            pool = [{'policy_id': 'synthetic-' + engine, 'model': 'synthetic-model', 'engine': engine,
+                     'effort': None, 'weight': 1, 'share': 1}]
+            with self.subTest(engine=engine):
+                rc, out = self.go(pool=pool, models=['synthetic-model'] * 10, capture_format_override='go')
+                self.assertEqual(rc, 1, out)
+                self.assertIn('no verified stream transport for engine ' + engine, out)
+                self.assertAllStopped()
+        path = Path(evidence()); ev = json.loads(path.read_text())
+        ev['operator_validation']['capture_transports'].pop('codex'); path.write_text(json.dumps(ev))
+        rc, out = self.go(evidence_bundle=str(path))
+        self.assertEqual(rc, 1, out); self.assertIn('no verified stream transport for engine codex', out)
+        self.assertAllStopped()
+
+    def test_wrong_stream_for_current_engine_is_not_proof(self):
+        rc, out = self.go(capture_format_override='go')
+        self.assertEqual(rc, 1, out); self.assertIn('no completed tool output', out)
+        self.assertAllStopped()
 
     def test_operator_bundle_must_not_change_during_acceptance(self):
         original = acc.checked_evidence
@@ -542,49 +574,93 @@ class ParserTests(unittest.TestCase):
         self.assertTrue(acc.alert_changes(good, dict(good, observed_at_ms=99999)))
 
     def test_probe_ignores_prompt_echo(self):
-        prompt, exp = acc.make_probe()
-        self.assertNotIn(exp, prompt)
-        self.assertFalse(acc.probe_output_ok(prompt, prompt, exp))
-        self.assertFalse(acc.probe_output_ok(prompt + '\n' + exp, prompt, exp))
-        for event in [
-            {'type': 'item.started', 'item': {'type': 'command_execution', 'aggregated_output': exp}},
-            {'type': 'item.completed', 'item': {'type': 'command_execution', 'command': exp}},
-            {'type': 'reasoning', 'text': exp}, {'prompt': exp},
-            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': exp}},
-            {'type': 'result', 'result': exp},
-            {'type': 'tool_use', 'part': {'type': 'tool', 'tool': 'bash', 'state': {'status': 'running', 'output': exp}}},
-            {'type': 'tool_result', 'tool_use_id': 'synthetic-tool', 'content': exp, 'is_error': True},
-        ]:
-            self.assertFalse(acc.probe_output_ok(json.dumps(event), prompt, exp), event)
-        event = {'type': 'item.completed', 'item': {'type': 'command_execution', 'aggregated_output': exp + '\n'}}
-        self.assertTrue(acc.probe_output_ok(json.dumps(event), prompt, exp))
-
-    def test_completed_tool_output_formats_and_failed_statuses(self):
         prompt, marker = acc.make_probe()
-        positive = [
-            {'type': 'item.completed', 'item': {'type': 'command_execution', 'status': 'completed', 'exit_code': 0, 'aggregated_output': marker}},
-            {'type': 'tool_use', 'part': {'type': 'tool', 'tool': 'bash', 'state': {'status': 'completed', 'output': marker}}},
-            {'type': 'user', 'message': {'role': 'user', 'content': [{'type': 'tool_result', 'tool_use_id': 'synthetic-tool', 'content': marker}]}},
-            {'type': 'tool_result', 'tool_use_id': 'synthetic-tool', 'content': [{'type': 'text', 'text': marker}]},
-        ]
-        for event in positive:
-            self.assertTrue(acc.probe_output_ok(json.dumps(event), prompt, marker), event)
-        contradictory = {'type': 'user', 'message': {'role': 'assistant', 'content': [{'type': 'tool_result', 'tool_use_id': 'synthetic-tool', 'content': marker}]}}
-        self.assertFalse(acc.probe_output_ok(json.dumps(contradictory), prompt, marker))
+        self.assertNotIn(marker, prompt)
+        for captured in (prompt, prompt + '\n' + marker):
+            self.assertFalse(acc.probe_output_ok(captured, prompt, marker, 'codex', transport()))
+        for event in [
+            {'type': 'item.started', 'item': {'type': 'command_execution', 'aggregated_output': marker}},
+            {'type': 'item.completed', 'item': {'type': 'command_execution', 'command': marker}},
+            {'type': 'reasoning', 'text': marker}, {'prompt': marker},
+            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': marker}},
+            {'type': 'result', 'result': marker},
+            {'type': 'tool_use', 'part': {'type': 'tool', 'tool': 'bash', 'state': {'status': 'running', 'output': marker}}},
+            {'type': 'tool_result', 'tool_use_id': 'synthetic-tool', 'content': marker},
+        ]:
+            for engine in acc.CAPTURE_FORMATS:
+                self.assertFalse(acc.probe_output_ok(json.dumps(event), prompt, marker, engine, transport(engine)), event)
+
+    def test_completed_tool_output_is_bound_to_verified_engine_format(self):
+        prompt, marker = acc.make_probe()
+        codex = {'type': 'item.completed', 'item': {'type': 'command_execution', 'status': 'completed', 'exit_code': 0, 'aggregated_output': marker}}
+        go = {'type': 'tool_use', 'part': {'type': 'tool', 'tool': 'bash', 'state': {'status': 'completed', 'output': marker}}}
+        for engine in acc.CAPTURE_FORMATS:
+            matching, foreign = (go, codex) if engine == 'go' else (codex, go)
+            self.assertTrue(acc.probe_output_ok(json.dumps(matching), prompt, marker, engine, transport(engine)))
+            self.assertFalse(acc.probe_output_ok(json.dumps(foreign), prompt, marker, engine, transport(engine)))
+            self.assertFalse(acc.probe_output_ok(json.dumps(matching), prompt, marker))
+            for bad in (None, True, {}, dict(transport(engine), engine='claude'),
+                        dict(transport(engine), format='plaintext'), dict(transport(engine), machine_id='other'),
+                        dict(transport(engine), host_release_sha='bad'), dict(transport(engine), provider_version=''),
+                        dict(transport(engine), profile_set_sha256='bad')):
+                self.assertFalse(acc.probe_output_ok(json.dumps(matching), prompt, marker, engine, bad), bad)
+        for engine in ('claude', 'antigravity'):
+            for event in (codex, go):
+                forged = dict(transport('go'), engine=engine)
+                self.assertFalse(acc.probe_output_ok(json.dumps(event), prompt, marker, engine, forged))
         for status in ('in_progress', 'failed', False):
-            event = {'type': 'item.completed', 'item': {'type': 'command_execution', 'status': status, 'aggregated_output': marker}}
-            self.assertFalse(acc.probe_output_ok(json.dumps(event), prompt, marker), event)
-        event = {'type': 'item.completed', 'item': {'type': 'command_execution', 'exit_code': False, 'aggregated_output': marker}}
-        self.assertFalse(acc.probe_output_ok(json.dumps(event), prompt, marker))
+            event = dict(codex, item=dict(codex['item'], status=status))
+            self.assertFalse(acc.probe_output_ok(json.dumps(event), prompt, marker, 'codex', transport()))
+        event = dict(codex, item=dict(codex['item'], exit_code=False))
+        self.assertFalse(acc.probe_output_ok(json.dumps(event), prompt, marker, 'codex', transport()))
+
+    def test_transport_attestation_bounds_and_same_release_are_required(self):
+        import copy
+        path = Path(evidence()); original = json.loads(path.read_text())
+        mutations = [lambda x: x.pop('capture_transports'), lambda x: x.update(capture_transports={}),
+                     lambda x: x['capture_transports'].update(claude=transport('claude')),
+                     lambda x: x['capture_transports']['go'].update(host_release_sha='b' * 40),
+                     lambda x: x['capture_transports']['codex'].update(format='opencode_json_v1'),
+                     lambda x: x['capture_transports']['zai'].update(provider_version=''),
+                     lambda x: x['capture_transports']['go'].update(profile_set_sha256='bad')]
+        for mutate in mutations:
+            ev = copy.deepcopy(original); mutate(ev['operator_validation']); path.write_text(json.dumps(ev))
+            self.assertTrue(acc.check_evidence(path, COMMIT), ev)
+        ev = copy.deepcopy(original)
+        receipt = path.with_suffix('.capture-receipt'); receipt.write_bytes(b'offline capture attestation')
+        self.addCleanup(receipt.unlink)
+        ev['operator_validation']['capture_transports']['go'].update(path=receipt.name, sha256=hashlib.sha256(receipt.read_bytes()).hexdigest())
+        path.write_text(json.dumps(ev)); self.assertEqual(acc.check_evidence(path, COMMIT), [])
+        receipt.write_bytes(b'changed')
+        self.assertTrue(any('hash mismatch' in e for e in acc.check_evidence(path, COMMIT)))
 
     def test_checked_evidence_hashes_the_single_validated_buffer(self):
         path = evidence()
         raw = Path(path).read_bytes()
         with mock.patch.object(acc, 'bounded_file', return_value=raw) as read:
-            problems, digest = acc.checked_evidence(path, COMMIT)
+            problems, digest, transports = acc.checked_evidence(path, COMMIT)
         self.assertEqual(problems, [])
         self.assertEqual(digest, hashlib.sha256(raw).hexdigest())
+        self.assertEqual(transports, json.loads(raw)['operator_validation']['capture_transports'])
         read.assert_called_once_with(path, acc.EVIDENCE_LIMIT)
+
+    def test_capture_attestation_and_hash_use_same_validated_buffer(self):
+        path = Path(evidence()); raw = path.read_bytes()
+        expected = json.loads(raw)['operator_validation']['capture_transports']
+        original = acc.validate_evidence
+        def replace_after_validate(data, filename, commit):
+            problems = original(data, filename, commit)
+            changed = json.loads(raw)
+            changed['operator_validation']['capture_transports'].pop('codex')
+            path.write_text(json.dumps(changed))
+            return problems
+        with mock.patch.object(acc, 'validate_evidence', side_effect=replace_after_validate):
+            problems, digest, actual = acc.checked_evidence(path, COMMIT)
+        self.assertEqual(problems, [])
+        self.assertEqual(digest, hashlib.sha256(raw).hexdigest())
+        self.assertEqual(actual, expected)
+        self.assertIn('codex', actual)
+        self.assertNotIn('codex', json.loads(path.read_text())['operator_validation']['capture_transports'])
 
     def test_operator_validation_cannot_be_replaced_by_four_green_strings(self):
         path = Path(evidence())

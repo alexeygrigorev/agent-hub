@@ -126,14 +126,14 @@ def checked_evidence(path, commit):
     and validated together on this invocation.
     """
     if not path:
-        return ['evidence file missing (--evidence)'], None
+        return ['evidence file missing (--evidence)'], None, {}
     try:
         raw = bounded_file(path, EVIDENCE_LIMIT)
         ev = json.loads(raw, object_pairs_hook=unique_object)
     except (OSError, ValueError, UnicodeError, TypeError):
-        return ['evidence unreadable or invalid'], None
+        return ['evidence unreadable or invalid'], None, {}
     problems = validate_evidence(ev, path, commit)
-    return problems, hashlib.sha256(raw).hexdigest()
+    return problems, hashlib.sha256(raw).hexdigest(), (ev['operator_validation']['capture_transports'] if not problems else {})
 
 
 def validate_evidence(ev, path, commit):
@@ -153,16 +153,25 @@ def validate_evidence(ev, path, commit):
             problems.append('%s not green (%r)' % (key, ev.get(key)))
     validation = ev.get('operator_validation')
     if (ev.get('kind') != 'phase7_operator_validated_evidence_v1' or not isinstance(validation, dict)
-            or set(validation) != {'actor', 'target_commit', 'receipts'}
+            or set(validation) != {'actor', 'target_commit', 'receipts', 'capture_transports'}
             or not evidence_text(validation.get('actor'), 120) or validation.get('target_commit') != commit
             or not isinstance(validation.get('receipts'), dict)
             or set(validation['receipts']) != {'deployment', 'canary', 'ci_e2e'}):
         problems.append('operator-validated same-commit receipt references required')
         return problems
-    for name, receipt in validation['receipts'].items():
-        if (not isinstance(receipt, dict) or set(receipt) - {'commit', 'reference', 'sha256', 'path'}
-                or not {'commit', 'reference', 'sha256'} <= set(receipt)
-                or receipt.get('commit') != commit or not evidence_text(receipt.get('reference'), 2048)
+    host_sha = validation.get('target_commit')
+    transports = validation.get('capture_transports')
+    if (not isinstance(host_sha, str) or not re.fullmatch(r'[0-9a-f]{40}', host_sha)
+            or not isinstance(transports, dict) or not 1 <= len(transports) <= 3
+            or any(not capture_transport_ok(engine, record, host_sha) for engine, record in transports.items())):
+        problems.append('verified engine/host/stream capture transport records required')
+        return problems
+    receipts = dict(validation['receipts'])
+    receipts.update({'capture_' + engine: record for engine, record in transports.items()})
+    for name, receipt in receipts.items():
+        if (not isinstance(receipt, dict) or set(receipt) - ({'commit', 'reference', 'sha256', 'path'} if not name.startswith('capture_') else CAPTURE_KEYS)
+                or not {'reference', 'sha256'} <= set(receipt)
+                or not name.startswith('capture_') and receipt.get('commit') != commit or not evidence_text(receipt.get('reference'), 2048)
                 or not isinstance(receipt.get('sha256'), str) or not re.fullmatch(r'[0-9a-f]{64}', receipt['sha256'])):
             problems.append('%s receipt identity invalid or commit mismatch' % name)
             continue
@@ -225,28 +234,37 @@ def make_probe():
     return prompt, marker
 
 
-def probe_output_ok(captured, prompt, expected):
-    """Only known completed tool-output fields prove the nonce, never prose.
+CAPTURE_FORMATS = {'codex': 'codex_jsonl_v1', 'zai': 'codex_jsonl_v1', 'go': 'opencode_json_v1'}
+CAPTURE_KEYS = {'engine', 'machine_id', 'format', 'host_release_sha', 'provider_version',
+                'profile_set_sha256', 'reference', 'sha256', 'path'}
 
-    Codex/ZAI command_execution and Go/OpenCode tool_use are maintained wire
-    shapes. Claude CLI tool results may be top-level or user-message blocks.
-    Plain-text and unknown provider formats deliberately fail closed.
+
+def capture_transport_ok(engine, record, host_sha):
+    """Root attests the effective argv/protocol, never inferred from output text."""
+    return (engine in CAPTURE_FORMATS and isinstance(record, dict)
+            and not set(record) - CAPTURE_KEYS and CAPTURE_KEYS - {'path'} <= set(record)
+            and record.get('engine') == engine and record.get('machine_id') == HOST
+            and record.get('format') == CAPTURE_FORMATS[engine]
+            and isinstance(host_sha, str) and re.fullmatch(r'[0-9a-f]{40}', host_sha) is not None
+            and record.get('host_release_sha') == host_sha
+            and evidence_text(record.get('provider_version'), 120)
+            and evidence_text(record.get('reference'), 2048)
+            and all(isinstance(record.get(key), str) and re.fullmatch(r'[0-9a-f]{64}', record[key])
+                    for key in ('profile_set_sha256', 'sha256')))
+
+
+def probe_output_ok(captured, prompt, expected, engine=None, transport=None):
+    """Parse only the Root-verified engine's stream; plaintext JSON is not proof.
+
+    Claude/Antigravity remain unsupported even with forged stream-shaped text.
+    The caller supplies a record extracted from the same validated evidence bytes.
     """
-    if expected in prompt or not isinstance(captured, str):
+    if (not capture_transport_ok(engine, transport, (transport.get('host_release_sha') if isinstance(transport, dict) else None))
+            or expected in prompt or not isinstance(captured, str)):
         return False
 
     def marker_in(text):
         return isinstance(text, str) and any(line.strip() == expected for line in text.splitlines())
-
-    def tool_result(block):
-        if (not isinstance(block, dict) or block.get('type') != 'tool_result'
-                or block.get('is_error') is not None and block.get('is_error') is not False
-                or block.get('role') not in (None, 'user', 'tool')
-                or not isinstance(block.get('tool_use_id'), str) or not block['tool_use_id']):
-            return False
-        content = block.get('content')
-        return marker_in(content) or isinstance(content, list) and any(
-            isinstance(part, dict) and part.get('type') == 'text' and marker_in(part.get('text')) for part in content)
 
     for line in captured.splitlines():
         try:
@@ -256,20 +274,17 @@ def probe_output_ok(captured, prompt, expected):
         if not isinstance(event, dict):
             continue
         item = event.get('item')
-        if (event.get('type') == 'item.completed' and isinstance(item, dict)
+        if (engine in ('codex', 'zai') and event.get('type') == 'item.completed' and isinstance(item, dict)
                 and item.get('type') == 'command_execution'
                 and item.get('status') in (None, 'completed')
-                and (item.get('exit_code') is None or type(item.get('exit_code')) is int and item['exit_code'] == 0) and marker_in(item.get('aggregated_output'))):
+                and (item.get('exit_code') is None or type(item.get('exit_code')) is int and item['exit_code'] == 0)
+                and marker_in(item.get('aggregated_output'))):
             return True
         part = event.get('part')
-        if (event.get('type') == 'tool_use' and isinstance(part, dict) and part.get('type') == 'tool'
+        if (engine == 'go' and event.get('type') == 'tool_use' and isinstance(part, dict) and part.get('type') == 'tool'
                 and isinstance(part.get('tool'), str) and part['tool'].strip()
                 and isinstance(part.get('state'), dict) and part['state'].get('status') == 'completed'
                 and marker_in(part['state'].get('output'))):
-            return True
-        message = event.get('message')
-        if tool_result(event) or (event.get('type') == 'user' and isinstance(message, dict) and message.get('role') in (None, 'user')
-                and isinstance(message.get('content'), list) and any(tool_result(block) for block in message['content'])):
             return True
     return False
 
@@ -433,7 +448,7 @@ def recover_owned(r, rec, clock):
     return sid
 
 
-def one_start(r, rec, clock, sleep, intake=None, workspace=None, seen_sessions=None, seen_natives=None):
+def one_start(r, rec, clock, sleep, intake=None, workspace=None, seen_sessions=None, seen_natives=None, capture_transports=None):
     err = rec['errors']
     prompt, expected = make_probe()
     key = 'acc10-' + uuid.uuid4().hex
@@ -513,6 +528,12 @@ def one_start(r, rec, clock, sleep, intake=None, workspace=None, seen_sessions=N
         seen_natives.add(rec['native_id'])
     if rec['native_id'] not in live_natives(r, left(clock, deadline, 60)):
         err.append('native not live in a list --running')
+    transport = (capture_transports or {}).get(rec.get('engine'))
+    if not capture_transport_ok(rec.get('engine'), transport, (transport.get('host_release_sha') if isinstance(transport, dict) else None)):
+        err.append('capture proof unavailable: no verified stream transport for engine %s' % rec.get('engine'))
+        return
+    rec['capture_transport'] = {key: transport[key] for key in
+                                ('engine', 'format', 'host_release_sha', 'provider_version', 'profile_set_sha256')}
     cdeadline = clock() + CAPTURE_BUDGET_S
     while clock() < cdeadline:
         try:
@@ -526,7 +547,7 @@ def one_start(r, rec, clock, sleep, intake=None, workspace=None, seen_sessions=N
             continue
         wait = captured.get('command_wait', {}) if isinstance(captured, dict) else {}
         ack = wait.get('ack', {})
-        if wait.get('state') == 'acked' and isinstance(ack, dict) and probe_output_ok(ack.get('capture'), prompt, expected):
+        if wait.get('state') == 'acked' and isinstance(ack, dict) and probe_output_ok(ack.get('capture'), prompt, expected, rec.get('engine'), transport):
             rec['capture_verified'] = True
             return
         sleep(min(1, max(0, cdeadline - clock())))
@@ -624,7 +645,7 @@ def summarize(recs, evidence_problems):
 def run(r, evidence_path, commit, clock=time.monotonic, sleep=time.sleep, out=sys.stdout,
         intake=None, synthetic_ac=False, workspace=None):
     window = {'start': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
-    evidence_problems, evidence_digest = checked_evidence(evidence_path, commit)
+    evidence_problems, evidence_digest, capture_transports = checked_evidence(evidence_path, commit)
     problems = list(evidence_problems)
     if not isinstance(workspace, str) or not workspace.startswith('/') or '\x00' in workspace:
         problems.append('explicit absolute --cwd workspace required')
@@ -645,7 +666,7 @@ def run(r, evidence_path, commit, clock=time.monotonic, sleep=time.sleep, out=sy
             rec = {'n': i, 'errors': []}
             recs.append(rec)
             try:
-                one_start(r, rec, clock, sleep, intake, workspace, seen_sessions, seen_natives)
+                one_start(r, rec, clock, sleep, intake, workspace, seen_sessions, seen_natives, capture_transports)
             except Exception as exc:  # keep the created id for cleanup
                 rec['errors'].append('start crashed: %s' % exc)
             print('start %d/%d id=%s model=%s engine=%s host=%s elapsed=%ss shares(%s)=%s' % (
@@ -673,7 +694,7 @@ def run(r, evidence_path, commit, clock=time.monotonic, sleep=time.sleep, out=sy
             if rec.get('cleanup_uncertain'):
                 rec['errors'].append('cleanup uncertain: could not determine whether start was accepted; original key ' + rec['key'])
     window['end'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-    evidence_problems, post_digest = checked_evidence(evidence_path, commit)
+    evidence_problems, post_digest, _ = checked_evidence(evidence_path, commit)
     post_problems = list(evidence_problems)
     if post_digest != evidence_digest:
         post_problems.append('operator-validated evidence bundle changed during run')

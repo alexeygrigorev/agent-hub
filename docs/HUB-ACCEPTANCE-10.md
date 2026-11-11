@@ -22,6 +22,19 @@ Root writes a private JSON file with this shape:
   "operator_validation": {
     "actor": "root",
     "target_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "capture_transports": {
+      "codex": {
+        "engine": "codex",
+        "machine_id": "hetzner-aplexer",
+        "format": "codex_jsonl_v1",
+        "host_release_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "provider_version": "Root-verified actual provider version",
+        "profile_set_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "reference": "Root-verified effective launch and raw stream receipt",
+        "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "path": "codex-capture-transport-receipt.json"
+      }
+    },
     "receipts": {
       "deployment": {
         "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -70,14 +83,42 @@ A mismatch ends the run; cleanup uses only the ID returned by this run's keyed
 start, never a foreign ID from a mismatching show response.
 
 The probe asks for a completed print tool call followed by a separate hold call.
-Only completed tool-output fields containing the decoded nonce prove output:
-Codex/ZAI command-execution events, Go/OpenCode completed tool events, and Claude
-structured tool-result events when available. Assistant messages, final result
-prose, prompt echoes, reasoning, tool inputs, unfinished events and plain text do
-not count. Unknown capture formats fail closed. Current maintained headless Claude/Antigravity command builders do not request
-structured tool streams. Their tool-output transport needs separate owner
-verification or correction. Do not weaken this check or force a model to make a
-live acceptance attempt pass.
+JSON shape alone cannot prove a tool ran: a plaintext assistant can print a fake
+JSON event. Root must attest the actual effective launch transport before the
+run, using `operator_validation.capture_transports`. The map contains at most
+three records, keyed only by `codex`, `zai`, or `go`. Every drawn engine needs its
+own record. Codex and ZAI require `codex_jsonl_v1`; Go requires
+`opencode_json_v1`. Parsers accept only the corresponding engine's completed
+tool-output event. A Codex event cannot prove Go output, or the reverse.
+
+Each record requires the exact engine, `hetzner-aplexer` machine, known format,
+full host release SHA equal to `operator_validation.target_commit`, actual
+provider version, `profile_set_sha256`, and receipt reference plus SHA256.
+`path` is optional and, when supplied, uses the same bounded local-receipt hash
+checks. The example includes Codex only; Root must supply separately verified
+ZAI/Go records if those engines can be selected. A missing record ends proof and
+cleans up the owned session; it does not change production model routing.
+
+Root computes `profile_set_sha256` over canonical JSON (UTF-8, sorted keys,
+compact separators) describing the **nonsecret effective launch descriptor**:
+engine, headless mode, stream protocol, provider identity/version, profile
+identity and effective argv template with prompt placeholders. Never hash or
+copy credential files, tokens, secret environment values or prompt contents.
+The receipt must identify that descriptor and Root's verification that the raw
+capture is the provider's structured stream rather than assistant-authored text.
+Before writing this bundle, Root independently verifies actual current host
+version, effective profile/argv, provider version and raw stream framing. The
+script cannot measure these facts from a session show response; the records are
+explicit trusted operator attestations, not remote authentication. Both the
+transport map and evidence digest come from the same validated byte buffer.
+
+Current plaintext Claude and Antigravity captures are **always refused**, even
+if they contain synthetic `tool_use`, `tool_result` or command-execution JSON.
+Neither engine can be added through an evidence-file override. A separately
+reviewed native format-support change and explicit parser support are required.
+Assistant messages, final result prose, prompt echoes, reasoning, tool inputs,
+unfinished events and plain text never count. Do not force a model or weaken
+this check to make live acceptance pass.
 
 Picker evidence remains tied to each actual current draw, including its bounded
 fallback history and normalized pool shares. No independent picker samples prove
