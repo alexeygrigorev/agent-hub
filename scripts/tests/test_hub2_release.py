@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 import zipfile
 from unittest.mock import patch
@@ -164,8 +165,18 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
     def test_retained_release_readiness_failure_restores_units_and_both_links(self):
         current, retained, units = self.prepare_retained_switch()
         self.status_rc = 1
+        startup = retained / 'lib/python3.11/site-packages/retained.pth'
+        previous_command = self.command
+
+        def assert_quiesced_before_restore(args):
+            if args[2:3] == ['stop']:
+                self.assertFalse(startup.exists())
+            previous_command(args)
+
+        self.command = assert_quiesced_before_restore
         with self.assertRaisesRegex(RuntimeError, 'host daemon connection not verified'):
             self.install()
+        self.assertIn(['systemctl', '--user', 'stop', updater.UNITS[0]], self.calls)
         self.assertEqual((self.root / 'current').resolve(), current)
         self.assertEqual((self.root / 'previous').resolve(), retained)
         self.assertEqual((units / updater.UNITS[0]).read_bytes(), b'active service unit')
@@ -178,10 +189,11 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
         current, retained, units = self.prepare_retained_switch()
         journal = self.root / 'retained-switch.json'
         updater.write_json(journal, {'current': current.name, 'target': retained.name, 'previous': retained.name,
-                                     'units': {name: (units / name).read_bytes().hex() for name in updater.UNITS}})
+                                     'units': {name: (units / name).read_bytes().hex() for name in updater.UNITS},
+                                     'switching': True})
         retained.rename(retained.with_name('.retained-' + retained.name))
         retained.mkdir()
-        updater.link(retained, self.root / 'current')
+        # The pointer was already restored, but the candidate may still run.
         updater.link(current, self.root / 'previous')
         (units / updater.UNITS[0]).write_bytes(b'interrupted service unit')
 
@@ -195,6 +207,7 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
         self.assertEqual((self.root / 'previous').resolve(), retained)
         self.assertEqual((units / updater.UNITS[0]).read_bytes(), b'active service unit')
         self.assertFalse(journal.exists())
+        self.assertIn(['systemctl', '--user', 'stop', updater.UNITS[0]], self.calls)
         self.assertTrue((retained / 'lib/python3.11/site-packages/retained.pth').is_file())
 
     def test_retained_build_failure_restores_original_environment(self):
@@ -226,6 +239,76 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
         self.assertFalse(backup.exists())
         self.assertFalse(journal.exists())
         self.assertEqual(self.calls, [])
+
+    def test_committed_cleanup_resyncs_releases_if_backup_is_already_removed(self):
+        _, retained, _ = self.prepare_retained_switch()
+        sync = updater.sync_directory
+        journal = self.root / 'retained-switch-committed.json'
+        backup = retained.with_name('.retained-' + retained.name)
+
+        def interrupt_sync(directory):
+            if directory == retained.parent and journal.exists() and not backup.exists():
+                raise OSError('interrupted directory sync')
+            sync(directory)
+
+        with patch.object(updater, 'sync_directory', side_effect=interrupt_sync):
+            with self.assertRaisesRegex(OSError, 'interrupted directory sync'):
+                self.install()
+        self.assertTrue(journal.exists())
+        self.assertFalse(backup.exists())
+        with patch.object(updater, 'sync_directory', wraps=sync) as synced:
+            self.install()
+        synced.assert_any_call(retained.parent)
+        self.assertFalse(journal.exists())
+
+    def test_killed_updater_leaves_lock_held_until_installer_exits(self):
+        self.root.mkdir()
+        started = self.root / 'child-started'
+        release = self.root / 'child-may-exit'
+        child = """
+from pathlib import Path
+import sys
+import time
+
+Path(sys.argv[1]).touch()
+deadline = time.monotonic() + 10
+while not Path(sys.argv[2]).exists() and time.monotonic() < deadline:
+    time.sleep(.02)
+"""
+        parent = """
+from pathlib import Path
+import runpy
+import sys
+
+api = runpy.run_path(sys.argv[1])
+with api['update_lock'](Path(sys.argv[2])):
+    api['command']([sys.executable, '-c', sys.argv[3], *sys.argv[4:]])
+"""
+        with subprocess.Popen([sys.executable, '-c', parent, str(REPO / 'scripts/hub2-self-update.py'),
+                               str(self.root), child, str(started), str(release)]) as process:
+            try:
+                deadline = time.monotonic() + 5
+                while not started.exists() and process.poll() is None and time.monotonic() < deadline:
+                    time.sleep(.02)
+                self.assertTrue(started.exists())
+                process.kill()
+                process.wait(timeout=5)
+                with self.assertRaises(BlockingIOError), updater.update_lock(self.root):
+                    self.fail('orphan installer did not hold the update lock')
+            finally:
+                release.touch()
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=5)
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                with updater.update_lock(self.root):
+                    break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(.02)
 
     def test_retained_release_refuses_different_receipt_or_tampered_download(self):
         current, retained, _ = self.prepare_retained_switch()
