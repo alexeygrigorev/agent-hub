@@ -66,6 +66,8 @@ class Journal:
             self.db.execute("ALTER TABLE launches ADD COLUMN native_dispatch_started INTEGER")
         if "legacy_failure_json" not in {row[1] for row in self.db.execute("PRAGMA table_info(launches)")}:
             self.db.execute("ALTER TABLE launches ADD COLUMN legacy_failure_json TEXT")
+        if "workspace_repair_digest" not in {row[1] for row in self.db.execute("PRAGMA table_info(launches)")}:
+            self.db.execute("ALTER TABLE launches ADD COLUMN workspace_repair_digest TEXT")
         self.db.execute("CREATE INDEX IF NOT EXISTS launches_active ON launches(state,operation_id)")
 
     @property
@@ -109,7 +111,9 @@ class Journal:
                     raise
                 reason = error.code or 'http_' + str(error.status)
                 with self.db:
-                    self.db.execute("INSERT OR REPLACE INTO outbox_dead_letters VALUES(?,?,?,?,?,?)",
+                    repaired = self.db.execute("SELECT 1 FROM launches WHERE 'finish:'||operation_id=? AND workspace_repair_digest IS NOT NULL", (row['key'],)).fetchone()
+                    verb = 'IGNORE' if repaired else 'REPLACE'
+                    self.db.execute(f"INSERT OR {verb} INTO outbox_dead_letters VALUES(?,?,?,?,?,?)",
                                     (row['key'], row['path'], row['payload'], error.status, reason, int(time.time()*1000)))
                     self.db.execute("DELETE FROM outbox WHERE key=? AND payload=?", (row['key'], row['payload']))
                 logging.getLogger(__name__).error('Host receipt dead-lettered key=%s status=%s reason=%s',
@@ -117,6 +121,29 @@ class Journal:
                 continue
             with self.db:
                 self.db.execute("DELETE FROM outbox WHERE key=? AND payload=?", (row["key"], row['payload']))
+
+
+def offer_ack_frame(session, epoch, workspace_binding=None):
+    # Keep legal Unicode paths compact on the existing 8192 UTF-16-unit frame.
+    return json.dumps({'type': 'offer_ack', 'session_id': session, 'epoch': epoch,
+                       **({'workspace_binding': workspace_binding} if workspace_binding else {})},
+                      sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+
+
+class OfferAcknowledgement:
+    """A claim ACK stays compatible; only an exact binding echo proves repair."""
+    def __init__(self, binding):
+        self.binding, self.binding_verified = binding, False
+        self.ready = threading.Event()
+
+    def accept(self, event):
+        self.binding_verified = self.binding is not None and event.get('workspace_binding') == self.binding
+        self.ready.set()
+
+    def wait(self, timeout):
+        if not self.ready.wait(timeout):
+            raise RuntimeError('claim_ack_unverified')
+        return self.binding_verified
 
 
 class Bridge:
@@ -258,10 +285,29 @@ class Bridge:
     def offer(self, offer, acknowledge=None):
         db = self.journal.db
         session, epoch = offer.get('session_id'), offer.get('epoch')
+        if 'recovery_native_id' in offer:
+            prior = db.execute('SELECT * FROM launches WHERE operation_id=?', (offer.get('operation_id'),)).fetchone()
+            recovery_native = offer.get('recovery_native_id')
+            if (offer.get('claimed') is not True or not isinstance(recovery_native, str)
+                    or not UUID_RE.fullmatch(recovery_native) or not prior
+                    or prior['session_id'] != session or prior['epoch'] != epoch
+                    or prior['native_id'] != recovery_native):
+                raise ValueError('native_reconciliation_required')
         if isinstance(session, str) and type(epoch) is int and 1 <= epoch <= 2**63 - 1:
             if db.execute('SELECT 1 FROM stop_fences WHERE session_id=? AND epoch>=?', (session, epoch)).fetchone():
                 return None
         launch = self.validate_launch(offer)
+        requested_workspace = offer['launch']['workspace']
+        workspace_binding = ({'version': 1, 'requested_workspace': requested_workspace,
+                              'resolved_workspace': launch['workspace']}
+                             if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', requested_workspace)
+                             else None)
+        def acknowledge_workspace():
+            if acknowledge:
+                if workspace_binding is None:
+                    return acknowledge(session, epoch)
+                else:
+                    return acknowledge(session, epoch, workspace_binding)
         digest = hashlib.sha256(canonical(launch).encode()).hexdigest()
         operation, session, epoch = offer["operation_id"], offer["session_id"], offer["epoch"]
         previous=db.execute('SELECT * FROM launches WHERE session_id=?',(session,)).fetchone()
@@ -280,13 +326,18 @@ class Bridge:
         if prior:
             if prior["session_id"] != session or prior["digest"] != digest or epoch < prior["epoch"]:
                 raise ValueError("offer_fence_conflict")
-            if prior['state'] in {'stopped_before_dispatch', 'launch_failed_unconfirmed'}:
-                return None
-            if prior['state']=='exited':
-                return prior['native_id']
             if epoch > prior["epoch"]:
                 # A new fence cannot adopt a process under the old fence automatically.
                 raise ValueError("native_reconciliation_required")
+            if prior['state'] in {'stopped_before_dispatch', 'launch_failed_unconfirmed'}:
+                return None
+            recovery_native = offer.get('recovery_native_id')
+            if recovery_native is not None and recovery_native != prior['native_id']:
+                raise ValueError('native_reconciliation_required')
+            if prior['state']=='exited':
+                if workspace_binding and acknowledge and recovery_native == prior['native_id']:
+                    self.repair_label_finish(prior, workspace_binding, acknowledge_workspace, launch['timeout_seconds'])
+                return prior['native_id']
             if prior['state'] == 'launching':
                 if prior['native_dispatch_started'] == 0:
                     self.settle_undispatched_launch(prior)
@@ -294,7 +345,7 @@ class Bridge:
                 self.abort_launch(operation)
                 raise RuntimeError('native_abort_pending')
             if acknowledge and prior['state']!='pending_admission':
-                acknowledge(session, epoch)
+                acknowledge_workspace()
             native = None
             if prior['state']=='aborting':
                 raise RuntimeError('native_abort_pending')
@@ -321,7 +372,7 @@ class Bridge:
                 from .providers import provision
                 launch['provider_home']=provision(self.client,offer,launch,self.journal.directory,self.launcher.config.get('routes'))
             if acknowledge:
-                acknowledge(session, epoch)
+                acknowledge_workspace()
             # The accepted claim already admitted this generation. The worker
             # context carries the server-issued expiry; persist it for host-side
             # containment without an additional admission RPC or CLI flag.
@@ -373,6 +424,77 @@ class Bridge:
         self.journal.emit(f"started:{operation}:{epoch}", f"/api/sessions/{session}/started",
                           {"operation_id": operation, "epoch": epoch, "native_id": native["id"]})
         return native["id"]
+
+    def repair_label_finish(self, row, binding, acknowledge, timeout_seconds):
+        """One exact frozen terminal receipt, after a durable binding ACK echo.
+
+        No native command is used: state=exited and this private receipt were
+        committed together only after reconcile's native identity/retirement
+        checks. The original body and idempotency key are never rewritten.
+        """
+        if row['workspace_repair_digest'] is not None:
+            return
+        native_id = row['native_id']
+        if not isinstance(native_id, str) or not UUID_RE.fullmatch(native_id):
+            return
+        key, path = 'finish:' + row['operation_id'], f"/api/sessions/{row['session_id']}/finish"
+        pending = self.journal.db.execute('SELECT * FROM outbox WHERE key=?', (key,)).fetchone()
+        receipt = pending or self.journal.db.execute(
+            "SELECT * FROM outbox_dead_letters WHERE key=? AND status=409 AND reason='unqualified_native_exit_evidence'", (key,)).fetchone()
+        if not receipt or receipt['path'] != path or len(receipt['payload'].encode()) > 12288:
+            return
+        try:
+            def unique_object(pairs):
+                value = {}
+                for key, item in pairs:
+                    if key in value:
+                        raise ValueError('duplicate_terminal_field')
+                    value[key] = item
+                return value
+            body = json.loads(receipt['payload'], object_pairs_hook=unique_object)
+            evidence = body['evidence']
+            identity, exit_info, deadline = evidence['native_identity'], evidence['native_exit'], evidence['native_deadline']
+            code, exited = native_returncode(exit_info), exit_info.get('exited_at_ms')
+            now = int(time.time()*1000)
+            if (body.get('operation_id') != row['operation_id'] or type(body.get('epoch')) is not int
+                    or body['epoch'] != row['epoch'] or body.get('native_id') != native_id
+                    or body.get('native_exit_confirmed') is not True or type(body.get('exit_code')) is not int
+                    or ('launch_failed' in body and type(body['launch_failed']) is not bool)
+                    or body['exit_code'] != code or evidence.get('source') not in {'aplexer_status', 'aplexer_retirement'}
+                    or evidence.get('containment_empty') is not True or identity.get('id') != native_id
+                    or identity.get('tag') != row['tag'] or row['tag'] != 'task-hub2-' + row['session_id']
+                    or identity.get('workspace') != row['workspace'] or binding['resolved_workspace'] != row['workspace']
+                    or type(exited) is not int or exited < 1 or exited > now + 5000
+                    or type(row['runtime_deadline']) is not int or deadline.get('deadline_ms') != row['runtime_deadline']
+                    or type(deadline.get('exceeded')) is not bool
+                    or exited < row['runtime_deadline'] - timeout_seconds*1000
+                    or (deadline['exceeded'] and row['runtime_deadline'] > now)
+                    or (exited >= row['runtime_deadline'] and deadline['exceeded'] is not True)):
+                return
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return
+        # Old/delayed claim ACKs can match session+epoch without confirming
+        # metadata. They must not consume the durable one-shot repair marker.
+        if acknowledge() is not True:
+            return
+        digest = hashlib.sha256(receipt['payload'].encode()).hexdigest()
+        with self.journal.db as db:
+            current = db.execute('SELECT * FROM launches WHERE operation_id=?', (row['operation_id'],)).fetchone()
+            if (not current or current['session_id'] != row['session_id'] or current['epoch'] != row['epoch']
+                    or current['native_id'] != native_id or current['state'] != 'exited'
+                    or current['digest'] != row['digest'] or current['workspace'] != row['workspace']
+                    or current['tag'] != row['tag'] or current['runtime_deadline'] != row['runtime_deadline']
+                    or current['workspace_repair_digest'] is not None):
+                return
+            source = db.execute('SELECT * FROM outbox WHERE key=?', (key,)).fetchone()
+            if source and (source['path'] != path or source['payload'] != receipt['payload']):
+                return
+            if not source:
+                source = db.execute("SELECT * FROM outbox_dead_letters WHERE key=? AND status=409 AND reason='unqualified_native_exit_evidence'", (key,)).fetchone()
+                if not source or source['path'] != path or source['payload'] != receipt['payload']:
+                    return
+            db.execute('UPDATE launches SET workspace_repair_digest=? WHERE operation_id=?', (digest, row['operation_id']))
+            db.execute('INSERT OR IGNORE INTO outbox VALUES(?,?,?)', (key, path, receipt['payload']))
 
     def attempt_label(self, session, operation, epoch):
         return hashlib.sha256(canonical([self.machine_id, session, operation, epoch]).encode()).hexdigest()
@@ -541,7 +663,10 @@ class Bridge:
                        "native_id": row["native_id"], "exit_code": code,
                        "native_exit_confirmed": True,
                        "evidence": {"source": "aplexer_retirement" if native.get("retirement") else "aplexer_status",
-                                    "native_identity": {key: native[key] for key in ("id", "tag", "workspace")},
+                                    # lookup/retired already qualified UUID/tag and
+                                    # samefile (or exact deleted retirement). Use
+                                    # the pinned spelling across Windows aliases.
+                                    "native_identity": {"id": native['id'], "tag": native['tag'], "workspace": row['workspace']},
                                     "containment_empty": True, "native_exit": exit_info,"launcher_state":launcher_state}}
             if type(row['runtime_deadline']) is int:
                 exited_at = exit_info.get('exited_at_ms')
@@ -911,14 +1036,13 @@ class Bridge:
                     logging.getLogger(__name__).info('Host connected machine=%s', machine_id)
                     waiters, waiter_lock = {}, threading.Lock()
                     pool, commands, slots = self._launch_pool, self._command_pool, self._worker_slots
-                    def acknowledge(session, epoch, _socket=socket, _waiters=waiters, _lock=waiter_lock):
-                        ready = threading.Event()
+                    def acknowledge(session, epoch, workspace_binding=None, _socket=socket, _waiters=waiters, _lock=waiter_lock):
+                        ready = OfferAcknowledgement(workspace_binding)
                         with _lock:
                             _waiters[(session, epoch)] = ready
                         try:
-                            _socket.send(canonical({"type": "offer_ack", "session_id": session, "epoch": epoch}))
-                            if not ready.wait(15):
-                                raise RuntimeError("claim_ack_unverified")
+                            _socket.send(offer_ack_frame(session, epoch, workspace_binding))
+                            return ready.wait(15)
                         finally:
                             with _lock:
                                 _waiters.pop((session, epoch), None)
@@ -959,7 +1083,7 @@ class Bridge:
                                 with waiter_lock:
                                     ready = waiters.get((event.get('session_id'), event.get('epoch')))
                                     if ready:
-                                        ready.set()
+                                        ready.accept(event)
                             elif event.get('type') == 'session.offer':
                                 session = event.get('offer', {}).get('session_id')
                                 with self._inflight_lock:

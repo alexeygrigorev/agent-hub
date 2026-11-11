@@ -1,4 +1,5 @@
 import {listProjectIntakes} from './intake-list';
+import {boundWorkspace,mergeWorkspaceBinding,type WorkspaceBinding} from './workspace-binding';
 import { MeteredDb, initializeSchema } from './db';
 import { SqlReceiptMeter, SQL_PROBE_HEADER, wrapSqlNamespaces } from './sql-receipt';
 import { sha256Hex } from './crypto';
@@ -662,17 +663,22 @@ export class ProjectDO {
   }
 
   private async claimInternal(request: Request): Promise<Response> {
-    const body = await bodyObject(request, 4096);
+    const body = await bodyObject(request, 8192);
     if (typeof body.operation_id !== 'string' || typeof body.attempt_operation_id !== 'string'
       || typeof body.session_id !== 'string' || typeof body.machine_id !== 'string' || !Number.isSafeInteger(body.epoch)) return error('invalid_claim', 400);
     const saga = this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?', body.operation_id);
     if (!saga || saga.session_id !== body.session_id || saga.machine_id !== body.machine_id
       || saga.attempt_operation_id !== body.attempt_operation_id || saga.epoch !== body.epoch) return error('stale_claim', 409);
+    const binding=this.workspaceBinding(saga,body.workspace_binding);
     if (saga.state==='complete' && saga.last_reason==='host_inventory_stale') return json({claimed:false,lost:true,duplicate:true});
-    if (saga.state === 'claimed' || saga.state === 'admitted' || saga.state === 'running') return json({ claimed: true, duplicate: true });
+    if (saga.state === 'claimed' || saga.state === 'admitted' || saga.state === 'running') {
+      this.transaction(()=>this.pinWorkspaceBinding(saga,binding));
+      return json({ claimed: true, duplicate: true });
+    }
     if (saga.state !== 'offered') return error('offer_not_claimable', 409);
     const now = Date.now();
     this.transaction(() => {
+      this.pinWorkspaceBinding(saga,binding);
       this.db.run("UPDATE dispatch_sagas SET state='admitted', next_action_at=NULL, updated_at=? WHERE operation_id=? AND state='offered' AND attempt_operation_id=? AND epoch=?",
         now, saga.operation_id, saga.attempt_operation_id, saga.epoch);
       this.appendEvent(saga.intake_id, `claim:${saga.attempt_operation_id}:${saga.epoch}`, `machine:${saga.machine_id}`, 'session_claimed',
@@ -707,9 +713,10 @@ export class ProjectDO {
     const historical=olderAttempt||!intakeMatches||terminalObservation;
     const key='legacy-unobserved:'+body.attempt_operation_id+':'+body.epoch;
     const accepted=this.db.one<{body_json:string}>('SELECT body_json FROM intake_events WHERE task_id=? AND event_key=?',saga.intake_id,key);
+    const binding=exact?this.workspaceBinding(saga,body.workspace_binding):undefined;
     if(!accepted){
       const launch=this.parse(saga.launch_spec_json) as JsonRecord|null;
-      if(!exact||!launch||!boundedString(launch.workspace,1024)||launch.workspace!==(evidence as JsonRecord).workspace)
+      if(!exact||!launch||!boundedString(launch.workspace,1024)||boundWorkspace(launch,binding)!==(evidence as JsonRecord).workspace)
         return error('legacy_launch_workspace_unverified',409);
     }
     const payload={session_id:body.session_id,machine_id:body.machine_id,attempt_operation_id:body.attempt_operation_id,
@@ -721,6 +728,7 @@ export class ProjectDO {
       if(!current||current.attempt_operation_id!==saga.attempt_operation_id||current.epoch!==saga.epoch||current.state!==saga.state
         ||current.machine_id!==saga.machine_id||current.native_id!==saga.native_id||current.launch_spec_json!==saga.launch_spec_json)
         throw new HttpError('stale_legacy_launch_failure',409);
+      if(exact)this.pinWorkspaceBinding(saga,binding);
       const prior=this.db.one<{body_json:string}>('SELECT body_json FROM intake_events WHERE task_id=? AND event_key=?',saga.intake_id,key);
       if(prior){
         if(JSON.stringify({...this.parse(prior.body_json) as JsonRecord,historical})!==encoded)
@@ -756,7 +764,7 @@ export class ProjectDO {
 
   private async stoppedInternal(request: Request): Promise<Response> {
     const reaped=new URL(request.url).pathname.endsWith('/reaped');
-    const body=await bodyObject(request,4096);
+    const body=await bodyObject(request,12_288);
     if(body.reason==='legacy_launch_unobserved')return this.legacyLaunchUnobserved(body,reaped);
     if(typeof body.operation_id!=='string'||typeof body.attempt_operation_id!=='string'||typeof body.session_id!=='string'
       ||typeof body.machine_id!=='string'||!Number.isSafeInteger(body.epoch)||!['dead','idle','stop_confirmed','launch_timeout_no_native','host_no_response','host_launch_refused','host_inventory_stale'].includes(String(body.reason)))
@@ -962,7 +970,7 @@ export class ProjectDO {
   }
 
   private async startedInternal(request: Request): Promise<Response> {
-    const body = await bodyObject(request, 4096);
+    const body = await bodyObject(request, 8192);
     if (typeof body.operation_id !== 'string' || typeof body.attempt_operation_id !== 'string'
       || typeof body.session_id !== 'string' || typeof body.machine_id !== 'string'
       || typeof body.native_id !== 'string' || body.native_id.length<8 || body.native_id.length>128
@@ -970,6 +978,7 @@ export class ProjectDO {
     const saga = this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?', body.operation_id);
     if (!saga || saga.session_id !== body.session_id || saga.machine_id !== body.machine_id
       || saga.attempt_operation_id !== body.attempt_operation_id || saga.epoch !== body.epoch) return error('stale_started_receipt', 409);
+    const binding=this.workspaceBinding(saga,body.workspace_binding);
     if (saga.state==='complete' && saga.last_reason==='host_inventory_stale' && saga.native_id===body.native_id) {
       return json({started:false,lost:true,duplicate:true});
     }
@@ -977,12 +986,14 @@ export class ProjectDO {
     const intake = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?', saga.intake_id);
     if (!intake || intake.session_id !== saga.session_id || intake.assigned_machine_id !== saga.machine_id) return error('started_intake_binding_mismatch', 409);
     if (saga.state === 'running') {
-      return saga.native_id === body.native_id && intake.status === 'running'
-        ? json({ started: true, duplicate: true }) : error('native_identity_conflict', 409);
+      if(saga.native_id!==body.native_id||intake.status!=='running')return error('native_identity_conflict',409);
+      this.transaction(()=>this.pinWorkspaceBinding(saga,binding));
+      return json({ started: true, duplicate: true });
     }
     if (saga.state !== 'admitted' || intake.status !== 'queued') return error('session_not_admitted', 409);
     const now = Date.now();
     this.transaction(() => {
+      this.pinWorkspaceBinding(saga,binding);
       this.db.run("UPDATE dispatch_sagas SET state='running', native_id=?, updated_at=? WHERE operation_id=? AND state='admitted' AND attempt_operation_id=? AND epoch=?",
         body.native_id, now, saga.operation_id, saga.attempt_operation_id, saga.epoch);
       this.db.run("UPDATE intakes SET status='running', updated_at=? WHERE id=? AND session_id=? AND assigned_machine_id=? AND status='queued'",
@@ -994,7 +1005,7 @@ export class ProjectDO {
   }
 
   private async finishInternal(request: Request): Promise<Response> {
-    const body = await bodyObject(request, 12_288);
+    const body = await bodyObject(request, 16_384);
     if (typeof body.operation_id !== 'string' || typeof body.attempt_operation_id !== 'string' || typeof body.session_id !== 'string'
       || typeof body.machine_id !== 'string' || typeof body.native_id !== 'string' || !Number.isSafeInteger(body.epoch)
       || !Number.isInteger(body.exit_code) || Number(body.exit_code) < -2147483648 || Number(body.exit_code) > 2147483647
@@ -1013,6 +1024,7 @@ export class ProjectDO {
     if (!saga || saga.session_id !== body.session_id || saga.machine_id !== body.machine_id
       || saga.attempt_operation_id !== body.attempt_operation_id || saga.epoch !== body.epoch
       || (saga.native_id !== body.native_id&&!(launchFailed&&(saga.state==='admitted'||lateLaunchFailure)&&saga.native_id===null&&/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(body.native_id)))) return error('dispatch_not_found', 404);
+    const binding=this.workspaceBinding(saga,body.workspace_binding);
     const intake = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id = ?', saga.intake_id);
     if (!intake) return error('intake_not_found', 404);
     const alreadyFinished = saga.state === 'complete'&&!lateLaunchFailure;
@@ -1024,7 +1036,7 @@ export class ProjectDO {
     if(launchFailed){
       const identity=evidence.native_identity as JsonRecord|undefined,exit=evidence.native_exit as JsonRecord|undefined,launch=this.parse(saga.launch_spec_json) as JsonRecord;
       if(!['aplexer_status','aplexer_retirement'].includes(String(evidence.source))||evidence.containment_empty!==true
-        ||identity?.id!==body.native_id||identity?.tag!=='task-hub2-'+saga.session_id||identity?.workspace!==launch.workspace||normalizedExit!==body.exit_code)return error('invalid_launch_failure_proof',400);
+        ||identity?.id!==body.native_id||identity?.tag!=='task-hub2-'+saga.session_id||identity?.workspace!==boundWorkspace(launch,binding)||normalizedExit!==body.exit_code)return error('invalid_launch_failure_proof',400);
     }
     const completionDigest=await sha256Hex(JSON.stringify({operation_id:saga.operation_id,attempt_operation_id:saga.attempt_operation_id,session_id:saga.session_id,machine_id:saga.machine_id,epoch:saga.epoch,native_id:body.native_id,exit_code:body.exit_code,evidence,...(launchFailed?{launch_failed:true}:{})}));
     const replay=()=>{
@@ -1033,6 +1045,7 @@ export class ProjectDO {
     };
     if(alreadyFinished){
       replay();
+      this.transaction(()=>this.pinWorkspaceBinding(saga,binding));
       await this.releaseSessionCap(saga.operation_id,saga.session_id);
       return json({ok:true,duplicate:true});
     }
@@ -1042,6 +1055,7 @@ export class ProjectDO {
     const deadlineExceeded = nativeDeadline?.exceeded === true;
     const finishedStatus = body.exit_code === 0 && !launchFailed && !deadlineExceeded ? 'completed-awaiting-review' : 'failed';
     const duplicate=this.transaction(() => {
+      this.pinWorkspaceBinding(saga,binding);
       const currentSaga=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?',saga.operation_id);
       if(currentSaga?.state==='complete'&&currentSaga.native_id!==null){replay();return true;}
       const current=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',intake.id);
@@ -1212,6 +1226,7 @@ export class ProjectDO {
       ...(() => {
         const launch = this.parse(saga.launch_spec_json) as JsonRecord | null;
         return launch ? { engine: launch.engine, model: launch.model, effort: launch.effort ?? null,
+          workspace:boundWorkspace(launch,this.workspaceBinding(saga)),requested_workspace:launch.workspace,
           route: [launch.engine, launch.model, launch.effort ?? 'default'].join('/') } : {};
       })(),
     };
@@ -1220,6 +1235,25 @@ export class ProjectDO {
   private startResponse(saga:SagaRow,status:number):Response{
     const session=this.sagaView(saga);
     return json({session,picker:session.picker},status);
+  }
+
+  private workspaceBinding(saga:SagaRow,incoming?:unknown):WorkspaceBinding|undefined {
+    const launch=this.parse(saga.launch_spec_json) as JsonRecord;
+    const route=this.parse(saga.routing_json) as JsonRecord|null;
+    return mergeWorkspaceBinding(launch.workspace,route?.workspace_binding,incoming);
+  }
+
+  /** Existing receipt transactions pin metadata without rewriting the request. */
+  private pinWorkspaceBinding(saga:SagaRow,binding:WorkspaceBinding|undefined):void {
+    if(!binding)return;
+    const current=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?',saga.operation_id);
+    if(!current||current.session_id!==saga.session_id||current.machine_id!==saga.machine_id
+      ||current.attempt_operation_id!==saga.attempt_operation_id||current.epoch!==saga.epoch)
+      throw new HttpError('workspace_binding_fence_changed',409);
+    const accepted=this.workspaceBinding(current,binding);
+    const route=this.parse(current.routing_json) as JsonRecord|null;
+    this.db.run('UPDATE dispatch_sagas SET routing_json=? WHERE operation_id=?',
+      JSON.stringify({...route,workspace_binding:accepted}),saga.operation_id);
   }
 
   private parse(value: unknown): unknown {

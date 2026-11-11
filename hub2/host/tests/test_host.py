@@ -11,7 +11,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_hub_host.agent import Bridge, Journal
+from agent_hub_host.agent import Bridge, Journal, offer_ack_frame, OfferAcknowledgement
 from agent_hub_host.client import ApiError, Client, save_config
 from agent_hub_host.cli import main as cli_main
 
@@ -157,6 +157,7 @@ class HostTests(unittest.TestCase):
         try:
             columns={row[1] for row in migrated.db.execute('PRAGMA table_info(launches)')}
             self.assertIn('runtime_deadline',columns)
+            self.assertIn('workspace_repair_digest',columns)
         finally:
             migrated.db.close()
 
@@ -371,6 +372,265 @@ class HostTests(unittest.TestCase):
         self.assertEqual(row["workspace"], str(workspace.resolve()))
         self.assertEqual(self.native.process["workspace"], str(workspace.resolve()))
         self.assertTrue(any(call[1] == "start" for call, _ in self.native.calls))
+
+    def test_label_resolution_is_bound_in_existing_ack_before_native_dispatch(self):
+        workspace = self.root / 'relay'
+        workspace.mkdir()
+        offer = self.offer()
+        offer['launch']['workspace'] = 'relay'
+        acknowledgements = []
+        def acknowledge(*args):
+            self.assertFalse(any(call[1] == 'start' for call, _ in self.native.calls))
+            row = self.journal.db.execute('SELECT * FROM launches').fetchone()
+            self.assertEqual(row['workspace'], str(workspace.resolve()))
+            acknowledgements.append(args)
+        self.bridge.offer(offer, acknowledge)
+        self.assertEqual(acknowledgements, [('session-1', 1, {
+            'version': 1, 'requested_workspace': 'relay',
+            'resolved_workspace': str(workspace.resolve())})])
+
+    def test_label_reconnect_keeps_same_binding_and_root_change_cannot_rebind(self):
+        workspace = self.root / 'relay'
+        workspace.mkdir()
+        offer = self.offer()
+        offer['launch']['workspace'] = 'relay'
+        acknowledgements = []
+        self.bridge.offer(offer, lambda *args: acknowledgements.append(args))
+        self.bridge.offer(offer, lambda *args: acknowledgements.append(args))
+        self.assertEqual(acknowledgements[0], acknowledgements[1])
+        self.assertEqual(sum(args[1] == 'start' for args, _ in self.native.calls), 1)
+        replacement = self.root / 'other-root'
+        (replacement / 'relay').mkdir(parents=True)
+        self.bridge.roots = [replacement]
+        with self.assertRaisesRegex(ValueError, 'offer_fence_conflict'):
+            self.bridge.offer(offer, lambda *args: acknowledgements.append(args))
+        self.assertEqual(len(acknowledgements), 2)
+
+    def test_old_absolute_ack_arity_and_qualified_samefile_evidence_spelling_are_preserved(self):
+        acknowledgements = []
+        self.bridge.offer(self.offer(), lambda *args: acknowledgements.append(args))
+        self.assertEqual(acknowledgements, [('session-1', 1)])
+        if os.name == 'nt':
+            alias = str(self.root).swapcase()
+        else:
+            link = self.root / 'same-directory-alias'
+            link.symlink_to(self.root, target_is_directory=True)
+            alias = str(link)
+        self.native.process.update(workspace=alias, phase='exited', containment_empty=True,
+                                   exit={'code': 0, 'exited_at_ms': int(time.time()*1000)})
+        self.bridge.launcher.finalize = lambda *args: 'finished'
+        self.bridge.reconcile()
+        payload = json.loads(self.journal.db.execute("SELECT payload FROM outbox WHERE path LIKE '%/finish'").fetchone()['payload'])
+        self.assertEqual(payload['evidence']['native_identity']['workspace'], str(self.root.resolve()))
+        self.assertEqual(payload['native_id'], self.native.process['id'])
+
+    def test_ack_unicode_encoding_fits_real_socket_utf16_limit_without_ascii_expansion(self):
+        for workspace in ('/' + '\u754c' * 1023, 'C:\\' + '\U0001f642' * 510):
+            binding = {'version': 1, 'requested_workspace': 'relay', 'resolved_workspace': workspace}
+            frame = offer_ack_frame('session-1', 1, binding)
+            self.assertEqual(json.loads(frame)['workspace_binding'], binding)
+            self.assertLessEqual(len(frame.encode('utf-16-le')) // 2, 8192)
+            self.assertLessEqual(len(frame.encode('utf-8')), 8192)
+            self.assertNotIn('\\u754c', frame)
+
+    def legacy_label_finished(self, epoch=3):
+        workspace = self.root / 'relay'
+        workspace.mkdir(exist_ok=True)
+        offer = self.offer(epoch=epoch)
+        offer['launch']['workspace'] = 'relay'
+        self.bridge.offer(offer)
+        self.journal.flush(self.client)
+        self.native.process.update(phase='exited', containment_empty=True,
+                                   exit={'code': 0, 'exited_at_ms': int(time.time()*1000)})
+        self.bridge.reconcile()
+        receipt = self.journal.db.execute("SELECT * FROM outbox WHERE key='finish:operation-1'").fetchone()
+        recovery = {**offer, 'claimed': True, 'expires_at': None,
+                    'recovery_native_id': self.native.process['id']}
+        return recovery, dict(receipt)
+
+    def test_exited_label_repair_reaches_pending_and_deadletter_via_dispatch_and_drain_once(self):
+        recovery, receipt = self.legacy_label_finished()
+        acknowledged, delivered = [], []
+        original = self.client.request
+        def request(method, path, body=None, key=None):
+            if path == '/api/offers':
+                return {'offers': [recovery]}
+            if path.endswith('/finish'):
+                delivered.append((json.dumps(body, sort_keys=True, separators=(',', ':')), key))
+                if not acknowledged:
+                    raise ApiError('old label comparison', status=409, code='unqualified_native_exit_evidence')
+            return original(method, path, body, key)
+        self.client.request = request
+        with self.assertLogs('agent_hub_host.agent', level='ERROR'):
+            self.journal.flush(self.client)
+        prior_native_calls = list(self.native.calls)
+        def acknowledge(*args):
+            acknowledged.append(args)
+            return True
+        # The actual polling upgrade route, not an otherwise unreachable direct offer.
+        self.bridge.drain(acknowledge)
+        self.assertEqual(len(acknowledged), 1)
+        self.assertEqual(acknowledged[0][2]['requested_workspace'], 'relay')
+        self.assertEqual(delivered, [(receipt['payload'], receipt['key'])] * 2)
+        self.assertFalse(self.journal.db.execute('SELECT 1 FROM outbox').fetchone())
+        self.assertEqual(self.native.calls, prior_native_calls)
+        # Retain the exact stale server offer across a process restart. Repair
+        # must not recreate a receipt that has already been retried/delivered.
+        path = self.journal.path
+        self.journal.db.close()
+        self.journal = Journal(path)
+        self.bridge.journal = self.journal
+        self.bridge.drain(acknowledge)
+        self.assertEqual(len(delivered), 2)
+        self.assertEqual(self.native.calls, prior_native_calls)
+
+    def test_exited_label_never_acknowledges_a_different_epoch_or_native(self):
+        recovery, _ = self.legacy_label_finished()
+        acknowledged = []
+        for changed in ({'epoch': 2}, {'epoch': 4},
+                        {'epoch': 4, 'claimed': False, 'expires_at': time.time()*1000+60000, 'recovery_native_id': None},
+                        {'recovery_native_id': '99999999-2222-4333-8444-555555555555'}):
+            with self.subTest(changed=changed), self.assertRaises((ValueError, RuntimeError)):
+                candidate = {**recovery, **changed}
+                if candidate.get('recovery_native_id') is None:
+                    candidate.pop('recovery_native_id', None)
+                self.bridge.offer(candidate, lambda *args: acknowledged.append(args))
+        self.assertFalse(acknowledged)
+
+    def test_pending_exited_label_repair_keeps_frozen_body_and_unrelated_deadletters(self):
+        recovery, receipt = self.legacy_label_finished()
+        unrelated = ('other-finish', '/api/sessions/foreign/finish', '{"private":"preserve"}', 409,
+                     'unqualified_native_exit_evidence', 1)
+        with self.journal.db:
+            self.journal.db.execute('INSERT INTO outbox_dead_letters VALUES(?,?,?,?,?,?)', unrelated)
+        calls = list(self.native.calls)
+        acknowledged = []
+        def acknowledge(*args):
+            acknowledged.append(args)
+            return True
+        self.bridge.dispatch({'type': 'session.offer', 'offer': recovery}, None,
+                             acknowledge)
+        self.assertEqual(len(acknowledged), 1)
+        self.assertEqual(dict(self.journal.db.execute('SELECT * FROM outbox').fetchone()), receipt)
+        self.assertEqual(tuple(self.journal.db.execute('SELECT * FROM outbox_dead_letters').fetchone()), unrelated)
+        self.assertEqual(self.native.calls, calls)
+
+    def test_binding_echo_is_required_only_for_historical_repair_not_fresh_starts(self):
+        recovery, receipt = self.legacy_label_finished()
+        with self.journal.db:
+            self.journal.db.execute('INSERT INTO outbox_dead_letters VALUES(?,?,?,?,?,?)',
+                                    (receipt['key'], receipt['path'], receipt['payload'], 409, 'unqualified_native_exit_evidence', 1))
+            self.journal.db.execute('DELETE FROM outbox')
+        binding = {'version': 1, 'requested_workspace': 'relay', 'resolved_workspace': str((self.root/'relay').resolve())}
+        calls = list(self.native.calls)
+        for echo in (None, {**binding, 'resolved_workspace': '/wrong'}):
+            acknowledgement = OfferAcknowledgement(binding)
+            acknowledgement.accept({'type': 'ack', 'session_id': recovery['session_id'], 'epoch': recovery['epoch'],
+                                    **({'workspace_binding': echo} if echo else {})})
+            self.bridge.offer(recovery, lambda *args: acknowledgement.wait(0))
+            self.assertFalse(self.journal.db.execute('SELECT 1 FROM outbox').fetchone())
+            self.assertIsNone(self.journal.db.execute('SELECT workspace_repair_digest FROM launches').fetchone()[0])
+        acknowledgement = OfferAcknowledgement(binding)
+        with self.assertRaisesRegex(RuntimeError, 'claim_ack_unverified'):
+            self.bridge.offer(recovery, lambda *args: acknowledgement.wait(0))
+        self.assertIsNone(self.journal.db.execute('SELECT workspace_repair_digest FROM launches').fetchone()[0])
+        acknowledgement.accept({'workspace_binding': binding})
+        self.bridge.offer(recovery, lambda *args: acknowledgement.wait(0))
+        self.assertEqual(dict(self.journal.db.execute('SELECT * FROM outbox').fetchone()), receipt)
+        self.assertEqual(self.native.calls, calls)
+        # An old server's normal claim ACK still admits a fresh launch.
+        fresh = self.offer(operation_id='fresh-op', session_id='fresh-session')
+        fresh['launch']['workspace'] = 'relay'
+        self.bridge.offer(fresh, lambda *args: False)
+        self.assertEqual(sum(args[1] == 'start' for args, _ in self.native.calls), 2)
+
+    def test_repair_crash_after_binding_echo_rolls_back_marker_and_retries_after_restart(self):
+        recovery, receipt = self.legacy_label_finished()
+        with self.journal.db:
+            self.journal.db.execute('INSERT INTO outbox_dead_letters VALUES(?,?,?,?,?,?)',
+                                    (receipt['key'], receipt['path'], receipt['payload'], 409, 'unqualified_native_exit_evidence', 1))
+            self.journal.db.execute('DELETE FROM outbox')
+            self.journal.db.execute("CREATE TRIGGER fail_repair_insert BEFORE INSERT ON outbox BEGIN SELECT RAISE(ABORT,'synthetic crash'); END")
+        calls = list(self.native.calls)
+        # Actual socket dispatch contains the fault instead of poisoning the host connection.
+        frames = []
+        class Socket:
+            def send(self, text):
+                frames.append(json.loads(text))
+        with self.assertLogs('agent_hub_host.agent', level='ERROR'):
+            self.bridge.dispatch({'type': 'session.offer', 'offer': recovery}, Socket(), lambda *args: True)
+        self.assertEqual(frames[-1]['type'], 'host.error')
+        self.assertIsNone(self.journal.db.execute('SELECT workspace_repair_digest FROM launches').fetchone()[0])
+        self.assertFalse(self.journal.db.execute('SELECT 1 FROM outbox').fetchone())
+        path = self.journal.path
+        self.journal.db.close()
+        self.journal = Journal(path)
+        self.bridge.journal = self.journal
+        self.journal.db.execute('DROP TRIGGER fail_repair_insert')
+        self.journal.db.commit()
+        self.bridge.offer(recovery, lambda *args: True)
+        self.assertEqual(dict(self.journal.db.execute('SELECT * FROM outbox').fetchone()), receipt)
+        self.assertEqual(self.native.calls, calls)
+
+    def test_recovery_offer_missing_local_identity_never_dispatches_or_acknowledges(self):
+        offer = self.offer(claimed=True, expires_at=None)
+        offer['recovery_native_id'] = '11111111-2222-4333-8444-555555555555'
+        acknowledged = []
+        for claimed in (True, False):
+            with self.assertRaisesRegex(ValueError, 'native_reconciliation_required'):
+                self.bridge.offer({**offer, 'claimed': claimed}, lambda *args: acknowledged.append(args))
+        self.assertEqual(self.native.calls, [])
+        self.assertFalse(acknowledged)
+
+    def test_unqualified_frozen_exit_and_other_permanent_failures_never_requeue(self):
+        recovery, receipt = self.legacy_label_finished()
+        original = json.loads(receipt['payload'])
+        for field, value in (('epoch', 2), ('native_id', '99999999-2222-4333-8444-555555555555'),
+                             ('native_exit_confirmed', False), ('exit_code', True)):
+            body = {**original, field: value}
+            self.journal.db.execute('UPDATE outbox SET payload=?', (json.dumps(body),))
+            self.journal.db.commit()
+            called = []
+            self.bridge.offer(recovery, lambda *args: called.append(args) or True)
+            self.assertFalse(called)
+        for field, value in (('containment_empty', False), ('native_identity', {'id': recovery['recovery_native_id'], 'tag': 'foreign', 'workspace': str(self.root/'relay')}),
+                             ('native_exit', {'code': 0, 'exited_at_ms': int(time.time()*1000)+60000})):
+            body = {**original, 'evidence': {**original['evidence'], field: value}}
+            self.journal.db.execute('UPDATE outbox SET payload=?', (json.dumps(body),))
+            self.journal.db.commit()
+            called = []
+            self.bridge.offer(recovery, lambda *args: called.append(args) or True)
+            self.assertFalse(called)
+        with self.journal.db:
+            self.journal.db.execute('DELETE FROM outbox')
+            self.journal.db.execute('INSERT INTO outbox_dead_letters VALUES(?,?,?,?,?,?)',
+                                    (receipt['key'], receipt['path'], receipt['payload'], 409, 'stale_or_unmatched_finish', 1))
+        called = []
+        self.bridge.offer(recovery, lambda *args: called.append(args) or True)
+        self.assertFalse(called)
+        self.assertFalse(self.journal.db.execute('SELECT 1 FROM outbox').fetchone())
+        with self.journal.db:
+            self.journal.db.execute('DELETE FROM outbox_dead_letters')
+            self.journal.db.execute('INSERT INTO outbox VALUES(?,?,?)',
+                                    (receipt['key'], receipt['path'], '{"native_exit_confirmed":false,' + receipt['payload'][1:]))
+        self.bridge.offer(recovery, lambda *args: called.append(args) or True)
+        self.assertFalse(called)
+
+    def test_one_failed_repair_keeps_original_deadletter_and_cannot_loop(self):
+        recovery, receipt = self.legacy_label_finished()
+        original = (receipt['key'], receipt['path'], receipt['payload'], 409, 'unqualified_native_exit_evidence', 1)
+        with self.journal.db:
+            self.journal.db.execute('INSERT INTO outbox_dead_letters VALUES(?,?,?,?,?,?)', original)
+            self.journal.db.execute('DELETE FROM outbox')
+        self.bridge.offer(recovery, lambda *args: True)
+        old = self.client.request
+        self.client.request = lambda *args, **kwargs: (_ for _ in ()).throw(ApiError('still refused', status=409, code='stale_or_unmatched_finish'))
+        with self.assertLogs('agent_hub_host.agent', level='ERROR'):
+            self.journal.flush(self.client)
+        self.assertEqual(tuple(self.journal.db.execute('SELECT * FROM outbox_dead_letters').fetchone()), original)
+        self.bridge.offer(recovery, lambda *args: True)
+        self.assertFalse(self.journal.db.execute('SELECT 1 FROM outbox').fetchone())
+        self.client.request = old
 
     def test_unavailable_workspace_label_fails_with_a_stable_reason(self):
         offer = self.offer()
