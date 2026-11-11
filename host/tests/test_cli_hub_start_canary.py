@@ -11,7 +11,7 @@ SCRIPT = ROOT / "scripts" / "hub-start-canary.sh"
 SID, NATIVE = "11111111-2222-4333-8444-555555555555", "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 
 FAKE_HUB = r'''
-import json, os, sys, pathlib, time
+import json, os, signal, sys, pathlib, time
 d = pathlib.Path(os.environ["FAKE_DIR"]); sc = os.environ.get("FAKE_SCENARIO", "ok")
 args = sys.argv[1:]
 with open(d / "argv.jsonl", "a") as recorded:
@@ -19,9 +19,11 @@ with open(d / "argv.jsonl", "a") as recorded:
 log = open(d / "calls.log", "a"); log.write(" ".join(args) + "\n"); log.close()
 SID = "%s"; NATIVE = "%s"
 def item(state, **kw):
+    name = (d / "session_name").read_text() if (d / "session_name").exists() else None
+    key = (d / "session_key").read_text() if (d / "session_key").exists() else None
     base = {"id": SID, "state": state, "intake_id": None, "project_id": "owner/repo", "machine_id": "HOST-1", "workspace": os.environ["HUB_CANARY_WORKSPACE"],
             "epoch": 1, "operation_id": "op:0", "native_id": NATIVE, "engine": "shell", "model": None,
-            "interactive": False, "evidence": None, "attention": None}
+            "name": name, "key": key, "interactive": False, "evidence": None, "attention": None}
     base.update(kw); return base
 if args[:2] == ["sessions", "start"]:
     if sc == "start_fail": sys.stderr.write("Session operation failed\n"); sys.exit(1)
@@ -32,17 +34,29 @@ if args[:2] == ["sessions", "start"]:
     (d / "started").write_text("1"); (d / "a_running").write_text("1")
     prompt_text = args[args.index("--prompt") + 1]
     (d / "prompt").write_text(prompt_text)
-    run_id = args[args.index("--name") + 1].rsplit("-", 1)[-1]
+    session_name = args[args.index("--name") + 1]
+    session_key = args[args.index("--key") + 1]
+    (d / "session_name").write_text(session_name)
+    (d / "session_key").write_text(session_key)
+    run_id = session_name.rsplit("-", 1)[-1]
     if "printf '%%s:%%s:%%s\\n' CANARY-OK " in prompt_text:
         parts = prompt_text.split(";")[0].split()
         (d / "marker").write_text(f"CANARY-OK:{parts[-2]}:{parts[-1]}")
     else:
         (d / "marker").write_text("CANARY-OK" + (":" + run_id if "--engine" not in args else ""))
+    if sc == "sigterm_on_start" and first:
+        parent_pid = int(os.environ["CANARY_TEST_PID"]) if "CANARY_TEST_PID" in os.environ else os.getppid()
+        os.kill(parent_pid, signal.SIGTERM)
+        time.sleep(2)
+        sys.exit(1)
     if sc == "start_lost_response" and first: print("lost accepted response"); sys.exit(0)
     if sc == "start_slow" and first: time.sleep(1)
     print(json.dumps({"id": SID, "state": "queued", "operation_id": "op:0"})); sys.exit(0)
 if args[:1] == ["routing-machines"]:
     host_ver = os.environ.get("FAKE_HOST_VERSION", "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7")
+    if sc == "post_hash_swap":
+        rel_root = pathlib.Path(os.environ["HUB_CANARY_HOST_RELEASE_ROOT"])
+        (rel_root / "releases" / host_ver / "hub.pyz").write_text("import sys; sys.exit(99)\n")
     connected = sc != "host_disconnected"
     mismatch = sc == "host_version_mismatch_flag"
     print(json.dumps({"hosts": [{"machine_id": os.environ.get("HUB_CANARY_MACHINE", "HOST-1"), "connected": connected, "host_version": host_ver, "version_mismatch": mismatch, "protocol_version": 1}]}))
@@ -475,7 +489,8 @@ class CanaryTest(unittest.TestCase):
         # switches self.hub to the verified immutable candidate hub.pyz without mutating ~/.local/bin/hub.
         r, v = self.run_canary(
             "ok", "--deploy-gate", "--mode", "shell",
-            "--candidate-sha", sha, "--run-token", token, "--helper-sha256", helper_sha,
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
             HUB_BIN="/nonexistent/global-hub-must-not-be-used",
             HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
             HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
@@ -498,47 +513,63 @@ class CanaryTest(unittest.TestCase):
         prompt = (self.tmp / "prompt").read_text()
         self.assertNotIn(f"CANARY-OK:{sha[:12]}:{token}", prompt)
         self.assertIn(f"printf '%s:%s:%s\\n' CANARY-OK {sha[:12]} {token}; sleep 30", prompt)
+        self.assertEqual(list((self.state / "pending").glob("*.json")), [])
 
     def test_precommit_deploy_gate_rejects_helper_digest_mismatch(self):
         sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
         token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
-        rel_root, _ = self.prepare_candidate_release(sha)
+        rel_root, pyz_sha = self.prepare_candidate_release(sha)
         r, v = self.run_canary(
             "ok", "--deploy-gate", "--mode", "shell",
-            "--candidate-sha", sha, "--run-token", token, "--helper-sha256", "0" * 64,
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", "0" * 64,
             HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
             HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
         )
         self.assertEqual(r.returncode, 1)
         self.assertEqual((v["ok"], v["stage"], v["reason"]), (False, "helper_version", "helper_sha256_mismatch"))
         self.assertEqual(self.calls(), "")
+        self.assertFalse(self.state.exists())
 
     def test_precommit_deploy_gate_rejects_unconverged_or_tampered_host_release(self):
         sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
         token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
         helper_sha = self.helper_sha256()
-        rel_root, _ = self.prepare_candidate_release(sha, converge=False)
+        rel_root, pyz_sha = self.prepare_candidate_release(sha, converge=False)
         r, v = self.run_canary(
             "ok", "--deploy-gate", "--mode", "shell",
-            "--candidate-sha", sha, "--run-token", token, "--helper-sha256", helper_sha,
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
             HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
             HUB_CANARY_CONVERGE_TIMEOUT_S="0.1",
         )
         self.assertEqual((r.returncode, v["stage"], v["reason"]), (1, "host_release", "timeout_current_release_not_converged"))
 
-        rel_root, _ = self.prepare_candidate_release(sha, tamper_pyz=True)
+        rel_root, pyz_sha = self.prepare_candidate_release(sha, tamper_pyz=True)
         r, v = self.run_canary(
             "ok", "--deploy-gate", "--mode", "shell",
-            "--candidate-sha", sha, "--run-token", token, "--helper-sha256", helper_sha,
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
             HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
             HUB_CANARY_CONVERGE_TIMEOUT_S="0.1",
         )
         self.assertEqual((r.returncode, v["stage"], v["reason"]), (1, "host_release", "candidate_hub_pyz_digest_mismatch"))
 
-        rel_root, _ = self.prepare_candidate_release(sha)
+        rel_root, pyz_sha = self.prepare_candidate_release(sha)
         r, v = self.run_canary(
             "ok", "--deploy-gate", "--mode", "shell",
-            "--candidate-sha", sha, "--run-token", token, "--helper-sha256", helper_sha,
+            "--candidate-sha", sha, "--candidate-cli-sha256", "f" * 64,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.1",
+        )
+        self.assertEqual((r.returncode, v["stage"], v["reason"]), (1, "host_release", "candidate_hub_pyz_cli_sha_mismatch"))
+
+        rel_root, pyz_sha = self.prepare_candidate_release(sha)
+        r, v = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
             HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
             HUB_CANARY_CONVERGE_TIMEOUT_S="0.1",
             FAKE_HOST_VERSION="ad0b8a0b2276303c2b13762a614fe49a63514ae7",
@@ -546,20 +577,170 @@ class CanaryTest(unittest.TestCase):
         self.assertEqual((r.returncode, v["stage"]), (1, "host_release"))
         self.assertIn("timeout_host_version_mismatch", v["reason"])
 
+    def test_precommit_deploy_gate_executes_sealed_memfd_immune_to_post_hash_disk_swap(self):
+        sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
+        token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        helper_sha = self.helper_sha256()
+        rel_root, pyz_sha = self.prepare_candidate_release(sha)
+        r, v = self.run_canary(
+            "post_hash_swap", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_BIN="/nonexistent/global-hub-must-not-be-used",
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
+            FAKE_HOST_VERSION=sha,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(v["ok"])
+        self.assertEqual(v["hub_pyz_sha256"], pyz_sha)
+        # Confirm that the on-disk file was indeed overwritten during routing-machines,
+        # yet all subsequent CLI invocations still executed the sealed memfd bytes.
+        self.assertEqual(
+            (rel_root / "releases" / sha / "hub.pyz").read_text(),
+            "import sys; sys.exit(99)\n",
+        )
+
     def test_precommit_deploy_gate_fails_when_intake_archival_fails(self):
         sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
         token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
         helper_sha = self.helper_sha256()
-        rel_root, _ = self.prepare_candidate_release(sha)
+        rel_root, pyz_sha = self.prepare_candidate_release(sha)
         r, v = self.run_canary(
             "archive_update_fail", "--deploy-gate", "--mode", "shell",
-            "--candidate-sha", sha, "--run-token", token, "--helper-sha256", helper_sha,
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
             HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
             HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
             FAKE_HOST_VERSION=sha,
         )
         self.assertEqual((r.returncode, v["ok"], v["stage"], v["reason"], v["intake_archived"]),
                          (1, False, "cleanup", "intake_archive_failed", False))
+
+    def test_precommit_deploy_gate_rejects_symlink_or_nonprivate_state_dir_and_symlink_lock_without_truncation(self):
+        sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
+        token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        helper_sha = self.helper_sha256()
+        rel_root, pyz_sha = self.prepare_candidate_release(sha)
+
+        victim_dir = self.tmp / "victim-dir"
+        victim_dir.mkdir(mode=0o700)
+        symlink_state = self.tmp / "symlink-state"
+        symlink_state.symlink_to(victim_dir)
+        r_sym, v_sym = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_STATE_DIR=str(symlink_state),
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
+        )
+        self.assertEqual((r_sym.returncode, v_sym["stage"], v_sym["reason"]), (1, "lock", "state_dir_symlink"))
+
+        open_state = self.tmp / "open-state"
+        open_state.mkdir(mode=0o755)
+        os.chmod(open_state, 0o755)
+        r_open, v_open = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_STATE_DIR=str(open_state),
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
+        )
+        self.assertEqual((r_open.returncode, v_open["stage"], v_open["reason"]), (1, "lock", "state_dir_not_private"))
+
+        priv_state = self.tmp / "priv-state"
+        priv_state.mkdir(mode=0o700)
+        os.chmod(priv_state, 0o700)
+        victim_file = self.tmp / "victim.txt"
+        victim_file.write_text("DO-NOT-TRUNCATE")
+        (priv_state / "deploy-gate.lock").symlink_to(victim_file)
+        r_lock_sym, v_lock_sym = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_STATE_DIR=str(priv_state),
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
+        )
+        self.assertEqual((r_lock_sym.returncode, v_lock_sym["stage"], v_lock_sym["reason"]), (1, "lock", "lock_file_symlink"))
+        self.assertEqual(victim_file.read_text(), "DO-NOT-TRUNCATE")
+
+        (priv_state / "deploy-gate.lock").unlink()
+        (priv_state / "deploy-gate.lock").write_text("KEEP-BYTES")
+        os.chmod(priv_state / "deploy-gate.lock", 0o600)
+        r_preserve, v_preserve = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_STATE_DIR=str(priv_state),
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
+            FAKE_HOST_VERSION=sha,
+        )
+        self.assertEqual((r_preserve.returncode, v_preserve["ok"]), (0, True))
+        self.assertEqual((priv_state / "deploy-gate.lock").read_text(), "KEEP-BYTES")
+
+    def test_sigterm_during_start_triggers_reconciliation_stop_and_intake_archive(self):
+        sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
+        token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        helper_sha = self.helper_sha256()
+        rel_root, pyz_sha = self.prepare_candidate_release(sha)
+        r, v = self.run_canary(
+            "sigterm_on_start", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
+            FAKE_HOST_VERSION=sha,
+        )
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual((v["ok"], v["stage"], v["reason"]), (False, "start", "terminated_sigterm"))
+        self.assertEqual(v["session_id"], SID)
+        self.assertEqual(v["cleanup"], "stopped")
+        self.assertEqual(v["intake_archived"], True)
+        self.assertFalse((self.tmp / "a_running").exists())
+        self.assertEqual(list((self.state / "pending").glob("*.json")), [])
+
+    def test_prior_unreconciled_pending_start_is_cleaned_up_on_next_run(self):
+        sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
+        token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        helper_sha = self.helper_sha256()
+        rel_root, pyz_sha = self.prepare_candidate_release(sha)
+        self.state.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(self.state, 0o700)
+        pending_dir = self.state / "pending"
+        pending_dir.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(pending_dir, 0o700)
+        prior_file = pending_dir / "prior-sigkilled.json"
+        prior_file.write_text(
+            json.dumps(
+                {
+                    "run_id": "prior-sigkilled",
+                    "mode": "shell",
+                    "name": "hub-canary-shell-prior-sigkilled",
+                    "key": "canary-prior-sigkilled",
+                    "repo": "owner/repo",
+                    "machine": "HOST-1",
+                    "workspace": str((self.tmp / "ws").resolve()),
+                    "prompt": "printf CANARY-OK; sleep 30",
+                    "candidate_sha": sha,
+                    "session_id": SID,
+                    "native_id": NATIVE,
+                }
+            )
+        )
+        os.chmod(prior_file, 0o600)
+        r, v = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
+            FAKE_HOST_VERSION=sha,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(v["ok"])
+        self.assertFalse(prior_file.exists())
+        self.assertIn("sessions stop " + SID + " --key canary-prior-sigkilled-reconcile", self.calls())
 
     def test_forced_command_wrapper_validates_ssh_original_command_purges_env_and_locks(self):
         sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
@@ -572,9 +753,20 @@ class CanaryTest(unittest.TestCase):
             dst = lib / name
             shutil.copy2(ROOT / "scripts" / name, dst)
             dst.chmod(0o755)
+        # B4: Create a poisoned user site-packages directory under USER_HOME
+        # to prove python3 -I -S never imports user site-packages or .pth files.
+        pyver = f"python{sys.version_info.major}.{sys.version_info.minor}"
+        user_site = self.tmp / ".local" / "lib" / pyver / "site-packages"
+        user_site.mkdir(parents=True, exist_ok=True)
+        poison_marker = self.tmp / "POISONED_USER_SITE_IMPORTED"
+        poison_code = f"import pathlib, sys; pathlib.Path({str(poison_marker)!r}).write_text('pwned'); sys.exit(88)\n"
+        (user_site / "sitecustomize.py").write_text(poison_code)
+        (user_site / "usercustomize.py").write_text(poison_code)
+        (user_site / "evil.pth").write_text(f"import pathlib, sys; pathlib.Path({str(poison_marker)!r}).write_text('pth'); sys.exit(88)\n")
+
         (lib / ".test-harness.env").write_text(
             f'USER_HOME="{self.tmp}"\n'
-            f'A_BIN="{sys.executable} {self.tmp / "fake_a.py"}"\n'
+            f'A_BIN="{sys.executable} -I -S {self.tmp / "fake_a.py"}"\n'
             f'HOST_RELEASE_ROOT="{rel_root}"\n'
             f'WORKSPACE_DIR="{self.tmp / "ws"}"\n'
             f'STATE_DIR="{self.state}"\n'
@@ -590,29 +782,40 @@ class CanaryTest(unittest.TestCase):
             "",
             "hub-deploy-gate",
             f"hub-deploy-gate --candidate-sha {sha} --run-token {token}",
-            f"hub-deploy-gate --candidate-sha {sha} --run-token {token} --helper-sha256 {helper_sha}; id",
-            f"hub-deploy-gate --candidate-sha NOT_HEX --run-token {token} --helper-sha256 {helper_sha}",
+            f"hub-deploy-gate --candidate-sha {sha} --run-token {token} --helper-sha256 {helper_sha}",
+            f"hub-deploy-gate --candidate-sha {sha} --candidate-cli-sha256 {pyz_sha} --run-token {token} --helper-sha256 {helper_sha}; id",
+            f"hub-deploy-gate --candidate-sha NOT_HEX --candidate-cli-sha256 {pyz_sha} --run-token {token} --helper-sha256 {helper_sha}",
         ):
             r = subprocess.run([forced], env={"SSH_ORIGINAL_COMMAND": bad_cmd}, capture_output=True, text=True, timeout=10)
             self.assertEqual(r.returncode, 2, bad_cmd)
             v = json.loads(r.stdout.strip())
             self.assertEqual((v["ok"], v["stage"]), (False, "forced_command"))
 
+        valid_cmd = (
+            f"hub-deploy-gate --candidate-sha {sha} --candidate-cli-sha256 {pyz_sha} "
+            f"--run-token {token} --helper-sha256 {helper_sha}"
+        )
         r_pos = subprocess.run(
             [forced, "extra"],
-            env={"SSH_ORIGINAL_COMMAND": f"hub-deploy-gate --candidate-sha {sha} --run-token {token} --helper-sha256 {helper_sha}"},
+            env={"SSH_ORIGINAL_COMMAND": valid_cmd},
             capture_output=True, text=True, timeout=10,
         )
         self.assertEqual(r_pos.returncode, 2)
 
-        valid_cmd = f"hub-deploy-gate --candidate-sha {sha} --run-token {token} --helper-sha256 {helper_sha}"
-        # Pass a poisoned caller HUB_BIN; env -i must purge it and use the candidate hub.pyz.
+        # Pass poisoned caller HUB_BIN, PYTHONPATH, PYTHONHOME, andDEPLOY_GATE_TIMEOUT_S=0;
+        # fixed defaults + env -i + python3 -I -S must ignore all of them.
         r_ok = subprocess.run(
             [forced],
-            env={"SSH_ORIGINAL_COMMAND": valid_cmd, "HUB_BIN": "/nonexistent/poisoned-by-caller"},
+            env={
+                "SSH_ORIGINAL_COMMAND": valid_cmd,
+                "HUB_BIN": "/nonexistent/poisoned-by-caller",
+                "PYTHONPATH": str(user_site),
+                "DEPLOY_GATE_TIMEOUT_S": "0",
+            },
             capture_output=True, text=True, timeout=20,
         )
         self.assertEqual(r_ok.returncode, 0, r_ok.stderr)
+        self.assertFalse(poison_marker.exists())
         verdict = json.loads(r_ok.stdout.strip())
         self.assertEqual(verdict["ok"], True)
         self.assertEqual(verdict["candidate_sha"], sha)
@@ -623,9 +826,9 @@ class CanaryTest(unittest.TestCase):
 
         # Hold the deploy-gate lock and verify concurrent forced-command execution fails closed.
         import fcntl
-        lock_file = open(self.state / "deploy-gate.lock", "w")
-        self.addCleanup(lock_file.close)
-        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_fd = os.open(self.state / "deploy-gate.lock", os.O_RDWR)
+        self.addCleanup(os.close, lock_fd)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         r_locked = subprocess.run([forced], env={"SSH_ORIGINAL_COMMAND": valid_cmd}, capture_output=True, text=True, timeout=10)
         self.assertEqual(r_locked.returncode, 1)
         v_locked = json.loads(r_locked.stdout.strip())
