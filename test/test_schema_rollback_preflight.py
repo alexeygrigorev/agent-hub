@@ -97,3 +97,76 @@ class SchemaRollbackPreflightTest(unittest.TestCase):
         done=subprocess.run(['python3',str(ROOT/'scripts/schema-rollback-preflight.py'),'--repo',str(self.repo),'--previous',self.previous,'--candidate',self.candidate,'--data-dir',str(self.db),'--print-mode'],capture_output=True,text=True)
         self.assertEqual((done.returncode,done.stdout),(0,'defer\n'),done.stderr)
         self.assertEqual(path.read_bytes(),before)
+
+    def test_legacy_manifestless_release_with_migrations_accepts_mixed_live_versions_and_rejects_invalid_bounds(self):
+        db_ts = self.repo / 'hub2/src/db.ts'
+        db_ts.parent.mkdir(parents=True, exist_ok=True)
+        db_ts.write_text(
+            'export function initializeSchema(state, db, version, statements, migrations = []) {\n'
+            '  while (applied < version) {\n'
+            '    const migration = migrations[applied - 1];\n'
+            '  }\n'
+            '}\n'
+        )
+        legacy_sources = {
+            'CONTROL': 'initializeSchema(ctx, this.db, 4, SCHEMA, [M1, M2, M3], afterInit);\n',
+            'MACHINES': 'initializeSchema(ctx, this.db, 6, LATEST_SCHEMA, [[S0], M2, M3, M4, M5], () => this.scheduleNext(), 6);\n',
+            'PROJECTS': 'initializeSchema(ctx, this.db, 4, SCHEMA, [], afterInit, 4);\n',
+            'ACCOUNTS': 'initializeSchema(ctx, this.db, 2, SCHEMA, [DROP_SESSION_CAPACITY], undefined, 2);\n',
+            'MAILBOXES': 'initializeSchema(ctx, this.db, 1, SCHEMA, [], () => this.schedule());\n',
+        }
+        for binding, src in legacy_sources.items():
+            (self.repo / preflight.SOURCES[binding]).write_text(src)
+        manifest_path = self.repo / 'deploy/schema-compatibility.json'
+        if manifest_path.exists():
+            manifest_path.unlink()
+        self.git('add', '-A')
+        self.git('commit', '-qm', 'legacy manifestless with migrations')
+        legacy_rev = self.git('rev-parse', 'HEAD')
+
+        old = preflight.manifest(self.repo, legacy_rev)
+        new = preflight.manifest(self.repo, self.candidate)
+        self.assertEqual(old['schemas']['ACCOUNTS']['min_read'], 1)
+        self.assertEqual(old['schemas']['MACHINES']['min_read'], 1)
+        self.assertEqual(old['schemas']['CONTROL']['min_read'], 1)
+        self.assertEqual(old['schemas']['PROJECTS']['min_read'], 4)
+
+        for name, (binding, ver) in {
+            'ACCOUNTS-a.sqlite': ('ACCOUNTS', 1),
+            'ACCOUNTS-b.sqlite': ('ACCOUNTS', 2),
+            'MACHINES-a.sqlite': ('MACHINES', 5),
+            'MACHINES-b.sqlite': ('MACHINES', 6),
+            'CONTROL-a.sqlite': ('CONTROL', 4),
+            'PROJECTS-a.sqlite': ('PROJECTS', 4),
+        }.items():
+            with closing(sqlite3.connect(self.db / name)) as db:
+                db.execute('CREATE TABLE hub2_schema(singleton INTEGER PRIMARY KEY,version INTEGER NOT NULL)')
+                db.execute('INSERT INTO hub2_schema VALUES(1,?)', (ver,))
+                db.commit()
+
+        live = preflight.live_schemas(self.db)
+        self.assertEqual(preflight.choose_mode(new, old, live), 'defer')
+
+        with self.assertRaisesRegex(preflight.Incompatible, 'candidate_cannot_read_live_schema:ACCOUNTS'):
+            preflight.choose_mode(new, old, [*live, ('ACCOUNTS', 3)])
+        with self.assertRaisesRegex(preflight.Incompatible, 'rollback_cannot_read_live_schema:MACHINES'):
+            preflight.choose_mode(new, old, [*live, ('MACHINES', 7)])
+        with self.assertRaisesRegex(preflight.Incompatible, 'candidate_cannot_read_live_schema:PROJECTS'):
+            preflight.choose_mode(new, old, [*live, ('PROJECTS', 3)])
+
+        (self.repo / preflight.SOURCES['MACHINES']).write_text(
+            'initializeSchema(ctx, this.db, 6, LATEST_SCHEMA, [M1, M2]);\n'
+        )
+        self.git('add', '-A')
+        self.git('commit', '-qm', 'incomplete legacy migrations')
+        bad_mig_rev = self.git('rev-parse', 'HEAD')
+        with self.assertRaisesRegex(preflight.Incompatible, 'legacy_schema_source_unrecognized:MACHINES'):
+            preflight.manifest(self.repo, bad_mig_rev)
+
+        (self.repo / preflight.SOURCES['MACHINES']).write_text(legacy_sources['MACHINES'])
+        db_ts.write_text('export function initializeSchema() {}\n')
+        self.git('add', '-A')
+        self.git('commit', '-qm', 'missing db migration loop')
+        bad_db_rev = self.git('rev-parse', 'HEAD')
+        with self.assertRaisesRegex(preflight.Incompatible, 'legacy_schema_migration_runner_unrecognized'):
+            preflight.manifest(self.repo, bad_db_rev)
