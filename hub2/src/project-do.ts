@@ -65,6 +65,8 @@ type SagaRow = {
   attempt: number; retry_count: number; next_action_at: number | null; last_reason: string | null; native_id: string | null;
   routing_json: string | null;route_registered:number;created_at:number;
 };
+const INTAKE_CONTEXT_FIELDS = ['current_state', 'next_step', 'owner', 'uncertainty'] as const;
+
 type IntakeEventRow = { seq: number; actor_id: string; kind: string; body_json: string; at: number };
 
 /** Per-project intake, queue, idempotency and launch-saga owner. */
@@ -223,7 +225,7 @@ export class ProjectDO {
 
   /** Version handle for compare-and-set callers (CLI `intake close/update`): the row's updated_at. */
   private taskCompat(row: IntakeRow): JsonRecord {
-    return { id: row.id, updated_at: row.updated_at, control: { version: row.updated_at } };
+    return { id: row.id, updated_at: row.updated_at, ...this.intakeContext(row.id), control: { version: row.updated_at } };
   }
 
   /** `hub intake context`: the intake plus its most recent events, bounded. */
@@ -256,9 +258,11 @@ export class ProjectDO {
     const body = await bodyObject(request.clone(), 16384);
     const row = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id = ?', intakeId);
     if (!row) return error('intake_not_found', 404);
+    const supported = ['key', 'expected_version', 'title', 'priority', 'acceptance_criteria', 'status', 'reason', 'note', 'outcome', 'superseded_by', ...INTAKE_CONTEXT_FIELDS];
+    if (Object.keys(body).some(field => !supported.includes(field))) return error('unknown_intake_field', 400);
     const mapped: JsonRecord = { key: body.key };
     if (typeof body.expected_version === 'number') mapped.expected_updated_at = body.expected_version;
-    for (const field of ['title', 'priority', 'acceptance_criteria']) if (body[field] !== undefined) mapped[field] = body[field];
+    for (const field of ['title', 'priority', 'acceptance_criteria', ...INTAKE_CONTEXT_FIELDS]) if (body[field] !== undefined) mapped[field] = body[field];
     if (body.status !== undefined) {
       // A cancelled or superseded intake is archived (never deleted); the replacement id stays in the note.
       mapped.status = body.status === 'done' || body.status === 'closed'
@@ -332,9 +336,10 @@ export class ProjectDO {
   private async editIntake(request:Request,intakeId:string):Promise<Response>{
     const actor=actorFrom(request),body=await bodyObject(request,16384),key=this.idempotencyKey(request,body);normalizeCriteria(body);
     if(!key)return error('idempotency_key_required',400);
-    const allowed=['key','expected_updated_at','title','text','acceptance_criteria','status','priority','note'];
-    if(!['title','text','acceptance_criteria','status','priority','note'].some(k=>body[k]!==undefined)||Object.keys(body).some(k=>!allowed.includes(k)))return error('unknown_intake_field',400);
+    const allowed=['key','expected_updated_at','title','text','acceptance_criteria','status','priority','note',...INTAKE_CONTEXT_FIELDS];
+    if(!['title','text','acceptance_criteria','status','priority','note',...INTAKE_CONTEXT_FIELDS].some(k=>body[k]!==undefined)||Object.keys(body).some(k=>!allowed.includes(k)))return error('unknown_intake_field',400);
     if(body.title!==undefined&&(typeof body.title!=='string'||!body.title.trim()||body.title.length>240)||body.text!==undefined&&(typeof body.text!=='string'||!body.text.trim()||new TextEncoder().encode(body.text).length>8192)||body.note!==undefined&&(typeof body.note!=='string'||!body.note.trim()||body.note.length>4000)||body.priority!==undefined&&(!Number.isInteger(body.priority)||Number(body.priority)<0||Number(body.priority)>3)||body.status!==undefined&&!['open','archived','needs_attention','accepted'].includes(String(body.status)))return error('invalid_intake_edit',400);
+    if(INTAKE_CONTEXT_FIELDS.some(field=>body[field]!==undefined&&body[field]!==null&&(typeof body[field]!=='string'||new TextEncoder().encode(body[field] as string).length>8192)))return error('invalid_intake_context',400);
     if(body.acceptance_criteria!==undefined&&(!Array.isArray(body.acceptance_criteria)||!body.acceptance_criteria.length||body.acceptance_criteria.length>32||!body.acceptance_criteria.every(v=>typeof v==='string'&&v.trim()&&v.length<=1000)))return error('acceptance_criteria_required',400);
     const digest=await sha256Hex(JSON.stringify(body)),scope='intake:edit:'+intakeId;
     const replay=this.idempotent(scope,key,digest);if(replay instanceof Response)return replay;
@@ -348,6 +353,11 @@ export class ProjectDO {
       if(body.status==='accepted'&&(row.status!=='completed-awaiting-review'||!hasScope(actor,'operator:admin')))return error('review_required',409);
       const at=Date.now(),next={title:typeof body.title==='string'?body.title.trim():row.title,text:body.text??row.text,acceptance_criteria_json:body.acceptance_criteria?JSON.stringify(body.acceptance_criteria):row.acceptance_criteria_json,status:body.status??row.status,priority:body.priority??row.priority??2};
       this.db.run('UPDATE intakes SET original_title=COALESCE(original_title,title),original_text=COALESCE(original_text,text),title=?,text=?,acceptance_criteria_json=?,status=?,priority=?,updated_at=? WHERE id=?',next.title,next.text,next.acceptance_criteria_json,next.status,next.priority,at,row.id);
+      if(INTAKE_CONTEXT_FIELDS.some(field=>body[field]!==undefined)){
+        const context={...this.intakeContext(row.id)};
+        for(const field of INTAKE_CONTEXT_FIELDS)if(body[field]!==undefined)context[field]=body[field];
+        this.appendEvent(row.id,'context:'+row.id+':'+key,actor!.id,'intake_context_updated',context,at);
+      }
       this.appendEvent(row.id,'edit:'+row.id+':'+key,actor!.id,'intake_updated',{...next,...(body.note?{note:body.note}:{})},at);
       this.db.run('INSERT INTO idempotency(scope,request_key,request_digest,response_json,created_at,expires_at) VALUES(?,?,?,?,?,?)',scope,key,digest,JSON.stringify({id:row.id}),at,at+180*86400000);
       return json({intake:this.viewIntake({...row,...next,updated_at:at} as IntakeRow)});
@@ -1209,10 +1219,17 @@ export class ProjectDO {
     try { return JSON.parse(row.response_json) as JsonRecord; } catch { return error('idempotency_result_unavailable', 503); }
   }
 
+  /** Context snapshots live in the existing event journal, preserving rollback schema compatibility. */
+  private intakeContext(id: string): JsonRecord {
+    const event = this.db.one<{body_json:string}>("SELECT body_json FROM intake_events WHERE task_id=? AND kind='intake_context_updated' ORDER BY seq DESC LIMIT 1", id);
+    return event ? this.parse(event.body_json) as JsonRecord : Object.fromEntries(INTAKE_CONTEXT_FIELDS.map(field=>[field,null]));
+  }
+
   private viewIntake(row: IntakeRow): JsonRecord {
     const saga = row.session_id ? this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id = ?', row.session_id) : undefined;
     return {
       id: row.id, project: row.project, title: row.title, text: row.text,
+      ...this.intakeContext(row.id),
       acceptance_criteria: this.parse(row.acceptance_criteria_json), status: row.status,
       assigned_machine_id: row.assigned_machine_id, session_id: row.session_id,
       linked_sessions: this.sessionLinks.links(row.id),

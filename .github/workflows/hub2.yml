@@ -4,6 +4,8 @@ on:
   push:
     paths:
       - "hub2/**"
+      - "test/hub2-core-ops.browser.mjs"
+      - "test/playwright.mjs"
       - "host/**"
       - "scripts/build-hub-cli.py"
       - "scripts/with-temp-home.sh"
@@ -15,6 +17,8 @@ on:
   pull_request:
     paths:
       - "hub2/**"
+      - "test/hub2-core-ops.browser.mjs"
+      - "test/playwright.mjs"
       - "host/**"
       - "scripts/build-hub-cli.py"
       - "scripts/with-temp-home.sh"
@@ -221,6 +225,17 @@ jobs:
         continue-on-error: true
         run: npm run test:oncall-alerts --prefix hub2
 
+      - name: Core operations and browser receipt regressions
+        id: core_ops
+        continue-on-error: true
+        env:
+          PLAYWRIGHT_PACKAGE: ${{ github.workspace }}/.local/ci-playwright/package.json
+        run: |
+          node --experimental-transform-types --import ./hub2/tests/node-fixture.mjs --test hub2/tests/intake-context-compat.test.ts hub2/tests/node-public-origin.test.mjs
+          npm install --prefix .local/ci-playwright --no-package-lock --no-save playwright@1.64.1
+          node .local/ci-playwright/node_modules/playwright/cli.js install --with-deps chromium
+          node test/hub2-core-ops.browser.mjs
+
       - name: Fail the job if any gate failed
         if: always()
         env:
@@ -246,6 +261,7 @@ jobs:
           CORE_NODE: ${{ steps.core_node.outcome }}
           PUBLIC_MAIL: ${{ steps.public_mail.outcome }}
           PRODUCTION_CLEAN_START: ${{ steps.production_clean_start.outcome }}
+          CORE_OPS: ${{ steps.core_ops.outcome }}
           ONCALL_ALERTS: ${{ steps.oncall_alerts.outcome }}
         run: |
           failed=0
@@ -262,7 +278,7 @@ jobs:
             "auth_gc:$AUTH_GC" "machine_socket_cap:$MACHINE_SOCKET_CAP" \
             "core_node:$CORE_NODE" "public_mail:$PUBLIC_MAIL" \
             "production_clean_start:$PRODUCTION_CLEAN_START" \
-            "oncall_alerts:$ONCALL_ALERTS"; do
+            "core_ops:$CORE_OPS" "oncall_alerts:$ONCALL_ALERTS"; do
             name=${result%%:*}
             outcome=${result#*:}
             echo "$name: $outcome"

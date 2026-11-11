@@ -122,7 +122,8 @@ const runtime = new Hub2Runtime({
   dataDir,
 });
 
-const listening = await startServer(runtime, { host, port });
+const publicOrigin = envVars.AUTH_CALLBACK_URL ? new URL(envVars.AUTH_CALLBACK_URL).origin : undefined;
+const listening = await startServer(runtime, { host, port, publicOrigin });
 console.log(
   `[hub2-node] listening http://${host}:${listening.port} release=${envVars.HUB2_RELEASE_MODE ?? 'unconfigured'} data=${dataDir}`,
 );
