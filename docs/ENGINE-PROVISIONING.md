@@ -375,3 +375,41 @@ node test/provisioning-ui.browser.mjs
 The test uses a real local Worker and SQLite with a synthetic native consent link.
 It covers machine login requests, the Google link, private code submission and the
 resulting state, and writes a screenshot under gitignored `.local/ui-evidence/`.
+
+## Native Claude import and saved-generation resume
+
+`hub engines import-native --provider claude --label hub-claude` collects the
+existing native login once, publishes the next central generation by CAS, then
+syncs only that account through the enrolled host credential. It does not cancel
+pending logins, refresh a provider token, remove another account directory or
+regenerate unrelated aplexer profiles. Global `hub engines sync` retains its
+existing fleet reconciliation behavior and is not the resume command.
+
+If upload succeeded but installation or acknowledgement did not finish, inspect
+`hub engines list` first. Resume the recorded generation rather than importing
+again:
+
+```sh
+hub engines import-native --provider claude --label hub-claude --resume-generation 5
+```
+
+The number must equal the account's current generation. Resume reads no native
+credential file, makes no import request and never creates a new generation. It
+uses the same enrolled host binding, requires exactly the selected account and
+generation, suppresses pending login work, and refuses an unexpected refresh
+lease before changing local files. A success result requires the host's normal
+sync acknowledgement to equal that generation. A pending result is not success
+and does not authorize another upload, token refresh or manual acknowledgement.
+
+The scoped path preserves unrelated directory contents and raw profile tables.
+Only the selected state entry may change; an unchanged state file is not
+rewritten. Failed installation does not clean up other accounts. Restoring
+profiles lost by an earlier global reconciliation is a separate reviewed action.
+
+Scoped lock acquisition waits at most30 seconds. A fresh maintained package
+installation can take300 seconds, followed by a30-second version verification
+and bounded Hub HTTP operations. An outer125-second timeout is insufficient.
+Operators should allow at least600 seconds and redirect output to private files
+rather than captured pipes. These are stage bounds, not a guaranteed total wall
+clock deadline. If an outer interruption occurs, check process/lock state and
+current central/host generations before resuming; never overlap sync writers.

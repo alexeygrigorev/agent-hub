@@ -57,13 +57,19 @@ def command(args):
     generation = rows[0]['generation']
     if machine not in rows[0].get('hosts', []):
         raise ValueError('This host is not approved for the managed Claude account')
-    files = collect()
-    saved = bus._do_request('POST', '/api/engines/import-native', {
-        'provider': 'claude', 'label': args.label, 'expected_generation': generation, 'files': files,
-    })
-    published = saved.get('credential_generation')
-    if type(published) is not int or published != generation + 1:
-        raise ValueError('Import receipt did not confirm the next generation; no sync attempted')
+    resume=getattr(args,'resume_generation',None)
+    if resume is not None:
+        if type(resume) is not int or resume<1 or generation!=resume:
+            raise ValueError('Saved native import generation does not match current account')
+        published=resume
+    else:
+        files = collect()
+        saved = bus._do_request('POST', '/api/engines/import-native', {
+            'provider': 'claude', 'label': args.label, 'expected_generation': generation, 'files': files,
+        })
+        published = saved.get('credential_generation')
+        if type(published) is not int or published != generation + 1:
+            raise ValueError('Import receipt did not confirm the next generation; no sync attempted')
 
     def current_only(method, path, payload=None):
         response = host_request(method, path, payload)
@@ -72,24 +78,25 @@ def command(args):
             if (not isinstance(bundles, list) or len(bundles) != 1
                     or bundles[0].get('label') != args.label
                     or type(bundles[0].get('credential_generation')) is not int
-                    or bundles[0]['credential_generation'] < published):
-                raise ValueError('Managed sync generation is older than the native import')
+                    or bundles[0]['credential_generation'] != published
+                    or bundles[0].get('refresh_lease') is not None and bundles[0].get('refresh_lease') is not False):
+                raise ValueError('Managed sync generation or refresh lease differs from saved import')
             # This command must never complete an unrelated pending login.
             response = dict(response, logins=[])
         return response
 
     try:
-        provisioning.sync(request=current_only)
+        provisioning.sync(request=current_only,target_label=args.label,expected_generation=published,lock_timeout=30)
         verified = bus._do_request('GET', '/api/engines')
         states = [account for row in verified.get('sync_status', [])
                   if row.get('machine_id') == machine
                   for account in row.get('accounts', []) if account.get('label') == args.label]
         if (len(states) != 1 or type(states[0].get('acked_generation')) is not int
-                or states[0]['acked_generation'] < published
+                or states[0]['acked_generation'] != published
                 or states[0]['acked_generation'] != states[0].get('credential_generation')):
             raise ValueError()
-    except Exception:
-        raise ValueError('Native import saved at generation %d; managed sync or acknowledgement is pending. Check hub engines list and verify managed Opus health before retrying import' % published) from None
-    return {'status': 'imported', 'provider': 'claude', 'label': args.label,
+    except Exception as exc:
+        raise ValueError('Native import saved at generation %d; managed sync or acknowledgement is pending (%s). Resume with --resume-generation %d; do not import again.' % (published,type(exc).__name__,published)) from None
+    return {'status': 'resumed' if resume is not None else 'imported', 'provider': 'claude', 'label': args.label,
             'credential_generation': published, 'machine_id': machine,
             'acked_generation': states[0]['acked_generation']}

@@ -1237,7 +1237,7 @@ def _windows_wait_lock(fd, timeout=None, sleep=None):
 
 
 @contextlib.contextmanager
-def lock(timeout=None):
+def lock(timeout=None, *, bounded=False):
     """One reconciler/exec reader; owner-only lock stays on disk across processes."""
     path = root() / 'reconcile.lock'
     with private_fs.parent(path, create=True) as anchor:
@@ -1247,7 +1247,21 @@ def lock(timeout=None):
                 _windows_wait_lock(fd, timeout)
             else:
                 import fcntl
-                fcntl.flock(fd, fcntl.LOCK_EX)
+                if not bounded:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                else:
+                    if not isinstance(timeout,(int,float)) or not math.isfinite(timeout) or not 0<=timeout<=600:
+                        raise ValueError('Invalid managed sync lock timeout')
+                    deadline=time.monotonic()+timeout
+                    while True:
+                        try:
+                            fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                            break
+                        except BlockingIOError:
+                            remaining=deadline-time.monotonic()
+                            if remaining<=0:
+                                raise TimeoutError('Managed sync lock timeout') from None
+                            time.sleep(min(0.1,remaining))
             yield
         finally:
             os.close(fd)
@@ -1916,7 +1930,7 @@ def _go_engine_current(bundle, dest):
         return True
 
 
-def install(bundle, request=None):
+def install(bundle, request=None, *, credential_generation=None):
     from . import credentials
     validate(bundle)
     if bundle['provider'] == 'codex':
@@ -1935,10 +1949,13 @@ def install(bundle, request=None):
     if (receipt is not None and credentials.install_snapshot(receipt, paths) == credentials.install_snapshot(bundle, paths)
             and (bundle['provider'] != 'go' or _go_engine_current(bundle, dest))):
         provision_managed_home(bundle, home, dest)
-        credentials.reconcile(bundle['label'], bundle, home, dest, request or host_request)
+        outcome=credentials.reconcile(bundle['label'], bundle, home, dest, request or host_request)
+        if credential_generation is not None and (outcome.get('generation')!=credential_generation or outcome.get('status')=='writeback_pending'):
+            raise ValueError('Scoped credential materialization incomplete')
         if bundle.get('provider') == 'go':
             _ensure_opencode_quse_auth(bundle, home)
-        credentials.leased_refresh(bundle['label'], bundle, home, request or host_request)
+        if credential_generation is None:
+            credentials.leased_refresh(bundle['label'], bundle, home, request or host_request)
         # A legacy receipt with identical content still migrates to the
         # secret-free form; unchanged split receipts are left untouched.
         if receipt != bundle or raw != _receipt_form(bundle):
@@ -2038,10 +2055,13 @@ def install(bundle, request=None):
         except (subprocess.SubprocessError, OSError):
             raise ValueError('Native engine verification failed') from None
     provision_managed_home(bundle, home, dest)
-    credentials.reconcile(bundle['label'], bundle, home, dest, request or host_request)
+    outcome=credentials.reconcile(bundle['label'], bundle, home, dest, request or host_request)
+    if credential_generation is not None and (outcome.get('generation')!=credential_generation or outcome.get('status')=='writeback_pending'):
+        raise ValueError('Scoped credential materialization incomplete')
     if bundle.get('provider') == 'go':
         _ensure_opencode_quse_auth(bundle, home)
-    credentials.leased_refresh(bundle['label'], bundle, home, request or host_request)
+    if credential_generation is None:
+        credentials.leased_refresh(bundle['label'], bundle, home, request or host_request)
     save_bundle(dest, bundle)
 
 
@@ -2110,9 +2130,125 @@ def _rmtree_managed(entry: Path) -> None:
     shutil.rmtree(entry, onerror=_on_rm_error)
 
 
-def sync(request=None):
+def scoped_profile(bundle):
+    """Change one generated Claude table, preserving all unrelated raw text."""
+    path=profile_path()
+    try:
+        text=private_fs.read_bytes(path,262144).decode()
+    except FileNotFoundError:
+        text='version = 1\n'
+    if text.count(BEGIN)!=text.count(END) or text.count(BEGIN)>1:
+        raise ValueError('Invalid managed profile block')
+    name='hub-'+bundle['label']
+    table=re.compile(r'(?m)^\s*\[profiles\.'+re.escape(name)+r'(?:\]|\.)')
+    before,marked,after=text,'',''
+    if BEGIN in text:
+        before,rest=text.split(BEGIN);marked,after=rest.split(END)
+    if table.search(before+after):
+        raise ValueError('Operator profile collision')
+    # Generated tables are flat. Refuse unexpected nested target syntax rather
+    # than consume another table or rewrite operator content.
+    heading='[profiles.'+name+']'
+    sections=re.split(r'(?m)(?=^\[)',marked)
+    command=module_command('execute',bundle['label'])
+    rendered=heading+'\nengine = '+json.dumps(PACKAGES[bundle['provider']][2])+'\ncommand = '+json.dumps(command)
+    kept=[];found=False
+    for section in sections:
+        if section.startswith(heading+'\n'):
+            if found:
+                raise ValueError('Duplicate scoped managed profile')
+            found=True
+            tail=re.search(r'\n[ \t\r\n]*\Z',section)
+            kept.append(rendered+(tail.group() if tail else '\n'))
+            continue
+        if table.search(section):
+            raise ValueError('Invalid scoped managed profile')
+        kept.append(section)
+    addition='' if found else '\n'+rendered+'\n'
+    updated=(before+BEGIN+''.join(kept)+addition+END+after if BEGIN in text
+             else text+'\n'+BEGIN+addition+END)
+    with private_fs.parent(path,create=True):
+        pass
+    private_fs.atomic_write(path,updated.encode(),262144)
+
+
+def scoped_state_snapshot(path):
+    try:
+        raw = private_fs.read_bytes(path, 1048576).decode()
+    except FileNotFoundError:
+        raw = '[]'
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError('Duplicate managed state field')
+            value[key] = item
+        return value
+    previous = json.loads(raw, object_pairs_hook=unique)
+    if (not isinstance(previous, list) or any(not isinstance(row, dict)
+            or not isinstance(row.get('label'), str) or not LABEL.fullmatch(row['label'])
+            for row in previous) or len({row['label'] for row in previous}) != len(previous)):
+        raise ValueError('Invalid managed state')
+    return raw, previous
+
+
+def write_scoped_state(path, snapshot, previous, item):
+    """Replace only the target JSON element; retain unrelated raw bytes."""
+    if scoped_state_snapshot(path)[0] != snapshot:
+        raise ValueError('Managed state changed during scoped sync')
+    decoder = json.JSONDecoder()
+    position = snapshot.index('[') + 1
+    target = None
+    for row in previous:
+        while snapshot[position].isspace() or snapshot[position] == ',':
+            position += 1
+        value, end = decoder.raw_decode(snapshot, position)
+        if row['label'] == item['label']:
+            if value == item:
+                return
+            target = (position, end)
+        position = end
+    encoded = json.dumps(item)
+    if target is None:
+        close = snapshot.rindex(']')
+        updated = snapshot[:close] + (',' if previous else '') + encoded + snapshot[close:]
+    else:
+        start, end = target
+        updated = snapshot[:start] + encoded + snapshot[end:]
+    private_fs.atomic_write(path, updated.encode(), 1048576)
+
+
+def sync_target(request, target_label, expected_generation, lock_timeout):
+    if not isinstance(target_label,str) or not LABEL.fullmatch(target_label) or type(expected_generation) is not int or expected_generation<0:
+        raise ValueError('Invalid scoped sync identity')
+    response=request('GET','/api/engines/sync')
+    bundles=response.get('engines')
+    if not isinstance(bundles,list) or len(bundles)!=1:
+        raise ValueError('Scoped sync requires exactly one account')
+    bundle=bundles[0];validate(bundle)
+    if (bundle['label']!=target_label or bundle['provider']!='claude'
+            or type(bundle.get('credential_generation')) is not int or bundle['credential_generation']!=expected_generation
+            or bundle.get('refresh_lease') is not None and bundle.get('refresh_lease') is not False):
+        raise ValueError('Scoped sync generation or refresh lease conflict')
+    with lock(timeout=lock_timeout,bounded=True):
+        state_path=root()/'state.json'
+        snapshot,previous=scoped_state_snapshot(state_path)
+        # Never enumerate/remove another account, cancel a login or refresh a
+        # provider token. Installation is the maintained bounded package path.
+        install(bundle,request,credential_generation=expected_generation)
+        scoped_profile(bundle)
+        item={key:bundle[key] for key in ('label','revision','provider')}
+        write_scoped_state(state_path,snapshot,previous,item)
+        request('POST','/api/engines/'+target_label,{'revision':bundle['revision'],'authenticated':True})
+    report_sync(request,'synced',[bundle])
+    return {'status':'synced','profiles':['hub-'+target_label]}
+
+
+def sync(request=None, *, target_label=None, expected_generation=None, lock_timeout=30):
     """Called on startup and each machine heartbeat. Failure preserves no new route."""
     request = request or host_request
+    if target_label is not None:
+        return sync_target(request,target_label,expected_generation,lock_timeout)
     response = request('GET', '/api/engines/sync')
     bundles = response.get('engines')
     if not isinstance(bundles, list) or len(bundles) > 32:
@@ -3074,6 +3210,7 @@ def add_commands(sub):
     native = commands.add_parser('import-native', help='Securely collect this host native Claude login into Hub, then acknowledge the managed generation')
     native.add_argument('--provider', choices=['claude'], required=True)
     native.add_argument('--label', choices=['hub-claude'], required=True)
+    native.add_argument('--resume-generation',type=int,help='Sync this already saved generation; no native credential read or upload')
     list_cmd.add_argument('--view', choices=['worker'], default=None, help='Sanitized read-only verification view (worker sessions): engine, account, host, health, quota state')
     commands.add_parser('quota', help='Sanitized managed account observations for the server collector')
     remove = commands.add_parser('remove')
