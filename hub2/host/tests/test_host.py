@@ -92,6 +92,10 @@ class HostTests(unittest.TestCase):
         provisioning=patch('agent_hub_host.providers.provision',side_effect=provision_fixture)
         provisioning.start()
         self.addCleanup(provisioning.stop)
+        # Existing lifecycle fixtures never inspect the operator's real login.
+        auth = patch('agent_hub_host.agent.local_claude_missing_contexts', return_value=[])
+        self.auth_observer = auth.start()
+        self.addCleanup(auth.stop)
 
     def tearDown(self):
         self.journal.db.close()
@@ -124,6 +128,53 @@ class HostTests(unittest.TestCase):
         self.assertFalse(any(':codex:' in v or ':antigravity:' in v for v in flags))
         self.assertNotIn('custom-secret-profile', json.dumps(captured[-1]))
         self.assertNotIn('custom-account', json.dumps(captured[-1]))
+
+    def test_scoped_missing_local_claude_keeps_engine_modes_and_unverified_source_hint(self):
+        from agent_hub_host.native_launch import LOCAL_ROUTES
+        captured = []
+        self.client.heartbeat = lambda *args, **kwargs: captured.append(args)
+        self.bridge.launcher.config = {'routes': {key: dict(value) for key, value in LOCAL_ROUTES.items()}}
+        self.bridge.engines = {'claude'}
+        self.bridge.launcher.capabilities = lambda: {'claude': {'headless', 'interactive', 'effort'}}
+        self.auth_observer.return_value = ['auth:missing:l:h:claude:' + 'x'*43 + ':1800000000']
+        self.bridge.heartbeat([], include_native_sessions=False)
+        self.assertEqual(captured[-1][1], ['claude'])
+        flags = captured[-1][2]
+        self.assertIn('interactive:claude', flags)
+        self.assertIn(self.auth_observer.return_value[0], flags)
+        self.assertIn('credentials:local:headless:claude:claude', flags)
+        self.assertIn('credentials:local:interactive:claude:claude', flags)
+        self.assertLessEqual(len(flags), 32)
+        self.auth_observer.return_value *= 2
+        self.bridge.launcher.capabilities = lambda: {'claude': {'headless','interactive', *('cap'+str(i) for i in range(27))}}
+        self.bridge.heartbeat([], include_native_sessions=False)
+        self.assertEqual(len(captured[-1][2]),32)
+        self.assertEqual(sum(flag.startswith('auth:missing:') for flag in captured[-1][2]),1)
+        self.assertIn('credentials:local:headless:claude:claude',captured[-1][2])
+        self.assertIn('credentials:local:interactive:claude:claude',captured[-1][2])
+        self.bridge.launcher.capabilities = lambda: {'claude': {'headless','interactive', *('cap'+str(i) for i in range(40))}}
+        self.bridge.heartbeat([], include_native_sessions=False)
+        self.assertEqual(len(captured[-1][2]),32)
+        self.assertFalse(any(flag.startswith('auth:missing:') for flag in captured[-1][2]))
+        self.bridge.launcher.capabilities = lambda: {'claude': {'headless','interactive','effort'}}
+        self.auth_observer.side_effect = RuntimeError('synthetic-secret')
+        self.bridge.heartbeat([], include_native_sessions=False)
+        self.assertIn('credentials:local:headless:claude:claude', captured[-1][2])
+        self.assertFalse(any(flag.startswith('auth:missing:') for flag in captured[-1][2]))
+        self.auth_observer.reset_mock()
+        self.bridge.launcher.config['routes']['claude'] = {'provider': 'claude', 'profile': 'custom'}
+        self.bridge.heartbeat([], include_native_sessions=False)
+        self.auth_observer.assert_not_called()
+        self.assertFalse(any(flag.startswith('credentials:') for flag in captured[-1][2]))
+
+    def test_known_missing_observation_does_not_gate_explicit_launch_validation(self):
+        self.bridge.engines.add('claude')
+        self.bridge.launcher.capabilities = lambda: {'claude': {'headless'}}
+        self.auth_observer.return_value = ['auth:missing:l:h:claude:' + 'x'*43 + ':1800000000']
+        offer = self.offer()
+        offer['launch'].update(engine='claude', model='sonnet')
+        self.assertEqual(self.bridge.validate_launch(offer)['engine'], 'claude')
+        self.auth_observer.assert_not_called()
 
     def test_local_source_modes_launch_without_central_home_injection(self):
         from agent_hub_host.native_launch import LOCAL_ROUTES
