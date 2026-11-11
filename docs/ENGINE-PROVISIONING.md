@@ -424,7 +424,12 @@ This selector is part of the immutable start request. It selects the fixed
 path or arbitrary provider arguments. It does not change native Claude defaults
 or globally enable private provider homes. Unsupported hosts and failed central
 materialization return a typed failure without falling back to native login.
-Other models, interactive mode and goals do not support this selector.
+Other models, interactive mode and goals do not support this selector. An
+unfinished task's automatic continuation retains the selector. The completion
+controller has no operator authority for this opt-in and therefore reports a
+refused continuation (403), rather than restarting against native credentials.
+An operator can explicitly retry. Delegated continuation authority is not part
+of this feature.
 
 The host advertises support only when the actual Claude profile pins the
 current installed host release's bundled, hash-verified CLI and that CLI proves

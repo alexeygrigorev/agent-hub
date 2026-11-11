@@ -901,6 +901,15 @@ class ManagedClaudeReadinessTests(unittest.TestCase):
                       'sys.argv[0]=sys.argv[1];print(json.dumps(module_command("execute","hub-claude")))')
                 command=json.loads(subprocess.check_output([str(current/'bin/python'),'-I','-S','-c',code,str(archive)],text=True))
                 self.assertEqual(command[0],str(release/'bin/python'))
+                self.assertEqual(command[1:3],['-I','-S'])
+                user_site=root/'untrusted-site';user_site.mkdir()
+                sentinel=root/'site-executed'
+                (user_site/'sitecustomize.py').write_text('from pathlib import Path;Path('+repr(str(sentinel))+').write_text("unexpected")')
+                harmless=[command[0],*command[1:command.index('-c')],'-c','print("isolated-owned-test")']
+                probe=subprocess.run(harmless,capture_output=True,text=True,timeout=3,
+                                     env={**os.environ,'PYTHONPATH':str(user_site),'HOME':str(root)})
+                self.assertEqual(probe.stdout.strip(),'isolated-owned-test');self.assertEqual(probe.returncode,0)
+                self.assertFalse(sentinel.exists())
                 def publish(argv):
                     profile.write_text('[profiles."hub-hub-claude"]\nengine="claude"\ncommand='+json.dumps(argv)+'\n')
                     profile.chmod(0o600)

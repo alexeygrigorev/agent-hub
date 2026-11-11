@@ -917,3 +917,27 @@ test('real Project and Machine carry the immutable managed selection only on a q
  assert.equal((database.prepare('SELECT state FROM sessions WHERE id=?').get(saga.session_id) as any).state,'claimed');
  f.sql.close();f.collectorSql.close();database.close();
 });
+
+test('unfinished managed Claude continuation keeps selector and refuses instead of using native credentials',async()=>{
+ const candidate={id:'claude-opus',engine:'claude',model:'opus',effort:'medium',account_id:'claude',weight:1,capabilities:[],enabled:true};
+ const f=fixture({modelCandidates:[candidate],machineCapabilities:['headless','effort:claude','managed:hub-claude:opus:medium:v1']});
+ const own=await intake(f,'managed-continuation');
+ const response=await f.call('/api/intakes/'+own.id+'/start','POST',{key:'managed-continuation',workspace:'/tmp/proof',
+  engine:'claude',model:'opus',effort:'medium',managed_credential_label:'hub-claude'});
+ assert.equal(response.status,201);
+ const saga=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any;
+ f.sql.prepare("UPDATE dispatch_sagas SET state='admitted' WHERE operation_id=?").run(saga.operation_id);
+ const binding={operation_id:saga.operation_id,attempt_operation_id:saga.attempt_operation_id,session_id:saga.session_id,
+  machine_id:saga.machine_id,epoch:saga.epoch,native_id:'11111111-2222-4333-8444-555555555555'};
+ assert.equal((await f.call('/_internal/started','POST',binding)).status,201);
+ assert.equal((await f.call('/_internal/finish','POST',{...binding,exit_code:0,native_exit_confirmed:true,
+  evidence:{result:'exit',native_deadline:{exceeded:false}}})).status,200);
+ await f.project.alarm();
+ const saved=f.sql.prepare('SELECT final_evidence_json FROM intakes WHERE id=?').get(own.id) as any;
+ const completion=JSON.parse(saved.final_evidence_json).completion;
+ assert.equal(completion.continuation.state,'refused');assert.equal(completion.continuation.last_reason,'forbidden');
+ assert.equal((f.sql.prepare('SELECT COUNT(*) AS n FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any).n,1,
+  'no new native-default continuation may be reserved');
+ assert.equal(JSON.parse((f.sql.prepare('SELECT launch_spec_json FROM dispatch_sagas WHERE operation_id=?').get(saga.operation_id) as any).launch_spec_json).managed_credential_label,'hub-claude');
+ f.sql.close();f.collectorSql.close();
+});

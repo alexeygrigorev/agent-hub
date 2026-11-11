@@ -1437,6 +1437,7 @@ def module_command(handler, label, managed_dir=None):
     # embedded path the -c import dies with ModuleNotFoundError on Windows.
     prefix = 'import sys; sys.path.insert(0, ' + repr(str(Path(__file__).resolve().parents[1])) + '); '
     python = sys.executable
+    isolated = []
     if Path(sys.argv[0]).is_file() and zipfile.is_zipfile(sys.argv[0]):
         # The frozen zipapp stays ahead of the checkout copy on sys.path.
         archive = Path(sys.argv[0]).resolve()
@@ -1448,9 +1449,10 @@ def module_command(handler, label, managed_dir=None):
             # Preserve the release venv, not the resolved base interpreter, and
             # never leave a scoped repin attached to the mutable current link.
             python = str(release / 'bin/python')
+            isolated = ['-I', '-S']
     m_dir = str(managed_dir or root())
     prefix += 'import os; os.environ["AGENT_HUB_MANAGED_DIR"] = ' + repr(m_dir) + '; '
-    return [python, '-c', prefix + 'from agent_hub_host.provisioning import ' + handler + '; ' + handler + '()', label]
+    return [python, *isolated, '-c', prefix + 'from agent_hub_host.provisioning import ' + handler + '; ' + handler + '()', label]
 
 
 def _opencode_engine_pin(bundles, is_windows=None):
@@ -2937,7 +2939,7 @@ def managed_exec_readiness(archive):
         sys.argv[0] = previous
     if (not isinstance(profile, dict) or set(profile) != {'engine', 'command'}
             or profile['engine'] != 'claude' or profile['command'] != expected
-            or str(archive) not in expected[2]):
+            or str(archive) not in expected[expected.index('-c')+1]):
         raise ValueError('managed_exec_unavailable')
     return {'protocol': MANAGED_CLAUDE_PROTOCOL, 'label': 'hub-claude', 'profile': 'hub-hub-claude'}
 
@@ -3010,7 +3012,15 @@ def managed_claude_settings(home, *, system_settings=None):
 
 def managed_claude_materialize(context, bundle, home, dest, request):
     """Fresh materialization and normal generation ACK, with no refresh owner."""
-    outcome = refresh_launch_credential('hub-claude', bundle, home, dest, request)
+    from . import credentials
+    try:
+        current = credentials.fetch_current('hub-claude', request)
+        outcome = credentials.reconcile('hub-claude', bundle, home, dest, request,
+            hub_files=current['files'], hub_generation=current['generation'])
+    except Exception:
+        # Unlike default managed execution, this explicit contract never
+        # restores a cached older generation after a failed fresh read.
+        raise ValueError('managed_credential_unverified') from None
     if (not isinstance(outcome, dict) or outcome.get('status') not in ('in_step', 'materialized', 'written_back', 'adopted_hub')
             or type(outcome.get('generation')) is not int or outcome['generation'] < 0):
         raise ValueError('managed_credential_unverified')

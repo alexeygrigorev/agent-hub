@@ -347,19 +347,22 @@ export class MachineDO {
     const now = Date.now();
     // The selector is delivered only on the readiness-qualified socket. An
     // older REST poller sharing this machine identity cannot silently ignore it.
-    const rows = this.offerRows(machineId,now).filter(row=>!this.managedClaudeLaunch(this.parse(row.launch_json)));
+    const rows = this.offerRows(machineId,now,false).filter(row=>!this.managedClaudeLaunch(this.parse(row.launch_json)));
     return json({ offers: rows.map(row => this.offerView(row)) });
   }
 
-  private offerRows(machineId:string,now:number):SessionRow[]{
+  private offerRows(machineId:string,now:number,allowManaged=true):SessionRow[]{
+    // Filter before the shared ten-row budget. Held opt-in attempts must not
+    // hide ordinary starts during a profile withdrawal or daemon rollback.
+    const delivery=allowManaged?'':` AND CASE WHEN json_valid(launch_json) THEN json_type(launch_json,'$.managed_credential_label') IS NULL ELSE 1 END`;
     const rows=this.db.all<SessionRow>(
-      `SELECT * FROM sessions WHERE machine_id=? AND ((state='offered' AND offer_expires_at>?) OR state='claimed') ORDER BY created_at,id LIMIT 10`,machineId,now);
+      `SELECT * FROM sessions WHERE machine_id=? AND ((state='offered' AND offer_expires_at>?) OR state='claimed')${delivery} ORDER BY created_at,id LIMIT 10`,machineId,now);
     // Historical repair fills spare offer capacity; it cannot displace starts.
     if(rows.length===10)return rows;
     let recovery:SessionRow[]=[];
     try{
       recovery=this.db.all<SessionRow>(
-        `SELECT * FROM sessions WHERE machine_id=? AND (${LABEL_RECOVERY}) ORDER BY ${RECOVERY_TURN},created_at,id LIMIT ?`,machineId,10-rows.length);
+        `SELECT * FROM sessions WHERE machine_id=? AND (${LABEL_RECOVERY})${delivery} ORDER BY ${RECOVERY_TURN},created_at,id LIMIT ?`,machineId,10-rows.length);
       if(recovery.length)this.db.transaction(this.ctx,()=>{
         let turn=this.db.one<{turn:number|null}>(
           `SELECT MAX(${RECOVERY_TURN}) AS turn FROM sessions WHERE machine_id=? AND (${LABEL_RECOVERY})`,machineId)?.turn??0;
@@ -647,7 +650,7 @@ export class MachineDO {
     if(this.stopOnly(socket))return;
     if(!this.currentSocket(socket))return;
     const now = Date.now();
-    const rows = this.offerRows(machineId,now);
+    const rows = this.offerRows(machineId,now,this.managedClaudeSocket(socket)&&this.managedClaudeAvailable(machineId));
     for (const row of rows) {
       if(this.managedClaudeLaunch(this.parse(row.launch_json))&&(!this.managedClaudeSocket(socket)||!this.managedClaudeAvailable(machineId)))continue;
       try { socket.send(JSON.stringify({ type: 'session.offer', offer: this.offerView(row) })); } catch { return; }

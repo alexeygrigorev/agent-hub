@@ -1944,7 +1944,9 @@ def test_managed_opus_exception_is_context_only_and_medium(monkeypatch):
 
 
 def test_managed_generation_uses_materialized_cas_winner_and_strict_ack(tmp_path,monkeypatch):
-    monkeypatch.setattr(p,'refresh_launch_credential',lambda *a:{'status':'adopted_hub','generation':6})
+    from agent_hub_host import credentials
+    monkeypatch.setattr(credentials,'fetch_current',lambda *a:{'generation':6,'files':{}})
+    monkeypatch.setattr(credentials,'reconcile',lambda *a,**kw:{'status':'adopted_hub','generation':6})
     calls=[]
     def request(method,path,body):
         calls.append((method,path,body));return {'status':'recorded'}
@@ -1952,10 +1954,10 @@ def test_managed_generation_uses_materialized_cas_winner_and_strict_ack(tmp_path
     assert p.managed_claude_materialize({},b,tmp_path,tmp_path,request)==6
     assert calls[0][2]['items'][0]['credential_generation']==6
     for status in ('hub_unreachable','writeback_pending','unmanaged'):
-        monkeypatch.setattr(p,'refresh_launch_credential',lambda *a:{'status':status,'generation':5})
+        monkeypatch.setattr(credentials,'reconcile',lambda *a,**kw:{'status':status,'generation':5})
         with pytest.raises(ValueError,match='unverified'):p.managed_claude_materialize({},b,tmp_path,tmp_path,request)
     assert len(calls)==1
-    monkeypatch.setattr(p,'refresh_launch_credential',lambda *a:{'status':'materialized','generation':6})
+    monkeypatch.setattr(credentials,'reconcile',lambda *a,**kw:{'status':'materialized','generation':6})
     def rotated(*a):raise ValueError('generation_conflict')
     with pytest.raises(ValueError,match='generation_conflict'):p.managed_claude_materialize({},b,tmp_path,tmp_path,rotated)
 
@@ -1986,7 +1988,9 @@ def test_explicit_managed_claude_execute_binds_actual_attempt_generation_and_chi
     monkeypatch.setattr(p,'engine_environment',lambda *a:{'PATH':'synthetic','CLAUDE_CODE_USE_BEDROCK':'1',
                           'ANTHROPIC_AUTH_TOKEN':'must-not-inherit','AWS_SESSION_TOKEN':'must-not-inherit','HUB2_TOKEN':'must-not-inherit'})
     monkeypatch.setattr(p,'profile_logged_in',lambda *a:True)
-    monkeypatch.setattr(p,'refresh_launch_credential',lambda *a:{'status':'adopted_hub','generation':6})
+    from agent_hub_host import credentials
+    monkeypatch.setattr(credentials,'fetch_current',lambda *a:{'generation':6,'files':{}})
+    monkeypatch.setattr(credentials,'reconcile',lambda *a,**kw:{'status':'adopted_hub','generation':6})
     requests=[]
     def request(method,path,body):
         requests.append((method,path,body))
@@ -2081,3 +2085,19 @@ def test_managed_settings_keep_private_generated_hooks_and_refuse_system_policy(
 def test_managed_settings_source_cannot_be_overridden(override):
     with pytest.raises(ValueError,match='managed_settings_unverified'):
         p.managed_claude_route_args({'provider':'claude','args':[]},[],['--model','opus',*override],managed={'model':'opus'})
+
+
+def test_managed_fresh_read_failure_never_restores_cached_older_generation(tmp_path):
+    from agent_hub_host import credentials
+    home=tmp_path/'home';dest=tmp_path/'bundle'
+    path=home/'.claude/.credentials.json';fresh='synthetic-generation-six';cached='synthetic-generation-five'
+    p.private_fs.atomic_write(path,fresh.encode(),65536)
+    state={'generation':6,'digests':{'.claude/.credentials.json':credentials._digest(fresh.encode())}}
+    state_file=dest/credentials.STATE_FILE;p.write_json(state_file,state)
+    bundle={'label':'hub-claude','provider':'claude','files':{'.claude/.credentials.json':cached},
+            'credential_generation':5,'credential_paths':['.claude/.credentials.json'],'revision':'a'*36}
+    def unreachable(*args):raise OSError('synthetic hub unavailable')
+    with pytest.raises(ValueError,match='managed_credential_unverified'):
+        p.managed_claude_materialize({},bundle,home,dest,unreachable)
+    assert path.read_text()==fresh
+    assert json.loads(state_file.read_text())==state

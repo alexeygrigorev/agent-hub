@@ -1210,5 +1210,24 @@ test('managed Claude opt-in needs current socket heartbeat, not stale persisted 
  // Withdrawal is also a normal heartbeat and immediately stops opt-in dispatch.
  await f.call('/api/heartbeat','POST',{labels:[],engines:['claude'],capabilities:['headless']});
  assert.equal((await reservation('managed-three')).status,409);
+ // More than one whole offer page may remain pending across a rollback.
+ await beat();await f.machine.webSocketMessage(old as any,JSON.stringify(frame));
+ for(let i=0;i<10;i++){
+  const id='held-'+i,r=await reservation(id);assert.equal(r.status,201);
+  const value=await r.json() as any;
+  assert.equal((await f.call('/_internal/activate','POST',{operation_id:'op-'+id,session_id:id,epoch:value.epoch})).status,201);
+ }
+ f.sockets.splice(0);const legacy=makeSocket('legacy-after-rollback');f.sockets.push(legacy);frames.length=0;
+ const normal=await f.call('/_internal/reserve','POST',{operation_id:'op-normal',dispatch_id:'dispatch-normal',attempt:0,
+  session_id:'ordinary-after-managed',project_id:'project-test',intake_id:'ordinary-intake',machine_id:'h1',request_digest:'c'.repeat(64),
+  title:'ordinary start',acceptance_criteria:['proof'],account_id:'codex',launch:{workspace:'/tmp',engine:'codex',model:'gpt-6.1-sol',
+   prompt:'normal work',interactive:false}});
+ assert.equal(normal.status,201);const normalEpoch=(await normal.json() as any).epoch;
+ assert.equal((await f.call('/_internal/activate','POST',{operation_id:'op-normal',session_id:'ordinary-after-managed',epoch:normalEpoch})).status,201);
+ await (f.machine as any).sendOffers(legacy,'h1');
+ assert(frames.some(value=>value.type==='session.offer'&&value.offer.session_id==='ordinary-after-managed'));
+ assert(!frames.some(value=>value.type==='session.offer'&&value.offer.launch.managed_credential_label));
+ const ordinaryPoll=await f.call('/api/offers','GET',undefined,{'x-hub2-actor':JSON.stringify({...machineActor,scopes:['machine:offer']})});
+ assert.deepEqual((await ordinaryPoll.json() as any).offers.map((offer:any)=>offer.session_id),['ordinary-after-managed']);
  f.database.close();
 });

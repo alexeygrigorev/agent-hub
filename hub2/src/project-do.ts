@@ -1287,6 +1287,7 @@ export class ProjectDO {
       const body:JsonRecord={key:action.key,workspace:launch.workspace,machine_id:saga.machine_id,engine:launch.engine,model:launch.model,
         ...(typeof launch.effort==='string'?{effort:launch.effort}:{}),interactive:launch.interactive===true,with_goal:launch.with_goal===true,
         purpose:launch.purpose??'implement',override_reason:'hub_completion_continuation',continuation_of:record.session_id,
+        ...(launch.managed_credential_label!==undefined?{managed_credential_label:launch.managed_credential_label}:{}),
         ...(Array.isArray(route?.required_capabilities)?{required_capabilities:route!.required_capabilities}:{}),
         // A session killed at its deadline gets more time, within the start limit.
         timeout_seconds:record.reason==='deadline_exceeded'?Math.min(7200,timeout*2):timeout,
