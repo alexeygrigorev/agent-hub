@@ -9,8 +9,9 @@ the offline tests never reach the network.
 """
 import argparse
 import base64
-import importlib.util
 import json
+import hashlib
+import stat
 import os
 import math
 import re
@@ -20,7 +21,6 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from types import SimpleNamespace
 
 COUNT = 10
 RUNNING_BUDGET_S = 150
@@ -30,9 +30,7 @@ MIN_MODELS = 3
 MAX_LUNA = 3
 HOST = 'hetzner-aplexer'
 EVIDENCE_GREEN = ('success', 'green', 'passed', 'pass')
-CANARY = importlib.util.spec_from_file_location('_acceptance_canary', Path(__file__).with_name('hub_start_canary.py'))
-canary = importlib.util.module_from_spec(CANARY)
-CANARY.loader.exec_module(canary)
+
 
 
 class Runner:
@@ -80,16 +78,55 @@ def is_luna(*parts):
     return any('luna' in str(p).lower() for p in parts)
 
 
+EVIDENCE_LIMIT = 128000
+RECEIPT_LIMIT = 2 * 1024 * 1024
+
+
+def unique_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError('duplicate JSON field')
+        value[key] = item
+    return value
+
+
+def bounded_file(path, limit):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > limit:
+            raise ValueError('receipt must be a bounded regular single-link file')
+        with os.fdopen(fd, 'rb') as stream:
+            fd = None
+            data = stream.read(limit + 1)
+        if len(data) > limit or len(data) != info.st_size:
+            raise ValueError('receipt changed or exceeds bound')
+        return data
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def evidence_text(value, bound):
+    return (isinstance(value, str) and bool(value.strip()) and len(value.encode()) <= bound
+            and not any(ord(char) < 32 or ord(char) == 127 for char in value))
+
+
 def check_evidence(path, commit):
-    """Same-commit canary + CI e2e green. Alerts are sampled live around the run, never taken from here."""
+    """Validate Root-supplied receipt pins, not remote-system authenticity.
+
+    Root independently checks actual deployment, canary and CI before supplying
+    this private bundle. Hashes bind optional local bytes, not their provenance.
+    Alerts are sampled live separately; this file can never prove zero alerts.
+    """
     problems = []
     if not path:
         return ['evidence file missing (--evidence)']
     try:
-        with open(path, encoding='utf-8') as fh:
-            ev = json.load(fh)
-    except (OSError, ValueError) as exc:
-        return ['evidence unreadable: %s' % exc]
+        ev = json.loads(bounded_file(path, EVIDENCE_LIMIT), object_pairs_hook=unique_object)
+    except (OSError, ValueError, UnicodeError):
+        return ['evidence unreadable or invalid']
     if not isinstance(ev, dict):
         return ['evidence is not an object']
     if not isinstance(commit, str) or not re.fullmatch(r'[0-9a-f]{40}', commit):
@@ -102,6 +139,33 @@ def check_evidence(path, commit):
     for key in ('canary', 'ci_e2e'):
         if str(ev.get(key, '')).lower() not in EVIDENCE_GREEN:
             problems.append('%s not green (%r)' % (key, ev.get(key)))
+    validation = ev.get('operator_validation')
+    if (ev.get('kind') != 'phase7_operator_validated_evidence_v1' or not isinstance(validation, dict)
+            or set(validation) != {'actor', 'target_commit', 'receipts'}
+            or not evidence_text(validation.get('actor'), 120) or validation.get('target_commit') != commit
+            or not isinstance(validation.get('receipts'), dict)
+            or set(validation['receipts']) != {'deployment', 'canary', 'ci_e2e'}):
+        problems.append('operator-validated same-commit receipt references required')
+        return problems
+    for name, receipt in validation['receipts'].items():
+        if (not isinstance(receipt, dict) or set(receipt) - {'commit', 'reference', 'sha256', 'path'}
+                or not {'commit', 'reference', 'sha256'} <= set(receipt)
+                or receipt.get('commit') != commit or not evidence_text(receipt.get('reference'), 2048)
+                or not isinstance(receipt.get('sha256'), str) or not re.fullmatch(r'[0-9a-f]{64}', receipt['sha256'])):
+            problems.append('%s receipt identity invalid or commit mismatch' % name)
+            continue
+        if 'path' in receipt:
+            if not evidence_text(receipt['path'], 4096):
+                problems.append('%s local receipt path invalid' % name)
+                continue
+            source = Path(receipt['path'])
+            if not source.is_absolute():
+                source = Path(path).parent / source
+            try:
+                if hashlib.sha256(bounded_file(source, RECEIPT_LIMIT)).hexdigest() != receipt['sha256']:
+                    problems.append('%s local receipt hash mismatch' % name)
+            except (OSError, ValueError):
+                problems.append('%s local receipt unreadable or invalid' % name)
     return problems
 
 
@@ -150,17 +214,61 @@ def make_probe():
 
 
 def probe_output_ok(captured, prompt, expected):
-    """Reuse the maintained canary's completed-output parser, never prompt/arguments/reasoning."""
-    if expected in prompt:
+    """Only known completed tool-output fields prove the nonce, never prose.
+
+    Codex/ZAI command_execution and Go/OpenCode tool_use are maintained wire
+    shapes. Claude CLI tool results may be top-level or user-message blocks.
+    Plain-text and unknown provider formats deliberately fail closed.
+    """
+    if expected in prompt or not isinstance(captured, str):
         return False
-    return canary.Canary.output_has_marker(SimpleNamespace(marker=expected), captured or '')
+
+    def marker_in(text):
+        return isinstance(text, str) and any(line.strip() == expected for line in text.splitlines())
+
+    def tool_result(block):
+        if (not isinstance(block, dict) or block.get('type') != 'tool_result'
+                or block.get('is_error') is not None and block.get('is_error') is not False
+                or block.get('role') not in (None, 'user', 'tool')
+                or not isinstance(block.get('tool_use_id'), str) or not block['tool_use_id']):
+            return False
+        content = block.get('content')
+        return marker_in(content) or isinstance(content, list) and any(
+            isinstance(part, dict) and part.get('type') == 'text' and marker_in(part.get('text')) for part in content)
+
+    for line in captured.splitlines():
+        try:
+            event = json.loads(line, object_pairs_hook=unique_object)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        item = event.get('item')
+        if (event.get('type') == 'item.completed' and isinstance(item, dict)
+                and item.get('type') == 'command_execution'
+                and item.get('status') in (None, 'completed')
+                and (item.get('exit_code') is None or type(item.get('exit_code')) is int and item['exit_code'] == 0) and marker_in(item.get('aggregated_output'))):
+            return True
+        part = event.get('part')
+        if (event.get('type') == 'tool_use' and isinstance(part, dict) and part.get('type') == 'tool'
+                and isinstance(part.get('tool'), str) and part['tool'].strip()
+                and isinstance(part.get('state'), dict) and part['state'].get('status') == 'completed'
+                and marker_in(part['state'].get('output'))):
+            return True
+        message = event.get('message')
+        if tool_result(event) or (event.get('type') == 'user' and isinstance(message, dict) and message.get('role') in (None, 'user')
+                and isinstance(message.get('content'), list) and any(tool_result(block) for block in message['content'])):
+            return True
+    return False
 
 
-def session_of(view):
+def session_of(view, expected_id=None):
     """`hub sessions show --json` is {"session": {...}}; a flat or foreign shape is an error, never guessed."""
     sess = view.get('session') if isinstance(view, dict) else None
     if not isinstance(sess, dict) or not sess.get('id'):
         raise RuntimeError('show response is not {"session": {...}}')
+    if expected_id is not None and sess['id'] != expected_id:
+        raise RuntimeError('show session id mismatch with requested session')
     return sess
 
 
@@ -276,6 +384,10 @@ def picker_problems(picker, session):
     return problems
 
 
+def valid_native_id(value):
+    return isinstance(value, str) and re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', value) is not None
+
+
 def valid_session_id(value):
     return isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}', value) is not None
 
@@ -309,7 +421,7 @@ def recover_owned(r, rec, clock):
     return sid
 
 
-def one_start(r, rec, clock, sleep, intake=None, workspace=None):
+def one_start(r, rec, clock, sleep, intake=None, workspace=None, seen_sessions=None, seen_natives=None):
     err = rec['errors']
     prompt, expected = make_probe()
     key = 'acc10-' + uuid.uuid4().hex
@@ -338,10 +450,15 @@ def one_start(r, rec, clock, sleep, intake=None, workspace=None):
         recover_owned(r, rec, clock)
         err.append('start returned no valid id')
         return
+    if seen_sessions is not None:
+        if sid in seen_sessions:
+            err.append('session id reused within this acceptance run')
+            return
+        seen_sessions.add(sid)
     if created.get('state') != 'running':
         err.append('default waited start did not return running')
     err.extend('start ' + p for p in picker_problems(created.get('picker'), created))
-    row = session_of(r.json('hub', ['sessions', 'show', sid, '--json'], left(clock, deadline, 60)))
+    row = session_of(r.json('hub', ['sessions', 'show', sid, '--json'], left(clock, deadline, 60)), sid)
     rec.update(model=row.get('model'), engine=row.get('engine'), host=row_host(row), native_id=row.get('native_id'))
     if row.get('state') != 'running':
         err.append('state %r not running' % row.get('state'))
@@ -374,9 +491,15 @@ def one_start(r, rec, clock, sleep, intake=None, workspace=None):
             or any(isinstance(choice, dict) and is_astra(choice.get('model'), choice.get('engine'), choice.get('policy_id'))
                    for choice in choices)):
         err.append('astra picked')
-    if not rec.get('native_id'):
-        err.append('no native id on running session')
-    elif rec['native_id'] not in live_natives(r, left(clock, deadline, 60)):
+    if not valid_native_id(rec.get('native_id')):
+        err.append('no canonical native UUID on running session')
+        return
+    if seen_natives is not None:
+        if rec['native_id'] in seen_natives:
+            err.append('native UUID reused within this acceptance run')
+            return
+        seen_natives.add(rec['native_id'])
+    if rec['native_id'] not in live_natives(r, left(clock, deadline, 60)):
         err.append('native not live in a list --running')
     cdeadline = clock() + CAPTURE_BUDGET_S
     while clock() < cdeadline:
@@ -431,15 +554,18 @@ def stop_one(r, rec, clock, sleep):
     try:
         r.json('hub', ['sessions', 'stop', sid, '--wait', '--timeout', str(max(1, STOP_BUDGET_S - 5))],
                left(clock, deadline))
-        sess = session_of(r.json('hub', ['sessions', 'show', sid, '--json'], left(clock, deadline, 60)))
+        sess = session_of(r.json('hub', ['sessions', 'show', sid, '--json'], left(clock, deadline, 60)), sid)
     except Exception as exc:
         err.append('stop failed: %s' % exc)
         rec['stop_s'] = round(clock() - t0, 1)
         return
     if sess.get('state') != 'stopped':
         err.append('state after stop %r != stopped' % sess.get('state'))
-    if native is None and sess.get('native_id'):
-        native = sess['native_id']
+    if not valid_native_id(native):
+        native = sess.get('native_id')
+    if not valid_native_id(native):
+        err.append('cleanup native UUID unconfirmed; authenticated stop requested but absence cannot be proved')
+        return
     while native:
         try:
             gone = native not in live_natives(r, left(clock, deadline, 60))
@@ -465,6 +591,12 @@ def summarize(recs, evidence_problems):
     problems = list(evidence_problems)
     if len(recs) != COUNT:
         problems.append('only %d of %d starts attempted' % (len(recs), COUNT))
+    sessions = [rec.get('id') for rec in recs]
+    natives = [rec.get('native_id') for rec in recs]
+    if not all(valid_session_id(value) for value in sessions) or len(set(sessions)) != COUNT:
+        problems.append('ten distinct valid session identities required')
+    if not all(valid_native_id(value) for value in natives) or len(set(natives)) != COUNT:
+        problems.append('ten distinct canonical native UUIDs required')
     if len(models) < MIN_MODELS:
         problems.append('%d distinct models < %d' % (len(models), MIN_MODELS))
     if luna > MAX_LUNA:
@@ -481,6 +613,11 @@ def run(r, evidence_path, commit, clock=time.monotonic, sleep=time.sleep, out=sy
         intake=None, synthetic_ac=False, workspace=None):
     window = {'start': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
     problems = list(check_evidence(evidence_path, commit))
+    evidence_digest = None
+    try:
+        evidence_digest = hashlib.sha256(bounded_file(evidence_path, EVIDENCE_LIMIT)).hexdigest()
+    except (OSError, ValueError, TypeError):
+        problems.append('evidence receipt bytes unavailable')
     if not isinstance(workspace, str) or not workspace.startswith('/') or '\x00' in workspace:
         problems.append('explicit absolute --cwd workspace required')
     if not intake and not synthetic_ac:
@@ -491,6 +628,7 @@ def run(r, evidence_path, commit, clock=time.monotonic, sleep=time.sleep, out=sy
         before = None
         problems.append('alert baseline unavailable: %s' % exc)
     recs = []
+    seen_sessions, seen_natives = set(), set()
     if problems:  # fail closed before touching Hub
         print('ACCEPTANCE FAIL (preconditions): %s' % '; '.join(problems), file=out)
         return 1
@@ -499,7 +637,7 @@ def run(r, evidence_path, commit, clock=time.monotonic, sleep=time.sleep, out=sy
             rec = {'n': i, 'errors': []}
             recs.append(rec)
             try:
-                one_start(r, rec, clock, sleep, intake, workspace)
+                one_start(r, rec, clock, sleep, intake, workspace, seen_sessions, seen_natives)
             except Exception as exc:  # keep the created id for cleanup
                 rec['errors'].append('start crashed: %s' % exc)
             print('start %d/%d id=%s model=%s engine=%s host=%s elapsed=%ss shares(%s)=%s' % (
@@ -528,6 +666,11 @@ def run(r, evidence_path, commit, clock=time.monotonic, sleep=time.sleep, out=sy
                 rec['errors'].append('cleanup uncertain: could not determine whether start was accepted; original key ' + rec['key'])
     window['end'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
     post_problems = list(check_evidence(evidence_path, commit))
+    try:
+        if hashlib.sha256(bounded_file(evidence_path, EVIDENCE_LIMIT)).hexdigest() != evidence_digest:
+            post_problems.append('operator-validated evidence bundle changed during run')
+    except (OSError, ValueError, TypeError):
+        post_problems.append('post-run evidence receipt bytes unavailable')
     after = None
     post_cutoff_ms = int(time.time() * 1000)
     try:
@@ -541,7 +684,7 @@ def run(r, evidence_path, commit, clock=time.monotonic, sleep=time.sleep, out=sy
         rec.pop('row', None)
         rec.pop('_start_argv', None)
     summary = summarize(recs, post_problems)
-    summary.update(commit=commit, window=window, starts=recs, alert_watermarks={'before': before, 'after': after, 'required_post_observed_at_ms': post_cutoff_ms},
+    summary.update(commit=commit, evidence_sha256=evidence_digest, window=window, starts=recs, alert_watermarks={'before': before, 'after': after, 'required_post_observed_at_ms': post_cutoff_ms},
                    acceptance_criteria=('intake ' + intake) if intake else 'server-synthetic (explicitly authorized)')
     print(json.dumps(summary, indent=2, sort_keys=True, default=str), file=out)
     print('ACCEPTANCE %s' % ('PASS' if summary['ok'] else 'FAIL'), file=out)
@@ -551,7 +694,7 @@ def run(r, evidence_path, commit, clock=time.monotonic, sleep=time.sleep, out=sy
 def main(argv=None, runner=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--live', action='store_true', help='really start ten sessions (also needs HUB_ACCEPTANCE_READY=1)')
-    ap.add_argument('--evidence', help='JSON: canary/ci_e2e (+_commit)')
+    ap.add_argument('--evidence', help='Root-validated same-commit deployment/canary/CI receipt references and SHA256 pins; see docs/HUB-ACCEPTANCE-10.md')
     ap.add_argument('--cwd', help='explicit workspace on hetzner-aplexer')
     ap.add_argument('--commit', help='deployed main commit the evidence must match')
     ap.add_argument('--alerts-cmd', help='verified durable sampler JSON: kind=dev_alert_occurrences_v1, recipient=dev@dtcdev.click, '
