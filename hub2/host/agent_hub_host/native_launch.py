@@ -537,6 +537,11 @@ class NativeLauncher:
                 "--pids", str(self.config.get("pids", 256)), "--startup-timeout-ms", "30000",
                 "--workspace", specification["workspace"], "--cwd", specification["workspace"],
                 "--tag", "task-" + task_id]
+        if objective is not None:
+            # A literal -- command keeps its argv but does not infer an engine.
+            # Both codex and the zcodex fork use the built-in Codex transcript
+            # family; do not depend on a host-specific zcodex engine/profile.
+            argv += ["--engine", "codex"]
         if specification.get("session_id"):
             argv += ["--label", "hub.managed=true", "--label", "hub.session=" + specification["session_id"]]
         if specification.get('attempt_label'):
