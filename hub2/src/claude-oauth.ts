@@ -83,4 +83,3 @@ export function loginRefusal(status: number, text: string): { ok: false; invalid
   const detail = oauth ?? (blocked ? 'egress_blocked' : status >= 500 ? 'provider_unavailable' : 'http_' + status);
   return { ok: false, invalid: !!oauth, reason: 'login_code_rejected', providerStatus: status, detail, blocked };
 }
-
