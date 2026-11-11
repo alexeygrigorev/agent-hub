@@ -30,7 +30,17 @@ def bind(operator_base):
         explicit = bool(os.environ.get('HUB_CONFIG_FILE'))
         # Check ancestor links too: a dangling linked directory must never
         # turn a failed current enrollment into legacy fallback authority.
-        current_selected = not explicit and (config._has_symlink(current) or current.exists())
+        current_selected = False
+        if not explicit:
+            if config._has_symlink(current):
+                current_selected = True
+            else:
+                try:
+                    current.lstat()
+                except FileNotFoundError:
+                    pass  # Only proven absence permits the legacy profile.
+                else:
+                    current_selected = True
         path = current if current_selected else config.get_host_config_path()
         host = config._load_from(path)  # bounded, owned, private, no-follow
         is_v2 = current_selected or 'server' in host or 'token' in host
