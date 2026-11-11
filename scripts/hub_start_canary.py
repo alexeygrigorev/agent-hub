@@ -65,8 +65,17 @@ def read_regular_nofollow(path, max_bytes=64 * 1024 * 1024):
 
 
 def create_sealed_pyz_fd(data):
-    if hasattr(os, "memfd_create") and hasattr(os, "MFD_ALLOW_SEALING") and hasattr(fcntl, "F_ADD_SEALS"):
-        fd = os.memfd_create("hub_candidate_pyz", os.MFD_ALLOW_SEALING)
+    if hasattr(os, "memfd_create"):
+        mfd_allow_sealing = getattr(os, "MFD_ALLOW_SEALING", 0x0002)
+        f_add_seals = getattr(fcntl, "F_ADD_SEALS", 1033)
+        f_get_seals = getattr(fcntl, "F_GET_SEALS", 1034)
+        seals = (
+            getattr(fcntl, "F_SEAL_SEAL", 0x0001)
+            | getattr(fcntl, "F_SEAL_SHRINK", 0x0002)
+            | getattr(fcntl, "F_SEAL_GROW", 0x0004)
+            | getattr(fcntl, "F_SEAL_WRITE", 0x0008)
+        )
+        fd = os.memfd_create("hub_candidate_pyz", mfd_allow_sealing)
         try:
             view = memoryview(data)
             written = 0
@@ -76,13 +85,9 @@ def create_sealed_pyz_fd(data):
                     raise OSError(errno.EIO, "short memfd write")
                 written += n
             os.lseek(fd, 0, os.SEEK_SET)
-            seals = (
-                fcntl.F_SEAL_SEAL
-                | fcntl.F_SEAL_SHRINK
-                | fcntl.F_SEAL_GROW
-                | fcntl.F_SEAL_WRITE
-            )
-            fcntl.fcntl(fd, fcntl.F_ADD_SEALS, seals)
+            fcntl.fcntl(fd, f_add_seals, seals)
+            if (fcntl.fcntl(fd, f_get_seals) & seals) != seals:
+                raise OSError(errno.EPERM, "memfd seal verification failed")
             os.set_inheritable(fd, True)
             return fd
         except BaseException:
