@@ -295,6 +295,72 @@ class SchemaInstallConfigurationTests(unittest.TestCase):
             self.assertTrue(staged[0].name.startswith(head + '-'))
             self.assertIn(f'HUB2_ALERT_EVIDENCE_DIR={staged[0]}\n', path.read_text())
 
+    def test_helper_refuses_owned_temp_replacement_between_mkdir_and_stat_or_open(self):
+        # Ensure ensure_private_evidence_root never performs fchown/fchmod repair.
+        helper_src = self.block.split('def ensure_private_evidence_root', 1)[1].split('if mode == "active"', 1)[0]
+        self.assertNotIn('fchown', helper_src)
+        self.assertNotIn('fchmod', helper_src)
+
+        with tempfile.TemporaryDirectory(dir=self.temporary_root) as temporary:
+            base = Path(temporary)
+            base.chmod(0o700)
+            repo, _head = self._create_synthetic_checkout(base)
+            path = base / '.dev.vars'
+            original = 'SYNTHETIC_SECRET=keep-private-fixture\nHUB2_RELEASE_MODE=bootstrap\n'
+            path.write_text(original)
+            path.chmod(0o600)
+
+            for scenario in ('replace_staging_after_mkdir', 'create_leaf_before_publish', 'replace_leaf_after_publish'):
+                with self.subTest(scenario=scenario):
+                    state_dir = base / f'state-{scenario}'
+                    state_dir.mkdir(mode=0o700)
+                    evidence_root = state_dir / 'credential-monitor-evidence'
+                    pre_existing = base / f'pre-{scenario}'
+                    pre_existing.mkdir(mode=0o700)
+                    pre_ino = pre_existing.lstat().st_ino
+
+                    harness = (
+                        'import os, sys\n'
+                        f'scenario = {scenario!r}\n'
+                        f'state_dir = {str(state_dir)!r}\n'
+                        f'pre_existing = {str(pre_existing)!r}\n'
+                        'real_mkdir = os.mkdir\n'
+                        'real_stat = os.stat\n'
+                        'published = False\n'
+                        'def hooked_mkdir(name, mode=0o777, *, dir_fd=None):\n'
+                        '    real_mkdir(name, mode, dir_fd=dir_fd)\n'
+                        '    if isinstance(name, str) and name.startswith(".stage-root-"):\n'
+                        '        if scenario == "replace_staging_after_mkdir":\n'
+                        '            os.rmdir(name, dir_fd=dir_fd)\n'
+                        '            os.rename(pre_existing, os.path.join(state_dir, name))\n'
+                        '        elif scenario == "create_leaf_before_publish":\n'
+                        '            os.rename(pre_existing, os.path.join(state_dir, "credential-monitor-evidence"))\n'
+                        'def hooked_stat(path_arg, *, dir_fd=None, follow_symlinks=True):\n'
+                        '    global published\n'
+                        '    if scenario == "replace_leaf_after_publish" and path_arg == "credential-monitor-evidence" and os.path.exists(os.path.join(state_dir, "credential-monitor-evidence")) and not published:\n'
+                        '        published = True\n'
+                        '        os.rmdir(os.path.join(state_dir, "credential-monitor-evidence"))\n'
+                        '        os.rename(pre_existing, os.path.join(state_dir, "credential-monitor-evidence"))\n'
+                        '    return real_stat(path_arg, dir_fd=dir_fd, follow_symlinks=follow_symlinks)\n'
+                        'os.mkdir = hooked_mkdir\n'
+                        'os.stat = hooked_stat\n'
+                    ) + self.block
+
+                    res = subprocess.run(
+                        [sys.executable, '-', str(path), 'active', 'apply', str(repo), str(evidence_root)],
+                        input=harness,
+                        text=True,
+                        capture_output=True,
+                        timeout=15,
+                    )
+                    self.assertNotEqual(res.returncode, 0, f'{scenario} should fail closed')
+                    self.assertIn('credential_monitor_staging_failed', res.stderr)
+                    self.assertEqual(path.read_text(), original)
+                    # Pre-existing directory must never have a boundary staged inside it.
+                    if evidence_root.exists():
+                        self.assertEqual(evidence_root.lstat().st_ino, pre_ino)
+                        self.assertEqual(list(evidence_root.iterdir()), [])
+
     def test_rollback_restores_previous_dev_vars_and_retains_all_historical_boundaries(self):
         with tempfile.TemporaryDirectory(dir=self.temporary_root) as temporary:
             base = Path(temporary)

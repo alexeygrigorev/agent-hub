@@ -113,6 +113,7 @@ fi
 if [[ -n "$RELEASE_MODE" || -n "$SCHEMA_MIGRATIONS" ]]; then
   echo "== release configuration"
   python3 - "$REPO/.dev.vars" "$RELEASE_MODE" "$SCHEMA_MIGRATIONS" "$REPO" "$CREDENTIAL_MONITOR_EVIDENCE_ROOT" <<'PY'
+import ctypes
 import hashlib
 import json
 import os
@@ -121,6 +122,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
@@ -144,6 +146,55 @@ if schema_mode:
     updates["HUB2_SCHEMA_MIGRATIONS"] = schema_mode
 
 
+class _CapHeader(ctypes.Structure):
+    _fields_ = [("version", ctypes.c_uint32), ("pid", ctypes.c_int)]
+
+
+class _CapData(ctypes.Structure):
+    _fields_ = [("effective", ctypes.c_uint32), ("permitted", ctypes.c_uint32), ("inheritable", ctypes.c_uint32)]
+
+
+def _mkdir_as_service_uid(parent_fd: int, name: str, owner_uid: int, owner_gid: int) -> None:
+    old_umask = os.umask(0o077)
+    switched = False
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        if os.geteuid() == 0 and (owner_uid != 0 or owner_gid != 0):
+            if libc.prctl(8, 1, 0, 0, 0) != 0:
+                raise OSError(ctypes.get_errno(), "prctl PR_SET_KEEPCAPS failed")
+            os.setegid(owner_gid)
+            os.seteuid(owner_uid)
+            switched = True
+            hdr = _CapHeader(0x20080522, 0)
+            data = (_CapData * 2)()
+            # Keep only CAP_DAC_OVERRIDE (bit 1) while creating the service-owned directory inside root-owned parent.
+            data[0].effective = 1 << 1
+            data[0].permitted = 1 << 1
+            data[0].inheritable = 0
+            if libc.capset(ctypes.byref(hdr), ctypes.byref(data)) != 0:
+                raise OSError(ctypes.get_errno(), "capset CAP_DAC_OVERRIDE failed")
+        os.mkdir(name, 0o700, dir_fd=parent_fd)
+    finally:
+        if switched:
+            try:
+                os.seteuid(0)
+                os.setegid(0)
+            finally:
+                libc.prctl(8, 0, 0, 0, 0)
+        os.umask(old_umask)
+
+
+def _publish_directory(parent_fd: int, staging: str, target: str) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    rename = getattr(libc, "renameat2", None)
+    if rename is None:
+        raise ValueError("renameat2 unavailable")
+    rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    rename.restype = ctypes.c_int
+    if rename(parent_fd, os.fsencode(staging), parent_fd, os.fsencode(target), 1) != 0:
+        raise OSError(ctypes.get_errno(), "exclusive evidence root publication refused")
+
+
 def ensure_private_evidence_root(target_root: Path, owner_uid: int, owner_gid: int) -> None:
     raw = os.fspath(target_root)
     if not os.path.isabs(raw) or os.path.normpath(raw) != raw or "\x00" in raw or len(target_root.parts) < 2:
@@ -158,17 +209,48 @@ def ensure_private_evidence_root(target_root: Path, owner_uid: int, owner_gid: i
             if info.st_uid not in (0, owner_uid) or (info.st_mode & 0o002):
                 raise ValueError("untrusted evidence root ancestor")
         leaf = target_root.name
-        created = False
-        old_umask = os.umask(0o077)
+        expected_identity = None
         try:
+            linfo = os.stat(leaf, dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            scan_fd = os.dup(fd)
             try:
-                os.mkdir(leaf, 0o700, dir_fd=fd)
-                created = True
-            except FileExistsError:
-                created = False
-        finally:
-            os.umask(old_umask)
-        linfo = os.stat(leaf, dir_fd=fd, follow_symlinks=False)
+                with os.scandir(scan_fd) as entries:
+                    existing_inodes = {entry.inode() for entry in entries}
+            finally:
+                os.close(scan_fd)
+            # Sleep across a kernel timestamp tick so any pre-existing directory renamed into
+            # staging during a raced mkdir has st_mtime_ns < st_ctime_ns and is rejected.
+            time.sleep(0.01)
+            staging = ".stage-root-" + uuid.uuid4().hex
+            staging_fd = None
+            try:
+                _mkdir_as_service_uid(fd, staging, owner_uid, owner_gid)
+                slinfo = os.stat(staging, dir_fd=fd, follow_symlinks=False)
+                if not stat.S_ISDIR(slinfo.st_mode):
+                    raise ValueError("staging evidence root must be a real directory")
+                staging_fd = os.open(staging, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                sinfo = os.fstat(staging_fd)
+                if (
+                    not stat.S_ISDIR(sinfo.st_mode)
+                    or (slinfo.st_dev, slinfo.st_ino) != (sinfo.st_dev, sinfo.st_ino)
+                    or sinfo.st_ino in existing_inodes
+                    or sinfo.st_uid != owner_uid
+                    or sinfo.st_gid != owner_gid
+                    or stat.S_IMODE(sinfo.st_mode) != 0o700
+                    or sinfo.st_nlink != 2
+                    or sinfo.st_mtime_ns != sinfo.st_ctime_ns
+                    or os.listdir(staging_fd)
+                ):
+                    raise ValueError("staging evidence root failed provenance verification")
+                os.fsync(staging_fd)
+                _publish_directory(fd, staging, leaf)
+                os.fsync(fd)
+                expected_identity = (sinfo.st_dev, sinfo.st_ino)
+            finally:
+                if staging_fd is not None:
+                    os.close(staging_fd)
+            linfo = os.stat(leaf, dir_fd=fd, follow_symlinks=False)
         if not stat.S_ISDIR(linfo.st_mode):
             raise ValueError("evidence root must be a 0700 directory")
         ev_fd = os.open(leaf, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
@@ -176,19 +258,8 @@ def ensure_private_evidence_root(target_root: Path, owner_uid: int, owner_gid: i
             finfo = os.fstat(ev_fd)
             if not stat.S_ISDIR(finfo.st_mode) or (linfo.st_dev, linfo.st_ino) != (finfo.st_dev, finfo.st_ino):
                 raise ValueError("evidence root identity mismatch")
-            if created:
-                if (
-                    finfo.st_uid != os.geteuid()
-                    or finfo.st_nlink != 2
-                    or stat.S_IMODE(finfo.st_mode) != 0o700
-                    or os.listdir(ev_fd)
-                ):
-                    raise ValueError("newly created evidence root failed identity check")
-                if os.geteuid() == 0 and (owner_uid != 0 or owner_gid != 0):
-                    os.fchown(ev_fd, owner_uid, owner_gid)
-                os.fsync(ev_fd)
-                os.fsync(fd)
-                finfo = os.fstat(ev_fd)
+            if expected_identity is not None and (finfo.st_dev, finfo.st_ino) != expected_identity:
+                raise ValueError("evidence root replacement detected")
             if finfo.st_uid != owner_uid or finfo.st_gid != owner_gid or stat.S_IMODE(finfo.st_mode) != 0o700:
                 raise ValueError("evidence root must be a 0700 directory owned by service user")
         finally:
