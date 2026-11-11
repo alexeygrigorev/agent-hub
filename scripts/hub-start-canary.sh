@@ -4,4 +4,4 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PATH="$PATH:${HOME:-/nonexistent}/.local/bin"
-exec python3 "$HERE/hub_start_canary.py" "$@"
+exec python3 -I -S "$HERE/hub_start_canary.py" "$@"

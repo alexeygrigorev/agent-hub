@@ -11,7 +11,7 @@ SCRIPT = ROOT / "scripts" / "hub-start-canary.sh"
 SID, NATIVE = "11111111-2222-4333-8444-555555555555", "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 
 FAKE_HUB = r'''
-import json, os, sys, pathlib, time
+import json, os, signal, sys, pathlib, time
 d = pathlib.Path(os.environ["FAKE_DIR"]); sc = os.environ.get("FAKE_SCENARIO", "ok")
 args = sys.argv[1:]
 with open(d / "argv.jsonl", "a") as recorded:
@@ -19,9 +19,11 @@ with open(d / "argv.jsonl", "a") as recorded:
 log = open(d / "calls.log", "a"); log.write(" ".join(args) + "\n"); log.close()
 SID = "%s"; NATIVE = "%s"
 def item(state, **kw):
+    name = (d / "session_name").read_text() if (d / "session_name").exists() else None
+    key = (d / "session_key").read_text() if (d / "session_key").exists() else None
     base = {"id": SID, "state": state, "intake_id": None, "project_id": "owner/repo", "machine_id": "HOST-1", "workspace": os.environ["HUB_CANARY_WORKSPACE"],
             "epoch": 1, "operation_id": "op:0", "native_id": NATIVE, "engine": "shell", "model": None,
-            "interactive": False, "evidence": None, "attention": None}
+            "name": name, "key": key, "interactive": False, "evidence": None, "attention": None}
     base.update(kw); return base
 if args[:2] == ["sessions", "start"]:
     if sc == "start_fail": sys.stderr.write("Session operation failed\n"); sys.exit(1)
@@ -30,15 +32,57 @@ if args[:2] == ["sessions", "start"]:
     if sc == "start_noid": print(json.dumps({"state": "queued"})); sys.exit(0)
     first = not (d / "started").exists()
     (d / "started").write_text("1"); (d / "a_running").write_text("1")
-    (d / "prompt").write_text(args[args.index("--prompt") + 1])
-    run_id = args[args.index("--name") + 1].rsplit("-", 1)[-1]
-    (d / "marker").write_text("CANARY-OK" + (":" + run_id if "--engine" not in args else ""))
+    prompt_text = args[args.index("--prompt") + 1]
+    (d / "prompt").write_text(prompt_text)
+    session_name = args[args.index("--name") + 1]
+    session_key = args[args.index("--key") + 1]
+    (d / "session_name").write_text(session_name)
+    (d / "session_key").write_text(session_key)
+    run_id = session_name.rsplit("-", 1)[-1]
+    if "printf '%%s:%%s:%%s\\n' CANARY-OK " in prompt_text:
+        parts = prompt_text.split(";")[0].split()
+        (d / "marker").write_text(f"CANARY-OK:{parts[-2]}:{parts[-1]}")
+    else:
+        (d / "marker").write_text("CANARY-OK" + (":" + run_id if "--engine" not in args else ""))
+    if sc == "sigterm_on_start" and first:
+        parent_pid = int(os.environ["CANARY_TEST_PID"]) if "CANARY_TEST_PID" in os.environ else os.getppid()
+        os.kill(parent_pid, signal.SIGTERM)
+        time.sleep(2)
+        sys.exit(1)
+    if sc in ("same_name_unrelated_key", "client_key_only_recovery", "conflicting_key_rows"):
+        print("lost accepted response"); sys.exit(0)
     if sc == "start_lost_response" and first: print("lost accepted response"); sys.exit(0)
     if sc == "start_slow" and first: time.sleep(1)
     print(json.dumps({"id": SID, "state": "queued", "operation_id": "op:0"})); sys.exit(0)
+if args[:1] == ["routing-machines"]:
+    host_ver = os.environ.get("FAKE_HOST_VERSION", "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7")
+    if sc == "post_hash_swap":
+        rel_root = pathlib.Path(os.environ["HUB_CANARY_HOST_RELEASE_ROOT"])
+        (rel_root / "releases" / host_ver / "hub.pyz").write_text("import sys; sys.exit(99)\n")
+    connected = sc != "host_disconnected"
+    mismatch = sc == "host_version_mismatch_flag"
+    print(json.dumps({"hosts": [{"machine_id": os.environ.get("HUB_CANARY_MACHINE", "HOST-1"), "connected": connected, "host_version": host_ver, "version_mismatch": mismatch, "protocol_version": 1}]}))
+    sys.exit(0)
+if args[:2] == ["sessions", "show"]:
+    if sc == "archive_show_fail": sys.exit(1)
+    print(json.dumps({"session": {"id": SID, "intake_id": "intake-canary-1"}})); sys.exit(0)
+if args[:2] == ["intake", "update"]:
+    if sc == "archive_update_fail": sys.exit(1)
+    (d / "archived_intake").write_text(" ".join(args)); sys.exit(0)
 if args[:2] == ["sessions", "list"]:
     if sc == "late_running": time.sleep(0.5)
-    items = [item("failed", id="other", native_id=None, attention={"reason": "engine_not_allowed", "observed_at": 1})]
+    list_count = int((d / "list_count").read_text()) if (d / "list_count").exists() else 0
+    (d / "list_count").write_text(str(list_count + 1))
+    if sc == "transient_inventory_changed_409" and list_count == 0:
+        sys.stderr.write("Session HTTP request failed with status 409 (native_inventory_changed)\n")
+        sys.exit(1)
+    if sc == "persistent_inventory_changed_409":
+        sys.stderr.write("Session HTTP request failed with status 409 (native_inventory_changed)\n")
+        sys.exit(1)
+    if sc == "list_auth_401":
+        sys.stderr.write("Session HTTP request failed with status 401 (unauthorized)\n")
+        sys.exit(1)
+    items = [item("failed", id="other", name="other-session", key="other-key", native_id=None, attention={"reason": "engine_not_allowed", "observed_at": 1})]
     if (d / "started").exists():
         if sc == "never_running": items.append(item("claimed", native_id=None, attention={"reason": "native_launch_unverified", "observed_at": 1}))
         elif sc == "failed_state": items.append(item("failed", native_id=None, attention={"reason": "engine_not_allowed", "observed_at": 1}))
@@ -46,6 +90,15 @@ if args[:2] == ["sessions", "list"]:
         elif sc == "no_host": items.append(item("running", machine_id=None, workspace="/w/hub-canary"))
         elif sc == "wrong_host": items.append(item("running", machine_id="desktop"))
         elif sc == "wrong_workspace": items.append(item("running", workspace="/wrong/workspace"))
+        elif sc == "same_name_unrelated_key":
+            items.append(item("running", id="UNRELATED-SID", key="different-key", client_key="different-key", native_id="unrelated-native"))
+        elif sc == "client_key_only_recovery":
+            items.append(item("running", id="UNRELATED-SID", key="different-key", client_key="different-key", native_id="unrelated-native"))
+            items.append(item("running", id=SID, key=None, client_key=(d / "session_key").read_text(), native_id=NATIVE))
+        elif sc == "conflicting_key_rows":
+            ck = (d / "session_key").read_text()
+            items.append(item("running", id=SID, key=None, client_key=ck, native_id=NATIVE))
+            items.append(item("running", id="CONFLICT-SID-2", key=None, client_key=ck, native_id="conflict-native-2"))
         else: items.append(item("running"))
     print(json.dumps({"items": items[:1] if sc == "past_first_page" else items, "next": None, "complete": True, "sessions": items, "next_cursor": None})); sys.exit(0)
 if args[:2] == ["sessions", "capture"]:
@@ -130,7 +183,7 @@ class CanaryTest(unittest.TestCase):
         )
         env["FAKE_PROMPT"] = mode_prompt or ("Reply CANARY-OK and exit" if ("full" in args or "--deploy-gate" in args) else "printf CANARY-OK; sleep 30")
         env.update(extra)
-        for f in ("started", "a_running", "stopped"):
+        for f in ("started", "a_running", "stopped", "list_count"):
             (self.tmp / f).unlink(missing_ok=True)
         (self.tmp / "calls.log").write_text("")
         r = subprocess.run([str(SCRIPT), *args], env=env, capture_output=True, text=True, timeout=60)
@@ -415,6 +468,856 @@ class CanaryTest(unittest.TestCase):
     def test_shell_capture_requires_output_line_not_command_text(self):
         # command line only, even with the marker inside it, must fail
         self.assert_stage("capture_prompt_only", "capture", "no_output_beyond_prompt")
+
+    def prepare_candidate_release(self, sha, *, converge=True, tamper_pyz=False):
+        root = self.tmp / "host-releases"
+        rel = root / "releases" / sha
+        rel.mkdir(parents=True, exist_ok=True)
+        pyz = rel / "hub.pyz"
+        pyz_bytes = (self.tmp / "fake_hub.py").read_bytes()
+        pyz.write_bytes(pyz_bytes)
+        import hashlib
+        digest = hashlib.sha256(pyz_bytes).hexdigest()
+        if tamper_pyz:
+            pyz.write_bytes(pyz_bytes + b"\n# tampered\n")
+        meta = {
+            "host_version": sha,
+            "protocol_version": 1,
+            "schema_version": 1,
+            "artifacts": {"hub.pyz": {"sha256": digest, "size": len(pyz_bytes)}},
+        }
+        (rel / "release.json").write_text(json.dumps(meta))
+        current = root / "current"
+        if current.exists() or current.is_symlink():
+            current.unlink()
+        if converge:
+            current.symlink_to(rel)
+        return root, digest
+
+    def helper_sha256(self):
+        out = subprocess.check_output(
+            [sys.executable, str(ROOT / "scripts" / "hub_start_canary.py"), "--print-helper-sha256"],
+            text=True,
+        ).strip()
+        self.assertRegex(out, r"^[0-9a-f]{64}$")
+        return out
+
+    def test_precommit_deploy_gate_binds_candidate_sha_run_token_helper_and_hub_pyz(self):
+        sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
+        token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        helper_sha = self.helper_sha256()
+        rel_root, pyz_sha = self.prepare_candidate_release(sha)
+        # Set HUB_BIN to a broken path to prove verify_candidate_host_release
+        # switches self.hub to the verified immutable candidate hub.pyz without mutating ~/.local/bin/hub.
+        r, v = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_BIN="/nonexistent/global-hub-must-not-be-used",
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
+            FAKE_HOST_VERSION=sha,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(v["ok"])
+        self.assertEqual(v["deploy_gate"], True)
+        self.assertEqual(v["mode"], "shell")
+        self.assertEqual(v["candidate_sha"], sha)
+        self.assertEqual(v["run_token"], token)
+        self.assertEqual(v["helper_sha256"], helper_sha)
+        self.assertEqual(v["host_version"], sha)
+        self.assertEqual(v["hub_pyz_sha256"], pyz_sha)
+        self.assertEqual(v["intake_archived"], True)
+        self.assertEqual(
+            (self.tmp / "archived_intake").read_text(),
+            "intake update intake-canary-1 --status archived --reason deploy_gate_shell_canary",
+        )
+        prompt = (self.tmp / "prompt").read_text()
+        self.assertNotIn(f"CANARY-OK:{sha[:12]}:{token}", prompt)
+        self.assertIn(f"printf '%s:%s:%s\\n' CANARY-OK {sha[:12]} {token}; sleep 30", prompt)
+        self.assertEqual(list((self.state / "pending").glob("*.json")), [])
+
+    def test_precommit_deploy_gate_rejects_helper_digest_mismatch(self):
+        sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
+        token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        rel_root, pyz_sha = self.prepare_candidate_release(sha)
+        r, v = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", "0" * 64,
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
+        )
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual((v["ok"], v["stage"], v["reason"]), (False, "helper_version", "helper_sha256_mismatch"))
+        self.assertEqual(self.calls(), "")
+        self.assertFalse(self.state.exists())
+
+    def test_precommit_deploy_gate_rejects_unconverged_or_tampered_host_release(self):
+        sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
+        token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        helper_sha = self.helper_sha256()
+        rel_root, pyz_sha = self.prepare_candidate_release(sha, converge=False)
+        r, v = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.1",
+        )
+        self.assertEqual((r.returncode, v["stage"], v["reason"]), (1, "host_release", "timeout_current_release_not_converged"))
+
+        rel_root, pyz_sha = self.prepare_candidate_release(sha, tamper_pyz=True)
+        r, v = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.1",
+        )
+        self.assertEqual((r.returncode, v["stage"], v["reason"]), (1, "host_release", "candidate_hub_pyz_digest_mismatch"))
+
+        rel_root, pyz_sha = self.prepare_candidate_release(sha)
+        r, v = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", "f" * 64,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.1",
+        )
+        self.assertEqual((r.returncode, v["stage"], v["reason"]), (1, "host_release", "candidate_hub_pyz_cli_sha_mismatch"))
+
+        rel_root, pyz_sha = self.prepare_candidate_release(sha)
+        r, v = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.1",
+            FAKE_HOST_VERSION="ad0b8a0b2276303c2b13762a614fe49a63514ae7",
+        )
+        self.assertEqual((r.returncode, v["stage"]), (1, "host_release"))
+        self.assertIn("timeout_host_version_mismatch", v["reason"])
+
+    def test_precommit_deploy_gate_executes_sealed_memfd_immune_to_post_hash_disk_swap(self):
+        sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
+        token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        helper_sha = self.helper_sha256()
+        rel_root, pyz_sha = self.prepare_candidate_release(sha)
+        r, v = self.run_canary(
+            "post_hash_swap", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_BIN="/nonexistent/global-hub-must-not-be-used",
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
+            FAKE_HOST_VERSION=sha,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(v["ok"])
+        self.assertEqual(v["hub_pyz_sha256"], pyz_sha)
+        # Confirm that the on-disk file was indeed overwritten during routing-machines,
+        # yet all subsequent CLI invocations still executed the sealed memfd bytes.
+        self.assertEqual(
+            (rel_root / "releases" / sha / "hub.pyz").read_text(),
+            "import sys; sys.exit(99)\n",
+        )
+
+    def test_precommit_deploy_gate_fails_when_intake_archival_fails(self):
+        sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
+        token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        helper_sha = self.helper_sha256()
+        rel_root, pyz_sha = self.prepare_candidate_release(sha)
+        r, v = self.run_canary(
+            "archive_update_fail", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
+            FAKE_HOST_VERSION=sha,
+        )
+        self.assertEqual((r.returncode, v["ok"], v["stage"], v["reason"], v["intake_archived"]),
+                         (1, False, "cleanup", "intake_archive_failed", False))
+
+    def test_precommit_deploy_gate_rejects_symlink_or_nonprivate_state_dir_and_symlink_lock_without_truncation(self):
+        sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
+        token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        helper_sha = self.helper_sha256()
+        rel_root, pyz_sha = self.prepare_candidate_release(sha)
+
+        victim_dir = self.tmp / "victim-dir"
+        victim_dir.mkdir(mode=0o700)
+        symlink_state = self.tmp / "symlink-state"
+        symlink_state.symlink_to(victim_dir)
+        r_sym, v_sym = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_STATE_DIR=str(symlink_state),
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
+        )
+        self.assertEqual((r_sym.returncode, v_sym["stage"], v_sym["reason"]), (1, "lock", "state_dir_symlink"))
+
+        open_state = self.tmp / "open-state"
+        open_state.mkdir(mode=0o755)
+        os.chmod(open_state, 0o755)
+        r_open, v_open = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_STATE_DIR=str(open_state),
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
+        )
+        self.assertEqual((r_open.returncode, v_open["stage"], v_open["reason"]), (1, "lock", "state_dir_not_private"))
+
+        priv_state = self.tmp / "priv-state"
+        priv_state.mkdir(mode=0o700)
+        os.chmod(priv_state, 0o700)
+        victim_file = self.tmp / "victim.txt"
+        victim_file.write_text("DO-NOT-TRUNCATE")
+        (priv_state / "deploy-gate.lock").symlink_to(victim_file)
+        r_lock_sym, v_lock_sym = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_STATE_DIR=str(priv_state),
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
+        )
+        self.assertEqual((r_lock_sym.returncode, v_lock_sym["stage"], v_lock_sym["reason"]), (1, "lock", "lock_file_symlink"))
+        self.assertEqual(victim_file.read_text(), "DO-NOT-TRUNCATE")
+
+        (priv_state / "deploy-gate.lock").unlink()
+        (priv_state / "deploy-gate.lock").write_text("KEEP-BYTES")
+        os.chmod(priv_state / "deploy-gate.lock", 0o600)
+        r_preserve, v_preserve = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_STATE_DIR=str(priv_state),
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
+            FAKE_HOST_VERSION=sha,
+        )
+        self.assertEqual((r_preserve.returncode, v_preserve["ok"]), (0, True))
+        self.assertEqual((priv_state / "deploy-gate.lock").read_text(), "KEEP-BYTES")
+
+    def test_sigterm_during_start_triggers_reconciliation_stop_and_intake_archive(self):
+        sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
+        token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        helper_sha = self.helper_sha256()
+        rel_root, pyz_sha = self.prepare_candidate_release(sha)
+        r, v = self.run_canary(
+            "sigterm_on_start", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
+            FAKE_HOST_VERSION=sha,
+        )
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual((v["ok"], v["stage"], v["reason"]), (False, "start", "terminated_sigterm"))
+        self.assertEqual(v["session_id"], SID)
+        self.assertEqual(v["cleanup"], "stopped")
+        self.assertEqual(v["intake_archived"], True)
+        self.assertFalse((self.tmp / "a_running").exists())
+        self.assertEqual(list((self.state / "pending").glob("*.json")), [])
+
+    def test_prior_unreconciled_pending_start_is_cleaned_up_on_next_run(self):
+        sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
+        token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        helper_sha = self.helper_sha256()
+        rel_root, pyz_sha = self.prepare_candidate_release(sha)
+        self.state.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(self.state, 0o700)
+        pending_dir = self.state / "pending"
+        pending_dir.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(pending_dir, 0o700)
+        prior_file = pending_dir / "prior-sigkilled.json"
+        prior_file.write_text(
+            json.dumps(
+                {
+                    "run_id": "prior-sigkilled",
+                    "mode": "shell",
+                    "name": "hub-canary-shell-prior-sigkilled",
+                    "key": "canary-prior-sigkilled",
+                    "repo": "owner/repo",
+                    "machine": "HOST-1",
+                    "workspace": str((self.tmp / "ws").resolve()),
+                    "prompt": "printf CANARY-OK; sleep 30",
+                    "candidate_sha": sha,
+                    "session_id": SID,
+                    "native_id": NATIVE,
+                }
+            )
+        )
+        os.chmod(prior_file, 0o600)
+        r, v = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
+            FAKE_HOST_VERSION=sha,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(v["ok"])
+        self.assertFalse(prior_file.exists())
+        self.assertIn("sessions stop " + SID + " --key canary-prior-sigkilled-reconcile", self.calls())
+
+    def test_forced_command_wrapper_validates_ssh_original_command_purges_env_and_locks(self):
+        sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
+        token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        helper_sha = self.helper_sha256()
+        rel_root, pyz_sha = self.prepare_candidate_release(sha)
+        lib = self.tmp / "canary-lib"
+        lib.mkdir()
+        for name in ("hub-deploy-gate-forced.sh", "hub-start-canary.sh", "hub_start_canary.py"):
+            dst = lib / name
+            shutil.copy2(ROOT / "scripts" / name, dst)
+            dst.chmod(0o755)
+        # B4: Create a poisoned user site-packages directory under USER_HOME
+        # to prove python3 -I -S never imports user site-packages or .pth files.
+        pyver = f"python{sys.version_info.major}.{sys.version_info.minor}"
+        user_site = self.tmp / ".local" / "lib" / pyver / "site-packages"
+        user_site.mkdir(parents=True, exist_ok=True)
+        poison_marker = self.tmp / "POISONED_USER_SITE_IMPORTED"
+        poison_code = f"import pathlib, sys; pathlib.Path({str(poison_marker)!r}).write_text('pwned'); sys.exit(88)\n"
+        (user_site / "sitecustomize.py").write_text(poison_code)
+        (user_site / "usercustomize.py").write_text(poison_code)
+        (user_site / "evil.pth").write_text(f"import pathlib, sys; pathlib.Path({str(poison_marker)!r}).write_text('pth'); sys.exit(88)\n")
+
+        (lib / ".test-harness.env").write_text(
+            f'USER_HOME="{self.tmp}"\n'
+            f'A_BIN="{sys.executable} -I -S {self.tmp / "fake_a.py"}"\n'
+            f'HOST_RELEASE_ROOT="{rel_root}"\n'
+            f'WORKSPACE_DIR="{self.tmp / "ws"}"\n'
+            f'STATE_DIR="{self.state}"\n'
+            f'DEPLOY_GATE_LOCK_WAIT_S="0"\n'
+            f'EXTRA_ENV=(FAKE_DIR="{self.tmp}" FAKE_SCENARIO="ok" FAKE_HOST_VERSION="{sha}" '
+            f'HUB_CANARY_MACHINE="HOST-1" HUB_CANARY_REPO="owner/repo" '
+            f'HUB_CANARY_POLL_S="0.02" HUB_CANARY_CONVERGE_TIMEOUT_S="0.2" '
+            f'HUB_CANARY_RUNNING_TIMEOUT_S="0.3" HUB_CANARY_CAPTURE_TIMEOUT_S="0.2" '
+            f'HUB_CANARY_STOP_TIMEOUT_S="0.3")\n'
+        )
+        forced = str(lib / "hub-deploy-gate-forced.sh")
+        for bad_cmd in (
+            "",
+            "hub-deploy-gate",
+            f"hub-deploy-gate --candidate-sha {sha} --run-token {token}",
+            f"hub-deploy-gate --candidate-sha {sha} --run-token {token} --helper-sha256 {helper_sha}",
+            f"hub-deploy-gate --candidate-sha {sha} --candidate-cli-sha256 {pyz_sha} --run-token {token} --helper-sha256 {helper_sha}; id",
+            f"hub-deploy-gate --candidate-sha NOT_HEX --candidate-cli-sha256 {pyz_sha} --run-token {token} --helper-sha256 {helper_sha}",
+        ):
+            r = subprocess.run([forced], env={"SSH_ORIGINAL_COMMAND": bad_cmd}, capture_output=True, text=True, timeout=10)
+            self.assertEqual(r.returncode, 2, bad_cmd)
+            v = json.loads(r.stdout.strip())
+            self.assertEqual((v["ok"], v["stage"]), (False, "forced_command"))
+
+        valid_cmd = (
+            f"hub-deploy-gate --candidate-sha {sha} --candidate-cli-sha256 {pyz_sha} "
+            f"--run-token {token} --helper-sha256 {helper_sha}"
+        )
+        r_pos = subprocess.run(
+            [forced, "extra"],
+            env={"SSH_ORIGINAL_COMMAND": valid_cmd},
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(r_pos.returncode, 2)
+
+        # Pass poisoned caller HUB_BIN, PYTHONPATH, PYTHONHOME, andDEPLOY_GATE_TIMEOUT_S=0;
+        # fixed defaults + env -i + python3 -I -S must ignore all of them.
+        r_ok = subprocess.run(
+            [forced],
+            env={
+                "SSH_ORIGINAL_COMMAND": valid_cmd,
+                "HUB_BIN": "/nonexistent/poisoned-by-caller",
+                "PYTHONPATH": str(user_site),
+                "DEPLOY_GATE_TIMEOUT_S": "0",
+            },
+            capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(r_ok.returncode, 0, r_ok.stderr)
+        self.assertFalse(poison_marker.exists())
+        verdict = json.loads(r_ok.stdout.strip())
+        self.assertEqual(verdict["ok"], True)
+        self.assertEqual(verdict["candidate_sha"], sha)
+        self.assertEqual(verdict["run_token"], token)
+        self.assertEqual(verdict["helper_sha256"], helper_sha)
+        self.assertEqual(verdict["hub_pyz_sha256"], pyz_sha)
+        self.assertEqual(verdict["intake_archived"], True)
+
+        # Hold the deploy-gate lock and verify concurrent forced-command execution fails closed.
+        import fcntl
+        lock_fd = os.open(self.state / "deploy-gate.lock", os.O_RDWR)
+        self.addCleanup(os.close, lock_fd)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        r_locked = subprocess.run([forced], env={"SSH_ORIGINAL_COMMAND": valid_cmd}, capture_output=True, text=True, timeout=10)
+        self.assertEqual(r_locked.returncode, 1)
+        v_locked = json.loads(r_locked.stdout.strip())
+        self.assertEqual((v_locked["ok"], v_locked["stage"], v_locked["reason"]), (False, "lock", "deploy_gate_lock_busy"))
+
+    def test_r1_cleanup_and_prior_reconcile_never_match_by_name_or_borrow_unrelated_native_id_and_reject_conflicts(self):
+        from scripts import hub_start_canary as mod
+
+        sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
+        token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        helper_sha = self.helper_sha256()
+        rel_root, pyz_sha = self.prepare_candidate_release(sha)
+        ws = str((self.tmp / "ws").resolve())
+
+        # 1. Same name, different key + failed key replay -> must NEVER stop or archive UNRELATED-SID.
+        r_name, v_name = self.run_canary(
+            "same_name_unrelated_key", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
+            FAKE_HOST_VERSION=sha,
+        )
+        self.assertEqual(r_name.returncode, 1)
+        self.assertEqual(v_name["session_id"], None)
+        self.assertEqual(v_name["cleanup"], "FAILED_needs_reconciliation")
+        self.assertEqual(v_name["intake_archived"], False)
+        self.assertNotIn("sessions stop", self.calls())
+        self.assertNotIn("intake update", self.calls())
+        # Pending file remains on disk because cleanup could not reconcile.
+        for pfile in (self.state / "pending").glob("*.json"):
+            pfile.unlink()
+
+        # 2. Unambiguous client_key alias + matching project/machine/workspace -> recovers SID, stops, archives, clears pending.
+        (self.tmp / "archived_intake").unlink(missing_ok=True)
+        r_ck, v_ck = self.run_canary(
+            "client_key_only_recovery", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
+            FAKE_HOST_VERSION=sha,
+        )
+        self.assertEqual(r_ck.returncode, 1)
+        self.assertEqual(v_ck["session_id"], SID)
+        self.assertEqual(v_ck["cleanup"], "stopped")
+        self.assertEqual(v_ck["intake_archived"], True)
+        self.assertIn("sessions stop " + SID, self.calls())
+        self.assertNotIn("UNRELATED-SID", self.calls())
+        self.assertEqual(list((self.state / "pending").glob("*.json")), [])
+
+        # 3. Conflicting client_key rows (two distinct SIDs for the same key) -> stays FAILED_needs_reconciliation, no stop/archive.
+        (self.tmp / "archived_intake").unlink(missing_ok=True)
+        r_conf, v_conf = self.run_canary(
+            "conflicting_key_rows", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
+            FAKE_HOST_VERSION=sha,
+        )
+        self.assertEqual(r_conf.returncode, 1)
+        self.assertEqual(v_conf["session_id"], None)
+        self.assertEqual(v_conf["cleanup"], "FAILED_needs_reconciliation")
+        self.assertEqual(v_conf["intake_archived"], False)
+        self.assertNotIn("sessions stop", self.calls())
+        self.assertNotIn("intake update", self.calls())
+        for pfile in (self.state / "pending").glob("*.json"):
+            pfile.unlink()
+
+        # 4. Direct unit verification of resolve_owned_session:
+        # Known SID never borrows native_id from an earlier same-name row and rejects conflicting rows.
+        items_borrow_test = [
+            {
+                "id": "UNRELATED-SID",
+                "name": "same-name",
+                "key": "other-key",
+                "project_id": "owner/repo",
+                "machine_id": "HOST-1",
+                "workspace": ws,
+                "native_id": "unrelated-native-must-not-be-borrowed",
+            },
+            {
+                "id": SID,
+                "name": "same-name",
+                "client_key": "expected-key",
+                "project_id": "owner/repo",
+                "machine_id": "HOST-1",
+                "workspace": ws,
+                "native_id": NATIVE,
+            },
+        ]
+        res_sid, res_nat, conflict = mod.Canary.resolve_owned_session(
+            items_borrow_test,
+            expected_sid=SID,
+            expected_key="expected-key",
+            expected_repo="owner/repo",
+            expected_machine="HOST-1",
+            expected_workspace=ws,
+        )
+        self.assertEqual((res_sid, res_nat, conflict), (SID, NATIVE, False))
+
+        # Known SID with another row claiming the same key -> conflict.
+        items_key_hijack = [
+            {
+                "id": "HIJACK-SID",
+                "client_key": "expected-key",
+                "project_id": "owner/repo",
+                "machine_id": "HOST-1",
+                "workspace": ws,
+                "native_id": "hijack-native",
+            },
+            {
+                "id": SID,
+                "client_key": "expected-key",
+                "project_id": "owner/repo",
+                "machine_id": "HOST-1",
+                "workspace": ws,
+                "native_id": NATIVE,
+            },
+        ]
+        self.assertEqual(
+            mod.Canary.resolve_owned_session(
+                items_key_hijack,
+                expected_sid=SID,
+                expected_key="expected-key",
+                expected_repo="owner/repo",
+                expected_machine="HOST-1",
+                expected_workspace=ws,
+            ),
+            (None, None, True),
+        )
+
+        # Unknown SID with mismatched scope (wrong workspace or machine or project) -> conflict.
+        for bad_field in (
+            {"project_id": "wrong/repo"},
+            {"machine_id": "WRONG-HOST"},
+            {"workspace": str(self.tmp / "wrong-ws")},
+            {"key": "disagreeing-key", "client_key": "expected-key"},
+        ):
+            row = {
+                "id": SID,
+                "client_key": "expected-key",
+                "project_id": "owner/repo",
+                "machine_id": "HOST-1",
+                "workspace": ws,
+                "native_id": NATIVE,
+            }
+            row.update(bad_field)
+            self.assertEqual(
+                mod.Canary.resolve_owned_session(
+                    [row],
+                    expected_sid=None,
+                    expected_key="expected-key",
+                    expected_repo="owner/repo",
+                    expected_machine="HOST-1",
+                    expected_workspace=ws,
+                ),
+                (None, None, True),
+                bad_field,
+            )
+
+    def test_r2_directory_fsync_and_durable_pending_publish_before_post_and_durable_unlink(self):
+        import errno
+        from unittest import mock
+        from scripts import hub_start_canary as mod
+
+        sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
+        token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        helper_sha = self.helper_sha256()
+        rel_root, pyz_sha = self.prepare_candidate_release(sha)
+
+        fsynced_dirs = []
+        real_fsync_dir = mod.fsync_dir
+
+        def record_fsync_dir(path):
+            fsynced_dirs.append(pathlib.Path(path).resolve())
+            return real_fsync_dir(path)
+
+        fresh_state = self.tmp / "r2-state" / "nested"
+        fresh_ws = self.tmp / "r2-ws"
+        env_patch = {
+            "HUB_CANARY_STATE_DIR": str(fresh_state),
+            "HUB_CANARY_WORKSPACE": str(fresh_ws),
+            "HUB_CANARY_HOST_RELEASE_ROOT": str(rel_root),
+            "HUB_CANARY_MACHINE": "HOST-1",
+            "HUB_CANARY_REPO": "owner/repo",
+            "HUB_CANARY_POLL_S": "0.02",
+            "HUB_CANARY_CONVERGE_TIMEOUT_S": "0.2",
+            "HUB_CANARY_RUNNING_TIMEOUT_S": "0.3",
+            "HUB_CANARY_CAPTURE_TIMEOUT_S": "0.2",
+            "HUB_CANARY_STOP_TIMEOUT_S": "0.3",
+            "A_BIN": f"{sys.executable} {self.tmp / 'fake_a.py'}",
+            "FAKE_DIR": str(self.tmp),
+            "FAKE_SCENARIO": "ok",
+            "FAKE_HOST_VERSION": sha,
+        }
+
+        with mock.patch.dict(os.environ, env_patch), mock.patch.object(mod, "fsync_dir", side_effect=record_fsync_dir):
+            canary = mod.Canary(
+                "shell",
+                f"{sha[:12]}-{token[:12]}",
+                candidate_sha=sha,
+                candidate_cli_sha256=pyz_sha,
+                run_token=token,
+                expected_helper_sha256=helper_sha,
+            )
+            orig_run = canary.run
+            pending_observed_before_post = []
+
+            def check_pending_before_post(argv, *a, **kw):
+                if argv[4:6] == ["sessions", "start"]:
+                    # At the moment POST (sessions start) is invoked, the pending file
+                    # must already exist on disk and pending_dir must already be fsynced.
+                    pending_observed_before_post.append(
+                        (
+                            canary.pending_path.is_file(),
+                            (fresh_state / "pending").resolve() in fsynced_dirs,
+                        )
+                    )
+                return orig_run(argv, *a, **kw)
+
+            with mock.patch.object(canary, "run", side_effect=check_pending_before_post):
+                verdict = canary.execute()
+
+        self.assertTrue(verdict["ok"], verdict)
+        self.assertEqual(pending_observed_before_post, [(True, True)])
+        self.assertIn(fresh_state.parent.resolve(), fsynced_dirs)
+        self.assertIn(fresh_state.resolve(), fsynced_dirs)
+        self.assertIn((fresh_state / "pending").resolve(), fsynced_dirs)
+        self.assertIn(fresh_ws.resolve(), fsynced_dirs)
+        self.assertFalse(canary.pending_path.exists())
+
+        # Pre-POST fsync failure on pending write must abort BEFORE invoking sessions start.
+        (self.tmp / "calls.log").write_text("")
+        with mock.patch.dict(os.environ, env_patch):
+            canary_fail_pre = mod.Canary(
+                "shell",
+                f"{sha[:12]}-{token[:12]}",
+                candidate_sha=sha,
+                candidate_cli_sha256=pyz_sha,
+                run_token=token,
+                expected_helper_sha256=helper_sha,
+            )
+            with mock.patch.object(
+                canary_fail_pre,
+                "write_pending_state",
+                side_effect=OSError(errno.EIO, "simulated pre-post dir fsync failure"),
+            ):
+                verdict_pre = canary_fail_pre.execute()
+        self.assertEqual(
+            (verdict_pre["ok"], verdict_pre["stage"], verdict_pre["reason"], verdict_pre["cleanup"]),
+            (False, "start", "pending_state_write_failed", "not_needed"),
+        )
+        self.assertFalse(canary_fail_pre.start_attempted)
+        self.assertNotIn("sessions start", self.calls())
+
+        # Directory fsync failure during durable_unlink at cleanup must fail closed.
+        with mock.patch.dict(os.environ, env_patch):
+            canary_fail_unlink = mod.Canary(
+                "shell",
+                f"{sha[:12]}-{token[:12]}",
+                candidate_sha=sha,
+                candidate_cli_sha256=pyz_sha,
+                run_token=token,
+                expected_helper_sha256=helper_sha,
+            )
+            with mock.patch.object(
+                mod,
+                "durable_unlink",
+                side_effect=OSError(errno.EIO, "simulated unlink dir fsync failure"),
+            ):
+                verdict_unlink = canary_fail_unlink.execute()
+        self.assertEqual(
+            (verdict_unlink["ok"], verdict_unlink["stage"], verdict_unlink["reason"], verdict_unlink["cleanup"]),
+            (False, "cleanup", "pending_state_clear_failed", "FAILED_needs_reconciliation"),
+        )
+
+        # R2 retry durability: if Attempt 1 fails during parent/ancestor fsync_dir AFTER
+        # os.mkdir has already created the target directory and its ancestors on disk,
+        # Attempt 2 (hitting the existing-path branch of ensure_private_dir) must still
+        # repair/validate durability across the existing directory and ancestor chain
+        # before POST (and fail closed before POST if fsync_dir still fails on retry).
+        retry_state = self.tmp / "r2-retry-state" / "nested" / "sub"
+        retry_ws = self.tmp / "r2-retry-ws"
+        retry_env = dict(env_patch, HUB_CANARY_STATE_DIR=str(retry_state), HUB_CANARY_WORKSPACE=str(retry_ws))
+        (self.tmp / "calls.log").write_text("")
+
+        def fail_on_parent_fsync_attempt1(path):
+            resolved = pathlib.Path(path).resolve()
+            if resolved == retry_state.parent.resolve() and retry_state.exists():
+                raise OSError(errno.EIO, "simulated parent dir fsync failure after mkdir")
+            return real_fsync_dir(path)
+
+        with mock.patch.dict(os.environ, retry_env), mock.patch.object(
+            mod, "fsync_dir", side_effect=fail_on_parent_fsync_attempt1
+        ):
+            canary_retry_1 = mod.Canary(
+                "shell",
+                f"{sha[:12]}-{token[:12]}",
+                candidate_sha=sha,
+                candidate_cli_sha256=pyz_sha,
+                run_token=token,
+                expected_helper_sha256=helper_sha,
+            )
+            verdict_retry_1 = canary_retry_1.execute()
+        self.assertEqual(
+            (verdict_retry_1["ok"], verdict_retry_1["stage"], verdict_retry_1["reason"], verdict_retry_1["cleanup"]),
+            (False, "lock", "state_dir_create_failed", "not_needed"),
+        )
+        # The directory now already exists on disk from Attempt 1's os.mkdir, even though
+        # its parent/ancestor fsync failed.
+        self.assertTrue(retry_state.is_dir())
+        self.assertNotIn("sessions start", self.calls())
+
+        # Attempt 2a: existing path still fails fsync_dir -> must reject before POST.
+        with mock.patch.dict(os.environ, retry_env), mock.patch.object(
+            mod, "fsync_dir", side_effect=fail_on_parent_fsync_attempt1
+        ):
+            canary_retry_2a = mod.Canary(
+                "shell",
+                f"{sha[:12]}-{token[:12]}",
+                candidate_sha=sha,
+                candidate_cli_sha256=pyz_sha,
+                run_token=token,
+                expected_helper_sha256=helper_sha,
+            )
+            verdict_retry_2a = canary_retry_2a.execute()
+        self.assertEqual(
+            (verdict_retry_2a["ok"], verdict_retry_2a["stage"], verdict_retry_2a["reason"], verdict_retry_2a["cleanup"]),
+            (False, "lock", "state_dir_create_failed", "not_needed"),
+        )
+        self.assertNotIn("sessions start", self.calls())
+
+        # Attempt 2b: existing path retry succeeds -> must fsync the existing directory
+        # and its ancestor leftovers BEFORE POST (sessions start).
+        retry_fsynced_before_post = []
+        retry_fsynced_now = []
+
+        def record_retry_fsync(path):
+            retry_fsynced_now.append(pathlib.Path(path).resolve())
+            return real_fsync_dir(path)
+
+        with mock.patch.dict(os.environ, retry_env), mock.patch.object(
+            mod, "fsync_dir", side_effect=record_retry_fsync
+        ):
+            canary_retry_2b = mod.Canary(
+                "shell",
+                f"{sha[:12]}-{token[:12]}",
+                candidate_sha=sha,
+                candidate_cli_sha256=pyz_sha,
+                run_token=token,
+                expected_helper_sha256=helper_sha,
+            )
+            orig_run_2b = canary_retry_2b.run
+
+            def capture_fsyncs_before_post(argv, *a, **kw):
+                if argv[4:6] == ["sessions", "start"]:
+                    retry_fsynced_before_post.extend(retry_fsynced_now)
+                return orig_run_2b(argv, *a, **kw)
+
+            with mock.patch.object(canary_retry_2b, "run", side_effect=capture_fsyncs_before_post):
+                verdict_retry_2b = canary_retry_2b.execute()
+
+        self.assertTrue(verdict_retry_2b["ok"], verdict_retry_2b)
+        self.assertIn((self.tmp / "r2-retry-state").resolve(), retry_fsynced_before_post)
+        self.assertIn(retry_state.parent.resolve(), retry_fsynced_before_post)
+        self.assertIn(retry_state.resolve(), retry_fsynced_before_post)
+        self.assertIn((retry_state / "pending").resolve(), retry_fsynced_before_post)
+        self.assertIn(retry_ws.resolve(), retry_fsynced_before_post)
+
+        # Real ancestor-symlink alias retry regression (no injected fsync_dir mock needed):
+        # ensure_private_dir(alias/private) where alias -> real-parent must fail closed
+        # before creating real-parent/private on Attempt 1, on retry Attempt 2, and even
+        # if real-parent/private already exists on disk (Attempt 3), never invoking POST.
+        real_parent = self.tmp / "real-parent"
+        real_parent.mkdir(mode=0o700)
+        alias_parent = self.tmp / "alias-parent"
+        alias_parent.symlink_to(real_parent)
+        alias_state = alias_parent / "private"
+        alias_env = dict(env_patch, HUB_CANARY_STATE_DIR=str(alias_state), HUB_CANARY_WORKSPACE=str(retry_ws))
+        (self.tmp / "calls.log").write_text("")
+
+        with mock.patch.dict(os.environ, alias_env):
+            verdict_alias_1 = mod.Canary(
+                "shell",
+                f"{sha[:12]}-{token[:12]}",
+                candidate_sha=sha,
+                candidate_cli_sha256=pyz_sha,
+                run_token=token,
+                expected_helper_sha256=helper_sha,
+            ).execute()
+            self.assertFalse((real_parent / "private").exists())
+            verdict_alias_2 = mod.Canary(
+                "shell",
+                f"{sha[:12]}-{token[:12]}",
+                candidate_sha=sha,
+                candidate_cli_sha256=pyz_sha,
+                run_token=token,
+                expected_helper_sha256=helper_sha,
+            ).execute()
+            (real_parent / "private").mkdir(mode=0o700)
+            verdict_alias_3 = mod.Canary(
+                "shell",
+                f"{sha[:12]}-{token[:12]}",
+                candidate_sha=sha,
+                candidate_cli_sha256=pyz_sha,
+                run_token=token,
+                expected_helper_sha256=helper_sha,
+            ).execute()
+
+        for verdict_alias in (verdict_alias_1, verdict_alias_2, verdict_alias_3):
+            self.assertEqual(
+                (verdict_alias["ok"], verdict_alias["stage"], verdict_alias["reason"], verdict_alias["cleanup"]),
+                (False, "lock", "state_dir_symlink", "not_needed"),
+            )
+        self.assertNotIn("sessions start", self.calls())
+
+    def test_running_retries_transient_native_inventory_changed_409_and_cleans_up_persistent_409(self):
+        # 1. Transient first-list 409 (native_inventory_changed) followed by a valid
+        # complete snapshot must succeed within the SAME running deadline, retaining
+        # the exact session/key and issuing only ONE sessions start (POST).
+        r_ok, v_ok = self.run_canary("transient_inventory_changed_409", "--mode", "shell", "--deploy-gate")
+        self.assertEqual(r_ok.returncode, 0, r_ok.stderr)
+        self.assertEqual(
+            (v_ok["ok"], v_ok["stage"], v_ok["reason"], v_ok["cleanup"], v_ok["session_id"]),
+            (True, None, None, "not_needed", SID),
+        )
+        calls_ok = self.calls().splitlines()
+        self.assertEqual(sum(1 for line in calls_ok if line.startswith("sessions start ")), 1)
+        self.assertEqual(sum(1 for line in calls_ok if line == "sessions list --all --json"), 2)
+
+        # 2. Persistent 409 (native_inventory_changed) churn until running deadline
+        # must time out at running/timeout_native_inventory_changed after retrying
+        # fresh complete listings within the same deadline, never issuing a second POST,
+        # and perform owned cleanup (stop + wait_gone).
+        r_churn, v_churn = self.run_canary(
+            "persistent_inventory_changed_409",
+            "--mode",
+            "shell",
+            "--deploy-gate",
+            HUB_CANARY_RUNNING_TIMEOUT_S="0.25",
+            HUB_CANARY_POLL_S="0.01",
+        )
+        self.assertEqual(r_churn.returncode, 1)
+        self.assertEqual(
+            (v_churn["ok"], v_churn["stage"], v_churn["reason"], v_churn["cleanup"], v_churn["session_id"]),
+            (False, "running", "timeout_native_inventory_changed", "stopped", SID),
+        )
+        calls_churn = self.calls().splitlines()
+        self.assertEqual(sum(1 for line in calls_churn if line.startswith("sessions start ")), 1)
+        self.assertGreaterEqual(sum(1 for line in calls_churn if line == "sessions list --all --json"), 2)
+        self.assertTrue(
+            any(line.startswith(f"sessions stop {SID} --key canary-{v_churn['run_id']}-cleanup") for line in calls_churn)
+        )
+
+        # 3. Non-409 failures (e.g. 401 unauthorized) must still fail immediately and
+        # truthfully without retrying.
+        r_auth, v_auth = self.run_canary("list_auth_401", "--mode", "shell", "--deploy-gate")
+        self.assertEqual(r_auth.returncode, 1)
+        self.assertEqual(
+            (v_auth["ok"], v_auth["stage"], v_auth["reason"], v_auth["cleanup"]),
+            (False, "running", "unauthorized", "stopped"),
+        )
+        calls_auth = self.calls().splitlines()
+        self.assertEqual(sum(1 for line in calls_auth if line.startswith("sessions start ")), 1)
+        self.assertEqual(sum(1 for line in calls_auth if line == "sessions list --all --json"), 1)
 
 
 if __name__ == "__main__":

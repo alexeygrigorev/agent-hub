@@ -198,8 +198,50 @@ if [[ "$HUB_ONLY" != true ]]; then
   systemctl reload caddy 2>/dev/null || systemctl restart caddy
 fi
 
-sleep 3
-systemctl is-active --quiet agent-hub-hub2.service
-curl -fsS --max-time 10 http://127.0.0.1:8787/health
+wait_for_hub2_readiness() {
+  local attempt=0 curl_rc=0 health_body="" max_wait=15 start_seconds deadline remaining max_time
+  if [[ "${AGENT_HUB_DEPLOY_TEST_MODE:-0}" == 1 && "${AGENT_HUB_TEST_READINESS_DEADLINE_S:-}" =~ ^[1-9][0-9]*$ ]]; then
+    max_wait="$AGENT_HUB_TEST_READINESS_DEADLINE_S"
+  fi
+  start_seconds=$SECONDS
+  deadline=$((start_seconds + max_wait))
+  for ((attempt = 1; attempt <= 15; attempt++)); do
+    if ((attempt > 1 && SECONDS >= deadline)); then
+      attempt=$((attempt - 1))
+      break
+    fi
+    if ! systemctl is-active --quiet agent-hub-hub2.service; then
+      printf 'ERROR: agent-hub-hub2.service entered an inactive/failed state on readiness attempt %s/15.\n' "$attempt" >&2
+      return 1
+    fi
+    remaining=$((deadline - SECONDS))
+    if ((remaining < 1)); then
+      remaining=1
+    fi
+    if ((remaining < 3)); then
+      max_time=$remaining
+    else
+      max_time=3
+    fi
+    if health_body="$(curl -fsS --max-time "$max_time" http://127.0.0.1:8787/health 2>&1)"; then
+      printf '%s\n' "$health_body"
+      return 0
+    else
+      curl_rc=$?
+    fi
+    if ((attempt >= 15 || SECONDS >= deadline)); then
+      break
+    fi
+    sleep 1
+  done
+  if ! systemctl is-active --quiet agent-hub-hub2.service; then
+    printf 'ERROR: agent-hub-hub2.service entered an inactive/failed state after %s readiness attempts.\n' "$((attempt > 15 ? 15 : attempt))" >&2
+    return 1
+  fi
+  printf 'ERROR: Hub2 local health check http://127.0.0.1:8787/health did not become ready after %s attempts / %ss (last curl exit=%s): %s\n' "$((attempt > 15 ? 15 : attempt))" "$((SECONDS - start_seconds))" "$curl_rc" "$health_body" >&2
+  return 1
+}
+
+wait_for_hub2_readiness
 echo
 echo "VM setup complete; budget cron retired with the Cloudflare checkers."

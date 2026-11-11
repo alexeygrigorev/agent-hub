@@ -28,6 +28,9 @@ if (( VERIFY )); then
   mkdir -p "$TMP/lib"
   # Rewrite ExecStart to a real file so verify has something to resolve.
   install -m 755 "$REPO_ROOT/scripts/hub-start-canary.sh" "$TMP/lib/hub-start-canary.sh"
+  install -m 755 "$REPO_ROOT/scripts/hub_start_canary.py" "$TMP/lib/hub_start_canary.py"
+  install -m 755 "$REPO_ROOT/scripts/hub-deploy-gate-forced.sh" "$TMP/lib/hub-deploy-gate-forced.sh"
+  bash -n "$TMP/lib/hub-start-canary.sh" "$TMP/lib/hub-deploy-gate-forced.sh"
   for u in "${UNITS[@]}"; do render "$u" | sed "s#$LIB/#$TMP/lib/#" > "$TMP/$u"; done
   systemd-analyze verify "$TMP"/hub-start-canary.service "$TMP"/hub-start-canary.timer \
     "$TMP"/hub-start-canary-full.service "$TMP"/hub-start-canary-full.timer
@@ -40,6 +43,7 @@ id "$RUN_USER" >/dev/null 2>&1 || { echo "user $RUN_USER does not exist" >&2; ex
 install -d -o root -g root -m 755 "$LIB"
 install -o root -g root -m 755 "$REPO_ROOT/scripts/hub-start-canary.sh" "$LIB/hub-start-canary.sh"
 install -o root -g root -m 755 "$REPO_ROOT/scripts/hub_start_canary.py" "$LIB/hub_start_canary.py"
+install -o root -g root -m 755 "$REPO_ROOT/scripts/hub-deploy-gate-forced.sh" "$LIB/hub-deploy-gate-forced.sh"
 for u in "${UNITS[@]}"; do
   render "$u" | install -o root -g root -m 644 /dev/stdin "/etc/systemd/system/$u"
 done
