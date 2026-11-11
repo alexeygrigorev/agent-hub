@@ -3,12 +3,13 @@ import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { ControlDO } from '../src/control-do';
 import worker from '../src/worker';
+import { AccountDO } from '../src/account-do';
 
 const admin = { id: 'human:admin', kind: 'operator', scopes: ['operator:admin'] };
 const machine = { id: 'machine:RMTHZ', kind: 'machine', scopes: ['host'], resource_id: 'RMTHZ' };
 const accessFile = JSON.stringify({ claudeAiOauth: { accessToken: 'synthetic-access-token' } });
 
-function fixture() {
+function fixture(managedAccount?: AccountDO) {
   const database = new DatabaseSync(':memory:');
   let generation = 7;
   const acknowledgements: Array<{ machine: string; generation: number }> = [];
@@ -18,6 +19,7 @@ function fixture() {
     idFromName: (id: string) => id,
     get: () => ({ fetch: async (input: Request | string, init?: RequestInit) => {
       const request = input instanceof Request ? input : new Request(input, init);
+      if (managedAccount) return managedAccount.fetch(request);
       const path = new URL(request.url).pathname;
       if (path === '/_internal/routing') return Response.json({ account: { provider: 'claude', enabled: true, min_remaining: 0 },
         credential_generation: generation, credential_status: 'ready', credential_usable: true, fresh: true,
@@ -189,4 +191,90 @@ test('Hub2 Worker forwards authenticated engine APIs to ControlDO', async () => 
   }), env);
   assert.equal(response.status, 200);
   assert.ok(seen.includes('/api/engines/sync'));
+});
+
+async function maintenanceFixture(options: { expired?: boolean; refuseRefresh?: boolean; refuseQuota?: boolean; missing?: boolean } = {}) {
+  const database = new DatabaseSync(':memory:');
+  const state: any = { storage: { async setAlarm() {}, async deleteAlarm() {}, sql: {
+    exec(query: string, ...args: unknown[]) {
+      const statement = database.prepare(query);
+      const rows = statement.columns().length ? statement.all(...args) : (statement.run(...args), []);
+      return { toArray: () => rows };
+    },
+  }, transactionSync(fn: () => unknown) { database.exec('BEGIN'); try { const value = fn(); database.exec('COMMIT'); return value; }
+    catch (caught) { database.exec('ROLLBACK'); throw caught; } } }, blockConcurrencyWhile: (fn: () => unknown) => Promise.resolve(fn()) };
+  const calls: string[] = [];
+  const account = new AccountDO(state, { HUB2_CREDENTIAL_KEY: 'a'.repeat(64), HUB2_PROVIDER_FETCH: (async (url: string) => {
+    calls.push(url);
+    if (url.endsWith('/token')) return options.refuseRefresh
+      ? Response.json({ error: 'invalid_grant', secret: 'synthetic-provider-secret' }, { status: 400 })
+      : Response.json({ access_token: 'synthetic-new-access', refresh_token: 'synthetic-new-refresh', expires_in: 86400 });
+    assert.ok(url.endsWith('/usage'));
+    return options.refuseQuota ? Response.json({ secret: 'synthetic-provider-secret' }, { status: 429 })
+      : Response.json({ five_hour: { utilization: 20, resets_at: new Date(Date.now() + 3600000).toISOString() },
+        seven_day: { utilization: 30, resets_at: new Date(Date.now() + 86400000).toISOString() } });
+  }) as any });
+  const callAccount = (path: string, method = 'POST', body?: unknown, actor: unknown = admin) => account.fetch(new Request('https://account.test' + path, {
+    method, headers: { 'Content-Type': 'application/json', 'x-hub2-actor': JSON.stringify(actor) },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  }));
+  assert.equal((await callAccount('/api/account', 'PATCH', { provider: 'claude', enabled: true })).status, 200);
+  if (!options.missing) assert.equal((await callAccount('/api/account/credentials', 'PUT', { expected_generation: 0,
+    files: { '.claude/.credentials.json': JSON.stringify({ claudeAiOauth: { accessToken: 'synthetic-old-access',
+      refreshToken: 'synthetic-old-refresh', expiresAt: Date.now() + (options.expired ? -1000 : 86400000) } }) } })).status, 200);
+  return { ...fixture(account), calls, callAccount };
+}
+
+test('operator maintain refreshes centrally, advances generation, and forces fresh quota without exporting secrets', async () => {
+  const f = await maintenanceFixture({ expired: true });
+  const response = await f.call('/api/engines/maintain', 'POST', {});
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { results: [{ label: 'hub-claude', generation: 2, status: 'ready', quota: 'observed' }] });
+  assert.equal(f.calls.filter(url => url.endsWith('/token')).length, 1);
+  assert.equal(f.calls.filter(url => url.endsWith('/usage')).length, 1);
+  await f.call('/api/engines/maintain', 'POST', {});
+  assert.equal(f.calls.filter(url => url.endsWith('/token')).length, 1);
+  assert.equal(f.calls.filter(url => url.endsWith('/usage')).length, 2, 'manual maintenance probes even with cached quota');
+});
+
+test('maintain reports expired credentials independently of the restored HTTP route', async () => {
+  const f = await maintenanceFixture({ expired: true, refuseRefresh: true });
+  const response = await f.call('/api/engines/maintain', 'POST', {});
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { results: [{ label: 'hub-claude', generation: 1, status: 'expired', quota: 'skipped' }] });
+  assert.equal(f.calls.length, 1);
+});
+
+test('maintain reports missing credentials and redacts provider quota refusal bodies', async () => {
+  const missing = await maintenanceFixture({ missing: true });
+  const response = await missing.call('/api/engines/maintain', 'POST', {});
+  assert.deepEqual(await response.json(), { results: [{ label: 'hub-claude', generation: null, status: 'missing', quota: 'skipped' }] });
+  assert.equal(missing.calls.length, 0);
+  const refused = await maintenanceFixture({ refuseQuota: true });
+  const failure = await refused.call('/api/engines/maintain', 'POST', {});
+  assert.equal(failure.status, 200);
+  assert.deepEqual(await failure.json(), { results: [{ label: 'hub-claude', generation: 1, status: 'ready', quota: 'failed', reason: 'quota_http_refused' }] });
+});
+
+test('maintain requires operator authority at both routing and account boundaries', async () => {
+  const f = await maintenanceFixture();
+  for (const actor of [machine, { id: 'agent:test', kind: 'agent', scopes: ['quota:write'] }, undefined]) {
+    const outsider = actor ?? null;
+    assert.equal((await f.call('/api/engines/maintain', 'POST', {}, outsider)).status, 403);
+    assert.equal((await f.callAccount('/api/account/maintain', 'POST', {}, outsider)).status, 403);
+  }
+  assert.equal(f.calls.length, 0);
+  assert.equal((await f.call('/api/engines/maintain')).status, 404, 'GET must not trigger maintenance');
+});
+
+test('public authenticated engine maintain reaches the real ControlDO and AccountDO', async () => {
+  const f = await maintenanceFixture({ expired: true });
+  const token = 'dev-operator-token-that-is-long-enough-for-hub2';
+  const env: any = { HUB2_DEV_OPERATOR_TOKEN: token, CONTROL: { idFromName: (id: string) => id,
+    get: () => ({ fetch: (request: Request) => f.call(new URL(request.url).pathname, request.method, {},
+      JSON.parse(request.headers.get('x-hub2-actor')!)) }) } };
+  const response = await worker.fetch(new Request('https://hub.test/api/engines/maintain', { method: 'POST',
+    headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' }, body: '{}' }), env);
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { results: [{ label: 'hub-claude', generation: 2, status: 'ready', quota: 'observed' }] });
 });
