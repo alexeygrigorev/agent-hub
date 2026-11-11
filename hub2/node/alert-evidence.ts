@@ -15,27 +15,30 @@
 // sentinel. Up to256 immutable chained snapshots are retained per incarnation;
 // no automatic old-generation deletion or mutable current pointer is used.
 // Source owners must manage retention only outside an accepted interval.
-// This is credential_monitor only; the
-// existing PickerControl durable occurrence counter remains its own authority.
+// Diagnostic producers are separate opt-ins; the default credential_monitor
+// enrollment/journal contract remains unchanged. PickerControl stays independent.
 import { constants } from 'node:fs';
 import { open, lstat, type FileHandle } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { isAbsolute, resolve } from 'node:path';
 import { fileURLToPath, URL } from 'node:url';
-import type { CredentialMonitorEvidence, JsonRecord } from '../src/types.ts';
+import type { CredentialMonitorEvidence, JsonRecord, PickerDiagnosticProducer } from '../src/types.ts';
 
 const LIMIT = 131072;
 const MAX_REQUESTS = 128; // Exhaustion is UNKNOWN, never receipt eviction/reset.
 const TIMEOUT_MS = 150;
 const RECIPIENT = 'dev@dtcdev.click';
-const PRODUCER = 'credential_monitor';
+type Producer = 'credential_monitor' | PickerDiagnosticProducer;
+const PRODUCERS: readonly Producer[] = ['credential_monitor', 'picker_excluded', 'picker_quota_stale'];
 const here = fileURLToPath(import.meta.url);
 const requiredArtifacts = [here, fileURLToPath(new URL('./main.ts', import.meta.url)),
   fileURLToPath(new URL('../src/worker.ts', import.meta.url))];
+const diagnosticArtifacts = [...requiredArtifacts, fileURLToPath(new URL('../src/model-picker.ts', import.meta.url)),
+  fileURLToPath(new URL('../src/routing-pool.ts', import.meta.url))];
 type Artifact = { path: string; sha256: string };
 type Enrollment = { kind: string; producer: string; recipient: string; enrollment_id: string;
   source_id: string; release_sha: string; artifacts: Artifact[] };
-type Journal = { kind: string; source_id: string; enrollment_id: string;
+type Journal = { kind: string; producer?: PickerDiagnosticProducer; source_id: string; enrollment_id: string;
   occurrence_count: number; started_total: number; finished_total: number };
 // Test-only IO injection writes an already O_EXCL-opened record; production
 // always uses the default file + directory fsync implementation below.
@@ -108,7 +111,8 @@ class PrivateStore {
     const sequence = this.commits.length + 1;
     const name = `snapshot-${this.boot}-${sequence}.json`;
     const previous = this.commits.at(-1)?.digest ?? hash(this.journalBaseline);
-    const record = {kind: 'hub_credential_monitor_snapshot_v1', controller_id: this.boot,
+    const record = {kind: value.kind === 'hub_credential_monitor_journal_v1'
+      ? 'hub_credential_monitor_snapshot_v1' : 'hub_picker_diagnostic_snapshot_v1', controller_id: this.boot,
       sequence, previous_sha256: previous, journal: value};
     const bytes = canonical(record);
     const handle = await open(this.name(name),
@@ -155,7 +159,9 @@ async function verifyArtifacts(entry: Enrollment, loaded: Record<string, string>
       check(bytesRead === st.size && hash(buffer.subarray(0, bytesRead)) === artifact.sha256);
     } finally { await handle.close(); }
   }
-  check(requiredArtifacts.every(path => paths.has(path) && loaded[path] === entry.artifacts.find(item => item.path === path)?.sha256)
+  const required = entry.producer === 'credential_monitor' ? requiredArtifacts : diagnosticArtifacts;
+  if (entry.producer !== 'credential_monitor') check(entry.artifacts.length === required.length);
+  check(required.every(path => paths.has(path) && loaded[path] === entry.artifacts.find(item => item.path === path)?.sha256)
     && hash(canonical(entry.artifacts)) === entry.source_id);
 }
 
@@ -172,18 +178,22 @@ export class AlertEvidence implements CredentialMonitorEvidence {
     private writer: SnapshotWriter | undefined, private readonly timeoutMs: number,
     private readonly loaded: Record<string, string>) { this.boot = store.boot; }
 
-  static async load(directory: string, options: { loadedArtifacts: Record<string, string>; writer?: SnapshotWriter; timeoutMs?: number }) {
+  static async load(directory: string, options: { loadedArtifacts: Record<string, string>; producer?: Producer; writer?: SnapshotWriter; timeoutMs?: number }) {
+    const producer = options.producer ?? 'credential_monitor';
+    check(PRODUCERS.includes(producer));
+    const diagnostic = producer !== 'credential_monitor';
     const store = await PrivateStore.load(directory);
     try {
       const entry = await store.read('enrollment.json') as Enrollment;
       exact(entry, ['kind', 'producer', 'recipient', 'enrollment_id', 'source_id', 'release_sha', 'artifacts']);
-      check(entry.kind === 'hub_credential_monitor_enrollment_v1' && entry.producer === PRODUCER
+      check(entry.kind === (diagnostic ? 'hub_picker_diagnostic_enrollment_v1' : 'hub_credential_monitor_enrollment_v1') && entry.producer === producer
         && entry.recipient === RECIPIENT && /^[0-9a-f]{32}$/.test(entry.enrollment_id)
         && /^[0-9a-f]{64}$/.test(entry.source_id) && /^[0-9a-f]{40}$/.test(entry.release_sha));
       await verifyArtifacts(entry, options.loadedArtifacts);
       const journal = await store.read('journal.json') as Journal;
-      exact(journal, ['kind', 'source_id', 'enrollment_id', 'occurrence_count', 'started_total', 'finished_total']);
-      check(journal.kind === 'hub_credential_monitor_journal_v1' && journal.source_id === entry.source_id
+      exact(journal, ['kind', 'source_id', 'enrollment_id', 'occurrence_count', 'started_total', 'finished_total', ...(diagnostic ? ['producer'] : [])]);
+      check(journal.kind === (diagnostic ? 'hub_picker_diagnostic_journal_v1' : 'hub_credential_monitor_journal_v1')
+        && (!diagnostic || journal.producer === producer) && journal.source_id === entry.source_id
         && journal.enrollment_id === entry.enrollment_id && integer(journal.occurrence_count)
         && integer(journal.started_total) && integer(journal.finished_total)
         && journal.occurrence_count <= journal.finished_total && journal.finished_total === journal.started_total);
@@ -264,7 +274,7 @@ export class AlertEvidence implements CredentialMonitorEvidence {
       check(stored === version);
     } catch { this.invalidate(); }
     if (this.dirty) return unavailable();
-    return { kind: 'hub_controller_coverage_v1', producer: PRODUCER, recipient: RECIPIENT,
+    return { kind: 'hub_controller_coverage_v1', producer: this.enrollment.producer, recipient: RECIPIENT,
       source_id: this.enrollment.source_id, release_sha: this.enrollment.release_sha, artifact_proof: 'loaded_and_current_v1',
       epoch: hash(this.enrollment.enrollment_id + ':' + this.boot), controller_id: this.boot,
       limitations: [], complete: true, started_total: this.journal.started_total,

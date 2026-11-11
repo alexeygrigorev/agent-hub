@@ -61,11 +61,11 @@ class IngressTests(unittest.TestCase):
         env.update(HOME=str(self.temp),TMPDIR=str(self.temp))
         return env
 
-    def start_node(self, fail=False, port=0):
+    def start_node(self, fail=False, port=0, producer='credential_monitor'):
         directory = self.temp/'node'
         directory.mkdir(exist_ok=True)
         child = subprocess.Popen(['node','--experimental-transform-types',str(ROOT/'hub2/tests/alert-evidence.test.ts'),
-            '--fixture-server',str(directory),'fail' if fail else 'good',str(port)],
+            '--fixture-server',str(directory),'fail' if fail else 'good',str(port),producer],
             stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=self.synthetic_env())
         self.children.append(child)
         with selectors.DefaultSelector() as selection:
@@ -78,7 +78,7 @@ class IngressTests(unittest.TestCase):
         base = 'http://127.0.0.1:' + str(info['port'])
         self.credential.write_text(json.dumps({'base_url':base,'access_token':TOKEN}))
         self.credential.chmod(0o600)
-        self.entry['remote'] = {'kind':'credential_monitor_post_v1','base_url':base,'credential_path':str(self.credential),
+        self.entry['remote'] = {'kind':'credential_monitor_post_v1' if producer=='credential_monitor' else 'picker_diagnostic_v1','base_url':base,'credential_path':str(self.credential),
                                 'source_id':info['source_id'],'release_sha':info['release_sha']}
         return child, info
 
@@ -125,6 +125,36 @@ class IngressTests(unittest.TestCase):
             producers[name]=entry
         evidence.install_enrollment(state,{'kind':'hub_alert_enrollment_v1','recipient':evidence.RECIPIENT,'producers':producers})
         return state
+
+    def test_diagnostic_remote_fetches_actual_node_decision_counters_and_refuses_dead_source(self):
+        for producer in ('picker_excluded', 'picker_quota_stale'):
+            with self.subTest(producer=producer):
+                child, info = self.start_node(producer=producer)
+                before = evidence.remote_witness(producer, self.entry)
+                self.assertEqual(before['occurrence_count'], 0)
+                if producer == 'picker_quota_stale':
+                    self.get('/__fixture/stale')
+                request = urllib.request.Request(self.entry['remote']['base_url'] + '/api/model-picker/pick',
+                    data=b'{}', method='POST', headers={'Authorization':'Bearer '+TOKEN,'Content-Type':'application/json'})
+                with urllib.request.urlopen(request, timeout=3) as response:
+                    body = json.load(response)
+                self.assertTrue(body['excluded'] if producer == 'picker_excluded' else body['warnings'])
+                self.get('/__fixture/idle')  # Test-only explicit durability barrier, no timing guess.
+                after = evidence.remote_witness(producer, self.entry)
+                self.assertEqual(after['producer'], producer)
+                self.assertEqual(after['epoch'], before['epoch'])
+                self.assertEqual(after['occurrence_count'], 1)
+                self.assertEqual(after['started_total'], after['finished_total'])
+                bad = copy.deepcopy(self.entry)
+                bad['remote']['kind'] = 'credential_monitor_post_v1'
+                with self.assertRaises(evidence.EvidenceUnavailable):
+                    evidence.remote_witness(producer, bad)
+                child.kill(); child.wait(timeout=3)
+                with self.assertRaises(evidence.EvidenceUnavailable):
+                    evidence.remote_witness(producer, self.entry)
+                # Preserve this exact old generation rather than resetting it
+                # to fresh zero when the next synthetic server starts.
+                shutil.rmtree(self.temp/'node')
 
     def test_aggregate_actually_fetches_live_remote_and_never_uses_cached_zero(self):
         child,_=self.start_node()

@@ -70,6 +70,23 @@ class AlertEvidenceTests(unittest.TestCase):
         self.assertNotIn('count', result)
         self.assertNotIn('observed_at_ms', result)
 
+    def test_remote_kind_is_bound_to_exact_supported_producer_and_external_mode(self):
+        kinds = {'credential_monitor':'credential_monitor_post_v1',
+                 'picker_excluded':'picker_diagnostic_v1', 'picker_quota_stale':'picker_diagnostic_v1'}
+        for name, kind in kinds.items():
+            entry = {'mode':'external','remote':{'kind':kind,'base_url':'https://hub.example.invalid',
+                     'credential_path':str(self.temp/'not-read.json'),'source_id':'a'*64,'release_sha':'b'*40}}
+            self.assertEqual(evidence.remote_spec(name, entry), entry['remote'])
+            for bad_name in ('picker_control','start_canary','quota_stale','backup','unknown'):
+                with self.subTest(name=name, bad_name=bad_name),self.assertRaises(evidence.EvidenceUnavailable):
+                    evidence.remote_spec(bad_name, entry)
+            for patch in ({'mode':'ledger'}, {'witness_path':str(self.temp/'cached-zero.json')}):
+                with self.subTest(patch=patch),self.assertRaises(evidence.EvidenceUnavailable):
+                    evidence.remote_spec(name, dict(entry, **patch))
+            remote = dict(entry['remote'], kind='picker_diagnostic_v1' if name=='credential_monitor' else 'credential_monitor_post_v1')
+            with self.assertRaises(evidence.EvidenceUnavailable):
+                evidence.remote_spec(name, dict(entry, remote=remote))
+
     def test_missing_state_is_unknown_and_readonly_without_zero_enrollment(self):
         self.unavailable()
         self.assertFalse(self.state.exists())

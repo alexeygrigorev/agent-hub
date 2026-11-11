@@ -124,6 +124,19 @@ const router = {
         return json({kind:'hub_alert_evidence_unavailable_v1',available:false,reason:'coverage_unknown',nonce},
           200, {'Cache-Control':'no-store'});
       }
+      if (path === '/api/model-picker/diagnostic-evidence') {
+        if (!admin(actor)) return error('forbidden', 403);
+        if (request.method !== 'GET') return error('method_not_allowed', 405);
+        const url = new URL(request.url), producer = url.searchParams.get('producer'), nonce = url.searchParams.get('nonce');
+        if (producer !== 'picker_excluded' && producer !== 'picker_quota_stale') return error('invalid_producer', 400);
+        if (!nonce || !/^[0-9a-f]{32}$/.test(nonce)) return error('invalid_nonce', 400);
+        const observer = env.PICKER_DIAGNOSTIC_EVIDENCE?.[producer];
+        try {
+          if (observer) return json(await observerBound(observer.snapshot(nonce)), 200, {'Cache-Control': 'no-store'});
+        } catch { try { observer?.invalidate(); } catch {} }
+        return json({kind: 'hub_alert_evidence_unavailable_v1', available: false, reason: 'coverage_unknown', nonce},
+          200, {'Cache-Control': 'no-store'});
+      }
       if (path === '/api/model-picker/pick')
         return request.method === 'POST' ? await dryRunPick(request, env, actor) : error('method_not_allowed', 405);
       if (path === '/api/fleet/routing/simulate')

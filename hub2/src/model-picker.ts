@@ -1,5 +1,5 @@
 import { HttpError } from './http';
-import type { Hub2Env } from './types';
+import type { CredentialMonitorEvidence, Hub2Env, PickerDiagnosticProducer } from './types';
 import { buildRoutingPool, eligibleCandidates, weightedChoice, type AccountView, type MachineView,
   type RoutingPolicy, type RoutingSnapshot, type PickInput, type PickedRoute, type PickDiagnostics } from './routing-pool';
 export { weightedChoice, buildRoutingPool } from './routing-pool';
@@ -67,11 +67,41 @@ export async function pickModelRoute(env: Hub2Env, input: PickInput, random = Ma
   return (await pickModelRouteDetailed(env, input, random)).route;
 }
 
+/** Optional diagnostics count the existing decisions; primary work never awaits IO. */
+function diagnosticObservation(env: Hub2Env, producer: PickerDiagnosticProducer) {
+  let observer: CredentialMonitorEvidence | undefined, identity: unknown, settled = false;
+  const invalidate = () => { try { observer?.invalidate(); } catch {} };
+  try { observer = env.PICKER_DIAGNOSTIC_EVIDENCE?.[producer]; identity = observer?.begin(); }
+  catch { invalidate(); observer = undefined; }
+  return {
+    complete(alert: boolean) {
+      if (settled) { invalidate(); return; }
+      settled = true;
+      try {
+        // finish updates its memory/queue synchronously, but its durability is
+        // awaited only by the fresh evidence barrier, never by a start/draw.
+        void observer?.finish(identity, alert ? 'alert' : 'observation').catch(invalidate);
+      } catch { invalidate(); }
+    },
+    uncertain() { if (!settled) invalidate(); },
+  };
+}
+
 export async function pickModelRouteDetailed(env: Hub2Env, input: PickInput, random = Math.random): Promise<{route: PickedRoute; diagnostics: PickDiagnostics}> {
-  const {options, diagnostics} = buildRoutingPool(await loadRoutingSnapshot(env, input), input);
-  if (diagnostics.excluded.length) console.error('[hub2] MODEL_PICKER_EXCLUDED alert=dev@dtcdev.click', JSON.stringify(diagnostics.excluded));
-  if (diagnostics.warnings?.length) console.error('[hub2] QUOTA_STALE alert=dev@dtcdev.click', JSON.stringify(diagnostics.warnings));
-  return {route: weightedChoice(options, random), diagnostics};
+  const excluded = diagnosticObservation(env, 'picker_excluded');
+  const quota = diagnosticObservation(env, 'picker_quota_stale');
+  try {
+    const {options, diagnostics} = buildRoutingPool(await loadRoutingSnapshot(env, input), input);
+    excluded.complete(diagnostics.excluded.length > 0);
+    if (diagnostics.excluded.length) console.error('[hub2] MODEL_PICKER_EXCLUDED alert=dev@dtcdev.click', JSON.stringify(diagnostics.excluded));
+    quota.complete(!!diagnostics.warnings?.length);
+    if (diagnostics.warnings?.length) console.error('[hub2] QUOTA_STALE alert=dev@dtcdev.click', JSON.stringify(diagnostics.warnings));
+    return {route: weightedChoice(options, random), diagnostics};
+  } finally {
+    // Unknown input/decision outcomes must not become a clean healthy sample.
+    // Completed decisions remain counted even if weightedChoice later refuses.
+    excluded.uncertain(); quota.uncertain();
+  }
 }
 
 /** One passive observation set; all draws are in memory and cannot advance live counters. */

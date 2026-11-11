@@ -73,6 +73,13 @@ try {
   loadedPrimarySources = Object.fromEntries([fileURLToPath(import.meta.url), join(here, '../src/worker.ts')]
     .map(path => [path, optionalSourceHash(path)]));
 } catch { /* Optional source proof is unavailable; primary imports still run. */ }
+// Separate optional proof: failure here must not disable the credential default.
+let loadedDiagnosticSources: Record<string, string> | undefined;
+try {
+  loadedDiagnosticSources = Object.fromEntries(['model-picker.ts', 'routing-pool.ts']
+    .map(name => { const path = join(here, '../src', name); return [path, optionalSourceHash(path)]; }));
+} catch { /* Diagnostics stay UNKNOWN; primary imports and credential proof continue. */ }
+
 
 const [{ default: entry, ControlDO, ProjectDO, MachineDO, AccountDO, MailboxDO }, { Hub2Runtime }, { assetFetcher }, { loadEnvironment }, { startServer }] =
   await Promise.all([
@@ -100,16 +107,40 @@ const observerLoad = (async () => {
   if (!acceptingObserver) { void observer.close().catch(() => {}); return undefined; }
   return observer;
 })();
+// Attach a timely credential load independently of optional diagnostics.
+void observerLoad.then(value => { if (acceptingObserver) alertEvidence = value; }).catch(() => {});
+const diagnosticEvidence: Partial<Record<import('../src/types.ts').PickerDiagnosticProducer,
+  import('../src/types.ts').CredentialMonitorEvidence>> = {};
+const diagnosticLoad = Promise.all(([
+  ['picker_excluded', envVars.HUB2_PICKER_EXCLUDED_EVIDENCE_DIR],
+  ['picker_quota_stale', envVars.HUB2_PICKER_QUOTA_STALE_EVIDENCE_DIR],
+] as const).map(async ([producer, directory]) => {
+  if (!directory || !loadedPrimarySources || !loadedDiagnosticSources) return;
+  let observer: (import('../src/types.ts').CredentialMonitorEvidence & {close(): Promise<void>}) | undefined;
+  try {
+    // Sharing a state directory between producers is a configuration error,
+    // never permission to double-count one enrollment as another authority.
+    if (directory === envVars.HUB2_ALERT_EVIDENCE_DIR
+        || directory === (producer === 'picker_excluded' ? envVars.HUB2_PICKER_QUOTA_STALE_EVIDENCE_DIR : envVars.HUB2_PICKER_EXCLUDED_EVIDENCE_DIR)) return;
+    const observerPath = join(here, 'alert-evidence.ts');
+    const loadedArtifacts = {...loadedPrimarySources, ...loadedDiagnosticSources,
+      [observerPath]: await optionalObserverHash(observerPath)};
+    const {AlertEvidence} = await import('./alert-evidence.ts');
+    observer = await AlertEvidence.load(directory, {producer, loadedArtifacts});
+    if (!acceptingObserver) { void observer.close().catch(() => {}); return; }
+    diagnosticEvidence[producer] = observer;
+  } catch { /* Optional diagnostics never alter credential/primary availability. */ }
+}));
 let observerTimer: ReturnType<typeof setTimeout> | undefined;
 try {
-  alertEvidence = await Promise.race([observerLoad, new Promise<undefined>(resolve => {
+  await Promise.race([Promise.all([observerLoad.catch(() => undefined), diagnosticLoad]), new Promise<undefined>(resolve => {
     observerTimer = setTimeout(() => resolve(undefined), 250);
   })]);
 } catch { /* No raw error/config/path reaches logs or primary responses. */ }
 finally { acceptingObserver = false; clearTimeout(observerTimer); }
 void observerLoad.then(value => { if (value !== alertEvidence) void value?.close().catch(() => {}); }).catch(() => {});
 const runtimeEnv = { ...envVars, ASSETS: assetFetcher(publicDir, cliReleaseRoot),
-  CREDENTIAL_MONITOR_EVIDENCE: alertEvidence };
+  CREDENTIAL_MONITOR_EVIDENCE: alertEvidence, PICKER_DIAGNOSTIC_EVIDENCE: diagnosticEvidence };
 // Do not serve /health before existing object migrations and recovery finish.
 // This runs before Hub2Runtime starts its alarm sweep.
 mkdirSync(dataDir, { recursive: true });
