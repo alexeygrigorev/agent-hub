@@ -296,21 +296,113 @@ class SchemaInstallConfigurationTests(unittest.TestCase):
             self.assertIn(f'HUB2_ALERT_EVIDENCE_DIR={staged[0]}\n', path.read_text())
 
     def test_helper_refuses_owned_temp_replacement_between_mkdir_and_stat_or_open(self):
-        # Ensure ensure_private_evidence_root never performs fchown/fchmod repair.
+        # Ensure ensure_private_evidence_root never drops process capabilities or switches process euid/egid.
         helper_src = self.block.split('def ensure_private_evidence_root', 1)[1].split('if mode == "active"', 1)[0]
-        self.assertNotIn('fchown', helper_src)
-        self.assertNotIn('fchmod', helper_src)
+        for forbidden in ('capset', 'prctl', 'seteuid', 'setegid', 'fchmod', 'time.sleep'):
+            self.assertNotIn(forbidden, helper_src)
+        self.assertEqual(helper_src.count('os.fchown('), 1)
+        self.assertIn('os.fchown(child_fd, owner_uid, owner_gid)', helper_src)
 
         with tempfile.TemporaryDirectory(dir=self.temporary_root) as temporary:
             base = Path(temporary)
             base.chmod(0o700)
-            repo, _head = self._create_synthetic_checkout(base)
+            repo, head = self._create_synthetic_checkout(base)
             path = base / '.dev.vars'
             original = 'SYNTHETIC_SECRET=keep-private-fixture\nHUB2_RELEASE_MODE=bootstrap\n'
             path.write_text(original)
             path.chmod(0o600)
 
-            for scenario in ('replace_staging_after_mkdir', 'create_leaf_before_publish', 'replace_leaf_after_publish'):
+            # 1. Simulated root execution: parent capabilities remain untouched through _drop_privileges and .dev.vars chown.
+            root_state_dir = base / 'state-simulated-root'
+            root_state_dir.mkdir(mode=0o700)
+            root_evidence = root_state_dir / 'credential-monitor-evidence'
+            trace_file = base / 'root-trace.json'
+            root_harness = (
+                'import json, os, stat, sys\n'
+                f'trace_file = {str(trace_file)!r}\n'
+                'real_fstat = os.fstat\n'
+                'real_lstat = os.lstat\n'
+                'real_stat = os.stat\n'
+                'SERVICE_UID = 4242\n'
+                'SERVICE_GID = 4242\n'
+                'chowned_inodes = set()\n'
+                'events = []\n'
+                'class _StatProxy:\n'
+                '    def __init__(self, st, uid, gid):\n'
+                '        self._st = st\n'
+                '        self.st_uid = uid\n'
+                '        self.st_gid = gid\n'
+                '    def __getattr__(self, name):\n'
+                '        return getattr(self._st, name)\n'
+                'def _wrap_stat(st, force_service=False):\n'
+                '    if force_service or st.st_ino in chowned_inodes:\n'
+                '        return _StatProxy(st, SERVICE_UID, SERVICE_GID)\n'
+                '    return _StatProxy(st, 0, 0)\n'
+                'os.geteuid = lambda: 0\n'
+                'os.getegid = lambda: 0\n'
+                'def fake_lstat(p):\n'
+                '    st = real_lstat(p)\n'
+                '    if str(p) == sys.argv[1]:\n'
+                '        return _wrap_stat(st, force_service=True)\n'
+                '    return _wrap_stat(st)\n'
+                'def fake_stat(p, *, dir_fd=None, follow_symlinks=True):\n'
+                '    st = real_stat(p, dir_fd=dir_fd, follow_symlinks=follow_symlinks)\n'
+                '    return _wrap_stat(st)\n'
+                'def fake_fstat(fd):\n'
+                '    st = real_fstat(fd)\n'
+                '    return _wrap_stat(st)\n'
+                'def fake_fchown(fd, uid, gid):\n'
+                '    st = real_fstat(fd)\n'
+                '    events.append(("fchown", st.st_ino, uid, gid))\n'
+                '    chowned_inodes.add(st.st_ino)\n'
+                'def fake_chown(p, uid, gid):\n'
+                '    events.append(("chown_dev_vars", uid, gid))\n'
+                'def fake_setgroups(groups):\n'
+                '    events.append(("setgroups", list(groups)))\n'
+                'def fake_setresgid(r, e, s):\n'
+                '    events.append(("setresgid", r, e, s))\n'
+                'def fake_setresuid(r, e, s):\n'
+                '    events.append(("setresuid", r, e, s))\n'
+                'os.lstat = fake_lstat\n'
+                'os.stat = fake_stat\n'
+                'os.fstat = fake_fstat\n'
+                'os.fchown = fake_fchown\n'
+                'os.chown = fake_chown\n'
+                'os.setgroups = fake_setgroups\n'
+                'os.setresgid = fake_setresgid\n'
+                'os.setresuid = fake_setresuid\n'
+            ) + self.block + (
+                '\nwith open(trace_file, "w", encoding="utf-8") as tf:\n'
+                '    json.dump(events, tf)\n'
+            )
+            res_root = subprocess.run(
+                [sys.executable, '-', str(path), 'active', 'apply', str(repo), str(root_evidence)],
+                input=root_harness,
+                text=True,
+                capture_output=True,
+                timeout=15,
+            )
+            self.assertEqual(res_root.returncode, 0, res_root.stderr)
+            events = json.loads(trace_file.read_text(encoding='utf-8'))
+            ev_ino = root_evidence.lstat().st_ino
+            self.assertIn(['fchown', ev_ino, 4242, 4242], events)
+            self.assertIn(['chown_dev_vars', 4242, 4242], events)
+            self.assertEqual([e for e in events if e[0].startswith('box')], [])
+            self.assertEqual([p.name for p in root_state_dir.iterdir()], ['credential-monitor-evidence'])
+            staged = list(root_evidence.iterdir())
+            self.assertEqual(len(staged), 1)
+            self.assertTrue(staged[0].name.startswith(head + '-'))
+            path.write_text(original)
+
+            # 2. Race scenarios: replacement of box, replacement of child before fchown, pre-created leaf, post-publish leaf swap.
+            scenarios = (
+                'replace_box_with_service_owned_dir',
+                'replace_child_with_service_owned_dir_before_fchown',
+                'replace_box_entry_before_publish',
+                'create_leaf_before_publish',
+                'replace_leaf_after_publish',
+            )
+            for scenario in scenarios:
                 with self.subTest(scenario=scenario):
                     state_dir = base / f'state-{scenario}'
                     state_dir.mkdir(mode=0o700)
@@ -324,15 +416,51 @@ class SchemaInstallConfigurationTests(unittest.TestCase):
                         f'scenario = {scenario!r}\n'
                         f'state_dir = {str(state_dir)!r}\n'
                         f'pre_existing = {str(pre_existing)!r}\n'
+                        f'pre_ino = {pre_ino!r}\n'
                         'real_mkdir = os.mkdir\n'
                         'real_stat = os.stat\n'
+                        'real_fstat = os.fstat\n'
+                        'real_lstat = os.lstat\n'
                         'published = False\n'
+                        'SERVICE_UID = 4242\n'
+                        'SERVICE_GID = 4242\n'
+                        'service_inodes = {pre_ino}\n'
+                        'fchown_calls = []\n'
+                        'class _StatProxy:\n'
+                        '    def __init__(self, st, uid, gid):\n'
+                        '        self._st = st\n'
+                        '        self.st_uid = uid\n'
+                        '        self.st_gid = gid\n'
+                        '    def __getattr__(self, name):\n'
+                        '        return getattr(self._st, name)\n'
+                        'def _wrap(st, force_service=False):\n'
+                        '    if force_service or st.st_ino in service_inodes:\n'
+                        '        return _StatProxy(st, SERVICE_UID, SERVICE_GID)\n'
+                        '    return _StatProxy(st, 0, 0)\n'
+                        'os.geteuid = lambda: 0\n'
+                        'os.getegid = lambda: 0\n'
+                        'os.lstat = lambda p: _wrap(real_lstat(p), force_service=(str(p) == sys.argv[1]))\n'
+                        'os.fstat = lambda fd: _wrap(real_fstat(fd))\n'
+                        'def fake_fchown(fd, uid, gid):\n'
+                        '    st = real_fstat(fd)\n'
+                        '    fchown_calls.append(st.st_ino)\n'
+                        '    service_inodes.add(st.st_ino)\n'
+                        'os.fchown = fake_fchown\n'
                         'def hooked_mkdir(name, mode=0o777, *, dir_fd=None):\n'
                         '    real_mkdir(name, mode, dir_fd=dir_fd)\n'
-                        '    if isinstance(name, str) and name.startswith(".stage-root-"):\n'
-                        '        if scenario == "replace_staging_after_mkdir":\n'
+                        '    if isinstance(name, str) and name.startswith(".stage-box-"):\n'
+                        '        if scenario == "replace_box_with_service_owned_dir":\n'
                         '            os.rmdir(name, dir_fd=dir_fd)\n'
                         '            os.rename(pre_existing, os.path.join(state_dir, name))\n'
+                        '    elif name == "evidence-root":\n'
+                        '        if scenario == "replace_child_with_service_owned_dir_before_fchown":\n'
+                        '            os.rmdir(name, dir_fd=dir_fd)\n'
+                        '            boxes = [d for d in os.listdir(state_dir) if d.startswith(".stage-box-")]\n'
+                        '            os.rename(pre_existing, os.path.join(state_dir, boxes[0], name))\n'
+                        '        elif scenario == "replace_box_entry_before_publish":\n'
+                        '            boxes = [d for d in os.listdir(state_dir) if d.startswith(".stage-box-")]\n'
+                        '            os.rename(os.path.join(state_dir, boxes[0]), os.path.join(state_dir, boxes[0] + "-moved"))\n'
+                        '            os.rename(pre_existing, os.path.join(state_dir, boxes[0]))\n'
                         '        elif scenario == "create_leaf_before_publish":\n'
                         '            os.rename(pre_existing, os.path.join(state_dir, "credential-monitor-evidence"))\n'
                         'def hooked_stat(path_arg, *, dir_fd=None, follow_symlinks=True):\n'
@@ -341,7 +469,7 @@ class SchemaInstallConfigurationTests(unittest.TestCase):
                         '        published = True\n'
                         '        os.rmdir(os.path.join(state_dir, "credential-monitor-evidence"))\n'
                         '        os.rename(pre_existing, os.path.join(state_dir, "credential-monitor-evidence"))\n'
-                        '    return real_stat(path_arg, dir_fd=dir_fd, follow_symlinks=follow_symlinks)\n'
+                        '    return _wrap(real_stat(path_arg, dir_fd=dir_fd, follow_symlinks=follow_symlinks))\n'
                         'os.mkdir = hooked_mkdir\n'
                         'os.stat = hooked_stat\n'
                     ) + self.block
@@ -356,7 +484,6 @@ class SchemaInstallConfigurationTests(unittest.TestCase):
                     self.assertNotEqual(res.returncode, 0, f'{scenario} should fail closed')
                     self.assertIn('credential_monitor_staging_failed', res.stderr)
                     self.assertEqual(path.read_text(), original)
-                    # Pre-existing directory must never have a boundary staged inside it.
                     if evidence_root.exists():
                         self.assertEqual(evidence_root.lstat().st_ino, pre_ino)
                         self.assertEqual(list(evidence_root.iterdir()), [])
