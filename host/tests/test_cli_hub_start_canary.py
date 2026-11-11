@@ -385,6 +385,8 @@ class CanaryTest(unittest.TestCase):
         for scenario, stage in (("start_slow", "start"), ("late_running", "running"),
                                 ("late_capture", "capture"), ("late_gone", "gone")):
             with self.subTest(scenario=scenario):
+                for p in (self.state / "pending").glob("*.json"):
+                    p.unlink()
                 started = time.monotonic()
                 result, verdict = self.run_canary(scenario, "--mode", "shell")
                 self.assertEqual(result.returncode, 1, verdict)
