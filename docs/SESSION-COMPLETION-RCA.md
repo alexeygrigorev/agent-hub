@@ -106,6 +106,8 @@ Pending actions live in the intake's own `final_evidence.completion`. The existi
 - Every controlled terminal path delivers, including auth-fallback exhaustion and legacy unobserved launches. A continuation keeps the original requester as the assigned actor and is fenced to the attempt it continues.
 - Launch-start failures stay with their existing owners: 06d135ab (explicit-model start `internal_error`) and 8faad246 / 217342ab (Windows `native_launch_unverified`). abf8e6d2 covers the Hub usage audit and recurring start failures. Hub now reports these failures to the owner instead of letting them sit silently.
 
+- Engines receive the prompt as a positional argument (`claude -p … <prompt>`, built by the aplexer task runner outside this repo). A prompt that starts with `-` is parsed as an option, and the engine exits 1 before the task starts. The first live probe (intake 0acaad70) caught this: the continuation preamble began with `--- Hub continuation ---`, both continuations failed with `error: unknown option`, and Hub hit the bound and delivered "NOT finished". Hub-generated prompts now never start with `-`. A user brief that starts with `-` is still exposed until the runner passes `--` before the prompt; that is a follow-up for the runner owner.
+
 ### Linked owners (not duplicated)
 
 - **03ca4ba7 / b38954eb:** `--notify=orin` completion notify. A launcher-level notify. This change delivers inside Hub to the intake owner.
