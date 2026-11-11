@@ -225,7 +225,7 @@ function observed(remaining:number,now=Date.now()){
 test('fresh quota affects weight, but expired quota never preserves stale preference',async()=>{
  const now=Date.now(),other=observed(50,now);
  const fresh=await pickModelRouteDetailed(observationEnv(observed(100,now),other),{interactive:false},()=>0);
- assert.ok(Math.abs(fresh.diagnostics.pool[0].share-2/3)<1e-9);
+ assert.ok(Math.abs(fresh.diagnostics.pool[0].share-(.03+.94*2/3))<1e-9);
  assert.deepEqual(fresh.diagnostics.warnings,[]);
  const stale=await pickModelRouteDetailed(observationEnv({fresh:true,quota:{remaining:100,captured_at:now-31*60000,valid_until:now+60000}},other),{interactive:false},()=>0);
  assert.equal(stale.diagnostics.pool[0].share,0.5);
