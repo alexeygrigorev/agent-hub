@@ -45,6 +45,7 @@ export class AccountDO {
    if(p==='/api/account/hosts')return await this.hosts(request,a);
    if(p==='/api/account/discovery')return await this.discovery(request,a);
    if(p==='/api/account/alerts'&&method==='GET')return this.alerts(request,a);
+   if(p==='/api/account/maintain'&&method==='POST')return await this.maintain(a);
    if(p==='/_internal/routing-snapshot'&&method==='GET')return this.routingView(await this.routingCredentialStatus(true));
    if(p==='/_internal/routing'&&method==='GET'){
     const credential=await this.routingCredentialStatus();
@@ -63,6 +64,20 @@ export class AccountDO {
     if(/^[a-z_]{1,80}$/.test(msg))return error(msg,409);
     return error('internal_error',500);
   }
+ }
+ private async maintain(actor:Actor|undefined):Promise<Response>{
+  if(!hasScope(actor,'operator:admin'))return error('forbidden',403);
+  // Reuse the central refresh lease/CAS path; never export credential files.
+  let credential=await this.routingCredentialStatus();
+  let quota='skipped',reason:string|undefined;
+  if(credential.credential_usable){
+   const response=await this.collect(true,true);
+   quota=response.ok?'observed':'failed';
+   if(!response.ok){const body=await response.json() as {error?:string};reason=body.error;}
+   credential=await this.routingCredentialStatus(true);
+  }
+  const generation=this.db.one<{generation:number}>('SELECT generation FROM credentials WHERE id=1')?.generation??null;
+  return json({generation,status:credential.credential_status,quota,...(reason?{reason}:{})});
  }
  private async routingCredentialStatus(passive=false):Promise<RoutingCredentialStatus>{
   const account=this.db.one<Account>('SELECT * FROM account WHERE id=1');
