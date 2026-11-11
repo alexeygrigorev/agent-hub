@@ -209,7 +209,16 @@ mkdir -p "$TEST_ROOT/seed/config"
 cp "$ROOT/scripts/apply-model-policy.py" "$TEST_ROOT/seed/scripts/apply-model-policy.py"
 cp "$ROOT/scripts/prepare-model-policy-service-credential.py" "$TEST_ROOT/seed/scripts/prepare-model-policy-service-credential.py"
 cp "$ROOT/config/model-policy.json" "$TEST_ROOT/seed/config/model-policy.json"
-git -C "$TEST_ROOT/seed" add deploy/hub.caddy scripts/apply-model-policy.py scripts/prepare-model-policy-service-credential.py config/model-policy.json
+python3 - "$ROOT/deploy/vm/install-hub2-node.sh" "$TEST_ROOT/seed/deploy/vm/install-hub2-node.sh" <<'PY'
+from pathlib import Path
+import sys
+real = Path(sys.argv[1]).read_text(encoding="utf-8")
+start = real.index("wait_for_hub2_readiness() {")
+end = real.index("\necho\n", start)
+with Path(sys.argv[2]).open("a", encoding="utf-8") as dst:
+    dst.write("\n" + real[start:end] + "\n")
+PY
+git -C "$TEST_ROOT/seed" add deploy/hub.caddy deploy/vm/install-hub2-node.sh scripts/apply-model-policy.py scripts/prepare-model-policy-service-credential.py config/model-policy.json
 git -C "$TEST_ROOT/seed" commit -qm 'candidate release'
 git -C "$TEST_ROOT/seed" push -q origin main
 CANDIDATE_SHA="$(git -C "$TEST_ROOT/seed" rev-parse HEAD)"
@@ -320,11 +329,15 @@ pass 'manual rollback restores release, Caddy config, and .dev.vars'
 ORIGINAL_CADDY_SHA256="$(sha256sum "$TEST_ROOT/etc/Caddyfile" | cut -d' ' -f1)"
 : > "$TEST_ROOT/caddy-calls"
 : > "$TEST_ROOT/systemctl-calls"
-run_transaction apply "$CANDIDATE_SHA" active hub-only >/dev/null
+: > "$TEST_ROOT/curl-count"
+: > "$TEST_ROOT/sleep-calls"
+TEST_CURL_FAIL_FIRST=3 run_transaction apply "$CANDIDATE_SHA" active hub-only >/dev/null
 [[ "$(sha256sum "$TEST_ROOT/etc/Caddyfile" | cut -d' ' -f1)" == "$ORIGINAL_CADDY_SHA256" ]] \
   || fail 'Hub-only apply changed the Caddyfile'
 [[ "$(cat "$TEST_ROOT/state/caddy-mode")" == hub-only ]] || fail 'Hub-only transaction mode was not recorded'
 [[ ! -s "$TEST_ROOT/caddy-calls" ]] || fail 'Hub-only apply ran Caddy validation'
+[[ "$(cat "$TEST_ROOT/curl-count")" == 5 ]] || fail 'installer readiness loop did not retry initial connect refusals'
+[[ "$(wc -l < "$TEST_ROOT/sleep-calls")" == 3 ]] || fail 'installer readiness loop did not sleep between connect refusals'
 run_transaction rollback >/dev/null
 [[ "$(git -C "$TEST_ROOT/work" rev-parse HEAD)" == "$PREVIOUS_SHA" ]] || fail 'Hub-only rollback missed old release'
 [[ "$(sha256sum "$TEST_ROOT/etc/Caddyfile" | cut -d' ' -f1)" == "$ORIGINAL_CADDY_SHA256" ]] \
@@ -333,6 +346,22 @@ if grep -Eq '(^| )(reload|restart) caddy($| )' "$TEST_ROOT/systemctl-calls"; the
   fail 'Hub-only apply or rollback reloaded/restarted Caddy'
 fi
 pass 'Hub-only apply and rollback leave the shared Caddy configuration untouched'
+
+: > "$TEST_ROOT/curl-count"
+: > "$TEST_ROOT/sleep-calls"
+if TEST_CURL_FAIL_FIRST=15 run_transaction apply "$CANDIDATE_SHA" active hub-only >/dev/null 2>"$TEST_ROOT/readiness-fail.err"; then
+  fail 'permanent installer readiness failure unexpectedly succeeded'
+fi
+grep -Fq 'ERROR: Hub2 local health check http://127.0.0.1:8787/health did not become ready after 15 attempts (last curl exit=7)' "$TEST_ROOT/readiness-fail.err" \
+  || fail 'permanent installer readiness failure did not log loud diagnostic error'
+[[ "$(git -C "$TEST_ROOT/work" rev-parse HEAD)" == "$PREVIOUS_SHA" ]] \
+  || fail 'permanent installer readiness failure did not restore old release'
+[[ "$(sha256sum "$TEST_ROOT/etc/Caddyfile" | cut -d' ' -f1)" == "$ORIGINAL_CADDY_SHA256" ]] \
+  || fail 'permanent installer readiness failure changed shared Caddyfile'
+[[ ! -e "$TEST_ROOT/state" ]] || fail 'successful readiness rollback retained transaction state'
+[[ "$(cat "$TEST_ROOT/curl-count")" == 16 ]] || fail 'permanent installer readiness failure did not exhaust 15 attempts before rollback health check'
+[[ "$(wc -l < "$TEST_ROOT/sleep-calls")" == 14 ]] || fail 'permanent installer readiness failure did not wait 14 times across 15 attempts'
+pass 'permanent installer readiness failure logs diagnostic and automatically rolls back'
 
 if TEST_NPM_FAIL_ONCE=1 run_transaction apply "$CANDIDATE_SHA" active >/dev/null 2>&1; then
   fail 'dependency installation failure unexpectedly succeeded'

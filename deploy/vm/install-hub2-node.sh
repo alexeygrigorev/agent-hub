@@ -198,8 +198,31 @@ if [[ "$HUB_ONLY" != true ]]; then
   systemctl reload caddy 2>/dev/null || systemctl restart caddy
 fi
 
-sleep 3
-systemctl is-active --quiet agent-hub-hub2.service
-curl -fsS --max-time 10 http://127.0.0.1:8787/health
+wait_for_hub2_readiness() {
+  local attempt curl_rc=0 health_body=""
+  for ((attempt = 1; attempt <= 15; attempt++)); do
+    if ! systemctl is-active --quiet agent-hub-hub2.service; then
+      printf 'ERROR: agent-hub-hub2.service entered an inactive/failed state on readiness attempt %s/15.\n' "$attempt" >&2
+      return 1
+    fi
+    if health_body="$(curl -fsS --max-time 3 http://127.0.0.1:8787/health 2>&1)"; then
+      printf '%s\n' "$health_body"
+      return 0
+    else
+      curl_rc=$?
+    fi
+    if ((attempt < 15)); then
+      sleep 1
+    fi
+  done
+  if ! systemctl is-active --quiet agent-hub-hub2.service; then
+    printf 'ERROR: agent-hub-hub2.service entered an inactive/failed state after 15 readiness attempts.\n' >&2
+    return 1
+  fi
+  printf 'ERROR: Hub2 local health check http://127.0.0.1:8787/health did not become ready after 15 attempts (last curl exit=%s): %s\n' "$curl_rc" "$health_body" >&2
+  return 1
+}
+
+wait_for_hub2_readiness
 echo
 echo "VM setup complete; budget cron retired with the Cloudflare checkers."
