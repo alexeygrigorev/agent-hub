@@ -1031,6 +1031,16 @@ class Canary:
             part = event.get('part')
             if event.get('type') == 'text' and isinstance(part, dict) and marker_in(part.get('text')):
                 return True
+            if (
+                event.get('type') == 'tool_use'
+                and isinstance(part, dict)
+                and part.get('type') == 'tool'
+                and isinstance(part.get('tool'), str)
+                and bool(part.get('tool').strip())
+            ):
+                state = part.get('state')
+                if isinstance(state, dict) and state.get('status') == 'completed' and marker_in(state.get('output')):
+                    return True
         return False
 
     def check_capture(self):

@@ -111,7 +111,9 @@ if args[:2] == ["sessions", "capture"]:
         sys.exit(1)
     if sc == "late_capture": time.sleep(0.5)
     prompt, marker = (d / "prompt").read_text(), (d / "marker").read_text()
-    if sc == "capture_prompt_only": output = "$ " + prompt
+    if (d / "capture_output.txt").exists():
+        output = (d / "capture_output.txt").read_text().replace("__MARKER__", marker)
+    elif sc == "capture_prompt_only": output = "$ " + prompt
     elif sc == "wrapped_prompt_only": output = "Reply CANARY-OK\nand exit"
     elif sc == "capture_empty": output = ""
     elif sc == "json_command_output": output = json.dumps({"type":"item.completed","item":{"type":"command_execution","aggregated_output":marker+"\n","command":"echo"}}) + "\n" + json.dumps({"type":"item.started","item":{"type":"command_execution","command":"sleep 60"}})
@@ -1824,6 +1826,85 @@ class CanaryTest(unittest.TestCase):
                 self.assertTrue(pfile.exists())
                 self.assertEqual([ln for ln in self.calls().splitlines() if ln.startswith("sessions start ")], [])
                 pfile.unlink()
+        (self.tmp / "show_payload.json").unlink(missing_ok=True)
+
+        # 6. @opencode/cli --format json completed tool output (type="tool_use", part.type="tool",
+        # part.state.status="completed", part.state.output with standalone marker) is accepted,
+        # while non-completed tool states, input/rawInput/metadata, and inline assistant summaries are rejected.
+        (self.tmp / "capture_output.txt").write_text(
+            json.dumps(
+                {
+                    "type": "tool_use",
+                    "part": {
+                        "type": "tool",
+                        "tool": "bash",
+                        "state": {
+                            "status": "completed",
+                            "input": {"command": "printf CANARY-OK"},
+                            "output": "__MARKER__\n",
+                        },
+                    },
+                }
+            )
+            + "\n"
+        )
+        r_tool_ok, v_tool_ok = self.run_canary("ok", "--mode", "full")
+        self.assertEqual(r_tool_ok.returncode, 0, r_tool_ok.stderr)
+        self.assertTrue(v_tool_ok["ok"])
+
+        rejected_captures = [
+            # Non-completed tool status must not count even if output has marker
+            json.dumps(
+                {
+                    "type": "tool_use",
+                    "part": {
+                        "type": "tool",
+                        "tool": "bash",
+                        "state": {"status": "running", "output": "__MARKER__\n"},
+                    },
+                }
+            ),
+            # Marker only in input / rawInput / metadata must not count
+            json.dumps(
+                {
+                    "type": "tool_use",
+                    "part": {
+                        "type": "tool",
+                        "tool": "bash",
+                        "state": {
+                            "status": "completed",
+                            "input": {"command": "__MARKER__"},
+                            "rawInput": "__MARKER__",
+                            "metadata": {"stdout": "__MARKER__"},
+                            "output": "done\n",
+                        },
+                    },
+                }
+            ),
+            # Inline assistant summary in plain text (03c67f8d failure mode) must not count
+            "First tool call printed `__MARKER__` as requested.\nSecond tool call (`sleep 60`) completed.",
+            # Inline assistant summary inside tool output must not count
+            json.dumps(
+                {
+                    "type": "tool_use",
+                    "part": {
+                        "type": "tool",
+                        "tool": "bash",
+                        "state": {"status": "completed", "output": "Printed __MARKER__ inline\n"},
+                    },
+                }
+            ),
+        ]
+        for idx, cap_text in enumerate(rejected_captures):
+            with self.subTest(rejected_capture=idx):
+                (self.tmp / "capture_output.txt").write_text(cap_text + "\n")
+                r_rej, v_rej = self.run_canary("ok", "--mode", "full")
+                self.assertEqual(r_rej.returncode, 1)
+                self.assertEqual(
+                    (v_rej["ok"], v_rej["stage"], v_rej["reason"], v_rej["cleanup"]),
+                    (False, "capture", "no_output_beyond_prompt", "stopped"),
+                )
+        (self.tmp / "capture_output.txt").unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
