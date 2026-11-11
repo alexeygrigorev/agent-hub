@@ -774,10 +774,10 @@ export class MachineDO {
       ...(launch[WORKSPACE_BINDING_FIELD]?{workspace_binding:launch[WORKSPACE_BINDING_FIELD]}:{}),
       ...(launchFailed?{launch_failed:true}:{}),
       ...(failureNotification?{after_notification:failureNotification.id}:{}),
-      // Freeze Machine-owned intent before forwarding. A later STOP ACK must
-      // not change this finish receipt, and host flags cannot create intent.
+      // An accepted STOP remains intent even if its ACK failed or timed out.
+      // Freeze it before forwarding; this is never proof of STOP confirmation.
       stop_requested:!!this.db.one(`SELECT id FROM session_commands WHERE session_id=? AND machine_id=? AND epoch=?
-        AND kind='stop' AND state='pending' LIMIT 1`,row.id,row.machine_id,row.epoch),
+        AND kind='stop' LIMIT 1`,row.id,row.machine_id,row.epoch),
       exit_code: Number(body.exit_code), native_exit_confirmed: true, evidence, evidence_digest: evidenceDigest };
     if (lateLost) {
       if (row.evidence_digest !== null) return row.evidence_digest===evidenceDigest
