@@ -1715,3 +1715,142 @@ def test_antigravity_home_is_seeded_past_theme_and_data_sharing_prompts(tmp_path
     other = tmp_path / 'other'
     p.provision_managed_home(dict(b, provider='codex'), other, tmp_path)
     assert not (other / p.ANTIGRAVITY_ONBOARDING).exists()
+
+
+@pytest.mark.parametrize('fail_install',[False,True])
+def test_scoped_native_sync_preserves_unrelated_files_profiles_and_state(tmp_path, monkeypatch,fail_install):
+    from agent_hub_host import engine_login
+    monkeypatch.setenv('AGENT_HUB_MANAGED_DIR', str(tmp_path / 'managed'))
+    target = dict(label='hub-claude', provider='claude', version='2.1.39', revision='33333333-3333-4333-8333-333333333333',
+                  credential_generation=5, files={'.claude/.credentials.json': '{}'}, env={}, args=[])
+    other = bundle()
+    p.root().mkdir(mode=0o700)
+    previous = [{'label': b['label'], 'revision': b['revision'], 'provider': b['provider']} for b in [other, target]]
+    p.write_json(p.root() / 'state.json', previous)
+    unrelated = p.root() / (other['label'] + '-' + other['revision'])
+    unrelated.mkdir(); (unrelated / 'keep.bin').write_bytes(b'unrelated exact bytes')
+    p.profiles([other, target])
+    text = p.profile_path().read_text()
+    unrelated_block = text.split('[profiles.hub-test-account]')[1].split('[profiles.hub-hub-claude]')[0]
+    state_before = (p.root() / 'state.json').read_bytes()
+    calls = []
+    def request(method, path, payload=None):
+        calls.append((method, path, payload))
+        return {'engines': [target], 'logins': [{'id': 'unrelated-login'}]} if method == 'GET' else {}
+    def install(b, request=None, **kw):
+        assert b['label'] == 'hub-claude' and kw['credential_generation'] == 5
+        dest = p.root() / (b['label'] + '-' + b['revision']); dest.mkdir(mode=0o700,exist_ok=True)
+        if fail_install:
+            raise RuntimeError('synthetic interrupted target installation')
+        p.write_json(dest / 'bundle.json', {'label': b['label']})
+    monkeypatch.setattr(p, 'install', install)
+    monkeypatch.setattr(engine_login, 'cancel_removed', lambda *a: pytest.fail('must not cancel unrelated login'))
+    monkeypatch.setattr(engine_login, 'tick', lambda *a: pytest.fail('must not tick login'))
+    if fail_install:
+        with pytest.raises(RuntimeError,match='interrupted target'):
+            p.sync(request,target_label='hub-claude',expected_generation=5)
+        assert (unrelated/'keep.bin').read_bytes()==b'unrelated exact bytes'
+        assert (p.root()/'state.json').read_bytes()==state_before
+        assert p.profile_path().read_text()==text
+        assert not any(method=='POST' for method,path,payload in calls)
+        return
+    result = p.sync(request, target_label='hub-claude', expected_generation=5)
+    assert result['profiles'] == ['hub-hub-claude']
+    assert (unrelated / 'keep.bin').read_bytes() == b'unrelated exact bytes'
+    assert (p.root() / 'state.json').read_bytes() == state_before
+    assert unrelated_block in p.profile_path().read_text()
+    assert '[profiles.hub-hub-claude]' in p.profile_path().read_text()
+    config_after=p.profile_path().read_bytes()
+    p.sync(request,target_label='hub-claude',expected_generation=5)
+    assert p.profile_path().read_bytes()==config_after
+    assert (p.root() / 'state.json').read_bytes()==state_before
+    reports = [payload for method, path, payload in calls if path == '/api/engines/sync-report']
+    assert reports[-1]['items'][0]['credential_generation'] == 5
+
+
+def test_scoped_sync_rejects_identity_or_refresh_lease_before_any_write(tmp_path, monkeypatch):
+    monkeypatch.setenv('AGENT_HUB_MANAGED_DIR', str(tmp_path / 'untouched'))
+    base = dict(label='hub-claude',provider='claude',version='2.1.39',revision='33333333-3333-4333-8333-333333333333',credential_generation=5,
+                files={'.claude/.credentials.json':'{}'},env={},args=[])
+    monkeypatch.setattr(p,'install',lambda *a,**kw:pytest.fail('must not install'))
+    for changes in [{'credential_generation':4},{'credential_generation':6},{'refresh_lease':True},{'label':'other'}]:
+        value=dict(base,**changes)
+        with pytest.raises(ValueError):
+            p.sync(lambda *a:{'engines':[value]},target_label='hub-claude',expected_generation=5)
+        assert not p.root().exists()
+
+
+def test_scoped_claude_install_materializes_exact_generation_without_refresh(tmp_path, monkeypatch):
+    from agent_hub_host import credentials
+    monkeypatch.setenv('AGENT_HUB_MANAGED_DIR',str(tmp_path / 'managed'))
+    value=dict(label='hub-claude',provider='claude',version='2.1.39',revision='33333333-3333-4333-8333-333333333333',credential_generation=5,
+               credential_paths=['.claude/.credentials.json'],files={'.claude/.credentials.json':'{}'},env={},args=[])
+    def install(argv,**kwargs):
+        if '--prefix' in argv:
+            system='win32' if os.name=='nt' else sys.platform
+            cpu={'x86_64':'x64','amd64':'x64','aarch64':'arm64','arm64':'arm64'}[p.platform.machine().lower()]
+            musl='-musl' if system=='linux' and p.platform.libc_ver()[0]=='musl' else ''
+            package=Path(argv[argv.index('--prefix')+1])/('node_modules/@anthropic-ai/claude-code-'+system+'-'+cpu+musl)
+            package.mkdir(parents=True)
+            (package/'package.json').write_text(json.dumps({'version':value['version']}))
+            exe=package/('claude.exe' if system=='win32' else 'claude')
+            exe.write_text('#!/bin/sh\nexit 0\n');exe.chmod(0o700)
+        return subprocess.CompletedProcess(argv,0)
+    monkeypatch.setattr(p.subprocess,'run',install)
+    monkeypatch.setattr(p,'resolve_npm_command',lambda:['synthetic-npm'])
+    monkeypatch.setattr(credentials,'leased_refresh',lambda *a,**kw:pytest.fail('must not refresh'))
+    p.install(value,lambda *a:pytest.fail('no credential writeback'),credential_generation=5)
+    dest=p.root()/(value['label']+'-'+value['revision'])
+    assert json.loads((dest/credentials.STATE_FILE).read_text())['generation']==5
+    assert (dest/'home/.claude/.credentials.json').read_text()=='{}'
+    # A same-generation resume uses the existing engine and remains refresh-free.
+    p.install(value,lambda *a:pytest.fail('no credential writeback'),credential_generation=5)
+
+
+@pytest.mark.skipif(os.name=='nt',reason='POSIX flock contract; Windows bounded lock tests are separate')
+def test_scoped_posix_lock_timeout_is_bounded(tmp_path,monkeypatch):
+    import time
+    monkeypatch.setenv('AGENT_HUB_MANAGED_DIR',str(tmp_path/'managed'))
+    p.root().mkdir(mode=0o700)
+    code="import os,fcntl,sys,time; f=os.open(sys.argv[1],os.O_CREAT|os.O_RDWR,0o600); fcntl.flock(f,fcntl.LOCK_EX); print('ready',flush=True); time.sleep(30)"
+    child=subprocess.Popen([sys.executable,'-c',code,str(p.root()/'reconcile.lock')],stdout=subprocess.PIPE,text=True)
+    try:
+        assert child.stdout.readline().strip()=='ready'
+        start=time.monotonic()
+        with pytest.raises(TimeoutError,match='lock timeout'):
+            with p.lock(timeout=0.05,bounded=True):pytest.fail('must not enter')
+        assert time.monotonic()-start<1
+    finally:
+        child.terminate();child.wait(timeout=5);child.stdout.close()
+
+
+def test_scoped_state_keeps_unrelated_raw_bytes_on_revision_change(tmp_path):
+    path=tmp_path/'state.json'
+    other=' { "label" : "keep", "revision" : "preserve exact whitespace", "extra" : [1, 2] } '
+    raw='[\n'+other+',\n {"label":"hub-claude","revision":"old","provider":"claude"}\n]\n'
+    path.write_text(raw);path.chmod(0o600)
+    snapshot,previous=p.scoped_state_snapshot(path)
+    item={'label':'hub-claude','revision':'new','provider':'claude'}
+    p.write_scoped_state(path,snapshot,previous,item)
+    assert other in path.read_text()
+    assert json.loads(path.read_text())[1]==item
+    before=path.read_bytes()
+    snapshot,previous=p.scoped_state_snapshot(path)
+    p.write_scoped_state(path,snapshot,previous,item)
+    assert path.read_bytes()==before
+    snapshot,previous=p.scoped_state_snapshot(path)
+    path.write_text('[]')
+    with pytest.raises(ValueError,match='changed during scoped'):
+        p.write_scoped_state(path,snapshot,previous,dict(item,revision='different'))
+    assert path.read_text()=='[]'
+
+
+@pytest.mark.skipif(os.name=='nt',reason='POSIX flock contract')
+def test_scoped_lock_does_not_change_existing_start_lock_behavior(tmp_path,monkeypatch):
+    import fcntl
+    monkeypatch.setenv('AGENT_HUB_MANAGED_DIR',str(tmp_path/'managed'))
+    operations=[]
+    monkeypatch.setattr(fcntl,'flock',lambda fd,operation:operations.append(operation))
+    with p.lock(timeout=2):pass
+    with p.lock(timeout=2,bounded=True):pass
+    assert operations==[fcntl.LOCK_EX,fcntl.LOCK_EX|fcntl.LOCK_NB]

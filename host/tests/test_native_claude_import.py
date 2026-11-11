@@ -89,9 +89,9 @@ class NativeImportTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'Native Claude home required'):
                 n.collect()
 
-    def run_command(self, *, incoming=5, receipt=5, ack=5, central=5, fail_upload=False, fail_sync=False, fail_verify=False):
+    def run_command(self, *, incoming=5, receipt=5, ack=5, central=5, current=4, lease=False, fail_upload=False, fail_sync=False, fail_verify=False):
         calls = []
-        before = {'credentials': [{'label': 'hub-claude', 'generation': 4, 'hosts': ['test-host']}]}
+        before = {'credentials': [{'label': 'hub-claude', 'generation': current, 'hosts': ['test-host']}]}
         after = {'sync_status': [{'machine_id': 'test-host', 'accounts': [{'label': 'hub-claude', 'credential_generation': central, 'acked_generation': ack}]}]}
         def transport(req):
             method, path = req.get_method(), urllib.parse.urlsplit(req.full_url).path
@@ -101,7 +101,7 @@ class NativeImportTest(unittest.TestCase):
             host_path = path in ('/api/engines/sync', '/api/engines/hub-claude', '/api/engines/sync-report')
             self.assertEqual(req.get_header('Authorization'), 'Bearer synthetic-host-token' if host_path else 'Bearer synthetic-operator-token')
             if host_path:
-                return {'engines': [{'label': 'hub-claude', 'credential_generation': incoming}], 'logins': [{'id': 'do-not-complete'}]}
+                return {'engines': [{'label': 'hub-claude', 'credential_generation': incoming,'refresh_lease':lease}], 'logins': [{'id': 'do-not-complete'}]}
             if method == 'GET':
                 if fail_verify and len(calls) > 1:
                     raise OSError('synthetic-private-provider-output')
@@ -111,7 +111,8 @@ class NativeImportTest(unittest.TestCase):
             self.assertEqual(payload['expected_generation'], 4)
             self.assertNotIn('must-not-import', repr(payload))
             return {'credential_generation': receipt}
-        def reconcile(request):
+        def reconcile(request, **kwargs):
+            self.assertEqual(kwargs, {'target_label': 'hub-claude', 'expected_generation': receipt, 'lock_timeout': 30})
             if fail_sync:
                 raise OSError('synthetic-private-provider-output')
             response = request('GET', '/api/engines/sync')
@@ -133,6 +134,27 @@ class NativeImportTest(unittest.TestCase):
         self.assertEqual(result['acked_generation'], 5)
         self.assertNotIn('synthetic', repr(result))
         self.assertEqual([call[0] for call in self.calls], ['GET', 'POST', 'GET', 'POST', 'POST', 'GET'])
+
+    def test_resume_saved_generation_never_reads_native_or_uploads(self):
+        self.args.resume_generation=5
+        with patch.object(n,'collect',side_effect=AssertionError('no native credential read')):
+            result=self.run_command(current=5)
+        self.assertEqual(result['status'],'resumed');self.assertEqual(result['acked_generation'],5)
+        self.assertNotIn('/api/engines/import-native',[path for method,path,payload in self.calls])
+
+    def test_resume_generation_mismatch_fails_before_collect_or_sync(self):
+        self.args.resume_generation=5
+        with patch.object(n,'collect',side_effect=AssertionError('no native read')):
+            with self.assertRaisesRegex(ValueError,'does not match current'):
+                self.run_command(current=6)
+        self.assertFalse(self.sync_called)
+
+    def test_scoped_sync_rejects_newer_generation_and_lease(self):
+        for flags in [{'incoming':6},{'lease':True}]:
+            with self.subTest(flags=flags):
+                with self.assertRaisesRegex(ValueError,'saved at generation 5'):
+                    self.run_command(**flags)
+                self.assertFalse(any(method=='POST' and path in ('/api/engines/hub-claude','/api/engines/sync-report') for method,path,payload in self.calls))
 
     def test_stale_upload_never_syncs(self):
         with self.assertRaisesRegex(ValueError, 'generation_conflict'):
@@ -327,3 +349,12 @@ class NativeImportTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class NativeImportParserTest(unittest.TestCase):
+    def test_saved_generation_flag_stays_on_existing_command(self):
+        parser=argparse.ArgumentParser()
+        p.add_commands(parser.add_subparsers(dest='command'))
+        args=parser.parse_args(['engines','import-native','--provider','claude','--label','hub-claude','--resume-generation','5'])
+        self.assertEqual(args.engines_cmd,'import-native')
+        self.assertEqual(args.resume_generation,5)
