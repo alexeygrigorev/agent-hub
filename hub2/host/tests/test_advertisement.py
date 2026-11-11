@@ -28,9 +28,14 @@ class AdvertisementTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 Advertisement([self.root], value)
         for value in [{'home': str(self.home), 'HOME': str(self.home)}, {'../home': str(self.home)},
-                      {'home': str(self.root.parent)}, {'home': 'relative'}, []]:
+                      {'home': 'relative'}, []]:
             with self.subTest(value=value), self.assertRaises(ValueError):
                 Advertisement([self.root], [], value)
+        # Outside-allowlist identity is retained but never advertised or launched.
+        escaped = Advertisement([self.root], [], {'home': str(self.root.parent)})
+        self.assertEqual(escaped.tags(), [])
+        with self.assertRaises(ValueError):
+            escaped.resolve_alias('home')
 
     def test_deleted_or_retargeted_alias_is_never_advertised_or_launched(self):
         link = self.root / 'alias'
@@ -46,15 +51,33 @@ class AdvertisementTests(unittest.TestCase):
             observed.resolve_alias('home')
         link.unlink()
         self.assertEqual(observed.tags(), [])
-        with self.assertRaises(OSError):
+        with self.assertRaises(ValueError):
             observed.resolve_alias('home')
 
+
+    def test_missing_alias_directory_keeps_bridge_alive_and_refuses_only_that_alias(self):
+        missing = self.root / 'deleted-alias'
+        bridge = self.bridge(workspaces={'home': str(missing)}, capabilities=['browser:orin-chrome'])
+        (self.root / 'home').mkdir()  # basename candidate must not win while the alias is enrolled
+        self.assertEqual(bridge.advertisement.workspaces, {'home': str(missing)})
+        self.assertEqual(bridge.advertisement.tags(), ['browser:orin-chrome'])
+        with self.assertRaisesRegex(ValueError, 'workspace_unavailable'):
+            bridge.resolve_workspace('home')
+        other = self.root / 'other'
+        other.mkdir()
+        self.assertEqual(bridge.resolve_workspace('other'), other)
+        bridge.heartbeat(['desktop'], include_native_sessions=False)
+        tags = bridge.client.heartbeat.call_args.args[2]
+        self.assertIn('browser:orin-chrome', tags)
+        self.assertNotIn('workspace:home', tags)
 
     def test_alias_must_be_directory_and_capacity_is_bounded(self):
         file = self.root / 'file'
         file.write_text('synthetic')
+        observed = Advertisement([self.root], [], {'home': str(file)})
+        self.assertEqual(observed.tags(), [])
         with self.assertRaises(ValueError):
-            Advertisement([self.root], [], {'home': str(file)})
+            observed.resolve_alias('home')
         with self.assertRaises(ValueError):
             Advertisement([self.root], ['tool:item' + str(i) for i in range(32)], {'home': str(self.home)})
 
@@ -86,8 +109,11 @@ class AdvertisementTests(unittest.TestCase):
         legacy.heartbeat([], include_native_sessions=False)
         self.assertNotIn('workspace:home', legacy.client.heartbeat.call_args.args[2])
 
-    def test_resource_observations_are_never_silently_truncated(self):
+    def test_capability_overflow_still_connects_and_preserves_accepted_tags(self):
         bridge = self.bridge(capabilities=['tool:item' + str(i) for i in range(31)])
-        with self.assertRaisesRegex(ValueError, 'advertisement_capacity_exceeded'):
-            bridge.heartbeat([], include_native_sessions=False)
-        bridge.client.heartbeat.assert_not_called()
+        bridge.heartbeat(['desktop'], include_native_sessions=False)
+        bridge.client.heartbeat.assert_called()
+        tags = bridge.client.heartbeat.call_args.args[2]
+        self.assertEqual(len(tags), 32)
+        self.assertTrue({'tool:item' + str(i) for i in range(31)} <= set(tags))
+        self.assertIn('headless', tags)

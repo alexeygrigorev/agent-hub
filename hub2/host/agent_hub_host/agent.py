@@ -990,9 +990,11 @@ class Bridge:
         capabilities=['headless']+[cap+':'+engine for engine in engines for cap in sorted(available[engine]-{'headless'})]
         advertisement = getattr(self, 'advertisement', None)
         resource_tags = advertisement.tags() if advertisement is not None else []
-        capabilities = list(dict.fromkeys(capabilities + resource_tags))
-        if resource_tags and len(capabilities) > 32:
-            raise ValueError('advertisement_capacity_exceeded')
+        # Accepted configuration leads the payload: when derived engine hints
+        # overflow the 32-slot heartbeat they are shed by the bound below,
+        # never an accepted tag, and never with an exception before the
+        # socket/heartbeat connection.
+        capabilities = list(dict.fromkeys(resource_tags + capabilities))
         configuration = getattr(self.launcher, 'config', {})
         if not configuration.get('private_provider_homes', False):
             # Execution-source hints only, never login/account health proof.
