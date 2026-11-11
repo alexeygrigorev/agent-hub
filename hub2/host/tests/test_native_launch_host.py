@@ -241,6 +241,43 @@ class TombstoneTest(unittest.TestCase):
         path.write_text(json.dumps(base))
         return str(Path(tmp) / '.local' / 'state' / 'aplexer'), base
 
+    def test_unmanaged_stop_deleted_or_recreated_workspace_uses_only_exact_positive_tombstone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = str(Path(tmp) / 'gone')
+            native_id = 'd6cf9872-8597-48a5-be64-990cdef4db31'
+            exit_info = {'code': 0, 'signal': None, 'exited_at_ms': round(time.time()*1000)-1000}
+            state_dir, _ = self.tombstone(tmp, native_id=native_id, workspace=workspace + ' (deleted)', exit=exit_info)
+            calls = []
+            def runner(*args, **kw):
+                calls.append(args)
+                raise AssertionError('no live native call for positive retirement')
+            adapter = nl.NativeLauncher({'routes': {}, 'aplexer_state_dir': state_dir}, runner=runner)
+            command = {'kind': 'stop', 'native_id': native_id,
+                       'identity': {'id': native_id, 'tag': 'task-t1', 'workspace': workspace},
+                       'deadline_ms': round(time.time()*1000)+60000}
+            for recreated in (False, True):
+                if recreated:
+                    Path(workspace).mkdir()
+                result = adapter.native_control(command)
+                self.assertTrue(result['stopped'])
+                self.assertEqual(result['evidence']['workspace'], workspace)
+                self.assertEqual(result['evidence']['source'], 'aplexer_retirement')
+            self.assertEqual(calls, [])
+            with self.assertRaisesRegex(RuntimeError, 'workspace_unavailable'):
+                adapter.native_control({**command, 'identity': {**command['identity'], 'workspace': str(Path(tmp)/'other')}})
+            self.assertEqual(calls, [])
+
+    def test_unmanaged_stop_absence_never_proves_exit_and_capture_does_not_guess_deleted_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = str(Path(tmp) / 'gone')
+            calls = []
+            adapter = nl.NativeLauncher({'routes': {}, 'aplexer_state_dir': tmp}, runner=lambda *a, **k: calls.append(a))
+            for kind in ('stop', 'capture'):
+                with self.assertRaisesRegex(RuntimeError, 'workspace_unavailable'):
+                    adapter.native_control({'kind': kind, 'native_id': 'd6cf9872-8597-48a5-be64-990cdef4db31',
+                        'identity': {'tag': 'peer', 'workspace': workspace}, 'deadline_ms': round(time.time()*1000)+60000})
+            self.assertEqual(calls, [])
+
     def test_read_verify_and_native_adapter(self):
         with tempfile.TemporaryDirectory() as tmp:
             state_dir, document = self.tombstone(tmp)

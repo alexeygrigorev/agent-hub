@@ -3,7 +3,7 @@
   "bridge": true,
   "schemas": {
     "CONTROL": {"min_read": 1, "max_read": 6, "bridge_write": 4, "active_write": 6},
-    "MACHINES": {"min_read": 1, "max_read": 8, "bridge_write": 7, "active_write": 8},
+    "MACHINES": {"min_read": 1, "max_read": 9, "bridge_write": 8, "active_write": 9},
     "PROJECTS": {"min_read": 4, "max_read": 4, "bridge_write": 4, "active_write": 4},
     "ACCOUNTS": {"min_read": 1, "max_read": 2, "bridge_write": 2, "active_write": 2},
     "MAILBOXES": {"min_read": 1, "max_read": 1, "bridge_write": 1, "active_write": 1}

@@ -67,11 +67,18 @@ test('UUID join, pagination, history and managed cap projection remain distinct'
  assert.equal((f.db.prepare("SELECT native_id FROM sessions WHERE id='managed'").get() as any).native_id,managed.id);f.db.close();
 });
 test('defer7 has no census DDL, migration8 and bridge reopening preserve observations',async()=>{
- const f=fixture('defer');await f.boot();assert.equal((f.db.prepare('SELECT version FROM hub2_schema').get() as any).version,7);
+ const f=fixture('defer');await f.boot();
+ // A faithful already-running schema7 bridge: remove ALL schema8 DDL and
+ // restore both persisted metadata and the constructor's recorded version.
+ f.db.exec('DROP TABLE native_inventory_meta; DROP TABLE native_inventory_rows; DROP TABLE native_inventory_upload; DROP TABLE native_inventory_chunks; UPDATE hub2_schema SET version=7');
+ (f.machine as any).db.schemaVersion=7;(f.machine as any).db.cache.clear();
+ assert.equal((f.db.prepare('SELECT version FROM hub2_schema').get() as any).version,7);
  assert.equal(f.db.prepare("SELECT name FROM sqlite_master WHERE name='native_inventory_rows'").get(),undefined);
  assert.equal((await f.call('/api/native-inventory','POST',{})).status,503);
  assert.equal((await list(f)).native_inventory.error,'inventory_schema_pending');
- const active=fixture('apply',f.db);await active.boot();await publish(active,await chunks([row()]));
+ const active=fixture('defer',f.db);await active.boot();
+ assert.equal((f.db.prepare('SELECT version FROM hub2_schema').get() as any).version,8);
+ await publish(active,await chunks([row()]));
  const rollback=fixture('defer',f.db);assert.equal((await list(rollback)).items[0].native_id,row().id);
  assert.equal((f.db.prepare('SELECT version FROM hub2_schema').get() as any).version,8);f.db.close();
 });

@@ -242,6 +242,16 @@ const router = {
         );
       }
 
+      const nativeCommand=path.match(/^\/api\/machines\/([A-Za-z0-9_.-]{1,80})\/native\/([0-9a-f-]{36})\/commands(?:\/([0-9a-f-]{36})(\/ack)?)?$/);
+      if(nativeCommand){
+        const ack=!!nativeCommand[4];
+        if(ack?request.method!=='POST'||actor.kind!=='machine'||actor.resource_id!==nativeCommand[1]||!actor.scopes.includes('session:report')
+          :actor.kind!=='operator'||!actor.scopes.includes('operator:admin'))return error('forbidden',403);
+        if(safetyMode)return error('forbidden',403);
+        const machine=env.MACHINES.get(env.MACHINES.idFromName(nativeCommand[1]));
+        return machine.fetch(await forwardRequest(request,'https://machine.hub2.internal/api/native/'+nativeCommand[2]+'/commands'
+          +(nativeCommand[3]?'/'+nativeCommand[3]:'')+(ack?'/ack':''),actor));
+      }
       const nativeInventory=path.match(/^\/api\/machines\/([A-Za-z0-9_.-]{1,80})\/native-inventory$/);
       if(nativeInventory){
         if(request.method!=='POST')return error('method_not_allowed',405);

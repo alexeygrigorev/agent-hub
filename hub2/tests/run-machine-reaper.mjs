@@ -12,3 +12,5 @@ await import('./machine-reaper.test.ts');
 await import('./machine-picker-evidence.test.ts');
 
 await import('./native-inventory.test.ts');
+
+await import('./native-commands.test.ts');

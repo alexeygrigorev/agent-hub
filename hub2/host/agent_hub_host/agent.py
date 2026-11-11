@@ -556,6 +556,8 @@ class Bridge:
                                        (f'finish:{row["operation_id"]}', f'/api/sessions/{row["session_id"]}/finish', canonical(payload)))
 
     def command(self, command):
+        if command.get("target_kind") == "native":
+            return self.native_command(command)
         identity = command.get("id")
         if not isinstance(identity, str) or not re.fullmatch(r"[A-Za-z0-9-]{1,80}", identity):
             raise ValueError("invalid_command_id")
@@ -633,6 +635,56 @@ class Bridge:
         with db:
             self.finish_command(identity, command, result)
         return result
+
+    def native_command(self, command):
+        identity, native_id = command.get('id'), command.get('native_id')
+        target = command.get('identity')
+        if (command.get('protocol') != 1 or not isinstance(identity, str) or not UUID_RE.fullmatch(identity)
+                or not isinstance(native_id, str) or not UUID_RE.fullmatch(native_id)
+                or command.get('machine_id') != self.machine_id
+                or not isinstance(target, dict) or set(target) != {'id', 'tag', 'workspace'}
+                or target.get('id') != native_id or not isinstance(target.get('tag'), str)
+                or not target['tag'] or len(target['tag'].encode()) > 512
+                or not isinstance(target.get('workspace'), str) or not Path(target['workspace']).is_absolute()
+                or len(target['workspace'].encode()) > 8192 or '\0' in target['workspace']
+                or type(command.get('deadline_ms')) is not int
+                or command.get('kind') not in {'stop', 'capture', 'send'}):
+            raise ValueError('invalid_native_command')
+        digest = hashlib.sha256(canonical(command).encode()).hexdigest()
+        path = f"/api/machines/{self.machine_id}/native/{native_id}/commands/{identity}/ack"
+        db = self.journal.db
+        # Serialize on the command UUID even when socket deliveries overlap.
+        with self._inflight_lock:
+            lock = self._session_locks.setdefault('native-command:' + identity, threading.RLock())
+        with lock:
+            old = db.execute('SELECT * FROM commands WHERE id=?', (identity,)).fetchone()
+            if old and old['digest'] != digest:
+                raise ValueError('command_id_conflict')
+            def finish(result):
+                payload = {'native_id': native_id, 'deadline_ms': command['deadline_ms'], 'result': result}
+                with db:
+                    db.execute("UPDATE commands SET state='done',result=? WHERE id=?", (canonical(result), identity))
+                    self.journal.enqueue('command:' + identity, path, payload)
+                return result
+            if old:
+                # No redispatch after a process died between native effect and receipt.
+                return finish(json.loads(old['result']) if old['state'] == 'done'
+                              else {'error': 'native_command_outcome_uncertain'})
+            with db:
+                self.begin_command(identity, digest)
+            if command['kind'] == 'send':
+                return finish({'error': 'native_send_unsupported_safe_input'})
+            if command['deadline_ms'] <= time.time()*1000 or command['deadline_ms'] > time.time()*1000+90000:
+                return finish({'error': 'native_command_deadline'})
+            if db.execute('SELECT 1 FROM launches WHERE native_id=?', (native_id,)).fetchone():
+                return finish({'error': 'native_target_managed'})
+            try:
+                return finish(self.launcher.native_control(command))
+            except Exception as exc:
+                reason = str(exc)
+                if not re.fullmatch(r'[a-z_]{1,80}', reason):
+                    reason = 'native_command_outcome_uncertain'
+                return finish({'error': reason})
 
     def stop_pre_native_command(self, command, identity, digest):
         session = command.get('session_id')
@@ -918,6 +970,13 @@ class Bridge:
                                     self._inflight.add(session)
                                     self._session_locks.setdefault(session, threading.RLock())
                                 pool.submit(execute, event, session)
+                            elif event.get('type') == 'session.command' and event.get('command', {}).get('target_kind') == 'native':
+                                session = 'native:' + str(event['command'].get('native_id'))
+                                with self._inflight_lock:
+                                    self._session_locks.setdefault(session, threading.RLock())
+                                if not slots.acquire(blocking=False):
+                                    raise RuntimeError('host_command_queue_full')
+                                commands.submit(execute, event, session)
                             elif event.get('type') == 'session.command' and event.get('command', {}).get('session_id') in self._inflight:
                                 session = event['command']['session_id']
                                 if not slots.acquire(blocking=False):
