@@ -245,7 +245,19 @@ export class AccountDO {
    if(prior){
     const previous=await this.unseal(prior.sealed,account.provider,prior.generation) as Record<string,string>;
     const existing=this.freshness(account.provider,previous);
-    if(existing!==null&&incoming<=existing)return error('native_credential_not_newer',409);
+    if(existing!==null&&incoming<=existing){
+     const failed=this.db.one('SELECT host_id FROM credential_rejections WHERE generation=? LIMIT 1',prior.generation)
+      ||this.db.one('SELECT id FROM alerts WHERE id IN (?,?)',`credential:${prior.generation}:credential_refresh_failed`,`credential:${prior.generation}:credential_expired`);
+     if(!failed)return error('native_credential_not_newer',409);
+     // A revoked token can expire later than a working native login. Recovery
+     // requires current-generation failure evidence plus live native auth proof.
+     // This is not an Opus health result and never clears an auth incident.
+     try{
+      const probe=await this.providerQuota('claude',JSON.parse(String((files as Record<string,string>)[PATHS.claude[0]])));
+      if(!probe.ok)return error('native_credential_unverified',409);
+      await this.boundedJson(probe);
+     }catch{return error('native_credential_unverified',503);}
+    }
    }
   }
   const sealed=await this.seal(files,account.provider,Number(b.expected_generation)+1);

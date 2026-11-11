@@ -333,3 +333,38 @@ test('native import enforces operator rights, payload bounds and OAuth validatio
   }
   assert.equal((await f.call('/api/engines/import-native', 'POST', { ...nativeBody(), padding: 'x'.repeat(25000) })).status, 413);
 });
+
+test('recorded rejected central auth can recover from a working native login with an earlier expiry', async () => {
+  const f = await maintenanceFixture();
+  await f.callAccount('/api/account/hosts', 'PUT', { hosts: ['RMTHZ'] });
+  assert.equal((await f.callAccount('/api/account/credential-rejection', 'POST', {
+    generation: 1, reason: 'provider_unauthorized',
+  }, machine)).status, 200);
+  const result = await f.call('/api/engines/import-native', 'POST', nativeBody(1, Date.now() + 43200000));
+  assert.equal(result.status, 200);
+  assert.equal((await result.json() as any).credential_generation, 2);
+  assert.equal(f.calls.filter(url => url.endsWith('/usage')).length, 1);
+  assert.equal(f.calls.filter(url => url.endsWith('/token')).length, 0);
+});
+
+test('failed native authentication probe never replaces a rejected central generation', async () => {
+  const f = await maintenanceFixture({ refuseQuota: true });
+  await f.callAccount('/api/account/hosts', 'PUT', { hosts: ['RMTHZ'] });
+  await f.callAccount('/api/account/credential-rejection', 'POST', { generation: 1, reason: 'provider_unauthorized' }, machine);
+  const response = await f.call('/api/engines/import-native', 'POST', nativeBody(1, Date.now() + 43200000));
+  assert.equal(response.status, 409);
+  assert.deepEqual(await response.json(), { error: 'native_credential_unverified' });
+  const metadata = await (await f.callAccount('/api/account/credentials?metadata=1', 'GET', undefined, machine)).json() as any;
+  assert.equal(metadata.generation, 1);
+});
+
+test('current generation refresh failure also permits proven native recovery', async () => {
+  const f = await maintenanceFixture({ refuseRefresh: true });
+  const central = nativeBody(1, Date.now() + 120000);
+  assert.equal((await f.callAccount('/api/account/credentials', 'PUT', { expected_generation: 1, files: central.files })).status, 200);
+  const maintenance = await (await f.call('/api/engines/maintain', 'POST', {})).json() as any;
+  assert.equal(maintenance.results[0].status, 'refresh_failed');
+  const response = await f.call('/api/engines/import-native', 'POST', nativeBody(2, Date.now() + 60000));
+  assert.equal(response.status, 200);
+  assert.equal((await response.json() as any).credential_generation, 3);
+});

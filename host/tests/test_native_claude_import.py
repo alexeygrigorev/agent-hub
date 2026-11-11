@@ -62,7 +62,7 @@ class NativeImportTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'Native Claude home required'):
                 n.collect()
 
-    def run_command(self, *, incoming=5, receipt=5, ack=5, central=5, fail_upload=False):
+    def run_command(self, *, incoming=5, receipt=5, ack=5, central=5, fail_upload=False, fail_sync=False, fail_verify=False):
         calls = []
         cfg = {'base_url': 'https://hub.test', 'machine_id': 'test-host'}
         before = {'credentials': [{'label': 'hub-claude', 'generation': 4, 'hosts': ['test-host']}]}
@@ -70,6 +70,8 @@ class NativeImportTest(unittest.TestCase):
         def operator(method, path, payload=None):
             calls.append((method, path, payload))
             if method == 'GET':
+                if fail_verify and len(calls) > 1:
+                    raise OSError('synthetic-private-provider-output')
                 return before if len(calls) == 1 else after
             if fail_upload:
                 raise ValueError('generation_conflict')
@@ -80,6 +82,8 @@ class NativeImportTest(unittest.TestCase):
             calls.append((method, path, payload))
             return {'engines': [{'label': 'hub-claude', 'credential_generation': incoming}], 'logins': [{'id': 'do-not-complete'}]}
         def reconcile(request):
+            if fail_sync:
+                raise OSError('synthetic-private-provider-output')
             response = request('GET', '/api/engines/sync')
             self.assertEqual(response['logins'], [])
             return {'status': 'synced'}
@@ -109,8 +113,14 @@ class NativeImportTest(unittest.TestCase):
         self.assertFalse(self.sync_called)
 
     def test_expired_central_generation_is_not_materialized(self):
-        with self.assertRaisesRegex(ValueError, 'older than'):
+        with self.assertRaisesRegex(ValueError, 'saved at generation 5'):
             self.run_command(incoming=4)
+
+    def test_post_upload_failures_preserve_saved_receipt_without_provider_output(self):
+        for flags in ({'fail_sync': True}, {'fail_verify': True}):
+            with self.assertRaisesRegex(ValueError, 'saved at generation 5') as exc:
+                self.run_command(**flags)
+            self.assertNotIn('synthetic-private', str(exc.exception))
 
     def test_missing_or_stale_ack_is_not_success(self):
         for ack, central in ((None, 5), (4, 5), (5, 6)):
