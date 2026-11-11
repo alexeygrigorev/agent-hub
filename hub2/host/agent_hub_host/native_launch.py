@@ -188,7 +188,7 @@ def adapter_argv(provider, goal, model):
     if provider == 'antigravity':
         return [binary, '--model', str(model), '--dangerously-skip-permissions', '-p', goal]
     if provider == 'go':
-        return [binary, 'run', '--standalone', '--auto', '--model', str(model), goal]
+        return [binary, 'run', '--standalone', '--auto', '--format', 'json', '--model', str(model), goal]
     return [binary, '--dangerously-skip-permissions', '--model', str(model), '-p', goal]
 
 
@@ -795,6 +795,8 @@ class NativeLauncher:
         output_args = ['--output-dir', str(Path(specification['workspace']).resolve().joinpath(*output['parts']))] if output else []
         selector = ['--profile', profile] if profile else ['--engine', route.get('engine', provider)]
         args = ['--model', model]
+        if provider == 'go':
+            args += ['--format', 'json']
         effort = specification.get('effort')
         if effort is not None:
             args += headless_effort_argv(provider, ['prompt'], effort)[:-1]

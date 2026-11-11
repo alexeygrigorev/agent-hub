@@ -1032,6 +1032,20 @@ export class MachineDO {
     await pending;
   }
 
+  private retainedCaptureReady(row:SessionRow):boolean {
+    const launch=this.parse(row.launch_json) as JsonRecord,proof=this.parse(row.evidence_json) as JsonRecord|null;
+    const evidence=proof?.evidence as JsonRecord|undefined,identity=evidence?.native_identity as JsonRecord|undefined;
+    return row.state==='completed-awaiting-review'&&launch.interactive===false&&!!row.native_id&&row.exit_code===0
+      &&typeof row.evidence_digest==='string'&&/^[0-9a-f]{64}$/.test(row.evidence_digest)
+      &&proof?.evidence_digest===row.evidence_digest&&proof.native_exit_confirmed===true&&proof.exit_code===0
+      &&proof.session_id===row.id&&proof.epoch===row.epoch&&proof.attempt_operation_id===row.operation_id
+      &&proof.operation_id===row.dispatch_id&&proof.intake_id===row.intake_id
+      &&proof.machine_id===row.machine_id&&proof.native_id===row.native_id
+      &&evidence?.containment_empty===true&&['aplexer_status','aplexer_retirement'].includes(String(evidence.source))
+      &&identity?.id===row.native_id&&identity.tag===`task-hub2-${row.id}`&&identity.workspace===boundWorkspace(launch)
+      &&nativeReturncode(evidence.native_exit as JsonRecord)===0;
+  }
+
   private async createCommand(request: Request, sessionId: string): Promise<Response> {
     const actor = actorFrom(request);
     if (!actor || actor.kind === 'machine') return error('forbidden', 403);
@@ -1039,6 +1053,7 @@ export class MachineDO {
     if (!session) return error('session_not_found', 404);
     const body = await bodyObject(request, 12_288);
     const kind = body.kind;
+    if(Object.hasOwn(body,'capture_binding'))return error('reserved_command_field',400);
     if (!['send', 'capture', 'stop'].includes(String(kind))) return error('invalid_command_kind', 400);
     const scope = kind === 'send' ? 'session:send' : kind === 'capture' ? 'session:capture' : 'session:stop';
     if (!hasScope(actor, 'operator:admin') && (!hasScope(actor, scope)
@@ -1056,6 +1071,9 @@ export class MachineDO {
     const key = request.headers.get('Idempotency-Key') || body.key;
     if (typeof key !== 'string' || !/^[A-Za-z0-9_.:-]{1,120}$/.test(key)) return error('idempotency_key_required', 400);
     const digest = await sha256Hex(JSON.stringify({ kind, text: commandText ?? null, epoch: session.epoch, ...(captureMode ? {mode:captureMode} : {}) }));
+    const retained = kind==='capture'&&captureMode===undefined&&actor.kind==='operator'
+      &&(this.parse(session.launch_json) as JsonRecord).interactive===false&&!!session.native_id;
+    const binding=retained?{native_id:session.native_id,operation_id:session.operation_id,request_digest:digest}:null;
     const immediateStop = kind === 'stop' && this.unclaimedWithoutNative(session);
     const prior = this.db.one<CommandRow>('SELECT * FROM session_commands WHERE session_id=? AND request_key=?', sessionId, key);
     if (prior) {
@@ -1063,7 +1081,7 @@ export class MachineDO {
       if (!immediateStop || prior.state !== 'pending') return json({ command: this.commandView(prior), replayed: true });
     }
     if (kind === 'stop' ? !immediateStop && !this.canDispatchStop(session)
-      : session.state !== 'running' || !session.native_id) return error('session_not_running', 409);
+      : (session.state !== 'running' || !session.native_id)&&!(retained&&this.retainedCaptureReady(session))) return error('session_not_running', 409);
     const now = Date.now(), id = crypto.randomUUID();
     if (immediateStop) {
       const applied = await this.recordStopped(session, 'stop_confirmed', now, prior ? undefined : {
@@ -1084,9 +1102,11 @@ export class MachineDO {
         const current = this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?', sessionId);
         if (!current || current.epoch !== session.epoch || !(kind==='stop'
           ? this.canDispatchStop(current)
-          : current.state==='running'&&!!current.native_id)) throw new HttpError('session_not_running', 409);
+          : current.state==='running'&&!!current.native_id||retained&&this.retainedCaptureReady(current))) throw new HttpError('session_not_running', 409);
         // Preserve the pre-delivery native binding in both schema readers.
-        const pendingResult = kind === 'stop' && current.native_id ? JSON.stringify({dispatch_native_id:current.native_id}) : null;
+        const pendingResult = kind === 'stop' && current.native_id ? JSON.stringify({dispatch_native_id:current.native_id})
+          :binding?JSON.stringify({capture_binding:binding}):null;
+        if(binding&&(current.native_id!==binding.native_id||current.operation_id!==binding.operation_id))throw new HttpError('stale_command',409);
         if(this.db.schemaVersion>=7){
           this.db.run(`INSERT INTO session_commands(id,session_id,machine_id,epoch,request_key,request_digest,kind,text,capture_mode,state,result_json,created_at,updated_at)
             VALUES(?,?,?,?,?,?,?,?,?,'pending',?,?,?)`, id, sessionId, session.machine_id, session.epoch, key, digest, kind,
@@ -1121,6 +1141,23 @@ export class MachineDO {
       ? this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND machine_id=? AND epoch=?',sessionId,machineId,row.epoch)
       : null;
     let result=body.result as JsonRecord;
+    const captureBinding=row.kind==='capture'?(this.parse(row.result_json) as JsonRecord|null)?.capture_binding as JsonRecord|undefined:undefined;
+    if(captureBinding){
+      const current=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND machine_id=? AND epoch=?',sessionId,machineId,row.epoch);
+      if(!current||current.native_id!==captureBinding.native_id||current.operation_id!==captureBinding.operation_id
+        ||captureBinding.request_digest!==row.request_digest)return error('stale_command',409);
+      const echo=result.capture_binding as JsonRecord|undefined;
+      const echoed=!!echo&&typeof echo==='object'&&!Array.isArray(echo)&&Object.keys(echo).length===3
+        &&['native_id','operation_id','request_digest'].every(key=>echo[key]===captureBinding[key]);
+      if(result.capture_binding!==undefined&&!echoed)return error('capture_fence_conflict',409);
+      if(result.error!==undefined){
+        if(typeof result.error!=='string'||!/^[a-z_]{1,80}$/.test(result.error))return error('invalid_command_ack',400);
+        result={error:result.error,reason:result.error,capture_binding:captureBinding,capture_source:result.capture_source??'legacy_running'};
+      }else{
+        if(typeof result.output!=='string'||new TextEncoder().encode(result.output).length>4096)return error('invalid_capture_output',400);
+        result={output:result.output,capture_binding:captureBinding,capture_source:result.capture_source??'legacy_running'};
+      }
+    }
     if (session) {
       const priorResult=this.parse(row.result_json) as JsonRecord|null;
       const legacyBoundStop = session.state!=='lost' && result.stopped === true && result.evidence === undefined && !!session.native_id
@@ -1133,11 +1170,18 @@ export class MachineDO {
       }
     }
     const resultJson = JSON.stringify(result);
+    if(new TextEncoder().encode(resultJson).length>8192)return error('command_ack_too_large',413);
     const unconfirmed=row.kind==='stop'&&result.stopped===false&&result.error==='stop_unconfirmed';
-    if (row.state === 'acked' || (row.state === 'failed' && unconfirmed && row.result_json === resultJson)) {
+    if (row.state === 'acked' || (row.state === 'failed' && (unconfirmed||captureBinding) && row.result_json === resultJson)) {
       return row.result_json === resultJson ? json({ acknowledged: true, duplicate: true }) : error('command_ack_conflict', 409);
     }
     if (row.state !== 'pending') return error('command_not_pending', 409);
+    if(captureBinding){
+      const current=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND machine_id=? AND epoch=?',sessionId,machineId,row.epoch);
+      const echo=(body.result as JsonRecord).capture_binding as JsonRecord|undefined;
+      if(!current||current.state!=='running'&&(!this.retainedCaptureReady(current)||!echo
+        ||(body.result as JsonRecord).capture_source!=='retained_task_output'))return error('unqualified_retained_capture',409);
+    }
     const now=Date.now();
     if (row.kind === 'stop' && result.stopped === true) {
       const nativeId = result.evidence === 'native_exit' ? result.native_id as string : undefined;
@@ -1146,7 +1190,7 @@ export class MachineDO {
       }
     } else {
       this.db.run("UPDATE session_commands SET state=?,result_json=?,updated_at=? WHERE id=? AND state='pending' AND epoch=?",
-        unconfirmed?'failed':'acked', resultJson, now, commandId, row.epoch);
+        unconfirmed||captureBinding&&result.error?'failed':'acked', resultJson, now, commandId, row.epoch);
     }
     await this.notifyPendingCommands(machineId);
     return json({ acknowledged: true });
@@ -1158,7 +1202,10 @@ export class MachineDO {
       SELECT c.* FROM session_commands c
       JOIN sessions s ON s.id=c.session_id AND s.machine_id=c.machine_id AND c.epoch=s.epoch
       WHERE c.machine_id=? AND c.state='pending' AND (
-        s.state IN ('claimed','running') OR (c.kind='stop' AND (
+        s.state IN ('claimed','running') OR (c.kind='capture' AND s.state='completed-awaiting-review' AND s.exit_code=0
+          AND CASE WHEN json_valid(c.result_json) THEN json_extract(c.result_json,'$.capture_binding.native_id') END=s.native_id
+          AND CASE WHEN json_valid(c.result_json) THEN json_extract(c.result_json,'$.capture_binding.operation_id') END=s.operation_id
+        ) OR (c.kind='stop' AND (
           (s.state='lost' AND s.native_id IS NOT NULL) OR
           (s.state='expired' AND EXISTS(SELECT 1 FROM launch_admissions a
             WHERE a.operation_id=s.operation_id AND a.session_id=s.id AND a.epoch=s.epoch))
@@ -1176,6 +1223,7 @@ export class MachineDO {
     try{
       const view=this.commandView(command);
       const session=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND machine_id=?',command.session_id,machineId);
+      if(command.kind==='capture'&&session&&session.state!=='running'&&session.state!=='claimed'&&!this.retainedCaptureReady(session))return;
       if (session && !session.native_id && (session.state === 'claimed' || session.state === 'expired')) {
         const launch=this.parse(session.launch_json) as JsonRecord;
         view.pre_native=true;view.workspace=boundWorkspace(launch);view.tag=`task-hub2-${session.id}`;
@@ -1736,6 +1784,8 @@ export class MachineDO {
   private commandView(row: CommandRow): JsonRecord {
     return { id: row.id, session_id: row.session_id, epoch: row.epoch, kind: row.kind,
       ...(row.capture_mode ? {mode:row.capture_mode} : {}),
+      ...(row.kind==='capture'&&(this.parse(row.result_json) as JsonRecord|null)?.capture_binding
+        ?{capture_binding:(this.parse(row.result_json) as JsonRecord).capture_binding}:{}),
       ...(row.kind==='send'&&row.text!==null ? {text:row.text} : {}) };
   }
 

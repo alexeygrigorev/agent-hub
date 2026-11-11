@@ -778,3 +778,19 @@ class StrictNativeSendTests(unittest.TestCase):
             command['deadline_ms'],command['submission']['text']],ensure_ascii=False,separators=(',',':')).encode()).hexdigest()
         with self.assertRaisesRegex(RuntimeError,'native_command_deadline'):self.adapter.native_control(command)
         self.assertFalse(any(args[1]=='send' for args,_ in self.calls))
+
+
+class GoJsonOutputTests(unittest.TestCase):
+    def test_direct_go_route_requests_documented_json_without_model_or_permission_changes(self):
+        self.assertEqual(nl.adapter_argv('go','synthetic prompt',nl.OPENCODE_MODEL),
+            ['opencode','run','--standalone','--auto','--format','json','--model',nl.OPENCODE_MODEL,'synthetic prompt'])
+
+    def test_actual_local_task_route_threads_json_option_as_engine_args(self):
+        with tempfile.TemporaryDirectory() as root:
+            adapter=nl.NativeLauncher({'private_provider_homes':False},aplexer='synthetic-a')
+            spec={'workspace':root,'operation_id':'op-local-go','epoch':1,'timeout_seconds':1800,'model':nl.OPENCODE_MODEL}
+            argv=adapter.profile_command('hub2-local-go',spec,nl.LOCAL_ROUTES['go'],'synthetic prompt')
+            self.assertEqual(argv[:3],['synthetic-a','task','run'])
+            self.assertIn('--engine-arg=--format',argv);self.assertIn('--engine-arg=json',argv)
+            self.assertIn('--engine-arg='+nl.OPENCODE_MODEL,argv)
+            self.assertEqual(argv[argv.index('--profile')+1],nl.LOCAL_ROUTES['go']['profile'])

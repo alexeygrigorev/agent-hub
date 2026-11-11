@@ -15,7 +15,7 @@ def output_parts(task_id, operation_id, epoch):
     return ('.local', 'hub2-output', token)
 
 
-def open_beneath(workspace, parts, create=False):
+def open_beneath(workspace, parts, create=False, private=False):
     """Open fixed relative components without following file/directory symlinks."""
     if not parts or any(not isinstance(p, str) or p in ('', '.', '..') or '/' in p or '\\' in p for p in parts):
         raise RuntimeError('task_output_path_invalid')
@@ -33,6 +33,19 @@ def open_beneath(workspace, parts, create=False):
                 except FileExistsError:
                     pass
             child = os.open(part, flags | (os.O_DIRECTORY if directory else 0), dir_fd=fd)
+            if private and directory:
+                info = os.fstat(child)
+                # The retained attempt directory is the privacy boundary: task
+                # stdout may be 0664, but must be unreachable outside this 0700
+                # owner directory, with no hardlink elsewhere.
+                # Existing owned ancestors may be group writable. Descriptor
+                # traversal pins them without following links; privacy is
+                # enforced at the exact 0700 attempt boundary and bound records.
+                if (info.st_uid != os.geteuid()
+                        or index < 2 and info.st_mode & 0o002
+                        or index == 2 and stat.S_IMODE(info.st_mode) != 0o700):
+                    os.close(child)
+                    raise RuntimeError('task_output_private_path_required')
             os.close(fd)
             fd = child
         return fd
@@ -41,11 +54,12 @@ def open_beneath(workspace, parts, create=False):
         raise
 
 
-def read_beneath(workspace, parts, limit, tail=False):
-    fd = open_beneath(workspace, parts)
+def read_beneath(workspace, parts, limit, tail=False, private=False):
+    fd = open_beneath(workspace, parts, private=private)
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
+        if not stat.S_ISREG(info.st_mode) or private and (info.st_uid != os.geteuid() or info.st_nlink != 1
+                or not tail and info.st_mode & 0o077):
             raise RuntimeError('task_output_file_invalid')
         if not tail and info.st_size > limit:
             raise RuntimeError('task_output_record_too_large')
@@ -78,29 +92,45 @@ def same_path(value, expected):
         return False
 
 
-def capture_task_output(task_id, expected, native_id, limit=16384):
+def capture_task_output(task_id, expected, native_id, limit=16384, *, retained_only=False):
     """None selects legacy/interactive PTY capture; empty means task not ready yet."""
     if os.open not in os.supports_dir_fd or not hasattr(os, 'O_NOFOLLOW'):
+        if retained_only:
+            raise RuntimeError('task_output_unavailable')
         return None
     workspace = expected['workspace']
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise RuntimeError('task_output_record_invalid')
+            value[key] = item
+        return value
     try:
-        record = json.loads(read_beneath(workspace, ('.local', 'launch-' + task_id + '.json'), 65536))
+        record = json.loads(read_beneath(workspace, ('.local', 'launch-' + task_id + '.json'), 65536,
+            private=retained_only), object_pairs_hook=unique)
     except FileNotFoundError:
+        if retained_only:
+            raise RuntimeError('task_output_unavailable') from None
         return None
     if not isinstance(record, dict):
         raise RuntimeError('task_output_record_invalid')
     binding = record.get('task_output')
     if binding is None:
+        if retained_only:
+            raise RuntimeError('task_output_unavailable')
         return None
     parts = output_parts(task_id, expected['operation_id'], expected['epoch'])
     if (record.get('session_id') != native_id or record.get('tag') != expected['tag']
             or not same_path(record.get('workspace'), workspace)
             or not isinstance(binding, dict) or binding.get('parts') != list(parts)
-            or binding.get('operation_id') != expected['operation_id'] or binding.get('epoch') != expected['epoch']):
+            or binding.get('operation_id') != expected['operation_id'] or type(binding.get('epoch')) is not int or binding.get('epoch') != expected['epoch']):
         raise RuntimeError('task_output_fence_conflict')
     try:
-        start = json.loads(read_beneath(workspace, (*parts, 'START.json'), 131072))
+        start = json.loads(read_beneath(workspace, (*parts, 'START.json'), 131072, private=retained_only), object_pairs_hook=unique)
     except FileNotFoundError:
+        if retained_only:
+            raise RuntimeError('task_output_unavailable') from None
         return ''
     if not isinstance(start, dict):
         raise RuntimeError('task_output_record_invalid')
@@ -110,22 +140,27 @@ def capture_task_output(task_id, expected, native_id, limit=16384):
             or not same_path(parent.get('workspace'), workspace)
             or not same_path(start.get('cwd'), workspace)
             or not same_path(start.get('output_dir'), Path(workspace).resolve().joinpath(*parts))
-            or start.get('schema_version') != 1 or type(created) is not int or type(started) is not int
+            or type(start.get('schema_version')) is not int or start.get('schema_version') != 1 or type(created) is not int or type(started) is not int
             or not created <= started <= time.time() * 1000 + 5000
             or start.get('profile') != binding.get('profile')
             or not isinstance(start.get('engine'), str) or not start['engine']
             or (binding.get('engine') is not None and start.get('engine') != binding['engine'])
+            or not isinstance(binding.get('prompt_sha256'), str) or not re.fullmatch('[0-9a-f]{64}',binding['prompt_sha256'])
             or start.get('prompt_sha256') != binding.get('prompt_sha256')):
         raise RuntimeError('task_output_start_conflict')
     try:
-        return read_beneath(workspace, (*parts, 'stdout.log'), min(16384, max(1, limit)), tail=True)
+        return read_beneath(workspace, (*parts, 'stdout.log'), min(16384, max(1, limit)), tail=True, private=retained_only)
     except FileNotFoundError:
+        if retained_only:
+            raise RuntimeError('task_output_unavailable') from None
         return ''
 
 
-def bounded_capture(output):
+def bounded_capture(output, result_fields=None):
     # Command acknowledgements have an 8192-byte JSON ceiling, including escapes.
+    if result_fields and len(json.dumps(result_fields,ensure_ascii=True).encode())>1024:
+        raise RuntimeError('capture_fence_conflict')
     output = output.encode('utf8', errors='replace')[-4096:].decode('utf8', errors='replace')
-    while len(json.dumps({'output': output}, ensure_ascii=True).encode()) > 8000:
+    while len(json.dumps({**(result_fields or {}), 'output': output}, ensure_ascii=True).encode()) > 8000:
         output = output[max(1, len(output) // 4):]
     return output

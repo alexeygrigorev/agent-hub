@@ -990,3 +990,139 @@ test('an expired legacy attempt retains its verified history and revokes without
  const outbox=f.database.prepare("SELECT state FROM machine_outbox WHERE kind='legacy-launch-failure'").get() as any;
  assert.equal(outbox.state,'delivered');
 });
+
+async function completedHeadless(f:ReturnType<typeof fixture>,session:string,native='11111111-2222-4333-8444-555555555555',complete=true,workspace='/work/retained'){
+ const epoch=await startClaimed(f,session,native),started=Date.now()-100;
+ const stored=f.database.prepare('SELECT launch_json FROM sessions WHERE id=?').get(session) as any;
+ const launch={...JSON.parse(stored.launch_json),workspace,timeout_seconds:1800,interactive:false};
+ f.database.prepare('UPDATE sessions SET launch_json=? WHERE id=?').run(JSON.stringify(launch),session);
+ f.database.prepare('INSERT INTO launch_admissions VALUES(?,?,?,?)').run('op-'+session,session,epoch,started);f.clearCache();
+ const finish={operation_id:'op-'+session,epoch,native_id:native,exit_code:0,native_exit_confirmed:true,evidence:{source:'aplexer_retirement',
+  native_identity:{id:native,tag:'task-hub2-'+session,workspace},containment_empty:true,
+  native_exit:{code:0,exited_at_ms:Date.now()},native_deadline:{deadline_ms:started+1800000,exceeded:false}}};
+ if(complete){const response=await f.call('/api/sessions/'+session+'/finish','POST',finish);assert.equal(response.status,201,await response.clone().text());}
+ return{epoch,native,finish};
+}
+
+test('qualified completed headless capture is retained-only and never requires a running session',async()=>{
+ const f=fixture(),session='completed-retained-capture';await completedHeadless(f,session);
+ const actor={'x-hub2-actor':JSON.stringify({id:'operator',kind:'operator',scopes:['operator:admin']})};
+ const response=await f.call('/api/sessions/'+session+'/commands','POST',{kind:'capture',key:'retained-once'},actor);
+ assert.equal(response.status,201,await response.clone().text());
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'completed-awaiting-review');
+});
+
+
+const captureOperator={'x-hub2-actor':JSON.stringify({id:'operator',kind:'operator',scopes:['operator:admin']})};
+function captureSocket(f:ReturnType<typeof fixture>){const frames:any[]=[];const socket={readyState:1,
+ deserializeAttachment:()=>({machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'capture-test'}),
+ send:(raw:string)=>frames.push(JSON.parse(raw))};f.sockets.push(socket);return{socket,frames};}
+
+test('completed retained capture dispatch and ACK bind exact op/native/digest and remain immutable',async()=>{
+ const f=fixture(),session='retained-ack',meta=await completedHeadless(f,session),{frames}=captureSocket(f);
+ const made=await f.call('/api/sessions/'+session+'/commands','POST',{kind:'capture',key:'retained'},captureOperator);
+ assert.equal(made.status,201);const wire=(await made.json() as any).command;
+ assert.deepEqual(frames.at(-1).command,wire);
+ assert.deepEqual(wire.capture_binding,{native_id:meta.native,operation_id:'op-'+session,
+  request_digest:(f.database.prepare('SELECT request_digest FROM session_commands WHERE id=?').get(wire.id) as any).request_digest});
+ const path='/api/sessions/'+session+'/commands/'+wire.id+'/ack';
+ const body={epoch:meta.epoch,result:{output:'retained tool event',capture_binding:wire.capture_binding,capture_source:'retained_task_output'}};
+ assert.equal((await f.call(path,'POST',body)).status,200);
+ f.restart();assert.equal((await f.call(path,'POST',body)).status,200);
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'completed-awaiting-review');
+ assert.equal((f.database.prepare('SELECT state FROM session_commands WHERE id=?').get(wire.id) as any).state,'acked');
+ assert.equal((await f.call('/api/sessions/'+session+'/commands','POST',{kind:'capture',key:'retained'},captureOperator)).status,200);
+});
+
+test('headless capture queued running survives positive finish with the identical read-only envelope',async()=>{
+ const f=fixture(),session='capture-finish-race',meta=await completedHeadless(f,session,undefined,false),{socket,frames}=captureSocket(f);
+ const made=await f.call('/api/sessions/'+session+'/commands','POST',{kind:'capture',key:'before-finish'},captureOperator);
+ assert.equal(made.status,201);const before=frames.at(-1).command;
+ assert.equal((await f.call('/api/sessions/'+session+'/finish','POST',meta.finish)).status,201);
+ await (f.machine as any).sendPendingCommands(socket,'h1');assert.deepEqual(frames.at(-1).command,before);
+ const result={output:'retained after completion',capture_source:'retained_task_output',capture_binding:before.capture_binding};
+ assert.equal((await f.call('/api/sessions/'+session+'/commands/'+before.id+'/ack','POST',{epoch:meta.epoch,result})).status,200);
+});
+
+test('terminal retained capture refuses screen, unqualified state/proof, and nonoperator authority',async()=>{
+ const f=fixture(),session='capture-terminal-refusals';await completedHeadless(f,session);
+ assert.equal((await f.call('/api/sessions/'+session+'/commands','POST',{kind:'capture',mode:'screen',key:'screen'},captureOperator)).status,409);
+ assert.equal((await f.call('/api/sessions/'+session+'/commands','POST',{kind:'capture',key:'spoof',capture_binding:{native_id:'foreign'}},captureOperator)).status,400);
+ const agent={'x-hub2-actor':JSON.stringify({id:'agent',kind:'agent',resource_id:'project-test',scopes:['session:capture']})};
+ assert.equal((await f.call('/api/sessions/'+session+'/commands','POST',{kind:'capture',key:'agent'},agent)).status,409);
+ const original=f.database.prepare('SELECT * FROM sessions WHERE id=?').get(session) as any;
+ for(const state of ['stopped','lost','failed']){
+  f.database.prepare('UPDATE sessions SET state=? WHERE id=?').run(state,session);f.clearCache();
+  assert.equal((await f.call('/api/sessions/'+session+'/commands','POST',{kind:'capture',key:state},captureOperator)).status,409);
+ }
+ f.database.prepare("UPDATE sessions SET state='completed-awaiting-review',evidence_digest=NULL WHERE id=?").run(session);f.clearCache();
+ assert.equal((await f.call('/api/sessions/'+session+'/commands','POST',{kind:'capture',key:'no-proof'},captureOperator)).status,409);
+ f.database.prepare('UPDATE sessions SET evidence_digest=?,evidence_json=? WHERE id=?').run(original.evidence_digest,JSON.stringify({...JSON.parse(original.evidence_json),native_id:'foreign'}),session);f.clearCache();
+ assert.equal((await f.call('/api/sessions/'+session+'/commands','POST',{kind:'capture',key:'foreign-proof'},captureOperator)).status,409);
+});
+
+test('terminal capture missing retained output is typed failed and repeats only its durable receipt',async()=>{
+ const f=fixture(),session='capture-unavailable',meta=await completedHeadless(f,session);
+ const made=await f.call('/api/sessions/'+session+'/commands','POST',{kind:'capture',key:'missing'},captureOperator);const command=(await made.json() as any).command;
+ const path='/api/sessions/'+session+'/commands/'+command.id+'/ack';
+ const body={epoch:meta.epoch,result:{error:'task_output_unavailable',capture_source:'retained_task_output',capture_binding:command.capture_binding}};
+ assert.equal((await f.call(path,'POST',body)).status,200);assert.equal((await f.call(path,'POST',body)).status,200);
+ const row=f.database.prepare('SELECT state,result_json FROM session_commands WHERE id=?').get(command.id) as any;
+ assert.equal(row.state,'failed');assert.equal(JSON.parse(row.result_json).reason,'task_output_unavailable');
+});
+
+test('terminal ACK never accepts a foreign binding or an unqualified native pane; running legacy remains compatible',async()=>{
+ const f=fixture(),session='retained-fences',meta=await completedHeadless(f,session,undefined,false);
+ const made=await f.call('/api/sessions/'+session+'/commands','POST',{kind:'capture',key:'running-legacy'},captureOperator);const command=(await made.json() as any).command;
+ const path='/api/sessions/'+session+'/commands/'+command.id+'/ack';
+ assert.equal((await f.call(path,'POST',{epoch:meta.epoch,result:{output:'legacy running'}})).status,200);
+ assert.equal((await f.call('/api/sessions/'+session+'/finish','POST',meta.finish)).status,201);
+ assert.equal((await f.call(path,'POST',{epoch:meta.epoch,result:{output:'legacy running'}})).status,200,'old running ACK replay stays idempotent after finish');
+ const terminal=await f.call('/api/sessions/'+session+'/commands','POST',{kind:'capture',key:'new-terminal'},captureOperator);const c=(await terminal.json() as any).command;
+ for(const result of [{output:'wrong'}, {output:'pane',capture_source:'native_pane',capture_binding:c.capture_binding},
+  {output:'wrong digest',capture_source:'retained_task_output',capture_binding:{...c.capture_binding,request_digest:'0'.repeat(64)}}]){
+  const ack=await f.call('/api/sessions/'+session+'/commands/'+c.id+'/ack','POST',{epoch:meta.epoch,result});
+  assert([400,409].includes(ack.status));
+ }
+ assert.equal((f.database.prepare('SELECT state FROM session_commands WHERE id=?').get(c.id) as any).state,'pending');
+});
+
+test('real Python retained file ACK composes with qualified completed Machine capture without native calls',async()=>{
+ const {spawnSync}=await import('node:child_process'),{mkdirSync,mkdtempSync,rmSync}=await import('node:fs'),{resolve,join}=await import('node:path');
+ const base=resolve(import.meta.dirname,'../../.local/tmp');mkdirSync(base,{recursive:true});const directory=mkdtempSync(join(base,'terminal-capture-wire-'));
+ const f=fixture(),session='terminal-wire-composition';
+ try{
+  const meta=await completedHeadless(f,session,undefined,true,directory);
+  const made=await f.call('/api/sessions/'+session+'/commands','POST',{kind:'capture',key:'composed'},captureOperator);assert.equal(made.status,201);
+  const wire=(await made.json() as any).command;
+  const script=`import json,sys,time
+from pathlib import Path
+from agent_hub_host.agent import Bridge,Journal
+from agent_hub_host import task_output
+command=json.loads(sys.stdin.read());root=Path(sys.argv[1]);journal=Journal(root/'private/journal.sqlite')
+binding=command['capture_binding'];tag='task-hub2-'+command['session_id'];task='hub2-'+command['session_id']
+journal.db.execute("INSERT INTO launches(operation_id,session_id,epoch,digest,workspace,tag,native_id,state,interactive) VALUES(?,?,?,?,?,?,?,'exited',0)",(binding['operation_id'],command['session_id'],command['epoch'],'immutable-launch',str(root),tag,binding['native_id']));journal.db.commit()
+spec={'workspace':str(root),'operation_id':binding['operation_id'],'epoch':command['epoch']}
+output=task_output.prepare_output(task,spec,'local-go','opencode','synthetic private prompt');outdir=root.joinpath(*output['parts']);created=int(time.time()*1000)-1000
+record={'session_id':binding['native_id'],'workspace':str(root),'tag':tag,'created_at_ms':created,'task_output':output}
+start={'schema_version':1,'parent_session':{'id':binding['native_id'],'workspace':str(root),'tag':tag},'cwd':str(root),'output_dir':str(outdir),'started_ms':created+1,'profile':'local-go','engine':'opencode','prompt_sha256':output['prompt_sha256']}
+for path,value in ((root/'.local'/('launch-'+task+'.json'),record),(outdir/'START.json',start)):
+ path.write_text(json.dumps(value));path.chmod(0o600)
+text=json.dumps({'type':'tool_use','part':{'type':'tool','tool':'shell','state':{'status':'completed','output':'CANARY-OK:synthetic-retained'}}})
+(outdir/'stdout.log').write_text(text);(outdir/'stdout.log').chmod(0o664)
+def forbidden(*args,**kw):raise AssertionError('terminal capture must not invoke any native command')
+bridge=Bridge(None,journal,[root],['go'],executable=sys.executable,runner=forbidden,machine_id='h1')
+result=bridge.command(command);assert result['capture_source']=='retained_task_output' and result['output']==text
+journal.db.close();journal=Journal(root/'private/journal.sqlite');bridge.journal=journal;bridge.launcher.journal=journal
+assert bridge.command(command)==result
+payload=json.loads(journal.db.execute('SELECT payload FROM outbox').fetchone()[0]);journal.db.close();print(json.dumps(payload))
+`;
+  const child=spawnSync('python3',['-c',script,directory],{input:JSON.stringify(wire),encoding:'utf8',timeout:10000,maxBuffer:16384,
+   env:{...process.env,PYTHONPATH:resolve(import.meta.dirname,'../host')}});
+  assert.equal(child.status,0,child.stderr);const body=JSON.parse(child.stdout);
+  assert.equal((await f.call('/api/sessions/'+session+'/commands/'+wire.id+'/ack','POST',body)).status,200);
+  const result=JSON.parse((f.database.prepare('SELECT result_json FROM session_commands WHERE id=?').get(wire.id) as any).result_json);
+  assert.equal(JSON.parse(result.output).part.state.status,'completed');assert.equal(result.capture_source,'retained_task_output');
+  assert(!JSON.stringify(result).includes('synthetic private prompt'));
+ }finally{f.database.close();rmSync(directory,{recursive:true});}
+});
