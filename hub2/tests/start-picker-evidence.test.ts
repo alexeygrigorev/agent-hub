@@ -242,7 +242,8 @@ test('a full 32-row pool stays bounded and travels separately from an 8192-byte 
     const own=await intake(f,'large-pool');
     const response=await f.call('/api/intakes/'+own.id+'/start','POST',{key:'large-start',workspace:'picker',prompt:'x'.repeat(8192)});
     assert.equal(response.status,201);const created=await parsed(response),reserved=f.reservations[0];
-    assert.equal(created.picker.pool.length,32);assert.equal(reserved.launch.prompt.length,8192);
+    assert.equal(created.picker.pool.length,32);assert(reserved.launch.prompt.startsWith('x'.repeat(8192)+'\n\n--- Hub task completion contract ---\n'));
+    assert(new TextEncoder().encode(JSON.stringify(reserved.launch)).length<=12_000,'contract keeps a maximal prompt within the Machine launch limit');
     assert.deepEqual(reserved.picker,created.picker);
     assert(new TextEncoder().encode(JSON.stringify(reserved)).length<64_000);
     const rows=Array.from({length:32},(_,i)=>({policy_id:String(i).padStart(3,'0')+'p'.repeat(117),engine:'e'.repeat(120),model:'m'.repeat(120),effort:'medium',weight:1,share:1/32}));
