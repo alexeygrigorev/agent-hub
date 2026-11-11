@@ -295,6 +295,12 @@ export class ControlDO {
   private async engines(request: Request, path: string): Promise<Response> {
     const actor = actorFrom(request);
     if (path === '/api/engines' && request.method === 'GET') return await this.listManagedEngines(actor);
+    if (path === '/api/engines/maintain' && request.method === 'POST') {
+      if (!hasScope(actor, 'operator:admin')) return error('forbidden', 403);
+      const response = await this.accountRequest('/api/account/maintain', 'POST', actor!, {});
+      if (!response.ok) return response;
+      return json({ results: [{ label: CLAUDE_ENGINE_LABEL, ...await response.json() as JsonRecord }] });
+    }
     if (path === '/api/engines/sync' && request.method === 'GET') return await this.syncManagedEngines(actor);
     if (path === '/api/engines/admission' && request.method === 'POST') return await this.engineAdmission(request, actor);
     if (path === '/api/engines/credential-logins' || /^\/api\/engines\/credential-logins\/[0-9a-f-]{36}$/i.test(path))
