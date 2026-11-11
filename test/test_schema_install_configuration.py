@@ -296,9 +296,10 @@ class SchemaInstallConfigurationTests(unittest.TestCase):
             self.assertIn(f'HUB2_ALERT_EVIDENCE_DIR={staged[0]}\n', path.read_text())
 
     def test_helper_refuses_owned_temp_replacement_between_mkdir_and_stat_or_open(self):
-        # Ensure ensure_private_evidence_root never drops process capabilities or switches process euid/egid.
+        # Ensure ensure_private_evidence_root never drops process capabilities, switches process euid/egid,
+        # or performs name-based rmdir/unlink under the service-writable parent directory.
         helper_src = self.block.split('def ensure_private_evidence_root', 1)[1].split('if mode == "active"', 1)[0]
-        for forbidden in ('capset', 'prctl', 'seteuid', 'setegid', 'fchmod', 'time.sleep'):
+        for forbidden in ('capset', 'prctl', 'seteuid', 'setegid', 'fchmod', 'rmdir', 'unlink', 'time.sleep'):
             self.assertNotIn(forbidden, helper_src)
         self.assertEqual(helper_src.count('os.fchown('), 1)
         self.assertIn('os.fchown(child_fd, owner_uid, owner_gid)', helper_src)
@@ -312,7 +313,8 @@ class SchemaInstallConfigurationTests(unittest.TestCase):
             path.write_text(original)
             path.chmod(0o600)
 
-            # 1. Simulated root execution: parent capabilities remain untouched through _drop_privileges and .dev.vars chown.
+            # 1. Simulated root execution: parent capabilities remain untouched through _drop_privileges and .dev.vars chown,
+            # and the private 0700 .stage-box-<uuid> container is retained deliberately without name-based rmdir.
             root_state_dir = base / 'state-simulated-root'
             root_state_dir.mkdir(mode=0o700)
             root_evidence = root_state_dir / 'credential-monitor-evidence'
@@ -388,13 +390,83 @@ class SchemaInstallConfigurationTests(unittest.TestCase):
             self.assertIn(['fchown', ev_ino, 4242, 4242], events)
             self.assertIn(['chown_dev_vars', 4242, 4242], events)
             self.assertEqual([e for e in events if e[0].startswith('box')], [])
-            self.assertEqual([p.name for p in root_state_dir.iterdir()], ['credential-monitor-evidence'])
+            boxes = [p for p in root_state_dir.iterdir() if p.name.startswith('.stage-box-')]
+            self.assertEqual(len(boxes), 1)
+            self.assertEqual(stat.S_IMODE(boxes[0].lstat().st_mode), 0o700)
+            self.assertEqual(list(boxes[0].iterdir()), [])
+            self.assertTrue(root_evidence.is_dir() and not root_evidence.is_symlink())
             staged = list(root_evidence.iterdir())
             self.assertEqual(len(staged), 1)
             self.assertTrue(staged[0].name.startswith(head + '-'))
             path.write_text(original)
 
-            # 2. Race scenarios: replacement of box, replacement of child before fchown, pre-created leaf, post-publish leaf swap.
+            # 2. Cleanup replacement race: replacing .stage-box-<uuid> after publish with an unrelated empty or
+            # populated directory must leave the replacement directory byte- and metadata-present (never rmdir'd).
+            for populated in (False, True):
+                with self.subTest(cleanup_replacement_populated=populated):
+                    cleanup_state_dir = base / f'state-cleanup-{"pop" if populated else "empty"}'
+                    cleanup_state_dir.mkdir(mode=0o700)
+                    cleanup_evidence = cleanup_state_dir / 'credential-monitor-evidence'
+                    unrelated_dir = base / f'unrelated-{"pop" if populated else "empty"}'
+                    unrelated_dir.mkdir(mode=0o755)
+                    unrelated_dir.chmod(0o755)
+                    if populated:
+                        marker_file = unrelated_dir / 'keep.txt'
+                        marker_file.write_text('preserve-unrelated-bytes', encoding='utf-8')
+                        marker_file.chmod(0o640)
+                        before_marker_stat = marker_file.lstat()
+                    before_unrelated_stat = unrelated_dir.lstat()
+
+                    cleanup_harness = (
+                        'import os\n'
+                        f'cleanup_state_dir = {str(cleanup_state_dir)!r}\n'
+                        f'unrelated_dir = {str(unrelated_dir)!r}\n'
+                        'real_fsync = os.fsync\n'
+                        'swapped = False\n'
+                        'def hooked_fsync(fd):\n'
+                        '    global swapped\n'
+                        '    real_fsync(fd)\n'
+                        '    if not swapped and os.path.exists(os.path.join(cleanup_state_dir, "credential-monitor-evidence")):\n'
+                        '        boxes = [d for d in os.listdir(cleanup_state_dir) if d.startswith(".stage-box-")]\n'
+                        '        if boxes:\n'
+                        '            swapped = True\n'
+                        '            box_path = os.path.join(cleanup_state_dir, boxes[0])\n'
+                        '            os.rename(box_path, box_path + "-moved")\n'
+                        '            os.rename(unrelated_dir, box_path)\n'
+                        'os.fsync = hooked_fsync\n'
+                    ) + self.block
+
+                    res_cleanup = subprocess.run(
+                        [sys.executable, '-', str(path), 'active', 'apply', str(repo), str(cleanup_evidence)],
+                        input=cleanup_harness,
+                        text=True,
+                        capture_output=True,
+                        timeout=15,
+                    )
+                    self.assertEqual(res_cleanup.returncode, 0, res_cleanup.stderr)
+                    replaced_boxes = [
+                        p for p in cleanup_state_dir.iterdir()
+                        if p.name.startswith('.stage-box-') and not p.name.endswith('-moved')
+                    ]
+                    self.assertEqual(len(replaced_boxes), 1)
+                    after_unrelated_stat = replaced_boxes[0].lstat()
+                    self.assertEqual(after_unrelated_stat.st_ino, before_unrelated_stat.st_ino)
+                    self.assertEqual(stat.S_IMODE(after_unrelated_stat.st_mode), 0o755)
+                    self.assertEqual(
+                        (after_unrelated_stat.st_uid, after_unrelated_stat.st_gid),
+                        (before_unrelated_stat.st_uid, before_unrelated_stat.st_gid),
+                    )
+                    if populated:
+                        replaced_marker = replaced_boxes[0] / 'keep.txt'
+                        self.assertTrue(replaced_marker.is_file())
+                        self.assertEqual(replaced_marker.read_text(encoding='utf-8'), 'preserve-unrelated-bytes')
+                        self.assertEqual(replaced_marker.lstat().st_ino, before_marker_stat.st_ino)
+                        self.assertEqual(stat.S_IMODE(replaced_marker.lstat().st_mode), 0o640)
+                    else:
+                        self.assertEqual(list(replaced_boxes[0].iterdir()), [])
+                    path.write_text(original)
+
+            # 3. Race scenarios: replacement of box, replacement of child before fchown, pre-created leaf, post-publish leaf swap.
             scenarios = (
                 'replace_box_with_service_owned_dir',
                 'replace_child_with_service_owned_dir_before_fchown',
@@ -408,8 +480,10 @@ class SchemaInstallConfigurationTests(unittest.TestCase):
                     state_dir.mkdir(mode=0o700)
                     evidence_root = state_dir / 'credential-monitor-evidence'
                     pre_existing = base / f'pre-{scenario}'
-                    pre_existing.mkdir(mode=0o700)
-                    pre_ino = pre_existing.lstat().st_ino
+                    pre_existing.mkdir(mode=0o755)
+                    pre_existing.chmod(0o755)
+                    pre_stat = pre_existing.lstat()
+                    pre_ino = pre_stat.st_ino
 
                     harness = (
                         'import os, sys\n'
@@ -484,9 +558,16 @@ class SchemaInstallConfigurationTests(unittest.TestCase):
                     self.assertNotEqual(res.returncode, 0, f'{scenario} should fail closed')
                     self.assertIn('credential_monitor_staging_failed', res.stderr)
                     self.assertEqual(path.read_text(), original)
-                    if evidence_root.exists():
-                        self.assertEqual(evidence_root.lstat().st_ino, pre_ino)
-                        self.assertEqual(list(evidence_root.iterdir()), [])
+                    # Verify pre_existing directory was never deleted or mutated regardless of where it was moved.
+                    matching_dirs = [
+                        p for p in state_dir.rglob('*')
+                        if p.is_dir() and p.lstat().st_ino == pre_ino
+                    ]
+                    self.assertEqual(len(matching_dirs), 1, f'unrelated replacement deleted in {scenario}')
+                    after_pre = matching_dirs[0].lstat()
+                    self.assertEqual(stat.S_IMODE(after_pre.st_mode), 0o755)
+                    self.assertEqual((after_pre.st_uid, after_pre.st_gid), (pre_stat.st_uid, pre_stat.st_gid))
+                    self.assertEqual(list(matching_dirs[0].iterdir()), [])
 
     def test_rollback_restores_previous_dev_vars_and_retains_all_historical_boundaries(self):
         with tempfile.TemporaryDirectory(dir=self.temporary_root) as temporary:
