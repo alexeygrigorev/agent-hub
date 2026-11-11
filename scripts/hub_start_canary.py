@@ -430,6 +430,12 @@ class Canary:
         return isinstance(value, str) and bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", value))
 
     @staticmethod
+    def valid_native_id(value):
+        return isinstance(value, str) and bool(
+            re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", value)
+        )
+
+    @staticmethod
     def row_authoritative_key(item):
         ck = item.get("client_key")
         k = item.get("key")
@@ -511,11 +517,13 @@ class Canary:
                     if cls.row_conflicts_scope(item, expected_repo, expected_machine, expected_workspace):
                         return None, None, True
                     sid_rows.append(item)
-            native_ids = {
-                item.get("native_id")
-                for item in sid_rows
-                if isinstance(item.get("native_id"), str) and item.get("native_id")
-            }
+            native_ids = set()
+            for item in sid_rows:
+                row_nat = item.get("native_id")
+                if row_nat is not None:
+                    if not cls.valid_native_id(row_nat):
+                        return None, None, True
+                    native_ids.add(row_nat)
             if len(native_ids) > 1:
                 return None, None, True
             resolved_native = next(iter(native_ids), None)
@@ -544,11 +552,13 @@ class Canary:
         if not key_rows:
             return None, None, False
         sids = {item.get("id") for item in key_rows}
-        native_ids = {
-            item.get("native_id")
-            for item in key_rows
-            if isinstance(item.get("native_id"), str) and item.get("native_id")
-        }
+        native_ids = set()
+        for item in key_rows:
+            row_nat = item.get("native_id")
+            if row_nat is not None:
+                if not cls.valid_native_id(row_nat):
+                    return None, None, True
+                native_ids.add(row_nat)
         if len(sids) != 1 or len(native_ids) > 1:
             return None, None, True
         resolved_sid = next(iter(sids))
@@ -737,7 +747,10 @@ class Canary:
         if raw_sid is not None and not self.valid_session_id(raw_sid):
             raise StageFailure("cleanup", "prior_pending_corrupt")
         sid = raw_sid if self.valid_session_id(raw_sid) else None
-        native_id = rec.get("native_id") if isinstance(rec.get("native_id"), str) and rec.get("native_id") else None
+        raw_native = rec.get("native_id")
+        if raw_native is not None and not self.valid_native_id(raw_native):
+            raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
+        native_id = raw_native if self.valid_native_id(raw_native) else None
         key = rec.get("key") if isinstance(rec.get("key"), str) and rec.get("key") else None
         repo = rec.get("repo") if isinstance(rec.get("repo"), str) and rec.get("repo") else None
         machine = rec.get("machine") if isinstance(rec.get("machine"), str) and rec.get("machine") else None
@@ -792,6 +805,8 @@ class Canary:
         if not confirmed:
             raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
         native_id = native_id or resolved_native
+        if native_id is not None and not self.valid_native_id(native_id):
+            raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
         if native_id:
             try:
                 self.wait_gone_for(native_id, deadline)
@@ -1029,8 +1044,6 @@ class Canary:
             if event.get('type') == 'result' and marker_in(event.get('result')):
                 return True
             part = event.get('part')
-            if event.get('type') == 'text' and isinstance(part, dict) and marker_in(part.get('text')):
-                return True
             if (
                 event.get('type') == 'tool_use'
                 and isinstance(part, dict)
@@ -1127,10 +1140,12 @@ class Canary:
         row_key, key_conflict = self.row_authoritative_key(node)
         if key_conflict or (expected_key and row_key is not None and row_key != expected_key):
             return False, None
-        session_native = node.get("native_id")
-        if not isinstance(session_native, str) or not session_native.strip():
+        if expected_native_id is not None and not self.valid_native_id(expected_native_id):
             return False, None
-        if expected_native_id and session_native != expected_native_id:
+        session_native = node.get("native_id")
+        if not self.valid_native_id(session_native):
+            return False, None
+        if expected_native_id is not None and session_native != expected_native_id:
             return False, None
         intake_id = node.get("intake_id")
         if not isinstance(intake_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", intake_id):
@@ -1234,9 +1249,11 @@ class Canary:
     ):
         rc, _, err = self.stop_session_with_output(session_id, stop_key, deadline)
         if rc == 0:
+            if expected_native_id is not None and not self.valid_native_id(expected_native_id):
+                return False, None
             return True, expected_native_id
         if self.failure_reason(rc, err) == "session_not_running":
-            return self.verify_terminal_session_retired(
+            verified, resolved_native = self.verify_terminal_session_retired(
                 session_id,
                 deadline,
                 expected_native_id=expected_native_id,
@@ -1245,6 +1262,9 @@ class Canary:
                 expected_machine=expected_machine,
                 expected_workspace=expected_workspace,
             )
+            if not verified or not self.valid_native_id(resolved_native):
+                return False, None
+            return True, resolved_native
         return False, expected_native_id
 
     def stop(self, deadline, suffix="stop"):
@@ -1370,6 +1390,8 @@ class Canary:
         if not confirmed:
             return "FAILED_needs_reconciliation"
         self.native = self.native or resolved_native
+        if self.native is not None and not self.valid_native_id(self.native):
+            return "FAILED_needs_reconciliation"
         if self.native:
             try:
                 self.wait_gone(limit_deadline)
