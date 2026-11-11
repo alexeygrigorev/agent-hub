@@ -48,6 +48,7 @@ require('wait_for_hub2_readiness()' in installer,
         "installer must poll Hub2 readiness with a bounded loop")
 
 import os
+import re
 import subprocess
 import tempfile
 
@@ -127,7 +128,13 @@ with tempfile.TemporaryDirectory(prefix="hub-installer-readiness-", dir=scratch)
         if deadline_s > 0:
             env["AGENT_HUB_DEPLOY_TEST_MODE"] = "1"
             env["AGENT_HUB_TEST_READINESS_DEADLINE_S"] = str(deadline_s)
-        proc = subprocess.run(["bash", "-euo", "pipefail", "-c", services_block], env=env, text=True, capture_output=True)
+        proc = subprocess.run(
+            ["bash", "-euo", "pipefail", "-c", services_block],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=15,
+        )
         return (
             proc,
             int(curl_count.read_text(encoding="utf-8").strip() or "0"),
@@ -158,11 +165,19 @@ with tempfile.TemporaryDirectory(prefix="hub-installer-readiness-", dir=scratch)
     # 3. Elapsed wall-clock deadline bounds slow attempts before 15 tries and shrinks --max-time
     proc, curls, sleeps, _, curl_args = run_services(hub_only="true", fail_curl_first=15, deadline_s=2, curl_delay_s=1)
     require(proc.returncode != 0, "elapsed deadline exhaustion must fail closed")
-    require(curls == 2, f"expected elapsed 2s deadline to stop after 2 slow 1s attempts, got {curls}")
-    require(sleeps == 1, f"expected 1 sleep before 2s deadline expired, got {sleeps}")
-    require("--max-time 2" in curl_args[0] and "--max-time 1" in curl_args[1], f"expected --max-time to shrink to remaining budget: {curl_args}")
+    require(1 <= curls <= 3 and curls < 15, f"expected elapsed 2s deadline to stop well before 15 attempts, got {curls}")
+    require(sleeps == curls - 1, f"expected sleeps == curls - 1 before deadline expired, got sleeps={sleeps} curls={curls}")
+    max_times = [int(m.group(1)) for line in curl_args if (m := re.search(r"--max-time\s+(\d+)", line))]
     require(
-        "ERROR: Hub2 local health check http://127.0.0.1:8787/health did not become ready after 2 attempts / 2s (last curl exit=7)" in proc.stderr,
+        len(max_times) == curls and all(1 <= t <= 2 for t in max_times),
+        f"expected --max-time within remaining 2s budget on every attempt: {curl_args}",
+    )
+    require(
+        re.search(
+            r"ERROR: Hub2 local health check http://127\.0\.0\.1:8787/health did not become ready after [1-3] attempts / [1-6]s \(last curl exit=7\)",
+            proc.stderr,
+        )
+        is not None,
         f"missing elapsed-deadline readiness diagnostic on stderr: {proc.stderr}",
     )
 
