@@ -14,7 +14,7 @@ import { credentialKey, openCredential, sealCredential } from './credential-cryp
 import { actorFrom, bodyObject, boundedString, boundedText, error, hasScope, HttpError, HUB2_FORWARD_BODY_LIMIT, json } from './http';
 import { modelPolicyCandidateViolation, type ModelPolicyRoute } from './model-policy';
 import { isLiveActiveSession, MAX_ACTIVE_SESSIONS } from './session-liveness';
-import { CLAUDE_OAUTH, claudeAuthorization, claudeExchange } from '../../src/credentials';
+import { CLAUDE_OAUTH, claudeAuthorization, claudeExchange } from './claude-oauth';
 import type { Actor, Hub2Env, JsonRecord } from './types';
 
 type CredentialActor=Actor&{family_id?:string;client_id?:string};
