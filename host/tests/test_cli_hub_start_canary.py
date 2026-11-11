@@ -1661,6 +1661,7 @@ class CanaryTest(unittest.TestCase):
             ev_attempt_operation_id="1ae2c72b-edf1-52dd-a22b-c8964afd4a8f:0",
             stop_confirmed=None,
             include_evidence=True,
+            native_id=NATIVE,
         ):
             sess = {
                 "id": SID,
@@ -1674,7 +1675,7 @@ class CanaryTest(unittest.TestCase):
                 "requested_workspace": ws,
                 "epoch": epoch,
                 "operation_id": operation_id,
-                "native_id": NATIVE,
+                "native_id": native_id,
                 "created_at": created_at,
                 "updated_at": "2026-11-11T15:26:37.604Z",
             }
@@ -1695,7 +1696,7 @@ class CanaryTest(unittest.TestCase):
                             "signal": None,
                         },
                         "native_identity": {
-                            "id": NATIVE,
+                            "id": native_id,
                             "tag": tag,
                             "workspace": nid_ws,
                         },
@@ -1706,7 +1707,7 @@ class CanaryTest(unittest.TestCase):
                     "intake_id": "09717ebe-e742-4403-80a9-2c6d9cb2d845",
                     "machine_id": "HOST-1",
                     "native_exit_confirmed": native_exit_confirmed,
-                    "native_id": NATIVE,
+                    "native_id": native_id,
                     "operation_id": ev_operation_id,
                     "session_id": SID,
                 }
@@ -1793,6 +1794,11 @@ class CanaryTest(unittest.TestCase):
             make_retired_show(exited_at_ms=1700000000000),  # before created_at
             make_retired_show(ev_epoch=999),
             make_retired_show(ev_attempt_operation_id="different-op:0"),
+            make_retired_show(native_id="bogus"),
+            make_retired_show(native_id="aaaaaaaa-bbbb"),
+            make_retired_show(native_id="AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE"),
+            make_retired_show(state="stopped", stop_confirmed=True, include_evidence=False, native_id="bogus"),
+            make_retired_show(state="stopped", stop_confirmed=True, include_evidence=False, native_id="aaaaaaaa-bbbb"),
         ]
         for idx, bad_payload in enumerate(invalid_payloads):
             with self.subTest(bad_case=idx):
@@ -1810,12 +1816,13 @@ class CanaryTest(unittest.TestCase):
                             "prompt": "Reply CANARY-OK and exit",
                             "candidate_sha": None,
                             "session_id": SID,
-                            "native_id": NATIVE,
+                            "native_id": None if bad_payload["session"]["native_id"] != NATIVE else NATIVE,
                         }
                     )
                 )
                 os.chmod(pfile, 0o600)
                 (self.tmp / "show_payload.json").write_text(json.dumps(bad_payload))
+                (self.tmp / "archived_intake").unlink(missing_ok=True)
                 (self.tmp / "calls.log").write_text("")
                 r_bad, v_bad = self.run_canary("reconcile_stop_409", "--mode", "shell")
                 self.assertEqual(r_bad.returncode, 1)
@@ -1824,13 +1831,44 @@ class CanaryTest(unittest.TestCase):
                     (False, "cleanup", "prior_pending_reconciliation_failed", None),
                 )
                 self.assertTrue(pfile.exists())
+                self.assertFalse((self.tmp / "archived_intake").exists())
                 self.assertEqual([ln for ln in self.calls().splitlines() if ln.startswith("sessions start ")], [])
                 pfile.unlink()
         (self.tmp / "show_payload.json").unlink(missing_ok=True)
 
+        # Direct unit probe for B2: when expected_native_id is None and real UUID is alive in a_running,
+        # self-consistent bogus/partial native_id in sessions show must return (False, None).
+        from scripts import hub_start_canary as mod
+        c_probe = mod.Canary("full", "probe-b2", deploy_gate=True)
+        for bad_nat in ("bogus", "aaaaaaaa-bbbb", "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE", ""):
+            for st_mode in ("retired", "stopped"):
+                payload = (
+                    make_retired_show(native_id=bad_nat)
+                    if st_mode == "retired"
+                    else make_retired_show(state="stopped", stop_confirmed=True, include_evidence=False, native_id=bad_nat)
+                )
+                (self.tmp / "show_payload.json").write_text(json.dumps(payload))
+                c_probe.hub = [sys.executable, str(self.tmp / "fake_hub.py")]
+                os.environ["FAKE_DIR"] = str(self.tmp)
+                os.environ["FAKE_SCENARIO"] = "ok"
+                self.assertEqual(
+                    c_probe.verify_terminal_session_retired(
+                        SID,
+                        time.monotonic() + 5.0,
+                        expected_native_id=None,
+                        expected_key="canary-probe-b2",
+                        expected_repo="owner/repo",
+                        expected_machine="HOST-1",
+                        expected_workspace=ws,
+                    ),
+                    (False, None),
+                )
+        (self.tmp / "show_payload.json").unlink(missing_ok=True)
+
         # 6. @opencode/cli --format json completed tool output (type="tool_use", part.type="tool",
         # part.state.status="completed", part.state.output with standalone marker) is accepted,
-        # while non-completed tool states, input/rawInput/metadata, and inline assistant summaries are rejected.
+        # while Go assistant-only text events (even with standalone marker), non-completed tool states,
+        # input/rawInput/metadata, and inline assistant summaries are rejected.
         (self.tmp / "capture_output.txt").write_text(
             json.dumps(
                 {
@@ -1853,6 +1891,25 @@ class CanaryTest(unittest.TestCase):
         self.assertTrue(v_tool_ok["ok"])
 
         rejected_captures = [
+            # Go @opencode/cli --format json assistant-only text event with standalone marker (zero tool_use) must NOT count
+            json.dumps(
+                {
+                    "type": "text",
+                    "part": {
+                        "type": "text",
+                        "text": "__MARKER__",
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "text",
+                    "part": {
+                        "type": "text",
+                        "text": "Intro line\n__MARKER__\nOutro line",
+                    },
+                }
+            ),
             # Non-completed tool status must not count even if output has marker
             json.dumps(
                 {
