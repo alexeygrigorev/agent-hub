@@ -30,6 +30,7 @@ if args[:2] == ["sessions", "start"]:
     if sc == "typed_start_fail": sys.stderr.write("Session HTTP request failed with status 503 (no_connected_host)\n"); sys.exit(1)
     if sc == "start_garbage": print("not json"); sys.exit(0)
     if sc == "start_noid": print(json.dumps({"state": "queued"})); sys.exit(0)
+    if sc == "replay_timeout_empty_list": time.sleep(2); sys.exit(0)
     first = not (d / "started").exists()
     (d / "started").write_text("1"); (d / "a_running").write_text("1")
     prompt_text = args[args.index("--prompt") + 1]
@@ -150,6 +151,34 @@ sys.exit(2)
 
 SINK = '#!/usr/bin/env bash\n{ printf "ARGS\\t%s\\n" "$*"; cat; printf "\\n---END---\\n"; } >> "$MAIL_SINK"\n[[ "${MAIL_FAIL:-0}" != 1 ]]\n'
 
+FAKE_SYSTEMCTL = r'''#!%s
+import json, os, pathlib, shutil, sys, time
+d = pathlib.Path(os.environ["FAKE_DIR"])
+rec = {"argv": sys.argv[1:], "xdg_runtime_dir": os.environ.get("XDG_RUNTIME_DIR")}
+with open(d / "systemctl.jsonl", "a", encoding="utf-8") as fh:
+    fh.write(json.dumps(rec) + "\n")
+action = os.environ.get("FAKE_SYSTEMCTL_ACTION", "noop")
+if action == "fail_exit_1":
+    sys.stderr.write("Failed to start agent-hub2-host-update.service\n")
+    sys.exit(1)
+if action == "hang":
+    time.sleep(5)
+    sys.exit(0)
+if action == "converge_from_staged":
+    staged = pathlib.Path(os.environ["FAKE_STAGED_RELEASE_DIR"])
+    rel_root = pathlib.Path(os.environ["HUB_CANARY_HOST_RELEASE_ROOT"])
+    sha = staged.name
+    dst = rel_root / "releases" / sha
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if not dst.exists():
+        shutil.copytree(staged, dst)
+    cur = rel_root / "current"
+    if cur.exists() or cur.is_symlink():
+        cur.unlink()
+    cur.symlink_to(dst)
+sys.exit(0)
+''' % sys.executable
+
 
 class CanaryTest(unittest.TestCase):
     def setUp(self):
@@ -166,6 +195,12 @@ class CanaryTest(unittest.TestCase):
         trap = self.tmp / "bin" / "msmtp"  # must never be reached
         trap.write_text('#!/usr/bin/env bash\ntouch "%s/REAL_MSMTP_CALLED"\n' % self.tmp)
         trap.chmod(0o755)
+        fake_sctl = self.tmp / "bin" / "systemctl"
+        fake_sctl.write_text(FAKE_SYSTEMCTL)
+        fake_sctl.chmod(0o755)
+        self.xdg_runtime = self.tmp / "xdg-runtime"
+        self.xdg_runtime.mkdir(mode=0o700)
+        os.chmod(self.xdg_runtime, 0o700)
         self.sink = self.tmp / "mail.sink"
         self.state = self.tmp / "state"
 
@@ -173,6 +208,7 @@ class CanaryTest(unittest.TestCase):
         env = dict(os.environ)
         env.update(
             PATH=f"{self.tmp / 'bin'}:{env['PATH']}",
+            XDG_RUNTIME_DIR=str(self.xdg_runtime),
             FAKE_DIR=str(self.tmp), FAKE_SCENARIO=scenario,
             HUB_BIN=f"{sys.executable} {self.tmp / 'fake_hub.py'}", A_BIN=f"{sys.executable} {self.tmp / 'fake_a.py'}",
             HUB_CANARY_MAILER=str(self.mailer), MAIL_SINK=str(self.sink),
@@ -183,7 +219,7 @@ class CanaryTest(unittest.TestCase):
         )
         env["FAKE_PROMPT"] = mode_prompt or ("Reply CANARY-OK and exit" if ("full" in args or "--deploy-gate" in args) else "printf CANARY-OK; sleep 30")
         env.update(extra)
-        for f in ("started", "a_running", "stopped", "list_count"):
+        for f in ("started", "a_running", "stopped", "list_count", "systemctl.jsonl"):
             (self.tmp / f).unlink(missing_ok=True)
         (self.tmp / "calls.log").write_text("")
         r = subprocess.run([str(SCRIPT), *args], env=env, capture_output=True, text=True, timeout=60)
@@ -193,17 +229,24 @@ class CanaryTest(unittest.TestCase):
     def calls(self):
         return (self.tmp / "calls.log").read_text()
 
+    def systemctl_calls(self):
+        p = self.tmp / "systemctl.jsonl"
+        return [json.loads(line) for line in p.read_text().splitlines()] if p.exists() else []
+
     def test_actual_canary_argv_is_accepted_by_the_maintained_cli(self):
         import argparse
         sys.path.insert(0, str(ROOT / 'host'))
-        from agent_hub_host import session_control
+        from agent_hub_host import intake, session_control
         parser = argparse.ArgumentParser()
-        session_control.add_commands(parser.add_subparsers(dest='command'))
+        sub = parser.add_subparsers(dest='command')
+        session_control.add_commands(sub)
+        intake.add_commands(sub)
         for mode in ('shell', 'full'):
             result, _ = self.run_canary('ok', '--mode', mode)
             self.assertEqual(result.returncode, 0, result.stderr)
         calls = [json.loads(line) for line in (self.tmp / 'argv.jsonl').read_text().splitlines()]
         self.assertTrue(any(args[:2] == ['sessions', 'capture'] for args in calls))
+        self.assertTrue(any(args[:2] == ['intake', 'update'] for args in calls))
         for args in calls:
             with self.subTest(argv=args[:3]):
                 parser.parse_args(args)
@@ -260,7 +303,11 @@ class CanaryTest(unittest.TestCase):
 
     def test_stage_start_garbage_and_no_id(self):
         self.assert_stage("start_garbage", "start", "unparseable_json")
+        self.assertEqual(len(list((self.state / "pending").glob("*.json"))), 1)
+        for p in (self.state / "pending").glob("*.json"):
+            p.unlink()
         self.assert_stage("start_noid", "start", "no_session_id")
+        self.assertEqual(len(list((self.state / "pending").glob("*.json"))), 1)
 
     def test_stage_running_never(self):
         v = self.assert_stage("never_running", "running", "native_launch_unverified")
@@ -1318,6 +1365,271 @@ class CanaryTest(unittest.TestCase):
         calls_auth = self.calls().splitlines()
         self.assertEqual(sum(1 for line in calls_auth if line.startswith("sessions start ")), 1)
         self.assertEqual(sum(1 for line in calls_auth if line == "sessions list --all --json"), 1)
+
+    def test_precommit_deploy_gate_triggers_maintained_updater_once_and_validates_xdg_runtime_dir(self):
+        sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
+        token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        helper_sha = self.helper_sha256()
+        staged_root, pyz_sha = self.prepare_candidate_release(sha, converge=True)
+        staged_rel = self.tmp / "staged-release" / sha
+        shutil.copytree(staged_root / "releases" / sha, staged_rel)
+
+        # Start with empty host-releases root so candidate release is not yet installed.
+        empty_root = self.tmp / "empty-host-releases"
+        empty_root.mkdir()
+        r_conv, v_conv = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_BIN="/nonexistent/global-hub-must-not-be-used",
+            HUB_CANARY_HOST_RELEASE_ROOT=str(empty_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.4",
+            FAKE_HOST_VERSION=sha,
+            FAKE_SYSTEMCTL_ACTION="converge_from_staged",
+            FAKE_STAGED_RELEASE_DIR=str(staged_rel),
+        )
+        self.assertEqual(r_conv.returncode, 0, r_conv.stderr)
+        self.assertTrue(v_conv["ok"])
+        self.assertEqual(v_conv["host_updater_trigger"], "triggered")
+        self.assertNotIn("host_updater_trigger_error", v_conv)
+        sctl = self.systemctl_calls()
+        self.assertEqual(len(sctl), 1)
+        self.assertEqual(
+            sctl[0]["argv"],
+            ["--user", "start", "--no-block", "agent-hub2-host-update.service"],
+        )
+        self.assertEqual(sctl[0]["xdg_runtime_dir"], str(self.xdg_runtime))
+
+        # Already converged on first check -> updater not triggered.
+        r_already, v_already = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_HOST_RELEASE_ROOT=str(empty_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
+            FAKE_HOST_VERSION=sha,
+        )
+        self.assertEqual(r_already.returncode, 0, r_already.stderr)
+        self.assertEqual(v_already["host_updater_trigger"], "not_needed")
+        self.assertEqual(self.systemctl_calls(), [])
+
+        # Unconverged release + multiple poll loops -> updater still triggered AT MOST ONCE.
+        unconv_root, _ = self.prepare_candidate_release(sha, converge=False)
+        r_once, v_once = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_HOST_RELEASE_ROOT=str(unconv_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.1",
+            HUB_CANARY_POLL_S="0.01",
+            FAKE_SYSTEMCTL_ACTION="noop",
+        )
+        self.assertEqual(r_once.returncode, 1)
+        self.assertEqual(v_once["host_updater_trigger"], "triggered")
+        self.assertEqual(len(self.systemctl_calls()), 1)
+
+        # Reject symlink, non-private, or missing XDG_RUNTIME_DIR with typed trigger error and never call systemctl.
+        sym_xdg = self.tmp / "sym-xdg"
+        sym_xdg.symlink_to(self.xdg_runtime)
+        r_sym, v_sym = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_HOST_RELEASE_ROOT=str(unconv_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.05",
+            XDG_RUNTIME_DIR=str(sym_xdg),
+        )
+        self.assertEqual(r_sym.returncode, 1)
+        self.assertEqual(v_sym["host_updater_trigger"], "failed")
+        self.assertEqual(v_sym["host_updater_trigger_error"], "host_updater_xdg_runtime_dir_symlink")
+        self.assertIn("host_updater_xdg_runtime_dir_symlink", v_sym["reason"])
+        self.assertEqual(self.systemctl_calls(), [])
+
+        open_xdg = self.tmp / "open-xdg"
+        open_xdg.mkdir(mode=0o755)
+        os.chmod(open_xdg, 0o755)
+        r_open, v_open = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_HOST_RELEASE_ROOT=str(unconv_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.05",
+            XDG_RUNTIME_DIR=str(open_xdg),
+        )
+        self.assertEqual(r_open.returncode, 1)
+        self.assertEqual(v_open["host_updater_trigger"], "failed")
+        self.assertEqual(v_open["host_updater_trigger_error"], "host_updater_xdg_runtime_dir_not_private")
+        self.assertEqual(self.systemctl_calls(), [])
+
+        # Non-zero systemctl exit records typed trigger error.
+        r_fail, v_fail = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_HOST_RELEASE_ROOT=str(unconv_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.05",
+            FAKE_SYSTEMCTL_ACTION="fail_exit_1",
+        )
+        self.assertEqual(r_fail.returncode, 1)
+        self.assertEqual(v_fail["host_updater_trigger"], "failed")
+        self.assertEqual(v_fail["host_updater_trigger_error"], "host_updater_trigger_exit_1")
+        self.assertIn("host_updater_trigger_exit_1", v_fail["reason"])
+
+    def test_periodic_mode_serializes_pending_state_archives_intake_and_ignores_lock_busy_for_alerts(self):
+        import fcntl
+
+        r_ok, v_ok = self.run_canary("ok", "--mode", "shell")
+        self.assertEqual(r_ok.returncode, 0, r_ok.stderr)
+        self.assertTrue(v_ok["ok"])
+        self.assertEqual(v_ok["intake_archived"], True)
+        self.assertEqual(
+            (self.tmp / "archived_intake").read_text(),
+            "intake update intake-canary-1 --status archived --note periodic_shell_canary",
+        )
+        self.assertEqual(list((self.state / "pending").glob("*.json")), [])
+
+        # Prior crashed periodic pending record with session_id is reconciled and archived on next periodic run.
+        pending_dir = self.state / "pending"
+        prior_periodic = pending_dir / "prior-periodic.json"
+        prior_periodic.write_text(
+            json.dumps(
+                {
+                    "run_id": "prior-periodic",
+                    "mode": "full",
+                    "name": "hub-canary-full-prior-periodic",
+                    "key": "canary-prior-periodic",
+                    "repo": "owner/repo",
+                    "machine": "HOST-1",
+                    "workspace": str((self.tmp / "ws").resolve()),
+                    "prompt": "Reply CANARY-OK and exit",
+                    "candidate_sha": None,
+                    "session_id": SID,
+                    "native_id": NATIVE,
+                }
+            )
+        )
+        os.chmod(prior_periodic, 0o600)
+        r_rec, v_rec = self.run_canary("ok", "--mode", "shell")
+        self.assertEqual(r_rec.returncode, 0, r_rec.stderr)
+        self.assertTrue(v_rec["ok"])
+        self.assertFalse(prior_periodic.exists())
+        self.assertIn("sessions stop " + SID + " --key canary-prior-periodic-reconcile", self.calls())
+
+        # Ambiguous prior periodic pending record (session_id=None, candidate_sha=None) must be RETAINED
+        # and fail closed at stage=cleanup/prior_pending_reconciliation_failed BEFORE minting any new start
+        # when same-key replay times out (rc=124) or returns unparseable output and list[] is empty.
+        prior_ambiguous = pending_dir / "prior-ambiguous.json"
+        prior_ambiguous.write_text(
+            json.dumps(
+                {
+                    "run_id": "prior-ambiguous",
+                    "mode": "shell",
+                    "name": "hub-canary-shell-prior-ambiguous",
+                    "key": "canary-prior-ambiguous",
+                    "repo": "owner/repo",
+                    "machine": "HOST-1",
+                    "workspace": str((self.tmp / "ws").resolve()),
+                    "prompt": "printf CANARY-OK; sleep 30",
+                    "candidate_sha": None,
+                    "session_id": None,
+                    "native_id": None,
+                }
+            )
+        )
+        os.chmod(prior_ambiguous, 0o600)
+
+        (self.tmp / "calls.log").write_text("")
+        r_to, v_to = self.run_canary(
+            "replay_timeout_empty_list", "--mode", "shell",
+            HUB_CANARY_CMD_TIMEOUT_S="0.05",
+            HUB_CANARY_STOP_TIMEOUT_S="0.2",
+        )
+        self.assertEqual(r_to.returncode, 1)
+        self.assertEqual(
+            (v_to["ok"], v_to["stage"], v_to["reason"], v_to["session_id"]),
+            (False, "cleanup", "prior_pending_reconciliation_failed", None),
+        )
+        self.assertTrue(prior_ambiguous.exists())
+        to_starts = [ln for ln in self.calls().splitlines() if ln.startswith("sessions start ")]
+        self.assertEqual(len(to_starts), 1)
+        self.assertIn("--key canary-prior-ambiguous", to_starts[0])
+
+        (self.tmp / "calls.log").write_text("")
+        r_garb, v_garb = self.run_canary("start_garbage", "--mode", "shell")
+        self.assertEqual(r_garb.returncode, 1)
+        self.assertEqual(
+            (v_garb["ok"], v_garb["stage"], v_garb["reason"], v_garb["session_id"]),
+            (False, "cleanup", "prior_pending_reconciliation_failed", None),
+        )
+        self.assertTrue(prior_ambiguous.exists())
+        garb_starts = [ln for ln in self.calls().splitlines() if ln.startswith("sessions start ")]
+        self.assertEqual(len(garb_starts), 1)
+        self.assertIn("--key canary-prior-ambiguous", garb_starts[0])
+        prior_ambiguous.unlink()
+
+        # Prior periodic pending record with exact session_id whose stop fails must abort BEFORE any fresh start.
+        prior_stop_fail = pending_dir / "prior-stop-fail.json"
+        prior_stop_fail.write_text(
+            json.dumps(
+                {
+                    "run_id": "prior-stop-fail",
+                    "mode": "shell",
+                    "name": "hub-canary-shell-prior-stop-fail",
+                    "key": "canary-prior-stop-fail",
+                    "repo": "owner/repo",
+                    "machine": "HOST-1",
+                    "workspace": str((self.tmp / "ws").resolve()),
+                    "prompt": "printf CANARY-OK; sleep 30",
+                    "candidate_sha": None,
+                    "session_id": SID,
+                    "native_id": NATIVE,
+                }
+            )
+        )
+        os.chmod(prior_stop_fail, 0o600)
+        (self.tmp / "calls.log").write_text("")
+        r_sf, v_sf = self.run_canary("stop_fail", "--mode", "shell")
+        self.assertEqual(r_sf.returncode, 1)
+        self.assertEqual(
+            (v_sf["ok"], v_sf["stage"], v_sf["reason"], v_sf["session_id"]),
+            (False, "cleanup", "prior_pending_reconciliation_failed", None),
+        )
+        self.assertTrue(prior_stop_fail.exists())
+        sf_starts = [ln for ln in self.calls().splitlines() if ln.startswith("sessions start ")]
+        self.assertEqual(sf_starts, [])
+        prior_stop_fail.unlink()
+
+        (self.state / "state-shell.json").unlink(missing_ok=True)
+        if self.sink.exists():
+            self.sink.unlink()
+
+        # Lock contention on deploy-gate.lock in periodic mode must NOT increment failures or send CRITICAL mail.
+        lock_fd = os.open(self.state / "deploy-gate.lock", os.O_RDWR)
+        self.addCleanup(os.close, lock_fd)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        for _ in range(3):
+            r_busy, v_busy = self.run_canary("ok", "--mode", "shell", HUB_CANARY_LOCK_WAIT_S="0.01")
+            self.assertEqual(r_busy.returncode, 1)
+            self.assertEqual((v_busy["ok"], v_busy["stage"], v_busy["reason"]), (False, "lock", "deploy_gate_lock_busy"))
+        self.assertEqual(self.mails(), [])
+        st = json.loads((self.state / "state-shell.json").read_text())
+        self.assertEqual(st["failures"], 0)
+        self.assertEqual(st["last_lock_busy"]["reason"], "deploy_gate_lock_busy")
+
+    def test_periodic_alert_state_failures_emit_structured_json_without_traceback(self):
+        self.state.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(self.state, 0o700)
+        victim = self.tmp / "victim-lock"
+        victim.write_text("keep")
+        (self.state / "shell.lock").symlink_to(victim)
+
+        r, v = self.run_canary("ok", "--mode", "shell")
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual((v["ok"], v["stage"], v["reason"]), (False, "lock", "lock_file_symlink"))
+        self.assertEqual(v["alert_state_error"], "lock:lock_file_symlink")
+        self.assertNotIn("Traceback", r.stderr)
+        err_verdict = json.loads(r.stderr.strip().splitlines()[-1])
+        self.assertEqual(err_verdict["alert_state_error"], "lock:lock_file_symlink")
 
 
 if __name__ == "__main__":
