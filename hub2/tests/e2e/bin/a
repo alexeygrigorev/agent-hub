@@ -194,7 +194,7 @@ def cmd_kill(args):
     row = json.loads(path.read_text())
     if row["phase"] != "exited":
         return fail("workload did not exit")
-    tombstone = {key: row.get(key) for key in ("id", "tag", "workspace", "exit")}
+    tombstone = {key: row.get(key) for key in ("id", "tag", "workspace", "created_at_ms", "exit")}
     tombstone.update(cause="finished", finished_at_ms=now_ms(), containment_empty=True)
     write(STATE / "retired-sessions" / row["id"] / "tombstone.json", tombstone)
     if "--keep-record" not in args:
