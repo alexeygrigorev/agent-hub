@@ -35,9 +35,9 @@ function fixture(revokeFailures=0,projectFailures=0){
    events.push({path,body:await request.json()});return Response.json({ok:true});
   }})},
  };
- const machine=new MachineDO(ctx,env);
+ let machine=new MachineDO(ctx,env);
  const call=(path:string,method='GET',body?:unknown,headers:Record<string,string>={})=>machine.fetch(new Request('https://machine.test'+path,{method,headers:{...header,...headers},...(body===undefined?{}:{body:JSON.stringify(body)})}));
- return{database,machine,call,events,sockets,revocations,clearCache:()=>((machine as any).db.cache.clear()),get alarm(){return alarm;}};
+ return{database,get machine(){return machine;},restart:()=>machine=new MachineDO(ctx,env),call,events,sockets,revocations,clearCache:()=>((machine as any).db.cache.clear()),get alarm(){return alarm;}};
 }
 
 async function startClaimed(f:ReturnType<typeof fixture>,sessionId:string,nativeId:string|null){
@@ -55,11 +55,285 @@ async function startOffered(f:ReturnType<typeof fixture>,sessionId:string){
  const beat=await f.call('/api/heartbeat','POST',{labels:[],engines:['codex'],capabilities:['headless'],native_sessions:[]});assert.equal(beat.status,200);
  const reservation=await f.call('/_internal/reserve','POST',{operation_id:'op-'+sessionId,dispatch_id:'dispatch-'+sessionId,attempt:0,
   session_id:sessionId,project_id:'project-test',intake_id:'intake-'+sessionId,machine_id:'h1',request_digest:'digest-'+sessionId,
-  title:'test session',acceptance_criteria:['test'],account_id:'codex',launch:{workspace:'relay',engine:'codex',model:'gpt-6.1-sol',prompt:'test work',interactive:false}});
+  title:'test session',acceptance_criteria:['test'],account_id:'codex',launch:{workspace:'relay',engine:'codex',model:'gpt-6.1-sol',prompt:'test work',interactive:false,timeout_seconds:1800}});
  assert.equal(reservation.status,201);const reserved=await reservation.json() as any;
  assert.equal((await f.call('/_internal/activate','POST',{operation_id:'op-'+sessionId,session_id:sessionId,epoch:reserved.epoch})).status,201);
  return reserved.epoch as number;
 }
+
+test('repo label ACK binds canonical cwd for public view and qualified exit without changing request',async()=>{
+ const f=fixture(),session='repo-label-lifecycle',epoch=await startOffered(f,session),frames:any[]=[];
+ const socket={readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'repo-label'}),send:(value:string)=>frames.push(JSON.parse(value))};
+ f.sockets.push(socket);
+ const binding={version:1,requested_workspace:'relay',resolved_workspace:'/owned/enrolled/relay'};
+ await f.machine.webSocketMessage(socket as any,JSON.stringify({type:'offer_ack',session_id:session,epoch,workspace_binding:binding}));
+ const native='11111111-2222-4333-8444-555555555555';
+ assert.equal((await f.call('/api/sessions/'+session+'/started','POST',{operation_id:'op-'+session,epoch,native_id:native})).status,201);
+ const admission=f.database.prepare('SELECT observed_at FROM launch_admissions WHERE operation_id=?').get('op-'+session) as any;
+ const launch=JSON.parse((f.database.prepare('SELECT launch_json FROM sessions WHERE id=?').get(session) as any).launch_json);
+ const finish={operation_id:'op-'+session,epoch,native_id:native,exit_code:0,native_exit_confirmed:true,evidence:{
+  source:'aplexer_status',native_identity:{id:native,tag:'task-hub2-'+session,workspace:binding.resolved_workspace},
+  containment_empty:true,native_exit:{code:0,exited_at_ms:Date.now()},native_deadline:{deadline_ms:admission.observed_at+1800_000,exceeded:false}}};
+ for(const bad of [
+  {...finish,epoch:epoch+1},
+  {...finish,native_id:'99999999-2222-4333-8444-555555555555'},
+  {...finish,evidence:{...finish.evidence,native_identity:{...finish.evidence.native_identity,tag:'foreign'}}},
+  {...finish,evidence:{...finish.evidence,native_identity:{...finish.evidence.native_identity,workspace:'/foreign/relay'}}},
+ ])assert.equal((await f.call('/api/sessions/'+session+'/finish','POST',bad)).status,409);
+ const result=await f.call('/api/sessions/'+session+'/finish','POST',finish);
+ assert.equal(result.status,201,JSON.stringify(await result.json()));
+ assert.equal(launch.workspace,'relay');
+ assert.equal((f.database.prepare('SELECT request_digest FROM sessions WHERE id=?').get(session) as any).request_digest,'digest-'+session);
+ const view=await (await f.call('/api/sessions/'+session,'GET',undefined,{'x-hub2-actor':JSON.stringify({id:'operator',kind:'operator',scopes:['operator:admin']})})).json() as any;
+ assert.equal(view.session.workspace,binding.resolved_workspace);
+ assert.equal(view.session.requested_workspace,'relay');
+ assert.equal(f.events.find(event=>event.path==='/_internal/claim')?.body.workspace_binding.resolved_workspace,binding.resolved_workspace);
+ assert.equal(f.events.find(event=>event.path==='/_internal/finish')?.body.workspace_binding.resolved_workspace,binding.resolved_workspace);
+ assert.equal((await f.call('/api/sessions/'+session+'/finish','POST',finish)).status,200);
+});
+
+test('workspace ACK replay pins once, omission never clears, and wrong absolute/epoch cannot bind',async()=>{
+ for(const resolved of ['/owned/enrolled/relay','C:\\Work\\relay']){
+  const f=fixture(),session='binding-replay',epoch=await startOffered(f,session),frames:any[]=[];
+  const socket={readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'binding-replay'}),send:(value:string)=>frames.push(JSON.parse(value))};
+  f.sockets.push(socket);
+  const ack={type:'offer_ack',session_id:session,epoch,workspace_binding:{version:1,requested_workspace:'relay',resolved_workspace:resolved}};
+  await f.machine.webSocketMessage(socket as any,JSON.stringify({...ack,epoch:epoch+1}));
+  assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'offered');
+  await f.machine.webSocketMessage(socket as any,JSON.stringify(ack));
+  await f.machine.webSocketMessage(socket as any,JSON.stringify(ack));
+  await f.machine.webSocketMessage(socket as any,JSON.stringify({...ack,workspace_binding:undefined}));
+  const prior=f.database.prepare('SELECT launch_json FROM sessions WHERE id=?').get(session) as any;
+  await f.machine.webSocketMessage(socket as any,JSON.stringify({...ack,workspace_binding:{...ack.workspace_binding,resolved_workspace:'/foreign/relay'}}));
+  assert.equal(frames.at(-1).error,'workspace_binding_conflict');
+  assert.equal((f.database.prepare('SELECT launch_json FROM sessions WHERE id=?').get(session) as any).launch_json,prior.launch_json);
+  const offers=await (await f.call('/api/offers','GET',undefined,{'x-hub2-actor':JSON.stringify({...machineActor,scopes:['machine:offer']})})).json() as any;
+  assert.equal(offers.offers[0].launch.workspace,'relay');
+  assert.equal(offers.offers[0].launch._hub_workspace_binding,undefined);
+ }
+ const f=fixture(),session='absolute-binding',epoch=await startClaimed(f,session,null),frames:any[]=[];
+ const socket={readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'absolute'}),send:(value:string)=>frames.push(JSON.parse(value))};
+ f.sockets.push(socket);
+ const prior=f.database.prepare('SELECT * FROM sessions WHERE id=?').get(session);
+ await f.machine.webSocketMessage(socket as any,JSON.stringify({type:'offer_ack',session_id:session,epoch,
+  workspace_binding:{version:1,requested_workspace:'/tmp',resolved_workspace:'/foreign/tmp'}}));
+ assert.equal(frames.at(-1).error,'invalid_workspace_binding');
+ assert.deepEqual(f.database.prepare('SELECT * FROM sessions WHERE id=?').get(session),prior);
+});
+
+test('legacy host label stays unbound and claimed binding upgrade uses a durable distinct receipt',async()=>{
+ const f=fixture(),session='legacy-label-upgrade',epoch=await startOffered(f,session),frames:any[]=[];
+ const socket={readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'upgrade'}),send:(value:string)=>frames.push(JSON.parse(value))};
+ f.sockets.push(socket);
+ const ack={type:'offer_ack',session_id:session,epoch};
+ await f.machine.webSocketMessage(socket as any,JSON.stringify(ack));
+ const original=f.database.prepare('SELECT payload_json FROM machine_outbox WHERE id=?').get('claim:op-'+session) as any;
+ assert.equal(JSON.parse(original.payload_json).workspace_binding,undefined);
+ const workspace='/'+'\u754c'.repeat(1023);
+ const receipt=legacyUnobserved(session,epoch);receipt.evidence.workspace=workspace;
+ assert.equal((await f.call('/api/sessions/'+session+'/finish','POST',receipt)).status,409);
+ await f.machine.webSocketMessage(socket as any,JSON.stringify({...ack,workspace_binding:{version:1,requested_workspace:'relay',resolved_workspace:workspace}}));
+ assert.equal((f.database.prepare('SELECT payload_json FROM machine_outbox WHERE id=?').get('claim:op-'+session) as any).payload_json,original.payload_json);
+ assert(f.database.prepare('SELECT id FROM machine_outbox WHERE id=?').get('workspace-claim:op-'+session));
+ assert.equal((await f.call('/api/sessions/'+session+'/finish','POST',{...receipt,evidence:{...receipt.evidence,workspace:workspace+'x'}})).status,409);
+ assert.equal((await f.call('/api/sessions/'+session+'/finish','POST',receipt)).status,200);
+ assert.equal(f.events.find(event=>event.path==='/_internal/reaped')?.body.workspace_binding.resolved_workspace,workspace);
+ const old=fixture(),oldSession='unbound-absolute-unicode',oldEpoch=await startClaimed(old,oldSession,null);
+ old.database.prepare("UPDATE sessions SET launch_json=json_set(launch_json,'$.workspace',?) WHERE id=?").run(workspace,oldSession);
+ old.database.prepare('INSERT INTO launch_admissions VALUES(?,?,?,?)').run('op-'+oldSession,oldSession,oldEpoch,Date.now());
+ old.clearCache();
+ const unbound=legacyUnobserved(oldSession,oldEpoch);unbound.evidence.workspace=workspace;
+ assert.equal((await old.call('/api/sessions/'+oldSession+'/finish','POST',unbound)).status,409);
+});
+
+test('actual Python Unicode ACK frames fit the existing Machine UTF16 frame and carry all path bytes',async()=>{
+ const {spawnSync}=await import('node:child_process'),{fileURLToPath}=await import('node:url');
+ for(const workspace of ['/'+'\u754c'.repeat(1023),'C:\\'+'\u{1f642}'.repeat(510)]){
+  const f=fixture(),session='unicode-frame',epoch=await startOffered(f,session),frames:any[]=[];
+  const socket={readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'unicode'}),send:(value:string)=>frames.push(JSON.parse(value))};
+  f.sockets.push(socket);
+  const binding={version:1,requested_workspace:'relay',resolved_workspace:workspace};
+  const child=spawnSync('python3',['-I','-c',
+   'import sys,json;sys.path.insert(0,sys.argv[1]);from agent_hub_host.agent import offer_ack_frame;print(offer_ack_frame(sys.argv[2],int(sys.argv[3]),json.loads(sys.argv[4])))',
+   fileURLToPath(new URL('../host',import.meta.url)),session,String(epoch),JSON.stringify(binding)],{encoding:'utf8',timeout:10000});
+  assert.equal(child.status,0,child.stderr);
+  const frame=child.stdout.trim();assert(frame.length<8192);assert(Buffer.byteLength(frame,'utf8')<8192);
+  await f.machine.webSocketMessage(socket as any,frame);
+  assert.equal(frames.at(-1).type,'ack');
+  const launch=JSON.parse((f.database.prepare('SELECT launch_json FROM sessions WHERE id=?').get(session) as any).launch_json);
+  assert.deepEqual(launch._hub_workspace_binding,binding);
+ }
+});
+
+test('running legacy label recovery stays reachable across ACK loss and accepts the same frozen exit',async()=>{
+ const f=fixture(),session='legacy-running-upgrade',epoch=await startOffered(f,session),frames:any[]=[];
+ const socket={readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'legacy-running'}),send:(value:string)=>frames.push(JSON.parse(value))};
+ f.sockets.push(socket);
+ const ack={type:'offer_ack',session_id:session,epoch};
+ await f.machine.webSocketMessage(socket as any,JSON.stringify(ack));
+ const native='11111111-2222-4333-8444-555555555555';
+ assert.equal((await f.call('/api/sessions/'+session+'/started','POST',{operation_id:'op-'+session,epoch,native_id:native})).status,201);
+ const admitted=f.database.prepare('SELECT observed_at FROM launch_admissions WHERE operation_id=?').get('op-'+session) as any;
+ const finish={operation_id:'op-'+session,epoch,native_id:native,exit_code:0,native_exit_confirmed:true,evidence:{source:'aplexer_status',
+  native_identity:{id:native,tag:'task-hub2-'+session,workspace:'/owned/relay'},containment_empty:true,
+  native_exit:{code:0,exited_at_ms:Date.now()},native_deadline:{deadline_ms:admitted.observed_at+1800_000,exceeded:false}}};
+ assert.equal((await f.call('/api/sessions/'+session+'/finish','POST',finish)).status,409);
+ const offers=async()=>((await (await f.call('/api/offers','GET',undefined,{'x-hub2-actor':JSON.stringify({...machineActor,scopes:['machine:offer']})})).json()) as any).offers;
+ const recovery=(await offers())[0];
+ assert.equal(recovery.claimed,true);assert.equal(recovery.recovery_native_id,native);
+ assert.equal(recovery.launch.workspace,'relay');assert.equal(recovery.operation_id,'op-'+session);
+ const binding={version:1,requested_workspace:'relay',resolved_workspace:'/owned/relay'};
+ await f.machine.webSocketMessage(socket as any,JSON.stringify({...ack,workspace_binding:binding}));
+ assert.deepEqual(frames.at(-1).workspace_binding,binding,'echo follows the durable binding transaction');
+ const pinned=f.database.prepare('SELECT * FROM sessions WHERE id=?').get(session) as any;
+ assert.equal(pinned.state,'running');assert.equal(pinned.native_id,native);assert.equal(pinned.epoch,epoch);
+ assert.equal(JSON.parse(pinned.launch_json)._hub_workspace_repair_pending,true);
+ // Simulate ACK loss/host crash before the local atomic requeue: the same
+ // existing recovery wire remains available even though binding is now pinned.
+ assert.equal((await offers())[0].recovery_native_id,native);
+ await f.machine.webSocketMessage(socket as any,JSON.stringify({type:'resync'}));
+ const frame=frames.filter(item=>item.type==='session.offer').at(-1);
+ assert.equal(frame.offer.recovery_native_id,native);
+ assert.equal(frame.offer.launch._hub_workspace_repair_pending,undefined);
+ assert.equal(frame.offer.launch._hub_workspace_binding,undefined);
+ assert.equal((await f.call('/api/sessions/'+session+'/finish','POST',finish)).status,201);
+ assert.equal((await f.call('/api/sessions/'+session+'/finish','POST',finish)).status,200);
+ assert.equal((await offers()).length,0);
+ assert.equal(JSON.parse((f.database.prepare('SELECT launch_json FROM sessions WHERE id=?').get(session) as any).launch_json)._hub_workspace_repair_pending,undefined);
+});
+
+test('historical label offers fill only spare capacity behind normal starts and exclude absolute paths',async()=>{
+ const f=fixture();
+ for(let i=0;i<12;i++){
+  const session='historical-'+i;
+  await startOffered(f,session);
+  f.database.prepare("UPDATE sessions SET state='running',native_id=?,created_at=? WHERE id=?")
+   .run('11111111-2222-4333-8444-'+String(i).padStart(12,'0'),i+1,session);
+ }
+ await startClaimed(f,'absolute-running','aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee');
+ await startOffered(f,'fresh-one');await startOffered(f,'fresh-two');
+ const response=await f.call('/api/offers','GET',undefined,{'x-hub2-actor':JSON.stringify({...machineActor,scopes:['machine:offer']})});
+ const offers=(await response.json() as any).offers;
+ assert.equal(offers.length,10);
+ assert.deepEqual(offers.slice(0,2).map((offer:any)=>offer.session_id),['fresh-one','fresh-two']);
+ assert(offers.slice(2).every((offer:any)=>offer.recovery_native_id&&offer.claimed===true));
+ assert.equal(offers.some((offer:any)=>offer.session_id==='absolute-running'),false);
+});
+
+test('historical recovery rotates beyond ten pending rows and preserves progress across restart',async()=>{
+ const f=fixture(),seen=new Set<string>(),frames:any[]=[];
+ for(let i=0;i<21;i++){
+  const session='rotation-'+String(i).padStart(2,'0');await startOffered(f,session);
+  f.database.prepare("UPDATE sessions SET state='running',native_id=?,created_at=? WHERE id=?")
+   .run('11111111-2222-4333-8444-'+String(i).padStart(12,'0'),i+1,session);
+ }
+ await startOffered(f,'fresh-rotation');
+ const socket={readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'rotation'}),send:(value:string)=>frames.push(JSON.parse(value))};f.sockets.push(socket);
+ const before=f.database.prepare('SELECT id,state,native_id,epoch,created_at,updated_at,request_digest FROM sessions ORDER BY id').all();
+ for(let wave=0;wave<3;wave++){
+  if(wave===1)f.restart();
+  const response=await f.call('/api/offers','GET',undefined,{'x-hub2-actor':JSON.stringify({...machineActor,scopes:['machine:offer']})});
+  const offers=(await response.json() as any).offers;
+  assert.equal(offers.length,10);assert.equal(offers[0].session_id,'fresh-rotation');
+  for(const offer of offers.slice(1)){
+   seen.add(offer.session_id);
+   assert.equal(offer.launch._hub_workspace_recovery_turn,undefined);
+   await f.machine.webSocketMessage(socket as any,JSON.stringify({type:'offer_ack',session_id:offer.session_id,epoch:offer.epoch,
+    workspace_binding:{version:1,requested_workspace:'relay',resolved_workspace:'/owned/relay'}}));
+  }
+ }
+ assert.equal(seen.size,21,'older live or unrecoverable pending rows must not starve an exited/deadletter row');
+ assert.deepEqual(f.database.prepare('SELECT id,state,native_id,epoch,created_at,updated_at,request_digest FROM sessions ORDER BY id').all(),before);
+});
+
+test('recovery rotation normalizes malformed and exhausted turns without changing registry fields',async()=>{
+ for(const exhausted of [false,true]){
+  const f=fixture(),seen=new Set<string>();
+  const invalid:any[]=['bad',-1,1.5,{},Number.MAX_SAFE_INTEGER+1];
+  for(let i=0;i<11;i++){
+   const session='counter-'+String(i).padStart(2,'0');await startOffered(f,session);
+   const launch=JSON.parse((f.database.prepare('SELECT launch_json FROM sessions WHERE id=?').get(session) as any).launch_json);
+   launch._hub_workspace_recovery_turn=exhausted?Number.MAX_SAFE_INTEGER:invalid[i%invalid.length];
+   f.database.prepare("UPDATE sessions SET state='running',native_id=?,created_at=?,launch_json=? WHERE id=?")
+    .run('11111111-2222-4333-8444-'+String(i).padStart(12,'0'),i+1,JSON.stringify(launch),session);
+  }
+  await startOffered(f,'fresh-counter');
+  const before=f.database.prepare('SELECT id,state,native_id,epoch,created_at,updated_at,request_digest FROM sessions ORDER BY id').all();
+  for(let wave=0;wave<2;wave++){
+   const offers=(await (await f.call('/api/offers','GET',undefined,{'x-hub2-actor':JSON.stringify({...machineActor,scopes:['machine:offer']})})).json() as any).offers;
+   assert.equal(offers[0].session_id,'fresh-counter');assert.equal(offers.length,10);
+   offers.slice(1).forEach((offer:any)=>seen.add(offer.session_id));
+   if(wave===0)f.restart();
+  }
+  assert.equal(seen.size,11);
+  for(const row of f.database.prepare("SELECT launch_json FROM sessions WHERE state='running'").all() as any[]){
+   const turn=JSON.parse(row.launch_json)._hub_workspace_recovery_turn;
+   assert(Number.isSafeInteger(turn)&&turn>=0&&turn<1000);
+  }
+  assert.deepEqual(f.database.prepare('SELECT id,state,native_id,epoch,created_at,updated_at,request_digest FROM sessions ORDER BY id').all(),before);
+ }
+});
+
+test('rotation checkpoint failure is visible and never blocks normal offers; later retry advances',async()=>{
+ const f=fixture(),seen=new Set<string>(),warnings:string[]=[];
+ for(let i=0;i<11;i++){
+  const session='checkpoint-'+String(i).padStart(2,'0');await startOffered(f,session);
+  f.database.prepare("UPDATE sessions SET state='running',native_id=?,created_at=? WHERE id=?")
+   .run('11111111-2222-4333-8444-'+String(i).padStart(12,'0'),i+1,session);
+ }
+ await startOffered(f,'fresh-checkpoint');
+ f.database.exec("CREATE TRIGGER fail_rotation BEFORE UPDATE OF launch_json ON sessions BEGIN SELECT RAISE(ABORT,'synthetic checkpoint failure'); END");
+ const warn=console.warn;console.warn=(message:any)=>warnings.push(String(message));
+ try{
+  const offers=(await (await f.call('/api/offers','GET',undefined,{'x-hub2-actor':JSON.stringify({...machineActor,scopes:['machine:offer']})})).json() as any).offers;
+  assert.equal(offers[0].session_id,'fresh-checkpoint');assert.equal(offers.length,10);
+ }finally{console.warn=warn;}
+ assert.deepEqual(warnings,['[hub2] workspace recovery rotation checkpoint unavailable']);
+ for(const row of f.database.prepare("SELECT launch_json FROM sessions WHERE state='running'").all() as any[])
+  assert.equal(JSON.parse(row.launch_json)._hub_workspace_recovery_turn,undefined);
+ f.database.exec('DROP TRIGGER fail_rotation');
+ for(let wave=0;wave<2;wave++){
+  const offers=(await (await f.call('/api/offers','GET',undefined,{'x-hub2-actor':JSON.stringify({...machineActor,scopes:['machine:offer']})})).json() as any).offers;
+  assert.equal(offers[0].session_id,'fresh-checkpoint');
+  offers.slice(1).forEach((offer:any)=>seen.add(offer.session_id));
+ }
+ assert.equal(seen.size,11);
+});
+
+test('malformed or overlong workspace ACK and oversized real frame never claim the offer',async()=>{
+ const f=fixture(),session='binding-invalid',epoch=await startOffered(f,session),frames:any[]=[],closed:any[]=[];
+ const socket={readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'invalid'}),send:(value:string)=>frames.push(JSON.parse(value)),close:(...args:any[])=>closed.push(args)};
+ f.sockets.push(socket);
+ for(const binding of [
+  {version:1,requested_workspace:'foreign',resolved_workspace:'/owned/relay'},
+  {version:1,requested_workspace:'relay',resolved_workspace:'relative'},
+  {version:1,requested_workspace:'relay',resolved_workspace:'/'+'x'.repeat(1024)},
+  {version:1,requested_workspace:'relay',resolved_workspace:'/owned/relay',untrusted:true},
+ ]){
+  await f.machine.webSocketMessage(socket as any,JSON.stringify({type:'offer_ack',session_id:session,epoch,workspace_binding:binding}));
+  assert.equal(frames.at(-1).error,'invalid_workspace_binding');
+ }
+ await f.machine.webSocketMessage(socket as any,JSON.stringify({type:'offer_ack',session_id:session,epoch,padding:'x'.repeat(8192)}));
+ assert.equal(closed.at(-1)[0],1009);
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'offered');
+ assert.equal(f.database.prepare('SELECT * FROM launch_admissions').all().length,0);
+ const injected=await f.call('/_internal/reserve','POST',{operation_id:'inject-op',dispatch_id:'inject-dispatch',attempt:0,
+  session_id:'inject-session',project_id:'project-test',intake_id:'inject-intake',machine_id:'h1',request_digest:'inject-digest',
+  title:'injected metadata',acceptance_criteria:['must refuse'],launch:{workspace:'relay',engine:'shell',model:'shell',prompt:'synthetic',interactive:false,
+   _hub_workspace_binding:{version:1,requested_workspace:'relay',resolved_workspace:'/foreign'}}});
+ assert.equal(injected.status,400);assert.equal((await injected.json() as any).error,'reserved_launch_field');
+ assert.equal(f.database.prepare('SELECT id FROM sessions WHERE id=?').get('inject-session'),undefined);
+ const reservedFlag=await f.call('/_internal/reserve','POST',{operation_id:'inject-op',dispatch_id:'inject-dispatch',attempt:0,
+  session_id:'inject-session',project_id:'project-test',intake_id:'inject-intake',machine_id:'h1',request_digest:'inject-digest',
+  title:'injected repair',acceptance_criteria:['must refuse'],launch:{workspace:'relay',engine:'shell',model:'shell',prompt:'synthetic',interactive:false,
+   _hub_workspace_repair_pending:true}});
+ assert.equal(reservedFlag.status,400);assert.equal((await reservedFlag.json() as any).error,'reserved_launch_field');
+ const reservedTurn=await f.call('/_internal/reserve','POST',{operation_id:'inject-op',dispatch_id:'inject-dispatch',attempt:0,
+  session_id:'inject-session',project_id:'project-test',intake_id:'inject-intake',machine_id:'h1',request_digest:'inject-digest',
+  title:'injected turn',acceptance_criteria:['must refuse'],launch:{workspace:'relay',engine:'shell',model:'shell',prompt:'synthetic',interactive:false,
+   _hub_workspace_recovery_turn:'malformed'}});
+ assert.equal(reservedTurn.status,400);assert.equal((await reservedTurn.json() as any).error,'reserved_launch_field');
+});
 
 test('host launch refusal terminally fails an unclaimed offer with a visible reason',async()=>{
  const f=fixture(),sessionId='workspace-label-refused',epoch=await startOffered(f,sessionId),frames:any[]=[];

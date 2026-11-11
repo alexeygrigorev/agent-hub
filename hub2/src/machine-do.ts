@@ -1,4 +1,5 @@
 import {MachineNativeCommands,NATIVE_COMMAND_SCHEMA} from './machine-native-commands';
+import {boundWorkspace,mergeWorkspaceBinding,WORKSPACE_BINDING_FIELD,WORKSPACE_REPAIR_FIELD,WORKSPACE_RECOVERY_TURN_FIELD} from './workspace-binding';
 import {MachineNativeInventory, NATIVE_INVENTORY_SCHEMA} from './machine-native-inventory';
 import { nativeReturncode } from './native-exit';
 import { normalizeStartPickerEvidence } from './start-picker-evidence';
@@ -8,6 +9,21 @@ import { sha256Hex } from './crypto';
 import { actorFrom, bodyObject, boundedString, error, hasScope, HttpError, json } from './http';
 import { CLAIMED_WITHOUT_NATIVE_GRACE_MS, HOST_INVENTORY_LOST_MS, inactiveReason, isLiveActiveSession, LIVE_SNAPSHOT_TTL_MS, SESSION_REAP_INTERVAL_MS, type LiveSession } from './session-liveness';
 import type { Actor, Hub2Env, JsonRecord } from './types';
+
+const LABEL_RECOVERY = `state='running' AND native_id IS NOT NULL
+  AND CASE WHEN json_valid(launch_json) THEN
+  (json_type(launch_json,'$._hub_workspace_binding') IS NULL
+       OR json_extract(launch_json,'$._hub_workspace_repair_pending')=1)
+  AND length(json_extract(launch_json,'$.workspace')) BETWEEN 1 AND 128
+  AND json_extract(launch_json,'$.workspace') GLOB '[A-Za-z0-9]*'
+  AND json_extract(launch_json,'$.workspace') NOT GLOB '*[^A-Za-z0-9._-]*'
+  ELSE 0 END`;
+
+const RECOVERY_TURN = `CASE WHEN json_valid(launch_json) THEN CASE
+  WHEN json_type(launch_json,'$.${WORKSPACE_RECOVERY_TURN_FIELD}') IN ('integer','real')
+   AND json_extract(launch_json,'$.${WORKSPACE_RECOVERY_TURN_FIELD}') BETWEEN 0 AND 9007199254740991
+   AND json_extract(launch_json,'$.${WORKSPACE_RECOVERY_TURN_FIELD}')=CAST(json_extract(launch_json,'$.${WORKSPACE_RECOVERY_TURN_FIELD}') AS INTEGER)
+  THEN json_extract(launch_json,'$.${WORKSPACE_RECOVERY_TURN_FIELD}') ELSE 0 END ELSE 0 END`;
 
 const SCHEMA = [
   'CREATE TABLE IF NOT EXISTS machine_capabilities(machine_id TEXT PRIMARY KEY,engines_json TEXT NOT NULL,capabilities_json TEXT NOT NULL,resources_json TEXT) WITHOUT ROWID',
@@ -306,10 +322,44 @@ export class MachineDO {
     const machineId = this.machineActor(actor, 'machine:offer');
     if (!machineId) return error('forbidden', 403);
     const now = Date.now();
-    const rows = this.db.all<SessionRow>(
-      `SELECT * FROM sessions WHERE machine_id=? AND ((state='offered' AND offer_expires_at > ?) OR state='claimed') ORDER BY created_at, id LIMIT 10`, machineId, now,
-    );
+    const rows = this.offerRows(machineId,now);
     return json({ offers: rows.map(row => this.offerView(row)) });
+  }
+
+  private offerRows(machineId:string,now:number):SessionRow[]{
+    const rows=this.db.all<SessionRow>(
+      `SELECT * FROM sessions WHERE machine_id=? AND ((state='offered' AND offer_expires_at>?) OR state='claimed') ORDER BY created_at,id LIMIT 10`,machineId,now);
+    // Historical repair fills spare offer capacity; it cannot displace starts.
+    if(rows.length===10)return rows;
+    let recovery:SessionRow[]=[];
+    try{
+      recovery=this.db.all<SessionRow>(
+        `SELECT * FROM sessions WHERE machine_id=? AND (${LABEL_RECOVERY}) ORDER BY ${RECOVERY_TURN},created_at,id LIMIT ?`,machineId,10-rows.length);
+      if(recovery.length)this.db.transaction(this.ctx,()=>{
+        let turn=this.db.one<{turn:number|null}>(
+          `SELECT MAX(${RECOVERY_TURN}) AS turn FROM sessions WHERE machine_id=? AND (${LABEL_RECOVERY})`,machineId)?.turn??0;
+        if(turn>Number.MAX_SAFE_INTEGER-recovery.length){
+          // Rare counter exhaustion: preserve queue order with a bounded
+          // renumber, rather than wrap older rows back ahead of unseen rows.
+          const queue=this.db.all<SessionRow>(
+            `SELECT * FROM sessions WHERE machine_id=? AND (${LABEL_RECOVERY}) ORDER BY ${RECOVERY_TURN},created_at,id LIMIT 1001`,machineId);
+          if(queue.length>1000)throw new Error('workspace_recovery_rotation_bound');
+          for(const [index,row] of queue.entries())this.db.run(
+            `UPDATE sessions SET launch_json=json_set(launch_json,'$.${WORKSPACE_RECOVERY_TURN_FIELD}',CAST(? AS INTEGER)) WHERE id=?`,index,row.id);
+          turn=queue.length;
+        }
+        for(const row of recovery)this.db.run(
+          `UPDATE sessions SET launch_json=json_set(launch_json,'$.${WORKSPACE_RECOVERY_TURN_FIELD}',CAST(? AS INTEGER)) WHERE id=? AND operation_id=? AND epoch=? AND state='running'`,
+          ++turn,row.id,row.operation_id,row.epoch);
+      });
+    }catch{
+      // Bookkeeping failure must not become a start gate. The selected rows
+      // remain retryable; durable fairness is unavailable until checkpointing
+      // recovers, and must not be inferred from a successful HTTP response.
+      console.warn('[hub2] workspace recovery rotation checkpoint unavailable');
+    }
+    rows.push(...recovery);
+    return rows;
   }
 
   private async reserveInternal(request: Request): Promise<Response> {
@@ -325,7 +375,8 @@ export class MachineDO {
       || typeof (launch as JsonRecord).workspace !== 'string' || typeof (launch as JsonRecord).engine !== 'string'
       || typeof (launch as JsonRecord).prompt !== 'string' || typeof (launch as JsonRecord).interactive !== 'boolean') return error('invalid_launch_spec', 400);
     if (new TextEncoder().encode(JSON.stringify(launch)).byteLength > 12_000) return error('launch_spec_too_large', 413);
-    if (Object.hasOwn(launch, '_hub_picker')) return error('reserved_launch_field', 400);
+    if (Object.hasOwn(launch, '_hub_picker') || Object.hasOwn(launch,WORKSPACE_BINDING_FIELD)
+      ||Object.hasOwn(launch,WORKSPACE_REPAIR_FIELD)||Object.hasOwn(launch,WORKSPACE_RECOVERY_TURN_FIELD)) return error('reserved_launch_field', 400);
     const picker = normalizeStartPickerEvidence(body.picker);
     if (body.picker !== undefined && (!picker || picker.machine_id !== body.machine_id || picker.attempt !== body.attempt
       || picker.engine !== (launch as JsonRecord).engine || picker.model !== (launch as JsonRecord).model
@@ -493,8 +544,28 @@ export class MachineDO {
         socket.send(JSON.stringify({ type: 'error', error: 'stale_offer' }));
         return;
       }
+      const launch=this.parse(row.launch_json) as JsonRecord;
+      const binding=mergeWorkspaceBinding(launch.workspace,launch[WORKSPACE_BINDING_FIELD],body.workspace_binding);
+      const newlyBound=binding!==undefined&&launch[WORKSPACE_BINDING_FIELD]===undefined;
+      const claim={operation_id:row.dispatch_id,attempt_operation_id:row.operation_id,session_id:row.id,
+        machine_id:row.machine_id,epoch:row.epoch,...(binding?{workspace_binding:binding}:{})};
       if (row.state === 'claimed' || row.state === 'running') {
-        socket.send(JSON.stringify({ type: 'ack', session_id: row.id, epoch: row.epoch, duplicate: true }));
+        if(newlyBound){
+          this.db.transaction(this.ctx,()=>{
+            this.db.run('UPDATE sessions SET launch_json=? WHERE id=?',JSON.stringify({...launch,[WORKSPACE_BINDING_FIELD]:binding,
+              ...(row.state==='running'&&/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(String(launch.workspace))
+                ?{[WORKSPACE_REPAIR_FIELD]:true}:{})}),row.id);
+            this.insertOutbox(`workspace-claim:${row.operation_id}`,'claim',row.operation_id,row.project_id,claim,Date.now());
+          });
+        }
+        if(binding){
+          const id=this.db.one('SELECT id FROM machine_outbox WHERE id=?',`workspace-claim:${row.operation_id}`)
+            ?`workspace-claim:${row.operation_id}`:`claim:${row.operation_id}`;
+          await this.flushOne(id);
+          await this.scheduleNext();
+        }
+        socket.send(JSON.stringify({ type: 'ack', session_id: row.id, epoch: row.epoch, duplicate: true,
+          ...(binding?{workspace_binding:binding}:{}) }));
         return;
       }
       if (row.state !== 'offered' || row.offer_expires_at === null || row.offer_expires_at <= Date.now()) {
@@ -503,27 +574,28 @@ export class MachineDO {
       }
       const now = Date.now();
       this.db.transaction(this.ctx, () => {
+        if(newlyBound)this.db.run('UPDATE sessions SET launch_json=? WHERE id=?',JSON.stringify({...launch,[WORKSPACE_BINDING_FIELD]:binding}),row.id);
         this.db.run("UPDATE sessions SET state='claimed', offer_expires_at=NULL, updated_at=? WHERE id=? AND state='offered' AND epoch=?", now, row.id, row.epoch);
         this.db.run('INSERT OR IGNORE INTO launch_admissions VALUES(?,?,?,?)', row.operation_id,row.id,row.epoch,now);
         this.insertOutbox(`claim:${row.operation_id}`, 'claim', row.operation_id, row.project_id,
-          { operation_id: row.dispatch_id, attempt_operation_id: row.operation_id, session_id: row.id,
-            machine_id: row.machine_id, epoch: row.epoch }, now);
+          claim, now);
       });
       await this.ensureDeadline(now+30_000);
       await this.flushOne(`claim:${row.operation_id}`);
       await this.scheduleNext();
       await this.sendPendingCommands(socket, attachment.machine_id,env);
-      socket.send(JSON.stringify({ type: 'ack', session_id: row.id, epoch: row.epoch }));
-    } catch {}
+      socket.send(JSON.stringify({ type: 'ack', session_id: row.id, epoch: row.epoch,
+        ...(binding?{workspace_binding:binding}:{}) }));
+    } catch(caught) {
+      if(caught instanceof HttpError)try{socket.send(JSON.stringify({type:'error',error:caught.code}));}catch{}
+    }
   }
 
   private async sendOffers(socket: WebSocket, machineId: string,env:Hub2Env=this.env): Promise<void> {
     if(this.stopOnly(socket))return;
     if(!this.currentSocket(socket))return;
     const now = Date.now();
-    const rows = this.db.all<SessionRow>(
-      `SELECT * FROM sessions WHERE machine_id=? AND ((state='offered' AND offer_expires_at > ?) OR state='claimed') ORDER BY created_at, id LIMIT 10`, machineId, now,
-    );
+    const rows = this.offerRows(machineId,now);
     for (const row of rows) {
       try { socket.send(JSON.stringify({ type: 'session.offer', offer: this.offerView(row) })); } catch { return; }
     }
@@ -542,12 +614,14 @@ export class MachineDO {
   }
 
   private offerView(row: SessionRow): JsonRecord {
-    const { _hub_picker: _picker, ...launch } = this.parse(row.launch_json) as JsonRecord;
+    const { _hub_picker: _picker, [WORKSPACE_BINDING_FIELD]: _binding, [WORKSPACE_REPAIR_FIELD]: _repair,
+      [WORKSPACE_RECOVERY_TURN_FIELD]:_turn,...launch } = this.parse(row.launch_json) as JsonRecord;
     return {
       session_id: row.id, operation_id: row.operation_id, intake_id: row.intake_id,
       project_id: row.project_id, account_id: row.account_id, epoch: row.epoch, title: row.title,
       acceptance_criteria: this.parse(row.acceptance_criteria_json),
-      launch, expires_at: row.offer_expires_at, claimed: row.state === 'claimed',
+      launch, expires_at: row.offer_expires_at, claimed: row.state === 'claimed'||row.state==='running',
+      ...(row.state==='running'?{recovery_native_id:row.native_id}:{}),
     };
   }
 
@@ -623,6 +697,8 @@ export class MachineDO {
     }
     if (row.state !== 'claimed' || row.operation_id !== body.operation_id || row.epoch !== body.epoch) return error('stale_or_unoffered_session', 409);
     if (!this.db.one('SELECT operation_id FROM launch_admissions WHERE operation_id=? AND session_id=? AND epoch=?',row.operation_id,row.id,row.epoch)) return error('launch_admission_required',409);
+    const launch=this.parse(row.launch_json) as JsonRecord;
+    const binding=mergeWorkspaceBinding(launch.workspace,launch[WORKSPACE_BINDING_FIELD]);
     const now=Date.now();
     this.db.transaction(this.ctx,()=>{
       this.db.run("UPDATE sessions SET state='running', native_id=?, offer_expires_at=NULL, updated_at=? WHERE id=? AND state='claimed'",
@@ -632,7 +708,8 @@ export class MachineDO {
         phase='running',last_activity_at=excluded.last_activity_at,exit_code=NULL,containment_empty=0,observed_at=excluded.observed_at`,
         sessionId,body.native_id,now,now);
       this.insertOutbox(`started:${row.operation_id}`,'started',row.operation_id,row.project_id,
-        {operation_id:row.dispatch_id,attempt_operation_id:row.operation_id,session_id:row.id,machine_id:row.machine_id,epoch:row.epoch,native_id:body.native_id},now);
+        {operation_id:row.dispatch_id,attempt_operation_id:row.operation_id,session_id:row.id,machine_id:row.machine_id,epoch:row.epoch,native_id:body.native_id,
+          ...(binding?{workspace_binding:binding}:{})},now);
     });
     await this.ensureDeadline(now+30_000);
     const forwarded=await this.flushOne(`started:${row.operation_id}`);
@@ -665,7 +742,7 @@ export class MachineDO {
     const nativeExit = evidence.native_exit as JsonRecord | undefined;
     if (!['aplexer_status', 'aplexer_retirement'].includes(String(evidence.source)) || evidence.containment_empty !== true
       || !identity || identity.id !== body.native_id || identity.tag !== `task-hub2-${row.id}`
-      || identity.workspace !== launch.workspace || !nativeExit || nativeReturncode(nativeExit) !== body.exit_code) return error('unqualified_native_exit_evidence', 409);
+      || identity.workspace !== boundWorkspace(launch) || !nativeExit || nativeReturncode(nativeExit) !== body.exit_code) return error('unqualified_native_exit_evidence', 409);
     const lateLaunchFailure=launchFailed&&row.state==='failed'&&row.native_id===null&&row.evidence_digest===null;
     if (row.state === 'completed-awaiting-review' || (row.state === 'failed'&&!lateLaunchFailure)) {
       return row.evidence_digest === evidenceDigest ? json({ ok: true, duplicate: true, state: row.state }) : error('finish_conflict', 409);
@@ -691,6 +768,7 @@ export class MachineDO {
     const state = !launchFailed&&nativeDeadline?.exceeded!==true&&Number(body.exit_code) === 0 ? 'completed-awaiting-review' : 'failed';
     const payload = { operation_id: row.dispatch_id, attempt_operation_id: row.operation_id, session_id: row.id,
       machine_id: row.machine_id,intake_id:row.intake_id, epoch: row.epoch, native_id: body.native_id,
+      ...(launch[WORKSPACE_BINDING_FIELD]?{workspace_binding:launch[WORKSPACE_BINDING_FIELD]}:{}),
       ...(launchFailed?{launch_failed:true}:{}),
       ...(failureNotification?{after_notification:failureNotification.id}:{}),
       exit_code: Number(body.exit_code), native_exit_confirmed: true, evidence, evidence_digest: evidenceDigest };
@@ -711,8 +789,9 @@ export class MachineDO {
       return json({ok:true,state:'lost',native_exit_recorded:true});
     }
     this.db.transaction(this.ctx, () => {
-      this.db.run('UPDATE sessions SET state=?, evidence_json=?, evidence_digest=?, exit_code=?, updated_at=?,native_id=? WHERE id=? AND state=?',
-        state, JSON.stringify(payload), evidenceDigest, Number(body.exit_code), now, body.native_id,row.id, row.state);
+      const {[WORKSPACE_REPAIR_FIELD]:_repair,...completedLaunch}=launch;
+      this.db.run('UPDATE sessions SET state=?, evidence_json=?, evidence_digest=?, exit_code=?, updated_at=?,native_id=?,launch_json=? WHERE id=? AND state=?',
+        state, JSON.stringify(payload), evidenceDigest, Number(body.exit_code), now, body.native_id,JSON.stringify(completedLaunch),row.id, row.state);
       this.db.run("UPDATE native_sessions SET phase='exited',last_activity_at=?,exit_code=?,containment_empty=1,observed_at=? WHERE session_id=?",
         now,Number(body.exit_code),now,row.id);
       if(failureNotification)this.db.run("UPDATE machine_outbox SET state='pending',attempt=0,next_action_at=?,updated_at=? WHERE id=? AND state='dead_letter'",
@@ -738,7 +817,7 @@ export class MachineDO {
       ||!Number.isSafeInteger(e.started_at_ms)||!Number.isSafeInteger(e.observed_at_ms)||Number(e.started_at_ms)<1
       ||Number(e.observed_at_ms)<Number(e.started_at_ms)||Number(e.observed_at_ms)-Number(e.started_at_ms)>6000
       ||Number(e.observed_at_ms)>Date.now()+5000||!Number.isSafeInteger(e.row_count)||Number(e.row_count)<0||Number(e.row_count)>5000
-      ||typeof e.sha256!=='string'||!/^[0-9a-f]{64}$/.test(e.sha256)||!boundedString(e.workspace,1024)||e.tag!=='task-hub2-'+sessionId)
+      ||typeof e.sha256!=='string'||!/^[0-9a-f]{64}$/.test(e.sha256)||!boundedString(e.workspace,4096)||e.tag!=='task-hub2-'+sessionId)
       return error('invalid_legacy_census',400);
     const evidence={source:e.source,started_at_ms:e.started_at_ms,observed_at_ms:e.observed_at_ms,row_count:e.row_count,
       sha256:e.sha256,complete:true,match_count:0,workspace:e.workspace,tag:e.tag,dispatch_provenance:e.dispatch_provenance};
@@ -759,8 +838,12 @@ export class MachineDO {
       // Only the current attempt retains its launch specification. A prior
       // accepted receipt above is the replay proof for superseded attempts.
       const launch=this.parse(row.launch_json) as JsonRecord|null;
-      if(!current||!launch||!boundedString(launch.workspace,1024)||launch.workspace!==evidence.workspace)
+      if(!current||!launch||!boundedString(launch.workspace,1024)||boundWorkspace(launch)!==evidence.workspace)
         throw new HttpError('legacy_launch_workspace_unverified',409);
+      // Only a pinned label resolution can carry the full canonical Unicode
+      // path. Keep the legacy byte bound for unbound/absolute receipts.
+      if((!launch[WORKSPACE_BINDING_FIELD]||!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(String(launch.workspace)))
+        &&!boundedString(evidence.workspace,1024))throw new HttpError('invalid_legacy_census',400);
       if(row.native_id!==null)
         throw new HttpError('stale_legacy_launch_failure',409);
       if(current&&!['offered','claimed','expired','failed','stopped'].includes(row.state))
@@ -770,6 +853,7 @@ export class MachineDO {
         machine_id:machineId,epoch,native_id:null,reason:'legacy_launch_unobserved',launch_failed:true,
         native_outcome:'unconfirmed',failure_kind:'legacy_census_absent',historical_only:row.state==='expired',
         evidence,evidence_digest:digest,observed_at:evidence.observed_at_ms};
+      const boundPayload={...payload,...(launch[WORKSPACE_BINDING_FIELD]?{workspace_binding:launch[WORKSPACE_BINDING_FIELD]}:{})};
       if(current){
         const active=['offered','claimed'].includes(row.state);
         const previous=this.parse(row.evidence_json) as JsonRecord|null;
@@ -780,7 +864,7 @@ export class MachineDO {
           this.settlePendingCommands(row,now,'legacy_launch_unobserved',null);
         }
       }
-      this.insertOutbox(key,'legacy-launch-failure',operation,row.project_id,payload,now);
+      this.insertOutbox(key,'legacy-launch-failure',operation,row.project_id,boundPayload,now);
     });
     const forwarded=await this.flushOne(key)||!!this.db.one("SELECT id FROM machine_outbox WHERE id=? AND state='delivered'",key);
     await this.scheduleNext();
@@ -1094,7 +1178,7 @@ export class MachineDO {
       const session=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND machine_id=?',command.session_id,machineId);
       if (session && !session.native_id && (session.state === 'claimed' || session.state === 'expired')) {
         const launch=this.parse(session.launch_json) as JsonRecord;
-        view.pre_native=true;view.workspace=launch.workspace;view.tag=`task-hub2-${session.id}`;
+        view.pre_native=true;view.workspace=boundWorkspace(launch);view.tag=`task-hub2-${session.id}`;
       }
       socket.send(JSON.stringify({type:'session.command',command:view}));
     }catch{}
@@ -1601,7 +1685,7 @@ export class MachineDO {
     const picker=normalizeStartPickerEvidence(launch._hub_picker);
     return {id:row.id,state:row.state,intake_id:row.intake_id,project_id:row.project_id,machine_id:row.machine_id,
       epoch:row.epoch,operation_id:row.operation_id,native_id:row.native_id,engine:launch.engine,model:launch.model,
-      managed:true,host:row.machine_id,machine:row.machine_id,workspace:launch.workspace,
+      managed:true,host:row.machine_id,machine:row.machine_id,workspace:boundWorkspace(launch),requested_workspace:launch.workspace,
       start_deadline_at:launch.start_deadline_at??null,
       account_id:row.account_id,account:row.account_id,effort:launch.effort??null,
       ...(picker ? { picker, policy_id: picker.policy_id, policy_version: picker.policy_version } : {}),

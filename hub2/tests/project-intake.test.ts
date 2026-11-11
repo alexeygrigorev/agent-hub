@@ -18,6 +18,112 @@ function fixture(options:{modelCandidates?:any[];accountHosts?:Record<string,str
  let project=new ProjectDO(ctx,env);const call=(p:string,m='GET',b?:unknown,a:any=admin)=>project.fetch(new Request('https://p.test'+p,{method:m,headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(a)},...(b===undefined?{}:{body:JSON.stringify(b)})}));return{sql,collectorSql,get project(){return project;},restart:()=>project=new ProjectDO(ctx,env),routes,machineCalls,accountCalls,capReleases,call,getAlarm:()=>alarm,storageValues};}
 const body=async(r:Response)=>await r.json() as any;
 async function intake(f:ReturnType<typeof fixture>,key='task'){const result=await f.call('/api/intakes?project=org/a','POST',{key,title:'Original task',text:'Original requested behavior',acceptance_criteria:['Actual result']});assert.equal(result.status,201);return(await body(result)).intake;}
+
+test('real Machine claim carries repo label binding through normal, aborted and legacy terminal paths',async()=>{
+ for(const outcome of ['normal','aborted','legacy']){
+  const database=new DatabaseSync(':memory:'),sockets:any[]=[];
+  const context:any={storage:{sql:{exec(query:string,...args:any[]){const statement=database.prepare(query);return{toArray:()=>statement.columns().length?statement.all(...args):(statement.run(...args),[])};}},
+   transactionSync(callback:()=>unknown){database.exec('BEGIN');try{const value=callback();database.exec('COMMIT');return value;}catch(error){database.exec('ROLLBACK');throw error;}},
+   async getAlarm(){return null;},async setAlarm(){},async deleteAlarm(){}},blockConcurrencyWhile:(callback:()=>unknown)=>Promise.resolve(callback()),getWebSockets:()=>sockets};
+  let machine:MachineDO;
+  const f=fixture({machineFetch:request=>machine.fetch(request)});
+  let delayClaim=true;
+  machine=new MachineDO(context,{
+   CONTROL:{idFromName:(id:string)=>id,get:()=>({fetch:async()=>Response.json({authorized:true,revoked:true})})},
+   PROJECTS:{idFromName:(id:string)=>id,get:()=>({fetch:async(request:Request)=>{
+    // A claim may reach Project without metadata before a new host reconnects.
+    if(new URL(request.url).pathname==='/_internal/claim'&&delayClaim){
+     const value=await request.json() as any;delete value.workspace_binding;delayClaim=false;
+     return f.call('/_internal/claim','POST',value);
+    }
+    return f.project.fetch(request);
+   }})},
+  } as any);
+  const own=await intake(f,'label-'+outcome),start={key:'label-start-'+outcome,workspace:'relay',engine:'shell',machine_id:'h1'};
+  assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',start)).status,201);
+  const saga=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any;
+  const binding={version:1,requested_workspace:'relay',resolved_workspace:'/'+'\u754c'.repeat(1023)};
+  const frames:any[]=[];
+  const socket={readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'label'}),send:(value:string)=>frames.push(JSON.parse(value))};
+  sockets.push(socket);
+  await machine.webSocketMessage(socket as any,JSON.stringify({type:'offer_ack',session_id:saga.session_id,epoch:saga.epoch,workspace_binding:binding}));
+  assert.equal(frames.at(-1).type,'ack');
+  const call=(suffix:string,receipt:unknown)=>machine.fetch(new Request('https://machine.test/api/sessions/'+saga.session_id+suffix,{
+   method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify({id:'machine:h1',kind:'machine',resource_id:'h1',scopes:['session:report']})},body:JSON.stringify(receipt)}));
+  const native='11111111-2222-4333-8444-555555555555',now=Date.now();
+  if(outcome==='normal')assert.equal((await call('/started',{operation_id:saga.attempt_operation_id,epoch:saga.epoch,native_id:native})).status,201);
+  const admitted=database.prepare('SELECT observed_at FROM launch_admissions WHERE operation_id=?').get(saga.attempt_operation_id) as any;
+  const launch=JSON.parse(saga.launch_spec_json);
+  const receipt=outcome==='legacy'?{
+   operation_id:saga.attempt_operation_id,epoch:saga.epoch,native_id:null,launch_failed:true,failure_kind:'legacy_census_absent',native_outcome:'unconfirmed',
+   evidence:{source:'aplexer_all_registry_census',started_at_ms:now-10,observed_at_ms:now,row_count:2,sha256:'a'.repeat(64),complete:true,match_count:0,
+    workspace:binding.resolved_workspace,tag:'task-hub2-'+saga.session_id,dispatch_provenance:'legacy_unknown'},
+  }:{operation_id:saga.attempt_operation_id,epoch:saga.epoch,native_id:native,exit_code:0,native_exit_confirmed:true,
+   ...(outcome==='aborted'?{launch_failed:true}:{}),evidence:{source:'aplexer_status',containment_empty:true,
+    native_identity:{id:native,tag:'task-hub2-'+saga.session_id,workspace:binding.resolved_workspace},native_exit:{code:0,exited_at_ms:Date.now()},
+    native_deadline:{deadline_ms:admitted.observed_at+launch.timeout_seconds*1000,exceeded:false}}};
+  if(outcome!=='legacy'){
+   const evidence=receipt.evidence as any;
+   evidence.padding='';
+   evidence.padding='x'.repeat(8192-new TextEncoder().encode(JSON.stringify(evidence)).byteLength);
+   assert.equal(new TextEncoder().encode(JSON.stringify(evidence)).byteLength,8192);
+   assert.equal((await call('/finish',{...receipt,evidence:{...evidence,padding:evidence.padding+'x'}})).status,413);
+  }
+  const finished=await call('/finish',receipt);
+  assert(finished.status<300,JSON.stringify(await finished.json()));
+  assert.equal((await call('/finish',receipt)).status,200);
+  for(const row of database.prepare('SELECT kind,payload_json FROM machine_outbox').all() as any[]){
+   const cap=({claim:8192,started:8192,finish:16384,'legacy-launch-failure':12288} as Record<string,number>)[row.kind];
+   if(cap){
+    const size=Buffer.byteLength(row.payload_json,'utf8');assert(size<=cap,`${row.kind}: ${size} > ${cap}`);
+    if(row.kind==='finish')assert(size>8192,'fixture must include full evidence plus binding');
+    if(row.kind==='legacy-launch-failure')assert(size>4096,'fixture must exercise expanded internal Unicode envelope');
+   }
+  }
+  const saved=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE operation_id=?').get(saga.operation_id) as any;
+  assert.equal(saved.request_digest,saga.request_digest);assert.equal(saved.launch_spec_json,saga.launch_spec_json);
+  assert.deepEqual(JSON.parse(saved.routing_json).workspace_binding,binding);
+  assert.equal(saved.state,'complete');
+  const task=(await body(await f.call('/api/intakes/'+own.id))).intake;
+  assert.equal(task.status,outcome==='normal'?'completed-awaiting-review':'failed');
+  assert.equal(task.dispatch.workspace,binding.resolved_workspace);assert.equal(task.dispatch.requested_workspace,'relay');
+  assert.equal((f.sql.prepare("SELECT COUNT(*) AS n FROM intake_events WHERE task_id=? AND kind='native_session_started'").get(own.id) as any).n,outcome==='normal'?1:0);
+  f.restart();
+  assert.equal((await body(await f.call('/api/intakes/'+own.id))).intake.dispatch.workspace,binding.resolved_workspace);
+ }
+});
+
+test('Project binding replay cannot rebind absolute intent or clear a pinned label',async()=>{
+ for(const [index,workspace] of ['relay','/owned/original','C:\\Work\\original'].entries()){
+  const f=fixture(),own=await intake(f,'project-binding-'+index);
+  await f.call('/api/intakes/'+own.id+'/start','POST',{key:'binding-start',workspace,engine:'shell',machine_id:'h1'});
+  const saga=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any;
+  const receipt={operation_id:saga.operation_id,attempt_operation_id:saga.attempt_operation_id,session_id:saga.session_id,machine_id:saga.machine_id,epoch:saga.epoch};
+  const binding={version:1,requested_workspace:workspace,resolved_workspace:'/owned/relay'};
+  if(workspace!=='relay'){
+   assert.equal((await f.call('/_internal/claim','POST',{...receipt,workspace_binding:binding})).status,409);
+   assert.equal((f.sql.prepare('SELECT state FROM dispatch_sagas WHERE operation_id=?').get(saga.operation_id) as any).state,'offered');
+   continue;
+  }
+  assert.equal((await f.call('/_internal/claim','POST',{...receipt,workspace_binding:binding})).status,200);
+  assert.equal((await f.call('/_internal/claim','POST',receipt)).status,200);
+  assert.equal((await f.call('/_internal/claim','POST',{...receipt,epoch:saga.epoch+1,workspace_binding:binding})).status,409);
+  assert.equal((await f.call('/_internal/claim','POST',{...receipt,workspace_binding:{...binding,resolved_workspace:'/foreign'}})).status,409);
+  assert.deepEqual(JSON.parse((f.sql.prepare('SELECT routing_json FROM dispatch_sagas WHERE operation_id=?').get(saga.operation_id) as any).routing_json).workspace_binding,binding);
+ }
+});
+
+test('internal workspace metadata envelopes remain byte bounded and malformed JSON fails closed',async()=>{
+ const f=fixture();
+ for(const [path,limit] of [['/_internal/claim',8192],['/_internal/started',8192],
+                           ['/_internal/reaped',12288],['/_internal/finish',16384]] as const){
+  const response=await f.call(path,'POST',{padding:'x'.repeat(limit)});
+  assert.equal(response.status,413,path);
+  assert.equal((await body(response)).error,'body_too_large');
+  const malformed=await f.project.fetch(new Request('https://p.test'+path,{method:'POST',body:'{invalid'}));
+  assert.equal(malformed.status,400,path);
+ }
+});
 test('model-less start falls back to another allowed model after an auth failure',async()=>{
  const candidates=[
   {id:'codex-sol',engine:'codex',model:'gpt-6.1-sol',effort:'medium',account_id:'codex',weight:1,capabilities:[],enabled:true},
