@@ -63,6 +63,8 @@ const router = {
       if (!sameOriginMutation(request)) return error('csrf_refused', 403);
       let actor = await authenticate(request, env);
       if (!actor) return error('unauthorized', 401);
+      // Deployment credentials are a fixed policy capability, never a general API identity.
+      if (actor.kind === 'service' && path !== '/api/model-policy') return error('forbidden', 403);
 
       const safetyMode = safetyModeForRequest(request, path, actor);
       if (safetyMode === false) return error('safety_mode_refused', 403);
@@ -81,6 +83,8 @@ const router = {
       if (path === '/mcp') return mcp(request, env, (r, e) => router.fetch(r, e), actor);
       if (
         path === '/api/model-policy' ||
+        path === '/api/deployment-credentials' ||
+        /^\/api\/deployment-credentials\/deployment:[0-9a-f-]+\/revoke$/.test(path) ||
         path === '/api/named-agents' ||
         /^\/api\/named-agents\/[^/]+\/grants$/.test(path) ||
         path === '/api/directory' ||

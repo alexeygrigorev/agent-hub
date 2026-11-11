@@ -5,6 +5,8 @@ transaction and its protected read-only schema checker execute unmodified.
 """
 from contextlib import closing
 import copy
+import signal
+import uuid
 import json
 import os
 from pathlib import Path
@@ -25,7 +27,9 @@ TRANSACTION = ROOT / 'deploy/vm/deploy-release-transaction.sh'
 CHECKER = ROOT / 'scripts/schema-rollback-preflight.py'
 POLICY_HELPER = ROOT / 'scripts/apply-model-policy.py'
 CANONICAL_POLICY = json.loads((ROOT / 'config/model-policy.json').read_text())['candidates']
-POLICY_TOKEN = 'synthetic-deploy-policy-token-' + 'x' * 40
+POLICY_TOKEN = 'b' * 64
+BOOTSTRAP_TOKEN = 'synthetic-deploy-bootstrap-' + 'x' * 40
+SERVICE_PREPARER = ROOT / 'scripts/prepare-model-policy-service-credential.py'
 SOURCES = {
     'CONTROL': 'control-do.ts', 'MACHINES': 'machine-do.ts',
     'PROJECTS': 'project-do.ts', 'ACCOUNTS': 'account-do.ts',
@@ -65,12 +69,27 @@ def policy_directory(state):
     return state / ('model-policy-' + (state / 'transaction-token').read_text().strip())
 
 
+def service_document(target_sha='a' * 40, request_id='9f8be3ac-8ad2-4639-8b25-941540f19860'):
+    return {'schema': 'hub2-model-policy-service-credential-v1', 'target_sha': target_sha,
+            'access_token': POLICY_TOKEN, 'credential': {
+                'id': 'deployment:' + request_id, 'request_id': request_id, 'kind': 'service',
+                'purpose': 'model-policy', 'label': 'agent-hub-model-policy-deploy',
+                'scopes': ['model-policy:read', 'model-policy:write'], 'expires_at': None,
+                'created_at': int(time.time() * 1000), 'revoked': False}}
+
+
 class PolicyAPI:
     """Offline protocol peer; requests still traverse the actual protected helper."""
     def __init__(self, fixture):
         self.fixture = fixture
         self.current = {'version': 5, 'candidates': copy.deepcopy(CANONICAL_POLICY)}
         self.calls = []
+        self.issuances = 0
+        self.drop_issuance = False
+        self.refuse_service = False
+        self.pause_issuance = False
+        self.issue_committed = threading.Event()
+        self.issue_release = threading.Event()
         self.unsupported = self.drop_apply = self.drop_rollback = self.invalid_prior = self.compete_apply = False
         outer = self
 
@@ -83,7 +102,8 @@ class PolicyAPI:
                 self.send_response(status)
                 self.send_header('Content-Length', str(len(raw)))
                 self.end_headers()
-                self.wfile.write(raw)
+                try: self.wfile.write(raw)
+                except (BrokenPipeError, ConnectionResetError): pass
 
             def do_GET(self):
                 self.handle_policy('GET')
@@ -95,11 +115,43 @@ class PolicyAPI:
                 self.handle_policy('PUT')
 
             def handle_policy(self, method):
+                if self.path == '/health' and method == 'GET':
+                    self.reply(200, {'ok': True, 'service': 'hub2'})
+                    return
+                if self.path == '/api/deployment-credentials' and method == 'POST':
+                    assert self.headers.get('Authorization') == 'Bearer ' + BOOTSTRAP_TOKEN
+                    body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                    assert set(body) == {'request_id', 'label'} and body['label'] == 'agent-hub-model-policy-deploy'
+                    assert fixture.health_log.exists()
+                    assert not (fixture.state / 'policy-apply-started').exists(), 'exchange must precede policy intent'
+                    intent = json.loads((fixture.credential.parent / 'model-policy-service-intent.json').read_text())
+                    assert intent['request_id'] == body['request_id']
+                    assert intent['target_sha'] == fixture.git(fixture.repo, 'rev-parse', 'HEAD')
+                    outer.issuances += 1
+                    outer.issue_committed.set()
+                    if outer.pause_issuance:
+                        if not outer.issue_release.wait(10):
+                            self.connection.close()
+                            return
+                    if outer.drop_issuance:
+                        outer.drop_issuance = False
+                        self.connection.shutdown(socket.SHUT_RDWR)
+                        self.connection.close()
+                        return
+                    self.reply(201, {'credential': service_document(request_id=body['request_id'])['credential'],
+                                     'access_token': POLICY_TOKEN, 'token_type': 'Bearer'})
+                    return
                 if self.path != '/api/model-policy' or self.headers.get('Authorization') != 'Bearer ' + POLICY_TOKEN:
                     self.reply(403, {'error': 'forbidden'})
                     return
+                # Older code accepts the SQLite files but cannot authenticate a
+                # service. Structural preflight must never query that old API.
+                commit = fixture.git(fixture.repo, 'rev-parse', 'HEAD')
+                if outer.refuse_service or getattr(fixture, 'candidate', None) and commit != fixture.candidate:
+                    self.reply(401, {'error': 'unauthorized'})
+                    return
                 body = None if method == 'GET' else json.loads(self.rfile.read(int(self.headers['Content-Length'])))
-                outer.calls.append((method, copy.deepcopy(body), fixture.git(fixture.repo, 'rev-parse', 'HEAD')))
+                outer.calls.append((method, copy.deepcopy(body), commit))
                 if method == 'GET':
                     if outer.current['candidates']:
                         self.reply(200, outer.current)
@@ -175,8 +227,8 @@ class SchemaReleaseTransactionTest(unittest.TestCase):
         self.addCleanup(self.policy.close)
         credential_dir = self.root / 'credentials'
         credential_dir.mkdir(mode=0o700)
-        self.credential = credential_dir / 'admin.json'
-        self.credential.write_text(json.dumps({'access_token': POLICY_TOKEN}))
+        self.credential = credential_dir / 'model-policy-admin.json'
+        self.credential.write_text(json.dumps(service_document()))
         self.credential.chmod(0o600)
         self.latest = json.loads((ROOT / 'deploy/schema-compatibility.json').read_text())
         self.old = copy.deepcopy(self.latest)
@@ -261,6 +313,7 @@ print('{"ok":true}')
             scripts.mkdir(exist_ok=True)
             shutil.copyfile(CHECKER, scripts / CHECKER.name)
             shutil.copyfile(POLICY_HELPER, scripts / POLICY_HELPER.name)
+            shutil.copyfile(SERVICE_PREPARER, scripts / SERVICE_PREPARER.name)
             config = self.seed / 'config'
             config.mkdir(exist_ok=True)
             (config / 'model-policy.json').write_text(json.dumps({'candidates': CANONICAL_POLICY}))
@@ -398,6 +451,165 @@ print('{"ok":true}')
         prior[0]['weight'] = 37
         self.policy.current = {'version': 5, 'candidates': prior}
         return copy.deepcopy(self.policy.current)
+
+    def bootstrap(self):
+        request_id = str(uuid.uuid4())
+        now = int(time.time() * 1000)
+        old = {'access_token': 'synthetic-forensic-old-operator-' + 'z' * 40}
+        self.credential.write_text(json.dumps(old)); self.credential.chmod(0o600)
+        bootstrap = {'schema': 'hub2-model-policy-bootstrap-v1',
+                     'intent': 'exchange_model_policy_service_credential', 'request_id': request_id,
+                     'target_sha': self.candidate, 'access_token': BOOTSTRAP_TOKEN,
+                     'refreshed_at_ms': now - 1000, 'expires_at_ms': now - 1000 + 3600000, 'ttl_seconds': 3600}
+        path = self.credential.with_name('model-policy-bootstrap.json')
+        path.write_text(json.dumps(bootstrap)); path.chmod(0o600)
+        return request_id, old, bootstrap
+
+    def test_existing_service_structural_preflight_does_not_query_incompatible_old_api(self):
+        original = self.credential.read_bytes()
+        self.transaction('apply')
+        self.assertEqual(self.policy.issuances, 0)
+        self.assertEqual(self.credential.read_bytes(), original)
+        self.assertEqual((policy_directory(self.state) / SERVICE_PREPARER.name).read_bytes(), SERVICE_PREPARER.read_bytes())
+        self.assertTrue(self.policy.calls)
+        self.assertTrue(all(commit == self.candidate for _, _, commit in self.policy.calls))
+        self.transaction('rollback')
+
+    def test_fresh_bootstrap_exchange_precedes_policy_intent_and_reuses_installed_service(self):
+        request_id, old, bootstrap = self.bootstrap()
+        self.transaction('apply')
+        installed = json.loads(self.credential.read_text())
+        self.assertEqual(installed['schema'], 'hub2-model-policy-service-credential-v1')
+        self.assertEqual(installed['credential']['id'], 'deployment:' + request_id)
+        self.assertEqual(installed['access_token'], POLICY_TOKEN)
+        self.assertNotEqual(installed['access_token'], old['access_token'])
+        self.assertEqual(json.loads(self.credential.with_name('model-policy-bootstrap.json').read_text()), bootstrap)
+        self.assertEqual(self.policy.issuances, 1)
+        self.assertTrue((self.state / 'policy-apply-started').exists())
+        self.transaction('rollback')
+        self.transaction('apply')
+        self.assertEqual(self.policy.issuances, 1, 'existing service must not trigger another issuance')
+        self.transaction('commit')
+
+    def test_preissuance_verification_failure_rolls_back_without_touching_credentials(self):
+        original = self.credential.read_bytes()
+        self.policy.refuse_service = True
+        result = self.transaction('apply', success=False)
+        self.assertIn('Automatic rollback succeeded', result.stderr)
+        self.assertEqual(self.git(self.repo, 'rev-parse', 'HEAD'), self.previous)
+        self.assertEqual(self.credential.read_bytes(), original)
+        self.assertFalse(self.state.exists())
+        self.assertEqual(self.policy.issuances, 0)
+        self.assertEqual(self.policy.writes(), [])
+
+    def test_bootstrap_installer_failure_never_reaches_exchange_or_policy(self):
+        self.bootstrap(); original = self.credential.read_bytes()
+        self.transaction('apply', success=False, FIXTURE_FAIL_INSTALL='1')
+        self.assertEqual(self.git(self.repo, 'rev-parse', 'HEAD'), self.previous)
+        self.assertEqual(self.credential.read_bytes(), original)
+        self.assertEqual(self.policy.issuances, 0)
+        self.assertEqual(self.policy.writes(), [])
+
+    def test_lost_issuance_response_retains_candidate_and_known_intent_without_remint(self):
+        request_id, old, _ = self.bootstrap()
+        self.policy.drop_issuance = True
+        result = self.transaction('apply', success=False)
+        self.assertIn('automatic rollback failed', result.stderr)
+        self.assertEqual(self.git(self.repo, 'rev-parse', 'HEAD'), self.candidate)
+        self.assertEqual(json.loads(self.credential.read_text()), old)
+        intent = json.loads(self.credential.with_name('model-policy-service-intent.json').read_text())
+        self.assertEqual(intent['request_id'], request_id); self.assertEqual(intent['target_sha'], self.candidate)
+        self.assertEqual(self.policy.issuances, 1)
+        self.assertFalse((self.state / 'policy-apply-started').exists())
+        self.transaction('rollback', success=False)
+        self.assertEqual(self.policy.issuances, 1)
+        self.assertEqual(self.policy.writes(), [])
+
+    def test_killed_helper_after_server_issuance_is_detected_without_response_json(self):
+        request_id, old, _ = self.bootstrap()
+        self.policy.pause_issuance = True
+        launcher_pid = self.root / 'exchange-launcher-pid'
+        self.write_executable('python3', '#!' + sys.executable + '\n' + r'''import os, pathlib, sys
+args=sys.argv[1:]
+if '-c' in args and 'service-exchange-finished.json' in args[args.index('-c')+1]:
+    try: os.close(9)
+    except OSError: pass
+    pathlib.Path(os.environ['FIXTURE_EXCHANGE_PID']).write_text(str(os.getpid()))
+os.execv(sys.executable,[sys.executable,*args])
+''')
+        with (self.root / 'killed-helper.log').open('w') as log:
+            process = subprocess.Popen(['bash', str(TRANSACTION), 'apply', self.candidate, 'active', 'hub-only'],
+                                       cwd=self.root, env=dict(self.env, FIXTURE_EXCHANGE_PID=str(launcher_pid)),
+                                       stdout=log, stderr=subprocess.STDOUT)
+            try:
+                self.assertTrue(self.policy.issue_committed.wait(15))
+                self.assertTrue(launcher_pid.exists())
+                parent = int(launcher_pid.read_text())
+                children = Path('/proc') / str(parent) / 'task' / str(parent) / 'children'
+                child_ids = children.read_text().split()
+                self.assertEqual(len(child_ids), 1)
+                os.kill(int(child_ids[0]), signal.SIGKILL)  # only our spawned helper
+                self.policy.issue_release.set()
+                self.assertNotEqual(process.wait(timeout=15), 0)
+            finally:
+                self.policy.issue_release.set()
+                if process.poll() is None: process.kill()
+                process.wait(timeout=5)
+        self.assertEqual(self.policy.issuances, 1)
+        self.assertEqual(self.git(self.repo, 'rev-parse', 'HEAD'), self.candidate)
+        self.assertEqual(json.loads(self.credential.read_text()), old)
+        self.assertEqual(json.loads(self.credential.with_name('model-policy-service-intent.json').read_text())['request_id'], request_id)
+        self.assertFalse((self.state / 'policy-apply-started').exists())
+        self.transaction('rollback', success=False)
+        self.assertEqual(self.policy.issuances, 1)
+        self.assertEqual(self.policy.writes(), [])
+
+    def test_killed_privileged_launcher_retains_candidate_until_explicit_reconciliation(self):
+        request_id, old, _ = self.bootstrap()
+        self.policy.pause_issuance = True
+        launcher_pid = self.root / 'exchange-launcher-pid'
+        self.write_executable('python3', '#!' + sys.executable + '\n' + r'''import os, pathlib, sys
+args=sys.argv[1:]
+if '-c' in args and 'service-exchange-finished.json' in args[args.index('-c')+1]:
+    try: os.close(9)
+    except OSError: pass
+    pathlib.Path(os.environ['FIXTURE_EXCHANGE_PID']).write_text(str(os.getpid()))
+os.execv(sys.executable,[sys.executable,*args])
+''')
+        with (self.root / 'killed-helper.log').open('w') as log:
+            process = subprocess.Popen(['bash', str(TRANSACTION), 'apply', self.candidate, 'active', 'hub-only'],
+                                       cwd=self.root, env=dict(self.env, FIXTURE_EXCHANGE_PID=str(launcher_pid)),
+                                       stdout=log, stderr=subprocess.STDOUT)
+            try:
+                self.assertTrue(self.policy.issue_committed.wait(15))
+                self.assertTrue(launcher_pid.exists())
+                parent = int(launcher_pid.read_text())
+                children = Path('/proc') / str(parent) / 'task' / str(parent) / 'children'
+                child_ids = children.read_text().split()
+                self.assertEqual(len(child_ids), 1)
+                os.kill(parent, signal.SIGKILL)  # only our spawned privileged launcher
+                self.policy.issue_release.set()
+                self.assertNotEqual(process.wait(timeout=15), 0)
+            finally:
+                self.policy.issue_release.set()
+                if process.poll() is None: process.kill()
+                process.wait(timeout=5)
+        self.assertEqual(self.policy.issuances, 1)
+        self.assertEqual(self.git(self.repo, 'rev-parse', 'HEAD'), self.candidate)
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            current = json.loads(self.credential.read_text())
+            status = Path('/proc') / child_ids[0] / 'stat'
+            if current.get('schema') == 'hub2-model-policy-service-credential-v1' and (not status.exists() or status.read_text().split()[2] == 'Z'):
+                break
+            time.sleep(.01)
+        self.assertEqual(json.loads(self.credential.read_text()).get('schema'), 'hub2-model-policy-service-credential-v1')
+        self.assertFalse((policy_directory(self.state) / 'service-exchange-finished.json').exists())
+        self.assertEqual(json.loads(self.credential.with_name('model-policy-service-intent.json').read_text())['request_id'], request_id)
+        self.assertFalse((self.state / 'policy-apply-started').exists())
+        self.transaction('rollback', success=False)
+        self.assertEqual(self.policy.issuances, 1)
+        self.assertEqual(self.policy.writes(), [])
 
     def test_active_deploy_noop_policy_is_protected_and_commit_only_reads(self):
         self.transaction('apply')
@@ -564,10 +776,10 @@ print('{"ok":true}')
                     target.chmod(0o600)
                     self.credential.symlink_to(target)
                 elif kind == 'public':
-                    self.credential.write_text(json.dumps({'access_token': POLICY_TOKEN}))
+                    self.credential.write_text(json.dumps(service_document()))
                     self.credential.chmod(0o644)
                 result = self.transaction('apply', success=False)
-                self.assertIn('policy_admin_credential_unavailable_or_untrusted', result.stderr)
+                self.assertTrue(any(slug in result.stdout + result.stderr for slug in ('private_file_missing', 'private_file_untrusted', 'credential_preparation_failed')), result.stdout + result.stderr)
                 self.assertNotIn(POLICY_TOKEN, result.stdout + result.stderr)
                 self.assertEqual(self.git(self.repo, 'rev-parse', 'HEAD'), self.previous)
                 self.assertFalse(self.state.exists())

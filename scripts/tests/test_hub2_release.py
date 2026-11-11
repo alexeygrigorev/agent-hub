@@ -1400,7 +1400,7 @@ class PublicationTests(unittest.TestCase):
                              '[ "$(cat hub2/public/cli/manifest.json)" = legacy ]\n')
         (vm / 'scripts').mkdir()
         for script in ('publish-hub2-release.py', 'build-hub2-release.py', 'hub2-self-update.py',
-                       'schema-rollback-preflight.py', 'apply-model-policy.py'):
+                       'schema-rollback-preflight.py', 'apply-model-policy.py', 'prepare-model-policy-service-credential.py'):
             shutil.copyfile(REPO / 'scripts' / script, vm / 'scripts' / script)
         shutil.copyfile(schema_contract, vm / 'deploy' / schema_contract.name)
         for path in checker.SOURCES.values():
@@ -1435,7 +1435,7 @@ class PublicationTests(unittest.TestCase):
             policy_request_pointers.append(os.readlink(current) if current.is_symlink() else None)
             return git(*args)
 
-        policy = policy_fixture.PolicyAPI(SimpleNamespace(repo=vm, state=state, health_log=health_log,
+        policy = policy_fixture.PolicyAPI(SimpleNamespace(repo=vm, state=state, health_log=health_log, candidate=candidate,
                                                          git=observe_commit))
         self.addCleanup(policy.close)
         prior = json.loads(json.dumps(policy.current['candidates']))
@@ -1443,8 +1443,8 @@ class PublicationTests(unittest.TestCase):
         policy.current = {'version': 5, 'candidates': prior}
         credentials = self.directory / 'deploy-credentials'
         credentials.mkdir(mode=0o700)
-        credential = credentials / 'admin.json'
-        credential.write_text(json.dumps({'access_token': policy_fixture.POLICY_TOKEN}))
+        credential = credentials / 'model-policy-admin.json'
+        credential.write_text(json.dumps(policy_fixture.service_document(target_sha=candidate)))
         credential.chmod(0o600)
         fake_bin = self.directory / 'fake-bin'
         fake_bin.mkdir()

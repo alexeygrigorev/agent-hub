@@ -95,11 +95,189 @@ try:
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_nlink != 1 or info.st_size > 16384:
             raise ValueError()
         value = json.load(stream)
-    if not isinstance(value, dict) or not isinstance(value.get('access_token'), str) or not re.fullmatch(r'[^\s]{32,4096}', value['access_token']):
+    if (not isinstance(value, dict) or value.get('schema') != 'hub2-model-policy-service-credential-v1'
+            or not isinstance(value.get('access_token'), str) or not re.fullmatch(r'[0-9a-f]{64}', value['access_token'])):
+        raise ValueError()
+    credential = value.get('credential')
+    if (not isinstance(credential, dict) or credential.get('kind') != 'service' or credential.get('purpose') != 'model-policy'
+            or credential.get('scopes') != ['model-policy:read', 'model-policy:write']):
         raise ValueError()
 except (OSError, ValueError, TypeError):
     raise SystemExit('policy_admin_credential_unavailable_or_untrusted') from None
 PY
+}
+
+
+
+tracked_service_exchange() {
+  local target_sha="$1" script="$2" directory
+  shift 2
+  directory="$(dirname "$script")"
+  # This privileged launcher, rather than its shell/sudo parent, records child
+  # completion. If it dies, rollback retains the candidate even before intent.
+  run_root env -u HUB2_TOKEN -u HUB_TOKEN -u HUB_CONFIG_FILE -u HUB2_CONFIG -u HUB2_SERVER \
+    python3 -I -S -c '
+import json, os, pathlib, subprocess, sys
+folder, target, token = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+status, output = 1, {"error":"credential_preparation_failed"}
+try:
+    result = subprocess.run([sys.executable,"-I","-S",*sys.argv[4:]], stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, timeout=60)
+    status = result.returncode
+    if len(result.stdout) <= 65536:
+        value = json.loads(result.stdout)
+        if isinstance(value,dict) and set(value) <= {"status","id","error","remaining_ms"}:
+            output = value
+            if status == 0 and value.get("status") not in ("service_ready","service_installed"):
+                status = 1
+        else:
+            status = 1
+    else:
+        status = 1
+except Exception:
+    status = 1
+metadata = json.dumps({"target_sha":target,"transaction_token":token,"exit_status":status}).encode()
+temporary = folder / (".service-exchange-finished-" + str(os.getpid()))
+fd = os.open(temporary, os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW, 0o600)
+try:
+    with os.fdopen(fd,"wb") as stream:
+        stream.write(metadata); stream.flush(); os.fsync(stream.fileno())
+    os.link(temporary, folder / "service-exchange-finished.json", follow_symlinks=False)
+    os.unlink(temporary)
+    parent = os.open(folder,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    try: os.fsync(parent)
+    finally: os.close(parent)
+finally:
+    temporary.unlink(missing_ok=True)
+print(json.dumps(output,sort_keys=True))
+raise SystemExit(0 if status == 0 else 1)
+' "$directory" "$target_sha" "$POLICY_TRANSACTION_TOKEN" "$@"
+}
+
+# Production CLI has fixed paths/URL. Only the existing disposable test mode
+# injects the exported core's owned directory, loopback transport and UID.
+service_credential_helper() {
+  local action="$1" target_sha="$2" script="${3:--}" directory
+  if [[ "${AGENT_HUB_DEPLOY_TEST_MODE:-0}" == 1 ]]; then
+    directory="$(dirname "$POLICY_CREDENTIAL")"
+    local adapter
+    adapter="$(cat <<'PY'
+import json, os, pathlib, sys
+try:
+    action, target, directory, base, script = sys.argv[1:]
+    source = sys.stdin.read() if script == '-' else pathlib.Path(script).read_text()
+    module = {'__name__': 'protected_service_credential_helper'}
+    exec(compile(source, '<verified-service-credential-helper>', 'exec'), module)
+    result = module['run'](target, directory=directory, base_url=base, owner_uid=os.getuid(),
+                           action=action, post_health=action == 'exchange')
+    print(json.dumps(result, sort_keys=True))
+except Exception as error:
+    result = {'error': getattr(error, 'code', 'credential_preparation_failed')}
+    if getattr(error, 'request_id', None):
+        result['id'] = 'deployment:' + error.request_id
+    print(json.dumps(result, sort_keys=True))
+    raise SystemExit(1) from None
+PY
+)"
+    if [[ "$action" == exchange ]]; then
+      tracked_service_exchange "$target_sha" "$script" -c "$adapter" "$action" "$target_sha" "$directory" "$POLICY_URL" "$script"
+    else
+      run_root env -u HUB2_TOKEN -u HUB_TOKEN -u HUB_CONFIG_FILE -u HUB2_CONFIG -u HUB2_SERVER \
+        python3 -I -S -c "$adapter" "$action" "$target_sha" "$directory" "$POLICY_URL" "$script"
+    fi
+  elif [[ "$action" == preflight ]]; then
+    run_root env -u HUB2_TOKEN -u HUB_TOKEN -u HUB_CONFIG_FILE -u HUB2_CONFIG -u HUB2_SERVER \
+      python3 -I -S - preflight --target-sha "$target_sha"
+  else
+    tracked_service_exchange "$target_sha" "$script" "$script" exchange --target-sha "$target_sha" --post-health
+  fi
+}
+
+preflight_service_credential() {
+  # This source is pinned to the verified candidate object, not the old checkout.
+  # Preflight is structural and must not authenticate against an older server
+  # that cannot yet recognize service credentials.
+  git -C "$REPO" show "$1:scripts/prepare-model-policy-service-credential.py" | service_credential_helper preflight "$1"
+}
+
+exchange_service_credential() {
+  local target_sha="$1" directory
+  [[ "$(git -C "$REPO" rev-parse HEAD)" == "$target_sha" ]] || return 1
+  directory="$(policy_directory)"
+  run_root install -d -m 700 "$directory"
+  run_root install -m 600 "$REPO/scripts/prepare-model-policy-service-credential.py" "$directory/prepare-model-policy-service-credential.py"
+  write_root_file "$directory/service-exchange-started" yes
+  run_root sync -f "$directory"
+  service_credential_helper exchange "$target_sha" "$directory/prepare-model-policy-service-credential.py"
+}
+
+
+service_exchange_rollback_safe() {
+  local directory inspect
+  # Older prepared transactions predate both tokens and credential exchange.
+  if [[ -z "$POLICY_TRANSACTION_TOKEN" ]]; then return 0; fi
+  directory="$(policy_directory)" || return 1
+  if ! run_root test -f "$directory/service-exchange-started"; then return 0; fi
+  if ! run_root test -f "$directory/service-exchange-finished.json"; then
+    printf 'ERROR: service exchange process outcome unconfirmed; retaining candidate and recovery state.\n' >&2
+    return 1
+  fi
+  inspect="$(cat <<'PY'
+import json, os, pathlib, re, sys
+identity = None
+try:
+    folder, target, token, test_mode, credential_dir, base = sys.argv[1:]
+    module = {'__name__':'protected_service_credential_helper'}
+    exec(compile(sys.stdin.read(),'<verified-service-credential-helper>','exec'),module)
+    context = module['_TEST_OWNER'].set(os.getuid() if test_mode == '1' else 0)
+    exchange = os.open(folder,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    try:
+        module['directory_check'](exchange,private=True)
+        finished = module['parse'](module['read_private'](exchange,'service-exchange-finished.json'))
+        module['require'](isinstance(finished,dict) and set(finished)=={'target_sha','transaction_token','exit_status'}
+            and finished['target_sha']==target and finished['transaction_token']==token
+            and type(finished['exit_status']) is int)
+    finally:
+        os.close(exchange)
+    if test_mode == '1':
+        location = pathlib.Path(credential_dir)
+        module['require'](location.resolve()==location,'directory_untrusted')
+        fd = os.open(location,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+        module['directory_check'](fd,private=True)
+    else:
+        fd = module['open_directory']()
+    try:
+        with module['locked'](fd):
+            raw = module['read_private'](fd,module['INTENT'],optional=True)
+            if raw is not None:
+                intent = module['parse'](raw)
+                module['require'](isinstance(intent,dict) and set(intent)=={
+                    'schema','request_id','target_sha','base_url','label','purpose','prior_output_sha256','phase'})
+                identity = module['request_id'](intent['request_id'])
+                module['source_sha'](intent['target_sha'])
+                module['require'](intent['schema']=='hub2-model-policy-service-intent-v1'
+                    and intent['base_url']==base and intent['label']==module['LABEL']
+                    and intent['purpose']=='model-policy' and intent['phase']=='issuance_started'
+                    and (intent['prior_output_sha256'] is None or isinstance(intent['prior_output_sha256'],str)
+                         and re.fullmatch('[0-9a-f]{64}',intent['prior_output_sha256'])))
+                output = module['service'](module['read_private'](fd,module['OUTPUT']))
+                received = module['service'](module['read_private'](fd,'model-policy-service-'+identity+'.received.json'))
+                module['require'](output==received and output['target_sha']==intent['target_sha']
+                    and output['credential']['id']=='deployment:'+identity)
+    finally:
+        os.close(fd)
+    module['_TEST_OWNER'].reset(context)
+except Exception:
+    result = {'error':'service_issuance_unconfirmed'}
+    if identity: result['id']='deployment:'+identity
+    print(json.dumps(result,sort_keys=True))
+    raise SystemExit(1) from None
+PY
+)"
+  git -C "$REPO" show "$POLICY_SOURCE_SHA:scripts/prepare-model-policy-service-credential.py" | \
+    run_root env -u HUB2_TOKEN -u HUB_TOKEN -u HUB_CONFIG_FILE -u HUB2_CONFIG -u HUB2_SERVER \
+    python3 -I -S -c "$inspect" "$directory" "$POLICY_SOURCE_SHA" "$POLICY_TRANSACTION_TOKEN" \
+      "${AGENT_HUB_DEPLOY_TEST_MODE:-0}" "$(dirname "$POLICY_CREDENTIAL")" "$POLICY_URL"
 }
 
 policy_directory() {
@@ -112,7 +290,7 @@ policy_recovery() {
   directory="$(policy_directory)" || return 1
   [[ "$POLICY_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || return 1
   validate_policy_credential || return 1
-  run_root env -u HUB2_TOKEN python3 "$directory/apply-model-policy.py" "$action" \
+  run_root env -u HUB2_TOKEN -u HUB_TOKEN -u HUB_CONFIG_FILE -u HUB2_CONFIG -u HUB2_SERVER python3 "$directory/apply-model-policy.py" "$action" \
     --url "$POLICY_URL" --token-file "$POLICY_CREDENTIAL" \
     --file "$directory/candidates.json" --source-sha "$POLICY_SOURCE_SHA" \
     --receipt "$directory/receipt.json" --transaction-token "$POLICY_TRANSACTION_TOKEN"
@@ -204,6 +382,11 @@ restore_previous_release() {
     || { printf 'ERROR: rollback metadata has an invalid previous commit.\n' >&2; return 1; }
   git -C "$REPO" cat-file -e "${previous_sha}^{commit}" \
     || { printf 'ERROR: previous release commit is unavailable locally: %s\n' "$previous_sha" >&2; return 1; }
+
+  service_exchange_rollback_safe || {
+    printf 'ERROR: service issuance unconfirmed; candidate API and protected evidence retained for operator recovery.\n' >&2
+    return 1
+  }
 
   if ! run_root test -f "$TRANSACTION_DIR/schema-preflight.py"; then
     printf 'ERROR: rollback_schema_proof_missing; keep live databases unchanged and prepare a compatible rollback build.\n' >&2
@@ -315,12 +498,12 @@ apply_release() {
 
   run_root test ! -e "$TRANSACTION_DIR" \
     || fail "an earlier deploy transaction is still pending; resolve its rollback first"
-  if [[ "$release_mode" == active ]]; then validate_policy_credential; fi
   git -C "$REPO" fetch --quiet --no-tags origin main
   git -C "$REPO" cat-file -e "${deploy_sha}^{commit}" \
     || fail "requested deploy commit is unavailable: $deploy_sha"
   git -C "$REPO" merge-base --is-ancestor "$deploy_sha" "$(git -C "$REPO" rev-parse origin/main)" \
     || fail "requested deploy commit is not reachable from origin/main: $deploy_sha"
+  if [[ "$release_mode" == active ]]; then preflight_service_credential "$deploy_sha"; fi
   local_status="$(git -C "$REPO" status --porcelain --untracked-files=all)"
   [[ -z "$local_status" ]] \
     || fail "refusing deployment because the VM checkout has uncommitted files"
@@ -426,7 +609,10 @@ apply_release() {
   wait_for_hub_health
   run_root python3 "$TRANSACTION_DIR/schema-preflight.py" --repo "$REPO" \
     --previous "$previous_sha" --candidate "$deploy_sha" --data-dir "$DB_DIR" --print-mode >/dev/null
-  if [[ "$release_mode" == active ]]; then apply_canonical_policy; fi
+  if [[ "$release_mode" == active ]]; then
+    exchange_service_credential "$deploy_sha"
+    apply_canonical_policy
+  fi
   write_root_file "$TRANSACTION_DIR/applied" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   trap - ERR
   if [[ "$schema_mode" == defer ]]; then
