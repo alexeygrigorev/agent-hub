@@ -39,6 +39,9 @@ class FakeNative:
                 "schema_version": 2, "worker_pid": os.getpid() + 7,
                 "updated_at_ms": created + 500, "boot_id": "fixture"}))
             return subprocess.CompletedProcess(args, 0, json.dumps(self.process), "")
+        if command[0] == "list":
+            rows = [{**self.process, 'schema_version': 1}] if self.process else []
+            return subprocess.CompletedProcess(args, 0, json.dumps(rows), "")
         if command[0] == "status":
             return subprocess.CompletedProcess(args, 0 if self.process else 1, json.dumps(self.process), "")
         if command[0] == "send" and self.fail_send:
@@ -786,14 +789,101 @@ class HostTests(unittest.TestCase):
         row = self.journal.db.execute("SELECT state,native_id FROM launches WHERE session_id='session-orphan'").fetchone()
         self.assertEqual(tuple(row), ("aborting", None))
         self.assertEqual(self.native.process["phase"], "running")
-        self.assertEqual(self.native.calls, [])
+        self.assertEqual([args[1:] for args, _ in self.native.calls], [['list', '--all', '--json']])
 
-    def test_reconcile_sweeps_launch_orphan_to_aborting(self):
+    def test_reconcile_closes_legacy_launch_with_unconfirmed_failure(self):
         self.insert_orphan_launch()
         self.bridge.reconcile()
         state = self.journal.db.execute(
             "SELECT state FROM launches WHERE session_id='session-orphan'").fetchone()[0]
-        self.assertEqual(state, "aborting")
+        self.assertEqual(state, "launch_failed_unconfirmed")
+        self.bridge.reconcile()
+        row = self.journal.db.execute('SELECT * FROM launches').fetchone()
+        payload = json.loads(row['legacy_failure_json'])
+        self.assertEqual(payload['native_outcome'], 'unconfirmed')
+        self.assertEqual(payload['failure_kind'], 'legacy_census_absent')
+        self.assertEqual(payload['native_id'], None)
+        self.assertNotIn('native_exit_confirmed', payload)
+        self.assertNotIn('no_dispatch', payload)
+        self.assertNotIn('exit_code', payload)
+        self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0], 1)
+        self.client.fail = True
+        with self.assertRaises(ApiError):
+            self.journal.flush(self.client)
+        self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0], 1)
+        self.client.fail = False
+        self.journal.flush(self.client)
+        self.assertEqual(self.client.calls[-1][2], payload)
+        reopened = Journal(self.journal.path)
+        try:
+            saved = reopened.db.execute('SELECT state,legacy_failure_json FROM launches').fetchone()
+            self.assertEqual(saved['state'], 'launch_failed_unconfirmed')
+            self.assertEqual(json.loads(saved['legacy_failure_json']), payload)
+        finally:
+            reopened.close_thread()
+
+    def test_legacy_no_match_closes_even_when_workspace_is_deleted(self):
+        self.insert_orphan_launch(state='aborting')
+        workspace = self.root / 'deleted'
+        workspace.mkdir()
+        with self.journal.db:
+            self.journal.db.execute('UPDATE launches SET workspace=?', (str(workspace),))
+        workspace.rmdir()
+        self.bridge.reconcile()
+        row = self.journal.db.execute('SELECT state,legacy_failure_json FROM launches').fetchone()
+        self.assertEqual(row['state'], 'launch_failed_unconfirmed')
+        self.assertEqual(json.loads(row['legacy_failure_json'])['evidence']['workspace'], str(workspace))
+        self.assertFalse(any(args[1] in {'status', 'kill'} for args, _ in self.native.calls))
+
+    def test_legacy_census_failure_retains_original_state_and_no_receipt(self):
+        self.insert_orphan_launch(state='aborting')
+        for raw in ('null', '{"sessions":[]}', '[{"id":"short"}]'):
+            with self.subTest(raw=raw), patch.object(self.bridge.launcher, 'runner',
+                    return_value=subprocess.CompletedProcess(['a'], 0, raw, '')):
+                self.bridge.reconcile()
+                self.assertEqual(self.journal.db.execute('SELECT state FROM launches').fetchone()[0], 'aborting')
+                self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0], 0)
+        from agent_hub_host.native_inventory import collect_native_inventory
+        row={'id':'11111111-1111-4111-8111-111111111111','tag':'other','workspace':str(self.root),'schema_version':1}
+        with patch('agent_hub_host.native_inventory.MAX_CENSUS_ROWS',0), patch.object(self.bridge.launcher,'runner',
+                return_value=subprocess.CompletedProcess(['a'],0,json.dumps([row]),'')):
+            self.bridge.reconcile()
+        self.assertEqual(self.journal.db.execute('SELECT state FROM launches').fetchone()[0], 'aborting')
+
+    def test_legacy_failure_receipt_and_terminal_journal_commit_together(self):
+        self.insert_orphan_launch(state='aborting')
+        inventory = self.bridge.launcher.inventory()
+        row = self.journal.db.execute('SELECT * FROM launches').fetchone()
+        with patch.object(self.journal, 'enqueue', side_effect=sqlite3.OperationalError('failed outbox write')):
+            with self.assertRaises(sqlite3.OperationalError):
+                self.bridge.settle_legacy_unobserved_launch(row, inventory)
+        saved = self.journal.db.execute('SELECT state,legacy_failure_json FROM launches').fetchone()
+        self.assertEqual(tuple(saved), ('aborting', None))
+        self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0], 0)
+        with self.journal.db:
+            self.journal.db.execute("UPDATE launches SET tag='wrong-tag'")
+        self.bridge.reconcile()
+        self.assertEqual(self.journal.db.execute('SELECT state FROM launches').fetchone()[0], 'aborting')
+
+    def test_legacy_resolution_cas_preserves_native_binding_and_inflight_attempt(self):
+        for mutation in ('native_id', 'epoch', 'native_dispatch_started', 'inflight'):
+            with self.subTest(mutation=mutation):
+                with self.journal.db:
+                    self.journal.db.execute('DELETE FROM launches')
+                self.bridge._inflight.clear()
+                self.insert_orphan_launch(state='aborting')
+                inventory = self.bridge.launcher.inventory()
+                original = self.journal.db.execute('SELECT * FROM launches').fetchone()
+                if mutation == 'inflight':
+                    self.bridge._inflight.add(original['session_id'])
+                else:
+                    value = {'native_id': '11111111-1111-4111-8111-111111111111',
+                             'epoch': 8, 'native_dispatch_started': 1}[mutation]
+                    with self.journal.db:
+                        self.journal.db.execute('UPDATE launches SET '+mutation+'=?', (value,))
+                self.bridge.settle_legacy_unobserved_launch(original, inventory)
+                self.assertEqual(self.journal.db.execute('SELECT state FROM launches').fetchone()[0], 'aborting')
+                self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0], 0)
 
     def test_non_stop_command_still_refused_for_launch_orphan(self):
         self.insert_orphan_launch()

@@ -494,6 +494,164 @@ test('late exit forwards the timeout before completion when the first timeout tr
  assert.equal(proof.native_exit_confirmed,true);assert.equal(proof.native_id,native);assert.equal(proof.exit_code,0);
 });
 
+test('legacy census failure retains native uncertainty and exact replay through Project completion',async()=>{
+ const f=fixture({lostReleaseFailures:1}),own=await intake(f,'legacy-census');
+ const response=await f.call('/api/intakes/'+own.id+'/start','POST',{key:'legacy-start',workspace:'/deleted',engine:'shell',machine_id:'h1'});
+ assert.equal(response.status,201);
+ const saga=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any;
+ const receipt={operation_id:saga.operation_id,attempt_operation_id:saga.attempt_operation_id,session_id:saga.session_id,
+  machine_id:saga.machine_id,intake_id:saga.intake_id,epoch:saga.epoch,native_id:null,reason:'legacy_launch_unobserved',
+  failure_kind:'legacy_census_absent',launch_failed:true,native_outcome:'unconfirmed',evidence_digest:'a'.repeat(64),
+  evidence:{source:'aplexer_all_registry_census',complete:true,match_count:0,dispatch_provenance:'legacy_unknown',workspace:'/deleted'}};
+ assert.equal((await f.call('/_internal/reaped','POST',{...receipt,native_exit_confirmed:true})).status,400);
+ const before=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE operation_id=?').get(saga.operation_id);
+ const beforeIntake=f.sql.prepare('SELECT * FROM intakes WHERE id=?').get(own.id);
+ const beforeEvents=f.sql.prepare('SELECT * FROM intake_events WHERE task_id=?').all(own.id);
+ assert.equal((await f.call('/_internal/reaped','POST',{...receipt,evidence:{...receipt.evidence,workspace:'/wrong-worktree'}})).status,409);
+ assert.deepEqual(f.sql.prepare('SELECT * FROM dispatch_sagas WHERE operation_id=?').get(saga.operation_id),before);
+ assert.deepEqual(f.sql.prepare('SELECT * FROM intakes WHERE id=?').get(own.id),beforeIntake);
+ assert.deepEqual(f.sql.prepare('SELECT * FROM intake_events WHERE task_id=?').all(own.id),beforeEvents);
+ assert.equal(f.capReleases.length,0);
+ assert.equal((await f.call('/_internal/reaped','POST',receipt)).status,503);
+ assert.equal((await f.call('/_internal/reaped','POST',receipt)).status,200);
+ const closed=f.sql.prepare('SELECT * FROM intakes WHERE id=?').get(own.id) as any;
+ assert.equal(closed.status,'failed');
+ const evidence=JSON.parse(closed.final_evidence_json);
+ assert.equal(evidence.native_outcome,'unconfirmed');assert.equal(evidence.native_exit_confirmed,undefined);
+ assert.equal((await f.call('/_internal/reaped','POST',receipt)).status,200);
+ assert.equal(f.sql.prepare("SELECT COUNT(*) AS n FROM intake_events WHERE kind='session_launch_failed' AND task_id=?").get(own.id).n,1);
+ assert.equal((await f.call('/_internal/reaped','POST',{...receipt,evidence_digest:'b'.repeat(64)})).status,409);
+});
+
+test('a first legacy failure for an older attempt refuses unavailable Project launch metadata',async()=>{
+ const f=fixture(),own=await intake(f,'legacy-history');
+ assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',{key:'legacy-start',workspace:'/deleted',engine:'shell',machine_id:'h1'})).status,201);
+ const first=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any;
+ f.sql.prepare("UPDATE dispatch_sagas SET attempt=1,attempt_operation_id=?,state='running',native_id='new-native',machine_id='h2' WHERE operation_id=?")
+  .run(first.operation_id+':1',first.operation_id);
+ const before=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE operation_id=?').get(first.operation_id);
+ const receipt={operation_id:first.operation_id,attempt_operation_id:first.attempt_operation_id,session_id:first.session_id,
+  machine_id:first.machine_id,intake_id:first.intake_id,epoch:first.epoch,native_id:null,reason:'legacy_launch_unobserved',
+  failure_kind:'legacy_census_absent',launch_failed:true,native_outcome:'unconfirmed',evidence_digest:'a'.repeat(64),
+  evidence:{source:'aplexer_all_registry_census',complete:true,match_count:0,dispatch_provenance:'legacy_unknown',workspace:'/deleted'}};
+ assert.equal((await f.call('/_internal/reaped','POST',receipt)).status,409);
+ assert.deepEqual(f.sql.prepare('SELECT * FROM dispatch_sagas WHERE operation_id=?').get(first.operation_id),before);
+ assert.equal(f.capReleases.length,0);
+ assert.equal(f.sql.prepare("SELECT body_json FROM intake_events WHERE kind='session_launch_failed' AND task_id=?").get(own.id),undefined);
+});
+
+test('legacy uncertainty enriches an already timed-out exact saga without reopening or losing old failure evidence',async()=>{
+ const f=fixture(),own=await intake(f,'legacy-late');
+ assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',{key:'legacy-late',workspace:'/deleted',engine:'shell',machine_id:'h1'})).status,201);
+ const saga=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any;
+ const binding={operation_id:saga.operation_id,attempt_operation_id:saga.attempt_operation_id,
+  session_id:saga.session_id,machine_id:saga.machine_id,epoch:saga.epoch,intake_id:saga.intake_id};
+ assert.equal((await f.call('/_internal/reaped','POST',{...binding,native_id:null,reason:'launch_timeout_no_native',launch_failed:true,observed_at:Date.now()})).status,200);
+ const receipt={...binding,native_id:null,reason:'legacy_launch_unobserved',failure_kind:'legacy_census_absent',
+  launch_failed:true,native_outcome:'unconfirmed',evidence_digest:'a'.repeat(64),
+  evidence:{source:'aplexer_all_registry_census',complete:true,match_count:0,dispatch_provenance:'legacy_unknown',workspace:'/deleted'}};
+ assert.equal((await f.call('/_internal/reaped','POST',receipt)).status,200);
+ const current=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE operation_id=?').get(saga.operation_id) as any;
+ assert.equal(current.state,'complete');assert.equal(current.last_reason,'launch_timeout_no_native');
+ const task=f.sql.prepare('SELECT * FROM intakes WHERE id=?').get(own.id) as any;
+ assert.equal(task.status,'failed');assert.equal(JSON.parse(task.final_evidence_json).legacy_launch_recovery.native_outcome,'unconfirmed');
+ const events=f.sql.prepare("SELECT body_json FROM intake_events WHERE task_id=? AND kind='session_launch_failed'").all(own.id) as any[];
+ assert.equal(events.length,2);
+ assert(events.some(event=>JSON.parse(event.body_json).reason==='launch_timeout_no_native'));
+});
+
+test('late legacy failure cannot overwrite a retry intake and remains replayable after the retry',async()=>{
+ const f=fixture(),own=await intake(f,'legacy-retry');
+ assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',{key:'legacy-retry',workspace:'/deleted',engine:'shell',machine_id:'h1'})).status,201);
+ const saga=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any;
+ const receipt={operation_id:saga.operation_id,attempt_operation_id:saga.attempt_operation_id,
+  session_id:saga.session_id,machine_id:saga.machine_id,epoch:saga.epoch,intake_id:saga.intake_id,
+  native_id:null,reason:'legacy_launch_unobserved',failure_kind:'legacy_census_absent',
+  launch_failed:true,native_outcome:'unconfirmed',evidence_digest:'a'.repeat(64),
+  evidence:{source:'aplexer_all_registry_census',complete:true,match_count:0,dispatch_provenance:'legacy_unknown',workspace:'/deleted'}};
+ assert.equal((await f.call('/_internal/reaped','POST',receipt)).status,200);
+ f.sql.prepare("UPDATE intakes SET session_id='new-session',assigned_machine_id='h2',status='running',final_evidence_json=? WHERE id=?")
+  .run(JSON.stringify({new_evidence:'preserve me'}),own.id);
+ const newer=f.sql.prepare('SELECT * FROM intakes WHERE id=?').get(own.id);
+ assert.equal((await f.call('/_internal/reaped','POST',receipt)).status,200);
+ assert.deepEqual(f.sql.prepare('SELECT * FROM intakes WHERE id=?').get(own.id),newer);
+
+ // First delivery can also arrive only after the manual retry.
+ const key='legacy-unobserved:'+saga.attempt_operation_id+':'+saga.epoch;
+ f.sql.prepare('DELETE FROM intake_events WHERE task_id=? AND event_key=?').run(own.id,key);
+ assert.equal((await f.call('/_internal/reaped','POST',receipt)).status,200);
+ assert.deepEqual(f.sql.prepare('SELECT * FROM intakes WHERE id=?').get(own.id),newer);
+ const event=f.sql.prepare('SELECT body_json FROM intake_events WHERE task_id=? AND event_key=?').get(own.id,key) as any;
+ assert.equal(JSON.parse(event.body_json).historical,true);
+});
+
+test('real Machine to Project legacy reports enrich stopped null-ID attempts without replacing terminal evidence',async()=>{
+ for(const reason of ['stop_confirmed','dead','idle']){
+  const database=new DatabaseSync(':memory:');
+  let alarm:number|null=null;
+  const context:any={storage:{
+   sql:{exec(query:string,...args:any[]){
+    const statement=database.prepare(query);
+    return {toArray:()=>statement.columns().length?statement.all(...args):(statement.run(...args),[])};
+   }},
+   transactionSync(callback:()=>unknown){
+    database.exec('BEGIN');
+    try{const value=callback();database.exec('COMMIT');return value;}catch(error){database.exec('ROLLBACK');throw error;}
+   },
+   async getAlarm(){return alarm;},async setAlarm(value:number){alarm=value;},async deleteAlarm(){alarm=null;},
+  },blockConcurrencyWhile:(callback:()=>unknown)=>Promise.resolve(callback()),getWebSockets:()=>[]};
+  let machine:MachineDO;
+  const f=fixture({machineFetch:request=>machine.fetch(request)});
+  const revoked:any[]=[];
+  machine=new MachineDO(context,{
+   CONTROL:{idFromName:(id:string)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{
+    const request=input instanceof Request?input:new Request(input,init);
+    if(new URL(request.url).pathname==='/_worker/revoke')revoked.push(await request.json());
+    return Response.json({authorized:true,revoked:true});
+   }})},
+   PROJECTS:{idFromName:(id:string)=>id,get:()=>({fetch:(request:Request)=>f.project.fetch(request)})},
+  } as any);
+  const own=await intake(f,'legacy-stopped-'+reason);
+  assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',{key:'legacy-start-'+reason,workspace:'/deleted/worktree',engine:'shell',machine_id:'h1'})).status,201);
+  const saga=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any;
+  const stopped={operation_id:saga.operation_id,attempt_operation_id:saga.attempt_operation_id,session_id:saga.session_id,
+   machine_id:saga.machine_id,epoch:saga.epoch,native_id:null,reason,observed_at:Date.now()};
+  assert.equal((await f.call(reason==='stop_confirmed'?'/_internal/stopped':'/_internal/reaped','POST',stopped)).status,200);
+  const previousSaga=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE operation_id=?').get(saga.operation_id);
+  const previousIntake=f.sql.prepare('SELECT * FROM intakes WHERE id=?').get(own.id) as any;
+  database.prepare("UPDATE sessions SET state='stopped',evidence_json=? WHERE id=?")
+   .run(JSON.stringify({stopped:true,reason,previous_proof:'retain'}),saga.session_id);
+  database.prepare("UPDATE machine_session_operations SET state='stopped' WHERE operation_id=?").run(saga.attempt_operation_id);
+  const now=Date.now();
+  database.prepare('INSERT INTO launch_admissions VALUES(?,?,?,?)').run(saga.attempt_operation_id,saga.session_id,saga.epoch,now-100);
+  (machine as any).db.cache.clear();
+  const receipt={operation_id:saga.attempt_operation_id,epoch:saga.epoch,native_id:null,launch_failed:true,
+   failure_kind:'legacy_census_absent',native_outcome:'unconfirmed',evidence:{source:'aplexer_all_registry_census',
+    started_at_ms:now-10,observed_at_ms:now,row_count:77,sha256:'a'.repeat(64),complete:true,match_count:0,
+    workspace:'/deleted/worktree',tag:'task-hub2-'+saga.session_id,dispatch_provenance:'legacy_unknown'}};
+  const call=()=>machine.fetch(new Request('https://machine.test/api/sessions/'+saga.session_id+'/finish',{
+   method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify({
+    id:'machine:h1',kind:'machine',resource_id:'h1',scopes:['session:report']})},body:JSON.stringify(receipt)}));
+  assert.equal((await call()).status,200);
+  assert.equal((await call()).status,200);
+  assert.equal(revoked.length,1);
+  const stored=database.prepare('SELECT state,evidence_json FROM sessions WHERE id=?').get(saga.session_id) as any;
+  assert.equal(stored.state,'stopped');
+  const machineEvidence=JSON.parse(stored.evidence_json);
+  assert.equal(machineEvidence.previous_proof,'retain');
+  assert.equal(machineEvidence.legacy_launch_recovery.native_outcome,'unconfirmed');
+  assert.equal(machineEvidence.native_exit_confirmed,undefined);
+  assert.deepEqual(f.sql.prepare('SELECT * FROM dispatch_sagas WHERE operation_id=?').get(saga.operation_id),previousSaga);
+  const current=f.sql.prepare('SELECT * FROM intakes WHERE id=?').get(own.id) as any;
+  assert.equal(current.status,previousIntake.status);
+  const {legacy_launch_recovery,...preserved}=JSON.parse(current.final_evidence_json);
+  assert.deepEqual(preserved,JSON.parse(previousIntake.final_evidence_json));
+  assert.equal(legacy_launch_recovery.native_outcome,'unconfirmed');
+  assert.equal(legacy_launch_recovery.historical,true);
+  const outbox=database.prepare("SELECT state FROM machine_outbox WHERE kind='legacy-launch-failure'").get() as any;
+  assert.equal(outbox.state,'delivered');
+ }
+});
 
 test('a lost central draw response replays the same draw before creating a saga',async()=>{
  const candidates=[{id:'codex-sol',engine:'codex',model:'gpt-6.1-sol',effort:'medium',account_id:'codex',weight:1,capabilities:[],enabled:true}];

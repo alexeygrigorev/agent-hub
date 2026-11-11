@@ -63,6 +63,8 @@ class Journal:
             self.db.execute("ALTER TABLE launches ADD COLUMN runtime_deadline INTEGER")
         if "native_dispatch_started" not in {row[1] for row in self.db.execute("PRAGMA table_info(launches)")}:
             self.db.execute("ALTER TABLE launches ADD COLUMN native_dispatch_started INTEGER")
+        if "legacy_failure_json" not in {row[1] for row in self.db.execute("PRAGMA table_info(launches)")}:
+            self.db.execute("ALTER TABLE launches ADD COLUMN legacy_failure_json TEXT")
         self.db.execute("CREATE INDEX IF NOT EXISTS launches_active ON launches(state,operation_id)")
 
     @property
@@ -277,7 +279,7 @@ class Bridge:
         if prior:
             if prior["session_id"] != session or prior["digest"] != digest or epoch < prior["epoch"]:
                 raise ValueError("offer_fence_conflict")
-            if prior['state'] == 'stopped_before_dispatch':
+            if prior['state'] in {'stopped_before_dispatch', 'launch_failed_unconfirmed'}:
                 return None
             if prior['state']=='exited':
                 return prior['native_id']
@@ -405,6 +407,33 @@ class Bridge:
                                  {"operation_id": operation, "epoch": epoch, "native_id": None,
                                   "launch_failed": True, "no_dispatch": True})
 
+    def settle_legacy_unobserved_launch(self, row, inventory):
+        if (not isinstance(row['session_id'], str) or not re.fullmatch(r'[A-Za-z0-9-]{1,80}', row['session_id'])
+                or not isinstance(row['operation_id'], str) or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,120}', row['operation_id'])
+                or type(row['epoch']) is not int or row['epoch'] < 1 or row['tag'] != 'task-hub2-' + row['session_id']
+                or not isinstance(row['workspace'], str) or len(row['workspace'].encode('utf-8')) > 1024):
+            raise RuntimeError('legacy_launch_identity_unverified')
+        evidence = inventory.absence_evidence(row['workspace'], row['tag'])
+        if evidence is None:
+            return
+        operation, session, epoch = row['operation_id'], row['session_id'], row['epoch']
+        payload = {'operation_id': operation, 'epoch': epoch, 'native_id': None,
+                   'launch_failed': True, 'failure_kind': 'legacy_census_absent',
+                   'native_outcome': 'unconfirmed', 'evidence': evidence}
+        with self._inflight_lock:
+            if session in self._inflight or not inventory.fresh():
+                return
+            with self.journal.db as db:
+                changed = db.execute(
+                    "UPDATE launches SET state='launch_failed_unconfirmed',legacy_failure_json=? "
+                    "WHERE operation_id=? AND session_id=? AND epoch=? AND digest=? "
+                    "AND workspace=? AND tag=? AND state=? AND state IN ('launching','aborting') "
+                    "AND native_dispatch_started IS NULL AND native_id IS NULL",
+                    (canonical(payload), operation, session, epoch, row['digest'], row['workspace'], row['tag'], row['state']))
+                if changed.rowcount != 1:
+                    return
+                self.journal.enqueue(f"legacy-unobserved:{operation}:{epoch}", f"/api/sessions/{session}/finish", payload)
+
     def abort_launch(self,operation):
         with self.journal.db:
             self.journal.db.execute("UPDATE launches SET state='aborting' WHERE operation_id=? AND state='launching'",(operation,))
@@ -437,6 +466,8 @@ class Bridge:
         rows = self.journal.db.execute("SELECT * FROM launches WHERE state IN ('running','aborting','deadline_stopping','launching') LIMIT 1001").fetchall()
         if len(rows) > 1000:
             raise RuntimeError("active_native_bound_exceeded")
+        inventory = None
+        inventory_failed = False
         for row in rows:
             if row['session_id'] in getattr(self, '_inflight', set()):
                 continue
@@ -448,6 +479,19 @@ class Bridge:
                 with self.journal.db:
                     self.journal.db.execute("UPDATE launches SET state='aborting' WHERE operation_id=? AND state='launching'",(row['operation_id'],))
                 row = self.journal.db.execute("SELECT * FROM launches WHERE operation_id=?", (row['operation_id'],)).fetchone()
+            if row['state']=='aborting' and row['native_dispatch_started'] is None and not row['native_id']:
+                try:
+                    if not inventory_failed:
+                        if inventory is None or not inventory.fresh():
+                            collect_inventory = getattr(self.launcher, 'inventory', None)
+                            if not callable(collect_inventory):
+                                raise RuntimeError('native_census_unavailable')
+                            inventory = collect_inventory()
+                        self.settle_legacy_unobserved_launch(row, inventory)
+                except (RuntimeError, OSError, subprocess.SubprocessError):
+                    inventory_failed = True
+                    logging.getLogger(__name__).warning('Native census unavailable; legacy launches remain unresolved')
+                continue
             workspace_available = self._workspace_is_available(row["workspace"])
             if not workspace_available and not row["native_id"]:
                 self._warn_unavailable_workspace(row)

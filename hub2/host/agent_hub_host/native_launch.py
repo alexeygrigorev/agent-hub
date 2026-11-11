@@ -433,7 +433,7 @@ class NativeLauncher:
         self.native_binary = self.config.get("aplexer") or aplexer
         self.state_dir = self.config.get("aplexer_state_dir")
 
-    def native(self, *args, input=None, allow_failure=False, timeout=30, workspace=None, env_overrides=None):
+    def native(self, *args, input=None, allow_failure=False, timeout=30, workspace=None, env_overrides=None, output_limit=262144):
         env = os.environ.copy()
         for key in ('HUB2_TOKEN', 'HUB2_SERVER', 'HUB2_CONFIG', 'HUB2_LAUNCH_CONTEXT'):
             env.pop(key, None)
@@ -443,9 +443,14 @@ class NativeLauncher:
                              timeout=timeout, check=False, env=env, cwd=workspace)
         if result.returncode and not allow_failure:
             raise RuntimeError("native_command_failed")
-        if len(result.stdout) > 262144:
+        if len(result.stdout) > output_limit:
             raise RuntimeError("native_response_too_large")
         return result
+
+    def inventory(self):
+        from .native_inventory import collect_native_inventory, CENSUS_TIMEOUT_SECONDS, MAX_CENSUS_BYTES
+        return collect_native_inventory(lambda: self.native('list', '--all', '--json',
+            timeout=CENSUS_TIMEOUT_SECONDS, output_limit=MAX_CENSUS_BYTES))
 
     def status(self, selector, workspace=None):
         result = self.native("status", selector, "--json", allow_failure=True, workspace=workspace)
