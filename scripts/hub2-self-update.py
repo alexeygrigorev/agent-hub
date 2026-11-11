@@ -8,6 +8,7 @@ import argparse
 import contextlib
 import fcntl
 import hashlib
+from io import BytesIO
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,7 @@ import tempfile
 import time
 from urllib.parse import urlsplit
 from urllib.request import urlopen
+from zipfile import BadZipFile, ZipFile
 
 UNITS = ('agent-hub2-host.service', 'agent-hub2-host-update.service', 'agent-hub2-host-update.timer')
 MAX_MANIFEST = 128 * 1024
@@ -223,6 +225,166 @@ def repair_service_files(base, manifest, root, target):
     command(['systemctl', '--user', 'daemon-reload'])
 
 
+def managed_release(releases, name):
+    if not isinstance(name, str) or not re.fullmatch(r'[0-9a-f]{40}', name):
+        raise ValueError('invalid retained release identity')
+    target = releases / name
+    if target.is_symlink() or not target.is_dir():
+        raise ValueError('retained release is not a managed directory')
+    return target
+
+
+def sync_directory(directory):
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def durable_write(path, data, mode):
+    fd, temporary = tempfile.mkstemp(prefix=path.name + '.', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            os.fchmod(stream.fileno(), mode)
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def verify_retained_packages(base, target, manifest, host_wheel):
+    locations = list((target / 'lib').glob('python*/site-packages'))
+    if len(locations) != 1 or locations[0].resolve() != locations[0]:
+        raise ValueError('retained release has no managed site-packages')
+    site_packages = locations[0]
+    for name in (host_wheel, 'websockets-16.0-py3-none-any.whl'):
+        data = verified_artifact(base, name, manifest['artifacts'][name])
+        try:
+            with ZipFile(BytesIO(data)) as wheel:
+                members = wheel.infolist()
+                if sum(member.file_size for member in members) > MAX_ARTIFACT:
+                    raise ValueError('retained wheel payload exceeds size limit')
+                for member in members:
+                    relative = Path(member.filename)
+                    if relative.is_absolute() or '..' in relative.parts:
+                        raise ValueError('unsafe retained wheel member')
+                    if member.is_dir() or (relative.parent.suffix == '.dist-info' and relative.name == 'RECORD'):
+                        continue  # The installer rewrites RECORD for the installed layout.
+                    installed = site_packages / relative
+                    if (installed.resolve() != installed or not installed.is_file()
+                            or installed.stat().st_size != member.file_size
+                            or installed.read_bytes() != wheel.read(member)):
+                        raise ValueError('retained installed package does not match published wheel: ' + name)
+        except BadZipFile:
+            raise ValueError('invalid published wheel') from None
+
+
+def replace_units(units, files):
+    units.mkdir(parents=True, exist_ok=True)
+    for name, data in files.items():
+        path = units / name
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise ValueError('refusing to replace an unmanaged unit')
+        if data is None:
+            path.unlink(missing_ok=True)
+            continue
+        durable_write(path, data, 0o600)
+    sync_directory(units)
+    command(['systemctl', '--user', 'daemon-reload'])
+
+
+def restore_retained_switch(root, releases, journal):
+    if journal.is_symlink() or not journal.is_file():
+        raise ValueError('invalid retained release journal')
+    state = json.loads(journal.read_text())
+    old = managed_release(releases, state['current'])
+    target = managed_release(releases, state['target'])
+    previous = state['previous']
+    if previous is not None:
+        previous = managed_release(releases, previous)
+    current_link, previous_link = root / 'current', root / 'previous'
+    if not current_link.is_symlink() or current_link.resolve() not in (old, target):
+        raise ValueError('current release changed during retained activation')
+    if (previous_link.exists() or previous_link.is_symlink()) and (
+            not previous_link.is_symlink() or previous_link.resolve() not in (old, previous)):
+        raise ValueError('previous release changed during retained activation')
+    if set(state['units']) != set(UNITS):
+        raise ValueError('invalid retained unit snapshot')
+    files = {name: None if data is None else bytes.fromhex(data) for name, data in state['units'].items()}
+    replace_units(Path.home() / '.config/systemd/user', files)
+    link(old, current_link)
+    if previous is None:
+        previous_link.unlink(missing_ok=True)
+    else:
+        link(previous, previous_link)
+    command(['systemctl', '--user', 'restart', UNITS[0]])
+    failure(root, target.name)
+    sync_directory(root)
+    journal.unlink()
+    sync_directory(root)
+
+
+def reactivate_retained_release(base, manifest, host_wheel, root, releases, old, target):
+    managed_release(releases, target.name)
+    receipt = target / 'release.json'
+    if receipt.is_symlink() or not receipt.is_file():
+        raise ValueError('release directory exists; explicit recovery required')
+    if (target / '.installing').exists() or read_release_receipt(target) != manifest:
+        raise ValueError('retained release does not match the published manifest')
+    for name in ('hub.pyz', 'hub2-enroll.py'):
+        if not matches_installed_artifact(target / name, manifest['artifacts'][name]):
+            raise ValueError('retained release artifact mismatch: ' + name)
+    verify_retained_packages(base, target, manifest, host_wheel)
+    check_host_package(target, manifest)
+    command([target / 'bin/hub2', '--help'])
+
+    if old is None or managed_release(releases, old.name) != old:
+        raise ValueError('current release is unmanaged')
+    previous_link = root / 'previous'
+    previous = None
+    if previous_link.exists() or previous_link.is_symlink():
+        if not previous_link.is_symlink():
+            raise ValueError('previous release is unmanaged')
+        previous = previous_link.resolve(strict=True)
+        if managed_release(releases, previous.name) != previous:
+            raise ValueError('previous release is unmanaged')
+
+    units = Path.home() / '.config/systemd/user'
+    replacements = {}
+    snapshot = {}
+    for name in UNITS:
+        path = units / name
+        record = manifest['artifacts'][name]
+        matches = matches_installed_artifact(path, record)
+        snapshot[name] = path.read_bytes().hex() if path.is_file() else None
+        if not matches:
+            replacements[name] = verified_artifact(base, name, record)
+    journal = root / 'retained-switch.json'
+    state = {'current': old.name, 'target': target.name,
+             'previous': previous.name if previous else None, 'units': snapshot}
+    durable_write(journal, json.dumps(state, sort_keys=True).encode(), 0o600)
+    sync_directory(root)
+    try:
+        if replacements:
+            replace_units(units, replacements)
+        link(target, root / 'current')
+        command(['systemctl', '--user', 'restart', UNITS[0]])
+        check_service_ready(target)
+        if json.loads(fetch(base + 'host-release.json', MAX_MANIFEST)) != manifest:
+            raise ValueError('published host release changed during retained activation')
+        link(old, previous_link)
+        sync_directory(root)
+    except BaseException:
+        restore_retained_switch(root, releases, journal)
+        raise
+    # Keep the updater that understands this journal available after rollback.
+    journal.unlink()
+    sync_directory(root)
+
+
 def recover(root, releases):
     # .next is our fixed atomic-link scratch name. Remove only links into this
     # release store; never remove a regular file or an unrelated symlink.
@@ -232,6 +394,9 @@ def recover(root, releases):
             dest = path.resolve()
             if dest.parent == releases and re.fullmatch(r'[0-9a-f]{40}', dest.name):
                 path.unlink()
+    journal = root / 'retained-switch.json'
+    if journal.exists() or journal.is_symlink():
+        restore_retained_switch(root, releases, journal)
     for target in releases.iterdir():
         marker = target / '.installing'
         if target.is_symlink() or not re.fullmatch(r'[0-9a-f]{40}', target.name) or not marker.is_file():
@@ -291,12 +456,12 @@ def install(base_url, root, *, install_service=False, restart=True):
     with (root / 'update.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         base = base_url.rstrip('/') + '/cli/'
-        manifest = json.loads(fetch(base + 'host-release.json', MAX_MANIFEST))
-        host_wheel = validate_manifest(manifest)
-        version = manifest['host_version']
         releases = root / 'releases'
         releases.mkdir(exist_ok=True)
         recover(root, releases)
+        manifest = json.loads(fetch(base + 'host-release.json', MAX_MANIFEST))
+        host_wheel = validate_manifest(manifest)
+        version = manifest['host_version']
         failures = root / 'failed-releases.json'
         record = json.loads(failures.read_text()).get(version, {}) if failures.exists() else {}
         if record.get('retry_at', 0) > time.time():
@@ -318,9 +483,15 @@ def install(base_url, root, *, install_service=False, restart=True):
                     enable_service_timer()
             print('Hub2 release already current: ' + version)
             return
-        if target.exists():
-            # Do not reuse a failed installation or overwrite a retained release.
-            raise ValueError('release directory exists; explicit recovery required')
+        if target.exists() or target.is_symlink():
+            if not restart:
+                raise ValueError('retained release activation requires a verified restart')
+            reactivate_retained_release(base, manifest, host_wheel, root, releases, old, target)
+            if install_service:
+                enable_service_timer()
+            prune(root, releases)
+            print('Reactivated retained Hub2 release: ' + version)
+            return
         scratch = root / 'tmp'
         scratch.mkdir(exist_ok=True)
         activated = False

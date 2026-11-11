@@ -117,6 +117,122 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
         self.assertIn('--no-deps', pip)
         self.assertFalse(any('systemctl' in args and 'stop' in args for args in self.calls))
 
+    def prepare_retained_switch(self):
+        transport_wheel = 'websockets-16.0-py3-none-any.whl'
+        sources = {HOST: 'agent_hub_host/agent.py', transport_wheel: 'websockets/__init__.py'}
+        for name, member in sources.items():
+            wheel_bytes = io.BytesIO()
+            with zipfile.ZipFile(wheel_bytes, 'w') as wheel:
+                wheel.writestr(member, b'published package source')
+            self.files[name] = wheel_bytes.getvalue()
+            self.manifest['artifacts'][name] = {'sha256': hashlib.sha256(self.files[name]).hexdigest(),
+                                                'size': len(self.files[name])}
+        current = self.old_release()
+        self.install(install_service=True)
+        retained = (self.root / 'current').resolve()
+        for member in sources.values():
+            installed = retained / 'lib/python3.11/site-packages' / member
+            installed.parent.mkdir(parents=True)
+            installed.write_bytes(b'published package source')
+        updater.link(current, self.root / 'current')
+        updater.link(retained, self.root / 'previous')
+        units = Path(self.temporary.name) / '.config/systemd/user'
+        (units / updater.UNITS[0]).write_bytes(b'active service unit')
+        (self.root / 'updater.py').write_bytes(b'current updater')
+        self.calls.clear()
+        self.downloads.clear()
+        return current, retained, units
+
+    def test_reactivates_exact_retained_release_without_rebuilding_or_replacing_updater(self):
+        current, retained, units = self.prepare_retained_switch()
+        receipt = (retained / 'release.json').read_bytes()
+        self.install()
+        self.assertEqual((self.root / 'current').resolve(), retained)
+        self.assertEqual((self.root / 'previous').resolve(), current)
+        self.assertEqual((retained / 'release.json').read_bytes(), receipt)
+        self.assertEqual((self.root / 'updater.py').read_bytes(), b'current updater')
+        self.assertEqual((units / updater.UNITS[0]).read_bytes(), self.files[updater.UNITS[0]])
+        self.assertEqual(self.downloads, ['host-release.json', HOST, 'websockets-16.0-py3-none-any.whl',
+                                          updater.UNITS[0], 'host-release.json'])
+        self.assertEqual(sum('restart' in args for args in self.calls), 1)
+        self.assertFalse(any('venv' in args for args in self.calls))
+        self.assertFalse((self.root / 'retained-switch.json').exists())
+
+    def test_retained_release_readiness_failure_restores_units_and_both_links(self):
+        current, retained, units = self.prepare_retained_switch()
+        self.status_rc = 1
+        with self.assertRaisesRegex(RuntimeError, 'host daemon connection not verified'):
+            self.install()
+        self.assertEqual((self.root / 'current').resolve(), current)
+        self.assertEqual((self.root / 'previous').resolve(), retained)
+        self.assertEqual((units / updater.UNITS[0]).read_bytes(), b'active service unit')
+        self.assertTrue(retained.is_dir())
+        self.assertEqual(sum('restart' in args for args in self.calls), 2)
+        self.assertFalse((self.root / 'retained-switch.json').exists())
+        self.assertIn(SHA, json.loads((self.root / 'failed-releases.json').read_text()))
+
+    def test_interrupted_retained_switch_recovers_even_when_manifest_is_unavailable(self):
+        current, retained, units = self.prepare_retained_switch()
+        journal = self.root / 'retained-switch.json'
+        updater.write_json(journal, {'current': current.name, 'target': retained.name, 'previous': retained.name,
+                                     'units': {name: (units / name).read_bytes().hex() for name in updater.UNITS}})
+        updater.link(retained, self.root / 'current')
+        updater.link(current, self.root / 'previous')
+        (units / updater.UNITS[0]).write_bytes(b'interrupted service unit')
+
+        def offline(*args):
+            raise OSError('offline')
+
+        self.fetch = offline
+        with self.assertRaisesRegex(OSError, 'offline'):
+            self.install()
+        self.assertEqual((self.root / 'current').resolve(), current)
+        self.assertEqual((self.root / 'previous').resolve(), retained)
+        self.assertEqual((units / updater.UNITS[0]).read_bytes(), b'active service unit')
+        self.assertFalse(journal.exists())
+        self.assertTrue(retained.is_dir())
+
+    def test_retained_release_refuses_different_receipt_or_tampered_cli(self):
+        current, retained, _ = self.prepare_retained_switch()
+        with patch.dict(self.manifest, {'protocol_version': 2}):
+            with self.assertRaisesRegex(ValueError, 'does not match the published manifest'):
+                self.install()
+        (retained / 'hub.pyz').write_bytes(b'tampered')
+        with self.assertRaisesRegex(ValueError, 'artifact mismatch: hub.pyz'):
+            self.install()
+        self.assertEqual((self.root / 'current').resolve(), current)
+        self.assertEqual((self.root / 'previous').resolve(), retained)
+        self.assertEqual(self.calls, [])
+
+    def test_retained_release_refuses_tampered_host_and_transport_modules(self):
+        current, retained, _ = self.prepare_retained_switch()
+        for member in ('agent_hub_host/agent.py', 'websockets/__init__.py'):
+            with self.subTest(member=member):
+                installed = retained / 'lib/python3.11/site-packages' / member
+                original = installed.read_bytes()
+                installed.write_bytes(b'changed package source')
+                with self.assertRaisesRegex(ValueError, 'installed package does not match published wheel'):
+                    self.install()
+                self.assertEqual((self.root / 'current').resolve(), current)
+                self.assertEqual(self.calls, [])
+                installed.write_bytes(original)
+
+    def test_retained_activation_rechecks_published_manifest_after_socket_readiness(self):
+        current, retained, units = self.prepare_retained_switch()
+        fetch = self.fetch
+
+        def changed(url, limit):
+            if url.endswith('/host-release.json') and 'host-release.json' in self.downloads:
+                return b'{}'
+            return fetch(url, limit)
+
+        self.fetch = changed
+        with self.assertRaisesRegex(ValueError, 'published host release changed'):
+            self.install()
+        self.assertEqual((self.root / 'current').resolve(), current)
+        self.assertEqual((self.root / 'previous').resolve(), retained)
+        self.assertEqual((units / updater.UNITS[0]).read_bytes(), b'active service unit')
+
     def test_existing_uv_creates_venv_without_system_ensurepip(self):
         with patch.object(updater.shutil, 'which', return_value='/mock/uv'):
             self.install()
