@@ -24,39 +24,41 @@ profile = pathlib.Path(os.environ.get("HUB_CONFIG_FILE") or
                        pathlib.Path(os.environ.get("XDG_CONFIG_HOME", pathlib.Path.home() / ".config")) / "agent-hub/host.json")
 with record.open("a") as out:
     out.write(json.dumps({"tool": name, "args": args, "tmp": os.environ.get("TMPDIR"),
-                          "home": os.environ.get("HOME"), "cache": os.environ.get("UV_CACHE_DIR"),
+                          "home": os.environ.get("HOME"), "pythonpath": os.environ.get("PYTHONPATH"), "cache": os.environ.get("UV_CACHE_DIR"),
                           "cap_dir": os.environ.get("AGENT_HUB_HEAVY_TEST_DIR"),
                           "pools": [os.environ.get(k) for k in ("UV_THREADPOOL_SIZE", "GOMAXPROCS", "NODE_OPTIONS")],
                           # AGENT_HUB_HEAVY_TEST_HELD is the wrapper's non-secret slot marker; the
                           # child must keep it so pytest never takes a second heavy-test slot.
                           "held": os.environ.get("AGENT_HUB_HEAVY_TEST_HELD"),
                           "priority": os.environ.get("AGENT_HUB_HEAVY_TEST_PRIORITY"),
-                          "selectors": sorted(k for k in os.environ if (k.startswith(("APLEXER_", "HUB_", "AGENT_HUB_"))
+                          "selectors": sorted(k for k in os.environ if (k.startswith(("APLEXER_", "HUB_", "HUB2_", "AGENT_HUB_"))
                             or k in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "GH_CONFIG_DIR"))
                             and k not in ("AGENT_HUB_HEAVY_TEST_HELD", "AGENT_HUB_HEAVY_TEST_HOLDER_TOKEN")),
                           "profile": str(profile),
-                          "hub_env": sorted(k for k in os.environ if k.startswith(("HUB_", "AGENT_HUB_"))
+                          "hub_env": sorted(k for k in os.environ if k.startswith(("HUB_", "HUB2_", "AGENT_HUB_"))
                                             and k not in ("AGENT_HUB_HEAVY_TEST_HELD", "AGENT_HUB_HEAVY_TEST_HOLDER_TOKEN"))}) + "\n")
 if name == "uv" and args[:1] == ["run"] and os.environ.get("CHECK_PROFILE_ISOLATION"):
     profile.parent.mkdir(parents=True, exist_ok=True)
     profile.write_text("written by isolated Python fixture")
 if name == "python3" and args[:1] == ["-c"]:
     print("/fixture/user-base")
-if name == "npx" and os.environ.get("FAIL_VITEST"):
+if name == "node" and "scripts/tests/release-contract.test.mjs" in args and os.environ.get("FAIL_RELEASE"):
     sys.exit(7)
-if name == "npx" and os.environ.get("VITEST_EXIT"):
-    sys.exit(int(os.environ["VITEST_EXIT"]))
+if name == "node" and "scripts/tests/release-contract.test.mjs" in args and os.environ.get("RELEASE_EXIT"):
+    sys.exit(int(os.environ["RELEASE_EXIT"]))
 if name == "npm" and args[:2] == ["run", "typecheck"] and os.environ.get("FAIL_TYPECHECK"):
     sys.exit(1)
 if name == "node":
-    # Model Chromium's different cwd when opening its shared-memory path.
+    # Model a Node child opening its IPC files from a different cwd.
     os.chdir(record.parent)
     tmp = pathlib.Path(os.environ["TMPDIR"])
-    assert tmp.is_absolute(), "Browser TMPDIR must be absolute"
-    (tmp / "browser-shared-memory").write_text("owned by this run")
+    assert tmp.is_absolute(), "Node IPC TMPDIR must be absolute"
+    (tmp / "node-ipc").write_text("owned by this run")
 if name == "uv" and args[:1] == ["run"] and os.environ.get("CHECK_SOCKET"):
+    socket_path = pathlib.Path(os.environ["TMPDIR"]) / "fixture.sock"
     with socket.socket(socket.AF_UNIX) as server:
-        server.bind(str(pathlib.Path(os.environ["TMPDIR"]) / "fixture.sock"))
+        server.bind(str(socket_path))
+    socket_path.unlink()
 if name == "uv" and args[:1] == ["run"] and os.environ.get("CHECK_AUTH_ISOLATION"):
     sys.path.insert(0, os.environ["STORAGE_HOST_SOURCE"])
     from agent_hub_host import config
@@ -117,14 +119,16 @@ class FullLocalStorageTests(unittest.TestCase):
 
     def start(self, name, runner_args=(), capped=False, retry=None, **overrides):
         record = self.root / f"{name}.jsonl"
-        env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}",
+        # CI=true applies only to this copied script with every suite command stubbed.
+        # It never enables execution of the real full suite.
+        env = dict(os.environ, CI="true", PATH=f"{self.bin}:{os.environ['PATH']}",
                    TMPDIR=str(self.temp), HOME=str(self.root / "original-home"),
                    UV_CACHE_DIR=str(self.root / "shared-uv-cache"), STORAGE_RECORD=str(record),
                    # These commands are stubs, not real heavy suites. Keep
                    # shell-storage fixtures out of the real host semaphore.
                    AGENT_HUB_HEAVY_TEST_DIR=str(self.root / "fixture-heavy-slots"),
                    AGENT_HUB_HEAVY_TEST_SLOTS="2")
-        for key in ("SKIP_PHONE_UI", "FAIL_SYNC", "FAIL_VITEST", "VITEST_EXIT", "FAIL_TYPECHECK",
+        for key in ("FAIL_SYNC", "FAIL_RELEASE", "RELEASE_EXIT", "FAIL_TYPECHECK",
                     "AGENT_HUB_HEAVY_TEST_REFUSAL_FILE", "CAPPED_TEST_RETRY_SLEEP", "PAUSE_SYNC", "CHECK_SOCKET", "CHECK_AUTH_ISOLATION",
                     "CHECK_PROFILE_ISOLATION", "UV_THREADPOOL_SIZE", "GOMAXPROCS", "NODE_OPTIONS",
                     "AGENT_HUB_HEAVY_TEST_HELD", "AGENT_HUB_HEAVY_TEST_HOLDER_TOKEN"):
@@ -180,8 +184,8 @@ class FullLocalStorageTests(unittest.TestCase):
                                   AGENT_HUB_HEAVY_TEST_WAIT_S="1")
         code, output = self.finish(child)
         self.assertEqual(code, 0, output)
-        vitest = next(row for row in self.records(record) if row["tool"] == "npx")
-        self.assertEqual(vitest["priority"], "final")
+        release = next(row for row in self.records(record) if row["tool"] == "node" and "scripts/tests/release-contract.test.mjs" in row["args"])
+        self.assertEqual(release["priority"], "final")
         self.assert_preserved()
 
     def occupy_fixture_slot(self):
@@ -201,10 +205,10 @@ class FullLocalStorageTests(unittest.TestCase):
                    if row["tool"] == "python3" and row["args"][:1] == ["scripts/build-hub-cli.py"])
 
     def test_command_own_exit_three_is_fail_not_hold(self):
-        child, record = self.start("own-exit-3", VITEST_EXIT="3")
+        child, record = self.start("own-exit-3", RELEASE_EXIT="3")
         code, output = self.finish(child)
         self.assertEqual(code, 1, output)
-        self.assertIn("FAIL: Vitest discovery suite exited with code 3", output)
+        self.assertIn("FAIL: Release contract suite exited with code 3", output)
         self.assertNotIn("HOLD:", output)
         self.assertIn("PASS: Python discovery suite passed", output)
         self.assertIn("PASS: Host canary hermeticity check passed", output)
@@ -216,8 +220,8 @@ class FullLocalStorageTests(unittest.TestCase):
         child, record = self.start("pure-hold", **self.HELD_PHASES)
         code, output = self.finish(child)
         self.assertEqual(code, 3, output)
-        for label in ("Vitest discovery suite", "Python discovery suite",
-                      "Host canary hermeticity check", "Standalone browser and static checks"):
+        for label in ("Release contract suite", "Python discovery suite",
+                      "Host daemon discovery suite", "Host canary hermeticity check", "Node alarm recovery checks"):
             self.assertIn(f"HOLD: {label} refused by the host capacity gate", output)
         self.assertNotIn("FAIL", output)
         self.assertFalse(any(row["tool"] in ("npx", "node") for row in self.records(record)))
@@ -230,8 +234,8 @@ class FullLocalStorageTests(unittest.TestCase):
         code, output = self.finish(child)
         self.assertEqual(code, 1, output)
         self.assertIn("FAIL: Typecheck failed", output)
-        self.assertIn("HOLD: Vitest discovery suite", output)
-        self.assertIn("FAILED: 5 suite(s) reported failures (4 capacity hold(s)", output)
+        self.assertIn("HOLD: Release contract suite", output)
+        self.assertIn("FAILED: 6 suite(s) reported failures (5 capacity hold(s)", output)
 
     @unittest.skipUnless(os.name == "posix", "POSIX advisory locks required")
     def test_documented_retry_command_reruns_full_runner_on_hold(self):
@@ -258,17 +262,17 @@ class FullLocalStorageTests(unittest.TestCase):
         self.assertIn("capacity hold (capped-test-run refused", output)
         self.assertEqual(sleeps.read_text().split(), ["9"])
         self.assertEqual(self.runner_starts(record), 2)
-        vitest = next(row for row in self.records(record) if row["tool"] == "npx")
-        self.assertEqual(vitest["priority"], "final")
-        self.assertEqual(vitest["held"], "1")
+        release = next(row for row in self.records(record) if row["tool"] == "node" and "scripts/tests/release-contract.test.mjs" in row["args"])
+        self.assertEqual(release["priority"], "final")
+        self.assertEqual(release["held"], "1")
         self.assert_preserved()
 
     def test_documented_retry_command_does_not_retry_real_failure(self):
         child, record = self.start("retry-real-exit-3", runner_args=("--priority", "final"),
-                                  retry=(), VITEST_EXIT="3")
+                                  retry=(), RELEASE_EXIT="3")
         code, output = self.finish(child)
         self.assertEqual(code, 1, output)
-        self.assertIn("FAIL: Vitest discovery suite exited with code 3", output)
+        self.assertIn("FAIL: Release contract suite exited with code 3", output)
         self.assertIn("FAILED: 1 suite(s) reported failures. Check", output)
         self.assertNotIn("retrying in", output)
         self.assertEqual(self.runner_starts(record), 1)
@@ -289,8 +293,8 @@ class FullLocalStorageTests(unittest.TestCase):
                 child, record = self.start("ambient-cap-isolation")
                 code, output = self.finish(child)
             self.assertEqual(code, 0, output)
-            vitest = next(row for row in self.records(record) if row["tool"] == "npx")
-            self.assertEqual(vitest["cap_dir"], str(self.root / "fixture-heavy-slots"))
+            release = next(row for row in self.records(record) if row["tool"] == "node" and "scripts/tests/release-contract.test.mjs" in row["args"])
+            self.assertEqual(release["cap_dir"], str(self.root / "fixture-heavy-slots"))
             self.assert_preserved()
 
     def test_python_discovery_does_not_touch_ambient_profiles(self):
@@ -298,7 +302,7 @@ class FullLocalStorageTests(unittest.TestCase):
         profile.write_text("preserve ambient profile")
         child, record = self.start("profile-isolation", CHECK_PROFILE_ISOLATION="1",
                                   HUB_CONFIG_FILE=str(profile), HUB_URL="https://fixture.invalid",
-                                  HUB_TOKEN="fixture-only", AGENT_HUB_MANAGED_DIR=str(self.root / "managed"),
+                                  HUB_TOKEN="fixture-only", HUB2_TOKEN="synthetic-daemon-parent", AGENT_HUB_MANAGED_DIR=str(self.root / "managed"),
                                   XDG_CONFIG_HOME=str(self.root / "ambient-config"))
         code, output = self.finish(child)
         self.assertEqual(code, 0, output)
@@ -321,7 +325,7 @@ class FullLocalStorageTests(unittest.TestCase):
         self.assertFalse(any(row["tool"] == "uv" and row["args"][0] == "run" for row in rows))
         self.assert_preserved()
 
-    def test_vitest_bounds_background_pools_without_changing_discovery_or_other_steps(self):
+    def test_release_bounds_background_pools_without_changing_discovery_or_other_steps(self):
         for overrides, expected in (
             ({}, ["1", "1", "--v8-pool-size=1"]),
             ({"NODE_OPTIONS": "--trace-warnings"}, ["1", "1", "--trace-warnings --v8-pool-size=1"]),
@@ -334,14 +338,23 @@ class FullLocalStorageTests(unittest.TestCase):
                 code, output = self.finish(child)
                 self.assertEqual(code, 0, output)
                 rows = self.records(record)
-                vitest = next(row for row in rows if row["tool"] == "npx")
-                self.assertEqual(vitest["pools"], expected)
-                self.assertEqual(vitest["args"], ["--no-install", "vitest", "run", "--configLoader", "runner",
-                    "--no-file-parallelism", "--maxWorkers", "1", "--disableConsoleIntercept"])
+                release = next(row for row in rows if row["tool"] == "node" and "scripts/tests/release-contract.test.mjs" in row["args"])
+                self.assertEqual(release["pools"], expected)
+                self.assertEqual(release["args"], ["--test", "scripts/tests/release-contract.test.mjs"])
                 inherited = [overrides.get(k) for k in ("UV_THREADPOOL_SIZE", "GOMAXPROCS", "NODE_OPTIONS")]
-                self.assertTrue(all(row["pools"] == inherited for row in rows if row["tool"] != "npx"))
-                self.assertFalse(Path(vitest["tmp"]).exists())
+                self.assertTrue(all(row["pools"] == inherited for row in rows if not (row["tool"] == "node" and "scripts/tests/release-contract.test.mjs" in row["args"])))
+                self.assertFalse(Path(release["tmp"]).exists())
                 self.assert_preserved()
+
+    def test_python_namespaces_have_separate_maintained_discovery_processes(self):
+        child, record = self.start('python-namespaces')
+        code, output = self.finish(child)
+        self.assertEqual(code, 0, output)
+        rows = [r for r in self.records(record) if r['tool'] == 'uv' and r['args'][:1] == ['run']]
+        self.assertEqual([r['pythonpath'] for r in rows], ['host:host/tests', 'hub2/host'])
+        self.assertTrue(all(p in rows[0]['args'] for p in ['host/tests','scripts/tests','scripts/ci']))
+        self.assertIn('hub2/host/tests', rows[1]['args'])
+        self.assert_preserved()
 
     def test_default_relative_tmpdir_preserves_existing_scratch(self):
         parent = self.repo / ".local/tmp"
@@ -359,22 +372,22 @@ class FullLocalStorageTests(unittest.TestCase):
         self.assertEqual(Path(python["home"]), self.repo / relative / "home")
         # An absolute socket path here exceeds Linux's 108-byte sun_path.
         self.assertGreater(len(str(self.repo / relative / "fixture.sock").encode()), 108)
-        browsers = [row for row in self.records(record) if row["tool"] == "node"]
-        self.assertEqual(len(browsers), 2)
-        self.assertEqual(browsers[0]["args"], ["--test", "scripts/test-browser-local.test.mjs"])
-        self.assertEqual(browsers[1]["args"], ["scripts/test-browser-local.mjs"])
-        self.assertTrue(all(Path(row["tmp"]) == self.repo / relative for row in browsers))
+        node_checks = [row for row in self.records(record) if row["tool"] == "node"]
+        self.assertEqual(len(node_checks), 2)
+        self.assertEqual(node_checks[0]["args"], ["--test", "scripts/tests/release-contract.test.mjs"])
+        self.assertEqual(node_checks[1]["args"], ["--experimental-transform-types", "--test", "hub2/tests/node-alarm-recovery.test.ts"])
+        self.assertTrue(all(Path(row["tmp"]) == self.repo / relative for row in node_checks))
         self.assertFalse((self.repo / relative).exists())
         self.assertEqual(marker.read_text(), "preserve")
 
-    def test_vitest_failure_is_aggregated_and_python_home_is_cleaned(self):
-        child, record = self.start("vitest-fail", FAIL_VITEST="1")
+    def test_release_failure_is_aggregated_and_python_home_is_cleaned(self):
+        child, record = self.start("release-fail", FAIL_RELEASE="1")
         code, output = self.finish(child)
         self.assertEqual(code, 1, output)
-        self.assertIn("Vitest discovery suite exited with code 7", output)
+        self.assertIn("Release contract suite exited with code 7", output)
         rows = self.records(record)
-        vitest = next(row for row in rows if row["tool"] == "npx")
-        self.assertIn("--no-install", vitest["args"])
+        release = next(row for row in rows if row["tool"] == "node" and "scripts/tests/release-contract.test.mjs" in row["args"])
+        self.assertIn("--test", release["args"])
         python = next(row for row in rows if row["tool"] == "uv" and row["args"][0] == "run")
         run = Path(python["tmp"])
         self.assertEqual(Path(python["home"]), run / "home")

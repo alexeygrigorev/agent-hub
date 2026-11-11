@@ -386,7 +386,7 @@ time.sleep(30)
         other_pool.mkdir()
         nested = (
             f"AGENT_HUB_HEAVY_TEST_DIR={str(other_pool)!r} {sys.executable} {str(helper)!r} "
-            "--slots 1 --wait 0 -- python -c 'print(\"different-pool-ran\")'"
+            f"--slots 1 --wait 0 -- {sys.executable!r} -c 'print(\"different-pool-ran\")'"
         )
         outer = subprocess.Popen(
             [sys.executable, str(helper), '--slots', '1', '--wait', '30', '--',
@@ -442,7 +442,7 @@ class RefusalTests(unittest.TestCase):
     def test_real_vitest_hook_refuses_corrupt_and_unknown_state(self):
         # Run the real exported hook, without starting Vitest/workerd or any
         # heavy workload. It must reject rather than return an uncapped run.
-        code = """import setup from './test/heavy-slot.global-setup.mjs';
+        code = """import setup from './scripts/ci/heavy-slot.global-setup.mjs';
 try { const cleanup = await setup(); if (cleanup) cleanup();
       console.log('UNEXPECTED_CONTINUE'); process.exitCode = 1; }
 catch (error) { console.log('REFUSED:' + error.message); process.exitCode = 3; }

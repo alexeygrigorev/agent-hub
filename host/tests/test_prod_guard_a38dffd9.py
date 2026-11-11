@@ -35,10 +35,6 @@ STATIC_SCAN_ALLOWLIST = {
         "production URL is a fake dispatcher fixture with mocked transport",
     "host/tests/test_domain_config.py":
         "production URL is used only to test origin parsing",
-    "test/proxy-origin.test.ts":
-        "Worker requests are in-memory forwarding fixtures, never outbound host writes",
-    "test/docker/lifecycle.py":
-        "the lifecycle rejects production Hub URLs before its local test requests",
 }
 
 PRODUCTION_MARKERS = ("hub.dtcdev.click", "agent-hub.cloudflare-ai-agent-de9ca0.workers.dev")
@@ -137,15 +133,9 @@ class TestProductionHubWriteGuard(unittest.TestCase):
 
     def test_repository_test_sources_have_no_unreviewed_production_registry_driver(self):
         repo_root = Path(__file__).resolve().parents[2]
-        roots = (repo_root / "host" / "tests", repo_root / "test")
+        roots = (repo_root / "host" / "tests", repo_root / "hub2" / "tests", repo_root / "hub2" / "host" / "tests", repo_root / "scripts" / "tests")
         self.assertEqual(unsafe_test_sources(roots, repo_root), [])
 
-    def test_docker_lifecycle_rejects_production_hub_and_arms_installer_children(self):
-        lifecycle = Path(__file__).resolve().parents[2] / "test" / "docker" / "lifecycle.py"
-        source = lifecycle.read_text(encoding="utf-8")
-        self.assertIn("isolated test Hub URL", source)
-        self.assertIn("os.environ['HUB_E2E'] = '1'", source)
-        self.assertIn("os.environ['HUB_BASE_URL'] = BASE", source)
 
 
 if __name__ == "__main__":

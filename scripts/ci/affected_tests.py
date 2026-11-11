@@ -2,9 +2,10 @@
 """Select the tests affected by a change (intake cb5c362e).
 
 Pre-push verification runs only these; the full suite runs once after the push
-in the deploy CI job. Prints JSON: vitest files, pytest files, flags. Anything
+in the deploy CI job. Prints isolated CLI/daemon pytest files and flags;
+the retired Vitest list remains empty for output compatibility. Anything
 that can change test behaviour globally (dependencies, runner config, the
-admission gate) sets "broad": true and the caller falls back to the full runner.
+admission gate) sets "broad": true; required full coverage then runs in CI.
 """
 import json
 import re
@@ -13,22 +14,12 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-BROAD = ('package.json', 'package-lock.json', 'vitest.config.ts', 'pyproject.toml', 'uv.lock',
-         'host/tests/conftest.py', 'test/heavy-slot.global-setup.mjs')
+BROAD = ('package.json', 'package-lock.json', 'pyproject.toml', 'uv.lock',
+         'host/tests/conftest.py', 'hub2/host/tests/conftest.py', 'scripts/ci/heavy-slot.global-setup.mjs')
 BROAD_PREFIX = ('tsconfig', 'scripts/heavy-', 'scripts/capped-', 'scripts/test-full-local', 'scripts/local-dependencies')
-SOURCE_DIRS = ('src/', 'public/', 'host/', 'scripts/', 'test/', 'migrations/')
-TEST_ROOTS = ('test', 'host/tests')
-TEST_RE = re.compile(r'(^test/.+\.test\.ts$|^test/test_.+\.py$|^host/tests/test_.+\.py$)')
-MCP_FILES = frozenset({
-    'src/mcp-tools.ts', 'src/mcp.ts', 'src/mcp-usage.ts', 'src/mcp-oauth.ts',
-    'src/conversation-hub.ts', 'src/worker.ts', 'src/ui-pages.ts',
-})
-PARITY_FILES = frozenset({
-    'host/agent_hub_host/cli.py', 'scripts/mcp-cli-inventory.py',
-    'test/mcp-cli-commands.json', 'src/mcp-tools.ts',
-})
-PARITY_TESTS = ('test/test_mcp_parity.py', 'test/mcp.test.ts')
-HOST_CLI_RE = re.compile(r'^host/agent_hub_host/[^/]+_cli\.py$')
+SOURCE_DIRS = ('hub2/', 'public/cli/', 'host/', 'scripts/', 'migrations/')
+TEST_ROOTS = ('host/tests', 'hub2/host/tests', 'scripts/tests', 'scripts/ci')
+TEST_RE = re.compile(r'^(?:host/tests|hub2/host/tests|scripts/tests|scripts/ci)/test_.+\.py$')
 HOST_CANARY_TESTS = frozenset({
     # Keep the recurring regressions found by Host canary hermeticity in the
     # pre-push lane for every host change. These cross-area contracts are not
@@ -36,7 +27,6 @@ HOST_CANARY_TESTS = frozenset({
     'host/tests/test_machine_binding.py',
     'host/tests/test_release_completeness.py',
     'host/tests/test_bootstrap_control.py',
-    'test/test_mcp_parity.py',
 })
 
 
@@ -90,15 +80,17 @@ def select(changed, root=ROOT):
     texts = {}
     picked = {c for c in changed if TEST_RE.match(c) and (root / c).exists()}
     for path in changed:
-        if path in MCP_FILES and (root / 'test/mcp.test.ts').is_file():
-            picked.add('test/mcp.test.ts')
-        if path in PARITY_FILES or HOST_CLI_RE.match(path):
-            picked.update(test for test in PARITY_TESTS if (root / test).is_file())
         if not path.startswith(SOURCE_DIRS) or TEST_RE.match(path) or not (root / path).exists():
             continue
         stem = Path(path).stem
         rx = module_regex(path)
         for test in tests:
+            # Both packages use agent_hub_host imports. Never select the other
+            # package's tests merely because a module basename matches.
+            if path.startswith('hub2/host/') and not test.startswith('hub2/host/tests/'):
+                continue
+            if path.startswith('host/') and test.startswith('hub2/host/tests/'):
+                continue
             if test not in texts:
                 texts[test] = (root / test).read_text(errors='replace')
             if Path(test).stem.replace('test_', '').startswith(stem) or path in texts[test] or rx.search(texts[test]):
@@ -111,16 +103,17 @@ def select(changed, root=ROOT):
     if any(path in {'scripts/ci/affected_tests.py', 'scripts/ci/test_affected_tests.py'}
            for path in changed) and (root / 'scripts/ci/test_affected_tests.py').is_file():
         picked.add('scripts/ci/test_affected_tests.py')
-    ts = sorted(p for p in picked if p.endswith('.ts'))
-    py = sorted(p for p in picked if p.endswith('.py'))
+    py = sorted(p for p in picked if p.endswith('.py') and not p.startswith('hub2/host/tests/'))
+    daemon = sorted(p for p in picked if p.startswith('hub2/host/tests/') and p.endswith('.py'))
     return {
         'changed': changed,
         'broad': broad,
-        'vitest': ts,
+        'vitest': [],
         'pytest': py,
+        'hub2_pytest': daemon,
         'typecheck': any(c.endswith('.ts') or c.startswith('tsconfig') for c in changed),
         'workflows': any(c.startswith(('.github/workflows/', 'scripts/ci/')) for c in changed),
-        'build': any(c.startswith(('src/', 'hub2/')) for c in changed),
+        'build': any(c.startswith('hub2/') for c in changed),
     }
 
 

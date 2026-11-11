@@ -9,7 +9,7 @@ if [ "${CI:-}" != "true" ]; then
 fi
 
 # Full local test suite verification for Agent Hub (Alexey 2026-10-17 22:54)
-# Executes all build, validation, Vitest discovery, and Python discovery suites.
+# Executes maintained release, validation, Python discovery and Node alarm checks.
 
 # The full runner acquires a slot for each heavy phase. An outer wrapper would
 # retain a slot while these phases wait for another, potentially deadlocking.
@@ -96,20 +96,18 @@ if ! python3 scripts/build-hub-cli.py --out-dir public/cli || ! npm run build; t
   FAILURES=$((FAILURES + 1))
 fi
 
-echo "=== 4/8: Vitest Discovery Suite (all test files, bounded concurrency) ==="
-VITEST_RC=0
-# Serial files still have Node/V8 and esbuild background pools. Bound those
-# pools inside the existing CPU cap rather than competing for its quota.
-VITEST_NODE_OPTIONS="${NODE_OPTIONS:-}"
-case "${VITEST_NODE_OPTIONS}" in
+echo "=== 4/8: Maintained release contract ==="
+RELEASE_RC=0
+RELEASE_NODE_OPTIONS="${NODE_OPTIONS:-}"
+case "${RELEASE_NODE_OPTIONS}" in
   *--v8-pool-size*) ;;
-  *) VITEST_NODE_OPTIONS="${VITEST_NODE_OPTIONS:+${VITEST_NODE_OPTIONS} }--v8-pool-size=1" ;;
+  *) RELEASE_NODE_OPTIONS="${RELEASE_NODE_OPTIONS:+${RELEASE_NODE_OPTIONS} }--v8-pool-size=1" ;;
 esac
-VITEST_MARKER="${RUN_TMP_ABSOLUTE}/refused-vitest"
+RELEASE_MARKER="${RUN_TMP_ABSOLUTE}/refused-release"
 UV_THREADPOOL_SIZE="${UV_THREADPOOL_SIZE:-1}" GOMAXPROCS="${GOMAXPROCS:-1}" \
-NODE_OPTIONS="${VITEST_NODE_OPTIONS}" AGENT_HUB_HEAVY_TEST_REFUSAL_FILE="${VITEST_MARKER}" \
-"${REPO_ROOT}/scripts/capped-test-run.sh" -- npx --no-install vitest run --configLoader runner --no-file-parallelism --maxWorkers 1 --disableConsoleIntercept || VITEST_RC=$?
-hold_or_fail "${VITEST_RC}" "Vitest discovery suite" "${VITEST_MARKER}"
+NODE_OPTIONS="${RELEASE_NODE_OPTIONS}" TMPDIR="${RUN_TMP_ABSOLUTE}" AGENT_HUB_HEAVY_TEST_REFUSAL_FILE="${RELEASE_MARKER}" \
+"${REPO_ROOT}/scripts/capped-test-run.sh" -- node --test scripts/tests/release-contract.test.mjs || RELEASE_RC=$?
+hold_or_fail "${RELEASE_RC}" "Release contract suite" "${RELEASE_MARKER}"
 
 echo "=== 5/8: Python Discovery Suite (disposable HOME, CI-matched env) ==="
 DTC_AUTH_PATH="${DTC_AUTH_HOME:-/home/alexey/git/auth}"
@@ -131,7 +129,7 @@ PYTHON_ENV=(env)
 while IFS= read -r name; do
   case "$name" in
     AGENT_HUB_HEAVY_TEST_HELD) ;;  # keep: nested runners must not take a second slot
-    APLEXER_*|HUB_*|AGENT_HUB_*|XDG_CONFIG_HOME|XDG_DATA_HOME|XDG_STATE_HOME|XDG_RUNTIME_DIR|GH_CONFIG_DIR)
+    APLEXER_*|HUB_*|HUB2_*|AGENT_HUB_*|XDG_CONFIG_HOME|XDG_DATA_HOME|XDG_STATE_HOME|XDG_RUNTIME_DIR|GH_CONFIG_DIR)
       PYTHON_ENV+=(-u "$name") ;;
   esac
 done < <(compgen -e)
@@ -141,10 +139,20 @@ DTC_AUTH_HOME="${DTC_AUTH_PATH}" \
 PYTHONPATH="host:host/tests" \
 CODEX_LAUNCH_WRAPPER="" \
 AGENT_HUB_HEAVY_TEST_REFUSAL_FILE="${PYTEST_MARKER}" \
-"${REPO_ROOT}/scripts/capped-test-run.sh" -- "${PYTHON_ENV[@]}" "${UV_BIN}" run --frozen --with pytest python -m pytest -q \
+"${REPO_ROOT}/scripts/capped-test-run.sh" -- "${PYTHON_ENV[@]}" "${UV_BIN}" run --frozen --with pytest python -m pytest -q host/tests scripts/tests scripts/ci \
   --basetemp "${RUN_TMP}/pytest" \
   -o tmp_path_retention_count=0 -o tmp_path_retention_policy=none || PYTEST_RC=$?
 hold_or_fail "${PYTEST_RC}" "Python discovery suite" "${PYTEST_MARKER}"
+
+# The operator CLI and daemon currently share an import namespace. Keep both
+# maintained test sets, each in its own interpreter and PYTHONPATH.
+DAEMON_RC=0
+DAEMON_MARKER="${RUN_TMP_ABSOLUTE}/refused-daemon"
+HOME="${DISPOSABLE_HOME}" PYTHONUSERBASE="${ORIGINAL_USER_BASE}" DTC_AUTH_HOME="${DTC_AUTH_PATH}" \
+PYTHONPATH="hub2/host" CODEX_LAUNCH_WRAPPER="" AGENT_HUB_HEAVY_TEST_REFUSAL_FILE="${DAEMON_MARKER}" \
+"${REPO_ROOT}/scripts/capped-test-run.sh" -- "${PYTHON_ENV[@]}" "${UV_BIN}" run --frozen --with pytest python -m pytest -q hub2/host/tests \
+  --basetemp "${RUN_TMP}/pytest-daemon" -o tmp_path_retention_count=0 -o tmp_path_retention_policy=none || DAEMON_RC=$?
+hold_or_fail "${DAEMON_RC}" "Host daemon discovery suite" "${DAEMON_MARKER}"
 
 echo "=== 6/8: Host canary hermeticity (full suite vs canary HOME, pytest + unittest) ==="
 # Intake 6b624e65: the suite must never touch the real user Hub profiles.
@@ -156,19 +164,13 @@ AGENT_HUB_HEAVY_TEST_REFUSAL_FILE="${CANARY_MARKER}" \
 "${REPO_ROOT}/scripts/capped-test-run.sh" -- python3 scripts/ci/host_canary_check.py || CANARY_RC=$?
 hold_or_fail "${CANARY_RC}" "Host canary hermeticity check" "${CANARY_MARKER}" "canary mutated or suite failed"
 
-echo "=== 7/8: All standalone browser and static checks ==="
-# Chromium resolves shared-memory files from a different working directory.
-# Supply an absolute path only here; keep socket-sensitive Python paths short.
+echo "=== 7/8: Node alarm recovery checks ==="
 export TMPDIR="${RUN_TMP_ABSOLUTE}"
-PHONE_RC=0
-PHONE_MARKER="${RUN_TMP_ABSOLUTE}/refused-phone"
-if [ -n "${SKIP_PHONE_UI:-}" ]; then
-  echo "SKIP: SKIP_PHONE_UI is set; phone browser UI not executed."
-else
-  AGENT_HUB_HEAVY_TEST_REFUSAL_FILE="${PHONE_MARKER}" \
-  "${REPO_ROOT}/scripts/capped-test-run.sh" -- bash -c 'node --test scripts/test-browser-local.test.mjs && node scripts/test-browser-local.mjs' || PHONE_RC=$?
-  hold_or_fail "${PHONE_RC}" "Standalone browser and static checks" "${PHONE_MARKER}" "needs Playwright Chromium; see docs/TEST-COVERAGE.md"
-fi
+NODE_RC=0
+NODE_MARKER="${RUN_TMP_ABSOLUTE}/refused-node"
+AGENT_HUB_HEAVY_TEST_REFUSAL_FILE="${NODE_MARKER}" \
+"${REPO_ROOT}/scripts/capped-test-run.sh" -- node --experimental-transform-types --test hub2/tests/node-alarm-recovery.test.ts || NODE_RC=$?
+hold_or_fail "${NODE_RC}" "Node alarm recovery checks" "${NODE_MARKER}"
 
 echo "=== 8/8: Summary ==="
 SUMMARY_RC=0

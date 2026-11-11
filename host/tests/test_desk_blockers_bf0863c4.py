@@ -141,6 +141,11 @@ def test_admission_stamps_hub_verdict_after_local_lock(tmp_path, monkeypatch):
     dest = m_dir / (b['label'] + '-' + b['revision'])
     dest.mkdir(mode=0o700)
     p.write_json(dest / 'bundle.json', b)
+    # Admission requires a readable materialized Claude login, independent of the Hub stub.
+    credential = dest / 'home/.claude/.credentials.json'
+    credential.parent.mkdir(parents=True, mode=0o700)
+    credential.write_text(json.dumps({'claudeAiOauth': {'accessToken': 'synthetic-fixture-only'}}))
+    credential.chmod(0o600)
     p.write_json(m_dir / 'state.json', [{'label': b['label'], 'revision': b['revision'], 'provider': 'claude'}])
     events = []
 
@@ -181,6 +186,11 @@ def test_admission_repairs_missing_profile_before_hub_stamp(tmp_path, monkeypatc
     dest = m_dir / (b['label'] + '-' + b['revision'])
     dest.mkdir(mode=0o700)
     p.write_json(dest / 'bundle.json', b)
+    # Admission requires a readable materialized Claude login, independent of the Hub stub.
+    credential = dest / 'home/.claude/.credentials.json'
+    credential.parent.mkdir(parents=True, mode=0o700)
+    credential.write_text(json.dumps({'claudeAiOauth': {'accessToken': 'synthetic-fixture-only'}}))
+    credential.chmod(0o600)
     p.write_json(m_dir / 'state.json', [{'label': b['label'], 'revision': b['revision'], 'provider': 'claude'}])
     events = []
 
@@ -221,6 +231,11 @@ def test_admission_missing_profile_still_refuses_after_failed_repair(tmp_path, m
     dest = m_dir / (b['label'] + '-' + b['revision'])
     dest.mkdir(mode=0o700)
     p.write_json(dest / 'bundle.json', b)
+    # Admission requires a readable materialized Claude login, independent of the Hub stub.
+    credential = dest / 'home/.claude/.credentials.json'
+    credential.parent.mkdir(parents=True, mode=0o700)
+    credential.write_text(json.dumps({'claudeAiOauth': {'accessToken': 'synthetic-fixture-only'}}))
+    credential.chmod(0o600)
     p.write_json(m_dir / 'state.json', [{'label': b['label'], 'revision': b['revision'], 'provider': 'claude'}])
     monkeypatch.setattr(p, 'lock', lambda timeout=None: contextlib.nullcontext())
 
@@ -258,12 +273,13 @@ def test_admission_refusal_carries_fixed_gate_reason():
     assert 'gate_reason' not in d.classify(ValueError('Fresh admission refused'))
 
 
-def test_typescript_gate_reasons_match_host():
+def test_host_gate_reason_vocabulary_remains_bounded():
     from agent_hub_host import dispatch_diagnostics as d
-    import re
-    ts = (REPO / 'src/fleet.ts').read_text()
-    block = ts.split('const GATE_REASONS = new Set([', 1)[1].split('])', 1)[0]
-    assert set(re.findall(r"'([a-z_]+)'", block)) == d.GATE_REASONS
+    # Keep the reviewed wire vocabulary after retirement of the Hub1 consumer.
+    assert d.GATE_REASONS == {'local_bundle_missing', 'local_lock_unavailable', 'local_profile_missing',
+        'profile_mismatch', 'account_mismatch', 'model_mismatch', 'hub_unreachable', 'profile_not_installed',
+        'account_unmapped', 'credential_invalid', 'credential_rejected', 'quota_exhausted', 'profile_unsupported',
+        'account_label_mismatch', 'admission_timestamp_stale', 'model_unverified', 'gate_refused', 'not_logged_in'}
 
 
 def test_admission_lock_failure_is_named(tmp_path, monkeypatch):
@@ -296,6 +312,11 @@ def test_admission_reads_atomic_state_when_lock_unavailable(tmp_path, monkeypatc
     dest = m_dir / (b['label'] + '-' + b['revision'])
     dest.mkdir(mode=0o700)
     p.write_json(dest / 'bundle.json', b)
+    # Admission requires a readable materialized Claude login, independent of the Hub stub.
+    credential = dest / 'home/.claude/.credentials.json'
+    credential.parent.mkdir(parents=True, mode=0o700)
+    credential.write_text(json.dumps({'claudeAiOauth': {'accessToken': 'synthetic-fixture-only'}}))
+    credential.chmod(0o600)
     p.write_json(m_dir / 'state.json', [{'label': b['label'], 'revision': b['revision'], 'provider': 'claude'}])
 
     @contextlib.contextmanager

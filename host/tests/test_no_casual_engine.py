@@ -23,25 +23,6 @@ class TestNoCasualEngine(unittest.TestCase):
     def parse(self, *args):
         return parser().parse_args(['sessions', *args])
 
-    def test_ui_has_no_casual_engine_dropdown_and_requires_override_reason(self):
-        repo_root = Path(__file__).resolve().parents[2]
-        fleet_html = (repo_root / 'public' / 'fleet.html').read_text()
-        fleet_js = (repo_root / 'public' / 'fleet.js').read_text()
-
-        # 1. UI default start flow is policy-driven (tier selector: auto, quick, daily, deep)
-        self.assertIn('id="fleet-tier"', fleet_html)
-        self.assertIn('Auto / policy-driven', fleet_html)
-        self.assertIn('value="quick"', fleet_html)
-        self.assertIn('value="daily"', fleet_html)
-        self.assertIn('value="deep"', fleet_html)
-
-        # 2. Engine override is hidden inside collapsed details and requires reason
-        self.assertIn('<details class="fleet-advanced" id="fleet-advanced-settings">', fleet_html)
-        self.assertIn('id="fleet-engine"', fleet_html)
-        self.assertIn('id="fleet-engine-reason"', fleet_html)
-
-        # 3. fleet.js enforces that engine override requires a non-empty explanation
-        self.assertIn('Engine override requires an explanation', fleet_js)
 
     def test_cli_sessions_override_requires_engine_and_allows_optional_reason(self):
         args = self.parse('override', '--workspace', 'demo', '--engine', 'flash')

@@ -1,7 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {CLAUDE_OAUTH,claudeAuthorization,claudeExchange,loginRefusal} from '../src/claude-oauth';
-import * as legacy from '../../src/credentials';
 
 const now=1_700_000_000_000;
 test('PKCE authorization binds independent verifier and state to the maintained endpoint and scopes',async()=>{
@@ -73,18 +72,4 @@ test('token refusal and transport errors retain bounded sanitized classification
  }
  assert.deepEqual(await claudeExchange('code','verifier','state',async()=>Response.json({refresh_token:'private'}),now),{ok:false,invalid:false,reason:'login_invalid_response',providerStatus:200,detail:'invalid_token_response'});
  assert.deepEqual(await claudeExchange('code','verifier','state',async()=>{throw new Error('private-network-error');},now),{ok:false,invalid:false,reason:'login_unreachable',detail:'egress_unreachable',blocked:true});
-});
-
-test('retained Hub1 exports use the same implementation and legacy Claude refresh preserves existing files',async()=>{
- assert.equal(legacy.CLAUDE_OAUTH,CLAUDE_OAUTH);assert.equal(legacy.claudeAuthorization,claudeAuthorization);
- assert.equal(legacy.claudeExchange,claudeExchange);assert.equal(legacy.loginRefusal,loginRefusal);
- const files={'.claude/.credentials.json':JSON.stringify({retained:'value',claudeAiOauth:{refreshToken:'synthetic-old',scopes:['user:inference'],subscriptionType:'max'}}),'unrelated':'preserved'};
- const result=await legacy.refreshCredential('claude',files,async(url,init)=>{
-  assert.equal(url,CLAUDE_OAUTH.token);
-  assert.deepEqual(JSON.parse(String(init?.body)),{grant_type:'refresh_token',refresh_token:'synthetic-old',client_id:CLAUDE_OAUTH.client,scope:'user:inference'});
-  return Response.json({access_token:'synthetic-new',refresh_token:'synthetic-rotated',expires_in:60});
- },now);
- assert.equal(result.ok,true);if(!result.ok)throw new Error('expected refresh');
- assert.equal(result.files.unrelated,'preserved');
- assert.deepEqual(JSON.parse(result.files['.claude/.credentials.json']),{retained:'value',claudeAiOauth:{refreshToken:'synthetic-rotated',accessToken:'synthetic-new',scopes:['user:inference'],subscriptionType:'max',expiresAt:now+60_000}});
 });
