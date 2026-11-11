@@ -248,7 +248,7 @@ def interactive_argv(provider, argv, prompt, *, model, effort=None, with_goal=Fa
             if effort not in {'low', 'medium', 'high', 'max'}:
                 raise ValueError('interactive_effort_unsupported')
             result += ['--effort', effort]
-        result.append(prompt)
+        result += ['--prompt-interactive', prompt] if provider == 'antigravity' else [prompt]
     else:
         if effort is not None:
             raise ValueError('interactive_effort_unsupported')

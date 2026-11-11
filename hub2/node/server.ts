@@ -75,14 +75,21 @@ async function rejectUpgrade(socket: { write(s: string): unknown; destroy(): unk
 
 export function startServer(
   runtime: Hub2Runtime,
-  options: { host?: string; port?: number } = {},
+  options: { host?: string; port?: number; publicOrigin?: string } = {},
 ): Promise<{ close(): Promise<void>; port: number }> {
+  // TLS terminates before Node, and the proxy Host may name the VM origin.
+  // Only deployment configuration chooses the public request identity;
+  // neither Host, forwarded headers nor browser Origin can override it.
+  const publicUrl = options.publicOrigin ? new URL(options.publicOrigin) : undefined;
+  if (publicUrl && (!['http:', 'https:'].includes(publicUrl.protocol) || publicUrl.username || publicUrl.password
+    || publicUrl.pathname !== '/' || publicUrl.search || publicUrl.hash)) throw new Error('invalid public origin');
+  const requestOrigin = (host: string) => publicUrl ? publicUrl.origin : `http://${host}`;
   const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
   const server = http.createServer((request, response) => {
     void (async () => {
       try {
         const host = request.headers.host ?? `127.0.0.1:${options.port ?? 0}`;
-        const upstream = await runtime.fetch(await buildRequest(request, `http://${host}`));
+        const upstream = await runtime.fetch(await buildRequest(request, requestOrigin(host)));
         if (upstream.status === 101 && responseWebSocket(upstream)) {
           // An upgrade response leaked into the plain path: refuse politely.
           response.writeHead(426, { 'Content-Type': 'application/json' });
@@ -106,7 +113,7 @@ export function startServer(
     void (async () => {
       try {
         const host = request.headers.host ?? `127.0.0.1:${options.port ?? 0}`;
-        const upstream = await runtime.fetch(await buildRequest(request, `http://${host}`));
+        const upstream = await runtime.fetch(await buildRequest(request, requestOrigin(host)));
         const pair = responseWebSocket(upstream) as PairClient | undefined;
         if (upstream.status !== 101 || !pair?._server) {
           await rejectUpgrade(socket, upstream);

@@ -816,12 +816,36 @@ class Bridge:
         with db:
             self.begin_command(identity, digest)
         if kind == "stop":
-            self.native("kill", native_id)
-            status = self.lookup(native_id, row)
-            if status and status.get("phase", status.get("state")) == "exited" and status.get("containment_empty") is True:
-                result = {'stopped': True, 'evidence': 'native_exit', 'native_id': native_id}
-            else:
+            deadline = command.get('deadline_ms')
+            if type(deadline) is int and deadline <= time.time() * 1000:
                 result = {'stopped': False, 'error': 'stop_unconfirmed', 'reason': 'stop_unconfirmed', 'stage': 'host_stop'}
+                with db:
+                    self.finish_command(identity, command, result)
+                return result
+            self.native("kill", native_id)
+            # Kill can return before the native worker writes its qualified
+            # retirement. Wait briefly inside the server's original deadline;
+            # legacy envelopes without a deadline retain their immediate check.
+            remaining = max(0, (deadline - time.time() * 1000) / 1000) if type(deadline) is int else 0
+            until = time.monotonic() + min(5, remaining)
+            birth = (_status or {}).get('created_at_ms')
+            while True:
+                status = self.lookup(native_id, row)
+                if (status and status.get("phase", status.get("state")) == "exited"
+                        and status.get("containment_empty") is True and native_returncode(status.get('exit')) is not None):
+                    observed_birth = status.get('created_at_ms')
+                    if type(birth) is int and status.get('retirement') == 'verified_finished':
+                        tombstone = native_launch.read_tombstone(native_id, state_dir=self.launcher.state_dir)
+                        observed_birth = (tombstone or {}).get('created_at_ms')
+                    if type(birth) is int and observed_birth != birth:
+                        raise RuntimeError('native_identity_mismatch')
+                    result = {'stopped': True, 'evidence': 'native_exit', 'native_id': native_id}
+                    break
+                left = min(until - time.monotonic(), (deadline - time.time() * 1000) / 1000 if type(deadline) is int else 0)
+                if left <= 0:
+                    result = {'stopped': False, 'error': 'stop_unconfirmed', 'reason': 'stop_unconfirmed', 'stage': 'host_stop'}
+                    break
+                time.sleep(min(.1, left))
         else:
             text = command.get("text")
             if not isinstance(text, str) or len(text.encode()) > 16384:

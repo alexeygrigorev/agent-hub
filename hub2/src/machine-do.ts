@@ -1831,6 +1831,7 @@ export class MachineDO {
 
   private commandView(row: CommandRow): JsonRecord {
     return { id: row.id, session_id: row.session_id, epoch: row.epoch, kind: row.kind,
+      ...(row.kind === 'stop' ? {deadline_ms: row.created_at + 60000} : {}),
       ...(row.capture_mode ? {mode:row.capture_mode} : {}),
       ...(row.kind==='capture'&&(this.parse(row.result_json) as JsonRecord|null)?.capture_binding
         ?{capture_binding:(this.parse(row.result_json) as JsonRecord).capture_binding}:{}),
