@@ -68,6 +68,14 @@ jobs:
           mkdir -p "$TMPDIR"
           scripts/with-temp-home.sh -- python -m pytest hub2/tests/e2e -v -rxXs -p no:cacheprovider --durations=0
 
+      - name: 500-intake pagination and global search (Node server + hub CLI)
+        env:
+          TMPDIR: ${{ github.workspace }}/.local/tmp
+          PYTHONPATH: host:host/tests
+        run: |
+          mkdir -p "$TMPDIR"
+          scripts/with-temp-home.sh -- python -m pytest host/tests/test_node_intake_e2e.py -v -p no:cacheprovider
+
   # Always-run gate for branch protection: fails explicitly unless the e2e job
   # succeeded (a skipped or cancelled e2e is a failure, never a pass).
   e2e-start-path-gate:
