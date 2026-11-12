@@ -1385,6 +1385,7 @@ class Canary:
         expected_repo,
         expected_machine,
         expected_workspace,
+        require_exit_zero=False,
     ):
         if not self.valid_session_id(session_id):
             return False, None
@@ -1428,14 +1429,15 @@ class Canary:
         if created_at_ms is None:
             return False, None
         state = node.get("state")
-        if state == "stopped" and node.get("stop_confirmed") is True:
+        if state == "stopped" and node.get("stop_confirmed") is True and not require_exit_zero:
             updated_at = node.get("updated_at")
             if updated_at is not None:
                 updated_at_ms = self.parse_timestamp_ms(updated_at)
                 if updated_at_ms is None or updated_at_ms < created_at_ms:
                     return False, None
             return True, session_native
-        if state not in ("completed-awaiting-review", "completed", "failed", "stopped"):
+        if (state not in ("completed-awaiting-review", "completed", "failed", "stopped")
+                or require_exit_zero and state == "failed"):
             return False, None
         ev = node.get("evidence")
         if not isinstance(ev, dict) or ev.get("native_exit_confirmed") is not True:
@@ -1461,7 +1463,8 @@ class Canary:
         if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
             return False, None
         exit_code = ev.get("exit_code")
-        if not isinstance(exit_code, int) or isinstance(exit_code, bool):
+        if (not isinstance(exit_code, int) or isinstance(exit_code, bool)
+                or require_exit_zero and exit_code != 0):
             return False, None
         inner = ev.get("evidence")
         if (
@@ -1520,8 +1523,11 @@ class Canary:
         expected_repo,
         expected_machine,
         expected_workspace,
+        require_exit_zero=False,
+        precomputed_stop=None,
     ):
-        rc, _, err = self.stop_session_with_output(session_id, stop_key, deadline)
+        rc, _, err = (self.stop_session_with_output(session_id, stop_key, deadline)
+                      if precomputed_stop is None else precomputed_stop)
         if rc == 0:
             if expected_native_id is not None and not self.valid_native_id(expected_native_id):
                 return False, None
@@ -1535,6 +1541,7 @@ class Canary:
                 expected_repo=expected_repo,
                 expected_machine=expected_machine,
                 expected_workspace=expected_workspace,
+                require_exit_zero=require_exit_zero,
             )
             if not verified or not self.valid_native_id(resolved_native):
                 return False, None
@@ -1543,7 +1550,16 @@ class Canary:
 
     def stop(self, deadline, suffix="stop"):
         self.current_stage = "stop"
-        return self.stop_session(self.session, f"{self.key}-{suffix}", deadline)
+        key = f"{self.key}-{suffix}"
+        stopped = self.stop_session_with_output(self.session, key, deadline)
+        if stopped[0] == 0:
+            return 0  # Keep ordinary confirmed STOP behavior unchanged.
+        confirmed, _native = self.stop_or_confirm_retired(
+            self.session, key, deadline, expected_native_id=self.native,
+            expected_key=self.key, expected_repo=self.repo, expected_machine=self.machine,
+            expected_workspace=self.workspace, require_exit_zero=True, precomputed_stop=stopped,
+        )
+        return 0 if confirmed else stopped[0]
 
     def wait_gone_for(self, native_id, deadline):
         while time.monotonic() < deadline:
