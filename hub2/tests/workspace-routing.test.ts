@@ -48,3 +48,9 @@ test('absolute paths do not require a workspace label tag', () => {
   assert.ok(result.options.every(row => row.value.machine_id === 'desktop'));
   assert.ok(!result.diagnostics.advisories?.some(row => row.reason === 'capability_not_advertised'));
 });
+
+test('placement retries exclude every machine already attempted', () => {
+  const result = buildRoutingPool(fixture(), {interactive: false, workspace: 'home', exclude_machine_ids: ['desktop']});
+  assert.ok(result.options.length > 0);
+  assert.ok(result.options.every(row => row.value.machine_id === 'linux'));
+});

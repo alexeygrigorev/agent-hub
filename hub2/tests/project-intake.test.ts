@@ -285,6 +285,34 @@ test('pre-claim host launch refusal fails clearly and is not silently re-offered
  assert.equal(retry.status,201,JSON.stringify(await retry.clone().json()));
  assert.equal((f.sql.prepare('SELECT COUNT(*) AS n FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any).n,2);
 });
+test('workspace placement refusal retries another host and leaves a visible intake alert',async()=>{
+ const candidates=[{id:'codex-sol',engine:'codex',model:'gpt-6.1-sol',effort:'medium',account_id:'codex',weight:1,capabilities:[],enabled:true}];
+ const f=fixture({modelCandidates:candidates,accountHosts:{codex:['h1','h2']}}),originalRandom=Math.random;Math.random=()=>0;
+ try{
+  const own=await intake(f,'workspace-placement-fallback'),start={key:'workspace-placement-first',workspace:'dataops',purpose:'implement'};
+  assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',start)).status,201);
+  const first=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any;
+  assert.equal(first.machine_id,'h1');assert.equal(first.state,'offered');
+  const refusal={operation_id:first.operation_id,attempt_operation_id:first.attempt_operation_id,session_id:first.session_id,
+   machine_id:first.machine_id,epoch:first.epoch,native_id:null,reason:'host_launch_refused',
+   failure_reason:'workspace_label_ambiguous',launch_failed:true,observed_at:Date.now()};
+  const response=await f.call('/_internal/reaped','POST',refusal),receipt=await body(response);
+  assert.equal(response.status,200,JSON.stringify(receipt));assert.equal(receipt.fallback,true);assert.equal(receipt.machine_id,'h2');
+  const retried=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE operation_id=?').get(first.operation_id) as any;
+  assert.equal(retried.state,'offered');assert.equal(retried.attempt,1);assert.equal(retried.attempt_operation_id,first.operation_id+':1');
+  assert.equal(retried.machine_id,'h2');
+  const retryDraw=f.routes.filter((row:any)=>Array.isArray(row.input?.exclude_machine_ids)).at(-1);
+  assert.deepEqual(retryDraw.input.exclude_machine_ids,['h1']);
+  const duplicate=await f.call('/_internal/reaped','POST',refusal);
+  assert.equal(duplicate.status,200);assert.equal((await body(duplicate)).duplicate,true);
+  const history=await body(await f.call('/api/intakes/'+own.id+'/history'));
+  const alert=history.events.find((event:any)=>event.kind==='session_placement_fallback');
+  assert.equal(alert.body.failed_machine_id,'h1');assert.equal(alert.body.next_machine_id,'h2');
+  assert.equal(alert.body.failure_reason,'workspace_label_ambiguous');
+  const intakeRow=f.sql.prepare('SELECT * FROM intakes WHERE id=?').get(own.id) as any;
+  assert.equal(intakeRow.status,'queued');assert.equal(intakeRow.assigned_machine_id,'h2');
+ }finally{Math.random=originalRandom;}
+});
 test('an expired unclaimed offer terminates instead of scheduling an unbounded retry',async()=>{
  const f=fixture(),own=await intake(f,'expired-offer-stop'),start={key:'expired-offer-stop',workspace:'/tmp/synthetic-expired-stop',engine:'shell',machine_id:'h1',override_reason:'Synthetic semantic test'};
  assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',start)).status,201);

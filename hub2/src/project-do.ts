@@ -19,6 +19,8 @@ import {
 } from './task-completion';
 import type { Actor, Hub2Env, JsonRecord } from './types';
 
+const WORKSPACE_PLACEMENT_FAILURES = new Set(['workspace_label_ambiguous', 'workspace_label_unavailable', 'workspace_unavailable']);
+
 // Use exactly the same pending/current-attempt predicate for the bounded
 // drain and its alarm. Terminal actions never expire with intake age.
 const COMPLETION_DUE = `CASE
@@ -855,8 +857,14 @@ export class ProjectDO {
       || (body.inventory_observed_at!==null && (!Number.isSafeInteger(body.inventory_observed_at)
         || Number(body.observed_at)-Number(body.inventory_observed_at)<HOST_INVENTORY_LOST_MS)))) return error('invalid_lost_receipt',400);
     const saga=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?',body.operation_id);
-    if(!saga||saga.session_id!==body.session_id||saga.machine_id!==body.machine_id)return error('stale_stopped_receipt',409);
+    if(!saga||saga.session_id!==body.session_id)return error('stale_stopped_receipt',409);
     const exactAttempt=saga.attempt_operation_id===body.attempt_operation_id&&saga.epoch===body.epoch;
+    const routeState=this.parse(saga.routing_json) as (PickedRoute&{placement_failures?:Array<JsonRecord>})|null;
+    const priorPlacementFailure=saga.attempt>0&&routeState?.placement_failures?.some(failure=>
+      failure.attempt_operation_id===body.attempt_operation_id&&failure.machine_id===body.machine_id
+      &&failure.epoch===body.epoch&&failure.failure_reason===body.failure_reason);
+    if(!exactAttempt&&priorPlacementFailure)return json({failed:true,fallback:true,duplicate:true,session_id:saga.session_id});
+    if(saga.machine_id!==body.machine_id)return error('stale_stopped_receipt',409);
     const previousAttempt=saga.attempt>0&&body.attempt_operation_id===`${saga.operation_id}:${saga.attempt-1}`&&saga.epoch===body.epoch;
     const pendingRetryStop=!launchTimedOut&&body.reason==='stop_confirmed'&&body.native_id==null&&saga.native_id===null
       &&saga.state==='pending_machine'&&previousAttempt;
@@ -877,6 +885,22 @@ export class ProjectDO {
     if(!['staged','offered','claimed','admitted','running'].includes(saga.state)&&!pendingRetryStop)return error('session_not_active',409);
     const intake=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',saga.intake_id);
     if(!intake||intake.session_id!==saga.session_id||intake.assigned_machine_id!==saga.machine_id)return error('stopped_intake_binding_mismatch',409);
+    if(launchRefused&&WORKSPACE_PLACEMENT_FAILURES.has(String(body.failure_reason))){
+      const fallback=await this.serializeRouting(()=>this.prepareWorkspacePlacementFallback(saga,intake,String(body.failure_reason)));
+      if(fallback){
+        await this.scheduleNext();
+        await this.dispatchSaga(fallback.operation_id);
+        await this.scheduleNext();
+        return json({failed:true,fallback:true,session_id:fallback.session_id,machine_id:fallback.machine_id,
+          failure_reason:fallback.failure_reason});
+      }
+      const latest=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?',saga.operation_id);
+      const latestRoute=this.parse(latest?.routing_json) as (PickedRoute&{placement_failures?:Array<JsonRecord>})|null;
+      if(latest&&latest.attempt>0&&latestRoute?.placement_failures?.some(failure=>
+        failure.attempt_operation_id===body.attempt_operation_id&&failure.machine_id===body.machine_id
+        &&failure.epoch===body.epoch&&failure.failure_reason===body.failure_reason))
+        return json({failed:true,fallback:true,duplicate:true,session_id:saga.session_id});
+    }
     const now=Date.now(),eventKey=`stopped:${saga.attempt_operation_id}:${saga.epoch}`;
     const applied=this.transaction(()=>{
       const current=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?',saga.operation_id);
@@ -937,6 +961,59 @@ export class ProjectDO {
     await this.dispatchSaga(prepared.operation_id);
     await this.scheduleNext();
     return json({fallback:true,session_id:prepared.session_id,engine:prepared.engine,model:prepared.model});
+  }
+
+  private async prepareWorkspacePlacementFallback(saga:SagaRow,intake:IntakeRow,failureReason:string):Promise<{
+    operation_id:string;session_id:string;machine_id:string;failure_reason:string;
+  }|null>{
+    const route=this.parse(saga.routing_json) as (PickedRoute&{picker?:unknown;initial_picker?:unknown;
+      completion_contract?:boolean;completion_contract_omitted?:string;placement_failures?:Array<JsonRecord>})|null;
+    if(saga.attempt!==0||saga.native_id!==null||!route||route.override_reason!==null)return null;
+    let next:PickedRoute,diagnostics:PickDiagnostics;
+    const launch=this.parse(saga.launch_spec_json) as JsonRecord;
+    try{
+      const picked=await pickCommittedModelRoute(this.env,{interactive:launch.interactive===true,
+        ...(typeof launch.workspace==='string'?{workspace:launch.workspace}:{}),
+        purpose:sessionPurpose(launch.purpose),with_goal:launch.with_goal===true,
+        required_capabilities:route.required_capabilities,exclude_machine_ids:[saga.machine_id]},
+        {project_id:intake.project,operation_id:saga.operation_id,attempt:1,previous_picker:route.picker});
+      next=picked.route;diagnostics=picked.diagnostics;
+    }catch{
+      return null;
+    }
+    if(next.machine_id===saga.machine_id)return null;
+    const now=Date.now(),nextAttempt=1;
+    const picker=buildStartPickerEvidence(next,diagnostics,nextAttempt,route.picker);
+    const placementFailure={attempt_operation_id:saga.attempt_operation_id,epoch:saga.epoch,
+      machine_id:saga.machine_id,failure_reason:failureReason};
+    const placementFailures=[...(route.placement_failures||[]),placementFailure].slice(-2);
+    const routeState={...next,attempted_policy_ids:[...new Set([...(Array.isArray((route as JsonRecord).attempted_policy_ids)
+      ?(route as JsonRecord).attempted_policy_ids as string[]:[]),route.policy_id,next.policy_id])],
+      picker,initial_picker:normalizeStartPickerEvidence(route.initial_picker)??normalizeStartPickerEvidence(route.picker),
+      placement_failures:placementFailures,
+      ...(route.completion_contract===true?{completion_contract:true}:{}),
+      ...(route.completion_contract_omitted==='launch_budget'?{completion_contract_omitted:'launch_budget'}:{})};
+    const applied=this.transaction(()=>{
+      if(!this.fallbackCurrent(saga,intake))return false;
+      const current=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?',saga.operation_id);
+      if(!current||current.attempt!==0||current.native_id!==null||!['offered','claimed'].includes(current.state))return false;
+      this.db.run(`UPDATE dispatch_sagas SET state='pending_machine',attempt=?,attempt_operation_id=?,machine_id=?,account_id=?,
+        routing_json=?,next_action_at=?,last_reason='workspace_placement_fallback',updated_at=?
+        WHERE operation_id=? AND state=? AND attempt_operation_id=? AND epoch=? AND native_id IS NULL`,
+        nextAttempt,`${saga.operation_id}:${nextAttempt}`,next.machine_id,next.account_id,JSON.stringify(routeState),now,now,
+        saga.operation_id,saga.state,saga.attempt_operation_id,saga.epoch);
+      this.db.run(`UPDATE intakes SET status='queued',assigned_machine_id=?,final_evidence_json=NULL,updated_at=?
+        WHERE id=? AND session_id=? AND assigned_machine_id=?`,next.machine_id,now,intake.id,saga.session_id,saga.machine_id);
+      this.appendEvent(intake.id,`placement-fallback:${saga.attempt_operation_id}:${saga.epoch}`,'hub2-dispatch',
+        'session_placement_fallback',{session_id:saga.session_id,failed_machine_id:saga.machine_id,
+          next_machine_id:next.machine_id,failure_reason:failureReason,attempt:nextAttempt},now);
+      return true;
+    });
+    if(!applied)return null;
+    console.error('[hub2] SESSION_PLACEMENT_FALLBACK alert=workspace-placement',JSON.stringify({intake_id:intake.id,
+      session_id:saga.session_id,failed_machine_id:saga.machine_id,next_machine_id:next.machine_id,
+      failure_reason:failureReason}));
+    return {operation_id:saga.operation_id,session_id:saga.session_id,machine_id:next.machine_id,failure_reason:failureReason};
   }
 
   private async prepareAuthFallback(request:Request):Promise<Response|{operation_id:string;session_id:string;engine:string;model:string}>{
