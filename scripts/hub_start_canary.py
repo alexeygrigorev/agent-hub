@@ -797,6 +797,7 @@ class Canary:
             "machine": self.machine,
             "workspace": str(pathlib.Path(self.workspace).resolve()),
             "prompt": self.prompt,
+            "purpose": "review",
             "candidate_sha": self.candidate_sha,
             "session_id": self.session,
             "native_id": self.native,
@@ -1146,7 +1147,7 @@ class Canary:
                 *self.hub, "sessions", "start", "--no-wait",
                 "--repo", rec["repo"], "--machine", rec["machine"],
                 "--workspace", rec["workspace"], "--name", rec["name"],
-                "--key", rec["key"], "--prompt", rec["prompt"], "--purpose", "review",
+                "--key", rec["key"], "--prompt", rec["prompt"], "--purpose", rec.get("purpose", "implement"),
             ]
             if rec["mode"] == "shell":
                 replay_args += ["--engine", "shell"]
