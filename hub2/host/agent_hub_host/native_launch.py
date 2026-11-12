@@ -973,7 +973,10 @@ class NativeLauncher:
         engine = start_json.get("engine")
         if engine not in {"codex", "zcodex", "claude"} or '\r' in prompt or '\n' in prompt:
             raise RuntimeError("native_goal_provider_unsupported")
-        read_goal = (lambda row: claude_goal.goal_store(row, claude_config_dir, objective_hash)) if engine == 'claude' else goal_store
+        expected_thread = claude_goal.conversation_id(start_json.get('command')) if engine == 'claude' else None
+        if engine == 'claude' and not expected_thread:
+            raise RuntimeError('native_goal_identity_unverified')
+        read_goal = (lambda row: claude_goal.goal_store(row, claude_config_dir, expected_thread, objective_hash)) if engine == 'claude' else goal_store
         expected = objective_hash(prompt)
         deadline = min(deadline, time.time() + 60)
         row = self.status(start_json["id"], workspace=specification["workspace"])
@@ -981,6 +984,8 @@ class NativeLauncher:
                 or not same_workspace(row.get("workspace"), start_json.get("workspace")) or row.get("engine") != engine
                 or row.get("created_at_ms") != start_json.get("created_at_ms") or row.get("phase") != "running"):
             raise RuntimeError("native_goal_identity_unverified")
+        if engine == 'claude' and row.get('command') != start_json.get('command'):
+            raise RuntimeError('native_goal_identity_unverified')
 
         def matching(proof):
             if proof and proof.get("objective_hash") != expected:
