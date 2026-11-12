@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 
 from .client import ApiError, private_file, save_config
-from . import native_launch
+from . import native_launch, launch_reaper
 from .advertisement import Advertisement
 from .native_launch import NativeLauncher, LOCAL_ROUTES, UUID_RE, canonical, native_returncode, same_workspace, spawn_environment
 from .local_auth_readiness import local_claude_missing_contexts
@@ -73,6 +73,7 @@ class Journal:
         if "workspace_repair_digest" not in {row[1] for row in self.db.execute("PRAGMA table_info(launches)")}:
             self.db.execute("ALTER TABLE launches ADD COLUMN workspace_repair_digest TEXT")
         self.db.execute("CREATE INDEX IF NOT EXISTS launches_active ON launches(state,operation_id)")
+        launch_reaper.initialize(self)
 
     @property
     def db(self):
@@ -346,6 +347,7 @@ class Bridge:
                      session, previous['operation_id'], previous['epoch']))
                 if changed.rowcount != 1:
                     return None
+        launch_reaper.remember(self.journal, operation, offer.get("expires_at"))
         prior = db.execute("SELECT * FROM launches WHERE operation_id=?", (operation,)).fetchone()
         if prior:
             if prior["session_id"] != session or prior["digest"] != digest or epoch < prior["epoch"]:
@@ -353,7 +355,7 @@ class Bridge:
             if epoch > prior["epoch"]:
                 # A new fence cannot adopt a process under the old fence automatically.
                 raise ValueError("native_reconciliation_required")
-            if prior['state'] in {'stopped_before_dispatch', 'launch_failed_unconfirmed'}:
+            if prior['state'] in {'stopped_before_dispatch', 'launch_failed_unconfirmed', 'launch_failed_reported'}:
                 return None
             recovery_native = offer.get('recovery_native_id')
             if recovery_native is not None and recovery_native != prior['native_id']:
@@ -637,6 +639,7 @@ class Bridge:
             pass  # Diagnostic transport never converts UNKNOWN into a resolved row.
 
     def reconcile(self):
+        launch_reaper.reap_expired_launches(self)
         rows = self.journal.db.execute("SELECT * FROM launches WHERE state IN ('running','aborting','deadline_stopping','launching') LIMIT 1001").fetchall()
         if len(rows) > 1000:
             raise RuntimeError("active_native_bound_exceeded")
