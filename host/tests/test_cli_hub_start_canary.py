@@ -136,10 +136,11 @@ if args[:2] == ["sessions", "capture"]:
     elif ((d / "session_engine").read_text() if (d / "session_engine").exists() else "shell") != "shell":
         output = json.dumps({"type":"item.completed","item":{"type":"command_execution","status":"completed","exit_code":0,"aggregated_output":marker+"\n","command":"echo"}})
     else: output = "$ " + prompt + "\n" + marker
+    if sc == "natural_exit_stop_409": (d / "a_running").unlink(missing_ok=True)
     print(json.dumps({"command_wait":{"state":"acked","ack":{"capture":output}}})); sys.exit(0)
 if args[:2] == ["sessions", "stop"]:
     if sc == "stop_fail" or (sc == "cleanup_fail" and "cleanup" in " ".join(args)): sys.exit(1)
-    if sc in ("capture_fail_stop_409_retired", "capture_fail_stop_409_still_running") or (sc == "reconcile_stop_409" and "reconcile" in " ".join(args)):
+    if sc in ("capture_fail_stop_409_retired", "capture_fail_stop_409_still_running", "natural_exit_stop_409", "natural_exit_stop_409_still_running") or (sc == "reconcile_stop_409" and "reconcile" in " ".join(args)):
         sys.stderr.write("hub error: HTTP 409 at http://127.0.0.1:8787/api/sessions/" + args[2] + "/stop: status 409 (session_not_running): session is completed-awaiting-review\n")
         sys.exit(1)
     if sc != "gone_fail": (d / "a_running").unlink(missing_ok=True)
@@ -1696,6 +1697,95 @@ class CanaryTest(unittest.TestCase):
         self.assertNotIn("Traceback", r.stderr)
         err_verdict = json.loads(r.stderr.strip().splitlines()[-1])
         self.assertEqual(err_verdict["alert_state_error"], "lock:lock_file_symlink")
+
+    def test_successful_capture_then_natural_exit_requires_positive_zero_exit_retirement(self):
+        import copy
+        ws=str((self.tmp/'ws').resolve());created=int(time.time()*1000)-1000
+        base={'session':{'id':SID,'state':'completed-awaiting-review','intake_id':'intake-natural',
+              'project_id':'owner/repo','machine_id':'HOST-1','workspace':ws,'requested_workspace':ws,
+              'epoch':2,'operation_id':'op-natural:0','native_id':NATIVE,'created_at':created,
+              'evidence':{'session_id':SID,'machine_id':'HOST-1','intake_id':'intake-natural',
+                  'native_id':NATIVE,'epoch':2,'operation_id':'op-natural','attempt_operation_id':'op-natural:0',
+                  'evidence_digest':'a'*64,'exit_code':0,'native_exit_confirmed':True,
+                  'evidence':{'source':'aplexer_retirement','containment_empty':True,
+                      'native_identity':{'id':NATIVE,'tag':'task-hub2-'+SID,'workspace':ws},
+                      'native_exit':{'code':0,'exited_at_ms':created+500}}}}}
+        # Maintained show omits request keys. Existing conflict checks still
+        # apply when a key is present; the exact own SID/native/capture is pinned.
+        self.assertNotIn('key',base['session']);self.assertNotIn('client_key',base['session'])
+        capture=[{'type':'assistant','session_id':NATIVE,'message':{'role':'assistant','content':[
+                    {'type':'tool_use','id':'toolu_natural_print','name':'Bash','input':{'command':'printf __MARKER__'}}]}},
+                 {'type':'user','session_id':NATIVE,'message':{'role':'user','content':[
+                    {'type':'tool_result','tool_use_id':'toolu_natural_print','content':'__MARKER__\n','is_error':False}]},
+                  'tool_use_result':{'stdout':'__MARKER__\n','stderr':'','interrupted':False}}]
+        (self.tmp/'capture_output.txt').write_text('\n'.join(json.dumps(row) for row in capture)+'\n')
+        (self.tmp/'show_payload.json').write_text(json.dumps(base))
+        result,verdict=self.run_canary('natural_exit_stop_409','--mode','full',FAKE_ENGINE='claude')
+        self.assertEqual((result.returncode,verdict['ok'],verdict['stage']),(0,True,None),verdict)
+        calls=[json.loads(line) for line in (self.tmp/'argv.jsonl').read_text().splitlines()]
+        stops=[args for args in calls if args[:2]==['sessions','stop']]
+        self.assertEqual(len(stops),1,'successful fallback must not issue duplicate STOP')
+        self.assertIn('sessions show '+SID,self.calls());self.assertIn('a list --json --running',self.calls())
+        self.assertLess(self.calls().index('sessions capture '),self.calls().index('sessions stop '))
+        self.assertLess(self.calls().index('sessions stop '),self.calls().index('a list --json --running'))
+
+        cases=[]
+        def mutate(name,change):
+            payload=copy.deepcopy(base);change(payload['session']);cases.append((name,payload))
+        mutate('missing',lambda row:row.update(evidence=None))
+        mutate('foreign_sid',lambda row:row.update(id='other-session'))
+        mutate('foreign_machine',lambda row:row.update(machine_id='OTHER'))
+        mutate('foreign_workspace',lambda row:row.update(workspace='/foreign'))
+        mutate('foreign_native',lambda row:row.update(native_id='bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'))
+        mutate('foreign_key',lambda row:row.update(client_key='different-key'))
+        mutate('conflicting_keys',lambda row:row.update(client_key='one',key='two'))
+        mutate('foreign_operation',lambda row:row['evidence'].update(attempt_operation_id='other:0'))
+        mutate('failed_state',lambda row:row.update(state='failed'))
+        mutate('unknown_state',lambda row:row.update(state='lost'))
+        mutate('confirmed_stop_without_finish',lambda row:row.update(state='stopped',stop_confirmed=True,evidence=None))
+        for code in [7,None,False]:
+            def exit_code(row,code=code):
+                row['evidence']['exit_code']=code;row['evidence']['evidence']['native_exit']['code']=code
+            mutate('exit_'+str(code),exit_code)
+        for name,payload in cases:
+            with self.subTest(retirement=name):
+                (self.tmp/'show_payload.json').write_text(json.dumps(payload))
+                result,verdict=self.run_canary('natural_exit_stop_409','--mode','full',FAKE_ENGINE='claude')
+                self.assertEqual((result.returncode,verdict['ok'],verdict['stage']),(1,False,'stop'),verdict)
+                for owned in (self.state/'pending').glob('*.json'):owned.unlink()
+        (self.tmp/'show_payload.json').write_text(json.dumps(base))
+        result,verdict=self.run_canary('natural_exit_stop_409_still_running','--mode','full',FAKE_ENGINE='claude')
+        self.assertEqual((result.returncode,verdict['ok'],verdict['stage']),(1,False,'gone'),verdict)
+        for owned in (self.state/'pending').glob('*.json'):owned.unlink()
+        # Cleanup may confirm a nonzero terminal exit, but cannot rescue capture.
+        failed=copy.deepcopy(base);failed['session']['state']='failed'
+        failed['session']['evidence']['exit_code']=7;failed['session']['evidence']['evidence']['native_exit']['code']=7
+        (self.tmp/'show_payload.json').write_text(json.dumps(failed))
+        result,verdict=self.run_canary('capture_fail_stop_409_retired','--mode','full',FAKE_ENGINE='claude')
+        self.assertEqual((result.returncode,verdict['ok'],verdict['stage'],verdict['cleanup']),
+                         (1,False,'capture','stopped'),verdict)
+
+    def test_success_stop_retirement_reuses_single_response_and_original_deadline(self):
+        from scripts import hub_start_canary as mod
+        from unittest.mock import patch
+        canary=mod.Canary('full','deadline')
+        canary.session=SID;canary.native=NATIVE
+        deadline=time.monotonic()+10
+        response=(1,'','status 409 (session_not_running): completed')
+        with patch.object(canary,'stop_session_with_output',return_value=response) as stop, \
+                patch.object(canary,'verify_terminal_session_retired',return_value=(True,NATIVE)) as verify, \
+                patch.object(canary,'a_running_ids',return_value=set()) as running:
+            self.assertEqual(canary.stop(deadline),0)
+            canary.wait_gone(deadline)
+        stop.assert_called_once_with(SID,canary.key+'-stop',deadline)
+        verify.assert_called_once_with(SID,deadline,expected_native_id=NATIVE,expected_key=canary.key,
+            expected_repo=canary.repo,expected_machine=canary.machine,expected_workspace=canary.workspace,require_exit_zero=True)
+        running.assert_called_once_with(deadline)
+        for code in [0,124,2]:
+            with self.subTest(code=code),patch.object(canary,'stop_session_with_output',return_value=(code,'','other')) as stop, \
+                    patch.object(canary,'verify_terminal_session_retired') as verify:
+                self.assertEqual(canary.stop(deadline),code)
+                stop.assert_called_once();verify.assert_not_called()
 
     def test_session_not_running_409_requires_positive_retirement_or_stop_evidence(self):
         ws = str((self.tmp / "ws").resolve())
