@@ -14,3 +14,5 @@ await import('./machine-picker-evidence.test.ts');
 await import('./native-inventory.test.ts');
 
 await import('./native-commands.test.ts');
+
+await import('./implement-workspace.test.ts');

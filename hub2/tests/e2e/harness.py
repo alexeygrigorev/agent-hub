@@ -179,8 +179,14 @@ class Host:
         self.workspace = self.workspace_root / "e2e-repo"
         self.workspace.mkdir(parents=True)
         subprocess.run(["git", "init", "-q", str(self.workspace)], check=True)
-        subprocess.run(["git", "-C", str(self.workspace), "remote", "add", "origin",
-                        "https://github.com/" + PROJECT + ".git"], check=True)
+        # A real local origin/main keeps implement isolation in the integrated
+        # server/daemon/CLI test without network access.
+        subprocess.run(["git", "-C", str(self.workspace), "checkout", "-b", "main"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(self.workspace), "-c", "user.name=fixture", "-c", "user.email=fixture@example.test",
+                        "commit", "--allow-empty", "-m", "fixture main"], check=True, capture_output=True)
+        origin = root / "origin.git"
+        subprocess.run(["git", "clone", "--bare", str(self.workspace), str(origin)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(self.workspace), "remote", "add", "origin", str(origin)], check=True)
         self.state = root / "aplexer-state"
         self.state.mkdir()
         self.config_dir = root / "host-config"

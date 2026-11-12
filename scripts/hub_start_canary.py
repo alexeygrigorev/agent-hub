@@ -1146,7 +1146,7 @@ class Canary:
                 *self.hub, "sessions", "start", "--no-wait",
                 "--repo", rec["repo"], "--machine", rec["machine"],
                 "--workspace", rec["workspace"], "--name", rec["name"],
-                "--key", rec["key"], "--prompt", rec["prompt"],
+                "--key", rec["key"], "--prompt", rec["prompt"], "--purpose", "review",
             ]
             if rec["mode"] == "shell":
                 replay_args += ["--engine", "shell"]
@@ -1309,7 +1309,7 @@ class Canary:
     def start_args(self):
         args = [*self.hub, "sessions", "start", "--no-wait", "--repo", self.repo,
                 "--machine", self.machine, "--workspace", self.workspace, "--name", self.name,
-                "--key", self.key, "--prompt", self.prompt]
+                "--key", self.key, "--prompt", self.prompt, "--purpose", "review"]
         if self.mode == "shell":
             args += ["--engine", "shell"]
         return args
