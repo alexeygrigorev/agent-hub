@@ -6,7 +6,7 @@ import unittest
 import urllib.error
 from pathlib import Path
 from unittest.mock import patch
-from agent_hub_host import repos, fleet, session_control
+from agent_hub_host import repos, fleet, session_control, intake
 
 
 class RepoTests(unittest.TestCase):
@@ -193,15 +193,151 @@ class RepoTests(unittest.TestCase):
     def test_cli_filters_and_operator_edit(self):
         parser = argparse.ArgumentParser()
         repos.add_commands(parser.add_subparsers(dest='cmd'))
-        with patch.object(repos.intake, 'request', return_value={}) as request:
+        with patch.object(repos.intake, 'request', return_value={'items': [], 'next': None}) as request:
             repos.execute(parser.parse_args(['repos', 'list', '--org', 'Example', '--status', 'active', '--flagged']))
-            self.assertEqual(request.call_args.args, ('GET', '/api/repos?org=Example&status=active&flagged=true'))
+            self.assertEqual(request.call_args.args, ('GET', '/api/repos?org=Example&status=active&flagged=true&limit=50'))
 
             with tempfile.TemporaryDirectory() as tmp:
                 fields = Path(tmp) / 'repo.json'
-                fields.write_text(json.dumps({'label': 'Old site', 'status': 'duplicate', 'canonical': 'main-site'}))
-                repos.execute(parser.parse_args(['repos', 'edit', 'old-site', '--file', str(fields)]))
-            self.assertEqual(request.call_args.args, ('PATCH', '/api/repos/old-site', {'label': 'Old site', 'status': 'duplicate', 'canonical': 'main-site'}))
+                fields.write_text(json.dumps({'purpose': 'Old site', 'status': 'duplicate', 'duplicate_of': 'main-site'}))
+                repos.execute(parser.parse_args(['repos', 'edit', 'Example/old-site', '--file', str(fields)]))
+            self.assertEqual(request.call_args.args[0], 'PATCH')
+            self.assertEqual(request.call_args.args[1], '/api/repos/Example%2Fold-site')
+            self.assertEqual(request.call_args.args[2], {'purpose': 'Old site', 'status': 'duplicate', 'duplicate_of': 'main-site'})
+
+
+class Hub2ReposCliTests(unittest.TestCase):
+    def parser(self):
+        parser = argparse.ArgumentParser()
+        repos.add_commands(parser.add_subparsers(dest='cmd'))
+        return parser
+
+    def test_list_walks_all_pages_past_the_default_page(self):
+        pages = [
+            {'items': [{'canonical_name': f'r{i:02d}'} for i in range(50)], 'next': 'r49'},
+            {'items': [{'canonical_name': f'r{i:02d}'} for i in range(50, 73)], 'next': None},
+        ]
+        with patch.object(repos.intake, 'request', side_effect=pages) as request:
+            result = repos.execute(self.parser().parse_args(['repos', 'list']))
+        self.assertEqual(result['total'], 73)
+        self.assertIsNone(result['next'])
+        self.assertEqual([row['canonical_name'] for row in result['items']], [f'r{i:02d}' for i in range(73)])
+        self.assertIn('limit=50', request.call_args_list[0].args[1])
+        self.assertIn('after=r49', request.call_args_list[1].args[1])
+
+    def test_list_limit_returns_one_page_with_cursor(self):
+        page = {'items': [{'canonical_name': 'a'}], 'next': 'a'}
+        with patch.object(repos.intake, 'request', return_value=page) as request:
+            result = repos.execute(self.parser().parse_args(['repos', 'list', '--limit', '1']))
+        self.assertEqual(result, {'items': [{'canonical_name': 'a'}], 'next': 'a', 'total': 1})
+        self.assertIn('limit=1', request.call_args.args[1])
+        with self.assertRaisesRegex(ValueError, '--limit must be between 1 and 100'):
+            repos.execute(self.parser().parse_args(['repos', 'list', '--limit', '101']))
+
+    def test_list_rejects_unexpected_shapes_and_duplicate_items(self):
+        with patch.object(repos.intake, 'request', return_value={'repos': []}):
+            with self.assertRaisesRegex(ValueError, 'Unexpected repos list response'):
+                repos.execute(self.parser().parse_args(['repos', 'list']))
+        pages = [{'items': [{'canonical_name': 'a'}], 'next': 'a'}, {'items': [{'canonical_name': 'a'}], 'next': None}]
+        with patch.object(repos.intake, 'request', side_effect=pages):
+            with self.assertRaisesRegex(ValueError, 'Duplicate repos list item'):
+                repos.execute(self.parser().parse_args(['repos', 'list']))
+
+    def test_add_creates_entry_in_one_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fields = Path(tmp) / 'repo.json'
+            fields.write_text(json.dumps({'canonical_url': 'https://github.com/alexeygrigorev/telegram-bridge', 'purpose': 'Telegram bridge'}))
+            with patch.object(repos.intake, 'request', return_value={'repo': {}}) as request:
+                repos.execute(self.parser().parse_args(['repos', 'add', 'alexeygrigorev/telegram-bridge', '--file', str(fields)]))
+            self.assertEqual(request.call_args.args,
+                             ('PATCH', '/api/repos/alexeygrigorev%2Ftelegram-bridge',
+                              {'canonical_url': 'https://github.com/alexeygrigorev/telegram-bridge', 'purpose': 'Telegram bridge'}))
+
+    def test_add_requires_canonical_url_and_valid_name(self):
+        parser = self.parser()
+        with tempfile.TemporaryDirectory() as tmp:
+            fields = Path(tmp) / 'repo.json'
+            fields.write_text(json.dumps({'purpose': 'no url'}))
+            with self.assertRaisesRegex(ValueError, 'Creating a registry entry requires: canonical_url'):
+                repos.execute(parser.parse_args(['repos', 'add', 'Example/site', '--file', str(fields)]))
+            fields.write_text(json.dumps({'canonical_url': 'http://insecure.example/site'}))
+            with self.assertRaisesRegex(ValueError, 'canonical_url must be an https:// URL'):
+                repos.execute(parser.parse_args(['repos', 'add', 'Example/site', '--file', str(fields)]))
+        with tempfile.TemporaryDirectory() as tmp:
+            fields = Path(tmp) / 'repo.json'
+            fields.write_text(json.dumps({'canonical_url': 'https://github.com/Example/site'}))
+            with patch.object(repos.intake, 'request') as request:
+                with self.assertRaisesRegex(ValueError, 'Invalid repository name'):
+                    repos.execute(parser.parse_args(['repos', 'add', 'bare-name', '--file', str(fields)]))
+                request.assert_not_called()
+
+    def test_field_validation_is_loud_about_legacy_and_bad_values(self):
+        cases = [
+            ({'label': 'x', 'canonical': 'y'}, 'Unknown repository fields: canonical, label'),
+            ({'canonical_url': 'https://github.com/E/s', 'status': 'duplicate'}, 'requires duplicate_of'),
+            ({'canonical_url': 'https://github.com/E/s', 'status': 'duplicate', 'duplicate_of': 'E/s'}, 'must differ from the entry name'),
+            ({'canonical_url': 'https://github.com/E/s', 'duplicate_of': 'E/other'}, 'duplicate_of requires status'),
+            ({'canonical_url': 'https://github.com/E/s', 'status': 'zombie'}, 'status must be one of'),
+            ({'canonical_url': 'https://github.com/E/s', 'domains': ['bad_host!']}, 'domains must be a list'),
+            ({'canonical_url': 'https://github.com/E/s', 'aliases': ['bad alias']}, 'aliases must be a list'),
+            ({'canonical_url': 'https://github.com/E/s', 'metadata': []}, 'metadata must be a JSON object'),
+            ({'canonical_url': 'https://github.com/E/s', 'purpose': 'x' * 2001}, 'purpose must be a string'),
+        ]
+        for payload, expected in cases:
+            with self.subTest(expected=expected):
+                with self.assertRaisesRegex(ValueError, expected):
+                    repos.validate_repo_fields(payload, name='E/s')
+
+    def test_edit_missing_repo_points_at_add(self):
+        def raise_404(method, path, payload=None):
+            raise intake.IntakeHTTPError(404, 'repo_not_found')
+        with tempfile.TemporaryDirectory() as tmp:
+            fields = Path(tmp) / 'repo.json'
+            fields.write_text(json.dumps({'purpose': 'x'}))
+            with patch.object(repos.intake, 'request', side_effect=raise_404):
+                with self.assertRaisesRegex(ValueError, r'repo_missing.*hub repos add Example/site --file'):
+                    repos.execute(self.parser().parse_args(['repos', 'edit', 'Example/site', '--file', str(fields)]))
+
+    def test_show_missing_repo_points_at_add(self):
+        def raise_404(method, path, payload=None):
+            raise intake.IntakeHTTPError(404, 'repo_not_found')
+        with patch.object(repos.intake, 'request', side_effect=raise_404):
+            with self.assertRaisesRegex(ValueError, r'repo_not_found.*hub repos add'):
+                repos.execute(self.parser().parse_args(['repos', 'show', 'Example/site']))
+
+    def test_refresh_is_refused_loudly_on_hub2(self):
+        with patch.object(repos.intake, 'request', return_value={'items': [], 'next': None}):
+            with self.assertRaisesRegex(ValueError, r'disabled on Hub2.*no POST /api/repos/refresh route'):
+                repos.execute(self.parser().parse_args(['repos', 'refresh', '--machine', 'host', '--root', '/tmp']))
+
+    def test_refresh_keeps_legacy_hub1_shape(self):
+        with patch.object(repos.intake, 'request', return_value={'repos': []}), \
+                patch.object(repos, 'scan_roots', return_value=['/tmp']), \
+                patch.object(repos, 'scan_all', return_value=[]) as scan_all:
+            result = repos.execute(self.parser().parse_args(['repos', 'refresh', '--machine', 'host', '--root', '/tmp']))
+        self.assertEqual(result['scanned'], 0)
+        scan_all.assert_called_once()
+
+    def test_unexpected_refresh_shape_is_loud(self):
+        with patch.object(repos.intake, 'request', return_value={'unexpected': True}):
+            with self.assertRaisesRegex(ValueError, 'Unexpected registry response for repos refresh'):
+                repos.execute(self.parser().parse_args(['repos', 'refresh', '--machine', 'host', '--root', '/tmp']))
+
+    def test_seed_and_refresh_post_404_names_the_missing_route(self):
+        def raise_404(method, path, payload=None):
+            raise intake.IntakeHTTPError(404, 'not_found')
+        with patch.object(repos.intake, 'request', side_effect=raise_404):
+            with self.assertRaisesRegex(ValueError, 'Hub2 has no POST /api/repos/seed'):
+                repos._post_batch('/api/repos/seed', [])
+            with self.assertRaisesRegex(ValueError, 'Hub2 has no POST /api/repos/refresh'):
+                repos._post_batch('/api/repos/refresh', [])
+
+    def test_metadata_size_and_domain_limit_are_enforced(self):
+        big = {'k': 'x' * 4097}
+        with self.assertRaisesRegex(ValueError, 'metadata must be a JSON object of at most 4096'):
+            repos.validate_repo_fields({'canonical_url': 'https://github.com/E/s', 'metadata': big})
+        with self.assertRaisesRegex(ValueError, 'domains must be a list'):
+            repos.validate_repo_fields({'canonical_url': 'https://github.com/E/s', 'domains': ['ok.example'] * 33})
 
 class MultiHostRepoTests(unittest.TestCase):
     runner = RepoTests.runner
