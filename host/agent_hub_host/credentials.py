@@ -179,18 +179,19 @@ def materialize_current(bundle, home, dest, expected_generation, *, check_only=F
                 raise ValueError('Invalid scoped credential state')
             result[key] = item
         return result
+    missing = object()
     try:
         state = json.loads(private_fs.read_bytes(dest / STATE_FILE, 65536), object_pairs_hook=unique)
     except FileNotFoundError:
-        state = None
+        state = missing
     except (ValueError, OSError):
         raise ValueError('Scoped credential state unavailable') from None
-    if state is not None and (not isinstance(state, dict) or set(state) != {'generation','digests'}
+    if state is not missing and (not isinstance(state, dict) or set(state) != {'generation','digests'}
             or type(state.get('generation')) is not int or not 0 <= state['generation'] <= 2**53-1
             or not isinstance(state.get('digests'), dict) or set(state['digests']) != {path}
             or not isinstance(state['digests'][path], str) or not re.fullmatch('[0-9a-f]{64}', state['digests'][path])):
         raise ValueError('Invalid scoped credential state')
-    if state is not None and state['generation'] > expected_generation:
+    if state is not missing and state['generation'] > expected_generation:
         raise ValueError('Scoped credential generation conflict')
     target = home / path
     try:
@@ -209,9 +210,9 @@ def materialize_current(bundle, home, dest, expected_generation, *, check_only=F
                     raise ValueError('Scoped credential file too large')
     except FileNotFoundError:
         local = None
-    if state is None and local is not None and local != data:
+    if state is missing and local is not None and local != data:
         raise ValueError('Scoped credential origin unavailable')
-    if state is not None and state['generation'] == expected_generation:
+    if state is not missing and state['generation'] == expected_generation:
         if state['digests'][path] != digest or local is not None and local != data:
             raise ValueError('Scoped credential current generation changed')
     result = {'status': 'in_step' if local == data else 'materialized', 'generation': expected_generation}
