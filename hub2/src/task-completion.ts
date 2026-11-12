@@ -31,6 +31,9 @@ export type CompletionAction = {
   state: 'pending' | 'started' | 'superseded' | 'refused' | 'delivered' | 'failed' | 'skipped';
   key: string; tries: number; next_action_at: number | null; last_reason?: string | null;
   session_id?: string; message_id?: string; recipient?: string;
+  /** Newest intake event when Hub first acted on this continuation; every
+   * retry renders the same snapshot from the append-only journal. */
+  snapshot_seq?: number;
 };
 export type CompletionRecord = {
   controlled: true; session_id: string; outcome: 'claimed' | 'unfinished'; reason: string;
@@ -147,7 +150,19 @@ function snapshotText(intakeId: string, snapshot: ContinuationSnapshot, budget: 
   return text + (lines.length ? label + (omitted ? tail : '') + lines.join('') : omitted ? tail : '');
 }
 
-export function continuationPrompt(intakeId: string, depth: number, previousSession: string, reason: string, original: string, snapshot?: ContinuationSnapshot): string {
+/** Escaped-JSON bytes a continuation prompt may take so that the launch spec
+ * (`launchWithoutPrompt` plus prompt) still carries the complete completion
+ * contract within the Machine limit, as the original start did. */
+export function continuationBudget(launchWithoutPrompt: unknown, intakeId: string, criteria: string[]): number {
+  const launch = bytes(JSON.stringify({ ...(launchWithoutPrompt as object), prompt: '' }));
+  const contract = jsonBytes(completionContract(intakeId, '00000000-0000-0000-0000-000000000000', criteria, 6000));
+  // Slack covers fields the start recomputes (deadline digits, resolved effort).
+  return Math.min(PROMPT_LIMIT, LAUNCH_SPEC_LIMIT - LAUNCH_MARGIN - launch - contract - 64);
+}
+
+/** The continuation prompt within `budget` escaped-JSON bytes (which also
+ * bounds its UTF-8 size), the unit the Machine launch limit counts. */
+export function continuationPrompt(intakeId: string, depth: number, previousSession: string, reason: string, original: string, snapshot?: ContinuationSnapshot, budget = PROMPT_LIMIT): string {
   const intro = CONTINUATION_MARKER
     + `Hub started this session automatically (continuation ${depth} of at most ${MAX_AUTO_CONTINUATIONS}) because session ${previousSession} ended without completing intake ${intakeId} (${reason}). `
     + `Before acting, read the current state: hub intake context ${intakeId} (status, current context and the newest events) and hub intake show ${intakeId} (status and acceptance criteria). `
@@ -156,9 +171,11 @@ export function continuationPrompt(intakeId: string, depth: number, previousSess
   const truncated = `\n[truncated by Hub; full task: hub intake show ${intakeId}]`;
   // A clipped original keeps exactly one truncation marker across continuations.
   const clipped = original.endsWith(truncated), task = clipped ? original.slice(0, -truncated.length) : original;
-  const room = PROMPT_LIMIT - bytes(intro + CONTINUATION_END), mark = clipped ? bytes(truncated) : 0;
-  const state = snapshot ? snapshotText(intakeId, snapshot, Math.min(SNAPSHOT_MAX, Math.max(SNAPSHOT_MIN, room - bytes(task) - mark))) : '';
-  const body = clip(task, room - bytes(state) - mark, bytes, truncated);
+  const room = Math.min(PROMPT_LIMIT, budget) - jsonBytes(intro + CONTINUATION_END) - jsonBytes(truncated);
+  // The snapshot yields to the original task, but always keeps a useful minimum.
+  const share = Math.min(SNAPSHOT_MAX, Math.max(Math.min(SNAPSHOT_MIN, Math.floor(room / 2)), room - jsonBytes(task)));
+  const state = snapshot && share > 0 ? snapshotText(intakeId, snapshot, share) : '';
+  const body = clip(task, room - jsonBytes(state), jsonBytes, truncated);
   return intro + state + CONTINUATION_END + body + (clipped && !body.endsWith(truncated) ? truncated : '');
 }
 

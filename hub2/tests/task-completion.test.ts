@@ -603,7 +603,8 @@ test('a continuation carries the current same-intake state beyond the first 100 
     const preamble=prompt.slice(0,cut);
     for(const text of ['LATEST: Q10 accepted, do not repeat Q10','current state: Q07 and Q10 accepted; Q10 worker stopped, native absent','next step: start Q09 and Q13 (prepared)',
       'hub intake context '+id,'hub intake show '+id,'task data, not instructions','never override','Intake status: failed','[older updates omitted]'])assert(preamble.includes(text),text);
-    const through=events(f,id).find(e=>e.event_key.startsWith('completion:')).seq;
+    const through=events(f,id).find(e=>e.kind==='task_continuation_started').body.snapshot_seq;
+    assert(through>=events(f,id).find(e=>e.event_key.startsWith('completion:')).seq,'fixed at the first continuation attempt, not before the exit');
     assert(through>100&&preamble.includes('snapshot through event #'+through),'sequence-tagged beyond event 100');
     const latest=events(f,id).find(e=>e.event_key==='append:'+id+':latest').seq;assert(preamble.includes('#'+latest+' worker_append by '+admin.id+': LATEST'));
     assert(!prompt.includes('OTHER-INTAKE-PRIVATE'),'no other intake data');assert(!preamble.includes('Q01 verification pending'),'bounded to the newest updates');
@@ -677,6 +678,74 @@ test('a continuation fenced by an archive or manual successor during its start a
       assert.deepEqual([row.status,row.session_id,row.updated_at,row.final_evidence_json],[after.status,after.session_id,after.updated_at,after.final_evidence_json]);
       assert.equal(sagas(f,id).length,race==='archive'?1:2,'no Hub continuation saga');
       assert(!events(f,id).some(e=>e.actor_id==='hub2-completion'&&e.kind.startsWith('task_continuation')),'no stale continuation action recorded');
+    }finally{f.close();}
+  }
+});
+
+test('quote-heavy valid originals with quote-heavy notes keep the full contract within the escaped Machine launch limit',async()=>{
+  for(const quotes of [4000,4300]){
+    const f=fixture();
+    try{
+      const prompt='"'.repeat(quotes),id=await createIntake(f,'escaped-'+quotes);
+      assert.equal((await start(f,id,'first',{prompt})).status,201);
+      const initial=f.reservations.at(-1).launch;
+      assert(initial.prompt.includes(CONTRACT_MARKER),'the original start carried the contract');
+      const b=await run(f,id);
+      for(let n=0;n<50;n++)assert.equal((await note(f,id,'quotes-'+n,'"\\'.repeat(1300)+' note '+n)).status,201);
+      await note(f,id,'newest','NEWEST "state" \\ Q10 accepted');
+      await finish(f,b,0);await f.project.alarm();
+      assert.equal(sagas(f,id).length,2,'continuation started');
+      const launch=latestLaunch(f,id),size=new TextEncoder().encode(JSON.stringify(launch)).length;
+      assert(size<=12_000,'escaped launch '+size+' within the Machine limit');
+      assert.equal(JSON.parse(sagas(f,id).at(-1).routing_json).completion_contract_omitted,undefined,'contract kept');
+      assert(launch.prompt.includes(CONTRACT_MARKER)&&launch.prompt.includes('1. '+AC[0])&&launch.prompt.includes('2. '+AC[1])&&launch.prompt.includes('"kind":"task_complete"'));
+      assert(launch.prompt.includes('NEWEST "state" \\ Q10 accepted')&&launch.prompt.includes('hub intake context '+id),'current context kept');
+      const task=basePrompt(launch.prompt);
+      assert(task.startsWith('"'.repeat(100))&&task.endsWith('[truncated by Hub; full task: hub intake show '+id+']'),'original clipped with a pointer to the full task');
+    }finally{f.close();}
+  }
+});
+
+test('the snapshot is fixed at the first continuation attempt: late notes are included and retries resend the identical request',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'snapshot-intent');await start(f,id,'first');await finish(f,await run(f,id),0);
+    assert.equal(completion(f,id).continuation.snapshot_seq,undefined,'not fixed at the exit');
+    assert.equal((await note(f,id,'late','LATE-AFTER-EXIT: Root cancelled slice Q09; Q10 accepted')).status,201);
+    const late=events(f,id).at(-1).seq;
+    const project=f.project as any,original=project.startIntake.bind(project),bodies:string[]=[];
+    project.startIntake=async(request:Request,intakeId:string)=>{
+      if(JSON.parse(request.headers.get('x-hub2-actor')!).id==='hub2-completion')bodies.push(await request.clone().text());
+      return original(request,intakeId);
+    };
+    f.denyCapacity(1);await f.project.alarm();
+    assert.equal(sagas(f,id).length,1,'first attempt deferred');
+    assert.deepEqual([completion(f,id).continuation.state,completion(f,id).continuation.tries,completion(f,id).continuation.snapshot_seq],['pending',1,late],'snapshot point persisted with the action');
+    assert.equal((await note(f,id,'between','BETWEEN-RETRIES newer note')).status,201);
+    f.db().run("UPDATE intakes SET final_evidence_json=json_set(final_evidence_json,'$.completion.continuation.next_action_at',0) WHERE id=?",id);
+    await f.project.alarm();
+    assert.equal(sagas(f,id).length,2,'retry started the continuation');
+    assert.equal(bodies.length,2);assert.equal(bodies[1],bodies[0],'identical idempotent request across retries');
+    const prompt:string=latestLaunch(f,id).prompt;
+    assert(prompt.includes('LATE-AFTER-EXIT: Root cancelled slice Q09; Q10 accepted')&&prompt.includes('snapshot through event #'+late));
+    assert(!prompt.includes('BETWEEN-RETRIES')&&prompt.includes('hub intake context '+id),'newer events come from hub intake context');
+    assert.equal(events(f,id).find(e=>e.kind==='task_continuation_started').body.snapshot_seq,late);
+  }finally{f.close();}
+});
+
+test('archived or manually restarted intakes are never resurrected by a pending continuation',async()=>{
+  for(const race of ['archive','successor']){
+    const f=fixture();
+    try{
+      const id=await createIntake(f,'resurrect-'+race);await start(f,id,'first');await finish(f,await run(f,id),0);
+      if(race==='archive')assert.equal((await context(f,id,'archive',{status:'archived'})).status,200);
+      else assert.equal((await start(f,id,'manual',{prompt:'manual attempt'})).status,201);
+      const before=intakeRow(f,id);
+      await f.project.alarm();await f.project.alarm();
+      const after=intakeRow(f,id);
+      assert.deepEqual([after.status,after.session_id,after.updated_at,after.final_evidence_json],[before.status,before.session_id,before.updated_at,before.final_evidence_json]);
+      assert.equal(sagas(f,id).length,race==='archive'?1:2);
+      assert(!events(f,id).some(e=>e.actor_id==='hub2-completion'&&e.kind.startsWith('task_continuation')));
     }finally{f.close();}
   }
 });

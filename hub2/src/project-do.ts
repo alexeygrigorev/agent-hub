@@ -14,7 +14,7 @@ import { HOST_INVENTORY_LOST_MS } from './session-liveness';
 import { PROJECT_WORK_SCHEMA, ProjectWork, type ProjectWorkHooks } from './project-work';
 import {
   COMPLETION_ACTOR, MAX_AUTO_CONTINUATIONS, MAX_CONTINUATION_TRIES, MAX_DELIVERY_TRIES,
-  LAUNCH_SPEC_LIMIT, basePrompt, completionClaim, continuationPrompt, deliveryBody, promptWithContract, retryDelay, stripCompletion,
+  LAUNCH_SPEC_LIMIT, basePrompt, completionClaim, continuationBudget, continuationPrompt, deliveryBody, promptWithContract, retryDelay, stripCompletion,
   type CompletionClaim, type CompletionRecord, type ContinuationSnapshot,
 } from './task-completion';
 import type { Actor, Hub2Env, JsonRecord } from './types';
@@ -1273,10 +1273,15 @@ export class ProjectDO {
 
   /** Bounded, durable follow-up of terminal attempts, driven by the project alarm. */
   private async runCompletionActions(now:number):Promise<void>{
-    for(const intake of this.completionDue(now)){
-      const record=(this.parse(intake.final_evidence_json??'{}') as JsonRecord).completion as CompletionRecord|undefined;
+    for(let intake of this.completionDue(now)){
+      let record=(this.parse(intake.final_evidence_json??'{}') as JsonRecord).completion as CompletionRecord|undefined;
       if(!record||record.controlled!==true||record.session_id!==intake.session_id
         ||!this.completionControlled(this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id=?',record.session_id)))continue;
+      if(record.continuation?.state==='pending'&&record.continuation.snapshot_seq===undefined){
+        const fixed=this.fixContinuationSnapshot(intake);
+        if(!fixed)continue;
+        ({intake,record}=fixed);
+      }
       try{
         if(record.continuation?.state==='pending')await this.continueTask(intake,record);
         else if(record.delivery?.state==='pending')await this.deliverOutcome(intake,record);
@@ -1301,13 +1306,28 @@ export class ProjectDO {
     }
   }
 
-  /** Bounded state of exactly this intake, as of the event that recorded the
-   * terminal attempt's outcome. Read before any await and fixed per attempt, so
-   * a retried continuation start sends the same request; newer events stay
-   * available through `hub intake context`. */
-  private continuationSnapshot(intake:IntakeRow,saga:SagaRow):ContinuationSnapshot{
-    const through=this.db.one<{seq:number}>('SELECT seq FROM intake_events WHERE task_id=? AND event_key=?',intake.id,'completion:'+saga.operation_id)?.seq
-      ??this.db.one<{seq:number|null}>('SELECT MAX(seq) AS seq FROM intake_events WHERE task_id=?',intake.id)?.seq??0;
+  private latestSeq(intakeId:string):number{
+    return this.db.one<{seq:number|null}>('SELECT MAX(seq) AS seq FROM intake_events WHERE task_id=?',intakeId)?.seq??0;
+  }
+
+  /** Durably fix the snapshot point at Hub's first action on a pending
+   * continuation (CAS on the current attempt), so notes written after the exit
+   * are included and every retry sends the identical start request. Returns
+   * the row this write produced, read in the same synchronous turn. */
+  private fixContinuationSnapshot(intake:IntakeRow):{intake:IntakeRow;record:CompletionRecord}|undefined{
+    const seq=this.latestSeq(intake.id);
+    if(!this.saveCompletion(intake,next=>{
+      if(next.continuation?.state==='pending'&&next.continuation.snapshot_seq===undefined)next.continuation.snapshot_seq=seq;
+    }))return undefined;
+    const current=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',intake.id);
+    const record=current?(this.parse(current.final_evidence_json??'{}') as JsonRecord).completion as CompletionRecord|undefined:undefined;
+    return current&&record?.continuation?.snapshot_seq===seq?{intake:current,record}:undefined;
+  }
+
+  /** Bounded state of exactly this intake through event `through`. The journal
+   * is append-only, so the same point always renders the same snapshot; newer
+   * events stay available through `hub intake context`. */
+  private continuationSnapshot(intake:IntakeRow,through:number):ContinuationSnapshot{
     const context=this.db.one<{body_json:string}>("SELECT body_json FROM intake_events WHERE task_id=? AND kind='intake_context_updated' AND seq<=? ORDER BY seq DESC LIMIT 1",intake.id,through);
     const rows=this.db.all<IntakeEventRow>(`SELECT seq,actor_id,kind,body_json,at FROM intake_events WHERE task_id=? AND seq<=?
       AND kind IN ('created','worker_append','intake_updated','intake_context_updated') ORDER BY seq DESC LIMIT 51`,intake.id,through);
@@ -1342,8 +1362,12 @@ export class ProjectDO {
         ...(launch.managed_credential_label!==undefined?{managed_credential_label:launch.managed_credential_label}:{}),
         ...(Array.isArray(route?.required_capabilities)?{required_capabilities:route!.required_capabilities}:{}),
         // A session killed at its deadline gets more time, within the start limit.
-        timeout_seconds:record.reason==='deadline_exceeded'?Math.min(7200,timeout*2):timeout,
-        prompt:continuationPrompt(intake.id,depth,record.session_id,record.reason,basePrompt(String(launch.prompt??''))||intake.text,this.continuationSnapshot(intake,saga))};
+        timeout_seconds:record.reason==='deadline_exceeded'?Math.min(7200,timeout*2):timeout};
+      // Budget the whole continuation launch (same fields the start builds) in
+      // escaped-JSON bytes so the complete contract still fits the Machine limit.
+      const criteria=this.parse(intake.acceptance_criteria_json),next={...launch,workspace:body.workspace,timeout_seconds:body.timeout_seconds,prompt:''};
+      const budget=continuationBudget(next,intake.id,Array.isArray(criteria)?criteria.map(String):[]);
+      body.prompt=continuationPrompt(intake.id,depth,record.session_id,record.reason,basePrompt(String(launch.prompt??''))||intake.text,this.continuationSnapshot(intake,action.snapshot_seq??this.latestSeq(intake.id)),budget);
       const actor:Actor={id:COMPLETION_ACTOR,kind:'agent',resource_id:intake.project,scopes:['session:start','intake:read','project:'+intake.project]};
       try{
         const response=await this.startIntake(new Request('https://project.internal/api/intakes/'+encodeURIComponent(intake.id)+'/start',{method:'POST',
@@ -1357,7 +1381,7 @@ export class ProjectDO {
     if(outcome.state==='started'){
       // The start transaction replaced the intake's terminal record; the event keeps it.
       this.transaction(()=>this.appendEvent(intake.id,action.key,COMPLETION_ACTOR,'task_continuation_started',
-        {previous_session_id:record.session_id,session_id:outcome.session_id??null,depth:record.depth+1,reason:record.reason},Date.now()));
+        {previous_session_id:record.session_id,session_id:outcome.session_id??null,depth:record.depth+1,reason:record.reason,snapshot_seq:action.snapshot_seq??null},Date.now()));
       return;
     }
     const tries=action.tries+1,exhausted=outcome.state==='refused'||(outcome.state==='retry'&&tries>=MAX_CONTINUATION_TRIES);
