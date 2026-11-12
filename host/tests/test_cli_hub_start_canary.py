@@ -4,7 +4,8 @@ Mail renders to a sink; no real msmtp/sendmail is ever called.
 
 Run: scripts/capped-test-run.sh -- scripts/with-temp-home.sh -- python3 -m unittest host.tests.test_cli_hub_start_canary
 """
-import json, os, pathlib, shutil, stat, subprocess, sys, tempfile, time, unittest
+import http.server, json, os, pathlib, shutil, socket, stat, subprocess, sys, tempfile, threading, time, unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "hub-start-canary.sh"
@@ -205,12 +206,67 @@ sys.exit(0)
 ''' % sys.executable
 
 
+class FakeHealthServer:
+    """Owned loopback /health fixture. Every canary run in this module is pointed here,
+    so the health preflight never reaches the production endpoint."""
+
+    def __init__(self):
+        self.status = 200
+        self.body = json.dumps({"ok": True, "service": "hub2"}).encode()
+        self.drip_s = None
+        self.requests = 0
+        self.stop = threading.Event()
+        fixture = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                fixture.requests += 1
+                fixture.last_headers = dict(self.headers)
+                fixture.last_path = self.path
+                self.send_response(fixture.status)
+                self.send_header("Content-Type", "application/json")
+                if fixture.drip_s is None:
+                    self.send_header("Content-Length", str(len(fixture.body)))
+                self.end_headers()
+                if fixture.drip_s is None:
+                    self.wfile.write(fixture.body)
+                    return
+                # Valid JSON prefix, one byte at a time: each read is fast, the total is not.
+                for ch in b'{"ok": true, "pad": "' + b"x" * 1000:
+                    if fixture.stop.wait(fixture.drip_s):
+                        return
+                    try:
+                        self.wfile.write(bytes([ch])); self.wfile.flush()
+                    except OSError:
+                        return
+
+            def log_message(self, *_args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.url = "http://127.0.0.1:%d/health" % self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.stop.set()
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(5)
+
+
 class CanaryTest(unittest.TestCase):
     def setUp(self):
         base = ROOT / ".local" / "tmp"
         base.mkdir(parents=True, exist_ok=True)
         self.tmp = pathlib.Path(tempfile.mkdtemp(prefix="hub-canary-test.", dir=base))
         self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.health = FakeHealthServer()
+        self.addCleanup(self.health.close)
+        env_patch = mock.patch.dict(os.environ, {"HUB_CANARY_HEALTH_URL": self.health.url})
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
         (self.tmp / "fake_hub.py").write_text(FAKE_HUB)
         (self.tmp / "fake_a.py").write_text(FAKE_A)
         self.mailer = self.tmp / "mailer.sh"
@@ -257,7 +313,7 @@ class CanaryTest(unittest.TestCase):
             HUB_CANARY_POLL_S="0.02", HUB_CANARY_CONVERGE_TIMEOUT_S="1.5",
             HUB_CANARY_RUNNING_TIMEOUT_S=running_timeout, HUB_CANARY_CAPTURE_TIMEOUT_S=capture_timeout,
             HUB_CANARY_STOP_TIMEOUT_S=stop_timeout, HUB_CANARY_CLEANUP_BUDGET_S=cleanup_budget,
-            HUB_CANARY_CMD_TIMEOUT_S="10",
+            HUB_CANARY_CMD_TIMEOUT_S="10", HUB_CANARY_HEALTH_URL=self.health.url,
         )
         env["FAKE_PROMPT"] = mode_prompt or ("Reply CANARY-OK and exit" if ("full" in args or "--deploy-gate" in args) else "printf CANARY-OK; sleep 30")
         env.update(extra)
@@ -515,6 +571,140 @@ class CanaryTest(unittest.TestCase):
         self.run_canary("capture_empty", "--mode", "shell")
         self.run_canary("capture_empty", "--mode", "full")
         self.assertEqual(self.mails(), [])
+
+    # ---- public /health body preflight (Fable 0.3)
+    def assert_no_health_leak(self, r, *extra):
+        for text in (r.stdout, r.stderr, *(self.mails())):
+            for secret in ("127.0.0.1", self.health.url, "dispatch_enabled", '"bootstrap"', "service", *extra):
+                self.assertNotIn(secret, text)
+
+    def test_bootstrap_health_body_fails_twice_and_renders_exactly_one_critical_alert(self):
+        self.health.body = json.dumps({"status": "bootstrap", "dispatch_enabled": False}).encode()
+        verdicts = []
+        for _ in range(2):
+            r, v = self.run_canary("ok", "--mode", "shell")
+            self.assertEqual(r.returncode, 1)
+            self.assertEqual((v["ok"], v["stage"], v["reason"], v["cleanup"], v["session_id"]),
+                             (False, "health", "health_status_bootstrap", "not_needed", None))
+            self.assertEqual(json.loads(r.stderr.strip().splitlines()[-1]), v)
+            self.assertNotIn("sessions start", self.calls())
+            self.assertFalse((self.tmp / "started").exists())
+            self.assert_no_health_leak(r)
+            verdicts.append(v)
+        self.assertEqual(self.health.requests, 2)
+        self.assertEqual(self.health.last_path, "/health")
+        self.assertNotIn("Authorization", self.health.last_headers)
+        self.assertNotIn("Cookie", self.health.last_headers)
+        (mail,) = self.mails()
+        self.assertTrue(mail.strip().splitlines()[0].endswith("-- dev@dtcdev.click"), mail)
+        self.assertIn("To: dev@dtcdev.click\n", mail)
+        self.assertNotIn("orin", mail)
+        self.assertIn("Subject: [CRITICAL] Hub start canary (shell) failing at stage health: health_status_bootstrap\n", mail)
+        self.assertIn("Failing stage: health\nReason: health_status_bootstrap\n", mail)
+        self.assertIn("Consecutive failures: 2\n", mail)
+        self.assertIn("Run id: " + verdicts[1]["run_id"], mail)
+        self.assertIn("Incident: " + verdicts[1]["run_id"], mail)
+        self.assertIn("Session cleanup: not_needed\n", mail)
+        self.assertFalse((self.tmp / "REAL_MSMTP_CALLED").exists())
+        state = json.loads((self.state / "state-shell.json").read_text())
+        self.assertEqual((state["failures"], state["incident_open"]), (2, True))
+        # Dedup holds, then the existing two-success recovery closes the incident once.
+        self.run_canary("ok", "--mode", "shell")
+        self.assertEqual(len(self.mails()), 1)
+        self.health.body = json.dumps({"ok": True, "service": "hub2"}).encode()
+        for _ in range(2):
+            r, v = self.run_canary("ok", "--mode", "shell")
+            self.assertEqual((r.returncode, v["ok"]), (0, True), r.stderr)
+        mails = self.mails()
+        self.assertEqual(len(mails), 2)
+        self.assertIn("[RECOVERED] Hub start canary (shell)", mails[1])
+        self.assertFalse((self.tmp / "REAL_MSMTP_CALLED").exists())
+
+    def test_healthy_body_allows_full_lifecycle_and_deploy_gate_skips_preflight(self):
+        r, v = self.run_canary("ok", "--mode", "shell")
+        self.assertEqual((r.returncode, v["ok"], v["stage"], v["cleanup"]), (0, True, None, "not_needed"), r.stderr)
+        self.assertEqual(self.health.requests, 1)
+        c = self.calls()
+        for needle in ("sessions start", "sessions capture " + SID, "sessions stop", "intake update"):
+            self.assertIn(needle, c)
+        self.assertEqual(list((self.state / "pending").glob("*.json")), [])
+        self.assertEqual(r.stderr, "")
+        self.health.body = json.dumps({"status": "bootstrap", "dispatch_enabled": False}).encode()
+        r, v = self.run_canary("ok", "--deploy-gate", "--mode", "shell")
+        self.assertEqual((r.returncode, v["ok"], v["deploy_gate"]), (0, True, True), r.stderr)
+        self.assertEqual(self.health.requests, 1)
+        self.assertEqual(len(self.mails()), 0)
+
+    def test_health_body_that_is_not_literal_ok_true_fails_closed_with_fixed_reason(self):
+        big_ok = json.dumps({"ok": True, "pad": "y" * 5000}).encode()
+        cases = [
+            (200, b'{"ok": false, "service": "hub2"}', "health_not_ok"),
+            (200, b'{"ok": "true"}', "health_not_ok"),
+            (200, b'{"ok": 1}', "health_not_ok"),
+            (200, b'{"status": "ready", "service": "hub2"}', "health_not_ok"),
+            (200, b'{}', "health_not_ok"),
+            (200, b'[{"ok": true}]', "health_unparseable_json"),
+            (200, b'true', "health_unparseable_json"),
+            (200, b'<html>ok</html>', "health_unparseable_json"),
+            (200, b'{"ok": true', "health_unparseable_json"),
+            (200, b'{"ok": false, "ok": true}', "health_unparseable_json"),
+            (200, b'\xff\xfe{"ok": true}', "health_unparseable_json"),
+            (200, b'', "health_unparseable_json"),
+            (200, big_ok, "health_body_too_large"),
+            (503, b'{"ok": true}', "health_http_status"),
+            (302, b'{"ok": true}', "health_http_status"),
+        ]
+        for status, body, reason in cases:
+            with self.subTest(status=status, body=body[:40]):
+                self.health.status, self.health.body = status, body
+                r, v = self.run_canary("ok", "--mode", "shell")
+                self.assertEqual((r.returncode, v["ok"], v["stage"], v["reason"]), (1, False, "health", reason))
+                self.assertNotIn("sessions start", self.calls())
+                self.assert_no_health_leak(r, "<html>", "yyyy")
+        self.assertEqual(self.health.requests, len(cases))
+        self.assertFalse((self.tmp / "REAL_MSMTP_CALLED").exists())
+
+    def test_health_read_is_bounded_by_total_remaining_active_budget(self):
+        # Each byte arrives well inside any per-read timeout; only a total deadline stops it.
+        self.health.drip_s = 0.05
+        started = time.monotonic()
+        r, v = self.run_canary("ok", "--mode", "shell", HUB_CANARY_ACTIVE_BUDGET_S="0.8")
+        elapsed = time.monotonic() - started
+        self.assertEqual((r.returncode, v["stage"], v["reason"]), (1, "health", "health_timeout"))
+        self.assertLess(elapsed, 4.0)
+        self.assertNotIn("sessions start", self.calls())
+        self.assert_no_health_leak(r)
+
+    def test_health_url_override_is_restricted_and_unreachable_is_sanitized(self):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            closed_port = probe.getsockname()[1]
+        closed = "http://127.0.0.1:%d/health" % closed_port
+        for url, reason in (
+            ("http://hub.dtcdev.click/health", "health_url_invalid"),
+            ("http://10.0.0.1/health", "health_url_invalid"),
+            ("http://localhost:1/health", "health_url_invalid"),
+            ("https://user:pw@127.0.0.1:1/health", "health_url_invalid"),
+            ("%s?x=1" % self.health.url, "health_url_invalid"),
+            (self.health.url.replace("/health", "/api/health"), "health_url_invalid"),
+            ("ftp://127.0.0.1/health", "health_url_invalid"),
+            ("http://127.0.0.1:99999/health", "health_url_invalid"),
+            (closed, "health_unreachable"),
+        ):
+            with self.subTest(url=url):
+                r, v = self.run_canary("ok", "--mode", "shell", HUB_CANARY_HEALTH_URL=url)
+                self.assertEqual((r.returncode, v["stage"], v["reason"]), (1, "health", reason))
+                self.assertNotIn("sessions start", self.calls())
+                self.assert_no_health_leak(r, url, "user:pw")
+        self.assertEqual(self.health.requests, 0)
+
+    def test_production_default_health_url_is_public_hub_endpoint(self):
+        sys.path.insert(0, str(ROOT))
+        from scripts import hub_start_canary as mod
+        self.assertEqual(mod.DEFAULT_HEALTH_URL, "https://hub.dtcdev.click/health")
+        self.assertEqual(mod.Canary.parse_health_url(mod.DEFAULT_HEALTH_URL), ("https", "hub.dtcdev.click", None))
+        self.assertIn("health", mod.STAGES)
+        self.assertLess(mod.STAGES.index("health"), mod.STAGES.index("start"))
 
     # ---- state perms
     def test_state_permissions(self):
@@ -909,7 +1099,8 @@ class CanaryTest(unittest.TestCase):
             f'HUB_CANARY_MACHINE="HOST-1" HUB_CANARY_REPO="owner/repo" '
             f'HUB_CANARY_POLL_S="0.02" HUB_CANARY_CONVERGE_TIMEOUT_S="1.5" '
             f'HUB_CANARY_RUNNING_TIMEOUT_S="1.5" HUB_CANARY_CAPTURE_TIMEOUT_S="1.5" '
-            f'HUB_CANARY_STOP_TIMEOUT_S="1.5" HUB_CANARY_CLEANUP_BUDGET_S="1.5")\n'
+            f'HUB_CANARY_STOP_TIMEOUT_S="1.5" HUB_CANARY_CLEANUP_BUDGET_S="1.5" '
+            f'HUB_CANARY_HEALTH_URL="{self.health.url}")\n'
         )
         forced = str(lib / "hub-deploy-gate-forced.sh")
         for bad_cmd in (
