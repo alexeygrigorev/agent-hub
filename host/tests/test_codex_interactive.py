@@ -68,6 +68,11 @@ def test_managed_execute_prepares_workspace_before_isolated_launch(monkeypatch, 
     bundle = {'label': label, 'provider': 'codex', 'version': '0.163.0', 'revision': revision,
               'files': {}, 'env': {}, 'args': []}
     p.write_json(dest / 'bundle.json', bundle)
+    # provision_managed_home is stubbed, so materialize the synthetic,
+    # non-secret login that profile_logged_in reads for Codex.
+    auth = dest / 'home' / '.codex' / 'auth.json'
+    auth.parent.mkdir(parents=True, mode=0o700)
+    auth.write_text('{"synthetic": true}', encoding='utf-8')
     calls = []
     monkeypatch.setattr(p, 'provision_managed_home', lambda *args: None)
     monkeypatch.setattr(p, 'install_managed_engine_permissions', lambda b, home, trusted_paths: calls.append(('trust', trusted_paths)))
