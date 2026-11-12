@@ -196,6 +196,18 @@ export class AccountDO {
    if(requested&&!repairLease)return error('refresh_permit_mismatch',409);
    const account=this.db.one<Account>('SELECT * FROM account WHERE id=1');if(!account)return error('account_unconfigured',409);
    if(query.get('metadata')==='1')return json({generation:row.generation,provider:account.provider,refresh_mode:account.provider==='zai'?'static':'central'});
+   if(query.has('expected_generation')){
+    // Exact-generation observation for a host release re-pin: synchronous,
+    // never unseals, refreshes or returns material (no awaits below).
+    const raw=query.get('expected_generation')||'';
+    if(requested||[...query.keys()].length!==1||!/^[1-9][0-9]{0,15}$/.test(raw)||!Number.isSafeInteger(Number(raw)))return error('invalid_generation_check',400);
+    if(account.provider!=='claude')return error('account_provider_mismatch',409);
+    if(row.generation!==Number(raw))return error('generation_conflict',409);
+    if(this.db.one('SELECT host_id FROM credential_rejections WHERE host_id=? AND generation=?',machine,row.generation))return error('credential_generation_rejected',409);
+    if(Number(row.refresh_until||0)>Date.now()||row.refresh_owner||row.refresh_lease)return error('refresh_in_progress',409);
+    if(this.hasUnresolvedRefresh(row.generation))return error('refresh_outcome_uncertain',503);
+    return json({generation:row.generation,provider:'claude',status:'current'});
+   }
    if(!repairLease&&this.db.one('SELECT host_id FROM credential_rejections WHERE host_id=? AND generation=?',machine,row.generation))return error('credential_generation_rejected',409);
    const minimum=Number(query.get('min_validity_ms')||0);if(!Number.isSafeInteger(minimum)||minimum<0||minimum>10800000)return error('invalid_access_validity',400);
    let files=await this.unseal(row.sealed,account.provider,row.generation) as Record<string,string>;

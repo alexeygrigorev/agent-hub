@@ -222,7 +222,7 @@ async function maintenanceFixture(options: { expired?: boolean; refuseRefresh?: 
   if (!options.missing) assert.equal((await callAccount('/api/account/credentials', 'PUT', { expected_generation: 0,
     files: { '.claude/.credentials.json': JSON.stringify({ claudeAiOauth: { accessToken: 'synthetic-old-access',
       refreshToken: 'synthetic-old-refresh', expiresAt: Date.now() + (options.expired ? -1000 : 86400000) } }) } })).status, 200);
-  return { ...fixture(account), calls, callAccount };
+  return { ...fixture(account), calls, callAccount, accountDatabase: database };
 }
 
 test('operator maintain refreshes centrally, advances generation, and forces fresh quota without exporting secrets', async () => {
@@ -367,4 +367,92 @@ test('current generation refresh failure also permits proven native recovery', a
   const response = await f.call('/api/engines/import-native', 'POST', nativeBody(2, Date.now() + 60000));
   assert.equal(response.status, 200);
   assert.equal((await response.json() as any).credential_generation, 3);
+});
+
+async function currentRevision() {
+  return ((await (await fixture().call('/api/engines')).json()) as any).engines[0].revision as string;
+}
+
+const generationPath = (generation: unknown, revision: unknown, extra = '') =>
+  `/api/engines/hub-claude/generation?generation=${generation}&revision=${revision}${extra}`;
+
+test('host re-pin generation check is metadata-only and never refreshes even an expired credential', async () => {
+  const revision = await currentRevision();
+  const f = await maintenanceFixture({ expired: true });
+  await f.callAccount('/api/account/hosts', 'PUT', { hosts: ['RMTHZ'] });
+  const response = await f.call(generationPath(1, revision), 'GET', undefined, machine);
+  assert.equal(response.status, 200);
+  const text = await response.text();
+  assert.deepEqual(JSON.parse(text), { label: 'hub-claude', generation: 1, revision, status: 'current' });
+  assert.ok(!text.includes('synthetic-old'), 'no credential material');
+  assert.equal(f.calls.length, 0, 'no provider refresh or probe');
+  const metadata = await (await f.callAccount('/api/account/credentials?metadata=1', 'GET', undefined, machine)).json() as any;
+  assert.equal(metadata.generation, 1, 'generation unchanged');
+  const hosts = await (await f.callAccount('/api/account/hosts', 'GET')).json() as any;
+  assert.equal(hosts.items[0].ack_generation ?? null, null, 'observation never acknowledges');
+});
+
+test('host re-pin generation check binds exact generation, revision, machine and bounded query', async () => {
+  const revision = await currentRevision();
+  const f = await maintenanceFixture();
+  await f.callAccount('/api/account/hosts', 'PUT', { hosts: ['RMTHZ'] });
+  assert.equal((await f.call(generationPath(2, revision), 'GET', undefined, machine)).status, 409);
+  assert.equal((await f.call(generationPath(0, revision), 'GET', undefined, machine)).status, 400);
+  const otherRevision = revision.replace(/^./, revision[0] === 'a' ? 'b' : 'a');
+  const changed = await f.call(generationPath(1, otherRevision), 'GET', undefined, machine);
+  assert.equal(changed.status, 409);
+  assert.equal((await changed.json() as any).error, 'revision_changed');
+  for (const path of [generationPath(1, revision, '&machine=OTHER'), generationPath(1, revision, '&generation=1'),
+    generationPath('1e3', revision), generationPath(1, 'not-a-revision'), '/api/engines/hub-claude/generation?generation=1',
+    generationPath(9007199254740993, revision)])
+    assert.equal((await f.call(path, 'GET', undefined, machine)).status, 400, path);
+  for (const actor of [admin, { id: 'agent:test', kind: 'agent', scopes: ['quota:write'] }, null])
+    assert.equal((await f.call(generationPath(1, revision), 'GET', undefined, actor)).status, 403);
+  const unapproved = { ...machine, id: 'machine:OTHER', resource_id: 'OTHER' };
+  assert.equal((await f.call(generationPath(1, revision), 'GET', undefined, unapproved)).status, 403);
+  assert.equal((await f.call(generationPath(1, revision), 'POST', {}, machine)).status, 404);
+  // The account mode itself refuses any extra or combined query.
+  assert.equal((await f.callAccount('/api/account/credentials?expected_generation=1&min_validity_ms=10800000', 'GET', undefined, machine)).status, 400);
+  assert.equal(f.calls.length, 0);
+});
+
+test('host re-pin generation check refuses rejection, active lease and unresolved refresh', async () => {
+  const revision = await currentRevision();
+  const rejected = await maintenanceFixture();
+  await rejected.callAccount('/api/account/hosts', 'PUT', { hosts: ['RMTHZ'] });
+  await rejected.callAccount('/api/account/credential-rejection', 'POST', { generation: 1, reason: 'provider_unauthorized' }, machine);
+  const refusal = await rejected.call(generationPath(1, revision), 'GET', undefined, machine);
+  assert.equal(refusal.status, 409);
+  assert.equal((await refusal.json() as any).error, 'credential_generation_rejected');
+
+  const leased = await maintenanceFixture();
+  await leased.callAccount('/api/account/hosts', 'PUT', { hosts: ['RMTHZ'] });
+  assert.equal((await leased.callAccount('/api/account/refresh-lease', 'POST', { generation: 1 }, machine)).status, 200);
+  const busy = await leased.call(generationPath(1, revision), 'GET', undefined, machine);
+  assert.equal(busy.status, 409);
+  assert.equal((await busy.json() as any).error, 'refresh_in_progress');
+  assert.equal(leased.calls.length, 0);
+
+  const uncertain = await maintenanceFixture();
+  await uncertain.callAccount('/api/account/hosts', 'PUT', { hosts: ['RMTHZ'] });
+  uncertain.accountDatabase.prepare("INSERT INTO credential_candidates(id,host_id,base_generation,sealed,observed_at,state) VALUES('c1','hub:central',1,'',1,'pending')").run();
+  const unresolved = await uncertain.call(generationPath(1, revision), 'GET', undefined, machine);
+  assert.equal(unresolved.status, 503);
+  assert.equal((await unresolved.json() as any).error, 'refresh_outcome_uncertain');
+  assert.equal(uncertain.calls.length, 0);
+});
+
+test('host re-pin generation check rechecks revision after the account await', async () => {
+  const revision = await currentRevision();
+  let control: ReturnType<typeof fixture>;
+  const account = { fetch: async (request: Request) => {
+    const url = new URL(request.url);
+    assert.equal(url.pathname + url.search, '/api/account/credentials?expected_generation=7');
+    control.database.prepare("INSERT OR REPLACE INTO hub2_engine_rollout(engine,desired_version,latest,rollout_id,target_version,previous_version,canary_machine,state,updated_at) VALUES('claude','2.1.312','9.9.9','r1','9.9.9','2.1.312','RMTHZ','canary_pending',1)").run();
+    return Response.json({ generation: 7, provider: 'claude', status: 'current' });
+  } };
+  control = fixture(account as any);
+  const response = await control.call(generationPath(7, revision), 'GET', undefined, machine);
+  assert.equal(response.status, 409);
+  assert.equal((await response.json() as any).error, 'revision_changed');
 });
