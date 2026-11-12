@@ -130,6 +130,14 @@ A validated `run_in_background:true` Bash `tool_use` paired with its
 Orphan results, mismatched/reused IDs, errors, interruptions, contradictory background/foreground results, and text/input echoes
 cannot prove output.
 
+Claude Code 2.1.322 reports a foreground Bash call with empty output as content
+exactly `(Bash completed with no output)` paired with `stdout:""`, `stderr:""`,
+`interrupted:false`, `isImage:false`, `noOutputExpected:false`, no
+`backgroundTaskId` and `is_error:false`. That exact pair is a recognized
+NONPROOF step: it never proves anything and does not reject a capture that also
+holds a distinct genuine foreground nonce pair. Any other literal, suffix,
+nonempty stdout, changed flag, error, background or reused identity still fails.
+
 For Argon, one capture must contain complete `step_update` tool/run_command
 ACTIVE and DONE frames with the same conversation, step and exact parameters.
 DONE alone is insufficient. Its output must have the native wrapper's anchored
