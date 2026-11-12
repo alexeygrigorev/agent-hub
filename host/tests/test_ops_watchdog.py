@@ -557,7 +557,7 @@ class OpsWatchdogTest(unittest.TestCase):
     def test_uncertain_and_http_failures_replay_the_identical_request(self):
         self.data['start_error'] = 'transport'
         self.assertNotEqual(self.run_ctl('start').returncode, 0)
-        key = (self.state / 'hub_start_pending').read_text().split('\0')[0]
+        key = (self.state / 'hub_start_pending').read_text().split('\0')[1]
         self.data['start_error'] = 'http'  # a 409 is not proof Hub created nothing
         result = self.run_ctl('start')
         self.assertIn('status 409 (no_host_capacity)', result.stdout)
@@ -569,11 +569,59 @@ class OpsWatchdogTest(unittest.TestCase):
         self.assertEqual(re.findall(r'--key (\S+)', starts[-1]), [key])
         self.assertFalse((self.state / 'hub_start_pending').exists())
 
+    def test_empty_or_malformed_pending_request_holds_and_is_never_reminted(self):
+        self.data['start_error'] = 'transport'
+        self.assertNotEqual(self.run_ctl('start').returncode, 0)
+        pending = self.state / 'hub_start_pending'
+        good = pending.read_bytes()
+        fields = good[:-1].split(b'\0')
+        self.assertEqual(fields[0], b'ops-hub-start/v1')
+        key = fields[1]
+        argv = fields[3:]
+
+        def rec(*parts):
+            return b'\0'.join(parts) + b'\0'
+        idx = argv.index(b'--intake-task-id') + 1
+        cases = {
+            'empty': b'',
+            'truncated': good[:-1],
+            'unversioned': rec(*fields[1:]),
+            'future version': rec(b'ops-hub-start/v2', *fields[1:]),
+            'three bare fields': rec(key, fields[2], b'sessions'),
+            'foreign key': rec(fields[0], b'ops-oncall-1794486767000000000', *fields[2:]),
+            'key not in argv': rec(*fields[:3], *[b'ops-orchestrator-1' if a == key else a for a in argv]),
+            'extra flag': rec(*fields[:3], *argv, b'--no-wait'),
+            'other command': rec(*fields[:3], b'sessions', b'stop', *argv[2:]),
+            'other role intake': rec(*fields[:3], *argv[:idx], b'intake-oncall-0002', *argv[idx + 1:]),
+            'oversized': rec(*fields, b'x' * 9000),
+        }
+        self.data['start_error'] = None
+        before = len(self.starts())
+        for name, body in cases.items():
+            with self.subTest(name):
+                pending.write_bytes(body)
+                result = self.run_ctl('start')
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn('corrupt pending Hub start', result.stdout)
+                self.assertIn('never re-minted', result.stdout)
+                self.assertEqual(pending.read_bytes(), body)  # kept for the operator, never deleted
+                self.assertEqual(len(self.starts()), before)  # nothing dispatched to Hub
+        pending.unlink()
+        pending.mkdir()  # not a regular file: still pending, still held
+        result = self.run_ctl('start')
+        self.assertIn('not a regular file', result.stdout)
+        self.assertEqual(len(self.starts()), before)
+        pending.rmdir()
+        pending.write_bytes(good)  # the intact record replays byte-for-byte
+        self.assertEqual(self.run_ctl('start').returncode, 0)
+        self.assertEqual(re.findall(r'--key (\S+)', self.starts()[-1]), [key.decode()])
+        self.assertFalse(pending.exists())
+
     def test_replayed_key_returns_the_session_hub_already_created(self):
         self.data['start_error'] = 'transport'
         self.assertNotEqual(self.run_ctl('start').returncode, 0)
         # The lost response did create the session: the replay must bind to it, not launch another.
-        key = (self.state / 'hub_start_pending').read_text().split('\0')[0]
+        key = (self.state / 'hub_start_pending').read_text().split('\0')[1]
         self.data['hub'] = {'hub-0001': dict(id='hub-0001', state='running', key=key, intake='intake-orch-0001',
                                              native_id='new', workspace=str(self.workspace))}
         self.data['sessions'] = [dict(id='new', tag='task-hub2-hub-0001', workspace=str(self.workspace), phase='running',

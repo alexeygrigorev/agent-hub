@@ -544,7 +544,56 @@ oncall_inbox_stalled() {
 # or the new record, never a torn one. The binding is durable before the pending
 # request is dropped, so one of the two always survives.
 PENDING="$STATE/hub_start_pending"
-has_pending() { [ -s "$PENDING" ]; }
+# Any pending entry, even an empty or unreadable one, is an unconfirmed
+# request: it is never treated as absent and never re-minted. Only a record
+# that passes pending_valid is replayed; anything else holds recovery.
+has_pending() { [ -e "$PENDING" ] || [ -L "$PENDING" ]; }
+PENDING_VERSION="ops-hub-start/v1"
+pending_valid() {  # validates $PENDING (bounded, versioned, exact argv) before any dispatch
+  local other; other=$(role_intake "$OTHER_ROLE" 2>/dev/null) || other=""
+  python3 - "$PENDING" "$PENDING_VERSION" "$ROLE" "$TAG" "$RUNDIR/$SUB" "$other" <<'PY'
+import os,re,stat,sys
+path,version,role,tag,workspace,other=sys.argv[1:7]
+def bad(why):
+    print(why); sys.exit(1)
+try:
+    st=os.lstat(path)
+except OSError as e:
+    bad("unreadable (%s)" % e.strerror)
+if not stat.S_ISREG(st.st_mode): bad("not a regular file")
+if not 0 < st.st_size <= 8192: bad("size %d outside 1..8192" % st.st_size)
+data=open(path,"rb").read()
+if not data.endswith(b"\0"): bad("truncated record")
+try:
+    f=data[:-1].decode("utf-8").split("\0")
+except UnicodeDecodeError:
+    bad("not UTF-8")
+if not 4 <= len(f) <= 32: bad("%d fields" % len(f))
+if f[0]!=version: bad("unknown version %r" % f[0][:40])
+key,engine,argv=f[1],f[2],f[3:]
+if not re.fullmatch(r"ops-%s-[0-9]{10,25}" % re.escape(role),key): bad("key not owned by role %s" % role)
+hub_engine={"opencode":"go","zcodex":"zai"}.get(engine,engine)
+if not re.fullmatch(r"[a-z][a-z0-9-]{0,31}",engine): bad("invalid engine")
+model=[]
+if role=="oncall":
+    if engine!="opencode": bad("unsafe oncall engine")
+    model=["--model","opencode-go/muse-spark-1.3-contributor"]
+elif engine=="antigravity":
+    if len(argv)<9 or argv[8]!="--model" or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/:-]{0,127}",argv[9] if len(argv)>9 else ""):
+        bad("missing or invalid --model")
+    model=["--model",argv[9]]
+head=["sessions","start","--workspace",workspace,"--name",tag,"--engine",hub_engine]+model
+tail=["--purpose","implement","--interactive","--reason","Pinned %s coordinator route" % role,"--intake-task-id"]
+n=len(head)+len(tail)
+if argv[:len(head)]!=head or argv[len(head):n]!=tail: bad("argv does not match the role's start contract")
+rest=argv[n:]
+if len(rest)!=6 or rest[1:]!=["--key",key,"--wait","--timeout","150"]:
+    bad("argv tail does not match the role's start contract")
+intake=rest[0]
+if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{5,127}",intake): bad("invalid intake")
+if other and intake==other: bad("intake belongs to the other role")
+PY
+}
 durable_put() {  # $1 = target, $2 = replace|noclobber; content on stdin
   python3 -c '
 import os,sys,tempfile
@@ -576,9 +625,12 @@ finally: os.close(fd)' "$STATE"
 hub_start() {
   local hub_engine key out err rc parsed hub_id intake other argv=() rec=()
   if has_pending; then
+    local why
+    why=$(pending_valid) || {
+      log "corrupt pending Hub start $PENDING (${why:-validation failed}); it is kept, never re-minted; operator reconcile required; recovery held"
+      return 1; }
     mapfile -d '' rec < "$PENDING"
-    [ "${#rec[@]}" -ge 3 ] && [ -n "${rec[0]}" ] || { log "corrupt pending Hub start $PENDING; recovery held"; return 1; }
-    key="${rec[0]}"; ENGINE="${rec[1]}"; argv=("${rec[@]:2}")
+    key="${rec[1]}"; ENGINE="${rec[2]}"; argv=("${rec[@]:3}")
     log "replaying unconfirmed Hub start $key unchanged (route $ENGINE)"
   else
     # Hub allows one active session per intake, so each role links its own.
@@ -597,7 +649,7 @@ hub_start() {
     # Publish the request durably before sending it. noclobber: a pending
     # request that appeared meanwhile is never overwritten (callers also hold
     # the role lock, so this is a second line of defence).
-    printf '%s\0' "$key" "$ENGINE" "${argv[@]}" | durable_put "$PENDING" noclobber \
+    printf '%s\0' "$PENDING_VERSION" "$key" "$ENGINE" "${argv[@]}" | durable_put "$PENDING" noclobber \
       || { log "cannot record pending Hub start (pending request exists or write failed); recovery held"; return 1; }
   fi
   out="$STATE/hub_start.out"; err="$STATE/hub_start.err"

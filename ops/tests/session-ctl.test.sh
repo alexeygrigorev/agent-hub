@@ -538,6 +538,17 @@ mapfile -t starts < <(grep '^sessions start ' "$FAKE_HUB_START_LOG" | tail -2)
 assert_contains "${starts[1]}" '--intake-task-id intake-oncall-0002'
 assert_contains "${starts[1]}" '--engine go'
 assert_not_contains "${starts[1]}" '--tag'
+# An empty (or otherwise invalid) pending record is still an unconfirmed
+# request: it is kept, recovery holds, and no new key is minted or sent.
+pending_file="$HOME/tmp/agent-reports/oncall/state/hub_start_pending"
+: > "$pending_file"
+starts_before=$(grep -c '^sessions start ' "$FAKE_HUB_START_LOG")
+if output="$(FORCE=1 run_ctl oncall restart 2>&1)"; then status=0; else status=$?; fi
+[[ "$status" -ne 0 ]]
+assert_contains "$output" 'corrupt pending Hub start'
+[[ -e "$pending_file" && ! -s "$pending_file" ]]
+[[ "$(grep -c '^sessions start ' "$FAKE_HUB_START_LOG")" == "$starts_before" ]]
+rm -f "$pending_file"
 
 # Distinct durable role intakes: a missing or shared mapping fails closed
 # before any Hub request, and never falls back to a native start.
