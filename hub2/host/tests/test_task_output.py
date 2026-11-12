@@ -100,14 +100,14 @@ class TaskOutputTest(unittest.TestCase):
         (self.directory/'START.json').write_text('x'*131073)
         with self.assertRaisesRegex(RuntimeError,'task_output_record_too_large'):self.capture()
         self.save();(self.directory/'stdout.log').write_text('x'*100000+'TAIL')
-        self.assertEqual(len(self.capture().encode()),16384)
+        self.assertEqual(len(self.capture().encode()),65536)
         self.assertTrue(self.capture().endswith('TAIL'))
 
     def test_ack_payload_including_escaped_controls_is_bounded(self):
-        for data in ['x'*20000,'\x00'*20000,'😀'*20000]:
+        for data in ['x'*65536,'\x00'*65536,'😀'*65536]:
             bounded=output.bounded_capture(data)
-            self.assertLessEqual(len(json.dumps({'output':bounded},ensure_ascii=True).encode()),8000)
-            self.assertLess(len(json.dumps({'epoch':2,'result':{'output':bounded}}).encode()),12288)
+            self.assertLessEqual(len(json.dumps({'output':bounded},ensure_ascii=True).encode()),output.CAPTURE_RESULT_JSON_BYTES)
+            self.assertLess(len(json.dumps({'epoch':2,'result':{'output':bounded}}).encode()),output.CAPTURE_ACK_BODY_BYTES)
 
     def test_actual_client_serialization_fits_command_ack_limits(self):
         for text in ['😀'*20000, '\x00'*20000, 'я'*20000]:
@@ -119,9 +119,45 @@ class TaskOutputTest(unittest.TestCase):
                 with mock.patch('urllib.request.build_opener',return_value=opener):
                     Client('https://hub.test').request('POST','/api/sessions/s/commands/c/ack',payload)
                 request=opener.open.call_args.args[0]
-                self.assertLess(len(request.data),12288)
+                self.assertLess(len(request.data),output.CAPTURE_ACK_BODY_BYTES)
                 decoded=json.loads(request.data)
-                self.assertLess(len(json.dumps(decoded['result'],ensure_ascii=False).encode()),8192)
+                self.assertLess(len(json.dumps(decoded['result'],ensure_ascii=False).encode()),output.CAPTURE_RESULT_JSON_BYTES)
+
+    def test_full_64k_tail_preserves_marker_and_never_expands_split_utf8(self):
+        for text in ['x'*65536, '\x00'*65536, '😀'*20000, 'я'*40000]:
+            with self.subTest(kind=text[0]):
+                bounded=output.bounded_capture(text+'END')
+                self.assertLessEqual(len(bounded.encode()),65536)
+                self.assertTrue(bounded.endswith('END'))
+                self.assertNotIn('\ufffd',bounded)
+                self.assertGreater(len(bounded.encode()),65000)
+        self.assertEqual(output.bounded_capture('x'*65536),'x'*65536)
+
+    def test_actual_retained_utf8_tail_discards_only_the_cut_codepoint(self):
+        for text in ['😀'*20000+'END', 'я'*40000+'END', 'あ'*30000+'END']:
+            with self.subTest(kind=text[0]):
+                (self.directory/'stdout.log').write_text(text)
+                captured=self.capture()
+                self.assertEqual(captured,output.capture_tail(text))
+                self.assertNotIn('\ufffd',captured)
+                self.assertLessEqual(len(captured.encode()),65536)
+                for limit in [1,2,3,4,7]:
+                    self.assertEqual(output.capture_task_output(self.task,self.expected,self.native,limit=limit),
+                                     output.capture_tail(text,limit))
+        (self.directory/'stdout.log').write_bytes(b'x'*70000+b'\xffEND')
+        self.assertIn('\ufffdEND',self.capture())
+
+    def test_capture_transport_allowance_never_enlarges_other_requests(self):
+        payload={'epoch':2,'result':{'output':'\x00'*65536}}
+        for path in ['/api/heartbeat','/api/sessions/s/finish',
+                     '/api/sessions/s/commands/c/ack?safety=operator_stop',
+                     '/api/machines/h/native/n/commands/c/ack']:
+            with self.subTest(path=path),self.assertRaisesRegex(ValueError,'request too large'):
+                Client('https://hub.test').request('POST',path,payload)
+        for result in [{'output':'x'*65537},{'stopped':True,'output':'\x00'*65536},
+                       {'output':'\x00'*65536,'capture_binding':{'unknown':'x'*2000}}]:
+            with self.subTest(keys=list(result)),self.assertRaisesRegex(ValueError,'request too large'):
+                Client('https://hub.test').request('POST','/api/sessions/s/commands/c/ack',{'epoch':2,'result':result})
 
     def test_profile_launch_passes_exact_output_directory_and_records_binding(self):
         config={'routes':{'codex':{'provider':'codex','profile':'local-codex'}}}
@@ -171,7 +207,7 @@ class TaskOutputTest(unittest.TestCase):
         meta={'capture_binding':{'native_id':self.native,'operation_id':'op-'+('x'*100),'request_digest':'a'*64},'capture_source':'retained_task_output'}
         for text in ('\x00'*20000,'😀'*20000,'plain'*10000):
             raw=output.bounded_capture(text,meta)
-            self.assertLessEqual(len(json.dumps({**meta,'output':raw},ensure_ascii=True).encode()),8000)
+            self.assertLessEqual(len(json.dumps({**meta,'output':raw},ensure_ascii=True).encode()),output.CAPTURE_RESULT_JSON_BYTES)
         with self.assertRaisesRegex(RuntimeError,'capture_fence_conflict'):
             output.bounded_capture('content',{'invalid':'x'*2000})
 

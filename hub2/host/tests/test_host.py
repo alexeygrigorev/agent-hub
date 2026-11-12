@@ -1759,6 +1759,45 @@ class RetainedManagedCaptureTests(unittest.TestCase):
         self.group_writable_parent_capture(terminal=True)
 
 
+    def test_terminal_64k_control_capture_replays_frozen_http_outbox_after_restart(self):
+        command=self.seed()
+        self.stdout.write_text('evicted-prefix'+'\x00'*65530+'MARKER')
+        result=self.bridge.command(command)
+        self.assertEqual(len(result['output'].encode()),65536)
+        self.assertTrue(result['output'].endswith('MARKER'))
+        key='command:'+command['id']
+        frozen=self.journal.db.execute('SELECT payload FROM outbox WHERE key=?',(key,)).fetchone()[0]
+        self.assertGreater(len(frozen.encode()),65536)
+        self.stdout.write_text('different later output')
+        self.assertEqual(self.bridge.command(command),result)
+        reopened=Journal(self.journal.path)
+        try:
+            sent=[]
+            response=__import__('unittest.mock',fromlist=['MagicMock']).MagicMock()
+            response.__enter__.return_value.read.return_value=b'{}'
+            opener=__import__('unittest.mock',fromlist=['MagicMock']).MagicMock()
+            def post(request,timeout):
+                sent.append(json.loads(request.data));return response
+            opener.open.side_effect=post
+            with patch('agent_hub_host.client.urllib.request.build_opener',return_value=opener):
+                reopened.flush(Client('https://hub.test'))
+            self.assertIn(json.loads(frozen),sent)
+            self.assertEqual(reopened.db.execute('SELECT COUNT(*) FROM outbox WHERE key=?',(key,)).fetchone()[0],0)
+        finally:reopened.close_thread()
+        self.assertEqual(self.native.calls,[])
+
+    def test_running_legacy_pane_capture_takes_byte_tail_not_character_prefix(self):
+        command=self.seed(terminal=False);command.pop('capture_binding');command['mode']='screen'
+        native_id=self.journal.db.execute('SELECT native_id FROM launches').fetchone()[0]
+        with patch.object(self.bridge,'resolve_launch_native',return_value=(native_id,{'phase':'running'})), \
+                patch.object(self.bridge,'native',return_value=__import__('types').SimpleNamespace(stdout='before'+'😀'*20000+'TAIL')):
+            result=self.bridge.command(command)
+        self.assertTrue(result['output'].endswith('TAIL'))
+        self.assertLessEqual(len(result['output'].encode()),65536)
+        self.assertGreater(len(result['output'].encode()),65000)
+        self.assertNotIn('\ufffd',result['output'])
+
+
 class ManagedClaudeHostTests(unittest.TestCase):
     setUp=HostTests.setUp
     tearDown=HostTests.tearDown
@@ -1849,11 +1888,12 @@ class CaptureAckCompatibilityTests(unittest.TestCase):
             'capture_binding':{'native_id':'11111111-1111-4111-8111-111111111111',
                                'operation_id':'op-frozen','request_digest':'a'*64}}}
 
-    def test_stage_a_emission_remains_legacy_small(self):
-        from agent_hub_host.task_output import bounded_capture
-        result=bounded_capture('\0'*65536)
-        self.assertLessEqual(len(result.encode()),4096)
-        self.assertLessEqual(len(json.dumps({'output':result},ensure_ascii=True).encode()),8000)
+    def test_stage_b_emission_uses_full_64k_with_bounded_json_escaping(self):
+        from agent_hub_host.task_output import bounded_capture, CAPTURE_RESULT_JSON_BYTES
+        result=bounded_capture('evicted-prefix'+'\0'*65536)
+        self.assertEqual(result,'\0'*65536)
+        self.assertEqual(len(result.encode()),65536)
+        self.assertLessEqual(len(json.dumps({'output':result},ensure_ascii=True).encode()),CAPTURE_RESULT_JSON_BYTES)
 
     def test_future_large_frozen_receipt_replays_after_unaccepted_or_lost_200(self):
         import urllib.error

@@ -729,7 +729,7 @@ class Bridge:
 
     def bound_capture(self, command, row):
         """Read only this exact attempt; a finished task never falls back to a pane."""
-        from .task_output import capture_task_output, bounded_capture
+        from .task_output import capture_task_output, bounded_capture, capture_tail, CAPTURE_OUTPUT_BYTES
         binding = command.get('capture_binding')
         expected_digest = hashlib.sha256(json.dumps({'kind':'capture','text':None,'epoch':command['epoch']},
             separators=(',',':')).encode()).hexdigest()
@@ -745,7 +745,7 @@ class Bridge:
             try:
                 # Use private retained-file guards even if completion races the
                 # journal snapshot taken above.
-                output = capture_task_output('hub2-'+row['session_id'],row,row['native_id'],retained_only=True)
+                output = capture_task_output('hub2-'+row['session_id'],row,row['native_id'],limit=CAPTURE_OUTPUT_BYTES,retained_only=True)
             except RuntimeError as exc:
                 if not terminal and str(exc)=='task_output_unavailable':
                     output = None
@@ -762,7 +762,7 @@ class Bridge:
                         or not current or current['state']!='running' or current['epoch']!=row['epoch']
                         or current['native_id']!=row['native_id'] or current['operation_id']!=row['operation_id']):
                     raise RuntimeError('task_output_unavailable')
-                output = self.native('capture',native_id,'--screen','--plain').stdout[:16384]
+                output = capture_tail(self.native('capture',native_id,'--screen','--plain').stdout)
                 metadata['capture_source'] = 'native_pane'
             return {**metadata,'output':bounded_capture(output,metadata)}
         except (OSError,ValueError,RuntimeError) as exc:
@@ -1001,14 +1001,14 @@ class Bridge:
         return result
 
     def legacy_capture(self, command, row):
-        from .task_output import capture_task_output, bounded_capture
+        from .task_output import capture_task_output, bounded_capture, capture_tail, CAPTURE_OUTPUT_BYTES
         native_id, _status = self.resolve_launch_native(row)
         if not native_id:
             raise RuntimeError('capture_identity_unavailable')
         output = (None if command.get('mode') == 'screen' else
-                  capture_task_output('hub2-' + row['session_id'], row, native_id))
+                  capture_task_output('hub2-' + row['session_id'], row, native_id, limit=CAPTURE_OUTPUT_BYTES))
         if output is None:
-            output = self.native('capture', native_id, '--screen', '--plain').stdout[:16384]
+            output = capture_tail(self.native('capture', native_id, '--screen', '--plain').stdout)
         return {'output': bounded_capture(output)}
 
     @staticmethod

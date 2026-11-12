@@ -598,6 +598,23 @@ class Canary:
                 "Apart from mandatory Hub first-action/completion evidence files if required by the session wrapper, "
                 "do not create or edit other files, start another agent, or exit early."
             )
+        if mode == "full":
+            # The picker chooses the runtime after launch. Keep the existing
+            # non-Claude instructions verbatim behind an explicit runtime branch.
+            marker_suffix = f"{candidate_sha[:12]}:{run_token}" if candidate_sha and run_token else run_id
+            self.prompt = (
+                "If this runtime is Claude Code, first use its existing native Bash tool to start a separate bounded "
+                "`sleep 60` hold with `run_in_background: true`, and retain the returned background task id. "
+                "Then run a separate foreground shell command that prints the "
+                f'concatenation of "CANARY-", "OK:", and "{marker_suffix}" as one output line and let it finish. '
+                "Immediately after that foreground marker result, enter the provider-native blocking Monitor or TaskOutput "
+                "wait on that exact background task id so the orchestrator can observe and stop this session before any "
+                "final prose or completion bookkeeping. The foreground marker must finish; background completion is not proof. "
+                "Do not put the marker or nonce in the background hold, echo proof, emit waiting prose, poll in a loop, "
+                "substitute another sleep mechanism, or wait externally. Apart from mandatory Hub first-action/completion "
+                "evidence files if required by the session wrapper, do not create or edit other files, start another agent, "
+                "or exit early. For every other runtime, follow this unchanged sequence: " + self.prompt
+            )
         self.session = self.native = self.engine = None
         self.started_at = self.running_deadline = None
         self.start_attempted = self.stopped = False
@@ -1322,7 +1339,7 @@ class Canary:
             attempt += 1
             key = f"canary-capture-{self.run_id}-{attempt}"
             rc, raw, _ = self.run([*self.hub, "sessions", "capture", self.session, "--key", key,
-                                   "--max-bytes", "4096"], deadline=deadline)
+                                   "--max-bytes", "65536"], deadline=deadline)
             out = ''
             if rc == 0:
                 try:
