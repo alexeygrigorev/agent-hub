@@ -37,11 +37,14 @@ def salvage_branch(workspace, timeout=30):
         remote = 'origin' if 'origin' in names else names[0] if len(names) == 1 else None
         if remote is None or remote.startswith('-'):
             return None
-        branch = git('symbolic-ref', '--quiet', '--short', 'HEAD')
+        branch = git('symbolic-ref', '--quiet', 'HEAD')
         head = git('rev-parse', '--verify', 'HEAD^{commit}')
         if branch.returncode or head.returncode:
             return None
-        branch, sha = branch.stdout.strip(), head.stdout.strip()
+        ref, sha = branch.stdout.strip(), head.stdout.strip()
+        if not ref.startswith('refs/heads/'):
+            return None
+        branch = ref[len('refs/heads/'):]
         if not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', sha):
             return None
         evidence = {'repo': root.stdout.strip(), 'remote': remote, 'branch': branch,

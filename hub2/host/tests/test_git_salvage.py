@@ -56,6 +56,12 @@ class GitSalvageTests(unittest.TestCase):
         self.assertIsNone(salvage_branch(self.repo))
         self.assertEqual(self.git('ls-remote', 'origin', 'refs/heads/trunk').split()[0], self.base)
 
+    def test_ambiguous_short_ref_still_pushes_exact_branch_name(self):
+        self.git('tag', 'task/work')
+        self.assertEqual(salvage_branch(self.repo)['branch'], 'task/work')
+        self.assertEqual(self.git('ls-remote', 'origin', 'refs/heads/task/work').split()[0], self.sha)
+        self.assertEqual(self.git('ls-remote', 'origin', 'refs/heads/heads/task/work'), '')
+
     def test_diverged_branch_is_never_forced_even_with_force_configuration(self):
         self.git('push', 'origin', 'task/work')
         self.git('reset', '--hard', self.base)  # disposable fixture only
