@@ -1,10 +1,15 @@
 """Actual-filesystem, local-Git staging regressions; no services or providers."""
+import array
+import ctypes
+import errno
 import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
+import select
 import shutil
+import socket
 import signal
 import stat
 import subprocess
@@ -19,6 +24,29 @@ spec = importlib.util.spec_from_file_location('diagnostic_stage', HELPER)
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 TOKEN = 'a' * 32
+
+
+def kill_owned_pidfd(pidfd):
+    # Some supported CPython builds omit the os/signal pidfd wrappers.
+    libc = ctypes.CDLL(None, use_errno=True)
+    send = libc.pidfd_send_signal
+    send.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint)
+    send.restype = ctypes.c_int
+    if send(pidfd, signal.SIGKILL, None, 0) != 0:
+        number = ctypes.get_errno()
+        raise OSError(number, os.strerror(number))
+
+
+def owned_process_alive(pid, pidfd):
+    # pidfd pins the owned child even if its numeric PID is later reused.
+    if select.select([pidfd], [], [], 0)[0]:
+        return False
+    try:
+        return Path('/proc', str(pid), 'stat').read_text().split(') ', 1)[1].split()[0] != 'Z'
+    except OSError as error:
+        if error.errno in (errno.ENOENT, errno.ESRCH):
+            return False
+        raise
 
 
 class DiagnosticStaging(unittest.TestCase):
@@ -299,32 +327,96 @@ m.stage(sys.argv[2],sys.argv[3],sys.argv[4],sys.argv[5])
         self.assertEqual(result.returncode,-signal.SIGKILL);self.assertEqual(result.stdout,b'')
         self.assertFalse((self.parent/TOKEN).exists());self.refused()
 
+    def test_owned_process_disappearing_during_proc_read_is_not_alive(self):
+        for number in (errno.ENOENT, errno.ESRCH):
+            with self.subTest(errno=number), mock.patch.object(select, 'select', return_value=([], [], [])), \
+                    mock.patch.object(Path, 'read_text', side_effect=OSError(number, 'synthetic disappearance')):
+                self.assertFalse(owned_process_alive(123, 456))
+
+    def test_owned_process_permission_and_other_errors_are_not_absence(self):
+        for number in (errno.EPERM, errno.EACCES, errno.EIO):
+            with self.subTest(errno=number), mock.patch.object(select, 'select', return_value=([], [], [])), \
+                    mock.patch.object(Path, 'read_text', side_effect=OSError(number, 'synthetic read failure')):
+                with self.assertRaises(OSError) as raised:
+                    owned_process_alive(123, 456)
+                self.assertEqual(raised.exception.errno, number)
+
+    def test_exited_pidfd_prevents_inspecting_a_reused_numeric_pid(self):
+        with mock.patch.object(select, 'select', return_value=([456], [], [])), \
+                mock.patch.object(Path, 'read_text') as read:
+            self.assertFalse(owned_process_alive(123, 456))
+            read.assert_not_called()
+
     def test_git_child_dies_if_staging_owner_is_killed(self):
         import time
-        pidfile=self.base/'owned-child.pid'
-        code='''import importlib.util,os,signal,subprocess,sys
+        receiver, sender = socket.socketpair()
+        receiver.settimeout(10)
+        owned = {'pidfd': None, 'helper': None}
+        def cleanup():
+            try:
+                try:
+                    if owned['pidfd'] is not None:
+                        try:
+                            kill_owned_pidfd(owned['pidfd'])
+                        except ProcessLookupError:
+                            pass
+                        finally:
+                            os.close(owned['pidfd'])
+                finally:
+                    if owned['helper'] is not None:
+                        if owned['helper'].poll() is None:
+                            owned['helper'].kill()
+                        owned['helper'].communicate(timeout=10)
+            finally:
+                receiver.close()
+                sender.close()
+        self.addCleanup(cleanup)  # Registered before creating either process.
+        code='''import array,ctypes,importlib.util,os,signal,socket,subprocess,sys
 sys.dont_write_bytecode=True
 spec=importlib.util.spec_from_file_location('m',sys.argv[1]);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
 original=subprocess.Popen
+channel=socket.socket(fileno=int(sys.argv[6]))
 def child(*args,**kwargs):
  process=original([sys.executable,'-I','-S','-c','import time;time.sleep(20)'],**kwargs)
- with open(sys.argv[6],'w') as file:file.write(str(process.pid));file.flush();os.fsync(file.fileno())
+ libc=ctypes.CDLL(None,use_errno=True)
+ open_pidfd=libc.pidfd_open;open_pidfd.argtypes=(ctypes.c_int,ctypes.c_uint);open_pidfd.restype=ctypes.c_int
+ pidfd=open_pidfd(process.pid,0)
+ if pidfd<0:
+  number=ctypes.get_errno();raise OSError(number,os.strerror(number))
+ try:
+  channel.sendmsg([str(process.pid).encode()],[(socket.SOL_SOCKET,socket.SCM_RIGHTS,array.array('i',[pidfd]))])
+ finally:os.close(pidfd)
+ if channel.recv(1)!=b'K':raise RuntimeError('missing parent acknowledgement')
  os.kill(os.getpid(),signal.SIGKILL)
 m.subprocess.Popen=child
 m.stage(sys.argv[2],sys.argv[3],sys.argv[4],sys.argv[5])
 '''
-        result=subprocess.run([sys.executable,'-I','-S','-c',code,str(HELPER),str(self.repo),str(self.parent),self.commit,TOKEN,str(pidfile)],
-                              stdin=subprocess.DEVNULL,capture_output=True,timeout=10)
-        self.assertEqual(result.returncode,-signal.SIGKILL)
-        pid=int(pidfile.read_text());deadline=time.monotonic()+2
-        def alive():
-            try:return Path('/proc',str(pid),'stat').read_text().split(') ',1)[1].split()[0]!='Z'
-            except FileNotFoundError:return False
-        try:
-            while alive() and time.monotonic()<deadline:time.sleep(.01)
-            self.assertFalse(alive(),'owned Git child survived its killed helper')
-        finally:
-            if alive():os.kill(pid,signal.SIGKILL)
+        owned['helper']=subprocess.Popen([sys.executable,'-I','-S','-c',code,str(HELPER),str(self.repo),str(self.parent),self.commit,TOKEN,str(sender.fileno())],
+                              stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,pass_fds=(sender.fileno(),))
+        sender.close()
+        payload, ancillary, flags, _ = receiver.recvmsg(32, socket.CMSG_SPACE(array.array('i').itemsize))
+        received = array.array('i')
+        for level, kind, data in ancillary:
+            if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                received.frombytes(data[:len(data) - len(data) % received.itemsize])
+        # Own every received descriptor before assertions can fail.
+        if received:
+            owned['pidfd'] = received[0]
+            for extra in received[1:]:os.close(extra)
+        self.assertEqual(flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC), 0)
+        if not received:
+            output, error = owned['helper'].communicate(timeout=10)
+            self.fail('owned child pidfd was not received: ' + error.decode(errors='replace'))
+        self.assertEqual(len(received), 1)
+        pid = int(payload)
+        os.set_inheritable(owned['pidfd'], False)
+        self.assertTrue(owned_process_alive(pid, owned['pidfd']), 'owned child exited before helper kill')
+        receiver.sendall(b'K')  # Helper cannot die before cleanup has the pinned child.
+        owned['helper'].communicate(timeout=10)
+        self.assertEqual(owned['helper'].returncode, -signal.SIGKILL)
+        deadline=time.monotonic()+2
+        while owned_process_alive(pid, owned['pidfd']) and time.monotonic()<deadline:time.sleep(.01)
+        self.assertFalse(owned_process_alive(pid, owned['pidfd']), 'owned Git child survived its killed helper')
 
     def test_cli_default_off_single_json_and_failed_replay_has_no_success_stdout(self):
         base=[sys.executable,'-I','-S',str(HELPER)]
