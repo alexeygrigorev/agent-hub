@@ -58,6 +58,7 @@ class ImplementWorkspaceTests(unittest.TestCase):
         from test_host import HostTests
         fixture = HostTests()
         fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
         self.addCleanup(fixture.tearDown)
         checkout = fixture.root / 'relay'
         self.git(fixture.root, 'clone', '-b', 'main', str(self.origin), str(checkout))
