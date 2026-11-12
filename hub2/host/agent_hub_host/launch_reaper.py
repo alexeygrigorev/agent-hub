@@ -5,6 +5,7 @@ stands in for containment evidence.
 """
 import json
 import logging
+import subprocess
 import time
 
 ADMISSION_WINDOW_MS = 60_000
@@ -52,7 +53,7 @@ def reap_expired_launches(bridge, now=None):
                     evidence = inventory.absence_evidence(row['workspace'], row['tag'])
                     if evidence is None:
                         continue
-                except (RuntimeError, OSError, AttributeError):
+                except (RuntimeError, OSError, AttributeError, subprocess.SubprocessError):
                     logging.getLogger(__name__).warning('Expired launch census unavailable session=%s', row['session_id'])
                     continue
                 evidence = {**evidence, 'dispatch_provenance': 'host_journal'}

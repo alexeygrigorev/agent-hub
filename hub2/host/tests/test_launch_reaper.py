@@ -1,4 +1,5 @@
 import json
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -92,3 +93,13 @@ class LaunchReaperTests(unittest.TestCase):
         self.bridge.launcher=SimpleNamespace(inventory=lambda:SimpleNamespace(fresh=lambda:True,absence_evidence=lambda *_:None))
         reap_expired_launches(self.bridge,2000)
         self.assertEqual(self.state(),'aborting')
+
+    def test_census_timeout_keeps_launch_unresolved_without_aborting_reconciliation(self):
+        self.row('aborting',deadline=100,native='native',dispatch=1)
+        def timeout():
+            raise subprocess.TimeoutExpired(['a','list','--all','--json'],5)
+        self.bridge.launcher=SimpleNamespace(inventory=timeout)
+        with self.assertLogs('agent_hub_host.launch_reaper',level='WARNING'):
+            reap_expired_launches(self.bridge,2000)
+        self.assertEqual(self.state(),'aborting')
+        self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0],0)
