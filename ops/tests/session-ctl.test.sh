@@ -2,6 +2,42 @@
 set -euo pipefail
 
 repo="$(cd "$(dirname "$0")/../.." && pwd)"
+
+# Self-isolation, before any fixture or controller code. The controller under
+# test writes $HOME/tmp/agent-reports and $HOME/git and reads $HOME/.config, so
+# the caller's HOME is never used, whatever it is (a developer shell, CI, a
+# worker). Each run owns a fresh directory under the repo's ignored .local/tmp
+# and removes only that directory on exit.
+real_home="$(getent passwd "$(id -u)" | cut -d: -f6)"; real_home="${real_home:-/nonexistent}"
+iso_root="$repo/.local/tmp"
+mkdir -p "$iso_root"
+iso_root="$(cd "$iso_root" && pwd -P)"
+iso="$(mktemp -d "$iso_root/session-ctl-test.XXXXXX")"
+cleanup() { case "$iso" in "$iso_root"/session-ctl-test.?*) rm -rf -- "$iso" ;; esac; }
+trap cleanup EXIT
+isolation_guard() {  # $1 = HOME candidate; 0 only for a run-owned dir that cannot reach live state
+  local h r
+  h="$(cd "$1" 2>/dev/null && pwd -P)" || return 1
+  case "$h" in "$iso_root"/session-ctl-test.?*) ;; *) return 1 ;; esac
+  case "$h" in */*/*) ;; *) return 1 ;; esac
+  r="$(cd "$real_home" 2>/dev/null && pwd -P)" || r="$real_home"
+  case "$r/" in "$h/"*) return 1 ;; esac  # never the real home or an ancestor of it
+  return 0
+}
+# Negative guard tests: live and shared paths are refused, including through a
+# symlink placed inside the run directory.
+ln -s "$real_home" "$iso/link-to-real-home"
+for candidate in "$real_home" / "$iso_root" "$repo" "$iso/link-to-real-home"; do
+  if isolation_guard "$candidate"; then echo "isolation guard accepted live path: $candidate" >&2; exit 1; fi
+done
+rm -f -- "$iso/link-to-real-home"
+isolation_guard "$iso" || { echo "refusing to run: $iso failed the isolation guard" >&2; exit 1; }
+export HOME="$iso" TMPDIR="$iso/tmp"
+mkdir -p "$TMPDIR"
+# No caller identity, Hub/aplexer config or operator override reaches the run.
+while IFS= read -r v; do unset "$v"; done < <(compgen -e | grep -E '^(APLEXER_|HUB_|HUB2_|AGENT_HUB_|OPS_|XDG_|GH_|ORCH_|ONCALL_)' || true)
+unset ENGINE ENGINE_SELECTED BASE_REPO SKILLS_REPO SKILLS_DIR MIN_RESTART_GAP TMUX
+
 fake="$HOME/session-ctl-fixture"
 bin="$fake/bin"
 mkdir -p "$bin" "$fake/skills/.agents/skills" "$fake/skills/.git" "$fake/locks"
@@ -23,6 +59,10 @@ export FAKE_HUB_STATE="$fake/hub-sessions.json"
 export FAKE_HUB_START_LOG="$fake/hub-start.log"
 export HUB_PARSER_ROOT="$repo/host"
 unset ENGINE ENGINE_SELECTED ORCH_ENGINE ORCH_FALLBACK_ENGINE ONCALL_ENGINE
+# Each coordinator role links its own durable Hub intake (Hub allows one
+# active session per intake).
+export OPS_ROLE_INTAKES="$fake/ops-role-intakes.json"
+printf '{"orchestrator":"intake-orch-0001","oncall":"intake-oncall-0002"}\n' > "$OPS_ROLE_INTAKES"
 
 cat > "$bin/a" <<'APLEXER'
 #!/usr/bin/env bash
@@ -75,18 +115,26 @@ hub=json.load(open(path)) if os.path.exists(path) else {}
 def save(): json.dump(hub,open(path,'w'))
 if ns.sessions_cmd=='start':
     assert ns.interactive and ns.wait and ns.purpose=='implement' and ns.key and ns.intake_task_id
+    # Idempotent key: a replayed request returns what Hub already created.
+    for hid,row in hub.items():
+        if row.get('key')==ns.key and row['state']=='running':
+            bound=dict(id=hid,state='running',native_id=row['native_id'],workspace=ns.workspace)
+            print(json.dumps({**bound,'client_key':ns.key,'binding_wait':{'session':bound}})); sys.exit(0)
+    # ProjectDO lifecycle: an intake with an active session refuses a second start.
+    if any(r.get('intake')==ns.intake_task_id and r['state'] in ('queued','running') for r in hub.values()):
+        sys.exit('Session HTTP request failed with status 409 (intake_already_assigned) (reconcile with --key %s via show/commands)' % ns.key)
     hid='hub-%04d' % (len(hub)+1)
     mode=os.environ.get('FAKE_HUB_START_MODE','running')
     if mode=='transport':
         sys.exit('Session transport failed: connection or TLS failure (reconcile with --key %s via show/commands)' % ns.key)
     if mode=='refused':
-        hub[hid]={'state':'refused'}; save()
+        hub[hid]={'state':'refused','key':ns.key,'intake':ns.intake_task_id}; save()
         sys.exit('session_start_failed; session %s reached refused (no_capacity); reconcile with --key %s via show/events' % (hid, ns.key))
     engine={'go':'opencode','zai':'zcodex'}.get(ns.engine,ns.engine)
     open(os.environ['FAKE_START_ENGINE'],'w').write(engine+'\n')
     open(os.environ['FAKE_START_MODEL'],'w').write(ns.model or '')
     native='new-'+ns.name
-    hub[hid]={'state':'running','native_id':native}; save()
+    hub[hid]={'state':'running','native_id':native,'key':ns.key,'intake':ns.intake_task_id}; save()
     json.dump([dict(id=native,workspace=ns.workspace,tag='task-hub2-'+hid,phase='running',worker_alive=True,
                     labels={'hub.session':hid,'hub.managed':'true'})],open(os.environ['FAKE_SESSIONS'],'w'))
     open(os.environ['FAKE_SCREEN'],'w').write(os.environ.get('FAKE_START_SCREEN','❯')+'\n')
@@ -154,6 +202,12 @@ set -euo pipefail
 exit 2
 GH
 chmod +x "$bin/a" "$bin/hub" "$bin/systemd-run" "$bin/git" "$bin/gh"
+# Every external command the controller drives resolves to a fake: no live
+# aplexer, Hub API, git remote, GitHub or systemd unit can be reached.
+for cmd in a hub systemd-run git gh; do
+  [[ "$(command -v "$cmd")" == "$bin/$cmd" ]] || { echo "isolation: $cmd does not resolve to the fake" >&2; exit 1; }
+done
+[[ "$HOME" == "$iso" && "$fake" == "$iso"/* ]] || { echo "isolation: fixture escaped the run directory" >&2; exit 1; }
 
 write_quota() {
   cat > "$FAKE_QUOTA"
@@ -462,13 +516,42 @@ for mode in refused transport; do
   if [[ "$mode" == refused ]]; then
     assert_contains "$output" 'reached refused (no_capacity)'
   else
-    assert_contains "$output" 'already ended (refused)'
+    assert_contains "$output" 'never started natively (refused, no native id)'
     assert_contains "$output" 'Session transport failed'
-    [[ -s "$HOME/tmp/agent-reports/oncall/state/hub_start_key" ]]
+    [[ -s "$HOME/tmp/agent-reports/oncall/state/hub_start_pending" ]]
   fi
 done
+# The unconfirmed request is replayed byte-for-byte (same key, route, intake)
+# even after the quota changes, so it can never draw a second, different start.
+write_quota <<'JSON'
+{"pools":[{"provider":"zai","state":"fresh","remaining_percent":90,"harness":["zcodex"]}]}
+JSON
 output="$(run_ctl oncall start 2>&1)"
+assert_contains "$output" 'replaying unconfirmed Hub start'
 assert_contains "$output" 'started session'
-[[ ! -e "$HOME/tmp/agent-reports/oncall/state/hub_start_key" ]]
+[[ ! -e "$HOME/tmp/agent-reports/oncall/state/hub_start_pending" ]]
+mapfile -t starts < <(grep '^sessions start ' "$FAKE_HUB_START_LOG" | tail -2)
+[[ "${starts[0]}" == "${starts[1]}" ]] || { echo "replay changed the request" >&2; printf '%s\n' "${starts[@]}" >&2; exit 1; }
+assert_contains "${starts[1]}" '--intake-task-id intake-oncall-0002'
+assert_contains "${starts[1]}" '--engine go'
+assert_not_contains "${starts[1]}" '--tag'
+
+# Distinct durable role intakes: a missing or shared mapping fails closed
+# before any Hub request, and never falls back to a native start.
+for intakes in '{"orchestrator":"intake-orch-0001"}' '{"orchestrator":"intake-shared-01","oncall":"intake-shared-01"}'; do
+  write_default_quota
+  write_dead oncall
+  rm -f "$HOME/tmp/agent-reports/oncall/state/hub_binding.json"
+  printf '%s\n' "$intakes" > "$OPS_ROLE_INTAKES"
+  before=$(wc -l < "$FAKE_HUB_START_LOG")
+  status=0
+  output="$(run_ctl oncall start 2>&1)" || status=$?
+  [[ "$status" -ne 0 ]]
+  assert_contains "$output" 'recovery held'
+  [[ "$(wc -l < "$FAKE_HUB_START_LOG")" == "$before" ]]
+  [[ ! -e "$FAKE_START_ENGINE" ]]
+done
+assert_contains "$output" 'role_intake_shared'
+printf '{"orchestrator":"intake-orch-0001","oncall":"intake-oncall-0002"}\n' > "$OPS_ROLE_INTAKES"
 
 echo 'session-ctl targeted tests passed'

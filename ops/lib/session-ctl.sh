@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Shared control for the two interactive ops sessions.
-#   session-ctl.sh <orchestrator|oncall> <start|ensure|check|status|restart|handoff-restart|skills-sync>
+#   session-ctl.sh <orchestrator|oncall> <start|ensure|check|status|session-id|restart|handoff-restart|skills-sync>
 # Watchdog (check) restarts a dead or tick-stalled session and proves every restart by a fresh
 # tick (intake 500fd60b); Hub scheduled prompts provide the engine-neutral scheduler.
 # Needs: a (aplexer), hub (maintained Hub CLI), git, gh, python3. Never prints secrets.
@@ -9,9 +9,9 @@ set -uo pipefail
 
 ROLE="${1:-}"; CMD="${2:-status}"
 case "$ROLE" in
-  orchestrator) TAG=orchestrator-main; REPORTS="$HOME/tmp/agent-reports/orchestrator"; RUNDIR="$HOME/git/agent-hub-wt-orchestrator-run"; SUB=ops/orchestrator; INTAKE=67847fde-a00a-4689-8460-fbad45599f99 ;;
-  oncall)       TAG=oncall-engineer;   REPORTS="$HOME/tmp/agent-reports/oncall";        RUNDIR="$HOME/git/agent-hub-wt-oncall-run";       SUB=ops/oncall;        INTAKE=67847fde-a00a-4689-8460-fbad45599f99 ;;
-  *) echo "usage: $0 <orchestrator|oncall> <start|ensure|check|status|restart|handoff-restart|skills-sync>" >&2; exit 64 ;;
+  orchestrator) TAG=orchestrator-main; REPORTS="$HOME/tmp/agent-reports/orchestrator"; RUNDIR="$HOME/git/agent-hub-wt-orchestrator-run"; SUB=ops/orchestrator; OTHER_ROLE=oncall ;;
+  oncall)       TAG=oncall-engineer;   REPORTS="$HOME/tmp/agent-reports/oncall";        RUNDIR="$HOME/git/agent-hub-wt-oncall-run";       SUB=ops/oncall;        OTHER_ROLE=orchestrator ;;
+  *) echo "usage: $0 <orchestrator|oncall> <start|ensure|check|status|session-id|restart|handoff-restart|skills-sync>" >&2; exit 64 ;;
 esac
 BASE_REPO="${BASE_REPO:-$HOME/git/agent-hub}"           # donor clone for the run worktree
 [ -f "$HOME/.local/share/agent-hub-ops/guard-bin/env.sh" ] && . "$HOME/.local/share/agent-hub-ops/guard-bin/env.sh"  # agent rm guard (504d662b): sessions inherit it via --setenv=PATH
@@ -116,6 +116,21 @@ arm_proof() {  # $1 = recovery path (1 = restart, 2 = new session on the fallbac
 # A record with only hub_id is a Hub session whose start was not confirmed; it
 # is stopped through Hub before any new start so no orphan keeps running.
 BINDING="$STATE/hub_binding.json"
+# Durable per-role Hub intakes, written by the operator (not this script):
+#   {"orchestrator": "<intake id>", "oncall": "<intake id>"}
+ROLE_INTAKES="${OPS_ROLE_INTAKES:-$HOME/.config/agent-hub/ops-role-intakes.json}"
+role_intake() {  # $1 = role; prints that role's intake id
+  python3 - "$ROLE_INTAKES" "$1" <<'PY' || { log "role_intake_unconfigured: $ROLE_INTAKES has no valid intake for $1; recovery held" >&2; return 1; }
+import json,re,sys
+try:
+    v=json.load(open(sys.argv[1])).get(sys.argv[2])
+except Exception:
+    sys.exit(1)
+if not isinstance(v,str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{5,127}",v):
+    sys.exit(1)
+print(v)
+PY
+}
 HUB_CFG="${HUB_CONFIG_FILE:-$HOME/.config/agent-hub/cli.json}"
 binding_get() {  # $1 = field; prints it (empty when absent); fails on a corrupt binding
   [ -e "$BINDING" ] || return 0
@@ -169,27 +184,46 @@ for s in rows:
 }
 find_session() { matching_sessions | head -1; }
 
-# Stop the bound Hub session through Hub (the owner of its lifecycle). A Hub
-# session that already ended is accepted; anything else fails loudly.
+# Stop the bound Hub session through Hub (the owner of its lifecycle). Only a
+# confirmed Hub stop, or positive evidence that nothing of it can still run,
+# retires the binding. A Hub state alone (lost/failed/refused/cancelled) never
+# proves absence, so a replacement is never started beside a surviving process:
+#  - bound native: Hub reports it ended AND the native's processes and
+#    containment are verified gone here;
+#  - no native recorded: Hub reports refused/cancelled with no native id AND no
+#    local record labelled with this Hub session is still running.
 stop_bound() {
-  local hub_id show state
+  local hub_id native show state show_native labelled id
   hub_id=$(binding_get hub_id) || { log "corrupt Hub binding $BINDING"; return 1; }
   [ -n "$hub_id" ] || return 0
+  native=$(binding_get native_id)
   if HUB_CONFIG_FILE="$HUB_CFG" T=60 t hub sessions stop "$hub_id" --key "ops-stop-$hub_id" >/dev/null 2>"$STATE/hub_stop.err"; then
-    log "stopped Hub session $hub_id"
-  else
-    show=$(HUB_CONFIG_FILE="$HUB_CFG" T=30 t hub sessions show "$hub_id" --json 2>/dev/null) || show=""
-    state=$(printf '%s' "$show" | python3 -c '
+    log "stopped Hub session $hub_id"; rm -f "$BINDING"; return 0
+  fi
+  show=$(HUB_CONFIG_FILE="$HUB_CFG" T=30 t hub sessions show "$hub_id" --json 2>/dev/null) || show=""
+  read -r state show_native < <(printf '%s' "$show" | python3 -c '
 import json,sys
 try:
     d=json.load(sys.stdin); d=d.get("session",d) if isinstance(d.get("session"),dict) else d
-    print(d.get("state") or "")
+    n=d.get("native_id")
+    print(d.get("state") or "-", n if isinstance(n,str) and n else "-")
 except Exception:
-    print("")')
-    case "$state" in
-      stopped|lost|failed|refused|cancelled) log "Hub session $hub_id already ended ($state)" ;;
-      *) log "Hub stop of $hub_id failed: $(diag "$STATE/hub_stop.err") (Hub state ${state:-unknown}); recovery held"; return 1 ;;
-    esac
+    print("- -")')
+  labelled=$(t a list --json 2>/dev/null | python3 -c '
+import json,sys
+for s in json.load(sys.stdin):
+    l=s.get("labels") if isinstance(s.get("labels"),dict) else {}
+    if l.get("hub.session")==sys.argv[1]: print(s["id"])' "$hub_id") || labelled="?"
+  local gone=1
+  if [ "$labelled" = "?" ]; then gone=0
+  else for id in $native $labelled; do native_dead "$id" || { gone=0; break; }; done; fi
+  if [ -n "$native" ] && [[ "$state" =~ ^(stopped|lost|failed|refused|cancelled)$ ]] && [ "$gone" = 1 ]; then
+    log "Hub session $hub_id ended ($state) and native $native is verified gone"
+  elif [ -z "$native" ] && [[ "$state" =~ ^(refused|cancelled)$ ]] && [ "$show_native" = - ] && [ "$gone" = 1 ]; then
+    log "Hub session $hub_id never started natively ($state, no native id)"
+  else
+    log "Hub stop of $hub_id failed: $(diag "$STATE/hub_stop.err") (Hub state ${state/#-/unknown}${native:+, native $native}; not verified gone); recovery held"
+    return 1
   fi
   rm -f "$BINDING"
 }
@@ -198,10 +232,10 @@ except Exception:
 # interpolates response bodies or credentials into these lines.
 diag() { head -n 3 "$1" 2>/dev/null | tr -d '\000-\010\013-\037' | tr '\n' ' ' | cut -c1-300; }
 
-# a forget explicitly does NOT stop surviving workloads. Require fresh evidence
-# that both recorded processes and any recorded containment have drained first.
-forget_dead() {
-  t a status "$1" --json | python3 -c '
+# Fresh evidence that a native record's processes and any recorded containment
+# have drained. An unknown record or unreadable status is not evidence.
+native_dead() {
+  t a status "$1" --json 2>/dev/null | python3 -c '
 import json,os,pathlib,sys
 s=json.load(sys.stdin)
 if s.get("worker_alive") is not False:
@@ -223,7 +257,13 @@ for k in ("worker_cgroup", "workload_cgroup"):
             for f in root.rglob("cgroup.procs"):
                 if f.read_text().strip():
                     sys.exit(1)
-' || { log "refusing forget $1: processes alive or death unverified"; return 1; }
+'
+}
+
+# a forget explicitly does NOT stop surviving workloads. Require fresh evidence
+# that both recorded processes and any recorded containment have drained first.
+forget_dead() {
+  native_dead "$1" || { log "refusing forget $1: processes alive or death unverified"; return 1; }
   t a forget "$1" --force >/dev/null || { log "forget failed: $1"; return 1; }
   log "forgot verified dead session $1"
 }
@@ -491,26 +531,41 @@ oncall_inbox_stalled() {
 # and always prints its JSON result). Hub performs project/workspace resolution,
 # quota/resource admission and the native launch; a refusal is terminal for
 # this attempt and is never bypassed with a native start. Records the binding.
+#
+# An attempt whose outcome is unknown (lost response, timeout, transport) is
+# pinned in $PENDING: key, engine and the exact argv. Every later attempt
+# replays that identical request until Hub gives a definitive answer, so a
+# changed quota, route or config can never draw a second, different start.
+PENDING="$STATE/hub_start_pending"
+has_pending() { [ -s "$PENDING" ]; }
 hub_start() {
-  local hub_engine key="" fp out err rc parsed hub_id
-  hub_engine="$ENGINE"
-  case "$hub_engine" in opencode) hub_engine=go ;; zcodex) hub_engine=zai ;; esac  # Hub2 engine ids
-  fp="$ROLE|$hub_engine|${model_args[*]}|$RUNDIR/$SUB"
-  # Reuse an uncertain attempt's idempotency key only for the identical request,
-  # so a lost response replays instead of launching a duplicate.
-  if [ -s "$STATE/hub_start_key" ]; then
-    local saved_key saved_fp
-    { IFS= read -r saved_key; IFS= read -r saved_fp; } < "$STATE/hub_start_key"
-    if [ "$saved_fp" = "$fp" ]; then key="$saved_key"
-    else log "previous Hub start ($saved_key) was unconfirmed for a different route; starting a new request"; fi
+  local hub_engine key out err rc parsed hub_id intake other argv=() rec=()
+  if has_pending; then
+    mapfile -d '' rec < "$PENDING"
+    [ "${#rec[@]}" -ge 3 ] && [ -n "${rec[0]}" ] || { log "corrupt pending Hub start $PENDING; recovery held"; return 1; }
+    key="${rec[0]}"; ENGINE="${rec[1]}"; argv=("${rec[@]:2}")
+    log "replaying unconfirmed Hub start $key unchanged (route $ENGINE)"
+  else
+    # Hub allows one active session per intake, so each role links its own.
+    intake=$(role_intake "$ROLE") || return 1
+    other=$(role_intake "$OTHER_ROLE" 2>/dev/null) || other=""
+    if [ "$intake" = "$other" ]; then
+      log "role_intake_shared: $ROLE and $OTHER_ROLE both name intake $intake in $ROLE_INTAKES; recovery held"
+      return 1
+    fi
+    hub_engine="$ENGINE"
+    case "$hub_engine" in opencode) hub_engine=go ;; zcodex) hub_engine=zai ;; esac  # Hub2 engine ids
+    key="ops-$ROLE-$(date +%s%N)"
+    argv=(sessions start --workspace "$RUNDIR/$SUB" --name "$TAG" --engine "$hub_engine" "${model_args[@]}"
+      --purpose implement --interactive --reason "Pinned $ROLE coordinator route" --intake-task-id "$intake"
+      --key "$key" --wait --timeout 150)
+    # Publish the request durably before sending it.
+    printf '%s\0' "$key" "$ENGINE" "${argv[@]}" > "$PENDING.tmp" && sync "$PENDING.tmp" \
+      && mv -f "$PENDING.tmp" "$PENDING" && sync "$STATE" \
+      || { log "cannot record pending Hub start; recovery held"; return 1; }
   fi
-  [ -n "$key" ] || key="ops-$ROLE-$(date +%s%N)"
-  printf '%s\n%s\n' "$key" "$fp" > "$STATE/hub_start_key"
   out="$STATE/hub_start.out"; err="$STATE/hub_start.err"
-  HUB_CONFIG_FILE="$HUB_CFG" T=180 t hub sessions start --workspace "$RUNDIR/$SUB" --name "$TAG" \
-    --engine "$hub_engine" "${model_args[@]}" --purpose implement --interactive \
-    --reason "Pinned $ROLE coordinator route" --intake-task-id "$INTAKE" \
-    --key "$key" --wait --timeout 150 >"$out" 2>"$err"; rc=$?
+  HUB_CONFIG_FILE="$HUB_CFG" T=180 t hub "${argv[@]}" >"$out" 2>"$err"; rc=$?
   # Accept only a running Hub session bound to a native session; record the
   # binding (or the bare Hub id) before anything else can fail.
   parsed=$(python3 - "$out" "$rc" "$BINDING" <<'PY'
@@ -544,19 +599,19 @@ sys.exit(0 if ok else 4)
 PY
 )
   case $? in
-    0) rm -f "$STATE/hub_start_key"; hub_id="$parsed"
+    0) rm -f "$PENDING"; hub_id="$parsed"
        log "Hub session $hub_id running as native $(binding_get native_id) (tag $(binding_get native_tag))"
        return 0 ;;
-    4) rm -f "$STATE/hub_start_key"
+    4) rm -f "$PENDING"  # Hub named the session; the binding now governs it
        log "Hub start unconfirmed: session $parsed not bound to a running native session; recovery held" ;;
     *) local reason; reason=$(diag "$err")
        if [[ "$reason" =~ session_start_failed\;\ session\ ([A-Za-z0-9][A-Za-z0-9_.:-]{0,127})\ reached ]]; then
          # Hub created the session but it did not run: remember it so it is
          # stopped through Hub before the next attempt.
-         printf '{"hub_id":"%s"}\n' "${BASH_REMATCH[1]}" > "$BINDING"; rm -f "$STATE/hub_start_key"
-       elif [[ "$reason" =~ status\ 4[0-9][0-9] ]]; then
-         rm -f "$STATE/hub_start_key"  # typed refusal: definitive, re-evaluated next attempt
+         printf '{"hub_id":"%s"}\n' "${BASH_REMATCH[1]}" > "$BINDING.tmp" && mv -f "$BINDING.tmp" "$BINDING" && rm -f "$PENDING"
        fi
+       # Any other failure (HTTP status included) is not proof that Hub created
+       # nothing: the pending request is replayed unchanged.
        log "Hub start failed (rc=$rc): ${reason:-no diagnostic}; recovery held" ;;
   esac
   return 1
@@ -566,13 +621,14 @@ start() {
   local current model_args=()
   current=$(find_session) || { log "session census failed"; return 1; }
   [ -n "$current" ] && { log "already running: $current"; return 0; }
-  select_engine || return 1
+  has_pending || select_engine || return 1
   # Clear stale names before launch; never leave orphan workloads behind.
   stop_old || return 1
   prep_worktree || return 1
   date +%s > "$STATE/last_start"
   model_args=()
-  if [ "$ROLE" = oncall ]; then
+  if has_pending; then :
+  elif [ "$ROLE" = oncall ]; then
     [ "$ENGINE" = opencode ] || { log "refusing unsafe oncall engine $ENGINE"; return 1; }
     model_args=(--model opencode-go/muse-spark-1.3-contributor)
     log "oncall model pinned to opencode-go/muse-spark-1.3-contributor"
@@ -635,7 +691,7 @@ make_handoff() {  # $1 = reason; keeps a hand-written handoff.md if it is newer 
 restart() {  # $1 = reason
   local now last; now=$(date +%s); last=$(cat "$STATE/last_start" 2>/dev/null || echo 0)
   if [ $((now-last)) -lt "$MIN_RESTART_GAP" ] && [ "${FORCE:-0}" != 1 ]; then log "restart suppressed: last start $((now-last))s ago"; return 1; fi
-  select_engine || return 1
+  has_pending || select_engine || return 1
   make_handoff "${1:-manual}"; stop_old || return 1; start
 }
 
@@ -741,6 +797,8 @@ check() {
 case "$CMD" in
   start) if [ "$ROLE" = orchestrator ]; then role_lock || exit 75; fi; start ;;
   ensure|check) if [ "$ROLE" = orchestrator ]; then role_lock || exit 75; fi; check ;;
+  session-id)  # exact bound (or pre-migration) live session id; 1 = none, 3 = census failed
+    id=$(find_session) || exit 3; [ -n "$id" ] || exit 1; printf '%s\n' "$id" ;;
   status) id=$(find_session); [ -n "$id" ] || { log "not running"; exit 1; }
     hid=""; [ "$id" = "$(binding_get native_id)" ] && hid=$(binding_get hub_id)
     log "running $id${hid:+ (Hub session $hid)}"; echo "attach: a attach $id" ;;

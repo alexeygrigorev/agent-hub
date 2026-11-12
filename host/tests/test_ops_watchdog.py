@@ -9,6 +9,7 @@ import time
 import unittest
 
 CTL = Path(__file__).resolve().parents[2] / 'ops/lib/session-ctl.sh'
+SEND = Path(__file__).resolve().parents[2] / 'ops/lib/send.sh'
 HOST_SRC = Path(__file__).resolve().parents[1]
 ADAPTER = r'''#!/usr/bin/env python3
 import json,os,pathlib,sys
@@ -59,16 +60,28 @@ elif name=='hub':
             assert ns.interactive and ns.wait and ns.purpose=='implement' and ns.key and ns.intake_task_id, args
             n=len(hub)+1; hid='hub-%04d' % n
             mode=s.get('start_error')
+            # Hub lifecycle (ProjectDO dispatch): an intake whose session is still
+            # queued/running refuses a second start (intake_already_assigned).
+            # A replay of the same key returns the original session instead.
+            same=[r for r in hub.values() if r.get('key')==ns.key]
+            if same:
+                r=same[0]
+                if r['state']!='running':
+                    fail('session_start_failed; session %s reached %s; reconcile with --key %s via show/events' % (r['id'], r['state'], ns.key))
+                bound=dict(id=r['id'],state='running',native_id=r['native_id'],workspace=r['workspace'])
+                print(json.dumps({**bound,'client_key':ns.key,'binding_wait':{'session':bound}})); sys.exit(0)
+            if any(r.get('intake')==ns.intake_task_id and r['state'] in ('queued','running') for r in hub.values()):
+                fail('Session HTTP request failed with status 409 (intake_already_assigned) (reconcile with --key %s via show/commands)' % ns.key)
             if mode=='transport':
                 fail('Session transport failed: connection or TLS failure (reconcile with --key %s via show/commands)' % ns.key)
             if mode=='http':
                 fail('Session HTTP request failed with status 409 (no_host_capacity) (reconcile with --key %s via show/commands)' % ns.key)
-            hub[hid]=dict(id=hid,state='refused' if mode else 'running',key=ns.key,name=ns.name)
+            hub[hid]=dict(id=hid,state='refused' if mode else 'running',key=ns.key,name=ns.name,intake=ns.intake_task_id)
             if mode:
                 fail('session_start_failed; session %s reached refused (no_capacity); reconcile with --key %s via show/events' % (hid, ns.key))
             native='new' if n==1 else 'new%d' % n
             ws=s.get('resolved_workspace') or ns.workspace
-            hub[hid]['native_id']=native
+            hub[hid]['native_id']=native; hub[hid]['workspace']=ws
             s['sessions'].append(dict(id=native,tag='task-hub2-'+hid,workspace=ws,phase='running',worker_alive=True,
                 worker_pid=os.getppid(),workload_pid=os.getppid(),labels={'hub.session':hid,'hub.managed':'true'}))
             bound=dict(id=hid,state='running',native_id=native,workspace=ws,requested_workspace=ns.workspace)
@@ -135,7 +148,10 @@ class OpsWatchdogTest(unittest.TestCase):
             ]},
         }
         self.env = {**os.environ, 'HOME': str(self.home), 'PATH': str(self.bin)+':'+os.environ['PATH'], 'LOOP_INTERVAL': 'off', 'MIN_RESTART_GAP': '0', 'OPS_LOCK_DIR': str(self.home),
-                    'HUB_PARSER_ROOT': str(HOST_SRC)}
+                    'HUB_PARSER_ROOT': str(HOST_SRC), 'OPS_SESSION_CTL': str(CTL)}
+        self.intakes = self.home / '.config/agent-hub/ops-role-intakes.json'
+        self.intakes.parent.mkdir(parents=True)
+        self.intakes.write_text(json.dumps({'orchestrator': 'intake-orch-0001', 'oncall': 'intake-oncall-0002'}))
         self.env.update({'ORCH_ENGINE': 'gemini', 'ORCH_FALLBACK_ENGINE': 'opencode'})
 
     def tearDown(self):
@@ -495,7 +511,7 @@ class OpsWatchdogTest(unittest.TestCase):
             self.assertNotIn(flag, start.split())
         self.assertIn('--workspace ' + str(self.workspace), start)
         self.assertIn('--name orchestrator-main', start)
-        self.assertIn('--intake-task-id 67847fde-a00a-4689-8460-fbad45599f99', start)
+        self.assertIn('--intake-task-id intake-orch-0001', start)
         self.assertIn('--interactive', start)
         self.assertEqual(self.binding(), {'hub_id': 'hub-0001', 'native_id': 'new', 'native_tag': 'task-hub2-hub-0001',
                                           'workspace': str(self.workspace)})
@@ -503,7 +519,7 @@ class OpsWatchdogTest(unittest.TestCase):
         self.assertIn('a send new Run the orchestrator tick now', self.calls())
         self.assertIn('Hub session hub-0001 (name orchestrator-main)', self.calls())
         self.assertNotIn('systemd-run --user --scope', self.calls())
-        self.assertFalse((self.state / 'hub_start_key').exists())
+        self.assertFalse((self.state / 'hub_start_pending').exists())
 
     def test_hub_started_session_is_found_only_by_its_binding(self):
         self.data['resolved_workspace'] = str(self.workspace.parents[1])  # Hub's resolved workspace, not $RUNDIR/$SUB
@@ -535,23 +551,38 @@ class OpsWatchdogTest(unittest.TestCase):
         result = self.run_ctl('start')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('hub sessions stop hub-0001', self.calls())
-        self.assertIn('Hub session hub-0001 already ended (refused)', result.stdout)
+        self.assertIn('Hub session hub-0001 never started natively (refused, no native id)', result.stdout)
         self.assertEqual(self.binding()['hub_id'], 'hub-0002')
 
-    def test_uncertain_start_reuses_key_and_typed_http_refusal_drops_it(self):
+    def test_uncertain_and_http_failures_replay_the_identical_request(self):
         self.data['start_error'] = 'transport'
         self.assertNotEqual(self.run_ctl('start').returncode, 0)
-        key = (self.state / 'hub_start_key').read_text().split()[0]
-        self.assertNotEqual(self.run_ctl('start').returncode, 0)
-        keys = re.findall(r'--key (\S+)', '\n'.join(self.starts()))
-        self.assertEqual(keys, [key, key])  # a lost response replays, never duplicates
-        self.data['start_error'] = 'http'
+        key = (self.state / 'hub_start_pending').read_text().split('\0')[0]
+        self.data['start_error'] = 'http'  # a 409 is not proof Hub created nothing
         result = self.run_ctl('start')
         self.assertIn('status 409 (no_host_capacity)', result.stdout)
-        self.assertFalse((self.state / 'hub_start_key').exists())
+        self.assertTrue((self.state / 'hub_start_pending').exists())
         self.data['start_error'] = None
         self.assertEqual(self.run_ctl('start').returncode, 0)
-        self.assertNotEqual(re.findall(r'--key (\S+)', self.starts()[-1])[0], key)
+        starts = self.starts()
+        self.assertEqual(len(set(starts)), 1, starts)  # one request, replayed byte-for-byte
+        self.assertEqual(re.findall(r'--key (\S+)', starts[-1]), [key])
+        self.assertFalse((self.state / 'hub_start_pending').exists())
+
+    def test_replayed_key_returns_the_session_hub_already_created(self):
+        self.data['start_error'] = 'transport'
+        self.assertNotEqual(self.run_ctl('start').returncode, 0)
+        # The lost response did create the session: the replay must bind to it, not launch another.
+        key = (self.state / 'hub_start_pending').read_text().split('\0')[0]
+        self.data['hub'] = {'hub-0001': dict(id='hub-0001', state='running', key=key, intake='intake-orch-0001',
+                                             native_id='new', workspace=str(self.workspace))}
+        self.data['sessions'] = [dict(id='new', tag='task-hub2-hub-0001', workspace=str(self.workspace), phase='running',
+                                      worker_alive=True, labels={'hub.session': 'hub-0001', 'hub.managed': 'true'})]
+        self.data['start_error'] = None
+        result = self.run_ctl('start')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.binding()['hub_id'], 'hub-0001')
+        self.assertEqual(len(self.data['hub']), 1)
 
     def test_restart_stops_bound_session_through_hub_not_native_kill(self):
         self.assertEqual(self.run_ctl('start').returncode, 0)
@@ -567,6 +598,7 @@ class OpsWatchdogTest(unittest.TestCase):
         result = self.run_ctl('restart')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('Hub stop of hub-0001 failed: stop_not_running', result.stdout)
+        self.assertIn('not verified gone); recovery held', result.stdout)
         self.assertEqual(len(self.starts()), 1)
         self.assertEqual(self.binding()['native_id'], 'new')
 
@@ -591,6 +623,192 @@ class OpsWatchdogTest(unittest.TestCase):
         self.assertIn('corrupt Hub binding', result.stdout + result.stderr)
         self.assertIn('session census failed', result.stdout)
         self.assertEqual(self.starts(), [])
+
+    # Review B1: an unconfirmed start is replayed verbatim, never redrawn.
+    def test_unconfirmed_start_replays_identical_request_after_route_change(self):
+        self.data['start_error'] = 'transport'
+        self.assertNotEqual(self.run_ctl('start').returncode, 0)
+        self.assertIn('--engine antigravity', self.starts()[-1])
+        # Quota now prefers another route and recovery path 2 would pick opencode.
+        self.data['quota'] = {'pools': [{'provider': 'go', 'harness': ['opencode'], 'state': 'fresh', 'remaining_percent': 80}]}
+        result = self.run_ctl('restart')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('replaying unconfirmed Hub start', result.stdout)
+        first, second = self.starts()
+        self.assertEqual(first, second)  # same key, route, intake and flags
+        self.data['start_error'] = None
+        result = self.run_ctl('start')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.starts()[-1], first)
+        self.assertFalse((self.state / 'hub_start_pending').exists())
+
+    # Review B2: a Hub state never proves the bound process is gone.
+    def bound_native(self, **fields):
+        native = next(x for x in self.data['sessions'] if x['id'] == 'new')
+        native.update(fields)
+
+    def test_failed_stop_with_lost_hub_state_and_live_native_holds(self):
+        self.assertEqual(self.run_ctl('start').returncode, 0)
+        self.bound_native(worker_pid=os.getpid(), workload_pid=os.getpid())
+        self.data['hub']['hub-0001']['state'] = 'lost'
+        self.data['stop_error'] = True
+        result = self.run_ctl('restart')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('(Hub state lost, native new; not verified gone); recovery held', result.stdout)
+        self.assertEqual(len(self.starts()), 1)
+        self.assertEqual(self.binding()['native_id'], 'new')
+
+    def test_failed_stop_with_lost_state_and_verified_dead_native_recovers(self):
+        self.assertEqual(self.run_ctl('start').returncode, 0)
+        self.bound_native(worker_alive=False, phase='exited', worker_pid=2147483647, workload_pid=2147483647)
+        self.data['hub']['hub-0001']['state'] = 'lost'
+        self.data['stop_error'] = True
+        result = self.run_ctl('restart')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('Hub session hub-0001 ended (lost) and native new is verified gone', result.stdout)
+        self.assertEqual(self.binding()['hub_id'], 'hub-0002')
+
+    def test_failed_stop_without_local_native_record_holds(self):
+        self.assertEqual(self.run_ctl('start').returncode, 0)
+        self.data['sessions'] = []
+        self.data['hub']['hub-0001']['state'] = 'failed'
+        self.data['stop_error'] = True
+        result = self.run_ctl('restart')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('not verified gone); recovery held', result.stdout)
+        self.assertEqual(len(self.starts()), 1)
+
+    # Review B3: each coordinator role links its own Hub intake.
+    def test_missing_role_intake_fails_closed_before_hub(self):
+        self.intakes.write_text(json.dumps({'oncall': 'intake-oncall-0002'}))
+        result = self.run_ctl('start')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('role_intake_unconfigured', result.stdout + result.stderr)
+        self.assertEqual(self.starts(), [])
+
+    def test_shared_role_intake_fails_closed_before_hub(self):
+        self.intakes.write_text(json.dumps({'orchestrator': '67847fde-a00a-4689-8460-fbad45599f99',
+                                            'oncall': '67847fde-a00a-4689-8460-fbad45599f99'}))
+        result = self.run_ctl('start')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('role_intake_shared', result.stdout)
+        self.assertEqual(self.starts(), [])
+
+    def test_refused_hub_session_with_surviving_labelled_native_holds(self):
+        self.data['start_error'] = 'refused'
+        self.assertNotEqual(self.run_ctl('start').returncode, 0)
+        # Hub says refused, but a native labelled with that Hub session is alive here.
+        self.data['sessions'] = [dict(id='ghost', tag='task-hub2-hub-0001', workspace=str(self.workspace), phase='running',
+                                      worker_alive=True, worker_pid=os.getpid(), workload_pid=os.getpid(),
+                                      labels={'hub.session': 'hub-0001', 'hub.managed': 'true'})]
+        self.data['start_error'] = None
+        result = self.run_ctl('start')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('not verified gone); recovery held', result.stdout)
+        self.assertEqual(len(self.starts()), 1)
+
+    def test_hub_one_active_session_per_intake_is_a_typed_refusal(self):
+        self.assertEqual(self.run_ctl('start').returncode, 0)
+        (self.state / 'hub_binding.json').unlink()  # lose the binding: the old session is still active in Hub
+        self.data['sessions'] = []
+        result = self.run_ctl('start')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('status 409 (intake_already_assigned)', result.stdout)
+        self.assertEqual(len(self.starts()), 2)
+
+    # Review B4: orch-send/oncall-send find the coordinator through the
+    # controller's exact binding; inbox semantics (0 delivered, 2 saved) hold.
+    def orch_send(self, text):
+        send = self.bin / 'orch-send'
+        send.write_text(SEND.read_text()); send.chmod(0o755)
+        self.runtime.write_text(json.dumps(self.data))
+        result = subprocess.run([str(send), text], env=self.env, text=True, capture_output=True, timeout=60)
+        self.data = json.loads(self.runtime.read_text())
+        return result
+
+    def test_orch_send_delivers_to_hub_bound_session(self):
+        self.assertEqual(self.run_ctl('start').returncode, 0)
+        result = self.orch_send('please check PR 502')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('DELIVERY=delivered to orchestrator-main (new)', result.stdout)
+        self.assertIn('a send new [INBOX ', self.calls())
+        inbox = self.home / 'tmp/agent-reports/orchestrator/inbox'
+        self.assertEqual(len(list(inbox.glob('*.md'))), 1)
+
+    def test_orch_send_never_guesses_an_old_tag_session(self):
+        # Only a Hub-managed decoy carries the old tag; no binding exists.
+        self.data['sessions'] = [dict(id='decoy', tag='orchestrator-main', workspace=str(self.workspace), phase='running',
+                                      worker_alive=True, labels={'hub.session': 'hub-9999', 'hub.managed': 'true'})]
+        result = self.orch_send('hello')
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('DELIVERY=not-delivered (no running orchestrator-main session', result.stdout)
+        self.assertNotIn('a send decoy', self.calls())
+        self.assertEqual(len(list((self.home / 'tmp/agent-reports/orchestrator/inbox').glob('*.md'))), 1)
+
+    def test_orch_send_census_failure_keeps_item_in_inbox(self):
+        self.data['census_error'] = True
+        result = self.orch_send('hello')
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('session lookup failed (rc=3)', result.stdout)
+
+    def test_orch_send_still_reaches_pre_migration_session(self):
+        self.data['sessions'] = [self.session(True, os.getpid())]
+        result = self.orch_send('hello')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('delivered to orchestrator-main (old)', result.stdout)
+
+
+class SessionCtlShellIsolationTest(unittest.TestCase):
+    """The shell suite isolates itself from whatever HOME its caller has.
+
+    The caller HOME here is a test-owned sentinel tree that looks like live ops
+    state (never the real home). After a full run every sentinel byte and mtime
+    is unchanged, nothing new appears in it, and the run directory is gone.
+    """
+
+    SHELL_TEST = Path(__file__).resolve().parents[2] / 'ops/tests/session-ctl.test.sh'
+    RUN_ROOT = Path(__file__).resolve().parents[2] / '.local/tmp'
+
+    @staticmethod
+    def snapshot(root):
+        out = {}
+        for p in sorted(root.rglob('*')):
+            st = p.lstat()
+            out[str(p.relative_to(root))] = (st.st_mode, st.st_mtime_ns,
+                                             p.read_bytes() if p.is_file() and not p.is_symlink() else None)
+        return out
+
+    def run_dirs(self):
+        return set(self.RUN_ROOT.glob('session-ctl-test.*')) if self.RUN_ROOT.is_dir() else set()
+
+    def test_caller_home_sentinel_is_never_written(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            caller = Path(tmp) / 'caller-home'
+            sentinels = {
+                'tmp/agent-reports/oncall/state/restart_failures': '0\n',
+                'tmp/agent-reports/oncall/state/last_start': '1\n',
+                'tmp/agent-reports/orchestrator/NEEDS_ALEXEY.md': '# sentinel\n',
+                'session-ctl-fixture/sessions.json': '[]\n',
+                '.config/agent-hub/ops-role-intakes.json': '{"orchestrator":"sentinel-a","oncall":"sentinel-b"}\n',
+                '.config/agent-hub/cli.json': '{"sentinel":true}\n',
+            }
+            for rel, body in sentinels.items():
+                (caller / rel).parent.mkdir(parents=True, exist_ok=True)
+                (caller / rel).write_text(body)
+            (caller / 'tmp/agent-reports/oncall/inbox').mkdir(parents=True)
+            before, dirs_before = self.snapshot(caller), self.run_dirs()
+            # Decoy identity/config values must be scrubbed, never used.
+            env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'HOME': str(caller),
+                   'TMPDIR': str(caller / 'tmp'), 'HUB_CONFIG_FILE': str(caller / '.config/agent-hub/cli.json'),
+                   'OPS_ROLE_INTAKES': str(caller / '.config/agent-hub/ops-role-intakes.json'),
+                   'OPS_SESSION_CTL': str(caller / 'nonexistent-ctl'), 'APLEXER_TAG': 'sentinel-tag',
+                   'HUB2_CONFIG': str(caller / 'hub2-contexts/x.json')}
+            result = subprocess.run(['bash', str(self.SHELL_TEST)], env=env, text=True,
+                                    capture_output=True, timeout=600)
+            self.assertEqual(result.returncode, 0, result.stdout[-3000:] + result.stderr[-3000:])
+            self.assertIn('session-ctl targeted tests passed', result.stdout)
+            self.assertEqual(self.snapshot(caller), before)
+            self.assertEqual(self.run_dirs() - dirs_before, set())
 
 if __name__ == '__main__':
     unittest.main()
