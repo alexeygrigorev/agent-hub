@@ -669,16 +669,16 @@ class ParserTests(unittest.TestCase):
     def test_claude_pair_identity_failure_interruption_and_echo_matrix(self):
         import copy
         prompt, marker = acc.make_probe()
-        self.assertIn("First use the provider-native background tool facility for a separate bounded 60-second hold", prompt)
-        self.assertIn("provider-native blocking monitor, TaskOutput, or status wait", prompt)
+        self.assertTrue(prompt.startswith("Use two sequential shell tool calls. First run a separate foreground shell command"))
+        self.assertIn("Immediately after the marker print finishes, run a separate foreground `sleep 60` command using the existing shell tool with a supported timeout sufficient for the 60-second hold", prompt)
+        self.assertIn("Do not chain the marker print with the hold in one command, do not use a background flag, do not include the marker or nonce in the hold command, do not echo proof or emit waiting prose, and do not search for or call any monitor, task-output, or status tools or poll in a loop", prompt)
         self.assertIn("mandatory Hub first-action/completion evidence files", prompt)
+        self.assertNotIn("background tool facility", prompt)
+        self.assertNotIn("TaskOutput", prompt)
+        self.assertNotIn("Monitor", prompt)
         self.assertLess(
-            prompt.index("First use the provider-native background tool facility for a separate bounded 60-second hold"),
-            prompt.index("then run a separate foreground shell command"),
-        )
-        self.assertLess(
-            prompt.index("then run a separate foreground shell command"),
-            prompt.index("Immediately after the marker print finishes, enter a provider-native blocking monitor"),
+            prompt.index("First run a separate foreground shell command"),
+            prompt.index("Immediately after the marker print finishes, run a separate foreground `sleep 60` command"),
         )
         changes = [
             lambda f: f[1].update(session_id='99999999-2222-4333-8444-555555555555'),
@@ -818,6 +818,99 @@ class ParserTests(unittest.TestCase):
         self.assertIn(fg_use_line, tail_4096)
         self.assertIn(fg_res_line, tail_4096)
         self.assertTrue(acc.probe_output_ok(tail_4096, prompt, marker, 'claude', transport('claude')))
+
+        fg_use_1145 = padded_frame(valid_fg[0], 1145)
+        fg_res_610 = padded_frame(valid_fg[1], 610)
+        fg_hold_use_1102 = padded_frame(
+            {
+                'type': 'assistant',
+                'session_id': session,
+                'message': {
+                    'role': 'assistant',
+                    'content': [{
+                        'type': 'tool_use',
+                        'id': 'toolu_synthetic_fg_sleep60',
+                        'name': 'Bash',
+                        'input': {
+                            'command': 'sleep 60',
+                            'description': 'Foreground 60-second hold',
+                            'timeout': 90000,
+                        },
+                    }],
+                },
+            },
+            1102,
+        )
+        two_call_active_hold_stream = '\n'.join([
+            prefix_line,
+            first_action_res,
+            fg_use_1145,
+            fg_res_610,
+            fg_hold_use_1102,
+        ]) + '\n'
+        two_call_tail_4096 = two_call_active_hold_stream.encode('utf-8')[-4096:].decode('utf-8')
+        self.assertEqual(len(two_call_tail_4096.encode('utf-8')), 4096)
+        self.assertIn(fg_use_1145, two_call_tail_4096)
+        self.assertIn(fg_res_610, two_call_tail_4096)
+        self.assertIn(fg_hold_use_1102, two_call_tail_4096)
+        self.assertTrue(acc.probe_output_ok(two_call_tail_4096, prompt, marker, 'claude', transport('claude')))
+
+        tok_193 = padded_frame({'type': 'system', 'subtype': 'thinking_tokens', 'session_id': session}, 193)
+        tok_195 = padded_frame({'type': 'system', 'subtype': 'thinking_tokens', 'session_id': session}, 195)
+        thinking_2013 = padded_frame(
+            {
+                'type': 'assistant',
+                'session_id': session,
+                'message': {'role': 'assistant', 'content': [{'type': 'thinking', 'thinking': '', 'signature': 'sig'}]},
+            },
+            2013,
+        )
+        tool_search_use_1035 = padded_frame(
+            {
+                'type': 'assistant',
+                'session_id': session,
+                'message': {
+                    'role': 'assistant',
+                    'content': [{
+                        'type': 'tool_use',
+                        'id': 'toolu_synthetic_toolsearch',
+                        'name': 'ToolSearch',
+                        'input': {'query': 'select:Monitor,TaskOutput', 'max_results': 5},
+                    }],
+                },
+            },
+            1035,
+        )
+        tool_search_res_594 = padded_frame(
+            {
+                'type': 'user',
+                'session_id': session,
+                'message': {
+                    'role': 'user',
+                    'content': [{
+                        'type': 'tool_result',
+                        'tool_use_id': 'toolu_synthetic_toolsearch',
+                        'content': "[{'type': 'tool_reference', 'tool_name': 'Monitor'}]",
+                    }],
+                },
+            },
+            594,
+        )
+        burst_evicted_stream = '\n'.join([
+            prefix_line,
+            first_action_res,
+            fg_use_1145,
+            fg_res_610,
+            tok_193,
+            tok_195,
+            thinking_2013,
+            tool_search_use_1035,
+            tool_search_res_594,
+        ]) + '\n'
+        burst_tail_4096 = burst_evicted_stream.encode('utf-8')[-4096:].decode('utf-8')
+        self.assertEqual(len(burst_tail_4096.encode('utf-8')), 4096)
+        self.assertEqual(len(burst_tail_4096.splitlines()[0]), 60)
+        self.assertFalse(acc.probe_output_ok(burst_tail_4096, prompt, marker, 'claude', transport('claude')))
 
         fg_with_bg_res = provider_frames('claude', marker)
         fg_with_bg_res[1]['tool_use_result']['backgroundTaskId'] = 'bg_synth_01'
