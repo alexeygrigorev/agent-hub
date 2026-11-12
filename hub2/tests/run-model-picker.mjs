@@ -15,3 +15,5 @@ await import('./machine-capabilities.test.ts');
 await import('./alert-evidence.test.ts');
 
 await import('./workspace-routing.test.ts');
+
+await import('./workspace-advertisement.test.ts');

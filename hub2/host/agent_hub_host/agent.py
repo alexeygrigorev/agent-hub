@@ -1203,6 +1203,8 @@ class Bridge:
         capabilities=['headless']+[cap+':'+engine for engine in engines for cap in sorted(available[engine]-{'headless'})]
         advertisement = getattr(self, 'advertisement', None)
         resource_tags = advertisement.tags() if advertisement is not None else []
+        workspace_tags = [tag for tag in resource_tags if tag.startswith('workspace:')]
+        resource_tags = [tag for tag in resource_tags if not tag.startswith('workspace:')]
         # Accepted configuration leads the payload: when derived engine hints
         # overflow the 32-slot heartbeat they are shed by the bound below,
         # never an accepted tag, and never with an exception before the
@@ -1245,6 +1247,9 @@ class Bridge:
                     self._managed_code_ready = True
             except Exception:
                 pass  # Code readiness is an optional observation, never a heartbeat gate.
+        # Workspace inventory has its own protocol allowance; repository count
+        # must never evict engine/credential hints or silently lose clone labels.
+        capabilities.extend(workspace_tags)
         if include_native_sessions:
             self.client.heartbeat(labels,engines,capabilities,native_sessions=self.live_sessions())
             self.publish_managed_readiness()

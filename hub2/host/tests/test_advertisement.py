@@ -117,3 +117,54 @@ class AdvertisementTests(unittest.TestCase):
         self.assertEqual(len(tags), 32)
         self.assertTrue({'tool:item' + str(i) for i in range(31)} <= set(tags))
         self.assertIn('headless', tags)
+
+
+    def clone(self, root, name):
+        path = root / name
+        path.mkdir()
+        (path / '.git').mkdir()
+        return path
+
+    def test_clone_created_after_enrollment_is_advertised_and_resolved(self):
+        bridge = self.bridge()
+        repo = self.clone(self.root, 'telegram-writing-assistant')
+        bridge.heartbeat([], include_native_sessions=False)
+        self.assertIn('workspace:telegram-writing-assistant', bridge.client.heartbeat.call_args.args[2])
+        self.assertEqual(bridge.resolve_workspace('TELEGRAM-WRITING-ASSISTANT'), repo)
+        (repo / '.git').rmdir()
+        self.assertNotIn('workspace:telegram-writing-assistant', bridge.advertisement.tags())
+
+    def test_git_worktree_file_and_checkout_root_are_discovered(self):
+        repo = self.root / 'project'
+        repo.mkdir()
+        (repo / '.git').write_text('gitdir: elsewhere')
+        observed = Advertisement([repo])
+        self.assertEqual(observed.tags(), ['workspace:project'])
+        self.assertEqual(observed.resolve_alias('PROJECT'), repo)
+
+    def test_ambiguous_clone_labels_and_escaped_symlinks_are_not_advertised(self):
+        first, second = self.root / 'first', self.root / 'second'
+        first.mkdir(); second.mkdir()
+        self.clone(first, 'project'); self.clone(second, 'project')
+        observed = Advertisement([first, second])
+        self.assertNotIn('workspace:project', observed.tags())
+        self.assertIsNone(observed.resolve_alias('project'))
+        outside = self.clone(self.root, 'outside')
+        (first / 'escape').symlink_to(outside, target_is_directory=True)
+        self.assertNotIn('workspace:escape', observed.tags())
+
+    def test_missing_explicit_alias_masks_discovered_clone(self):
+        self.clone(self.root, 'project')
+        observed = Advertisement([self.root], workspaces={'project': str(self.root / 'missing')})
+        self.assertEqual(observed.tags(), [])
+        with self.assertRaisesRegex(ValueError, 'workspace_unavailable'):
+            observed.resolve_alias('project')
+
+    def test_many_clones_preserve_engine_capabilities_and_all_workspace_labels(self):
+        bridge = self.bridge()
+        for index in range(80):
+            self.clone(self.root, 'project-' + str(index))
+        bridge.heartbeat([], include_native_sessions=False)
+        tags = bridge.client.heartbeat.call_args.args[2]
+        self.assertTrue({'headless', 'interactive:codex', 'effort:codex'} <= set(tags))
+        self.assertEqual(len([tag for tag in tags if tag.startswith('workspace:')]), 80)
