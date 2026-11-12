@@ -580,6 +580,61 @@ test('a historical STOP epoch does not inhibit the current attempt',async()=>{
   }finally{m.close();f.close();}
 });
 
+test('aplexer_retirement timeout (exit 124) never marks intake or dispatch complete/archived, raises attention, and starts recovery; d3e6c4b0-class intakes reopen',async()=>{
+  const f=fixture(),m=machineFixture(f);
+  try{
+    const id=await createIntake(f,'timeout-retirement');await start(f,id,'first');
+    const {binding}=await m.running(id);
+    // Simulate a pre-contract saga retiring on timeout (exit 124, native_deadline exceeded) with no AC proof.
+    f.db().run("UPDATE dispatch_sagas SET routing_json=json_remove(routing_json,'$.completion_contract') WHERE operation_id=?",binding.operation_id);
+    const admittedAt=Date.now()-1801_000,deadlineMs=admittedAt+1800_000,exitedAt=deadlineMs+500;
+    m.db().run('UPDATE launch_admissions SET observed_at=? WHERE operation_id=? AND session_id=? AND epoch=?',admittedAt,binding.attempt_operation_id,binding.session_id,binding.epoch);
+    const timeoutBody={operation_id:binding.attempt_operation_id,epoch:binding.epoch,native_id:binding.native_id,exit_code:124,native_exit_confirmed:true,
+      evidence:{source:'aplexer_retirement',containment_empty:true,native_identity:{id:binding.native_id,tag:'task-hub2-'+binding.session_id,workspace:'/srv/work/feature'},
+        native_exit:{code:124,exited_at_ms:exitedAt},native_deadline:{deadline_ms:deadlineMs,exceeded:true}}};
+    const finished=await m.call('/api/sessions/'+binding.session_id+'/finish',timeoutBody);
+    assert.equal(finished.status,201);
+    const attention=m.db().one('SELECT reason,observed_at FROM attention WHERE session_id=?',binding.session_id);
+    assert.equal(attention?.reason,'deadline_exceeded','timeout retirement raises a visible session alert');
+    const shownBefore=await json(await f.call('/api/intakes/'+id));
+    assert.equal(shownBefore.intake.status,'failed');
+    assert.notEqual(shownBefore.intake.dispatch.state,'complete','failed/timed-out dispatch view must not report complete');
+    assert.equal(completion(f,id).outcome,'unfinished');
+    assert.equal(completion(f,id).reason,'deadline_exceeded');
+    assert.equal(completion(f,id).continuation.state,'pending');
+    // Closing as done/closed or archiving without an explicit cancellation/supersede reason is refused.
+    assert.equal((await f.call('/api/intakes/'+id,'POST',{key:'bad-close',status:'done'})).status,409);
+    assert.equal((await f.call('/api/intakes/'+id,'PATCH',{key:'bad-archive',status:'archived'})).status,409);
+    await f.project.alarm();
+    const shownAfter=await json(await f.call('/api/intakes/'+id));
+    assert(['queued','running'].includes(shownAfter.intake.status),'recovery continuation started');
+    assert.equal(sagas(f,id).length,2);
+    assert(events(f,id).some(e=>e.kind==='task_continuation_started'&&e.body.previous_session_id===binding.session_id&&e.body.reason==='deadline_exceeded'));
+
+    // Historical d3e6c4b0-class intakes closed/left unrecovered by aplexer_retirement in the last 14 days reopen on startup.
+    const retiredTimeout=await createIntake(f,'d3e6c4b0-timeout');await start(f,retiredTimeout,'first');const b1=await run(f,retiredTimeout);
+    const retiredZero=await createIntake(f,'d3e6c4b0-zero');await start(f,retiredZero,'first');const b2=await run(f,retiredZero);
+    const now=Date.now();
+    f.db().run("UPDATE dispatch_sagas SET state='complete',routing_json=json_remove(routing_json,'$.completion_contract') WHERE intake_id IN (?,?)",retiredTimeout,retiredZero);
+    f.db().run("UPDATE intakes SET status='archived',final_evidence_json=?,updated_at=? WHERE id=?",
+      JSON.stringify({source:'aplexer_retirement',exit_code:124,native_exit_confirmed:true,native_deadline:{deadline_ms:now-1000,exceeded:true}}),now-86400_000,retiredTimeout);
+    f.db().run("UPDATE intakes SET status='completed-awaiting-review',final_evidence_json=?,updated_at=? WHERE id=?",
+      JSON.stringify({source:'aplexer_retirement',exit_code:0,native_exit_confirmed:true,native_deadline:{deadline_ms:now+1000,exceeded:false}}),now-86400_000,retiredZero);
+    f.reopen();
+    for(const [reopenedId,expectedReason,prevStatus,sessionId] of [
+      [retiredTimeout,'deadline_exceeded','archived',b1.session_id],
+      [retiredZero,'exit_without_completion_claim','completed-awaiting-review',b2.session_id],
+    ] as const){
+      const view=(await json(await f.call('/api/intakes/'+reopenedId))).intake;
+      assert.equal(view.status,'open','d3e6c4b0-class intake reopened as unfinished');
+      assert.notEqual(view.dispatch.state,'complete');
+      assert.equal(view.final_evidence.reopened_unfinished.reason,expectedReason);
+      assert.equal(view.final_evidence.reopened_unfinished.previous_status,prevStatus);
+      assert(events(f,reopenedId).some(e=>e.kind==='intake_reopened_unfinished'&&e.body.session_id===sessionId&&e.body.reason===expectedReason));
+    }
+  }finally{m.close();f.close();}
+});
+
 const note=(f:F,id:string,key:string,text:string,actor:object=admin)=>f.call('/api/intakes/'+id+'/events','POST',{key,note:text},actor);
 const context=(f:F,id:string,key:string,fields:object)=>f.call('/api/intakes/'+id,'PATCH',{key,...fields});
 const latestLaunch=(f:F,id:string)=>JSON.parse(sagas(f,id).at(-1).launch_spec_json);
@@ -738,7 +793,7 @@ test('archived or manually restarted intakes are never resurrected by a pending 
     const f=fixture();
     try{
       const id=await createIntake(f,'resurrect-'+race);await start(f,id,'first');await finish(f,await run(f,id),0);
-      if(race==='archive')assert.equal((await context(f,id,'archive',{status:'archived'})).status,200);
+      if(race==='archive')assert.equal((await context(f,id,'archive',{status:'archived',note:'superseded by operator'})).status,200);
       else assert.equal((await start(f,id,'manual',{prompt:'manual attempt'})).status,201);
       const before=intakeRow(f,id);
       await f.project.alarm();await f.project.alarm();

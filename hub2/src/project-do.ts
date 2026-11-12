@@ -112,6 +112,7 @@ export class ProjectDO {
       occurrence: record => this.scheduleOccurrence(record),
     });
     this.ready = initializeSchema(ctx, this.db, 4, SCHEMA, [], async () => {
+      this.reopenRetiredUnverifiedIntakes();
       await this.retryPendingIntakeRoutes();
       await this.scheduleNext();
       this.constructorMs = performance.now() - started;
@@ -283,9 +284,11 @@ export class ProjectDO {
     if (typeof body.expected_version === 'number') mapped.expected_updated_at = body.expected_version;
     for (const field of ['title', 'priority', 'acceptance_criteria', ...INTAKE_CONTEXT_FIELDS]) if (body[field] !== undefined) mapped[field] = body[field];
     if (body.status !== undefined) {
+      const forceClose = body.force === true || body.outcome === 'closed_unverified';
+      const unverifiedSession = row.session_id !== null && row.status !== 'completed-awaiting-review' && !forceClose;
       // A cancelled or superseded intake is archived (never deleted); the replacement id stays in the note.
       mapped.status = body.status === 'done' || body.status === 'closed'
-        ? (row.status === 'completed-awaiting-review' ? 'accepted' : 'archived')
+        ? (row.status === 'completed-awaiting-review' || unverifiedSession ? 'accepted' : 'archived')
         : ['cancelled', 'canceled', 'superseded'].includes(String(body.status)) ? 'archived' : body.status;
     }
     if (body.superseded_by !== undefined && (typeof body.superseded_by !== 'string' || !/^[A-Za-z0-9._:-]{6,128}$/.test(body.superseded_by))) return error('invalid_superseded_by', 400);
@@ -373,6 +376,7 @@ export class ProjectDO {
       const changesCore=body.title!==undefined||body.text!==undefined||body.acceptance_criteria!==undefined||body.status!==undefined;
       if(changesCore&&(['queued','running'].includes(row.status)||(row.session_id&&this.db.one<SagaRow>("SELECT * FROM dispatch_sagas WHERE session_id=? AND state<>'complete'",row.session_id))))return error('intake_active',409);
       if(body.status==='accepted'&&(row.status!=='completed-awaiting-review'||!hasScope(actor,'operator:admin')))return error('review_required',409);
+      if(body.status==='archived'&&row.session_id!==null&&row.status!=='completed-awaiting-review'&&typeof body.note!=='string')return error('review_required',409);
       const at=Date.now(),next={title:typeof body.title==='string'?body.title.trim():row.title,text:body.text??row.text,acceptance_criteria_json:body.acceptance_criteria?JSON.stringify(body.acceptance_criteria):row.acceptance_criteria_json,status:body.status??row.status,priority:body.priority??row.priority??2};
       this.db.run('UPDATE intakes SET original_title=COALESCE(original_title,title),original_text=COALESCE(original_text,text),title=?,text=?,acceptance_criteria_json=?,status=?,priority=?,updated_at=? WHERE id=?',next.title,next.text,next.acceptance_criteria_json,next.status,next.priority,at,row.id);
       if(INTAKE_CONTEXT_FIELDS.some(field=>body[field]!==undefined)){
@@ -1170,6 +1174,13 @@ export class ProjectDO {
       if((launchFailed?currentSaga?.state!=='admitted':currentSaga?.state!=='running')||current?.session_id!==saga.session_id||current.assigned_machine_id!==saga.machine_id)throw new HttpError('completion_binding_changed',409);
       // Process exit is not task completion: a controlled session finishes the
       // task only with its own completion claim, whatever the exit code.
+      const retirementOrStatus=!!currentSaga&&['aplexer_status','aplexer_retirement'].includes(String(evidence.source))
+        &&(this.parse(currentSaga.launch_spec_json) as JsonRecord|null)?.engine!=='shell'&&!current.schedule_id;
+      if(retirementOrStatus&&currentSaga&&!this.completionControlled(currentSaga)){
+        const route=(this.parse(currentSaga.routing_json) as JsonRecord|null)??{};
+        currentSaga.routing_json=JSON.stringify({...route,completion_contract:true});
+        this.db.run('UPDATE dispatch_sagas SET routing_json=? WHERE operation_id=?',currentSaga.routing_json,saga.operation_id);
+      }
       let status:string=finishedStatus,completion:CompletionRecord|undefined;
       if(this.completionControlled(currentSaga)){
         const claim=launchFailed?undefined:this.findCompletionClaim(current,saga);
@@ -1446,6 +1457,44 @@ export class ProjectDO {
       if(!await this.registerIntakeRoute(row))break;
     }
   }
+  private reopenRetiredUnverifiedIntakes(now=Date.now()):void{
+    const cutoff=now-14*86_400_000;
+    const rows=this.db.all<IntakeRow>(
+      `SELECT * FROM intakes WHERE updated_at>=? AND schedule_id IS NULL AND session_id IS NOT NULL
+       AND status IN ('failed','completed-awaiting-review','archived','accepted')
+       AND json_extract(final_evidence_json,'$.source')='aplexer_retirement'
+       AND json_extract(final_evidence_json,'$.reopened_unfinished') IS NULL
+       AND (json_extract(final_evidence_json,'$.completion') IS NULL
+         OR (json_extract(final_evidence_json,'$.completion.outcome')='unfinished'
+           AND status IN ('completed-awaiting-review','archived','accepted')))
+       ORDER BY updated_at,id LIMIT 64`,cutoff);
+    if(!rows.length)return;
+    this.transaction(()=>{
+      for(const intake of rows){
+        if(!intake.session_id)continue;
+        const saga=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id=? AND intake_id=?',intake.session_id,intake.id);
+        if(!saga||(this.parse(saga.launch_spec_json) as JsonRecord|null)?.engine==='shell')continue;
+        if(this.findCompletionClaim(intake,saga))continue;
+        const explicitClose=this.db.one<{body_json:string}>(
+          "SELECT body_json FROM intake_events WHERE task_id=? AND kind='intake_updated' ORDER BY seq DESC LIMIT 1",intake.id);
+        const closeNote=explicitClose?String((this.parse(explicitClose.body_json) as JsonRecord|null)?.note??''):'';
+        if(intake.status==='archived'&&/(?:^|\b)(?:superseded by|cancelled|canceled|closed_unverified|start refused)\b/i.test(closeNote))continue;
+        const evidence=(this.parse(intake.final_evidence_json) as JsonRecord|null)??{};
+        const deadlineExceeded=(evidence.native_deadline as JsonRecord|undefined)?.exceeded===true;
+        const exitCode=typeof evidence.exit_code==='number'?evidence.exit_code:null;
+        const reason=deadlineExceeded?'deadline_exceeded':exitCode===0?'exit_without_completion_claim':'native_exit_'+String(exitCode??'unknown');
+        const route=(this.parse(saga.routing_json) as JsonRecord|null)??{};
+        if(route.completion_contract!==true){
+          this.db.run('UPDATE dispatch_sagas SET routing_json=?,updated_at=? WHERE operation_id=?',
+            JSON.stringify({...route,completion_contract:true}),now,saga.operation_id);
+        }
+        const reopened={at:now,previous_status:intake.status,reason,session_id:saga.session_id,source:'aplexer_retirement'};
+        this.db.run("UPDATE intakes SET status='open',final_evidence_json=?,updated_at=? WHERE id=?",
+          JSON.stringify({...evidence,reopened_unfinished:reopened}),now,intake.id);
+        this.appendEvent(intake.id,'reopen-unverified:'+saga.operation_id,COMPLETION_ACTOR,'intake_reopened_unfinished',reopened,now);
+      }
+    });
+  }
   private async scheduleHasActiveSession(scheduleId:string):Promise<boolean>{
     return !!this.db.one("SELECT id FROM intakes WHERE schedule_id=? AND status IN ('queued','running') LIMIT 1",scheduleId);
   }
@@ -1543,16 +1592,17 @@ export class ProjectDO {
       acceptance_criteria: this.parse(row.acceptance_criteria_json), status: row.status,
       assigned_machine_id: row.assigned_machine_id, session_id: row.session_id,
       linked_sessions: this.sessionLinks.links(row.id),
-      dispatch: saga ? this.sagaView(saga) : undefined,
+      dispatch: saga ? this.sagaView(saga, row.status) : undefined,
       priority:row.priority??2,original_ask:{title:row.original_title??row.title,text:row.original_text??row.text},provenance:this.parse(row.source_json),parent_intake_id:row.parent_intake_id??null,schedule_id:row.schedule_id??null,occurrence_id:row.occurrence_id??null,final_evidence: this.parse(row.final_evidence_json), created_at: row.created_at, updated_at: row.updated_at,
     };
   }
 
-  private sagaView(saga: SagaRow): JsonRecord {
+  private sagaView(saga: SagaRow, intakeStatus?: string): JsonRecord {
     const picker=normalizeStartPickerEvidence((this.parse(saga.routing_json) as JsonRecord|null)?.picker);
+    const state=saga.state==='complete'&&intakeStatus&&!['completed-awaiting-review','accepted'].includes(intakeStatus)?'failed':saga.state;
     return {
       id: saga.session_id, operation_id: saga.operation_id, attempt_operation_id: saga.attempt_operation_id, intake_id: saga.intake_id,
-      machine_id: saga.machine_id, epoch: saga.epoch, state: saga.state, native_id: saga.native_id,
+      machine_id: saga.machine_id, epoch: saga.epoch, state, native_id: saga.native_id,
       attempt: saga.attempt, next_action_at: saga.next_action_at,
       picker,policy_id:picker?.policy_id??null,policy_version:picker?.policy_version??null,
       ...(() => {
