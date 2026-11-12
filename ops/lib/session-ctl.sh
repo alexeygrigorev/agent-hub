@@ -79,8 +79,9 @@ hub_report() {  # $1 = state
 
 # Exact-time checks: the 10-min timer alone would bound detection at ~41 min. Each transient
 # timer runs this role's check directly, not watchdog.sh, so it never waits behind the other
-# role or the shared service lock. The per-role lock (role_lock) is held only by one
-# orchestrator check at a time, so a deadline waits at most for an in-flight check of the
+# role or the shared service lock. Every mutating command of either role (start, check,
+# restart) holds the per-role lock (role_lock), so Hub start publication, binding and stop
+# are serialized per role; a deadline waits at most for an in-flight check of the
 # same session (seconds; a minute or more only while a restart is already recovering it).
 SELF="$(readlink -f "$0")"
 LOCK_DIR="${OPS_LOCK_DIR:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}}"
@@ -536,8 +537,42 @@ oncall_inbox_stalled() {
 # pinned in $PENDING: key, engine and the exact argv. Every later attempt
 # replays that identical request until Hub gives a definitive answer, so a
 # changed quota, route or config can never draw a second, different start.
+#
+# Durability: stdin is staged in a unique file beside the target, fsynced, then
+# published atomically (replace, or link that refuses an existing target when
+# $2 = noclobber) and the directory is fsynced, so a crash leaves either the old
+# or the new record, never a torn one. The binding is durable before the pending
+# request is dropped, so one of the two always survives.
 PENDING="$STATE/hub_start_pending"
 has_pending() { [ -s "$PENDING" ]; }
+durable_put() {  # $1 = target, $2 = replace|noclobber; content on stdin
+  python3 -c '
+import os,sys,tempfile
+target,mode=sys.argv[1],sys.argv[2]
+d=os.path.dirname(target) or "."
+data=sys.stdin.buffer.read()
+fd,tmp=tempfile.mkstemp(prefix="."+os.path.basename(target)+".",dir=d)
+try:
+    os.write(fd,data); os.fsync(fd); os.close(fd); fd=-1
+    if mode=="noclobber":
+        os.link(tmp,target)
+    else:
+        os.replace(tmp,target); tmp=None
+finally:
+    if fd>=0: os.close(fd)
+    if tmp and os.path.lexists(tmp): os.unlink(tmp)
+dfd=os.open(d,os.O_RDONLY)
+try: os.fsync(dfd)
+finally: os.close(dfd)
+' "$1" "$2"
+}
+drop_pending() {  # only after the binding that supersedes it is durable
+  rm -f "$PENDING" && python3 -c '
+import os,sys
+fd=os.open(sys.argv[1],os.O_RDONLY)
+try: os.fsync(fd)
+finally: os.close(fd)' "$STATE"
+}
 hub_start() {
   local hub_engine key out err rc parsed hub_id intake other argv=() rec=()
   if has_pending; then
@@ -559,10 +594,11 @@ hub_start() {
     argv=(sessions start --workspace "$RUNDIR/$SUB" --name "$TAG" --engine "$hub_engine" "${model_args[@]}"
       --purpose implement --interactive --reason "Pinned $ROLE coordinator route" --intake-task-id "$intake"
       --key "$key" --wait --timeout 150)
-    # Publish the request durably before sending it.
-    printf '%s\0' "$key" "$ENGINE" "${argv[@]}" > "$PENDING.tmp" && sync "$PENDING.tmp" \
-      && mv -f "$PENDING.tmp" "$PENDING" && sync "$STATE" \
-      || { log "cannot record pending Hub start; recovery held"; return 1; }
+    # Publish the request durably before sending it. noclobber: a pending
+    # request that appeared meanwhile is never overwritten (callers also hold
+    # the role lock, so this is a second line of defence).
+    printf '%s\0' "$key" "$ENGINE" "${argv[@]}" | durable_put "$PENDING" noclobber \
+      || { log "cannot record pending Hub start (pending request exists or write failed); recovery held"; return 1; }
   fi
   out="$STATE/hub_start.out"; err="$STATE/hub_start.err"
   HUB_CONFIG_FILE="$HUB_CFG" T=180 t hub "${argv[@]}" >"$out" 2>"$err"; rc=$?
@@ -591,24 +627,36 @@ ok=(rc==0 and s.get("state")=="running" and s.get("id",hub_id)==hub_id
     and isinstance(native,str) and safe.match(native) and isinstance(ws,str) and ws.startswith("/"))
 if ok:
     rec.update(native_id=native,native_tag="task-hub2-"+hub_id,workspace=ws)
-tmp=binding+".tmp"
-with open(tmp,"w") as f: json.dump(rec,f)
-os.replace(tmp,binding)
+import tempfile
+d=os.path.dirname(binding) or "."
+fd,tmp=tempfile.mkstemp(prefix=".hub_binding.",dir=d)
+try:
+    with os.fdopen(fd,"w") as f:
+        json.dump(rec,f); f.flush(); os.fsync(f.fileno())
+    os.replace(tmp,binding)
+except BaseException:
+    if os.path.lexists(tmp): os.unlink(tmp)
+    sys.exit(5)  # binding not durable: keep the pending request
+dfd=os.open(d,os.O_RDONLY)
+try: os.fsync(dfd)
+finally: os.close(dfd)
 print(hub_id)
 sys.exit(0 if ok else 4)
 PY
 )
   case $? in
-    0) rm -f "$PENDING"; hub_id="$parsed"
+    0) drop_pending || { log "cannot drop pending Hub start after durable binding; recovery held"; return 1; }
+       hub_id="$parsed"
        log "Hub session $hub_id running as native $(binding_get native_id) (tag $(binding_get native_tag))"
        return 0 ;;
-    4) rm -f "$PENDING"  # Hub named the session; the binding now governs it
+    4) drop_pending  # Hub named the session; the durable binding now governs it
        log "Hub start unconfirmed: session $parsed not bound to a running native session; recovery held" ;;
+    5) log "Hub answered (rc=$rc) but its binding could not be recorded durably; pending request kept for replay; recovery held" ;;
     *) local reason; reason=$(diag "$err")
        if [[ "$reason" =~ session_start_failed\;\ session\ ([A-Za-z0-9][A-Za-z0-9_.:-]{0,127})\ reached ]]; then
          # Hub created the session but it did not run: remember it so it is
          # stopped through Hub before the next attempt.
-         printf '{"hub_id":"%s"}\n' "${BASH_REMATCH[1]}" > "$BINDING.tmp" && mv -f "$BINDING.tmp" "$BINDING" && rm -f "$PENDING"
+         printf '{"hub_id":"%s"}\n' "${BASH_REMATCH[1]}" | durable_put "$BINDING" replace && drop_pending
        fi
        # Any other failure (HTTP status included) is not proof that Hub created
        # nothing: the pending request is replayed unchanged.
@@ -795,14 +843,14 @@ check() {
 }
 
 case "$CMD" in
-  start) if [ "$ROLE" = orchestrator ]; then role_lock || exit 75; fi; start ;;
-  ensure|check) if [ "$ROLE" = orchestrator ]; then role_lock || exit 75; fi; check ;;
+  start) role_lock || exit 75; start ;;
+  ensure|check) role_lock || exit 75; check ;;
   session-id)  # exact bound (or pre-migration) live session id; 1 = none, 3 = census failed
     id=$(find_session) || exit 3; [ -n "$id" ] || exit 1; printf '%s\n' "$id" ;;
   status) id=$(find_session); [ -n "$id" ] || { log "not running"; exit 1; }
     hid=""; [ "$id" = "$(binding_get native_id)" ] && hid=$(binding_get hub_id)
     log "running $id${hid:+ (Hub session $hid)}"; echo "attach: a attach $id" ;;
-  restart) if [ "$ROLE" = orchestrator ]; then role_lock || exit 75; fi; FORCE=1 restart "manual" ;;
+  restart) role_lock || exit 75; FORCE=1 restart "manual" ;;
   handoff-restart)  # called BY the session itself after writing handoff.md; detaches so it survives the kill
     FORCE=1 setsid nohup bash -c "sleep 5; '$0' $ROLE restart" >>"$STATE/restart.log" 2>&1 < /dev/null 9>&- & log "restart scheduled in 5s" ;;
   skills-sync) skills_sync ;;

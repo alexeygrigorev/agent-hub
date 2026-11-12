@@ -758,6 +758,70 @@ class OpsWatchdogTest(unittest.TestCase):
         self.assertIn('delivered to orchestrator-main (old)', result.stdout)
 
 
+class SessionCtlDurabilityTest(unittest.TestCase):
+    """Review r2 B1: serialized per-role mutators and durable record handoff."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+        self.bin = self.home / 'bin'
+        self.bin.mkdir()
+        for cmd in ('a', 'git', 'gh', 'sleep', 'systemd-run', 'systemctl', 'hub'):
+            (self.bin / cmd).write_text(ADAPTER)
+            (self.bin / cmd).chmod(0o755)
+        (self.home / 'runtime.json').write_text(json.dumps({'sessions': []}))
+        self.env = {'PATH': str(self.bin) + ':' + os.environ['PATH'], 'HOME': str(self.home),
+                    'OPS_LOCK_DIR': str(self.home), 'ROLE_LOCK_WAIT': '1', 'OPS_TIMERS': '0',
+                    'HUB_PARSER_ROOT': str(HOST_SRC)}
+
+    def test_oncall_mutators_wait_for_the_role_lock(self):
+        # A second oncall mutator (manual start, handoff restart, deadline
+        # timer) must not run beside an in-flight one: Hub start publication,
+        # binding and stop are serialized per role, as for the orchestrator.
+        lock = self.home / 'ops-ctl-oncall.lock'
+        holder = subprocess.Popen(['flock', str(lock), 'sleep', '30'], stdout=subprocess.DEVNULL)
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        deadline = time.time() + 10
+        while time.time() < deadline and subprocess.run(['flock', '-n', str(lock), 'true']).returncode == 0:
+            time.sleep(0.05)
+        for command in ('start', 'check', 'restart'):
+            result = subprocess.run(['bash', str(CTL), 'oncall', command], env=self.env, text=True,
+                                    capture_output=True, timeout=60)
+            self.assertEqual(result.returncode, 75, command + result.stdout + result.stderr)
+            self.assertIn('role lock busy', result.stdout)
+        calls = (self.home / 'calls').read_text() if (self.home / 'calls').exists() else ''
+        self.assertNotIn('hub sessions', calls)
+        self.assertNotIn('a start', calls)
+
+    def durable_put(self, target, mode, data):
+        body = CTL.read_text()
+        fn = body[body.index('durable_put() {'):]
+        fn = fn[:fn.index('\n}\n') + 3]
+        return subprocess.run(['bash', '-c', fn + 'durable_put "$1" "$2"', 'x', str(target), mode],
+                              input=data, capture_output=True, timeout=30)
+
+    def test_durable_put_publishes_atomically_and_never_clobbers(self):
+        target = self.home / 'state' / 'hub_start_pending'
+        target.parent.mkdir()
+        first = b'key-A\x00go\x00sessions\x00start\x00'
+        self.assertEqual(self.durable_put(target, 'noclobber', first).returncode, 0)
+        self.assertEqual(target.read_bytes(), first)
+        # A concurrent publisher with a different key fails loudly; the first
+        # request stays byte-identical.
+        lost = self.durable_put(target, 'noclobber', b'key-B\x00zai\x00')
+        self.assertNotEqual(lost.returncode, 0)
+        self.assertEqual(target.read_bytes(), first)
+        binding = target.parent / 'hub_binding.json'
+        self.assertEqual(self.durable_put(binding, 'replace', b'{"hub_id":"h1"}').returncode, 0)
+        self.assertEqual(self.durable_put(binding, 'replace', b'{"hub_id":"h2"}').returncode, 0)
+        self.assertEqual(binding.read_bytes(), b'{"hub_id":"h2"}')
+        # Staging files are unique and never left behind (no fixed .tmp path).
+        self.assertEqual(sorted(p.name for p in target.parent.iterdir()), ['hub_binding.json', 'hub_start_pending'])
+        self.assertNotIn('$PENDING.tmp', CTL.read_text())
+
+
 class SessionCtlShellIsolationTest(unittest.TestCase):
     """The shell suite isolates itself from whatever HOME its caller has.
 
