@@ -344,7 +344,7 @@ def paired_stream_output_ok(captured, expected, engine):
             tool = step.get('tool_name')
             info = step.get('tool_info')
             if (not valid_native_id(conversation) or type(index) is not int or not 0 <= index <= 2**31 - 1
-                    or tool not in ('run_command', 'manage_task', 'schedule', 'command_status', 'wait', 'wait_5_seconds')
+                    or tool not in ('run_command', 'read_file', 'manage_task', 'schedule', 'command_status', 'wait', 'wait_5_seconds')
                     or not isinstance(info, dict) or info.get('name') != tool):
                 return False
             if any(part.get(key) not in (None, False, '') for part in (event, step, info)
@@ -356,6 +356,16 @@ def paired_stream_output_ok(captured, expected, engine):
             if tool == 'run_command':
                 if (set(params) != {'CommandLine'}
                         or not isinstance(params['CommandLine'], str) or not params['CommandLine']):
+                    return False
+            elif tool == 'read_file':
+                # NONPROOF class: classified only; its output never sets proven.
+                if (not set(params) <= {'Path', 'StartLine', 'EndLine'}
+                        or not isinstance(params.get('Path'), str) or not params['Path']
+                        or '\0' in params['Path']
+                        or not all(type(params[k]) is int and 0 <= params[k] <= 2**31 - 1
+                                   for k in ('StartLine', 'EndLine') if k in params)
+                        or ('StartLine' in params and 'EndLine' in params
+                            and params['EndLine'] < params['StartLine'])):
                     return False
             elif tool == 'manage_task':
                 if (not params or not set(params) <= {'Action', 'TaskId', 'Input'}

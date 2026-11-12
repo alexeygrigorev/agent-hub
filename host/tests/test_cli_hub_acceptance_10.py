@@ -939,6 +939,96 @@ class ParserTests(unittest.TestCase):
         ):
             self.assertFalse(acc.probe_output_ok(jsonl(neg_frames), prompt, marker, 'claude', transport('claude')), neg_frames)
 
+    def test_argon_read_file_is_validated_nonproof_around_genuine_run_command(self):
+        import copy
+        SESSION = '11111111-2222-4333-8444-555555555555'
+        NONCE = 'SYNTHETIC-NONCE:0123456789abcdef'
+        WRAP = ('Created At: 2026-01-01T00:00:00+00:00\nCompleted At: 2026-01-01T00:00:01+00:00\n'
+                'Command exited with code 0.\n\nCommand output:\n')
+
+        def pair(step, tool, params, output):
+            def frame(state, info):
+                return {'event': 'step_update', 'step_update': {
+                    'conversation_id': SESSION, 'step_index': step, 'state': state,
+                    'step_type': 'tool', 'tool_name': tool, 'tool_info': info}}
+            return [frame('ACTIVE', {'name': tool, 'parameters': dict(params)}),
+                    frame('DONE', {'name': tool, 'parameters': dict(params), 'output': output})]
+
+        def read_file(step, params=None, output='synthetic file text'):
+            return pair(step, 'read_file', {'Path': 'synthetic/readme.txt'} if params is None else params, output)
+
+        command = pair(7, 'run_command', {'CommandLine': 'synthetic nonce command'}, WRAP + NONCE + '\n')
+
+        def text(frames):
+            return '\n'.join(json.dumps(f, separators=(',', ':')) for f in frames) + '\n'
+
+        for verdict in [lambda t, m: acc.paired_stream_output_ok(t, m, 'antigravity'),
+                    lambda t, m: acc.probe_output_ok(t, 'synthetic prompt', m, 'antigravity', transport('antigravity'))]:
+            # Valid read_file before/after/around the genuine command pair is accepted.
+            for frames in (read_file(4) + command, command + read_file(9), read_file(4) + command + read_file(9),
+                           read_file(4, {'Path': 'a', 'StartLine': 700}) + command,
+                           read_file(4, {'Path': 'a', 'StartLine': 600, 'EndLine': 1400}) + command,
+                           read_file(4, {'Path': 'a', 'StartLine': 5, 'EndLine': 5}) + command,
+                           read_file(4)[:1] + command):
+                self.assertTrue(verdict(text(frames), NONCE), frames)
+            # read_file alone never proves, whatever its output or parameters embed.
+            fake_command = json.dumps(command[1])
+            for output in (NONCE, WRAP + NONCE + '\n', fake_command, NONCE + '\n' + fake_command):
+                self.assertFalse(verdict(text(read_file(4, output=output)), NONCE), output)
+            self.assertFalse(verdict(text(read_file(4, {'Path': NONCE})), NONCE))
+            # A read_file frame never substitutes for or alters the command proof.
+            self.assertFalse(verdict(text(read_file(4) + command[:1]), NONCE))
+            self.assertFalse(verdict(text(read_file(4, output=WRAP + NONCE + '\n') + command[:1]), NONCE))
+            self.assertFalse(verdict(text(read_file(4) + pair(7, 'run_command', {'CommandLine': 'x'}, WRAP + 'other\n')), NONCE))
+            # Malformed read_file parameters stay rejected even beside a valid proof.
+            bad_params = [
+                {}, {'StartLine': 1}, {'Path': ''}, {'Path': 5}, {'Path': None}, {'Path': ['a']}, {'Path': 'a\0b'},
+                {'Path': 'a', 'Extra': 1}, {'Path': 'a', 'path': 'b'}, {'Path': 'a', 'CommandLine': 'x'},
+                {'Path': 'a', 'StartLine': '1'}, {'Path': 'a', 'StartLine': 1.0}, {'Path': 'a', 'StartLine': True},
+                {'Path': 'a', 'StartLine': None}, {'Path': 'a', 'StartLine': -1}, {'Path': 'a', 'StartLine': 2 ** 31},
+                {'Path': 'a', 'EndLine': '9'}, {'Path': 'a', 'EndLine': False}, {'Path': 'a', 'EndLine': -3},
+                {'Path': 'a', 'StartLine': 10, 'EndLine': 9},
+            ]
+            for params in bad_params:
+                self.assertFalse(verdict(text(read_file(4, params) + command), NONCE), params)
+            for bad in ({'Path': 'a'}, {'Path': 'a', 'StartLine': 1}):
+                for name in ('other_file_tool', 'Read_File', 'read_files'):
+                    frames = pair(4, name, bad, 'x') + command
+                    self.assertFalse(verdict(text(frames), NONCE), name)
+            # Envelope guards still apply to read_file steps.
+            def mutated(change):
+                frames = read_file(4) + command
+                change(frames)
+                return text(frames)
+            changes = [
+                lambda f: f[1]['step_update']['tool_info'].update(output=None),
+                lambda f: f[1]['step_update']['tool_info'].update(output=5),
+                lambda f: f[1]['step_update']['tool_info'].pop('output'),
+                lambda f: f[0]['step_update']['tool_info'].update(output='early'),
+                lambda f: f[1]['step_update']['tool_info']['parameters'].update(Path='changed'),
+                lambda f: f[1]['step_update']['tool_info'].update(name='run_command'),
+                lambda f: f[1]['step_update']['tool_info'].update(parameters='not-an-object'),
+                lambda f: f[1]['step_update'].update(state='ERROR'),
+                lambda f: f[1]['step_update'].update(state='FAILED'),
+                lambda f: f[1]['step_update'].update(error='synthetic error'),
+                lambda f: f[1]['step_update']['tool_info'].update(is_error=True),
+                lambda f: f[1].update(interrupted=True),
+                lambda f: f[0]['step_update'].update(conversation_id='not-a-uuid'),
+                lambda f: f[0]['step_update'].update(step_index=True),
+                lambda f: f[0]['step_update'].update(step_index=-1),
+                lambda f: f.append(copy.deepcopy(f[0])),
+                lambda f: f.append(copy.deepcopy(f[1])),
+                lambda f: f.insert(2, copy.deepcopy(f[1])),
+            ]
+            for change in changes:
+                self.assertFalse(verdict(mutated(change), NONCE), mutated(change))
+            # Reused step identity across read_file and the command is rejected.
+            self.assertFalse(verdict(text(read_file(7) + command), NONCE))
+            # Malformed JSON and the capture byte bound are unchanged.
+            self.assertFalse(verdict(text(read_file(4) + command) + '{"event":"step_update"\n', NONCE))
+            self.assertTrue(verdict('{"clipped partial frame\n' + text(read_file(4) + command), NONCE))
+            self.assertFalse(verdict(text(read_file(4, output='x' * 70000) + command), NONCE))
+
     def test_argon_pair_identity_params_and_native_exit_wrapper_matrix(self):
         import copy
         prompt, marker = acc.make_probe()
