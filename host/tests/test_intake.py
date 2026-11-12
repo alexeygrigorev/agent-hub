@@ -627,6 +627,39 @@ class TestIntakeCli(unittest.TestCase):
             self.assertEqual(self.run_cli('intake', 'revoke', 'g1', '--payload-file', '-')[0], 0)
             self.assertEqual(transport.call_args.args[1], '/api/intake/grants/g1/revoke')
 
+    def test_history_forwards_explicit_cursor_and_limit_in_normal_mode(self):
+        page = {'events': [{'seq': 7}], 'next': 7}
+        with patch.object(intake, 'request', return_value=page) as transport:
+            code, out, error = self.run_cli('intake', 'history', 'task-1', '--after', '6', '--limit', '50')
+        self.assertEqual(code, 0, error)
+        transport.assert_called_once_with('GET', '/api/intake/tasks/task-1/history?limit=50&after=6')
+        self.assertEqual(json.loads(out), page)
+        for argv, expected in ((('--after', '0'), '?after=0'), (('--limit', '1'), '?limit=1')):
+            with self.subTest(argv=argv), patch.object(intake, 'request', return_value={}) as transport:
+                self.assertEqual(self.run_cli('intake', 'history', 'task-1', *argv)[0], 0)
+                transport.assert_called_once_with('GET', '/api/intake/tasks/task-1/history' + expected)
+
+    def test_history_default_and_archived_requests_are_unchanged(self):
+        with patch.object(intake, 'request', return_value={'events': [], 'next': None}) as transport:
+            code, out, error = self.run_cli('intake', 'history', 'task-1')
+        self.assertEqual(code, 0, error)
+        transport.assert_called_once_with('GET', '/api/intake/tasks/task-1/history')
+        self.assertEqual(json.loads(out), {'events': [], 'next': None})
+        for argv, expected in ((('--archived',), '?archived=1&limit=100'),
+                               (('--archived', '--after', '9'), '?archived=1&limit=100&after=9'),
+                               (('--archived', '--after', '9', '--limit', '3'), '?archived=1&limit=3&after=9')):
+            with self.subTest(argv=argv), patch.object(intake, 'request', return_value={}) as transport:
+                self.assertEqual(self.run_cli('intake', 'history', 'task-1', *argv)[0], 0)
+                transport.assert_called_once_with('GET', '/api/intake/tasks/task-1/history' + expected)
+
+    def test_invalid_normal_history_page_never_reaches_transport(self):
+        for option, value in (('--limit', '0'), ('--limit', '101'), ('--after', '-1')):
+            with self.subTest(option=option), patch.object(intake, 'request') as transport:
+                code, _, error = self.run_cli('intake', 'history', 'task-1', option, value)
+                self.assertEqual(code, 1)
+                self.assertIn('Invalid history page', error)
+                transport.assert_not_called()
+
     def test_invalid_id_and_exception_never_echo_private_values(self):
         for identifier in ('..', '../rules', 'task?admin=true', 'task/other'):
             with patch.object(intake, 'request') as transport:
