@@ -898,3 +898,17 @@ test('recovery_exhausted alert names the cause from the last session note when n
     assert.match((await json(await f.call('/api/intakes/'+id))).task.current_state,/Cause: .*attempt 2: portal refresh token family revoked/);
   }finally{f.close();}
 });
+
+test('an operator stop keeps its reason and raises no developer alert even after a hard blocker record',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'blocked-then-stopped');
+    assert.equal((await start(f,id,'first')).status,201);
+    const first=await run(f,id);
+    await blocked(f,id,first.session_id,'permission','HTTP 403');
+    const r=await f.call('/_internal/finish','POST',{...first,exit_code:143,native_exit_confirmed:true,stop_requested:true,evidence:{result:'exit',stop_requested:true}});
+    assert.equal(r.status,200);
+    assert.equal(completion(f,id).reason,'stop_requested');assert.equal(completion(f,id).continuation,undefined);
+    assert.equal(events(f,id).filter(e=>e.kind==='developer_alert_raised'&&e.body.kind==='blocked').length,0);
+  }finally{f.close();}
+});

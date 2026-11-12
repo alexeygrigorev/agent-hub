@@ -1269,7 +1269,9 @@ export class ProjectDO {
     const depth=this.continuationDepth(intake.id);
     const contractOmitted=(this.parse(saga.routing_json) as JsonRecord|null)?.completion_contract_omitted==='launch_budget';
     const unfinished=claim?undefined:this.unfinishedCause(intake,saga,reason);
-    const blocker=unfinished?.blocker,hard=!!blocker&&HARD_BLOCKERS.includes(blocker.cause);
+    // Only a session that ended on its own is judged by its blocker; an operator
+    // stop, a lost host or a failed launch keeps its own reason and alert policy.
+    const blocker=unfinished?.blocker,hard=continuable&&!!blocker&&HARD_BLOCKERS.includes(blocker.cause);
     const record:CompletionRecord={controlled:true,session_id:saga.session_id,outcome:claim?'claimed':'unfinished',
       reason:claim?'completion_claimed':contractOmitted?'completion_contract_omitted_launch_budget':hard?'blocked_'+blocker!.cause:reason,depth,
       ...(claim?.summary?{summary:claim.summary}:{}),...(unfinished?{cause:unfinished.cause}:{}),...(blocker?{blocker}:{})};
