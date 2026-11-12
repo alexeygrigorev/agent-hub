@@ -508,7 +508,9 @@ def recover_repin(root, releases):
     state = read_repin_journal(journal)
     release = release_path(releases, state['release'])
     current = root / 'current'
-    committed = (state['verified'] and current.is_symlink() and current.resolve() == release
+    # A missing candidate is never committed, whatever the links say.
+    committed = (state['verified'] and not release.is_symlink() and release.is_dir()
+                 and current.is_symlink() and current.resolve() == release
                  and not (release / '.installing').exists() and not (root / 'retained-switch.json').exists())
     if committed:
         commit_repin(root, releases)
@@ -615,8 +617,10 @@ def repin_managed_claude(target, base, root, updater):
     archive = target / 'hub.pyz'
     if not matches_installed_artifact(archive, installed['artifacts']['hub.pyz']):
         raise ValueError('installed release artifact mismatch: hub.pyz')
-    # Fresh payloads must be durable before any profile can name them.
+    # Fresh payloads and the candidate's entry in the releases parent must be
+    # durable before any profile can name them.
     sync_environment(target)
+    sync_directory(target.parent)
     advance_updater(root, target.name, updater())
     env = {key: value for key, value in os.environ.items()
            if key not in REPIN_ENV_DROP and not key.startswith('PYTHON')}

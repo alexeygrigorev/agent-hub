@@ -996,3 +996,44 @@ def test_fresh_payload_barrier_failure_refuses_before_pin(world):
     assert world.helper_runs == [] and world.hub_calls == []
     assert all(e['pin'] != world.command_for(candidate) for e in barriers.events)
     assert_rolled_back(world, old, original)
+
+
+def test_releases_parent_barrier_failure_refuses_before_pin(world):
+    old = upgrade_world(world)
+    original = world.profile.read_text()
+    candidate = world.releases / NEW
+    barriers = Barriers(world, fail=lambda e: e['path'] == world.releases and not e['journal'])
+    with patch.object(updater, 'sync_directory', barriers), pytest.raises(OSError, match='durability barrier'):
+        world.install()
+    assert world.helper_runs == [] and world.hub_calls == []
+    assert all(e['pin'] != world.command_for(candidate) for e in barriers.events)
+    assert_rolled_back(world, old, original)
+
+
+def test_releases_parent_synced_after_payload_before_pin_publication(world):
+    upgrade_world(world)
+    candidate = world.releases / NEW
+    barriers = Barriers(world)
+    with patch.object(updater, 'sync_directory', barriers):
+        world.install()
+    published = next(i for i, e in enumerate(barriers.events) if e['pin'] == world.command_for(candidate))
+    paths = [e['path'] for e in barriers.events[:published]]
+    assert candidate / 'bin' in paths and world.releases in paths
+    assert paths.index(world.releases, paths.index(candidate)) > paths.index(candidate)
+
+
+def test_recovery_never_commits_a_missing_candidate(world):
+    old = upgrade_world(world)
+    original = world.profile.read_text()
+    world.install()
+    candidate = world.releases / NEW
+    journal = {'schema': 1, 'release': NEW, 'previous_release': OLD, 'profile_path': str(world.profile),
+               'managed_root': str(world.managed), 'previous_command': world.command_for(old),
+               'command': world.command_for(candidate), 'generation': GENERATION, 'revision': REV, 'verified': True}
+    (world.root / updater.REPIN_JOURNAL).write_text(json.dumps(journal))
+    # Power loss dropped the candidate's directory entry; current still names it.
+    shutil.rmtree(candidate)
+    assert (world.root / 'current').is_symlink()
+    recover_world(world)
+    assert world.profile.read_text() == original and world.pinned() == world.command_for(old)
+    assert not (world.root / updater.REPIN_JOURNAL).exists()
