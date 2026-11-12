@@ -341,31 +341,60 @@ def paired_stream_output_ok(captured, expected, engine):
             if event.get('event') != 'step_update' or not isinstance(step, dict) or step.get('step_type') != 'tool':
                 continue
             conversation, index = step.get('conversation_id'), step.get('step_index')
+            tool = step.get('tool_name')
             info = step.get('tool_info')
             if (not valid_native_id(conversation) or type(index) is not int or not 0 <= index <= 2**31 - 1
-                    or step.get('tool_name') != 'run_command' or not isinstance(info, dict)
-                    or info.get('name') != 'run_command'):
+                    or tool not in ('run_command', 'manage_task', 'schedule', 'command_status', 'wait', 'wait_5_seconds')
+                    or not isinstance(info, dict) or info.get('name') != tool):
                 return False
             if any(part.get(key) not in (None, False, '') for part in (event, step, info)
                    for key in ('error', 'is_error', 'interrupted')):
                 return False
             params = info.get('parameters')
-            if (not isinstance(params, dict) or set(params) != {'CommandLine'}
-                    or not isinstance(params['CommandLine'], str) or not params['CommandLine']):
+            if not isinstance(params, dict):
+                return False
+            if tool == 'run_command':
+                if (set(params) != {'CommandLine'}
+                        or not isinstance(params['CommandLine'], str) or not params['CommandLine']):
+                    return False
+            elif tool == 'manage_task':
+                if (not params or not set(params) <= {'Action', 'TaskId', 'Input'}
+                        or params.get('Action') not in ('list', 'status', 'kill', 'send_input')
+                        or not all(isinstance(v, str) and bool(v) for v in params.values())):
+                    return False
+            elif tool == 'schedule':
+                if (not params
+                        or not set(params) <= {'Prompt', 'DurationSeconds', 'CronExpression',
+                                               'TimerCondition', 'ExactTiming', 'IsDaemon', 'MaxIterations'}
+                        or not isinstance(params.get('Prompt'), str) or not params['Prompt']
+                        or not all((k in ('Prompt', 'CronExpression', 'TimerCondition') and isinstance(v, str) and bool(v))
+                                   or (k in ('DurationSeconds', 'MaxIterations') and type(v) is int and v > 0)
+                                   or (k in ('ExactTiming', 'IsDaemon') and type(v) is bool)
+                                   for k, v in params.items())):
+                    return False
+            elif (bool(params) if tool == 'wait_5_seconds'
+                  else (not params
+                        or not all(provider_id(k)
+                                   and ((isinstance(v, str) and bool(v))
+                                        or (type(v) is int and v >= 0)
+                                        or type(v) is bool)
+                                   for k, v in params.items()))):
                 return False
             identity = (conversation, index)
             if step.get('state') == 'ACTIVE':
                 if identity in uses or identity in results or 'output' in info:
                     return False
-                uses[identity] = params
+                uses[identity] = (tool, params)
             elif step.get('state') == 'DONE':
                 if identity in results:
                     return False
                 results.add(identity)
-                if identity not in uses:
-                    continue
-                if params != uses[identity] or not isinstance(info.get('output'), str):
+                if identity in uses and uses[identity] != (tool, params):
                     return False
+                if not isinstance(info.get('output'), str):
+                    return False
+                if tool != 'run_command' or identity not in uses:
+                    continue
                 # Only the native wrapper's anchored zero status counts. A fake
                 # zero status embedded inside command output cannot override it.
                 match = re.fullmatch(r'Created At: ([^\n]+)\nCompleted At: ([^\n]+)\n'

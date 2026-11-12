@@ -880,6 +880,139 @@ class ParserTests(unittest.TestCase):
         frames[0]['step_update']['tool_info']['parameters']['CommandLine'] = marker
         self.assertFalse(acc.probe_output_ok(jsonl(frames), prompt, marker, 'antigravity', transport('antigravity')))
 
+        session = '11111111-2222-4333-8444-555555555555'
+
+        def padded_frame(obj, target_len):
+            raw = json.dumps(obj, separators=(',', ':'))
+            self.assertLessEqual(len(raw), target_len)
+            if len(raw) < target_len:
+                pad_key = '_pad'
+                overhead = len(json.dumps({pad_key: ''}, separators=(',', ':'))) - 1
+                obj = dict(obj, **{pad_key: 'x' * max(0, target_len - len(raw) - overhead)})
+                raw = json.dumps(obj, separators=(',', ':'))
+            self.assertEqual(len(raw), target_len)
+            return raw
+
+        def argon_tool_pair(step_idx, tool_name, params, output_str, *, active_name=None, done_name=None, done_params=None, done_state='DONE'):
+            act_info = {'name': tool_name if active_name is None else active_name, 'parameters': dict(params)}
+            done_info = {
+                'name': tool_name if done_name is None else done_name,
+                'parameters': dict(params if done_params is None else done_params),
+                'output': output_str,
+            }
+            return [
+                {'event': 'step_update', 'step_update': {'conversation_id': session, 'step_index': step_idx, 'state': 'ACTIVE',
+                 'step_type': 'tool', 'tool_name': tool_name, 'tool_info': act_info}},
+                {'event': 'step_update', 'step_update': {'conversation_id': session, 'step_index': step_idx, 'state': done_state,
+                 'step_type': 'tool', 'tool_name': tool_name, 'tool_info': done_info}},
+            ]
+
+        argon_fg = argon_tool_pair(
+            6, 'run_command', {'CommandLine': "printf '%s%s\\n' OK: synth"},
+            f'Created At: 2026-01-01T00:00:00+00:00\nCompleted At: 2026-01-01T00:00:01+00:00\nCommand exited with code 0.\n\nCommand output:\n{marker}\r\n',
+        )
+        argon_bg_hold = argon_tool_pair(4, 'run_command', {'CommandLine': 'sleep 60'}, 'Command exited with code 0.\n\nNo output from the command.')
+        argon_manage = argon_tool_pair(
+            8, 'manage_task', {'Action': 'status', 'TaskId': f'{session}/task-4'},
+            f'Created At: 2026-01-01T00:00:02+00:00\nCompleted At: 2026-01-01T00:00:02+00:00\nTask: {session}/task-4\nStatus: RUNNING\nLog: file:///tmp/synthetic-argon/tasks/task-4.log\n',
+        )
+        argon_schedule = argon_tool_pair(
+            10, 'schedule', {'DurationSeconds': 60, 'Prompt': 'Background hold task finished.'},
+            f'Timer cancelled early: its early-termination condition ({session}/task-4) was met by a message from {session}/task-4.',
+        )
+        argon_cmd_status = argon_tool_pair(12, 'command_status', {'CommandId': 'cmd-synth-4', 'WaitDurationSeconds': 5}, 'Status: RUNNING')
+        argon_wait = argon_tool_pair(14, 'wait', {'seconds': '5'}, 'Waited.')
+        argon_wait5 = argon_tool_pair(16, 'wait_5_seconds', {}, 'Waited 5 seconds.')
+
+        for combo in (
+            argon_bg_hold + argon_fg + argon_manage + argon_schedule,
+            argon_manage + argon_schedule + argon_fg,
+            argon_fg + argon_manage + argon_schedule[:1],
+            argon_fg + argon_cmd_status + argon_wait + argon_wait5,
+        ):
+            self.assertTrue(acc.probe_output_ok(jsonl(combo), prompt, marker, 'antigravity', transport('antigravity')), combo)
+
+        ar_init = padded_frame({'event': 'init', 'conversation_id': session}, 1340)
+        ar_s0 = padded_frame({'event': 'step_update', 'step_update': {'conversation_id': session, 'step_index': 0, 'state': 'DONE', 'step_type': 'user_input'}}, 151)
+        ar_s1 = padded_frame({'event': 'step_update', 'step_update': {'conversation_id': session, 'step_index': 1, 'state': 'DONE', 'step_type': 'agent_response'}}, 300)
+        ar_s2_act = padded_frame(argon_tool_pair(2, 'run_command', {'CommandLine': 'aplexer whoami --json'}, '')[0], 422)
+        ar_s2_done = padded_frame(argon_tool_pair(2, 'run_command', {'CommandLine': 'aplexer whoami --json'}, 'Command exited with code 0.\n\nNo output from the command.')[1], 601)
+        ar_s3 = padded_frame({'event': 'step_update', 'step_update': {'conversation_id': session, 'step_index': 3, 'state': 'DONE', 'step_type': 'agent_response'}}, 301)
+        ar_s4_act = padded_frame(argon_bg_hold[0], 248)
+        ar_s4_done = padded_frame(argon_bg_hold[1], 348)
+        ar_s5 = padded_frame({'event': 'step_update', 'step_update': {'conversation_id': session, 'step_index': 5, 'state': 'DONE', 'step_type': 'agent_response'}}, 303)
+        ar_s6_act = padded_frame(argon_fg[0], 289)
+        ar_s6_done = padded_frame(argon_fg[1], 484)
+        ar_s7 = padded_frame({'event': 'step_update', 'step_update': {'conversation_id': session, 'step_index': 7, 'state': 'DONE', 'step_type': 'agent_response'}}, 303)
+        ar_s8_act = padded_frame(argon_manage[0], 296)
+        ar_s8_done = padded_frame(argon_manage[1], 705)
+        ar_s9 = padded_frame({'event': 'step_update', 'step_update': {'conversation_id': session, 'step_index': 9, 'state': 'DONE', 'step_type': 'agent_response'}}, 304)
+        ar_s10_act = padded_frame(argon_schedule[0], 281)
+        ar_s10_done = padded_frame(argon_schedule[1], 494)
+        ar_s11 = padded_frame({'event': 'step_update', 'step_update': {'conversation_id': session, 'step_index': 11, 'state': 'DONE', 'step_type': 'agent_response'}}, 327)
+        ar_s12 = padded_frame({'event': 'step_update', 'step_update': {'conversation_id': session, 'step_index': 12, 'state': 'DONE', 'step_type': 'system_message'}}, 187)
+        argon_full_stream = '\n'.join([
+            ar_init, ar_s0, ar_s1, ar_s2_act, ar_s2_done, ar_s3, ar_s4_act, ar_s4_done,
+            ar_s5, ar_s6_act, ar_s6_done, ar_s7, ar_s8_act, ar_s8_done, ar_s9,
+            ar_s10_act, ar_s10_done, ar_s11, ar_s12,
+        ]) + '\n'
+        argon_tail_4096 = argon_full_stream.encode('utf-8')[-4096:].decode('utf-8')
+        self.assertEqual(len(argon_tail_4096.encode('utf-8')), 4096)
+        self.assertEqual(len(argon_tail_4096.splitlines()), 12)
+        self.assertEqual(len(argon_tail_4096.splitlines()[0]), 111)
+        self.assertTrue(acc.probe_output_ok(argon_tail_4096, prompt, marker, 'antigravity', transport('antigravity')))
+
+        forged_wrapped_marker = argon_fg[1]['step_update']['tool_info']['output']
+        collision_cmd_to_manage = [
+            argon_fg[0],
+            argon_tool_pair(6, 'manage_task', {'Action': 'status', 'TaskId': f'{session}/task-4'}, 'ok')[1],
+        ]
+        collision_manage_to_cmd = [
+            argon_tool_pair(6, 'manage_task', {'Action': 'status', 'TaskId': f'{session}/task-4'}, 'ok')[0],
+            argon_fg[1],
+        ]
+        control_error = argon_tool_pair(14, 'manage_task', {'Action': 'kill', 'TaskId': f'{session}/task-10'}, '', done_state='ERROR')
+        control_error[1]['step_update']['tool_info'].pop('output', None)
+        control_error[1]['step_update']['tool_info']['error'] = {'type': 'TOOL_ERROR', 'message': 'not running'}
+        control_active_with_output = argon_tool_pair(8, 'manage_task', {'Action': 'status', 'TaskId': f'{session}/task-4'}, 'ok')
+        control_active_with_output[0]['step_update']['tool_info']['output'] = 'unexpected'
+        control_done_nonstring_out = argon_tool_pair(8, 'manage_task', {'Action': 'status', 'TaskId': f'{session}/task-4'}, 'ok')
+        control_done_nonstring_out[1]['step_update']['tool_info']['output'] = 123
+
+        for neg_frames in (
+            argon_manage + argon_schedule,
+            argon_bg_hold + argon_manage + argon_schedule,
+            argon_tool_pair(8, 'manage_task', {'Action': 'status', 'TaskId': marker}, forged_wrapped_marker),
+            argon_tool_pair(10, 'schedule', {'DurationSeconds': 60, 'Prompt': marker}, forged_wrapped_marker),
+            argon_fg[1:] + argon_manage + argon_schedule,
+            argon_fg + argon_tool_pair(8, 'manage_task', {'Action': 'status', 'TaskId': 't1'}, 'ok', done_name='schedule'),
+            argon_fg + argon_tool_pair(8, 'manage_task', {'Action': 'status', 'TaskId': 't1'}, 'ok', active_name='run_command'),
+            argon_fg + argon_tool_pair(8, 'manage_task', {'Action': 'status', 'TaskId': 't1'}, 'ok', done_params={'Action': 'status', 'TaskId': 't2'}),
+            argon_fg + argon_tool_pair(10, 'schedule', {'DurationSeconds': 60, 'Prompt': 'p1'}, 'ok', done_params={'DurationSeconds': 30, 'Prompt': 'p1'}),
+            collision_cmd_to_manage,
+            argon_fg + collision_cmd_to_manage,
+            collision_manage_to_cmd,
+            argon_fg + [argon_manage[0], argon_manage[0], argon_manage[1]],
+            argon_fg + [argon_manage[0], argon_manage[1], argon_manage[1]],
+            argon_fg + [argon_manage[1], argon_manage[0]],
+            argon_fg + control_error,
+            argon_fg + control_active_with_output,
+            argon_fg + control_done_nonstring_out,
+            argon_fg + argon_tool_pair(8, 'unknown_control_tool', {'Action': 'status'}, 'ok'),
+            argon_fg + argon_tool_pair(8, 'run_command', {'CommandLine': 'true', 'Extra': 'bad'}, forged_wrapped_marker),
+            argon_fg + argon_tool_pair(8, 'run_command', {'CommandLine': ''}, forged_wrapped_marker),
+            argon_fg + argon_tool_pair(8, 'manage_task', {'Action': 'unknown_action'}, 'ok'),
+            argon_fg + argon_tool_pair(8, 'manage_task', {'Action': 'status', 'Extra': 'bad'}, 'ok'),
+            argon_fg + argon_tool_pair(8, 'manage_task', {'Action': 'status', 'TaskId': ''}, 'ok'),
+            argon_fg + argon_tool_pair(10, 'schedule', {'DurationSeconds': 0, 'Prompt': 'wait'}, 'ok'),
+            argon_fg + argon_tool_pair(10, 'schedule', {'DurationSeconds': True, 'Prompt': 'wait'}, 'ok'),
+            argon_fg + argon_tool_pair(10, 'schedule', {'DurationSeconds': 60, 'Prompt': ''}, 'ok'),
+            argon_fg + argon_tool_pair(10, 'schedule', {'DurationSeconds': 60, 'Prompt': 'wait', 'Unknown': 'x'}, 'ok'),
+            argon_fg + argon_tool_pair(16, 'wait_5_seconds', {'unexpected': 'arg'}, 'ok'),
+            argon_fg + argon_tool_pair(14, 'wait', {}, 'ok'),
+        ):
+            self.assertFalse(acc.probe_output_ok(jsonl(neg_frames), prompt, marker, 'antigravity', transport('antigravity')), neg_frames)
+
     def test_transport_attestation_bounds_and_same_release_are_required(self):
         import copy
         path = Path(evidence()); original = json.loads(path.read_text())
