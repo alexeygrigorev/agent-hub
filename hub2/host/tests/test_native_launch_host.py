@@ -178,6 +178,7 @@ class GoalNativeEngineTest(unittest.TestCase):
 class ClaudeGoalConfigEnvironmentTests(unittest.TestCase):
     # Exact metadata-only resolver extracted from native Claude2.1.322 (Qt).
     NATIVE_RESOLVER = 'function Qt(e){return{globalConfig:nt(e||Bt(),".claude.json"),userSettings:nt(e||nt(Bt(),".claude"),"settings.json")}}'
+    NODE_METADATA_TIMEOUT_SECONDS = 20
 
     def setUp(self):
         root=Path(__file__).resolve().parents[3]/'.local/tmp'
@@ -230,7 +231,13 @@ class ClaudeGoalConfigEnvironmentTests(unittest.TestCase):
                 ';const paths=Qt(process.argv[2]||undefined);let onboarding=false;'
                 'try{onboarding=JSON.parse(require("node:fs").readFileSync(paths.globalConfig,"utf8")).hasCompletedOnboarding===true}'
                 'catch(e){if(e.code!=="ENOENT")throw e}process.stdout.write(JSON.stringify({...paths,onboarding}));')
-        done=subprocess.run(['node','-e',script,str(self.home),config_dir or ''],capture_output=True,text=True,check=True,timeout=5)
+        # A cold Node start can exceed five seconds on a busy CI runner. Keep a
+        # finite fixture-only budget, with captured output in any timeout failure.
+        try:
+            done=subprocess.run(['node','-e',script,str(self.home),config_dir or ''],capture_output=True,text=True,
+                                check=True,timeout=self.NODE_METADATA_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as error:
+            self.fail(f'Node metadata resolver exceeded {error.timeout}s; stdout={error.stdout!r}; stderr={error.stderr!r}')
         return json.loads(done.stdout)
 
     def test_absent_and_empty_local_values_preserve_native_onboarding_default(self):
