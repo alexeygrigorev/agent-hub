@@ -544,16 +544,17 @@ class CanaryTest(unittest.TestCase):
         self.assertEqual((r.returncode, value['ok'], value['stage']), (0, True, None))
         prompt = (self.tmp / 'prompt').read_text()
         self.assertIn('two sequential shell tool calls', prompt)
-        self.assertIn('First use the provider-native background tool facility for a separate bounded 60-second hold', prompt)
+        self.assertIn('First run a separate foreground shell command that prints the concatenation of "CANARY-", "OK:", and', prompt)
         self.assertLess(
-            prompt.index('First use the provider-native background tool facility'),
-            prompt.index('then run a separate foreground shell command'),
+            prompt.index('First run a separate foreground shell command'),
+            prompt.index('Immediately after the marker print finishes, run a separate foreground `sleep 60` command'),
         )
-        self.assertIn('enter a provider-native blocking monitor, TaskOutput, or status wait on that existing background hold task', prompt)
-        self.assertIn('monitoring it internally so the orchestrator can stop this session before any final prose or completion bookkeeping', prompt)
-        self.assertIn('do not merely emit a waiting answer and finish the turn', prompt)
-        self.assertIn('Do not chain the print with a foreground sleep, poll in a loop, or wait externally', prompt)
+        self.assertIn('using the existing shell tool with a supported timeout sufficient for the 60-second hold so the orchestrator can observe and stop this session before any final prose or completion bookkeeping', prompt)
+        self.assertIn('Do not chain the marker print with the hold in one command, do not use a background flag, do not include the marker or nonce in the hold command, do not echo proof or emit waiting prose, and do not search for or call any monitor, task-output, or status tools or poll in a loop', prompt)
         self.assertIn('Apart from mandatory Hub first-action/completion evidence files if required by the session wrapper', prompt)
+        self.assertNotIn('background tool facility', prompt)
+        self.assertNotIn('TaskOutput', prompt)
+        self.assertNotIn('Monitor', prompt)
         for scenario in ('json_prompt_only', 'json_message_output', 'json_result_output', 'json_arbitrary_marker'):
             with self.subTest(scenario=scenario):
                 self.assert_stage(scenario, 'capture', 'no_output_beyond_prompt', mode='full')
@@ -2600,6 +2601,145 @@ class CanaryTest(unittest.TestCase):
             self.assertFalse(c_full.output_has_marker(neg_text, engine="antigravity"), neg_text)
             self.assertFalse(mod.paired_stream_output_ok(neg_text, marker, "antigravity"), neg_text)
             self.assertFalse(acc.paired_stream_output_ok(neg_text, marker, "antigravity"), neg_text)
+
+        # 7. Two-call quiet-hold prompt contract (periodic + deploy-gate full modes) and 02:55Z ToolSearch burst regression.
+        c_gate_full = mod.Canary(
+            "full",
+            "pair-check",
+            deploy_gate=True,
+            candidate_sha="a47ed73aa1eb3f5bbe597fa0016ba69cc8bad3af",
+            run_token="tok987",
+        )
+        for inst, expected_piece in (
+            (c_full, '"pair-check"'),
+            (c_gate_full, '"a47ed73aa1eb:tok987"'),
+        ):
+            self.assertNotIn(inst.marker, inst.prompt)
+            self.assertTrue(inst.prompt.startswith("Use two sequential shell tool calls. First run a separate foreground shell command"))
+            self.assertIn(f'concatenation of "CANARY-", "OK:", and {expected_piece} as one output line and let it finish.', inst.prompt)
+            self.assertIn(
+                "Immediately after the marker print finishes, run a separate foreground `sleep 60` command using the existing shell tool with a supported timeout sufficient for the 60-second hold",
+                inst.prompt,
+            )
+            self.assertIn("Do not chain the marker print with the hold in one command", inst.prompt)
+            self.assertIn("do not use a background flag", inst.prompt)
+            self.assertIn("do not include the marker or nonce in the hold command", inst.prompt)
+            self.assertIn("do not echo proof or emit waiting prose", inst.prompt)
+            self.assertIn("do not search for or call any monitor, task-output, or status tools or poll in a loop", inst.prompt)
+            self.assertIn("mandatory Hub first-action/completion evidence files", inst.prompt)
+            self.assertNotIn("background tool facility", inst.prompt)
+            self.assertNotIn("TaskOutput", inst.prompt)
+            self.assertNotIn("Monitor", inst.prompt)
+            self.assertEqual(inst.poll, 2.0)
+
+        # Two-call active foreground sleep 60 hold: after 1145B fg marker tool_use + 610B fg marker tool_result,
+        # an in-progress 1102B foreground Bash `sleep 60` tool_use (with no tool_result while blocked for 60s)
+        # keeps both marker frames unclipped inside the 4096B tail and proves the marker.
+        fg_use_1145 = padded_frame(valid_fg[0], 1145)
+        fg_res_610 = padded_frame(valid_fg[1], 610)
+        fg_hold_use_1102 = padded_frame(
+            {
+                "type": "assistant",
+                "session_id": session,
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_synthetic_fg_sleep60",
+                            "name": "Bash",
+                            "input": {
+                                "command": "sleep 60",
+                                "description": "Foreground 60-second hold",
+                                "timeout": 90000,
+                            },
+                        }
+                    ],
+                },
+            },
+            1102,
+        )
+        two_call_active_hold_stream = "\n".join(
+            [
+                prefix_line,
+                first_action_res,
+                fg_use_1145,
+                fg_res_610,
+                fg_hold_use_1102,
+            ]
+        ) + "\n"
+        two_call_tail_4096 = two_call_active_hold_stream.encode("utf-8")[-4096:].decode("utf-8")
+        self.assertEqual(len(two_call_tail_4096.encode("utf-8")), 4096)
+        self.assertIn(fg_use_1145, two_call_tail_4096)
+        self.assertIn(fg_res_610, two_call_tail_4096)
+        self.assertIn(fg_hold_use_1102, two_call_tail_4096)
+        self.assertTrue(c_full.output_has_marker(two_call_tail_4096, engine="claude"))
+
+        # Conversely, the 02:55Z (780f25d061e1) post-marker 4035B burst (193B+195B thinking_tokens + 2013B thinking
+        # + 1035B ToolSearch tool_use + 594B ToolSearch tool_result + 5 newlines) evicts the 1755B marker pair from the
+        # 4096B tail (leaving only the clipped last 60B of fg_res_610) and must fail closed.
+        tok_193 = padded_frame({"type": "system", "subtype": "thinking_tokens", "session_id": session}, 193)
+        tok_195 = padded_frame({"type": "system", "subtype": "thinking_tokens", "session_id": session}, 195)
+        thinking_2013 = padded_frame(
+            {
+                "type": "assistant",
+                "session_id": session,
+                "message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "", "signature": "sig"}]},
+            },
+            2013,
+        )
+        tool_search_use_1035 = padded_frame(
+            {
+                "type": "assistant",
+                "session_id": session,
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_synthetic_toolsearch",
+                            "name": "ToolSearch",
+                            "input": {"query": "select:Monitor,TaskOutput", "max_results": 5},
+                        }
+                    ],
+                },
+            },
+            1035,
+        )
+        tool_search_res_594 = padded_frame(
+            {
+                "type": "user",
+                "session_id": session,
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_synthetic_toolsearch",
+                            "content": "[{'type': 'tool_reference', 'tool_name': 'Monitor'}]",
+                        }
+                    ],
+                },
+            },
+            594,
+        )
+        burst_evicted_stream = "\n".join(
+            [
+                prefix_line,
+                first_action_res,
+                fg_use_1145,
+                fg_res_610,
+                tok_193,
+                tok_195,
+                thinking_2013,
+                tool_search_use_1035,
+                tool_search_res_594,
+            ]
+        ) + "\n"
+        burst_tail_4096 = burst_evicted_stream.encode("utf-8")[-4096:].decode("utf-8")
+        self.assertEqual(len(burst_tail_4096.encode("utf-8")), 4096)
+        self.assertEqual(len(burst_tail_4096.splitlines()[0]), 60)
+        self.assertFalse(c_full.output_has_marker(burst_tail_4096, engine="claude"))
 
 
 if __name__ == "__main__":

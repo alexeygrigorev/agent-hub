@@ -570,13 +570,14 @@ class Canary:
                 f"printf '%s:%s:%s\\n' CANARY-OK {sha12} {run_token}; sleep 30"
                 if mode == "shell"
                 else (
-                    "Use two sequential shell tool calls. First use the provider-native background tool facility for a "
-                    "separate bounded 60-second hold (`sleep 60`), then run a separate foreground shell command that prints the "
+                    "Use two sequential shell tool calls. First run a separate foreground shell command that prints the "
                     f'concatenation of "CANARY-", "OK:", and "{sha12}:{run_token}" as one output line and let it finish. '
-                    "Immediately after the marker print finishes, enter a provider-native blocking monitor, TaskOutput, or "
-                    "status wait on that existing background hold task, monitoring it internally so the orchestrator can stop "
-                    "this session before any final prose or completion bookkeeping; do not merely emit a waiting answer and finish the turn. "
-                    "Do not chain the print with a foreground sleep, poll in a loop, or wait externally; external waits require a Hub wake. "
+                    "Immediately after the marker print finishes, run a separate foreground `sleep 60` command using the "
+                    "existing shell tool with a supported timeout sufficient for the 60-second hold so the orchestrator can "
+                    "observe and stop this session before any final prose or completion bookkeeping. "
+                    "Do not chain the marker print with the hold in one command, do not use a background flag, do not include "
+                    "the marker or nonce in the hold command, do not echo proof or emit waiting prose, and do not search for "
+                    "or call any monitor, task-output, or status tools or poll in a loop. "
                     "Apart from mandatory Hub first-action/completion evidence files if required by the session wrapper, "
                     "do not create or edit other files, start another agent, or exit early."
                 )
@@ -586,13 +587,14 @@ class Canary:
             # The complete expected output never occurs in the model prompt. A
             # wrapped echo of the prompt therefore cannot count as execution.
             self.prompt = PROMPTS["shell"] if mode == "shell" else (
-                "Use two sequential shell tool calls. First use the provider-native background tool facility for a "
-                "separate bounded 60-second hold (`sleep 60`), then run a separate foreground shell command that prints the "
+                "Use two sequential shell tool calls. First run a separate foreground shell command that prints the "
                 f'concatenation of "CANARY-", "OK:", and "{run_id}" as one output line and let it finish. '
-                "Immediately after the marker print finishes, enter a provider-native blocking monitor, TaskOutput, or "
-                "status wait on that existing background hold task, monitoring it internally so the orchestrator can stop "
-                "this session before any final prose or completion bookkeeping; do not merely emit a waiting answer and finish the turn. "
-                "Do not chain the print with a foreground sleep, poll in a loop, or wait externally; external waits require a Hub wake. "
+                "Immediately after the marker print finishes, run a separate foreground `sleep 60` command using the "
+                "existing shell tool with a supported timeout sufficient for the 60-second hold so the orchestrator can "
+                "observe and stop this session before any final prose or completion bookkeeping. "
+                "Do not chain the marker print with the hold in one command, do not use a background flag, do not include "
+                "the marker or nonce in the hold command, do not echo proof or emit waiting prose, and do not search for "
+                "or call any monitor, task-output, or status tools or poll in a loop. "
                 "Apart from mandatory Hub first-action/completion evidence files if required by the session wrapper, "
                 "do not create or edit other files, start another agent, or exit early."
             )
