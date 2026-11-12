@@ -216,6 +216,7 @@ class FakeHealthServer:
         self.drip_s = None
         self.requests = 0
         self.stop = threading.Event()
+        self.disconnected = threading.Event()
         fixture = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -227,6 +228,8 @@ class FakeHealthServer:
                 self.send_header("Content-Type", "application/json")
                 if fixture.drip_s is None:
                     self.send_header("Content-Length", str(len(fixture.body)))
+                else:
+                    self.send_header("Connection", "close")  # HTTP/1.0 close-delimited body
                 self.end_headers()
                 if fixture.drip_s is None:
                     self.wfile.write(fixture.body)
@@ -238,6 +241,7 @@ class FakeHealthServer:
                     try:
                         self.wfile.write(bytes([ch])); self.wfile.flush()
                     except OSError:
+                        fixture.disconnected.set()
                         return
 
             def log_message(self, *_args):
@@ -697,6 +701,58 @@ class CanaryTest(unittest.TestCase):
                 self.assertNotIn("sessions start", self.calls())
                 self.assert_no_health_leak(r, url, "user:pw")
         self.assertEqual(self.health.requests, 0)
+
+    def run_health_in_process(self, url, budget_s):
+        """Call Canary.check_health in this test process and record the real request child."""
+        sys.path.insert(0, str(ROOT))
+        from scripts import hub_start_canary as mod
+        children = []
+        real_popen = mod.subprocess.Popen
+
+        def recording_popen(*args, **kwargs):
+            proc = real_popen(*args, **kwargs)
+            children.append(proc)
+            return proc
+
+        canary = mod.Canary("shell", "health-inproc")
+        canary.active_deadline = time.monotonic() + budget_s
+        with mock.patch.dict(os.environ, {"HUB_CANARY_HEALTH_URL": url}), \
+                mock.patch.object(mod.subprocess, "Popen", side_effect=recording_popen):
+            with self.assertRaises(mod.StageFailure) as caught:
+                canary.check_health()
+        return caught.exception, children
+
+    def assert_child_killed_and_reaped(self, children):
+        self.assertEqual(len(children), 1)
+        (child,) = children
+        self.assertEqual(child.returncode, -9)  # SIGKILLed at the deadline, and waited for
+        self.assertFalse(pathlib.Path(f"/proc/{child.pid}").exists())  # no zombie left behind
+
+    def test_health_blocked_connect_child_is_killed_and_reaped_at_deadline(self):
+        import socket as socketmod
+        listener = socketmod.socket()
+        self.addCleanup(listener.close)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(0)
+        port = listener.getsockname()[1]
+        filler = socketmod.create_connection(("127.0.0.1", port), timeout=1)
+        self.addCleanup(filler.close)
+        with socketmod.socket() as probe:  # precondition: further connects block (full accept queue)
+            probe.settimeout(0.3)
+            with self.assertRaises(TimeoutError):
+                probe.connect(("127.0.0.1", port))
+        failure, children = self.run_health_in_process("http://127.0.0.1:%d/health" % port, 0.6)
+        self.assertEqual((failure.stage, failure.reason), ("health", "health_timeout"))
+        self.assert_child_killed_and_reaped(children)
+
+    def test_health_http10_close_delimited_slow_drip_is_disconnected_at_deadline(self):
+        self.health.drip_s = 0.05
+        failure, children = self.run_health_in_process(self.health.url, 0.6)
+        self.assertEqual((failure.stage, failure.reason), ("health", "health_timeout"))
+        self.assertEqual(self.health.requests, 1)
+        self.assert_child_killed_and_reaped(children)
+        # The test process is still alive: only the killed request child can have closed the socket.
+        self.assertTrue(self.health.disconnected.wait(3))
 
     def test_production_default_health_url_is_public_hub_endpoint(self):
         sys.path.insert(0, str(ROOT))
