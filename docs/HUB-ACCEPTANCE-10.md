@@ -138,6 +138,16 @@ Created At / Completed At timestamps, `Command exited with code 0.` status, and
 inside the output cannot replace a missing/nonzero native header. Error states,
 changed parameters and reused identities fail proof.
 
+Argon's native `read_file` is a recognized NONPROOF step class: it appears
+between model-less proof steps and must not reject a capture that also holds a
+genuine run_command pair. Its parameters must be an object with a nonempty,
+NUL-free string `Path` and optional `StartLine`/`EndLine` that are exact
+non-negative integers (no bool/string/float, at most 2^31-1, `EndLine` not
+before `StartLine`); other keys, errors and the shared identity, state, output
+and replay guards still fail. Its output, even a nonce, fake native wrapper or
+JSON-shaped command frame, never proves anything; only a distinct
+run_command pair does. Unknown tools are still rejected.
+
 A leading clipped line is discarded without repair; complete paired frames
 must remain in the same capture. Later malformed or partial JSON fails proof.
 No state is carried between capture requests to reconstruct a missing pair.
