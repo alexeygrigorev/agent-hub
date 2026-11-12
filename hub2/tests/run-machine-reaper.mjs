@@ -15,4 +15,5 @@ await import('./native-inventory.test.ts');
 
 await import('./native-commands.test.ts');
 
+await import('./p7-finish.test.ts');
 await import('./implement-workspace.test.ts');
