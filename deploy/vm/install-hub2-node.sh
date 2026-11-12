@@ -118,6 +118,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import stat
 import subprocess
 import sys
@@ -138,6 +139,7 @@ if schema_mode and schema_mode not in {"defer", "apply"}:
 original_stat = os.lstat(path)
 if not stat.S_ISREG(original_stat.st_mode):
     raise SystemExit("invalid .dev.vars file")
+original_text = path.read_bytes().decode("utf-8")
 updates = {}
 if mode:
     updates["HUB2_RELEASE_MODE"] = mode
@@ -267,7 +269,99 @@ def ensure_private_evidence_root(target_root: Path, owner_uid: int, owner_gid: i
         os.close(fd)
 
 
+# Match Node parseDevVars: outer JS trim, paired quotes, last assignment wins.
+OBSERVER_KEY = "HUB2_ALERT_EVIDENCE_DIR"
+JS_SPACE = "\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
+
+
+def file_observer_value(text):
+    selected = ""
+    for raw in text.split("\n"):
+        line = raw.strip(JS_SPACE)
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key.strip(JS_SPACE) != OBSERVER_KEY:
+            continue
+        value = value.strip(JS_SPACE)
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        selected = value
+    return selected
+
+
+def service_environment():
+    # Never inspect sudo/caller environment as service authority. Refresh the
+    # installed unit/drop-ins first; no running process is restarted here.
+    def systemctl(*args):
+        result = subprocess.run(["/usr/bin/systemctl", *args], env={"PATH": os.defpath, "LC_ALL": "C"},
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5, check=False)
+        if result.returncode or len(result.stdout) > 65536:
+            raise ValueError("observer_service_environment_unverified")
+        return result.stdout.decode("utf-8")
+    systemctl("daemon-reload")
+    names = ("Environment", "EnvironmentFiles", "PassEnvironment", "UnsetEnvironment", "NeedDaemonReload")
+    raw = systemctl("show", "agent-hub-hub2.service", *("--property=" + name for name in names))
+    props = dict(line.split("=", 1) for line in raw.splitlines() if "=" in line)
+    if set(props) != set(names) or props["NeedDaemonReload"] != "no":
+        raise ValueError("observer_service_environment_unverified")
+    for name in ("PassEnvironment", "UnsetEnvironment"):
+        if any(word.split("=", 1)[0] == OBSERVER_KEY for word in shlex.split(props[name])):
+            raise ValueError("observer_service_override_unsupported")
+    files = props["EnvironmentFiles"].strip()
+    entries = re.findall(r"([^\s]+) \(ignore_errors=(yes|no)\)", files)
+    if " ".join(f"{name} (ignore_errors={optional})" for name, optional in entries) != files:
+        raise ValueError("observer_service_environment_unverified")
+    for name, optional in entries:
+        if not os.path.isabs(name) or any(char in name for char in "\\*?%["):
+            raise ValueError("observer_service_environment_unverified")
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            if optional == "yes":
+                continue
+            raise
+        with os.fdopen(fd, "rb") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise ValueError("observer_service_environment_unverified")
+            content = stream.read(1024 * 1024 + 1)
+        if len(content) > 1024 * 1024:
+            raise ValueError("observer_service_environment_unverified")
+        # Do not implement systemd's multiline value language. An assignment
+        # affecting this target needs explicit owner resolution, not OFF.
+        logical = content.decode("utf-8").replace("\\\n", "").replace("\\\r\n", "")
+        if re.search(r"(?m)^[ \t\r\v\f]*" + OBSERVER_KEY + r"[ \t\r\v\f]*=", logical):
+            raise ValueError("observer_service_override_unsupported")
+    assignments = {}
+    for word in shlex.split(props["Environment"]):
+        key, separator, value = word.partition("=")
+        if separator and key == OBSERVER_KEY:
+            assignments[key] = value
+    if OBSERVER_KEY not in assignments:
+        manager = systemctl("show-environment")
+        if any(line.split("=", 1)[0] == OBSERVER_KEY for line in manager.splitlines()):
+            raise ValueError("observer_service_override_unsupported")
+    return assignments
+
+
+observer_selected = False
 if mode == "active" and (repo_arg or evidence_root_arg):
+    try:
+        overrides = service_environment()
+        if OBSERVER_KEY in overrides:
+            if overrides[OBSERVER_KEY]:
+                # A fixed process override would ignore the new file pointer.
+                raise ValueError("observer_service_override_unhonorable")
+        else:
+            observer_selected = bool(file_observer_value(original_text))
+    except Exception as exc:
+        reason = str(exc) if isinstance(exc, ValueError) and str(exc) in {
+            "observer_service_environment_unverified", "observer_service_override_unsupported",
+            "observer_service_override_unhonorable"} else "observer_service_environment_unverified"
+        raise SystemExit("observer_selection_failed: " + reason) from None
+
+
+if mode == "active" and observer_selected and (repo_arg or evidence_root_arg):
     if not repo_arg or not evidence_root_arg:
         raise SystemExit("credential_monitor_staging_failed")
     try:
@@ -354,29 +448,33 @@ if mode == "active" and (repo_arg or evidence_root_arg):
     except Exception as exc:
         raise SystemExit(f"credential_monitor_staging_failed: {exc}") from None
 
-lines = path.read_text(encoding="utf-8").splitlines()
+# Keep every unrelated byte, including CRLF and absent final newline.
+lines = re.findall(r"[^\n]*\n|[^\n]+$", original_text)
 updated = []
 inserted = set()
 for line in lines:
     key, separator, _value = line.partition("=")
-    key = key.strip()
+    key = key.strip(JS_SPACE)
     if separator and key in updates:
         if key not in inserted:
-            updated.append(f"{key}={updates[key]}")
+            ending = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
+            updated.append(f"{key}={updates[key]}{ending}")
             inserted.add(key)
         continue
     updated.append(line)
 for key, value in updates.items():
     if key not in inserted:
-        if key == "HUB2_ALERT_EVIDENCE_DIR":
-            updated.append(f"{key}={value}")
+        if key == OBSERVER_KEY:
+            if updated and not updated[-1].endswith("\n"):
+                updated.append("\n")
+            updated.append(f"{key}={value}\n")
         else:
-            updated.insert(0, f"{key}={value}")
-contents = "\n".join(updated) + "\n"
+            updated.insert(0, f"{key}={value}\n")
+contents = "".join(updated)
 
 fd, temporary_name = tempfile.mkstemp(prefix=".dev.vars.", dir=path.parent)
 try:
-    with os.fdopen(fd, "w", encoding="utf-8") as temporary:
+    with os.fdopen(fd, "w", encoding="utf-8", newline="") as temporary:
         temporary.write(contents)
         temporary.flush()
         os.fsync(temporary.fileno())
