@@ -47,6 +47,11 @@ export function isModelPolicyCandidateAllowed(candidate: ModelPolicyRoute): bool
   return modelPolicyCandidateViolation(candidate) === null;
 }
 
+/** Hydrogen replaces Flash/Argon in ordinary automatic work, without changing other engines. */
+export function isOrdinaryWorkModel(candidate: Pick<ModelPolicyRoute, 'id' | 'model'>): boolean {
+  return !/(?:flash|gemini-4-argon)/i.test(`${candidate.id} ${candidate.model}`);
+}
+
 /** Models that stay out of the default pick; only an explicit, reasoned request may select them. */
 export function isExplicitOnlyModel(candidate: Pick<ModelPolicyRoute, 'id' | 'model'>): boolean {
   return /astra/i.test(`${candidate.id} ${candidate.model}`);

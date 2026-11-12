@@ -3,7 +3,7 @@
 // otherwise loads only Workers globals. @types/node is already a dependency.
 import { createHash } from 'node:crypto';
 import { HttpError } from './http';
-import { isDeepWorkModel, isExplicitOnlyModel, isModelPolicyCandidateAllowed } from './model-policy';
+import { isDeepWorkModel, isExplicitOnlyModel, isModelPolicyCandidateAllowed, isOrdinaryWorkModel } from './model-policy';
 import { allowsAstra, sessionPurpose, type SessionPurpose } from './session-purpose';
 
 export type Candidate = { id: string; engine: string; model: string; effort?: string; account_id: string; weight: number; capabilities: string[]; enabled: boolean };
@@ -86,7 +86,9 @@ export function eligibleCandidates(policy: RoutingPolicy, input: PickInput): Can
     (input.model === candidate.id || input.model === candidate.model) && isExplicitOnlyModel(candidate)))
     throw new HttpError('astra_not_for_implementation', 400);
   const excluded=new Set(input.exclude_policy_ids||[]);
+  const ordinaryAutomatic = !input.model && !allowsAstra(purpose) && !DEEP_TIERS.has(input.tier || '');
   const candidates = policy.candidates.filter(candidate => candidate.enabled && !excluded.has(candidate.id)
+    && (!ordinaryAutomatic || isOrdinaryWorkModel(candidate))
     && (!isExplicitOnlyModel(candidate) || allowsAstra(purpose))
     && (candidate.id !== 'claude-fable-5-2' || input.model === candidate.id || input.model === candidate.model)
     && (!isExplicitOnlyModel(candidate) || (override && !!input.model && (input.model === candidate.model || input.model === candidate.id)))
