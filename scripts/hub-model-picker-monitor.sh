@@ -17,6 +17,8 @@ ALERT_CMD="${HUB_PICKER_ALERT_CMD:-$HOME/.local/bin/principal-alert.sh}"
 delivery_status=0
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 python3 "$script_dir/hub-picker-alerts.py" --base-url "$BASE_URL" --cli-json "$CLI_JSON" --helper "$ALERT_CMD" || delivery_status=$?
+# Intakes Hub could not recover itself (bounded recovery spent, lost host...) -> dev@.
+python3 "$script_dir/hub-intake-recovery-alerts.py" --base-url "$BASE_URL" --cli-json "$CLI_JSON" --helper "$ALERT_CMD" || delivery_status=$?
 mkdir -p "$(dirname "$STATE")"
 token="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["access_token"])' "$CLI_JSON")"
 excluded="$(curl -fsS --max-time 30 -X POST -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \

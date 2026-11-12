@@ -4,6 +4,8 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"; dest="$HOME/.local/share/agent-hub-ops"
 mkdir -p "$dest" "$HOME/bin" "$HOME/.config/systemd/user"
 install -m755 "$here/lib/session-ctl.sh" "$here/lib/watchdog.sh" "$dest/"
+# Model-picker monitor timer also mails dev@ for intakes Hub could not recover.
+install -m755 "$here/../scripts/hub-model-picker-monitor.sh" "$here/../scripts/hub-picker-alerts.py" "$here/../scripts/hub-intake-recovery-alerts.py" "$dest/"
 install -m755 "$here/lib/send.sh" "$HOME/bin/orch-send"
 install -m755 "$here/lib/send.sh" "$HOME/bin/oncall-send"
 install -m644 "$here"/systemd/ops-watchdog.service "$here"/systemd/ops-watchdog.timer "$HOME/.config/systemd/user/"
