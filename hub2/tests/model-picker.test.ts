@@ -431,6 +431,24 @@ test('workspace hints only narrow hosts that survived goal capability selection'
  assert.deepEqual(buildRoutingPool(snapshot,input).options.map(row=>[row.value.engine,row.value.machine_id]),[['codex','h2']]);
 });
 
+test('placement fallback can retain the same policy on another approved host',()=>{
+ const snapshot=capabilitySnapshot(['headless','effort:codex','effort:claude']);
+ snapshot.policy={...snapshot.policy,candidates:snapshot.policy.candidates.filter(row=>row.id==='codex-sol-medium')};
+ snapshot.accounts.get('codex')!.hosts=['h1','h2'];
+ snapshot.machines.set('h2',{connected:true,engines:['codex'],capabilities:['headless','effort:codex']});
+ const result=buildRoutingPool(snapshot,{interactive:false,workspace:'dataops',exclude_machine_ids:['h1']});
+ assert.deepEqual(result.options.map(row=>[row.value.policy_id,row.value.machine_id]),[['codex-sol-medium','h2']]);
+});
+
+test('placement exclusion cannot restore a candidate whose only approved host failed',()=>{
+ const snapshot=capabilitySnapshot(['headless','effort:codex','effort:claude']);
+ snapshot.policy={...snapshot.policy,candidates:snapshot.policy.candidates.filter(row=>row.id==='codex-sol-medium')};
+ snapshot.accounts.get('codex')!.hosts=['h1'];
+ snapshot.machines.set('h2',{connected:true,engines:['codex'],capabilities:['headless','effort:codex']});
+ assert.throws(()=>buildRoutingPool(snapshot,{interactive:false,workspace:'dataops',exclude_machine_ids:['h1']}),
+  {code:'model_policy_unavailable'});
+});
+
 test('ordinary starts retain model diversity when both engines advertise launch capabilities',()=>{
  const snapshot=capabilitySnapshot(['interactive:codex','interactive:claude','effort:codex','effort:claude','goal:codex']);
  const result=buildRoutingPool(snapshot,{interactive:true,effort:'medium'});

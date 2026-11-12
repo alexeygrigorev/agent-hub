@@ -34,7 +34,8 @@ export type PickInput = {
   /** Server-authorized explicit central delivery, never inferred from a capability hint. */
   managed_credential_label?: 'hub-claude';
   machine_id?: string; engine?: string; model?: string; effort?: string; override_reason?: string;
-  tier?: string; interactive: boolean; with_goal?: boolean; required_capabilities?: string[]; exclude_policy_ids?: string[];
+  tier?: string; interactive: boolean; with_goal?: boolean; required_capabilities?: string[];
+  exclude_policy_ids?: string[]; exclude_machine_ids?: string[];
   /** Launch workspace: a label or an absolute path on the target host. */
   workspace?: string;
 };
@@ -79,6 +80,11 @@ export function eligibleCandidates(policy: RoutingPolicy, input: PickInput): Can
   const required = [...new Set([input.interactive ? 'interactive' : 'headless', ...(input.with_goal ? ['goal'] : []), ...(input.required_capabilities || [])])];
   if (required.length > 32 || required.some(value => typeof value !== 'string' || !value || value.length > 80))
     throw new HttpError('invalid_required_capabilities', 400);
+  if (input.exclude_machine_ids !== undefined && (!Array.isArray(input.exclude_machine_ids)
+      || input.exclude_machine_ids.length > 32
+      || input.exclude_machine_ids.some(value => typeof value !== 'string' || !value || value.length > 180
+        || /[\u0000-\u001f\u007f]/.test(value))))
+    throw new HttpError('invalid_excluded_machines', 400);
 
   if (!Array.isArray(policy.candidates) || !policy.candidates.length || policy.candidates.length > 32)
     throw new HttpError('model_policy_unconfigured', 503);
@@ -105,6 +111,7 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
   const accounts = snapshot.accounts, machines = snapshot.machines;
   const accountIds = [...new Set(candidates.map(candidate => candidate.account_id))];
   const ids = new Set([...machines.keys()].sort());
+  const excludedMachines = new Set(input.exclude_machine_ids || []);
   const override = !!(input.machine_id || input.engine || input.model || input.effort);
   const required = [...new Set([input.interactive ? 'interactive' : 'headless', ...(input.with_goal ? ['goal'] : []), ...(input.required_capabilities || [])])];
   for (const id of ids) if (machines.get(id)?.connected !== true) ids.delete(id);
@@ -157,7 +164,7 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
     const hosts = input.machine_id ? [input.machine_id] : approved.length
       ? managedCentral ? approved : [...new Set([...approved,...[...ids].filter(id=>local(candidate,id))])] : [...ids];
     const matching = hosts.filter(id => machines.get(id)?.engines?.includes(candidate.engine));
-    return matching.length ? matching : hosts;
+    return (matching.length ? matching : hosts).filter(id => !excludedMachines.has(id));
   };
   const scored = candidates.map(candidate => {
     const left = headroom(candidate);
