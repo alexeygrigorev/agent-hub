@@ -241,3 +241,26 @@ test('Control passive route never answers when the generation or the desired rev
   assert.deepEqual([changed.status, JSON.parse(changedText).error], [409, 'revision_changed']);
   assert.ok(!changedText.includes(ACCESS));
 });
+
+test('Control passive route rechecks the rollout after the final metadata await, immediately before responding', async () => {
+  const f = await controlFixture();
+  const original = f.control.accountRequest.bind(f.control);
+  let metadataCalls = 0, release!: () => void, entered!: () => void;
+  const held = new Promise<void>(r => { release = r; }), reached = new Promise<void>(r => { entered = r; });
+  f.control.accountRequest = async (path: string, ...rest: unknown[]) => {
+    const response = await original(path, ...rest);
+    // The first metadata read captures the generation; the second is the final fence. Hold that one open.
+    if (path.includes('metadata=1') && ++metadataCalls === 2) { entered(); await held; }
+    return response;
+  };
+  const pending = f.call(ROUTE);
+  await reached;
+  // Generation is unchanged and the earlier revision check already passed; now move the desired version.
+  f.controlDatabase.prepare("INSERT OR REPLACE INTO hub2_engine_rollout(engine,desired_version,latest,state,updated_at) VALUES('claude','0.0.2-synthetic','0.0.2-synthetic','stable',?)").run(Date.now());
+  f.control.db.cache?.clear?.();
+  release();
+  const response = await pending, text = await response.text();
+  assert.deepEqual([response.status, JSON.parse(text).error], [409, 'revision_changed']);
+  assert.ok(!text.includes(ACCESS), 'old-revision material is never returned');
+  assert.equal(metadataCalls, 2);
+});
