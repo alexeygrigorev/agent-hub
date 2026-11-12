@@ -326,6 +326,9 @@ class Bridge:
         if prior and prior['state'] != 'pending_admission':
             # Reconciliation after an upgrade must never relocate a live worker.
             workspace = Path(prior['workspace'])
+            source = Path(launch['workspace'])
+            if workspace != source and not workspace.is_relative_to(source / '.local' / 'hub-worktrees'):
+                raise ValueError('offer_fence_conflict')
         else:
             workspace = prepare_workspace(launch['workspace'], offer['launch'].get('purpose'), offer.get('intake_id'), offer.get('project_id'))
         launch['workspace'] = str(workspace)
