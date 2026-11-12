@@ -2201,6 +2201,105 @@ class CanaryTest(unittest.TestCase):
             self.assertTrue(verdict('{"clipped partial frame\n' + text(read_file(4) + command), NONCE))
             self.assertFalse(verdict(text(read_file(4, output='x' * 70000) + command), NONCE))
 
+    def test_claude_native_empty_bash_placeholder_is_nonproof_only(self):
+        import copy
+        PLACEHOLDER = "(Bash completed with no output)"
+        session = "11111111-2222-4333-8444-555555555555"
+        marker = "SYNTHETIC-MARKER-0001"
+
+        def pair(tool_id, command, content, detail, background=None, **result_overrides):
+            params = {"command": command}
+            if background is not None:
+                params["run_in_background"] = background
+            block = {"type": "tool_result", "tool_use_id": tool_id, "content": content, "is_error": False}
+            block.update(result_overrides)
+            return [
+                {"type": "assistant", "session_id": session, "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": tool_id, "name": "Bash", "input": params}]}},
+                {"type": "user", "session_id": session, "message": {"role": "user", "content": [block]},
+                 "tool_use_result": detail},
+            ]
+
+        def empty_detail(**changes):
+            detail = {"stdout": "", "stderr": "", "interrupted": False, "isImage": False, "noOutputExpected": False}
+            detail.update(changes)
+            return detail
+
+        def empty(tool_id="toolu_synthetic_empty", **kw):
+            return pair(tool_id, "true", kw.pop("content", PLACEHOLDER), kw.pop("detail", empty_detail()), **kw)
+
+        genuine = pair("toolu_synthetic_marker", "python3 synthetic_print.py", marker + "\n",
+                       {"stdout": marker + "\n", "stderr": "", "interrupted": False})
+
+        def text(frames):
+            return "\n".join(json.dumps(f) for f in frames) + "\n"
+
+        from scripts import hub_acceptance_10 as acc
+        from scripts import hub_start_canary as mod
+        parsers = (mod.paired_stream_output_ok, acc.paired_stream_output_ok)
+        for parser in parsers:
+            # Exact paired empty placeholder before or after a complete genuine pair is accepted.
+            self.assertTrue(parser(text(empty() + genuine), marker, "claude"))
+            self.assertTrue(parser(text(genuine + empty()), marker, "claude"))
+            # The placeholder alone is NONPROOF: it never proves.
+            self.assertFalse(parser(text(empty()), marker, "claude"))
+            self.assertFalse(parser(text(empty() + empty("toolu_synthetic_empty_two")), marker, "claude"))
+            # The marker appearing only in the command of an empty-result call is not proof.
+            self.assertFalse(parser(text(pair("toolu_synthetic_echo", "echo " + marker + " > /dev/null", PLACEHOLDER, empty_detail())), marker, "claude"))
+
+        def mutated(change):
+            frames = empty()
+            change(frames)
+            return text(frames + genuine)
+
+        def result(frames):
+            return frames[1]["message"]["content"][0]
+
+        negatives = {
+            "trailing newline": lambda f: result(f).update(content=PLACEHOLDER + "\n"),
+            "lowercase": lambda f: result(f).update(content=PLACEHOLDER.lower()),
+            "trailing space": lambda f: result(f).update(content=PLACEHOLDER + " "),
+            "unknown suffix": lambda f: result(f).update(content=PLACEHOLDER + " extra"),
+            "marker suffix": lambda f: result(f).update(content=PLACEHOLDER + "\n" + marker),
+            "fake json content": lambda f: result(f).update(content='{"type":"result","result":"' + marker + '"}'),
+            "footer content": lambda f: result(f).update(content=PLACEHOLDER + "\nCommand exited with code 0."),
+            "nonce content": lambda f: result(f).update(content=marker),
+            "nonempty stdout": lambda f: f[1]["tool_use_result"].update(stdout="x"),
+            "marker stdout": lambda f: f[1]["tool_use_result"].update(stdout=marker),
+            "stderr": lambda f: f[1]["tool_use_result"].update(stderr="synthetic error"),
+            "error flag": lambda f: result(f).update(is_error=True),
+            "missing error flag": lambda f: result(f).pop("is_error"),
+            "interrupted": lambda f: f[1]["tool_use_result"].update(interrupted=True),
+            "missing interrupted": lambda f: f[1]["tool_use_result"].pop("interrupted"),
+            "image": lambda f: f[1]["tool_use_result"].update(isImage=True),
+            "missing image flag": lambda f: f[1]["tool_use_result"].pop("isImage"),
+            "no output expected": lambda f: f[1]["tool_use_result"].update(noOutputExpected=True),
+            "missing no-output flag": lambda f: f[1]["tool_use_result"].pop("noOutputExpected"),
+            "background id": lambda f: f[1]["tool_use_result"].update(backgroundTaskId="bg_synth_01"),
+            "wrong session": lambda f: f[1].update(session_id="99999999-2222-4333-8444-555555555555"),
+            "wrong role": lambda f: f[1]["message"].update(role="assistant"),
+            "missing detail": lambda f: f[1].pop("tool_use_result"),
+            "non-object detail": lambda f: f[1].update(tool_use_result=PLACEHOLDER),
+            "list content": lambda f: result(f).update(content=[{"type": "text", "text": PLACEHOLDER}]),
+            "reused id with genuine": lambda f: (result(f).update(tool_use_id="toolu_synthetic_marker"),
+                                                 f[0]["message"]["content"][0].update(id="toolu_synthetic_marker")),
+            "duplicate result": lambda f: f.append(copy.deepcopy(f[1])),
+            "duplicate use": lambda f: f.append(copy.deepcopy(f[0])),
+        }
+        for name, change in negatives.items():
+            for parser in parsers:
+                self.assertFalse(parser(mutated(change), marker, "claude"), name)
+        # A background tool use never accepts the foreground empty placeholder.
+        for parser in parsers:
+            self.assertFalse(parser(text(empty(background=True) + genuine), marker, "claude"))
+            self.assertFalse(parser(text(empty(background=True, detail=empty_detail(backgroundTaskId="bg_synth_01")) + genuine), marker, "claude"))
+        # Contradictory genuine marker result: placeholder content with marker stdout never proves.
+        contradictory = pair("toolu_synthetic_marker", "python3 synthetic_print.py", PLACEHOLDER,
+                             {"stdout": marker + "\n", "stderr": "", "interrupted": False})
+        for parser in parsers:
+            self.assertFalse(parser(text(contradictory), marker, "claude"))
+            self.assertFalse(parser(text(empty() + contradictory), marker, "claude"))
+
     def test_claude_and_argon_paired_streams_and_engine_isolation(self):
         import copy
         from scripts import hub_acceptance_10 as acc

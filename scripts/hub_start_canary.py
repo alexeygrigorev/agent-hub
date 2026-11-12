@@ -290,6 +290,10 @@ def valid_native_id(val):
     return Canary.valid_native_id(val)
 
 
+# Claude Code 2.1.322 native content for a Bash call with empty stdout/stderr.
+CLAUDE_EMPTY_BASH_PLACEHOLDER = "(Bash completed with no output)"
+
+
 def paired_stream_output_ok(captured, expected, engine):
     """Complete provider frames from ONE capture only; never repair clipped JSON."""
     if len(captured.encode()) > 65536:
@@ -374,7 +378,14 @@ def paired_stream_output_ok(captured, expected, engine):
                         ):
                             return False
                         continue
-                    if detail.get("backgroundTaskId") is not None or detail.get("stdout") != block["content"]:
+                    if detail.get("backgroundTaskId") is not None:
+                        return False
+                    if block["content"] == CLAUDE_EMPTY_BASH_PLACEHOLDER and detail.get("stdout") == "":
+                        # NONPROOF: the exact native empty-result pair is classified only.
+                        if detail.get("isImage") is not False or detail.get("noOutputExpected") is not False:
+                            return False
+                        continue
+                    if detail.get("stdout") != block["content"]:
                         return False
                     proven = proven or marker_in(block["content"])
         else:
