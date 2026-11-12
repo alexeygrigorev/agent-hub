@@ -2998,6 +2998,13 @@ def managed_claude_context(extra_argv):
 
 
 MANAGED_CLAUDE_SYSTEM_SETTINGS = ('/etc/claude-code/managed-settings.json', '/etc/claude-code/managed-settings.d')
+# Claude Code itself rewrites the generated .claude.json metadata (project trust,
+# history, caches) and it legitimately grows past 64 KiB. Only those two
+# metadata files get this documented finite 1 MiB read cap; settings.json and
+# settings.local.json stay at 64 KiB. Both are read whole by the private reader
+# (no prefix scan or truncation) and fully parsed and validated.
+MANAGED_CLAUDE_SETTINGS_LIMIT = 65536
+MANAGED_CLAUDE_METADATA_LIMIT = 1048576
 
 
 def managed_claude_settings(home, *, system_settings=None):
@@ -3013,11 +3020,13 @@ def managed_claude_settings(home, *, system_settings=None):
         raise ValueError('managed_settings_unverified')
     auth_keys = {'apiKeyHelper', 'primaryApiKey', 'awsAuthRefresh', 'awsCredentialExport',
                  'forceLoginMethod', 'forceLoginOrgUUID'}
-    for parts in (('.claude', 'settings.json'), ('.claude', 'settings.local.json'),
-                  ('.claude', '.claude.json'), ('.claude.json',)):
+    for parts, limit in ((('.claude', 'settings.json'), MANAGED_CLAUDE_SETTINGS_LIMIT),
+                         (('.claude', 'settings.local.json'), MANAGED_CLAUDE_SETTINGS_LIMIT),
+                         (('.claude', '.claude.json'), MANAGED_CLAUDE_METADATA_LIMIT),
+                         (('.claude.json',), MANAGED_CLAUDE_METADATA_LIMIT)):
         path = Path(home).joinpath(*parts)
         try:
-            settings = json.loads(private_fs.read_bytes(path, 65536))
+            settings = json.loads(private_fs.read_bytes(path, limit))
         except FileNotFoundError:
             continue
         except (OSError, ValueError):
