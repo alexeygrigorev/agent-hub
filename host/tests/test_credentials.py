@@ -533,3 +533,86 @@ def test_cli_engines_failure_prints_the_sanitized_server_error(monkeypatch, caps
         cli.main()
     assert e.value.code == 1
     assert capsys.readouterr().err.strip() == 'login expired (login_expired, HTTP 410) -- rerun hub engines login'
+
+
+def test_scoped_authoritative_generation_replaces_old_rotation_without_writeback(tmp_path):
+    dest = tmp_path / 'target'
+    home = dest / 'home'
+    path = '.claude/.credentials.json'
+    (home / '.claude').mkdir(parents=True, mode=0o700)
+    for directory in (dest, home): directory.chmod(0o700)
+    old = {'label':'hub-claude','provider':'claude','credential_generation':5,
+           'credential_paths':[path],'files':{path:'synthetic-old5'}}
+    assert c.reconcile('hub-claude',old,home,dest,lambda *a:pytest.fail('no request'))['generation']==5
+    (home / path).write_text('synthetic-changed-old5')
+    incoming = {**old,'credential_generation':6,'files':{path:'synthetic-central6'}}
+    result = c.materialize_current(incoming,home,dest,6)
+    assert result == {'status':'materialized','generation':6}
+    assert (home/path).read_text()=='synthetic-central6'
+    assert json.loads((dest/c.STATE_FILE).read_text())['generation']==6
+    assert c.materialize_current(incoming,home,dest,6)=={'status':'in_step','generation':6}
+
+
+def scoped_materialization_fixture(tmp_path):
+    dest=tmp_path/'scoped';home=dest/'home';path='.claude/.credentials.json'
+    (home/'.claude').mkdir(parents=True,mode=0o700)
+    for folder in (dest,home):folder.chmod(0o700)
+    b={'label':'hub-claude','provider':'claude','credential_generation':6,'credential_paths':[path],
+       'files':{path:'synthetic-authoritative6'}}
+    return dest,home,path,b
+
+
+@pytest.mark.parametrize('fault',['newer','samegen_rotation','samegen_content','invalid_state','duplicate_state',
+    'missing_state_unknown_local','invalid_generation','symlink','hardlink','wide_parent','oversized_local'])
+def test_scoped_materialization_refuses_conflicts_without_mutation(tmp_path,fault):
+    dest,home,path,b=scoped_materialization_fixture(tmp_path)
+    c.reconcile('hub-claude',b,home,dest,lambda *a:pytest.fail('no request'))
+    target=home/path;state=dest/c.STATE_FILE
+    if fault=='newer':
+        value=json.loads(state.read_text());value['generation']=7;state.write_text(json.dumps(value))
+    elif fault=='samegen_rotation':target.write_text('synthetic-locally-refreshed6')
+    elif fault=='samegen_content':b['files'][path]='synthetic-conflicting-central6'
+    elif fault=='invalid_state':state.write_text('{')
+    elif fault=='duplicate_state':state.write_text('{"generation":7,"generation":5,"digests":{}}')
+    elif fault=='missing_state_unknown_local':state.unlink();target.write_text('synthetic-unversioned')
+    elif fault=='invalid_generation':b['credential_generation']=7
+    elif fault=='symlink':
+        saved=target.with_suffix('.saved');target.rename(saved);target.symlink_to(saved)
+    elif fault=='hardlink':
+        import os
+        os.link(target,target.with_suffix('.link'))
+    elif fault=='wide_parent':target.parent.chmod(0o770)
+    elif fault=='oversized_local':target.write_text('x'*32001)
+    before=target.read_bytes();before_state=state.read_bytes() if state.exists() else None
+    with pytest.raises((ValueError,OSError)):
+        c.materialize_current(b,home,dest,6)
+    assert target.read_bytes()==before
+    assert (state.read_bytes() if state.exists() else None)==before_state
+
+
+def test_scoped_materialization_state_publication_failure_is_resumable(tmp_path,monkeypatch):
+    dest,home,path,b=scoped_materialization_fixture(tmp_path)
+    old={**b,'credential_generation':5,'files':{path:'synthetic-old5'}}
+    c.reconcile('hub-claude',old,home,dest,lambda *a:pytest.fail('no request'))
+    (home/path).write_text('synthetic-rotated-old5')
+    original=c.private_fs.atomic_write
+    def failure(target,*args,**kwargs):
+        if Path(target).name==c.STATE_FILE:raise OSError('synthetic interrupted state publication')
+        return original(target,*args,**kwargs)
+    with monkeypatch.context() as m:
+        m.setattr(c.private_fs,'atomic_write',failure)
+        with pytest.raises(OSError):c.materialize_current(b,home,dest,6)
+    assert (home/path).read_text()==b['files'][path]
+    assert json.loads((dest/c.STATE_FILE).read_text())['generation']==5
+    assert c.materialize_current(b,home,dest,6)['generation']==6
+    assert json.loads((dest/c.STATE_FILE).read_text())['generation']==6
+
+
+def test_scoped_materialization_missing_first_state_and_file_repair(tmp_path):
+    dest,home,path,b=scoped_materialization_fixture(tmp_path)
+    assert c.materialize_current(b,home,dest,6,check_only=True)['generation']==6
+    assert not (home/path).exists() and not (dest/c.STATE_FILE).exists()
+    (home/path).write_text(b['files'][path]);(home/path).chmod(0o600)
+    assert c.materialize_current(b,home,dest,6)['status']=='in_step'
+    (home/path).unlink()
+    assert c.materialize_current(b,home,dest,6)['status']=='materialized'

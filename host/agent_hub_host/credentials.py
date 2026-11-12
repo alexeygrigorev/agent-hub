@@ -152,6 +152,81 @@ def reconcile(label, bundle, home, dest, request, hub_files=None, hub_generation
     return result
 
 
+def materialize_current(bundle, home, dest, expected_generation, *, check_only=False):
+    """Scoped import/resume: authoritative current Hub generation, no writeback.
+
+    The caller holds the provisioning lock and has validated the exact current
+    bundle. Older local rotations cannot overwrite this explicit import. An
+    equal-generation change or newer local state needs separate reconciliation.
+    """
+    path = '.claude/.credentials.json'
+    if (bundle.get('label') != 'hub-claude' or bundle.get('provider') != 'claude'
+            or type(expected_generation) is not int or not 1 <= expected_generation <= 2**53-1
+            or type(bundle.get('credential_generation')) is not int
+            or bundle['credential_generation'] != expected_generation
+            or bundle.get('credential_paths') != [path]):
+        raise ValueError('Scoped credential generation conflict')
+    value = bundle.get('files', {}).get(path)
+    if not isinstance(value, str) or not value or len(value.encode('utf8')) > MAX_FILE:
+        raise ValueError('Invalid scoped credential material')
+    data = value.encode('utf8')
+    digest = _digest(data)
+    home, dest = Path(home), Path(dest)
+    def unique(pairs):
+        result = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError('Invalid scoped credential state')
+            result[key] = item
+        return result
+    try:
+        state = json.loads(private_fs.read_bytes(dest / STATE_FILE, 65536), object_pairs_hook=unique)
+    except FileNotFoundError:
+        state = None
+    except (ValueError, OSError):
+        raise ValueError('Scoped credential state unavailable') from None
+    if state is not None and (not isinstance(state, dict) or set(state) != {'generation','digests'}
+            or type(state.get('generation')) is not int or not 0 <= state['generation'] <= 2**53-1
+            or not isinstance(state.get('digests'), dict) or set(state['digests']) != {path}
+            or not isinstance(state['digests'][path], str) or not re.fullmatch('[0-9a-f]{64}', state['digests'][path])):
+        raise ValueError('Invalid scoped credential state')
+    if state is not None and state['generation'] > expected_generation:
+        raise ValueError('Scoped credential generation conflict')
+    target = home / path
+    try:
+        # Provider-owned replacements may use a wider umask. Read without chmod,
+        # retain no-follow/single-link/owner proof and a private leaf directory.
+        with private_fs.parent(target) as anchor:
+            fd = private_fs._open(anchor, target, os.O_RDONLY, private=False)
+            with os.fdopen(fd, 'rb') as stream:
+                info = os.fstat(stream.fileno())
+                if os.name != 'nt' and info.st_uid != os.getuid():
+                    raise ValueError('Unsafe scoped credential owner')
+                if info.st_size > MAX_FILE*2:
+                    raise ValueError('Scoped credential file too large')
+                local = stream.read(MAX_FILE*2+1)
+                if len(local) > MAX_FILE*2:
+                    raise ValueError('Scoped credential file too large')
+    except FileNotFoundError:
+        local = None
+    if state is None and local is not None and local != data:
+        raise ValueError('Scoped credential origin unavailable')
+    if state is not None and state['generation'] == expected_generation:
+        if state['digests'][path] != digest or local is not None and local != data:
+            raise ValueError('Scoped credential current generation changed')
+    result = {'status': 'in_step' if local == data else 'materialized', 'generation': expected_generation}
+    if check_only:
+        return result
+    # File first, digest-state last. An interrupted state publication leaves the
+    # older state so retry can complete the same authoritative generation.
+    if local != data:
+        _write_file(target, data)
+    desired = {'generation': expected_generation, 'digests': {path: digest}}
+    if state != desired:
+        private_fs.atomic_write(dest / STATE_FILE, json.dumps(desired).encode(), 65536)
+    return result
+
+
 def fetch_current(label, request):
     """Launch-time fetch of Hub's current credential generation (I3)."""
     response = request('GET', '/api/engines/%s/credential' % label)

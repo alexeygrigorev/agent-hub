@@ -16,6 +16,7 @@ from unittest.mock import patch
 from agent_hub_host import native_claude_import as n
 from agent_hub_host import native_import_host as h
 from agent_hub_host import provisioning as p
+from agent_hub_host import engine_login
 
 
 class NativeImportTest(unittest.TestCase):
@@ -88,6 +89,76 @@ class NativeImportTest(unittest.TestCase):
         with patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': str(self.home / 'managed-engines' / 'home/.claude')}):
             with self.assertRaisesRegex(ValueError, 'Native Claude home required'):
                 n.collect()
+
+    def scoped_materialization_integration(self, resume):
+        from agent_hub_host import credentials
+        revision = '33333333-3333-4333-8333-333333333333'
+        root = self.home / 'managed-scoped'
+        dest = root / ('hub-claude-' + revision)
+        home = dest / 'home'
+        (home / '.claude').mkdir(parents=True, mode=0o700)
+        for directory in (root, dest, home): directory.chmod(0o700)
+        old = {'label':'hub-claude','provider':'claude','version':'2.1.322','revision':revision,
+               'files':{n.AUTH_PATH:json.dumps({'claudeAiOauth':{'accessToken':'synthetic-old5'}})},
+               'env':{},'args':[],'credential_paths':[n.AUTH_PATH],'credential_generation':5}
+        incoming = dict(old, credential_generation=6, files={n.AUTH_PATH:json.dumps({'claudeAiOauth': self.oauth})})
+        credentials.reconcile('hub-claude',old,home,dest,lambda *args: self.fail('no request for initial fixture'))
+        (home/n.AUTH_PATH).write_text('synthetic changed old generation5')
+        p.save_bundle(dest,old)
+        state = [{'label':'unrelated','provider':'codex','revision':revision},
+                 {'label':'hub-claude','provider':'claude','revision':revision}]
+        state_bytes=json.dumps(state).encode();(root/'state.json').write_bytes(state_bytes);(root/'state.json').chmod(0o600)
+        unrelated=root/'unrelated-private';unrelated.mkdir(mode=0o700);(unrelated/'keep').write_bytes(b'unchanged')
+        profile=self.home/'.config/aplexer/config.toml';profile.parent.mkdir(parents=True,mode=0o700)
+        original='version = 1\n[profiles.unrelated]\nengine = "shell"\ncommand = ["synthetic"]\n'
+        profile.write_text(original);profile.chmod(0o600)
+        calls=[];current=6 if resume else 5;acked=5
+        def transport(req):
+            nonlocal current,acked
+            method,path=req.get_method(),urllib.parse.urlsplit(req.full_url).path
+            payload=json.loads(req.data) if req.data else None
+            calls.append((method,path))
+            if method=='GET' and path=='/api/engines':
+                return {'credentials':[{'label':'hub-claude','generation':current,'hosts':['test-host']}],
+                        'sync_status':[{'machine_id':'test-host','accounts':[{'label':'hub-claude',
+                            'credential_generation':current,'acked_generation':acked}]}]}
+            if method=='POST' and path=='/api/engines/import-native':
+                self.assertFalse(resume);self.assertEqual(payload['expected_generation'],5)
+                current=6;return {'credential_generation':6}
+            if method=='GET' and path=='/api/engines/sync':
+                return {'engines':[incoming],'logins':[{'id':'must-not-complete'}]}
+            if method=='POST' and path=='/api/engines/hub-claude':return {'ok':True}
+            if method=='POST' and path=='/api/engines/sync-report':
+                self.assertEqual(payload['items'][0]['credential_generation'],6);acked=6
+                return {'status':'recorded'}
+            self.fail('unexpected API path '+method+' '+path)
+        self.args.resume_generation=6 if resume else None
+        p._last_sync_report.update(body=None,at=0)
+        native_before=self.path.read_bytes()
+        with patch.dict(os.environ,{'AGENT_HUB_MANAGED_DIR':str(root),'APLEXER_CONFIG':str(profile)}), \
+             patch.object(h.api,'safe_http_json',side_effect=transport), \
+             patch.object(p,'provision_managed_home'), \
+             patch.object(engine_login,'cancel_removed',side_effect=AssertionError('no global cleanup')):
+            if resume:
+                with patch.object(n,'collect',side_effect=AssertionError('resume must not collect')):
+                    result=n.command(self.args)
+            else:result=n.command(self.args)
+        self.assertEqual(result['credential_generation'],6);self.assertEqual(result['acked_generation'],6)
+        self.assertEqual((home/n.AUTH_PATH).read_text(),incoming['files'][n.AUTH_PATH])
+        self.assertEqual(json.loads((dest/credentials.STATE_FILE).read_text())['generation'],6)
+        self.assertEqual(self.path.read_bytes(),native_before)
+        self.assertEqual((root/'state.json').read_bytes(),state_bytes)
+        self.assertEqual((unrelated/'keep').read_bytes(),b'unchanged')
+        self.assertTrue(profile.read_text().startswith(original))
+        self.assertIn('[profiles.hub-hub-claude]',profile.read_text())
+        self.assertFalse(any(path.endswith('/credential') for _,path in calls))
+        self.assertEqual(sum(path=='/api/engines/import-native' for _,path in calls),0 if resume else 1)
+
+    def test_initial_import_real_scoped_modules_do_not_write_back_old_local_generation(self):
+        self.scoped_materialization_integration(False)
+
+    def test_resume_real_scoped_modules_do_not_collect_or_write_back_old_local_generation(self):
+        self.scoped_materialization_integration(True)
 
     def run_command(self, *, incoming=5, receipt=5, ack=5, central=5, current=4, lease=False, fail_upload=False, fail_sync=False, fail_verify=False):
         calls = []
