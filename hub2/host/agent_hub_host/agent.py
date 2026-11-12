@@ -656,6 +656,17 @@ class Bridge:
             else:
                 native = self.launcher.retired(row["native_id"], dict(row))
             if not native:
+                # Only automatic reconciliation may join a positive tombstone
+                # to the original host launch evidence. Never reuse this for a
+                # live operation or a missing-process-as-exit inference.
+                matches = self.journal.db.execute("SELECT COUNT(*) FROM launches WHERE native_id=?",
+                                                  (row['native_id'],)).fetchone()[0]
+                current = self.journal.db.execute("SELECT * FROM launches WHERE operation_id=?", (row['operation_id'],)).fetchone()
+                if (matches == 1 and current is not None
+                        and all(current[key] == row[key] for key in ('session_id','epoch','digest','native_id','workspace','tag','state'))
+                        and callable(getattr(self.launcher, 'retired_origin', None))):
+                    native = self.launcher.retired_origin(row['native_id'], dict(row))
+            if not native:
                 if not workspace_available:
                     self._warn_unavailable_workspace(row)
                 continue  # Missing process is uncertain, never a successful finish.
@@ -678,7 +689,7 @@ class Bridge:
             if code is None:
                 continue
             launcher_state = (
-                "retired-finished" if not workspace_available
+                "retired-finished" if not workspace_available or native.get("retirement") == "verified_origin"
                 else self.launcher.finalize(row["native_id"], {"tag": row["tag"], "workspace": row["workspace"]})
             )
             payload = {"operation_id": row["operation_id"], "epoch": row["epoch"],
@@ -690,6 +701,8 @@ class Bridge:
                                     # the pinned spelling across Windows aliases.
                                     "native_identity": {"id": native['id'], "tag": native['tag'], "workspace": row['workspace']},
                                     "containment_empty": True, "native_exit": exit_info,"launcher_state":launcher_state}}
+            if native.get('retirement_origin'):
+                payload['evidence']['retirement_origin'] = native['retirement_origin']
             if type(row['runtime_deadline']) is int:
                 exited_at = exit_info.get('exited_at_ms')
                 exceeded = native.get('deadline_exceeded') is True or (type(exited_at) is int and exited_at >= row['runtime_deadline'])
@@ -697,8 +710,20 @@ class Bridge:
             elif type(native.get('deadline_ms')) is int:
                 payload['evidence']['native_deadline']={'deadline_ms':native['deadline_ms'],'exceeded':native.get('deadline_exceeded') is True}
             if row['state']=='aborting':payload['launch_failed']=True
+            if native.get('retirement') == 'verified_origin' and len(canonical(payload['evidence']).encode('utf8')) > 8192:
+                logging.getLogger(__name__).warning('Origin retirement evidence too large session=%s', row['session_id'])
+                continue
             with self.journal.db:
-                self.journal.db.execute("UPDATE launches SET state='exited' WHERE operation_id=?", (row["operation_id"],))
+                if native.get('retirement') == 'verified_origin':
+                    keys = ('operation_id','session_id','epoch','digest','native_id','workspace','tag','state')
+                    changed = self.journal.db.execute("UPDATE launches SET state='exited' WHERE "
+                        + ' AND '.join(key+'=?' for key in keys)
+                        + ' AND (SELECT COUNT(*) FROM launches WHERE native_id=?)=1',
+                        tuple(row[key] for key in keys)+(row['native_id'],))
+                    if changed.rowcount != 1:
+                        continue
+                else:
+                    self.journal.db.execute("UPDATE launches SET state='exited' WHERE operation_id=?", (row["operation_id"],))
                 self.journal.db.execute("INSERT OR REPLACE INTO outbox VALUES(?,?,?)",
                                        (f'finish:{row["operation_id"]}', f'/api/sessions/{row["session_id"]}/finish', canonical(payload)))
 

@@ -364,6 +364,46 @@ def read_tombstone(native_id, state_dir=None):
         return None
 
 
+def retirement_private_json(path, limit):
+    """Read owner-private retirement evidence without following any path link."""
+    if os.name != 'posix':
+        raise ValueError('retirement evidence unsupported')
+    path = Path(os.path.abspath(path))
+    directory = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in path.parts[1:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            os.close(directory)
+            directory = child
+            if os.fstat(directory).st_uid not in (0, os.geteuid()):
+                raise ValueError('foreign evidence ancestor')
+        parent = os.fstat(directory)
+        if parent.st_uid != os.geteuid() or parent.st_mode & 0o077:
+            raise ValueError('nonprivate evidence boundary')
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        with os.fdopen(fd, 'rb') as stream:
+            meta = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(meta.st_mode) or meta.st_uid != os.geteuid()
+                    or meta.st_nlink != 1 or meta.st_mode & 0o077 or meta.st_size > limit):
+                raise ValueError('unsafe retirement file')
+            raw = stream.read(limit+1)
+        if len(raw) > limit:
+            raise ValueError('oversized retirement evidence')
+        def unique(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError('duplicate retirement field')
+                result[key] = value
+            return result
+        value = json.loads(raw, object_pairs_hook=unique)
+        if not isinstance(value, dict):
+            raise ValueError('invalid retirement evidence')
+        return value
+    finally:
+        os.close(directory)
+
+
 def verify_tombstone(tombstone, expected_id, expected_tag, expected_workspace):
     if not isinstance(tombstone, dict):
         return False, 'tombstone is not a dictionary'
@@ -995,6 +1035,61 @@ class NativeLauncher:
                 'phase': 'exited', 'containment_empty': True, 'exit': tombstone['exit'],
                 'deadline_ms': tombstone.get('deadline_ms'), 'deadline_exceeded': tombstone.get('deadline_exceeded'),
                 'retirement': 'verified_finished'}
+
+    def retired_origin(self, native_id, expected):
+        """Automatic reconcile only: legacy host launch evidence, not live identity.
+
+        The caller must qualify the unique current journal attempt. Legacy launch
+        manifests are host-persisted evidence, not immutable/cryptographic proof;
+        they lack direct attempt fields. Any stored attempt fields must match too.
+        """
+        try:
+            session = expected['session_id']
+            workspace = expected['workspace']
+            if (not isinstance(session, str) or not UUID_RE.fullmatch(session)
+                    or not isinstance(native_id, str) or not UUID_RE.fullmatch(native_id)
+                    or expected.get('native_id') != native_id or expected.get('tag') != 'task-hub2-'+session
+                    or not isinstance(workspace, str) or not Path(workspace).is_absolute()
+                    or type(expected.get('epoch')) is not int or expected['epoch'] < 1
+                    or not isinstance(expected.get('operation_id'), str) or not re.fullmatch('[A-Za-z0-9_.:-]{1,120}', expected['operation_id'])
+                    or not re.fullmatch('[0-9a-f]{64}', expected.get('digest', ''))):
+                return None
+            manifest = retirement_private_json(Path(workspace)/'.local'/('launch-hub2-'+session+'.json'), 65536)
+            base = Path(self.state_dir) if self.state_dir else Path(os.environ.get('APLEXER_STATE_DIR', str(Path.home()/'.local/state/aplexer')))
+            tombstone = retirement_private_json(base/'retired-sessions'/native_id.lower()/'tombstone.json', TOMBSTONE_ENVELOPE_BYTES)
+            tombstone.pop('output', None)
+            if len(json.dumps(tombstone, ensure_ascii=True).encode()) > TOMBSTONE_METADATA_BYTES:
+                return None
+            if (manifest.get('task_id') != 'hub2-'+session or manifest.get('session_id') != native_id
+                    or manifest.get('tag') != expected['tag'] or manifest.get('workspace') != workspace
+                    or tombstone.get('id') != native_id or tombstone.get('tag') != expected['tag']
+                    or tombstone.get('workspace') == workspace
+                    or not isinstance(tombstone.get('workspace'), str) or not Path(tombstone['workspace']).is_absolute()
+                    or len(tombstone['workspace'].encode('utf8')) > 4096
+                    or tombstone.get('cause') != 'finished' or tombstone.get('containment_empty') is not True
+                    or native_returncode(tombstone.get('exit')) is None):
+                return None
+            birth = manifest.get('created_at_ms')
+            exited = tombstone['exit'].get('exited_at_ms')
+            finished = tombstone.get('finished_at_ms')
+            started = manifest.get('native_started_at')
+            if (any(type(value) is not int for value in (birth, exited, finished))
+                    or not 0 < birth <= exited <= finished <= int(time.time()*1000)+5000
+                    or tombstone.get('created_at_ms') != birth or type(tombstone.get('created_at_ms')) is not int
+                    or type(started) not in (int, float) or not birth <= started*1000 <= exited):
+                return None
+            for field in ('operation_id', 'epoch', 'digest'):
+                if field in manifest and (type(manifest[field]) is not type(expected[field]) or manifest[field] != expected[field]):
+                    return None
+            proof = {'source': 'host_launch_manifest', 'created_at_ms': birth,
+                     'origin_workspace': workspace, 'observed_workspace': tombstone['workspace'],
+                     'operation_id': expected['operation_id'], 'epoch': expected['epoch'], 'journal_digest': expected['digest']}
+            return {'id': native_id, 'tag': expected['tag'], 'workspace': workspace, 'phase': 'exited',
+                    'containment_empty': True, 'exit': tombstone['exit'], 'retirement': 'verified_origin',
+                    'retirement_origin': proof, 'deadline_ms': tombstone.get('deadline_ms'),
+                    'deadline_exceeded': tombstone.get('deadline_exceeded')}
+        except (OSError, ValueError, TypeError, KeyError, OverflowError):
+            return None
 
     def recover(self, task_id, workspace, requirements=None):
         """Identity from our persisted evidence plus the live native row.

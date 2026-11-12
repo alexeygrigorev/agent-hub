@@ -318,6 +318,106 @@ class HostTests(unittest.TestCase):
                 self.assertEqual(payload["evidence"]["native_deadline"],
                                  {"deadline_ms": row["runtime_deadline"], "exceeded": False})
 
+    def origin_retirement_fixture(self):
+        self.bridge.offer(self.offer(session_id='11111111-2222-4333-8444-555555555555'))
+        row = self.journal.db.execute("SELECT * FROM launches").fetchone()
+        manifest = json.loads((Path(row['workspace']) / '.local' / ('launch-hub2-' + row['session_id'] + '.json')).read_text())
+        state = self.root / 'origin-native-state'
+        retired = state / 'retired-sessions' / row['native_id']
+        retired.mkdir(parents=True, mode=0o700, exist_ok=True)
+        now = int(time.time()*1000)
+        (retired / 'tombstone.json').write_text(json.dumps({'id': row['native_id'], 'tag': row['tag'],
+            'workspace': str(self.root / 'different-cwd'), 'created_at_ms': manifest['created_at_ms'],
+            'cause': 'finished', 'containment_empty': True, 'finished_at_ms': now,
+            'exit': {'code': 127, 'signal': None, 'exited_at_ms': now}}))
+        (retired / 'tombstone.json').chmod(0o600)
+        self.bridge.launcher.state_dir = state
+        self.native.process = None
+        with self.journal.db:
+            self.journal.db.execute('DELETE FROM outbox')
+        self.native.calls.clear()
+        return row, manifest, retired
+
+    def test_reconcile_origin_retirement_preserves_failed_exit_without_native_effects(self):
+        row, manifest, retired = self.origin_retirement_fixture()
+        self.bridge.reconcile()
+        self.bridge.reconcile()
+        self.assertEqual(self.journal.db.execute('SELECT state FROM launches').fetchone()[0], 'exited')
+        self.assertEqual([args[1] for args, _ in self.native.calls], ['status'])
+        payload = json.loads(self.journal.db.execute('SELECT payload FROM outbox').fetchone()[0])
+        self.assertEqual(payload['exit_code'], 127)
+        self.assertEqual(payload['operation_id'], row['operation_id'])
+        self.assertEqual(payload['epoch'], row['epoch'])
+        self.assertEqual(payload['evidence']['native_identity']['workspace'], row['workspace'])
+        self.assertEqual(payload['evidence']['retirement_origin']['observed_workspace'], str(self.root / 'different-cwd'))
+        self.assertEqual(payload['evidence']['retirement_origin']['created_at_ms'], manifest['created_at_ms'])
+
+    def test_origin_retirement_restart_keeps_one_durable_failed_finish(self):
+        row, _, _ = self.origin_retirement_fixture()
+        self.bridge.reconcile()
+        self.journal.db.close()
+        self.journal = Journal(self.root / 'private/journal.sqlite')
+        restarted = Bridge(self.client, self.journal, [self.root], ['codex'],
+                           executable=os.sys.executable, runner=self.native)
+        self.native.calls.clear()
+        restarted.reconcile()
+        self.assertEqual(self.native.calls, [])
+        receipts = self.journal.db.execute('SELECT payload FROM outbox').fetchall()
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(json.loads(receipts[0][0])['exit_code'], 127)
+
+    def test_origin_retirement_oversized_finish_stays_unresolved(self):
+        self.origin_retirement_fixture()
+        original = self.bridge.launcher.retired_origin
+        def enlarged(*args):
+            result = original(*args)
+            result['retirement_origin']['observed_workspace'] = '/' + 'x'*8192
+            return result
+        with patch.object(self.bridge.launcher, 'retired_origin', side_effect=enlarged):
+            self.bridge.reconcile()
+        self.assertFalse(self.journal.db.execute('SELECT 1 FROM outbox').fetchone())
+        self.assertEqual(self.journal.db.execute('SELECT state FROM launches').fetchone()[0], 'running')
+
+    def test_origin_retirement_duplicate_native_journal_binding_is_unresolved(self):
+        row, _, _ = self.origin_retirement_fixture()
+        duplicate = dict(row, session_id='other-session', operation_id='other-operation')
+        columns = list(duplicate)
+        with self.journal.db:
+            self.journal.db.execute('INSERT INTO launches ('+','.join(columns)+') VALUES ('+','.join('?' for _ in columns)+')',
+                                    [duplicate[key] for key in columns])
+        self.bridge.reconcile()
+        self.assertFalse(self.journal.db.execute('SELECT 1 FROM outbox').fetchone())
+        self.assertEqual({v[0] for v in self.journal.db.execute('SELECT state FROM launches')}, {'running'})
+        self.assertFalse(any(args[1] in ('kill','send','start') for args, _ in self.native.calls))
+
+    def test_origin_retirement_rechecks_attempt_after_evidence_read(self):
+        for field, value in [('epoch', 232), ('digest', 'f'*64), ('native_id', '00000000-0000-4000-8000-000000000000')]:
+            with self.subTest(field=field):
+                if self.journal.db.execute('SELECT 1 FROM launches').fetchone():
+                    with self.journal.db:
+                        self.journal.db.execute('DELETE FROM launches')
+                self.native.process = None
+                row, _, _ = self.origin_retirement_fixture()
+                original = self.bridge.launcher.retired_origin
+                def changed(*args):
+                    result = original(*args)
+                    with self.journal.db:
+                        self.journal.db.execute('UPDATE launches SET '+field+'=?', (value,))
+                    return result
+                with patch.object(self.bridge.launcher, 'retired_origin', side_effect=changed):
+                    self.bridge.reconcile()
+                self.assertFalse(self.journal.db.execute('SELECT 1 FROM outbox').fetchone())
+                self.assertEqual(self.journal.db.execute('SELECT state FROM launches').fetchone()[0], 'running')
+
+    def test_origin_retirement_never_overrides_conflicting_live_identity(self):
+        row, _, _ = self.origin_retirement_fixture()
+        self.native.process = {'id': row['native_id'], 'tag': row['tag'], 'workspace': str(self.root/'foreign'), 'phase': 'running'}
+        with patch.object(self.bridge.launcher, 'retired_origin', side_effect=AssertionError('must not qualify a live conflict')):
+            with self.assertRaisesRegex(RuntimeError, 'native_identity_mismatch'):
+                self.bridge.reconcile()
+        self.assertFalse(self.journal.db.execute('SELECT 1 FROM outbox').fetchone())
+        self.assertEqual([args[1] for args, _ in self.native.calls], ['status'])
+
     def test_missing_workspace_without_bound_retirement_remains_unresolved(self):
         self.bridge.offer(self.offer())
         with self.journal.db:

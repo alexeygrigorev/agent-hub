@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from unittest import mock
 
@@ -223,6 +224,94 @@ class FirstActionTest(unittest.TestCase):
             path.write_text(json.dumps({k: v for k, v in whoami.items() if k != 'worker_pid'}))
             os.utime(path, (time.time(), time.time()))
             self.assertFalse(nl.validate_first_action(str(path), record, time.time() - 1))
+
+
+class RetirementOriginTest(unittest.TestCase):
+    def evidence(self, tmp):
+        sid = '11111111-2222-4333-8444-555555555555'
+        nid = '22222222-3333-4444-8555-666666666666'
+        workspace = str(Path(tmp)/'original')
+        expected = {'session_id': sid, 'native_id': nid, 'operation_id': 'operation:0', 'epoch': 231,
+                    'digest': 'a'*64, 'tag': 'task-hub2-'+sid, 'workspace': workspace}
+        manifest = Path(workspace)/'.local'/('launch-hub2-'+sid+'.json')
+        manifest.parent.mkdir(parents=True, mode=0o700)
+        state = Path(tmp)/'native'
+        tombstone = state/'retired-sessions'/nid/'tombstone.json'
+        tombstone.parent.mkdir(parents=True, mode=0o700)
+        now = int(time.time()*1000)
+        launch = {'task_id': 'hub2-'+sid, 'session_id': nid, 'tag': expected['tag'], 'workspace': workspace,
+                  'created_at_ms': now-2000, 'native_started_at': (now-1000)/1000}
+        retired = {'id': nid, 'tag': expected['tag'], 'workspace': str(Path(tmp)/'moved'), 'created_at_ms': now-2000,
+                   'cause': 'finished', 'containment_empty': True, 'exit': {'code': 127, 'signal': None, 'exited_at_ms': now},
+                   'finished_at_ms': now}
+        for path, value in ((manifest, launch), (tombstone, retired)):
+            path.write_text(json.dumps(value)); path.chmod(0o600)
+        adapter = nl.NativeLauncher({'aplexer_state_dir': str(state)})
+        return adapter, expected, manifest, tombstone, launch, retired
+
+    def test_legacy_origin_requires_exact_birth_positive_exit_and_preserves_live_refusal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter, expected, manifest, tombstone, launch, retired = self.evidence(tmp)
+            self.assertIsNone(adapter.retired(expected['native_id'], expected))
+            value = adapter.retired_origin(expected['native_id'], expected)
+            self.assertEqual(value['exit']['code'], 127)
+            self.assertEqual(value['workspace'], expected['workspace'])
+            self.assertEqual(value['retirement_origin']['observed_workspace'], retired['workspace'])
+            self.assertNotIn('first_action', value)
+            # A legacy manifest has no fabricated direct attempt fields.
+            self.assertNotIn('epoch', launch)
+
+    def test_invalid_retirement_or_launch_never_qualifies(self):
+        changes = [('retired', {'created_at_ms': 1}), ('retired', {'tag': 'other'}),
+            ('retired', {'id': '00000000-0000-4000-8000-000000000000'}),
+            ('retired', {'containment_empty': False}), ('retired', {'cause': 'forgotten'}),
+            ('retired', {'exit': {}}), ('retired', {'finished_at_ms': 1}),
+            ('retired', {'finished_at_ms': int(time.time()*1000)+60000}),
+            ('retired', {'created_at_ms': True}), ('launch', {'workspace': '/foreign'}),
+            ('launch', {'session_id': 'other'}), ('launch', {'tag': 'other'}),
+            ('launch', {'native_started_at': float('nan')}), ('launch', {'created_at_ms': None}),
+            ('launch', {'operation_id': 'other'}), ('launch', {'epoch': 230}),
+            ('launch', {'epoch': 232}), ('launch', {'digest': 'b'*64})]
+        for target, patch in changes:
+            with self.subTest(target=target, patch=patch), tempfile.TemporaryDirectory() as tmp:
+                adapter, expected, manifest, tombstone, launch, retired = self.evidence(tmp)
+                value = launch if target == 'launch' else retired
+                value.update(patch)
+                (manifest if target == 'launch' else tombstone).write_text(json.dumps(value))
+                self.assertIsNone(adapter.retired_origin(expected['native_id'], expected))
+
+    def test_invalid_expected_attempt_and_foreign_owner_are_unknown(self):
+        for field, value in [('session_id', 'foreign'), ('epoch', True), ('epoch', 0),
+                             ('digest', 'invalid'), ('operation_id', ''), ('workspace', 'relative')]:
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
+                adapter, expected, _, _, _, _ = self.evidence(tmp)
+                expected[field] = value
+                self.assertIsNone(adapter.retired_origin(expected['native_id'], expected))
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter, expected, _, _, _, _ = self.evidence(tmp)
+            with patch.object(nl.os, 'geteuid', return_value=os.geteuid()+1):
+                self.assertIsNone(adapter.retired_origin(expected['native_id'], expected))
+
+    def test_private_reader_refuses_unsafe_duplicate_and_blocking_files(self):
+        for target in ('manifest', 'tombstone'):
+            for fault in ('group_file','group_parent','symlink','hardlink','fifo','duplicate','nested_duplicate','oversize','metadata_oversize','truncated','ancestor_link'):
+                with self.subTest(target=target, fault=fault), tempfile.TemporaryDirectory() as tmp:
+                    adapter, expected, manifest, tombstone, launch, retired = self.evidence(tmp)
+                    path = manifest if target == 'manifest' else tombstone
+                    if fault == 'group_file': path.chmod(0o660)
+                    elif fault == 'group_parent': path.parent.chmod(0o770)
+                    elif fault == 'symlink':
+                        copy = path.with_suffix('.original'); path.rename(copy); path.symlink_to(copy)
+                    elif fault == 'hardlink': os.link(path, path.with_suffix('.link'))
+                    elif fault == 'fifo': path.unlink(); os.mkfifo(path, 0o600)
+                    elif fault == 'ancestor_link':
+                        directory = path.parent; moved = directory.with_name(directory.name+'-moved'); directory.rename(moved); directory.symlink_to(moved, target_is_directory=True)
+                    elif fault == 'duplicate': path.write_text('{"id":"first","id":"second"}')
+                    elif fault == 'nested_duplicate': path.write_text('{"exit":{"code":127,"code":0}}')
+                    elif fault == 'oversize': path.write_text(' '*1100000)
+                    elif fault == 'metadata_oversize': path.write_text(json.dumps({**(launch if target == 'manifest' else retired), 'extra': 'x'*65536}))
+                    elif fault == 'truncated': path.write_text('{')
+                    self.assertIsNone(adapter.retired_origin(expected['native_id'], expected))
 
 
 class TombstoneTest(unittest.TestCase):
