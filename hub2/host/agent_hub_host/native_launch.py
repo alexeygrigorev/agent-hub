@@ -812,10 +812,13 @@ class NativeLauncher:
             child_env["APLEXER_RETAIN_RETIRED_OUTPUT"] = "1"
         if specification.get("child_config_file"):
             child_env["HUB2_CONFIG"] = specification["child_config_file"]
+        claude_config_dir = child_env.get('CLAUDE_CONFIG_DIR')
         if objective is not None and provider == 'claude':
-            # Pin the same trusted config root for the child and receipt reader,
-            # including local-login hosts whose aplexer daemon has another env.
-            child_env.setdefault('CLAUDE_CONFIG_DIR', os.environ.get('CLAUDE_CONFIG_DIR', str(Path.home() / '.claude')))
+            # An explicit default directory changes Claude's global onboarding
+            # path. Preserve native absence while pinning its transcript root.
+            if 'CLAUDE_CONFIG_DIR' not in child_env and os.environ.get('CLAUDE_CONFIG_DIR'):
+                child_env['CLAUDE_CONFIG_DIR'] = os.environ['CLAUDE_CONFIG_DIR']
+            claude_config_dir = child_env.get('CLAUDE_CONFIG_DIR', str(Path.home() / '.claude'))
         tmpdir = Path(child_env["TMPDIR"])
         tmpdir.mkdir(mode=0o700, parents=True, exist_ok=True)
         argv = [self.native_binary, "start", "--json", "--memory", f"{requested_mb}M",
@@ -836,6 +839,8 @@ class NativeLauncher:
         argv += ["--"] + child
         started = time.time()
         env = spawn_environment(bool(specification.get("provider_home") or specification.get("managed_credential_label")))
+        if objective is not None and provider == 'claude' and 'CLAUDE_CONFIG_DIR' not in child_env:
+            env.pop('CLAUDE_CONFIG_DIR', None)  # Empty inherited values stay absent too.
         env["PWD"] = str(Path(specification["workspace"]).resolve())
         # `a start` is only the daemon handshake client: the spawned session lives
         # under the aplexer supervisor, so the runner timeout bounds the handshake
@@ -881,7 +886,7 @@ class NativeLauncher:
                 raise RuntimeError('native_goal_provider_unsupported')
             goal_registration = self.register_goal(start_json, specification, objective,
                                                    deadline=started + specification["timeout_seconds"],
-                                                   claude_config_dir=child_env.get('CLAUDE_CONFIG_DIR'))
+                                                   claude_config_dir=claude_config_dir)
         # Pane creation is the start receipt. First-action proof is observed later;
         # a slow model must not hold the native id behind the server deadline.
         receipt = {"session_id": start_json["id"],
