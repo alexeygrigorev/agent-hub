@@ -462,6 +462,13 @@ and local settings. Conflicting settings argv, alternate auth in the controlled
 managed user home, and unverified system managed-settings policy refuse the
 explicit attempt. No global or project settings file is edited or helper run.
 
+Hub's non-interactive Claude launches also use `--setting-sources user` so
+workspace settings cannot reject managed bypass mode. This excludes every
+Claude Code setting from the `project` and `local` sources for that process,
+including hooks and other configuration those settings provide; the option is
+not limited to the bypass restriction. Interactive Claude launches retain the
+normal workspace settings.
+
 The private attempt context and its adjacent `.receipt.json` identify the Hub
 session, operation, epoch, original request digest, workspace, native UUID/tag/
 birth time, canonical account, fixed profile, execution archive hash and actual

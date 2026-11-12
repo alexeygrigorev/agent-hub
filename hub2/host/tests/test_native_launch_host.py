@@ -1030,7 +1030,7 @@ class HeadlessStreamOutputTests(unittest.TestCase):
             with self.subTest(provider='claude', effort=effort):
                 child, prompt = self.launch('claude', effort=effort)
                 self.assertEqual(child, ['claude', '--dangerously-skip-permissions', '--model', 'opus', '-p',
-                                        *(['--effort', effort] if effort else []),
+                                        *(['--effort', effort] if effort else []), '--setting-sources', 'user',
                                         '--output-format', 'stream-json', '--verbose', prompt])
             with self.subTest(provider='antigravity', effort=effort):
                 child, prompt = self.launch('antigravity', effort=effort)
@@ -1046,6 +1046,7 @@ class HeadlessStreamOutputTests(unittest.TestCase):
                     flags = [arg.split('=', 1)[1] for arg in child if arg.startswith('--engine-arg=')]
                     self.assertEqual(flags, ['--model', self.MODELS[provider], '--output-format', 'stream-json',
                                              *(['--verbose'] if provider == 'claude' else []),
+                                             *(['--setting-sources', 'user'] if provider == 'claude' else []),
                                              *(['--effort', effort] if effort else [])])
                     self.assertEqual(child[:3], ['synthetic-aplexer', 'task', 'run'])
                     selector = '--profile' if provider == 'antigravity' else '--engine'
