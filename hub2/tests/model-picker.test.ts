@@ -491,6 +491,40 @@ test('--with-goal on the live hetzner-aplexer advertisement only draws goal-capa
  assert.ok(buildRoutingPool({policy,accounts,machines,observed_at:now},{interactive:true,tier:'deep'}).options.some(row=>row.value.engine==='claude'));
 });
 
+test('advertising goal:claude admits Opus and Sonnet to the real weighted goal draw without an engine override',()=>{
+ const now=Date.now(),host='hetzner-aplexer';
+ const candidates=[
+  {id:'codex-sol-medium',engine:'codex',model:'gpt-6.1-sol',effort:'medium',account_id:'codex',weight:1,capabilities:[],enabled:true},
+  {id:'claude-opus-medium',engine:'claude',model:'opus',effort:'medium',account_id:'claude',weight:1,capabilities:[],enabled:true},
+  {id:'claude-sonnet-medium',engine:'claude',model:'sonnet',effort:'medium',account_id:'claude',weight:1,capabilities:[],enabled:true},
+  {id:'zai-glm-flash',engine:'zai',model:'glm-5.3-flash',account_id:'zai-central',weight:1,capabilities:[],enabled:true},
+ ];
+ const capabilities=['headless','interactive:codex','interactive:claude','interactive:zai',
+  'effort:codex','effort:claude','effort:zai','goal:codex','goal:zai'];
+ const snapshot={policy:{version:5,candidates},observed_at:now,
+  accounts:new Map(['codex','claude','zai-central'].map(id=>[id,{account:{enabled:true},credential_usable:true,hosts:[host],...observed(80,now)}])),
+  machines:new Map([[host,{connected:true,os:'linux',engines:['codex','claude','zai'],capabilities}]]),
+ };
+ const input={interactive:true,with_goal:true,machine_id:host,tier:'deep'};
+ assert.deepEqual(buildRoutingPool(snapshot,input).options.map(row=>row.value.engine).sort(),['codex','zai']);
+ capabilities.push('goal:claude');
+ const result=buildRoutingPool(snapshot,input);
+ assert.deepEqual(result.options.map(row=>row.value.model).sort(),['glm-5.3-flash','gpt-6.1-sol','opus','sonnet']);
+ let cumulative=0;
+ const total=result.options.reduce((sum,row)=>sum+row.weight,0);
+ const drawn=new Set<string>();
+ for(const option of result.options){
+  const picked=weightedChoice(result.options,()=>(cumulative+option.weight/2)/total);
+  cumulative+=option.weight;
+  assert.equal(picked.model,option.value.model);
+  assert.equal(picked.machine_id,host);
+  assert.deepEqual(picked.required_capabilities,['interactive','goal']);
+  drawn.add(picked.model);
+ }
+ assert.ok(drawn.has('opus')&&drawn.has('sonnet'));
+ assert.equal(result.diagnostics.excluded.filter(row=>row.reason==='goal_not_advertised').length,0);
+});
+
 test('explicit unsupported engine/model stays explicit with advisory capability observations',()=>{
  const snapshot=capabilitySnapshot(['interactive:codex','interactive:claude','effort:codex','effort:claude','goal:codex']);
  for(const explicit of [{engine:'claude'},{model:'claude-opus-medium'}]){
