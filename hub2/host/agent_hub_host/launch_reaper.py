@@ -78,13 +78,13 @@ def _observe(bridge, state):
                 state['thread'] = None
 
 
-def request_census(bridge):
+def request_census(bridge, refresh=False):
     """Return a fresh cached census, or start one single-inflight observation and return None. Never blocks."""
     state = _observer(bridge)
     with _OBSERVER_LOCK:
         inventory = state['inventory']
         try:
-            if inventory is not None and inventory.fresh():
+            if inventory is not None and not refresh and inventory.fresh():
                 return inventory
         except _CENSUS_ERRORS:
             pass
@@ -112,6 +112,7 @@ def _sweep(bridge, now, inventory):
                       "AND COALESCE(runtime_deadline,admission_expires_at)<=? LIMIT 1000", (now,)).fetchall()
     requested = inventory is not None
     unusable_logged = False
+    refreshed = False
     for row in rows:
         evidence = None
         needs_census = (row['state'] in {'aborting','deadline_stopping','launching','running'}
@@ -129,6 +130,15 @@ def _sweep(bridge, now, inventory):
                     logging.getLogger(__name__).warning('Expired launch census unusable session=%s', row['session_id'])
                 continue
             if evidence is None:
+                continue
+            # The receiver rejects evidence whose census began before the deadline
+            # (permanently), so such a census must never be applied; keep the row
+            # unresolved and obtain a census that starts at/after the deadline.
+            started = evidence.get('started_at_ms')
+            if type(started) is not int or started < row['runtime_deadline']:
+                if not refreshed:
+                    refreshed = True
+                    request_census(bridge, refresh=True)
                 continue
             evidence = {**evidence, 'dispatch_provenance': 'host_journal'}
         with bridge._inflight_lock:

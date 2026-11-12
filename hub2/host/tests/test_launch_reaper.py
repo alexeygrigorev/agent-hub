@@ -92,7 +92,7 @@ class LaunchReaperTests(unittest.TestCase):
 
     def test_overdue_aborting_launch_absent_from_fresh_registry_reports_unconfirmed(self):
         self.row('aborting',deadline=100,native='native',dispatch=1)
-        evidence={'source':'aplexer_all_registry_census','complete':True,'match_count':0}
+        evidence={'source':'aplexer_all_registry_census','complete':True,'match_count':0,'started_at_ms':150,'observed_at_ms':160}
         self.bridge.launcher=SimpleNamespace(inventory=lambda:SimpleNamespace(fresh=lambda:True,absence_evidence=lambda *_:evidence))
         self.settle()
         self.assertEqual(self.state(),'expired_unconfirmed')
@@ -155,7 +155,7 @@ class LaunchReaperTests(unittest.TestCase):
         calls=[]
         def inventory():
             calls.append(1)
-            return SimpleNamespace(fresh=lambda:True,absence_evidence=lambda w,t:{'source':'aplexer_all_registry_census','complete':True,'match_count':0,'tag':t})
+            return SimpleNamespace(fresh=lambda:True,absence_evidence=lambda w,t:{'source':'aplexer_all_registry_census','complete':True,'match_count':0,'tag':t,'started_at_ms':150,'observed_at_ms':160})
         self.bridge.launcher=SimpleNamespace(inventory=inventory)
         self.settle()
         self.assertEqual(len(calls),1)
@@ -186,6 +186,51 @@ class LaunchReaperTests(unittest.TestCase):
         self.assertEqual(self.state_of('operation'),'stopped_before_dispatch')  # admission rows settle without census
         self.assertTrue(self.bridge._inflight_lock.acquire(timeout=.1))  # STOP/cleanup can take it
         self.bridge._inflight_lock.release()
+
+    def sequenced(self, starts):
+        calls = []
+        def inventory():
+            started = starts[min(len(calls), len(starts)-1)]
+            calls.append(started)
+            return SimpleNamespace(fresh=lambda:True, absence_evidence=lambda w,t:{
+                'source':'aplexer_all_registry_census','complete':True,'match_count':0,'tag':t,
+                'started_at_ms':started,'observed_at_ms':started+10})
+        self.bridge.launcher = SimpleNamespace(inventory=inventory)
+        return calls
+
+    def wait_census(self):
+        thread = observation_thread(self.bridge)
+        if thread is not None:
+            thread.join(5)
+            self.assertFalse(thread.is_alive())
+
+    def test_fresh_census_started_before_deadline_is_never_applied_then_replaced(self):
+        self.row('aborting',deadline=100,native='native',dispatch=1)
+        calls = self.sequenced([50, 150])  # first (still fresh) census began before the deadline
+        reap_expired_launches(self.bridge,2000); self.wait_census()
+        self.assertEqual(self.state(),'aborting')  # cached pre-deadline census rejected by the worker
+        self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0],0)
+        reap_expired_launches(self.bridge,2000)  # cached pre-deadline census triggers a replacement
+        self.wait_census()
+        self.assertEqual(calls,[50,150])
+        self.assertEqual(self.state(),'expired_unconfirmed')
+        self.assertGreaterEqual(self.receipt()['evidence']['started_at_ms'],100)
+
+    def test_deadline_crossed_during_collection_keeps_row_until_qualifying_census(self):
+        self.row('aborting',deadline=100,native='native',dispatch=1)
+        calls = self.sequenced([99, 100])  # collection began 1ms before the deadline, then exactly at it
+        reap_expired_launches(self.bridge,2000); self.wait_census()
+        self.assertEqual(self.state(),'aborting')
+        reap_expired_launches(self.bridge,2000); self.wait_census()
+        self.assertEqual(calls,[99,100])
+        self.assertEqual(self.state(),'expired_unconfirmed')
+        self.assertEqual(self.receipt()['evidence']['started_at_ms'],100)
+
+    def test_malformed_census_start_is_never_applied(self):
+        self.row('aborting',deadline=100,native='native',dispatch=1)
+        self.bridge.launcher=SimpleNamespace(inventory=lambda:SimpleNamespace(fresh=lambda:True,absence_evidence=lambda *_:{'complete':True}))
+        reap_expired_launches(self.bridge,2000); self.wait_census()
+        self.assertEqual(self.state(),'aborting')
 
     def state_of(self, operation):
         return self.journal.db.execute('SELECT state FROM launches WHERE operation_id=?',(operation,)).fetchone()[0]

@@ -127,6 +127,8 @@ test('expired absent native launch is reported without declaring an exit or chan
   native_outcome:'unconfirmed',runtime_deadline:deadline,evidence:{source:'aplexer_all_registry_census',dispatch_provenance:'host_journal',
   complete:true,match_count:0,workspace:'/tmp',tag:'task-hub2-'+session,started_at_ms:now-100,observed_at_ms:now,row_count:0,sha256:'a'.repeat(64)}};
  assert.equal((await f.call('/api/sessions/'+session+'/finish','POST',{...receipt,runtime_deadline:deadline+1})).status,409);
+ // A census that began before the runtime deadline can never qualify, however fresh.
+ assert.equal((await f.call('/api/sessions/'+session+'/finish','POST',{...receipt,evidence:{...receipt.evidence,started_at_ms:deadline-1,observed_at_ms:deadline+10}})).status,409);
  const response=await f.call('/api/sessions/'+session+'/finish','POST',receipt);
  assert.equal(response.status,200,JSON.stringify(await response.clone().json()));
  assert.deepEqual(await response.json(),{ok:true,native_outcome:'unconfirmed',terminal_report:true});
