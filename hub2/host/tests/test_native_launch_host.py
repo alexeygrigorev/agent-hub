@@ -473,7 +473,7 @@ class CapabilityTest(unittest.TestCase):
         with mock.patch.object(nl.provider_home, 'claude_install_available', return_value=True), \
              mock.patch.object(nl.shutil, 'which', return_value=None):
             self.assertEqual(nl.NativeLauncher(config).capabilities()['claude'],
-                             {'headless', 'interactive', 'effort'})
+                             {'headless', 'interactive', 'goal', 'effort'})
 
 
 class ProviderHomeTest(unittest.TestCase):
