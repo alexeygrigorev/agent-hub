@@ -121,6 +121,10 @@ if args[:2] == ["sessions", "capture"]:
         output = raw.replace("__MARKER__", marker)
     elif (d / "capture_output.txt").exists():
         output = (d / "capture_output.txt").read_text().replace("__MARKER__", marker)
+    elif sc == "capture_64k_window":
+        output = json.dumps({"type":"item.completed","item":{"type":"command_execution","status":"completed","exit_code":0,"aggregated_output":marker+"\n","command":"printf"}})
+        output += "\n" + json.dumps({"type":"item.completed","item":{"type":"agent_message","text":"x"*8000}})
+        output = output.encode()[-int(args[args.index("--max-bytes") + 1]):].decode()
     elif sc == "capture_prompt_only": output = "$ " + prompt
     elif sc == "wrapped_prompt_only": output = "Reply CANARY-OK\nand exit"
     elif sc == "capture_empty": output = ""
@@ -312,7 +316,8 @@ class CanaryTest(unittest.TestCase):
         c = self.calls()
         self.assertNotIn("--engine", c)
         self.assertNotIn("--model", c)
-        self.assertIn("--prompt Use two sequential shell tool calls.", c)
+        self.assertIn("--prompt If this runtime is Claude Code,", c)
+        self.assertIn("For every other runtime, follow this unchanged sequence: Use two sequential shell tool calls.", c)
         self.assertIn("--repo owner/repo", c)
         self.assertIn("--machine HOST-1", c)
         self.assertIn("--no-wait", c)
@@ -356,6 +361,15 @@ class CanaryTest(unittest.TestCase):
     def test_stage_list_host_workspace(self):
         self.assert_stage("no_workspace", "list_host_workspace", "missing_workspace")
         self.assert_stage("no_host", "list_host_workspace", "missing_host")
+
+    def test_capture_requests_64k_and_preserves_proof_older_than_4k_tail(self):
+        r, verdict = self.run_canary("capture_64k_window")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(verdict['ok'], verdict)
+        calls = [json.loads(line) for line in (self.tmp / 'argv.jsonl').read_text().splitlines()]
+        captures = [args for args in calls if args[:2] == ['sessions', 'capture']]
+        self.assertTrue(captures)
+        self.assertTrue(all(args[args.index('--max-bytes') + 1] == '65536' for args in captures))
 
     def test_stage_capture(self):
         self.assert_stage("capture_prompt_only", "capture", "no_output_beyond_prompt")
@@ -543,6 +557,9 @@ class CanaryTest(unittest.TestCase):
         r, value = self.run_canary('json_command_output', '--mode', 'full')
         self.assertEqual((r.returncode, value['ok'], value['stage']), (0, True, None))
         prompt = (self.tmp / 'prompt').read_text()
+        claude_prompt, prompt = prompt.split('For every other runtime, follow this unchanged sequence: ', 1)
+        self.assertIn('`run_in_background: true`', claude_prompt)
+        self.assertIn('wait on that exact background task id', claude_prompt)
         self.assertIn('two sequential shell tool calls', prompt)
         self.assertIn('First run a separate foreground shell command that prints the concatenation of "CANARY-", "OK:", and', prompt)
         self.assertLess(
@@ -2615,7 +2632,18 @@ class CanaryTest(unittest.TestCase):
             (c_gate_full, '"a47ed73aa1eb:tok987"'),
         ):
             self.assertNotIn(inst.marker, inst.prompt)
-            self.assertTrue(inst.prompt.startswith("Use two sequential shell tool calls. First run a separate foreground shell command"))
+            claude_prompt, other_prompt = inst.prompt.split("For every other runtime, follow this unchanged sequence: ", 1)
+            self.assertTrue(claude_prompt.startswith("If this runtime is Claude Code, first use its existing native Bash tool"))
+            self.assertLess(claude_prompt.index("`run_in_background: true`"), claude_prompt.index("Then run a separate foreground shell command"))
+            self.assertLess(claude_prompt.index("Then run a separate foreground shell command"), claude_prompt.index("provider-native blocking Monitor or TaskOutput"))
+            self.assertIn("wait on that exact background task id", claude_prompt)
+            self.assertIn("background completion is not proof", claude_prompt)
+            self.assertIn("substitute another sleep mechanism", claude_prompt)
+            self.assertIn("do not create or edit other files", claude_prompt)
+            self.assertNotIn("foreground `sleep", claude_prompt)
+            expected_hash = "162c127213a58a56922031e4f7bcb6ed635cf931d6ba5bf2ee6d41b64f14c4bf" if inst is c_full else "ea03a441552fab36088e0dba4ca0d238811c6210e1f0825985d02fa356cc7d44"
+            self.assertEqual(__import__("hashlib").sha256(other_prompt.encode()).hexdigest(), expected_hash)
+            self.assertTrue(other_prompt.startswith("Use two sequential shell tool calls. First run a separate foreground shell command"))
             self.assertIn(f'concatenation of "CANARY-", "OK:", and {expected_piece} as one output line and let it finish.', inst.prompt)
             self.assertIn(
                 "Immediately after the marker print finishes, run a separate foreground `sleep 60` command using the existing shell tool with a supported timeout sufficient for the 60-second hold",
@@ -2627,9 +2655,9 @@ class CanaryTest(unittest.TestCase):
             self.assertIn("do not echo proof or emit waiting prose", inst.prompt)
             self.assertIn("do not search for or call any monitor, task-output, or status tools or poll in a loop", inst.prompt)
             self.assertIn("mandatory Hub first-action/completion evidence files", inst.prompt)
-            self.assertNotIn("background tool facility", inst.prompt)
-            self.assertNotIn("TaskOutput", inst.prompt)
-            self.assertNotIn("Monitor", inst.prompt)
+            self.assertNotIn("background tool facility", other_prompt)
+            self.assertNotIn("TaskOutput", other_prompt)
+            self.assertNotIn("Monitor", other_prompt)
             self.assertEqual(inst.poll, 2.0)
 
         # Two-call active foreground sleep 60 hold: after 1145B fg marker tool_use + 610B fg marker tool_result,

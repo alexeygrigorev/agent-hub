@@ -8,6 +8,17 @@ import stat
 import time
 
 
+# Capture travels in durable HTTP receipts, never in a websocket frame.
+CAPTURE_OUTPUT_BYTES = 64 * 1024
+# A control byte can take six JSON bytes; leave room for the <=1KiB binding.
+CAPTURE_RESULT_JSON_BYTES = 400 * 1024
+CAPTURE_ACK_BODY_BYTES = 401 * 1024
+
+
+def capture_tail(output, limit=CAPTURE_OUTPUT_BYTES):
+    return output.encode('utf8', errors='replace')[-limit:].decode('utf8', errors='ignore')
+
+
 def output_parts(task_id, operation_id, epoch):
     if not isinstance(task_id, str) or not re.fullmatch(r"[A-Za-z0-9-]{1,100}", task_id):
         raise RuntimeError('task_output_identity_invalid')
@@ -64,7 +75,10 @@ def read_beneath(workspace, parts, limit, tail=False, private=False):
         if not tail and info.st_size > limit:
             raise RuntimeError('task_output_record_too_large')
         if tail:
-            os.lseek(fd, max(0, info.st_size - limit), os.SEEK_SET)
+            # Include enough preceding bytes to decode a split UTF-8 character
+            # before taking the byte tail. Invalid interior bytes still replace.
+            os.lseek(fd, max(0, info.st_size - limit - 3), os.SEEK_SET)
+            return capture_tail(os.read(fd, limit + 3).decode('utf8', errors='replace'), limit)
         return os.read(fd, limit).decode('utf8', errors='replace')
     finally:
         os.close(fd)
@@ -92,7 +106,7 @@ def same_path(value, expected):
         return False
 
 
-def capture_task_output(task_id, expected, native_id, limit=16384, *, retained_only=False):
+def capture_task_output(task_id, expected, native_id, limit=CAPTURE_OUTPUT_BYTES, *, retained_only=False):
     """None selects legacy/interactive PTY capture; empty means task not ready yet."""
     if os.open not in os.supports_dir_fd or not hasattr(os, 'O_NOFOLLOW'):
         if retained_only:
@@ -149,7 +163,7 @@ def capture_task_output(task_id, expected, native_id, limit=16384, *, retained_o
             or start.get('prompt_sha256') != binding.get('prompt_sha256')):
         raise RuntimeError('task_output_start_conflict')
     try:
-        return read_beneath(workspace, (*parts, 'stdout.log'), min(16384, max(1, limit)), tail=True, private=retained_only)
+        return read_beneath(workspace, (*parts, 'stdout.log'), min(CAPTURE_OUTPUT_BYTES, max(1, limit)), tail=True, private=retained_only)
     except FileNotFoundError:
         if retained_only:
             raise RuntimeError('task_output_unavailable') from None
@@ -157,10 +171,10 @@ def capture_task_output(task_id, expected, native_id, limit=16384, *, retained_o
 
 
 def bounded_capture(output, result_fields=None):
-    # Command acknowledgements have an 8192-byte JSON ceiling, including escapes.
+    # Keep raw UTF-8 and serialized JSON budgets independent, including escapes.
     if result_fields and len(json.dumps(result_fields,ensure_ascii=True).encode())>1024:
         raise RuntimeError('capture_fence_conflict')
-    output = output.encode('utf8', errors='replace')[-4096:].decode('utf8', errors='replace')
-    while len(json.dumps({**(result_fields or {}), 'output': output}, ensure_ascii=True).encode()) > 8000:
+    output = capture_tail(output)
+    while len(json.dumps({**(result_fields or {}), 'output': output}, ensure_ascii=True).encode()) > CAPTURE_RESULT_JSON_BYTES:
         output = output[max(1, len(output) // 4):]
     return output
