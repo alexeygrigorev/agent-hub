@@ -4,14 +4,14 @@
 Drives the public CLIs only (`hub sessions start|list|capture|stop`,
 `a list --json --running`). See docs/HUB-START-CANARY.md.
 """
-import argparse, datetime, errno, fcntl, hashlib, json, os, pathlib, re, shlex, signal, stat, subprocess, sys, time, uuid
+import argparse, datetime, errno, fcntl, hashlib, http.client, ipaddress, json, os, pathlib, re, shlex, signal, ssl, stat, subprocess, sys, threading, time, urllib.parse, uuid
 
 ALERT_TO = "dev@dtcdev.click"  # fixed on purpose: never configurable, never orin@
 ALERT_FROM = "alerts@dtcdev.click"
 MSMTP_ACCOUNT = "alerts"
 MARKER = "CANARY-OK"
 PROMPTS = {"full": "Reply CANARY-OK and exit", "shell": "printf CANARY-OK; sleep 30"}
-STAGES = ("helper_version", "lock", "host_release", "start", "running", "list_host_workspace", "capture", "stop", "gone", "cleanup")
+STAGES = ("helper_version", "lock", "host_release", "health", "start", "running", "list_host_workspace", "capture", "stop", "gone", "cleanup")
 FAIL_THRESHOLD = 2
 RECOVER_THRESHOLD = 2
 HELPER_FILES = ("hub-deploy-gate-forced.sh", "hub-start-canary.sh", "hub_start_canary.py")
@@ -26,6 +26,12 @@ TRUSTED_ACTIVE_BUDGET_S = 240.0
 TRUSTED_CLEANUP_BUDGET_S = 60.0
 TRUSTED_LOCK_WAIT_S = 5.0
 PERIODIC_DEFAULT_LOCK_WAIT_S = 120.0
+# Public, unauthenticated Hub health body checked before each periodic start.
+# HUB_CANARY_HEALTH_URL exists for offline tests: https anywhere, plain http
+# only on a loopback literal; path must be /health; no userinfo/query/fragment.
+DEFAULT_HEALTH_URL = "https://hub.dtcdev.click/health"
+HEALTH_TIMEOUT_S = 10.0
+HEALTH_MAX_BYTES = 4096
 HOST_UPDATER_TRIGGER_ARGV = (
     "systemctl",
     "--user",
@@ -659,6 +665,103 @@ class Canary:
             raise StageFailure("helper_version", "helper_bundle_unreadable")
         if self.expected_helper_sha256 is not None and self.helper_sha256 != self.expected_helper_sha256:
             raise StageFailure("helper_version", "helper_sha256_mismatch")
+
+    @staticmethod
+    def parse_health_url(raw):
+        try:
+            parts = urllib.parse.urlsplit(raw)
+            host, port = parts.hostname, parts.port
+        except ValueError:
+            return None
+        if not host or parts.username is not None or parts.password is not None:
+            return None
+        if parts.path != "/health" or parts.query or parts.fragment or "@" in parts.netloc:
+            return None
+        if parts.scheme == "http":
+            try:
+                if not ipaddress.ip_address(host).is_loopback:
+                    return None
+            except ValueError:
+                return None
+        elif parts.scheme != "https":
+            return None
+        return parts.scheme, host, port
+
+    def check_health(self):
+        """Fail before start unless the public /health body is HTTP 200 JSON with literal ok:true.
+
+        Bounded by HEALTH_TIMEOUT_S and the remaining active budget (connect,
+        headers and body together) and HEALTH_MAX_BYTES. Sends no credentials,
+        follows no redirects and never reports the URL, headers or body.
+        """
+        self.current_stage = "health"
+        target = self.parse_health_url(os.environ.get("HUB_CANARY_HEALTH_URL") or DEFAULT_HEALTH_URL)
+        if target is None:
+            raise StageFailure("health", "health_url_invalid")
+        scheme, host, port = target
+        deadline = self.stage_deadline(HEALTH_TIMEOUT_S)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise StageFailure("health", "health_timeout")
+        if scheme == "https":
+            conn = http.client.HTTPSConnection(host, port, timeout=remaining, context=ssl.create_default_context())
+        else:
+            conn = http.client.HTTPConnection(host, port, timeout=remaining)
+        outcome = {}
+
+        def fetch():
+            try:
+                conn.request("GET", "/health", headers={"Accept": "application/json", "User-Agent": "hub-start-canary"})
+                resp = conn.getresponse()
+                if resp.status != 200:
+                    outcome["reason"] = "health_http_status"
+                    return
+                body = b""
+                while len(body) <= HEALTH_MAX_BYTES:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        outcome["reason"] = "health_timeout"
+                        return
+                    if conn.sock is not None:
+                        conn.sock.settimeout(left)
+                    chunk = resp.read(HEALTH_MAX_BYTES + 1 - len(body))
+                    if not chunk:
+                        break
+                    body += chunk
+                if len(body) > HEALTH_MAX_BYTES:
+                    outcome["reason"] = "health_body_too_large"
+                    return
+                outcome["body"] = body
+            except (TimeoutError, OSError) as error:
+                timed_out = isinstance(error, TimeoutError) or time.monotonic() >= deadline
+                outcome["reason"] = "health_timeout" if timed_out else "health_unreachable"
+            except Exception:
+                outcome["reason"] = "health_unreachable"
+
+        worker = threading.Thread(target=fetch, name="hub-canary-health", daemon=True)
+        try:
+            worker.start()
+            worker.join(max(0.0, deadline - time.monotonic()))
+        finally:
+            if worker.is_alive():
+                try:
+                    if conn.sock is not None:
+                        conn.sock.shutdown(2)
+                except OSError:
+                    pass
+            conn.close()
+        if worker.is_alive() or time.monotonic() >= deadline:
+            raise StageFailure("health", "health_timeout")
+        if "reason" in outcome:
+            raise StageFailure("health", outcome["reason"])
+        try:
+            data = json.loads(outcome["body"].decode("utf-8"), object_pairs_hook=unique_object)
+        except (KeyError, UnicodeDecodeError, ValueError, RecursionError):
+            raise StageFailure("health", "health_unparseable_json")
+        if not isinstance(data, dict):
+            raise StageFailure("health", "health_unparseable_json")
+        if data.get("ok") is not True:
+            raise StageFailure("health", "health_status_bootstrap" if data.get("status") == "bootstrap" else "health_not_ok")
 
     def acquire_deploy_gate_lock(self):
         if not self.durable_pending_enabled:
@@ -1739,6 +1842,8 @@ class Canary:
             self.acquire_deploy_gate_lock()
             self.verify_candidate_host_release()
             self.reconcile_prior_pending()
+            if not self.deploy_gate:
+                self.check_health()
             self.start()
             self.wait_running()
             self.check_capture()
