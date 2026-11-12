@@ -228,16 +228,16 @@ def alert_changes(before, after):
 def make_probe():
     marker = 'ACCEPTANCE-OK:' + uuid.uuid4().hex
     encoded = base64.b64encode(marker.encode()).decode()
-    prompt = ('Use two sequential shell tool calls. First use the provider-native background tool facility for a '
-              'separate bounded 60-second hold (`sleep 60`), then run a separate foreground shell command '
+    prompt = ('Use two sequential shell tool calls. First run a separate foreground shell command '
               '`python3 -c \'import base64; print(base64.b64decode("%s").decode())\'` as one output line and let it '
-              'finish. Immediately after the marker print finishes, enter a provider-native blocking monitor, '
-              'TaskOutput, or status wait on that existing background hold task, monitoring it internally so the '
-              'orchestrator can stop this session before any final prose or completion bookkeeping; do not merely '
-              'emit a waiting answer and finish the turn. '
-              'Do not chain the print with a foreground sleep, poll in a loop, or wait externally; external waits '
-              'require a Hub wake. Apart from mandatory Hub first-action/completion evidence files if required by the '
-              'session wrapper, do not create or edit other files, start another agent, or exit early.' % encoded)
+              'finish. Immediately after the marker print finishes, run a separate foreground `sleep 60` command '
+              'using the existing shell tool with a supported timeout sufficient for the 60-second hold so the '
+              'orchestrator can observe and stop this session before any final prose or completion bookkeeping. '
+              'Do not chain the marker print with the hold in one command, do not use a background flag, do not '
+              'include the marker or nonce in the hold command, do not echo proof or emit waiting prose, and do not '
+              'search for or call any monitor, task-output, or status tools or poll in a loop. Apart from mandatory '
+              'Hub first-action/completion evidence files if required by the session wrapper, do not create or edit '
+              'other files, start another agent, or exit early.' % encoded)
     return prompt, marker
 
 
