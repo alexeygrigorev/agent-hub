@@ -75,6 +75,10 @@ HEADLESS_OUTPUT_FLAGS = {
     'claude': ('--output-format', 'stream-json', '--verbose'),
     'antigravity': ('--output-format', 'stream-json'),
 }
+# Hub headless Claude has no approval surface. The user-only source deliberately
+# excludes project/local Claude settings that can reject the managed bypass;
+# interactive sessions retain their normal workspace settings.
+CLAUDE_MANAGED_HEADLESS_FLAGS = ('--setting-sources', 'user')
 
 
 def native_returncode(value):
@@ -784,6 +788,8 @@ class NativeLauncher:
         elif not local:
             if specification.get("effort") is not None:
                 child = headless_effort_argv(provider, child, specification["effort"])
+            if provider == 'claude' and not specification.get('managed_credential_label'):
+                child = _headless_insert_flags(provider, child, CLAUDE_MANAGED_HEADLESS_FLAGS)
             child = _headless_insert_flags(provider, child, HEADLESS_OUTPUT_FLAGS.get(provider, ()))
         runtime_deadline = specification.get("runtime_deadline")
         if runtime_deadline is not None and (type(runtime_deadline) is not int or
@@ -934,6 +940,8 @@ class NativeLauncher:
         selector = ['--profile', profile] if profile else ['--engine', route.get('engine', provider)]
         args = ['--model', model]
         args += HEADLESS_OUTPUT_FLAGS.get(provider, ())
+        if provider == 'claude' and not specification.get('interactive') and not specification.get('managed_credential_label'):
+            args += CLAUDE_MANAGED_HEADLESS_FLAGS
         if provider == 'go':
             args += ['--format', 'json']
         if specification.get('managed_credential_label'):
