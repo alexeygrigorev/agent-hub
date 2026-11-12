@@ -922,3 +922,77 @@ def test_repin_binding_is_current_enrollment_only_with_two_exact_routes(tmp_path
     with pytest.raises(ValueError):
         native_import_host.bind_managed_claude_repin('https://hub.test')
     assert len(sent) == 2
+
+
+def test_unrelated_profile_naming_candidate_blocks_cleanup_after_restore_and_retry(world):
+    """Same-owner Claude restore succeeds, yet another table still names the candidate."""
+    old = upgrade_world(world)
+    world.acks = [{'status': 'recorded'}, {'status': 'held'}]
+    candidate = world.releases / NEW
+    keep = '\n[profiles.keep]\nengine = "shell"\ncommand = ' + json.dumps([str(candidate / 'bin/python'), '-c', 'pass']) + '\n'
+    def concurrent(index):
+        if index == 1:
+            with world.profile.open('a') as stream:
+                stream.write(keep)
+    world.on_ack = concurrent
+    with pytest.raises(RuntimeError, match='pin restore pending'):
+        world.install()
+    # Restored: the Claude pin is back on the old release, the unrelated table is kept.
+    assert world.pinned() == world.command_for(old) and world.profile.read_text().endswith(keep)
+    assert candidate.is_dir() and (world.root / updater.REPIN_JOURNAL).exists()
+    assert (world.root / 'updater.py').read_bytes() == world.files['hub2-self-update.py']
+    # Already-restored retry: still referenced, still pending, nothing rewritten.
+    held = world.profile.read_bytes()
+    with pytest.raises(RuntimeError, match='pin restore pending'):
+        recover_world(world)
+    assert world.profile.read_bytes() == held
+    assert candidate.is_dir() and (world.root / updater.REPIN_JOURNAL).exists()
+    # The unrelated owner moves off the candidate; cleanup may proceed.
+    moved = world.profile.read_text().replace(str(candidate), str(old))
+    world.profile.write_text(moved)
+    recover_world(world)
+    assert world.profile.read_text() == moved
+    assert not candidate.exists() and not (world.root / updater.REPIN_JOURNAL).exists()
+    assert (world.root / 'updater.py').read_bytes() == world.old_updater
+
+
+def test_removed_profile_directory_absence_is_persisted_through_existing_ancestor(world):
+    old = upgrade_world(world)
+    world.acks = [{'status': 'recorded'}, {'status': 'held'}]
+    ancestor = world.profile.parent.parent
+    world.on_ack = lambda index: index == 1 and shutil.rmtree(world.profile.parent)
+    # The ancestor barrier fails for every restore the failed install attempts.
+    barriers = Barriers(world, fail=lambda e: e['path'] == ancestor and e['journal'], once=False)
+    with patch.object(updater, 'sync_directory', barriers), pytest.raises(RuntimeError, match='pin restore pending'):
+        world.install()
+    assert (world.root / updater.REPIN_JOURNAL).exists() and (world.releases / NEW).is_dir()
+    retry = Barriers(world)
+    with patch.object(updater, 'sync_directory', retry):
+        recover_world(world)
+    assert not (world.root / updater.REPIN_JOURNAL).exists() and not (world.releases / NEW).exists()
+    assert (world.root / 'current').resolve() == old and not world.profile.parent.exists()
+    synced = [e for e in retry.events if e['path'] == ancestor]
+    assert synced and all(e['journal'] for e in synced)
+
+
+def test_fresh_release_payload_is_durable_before_pin_publication(world):
+    upgrade_world(world)
+    candidate = world.releases / NEW
+    barriers = Barriers(world)
+    with patch.object(updater, 'sync_directory', barriers):
+        world.install()
+    published = next(i for i, e in enumerate(barriers.events) if e['pin'] == world.command_for(candidate))
+    synced = {e['path'] for e in barriers.events[:published]}
+    assert {candidate, candidate / 'bin'} <= synced
+
+
+def test_fresh_payload_barrier_failure_refuses_before_pin(world):
+    old = upgrade_world(world)
+    original = world.profile.read_text()
+    candidate = world.releases / NEW
+    barriers = Barriers(world, fail=lambda e: e['path'] == candidate / 'bin')
+    with patch.object(updater, 'sync_directory', barriers), pytest.raises(OSError, match='durability barrier'):
+        world.install()
+    assert world.helper_runs == [] and world.hub_calls == []
+    assert all(e['pin'] != world.command_for(candidate) for e in barriers.events)
+    assert_rolled_back(world, old, original)
