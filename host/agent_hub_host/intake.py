@@ -84,6 +84,9 @@ def valid_key(value):
 
 def diagnostic(exc):
     """Never interpolate exception bodies: they may contain credentials or payloads."""
+    from .worker_auth import WorkerContextError
+    if isinstance(exc, WorkerContextError):
+        return str(exc)
     import http.client
     import urllib.error
     from .config import ConfigPermissionError
@@ -299,6 +302,7 @@ def request(method, path, payload=None):
     import urllib.request
     from . import _test_isolation, api, auth, config
 
+    from .worker_auth import validate_v2_request
     cfg = config.load_config()
     base = os.environ.get('HUB_URL') or os.environ.get('HUB_BASE_URL') or cfg.get('base_url')
     api.check_url(base)
@@ -319,6 +323,7 @@ def request(method, path, payload=None):
     max_attempts = 2 if method == 'GET' or retry_key else 1
 
     def send(access):
+        validate_v2_request(cfg)
         try:
             if (
                 method == 'GET'
@@ -362,7 +367,7 @@ def request(method, path, payload=None):
     try:
         return send_with_retry(token)
     except urllib.error.HTTPError as exc:
-        if exc.code == 401 and not env_token:
+        if exc.code == 401 and not cfg.get('_hub2_worker') and not env_token:
             auth.refresh_token(expected_token=token) if cfg.get('worker_launch_id') else auth.refresh_token()
             try:
                 return send_with_retry(auth.get_access_token())
