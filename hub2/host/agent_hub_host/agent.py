@@ -14,6 +14,7 @@ from pathlib import Path
 
 from .client import ApiError, private_file, save_config
 from . import native_launch, launch_reaper
+from .implement_workspace import prepare_workspace
 from .advertisement import Advertisement
 from .native_launch import NativeLauncher, LOCAL_ROUTES, UUID_RE, canonical, native_returncode, same_workspace, spawn_environment
 from .local_auth_readiness import local_claude_missing_contexts
@@ -322,10 +323,20 @@ class Bridge:
             if db.execute('SELECT 1 FROM stop_fences WHERE session_id=? AND epoch>=?', (session, epoch)).fetchone():
                 return None
         launch = self.validate_launch(offer)
+        prior = self.journal.db.execute('SELECT workspace,state FROM launches WHERE operation_id=?', (offer['operation_id'],)).fetchone()
+        if prior and prior['state'] != 'pending_admission':
+            # Reconciliation after an upgrade must never relocate a live worker.
+            workspace = Path(prior['workspace'])
+            source = Path(launch['workspace'])
+            if workspace != source and not workspace.is_relative_to(source / '.local' / 'hub-worktrees'):
+                raise ValueError('offer_fence_conflict')
+        else:
+            workspace = prepare_workspace(launch['workspace'], offer['launch'].get('purpose'), offer.get('intake_id'), offer.get('project_id'))
+        launch['workspace'] = str(workspace)
         requested_workspace = offer['launch']['workspace']
         workspace_binding = ({'version': 1, 'requested_workspace': requested_workspace,
                               'resolved_workspace': launch['workspace']}
-                             if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', requested_workspace)
+                             if launch['workspace'] != requested_workspace or re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', requested_workspace)
                              else None)
         def acknowledge_workspace():
             if acknowledge:

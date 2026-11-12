@@ -1,7 +1,9 @@
+import {readFileSync} from 'node:fs';
 import { createHash } from 'node:crypto';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { pickModelRoute, pickModelRouteDetailed, weightedChoice, buildRoutingPool } from '../src/model-picker.ts';
+import type { RoutingSnapshot } from '../src/routing-pool.ts';
 
 const candidates=[
  {id:'codex',engine:'codex',model:'gpt-6.1-sol',effort:'medium',account_id:'codex',weight:1,capabilities:[],enabled:true},
@@ -618,4 +620,42 @@ test('managed picker mode validates exact selector, Opus/medium/headless and can
   assert.throws(()=>buildRoutingPool(snapshot,{...input,...changed} as any),/invalid_managed_credential_route/);
  snapshot.policy.candidates[0].account_id='foreign-claude';
  assert.throws(()=>buildRoutingPool(snapshot,input),/model_policy_unavailable/);
+});
+
+const hydrogenPolicy = JSON.parse(readFileSync(new URL('../../config/model-policy.json', import.meta.url), 'utf8'));
+function hydrogenFixture(): RoutingSnapshot {
+ const now=Date.now();
+ const candidates=[...hydrogenPolicy.candidates,{id:'zai-glm-flash',engine:'zai',model:'glm-5.3-flash',account_id:'zai-central',weight:1_000_000,capabilities:[],enabled:true}];
+ return {policy:{version:6,candidates},observed_at:now,
+  accounts:new Map(candidates.map((row:any)=>[row.account_id,{account:{enabled:true},credential_usable:true,fresh:true,hosts:['h1'],quota:{remaining:80,captured_at:now,valid_until:now+900000}}])),
+  machines:new Map([['h1',{connected:true,engines:['codex','claude','antigravity','go','zai'],capabilities:['headless','interactive','effort:codex','effort:claude','effort:antigravity']} ]])};
+}
+test('ordinary default/fix/implement in both modes and quick/daily excludes Argon and stale Flash',()=>{
+ for(const purpose of [undefined,'fix','implement'] as const)for(const interactive of [false,true])for(const tier of [undefined,'quick','daily']){
+  const result=buildRoutingPool(hydrogenFixture(),{interactive,purpose,tier});
+  const models=result.options.map(row=>row.value.model);
+  assert(models.includes('gemini-4-hydrogen-medium'));
+  assert(models.includes('gpt-6.1-sol'));
+  assert(!models.some(model=>/argon|flash/.test(model)));
+  for(const draw of [0,.25,.5,.75,.999999])assert(!/argon|flash/.test(weightedChoice(result.options,()=>draw).model));
+ }
+});
+test('review/think/deep and explicit Sol/Fable/Argon preserve existing selection',()=>{
+ for(const input of [{purpose:'review' as const},{purpose:'think' as const},{tier:'deep'}]){
+  const models=buildRoutingPool(hydrogenFixture(),{interactive:false,...input}).options.map(row=>row.value.model);
+  assert(models.includes('gemini-4-argon-medium'));
+ }
+ for(const model of ['gemini-4-argon-medium','antigravity-argon-medium','gpt-6.1-sol','fable']){
+  const result=buildRoutingPool(hydrogenFixture(),{interactive:false,model});
+  assert(result.options.every(row=>row.value.model===model||row.value.policy_id===model));
+ }
+});
+test('an Antigravity-only ordinary automatic pool selects Hydrogen, never Argon fallback',()=>{
+ const snapshot=hydrogenFixture();
+ const result=buildRoutingPool(snapshot,{interactive:false,engine:'antigravity'});
+ assert(result.options.length>0);
+ assert(result.options.every(row=>row.value.model==='gemini-4-hydrogen-medium'));
+ snapshot.policy.candidates=snapshot.policy.candidates.filter(row=>row.model!=='gemini-4-hydrogen-medium');
+ assert.throws(()=>buildRoutingPool(snapshot,{interactive:false,engine:'antigravity'}),(e:any)=>e.code==='model_policy_unavailable');
+ assert.equal(buildRoutingPool(snapshot,{interactive:false,engine:'antigravity',model:'gemini-4-argon-medium'}).options[0].value.model,'gemini-4-argon-medium');
 });

@@ -511,7 +511,7 @@ class HostTests(unittest.TestCase):
         offer = {"operation_id": "operation-1", "session_id": "session-1", "epoch": 1,
                  'intake_id':'intake-1','project_id':'org/repo',
                  "expires_at": time.time() * 1000 + 60000,
-                 "launch": {"workspace": str(self.root), "engine": "codex", "model": "test-model",
+                 "launch": {"purpose": "review", "workspace": str(self.root), "engine": "codex", "model": "test-model",
                                  "prompt": "Print hello; $(do not interpret as shell)", "interactive": False}}
         offer.update(changes)
         return offer

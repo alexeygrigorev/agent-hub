@@ -1,9 +1,9 @@
 [Unit]
-Description=Run the Hub shell-mode start canary every 5 minutes
+Description=Run the Hub shell-mode start canary every 15 minutes
 
 [Timer]
 OnBootSec=3min
-OnUnitActiveSec=5min
+OnUnitActiveSec=15min
 AccuracySec=15s
 Persistent=true
 Unit=hub-start-canary.service

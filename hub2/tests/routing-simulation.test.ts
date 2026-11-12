@@ -43,15 +43,15 @@ test('skewed headroom keeps Go above three percent in the real simulation and dr
  const f=skewedFixture();let index=0;
  const result=await simulateModelRoutes(f.env,{interactive:false},1000,()=>((index++)+.5)/1000);
  assert.deepEqual(result.share_floor,{minimum_share:.03,applied:true,reason:null});
- assert.equal(result.pool.length,7);assert.equal(result.pool_degraded,false);
+ assert.equal(result.pool.length,6);assert.equal(result.pool_degraded,false);
  assert.ok(result.pool.every(row=>row.share>.03));
  assert.ok(Math.abs(result.pool.reduce((sum,row)=>sum+row.share,0)-1)<1e-12);
  const go=result.pool.find(row=>row.policy_id==='go-muse')!;
- assert.ok(Math.abs(go.share-(.03+.79*7/433.9))<1e-12);
- assert.deepEqual({...result.counts},{'codex-luna-max':132,'codex-sol-medium':132,'claude-sonnet-medium':168,
-  'go-muse':43,'claude-opus-medium':168,'antigravity-hydrogen-medium':179,'antigravity-argon-medium':178});
+ assert.ok(Math.abs(go.share-(.03+.82*7/352.45))<1e-12);
+ assert.deepEqual({...result.counts},{'codex-luna-max':160,'codex-sol-medium':161,'claude-sonnet-medium':206,
+  'go-muse':47,'claude-opus-medium':207,'antigravity-hydrogen-medium':219});
  // The actual start draw uses the same transformed weights, not just diagnostics.
- const start=await pickModelRouteDetailed(f.env,{interactive:false},()=>.47);
+ const start=await pickModelRouteDetailed(f.env,{interactive:false},()=>.55);
  assert.equal(start.route.policy_id,'go-muse');
  assert.deepEqual(start.diagnostics.pool,result.pool);
  const luna=result.pool.find(row=>row.policy_id==='codex-luna-max')!;
@@ -74,7 +74,7 @@ test('exploration retains the five-percent eligibility boundary and cannot resto
 test('exploration preserves stale-neutral headroom, quota influence and underlying deep multipliers',async()=>{
  const f=skewedFixture();f.accountRows.get('shared-go').fresh=false;
  const stale=await simulateModelRoutes(f.env,{interactive:false},1,()=>0);
- assert.ok(Math.abs(stale.pool.find(row=>row.policy_id==='go-muse')!.share-(.03+.79*50/476.9))<1e-12);
+ assert.ok(Math.abs(stale.pool.find(row=>row.policy_id==='go-muse')!.share-(.03+.82*50/395.45))<1e-12);
  assert.ok(stale.warnings.some(row=>row.account_id==='shared-go'&&row.reason==='quota_stale'));
  f.accountRows.get('shared-go').fresh=true;
  const ordinary=await simulateModelRoutes(f.env,{interactive:false},1,()=>0);
@@ -90,7 +90,7 @@ test('Luna mean clipping and candidate shares survive skew and additional hosts'
  for(const [id,row] of f.accountRows)row.quota.remaining=id==='codex'?100:5;
  const original=await simulateModelRoutes(f.env,{interactive:false},1,()=>0);
  const luna=original.pool.find(row=>row.policy_id==='codex-luna-max')!;
- assert.ok(Math.abs(luna.share-1/7)<1e-12,'clipped Luna equals the other six candidates mean');
+ assert.ok(Math.abs(luna.share-1/6)<1e-12,'clipped Luna equals the other five candidates mean');
  f.machines.set('h2',{machine_id:'h2',connected:true,engines:['codex'],capabilities:[flags()[0]]});
  const expanded=await simulateModelRoutes(f.env,{interactive:false},1,()=>0);
  assert.deepEqual(expanded.pool,original.pool);
@@ -109,13 +109,13 @@ test('exploration remains feasible at the existing maximum policy size and for a
  }
 });
 
-test('1000 simulated draws use one passive observation set and the committed Argon pool',async()=>{
+test('1000 simulated draws use one passive observation set and the committed ordinary Hydrogen pool',async()=>{
  const f=fixture();let index=0;
  const result=await simulateModelRoutes(f.env,{interactive:false},1000,()=>((index++)+.5)/1000);
  assert.equal(result.draws,1000);assert.equal(result.policy_version,17);
  assert.equal(Object.values(result.counts).reduce((a,b)=>a+b,0),1000);
  assert.equal(result.pool_degraded,false);
- assert.ok(result.pool.some(row=>row.policy_id==='antigravity-argon-medium'));
+ assert.ok(!result.pool.some(row=>row.policy_id==='antigravity-argon-medium'));
  assert.ok(result.pool.some(row=>row.policy_id==='antigravity-hydrogen-medium')&&!result.pool.some(row=>/flash/.test(row.model)));
  assert.ok(result.pool.every(row=>row.share>.03&&!/astra|fable/i.test(row.model)));
  const luna=result.pool.find(row=>/luna/.test(row.model))!;

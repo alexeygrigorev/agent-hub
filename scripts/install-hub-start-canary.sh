@@ -49,4 +49,4 @@ for u in "${UNITS[@]}"; do
 done
 systemctl daemon-reload
 systemctl enable --now hub-start-canary.timer hub-start-canary-full.timer
-echo "Hub start canary timers installed for user $RUN_USER (shell every 5 min, full every 30 min)."
+echo "Hub start canary timers installed for user $RUN_USER (shell every 15 min, full every 30 min)."
