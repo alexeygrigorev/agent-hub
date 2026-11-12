@@ -9,6 +9,7 @@ import time
 import unittest
 
 CTL = Path(__file__).resolve().parents[2] / 'ops/lib/session-ctl.sh'
+HOST_SRC = Path(__file__).resolve().parents[1]
 ADAPTER = r'''#!/usr/bin/env python3
 import json,os,pathlib,sys
 name=pathlib.Path(sys.argv[0]).name
@@ -18,6 +19,8 @@ f=p/'runtime.json'
 s=json.loads(f.read_text())
 with (p/'calls').open('a') as out: out.write(name+' '+ ' '.join(args)+'\n')
 def save(): f.write_text(json.dumps(s))
+def fail(msg, code=1):
+    sys.stderr.write(msg+'\n'); save(); sys.exit(code)
 if name=='a':
     cmd=args[0]
     if cmd=='list':
@@ -32,10 +35,7 @@ if name=='a':
         else: sys.exit(1)
     elif cmd=='forget':
         s['sessions']=[x for x in s['sessions'] if x['id']!=args[1]];save()
-    elif cmd=='start':
-        if s.get('start_error'): sys.exit(1)
-        s['sessions'].append(dict(id='new',tag='orchestrator-main',workspace=str(p/'git/agent-hub-wt-orchestrator-run/ops/orchestrator'),phase='running',worker_alive=True,worker_pid=os.getppid(),workload_pid=os.getppid()))
-        save()
+    elif cmd=='start': sys.exit(90)  # Coordinators never start natively (phase 6.1).
     elif cmd=='capture': print(s.get('capture_prompt', '❯'))
     elif cmd=='send':
         if s.get('capture_prompt'):
@@ -46,6 +46,49 @@ elif name=='systemd-run':
     # Proof timers (--on-active) are only recorded; scope launches run their command.
     sys.exit(subprocess.call(args[args.index('--')+1:]) if '--' in args else 0)
 elif name=='hub':
+    if args and args[0]=='sessions':
+        # The maintained CLI parser is the contract: unsupported flags such as
+        # --tag or --json exit 2 here exactly as they do in production.
+        import argparse
+        sys.path.insert(0, os.environ['HUB_PARSER_ROOT'])
+        from agent_hub_host import session_control
+        parser=argparse.ArgumentParser(prog='hub'); session_control.add_commands(parser.add_subparsers(dest='cmd'))
+        ns=parser.parse_args(args)
+        hub=s.setdefault('hub',{})
+        if ns.sessions_cmd=='start':
+            assert ns.interactive and ns.wait and ns.purpose=='implement' and ns.key and ns.intake_task_id, args
+            n=len(hub)+1; hid='hub-%04d' % n
+            mode=s.get('start_error')
+            if mode=='transport':
+                fail('Session transport failed: connection or TLS failure (reconcile with --key %s via show/commands)' % ns.key)
+            if mode=='http':
+                fail('Session HTTP request failed with status 409 (no_host_capacity) (reconcile with --key %s via show/commands)' % ns.key)
+            hub[hid]=dict(id=hid,state='refused' if mode else 'running',key=ns.key,name=ns.name)
+            if mode:
+                fail('session_start_failed; session %s reached refused (no_capacity); reconcile with --key %s via show/events' % (hid, ns.key))
+            native='new' if n==1 else 'new%d' % n
+            ws=s.get('resolved_workspace') or ns.workspace
+            hub[hid]['native_id']=native
+            s['sessions'].append(dict(id=native,tag='task-hub2-'+hid,workspace=ws,phase='running',worker_alive=True,
+                worker_pid=os.getppid(),workload_pid=os.getppid(),labels={'hub.session':hid,'hub.managed':'true'}))
+            bound=dict(id=hid,state='running',native_id=native,workspace=ws,requested_workspace=ns.workspace)
+            save()
+            print(json.dumps({**bound,'client_key':ns.key,'binding_wait':{'session':bound}}, indent=2))
+        elif ns.sessions_cmd=='stop':
+            row=hub.get(ns.id)
+            if s.get('stop_error') or not row or row['state']!='running':
+                fail('stop_not_running; command c1; stop was not confirmed')
+            row['state']='stopped'
+            s['sessions']=[x for x in s['sessions'] if x['id']!=row.get('native_id')]
+            save()
+            print(json.dumps({'state':'acked'}))
+        elif ns.sessions_cmd=='show':
+            row=hub.get(ns.id)
+            if not row: fail('Session HTTP request failed with status 404 (not_found)')
+            print(json.dumps({'session':row}))
+        else:
+            sys.exit(2)
+        sys.exit(0)
     if args and args[0]=='quota':
         default={'pools': [
             {'provider': 'gemini', 'harness': ['antigravity'], 'state': 'fresh', 'remaining_percent': 80, 'limit_reached': False},
@@ -91,11 +134,17 @@ class OpsWatchdogTest(unittest.TestCase):
                 {'provider': 'go', 'harness': ['opencode'], 'state': 'fresh', 'remaining_percent': 80},
             ]},
         }
-        self.env = {**os.environ, 'HOME': str(self.home), 'PATH': str(self.bin)+':'+os.environ['PATH'], 'LOOP_INTERVAL': 'off', 'MIN_RESTART_GAP': '0', 'OPS_LOCK_DIR': str(self.home)}
+        self.env = {**os.environ, 'HOME': str(self.home), 'PATH': str(self.bin)+':'+os.environ['PATH'], 'LOOP_INTERVAL': 'off', 'MIN_RESTART_GAP': '0', 'OPS_LOCK_DIR': str(self.home),
+                    'HUB_PARSER_ROOT': str(HOST_SRC)}
         self.env.update({'ORCH_ENGINE': 'gemini', 'ORCH_FALLBACK_ENGINE': 'opencode'})
 
+    def tearDown(self):
+        self.assertNotIn('a start', self.calls())  # phase 6.1: no direct native start, ever
+
     def session(self, alive=False, pid=2147483647):
-        return dict(id='old', tag='orchestrator-main', workspace=str(self.workspace), phase='running', worker_alive=alive, worker_pid=pid, workload_pid=pid)
+        # A pre-migration coordinator this script once started directly.
+        return dict(id='old', tag='orchestrator-main', workspace=str(self.workspace), phase='running', worker_alive=alive, worker_pid=pid, workload_pid=pid,
+                    labels={'ops.role': 'orchestrator', 'hub.intake': '67847fde-a00a-4689-8460-fbad45599f99'})
 
     def run_ctl(self, command='check'):
         self.runtime.write_text(json.dumps(self.data))
@@ -148,7 +197,7 @@ class OpsWatchdogTest(unittest.TestCase):
         ]}
         result = self.run_ctl('start')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn('--engine opencode', self.starts()[-1])
+        self.assertIn('--engine go', self.starts()[-1])
         self.assertNotIn('--engine claude', self.starts()[-1])
         self.assertNotIn('--engine sonnet', self.starts()[-1])
 
@@ -175,7 +224,7 @@ class OpsWatchdogTest(unittest.TestCase):
         result = self.run_ctl()
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn('a forget', self.calls())
-        self.assertNotIn('a start', self.calls())
+        self.assertEqual(self.starts(), [])
 
     def test_unknown_pid_blocks_forget(self):
         session = self.session()
@@ -209,12 +258,12 @@ class OpsWatchdogTest(unittest.TestCase):
     def test_census_error_never_starts_duplicate(self):
         self.data['census_error'] = True
         self.assertNotEqual(self.run_ctl().returncode, 0)
-        self.assertNotIn('a start', self.calls())
+        self.assertEqual(self.starts(), [])
 
     def test_stop_failure_propagates_manual_restart(self):
         self.data['sessions'] = [self.session(True, os.getpid())]
         self.assertNotEqual(self.run_ctl('restart').returncode, 0)
-        self.assertNotIn('a start', self.calls())
+        self.assertEqual(self.starts(), [])
 
     def test_live_session_after_old_dead_record_selected(self):
         self.data['sessions'] = [self.session(), {**self.session(True), 'id': 'live'}]
@@ -286,7 +335,7 @@ class OpsWatchdogTest(unittest.TestCase):
         result = self.run_ctl()
         self.assertIn('recovery proof FAILED (path 1)', result.stdout)
         self.assertIn('recovery path 2 started', result.stdout)
-        self.assertIn('--engine opencode', self.starts()[-1])
+        self.assertIn('--engine go', self.starts()[-1])
         self.assertEqual((self.state / 'restart_failures').read_text().strip(), '1')
 
     def test_on_time_tick_in_history_proves_even_after_a_later_tick(self):
@@ -324,13 +373,15 @@ class OpsWatchdogTest(unittest.TestCase):
         self.assertRegex(self.run_ctl().stdout, r'STALLED session=live: no tick for 180[0-2]s')
 
     def test_detached_children_never_inherit_the_role_lock(self):
-        # Real systemd --scope and aplexer's setsid worker spawn keep inherited fds
-        # (Codex round-3 repro). Make the adapters do the same, then require that
-        # the next check still gets the lock and no detached child holds fd 9.
+        # A detached child of the Hub CLI (or of systemd-run) can keep inherited
+        # fds (Codex round-3 repro). Make the adapters do the same, then require
+        # that the next check still gets the lock and no detached child holds fd 9.
         run = self.bin / 'systemd-run'
         run.write_text(run.read_text().replace("subprocess.call(args[args.index('--')+1:])", "subprocess.call(args[args.index('--')+1:], close_fds=False)"))
-        a = self.bin / 'a'
-        a.write_text(a.read_text().replace("    elif cmd=='start':\n", "    elif cmd=='start':\n        import subprocess\n        child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(20)'],close_fds=False,start_new_session=True,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\n        (p/'detached_pid').write_text(str(child.pid))\n"))
+        hub = self.bin / 'hub'
+        marker = "        if ns.sessions_cmd=='start':\n"
+        self.assertIn(marker, hub.read_text())
+        hub.write_text(hub.read_text().replace(marker, marker + "            import subprocess\n            child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(20)'],close_fds=False,start_new_session=True,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\n            (p/'detached_pid').write_text(str(child.pid))\n"))
         self.env['ROLE_LOCK_WAIT'] = '1'
         self.data['sessions'] = [self.session()]
         first = self.run_ctl()
@@ -345,7 +396,7 @@ class OpsWatchdogTest(unittest.TestCase):
         self.assertNotIn('role lock busy', second.stdout)
 
     def starts(self):
-        return [line for line in self.calls().splitlines() if line.startswith('a start')]
+        return [line for line in self.calls().splitlines() if line.startswith('hub sessions start')]
 
     def test_29_oct_live_session_without_ticks_is_restarted_not_ok(self):
         self.data['sessions'] = [{**self.session(True, os.getpid()), 'id': 'live'}]
@@ -393,7 +444,7 @@ class OpsWatchdogTest(unittest.TestCase):
         result = self.run_ctl()
         self.assertIn('recovery proof FAILED (path 1)', result.stdout)
         self.assertIn('recovery path 2 started', result.stdout)
-        self.assertIn('--engine opencode', self.starts()[-1])
+        self.assertIn('--engine go', self.starts()[-1])
         needs = self.home / 'tmp/agent-reports/orchestrator/NEEDS_ALEXEY.md'
         self.assertFalse(needs.exists())  # one failed recovery is not an alert
         self.assertIn('--state proof_failed --recovery-failures 1', self.calls())
@@ -419,6 +470,127 @@ class OpsWatchdogTest(unittest.TestCase):
         self.assertIn('hub ops report failed', result.stdout)
         self.assertIn('recovery path 1 started', result.stdout)
 
+
+    # Phase 6.1: coordinators start only through the maintained Hub CLI and are
+    # discovered/controlled only through the binding Hub returns.
+    def binding(self):
+        return json.loads((self.state / 'hub_binding.json').read_text())
+
+    def test_fake_hub_enforces_the_maintained_cli_parser(self):
+        # The adapter parses argv with the real `hub sessions` parser, so the
+        # unsupported --tag/--json of the old draft would fail every start test.
+        self.runtime.write_text(json.dumps(self.data))
+        for bad in (['--tag', 'orchestrator-main'], ['--json']):
+            result = subprocess.run([str(self.bin / 'hub'), 'sessions', 'start', '--workspace', str(self.workspace),
+                                     '--interactive', '--key', 'k', '--intake-task-id', 'i', *bad],
+                                    env=self.env, text=True, capture_output=True, timeout=30)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn('unrecognized arguments', result.stderr)
+
+    def test_start_uses_supported_hub_cli_and_records_exact_binding(self):
+        result = self.run_ctl('start')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        start = self.starts()[-1]
+        for flag in ('--tag', '--json', '--no-wait'):
+            self.assertNotIn(flag, start.split())
+        self.assertIn('--workspace ' + str(self.workspace), start)
+        self.assertIn('--name orchestrator-main', start)
+        self.assertIn('--intake-task-id 67847fde-a00a-4689-8460-fbad45599f99', start)
+        self.assertIn('--interactive', start)
+        self.assertEqual(self.binding(), {'hub_id': 'hub-0001', 'native_id': 'new', 'native_tag': 'task-hub2-hub-0001',
+                                          'workspace': str(self.workspace)})
+        self.assertIn('Hub session hub-0001 running as native new (tag task-hub2-hub-0001)', result.stdout)
+        self.assertIn('a send new Run the orchestrator tick now', self.calls())
+        self.assertIn('Hub session hub-0001 (name orchestrator-main)', self.calls())
+        self.assertNotIn('systemd-run --user --scope', self.calls())
+        self.assertFalse((self.state / 'hub_start_key').exists())
+
+    def test_hub_started_session_is_found_only_by_its_binding(self):
+        self.data['resolved_workspace'] = str(self.workspace.parents[1])  # Hub's resolved workspace, not $RUNDIR/$SUB
+        self.assertEqual(self.run_ctl('start').returncode, 0)
+        # Decoys: a Hub session reusing the old tag, and another Hub task in the same workspace.
+        self.data['sessions'] += [
+            dict(id='decoy-tag', tag='orchestrator-main', workspace=str(self.workspace), phase='running', worker_alive=True,
+                 labels={'hub.session': 'hub-9999', 'hub.managed': 'true'}),
+            dict(id='decoy-hub', tag='task-hub2-hub-9999', workspace=str(self.workspace.parents[1]), phase='running',
+                 worker_alive=True, labels={'hub.session': 'hub-9999', 'hub.managed': 'true'}),
+        ]
+        self.tick(after_start=5)
+        result = self.run_ctl()
+        self.assertIn('OK session=new', result.stdout)
+        self.assertEqual(len(self.starts()), 1)
+        # Without the binding no guessed tag or workspace identifies the session.
+        (self.state / 'hub_binding.json').unlink()
+        self.assertIn('not running', self.run_ctl('status').stdout)
+
+    def test_hub_refusal_is_typed_and_never_bypassed_then_stopped_through_hub(self):
+        self.data['start_error'] = 'refused'
+        result = self.run_ctl('start')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Hub start failed (rc=1): session_start_failed; session hub-0001 reached refused (no_capacity)', result.stdout)
+        self.assertIn('recovery held', result.stdout)
+        self.assertNotIn('started session', result.stdout)
+        self.assertEqual(self.binding(), {'hub_id': 'hub-0001'})
+        self.data['start_error'] = None
+        result = self.run_ctl('start')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('hub sessions stop hub-0001', self.calls())
+        self.assertIn('Hub session hub-0001 already ended (refused)', result.stdout)
+        self.assertEqual(self.binding()['hub_id'], 'hub-0002')
+
+    def test_uncertain_start_reuses_key_and_typed_http_refusal_drops_it(self):
+        self.data['start_error'] = 'transport'
+        self.assertNotEqual(self.run_ctl('start').returncode, 0)
+        key = (self.state / 'hub_start_key').read_text().split()[0]
+        self.assertNotEqual(self.run_ctl('start').returncode, 0)
+        keys = re.findall(r'--key (\S+)', '\n'.join(self.starts()))
+        self.assertEqual(keys, [key, key])  # a lost response replays, never duplicates
+        self.data['start_error'] = 'http'
+        result = self.run_ctl('start')
+        self.assertIn('status 409 (no_host_capacity)', result.stdout)
+        self.assertFalse((self.state / 'hub_start_key').exists())
+        self.data['start_error'] = None
+        self.assertEqual(self.run_ctl('start').returncode, 0)
+        self.assertNotEqual(re.findall(r'--key (\S+)', self.starts()[-1])[0], key)
+
+    def test_restart_stops_bound_session_through_hub_not_native_kill(self):
+        self.assertEqual(self.run_ctl('start').returncode, 0)
+        result = self.run_ctl('restart')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('hub sessions stop hub-0001 --key ops-stop-hub-0001', self.calls())
+        self.assertNotIn('a kill new', self.calls())
+        self.assertEqual(self.binding()['native_id'], 'new2')
+
+    def test_hub_stop_failure_holds_recovery(self):
+        self.assertEqual(self.run_ctl('start').returncode, 0)
+        self.data['stop_error'] = True
+        result = self.run_ctl('restart')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Hub stop of hub-0001 failed: stop_not_running', result.stdout)
+        self.assertEqual(len(self.starts()), 1)
+        self.assertEqual(self.binding()['native_id'], 'new')
+
+    def test_pre_migration_coordinator_is_stopped_before_the_first_hub_start(self):
+        self.data['sessions'] = [self.session(True, os.getpid())]
+        self.data['kill_ok'] = True
+        result = self.run_ctl('restart')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = self.calls()
+        self.assertLess(calls.index('a kill old'), calls.index('hub sessions start'))
+        self.assertEqual(self.binding()['native_id'], 'new')
+
+    def test_legacy_tag_without_own_role_label_is_not_this_coordinator(self):
+        self.data['sessions'] = [{**self.session(True, os.getpid()), 'labels': {}}]
+        self.assertIn('not running', self.run_ctl('status').stdout)
+
+    def test_corrupt_binding_fails_census_instead_of_starting(self):
+        self.state.mkdir(parents=True, exist_ok=True)
+        (self.state / 'hub_binding.json').write_text('{not json')
+        result = self.run_ctl('start')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('corrupt Hub binding', result.stdout + result.stderr)
+        self.assertIn('session census failed', result.stdout)
+        self.assertEqual(self.starts(), [])
 
 if __name__ == '__main__':
     unittest.main()

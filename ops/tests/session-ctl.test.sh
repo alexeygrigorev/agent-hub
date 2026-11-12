@@ -19,6 +19,9 @@ export FAKE_KILLED="$fake/killed.log"
 export FAKE_START_ENGINE="$fake/start-engine"
 export FAKE_START_MODEL="$fake/start-model"
 export FAKE_SEND_LOG="$fake/send.log"
+export FAKE_HUB_STATE="$fake/hub-sessions.json"
+export FAKE_HUB_START_LOG="$fake/hub-start.log"
+export HUB_PARSER_ROOT="$repo/host"
 unset ENGINE ENGINE_SELECTED ORCH_ENGINE ORCH_FALLBACK_ENGINE ONCALL_ENGINE
 
 cat > "$bin/a" <<'APLEXER'
@@ -39,20 +42,7 @@ case "${1:-}" in
     printf '[]\n' > "$FAKE_SESSIONS"
     ;;
   start)
-    workspace=""; tag=""; engine=""; model=""
-    while (($#)); do
-      case "$1" in
-        --workspace) workspace="$2"; shift 2 ;;
-        --tag) tag="$2"; shift 2 ;;
-        --engine) engine="$2"; shift 2 ;;
-        --model) model="$2"; shift 2 ;;
-        *) shift ;;
-      esac
-    done
-    printf '%s\n' "$engine" > "$FAKE_START_ENGINE"
-    printf '%s' "$model" > "$FAKE_START_MODEL"
-    printf '[{"id":"new-%s","workspace":"%s","tag":"%s","phase":"running","worker_alive":true}]\n' "$tag" "$workspace" "$tag" > "$FAKE_SESSIONS"
-    printf '%s\n' "${FAKE_START_SCREEN:-❯}" > "$FAKE_SCREEN"
+    echo 'direct native start is forbidden (phase 6.1)' >&2; exit 90
     ;;
   send)
     printf '%s\n' "$*" >> "$FAKE_SEND_LOG"
@@ -70,6 +60,50 @@ APLEXER
 cat > "$bin/hub" <<'HUB'
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ "${1:-}" == sessions ]]; then
+  printf '%s\n' "$*" >> "$FAKE_HUB_START_LOG"
+  exec python3 -I - "$@" <<'PYHUB'
+# Parse argv with the maintained `hub sessions` parser: unsupported flags such
+# as --tag or --json exit 2 exactly as in production.
+import argparse,json,os,sys
+sys.path.insert(0, os.environ['HUB_PARSER_ROOT'])
+from agent_hub_host import session_control
+parser=argparse.ArgumentParser(prog='hub'); session_control.add_commands(parser.add_subparsers(dest='cmd'))
+ns=parser.parse_args(sys.argv[1:])
+path=os.environ['FAKE_HUB_STATE']
+hub=json.load(open(path)) if os.path.exists(path) else {}
+def save(): json.dump(hub,open(path,'w'))
+if ns.sessions_cmd=='start':
+    assert ns.interactive and ns.wait and ns.purpose=='implement' and ns.key and ns.intake_task_id
+    hid='hub-%04d' % (len(hub)+1)
+    mode=os.environ.get('FAKE_HUB_START_MODE','running')
+    if mode=='transport':
+        sys.exit('Session transport failed: connection or TLS failure (reconcile with --key %s via show/commands)' % ns.key)
+    if mode=='refused':
+        hub[hid]={'state':'refused'}; save()
+        sys.exit('session_start_failed; session %s reached refused (no_capacity); reconcile with --key %s via show/events' % (hid, ns.key))
+    engine={'go':'opencode','zai':'zcodex'}.get(ns.engine,ns.engine)
+    open(os.environ['FAKE_START_ENGINE'],'w').write(engine+'\n')
+    open(os.environ['FAKE_START_MODEL'],'w').write(ns.model or '')
+    native='new-'+ns.name
+    hub[hid]={'state':'running','native_id':native}; save()
+    json.dump([dict(id=native,workspace=ns.workspace,tag='task-hub2-'+hid,phase='running',worker_alive=True,
+                    labels={'hub.session':hid,'hub.managed':'true'})],open(os.environ['FAKE_SESSIONS'],'w'))
+    open(os.environ['FAKE_SCREEN'],'w').write(os.environ.get('FAKE_START_SCREEN','❯')+'\n')
+    bound=dict(id=hid,state='running',native_id=native,workspace=ns.workspace)
+    print(json.dumps({**bound,'client_key':ns.key,'binding_wait':{'session':bound}},indent=2))
+elif ns.sessions_cmd=='stop':
+    row=hub.get(ns.id)
+    if not row or row['state']!='running': sys.exit('stop_not_running; command c1; stop was not confirmed')
+    row['state']='stopped'; save()
+    rows=[x for x in json.load(open(os.environ['FAKE_SESSIONS'])) if x['id']!=row['native_id']]
+    json.dump(rows,open(os.environ['FAKE_SESSIONS'],'w'))
+elif ns.sessions_cmd=='show':
+    print(json.dumps({'session':{'id':ns.id,**hub.get(ns.id,{'state':'unknown'})}}))
+else:
+    sys.exit(2)
+PYHUB
+fi
 [[ "${1:-}" == quota && "${2:-}" == --json ]] || exit 2
 case "${FAKE_HUB_MODE:-healthy}" in
   fail) exit 1 ;;
@@ -131,7 +165,7 @@ write_live() {
   else tag=oncall-engineer; sub=oncall; fi
   workspace="$HOME/git/agent-hub-wt-${role}-run/ops/$sub"
   mkdir -p "$workspace" "$HOME/tmp/agent-reports/$sub/inbox"
-  printf '[{"id":"old-%s","workspace":"%s","tag":"%s","phase":"running","worker_alive":true}]\n' "$role" "$workspace" "$tag" > "$FAKE_SESSIONS"
+  printf '[{"id":"old-%s","workspace":"%s","tag":"%s","phase":"running","worker_alive":true,"labels":{"ops.role":"%s"}}]\n' "$role" "$workspace" "$tag" "$role" > "$FAKE_SESSIONS"
   printf '%s\n' "$pane" > "$FAKE_SCREEN"
   : > "$FAKE_KILLED"
   : > "$FAKE_SEND_LOG"
@@ -376,5 +410,65 @@ output="$(run_ctl oncall check 2>&1)" || status=$?
 [[ "$status" -ne 0 ]]
 assert_contains "$output" 'no configured non-Claude engine has fresh Hub quota headroom'
 [[ ! -e "$FAKE_START_ENGINE" ]]
+
+# Phase 6.1 CLI contract: the fake parses argv with the maintained parser, so
+# the unsupported --tag/--json of the old draft are rejected (argparse exit 2).
+for bad in '--tag oncall-engineer' '--json'; do
+  status=0
+  # shellcheck disable=SC2086
+  "$bin/hub" sessions start --workspace /w --interactive --key k --intake-task-id i $bad >/dev/null 2>&1 || status=$?
+  [[ "$status" -eq 2 ]]
+done
+
+# A successful start goes through Hub only and is discovered through the exact
+# returned binding (task-hub2-<Hub id>), never the old tag.
+write_default_quota
+write_dead oncall
+: > "$FAKE_HUB_START_LOG"
+output="$(run_ctl oncall start 2>&1)"
+assert_contains "$output" 'started session new-oncall-engineer'
+start_line="$(grep '^sessions start' "$FAKE_HUB_START_LOG")"
+assert_not_contains "$start_line" '--tag'
+assert_not_contains "$start_line" '--json'
+assert_contains "$start_line" '--name oncall-engineer'
+assert_contains "$start_line" '--engine go'
+binding="$HOME/tmp/agent-reports/oncall/state/hub_binding.json"
+python3 -c '
+import json,sys
+b=json.load(open(sys.argv[1]))
+assert b["native_id"]=="new-oncall-engineer" and b["native_tag"]=="task-hub2-"+b["hub_id"], b' "$binding"
+output="$(run_ctl oncall check 2>&1)"
+assert_contains "$output" 'OK session=new-oncall-engineer'
+# The same native without the binding is not guessed from tag or workspace.
+mv "$binding" "$binding.saved"
+status=0
+output="$(run_ctl oncall status 2>&1)" || status=$?
+[[ "$status" -ne 0 ]]
+assert_contains "$output" 'not running'
+mv "$binding.saved" "$binding"
+
+# Hub refusal or transport failure never falls back to a native start; the
+# typed reason is logged. The refused Hub session is stopped through Hub
+# before the next attempt.
+for mode in refused transport; do
+  write_default_quota
+  write_dead oncall
+  status=0
+  output="$(FAKE_HUB_START_MODE="$mode" run_ctl oncall start 2>&1)" || status=$?
+  [[ "$status" -ne 0 ]]
+  [[ ! -e "$FAKE_START_ENGINE" ]]
+  assert_not_contains "$output" 'started session'
+  assert_contains "$output" 'recovery held'
+  if [[ "$mode" == refused ]]; then
+    assert_contains "$output" 'reached refused (no_capacity)'
+  else
+    assert_contains "$output" 'already ended (refused)'
+    assert_contains "$output" 'Session transport failed'
+    [[ -s "$HOME/tmp/agent-reports/oncall/state/hub_start_key" ]]
+  fi
+done
+output="$(run_ctl oncall start 2>&1)"
+assert_contains "$output" 'started session'
+[[ ! -e "$HOME/tmp/agent-reports/oncall/state/hub_start_key" ]]
 
 echo 'session-ctl targeted tests passed'
