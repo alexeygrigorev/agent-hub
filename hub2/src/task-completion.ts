@@ -37,9 +37,22 @@ export type CompletionAction = {
    * retry renders the same snapshot from the append-only journal. */
   snapshot_seq?: number;
 };
+/** Causes a session can declare in a `task_blocked` record. */
+export const BLOCKER_CAUSES = ['permission', 'credential', 'external', 'waiting', 'other'] as const;
+export type BlockerCause = typeof BLOCKER_CAUSES[number];
+/** Blockers a fresh session on the same worker cannot clear: Hub alerts the
+ * developer at once instead of spending its bounded continuations on them
+ * (12 Nov 2026: four intakes burnt every continuation in 1-3 minutes each on a
+ * 403, a revoked portal token and a deploy owned by another session). */
+export const HARD_BLOCKERS: readonly BlockerCause[] = ['permission', 'credential', 'external'];
+/** A `waiting` blocker (CI, deploy still running) is continued after this delay. */
+export const BLOCKED_WAIT_MS = 15 * 60_000;
+export type TaskBlocker = { cause: BlockerCause; detail: string; next_step?: string };
 export type CompletionRecord = {
   controlled: true; session_id: string; outcome: 'claimed' | 'unfinished'; reason: string;
   depth: number; summary?: string; continuation?: CompletionAction; delivery?: CompletionAction;
+  /** Why the session ended unfinished, in words: its blocker record or last note. */
+  cause?: string; blocker?: TaskBlocker;
 };
 
 const bytes = (value: string) => new TextEncoder().encode(value).byteLength;
@@ -73,7 +86,11 @@ export function completionContract(intakeId: string, sessionId: string, criteria
   const tail = `When every criterion is met with proof, before you exit write the completion record:\n`
     + `  hub intake append ${intakeId} --key complete-${sessionId} --version 1 --event-file <file>\n`
     + `with <file> containing {"kind":"task_complete","session_id":"${sessionId}","summary":"<what was delivered>","acceptance":[{"status":"met","proof":"<commit, PR, CI, deploy or live evidence>"}]} and exactly one acceptance entry per criterion, in order.\n`
-    + `If you cannot finish, do not write that record: append a note with the current state and the next step (hub intake append ${intakeId} --note "...") and exit. Hub continues unfinished tasks itself (bounded) and delivers the outcome to the requester.`;
+    + `If you cannot finish, do not write that record. Append a note with the current state and the next step (hub intake append ${intakeId} --note "..."). If something outside this session blocks you, also write a blocker record before you exit:\n`
+    + `  hub intake append ${intakeId} --key blocked-${sessionId} --version 1 --event-file <file>\n`
+    + `with <file> containing {"kind":"task_blocked","session_id":"${sessionId}","cause":"<permission|credential|external|waiting|other>","detail":"<exact error or missing dependency>","next_step":"<who must do what>"}. `
+    + `permission = Hub/API access denied (403/404) to this worker; credential = expired or revoked login or token; external = another owner must act first (deploy, review, decision); waiting = a running job (CI, deploy) needs more time; other = anything else. `
+    + `Hub does not restart a session into a permission, credential or external blocker; it alerts the developer with your cause. Otherwise Hub continues unfinished tasks itself (bounded) and delivers the outcome to the requester.`;
   const header = `Acceptance criteria (${criteria.length}; full text: hub intake show ${intakeId}):\n`;
   const fixed = jsonBytes(CONTRACT_MARKER + head + header + tail);
   let room = budget - fixed;
@@ -195,13 +212,40 @@ export function completionClaim(evidence: unknown, sessionId: string, criteriaCo
   return { summary: typeof record.summary === 'string' ? clip(record.summary.trim(), 1000) : '', met: criteriaCount };
 }
 
+/** A blocker record counts only for this exact session. */
+export function taskBlocker(evidence: unknown, sessionId: string): TaskBlocker | undefined {
+  if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)) return;
+  const record = evidence as Record<string, unknown>;
+  if (record.kind !== 'task_blocked' || record.session_id !== sessionId) return;
+  const raw = typeof record.cause === 'string' ? record.cause.trim().toLowerCase() : '';
+  const cause: BlockerCause = (BLOCKER_CAUSES as readonly string[]).includes(raw) ? raw as BlockerCause : 'other';
+  const detail = typeof record.detail === 'string' ? oneLine(record.detail) : '';
+  const next = typeof record.next_step === 'string' ? oneLine(record.next_step) : '';
+  return { cause, detail: clip(detail || 'no detail given', 600), ...(next ? { next_step: clip(next, 400) } : {}) };
+}
+
+const REASON_TEXT: Record<string, string> = {
+  exit_without_completion_claim: 'the session exited on its own without a completion record',
+  deadline_exceeded: 'the session was killed at its deadline',
+  launch_failed: 'the session failed to launch',
+};
+
+/** One human-readable cause for an unfinished exit: the session's blocker
+ * record, else its newest note, else the exit reason itself. */
+export function exitCause(reason: string, blocker?: TaskBlocker, lastNote?: string): string {
+  if (blocker) return clip(`blocked (${blocker.cause}): ${blocker.detail}${blocker.next_step ? ` Next: ${blocker.next_step}` : ''}`, 1000);
+  const base = REASON_TEXT[reason] ?? reason;
+  const note = lastNote ? oneLine(lastNote) : '';
+  return clip(note ? `${base}; its last note: ${note}` : `${base}; it left no note`, 1000);
+}
+
 export function retryDelay(tries: number): number {
   return Math.min(30 * 60_000, 60_000 * 4 ** Math.max(0, tries - 1));
 }
 
 export function deliveryBody(input: {
   intake_id: string; title: string; outcome: 'claimed' | 'unfinished'; reason: string; session_id: string;
-  summary?: string; continuation?: CompletionAction; depth: number;
+  summary?: string; continuation?: CompletionAction; depth: number; cause?: string; blocker?: TaskBlocker;
 }): string {
   const lines = input.outcome === 'claimed'
     ? [`Task finished, awaiting review: ${input.title}`,
@@ -210,7 +254,10 @@ export function deliveryBody(input: {
       `Proof: hub intake history ${input.intake_id}. Accept with hub intake update ${input.intake_id} --status accepted, or reopen it.`]
     : [`Task NOT finished: ${input.title}`,
       `Intake ${input.intake_id}; last session ${input.session_id} ended without a completion claim (${input.reason}).`,
-      input.continuation?.state === 'refused'
+      ...(input.cause ? ['Cause: ' + input.cause] : []),
+      input.blocker && HARD_BLOCKERS.includes(input.blocker.cause)
+        ? `Hub does not restart a session into a ${input.blocker.cause} blocker; the Hub developer was alerted.`
+        : input.continuation?.state === 'refused'
         ? `Hub could not start a continuation (${input.continuation.last_reason ?? 'refused'}).`
         : input.depth >= MAX_AUTO_CONTINUATIONS
           ? `Hub already continued it ${input.depth} times automatically; it needs a decision.`
