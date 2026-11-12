@@ -140,11 +140,16 @@ try{
   liveSocket.socket.close();liveSocket=null;
   // Hub itself delivers the terminal outcome to the intake owner; then the alarm settles.
   expect(await fixture('project',project,'alarm',{}),200,'project completion alarm');
+  // Named-agent forwarding leaves a durable Control wake even after mail delivery.
+  // Settle that known work before measuring idle; an unsettled alarm must fail below.
+  expect(await fixture('control','global','alarm',{}),200,'control mailbox wake alarm');
   const completionHistory=expect(await api(`/api/intakes/${created.id}/history`),200,'completion history').events;
   assert(completionHistory.some(e=>e.kind==='task_completion_claimed'),'completion claim recorded');
   assert.equal(completionHistory.filter(e=>e.kind==='task_outcome_delivered').length,1,'terminal outcome delivered once: '+JSON.stringify(completionHistory.filter(e=>e.kind.startsWith('task_')).map(e=>[e.kind,e.body])));
   const after=await snapshots();measurements.complete_flow=delta(before,after);measurements.quiescent=after;const total=Object.values(measurements.complete_flow).reduce((n,v)=>n+v.reads+v.writes,0);assert(total<2000,'warm core flow exceeds2000row guard');
   measurements.machine_deadlines=expect(await fixture('machine',machine,'machine-deadlines'),200,'exact machine pending work diagnostics');
+  assert.equal(after.control.alarm,null,'finished control has no pending mailbox wake');
+  if(process.env.HUB2_CORE_PUBLIC_MAIL)assert.equal(after['mailbox:global'].alarm,null,'finished mailbox has no pending alarm');
   assert.equal(after.project.alarm,null,'finished project has no pending alarm');
   assert.equal(after.machine.alarm===null,!offers.offers.some(offer=>offer.session_id!==started.id),'machine alarm reflects only unrelated open offers');
   assert.equal(after.account.alarm,null,'released account has no pending alarm');
