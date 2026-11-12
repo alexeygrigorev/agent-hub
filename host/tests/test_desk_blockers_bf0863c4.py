@@ -130,6 +130,15 @@ def test_operator_launcher_is_never_replaced(install_root, tmp_path, monkeypatch
     assert settings.read_text() == before
 
 
+def materialize_synthetic_claude_login(dest):
+    # provisioning.profile_logged_in reads only the materialized home credential
+    # for Claude (3160d5df); a synthetic, non-secret file satisfies that contract.
+    cred = dest / 'home' / '.claude' / '.credentials.json'
+    cred.parent.mkdir(parents=True, mode=0o700)
+    cred.write_text('{"synthetic": true}', encoding='utf-8')
+    os.chmod(cred, 0o600)
+
+
 def test_admission_stamps_hub_verdict_after_local_lock(tmp_path, monkeypatch):
     os.chmod(tmp_path, 0o700)
     m_dir = tmp_path / 'managed-engines'
@@ -140,6 +149,7 @@ def test_admission_stamps_hub_verdict_after_local_lock(tmp_path, monkeypatch):
              revision='11111111-1111-4111-8111-111111111111')
     dest = m_dir / (b['label'] + '-' + b['revision'])
     dest.mkdir(mode=0o700)
+    materialize_synthetic_claude_login(dest)
     p.write_json(dest / 'bundle.json', b)
     p.write_json(m_dir / 'state.json', [{'label': b['label'], 'revision': b['revision'], 'provider': 'claude'}])
     events = []
@@ -180,6 +190,7 @@ def test_admission_repairs_missing_profile_before_hub_stamp(tmp_path, monkeypatc
              revision='11111111-1111-4111-8111-111111111111')
     dest = m_dir / (b['label'] + '-' + b['revision'])
     dest.mkdir(mode=0o700)
+    materialize_synthetic_claude_login(dest)
     p.write_json(dest / 'bundle.json', b)
     p.write_json(m_dir / 'state.json', [{'label': b['label'], 'revision': b['revision'], 'provider': 'claude'}])
     events = []
@@ -220,6 +231,7 @@ def test_admission_missing_profile_still_refuses_after_failed_repair(tmp_path, m
              revision='11111111-1111-4111-8111-111111111111')
     dest = m_dir / (b['label'] + '-' + b['revision'])
     dest.mkdir(mode=0o700)
+    materialize_synthetic_claude_login(dest)
     p.write_json(dest / 'bundle.json', b)
     p.write_json(m_dir / 'state.json', [{'label': b['label'], 'revision': b['revision'], 'provider': 'claude'}])
     monkeypatch.setattr(p, 'lock', lambda timeout=None: contextlib.nullcontext())
@@ -295,6 +307,7 @@ def test_admission_reads_atomic_state_when_lock_unavailable(tmp_path, monkeypatc
              revision='11111111-1111-4111-8111-111111111111')
     dest = m_dir / (b['label'] + '-' + b['revision'])
     dest.mkdir(mode=0o700)
+    materialize_synthetic_claude_login(dest)
     p.write_json(dest / 'bundle.json', b)
     p.write_json(m_dir / 'state.json', [{'label': b['label'], 'revision': b['revision'], 'provider': 'claude'}])
 

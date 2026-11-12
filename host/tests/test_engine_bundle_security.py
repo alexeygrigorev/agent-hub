@@ -85,9 +85,13 @@ def test_sync_uses_shipped_codex_pin_after_account_bundle_bump(managed_engine, m
     monkeypatch.setattr(p, 'profiles', lambda *_args, **_kwargs: None)
     monkeypatch.setattr(p, 'sync_native_antigravity', lambda *_args, **_kwargs: None)
     monkeypatch.setattr(p, 'sync_opencode_device', lambda *_args, **_kwargs: None)
-    from agent_hub_host import engine_login
+    from agent_hub_host import engine_login, engine_rollout
     monkeypatch.setattr(engine_login, 'cancel_removed', lambda *_args, **_kwargs: None)
     monkeypatch.setattr(engine_login, 'tick', lambda *_args, **_kwargs: None)
+    # sync() asks engine_rollout which labels have live sessions (intake 8cc9e31a);
+    # that probe runs `aplexer list` through the subprocess.run patched above, so
+    # isolate it here and keep npm_installs an exact record of every subprocess.
+    monkeypatch.setattr(engine_rollout, 'deferred_labels', lambda *_args, **_kwargs: set())
 
     stale = _codex_bundle('0.162.1')
 

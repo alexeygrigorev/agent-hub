@@ -189,9 +189,12 @@ class CodexQuotaGateWindowsTest(unittest.TestCase):
                 patch('shutil.which', return_value=None):
             self.assertEqual(provisioning.hub_launch_gate('codex-orin', hub), (True, 'ok'))
 
-    def test_host_package_depends_on_quse(self):
-        text = (Path(__file__).resolve().parents[2] / 'pyproject.toml').read_text()
-        self.assertIn('"quse>=', text)
+    def test_host_package_is_quse_free_with_pinned_transport(self):
+        """Hub owns the quota verdict (5814e109 I4), so the host package no longer
+        ships quse (022e01ec); its sole dependency is the approved transport pin."""
+        import tomllib
+        package = tomllib.loads((Path(__file__).resolve().parents[2] / 'pyproject.toml').read_text())
+        self.assertEqual(package['project']['dependencies'], ['websockets==16.0'])
 
 
 class ProvisioningLockWindowsTest(unittest.TestCase):

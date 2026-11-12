@@ -29,6 +29,11 @@ class ManagedEffortTests(unittest.TestCase):
                                  files={'.codex/config.toml': 'model_reasoning_effort = "xhigh"\n'}, env={})
                         dest = managed / (label + '-' + revision)
                         dest.mkdir(mode=0o700)
+                        # provision_managed_home is patched out, so materialize the
+                        # synthetic, non-secret login that profile_logged_in reads.
+                        auth = dest / 'home' / '.codex' / 'auth.json'
+                        auth.parent.mkdir(parents=True, mode=0o700)
+                        auth.write_text('{"synthetic": true}', encoding='utf-8')
                         p.write_json(dest / 'bundle.json', b)
                         p.write_json(managed / 'state.json', [dict(label=label, revision=revision)])
                         with patch.object(p, 'root', return_value=managed), \
