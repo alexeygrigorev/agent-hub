@@ -155,7 +155,10 @@ test('Project terminal receipt helper raises exactly one developer alert and ret
  for(let i=0;i<3;i++)assert.equal((await send('/_internal/finish-dead-letter',alert)).status,200);
  assert.equal((database.prepare("SELECT COUNT(*) AS n FROM intake_events WHERE kind='developer_alert_raised'").get() as any).n,1);
  assert.equal(JSON.parse((database.prepare("SELECT body_json FROM intake_events WHERE kind='intake_context_updated'").get() as any).body_json).owner,'dev@dtcdev.click');
- assert.equal((await send('/_internal/finish-dead-letter',{...alert,machine_id:'foreign'})).status,409);
+ assert.equal((await send('/_internal/finish-dead-letter',{...alert,intake_id:'foreign'})).status,409);
+ assert.equal((await send('/_internal/finish-dead-letter',{...alert,machine_id:'old-host',attempt_operation_id:'old-attempt',epoch:0})).status,200);
+ assert.equal((database.prepare("SELECT COUNT(*) AS n FROM intake_events WHERE kind='developer_alert_raised'").get() as any).n,2);
+ assert.equal((await send('/_internal/stopped-finish',{...alert,machine_id:'old-host',state:'stopped',native_id:'native',native_exit_confirmed:true,evidence_digest:'b'.repeat(64)})).status,409);
  const evidence={git_salvage:{branch:'fix/work',commit:'a'.repeat(40),pushed:true}};
  assert.equal((await send('/_internal/stopped-finish',{...alert,state:'stopped',native_id:'native',native_exit_confirmed:true,evidence_digest:'b'.repeat(64),evidence})).status,200);
  const final=JSON.parse((database.prepare("SELECT final_evidence_json FROM intakes WHERE id='i'").get() as any).final_evidence_json);
