@@ -669,6 +669,17 @@ class ParserTests(unittest.TestCase):
     def test_claude_pair_identity_failure_interruption_and_echo_matrix(self):
         import copy
         prompt, marker = acc.make_probe()
+        self.assertIn("First use the provider-native background tool facility for a separate bounded 60-second hold", prompt)
+        self.assertIn("provider-native blocking monitor, TaskOutput, or status wait", prompt)
+        self.assertIn("mandatory Hub first-action/completion evidence files", prompt)
+        self.assertLess(
+            prompt.index("First use the provider-native background tool facility for a separate bounded 60-second hold"),
+            prompt.index("then run a separate foreground shell command"),
+        )
+        self.assertLess(
+            prompt.index("then run a separate foreground shell command"),
+            prompt.index("Immediately after the marker print finishes, enter a provider-native blocking monitor"),
+        )
         changes = [
             lambda f: f[1].update(session_id='99999999-2222-4333-8444-555555555555'),
             lambda f: f[0].update(session_id='not-provider-session'),
@@ -693,6 +704,147 @@ class ParserTests(unittest.TestCase):
         frames = provider_frames('claude', marker)[:1]
         frames[0]['message']['content'][0]['input']['command'] = marker
         self.assertFalse(acc.probe_output_ok(jsonl(frames), prompt, marker, 'claude', transport('claude')))
+
+        # Background-start control pairs (`run_in_background: true` + `backgroundTaskId`) are non-proof
+        # and do not poison a completed foreground Bash nonce pair; 4096-byte tail at blocking monitor preserves fg pair.
+        session = '11111111-2222-4333-8444-555555555555'
+
+        def padded_frame(obj, target_len):
+            raw = json.dumps(obj, separators=(',', ':'))
+            self.assertLessEqual(len(raw), target_len)
+            if len(raw) < target_len:
+                pad_key = '_pad'
+                overhead = len(json.dumps({pad_key: ''}, separators=(',', ':'))) - 1
+                obj = dict(obj, **{pad_key: 'x' * max(0, target_len - len(raw) - overhead)})
+                raw = json.dumps(obj, separators=(',', ':'))
+            self.assertEqual(len(raw), target_len)
+            return raw
+
+        def bg_frames(task_id='bg_synth_01', cmd='sleep 60; echo done', content_override=None, stdout_val='', is_err=False, interrupted_val=False, stderr_val='', bg_flag=True):
+            content_str = (
+                content_override
+                if content_override is not None
+                else f'Command running in background with ID: {task_id}. Output is being written to: /tmp/synthetic-claude/tasks/{task_id}.output'
+            )
+            use_ev = {
+                'type': 'assistant',
+                'session_id': session,
+                'message': {
+                    'role': 'assistant',
+                    'content': [{
+                        'type': 'tool_use',
+                        'id': 'toolu_synthetic_bg_hold',
+                        'name': 'Bash',
+                        'input': {
+                            'command': cmd,
+                            'description': 'Hold 60 seconds in background',
+                            'run_in_background': bg_flag,
+                            'timeout': 120000,
+                        },
+                    }],
+                },
+            }
+            hook_1 = {'type': 'system', 'subtype': 'hook_started', 'session_id': session}
+            hook_2 = {'type': 'system', 'subtype': 'hook_response', 'session_id': session, 'outcome': 'success'}
+            res_ev = {
+                'type': 'user',
+                'session_id': session,
+                'message': {
+                    'role': 'user',
+                    'content': [{
+                        'type': 'tool_result',
+                        'tool_use_id': 'toolu_synthetic_bg_hold',
+                        'content': content_str,
+                        'is_error': is_err,
+                    }],
+                },
+                'tool_use_result': {
+                    'stdout': stdout_val,
+                    'stderr': stderr_val,
+                    'interrupted': interrupted_val,
+                    'isImage': False,
+                    'noOutputExpected': False,
+                    'backgroundTaskId': task_id,
+                },
+            }
+            return [use_ev, hook_1, hook_2, res_ev]
+
+        valid_fg = provider_frames('claude', marker)
+        valid_bg = bg_frames()
+        for combined in (valid_fg + valid_bg, valid_bg + valid_fg):
+            self.assertTrue(acc.probe_output_ok(jsonl(combined), prompt, marker, 'claude', transport('claude')))
+
+        prefix_line = padded_frame({'type': 'system', 'subtype': 'init', 'session_id': session}, 11000)
+        first_action_res = padded_frame({'type': 'system', 'subtype': 'first_action', 'session_id': session}, 6259)
+        bg_use_line = padded_frame(valid_bg[0], 1174)
+        bg_hook1_line = padded_frame(valid_bg[1], 291)
+        bg_hook2_line = padded_frame(valid_bg[2], 337)
+        bg_res_line = padded_frame(valid_bg[3], 950)
+        fg_use_line = padded_frame(valid_fg[0], 1106)
+        fg_res_line = padded_frame(valid_fg[1], 609)
+        monitor_use_line = padded_frame(
+            {
+                'type': 'assistant',
+                'session_id': session,
+                'message': {
+                    'role': 'assistant',
+                    'content': [{
+                        'type': 'tool_use',
+                        'id': 'toolu_synthetic_monitor',
+                        'name': 'TaskOutput',
+                        'input': {'task_id': 'bg_synth_01', 'block': True, 'timeout': 60000},
+                    }],
+                },
+            },
+            520,
+        )
+        mon_hook1_line = padded_frame(valid_bg[1], 291)
+        mon_hook2_line = padded_frame(valid_bg[2], 337)
+        stream_at_blocking_monitor = '\n'.join([
+            prefix_line,
+            first_action_res,
+            bg_use_line,
+            bg_hook1_line,
+            bg_hook2_line,
+            bg_res_line,
+            fg_use_line,
+            fg_res_line,
+            monitor_use_line,
+            mon_hook1_line,
+            mon_hook2_line,
+        ]) + '\n'
+        tail_4096 = stream_at_blocking_monitor.encode('utf-8')[-4096:].decode('utf-8')
+        self.assertEqual(len(tail_4096.encode('utf-8')), 4096)
+        self.assertIn(fg_use_line, tail_4096)
+        self.assertIn(fg_res_line, tail_4096)
+        self.assertTrue(acc.probe_output_ok(tail_4096, prompt, marker, 'claude', transport('claude')))
+
+        fg_with_bg_res = provider_frames('claude', marker)
+        fg_with_bg_res[1]['tool_use_result']['backgroundTaskId'] = 'bg_synth_01'
+        bg_with_fg_res = bg_frames()
+        bg_with_fg_res[3]['tool_use_result'].pop('backgroundTaskId', None)
+        bg_with_fg_res[3]['tool_use_result']['stdout'] = marker + '\n'
+        bg_with_fg_res[3]['message']['content'][0]['content'] = marker + '\n'
+        for neg_frames in (
+            valid_bg,
+            bg_frames(cmd=marker),
+            bg_frames(content_override=f'Command running in background with ID: bg_synth_01.\n{marker}'),
+            bg_frames(content_override=marker, stdout_val=marker),
+            bg_with_fg_res,
+            valid_fg + bg_with_fg_res,
+            fg_with_bg_res,
+            valid_fg + fg_with_bg_res,
+            valid_fg + bg_frames(bg_flag=1),
+            valid_fg + bg_frames(bg_flag='true'),
+            valid_fg + bg_frames(task_id=''),
+            valid_fg + bg_frames(task_id='bad id!'),
+            valid_fg + bg_frames(content_override='Command running in background with ID: other_id. Output is being written.'),
+            valid_fg + bg_frames(stdout_val='unexpected stdout'),
+            valid_fg + bg_frames(stderr_val='unexpected stderr'),
+            valid_fg + bg_frames(is_err=True),
+            valid_fg + bg_frames(interrupted_val=True),
+        ):
+            self.assertFalse(acc.probe_output_ok(jsonl(neg_frames), prompt, marker, 'claude', transport('claude')), neg_frames)
 
     def test_argon_pair_identity_params_and_native_exit_wrapper_matrix(self):
         import copy
