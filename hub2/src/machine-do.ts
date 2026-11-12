@@ -270,7 +270,12 @@ export class MachineDO {
     const arch = typeof body.arch === 'string' && body.arch.length <= 40 ? body.arch : 'unknown';
     const labels = Array.isArray(body.labels) ? body.labels : [];
     const engines=body.engines??[],capabilities=body.capabilities??[];
-    if(![engines,capabilities].every(values=>Array.isArray(values)&&values.length<=32&&values.every(v=>boundedString(v,80))))return error('invalid_capabilities',400);
+    if(!Array.isArray(engines)||engines.length>32||!engines.every(v=>boundedString(v,80))
+      ||!Array.isArray(capabilities)||capabilities.length>544||!capabilities.every(v=>boundedString(v,80)))return error('invalid_capabilities',400);
+    // Repository inventory has an independent allowance so adding clones cannot
+    // consume the 32 engine/resource observations needed for placement.
+    const workspaces=capabilities.filter(v=>typeof v==='string'&&/^workspace:[a-z0-9][a-z0-9._-]{0,63}$/.test(v));
+    if(workspaces.length>512||capabilities.length-workspaces.length>32)return error('invalid_capabilities',400);
     const enginesJson=JSON.stringify([...new Set(engines as string[])].sort()),capabilitiesJson=JSON.stringify([...new Set(capabilities as string[])].sort());
     if (labels.length > 64 || !labels.every(value => typeof value === 'string' && value.length > 0 && value.length <= 80)) return error('invalid_capabilities', 400);
     const now = Date.now();

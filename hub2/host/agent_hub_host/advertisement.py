@@ -1,4 +1,4 @@
-"""Operator-configured host observations. These tags never confer a grant."""
+"""Enrolled host resources and discovered git checkout observations. These tags never confer a grant."""
 import re
 from pathlib import Path
 
@@ -37,6 +37,31 @@ class Advertisement:
             raise ValueError('workspace_outside_allowlist')
         return path
 
+    def clones(self):
+        """Discover immediate git checkouts, including enrolled checkout roots.
+
+        Do not traverse repository contents or widen the enrollment. Resolve
+        symlinks on each observation and discard ambiguous basename labels.
+        Explicit aliases retain precedence, including unavailable aliases.
+        """
+        candidates = {}
+        for root in self.roots:
+            try:
+                paths = [root, *root.iterdir()]
+            except OSError:
+                continue
+            for path in paths:
+                if not LABEL.fullmatch(path.name):
+                    continue
+                try:
+                    resolved = self.allowed_path(str(path))
+                    if not (resolved / '.git').exists():
+                        continue
+                except (OSError, ValueError):
+                    continue
+                candidates.setdefault(path.name.casefold(), set()).add(resolved)
+        return {label: next(iter(paths)) for label, paths in candidates.items() if len(paths) == 1}
+
     def resolve_alias(self, label):
         for name, path in self.workspaces.items():
             if name.casefold() == label.casefold():
@@ -47,7 +72,7 @@ class Advertisement:
                     return self.allowed_path(path)
                 except OSError:
                     raise ValueError('workspace_unavailable') from None
-        return None
+        return self.clones().get(label.casefold())
 
     def tags(self):
         tags = list(self.capabilities)
@@ -57,6 +82,8 @@ class Advertisement:
             except (OSError, ValueError):
                 continue
             tags.append('workspace:' + label.casefold())
+        explicit = {label.casefold() for label in self.workspaces}
+        tags.extend('workspace:' + label for label in sorted(self.clones()) if label not in explicit)
         return tags
 
 
