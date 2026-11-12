@@ -235,6 +235,8 @@ export class AccountDO {
    const query=new URL(r.url).searchParams,requested=query.get('refresh_lease'),repairLease=!!requested&&row.refresh_owner===machine&&row.refresh_lease===requested;
    if(requested&&!repairLease)return error('refresh_permit_mismatch',409);
    const account=this.db.one<Account>('SELECT * FROM account WHERE id=1');if(!account)return error('account_unconfigured',409);
+   // Dedicated passive material retrieval: never refreshes, leases, calls the provider or writes.
+   if(query.has('passive_generation'))return await this.passiveCredential(machine,account,query);
    if(query.get('metadata')==='1')return json({generation:row.generation,provider:account.provider,refresh_mode:account.provider==='zai'?'static':'central'});
    if(query.has('expected_generation')){
     // Exact-generation observation for a host release re-pin: synchronous,
@@ -260,10 +262,7 @@ export class AccountDO {
    if(!repairLease&&this.db.one('SELECT host_id FROM credential_rejections WHERE host_id=? AND generation=?',machine,row.generation))return error('credential_generation_rejected',409);
    const expires=this.accessExpiry(account.provider,files);
    if(!repairLease&&account.provider!=='zai'&&minimum>0&&(expires===null||expires<=Date.now()+minimum))return error('access_lifetime_insufficient',409);
-   if(!repairLease&&account.provider!=='zai'){
-    const strip=(v:any):void=>{if(v&&typeof v==='object')for(const key of Object.keys(v)){if(key.toLowerCase().includes('refresh')&&typeof v[key]==='string')v[key]='';else strip(v[key]);}};
-    files={...files};for(const path of Object.keys(files))if(path.endsWith('.json')||path.endsWith('antigravity-oauth-token')){const auth=JSON.parse(files[path]),lastRefresh=path==='.codex/auth.json'&&typeof auth.last_refresh==='string'&&Number.isFinite(Date.parse(auth.last_refresh))?auth.last_refresh:undefined;strip(auth);if(lastRefresh!==undefined)auth.last_refresh=lastRefresh;files[path]=JSON.stringify(auth);}
-   }
+   if(!repairLease&&account.provider!=='zai')files=this.stripRefreshMaterial(files);
    return json({generation:row.generation,provider:account.provider,files,access_expires_at:expires,refresh_material:repairLease,static_key:account.provider==='zai'});
   }
   if(r.method==='POST'){
@@ -652,6 +651,43 @@ export class AccountDO {
   const provider=this.db.one<Account>('SELECT * FROM account WHERE id=1')?.provider??null,row=this.renewalRow();
   // Secret-free by construction: the row never holds token material.
   return json({provider,renewal:row&&provider==='claude'?{generation:row.generation,status:row.status,attempts:row.attempts,next_at:row.next_at,access_expires_at:row.access_expires_at,reason:row.reason,updated_at:row.updated_at}:null});
+ }
+ /** Recursively blanks refresh-token strings (preserving Codex last_refresh); returns a copy. */
+ private stripRefreshMaterial(input:Record<string,string>):Record<string,string>{
+  const strip=(v:any):void=>{if(v&&typeof v==='object')for(const key of Object.keys(v)){if(key.toLowerCase().includes('refresh')&&typeof v[key]==='string')v[key]='';else strip(v[key]);}};
+  const files={...input};
+  for(const path of Object.keys(files))if(path.endsWith('.json')||path.endsWith('antigravity-oauth-token')){const auth=JSON.parse(files[path]),lastRefresh=path==='.codex/auth.json'&&typeof auth.last_refresh==='string'&&Number.isFinite(Date.parse(auth.last_refresh))?auth.last_refresh:undefined;strip(auth);if(lastRefresh!==undefined)auth.last_refresh=lastRefresh;files[path]=JSON.stringify(auth);}
+  return files;
+ }
+ /**
+  * Approved-host passive retrieval of the exact current Claude generation.
+  * Reads and unseals only: no refresh, lease, provider call, ack or write. The
+  * host/generation/rejection/lease/uncertainty gate runs before and again after
+  * the awaited unseal, so material is never returned for a superseded state.
+  */
+ private async passiveCredential(machine:string,account:Account,query:URLSearchParams):Promise<Response>{
+  const raw=query.get('passive_generation')||'';
+  if([...query.keys()].length!==1||!/^[1-9][0-9]{0,15}$/.test(raw)||!Number.isSafeInteger(Number(raw)))return error('invalid_passive_generation',400);
+  if(account.provider!=='claude')return error('account_provider_mismatch',409);
+  const generation=Number(raw);
+  const gate=():Response|null=>{
+   const row=this.db.one<{generation:number;refresh_owner:string|null;refresh_until:number|null;refresh_lease:string|null}>('SELECT generation,refresh_owner,refresh_until,refresh_lease FROM credentials WHERE id=1');
+   if(!row)return error('credentials_unavailable',503);
+   if(!this.db.one('SELECT id FROM approved_hosts WHERE id=?',machine))return error('host_not_approved',403);
+   if(row.generation!==generation)return error('generation_conflict',409);
+   if(this.db.one('SELECT host_id FROM credential_rejections WHERE host_id=? AND generation=?',machine,generation))return error('credential_generation_rejected',409);
+   if(Number(row.refresh_until||0)>Date.now()||row.refresh_owner||row.refresh_lease)return error('refresh_in_progress',409);
+   if(this.hasUnresolvedRefresh(generation))return error('refresh_outcome_uncertain',503);
+   return null;
+  };
+  const before=gate();if(before)return before;
+  const sealed=this.db.one<{sealed:string}>('SELECT sealed FROM credentials WHERE id=1 AND generation=?',generation);
+  if(!sealed)return error('generation_conflict',409);
+  const files=await this.unseal(sealed.sealed,'claude',generation) as Record<string,string>;
+  const after=gate();if(after)return after;
+  const expires=this.accessExpiry('claude',files);
+  if(expires===null||expires<=Date.now())return error('access_lifetime_insufficient',409);
+  return json({generation,provider:'claude',files:this.stripRefreshMaterial(files),access_expires_at:expires,refresh_material:false,static_key:false,passive:true});
  }
  private hasUnresolvedRefresh(generation:number):boolean{
   return ['issued','pending'].some(state=>!!this.db.one('SELECT id FROM credential_candidates WHERE base_generation=? AND state=? ORDER BY id LIMIT 1',generation,state));
