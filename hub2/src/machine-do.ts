@@ -862,6 +862,8 @@ export class MachineDO {
         state, JSON.stringify(payload), evidenceDigest, Number(body.exit_code), now, body.native_id,JSON.stringify(completedLaunch),row.id, row.state);
       this.db.run("UPDATE native_sessions SET phase='exited',last_activity_at=?,exit_code=?,containment_empty=1,observed_at=? WHERE session_id=?",
         now,Number(body.exit_code),now,row.id);
+      if(state==='failed'&&!payload.stop_requested)this.db.run('INSERT OR REPLACE INTO attention(session_id, reason, observed_at) VALUES (?, ?, ?)',
+        row.id,nativeDeadline?.exceeded===true?'deadline_exceeded':launchFailed?'launch_failed':'native_exit_'+String(body.exit_code),now);
       if(failureNotification)this.db.run("UPDATE machine_outbox SET state='pending',attempt=0,next_action_at=?,updated_at=? WHERE id=? AND state='dead_letter'",
         now,now,failureNotification.id);
       this.insertOutbox(`finish:${row.operation_id}`, 'finish', row.operation_id, row.project_id, payload, now);
