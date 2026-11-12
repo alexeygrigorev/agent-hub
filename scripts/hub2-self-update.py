@@ -788,7 +788,7 @@ def finish_retained_switch(root, releases, journal):
     sync_directory(root)
 
 
-def reactivate_retained_release(base, manifest, host_wheel, root, releases, old, target):
+def reactivate_retained_release(base, manifest, host_wheel, root, releases, old, target, *, activation_allowed=None):
     require_release_directory(target)
     receipt = target / 'release.json'
     if receipt.is_symlink() or not receipt.is_file():
@@ -840,6 +840,15 @@ def reactivate_retained_release(base, manifest, host_wheel, root, releases, old,
             prepare_environment(target, download, manifest, host_wheel)
             sync_environment(target)
             sync_directory(releases)
+            if activation_allowed is not None and not activation_allowed():
+                # No unit or pointer was changed. Restore the retained copy
+                # without invoking rollback, which would restart the daemon.
+                shutil.rmtree(require_release_directory(target))
+                backup.rename(target)
+                sync_directory(releases)
+                journal.unlink()
+                sync_directory(root)
+                return False
             if replacements:
                 replace_units(units, replacements)
             state['switching'] = True
@@ -872,6 +881,7 @@ def reactivate_retained_release(base, manifest, host_wheel, root, releases, old,
         commit_repin(root, releases)
         commit_updater(root, releases)
         finish_retained_switch(root, releases, committed)
+        return True
 
 
 def recover(root, releases):
@@ -1134,7 +1144,10 @@ def install(base_url, root, *, install_service=False, restart=True, scheduled=Fa
         if target.exists() or target.is_symlink():
             if not restart:
                 raise ValueError('retained release activation requires a verified restart')
-            reactivate_retained_release(base, manifest, host_wheel, root, releases, old, target)
+            allowed = (lambda: not defer_activation(root, current, version)) if scheduled else None
+            if not reactivate_retained_release(base, manifest, host_wheel, root, releases, old, target,
+                                               activation_allowed=allowed):
+                return
             if install_service:
                 enable_service_timer()
             prune(root, releases)

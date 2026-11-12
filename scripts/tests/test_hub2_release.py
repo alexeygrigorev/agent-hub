@@ -422,6 +422,24 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
         self.downloads.clear()
         return current, retained, units
 
+    def test_retained_preparation_rechecks_sessions_without_restart_on_deferral(self):
+        current, retained, units = self.prepare_retained_switch()
+        before = (retained / 'release.json').read_bytes()
+        self.policy()
+        with patch.object(updater, 'managed_session_count', side_effect=[0, 1]), \
+             patch.object(updater.time, 'time', return_value=updater.ACTIVATION_INTERVAL + 1):
+            self.install(scheduled=True)
+        self.assertEqual((self.root / 'current').resolve(), current)
+        self.assertEqual((self.root / 'previous').resolve(), retained)
+        self.assertEqual((retained / 'release.json').read_bytes(), before)
+        self.assertTrue((retained / 'lib/python3.11/site-packages/retained.pth').is_file())
+        self.assertEqual((units / updater.UNITS[0]).read_bytes(), b'active service unit')
+        self.assertFalse(any('restart' in args or 'stop' in args for args in self.calls))
+        self.assertFalse((self.root / 'retained-switch.json').exists())
+        self.assertFalse(retained.with_name('.retained-' + retained.name).exists())
+        self.assertFalse((self.root / 'failed-releases.json').exists())
+        self.assertEqual(self.receipt()['reason'], 'managed_sessions_running')
+
     def test_rebuilds_retained_release_without_executing_it_or_replacing_updater(self):
         current, retained, units = self.prepare_retained_switch()
         receipt = (retained / 'release.json').read_bytes()

@@ -47,7 +47,11 @@ next check time. Failed activations retain their existing retry backoff.
 Explicit `--install-service` setup and initial enrollment remain immediate;
 operators should coordinate these restarts separately. Recovery/rollback is
 also immediate. The batching limit covers automatic successful activations,
-not crashes, rollbacks, or explicit operator restarts.
+not crashes, rollbacks, or explicit operator restarts. This P9 batching policy
+supersedes the earlier expectation of automatic host adoption within 15 minutes:
+an eligible batch can wait up to two hours for sessions, and a release published
+just after activation can wait six hours before becoming eligible. The updater
+still checks every five minutes; check frequency is not rollout latency.
 
 After the activation gate permits the latest release, it downloads all artifacts, verifies
 their hashes, builds a new environment under `releases/<commit>` offline from
