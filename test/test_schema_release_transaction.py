@@ -597,12 +597,20 @@ os.execv(sys.executable,[sys.executable,*args])
         self.assertEqual(self.policy.issuances, 1)
         self.assertEqual(self.git(self.repo, 'rev-parse', 'HEAD'), self.candidate)
         deadline = time.monotonic() + 12
+        observed_retirement = False
         while time.monotonic() < deadline:
             current = json.loads(self.credential.read_text())
-            status = Path('/proc') / child_ids[0] / 'stat'
-            if current.get('schema') == 'hub2-model-policy-service-credential-v1' and (not status.exists() or status.read_text().split()[2] == 'Z'):
-                break
+            if current.get('schema') == 'hub2-model-policy-service-credential-v1':
+                status = Path('/proc') / child_ids[0] / 'stat'
+                try:
+                    retired = status.read_text().split()[2] == 'Z'
+                except FileNotFoundError:
+                    retired = True
+                if retired:
+                    observed_retirement = True
+                    break
             time.sleep(.01)
+        self.assertTrue(observed_retirement, 'issued credential and child retirement must both be observed')
         self.assertEqual(json.loads(self.credential.read_text()).get('schema'), 'hub2-model-policy-service-credential-v1')
         self.assertFalse((policy_directory(self.state) / 'service-exchange-finished.json').exists())
         self.assertEqual(json.loads(self.credential.with_name('model-policy-service-intent.json').read_text())['request_id'], request_id)
