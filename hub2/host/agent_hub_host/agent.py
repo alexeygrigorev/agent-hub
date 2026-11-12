@@ -1,4 +1,5 @@
 """Native process receipts are journaled before delivery and replayed on reconnect."""
+import configparser
 import hashlib
 import json
 import logging
@@ -11,6 +12,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .client import ApiError, private_file, save_config
 from . import native_launch
@@ -207,7 +209,7 @@ class Bridge:
         launch = offer.get("launch")
         if not isinstance(launch, dict):
             raise ValueError("launch_specification_required")
-        workspace = self.resolve_workspace(launch.get("workspace"))
+        workspace = self.resolve_workspace(launch.get("workspace"), offer.get("project_id"))
         engine = launch.get("engine")
         if engine not in self.engines:
             raise ValueError("engine_not_allowed")
@@ -245,7 +247,7 @@ class Bridge:
                 "prompt": prompt, "interactive": bool(launch.get("interactive", False)), "timeout_seconds": timeout,
                 'with_goal':with_goal,'effort':effort,**managed}
 
-    def resolve_workspace(self, value):
+    def resolve_workspace(self, value, project_id=None):
         if not isinstance(value, str) or not value or len(value) > 1024 or "\0" in value:
             raise ValueError("invalid_workspace")
         candidate = Path(value)
@@ -279,10 +281,84 @@ class Bridge:
             if workspace.is_dir() and any(workspace.is_relative_to(root) for root in self.roots):
                 matches[str(workspace)] = workspace
         if len(matches) > 1:
+            project_matches = [workspace for workspace in matches.values()
+                               if self._workspace_matches_project(workspace, project_id)]
+            if len(project_matches) == 1:
+                return project_matches[0]
             raise ValueError("workspace_label_ambiguous")
         if not matches:
             raise ValueError("workspace_label_unavailable")
         return next(iter(matches.values()))
+
+    def _workspace_matches_project(self, workspace, project_id):
+        """Use the Hub's repository identity to resolve duplicate basename labels safely."""
+        if not isinstance(project_id, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}/[A-Za-z0-9_.-]{1,100}", project_id):
+            return False
+        expected = tuple(part.casefold() for part in project_id.split("/"))
+        git_entry = workspace / ".git"
+        try:
+            if git_entry.is_dir():
+                git_dir = git_entry.resolve(strict=True)
+            elif git_entry.is_file() and git_entry.stat().st_size <= 1024:
+                pointer = git_entry.read_text(encoding="utf-8")
+                match = re.fullmatch(r"\s*gitdir:\s*(.+?)\s*", pointer, re.IGNORECASE)
+                if not match:
+                    return False
+                git_dir = Path(match.group(1))
+                if not git_dir.is_absolute():
+                    git_dir = workspace / git_dir
+                git_dir = git_dir.resolve(strict=True)
+            else:
+                return False
+            if not any(git_dir.is_relative_to(root) for root in self.roots):
+                return False
+            common_dir_file = git_dir / "commondir"
+            if common_dir_file.is_file() and common_dir_file.stat().st_size <= 1024:
+                common_dir = Path(common_dir_file.read_text(encoding="utf-8").strip())
+                if not common_dir.is_absolute():
+                    common_dir = git_dir / common_dir
+                git_dir = common_dir.resolve(strict=True)
+                if not any(git_dir.is_relative_to(root) for root in self.roots):
+                    return False
+            config_path = git_dir / "config"
+            if not config_path.is_file() or config_path.stat().st_size > 262144:
+                return False
+            config = configparser.ConfigParser(interpolation=None, strict=True)
+            with config_path.open(encoding="utf-8") as stream:
+                config.read_file(stream)
+            for section in config.sections():
+                if not section.casefold().startswith('remote "'):
+                    continue
+                try:
+                    remote = config.get(section, "url", raw=True)
+                except (configparser.Error, KeyError):
+                    continue
+                if self._repository_key(remote) == expected:
+                    return True
+        except (OSError, UnicodeError, configparser.Error, ValueError):
+            return False
+        return False
+
+    @staticmethod
+    def _repository_key(remote):
+        if not isinstance(remote, str) or len(remote) > 2048:
+            return None
+        scp = re.fullmatch(r"(?:[^@/]+@)?github\.com:([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?", remote.strip(), re.IGNORECASE)
+        if scp:
+            return scp.group(1).casefold(), scp.group(2).casefold()
+        try:
+            parsed = urlsplit(remote.strip())
+            if parsed.hostname is None or parsed.hostname.casefold() != "github.com":
+                return None
+            parts = parsed.path.strip("/").split("/")
+            if len(parts) != 2:
+                return None
+            repository = parts[1][:-4] if parts[1].casefold().endswith(".git") else parts[1]
+            if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", parts[0]) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", repository):
+                return None
+            return parts[0].casefold(), repository.casefold()
+        except ValueError:
+            return None
 
     def child_context(self,offer,launch):
         if not self.machine_id:raise RuntimeError('host_identity_required')

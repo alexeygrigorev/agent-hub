@@ -539,6 +539,23 @@ class HostTests(unittest.TestCase):
         self.assertEqual(self.native.process["workspace"], str(workspace.resolve()))
         self.assertTrue(any(call[1] == "start" for call, _ in self.native.calls))
 
+    def test_repo_identity_disambiguates_duplicate_workspace_label(self):
+        roots = [self.root / "checkout-a", self.root / "checkout-b"]
+        workspaces = [root / "dataops" for root in roots]
+        for root, workspace in zip(roots, workspaces):
+            workspace.mkdir(parents=True)
+            git = workspace / ".git"
+            git.mkdir()
+            repository = "someone-else/dataops" if workspace is workspaces[0] else "DataTalksClub/dataops"
+            (git / "config").write_text(f'[remote "origin"]\n\turl = git@github.com:{repository}.git\n')
+        self.bridge.roots = [root.resolve() for root in roots]
+        self.bridge.advertisement.roots = self.bridge.roots
+        with self.assertRaisesRegex(ValueError, "workspace_label_ambiguous"):
+            self.bridge.resolve_workspace("dataops")
+        offer = self.offer(project_id="DataTalksClub/dataops")
+        offer["launch"]["workspace"] = "dataops"
+        self.assertEqual(self.bridge.validate_launch(offer)["workspace"], str(workspaces[1].resolve()))
+
     def test_label_resolution_is_bound_in_existing_ack_before_native_dispatch(self):
         workspace = self.root / 'relay'
         workspace.mkdir()
