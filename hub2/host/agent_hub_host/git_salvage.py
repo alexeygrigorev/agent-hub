@@ -3,6 +3,7 @@ import os
 import re
 import subprocess
 import time
+from pathlib import Path
 
 
 def salvage_branch(workspace, timeout=30):
@@ -26,7 +27,9 @@ def salvage_branch(workspace, timeout=30):
 
     try:
         root = git('rev-parse', '--show-toplevel')
-        if root.returncode:
+        if root.returncode or not Path(root.stdout.strip()).samefile(workspace):
+            # A non-repository workspace nested beneath some other checkout
+            # must never cause that parent checkout's branch to be published.
             return None
         remotes = git('remote')
         names = remotes.stdout.splitlines()
