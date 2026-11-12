@@ -57,6 +57,14 @@ class RecoveryAlertTest(unittest.TestCase):
         self.assertEqual(len(self.log.read_text().splitlines()), 1, 'an alert is mailed once')
         self.assertEqual(json.loads(self.state.read_text())['sent'], ['abc-1:9'])
 
+    def test_alert_names_the_cause_not_only_the_kind(self):
+        alert = dict(ALERT, kind='blocked', reason='blocked_permission',
+                     cause='blocked (permission): hub model-policy returns HTTP 403 for this worker\nNext: Root applies the policy')
+        message = poller.render({'id': 'abc-1', 'project': 'o/r', 'title': 'T', 'status': 'failed'}, alert)
+        self.assertIn('Alert blocked (blocked_permission)', message)
+        self.assertIn('Cause: blocked (permission): hub model-policy returns HTTP 403 for this worker Next: Root', message)
+        self.assertNotIn('Cause:', poller.render({'id': 'abc-1'}, ALERT), 'older alerts without a cause still render')
+
     def test_skips_intakes_someone_already_owns(self):
         self.assertEqual(poller.deliver(StubTransport(owner='human:x'), self.state, self.helper), {'sent': 0, 'errors': 0})
         self.assertFalse(self.log.exists())

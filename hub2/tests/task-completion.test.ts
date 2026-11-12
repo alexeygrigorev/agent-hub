@@ -8,7 +8,7 @@ import {NodeSqlStorage,NodeDurableStorage} from '../node/sqlite-storage.ts';
 import {ProjectDO} from '../src/project-do';
 import {ControlDO} from '../src/control-do';
 import {MachineDO} from '../src/machine-do';
-import {CONTRACT_MARKER,CONTINUATION_MARKER,MAX_AUTO_CONTINUATIONS,basePrompt,completionClaim,completionContract,continuationPrompt} from '../src/task-completion';
+import {CONTRACT_MARKER,CONTINUATION_MARKER,MAX_AUTO_CONTINUATIONS,basePrompt,completionClaim,completionContract,continuationPrompt,taskBlocker} from '../src/task-completion';
 
 const admin={id:'human:completion-owner',kind:'operator',scopes:['operator:admin']};
 const candidates=[{id:'sol-route',engine:'codex',model:'gpt-6.1-sol',effort:'medium',account_id:'codex-private',weight:1,capabilities:[],enabled:true}];
@@ -821,4 +821,94 @@ test('archived or manually restarted intakes are never resurrected by a pending 
       assert(!events(f,id).some(e=>e.actor_id==='hub2-completion'&&e.kind.startsWith('task_continuation')));
     }finally{f.close();}
   }
+});
+
+// 12 Nov 2026: four intakes burnt both continuations in 1-3 minutes each because
+// every session hit the same outside blocker (worker 403, revoked token, a deploy
+// another session owned) and the alert said only recovery_exhausted.
+async function blocked(f:F,id:string,sessionId:string,cause:string,detail:string,key='blocked-'+sessionId){
+  const r=await f.call('/api/intakes/'+id+'/events','POST',{key,event:{kind:'task_blocked',session_id:sessionId,cause,detail,next_step:'Root applies the policy'}});
+  assert.equal(r.status,201,JSON.stringify(await r.clone().json()));
+}
+
+test('the completion contract tells sessions how to record a blocker with its cause',async()=>{
+  const text=completionContract('i-1','s-1',AC,6000);
+  for(const part of ['"kind":"task_blocked"','"session_id":"s-1"','--key blocked-s-1','permission','credential','external','waiting'])assert(text.includes(part),part);
+  assert.deepEqual(taskBlocker({kind:'task_blocked',session_id:'s-1',cause:'Permission',detail:'HTTP 403\nforbidden'},'s-1'),{cause:'permission',detail:'HTTP 403 forbidden'});
+  assert.equal(taskBlocker({kind:'task_blocked',session_id:'s-2',cause:'permission',detail:'x'},'s-1'),undefined,'another session\'s blocker does not count');
+  assert.equal(taskBlocker({kind:'task_blocked',session_id:'s-1',cause:'bogus'},'s-1')!.cause,'other');
+});
+
+test('a permission blocker is not continued: Hub alerts the developer at once and the alert names the cause',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'blocked-permission');
+    assert.equal((await start(f,id,'first')).status,201);
+    const first=await run(f,id);
+    await f.call('/api/intakes/'+id+'/events','POST',{key:'state',note:'AC4 blocked: hub model-policy returns 403'});
+    await blocked(f,id,first.session_id,'permission','hub model-policy returns HTTP 403 for this worker');
+    await finish(f,first,0);
+    const record=completion(f,id);
+    assert.equal(record.reason,'blocked_permission');assert.equal(record.continuation,undefined,'no continuation into the same blocker');
+    assert.equal(record.blocker.cause,'permission');assert.match(record.cause,/^blocked \(permission\): hub model-policy returns HTTP 403 for this worker Next: Root applies the policy/);
+    const alerts=events(f,id).filter(e=>e.kind==='developer_alert_raised');
+    assert.equal(alerts.length,1);assert.equal(alerts[0].body.kind,'blocked');assert.equal(alerts[0].body.reason,'blocked_permission');
+    assert.match(alerts[0].body.cause,/HTTP 403/);assert.equal(alerts[0].body.depth,0);
+    const task=(await json(await f.call('/api/intakes/'+id))).task;
+    assert.equal(task.owner,'dev@dtcdev.click');assert.match(task.current_state,/Cause: blocked \(permission\): hub model-policy returns HTTP 403/);
+    assert(events(f,id).some(e=>e.kind==='task_unfinished'&&e.body.next==='deliver'&&/HTTP 403/.test(e.body.cause)));
+    await f.project.alarm();
+    assert.equal(sagas(f,id).length,1,'no continuation was started');
+    assert.equal(f.mail.length,1);assert.match(f.mail[0].body,/Cause: blocked \(permission\)/);assert.match(f.mail[0].body,/does not restart a session into a permission blocker/);
+  }finally{f.close();}
+});
+
+test('a waiting blocker is continued after a delay, not immediately',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'blocked-waiting');
+    assert.equal((await start(f,id,'first')).status,201);
+    const first=await run(f,id);
+    await blocked(f,id,first.session_id,'waiting','CI run 42 still running on the PR head');
+    const before=Date.now();
+    await finish(f,first,0);
+    const record=completion(f,id);
+    assert.equal(record.reason,'exit_without_completion_claim');assert.equal(record.continuation.state,'pending');
+    assert(record.continuation.next_action_at>=before+15*60_000,'waits before continuing');
+    await f.project.alarm();
+    assert.equal(sagas(f,id).length,1,'not started yet');
+    assert.equal(events(f,id).filter(e=>e.kind==='developer_alert_raised').length,0);
+  }finally{f.close();}
+});
+
+test('recovery_exhausted alert names the cause from the last session note when no blocker record exists',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'exhausted-cause');
+    assert.equal((await start(f,id,'first')).status,201);
+    for(let attempt=0;attempt<=MAX_AUTO_CONTINUATIONS;attempt++){
+      const binding=await run(f,id);
+      await f.call('/api/intakes/'+id+'/events','POST',{key:'note-'+attempt,note:'attempt '+attempt+': portal refresh token family revoked'});
+      await finish(f,binding,0);
+      await f.project.alarm();
+    }
+    const alerts=events(f,id).filter(e=>e.kind==='developer_alert_raised');
+    assert.equal(alerts.length,1);assert.equal(alerts[0].body.kind,'recovery_exhausted');
+    assert.equal(alerts[0].body.cause,'the session exited on its own without a completion record; its last note: attempt 2: portal refresh token family revoked');
+    assert.match((await json(await f.call('/api/intakes/'+id))).task.current_state,/Cause: .*attempt 2: portal refresh token family revoked/);
+  }finally{f.close();}
+});
+
+test('an operator stop keeps its reason and raises no developer alert even after a hard blocker record',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'blocked-then-stopped');
+    assert.equal((await start(f,id,'first')).status,201);
+    const first=await run(f,id);
+    await blocked(f,id,first.session_id,'permission','HTTP 403');
+    const r=await f.call('/_internal/finish','POST',{...first,exit_code:143,native_exit_confirmed:true,stop_requested:true,evidence:{result:'exit',stop_requested:true}});
+    assert.equal(r.status,200);
+    assert.equal(completion(f,id).reason,'stop_requested');assert.equal(completion(f,id).continuation,undefined);
+    assert.equal(events(f,id).filter(e=>e.kind==='developer_alert_raised'&&e.body.kind==='blocked').length,0);
+  }finally{f.close();}
 });
