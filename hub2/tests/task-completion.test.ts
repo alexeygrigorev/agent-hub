@@ -188,6 +188,11 @@ test('continuations are bounded per requester start; deadline exits get more tim
     assert.equal(completion(f,id).continuation,undefined);assert.equal(completion(f,id).depth,MAX_AUTO_CONTINUATIONS);
     assert.equal(f.mail.length,1);assert.match(f.mail[0].body,/Task NOT finished/);assert.match(f.mail[0].body,/continued it 2 times/);
     await f.project.alarm();assert.equal(sagas(f,id).length,3,'no unbounded restart loop');
+    // Exhaustion raises a loud developer alert (dev@, not the requester) and the developer owns the intake.
+    const alerts=events(f,id).filter(e=>e.kind==='developer_alert_raised');
+    assert.equal(alerts.length,1);assert.equal(alerts[0].body.recipient,'dev@dtcdev.click');assert.equal(alerts[0].body.kind,'recovery_exhausted');
+    assert.equal((await json(await f.call('/api/intakes/'+id))).task.owner,'dev@dtcdev.click');
+    assert(f.mail.every(m=>m.recipient!=='dev@dtcdev.click'),'developer alert is not routed through the requester mailbox');
     // A new requester start opens a new bounded budget.
     assert.equal((await start(f,id,'human-restart')).status,201);
     await finish(f,await run(f,id),0);
@@ -212,6 +217,7 @@ test('a refused continuation start retries with backoff, then reports the unfini
     assert(events(f,id).some(e=>e.kind==='task_continuation_refused'));
     await f.project.alarm();
     assert.equal(f.mail.length,1);assert.match(f.mail[0].body,/could not start a continuation/);
+    assert(events(f,id).some(e=>e.kind==='developer_alert_raised'&&e.body.kind==='recovery_start_refused'));
   }finally{f.close();}
 });
 
@@ -631,6 +637,13 @@ test('aplexer_retirement timeout (exit 124) never marks intake or dispatch compl
       assert.equal(view.final_evidence.reopened_unfinished.reason,expectedReason);
       assert.equal(view.final_evidence.reopened_unfinished.previous_status,prevStatus);
       assert(events(f,reopenedId).some(e=>e.kind==='intake_reopened_unfinished'&&e.body.session_id===sessionId&&e.body.reason===expectedReason));
+    }
+    // A reopened intake never sits open without an owner: Hub starts the recovery session itself.
+    await f.project.alarm();
+    for(const [reopenedId,sessionId] of [[retiredTimeout,b1.session_id],[retiredZero,b2.session_id]] as const){
+      assert(['queued','running'].includes(intakeRow(f,reopenedId).status),'reopened intake gets a recovery session');
+      assert(events(f,reopenedId).some(e=>e.kind==='task_continuation_started'&&e.body.previous_session_id===sessionId));
+      assert.notEqual(intakeRow(f,reopenedId).session_id,sessionId);
     }
   }finally{m.close();f.close();}
 });

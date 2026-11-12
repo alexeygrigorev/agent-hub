@@ -14,6 +14,8 @@ export const CONTINUATION_END = '\n=== Original task (historical objective; the 
 const PREVIOUS_CONTINUATIONS = [[CONTINUATION_MARKER, '\n=== Original task ===\n'], ['--- Hub continuation ---\n', '\n--- Original task ---\n']] as const;
 /** Consecutive Hub-started continuations after one requester start. */
 export const MAX_AUTO_CONTINUATIONS = 2;
+/** Hub developer alerts go here, never to the requester's channels. */
+export const DEVELOPER_ALERT_RECIPIENT = 'dev@dtcdev.click';
 export const MAX_CONTINUATION_TRIES = 3;
 export const MAX_DELIVERY_TRIES = 5;
 const PROMPT_LIMIT = 8192;

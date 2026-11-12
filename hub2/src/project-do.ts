@@ -13,7 +13,7 @@ import { nativeReturncode } from './native-exit';
 import { HOST_INVENTORY_LOST_MS } from './session-liveness';
 import { PROJECT_WORK_SCHEMA, ProjectWork, type ProjectWorkHooks } from './project-work';
 import {
-  COMPLETION_ACTOR, MAX_AUTO_CONTINUATIONS, MAX_CONTINUATION_TRIES, MAX_DELIVERY_TRIES,
+  COMPLETION_ACTOR, DEVELOPER_ALERT_RECIPIENT, MAX_AUTO_CONTINUATIONS, MAX_CONTINUATION_TRIES, MAX_DELIVERY_TRIES,
   LAUNCH_SPEC_LIMIT, basePrompt, completionClaim, continuationBudget, continuationPrompt, deliveryBody, promptWithContract, retryDelay, stripCompletion,
   type CompletionClaim, type CompletionRecord, type ContinuationSnapshot,
 } from './task-completion';
@@ -26,7 +26,7 @@ const COMPLETION_DUE = `CASE
     THEN json_extract(i.final_evidence_json,'$.completion.continuation.next_action_at')
   WHEN json_extract(i.final_evidence_json,'$.completion.delivery.state')='pending'
     THEN json_extract(i.final_evidence_json,'$.completion.delivery.next_action_at') END`;
-const COMPLETION_ELIGIBLE = `i.status IN ('failed','completed-awaiting-review')
+const COMPLETION_ELIGIBLE = `i.status IN ('open','failed','completed-awaiting-review')
   AND json_extract(i.final_evidence_json,'$.completion.controlled')=1
   AND json_extract(i.final_evidence_json,'$.completion.session_id')=i.session_id
   AND EXISTS(SELECT 1 FROM dispatch_sagas s WHERE s.session_id=i.session_id AND s.intake_id=i.id
@@ -1253,6 +1253,7 @@ export class ProjectDO {
       reason:claim?'completion_claimed':contractOmitted?'completion_contract_omitted_launch_budget':reason,depth,...(claim?.summary?{summary:claim.summary}:{})};
     if(!claim&&continuable&&!contractOmitted&&depth<MAX_AUTO_CONTINUATIONS)record.continuation={state:'pending',key:'continue:'+saga.operation_id,tries:0,next_action_at:now};
     else if(deliver)record.delivery={state:'pending',key:'terminal:'+saga.operation_id,tries:0,next_action_at:now};
+    if(!claim&&continuable&&!record.continuation)this.raiseDeveloperAlert(intake.id,saga.session_id,'recovery_exhausted',record.reason,depth,now);
     this.appendEvent(intake.id,'completion:'+saga.operation_id,COMPLETION_ACTOR,claim?'task_completion_claimed':'task_unfinished',
       {session_id:saga.session_id,reason:record.reason,depth,next:record.continuation?'continue':record.delivery?'deliver':'none',
         ...(claim?{criteria_met:claim.met,...(claim.summary?{summary:claim.summary}:{})}:{})},now);
@@ -1314,11 +1315,26 @@ export class ProjectDO {
             if(continuing){
               const saga=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id=?',record.session_id);
               next.delivery={state:'pending',key:'terminal:'+(saga?.operation_id??record.session_id),tries:0,next_action_at:Date.now()};
+              this.raiseDeveloperAlert(intake.id,record.session_id,'recovery_start_failed','internal_error',record.depth,Date.now());
             }
           }else action.next_action_at=Date.now()+retryDelay(action.tries);
         });
       }
     }
+  }
+
+  /** Loud, durable alert to the Hub developer (never the requester's channels)
+   * when Hub cannot recover an unfinished intake itself. Runs inside the
+   * caller's transaction: records the alert in the intake journal and makes the
+   * developer the intake's active owner, so it never sits ownerless. */
+  private raiseDeveloperAlert(intakeId:string,sessionId:string,kind:string,reason:string,depth:number,now:number):void{
+    const alert={recipient:DEVELOPER_ALERT_RECIPIENT,kind,reason,session_id:sessionId,depth,max_continuations:MAX_AUTO_CONTINUATIONS};
+    this.appendEvent(intakeId,'developer-alert:'+kind+':'+sessionId,COMPLETION_ACTOR,'developer_alert_raised',alert,now);
+    this.appendEvent(intakeId,'developer-owner:'+kind+':'+sessionId,COMPLETION_ACTOR,'intake_context_updated',{...this.intakeContext(intakeId),
+      owner:DEVELOPER_ALERT_RECIPIENT,
+      current_state:`Hub could not finish this intake automatically (${kind}: ${reason}; session ${sessionId}; ${depth} of ${MAX_AUTO_CONTINUATIONS} recovery sessions used).`,
+      next_step:'Developer: inspect the intake notes, fix the blocker and restart the intake (hub intake start).'},now);
+    console.error('[hub2] INTAKE_RECOVERY_ALERT alert='+DEVELOPER_ALERT_RECIPIENT,JSON.stringify({intake_id:intakeId,...alert}));
   }
 
   private latestSeq(intakeId:string):number{
@@ -1407,7 +1423,10 @@ export class ProjectDO {
     }
     this.saveCompletion(intake,next=>{
       next.continuation={...action,tries,state:exhausted?'refused':'pending',next_action_at:exhausted?null:Date.now()+retryDelay(tries),last_reason:outcome.reason};
-      if(exhausted)next.delivery={state:'pending',key:'terminal:'+(saga?.operation_id??record.session_id),tries:0,next_action_at:Date.now()};
+      if(exhausted){
+        next.delivery={state:'pending',key:'terminal:'+(saga?.operation_id??record.session_id),tries:0,next_action_at:Date.now()};
+        this.raiseDeveloperAlert(intake.id,record.session_id,'recovery_start_refused',outcome.reason??record.reason,record.depth,Date.now());
+      }
     },exhausted?{key:action.key+':refused',kind:'task_continuation_refused',body:{session_id:record.session_id,reason:outcome.reason??null,tries}}:undefined);
   }
 
@@ -1493,9 +1512,16 @@ export class ProjectDO {
             JSON.stringify({...route,completion_contract:true}),now,saga.operation_id);
         }
         const reopened={at:now,previous_status:intake.status,reason,session_id:saga.session_id,source:'aplexer_retirement'};
+        // A reopened intake is never left open without an owner: Hub schedules a
+        // bounded recovery continuation, or alerts the developer when the bound is spent.
+        const depth=this.continuationDepth(intake.id);
+        const completion:CompletionRecord={controlled:true,session_id:saga.session_id,outcome:'unfinished',reason,depth,
+          ...(depth<MAX_AUTO_CONTINUATIONS?{continuation:{state:'pending',key:'continue:'+saga.operation_id,tries:0,next_action_at:now}}:{})};
         this.db.run("UPDATE intakes SET status='open',final_evidence_json=?,updated_at=? WHERE id=?",
-          JSON.stringify({...evidence,reopened_unfinished:reopened}),now,intake.id);
-        this.appendEvent(intake.id,'reopen-unverified:'+saga.operation_id,COMPLETION_ACTOR,'intake_reopened_unfinished',reopened,now);
+          JSON.stringify({...evidence,reopened_unfinished:reopened,completion}),now,intake.id);
+        this.appendEvent(intake.id,'reopen-unverified:'+saga.operation_id,COMPLETION_ACTOR,'intake_reopened_unfinished',
+          {...reopened,next:completion.continuation?'continue':'developer_alert'},now);
+        if(!completion.continuation)this.raiseDeveloperAlert(intake.id,saga.session_id,'recovery_exhausted',reason,depth,now);
       }
     });
   }
