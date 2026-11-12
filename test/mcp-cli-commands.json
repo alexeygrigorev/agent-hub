@@ -127,6 +127,7 @@
   "quota",
   "release",
   "reply",
+  "repos add",
   "repos edit",
   "repos list",
   "repos refresh",
