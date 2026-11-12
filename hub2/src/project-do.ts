@@ -305,11 +305,15 @@ export class ProjectDO {
     const rawAfter = new URL(request.url).searchParams.get('after') || '0';
     const after = Number(rawAfter);
     if (!Number.isSafeInteger(after) || after < 0) return error('invalid_cursor', 400);
+    const rawLimit = new URL(request.url).searchParams.get('limit');
+    // Absent limit keeps the historical page size; a present limit must be a plain decimal integer in 1..100.
+    const limit = rawLimit === null ? 100 : /^[0-9]{1,3}$/.test(rawLimit) ? Number(rawLimit) : 0;
+    if (limit < 1 || limit > 100) return error('invalid_limit', 400);
     const rows = this.db.all<IntakeEventRow>(
-      'SELECT seq, actor_id, kind, body_json, at FROM intake_events WHERE task_id = ? AND seq > ? ORDER BY seq LIMIT 101', intakeId, after,
+      'SELECT seq, actor_id, kind, body_json, at FROM intake_events WHERE task_id = ? AND seq > ? ORDER BY seq LIMIT ?', intakeId, after, limit + 1,
     );
-    const hasMore = rows.length > 100;
-    const page = rows.slice(0, 100).map(row => ({ seq: row.seq, actor_id: row.actor_id, kind: row.kind, at: row.at, body: this.parse(row.body_json) }));
+    const hasMore = rows.length > limit;
+    const page = rows.slice(0, limit).map(row => ({ seq: row.seq, actor_id: row.actor_id, kind: row.kind, at: row.at, body: this.parse(row.body_json) }));
     return json({ events: page, next: hasMore ? page[page.length - 1]?.seq : null });
   }
 

@@ -942,3 +942,32 @@ test('unfinished managed Claude continuation keeps selector and refuses instead 
  assert.equal(JSON.parse((f.sql.prepare('SELECT launch_spec_json FROM dispatch_sagas WHERE operation_id=?').get(saga.operation_id) as any).launch_spec_json).managed_credential_label,'hub-claude');
  f.sql.close();f.collectorSql.close();
 });
+
+test('same-intake history honors limit with exclusive after cursor and traverses >100 events losslessly',async()=>{
+ const f=fixture(),own=await intake(f,'paged'),other=await intake(f,'paged-other'),project=f.project as any;
+ project.transaction(()=>{for(let i=0;i<249;i++)project.appendEvent(own.id,'page-'+i,'human:admin','note',{note:'n'+i},Date.now());
+ project.appendEvent(other.id,'other-1','human:admin','note',{note:'other'},Date.now());});
+ const path='/api/intakes/'+own.id+'/history',seqs=(h:any)=>h.events.map((e:any)=>e.seq);
+ const def=await body(await f.call(path));assert.equal(def.events.length,100);assert.equal(def.next,100);assert.deepEqual(seqs(def),Array.from({length:100},(_,i)=>i+1));
+ const one=await body(await f.call(path+'?limit=1'));assert.deepEqual(seqs(one),[1]);assert.equal(one.next,1);
+ const seven=await body(await f.call(path+'?limit=7&after=3'));assert.deepEqual(seqs(seven),[4,5,6,7,8,9,10]);assert.equal(seven.next,10);
+ for(const limit of [1,7,100,undefined]){
+  const seen:number[]=[];let after=0,guard=0;
+  for(;;){const h=await body(await f.call(path+'?after='+after+(limit?'&limit='+limit:'')));assert(h.events.length<=(limit??100));seen.push(...seqs(h));if(h.next===null)break;assert.equal(h.next,seqs(h).at(-1));after=h.next;assert(++guard<400);}
+  assert.deepEqual(seen,Array.from({length:250},(_,i)=>i+1),'limit '+limit);
+ }
+ const last=await body(await f.call(path+'?after=245&limit=5'));assert.deepEqual(seqs(last),[246,247,248,249,250]);assert.equal(last.next,null);
+ const exact=await body(await f.call(path+'?after=240&limit=10'));assert.equal(exact.events.length,10);assert.equal(exact.next,null);
+ const beyond=await body(await f.call(path+'?after=250&limit=5'));assert.deepEqual(beyond,{events:[],next:null});
+ for(const bad of ['0','-1','101','1.5','abc','','Infinity','NaN','1e1','0x10',' 5','5%20','1;DROP TABLE intakes','%2B5','0005'.replace('0005','1000000')]){
+  const r=await f.call(path+'?limit='+bad);assert.equal(r.status,400,'limit='+bad);assert.equal((await body(r)).error,'invalid_limit');
+ }
+ assert.equal((await f.call(path+'?limit=5&limit=500')).status,200);
+ assert.equal((await f.call(path+'?after=-1&limit=5')).status,400);
+ assert.equal((await f.call(path+'?after=abc')).status,400);
+ assert.equal((await f.call('/api/intakes/'+other.id+'/history?limit=100')).status,200);
+ assert.deepEqual(seqs(await body(await f.call('/api/intakes/'+other.id+'/history?limit=100'))),[1,2]);
+ assert.equal((await f.call('/api/intakes/00000000-0000-4000-8000-000000000000/history?limit=5')).status,404);
+ assert.equal((await f.call(path+'?limit=5','GET',undefined,{id:'human:nobody',kind:'operator',scopes:[]})).status,403);
+ f.sql.close();f.collectorSql.close();
+});
