@@ -413,10 +413,11 @@ class HostTests(unittest.TestCase):
         row, _, _ = self.origin_retirement_fixture()
         self.native.process = {'id': row['native_id'], 'tag': row['tag'], 'workspace': str(self.root/'foreign'), 'phase': 'running'}
         with patch.object(self.bridge.launcher, 'retired_origin', side_effect=AssertionError('must not qualify a live conflict')):
+            self.bridge.reconcile()
             with self.assertRaisesRegex(RuntimeError, 'native_identity_mismatch'):
-                self.bridge.reconcile()
+                self.bridge.lookup(row['native_id'], row)
         self.assertFalse(self.journal.db.execute('SELECT 1 FROM outbox').fetchone())
-        self.assertEqual([args[1] for args, _ in self.native.calls], ['status'])
+        self.assertEqual([args[1] for args, _ in self.native.calls], ['status', 'status'])
 
     def test_missing_workspace_without_bound_retirement_remains_unresolved(self):
         self.bridge.offer(self.offer())
@@ -471,8 +472,10 @@ class HostTests(unittest.TestCase):
 
     def test_unverified_foreign_identity_is_never_killed_or_reported_finished(self):
         self.failed_native(wrong_tag=True)
+        self.bridge.reconcile()
+        row=self.journal.db.execute('SELECT * FROM launches').fetchone()
         with self.assertRaisesRegex(RuntimeError,'native_identity_mismatch'):
-            self.bridge.reconcile()
+            self.bridge.resolve_launch_native(row)
         self.assertFalse(any('kill' in argv for argv,options in self.native.calls))
         self.assertFalse(self.journal.db.execute('SELECT 1 FROM outbox').fetchone())
 
@@ -958,8 +961,13 @@ class HostTests(unittest.TestCase):
         original = dict(self.native.process)
         for field, value in (("id", "other-native"), ("tag", "other-tag"), ("workspace", str(self.root.parent))):
             self.native.process = {**original, field: value, "phase": "exited", "exit": {"code": 0}, "containment_empty": True}
+            row=self.journal.db.execute('SELECT * FROM launches').fetchone()
+            before=dict(row)
+            self.bridge.reconcile()
+            self.assertEqual(self.bridge.live_sessions(),[])
+            self.assertEqual(dict(self.journal.db.execute('SELECT * FROM launches').fetchone()),before)
             with self.assertRaisesRegex(RuntimeError, "identity"):
-                self.bridge.reconcile()
+                self.bridge.lookup(row['native_id'],row)
         self.assertFalse(any("finish" in row["path"] for row in self.journal.db.execute("SELECT * FROM outbox")))
 
     def test_command_exactly_once_fenced_and_payload_conflict(self):
@@ -1950,3 +1958,138 @@ class CaptureAckCompatibilityTests(unittest.TestCase):
                        {'output':'\0'*65536,'capture_binding':{'unknown':'x'*2000}}]:
             with self.subTest(keys=list(result)),self.assertRaisesRegex(ValueError,'request too large'):
                 Client('https://hub.test').request('POST','/api/sessions/s/commands/c/ack',{'epoch':7,'result':result})
+
+
+
+class NativeObservationIsolationTests(unittest.TestCase):
+    setUp = HostTests.setUp
+    tearDown = HostTests.tearDown
+
+    def seed(self, *, healthy_state='running', healthy_phase='running'):
+        with self.journal.db:
+            self.journal.db.execute('DELETE FROM launches')
+            self.journal.db.execute('DELETE FROM outbox')
+            for session, native, state in [('a-poison','11111111-1111-4111-8111-111111111111','launching'),
+                    ('z-healthy','22222222-2222-4222-8222-222222222222',healthy_state)]:
+                self.journal.db.execute('INSERT INTO launches(operation_id,session_id,epoch,digest,workspace,tag,native_id,state,native_dispatch_started) VALUES(?,?,?,?,?,?,?,?,?)',
+                    ('op-'+session,session,1,'d'*64,str(self.root),'task-'+session,native,state,1))
+        self.rows={row['session_id']:dict(row) for row in self.journal.db.execute('SELECT * FROM launches')}
+        self.observations={row['native_id']:{'id':row['native_id'],'tag':row['tag'],'workspace':row['workspace'],
+                           'phase':'running','last_activity_ms':123} for row in self.rows.values()}
+        self.observations[self.rows['a-poison']['native_id']]['tag']='foreign-private-tag'
+        healthy=self.observations[self.rows['z-healthy']['native_id']]
+        healthy.update(phase=healthy_phase,containment_empty=True,exit={'code':0,'exited_at_ms':123})
+        self.effects=[];self.frames=[]
+        def runner(argv,**kwargs):
+            self.effects.append(argv[1:])
+            if argv[1]=='kill':
+                self.assertEqual(argv[2],self.rows['z-healthy']['native_id'])
+                healthy.update(phase='exited',containment_empty=True,exit={'code':143,'exited_at_ms':123})
+                return subprocess.CompletedProcess(argv,0,'','')
+            self.assertEqual(argv[1],'status')
+            return subprocess.CompletedProcess(argv,0,json.dumps(self.observations[argv[2]]),'')
+        self.bridge.runner=runner
+        self.bridge._managed_socket=__import__('types').SimpleNamespace(send=lambda text:self.frames.append(json.loads(text)))
+        return self.rows
+
+    def test_bad_first_row_is_omitted_while_healthy_heartbeat_and_finish_progress(self):
+        rows=self.seed(healthy_phase='exited')
+        captured=[];self.client.heartbeat=lambda *args,**kwargs:captured.append(kwargs['native_sessions'])
+        with patch.object(self.bridge.launcher,'finalize',return_value='retired-finished') as finalize, \
+                patch.object(self.bridge.launcher,'retired_origin',side_effect=AssertionError('no foreign fallback')):
+            self.bridge.heartbeat([])
+            self.bridge.reconcile()
+        self.assertEqual([row['session_id'] for row in captured[0]],['z-healthy'])
+        self.assertEqual(dict(self.journal.db.execute("SELECT * FROM launches WHERE session_id='a-poison'").fetchone()),rows['a-poison'])
+        finalize.assert_called_once_with(rows['z-healthy']['native_id'],{'tag':rows['z-healthy']['tag'],'workspace':str(self.root)})
+        pending=self.journal.db.execute('SELECT path,payload FROM outbox').fetchall()
+        self.assertEqual(len(pending),1);self.assertIn('/z-healthy/finish',pending[0]['path'])
+        self.assertTrue(json.loads(pending[0]['payload'])['native_exit_confirmed'])
+        self.journal.flush(self.client)
+        self.assertFalse(self.journal.db.execute('SELECT 1 FROM outbox').fetchone())
+        errors=[frame for frame in self.frames if frame['type']=='host.error']
+        self.assertEqual(len(errors),1)
+        self.assertEqual(errors[0]['stage'],'host_observation')
+        self.assertEqual(errors[0]['epoch'],1)
+        self.assertNotIn('foreign-private-tag',json.dumps(errors))
+        self.assertNotIn(str(self.root),json.dumps(errors))
+        self.assertFalse(any(args[0]=='kill' for args in self.effects))
+
+    def test_valid_interrupted_bound_launch_still_stops_only_qualified_native(self):
+        rows=self.seed(healthy_state='launching')
+        with patch.object(self.bridge.launcher,'finalize',return_value='retired-finished'):
+            self.bridge.reconcile()
+        self.assertEqual([args[1] for args in self.effects if args[0]=='kill'],[rows['z-healthy']['native_id']])
+        self.assertEqual(dict(self.journal.db.execute("SELECT * FROM launches WHERE session_id='a-poison'").fetchone()),rows['a-poison'])
+        payload=json.loads(self.journal.db.execute('SELECT payload FROM outbox').fetchone()[0])
+        self.assertTrue(payload['launch_failed']);self.assertEqual(payload['native_id'],rows['z-healthy']['native_id'])
+
+    def test_command_guard_still_raises_for_foreign_native(self):
+        rows=self.seed()
+        with self.assertRaisesRegex(RuntimeError,'native_identity_mismatch'):
+            self.bridge.command({'id':'guard-stop','session_id':'a-poison','epoch':1,'kind':'stop'})
+        self.assertFalse(any(args[0]=='kill' for args in self.effects))
+        self.assertFalse(self.journal.db.execute('SELECT 1 FROM outbox').fetchone())
+        self.assertEqual(dict(self.journal.db.execute("SELECT * FROM launches WHERE session_id='a-poison'").fetchone()),rows['a-poison'])
+
+    def test_known_observation_failures_isolate_but_programming_and_sql_errors_propagate(self):
+        for error in [RuntimeError('private failure'),ValueError('private JSON'),OSError('private path'),
+                      subprocess.TimeoutExpired('private command',1)]:
+            with self.subTest(kind=type(error).__name__):
+                rows=self.seed();lookup=self.bridge.lookup
+                def observe(native,*args,**kwargs):
+                    if native==rows['a-poison']['native_id']:raise error
+                    return lookup(native,*args,**kwargs)
+                with patch.object(self.bridge,'lookup',side_effect=observe):
+                    self.assertEqual([r['session_id'] for r in self.bridge.live_sessions()],['z-healthy'])
+                    self.bridge.reconcile()
+                self.assertEqual(dict(self.journal.db.execute("SELECT * FROM launches WHERE session_id='a-poison'").fetchone()),rows['a-poison'])
+                self.assertNotIn('private ',json.dumps(self.frames))
+        for error in [KeyError('programming'),sqlite3.OperationalError('database')]:
+            with self.subTest(kind=type(error).__name__),patch.object(self.bridge,'lookup',side_effect=error):
+                with self.assertRaises(type(error)):self.bridge.live_sessions()
+                with self.assertRaises(type(error)):self.bridge.reconcile()
+
+    def test_reports_are_bounded_deduplicated_safe_and_reconnect_retries_failure(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from types import SimpleNamespace
+        from agent_hub_host.agent import _NATIVE_OBSERVATION_REPORT_LIMIT
+        self.seed();self.bridge._managed_socket=None
+        row={'session_id':'safe','operation_id':'op:safe','epoch':1}
+        self.bridge._report_native_observation(row)
+        attempts=[]
+        def failed(text):attempts.append(text);raise RuntimeError('private transport failure')
+        self.bridge._managed_socket=SimpleNamespace(send=failed)
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(lambda _:self.bridge._report_native_observation(row),range(32)))
+        self.assertEqual(len(attempts),1)
+        frames=[];self.bridge._managed_socket=SimpleNamespace(send=lambda text:frames.append(json.loads(text)))
+        self.bridge._report_native_observation(row);self.bridge._report_native_observation(row)
+        self.assertEqual(len(frames),1)
+        for i in range(200):self.bridge._report_native_observation({**row,'session_id':'safe-'+str(i)})
+        self.assertEqual(len(frames),_NATIVE_OBSERVATION_REPORT_LIMIT)
+        self.assertEqual(len(self.bridge._native_observation_reports[1]),_NATIVE_OBSERVATION_REPORT_LIMIT)
+        self.assertTrue(all(len(json.dumps(frame).encode())<1024 for frame in frames))
+        fresh=[];self.bridge._managed_socket=SimpleNamespace(send=lambda text:fresh.append(json.loads(text)))
+        for unsafe in [{**row,'session_id':'private/path'}, {**row,'operation_id':'unsafe\ncommand'}, {**row,'epoch':True}]:
+            self.bridge._report_native_observation(unsafe)
+        self.assertEqual(fresh,[])
+        self.bridge._report_native_observation(row)
+        self.assertEqual(len(fresh),1)
+
+    def test_failed_diagnostic_transport_preserves_healthy_heartbeat_and_outbox(self):
+        from types import SimpleNamespace
+        rows=self.seed();attempts=[];beats=[]
+        def failed(text):
+            frame=json.loads(text)
+            if frame['type']=='host.error':
+                attempts.append(frame)
+                raise OSError('private socket detail')
+        self.bridge._managed_socket=SimpleNamespace(send=failed)
+        self.client.heartbeat=lambda *args,**kwargs:beats.append(kwargs['native_sessions'])
+        self.journal.enqueue('existing','/api/sessions/z-healthy/commands/queued/ack',{'epoch':1,'result':{'error':'synthetic_queued_failure'}})
+        self.bridge.heartbeat([]);self.bridge.heartbeat([]);self.journal.flush(self.client)
+        self.assertEqual([[r['session_id'] for r in beat] for beat in beats],[['z-healthy'],['z-healthy']])
+        self.assertEqual(len(attempts),1)
+        self.assertFalse(self.journal.db.execute('SELECT 1 FROM outbox').fetchone())
+        self.assertEqual(dict(self.journal.db.execute("SELECT * FROM launches WHERE session_id='a-poison'").fetchone()),rows['a-poison'])

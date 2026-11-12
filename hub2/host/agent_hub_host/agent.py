@@ -21,6 +21,8 @@ from .local_auth_readiness import local_claude_missing_contexts
 # Keep the live native-session census fresh for the global Hub session limit.
 LIVE_SESSION_HEARTBEAT_SECONDS = 30
 _NATIVE_INVENTORY_START_LOCK = threading.Lock()
+_NATIVE_OBSERVATION_REPORT_LOCK = threading.Lock()
+_NATIVE_OBSERVATION_REPORT_LIMIT = 128
 
 
 def run_heartbeat_loop(beat, stop, interval=LIVE_SESSION_HEARTBEAT_SECONDS):
@@ -607,6 +609,33 @@ class Bridge:
             session_id,
         )
 
+    def _report_native_observation(self, row):
+        """Best-effort fixed diagnostic, bounded once per attempt/socket."""
+        session, operation, epoch = row['session_id'], row['operation_id'], row['epoch']
+        if (not isinstance(session, str) or not re.fullmatch(r'[A-Za-z0-9-]{1,80}', session)
+                or not isinstance(operation, str) or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,120}', operation)
+                or type(epoch) is not int or not 1 <= epoch <= 9007199254740991):
+            return
+        socket = getattr(self, '_managed_socket', None)
+        if socket is None:
+            return  # Connection setup immediately reconciles again with its socket.
+        with _NATIVE_OBSERVATION_REPORT_LOCK:
+            if socket is not getattr(self, '_managed_socket', None):
+                return
+            state = getattr(self, '_native_observation_reports', None)
+            if state is None or state[0] is not socket:
+                state = self._native_observation_reports = (socket, set())
+            key = (session, operation, epoch)
+            if key in state[1] or len(state[1]) >= _NATIVE_OBSERVATION_REPORT_LIMIT:
+                return
+            state[1].add(key)  # Failed transport retries on the next connection.
+        try:
+            socket.send(canonical({'type': 'host.error', 'stage': 'host_observation',
+                'reason': 'native_observation_unverified', 'detail': 'native_observation_unverified',
+                'session_id': session, 'operation_id': operation, 'epoch': epoch}))
+        except (RuntimeError, ValueError, OSError):
+            pass  # Diagnostic transport never converts UNKNOWN into a resolved row.
+
     def reconcile(self):
         rows = self.journal.db.execute("SELECT * FROM launches WHERE state IN ('running','aborting','deadline_stopping','launching') LIMIT 1001").fetchall()
         if len(rows) > 1000:
@@ -619,7 +648,8 @@ class Bridge:
             if row['state'] in {'launching','aborting'} and row['native_dispatch_started'] == 0 and not row['native_id']:
                 self.settle_undispatched_launch(row)
                 continue
-            if row['state']=='launching':
+            interrupted_bound = row['state']=='launching' and bool(row['native_id'])
+            if row['state']=='launching' and not interrupted_bound:
                 # In-flight launches were excluded above; this is an interrupted dispatch.
                 with self.journal.db:
                     self.journal.db.execute("UPDATE launches SET state='aborting' WHERE operation_id=? AND state='launching'",(row['operation_id'],))
@@ -651,10 +681,14 @@ class Bridge:
                 with self.journal.db:
                     self.journal.db.execute('UPDATE launches SET native_id=? WHERE operation_id=?',(identity,row['operation_id']))
                 row=self.journal.db.execute('SELECT * FROM launches WHERE operation_id=?',(row['operation_id'],)).fetchone()
-            if workspace_available:
-                native = self.lookup(row["native_id"], row)
-            else:
-                native = self.launcher.retired(row["native_id"], dict(row))
+            try:
+                if workspace_available:
+                    native = self.lookup(row["native_id"], row)
+                else:
+                    native = self.launcher.retired(row["native_id"], dict(row))
+            except (RuntimeError, ValueError, OSError, subprocess.SubprocessError):
+                self._report_native_observation(row)
+                continue
             if not native:
                 # Only automatic reconciliation may join a positive tombstone
                 # to the original host launch evidence. Never reuse this for a
@@ -665,11 +699,20 @@ class Bridge:
                 if (matches == 1 and current is not None
                         and all(current[key] == row[key] for key in ('session_id','epoch','digest','native_id','workspace','tag','state'))
                         and callable(getattr(self.launcher, 'retired_origin', None))):
-                    native = self.launcher.retired_origin(row['native_id'], dict(row))
+                    try:
+                        native = self.launcher.retired_origin(row['native_id'], dict(row))
+                    except (RuntimeError, ValueError, OSError, subprocess.SubprocessError):
+                        self._report_native_observation(row)
+                        continue
             if not native:
                 if not workspace_available:
                     self._warn_unavailable_workspace(row)
                 continue  # Missing process is uncertain, never a successful finish.
+            if interrupted_bound:
+                # Do not rewrite an interrupted bound row until identity qualifies.
+                with self.journal.db:
+                    self.journal.db.execute("UPDATE launches SET state='aborting' WHERE operation_id=? AND state='launching'",(row['operation_id'],))
+                row = self.journal.db.execute("SELECT * FROM launches WHERE operation_id=?", (row['operation_id'],)).fetchone()
             phase = native.get("phase", native.get("state"))
             deadline = row['runtime_deadline']
             if row['state']=='running' and type(deadline) is int and int(time.time()*1000)>=deadline and phase!='exited':
@@ -680,7 +723,11 @@ class Bridge:
             if phase != "exited":
                 if row['state'] in {'aborting','deadline_stopping'}:
                     self.native('kill',row['native_id'],allow_failure=True)
-                    native=self.lookup(row['native_id'],row)
+                    try:
+                        native=self.lookup(row['native_id'],row)
+                    except (RuntimeError, ValueError, OSError, subprocess.SubprocessError):
+                        self._report_native_observation(row)
+                        continue
                 if not native or native.get('phase',native.get('state'))!='exited':continue
             if native.get("containment_empty") is not True:
                 continue
@@ -1081,7 +1128,11 @@ class Bridge:
                 self._warn_unavailable_workspace(row)
                 native_id,status,phase=row['native_id'],None,'unknown'
             else:
-                native_id,status=self.resolve_launch_native(row)
+                try:
+                    native_id,status=self.resolve_launch_native(row)
+                except (RuntimeError, ValueError, OSError, subprocess.SubprocessError):
+                    self._report_native_observation(row)
+                    continue
                 phase=str((status or {}).get('phase',(status or {}).get('state',
                     'launching' if row['state']=='launching' else 'missing')))
             activity=(status or {}).get('last_activity_ms',(status or {}).get('updated_at_ms',(status or {}).get('created_at_ms')))
