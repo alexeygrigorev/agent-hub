@@ -2,7 +2,7 @@ import tempfile
 import unittest
 import sys
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, MagicMock, patch
 
 from agent_hub_host.advertisement import Advertisement
 from agent_hub_host.agent import Bridge
@@ -168,3 +168,20 @@ class AdvertisementTests(unittest.TestCase):
         tags = bridge.client.heartbeat.call_args.args[2]
         self.assertTrue({'headless', 'interactive:codex', 'effort:codex'} <= set(tags))
         self.assertEqual(len([tag for tag in tags if tag.startswith('workspace:')]), 80)
+
+
+    def test_large_workspace_inventory_transport_allowance_is_heartbeat_only(self):
+        from agent_hub_host.client import Client
+        import json
+        capabilities = ['workspace:project-' + str(i) + 'x' * 45 for i in range(1125)]
+        body = {'labels': [], 'engines': ['codex'], 'capabilities': capabilities}
+        self.assertGreater(len(json.dumps(body).encode()), 65536)
+        opener = MagicMock()
+        opener.open.return_value.__enter__.return_value.read.return_value = b'{}'
+        with patch('urllib.request.build_opener', return_value=opener):
+            Client('https://hub.test').request('POST', '/api/heartbeat', body)
+        for method, path in [('POST', '/api/sessions'), ('PUT', '/api/heartbeat')]:
+            with self.subTest(path=path), self.assertRaisesRegex(ValueError, 'request too large'):
+                Client('https://hub.test').request(method, path, body)
+        with self.assertRaisesRegex(ValueError, 'request too large'):
+            Client('https://hub.test').request('POST', '/api/heartbeat', {'data': 'x' * 262144})

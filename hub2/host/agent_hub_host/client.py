@@ -124,6 +124,8 @@ class Client:
         payload = None if body is None else json.dumps(body).encode()
         if payload is not None:
             limit = CAPTURE_ACK_BODY_BYTES if method == 'POST' and _capture_ack(path, body) else 65536
+            if method == 'POST' and path == '/api/heartbeat':
+                limit = 262144  # Bounded workspace inventory, independent of captures.
             if len(payload) > limit:
                 raise ValueError("request too large")
             headers["Content-Type"] = "application/json"

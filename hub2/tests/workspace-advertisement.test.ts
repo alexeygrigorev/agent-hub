@@ -31,7 +31,7 @@ function fixture(){
 
 test('large clone inventory reaches routing without dropping engine capabilities',async()=>{
  const f=fixture();try{
-  const workspaces=Array.from({length:100},(_,i)=>'workspace:project-'+i);
+  const workspaces=Array.from({length:1125},(_,i)=>'workspace:project-'+i+'x'.repeat(45));
   const capabilities=['headless','interactive:codex','effort:codex',...workspaces];
   assert.equal((await f.call('/api/heartbeat',{labels:[],engines:['codex'],capabilities})).status,200);
   f.socket('live',1);
@@ -47,7 +47,7 @@ test('large clone inventory reaches routing without dropping engine capabilities
 test('workspace allowance does not widen the ordinary capability or engine bounds',async()=>{
  const f=fixture();try{
   for(const capabilities of [Array.from({length:33},(_,i)=>'tool:item'+i),
-    Array.from({length:513},(_,i)=>'workspace:repo'+i),
+    Array.from({length:2049},(_,i)=>'workspace:repo'+i),
     Array.from({length:33},(_,i)=>'workspace:invalid/'+i)]){
    assert.equal((await f.call('/api/heartbeat',{labels:[],engines:['codex'],capabilities})).status,400);
   }
