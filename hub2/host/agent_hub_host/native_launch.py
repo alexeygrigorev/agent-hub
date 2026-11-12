@@ -17,6 +17,7 @@ from pathlib import Path
 
 from .client import private_file
 from . import provider_home
+from . import claude_goal
 from .provider_home import clean_provider_environment, native_environment, session_binding
 
 FIRST_ACTION_INSTRUCTION = (
@@ -59,7 +60,7 @@ OPENCODE_MODEL = "opencode-go/muse-spark-1.3-contributor"
 PROVIDER_CAPABILITIES = {"shell": {"headless"}, "zai": {"headless", "interactive", "goal", "effort"},
                          "codex": {"headless", "interactive", "goal", "effort"},
                          "go": {"headless", "interactive"},
-                         "claude": {"headless", "interactive", "effort"},
+                         "claude": {"headless", "interactive", "goal", "effort"},
                          "antigravity": {"headless", "interactive", "effort"}}
 PROVIDER_BINARIES = {"zai": "zcodex", "codex": "codex", "go": "opencode", "claude": "claude", "antigravity": "agy"}
 FIRST_ACTION_PROVIDERS = {"zai", "go", "claude", "codex", "antigravity"}
@@ -223,7 +224,7 @@ def interactive_argv(provider, argv, prompt, *, model, effort=None, with_goal=Fa
         raise ValueError('interactive_explicit_model_required')
     if provider not in {'codex', 'zai', 'claude', 'go', 'antigravity'}:
         raise ValueError('interactive_provider_unsupported')
-    if with_goal and provider not in {'codex', 'zai'}:
+    if with_goal and provider not in {'codex', 'zai', 'claude'}:
         raise ValueError('native_goal_provider_unsupported')
     if not argv or argv[-1] != prompt:
         raise ValueError('interactive_adapter_shape_unverified')
@@ -248,7 +249,8 @@ def interactive_argv(provider, argv, prompt, *, model, effort=None, with_goal=Fa
             if effort not in {'low', 'medium', 'high', 'max'}:
                 raise ValueError('interactive_effort_unsupported')
             result += ['--effort', effort]
-        result += ['--prompt-interactive', prompt] if provider == 'antigravity' else [prompt]
+        if not with_goal:
+            result += ['--prompt-interactive', prompt] if provider == 'antigravity' else [prompt]
     else:
         if effort is not None:
             raise ValueError('interactive_effort_unsupported')
@@ -777,6 +779,8 @@ class NativeLauncher:
                                      effort=specification.get("effort"), with_goal=specification.get("with_goal", False))
             if specification.get("with_goal"):
                 objective = goal_prompt(goal, specification["workspace"], task_id, str(fa_path))
+                if provider == 'claude':
+                    child = claude_goal.conversation_argv(child, task_id, specification.get('operation_id'), specification.get('epoch'))
         elif not local:
             if specification.get("effort") is not None:
                 child = headless_effort_argv(provider, child, specification["effort"])
@@ -808,6 +812,10 @@ class NativeLauncher:
             child_env["APLEXER_RETAIN_RETIRED_OUTPUT"] = "1"
         if specification.get("child_config_file"):
             child_env["HUB2_CONFIG"] = specification["child_config_file"]
+        if objective is not None and provider == 'claude':
+            # Pin the same trusted config root for the child and receipt reader,
+            # including local-login hosts whose aplexer daemon has another env.
+            child_env.setdefault('CLAUDE_CONFIG_DIR', os.environ.get('CLAUDE_CONFIG_DIR', str(Path.home() / '.claude')))
         tmpdir = Path(child_env["TMPDIR"])
         tmpdir.mkdir(mode=0o700, parents=True, exist_ok=True)
         argv = [self.native_binary, "start", "--json", "--memory", f"{requested_mb}M",
@@ -816,9 +824,9 @@ class NativeLauncher:
                 "--tag", "task-" + task_id]
         if objective is not None:
             # A literal -- command keeps its argv but does not infer an engine.
-            # Both codex and the zcodex fork use the built-in Codex transcript
-            # family; do not depend on a host-specific zcodex engine/profile.
-            argv += ["--engine", "codex"]
+            # Codex and its zcodex fork share a transcript family; Claude has
+            # its own native delivery/readiness and conversation format.
+            argv += ["--engine", "claude" if provider == 'claude' else "codex"]
         if specification.get("session_id"):
             argv += ["--label", "hub.managed=true", "--label", "hub.session=" + specification["session_id"]]
         if specification.get('attempt_label'):
@@ -869,8 +877,11 @@ class NativeLauncher:
             raise RuntimeError("native_interactive_command_mismatch")
         goal_registration = None
         if objective is not None:
+            if start_json.get('engine') != ('claude' if provider == 'claude' else 'codex'):
+                raise RuntimeError('native_goal_provider_unsupported')
             goal_registration = self.register_goal(start_json, specification, objective,
-                                                   deadline=started + specification["timeout_seconds"])
+                                                   deadline=started + specification["timeout_seconds"],
+                                                   claude_config_dir=child_env.get('CLAUDE_CONFIG_DIR'))
         # Pane creation is the start receipt. First-action proof is observed later;
         # a slow model must not hold the native id behind the server deadline.
         receipt = {"session_id": start_json["id"],
@@ -957,11 +968,12 @@ class NativeLauncher:
             sleep(min(2.0, max(0.0, deadline - time.time())))
         raise RuntimeError("native_first_action_unverified")
 
-    def register_goal(self, start_json, specification, prompt, deadline):
-        """One guarded /goal send plus exact-thread proof (codex-family only)."""
+    def register_goal(self, start_json, specification, prompt, deadline, claude_config_dir=None):
+        """One guarded /goal send plus the exact engine conversation's proof."""
         engine = start_json.get("engine")
-        if engine not in {"codex", "zcodex"} or '\r' in prompt or '\n' in prompt:
+        if engine not in {"codex", "zcodex", "claude"} or '\r' in prompt or '\n' in prompt:
             raise RuntimeError("native_goal_provider_unsupported")
+        read_goal = (lambda row: claude_goal.goal_store(row, claude_config_dir, objective_hash)) if engine == 'claude' else goal_store
         expected = objective_hash(prompt)
         deadline = min(deadline, time.time() + 60)
         row = self.status(start_json["id"], workspace=specification["workspace"])
@@ -975,7 +987,7 @@ class NativeLauncher:
                 raise RuntimeError("native_goal_objective_conflict")
             return proof
 
-        proof = matching(goal_store(row))
+        proof = matching(read_goal(row))
         if proof:
             return proof
         result = self.native("send", start_json["id"], "/goal " + prompt, "--enter", "--json", "--wait-ack", "0",
@@ -991,7 +1003,7 @@ class NativeLauncher:
                 or type(delivery.get("enter_presses")) is not int or not 1 <= delivery["enter_presses"] <= 3):
             raise RuntimeError("native_goal_delivery_unverified")
         while time.time() < deadline:
-            proof = matching(goal_store(row))
+            proof = matching(read_goal(row))
             if proof:
                 return proof
             time.sleep(0.5)
