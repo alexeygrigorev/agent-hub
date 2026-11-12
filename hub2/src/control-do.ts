@@ -311,6 +311,8 @@ export class ControlDO {
     if (path === '/api/engines/version-report' && request.method === 'POST') return await this.reportEngineVersions(request, actor);
     if (path === '/api/engines/sync-report' && request.method === 'POST') return await this.reportEngineSync(request, actor);
     if (path === '/api/engines/' + CLAUDE_ENGINE_LABEL && request.method === 'POST') return await this.acknowledgeEngine(request, actor);
+    if (path === '/api/engines/' + CLAUDE_ENGINE_LABEL + '/generation' && request.method === 'GET')
+      return await this.engineGenerationCheck(request, actor);
     const credentialRoute = path.match(/^\/api\/engines\/hub-claude\/(credential|rejection)$/);
     if (credentialRoute) return await this.engineCredential(request, credentialRoute[1] as 'credential' | 'rejection', actor);
     return error('not_found', 404);
@@ -392,6 +394,29 @@ export class ControlDO {
     return json({ engines: [{ label: CLAUDE_ENGINE_LABEL, provider: 'claude', version, revision,
       files: credential.files, env: {}, args: [], credential_generation: credential.generation,
       credential_paths: ['.claude/.credentials.json'] }], logins: [], latest_version: this.engineRollout().latest });
+  }
+
+  // Host release re-pin: fenced observation that this machine's engine revision
+  // and the account's exact credential generation are still the expected ones.
+  // Never returns credential material, refreshes, leases or acknowledges.
+  private async engineGenerationCheck(request: Request, actor?: Actor): Promise<Response> {
+    if (!actor || actor.kind !== 'machine' || !actor.resource_id) return error('forbidden', 403);
+    const query = new URL(request.url).searchParams;
+    const keys = [...query.keys()].sort();
+    const raw = query.get('generation') || '', revision = query.get('revision') || '';
+    if (keys.length !== 2 || keys[0] !== 'generation' || keys[1] !== 'revision' || !/^[1-9][0-9]{0,15}$/.test(raw)
+      || !Number.isSafeInteger(Number(raw)) || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(revision))
+      return error('invalid_generation_check', 400);
+    const generation = Number(raw);
+    if (await this.engineRevision(this.engineVersionFor(actor.resource_id)) !== revision) return error('revision_changed', 409);
+    const response = await this.accountRequest('/api/account/credentials?expected_generation=' + generation, 'GET', actor);
+    if (!response.ok) return response;
+    const observed = await response.json() as any;
+    if (observed?.generation !== generation || observed?.status !== 'current' || observed?.provider !== 'claude')
+      return error('generation_conflict', 409);
+    // Rollout state may change while the account request is awaited.
+    if (await this.engineRevision(this.engineVersionFor(actor.resource_id)) !== revision) return error('revision_changed', 409);
+    return json({ label: CLAUDE_ENGINE_LABEL, generation, revision, status: 'current' });
   }
 
   private async engineAdmission(request: Request, actor?: Actor): Promise<Response> {

@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import urllib.parse
 import urllib.request
 
@@ -17,7 +18,11 @@ def _https_origin(base):
         raise ValueError(_ENROLLMENT_ERROR)
 
 
-def _bind(operator_base, *, execution=False):
+_REPIN_GENERATION = re.compile(r'/api/engines/hub-claude/generation\?generation=[1-9][0-9]{0,15}'
+                               r'&revision=[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\Z')
+
+
+def _bind(operator_base, *, execution=False, repin=False):
     """Pin host identity and transport separately from the operator profile.
 
     HUB2_CONFIG is a per-worker selector, never host enrollment authority.
@@ -41,6 +46,7 @@ def _bind(operator_base, *, execution=False):
                     pass  # Only proven absence permits the legacy profile.
                 else:
                     current_selected = True
+        execution = execution or repin
         if execution and (not current_selected or explicit):
             raise ValueError(_ENROLLMENT_ERROR)
         path = current if current_selected else config.get_host_config_path()
@@ -73,13 +79,19 @@ def _bind(operator_base, *, execution=False):
     base = base.rstrip('/')
 
     def request(method, path, payload=None):
+        if repin:
+            # Release re-pin: one fenced metadata observation and the strict
+            # generation ACK. No credential, admission, sync or refresh route.
+            if not ((method == 'GET' and _REPIN_GENERATION.fullmatch(path))
+                    or (method, path) == ('POST', '/api/engines/sync-report')):
+                raise ValueError('Native import host engine API path required')
         allowed = ((('GET', '/api/engines/hub-claude/credential'),
                     ('POST', '/api/engines/hub-claude/credential'),
                     ('POST', '/api/engines/admission'),
                     ('POST', '/api/engines/sync-report')) if execution else (
                     ('GET', '/api/engines/sync'), ('POST', '/api/engines/hub-claude'),
                     ('POST', '/api/engines/sync-report')))
-        if (method, path) not in allowed:
+        if not repin and (method, path) not in allowed:
             raise ValueError('Native import host engine API path required')
         if execution and method == 'POST':
             if path.endswith('/admission') and payload != {'label': 'hub-claude', 'native': True}:
@@ -109,3 +121,8 @@ def bind(operator_base):
 def bind_managed_claude(operator_base):
     """Current enrolled v2 host only; no import, login or refresh authority."""
     return _bind(operator_base, execution=True)
+
+
+def bind_managed_claude_repin(operator_base):
+    """Current enrolled v2 host only: exact-generation check and strict ACK."""
+    return _bind(operator_base, repin=True)

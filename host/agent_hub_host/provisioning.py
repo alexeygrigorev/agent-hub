@@ -2150,13 +2150,19 @@ def _rmtree_managed(entry: Path) -> None:
     shutil.rmtree(entry, onerror=_on_rm_error)
 
 
-def scoped_profile(bundle):
-    """Change one generated Claude table, preserving all unrelated raw text."""
+def scoped_profile(bundle, *, expected_text=None):
+    """Change one generated Claude table, preserving all unrelated raw text.
+
+    ``expected_text`` makes publication a compare-and-set against the exact
+    document a release re-pin validated under the same managed lock.
+    """
     path=profile_path()
     try:
         text=private_fs.read_bytes(path,262144).decode()
     except FileNotFoundError:
         text='version = 1\n'
+    if expected_text is not None and text!=expected_text:
+        raise ValueError('Managed profile changed during scoped re-pin')
     if text.count(BEGIN)!=text.count(END) or text.count(BEGIN)>1:
         raise ValueError('Invalid managed profile block')
     original=tomllib.loads(text)
@@ -2213,6 +2219,8 @@ def scoped_profile(bundle):
         raise ValueError('Scoped profile would change unrelated TOML semantics')
     with private_fs.parent(path,create=True):
         pass
+    if expected_text is not None and private_fs.read_bytes(path,262144).decode()!=expected_text:
+        raise ValueError('Managed profile changed during scoped re-pin')
     private_fs.atomic_write(path,updated.encode(),262144)
 
 

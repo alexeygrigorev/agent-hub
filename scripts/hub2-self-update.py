@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from urllib.parse import urlsplit
 from urllib.request import urlopen
 
@@ -244,6 +245,300 @@ def repair_service_files(base, manifest, root, target):
     command(['systemctl', '--user', 'daemon-reload'])
 
 
+# Managed Claude release re-pin (see agent_hub_host.managed_claude_repin).
+MANAGED_PROFILE = 'hub-hub-claude'
+REPIN_JOURNAL = 'managed-claude-repin.json'
+REPIN_TIMEOUT = 120
+REPIN_LOCK_TIMEOUT = 30
+REPIN_BOOT = ('import sys; sys.path.insert(0, sys.argv[1]); '
+              'from agent_hub_host.managed_claude_repin import main; raise SystemExit(main(sys.argv[1:]))')
+# Selectors and tokens never reach the helper; it binds the current enrollment.
+REPIN_ENV_DROP = ('HUB_CONFIG_FILE', 'HUB2_CONFIG', 'HUB_TOKEN', 'HUB2_TOKEN', 'HUB_JOB_TOKEN', 'HUB_URL',
+                  'HUB_BASE_URL', 'APLEXER_TAG', 'APLEXER_WORKSPACE', 'APLEXER_SESSION_ID')
+MANAGED_BEGIN = '# BEGIN HUB MANAGED ENGINES\n'
+MANAGED_END = '# END HUB MANAGED ENGINES\n'
+MANAGED_HEADING = '[profiles.' + MANAGED_PROFILE + ']\n'
+
+
+def managed_profile_path():
+    # Same selection as provisioning.profile_path on the supported Linux hosts.
+    explicit = os.environ.get('APLEXER_CONFIG')
+    if explicit:
+        return Path(explicit)
+    return Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'aplexer' / 'config.toml'
+
+
+def managed_claude_configured():
+    """Cheap local pre-check; the verified release helper decides strictly."""
+    try:
+        with managed_profile_path().open('rb') as stream:
+            raw = stream.read(262145)
+    except FileNotFoundError:
+        return False
+    return MANAGED_PROFILE.encode() in raw
+
+
+def read_repin_journal(journal):
+    if journal.is_symlink() or not journal.is_file():
+        raise ValueError('invalid managed Claude re-pin journal')
+    with journal.open('rb') as stream:
+        raw = stream.read(65537)
+    state = json.loads(raw) if len(raw) <= 65536 else None
+    keys = {'schema', 'release', 'previous_release', 'profile_path', 'managed_root', 'previous_command',
+            'command', 'generation', 'revision', 'verified'}
+    if (not isinstance(state, dict) or set(state) != keys or state['schema'] != 1
+            or any(not isinstance(state[k], str) or not re.fullmatch(r'[0-9a-f]{40}', state[k])
+                   for k in ('release', 'previous_release'))
+            or any(not isinstance(state[k], str) or not Path(state[k]).is_absolute() for k in ('profile_path', 'managed_root'))
+            or any(not isinstance(state[k], list) or not state[k] or not all(isinstance(v, str) for v in state[k])
+                   for k in ('previous_command', 'command'))
+            or type(state['generation']) is not int or state['generation'] < 1
+            or not isinstance(state['revision'], str) or not re.fullmatch(r'[a-f0-9-]{36}', state['revision'])
+            or type(state['verified']) is not bool):
+        raise ValueError('invalid managed Claude re-pin journal')
+    return state
+
+
+@contextlib.contextmanager
+def managed_lock(managed_root):
+    """The provisioning reconcile lock, bounded; never created or replaced here."""
+    fd = os.open(managed_root / 'reconcile.lock', os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        deadline = time.monotonic() + REPIN_LOCK_TIMEOUT
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('managed Claude lock timeout') from None
+                time.sleep(0.1)
+        yield
+    finally:
+        os.close(fd)
+
+
+def managed_owner_matches(state):
+    """Generation/ownership fence: the receipt the re-pin verified is still current."""
+    root = Path(state['managed_root'])
+    try:
+        rows = json.loads((root / 'state.json').read_bytes())
+        rows = [row for row in rows if isinstance(row, dict) and row.get('label') == 'hub-claude']
+        if len(rows) != 1 or rows[0].get('revision') != state['revision'] or rows[0].get('provider') != 'claude':
+            return False
+        credential = json.loads((root / ('hub-claude-' + state['revision']) / 'credential-state.json').read_bytes())
+    except (OSError, ValueError, TypeError):
+        return False
+    return isinstance(credential, dict) and type(credential.get('generation')) is int and credential['generation'] == state['generation']
+
+
+def restore_profile_pin(state):
+    """Compare-and-set the one managed command back; never a blanket restore."""
+    path = Path(state['profile_path'])
+    try:
+        text = path.read_bytes().decode()
+    except FileNotFoundError:
+        return 'superseded'
+    if not managed_owner_matches(state):
+        return 'superseded'
+    published = 'command = ' + json.dumps(state['command'])
+    previous = 'command = ' + json.dumps(state['previous_command'])
+    if text.count(MANAGED_BEGIN) != 1 or text.count(MANAGED_END) != 1:
+        return 'superseded'
+    before, rest = text.split(MANAGED_BEGIN)
+    marked, after = rest.split(MANAGED_END)
+    sections = re.split(r'(?m)(?=^\[)', marked)
+    targets = [index for index, section in enumerate(sections) if section.startswith(MANAGED_HEADING)]
+    if len(targets) != 1:
+        return 'superseded'
+    lines = sections[targets[0]].split('\n')
+    if lines[1:3] == ['engine = "claude"', previous]:
+        return 'restored'
+    if lines[1:3] != ['engine = "claude"', published] or any(line.strip() for line in lines[3:]):
+        return 'superseded'
+    lines[2] = previous
+    sections[targets[0]] = '\n'.join(lines)
+    updated = before + MANAGED_BEGIN + ''.join(sections) + MANAGED_END + after
+    original, proposed = tomllib.loads(text), tomllib.loads(updated)
+    if (original['profiles'][MANAGED_PROFILE]['command'] != state['command']
+            or proposed['profiles'][MANAGED_PROFILE]['command'] != state['previous_command']):
+        return 'superseded'
+    proposed['profiles'][MANAGED_PROFILE]['command'] = state['command']
+    if proposed != original:
+        return 'superseded'
+    if path.read_bytes().decode() != text:
+        return 'superseded'
+    durable_write(path, updated.encode(), 0o600)
+    return 'restored'
+
+
+def restore_managed_claude(root):
+    """Undo an unverified or rolled-back re-pin, preserving newer owners."""
+    journal = root / REPIN_JOURNAL
+    if not (journal.exists() or journal.is_symlink()):
+        return None
+    state = read_repin_journal(journal)
+    with managed_lock(Path(state['managed_root'])):
+        outcome = restore_profile_pin(state)
+    journal.unlink()
+    sync_directory(root)
+    return outcome
+
+
+def mark_repin_verified(root):
+    journal = root / REPIN_JOURNAL
+    if journal.exists() or journal.is_symlink():
+        state = read_repin_journal(journal)
+        state['verified'] = True
+        durable_write(journal, json.dumps(state, sort_keys=True).encode(), 0o600)
+        sync_directory(root)
+
+
+def commit_repin(root):
+    journal = root / REPIN_JOURNAL
+    if journal.exists() or journal.is_symlink():
+        read_repin_journal(journal)
+        journal.unlink()
+        sync_directory(root)
+
+
+def recover_repin(root, releases):
+    """Before release recovery: keep only a verified pin of the committed release."""
+    journal = root / REPIN_JOURNAL
+    if not (journal.exists() or journal.is_symlink()):
+        return
+    state = read_repin_journal(journal)
+    release = release_path(releases, state['release'])
+    current = root / 'current'
+    committed = (state['verified'] and current.is_symlink() and current.resolve() == release
+                 and not (release / '.installing').exists() and not (root / 'retained-switch.json').exists())
+    if committed:
+        commit_repin(root)
+    else:
+        restore_managed_claude(root)
+
+
+UPDATER_ROLLBACK = 'updater-rollback.json'
+
+
+def release_updater(base, manifest, root):
+    """This release's verified updater bytes; reuse the installed copy when exact."""
+    record = manifest['artifacts']['hub2-self-update.py']
+    if matches_installed_artifact(root / 'updater.py', record):
+        return (root / 'updater.py').read_bytes()
+    return verified_artifact(base, 'hub2-self-update.py', record)
+
+
+def advance_updater(root, release, data):
+    """Make journal-aware recovery code durably reachable before any profile write.
+
+    An older updater would treat the candidate as an interrupted release and
+    remove it while the profile still named it. The previous bytes are kept
+    until the re-pin commits or its journal is resolved.
+    """
+    path, record = root / 'updater.py', root / UPDATER_ROLLBACK
+    if record.exists() or record.is_symlink():
+        raise ValueError('updater rollback pending; explicit recovery required')
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise ValueError('refusing to replace an unmanaged updater')
+    previous = path.read_bytes() if path.is_file() else None
+    if previous == data:
+        return
+    write_json(record, {'release': release, 'previous': None if previous is None else previous.hex()})
+    sync_directory(root)
+    durable_write(path, data, 0o700)
+    sync_directory(root)
+
+
+def read_updater_rollback(record):
+    if record.is_symlink() or not record.is_file():
+        raise ValueError('invalid updater rollback record')
+    state = json.loads(record.read_bytes()[:4 * MAX_ARTIFACT])
+    if (not isinstance(state, dict) or set(state) != {'release', 'previous'}
+            or not isinstance(state['release'], str) or not re.fullmatch(r'[0-9a-f]{40}', state['release'])
+            or state['previous'] is not None and (not isinstance(state['previous'], str)
+                                                  or not re.fullmatch(r'(?:[0-9a-f]{2})+', state['previous']))):
+        raise ValueError('invalid updater rollback record')
+    return state
+
+
+def restore_updater(root):
+    """Only after the pin journal is resolved; never strands a published pin."""
+    record = root / UPDATER_ROLLBACK
+    if not (record.exists() or record.is_symlink()):
+        return
+    if (root / REPIN_JOURNAL).exists() or (root / REPIN_JOURNAL).is_symlink():
+        raise RuntimeError('managed Claude pin restore pending')
+    state = read_updater_rollback(record)
+    if state['previous'] is None:
+        (root / 'updater.py').unlink(missing_ok=True)
+    else:
+        durable_write(root / 'updater.py', bytes.fromhex(state['previous']), 0o700)
+    sync_directory(root)
+    record.unlink()
+    sync_directory(root)
+
+
+def commit_updater(root):
+    record = root / UPDATER_ROLLBACK
+    if record.exists() or record.is_symlink():
+        read_updater_rollback(record)
+        record.unlink()
+        sync_directory(root)
+
+
+def recover_updater(root, releases):
+    record = root / UPDATER_ROLLBACK
+    if not (record.exists() or record.is_symlink()):
+        return
+    release = release_path(releases, read_updater_rollback(record)['release'])
+    current = root / 'current'
+    if (current.is_symlink() and current.resolve() == release and not (release / '.installing').exists()
+            and not (root / 'retained-switch.json').exists()):
+        commit_updater(root)
+    else:
+        restore_updater(root)
+
+
+def repin_managed_claude(target, base, root, updater):
+    """Re-pin an already-configured managed Claude target to this verified release.
+
+    ``updater`` returns this release's verified updater bytes; it is installed
+    before the helper can publish anything.
+    """
+    if not managed_claude_configured():
+        return None
+    journal = root / REPIN_JOURNAL
+    if journal.exists() or journal.is_symlink():
+        raise ValueError('managed Claude re-pin journal requires recovery')
+    installed = read_release_receipt(target)
+    if installed['host_version'] != target.name:
+        raise ValueError('installed release receipt does not match release directory')
+    archive = target / 'hub.pyz'
+    if not matches_installed_artifact(archive, installed['artifacts']['hub.pyz']):
+        raise ValueError('installed release artifact mismatch: hub.pyz')
+    advance_updater(root, target.name, updater())
+    env = {key: value for key, value in os.environ.items()
+           if key not in REPIN_ENV_DROP and not key.startswith('PYTHON')}
+    lock_fd = UPDATE_LOCK_FD.get()
+    try:
+        result = subprocess.run([str(target / 'bin/python'), '-I', '-S', '-c', REPIN_BOOT, str(archive), 'repin',
+                                 base, str(journal)], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, timeout=REPIN_TIMEOUT, env=env, cwd=str(root),
+                                pass_fds=() if lock_fd is None else (lock_fd,))
+        status = json.loads(result.stdout) if result.returncode == 0 and len(result.stdout) <= 4096 else None
+    except (ValueError, OSError, subprocess.TimeoutExpired):
+        status = None
+    pending = journal.exists() or journal.is_symlink()
+    if (not isinstance(status, dict) or status.get('status') not in ('absent', 'current', 'repinned')
+            or pending != (status['status'] == 'repinned')):
+        restore_managed_claude(root)
+        raise RuntimeError('managed Claude re-pin not verified')
+    if pending:
+        mark_repin_verified(root)
+    return status['status']
+
+
 def release_path(releases, name):
     if not isinstance(name, str) or not re.fullmatch(r'[0-9a-f]{40}', name):
         raise ValueError('invalid retained release identity')
@@ -447,14 +742,27 @@ def reactivate_retained_release(base, manifest, host_wheel, root, releases, old,
             check_service_ready(target)
             if json.loads(fetch(base + 'host-release.json', MAX_MANIFEST)) != manifest:
                 raise ValueError('published host release changed during retained activation')
+            # Same canonical generation, verified readiness and recorded ACK.
+            repin_managed_claude(target, base.removesuffix('/cli/'), root,
+                                 lambda: release_updater(base, manifest, root))
             link(old, previous_link)
             sync_directory(root)
         except BaseException:
+            # Restore the pin before the release links and directories move back.
+            # If it cannot be restored, keep the candidate, its backup and both
+            # journals for the next recovery rather than strand the pin.
+            try:
+                restore_managed_claude(root)
+            except Exception:
+                raise RuntimeError('managed Claude pin restore pending') from None
+            restore_updater(root)
             restore_retained_switch(root, releases, journal)
             raise
         # Keep the updater that understands this journal available after rollback.
         committed = root / 'retained-switch-committed.json'
         journal.rename(committed)
+        commit_repin(root)
+        commit_updater(root)
         finish_retained_switch(root, releases, committed)
 
 
@@ -467,6 +775,7 @@ def recover(root, releases):
             dest = path.resolve()
             if dest.parent == releases and re.fullmatch(r'[0-9a-f]{40}', dest.name):
                 path.unlink()
+    recover_repin(root, releases)
     journal = root / 'retained-switch.json'
     if journal.exists() or journal.is_symlink():
         restore_retained_switch(root, releases, journal)
@@ -491,6 +800,7 @@ def recover(root, releases):
                 current.unlink()
         failure(root, target.name)
         shutil.rmtree(target)
+    recover_updater(root, releases)
 
 
 def restore_units(target):
@@ -640,6 +950,11 @@ def install(base_url, root, *, install_service=False, restart=True):
                     command(['systemctl', '--user', 'restart', UNITS[0]])
                     check_service_ready(target)
                     enable_service_timer()
+            # Heal a pin left on an older release; nothing else to roll back.
+            repin_managed_claude(target, base_url.rstrip('/'), root,
+                                 lambda: release_updater(base, manifest, root))
+            commit_repin(root)
+            commit_updater(root)
             print('Hub2 release already current: ' + version)
             return
         if target.exists() or target.is_symlink():
@@ -684,6 +999,8 @@ def install(base_url, root, *, install_service=False, restart=True):
                 if restart:
                     command(['systemctl', '--user', 'restart', 'agent-hub2-host.service'])
                     check_service_ready(target)
+                repin_managed_claude(target, base_url.rstrip('/'), root,
+                                     lambda: (download / 'hub2-self-update.py').read_bytes())
                 # Replace the updater only after successful activation.
                 updater = root / 'updater.py.next'
                 shutil.copyfile(download / 'hub2-self-update.py', updater)
@@ -691,6 +1008,15 @@ def install(base_url, root, *, install_service=False, restart=True):
                 updater.replace(root / 'updater.py')
                 (target / '.installing').unlink()
             except BaseException:
+                # A failed restore keeps the candidate, its marker, the journal
+                # and the advanced updater for the next recovery.
+                try:
+                    restore_managed_claude(root)
+                    pin_restored = True
+                except Exception:
+                    pin_restored = False
+                if pin_restored:
+                    restore_updater(root)
                 failure(root, version)
                 restore_units(target)
                 if activated:
@@ -703,13 +1029,19 @@ def install(base_url, root, *, install_service=False, restart=True):
                             with contextlib.suppress(Exception):
                                 command(['systemctl', '--user', 'stop', 'agent-hub2-host.service'])
                         current.unlink()
+                if not pin_restored:
+                    raise RuntimeError('managed Claude pin restore pending') from None
                 raise
             finally:
-                # Remove only the new failed environment created by this call.
-                if not current.is_symlink() or current.resolve() != target:
+                # Remove only the new failed environment created by this call,
+                # and never while a published pin may still name it.
+                if ((not current.is_symlink() or current.resolve() != target)
+                        and not (root / REPIN_JOURNAL).exists()):
                     shutil.rmtree(target)
         # Release activation and updater publication are committed. If enabling
         # the timer fails, leave that working pair in place for same-version retry.
+        commit_repin(root)
+        commit_updater(root)
         if install_service and restart:
             enable_service_timer()
         prune(root, releases)
