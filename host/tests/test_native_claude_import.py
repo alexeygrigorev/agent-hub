@@ -426,6 +426,82 @@ class NativeImportTest(unittest.TestCase):
         self.v2.unlink()
         with self.assertRaises(ValueError):h.bind_managed_claude('https://hub.test')
 
+    def test_trusted_exec_under_v2_native_tag_keeps_ordinary_worker_denial(self):
+        from agent_hub_host import config, worker_auth
+        tag='task-hub2-11111111-2222-4333-8444-555555555555'
+        with patch.dict(os.environ, {'APLEXER_TAG':tag,'HUB2_CONFIG':''}), \
+                patch.object(h.api,'safe_http_json',return_value={}) as transport:
+            machine,send=h.bind_managed_claude('https://hub.test')
+            self.assertEqual(os.environ['APLEXER_TAG'],tag)
+            self.assertEqual(machine,'test-host')
+            send('GET','/api/engines/hub-claude/credential')
+            send('POST','/api/engines/hub-claude/credential',{'revision':'synthetic'})
+            send('POST','/api/engines/admission',{'label':'hub-claude','native':True})
+            send('POST','/api/engines/sync-report',{'state':'synced','items':[
+                {'label':'hub-claude','revision':'synthetic','state':'installed','credential_generation':1}]})
+            for method,path in [('GET','/api/sessions'),('GET','/api/engines/sync'),
+                    ('GET','/api/engines/hub-claude/credential?other=1'),('DELETE','/api/engines/hub-claude/credential')]:
+                with self.subTest(path=path),self.assertRaises(ValueError):send(method,path)
+            self.assertEqual(transport.call_count,4)
+            for call in transport.call_args_list:
+                self.assertTrue(call.args[0].full_url.startswith('https://hub.test/api/engines/'))
+                self.assertEqual(call.args[0].get_header('Authorization'),'Bearer synthetic-host-token')
+            with self.assertRaises(worker_auth.WorkerContextError):config._load_from(self.v2)
+            with self.assertRaises(ValueError):h.bind('https://hub.test')
+            self.assertEqual(transport.call_count,4)
+
+    def test_trusted_exec_preserves_real_profile_test_guard_before_any_read(self):
+        from agent_hub_host import config
+        with patch.dict(os.environ, {'APLEXER_TAG':'task-hub2-11111111-2222-4333-8444-555555555555',
+                'HUB2_CONFIG':'',config.TEST_GUARD_HOME_ENV:str(self.home)}), \
+                patch.object(h.private_fs,'read_bytes') as read,patch.object(h.api,'safe_http_json') as transport:
+            with self.assertRaises(ValueError):h.bind_managed_claude('https://hub.test')
+            read.assert_not_called()
+            transport.assert_not_called()
+
+    def test_exec_ignores_worker_selector_but_never_accepts_explicit_or_legacy_override(self):
+        worker=self.home/'malicious-worker.json'
+        self.profile(worker,dict(self.enrollment,server='https://wrong.test',token='synthetic-wrong-token'))
+        with patch.dict(os.environ, {'APLEXER_TAG':'task-hub2-11111111-2222-4333-8444-555555555555',
+                'HUB2_CONFIG':str(worker)}),patch.object(h.api,'safe_http_json',return_value={}) as transport:
+            _,send=h.bind_managed_claude('https://hub.test')
+            send('GET','/api/engines/hub-claude/credential')
+            self.assertEqual(transport.call_args.args[0].get_header('Authorization'),'Bearer synthetic-host-token')
+            with patch.dict(os.environ,{'HUB_CONFIG_FILE':str(self.v2)}):
+                with self.assertRaises(ValueError):h.bind_managed_claude('https://hub.test')
+            self.v2.unlink()
+            with self.assertRaises(ValueError):h.bind_managed_claude('https://hub.test')
+            self.assertEqual(transport.call_count,1)
+
+    def test_exec_fixed_enrollment_still_refuses_malicious_metadata_and_unsafe_files(self):
+        tag='task-hub2-11111111-2222-4333-8444-555555555555'
+        with patch.dict(os.environ,{'APLEXER_TAG':tag,'HUB2_CONFIG':''}), \
+                patch.object(h.api,'safe_http_json') as transport:
+            for fields in [{'client_kind':'human'},{'client_kind':'worker'},{'worker':{}},
+                    {'worker_launch_id':'synthetic-worker'},{'machine_id':'invalid machine'},
+                    {'server':'http://hub.test'},{'server':'https://wrong.test'},
+                    {'token':''},{'token':'synthetic\nsecret'}]:
+                with self.subTest(fields=fields):
+                    self.profile(self.v2,dict(self.enrollment,**fields))
+                    with self.assertRaises(ValueError) as error:h.bind_managed_claude('https://hub.test')
+                    self.assertEqual(str(error.exception),h._ENROLLMENT_ERROR)
+            self.profile(self.v2,self.enrollment)
+            for fault in ['mode','hardlink','symlink','oversize','deep_json','invalid_json']:
+                with self.subTest(fault=fault):
+                    linked=self.home/'synthetic-linked'
+                    if fault=='mode':self.v2.chmod(0o640)
+                    elif fault=='hardlink':os.link(self.v2,linked)
+                    elif fault=='symlink':self.v2.rename(linked);self.v2.symlink_to(linked)
+                    elif fault=='oversize':self.v2.write_bytes(b'x'*(1024*1024+1))
+                    elif fault=='deep_json':self.v2.write_bytes(b'['*2000+b'0'+b']'*2000)
+                    else:self.v2.write_bytes(b'[]')
+                    with self.assertRaises(ValueError) as error:h.bind_managed_claude('https://hub.test')
+                    self.assertEqual(str(error.exception),h._ENROLLMENT_ERROR)
+                    if self.v2.is_symlink():self.v2.unlink()
+                    linked.unlink(missing_ok=True)
+                    self.profile(self.v2,self.enrollment)
+            transport.assert_not_called()
+
     def test_cli_dispatch(self):
         parser = argparse.ArgumentParser()
         p.add_commands(parser.add_subparsers(dest='cmd'))

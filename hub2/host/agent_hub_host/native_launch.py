@@ -944,10 +944,10 @@ class NativeLauncher:
                            profile='hub-hub-claude', task_id=task_id, server=specification['client'].base_url,
                            exec_archive_sha256=ready['sha256'])
             token = hashlib.sha256(canonical(context).encode()).hexdigest()
-            path = self.journal.directory / 'managed-claude' / (token + '.json')
-            save_config(path, context)
-            specification['_managed_exec_context'] = str(path)
-            args.append('--hub-managed-claude-context=' + str(path))
+            context_path = self.journal.directory / 'managed-claude' / (token + '.json')
+            save_config(context_path, context)
+            specification['_managed_exec_context'] = str(context_path)
+            args.append('--hub-managed-claude-context=' + str(context_path))
         effort = specification.get('effort')
         if effort is not None:
             args += headless_effort_argv(provider, ['prompt'], effort)[:-1]

@@ -5,7 +5,7 @@ from pathlib import Path
 import urllib.parse
 import urllib.request
 
-from . import api, config
+from . import api, config, private_fs
 
 _ENROLLMENT_ERROR = 'Native import requires HTTPS and an enrolled host on the same Hub'
 
@@ -44,7 +44,17 @@ def _bind(operator_base, *, execution=False):
         if execution and (not current_selected or explicit):
             raise ValueError(_ENROLLMENT_ERROR)
         path = current if current_selected else config.get_host_config_path()
-        host = config._load_from(path)  # bounded, owned, private, no-follow
+        if execution:
+            # Trusted provider execution reads only current v2 enrollment. The
+            # ordinary profile loader must continue refusing native workers.
+            config._forbid_real_user_profile(current)
+            try:
+                host = config._validate_data(json.loads(private_fs.read_bytes(current, 1024 * 1024)))
+            except Exception:
+                # Match the ordinary loader's parse failures without fallback.
+                raise ValueError(_ENROLLMENT_ERROR) from None
+        else:
+            host = config._load_from(path)  # bounded, owned, private, no-follow
         is_v2 = current_selected or 'server' in host or 'token' in host
         base = host.get('server' if is_v2 else 'base_url')
         token = host.get('token' if is_v2 else 'access_token')
