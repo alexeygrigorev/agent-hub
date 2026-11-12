@@ -9,11 +9,16 @@ account, label or profile. The daemon acknowledges only after this reports the
 exact generation the consumer now holds.
 
 Under the provisioning lock every managed writer and exec reader holds, it
-checks the canonical state row, receipt and aplexer profile, then writes with
-the maintained scoped writer (``credentials.materialize_current``: file first,
-digest state last; older or equal-but-changed generations are refused) and
-publishes the receipt copy exactly as scoped ``install`` does, so the
-offline-fallback copy can never revert to an older generation.
+checks the canonical state row and receipt and that the managed aplexer
+profile is exactly the command this verified release generates (interpreter,
+archive and managed root, via ``managed_exec_readiness``). It then publishes
+the receipt copy first and only afterwards the home file and digest state
+(``credentials.materialize_current``: file first, state last; older or
+equal-but-changed generations are refused before anything is written). The
+receipt is therefore never older than the home: a failure or kill between the
+two steps leaves the offline fallback (``refresh_launch_credential`` ->
+``reconcile`` of the receipt) moving forward, never reverting a delivered
+generation.
 
 Output is one JSON object on stdout. Exit 0 means ``absent`` (no managed
 hub-claude consumer here, nothing written), ``in_step`` or ``materialized``.
@@ -57,8 +62,9 @@ def _read_request(stream):
     return request
 
 
-def _profile_present():
-    """The canonical managed aplexer profile actually runs this home."""
+def _profile_present(archive):
+    """The managed profile exists and is exactly this release's generated
+    command bound to this managed root. Caller holds the provisioning lock."""
     try:
         text = private_fs.read_bytes(provisioning.profile_path(), 262144).decode()
     except FileNotFoundError:
@@ -66,9 +72,15 @@ def _profile_present():
     except (OSError, ValueError):
         raise Refused('profile_unreadable') from None
     try:
-        return managed_claude_repin._profile_table(text) is not None
+        if managed_claude_repin._profile_table(text) is None:
+            return False
     except managed_claude_repin.Refused as refused:
         raise Refused(str(refused)) from None
+    try:
+        provisioning.managed_exec_readiness(archive)
+    except (OSError, ValueError, TypeError, KeyError):
+        raise Refused('profile_unverified') from None
+    return True
 
 
 def _receipt(revision):
@@ -101,38 +113,55 @@ def _receipt(revision):
     return dest, receipt
 
 
-def deliver(request):
+def deliver(archive, request):
     with provisioning.lock(timeout=LOCK_TIMEOUT_S, bounded=True):
         found = _receipt(request['revision'])
-        if found is None or not _profile_present():
+        if found is None or not _profile_present(archive):
             return {'status': 'absent'}
         dest, receipt = found
         generation = request['generation']
+        # A fault after the receipt step can leave the receipt ahead of the
+        # digest state; never move the receipt backwards or swap material
+        # within one generation.
+        held = receipt.get('credential_generation')
+        if held is not None and (type(held) is not int or held > generation or (
+                held == generation and (receipt.get('files') or {}).get(CREDENTIAL_PATH)
+                != request['files'][CREDENTIAL_PATH])):
+            raise Refused('generation_refused')
         files = dict(receipt.get('files') or {})
         files[CREDENTIAL_PATH] = request['files'][CREDENTIAL_PATH]
         bundle = dict(receipt, credential_generation=generation, files=files)
+        home = dest / 'home'
         try:
             provisioning.validate(bundle)
-            outcome = credentials.materialize_current(bundle, dest / 'home', dest, generation)
+            # Refuse older or equal-but-changed generations before any write.
+            credentials.materialize_current(bundle, home, dest, generation, check_only=True)
+        except (OSError, ValueError, TypeError, KeyError):
+            raise Refused('generation_refused') from None
+        try:
+            # Receipt first: it is never older than the home it backs.
+            if provisioning.load_bundle(dest) != bundle:
+                provisioning.save_bundle(dest, bundle)
+        except (OSError, ValueError, TypeError):
+            raise Refused('receipt_publication_failed') from None
+        try:
+            outcome = credentials.materialize_current(bundle, home, dest, generation)
         except (OSError, ValueError, TypeError, KeyError):
             raise Refused('generation_refused') from None
         if (not isinstance(outcome, dict) or outcome.get('generation') != generation
                 or outcome.get('status') not in ('in_step', 'materialized')):
             raise Refused('generation_refused')
-        try:
-            if provisioning.load_bundle(dest) != bundle:
-                provisioning.save_bundle(dest, bundle)
-        except (OSError, ValueError, TypeError):
-            raise Refused('receipt_publication_failed') from None
         return {'status': outcome['status'], 'generation': generation, 'revision': request['revision']}
 
 
 def main(argv, stdin=None):
+    """argv: [<verified hub.pyz this helper runs from>, 'materialize']."""
     try:
-        if list(argv) != ['materialize']:
+        argv = list(argv)
+        if len(argv) != 2 or argv[1] != 'materialize' or not isinstance(argv[0], str) or not argv[0].startswith('/'):
             raise Refused('invalid_arguments')
         stream = stdin if stdin is not None else sys.stdin.buffer
-        result, code = deliver(_read_request(stream)), 0
+        result, code = deliver(argv[0], _read_request(stream)), 0
     except Refused as refused:
         result, code = {'status': 'refused', 'reason': str(refused)}, 3
     except TimeoutError:

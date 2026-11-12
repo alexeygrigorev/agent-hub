@@ -37,7 +37,7 @@ def main(argv):
     if mode == 'sleep':
         time.sleep(30)
     request = json.loads(sys.stdin.read(32768))
-    if argv != ['materialize']:
+    if argv[1:] != ['materialize'] or Path(argv[0]).resolve() != Path(__file__).resolve().parents[1]:
         print(json.dumps({'status': 'refused', 'reason': 'invalid_arguments'})); return 3
     if mode == 'absent':
         print(json.dumps({'status': 'absent'})); return 0

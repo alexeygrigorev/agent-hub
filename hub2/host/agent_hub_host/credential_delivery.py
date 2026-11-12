@@ -45,7 +45,7 @@ _CODE = re.compile(r'[a-z0-9_]{1,64}\Z')
 _LOCK = threading.Lock()
 # Runs only the verified bundled CLI module; never this daemon's package.
 HELPER_BOOT = ('import sys; sys.path.insert(0, sys.argv[1]); '
-               'from agent_hub_host.managed_claude_deliver import main; raise SystemExit(main(sys.argv[2:]))')
+               'from agent_hub_host.managed_claude_deliver import main; raise SystemExit(main(sys.argv[1:]))')
 HELPER_ENV_DROP = ('HUB_CONFIG_FILE', 'HUB2_CONFIG', 'HUB_TOKEN', 'HUB2_TOKEN', 'HUB_JOB_TOKEN', 'HUB_URL',
                    'HUB_BASE_URL', 'APLEXER_TAG', 'APLEXER_WORKSPACE', 'APLEXER_SESSION_ID')
 
