@@ -4,7 +4,7 @@ import {buildRoutingPool, type RoutingSnapshot} from '../src/routing-pool.ts';
 
 function fixture(): RoutingSnapshot {
   const now = Date.now();
-  const candidate = (engine: string) => ({id: engine, engine, model: engine === 'codex' ? 'gpt-6.1-sol' : 'gemini-4-argon-medium',
+  const candidate = (engine: string) => ({id: engine, engine, model: engine === 'codex' ? 'gpt-6.1-sol' : 'gemini-4-hydrogen-medium',
     effort: 'medium', account_id: engine, weight: 1, capabilities: [], enabled: true});
   return {observed_at: now, policy: {version: 1, candidates: [candidate('codex'), candidate('antigravity')]},
     accounts: new Map(['codex', 'antigravity'].map(id => [id, {account: {enabled: true}, credential_usable: true,
