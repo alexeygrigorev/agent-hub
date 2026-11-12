@@ -275,6 +275,12 @@ if mode == "active" and (repo_arg or evidence_root_arg):
         evidence_root = Path(evidence_root_arg)
         owner_uid, owner_gid = original_stat.st_uid, original_stat.st_gid
         ensure_private_evidence_root(evidence_root, owner_uid, owner_gid)
+        def _drop_privileges():
+            if os.geteuid() == 0 and (owner_uid != 0 or owner_gid != 0):
+                os.setgroups([owner_gid])
+                os.setresgid(owner_gid, owner_gid, owner_gid)
+                os.setresuid(owner_uid, owner_uid, owner_uid)
+
         git_env = {
             "PATH": os.defpath,
             "HOME": "/nonexistent",
@@ -289,6 +295,7 @@ if mode == "active" and (repo_arg or evidence_root_arg):
             stderr=subprocess.DEVNULL,
             timeout=5,
             check=False,
+            preexec_fn=_drop_privileges if os.geteuid() == 0 and (owner_uid != 0 or owner_gid != 0) else None,
         )
         if head_proc.returncode != 0 or len(head_proc.stdout) > 64:
             raise ValueError("unable to resolve checkout HEAD")
@@ -303,12 +310,6 @@ if mode == "active" and (repo_arg or evidence_root_arg):
                 raise ValueError(f"untrusted authority artifact: {rel}")
             hashes[rel] = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
         destination = evidence_root / f"{expected_commit}-{uuid.uuid4().hex}"
-
-        def _drop_privileges():
-            if os.geteuid() == 0 and (owner_uid != 0 or owner_gid != 0):
-                os.setgroups([owner_gid])
-                os.setresgid(owner_gid, owner_gid, owner_gid)
-                os.setresuid(owner_uid, owner_uid, owner_uid)
 
         stage_cmd = [
             sys.executable,
