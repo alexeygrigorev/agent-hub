@@ -12,9 +12,9 @@ are omitted as ambiguous. Symlinks must resolve inside an enrolled root.
 The host resolves discovered labels using the same inventory at launch time.
 The existing absolute-path and directory-label allowlist checks still apply.
 A removed clone disappears from the next heartbeat. The heartbeat reserves
-32 engine/resource hints separately from up to 512 workspace labels, so a
+32 engine/resource hints separately from up to 2048 workspace labels, so a
 large clone inventory does not suppress engine, effort or credential hints.
-The server rejects excess inventory rather than silently truncating it.
+Heartbeat requests allow up to 256 KiB. The server rejects excess inventory rather than silently truncating it.
 
 For existing hosts, the deployment owner must enroll every intended clone
 parent in the private host configuration's `roots`, preserving existing roots,
