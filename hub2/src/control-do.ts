@@ -427,6 +427,9 @@ export class ControlDO {
     const latest = await this.accountRequest('/api/account/credentials?metadata=1', 'GET', actor);
     if (!latest.ok) return latest;
     if ((await latest.json() as any)?.generation !== generation) return error('generation_conflict', 409);
+    // The rollout can move during that last await: recheck the captured version
+    // synchronously, with no await between this check and the response.
+    if (this.engineVersionFor(machineId) !== version) return error('revision_changed', 409);
     return json({ label: CLAUDE_ENGINE_LABEL, generation, revision, status: 'current', files: credential.files });
   }
 
