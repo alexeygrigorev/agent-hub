@@ -17,9 +17,14 @@ class SchemaInstallConfigurationTests(unittest.TestCase):
     def setUp(self):
         self.installer_source = (ROOT / 'deploy/vm/install-hub2-node.sh').read_text()
         self.block = self.installer_source.split("<<'PY'\n", 1)[1].split('\nPY\n', 1)[0]
+        original_block = self.block
+        self.assertEqual(self.block.count('overrides = service_environment()'), 1)
+        # This suite exercises the real staging and filesystem guards; the new
+        # selection suite supplies fake systemd responses to the actual probe.
+        self.block = self.block.replace('overrides = service_environment()', 'overrides = {}')
         state_idx = self.installer_source.index('echo "== state directories"')
         backup_idx = self.installer_source.index('echo "== daily backup')
-        self.installer_state_and_release_section = self.installer_source[state_idx:backup_idx]
+        self.installer_state_and_release_section = self.installer_source[state_idx:backup_idx].replace(original_block, self.block)
         self.temporary_root = ROOT / '.local/tmp'
         self.temporary_root.mkdir(parents=True, exist_ok=True)
 
@@ -56,7 +61,7 @@ class SchemaInstallConfigurationTests(unittest.TestCase):
     def test_updates_modes_without_changing_secret_lines_or_permissions(self):
         with tempfile.TemporaryDirectory(dir=self.temporary_root) as temporary:
             path = Path(temporary) / '.dev.vars'
-            path.write_text('# retained comment\nSYNTHETIC_SECRET=keep-private-fixture\nHUB2_RELEASE_MODE=bootstrap\nHUB2_SCHEMA_MIGRATIONS=defer\nHUB2_SCHEMA_MIGRATIONS=apply\n')
+            path.write_text('# retained comment\nSYNTHETIC_SECRET=keep-private-fixture\nHUB2_RELEASE_MODE=bootstrap\nHUB2_ALERT_EVIDENCE_DIR=/synthetic-already-enabled\nHUB2_SCHEMA_MIGRATIONS=defer\nHUB2_SCHEMA_MIGRATIONS=apply\n')
             path.chmod(0o640)
             previous = path.stat()
             def run(mode, schema):
@@ -86,7 +91,7 @@ class SchemaInstallConfigurationTests(unittest.TestCase):
             # Notice evidence_root does not exist before first active run; Python block creates it O_NOFOLLOW 0700.
             evidence_root = base / 'credential-monitor-evidence'
             path = base / '.dev.vars'
-            path.write_text('# retained comment\nSYNTHETIC_SECRET=keep-private-fixture\nHUB2_RELEASE_MODE=bootstrap\n')
+            path.write_text('# retained comment\nSYNTHETIC_SECRET=keep-private-fixture\nHUB2_RELEASE_MODE=bootstrap\nHUB2_ALERT_EVIDENCE_DIR=/synthetic-already-enabled\n')
             path.chmod(0o600)
 
             res1 = subprocess.run(
@@ -158,7 +163,7 @@ class SchemaInstallConfigurationTests(unittest.TestCase):
             evidence_root = base / 'credential-monitor-evidence'
             evidence_root.mkdir(mode=0o750)  # non-private parent must be refused without repairing mode
             path = base / '.dev.vars'
-            original = 'SYNTHETIC_SECRET=keep-private-fixture\nHUB2_RELEASE_MODE=bootstrap\n'
+            original = 'SYNTHETIC_SECRET=keep-private-fixture\nHUB2_RELEASE_MODE=bootstrap\nHUB2_ALERT_EVIDENCE_DIR=/synthetic-already-enabled\n'
             path.write_text(original)
             path.chmod(0o600)
 
@@ -187,7 +192,7 @@ class SchemaInstallConfigurationTests(unittest.TestCase):
             base.chmod(0o700)
             repo, head = self._create_synthetic_checkout(base)
             path = repo / '.dev.vars'
-            original = 'SYNTHETIC_SECRET=keep-private-fixture\nHUB2_RELEASE_MODE=bootstrap\n'
+            original = 'SYNTHETIC_SECRET=keep-private-fixture\nHUB2_RELEASE_MODE=bootstrap\nHUB2_ALERT_EVIDENCE_DIR=/synthetic-already-enabled\n'
             path.write_text(original)
             path.chmod(0o600)
 
@@ -309,7 +314,7 @@ class SchemaInstallConfigurationTests(unittest.TestCase):
             base.chmod(0o700)
             repo, head = self._create_synthetic_checkout(base)
             path = base / '.dev.vars'
-            original = 'SYNTHETIC_SECRET=keep-private-fixture\nHUB2_RELEASE_MODE=bootstrap\n'
+            original = 'SYNTHETIC_SECRET=keep-private-fixture\nHUB2_RELEASE_MODE=bootstrap\nHUB2_ALERT_EVIDENCE_DIR=/synthetic-already-enabled\n'
             path.write_text(original)
             path.chmod(0o600)
 
@@ -578,7 +583,7 @@ class SchemaInstallConfigurationTests(unittest.TestCase):
             evidence_root.mkdir(mode=0o700)
             path = base / '.dev.vars'
             backup = base / 'dev.vars.previous'
-            path.write_text('SYNTHETIC_SECRET=keep-private-fixture\nHUB2_RELEASE_MODE=bootstrap\n')
+            path.write_text('SYNTHETIC_SECRET=keep-private-fixture\nHUB2_RELEASE_MODE=bootstrap\nHUB2_ALERT_EVIDENCE_DIR=/synthetic-already-enabled\n')
             path.chmod(0o600)
 
             # Release 1 (active)

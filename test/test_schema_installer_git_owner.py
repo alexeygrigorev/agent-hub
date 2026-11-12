@@ -18,6 +18,8 @@ GIT_ENV = {'PATH': os.defpath, 'HOME': '/nonexistent', 'GIT_CONFIG_NOSYSTEM': '1
 class InstallerGitOwnerTests(unittest.TestCase):
     def setUp(self):
         self.block = (ROOT/'deploy/vm/install-hub2-node.sh').read_text().split("<<'PY'\n",1)[1].split('\nPY\n',1)[0]
+        self.assertEqual(self.block.count('overrides = service_environment()'), 1)
+        self.block = self.block.replace('overrides = service_environment()', 'overrides = {}')
         parent = ROOT/'.local/tmp'
         parent.mkdir(parents=True, mode=0o700, exist_ok=True)
         self.temporary = tempfile.TemporaryDirectory(prefix='installer-git-owner-', dir=parent)
@@ -43,7 +45,7 @@ class InstallerGitOwnerTests(unittest.TestCase):
             '-c','core.hooksPath=/dev/null','-c','commit.gpgsign=false','commit','-qm','synthetic source')
         self.head = git('rev-parse','HEAD')
         self.vars = self.repo/'.dev.vars'
-        self.before = 'SYNTHETIC_PRIVATE=unchanged\nHUB2_RELEASE_MODE=bootstrap\nHUB2_SCHEMA_MIGRATIONS=defer\n'
+        self.before = 'SYNTHETIC_PRIVATE=unchanged\nHUB2_RELEASE_MODE=bootstrap\nHUB2_ALERT_EVIDENCE_DIR=/synthetic-already-enabled\nHUB2_SCHEMA_MIGRATIONS=defer\n'
         self.vars.write_text(self.before);self.vars.chmod(0o640)
         self.evidence = self.base/'evidence';self.evidence.mkdir(mode=0o700)
         if os.geteuid()==0:
