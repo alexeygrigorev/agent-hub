@@ -20,15 +20,23 @@ def conversation_argv(argv, task_id, operation_id, epoch):
     return [*argv, '--session-id', thread]
 
 
-def goal_store(row, config_dir, objective_hash):
-    """Return bounded, exact-conversation native state; never scan nearby logs."""
-    command = row.get('command')
+def conversation_id(command):
+    """Read only an unambiguous, canonical explicit conversation selector."""
     if not isinstance(command, list) or command.count('--session-id') != 1:
         return None
     try:
         thread = command[command.index('--session-id') + 1]
-        if str(uuid.UUID(thread)) != thread:
-            return None
+        return thread if str(uuid.UUID(thread)) == thread else None
+    except (ValueError, TypeError, AttributeError, IndexError):
+        return None
+
+
+def goal_store(row, config_dir, expected_thread, objective_hash):
+    """Read only the immutable launch-pinned conversation, never a status replacement."""
+    if not expected_thread or conversation_id(row.get('command')) != expected_thread:
+        return None
+    thread = expected_thread
+    try:
         workspace = row['workspace']
         created = row['created_at_ms']
         if not Path(workspace).is_absolute() or type(created) is not int or created <= 0:

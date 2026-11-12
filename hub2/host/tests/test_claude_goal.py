@@ -43,7 +43,24 @@ class ClaudeGoalStoreTest(unittest.TestCase):
         self.path.write_text(''.join(json.dumps(event) + '\n' for event in events))
 
     def read(self):
-        return cg.goal_store(self.row, self.root, digest)
+        return cg.goal_store(self.row, self.root, self.thread, digest)
+
+    def test_status_cannot_replace_the_launch_pinned_conversation(self):
+        start = {**self.row, 'id': 'd6cf9872-8597-48a5-be64-990cdef4db31',
+                 'tag': 'task-launch', 'engine': 'claude', 'phase': 'running'}
+        other = cg.conversation_argv(['claude', '--model', 'opus'], 'other-task', 'other-operation', 1)
+        other_thread = other[-1]
+        self.path.with_name(other_thread + '.jsonl').write_text(json.dumps({
+            **self.event, 'sessionId': other_thread}) + '\n')
+        status = {**start, 'command': other}
+        adapter = nl.NativeLauncher({})
+        with mock.patch.object(adapter, 'status', return_value=status), \
+             mock.patch.object(adapter, 'native') as send:
+            with self.assertRaisesRegex(RuntimeError, '^native_goal_identity_unverified$'):
+                adapter.register_goal(start, {'workspace': self.workspace}, 'finish objective',
+                                      time.time() + 10, claude_config_dir=self.root)
+            send.assert_not_called()
+        self.assertIsNone(cg.goal_store(status, self.root, self.thread, digest))
 
     def test_attempt_identity_is_stable_but_never_shared_with_another_attempt(self):
         self.assertEqual(self.command, cg.conversation_argv(self.command[:-2], 'task', 'operation:0', 1))
