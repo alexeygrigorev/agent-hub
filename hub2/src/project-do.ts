@@ -13,9 +13,9 @@ import { nativeReturncode } from './native-exit';
 import { HOST_INVENTORY_LOST_MS } from './session-liveness';
 import { PROJECT_WORK_SCHEMA, ProjectWork, type ProjectWorkHooks } from './project-work';
 import {
-  COMPLETION_ACTOR, DEVELOPER_ALERT_RECIPIENT, MAX_AUTO_CONTINUATIONS, MAX_CONTINUATION_TRIES, MAX_DELIVERY_TRIES,
-  LAUNCH_SPEC_LIMIT, basePrompt, completionClaim, continuationBudget, continuationPrompt, deliveryBody, promptWithContract, retryDelay, stripCompletion,
-  type CompletionClaim, type CompletionRecord, type ContinuationSnapshot,
+  BLOCKED_WAIT_MS, COMPLETION_ACTOR, DEVELOPER_ALERT_RECIPIENT, HARD_BLOCKERS, MAX_AUTO_CONTINUATIONS, MAX_CONTINUATION_TRIES, MAX_DELIVERY_TRIES,
+  LAUNCH_SPEC_LIMIT, basePrompt, completionClaim, continuationBudget, continuationPrompt, deliveryBody, exitCause, promptWithContract, retryDelay, stripCompletion, taskBlocker,
+  type CompletionClaim, type CompletionRecord, type ContinuationSnapshot, type TaskBlocker,
 } from './task-completion';
 import type { Actor, Hub2Env, JsonRecord } from './types';
 
@@ -355,6 +355,8 @@ export class ProjectDO {
       // A completion claim may come only from that session itself or an operator.
       const claimed=(body.evidence as JsonRecord|undefined)?.kind==='task_complete'?(body.evidence as JsonRecord).session_id:undefined;
       if(claimed!==undefined&&!hasScope(actor,'operator:admin')&&actor.id!=='session:'+String(claimed))return error('completion_claim_forbidden',403);
+      const blockedBy=(body.evidence as JsonRecord|undefined)?.kind==='task_blocked'?(body.evidence as JsonRecord).session_id:undefined;
+      if(blockedBy!==undefined&&!hasScope(actor,'operator:admin')&&actor.id!=='session:'+String(blockedBy))return error('blocker_record_forbidden',403);
       const previous=this.db.one<{body_json:string}>('SELECT body_json FROM intake_events WHERE event_key=?',eventKey);
       if(previous)return (JSON.parse(previous.body_json) as JsonRecord).request_digest===digest?json({appended:true,duplicate:true,intake_id:intakeId}):error('idempotency_conflict',409);
       this.appendEvent(intake.id,eventKey,actor.id,'worker_append',{...(body.note?{note:body.note}:{}),...(body.evidence?{evidence:body.evidence}:{}),request_digest:digest},Date.now());
@@ -1234,6 +1236,23 @@ export class ProjectDO {
     return undefined;
   }
 
+  /** Worker appends written after this attempt's start, newest first. */
+  private appendsSinceStart(intake:IntakeRow,saga:SagaRow):JsonRecord[]{
+    const started=this.db.one<{seq:number}>('SELECT seq FROM intake_events WHERE task_id=? AND event_key=?',intake.id,`start:${saga.operation_id}:requested`)?.seq;
+    if(started===undefined)return [];
+    return this.db.all<{body_json:string}>("SELECT body_json FROM intake_events WHERE task_id=? AND kind='worker_append' AND seq>? ORDER BY seq DESC LIMIT 200",intake.id,started)
+      .map(row=>(this.parse(row.body_json) as JsonRecord|null)??{});
+  }
+
+  /** Why this attempt ended unfinished: its own blocker record, else the newest note. */
+  private unfinishedCause(intake:IntakeRow,saga:SagaRow,reason:string):{cause:string;blocker?:TaskBlocker}{
+    const appends=this.appendsSinceStart(intake,saga);
+    let blocker:TaskBlocker|undefined;
+    for(const body of appends){blocker=taskBlocker(body.evidence,saga.session_id);if(blocker)break;}
+    const note=appends.find(body=>typeof body.note==='string'&&body.note.trim())?.note as string|undefined;
+    return {cause:exitCause(reason,blocker,note),...(blocker?{blocker}:{})};
+  }
+
   /** Consecutive Hub-started continuations since the last requester start. */
   private continuationDepth(intakeId:string):number{
     let depth=0;
@@ -1249,16 +1268,23 @@ export class ProjectDO {
   private completionOutcome(intake:IntakeRow,saga:SagaRow,claim:CompletionClaim|undefined,reason:string,continuable:boolean,deliver:boolean,now:number):CompletionRecord{
     const depth=this.continuationDepth(intake.id);
     const contractOmitted=(this.parse(saga.routing_json) as JsonRecord|null)?.completion_contract_omitted==='launch_budget';
+    const unfinished=claim?undefined:this.unfinishedCause(intake,saga,reason);
+    const blocker=unfinished?.blocker,hard=!!blocker&&HARD_BLOCKERS.includes(blocker.cause);
     const record:CompletionRecord={controlled:true,session_id:saga.session_id,outcome:claim?'claimed':'unfinished',
-      reason:claim?'completion_claimed':contractOmitted?'completion_contract_omitted_launch_budget':reason,depth,...(claim?.summary?{summary:claim.summary}:{})};
-    if(!claim&&continuable&&!contractOmitted&&depth<MAX_AUTO_CONTINUATIONS)record.continuation={state:'pending',key:'continue:'+saga.operation_id,tries:0,next_action_at:now};
+      reason:claim?'completion_claimed':contractOmitted?'completion_contract_omitted_launch_budget':hard?'blocked_'+blocker!.cause:reason,depth,
+      ...(claim?.summary?{summary:claim.summary}:{}),...(unfinished?{cause:unfinished.cause}:{}),...(blocker?{blocker}:{})};
+    // A fresh session cannot clear a permission, credential or external blocker:
+    // never spend the bounded continuations on one. A running job gets time first.
+    if(!claim&&continuable&&!contractOmitted&&!hard&&depth<MAX_AUTO_CONTINUATIONS)
+      record.continuation={state:'pending',key:'continue:'+saga.operation_id,tries:0,next_action_at:blocker?.cause==='waiting'?now+BLOCKED_WAIT_MS:now};
     else if(deliver)record.delivery={state:'pending',key:'terminal:'+saga.operation_id,tries:0,next_action_at:now};
     // Every unclaimed end Hub does not recover itself (bound spent, lost host,
     // failed launch) gets a developer owner; only an operator stop is exempt.
     if(!claim&&!record.continuation&&!['stop_requested','session_stop_confirmed'].includes(record.reason))
-      this.raiseDeveloperAlert(intake.id,saga.session_id,continuable&&!contractOmitted?'recovery_exhausted':'not_recoverable',record.reason,depth,now);
+      this.raiseDeveloperAlert(intake.id,saga.session_id,hard?'blocked':continuable&&!contractOmitted?'recovery_exhausted':'not_recoverable',record.reason,depth,now,unfinished);
     this.appendEvent(intake.id,'completion:'+saga.operation_id,COMPLETION_ACTOR,claim?'task_completion_claimed':'task_unfinished',
       {session_id:saga.session_id,reason:record.reason,depth,next:record.continuation?'continue':record.delivery?'deliver':'none',
+        ...(unfinished?{cause:unfinished.cause}:{}),...(blocker?{blocker}:{}),
         ...(claim?{criteria_met:claim.met,...(claim.summary?{summary:claim.summary}:{})}:{})},now);
     return record;
   }
@@ -1318,7 +1344,8 @@ export class ProjectDO {
             if(continuing){
               const saga=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id=?',record.session_id);
               next.delivery={state:'pending',key:'terminal:'+(saga?.operation_id??record.session_id),tries:0,next_action_at:Date.now()};
-              this.raiseDeveloperAlert(intake.id,record.session_id,'recovery_start_failed','internal_error',record.depth,Date.now());
+              this.raiseDeveloperAlert(intake.id,record.session_id,'recovery_start_failed','internal_error',record.depth,Date.now(),
+                record.cause?{cause:record.cause,...(record.blocker?{blocker:record.blocker}:{})}:undefined);
             }
           }else action.next_action_at=Date.now()+retryDelay(action.tries);
         });
@@ -1330,12 +1357,13 @@ export class ProjectDO {
    * when Hub cannot recover an unfinished intake itself. Runs inside the
    * caller's transaction: records the alert in the intake journal and makes the
    * developer the intake's active owner, so it never sits ownerless. */
-  private raiseDeveloperAlert(intakeId:string,sessionId:string,kind:string,reason:string,depth:number,now:number):void{
-    const alert={recipient:DEVELOPER_ALERT_RECIPIENT,kind,reason,session_id:sessionId,depth,max_continuations:MAX_AUTO_CONTINUATIONS};
+  private raiseDeveloperAlert(intakeId:string,sessionId:string,kind:string,reason:string,depth:number,now:number,why?:{cause:string;blocker?:TaskBlocker}):void{
+    const alert={recipient:DEVELOPER_ALERT_RECIPIENT,kind,reason,session_id:sessionId,depth,max_continuations:MAX_AUTO_CONTINUATIONS,
+      ...(why?{cause:why.cause}:{}),...(why?.blocker?{blocker:why.blocker}:{})};
     this.appendEvent(intakeId,'developer-alert:'+kind+':'+sessionId,COMPLETION_ACTOR,'developer_alert_raised',alert,now);
     this.appendEvent(intakeId,'developer-owner:'+kind+':'+sessionId,COMPLETION_ACTOR,'intake_context_updated',{...this.intakeContext(intakeId),
       owner:DEVELOPER_ALERT_RECIPIENT,
-      current_state:`Hub could not finish this intake automatically (${kind}: ${reason}; session ${sessionId}; ${depth} of ${MAX_AUTO_CONTINUATIONS} recovery sessions used).`,
+      current_state:`Hub could not finish this intake automatically (${kind}: ${reason}; session ${sessionId}; ${depth} of ${MAX_AUTO_CONTINUATIONS} recovery sessions used).${why?` Cause: ${why.cause}`:''}`,
       next_step:'Developer: inspect the intake notes, fix the blocker and restart the intake (hub intake start).'},now);
     console.error('[hub2] INTAKE_RECOVERY_ALERT alert='+DEVELOPER_ALERT_RECIPIENT,JSON.stringify({intake_id:intakeId,...alert}));
   }
@@ -1440,7 +1468,8 @@ export class ProjectDO {
     else{
       const sender='intake:'+intake.id,actor:Actor={id:sender,kind:'agent',resource_id:intake.project,scopes:['message:send']};
       const text=deliveryBody({intake_id:intake.id,title:intake.title,outcome:record.outcome,reason:record.reason,session_id:record.session_id,
-        ...(record.summary?{summary:record.summary}:{}),...(record.continuation?{continuation:record.continuation}:{}),depth:record.depth});
+        ...(record.summary?{summary:record.summary}:{}),...(record.continuation?{continuation:record.continuation}:{}),depth:record.depth,
+        ...(record.cause?{cause:record.cause}:{}),...(record.blocker?{blocker:record.blocker}:{})});
       try{
         const response=await this.env.MAILBOXES.get(this.env.MAILBOXES.idFromName('global')).fetch('https://mailbox.internal/api/messages',{method:'POST',
           headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(actor),'x-hub2-mailbox':sender},body:JSON.stringify({key:action.key,recipient,body:text})});
@@ -1518,13 +1547,15 @@ export class ProjectDO {
         // A reopened intake is never left open without an owner: Hub schedules a
         // bounded recovery continuation, or alerts the developer when the bound is spent.
         const depth=this.continuationDepth(intake.id);
-        const completion:CompletionRecord={controlled:true,session_id:saga.session_id,outcome:'unfinished',reason,depth,
-          ...(depth<MAX_AUTO_CONTINUATIONS?{continuation:{state:'pending',key:'continue:'+saga.operation_id,tries:0,next_action_at:now}}:{})};
+        const why=this.unfinishedCause(intake,saga,reason),hard=!!why.blocker&&HARD_BLOCKERS.includes(why.blocker.cause);
+        const completion:CompletionRecord={controlled:true,session_id:saga.session_id,outcome:'unfinished',reason:hard?'blocked_'+why.blocker!.cause:reason,depth,cause:why.cause,
+          ...(why.blocker?{blocker:why.blocker}:{}),
+          ...(depth<MAX_AUTO_CONTINUATIONS&&!hard?{continuation:{state:'pending',key:'continue:'+saga.operation_id,tries:0,next_action_at:why.blocker?.cause==='waiting'?now+BLOCKED_WAIT_MS:now}}:{})};
         this.db.run("UPDATE intakes SET status='open',final_evidence_json=?,updated_at=? WHERE id=?",
           JSON.stringify({...evidence,reopened_unfinished:reopened,completion}),now,intake.id);
         this.appendEvent(intake.id,'reopen-unverified:'+saga.operation_id,COMPLETION_ACTOR,'intake_reopened_unfinished',
           {...reopened,next:completion.continuation?'continue':'developer_alert'},now);
-        if(!completion.continuation)this.raiseDeveloperAlert(intake.id,saga.session_id,'recovery_exhausted',reason,depth,now);
+        if(!completion.continuation)this.raiseDeveloperAlert(intake.id,saga.session_id,hard?'blocked':'recovery_exhausted',completion.reason,depth,now,why);
       }
     });
   }
