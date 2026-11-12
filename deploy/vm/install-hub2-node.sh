@@ -302,16 +302,32 @@ def service_environment():
     systemctl("daemon-reload")
     names = ("Environment", "EnvironmentFiles", "PassEnvironment", "UnsetEnvironment", "NeedDaemonReload")
     raw = systemctl("show", "agent-hub-hub2.service", *("--property=" + name for name in names))
-    props = dict(line.split("=", 1) for line in raw.splitlines() if "=" in line)
-    if set(props) != set(names) or props["NeedDaemonReload"] != "no":
+    props, file_rows = {}, []
+    for line in raw.splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or key not in names:
+            raise ValueError("observer_service_environment_unverified")
+        if key == "EnvironmentFiles":
+            file_rows.append(value)
+        elif key in props:
+            raise ValueError("observer_service_environment_unverified")
+        else:
+            props[key] = value
+    # systemd255 omits this empty array and emits one row per populated item.
+    # Scalar properties must still be present exactly once.
+    if set(props) != set(names) - {"EnvironmentFiles"} or props["NeedDaemonReload"] != "no":
         raise ValueError("observer_service_environment_unverified")
     for name in ("PassEnvironment", "UnsetEnvironment"):
         if any(word.split("=", 1)[0] == OBSERVER_KEY for word in shlex.split(props[name])):
             raise ValueError("observer_service_override_unsupported")
-    files = props["EnvironmentFiles"].strip()
-    entries = re.findall(r"([^\s]+) \(ignore_errors=(yes|no)\)", files)
-    if " ".join(f"{name} (ignore_errors={optional})" for name, optional in entries) != files:
-        raise ValueError("observer_service_environment_unverified")
+    entries = []
+    for row in file_rows:
+        files = row.strip()
+        parsed = re.findall(r"([^\s]+) \(ignore_errors=(yes|no)\)", files)
+        if (not files and len(file_rows) != 1
+                or " ".join(f"{name} (ignore_errors={optional})" for name, optional in parsed) != files):
+            raise ValueError("observer_service_environment_unverified")
+        entries.extend(parsed)
     for name, optional in entries:
         if not os.path.isabs(name) or any(char in name for char in "\\*?%["):
             raise ValueError("observer_service_environment_unverified")

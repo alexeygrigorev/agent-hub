@@ -26,11 +26,11 @@ class ObserverSelectionTests(unittest.TestCase):
         source=(ROOT/'deploy/vm/install-hub2-node.sh').read_text()
         self.block=source.split("<<'PY'\n",1)[1].split('\nPY\n',1)[0]
 
-    def invoke(self, text, *, props=None, manager='', fail=False, ambient=None, race=False):
+    def invoke(self, text, *, props=None, manager='', fail=False, ambient=None, race=False, show=None, fail_stage=None, timeout_stage=None):
         raw=text.encode() if isinstance(text,str) else text
         self.vars.write_bytes(raw);self.vars.chmod(0o640)
         properties=dict(PROPS,**(props or {}))
-        fixture={'properties':properties,'manager':manager,'fail':fail,'race':race,'artifact':str(self.repo/configuration_fixture.ARTIFACTS[0])}
+        fixture={'properties':properties,'manager':manager,'fail':fail,'race':race,'artifact':str(self.repo/configuration_fixture.ARTIFACTS[0]),'show':show,'fail_stage':fail_stage,'timeout_stage':timeout_stage}
         calls=self.base/'probe-calls.jsonl'
         prefix='''import subprocess,json
 _fixture=FIXTURE
@@ -39,9 +39,10 @@ def _fake_run(argv,*args,**kwargs):
     if argv and argv[0]=='/usr/bin/systemctl':
         assert kwargs['env']=={'PATH':__import__('os').defpath,'LC_ALL':'C'}
         with open(CALLS,'a') as trace:trace.write(json.dumps(argv)+'\\n')
-        if _fixture['fail']:return subprocess.CompletedProcess(argv,1,stdout=b'',stderr=b'')
+        if argv[1]==_fixture['timeout_stage']:raise subprocess.TimeoutExpired(argv,5)
+        if _fixture['fail'] or argv[1]==_fixture['fail_stage']:return subprocess.CompletedProcess(argv,1,stdout=b'',stderr=b'')
         if argv[1]=='daemon-reload':out=''
-        elif argv[1]=='show':out='\\n'.join(k+'='+v for k,v in _fixture['properties'].items())+'\\n'
+        elif argv[1]=='show':out=_fixture['show'] if _fixture['show'] is not None else '\\n'.join(k+'='+v for k,v in _fixture['properties'].items())+'\\n'
         elif argv[1]=='show-environment':out=_fixture['manager']
         else:raise AssertionError('unexpected service command')
         return subprocess.CompletedProcess(argv,0,stdout=out.encode(),stderr=b'')
@@ -158,6 +159,63 @@ subprocess.run=_fake_run
         self.assertNotEqual(done.returncode,0)
         self.assertIn('observer_service_override_unsupported',done.stderr)
         self.assertEqual(self.vars.read_text(),text);self.assertFalse(self.evidence.exists())
+
+    def test_actual_systemd255_omitted_empty_array_preserves_off_without_staging(self):
+        # Observed formatter shape: rc0, four scalar lines, no EnvironmentFiles.
+        show='Environment=NODE_ENV=production TMPDIR=/synthetic/tmp HOME=/synthetic/home\nPassEnvironment=\nUnsetEnvironment=\nNeedDaemonReload=no\n'
+        self.assert_off('HUB2_RELEASE_MODE=bootstrap\nHUB2_SCHEMA_MIGRATIONS=defer\n',show=show)
+
+    def test_omitted_empty_array_still_stages_explicitly_selected_on(self):
+        show='Environment=NODE_ENV=production\nPassEnvironment=\nUnsetEnvironment=\nNeedDaemonReload=no\n'
+        done=self.invoke('HUB2_RELEASE_MODE=bootstrap\n'+KEY+'=0\n',show=show)
+        self.assertEqual(done.returncode,0,done.stderr)
+        selected=[line for line in self.vars.read_text().splitlines() if line.startswith(KEY+'=')]
+        self.assertEqual(len(selected),1)
+        directory=Path(selected[0].split('=',1)[1])
+        self.assertEqual(directory.parent,self.evidence)
+        self.assertTrue((directory/'enrollment.json').is_file())
+        self.assertTrue((directory/'journal.json').is_file())
+
+    def test_repeated_file_rows_validate_every_file_including_earlier_target(self):
+        first=self.base/'first.env';second=self.base/'second.env'
+        first.write_text(KEY+'=/earlier-must-not-be-lost\n');second.write_text('UNRELATED=one\n')
+        scalar='Environment=\nPassEnvironment=\nUnsetEnvironment=\nNeedDaemonReload=no\n'
+        show=scalar+f'EnvironmentFiles={first} (ignore_errors=no)\nEnvironmentFiles={second} (ignore_errors=no)\n'
+        text='HUB2_RELEASE_MODE=bootstrap\n'+KEY+'=/on\n'
+        done=self.invoke(text,show=show)
+        self.assertNotEqual(done.returncode,0)
+        self.assertIn('observer_service_override_unsupported',done.stderr)
+        self.assertEqual(self.vars.read_text(),text);self.assertFalse(self.evidence.exists())
+        first.write_text('UNRELATED=two\n')
+        self.assert_off('HUB2_RELEASE_MODE=bootstrap\nHUB2_SCHEMA_MIGRATIONS=defer\n',show=show)
+
+    def test_only_environment_files_may_be_absent_or_repeated(self):
+        scalar={'Environment':'','PassEnvironment':'','UnsetEnvironment':'','NeedDaemonReload':'no'}
+        cases=[]
+        for key in scalar:
+            cases.append(''.join(k+'='+v+'\n' for k,v in scalar.items() if k!=key))
+            cases.append(''.join(k+'='+v+'\n' for k,v in scalar.items())+key+'='+scalar[key]+'\n')
+        standard=''.join(k+'='+v+'\n' for k,v in scalar.items())
+        cases.extend([standard+'Unexpected=\n',standard+'EnvironmentFiles=[]\n',
+                      standard+'EnvironmentFiles=\nEnvironmentFiles=/synthetic (ignore_errors=no)\n',
+                      standard+'EnvironmentFiles=malformed\nEnvironmentFiles=\n'])
+        text='HUB2_RELEASE_MODE=bootstrap\n'+KEY+'=/on\n'
+        for show in cases:
+            with self.subTest(shape=show):
+                done=self.invoke(text,show=show)
+                self.assertNotEqual(done.returncode,0)
+                self.assertIn('observer_service_environment_unverified',done.stderr)
+                self.assertEqual(self.vars.read_text(),text);self.assertFalse(self.evidence.exists())
+
+    def test_each_metadata_command_failure_and_timeout_is_still_unknown(self):
+        text='HUB2_RELEASE_MODE=bootstrap\n'+KEY+'=/on\n'
+        for stage in ['daemon-reload','show','show-environment']:
+            for option in ['fail_stage','timeout_stage']:
+                with self.subTest(stage=stage,kind=option):
+                    done=self.invoke(text,**{option:stage})
+                    self.assertNotEqual(done.returncode,0)
+                    self.assertIn('observer_service_environment_unverified',done.stderr)
+                    self.assertEqual(self.vars.read_text(),text);self.assertFalse(self.evidence.exists())
 
     def test_metadata_failure_is_unknown_and_cannot_disable_selected_observer(self):
         text='HUB2_RELEASE_MODE=bootstrap\n'+KEY+'=/on\n'
