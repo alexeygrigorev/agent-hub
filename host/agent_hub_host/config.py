@@ -235,6 +235,8 @@ def _profile_write_lock(path: Path):
     an empty profile, lose a race to human login, then replace the new login.
     Lock files are persistent; the OS releases their lock when a process exits.
     """
+    from .worker_auth import refuse_v2_profile_io
+    refuse_v2_profile_io()
     lock_path = path.with_name(path.name + '.write.lock')
     deadline = time.monotonic() + 30
     manager = None
@@ -313,6 +315,8 @@ def _has_symlink(path: Path) -> bool:
 
 
 def _load_from(path: Path) -> dict:
+    from .worker_auth import refuse_v2_profile_io
+    refuse_v2_profile_io()
     _forbid_real_user_profile(path)
     if _has_symlink(path):
         raise ConfigPermissionError(
@@ -346,6 +350,8 @@ def _load_from(path: Path) -> dict:
 
 
 def _save_to(path: Path, data: dict, *, human_flow: bool = False):
+    from .worker_auth import refuse_v2_profile_io
+    refuse_v2_profile_io()
     _forbid_real_user_profile(path)
     if not isinstance(data, dict):
         raise ValueError("Config data must be a dict")
@@ -428,7 +434,8 @@ def is_human_config(cfg: dict) -> bool:
 def load_config() -> dict:
     """Active profile for normal user commands (human-first, host fallback).
 
-    - HUB_CONFIG_FILE set: single-file mode, return that file as-is
+    - Recognized Hub2 workers: strict read-only attempt context, no fallback.
+    - Otherwise HUB_CONFIG_FILE set: single-file mode, return that file as-is
       (legacy behavior; kind check left to callers).
     - Else: human cli.json when it holds an access token, otherwise
       legacy host.json. On fresh Linux after `hub auth login` only the
@@ -437,6 +444,10 @@ def load_config() -> dict:
       load_host_config() explicitly so a human profile never overwrites
       or impersonates the host file.
     """
+    from .worker_auth import load_v2_context
+    scoped = load_v2_context()
+    if scoped is not None:
+        return scoped
     if os.environ.get('HUB_CONFIG_FILE'):
         return _load_from(get_config_path())
     from .worker_auth import config_path
@@ -451,7 +462,9 @@ def load_config() -> dict:
 
 def save_config(data: dict):
     """Legacy host save (host.json, or HUB_CONFIG_FILE override). Untouched."""
-    from .worker_auth import config_path
+    from .worker_auth import config_path, is_v2_worker, WorkerContextError
+    if is_v2_worker():
+        raise WorkerContextError()
     worker = None if os.environ.get('HUB_CONFIG_FILE') else config_path()
     _save_to(worker if worker is not None else get_config_path(), data)
 

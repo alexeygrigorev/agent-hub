@@ -111,6 +111,9 @@ class SessionInputError(ValueError):
 
 def diagnostic(exc):
     """Never interpolate exception bodies: they may contain credentials or payloads."""
+    from .worker_auth import WorkerContextError
+    if isinstance(exc, WorkerContextError):
+        return str(exc)
     if isinstance(exc, (SessionHTTPError, SessionTransportError, SessionInputError, config.ConfigPermissionError)):
         return str(exc)
     if isinstance(exc, UnicodeDecodeError):
@@ -266,6 +269,7 @@ def _repo_from_workspace(workspace):
 
 def request(method, path, payload=None):
     ensure_hub2_supported(method, path)
+    from .worker_auth import validate_v2_request
     cfg = config.load_config()
     base = os.environ.get('HUB_URL') or os.environ.get('HUB_BASE_URL') or cfg.get('base_url')
     api.check_url(base)
@@ -274,10 +278,11 @@ def request(method, path, payload=None):
     if data is not None and len(data) > max_req:
         raise SessionInputError('Session request exceeds capacity')
     env_token = os.environ.get('HUB_TOKEN') or os.environ.get('HUB_JOB_TOKEN')
-    token = env_token or auth.get_access_token()
+    token = env_token or (cfg['access_token'] if cfg.get('_hub2_worker') else auth.get_access_token())
     payload_key = payload.get('key') if isinstance(payload, dict) else None
 
     def send(access):
+        validate_v2_request(cfg)
         req = urllib.request.Request(base.rstrip('/') + path, data=data, method=method,
                                      headers={'Authorization': 'Bearer ' + access, 'Content-Type': 'application/json'})
         try:
@@ -299,7 +304,7 @@ def request(method, path, payload=None):
     try:
         return send(token)
     except urllib.error.HTTPError as exc:
-        if exc.code == 401 and not env_token and _request_deadline.get() is None:
+        if exc.code == 401 and not cfg.get('_hub2_worker') and not env_token and _request_deadline.get() is None:
             try:
                 auth.refresh_token(expected_token=token) if cfg.get('worker_launch_id') else auth.refresh_token()
                 return send(auth.get_access_token())

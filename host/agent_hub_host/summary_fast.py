@@ -42,7 +42,7 @@ def _ssl_context():
 
 def _fast_load_posix_config():
     """Fast POSIX read of cli.json / host.json without importing pathlib/uuid/platform."""
-    if os.name != 'posix' or os.environ.get('HUB_CONFIG_FILE') or os.environ.get('HUB_WORKER_CONFIG_FILE'):
+    if os.name != 'posix' or os.environ.get('HUB_CONFIG_FILE') or os.environ.get('HUB_WORKER_CONFIG_FILE') or os.environ.get('HUB2_CONFIG'):
         return None
     if os.environ.get('APLEXER_TAG') or os.environ.get('APLEXER_WORKSPACE') or os.environ.get('APLEXER_SESSION_ID'):
         # A session-scoped worker profile would win over the static XDG files
