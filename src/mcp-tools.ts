@@ -7,7 +7,7 @@ function tool(name: string, method: Method, path: string, description: string, c
 }
 tool('repos_list', 'GET', '/api/repos', 'Private repository registry; query org, status (active/archived/duplicate), flagged=true.', ['repos list']);
 tool('repos_show', 'GET', '/api/repos/{name}', 'Repository metadata and canonical duplicate target.', ['repos show']);
-tool('repos_edit', 'PATCH', '/api/repos/{name}', 'Operator-only human fields: payload label, aliases, purpose, stack, key_folders, urls. Refresh never overwrites these.', ['repos edit']);
+tool('repos_edit', 'PATCH', '/api/repos/{name}', 'Operator-only repository fields (create or update): payload canonical_url (required for create), purpose, status, duplicate_of, domains, aliases, metadata.', ['repos add', 'repos edit']);
 tool('status', 'GET', '/api/status', 'Authorized status; query accepts since, task, project, host, after, limit.', ['status']);
 tool('machines_available', 'GET', '/api/machines/available', 'List available machines.', ['machines available']);
 tool('fleet', 'GET', '/api/fleet', 'Fleet machines, native sessions, agents, accounts and launch lineage. Sessions paged (sessions_limit/cursor); sections= subsets.', ['fleet']);
