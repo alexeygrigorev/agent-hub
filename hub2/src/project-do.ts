@@ -15,7 +15,7 @@ import { PROJECT_WORK_SCHEMA, ProjectWork, type ProjectWorkHooks } from './proje
 import {
   COMPLETION_ACTOR, MAX_AUTO_CONTINUATIONS, MAX_CONTINUATION_TRIES, MAX_DELIVERY_TRIES,
   LAUNCH_SPEC_LIMIT, basePrompt, completionClaim, continuationPrompt, deliveryBody, promptWithContract, retryDelay, stripCompletion,
-  type CompletionClaim, type CompletionRecord,
+  type CompletionClaim, type CompletionRecord, type ContinuationSnapshot,
 } from './task-completion';
 import type { Actor, Hub2Env, JsonRecord } from './types';
 
@@ -1301,6 +1301,33 @@ export class ProjectDO {
     }
   }
 
+  /** Bounded state of exactly this intake, as of the event that recorded the
+   * terminal attempt's outcome. Read before any await and fixed per attempt, so
+   * a retried continuation start sends the same request; newer events stay
+   * available through `hub intake context`. */
+  private continuationSnapshot(intake:IntakeRow,saga:SagaRow):ContinuationSnapshot{
+    const through=this.db.one<{seq:number}>('SELECT seq FROM intake_events WHERE task_id=? AND event_key=?',intake.id,'completion:'+saga.operation_id)?.seq
+      ??this.db.one<{seq:number|null}>('SELECT MAX(seq) AS seq FROM intake_events WHERE task_id=?',intake.id)?.seq??0;
+    const context=this.db.one<{body_json:string}>("SELECT body_json FROM intake_events WHERE task_id=? AND kind='intake_context_updated' AND seq<=? ORDER BY seq DESC LIMIT 1",intake.id,through);
+    const rows=this.db.all<IntakeEventRow>(`SELECT seq,actor_id,kind,body_json,at FROM intake_events WHERE task_id=? AND seq<=?
+      AND kind IN ('created','worker_append','intake_updated','intake_context_updated') ORDER BY seq DESC LIMIT 51`,intake.id,through);
+    const fields=(value:unknown)=>{
+      const body=value&&typeof value==='object'&&!Array.isArray(value)?value as JsonRecord:{};
+      return INTAKE_CONTEXT_FIELDS.filter(field=>typeof body[field]==='string'&&(body[field] as string).trim()).map(field=>field+': '+String(body[field])).join('; ');
+    };
+    const text=(row:IntakeEventRow)=>{
+      const body=(this.parse(row.body_json)??{}) as JsonRecord,note=typeof body.note==='string'?body.note:'';
+      if(row.kind==='worker_append')return [note,body.evidence!==undefined?'evidence '+JSON.stringify(body.evidence).slice(0,2000):''].filter(Boolean).join(' | ');
+      if(row.kind==='intake_updated')return ['status '+String(body.status??''),note].filter(Boolean).join(': ');
+      if(row.kind==='intake_context_updated')return fields(body);
+      return 'title '+String(body.title??'');
+    };
+    const contextBody=context?this.parse(context.body_json) as JsonRecord|null:null;
+    return {through_seq:through,status:intake.status,
+      context:Object.fromEntries(INTAKE_CONTEXT_FIELDS.map(field=>[field,contextBody?.[field]??null])),
+      updates:rows.slice(0,50).reverse().map(row=>({seq:row.seq,kind:row.kind,actor:row.actor_id,text:text(row)})),more:rows.length>50};
+  }
+
   private async continueTask(intake:IntakeRow,record:CompletionRecord):Promise<void>{
     const action=record.continuation!,saga=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id=?',record.session_id);
     const launch=saga?this.parse(saga.launch_spec_json) as JsonRecord:undefined;
@@ -1316,7 +1343,7 @@ export class ProjectDO {
         ...(Array.isArray(route?.required_capabilities)?{required_capabilities:route!.required_capabilities}:{}),
         // A session killed at its deadline gets more time, within the start limit.
         timeout_seconds:record.reason==='deadline_exceeded'?Math.min(7200,timeout*2):timeout,
-        prompt:continuationPrompt(intake.id,depth,record.session_id,record.reason,basePrompt(String(launch.prompt??''))||intake.text)};
+        prompt:continuationPrompt(intake.id,depth,record.session_id,record.reason,basePrompt(String(launch.prompt??''))||intake.text,this.continuationSnapshot(intake,saga))};
       const actor:Actor={id:COMPLETION_ACTOR,kind:'agent',resource_id:intake.project,scopes:['session:start','intake:read','project:'+intake.project]};
       try{
         const response=await this.startIntake(new Request('https://project.internal/api/intakes/'+encodeURIComponent(intake.id)+'/start',{method:'POST',
