@@ -2101,3 +2101,20 @@ def test_managed_fresh_read_failure_never_restores_cached_older_generation(tmp_p
         p.managed_claude_materialize({},bundle,home,dest,unreachable)
     assert path.read_text()==fresh
     assert json.loads(state_file.read_text())==state
+
+
+def test_scoped_install_refuses_newer_state_before_hooks_or_package_writes(tmp_path,monkeypatch):
+    from agent_hub_host import credentials
+    monkeypatch.setenv('AGENT_HUB_MANAGED_DIR',str(tmp_path/'managed'))
+    b=dict(label='hub-claude',provider='claude',version='2.1.322',revision='33333333-3333-4333-8333-333333333333',
+           credential_generation=7,credential_paths=['.claude/.credentials.json'],files={'.claude/.credentials.json':'synthetic-central7'},env={},args=[])
+    dest=p.root()/(b['label']+'-'+b['revision']);home=dest/'home'
+    credentials.materialize_current(b,home,dest,7)
+    before=(home/'.claude/.credentials.json').read_bytes();before_state=(dest/credentials.STATE_FILE).read_bytes()
+    monkeypatch.setattr(p,'provision_managed_home',lambda *a,**kw:pytest.fail('must refuse before hooks'))
+    monkeypatch.setattr(p.subprocess,'run',lambda *a,**kw:pytest.fail('must refuse before package install'))
+    incoming={**b,'credential_generation':6,'files':{'.claude/.credentials.json':'synthetic-central6'}}
+    with pytest.raises(ValueError,match='generation conflict'):
+        p.install(incoming,lambda *a:pytest.fail('no API writeback'),credential_generation=6)
+    assert (home/'.claude/.credentials.json').read_bytes()==before
+    assert (dest/credentials.STATE_FILE).read_bytes()==before_state

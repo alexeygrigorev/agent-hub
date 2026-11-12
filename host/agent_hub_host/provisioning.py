@@ -1953,6 +1953,8 @@ def install(bundle, request=None, *, credential_generation=None):
         validate(bundle)
     dest = root() / (bundle['label'] + '-' + bundle['revision'])
     home = dest / 'home'
+    if credential_generation is not None:
+        credentials.materialize_current(bundle, home, dest, credential_generation, check_only=True)
     raw = read_json(dest / 'bundle.json')
     receipt = load_bundle(dest)
     # A new Hub credential generation is not a new install: only the
@@ -1960,8 +1962,11 @@ def install(bundle, request=None, *, credential_generation=None):
     paths = bundle.get('credential_paths') or []
     if (receipt is not None and credentials.install_snapshot(receipt, paths) == credentials.install_snapshot(bundle, paths)
             and (bundle['provider'] != 'go' or _go_engine_current(bundle, dest))):
+        if credential_generation is not None:
+            outcome = credentials.materialize_current(bundle, home, dest, credential_generation)
         provision_managed_home(bundle, home, dest)
-        outcome=credentials.reconcile(bundle['label'], bundle, home, dest, request or host_request)
+        if credential_generation is None:
+            outcome=credentials.reconcile(bundle['label'], bundle, home, dest, request or host_request)
         if credential_generation is not None and (outcome.get('generation')!=credential_generation or outcome.get('status')=='writeback_pending'):
             raise ValueError('Scoped credential materialization incomplete')
         if bundle.get('provider') == 'go':
@@ -2066,8 +2071,11 @@ def install(bundle, request=None, *, credential_generation=None):
             subprocess.run(engine_argv(bundle, dest) + ['--version'], env=clean_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=True)
         except (subprocess.SubprocessError, OSError):
             raise ValueError('Native engine verification failed') from None
+    if credential_generation is not None:
+        outcome = credentials.materialize_current(bundle, home, dest, credential_generation)
     provision_managed_home(bundle, home, dest)
-    outcome=credentials.reconcile(bundle['label'], bundle, home, dest, request or host_request)
+    if credential_generation is None:
+        outcome=credentials.reconcile(bundle['label'], bundle, home, dest, request or host_request)
     if credential_generation is not None and (outcome.get('generation')!=credential_generation or outcome.get('status')=='writeback_pending'):
         raise ValueError('Scoped credential materialization incomplete')
     if bundle.get('provider') == 'go':
