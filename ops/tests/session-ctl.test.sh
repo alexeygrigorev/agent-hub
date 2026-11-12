@@ -13,7 +13,10 @@ iso_root="$repo/.local/tmp"
 mkdir -p "$iso_root"
 iso_root="$(cd "$iso_root" && pwd -P)"
 iso="$(mktemp -d "$iso_root/session-ctl-test.XXXXXX")"
-cleanup() { case "$iso" in "$iso_root"/session-ctl-test.?*) rm -rf -- "$iso" ;; esac; }
+# The agent rm guard (ops/guard-bin/rm) protects $HOME, which is the run dir
+# during the test; cleanup runs with the caller's HOME so the guard stays intact.
+caller_home="${HOME:-}"
+cleanup() { case "$iso" in "$iso_root"/session-ctl-test.?*) HOME="$caller_home" rm -rf -- "$iso" ;; esac; }
 trap cleanup EXIT
 isolation_guard() {  # $1 = HOME candidate; 0 only for a run-owned dir that cannot reach live state
   local h r
