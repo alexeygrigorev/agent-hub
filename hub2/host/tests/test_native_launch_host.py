@@ -175,6 +175,110 @@ class GoalNativeEngineTest(unittest.TestCase):
 
 
 
+class ClaudeGoalConfigEnvironmentTests(unittest.TestCase):
+    # Exact metadata-only resolver extracted from native Claude2.1.322 (Qt).
+    NATIVE_RESOLVER = 'function Qt(e){return{globalConfig:nt(e||Bt(),".claude.json"),userSettings:nt(e||nt(Bt(),".claude"),"settings.json")}}'
+
+    def setUp(self):
+        root=Path(__file__).resolve().parents[3]/'.local/tmp'
+        root.mkdir(parents=True,exist_ok=True)
+        self.temp=tempfile.TemporaryDirectory(dir=root,prefix='claude-config-root-')
+        self.addCleanup(self.temp.cleanup)
+        self.home=Path(self.temp.name)/'home';self.home.mkdir(mode=0o700)
+        self.workspace=Path(self.temp.name)/'workspace';self.workspace.mkdir(mode=0o700)
+        self.launch_count=0
+        (self.home/'.claude').mkdir(mode=0o700)
+        (self.home/'.claude.json').write_text(json.dumps({'hasCompletedOnboarding':True}))
+        (self.home/'.claude/.claude.json').write_text(json.dumps({'hasCompletedOnboarding':False}))
+
+    def launch(self, inherited=None, private=None):
+        self.launch_count+=1
+        task_id='claude-config-root-'+str(self.launch_count)
+        captured={}
+        def runner(argv,**options):
+            child=argv[argv.index('--')+1:]
+            row={'id':'d6cf9872-8597-48a5-be64-990cdef4db31','tag':'task-'+task_id,
+                 'workspace':str(self.workspace),'engine':'claude','command':child,
+                 'created_at_ms':int(time.time()*1000),'phase':'running'}
+            captured.update(argv=argv,options=options,row=row)
+            return subprocess.CompletedProcess(argv,0,json.dumps(row),'')
+        adapter=nl.NativeLauncher({'routes':{'claude':{'provider':'claude'}}},runner=runner,aplexer='synthetic-a')
+        spec={'workspace':str(self.workspace),'engine':'claude','model':'sonnet','prompt':'synthetic goal',
+              'interactive':True,'with_goal':True,'timeout_seconds':600,
+              'session_id':'synthetic-session','operation_id':'synthetic-operation','epoch':1}
+        if private:spec.update(provider_home='/synthetic/private-manifest',client=mock.Mock())
+        binding={'runtime_deadline':int(time.time()*1000)+500000,'engine_binary_path':'/synthetic/private/claude'}
+        with mock.patch.dict(os.environ,{'HOME':str(self.home),'USERPROFILE':str(self.home)}), \
+                mock.patch.object(Path,'home',return_value=self.home), \
+                mock.patch.object(nl,'session_binding',return_value=binding), \
+                mock.patch.object(nl,'native_environment',return_value=private or {}), \
+                mock.patch.object(adapter,'register_goal',return_value={'status':'active'}) as register:
+            os.environ.pop('CLAUDE_CONFIG_DIR',None)
+            if inherited is not None:os.environ['CLAUDE_CONFIG_DIR']=inherited
+            adapter.launch(task_id,spec)
+        args=captured['argv'];prefix=args[:args.index('--')]
+        pairs=dict(prefix[i+1].split('=',1) for i,arg in enumerate(prefix[:-1]) if arg=='--env')
+        captured.update(child_env=pairs,reader_root=register.call_args.kwargs['claude_config_dir'])
+        captured['effective_env']={**captured['options']['env'],**pairs}  # Maintained builtin engine env is empty.
+        self.assertNotIn('--env-unset',prefix)  # Not an aplexer start option.
+        return captured
+
+    def resolve_native_metadata(self, config_dir):
+        # Runs only the extracted pure resolver against owned synthetic metadata;
+        # no native provider CLI, login, auth file or real configuration is read.
+        script=('const nt=require("node:path").join;const Bt=()=>process.argv[1];'+self.NATIVE_RESOLVER+
+                ';const paths=Qt(process.argv[2]||undefined);let onboarding=false;'
+                'try{onboarding=JSON.parse(require("node:fs").readFileSync(paths.globalConfig,"utf8")).hasCompletedOnboarding===true}'
+                'catch(e){if(e.code!=="ENOENT")throw e}process.stdout.write(JSON.stringify({...paths,onboarding}));')
+        done=subprocess.run(['node','-e',script,str(self.home),config_dir or ''],capture_output=True,text=True,check=True,timeout=5)
+        return json.loads(done.stdout)
+
+    def test_absent_and_empty_local_values_preserve_native_onboarding_default(self):
+        explicit_default=self.resolve_native_metadata(str(self.home/'.claude'))
+        self.assertFalse(explicit_default['onboarding'])
+        self.assertEqual(explicit_default['globalConfig'],str(self.home/'.claude/.claude.json'))
+        for inherited in (None,''):
+            with self.subTest(inherited=inherited):
+                captured=self.launch(inherited)
+                self.assertNotIn('CLAUDE_CONFIG_DIR',captured['child_env'])
+                self.assertNotIn('CLAUDE_CONFIG_DIR',captured['options']['env'])
+                metadata=self.resolve_native_metadata(captured['effective_env'].get('CLAUDE_CONFIG_DIR'))
+                self.assertTrue(metadata['onboarding'])
+                self.assertEqual(metadata['globalConfig'],str(self.home/'.claude.json'))
+                self.assertEqual(metadata['userSettings'],str(self.home/'.claude/settings.json'))
+                self.assertEqual(captured['reader_root'],str(self.home/'.claude'))
+
+    def test_nonempty_explicit_and_private_home_overrides_pin_same_child_and_reader(self):
+        explicit=str(self.home/'explicit override')
+        trusted=str(self.home/'trusted private/.claude')
+        for inherited,private,expected in [(explicit,None,explicit),
+                (explicit,{'HOME':str(self.home/'trusted private'),'CLAUDE_CONFIG_DIR':trusted},trusted)]:
+            with self.subTest(private=private):
+                captured=self.launch(inherited,private)
+                self.assertEqual(captured['child_env']['CLAUDE_CONFIG_DIR'],expected)
+                self.assertEqual(captured['effective_env']['CLAUDE_CONFIG_DIR'],expected)
+                self.assertEqual(captured['reader_root'],expected)
+                if private:self.assertEqual(captured['child_env']['HOME'],private['HOME'])
+                metadata=self.resolve_native_metadata(expected)
+                self.assertEqual(metadata['globalConfig'],str(Path(expected)/'.claude.json'))
+                self.assertEqual(metadata['userSettings'],str(Path(expected)/'settings.json'))
+
+    def test_unresolved_custom_engine_root_does_not_prove_a_goal_at_default_reader(self):
+        from datetime import datetime,timezone
+        import re
+        captured=self.launch()
+        row=captured['row'];thread=nl.claude_goal.conversation_id(row['command'])
+        injected=self.home/'custom-engine-config'
+        path=injected/'projects'/re.sub(r'[^A-Za-z0-9]','-',row['workspace'])/(thread+'.jsonl')
+        path.parent.mkdir(parents=True)
+        event={'type':'attachment','isSidechain':False,'sessionId':thread,'cwd':row['workspace'],
+               'timestamp':datetime.now(timezone.utc).isoformat(),
+               'attachment':{'type':'goal_status','met':False,'sentinel':True,'condition':'synthetic goal'}}
+        path.write_text(json.dumps(event)+'\n')
+        self.assertEqual(nl.claude_goal.goal_store(row,injected,thread,nl.objective_hash)['status'],'active')
+        self.assertIsNone(nl.claude_goal.goal_store(row,captured['reader_root'],thread,nl.objective_hash))
+
+
 class FirstActionTest(unittest.TestCase):
     def start_record(self, tmp):
         return {'id': 'd6cf9872-8597-48a5-be64-990cdef4db31', 'tag': 'task-t1',
