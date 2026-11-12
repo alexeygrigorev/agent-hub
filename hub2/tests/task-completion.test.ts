@@ -912,3 +912,68 @@ test('an operator stop keeps its reason and raises no developer alert even after
     assert.equal(events(f,id).filter(e=>e.kind==='developer_alert_raised'&&e.body.kind==='blocked').length,0);
   }finally{f.close();}
 });
+
+// P4: committed work remains discoverable after the previous attempt ends.
+test('salvage finish evidence persists on the intake and names the same branch in a continuation',async()=>{
+  for(const status of ['pushed','already_present']){
+    const f=fixture();
+    try{
+      const id=await createIntake(f,'salvage-'+status);
+      assert.equal((await start(f,id,'first')).status,201);
+      const first=await run(f,id);
+      const saved={repo:'/srv/work/feature',remote:'origin',branch:'fix/preserved-work',head_sha:'a'.repeat(40),status};
+      const response=await f.call('/_internal/finish','POST',{...first,exit_code:137,native_exit_confirmed:true,
+        evidence:{result:'killed',git_salvage:saved}});
+      assert.equal(response.status,200);
+      assert.deepEqual(JSON.parse(intakeRow(f,id).final_evidence_json).git_salvage,saved);
+      assert.deepEqual(events(f,id).find(e=>e.kind==='finish_evidence_received').body.evidence.git_salvage,saved);
+      // Progress chatter must not bury the branch outside the newest 50 notes.
+      for(let n=0;n<55;n++)await note(f,id,'post-exit-'+n,'verification progress '+n);
+      f.reopen();
+      await f.project.alarm();
+      const launch=latestLaunch(f,id);
+      assert.equal(launch.workspace,'/srv/work/feature','continuation keeps the bound worktree');
+      for(const text of [saved.branch,saved.head_sha,saved.repo,'Reuse this branch','existing PR'])
+        assert(launch.prompt.includes(text),'continuation includes '+text);
+      assert.equal(sagas(f,id).length,2,'exactly one continuation');
+      assert(events(f,id).some(e=>e.kind==='finish_evidence_received'&&e.body.evidence.git_salvage.branch===saved.branch),
+        'receipt survives clearing final evidence on reassignment');
+    }finally{f.close();}
+  }
+});
+
+test('continuation salvage ignores failed or malformed push evidence and other attempts',async()=>{
+  for(const saved of [
+    {repo:'/srv/work/feature',remote:'origin',branch:'DO-NOT-REUSE-FAILED',head_sha:'a'.repeat(40),status:'failed'},
+    {repo:'/srv/work/feature',remote:'origin',branch:'DO-NOT-REUSE-BAD-SHA',head_sha:'invalid',status:'pushed'},
+  ]){
+    const f=fixture();
+    try{
+      const id=await createIntake(f,'salvage-invalid');
+      assert.equal((await start(f,id,'first')).status,201);
+      const first=await run(f,id);
+      assert.equal((await f.call('/_internal/finish','POST',{...first,exit_code:1,native_exit_confirmed:true,
+        evidence:{git_salvage:saved}})).status,200);
+      (f.project as any).transaction(()=>(f.project as any).appendEvent(id,'foreign-finish','hub2-host','finish_evidence_received',
+        {session_id:'foreign-attempt',evidence:{git_salvage:{...saved,status:'pushed',branch:'FOREIGN-BRANCH',head_sha:'b'.repeat(40)}}},Date.now()));
+      await f.project.alarm();
+      const prompt=latestLaunch(f,id).prompt;
+      assert(!prompt.includes('DO-NOT-REUSE')&&!prompt.includes('FOREIGN-BRANCH'));
+    }finally{f.close();}
+  }
+});
+
+test('continuation snapshot can read qualified late-stop salvage without altering stop recovery',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'late-stop-salvage');
+    assert.equal((await start(f,id,'first')).status,201);
+    const first=await run(f,id);
+    await finish(f,first,1);
+    (f.project as any).transaction(()=>(f.project as any).appendEvent(id,'late-stop-finish','hub2-host','session_finish_after_stop',
+      {session_id:first.session_id,evidence:{git_salvage:{repo:'/srv/work/feature',remote:'origin',branch:'fix/late-stop',head_sha:'c'.repeat(40),status:'pushed'}}},Date.now()));
+    await f.project.alarm();
+    assert(latestLaunch(f,id).prompt.includes('fix/late-stop'));
+    assert(latestLaunch(f,id).prompt.includes('c'.repeat(40)));
+  }finally{f.close();}
+});
