@@ -408,15 +408,24 @@ export class ControlDO {
       || !Number.isSafeInteger(Number(raw)) || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(revision))
       return error('invalid_generation_check', 400);
     const generation = Number(raw);
-    if (await this.engineRevision(this.engineVersionFor(actor.resource_id)) !== revision) return error('revision_changed', 409);
+    if (!await this.engineRevisionStable(actor.resource_id, revision)) return error('revision_changed', 409);
     const response = await this.accountRequest('/api/account/credentials?expected_generation=' + generation, 'GET', actor);
     if (!response.ok) return response;
     const observed = await response.json() as any;
     if (observed?.generation !== generation || observed?.status !== 'current' || observed?.provider !== 'claude')
       return error('generation_conflict', 409);
     // Rollout state may change while the account request is awaited.
-    if (await this.engineRevision(this.engineVersionFor(actor.resource_id)) !== revision) return error('revision_changed', 409);
+    if (!await this.engineRevisionStable(actor.resource_id, revision)) return error('revision_changed', 409);
     return json({ label: CLAUDE_ENGINE_LABEL, generation, revision, status: 'current' });
+  }
+
+  // The rollout can change while the revision digest is awaited: capture the
+  // version, await its revision, then synchronously re-read the version. Only a
+  // stable version with the expected revision passes.
+  private async engineRevisionStable(machineId: string, expected: string): Promise<boolean> {
+    const version = this.engineVersionFor(machineId);
+    const revision = await this.engineRevision(version);
+    return this.engineVersionFor(machineId) === version && revision === expected;
   }
 
   private async engineAdmission(request: Request, actor?: Actor): Promise<Response> {

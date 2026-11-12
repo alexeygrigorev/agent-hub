@@ -456,3 +456,30 @@ test('host re-pin generation check rechecks revision after the account await', a
   assert.equal(response.status, 409);
   assert.equal((await response.json() as any).error, 'revision_changed');
 });
+
+test('host re-pin generation check rechecks the rollout version after the final revision digest', async () => {
+  const revision = await currentRevision();
+  let control: ReturnType<typeof fixture>;
+  let armed = false, raced = false;
+  const subtle = crypto.subtle as any, digest = subtle.digest;
+  // Change the rollout while the FINAL revision digest is pending: the version
+  // was already captured, so only a synchronous re-read can catch it.
+  Object.defineProperty(subtle, 'digest', { configurable: true, writable: true, value: async (...args: any[]) => {
+    const result = await digest.apply(subtle, args);
+    if (armed && !raced) {
+      raced = true;
+      control.database.prepare("INSERT OR REPLACE INTO hub2_engine_rollout(engine,desired_version,latest,rollout_id,target_version,previous_version,canary_machine,state,updated_at) VALUES('claude','2.1.312','9.9.9','r1','9.9.9','2.1.312','RMTHZ','canary_pending',1)").run();
+    }
+    return result;
+  } });
+  try {
+    const account = { fetch: async () => { armed = true; return Response.json({ generation: 7, provider: 'claude', status: 'current' }); } };
+    control = fixture(account as any);
+    const response = await control.call(generationPath(7, revision), 'GET', undefined, machine);
+    assert.ok(raced, 'rollout changed during the final digest');
+    assert.equal(response.status, 409);
+    assert.equal((await response.json() as any).error, 'revision_changed');
+  } finally {
+    delete subtle.digest;
+  }
+});
