@@ -544,9 +544,16 @@ class CanaryTest(unittest.TestCase):
         self.assertEqual((r.returncode, value['ok'], value['stage']), (0, True, None))
         prompt = (self.tmp / 'prompt').read_text()
         self.assertIn('two sequential shell tool calls', prompt)
-        self.assertIn('provider-native background tool facility for a separate bounded 60-second hold', prompt)
-        self.assertIn('monitoring it internally so the orchestrator can stop this session', prompt)
-        self.assertIn('Do not chain the print with a foreground sleep or wait externally', prompt)
+        self.assertIn('First use the provider-native background tool facility for a separate bounded 60-second hold', prompt)
+        self.assertLess(
+            prompt.index('First use the provider-native background tool facility'),
+            prompt.index('then run a separate foreground shell command'),
+        )
+        self.assertIn('enter a provider-native blocking monitor, TaskOutput, or status wait on that existing background hold task', prompt)
+        self.assertIn('monitoring it internally so the orchestrator can stop this session before any final prose or completion bookkeeping', prompt)
+        self.assertIn('do not merely emit a waiting answer and finish the turn', prompt)
+        self.assertIn('Do not chain the print with a foreground sleep, poll in a loop, or wait externally', prompt)
+        self.assertIn('Apart from mandatory Hub first-action/completion evidence files if required by the session wrapper', prompt)
         for scenario in ('json_prompt_only', 'json_message_output', 'json_result_output', 'json_arbitrary_marker'):
             with self.subTest(scenario=scenario):
                 self.assert_stage(scenario, 'capture', 'no_output_beyond_prompt', mode='full')
@@ -2200,6 +2207,206 @@ class CanaryTest(unittest.TestCase):
                 mod.paired_stream_output_ok(text, marker, "antigravity"),
                 acc.paired_stream_output_ok(text, marker, "antigravity"),
             )
+
+        # 5. Identical parser AST across canary and acceptance, plus Claude background-start control
+        # non-proof handling and 4096-byte tail preservation at the quiet blocking-monitor point.
+        import ast, inspect
+        self.assertEqual(
+            ast.dump(ast.parse(inspect.getsource(mod.paired_stream_output_ok))),
+            ast.dump(ast.parse(inspect.getsource(acc.paired_stream_output_ok))),
+        )
+        session = "11111111-2222-4333-8444-555555555555"
+
+        def padded_frame(obj, target_len):
+            raw = json.dumps(obj, separators=(",", ":"))
+            self.assertLessEqual(len(raw), target_len)
+            if len(raw) < target_len:
+                pad_key = "_pad"
+                overhead = len(json.dumps({pad_key: ""}, separators=(",", ":"))) - 1
+                obj = dict(obj, **{pad_key: "x" * max(0, target_len - len(raw) - overhead)})
+                raw = json.dumps(obj, separators=(",", ":"))
+            self.assertEqual(len(raw), target_len)
+            return raw
+
+        def bg_frames(task_id="bg_synth_01", cmd="sleep 60; echo done", content_override=None, stdout_val="", is_err=False, interrupted_val=False, stderr_val="", bg_flag=True):
+            content_str = (
+                content_override
+                if content_override is not None
+                else f"Command running in background with ID: {task_id}. Output is being written to: /tmp/synthetic-claude/tasks/{task_id}.output"
+            )
+            use_ev = {
+                "type": "assistant",
+                "session_id": session,
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_synthetic_bg_hold",
+                            "name": "Bash",
+                            "input": {
+                                "command": cmd,
+                                "description": "Hold 60 seconds in background",
+                                "run_in_background": bg_flag,
+                                "timeout": 120000,
+                            },
+                        }
+                    ],
+                },
+            }
+            hook_1 = {"type": "system", "subtype": "hook_started", "session_id": session}
+            hook_2 = {"type": "system", "subtype": "hook_response", "session_id": session, "outcome": "success"}
+            res_ev = {
+                "type": "user",
+                "session_id": session,
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_synthetic_bg_hold",
+                            "content": content_str,
+                            "is_error": is_err,
+                        }
+                    ],
+                },
+                "tool_use_result": {
+                    "stdout": stdout_val,
+                    "stderr": stderr_val,
+                    "interrupted": interrupted_val,
+                    "isImage": False,
+                    "noOutputExpected": False,
+                    "backgroundTaskId": task_id,
+                },
+            }
+            return [use_ev, hook_1, hook_2, res_ev]
+
+        valid_fg = provider_frames("claude", marker)
+        valid_bg = bg_frames()
+        # Both orders (valid foreground pair followed by background control pair as in 23:25Z lines 9..14,
+        # and background control pair followed by valid foreground pair) must pass.
+        for combined in (valid_fg + valid_bg, valid_bg + valid_fg):
+            txt = jsonl(combined)
+            self.assertTrue(c_full.output_has_marker(txt, engine="claude"))
+            self.assertTrue(mod.paired_stream_output_ok(txt, marker, "claude"))
+            self.assertTrue(acc.paired_stream_output_ok(txt, marker, "claude"))
+
+        # Observed byte-size layout (17260B prefix + 1174B bg tool_use + 291B/337B hooks + 950B bg tool_result
+        # + 1106B fg marker tool_use + 609B fg marker tool_result + 520B blocking TaskOutput tool_use + 291B/337B hooks):
+        # at the quiet blocking-monitor point, the 4096-byte tail slice preserves the complete foreground marker pair.
+        prefix_line = padded_frame({"type": "system", "subtype": "init", "session_id": session}, 11000)
+        first_action_res = padded_frame({"type": "system", "subtype": "first_action", "session_id": session}, 6259)
+        bg_use_line = padded_frame(valid_bg[0], 1174)
+        bg_hook1_line = padded_frame(valid_bg[1], 291)
+        bg_hook2_line = padded_frame(valid_bg[2], 337)
+        bg_res_line = padded_frame(valid_bg[3], 950)
+        fg_use_line = padded_frame(valid_fg[0], 1106)
+        fg_res_line = padded_frame(valid_fg[1], 609)
+        monitor_use_line = padded_frame(
+            {
+                "type": "assistant",
+                "session_id": session,
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_synthetic_monitor",
+                            "name": "TaskOutput",
+                            "input": {"task_id": "bg_synth_01", "block": True, "timeout": 60000},
+                        }
+                    ],
+                },
+            },
+            520,
+        )
+        mon_hook1_line = padded_frame(valid_bg[1], 291)
+        mon_hook2_line = padded_frame(valid_bg[2], 337)
+        stream_at_blocking_monitor = "\n".join(
+            [
+                prefix_line,
+                first_action_res,
+                bg_use_line,
+                bg_hook1_line,
+                bg_hook2_line,
+                bg_res_line,
+                fg_use_line,
+                fg_res_line,
+                monitor_use_line,
+                mon_hook1_line,
+                mon_hook2_line,
+            ]
+        ) + "\n"
+        tail_4096 = stream_at_blocking_monitor.encode("utf-8")[-4096:].decode("utf-8")
+        self.assertEqual(len(tail_4096.encode("utf-8")), 4096)
+        self.assertIn(fg_use_line, tail_4096)
+        self.assertIn(fg_res_line, tail_4096)
+        self.assertTrue(c_full.output_has_marker(tail_4096, engine="claude"))
+        self.assertTrue(mod.paired_stream_output_ok(tail_4096, marker, "claude"))
+        self.assertTrue(acc.paired_stream_output_ok(tail_4096, marker, "claude"))
+
+        # Conversely, in the old order where fg pair ran before bg hold AND the turn finished with 915B prose + 2524B result,
+        # the 4096-byte tail evicted the fg pair; our parser must reject that evicted tail (no prose/result acceptance).
+        prose_line = padded_frame(
+            {
+                "type": "assistant",
+                "session_id": session,
+                "message": {"role": "assistant", "content": [{"type": "text", "text": marker}]},
+            },
+            915,
+        )
+        turn_result_line = padded_frame({"type": "result", "subtype": "success", "result": marker}, 2524)
+        old_evicted_stream = "\n".join(
+            [
+                prefix_line,
+                first_action_res,
+                fg_use_line,
+                fg_res_line,
+                bg_use_line,
+                bg_hook1_line,
+                bg_hook2_line,
+                bg_res_line,
+                prose_line,
+                turn_result_line,
+            ]
+        ) + "\n"
+        evicted_tail_4096 = old_evicted_stream.encode("utf-8")[-4096:].decode("utf-8")
+        self.assertFalse(c_full.output_has_marker(evicted_tail_4096, engine="claude"))
+        self.assertFalse(mod.paired_stream_output_ok(evicted_tail_4096, marker, "claude"))
+        self.assertFalse(acc.paired_stream_output_ok(evicted_tail_4096, marker, "claude"))
+
+        # Background-only and negative background control mutations must all fail closed.
+        fg_with_bg_res = provider_frames("claude", marker)
+        fg_with_bg_res[1]["tool_use_result"]["backgroundTaskId"] = "bg_synth_01"
+        bg_with_fg_res = bg_frames()
+        bg_with_fg_res[3]["tool_use_result"].pop("backgroundTaskId", None)
+        bg_with_fg_res[3]["tool_use_result"]["stdout"] = marker + "\n"
+        bg_with_fg_res[3]["message"]["content"][0]["content"] = marker + "\n"
+
+        negative_bg_streams = [
+            valid_bg,
+            bg_frames(cmd=marker),
+            bg_frames(content_override=f"Command running in background with ID: bg_synth_01.\n{marker}"),
+            bg_frames(content_override=marker, stdout_val=marker),
+            bg_with_fg_res,
+            valid_fg + bg_with_fg_res,
+            fg_with_bg_res,
+            valid_fg + fg_with_bg_res,
+            valid_fg + bg_frames(bg_flag=1),
+            valid_fg + bg_frames(bg_flag="true"),
+            valid_fg + bg_frames(task_id=""),
+            valid_fg + bg_frames(task_id="bad id!"),
+            valid_fg + bg_frames(content_override="Command running in background with ID: other_id. Output is being written."),
+            valid_fg + bg_frames(stdout_val="unexpected stdout"),
+            valid_fg + bg_frames(stderr_val="unexpected stderr"),
+            valid_fg + bg_frames(is_err=True),
+            valid_fg + bg_frames(interrupted_val=True),
+        ]
+        for neg_frames in negative_bg_streams:
+            neg_text = jsonl(neg_frames)
+            self.assertFalse(c_full.output_has_marker(neg_text, engine="claude"), neg_text)
+            self.assertFalse(mod.paired_stream_output_ok(neg_text, marker, "claude"), neg_text)
+            self.assertFalse(acc.paired_stream_output_ok(neg_text, marker, "claude"), neg_text)
 
 
 if __name__ == "__main__":

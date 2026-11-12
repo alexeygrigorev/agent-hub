@@ -82,7 +82,10 @@ lowercase native UUIDs. Every show response must name the exact requested sessio
 A mismatch ends the run; cleanup uses only the ID returned by this run's keyed
 start, never a foreign ID from a mismatching show response.
 
-The probe asks for a completed print tool call followed by a separate hold call.
+The probe asks for a separate bounded 60-second background hold first, followed
+by a separate foreground marker print tool call and an immediate provider-native
+blocking monitor, `TaskOutput`, or status wait on the background hold task before
+any final prose or completion bookkeeping.
 JSON shape alone cannot prove a tool ran: a plaintext assistant can print a fake
 JSON event. Root must attest the actual effective launch transport before the
 run, using `operator_validation.capture_transports`. The map contains at most
@@ -122,7 +125,9 @@ For Claude, one capture must contain a complete assistant Bash `tool_use` and a
 later user `tool_result` with the same tool ID and provider session. The result
 must explicitly report `is_error:false` and `interrupted:false`, empty stderr,
 and exactly equal structured stdout/content containing the standalone nonce.
-Orphan results, mismatched/reused IDs, errors, interruptions and text/input echoes
+A validated `run_in_background:true` Bash `tool_use` paired with its
+`backgroundTaskId` control `tool_result` (`stdout:""` and matching `Command running in background with ID: <id>.` prefix) never proves marker output, but does not invalidate a distinct completed foreground Bash nonce pair in the same capture.
+Orphan results, mismatched/reused IDs, errors, interruptions, contradictory background/foreground results, and text/input echoes
 cannot prove output.
 
 For Argon, one capture must contain complete `step_update` tool/run_command

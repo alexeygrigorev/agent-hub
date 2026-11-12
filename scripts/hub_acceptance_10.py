@@ -228,12 +228,16 @@ def alert_changes(before, after):
 def make_probe():
     marker = 'ACCEPTANCE-OK:' + uuid.uuid4().hex
     encoded = base64.b64encode(marker.encode()).decode()
-    prompt = ('Use two sequential shell tool calls. First run `python3 -c '
-              "'import base64; print(base64.b64decode(\"%s\").decode())'` and let it finish. "
-              'Then use the provider-native background tool facility for a separate bounded60-second hold, '
-              'monitoring it internally so the orchestrator can stop this session. '
-              'Do not chain the print with a foreground sleep or wait externally; external waits require a Hub wake. '
-              'Do not edit files, start another agent, or exit early.' % encoded)
+    prompt = ('Use two sequential shell tool calls. First use the provider-native background tool facility for a '
+              'separate bounded 60-second hold (`sleep 60`), then run a separate foreground shell command '
+              '`python3 -c \'import base64; print(base64.b64decode("%s").decode())\'` as one output line and let it '
+              'finish. Immediately after the marker print finishes, enter a provider-native blocking monitor, '
+              'TaskOutput, or status wait on that existing background hold task, monitoring it internally so the '
+              'orchestrator can stop this session before any final prose or completion bookkeeping; do not merely '
+              'emit a waiting answer and finish the turn. '
+              'Do not chain the print with a foreground sleep, poll in a loop, or wait externally; external waits '
+              'require a Hub wake. Apart from mandatory Hub first-action/completion evidence files if required by the '
+              'session wrapper, do not create or edit other files, start another agent, or exit early.' % encoded)
     return prompt, marker
 
 
@@ -305,7 +309,10 @@ def paired_stream_output_ok(captured, expected, engine):
                     if (message.get('role') != 'assistant' or block.get('name') != 'Bash'
                             or not isinstance(params, dict) or not isinstance(params.get('command'), str)):
                         continue
-                    uses[identity] = session
+                    background = params.get('run_in_background')
+                    if background is not None and type(background) is not bool:
+                        return False
+                    uses[identity] = (session, background is True)
                 elif event['type'] == 'user' and block.get('type') == 'tool_result':
                     identity = block.get('tool_use_id')
                     if not provider_id(identity) or identity in results:
@@ -313,12 +320,20 @@ def paired_stream_output_ok(captured, expected, engine):
                     results.add(identity)
                     if identity not in uses:  # An orphan alone can never prove output.
                         continue
+                    use_session, is_background = uses[identity]
                     detail = event.get('tool_use_result')
-                    if (session != uses[identity] or message.get('role') != 'user'
+                    if (session != use_session or message.get('role') != 'user'
                             or block.get('is_error') is not False or not isinstance(detail, dict)
                             or detail.get('interrupted') is not False or detail.get('stderr') != ''
-                            or not isinstance(block.get('content'), str)
-                            or detail.get('stdout') != block['content']):
+                            or not isinstance(block.get('content'), str)):
+                        return False
+                    if is_background:
+                        bg_task_id = detail.get('backgroundTaskId')
+                        if (not provider_id(bg_task_id) or detail.get('stdout') != ''
+                                or not block['content'].startswith(f'Command running in background with ID: {bg_task_id}.')):
+                            return False
+                        continue
+                    if detail.get('backgroundTaskId') is not None or detail.get('stdout') != block['content']:
                         return False
                     proven = proven or marker_in(block['content'])
         else:

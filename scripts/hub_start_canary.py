@@ -286,6 +286,10 @@ def unique_object(pairs):
     return value
 
 
+def valid_native_id(val):
+    return Canary.valid_native_id(val)
+
+
 def paired_stream_output_ok(captured, expected, engine):
     """Complete provider frames from ONE capture only; never repair clipped JSON."""
     if len(captured.encode()) > 65536:
@@ -326,7 +330,7 @@ def paired_stream_output_ok(captured, expected, engine):
                     continue
                 if event["type"] == "assistant" and block.get("type") == "tool_use":
                     identity = block.get("id")
-                    if not provider_id(identity) or not Canary.valid_native_id(session):
+                    if not provider_id(identity) or not valid_native_id(session):
                         return False
                     if identity in uses:
                         return False
@@ -338,7 +342,10 @@ def paired_stream_output_ok(captured, expected, engine):
                         or not isinstance(params.get("command"), str)
                     ):
                         continue
-                    uses[identity] = session
+                    background = params.get("run_in_background")
+                    if background is not None and type(background) is not bool:
+                        return False
+                    uses[identity] = (session, background is True)
                 elif event["type"] == "user" and block.get("type") == "tool_result":
                     identity = block.get("tool_use_id")
                     if not provider_id(identity) or identity in results:
@@ -346,17 +353,28 @@ def paired_stream_output_ok(captured, expected, engine):
                     results.add(identity)
                     if identity not in uses:  # An orphan alone can never prove output.
                         continue
+                    use_session, is_background = uses[identity]
                     detail = event.get("tool_use_result")
                     if (
-                        session != uses[identity]
+                        session != use_session
                         or message.get("role") != "user"
                         or block.get("is_error") is not False
                         or not isinstance(detail, dict)
                         or detail.get("interrupted") is not False
                         or detail.get("stderr") != ""
                         or not isinstance(block.get("content"), str)
-                        or detail.get("stdout") != block["content"]
                     ):
+                        return False
+                    if is_background:
+                        bg_task_id = detail.get("backgroundTaskId")
+                        if (
+                            not provider_id(bg_task_id)
+                            or detail.get("stdout") != ""
+                            or not block["content"].startswith(f"Command running in background with ID: {bg_task_id}.")
+                        ):
+                            return False
+                        continue
+                    if detail.get("backgroundTaskId") is not None or detail.get("stdout") != block["content"]:
                         return False
                     proven = proven or marker_in(block["content"])
         else:
@@ -366,7 +384,7 @@ def paired_stream_output_ok(captured, expected, engine):
             conversation, index = step.get("conversation_id"), step.get("step_index")
             info = step.get("tool_info")
             if (
-                not Canary.valid_native_id(conversation)
+                not valid_native_id(conversation)
                 or type(index) is not int
                 or not 0 <= index <= 2**31 - 1
                 or step.get("tool_name") != "run_command"
@@ -495,11 +513,15 @@ class Canary:
                 f"printf '%s:%s:%s\\n' CANARY-OK {sha12} {run_token}; sleep 30"
                 if mode == "shell"
                 else (
-                    f'Use two sequential shell tool calls. First run a shell command that prints the concatenation of "CANARY-", "OK:", and "{sha12}:{run_token}" '
-                    "as one output line and let it finish. Then use the provider-native background tool facility for a separate bounded 60-second hold, "
-                    "monitoring it internally so the orchestrator can stop this session. "
-                    "Do not chain the print with a foreground sleep or wait externally; external waits require a Hub wake. "
-                    "Do not edit files, start another agent, or exit early."
+                    "Use two sequential shell tool calls. First use the provider-native background tool facility for a "
+                    "separate bounded 60-second hold (`sleep 60`), then run a separate foreground shell command that prints the "
+                    f'concatenation of "CANARY-", "OK:", and "{sha12}:{run_token}" as one output line and let it finish. '
+                    "Immediately after the marker print finishes, enter a provider-native blocking monitor, TaskOutput, or "
+                    "status wait on that existing background hold task, monitoring it internally so the orchestrator can stop "
+                    "this session before any final prose or completion bookkeeping; do not merely emit a waiting answer and finish the turn. "
+                    "Do not chain the print with a foreground sleep, poll in a loop, or wait externally; external waits require a Hub wake. "
+                    "Apart from mandatory Hub first-action/completion evidence files if required by the session wrapper, "
+                    "do not create or edit other files, start another agent, or exit early."
                 )
             )
         else:
@@ -507,11 +529,15 @@ class Canary:
             # The complete expected output never occurs in the model prompt. A
             # wrapped echo of the prompt therefore cannot count as execution.
             self.prompt = PROMPTS["shell"] if mode == "shell" else (
-                f'Use two sequential shell tool calls. First run a shell command that prints the concatenation of "CANARY-", "OK:", and "{run_id}" '
-                "as one output line and let it finish. Then use the provider-native background tool facility for a separate bounded 60-second hold, "
-                "monitoring it internally so the orchestrator can stop this session. "
-                "Do not chain the print with a foreground sleep or wait externally; external waits require a Hub wake. "
-                "Do not edit files, start another agent, or exit early."
+                "Use two sequential shell tool calls. First use the provider-native background tool facility for a "
+                "separate bounded 60-second hold (`sleep 60`), then run a separate foreground shell command that prints the "
+                f'concatenation of "CANARY-", "OK:", and "{run_id}" as one output line and let it finish. '
+                "Immediately after the marker print finishes, enter a provider-native blocking monitor, TaskOutput, or "
+                "status wait on that existing background hold task, monitoring it internally so the orchestrator can stop "
+                "this session before any final prose or completion bookkeeping; do not merely emit a waiting answer and finish the turn. "
+                "Do not chain the print with a foreground sleep, poll in a loop, or wait externally; external waits require a Hub wake. "
+                "Apart from mandatory Hub first-action/completion evidence files if required by the session wrapper, "
+                "do not create or edit other files, start another agent, or exit early."
             )
         self.session = self.native = self.engine = None
         self.started_at = self.running_deadline = None
