@@ -93,9 +93,8 @@ def link(target, path):
 
 
 def write_json(path, data):
-    pending = path.with_name(path.name + '.tmp')
-    pending.write_text(json.dumps(data, sort_keys=True) + '\n')
-    pending.replace(path)
+    # Receipts must remain private even when the updater inherits umask 0002.
+    durable_write(path, (json.dumps(data, sort_keys=True) + '\n').encode(), 0o600)
 
 
 def failure(root, version):

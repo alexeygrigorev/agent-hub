@@ -122,6 +122,81 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
         self.assertFalse(any('systemctl' in args and 'stop' in args for args in self.calls))
         self.assertEqual(os.readlink(self.root / 'current/bin/hub'), '../hub.pyz')
 
+    def test_permissive_umask_install_and_same_version_reuse_keep_private_receipt(self):
+        previous = os.umask(0o002)
+        try:
+            self.install(install_service=True, restart=False)
+            target = (self.root / 'current').resolve()
+            receipt = target / 'release.json'
+            snapshot = target / 'units-before.json'
+            original, inode = receipt.read_bytes(), receipt.stat().st_ino
+            self.assertEqual(json.loads(original), self.manifest)
+            self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(snapshot.stat().st_mode & 0o777, 0o600)
+            self.calls.clear()
+            self.install(restart=False)
+            self.assertEqual((receipt.read_bytes(), receipt.stat().st_ino), (original, inode))
+            self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(self.calls, [])
+        finally:
+            os.umask(previous)
+
+    def test_same_version_does_not_implicitly_mutate_legacy_receipt(self):
+        self.install(restart=False)
+        receipt = (self.root / 'current').resolve() / 'release.json'
+        receipt.chmod(0o664)  # Owned synthetic legacy receipt; no live release.
+        original, inode = receipt.read_bytes(), receipt.stat().st_ino
+        self.calls.clear()
+        self.install(restart=False)
+        self.assertEqual((receipt.read_bytes(), receipt.stat().st_ino), (original, inode))
+        self.assertEqual(receipt.stat().st_mode & 0o777, 0o664)
+        self.assertEqual(self.calls, [])
+
+    def test_private_json_write_does_not_follow_old_fixed_temporary_links(self):
+        previous = os.umask(0o002)
+        try:
+            self.root.mkdir()
+            for kind in ('symlink', 'hardlink'):
+                with self.subTest(kind=kind):
+                    foreign = self.root / (kind + '-foreign')
+                    foreign.write_bytes(b'synthetic unrelated bytes')
+                    receipt = self.root / (kind + '.json')
+                    legacy_temp = receipt.with_name(receipt.name + '.tmp')
+                    if kind == 'symlink':
+                        legacy_temp.symlink_to(foreign)
+                    else:
+                        os.link(foreign, legacy_temp)
+                    original = foreign.read_bytes()
+                    updater.write_json(receipt, {'synthetic': True})
+                    self.assertEqual(json.loads(receipt.read_bytes()), {'synthetic': True})
+                    self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
+                    self.assertEqual(receipt.stat().st_nlink, 1)
+                    self.assertEqual(foreign.read_bytes(), original)
+                    self.assertTrue(legacy_temp.exists())
+        finally:
+            os.umask(previous)
+
+    def test_retained_rebuild_and_cleanup_resume_preserve_private_receipt(self):
+        previous = os.umask(0o002)
+        try:
+            _, retained, _ = self.prepare_retained_switch()
+            receipt = retained / 'release.json'
+            original = receipt.read_bytes()
+            receipt.chmod(0o664)  # Rebuild verifies and replaces this owned fixture.
+            with patch.object(updater, 'finish_retained_switch', side_effect=OSError('cleanup interrupted')):
+                with self.assertRaisesRegex(OSError, 'cleanup interrupted'):
+                    self.install()
+            inode = receipt.stat().st_ino
+            self.assertEqual((receipt.read_bytes(), receipt.stat().st_mode & 0o777), (original, 0o600))
+            self.calls.clear()
+            self.install()
+            self.assertEqual((receipt.read_bytes(), receipt.stat().st_ino), (original, inode))
+            self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
+            self.assertFalse((self.root / 'retained-switch-committed.json').exists())
+            self.assertEqual(self.calls, [])
+        finally:
+            os.umask(previous)
+
     def test_same_version_repairs_wheel_operator_shim_without_restart(self):
         self.install()
         target = (self.root / 'current').resolve()
