@@ -616,3 +616,15 @@ def test_scoped_materialization_missing_first_state_and_file_repair(tmp_path):
     assert c.materialize_current(b,home,dest,6)['status']=='in_step'
     (home/path).unlink()
     assert c.materialize_current(b,home,dest,6)['status']=='materialized'
+
+
+@pytest.mark.parametrize('raw',['null','true','false','0','6','"synthetic"','[]'])
+@pytest.mark.parametrize('check_only',[True,False])
+def test_scoped_materialization_existing_scalar_state_never_means_missing(tmp_path,raw,check_only):
+    dest,home,path,b=scoped_materialization_fixture(tmp_path)
+    state=dest/c.STATE_FILE
+    state.write_text(raw);state.chmod(0o600)
+    with pytest.raises(ValueError,match='Invalid scoped credential state'):
+        c.materialize_current(b,home,dest,6,check_only=check_only)
+    assert not (home/path).exists()
+    assert state.read_text()==raw

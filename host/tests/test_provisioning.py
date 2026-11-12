@@ -2118,3 +2118,19 @@ def test_scoped_install_refuses_newer_state_before_hooks_or_package_writes(tmp_p
         p.install(incoming,lambda *a:pytest.fail('no API writeback'),credential_generation=6)
     assert (home/'.claude/.credentials.json').read_bytes()==before
     assert (dest/credentials.STATE_FILE).read_bytes()==before_state
+
+
+@pytest.mark.parametrize('raw',['null','true','false','0','6','"synthetic"','[]'])
+def test_scoped_install_scalar_state_refuses_before_package_and_hooks(tmp_path,monkeypatch,raw):
+    from agent_hub_host import credentials
+    monkeypatch.setenv('AGENT_HUB_MANAGED_DIR',str(tmp_path/'managed'))
+    b=dict(label='hub-claude',provider='claude',version='2.1.322',revision='33333333-3333-4333-8333-333333333333',
+           credential_generation=6,credential_paths=['.claude/.credentials.json'],files={'.claude/.credentials.json':'synthetic-central6'},env={},args=[])
+    dest=p.root()/(b['label']+'-'+b['revision']);dest.mkdir(parents=True,mode=0o700)
+    state=dest/credentials.STATE_FILE;state.write_text(raw);state.chmod(0o600)
+    monkeypatch.setattr(p,'provision_managed_home',lambda *a,**kw:pytest.fail('must refuse before hooks'))
+    monkeypatch.setattr(p.subprocess,'run',lambda *a,**kw:pytest.fail('must refuse before package installation'))
+    with pytest.raises(ValueError,match='Invalid scoped credential state'):
+        p.install(b,lambda *a:pytest.fail('no API operation'),credential_generation=6)
+    assert state.read_text()==raw
+    assert sorted(x.name for x in dest.iterdir())==[credentials.STATE_FILE]
