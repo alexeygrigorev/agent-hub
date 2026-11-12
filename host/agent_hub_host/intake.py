@@ -463,8 +463,8 @@ def add_commands(sub):
         command.add_argument('id')
         if name == 'history':
             command.add_argument('--archived', action='store_true', help='Read one page of losslessly retained note history')
-            command.add_argument('--after', type=int)
-            command.add_argument('--limit', type=int, default=100)
+            command.add_argument('--after', type=int, help='Return events after this sequence (the previous page\'s next)')
+            command.add_argument('--limit', type=int, default=None, help='Page size 1-100 (archived default 100)')
     start = commands.add_parser('continue', help='CAS ready -> active context only; does not start a session')
     start.add_argument('id')
     start.add_argument('--version', type=int, required=True)
@@ -823,14 +823,21 @@ def execute(args):
             payload['workspace'] = args.workspace
         return request('POST', path + '/' + command, payload)
     if command in ('show', 'history', 'links', 'context'):
-        if command == 'history' and getattr(args, 'archived', False):
-            limit, after = getattr(args, 'limit', 100), getattr(args, 'after', None)
-            if not 1 <= limit <= 100 or (after is not None and after < 0):
-                raise IntakeInputError('Invalid archive page: limit is 1-100 and after is a nonnegative sequence')
-            params = {'archived': '1', 'limit': limit}
+        if command == 'history':
+            archived = getattr(args, 'archived', False)
+            limit, after = getattr(args, 'limit', None), getattr(args, 'after', None)
+            if archived and limit is None:
+                limit = 100
+            if (limit is not None and not 1 <= limit <= 100) or (after is not None and after < 0):
+                raise IntakeInputError(('Invalid archive page' if archived else 'Invalid history page')
+                                       + ': limit is 1-100 and after is a nonnegative sequence')
+            params = {'archived': '1'} if archived else {}
+            if limit is not None:
+                params['limit'] = limit
             if after is not None:
                 params['after'] = after
-            return request('GET', path + '/history?' + urlencode(params))
+            if params:
+                return request('GET', path + '/history?' + urlencode(params))
         result = request('GET', path + ('' if command == 'show' else '/' + command))
         if command == 'show' and isinstance(result, dict):
             task = result.get('task')
