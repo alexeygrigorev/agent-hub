@@ -1,41 +1,65 @@
 """Background delivery of the current approved hub-claude credential generation.
 
-The host observes the one enrolled ``hub-claude`` bundle through the same
-machine-scoped sync endpoint and exact acknowledgement that launch admission
-uses. It never refreshes, leases, rotates or logs in, touches no other account
-or profile, and runs on one bounded daemon worker so heartbeats, STOP and the
-control path are never delayed. Diagnostics are sanitized codes only.
+One bounded daemon worker observes the enrolled ``hub-claude`` generation
+through a passive host read (never a refresh, refresh lease, rotation, login or
+global sync), hands the material to the maintained managed-engines consumer
+through the verified installed release archive (the same trust boundary as
+managed readiness), and only then sends the exact sync-report ACK for the
+generation that consumer actually holds.
+
+Ownership is per ``serve()`` connection epoch. An epoch object is created once
+and only ever stopped; it is never re-armed. Every step that writes, ACKs or
+publishes state re-checks, under the module lock, that its epoch is still the
+current one, so a late result of an old connection cannot act after a
+reconnect. Heartbeats only *request* a pass and never wait; STOP and the
+control path never touch this worker. Diagnostics are fixed codes only.
 """
+import json
 import logging
+import os
 import re
+import signal
+import subprocess
 import threading
 import time
-from pathlib import Path
 
-from . import provider_home, providers
 from .client import ApiError
 
-ACCOUNT = 'claude'
-MODEL = 'opus'
+LABEL = 'hub-claude'
+CREDENTIAL_PATH = '.claude/.credentials.json'
+# Passive, approved-host-only observation: no refresh, lease or material
+# change on the Hub side (Root-owned contract, see task-0514).
+PASSIVE_PATH = '/api/engines/hub-claude/passive-credential'
+GENERATION_PATH = '/api/engines/hub-claude/generation?generation=%d&revision=%s'
+ACK_PATH = '/api/engines/sync-report'
 INTERVAL_SECONDS = 120
 BACKOFF_BASE_SECONDS = 15
 BACKOFF_MAX_SECONDS = 900
 NOT_ENROLLED_SECONDS = 900
 REQUEST_TIMEOUT_SECONDS = 20
-LIFETIME_SECONDS = 900
-KEEP_GENERATIONS = 2
-_LOCK = threading.Lock()
+HELPER_TIMEOUT_SECONDS = 60
+HELPER_OUTPUT_BYTES = 4096
+MAX_CREDENTIAL_BYTES = 16000
+REVISION = re.compile(r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\Z')
 _CODE = re.compile(r'[a-z0-9_]{1,64}\Z')
+_LOCK = threading.Lock()
+# Runs only the verified bundled CLI module; never this daemon's package.
+HELPER_BOOT = ('import sys; sys.path.insert(0, sys.argv[1]); '
+               'from agent_hub_host.managed_claude_deliver import main; raise SystemExit(main(sys.argv[2:]))')
+HELPER_ENV_DROP = ('HUB_CONFIG_FILE', 'HUB2_CONFIG', 'HUB_TOKEN', 'HUB2_TOKEN', 'HUB_JOB_TOKEN', 'HUB_URL',
+                   'HUB_BASE_URL', 'APLEXER_TAG', 'APLEXER_WORKSPACE', 'APLEXER_SESSION_ID')
 
 
-class _Bounded:
-    """Give every request of the worker its own short network timeout."""
+class Refused(RuntimeError):
+    """A fixed, non-sensitive outcome code."""
 
-    def __init__(self, client):
-        self._client = client
 
-    def request(self, method, path, body=None):
-        return self._client.request(method, path, body, timeout=REQUEST_TIMEOUT_SECONDS)
+class _Epoch:
+    """One serve() connection's ownership. Stopped once, never revived."""
+    __slots__ = ('stopped',)
+
+    def __init__(self):
+        self.stopped = threading.Event()
 
 
 def _state(bridge):
@@ -43,7 +67,7 @@ def _state(bridge):
         state = getattr(bridge, '_credential_delivery', None)
         if state is None:
             state = bridge._credential_delivery = {
-                'thread': None, 'stop': threading.Event(), 'next_at': 0.0, 'failures': 0,
+                'epoch': None, 'thread': None, 'child': None, 'next_at': 0.0, 'failures': 0,
                 'delivered': None, 'diagnostic': None}
         return state
 
@@ -54,38 +78,78 @@ def delivery_thread(bridge):
 
 
 def diagnostic(bridge):
-    """Last sanitized outcome code (None after a successful or idle pass)."""
+    """Last sanitized outcome code (None after a successful pass)."""
     return _state(bridge)['diagnostic']
 
 
 def delivered(bridge):
-    """(generation, revision) last materialized and acknowledged, or None."""
+    """(generation, revision) last delivered and acknowledged, or None."""
     return _state(bridge)['delivered']
 
 
-def stop(bridge):
-    _state(bridge)['stop'].set()
-
-
 def start(bridge):
-    """Re-arm after a prior serve() stopped delivery (a new connection epoch)."""
-    _state(bridge)['stop'].clear()
+    """Begin a new connection epoch; any earlier epoch stays stopped for good."""
+    state = _state(bridge)
+    with _LOCK:
+        if state['epoch'] is not None:
+            state['epoch'].stopped.set()
+        state['epoch'] = _Epoch()
+        state['next_at'] = 0.0
+        child = state['child']
+    _terminate(child)
+
+
+def stop(bridge):
+    """End the current epoch without waiting; an in-flight helper is terminated."""
+    state = _state(bridge)
+    with _LOCK:
+        if state['epoch'] is not None:
+            state['epoch'].stopped.set()
+        state['epoch'] = None
+        child = state['child']
+    _terminate(child)
+
+
+def _terminate(child):
+    """Kill the helper's own process group (it is a session leader we started)."""
+    if child is None:
+        return
+    try:
+        if os.name != 'nt' and child.poll() is None:
+            os.killpg(child.pid, signal.SIGKILL)
+        else:
+            child.kill()
+    except (OSError, ProcessLookupError):
+        pass
+
+
+def _owns(state, epoch):
+    """Caller holds _LOCK."""
+    return state['epoch'] is epoch and not epoch.stopped.is_set()
+
+
+def _fence(state, epoch):
+    with _LOCK:
+        if not _owns(state, epoch):
+            raise Refused('delivery_stopped')
 
 
 def request(bridge, now=None):
-    """Start one background observation if due; never blocks. Returns True when started."""
+    """Start one background pass if due; never blocks. Returns True when started."""
     if 'claude' not in getattr(bridge, 'engines', ()) or not callable(getattr(getattr(bridge, 'client', None), 'request', None)):
         return False
-    if getattr(getattr(bridge, 'journal', None), 'directory', None) is None:
+    if not callable(getattr(getattr(bridge, 'launcher', None), 'managed_claude_readiness', None)):
         return False
     state = _state(bridge)
     now = time.monotonic() if now is None else now
     with _LOCK:
-        running = state['thread']
-        if state['stop'].is_set() or (running is not None and running.is_alive()) or now < state['next_at']:
+        epoch, running = state['epoch'], state['thread']
+        # Single in-flight across epochs: an old worker must finish (it is
+        # fenced and its helper killed) before a new epoch starts another.
+        if epoch is None or epoch.stopped.is_set() or (running is not None and running.is_alive()) or now < state['next_at']:
             return False
         thread = state['thread'] = threading.Thread(
-            target=_run, args=(bridge, state), name='hub2-credential-delivery', daemon=True)
+            target=_run, args=(bridge, state, epoch), name='hub2-credential-delivery', daemon=True)
         thread.start()
     return True
 
@@ -93,6 +157,8 @@ def request(bridge, now=None):
 def _code(error):
     if isinstance(error, ApiError):
         return 'api_' + str(error.status) if isinstance(error.status, int) else 'api_unavailable'
+    if isinstance(error, subprocess.TimeoutExpired):
+        return 'consumer_timeout'
     if isinstance(error, (TimeoutError, OSError)):
         return 'network_unavailable'
     message = str(error)
@@ -101,81 +167,135 @@ def _code(error):
     return 'delivery_failed'
 
 
-def _run(bridge, state):
+def _run(bridge, state, epoch):
     log = logging.getLogger(__name__)
     delay = INTERVAL_SECONDS
     try:
-        _deliver(bridge, state)
+        outcome = _deliver(bridge, state, epoch)
         with _LOCK:
-            state['failures'], state['diagnostic'] = 0, None
+            if _owns(state, epoch):
+                state['failures'], state['diagnostic'] = 0, None
+                if outcome is not None:
+                    state['delivered'] = outcome
     except Exception as error:
         code = _code(error)
         with _LOCK:
-            state['failures'] += 1
-            state['diagnostic'] = code
-            delay = (NOT_ENROLLED_SECONDS if isinstance(error, ApiError) and error.status in {403, 404}
-                     else min(BACKOFF_MAX_SECONDS, BACKOFF_BASE_SECONDS * 2 ** min(state['failures'] - 1, 6)))
-        # The code only: exception text may be derived from untrusted payloads.
-        log.warning('Claude credential delivery unavailable code=%s', code)
+            current = _owns(state, epoch)
+            if current:
+                state['failures'] += 1
+                state['diagnostic'] = code
+                delay = (NOT_ENROLLED_SECONDS if isinstance(error, ApiError) and error.status in {403, 404}
+                         else min(BACKOFF_MAX_SECONDS, BACKOFF_BASE_SECONDS * 2 ** min(state['failures'] - 1, 6)))
+        if current:
+            # The code only: exception text may derive from untrusted payloads.
+            log.warning('Claude credential delivery unavailable code=%s', code)
     finally:
         try:
             bridge.journal.close_thread()
         except Exception:
             pass
         with _LOCK:
-            state['next_at'] = time.monotonic() + delay
+            if _owns(state, epoch):
+                state['next_at'] = time.monotonic() + delay
             if state['thread'] is threading.current_thread():
                 state['thread'] = None
 
 
-def _deliver(bridge, state):
-    client = _Bounded(bridge.client)
-    bundle, _latest = providers._claude_sync_bundle(client)
-    key = (bundle['credential_generation'], bundle['revision'])
-    if state['delivered'] == key:
-        return
-    if state['stop'].is_set():
-        raise RuntimeError('delivery_stopped')
-    try:
-        engine_binary = provider_home.install_managed_claude(bundle['version'])
-    except (OSError, ValueError):
-        raise RuntimeError('provider_sdk_install_refused') from None
-    root = Path(bridge.journal.directory).resolve() / 'credential-delivery'
-    try:
-        manifest = provider_home.materialize(
-            str(root), ACCOUNT, 'claude', bundle['credential_generation'], bundle['files'], MODEL,
-            timeout_seconds=LIFETIME_SECONDS, engine_binary=engine_binary)
-        verified = provider_home.verify(manifest)
-    except (OSError, ValueError):
-        raise RuntimeError('provider_materialization_refused') from None
-    if verified.get('generation') != bundle['credential_generation']:
-        raise RuntimeError('provider_materialization_refused')
-    if state['stop'].is_set():
-        raise RuntimeError('delivery_stopped')
-    acknowledged = client.request('POST', '/api/engines/sync-report', {
-        'state': 'synced',
-        'items': [{'label': providers.CLAUDE_ENGINE_LABEL, 'revision': bundle['revision'], 'state': 'installed',
-                   'credential_generation': bundle['credential_generation']}],
-    })
-    if not isinstance(acknowledged, dict) or acknowledged.get('status') != 'recorded':
-        raise RuntimeError('provider_generation_ack_unverified')
+def _observe(client):
+    """Passive current generation; refuses anything but exact, bounded material."""
+    view = client.request('GET', PASSIVE_PATH, None, timeout=REQUEST_TIMEOUT_SECONDS)
+    if (not isinstance(view, dict) or view.get('label') != LABEL or view.get('status') != 'current'
+            or type(view.get('generation')) is not int or not 1 <= view['generation'] <= 2**53 - 1
+            or not isinstance(view.get('revision'), str) or not REVISION.fullmatch(view['revision'])
+            or not isinstance(view.get('files'), dict) or set(view['files']) != {CREDENTIAL_PATH}
+            or not isinstance(view['files'][CREDENTIAL_PATH], str) or not view['files'][CREDENTIAL_PATH]
+            or len(view['files'][CREDENTIAL_PATH].encode('utf8')) > MAX_CREDENTIAL_BYTES):
+        raise Refused('passive_generation_invalid')
+    return view['generation'], view['revision'], view['files']
+
+
+def _still_current(client, generation, revision):
+    observed = client.request('GET', GENERATION_PATH % (generation, revision), None, timeout=REQUEST_TIMEOUT_SECONDS)
+    if observed != {'label': LABEL, 'generation': generation, 'revision': revision, 'status': 'current'}:
+        raise Refused('generation_changed')
+
+
+def _environment():
+    env = {key: value for key, value in os.environ.items()
+           if key not in HELPER_ENV_DROP and not key.startswith(('CLAUDE_', 'ANTHROPIC_', 'AWS_'))}
+    return env
+
+
+def _consume(bridge, state, epoch, archive, generation, revision, files):
+    """Materialize into the maintained managed-engines home via the verified
+    release helper; returns its fixed status. Killed on epoch stop."""
+    python = os.path.join(os.path.dirname(archive), 'bin', 'python')
+    payload = json.dumps({'label': LABEL, 'generation': generation, 'revision': revision, 'files': files}).encode()
     with _LOCK:
-        state['delivered'] = key
-    _prune(root, bundle['credential_generation'])
-
-
-def _prune(root, current):
-    """Drop only this worker's own superseded generation homes."""
+        if not _owns(state, epoch):
+            raise Refused('delivery_stopped')
+        child = state['child'] = (getattr(bridge, 'delivery_popen', None) or subprocess.Popen)(
+            [python, '-I', '-S', '-c', HELPER_BOOT, archive, 'materialize'],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            env=_environment(), close_fds=True, start_new_session=True)
     try:
-        import shutil
-        pattern = re.compile(re.escape(ACCOUNT) + r'-([0-9]+)-[0-9a-f]{12}\Z')
-        homes = []
-        for child in root.iterdir():
-            match = pattern.fullmatch(child.name)
-            if match and child.is_dir() and not child.is_symlink():
-                homes.append((int(match.group(1)), child))
-        for generation, child in sorted(homes, key=lambda item: item[0], reverse=True)[KEEP_GENERATIONS:]:
-            if generation < current:
-                shutil.rmtree(child, ignore_errors=True)
-    except OSError:
-        pass
+        try:
+            out, _ = child.communicate(payload, timeout=HELPER_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            _terminate(child)
+            child.communicate()
+            raise
+    finally:
+        with _LOCK:
+            if state['child'] is child:
+                state['child'] = None
+    _fence(state, epoch)
+    if out is None or len(out) > HELPER_OUTPUT_BYTES:
+        raise Refused('consumer_output_invalid')
+    try:
+        result = json.loads(out)
+    except ValueError:
+        raise Refused('consumer_output_invalid') from None
+    if not isinstance(result, dict):
+        raise Refused('consumer_output_invalid')
+    if child.returncode != 0:
+        reason = result.get('reason')
+        raise Refused('consumer_' + reason if isinstance(reason, str) and _CODE.fullmatch(reason) and len(reason) <= 55
+                      else 'consumer_refused')
+    status = result.get('status')
+    if status == 'absent' and set(result) == {'status'}:
+        return status
+    if (status in ('in_step', 'materialized') and result.get('generation') == generation
+            and result.get('revision') == revision and set(result) == {'status', 'generation', 'revision'}):
+        return status
+    raise Refused('consumer_output_invalid')
+
+
+def _deliver(bridge, state, epoch):
+    _fence(state, epoch)
+    readiness = bridge.launcher.managed_claude_readiness()
+    if not isinstance(readiness, dict) or not isinstance(readiness.get('archive'), str):
+        raise Refused('managed_claude_unavailable')
+    client = bridge.client
+    generation, revision, files = _observe(client)
+    key = (generation, revision)
+    with _LOCK:
+        if state['delivered'] == key:
+            return None
+    _fence(state, epoch)
+    status = _consume(bridge, state, epoch, readiness['archive'], generation, revision, files)
+    if status == 'absent':
+        # No enrolled managed-engines consumer on this host: never ACK a copy
+        # nothing uses. Truthful diagnostic; retry on the normal interval.
+        raise Refused('managed_claude_consumer_absent')
+    # The consumer now holds exactly (generation, revision). Re-check Hub, then
+    # ACK only while this connection epoch still owns delivery.
+    _still_current(client, generation, revision)
+    _fence(state, epoch)
+    acknowledged = client.request('POST', ACK_PATH, {
+        'state': 'synced',
+        'items': [{'label': LABEL, 'revision': revision, 'state': 'installed', 'credential_generation': generation}],
+    }, timeout=REQUEST_TIMEOUT_SECONDS)
+    if not isinstance(acknowledged, dict) or acknowledged.get('status') != 'recorded':
+        raise Refused('generation_ack_unverified')
+    return key
