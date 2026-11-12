@@ -347,6 +347,9 @@ class CanaryTest(unittest.TestCase):
             result, _ = self.run_canary('ok', '--mode', mode)
             self.assertEqual(result.returncode, 0, result.stderr)
         calls = [json.loads(line) for line in (self.tmp / 'argv.jsonl').read_text().splitlines()]
+        starts = [args for args in calls if args[:2] == ['sessions', 'start']]
+        self.assertTrue(starts)
+        self.assertTrue(all(args[args.index('--purpose') + 1] == 'review' for args in starts))
         self.assertTrue(any(args[:2] == ['sessions', 'capture'] for args in calls))
         self.assertTrue(any(args[:2] == ['intake', 'update'] for args in calls))
         for args in calls:
