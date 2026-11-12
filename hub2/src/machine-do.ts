@@ -236,7 +236,7 @@ export class MachineDO {
         if (match[2] === 'started') return await this.started(request, sessionId);
         if (match[2] === 'admission') return await this.admission(request, sessionId);
         if (match[2] === 'credentials') return await this.childCredentials(request,sessionId);
-        return await this.finish(request, sessionId);
+        return await this.finishObserved(request, sessionId);
       }
       return error('not_found', 404);
     } catch (caught) {
@@ -786,11 +786,67 @@ export class MachineDO {
     return json({ ok: true, session_id: sessionId, state: 'running',forwarded }, forwarded?201:202);
   }
 
+  private isCanary(session:SessionRow):boolean{
+    const launch=this.parse(session.launch_json) as JsonRecord;
+    return session.title.startsWith('hub-canary-')&&/(?:^|[/\\])hub-canary$/.test(String(boundWorkspace(launch)));
+  }
+
+  private async finishObserved(request:Request,sessionId:string):Promise<Response>{
+    let response:Response;
+    try{response=await this.finish(request,sessionId);}catch(caught){
+      if(!(caught instanceof HttpError))throw caught;
+      response=error(caught.code,caught.status);
+    }
+    if([400,404,409,410,413,422].includes(response.status)){
+      const machine=this.machineActor(actorFrom(request),'session:report');
+      const row=machine?this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND machine_id=?',sessionId,machine):null;
+      if(row&&!this.isCanary(row)){
+        const detail=await response.clone().json() as JsonRecord;
+        await this.queueFinishAlert(row,'finish_dead_letter',String(detail.error??'finish_rejected'),response.status);
+      }
+    }
+    return response;
+  }
+
+  private async queueFinishAlert(row:SessionRow,kind:string,reason:string,status:number,extra:JsonRecord={}):Promise<void>{
+    const key=`${kind}:${row.operation_id}:${row.epoch}`;
+    this.insertOutbox(key,'finish-dead-letter',row.operation_id,row.project_id,{
+      operation_id:row.dispatch_id,attempt_operation_id:row.operation_id,session_id:row.id,
+      intake_id:row.intake_id,machine_id:row.machine_id,epoch:row.epoch,kind,reason,status,
+      recipient:'dev@dtcdev.click',observed_at:Date.now(),...extra},Date.now());
+    await this.flushOne(key);
+    await this.scheduleNext();
+  }
+
+  private async finishExpired(machineId:string,sessionId:string,body:JsonRecord):Promise<Response>{
+    const row=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND machine_id=?',sessionId,machineId);
+    if(!row||row.operation_id!==body.operation_id||row.epoch!==body.epoch||row.native_id!==body.native_id)
+      return error('stale_expired_launch',409);
+    const admission=this.db.one<{observed_at:number}>('SELECT observed_at FROM launch_admissions WHERE operation_id=? AND session_id=? AND epoch=?',row.operation_id,row.id,row.epoch);
+    const launch=this.parse(row.launch_json) as JsonRecord;
+    const e=body.evidence as JsonRecord|undefined;
+    const deadline=admission?admission.observed_at+Number(launch.timeout_seconds)*1000:null;
+    if(body.launch_expired!==true||body.native_outcome!=='unconfirmed'||body.native_exit_confirmed!==undefined||body.exit_code!==undefined
+      ||!deadline||deadline>Date.now()||body.runtime_deadline!==deadline
+      ||!e||e.source!=='aplexer_all_registry_census'||e.dispatch_provenance!=='host_journal'||e.complete!==true||e.match_count!==0
+      ||e.workspace!==boundWorkspace(launch)||e.tag!==`task-hub2-${row.id}`
+      ||!Number.isSafeInteger(e.started_at_ms)||!Number.isSafeInteger(e.observed_at_ms)
+      ||Number(e.started_at_ms)<deadline||Number(e.observed_at_ms)<Number(e.started_at_ms)
+      ||Number(e.observed_at_ms)>Date.now()+5000||Number(e.observed_at_ms)-Number(e.started_at_ms)>6000
+      ||!Number.isSafeInteger(e.row_count)||Number(e.row_count)<0||Number(e.row_count)>5000
+      ||typeof e.sha256!=='string'||!/^[0-9a-f]{64}$/.test(e.sha256))return error('unqualified_expired_launch',409);
+    // This records an expired host launch, never confirmed death or success.
+    // Hub's independent lost-session/containment accounting remains authoritative.
+    await this.queueFinishAlert(row,'launch_expired_unconfirmed','deadline_expired_native_absent',0,{evidence:e,native_id:body.native_id,runtime_deadline:deadline});
+    return json({ok:true,native_outcome:'unconfirmed',terminal_report:true});
+  }
+
   private async finish(request: Request, sessionId: string): Promise<Response> {
     const actor = actorFrom(request);
     const machineId = this.machineActor(actor, 'session:report');
     if (!machineId) return error('forbidden', 403);
     const body = await bodyObject(request, 12_288);
+    if(body.launch_expired!==undefined)return await this.finishExpired(machineId,sessionId,body);
     if(body.failure_kind!==undefined||body.native_outcome!==undefined)return await this.finishLegacyUnobserved(machineId,sessionId,body);
     if(body.no_dispatch!==undefined)return await this.finishWithoutDispatch(machineId,sessionId,body);
     const launchFailed=body.launch_failed===true;
@@ -823,6 +879,23 @@ export class MachineDO {
       ||!Number.isSafeInteger(nativeExit.exited_at_ms)||Number(nativeExit.exited_at_ms)<admission.observed_at||Number(nativeExit.exited_at_ms)>Date.now()+5000
       ||(Number(nativeExit.exited_at_ms)>=Number(nativeDeadline.deadline_ms)&&nativeDeadline.exceeded!==true)
       ||(nativeDeadline.exceeded&&Number(nativeDeadline.deadline_ms)>Date.now()))return error('native_deadline_unverified',409);
+    // A qualified native exit adds no new lifecycle transition after a confirmed
+    // stop. Keep the stop outcome and its Project notification authoritative.
+    if(row.state==='stopped'&&row.native_id===body.native_id&&this.stopConfirmed(row)){
+      const now=Date.now(),key=`stopped-finish:${row.operation_id}:${row.epoch}`;
+      const payload={operation_id:row.dispatch_id,attempt_operation_id:row.operation_id,session_id:row.id,
+        intake_id:row.intake_id,machine_id:row.machine_id,epoch:row.epoch,native_id:body.native_id,
+        state:'stopped',exit_code:body.exit_code,native_exit_confirmed:true,evidence,evidence_digest:evidenceDigest};
+      this.db.transaction(this.ctx,()=>{
+        if(row.evidence_digest!==null)return;
+        this.db.run("UPDATE sessions SET evidence_json=?,evidence_digest=?,exit_code=? WHERE id=? AND state='stopped' AND evidence_digest IS NULL",
+          JSON.stringify(payload),evidenceDigest,body.exit_code,row.id);
+        this.insertOutbox(key,'stopped-finish',row.operation_id,row.project_id,payload,now);
+      });
+      await this.flushOne(key);
+      await this.scheduleNext();
+      return json({ok:true,duplicate:true,state:'stopped'});
+    }
     const lateLost=row.state==='lost'&&row.native_id===body.native_id&&!launchFailed;
     const admittedAbort=launchFailed&&(row.state==='claimed'||lateLaunchFailure)&&row.native_id===null
       &&/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(body.native_id)
@@ -954,10 +1027,12 @@ export class MachineDO {
     const operationId=body.operation_id,epoch=body.epoch as number;
     const admission=this.db.one('SELECT operation_id FROM launch_admissions WHERE operation_id=? AND session_id=? AND epoch=?',
       operationId,sessionId,epoch);
-    if(!row||!admission)return error('stale_no_dispatch_receipt',409);
+    const admissionExpired=body.admission_expired===true&&row&&row.native_id===null
+      &&Date.now()>=(row.offer_expires_at??row.created_at+60_000);
+    if(!row||!admission&&!admissionExpired)return error('stale_no_dispatch_receipt',409);
     const current=row.operation_id===operationId&&row.epoch===epoch;
     if(current&&row.native_id!==null)return error('stale_no_dispatch_receipt',409);
-    if(current&&row.state==='claimed'){
+    if(current&&['offered','claimed'].includes(row.state)){
       await this.recordLaunchRefusal(row,'native_dispatch_not_started',true);
     }else{
       const settled=current ? ['failed','stopped','expired'].includes(row.state)
@@ -1041,7 +1116,7 @@ export class MachineDO {
         return true;
       }
       const stub = env.PROJECTS.get(env.PROJECTS.idFromName(row.project_id));
-      const path = row.kind === 'finish' ? '/_internal/finish' : row.kind === 'started' ? '/_internal/started'
+      const path = row.kind === 'stopped-finish' ? '/_internal/stopped-finish' : row.kind === 'finish-dead-letter' ? '/_internal/finish-dead-letter' : row.kind === 'finish' ? '/_internal/finish' : row.kind === 'started' ? '/_internal/started'
         : row.kind === 'auth-fallback' ? '/_internal/auth-fallback'
         : row.kind === 'stopped' ? '/_internal/stopped' : (row.kind === 'reaped' || row.kind === 'lost' || row.kind === 'legacy-launch-failure') ? '/_internal/reaped'
         : row.kind === 'claim' ? '/_internal/claim' : '/_internal/requeue';

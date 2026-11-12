@@ -947,7 +947,7 @@ test('legacy absence receipt rejects invented exit, incomplete census and identi
  assert.equal(f.events.some(event=>event.path==='/_internal/reaped'),false);
 });
 
-test('a first legacy receipt for a superseded attempt refuses unavailable launch metadata without effects',async()=>{
+test('a first legacy receipt for a superseded attempt preserves lifecycle and raises a diagnostic alert',async()=>{
  const f=fixture(),session='legacy-superseded',epoch=await startClaimed(f,session,null),receipt=legacyUnobserved(session,epoch);
  f.database.prepare('INSERT INTO launch_admissions VALUES(?,?,?,?)').run(receipt.operation_id,session,epoch,Date.now()-100);
  f.database.prepare("UPDATE machine_session_operations SET state='expired' WHERE operation_id=?").run(receipt.operation_id);
@@ -957,7 +957,8 @@ test('a first legacy receipt for a superseded attempt refuses unavailable launch
  const outboxes=f.database.prepare('SELECT * FROM machine_outbox').all();
  assert.equal((await f.call('/api/sessions/'+session+'/finish','POST',receipt)).status,409);
  assert.deepEqual(f.database.prepare('SELECT * FROM sessions WHERE id=?').get(session),before);
- assert.deepEqual(f.database.prepare('SELECT * FROM machine_outbox').all(),outboxes);
+ assert.deepEqual(f.database.prepare("SELECT * FROM machine_outbox WHERE kind<>'finish-dead-letter'").all(),outboxes);
+ assert.equal(f.events.filter(event=>event.path==='/_internal/finish-dead-letter').length,1);
  assert.equal(f.revocations.length,0);
  assert.equal(f.events.some(event=>event.path==='/_internal/reaped'),false);
 });

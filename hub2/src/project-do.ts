@@ -1,3 +1,4 @@
+import {terminalReceipt} from './terminal-receipts';
 import { SessionIntakeLink } from './session-intake-link';
 import {listProjectIntakes} from './intake-list';
 import {boundWorkspace,mergeWorkspaceBinding,type WorkspaceBinding} from './workspace-binding';
@@ -127,6 +128,8 @@ export class ProjectDO {
     const url = new URL(request.url);
     try {
       await this.ready;
+      if (['/_internal/finish-dead-letter','/_internal/stopped-finish'].includes(url.pathname) && request.method==='POST')
+        return await terminalReceipt(request,this.db,fn=>this.transaction(fn),(...args)=>this.appendEvent(...args),id=>this.intakeContext(id));
       if (url.pathname === '/_internal/finish' && request.method === 'POST') return await this.finishInternal(request);
       if (url.pathname === '/_internal/started' && request.method === 'POST') return await this.startedInternal(request);
       if ((url.pathname === '/_internal/stopped' || url.pathname === '/_internal/reaped') && request.method === 'POST') return await this.stoppedInternal(request);
