@@ -46,4 +46,11 @@ jobs:
         run: |
           scripts/ci/run-python-tests.sh host/tests/QUARANTINE-cli.md \
             "$PWD/host:$PWD/host/tests" -- \
-            host/tests/test_cli*.py host/tests/test_session_control.py host/tests/test_intake*.py host/tests/test_native_claude_import.py host/tests/test_stage_credential_monitor.py
+            host/tests/test_cli*.py host/tests/test_session_control.py host/tests/test_intake*.py host/tests/test_native_claude_import.py host/tests/test_stage_credential_monitor.py \
+            host/tests/test_credentials.py::test_scoped_authoritative_generation_replaces_old_rotation_without_writeback \
+            host/tests/test_credentials.py::test_scoped_materialization_refuses_conflicts_without_mutation \
+            host/tests/test_credentials.py::test_scoped_materialization_state_publication_failure_is_resumable \
+            host/tests/test_credentials.py::test_scoped_materialization_missing_first_state_and_file_repair \
+            host/tests/test_credentials.py::test_scoped_materialization_existing_scalar_state_never_means_missing \
+            host/tests/test_provisioning.py::test_scoped_install_refuses_newer_state_before_hooks_or_package_writes \
+            host/tests/test_provisioning.py::test_scoped_install_scalar_state_refuses_before_package_and_hooks
