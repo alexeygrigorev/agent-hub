@@ -47,9 +47,9 @@ test('skewed headroom keeps Go above three percent in the real simulation and dr
  assert.ok(result.pool.every(row=>row.share>.03));
  assert.ok(Math.abs(result.pool.reduce((sum,row)=>sum+row.share,0)-1)<1e-12);
  const go=result.pool.find(row=>row.policy_id==='go-muse')!;
- assert.ok(Math.abs(go.share-(.03+.79*7/417.45))<1e-12);
- assert.deepEqual({...result.counts},{'codex-luna-max':136,'codex-sol-medium':136,'claude-sonnet-medium':174,
-  'go-muse':43,'claude-opus-medium':174,'zai-glm-flash':153,'antigravity-argon-medium':184});
+ assert.ok(Math.abs(go.share-(.03+.79*7/433.9))<1e-12);
+ assert.deepEqual({...result.counts},{'codex-luna-max':132,'codex-sol-medium':132,'claude-sonnet-medium':168,
+  'go-muse':43,'claude-opus-medium':168,'antigravity-hydrogen-medium':179,'antigravity-argon-medium':178});
  // The actual start draw uses the same transformed weights, not just diagnostics.
  const start=await pickModelRouteDetailed(f.env,{interactive:false},()=>.47);
  assert.equal(start.route.policy_id,'go-muse');
@@ -74,15 +74,15 @@ test('exploration retains the five-percent eligibility boundary and cannot resto
 test('exploration preserves stale-neutral headroom, quota influence and underlying deep multipliers',async()=>{
  const f=skewedFixture();f.accountRows.get('shared-go').fresh=false;
  const stale=await simulateModelRoutes(f.env,{interactive:false},1,()=>0);
- assert.ok(Math.abs(stale.pool.find(row=>row.policy_id==='go-muse')!.share-(.03+.79*50/460.45))<1e-12);
+ assert.ok(Math.abs(stale.pool.find(row=>row.policy_id==='go-muse')!.share-(.03+.79*50/476.9))<1e-12);
  assert.ok(stale.warnings.some(row=>row.account_id==='shared-go'&&row.reason==='quota_stale'));
  f.accountRows.get('shared-go').fresh=true;
  const ordinary=await simulateModelRoutes(f.env,{interactive:false},1,()=>0);
  assert.ok(stale.pool.find(row=>row.policy_id==='go-muse')!.share>ordinary.pool.find(row=>row.policy_id==='go-muse')!.share);
  const deep=await simulateModelRoutes(f.env,{interactive:false,tier:'deep'},1,()=>0);
  assert.ok(deep.pool.every(row=>row.share>.03));
- assert.ok(Math.abs(deep.pool.find(row=>row.policy_id==='codex-sol-medium')!.share-(.03+.79*168/681.45))<1e-12);
- assert.ok(Math.abs(deep.pool.find(row=>row.policy_id==='claude-opus-medium')!.share-(.03+.79*228/681.45))<1e-12);
+ assert.ok(Math.abs(deep.pool.find(row=>row.policy_id==='codex-sol-medium')!.share-(.03+.79*168/697.9))<1e-12);
+ assert.ok(Math.abs(deep.pool.find(row=>row.policy_id==='claude-opus-medium')!.share-(.03+.79*228/697.9))<1e-12);
 });
 
 test('Luna mean clipping and candidate shares survive skew and additional hosts',async()=>{
@@ -116,13 +116,14 @@ test('1000 simulated draws use one passive observation set and the committed Arg
  assert.equal(Object.values(result.counts).reduce((a,b)=>a+b,0),1000);
  assert.equal(result.pool_degraded,false);
  assert.ok(result.pool.some(row=>row.policy_id==='antigravity-argon-medium'));
+ assert.ok(result.pool.some(row=>row.policy_id==='antigravity-hydrogen-medium')&&!result.pool.some(row=>/flash/.test(row.model)));
  assert.ok(result.pool.every(row=>row.share>.03&&!/astra|fable/i.test(row.model)));
  const luna=result.pool.find(row=>/luna/.test(row.model))!;
  const others=result.pool.filter(row=>row!==luna);
  assert.ok(luna.share<=others.reduce((n,row)=>n+row.share,0)/others.length+1e-12);
  for(const kind of ['accounts','machines']){
   const rows=f.calls.filter(call=>call.kind===kind);
-  assert.equal(rows.length,kind==='accounts'?5:1);
+  assert.equal(rows.length,kind==='accounts'?4:1);
   assert.ok(rows.every(call=>call.path==='/_internal/routing-snapshot'&&call.method==='GET'));
  }
  assert.equal(result.advisories.filter(row=>row.reason==='local_login_unverified').length,result.pool.length);
