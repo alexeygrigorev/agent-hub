@@ -450,7 +450,7 @@ def _fetch_command_entry(session_id, command_id):
     from urllib.parse import quote
     cursor = None
     for _ in range(10):
-        path = '/api/sessions/' + session_id + '/commands?limit=100'
+        path = '/api/sessions/' + session_id + '/commands?limit=100&command_id=' + quote(command_id, safe='')
         if cursor:
             path += '&cursor=' + quote(cursor, safe='')
         listing = request('GET', path)
@@ -796,6 +796,7 @@ def add_commands(sub):
     events.add_argument('id')
     history = commands.add_parser('commands', help='List durable commands with recorded/transported/acked states')
     history.add_argument('id')
+    history.add_argument('--command-id', help='Read one exact command receipt without downloading history')
     receive = commands.add_parser('host-receive', help='Bounded host receiver: poll offers, claim, execute, ack (no daemon; Fleet-owned start rejected)')
     receive.add_argument('--once', action='store_true', required=True,
                          help='Run exactly one bounded poll cycle and exit')
@@ -1185,6 +1186,11 @@ def _execute(args):
             list(pool.map(capture_warning, result.get('warnings', [])))
         return result
     if cmd == 'commands':
+        command_id = getattr(args, 'command_id', None)
+        if command_id is not None:
+            if not re.fullmatch(r'[A-Za-z0-9-]{1,80}', command_id):
+                raise SessionInputError('invalid_command_id')
+            return {'commands': [_fetch_command_entry(args.id, command_id)], 'next_cursor': None}
         return request('GET', _native_command_path(args.id) or '/api/sessions/' + args.id + '/commands')
     if cmd in ('start', 'override'):
         engine = getattr(args, 'engine', None)

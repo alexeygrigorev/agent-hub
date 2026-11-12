@@ -12,6 +12,27 @@ import urllib.request
 from pathlib import Path
 
 
+# Accepted protocol capacity is deliberately independent of capture emission.
+# Stage A keeps old 4KiB producers but can replay a future Stage B receipt.
+CAPTURE_OUTPUT_BYTES = 64 * 1024
+CAPTURE_ACK_BODY_BYTES = 401 * 1024
+
+
+def _capture_ack(path, body):
+    # This is a transport allowance, not command authority. MachineDO chooses
+    # the actual limit from its authenticated, persisted command row.
+    if (not re.fullmatch(r'/api/sessions/[A-Za-z0-9-]{1,80}/commands/[A-Za-z0-9-]{1,80}/ack', path)
+            or not isinstance(body, dict) or set(body) != {'epoch', 'result'}
+            or type(body['epoch']) is not int or body['epoch'] < 1):
+        return False
+    result = body['result']
+    if (not isinstance(result, dict) or not set(result) <= {'output', 'capture_binding', 'capture_source'}
+            or not isinstance(result.get('output'), str)
+            or len(result['output'].encode('utf8')) > CAPTURE_OUTPUT_BYTES):
+        return False
+    return len(json.dumps({k:v for k,v in result.items() if k != 'output'}).encode()) <= 1024
+
+
 def private_file(path):
     path = Path(path)
     if os.name == "nt":
@@ -102,7 +123,8 @@ class Client:
             headers["Idempotency-Key"] = key
         payload = None if body is None else json.dumps(body).encode()
         if payload is not None:
-            if len(payload) > 65536:
+            limit = CAPTURE_ACK_BODY_BYTES if method == 'POST' and _capture_ack(path, body) else 65536
+            if len(payload) > limit:
                 raise ValueError("request too large")
             headers["Content-Type"] = "application/json"
         request = urllib.request.Request(self.base_url + path, payload, headers, method=method)

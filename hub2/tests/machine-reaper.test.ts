@@ -1231,3 +1231,76 @@ test('managed Claude opt-in needs current socket heartbeat, not stale persisted 
  assert.deepEqual((await ordinaryPoll.json() as any).offers.map((offer:any)=>offer.session_id),['ordinary-after-managed']);
  f.database.close();
 });
+
+test('64KiB retained capture survives HTTP escaping, exact replay and targeted receipt lookup',async()=>{
+ const f=fixture(),session='capture-64k',meta=await completedHeadless(f,session);
+ for(const [index,output] of ['x'.repeat(65536),'\0'.repeat(65536),'😀'.repeat(16384)].entries()){
+  const made=await f.call('/api/sessions/'+session+'/commands','POST',{kind:'capture',key:'large-'+index},captureOperator);
+  const command=(await made.json() as any).command;
+  const path='/api/sessions/'+session+'/commands/'+command.id+'/ack';
+  const body={epoch:meta.epoch,result:{output,capture_binding:command.capture_binding,capture_source:'retained_task_output'}};
+  const frozen=JSON.stringify(body);
+  const replay=()=>f.machine.fetch(new Request('https://machine.test'+path,{method:'POST',headers:header,body:frozen}));
+  assert.equal((await replay()).status,200,'first delivery of a previously unaccepted large frozen ACK');
+  const accepted=f.database.prepare('SELECT result_json FROM session_commands WHERE id=?').get(command.id) as any;
+  f.restart();const duplicate=await replay();assert.equal(duplicate.status,200);
+  assert.equal((await duplicate.json() as any).duplicate,true,'lost-200 receipt retries exactly after restart');
+  assert.equal((f.database.prepare('SELECT result_json FROM session_commands WHERE id=?').get(command.id) as any).result_json,accepted.result_json);
+  assert.equal((await f.call(path,'POST',{...body,result:{...body.result,output:output.slice(1)}})).status,409);
+  const read=await f.call('/api/sessions/'+session+'/commands?command_id='+command.id,'GET',undefined,captureOperator);
+  const data=await read.json() as any;assert.equal(data.commands.length,1);
+  assert.equal(data.commands[0].ack.capture,output);assert.equal(data.commands[0].ack.output,output);
+ }
+ const made=await f.call('/api/sessions/'+session+'/commands','POST',{kind:'capture',key:'over-limit'},captureOperator);
+ const command=(await made.json() as any).command;
+ const path='/api/sessions/'+session+'/commands/'+command.id+'/ack';
+ assert.equal((await f.call(path,'POST',{epoch:meta.epoch,result:{output:'x'.repeat(65537),capture_binding:command.capture_binding,capture_source:'retained_task_output'}})).status,400);
+ assert.equal((await f.call(path,'POST',{epoch:meta.epoch,result:{output:'small',padding:'x'.repeat(401*1024)}})).status,413);
+ assert.equal((f.database.prepare('SELECT state FROM session_commands WHERE id=?').get(command.id) as any).state,'pending');
+});
+
+test('capture allowance never enlarges persisted SEND or STOP ACK budgets',async()=>{
+ const f=fixture(),session='noncapture-bounds',meta=await completedHeadless(f,session);
+ for(const kind of ['send','stop']){
+  const made=await f.call('/api/sessions/'+session+'/commands','POST',{kind:'capture',key:kind+'-limits'},captureOperator);
+  const command=(await made.json() as any).command;
+  f.database.prepare('UPDATE session_commands SET kind=? WHERE id=?').run(kind,command.id);
+  const path='/api/sessions/'+session+'/commands/'+command.id+'/ack';
+  for(const output of ['x'.repeat(9000),'\0'.repeat(65536)]){
+   assert.equal((await f.call(path,'POST',{epoch:meta.epoch,result:{output}})).status,413,kind+' old result/body budget');
+  }
+  assert.equal((f.database.prepare('SELECT state FROM session_commands WHERE id=?').get(command.id) as any).state,'pending');
+ }
+});
+
+test('large legacy running screen capture uses same byte budget without retained metadata',async()=>{
+ const f=fixture(),session='legacy-capture-64k',epoch=await startClaimed(f,session,'11111111-1111-4111-8111-111111111111');
+ const made=await f.call('/api/sessions/'+session+'/commands','POST',{kind:'capture',key:'screen',mode:'screen'},captureOperator);
+ const command=(await made.json() as any).command;assert.equal(command.capture_binding,undefined);
+ const path='/api/sessions/'+session+'/commands/'+command.id+'/ack';
+ assert.equal((await f.call(path,'POST',{epoch,result:{output:'x'.repeat(65536)}})).status,200);
+});
+
+test('oversized unfiltered history refuses explicitly while selected receipts stay complete and scoped',async()=>{
+ const f=fixture(),session='large-history',meta=await completedHeadless(f,session);let target='';
+ for(let index=0;index<12;index++){
+  const made=await f.call('/api/sessions/'+session+'/commands','POST',{kind:'capture',key:'history-'+index},captureOperator);
+  const command=(await made.json() as any).command;target=command.id;
+  assert.equal((await f.call('/api/sessions/'+session+'/commands/'+target+'/ack','POST',{
+   epoch:meta.epoch,result:{output:'\0'.repeat(65536),capture_binding:command.capture_binding,capture_source:'retained_task_output'}})).status,200);
+ }
+ const history=await f.call('/api/sessions/'+session+'/commands','GET',undefined,captureOperator);
+ assert.equal(history.status,413);assert.equal((await history.json() as any).error,'command_history_too_large');
+ const exact=await (await f.call('/api/sessions/'+session+'/commands?command_id='+target,'GET',undefined,captureOperator)).json() as any;
+ assert.equal(exact.commands.length,1);assert.equal(exact.commands[0].ack.capture.length,65536);
+ for(const query of ['command_id=bad%2Fid','command_id=','command_id='+target+'&command_id='+target]){
+  assert.equal((await f.call('/api/sessions/'+session+'/commands?'+query,'GET',undefined,captureOperator)).status,400);
+ }
+ const unknown=await (await f.call('/api/sessions/'+session+'/commands?command_id=missing','GET',undefined,captureOperator)).json() as any;
+ assert.deepEqual(unknown,{commands:[],next_cursor:null});
+ await completedHeadless(f,'other-history','99999999-2222-4333-8444-555555555555');
+ const foreign=await (await f.call('/api/sessions/other-history/commands?command_id='+target,'GET',undefined,captureOperator)).json() as any;
+ assert.deepEqual(foreign,{commands:[],next_cursor:null});
+ const denied={'x-hub2-actor':JSON.stringify({id:'agent',kind:'agent',resource_id:'foreign',scopes:['session:read']})};
+ assert.equal((await f.call('/api/sessions/'+session+'/commands?command_id='+target,'GET',undefined,denied)).status,404);
+});

@@ -1833,3 +1833,80 @@ class ManagedClaudeHostTests(unittest.TestCase):
         with patch.object(self.bridge.launcher,'managed_claude_readiness') as ready:
             self.bridge.heartbeat([],include_native_sessions=False)
         self.assertEqual(captured[-1][2],tags);ready.assert_not_called()
+
+
+class CaptureAckCompatibilityTests(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path=Path(self.temp.name)/'private/journal.sqlite'
+        self.journal=Journal(self.path)
+        self.addCleanup(self.journal.close_thread)
+
+    @staticmethod
+    def payload(output):
+        return {'epoch':7,'result':{'output':output,'capture_source':'retained_task_output',
+            'capture_binding':{'native_id':'11111111-1111-4111-8111-111111111111',
+                               'operation_id':'op-frozen','request_digest':'a'*64}}}
+
+    def test_stage_a_emission_remains_legacy_small(self):
+        from agent_hub_host.task_output import bounded_capture
+        result=bounded_capture('\0'*65536)
+        self.assertLessEqual(len(result.encode()),4096)
+        self.assertLessEqual(len(json.dumps({'output':result},ensure_ascii=True).encode()),8000)
+
+    def test_future_large_frozen_receipt_replays_after_unaccepted_or_lost_200(self):
+        import urllib.error
+        from unittest.mock import MagicMock
+        path='/api/sessions/s/commands/c/ack'
+        for lost_after_accept in [False,True]:
+            with self.subTest(lost_after_accept=lost_after_accept):
+                key='command:c'
+                payload=self.payload('\0'*65536)
+                self.journal.emit(key,path,payload)
+                frozen=self.journal.db.execute('SELECT payload FROM outbox WHERE key=?',(key,)).fetchone()[0]
+                requests=[];accepted=[]
+                response=MagicMock();response.__enter__.return_value.read.return_value=b'{"acknowledged":true}'
+                opener=MagicMock()
+                def post(request,timeout):
+                    requests.append(request.data)
+                    self.assertGreater(len(request.data),65536)
+                    self.assertLessEqual(len(request.data),401*1024)
+                    if len(requests)==1:
+                        if lost_after_accept:accepted.append(request.data)
+                        raise urllib.error.URLError('synthetic response lost')
+                    if not accepted:accepted.append(request.data)
+                    self.assertEqual(request.data,accepted[0])
+                    return response
+                opener.open.side_effect=post
+                with patch('agent_hub_host.client.urllib.request.build_opener',return_value=opener):
+                    with self.assertRaises(ApiError):self.journal.flush(Client('https://hub.test'))
+                    self.assertEqual(self.journal.db.execute('SELECT payload FROM outbox WHERE key=?',(key,)).fetchone()[0],frozen)
+                    reopened=Journal(self.path)
+                    try:reopened.flush(Client('https://hub.test'))
+                    finally:reopened.close_thread()
+                self.assertEqual(requests[0],requests[1])
+                self.assertEqual(json.loads(requests[1]),json.loads(frozen))
+                self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM outbox WHERE key=?',(key,)).fetchone()[0],0)
+
+    def test_capture_only_transport_budget_handles_unicode_and_controls(self):
+        from unittest.mock import MagicMock
+        for output in ['x'*65536,'\0'*65536,'😀'*16384]:
+            response=MagicMock();response.__enter__.return_value.read.return_value=b'{}'
+            opener=MagicMock();opener.open.return_value=response
+            with patch('agent_hub_host.client.urllib.request.build_opener',return_value=opener):
+                Client('https://hub.test').request('POST','/api/sessions/s/commands/c/ack',self.payload(output))
+            raw=opener.open.call_args.args[0].data
+            self.assertLessEqual(len(raw),401*1024)
+            self.assertEqual(json.loads(raw)['result']['output'],output)
+
+    def test_generic_and_non_capture_shapes_keep_existing_transport_limit(self):
+        payload=self.payload('\0'*65536)
+        for path in ['/api/heartbeat','/api/sessions/s/finish','/api/sessions/s/commands/c/ack?safety=operator_stop',
+                     '/api/machines/h/native/n/commands/c/ack']:
+            with self.subTest(path=path),self.assertRaisesRegex(ValueError,'request too large'):
+                Client('https://hub.test').request('POST',path,payload)
+        for result in [{'output':'x'*65537},{'stopped':True,'output':'\0'*65536},
+                       {'output':'\0'*65536,'capture_binding':{'unknown':'x'*2000}}]:
+            with self.subTest(keys=list(result)),self.assertRaisesRegex(ValueError,'request too large'):
+                Client('https://hub.test').request('POST','/api/sessions/s/commands/c/ack',{'epoch':7,'result':result})

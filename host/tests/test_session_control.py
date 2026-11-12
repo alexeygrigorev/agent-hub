@@ -1153,3 +1153,29 @@ class TestNativeControlCli(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'native_send_uncertain'):
                 session_control.execute(self.parse('send',self.native,'--prompt','owned text','--wait','--key','same'))
             self.assertEqual(call.call_count,2)
+
+
+class TestTargetedCaptureReceipt(unittest.TestCase):
+    def test_wait_reads_exact_id_filter_and_preserves_large_capture(self):
+        entry={'id':'cmd-1','state':'acked','ack':{'capture':'x'*65536}}
+        with patch.object(session_control,'request',return_value={'commands':[entry],'next_cursor':None}) as transport:
+            self.assertEqual(session_control.wait_for_command('session','cmd-1',1,1),entry)
+        transport.assert_called_once_with('GET','/api/sessions/session/commands?limit=100&command_id=cmd-1')
+
+    def test_explicit_reconciliation_uses_same_selector(self):
+        args=parser().parse_args(['sessions','commands','session','--command-id','cmd-1'])
+        with patch.object(session_control,'request',return_value={'commands':[{'id':'cmd-1'}]}) as transport:
+            self.assertEqual(session_control.execute(args),{'commands':[{'id':'cmd-1'}],'next_cursor':None})
+        self.assertIn('command_id=cmd-1',transport.call_args.args[1])
+
+    def test_missing_or_oversized_history_is_not_an_empty_capture(self):
+        with patch.object(session_control,'request',return_value={'commands':[],'next_cursor':None}):
+            with self.assertRaisesRegex(ValueError,'Command missing'):session_control._fetch_command_entry('s','missing')
+        with patch.object(session_control,'request',side_effect=session_control.SessionHTTPError(413,'command_history_too_large')):
+            with self.assertRaisesRegex(ValueError,'command_history_too_large'):session_control._fetch_command_entry('s','cmd')
+
+    def test_invalid_reconciliation_id_never_sends(self):
+        args=parser().parse_args(['sessions','commands','session','--command-id','bad/id'])
+        with patch.object(session_control,'request') as transport:
+            with self.assertRaisesRegex(ValueError,'invalid_command_id'):session_control.execute(args)
+        transport.assert_not_called()

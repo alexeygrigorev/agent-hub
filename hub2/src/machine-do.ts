@@ -11,6 +11,12 @@ import { actorFrom, bodyObject, boundedString, error, hasScope, HttpError, json 
 import { CLAIMED_WITHOUT_NATIVE_GRACE_MS, HOST_INVENTORY_LOST_MS, inactiveReason, isLiveActiveSession, LIVE_SNAPSHOT_TTL_MS, SESSION_REAP_INTERVAL_MS, type LiveSession } from './session-liveness';
 import type { Actor, Hub2Env, JsonRecord } from './types';
 
+const CAPTURE_OUTPUT_BYTES = 64 * 1024;
+// Six JSON bytes per raw control byte, plus the existing bounded binding.
+const CAPTURE_RESULT_JSON_BYTES = 400 * 1024;
+const CAPTURE_ACK_BODY_BYTES = 401 * 1024;
+const COMMAND_HISTORY_BYTES = 8 * 1024 * 1024;
+
 const LABEL_RECOVERY = `state='running' AND native_id IS NOT NULL
   AND CASE WHEN json_valid(launch_json) THEN
   (json_type(launch_json,'$._hub_workspace_binding') IS NULL
@@ -1195,11 +1201,14 @@ export class MachineDO {
     if (!machineId) return error('forbidden', 403);
     const safety=request.headers.get('x-hub2-safety-mode')==='operator_stop';
     if(new URL(request.url).searchParams.has('safety')&&!safety)return error('untrusted_safety_mode',403);
-    const body = await bodyObject(request, 12_288);
-    if (!Number.isSafeInteger(body.epoch) || !body.result || typeof body.result !== 'object' || Array.isArray(body.result)) return error('invalid_command_ack', 400);
-    if (new TextEncoder().encode(JSON.stringify(body.result)).byteLength > 8192) return error('command_ack_too_large', 413);
     const row = this.db.one<CommandRow>('SELECT * FROM session_commands WHERE id=? AND session_id=? AND machine_id=?', commandId, sessionId, machineId);
-    if (!row || row.epoch !== body.epoch) return error('stale_command', 409);
+    if (!row) return error('stale_command', 409);
+    const capture = row.kind === 'capture';
+    const body = await bodyObject(request, capture ? CAPTURE_ACK_BODY_BYTES : 12_288);
+    if (!Number.isSafeInteger(body.epoch) || !body.result || typeof body.result !== 'object' || Array.isArray(body.result)) return error('invalid_command_ack', 400);
+    const resultLimit = capture && typeof (body.result as JsonRecord).output === 'string' ? CAPTURE_RESULT_JSON_BYTES : 8192;
+    if (new TextEncoder().encode(JSON.stringify(body.result)).byteLength > resultLimit) return error('command_ack_too_large', 413);
+    if (row.epoch !== body.epoch) return error('stale_command', 409);
     if(safety&&row.kind!=='stop')return error('safety_command_refused',403);
     const session = row.kind === 'stop'
       ? this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND machine_id=? AND epoch=?',sessionId,machineId,row.epoch)
@@ -1208,6 +1217,7 @@ export class MachineDO {
     const captureFailed=row.kind==='capture'&&result.error!==undefined;
     if(captureFailed&&(typeof result.error!=='string'||!/^[a-z_]{1,80}$/.test(result.error)
       ||result.output!==undefined))return error('invalid_command_ack',400);
+    if(capture&&!captureFailed&&(typeof result.output!=='string'||new TextEncoder().encode(result.output).length>CAPTURE_OUTPUT_BYTES))return error('invalid_capture_output',400);
     const captureBinding=row.kind==='capture'?(this.parse(row.result_json) as JsonRecord|null)?.capture_binding as JsonRecord|undefined:undefined;
     if(captureBinding){
       const current=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND machine_id=? AND epoch=?',sessionId,machineId,row.epoch);
@@ -1221,7 +1231,7 @@ export class MachineDO {
         if(typeof result.error!=='string'||!/^[a-z_]{1,80}$/.test(result.error))return error('invalid_command_ack',400);
         result={error:result.error,reason:result.error,capture_binding:captureBinding,capture_source:result.capture_source??'legacy_running'};
       }else{
-        if(typeof result.output!=='string'||new TextEncoder().encode(result.output).length>4096)return error('invalid_capture_output',400);
+        if(typeof result.output!=='string'||new TextEncoder().encode(result.output).length>CAPTURE_OUTPUT_BYTES)return error('invalid_capture_output',400);
         result={output:result.output,capture_binding:captureBinding,capture_source:result.capture_source??'legacy_running'};
       }
     }
@@ -1237,7 +1247,7 @@ export class MachineDO {
       }
     }
     const resultJson = JSON.stringify(result);
-    if(new TextEncoder().encode(resultJson).length>8192)return error('command_ack_too_large',413);
+    if(new TextEncoder().encode(resultJson).length>resultLimit)return error('command_ack_too_large',413);
     const unconfirmed=row.kind==='stop'&&result.stopped===false&&result.error==='stop_unconfirmed';
     if (row.state === 'acked' || (row.state === 'failed' && (unconfirmed||captureBinding||captureFailed) && row.result_json === resultJson)) {
       return row.result_json === resultJson ? json({ acknowledged: true, duplicate: true }) : error('command_ack_conflict', 409);
@@ -1776,8 +1786,15 @@ export class MachineDO {
   private commandListing(request: Request, sessionId: string): Response {
     const actor = actorFrom(request), session = this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?', sessionId);
     if (!session || (!hasScope(actor, 'operator:admin') && !(hasScope(actor, 'session:read') && [session.id, session.project_id].includes(actor?.resource_id || '')))) return error('session_not_found', 404);
-    const rows = this.db.all<CommandRow>('SELECT * FROM session_commands WHERE session_id=? ORDER BY created_at DESC,id LIMIT 100', sessionId);
-    return json({ commands: rows.map(row => {
+    const query = new URL(request.url).searchParams;
+    const commandId = query.get('command_id');
+    if (commandId !== null && (query.getAll('command_id').length !== 1 || !/^[A-Za-z0-9-]{1,80}$/.test(commandId))) return error('invalid_command_id',400);
+    const rows = commandId !== null
+      ? this.db.all<CommandRow>('SELECT * FROM session_commands WHERE session_id=? AND id=?',sessionId,commandId)
+      : this.db.all<CommandRow>('SELECT * FROM session_commands WHERE session_id=? ORDER BY created_at DESC,id LIMIT 100', sessionId);
+    const commands:JsonRecord[]=[];
+    let bytes = new TextEncoder().encode(JSON.stringify({commands:[],next_cursor:null})).length;
+    for (const row of rows) {
       const result = row.state !== 'pending' && row.result_json ? JSON.parse(row.result_json) as JsonRecord : null;
       const ack = result === null ? null : {
         ...result,
@@ -1785,8 +1802,12 @@ export class MachineDO {
         ...(row.kind === 'stop' ? { outcome: row.state === 'failed' ? 'failed' : 'delivered',
           confirmed_exit: row.state==='acked'&&this.qualifiedStopResult(session,result) } : {}),
       };
-      return { id: row.id, session_id: row.session_id, kind: row.kind, state: row.state, created_at: row.created_at, ack };
-    }), next_cursor: null });
+      const entry={ id: row.id, session_id: row.session_id, kind: row.kind, state: row.state, created_at: row.created_at, ack };
+      bytes += new TextEncoder().encode(JSON.stringify(entry)).length + (commands.length ? 1 : 0);
+      if(bytes>COMMAND_HISTORY_BYTES)return error('command_history_too_large',413);
+      commands.push(entry);
+    }
+    return json({commands,next_cursor:null});
   }
 
   private sessionDetail(request: Request, id: string): Response {
