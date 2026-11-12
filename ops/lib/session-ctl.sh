@@ -615,6 +615,24 @@ try: os.fsync(dfd)
 finally: os.close(dfd)
 ' "$1" "$2"
 }
+# STATE and its ancestors may have just been created by mkdir -p; a new
+# directory entry is durable only once its parent is fsynced. durable_chain
+# fsyncs $1 and every ancestor directory up to /, and runs before every Hub
+# start dispatch (first request and every replay, so a request whose earlier
+# sync failed is never sent until its whole path is durable).
+durable_chain() {  # $1 = existing file
+  python3 -c '
+import os,sys
+p=os.path.abspath(sys.argv[1])
+while True:
+    fd=os.open(p,os.O_RDONLY)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+    parent=os.path.dirname(p)
+    if parent==p: break
+    p=parent
+' "$1"
+}
 drop_pending() {  # only after the binding that supersedes it is durable
   rm -f "$PENDING" && python3 -c '
 import os,sys
@@ -652,6 +670,8 @@ hub_start() {
     printf '%s\0' "$PENDING_VERSION" "$key" "$ENGINE" "${argv[@]}" | durable_put "$PENDING" noclobber \
       || { log "cannot record pending Hub start (pending request exists or write failed); recovery held"; return 1; }
   fi
+  durable_chain "$PENDING" \
+    || { log "cannot make pending Hub start $PENDING durable (state path sync failed); not sent; recovery held"; return 1; }
   out="$STATE/hub_start.out"; err="$STATE/hub_start.err"
   HUB_CONFIG_FILE="$HUB_CFG" T=180 t hub "${argv[@]}" >"$out" 2>"$err"; rc=$?
   # Accept only a running Hub session bound to a native session; record the

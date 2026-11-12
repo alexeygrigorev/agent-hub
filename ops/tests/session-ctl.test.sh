@@ -38,7 +38,13 @@ isolation_guard "$iso" || { echo "refusing to run: $iso failed the isolation gua
 export HOME="$iso" TMPDIR="$iso/tmp"
 mkdir -p "$TMPDIR"
 # No caller identity, Hub/aplexer config or operator override reaches the run.
-while IFS= read -r v; do unset "$v"; done < <(compgen -e | grep -E '^(APLEXER_|HUB_|HUB2_|AGENT_HUB_|OPS_|XDG_|GH_|ORCH_|ONCALL_)' || true)
+# The host heavy-test admission variables (AGENT_HUB_HEAVY_TEST_*, including
+# the inherited HELD marker) are never cleared: they are admission state, not
+# operator identity.
+heavy_before=$(env | grep -E '^AGENT_HUB_HEAVY_TEST_' | sort || true)
+while IFS= read -r v; do unset "$v"; done < <(compgen -e | grep -E '^(APLEXER_|HUB_|HUB2_|AGENT_HUB_|OPS_|XDG_|GH_|ORCH_|ONCALL_)' | grep -v '^AGENT_HUB_HEAVY_TEST_' || true)
+[[ "$(env | grep -E '^AGENT_HUB_HEAVY_TEST_' | sort || true)" == "$heavy_before" ]] \
+  || { echo "refusing to run: the scrub changed heavy-test admission variables" >&2; exit 1; }
 unset ENGINE ENGINE_SELECTED BASE_REPO SKILLS_REPO SKILLS_DIR MIN_RESTART_GAP TMUX
 
 fake="$HOME/session-ctl-fixture"

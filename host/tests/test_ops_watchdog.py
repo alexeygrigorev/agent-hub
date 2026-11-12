@@ -617,6 +617,52 @@ class OpsWatchdogTest(unittest.TestCase):
         self.assertEqual(re.findall(r'--key (\S+)', self.starts()[-1]), [key.decode()])
         self.assertFalse(pending.exists())
 
+    def test_new_state_path_is_durable_before_any_hub_dispatch(self):
+        # A test-owned sitecustomize records every fsync (by resolved path) and
+        # the Hub start dispatch in one ordered log, and can fail one fsync.
+        hook = self.home / 'pyhook'
+        hook.mkdir()
+        (hook / 'sitecustomize.py').write_text(
+            "import os,sys\n"
+            "log=os.environ.get('FSYNC_LOG')\n"
+            "if log:\n"
+            "    fail=os.environ.get('FSYNC_FAIL','')\n"
+            "    real=os.fsync\n"
+            "    def fsync(fd):\n"
+            "        path=os.readlink('/proc/self/fd/%d' % fd)\n"
+            "        if fail and path==fail: raise OSError(5,'injected fsync failure',path)\n"
+            "        real(fd)\n"
+            "        with open(log,'a') as o: o.write('fsync '+path+'\\n')\n"
+            "    os.fsync=fsync\n"
+            "    if os.path.basename(sys.argv[0])=='hub' and sys.argv[1:3]==['sessions','start']:\n"
+            "        with open(log,'a') as o: o.write('dispatch\\n')\n")
+        log = self.home / 'fsync.log'
+        self.env.update(PYTHONPATH=str(hook), FSYNC_LOG=str(log))
+        state = self.state.resolve(strict=False)
+        self.assertFalse(self.state.exists())  # first use: the controller creates STATE
+        ancestors = [state / 'hub_start_pending', state, *state.parents]
+
+        # A new ancestor whose entry cannot be made durable: nothing is sent.
+        self.env['FSYNC_FAIL'] = str(state.parent)
+        result = self.run_ctl('start')
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn('state path sync failed', result.stdout)
+        self.assertEqual(self.starts(), [])
+        self.assertNotIn('dispatch', log.read_text())
+        key = (self.state / 'hub_start_pending').read_text().split('\0')[1]  # kept, never re-minted
+
+        # The retry syncs the whole chain before it replays the same request.
+        del self.env['FSYNC_FAIL']
+        log.unlink()
+        self.assertEqual(self.run_ctl('start').returncode, 0)
+        lines = log.read_text().splitlines()
+        dispatch = lines.index('dispatch')
+        synced = lines[:dispatch]
+        for path in ancestors:
+            self.assertIn('fsync ' + str(path), synced, f'{path} not durable before the Hub POST')
+        self.assertEqual(re.findall(r'--key (\S+)', self.starts()[-1]), [key])
+        self.assertEqual(len(self.starts()), 1)
+
     def test_replayed_key_returns_the_session_hub_already_created(self):
         self.data['start_error'] = 'transport'
         self.assertNotEqual(self.run_ctl('start').returncode, 0)
@@ -914,9 +960,12 @@ class SessionCtlShellIsolationTest(unittest.TestCase):
                    'TMPDIR': str(caller / 'tmp'), 'HUB_CONFIG_FILE': str(caller / '.config/agent-hub/cli.json'),
                    'OPS_ROLE_INTAKES': str(caller / '.config/agent-hub/ops-role-intakes.json'),
                    'OPS_SESSION_CTL': str(caller / 'nonexistent-ctl'), 'APLEXER_TAG': 'sentinel-tag',
-                   'HUB2_CONFIG': str(caller / 'hub2-contexts/x.json')}
+                   'HUB2_CONFIG': str(caller / 'hub2-contexts/x.json'),
+                   'AGENT_HUB_HEAVY_TEST_HELD': 'sentinel-held'}
             result = subprocess.run(['bash', str(self.SHELL_TEST)], env=env, text=True,
                                     capture_output=True, timeout=600)
+            # The admission marker survives the scrub; operator identity does not.
+            self.assertNotIn('changed heavy-test admission variables', result.stderr)
             self.assertEqual(result.returncode, 0, result.stdout[-3000:] + result.stderr[-3000:])
             self.assertIn('session-ctl targeted tests passed', result.stdout)
             self.assertEqual(self.snapshot(caller), before)
