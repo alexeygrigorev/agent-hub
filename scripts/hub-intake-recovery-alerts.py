@@ -6,7 +6,7 @@ dev@dtcdev.click when an unfinished intake exhausts its bounded recovery
 sessions, a recovery start is refused, or the session cannot be recovered
 (lost host, launch failure). This poller finds those intakes across projects,
 mails each alert once through the dev-mail helper and remembers it in a private
-receipt journal. It is run by hub-model-picker-monitor.sh every five minutes.
+receipt journal. It runs every five minutes from ops/systemd/hub-intake-recovery-alerts.timer.
 """
 import argparse
 import json
