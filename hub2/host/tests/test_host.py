@@ -1222,9 +1222,19 @@ class HostTests(unittest.TestCase):
         self.assertEqual(self.native.process["phase"], "running")
         self.assertEqual([args[1:] for args, _ in self.native.calls], [['list', '--all', '--json']])
 
+    def reconcile_with_census(self):
+        """Census runs off the control loop; wait for its single worker, never in production."""
+        from agent_hub_host.launch_reaper import observation_thread
+        self.bridge.reconcile()
+        thread = observation_thread(self.bridge)
+        if thread is not None:
+            thread.join(10)
+            self.assertFalse(thread.is_alive())
+        self.bridge.reconcile()
+
     def test_reconcile_closes_legacy_launch_with_unconfirmed_failure(self):
         self.insert_orphan_launch()
-        self.bridge.reconcile()
+        self.reconcile_with_census()
         state = self.journal.db.execute(
             "SELECT state FROM launches WHERE session_id='session-orphan'").fetchone()[0]
         self.assertEqual(state, "launch_failed_unconfirmed")
@@ -1260,7 +1270,7 @@ class HostTests(unittest.TestCase):
         with self.journal.db:
             self.journal.db.execute('UPDATE launches SET workspace=?', (str(workspace),))
         workspace.rmdir()
-        self.bridge.reconcile()
+        self.reconcile_with_census()
         row = self.journal.db.execute('SELECT state,legacy_failure_json FROM launches').fetchone()
         self.assertEqual(row['state'], 'launch_failed_unconfirmed')
         self.assertEqual(json.loads(row['legacy_failure_json'])['evidence']['workspace'], str(workspace))

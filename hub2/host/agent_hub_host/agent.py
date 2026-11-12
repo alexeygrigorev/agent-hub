@@ -595,6 +595,16 @@ class Bridge:
                     return
                 self.journal.enqueue(f"legacy-unobserved:{operation}:{epoch}", f"/api/sessions/{session}/finish", payload)
 
+    def settle_legacy_census(self, inventory):
+        rows = self.journal.db.execute("SELECT * FROM launches WHERE state='aborting' AND native_dispatch_started IS NULL "
+                                       "AND native_id IS NULL LIMIT 1000").fetchall()
+        for row in rows:
+            try:
+                self.settle_legacy_unobserved_launch(row, inventory)
+            except (RuntimeError, OSError, subprocess.SubprocessError):
+                logging.getLogger(__name__).warning('Native census unusable; legacy launches remain unresolved')
+                return
+
     def abort_launch(self,operation):
         with self.journal.db:
             self.journal.db.execute("UPDATE launches SET state='aborting' WHERE operation_id=? AND state='launching'",(operation,))
@@ -655,8 +665,6 @@ class Bridge:
         rows = self.journal.db.execute("SELECT * FROM launches WHERE state IN ('running','aborting','deadline_stopping','launching') LIMIT 1001").fetchall()
         if len(rows) > 1000:
             raise RuntimeError("active_native_bound_exceeded")
-        inventory = None
-        inventory_failed = False
         for row in rows:
             if row['session_id'] in getattr(self, '_inflight', set()):
                 continue
@@ -670,17 +678,16 @@ class Bridge:
                     self.journal.db.execute("UPDATE launches SET state='aborting' WHERE operation_id=? AND state='launching'",(row['operation_id'],))
                 row = self.journal.db.execute("SELECT * FROM launches WHERE operation_id=?", (row['operation_id'],)).fetchone()
             if row['state']=='aborting' and row['native_dispatch_started'] is None and not row['native_id']:
-                try:
-                    if not inventory_failed:
-                        if inventory is None or not inventory.fresh():
-                            collect_inventory = getattr(self.launcher, 'inventory', None)
-                            if not callable(collect_inventory):
-                                raise RuntimeError('native_census_unavailable')
-                            inventory = collect_inventory()
-                        self.settle_legacy_unobserved_launch(row, inventory)
-                except (RuntimeError, OSError, subprocess.SubprocessError):
-                    inventory_failed = True
+                # Census collection runs off this control loop (single in-flight);
+                # the worker also settles legacy rows as soon as it completes.
+                inventory = launch_reaper.request_census(self)
+                if inventory is None and not callable(getattr(self.launcher, 'inventory', None)):
                     logging.getLogger(__name__).warning('Native census unavailable; legacy launches remain unresolved')
+                if inventory is not None:
+                    try:
+                        self.settle_legacy_unobserved_launch(row, inventory)
+                    except (RuntimeError, OSError, subprocess.SubprocessError):
+                        logging.getLogger(__name__).warning('Native census unusable; legacy launches remain unresolved')
                 continue
             workspace_available = self._workspace_is_available(row["workspace"])
             if not workspace_available and not row["native_id"]:
