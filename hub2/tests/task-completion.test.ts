@@ -250,6 +250,11 @@ test('an operator stop and a launch failure are reported, not continued; a dead 
     assert.equal(sagas(f,refused).length,1,'launch refusals are not retried in a loop');
     const report=f.mail.find(m=>m.key==='terminal:'+saga.operation_id);
     assert(report);assert.match(report.body,/launch_failed/);
+    // Unrecovered ends get a developer owner; an operator stop does not.
+    assert(!events(f,stopped).some(e=>e.kind==='developer_alert_raised'),'an operator stop is not alerted');
+    const launchAlert=events(f,refused).find(e=>e.kind==='developer_alert_raised');
+    assert(launchAlert);assert.equal(launchAlert.body.kind,'not_recoverable');assert.equal(launchAlert.body.recipient,'dev@dtcdev.click');
+    assert.equal((await json(await f.call('/api/intakes/'+refused))).task.owner,'dev@dtcdev.click');
   }finally{f.close();}
 });
 
