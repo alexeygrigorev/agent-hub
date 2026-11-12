@@ -60,10 +60,11 @@
       "enabled": true
     },
     {
-      "id": "zai-glm-flash",
-      "engine": "zai",
-      "model": "glm-5.3-flash",
-      "account_id": "zai-central",
+      "id": "antigravity-hydrogen-medium",
+      "engine": "antigravity",
+      "model": "gemini-4-hydrogen-medium",
+      "effort": "medium",
+      "account_id": "gemini",
       "weight": 1,
       "capabilities": [],
       "enabled": true

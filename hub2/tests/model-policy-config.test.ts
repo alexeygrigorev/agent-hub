@@ -70,7 +70,18 @@ test('zai appears only as the canonical zai engine on zai-central; astra stays o
     if (candidate.engine === 'zai') assert.equal(candidate.account_id, 'zai-central');
     assert.ok(!/astra/i.test(candidate.model + ' ' + candidate.id), 'astra is explicit-only, never a default candidate');
   }
-  assert.ok(policy.candidates.some(candidate => candidate.engine === 'zai'), 'Z.ai GLM is part of the pool');
+});
+
+test('Gemini 4 Hydrogen via Antigravity replaces the flash route for ordinary picks (intake aaeee7b1)', () => {
+  const hydrogen = policy.candidates.find(candidate => candidate.id === 'antigravity-hydrogen-medium');
+  assert.ok(hydrogen, 'Hydrogen candidate is in the pool');
+  assert.equal(hydrogen.engine, 'antigravity');
+  assert.equal(hydrogen.model, 'gemini-4-hydrogen-medium');
+  assert.equal(hydrogen.effort, 'medium');
+  assert.equal(hydrogen.enabled, true);
+  assert.deepEqual(hydrogen.capabilities ?? [], [], 'ordinary: not review-only');
+  assert.ok(!policy.candidates.some(candidate => /flash/i.test(`${candidate.id} ${candidate.model}`)), 'no flash route remains in the default pool');
+  assert.equal(modelPolicyCandidateViolation({id: hydrogen.id, engine: 'antigravity', model: hydrogen.model, effort: 'medium', account_id: 'gemini', capabilities: []}), null);
 });
 
 test('no haiku anywhere in the pool', () => {
