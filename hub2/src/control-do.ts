@@ -313,6 +313,8 @@ export class ControlDO {
     if (path === '/api/engines/' + CLAUDE_ENGINE_LABEL && request.method === 'POST') return await this.acknowledgeEngine(request, actor);
     if (path === '/api/engines/' + CLAUDE_ENGINE_LABEL + '/generation' && request.method === 'GET')
       return await this.engineGenerationCheck(request, actor);
+    if (path === '/api/engines/' + CLAUDE_ENGINE_LABEL + '/passive-credential' && request.method === 'GET')
+      return await this.enginePassiveCredential(request, actor);
     const credentialRoute = path.match(/^\/api\/engines\/hub-claude\/(credential|rejection)$/);
     if (credentialRoute) return await this.engineCredential(request, credentialRoute[1] as 'credential' | 'rejection', actor);
     return error('not_found', 404);
@@ -394,6 +396,38 @@ export class ControlDO {
     return json({ engines: [{ label: CLAUDE_ENGINE_LABEL, provider: 'claude', version, revision,
       files: credential.files, env: {}, args: [], credential_generation: credential.generation,
       credential_paths: ['.claude/.credentials.json'] }], logins: [], latest_version: this.engineRollout().latest });
+  }
+
+  // Approved-host passive retrieval of the current Claude generation's
+  // refresh-stripped material. Never refreshes, leases, logs in, discovers,
+  // allocates an account, syncs or acknowledges. Fenced on the desired engine
+  // revision and the exact generation captured before the awaits.
+  private async enginePassiveCredential(request: Request, actor?: Actor): Promise<Response> {
+    if (!actor || actor.kind !== 'machine' || !actor.resource_id) return error('forbidden', 403);
+    if ([...new URL(request.url).searchParams.keys()].length || (await request.text()).length)
+      return error('invalid_passive_credential', 400);
+    const machineId = actor.resource_id;
+    const captured = await this.accountRequest('/api/account/credentials?metadata=1', 'GET', actor);
+    if (!captured.ok) return captured;
+    const metadata = await captured.json() as any;
+    if (metadata?.provider !== 'claude' || !Number.isSafeInteger(metadata?.generation) || metadata.generation < 1)
+      return error('managed_credential_unavailable', 503);
+    const generation = metadata.generation as number;
+    const version = this.engineVersionFor(machineId);
+    const revision = await this.engineRevision(version);
+    if (this.engineVersionFor(machineId) !== version) return error('revision_changed', 409);
+    const response = await this.accountRequest('/api/account/credentials?passive_generation=' + generation, 'GET', actor);
+    if (!response.ok) return response;
+    const credential = await response.json() as any;
+    if (credential?.provider !== 'claude' || credential?.generation !== generation || credential?.passive !== true
+      || !credential.files || typeof credential.files !== 'object' || Array.isArray(credential.files))
+      return error('generation_conflict', 409);
+    // Both the rollout revision and the exact generation may have moved while awaiting.
+    if (!await this.engineRevisionStable(machineId, revision)) return error('revision_changed', 409);
+    const latest = await this.accountRequest('/api/account/credentials?metadata=1', 'GET', actor);
+    if (!latest.ok) return latest;
+    if ((await latest.json() as any)?.generation !== generation) return error('generation_conflict', 409);
+    return json({ label: CLAUDE_ENGINE_LABEL, generation, revision, status: 'current', files: credential.files });
   }
 
   // Host release re-pin: fenced observation that this machine's engine revision
