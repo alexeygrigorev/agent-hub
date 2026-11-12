@@ -132,7 +132,7 @@ The checked-in table and rules live in `config/model-routing.json`; the HTTP pol
 | Tier | Models | Aliases |
 |---|---|---|
 | `deep` | Codex Astra, Gemini Argon, Claude Opus | `smart`, `hard`, `hard-reasoning` |
-| `daily` | GPT Sol, Claude Sonnet (medium effort; Claude Haiku is never routed), Z.ai **glm-5.3-flash**, OpenCode Muse Spark 1.3, OpenCode deepseek-v4.1-flash; Grok as eligible fallback | `everyday`, `good`, `volume` |
+| `daily` | GPT Sol, Claude Sonnet (medium effort; Claude Haiku is never routed), Gemini 4 **Hydrogen** (Antigravity, medium effort; replaces the flash route for ordinary picks), OpenCode Muse Spark 1.3, OpenCode deepseek-v4.1-flash; Grok as eligible fallback | `everyday`, `good`, `volume` |
 | `quick` | GPT-6 Luna at **max** effort | `concrete`, `no-thinking` |
 
 Current standing rules: Z.ai and OpenCode preferred for volume; Grok allowed by hub policy. Routing keeps the configured tier membership and provider restrictions. Codex remains explicit-only (runner or model) except that tier-only daily/deep/review work may use it while its current quota is forecast to expire unused (`explicit_only_burn_release_percent`, default 30%). Quick-tier work keeps explicit-only behavior. Asking for a tier alone does not authorize Codex; quick tasks therefore remain queued until an allowed exact route exists or Codex is explicitly requested. No full `glm-5.3` route exists; OpenCode has only Muse and DeepSeek entries. GLM uses ZCode. Exact IDs are configurable and must match actual host/launcher support; a table entry alone does not prove account access. The deployed operator rules and launcher admission still govern execution; this scoring configuration does not grant permission to launch a provider.
