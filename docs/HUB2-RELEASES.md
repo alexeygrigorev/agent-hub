@@ -36,7 +36,20 @@ production work. The helper is portable; Windows service/update automation
 requires its separate platform adapter and live verification.
 
 The host user unit runs `~/.local/share/agent-hub2/current/bin/hub2 serve`.
-Its update timer checks every five minutes, downloads all artifacts, verifies
+Its update timer checks every five minutes. Automatic activation is batched at
+least six hours after the last activation. Once eligible, it waits for the
+managed-launch journal to become idle, for at most two more hours. Newer
+published releases replace the candidate without resetting that wait. Missing
+or unreadable session state is treated as busy for the same bounded window.
+The private `activation-policy.json` receipt and updater stdout record the
+candidate, decision, reason, managed-session count (null means unknown), and
+next check time. Failed activations retain their existing retry backoff.
+Explicit `--install-service` setup and initial enrollment remain immediate;
+operators should coordinate these restarts separately. Recovery/rollback is
+also immediate. The batching limit covers automatic successful activations,
+not crashes, rollbacks, or explicit operator restarts.
+
+After the activation gate permits the latest release, it downloads all artifacts, verifies
 their hashes, builds a new environment under `releases/<commit>` offline from
 the shipped wheels, checks the heartbeat signature, then switches `current`
 atomically and restarts the daemon. It observes the service for 30 seconds and
@@ -75,3 +88,8 @@ CI workflow hooks, immutable artifact delivery, runtime version reporting,
 canary rollback and desktop enrollment are coordinated changes; acceptance
 requires their integrated evidence. Linux user units do not install a Windows
 service or prove enrollment on an offline desktop.
+
+The shell start canary runs every 15 minutes; the full probe remains every 30
+minutes. Both retain their existing failure alert path. Cadence reduces probe
+volume but cannot guarantee a launch-share percentage independently of real
+traffic; measure both counts over the same 24-hour window after deployment.

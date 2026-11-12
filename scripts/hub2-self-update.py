@@ -10,10 +10,12 @@ from contextvars import ContextVar
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -1015,7 +1017,70 @@ def preserve_provider_path():
         Path(temporary).unlink(missing_ok=True)
 
 
-def install(base_url, root, *, install_service=False, restart=True):
+# Timer checks are cheap; activations are separated by six hours. Busy hosts
+# get a further two-hour drain window without resetting it for newer releases.
+ACTIVATION_INTERVAL = 6 * 3600
+MAX_BUSY_WAIT = 2 * 3600
+ACTIVATION_RECEIPT = 'activation-policy.json'
+
+
+def managed_session_count():
+    journal = Path.home() / '.config/agent-hub/v2-journal.sqlite'
+    # Read the daemon's authoritative managed-launch journal without creating
+    # or migrating it. Unknown state is treated as busy until the bounded wait.
+    try:
+        with contextlib.closing(sqlite3.connect(journal.as_uri() + '?mode=ro', uri=True, timeout=2)) as db:
+            return db.execute("SELECT count(*) FROM launches WHERE state NOT IN "
+                              "('exited','stopped_before_dispatch','launch_failed_reported')").fetchone()[0]
+    except (OSError, sqlite3.Error):
+        return None
+
+
+def activation_state(root, current):
+    path = root / ACTIVATION_RECEIPT
+    state = json.loads(path.read_text()) if path.exists() else {
+        'last_activation': current.lstat().st_mtime, 'pending_since': None}
+    if not isinstance(state, dict):
+        raise ValueError('invalid activation policy receipt')
+    for key in ('last_activation', 'pending_since'):
+        value = state.get(key)
+        if value is None and key == 'pending_since':
+            continue
+        if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+            raise ValueError('invalid activation policy timestamp')
+    return state
+
+
+def defer_activation(root, current, version):
+    now = time.time()
+    state = activation_state(root, current)
+    eligible_at = state['last_activation'] + ACTIVATION_INTERVAL
+    state.update(version=version, observed_at=now)
+    if now < eligible_at:
+        state.update(reason='release_batch_interval', next_check_at=eligible_at, managed_sessions=None)
+        deferred = True
+    else:
+        if state['pending_since'] is None:
+            state['pending_since'] = now
+        count = managed_session_count()
+        deadline = state['pending_since'] + MAX_BUSY_WAIT
+        deferred = count != 0 and now < deadline
+        state.update(managed_sessions=count, next_check_at=min(now + 300, deadline) if deferred else now,
+                     reason=('managed_sessions_running' if count is not None else 'managed_sessions_unknown')
+                     if deferred else ('bounded_wait_expired' if count != 0 else 'managed_sessions_idle'))
+    state['decision'] = 'deferred' if deferred else 'activate'
+    write_json(root / ACTIVATION_RECEIPT, state)
+    print('Hub2 activation ' + state['decision'] + ': ' + state['reason'] + ' release=' + version)
+    return deferred
+
+
+def record_activation(root, version):
+    write_json(root / ACTIVATION_RECEIPT, {
+        'last_activation': time.time(), 'pending_since': None, 'version': version,
+        'decision': 'activated', 'reason': 'verified_activation'})
+
+
+def install(base_url, root, *, install_service=False, restart=True, scheduled=False):
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     with update_lock(root):
         base = base_url.rstrip('/') + '/cli/'
@@ -1055,6 +1120,7 @@ def install(base_url, root, *, install_service=False, restart=True):
                     # this same release is already running with the old PATH.
                     command(['systemctl', '--user', 'restart', UNITS[0]])
                     check_service_ready(target)
+                    record_activation(root, version)
                     enable_service_timer()
             # Heal a pin left on an older release; nothing else to roll back.
             repin_managed_claude(target, base_url.rstrip('/'), root,
@@ -1063,6 +1129,8 @@ def install(base_url, root, *, install_service=False, restart=True):
             commit_updater(root, releases)
             print('Hub2 release already current: ' + version)
             return
+        if scheduled and restart and old and defer_activation(root, current, version):
+            return
         if target.exists() or target.is_symlink():
             if not restart:
                 raise ValueError('retained release activation requires a verified restart')
@@ -1070,6 +1138,7 @@ def install(base_url, root, *, install_service=False, restart=True):
             if install_service:
                 enable_service_timer()
             prune(root, releases)
+            record_activation(root, version)
             print('Reactivated retained Hub2 release: ' + version)
             return
         scratch = root / 'tmp'
@@ -1090,6 +1159,10 @@ def install(base_url, root, *, install_service=False, restart=True):
                 python = target / 'bin/python'
                 command([python, '-m', 'py_compile', download / 'hub2-self-update.py'])
                 command([python, download / 'hub2-self-update.py', '--help'])
+                # Preparation can take time: recheck just before switching.
+                # Returning here removes only our new unactivated environment.
+                if scheduled and restart and old and defer_activation(root, current, version):
+                    return
                 if old:
                     link(old, root / 'previous')
                 link(target, current)
@@ -1151,6 +1224,8 @@ def install(base_url, root, *, install_service=False, restart=True):
         if install_service and restart:
             enable_service_timer()
         prune(root, releases)
+        if restart:
+            record_activation(root, version)
         print('Activated Hub2 release: ' + version)
 
 
@@ -1172,7 +1247,8 @@ def main():
         config = Path.home() / '.config/agent-hub/v2.json'
         base = args.base_url or (json.loads(config.read_text()).get('server') if config.exists() else None)
         install(base or 'https://hub.dtcdev.click', args.root.resolve(),
-                install_service=args.install_service, restart=not args.no_restart)
+                install_service=args.install_service, restart=not args.no_restart,
+                scheduled=not args.install_service and not args.no_restart)
     except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
         print('Hub2 release update failed; inspect the current release and retry. No credentials logged.', file=sys.stderr)
         return 1

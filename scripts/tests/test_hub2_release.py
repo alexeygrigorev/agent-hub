@@ -110,6 +110,127 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
              patch.object(updater.subprocess, 'run', self.status_command):
             updater.install('https://example.invalid', self.root, **kwargs)
 
+    def policy(self, last=1, pending=None):
+        self.root.mkdir(exist_ok=True)
+        updater.write_json(self.root / updater.ACTIVATION_RECEIPT,
+                           {'last_activation': last, 'pending_since': pending})
+
+    def receipt(self):
+        return json.loads((self.root / updater.ACTIVATION_RECEIPT).read_text())
+
+    def test_scheduled_batch_defers_without_downloading_or_restarting(self):
+        old = self.old_release()
+        self.policy(last=1000)
+        with patch.object(updater.time, 'time', return_value=1001):
+            self.install(scheduled=True)
+        self.assertEqual(self.downloads, ['host-release.json'])
+        self.assertEqual((self.root / 'current').resolve(), old)
+        self.assertFalse(any('restart' in args for args in self.calls))
+        self.assertEqual(self.receipt()['reason'], 'release_batch_interval')
+        self.assertEqual(self.receipt()['next_check_at'], 1000 + updater.ACTIVATION_INTERVAL)
+        self.assertEqual((self.root / updater.ACTIVATION_RECEIPT).stat().st_mode & 0o777, 0o600)
+
+    def test_busy_deferral_preserves_deadline_across_newer_releases(self):
+        old = self.old_release()
+        self.policy()
+        start = updater.ACTIVATION_INTERVAL + 1
+        with patch.object(updater, 'managed_session_count', return_value=3), \
+             patch.object(updater.time, 'time', return_value=start):
+            self.install(scheduled=True)
+        self.assertEqual(self.receipt()['reason'], 'managed_sessions_running')
+        self.assertEqual(self.receipt()['managed_sessions'], 3)
+        with patch.object(updater, 'managed_session_count', return_value=2), \
+             patch.object(updater.time, 'time', return_value=start + 100):
+            self.assertTrue(updater.defer_activation(self.root, self.root / 'current', 'c' * 40))
+        self.assertEqual(self.receipt()['pending_since'], start)
+        self.assertEqual(self.receipt()['version'], 'c' * 40)
+        self.assertEqual((self.root / 'current').resolve(), old)
+        self.assertEqual(self.downloads, ['host-release.json'])
+
+    def test_busy_wait_expires_and_success_starts_new_batch_interval(self):
+        self.old_release()
+        self.policy(pending=updater.ACTIVATION_INTERVAL + 1)
+        now = updater.ACTIVATION_INTERVAL + 1 + updater.MAX_BUSY_WAIT
+        reasons = []
+        original = updater.write_json
+        def capture(path, value):
+            if path.name == updater.ACTIVATION_RECEIPT:
+                reasons.append(value['reason'])
+            return original(path, value)
+        with patch.object(updater, 'managed_session_count', return_value=4), \
+             patch.object(updater.time, 'time', return_value=now), \
+             patch.object(updater, 'write_json', side_effect=capture):
+            self.install(scheduled=True)
+        self.assertIn('bounded_wait_expired', reasons)
+        self.assertEqual(self.receipt()['last_activation'], now)
+        self.assertIsNone(self.receipt()['pending_since'])
+        self.assertEqual(sum('restart' in args for args in self.calls), 1)
+        with patch.object(updater.time, 'time', return_value=now + 1):
+            self.assertTrue(updater.defer_activation(self.root, self.root / 'current', 'd' * 40))
+
+    def test_idle_host_activates_without_wait_after_batch_interval(self):
+        self.old_release()
+        self.policy()
+        with patch.object(updater, 'managed_session_count', return_value=0), \
+             patch.object(updater.time, 'time', return_value=updater.ACTIVATION_INTERVAL + 1):
+            self.install(scheduled=True)
+        self.assertEqual(self.receipt()['decision'], 'activated')
+        self.assertEqual(sum('restart' in args for args in self.calls), 1)
+
+    def test_session_starting_during_preparation_defers_before_switch(self):
+        old = self.old_release()
+        self.policy()
+        with patch.object(updater, 'managed_session_count', side_effect=[0, 1]), \
+             patch.object(updater.time, 'time', return_value=updater.ACTIVATION_INTERVAL + 1):
+            self.install(scheduled=True)
+        self.assertEqual((self.root / 'current').resolve(), old)
+        self.assertFalse((self.root / 'releases' / SHA).exists())
+        self.assertFalse(any('restart' in args for args in self.calls))
+        self.assertEqual(self.receipt()['reason'], 'managed_sessions_running')
+
+    def test_unknown_sessions_defer_but_do_not_block_forever(self):
+        self.old_release()
+        self.policy()
+        start = updater.ACTIVATION_INTERVAL + 1
+        with patch.object(updater, 'managed_session_count', return_value=None), \
+             patch.object(updater.time, 'time', return_value=start):
+            self.assertTrue(updater.defer_activation(self.root, self.root / 'current', SHA))
+        self.assertEqual(self.receipt()['reason'], 'managed_sessions_unknown')
+        with patch.object(updater, 'managed_session_count', return_value=None), \
+             patch.object(updater.time, 'time', return_value=start + updater.MAX_BUSY_WAIT):
+            self.assertFalse(updater.defer_activation(self.root, self.root / 'current', SHA))
+        self.assertEqual(self.receipt()['reason'], 'bounded_wait_expired')
+
+    def test_first_policy_uses_current_link_activation_time(self):
+        self.old_release()
+        activated = (self.root / 'current').lstat().st_mtime
+        with patch.object(updater.time, 'time', return_value=activated + 1):
+            self.assertTrue(updater.defer_activation(self.root, self.root / 'current', SHA))
+        self.assertEqual(self.receipt()['last_activation'], activated)
+
+    def test_managed_session_journal_is_read_only_and_conservative(self):
+        import sqlite3
+        journal = self.config.parent / 'v2-journal.sqlite'
+        with patch.object(Path, 'home', return_value=Path(self.temporary.name)):
+            self.assertIsNone(updater.managed_session_count())
+            self.assertFalse(journal.exists())
+            with sqlite3.connect(journal) as db:
+                db.execute('CREATE TABLE launches(state TEXT)')
+                states = ['running', 'launching', 'pending_admission', 'aborting',
+                          'deadline_stopping', 'launch_failed_unconfirmed', 'exited', 'stopped_before_dispatch',
+                          'launch_failed_reported']
+                db.executemany('INSERT INTO launches VALUES (?)', [(state,) for state in states])
+            self.assertEqual(updater.managed_session_count(), 6)
+            with sqlite3.connect(journal) as db:
+                self.assertEqual(db.execute('SELECT count(*) FROM launches').fetchone()[0], 9)
+
+    def test_invalid_policy_fails_before_activation(self):
+        self.old_release()
+        self.policy(last=float('nan'))
+        with self.assertRaisesRegex(ValueError, 'policy timestamp'):
+            self.install(scheduled=True)
+        self.assertEqual(self.downloads, ['host-release.json'])
+
     def test_valid_update_is_offline_and_keeps_previous(self):
         old = self.old_release()
         self.install()
