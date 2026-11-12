@@ -18,6 +18,7 @@ from .implement_workspace import prepare_workspace
 from .advertisement import Advertisement
 from .native_launch import NativeLauncher, LOCAL_ROUTES, UUID_RE, canonical, native_returncode, same_workspace, spawn_environment
 from .local_auth_readiness import local_claude_missing_contexts
+from .git_salvage import salvage_branch
 
 # Keep the live native-session census fresh for the global Hub session limit.
 LIVE_SESSION_HEARTBEAT_SECONDS = 30
@@ -768,6 +769,12 @@ class Bridge:
             elif type(native.get('deadline_ms')) is int:
                 payload['evidence']['native_deadline']={'deadline_ms':native['deadline_ms'],'exceeded':native.get('deadline_exceeded') is True}
             if row['state']=='aborting':payload['launch_failed']=True
+            # All verified exits (normal, deadline and explicit stop) converge
+            # here. Preserve committed work before journaling the finish, so a
+            # continuation cannot race ahead of its salvage receipt.
+            salvage = salvage_branch(row['workspace']) if workspace_available else None
+            if salvage is not None:
+                payload['evidence']['git_salvage'] = salvage
             if native.get('retirement') == 'verified_origin' and len(canonical(payload['evidence']).encode('utf8')) > 8192:
                 logging.getLogger(__name__).warning('Origin retirement evidence too large session=%s', row['session_id'])
                 continue
