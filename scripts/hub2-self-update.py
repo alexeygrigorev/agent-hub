@@ -294,7 +294,9 @@ def read_repin_journal(journal):
                    for k in ('previous_command', 'command'))
             or type(state['generation']) is not int or state['generation'] < 1
             or not isinstance(state['revision'], str) or not re.fullmatch(r'[a-f0-9-]{36}', state['revision'])
-            or type(state['verified']) is not bool):
+            or type(state['verified']) is not bool
+            or Path(state['command'][0]).parent.parent.name != state['release']
+            or Path(state['previous_command'][0]).parent.parent.name != state['previous_release']):
         raise ValueError('invalid managed Claude re-pin journal')
     return state
 
@@ -332,44 +334,104 @@ def managed_owner_matches(state):
     return isinstance(credential, dict) and type(credential.get('generation')) is int and credential['generation'] == state['generation']
 
 
-def restore_profile_pin(state):
-    """Compare-and-set the one managed command back; never a blanket restore."""
-    path = Path(state['profile_path'])
+def persist_profile(path):
+    """Make the observed profile bytes and directory entry durable (or absence)."""
     try:
-        text = path.read_bytes().decode()
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except FileNotFoundError:
-        return 'superseded'
-    if not managed_owner_matches(state):
-        return 'superseded'
+        pass
+    else:
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    with contextlib.suppress(FileNotFoundError):
+        sync_directory(path.parent)
+
+
+def profile_strings(value):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield key
+            yield from profile_strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from profile_strings(item)
+
+
+def profile_unreferenced(text, candidate):
+    """Positive proof: neither raw bytes nor any parsed string names the candidate."""
+    needle = str(candidate)
+    if needle in text:
+        return False
+    try:
+        document = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return False
+    return not any(needle in value for value in profile_strings(document))
+
+
+def compare_and_set_pin(path, text, state):
+    """Put the one managed command back when it is exactly ours; else None."""
     published = 'command = ' + json.dumps(state['command'])
     previous = 'command = ' + json.dumps(state['previous_command'])
     if text.count(MANAGED_BEGIN) != 1 or text.count(MANAGED_END) != 1:
-        return 'superseded'
+        return None
     before, rest = text.split(MANAGED_BEGIN)
     marked, after = rest.split(MANAGED_END)
     sections = re.split(r'(?m)(?=^\[)', marked)
     targets = [index for index, section in enumerate(sections) if section.startswith(MANAGED_HEADING)]
     if len(targets) != 1:
-        return 'superseded'
+        return None
     lines = sections[targets[0]].split('\n')
     if lines[1:3] == ['engine = "claude"', previous]:
+        # A previous attempt may have replaced it without a durable directory.
         return 'restored'
     if lines[1:3] != ['engine = "claude"', published] or any(line.strip() for line in lines[3:]):
-        return 'superseded'
+        return None
     lines[2] = previous
     sections[targets[0]] = '\n'.join(lines)
     updated = before + MANAGED_BEGIN + ''.join(sections) + MANAGED_END + after
-    original, proposed = tomllib.loads(text), tomllib.loads(updated)
+    try:
+        original, proposed = tomllib.loads(text), tomllib.loads(updated)
+    except tomllib.TOMLDecodeError:
+        return None
     if (original['profiles'][MANAGED_PROFILE]['command'] != state['command']
             or proposed['profiles'][MANAGED_PROFILE]['command'] != state['previous_command']):
-        return 'superseded'
+        return None
     proposed['profiles'][MANAGED_PROFILE]['command'] = state['command']
-    if proposed != original:
-        return 'superseded'
-    if path.read_bytes().decode() != text:
-        return 'superseded'
+    if proposed != original or path.read_bytes().decode() != text:
+        return None
     durable_write(path, updated.encode(), 0o600)
     return 'restored'
+
+
+def restore_profile_pin(state):
+    """Compare-and-set the one managed command back; never a blanket restore.
+
+    ``superseded`` requires positive proof that the profile no longer names the
+    candidate release. A newer owner, generation or layout alone is not proof:
+    the restore stays pending and the candidate and journal are kept. Every
+    outcome is made durable before the caller may retire the journal.
+    """
+    path = Path(state['profile_path'])
+    candidate = Path(state['command'][0]).parent.parent
+    try:
+        text = path.read_bytes().decode()
+    except FileNotFoundError:
+        persist_profile(path)
+        return 'superseded'
+    except UnicodeDecodeError:
+        raise RuntimeError('managed Claude pin restore pending') from None
+    outcome = compare_and_set_pin(path, text, state) if managed_owner_matches(state) else None
+    if outcome is None:
+        if not profile_unreferenced(text, candidate):
+            raise RuntimeError('managed Claude pin restore pending')
+        outcome = 'superseded'
+    persist_profile(path)
+    return outcome
 
 
 def restore_managed_claude(root):
@@ -394,10 +456,31 @@ def mark_repin_verified(root):
         sync_directory(root)
 
 
-def commit_repin(root):
+def activation_barrier(root, releases, name):
+    """Persist the committed activation before recovery metadata is retired.
+
+    Recovery would treat a resurrected ``.installing`` marker or missing link as
+    an interrupted release and delete the candidate, so the marker removal,
+    the release entry, the links and the updater must be durable first.
+    """
+    target = require_release_directory(release_path(releases, name))
+    current = root / 'current'
+    if (not current.is_symlink() or current.resolve() != target or (target / '.installing').exists()
+            or (root / 'retained-switch.json').exists() or (root / 'retained-switch.json').is_symlink()):
+        raise ValueError('managed Claude re-pin activation is not committed')
+    sync_directory(target)
+    sync_directory(releases)
+    sync_directory(root)
+
+
+def commit_repin(root, releases):
     journal = root / REPIN_JOURNAL
     if journal.exists() or journal.is_symlink():
-        read_repin_journal(journal)
+        state = read_repin_journal(journal)
+        if not state['verified']:
+            raise ValueError('managed Claude re-pin is not verified')
+        activation_barrier(root, releases, state['release'])
+        persist_profile(Path(state['profile_path']))
         journal.unlink()
         sync_directory(root)
 
@@ -413,7 +496,7 @@ def recover_repin(root, releases):
     committed = (state['verified'] and current.is_symlink() and current.resolve() == release
                  and not (release / '.installing').exists() and not (root / 'retained-switch.json').exists())
     if committed:
-        commit_repin(root)
+        commit_repin(root, releases)
     else:
         restore_managed_claude(root)
 
@@ -479,10 +562,10 @@ def restore_updater(root):
     sync_directory(root)
 
 
-def commit_updater(root):
+def commit_updater(root, releases):
     record = root / UPDATER_ROLLBACK
     if record.exists() or record.is_symlink():
-        read_updater_rollback(record)
+        activation_barrier(root, releases, read_updater_rollback(record)['release'])
         record.unlink()
         sync_directory(root)
 
@@ -495,7 +578,7 @@ def recover_updater(root, releases):
     current = root / 'current'
     if (current.is_symlink() and current.resolve() == release and not (release / '.installing').exists()
             and not (root / 'retained-switch.json').exists()):
-        commit_updater(root)
+        commit_updater(root, releases)
     else:
         restore_updater(root)
 
@@ -568,6 +651,8 @@ def durable_write(path, data, mode):
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        # The replacement is durable only once its directory entry is.
+        sync_directory(path.parent)
     finally:
         Path(temporary).unlink(missing_ok=True)
 
@@ -761,8 +846,8 @@ def reactivate_retained_release(base, manifest, host_wheel, root, releases, old,
         # Keep the updater that understands this journal available after rollback.
         committed = root / 'retained-switch-committed.json'
         journal.rename(committed)
-        commit_repin(root)
-        commit_updater(root)
+        commit_repin(root, releases)
+        commit_updater(root, releases)
         finish_retained_switch(root, releases, committed)
 
 
@@ -953,8 +1038,8 @@ def install(base_url, root, *, install_service=False, restart=True):
             # Heal a pin left on an older release; nothing else to roll back.
             repin_managed_claude(target, base_url.rstrip('/'), root,
                                  lambda: release_updater(base, manifest, root))
-            commit_repin(root)
-            commit_updater(root)
+            commit_repin(root, releases)
+            commit_updater(root, releases)
             print('Hub2 release already current: ' + version)
             return
         if target.exists() or target.is_symlink():
@@ -1040,8 +1125,8 @@ def install(base_url, root, *, install_service=False, restart=True):
                     shutil.rmtree(target)
         # Release activation and updater publication are committed. If enabling
         # the timer fails, leave that working pair in place for same-version retry.
-        commit_repin(root)
-        commit_updater(root)
+        commit_repin(root, releases)
+        commit_updater(root, releases)
         if install_service and restart:
             enable_service_timer()
         prune(root, releases)

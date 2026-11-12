@@ -475,11 +475,17 @@ def test_rollback_after_publication_keeps_concurrent_unrelated_changes(world):
     assert (world.managed / ('test-account-' + OTHER_REV) / 'keep.bin').read_bytes() == b'concurrent unrelated bytes'
 
 
-@pytest.mark.parametrize('owner', ['newer_generation', 'newer_command', 'newer_revision'])
-def test_rollback_never_overwrites_a_newer_owner(world, owner):
-    upgrade_world(world)
+def recover_world(world):
+    with patch.object(updater, 'command', world.command), patch.object(Path, 'home', return_value=world.home):
+        updater.recover(world.root, world.releases)
+
+
+@pytest.mark.parametrize('owner', ['newer_generation', 'newer_revision', 'newer_args_same_release'])
+def test_owner_change_still_naming_candidate_keeps_candidate_and_journal(world, owner):
+    """A G/R or command change is not proof the candidate is unreferenced."""
+    old = upgrade_world(world)
     world.acks = [{'status': 'recorded'}, {'status': 'held'}]
-    newer = ['/synthetic/newer/owner/python', '-c', 'pass', 'hub-claude']
+    candidate = world.releases / NEW
     def takeover(index):
         if index != 1:
             return
@@ -492,15 +498,166 @@ def test_rollback_never_overwrites_a_newer_owner(world, owner):
             rows[1]['revision'] = OTHER_REV.replace('1', '4')
             (world.managed / 'state.json').write_text(json.dumps(rows))
         else:
-            text = world.profile.read_text()
-            line = 'command = ' + json.dumps(world.command_for(world.releases / NEW))
-            world.profile.write_text(text.replace(line, 'command = ' + json.dumps(newer)))
+            line = 'command = ' + json.dumps(world.command_for(candidate))
+            newer = [str(candidate / 'bin/python'), '-I', '-c', 'pass', 'hub-claude']
+            world.profile.write_text(world.profile.read_text().replace(line, 'command = ' + json.dumps(newer)))
         world.after_takeover = world.profile.read_bytes()
     world.on_ack = takeover
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match='pin restore pending'):
+        world.install()
+    # Newer bytes preserved, and the pin they hold still resolves.
+    assert world.profile.read_bytes() == world.after_takeover
+    assert str(candidate) in world.profile.read_text()
+    assert candidate.is_dir() and (candidate / 'bin/python').is_file()
+    assert (world.root / updater.REPIN_JOURNAL).exists()
+    assert (world.root / 'updater.py').read_bytes() == world.files['hub2-self-update.py']
+    assert (world.root / 'current').resolve() == old
+    # Recovery fails visibly while the candidate is still named.
+    with pytest.raises(RuntimeError, match='pin restore pending'):
+        recover_world(world)
+    assert candidate.is_dir() and (world.root / updater.REPIN_JOURNAL).exists()
+    assert world.profile.read_bytes() == world.after_takeover
+    # The newer owner moves off the candidate: positive unreference proof.
+    newest = world.profile.read_text().replace(str(candidate), str(old))
+    world.profile.write_text(newest)
+    recover_world(world)
+    assert world.profile.read_text() == newest
+    assert not candidate.exists() and not (world.root / updater.REPIN_JOURNAL).exists()
+    assert (world.root / 'updater.py').read_bytes() == world.old_updater
+
+
+def test_newer_owner_off_candidate_is_superseded_and_preserved(world):
+    old = upgrade_world(world)
+    world.acks = [{'status': 'recorded'}, {'status': 'held'}]
+    newer = ['/synthetic/newer/owner/python', '-c', 'pass', 'hub-claude']
+    def takeover(index):
+        if index != 1:
+            return
+        line = 'command = ' + json.dumps(world.command_for(world.releases / NEW))
+        world.profile.write_text(world.profile.read_text().replace(line, 'command = ' + json.dumps(newer)))
+        world.after_takeover = world.profile.read_bytes()
+    world.on_ack = takeover
+    with pytest.raises(RuntimeError, match='re-pin not verified'):
         world.install()
     assert world.profile.read_bytes() == world.after_takeover
     assert not (world.root / updater.REPIN_JOURNAL).exists()
+    assert not (world.releases / NEW).exists()
+    assert (world.root / 'current').resolve() == old
+
+
+class Barriers:
+    """Records each directory fsync with the recovery metadata visible at that moment."""
+
+    def __init__(self, world, fail=None, once=True):
+        self.world, self.fail, self.once, self.events, self.real = world, fail, once, [], updater.sync_directory
+
+    def __call__(self, directory):
+        root = self.world.root
+        event = {'path': Path(directory), 'journal': (root / updater.REPIN_JOURNAL).exists(),
+                 'marker': (self.world.releases / NEW / '.installing').exists(),
+                 'updater_record': (root / updater.UPDATER_ROLLBACK).exists(),
+                 'pin': self.world.pinned() if self.world.profile.exists() else None}
+        self.events.append(event)
+        if self.fail and self.fail(event):
+            if self.once:
+                self.fail = None
+            raise OSError('synthetic crash at durability barrier')
+        self.real(directory)
+
+
+def test_restore_fsyncs_profile_directory_before_journal_retirement(world):
+    old = upgrade_world(world)
+    original = world.profile.read_text()
+    world.acks = [{'status': 'recorded'}, {'status': 'held'}]
+    barriers = Barriers(world)
+    with patch.object(updater, 'sync_directory', barriers), pytest.raises(RuntimeError, match='re-pin not verified'):
+        world.install()
+    assert_rolled_back(world, old, original)
+    restored = [e for e in barriers.events if e['path'] == world.profile.parent and e['pin'] == world.command_for(old)]
+    assert restored and all(e['journal'] for e in restored)
+
+
+def test_failed_profile_directory_fsync_keeps_journal_and_retry_repairs_it(world):
+    old = upgrade_world(world)
+    original = world.profile.read_text()
+    world.acks = [{'status': 'recorded'}, {'status': 'held'}]
+    # Power-loss window: the restored bytes were replaced, the directory entry is
+    # not durable, for every restore attempt the failed install makes.
+    barriers = Barriers(world, fail=lambda e: e['path'] == world.profile.parent and e['pin'] == world.command_for(old),
+                        once=False)
+    with patch.object(updater, 'sync_directory', barriers), pytest.raises(RuntimeError, match='pin restore pending'):
+        world.install()
+    assert (world.root / updater.REPIN_JOURNAL).exists() and (world.releases / NEW).is_dir()
+    assert world.pinned() == world.command_for(old)  # replaced, but not yet proven durable
+    retry = Barriers(world)
+    with patch.object(updater, 'sync_directory', retry):
+        recover_world(world)
+    assert_rolled_back(world, old, original)
+    # The retry found the previous pin already in place and still made it durable
+    # before retiring the journal.
+    repaired = [e for e in retry.events if e['path'] == world.profile.parent]
+    assert repaired and all(e['journal'] for e in repaired)
+
+
+def test_activation_barriers_precede_retirement_of_recovery_metadata(world):
+    upgrade_world(world)
+    barriers = Barriers(world)
+    with patch.object(updater, 'sync_directory', barriers):
+        world.install()
+    candidate = world.releases / NEW
+    def retired(key):
+        written = next(i for i, e in enumerate(barriers.events) if e[key])
+        return next(i for i, e in enumerate(barriers.events) if i > written and not e[key])
+    before = barriers.events[:retired('journal')]
+    for path in (candidate, world.releases, world.root, world.profile.parent):
+        assert any(e['path'] == path and not e['marker'] for e in before), path
+    assert not (world.root / updater.REPIN_JOURNAL).exists() and not (world.root / updater.UPDATER_ROLLBACK).exists()
+    assert any(e['path'] == candidate and not e['marker'] for e in barriers.events[:retired('updater_record')])
+
+
+@pytest.mark.parametrize('resurrected', [False, True])
+def test_crash_at_activation_barrier_keeps_journal_and_recovers_consistently(world, resurrected):
+    old = upgrade_world(world)
+    original = world.profile.read_text()
+    candidate = world.releases / NEW
+    barriers = Barriers(world, fail=lambda e: e['path'] == candidate and not e['marker'] and e['journal'])
+    with patch.object(updater, 'sync_directory', barriers), pytest.raises(OSError, match='durability barrier'):
+        world.install()
+    # The journal was not retired: the marker removal was never proven durable.
+    state = json.loads((world.root / updater.REPIN_JOURNAL).read_text())
+    assert state['verified'] is True and world.pinned() == world.command_for(candidate)
+    if resurrected:
+        # Power loss lost the marker unlink: recovery sees an interrupted release.
+        (candidate / '.installing').write_text(NEW)
+    recover_world(world)
+    assert not (world.root / updater.REPIN_JOURNAL).exists()
+    if resurrected:
+        assert (world.root / 'current').resolve() == old and not candidate.exists()
+        assert world.profile.read_text() == original
+    else:
+        assert (world.root / 'current').resolve() == candidate
+        assert world.pinned() == world.command_for(candidate)
+    assert Path(world.pinned()[0]).is_file()  # never a dangling pin
+    assert world.bytes() == world.snapshot
+
+
+@pytest.mark.parametrize('stage', ['marker', 'retained_switch', 'unverified'])
+def test_commit_refuses_to_retire_journal_before_activation_commits(world, stage):
+    upgrade_world(world)
+    world.install()
+    candidate = world.releases / NEW
+    journal = {'schema': 1, 'release': NEW, 'previous_release': OLD, 'profile_path': str(world.profile),
+               'managed_root': str(world.managed), 'previous_command': world.command_for(world.releases / OLD),
+               'command': world.command_for(candidate), 'generation': GENERATION, 'revision': REV,
+               'verified': stage != 'unverified'}
+    (world.root / updater.REPIN_JOURNAL).write_text(json.dumps(journal))
+    if stage == 'marker':
+        (candidate / '.installing').write_text(NEW)
+    elif stage == 'retained_switch':
+        (world.root / 'retained-switch.json').write_text('{}')
+    with pytest.raises(ValueError):
+        updater.commit_repin(world.root, world.releases)
+    assert (world.root / updater.REPIN_JOURNAL).exists() and candidate.is_dir()
 
 
 def test_held_managed_lock_is_bounded_and_refuses_without_changes(world, monkeypatch):
