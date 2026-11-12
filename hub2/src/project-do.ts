@@ -1392,6 +1392,17 @@ export class ProjectDO {
    * is append-only, so the same point always renders the same snapshot; newer
    * events stay available through `hub intake context`. */
   private continuationSnapshot(intake:IntakeRow,through:number):ContinuationSnapshot{
+    // Finish evidence survives reassignment in the append-only intake journal.
+    // Read the exact previous attempt, independently of the recent-note limit.
+    const finish=this.db.one<{body_json:string}>(`SELECT body_json FROM intake_events WHERE task_id=? AND seq<=?
+      AND kind IN ('finish_evidence_received','session_finish_after_stop')
+      AND json_extract(body_json,'$.session_id')=? ORDER BY seq DESC LIMIT 1`,intake.id,through,intake.session_id);
+    const receipt=finish?this.parse(finish.body_json) as JsonRecord|null:null;
+    const saved=(receipt?.evidence as JsonRecord|undefined)?.git_salvage as JsonRecord|undefined;
+    const preserved=saved&&['pushed','already_present'].includes(String(saved.status))
+      &&typeof saved.branch==='string'&&typeof saved.repo==='string'&&typeof saved.remote==='string'
+      &&typeof saved.head_sha==='string'&&/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(saved.head_sha)
+      ?`Branch ${saved.branch}; head ${saved.head_sha}; repository ${saved.repo}; remote ${saved.remote} (${saved.status}). Reuse this branch and inspect its existing PR before opening another.`:undefined;
     const context=this.db.one<{body_json:string}>("SELECT body_json FROM intake_events WHERE task_id=? AND kind='intake_context_updated' AND seq<=? ORDER BY seq DESC LIMIT 1",intake.id,through);
     const rows=this.db.all<IntakeEventRow>(`SELECT seq,actor_id,kind,body_json,at FROM intake_events WHERE task_id=? AND seq<=?
       AND kind IN ('created','worker_append','intake_updated','intake_context_updated') ORDER BY seq DESC LIMIT 51`,intake.id,through);
@@ -1408,7 +1419,7 @@ export class ProjectDO {
     };
     const contextBody=context?this.parse(context.body_json) as JsonRecord|null:null;
     return {through_seq:through,status:intake.status,
-      context:Object.fromEntries(INTAKE_CONTEXT_FIELDS.map(field=>[field,contextBody?.[field]??null])),
+      context:{...(preserved?{preserved_work:preserved}:{}),...Object.fromEntries(INTAKE_CONTEXT_FIELDS.map(field=>[field,contextBody?.[field]??null]))},
       updates:rows.slice(0,50).reverse().map(row=>({seq:row.seq,kind:row.kind,actor:row.actor_id,text:text(row)})),more:rows.length>50};
   }
 
