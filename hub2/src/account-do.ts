@@ -35,6 +35,7 @@ const RENEWAL_HORIZON_MS=6*3600_000;
 const RENEWAL_RETRY_BASE_MS=30_000;
 const RENEWAL_RETRY_CAP_MS=5*60_000;
 const RENEWAL_MAX_ATTEMPTS=6;
+const RENEWAL_SCHEDULE_PASSES=4;
 const RENEWAL_ACTIVE=['scheduled','retrying'];
 type Renewal={generation:number;access_expires_at:number|null;next_at:number|null;attempts:number;status:string;reason:string|null;updated_at:number};
 const DROP_SESSION_CAPACITY = ['DROP TABLE IF EXISTS reservations', 'ALTER TABLE account DROP COLUMN capacity', 'ALTER TABLE account DROP COLUMN occupied'];
@@ -182,13 +183,25 @@ export class AccountDO {
   return json({account:account||null,quota:quota||null,fresh:!!quota&&quota.valid_until>Date.now()});
  }
  private async schedule():Promise<void>{
-  const due:number[]=[];
-  this.db.alarmOperation();const discovery=this.db.one<{next_at:number}>('SELECT next_at FROM discovery WHERE id=1 AND enabled=1');if(discovery)due.push(discovery.next_at);
-  const grants=this.db.all<{id:string;expires_at:number}>('SELECT id,expires_at FROM reset_grants WHERE available=1 ORDER BY expires_at,id LIMIT 33');
-  if(grants.length>32)throw new HttpError('reset_observation_limit',503);
-  for(const g of grants){const key='reset:'+g.id+':'+g.expires_at+':24h';if(g.expires_at>Date.now()&&!this.db.one('SELECT id FROM alerts WHERE id=?',key))due.push(Math.max(Date.now()+100,g.expires_at-86400000));}
-  const renewal=await this.renewalDue();if(renewal!==null)due.push(renewal);
-  if(due.length)await this.ctx.storage.setAlarm(Math.max(Date.now()+100,Math.min(...due)));else await this.ctx.storage.deleteAlarm();
+  this.db.alarmOperation();
+  // The renewal read awaits an unseal. A concurrent import/rotation can publish
+  // a newer generation (and rearm it) meanwhile, so a result computed for a
+  // superseded generation is never published: recompute, bounded, and leave
+  // the newer generation's alarm untouched if it keeps moving.
+  for(let pass=0;pass<RENEWAL_SCHEDULE_PASSES;pass++){
+   const due:number[]=[],startGeneration=this.credentialGeneration();
+   const discovery=this.db.one<{next_at:number}>('SELECT next_at FROM discovery WHERE id=1 AND enabled=1');if(discovery)due.push(discovery.next_at);
+   const grants=this.db.all<{id:string;expires_at:number}>('SELECT id,expires_at FROM reset_grants WHERE available=1 ORDER BY expires_at,id LIMIT 33');
+   if(grants.length>32)throw new HttpError('reset_observation_limit',503);
+   for(const g of grants){const key='reset:'+g.id+':'+g.expires_at+':24h';if(g.expires_at>Date.now()&&!this.db.one('SELECT id FROM alerts WHERE id=?',key))due.push(Math.max(Date.now()+100,g.expires_at-86400000));}
+   const renewal=await this.renewalDue();
+   if(renewal==='superseded'||this.credentialGeneration()!==startGeneration)continue;
+   // Unknown is not "no work": keep a bounded retry instead of dropping the alarm.
+   if(renewal==='unknown')due.push(Date.now()+RENEWAL_RETRY_CAP_MS);else if(renewal!==null)due.push(renewal);
+   // Fenced: no await between the generation check above and the publish below.
+   if(due.length)await this.ctx.storage.setAlarm(Math.max(Date.now()+100,Math.min(...due)));else await this.ctx.storage.deleteAlarm();
+   return;
+  }
  }
  async alarm():Promise<void>{
   this.resetAlerts();
@@ -565,8 +578,8 @@ export class AccountDO {
   const code=e instanceof HttpError?e.code:e instanceof Error?e.message:'';
   return /^[a-z_]{1,80}$/.test(code)?code:'renewal_failed';
  }
- /** Next renewal wake for the current Claude generation, or null. Never throws. */
- private async renewalDue():Promise<number|null>{
+ /** Next renewal wake for the current Claude generation; null only when there is authoritatively no work, 'superseded' when a newer generation appeared mid-read, 'unknown' on an unexpected failure. Never throws. */
+ private async renewalDue():Promise<number|null|'superseded'|'unknown'>{
   try{
    const account=this.db.one<Account>('SELECT * FROM account WHERE id=1');
    const cred=this.db.one<{generation:number;sealed:string}>('SELECT generation,sealed FROM credentials WHERE id=1');
@@ -581,7 +594,7 @@ export class AccountDO {
      else next=this.renewalTarget(expires,now);
     }catch(e){reason=this.renewalCode(e);} // Due now: the attempt records a bounded retry.
     // Write only if no newer generation or concurrent row appeared while unsealing.
-    if(this.credentialGeneration()!==cred.generation)return null;
+    if(this.credentialGeneration()!==cred.generation)return 'superseded';
     const latest=this.renewalRow();
     if(!latest||latest.generation!==cred.generation)
      this.db.run('INSERT INTO credential_renewal(id,generation,access_expires_at,next_at,attempts,status,reason,updated_at) VALUES(1,?,?,?,0,?,?,?) ON CONFLICT(id) DO UPDATE SET generation=excluded.generation,access_expires_at=excluded.access_expires_at,next_at=excluded.next_at,attempts=0,status=excluded.status,reason=excluded.reason,updated_at=excluded.updated_at',cred.generation,expires,next,status,reason,now);
@@ -591,8 +604,9 @@ export class AccountDO {
     const now=Date.now();
     this.db.run("UPDATE credential_renewal SET status='retrying',next_at=?,updated_at=? WHERE id=1 AND generation=?",now,now,row.generation);row=this.renewalRow();
    }
+   if(this.credentialGeneration()!==cred.generation)return 'superseded';
    return row&&RENEWAL_ACTIVE.includes(row.status)&&row.next_at!==null?row.next_at:null;
-  }catch{return null;}
+  }catch{return 'unknown';}
  }
  /** Alarm work: renew the current Claude generation through the central lease/CAS path. */
  private async renewIfDue():Promise<void>{
