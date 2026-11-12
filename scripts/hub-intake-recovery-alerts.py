@@ -64,8 +64,9 @@ def pending_alerts(transport):
 
 def render(item, alert):
     return ('Hub could not recover intake {id} ({project}): "{title}". Alert {kind} ({reason}) after '
-            'session {session}; {depth} of {max} recovery sessions used. Status {status}. '
+            'session {session}; {depth} of {max} recovery sessions used. Status {status}. {cause}'
             'Inspect: hub intake context {id}; restart: hub intake start {id}.').format(
+        cause=('Cause: ' + ' '.join(str(alert['cause']).split())[:1000] + '. ') if alert.get('cause') else '',
         id=item.get('id'), project=item.get('project'), title=str(item.get('title', ''))[:200],
         kind=alert.get('kind'), reason=alert.get('reason'), session=alert.get('session_id'),
         depth=alert.get('depth'), max=alert.get('max_continuations'), status=item.get('status'))
