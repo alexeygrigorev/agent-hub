@@ -303,3 +303,60 @@ test('on the Node runtime a persisted renewal alarm survives restart and renews 
     } finally { db.close(); }
   } finally { await runtime.dispose(); rmSync(dataDir, { recursive: true }); restore(); }
 });
+
+// Review B1: a scheduler blocked in unseal for generation 1 must not delete or
+// overwrite the alarm a concurrent import published for generation 2.
+async function blockedScheduler(blockedGeneration: number) {
+  const gate: { release?: () => void; entered?: () => void; armed: boolean } = { armed: false };
+  const entered = new Promise<void>(r => { gate.entered = r; });
+  const released = new Promise<void>(r => { gate.release = r; });
+  const base = (AccountDO as any).prototype.unseal;
+  class BlockingAccountDO extends (AccountDO as any) {
+    async unseal(value: string, providerName: string, gen: number) {
+      if (gate.armed && gen === blockedGeneration) { gate.armed = false; gate.entered!(); await released; }
+      return base.call(this, value, providerName, gen);
+    }
+  }
+  const s = state(), p = provider();
+  const account: any = new BlockingAccountDO(s.ctx, { HUB2_CREDENTIAL_KEY: KEY, HUB2_PROVIDER_FETCH: p.fetcher as any });
+  return { ...s, p, account, gate, entered };
+}
+
+test('a scheduler blocked in unseal never deletes or overwrites the newer generation alarm', async () => {
+  const restore = useClock();
+  try {
+    const { ctx, database, account, gate, entered } = await blockedScheduler(1);
+    assert.equal((await account.fetch(request('/api/account', 'PATCH', { provider: 'claude', enabled: true }))).status, 200);
+    const expiresAt1 = clock + 2 * HOUR;
+    assert.equal((await account.fetch(request('/api/account/credentials', 'PUT', { expected_generation: 0, files: claudeFiles(expiresAt1) }))).status, 200);
+    assert.equal(ctx.alarm, expiresAt1 - LEAD);
+
+    // Scheduler A re-reads generation 1 (no renewal row) and blocks inside unseal.
+    database.prepare('DELETE FROM credential_renewal').run(); (account as any).db.cache?.clear?.();
+    gate.armed = true;
+    // The alarm path has no outer request rearm to rescue a wrong publish.
+    const a = account.alarm();
+    await entered;
+
+    // Concurrent import B publishes generation 2 and arms its own alarm.
+    const expiresAt2 = clock + 5 * HOUR;
+    assert.equal((await account.fetch(request('/api/account/credentials', 'PUT', { expected_generation: 1, files: claudeFiles(expiresAt2, 'synthetic-access-g2', 'synthetic-refresh-g2') }))).status, 200);
+    assert.equal(generation(database), 2);
+    assert.equal(ctx.alarm, expiresAt2 - LEAD, 'generation 2 armed before A resumes');
+
+    gate.release!(); await a;
+    assert.equal(ctx.alarm, expiresAt2 - LEAD, 'A resume recomputes instead of deleting/overwriting the generation 2 alarm');
+    const view = await renewal(account);
+    assert.equal(view.generation, 2); assert.equal(view.status, 'scheduled'); assert.equal(view.next_at, expiresAt2 - LEAD);
+  } finally { restore(); }
+});
+
+test('an unexpected renewal read failure keeps a bounded retry alarm rather than reading as no work', async () => {
+  const restore = useClock();
+  try {
+    const { ctx, account } = await claudeAccount(clock + 2 * HOUR);
+    (account as any).renewalRow = () => { throw new Error('synthetic storage failure'); };
+    await (account as any).schedule();
+    assert.equal(ctx.alarm, clock + 5 * 60_000, 'unknown is retried, never deleted');
+  } finally { restore(); }
+});

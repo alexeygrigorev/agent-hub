@@ -717,3 +717,6 @@ test('passive account routing observes credentials without refresh, quota probes
   }finally{s.database.close();}
  }
 });
+// Register the dedicated AccountDO credential-renewal regressions through this
+// CI-invoked entrypoint (npm run test:accounts-mail) so they cannot go unrun.
+await import('./account-credential-renewal.test.ts');
