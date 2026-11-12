@@ -1253,7 +1253,10 @@ export class ProjectDO {
       reason:claim?'completion_claimed':contractOmitted?'completion_contract_omitted_launch_budget':reason,depth,...(claim?.summary?{summary:claim.summary}:{})};
     if(!claim&&continuable&&!contractOmitted&&depth<MAX_AUTO_CONTINUATIONS)record.continuation={state:'pending',key:'continue:'+saga.operation_id,tries:0,next_action_at:now};
     else if(deliver)record.delivery={state:'pending',key:'terminal:'+saga.operation_id,tries:0,next_action_at:now};
-    if(!claim&&continuable&&!record.continuation)this.raiseDeveloperAlert(intake.id,saga.session_id,'recovery_exhausted',record.reason,depth,now);
+    // Every unclaimed end Hub does not recover itself (bound spent, lost host,
+    // failed launch) gets a developer owner; only an operator stop is exempt.
+    if(!claim&&!record.continuation&&!['stop_requested','session_stop_confirmed'].includes(record.reason))
+      this.raiseDeveloperAlert(intake.id,saga.session_id,continuable&&!contractOmitted?'recovery_exhausted':'not_recoverable',record.reason,depth,now);
     this.appendEvent(intake.id,'completion:'+saga.operation_id,COMPLETION_ACTOR,claim?'task_completion_claimed':'task_unfinished',
       {session_id:saga.session_id,reason:record.reason,depth,next:record.continuation?'continue':record.delivery?'deliver':'none',
         ...(claim?{criteria_met:claim.met,...(claim.summary?{summary:claim.summary}:{})}:{})},now);
