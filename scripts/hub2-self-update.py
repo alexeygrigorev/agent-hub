@@ -335,7 +335,12 @@ def managed_owner_matches(state):
 
 
 def persist_profile(path):
-    """Make the observed profile bytes and directory entry durable (or absence)."""
+    """Make the observed profile bytes and directory entry durable, or its absence.
+
+    When the profile (or whole directories above it) is gone, the removal is
+    durable only once the nearest existing ancestor is synced; that barrier is
+    never skipped and its failure propagates so the journal is kept.
+    """
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except FileNotFoundError:
@@ -345,8 +350,12 @@ def persist_profile(path):
             os.fsync(fd)
         finally:
             os.close(fd)
-    with contextlib.suppress(FileNotFoundError):
-        sync_directory(path.parent)
+    directory = Path(path).parent
+    while not directory.is_dir():
+        if directory.parent == directory:
+            raise RuntimeError('managed Claude pin restore pending')
+        directory = directory.parent
+    sync_directory(directory)
 
 
 def profile_strings(value):
@@ -426,12 +435,18 @@ def restore_profile_pin(state):
     except UnicodeDecodeError:
         raise RuntimeError('managed Claude pin restore pending') from None
     outcome = compare_and_set_pin(path, text, state) if managed_owner_matches(state) else None
-    if outcome is None:
-        if not profile_unreferenced(text, candidate):
-            raise RuntimeError('managed Claude pin restore pending')
-        outcome = 'superseded'
+    # Whatever happened to the Claude table, the complete resulting config,
+    # including unrelated profiles, must no longer name the candidate.
+    try:
+        final = path.read_bytes().decode()
+    except FileNotFoundError:
+        final = None
+    except UnicodeDecodeError:
+        raise RuntimeError('managed Claude pin restore pending') from None
+    if final is not None and not profile_unreferenced(final, candidate):
+        raise RuntimeError('managed Claude pin restore pending')
     persist_profile(path)
-    return outcome
+    return outcome or 'superseded'
 
 
 def restore_managed_claude(root):
@@ -600,6 +615,8 @@ def repin_managed_claude(target, base, root, updater):
     archive = target / 'hub.pyz'
     if not matches_installed_artifact(archive, installed['artifacts']['hub.pyz']):
         raise ValueError('installed release artifact mismatch: hub.pyz')
+    # Fresh payloads must be durable before any profile can name them.
+    sync_environment(target)
     advance_updater(root, target.name, updater())
     env = {key: value for key, value in os.environ.items()
            if key not in REPIN_ENV_DROP and not key.startswith('PYTHON')}
