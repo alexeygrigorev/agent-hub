@@ -83,6 +83,12 @@ class GitSalvageTests(unittest.TestCase):
         outside.mkdir()
         self.assertIsNone(salvage_branch(outside))
 
+    def test_nested_directory_cannot_publish_parent_checkout(self):
+        nested = self.repo / 'non-repository-workspace'
+        nested.mkdir()
+        self.assertIsNone(salvage_branch(nested))
+        self.assertEqual(self.git('ls-remote', 'origin', 'refs/heads/task/work'), '')
+
     def test_unknown_default_fails_closed(self):
         subprocess.check_call(['git', '--git-dir', str(self.remote), 'symbolic-ref', 'HEAD', 'refs/heads/missing'])
         self.assertEqual(salvage_branch(self.repo)['reason'], 'default_branch_unknown')
