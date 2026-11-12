@@ -1,0 +1,7 @@
+[Unit]
+Description=Mail dev@dtcdev.click for intakes Hub could not recover itself (never the requester)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/flock -n -o %t/hub-intake-recovery-alerts.lock /usr/bin/timeout 600 /usr/bin/python3 -I %h/.local/share/agent-hub-ops/hub-intake-recovery-alerts.py --cli-json %h/.config/agent-hub/cli.json --helper %h/.local/bin/principal-alert.sh
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin

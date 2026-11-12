@@ -1,0 +1,10 @@
+[Unit]
+Description=5-minute developer alert poller for unrecoverable Hub intakes
+
+[Timer]
+OnCalendar=*:0/5
+RandomizedDelaySec=30
+Persistent=false
+
+[Install]
+WantedBy=timers.target
