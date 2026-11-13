@@ -90,14 +90,24 @@ each pre/post check validates and hashes the same bounded byte buffer.
 
 For each of the 10 consecutive samples:
 
-1. **Private run manifest**: persisted exclusively in `--output-dir` before any
-   child intake creation (`manifest-<run_id>.json`).
+1. **Private run manifest**: `--output-dir` must be a NEW directory (created
+   0700 with `mkdir`, never an existing path or symlink, no `..`, canonical
+   parent); the manifest is persisted exclusively there before any child intake
+   creation (`manifest-<run_id>.json`). Every create/replace fsyncs the file AND
+   its containing directory and re-reads the exact private bytes (custody check).
 2. **Unique keyed child intake**: created via `hub intake create` with
-   `--text-file`, `--acceptance-criteria-file`, `--source-type forwarded`,
-   `--source-reference parent:<parent>;run:<run_id>;sample:<n>`, and a stable
-   `--key`. Lost responses replay the exact same key/body. Parent/child
-   ownership is recorded via a keyed `hub intake append` note on the parent
-   intake (never an invented `--parent` flag).
+   `--title`, `--text-file`, `--acceptance-criteria-file`, and a stable `--key`
+   (lost responses replay the exact same key/body). The actual hub2 Project
+   create (`hub2/src/project-do.ts` create + `viewIntake`) ignores any request
+   `source` and persists `provenance == {"type":"user","code_task":true}`,
+   `original_ask == {title,text}` and `parent_intake_id == null`; the driver
+   sends no `--source-*` flags and requires exactly that view plus the exact
+   project, title, verbatim text, normalized acceptance criteria, `open` status
+   and no session. No source-reference persistence or structural parent link is
+   claimed. Ownership is an explicit keyed maintained `hub intake append` note
+   on the parent (`acc10-own-<run>-<n>`) binding child id, run, sample, project,
+   create/start keys and the text/AC sha256 values, also kept in the private
+   `create_receipt` (never an invented `--parent` flag).
 3. **Pre-start 32-byte challenge**: created exclusively in `--output-dir` after
    freezing the immutable brief/AC bytes and before `hub sessions start`. Only
    the challenge path is included in the brief, never its bytes or expected
@@ -126,10 +136,24 @@ Within the 90-second capture window, the driver requires BOTH:
    - **Claude (`claude_native_pane_v1`)**: completed `● Bash(...)` heading and
      output-tree block carrying `AC10_WORK_V2 <run_id> <sample> <proof_digest> <head> 5050`
      (`Waiting…`, hooks-only, and assistant prose are nonproof).
-   - **Hydrogen (`hydrogen_native_pane_v1`)**: completed `● Ran (...)` action
-     row plus post-action `AC10_WORK_V2 ...` output (`native_action_plus_artifact_v2`,
-     explicitly distinct from typed tool stdout; `Command exited with code 0.`
-     in prose is nonproof).
+   - **Hydrogen (`hydrogen_native_pane_v1`, proof class
+     `native_exact_probe_header_plus_artifact_v3`)**: the real Hydrogen pane
+     collapses tool stdout (`(ctrl+o to expand)`), so lines after the header
+     are assistant/footer prose and are never proof. The brief makes every
+     sample run its work as ONE script at a short unique per-sample path
+     `.local/a10/<run8><nn>.py` via the single command
+     `python3 .local/a10/<run8><nn>.py`; proof requires an exact, fully visible
+     (not truncated) `● Ran (python3 .local/a10/<run8><nn>.py) (ctrl+o to expand)`
+     header line AND the independent artifact AND that probe file present as a
+     regular no-symlink file in the actual child workspace (its sha256 is
+     recorded). Unrelated Python/shell actions, other samples' probes,
+     truncated headers, grouped `Ran N commands` rows, assistant footers and
+     `Command exited with code 0.` prose are nonproof. No expanded stdout,
+     typed JSON or UI completion is fabricated.
+   - **Hydrogen proof is currently UNAVAILABLE**: the existing Root v2
+     Hydrogen attestation (`native_action_plus_artifact_v2`) does not satisfy
+     the v3 class, so Hydrogen samples fail closed until Root runs a qualified
+     preflight (below). Hydrogen is not permanently disabled.
    - Trust menus (`Do you trust the contents of this project?`), raw headless
      JSON stream frames, prompt echoes, and unknown engines fail closed.
 
@@ -154,5 +178,28 @@ Cleanup runs under a single 60-second budget:
 - Incomplete archives, sequence gaps, snapshot changes, pending completion
   actions, foreign session assignments, or exhausted bounds mark cleanup
   `UNKNOWN` and stop the run.
-- Only after `cleanup_confirmed`, the child intake is archived with an exact
-  CAS `--version <updated_at>` (never forced, never blindly retried).
+- Current custody is mandatory (missing/NULL is UNKNOWN, never equality):
+  the current `session_id` must be an owned SID, `assigned_machine_id` must be
+  the host, and the current `dispatch` must exist, name the current owned SID,
+  be terminal, and match the immutable original (from the start show) or
+  proven-descendant (from its pre-STOP show) `operation_id`,
+  `attempt_operation_id`, `epoch`, `machine_id` and `native_id`. The stop
+  view may only confirm that identity; drift is never adopted.
+- Archive with exact CAS `--version <updated_at>` only after that proof
+  (never forced, never active, never blindly retried). `cleanup_status` is
+  `CONFIRMED` only after the archive response or a final `intake show`
+  recheck proves `archived` with the same terminal owned dispatch; otherwise it
+  stays `ARCHIVE_PENDING` (explicit, not CONFIRMED) or `UNKNOWN`.
+- The 90-second proof window is a single deadline propagated into every Git
+  and artifact call, and re-checked after verification; no timeout is widened.
+
+## Requested qualified Root preflight for Hydrogen (not executed here)
+
+Root (not this driver work) should run one bounded interactive Hydrogen
+session on the host with a brief that writes a pinned canonical probe body to
+`.local/a10/<run8><nn>.py` and runs exactly `python3 .local/a10/<run8><nn>.py`,
+then capture `a capture <native_id> --screen --plain` and confirm: the
+completed `● Ran (python3 .local/a10/<run8><nn>.py) (ctrl+o to expand)` header
+is rendered fully (no truncation), the probe file body hash equals the pinned
+hash, and the artifact verifies. Only after that review may Root attest
+`native_exact_probe_header_plus_artifact_v3` for `antigravity`.

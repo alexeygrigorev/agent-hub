@@ -58,7 +58,10 @@ NATIVE_CAPTURE_FORMATS = {
 }
 NATIVE_PROOF_CLASSES = {
     'claude': 'native_bash_output_plus_artifact_v2',
-    'antigravity': 'native_action_plus_artifact_v2',
+    # V3: completed `● Ran (python3 <exact per-sample probe path>)` header + independent artifact/probe file.
+    # Root's existing v2 Hydrogen attestation does NOT qualify: Hydrogen proof stays unavailable until a
+    # qualified Root preflight attests this class on a real native render (docs/HUB-ACCEPTANCE-10.md).
+    'antigravity': 'native_exact_probe_header_plus_artifact_v3',
 }
 NATIVE_CAPTURE_COMMAND = 'a capture <native_id> --screen --plain'
 NATIVE_CAPTURE_KEYS = {
@@ -184,6 +187,54 @@ def bounded_file(path, limit):
             os.close(fd)
 
 
+def fsync_dir(path):
+    """Make a create/replace in `path` crash-durable by fsyncing the containing directory."""
+    fd = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def verify_private_bytes(path, data, mode=0o600):
+    """Custody check: the persisted file is a private regular non-symlink with exactly `data`."""
+    fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        st = os.fstat(fd)
+        if (not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or stat.S_IMODE(st.st_mode) != mode
+                or st.st_uid != os.getuid() or st.st_size != len(data)):
+            raise OSError('custody file %s is not an exact private regular file' % path)
+        with os.fdopen(os.dup(fd), 'rb') as stream:
+            if stream.read(len(data) + 1) != data:
+                raise OSError('custody file %s bytes changed after write' % path)
+    finally:
+        os.close(fd)
+
+
+def make_private_output_dir(output_dir):
+    """Create a NEW private 0700 output directory (never reuse/chmod an existing path or follow symlinks)."""
+    raw = Path(output_dir)
+    if '..' in raw.parts:
+        raise ValueError('output dir must not contain .. traversal')
+    path = Path(os.path.abspath(str(raw)))
+    parent = path.parent
+    if parent.resolve(strict=True) != parent:
+        raise ValueError('output dir parent must be a canonical path without symlinks')
+    pst = os.lstat(parent)
+    if not stat.S_ISDIR(pst.st_mode):
+        raise ValueError('output dir parent is not a directory')
+    old_umask = os.umask(0o077)
+    try:
+        os.mkdir(str(path), 0o700)  # FileExistsError for any existing path, including symlinks
+    finally:
+        os.umask(old_umask)
+    st = os.lstat(path)
+    if (not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) != 0o700):
+        raise ValueError('output dir is not a new private 0700 directory owned by this user')
+    fsync_dir(parent)
+    return path
+
+
 def atomic_write_private(path, data, mode=0o600):
     path = Path(path)
     tmp = None
@@ -196,6 +247,9 @@ def atomic_write_private(path, data, mode=0o600):
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(tmp, path)
+        tmp = None
+        fsync_dir(path.parent)
+        verify_private_bytes(path, data, mode)
     finally:
         if tmp is not None:
             tmp.unlink(missing_ok=True)
@@ -212,6 +266,8 @@ def exclusive_write_private(path, data, mode=0o600):
     finally:
         if fd is not None:
             os.close(fd)
+    fsync_dir(Path(path).parent)
+    verify_private_bytes(path, data, mode)
 
 
 def evidence_text(value, bound):
@@ -656,6 +712,15 @@ def work_rel_path(run_id, sample):
     return Path('.local') / 'acceptance-native' / run_id / str(sample) / 'result.json'
 
 
+def probe_rel_path(run_id, sample):
+    """Short unique per-sample probe script path; short enough to be fully visible in a Hydrogen Ran header."""
+    return Path('.local') / 'a10' / ('%s%02d.py' % (run_id.replace('-', '')[:8], sample))
+
+
+def probe_command(run_id, sample):
+    return 'python3 %s' % probe_rel_path(run_id, sample)
+
+
 def validate_no_symlink_ancestors(base_dir, rel_path):
     """Ensure base_dir and every component up to rel_path exist without symlinks."""
     base = Path(base_dir)
@@ -672,7 +737,7 @@ def validate_no_symlink_ancestors(base_dir, rel_path):
             raise ValueError('symlink component in artifact path: %s' % cur)
 
 
-def observe_git_state(r, workspace, timeout=30):
+def observe_git_state(r, workspace, timeout):
     rc, head_out, head_err = r.run('git', ['-C', workspace, 'rev-parse', '--verify', 'HEAD'], timeout)
     if rc != 0:
         raise RuntimeError('git rev-parse HEAD failed: %s' % (head_err or head_out).strip()[:200])
@@ -688,8 +753,20 @@ def observe_git_state(r, workspace, timeout=30):
 
 
 def verify_work_artifact(r, actual_workspace, run_id, sample, parent_intake_id, child_intake_id,
-                         session_id, native_id, challenge32):
-    """Independently verify result.json bytes, schema, identities, Git state, and challenge digest."""
+                         session_id, native_id, challenge32, clock, deadline, require_probe=False):
+    """Independently verify result.json bytes, schema, identities, Git state, and challenge digest.
+
+    Every Git call uses the REMAINING proof deadline (never a fresh default timeout)."""
+    if clock() >= deadline:
+        raise TimeoutError('proof deadline exhausted before artifact verification')
+    probe_sha = None
+    if require_probe:
+        prel = probe_rel_path(run_id, sample)
+        validate_no_symlink_ancestors(actual_workspace, prel)
+        probe_bytes = bounded_file(Path(actual_workspace) / prel, ARTIFACT_LIMIT)
+        if not probe_bytes.strip():
+            raise ValueError('per-sample probe script is empty')
+        probe_sha = hashlib.sha256(probe_bytes).hexdigest()
     rel = work_rel_path(run_id, sample)
     validate_no_symlink_ancestors(actual_workspace, rel)
     result_path = Path(actual_workspace) / rel
@@ -701,7 +778,12 @@ def verify_work_artifact(r, actual_workspace, run_id, sample, parent_intake_id, 
     for int_key in ('sample', 'tracked_status_entries', 'calculation'):
         if type(parsed.get(int_key)) is not int:
             raise ValueError('%s must be exact int' % int_key)
-    head, status_sha, entries = observe_git_state(r, actual_workspace)
+    remaining = deadline - clock()
+    if remaining <= 0:
+        raise TimeoutError('proof deadline exhausted before Git observation')
+    head, status_sha, entries = observe_git_state(r, actual_workspace, max(0.01, min(30, remaining)))
+    if clock() > deadline:
+        raise TimeoutError('proof deadline exhausted during Git observation')
     expected_work = {
         'schema': WORK_SCHEMA,
         'run_id': run_id,
@@ -732,6 +814,7 @@ def verify_work_artifact(r, actual_workspace, run_id, sample, parent_intake_id, 
         'calculation': EXPECTED_CALCULATION,
         'mtime_ns': mtime_ns,
         'result_path': str(result_path),
+        'probe_sha256': probe_sha,
     }
 
 
@@ -804,29 +887,23 @@ def _claude_native_pane_ok(captured, expected_line, brief_text):
     return False
 
 
-def _hydrogen_native_pane_ok(captured, expected_line, brief_text):
-    """Require completed `● Ran (python3/shell ...) (ctrl+o to expand)` action row + post-action expected_line."""
-    lines = [_strip_ansi(line) for line in captured.splitlines()]
-    ran_idx = None
-    for idx, line in enumerate(lines):
-        stripped = line.strip()
-        if re.match(r'^●\s+Ran\s+\((?:python3|python|bash|sh)\b[^)]*\)\s*\(ctrl\+o to expand\)$', stripped):
-            ran_idx = idx
-    if ran_idx is None:
+def _hydrogen_native_pane_ok(captured, command_id):
+    """Require a completed Hydrogen action header bound to THIS sample's exact probe command.
+
+    The real Hydrogen pane collapses tool stdout (`(ctrl+o to expand)`), so stdout/expected lines that appear
+    after the header are assistant/footer prose and are deliberately NOT accepted as proof. The only pane
+    evidence is an exact, fully visible (not truncated) `● Ran (<command_id>) (ctrl+o to expand)` header; the
+    work itself is proven by the independent artifact + per-sample probe file."""
+    if not isinstance(command_id, str) or not re.fullmatch(r'python3 \.local/a10/[0-9a-f]{8}\d{2}\.py', command_id):
         return False
-    after_lines = []
-    for line in lines[ran_idx + 1:]:
-        stripped = line.strip()
-        if stripped.startswith('>') or re.match(r'^─{10,}', stripped) or 'Auto mode:' in stripped:
-            continue
-        if stripped:
-            after_lines.append(stripped)
-    joined = _collapse_ws(' '.join(after_lines))
-    target = _collapse_ws(expected_line)
-    return target in joined
+    want = '● Ran (%s) (ctrl+o to expand)' % command_id
+    for line in captured.splitlines():
+        if _collapse_ws(_strip_ansi(line)) == want:
+            return True
+    return False
 
 
-def native_pane_output_ok(captured, engine, transport, expected_line, brief_text):
+def native_pane_output_ok(captured, engine, transport, expected_line, brief_text, command_id=None):
     """Validate direct `a capture <native_id> --screen --plain` against attested interactive profile."""
     if (not isinstance(captured, str) or len(captured.encode('utf-8')) > CAPTURE_LIMIT
             or not isinstance(brief_text, str) or expected_line in brief_text):
@@ -843,7 +920,7 @@ def native_pane_output_ok(captured, engine, transport, expected_line, brief_text
     if engine == 'claude':
         return _claude_native_pane_ok(captured, expected_line, brief_text)
     if engine == 'antigravity':
-        return _hydrogen_native_pane_ok(captured, expected_line, brief_text)
+        return _hydrogen_native_pane_ok(captured, command_id)
     return False
 
 
@@ -869,7 +946,9 @@ def make_child_brief_and_ac(run_id, sample, parent_intake_id, challenge_path):
     rel_result = str(work_rel_path(run_id, sample))
     brief = (
         f'Phase 7 interactive native-pane probe (run {run_id}, sample {sample}/{COUNT}, parent {parent_intake_id}).\n'
-        'First action: run `aplexer whoami --json` to observe your canonical native id, tag, and workspace.\n'
+        'First action: run `aplexer whoami --json` to observe your canonical native id, tag, and workspace '
+        '(it prints a full session record: read only its `id` and `workspace` fields; never copy the record, '
+        'command, env or profile into files or output).\n'
         'Then use a real shell/Python tool in your actual child workspace to:\n'
         '1. Run `git rev-parse --verify HEAD` and `git status --porcelain=v1 -z --untracked-files=no`.\n'
         '2. Compute `calculation = sum(range(1, 101))`.\n'
@@ -883,6 +962,8 @@ def make_child_brief_and_ac(run_id, sample, parent_intake_id, challenge_path):
         f'6. Write canonical JSON (work_object + proof_digest, sort_keys=True, separators=(",", ":"), ensure_ascii=False, + "\\n") '
         f'only to `{rel_result}` inside your actual child workspace.\n'
         f'7. Print `AC10_WORK_V2 {run_id} {sample} <proof_digest> <head> 5050` from the real tool stdout AFTER writing the file.\n'
+        f'Perform steps 1-7 in ONE Python script saved at `{probe_rel_path(run_id, sample)}` in your child workspace and '
+        f'run it once as the single foreground command `{probe_command(run_id, sample)}` (no cd, pipes, chaining or extra args).\n'
         'Do not edit tracked files, commit, push, exit, start timers, or call `hub sessions finish`; remain at the interactive prompt until Hub STOP.'
     )
     ac = (
@@ -1080,15 +1161,15 @@ def create_child_intake(r, rec, run_id, sample, parent_intake_id, brief_path, ac
     """Create a unique keyed child intake; replay exact key/body on ambiguity."""
     create_key = rec['create_key']
     title = 'Phase7 owned run %s/%d' % (run_id, sample)
-    source_ref = 'parent:%s;run:%s;sample:%d' % (parent_intake_id, run_id, sample)
+    # Actual hub2 Project create persists only title/text/acceptance_criteria/code_task and stores
+    # provenance={type:user,code_task:<bool>}; it ignores body.source and has no structural parent link.
+    # So no --source-* flags are sent and no source-reference persistence is claimed.
     argv = [
         'intake', 'create',
         '--project', PROJECT,
         '--title', title,
         '--text-file', str(brief_path),
         '--acceptance-criteria-file', str(ac_path),
-        '--source-type', 'forwarded',
-        '--source-reference', source_ref,
         '--key', create_key,
     ]
     deadline = clock() + CREATE_BUDGET_S
@@ -1119,17 +1200,49 @@ def create_child_intake(r, rec, run_id, sample, parent_intake_id, brief_path, ac
         raise RuntimeError('child intake text mismatch')
     if shown.get('acceptance_criteria') != normalize_acceptance_criteria(ac_text):
         raise RuntimeError('child intake acceptance_criteria mismatch')
-    prov = shown.get('provenance') or {}
-    if not isinstance(prov, dict) or prov.get('reference') != source_ref or prov.get('type') != 'forwarded':
-        raise RuntimeError('child intake provenance mismatch: %r' % (prov,))
+    problem = child_intake_shape_problem(shown, cid, title, brief_text, ac_text)
+    if problem:
+        raise RuntimeError(problem)
     rec['child_intake_id'] = cid
-    # Explicit keyed parent note (never invent --parent on intake create).
+    text_sha = hashlib.sha256(brief_text.encode('utf-8')).hexdigest()
+    ac_sha = hashlib.sha256(canonical_json_bytes(normalize_acceptance_criteria(ac_text))).hexdigest()
+    # Ownership is an explicit, keyed, maintained parent note binding exact create receipt fields; it is
+    # NOT a structural parent link (parent_intake_id stays null on the actual server view).
     note_key = 'acc10-own-%s-%d' % (run_id, sample)
-    note_text = 'Owned Phase7 child intake %s (run=%s sample=%d create_key=%s start_key=%s)' % (
-        cid, run_id, sample, create_key, rec['start_key'])
+    note_text = ('Owned Phase7 child intake %s (run=%s sample=%d project=%s create_key=%s start_key=%s '
+                 'text_sha256=%s ac_sha256=%s)' % (cid, run_id, sample, PROJECT, create_key, rec['start_key'], text_sha, ac_sha))
     r.json('hub', ['intake', 'append', parent_intake_id, '--key', note_key, '--note', note_text],
            left(clock, deadline, 30))
+    rec['create_receipt'] = {
+        'create_key': create_key, 'child_intake_id': cid, 'project': PROJECT, 'title': title,
+        'text_sha256': text_sha, 'acceptance_criteria_sha256': ac_sha,
+        'provenance': dict(shown['provenance']), 'parent_note_key': note_key,
+        'parent_intake_id': parent_intake_id, 'structural_parent_link': False,
+    }
     return cid
+
+
+def child_intake_shape_problem(shown, cid, title, brief_text, ac_text):
+    """Validate the actual hub2 viewIntake shape (project-do.ts create/viewIntake) for a fresh child."""
+    if not isinstance(shown, dict) or shown.get('id') != cid:
+        return 'child intake id mismatch on show'
+    if shown.get('project') != PROJECT:
+        return 'child intake project mismatch: %r' % shown.get('project')
+    if shown.get('title') != title.strip():
+        return 'child intake title mismatch'
+    if shown.get('text') != brief_text:
+        return 'child intake text mismatch'
+    if shown.get('acceptance_criteria') != normalize_acceptance_criteria(ac_text):
+        return 'child intake acceptance_criteria mismatch'
+    if shown.get('original_ask') != {'title': title.strip(), 'text': brief_text}:
+        return 'child intake original_ask mismatch'
+    if shown.get('provenance') != {'type': 'user', 'code_task': True}:
+        return 'child intake provenance mismatch: %r' % (shown.get('provenance'),)
+    if shown.get('parent_intake_id') is not None:
+        return 'child intake unexpectedly has structural parent_intake_id %r' % shown.get('parent_intake_id')
+    if shown.get('status') != 'open' or shown.get('session_id') is not None:
+        return 'fresh child intake is not open/unassigned'
+    return None
 
 
 # --- V2 Complete Paged History & Owned Lineage Cleanup ---
@@ -1248,8 +1361,40 @@ def _stop_single_session(r, sid, known_native, stop_key, deadline, clock, sleep)
     return sess, None
 
 
+DISPATCH_TERMINAL_STATES = ('stopped', 'failed', 'complete', 'cancelled')
+ARCHIVABLE_INTAKE_STATUSES = ('open', 'stopped', 'failed', 'cancelled')
+
+
+def _identity_problem(expected, actual, label):
+    """Strict binding: every expected field must be present (non-null) on BOTH sides and equal.
+
+    Missing/NULL metadata is UNKNOWN, never equality."""
+    for key, want in expected.items():
+        got = actual.get(key) if isinstance(actual, dict) else None
+        if want is None or got is None:
+            return '%s %s UNKNOWN (expected=%r actual=%r)' % (label, key, want, got)
+        if got != want:
+            return '%s %s drift %r != %r' % (label, key, got, want)
+    return None
+
+
+def _owned_identity(row, native):
+    """Immutable identity captured from an original start show or a proven-descendant show."""
+    return {
+        'operation_id': row.get('operation_id'),
+        'attempt_operation_id': row.get('attempt_operation_id'),
+        'epoch': row.get('epoch'),
+        'machine_id': row_host(row),
+        'native_id': native if valid_native_id(native) else None,
+    }
+
+
 def stop_and_drain_lineage(r, rec, run_id, clock, sleep):
-    """V2 owned-lineage cleanup within ONE overall 60s budget, then exact-CAS terminal archival."""
+    """V2 owned-lineage cleanup within ONE overall 60s budget, then exact-CAS terminal archival.
+
+    Order: unconditional STOP of every known owned SID (even native_id NULL) -> complete paged lineage
+    scan -> mandatory fresh current dispatch/assignment custody bound strictly to the immutable original
+    or proven-descendant identity -> exact-CAS archive -> cleanup CONFIRMED only after archive proof."""
     sid = rec.get('id')
     child_id = rec.get('child_intake_id')
     err = rec['errors']
@@ -1258,28 +1403,45 @@ def stop_and_drain_lineage(r, rec, run_id, clock, sleep):
     t0 = clock()
     deadline = t0 + STOP_BUDGET_S
     rec.setdefault('cleanup_lineage', [])
+    rec['cleanup_confirmed'] = False
+    rec['cleanup_status'] = 'PENDING'
     owned_sids = {sid}
-    owned_meta = {sid: (rec.get('operation_id'), rec.get('epoch'))}
+    # Immutable original identity recorded from the start show; NEVER overwritten from stop/show views.
+    original = rec.get('owned_identity')
+    if not isinstance(original, dict):
+        original = {'operation_id': rec.get('operation_id'), 'attempt_operation_id': rec.get('attempt_operation_id'),
+                    'epoch': rec.get('epoch'), 'machine_id': rec.get('host'),
+                    'native_id': rec.get('native_id') if valid_native_id(rec.get('native_id')) else None}
+    owned_meta = {sid: dict(original)}
     stopped_sids = {}
     descendant_count = 0
+
+    def unknown(msg):
+        rec['cleanup_status'] = 'UNKNOWN'
+        rec['cleanup_confirmed'] = False
+        err.append(msg)
+        rec['stop_s'] = round(clock() - t0, 1)
 
     try:
         sess, stop_err = _stop_single_session(r, sid, rec.get('native_id'), rec['stop_key'], deadline, clock, sleep)
         stopped_sids[sid] = sess
-        if sess.get('operation_id') or sess.get('epoch') is not None:
-            owned_meta[sid] = (sess.get('operation_id') or owned_meta[sid][0],
-                               sess.get('epoch') if sess.get('epoch') is not None else owned_meta[sid][1])
         if stop_err:
             err.append(stop_err)
     except Exception as exc:
-        err.append('stop failed: %s' % exc)
-        rec['stop_s'] = round(clock() - t0, 1)
-        rec['cleanup_status'] = 'UNKNOWN'
-        return
+        return unknown('stop failed: %s' % exc)
+    # The stop view may only CONFIRM the original identity; a changed/missing binding is drift/UNKNOWN.
+    drift = _identity_problem({k: original.get(k) for k in ('operation_id', 'attempt_operation_id', 'epoch')},
+                              sess, 'stopped session %s' % sid)
+    if drift:
+        return unknown(drift)
 
     if not child_id:
-        rec['cleanup_confirmed'] = not err
         rec['stop_s'] = round(clock() - t0, 1)
+        if not err:
+            rec['cleanup_status'] = 'CONFIRMED_NO_INTAKE'
+            rec['cleanup_confirmed'] = True
+        else:
+            rec['cleanup_status'] = 'UNKNOWN'
         return
 
     # Drain any source-proven automatic continuation/verification descendants within the same 60s budget.
@@ -1289,100 +1451,54 @@ def stop_and_drain_lineage(r, rec, run_id, clock, sleep):
         except Exception as exc:
             snap, scan_err = None, str(exc)
         if scan_err:
-            rec['cleanup_status'] = 'UNKNOWN'
-            err.append('cleanup lineage scan UNKNOWN: %s' % scan_err)
-            rec['stop_s'] = round(clock() - t0, 1)
-            return
+            return unknown('cleanup lineage scan UNKNOWN: %s' % scan_err)
 
         intake_row = snap['show']
         current_sid = intake_row.get('session_id')
         new_desc = extract_proven_descendants(snap['events'], owned_sids)
         pending_desc = [(kind, dsid) for kind, dsid in new_desc if dsid not in stopped_sids]
 
-        if current_sid and current_sid not in owned_sids and current_sid not in {d for _, d in new_desc}:
-            rec['cleanup_status'] = 'UNKNOWN'
-            err.append('foreign or unprovable session %s assigned to child intake' % current_sid)
-            rec['stop_s'] = round(clock() - t0, 1)
-            return
-        assigned_host = intake_row.get('assigned_machine_id')
-        if assigned_host is not None and assigned_host != HOST:
-            rec['cleanup_status'] = 'UNKNOWN'
-            err.append('foreign assigned_machine_id %r on child intake' % assigned_host)
-            rec['stop_s'] = round(clock() - t0, 1)
-            return
+        if current_sid not in owned_sids and current_sid not in {d for _, d in new_desc}:
+            return unknown('foreign, missing or unprovable current session %r assigned to child intake' % current_sid)
+        if intake_row.get('assigned_machine_id') != HOST:
+            return unknown('current assigned_machine_id %r is not %s (missing is UNKNOWN)'
+                           % (intake_row.get('assigned_machine_id'), HOST))
 
         if not pending_desc:
             dispatch = intake_row.get('dispatch')
-            if dispatch is not None:
-                if not isinstance(dispatch, dict):
-                    rec['cleanup_status'] = 'UNKNOWN'
-                    err.append('malformed dispatch on child intake')
-                    rec['stop_s'] = round(clock() - t0, 1)
-                    return
-                d_sid = dispatch.get('id')
-                if d_sid not in owned_sids or (current_sid and d_sid != current_sid):
-                    rec['cleanup_status'] = 'UNKNOWN'
-                    err.append('foreign or mismatched dispatch session %r' % d_sid)
-                    rec['stop_s'] = round(clock() - t0, 1)
-                    return
-                if dispatch.get('machine_id') is not None and dispatch.get('machine_id') != HOST:
-                    rec['cleanup_status'] = 'UNKNOWN'
-                    err.append('foreign dispatch machine_id %r' % dispatch.get('machine_id'))
-                    rec['stop_s'] = round(clock() - t0, 1)
-                    return
-                if dispatch.get('state') not in ('stopped', 'failed', 'complete', 'cancelled'):
-                    rec['cleanup_status'] = 'UNKNOWN'
-                    err.append('non-terminal dispatch state %r after drain' % dispatch.get('state'))
-                    rec['stop_s'] = round(clock() - t0, 1)
-                    return
-                exp_op, exp_epoch = owned_meta.get(d_sid, (None, None))
-                if exp_op and dispatch.get('operation_id') and dispatch.get('operation_id') != exp_op:
-                    rec['cleanup_status'] = 'UNKNOWN'
-                    err.append('unproven dispatch operation_id %r != %r' % (dispatch.get('operation_id'), exp_op))
-                    rec['stop_s'] = round(clock() - t0, 1)
-                    return
-                if exp_epoch is not None and dispatch.get('epoch') is not None and dispatch.get('epoch') != exp_epoch:
-                    rec['cleanup_status'] = 'UNKNOWN'
-                    err.append('unproven dispatch epoch %r != %r' % (dispatch.get('epoch'), exp_epoch))
-                    rec['stop_s'] = round(clock() - t0, 1)
-                    return
+            if not isinstance(dispatch, dict):
+                return unknown('missing or malformed current dispatch on child intake (UNKNOWN, not clean)')
+            d_sid = dispatch.get('id')
+            if d_sid not in owned_sids or d_sid != current_sid or d_sid not in stopped_sids:
+                return unknown('foreign or mismatched current dispatch session %r (current=%r)' % (d_sid, current_sid))
+            if dispatch.get('state') not in DISPATCH_TERMINAL_STATES:
+                return unknown('non-terminal dispatch state %r after drain' % dispatch.get('state'))
+            bind = _identity_problem(owned_meta[d_sid], dispatch, 'current dispatch %s' % d_sid)
+            if bind:
+                return unknown(bind)
             pending_comp = _pending_completion_reason(intake_row)
             if pending_comp:
-                rec['cleanup_status'] = 'UNKNOWN'
-                err.append('completion action still %s after drain' % pending_comp)
-                rec['stop_s'] = round(clock() - t0, 1)
-                return
+                return unknown('completion action still %s after drain' % pending_comp)
             break
 
         for kind, dsid in pending_desc:
             descendant_count += 1
             if descendant_count > MAX_DESCENDANTS:
-                rec['cleanup_status'] = 'UNKNOWN'
-                err.append('cleanup lineage exceeded %d descendant bound' % MAX_DESCENDANTS)
-                rec['stop_s'] = round(clock() - t0, 1)
-                return
+                return unknown('cleanup lineage exceeded %d descendant bound' % MAX_DESCENDANTS)
             try:
                 dsess = session_of(r.json('hub', ['sessions', 'show', dsid, '--json'], left(clock, deadline, 20)), dsid)
             except Exception as exc:
-                rec['cleanup_status'] = 'UNKNOWN'
-                err.append('descendant show failed: %s' % exc)
-                rec['stop_s'] = round(clock() - t0, 1)
-                return
+                return unknown('descendant show failed: %s' % exc)
             if dsess.get('intake_id') != child_id or dsess.get('project_id') != PROJECT or row_host(dsess) != HOST:
-                rec['cleanup_status'] = 'UNKNOWN'
-                err.append('descendant %s failed intake/project/host binding' % dsid)
-                rec['stop_s'] = round(clock() - t0, 1)
-                return
+                return unknown('descendant %s failed intake/project/host binding' % dsid)
             owned_sids.add(dsid)
-            owned_meta[dsid] = (dsess.get('operation_id'), dsess.get('epoch'))
+            # Proven-descendant identity is captured once from its pre-STOP show and is immutable thereafter.
+            owned_meta[dsid] = _owned_identity(dsess, dsess.get('native_id'))
             desc_stop_key = '%s-desc-%d' % (rec['stop_key'], descendant_count)
             try:
                 dsess_after, d_err = _stop_single_session(r, dsid, dsess.get('native_id'), desc_stop_key, deadline, clock, sleep)
             except Exception as exc:
-                rec['cleanup_status'] = 'UNKNOWN'
-                err.append('descendant %s stop failed: %s' % (dsid, exc))
-                rec['stop_s'] = round(clock() - t0, 1)
-                return
+                return unknown('descendant %s stop failed: %s' % (dsid, exc))
             stopped_sids[dsid] = dsess_after
             rec['cleanup_lineage'].append({
                 'kind': kind,
@@ -1391,39 +1507,48 @@ def stop_and_drain_lineage(r, rec, run_id, clock, sleep):
                 'stopped': d_err is None,
             })
             if d_err:
-                rec['cleanup_status'] = 'UNKNOWN'
-                err.append('descendant %s: %s' % (dsid, d_err))
-                rec['stop_s'] = round(clock() - t0, 1)
-                return
+                return unknown('descendant %s: %s' % (dsid, d_err))
+            d_drift = _identity_problem({k: owned_meta[dsid].get(k) for k in ('operation_id', 'attempt_operation_id', 'epoch')},
+                                        dsess_after, 'stopped descendant %s' % dsid)
+            if d_drift:
+                return unknown(d_drift)
 
     rec['stop_s'] = round(clock() - t0, 1)
     if rec['stop_s'] > STOP_BUDGET_S:
-        err.append('stop took %.1fs > %ds' % (rec['stop_s'], STOP_BUDGET_S))
+        return unknown('stop took %.1fs > %ds' % (rec['stop_s'], STOP_BUDGET_S))
+    if err:
         rec['cleanup_status'] = 'UNKNOWN'
         return
-
     if any(s.get('state') != 'stopped' or s.get('stop_confirmed') is not True for s in stopped_sids.values()):
         rec['cleanup_status'] = 'UNKNOWN'
         return
 
-    rec['cleanup_confirmed'] = True
-    rec['cleanup_status'] = 'CONFIRMED'
-
-    # Normal terminal archival with exact CAS version (never force, never active, never blindly retry CAS).
+    # Stop + custody proven; archive is still PENDING. CONFIRMED only after archive proof.
+    rec['cleanup_status'] = 'STOPPED_ARCHIVE_PENDING'
     version = intake_row.get('updated_at')
     if type(version) is not int:
-        rec['cleanup_status'] = 'UNKNOWN'
-        err.append('cannot archive child intake: missing integer updated_at version')
-        return
+        return unknown('cannot archive child intake: missing integer updated_at version')
+
+    def archive_proven(row):
+        disp = row.get('dispatch') if isinstance(row, dict) else None
+        return (isinstance(row, dict) and row.get('id') == child_id and row.get('status') == 'archived'
+                and row.get('session_id') == current_sid and isinstance(disp, dict)
+                and disp.get('id') == current_sid and disp.get('state') in DISPATCH_TERMINAL_STATES
+                and _identity_problem(owned_meta[current_sid], disp, 'archived dispatch') is None)
+
     if intake_row.get('status') == 'archived':
-        rec['archived'] = True
+        if archive_proven(intake_row):
+            rec['archived'] = True
+            rec['cleanup_confirmed'] = True
+            rec['cleanup_status'] = 'CONFIRMED'
+        else:
+            unknown('already-archived child intake lacks terminal owned custody proof')
         return
-    if intake_row.get('status') not in ('open', 'stopped', 'failed', 'cancelled'):
-        rec['cleanup_status'] = 'UNKNOWN'
-        err.append('refusing archive for unexpected child intake status %r' % intake_row.get('status'))
-        return
+    if intake_row.get('status') not in ARCHIVABLE_INTAKE_STATUSES:
+        return unknown('refusing archive for unexpected child intake status %r' % intake_row.get('status'))
     archive_key = 'acc10-archive-%s-%d' % (run_id, rec['n'])
     note = 'Phase7 acceptance run %s sample %d terminal cleanup (owned_sids=%d)' % (run_id, rec['n'], len(owned_sids))
+    arch_err = None
     try:
         updated = r.json('hub', [
             'intake', 'update', child_id,
@@ -1432,13 +1557,23 @@ def stop_and_drain_lineage(r, rec, run_id, clock, sleep):
             '--key', archive_key,
             '--note', note,
         ], left(clock, deadline, 20))
-        arch = intake_of(updated, child_id)
-        if arch.get('status') != 'archived' or arch.get('session_id') != intake_row.get('session_id'):
-            err.append('archive verification failed for child intake %s' % child_id)
-        else:
-            rec['archived'] = True
+        if not archive_proven(intake_of(updated, child_id)):
+            arch_err = 'archive response did not prove terminal owned archival'
     except Exception as exc:
-        err.append('archive CAS failed for child intake %s: %s' % (child_id, exc))
+        arch_err = 'archive CAS failed: %s' % exc
+    # Final recheck: an uncertain archive is re-read; never CONFIRMED on failed/unknown archive.
+    try:
+        final = intake_of(r.json('hub', ['intake', 'show', child_id], left(clock, deadline, 10)), child_id)
+    except Exception as exc:
+        final = None
+        arch_err = arch_err or 'archive final recheck failed: %s' % exc
+    if final is not None and archive_proven(final):
+        rec['archived'] = True
+        rec['cleanup_confirmed'] = True
+        rec['cleanup_status'] = 'CONFIRMED'
+        return
+    rec['cleanup_status'] = 'ARCHIVE_PENDING'
+    err.append('child intake %s archive unproven (%s); custody remains pending' % (child_id, arch_err or 'final recheck not archived'))
 
 
 # --- Core Sample Execution ---
@@ -1552,7 +1687,9 @@ def one_start(r, rec, run_id, parent_intake_id, workspace, output_dir, manifest,
         workspace=actual_workspace,
         epoch=row.get('epoch'),
         operation_id=row.get('operation_id'),
+        attempt_operation_id=row.get('attempt_operation_id'),
     )
+    rec['owned_identity'] = _owned_identity(row, row.get('native_id'))
     if row.get('state') != 'running':
         err.append('state %r not running' % row.get('state'))
     if row_host(row) != HOST:
@@ -1640,12 +1777,17 @@ def one_start(r, rec, run_id, parent_intake_id, workspace, output_dir, manifest,
             cap_acquired_ns = time.time_ns()
             if rc_cap == 0 and cap_out:
                 work_info = verify_work_artifact(
-                    r, actual_workspace, run_id, sample, parent_intake_id, child_id, sid, native_id, challenge32
+                    r, actual_workspace, run_id, sample, parent_intake_id, child_id, sid, native_id, challenge32,
+                    clock, cdeadline, require_probe=(engine == 'antigravity'),
                 )
                 expected_line = 'AC10_WORK_V2 %s %d %s %s %d' % (
                     run_id, sample, work_info['proof_digest'], work_info['head'], EXPECTED_CALCULATION
                 )
-                if native_pane_output_ok(cap_out, engine, transport, expected_line, brief_text):
+                if native_pane_output_ok(cap_out, engine, transport, expected_line, brief_text,
+                                         command_id=probe_command(run_id, sample)):
+                    if clock() > cdeadline:
+                        err.append('work proof completed after %ds proof deadline' % CAPTURE_BUDGET_S)
+                        return
                     if cap_acquired_ns < work_info['mtime_ns']:
                         err.append('capture acquired before result file mtime')
                         return
@@ -1661,6 +1803,9 @@ def one_start(r, rec, run_id, parent_intake_id, workspace, output_dir, manifest,
                     rec['tracked_status_sha256'] = work_info['tracked_status_sha256']
                     rec['tracked_status_entries'] = work_info['tracked_status_entries']
                     rec['calculation'] = work_info['calculation']
+                    if work_info.get('probe_sha256'):
+                        rec['probe_command'] = probe_command(run_id, sample)
+                        rec['probe_sha256'] = work_info['probe_sha256']
                     sample_manifest.update(
                         capture_sha256=rec['capture_sha256'],
                         artifact_sha256=rec['artifact_sha256'],
@@ -1775,9 +1920,11 @@ def run(r, evidence_path, commit, clock=time.monotonic, sleep=time.sleep, out=No
         print('ACCEPTANCE FAIL (preconditions): %s' % '; '.join(problems), file=out)
         return 1
 
-    out_dir = Path(output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    os.chmod(out_dir, 0o700)
+    try:
+        out_dir = make_private_output_dir(output_dir)
+    except (OSError, ValueError) as exc:
+        print('ACCEPTANCE FAIL (preconditions): output dir must be a NEW private directory: %s' % exc, file=out)
+        return 1
     manifest_path = out_dir / ('manifest-%s.json' % run_id)
     manifest = {
         'schema': 'phase7_native_run_manifest_v2',
@@ -1833,7 +1980,9 @@ def run(r, evidence_path, commit, clock=time.monotonic, sleep=time.sleep, out=No
                 break
     finally:
         for rec in recs:
-            if rec.get('cleanup_confirmed'):
+            # CONFIRMED (archive proven) or ARCHIVE_PENDING (stopped, custody proven, archive unproven after its
+            # own final recheck) are not re-driven; pending custody stays explicit, never CONFIRMED.
+            if rec.get('cleanup_confirmed') or rec.get('cleanup_status') == 'ARCHIVE_PENDING':
                 continue
             try:
                 if not rec.get('id') and rec.get('cleanup_uncertain'):

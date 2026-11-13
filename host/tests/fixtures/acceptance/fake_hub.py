@@ -118,6 +118,12 @@ def _write_worker_artifact(s, intake_row):
     ws.mkdir(parents=True, exist_ok=True)
     result_path = ws / m_rel.group(1)
     result_path.parent.mkdir(parents=True, exist_ok=True)
+    m_probe = re.search(r'single foreground command `python3 ([^`]+)`', brief)
+    if m_probe and not CFG.get('no_probe_file'):
+        probe = ws / m_probe.group(1)
+        probe.parent.mkdir(parents=True, exist_ok=True)
+        probe.write_text('# synthetic fake probe body (not live evidence)\nprint("probe")\n')
+        s['probe_command'] = 'python3 ' + m_probe.group(1)
     if CFG.get('result_preexisting'):
         return
     head = CFG.get('worker_head', CFG.get('git_head', 'b' * 40))
@@ -199,9 +205,12 @@ def _handle_intake(argv):
             'status': 'open',
             'assigned_machine_id': None,
             'session_id': None,
-            'dispatch': None,
+            # Actual hub2 viewIntake (project-do.ts): `dispatch` is omitted until a saga exists; create ignores
+            # body.source and persists provenance={type:user,code_task}; original_ask mirrors title/text.
             'updated_at': 1000 + idx,
-            'provenance': {'type': args.source_type, 'reference': args.source_reference},
+            'original_ask': {'title': args.title.strip(), 'text': text},
+            'provenance': ({'type': 'forwarded', 'reference': args.source_reference}
+                           if CFG.get('legacy_forwarded_provenance') else {'type': 'user', 'code_task': True}),
             'parent_intake_id': None,
             'events': [{'seq': 1, 'actor_id': 'operator', 'kind': 'created', 'at': 1000, 'body': {'title': args.title}}],
         }
@@ -241,8 +250,12 @@ def _handle_intake(argv):
         item = ST['intakes'][args.id]
         if CFG.get('archive_cas_conflict') or (args.version is not None and args.version != item['updated_at']):
             fail('conflict: expected_updated_at mismatch')
+        if CFG.get('archive_unproven'):
+            out({'intake': dict(item, status='open')})
         item['status'] = args.status or item['status']
         item['updated_at'] += 1
+        if CFG.get('archive_lost_ack'):
+            fail('upstream 502 after archive applied')
         out({'intake': item})
 
     fail('unhandled intake command: ' + sub)
@@ -354,7 +367,8 @@ def _handle_sessions(argv):
             ST['intakes'][child_id]['dispatch'] = {
                 'id': sid,
                 'operation_id': s['id'],
-                'attempt_operation_id': s['id'] + ':0',
+                # Same saga row as the session view: fallback attempt is reflected in both.
+                'attempt_operation_id': s['id'] + (':1' if CFG.get('fallback') else ':0'),
                 'machine_id': picker['machine_id'],
                 'epoch': s['epoch'],
                 'state': 'running',
@@ -425,7 +439,7 @@ def _handle_sessions(argv):
                     'at': 3000 + seq, 'body': {'previous_session_id': s['id'], 'session_id': dsid, 'depth': intake_row['_injected_count'], 'reason': 'late'},
                 })
                 intake_row['session_id'] = dsid
-                intake_row['dispatch'] = {'id': dsid, 'operation_id': dsid, 'attempt_operation_id': dsid + ':0', 'machine_id': 'hetzner-aplexer', 'epoch': 1, 'state': 'running'}
+                intake_row['dispatch'] = {'id': dsid, 'operation_id': dsid, 'attempt_operation_id': dsid + ':0', 'machine_id': 'hetzner-aplexer', 'epoch': 1, 'state': 'running', 'native_id': ST['sessions'][dsid]['native_id']}
                 intake_row['updated_at'] += 1
             elif not intake_row.get('_lineage_injected'):
                 intake_row['_lineage_injected'] = True
@@ -438,7 +452,7 @@ def _handle_sessions(argv):
                         'at': 3000, 'body': {'previous_session_id': s['id'], 'session_id': dsid, 'depth': 1, 'reason': 'exit'},
                     })
                     intake_row['session_id'] = dsid
-                    intake_row['dispatch'] = {'id': dsid, 'operation_id': dsid, 'attempt_operation_id': dsid + ':0', 'machine_id': 'hetzner-aplexer', 'epoch': 1, 'state': 'running'}
+                    intake_row['dispatch'] = {'id': dsid, 'operation_id': dsid, 'attempt_operation_id': dsid + ':0', 'machine_id': 'hetzner-aplexer', 'epoch': 1, 'state': 'running', 'native_id': ST['sessions'][dsid]['native_id']}
                     intake_row['updated_at'] += 1
                 elif CFG.get('verification_descendant'):
                     dsid = str(uuid.UUID(int=7200 + len(ST['sessions'])))
@@ -449,7 +463,7 @@ def _handle_sessions(argv):
                         'at': 3000, 'body': {'original_session_id': s['id'], 'previous_session_id': s['id'], 'session_id': dsid, 'attempt': 1},
                     })
                     intake_row['session_id'] = dsid
-                    intake_row['dispatch'] = {'id': dsid, 'operation_id': dsid, 'attempt_operation_id': dsid + ':0', 'machine_id': 'hetzner-aplexer', 'epoch': 1, 'state': 'running'}
+                    intake_row['dispatch'] = {'id': dsid, 'operation_id': dsid, 'attempt_operation_id': dsid + ':0', 'machine_id': 'hetzner-aplexer', 'epoch': 1, 'state': 'running', 'native_id': ST['sessions'][dsid]['native_id']}
                     intake_row['updated_at'] += 1
                 elif CFG.get('foreign_assignment'):
                     intake_row['session_id'] = str(uuid.UUID(int=888888))
@@ -457,6 +471,26 @@ def _handle_sessions(argv):
                 elif CFG.get('foreign_assigned_machine'):
                     intake_row['assigned_machine_id'] = 'foreign-host'
                     intake_row['updated_at'] += 1
+                elif CFG.get('cleanup_missing_dispatch'):
+                    intake_row.pop('dispatch', None)
+                    intake_row['updated_at'] += 1
+                elif CFG.get('cleanup_null_machine'):
+                    intake_row['assigned_machine_id'] = None
+                    intake_row['updated_at'] += 1
+                elif CFG.get('cleanup_dispatch_missing_op'):
+                    intake_row['dispatch'].pop('operation_id', None)
+                    intake_row['updated_at'] += 1
+                elif CFG.get('cleanup_dispatch_null_machine'):
+                    intake_row['dispatch']['machine_id'] = None
+                    intake_row['updated_at'] += 1
+                elif CFG.get('cleanup_epoch_drift'):
+                    intake_row['dispatch']['epoch'] = 2
+                    intake_row['updated_at'] += 1
+                elif CFG.get('cleanup_native_drift'):
+                    intake_row['dispatch']['native_id'] = str(uuid.UUID(int=424242))
+                    intake_row['updated_at'] += 1
+                elif CFG.get('cleanup_stop_view_op_drift'):
+                    s['operation_id'] = 'drifted-operation'
                 elif CFG.get('pending_dispatch_state'):
                     intake_row['dispatch'] = {
                         'id': s['id'], 'state': 'offered', 'operation_id': 'unproven-other-operation',
@@ -481,7 +515,7 @@ def _handle_sessions(argv):
                         })
                         prev = dsid
                     intake_row['session_id'] = prev
-                    intake_row['dispatch'] = {'id': prev, 'operation_id': prev, 'attempt_operation_id': prev + ':0', 'machine_id': 'hetzner-aplexer', 'epoch': 1, 'state': 'running'}
+                    intake_row['dispatch'] = {'id': prev, 'operation_id': prev, 'attempt_operation_id': prev + ':0', 'machine_id': 'hetzner-aplexer', 'epoch': 1, 'state': 'running', 'native_id': ST['sessions'][prev]['native_id']}
                     intake_row['updated_at'] += 1
         out({'id': s['id'], 'state': 'stopped', 'stop_confirmed': not CFG.get('stop_not_confirmed')})
 
@@ -549,12 +583,31 @@ def native(argv):
             save()
             print('● Ran (git status) (ctrl+o to expand)\n\nAssistant final summary:\n' + expected_line + '\n')
             sys.exit(0)
+        probe_cmd = s.get('probe_command', 'python3 .local/a10/missing.py')
+        if CFG.get('hydrogen_unrelated_python'):
+            save()
+            print('● Ran (python3 -c unrelated.py) (ctrl+o to expand)\n\nAssistant final summary:\n' + expected_line + '\n> ')
+            sys.exit(0)
+        if CFG.get('hydrogen_unrelated_shell'):
+            save()
+            print('● Ran (bash -c true) (ctrl+o to expand)\n\n  ' + expected_line + '\n> ')
+            sys.exit(0)
+        if CFG.get('hydrogen_assistant_footer'):
+            save()
+            print('● Ran 2 commands (aplexer whoami --jso... · cd /tmp...)\n\nAssistant: I ran `' + probe_cmd
+                  + '`.\n' + expected_line + '\n> ')
+            sys.exit(0)
+        if CFG.get('hydrogen_truncated_header'):
+            save()
+            print('● Ran (' + probe_cmd[:20] + '...) (ctrl+o to expand)\n> ')
+            sys.exit(0)
         engine = CFG.get('capture_format_override', row_for(s, show=True)['engine'])
         save()
         if engine == 'claude':
             print('● Bash(python3 - <<\'PY\' ...)\n  ⎿  ' + expected_line + '\n\n● Done.\n❯ ')
         elif engine == 'antigravity':
-            print('● Ran (python3 - <<\'PY\' ...) (ctrl+o to expand)\n\n  ' + expected_line + '\n> ')
+            # Real Hydrogen render collapses stdout; only the exact completed probe header is shown.
+            print('● Ran (' + probe_cmd + ') (ctrl+o to expand)\n> ')
         else:
             print(expected_line)
         sys.exit(0)
