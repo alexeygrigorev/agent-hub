@@ -5,6 +5,7 @@ host/tests/fixtures/acceptance/. No Hub access, no real session is started or st
 import importlib.util
 import io
 import json
+import re
 import hashlib
 import os
 import runpy
@@ -25,13 +26,19 @@ acc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(acc)
 
 SOL, GLM, MUSE, LUNA = 'claude-sonnet-4-6', 'claude-opus-4-6', 'gemini-4-hydrogen', 'gemini-4-luna'
-OK_MODELS = [SOL, GLM, MUSE, SOL, GLM, MUSE, SOL, GLM, LUNA, SOL]
+HAIKU = 'claude-haiku-4-5'
+# Offline PASS-path draws use only engines with a QUALIFIED native framing contract (Claude). Hydrogen draws are
+# exercised separately and must fail with UNKNOWN_NATIVE_FRAMING; the runtime picker itself is NOT narrowed.
+OK_MODELS = [SOL, GLM, HAIKU, SOL, GLM, HAIKU, SOL, GLM, HAIKU, SOL]
 NATIVE_POOL = [
-    {'policy_id': 'claude-sonnet', 'engine': 'claude', 'model': SOL, 'effort': 'medium', 'weight': 40, 'share': 0.4},
+    {'policy_id': 'claude-sonnet', 'engine': 'claude', 'model': SOL, 'effort': 'medium', 'weight': 30, 'share': 0.3},
     {'policy_id': 'claude-opus', 'engine': 'claude', 'model': GLM, 'effort': 'high', 'weight': 20, 'share': 0.2},
+    {'policy_id': 'claude-haiku', 'engine': 'claude', 'model': HAIKU, 'effort': 'low', 'weight': 10, 'share': 0.1},
     {'policy_id': 'hydrogen-med', 'engine': 'antigravity', 'model': MUSE, 'effort': 'medium', 'weight': 25, 'share': 0.25},
     {'policy_id': 'hydrogen-luna', 'engine': 'antigravity', 'model': LUNA, 'effort': 'low', 'weight': 15, 'share': 0.15},
 ]
+_CLAUDE = [dict(x) for x in NATIVE_POOL if x['engine'] == 'claude']
+CLAUDE_POOL = [dict(x, share=x['weight'] / sum(y['weight'] for y in _CLAUDE)) for x in _CLAUDE]
 PARENT_INTAKE = '11111111-1111-4111-8111-111111111111'
 
 
@@ -60,7 +67,8 @@ def native_transport(engine='claude', commit=COMMIT):
         'machine_id': acc.HOST,
         'mode': 'interactive',
         'format': acc.NATIVE_CAPTURE_FORMATS[engine],
-        'proof_class': acc.NATIVE_PROOF_CLASSES[engine],
+        # A hypothetical/new Hydrogen class label must never be enough (label is not attestation).
+        'proof_class': acc.NATIVE_PROOF_CLASSES.get(engine, 'native_exact_probe_header_plus_artifact_v3'),
         'capture_command': acc.NATIVE_CAPTURE_COMMAND,
         'artifact_schema': acc.WORK_SCHEMA,
         'host_release_sha': commit,
@@ -122,7 +130,7 @@ def native_evidence(commit=COMMIT, **kw):
         'operator_validation': {
             'actor': 'offline-fixture',
             'target_commit': commit,
-            'capture_transports': {engine: native_transport(engine, commit) for engine in acc.NATIVE_CAPTURE_FORMATS},
+            'capture_transports': {engine: native_transport(engine, commit) for engine in acc.NATIVE_PROOF_CLASSES},
             'receipts': {
                 name: {
                     'commit': commit,
@@ -255,7 +263,7 @@ class AcceptanceTests(Harness):
         self.assertEqual(len(self.state()['intakes']), 10)
         self.assertNotIn('pick', self.state()['log'])
         summary = json.loads(out[out.index('{\n'):out.rindex('\nACCEPTANCE ')])
-        self.assertEqual(len(summary['starts'][0]['picker']['pool']), 4)
+        self.assertEqual(len(summary['starts'][0]['picker']['pool']), len(NATIVE_POOL))
         self.assertEqual(summary['starts'][0]['picker']['policy_version'], 7)
         for rec in summary['starts']:
             self.assertEqual(rec['requested_workspace'], str(self.base_ws))
@@ -309,8 +317,8 @@ class AcceptanceTests(Harness):
         path.write_text(json.dumps(ev))
         rc, out = self.go(evidence_bundle=str(path))
         self.assertEqual(rc, 1, out)
-        self.assertIn('no verified interactive native-pane transport for engine claude', out)
-        self.assertAllStopped()
+        self.assertIn('verified interactive native-pane capture transport records required', out)
+        self.assertEqual(self.state()['sessions'], {})
 
     def test_operator_bundle_must_not_change_during_acceptance(self):
         original = acc.checked_native_evidence
@@ -357,10 +365,11 @@ class AcceptanceTests(Harness):
         self.assertAllStopped()
 
     def test_actual_current_fallback_pool_and_history(self):
-        rc, out = self.go(fallback=True)
+        # Fallback stays inside qualified-framing engines here; a Hydrogen fallback is covered by the B2 tests.
+        rc, out = self.go(fallback=True, pool=CLAUDE_POOL)
         self.assertEqual(rc, 0, out)
         self.assertAllStopped()
-        rc, out = self.go(fallback=True, cross_attempt_pool=True)
+        rc, out = self.go(fallback=True, cross_attempt_pool=True, pool=CLAUDE_POOL)
         self.assertEqual(rc, 1)
         self.assertIn('current chosen model/policy not in the picker pool', out)
         self.assertAllStopped()
@@ -480,12 +489,18 @@ class AcceptanceTests(Harness):
         self.assertIn('astra picked', out)
 
     def test_luna_over_three(self):
+        # Luna is a Hydrogen-engine draw, so a live run ends at its unavailable native proof; the quota rule is
+        # still enforced by the summary over whatever records exist.
+        recs = [{'n': i + 1, 'model': m, 'engine': 'antigravity' if m in (LUNA, MUSE) else 'claude', 'errors': []}
+                for i, m in enumerate([LUNA] * 4 + [SOL, GLM, MUSE, SOL, GLM, MUSE])]
+        self.assertIn('luna 4 > 3', acc.summarize(recs, [])['problems'])
         rc, out = self.go(models=[LUNA] * 4 + [SOL, GLM, MUSE, SOL, GLM, MUSE])
         self.assertEqual(rc, 1)
-        self.assertIn('luna 4 > 3', out)
+        self.assertIn('UNKNOWN_NATIVE_FRAMING', out)
+        self.assertAllStopped()
 
     def test_luna_on_degraded_pool(self):
-        one = [NATIVE_POOL[3]]
+        one = [next(x for x in NATIVE_POOL if x['model'] == LUNA)]
         one[0] = dict(one[0], share=1.0)
         rc, out = self.go(pool=one, models=[LUNA] * 10)
         self.assertEqual(rc, 1)
@@ -724,7 +739,7 @@ class V2NativeAndLineageTests(Harness):
         for knob, expected in [
             ('cleanup_missing_dispatch', 'missing or malformed current dispatch'),
             ('cleanup_null_machine', 'current assigned_machine_id None'),
-            ('cleanup_dispatch_missing_op', 'operation_id UNKNOWN'),
+            ('cleanup_dispatch_missing_op', 'operation_id None is not a base UUID'),
             ('cleanup_dispatch_null_machine', 'machine_id UNKNOWN'),
             ('cleanup_epoch_drift', 'epoch drift 2 != 1'),
             ('cleanup_native_drift', 'native_id drift'),
@@ -753,8 +768,160 @@ class V2NativeAndLineageTests(Harness):
             self.assertTrue(rec.get('archived'))
         self.assertEqual(rc, 0, out)
 
+    @staticmethod
+    def real_shapes(attempt=0):
+        """Sanitized copies of Root's genuine observation-1 field SHAPES (values synthetic)."""
+        base, sid, native = '2ff7f80c-0d8b-58a7-a7ad-d24786513cdd', '743973dd-533c-55ab-a5fb-29c3b7a93125', '4a082cb8-f506-46fc-9beb-8ca53ccc10d2'
+        cid, att = '65b8e3e4-c77a-4bdb-b937-a1c590297df6', '2ff7f80c-0d8b-58a7-a7ad-d24786513cdd:%d' % attempt
+        live = {'id': sid, 'state': 'running', 'intake_id': cid, 'project_id': acc.PROJECT, 'machine_id': acc.HOST,
+                'epoch': 1445, 'operation_id': att, 'native_id': native, 'host': acc.HOST, 'machine': acc.HOST,
+                'mode': 'interactive', 'interactive': True, 'evidence': None, 'attention': None}
+        exit_ev = {'operation_id': base, 'attempt_operation_id': att, 'session_id': sid, 'intake_id': cid,
+                   'machine_id': acc.HOST, 'epoch': 1445, 'native_id': native, 'state': 'stopped', 'exit_code': 0,
+                   'native_exit_confirmed': True, 'evidence': {'containment_empty': True, 'source': 'aplexer_retirement'}}
+        stopped = dict(live, state='stopped', evidence=dict(exit_ev), stop_confirmed=True)
+        dispatch = {'id': sid, 'operation_id': base, 'attempt_operation_id': att, 'intake_id': cid, 'machine_id': acc.HOST,
+                    'epoch': 1445, 'state': 'failed', 'native_id': native, 'attempt': attempt, 'next_action_at': None}
+        final = {'stopped': True, 'reaped': False, 'operation_id': base, 'attempt_operation_id': att, 'session_id': sid,
+                 'machine_id': acc.HOST, 'epoch': 1445, 'reason': 'stop_confirmed', 'native_id': native,
+                 'completion': {'controlled': True, 'session_id': sid, 'outcome': 'unfinished',
+                                'reason': 'session_stop_confirmed', 'depth': 0},
+                 'finish_after_stop': dict(exit_ev)}
+        return live, stopped, dispatch, final, cid
+
+    def test_b3_real_machine_vs_project_shapes_bind_base_and_attempt(self):
+        for attempt in (0, 1):
+            live, stopped, dispatch, final, cid = self.real_shapes(attempt)
+            self.assertNotIn('attempt_operation_id', live)
+            ident = acc._owned_identity(live, live['native_id'])
+            self.assertEqual(ident['operation_id'], dispatch['operation_id'])
+            self.assertEqual(ident['attempt_operation_id'], live['operation_id'])
+            self.assertEqual(ident['attempt'], attempt)
+            self.assertIsNone(acc._stop_view_problem(ident, stopped, 'stop view'))
+            self.assertIsNone(acc._bind_view(ident, live, acc.machine_session_identity, 'pre-stop', acc.IDENTITY_KEYS))
+            self.assertIsNone(acc._bind_view(ident, dispatch, acc.dispatch_identity, 'dispatch', acc.IDENTITY_KEYS))
+            self.assertIsNone(acc.final_stop_proof_problem(final, ident, cid))
+            # Raw operation_id labels differ across endpoints by contract; they are never compared directly.
+            self.assertNotEqual(live['operation_id'], dispatch['operation_id'])
+            # An optional redundant Machine alias is accepted only when it agrees.
+            self.assertIsNone(acc._stop_view_problem(ident, dict(stopped, attempt_operation_id=live['operation_id']), 'v'))
+
+    def test_b3_contradictory_malformed_missing_or_different_tuple_fails(self):
+        live, stopped, dispatch, final, cid = self.real_shapes(0)
+        ident = acc._owned_identity(live, live['native_id'])
+        base = dispatch['operation_id']
+        other = 'bbbbbbbb-0d8b-58a7-a7ad-d24786513cdd'
+        for bad in ['opaque-op', base, base.upper() + ':0', base + ':01', base + ':-1', base + ':0:0', None, 7,
+                    'prefix-' + base + ':0']:
+            with self.subTest(machine_op=bad):
+                with self.assertRaises(acc.IdentityError):
+                    acc.machine_session_identity(dict(live, operation_id=bad))
+                self.assertIsNone(acc._owned_identity(dict(live, operation_id=bad), live['native_id'])['operation_id'])
+        machine_neg = [
+            (dict(stopped, attempt_operation_id=base), 'contradicts Machine operation_id'),
+            (dict(stopped, attempt=1), 'contradicts Machine operation_id'),
+            (dict(stopped, attempt=True), 'contradicts Machine operation_id'),
+            (dict(stopped, operation_id=other + ':0'), 'operation_id drift'),
+            (dict(stopped, operation_id=base + ':1'), 'drift'),
+            (dict(stopped, epoch=1446), 'epoch drift'),
+            (dict(stopped, epoch=None), 'epoch UNKNOWN'),
+            (dict(stopped, machine_id='other-host', host='other-host', machine='other-host'), 'machine_id drift'),
+            (dict(stopped, host='other-host'), 'contradicts machine_id'),
+            (dict(stopped, native_id='99999999-0000-4000-8000-000000000000'), 'native_id drift'),
+            (dict(stopped, id='00000000-0000-4000-8000-000000000001'), 'session_id drift'),
+            (dict(stopped, evidence=dict(stopped['evidence'], attempt_operation_id=base + ':1')), 'session exit evidence'),
+            (dict(stopped, evidence=dict(stopped['evidence'], operation_id=other, attempt_operation_id=other + ':0')), 'session exit evidence'),
+        ]
+        for view, msg in machine_neg:
+            with self.subTest(msg=msg):
+                problem = acc._stop_view_problem(ident, view, 'stop view')
+                self.assertIsNotNone(problem)
+                self.assertIn(msg, problem)
+        dispatch_neg = [
+            (None, 'missing or malformed'),
+            ('unknown', 'missing or malformed'),
+            (dict(dispatch, operation_id=dispatch['attempt_operation_id']), 'is not a base UUID'),
+            ({k: v for k, v in dispatch.items() if k != 'attempt_operation_id'}, 'not strict'),
+            (dict(dispatch, attempt_operation_id=other + ':0'), 'attempt_operation_id base'),
+            (dict(dispatch, attempt=1), 'contradicts attempt_operation_id'),
+            (dict(dispatch, attempt=False), 'contradicts attempt_operation_id'),
+            (dict(dispatch, operation_id=other, attempt_operation_id=other + ':0'), 'operation_id drift'),
+            (dict(dispatch, epoch=1446), 'epoch drift'),
+            (dict(dispatch, machine_id=None), 'machine_id UNKNOWN'),
+            (dict(dispatch, native_id=None), 'native_id UNKNOWN'),
+            (dict(dispatch, id='00000000-0000-4000-8000-000000000001'), 'session_id drift'),
+        ]
+        for view, msg in dispatch_neg:
+            with self.subTest(dispatch=msg):
+                problem = acc._bind_view(ident, view, acc.dispatch_identity, 'dispatch', acc.IDENTITY_KEYS)
+                self.assertIsNotNone(problem)
+                self.assertIn(msg, problem)
+        fas = final['finish_after_stop']
+        final_neg = [
+            (None, 'missing'),
+            (dict(final, attempt_operation_id=base + ':1'), 'drift'),
+            (dict(final, finish_after_stop=dict(fas, attempt_operation_id=base + ':1')), 'finish_after_stop'),
+            (dict(final, finish_after_stop=dict(fas, operation_id=base + ':0')), 'not a base UUID'),
+            (dict(final, finish_after_stop=None), 'finish_after_stop'),
+            (dict(final, reason='finished'), 'not a confirmed stop'),
+            (dict(final, completion=dict(final['completion'], reason='session_finished')), 'session_stop_confirmed'),
+            (dict(final, finish_after_stop=dict(fas, native_exit_confirmed=False)), 'native exit'),
+            (dict(final, finish_after_stop=dict(fas, evidence={'containment_empty': False})), 'empty containment'),
+            (dict(final, finish_after_stop=dict(fas, intake_id='other')), 'finish_after_stop'),
+            (dict(final, epoch=1446), 'epoch drift'),
+        ]
+        for view, msg in final_neg:
+            with self.subTest(final=msg):
+                problem = acc.final_stop_proof_problem(view, ident, cid)
+                self.assertIsNotNone(problem)
+                self.assertIn(msg, problem)
+        # NULL native original: never equality, even when later views carry a native id.
+        null_ident = acc._owned_identity(live, None)
+        self.assertIn('native_id UNKNOWN', acc._bind_view(null_ident, dispatch, acc.dispatch_identity, 'd', acc.IDENTITY_KEYS))
+        self.assertIn('native_id UNKNOWN', acc.final_stop_proof_problem(final, null_ident, cid))
+
+    def test_b3_process_fake_real_shapes_end_to_end(self):
+        rc, out = self.go(show_redundant_alias=True)
+        self.assertEqual(rc, 0, out)
+        self.assertAllStopped()
+        report = json.loads(out[out.index('\n{\n') + 1:out.rindex('\n}') + 2])
+        for rec in report['starts']:
+            self.assertRegex(rec['attempt_operation_id'], r'^%s:0$' % re.escape(rec['operation_id']))
+            self.assertEqual(rec['attempt'], 0)
+        for intake in self.state()['intakes'].values():
+            self.assertEqual(intake['status'], 'archived')
+            self.assertEqual(intake['dispatch']['state'], 'failed')
+            self.assertEqual(intake['final_evidence']['completion']['reason'], 'session_stop_confirmed')
+        for knob, msg, archived in [
+            ('show_alias_contradiction', 'contradicts Machine operation_id', False),
+            ('show_attempt_contradiction', 'contradicts Machine operation_id', False),
+            ('show_malformed_operation', 'not strict <uuid>:<attempt>', False),
+            ('start_response_base_drift', 'start response operation_id drift', None),
+            ('stop_evidence_contradiction', 'session exit evidence', False),
+            ('dispatch_alias_base_mismatch', 'attempt_operation_id base', False),
+            ('dispatch_attempt_int_contradiction', 'contradicts attempt_operation_id', False),
+            ('dispatch_machine_attempt_as_base', 'is not a base UUID', False),
+            ('dispatch_missing_alias', 'not strict', False),
+            ('final_missing', 'final_evidence missing', False),
+            ('final_attempt_contradiction', 'finish_after_stop', False),
+            ('final_reason_not_stop', 'session_stop_confirmed', False),
+            ('final_no_native_exit', 'native exit', False),
+            ('final_containment_not_empty', 'empty containment', False),
+        ]:
+            with self.subTest(knob=knob):
+                rc, out = self.go(**{knob: True})
+                self.assertEqual(rc, 1, out)
+                self.assertIn(msg, out)
+                self.assertAllStopped()
+                stops = [x for x in self.state()['log'] if x.startswith('stop:')]
+                self.assertTrue(stops)
+                if archived is False:
+                    self.assertNotIn('intake:update', self.state()['log'])
+                    self.assertFalse(any(i['status'] == 'archived' for i in self.state()['intakes'].values()))
+
     def test_b3_pinned_review_counterexample_null_dispatch_is_unknown(self):
         run, sid, cid = (PARENT_INTAKE, '22222222-3333-4444-8555-666666666666', '33333333-4444-4555-8666-777777777777')
+        base, native = 'abcdef01-2345-5678-89ab-cdef01234567', '55555555-6666-4777-8888-999999999999'
         show = {'id': cid, 'project': acc.PROJECT, 'session_id': sid, 'assigned_machine_id': acc.HOST, 'updated_at': 100,
                 'status': 'open', 'dispatch': None, 'final_evidence': None}
 
@@ -764,20 +931,23 @@ class V2NativeAndLineageTests(Harness):
             def json(self, tool, args, timeout):
                 self.calls.append(args)
                 return {'intake': dict(show, status='archived')}
-        stop_view = {'id': sid, 'state': 'stopped', 'stop_confirmed': True, 'operation_id': 'original-op',
-                     'attempt_operation_id': 'original-op:0', 'epoch': 1}
-        for rec_extra, view, msg in [
+        # Machine-shaped stop view: operation_id IS the attempt id, no redundant alias.
+        stop_view = {'id': sid, 'state': 'stopped', 'stop_confirmed': True, 'operation_id': base + ':0',
+                     'epoch': 1, 'machine_id': acc.HOST, 'native_id': native}
+        owned = {'session_id': sid, 'operation_id': base, 'attempt_operation_id': base + ':0', 'attempt': 0,
+                 'epoch': 1, 'machine_id': acc.HOST, 'native_id': native}
+        for owned_extra, view, msg in [
             ({}, stop_view, 'missing or malformed current dispatch'),
             ({'attempt_operation_id': None}, stop_view, 'attempt_operation_id UNKNOWN'),
             ({}, dict(stop_view, epoch=None), 'epoch UNKNOWN'),
-            ({}, dict(stop_view, operation_id='other-op'), 'operation_id drift'),
+            ({}, dict(stop_view, operation_id='bbbbbbbb-2345-5678-89ab-cdef01234567:0'), 'operation_id drift'),
+            ({}, dict(stop_view, operation_id='original-op'), 'identity invalid'),
+            ({}, dict(stop_view, attempt_operation_id=base), 'contradicts Machine operation_id'),
         ]:
             with self.subTest(msg=msg):
                 r = R(); r.calls = []
-                rec = dict({'id': sid, 'child_intake_id': cid, 'operation_id': 'original-op',
-                            'attempt_operation_id': 'original-op:0', 'epoch': 1, 'host': acc.HOST,
-                            'native_id': '55555555-6666-4777-8888-999999999999',
-                            'stop_key': 'synthetic-stop', 'errors': [], 'n': 1}, **rec_extra)
+                rec = {'id': sid, 'child_intake_id': cid, 'owned_identity': dict(owned, **owned_extra), 'host': acc.HOST,
+                       'native_id': native, 'stop_key': 'synthetic-stop', 'errors': [], 'n': 1}
                 with mock.patch.object(acc, '_stop_single_session', lambda *a, v=view: (dict(v), None)), \
                         mock.patch.object(acc, 'scan_intake_lineage',
                                           lambda *a: ({'show': show, 'events': [{'seq': 1, 'kind': 'created', 'body': {}}]}, None)):
@@ -838,41 +1008,110 @@ class V2NativeAndLineageTests(Harness):
         self.assertEqual(rc, 1, out)
         self.assertIn('provenance mismatch', out)
 
-    def test_b2_hydrogen_binds_exact_probe_header_not_footer(self):
+    def test_b2_hydrogen_native_proof_unavailable_for_every_rendering_and_label(self):
+        """A class label is not attestation: no unqualified Hydrogen rendering may ever pass today."""
         run = '40a49778-f092-450d-a042-12ad276ab134'
         cmd = acc.probe_command(run, 3)
         self.assertEqual(cmd, 'python3 .local/a10/40a4977803.py')
         expected = 'AC10_WORK_V2 %s 3 %s %s 5050' % (run, 'a' * 64, 'b' * 40)
         brief, _ = acc.make_child_brief_and_ac(run, 3, PARENT_INTAKE, '/tmp/ch.bin')
         self.assertIn('`%s`' % cmd, brief)
-        ok = '● Ran (%s) (ctrl+o to expand)\n> ' % cmd
-        t = native_transport('antigravity', COMMIT)
-        self.assertTrue(acc.native_pane_output_ok(ok, 'antigravity', t, expected, brief, command_id=cmd))
-        for bad in [
-            '● Ran (python3 -c unrelated.py) (ctrl+o to expand)\nAssistant final summary:\n' + expected,
-            '● Ran (bash -c true) (ctrl+o to expand)\n  ' + expected,
-            '● Ran (python3 .local/a10/40a4977804.py) (ctrl+o to expand)\n' + expected,
-            '● Ran (%s...) (ctrl+o to expand)\n' % cmd[:20],
-            '● Ran 2 commands (aplexer whoami --jso... · cd /x...)\nAssistant: I ran `%s`\n%s' % (cmd, expected),
-            'Assistant: ● Ran (%s) (ctrl+o to expand) %s' % (cmd, expected),
-            '  Command exited with code 0.\n' + expected,
-        ]:
-            with self.subTest(bad=bad[:40]):
-                self.assertFalse(acc.native_pane_output_ok(bad, 'antigravity', t, expected, brief, command_id=cmd))
-        self.assertFalse(acc.native_pane_output_ok(ok, 'antigravity', t, expected, brief, command_id=None))
-        # Root's existing v2 Hydrogen attestation does not qualify for the v3 bound proof class.
-        legacy = dict(t, proof_class='native_action_plus_artifact_v2')
-        self.assertFalse(acc.native_transport_ok('antigravity', legacy, legacy['host_release_sha']))
-        self.assertFalse(acc.native_pane_output_ok(ok, 'antigravity', legacy, expected, brief, command_id=cmd))
+        self.assertNotIn('antigravity', acc.NATIVE_PROOF_CLASSES)
+        row = '● Ran (%s) (ctrl+o to expand)\n' % cmd
+        panes = {
+            'exact_row_alone': row + '> ',
+            'assistant_footer_exact_row': 'Assistant readiness summary:\n' + row + 'I am done.\n',
+            'same_command_running': row + '● Running (%s)\n' % cmd,
+            'same_command_failed': row + 'Error: %s failed with exit1\n' % cmd,
+            'duplicate_exact_row': row + row,
+            'row_plus_expected_stdout': row + '  ' + expected + '\n',
+        }
+        labels = ['native_exact_probe_header_plus_artifact_v3', 'native_exact_probe_header_plus_artifact_v4',
+                  'native_action_plus_artifact_v2', acc.NATIVE_PROOF_CLASSES['claude']]
+        for label in labels:
+            t = dict(native_transport('antigravity', COMMIT), proof_class=label)
+            self.assertFalse(acc.native_transport_ok('antigravity', t, COMMIT), label)
+            for name, pane in panes.items():
+                with self.subTest(label=label, pane=name):
+                    self.assertFalse(acc.native_pane_output_ok(pane, 'antigravity', t, expected, brief, command_id=cmd))
+        # Prospective support hook reports candidates/contradictions but never native authority.
+        for name, pane in panes.items():
+            diag = acc.hydrogen_framing_diagnostic(pane, cmd)
+            self.assertEqual(diag['status'], 'UNAVAILABLE')
+            self.assertEqual(diag['reason'], 'UNKNOWN_NATIVE_FRAMING')
+            self.assertEqual(diag['root_checker_status'], 'NEEDS_ROOT_RENDERER_ATTESTATION')
+            self.assertIs(diag['native_action_verified'], False)
+            self.assertIs(diag['typed_stdout_verified'], False)
+        self.assertEqual(acc.hydrogen_framing_diagnostic(panes['duplicate_exact_row'], cmd)['contradictions'], ['duplicate exact row'])
+        self.assertIn('same-command non-completed/failed row',
+                      acc.hydrogen_framing_diagnostic(panes['same_command_running'], cmd)['contradictions'])
+        # Root's genuine observation-1 shape: plain viewport, assistant footer only, zero candidate rows.
+        self.assertEqual(acc.hydrogen_framing_diagnostic('Assistant: wrote result.json\n> ', cmd)['candidate_rows'], 0)
+        # An operator bundle that names a Hydrogen transport is refused with the explicit diagnostic.
+        path = Path(native_evidence())
+        ev = json.loads(path.read_text())
+        ev['operator_validation']['capture_transports']['antigravity'] = native_transport('antigravity', COMMIT)
+        problems = acc.validate_native_evidence(ev, str(path), COMMIT)
+        self.assertTrue(any('UNKNOWN_NATIVE_FRAMING' in p for p in problems), problems)
 
-    def test_b2_hydrogen_requires_probe_file_and_propagates_deadline(self):
-        rc, out = self.go(no_probe_file=True, models=[MUSE])
-        self.assertEqual(rc, 1, out)
-        self.assertIn('did not prove completed work', out)
-        self.assertAllStopped()
+    def test_b2_hydrogen_draw_fails_unavailable_with_artifact_only_and_cleanup(self):
+        for knob, artifact in [({}, 'VALIDATED'), ({'no_probe_file': True}, 'absent')]:
+            with self.subTest(knob=knob):
+                rc, out = self.go(models=[MUSE], **knob)
+                self.assertEqual(rc, 1, out)
+                self.assertIn('native proof UNAVAILABLE for engine antigravity: UNKNOWN_NATIVE_FRAMING', out)
+                self.assertIn('artifact-only=%s' % artifact, out)
+                self.assertNotIn('ACCEPTANCE PASS', out)
+                self.assertAllStopped()
+                report = json.loads(out[out.index('\n{\n') + 1:out.rindex('\n}') + 2])
+                first = report['starts'][0]
+                self.assertIs(first.get('capture_verified'), False)
+                self.assertEqual(first['native_proof']['root_checker_status'], 'NEEDS_ROOT_RENDERER_ATTESTATION')
+                self.assertIs(first['native_proof']['native_action_verified'], False)
+                self.assertEqual(bool(first.get('artifact_only')), artifact == 'VALIDATED')
         with self.assertRaises(TimeoutError):
             acc.verify_work_artifact(None, str(self.tmp), PARENT_INTAKE, 1, PARENT_INTAKE, PARENT_INTAKE,
                                      PARENT_INTAKE, PARENT_INTAKE, b'x' * 32, lambda: 10, 5)
+
+    def test_deadline_each_git_call_gets_fresh_remaining_budget(self):
+        class Clock:
+            t = 100.0
+
+            def __call__(self):
+                return self.t
+
+        class R:
+            def __init__(self, clock, costs):
+                self.clock, self.costs, self.timeouts = clock, list(costs), []
+
+            def _spend(self, timeout):
+                self.timeouts.append(timeout)
+                self.clock.t += self.costs.pop(0)
+
+            def run(self, tool, args, timeout):
+                self._spend(timeout)
+                return 0, 'b' * 40 + '\n', ''
+
+            def run_bytes(self, tool, args, timeout):
+                self._spend(timeout)
+                return 0, b'', b''
+        # First call consumes most of the budget; the second gets only what remains (not the initial value).
+        clock = Clock(); r = R(clock, [24.0, 1.0])
+        acc.observe_git_state(r, '/ws', clock, 100.0 + 30.0)
+        self.assertEqual(r.timeouts, [30.0, 6.0])
+        clock = Clock(); r = R(clock, [10.0, 1.0])
+        acc.observe_git_state(r, '/ws', clock, 100.0 + 90.0)
+        self.assertEqual(r.timeouts, [30.0, 30.0])
+        # First call exhausts the 90s total: the second Git call is never started.
+        clock = Clock(); r = R(clock, [91.0, 1.0])
+        with self.assertRaises(TimeoutError):
+            acc.observe_git_state(r, '/ws', clock, 100.0 + 90.0)
+        self.assertEqual(r.timeouts, [30.0])
+        # Second call overruns: refused after it returns even though both commands "succeeded".
+        clock = Clock(); r = R(clock, [5.0, 30.0])
+        with self.assertRaises(TimeoutError):
+            acc.observe_git_state(r, '/ws', clock, 100.0 + 30.0)
+        self.assertEqual(r.timeouts, [30.0, 25.0])
 
     def test_porcelain_z_rename_copy_counting(self):
         self.assertEqual(acc.parse_porcelain_z_count(b''), 0)

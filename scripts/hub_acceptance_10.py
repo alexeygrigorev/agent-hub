@@ -58,10 +58,20 @@ NATIVE_CAPTURE_FORMATS = {
 }
 NATIVE_PROOF_CLASSES = {
     'claude': 'native_bash_output_plus_artifact_v2',
-    # V3: completed `● Ran (python3 <exact per-sample probe path>)` header + independent artifact/probe file.
-    # Root's existing v2 Hydrogen attestation does NOT qualify: Hydrogen proof stays unavailable until a
-    # qualified Root preflight attests this class on a real native render (docs/HUB-ACCEPTANCE-10.md).
-    'antigravity': 'native_exact_probe_header_plus_artifact_v3',
+}
+# Hydrogen (antigravity) native framing is NOT qualified. No proof-class label, record, flag, env var or
+# same-UID artifact can enable it: a class label is not attestation. Enabling requires a Root-qualified actual
+# renderer preflight AND a later separately reviewed source recognizer change (docs/HUB-ACCEPTANCE-10.md).
+UNQUALIFIED_NATIVE_FRAMING = {
+    'antigravity': {
+        'status': 'UNAVAILABLE',
+        'reason': 'UNKNOWN_NATIVE_FRAMING',
+        'root_checker_status': 'NEEDS_ROOT_RENDERER_ATTESTATION',
+        'native_action_verified': False,
+        'typed_stdout_verified': False,
+        'diagnostic': ('Hydrogen native-pane framing has no qualified renderer contract; an exact command row, '
+                       'footer or artifact cannot attest a completed native action'),
+    },
 }
 NATIVE_CAPTURE_COMMAND = 'a capture <native_id> --screen --plain'
 NATIVE_CAPTURE_KEYS = {
@@ -335,6 +345,8 @@ def _validate_evidence_common(ev, commit, expected_kind):
 
 def native_transport_ok(engine, record, host_sha):
     """Root attests interactive native-pane transport, proof class, and capture command."""
+    if engine in UNQUALIFIED_NATIVE_FRAMING or engine not in NATIVE_PROOF_CLASSES:
+        return False
     return (engine in NATIVE_CAPTURE_FORMATS and isinstance(record, dict)
             and not set(record) - NATIVE_CAPTURE_KEYS
             and NATIVE_CAPTURE_KEYS - {'path'} <= set(record)
@@ -359,6 +371,10 @@ def validate_native_evidence(ev, path, commit):
     if validation is None:
         return problems
     transports = validation.get('capture_transports')
+    if isinstance(transports, dict):
+        for engine in sorted(set(transports) & set(UNQUALIFIED_NATIVE_FRAMING)):
+            info = UNQUALIFIED_NATIVE_FRAMING[engine]
+            problems.append('capture_%s native proof %s: %s (%s)' % (engine, info['status'], info['reason'], info['diagnostic']))
     if (not valid_hex40(host_sha) or not isinstance(transports, dict)
             or not 1 <= len(transports) <= len(NATIVE_CAPTURE_FORMATS)
             or any(not native_transport_ok(engine, record, host_sha) for engine, record in transports.items())):
@@ -737,14 +753,30 @@ def validate_no_symlink_ancestors(base_dir, rel_path):
             raise ValueError('symlink component in artifact path: %s' % cur)
 
 
-def observe_git_state(r, workspace, timeout):
-    rc, head_out, head_err = r.run('git', ['-C', workspace, 'rev-parse', '--verify', 'HEAD'], timeout)
+def _fresh_git_timeout(clock, deadline, what, cap=30):
+    """Freshly remaining proof budget immediately BEFORE one Git call (never a reused earlier value)."""
+    remaining = deadline - clock()
+    if remaining <= 0:
+        raise TimeoutError('proof deadline exhausted before %s' % what)
+    return max(0.01, min(cap, remaining))
+
+
+def observe_git_state(r, workspace, clock, deadline):
+    """Two Git observations inside ONE total proof deadline: each call gets the budget remaining at its own start
+    and the deadline is rechecked after each call returns."""
+    rc, head_out, head_err = r.run('git', ['-C', workspace, 'rev-parse', '--verify', 'HEAD'],
+                                   _fresh_git_timeout(clock, deadline, 'git rev-parse'))
+    if clock() > deadline:
+        raise TimeoutError('proof deadline exhausted during git rev-parse')
     if rc != 0:
         raise RuntimeError('git rev-parse HEAD failed: %s' % (head_err or head_out).strip()[:200])
     head = head_out.strip()
     if not valid_hex40(head):
         raise RuntimeError('git rev-parse HEAD invalid: %r' % head)
-    rc, st_out, st_err = r.run_bytes('git', ['-C', workspace, 'status', '--porcelain=v1', '-z', '--untracked-files=no'], timeout)
+    rc, st_out, st_err = r.run_bytes('git', ['-C', workspace, 'status', '--porcelain=v1', '-z', '--untracked-files=no'],
+                                     _fresh_git_timeout(clock, deadline, 'git status'))
+    if clock() > deadline:
+        raise TimeoutError('proof deadline exhausted during git status')
     if rc != 0:
         raise RuntimeError('git status failed: %s' % st_err.decode('utf-8', 'replace').strip()[:200])
     entries = parse_porcelain_z_count(st_out)
@@ -778,10 +810,9 @@ def verify_work_artifact(r, actual_workspace, run_id, sample, parent_intake_id, 
     for int_key in ('sample', 'tracked_status_entries', 'calculation'):
         if type(parsed.get(int_key)) is not int:
             raise ValueError('%s must be exact int' % int_key)
-    remaining = deadline - clock()
-    if remaining <= 0:
+    if clock() >= deadline:
         raise TimeoutError('proof deadline exhausted before Git observation')
-    head, status_sha, entries = observe_git_state(r, actual_workspace, max(0.01, min(30, remaining)))
+    head, status_sha, entries = observe_git_state(r, actual_workspace, clock, deadline)
     if clock() > deadline:
         raise TimeoutError('proof deadline exhausted during Git observation')
     expected_work = {
@@ -887,19 +918,35 @@ def _claude_native_pane_ok(captured, expected_line, brief_text):
     return False
 
 
-def _hydrogen_native_pane_ok(captured, command_id):
-    """Require a completed Hydrogen action header bound to THIS sample's exact probe command.
+def hydrogen_framing_diagnostic(captured, command_id):
+    """PROSPECTIVE support hook only -- never native authority.
 
-    The real Hydrogen pane collapses tool stdout (`(ctrl+o to expand)`), so stdout/expected lines that appear
-    after the header are assistant/footer prose and are deliberately NOT accepted as proof. The only pane
-    evidence is an exact, fully visible (not truncated) `● Ran (<command_id>) (ctrl+o to expand)` header; the
-    work itself is proven by the independent artifact + per-sample probe file."""
-    if not isinstance(command_id, str) or not re.fullmatch(r'python3 \.local/a10/[0-9a-f]{8}\d{2}\.py', command_id):
-        return False
-    want = '● Ran (%s) (ctrl+o to expand)' % command_id
-    for line in captured.splitlines():
-        if _collapse_ws(_strip_ansi(line)) == want:
-            return True
+    Reports how many exact, fully visible `● Ran (<command_id>) (ctrl+o to expand)` rows the plain pane shows and
+    which known ambiguity classes are present (same-command Running/error rows, duplicates). It cannot tell a
+    completed native action from assistant/footer text, so its status is always UNKNOWN_NATIVE_FRAMING and
+    native_action_verified is always False until a Root-qualified renderer contract and a separately reviewed
+    recognizer replace this function."""
+    info = dict(UNQUALIFIED_NATIVE_FRAMING['antigravity'])
+    exact = bool(isinstance(command_id, str) and re.fullmatch(r'python3 \.local/a10/[0-9a-f]{8}\d{2}\.py', command_id))
+    rows = 0
+    contradictions = []
+    if exact and isinstance(captured, str):
+        want = '● Ran (%s) (ctrl+o to expand)' % command_id
+        for line in captured.splitlines():
+            flat = _collapse_ws(_strip_ansi(line))
+            if flat == want:
+                rows += 1
+            elif command_id in flat and re.search(r'Running|Error|failed|exit', flat):
+                contradictions.append('same-command non-completed/failed row')
+        if rows > 1:
+            contradictions.append('duplicate exact row')
+    info.update(exact_command=exact, candidate_rows=rows, contradictions=sorted(set(contradictions)))
+    return info
+
+
+def _hydrogen_native_pane_ok(captured, command_id):
+    """Hydrogen native proof is UNAVAILABLE (UNKNOWN_NATIVE_FRAMING): always False today."""
+    hydrogen_framing_diagnostic(captured, command_id)
     return False
 
 
@@ -1100,13 +1147,16 @@ def picker_problems(picker, session):
             problems.append('picker %s mismatch with current session' % key)
     if picker.get('machine_id') != row_host(session):
         problems.append('picker machine mismatch with current session')
-    op_id = session.get('operation_id')
-    attempt_op = session.get('attempt_operation_id')
-    # Distinct opaque fields: if attempt_operation_id is present, use its attempt suffix; else operation_id.
-    op_ref = attempt_op if isinstance(attempt_op, str) and attempt_op else op_id
-    suffix = re.search(r':([01])$', op_ref) if isinstance(op_ref, str) else None
-    attempt = int(suffix.group(1)) if suffix else session.get('attempt')
-    if picker.get('attempt') != attempt:
+    # Endpoint-aware: a Project-shaped view (start response) carries base + attempt alias; a Machine show carries
+    # the attempt id in operation_id. Both are strictly normalized; malformed/contradictory is a mismatch.
+    try:
+        if session.get('attempt_operation_id') is not None and session.get('attempt_operation_id') != session.get('operation_id'):
+            attempt = _project_shape_identity(session, 'session', 'id')['attempt']
+        else:
+            attempt = machine_session_identity(session)['attempt']
+    except IdentityError:
+        attempt = None
+    if attempt is None or picker.get('attempt') != attempt:
         problems.append('picker attempt mismatch with current session')
     pool = picker.get('pool')
     if isinstance(pool, list) and not any(isinstance(row, dict) and all(row.get(key) == picker.get(key)
@@ -1378,15 +1428,150 @@ def _identity_problem(expected, actual, label):
     return None
 
 
-def _owned_identity(row, native):
-    """Immutable identity captured from an original start show or a proven-descendant show."""
+# --- Endpoint-specific operation identity normalization ---
+# Source contract (hub2/src/machine-do.ts sessionView + claim at :722; hub2/src/project-do.ts sagaView and the
+# previous-attempt relation at :1016): the Machine session row stores the ATTEMPT operation id in `operation_id`
+# (its base dispatch id is not projected) and emits no `attempt_operation_id`/`attempt`. The Project dispatch saga,
+# final_evidence and the nested exit evidence carry `operation_id` = BASE and `attempt_operation_id` =
+# `<base>:<attempt>` (dispatch also carries integer `attempt`). Every view is normalized into the SAME
+# (base, attempt_operation_id, attempt) triple; raw `operation_id` labels are never compared across endpoints.
+_BASE_OP_RE = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+_ATTEMPT_OP_RE = re.compile(r'(%s):(0|[1-9][0-9]{0,2})' % _BASE_OP_RE)
+IDENTITY_KEYS = ('session_id', 'operation_id', 'attempt_operation_id', 'attempt', 'epoch', 'machine_id', 'native_id')
+BINDING_KEYS = ('session_id', 'operation_id', 'attempt_operation_id', 'attempt', 'epoch', 'machine_id')
+
+
+class IdentityError(ValueError):
+    """Malformed or self-contradictory endpoint identity (never treated as equality)."""
+
+
+def split_attempt_operation_id(value):
+    """Strict `<lowercase UUID base>:<attempt>`; anything else (opaque/other scheme) is refused, never stripped."""
+    m = _ATTEMPT_OP_RE.fullmatch(value) if isinstance(value, str) else None
+    if not m:
+        raise IdentityError('attempt operation id %r is not strict <uuid>:<attempt>' % (value,))
+    return m.group(1), int(m.group(2))
+
+
+def _valid_epoch(value):
+    return type(value) is int and value >= 0
+
+
+def _project_shape_identity(view, label, session_key):
+    """Project dispatch / final_evidence / nested exit evidence: base + attempt alias (+ optional int attempt)."""
+    if not isinstance(view, dict):
+        raise IdentityError('%s missing or malformed' % label)
+    base = view.get('operation_id')
+    if not (isinstance(base, str) and re.fullmatch(_BASE_OP_RE, base)):
+        raise IdentityError('%s operation_id %r is not a base UUID' % (label, base))
+    att_base, attempt = split_attempt_operation_id(view.get('attempt_operation_id'))
+    if att_base != base:
+        raise IdentityError('%s attempt_operation_id base %r != operation_id %r' % (label, att_base, base))
+    if 'attempt' in view and view.get('attempt') is not None and (type(view['attempt']) is not int or view['attempt'] != attempt):
+        raise IdentityError('%s attempt %r contradicts attempt_operation_id index %d' % (label, view['attempt'], attempt))
     return {
-        'operation_id': row.get('operation_id'),
-        'attempt_operation_id': row.get('attempt_operation_id'),
-        'epoch': row.get('epoch'),
-        'machine_id': row_host(row),
-        'native_id': native if valid_native_id(native) else None,
+        'session_id': view.get(session_key), 'operation_id': base, 'attempt_operation_id': view['attempt_operation_id'],
+        'attempt': attempt, 'epoch': view.get('epoch') if _valid_epoch(view.get('epoch')) else None,
+        'machine_id': view.get('machine_id'), 'native_id': view.get('native_id') if valid_native_id(view.get('native_id')) else None,
     }
+
+
+def machine_session_identity(row):
+    """Normalize a Machine `sessions show`/`stop_wait` row. `operation_id` IS the attempt id."""
+    if not isinstance(row, dict):
+        raise IdentityError('session view missing or malformed')
+    op = row.get('operation_id')
+    base, attempt = split_attempt_operation_id(op)
+    # Optional redundant aliases are not required (Machine does not emit them); if present they must agree.
+    if row.get('attempt_operation_id') is not None and row.get('attempt_operation_id') != op:
+        raise IdentityError('session attempt_operation_id %r contradicts Machine operation_id %r'
+                            % (row.get('attempt_operation_id'), op))
+    if row.get('attempt') is not None and (type(row.get('attempt')) is not int or row.get('attempt') != attempt):
+        raise IdentityError('session attempt %r contradicts Machine operation_id %r' % (row.get('attempt'), op))
+    if row.get('dispatch_id') is not None and row.get('dispatch_id') != base:
+        raise IdentityError('session dispatch_id %r contradicts Machine operation_id %r' % (row.get('dispatch_id'), op))
+    machine = row.get('machine_id')
+    for alias in ('host', 'machine'):
+        if row.get(alias) is not None and machine is not None and row.get(alias) != machine:
+            raise IdentityError('session %s %r contradicts machine_id %r' % (alias, row.get(alias), machine))
+    ident = {
+        'session_id': row.get('id'), 'operation_id': base, 'attempt_operation_id': op, 'attempt': attempt,
+        'epoch': row.get('epoch') if _valid_epoch(row.get('epoch')) else None,
+        'machine_id': machine if machine is not None else row_host(row),
+        'native_id': row.get('native_id') if valid_native_id(row.get('native_id')) else None,
+    }
+    # Terminal Machine views nest Project-shaped exit evidence; it must repeat the SAME base/attempt tuple.
+    nested = row.get('evidence')
+    if isinstance(nested, dict) and ('operation_id' in nested or 'attempt_operation_id' in nested):
+        inner = _project_shape_identity(nested, 'session exit evidence', 'session_id')
+        bad = _identity_problem({k: ident[k] for k in IDENTITY_KEYS if ident[k] is not None}, inner, 'session exit evidence')
+        if bad:
+            raise IdentityError(bad)
+    return ident
+
+
+def dispatch_identity(dispatch):
+    return _project_shape_identity(dispatch, 'current dispatch', 'id')
+
+
+def final_evidence_identity(final):
+    return _project_shape_identity(final, 'final_evidence', 'session_id')
+
+
+def _owned_identity(row, native):
+    """Immutable identity captured from an original start show or a proven-descendant pre-STOP show.
+
+    Malformed/contradictory Machine identity yields all-None operation fields (UNKNOWN, never equality)."""
+    try:
+        ident = machine_session_identity(row)
+    except IdentityError:
+        ident = {k: None for k in IDENTITY_KEYS}
+        ident['session_id'] = row.get('id') if isinstance(row, dict) else None
+        ident['machine_id'] = row_host(row) if isinstance(row, dict) else None
+    ident['native_id'] = native if valid_native_id(native) else None
+    return ident
+
+
+def _bind_view(expected, view, normalize, label, keys=BINDING_KEYS):
+    """Normalize an endpoint view, then require strict equality on `keys` (missing on either side = UNKNOWN)."""
+    try:
+        actual = normalize(view)
+    except IdentityError as exc:
+        return '%s identity invalid: %s' % (label, exc)
+    return _identity_problem({k: expected.get(k) for k in keys}, actual, label)
+
+
+def _stop_view_problem(expected, view, label):
+    """A post-STOP Machine view may only CONFIRM the immutable expected tuple (it never overwrites it).
+
+    A native id is compared when the immutable tuple has one; a late native on a NULL-native original is not
+    adopted here (its absence is still checked) and keeps the dispatch binding UNKNOWN."""
+    keys = BINDING_KEYS + (('native_id',) if expected.get('native_id') is not None else ())
+    return _bind_view(expected, view, machine_session_identity, label, keys)
+
+
+def final_stop_proof_problem(final, expected, intake_id, label='final_evidence'):
+    """Normal operator STOP: Project final_evidence must prove stop_confirmed + exit + empty containment for the
+    exact owned base/attempt tuple, including the nested finish_after_stop repetition."""
+    if not isinstance(final, dict):
+        return '%s missing (UNKNOWN, not clean)' % label
+    bad = _bind_view(expected, final, final_evidence_identity, label, IDENTITY_KEYS)
+    if bad:
+        return bad
+    if final.get('stopped') is not True or final.get('reason') != 'stop_confirmed':
+        return '%s is not a confirmed stop (stopped=%r reason=%r)' % (label, final.get('stopped'), final.get('reason'))
+    comp = final.get('completion')
+    if not isinstance(comp, dict) or comp.get('reason') != 'session_stop_confirmed' or comp.get('session_id') != expected.get('session_id'):
+        return '%s completion is not session_stop_confirmed for the owned session' % label
+    fas = final.get('finish_after_stop')
+    bad = _bind_view(expected, fas, final_evidence_identity, label + '.finish_after_stop', IDENTITY_KEYS)
+    if bad:
+        return bad
+    inner = fas.get('evidence') if isinstance(fas.get('evidence'), dict) else {}
+    if (fas.get('state') != 'stopped' or fas.get('native_exit_confirmed') is not True
+            or inner.get('containment_empty') is not True or fas.get('intake_id') != intake_id):
+        return '%s.finish_after_stop lacks stopped/native exit/empty containment proof' % label
+    return None
 
 
 def stop_and_drain_lineage(r, rec, run_id, clock, sleep):
@@ -1409,9 +1594,10 @@ def stop_and_drain_lineage(r, rec, run_id, clock, sleep):
     # Immutable original identity recorded from the start show; NEVER overwritten from stop/show views.
     original = rec.get('owned_identity')
     if not isinstance(original, dict):
-        original = {'operation_id': rec.get('operation_id'), 'attempt_operation_id': rec.get('attempt_operation_id'),
-                    'epoch': rec.get('epoch'), 'machine_id': rec.get('host'),
-                    'native_id': rec.get('native_id') if valid_native_id(rec.get('native_id')) else None}
+        # No validated start show: every operation field is UNKNOWN (STOP still runs first, archive never).
+        original = {k: None for k in IDENTITY_KEYS}
+        original.update(session_id=sid, machine_id=rec.get('host'),
+                        native_id=rec.get('native_id') if valid_native_id(rec.get('native_id')) else None)
     owned_meta = {sid: dict(original)}
     stopped_sids = {}
     descendant_count = 0
@@ -1430,8 +1616,7 @@ def stop_and_drain_lineage(r, rec, run_id, clock, sleep):
     except Exception as exc:
         return unknown('stop failed: %s' % exc)
     # The stop view may only CONFIRM the original identity; a changed/missing binding is drift/UNKNOWN.
-    drift = _identity_problem({k: original.get(k) for k in ('operation_id', 'attempt_operation_id', 'epoch')},
-                              sess, 'stopped session %s' % sid)
+    drift = _stop_view_problem(original, sess, 'stopped session %s' % sid)
     if drift:
         return unknown(drift)
 
@@ -1473,9 +1658,11 @@ def stop_and_drain_lineage(r, rec, run_id, clock, sleep):
                 return unknown('foreign or mismatched current dispatch session %r (current=%r)' % (d_sid, current_sid))
             if dispatch.get('state') not in DISPATCH_TERMINAL_STATES:
                 return unknown('non-terminal dispatch state %r after drain' % dispatch.get('state'))
-            bind = _identity_problem(owned_meta[d_sid], dispatch, 'current dispatch %s' % d_sid)
+            bind = _bind_view(owned_meta[d_sid], dispatch, dispatch_identity, 'current dispatch %s' % d_sid, IDENTITY_KEYS)
             if bind:
                 return unknown(bind)
+            if dispatch.get('intake_id') is not None and dispatch.get('intake_id') != child_id:
+                return unknown('current dispatch intake_id %r != %s' % (dispatch.get('intake_id'), child_id))
             pending_comp = _pending_completion_reason(intake_row)
             if pending_comp:
                 return unknown('completion action still %s after drain' % pending_comp)
@@ -1508,8 +1695,7 @@ def stop_and_drain_lineage(r, rec, run_id, clock, sleep):
             })
             if d_err:
                 return unknown('descendant %s: %s' % (dsid, d_err))
-            d_drift = _identity_problem({k: owned_meta[dsid].get(k) for k in ('operation_id', 'attempt_operation_id', 'epoch')},
-                                        dsess_after, 'stopped descendant %s' % dsid)
+            d_drift = _stop_view_problem(owned_meta[dsid], dsess_after, 'stopped descendant %s' % dsid)
             if d_drift:
                 return unknown(d_drift)
 
@@ -1529,12 +1715,17 @@ def stop_and_drain_lineage(r, rec, run_id, clock, sleep):
     if type(version) is not int:
         return unknown('cannot archive child intake: missing integer updated_at version')
 
+    final_bad = final_stop_proof_problem(intake_row.get('final_evidence'), owned_meta[current_sid], child_id)
+    if final_bad:
+        return unknown('cannot archive: %s' % final_bad)
+
     def archive_proven(row):
         disp = row.get('dispatch') if isinstance(row, dict) else None
         return (isinstance(row, dict) and row.get('id') == child_id and row.get('status') == 'archived'
                 and row.get('session_id') == current_sid and isinstance(disp, dict)
                 and disp.get('id') == current_sid and disp.get('state') in DISPATCH_TERMINAL_STATES
-                and _identity_problem(owned_meta[current_sid], disp, 'archived dispatch') is None)
+                and _bind_view(owned_meta[current_sid], disp, dispatch_identity, 'archived dispatch', IDENTITY_KEYS) is None
+                and final_stop_proof_problem(row.get('final_evidence'), owned_meta[current_sid], child_id) is None)
 
     if intake_row.get('status') == 'archived':
         if archive_proven(intake_row):
@@ -1686,10 +1877,35 @@ def one_start(r, rec, run_id, parent_intake_id, workspace, output_dir, manifest,
         requested_workspace=row.get('requested_workspace'),
         workspace=actual_workspace,
         epoch=row.get('epoch'),
-        operation_id=row.get('operation_id'),
-        attempt_operation_id=row.get('attempt_operation_id'),
     )
+    # Immutable expected tuple from the Machine start show (operation_id is the ATTEMPT id there).
     rec['owned_identity'] = _owned_identity(row, row.get('native_id'))
+    rec.update({k: rec['owned_identity'][k] for k in ('operation_id', 'attempt_operation_id', 'attempt')})
+    try:
+        machine_session_identity(row)
+    except IdentityError as exc:
+        err.append('start show identity invalid: %s' % exc)
+    if rec['owned_identity'].get('session_id') != sid:
+        err.append('start show session id %r != %s' % (rec['owned_identity'].get('session_id'), sid))
+    # The Project start response (dispatch saga view) must name the SAME base/attempt/epoch/machine.
+    # Allowed difference: only the source-backed previous-attempt relation (project-do.ts:1016) when the waited
+    # start fell back after the POST response; base and session must still be identical.
+    created_bind = _bind_view(rec['owned_identity'], created, lambda v: _project_shape_identity(v, 'start response', 'id'),
+                              'start response', BINDING_KEYS)
+    if created_bind:
+        try:
+            created_ident = _project_shape_identity(created, 'start response', 'id')
+        except IdentityError:
+            created_ident = None
+        own = rec['owned_identity']
+        fallback_relation = (
+            created_ident is not None and own.get('operation_id') is not None
+            and created_ident['session_id'] == own['session_id'] == sid
+            and created_ident['operation_id'] == own['operation_id']
+            and type(own.get('attempt')) is int and created_ident['attempt'] == own['attempt'] - 1
+            and created_ident['attempt_operation_id'] == '%s:%d' % (own['operation_id'], own['attempt'] - 1))
+        if not fallback_relation:
+            err.append(created_bind)
     if row.get('state') != 'running':
         err.append('state %r not running' % row.get('state'))
     if row_host(row) != HOST:
@@ -1755,6 +1971,32 @@ def one_start(r, rec, run_id, parent_intake_id, workspace, output_dir, manifest,
         return
 
     engine = rec.get('engine')
+    if engine in UNQUALIFIED_NATIVE_FRAMING:
+        # Honest unavailable gate: artifact-only evidence is still verified and recorded, but it can never
+        # bootstrap native authority. The sample is not resampled and cannot count toward the formal ten.
+        info = UNQUALIFIED_NATIVE_FRAMING[engine]
+        rec['native_proof'] = {k: info[k] for k in ('status', 'reason', 'root_checker_status',
+                                                    'native_action_verified', 'typed_stdout_verified')}
+        rec['capture_verified'] = False
+        adeadline = clock() + CAPTURE_BUDGET_S
+        while clock() < adeadline:
+            try:
+                work_info = verify_work_artifact(
+                    r, actual_workspace, run_id, sample, parent_intake_id, child_id, sid, native_id, challenge32,
+                    clock, adeadline, require_probe=True,
+                )
+                rec['artifact_only'] = {k: work_info[k] for k in (
+                    'artifact_sha256', 'proof_digest', 'head', 'tracked_status_sha256', 'probe_sha256')}
+                break
+            except (OSError, ValueError, RuntimeError, TimeoutError):
+                pass
+            if clock() >= adeadline:
+                break
+            sleep(min(1, max(0.01, adeadline - clock())))
+        err.append('native proof %s for engine %s: %s (artifact-only=%s; %s)' % (
+            info['status'], engine, info['reason'], 'VALIDATED' if rec.get('artifact_only') else 'absent',
+            info['diagnostic']))
+        return
     transport = (capture_transports or {}).get(engine)
     if not native_transport_ok(engine, transport, (transport.get('host_release_sha') if isinstance(transport, dict) else None)):
         err.append('capture proof unavailable: no verified interactive native-pane transport for engine %s' % engine)
@@ -1861,6 +2103,11 @@ def verify_running_before_stop(r, rec, clock):
     if native_id not in live or sess.get('state') != 'running':
         err.append('natural exit after proof before live STOP (native_live=%s, state=%r)' % (
             native_id in live, sess.get('state')))
+        return False
+    expected = rec.get('owned_identity') if isinstance(rec.get('owned_identity'), dict) else {}
+    drift = _bind_view(expected, sess, machine_session_identity, 'pre-stop session', IDENTITY_KEYS)
+    if drift:
+        err.append(drift)
         return False
     return True
 
