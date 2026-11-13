@@ -124,6 +124,7 @@ export const CLI_EXCLUSIONS: Record<string, string> = {
   'fleet-capacity-history': 'Admin-only account capacity observations are operator diagnostics, never agent MCP tools.',
   'intake merge-check': 'Host-local: runs git and gh in a checkout, then records merge evidence; deliberate CLI step. The close gate itself is enforced for MCP intake_update (intake 2e00e01f).',
   'intake merge-state': 'Read of the merge gate; shown on intake_show (merge_state) and GET /api/intake/merge-state.',
+  'intake reevaluate': 'Operator-only: restarts Hub acceptance verification and the merge gate for a failed intake (Hub2); deliberate CLI step, not an agent tool.',
   'intake queue': 'Read of the autonomous intake queue (GET /api/intake/queue); MCP callers inspect queue health via ops_status or intake_list.',
   'machines remove': 'Operator-only machine retirement; deliberate CLI step, not an agent tool.',
   'machines revoke': 'Admin-only hard hide of a machine with credential kill; deliberate CLI step, not an agent tool.',
