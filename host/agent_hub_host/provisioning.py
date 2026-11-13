@@ -1870,6 +1870,36 @@ CODEX_WRAPPER_DEFAULT = ('git', 'cloudflare-agent-git', 'scripts', 'launch-codex
 CODEX_WRAPPER_UNAVAILABLE = 'codex_launch_wrapper_unavailable'
 
 
+def _valid_codex_wrapper_body(text):
+    """Return True only for the exact canonical maintained Codex quota wrapper template."""
+    if '\r' in text:
+        return False
+    raw_lines = text.splitlines()
+    if not raw_lines or raw_lines[0] not in ('#!/usr/bin/env bash', '#!/bin/bash'):
+        return False
+    stmts = [line.strip() for line in raw_lines[1:] if line.strip() and not line.strip().startswith('#')]
+    if len(stmts) not in (3, 4) or stmts[0] != 'set -euo pipefail':
+        return False
+    if len(stmts) == 4:
+        repo_match = re.fullmatch(r'repo=(/[A-Za-z0-9._/@+-]+)', stmts[1])
+        if not repo_match or '..' in Path(repo_match.group(1)).parts:
+            return False
+        if stmts[2] != 'python3 "$repo/scripts/quota-gate.py"':
+            return False
+    else:
+        # Direct form: python3 /abs/.../quota-gate.py (unquoted or double-quoted)
+        gate_match = re.fullmatch(r'python3 (?:"(/[A-Za-z0-9._/@+-]+/quota-gate\.py)"|(/[A-Za-z0-9._/@+-]+/quota-gate\.py))', stmts[1])
+        if not gate_match:
+            return False
+        gate_path = gate_match.group(1) or gate_match.group(2)
+        if '..' in Path(gate_path).parts:
+            return False
+    exec_match = re.fullmatch(r'exec (/[A-Za-z0-9._/@+-]+/codex) "\$@"', stmts[-1])
+    if not exec_match or '..' in Path(exec_match.group(1)).parts:
+        return False
+    return True
+
+
 def codex_launch_wrapper(environ=None, home=None):
     """Return the verified maintained Codex quota wrapper (a resolved Linux path).
 
@@ -1908,12 +1938,11 @@ def codex_launch_wrapper(environ=None, home=None):
                 or info.st_mode & 0o020 and info.st_gid != os.getegid() or not os.access(real, os.X_OK)):
             raise ValueError(CODEX_WRAPPER_UNAVAILABLE)
         with open(real, 'rb') as stream:
-            text = stream.read(4097).decode('utf8')
-        lines = [line.strip() for line in text.splitlines() if line.strip() and not line.strip().startswith('#!')]
-        lines = [line for line in lines if not line.startswith('#')]
-        if (not text.startswith(('#!/usr/bin/env bash', '#!/bin/bash')) or 'set -euo pipefail' not in lines
-                or not any('quota-gate.py' in line for line in lines[:-1])
-                or not lines or not re.fullmatch(r'exec \S*/codex "\$@"', lines[-1])):
+            raw = stream.read(4097)
+        if len(raw) > 4096:
+            raise ValueError(CODEX_WRAPPER_UNAVAILABLE)
+        text = raw.decode('utf8')
+        if not _valid_codex_wrapper_body(text):
             raise ValueError(CODEX_WRAPPER_UNAVAILABLE)
         return Path(real)
     except (OSError, ValueError, UnicodeDecodeError, RuntimeError):
@@ -3018,7 +3047,9 @@ def codex_exec_readiness(archive):
     """Read-only proof that this archive's Codex profile executes through the wrapper.
 
     The profile must be the maintained `hub-shared-codex` entry whose command
-    runs this archive's gated `execute`; no quota probe, install or sync."""
+    matches this archive's exact generated `execute` invocation (interpreter,
+    effective archive precedence, managed root, handler and account label);
+    no quota probe, install or sync."""
     archive = Path(archive).resolve(strict=True)
     if not archive.is_file() or not zipfile.is_zipfile(archive):
         raise ValueError(CODEX_WRAPPER_UNAVAILABLE)
@@ -3026,12 +3057,15 @@ def codex_exec_readiness(archive):
     document = tomllib.loads(private_fs.read_bytes(profile_path(), 262144).decode('utf8'))
     profiles = document.get('profiles')
     profile = profiles.get('hub-shared-codex') if isinstance(profiles, dict) else None
-    command = profile.get('command') if isinstance(profile, dict) else None
-    if (not isinstance(profile, dict) or set(profile) != {'engine', 'command'} or profile['engine'] != 'codex'
-            or not isinstance(command, list) or len(command) < 4 or not all(isinstance(v, str) for v in command)
-            or command[-1] != 'shared-codex' or command[-3] != '-c'
-            or not command[-2].endswith('from agent_hub_host.provisioning import execute; execute()')
-            or repr(str(archive)) not in command[-2]):
+    previous = sys.argv[0]
+    try:
+        sys.argv[0] = str(archive)
+        expected = module_command('execute', 'shared-codex')
+    finally:
+        sys.argv[0] = previous
+    if (not isinstance(profile, dict) or set(profile) != {'engine', 'command'}
+            or profile['engine'] != 'codex' or profile['command'] != expected
+            or str(archive) not in expected[expected.index('-c') + 1]):
         raise ValueError(CODEX_WRAPPER_UNAVAILABLE)
     return {'protocol': CODEX_WRAPPER_PROTOCOL, 'label': 'shared-codex', 'profile': 'hub-shared-codex',
             'wrapper': str(wrapper)}
