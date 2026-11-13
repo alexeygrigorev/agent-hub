@@ -214,11 +214,11 @@ export class ProjectDO {
     normalizeCriteria(body);
     if (typeof body.title !== 'string' || body.title.trim().length < 1 || body.title.length > 240) return error('invalid_title', 400);
     if (typeof body.text !== 'string' || body.text.trim().length < 1 || new TextEncoder().encode(body.text).byteLength > 8192) return error('invalid_text', 400);
-    if (!Array.isArray(body.acceptance_criteria) || body.acceptance_criteria.length < 1 || body.acceptance_criteria.length > 32
-      || !body.acceptance_criteria.every(item => typeof item === 'string' && item.trim().length > 0 && item.length <= 1000)) return error('acceptance_criteria_required', 400);
+    const criteriaProblem = criteriaError(body.acceptance_criteria);
+    if (criteriaProblem) return criteriaProblem;
     const key = this.idempotencyKey(request, body);
     if (!key) return error('idempotency_key_required', 400);
-    const normalized = { title: body.title.trim(), text: body.text, acceptance_criteria: body.acceptance_criteria.map(value => (value as string).trim()) };
+    const normalized = { title: body.title.trim(), text: body.text, acceptance_criteria: (body.acceptance_criteria as string[]).map(value => value.trim()) };
     const digest = await sha256Hex(JSON.stringify(normalized));
     const prior = this.idempotent('intake:create', key, digest);
     if (prior instanceof Response) return prior;
@@ -388,7 +388,7 @@ export class ProjectDO {
     if(!['title','text','acceptance_criteria','status','priority','note',...INTAKE_CONTEXT_FIELDS].some(k=>body[k]!==undefined)||Object.keys(body).some(k=>!allowed.includes(k)))return error('unknown_intake_field',400);
     if(body.title!==undefined&&(typeof body.title!=='string'||!body.title.trim()||body.title.length>240)||body.text!==undefined&&(typeof body.text!=='string'||!body.text.trim()||new TextEncoder().encode(body.text).length>8192)||body.note!==undefined&&(typeof body.note!=='string'||!body.note.trim()||body.note.length>4000)||body.priority!==undefined&&(!Number.isInteger(body.priority)||Number(body.priority)<0||Number(body.priority)>3)||body.status!==undefined&&!['open','archived','needs_attention','accepted'].includes(String(body.status)))return error('invalid_intake_edit',400);
     if(INTAKE_CONTEXT_FIELDS.some(field=>body[field]!==undefined&&body[field]!==null&&(typeof body[field]!=='string'||new TextEncoder().encode(body[field] as string).length>8192)))return error('invalid_intake_context',400);
-    if(body.acceptance_criteria!==undefined&&(!Array.isArray(body.acceptance_criteria)||!body.acceptance_criteria.length||body.acceptance_criteria.length>32||!body.acceptance_criteria.every(v=>typeof v==='string'&&v.trim()&&v.length<=1000)))return error('acceptance_criteria_required',400);
+    if(body.acceptance_criteria!==undefined){const problem=criteriaError(body.acceptance_criteria);if(problem)return problem;}
     const digest=await sha256Hex(JSON.stringify(body)),scope='intake:edit:'+intakeId;
     const replay=this.idempotent(scope,key,digest);if(replay instanceof Response)return replay;
     const result=this.transaction(()=>{
@@ -1749,6 +1749,22 @@ export class ProjectDO {
   }
 
 
+}
+
+/** Per-criterion bound: long verbatim requester wording must fit as AC1; the whole request body stays bounded at 16 KiB. */
+export const ACCEPTANCE_CRITERION_MAX_CHARS = 6000;
+export const ACCEPTANCE_CRITERIA_MAX_COUNT = 32;
+
+/** Validate criteria and name the exact failing check instead of a generic "required". */
+function criteriaError(value: unknown): Response | null {
+  if (!Array.isArray(value) || value.length < 1) return error('acceptance_criteria_required', 400, 'at least one acceptance criterion is required');
+  if (value.length > ACCEPTANCE_CRITERIA_MAX_COUNT) return error('acceptance_criteria_too_many', 400, `${value.length} criteria; max ${ACCEPTANCE_CRITERIA_MAX_COUNT}`);
+  for (let index = 0; index < value.length; index++) {
+    const item = value[index];
+    if (typeof item !== 'string' || !item.trim()) return error('acceptance_criterion_empty', 400, `criterion ${index + 1} must be non-empty text`);
+    if (item.length > ACCEPTANCE_CRITERION_MAX_CHARS) return error('acceptance_criterion_too_long', 400, `criterion ${index + 1} is ${item.length} characters; max ${ACCEPTANCE_CRITERION_MAX_CHARS} per criterion (16 KiB per request)`);
+  }
+  return null;
 }
 
 /** CLI/MCP clients send criteria as one text block; store one criterion per non-empty line. */
