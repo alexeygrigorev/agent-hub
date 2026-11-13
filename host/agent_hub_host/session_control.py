@@ -94,11 +94,14 @@ HUB2_UNSUPPORTED_PREFIXES = (
     '/api/fleet/reservations', '/api/fleet/accounts', '/api/fleet/limits',
     '/api/fleet/resources', '/api/fleet/routing/host-goal',
     '/api/fleet/routing/policy/grok', '/api/fleet/machines/',
+    '/api/fleet/routing/host-release', '/api/fleet/routing/launcher-release',
 )
 HUB2_UNSUPPORTED_HINTS = {
     '/api/bus/': 'messaging moved to the Hub2 mailbox /api/messages; use `hub msg send --to human:me|session:<id>|agent:<name>` (web Inbox) or `hub sessions send <id>` to type into a bound session',
     '/api/webhooks': 'webhooks retired with Hub1',
     '/api/prompts': 'prompt library retired with Hub1',
+    '/api/fleet/routing/host-release': 'Hub2 hosts follow the published /cli/host-release.json; use `hub host-release --machine <id> --sha <sha>` to see its rollout',
+    '/api/fleet/routing/launcher-release': 'launcher pins were Hub1-only; Hub2 launchers ship inside the published host release',
 }
 
 

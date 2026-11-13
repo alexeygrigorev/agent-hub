@@ -165,7 +165,9 @@ def execute(args):
         return bus._do_request('GET', '/api/device/pending')
     if args.cmd in ('routing-machines', 'model-policy'):
         return bus._do_request('GET', '/api/fleet/routing/' + ('machines' if args.cmd == 'routing-machines' else 'policy'))
-    if args.cmd in ('host-release', 'launcher-release'):
+    if args.cmd == 'host-release':
+        return host_release(args)
+    if args.cmd == 'launcher-release':
         if not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', args.machine):
             raise ValueError('Invalid machine id')
         if args.sha is not None and not re.fullmatch(r'[0-9a-fA-F]{40}', args.sha):
@@ -185,6 +187,78 @@ def execute(args):
                'artifacts': json.loads(read_text(args.artifacts_file)) if args.artifacts_file else [],
                'confirmed_exit': args.confirmed_exit}
     return bus._do_request('POST', path + '/result', payload)
+
+
+HOST_RELEASE_DEPLOY_PATH = (
+    "the 'Hub 2 production' workflow (.github/workflows/deploy.yml) publishes it automatically after "
+    "green CI on a main push and triggers the Hetzner host updater; to roll out now: "
+    "gh workflow run deploy.yml --ref main -f dry_run=false")
+
+
+def _hub_base_url():
+    from . import config
+    base = os.environ.get('HUB_URL') or os.environ.get('HUB_BASE_URL') or config.load_config().get('base_url')
+    if not base:
+        raise ValueError('Not logged in. Base URL not configured.')
+    return base.rstrip('/')
+
+
+def host_release(args):
+    """Hub2 has no per-machine host pin (the Hub1 PUT route answers 404).
+
+    Hub2 hosts follow the published /cli/host-release.json. Report where the
+    requested commit stands in that rollout, or name exactly why it is not live.
+    """
+    from .api import check_url, safe_http_json
+    from .session_control import SessionInputError, diagnostic
+    import urllib.request
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', args.machine):
+        raise ValueError('Invalid machine id')
+    base = _hub_base_url()
+    check_url(base)
+    manifest_url = base + '/cli/host-release.json'
+    if args.clear:
+        raise SessionInputError(
+            'not_supported_on_hub2; Hub2 has no per-machine host-release pin to clear: '
+            f'{args.machine} follows {manifest_url}')
+    if not re.fullmatch(r'[0-9a-fA-F]{40}', args.sha):
+        raise ValueError('A full 40-hex commit is required')
+    sha = args.sha.lower()
+    try:
+        manifest = safe_http_json(urllib.request.Request(manifest_url, method='GET'))
+    except Exception as exc:
+        raise SessionInputError(
+            f'host_release_manifest_unavailable; could not read {manifest_url}: {diagnostic(exc)}') from None
+    published = manifest.get('host_version') if isinstance(manifest, dict) else None
+    if not isinstance(published, str) or not re.fullmatch(r'[0-9a-f]{40}', published):
+        raise SessionInputError(f'host_release_manifest_invalid; {manifest_url} has no 40-hex host_version')
+    if published != sha:
+        raise SessionInputError(
+            f'host_release_not_published; Hub2 has no per-machine pin (the Hub1 route is gone, hence 404): '
+            f'{args.machine} follows {manifest_url}, which publishes {published} not {sha} '
+            f'(no action if {published[:12]} already contains {sha[:12]}); {HOST_RELEASE_DEPLOY_PATH}')
+    result = {'machine': args.machine, 'requested_sha': sha, 'published_host_version': published,
+              'machine_host_version': None, 'connected': None}
+    try:
+        machines = bus._do_request('GET', '/api/fleet/routing/machines').get('machines') or []
+        entry = next((m for m in machines if isinstance(m, dict)
+                      and (m.get('machine_id') == args.machine or m.get('id') == args.machine)), None)
+    except Exception as exc:
+        entry, result['machine_view_error'] = None, diagnostic(exc)
+    if entry is not None:
+        result['machine_host_version'] = entry.get('host_version')
+        result['connected'] = entry.get('connected')
+    elif 'machine_view_error' not in result:
+        result['machine_view_error'] = 'machine_not_listed'
+    if result['machine_host_version'] == sha:
+        result['state'] = 'current'
+    elif result['machine_host_version'] is None:
+        result['state'] = 'published'
+    else:
+        result['state'] = 'published_pending_host_update'
+        result['next_step'] = ('the host updater timer adopts it within its batching window; '
+                               'run systemctl --user start agent-hub2-host-update.service on the host to adopt now')
+    return result
 
 
 def intake_artifact(args):

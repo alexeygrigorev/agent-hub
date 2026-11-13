@@ -1131,6 +1131,23 @@ def record_activation(root, version):
         'decision': 'activated', 'reason': 'verified_activation'})
 
 
+# systemd (verified on 255) keeps the last timer activation's TRIGGER_UNIT and
+# TRIGGER_TIMER_*_USEC on a later manual `systemctl start`, so a deploy canary's
+# explicit start looked timer-triggered and was deferred for hours (intake
+# bf07f437). A genuine timer activation execs within moments of its trigger
+# time; anything older is a manual start and must apply immediately.
+TIMER_TRIGGER_FRESH_S = 15
+
+
+def timer_triggered(env, now):
+    if not env.get('TRIGGER_UNIT', '').endswith('.timer'):
+        return False
+    raw = env.get('TRIGGER_TIMER_REALTIME_USEC', '')
+    if not raw.isdigit():
+        return True
+    return 0 <= now - int(raw) / 1_000_000 <= TIMER_TRIGGER_FRESH_S
+
+
 def install(base_url, root, *, install_service=False, restart=True, scheduled=False):
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     with update_lock(root):
@@ -1303,7 +1320,7 @@ def main():
         scheduled = (
             not args.install_service
             and not args.no_restart
-            and os.environ.get('TRIGGER_UNIT', '').endswith('.timer')
+            and timer_triggered(os.environ, time.time())
         )
         install(base or 'https://hub.dtcdev.click', args.root.resolve(),
                 install_service=args.install_service, restart=not args.no_restart,
