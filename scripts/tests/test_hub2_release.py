@@ -231,6 +231,21 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
             self.install(scheduled=True)
         self.assertEqual(self.downloads, ['host-release.json'])
 
+    def test_main_marks_scheduled_only_when_triggered_by_timer(self):
+        seen = []
+        def fake_install(base_url, root, *, install_service=False, restart=True, scheduled=False):
+            seen.append((install_service, restart, scheduled))
+        with patch.object(updater, 'install', fake_install), \
+             patch.object(Path, 'home', return_value=Path(self.temporary.name)):
+            with patch.object(sys, 'argv', ['hub2-self-update.py']), \
+                 patch.dict(os.environ, {'TRIGGER_UNIT': 'agent-hub2-host-update.timer'}, clear=False):
+                self.assertEqual(updater.main(), 0)
+            with patch.object(sys, 'argv', ['hub2-self-update.py']), \
+                 patch.dict(os.environ, {}, clear=False):
+                os.environ.pop('TRIGGER_UNIT', None)
+                self.assertEqual(updater.main(), 0)
+        self.assertEqual(seen, [(False, True, True), (False, True, False)])
+
     def test_valid_update_is_offline_and_keeps_previous(self):
         old = self.old_release()
         self.install()
