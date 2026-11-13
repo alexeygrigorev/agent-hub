@@ -71,6 +71,8 @@ class FakeClient:
         self.passive_error = self.check_error = None
         self.ack_reply = {'status': 'recorded'}
         self.gate = None
+        self.gate_timeout = 10
+        self.passive_entered = threading.Event()
         self.heartbeats = 0
 
     def heartbeat(self, *args, **kwargs):
@@ -80,8 +82,9 @@ class FakeClient:
         self.calls.append((method, path, body))
         self.timeouts.append(timeout)
         if path == delivery.PASSIVE_PATH:
+            self.passive_entered.set()
             if self.gate is not None:
-                self.gate.wait(10)
+                self.gate.wait(self.gate_timeout)
             if self.passive_error:
                 raise self.passive_error
             return {'label': 'hub-claude', 'generation': self.generation, 'revision': self.revision,
@@ -337,7 +340,10 @@ class SchedulingTests(DeliveryCase):
 class ConnectionOwnershipTests(DeliveryCase):
     def test_late_result_of_old_connection_cannot_write_or_ack_after_reconnect(self):
         self.client.gate = threading.Event()
+        self.client.gate_timeout = None  # Only explicit release can finish the old HTTP request.
+        self.addCleanup(self.client.gate.set)
         self.assertTrue(delivery.request(self.bridge))
+        self.assertTrue(self.client.passive_entered.wait(2), 'old request must be in flight before reconnect')
         old = self.bridge._credential_delivery['epoch']
         delivery.stop(self.bridge)            # connection lost
         delivery.start(self.bridge)           # reconnect: a new epoch
