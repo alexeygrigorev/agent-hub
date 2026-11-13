@@ -6,8 +6,8 @@
 # session drains it on its next loop), 1 = could not save.
 set -uo pipefail
 case "$(basename "$0")" in
-  orch-send)   ROLE=orchestrator; TAG=orchestrator-main; RUNDIR="$HOME/git/agent-hub-wt-orchestrator-run"; SUB=ops/orchestrator ;;
-  oncall-send) ROLE=oncall;       TAG=oncall-engineer;   RUNDIR="$HOME/git/agent-hub-wt-oncall-run"; SUB=ops/oncall ;;
+  orch-send)   ROLE=orchestrator; TAG=orchestrator-main ;;
+  oncall-send) ROLE=oncall;       TAG=oncall-engineer ;;
   *) echo "run as orch-send or oncall-send" >&2; exit 64 ;;
 esac
 INBOX="$HOME/tmp/agent-reports/$ROLE/inbox"; mkdir -p "$INBOX/processed"
@@ -28,11 +28,17 @@ if [ "${#body}" -le 1500 ]; then
 else
   msg="[INBOX $id] long message saved at $f - read it, act, then mv it to inbox/processed/"
 fi
-sid=$(a list --json 2>/dev/null | python3 -c '
-import json,sys
-w,t=sys.argv[1:3]
-for s in json.load(sys.stdin):
-    if s.get("workspace")==w and s.get("tag")==t and s.get("phase")=="running": print(s["id"]); break' "$RUNDIR/$SUB" "$TAG")
-if [ -z "$sid" ]; then echo "DELIVERY=not-delivered (no running $TAG session; watchdog will restart it, item stays in inbox)"; exit 2; fi
+# The watchdog's controller owns discovery: its exact Hub binding (native id,
+# task-hub2-<Hub id> tag, Hub-resolved workspace) or a pre-migration session.
+# A Hub-started coordinator never carries the old tag, so it is never guessed.
+CTL="${OPS_SESSION_CTL:-$HOME/.local/share/agent-hub-ops/session-ctl.sh}"
+sid=$(timeout 60 "$CTL" "$ROLE" session-id 2>/dev/null); rc=$?
+if [ "$rc" -ne 0 ] || [ -z "$sid" ]; then
+  case "$rc" in
+    1) why="no running $TAG session; watchdog will restart it" ;;
+    *) why="session lookup failed (rc=$rc)" ;;
+  esac
+  echo "DELIVERY=not-delivered ($why, item stays in inbox)"; exit 2
+fi
 if timeout 60 a send "$sid" "$msg" --enter >/dev/null 2>&1; then echo "DELIVERY=delivered to $TAG ($sid)"; exit 0
 else echo "DELIVERY=not-delivered (a send rc=$?; item stays in inbox, drained next loop)"; exit 2; fi
