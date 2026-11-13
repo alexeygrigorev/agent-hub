@@ -35,6 +35,8 @@ export type PickInput = {
   managed_credential_label?: 'hub-claude';
   machine_id?: string; engine?: string; model?: string; effort?: string; override_reason?: string;
   tier?: string; interactive: boolean; with_goal?: boolean; required_capabilities?: string[]; exclude_policy_ids?: string[];
+  /** Machines already tried for a placement retry. */
+  exclude_machine_ids?: string[];
   /** Launch workspace: a label or an absolute path on the target host. */
   workspace?: string;
 };
@@ -67,6 +69,10 @@ export function weightedChoice<T>(values: Array<{ value: T; weight: number }>, r
 
 export function eligibleCandidates(policy: RoutingPolicy, input: PickInput): Candidate[] {
   const purpose = sessionPurpose(input.purpose);
+  const excludedMachines = input.exclude_machine_ids ?? [];
+  if (!Array.isArray(excludedMachines) || excludedMachines.length > 64
+      || excludedMachines.some(id => typeof id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(id)))
+    throw new HttpError('invalid_excluded_machines', 400);
   if(input.managed_credential_label!==undefined&&(input.managed_credential_label!=='hub-claude'
     ||input.engine!=='claude'||input.model!=='opus'||input.effort!=='medium'||input.interactive||input.with_goal))
     throw new HttpError('invalid_managed_credential_route',400);
@@ -134,6 +140,7 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
   });
   const headroom = (candidate: Candidate): number | null => observations.get(candidate.account_id) ?? null;
   const managedCentral=input.managed_credential_label==='hub-claude';
+  const excludedMachines = new Set(input.exclude_machine_ids ?? []);
   const dropped: PickDiagnostics['excluded'] = [], advisories: NonNullable<PickDiagnostics['advisories']> = [];
   const centralReady = (candidate: Candidate): boolean => {
     const view = accounts.get(candidate.account_id);
@@ -156,10 +163,11 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
   const hostsFor = (candidate: Candidate): string[] => {
     const approved = (accounts.get(candidate.account_id)?.hosts || []).filter(id => ids.has(id));
     // Central credential delivery approval does not constrain host-owned logins.
-    const hosts = input.machine_id ? [input.machine_id] : approved.length
+    const hosts = input.machine_id ? (excludedMachines.has(input.machine_id) ? [] : [input.machine_id]) : approved.length
       ? managedCentral ? approved : [...new Set([...approved,...[...ids].filter(id=>local(candidate,id))])] : [...ids];
-    const matching = hosts.filter(id => machines.get(id)?.engines?.includes(candidate.engine));
-    return matching.length ? matching : hosts;
+    const available = hosts.filter(id => !excludedMachines.has(id));
+    const matching = available.filter(id => machines.get(id)?.engines?.includes(candidate.engine));
+    return matching.length ? matching : available;
   };
   const scored = candidates.map(candidate => {
     const left = headroom(candidate);
