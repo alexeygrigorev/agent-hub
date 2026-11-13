@@ -82,6 +82,8 @@ export function mergeGate(required: boolean, value: unknown, expectedRepository?
   else if (expectedRepository && e.repository.toLowerCase() !== expectedRepository.toLowerCase())
     problems.push(`merge evidence is for ${e.repository}, expected ${expectedRepository}`);
   if (typeof e.pr_url !== 'string' || !GITHUB_PR.test(e.pr_url)) problems.push('a GitHub pull request is not identified');
+  else if (typeof e.repository === 'string' && !e.pr_url.toLowerCase().startsWith(`https://github.com/${e.repository.toLowerCase()}/pull/`))
+    problems.push(`the pull request ${e.pr_url} is not in ${e.repository}`);
   if (e.base_ref !== 'main') problems.push('the pull request base is not main');
   if (typeof e.merged_at !== 'string' || !e.merged_at.trim() || !Number.isFinite(Date.parse(e.merged_at))) problems.push('the pull request is not merged');
   if (typeof e.head_sha !== 'string' || !SHA.test(e.head_sha)) problems.push('the pull request head SHA is missing or invalid');
