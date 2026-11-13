@@ -92,6 +92,80 @@ HOST_UPDATER_TRIGGER_ARGV = (
     "--no-block",
     "agent-hub2-host-update.service",
 )
+HOST_UPDATER_GATE_PYTHON = "/usr/bin/python3"
+HOST_UPDATER_GATE_MAX_S = 300
+HOST_UPDATER_GATE_STOP_S = 30
+
+
+def host_updater_gate_unit(sha, token):
+    return f"agent-hub2-host-update-gate-{sha[:12]}-{token[:12]}.service"
+
+
+def trusted_path_chain(path, euid):
+    """True when no component of ``path`` can be substituted by another unprivileged user."""
+    parts = pathlib.PurePosixPath(path).parts
+    for i in range(1, len(parts) + 1):
+        current = str(pathlib.PurePosixPath(*parts[:i]))
+        try:
+            st = os.lstat(current)
+        except OSError:
+            return False
+        if st.st_uid not in (0, euid):
+            return False
+        if stat.S_ISLNK(st.st_mode):
+            # Only root-owned system symlinks (for example /home) may redirect the chain.
+            if st.st_uid != 0:
+                return False
+            if not trusted_path_chain(os.path.realpath(current), euid):
+                return False
+            continue
+        if not stat.S_ISDIR(st.st_mode):
+            return False
+        if st.st_mode & 0o002 and not (st.st_mode & stat.S_ISVTX and st.st_uid == 0):
+            return False
+        # Group write is tolerated only for the caller's own user-private group (umask 002 layouts).
+        if st.st_mode & 0o020 and st.st_gid != os.getegid():
+            return False
+    return True
+
+
+def host_updater_gate_argv(root, home, sha, token, limit_s=HOST_UPDATER_GATE_MAX_S):
+    """Fixed argv for the candidate-bound one-shot updater; None if any path is unsafe.
+
+    Runs the installed updater's explicit --install-service (immediate, serialized by its
+    update.lock, readiness-checked and rolled back by the updater itself) as a transient
+    user unit queued with --no-block, its lifetime capped by the remaining gate budget.
+    Nothing is mutated in the manager environment.
+    """
+    if not (re.fullmatch(r"[0-9a-f]{40}", sha) and re.fullmatch(r"[0-9a-f]{32,64}", token)):
+        return None
+    safe = re.compile(r"/[A-Za-z0-9_./+-]+")
+    root_s, home_s = str(root), str(home)
+    if not (safe.fullmatch(root_s) and safe.fullmatch(home_s)) or ".." in root_s.split("/"):
+        return None
+    euid = os.geteuid()
+    updater = pathlib.Path(root_s) / "updater.py"
+    if not trusted_path_chain(root_s, euid):
+        return None
+    try:
+        st = os.lstat(updater)
+    except OSError:
+        return None
+    if (not stat.S_ISREG(st.st_mode) or st.st_uid != euid or st.st_nlink != 1
+            or st.st_mode & 0o022):
+        return None
+    limit = str(max(1, min(HOST_UPDATER_GATE_MAX_S, int(limit_s))))
+    return [
+        "systemd-run", "--user", "--quiet", "--collect", "--no-block",
+        f"--unit={host_updater_gate_unit(sha, token)[:-len('.service')]}",
+        "-p", "Type=oneshot",
+        "-p", f"TimeoutStartSec={limit}",
+        "-p", f"RuntimeMaxSec={limit}",
+        "-p", f"TimeoutStopSec={HOST_UPDATER_GATE_STOP_S}",
+        "-p", f"Environment=PATH={home_s}/.local/bin:/usr/local/bin:/usr/bin:/bin",
+        "-p", f"EnvironmentFile=-{home_s}/.config/agent-hub/host.env",
+        "--", HOST_UPDATER_GATE_PYTHON, str(updater), "--root", root_s, "--install-service",
+    ]
 
 
 class StageFailure(Exception):
@@ -608,6 +682,8 @@ class Canary:
         self.host_updater_triggered = False
         self.host_updater_trigger = "not_needed"
         self.host_updater_trigger_error = None
+        self.host_updater_unit = None
+        self.host_updater_env = None
         self.pyz_fd = None
         self.hub_pass_fds = ()
         self.lock_fd = None
@@ -1000,7 +1076,20 @@ class Canary:
             return
         updater_env = dict(os.environ)
         updater_env["XDG_RUNTIME_DIR"] = xdg_dir
-        rc, _, _ = self.run(list(HOST_UPDATER_TRIGGER_ARGV), deadline=deadline, env=updater_env)
+        argv = list(HOST_UPDATER_TRIGGER_ARGV)
+        if self.candidate_sha and self.run_token:
+            argv = host_updater_gate_argv(
+                self.host_release_root.absolute(), pathlib.Path.home(), self.candidate_sha, self.run_token,
+                limit_s=effective_deadline - time.monotonic(),
+            )
+            if argv is None:
+                self.host_updater_trigger = "failed"
+                self.host_updater_trigger_error = "host_updater_gate_paths_invalid"
+                return
+        rc, _, _ = self.run(argv, deadline=deadline, env=updater_env)
+        if self.candidate_sha and self.run_token:
+            self.host_updater_env = updater_env
+            self.host_updater_unit = host_updater_gate_unit(self.candidate_sha, self.run_token)
         if rc == 0:
             self.host_updater_trigger = "triggered"
             self.host_updater_trigger_error = None
@@ -1010,6 +1099,26 @@ class Canary:
         else:
             self.host_updater_trigger = "failed"
             self.host_updater_trigger_error = f"host_updater_trigger_exit_{rc}"
+
+    def host_updater_unit_inactive(self, deadline):
+        rc, out, _ = self.run(
+            ["systemctl", "--user", "is-active", self.host_updater_unit], deadline=deadline, env=self.host_updater_env
+        )
+        return rc != 124 and rc != 127 and out.strip() in ("inactive", "failed")
+
+    def stop_host_updater_unit(self, deadline):
+        """Stop ONLY the owned transient unit and prove it is inactive (bounded); True when proven."""
+        unit, env = self.host_updater_unit, self.host_updater_env
+        self.run(["systemctl", "--user", "stop", unit], deadline=deadline, env=env)
+        if self.host_updater_unit_inactive(deadline):
+            return True
+        self.run(["systemctl", "--user", "kill", "--kill-whom=all", "--signal=SIGKILL", unit],
+                 deadline=deadline, env=env)
+        while time.monotonic() < deadline:
+            if self.host_updater_unit_inactive(deadline):
+                return True
+            self.pause(deadline)
+        return False
 
     def verify_candidate_host_release(self):
         if not self.candidate_sha:
@@ -1870,6 +1979,16 @@ class Canary:
         finally:
             self.in_cleanup = True
             cleanup_deadline = time.monotonic() + self.cleanup_budget
+            if self.host_updater_unit and not result["ok"]:
+                # A failed gate must not leave its owned one-shot able to activate later.
+                try:
+                    proven = self.stop_host_updater_unit(cleanup_deadline)
+                except BaseException:
+                    proven = False
+                result["host_updater_unit_stop"] = "inactive" if proven else "unproven"
+                if not proven:
+                    result["cleanup"] = "FAILED_needs_reconciliation"
+                    result["reason"] = f"{result.get('reason')}:host_updater_unit_not_quiescent"
             if self.start_attempted and not self.stopped:
                 try:
                     result["cleanup"] = self.cleanup(deadline=cleanup_deadline)

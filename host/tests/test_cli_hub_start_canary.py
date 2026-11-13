@@ -178,19 +178,10 @@ sys.exit(2)
 SINK = '#!/usr/bin/env bash\n{ printf "ARGS\\t%s\\n" "$*"; cat; printf "\\n---END---\\n"; } >> "$MAIL_SINK"\n[[ "${MAIL_FAIL:-0}" != 1 ]]\n'
 
 FAKE_SYSTEMCTL = r'''#!%s
-import json, os, pathlib, shutil, sys, time
+import json, os, pathlib, shutil, signal, subprocess, sys, time
 d = pathlib.Path(os.environ["FAKE_DIR"])
-rec = {"argv": sys.argv[1:], "xdg_runtime_dir": os.environ.get("XDG_RUNTIME_DIR")}
-with open(d / "systemctl.jsonl", "a", encoding="utf-8") as fh:
-    fh.write(json.dumps(rec) + "\n")
-action = os.environ.get("FAKE_SYSTEMCTL_ACTION", "noop")
-if action == "fail_exit_1":
-    sys.stderr.write("Failed to start agent-hub2-host-update.service\n")
-    sys.exit(1)
-if action == "hang":
-    time.sleep(5)
-    sys.exit(0)
-if action == "converge_from_staged":
+
+def converge():
     staged = pathlib.Path(os.environ["FAKE_STAGED_RELEASE_DIR"])
     rel_root = pathlib.Path(os.environ["HUB_CANARY_HOST_RELEASE_ROOT"])
     sha = staged.name
@@ -202,6 +193,61 @@ if action == "converge_from_staged":
     if cur.exists() or cur.is_symlink():
         cur.unlink()
     cur.symlink_to(dst)
+
+if os.environ.get("FAKE_UNIT_CHILD") == "1":
+    # The detached transient unit: owned by the fake manager, outlives its systemd-run client.
+    (d / "unit.pid").write_text(str(os.getpid()))
+    time.sleep(float(os.environ["FAKE_UNIT_DELAY"]))
+    converge()
+    (d / "unit.pid").unlink()
+    sys.exit(0)
+rec = {"prog": os.path.basename(sys.argv[0]), "argv": sys.argv[1:], "xdg_runtime_dir": os.environ.get("XDG_RUNTIME_DIR")}
+with open(d / "systemctl.jsonl", "a", encoding="utf-8") as fh:
+    fh.write(json.dumps(rec) + "\n")
+action = os.environ.get("FAKE_SYSTEMCTL_ACTION", "noop")
+def unit_alive():
+    try:
+        pid = int((d / "unit.pid").read_text())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        return None
+
+def kill_unit():
+    pid = unit_alive()
+    if pid:
+        os.kill(pid, signal.SIGKILL)
+        time.sleep(0.05)
+        (d / "unit.pid").unlink(missing_ok=True)
+
+if rec["prog"] == "systemctl" and sys.argv[1:3] == ["--user", "stop"]:
+    if os.environ.get("FAKE_STOP_IGNORED") != "1":
+        kill_unit()
+    sys.exit(0)
+if rec["prog"] == "systemctl" and sys.argv[1:3] == ["--user", "kill"]:
+    if os.environ.get("FAKE_KILL_IGNORED") != "1":
+        kill_unit()
+    sys.exit(0)
+if rec["prog"] == "systemctl" and sys.argv[1:3] == ["--user", "is-active"]:
+    print("activating" if unit_alive() else "inactive")
+    sys.exit(0 if False else 3)
+if action == "fail_exit_1":
+    sys.stderr.write("Failed to start agent-hub2-host-update.service\n")
+    sys.exit(1)
+if action == "hang":
+    time.sleep(5)
+    sys.exit(0)
+if action == "converge_from_staged":
+    converge()
+if action == "detached_unit":
+    if "--no-block" not in sys.argv:
+        # Real oneshot semantics without --no-block: the client waits for the unit to finish.
+        time.sleep(float(os.environ["FAKE_UNIT_DELAY"]))
+        converge()
+    else:
+        env = dict(os.environ, FAKE_UNIT_CHILD="1")
+        subprocess.Popen([sys.executable, sys.argv[0]], env=env, start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 sys.exit(0)
 ''' % sys.executable
 
@@ -283,6 +329,9 @@ class CanaryTest(unittest.TestCase):
         fake_sctl = self.tmp / "bin" / "systemctl"
         fake_sctl.write_text(FAKE_SYSTEMCTL)
         fake_sctl.chmod(0o755)
+        fake_run = self.tmp / "bin" / "systemd-run"
+        fake_run.write_text(FAKE_SYSTEMCTL)
+        fake_run.chmod(0o755)
         self.xdg_runtime = self.tmp / "xdg-runtime"
         self.xdg_runtime.mkdir(mode=0o700)
         os.chmod(self.xdg_runtime, 0o700)
@@ -848,6 +897,8 @@ class CanaryTest(unittest.TestCase):
             "artifacts": {"hub.pyz": {"sha256": digest, "size": len(pyz_bytes)}},
         }
         (rel / "release.json").write_text(json.dumps(meta))
+        (root / "updater.py").write_text("# installed updater stand-in\n")
+        os.chmod(root / "updater.py", 0o700)
         current = root / "current"
         if current.exists() or current.is_symlink():
             current.unlink()
@@ -1693,6 +1744,8 @@ class CanaryTest(unittest.TestCase):
         # Start with empty host-releases root so candidate release is not yet installed.
         empty_root = self.tmp / "empty-host-releases"
         empty_root.mkdir()
+        (empty_root / "updater.py").write_text("# installed updater stand-in\n")
+        os.chmod(empty_root / "updater.py", 0o700)
         r_conv, v_conv = self.run_canary(
             "ok", "--deploy-gate", "--mode", "shell",
             "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
@@ -1710,10 +1763,25 @@ class CanaryTest(unittest.TestCase):
         self.assertNotIn("host_updater_trigger_error", v_conv)
         sctl = self.systemctl_calls()
         self.assertEqual(len(sctl), 1)
+        # Candidate-bound gate: one bounded transient oneshot running the installed
+        # updater's explicit --install-service; never the paced updater.service,
+        # never a manager-global environment mutation.
+        self.assertEqual(sctl[0]["prog"], "systemd-run")
+        argv = sctl[0]["argv"]
+        self.assertEqual(argv[:4], ["--user", "--quiet", "--collect", "--no-block"])
+        self.assertEqual(argv[4], f"--unit=agent-hub2-host-update-gate-{sha[:12]}-{token[:12]}")
+        self.assertIn("Type=oneshot", argv)
+        # Lifetime is capped by the remaining gate budget (converge timeout 1.5s), never the 300s default.
+        self.assertIn("TimeoutStartSec=1", argv)
+        self.assertIn("RuntimeMaxSec=1", argv)
         self.assertEqual(
-            sctl[0]["argv"],
-            ["--user", "start", "--no-block", "agent-hub2-host-update.service"],
+            argv[argv.index("--") + 1:],
+            ["/usr/bin/python3", str(empty_root / "updater.py"), "--root", str(empty_root), "--install-service"],
         )
+        joined = " ".join(argv)
+        for forbidden in ("set-environment", "import-environment", "restart", "ssh"):
+            self.assertNotIn(forbidden, joined)
+        self.assertFalse(any(c["prog"] == "systemctl" for c in sctl))
         self.assertEqual(sctl[0]["xdg_runtime_dir"], str(self.xdg_runtime))
 
         # Already converged on first check -> updater not triggered.
@@ -1742,7 +1810,13 @@ class CanaryTest(unittest.TestCase):
         )
         self.assertEqual(r_once.returncode, 1)
         self.assertEqual(v_once["host_updater_trigger"], "triggered")
-        self.assertEqual(len(self.systemctl_calls()), 1)
+        calls = self.systemctl_calls()
+        self.assertEqual([c["prog"] for c in calls], ["systemd-run", "systemctl", "systemctl"])
+        # The failed gate stops ONLY its own transient unit.
+        unit = f"agent-hub2-host-update-gate-{sha[:12]}-{token[:12]}.service"
+        self.assertEqual(calls[1]["argv"], ["--user", "stop", unit])
+        self.assertEqual(calls[2]["argv"], ["--user", "is-active", unit])
+        self.assertEqual(v_once["host_updater_unit_stop"], "inactive")
 
         # Reject symlink, non-private, or missing XDG_RUNTIME_DIR with typed trigger error and never call systemctl.
         sym_xdg = self.tmp / "sym-xdg"
@@ -1790,7 +1864,151 @@ class CanaryTest(unittest.TestCase):
         self.assertEqual(v_fail["host_updater_trigger"], "failed")
         self.assertEqual(v_fail["host_updater_trigger_error"], "host_updater_trigger_exit_1")
         self.assertIn("host_updater_trigger_exit_1", v_fail["reason"])
-        self.assertEqual(len(self.systemctl_calls()), 1)
+        self.assertEqual([c["prog"] for c in self.systemctl_calls()], ["systemd-run", "systemctl", "systemctl"])
+
+        # A missing installed updater is an explicit bounded failure; nothing is assumed to have run.
+        (unconv_root / "updater.py").unlink()
+        r_noup, v_noup = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_HOST_RELEASE_ROOT=str(unconv_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.3",
+        )
+        self.assertEqual(r_noup.returncode, 1)
+        self.assertEqual(v_noup["host_updater_trigger"], "failed")
+        self.assertEqual(v_noup["host_updater_trigger_error"], "host_updater_gate_paths_invalid")
+        self.assertEqual(self.systemctl_calls(), [])
+
+    def gate_module(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("hub_start_canary_under_test", ROOT / "scripts" / "hub_start_canary.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_gate_updater_path_validation_rejects_unsafe_layouts(self):
+        mod = self.gate_module()
+        sha, token = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7", "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        home = self.tmp / "gate-home"
+        home.mkdir()
+        root = self.tmp / "gate-root"
+        root.mkdir(mode=0o700)
+        updater = root / "updater.py"
+        updater.write_text("# stand-in\n")
+        os.chmod(updater, 0o700)
+        ok = mod.host_updater_gate_argv(root, home, sha, token)
+        self.assertEqual(ok[-5:], ["/usr/bin/python3", str(updater), "--root", str(root), "--install-service"])
+        # The service EnvironmentFile contract is preserved without reading or copying it.
+        self.assertIn(f"EnvironmentFile=-{home}/.config/agent-hub/host.env", ok)
+        os.chmod(updater, 0o720)
+        self.assertIsNone(mod.host_updater_gate_argv(root, home, sha, token))
+        os.chmod(updater, 0o602)
+        self.assertIsNone(mod.host_updater_gate_argv(root, home, sha, token))
+        os.chmod(updater, 0o700)
+        os.link(updater, root / "alias.py")
+        self.assertIsNone(mod.host_updater_gate_argv(root, home, sha, token))
+        (root / "alias.py").unlink()
+        os.chmod(root, 0o707)
+        self.assertIsNone(mod.host_updater_gate_argv(root, home, sha, token))
+        # Group-writable with the caller's own private group is a healthy umask-002 layout.
+        os.chmod(root, 0o770)
+        self.assertIsNotNone(mod.host_updater_gate_argv(root, home, sha, token))
+        other = [g for g in os.getgroups() if g != os.getegid()]
+        if other:
+            os.chown(root, -1, other[0])
+            self.assertIsNone(mod.host_updater_gate_argv(root, home, sha, token))
+            os.chown(root, -1, os.getegid())
+        os.chmod(root, 0o700)
+        link = self.tmp / "gate-root-link"
+        link.symlink_to(root)
+        self.assertIsNone(mod.host_updater_gate_argv(link, home, sha, token))
+        (root / "updater.py").unlink()
+        (root / "updater.py").symlink_to(self.tmp / "elsewhere.py")
+        self.assertIsNone(mod.host_updater_gate_argv(root, home, sha, token))
+        self.assertIsNone(mod.host_updater_gate_argv(root, home, "bad", token))
+        self.assertIsNone(mod.host_updater_gate_argv(root, self.tmp / "ho me", sha, token))
+        self.assertIsNone(mod.host_updater_gate_argv(root, home, sha, "short"))
+        # The lifetime is always bounded.
+        os.unlink(root / "updater.py")
+        updater.write_text("# stand-in\n")
+        os.chmod(updater, 0o700)
+        argv = mod.host_updater_gate_argv(root, home, sha, token, limit_s=9999)
+        self.assertIn("RuntimeMaxSec=300", argv)
+        self.assertIn("RuntimeMaxSec=1", mod.host_updater_gate_argv(root, home, sha, token, limit_s=0.2))
+
+    def run_detached_gate(self, delay, converge_timeout, cmd_timeout, **extra):
+        sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
+        token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        helper_sha = self.helper_sha256()
+        staged_root, pyz_sha = self.prepare_candidate_release(sha, converge=True)
+        staged_rel = self.tmp / "staged-release" / sha
+        shutil.copytree(staged_root / "releases" / sha, staged_rel, dirs_exist_ok=True)
+        root = pathlib.Path(tempfile.mkdtemp(prefix="detached-host-releases.", dir=self.tmp))
+        os.chmod(root, 0o700)
+        (root / "updater.py").write_text("# stand-in\n")
+        os.chmod(root / "updater.py", 0o700)
+        r, v = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_HOST_RELEASE_ROOT=str(root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S=str(converge_timeout),
+            HUB_CANARY_CMD_TIMEOUT_S=str(cmd_timeout),
+            FAKE_HOST_VERSION=sha,
+            FAKE_SYSTEMCTL_ACTION="detached_unit",
+            FAKE_UNIT_DELAY=str(delay),
+            FAKE_STAGED_RELEASE_DIR=str(staged_rel),
+            **extra,
+        )
+        return r, v, root
+
+    def test_gate_trigger_is_nonblocking_and_slow_healthy_updater_succeeds(self):
+        # The unit takes longer than the per-command cap; a blocking client would falsely time out.
+        r, v, root = self.run_detached_gate(delay=1.0, converge_timeout=6, cmd_timeout=0.4)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(v["ok"])
+        self.assertEqual(v["host_updater_trigger"], "triggered")
+        self.assertTrue((root / "releases" / v["candidate_sha"]).is_dir())
+        self.assertEqual([c["prog"] for c in self.systemctl_calls()], ["systemd-run"])
+
+    def test_failed_gate_stops_only_owned_unit_and_no_late_activation(self):
+        r, v, root = self.run_detached_gate(delay=4.0, converge_timeout=0.6, cmd_timeout=10)
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(v["stage"], "host_release")
+        calls = self.systemctl_calls()
+        unit = f"agent-hub2-host-update-gate-{v['candidate_sha'][:12]}-{v['run_token'][:12]}.service"
+        self.assertEqual(calls[0]["prog"], "systemd-run")
+        # Blocking stop, then an inactive proof; only the owned unit is ever addressed.
+        self.assertEqual([c["argv"] for c in calls[1:]], [["--user", "stop", unit], ["--user", "is-active", unit]])
+        self.assertEqual(v["host_updater_unit_stop"], "inactive")
+        self.assertFalse((self.tmp / "unit.pid").exists())
+        # The detached unit was killed, so it never activates after the gate has failed.
+        time.sleep(4.5)
+        self.assertFalse((root / "releases" / v["candidate_sha"]).exists())
+        self.assertFalse((self.tmp / "unit.pid").exists())
+
+    def test_failed_gate_escalates_to_kill_and_reports_unproven_quiescence(self):
+        r, v, root = self.run_detached_gate(delay=30, converge_timeout=0.6, cmd_timeout=10, FAKE_STOP_IGNORED="1")
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(v["host_updater_unit_stop"], "inactive")
+        argvs = [c["argv"][:2] for c in self.systemctl_calls()]
+        self.assertIn(["--user", "kill"], argvs)
+        self.assertFalse((self.tmp / "unit.pid").exists())
+        r, v, root = self.run_detached_gate(
+            delay=30, converge_timeout=0.6, cmd_timeout=10, FAKE_STOP_IGNORED="1", FAKE_KILL_IGNORED="1",
+            HUB_CANARY_CLEANUP_BUDGET_S="0.5",
+        )
+        try:
+            self.assertEqual(r.returncode, 1)
+            self.assertEqual(v["host_updater_unit_stop"], "unproven")
+            self.assertEqual(v["cleanup"], "FAILED_needs_reconciliation")
+            self.assertTrue(v["reason"].endswith(":host_updater_unit_not_quiescent"))
+        finally:
+            try:
+                os.kill(int((self.tmp / "unit.pid").read_text()), 9)
+            except (OSError, ValueError):
+                pass
 
     def test_periodic_mode_serializes_pending_state_archives_intake_and_ignores_lock_busy_for_alerts(self):
         import fcntl

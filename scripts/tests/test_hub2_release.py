@@ -231,20 +231,27 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
             self.install(scheduled=True)
         self.assertEqual(self.downloads, ['host-release.json'])
 
-    def test_main_marks_scheduled_only_when_triggered_by_timer(self):
+    def test_main_paces_by_default_regardless_of_trigger_unit_metadata(self):
         seen = []
         def fake_install(base_url, root, *, install_service=False, restart=True, scheduled=False):
             seen.append((install_service, restart, scheduled))
+        def run(argv, trigger):
+            env = {} if trigger is None else {'TRIGGER_UNIT': trigger}
+            with patch.object(sys, 'argv', ['hub2-self-update.py', *argv]), \
+                 patch.dict(os.environ, env, clear=False):
+                if trigger is None:
+                    os.environ.pop('TRIGGER_UNIT', None)
+                self.assertEqual(updater.main(), 0)
         with patch.object(updater, 'install', fake_install), \
              patch.object(Path, 'home', return_value=Path(self.temporary.name)):
-            with patch.object(sys, 'argv', ['hub2-self-update.py']), \
-                 patch.dict(os.environ, {'TRIGGER_UNIT': 'agent-hub2-host-update.timer'}, clear=False):
-                self.assertEqual(updater.main(), 0)
-            with patch.object(sys, 'argv', ['hub2-self-update.py']), \
-                 patch.dict(os.environ, {}, clear=False):
-                os.environ.pop('TRIGGER_UNIT', None)
-                self.assertEqual(updater.main(), 0)
-        self.assertEqual(seen, [(False, True, True), (False, True, False)])
+            for trigger in ('agent-hub2-host-update.timer', None, '', 'agent-hub2-host-update.service', 'spoofed.path'):
+                run([], trigger)
+            # Explicit operator enrollment/recovery and staging stay exempt.
+            run(['--install-service'], None)
+            run(['--install-service'], 'agent-hub2-host-update.timer')
+            run(['--no-restart'], 'agent-hub2-host-update.timer')
+        self.assertEqual(seen, [(False, True, True)] * 5 + [
+            (True, True, False), (True, True, False), (False, False, False)])
 
     def test_valid_update_is_offline_and_keeps_previous(self):
         old = self.old_release()

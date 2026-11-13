@@ -1300,11 +1300,12 @@ def main():
             return 0
         config = Path.home() / '.config/agent-hub/v2.json'
         base = args.base_url or (json.loads(config.read_text()).get('server') if config.exists() else None)
-        scheduled = (
-            not args.install_service
-            and not args.no_restart
-            and os.environ.get('TRIGGER_UNIT', '').endswith('.timer')
-        )
+        # TRIGGER_UNIT is lossy best-effort systemd metadata: it may be missing,
+        # empty or spoofed, so it never authorizes immediate activation. Pacing
+        # is the default; only explicit --install-service (operator enrollment,
+        # recovery or the candidate-bound deploy gate) and --no-restart staging
+        # are exempt.
+        scheduled = not args.install_service and not args.no_restart
         install(base or 'https://hub.dtcdev.click', args.root.resolve(),
                 install_service=args.install_service, restart=not args.no_restart,
                 scheduled=scheduled)
