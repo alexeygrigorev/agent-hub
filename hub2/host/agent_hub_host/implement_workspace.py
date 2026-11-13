@@ -219,12 +219,19 @@ def _fsync_dir(path, *, nofollow):
         os.close(fd)
 
 
+def _record_durability_open_flags(*, windows):
+    """Return non-creating flags suitable for flushing an existing record."""
+    access = os.O_RDWR if windows else os.O_RDONLY
+    return access | getattr(os, 'O_NOFOLLOW', 0)
+
+
 def _make_record_durable(common, digest):
-    """Flush the record and every directory entry leading to it.
+    """Flush the record and, on POSIX, every directory entry leading to it.
 
     Called before any successful return that relies on the record, including
-    retries that find an already existing record, so a power loss can never
-    drop the only ownership proof after a reported success.
+    retries that find an already existing record. POSIX directory fsyncs make
+    the record's path updates durable; Windows only flushes the record because
+    directory fsync is unavailable there and does not get the same barrier.
     """
     owners_dir = common / _OWNERS_DIR
     record_path = owners_dir / f'{digest}.json'
@@ -232,7 +239,8 @@ def _make_record_durable(common, digest):
             or not _validate_private_stat(record_path, expect_dir=False)):
         raise ValueError('implement_worktree_owner_invalid')
     try:
-        fd = os.open(record_path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+        flags = _record_durability_open_flags(windows=os.name == 'nt')
+        fd = os.open(record_path, flags)
     except OSError:
         raise ValueError('implement_worktree_owner_invalid') from None
     try:
