@@ -200,10 +200,20 @@ class Host:
         self.log_path = root / "host.log"
         self.process = None
         self.source = REPO / "hub2/host"
+        # Codex starts require the maintained quota wrapper (canonical body). The
+        # e2e wrapper runs a no-op gate and then the stub `codex` only.
+        wrapper_dir = root / "codex-wrapper"
+        wrapper_dir.mkdir(mode=0o700)
+        (wrapper_dir / "quota-gate.py").write_text("raise SystemExit(0)\n")
+        self.codex_wrapper = wrapper_dir / "launch-codex.sh"
+        self.codex_wrapper.write_text("#!/usr/bin/env bash\nset -euo pipefail\npython3 %s\nexec %s \"$@\"\n" % (
+            wrapper_dir / "quota-gate.py", STUB_BIN / "codex"))
+        self.codex_wrapper.chmod(0o700)
 
     def env(self):
         env = dict(os.environ, PATH=str(STUB_BIN) + os.pathsep + os.environ.get("PATH", ""),
-                   PYTHONPATH=os.pathsep.join(filter(None, [str(self.source), os.environ.get("PYTHONPATH")])), APLEXER_STATE_DIR=str(self.state), PYTHONUNBUFFERED="1")
+                   PYTHONPATH=os.pathsep.join(filter(None, [str(self.source), os.environ.get("PYTHONPATH")])), APLEXER_STATE_DIR=str(self.state), PYTHONUNBUFFERED="1",
+                   CODEX_LAUNCH_WRAPPER=str(self.codex_wrapper))
         for name in ("HUB_TOKEN", "HUB_CONFIG_FILE", "HUB2_TOKEN", "HUB_URL"):
             env.pop(name, None)
         return env
