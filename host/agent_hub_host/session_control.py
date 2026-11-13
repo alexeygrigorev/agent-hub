@@ -51,7 +51,7 @@ HOST_START_DETAIL_LIMIT = 240
 _UNSAFE_DETAIL_CONTROL = re.compile(r'[\x00-\x1f\x7f-\x9f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]')
 _CREDENTIAL_ASSIGNMENT = re.compile(
     r'\b(?:[A-Za-z0-9_-]*(?:authorization|proxy-authorization|www-authenticate|cookie|token|api[_-]?key|'
-    r'password|passwd|secret|credential)[A-Za-z0-9_-]*)\b\s*[:=]', re.IGNORECASE)
+    r'password|passwd|secret|credential)[A-Za-z0-9_-]*)\b["\'`]?\s*[:=]', re.IGNORECASE)
 _INLINE_CREDENTIAL = re.compile(r'\b(?:Bearer|Basic)\s+\S', re.IGNORECASE)
 _URL_CREDENTIAL = re.compile(r'https?://[^\s/@:]+:[^\s/@]+@', re.IGNORECASE)
 _TOKEN_CREDENTIAL = re.compile(r'\b(?:gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[A-Z0-9]{16})\b')

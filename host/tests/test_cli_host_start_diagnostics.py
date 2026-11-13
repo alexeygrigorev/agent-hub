@@ -153,6 +153,10 @@ class TestCliHostStartDiagnostics(unittest.TestCase):
         unsafe_details = (
             'Authorization: Bearer\x00 synthetic-private-token',
             'AWS_SECRET_ACCESS_KEY: synthetic-private-token',
+            '"AWS_SECRET_ACCESS_KEY": "synthetic-private-token"',
+            '"access_token": "synthetic-private-token"',
+            "'access_token': 'synthetic-private-token'",
+            '`access_token`: `synthetic-private-token`',
         )
         for unsafe_detail in unsafe_details:
             with self.subTest(detail_kind='authorization' if 'Authorization' in unsafe_detail else 'secret-assignment'):
