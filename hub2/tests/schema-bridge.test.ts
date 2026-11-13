@@ -29,12 +29,12 @@ test('control bridge defers shared-memory migration, then rollback preserves pos
  const preserved=(bridge.database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all() as any[]).map(row=>row.name);
  const applied=fixture('control','apply',bridge);
  const rule={id:'after-migration',key:'rule-bridge-1',expected_version:0,text:'Preserve this operator rule',source:{type:'user',reference:'synthetic'},decision:'Apply'};
- assert.equal((await applied.call('/api/intake/rules','POST',rule)).status,200);assert.equal(version(applied),6);
+ assert.equal((await applied.call('/api/intake/rules','POST',rule)).status,200);assert.equal(version(applied),7);
  const ingest={source:'cli',agents:[{agent_id:'bridge-writer',messages:[{msg_id:'t1u',role:'user',text:'Preserve this ask after rollback'}]}]};
  assert.equal((await applied.call('/api/asks/ingest','POST',ingest)).status,200);
  const before=applied.database.prepare('SELECT * FROM memory_messages').all();
  const rollback=fixture('control','defer',applied);
- assert.equal((await rollback.call('/api/intake/rules')).status,200);assert.equal(version(rollback),6);
+ assert.equal((await rollback.call('/api/intake/rules')).status,200);assert.equal(version(rollback),7);
  assert.equal((await data(await rollback.call('/api/intake/rules'))).operator_rules[0].text,undefined);
  assert.equal((await data(await rollback.call('/api/asks'))).asks[0].text,'Preserve this ask after rollback');
  assert.deepEqual(rollback.database.prepare('SELECT * FROM memory_messages').all(),before);
@@ -73,7 +73,7 @@ test('first bridge keeps legacy capture contract; upgraded bridge preserves scre
  await bridge.ctx.storage.setAlarm(due);
  const outboxes=bridge.database.prepare('SELECT * FROM machine_outbox').all();
  const applied=fixture('machine','apply',bridge);
- assert.equal((await applied.call('/api/sessions/bridge-session/commands')).status,200);assert.equal(version(applied),9);
+ assert.equal((await applied.call('/api/sessions/bridge-session/commands')).status,200);assert.equal(version(applied),10);
  const row=applied.database.prepare('SELECT * FROM session_commands WHERE id=?').get(command.id) as any;
  assert.equal(row.capture_mode,null);assert.equal(row.text,null);assert.equal(row.request_digest,old.request_digest);
  const replay=await applied.call('/api/sessions/bridge-session/capture','POST',{key:'capture-before-upgrade'});
@@ -83,7 +83,7 @@ test('first bridge keeps legacy capture contract; upgraded bridge preserves scre
  const rollback=fixture('machine','defer',applied);
  const listed=await rollback.call('/api/sessions/bridge-session/commands');assert.equal(listed.status,200);assert.equal((await data(listed)).commands.length,2);
  assert.equal(await rollback.ctx.storage.getAlarm(),due);
- assert.equal(version(rollback),9);assert.deepEqual(rollback.database.prepare('SELECT * FROM machine_outbox').all(),outboxes);
+ assert.equal(version(rollback),10);assert.deepEqual(rollback.database.prepare('SELECT * FROM machine_outbox').all(),outboxes);
  const commands=rollback.database.prepare('SELECT * FROM session_commands').all();
  const again=fixture('machine','apply',rollback);assert.equal((await again.call('/api/sessions/bridge-session')).status,200);
  assert.deepEqual(again.database.prepare('SELECT * FROM session_commands').all(),commands);
@@ -108,7 +108,7 @@ test('legacy capture ACK remains unchanged across deferred, applied and rollback
  const rollback=fixture('machine','defer',applied);
  assert.equal((await rollback.call(ackPath,'POST',ack,machine)).status,200);
  assert.equal((await rollback.call(path+'/'+fresh.command.id+'/ack','POST',ack,machine)).status,200,'upgraded bound running capture accepts an old host without an echo');
- assert.equal(version(rollback),9);
+ assert.equal(version(rollback),10);
  const after=rollback.database.prepare('SELECT * FROM session_commands WHERE id=?').get(queued.command.id) as any;
  assert.equal(after.request_digest,before.request_digest);assert.equal(after.result_json,before.result_json);
 });
@@ -126,7 +126,7 @@ test('a bound stop survives the schema-six to schema-seven bridge with its dispa
  const applied=fixture('machine','apply',bridge);
  const receipt=await applied.call(path+'/'+command.id+'/ack','POST',{epoch,result:{stopped:true}},machine);
  assert.equal(receipt.status,200);
- assert.equal(version(applied),9);
+ assert.equal(version(applied),10);
  const after=await data(await applied.call(path));
  assert.equal(after.commands[0].ack.confirmed_exit,true);
  assert.equal(after.commands[0].ack.native_id,'11111111-1111-4111-8111-111111111111');

@@ -823,7 +823,7 @@ test('latest schema preserves pending version-six commands and adds capture mode
  assert.equal(listed.status,200);assert.equal((await listed.json() as any).commands[0].id,created.command_id);
  const row=f.database.prepare('SELECT * FROM session_commands WHERE id=?').get(created.command_id) as any;
  assert.equal(row.capture_mode,null);assert.equal(row.state,'pending');
- assert.equal((f.database.prepare('SELECT version FROM hub2_schema').get() as any).version,9);
+ assert.equal((f.database.prepare('SELECT version FROM hub2_schema').get() as any).version,10);
 });
 
 

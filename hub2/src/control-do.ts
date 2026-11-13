@@ -755,7 +755,7 @@ export class ControlDO {
       for (const eng of engines) {
         const jobId = crypto.randomUUID();
         jobs.push({ job_id: jobId, machine_id: machineId, engine: eng.engine });
-        await this.env.MACHINES.get(this.env.MACHINES.idFromName(machineId)).fetch(
+        const dispatchRes = await this.env.MACHINES.get(this.env.MACHINES.idFromName(machineId)).fetch(
           new Request('https://machine.internal/_internal/engine-update', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -768,6 +768,7 @@ export class ControlDO {
             }),
           }),
         );
+        if (!dispatchRes.ok) return error('machine_dispatch_failed', dispatchRes.status >= 400 ? dispatchRes.status : 502);
       }
     }
     this.db.run(
@@ -803,14 +804,18 @@ export class ControlDO {
         };
       }
       const row = await response.json() as any;
+      const oldV = row.old_version ?? null;
+      const newV = row.new_version ?? null;
+      const status = row.state === 'completed' ? (oldV !== newV ? 'updated' : 'unchanged') : (row.state === 'failed' ? 'failed' : row.state);
       return {
         job_id: job.job_id,
         machine_id: job.machine_id,
         engine: row.engine ?? job.engine,
         state: row.state,
+        status,
         ok: row.state === 'completed',
-        old_version: row.old_version ?? null,
-        new_version: row.new_version ?? null,
+        old_version: oldV,
+        new_version: newV,
         exit_code: row.exit_code ?? null,
         error: row.error ?? null,
         output: row.output ?? null,
