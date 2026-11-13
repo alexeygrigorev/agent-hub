@@ -758,7 +758,7 @@ def _fresh_git_timeout(clock, deadline, what, cap=30):
     remaining = deadline - clock()
     if remaining <= 0:
         raise TimeoutError('proof deadline exhausted before %s' % what)
-    return max(0.01, min(cap, remaining))
+    return min(cap, remaining)
 
 
 def observe_git_state(r, workspace, clock, deadline):
@@ -794,16 +794,23 @@ def verify_work_artifact(r, actual_workspace, run_id, sample, parent_intake_id, 
     probe_sha = None
     if require_probe:
         prel = probe_rel_path(run_id, sample)
+        _fresh_git_timeout(clock, deadline, 'probe path validation')
         validate_no_symlink_ancestors(actual_workspace, prel)
+        _fresh_git_timeout(clock, deadline, 'probe read')
         probe_bytes = bounded_file(Path(actual_workspace) / prel, ARTIFACT_LIMIT)
+        _fresh_git_timeout(clock, deadline, 'probe read completion')
         if not probe_bytes.strip():
             raise ValueError('per-sample probe script is empty')
         probe_sha = hashlib.sha256(probe_bytes).hexdigest()
     rel = work_rel_path(run_id, sample)
+    _fresh_git_timeout(clock, deadline, 'result path validation')
     validate_no_symlink_ancestors(actual_workspace, rel)
     result_path = Path(actual_workspace) / rel
+    _fresh_git_timeout(clock, deadline, 'result read')
     raw_bytes = bounded_file(result_path, ARTIFACT_LIMIT)
+    _fresh_git_timeout(clock, deadline, 'result metadata read')
     mtime_ns = os.lstat(result_path).st_mtime_ns
+    _fresh_git_timeout(clock, deadline, 'result metadata completion')
     parsed = json.loads(raw_bytes.decode('utf-8'), object_pairs_hook=unique_object)
     if not isinstance(parsed, dict) or set(parsed) != set(RESULT_KEYS):
         raise ValueError('result.json keys do not match exact V2 schema')
@@ -1441,6 +1448,23 @@ IDENTITY_KEYS = ('session_id', 'operation_id', 'attempt_operation_id', 'attempt'
 BINDING_KEYS = ('session_id', 'operation_id', 'attempt_operation_id', 'attempt', 'epoch', 'machine_id')
 
 
+def _previous_attempt_matches(owned, created, session_id):
+    """A start response may precede a recorded fallback by exactly one attempt.
+
+    Only the attempt index and its derived ID may differ; every other binding
+    remains immutable and missing metadata is still UNKNOWN.
+    """
+    if (not isinstance(owned, dict) or not isinstance(created, dict)
+            or owned.get('session_id') != session_id
+            or type(owned.get('attempt')) is not int or owned['attempt'] <= 0):
+        return False
+    previous = dict(owned)
+    previous['attempt'] -= 1
+    previous['attempt_operation_id'] = '%s:%d' % (owned.get('operation_id'), previous['attempt'])
+    return _identity_problem({k: previous.get(k) for k in BINDING_KEYS}, created,
+                             'previous-attempt start response') is None
+
+
 class IdentityError(ValueError):
     """Malformed or self-contradictory endpoint identity (never treated as equality)."""
 
@@ -1898,12 +1922,7 @@ def one_start(r, rec, run_id, parent_intake_id, workspace, output_dir, manifest,
         except IdentityError:
             created_ident = None
         own = rec['owned_identity']
-        fallback_relation = (
-            created_ident is not None and own.get('operation_id') is not None
-            and created_ident['session_id'] == own['session_id'] == sid
-            and created_ident['operation_id'] == own['operation_id']
-            and type(own.get('attempt')) is int and created_ident['attempt'] == own['attempt'] - 1
-            and created_ident['attempt_operation_id'] == '%s:%d' % (own['operation_id'], own['attempt'] - 1))
+        fallback_relation = _previous_attempt_matches(own, created_ident, sid)
         if not fallback_relation:
             err.append(created_bind)
     if row.get('state') != 'running':
