@@ -967,6 +967,12 @@ class TestSessionControlCli(unittest.TestCase):
         self.assertIsNone(session_control.sanitize_start_detail('config={"api_key":"private-test-secret"}'))
         self.assertIsNone(session_control.sanitize_start_detail('Authorization: Bearer' + chr(0) + ' synthetic-private-token'))
         self.assertIsNone(session_control.sanitize_start_detail('AWS_SECRET_ACCESS_KEY: synthetic-private-token'))
+        for detail in ('"AWS_SECRET_ACCESS_KEY": "synthetic-private-token"',
+                       '"access_token": "synthetic-private-token"',
+                       "'access_token': 'synthetic-private-token'",
+                       '`access_token`: `synthetic-private-token`'):
+            with self.subTest(detail=detail):
+                self.assertIsNone(session_control.sanitize_start_detail(detail))
         self.assertIsNone(session_control.sanitize_start_detail('Workspace unavailable.' + chr(27) + '[31m Retry'))
         safe = session_control.sanitize_start_detail('Workspace unavailable. Retry the enrolled workspace.')
         self.assertIn('Workspace unavailable.', safe)

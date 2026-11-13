@@ -84,6 +84,10 @@ test('host.error refusal persists a sanitized attempt-bound diagnostic in the fa
 for(const [label,detail] of [
  ['authorization header split by NUL','Authorization: Bearer\u0000 synthetic-private-token'],
  ['secret assignment with colon','AWS_SECRET_ACCESS_KEY: synthetic-private-token'],
+ ['double quoted secret key','"AWS_SECRET_ACCESS_KEY": "synthetic-private-token"'],
+ ['double quoted access token','"access_token": "synthetic-private-token"'],
+ ['single quoted access token',"'access_token': 'synthetic-private-token'"],
+ ['backtick quoted access token','`access_token`: `synthetic-private-token`'],
 ] as const){
  test(`host.error rejects ${label} detail from storage and session projection`,async()=>{
   const f=fixture(),sessionId='host-diagnostic-unsafe-'+label.replace(/[^a-z]+/gi,'-'),epoch=await startOffered(f,sessionId),socket=hostSocket(f);
