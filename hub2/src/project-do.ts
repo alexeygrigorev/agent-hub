@@ -17,7 +17,7 @@ import { HOST_INVENTORY_LOST_MS } from './session-liveness';
 import { PROJECT_WORK_SCHEMA, ProjectWork, type ProjectWorkHooks } from './project-work';
 import {
   BLOCKED_WAIT_MS, COMPLETION_ACTOR, VERIFICATION_ACTOR, DEVELOPER_ALERT_RECIPIENT, HARD_BLOCKERS, MAX_AUTO_CONTINUATIONS, MAX_CONTINUATION_TRIES, MAX_DELIVERY_TRIES, MAX_VERIFICATION_ATTEMPTS, MAX_VERIFICATION_START_TRIES,
-  LAUNCH_SPEC_LIMIT, basePrompt, completionClaim, continuationBudget, continuationPrompt, deliveryBody, exitCause, promptWithContract, retryDelay, stripCompletion, taskBlocker, verificationPrompt, verificationVerdict,
+  LAUNCH_SPEC_LIMIT, basePrompt, completionClaim, continuationBudget, continuationPrompt, deliveryBody, exitCause, promptWithContract, retryDelay, stripCompletion, taskBlocker, unwrapEvidence, verificationPrompt, verificationVerdict, verifierNoVerdictCause,
   type CompletionClaim, type CompletionRecord, type ContinuationSnapshot, type TaskBlocker, type VerificationAction, type VerificationVerdict,
 } from './task-completion';
 import type { Actor, Hub2Env, JsonRecord } from './types';
@@ -31,7 +31,7 @@ const COMPLETION_DUE = `CASE
     THEN json_extract(i.final_evidence_json,'$.completion.continuation.next_action_at')
   WHEN json_extract(i.final_evidence_json,'$.completion.delivery.state')='pending'
     THEN json_extract(i.final_evidence_json,'$.completion.delivery.next_action_at') END`;
-const COMPLETION_ELIGIBLE = `i.status IN ('open','failed','completed-awaiting-review')
+const COMPLETION_ELIGIBLE = `i.status IN ('open','failed','completed-awaiting-review','accepted')
   AND json_extract(i.final_evidence_json,'$.completion.controlled')=1
   AND json_extract(i.final_evidence_json,'$.completion.session_id')=i.session_id
   AND EXISTS(SELECT 1 FROM dispatch_sagas s WHERE s.session_id=i.session_id AND s.intake_id=i.id
@@ -169,7 +169,7 @@ export class ProjectDO {
         ?? error('method_not_allowed', 405, `${request.method} is not supported on /${relation[2]}`);
       const prerequisites = url.pathname.match(/^\/_internal\/prerequisites\/([^/]+)$/);
       if (prerequisites && request.method === 'GET') return this.relations.internalPrerequisites(decodeURIComponent(prerequisites[1]));
-      const match = url.pathname.match(/^\/api\/intakes\/([^/]+)(?:\/(start|history|append|events|context|audit|discard|finished|merge-evidence))?$/);
+      const match = url.pathname.match(/^\/api\/intakes\/([^/]+)(?:\/(start|history|append|events|context|audit|discard|finished|merge-evidence|merge-state|reevaluate))?$/);
       if (!match) return error('not_found', 404);
       const intakeId = decodeURIComponent(match[1]);
       if (match[2] === 'start' && request.method === 'POST') return await this.startIntake(request, intakeId);
@@ -178,6 +178,8 @@ export class ProjectDO {
       if(match[2]==='append'&&request.method==='POST')return await this.appendIntake(request,intakeId);
       if(match[2]==='finished'&&request.method==='POST')return await this.sessionFinished(request,intakeId);
       if(match[2]==='merge-evidence'&&request.method==='POST')return await this.mergeEvidence(request,intakeId);
+      if(match[2]==='merge-state'&&request.method==='GET')return this.mergeState(request,intakeId);
+      if(match[2]==='reevaluate'&&request.method==='POST')return await this.reevaluate(request,intakeId);
       if(match[2]==='events'&&request.method==='POST')return await this.eventsCompat(request,intakeId);
       if(match[2]==='context'&&request.method==='GET')return this.contextView(request,intakeId);
       if(match[2]==='audit'&&request.method==='GET')return this.history(request,intakeId);
@@ -370,6 +372,8 @@ export class ProjectDO {
   private async appendIntake(request:Request,intakeId:string):Promise<Response>{
     const actor=actorFrom(request),body=await bodyObject(request,16384),key=this.idempotencyKey(request,body);
     if(!key||Object.keys(body).some(k=>!['key','note','evidence'].includes(k)))return error('invalid_append',400);
+    // A record the CLI wrapped twice ({evidence:{evidence:{kind}}}) is stored as written by its author.
+    if(body.evidence!==undefined)body.evidence=unwrapEvidence(body.evidence);
     if(body.note!==undefined&&(typeof body.note!=='string'||!body.note.trim()||body.note.length>4000)||body.evidence!==undefined&&(!body.evidence||typeof body.evidence!=='object'||Array.isArray(body.evidence)||!Object.keys(body.evidence).length)||body.note===undefined&&body.evidence===undefined)return error('invalid_append',400);
     const digest=await sha256Hex(JSON.stringify([body.note??null,body.evidence??null])),eventKey='append:'+intakeId+':'+key;
     return this.transaction(()=>{
@@ -431,6 +435,65 @@ export class ProjectDO {
     if(problem)return error('invalid_merge_evidence',400,problem);
     const actor=actorFrom(request);
     return await this.appendIntake(new Request(request.url,{method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(actor)},body:JSON.stringify({key,evidence:body.evidence})}),intakeId);
+  }
+
+  /** `hub intake merge-state`: the programmatic merge gate of one intake, as
+   * Hub evaluates it on acceptance. Readable by intake readers (operators and
+   * the intake's own worker credential). */
+  private mergeState(request:Request,intakeId:string):Response{
+    const actor=actorFrom(request);
+    const intake=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',intakeId);
+    if(!intake)return error('intake_not_found',404);
+    if(!this.canReadIntake(actor,intake))return error('forbidden',403);
+    const gate=this.intakeMergeGate(intake);
+    const completion=(this.parse(intake.final_evidence_json??'{}') as JsonRecord|null)?.completion as CompletionRecord|undefined;
+    return json({intake_id:intake.id,project:intake.project,status:intake.status,code_task:gate.required,
+      merge_gate:{required:gate.required,ok:gate.ok,problems:gate.problems,evidence:gate.evidence??null},
+      verification:completion?.verification?{state:completion.verification.state,attempts:completion.verification.attempts,
+        ...(completion.verification.gaps?{gaps:completion.verification.gaps}:{}),...(completion.verification.last_reason?{last_reason:completion.verification.last_reason}:{})}:null,
+      next_step:!gate.required?'Not a code intake: no merge evidence is required.'
+        :gate.ok?'Merge gate satisfied.':`Merge the PR to main with green checks for its exact head, then run hub intake merge-check ${intake.id} --pr <PR URL>.`});
+  }
+
+  /** Operator: re-run Hub's gate on an intake that ended failed (or is waiting
+   * for review): an independent verifier checks every criterion and the merge
+   * gate; a pass accepts the intake, a fail sends it back with named gaps. */
+  private async reevaluate(request:Request,intakeId:string):Promise<Response>{
+    const actor=actorFrom(request),body=await bodyObject(request,4096),key=this.idempotencyKey(request,body);
+    if(!key||Object.keys(body).some(k=>!['key','reason'].includes(k)))return error('invalid_reevaluation',400);
+    if(body.reason!==undefined&&(typeof body.reason!=='string'||body.reason.length>500))return error('invalid_reevaluation',400);
+    if(!hasScope(actor,'operator:admin'))return error('forbidden',403);
+    const eventKey='reevaluate:'+intakeId+':'+key,round='re'+(await sha256Hex(eventKey)).slice(0,12);
+    const result=this.transaction(()=>{
+      const intake=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',intakeId);
+      if(!intake)return error('intake_not_found',404);
+      const previous=this.db.one<{body_json:string}>('SELECT body_json FROM intake_events WHERE event_key=?',eventKey);
+      if(previous)return json({reevaluation:'requested',duplicate:true,intake_id:intake.id,...(this.parse(previous.body_json) as JsonRecord)});
+      if(!['failed','completed-awaiting-review'].includes(intake.status))return error('reevaluation_not_applicable',409,`intake is ${intake.status}; only failed or completed-awaiting-review intakes are re-evaluated`);
+      const saga=intake.session_id?this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id=? AND intake_id=?',intake.session_id,intake.id):undefined;
+      if(!saga||saga.state!=='complete')return error('reevaluation_session_active',409,'the intake has no finished session to re-evaluate');
+      const criteria=this.parse(intake.acceptance_criteria_json);
+      if(!Array.isArray(criteria)||!criteria.length)return error('acceptance_criteria_required',409);
+      const launch=(this.parse(saga.launch_spec_json) as JsonRecord|null)??{};
+      if(String(launch.engine??'').toLowerCase()==='shell')return error('reevaluation_not_applicable',409,'shell sessions carry no completion contract');
+      const route=(this.parse(saga.routing_json) as JsonRecord|null)??{};
+      if(route.completion_contract!==true)
+        this.db.run('UPDATE dispatch_sagas SET routing_json=? WHERE operation_id=?',JSON.stringify({...route,completion_contract:true}),saga.operation_id);
+      const now=Date.now();
+      const reason=typeof body.reason==='string'&&body.reason.trim()?body.reason.trim():'operator re-evaluation';
+      const summary=`Re-evaluation requested (${reason}). Check the current state of the work (merged PRs, deployed code, recorded notes), not only the last session.`;
+      const evidence=(this.parse(intake.final_evidence_json??'{}') as JsonRecord|null)??{};
+      const record:CompletionRecord={controlled:true,session_id:saga.session_id,outcome:'unfinished',reason:'reevaluation_requested',depth:0,summary,
+        verification:{state:'pending',key:'verify:'+saga.session_id+':'+round+':1',attempts:0,tries:0,next_action_at:now,original_session_id:saga.session_id,
+          summary,excluded_policy_ids:[],round}};
+      const at=Math.max(now,intake.updated_at+1);
+      this.db.run('UPDATE intakes SET final_evidence_json=?,updated_at=? WHERE id=?',JSON.stringify({...evidence,completion:record}),at,intake.id);
+      const view={session_id:saga.session_id,round,reason,previous_status:intake.status};
+      this.appendEvent(intake.id,eventKey,actor!.id,'task_reevaluation_requested',view,at);
+      return json({reevaluation:'requested',intake_id:intake.id,...view},202);
+    });
+    await this.scheduleNext();
+    return result;
   }
 
   private latestMergeEvidence(intakeId:string):unknown{
@@ -526,8 +589,10 @@ export class ProjectDO {
     const verificationOf=actor?.id===VERIFICATION_ACTOR&&typeof body.verification_of_session_id==='string'?body.verification_of_session_id:undefined;
     const verificationOrigin=actor?.id===VERIFICATION_ACTOR&&typeof body.verification_origin_session_id==='string'?body.verification_origin_session_id:undefined;
     const verificationAttempt=body.verification_attempt;
-    if((body.verification_of_session_id!==undefined||body.verification_origin_session_id!==undefined||body.verification_attempt!==undefined)
+    const verificationRound=actor?.id===VERIFICATION_ACTOR&&typeof body.verification_round==='string'&&/^re[0-9a-f]{12}$/.test(body.verification_round)?body.verification_round:undefined;
+    if((body.verification_of_session_id!==undefined||body.verification_origin_session_id!==undefined||body.verification_attempt!==undefined||body.verification_round!==undefined)
       &&actor?.id!==VERIFICATION_ACTOR)return error('verification_start_forbidden',403);
+    if(body.verification_round!==undefined&&verificationRound===undefined)return error('verification_start_stale',409);
     let verificationPrevious:SagaRow|undefined,verificationOriginal:SagaRow|undefined;
     let excludedPolicyIds:string[]=[];
     if(verificationOf!==undefined){
@@ -536,12 +601,18 @@ export class ProjectDO {
       verificationPrevious=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id=? AND intake_id=?',verificationOf,intake.id);
       verificationOriginal=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id=? AND intake_id=?',verificationOrigin,intake.id);
       const previousRoute=(this.parse(verificationPrevious?.routing_json??'{}') as JsonRecord|null)??{};
+      // The first verifier of an operator re-evaluation checks the intake's last
+      // finished session itself, whatever that session claimed.
+      const pending=((this.parse(intake.final_evidence_json??'{}') as JsonRecord|null)?.completion as CompletionRecord|undefined)?.verification;
+      const reevaluationStart=verificationRound!==undefined&&verificationAttempt===1&&verificationOf===verificationOrigin
+        &&pending?.state==='pending'&&pending.round===verificationRound&&pending.original_session_id===verificationOrigin;
+      if(verificationRound!==undefined&&!reevaluationStart&&previousRoute.verification_round!==verificationRound)return error('verification_start_stale',409);
       if(!verificationPrevious||!verificationOriginal||!this.completionControlled(verificationOriginal)
         ||!['completed-awaiting-review','failed'].includes(intake.status)
         ||(intake.status==='completed-awaiting-review'&&verificationAttempt!==1)
-        ||(intake.status==='failed'&&(previousRoute.acceptance_verification!==true||Number(verificationAttempt)!==Number(previousRoute.verification_attempt)+1
+        ||(intake.status==='failed'&&!reevaluationStart&&(previousRoute.acceptance_verification!==true||Number(verificationAttempt)!==Number(previousRoute.verification_attempt)+1
           ||previousRoute.verification_origin_session_id!==verificationOrigin)))return error('verification_start_stale',409);
-      if(intake.status==='completed-awaiting-review'&&(!this.findCompletionClaim(intake,verificationOriginal)
+      if(intake.status==='completed-awaiting-review'&&!reevaluationStart&&(!this.findCompletionClaim(intake,verificationOriginal)
         ||verificationOf!==verificationOrigin))return error('verification_start_stale',409);
       const rawExclude=body.exclude_policy_ids??[];
       if(!Array.isArray(rawExclude)||rawExclude.length>16||rawExclude.some(v=>typeof v!=='string'||!v.trim()||v.length>128))return error('invalid_verification_exclusions',400);
@@ -607,7 +678,7 @@ export class ProjectDO {
       required_capabilities: requiredCapabilities, with_goal: withGoal,
       ...(purpose !== 'implement' ? { purpose } : {}),
       ...(verificationOf!==undefined?{verification_of_session_id:verificationOf,verification_origin_session_id:verificationOrigin,
-        verification_attempt:Number(verificationAttempt),exclude_policy_ids:excludedPolicyIds,verification_summary:body.verification_summary??''}:{}),
+        verification_attempt:Number(verificationAttempt),exclude_policy_ids:excludedPolicyIds,verification_summary:body.verification_summary??'',...(verificationRound?{verification_round:verificationRound}:{})}:{}),
       ...(managedLabel!==undefined?{managed_credential_label:managedLabel}:{}),
     };
     const digest = await sha256Hex(JSON.stringify({
@@ -738,7 +809,7 @@ export class ProjectDO {
             ? `intake is ${current.status} with session ${current.session_id}; stop it first (hub sessions stop ${current.session_id}), then start again on this intake`
             : `intake is ${current.status}; reopen it first (hub intake update ${current.id} --status open), then start again on this intake`);
         this.db.run(`INSERT INTO dispatch_sagas(operation_id, request_digest, request_key, intake_id, session_id, machine_id, account_id, attempt_operation_id, launch_spec_json, routing_json, epoch, state, attempt, next_action_at, last_reason, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending_machine', 0, ?, NULL, ?, ?)`, operationId, digest, key, intakeId, sessionId, machineId, accountId, `${operationId}:0`, JSON.stringify(launchSpec), JSON.stringify({...route,attempted_policy_ids:[route.policy_id],picker,initial_picker:picker,...(completionControlled?{completion_contract:true}:{}),...(verificationOf!==undefined?{acceptance_verification:true,verification_of_session_id:verificationOf,verification_origin_session_id:verificationOrigin,verification_attempt:Number(verificationAttempt),exclude_policy_ids:excludedPolicyIds,verification_summary:body.verification_summary??''}:{}),...(contractOmitted?{completion_contract_omitted:'launch_budget'}:{})}), now + 30_000, now, now);
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending_machine', 0, ?, NULL, ?, ?)`, operationId, digest, key, intakeId, sessionId, machineId, accountId, `${operationId}:0`, JSON.stringify(launchSpec), JSON.stringify({...route,attempted_policy_ids:[route.policy_id],picker,initial_picker:picker,...(completionControlled?{completion_contract:true}:{}),...(verificationOf!==undefined?{acceptance_verification:true,verification_of_session_id:verificationOf,verification_origin_session_id:verificationOrigin,verification_attempt:Number(verificationAttempt),exclude_policy_ids:excludedPolicyIds,verification_summary:body.verification_summary??'',...(verificationRound?{verification_round:verificationRound}:{})}:{}),...(contractOmitted?{completion_contract_omitted:'launch_budget'}:{})}), now + 30_000, now, now);
         // A Hub continuation keeps the original requester as the assigned actor.
         const assignedActor=verificationOf!==undefined?current.assigned_actor_id??actor?.id??'operator'
           :continuationOf!==undefined?current.assigned_actor_id??actor?.id??'operator':actor?.id||'operator';
@@ -1340,7 +1411,9 @@ export class ProjectDO {
           const verdict=launchFailed?undefined:this.findVerificationVerdict(current,saga);
           completion=this.verificationOutcome(current,currentSaga,verdict,launchFailed?'launch_failed':stopRequested?'stop_requested':deadlineExceeded?'deadline_exceeded'
             :body.exit_code===0?'verifier_exit_without_verdict':'verifier_exit_'+String(body.exit_code),now);
-          status=completion.outcome==='claimed'?'completed-awaiting-review':'failed';
+          // Hub's own gate decided: independent verification passed and, for
+          // code work, the merge gate holds. The intake is accepted.
+          status=completion.outcome==='claimed'?'accepted':'failed';
         }else{
           const claim=launchFailed?undefined:this.findCompletionClaim(current,saga);
           status=claim?'completed-awaiting-review':'failed';
@@ -1423,11 +1496,14 @@ export class ProjectDO {
       }
     }
     const explicit=verdict!==undefined;
+    const round=typeof route.verification_round==='string'?route.verification_round:undefined;
+    const criteria=this.parse(intake.acceptance_criteria_json);
+    const missing=explicit?undefined:`${reason}: ${verifierNoVerdictCause(this.appendsSinceStart(intake,saga),saga.session_id,Array.isArray(criteria)?criteria.length:0)}`;
     const depth=this.continuationDepth(intake.id);
     const retry=!explicit&&attempt<MAX_VERIFICATION_ATTEMPTS;
     const escalated=!explicit&&!retry;
     const state:VerificationAction['state']=passed?'passed':explicit?'failed':retry?'pending':'escalated';
-    const verification:VerificationAction={state,key:'verify:'+origin+':'+String(attempt),attempts:Number.isSafeInteger(attempt)?attempt:0,
+    const verification:VerificationAction={state,key:'verify:'+origin+(round?':'+round:'')+':'+String(attempt),...(round?{round}:{}),attempts:Number.isSafeInteger(attempt)?attempt:0,
       tries:0,next_action_at:retry?now:null,original_session_id:origin,
       ...(typeof route.verification_summary==='string'&&route.verification_summary?{summary:route.verification_summary}:{}),
       ...(gaps.length?{gaps}:{}),...(priorVerifier?{previous_verifier_session_id:priorVerifier}:{}),
@@ -1435,7 +1511,7 @@ export class ProjectDO {
     const record:CompletionRecord={controlled:true,session_id:saga.session_id,outcome:passed?'claimed':'unfinished',
       reason:passed?'acceptance_verified':explicit?'acceptance_verification_failed':escalated?'verification_exhausted':'verification_incomplete',
       depth,...(typeof route.verification_summary==='string'&&route.verification_summary?{summary:route.verification_summary}:{}),verification,
-      ...(!passed&&gaps.length?{cause:'Acceptance gaps: '+gaps.join(' | ')}:{})};
+      ...(!passed&&gaps.length?{cause:'Acceptance gaps: '+gaps.join(' | ')}:missing?{cause:missing}:{})};
     if(passed){
       record.delivery={state:'pending',key:'terminal:'+saga.operation_id,tries:0,next_action_at:now};
     }else if(explicit&&depth<MAX_AUTO_CONTINUATIONS){
@@ -1452,7 +1528,7 @@ export class ProjectDO {
     this.appendEvent(intake.id,'verification-result:'+saga.operation_id,VERIFICATION_ACTOR,
       passed?'task_acceptance_verified':explicit?'task_acceptance_verification_failed':'task_verifier_unfinished',
       {session_id:saga.session_id,original_session_id:origin,attempt,verdict:passed?'pass':explicit?'fail':'missing',reason,
-        ...(gaps.length?{gaps}:{}),...(mergeBlocked?{merge_gate_blocked:true}:{})},now);
+        ...(missing?{cause:missing}:{}),...(gaps.length?{gaps}:{}),...(mergeBlocked?{merge_gate_blocked:true}:{})},now);
     return record;
   }
 
@@ -1617,7 +1693,7 @@ export class ProjectDO {
       const route=(this.parse(saga.routing_json) as JsonRecord|null)??{},picker=route.picker as JsonRecord|undefined;
       if(typeof picker?.policy_id==='string')excluded.add(picker.policy_id);
     }
-    const key='verify:'+action.original_session_id+':'+attempt;
+    const key='verify:'+action.original_session_id+(action.round?':'+action.round:'')+':'+attempt;
     const hash=await sha256Hex(JSON.stringify(['hub2-start-session-v1',intake.project,intake.id,key]));
     const verifierSessionId=`${hash.slice(0,8)}-${hash.slice(8,12)}-5${hash.slice(13,16)}-a${hash.slice(17,20)}-${hash.slice(20,32)}`;
     const criteria=this.parse(intake.acceptance_criteria_json);
@@ -1626,7 +1702,8 @@ export class ProjectDO {
     const originalLaunch=this.parse(origin.launch_spec_json) as JsonRecord;
     const body:JsonRecord={key,workspace:boundWorkspace(originalLaunch,this.workspaceBinding(origin)),prompt,purpose:'review',
       timeout_seconds:1800,verification_of_session_id:record.session_id,verification_origin_session_id:action.original_session_id,
-      verification_attempt:attempt,verification_summary:action.summary??record.summary??'',exclude_policy_ids:[...excluded]};
+      verification_attempt:attempt,verification_summary:action.summary??record.summary??'',exclude_policy_ids:[...excluded],
+      ...(action.round?{verification_round:action.round}:{})};
     body.machine_id=origin.machine_id;
     const actor:Actor={id:VERIFICATION_ACTOR,kind:'agent',resource_id:intake.project,scopes:['session:start','intake:read','project:'+intake.project]};
     let outcome:{state:'started'|'retry'|'refused';reason?:string;session_id?:string};
