@@ -63,6 +63,11 @@ class World:
             monkeypatch.setenv(key, value)
         for key in ('CLAUDE_CONFIG_DIR', 'CLAUDE_SECURESTORAGE_CONFIG_DIR'):
             monkeypatch.delenv(key, raising=False)
+        self.bin = tmp_path / 'bin'
+        self.bin.mkdir(mode=0o755)
+        self.claude = self.bin / 'claude'
+        self.set_version('2.1.322')
+        monkeypatch.setenv('PATH', str(self.bin) + os.pathsep + os.environ.get('PATH', ''))
         monkeypatch.setattr(dcc, 'NATIVE_WAIT_S', 0.6)
         monkeypatch.setattr(dcc, 'FAULT', None)
 
@@ -70,6 +75,14 @@ class World:
             raise AssertionError('network use is forbidden')
         monkeypatch.setattr(socket.socket, 'connect', refuse)
         self.cred = self.store / '.credentials.json'
+
+    def set_version(self, text, code=0):
+        # A synthetic stand-in for the public executable: never the real Claude, no auth.
+        # A fresh file (new inode) models a package upgrade replacing the executable.
+        staging = self.bin / 'claude.new'
+        staging.write_text('#!/bin/sh\necho %s\nexit %d\n' % (text, code))
+        os.chmod(staging, 0o755)
+        os.replace(staging, self.claude)
 
     def put(self, body, extra=None, raw=None):
         document = {'claudeAiOauth': body}
@@ -457,41 +470,6 @@ def test_crash_after_file_then_a_newer_generation_moves_forward(writing, monkeyp
     assert writing.doc()['claudeAiOauth'] == oauth(9) and writing.state()['committed']['generation'] == 9
 
 
-def xattrs_supported(directory):
-    probe = Path(directory) / 'xattr-probe'
-    probe.mkdir()
-    try:
-        os.setxattr(probe, native.XATTR, b'1')
-        return True
-    except OSError:
-        return False
-    finally:
-        probe.rmdir()
-
-
-def test_a_killed_process_leaves_only_its_own_recoverable_lock_incarnations(writing):
-    if not xattrs_supported(writing.store):
-        pytest.skip('no user xattrs here: automatic reap is conservatively refused (covered separately)')
-    code = textwrap.dedent('''
-        import os, sys
-        sys.path.insert(0, %r)
-        from agent_hub_host import default_claude_consumer as dcc
-        def fault(name):
-            if name == 'after_file':
-                os._exit(9)
-        dcc.FAULT = fault
-        dcc.deliver(%r)
-    ''') % (str(REPO / 'host'), request(8))
-    done = subprocess.run([sys.executable, '-I', '-c', code], capture_output=True, timeout=60)
-    assert done.returncode == 9
-    locks = [writing.store / '.oauth_refresh.lock', writing.home / '.claude.lock', writing.store / '.storage-write.lock']
-    assert all(lock.is_dir() for lock in locks)
-    # The dead owner's recorded incarnations are removed by the next consumer run and nothing else.
-    assert dcc.deliver(request(8)) == {'status': 'in_step', 'enabled': True}
-    assert not any(lock.exists() for lock in locks)
-    assert writing.state()['committed']['generation'] == 8
-
-
 # ---------------------------------------------------- native lock contenders
 
 EMULATOR = textwrap.dedent('''
@@ -663,7 +641,7 @@ def test_foreign_stale_and_busy_locks_are_never_removed(writing):
     old = time.time() - 3600
     os.utime(stale, (old, old))
     before = writing.raw()
-    assert dcc.deliver(request(8)) == {'status': 'lock_stale_foreign', 'enabled': True}
+    assert dcc.deliver(request(8)) == {'status': 'lock_stale_operator_recovery', 'enabled': True}
     assert stale.is_dir() and abs(stale.stat().st_mtime - old) < 2  # untouched, not "refreshed"
     assert writing.raw() == before
     # Our earlier refresh/legacy locks were released; only the foreign one remains.
@@ -672,7 +650,7 @@ def test_foreign_stale_and_busy_locks_are_never_removed(writing):
     foreign = writing.home / '.claude.lock'
     foreign.mkdir()
     os.utime(foreign, (old, old))
-    assert dcc.deliver(request(8))['status'] == 'lock_stale_foreign' and foreign.is_dir()
+    assert dcc.deliver(request(8))['status'] == 'lock_stale_operator_recovery' and foreign.is_dir()
     foreign.rmdir()
     fresh = writing.store / '.oauth_refresh.lock'
     fresh.mkdir()
@@ -697,58 +675,6 @@ def test_release_removes_only_the_incarnation_it_created_and_heartbeat_keeps_the
         assert locks.compromised()
     assert paths['storage'].is_dir()
     paths['storage'].rmdir()
-
-
-def private_write(path, text):
-    Path(path).write_text(text)
-    os.chmod(path, 0o600)
-
-
-def dead_pid():
-    done = subprocess.Popen([sys.executable, '-c', 'pass'])
-    done.wait()
-    return done.pid
-
-
-def test_the_ledger_never_reaps_a_foreign_lock_that_reuses_a_recorded_inode(world):
-    # ABA: a stale record names (dev, ino) of a dead owner; the same inode number is now a
-    # FOREIGN, fresh native lock (inode reuse). Without the exact durable proof nothing is removed.
-    ledger = native.IncarnationLedger(world.managed / 'ledger.json')
-    foreign = world.store / '.storage-write.lock'
-    foreign.mkdir()
-    info = foreign.stat()
-    entry = {'dev': info.st_dev, 'ino': info.st_ino, 'pid': dead_pid(), 'start': None}
-    world.managed.mkdir(exist_ok=True, mode=0o700)
-    for nonce in (None, 'deadbeef' * 4):
-        private_write(world.managed / 'ledger.json', json.dumps({'storage': dict(entry, nonce=nonce)}))
-        assert ledger.reap('storage', foreign) is False and foreign.is_dir()
-    # A live owner of the recorded incarnation is never reaped either, even with the nonce.
-    if xattrs_supported(world.store):
-        os.setxattr(foreign, native.XATTR, b'deadbeef' * 4)
-        private_write(world.managed / 'ledger.json', json.dumps({'storage': dict(entry, nonce='deadbeef' * 4, pid=os.getpid(),
-                                                                                  start=native._process_start(os.getpid()))}))
-        assert ledger.reap('storage', foreign) is False and foreign.is_dir()
-        # Only the full proof (same inode, same nonce, provably dead owner) removes it.
-        private_write(world.managed / 'ledger.json', json.dumps({'storage': dict(entry, nonce='deadbeef' * 4)}))
-        assert ledger.reap('storage', foreign) is True and not foreign.exists()
-
-
-def test_a_stale_ledger_entry_cannot_make_the_consumer_remove_a_foreign_lock(writing):
-    foreign = writing.store / '.storage-write.lock'
-    foreign.mkdir()
-    old = time.time() - 3600
-    os.utime(foreign, (old, old))
-    info = foreign.stat()
-    private_write(writing.managed / dcc.LEDGER_NAME, json.dumps({'storage': {
-        'dev': info.st_dev, 'ino': info.st_ino, 'nonce': None, 'pid': dead_pid(), 'start': None}}))
-    assert dcc.deliver(request(8))['status'] == 'lock_stale_foreign' and foreign.is_dir()
-    foreign.rmdir()
-    fresh = writing.store / '.storage-write.lock'
-    fresh.mkdir()
-    info = fresh.stat()
-    private_write(writing.managed / dcc.LEDGER_NAME, json.dumps({'storage': {
-        'dev': info.st_dev, 'ino': info.st_ino, 'nonce': 'ab' * 16, 'pid': dead_pid(), 'start': None}}))
-    assert dcc.deliver(request(8))['status'] == 'lock_busy' and fresh.is_dir()
 
 
 def test_a_lost_lock_blocks_the_replacement(writing, monkeypatch):
@@ -850,3 +776,182 @@ def test_non_finite_json_is_malformed_everywhere_native_json_parse_would_reject_
         writing.enroll(7)
     with pytest.raises(native.StoreRefused):
         native.render_document({'claudeAiOauth': oauth(7), 'k': float(constant.lower().replace('infinity', 'inf'))}, None)
+
+
+# ------------------------------- B2: no automatic crash reaping of native locks
+
+def test_a_crashed_owner_leaves_locks_that_are_refused_never_reaped(writing):
+    code = textwrap.dedent('''
+        import os, sys
+        sys.path.insert(0, %r)
+        from agent_hub_host import default_claude_consumer as dcc
+        def fault(name):
+            if name == 'after_file':
+                os._exit(9)
+        dcc.FAULT = fault
+        dcc.deliver(%r)
+    ''') % (str(REPO / 'host'), request(8))
+    assert subprocess.run([sys.executable, '-I', '-c', code], capture_output=True, timeout=60).returncode == 9
+    locks = [writing.store / '.oauth_refresh.lock', writing.home / '.claude.lock', writing.store / '.storage-write.lock']
+    assert all(lock.is_dir() for lock in locks)
+    # Fresh: indistinguishable from a live native refresh -> busy. Never removed.
+    assert dcc.deliver(request(8)) == {'status': 'lock_busy', 'enabled': True}
+    old = time.time() - 3600
+    for lock in locks:
+        os.utime(lock, (old, old))
+    # Stale: an operator decision, reported truthfully; no automatic hard-crash recovery.
+    assert dcc.deliver(request(8)) == {'status': 'lock_stale_operator_recovery', 'enabled': True}
+    assert all(lock.is_dir() for lock in locks)
+    assert writing.state()['committed']['generation'] == 7 and writing.state()['pending']['generation'] == 8
+    # After the operator removes them the pending intent completes forward.
+    for lock in locks:
+        lock.rmdir()
+    assert dcc.deliver(request(8)) == {'status': 'in_step', 'enabled': True}
+    assert writing.state()['committed']['generation'] == 8
+
+
+def test_a_foreign_replacement_between_staleness_check_and_any_removal_is_preserved(writing, monkeypatch):
+    lock = writing.store / '.storage-write.lock'
+    lock.mkdir()
+    old = time.time() - 3600
+    os.utime(lock, (old, old))
+    real_lstat, real_rmdir, removed, state = os.lstat, os.rmdir, [], {'swapped': False}
+
+    def lstat(path, *a, **kw):
+        result = real_lstat(path, *a, **kw)
+        if Path(path) == lock and not state['swapped']:
+            # The deterministic race: a native contender replaces the directory right after we looked.
+            state['swapped'] = True
+            real_rmdir(lock)  # the contender's own removal, not ours
+            lock.mkdir()
+            (lock / 'foreign-marker').write_text('live native lock')
+        return result
+    monkeypatch.setattr(os, 'lstat', lstat)
+    monkeypatch.setattr(os, 'rmdir', lambda path, *a, **kw: (removed.append(str(path)), real_rmdir(path, *a, **kw))[1])
+    assert dcc.deliver(request(8))['status'] in ('lock_stale_operator_recovery', 'lock_busy')
+    assert state['swapped'] and (lock / 'foreign-marker').read_text() == 'live native lock'
+    assert str(lock) not in removed          # we never removed a directory we did not create
+
+
+# ------------------------------------------ B3: durable disable
+
+def test_disable_fsyncs_the_directory_after_the_unlink_and_surfaces_failure(writing, monkeypatch):
+    path = writing.managed / dcc.STATE_NAME
+    real_fsync, events = os.fsync, []
+
+    def fsync(fd):
+        try:
+            same_dir = os.path.samefile('/proc/self/fd/%d' % fd, writing.managed)
+        except OSError:
+            same_dir = False
+        events.append(('dir' if same_dir else 'file', path.exists()))
+        return real_fsync(fd)
+    monkeypatch.setattr(os, 'fsync', fsync)
+    assert dcc.disable() == {'enrolled': False, 'removed': True}
+    # The containing directory was synced, and only after the enrollment was unlinked.
+    assert ('dir', False) in events and ('dir', True) not in events
+    # A sync failure is a failure, not a quiet success; repeating the command succeeds.
+    path.write_bytes(b'{}')
+    monkeypatch.setattr(os, 'fsync', lambda fd: (_ for _ in ()).throw(OSError(5, 'io')))
+    with pytest.raises(dcc.Refused, match='disable_not_durable'):
+        dcc.disable()
+    monkeypatch.setattr(os, 'fsync', real_fsync)
+    assert dcc.disable() == {'enrolled': False, 'removed': False}
+
+
+def test_disable_failure_is_a_command_error_and_never_claims_success(writing, monkeypatch):
+    monkeypatch.setattr(os, 'fsync', lambda fd: (_ for _ in ()).throw(OSError(5, 'io')))
+    with pytest.raises(ValueError, match='disable_not_durable'):
+        dcc.command(argparse.Namespace(default_claude_cmd='disable'))
+
+
+# --------------------------------- B4: executable and version binding
+
+def test_enrollment_binds_the_resolved_executable_and_supported_version(world):
+    world.put(oauth(7))
+    world.enroll(7)
+    pin = world.state()['executable']
+    assert pin['path'] == str(world.claude.resolve()) and pin['version'] == '2.1.322'
+    assert dcc.status()['claude_version'] == '2.1.322'
+    no_secret(json.dumps(world.state()))
+
+
+@pytest.mark.parametrize('case', ['missing', 'unsupported', 'unparsable', 'failing', 'group_writable'])
+def test_enrollment_refuses_a_missing_unsupported_or_untrusted_executable_without_mutation(world, case, monkeypatch):
+    world.put(oauth(7))
+    if case == 'missing':
+        world.claude.unlink()
+        monkeypatch.setenv('PATH', str(world.bin))
+        expect = 'executable_missing'
+    elif case == 'unsupported':
+        world.set_version('2.1.999')
+        expect = 'version_unsupported'
+    elif case == 'unparsable':
+        world.set_version('no version here')
+        expect = 'version_unavailable'
+    elif case == 'failing':
+        world.set_version('2.1.322', code=1)
+        expect = 'version_unavailable'
+    else:
+        os.chmod(world.claude, 0o775)
+        expect = 'executable_untrusted'
+    before = world.raw()
+    with pytest.raises(dcc.Refused, match=expect):
+        world.enroll(7)
+    assert world.raw() == before and not (world.managed / dcc.STATE_NAME).exists()
+
+
+@pytest.mark.parametrize('change,expect', [
+    ('unsupported', 'version_unsupported'), ('replaced', 'executable_changed'),
+    ('removed', 'executable_missing'), ('untrusted', 'executable_untrusted')])
+def test_changed_executable_refuses_this_consumer_before_any_write(writing, monkeypatch, change, expect):
+    before, state = writing.raw(), (writing.managed / dcc.STATE_NAME).read_bytes()
+    if change == 'unsupported':
+        # Same inode/size/mtime would be required to evade the identity pin, so go through a replacement
+        # and then re-pin it to isolate the version gate.
+        writing.set_version('2.1.999')
+        pin = dict(writing.state()['executable'], **native._executable_identity(str(writing.claude)))
+        saved = json.loads(json.dumps(writing.state()))
+        saved['executable'] = dict(pin, version='2.1.322')
+        (writing.managed / dcc.STATE_NAME).write_text(json.dumps(saved))
+        state = (writing.managed / dcc.STATE_NAME).read_bytes()
+    elif change == 'replaced':
+        writing.set_version('2.1.322')
+    elif change == 'removed':
+        writing.claude.unlink()
+    else:
+        os.chmod(writing.claude, 0o777)
+    for check_only in (False, True):
+        assert dcc.deliver(request(8), check_only=check_only) == {'status': expect, 'enabled': True}
+    assert dcc.status()['local'] == expect
+    assert writing.raw() == before and (writing.managed / dcc.STATE_NAME).read_bytes() == state
+    # Only this consumer is blocked: it never claims a held generation, so no ACK can cover it.
+    assert dcc.deliver(request(8))['status'] not in dcc.HELD
+    assert not list(writing.store.glob('.*.lock'))
+
+
+def test_version_drift_to_another_supported_version_refuses_until_reenrolled(writing, monkeypatch):
+    monkeypatch.setattr(native, 'SUPPORTED_VERSIONS', ('2.1.322', '2.1.323'))
+    # Same file, but it now reports another version: the pin (and not just support) is checked.
+    code = (writing.bin / 'claude').read_text().replace('2.1.322', '2.1.323')
+    os.chmod(writing.claude, 0o755)
+    state = json.loads(json.dumps(writing.state()))
+    (writing.bin / 'claude').write_text(code)
+    state['executable'].update(native._executable_identity(str(writing.claude)))
+    (writing.managed / dcc.STATE_NAME).write_text(json.dumps(state))
+    assert dcc.deliver(request(8)) == {'status': 'version_changed', 'enabled': True}
+    assert writing.doc()['claudeAiOauth'] == oauth(7)
+    # Re-enrollment (the operator's recovery) re-pins the new supported version; same store, known content.
+    writing.enroll(7)
+    assert writing.state()['executable']['version'] == '2.1.323' and writing.state()['mode'] == 'write'
+    assert dcc.deliver(request(8))['status'] == 'materialized'
+
+
+def test_runtime_uses_the_pinned_executable_not_the_ambient_path(writing, monkeypatch):
+    other = writing.tmp / 'other-bin'
+    other.mkdir()
+    fake = other / 'claude'
+    fake.write_text('#!/bin/sh\necho 9.9.9\n')
+    os.chmod(fake, 0o755)
+    monkeypatch.setenv('PATH', str(other) + os.pathsep + os.environ['PATH'])
+    assert dcc.deliver(request(8))['status'] == 'materialized'
