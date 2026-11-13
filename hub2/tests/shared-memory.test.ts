@@ -122,7 +122,7 @@ test('schema v4 upgrades in place without changing existing control records',asy
  const upgraded=new ControlDO(f.c.ctx,f.env);
  const response=await upgraded.fetch(new Request('https://control.test/api/intake/rules',{headers:{'x-hub2-actor':JSON.stringify(admin)}}));
  assert.equal(response.status,200);assert.deepEqual((await data(response)).operator_rules,[]);
- assert.equal((f.c.database.prepare('SELECT version FROM hub2_schema').get() as any).version,6);
+ assert.equal((f.c.database.prepare('SELECT version FROM hub2_schema').get() as any).version,7);
  assert.equal((f.c.database.prepare("SELECT display_name FROM named_agents WHERE id='existing'").get() as any).display_name,'Existing');
 });
 

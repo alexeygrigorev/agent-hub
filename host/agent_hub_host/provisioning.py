@@ -3962,16 +3962,17 @@ def command(args):
         from . import engine_rollout
         return engine_update_command(args)
     if args.engines_cmd == 'registry':
+        import urllib.parse
         if args.registry_cmd == 'list':
             return bus._do_request('GET', '/api/engines/registry')
         if args.registry_cmd == 'set':
-            return bus._do_request('PUT', '/api/engines/registry/' + args.engine, {
+            return bus._do_request('PUT', '/api/engines/registry/' + urllib.parse.quote(args.engine, safe=''), {
                 'binary': args.binary,
                 'version_command': args.version_command,
                 'update_command': args.update_command,
             })
         if args.registry_cmd == 'remove':
-            return bus._do_request('DELETE', '/api/engines/registry/' + args.engine)
+            return bus._do_request('DELETE', '/api/engines/registry/' + urllib.parse.quote(args.engine, safe=''))
     if args.engines_cmd == 'list':
         if getattr(args, 'view', None) == 'worker':
             return bus._do_request('GET', '/api/engines?view=worker')
