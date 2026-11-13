@@ -673,8 +673,8 @@ class V2NativeAndLineageTests(Harness):
 
     def test_foreign_incomplete_archive_snapshot_change_over_limit_and_cas_conflict(self):
         for knob, expected in [
-            ('foreign_assignment', 'foreign or unprovable session'),
-            ('foreign_assigned_machine', 'foreign assigned_machine_id'),
+            ('foreign_assignment', 'foreign, missing or unprovable current session'),
+            ('foreign_assigned_machine', "current assigned_machine_id 'foreign-host'"),
             ('pending_dispatch_state', 'non-terminal dispatch state'),
             ('history_seq_gap', 'intake history sequence gap'),
             ('history_incomplete_archive', 'history_archive has 3 unread archived events'),
@@ -689,7 +689,9 @@ class V2NativeAndLineageTests(Harness):
 
     def test_trust_menu_and_negative_pane_renderings_fail(self):
         for knob in ('trust_menu_rendered', 'hydrogen_prose_command_exited', 'claude_waiting_only',
-                     'claude_prose_only', 'claude_unterminated_echo', 'hydrogen_unrelated_action'):
+                     'claude_prose_only', 'claude_unterminated_echo', 'hydrogen_unrelated_action',
+                     'hydrogen_unrelated_python', 'hydrogen_unrelated_shell', 'hydrogen_assistant_footer',
+                     'hydrogen_truncated_header'):
             with self.subTest(knob=knob):
                 rc, out = self.go(**{knob: True})
                 self.assertEqual(rc, 1, out)
@@ -717,6 +719,160 @@ class V2NativeAndLineageTests(Harness):
                 self.assertEqual(rc, 1, out)
                 self.assertIn('did not prove completed work', out)
                 self.assertAllStopped()
+
+    def test_b3_missing_or_drifted_current_custody_never_confirms_or_archives(self):
+        for knob, expected in [
+            ('cleanup_missing_dispatch', 'missing or malformed current dispatch'),
+            ('cleanup_null_machine', 'current assigned_machine_id None'),
+            ('cleanup_dispatch_missing_op', 'operation_id UNKNOWN'),
+            ('cleanup_dispatch_null_machine', 'machine_id UNKNOWN'),
+            ('cleanup_epoch_drift', 'epoch drift 2 != 1'),
+            ('cleanup_native_drift', 'native_id drift'),
+            ('cleanup_stop_view_op_drift', 'operation_id drift'),
+            ('archive_unproven', 'archive unproven'),
+        ]:
+            with self.subTest(knob=knob):
+                rc, out = self.go(**{knob: True})
+                self.assertEqual(rc, 1, out)
+                self.assertIn(expected, out)
+                self.assertAllStopped()
+                report = json.loads(out[out.index('\n{\n') + 1:out.rindex('\n}') + 2])
+                first = report['starts'][0]
+                self.assertNotEqual(first.get('cleanup_status'), 'CONFIRMED')
+                if knob != 'archive_unproven':
+                    self.assertNotIn('intake:update', self.state()['log'])
+                    self.assertFalse(first.get('archived'))
+                else:
+                    self.assertEqual(first.get('cleanup_status'), 'ARCHIVE_PENDING')
+
+    def test_b3_lost_archive_ack_is_confirmed_only_by_final_recheck(self):
+        rc, out = self.go(archive_lost_ack=True)
+        report = json.loads(out[out.index('\n{\n') + 1:out.rindex('\n}') + 2])
+        for rec in report['starts']:
+            self.assertEqual(rec.get('cleanup_status'), 'CONFIRMED', out)
+            self.assertTrue(rec.get('archived'))
+        self.assertEqual(rc, 0, out)
+
+    def test_b3_pinned_review_counterexample_null_dispatch_is_unknown(self):
+        run, sid, cid = (PARENT_INTAKE, '22222222-3333-4444-8555-666666666666', '33333333-4444-4555-8666-777777777777')
+        show = {'id': cid, 'project': acc.PROJECT, 'session_id': sid, 'assigned_machine_id': acc.HOST, 'updated_at': 100,
+                'status': 'open', 'dispatch': None, 'final_evidence': None}
+
+        class R:
+            calls = []
+
+            def json(self, tool, args, timeout):
+                self.calls.append(args)
+                return {'intake': dict(show, status='archived')}
+        stop_view = {'id': sid, 'state': 'stopped', 'stop_confirmed': True, 'operation_id': 'original-op',
+                     'attempt_operation_id': 'original-op:0', 'epoch': 1}
+        for rec_extra, view, msg in [
+            ({}, stop_view, 'missing or malformed current dispatch'),
+            ({'attempt_operation_id': None}, stop_view, 'attempt_operation_id UNKNOWN'),
+            ({}, dict(stop_view, epoch=None), 'epoch UNKNOWN'),
+            ({}, dict(stop_view, operation_id='other-op'), 'operation_id drift'),
+        ]:
+            with self.subTest(msg=msg):
+                r = R(); r.calls = []
+                rec = dict({'id': sid, 'child_intake_id': cid, 'operation_id': 'original-op',
+                            'attempt_operation_id': 'original-op:0', 'epoch': 1, 'host': acc.HOST,
+                            'native_id': '55555555-6666-4777-8888-999999999999',
+                            'stop_key': 'synthetic-stop', 'errors': [], 'n': 1}, **rec_extra)
+                with mock.patch.object(acc, '_stop_single_session', lambda *a, v=view: (dict(v), None)), \
+                        mock.patch.object(acc, 'scan_intake_lineage',
+                                          lambda *a: ({'show': show, 'events': [{'seq': 1, 'kind': 'created', 'body': {}}]}, None)):
+                    acc.stop_and_drain_lineage(r, rec, run, lambda: 0, lambda _: None)
+                self.assertFalse(rec['cleanup_confirmed'])
+                self.assertEqual(rec['cleanup_status'], 'UNKNOWN')
+                self.assertFalse(rec.get('archived'))
+                self.assertEqual(r.calls, [])
+                self.assertTrue(any(msg in e for e in rec['errors']), rec['errors'])
+
+    def test_b1_actual_project_create_shape_and_no_invented_source(self):
+        brief, ac = acc.make_child_brief_and_ac(PARENT_INTAKE, 1, PARENT_INTAKE, '/tmp/ch.bin')
+        cid = '33333333-4444-4555-8666-777777777777'
+        title = 'Phase7 owned run %s/%d' % (PARENT_INTAKE, 1)
+        # Mirrors hub2/src/project-do.ts create INSERT + viewIntake (no saga yet => no dispatch key).
+        actual = {'id': cid, 'project': acc.PROJECT, 'title': title, 'text': brief,
+                  'acceptance_criteria': acc.normalize_acceptance_criteria(ac), 'status': 'open',
+                  'assigned_machine_id': None, 'session_id': None, 'linked_sessions': [], 'priority': 2,
+                  'original_ask': {'title': title, 'text': brief}, 'provenance': {'type': 'user', 'code_task': True},
+                  'parent_intake_id': None, 'schedule_id': None, 'occurrence_id': None, 'final_evidence': None,
+                  'created_at': 1, 'updated_at': 1}
+
+        class R:
+            def __init__(self, view):
+                self.view, self.calls = view, []
+
+            def json(self, tool, args, timeout):
+                self.calls.append(args)
+                return {'intake': self.view} if args[1] in ('create', 'show') else {'ok': True}
+        r = R(actual)
+        rec = {'create_key': 'k-create', 'start_key': 'k-start'}
+        self.assertEqual(acc.create_child_intake(r, rec, PARENT_INTAKE, 1, PARENT_INTAKE, 'b', 'a', brief, ac, set(), lambda: 0), cid)
+        self.assertFalse(any(flag.startswith('--source') for flag in r.calls[0]))
+        receipt = rec['create_receipt']
+        self.assertEqual(receipt['provenance'], {'type': 'user', 'code_task': True})
+        self.assertFalse(receipt['structural_parent_link'])
+        self.assertEqual(receipt['text_sha256'], hashlib.sha256(brief.encode()).hexdigest())
+        note = r.calls[-1]
+        self.assertEqual(note[:5], ['intake', 'append', PARENT_INTAKE, '--key', 'acc10-own-%s-1' % PARENT_INTAKE])
+        self.assertIn('create_key=k-create', note[-1])
+        self.assertIn(receipt['acceptance_criteria_sha256'], note[-1])
+        for change, msg in [
+            ({'provenance': {'type': 'forwarded', 'reference': 'parent:x'}}, 'provenance mismatch'),
+            ({'provenance': {'type': 'user', 'code_task': False}}, 'provenance mismatch'),
+            ({'parent_intake_id': PARENT_INTAKE}, 'structural parent_intake_id'),
+            ({'text': brief + ' '}, 'text mismatch'),
+            ({'original_ask': {'title': title, 'text': 'x'}}, 'original_ask mismatch'),
+            ({'acceptance_criteria': ac.splitlines()}, 'acceptance_criteria mismatch'),
+            ({'session_id': '22222222-3333-4444-8555-666666666666'}, 'not open/unassigned'),
+        ]:
+            with self.subTest(msg=msg):
+                with self.assertRaisesRegex(RuntimeError, msg):
+                    acc.create_child_intake(R(dict(actual, **change)), dict(rec), PARENT_INTAKE, 1, PARENT_INTAKE,
+                                            'b', 'a', brief, ac, set(), lambda: 0)
+
+    def test_b1_fake_legacy_forwarded_provenance_is_rejected(self):
+        rc, out = self.go(legacy_forwarded_provenance=True)
+        self.assertEqual(rc, 1, out)
+        self.assertIn('provenance mismatch', out)
+
+    def test_b2_hydrogen_binds_exact_probe_header_not_footer(self):
+        run = '40a49778-f092-450d-a042-12ad276ab134'
+        cmd = acc.probe_command(run, 3)
+        self.assertEqual(cmd, 'python3 .local/a10/40a4977803.py')
+        expected = 'AC10_WORK_V2 %s 3 %s %s 5050' % (run, 'a' * 64, 'b' * 40)
+        brief, _ = acc.make_child_brief_and_ac(run, 3, PARENT_INTAKE, '/tmp/ch.bin')
+        self.assertIn('`%s`' % cmd, brief)
+        ok = '● Ran (%s) (ctrl+o to expand)\n> ' % cmd
+        t = native_transport('antigravity', COMMIT)
+        self.assertTrue(acc.native_pane_output_ok(ok, 'antigravity', t, expected, brief, command_id=cmd))
+        for bad in [
+            '● Ran (python3 -c unrelated.py) (ctrl+o to expand)\nAssistant final summary:\n' + expected,
+            '● Ran (bash -c true) (ctrl+o to expand)\n  ' + expected,
+            '● Ran (python3 .local/a10/40a4977804.py) (ctrl+o to expand)\n' + expected,
+            '● Ran (%s...) (ctrl+o to expand)\n' % cmd[:20],
+            '● Ran 2 commands (aplexer whoami --jso... · cd /x...)\nAssistant: I ran `%s`\n%s' % (cmd, expected),
+            'Assistant: ● Ran (%s) (ctrl+o to expand) %s' % (cmd, expected),
+            '  Command exited with code 0.\n' + expected,
+        ]:
+            with self.subTest(bad=bad[:40]):
+                self.assertFalse(acc.native_pane_output_ok(bad, 'antigravity', t, expected, brief, command_id=cmd))
+        self.assertFalse(acc.native_pane_output_ok(ok, 'antigravity', t, expected, brief, command_id=None))
+        # Root's existing v2 Hydrogen attestation does not qualify for the v3 bound proof class.
+        legacy = dict(t, proof_class='native_action_plus_artifact_v2')
+        self.assertFalse(acc.native_transport_ok('antigravity', legacy, legacy['host_release_sha']))
+        self.assertFalse(acc.native_pane_output_ok(ok, 'antigravity', legacy, expected, brief, command_id=cmd))
+
+    def test_b2_hydrogen_requires_probe_file_and_propagates_deadline(self):
+        rc, out = self.go(no_probe_file=True, models=[MUSE])
+        self.assertEqual(rc, 1, out)
+        self.assertIn('did not prove completed work', out)
+        self.assertAllStopped()
+        with self.assertRaises(TimeoutError):
+            acc.verify_work_artifact(None, str(self.tmp), PARENT_INTAKE, 1, PARENT_INTAKE, PARENT_INTAKE,
+                                     PARENT_INTAKE, PARENT_INTAKE, b'x' * 32, lambda: 10, 5)
 
     def test_porcelain_z_rename_copy_counting(self):
         self.assertEqual(acc.parse_porcelain_z_count(b''), 0)
