@@ -142,7 +142,6 @@ class FrameRecognizerTests(unittest.TestCase):
             CMD.replace('h7_', 'h\\7_'),
             'python3 -c\"open(\'x.py\')\"',
             'python3 .local/h7_000000000000_02.py',
-            'echo ' + REL,
             'python3 -c"exec(\'' + REL + '\')"',
             'cp /h .local/h7_000000000000_02.py',
             'cp /h ' + REL + '…',
@@ -180,6 +179,52 @@ class FrameRecognizerTests(unittest.TestCase):
         for command in commands:
             with self.subTest(command=command), self.assertRaises(frame.Refused):
                 recognize(EXPANDED.decode().replace(THOUGHT, header_row('(' + command + ')')).encode())
+
+
+    def test_completed_literal_metadata_mode_and_path_echo_are_context_not_execution(self):
+        commands = [
+            'chmod 600 ' + REL, 'chmod 0600 ' + REL,
+            'sha256sum ' + REL, 'ls -l ' + REL, 'stat ' + REL,
+            'stat -c "%a %U %n" ' + REL, 'stat --format "%a:%u:%g" ' + REL,
+            'echo ' + REL,
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertLessEqual(68 + 9 * (len(command) + 2), 748)
+                svg = EXPANDED.decode().replace(THOUGHT, header_row('(' + command + ')')).encode()
+                self.assertEqual(recognize(svg)['proof_digest'], DIGEST)
+        # Context is never positive proof: removing the canonical result still
+        # refuses even when every metadata header is completed and valid.
+        command = 'sha256sum ' + REL
+        svg = EXPANDED.decode().replace(THOUGHT, header_row('(' + command + ')'))
+        with self.assertRaises(frame.Refused):
+            recognize(svg.replace('Command exited with code 0.', 'Command exited with code 1.').encode())
+
+    def test_metadata_expansion_wrappers_quoted_execution_and_noncompleted_refuse(self):
+        commands = [
+            'echo "' + CMD + '"',
+            'echo "$(cat ' + REL + ')"',
+            'chmod 600 ' + REL + ';:', 'ls -l ' + REL + '|cat',
+            'stat ' + REL + ' >/x', 'env chmod 600 ' + REL,
+            'sh -c "stat ' + REL + '"',
+            'sha256sum .local/*.py', 'ls -l .local/{a,b}.py',
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertLessEqual(68 + 9 * (len(command) + 2), 748)
+                with self.assertRaises(frame.Refused):
+                    recognize(EXPANDED.decode().replace(THOUGHT, header_row('(' + command + ')')).encode())
+        for command in ['chmod 600 ' + REL, 'sha256sum ' + REL, 'echo ' + REL]:
+            for marker, color in [('○', '#98c379'), ('●', '#e06c75')]:
+                row = header_row('(' + command + ')', marker=marker).replace('#98c379', color)
+                with self.subTest(command=command, marker=marker, color=color), self.assertRaises(frame.Refused):
+                    recognize(EXPANDED.decode().replace(THOUGHT, row).encode())
+        for command in ['python3 -c"exec(open(\'x\').read())#x.py"',
+                        'chmod 600 $(cat x)', 'stat -c "%a;id" ' + REL,
+                        'ls -l ' + REL + ' extra', 'echo AC10_WORK_V2', 'printf ' + REL,
+                        'chmod 600\n' + REL, 'stat\t' + REL]:
+            with self.subTest(helper=command):
+                self.assertFalse(frame._probe_file_context(command, REL))
 
 
 class CollapsedEligibilityTests(unittest.TestCase):
