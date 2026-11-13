@@ -9,13 +9,15 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 from unittest import mock
 
 import pytest
 
-from agent_hub_host import (api, default_claude_consumer as dcc, default_claude_transport as transport,
-                            native_import_host)
-from test_cli_default_claude_consumer import PATH, World, oauth, view
+from agent_hub_host import (api, config, default_claude_consumer as dcc, default_claude_transport as transport,
+                            managed_claude_deliver as deliver, native_claude_store as native,
+                            native_import_host, private_fs, worker_auth)
+from test_cli_default_claude_consumer import MCP, PATH, World, oauth, request, view
 
 pytestmark = pytest.mark.skipif(sys.platform != 'linux', reason='default Claude consumer is Linux only')
 
@@ -165,3 +167,124 @@ def test_legacy_or_ordinary_profile_is_never_a_fallback_identity(hub):
     with pytest.raises(ValueError, match='current enrolled host'):
         transport.bind_passive(SERVER)
     assert hub.opener.requests == []
+
+
+ALL_COMMANDS = (
+    ('status', {}),
+    ('check', {}),
+    ('enroll', {'confirm_same_account': True}),
+    ('disable', {}),
+    ('enable-writes', {'confirm_writer_handoff': True}),
+    ('observe', {}),
+)
+
+
+def _make_worker_context(tmp_path):
+    sid = '11111111-1111-4111-8111-111111111111'
+    intake = '33333333-3333-4333-8333-333333333333'
+    workspace = tmp_path / 'worker-ws'
+    contexts = workspace / '.local' / 'hub2-contexts'
+    contexts.mkdir(mode=0o700, parents=True, exist_ok=True)
+    ctx_file = contexts / f'{sid}-7.json'
+    ctx_file.write_text(json.dumps({
+        'server': SERVER,
+        'token': 'FAKE_WORKER_ONLY_' + 'x' * 40,
+        'expires_at': time.time() + 600,
+        'worker': {
+            'session_id': sid,
+            'operation_id': '22222222-2222-4222-8222-222222222222:0',
+            'epoch': 7,
+            'intake_id': intake,
+            'project_id': 'synthetic/project',
+            'machine_id': 'synthetic-machine',
+            'actor': 'session:' + sid,
+        },
+    }), encoding='utf-8')
+    os.chmod(ctx_file, 0o600)
+    return {
+        'APLEXER_TAG': 'task-hub2-' + sid,
+        'APLEXER_WORKSPACE': str(workspace),
+        'HUB2_CONFIG': str(ctx_file),
+    }
+
+
+def _assert_all_refused_with_zero_effects(hub, monkeypatch, env_overrides):
+    calls = []
+    monkeypatch.setattr(native, 'probe_version', lambda *a, **kw: calls.append('probe_version'))
+    monkeypatch.setattr(native, 'bind_executable', lambda *a, **kw: calls.append('bind_executable'))
+    monkeypatch.setattr(native, 'verify_executable', lambda *a, **kw: calls.append('verify_executable'))
+    monkeypatch.setattr(config, 'load_config', lambda *a, **kw: calls.append('load_config'))
+    real_read_bytes = private_fs.read_bytes
+    monkeypatch.setattr(private_fs, 'read_bytes',
+                        lambda path, *a, **kw: (calls.append(('read_bytes', str(path))),
+                                                real_read_bytes(path, *a, **kw))[1])
+    monkeypatch.setattr(dcc, 'save_state', lambda *a, **kw: calls.append('save_state'))
+    monkeypatch.setattr(dcc, '_remove_durably', lambda *a, **kw: calls.append('remove_durably'))
+
+    state_file = hub.managed / dcc.STATE_NAME
+    state_before = state_file.read_bytes() if state_file.exists() else None
+    cred_before = hub.raw()
+
+    with mock.patch.dict(os.environ, env_overrides):
+        for action, flags in ALL_COMMANDS:
+            with pytest.raises(worker_auth.WorkerContextError):
+                run(action, **flags)
+        with pytest.raises(worker_auth.WorkerContextError):
+            transport.bind_passive(SERVER)
+
+    assert calls == []
+    assert hub.opener.requests == []
+    assert (state_file.read_bytes() if state_file.exists() else None) == state_before
+    assert hub.raw() == cred_before
+
+
+@pytest.mark.parametrize('use_url_shortcut', [True, False])
+@pytest.mark.parametrize('pre_enrolled', [False, True])
+def test_v2_worker_context_refuses_all_six_commands_and_binder_without_side_effects(
+    hub, tmp_path, monkeypatch, use_url_shortcut, pre_enrolled
+):
+    hub.put(oauth(7))
+    if pre_enrolled:
+        run('enroll', confirm_same_account=True)
+        hub.opener.requests.clear()
+    worker_env = _make_worker_context(tmp_path)
+    if not use_url_shortcut:
+        monkeypatch.delenv('HUB_URL', raising=False)
+        monkeypatch.delenv('HUB_BASE_URL', raising=False)
+    else:
+        worker_env['HUB_URL'] = SERVER
+    _assert_all_refused_with_zero_effects(hub, monkeypatch, worker_env)
+
+
+@pytest.mark.parametrize('case', ['bad_tag', 'prefix_tag', 'missing_selector', 'malformed_selector'])
+def test_malformed_v2_worker_markers_refuse_without_fallback(hub, tmp_path, monkeypatch, case):
+    hub.put(oauth(7))
+    run('enroll', confirm_same_account=True)
+    hub.opener.requests.clear()
+    overrides = {
+        'bad_tag': {'APLEXER_TAG': 'task-hub2-corrupt'},
+        'prefix_tag': {'APLEXER_TAG': 'task-hub2-'},
+        'missing_selector': {'HUB2_CONFIG': str(tmp_path / 'hub2-contexts' / 'missing.json')},
+        'malformed_selector': {'HUB2_CONFIG': '/nonexistent/hub2-contexts/bad'},
+    }[case]
+    _assert_all_refused_with_zero_effects(hub, monkeypatch, overrides)
+
+
+def test_positive_ordinary_operator_and_clean_host_helper_delivery_still_work(hub):
+    hub.put(oauth(7))
+    assert transport.bind_passive(SERVER)[0] == 'test-host'
+    assert run('enroll', confirm_same_account=True)['mode'] == 'observe'
+    assert run('check')['generation'] == 7
+    assert run('enable-writes', confirm_writer_handoff=True)['mode'] == 'write'
+    assert run('status')['mode'] == 'write'
+
+    # Clean host delivery helper continues to materialize validated material.
+    delivered = deliver.deliver(None, request(8))
+    assert delivered['status'] == 'absent'
+    assert delivered['default'] == 'materialized'
+    assert delivered['default_enabled'] is True
+    assert hub.doc()['claudeAiOauth'] == oauth(8)
+    assert hub.doc()['mcpOAuth'] == MCP['mcpOAuth']
+
+    assert run('observe')['mode'] == 'observe'
+    assert run('disable')['removed'] is True

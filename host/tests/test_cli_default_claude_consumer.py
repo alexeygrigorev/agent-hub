@@ -61,7 +61,8 @@ class World:
         self.env = {'HOME': str(self.home), 'AGENT_HUB_MANAGED_DIR': str(self.managed)}
         for key, value in self.env.items():
             monkeypatch.setenv(key, value)
-        for key in ('CLAUDE_CONFIG_DIR', 'CLAUDE_SECURESTORAGE_CONFIG_DIR'):
+        for key in ('CLAUDE_CONFIG_DIR', 'CLAUDE_SECURESTORAGE_CONFIG_DIR',
+                    'HUB2_CONFIG', 'APLEXER_TAG', 'APLEXER_WORKSPACE', 'APLEXER_SESSION_ID'):
             monkeypatch.delenv(key, raising=False)
         self.bin = tmp_path / 'bin'
         self.bin.mkdir(mode=0o755)

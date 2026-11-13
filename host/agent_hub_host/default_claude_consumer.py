@@ -472,7 +472,9 @@ def set_mode(mode, *, confirm_writer_handoff=False):
 
 
 def command(args):
-    from . import config, default_claude_transport
+    from . import config, default_claude_transport, worker_auth
+
+    worker_auth.refuse_v2_profile_io()
 
     def fetch():
         base = os.environ.get('HUB_URL') or os.environ.get('HUB_BASE_URL') or config.load_config().get('base_url')
