@@ -551,6 +551,126 @@ class HealthTests(unittest.TestCase):
         self.assertEqual(self.requests, [])
         self.assertFalse(self.health_state.exists())
 
+    def test_health_state_ancestor_mkdir_and_fsync_fault_injection_retry(self):
+        self.start_server()
+        self.responses['/health'] = 200, b'{"ok":false}'
+        nested_parent = self.home / 'nested'
+        state_dir = nested_parent / 'state-dir'
+        self.health_state = state_dir / 'health.json'
+        args = helper.argparse.Namespace(
+            health_config=self.host_config, health_state=self.health_state,
+            health_timeout=1, health_offline_loopback=True,
+            alert_command=self.sink, alert_timeout=1)
+
+        real_mkdir = os.mkdir
+        real_fsync = os.fsync
+        fsynced_inos = []
+        fail_mkdir = [True]
+        fail_ino = [None]
+        fail_after_alerts = [None]
+
+        def wrapped_mkdir(path, mode=0o777, *, dir_fd=None):
+            if fail_mkdir[0]:
+                fail_mkdir[0] = False
+                raise OSError('injected mkdir failure')
+            return real_mkdir(path, mode, dir_fd=dir_fd)
+
+        def wrapped_fsync(fd):
+            ino = os.fstat(fd).st_ino
+            fsynced_inos.append(ino)
+            if fail_ino[0] is not None and ino == fail_ino[0]:
+                if fail_after_alerts[0] is None or len(self.alerts()) >= fail_after_alerts[0]:
+                    fail_ino[0] = None
+                    raise OSError('injected parent fsync failure')
+            return real_fsync(fd)
+
+        with mock.patch.object(helper.os, 'mkdir', side_effect=wrapped_mkdir), \
+             mock.patch.object(helper.os, 'fsync', side_effect=wrapped_fsync):
+            # 1. First mkdir fails: unknown, no renderer, nothing created.
+            res = helper.check_health(args)
+            self.assertEqual(res['status'], 'health_unknown')
+            self.assertFalse(res['alert_sent'])
+            self.assertEqual(self.alerts(), [])
+            self.assertFalse(nested_parent.exists())
+
+            # 2. Retry mkdir succeeds, but parent barrier (self.home) fsync fails.
+            home_ino = self.home.stat().st_ino
+            fail_ino[0] = home_ino
+            res = helper.check_health(args)
+            self.assertEqual(res['status'], 'health_unknown')
+            self.assertFalse(res['alert_sent'])
+            self.assertEqual(self.alerts(), [])
+            self.assertTrue(state_dir.is_dir())  # existing-dir retry must repair!
+
+            # 3. Retry with existing state_dir repairs ancestor barriers and records failure 1.
+            fsynced_inos.clear()
+            time.sleep(0.002)
+            res = helper.check_health(args)
+            self.assertEqual(res['status'], 'health_failed')
+            self.assertEqual(res['failures'], 1)
+            self.assertFalse(res['alert_sent'])
+            self.assertEqual(self.alerts(), [])
+            nested_ino = nested_parent.stat().st_ino
+            dir_ino = state_dir.stat().st_ino
+            self.assertIn(dir_ino, fsynced_inos)
+            self.assertIn(nested_ino, fsynced_inos)
+            self.assertIn(home_ino, fsynced_inos)
+
+            # 4. Second failure hits parent fsync failure before renderer: must NOT invoke renderer.
+            fail_ino[0] = nested_ino
+            time.sleep(0.002)
+            res = helper.check_health(args)
+            self.assertEqual(res['status'], 'health_unknown')
+            self.assertFalse(res['alert_sent'])
+            self.assertEqual(self.alerts(), [])
+
+            # 5. Retry repairs barrier, retains counter=2, invokes renderer once, persists alerted=True.
+            fsynced_inos.clear()
+            time.sleep(0.002)
+            res = helper.check_health(args)
+            self.assertEqual(res['status'], 'health_failed')
+            self.assertEqual(res['failures'], 2)
+            self.assertTrue(res['alert_sent'])
+            self.assertEqual(len(self.alerts()), 1)
+            self.assertIn(nested_ino, fsynced_inos)
+            self.assertIn(home_ino, fsynced_inos)
+            self.assertTrue(json.loads(self.health_state.read_text())['alerted'])
+
+            # 6. Subsequent failure dedupes with no duplicate alert.
+            time.sleep(0.002)
+            res = helper.check_health(args)
+            self.assertEqual(res['status'], 'health_failed')
+            self.assertEqual(res['failures'], 2)
+            self.assertFalse(res['alert_sent'])
+            self.assertEqual(len(self.alerts()), 1)
+
+            # 7. Recovery, then post-renderer barrier failure must not claim alert_sent=True.
+            self.responses['/health'] = 200, b'{"ok":true}'
+            time.sleep(0.002)
+            self.assertEqual(helper.check_health(args)['failures'], 0)
+            self.responses['/health'] = 200, b'{"ok":false}'
+            time.sleep(0.002)
+            self.assertEqual(helper.check_health(args)['failures'], 1)
+            fail_ino[0] = nested_ino
+            fail_after_alerts[0] = 2
+            time.sleep(0.002)
+            res = helper.check_health(args)
+            self.assertEqual(res['status'], 'health_unknown')
+            self.assertFalse(res['alert_sent'])
+
+    def test_health_state_symlink_ancestor_parent_fences(self):
+        self.start_server()
+        real_dir = self.home / 'real-dir'
+        real_dir.mkdir(mode=0o700)
+        link_parent = self.home / 'link-parent'
+        link_parent.symlink_to(real_dir, target_is_directory=True)
+        self.health_state = link_parent / 'sub' / 'health.json'
+        res = self.invoke_health()[1]['health']
+        self.assertEqual(res['status'], 'health_unknown')
+        self.assertFalse(res['healthy'])
+        self.assertEqual(self.alerts(), [])
+        self.assertFalse((real_dir / 'sub').exists())
+
 
 class ContractTests(unittest.TestCase):
     def test_config_bounds_and_known_default_accounts(self):
