@@ -195,7 +195,7 @@ class Host:
         self.config.write_text(json.dumps({
             "server": server.origin, "token": token, "machine_id": MACHINE,
             "roots": [str(self.workspace_root)], "engines": ["codex"],
-            "launcher": {"routes": {"codex": {"provider": "codex"}}, "aplexer_state_dir": str(self.state)}}))
+            "launcher": {"routes": {"codex": {"provider": "codex"}}, "aplexer_state_dir": str(self.state), "private_provider_homes": True}}))
         self.config.chmod(0o600)
         self.log_path = root / "host.log"
         self.process = None
