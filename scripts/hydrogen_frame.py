@@ -169,6 +169,24 @@ def timestamp(text, prefix):
         raise Refused('candidate timestamp refused') from error
 
 
+_UNRELATED_TOKENS = ('h7_', 'AC10', 'python3 .local', '.py', '…', '...', 'ctrl+o')
+
+
+def _unrelated_header(row):
+    """True only for a complete native tool header whose command cannot be the probe."""
+    if len(row) != 4:
+        return False
+    marker, gap, tool, args = row
+    if gap[:2] != (23, '#d4d4d4') or gap[3] != ' ' or tool[0] != 32 or tool[2] != 'bold':
+        return False
+    if re.fullmatch('[A-Za-z]{1,32}', tool[3]) is None or args[0] != 32 + 9 * len(tool[3]):
+        return False
+    text = args[3]
+    if not (text.startswith('(') and text.endswith(')') and 2 < len(text) <= 80):
+        return False
+    return not any(token in text for token in _UNRELATED_TOKENS)
+
+
 def recognize(svg, *, work, script_relpath, script_sha256, pinned_script,
               challenge, canonical_artifact, expected_command, home):
     """All arguments are independent Root-frozen byte snapshots, NOT values read from the SVG.
@@ -188,11 +206,15 @@ def recognize(svg, *, work, script_relpath, script_sha256, pinned_script,
     need(canonical_artifact == canonical({**work, 'proof_digest': digest}) + b'\n')
     title = expected_title(work['workspace'], work['session_id'], home)
     rows = rows_from_svg(svg, title)
-    # All native-looking tool headers count. A second, failed, collapsed or
-    # running native tool in this buffer is ambiguous; no "best block" selection.
+    # Exact target selection. Every native-looking tool header is a target
+    # candidate unless it is a complete, well-formed header for a provably
+    # unrelated command (e.g. `Bash(whoami)`): any probe path, evidence token,
+    # truncation or malformed/bare marker fails closed as a candidate. Exactly
+    # one candidate may exist, so a duplicate, same-command running/failed,
+    # another sample's probe or a truncated row is ambiguous; no "best block".
     native = []
     for y, row in rows.items():
-        if row and row[0][0] == 14 and row[0][3] in ('●', '○'):
+        if row and row[0][0] == 14 and row[0][3] in ('●', '○') and not _unrelated_header(row):
             native.append((y, row))
     need(len(native) == 1)
     y, header = native[0]

@@ -52,6 +52,16 @@ EXPANDED = (HFIX / 'expanded.svg').read_bytes()
 COLLAPSED = (HFIX / 'collapsed.svg').read_bytes()
 
 
+THOUGHT = '<text x="14" y="156" fill="#5c6370" textLength="144">▾ Thought for 2s</text>'
+
+
+def header_row(args, marker='●'):
+    return ('<text x="14" y="156" fill="#98c379" textLength="9">%s</text>'
+            '<text x="23" y="156" fill="#d4d4d4" textLength="9"> </text>'
+            '<text x="32" y="156" fill="#e5c07b" textLength="36" font-weight="bold">Bash</text>'
+            '<text x="68" y="156" fill="#abb2bf" textLength="%d">%s</text>') % (marker, 9 * len(args), args)
+
+
 def recognize(svg, **change):
     args = dict(work=WORK, script_relpath=REL, script_sha256=hashlib.sha256(SCRIPT).hexdigest(),
                 pinned_script=SCRIPT, challenge=CHALLENGE, canonical_artifact=ARTIFACT,
@@ -66,6 +76,12 @@ class FrameRecognizerTests(unittest.TestCase):
         self.assertEqual(result['status'], 'CANDIDATE_EXPANDED_FRAME_MATCH')
         self.assertEqual(result['proof_digest'], DIGEST)
         self.assertEqual(REL, '.local/h7_%s_01.py' % hashlib.sha256(frame.canonical([RUN, 1])).hexdigest()[:12])
+
+    def test_unrelated_complete_native_header_does_not_block_exact_target(self):
+        svg = EXPANDED.decode().replace(THOUGHT, header_row('(whoami)')).encode()
+        self.assertEqual(recognize(svg)['proof_digest'], DIGEST)
+        svg = EXPANDED.decode().replace(THOUGHT, header_row('(whoami)', marker='○')).encode()
+        self.assertEqual(recognize(svg)['proof_digest'], DIGEST)
 
     def test_negative_frames_and_bindings_refuse(self):
         text = EXPANDED.decode()
@@ -87,6 +103,9 @@ class FrameRecognizerTests(unittest.TestCase):
                 '<text x="14" y="156" fill="#98c379" textLength="9">●</text>').encode(),
             'hidden_nested_group': text.replace('</g></svg>', '<g><text x="14" y="12" fill="#d4d4d4" textLength="9">x</text></g></g></svg>').encode(),
             'doctype': b'<!DOCTYPE svg>' + EXPANDED,
+            'other_sample_probe_header': text.replace(THOUGHT, header_row('(python3 .local/h7_000000000000_02.py)')).encode(),
+            'truncated_target_header': text.replace(THOUGHT, header_row('(python3 .local/h7_c265b4…)')).encode(),
+            'unterminated_header': text.replace(THOUGHT, header_row('(whoami')).encode(),
         }
         for name, svg in mutations.items():
             with self.subTest(name=name), self.assertRaises(frame.Refused):
@@ -250,6 +269,47 @@ class BoundedCollectorTests(unittest.TestCase):
         self.assertEqual(rc, 126)
         self.assertLess(took, 3)
         self.assertEqual(acc.Runner().run_bounded('git', ['status'], deadline=1, timeout=1, max_stdout=1, max_stderr=1)[0], 127)
+
+
+    def test_absolute_deadline_caps_timeout_and_expired_deadline_never_spawns(self):
+        marker = Path(tempfile.mkdtemp(dir=os.environ.get('TMPDIR'))) / 'spawned'
+        r = acc.Runner(a=sys.executable)
+        now = time.monotonic()
+        code = 'open(%r, "w").close()' % str(marker)
+        rc, out, err = r.run_bounded('a', ['-c', code], deadline=now - 1, timeout=1, max_stdout=10, max_stderr=10)
+        self.assertEqual((rc, out), (124, b''))
+        time.sleep(0.2)
+        self.assertFalse(marker.exists(), 'an expired absolute deadline must refuse before any child exists')
+        start = time.monotonic()
+        rc, _, _ = r.run_bounded('a', ['-c', 'import time; time.sleep(30)'], deadline=start + 0.4, timeout=30,
+                                 max_stdout=10, max_stderr=10)
+        self.assertEqual(rc, 124)
+        self.assertLess(time.monotonic() - start, 2.5)
+
+    def test_interrupt_during_wait_still_kills_reaps_and_closes_owned_child(self):
+        r = acc.Runner(a=sys.executable)
+        seen = {}
+        real_popen = subprocess.Popen
+
+        def popen(*args, **kwargs):
+            proc = real_popen(*args, **kwargs)
+            seen['proc'] = proc
+            real_wait = proc.wait
+            calls = {'n': 0}
+
+            def wait(timeout=None):
+                calls['n'] += 1
+                if calls['n'] == 1:
+                    raise KeyboardInterrupt
+                return real_wait(timeout)
+            proc.wait = wait
+            return proc
+        with mock.patch.object(acc.subprocess, 'Popen', popen), self.assertRaises(KeyboardInterrupt):
+            r.run_bounded('a', ['-c', 'import time; time.sleep(30)'], deadline=time.monotonic() + 0.3,
+                          timeout=0.3, max_stdout=10, max_stderr=10)
+        proc = seen['proc']
+        self.assertIsNotNone(proc.returncode, 'owned child must be reaped')
+        self.assertTrue(proc.stdout.closed and proc.stderr.closed)
 
 
 class PinnedHelperTests(unittest.TestCase):
