@@ -137,6 +137,7 @@ def test_credentials_go_to_child_only_not_native_profile_or_argv():
     with patch.object(p.subprocess, 'run', side_effect=installer):
         p.sync(lambda *a: {'engines': [b]})
     with patch.object(p.sys, 'argv', ['wrapper', 'test-account', '--version']), \
+         patch.object(p, 'codex_launch_wrapper', return_value=Path('/synthetic/launch-codex.sh')), \
          patch.object(p, 'hub_launch_gate', return_value=(True, 'ok')), \
          patch.object(p.os, 'execve') as execute:
         p.execute()
