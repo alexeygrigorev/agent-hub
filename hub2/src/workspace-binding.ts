@@ -25,6 +25,16 @@ function intakeWorktree(requested:string,resolved:string):boolean {
   return resolved.startsWith(prefix)&&/^[a-f0-9]{64}$/.test(resolved.slice(prefix.length));
 }
 
+// A retained intake branch stays checked out where it was first created, so a
+// later start in another enrolled checkout continues in that same worktree:
+// `<any absolute checkout>/.local/hub-worktrees/<64-hex intake digest>`.
+function retainedIntakeWorktree(resolved:string):boolean {
+  const parts=resolved.split(/[\\/]/);
+  const marker=parts.length-3;
+  return marker>=2&&parts[marker]==='.local'&&parts[marker+1]==='hub-worktrees'&&/^[a-f0-9]{64}$/.test(parts[marker+2])
+    &&!parts.slice(0,marker).includes('..')&&!parts.slice(0,marker).includes('.');
+}
+
 function validate(requested:unknown,value:unknown):WorkspaceBinding {
   const binding=value as Partial<WorkspaceBinding>|null;
   if(typeof requested!=='string'||!binding||typeof binding!=='object'||Array.isArray(binding)
@@ -32,7 +42,7 @@ function validate(requested:unknown,value:unknown):WorkspaceBinding {
     ||typeof binding.resolved_workspace!=='string'||binding.resolved_workspace.length>1024
     ||/[\u0000-\u001f]/.test(binding.resolved_workspace)||!absolute(binding.resolved_workspace)
     ||(!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(requested)&&binding.resolved_workspace!==requested
-      && !intakeWorktree(requested,binding.resolved_workspace))) {
+      && !intakeWorktree(requested,binding.resolved_workspace)&&!retainedIntakeWorktree(binding.resolved_workspace))) {
     throw new HttpError('invalid_workspace_binding',409);
   }
   return {version:1,requested_workspace:requested,resolved_workspace:binding.resolved_workspace};

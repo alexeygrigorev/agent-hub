@@ -710,12 +710,12 @@ export class MachineDO {
       if (!attachment?.machine_id) return;
       const row = this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND machine_id=?', body.session_id, attachment.machine_id);
       if (!row || row.epoch !== body.epoch) {
-        socket.send(JSON.stringify({ type: 'error', error: 'stale_offer' }));
+        socket.send(JSON.stringify({ type: 'error', error: 'stale_offer', session_id: body.session_id, epoch: body.epoch }));
         return;
       }
       const launch=this.parse(row.launch_json) as JsonRecord;
       if(this.managedClaudeLaunch(launch)&&(!this.managedClaudeSocket(socket)||!this.managedClaudeAvailable(row.machine_id))){
-        socket.send(JSON.stringify({type:'error',error:'managed_exec_unavailable'}));return;
+        socket.send(JSON.stringify({type:'error',error:'managed_exec_unavailable',session_id:body.session_id,epoch:body.epoch}));return;
       }
       const binding=mergeWorkspaceBinding(launch.workspace,launch[WORKSPACE_BINDING_FIELD],body.workspace_binding);
       const newlyBound=binding!==undefined&&launch[WORKSPACE_BINDING_FIELD]===undefined;
@@ -741,7 +741,7 @@ export class MachineDO {
         return;
       }
       if (row.state !== 'offered' || row.offer_expires_at === null || row.offer_expires_at <= Date.now()) {
-        socket.send(JSON.stringify({ type: 'error', error: 'offer_unavailable' }));
+        socket.send(JSON.stringify({ type: 'error', error: 'offer_unavailable', session_id: body.session_id, epoch: body.epoch }));
         return;
       }
       const now = Date.now();
@@ -759,7 +759,7 @@ export class MachineDO {
       socket.send(JSON.stringify({ type: 'ack', session_id: row.id, epoch: row.epoch,
         ...(binding?{workspace_binding:binding}:{}) }));
     } catch(caught) {
-      if(caught instanceof HttpError)try{socket.send(JSON.stringify({type:'error',error:caught.code}));}catch{}
+      if(caught instanceof HttpError)try{socket.send(JSON.stringify({type:'error',error:caught.code,session_id:body.session_id,epoch:body.epoch}));}catch{}
     }
   }
 

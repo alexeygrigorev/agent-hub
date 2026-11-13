@@ -15,3 +15,11 @@ test('absolute worktree redirection refuses arbitrary paths, traversal and malfo
  for(const resolved of ['/foreign','/work/repo/.local/hub-worktrees/../foreign','/work/repo/.local/hub-worktrees/'+ 'a'.repeat(63),'/work/repo/.local/hub-worktrees/'+ 'a'.repeat(64)+'/child'])
   assert.throws(()=>mergeWorkspaceBinding('/work/repo',undefined,{version:1,requested_workspace:'/work/repo',resolved_workspace:resolved}),/invalid_workspace_binding/);
 });
+test('a retained intake worktree created under another enrolled checkout stays a valid binding',()=>{
+ const resolved='/work/preview-wrap/.local/hub-worktrees/'+'9'.repeat(64);
+ const binding={version:1,requested_workspace:'/work/newsletter',resolved_workspace:resolved};
+ assert.deepEqual(mergeWorkspaceBinding('/work/newsletter',undefined,binding),binding);
+ assert.equal(boundWorkspace({workspace:'/work/newsletter'},binding),resolved);
+ for(const bad of ['/work/x/../y/.local/hub-worktrees/'+'9'.repeat(64),'/.local/hub-worktrees/'+'9'.repeat(64),'/work/x/.local/other/'+'9'.repeat(64),'/work/x/.local/hub-worktrees/'+'G'.repeat(64)])
+  assert.throws(()=>mergeWorkspaceBinding('/work/newsletter',undefined,{...binding,resolved_workspace:bad}),/invalid_workspace_binding/);
+});

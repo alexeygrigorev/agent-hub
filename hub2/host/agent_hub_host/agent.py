@@ -143,13 +143,25 @@ class OfferAcknowledgement:
     def __init__(self, binding):
         self.binding, self.binding_verified = binding, False
         self.ready = threading.Event()
+        self.rejection = None
+
+    def reject(self, event):
+        # The server named why it will not claim this offer; fail now, not after 15s.
+        if self.ready.is_set():
+            return  # the first response wins
+        self.rejection = str(event.get('error') or 'unknown')[:80]
+        self.ready.set()
 
     def accept(self, event):
+        if self.ready.is_set():
+            return  # the first response wins
         self.binding_verified = self.binding is not None and event.get('workspace_binding') == self.binding
         self.ready.set()
 
     def wait(self, timeout):
         if not self.ready.wait(timeout):
+            raise RuntimeError('claim_ack_unverified')
+        if self.rejection is not None:
             raise RuntimeError('claim_ack_unverified')
         return self.binding_verified
 
@@ -1532,6 +1544,13 @@ class Bridge:
                                     ready = waiters.get((event.get('session_id'), event.get('epoch')))
                                     if ready:
                                         ready.accept(event)
+                            elif event.get('type') == 'error' and (event.get('session_id'), event.get('epoch')) in waiters:
+                                logging.getLogger(__name__).error('Hub refused offer claim session=%s epoch=%s error=%s',
+                                                                  event.get('session_id'), event.get('epoch'), str(event.get('error'))[:80])
+                                with waiter_lock:
+                                    ready = waiters.get((event.get('session_id'), event.get('epoch')))
+                                    if ready:
+                                        ready.reject(event)
                             elif event.get('type') == 'session.offer':
                                 session = event.get('offer', {}).get('session_id')
                                 with self._inflight_lock:
