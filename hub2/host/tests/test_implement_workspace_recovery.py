@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -275,11 +276,12 @@ with _repository_lock(sys.argv[1]):
 
         # Foreign record content is rejected and never overwritten.
         foreign_payload = json.dumps({
-            'version': 1,
+            'version': module._RECORD_VERSION,
             'intake_id': 'other-intake',
             'project_id': 'org/project',
             'ref': self.ref,
             'source': 'prepare',
+            'phase': 'owned',
         })
         record_path.write_text(foreign_payload)
         with self.assertRaisesRegex(ValueError, 'owner_conflict'):
@@ -395,6 +397,141 @@ with _repository_lock(sys.argv[1]):
         self.assertEqual(self.git(recovered, 'rev-parse', 'HEAD'), tip)
         self.assertEqual((recovered / 'legacy').read_text(), 'legacy')
 
+
+    # --- AB0516 follow-up regressions -------------------------------------
+
+    def common(self):
+        return Path(self.git(self.repo, 'rev-parse', '--path-format=absolute', '--git-common-dir'))
+
+    def record_path(self):
+        return self.common() / module._OWNERS_DIR / f'{self.digest}.json'
+
+    def fsynced_inodes(self, action):
+        seen = set()
+        real = os.fsync
+        def spy(fd):
+            st = os.fstat(fd)
+            seen.add((st.st_dev, st.st_ino))
+            return real(fd)
+        with patch.object(module.os, 'fsync', side_effect=spy):
+            result = action()
+        return result, seen
+
+    def chain_inodes(self):
+        paths = [self.record_path(), self.common() / module._OWNERS_DIR, self.common()]
+        return {(p.stat().st_dev, p.stat().st_ino) for p in paths}
+
+    @unittest.skipIf(os.name == 'nt', 'directory fsync is POSIX-only')
+    def test_new_record_fsyncs_file_owners_dir_and_common_dir(self):
+        target, seen = self.fsynced_inodes(self.prepare)
+        self.assertEqual(target, self.target)
+        self.assertLessEqual(self.chain_inodes(), seen)
+        data = json.loads(self.record_path().read_text())
+        self.assertEqual((data['version'], data['phase'], data['source']),
+                         (module._RECORD_VERSION, 'owned', 'prepare'))
+
+    @unittest.skipIf(os.name == 'nt', 'directory fsync is POSIX-only')
+    def test_existing_record_retries_repair_full_chain_durability(self):
+        self.retained()
+        # Retained-branch retry with an existing record.
+        target, seen = self.fsynced_inodes(self.prepare)
+        self.assertEqual(target, self.target)
+        self.assertLessEqual(self.chain_inodes(), seen)
+        # Continuation retries (target path and bound worktree root).
+        for action in (self.prepare,
+                       lambda: module.prepare_workspace(self.target, 'fix', **self.identity)):
+            _, seen = self.fsynced_inodes(action)
+            self.assertLessEqual(self.chain_inodes(), seen)
+
+    @unittest.skipIf(os.name == 'nt', 'directory fsync is POSIX-only')
+    def test_directory_fsync_failure_fails_closed_before_success(self):
+        tip = self.retained()
+        real = os.fsync
+        def fail_dirs(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError('injected')
+            return real(fd)
+        with patch.object(module.os, 'fsync', side_effect=fail_dirs):
+            with self.assertRaisesRegex(ValueError, 'owner_durability_failed'):
+                self.prepare()
+        self.assertFalse(self.target.exists())
+        self.assertEqual(self.git(self.repo, 'rev-parse', self.ref), tip)
+        self.assertEqual(self.git(self.prepare(), 'rev-parse', 'HEAD'), tip)
+
+    def test_foreign_ref_injected_before_add_never_auto_assigned(self):
+        (self.repo / 'foreign').write_text('foreign')
+        self.git(self.repo, 'add', 'foreign')
+        self.git(self.repo, 'commit', '-m', 'foreign commit')
+        foreign_tip = self.git(self.repo, 'rev-parse', 'HEAD')
+        self.git(self.repo, 'reset', '--hard', 'HEAD~1')
+        real_git = module._git
+        def inject(root, *args):
+            if args[:3] == ('worktree', 'add', '-b'):
+                self.git(self.repo, 'update-ref', self.ref, foreign_tip, '')
+            return real_git(root, *args)
+        with patch.object(module, '_git', side_effect=inject):
+            with self.assertRaisesRegex(ValueError, 'git_failed operation=worktree'):
+                self.prepare()
+        self.assertFalse(self.record_path().exists())
+        self.assertFalse(self.target.exists())
+        self.assertEqual(self.git(self.repo, 'rev-parse', self.ref), foreign_tip)
+        with self.assertRaisesRegex(ValueError, 'ownership_unverified'):
+            self.prepare()
+        self.assertFalse(self.record_path().exists())
+        self.assertFalse(self.target.exists())
+        self.assertEqual(self.git(self.repo, 'rev-parse', self.ref), foreign_tip)
+        self.assertNotIn('branch ' + self.ref, self.git(self.repo, 'worktree', 'list', '--porcelain'))
+
+    def test_premature_pre_creation_v1_record_is_rejected(self):
+        self.git(self.repo, 'branch', self.branch, 'main')
+        owners = self.common() / module._OWNERS_DIR
+        owners.mkdir(mode=0o700)
+        self.record_path().write_text(json.dumps({
+            'version': 1, 'source': 'prepare', 'ref': self.ref, **self.identity}))
+        os.chmod(self.record_path(), 0o600)
+        with self.assertRaisesRegex(ValueError, 'owner_invalid'):
+            self.prepare()
+        self.assertFalse(self.target.exists())
+
+    def legacy_marked_worktree(self):
+        self.target.parent.mkdir(parents=True, exist_ok=True)
+        self.git(self.repo, 'worktree', 'add', '-b', 'legacy-renamed', str(self.target), 'main')
+        admin = Path(self.git(self.target, 'rev-parse', '--absolute-git-dir'))
+        (admin / module._MARKER).write_text(json.dumps(self.identity, sort_keys=True))
+
+    def foreign_same_name_ref(self):
+        (self.repo / 'foreign').write_text('foreign')
+        self.git(self.repo, 'add', 'foreign')
+        self.git(self.repo, 'commit', '-m', 'foreign commit')
+        foreign_tip = self.git(self.repo, 'rev-parse', 'HEAD')
+        self.git(self.repo, 'branch', self.branch, foreign_tip)
+        self.git(self.repo, 'reset', '--hard', 'HEAD~1')
+        return foreign_tip
+
+    def assert_legacy_mismatch_preserved_without_minting(self, foreign_tip):
+        (self.target / 'source').write_text('dirty legacy continuation')
+        self.assertEqual(self.prepare(), self.target)
+        self.assertEqual(module.prepare_workspace(self.target, 'fix', **self.identity), self.target)
+        self.assertEqual((self.target / 'source').read_text(), 'dirty legacy continuation')
+        self.assertFalse(self.record_path().exists())
+        self.assertEqual(self.git(self.repo, 'rev-parse', self.ref), foreign_tip)
+        self.git(self.repo, 'worktree', 'remove', '--force', str(self.target))
+        with self.assertRaisesRegex(ValueError, 'ownership_unverified'):
+            self.prepare()
+        self.assertFalse(self.record_path().exists())
+        self.assertEqual(self.git(self.repo, 'rev-parse', self.ref), foreign_tip)
+
+    def test_legacy_marker_on_renamed_branch_never_mints_derived_ownership(self):
+        foreign_tip = self.foreign_same_name_ref()
+        self.legacy_marked_worktree()
+        self.assertEqual(self.git(self.target, 'symbolic-ref', 'HEAD'), 'refs/heads/legacy-renamed')
+        self.assert_legacy_mismatch_preserved_without_minting(foreign_tip)
+
+    def test_legacy_marker_on_detached_head_never_mints_derived_ownership(self):
+        foreign_tip = self.foreign_same_name_ref()
+        self.legacy_marked_worktree()
+        self.git(self.target, 'checkout', '--detach')
+        self.assert_legacy_mismatch_preserved_without_minting(foreign_tip)
 
 if __name__ == '__main__':
     unittest.main()
