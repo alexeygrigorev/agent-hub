@@ -62,13 +62,40 @@ def absolute_path(raw):
     return path
 
 
+def fsync_state_dir(parent, create=False):
+    if not parent.is_absolute():
+        raise Failure('state_directory_untrusted')
+    fds = []
+    try:
+        fds.append(os.open('/', os.O_RDONLY | os.O_DIRECTORY))
+        for part in parent.parts[1:]:
+            try:
+                next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fds[-1])
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(part, 0o700, dir_fd=fds[-1])
+                except FileExistsError:
+                    pass
+                next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fds[-1])
+            fds.append(next_fd)
+        info = os.fstat(fds[-1])
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise Failure('state_directory_untrusted')
+        target_dev = info.st_dev
+        for fd in reversed(fds):
+            if os.fstat(fd).st_dev != target_dev:
+                break
+            os.fsync(fd)
+    finally:
+        for fd in reversed(fds):
+            os.close(fd)
+
+
 @contextlib.contextmanager
 def locked(path, timeout=1):
-    parent = path.parent
-    parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    info = parent.lstat()
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
-        raise Failure('state_directory_untrusted')
+    fsync_state_dir(path.parent, create=True)
     flags = os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW
     fd = os.open(str(path) + '.lock', flags, 0o600)
     try:
@@ -129,11 +156,7 @@ def write_state(path, data):
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
-        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        fsync_state_dir(path.parent)
     finally:
         Path(temporary).unlink(missing_ok=True)
 
