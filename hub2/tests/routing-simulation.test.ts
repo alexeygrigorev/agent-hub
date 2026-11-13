@@ -241,3 +241,21 @@ test('valid policy identifiers cannot change the simulation count object prototy
  assert.equal(response.status,200);assert.deepEqual(Object.keys(result.counts),['__proto__']);
  assert.equal(result.counts['__proto__'],3);
 });
+
+test('simulation with the real policy draws zero Codex when the account is fresh 6% or stale/unknown',async()=>{
+ const f=fixture();
+ f.accountRows.get('codex').quota.remaining=6;
+ const low=await simulateModelRoutes(f.env,{interactive:false},500,(()=>{let i=0;return()=>((i++)+.5)/500;})());
+ assert.ok(low.pool.every(row=>!row.policy_id.startsWith('codex-')));
+ assert.ok(!Object.keys(low.counts).some(id=>id.startsWith('codex-')),JSON.stringify(low.counts));
+ assert.ok(low.excluded.some(row=>row.policy_id==='codex-sol-medium'&&row.reason==='codex_reserve'));
+ assert.ok(Math.abs(low.pool.reduce((sum,row)=>sum+row.share,0)-1)<1e-12);
+ f.accountRows.get('codex').quota.remaining=16;
+ const ok=await simulateModelRoutes(f.env,{interactive:false},500,(()=>{let i=0;return()=>((i++)+.5)/500;})());
+ assert.ok(ok.pool.some(row=>row.policy_id==='codex-sol-medium'));
+ f.accountRows.get('codex').fresh=false;
+ const stale=await simulateModelRoutes(f.env,{interactive:false},500,(()=>{let i=0;return()=>((i++)+.5)/500;})());
+ assert.ok(!Object.keys(stale.counts).some(id=>id.startsWith('codex-')));
+ // Explicit Codex with an excluded account is a typed refusal, never a restored route.
+ await assert.rejects(()=>simulateModelRoutes(f.env,{interactive:false,engine:'codex'},1,()=>0),(e:any)=>e.code==='model_policy_unavailable');
+});
