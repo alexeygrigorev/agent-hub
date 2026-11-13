@@ -305,6 +305,12 @@ export function verificationVerdict(evidence: unknown, sessionId: string, criter
   return checked && 'verdict' in checked ? checked.verdict : undefined;
 }
 
+/** The named problem of a malformed verdict, for the append rejection. */
+export function verdictProblem(evidence: unknown, sessionId: string, criteriaCount: number): string {
+  const checked = checkVerdict(evidence, sessionId, criteriaCount);
+  return checked && 'problem' in checked ? clip(checked.problem, 600) : 'evidence is not an acceptance_verification verdict for this session';
+}
+
 /** Why a verifier left no usable verdict, in words, from its own appends
  * (newest first): a malformed verdict, a wrong record kind, or nothing. */
 export function verifierNoVerdictCause(appends: Array<{ note?: unknown; evidence?: unknown }>, sessionId: string, criteriaCount: number): string {

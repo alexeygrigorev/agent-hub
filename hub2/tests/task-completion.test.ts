@@ -484,6 +484,21 @@ test('pending continuation and delivery survive an outage longer than 25 hours',
   }finally{f.close();}
 });
 
+test('accepted intakes enter the completion scan only inside the bounded recent window',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'accepted-window');await start(f,id,'first');const b=await run(f,id);await claim(f,id,b.session_id);await finishClaimed(f,id,b);
+    const evidence=JSON.parse(intakeRow(f,id).final_evidence_json),due=Date.now()-100;
+    evidence.completion.delivery={state:'pending',key:'accepted-delivery',tries:0,next_action_at:due};
+    f.db().run("UPDATE intakes SET status='accepted',final_evidence_json=?,updated_at=? WHERE id=?",JSON.stringify(evidence),Date.now()-60_000,id);
+    assert.equal((f.project as any).completionNextDeadline(),due,'a recent accepted intake still gets its pending delivery');
+    f.db().run('UPDATE intakes SET updated_at=? WHERE id=?',Date.now()-8*24*3600000,id);
+    assert.equal((f.project as any).completionNextDeadline(),undefined,'old accepted intakes are outside the host-polled scan');
+    const plan=(f.db().all(`EXPLAIN QUERY PLAN SELECT 1 FROM intakes i WHERE i.status='accepted' AND i.updated_at>=?`,0) as any[]).map(r=>r.detail).join(' ');
+    assert.match(plan,/intakes_status_updated/,'the accepted window is an index range');
+  }finally{f.close();}
+});
+
 test('eligible current actions are filtered before LIMIT and alarm MIN; terminal continuation timestamps cannot hide delivery',async()=>{
   const f=fixture();
   try{
