@@ -783,7 +783,8 @@ with api['update_lock'](Path(sys.argv[2])):
         self.status['protocol_version'] = 2
         self.install()
         check = next(args for args in self.calls if '-c' in args)
-        self.assertIn('PROTOCOL_VERSION == 2', check[-1])
+        self.assertEqual(check[1:3], ['-I', '-c'])
+        self.assertEqual(check[4:], [SHA, '2', str((self.root / 'releases' / SHA).resolve())])
 
     def test_prune_keeps_three_owned_releases_and_unmanaged_directory(self):
         self.old_release()
