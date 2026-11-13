@@ -4,6 +4,7 @@ import {execFileSync,spawn} from 'node:child_process';
 import {createServer} from 'node:http';
 import {chmodSync,mkdirSync,mkdtempSync,rmSync,writeFileSync} from 'node:fs';
 import {join,resolve} from 'node:path';
+import {fileURLToPath} from 'node:url';
 import {NodeSqlStorage,NodeDurableStorage} from '../node/sqlite-storage.ts';
 import {ProjectDO} from '../src/project-do';
 import {ControlDO} from '../src/control-do';
@@ -11,7 +12,8 @@ import {ControlDO} from '../src/control-do';
 const admin={id:'human:cli-node-owner',kind:'operator',scopes:['operator:admin']};
 const criteria=['The feature is implemented','The PR is merged with green checks'];
 test('real Hub host CLI writes merge evidence and session-finished events through Node ProjectDO',async()=>{
-  const root=resolve('.local/tmp');mkdirSync(root,{recursive:true});
+  const projectRoot=resolve(fileURLToPath(new URL('../..',import.meta.url)));
+  const root=join(projectRoot,'.local','tmp');mkdirSync(root,{recursive:true});
   const directory=mkdtempSync(join(root,'completion-cli-node-'));
   const repo=join(directory,'repo'),bin=join(directory,'bin');mkdirSync(repo);mkdirSync(bin);
   const git=(...args:string[])=>execFileSync('git',args,{cwd:repo,encoding:'utf8',stdio:'pipe'}).trim();
@@ -80,7 +82,7 @@ test('real Hub host CLI writes merge evidence and session-finished events throug
     writeFileSync(config,JSON.stringify({server:`http://127.0.0.1:${port}`,token:'synthetic-cli-token',project:'org/cli-node'}));
     writeFileSync(finishedFile,JSON.stringify({kind:'session_finished',session_id:sessionId,summary:'CLI event delivered to Hub.',
       acceptance:criteria.map((criterion,index)=>({status:'met',proof:`${criterion}; proof ${index+1}`}))}));
-    const workingRepo=resolve('.'),pythonPath=resolve('hub2/host');
+    const workingRepo=projectRoot,pythonPath=join(projectRoot,'hub2','host');
     const invoke=(...args:string[])=>new Promise<{status:number|null;stdout:string;stderr:string}>((resolveInvoke,rejectInvoke)=>{
       const child=spawn('python3',['-B','-m','agent_hub_host.cli','--config',config,...args],{
         cwd:workingRepo,env:{PATH:bin+':'+(process.env.PATH??'/usr/bin:/bin'),PYTHONPATH:pythonPath,PYTHONDONTWRITEBYTECODE:'1'},
