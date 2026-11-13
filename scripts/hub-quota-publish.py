@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Maintain quota publication receipts; independently alert on stale accounts.
+"""Maintain quota receipts and monitor staleness, with opt-in Hub/host health.
 
 No quota details or command stderr are emitted or included in alerts. Only a
 validated successful `hub quota publish` receipt advances publication times.
@@ -9,6 +9,11 @@ import contextlib
 import fcntl
 import json
 import math
+import multiprocessing
+import re
+import urllib.error
+import urllib.parse
+import urllib.request
 import os
 from pathlib import Path
 import stat
@@ -58,7 +63,7 @@ def absolute_path(raw):
 
 
 @contextlib.contextmanager
-def locked(path):
+def locked(path, timeout=1):
     parent = path.parent
     parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     info = parent.lstat()
@@ -70,7 +75,15 @@ def locked(path):
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_nlink != 1:
             raise Failure('state_lock_untrusted')
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise Failure('state_lock_timeout') from None
+                time.sleep(0.02)
         yield
     finally:
         os.close(fd)
@@ -92,7 +105,7 @@ def read_state(path, now):
         with os.fdopen(fd, 'r', encoding='utf-8') as stream:
             fd = None
             data = json.load(stream, object_pairs_hook=unique_object)
-    except (ValueError, UnicodeError):
+    except (ValueError, UnicodeError, RecursionError):
         raise Failure('state_invalid') from None
     finally:
         if fd is not None:
@@ -173,13 +186,13 @@ def publish(args):
     return {'status': 'published', 'accounts': sorted(published)}
 
 
-def alert(args, accounts):
-    message = 'quota_stale accounts=' + ','.join(sorted(accounts)) + '; inspect the maintained quota publisher.'
+def alert(args, accounts=(), message=None):
+    message = message or 'quota_stale accounts=' + ','.join(sorted(accounts)) + '; inspect the maintained quota publisher.'
     env = {key: value for key, value in os.environ.items()
            if not any(word in key.upper() for word in ('TOKEN', 'SECRET', 'PASSWORD', 'CREDENTIAL', 'API_KEY', 'QUSE', 'HUB'))}
     env.update(PRINCIPAL_ALERT_TO=RECIPIENT, ALERT_TO=RECIPIENT, PING_ALERT_MESSAGE=message)
     try:
-        result = subprocess.run([str(args.alert_command), message], env=env, capture_output=True, text=True, timeout=args.alert_timeout)
+        result = subprocess.run([str(args.alert_command), message], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=args.alert_timeout)
         return result.returncode == 0
     except (OSError, UnicodeError, subprocess.TimeoutExpired):
         return False
@@ -204,6 +217,211 @@ def check(args):
             'sink_failed': not delivered}
 
 
+# The child alone loads the enrolled MACHINE credential. The parent receives
+# only fixed slugs, never response/config/exception text. Killing this owned
+# child bounds DNS, TLS and slow-drip reads as well as socket connection time.
+HEALTH_REASONS = frozenset(('ok', 'config_invalid', 'origin_invalid', 'auth_expired',
+    'http_rejected', 'response_invalid', 'not_ok', 'identity_mismatch',
+    'disconnected', 'transport_failed', 'deadline', 'probe_failed'))
+HEALTH_STAGES = frozenset(('config', 'public', 'host', 'probe'))
+
+
+def private_json(path):
+    # Walk from / with O_NOFOLLOW: a safe leaf behind a symlink is unsafe too.
+    directory = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in path.parts[1:-1]:
+            next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            os.close(directory)
+            directory = next_fd
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_mode & 0o077 or info.st_nlink != 1 or info.st_size > MAX_STATE_BYTES):
+                raise Failure('config_invalid')
+            with os.fdopen(fd, 'rb') as stream:
+                fd = None
+                raw = stream.read(MAX_STATE_BYTES + 1)
+            if len(raw) > MAX_STATE_BYTES:
+                raise Failure('config_invalid')
+            try:
+                value = json.loads(raw, object_pairs_hook=unique_object)
+            except (ValueError, UnicodeError, RecursionError):
+                raise Failure('config_invalid') from None
+            if not isinstance(value, dict):
+                raise Failure('config_invalid')
+            return value
+        finally:
+            if fd is not None:
+                os.close(fd)
+    finally:
+        os.close(directory)
+
+
+def health_origin(raw, offline):
+    if (not isinstance(raw, str) or len(raw) > 2048
+            or not re.fullmatch(r'[!-~]+', raw) or any(c in raw for c in ('\\', '%', '?', '#'))):
+        raise Failure('origin_invalid')
+    try:
+        url = urllib.parse.urlsplit(raw)
+        port = url.port
+        if (not url.hostname or url.username is not None or url.password is not None
+                or url.path not in ('', '/') or (port is not None and not 1 <= port <= 65535)):
+            raise ValueError()
+        host = url.hostname
+        label = r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
+        if not (re.fullmatch(label + r'(?:\.' + label + r')*', host) or host == '::1'):
+            raise ValueError()
+        authority = ('[' + host + ']' if ':' in host else host) + (':' + str(port) if port is not None else '')
+        if url.netloc.lower() != authority:
+            raise ValueError()
+        if url.scheme != 'https' and not (offline and url.scheme == 'http' and host in ('127.0.0.1', '::1')):
+            raise ValueError()
+    except ValueError:
+        raise Failure('origin_invalid') from None
+    return raw.rstrip('/')
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def health_get(opener, origin, path, token=None):
+    headers = {'Accept': 'application/json', 'Accept-Encoding': 'identity'}
+    if token is not None:
+        headers['Authorization'] = 'Bearer ' + token
+    request = urllib.request.Request(origin + path, headers=headers, method='GET')
+    try:
+        with opener.open(request, timeout=3) as response:
+            if not 200 <= response.status < 300 or response.geturl() != origin + path:
+                raise Failure('http_rejected')
+            if response.headers.get_content_type() != 'application/json' or response.headers.get('Content-Encoding', 'identity') != 'identity':
+                raise Failure('response_invalid')
+            raw = response.read(MAX_STATE_BYTES + 1)
+        if len(raw) > MAX_STATE_BYTES:
+            raise Failure('response_invalid')
+        body = json.loads(raw, object_pairs_hook=unique_object)
+        if not isinstance(body, dict):
+            raise Failure('response_invalid')
+        return body
+    except urllib.error.HTTPError:
+        raise Failure('http_rejected') from None
+    except (ValueError, UnicodeError, RecursionError):
+        raise Failure('response_invalid') from None
+    except (OSError, urllib.error.URLError):
+        raise Failure('transport_failed') from None
+
+
+def health_probe(pipe, config_path, offline):
+    stage = 'config'
+    try:
+        try:
+            config = private_json(config_path)
+        except (OSError, ValueError, UnicodeError):
+            raise Failure('config_invalid') from None
+        origin = health_origin(config.get('server'), offline)
+        machine, token = config.get('machine_id'), config.get('token')
+        if (not isinstance(machine, str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,80}', machine)
+                or not isinstance(token, str) or not re.fullmatch(r'[!-~]{1,8192}', token)):
+            raise Failure('config_invalid')
+        expires = config.get('expires_at')
+        if expires is not None and (type(expires) not in (int, float) or not math.isfinite(expires) or expires <= time.time()):
+            raise Failure('auth_expired')
+        # Explicitly disable all environment proxies. Redirects are never followed,
+        # including same-origin redirects, and public health never gets a token.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+        stage = 'public'
+        public = health_get(opener, origin, '/health')
+        if public.get('ok') is not True or public.get('status') == 'bootstrap':
+            raise Failure('not_ok')
+        stage = 'host'
+        body = health_get(opener, origin, '/api/fleet/routing/self', token)
+        if body.get('machine_id') != machine:
+            raise Failure('identity_mismatch')
+        if body.get('connected') is not True:
+            raise Failure('disconnected')
+        pipe.send((stage, 'ok'))
+    except Failure as error:
+        pipe.send((stage, str(error) if str(error) in HEALTH_REASONS else 'probe_failed'))
+    except Exception:
+        pipe.send((stage, 'probe_failed'))
+    finally:
+        pipe.close()
+
+
+def sample_health(args):
+    context = multiprocessing.get_context('fork')
+    reader, writer = context.Pipe(duplex=False)
+    child = context.Process(target=health_probe, args=(writer, args.health_config, args.health_offline_loopback))
+    deadline = time.monotonic() + args.health_timeout
+    try:
+        child.start()
+        writer.close()
+        child.join(max(0, deadline - time.monotonic()))
+        if child.is_alive():
+            return {'stage': 'probe', 'reason': 'deadline', 'healthy': False}
+        try:
+            stage, reason = reader.recv() if reader.poll() else ('probe', 'probe_failed')
+        except (EOFError, ValueError, TypeError):
+            stage, reason = 'probe', 'probe_failed'
+        if stage not in HEALTH_STAGES or reason not in HEALTH_REASONS:
+            stage, reason = 'probe', 'probe_failed'
+        return {'stage': stage, 'reason': reason, 'healthy': reason == 'ok'}
+    finally:
+        if child.pid is not None:
+            if child.is_alive():
+                child.kill()
+            child.join()
+            child.close()
+        writer.close()
+        reader.close()
+
+
+def check_health(args):
+    try:
+        started = now_ms()
+        # Serialize sample + transition + sink so overlapping/older invocations
+        # cannot deliver a stale incident after a later recovery. Lock is bounded.
+        with locked(args.health_state):
+            sample = sample_health(args)
+            try:
+                data = private_json(args.health_state)
+            except FileNotFoundError:
+                data = {'version': 1, 'last_sample': 0, 'failures': 0, 'alerted': False}
+            except (ValueError, UnicodeError, RecursionError):
+                raise Failure('state_invalid') from None
+            if (set(data) != {'version', 'last_sample', 'failures', 'alerted'}
+                    or type(data['version']) is not int or data['version'] != 1
+                    or type(data['last_sample']) is not int or data['last_sample'] < 0
+                    or type(data['failures']) is not int or not 0 <= data['failures'] <= 2
+                    or type(data['alerted']) is not bool
+                    or (data['alerted'] and data['failures'] != 2)):
+                raise Failure('state_invalid')
+            if started <= data['last_sample']:
+                raise Failure('clock_regressed')
+            data['last_sample'] = started
+            data['failures'] = 0 if sample['healthy'] else min(2, data['failures'] + 1)
+            if sample['healthy']:
+                data['alerted'] = False
+            # Persist failure evidence before invoking the renderer. Sink failure
+            # or process death leaves a retryable unsent incident.
+            write_state(args.health_state, data)
+            unsent = data['failures'] == 2 and not data['alerted']
+            delivered = not unsent or alert(args, message='health_critical stage=' + sample['stage'] +
+                ' reason=' + sample['reason'] + '; inspect Hub public health and the enrolled host daemon.')
+            if unsent and delivered:
+                data['alerted'] = True
+                write_state(args.health_state, data)
+            return {**sample, 'status': 'healthy' if sample['healthy'] else 'health_failed',
+                    'failures': data['failures'], 'alert_sent': bool(unsent and delivered), 'sink_failed': not delivered}
+    except (Failure, OSError):
+        # Unsafe/unavailable durable state cannot prove recovery or dedupe.
+        return {'status': 'health_unknown', 'healthy': False, 'stage': 'state',
+                'reason': 'state_unavailable', 'alert_sent': False, 'sink_failed': False}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--check', action='store_true', help='independent staleness monitor; never invokes hub/quse')
@@ -214,9 +432,21 @@ def main(argv=None):
     parser.add_argument('--stale-seconds', type=int, default=DEFAULT_STALE_SECONDS, help='1..900; default840 leaves delivery allowance within20min drill')
     parser.add_argument('--publish-timeout', type=int, default=120)
     parser.add_argument('--alert-timeout', type=int, default=30)
+    parser.add_argument('--health-check', action='store_true', help='opt-in public and own enrolled host health; requires --check')
+    parser.add_argument('--health-config', type=absolute_path, default=Path.home() / '.config/agent-hub/v2.json')
+    parser.add_argument('--health-state', type=absolute_path, default=Path.home() / '.local/state/agent-hub-health-monitor/state.json')
+    parser.add_argument('--health-timeout', type=int, default=8, help='1..8 seconds total child wall budget including DNS and reads')
+    parser.add_argument('--health-offline-loopback', action='store_true', help='allow literal loopback HTTP for explicit offline fixtures')
     args = parser.parse_args(argv)
+    if not 1 <= args.health_timeout <= 8 or (args.health_check and not args.check):
+        parser.error('health requires --check and timeout1..8 seconds')
+    if args.health_check and args.health_state == args.state:
+        parser.error('health state must be separate from quota state')
+    if args.health_check and args.alert_timeout > 8:
+        parser.error('health monitor requires alert timeout1..8 seconds to retain 45s service budget')
     if not 1 <= args.stale_seconds <= 900 or not 1 <= args.publish_timeout <= 120 or not 1 <= args.alert_timeout <= 30:
         parser.error('bounds: stale1..900, publish timeout1..120, alert timeout1..30 seconds')
+    health = check_health(args) if args.health_check else None
     try:
         result = check(args) if args.check else publish(args)
     except (Failure, OSError) as error:
@@ -230,7 +460,13 @@ def main(argv=None):
             result = {'status': 'publish_failed', 'reason': slug if slug in {
                 'clock_invalid', 'clock_regressed', 'state_invalid', 'state_directory_untrusted',
                 'state_lock_untrusted', 'result_invalid', 'cli_timeout', 'cli_unavailable', 'cli_failed'} else 'operation_failed'}
+    if health is not None:
+        result['health'] = health
+        if health['sink_failed']:
+            result['sink_failed'] = True
     print(json.dumps(result, sort_keys=True))
+    if health is not None and (not health['healthy'] or health['sink_failed']):
+        return 3 if result.get('sink_failed') else 2
     if result['status'] in ('fresh', 'published'):
         return 0
     return 3 if result.get('sink_failed') else 2 if result['status'] == 'quota_stale' else 1
