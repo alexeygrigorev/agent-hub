@@ -16,6 +16,29 @@ const CAPTURE_OUTPUT_BYTES = 64 * 1024;
 const CAPTURE_RESULT_JSON_BYTES = 400 * 1024;
 const CAPTURE_ACK_BODY_BYTES = 401 * 1024;
 const COMMAND_HISTORY_BYTES = 8 * 1024 * 1024;
+const HOST_START_DIAGNOSTIC_KEY = '_hub_host_start_diagnostic';
+const ANSI_ESCAPE = /\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001b\\))/g;
+const SECRET_ASSIGNMENT = /\b(authorization|proxy-authorization|www-authenticate|cookie|set-cookie|(?:access|refresh|id)[_-]?token|token|api[_-]?key|password|passwd|secret|credential)\b["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|\[redacted\]|[^\s,;}\]]+)/gi;
+
+function sanitizedHostDetail(value: unknown): string | undefined {
+  if(typeof value!=='string'||!value.trim())return undefined;
+  const input=value.slice(0,2048).replace(ANSI_ESCAPE,'');
+  const shapeCheck=input.replace(/\[redacted\]/gi,'');
+  if(/\b(?:traceback|stack trace|raw stderr|stderr|stdout|request body|response body|environment dump)\b/i.test(shapeCheck)
+    ||/[{}\[\]]/.test(shapeCheck)||/\b[A-Za-z_][A-Za-z0-9_]{1,}\s*=\s*(?!\[redacted\])\S/.test(input))return undefined;
+  const detail=input
+    .replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{6,}/gi,'[redacted]')
+    .replace(SECRET_ASSIGNMENT,'$1=[redacted]')
+    .replace(/https?:\/\/[^\s/@:]+:[^\s/@]+@/gi,'https://[redacted]@')
+    .replace(/\b(?:gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[A-Z0-9]{16})\b/g,'[redacted]')
+    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]/g,' ')
+    .replace(/\s+/g,' ').trim().slice(0,240).trim();
+  return detail||undefined;
+}
+
+function isJsonRecord(value: unknown): value is JsonRecord {
+  return typeof value==='object'&&value!==null&&!Array.isArray(value);
+}
 
 const LABEL_RECOVERY = `state='running' AND native_id IS NOT NULL
   AND CASE WHEN json_valid(launch_json) THEN
@@ -1474,6 +1497,28 @@ export class MachineDO {
     const row = this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND machine_id=?',body.session_id,attachment.machine_id);
     if (!row) return;
     const operation=boundedString(body.operation_id,180)?body.operation_id:null,message=boundedString(body.message_id,180)?body.message_id:null;
+    const hostLaunchEvent=(body.stage==='host_launch'||body.stage==null)&&message===null;
+    const hostLaunchDiagnostic=body.stage==='host_launch'&&message===null;
+    // A launch diagnostic is useful only for the exact currently-owned
+    // attempt. Operation IDs fence legacy hosts that omit epoch; if epoch is
+    // supplied, it must also match. Command and mailbox errors keep their
+    // existing looser diagnostic-only behavior below.
+    if(hostLaunchEvent&&(operation!==row.operation_id
+      ||body.epoch!==undefined&&(!Number.isSafeInteger(body.epoch)||body.epoch!==row.epoch)))return;
+    if(hostLaunchDiagnostic&&row.evidence_digest===null){
+      const previous=this.parse(row.evidence_json);
+      if(previous===null||isJsonRecord(previous)){
+        const evidence=isJsonRecord(previous)?{...previous}:{};
+        const detail=sanitizedHostDetail(body.detail);
+        const diagnostic={operation_id:row.operation_id,attempt:row.attempt,epoch:row.epoch,reason:body.reason,stage:'host_launch',
+          ...(detail?{detail}:{})};
+        if(JSON.stringify(evidence[HOST_START_DIAGNOSTIC_KEY])!==JSON.stringify(diagnostic)){
+          evidence[HOST_START_DIAGNOSTIC_KEY]=diagnostic;
+          this.db.run('UPDATE sessions SET evidence_json=? WHERE id=? AND operation_id=? AND attempt=? AND epoch=? AND evidence_digest IS NULL',
+            JSON.stringify(evidence),row.id,row.operation_id,row.attempt,row.epoch);
+        }
+      }
+    }
     const prior=this.db.one<{reason:string;operation_id:string|null;message_id:string|null}>('SELECT reason,operation_id,message_id FROM attention WHERE session_id=?',row.id);
     if (!prior || prior.reason!==body.reason || prior.operation_id!==operation || prior.message_id!==message) {
       this.db.run('INSERT INTO attention VALUES(?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET reason=excluded.reason,operation_id=excluded.operation_id,message_id=excluded.message_id,observed_at=excluded.observed_at',
@@ -1901,6 +1946,8 @@ export class MachineDO {
   private sessionView(row: SessionRow): JsonRecord {
     const launch=this.parse(row.launch_json) as JsonRecord;
     const picker=normalizeStartPickerEvidence(launch._hub_picker);
+    const attention=this.db.one<{reason:string;observed_at:number}>('SELECT reason,observed_at FROM attention WHERE session_id=?',row.id);
+    const diagnostic=attention?this.hostStartDiagnostic(row,attention.reason):null;
     return {id:row.id,state:row.state,intake_id:row.intake_id,project_id:row.project_id,machine_id:row.machine_id,
       epoch:row.epoch,operation_id:row.operation_id,native_id:row.native_id,engine:launch.engine,model:launch.model,
       managed:true,host:row.machine_id,machine:row.machine_id,workspace:boundWorkspace(launch),requested_workspace:launch.workspace,
@@ -1911,7 +1958,25 @@ export class MachineDO {
       mode:launch.interactive===true?'interactive':'headless',
       created_at:new Date(row.created_at).toISOString(),updated_at:new Date(row.updated_at).toISOString(),
       last_activity_at:this.db.one<{last_activity_at:number|null}>('SELECT last_activity_at FROM native_sessions WHERE session_id=?',row.id)?.last_activity_at??null,
-      interactive:launch.interactive,evidence:this.parse(row.evidence_json),attention:this.db.one('SELECT reason,observed_at FROM attention WHERE session_id=?',row.id)||null};
+      interactive:launch.interactive,evidence:this.sessionEvidence(row),
+      attention:attention?{...attention,...(diagnostic??{})}:null};
+  }
+
+  private sessionEvidence(row:SessionRow):unknown{
+    const evidence=this.parse(row.evidence_json);
+    if(!isJsonRecord(evidence)||!(HOST_START_DIAGNOSTIC_KEY in evidence))return evidence;
+    const projected={...evidence};delete projected[HOST_START_DIAGNOSTIC_KEY];
+    return Object.keys(projected).length?projected:null;
+  }
+
+  private hostStartDiagnostic(row:SessionRow,reason:string):JsonRecord|null{
+    if(row.evidence_digest!==null)return null;
+    const evidence=this.parse(row.evidence_json);
+    const diagnostic=isJsonRecord(evidence)?evidence[HOST_START_DIAGNOSTIC_KEY]:null;
+    if(!isJsonRecord(diagnostic)||diagnostic.operation_id!==row.operation_id||diagnostic.attempt!==row.attempt||diagnostic.epoch!==row.epoch
+      ||diagnostic.reason!==reason||diagnostic.stage!=='host_launch')return null;
+    const detail=sanitizedHostDetail(diagnostic.detail);
+    return {stage:'host_launch',...(detail?{detail}:{})};
   }
 
   /** Hibernation attachments retain selection across eviction; prune legacy duplicates before RPCs. */
