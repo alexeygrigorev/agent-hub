@@ -107,6 +107,35 @@ CODEX_WRAPPER_PROFILE = 'hub-shared-codex'
 CODEX_WRAPPER_DEFAULT = ('git', 'cloudflare-agent-git', 'scripts', 'launch-codex.sh')
 
 
+def _valid_codex_wrapper_body(text):
+    """Return True only for the exact canonical maintained Codex quota wrapper template."""
+    if '\r' in text:
+        return False
+    raw_lines = text.splitlines()
+    if not raw_lines or raw_lines[0] not in ('#!/usr/bin/env bash', '#!/bin/bash'):
+        return False
+    stmts = [line.strip() for line in raw_lines[1:] if line.strip() and not line.strip().startswith('#')]
+    if len(stmts) not in (3, 4) or stmts[0] != 'set -euo pipefail':
+        return False
+    if len(stmts) == 4:
+        repo_match = re.fullmatch(r'repo=(/[A-Za-z0-9._/@+-]+)', stmts[1])
+        if not repo_match or '..' in Path(repo_match.group(1)).parts:
+            return False
+        if stmts[2] != 'python3 "$repo/scripts/quota-gate.py"':
+            return False
+    else:
+        gate_match = re.fullmatch(r'python3 (?:"(/[A-Za-z0-9._/@+-]+/quota-gate\.py)"|(/[A-Za-z0-9._/@+-]+/quota-gate\.py))', stmts[1])
+        if not gate_match:
+            return False
+        gate_path = gate_match.group(1) or gate_match.group(2)
+        if '..' in Path(gate_path).parts:
+            return False
+    exec_match = re.fullmatch(r'exec (/[A-Za-z0-9._/@+-]+/codex) "\$@"', stmts[-1])
+    if not exec_match or '..' in Path(exec_match.group(1)).parts:
+        return False
+    return True
+
+
 def codex_launch_wrapper(environ=None, home=None):
     """Verified maintained Codex quota wrapper (resolved Linux path) or ValueError.
 
@@ -142,11 +171,11 @@ def codex_launch_wrapper(environ=None, home=None):
                 or info.st_mode & 0o020 and info.st_gid != os.getegid() or not os.access(real, os.X_OK)):
             raise ValueError
         with open(real, 'rb') as stream:
-            text = stream.read(4097).decode('utf8')
-        lines = [line.strip() for line in text.splitlines() if line.strip() and not line.strip().startswith('#')]
-        if (not text.startswith(('#!/usr/bin/env bash', '#!/bin/bash')) or 'set -euo pipefail' not in lines
-                or not lines or not any('quota-gate.py' in line for line in lines[:-1])
-                or not re.fullmatch(r'exec \S*/codex "\$@"', lines[-1])):
+            raw = stream.read(4097)
+        if len(raw) > 4096:
+            raise ValueError
+        text = raw.decode('utf8')
+        if not _valid_codex_wrapper_body(text):
             raise ValueError
         return Path(real)
     except (OSError, ValueError, UnicodeDecodeError, RuntimeError):
