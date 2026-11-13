@@ -101,6 +101,26 @@ class ImplementWorkspaceTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'path_untrusted'):
                 prepare_workspace(self.shared, 'implement', 'one', 'org/repo')
 
+    def test_default_branch_master_when_origin_has_no_main(self):
+        origin = self.root / 'origin-master.git'
+        seed = self.root / 'seed-master'
+        checkout = self.root / 'checkout-master'
+        self.git(self.root, 'init', '--bare', str(origin))
+        self.git(self.root, 'init', '-b', 'master', str(seed))
+        self.git(seed, 'config', 'user.email', 'test@example.test')
+        self.git(seed, 'config', 'user.name', 'test')
+        (seed / 'tracked').write_text('master')
+        self.git(seed, 'add', 'tracked')
+        self.git(seed, 'commit', '-m', 'master')
+        self.git(seed, 'remote', 'add', 'origin', str(origin))
+        self.git(seed, 'push', 'origin', 'master')
+        self.git(origin, 'symbolic-ref', 'HEAD', 'refs/heads/master')
+        self.git(self.root, 'clone', '-b', 'master', str(origin), str(checkout))
+        expected = self.git(seed, 'rev-parse', 'HEAD')
+        wt = prepare_workspace(checkout, 'implement', 'intake-master', 'org/repo-master')
+        self.assertEqual(self.git(wt, 'rev-parse', 'HEAD'), expected)
+        self.assertEqual((wt / 'tracked').read_text(), 'master')
+
 
 if __name__ == '__main__':
     unittest.main()
