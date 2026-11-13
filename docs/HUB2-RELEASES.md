@@ -113,6 +113,18 @@ pushes queue behind the `agent-hub-production` concurrency group, so the newest
 pending commit wins. Manual `gh workflow run deploy.yml --ref main -f dry_run=false`
 remains for bootstrap mode, retries and rollback.
 
+The deploy canary's explicit `systemctl --user start` must not be mistaken
+for a timer run. systemd (verified on 255) keeps the previous timer
+activation's `TRIGGER_UNIT` and `TRIGGER_TIMER_REALTIME_USEC` on a later manual
+start. The updater therefore treats a run as timer-triggered only when that
+trigger time is at most 15 s old. Before this fix every canary start was
+deferred by `release_batch_interval`. The canary then timed out with
+`timeout_candidate_release_not_installed`, the deploy rolled back the
+publication, and hosts stayed on the old release. A host that still runs an
+updater older than this fix needs one direct run during a deploy's canary
+window (`python3 ~/.local/share/agent-hub2/updater.py` with no `TRIGGER_*`
+variables set). That run installs the fixed updater.
+
 A failed automatic deploy rolls back. It then opens or updates the GitHub issue
 "Hub2 auto-deploy failed: main is not live in production", assigned to the
 repository owner (the deploy owner), with the run link, and marks the run with an
