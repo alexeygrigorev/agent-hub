@@ -269,6 +269,61 @@ def interactive_argv(provider, argv, prompt, *, model, effort=None, with_goal=Fa
     return result
 
 
+def antigravity_launch_workspace(workspace):
+    """The directory an interactive agy pane actually runs in.
+
+    aplexer starts the child with --cwd set to the launch workspace and the
+    client PWD is already the resolved spelling, so the kernel/Go working
+    directory is the resolved existing directory. Only that exact path is
+    eligible for session trust; parents, siblings and requested aliases are
+    never added."""
+    if not isinstance(workspace, str) or '\0' in workspace or not Path(workspace).is_absolute():
+        raise ValueError('antigravity_workspace_trust_unverified')
+    try:
+        resolved = Path(workspace).resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise ValueError('antigravity_workspace_trust_unverified') from None
+    if not resolved.is_dir() or not same_workspace(str(resolved), workspace):
+        raise ValueError('antigravity_workspace_trust_unverified')
+    return str(resolved)
+
+
+def antigravity_trust_argv(argv, workspace):
+    """Session-only agy --settings granting trust to exactly one workspace.
+
+    agy's --settings accepts an inline JSON object whose trustedWorkspaces is a
+    string array. Nothing is written to agy's global settings or trust store.
+    An existing inline JSON object is merged rather than shadowed by a second
+    flag; any other --settings form (file path, repeated flag, conflicting
+    trust list) is refused instead of guessed."""
+    trusted = [antigravity_launch_workspace(workspace)]
+    found = [i for i, arg in enumerate(argv) if arg == '--settings' or arg.startswith('--settings=')]
+    if len(found) > 1:
+        raise ValueError('antigravity_settings_unverified')
+    result = list(argv)
+    if found:
+        index = found[0]
+        if result[index] == '--settings':
+            if index + 1 >= len(result):
+                raise ValueError('antigravity_settings_unverified')
+            raw, span = result[index + 1], 2
+        else:
+            raw, span = result[index].split('=', 1)[1], 1
+        try:
+            settings = json.loads(raw)
+        except ValueError:
+            settings = None
+        if not isinstance(settings, dict) or settings.get('trustedWorkspaces', trusted) != trusted:
+            raise ValueError('antigravity_settings_unverified')
+        settings['trustedWorkspaces'] = trusted
+        result[index:index + span] = ['--settings', json.dumps(settings, separators=(',', ':'))]
+        return result
+    settings = json.dumps({'trustedWorkspaces': trusted}, separators=(',', ':'))
+    # Options stay before the interactive prompt pair agy consumes last.
+    index = result.index('--prompt-interactive') if '--prompt-interactive' in result else len(result)
+    return [*result[:index], '--settings', settings, *result[index:]]
+
+
 def goal_prompt(prompt, workspace, task_id, first_action_path):
     if '\r' not in prompt and '\n' not in prompt and len(('/goal ' + prompt).encode('utf-16-le')) // 2 <= 4000:
         return prompt
@@ -811,6 +866,10 @@ class NativeLauncher:
         if specification.get("interactive") and not local:
             child = interactive_argv(provider, child, goal, model=specification["model"],
                                      effort=specification.get("effort"), with_goal=specification.get("with_goal", False))
+            if provider == 'antigravity':
+                # The interactive pane otherwise stops at agy's workspace-trust
+                # prompt. Trust only the exact directory this process runs in.
+                child = antigravity_trust_argv(child, specification["workspace"])
             if specification.get("with_goal"):
                 objective = goal_prompt(goal, specification["workspace"], task_id, str(fa_path))
                 if provider == 'claude':
