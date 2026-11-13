@@ -23,11 +23,20 @@ test('hub2 entry and production manifest select the Node runtime only', () => {
   assert.doesNotMatch(read('package.json'), /miniflare/, 'no Cloudflare runtime may come back through dev tooling');
 });
 
-test('production deploy is dispatch-gated, SSH-only and health verified', () => {
+test('production deploy runs after green main CI (or dispatch), SSH-only and health verified', () => {
   const flow = read('.github/workflows/deploy.yml');
   assert.match(flow, /uses: \.\/\.github\/workflows\/hub2\.yml/);
-  assert.match(flow, /github\.event_name == 'workflow_dispatch'/);
-  assert.match(flow, /needs: \[hub2, distribution\]/);
+  // Intake bf07f437: a green main push deploys automatically; PRs never deploy.
+  const gate = /\n  deploy:\n    needs: \[test, hub2, distribution\]\n(?:    #.*\n)*    if: >-\n((?:      .*\n)+)/.exec(flow);
+  assert.ok(gate, 'deploy job must be gated on test, hub2 and distribution');
+  const condition = gate[1].replace(/\s+/g, ' ').trim();
+  assert.equal(condition, "github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run && !inputs.rollback_pending))");
+  assert.doesNotMatch(condition, /pull_request/);
+  assert.match(flow, /Require green Python host tests for this main commit\n        if: github\.event_name == 'push'/);
+  assert.doesNotMatch(flow, /if: inputs\.release_mode == 'active'/, 'push deploys have no inputs; release_mode must default to active');
+  assert.doesNotMatch(flow, /RELEASE_MODE: \$\{\{ inputs\.release_mode \}\}/);
+  assert.match(flow, /Alert the deploy owner when an automatic deploy fails\n        if: failure\(\) && github\.event_name == 'push'/);
+  assert.match(flow, /--assignee "\$OWNER"/);
   assert.doesNotMatch(flow, /CLOUDFLARE_API_TOKEN|CLOUDFLARE_ACCOUNT_ID/);
   assert.doesNotMatch(flow, /wrangler|gcloud|GOOGLE_APPLICATION_CREDENTIALS/);
   assert.match(flow, /AGENT_HUB_VM_DEPLOY_KEY/);

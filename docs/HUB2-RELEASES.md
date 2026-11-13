@@ -99,3 +99,28 @@ The shell start canary runs every 15 minutes; the full probe remains every 30
 minutes. Both retain their existing failure alert path. Cadence reduces probe
 volume but cannot guarantee a launch-share percentage independently of real
 traffic; measure both counts over the same 24-hour window after deployment.
+
+## Automatic production deploy after green main CI (intake bf07f437)
+
+Every push to `main` deploys itself: the `deploy` job of the "Hub 2 production"
+workflow (`.github/workflows/deploy.yml`) runs once its `test`, `hub2` and
+`distribution` jobs pass, after it confirms that the same commit's Python host
+tests and release-tooling run are green. It publishes `/cli/host-release.json`
+for that commit, starts the Hetzner host updater immediately (the six-hour
+timer batching does not apply), and accepts the deploy only when the canary sees
+hetzner-aplexer report that `host_version`. Pull requests never deploy. Newer
+pushes queue behind the `agent-hub-production` concurrency group, so the newest
+pending commit wins. Manual `gh workflow run deploy.yml --ref main -f dry_run=false`
+remains for bootstrap mode, retries and rollback.
+
+A failed automatic deploy rolls back. It then opens or updates the GitHub issue
+"Hub2 auto-deploy failed: main is not live in production", assigned to the
+repository owner (the deploy owner), with the run link, and marks the run with an
+`::error` annotation.
+
+Hub2 has no per-machine host pin. The Hub1 `PUT /api/fleet/routing/host-release/<id>`
+route is not served, which is why the old command showed a bare 404. Now
+`hub host-release --machine <id> --sha <sha>` reads the published manifest and
+reports `state` (`current`, `published_pending_host_update` or `published`).
+When the commit is not published it exits 1 with `host_release_not_published`,
+naming the published SHA and this deploy path.
