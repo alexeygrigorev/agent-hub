@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { isOrdinaryWorkModel, modelPolicyCandidateViolation } from '../src/model-policy.ts';
+import { isOrdinaryWorkModel, isThinkOnlyModel, modelPolicyCandidateViolation } from '../src/model-policy.ts';
 
 const root = resolve(import.meta.dirname, '../..');
 const policy = JSON.parse(readFileSync(resolve(root, 'config/model-policy.json'), 'utf8')) as {
@@ -112,6 +112,24 @@ test('Gemini 4 Carbon is allowlisted for pinned thinking only, outside every aut
     'Carbon must not join automatic starts');
   assert.ok(policy.candidates.some(candidate => candidate.id === 'antigravity-hydrogen-medium'
     && candidate.model === 'gemini-4-hydrogen-medium'), 'Hydrogen remains the ordinary Gemini candidate');
+});
+
+test('Carbon identity requires the exact think-only policy contract', () => {
+  const canonical = policy.candidates.find(candidate => candidate.id === 'antigravity-carbon-medium')!;
+  const malformed = [
+    {...canonical, capabilities: []},
+    {...canonical, id: 'generic-route', capabilities: []},
+    {...canonical, id: 'generic-carbon-alias'},
+    {...canonical, model: 'gemini-4-carbon-alias'},
+    {...canonical, engine: 'codex'},
+    {...canonical, effort: 'low'},
+    {...canonical, account_id: 'codex'},
+    {...canonical, capabilities: ['think-only', 'review-only']},
+  ];
+  for (const candidate of malformed) {
+    assert.equal(isThinkOnlyModel(candidate), true, `${candidate.id} remains think-only by identity`);
+    assert.equal(modelPolicyCandidateViolation(candidate), 'carbon_policy_contract_invalid');
+  }
 });
 
 test('no haiku anywhere in the pool', () => {

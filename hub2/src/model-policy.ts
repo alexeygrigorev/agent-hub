@@ -12,6 +12,12 @@ export type ModelPolicyRoute = {
 const FORBIDDEN_ZAI_ENGINES = new Set(['zcodex', 'goz']);
 const FORBIDDEN_ZAI_ACCOUNTS = new Set(['shared-zai', 'zcodex']);
 const CLAUDE_PICKER_MODELS = new Set(['sonnet', 'opus']);
+const CARBON_POLICY_ID = 'antigravity-carbon-medium';
+const CARBON_MODEL_ID = 'gemini-4-carbon-medium';
+
+function isCarbonRoute(candidate: Pick<ModelPolicyRoute, 'id' | 'model'>): boolean {
+  return /carbon/i.test(`${candidate.id} ${candidate.model}`);
+}
 
 function requiresBoundedEffort(model: string): boolean {
   return /^gpt-6(?:\.1)?-(?:sol|astra)$/i.test(model)
@@ -24,6 +30,19 @@ export function modelPolicyCandidateViolation(candidate: ModelPolicyRoute): stri
   const model = candidate.model.toLowerCase();
   const id = candidate.id.toLowerCase();
   const account = candidate.account_id.toLowerCase();
+
+  // Carbon must stay tied to the verified model identity. Policy capabilities
+  // are operator supplied metadata, so an omitted marker or alias must not
+  // turn Carbon into an ordinary automatic route.
+  if (isCarbonRoute(candidate) && (
+    candidate.id !== CARBON_POLICY_ID
+    || candidate.engine !== 'antigravity'
+    || candidate.model !== CARBON_MODEL_ID
+    || candidate.effort !== 'medium'
+    || candidate.account_id !== 'gemini'
+    || candidate.capabilities?.length !== 1
+    || candidate.capabilities[0] !== 'think-only'
+  )) return 'carbon_policy_contract_invalid';
 
   if (FORBIDDEN_ZAI_ENGINES.has(engine) || FORBIDDEN_ZAI_ACCOUNTS.has(account)
     || (engine === 'zai' && account !== 'zai-central'))
@@ -47,9 +66,9 @@ export function isModelPolicyCandidateAllowed(candidate: ModelPolicyRoute): bool
   return modelPolicyCandidateViolation(candidate) === null;
 }
 
-/** Models carrying this capability are available only for a pinned thinking session. */
-export function isThinkOnlyModel(candidate: Pick<ModelPolicyRoute, 'capabilities'>): boolean {
-  return candidate.capabilities?.includes('think-only') === true;
+/** Carbon identity stays think-only even if policy metadata omits its marker. */
+export function isThinkOnlyModel(candidate: Pick<ModelPolicyRoute, 'id' | 'model' | 'capabilities'>): boolean {
+  return isCarbonRoute(candidate) || candidate.capabilities?.includes('think-only') === true;
 }
 
 /** Hydrogen replaces Flash/Argon in ordinary automatic work, without changing other engines. */
