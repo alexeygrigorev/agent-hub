@@ -18,9 +18,10 @@ const CAPTURE_ACK_BODY_BYTES = 401 * 1024;
 const COMMAND_HISTORY_BYTES = 8 * 1024 * 1024;
 const HOST_START_DIAGNOSTIC_KEY = '_hub_host_start_diagnostic';
 const UNSAFE_DETAIL_CONTROL=/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
-const CREDENTIAL_ASSIGNMENT=/\b(?:[A-Za-z0-9_-]*(?:authorization|proxy-authorization|www-authenticate|cookie|token|api[_-]?key|password|passwd|secret|credential)[A-Za-z0-9_-]*)\b["'`]?\s*[:=]/i;
+const CREDENTIAL_ASSIGNMENT=/\b(?:[A-Za-z0-9_-]*(?:authorization|proxy-authorization|www-authenticate|cookie|token|api[ _-]?key|private[ _-]?key|password|passwd|secret|credential)[A-Za-z0-9_-]*)\b["'`]?\s*[:=]/i;
+const QUOTED_ASSIGNMENT=/["'`][^"'`\r\n]{1,128}["'`]\s*[:=]/;
 const INLINE_CREDENTIAL=/\b(?:Bearer|Basic)\s+\S/i;
-const URL_CREDENTIAL=/https?:\/\/[^\s/@:]+:[^\s/@]+@/i;
+const URL_CREDENTIAL=/https?:\/\/[^\s/@]+@/i;
 const TOKEN_CREDENTIAL=/\b(?:gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[A-Z0-9]{16})\b/;
 
 function sanitizedHostDetail(value: unknown): string | undefined {
@@ -28,7 +29,7 @@ function sanitizedHostDetail(value: unknown): string | undefined {
   // Fail closed before normalizing controls: stripping a NUL from a broken-up
   // authorization header can expose the credential that followed it.
   const input=value.slice(0,2048);
-  if(UNSAFE_DETAIL_CONTROL.test(input)||CREDENTIAL_ASSIGNMENT.test(input)||INLINE_CREDENTIAL.test(input)
+  if(UNSAFE_DETAIL_CONTROL.test(input)||CREDENTIAL_ASSIGNMENT.test(input)||QUOTED_ASSIGNMENT.test(input)||INLINE_CREDENTIAL.test(input)
     ||URL_CREDENTIAL.test(input)||TOKEN_CREDENTIAL.test(input))return undefined;
   if(/\b(?:traceback|stack trace|raw stderr|stderr|stdout|request body|response body|environment dump)\b/i.test(input)
     ||/[{}\[\]]/.test(input)||/\b[A-Za-z_][A-Za-z0-9_]{1,}\s*=\s*\S/.test(input))return undefined;

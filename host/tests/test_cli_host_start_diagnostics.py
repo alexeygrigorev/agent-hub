@@ -157,6 +157,12 @@ class TestCliHostStartDiagnostics(unittest.TestCase):
             '"access_token": "synthetic-private-token"',
             "'access_token': 'synthetic-private-token'",
             '`access_token`: `synthetic-private-token`',
+            '"private_key": "synthetic-private-token"',
+            '"api key": "synthetic-private-token"',
+            '"access_token ": "synthetic-private-token"',
+            'https://synthetic-private-token@example.test/repo.git',
+            'private_key: synthetic-private-token',
+            'api key: synthetic-private-token',
         )
         for unsafe_detail in unsafe_details:
             with self.subTest(detail_kind='authorization' if 'Authorization' in unsafe_detail else 'secret-assignment'):
