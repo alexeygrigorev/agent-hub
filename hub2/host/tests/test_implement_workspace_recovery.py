@@ -443,6 +443,46 @@ with _repository_lock(sys.argv[1]):
             _, seen = self.fsynced_inodes(action)
             self.assertLessEqual(self.chain_inodes(), seen)
 
+    def test_windows_record_flush_uses_writable_nontruncating_open(self):
+        windows_flags = module._record_durability_open_flags(windows=True)
+        self.assertEqual(windows_flags & (os.O_WRONLY | os.O_RDWR), os.O_RDWR)
+        self.assertFalse(windows_flags & getattr(os, 'O_TRUNC', 0))
+        self.assertFalse(windows_flags & (os.O_CREAT | os.O_EXCL))
+        if hasattr(os, 'O_NOFOLLOW'):
+            self.assertTrue(windows_flags & os.O_NOFOLLOW)
+
+        record_path = self.record_path()
+        real_open = os.open
+        observed = []
+
+        def capture_record_open(path, flags, *args, **kwargs):
+            if Path(path) == record_path:
+                observed.append(flags)
+            return real_open(path, flags, *args, **kwargs)
+
+        with patch.object(module, '_record_durability_open_flags',
+                          return_value=windows_flags), \
+                patch.object(module.os, 'open', side_effect=capture_record_open):
+            target = self.prepare()
+            before = record_path.read_bytes()
+            module._make_record_durable(self.common(), self.digest)
+
+        self.assertEqual(target, self.target)
+        self.assertEqual(observed[-2:], [windows_flags, windows_flags])
+        self.assertEqual(record_path.read_bytes(), before)
+
+    def test_windows_record_fsync_failure_fails_closed_without_changing_bytes(self):
+        self.prepare()
+        record_path = self.record_path()
+        before = record_path.read_bytes()
+        windows_flags = module._record_durability_open_flags(windows=True)
+        with patch.object(module, '_record_durability_open_flags',
+                          return_value=windows_flags), \
+                patch.object(module.os, 'fsync', side_effect=OSError('injected')):
+            with self.assertRaisesRegex(ValueError, 'owner_durability_failed'):
+                module._make_record_durable(self.common(), self.digest)
+        self.assertEqual(record_path.read_bytes(), before)
+
     @unittest.skipIf(os.name == 'nt', 'directory fsync is POSIX-only')
     def test_directory_fsync_failure_fails_closed_before_success(self):
         tip = self.retained()
