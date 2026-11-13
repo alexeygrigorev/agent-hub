@@ -197,7 +197,9 @@ class HostTests(unittest.TestCase):
                 offer['session_id'] += '-interactive' if interactive else '-headless'
                 offer['operation_id'] += '-interactive' if interactive else '-headless'
                 offer['launch']['interactive'] = interactive
-                with patch('agent_hub_host.providers.provision', side_effect=AssertionError('central home must not be provisioned')):
+                with patch('agent_hub_host.providers.provision', side_effect=AssertionError('central home must not be provisioned')), \
+                     patch('agent_hub_host.native_launch.codex_launch_wrapper', return_value=Path('/synthetic/launch-codex.sh')), \
+                     patch('agent_hub_host.native_launch.NativeLauncher.codex_exec_readiness', return_value={'wrapper': '/synthetic/launch-codex.sh'}):
                     self.bridge.offer(offer)
                 argv, options = next((args, kw) for args, kw in reversed(self.native.calls) if args[1] == 'start')
                 child = argv[argv.index('--') + 1:]
@@ -205,7 +207,7 @@ class HostTests(unittest.TestCase):
                 self.assertNotIn('CLAUDE_CONFIG_DIR=', ' '.join(argv))
                 self.assertNotIn('HUB2_LAUNCH_CONTEXT', options['env'])
                 if interactive:
-                    self.assertEqual(child[0], 'codex')
+                    self.assertEqual(child[0], '/synthetic/launch-codex.sh')
                     self.assertNotIn('exec', child)
                 else:
                     self.assertIn('task', child); self.assertIn('run', child)
