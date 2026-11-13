@@ -172,6 +172,7 @@
   "sessions commands",
   "sessions count",
   "sessions events",
+  "sessions finish",
   "sessions first-attempt-report",
   "sessions host-receive",
   "sessions link",
