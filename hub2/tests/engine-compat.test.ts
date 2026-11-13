@@ -9,7 +9,7 @@ const admin = { id: 'human:admin', kind: 'operator', scopes: ['operator:admin'] 
 const machine = { id: 'machine:RMTHZ', kind: 'machine', scopes: ['host'], resource_id: 'RMTHZ' };
 const accessFile = JSON.stringify({ claudeAiOauth: { accessToken: 'synthetic-access-token' } });
 
-function fixture(managedAccount?: AccountDO) {
+function fixture(managedAccount?: AccountDO, machines?: unknown) {
   const database = new DatabaseSync(':memory:');
   let generation = 7;
   const acknowledgements: Array<{ machine: string; generation: number }> = [];
@@ -57,7 +57,7 @@ function fixture(managedAccount?: AccountDO) {
     },
   }, transactionSync(fn: () => unknown) { database.exec('BEGIN'); try { const value = fn(); database.exec('COMMIT'); return value; }
     catch (caught) { database.exec('ROLLBACK'); throw caught; } } }, blockConcurrencyWhile: (fn: () => unknown) => Promise.resolve(fn()) };
-  const control = new ControlDO(state, { ACCOUNTS: account, HUB2_CREDENTIAL_KEY: 'a'.repeat(64) } as any);
+  const control = new ControlDO(state, { ACCOUNTS: account, MACHINES: machines, HUB2_CREDENTIAL_KEY: 'a'.repeat(64) } as any);
   const call = (path: string, method = 'GET', body?: unknown, actor: unknown = admin) => control.fetch(new Request('https://control.test' + path, {
     method, headers: { 'Content-Type': 'application/json', 'x-hub2-actor': JSON.stringify(actor) },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
@@ -482,4 +482,87 @@ test('host re-pin generation check rechecks the rollout version after the final 
   } finally {
     delete subtle.digest;
   }
+});
+
+test('engine registry stores per-engine update commands and supports admin CRUD', async () => {
+  const f = fixture();
+  const listRes = await f.call('/api/engines/registry', 'GET', undefined, admin);
+  assert.equal(listRes.status, 200);
+  const body = await listRes.json() as any;
+  const engines = new Map<string, any>(body.engines.map((e: any) => [e.engine, e]));
+  for (const name of ['claude', 'codex', 'opencode', 'gemini', 'antigravity']) {
+    const entry = engines.get(name);
+    assert.ok(entry, `missing default registry entry for ${name}`);
+    assert.ok(typeof entry.binary === 'string' && entry.binary.length > 0);
+    assert.ok(typeof entry.version_command === 'string' && entry.version_command.length > 0);
+    assert.ok(typeof entry.update_command === 'string' && entry.update_command.length > 0);
+  }
+
+  const machinePut = await f.call('/api/engines/registry/custom-cli', 'PUT', {
+    binary: 'custom-cli', version_command: 'custom-cli --version', update_command: 'npm install -g custom-cli@latest',
+  }, machine);
+  assert.equal(machinePut.status, 403);
+
+  const putRes = await f.call('/api/engines/registry/custom-cli', 'PUT', {
+    binary: 'custom-cli', version_command: 'custom-cli --version', update_command: 'npm install -g custom-cli@latest',
+  }, admin);
+  assert.equal(putRes.status, 200);
+  assert.equal((await putRes.json() as any).update_command, 'npm install -g custom-cli@latest');
+
+  const delRes = await f.call('/api/engines/registry/custom-cli', 'DELETE', undefined, admin);
+  assert.equal(delRes.status, 200);
+  assert.equal((await delRes.json() as any).deleted, true);
+});
+
+test('engine update runs dispatch to MachineDO and report offline/completed results loudly', async () => {
+  const dispatched: any[] = [];
+  const jobs = new Map<string, any>();
+  const machinesNamespace = {
+    idFromName: (name: string) => name,
+    get: (machineId: string) => ({
+      fetch: async (req: Request) => {
+        const url = new URL(req.url);
+        if (url.pathname === '/_internal/engine-update') {
+          const payload = await req.json() as any;
+          dispatched.push({ machineId, ...payload });
+          const row = {
+            id: payload.job_id,
+            engine: payload.engine,
+            update_command: payload.update_command,
+            state: machineId === 'offline-host' ? 'failed' : 'completed',
+            old_version: machineId === 'offline-host' ? null : '1.0.0',
+            new_version: machineId === 'offline-host' ? null : '1.0.1',
+            exit_code: machineId === 'offline-host' ? null : 0,
+            error: machineId === 'offline-host' ? 'machine_offline' : null,
+          };
+          jobs.set(payload.job_id, row);
+          return Response.json(row);
+        }
+        const m = url.pathname.match(/^\/_internal\/engine-updates\/(.+)$/);
+        if (m) return Response.json(jobs.get(m[1]));
+        return new Response('not found', { status: 404 });
+      },
+    }),
+  };
+  const f = fixture(undefined, machinesNamespace);
+  await f.call('/api/engines/registry', 'GET', undefined, admin);
+  f.database.prepare("INSERT INTO credentials(actor_id,kind,resource_id,token_hash,generation,scopes_json,family_id,client_id,expires_at,principal_email,created_at,revoked_at) VALUES('machine:RMTHZ','machine','RMTHZ','h1','1','[\"host\"]','f','c',NULL,NULL,1,NULL)").run();
+  f.database.prepare("INSERT INTO credentials(actor_id,kind,resource_id,token_hash,generation,scopes_json,family_id,client_id,expires_at,principal_email,created_at,revoked_at) VALUES('machine:offline-host','machine','offline-host','h2','1','[\"host\"]','f','c',NULL,NULL,1,NULL)").run();
+
+  const startRes = await f.call('/api/engines/update-runs', 'POST', { engine: 'codex' }, admin);
+  assert.equal(startRes.status, 202);
+  const started = await startRes.json() as any;
+  assert.equal(dispatched.length, 2);
+
+  const pollRes = await f.call('/api/engines/update-runs/' + started.run_id, 'GET', undefined, admin);
+  assert.equal(pollRes.status, 200);
+  const polled = await pollRes.json() as any;
+  assert.equal(polled.done, true);
+  assert.equal(polled.ok, false);
+  const byMachine = new Map<string, any>(polled.results.map((r: any) => [r.machine_id, r]));
+  assert.equal(byMachine.get('RMTHZ').old_version, '1.0.0');
+  assert.equal(byMachine.get('RMTHZ').new_version, '1.0.1');
+  assert.equal(byMachine.get('RMTHZ').ok, true);
+  assert.equal(byMachine.get('offline-host').ok, false);
+  assert.equal(byMachine.get('offline-host').error, 'machine_offline');
 });

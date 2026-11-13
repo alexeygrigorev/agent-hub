@@ -1128,6 +1128,8 @@ class Bridge:
                 deliver(self, event["message"])
             elif event.get("type") == "session.offer":
                 self.offer(event["offer"], acknowledge)
+            elif event.get("type") == "engine.update":
+                threading.Thread(target=self.run_engine_update, args=(event["job"],), daemon=True).start()
             elif event.get("type") == "resync":
                 self.reconcile()
                 self.journal.flush(self.client)
@@ -1155,6 +1157,62 @@ class Bridge:
             socket.send(canonical({"type": "host.error", "reason": reason, "stage": stage, "detail": reason[:200],
                                    "session_id": target.get("session_id"), "operation_id": target.get("operation_id"),
                                    "message_id": target.get("id")}))
+
+    def run_engine_update(self, job):
+        job_id = job.get("id")
+        version_command = job.get("version_command", "")
+        update_command = job.get("update_command", "")
+        version_re = re.compile(r"(\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?)")
+
+        def _probe_version():
+            if not version_command:
+                return None
+            try:
+                proc = subprocess.run(version_command, shell=True, stdin=subprocess.DEVNULL,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+                out = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+                m = version_re.search(out)
+                return m.group(1) if m else (out.splitlines()[0][:80] if proc.returncode == 0 and out else None)
+            except Exception:
+                return None
+
+        old_version = _probe_version()
+        ok = False
+        exit_code = None
+        err_text = None
+        output = None
+        try:
+            proc = subprocess.run(update_command, shell=True, stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
+            exit_code = proc.returncode
+            combined = ((proc.stderr or "") + "\n" + (proc.stdout or "")).strip()
+            output = combined[-1500:] if combined else None
+            if proc.returncode == 0:
+                ok = True
+            else:
+                err_text = f"exit_code_{proc.returncode}" + (f": {combined.splitlines()[-1][:200]}" if combined else "")
+        except subprocess.TimeoutExpired:
+            err_text = "update_command_timeout"
+        except Exception as exc:
+            err_text = f"{type(exc).__name__}: {exc}"[:300]
+
+        new_version = _probe_version()
+        if self.machine_id and job_id:
+            try:
+                self.client.request(
+                    "POST",
+                    f"/api/machines/{self.machine_id}/engine-updates/{job_id}/ack",
+                    {
+                        "ok": ok,
+                        "old_version": old_version,
+                        "new_version": new_version,
+                        "exit_code": exit_code,
+                        "error": err_text,
+                        "output": output,
+                    },
+                )
+            except Exception:
+                logging.getLogger(__name__).exception("Failed to ack engine update job_id=%s", job_id)
     def live_sessions(self):
         rows=self.journal.db.execute("SELECT session_id,operation_id,epoch,native_id,tag,workspace,state,native_dispatch_started FROM launches WHERE state IN ('launching','running','aborting','deadline_stopping') ORDER BY session_id LIMIT 100").fetchall()
         result=[]

@@ -202,3 +202,107 @@ def test_record_and_last_result():
     er.record_result('codex', {'state': 'green', 'version': '0.166.0', 'error': None})
     assert er.last_result('codex')['state'] == 'green'
     assert er.last_result('claude') is None
+
+
+def test_registry_engine_update_reports_versions_and_loud_failures(monkeypatch):
+    import types
+    import subprocess
+    from agent_hub_host import bus
+
+    registry = {
+        'engines': [
+            {
+                'engine': 'codex',
+                'binary': 'codex',
+                'version_command': 'codex --version',
+                'update_command': 'npm install -g @openai/codex@latest',
+            },
+            {
+                'engine': 'claude',
+                'binary': 'claude',
+                'version_command': 'claude --version',
+                'update_command': 'npm install -g @anthropic-ai/claude-code@latest',
+            },
+        ]
+    }
+    monkeypatch.setattr(bus, '_do_request', lambda method, path, body=None: registry)
+
+    calls = []
+    versions = {'codex': ['0.166.0', '0.168.0'], 'claude': ['2.1.322', '2.1.322']}
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd == 'codex --version':
+            return types.SimpleNamespace(returncode=0, stdout=f'codex-cli {versions["codex"].pop(0)}\n', stderr='')
+        if cmd == 'claude --version':
+            return types.SimpleNamespace(returncode=0, stdout=f'{versions["claude"].pop(0)} (Claude Code)\n', stderr='')
+        if cmd == 'npm install -g @openai/codex@latest':
+            return types.SimpleNamespace(returncode=0, stdout='updated\n', stderr='')
+        if cmd == 'npm install -g @anthropic-ai/claude-code@latest':
+            return types.SimpleNamespace(returncode=1, stdout='', stderr='EACCES permission denied\n')
+        raise AssertionError(f'unexpected command: {cmd}')
+
+    monkeypatch.setattr(subprocess, 'run', fake_run)
+
+    args = types.SimpleNamespace(engine=None, machine=None, all_machines=False, canary=None, check_only=False)
+    result = p.engine_update_command(args)
+    assert result['ok'] is False
+    by_engine = {r['engine']: r for r in result['results']}
+    assert by_engine['codex']['old_version'] == '0.166.0'
+    assert by_engine['codex']['new_version'] == '0.168.0'
+    assert by_engine['codex']['status'] == 'updated'
+    assert by_engine['codex']['ok'] is True
+    assert by_engine['claude']['old_version'] == '2.1.322'
+    assert by_engine['claude']['new_version'] == '2.1.322'
+    assert by_engine['claude']['status'] == 'failed'
+    assert by_engine['claude']['ok'] is False
+    assert 'exit_code_1' in by_engine['claude']['error']
+
+    rendered = p.render_engine_update(result)
+    assert '0.166.0' in rendered and '0.168.0' in rendered
+    assert 'ERROR [' in rendered and 'EACCES permission denied' in rendered
+
+
+def test_registry_engine_update_unknown_engine_fails_loudly(monkeypatch):
+    import types
+    import pytest
+    from agent_hub_host import bus
+
+    monkeypatch.setattr(bus, '_do_request', lambda method, path, body=None: {'engines': [
+        {'engine': 'codex', 'binary': 'codex', 'version_command': 'codex --version', 'update_command': 'npm i -g @openai/codex@latest'}
+    ]})
+    args = types.SimpleNamespace(engine='nonexistent', machine=None, all_machines=False, canary=None, check_only=False)
+    with pytest.raises(ValueError, match='Unknown engine in Hub registry'):
+        p.engine_update_command(args)
+
+
+def test_registry_engine_update_remote_machine_dispatches_via_hub(monkeypatch):
+    import types
+    from agent_hub_host import bus
+
+    requests = []
+
+    def fake_request(method, path, body=None):
+        requests.append((method, path, body))
+        if method == 'POST' and path == '/api/engines/update-runs':
+            return {'run_id': 'run-123', 'jobs': [{'job_id': 'j1', 'machine_id': 'remote-box', 'engine': 'codex'}]}
+        if method == 'GET' and path == '/api/engines/update-runs/run-123':
+            return {
+                'run_id': 'run-123',
+                'done': True,
+                'ok': True,
+                'results': [{
+                    'job_id': 'j1', 'machine_id': 'remote-box', 'engine': 'codex',
+                    'state': 'completed', 'ok': True, 'old_version': '0.166.0', 'new_version': '0.168.0',
+                }],
+            }
+        raise AssertionError(f'unexpected request: {method} {path}')
+
+    monkeypatch.setattr(bus, '_do_request', fake_request)
+    args = types.SimpleNamespace(engine='codex', machine='remote-box', all_machines=False, canary=None, check_only=False)
+    result = p.engine_update_command(args)
+    assert result['ok'] is True
+    assert result['run_id'] == 'run-123'
+    assert result['results'][0]['old_version'] == '0.166.0'
+    assert result['results'][0]['new_version'] == '0.168.0'
+    assert requests[0] == ('POST', '/api/engines/update-runs', {'engine': 'codex', 'machine': 'remote-box'})

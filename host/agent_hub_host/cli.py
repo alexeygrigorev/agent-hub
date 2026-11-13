@@ -732,8 +732,13 @@ def main():
             result = provisioning.command(args)
             if getattr(args, 'engines_cmd', None) == 'recommend' and not getattr(args, 'json', False) and isinstance(result, dict):
                 print(provisioning.render_recommend(result))
+            elif getattr(args, 'engines_cmd', None) == 'update' and not getattr(args, 'json', False) and isinstance(result, dict) and 'results' in result:
+                print(provisioning.render_engine_update(result))
             else:
                 print(json.dumps(result))
+            if getattr(args, 'engines_cmd', None) == 'update' and isinstance(result, dict) and result.get('ok') is False:
+                print('ERROR: one or more engine updates failed', file=sys.stderr)
+                sys.exit(1)
         except Exception as exc:
             print(provisioning.engine_error_message(exc, getattr(args, 'engines_cmd', None)), file=sys.stderr)
             sys.exit(1)
