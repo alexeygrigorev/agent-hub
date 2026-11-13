@@ -33,6 +33,15 @@ Safety model, in short:
   separately verified writer handoff (the legacy copier is stopped by its
   owner; this module never controls services). Running-client recovery is not
   claimed here.
+* Native executable: enrollment also binds the resolved public ``claude``
+  executable (real path, identity) and its self-reported version, which must be
+  a supported one; both are revalidated before every delivery and a missing,
+  replaced, untrusted or unsupported executable refuses THIS consumer only (never
+  a Hub start). Re-enroll after an upgrade. A race between that check and the
+  write is not claimed away.
+* No automatic hard-crash lock recovery: a lock left by a killed run is reported
+  as ``lock_busy`` / ``lock_stale_operator_recovery`` and removed by the operator.
+* ``disable`` fsyncs the managed directory and fails honestly if it cannot.
 
 Root handoff (bounded, nothing here activates anything): enroll (observe) ->
 ``check`` -> keep observe-only while the legacy copier is active -> only after
@@ -58,8 +67,6 @@ LABEL = 'hub-claude'
 ACCOUNT = 'claude'
 CREDENTIAL_PATH = '.claude/.credentials.json'
 STATE_NAME = 'default-claude-consumer.json'
-LEDGER_NAME = 'default-claude-lock-incarnations.json'
-PASSIVE_PATH = '/api/engines/hub-claude/passive-credential'
 MAX_PAYLOAD = 16000
 PROVISIONING_WAIT_S = 15
 NATIVE_WAIT_S = 10.0
@@ -86,23 +93,26 @@ def state_path():
     return provisioning.root() / STATE_NAME
 
 
-def _ledger():
-    return native.IncarnationLedger(provisioning.root() / LEDGER_NAME)
-
-
 # ----------------------------------------------------------------- state
 
 def _generation(value):
     return type(value) is int and 1 <= value <= 2**53 - 1
 
 
+def _valid_executable(pin):
+    return (isinstance(pin, dict) and set(pin) == {'path', 'dev', 'ino', 'size', 'mtime_ns', 'version'}
+            and isinstance(pin['path'], str) and os.path.isabs(pin['path'])
+            and all(type(pin[k]) is int for k in ('dev', 'ino', 'size', 'mtime_ns'))
+            and isinstance(pin['version'], str) and native.VERSION_RE.fullmatch(pin['version']))
+
+
 def _valid(state):
     keys = {'version', 'protocol', 'label', 'account', 'consumer_id', 'store', 'store_dev', 'store_ino',
-            'revision', 'mode', 'enrolled_generation', 'committed', 'pending'}
+            'revision', 'mode', 'enrolled_generation', 'committed', 'pending', 'executable'}
     if not isinstance(state, dict) or set(state) != keys or state['version'] != 1:
         return False
     committed, pending = state['committed'], state['pending']
-    return (isinstance(state['protocol'], str) and state['label'] == LABEL and state['account'] == ACCOUNT
+    return (_valid_executable(state['executable']) and isinstance(state['protocol'], str) and state['label'] == LABEL and state['account'] == ACCOUNT
             and isinstance(state['consumer_id'], str) and CONSUMER_ID.fullmatch(state['consumer_id'])
             and isinstance(state['store'], str) and os.path.isabs(state['store'])
             and type(state['store_dev']) is int and type(state['store_ino']) is int
@@ -235,6 +245,11 @@ def _deliver(state, request, check_only):
         return 'platform_unsupported'
     if state['protocol'] not in native.SUPPORTED_PROTOCOLS:
         return 'protocol_unsupported'
+    try:
+        # Blocks this consumer only, never a Hub start; before any store access.
+        native.verify_executable(state['executable'])
+    except native.StoreRefused as refused:
+        return str(refused)
     generation = request['generation']
     if request['revision'] != state['revision']:
         return 'revision_changed'
@@ -276,7 +291,7 @@ def _observe(state, generation, incoming, store, check_only):
 
 
 def _write(state, generation, oauth, incoming, store):
-    with native.NativeLocks(store, ledger=_ledger(), wait_s=NATIVE_WAIT_S) as locks:
+    with native.NativeLocks(store, wait_s=NATIVE_WAIT_S) as locks:
         # Re-read under the locks; nothing decided before this point is trusted.
         raw, document, local = _read_local(store)
         verdict = _classify(state, generation, incoming, local)
@@ -316,10 +331,19 @@ def _write(state, generation, oauth, incoming, store):
 def _view(state):
     return {'enrolled': True, 'mode': state['mode'], 'protocol': state['protocol'],
             'protocol_supported': state['protocol'] in native.SUPPORTED_PROTOCOLS,
+            'claude_version': state['executable']['version'], 'claude_executable': state['executable']['path'],
             'label': state['label'], 'account': state['account'], 'revision': state['revision'],
             'consumer_id': state['consumer_id'], 'store': state['store'],
             'committed_generation': state['committed']['generation'],
             'pending_generation': state['pending']['generation'] if state['pending'] else None}
+
+
+def _executable_state(state):
+    try:
+        native.verify_executable(state['executable'])
+    except native.StoreRefused as refused:
+        return str(refused)
+    return None
 
 
 def status():
@@ -332,6 +356,8 @@ def status():
     try:
         if sys.platform != 'linux':
             view['local'] = 'platform_unsupported'
+        elif state['protocol'] in native.SUPPORTED_PROTOCOLS and (blocked := _executable_state(state)) is not None:
+            view['local'] = blocked
         else:
             if native.store_identity(state['store']) != (state['store_dev'], state['store_ino']):
                 view['local'] = 'store_changed'
@@ -380,6 +406,10 @@ def enroll(fetch, *, confirm_same_account, environ=None):
         raise Refused(str(refused)) from None
     if local != central:
         raise Refused('local_differs_from_central')
+    try:
+        executable = native.bind_executable(environ)
+    except native.StoreRefused as refused:
+        raise Refused(str(refused)) from None
     with provisioning.lock(timeout=PROVISIONING_WAIT_S, bounded=True):
         existing = load_state()
         consumer, mode = uuid.uuid4().hex, 'observe'
@@ -394,24 +424,37 @@ def enroll(fetch, *, confirm_same_account, environ=None):
             consumer, mode = existing['consumer_id'], existing['mode']
         state = {'version': 1, 'protocol': native.PROTOCOL, 'label': LABEL, 'account': ACCOUNT,
                  'consumer_id': consumer, 'store': str(store), 'store_dev': identity[0], 'store_ino': identity[1],
-                 'revision': request['revision'], 'mode': mode, 'enrolled_generation': request['generation'],
+                 'revision': request['revision'], 'mode': mode, 'enrolled_generation': request['generation'], 'executable': executable,
                  'committed': {'generation': request['generation'], 'oauth_digest': central}, 'pending': None}
         save_state(state)
     return dict(_view(state), status='enrolled')
 
 
+def _remove_durably(path):
+    """Unlink ``path`` and fsync its directory, so an acknowledged removal cannot
+    reappear after a crash. The directory is synced even when the file was already
+    absent (an earlier removal may not have reached disk). Returns whether a file
+    was removed; a sync failure is a refusal, never a quiet success."""
+    path = os.fspath(path)
+    try:
+        with private_fs.parent(path) as anchor:
+            try:
+                os.unlink(os.path.basename(path), dir_fd=anchor)
+                removed = True
+            except FileNotFoundError:
+                removed = False
+            os.fsync(anchor)
+    except OSError:
+        raise Refused('disable_not_durable') from None
+    return removed
+
+
 def disable():
-    """Remove the enrollment. Leaves the credential file, locks and legacy copier alone."""
+    """Remove the enrollment durably. Leaves the credential file, locks and legacy copier alone.
+    If the removal cannot be made durable the command fails (``disable_not_durable``) and may
+    simply be repeated: until it succeeds a crash could restore the enrollment."""
     with provisioning.lock(timeout=PROVISIONING_WAIT_S, bounded=True):
-        try:
-            os.unlink(state_path())
-            removed = True
-        except FileNotFoundError:
-            removed = False
-        try:
-            os.unlink(provisioning.root() / LEDGER_NAME)
-        except FileNotFoundError:
-            pass
+        removed = _remove_durably(state_path())
     return {'enrolled': False, 'removed': removed}
 
 
@@ -429,13 +472,13 @@ def set_mode(mode, *, confirm_writer_handoff=False):
 
 
 def command(args):
-    from . import bus, config, native_import_host
+    from . import config, default_claude_transport
 
     def fetch():
-        operator = config.load_config()
-        base = os.environ.get('HUB_URL') or os.environ.get('HUB_BASE_URL') or operator.get('base_url')
-        _, host_request = native_import_host.bind(base)
-        return host_request('GET', PASSIVE_PATH, None)
+        base = os.environ.get('HUB_URL') or os.environ.get('HUB_BASE_URL') or config.load_config().get('base_url')
+        # Passive-only binding: one GET, no import/exec/re-pin authority, no POST.
+        _, passive = default_claude_transport.bind_passive(base)
+        return passive()
 
     try:
         action = args.default_claude_cmd

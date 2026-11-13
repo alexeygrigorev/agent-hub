@@ -430,6 +430,15 @@ describe('Hub MCP protocol and parity', () => {
     expect(CLI_EXCLUSIONS['engines import-native']).toContain('private native Claude credentials');
     expect(MCP_ROUTES.flatMap(route => route.cli)).not.toContain('engines import-native');
   });
+  it('keeps operator-only engine controls out of model-tool mutation mappings', () => {
+    const routed = new Set(MCP_ROUTES.flatMap(route => route.cli));
+    for (const command of ['engines registry list', 'engines registry set', 'engines registry remove',
+      'engines default-claude enroll', 'engines default-claude enable-writes', 'engines default-claude disable']) {
+      expect(cliCommands, command).toContain(command);
+      expect(routed.has(command), command).toBe(false);
+      expect(CLI_EXCLUSIONS[command], command).toMatch(/Operator-only/);
+    }
+  });
   it('passes the exact bearer into real API routes and preserves errors', async () => {
     const direct = await doFetch(new Request(origin + '/api/sessions/tree', { headers: { Authorization: 'Bearer ' + bearer } }));
     const mcp: any = await (await rpc('tools/call', { name: 'sessions_tree' })).json();

@@ -25,8 +25,15 @@ release with another protocol). It never removes a lock it does not own: a
 stale or foreign lock is a bounded refusal, because breaking it is the native
 contenders' own rule and a wrong guess would corrupt a live refresh. Own locks
 carry a heartbeat and are released only while this exact directory incarnation
-is still the one created; a crashed owner's incarnation is recorded privately
-so a later run can remove precisely that dead incarnation.
+is still the one created (checked through an open directory descriptor).
+
+Hard-crash recovery is NOT automatic. A consumer killed while holding a lock
+leaves that directory behind; it is refused as ``lock_stale_operator_recovery``
+once older than its stale window (``lock_busy`` before that). Removing it by path
+cannot be made conditional on identity (check-then-rmdir races a native contender
+that replaces the directory in between and would delete its live lock), so the
+operator must confirm that no Claude process or consumer is running and remove
+the stale lock directory by hand.
 
 Nothing here logs, prints or raises with credential content or paths.
 """
@@ -37,7 +44,10 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
+import shutil
 import stat
+import subprocess
 import threading
 import time
 import unicodedata
@@ -191,32 +201,86 @@ def write_document(store, raw):
 
 
 # --------------------------------------------------------------------------
-# proper-lockfile compatible mkdir locks
+# the public native executable and its supported version
 # --------------------------------------------------------------------------
 
-def _process_start(pid):
+# Versions whose file-store/lock protocol was read from the public binary. The
+# protocol pin alone says nothing about the program actually installed, so the
+# resolved executable and its self-reported version are bound at enrollment and
+# revalidated before every delivery. This gates THIS consumer only, never a Hub
+# start. The credential files are never hashed or read for this.
+SUPPORTED_VERSIONS = ('2.1.322',)
+VERSION_RE = re.compile(r'(\d+\.\d+\.\d+)(?![\w.-])')
+VERSION_TIMEOUT_S = 20
+EXECUTABLE_NAME = 'claude'
+
+
+def _executable_identity(path):
     try:
-        with open('/proc/%d/stat' % pid, 'rb') as handle:
-            return handle.read().rsplit(b') ', 1)[1].split()[19].decode()
-    except (OSError, IndexError):
-        return None
+        info = os.lstat(path)
+    except FileNotFoundError:
+        raise StoreRefused('executable_missing') from None
+    except OSError:
+        raise StoreRefused('executable_untrusted') from None
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid not in (os.getuid(), 0) or info.st_mode & 0o022
+            or not info.st_mode & 0o100):
+        raise StoreRefused('executable_untrusted')
+    return {'dev': info.st_dev, 'ino': info.st_ino, 'size': info.st_size, 'mtime_ns': info.st_mtime_ns}
 
 
-def process_alive(pid, start):
-    """True unless this exact process incarnation is provably gone."""
-    if not isinstance(pid, int) or pid <= 0:
-        return True
-    current = _process_start(pid)
-    if current is None:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except OSError:
-            return True
-        return True  # signal 0 succeeded and /proc is unreadable: not provably gone
-    return start is None or current == start
+def probe_version(path):
+    """The version the executable at ``path`` reports (``--version``: no login,
+    no network use, scrubbed environment, bounded). Fixed reason codes only."""
+    env = {'PATH': '/usr/local/bin:/usr/bin:/bin', 'HOME': os.path.expanduser('~'), 'LC_ALL': 'C'}
+    try:
+        done = subprocess.run([path, '--version'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, env=env, timeout=VERSION_TIMEOUT_S, check=False)
+    except FileNotFoundError:
+        raise StoreRefused('executable_missing') from None
+    except (OSError, subprocess.SubprocessError):
+        raise StoreRefused('version_unavailable') from None
+    match = VERSION_RE.search(done.stdout[:4096].decode('utf8', 'replace'))
+    if done.returncode != 0 or not match:
+        raise StoreRefused('version_unavailable')
+    return match.group(1)
 
+
+def bind_executable(environ=None):
+    """Resolve the public ``claude`` from ``environ``'s PATH (enrollment only) to
+    its real path and pin identity plus supported version."""
+    search = (environ or {}).get('PATH') or os.environ.get('PATH') or os.defpath
+    found = shutil.which(EXECUTABLE_NAME, path=search)
+    if not found:
+        raise StoreRefused('executable_missing')
+    real = os.path.realpath(found)
+    pin = dict(_executable_identity(real), path=real)
+    version = probe_version(real)
+    if version not in SUPPORTED_VERSIONS:
+        raise StoreRefused('version_unsupported')
+    if _executable_identity(real) != {k: pin[k] for k in ('dev', 'ino', 'size', 'mtime_ns')}:
+        raise StoreRefused('executable_changed')
+    pin['version'] = version
+    return pin
+
+
+def verify_executable(pin):
+    """Revalidate the pinned executable (never re-resolved from the environment).
+    Raises StoreRefused with a fixed code when it is missing, replaced, not a
+    supported version or no longer the pinned version. A race between this check
+    and the write is inherent and not claimed away."""
+    path = pin['path']
+    if _executable_identity(path) != {k: pin[k] for k in ('dev', 'ino', 'size', 'mtime_ns')}:
+        raise StoreRefused('executable_changed')
+    version = probe_version(path)
+    if version not in SUPPORTED_VERSIONS:
+        raise StoreRefused('version_unsupported')
+    if version != pin['version']:
+        raise StoreRefused('version_changed')
+
+
+# --------------------------------------------------------------------------
+# proper-lockfile compatible mkdir locks
+# --------------------------------------------------------------------------
 
 XATTR = 'user.agent-hub-default-claude-lock'
 
@@ -227,9 +291,9 @@ class _Held:
     An O_DIRECTORY descriptor pins the live incarnation: while it is open the
     inode cannot be recycled, so a different (ino, dev) at the path always
     means somebody removed and recreated it. A random nonce is also written as
-    an extended attribute (when the filesystem has them) so that a *crashed*
-    owner's incarnation can later be proven exactly; without that proof it is
-    never reaped automatically."""
+    an extended attribute (when the filesystem has them) as an extra marker of
+    this incarnation. It is never used to remove a directory of a dead owner:
+    see the module docstring (no automatic crash recovery)."""
 
     def __init__(self, path, update_s):
         self.path, self.update_s = path, update_s
@@ -309,62 +373,7 @@ class _Held:
                     os.close(fd)
 
 
-class IncarnationLedger:
-    """Private record of lock directories this consumer created, so that a crashed
-    consumer's own dead incarnation (and only that) can be cleaned up later.
-
-    Reaping needs the exact durable proof: recorded (dev, ino), the recorded
-    nonce still present as the directory's extended attribute, and a provably
-    gone owner process. An inode number alone can be recycled by a foreign lock,
-    so an entry without a nonce (no xattr support) is never reaped."""
-
-    def __init__(self, path):
-        self.path = Path(path)
-
-    def _load(self):
-        try:
-            value = json.loads(private_fs.read_bytes(self.path, 65536))
-        except (FileNotFoundError, ValueError, OSError):
-            return {}
-        return value if isinstance(value, dict) else {}
-
-    def _save(self, value):
-        private_fs.atomic_write(self.path, json.dumps(value, sort_keys=True).encode(), 65536)
-
-    def record(self, name, held):
-        value = self._load()
-        value[name] = {'dev': held.dev, 'ino': held.ino, 'nonce': held.nonce, 'pid': os.getpid(),
-                       'start': _process_start(os.getpid())}
-        self._save(value)
-
-    def forget(self, name):
-        value = self._load()
-        if value.pop(name, None) is not None:
-            self._save(value)
-
-    def reap(self, name, lock_path):
-        """Remove ``lock_path`` iff it is provably the recorded incarnation of a
-        dead owner. Never touches any other directory."""
-        entry = self._load().get(name)
-        if not isinstance(entry, dict) or not isinstance(entry.get('nonce'), str) or not entry['nonce']:
-            return False
-        try:
-            info = os.lstat(lock_path)
-            found = os.getxattr(lock_path, XATTR, follow_symlinks=False)
-        except (OSError, AttributeError):
-            return False
-        if ((info.st_dev, info.st_ino) != (entry.get('dev'), entry.get('ino')) or not stat.S_ISDIR(info.st_mode)
-                or found != entry['nonce'].encode() or process_alive(entry.get('pid'), entry.get('start'))):
-            return False
-        try:
-            os.rmdir(lock_path)
-        except OSError:
-            return False
-        self.forget(name)
-        return True
-
-
-def _acquire(name, path, stale_s, update_s, deadline, ledger, sleep, clock):
+def _acquire(path, stale_s, update_s, deadline, sleep, clock):
     delay = RETRY_MIN_S
     while True:
         try:
@@ -376,12 +385,13 @@ def _acquire(name, path, stale_s, update_s, deadline, ledger, sleep, clock):
                 continue
             except OSError:
                 raise StoreRefused('lock_unavailable') from None
-            if ledger is not None and ledger.reap(name, path):
-                continue
             if age > stale_s:
-                # A stale lock that is not our own dead incarnation is foreign:
-                # breaking it is the native contenders' decision, never ours.
-                raise StoreRefused('lock_stale_foreign')
+                # Never removed automatically: no atomic conditional rmdir exists, so
+                # between any proof of ownership and the removal a native contender may
+                # replace the directory and we would delete ITS live lock. Whether the
+                # owner (this consumer after a hard crash, or a native CLI) is gone is an
+                # operator decision; breaking it is also the native contenders' own rule.
+                raise StoreRefused('lock_stale_operator_recovery')
             remaining = deadline - clock()
             if remaining <= 0:
                 raise StoreRefused('lock_busy')
@@ -394,12 +404,6 @@ def _acquire(name, path, stale_s, update_s, deadline, ledger, sleep, clock):
             held = _Held(path, update_s)
         except OSError:
             raise StoreRefused('lock_unavailable') from None
-        if ledger is not None:
-            try:
-                ledger.record(name, held)
-            except (OSError, ValueError):
-                held.release()
-                raise StoreRefused('lock_unavailable') from None
         return held
 
 
@@ -409,8 +413,8 @@ class NativeLocks:
     ``compromised()`` becomes true when any held lock was lost; check it right
     before the replacement."""
 
-    def __init__(self, store, ledger=None, wait_s=LOCK_WAIT_S, sleep=time.sleep, clock=time.monotonic):
-        self.store, self.ledger = Path(store), ledger
+    def __init__(self, store, wait_s=LOCK_WAIT_S, sleep=time.sleep, clock=time.monotonic):
+        self.store = Path(store)
         self.wait_s, self.sleep, self.clock = wait_s, sleep, clock
         self._held = []
 
@@ -419,8 +423,8 @@ class NativeLocks:
         deadline = self.clock() + self.wait_s
         try:
             for name, stale_s, update_s in LOCK_ORDER:
-                self._held.append((name, _acquire(name, paths[name], stale_s, update_s, deadline,
-                                                  self.ledger, self.sleep, self.clock)))
+                self._held.append((name, _acquire(paths[name], stale_s, update_s, deadline,
+                                                  self.sleep, self.clock)))
         except BaseException:
             self._release()
             raise
@@ -431,11 +435,8 @@ class NativeLocks:
 
     def _release(self):
         while self._held:
-            name, held = self._held.pop()
+            _, held = self._held.pop()
             held.release()
-            if self.ledger is not None:
-                with contextlib.suppress(OSError, ValueError):
-                    self.ledger.forget(name)
 
     def __exit__(self, *exc):
         self._release()
