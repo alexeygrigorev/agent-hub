@@ -38,9 +38,9 @@ def settings_with(subs):
 
 
 class CatalogTest(unittest.TestCase):
-    def test_loads_seven_canonical_accounts(self):
+    def test_loads_six_canonical_accounts(self):
         accounts = account_registry.policy_accounts(POLICY)
-        self.assertEqual(7, len(accounts))
+        self.assertEqual(6, len(accounts))
         by_account = {a["account"]: a for a in accounts}
         self.assertEqual("codex", by_account["shared-codex"]["harness"])
         self.assertEqual("hub-shared-codex", by_account["shared-codex"]["aplexer_profile"])
@@ -56,7 +56,7 @@ class CatalogTest(unittest.TestCase):
         self.assertEqual(len(ids), len(set(ids)))
 
     def test_rejects_bad_catalog(self):
-        for mutate in (lambda a: a.__setitem__("account", "codex-orin"),
+        for mutate in (lambda a: a.__setitem__("account", "shared-claude"),
                        lambda a: a["credential"].__setitem__("mode", "vault"),
                        lambda a: a.__setitem__("quota_probe", "not-a-list"),
                        lambda a: a.__setitem__("aplexer_profile", "codex")):
@@ -72,16 +72,16 @@ class RenderTest(unittest.TestCase):
     def test_merge_sets_owned_fields_and_preserves_host_local(self):
         accounts = sample_accounts()
         settings = settings_with([{
-            "account_label": "codex-orin", "service": "codex", "engine": "codex",
-            "profile": "hub-codex-orin",
-            "quota_argv": ["quse", "codex", "--profile", "hub-codex-orin", "--json"],
+            "account_label": "shared-codex", "service": "codex", "engine": "codex",
+            "profile": "hub-shared-codex",
+            "quota_argv": ["quse", "codex", "--profile", "hub-shared-codex", "--json"],
             "admission_argv": ["local", "probe"],
         }])
         entries, changes = account_registry.diff_subscriptions(settings, accounts)
-        orin = next(s for s in entries if s["account_label"] == "codex-orin")
-        self.assertEqual(["quse", "codex-orin", "--json"], orin["quota_argv"])
+        orin = next(s for s in entries if s["account_label"] == "shared-codex")
+        self.assertEqual(["quse", "codex", "--json"], orin["quota_argv"])
         self.assertEqual(["local", "probe"], orin["admission_argv"])
-        self.assertTrue(any("codex-orin" in c and "quota_argv" in c for c in changes))
+        self.assertTrue(any("shared-codex" in c and "quota_argv" in c for c in changes))
         # Alias label is kept, never force-renamed by sync.
         legacy = settings_with([{"account_label": "urgent-muse", "service": "go"}])
         entries, _ = account_registry.diff_subscriptions(legacy, accounts)
@@ -96,7 +96,7 @@ class RenderTest(unittest.TestCase):
         accounts = sample_accounts()
         entries, changes = account_registry.diff_subscriptions(
             settings_with([{"account_label": "custom", "service": "go"}]), accounts)
-        self.assertEqual(8, len(entries))
+        self.assertEqual(7, len(entries))
         self.assertTrue(any(s["account_label"] == "shared-codex" for s in entries))
         self.assertTrue(any(s["account_label"] == "custom" for s in entries))
         self.assertTrue(any("add entry" in c for c in changes))
@@ -128,7 +128,7 @@ class RenderTest(unittest.TestCase):
             done = account_registry.sync_settings(str(path), accounts, write=True)
             self.assertTrue(done["wrote"])
             written = json.loads(path.read_text())
-            self.assertEqual(7, len(written["subscriptions"]))
+            self.assertEqual(6, len(written["subscriptions"]))
             again = account_registry.sync_settings(str(path), accounts, write=True)
             self.assertFalse(again["changes"] or again["wrote"])
 
@@ -151,17 +151,17 @@ class AplexerTest(unittest.TestCase):
         import tempfile
         accounts = sample_accounts()
         with tempfile.TemporaryDirectory() as tmp:
-            managed, cfg = self._env(tmp, [{"label": "codex-orin", "revision": "r", "provider": "codex"}])
+            managed, cfg = self._env(tmp, [{"label": "shared-codex", "revision": "r", "provider": "codex"}])
             env = {"AGENT_HUB_MANAGED_DIR": str(managed), "APLEXER_CONFIG": str(cfg)}
             with patch.dict(os.environ, env):
                 res = account_registry.sync_aplexer_profiles(None, accounts, write=False)
-                self.assertIn("hub-codex-orin", res["managed"])
+                self.assertIn("hub-shared-codex", res["managed"])
                 self.assertTrue(res["changes"])
                 self.assertFalse(res["wrote"])
                 res = account_registry.sync_aplexer_profiles(None, accounts, write=True)
                 self.assertTrue(res["wrote"])
                 text = cfg.read_text()
-                self.assertIn("[profiles.hub-codex-orin]", text)
+                self.assertIn("[profiles.hub-shared-codex]", text)
                 self.assertIn('engine = "codex"', text)
                 again = account_registry.sync_aplexer_profiles(None, accounts, write=True)
                 self.assertFalse(again["changes"] or again["wrote"])
@@ -186,13 +186,13 @@ class ManagedSubscriptionTest(unittest.TestCase):
             managed = Path(tmp) / "managed"
             managed.mkdir(mode=0o700)
             (managed / "state.json").write_text(json.dumps(
-                [{"label": "codex-orin", "revision": "r", "provider": "codex"}]))
+                [{"label": "shared-codex", "revision": "r", "provider": "codex"}]))
             (managed / "state.json").chmod(0o600)
             with patch.dict(os.environ, {"AGENT_HUB_MANAGED_DIR": str(managed)}):
                 subs = provisioning.managed_subscriptions()
-            orin = next(s for s in subs if s["account_label"] == "codex-orin")
+            orin = next(s for s in subs if s["account_label"] == "shared-codex")
             self.assertNotIn("quota_argv", orin)
-            self.assertEqual("hub-codex-orin", orin["profile"])
+            self.assertEqual("hub-shared-codex", orin["profile"])
 
 
 class DriftTest(unittest.TestCase):
@@ -204,7 +204,6 @@ class DriftTest(unittest.TestCase):
                   for a in accounts]
         aplexer = ("version = 1\n\n# BEGIN HUB MANAGED ENGINES\n\n"
                    "[profiles.hub-shared-codex]\nengine = \"codex\"\ncommand = [\"x\", \"codex\"]\n"
-                   "[profiles.hub-codex-orin]\nengine = \"codex\"\ncommand = [\"x\", \"codex-orin\"]\n"
                    "# END HUB MANAGED ENGINES\n")
         return subs, routes, aplexer
 
@@ -231,18 +230,18 @@ class DriftTest(unittest.TestCase):
     def test_flags_each_source(self):
         accounts = sample_accounts()
         subs, routes, aplexer = self._clean(accounts)
-        subs = [s for s in subs if s["account_label"] != "codex-orin"]
-        orin_route = next(r for r in routes if r["account"] == "codex-orin")
+        subs = [s for s in subs if s["account_label"] != "shared-codex"]
+        orin_route = next(r for r in routes if r["account"] == "shared-codex")
         orin_route["engine"] = "bogus"
-        aplexer = aplexer.replace("[profiles.hub-codex-orin]", "[profiles.hub-stray]")
+        aplexer = aplexer.replace("[profiles.hub-shared-codex]", "[profiles.hub-stray]")
         probes = {"shared-zai": (False, "exit 2: No such option")}
         problems = account_registry.check_drift(accounts, subs, aplexer, routes,
                                                 probe_results=probes, home="/nonexistent-home-xyz",
                                                 managed_root=Path("/nonexistent-managed-xyz"))
         joined = "\n".join(problems)
-        for needle in ("subscriptions: account codex-orin has no host entry",
-                       "routes: bogus/codex-orin",
-                       "aplexer: managed profile [hub-codex-orin] is missing",
+        for needle in ("subscriptions: account shared-codex has no host entry",
+                       "routes: bogus/shared-codex",
+                       "aplexer: managed profile [hub-shared-codex] is missing",
                        "quota: shared-zai exit 2: No such option",
                        "credential: home path"):
             self.assertIn(needle, joined)

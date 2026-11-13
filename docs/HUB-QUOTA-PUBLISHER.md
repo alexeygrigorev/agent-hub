@@ -16,7 +16,7 @@ provider errors, quse details or tokens enter the helper's output or alert text.
 
 ## Configuration and state
 
-The default expected set is `claude,codex,codex-orin,gemini,grok,copilot,shared-go,zai-central`.
+The default expected set is `claude,codex,gemini,grok,copilot,shared-go,zai-central`.
 Review this against the intended pools before installation. Use the same explicit
 `--accounts` list in both unit overrides if only a subset is expected. Gemini and
 ZAI use labels `gemini` and `zai-central`. Disabled pools are not enabled by this

@@ -14,14 +14,6 @@
       "quota_probe": ["quse", "codex", "--json"]
     },
     {
-      "account": "codex-orin",
-      "harness": "codex",
-      "provider": "codex",
-      "aplexer_profile": "hub-codex-orin",
-      "credential": {"mode": "managed-bundle", "bundle": "codex-orin"},
-      "quota_probe": ["quse", "codex-orin", "--json"]
-    },
-    {
       "account": "shared-claude",
       "harness": "claude",
       "provider": "claude",
