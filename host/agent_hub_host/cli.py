@@ -876,6 +876,12 @@ def main():
             print(json.dumps(routing.execute(args), indent=2))
         except Exception as exc:
             from . import session_control
+            if args.cmd in ('task-artifact', 'artifact'):
+                # Name the failed check (local PNG check or the Hub's error slug + detail), nothing generic.
+                from . import intake
+                reason = str(exc) if isinstance(exc, routing.ArtifactCheckError) else intake.diagnostic(exc)
+                print('Hub task operation failed (%s): %s' % (args.cmd, reason), file=sys.stderr)
+                sys.exit(1)
             print('Hub task operation failed (%s): %s; check inputs, authentication and host admission.'
                   % (args.cmd, session_control.diagnostic(exc)), file=sys.stderr)
             sys.exit(1)

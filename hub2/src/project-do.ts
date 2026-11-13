@@ -1,5 +1,6 @@
 import {terminalReceipt} from './terminal-receipts';
 import { SessionIntakeLink } from './session-intake-link';
+import { IntakeRelations } from './intake-relations';
 import {listProjectIntakes} from './intake-list';
 import {boundWorkspace,mergeWorkspaceBinding,type WorkspaceBinding} from './workspace-binding';
 import { MeteredDb, initializeSchema } from './db';
@@ -95,6 +96,7 @@ export class ProjectDO {
   private readonly env: Hub2Env;
   private readonly work: ProjectWork;
   private readonly sessionLinks: SessionIntakeLink;
+  private readonly relations: IntakeRelations;
   private readonly ready: Promise<void>;
   private constructorMs = 0;
   private readonly eventSequences=new Map<string,number>();
@@ -105,6 +107,12 @@ export class ProjectDO {
     const started = performance.now();
     this.db = new MeteredDb(ctx.storage.sql);
     this.sessionLinks = new SessionIntakeLink(this.db, callback => this.transaction(callback), (...args) => this.appendEvent(...args));
+    this.relations = new IntakeRelations(this.db, {
+      transaction: callback => this.transaction(callback),
+      append: (...args) => this.appendEvent(...args),
+      canRead: (actor, intake) => this.canReadIntake(actor, intake as IntakeRow),
+      canWrite: (actor, intake) => this.canProject(actor, intake.project, 'intake:write'),
+    });
     this.sqlReceipts = new SqlReceiptMeter(this.db);
     this.env = wrapSqlNamespaces(env, this.sqlReceipts) as Hub2Env;
     this.work = new ProjectWork(ctx, this.db, {
@@ -153,6 +161,11 @@ export class ProjectDO {
       if (url.pathname === '/_internal/session-link' && request.method === 'POST') return await this.sessionLinks.receive(request);
       if (url.pathname === '/api/intakes' && request.method === 'POST') return await this.createIntake(request);
       if (url.pathname === '/api/intakes' && request.method === 'GET') return this.listIntakes(request);
+      const relation = url.pathname.match(/^\/api\/intakes\/([^/]+)\/(depend|links|artifacts)(?:\/([^/]+))?$/);
+      if (relation) return await this.relations.fetch(request, decodeURIComponent(relation[1]), relation[2], relation[3] && decodeURIComponent(relation[3]))
+        ?? error('method_not_allowed', 405, `${request.method} is not supported on /${relation[2]}`);
+      const prerequisites = url.pathname.match(/^\/_internal\/prerequisites\/([^/]+)$/);
+      if (prerequisites && request.method === 'GET') return this.relations.internalPrerequisites(decodeURIComponent(prerequisites[1]));
       const match = url.pathname.match(/^\/api\/intakes\/([^/]+)(?:\/(start|history|append|events|context|audit|discard))?$/);
       if (!match) return error('not_found', 404);
       const intakeId = decodeURIComponent(match[1]);
@@ -243,7 +256,8 @@ export class ProjectDO {
     const row = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id = ?', intakeId);
     if (!row) return error('intake_not_found', 404);
     if (!this.canReadIntake(actor, row)) return error('forbidden', 403);
-    return json({ intake: this.viewIntake(row), task: this.taskCompat(row) }, status);
+    return json({ intake: { ...this.viewIntake(row), depends_on: this.relations.prerequisites(row.id), artifacts: this.relations.artifacts(row.id) },
+      task: this.taskCompat(row) }, status);
   }
 
   /** Version handle for compare-and-set callers (CLI `intake close/update`): the row's updated_at. */

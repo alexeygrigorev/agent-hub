@@ -6,6 +6,7 @@ import { pickModelRouteDetailed, simulateModelRoutes, type PickInput } from './m
 import { sessionPurpose } from './session-purpose';
 import { isLiveActiveSession, type LiveSession } from './session-liveness';
 import { qualifiedRepositoryWorkspace, REPOSITORY_IDENTITY_CAPABILITY } from './repository-identity';
+import { ARTIFACT_BODY_LIMIT, ARTIFACT_MAX_BYTES, PREREQUISITE_HEADER } from './intake-relations';
 import type { Actor, Hub2Env, JsonRecord } from './types';
 
 const CONTROL = 'https://control.hub2.internal';
@@ -206,9 +207,11 @@ const router = {
         path === '/api/schedules' ||
         /^\/api\/schedules\/[^/]+(?:\/(?:pause|resume|cancel|occurrences))?$/.test(path) ||
         path === '/api/intakes' ||
-        /^\/api\/intakes\/[^/]+(?:\/(?:start|history|append|events|context|audit))?$/.test(path) ||
+        /^\/api\/intakes\/[^/]+(?:\/(?:start|history|append|events|context|audit|depend|links|artifacts))?$/.test(path) ||
+        /^\/api\/intakes\/[^/]+\/artifacts\/[^/]+$/.test(path) ||
         path === '/api/intake/tasks' ||
-        /^\/api\/intake\/tasks\/[^/]+(?:\/(?:start|history|append|events|context|audit))?$/.test(path);
+        /^\/api\/intake\/tasks\/[^/]+(?:\/(?:start|history|append|events|context|audit|depend|links|artifacts))?$/.test(path) ||
+        /^\/api\/intake\/tasks\/[^/]+\/artifacts\/[^/]+$/.test(path);
       if (projectPath) {
         const url = requestUrl(request);
         let requested = url.searchParams.get('project');
@@ -240,7 +243,9 @@ const router = {
           if (requested && requested !== route.owner) return error('project_forbidden',403);
           url.searchParams.set('project',route.owner);
           const internalPath = url.pathname.replace('/api/intake/tasks','/api/intakes');
-          return env.PROJECTS.get(env.PROJECTS.idFromName(route.owner)).fetch(await forwardRequest(request,'https://project.internal'+internalPath+url.search,actor));
+          const relation = await relationForward(request, env, control, actor, internalPath);
+          if (relation instanceof Response) return relation;
+          return env.PROJECTS.get(env.PROJECTS.idFromName(route.owner)).fetch(await forwardRequest(request,'https://project.internal'+internalPath+url.search,actor,undefined,undefined,undefined,relation));
         }
         if (!requested && !intakeId && request.method === 'GET' && (path === '/api/intakes' || path === '/api/intake/tasks'))
           return control.fetch(await forwardRequest(request, CONTROL + '/api/intakes' + url.search, actor));
@@ -263,11 +268,17 @@ const router = {
           ? url.pathname.replace('/api/intake/tasks', '/api/intakes')
           : url.pathname;
         const stub = env.PROJECTS.get(env.PROJECTS.idFromName(repo.repo.canonical_name));
+        const relation = await relationForward(request, env, control, actor, internalPath);
+        if (relation instanceof Response) return relation;
         return stub.fetch(
           await forwardRequest(
             request,
             `https://project.hub2.internal${internalPath}${url.search}`,
             actor,
+            undefined,
+            undefined,
+            undefined,
+            relation,
           ),
         );
       }
@@ -569,17 +580,19 @@ async function forwardRequest(
   mailbox?: string,
   deliverySession?: string,
   safetyMode?: 'operator_stop',
+  options?: ForwardOptions,
 ): Promise<Request> {
   const headers = new Headers(request.headers);
   for (const key of [...headers.keys()])
     if (key.toLowerCase().startsWith('x-hub2-')) headers.delete(key);
+  for (const [key, value] of Object.entries(options?.headers ?? {})) headers.set(key, value);
   if (actor) headers.set('x-hub2-actor', JSON.stringify(actor));
   if (mailbox) headers.set('x-hub2-mailbox', mailbox);
   if (deliverySession) headers.set('x-hub2-delivery-session', deliverySession);
   if (safetyMode === 'operator_stop') headers.set('x-hub2-safety-mode', safetyMode);
   let body: ArrayBuffer | undefined;
   if (!['GET', 'HEAD'].includes(request.method)) {
-    const text = await boundedText(request.clone(), HUB2_FORWARD_BODY_LIMIT);
+    const text = await boundedText(request.clone(), options?.bodyLimit ?? HUB2_FORWARD_BODY_LIMIT);
     const encoded = new TextEncoder().encode(text);
     const copied = new Uint8Array(new ArrayBuffer(encoded.byteLength));
     copied.set(encoded);
@@ -590,6 +603,55 @@ async function forwardRequest(
     headers,
     ...(body ? { body } : {}),
   });
+}
+
+type ForwardOptions = { bodyLimit?: number; headers?: Record<string, string> };
+
+/**
+ * Intake relation routes: artifacts get a PNG-sized body bound; `depend` resolves the
+ * prerequisite (`on`, possibly in another project) with the caller's own visibility, refuses
+ * cross-project cycles, and hands the canonical id/project to the dependent's project object
+ * in a trusted header (client x-hub2-* headers are always stripped).
+ */
+async function relationForward(request: Request, env: Hub2Env, control: DurableObjectStub, actor: Actor,
+  internalPath: string): Promise<ForwardOptions | Response | undefined> {
+  const match = internalPath.match(/^\/api\/intakes\/([^/]+)\/(depend|artifacts)(?:\/[^/]+)?$/);
+  if (!match || request.method !== 'POST') return undefined;
+  if (match[2] === 'artifacts') {
+    const length = Number(request.headers.get('Content-Length'));
+    if (Number.isFinite(length) && length > ARTIFACT_BODY_LIMIT)
+      return error('artifact_too_large', 413, `size check failed: PNG over ${ARTIFACT_MAX_BYTES} bytes (6 MiB limit)`);
+    return { bodyLimit: ARTIFACT_BODY_LIMIT };
+  }
+  const dependent = decodeURIComponent(match[1]);
+  const body = (await request.clone().json().catch(() => null)) as { on?: unknown } | null;
+  if (!body || typeof body.on !== 'string' || !body.on || body.on.length > 180)
+    return error('prerequisite_required', 400, 'pass the prerequisite intake id with --on');
+  const routed = await control.fetch(new Request(`${CONTROL}/api/routes/intake/${encodeURIComponent(body.on)}`,
+    { headers: { 'x-hub2-actor': JSON.stringify(actor) } }));
+  if (!routed.ok) {
+    const code = ((await routed.json().catch(() => null)) as { error?: string } | null)?.error;
+    if (code === 'ambiguous_prefix') return error('prerequisite_ambiguous', 409, `prerequisite id prefix ${body.on} matches several intakes; pass the full id`);
+    if (code === 'prefix_too_short') return error('prerequisite_prefix_too_short', 400, 'prerequisite id prefix must be at least 6 characters');
+    return error('prerequisite_not_found', 404, `prerequisite intake ${body.on} does not exist or is not visible to this caller`);
+  }
+  const { route } = (await routed.json()) as { route: { id: string; owner: string } };
+  if (route.id === dependent) return error('dependency_self', 409, 'an intake cannot depend on itself');
+  // Bounded walk over the prerequisite's own prerequisites, across projects.
+  const seen = new Set<string>(), queue: Array<{ id: string; project: string }> = [{ id: route.id, project: route.owner }];
+  while (queue.length) {
+    const next = queue.shift()!;
+    if (next.id === dependent) return error('dependency_cycle', 409, `${route.id} already depends (directly or transitively) on ${dependent}`);
+    if (seen.has(next.id) || !next.project) continue;
+    seen.add(next.id);
+    if (seen.size > 64) return error('dependency_graph_too_large', 409, 'prerequisite chain exceeds 64 intakes; cycle check could not complete');
+    const response = await env.PROJECTS.get(env.PROJECTS.idFromName(next.project))
+      .fetch(new Request('https://project.hub2.internal/_internal/prerequisites/' + encodeURIComponent(next.id)));
+    if (!response.ok) continue;
+    const view = (await response.json()) as { depends_on?: Array<{ intake_id: string; project: string }> };
+    for (const item of view.depends_on ?? []) queue.push({ id: item.intake_id, project: item.project });
+  }
+  return { headers: { [PREREQUISITE_HEADER]: JSON.stringify({ id: route.id, project: route.owner }) } };
 }
 
 /**
