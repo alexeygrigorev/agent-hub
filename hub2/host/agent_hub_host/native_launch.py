@@ -1070,6 +1070,10 @@ class NativeLauncher:
             # Central-home sanitization removes CODEX_*; carry only the verified
             # path so the gated profile execution resolves the same wrapper.
             child_env["CODEX_LAUNCH_WRAPPER"] = codex_wrapper
+        if provider == "zai":
+            # Fixed per-attempt metadata diagnostics only. Trusted child values
+            # and a managed profile's existing explicit env retain precedence.
+            child_env.setdefault("RUST_LOG", "error,codex_tool_lifecycle=info")
         if specification.get("child_config_file"):
             child_env["HUB2_CONFIG"] = specification["child_config_file"]
         claude_config_dir = child_env.get('CLAUDE_CONFIG_DIR')
