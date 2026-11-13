@@ -339,27 +339,26 @@ def read_git_origin(checkout, roots):
     if common_text is None:
         return None
     configs = [common_text]
-    if gitdir != common:
-        worktree_config = gitdir / 'config.worktree'
-        try:
-            worktree_info = worktree_config.lstat()
-        except FileNotFoundError:
-            worktree_info = None
-        except OSError:
+    worktree_config = gitdir / 'config.worktree'
+    try:
+        worktree_info = worktree_config.lstat()
+    except FileNotFoundError:
+        worktree_info = None
+    except OSError:
+        return None
+    if worktree_info is not None:
+        worktree_enabled = _worktree_config_enabled(common_text)
+        if worktree_enabled is None:
             return None
-        if worktree_info is not None:
-            worktree_enabled = _worktree_config_enabled(common_text)
-            if worktree_enabled is None:
-                return None
-            if not worktree_enabled:
-                worktree_info = None  # Git ignores this file without the extension.
-        if worktree_info is not None:
-            if not stat.S_ISREG(worktree_info.st_mode):
-                return None
-            worktree_text = _read_regular(worktree_config)
-            if worktree_text is None:
-                return None
-            configs.append(worktree_text)
+        if not worktree_enabled:
+            worktree_info = None  # Git ignores this file without the extension.
+    if worktree_info is not None:
+        if not stat.S_ISREG(worktree_info.st_mode):
+            return None
+        worktree_text = _read_regular(worktree_config)
+        if worktree_text is None:
+            return None
+        configs.append(worktree_text)
 
     urls = []
     for config in configs:
@@ -367,12 +366,11 @@ def read_git_origin(checkout, roots):
         if values is None:
             return None
         for value in values:
-            # Git treats an empty remote URL in a later config layer as a reset
-            # of earlier URL values. Multiple effective origins are refused.
+            # Empty or multiple remote.origin.url entries have layer-dependent
+            # Git precedence; fail closed as unknown rather than guessing.
             if not value:
-                urls = []
-            else:
-                urls.append(value)
+                return None
+            urls.append(value)
     if len(urls) != 1:
         return None
     return normalize_git_origin(urls[0])
