@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { modelPolicyCandidateViolation } from '../src/model-policy.ts';
+import { isOrdinaryWorkModel, modelPolicyCandidateViolation } from '../src/model-policy.ts';
 
 const root = resolve(import.meta.dirname, '../..');
 const policy = JSON.parse(readFileSync(resolve(root, 'config/model-policy.json'), 'utf8')) as {
@@ -80,7 +80,8 @@ test('Gemini 4 Hydrogen via Antigravity replaces the flash route for ordinary pi
   assert.equal(hydrogen.effort, 'medium');
   assert.equal(hydrogen.enabled, true);
   assert.deepEqual(hydrogen.capabilities ?? [], [], 'ordinary: not review-only');
-  assert.ok(!policy.candidates.some(candidate => /flash/i.test(`${candidate.id} ${candidate.model}`)), 'no flash route remains in the default pool');
+  const ordinary = policy.candidates.filter(isOrdinaryWorkModel);
+  assert.ok(!ordinary.some(candidate => /flash/i.test(`${candidate.id} ${candidate.model}`)), 'no flash route remains in the ordinary automatic pool');
   assert.equal(modelPolicyCandidateViolation({id: hydrogen.id, engine: 'antigravity', model: hydrogen.model, effort: 'medium', account_id: 'gemini', capabilities: []}), null);
 });
 
@@ -130,4 +131,16 @@ test('Astra policy writes require review-only capability for both id and model a
   assert.equal(modelPolicyCandidateViolation({...route,capabilities:['headless']}),'astra_review_only_required');
   assert.equal(modelPolicyCandidateViolation({...route,capabilities:['review-only']}),null);
  }
+});
+
+
+test('committed GLM uses only the canonical ZAI route and remains outside ordinary work', () => {
+  const routes = policy.candidates.filter(candidate => candidate.engine === 'zai');
+  assert.deepEqual(routes, [{id: 'zai-glm-5-3-flash', engine: 'zai', model: 'glm-5.3-flash',
+    effort: 'medium', account_id: 'zai-central', weight: 1, capabilities: [], enabled: true}]);
+  assert.equal(isOrdinaryWorkModel(routes[0]), false);
+  assert.deepEqual(policy.candidates.filter(candidate => candidate.engine === 'go').map(candidate => candidate.model),
+    ['opencode-go/muse-spark-1.3-contributor']);
+  assert(policy.candidates.filter(candidate => /glm/i.test(candidate.model))
+    .every(candidate => candidate.engine === 'zai' && candidate.account_id === 'zai-central'));
 });
