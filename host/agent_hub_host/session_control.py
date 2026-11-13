@@ -798,6 +798,12 @@ def add_commands(sub):
     protect = commands.add_parser('protect', help='Permanently protect an owned session from automated cleanup; never stops it')
     protect.add_argument('id')
     protect.add_argument('--key', required=True, help='Stable protection key; this operation has no unprotect counterpart')
+    finish = commands.add_parser('finish', help='Record this session completion claim; does not report native exit or accept the intake')
+    finish.add_argument('id', help='Exact Hub session UUID whose claim is in --file')
+    finish.add_argument('--intake-task-id', required=True, help='Exact currently assigned intake UUID')
+    finish.add_argument('--key', required=True, help='Stable claim key; reuse exactly after a lost response')
+    finish.add_argument('--file', required=True, help='Bounded UTF-8 session_finished JSON claim file, or - for stdin')
+    finish.add_argument('--json', action='store_true')
     show = commands.add_parser('show', help='Show one session with its binding state')
     show.add_argument('id')
     show.add_argument('--threshold')
@@ -964,6 +970,45 @@ def _session_page(page):
     return rows, cursor
 
 
+def completion_claim_payload(args):
+    """Model-authored completion claim only; never host/native/verification evidence."""
+    import uuid
+    for value in (args.id, args.intake_task_id):
+        if not isinstance(value, str) or str(uuid.UUID(value)) != value:
+            raise ValueError('Completion requires canonical session and intake UUIDs')
+    if not isinstance(args.key, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}', args.key):
+        raise ValueError('Invalid completion key')
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError('Duplicate completion JSON key')
+            result[key] = value
+        return result
+    def invalid_number(_):
+        raise ValueError('Invalid completion JSON number')
+    try:
+        record = json.loads(read_file(args.file, limit=MAX_BODY, field='Completion claim'),
+                            object_pairs_hook=pairs, parse_constant=invalid_number, parse_float=invalid_number)
+    except (ValueError, RecursionError):
+        raise ValueError('Invalid completion claim JSON') from None
+    if (not isinstance(record, dict) or set(record) != {'kind','session_id','summary','acceptance'}
+            or record['kind'] != 'session_finished' or record['session_id'] != args.id
+            or not isinstance(record['summary'], str) or not record['summary'].strip()
+            or len(record['summary']) > 1000 or not isinstance(record['acceptance'], list)
+            or not record['acceptance']):
+        raise ValueError('File must contain a full session_finished claim for this session')
+    for entry in record['acceptance']:
+        if (not isinstance(entry, dict) or set(entry) != {'status','proof'}
+                or entry['status'] != 'met' or not isinstance(entry['proof'], str)
+                or not entry['proof'].strip()):
+            raise ValueError('Every completion entry requires status met and nonempty proof')
+    payload = {**record, 'key': args.key}
+    if len(json.dumps(payload, ensure_ascii=False).encode('utf-8')) > MAX_BODY:
+        raise ValueError('Completion claim exceeds capacity')
+    return payload
+
+
 def execute(args):
     # Capture's budget covers enqueue, every paginated HTTP request and sleep.
     # A context-local deadline cannot affect concurrent host receiver requests.
@@ -985,6 +1030,9 @@ def _execute(args):
         # Default grouped needs-action lifecycle projection (M15c). The
         # existing `list` spelling keeps the flat session intent listing.
         return request('GET', '/api/sessions?view=lifecycle')
+    if cmd == 'finish':
+        payload = completion_claim_payload(args)
+        return request('POST', '/api/intakes/' + args.intake_task_id + '/finished', payload)
     if cmd == 'link':
         from urllib.parse import quote
         return request('POST', '/api/sessions/' + quote(args.session, safe='') + '/link',

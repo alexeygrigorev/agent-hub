@@ -195,7 +195,7 @@ test('a claim starts an independent verifier and is delivered only after verific
     assert.match(JSON.parse(verifier.launch_spec_json).prompt,/Hub post-DONE acceptance verifier/);
     assert(!JSON.parse(verifier.launch_spec_json).prompt.includes(CONTRACT_MARKER),'verifier gets its verdict contract, not the worker contract');
     const verifierRun=await run(f,id);await verify(f,id,verifierRun.session_id,'pass');await finish(f,verifierRun,0);
-    assert.equal(intakeRow(f,id).status,'completed-awaiting-review');assert.equal(completion(f,id).verification.state,'passed');
+    assert.equal(intakeRow(f,id).status,'accepted','Hub accepts verified, merged code work itself');assert.equal(completion(f,id).verification.state,'passed');
     await f.project.alarm();
     assert.equal(f.mail.length,0);assert.equal(completion(f,id).delivery.state,'pending');assert.equal(completion(f,id).delivery.tries,1);
     assert(completion(f,id).delivery.next_action_at>Date.now(),'transient delivery failure backs off');
@@ -204,10 +204,10 @@ test('a claim starts an independent verifier and is delivered only after verific
     assert.equal(f.mail.length,1);
     const message=f.mail[0];
     assert.equal(message.recipient,admin.id);assert.equal(message.sender,'intake:'+id);assert.equal(message.key,'terminal:'+activeSaga(f,id).operation_id);
-    assert.match(message.body,/Task finished, awaiting review/);assert(message.body.includes(id)&&message.body.includes('Feature shipped and verified live.'));
+    assert.match(message.body,/Task accepted by Hub/);assert(message.body.includes(id)&&message.body.includes('Feature shipped and verified live.'));
     assert.equal(completion(f,id).delivery.state,'delivered');
     assert(events(f,id).some(e=>e.kind==='task_outcome_delivered'&&e.body.message_id==='message-1'));
-    assert.equal((await f.call('/api/intakes/'+id,'PATCH',{key:'accept-after-review',status:'accepted'})).status,200);
+    assert.equal(intakeRow(f,id).status,'accepted');
     f.reopen();await f.project.alarm();
     assert.equal(f.mail.length,1,'delivery is durable and never repeated');
     assert.equal(sagas(f,id).length,2,'a verified task is never continued');
@@ -484,6 +484,21 @@ test('pending continuation and delivery survive an outage longer than 25 hours',
   }finally{f.close();}
 });
 
+test('accepted intakes enter the completion scan only inside the bounded recent window',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'accepted-window');await start(f,id,'first');const b=await run(f,id);await claim(f,id,b.session_id);await finishClaimed(f,id,b);
+    const evidence=JSON.parse(intakeRow(f,id).final_evidence_json),due=Date.now()-100;
+    evidence.completion.delivery={state:'pending',key:'accepted-delivery',tries:0,next_action_at:due};
+    f.db().run("UPDATE intakes SET status='accepted',final_evidence_json=?,updated_at=? WHERE id=?",JSON.stringify(evidence),Date.now()-60_000,id);
+    assert.equal((f.project as any).completionNextDeadline(),due,'a recent accepted intake still gets its pending delivery');
+    f.db().run('UPDATE intakes SET updated_at=? WHERE id=?',Date.now()-8*24*3600000,id);
+    assert.equal((f.project as any).completionNextDeadline(),undefined,'old accepted intakes are outside the host-polled scan');
+    const plan=(f.db().all(`EXPLAIN QUERY PLAN SELECT 1 FROM intakes i WHERE i.status='accepted' AND i.updated_at>=?`,0) as any[]).map(r=>r.detail).join(' ');
+    assert.match(plan,/intakes_status_updated/,'the accepted window is an index range');
+  }finally{f.close();}
+});
+
 test('eligible current actions are filtered before LIMIT and alarm MIN; terminal continuation timestamps cannot hide delivery',async()=>{
   const f=fixture();
   try{
@@ -539,7 +554,7 @@ for(const failure of ['retry','refused','superseded','throw','outer-catch']){
       };
       await f.project.alarm();
       assert.equal(replaced,true);assert.equal(intakeRow(f,id).session_id,snapshot.session_id);
-      assert.equal(intakeRow(f,id).status,'completed-awaiting-review');assert.equal(intakeRow(f,id).final_evidence_json,snapshot.final_evidence_json);
+      assert.equal(intakeRow(f,id).status,'accepted');assert.equal(intakeRow(f,id).final_evidence_json,snapshot.final_evidence_json);
       assert.equal(intakeRow(f,id).updated_at,snapshot.updated_at);assert.equal(completion(f,id).outcome,'claimed');assert.equal(completion(f,id).continuation,undefined);
       await f.project.alarm();assert.equal(f.mail.length,1,'new claimed result still delivers normally');assert.equal(sagas(f,id).length,3);
     }finally{f.close();}
@@ -555,7 +570,7 @@ test('valid quote-heavy prompt stays exact and outcome-controlled when the contr
     assert.equal(intakeRow(f,id).status,'failed');assert.equal(completion(f,id).outcome,'unfinished');assert.equal(completion(f,id).continuation,undefined);
     await f.project.alarm();assert.equal(sagas(f,id).length,1);assert.equal(f.mail.length,1);assert.match(f.mail[0].body,/NOT finished/);
     const done=await createIntake(f,'omitted-claim');await start(f,done,'first',{prompt});const b=await run(f,done);await claim(f,done,b.session_id);await finishClaimed(f,done,b);
-    assert.equal(intakeRow(f,done).status,'completed-awaiting-review');assert.equal(completion(f,done).outcome,'claimed','a valid explicit claim still counts');
+    assert.equal(intakeRow(f,done).status,'accepted');assert.equal(completion(f,done).outcome,'claimed','a valid explicit claim still counts');
   }finally{f.close();}
 });
 
@@ -1090,5 +1105,149 @@ test('continuation snapshot can read qualified late-stop salvage without alterin
     await f.project.alarm();
     assert(latestLaunch(f,id).prompt.includes('fix/late-stop'));
     assert(latestLaunch(f,id).prompt.includes('c'.repeat(40)));
+  }finally{f.close();}
+});
+
+// Live probe a3fa3196 (13 Nov 2026): verifiers wrote {"evidence":{...}} as the
+// prompt said, the CLI wrapped it again, and Hub saw no verdict twice.
+test('a doubly wrapped verdict is read as written and an absent verdict fails loudly with its cause',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'wrapped-verdict',true);
+    await start(f,id,'first');const first=await run(f,id);await addMergeProof(f,id);await claim(f,id,first.session_id);await finish(f,first,0);
+    await f.project.alarm();
+    const verifier=await run(f,id),actor={id:'session:'+verifier.session_id,kind:'agent',resource_id:id,scopes:['intake:append']};
+    const record={kind:'acceptance_verification',session_id:verifier.session_id,verdict:'pass',summary:'All criteria verified',
+      acceptance:AC.map(()=>({status:'met',proof:'checked'}))};
+    const r=await f.call('/api/intakes/'+id+'/events','POST',{key:'wrapped',event:{evidence:record}},actor);
+    assert.equal(r.status,201,await r.clone().text());
+    assert.deepEqual(events(f,id).filter(e=>e.kind==='worker_append').at(-1).body.evidence,record,'stored unwrapped');
+    await finish(f,verifier,0);
+    assert.equal(intakeRow(f,id).status,'accepted');assert.equal(completion(f,id).verification.state,'passed');
+
+    const silent=await createIntake(f,'silent-verifier',false);
+    await start(f,silent,'first');const work=await run(f,silent);await claim(f,silent,work.session_id);await finish(f,work,0);
+    await f.project.alarm();
+    const quiet=await run(f,silent),quietActor={id:'session:'+quiet.session_id,kind:'agent',resource_id:silent,scopes:['intake:append']};
+    const malformed=await f.call('/api/intakes/'+silent+'/events','POST',{key:'short',event:{evidence:{evidence:{...record,session_id:quiet.session_id,acceptance:[{status:'met',proof:'x'}]}}}},quietActor);
+    assert.equal(malformed.status,400,'a malformed verdict is refused at append, even when wrapped');
+    await f.call('/api/intakes/'+silent+'/events','POST',{key:'note',note:'could not reach the deployment'},quietActor);
+    await finish(f,quiet,0);
+    const unfinished=events(f,silent).find(e=>e.kind==='task_verifier_unfinished');
+    assert.match(unfinished.body.cause,/^verifier_exit_without_verdict: the verifier appended no verdict; its last note: could not reach the deployment/);
+    assert.equal(completion(f,silent).cause,unfinished.body.cause);
+  }finally{f.close();}
+});
+
+test('merge-state is readable by operators and the intake worker only, and names the gate problems',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'merge-state',true);
+    await start(f,id,'first');const first=await run(f,id);
+    const worker={id:'session:'+first.session_id,kind:'agent',resource_id:id,scopes:['intake:read','intake:append']};
+    let state=await json(await f.call('/api/intakes/'+id+'/merge-state','GET',undefined,worker));
+    assert.equal(state.code_task,true);assert.equal(state.merge_gate.ok,false);assert.match(state.merge_gate.problems[0],/JSON object/);
+    assert.match(state.next_step,/hub intake merge-check/);
+    const posted=await f.call('/api/intakes/'+id+'/merge-evidence','POST',{key:'worker-proof',evidence:mergeProof},worker);
+    assert.equal(posted.status,201,await posted.clone().text());
+    state=await json(await f.call('/api/intakes/'+id+'/merge-state'));
+    assert.equal(state.merge_gate.ok,true);assert.deepEqual(state.merge_gate.problems,[]);
+    const other=await createIntake(f,'other-intake',true);
+    const foreign=await f.call('/api/intakes/'+other+'/merge-state','GET',undefined,worker);
+    assert.equal(foreign.status,403);
+    const noCi={...mergeProof,checks_state:'none',checks_total:0,checks_successful:0};
+    await f.call('/api/intakes/'+other+'/merge-evidence','POST',{key:'no-ci',evidence:noCi});
+    state=await json(await f.call('/api/intakes/'+other+'/merge-state'));
+    assert.equal(state.merge_gate.ok,true,'a merged PR in a repository without CI is not blocked');
+    await f.call('/api/intakes/'+other+'/merge-evidence','POST',{key:'red',evidence:{...mergeProof,checks_state:'failure',checks_successful:1,checks_failed:1}});
+    state=await json(await f.call('/api/intakes/'+other+'/merge-state'));
+    assert.equal(state.merge_gate.ok,false);assert(state.merge_gate.problems.some((p:string)=>p.includes('green')));
+  }finally{f.close();}
+});
+
+test('operator re-evaluation of a failed intake accepts merged work and sends unmerged work back with named gaps',async()=>{
+  const f=fixture();
+  try{
+    // Merged work whose session ended blocked (a0af4b9b/d40c7989 on 13 Nov).
+    const merged=await createIntake(f,'reeval-merged',true);
+    await start(f,merged,'first');const first=await run(f,merged);
+    const blocker={kind:'task_blocked',session_id:first.session_id,cause:'permission',detail:'merge-state 404'};
+    await f.call('/api/intakes/'+merged+'/events','POST',{key:'blocked',event:blocker},{id:'session:'+first.session_id,kind:'agent',resource_id:merged,scopes:['intake:append']});
+    await finish(f,first,0);
+    assert.equal(intakeRow(f,merged).status,'failed');
+    await f.project.alarm();
+    const before=sagas(f,merged).length;
+    const workerTry=await f.call('/api/intakes/'+merged+'/reevaluate','POST',{key:'r1'},{id:'session:'+first.session_id,kind:'agent',resource_id:merged,scopes:['intake:append']});
+    assert.equal(workerTry.status,403);
+    const requested=await f.call('/api/intakes/'+merged+'/reevaluate','POST',{key:'r1',reason:'PR merged; merge-state was 404'});
+    assert.equal(requested.status,202,await requested.clone().text());
+    assert.equal((await f.call('/api/intakes/'+merged+'/reevaluate','POST',{key:'r1',reason:'PR merged; merge-state was 404'})).status,200,'idempotent');
+    await f.project.alarm();
+    assert.equal(sagas(f,merged).length,before+1,'one independent verifier');
+    const verifier=activeSaga(f,merged),route=JSON.parse(verifier.routing_json);
+    assert.equal(route.acceptance_verification,true);assert.match(route.verification_round,/^re[0-9a-f]{12}$/);
+    assert.notEqual(route.picker.policy_id,JSON.parse(sagas(f,merged)[0].routing_json).picker.policy_id);
+    assert.match(JSON.parse(verifier.launch_spec_json).prompt,/hub intake merge-check/);
+    const vrun=await run(f,merged);
+    await f.call('/api/intakes/'+merged+'/merge-evidence','POST',{key:'verifier-proof',evidence:mergeProof},{id:'session:'+vrun.session_id,kind:'agent',resource_id:merged,scopes:['intake:append']});
+    await verify(f,merged,vrun.session_id,'pass');await finish(f,vrun,0);
+    assert.equal(intakeRow(f,merged).status,'accepted');
+    assert(events(f,merged).some(e=>e.kind==='task_reevaluation_requested'));
+    assert(events(f,merged).some(e=>e.kind==='task_acceptance_verified'));
+
+    // Work that never reached main: a model pass cannot bypass the gate.
+    const unmerged=await createIntake(f,'reeval-unmerged',true);
+    await start(f,unmerged,'first');const second=await run(f,unmerged);await finish(f,second,0);
+    await f.project.alarm();await f.project.alarm();
+    while(['queued','running'].includes(intakeRow(f,unmerged).status)){await finish(f,await run(f,unmerged),0);await f.project.alarm();}
+    assert.equal(intakeRow(f,unmerged).status,'failed');
+    assert.equal((await f.call('/api/intakes/'+unmerged+'/reevaluate','POST',{key:'r2'})).status,202);
+    await f.project.alarm();
+    const check=await run(f,unmerged);
+    await f.call('/api/intakes/'+unmerged+'/merge-evidence','POST',{key:'open-pr',evidence:{...mergeProof,merged_at:null,merge_commit_in_main:false}});
+    await verify(f,unmerged,check.session_id,'pass');await finish(f,check,0);
+    assert.equal(intakeRow(f,unmerged).status,'failed');
+    const gaps=completion(f,unmerged).verification.gaps as string[];
+    assert(gaps.some(g=>g.includes('the pull request is not merged')),JSON.stringify(gaps));
+    assert.equal(completion(f,unmerged).continuation.state,'pending','sent back to the worker');
+    await f.project.alarm();
+    assert(JSON.parse(activeSaga(f,unmerged).launch_spec_json).prompt.includes('the pull request is not merged'));
+    assert.equal((await f.call('/api/intakes/'+unmerged+'/reevaluate','POST',{key:'r3'})).status,409,'not while a session runs');
+  }finally{f.close();}
+});
+
+// a3fa3196 shape: the intake failed after its verifiers escalated, so its last
+// session is a verifier. Re-evaluation must review the implementation session.
+test('re-evaluation after verifier escalation reviews the implementation session and sends gaps to a worker, not a reviewer',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'reeval-after-verifier',true);
+    await start(f,id,'first');const work=await run(f,id);await claim(f,id,work.session_id);await finish(f,work,0);
+    for(let attempt=1;attempt<=MAX_VERIFICATION_ATTEMPTS;attempt++){await f.project.alarm();await finish(f,await run(f,id),0);}
+    assert.equal(intakeRow(f,id).status,'failed');assert.equal(completion(f,id).verification.state,'escalated');
+    const lastVerifier=intakeRow(f,id).session_id;assert.notEqual(lastVerifier,work.session_id);
+    const requested=await json(await f.call('/api/intakes/'+id+'/reevaluate','POST',{key:'after-escalation'}));
+    assert.equal(requested.original_session_id,work.session_id);assert.equal(requested.session_id,lastVerifier);
+    await f.project.alarm();
+    const verifier=activeSaga(f,id),route=JSON.parse(verifier.routing_json);
+    assert.equal(route.verification_origin_session_id,work.session_id);assert.equal(route.verification_of_session_id,lastVerifier);
+    assert(JSON.parse(verifier.launch_spec_json).prompt.includes('implementation session '+work.session_id));
+    const vrun=await run(f,id);await verify(f,id,vrun.session_id,'fail','Export is missing.');await finish(f,vrun,0);
+    assert.equal(completion(f,id).continuation.state,'pending');
+    await f.project.alarm();
+    const fix=activeSaga(f,id),launch=JSON.parse(fix.launch_spec_json);
+    assert.equal(JSON.parse(fix.routing_json).purpose,undefined,'the fix session implements');
+    assert(!launch.prompt.includes('Hub post-DONE acceptance verifier'),'the fix session is not given the verifier role');
+    assert(launch.prompt.includes('Implement the requested feature end to end.'));assert(launch.prompt.includes('Export is missing.'));
+  }finally{f.close();}
+});
+
+test('merge evidence for a PR of another repository never satisfies the gate',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'foreign-pr',true);
+    await f.call('/api/intakes/'+id+'/merge-evidence','POST',{key:'foreign',evidence:{...mergeProof,pr_url:'https://github.com/org/other/pull/9'}});
+    const state=await json(await f.call('/api/intakes/'+id+'/merge-state'));
+    assert.equal(state.merge_gate.ok,false);assert(state.merge_gate.problems.some((p:string)=>p.includes('is not in org/completion')));
   }finally{f.close();}
 });

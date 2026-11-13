@@ -97,3 +97,29 @@ failures, denied intake lookups, and refused apply operations appear as
 `inspection_failed`, `fetch_failed`, `lookup_failed`, or `apply_failed` rows
 rather than being silently counted as merged or as no-intake work. The Hub
 watcher requeues recorded unmerged work.
+
+## Hub2 merge gate (intake 52f5e130, 13 Nov 2026)
+
+Hub2 validates and journals merge evidence; GitHub is read by the CLI, never by
+the Worker. The installed `hub` CLI speaks the Hub2 shape:
+
+- `hub intake merge-check <id> [--pr URL|N] [--dry-run]` reads the PR, the
+  exact-head check runs and statuses, `main` and the compare API through `gh`
+  (no local checkout), records `{kind:"merge_gate",...}` on the intake and
+  prints the resulting merge state. Without `--pr` it uses the newest PR of the
+  intake project cited in the intake journal, else a PR of a branch the host
+  pushed for the intake. A merged PR whose exact head has no check run or status
+  at all is recorded as `checks_state:"none"` (the repository runs no CI) and
+  does not block; red or pending checks always do.
+- `hub intake merge-state <id>` (`GET /api/intakes/ID/merge-state`, compat
+  `/api/intake/tasks/ID/merge-state`) shows the gate, its problems and the
+  verification state. Operators and the intake's own worker credential may read it.
+- `hub intake reevaluate <id> [--reason TEXT]` (operator) starts an independent
+  verifier for a failed intake. The verifier records merge evidence and a
+  verdict; a pass with a satisfied gate ends `accepted`, a fail or a gate
+  problem sends the work back to the worker with the named gaps.
+
+An independent verification pass for code work whose merge gate holds now ends
+the intake `accepted` without a manual review step. A verifier that exits
+without a usable verdict is retried once and then escalated with the exact
+cause (malformed verdict, wrong record kind, or its last note).
