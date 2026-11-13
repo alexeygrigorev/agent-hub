@@ -1,5 +1,6 @@
 // Real Node/SQLite routes plus the installed Python CLI, with synthetic credentials.
 import assert from 'node:assert/strict';
+import { qualifiedRepositoryWorkspace, REPOSITORY_IDENTITY_CAPABILITY } from '../src/repository-identity.ts';
 import WebSocket from 'ws';
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
@@ -131,6 +132,14 @@ try {
     body:JSON.stringify({labels:[],engines:['codex'],capabilities:['headless'],native_sessions:[]})})).status,200);
   hostSocket=new WebSocket(fixture.origin.replace('http:','ws:')+'/api/connect',{headers:{Authorization:'Bearer '+machine}});
   await new Promise((resolve,reject)=>{hostSocket.once('open',resolve);hostSocket.once('error',reject);});
+  // A connected older host without canonical-origin advertisement must refuse repo-only placement.
+  const oldHostRepoOnly = await start({ ...base, key: 'start-old-host-repo-only', workspace: undefined });
+  assert.equal(oldHostRepoOnly.status, 503);
+  const repositoryWorkspace = await qualifiedRepositoryWorkspace('https://github.com/owner/repo');
+  assert(repositoryWorkspace);
+  assert.equal((await fixture.fetch('/api/heartbeat',{method:'POST',headers:{Authorization:'Bearer '+machine,'Content-Type':'application/json'},
+    body:JSON.stringify({labels:[],engines:['codex'],capabilities:['headless',REPOSITORY_IDENTITY_CAPABILITY,
+      'workspace:'+repositoryWorkspace],native_sessions:[]})})).status,200);
   // --repo owner/name supplies its repository workspace when --workspace is omitted.
   const repoOnly = await start({ ...base, key: 'start-repo-only-01', workspace: undefined });
   const repoOnlyBody = await repoOnly.json();
