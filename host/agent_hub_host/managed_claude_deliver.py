@@ -20,15 +20,27 @@ two steps leaves the offline fallback (``refresh_launch_credential`` ->
 ``reconcile`` of the receipt) moving forward, never reverting a delivered
 generation.
 
+A second, independent consumer may be opted in by an operator: the one-way
+default Claude consumer (``default_claude_consumer``). It is handled after, and
+never through, the managed step: a host with only a default enrollment needs no
+managed profile or receipt, and a managed refusal does not stop the default
+step (or the reverse). Without that enrollment the output and behavior are
+exactly the managed-only ones above. With it, the result also carries the
+default consumer's fixed status, whether it is an enabled (write-mode)
+delivery consumer and the current consumer-set identity, so the daemon can
+ACK only when every enabled consumer holds the generation. The ``check``
+action is the same evaluation with zero writes.
+
 Output is one JSON object on stdout. Exit 0 means ``absent`` (no managed
-hub-claude consumer here, nothing written), ``in_step`` or ``materialized``.
-Anything else exits 3 with a fixed reason; never paths, tokens or exceptions.
+hub-claude consumer here, nothing written), ``in_step`` or ``materialized``
+(``pending`` for ``check``). Anything else exits 3 with a fixed reason; never
+paths, tokens or exceptions.
 """
 import json
 import re
 import sys
 
-from . import credentials, managed_claude_repin, private_fs, provisioning
+from . import credentials, default_claude_consumer, managed_claude_repin, private_fs, provisioning
 
 LABEL = 'hub-claude'
 CREDENTIAL_PATH = '.claude/.credentials.json'
@@ -113,7 +125,7 @@ def _receipt(revision):
     return dest, receipt
 
 
-def deliver(archive, request):
+def _managed(archive, request, check):
     with provisioning.lock(timeout=LOCK_TIMEOUT_S, bounded=True):
         found = _receipt(request['revision'])
         if found is None or not _profile_present(archive):
@@ -135,9 +147,14 @@ def deliver(archive, request):
         try:
             provisioning.validate(bundle)
             # Refuse older or equal-but-changed generations before any write.
-            credentials.materialize_current(bundle, home, dest, generation, check_only=True)
+            checked = credentials.materialize_current(bundle, home, dest, generation, check_only=True)
         except (OSError, ValueError, TypeError, KeyError):
             raise Refused('generation_refused') from None
+        if check:
+            # Read-only: held only when receipt and home already equal the request.
+            current = held == generation and checked.get('status') == 'in_step'
+            return {'status': 'in_step' if current else 'pending', 'generation': generation,
+                    'revision': request['revision']}
         try:
             # Receipt first: it is never older than the home it backs.
             if provisioning.load_bundle(dest) != bundle:
@@ -154,14 +171,37 @@ def deliver(archive, request):
         return {'status': outcome['status'], 'generation': generation, 'revision': request['revision']}
 
 
+def deliver(archive, request, check=False):
+    refusal, managed = None, None
+    try:
+        managed = _managed(archive, request, check)
+    except (Refused, TimeoutError) as error:
+        refusal = str(error) if isinstance(error, Refused) else 'lock_timeout'
+    default = default_claude_consumer.deliver(request, check_only=check)
+    if default['status'] == 'absent':
+        # No default enrollment: exactly the managed-only contract.
+        if refusal is not None:
+            if refusal == 'lock_timeout':
+                raise TimeoutError
+            raise Refused(refusal)
+        return managed
+    result = {'status': 'refused', 'reason': refusal} if refusal is not None else dict(managed)
+    result['default'] = default['status']
+    result['default_enabled'] = bool(default['enabled'])
+    result['consumer_set'] = default_claude_consumer.current_set(
+        refusal is None and managed['status'] != 'absent')
+    return result
+
+
 def main(argv, stdin=None):
-    """argv: [<verified hub.pyz this helper runs from>, 'materialize']."""
+    """argv: [<verified hub.pyz this helper runs from>, 'materialize' | 'check']."""
     try:
         argv = list(argv)
-        if len(argv) != 2 or argv[1] != 'materialize' or not isinstance(argv[0], str) or not argv[0].startswith('/'):
+        if len(argv) != 2 or argv[1] not in ('materialize', 'check') or not isinstance(argv[0], str) or not argv[0].startswith('/'):
             raise Refused('invalid_arguments')
         stream = stdin if stdin is not None else sys.stdin.buffer
-        result, code = deliver(argv[0], _read_request(stream)), 0
+        result = deliver(argv[0], _read_request(stream), argv[1] == 'check')
+        code = 3 if result['status'] == 'refused' else 0
     except Refused as refused:
         result, code = {'status': 'refused', 'reason': str(refused)}, 3
     except TimeoutError:
