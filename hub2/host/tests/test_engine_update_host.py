@@ -15,7 +15,7 @@ class EngineUpdateHostTest(unittest.TestCase):
         client = types.SimpleNamespace(
             request=lambda method, path, body=None: posted.append((method, path, body)) or {}
         )
-        bridge = Bridge(client, None, ['/tmp'], ['codex'], machine_id='hetzner-aplexer')
+        bridge = Bridge(client, None, ['/tmp'], ['codex'], executable=sys.executable, machine_id='hetzner-aplexer')
         versions = ['0.166.0', '0.168.0']
 
         def fake_run(cmd, **kwargs):
