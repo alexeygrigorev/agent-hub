@@ -14,6 +14,11 @@ const policy = JSON.parse(readFileSync(resolve(root, 'config/model-policy.json')
     account_id: string; weight: number; capabilities: string[]; enabled: boolean;
   }[];
 };
+const routing = JSON.parse(readFileSync(resolve(root, 'config/model-routing.json'), 'utf8')) as {
+  models: {id:string; model:string; provider:string; engine:string; effort:string|null}[];
+  tiers: Record<string,string[]>;
+  rules: {auto_start_models:string[]};
+};
 
 const FIELD_PATTERN = /^[A-Za-z0-9_.:/-]+$/;
 const EFFORTS = new Set(['low', 'medium', 'max']);
@@ -83,6 +88,30 @@ test('Gemini 4 Hydrogen via Antigravity replaces the flash route for ordinary pi
   const ordinary = policy.candidates.filter(isOrdinaryWorkModel);
   assert.ok(!ordinary.some(candidate => /flash/i.test(`${candidate.id} ${candidate.model}`)), 'no flash route remains in the ordinary automatic pool');
   assert.equal(modelPolicyCandidateViolation({id: hydrogen.id, engine: 'antigravity', model: hydrogen.model, effort: 'medium', account_id: 'gemini', capabilities: []}), null);
+});
+
+test('Gemini 4 Carbon is allowlisted for pinned thinking only, outside every automatic tier', () => {
+  const carbon = policy.candidates.find(candidate => candidate.id === 'antigravity-carbon-medium');
+  assert.ok(carbon, 'Carbon candidate is in the Hub pool');
+  assert.equal(carbon.engine, 'antigravity');
+  assert.equal(carbon.model, 'gemini-4-carbon-medium');
+  assert.equal(carbon.effort, 'medium');
+  assert.equal(carbon.account_id, 'gemini');
+  assert.deepEqual(carbon.capabilities, ['think-only']);
+  assert.equal(carbon.enabled, true);
+  assert.equal(modelPolicyCandidateViolation(carbon), null);
+
+  const localCarbon = routing.models.find(model => model.id === 'antigravity-carbon-medium');
+  assert.deepEqual(localCarbon, {
+    id: 'antigravity-carbon-medium', model: 'gemini-4-carbon-medium', provider: 'gemini',
+    engine: 'antigravity', profile: null, effort: 'medium',
+  });
+  assert.ok(Object.values(routing.tiers).every(members => !members.includes('antigravity-carbon-medium')),
+    'Carbon must not join daily, review, deep or quick defaults');
+  assert.ok(!routing.rules.auto_start_models.includes('antigravity-carbon-medium'),
+    'Carbon must not join automatic starts');
+  assert.ok(policy.candidates.some(candidate => candidate.id === 'antigravity-hydrogen-medium'
+    && candidate.model === 'gemini-4-hydrogen-medium'), 'Hydrogen remains the ordinary Gemini candidate');
 });
 
 test('no haiku anywhere in the pool', () => {
