@@ -99,11 +99,19 @@ jobs:
       - run: python3 scripts/ci/test_root_distribution.py
       - run: npm run build
   deploy:
-    needs: [hub2, distribution]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && !inputs.dry_run && !inputs.rollback_pending
+    needs: [test, hub2, distribution]
+    # Intake bf07f437: a green push to main deploys automatically (release_mode
+    # active, full Caddy), so a merged Hub host/server fix never sits
+    # unpublished waiting for someone to dispatch. Pull requests never deploy;
+    # workflow_dispatch stays the manual and bootstrap path.
+    if: >-
+      github.ref == 'refs/heads/main'
+      && (github.event_name == 'push'
+          || (github.event_name == 'workflow_dispatch' && !inputs.dry_run && !inputs.rollback_pending))
     permissions:
       contents: read
       actions: read
+      issues: write
     concurrency:
       group: agent-hub-production
       cancel-in-progress: false
@@ -115,8 +123,44 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Require green Python host tests for this main commit
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid deploy commit" >&2; exit 2; }
+          runs_path="$RUNNER_TEMP/python-tests-runs.json"
+          for attempt in $(seq 1 60); do
+            gh api "repos/$REPO/actions/workflows/python-tests.yml/runs?branch=main&event=push&head_sha=$DEPLOY_SHA&per_page=20" > "$runs_path"
+            if python3 - "$runs_path" "$DEPLOY_SHA" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          runs = [r for r in payload.get("workflow_runs", []) if r.get("head_sha") == sys.argv[2]]
+          if any(r.get("status") == "completed" and r.get("conclusion") == "success" for r in runs):
+              raise SystemExit(0)
+          if runs and all(r.get("status") == "completed" for r in runs):
+              print("Python host tests did not pass for this commit: "
+                    + ",".join(sorted({str(r.get("conclusion")) for r in runs})), file=sys.stderr)
+              raise SystemExit(2)
+          raise SystemExit(1)
+          PY
+            then
+              echo "Python host tests are green for $DEPLOY_SHA"
+              exit 0
+            else
+              rc=$?
+              ((rc == 1 && attempt < 60)) || { echo "refusing automatic deploy of $DEPLOY_SHA without green Python host tests" >&2; exit 1; }
+              sleep 10
+            fi
+          done
       - name: Prepare and verify matched CLI release bundle
-        if: inputs.release_mode == 'active'
+        if: (inputs.release_mode || 'active') == 'active'
         id: prepare_cli_bundle
         env:
           GH_TOKEN: ${{ github.token }}
@@ -267,7 +311,7 @@ jobs:
             exit 1
           fi
       - name: Stage verified matched CLI release bundle on VM
-        if: inputs.release_mode == 'active'
+        if: (inputs.release_mode || 'active') == 'active'
         env:
           DEPLOY_SHA: ${{ github.sha }}
           BUNDLE_DIR: ${{ steps.prepare_cli_bundle.outputs.bundle_dir }}
@@ -285,7 +329,7 @@ jobs:
       - name: Deploy validated revision through the fixed VM transaction script
         id: deploy_vm
         env:
-          RELEASE_MODE: ${{ inputs.release_mode }}
+          RELEASE_MODE: ${{ inputs.release_mode || 'active' }}
           CONFIRM_BOOTSTRAP: ${{ inputs.confirm_bootstrap }}
           HUB_ONLY: ${{ inputs.hub_only }}
           DEPLOY_SHA: ${{ github.sha }}
@@ -314,7 +358,7 @@ jobs:
             < deploy/vm/deploy-release-transaction.sh
       - name: Read Hub API health on the configured client URL
         env:
-          RELEASE_MODE: ${{ inputs.release_mode }}
+          RELEASE_MODE: ${{ inputs.release_mode || 'active' }}
         run: |
           set -euo pipefail
           for attempt in 1 2 3 4 5 6; do
@@ -346,7 +390,7 @@ jobs:
           echo "Hub API health read did not report the requested healthy release mode: $RELEASE_MODE" >&2
           exit 1
       - name: Publish matched CLI and host release assets
-        if: inputs.release_mode == 'active'
+        if: (inputs.release_mode || 'active') == 'active'
         env:
           DEPLOY_SHA: ${{ github.sha }}
           MANIFEST_SHA256: ${{ steps.prepare_cli_bundle.outputs.manifest_sha256 }}
@@ -361,7 +405,7 @@ jobs:
             "$SSH_TARGET" bash -s -- publish "$DEPLOY_SHA" "$MANIFEST_SHA256" \
             < deploy/vm/deploy-release-transaction.sh
       - name: Verify public CLI and host release assets against CI bundle
-        if: inputs.release_mode == 'active'
+        if: (inputs.release_mode || 'active') == 'active'
         env:
           DEPLOY_SHA: ${{ github.sha }}
           BUNDLE_DIR: ${{ steps.prepare_cli_bundle.outputs.bundle_dir }}
@@ -414,7 +458,7 @@ jobs:
             --manifest-sha256 "$MANIFEST_SHA256"
       - name: Run pre-commit live shell start canary on Hetzner
         id: precommit_shell_canary
-        if: inputs.release_mode == 'active'
+        if: (inputs.release_mode || 'active') == 'active'
         env:
           DEPLOY_SHA: ${{ github.sha }}
           BUNDLE_DIR: ${{ steps.prepare_cli_bundle.outputs.bundle_dir }}
@@ -539,6 +583,26 @@ jobs:
             -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
             -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
             "$SSH_TARGET" bash -s -- rollback < deploy/vm/deploy-release-transaction.sh
+      - name: Alert the deploy owner when an automatic deploy fails
+        if: failure() && github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="Hub2 auto-deploy failed: main is not live in production"
+          body="$(printf 'Automatic production deploy of main %s failed after green CI, so the merged fix is NOT deployed to hub.dtcdev.click or hosts.\n\nDeploy owner: %s (repository owner). Run: %s\n\nNext step: read the failed step; fix forward or rerun with gh workflow run deploy.yml --ref main -f dry_run=false. Close this issue once host-release.json reports a commit that contains %s.' "$DEPLOY_SHA" "$OWNER" "$RUN_URL" "$DEPLOY_SHA")"
+          existing="$(gh issue list --repo "$REPO" --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')"
+          if [[ -n "$existing" ]]; then
+            gh issue comment "$existing" --repo "$REPO" --body "$body"
+            gh issue edit "$existing" --repo "$REPO" --add-assignee "$OWNER"
+          else
+            gh issue create --repo "$REPO" --title "$title" --assignee "$OWNER" --body "$body"
+          fi
+          echo "::error title=Hub2 auto-deploy failed::main $DEPLOY_SHA is not deployed; deploy owner $OWNER alerted via issue"
       - name: Remove the temporary SSH key
         if: always()
         run: rm -f -- "$RUNNER_TEMP/agent-hub-ssh/hub_vm_key" "$RUNNER_TEMP/agent-hub-ssh/hetzner_canary_key" "$RUNNER_TEMP/agent-hub-ssh/hetzner_canary_known_hosts" "$RUNNER_TEMP/precommit-shell-canary.json"

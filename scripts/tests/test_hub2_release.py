@@ -246,6 +246,32 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
                 self.assertEqual(updater.main(), 0)
         self.assertEqual(seen, [(False, True, True), (False, True, False)])
 
+    def test_manual_start_with_stale_systemd_timer_trigger_is_immediate(self):
+        # Intake bf07f437: systemd 255 keeps the previous timer activation's
+        # TRIGGER_UNIT/TRIGGER_TIMER_REALTIME_USEC on a manual `systemctl start`.
+        now = 1_794_578_913.5
+        timer = {'TRIGGER_UNIT': 'agent-hub2-host-update.timer'}
+        fresh = {**timer, 'TRIGGER_TIMER_REALTIME_USEC': str(int((now - 0.2) * 1_000_000))}
+        stale = {**timer, 'TRIGGER_TIMER_REALTIME_USEC': str(int((now - 156) * 1_000_000))}
+        future = {**timer, 'TRIGGER_TIMER_REALTIME_USEC': str(int((now + 60) * 1_000_000))}
+        self.assertTrue(updater.timer_triggered(fresh, now))
+        self.assertFalse(updater.timer_triggered(stale, now), 'stale trigger means a manual (deploy canary) start')
+        self.assertFalse(updater.timer_triggered(future, now))
+        self.assertTrue(updater.timer_triggered(timer, now), 'without a trigger time keep the batching default')
+        self.assertFalse(updater.timer_triggered({}, now))
+        self.assertFalse(updater.timer_triggered({'TRIGGER_UNIT': 'x.path', 'TRIGGER_TIMER_REALTIME_USEC': fresh['TRIGGER_TIMER_REALTIME_USEC']}, now))
+        seen = []
+        def fake_install(base_url, root, *, install_service=False, restart=True, scheduled=False):
+            seen.append(scheduled)
+        with patch.object(updater, 'install', fake_install), \
+             patch.object(Path, 'home', return_value=Path(self.temporary.name)), \
+             patch.object(sys, 'argv', ['hub2-self-update.py']), \
+             patch.object(updater.time, 'time', return_value=now):
+            for env in (stale, fresh):
+                with patch.dict(os.environ, env, clear=False):
+                    self.assertEqual(updater.main(), 0)
+        self.assertEqual(seen, [False, True])
+
     def test_valid_update_is_offline_and_keeps_previous(self):
         old = self.old_release()
         self.install()

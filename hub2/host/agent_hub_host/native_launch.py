@@ -6,6 +6,7 @@ external Agent Quota Launcher remains untouched for its other consumers.
 """
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -13,6 +14,7 @@ import subprocess
 import stat
 import sys
 import time
+import unicodedata
 from pathlib import Path
 
 from .client import private_file
@@ -99,6 +101,98 @@ INHERITED_SECRET_VARS = ('HUB2_LAUNCH_CONTEXT', 'HUB2_TOKEN', 'HUB2_SERVER', 'HU
                          'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ZAI_API_KEY', 'GO_API_KEY', 'AWS_ACCESS_KEY_ID',
                          'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN',
                          'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY')
+
+
+CODEX_WRAPPER_PROTOCOL = 'hub2-codex-wrapper-exec-v1'
+CODEX_WRAPPER_PROFILE = 'hub-shared-codex'
+CODEX_WRAPPER_DEFAULT = ('git', 'cloudflare-agent-git', 'scripts', 'launch-codex.sh')
+
+
+def _valid_codex_wrapper_body(text):
+    """Return True only for the exact canonical maintained Codex quota wrapper template."""
+    if not isinstance(text, str):
+        return False
+    # Reject control characters (except LF/HT) and non-ASCII whitespace/separators
+    # so Python line/whitespace parsing cannot diverge from Bash.
+    for ch in text:
+        if ch in (' ', '\t', '\n'):
+            continue
+        if (ord(ch) < 0x20 or 0x7f <= ord(ch) <= 0x9f or ch.isspace()
+                or unicodedata.category(ch) in ('Cc', 'Cf', 'Zl', 'Zp', 'Zs')):
+            return False
+    raw_lines = text.split('\n')
+    if not raw_lines or raw_lines[0] not in ('#!/usr/bin/env bash', '#!/bin/bash'):
+        return False
+    stmts = []
+    for line in raw_lines[1:]:
+        stripped = line.strip(' \t')
+        if stripped and not stripped.startswith('#'):
+            stmts.append(stripped)
+    if len(stmts) not in (3, 4) or stmts[0] != 'set -euo pipefail':
+        return False
+    if len(stmts) == 4:
+        repo_match = re.fullmatch(r'repo=(/[A-Za-z0-9._/@+-]+)', stmts[1])
+        if not repo_match or '..' in Path(repo_match.group(1)).parts:
+            return False
+        if stmts[2] != 'python3 "$repo/scripts/quota-gate.py"':
+            return False
+    else:
+        gate_match = re.fullmatch(r'python3 (?:"(/[A-Za-z0-9._/@+-]+/quota-gate\.py)"|(/[A-Za-z0-9._/@+-]+/quota-gate\.py))', stmts[1])
+        if not gate_match:
+            return False
+        gate_path = gate_match.group(1) or gate_match.group(2)
+        if '..' in Path(gate_path).parts:
+            return False
+    exec_match = re.fullmatch(r'exec (/[A-Za-z0-9._/@+-]+/codex) "\$@"', stmts[-1])
+    if not exec_match or '..' in Path(exec_match.group(1)).parts:
+        return False
+    return True
+
+
+def codex_launch_wrapper(environ=None, home=None):
+    """Verified maintained Codex quota wrapper (resolved Linux path) or ValueError.
+
+    Mirrors the host CLI's resolution: operator CODEX_LAUNCH_WRAPPER of this
+    daemon, else the fixed maintained script under the passwd home. Nothing from
+    an offer, bundle or worker control is consulted; a configured value never
+    falls back to the default. The wrapper alone runs the fresh quota gate."""
+    environ = os.environ if environ is None else environ
+    if os.name == 'nt' or sys.platform != 'linux':
+        raise ValueError('codex_launch_wrapper_unavailable')
+    configured = environ.get('CODEX_LAUNCH_WRAPPER')
+    try:
+        if configured is not None:
+            # Present-but-empty is an operator decision to disable Codex, not unset.
+            candidate = configured
+        else:
+            if home is None:
+                import pwd
+                home = pwd.getpwuid(os.geteuid()).pw_dir
+            candidate = str(Path(home).joinpath(*CODEX_WRAPPER_DEFAULT))
+        if not isinstance(candidate, str) or '\0' in candidate or not os.path.isabs(candidate):
+            raise ValueError
+        real = os.path.realpath(candidate, strict=True)
+        owners = {0, os.geteuid()}
+        for item in [real] + [str(parent) for parent in Path(real).parents]:
+            info = os.lstat(item)
+            if info.st_uid not in owners:
+                raise ValueError
+            if info.st_mode & 0o002 and not (stat.S_ISDIR(info.st_mode) and info.st_mode & stat.S_ISVTX):
+                raise ValueError
+        info = os.lstat(real)
+        if (not stat.S_ISREG(info.st_mode) or info.st_size > 4096 or not info.st_mode & 0o100
+                or info.st_mode & 0o020 and info.st_gid != os.getegid() or not os.access(real, os.X_OK)):
+            raise ValueError
+        with open(real, 'rb') as stream:
+            raw = stream.read(4097)
+        if len(raw) > 4096:
+            raise ValueError
+        text = raw.decode('utf8')
+        if not _valid_codex_wrapper_body(text):
+            raise ValueError
+        return Path(real)
+    except (OSError, ValueError, UnicodeDecodeError, RuntimeError):
+        raise ValueError('codex_launch_wrapper_unavailable') from None
 
 
 def spawn_environment(central_home):
@@ -267,6 +361,89 @@ def interactive_argv(provider, argv, prompt, *, model, effort=None, with_goal=Fa
     if not observed or set(observed) != {model}:
         raise ValueError('interactive_model_unverified')
     return result
+
+
+def antigravity_launch_workspace(workspace):
+    """The directory an interactive agy pane actually runs in.
+
+    aplexer starts the child with --cwd set to the launch workspace and the
+    client PWD is already the resolved spelling, so the kernel/Go working
+    directory is the resolved existing directory. Only that exact path is
+    eligible for session trust; parents, siblings and requested aliases are
+    never added."""
+    if not isinstance(workspace, str) or '\0' in workspace or not Path(workspace).is_absolute():
+        raise ValueError('antigravity_workspace_trust_unverified')
+    try:
+        resolved = Path(workspace).resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise ValueError('antigravity_workspace_trust_unverified') from None
+    if not resolved.is_dir() or not same_workspace(str(resolved), workspace):
+        raise ValueError('antigravity_workspace_trust_unverified')
+    return str(resolved)
+
+
+def _strict_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError('antigravity_settings_unverified')
+        result[key] = value
+    return result
+
+
+def _strict_json_constant(constant):
+    raise ValueError('antigravity_settings_unverified')
+
+
+def _strict_json_float(token):
+    value = float(token)
+    if not math.isfinite(value):
+        raise ValueError('antigravity_settings_unverified')
+    return value
+
+
+def antigravity_trust_argv(argv, workspace):
+    """Session-only agy --settings granting trust to exactly one workspace.
+
+    agy's --settings accepts an inline JSON object whose trustedWorkspaces is a
+    string array. Nothing is written to agy's global settings or trust store.
+    An existing inline JSON object is merged rather than shadowed by a second
+    flag; any other --settings form (file path, repeated flag, conflicting
+    trust list, duplicate keys or non-finite JSON values) is refused instead of
+    guessed."""
+    trusted = [antigravity_launch_workspace(workspace)]
+    if len(argv) >= 2 and argv[-2] == '--prompt-interactive':
+        options, prompt_suffix = list(argv[:-2]), list(argv[-2:])
+    else:
+        options, prompt_suffix = list(argv), []
+    found = [i for i, arg in enumerate(options) if arg == '--settings' or arg.startswith('--settings=')]
+    if len(found) > 1:
+        raise ValueError('antigravity_settings_unverified')
+    if found:
+        index = found[0]
+        if options[index] == '--settings':
+            if index + 1 >= len(options):
+                raise ValueError('antigravity_settings_unverified')
+            raw, span = options[index + 1], 2
+        else:
+            raw, span = options[index].split('=', 1)[1], 1
+        try:
+            settings = json.loads(
+                raw,
+                object_pairs_hook=_strict_json_object,
+                parse_constant=_strict_json_constant,
+                parse_float=_strict_json_float,
+            )
+        except ValueError:
+            settings = None
+        if not isinstance(settings, dict) or settings.get('trustedWorkspaces', trusted) != trusted:
+            raise ValueError('antigravity_settings_unverified')
+        settings['trustedWorkspaces'] = trusted
+        options[index:index + span] = ['--settings', json.dumps(settings, separators=(',', ':'), allow_nan=False)]
+        return [*options, *prompt_suffix]
+    settings = json.dumps({'trustedWorkspaces': trusted}, separators=(',', ':'), allow_nan=False)
+    # Options stay before the interactive prompt pair agy consumes last.
+    return [*options, '--settings', settings, *prompt_suffix]
 
 
 def goal_prompt(prompt, workspace, task_id, first_action_path):
@@ -684,6 +861,14 @@ class NativeLauncher:
             available = bool(shutil.which(PROVIDER_BINARIES.get(provider, "")))
             if self.config.get('private_provider_homes') and provider == 'claude':
                 available = provider_home.claude_install_available()
+            if provider == 'codex':
+                # Advertise Codex only when the maintained quota wrapper (and,
+                # for a profile route, the maintained profile name) is usable.
+                try:
+                    codex_launch_wrapper()
+                    available = route.get('profile') in (None, CODEX_WRAPPER_PROFILE)
+                except ValueError:
+                    available = False
             if supported and available:
                 result[engine] = set(supported)
         return result
@@ -751,6 +936,20 @@ class NativeLauncher:
 
     def managed_claude_readiness(self, release=None):
         """Exact installed release and actual profile code; no credential probe."""
+        return self._release_proof('managed_exec_readiness', {'protocol': 'hub2-managed-claude-exec-v1',
+                                   'label': 'hub-claude', 'profile': 'hub-hub-claude'}, release, 'managed_exec_unavailable')
+
+    def codex_exec_readiness(self, route, wrapper, release=None):
+        """Maintained Codex profile executes the wrapper-aware pinned archive, or None."""
+        if sys.platform != 'linux' or not isinstance(route, dict) or route.get('profile') != CODEX_WRAPPER_PROFILE:
+            return None
+        proof = self._release_proof('codex_exec_readiness', None, release, 'codex_launch_wrapper_unavailable',
+                                    {'CODEX_LAUNCH_WRAPPER': wrapper})
+        if not proof or proof.get('wrapper') != wrapper or proof.get('profile') != CODEX_WRAPPER_PROFILE:
+            return None
+        return proof
+
+    def _release_proof(self, function, expected, release, error, extra_env=None):
         try:
             found = self._verified_release(release)
             if found is None:
@@ -759,15 +958,19 @@ class NativeLauncher:
             # -I -S prevents user-site startup; import only the verified bundled
             # CLI, never this daemon's duplicate package or CLI main/network.
             code = ('import sys,json; sys.path.insert(0,sys.argv[1]); '
-                    'from agent_hub_host.provisioning import managed_exec_readiness; '
-                    'print(json.dumps(managed_exec_readiness(sys.argv[1])))')
+                    'from agent_hub_host.provisioning import ' + function + '; '
+                    'print(json.dumps(' + function + '(sys.argv[1])))')
             result = self.runner([str(python), '-I', '-S', '-c', code, str(archive)],
                 capture_output=True, text=True, check=False, timeout=3,
-                env=spawn_environment(True))
+                env=dict(spawn_environment(True), **(extra_env or {})))
             if result.returncode or len(result.stdout) > 1024:
                 return None
             proof = json.loads(result.stdout)
-            if proof != {'protocol': 'hub2-managed-claude-exec-v1', 'label': 'hub-claude', 'profile': 'hub-hub-claude'}:
+            if expected is None:
+                if (not isinstance(proof, dict) or proof.get('protocol') != CODEX_WRAPPER_PROTOCOL
+                        or proof.get('label') != 'shared-codex' or not isinstance(proof.get('wrapper'), str)):
+                    return None
+            elif proof != expected:
                 return None
             # Repeat the archive check after the helper; immutable owner release
             # storage is the existing installer trust boundary.
@@ -782,6 +985,14 @@ class NativeLauncher:
         if not isinstance(route, dict) or route.get("provider") not in PROVIDER_CAPABILITIES:
             raise RuntimeError("native_launch_route_missing")
         provider = route["provider"]
+        codex_wrapper = None
+        if provider == 'codex':
+            # Resolve and verify before anything is written or spawned. The
+            # operator-owned path is the only source; no raw SDK fallback.
+            try:
+                codex_wrapper = str(codex_launch_wrapper())
+            except ValueError:
+                raise RuntimeError('codex_launch_wrapper_unavailable') from None
         if specification.get('managed_credential_label') is not None:
             if (specification['managed_credential_label'] != 'hub-claude' or specification['engine'] != 'claude'
                     or provider != 'claude' or specification.get('model') != 'opus'
@@ -804,13 +1015,22 @@ class NativeLauncher:
             goal = aplexer_prompt(goal)
         local = provider == 'shell' or bool(specification.get('managed_credential_label')) or (not self.config.get("private_provider_homes", False) and not specification.get("interactive"))
         if local:
+            if codex_wrapper and not self.codex_exec_readiness(route, codex_wrapper):
+                raise RuntimeError('codex_launch_wrapper_unavailable')
             child = self.profile_command(task_id, specification, route, goal)
         else:
             child = adapter_argv(provider, goal, specification["model"])
+            if codex_wrapper:
+                # Only the SDK executable changes; model, effort and prompt argv stay.
+                child[0] = codex_wrapper
         objective = None
         if specification.get("interactive") and not local:
             child = interactive_argv(provider, child, goal, model=specification["model"],
                                      effort=specification.get("effort"), with_goal=specification.get("with_goal", False))
+            if provider == 'antigravity':
+                # The interactive pane otherwise stops at agy's workspace-trust
+                # prompt. Trust only the exact directory this process runs in.
+                child = antigravity_trust_argv(child, specification["workspace"])
             if specification.get("with_goal"):
                 objective = goal_prompt(goal, specification["workspace"], task_id, str(fa_path))
                 if provider == 'claude':
@@ -846,6 +1066,10 @@ class NativeLauncher:
             child_env.update(native_environment(specification["provider_home"]))
             child_env["TMPDIR"] = str(workspace / ".local" / "tmp" / task_id)
             child_env["APLEXER_RETAIN_RETIRED_OUTPUT"] = "1"
+        if codex_wrapper and local:
+            # Central-home sanitization removes CODEX_*; carry only the verified
+            # path so the gated profile execution resolves the same wrapper.
+            child_env["CODEX_LAUNCH_WRAPPER"] = codex_wrapper
         if specification.get("child_config_file"):
             child_env["HUB2_CONFIG"] = specification["child_config_file"]
         claude_config_dir = child_env.get('CLAUDE_CONFIG_DIR')

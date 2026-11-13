@@ -112,6 +112,8 @@ class GoalNativeEngineTest(unittest.TestCase):
                 path=Path(workspace) / '.local' / ('first-action-' + task_id + '.json')))
             expected_child = nl.interactive_argv(provider, nl.adapter_argv(provider, prompt, model), prompt,
                                                  model=model, effort='medium', with_goal=True)
+            if provider == 'codex':
+                expected_child[0] = '/synthetic/launch-codex.sh'
             row = {}
 
             def runner(argv, **options):
@@ -145,6 +147,7 @@ class GoalNativeEngineTest(unittest.TestCase):
                  mock.patch.object(adapter, 'status', side_effect=lambda *args, **kw: dict(row)), \
                  mock.patch.object(nl, 'goal_store', side_effect=[None, proof]) as store, \
                  mock.patch.object(adapter, 'native', return_value=subprocess.CompletedProcess([], 0, json.dumps(delivery), '')) as send, \
+                 mock.patch.object(nl, 'codex_launch_wrapper', return_value=Path('/synthetic/launch-codex.sh')), \
                  mock.patch.object(adapter, 'record_evidence'):
                 receipt = adapter.launch(task_id, spec)
             expected_goal = captured['objective']
@@ -1005,6 +1008,7 @@ class HeadlessStreamOutputTests(unittest.TestCase):
         parent = Path(__file__).resolve().parents[3] / '.local/tmp'
         parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=parent, prefix='headless-stream-') as workspace:
+            self.workspace = str(Path(workspace).resolve())
             captured = {}
             native_id = 'd6cf9872-8597-48a5-be64-990cdef4db31'
 
@@ -1067,7 +1071,195 @@ class HeadlessStreamOutputTests(unittest.TestCase):
                     child, prompt = self.launch(provider, effort=effort, interactive=True)
                     prefix = (['claude', '--dangerously-skip-permissions', '--model', 'opus'] if provider == 'claude'
                               else ['agy', '--model', self.MODELS[provider], '--dangerously-skip-permissions'])
-                    self.assertEqual(child, [*prefix, *(['--effort', effort] if effort else []), *(['--prompt-interactive'] if provider == 'antigravity' else []), prompt])
+                    trust = (['--settings', json.dumps({'trustedWorkspaces': [self.workspace]}, separators=(',', ':'))]
+                             if provider == 'antigravity' else [])
+                    self.assertEqual(child, [*prefix, *(['--effort', effort] if effort else []), *trust, *(['--prompt-interactive'] if provider == 'antigravity' else []), prompt])
+
+    def test_headless_and_profile_antigravity_argv_carry_no_trust_settings(self):
+        for local in (False, True):
+            with self.subTest(local=local):
+                child, _ = self.launch('antigravity', effort='medium', local=local)
+                self.assertFalse(any('--settings' in arg or 'trustedWorkspaces' in arg for arg in child))
+
+
+class AntigravityWorkspaceTrustTests(unittest.TestCase):
+    """Session-only agy trust is limited to the exact launch directory."""
+    MODEL = 'gemini-4-argon-medium'
+
+    def setUp(self):
+        parent = Path(__file__).resolve().parents[3] / '.local/tmp'
+        parent.mkdir(parents=True, exist_ok=True)
+        self.temporary = tempfile.TemporaryDirectory(dir=parent, prefix='agy-trust-')
+        self.root = Path(self.temporary.name).resolve()
+        self.addCleanup(self.temporary.cleanup)
+
+    @staticmethod
+    def settings_of(argv):
+        options = argv[:-2] if len(argv) >= 2 and argv[-2] == '--prompt-interactive' else argv
+        values = [options[i + 1] for i, arg in enumerate(options[:-1]) if arg == '--settings']
+        assert len(values) == 1 and not any(a.startswith('--settings=') for a in options), argv
+        return json.loads(values[0])
+
+    def launch(self, workspace, *, interactive=True, effort='medium', provider='antigravity', model=None,
+               prompt='do the scoped work'):
+        captured = {}
+        native_id = 'd6cf9872-8597-48a5-be64-990cdef4db31'
+        model = model or self.MODEL
+
+        def runner(argv, **options):
+            child = argv[argv.index('--') + 1:]
+            captured.update(argv=argv, child=child, options=options)
+            return subprocess.CompletedProcess(argv, 0, json.dumps({
+                'id': native_id, 'tag': 'task-agy-trust', 'workspace': str(workspace), 'command': child}), '')
+
+        adapter = nl.NativeLauncher({'private_provider_homes': False, 'routes': {provider: nl.LOCAL_ROUTES[provider]}},
+                                    aplexer='synthetic-aplexer', runner=runner)
+        spec = {'workspace': str(workspace), 'engine': provider, 'model': model, 'prompt': prompt,
+                'interactive': interactive, 'timeout_seconds': 90, 'operation_id': 'agy-trust-op', 'epoch': 1,
+                'effort': effort}
+        with mock.patch.object(adapter, 'record_evidence'):
+            receipt = adapter.launch('agy-trust', spec)
+        return receipt, captured
+
+    def test_interactive_agy_trusts_exactly_the_launch_cwd_and_keeps_identity(self):
+        names = ['plain', 'with space', 'ünïcødé-трест', 'quote"and\\back']
+        for name in names:
+            with self.subTest(name=name):
+                workspace = self.root / 'requested-base' / '.local' / 'hub-worktrees' / name
+                workspace.mkdir(parents=True)
+                receipt, captured = self.launch(workspace)
+                argv, child = captured['argv'], captured['child']
+                self.assertEqual(argv[argv.index('--cwd') + 1], str(workspace))
+                self.assertEqual(argv[argv.index('--workspace') + 1], str(workspace))
+                self.assertEqual(self.settings_of(child), {'trustedWorkspaces': [str(workspace)]})
+                for implied in (self.root / 'requested-base', self.root, workspace.parent, Path.home()):
+                    self.assertNotIn(str(implied), self.settings_of(child)['trustedWorkspaces'])
+                self.assertEqual(child[:4], ['agy', '--model', self.MODEL, '--dangerously-skip-permissions'])
+                self.assertEqual(child[4:6], ['--effort', 'medium'])
+                self.assertEqual(child[6], '--settings')
+                self.assertEqual(child[-2], '--prompt-interactive')
+                self.assertTrue(child[-1].startswith('do the scoped work'))
+                self.assertEqual(nl.native_command_model(child), self.MODEL)
+                self.assertEqual(nl.command_effort(child), 'medium')
+                self.assertEqual(receipt['session_id'], 'd6cf9872-8597-48a5-be64-990cdef4db31')
+                self.assertTrue(receipt['interactive_verified'] and receipt['model_verified'] and receipt['effort_verified'])
+                self.assertEqual(captured['options']['cwd'], str(workspace))
+                self.assertEqual(captured['options']['env']['PWD'], str(workspace))
+
+    def test_symlinked_launch_spelling_trusts_the_actual_directory_only(self):
+        actual = self.root / 'actual'
+        actual.mkdir()
+        alias = self.root / 'alias'
+        alias.symlink_to(actual, target_is_directory=True)
+        _, captured = self.launch(alias)
+        self.assertEqual(self.settings_of(captured['child']), {'trustedWorkspaces': [str(actual)]})
+        self.assertEqual(captured['options']['env']['PWD'], str(actual))
+
+    def test_unverifiable_workspace_is_refused_before_native_start(self):
+        file_path = self.root / 'file'
+        file_path.write_text('x')
+        for value in ('relative/workspace', str(self.root) + '\0x', 7):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, 'antigravity_workspace_trust_unverified'):
+                    nl.antigravity_launch_workspace(value)
+        with self.assertRaisesRegex(ValueError, 'antigravity_workspace_trust_unverified'):
+            nl.antigravity_launch_workspace(str(self.root / 'missing'))
+        with self.assertRaisesRegex(ValueError, 'antigravity_workspace_trust_unverified'):
+            nl.antigravity_launch_workspace(str(file_path))
+
+    def test_windows_style_paths_round_trip_through_json_quoting(self):
+        path = 'C:\\Users\\Some One\\hub-worktrees\\ünï "q"'
+        with mock.patch.object(nl, 'antigravity_launch_workspace', return_value=path):
+            argv = nl.antigravity_trust_argv(['agy', '--model', 'm', '--prompt-interactive', 'p'], path)
+        self.assertEqual(argv[:3], ['agy', '--model', 'm'])
+        self.assertEqual(argv[-2:], ['--prompt-interactive', 'p'])
+        self.assertEqual(self.settings_of(argv), {'trustedWorkspaces': [path]})
+
+    def test_existing_inline_settings_are_merged_not_shadowed(self):
+        workspace = str(self.root)
+        existing = json.dumps({'theme': 'dark', 'ratio': 1.5, 'label': 'ünï "q"', 'nested': {'a': [1, 2]}})
+        base = ['agy', '--model', 'm', '--settings', existing, '--effort', 'low', '--prompt-interactive', 'p']
+        argv = nl.antigravity_trust_argv(base, workspace)
+        self.assertEqual(argv[:3] + argv[5:], base[:3] + base[5:])
+        self.assertEqual(self.settings_of(argv), {'theme': 'dark', 'ratio': 1.5, 'label': 'ünï "q"',
+                                                  'nested': {'a': [1, 2]}, 'trustedWorkspaces': [workspace]})
+        equals = nl.antigravity_trust_argv(['agy', '--settings=' + existing, '--prompt-interactive', 'p'], workspace)
+        self.assertEqual(self.settings_of(equals)['theme'], 'dark')
+        same = nl.antigravity_trust_argv(['agy', '--settings',
+                                          json.dumps({'trustedWorkspaces': [workspace], 'theme': 'dark'}),
+                                          '--prompt-interactive', 'p'], workspace)
+        self.assertEqual(self.settings_of(same), {'trustedWorkspaces': [workspace], 'theme': 'dark'})
+
+    def test_forged_or_unverifiable_settings_never_widen_trust(self):
+        workspace = str(self.root)
+        refused = [
+            ['agy', '--settings', json.dumps({'trustedWorkspaces': [workspace, str(self.root.parent)]}), 'p'],
+            ['agy', '--settings', json.dumps({'trustedWorkspaces': [str(self.root.parent)]}), 'p'],
+            ['agy', '--settings', json.dumps({'trustedWorkspaces': True}), 'p'],
+            ['agy', '--settings', '/home/someone/.gemini/settings.json', 'p'],
+            ['agy', '--settings', '[]', 'p'],
+            ['agy', '--settings', '{}', '--settings', '{}', 'p'],
+            ['agy', '--settings'],
+            ['agy', '--settings', f'{{"trustedWorkspaces":["/evil"],"trustedWorkspaces":["{workspace}"]}}',
+             '--prompt-interactive', 'p'],
+            ['agy', '--settings', '{"theme":"light","theme":"dark"}', '--prompt-interactive', 'p'],
+            ['agy', '--settings', '{"nested":{"a":1,"a":2}}', '--prompt-interactive', 'p'],
+            ['agy', '--settings', '{"x":NaN}', '--prompt-interactive', 'p'],
+            ['agy', '--settings', '{"x":Infinity}', '--prompt-interactive', 'p'],
+            ['agy', '--settings', '{"x":-Infinity}', '--prompt-interactive', 'p'],
+            ['agy', '--settings', '{"nested":{"x":NaN}}', '--prompt-interactive', 'p'],
+            ['agy', '--settings', '{"nested":[1,Infinity,-Infinity]}', '--prompt-interactive', 'p'],
+            ['agy', '--settings', '{"x":1e500}', '--prompt-interactive', 'p'],
+            ['agy', '--settings', '{"nested":[-1e500]}', '--prompt-interactive', 'p'],
+        ]
+        for argv in refused:
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(ValueError, 'antigravity_settings_unverified'):
+                    nl.antigravity_trust_argv(argv, workspace)
+
+    def test_prompt_values_starting_with_flags_are_preserved_verbatim(self):
+        workspace = self.root / 'ws-flag-prompt'
+        workspace.mkdir()
+        fa_text = nl.FIRST_ACTION_INSTRUCTION.format(path=workspace / '.local/first-action-agy-trust.json')
+        for prompt_text in (
+            '--settings={"theme":"dark"}',
+            '--settings=invalid-not-json',
+            '--settings',
+            '--prompt-interactive',
+        ):
+            with self.subTest(prompt_text=prompt_text):
+                direct_prompt = prompt_text + fa_text
+                direct = nl.antigravity_trust_argv(
+                    ['agy', '--model', self.MODEL, '--prompt-interactive', direct_prompt], str(workspace))
+                self.assertEqual(direct[-2:], ['--prompt-interactive', direct_prompt])
+                self.assertEqual(self.settings_of(direct), {'trustedWorkspaces': [str(workspace)]})
+
+                _, captured = self.launch(workspace, prompt=prompt_text)
+                child = captured['child']
+                self.assertEqual(child[-2:], ['--prompt-interactive', nl.aplexer_prompt(direct_prompt)])
+                self.assertEqual(self.settings_of(child), {'trustedWorkspaces': [str(workspace)]})
+                self.assertEqual(nl.native_command_model(child), self.MODEL)
+                self.assertEqual(nl.command_effort(child), 'medium')
+
+        merged = nl.antigravity_trust_argv(
+            ['agy', '--model', self.MODEL, '--settings', '{"theme":"dark"}', '--prompt-interactive', '--settings=bad'],
+            str(workspace))
+        self.assertEqual(merged[-2:], ['--prompt-interactive', '--settings=bad'])
+        self.assertEqual(self.settings_of(merged), {'theme': 'dark', 'trustedWorkspaces': [str(workspace)]})
+
+        without_prompt_pair = nl.antigravity_trust_argv(['agy', '--model', self.MODEL], str(workspace))
+        self.assertEqual(without_prompt_pair[:3], ['agy', '--model', self.MODEL])
+        self.assertEqual(self.settings_of(without_prompt_pair), {'trustedWorkspaces': [str(workspace)]})
+
+    def test_other_providers_and_headless_agy_argv_are_unchanged(self):
+        workspace = self.root / 'ws'
+        workspace.mkdir()
+        _, captured = self.launch(workspace, provider='claude', model='opus')
+        self.assertFalse(any('trustedWorkspaces' in arg for arg in captured['child']))
+        self.assertNotIn('--settings', captured['child'])
+        # Headless agy through the local profile path stays byte-identical.
+        _, captured = self.launch(workspace, interactive=False)
+        self.assertFalse(any('trustedWorkspaces' in arg or '--settings' in arg for arg in captured['child']))
 
 
 class ManagedClaudeReadinessTests(unittest.TestCase):
@@ -1218,3 +1410,262 @@ class ManagedClaudeReadinessTests(unittest.TestCase):
                 self.assertEqual(json.loads(context_path.read_bytes())['protocol'],'hub2-managed-claude-exec-v1')
                 self.assertNotEqual(context_path.read_bytes(),expected)
                 self.assertNotIn('provider_home',spec)
+
+
+class CodexQuotaWrapperLaunchTests(unittest.TestCase):
+    """Codex starts only through the maintained quota wrapper; refusals spawn nothing."""
+    NATIVE_ID = 'd6cf9872-8597-48a5-be64-990cdef4db31'
+
+    def setUp(self):
+        base = Path(__file__).resolve().parents[3] / '.local/tmp'
+        base.mkdir(parents=True, exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(dir=base, prefix='codex-wrapper-')
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        os.chmod(self.root, 0o700)
+        self.workspace = self.root / 'work'
+        self.workspace.mkdir(mode=0o700)
+        self.wrapper = self.write_wrapper('launch-codex.sh')
+        patcher = mock.patch.dict(os.environ, {'CODEX_LAUNCH_WRAPPER': str(self.wrapper)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def write_wrapper(self, name, text=None, mode=0o700):
+        path = self.root / name
+        path.write_text(text or ('#!/usr/bin/env bash\nset -euo pipefail\nrepo=%s\n'
+                                 'python3 "$repo/scripts/quota-gate.py"\nexec %s/codex "$@"\n' % (self.root, self.root)))
+        path.chmod(mode)
+        return path
+
+    def launch(self, *, interactive, route=None, provider='codex', readiness=True, effort='high'):
+        calls = []
+
+        def runner(argv, **options):
+            calls.append((argv, options))
+            child = argv[argv.index('--') + 1:]
+            return subprocess.CompletedProcess(argv, 0, json.dumps({
+                'id': self.NATIVE_ID, 'tag': 'task-t1', 'workspace': str(self.workspace), 'command': child}), '')
+        route = route or ({'provider': provider} if interactive else {'provider': provider, 'profile': 'hub-shared-codex'})
+        config = {'routes': {'codex': route}}
+        if route.get('profile') is None:
+            config['private_provider_homes'] = True
+        adapter = nl.NativeLauncher(config, runner=runner)
+        spec = {'workspace': str(self.workspace), 'engine': 'codex', 'model': 'gpt-6.1-sol', 'prompt': 'synthetic prompt',
+                'interactive': interactive, 'effort': effort, 'timeout_seconds': 600,
+                'codex_launch_wrapper': '/offer/supplied/wrapper'}
+        proof = {'wrapper': str(self.wrapper.resolve()), 'profile': 'hub-shared-codex'} if readiness else None
+        with mock.patch.object(adapter, 'codex_exec_readiness', return_value=proof), \
+             mock.patch.object(adapter, 'record_evidence'):
+            try:
+                adapter.launch('t1', spec)
+                error = None
+            except RuntimeError as caught:
+                error = str(caught)
+        return calls, error
+
+    def child(self, calls):
+        argv = calls[0][0]
+        return argv[argv.index('--') + 1:]
+
+    def test_direct_headless_replaces_only_the_sdk_executable(self):
+        calls, error = self.launch(interactive=False, route={'provider': 'codex'})
+        self.assertIsNone(error)
+        prompt = nl.aplexer_prompt('synthetic prompt' + nl.FIRST_ACTION_INSTRUCTION.format(
+            path=self.workspace / '.local/first-action-t1.json'))
+        expected = nl.headless_effort_argv('codex', nl.adapter_argv('codex', prompt, 'gpt-6.1-sol'), 'high')
+        expected = nl._headless_insert_flags('codex', expected, nl.HEADLESS_OUTPUT_FLAGS.get('codex', ()))
+        self.assertEqual(self.child(calls), [str(self.wrapper.resolve())] + expected[1:])
+        self.assertNotIn('/offer/supplied/wrapper', ' '.join(calls[0][0]))
+
+    def test_direct_interactive_replaces_only_the_sdk_executable(self):
+        calls, error = self.launch(interactive=True, effort='medium')
+        self.assertIsNone(error)
+        prompt = nl.aplexer_prompt('synthetic prompt' + nl.FIRST_ACTION_INSTRUCTION.format(
+            path=self.workspace / '.local/first-action-t1.json'))
+        expected = nl.interactive_argv('codex', nl.adapter_argv('codex', prompt, 'gpt-6.1-sol'), prompt,
+                                       model='gpt-6.1-sol', effort='medium')
+        self.assertEqual(self.child(calls), [str(self.wrapper.resolve())] + expected[1:])
+        self.assertIn('-c', self.child(calls))
+        self.assertNotIn('exec', self.child(calls))
+
+    def test_profile_route_keeps_task_run_and_propagates_only_the_verified_wrapper(self):
+        calls, error = self.launch(interactive=False)
+        self.assertIsNone(error)
+        argv, options = calls[0]
+        child = self.child(calls)
+        self.assertEqual(child[1:3], ['task', 'run'])
+        self.assertEqual(child[child.index('--profile') + 1], 'hub-shared-codex')
+        self.assertNotIn(str(self.wrapper), child, 'the wrapper must not wrap or replace task run')
+        self.assertIn('CODEX_LAUNCH_WRAPPER=' + str(self.wrapper.resolve()), argv[:argv.index('--')])
+        self.assertNotIn('/offer/supplied/wrapper', ' '.join(argv))
+
+    def test_missing_unsafe_or_incompatible_wrapper_refuses_before_spawn(self):
+        raw = '#!/usr/bin/env bash\nset -euo pipefail\nexec %s/codex "$@"\n' % self.root
+        cases = {'missing': str(self.root / 'absent.sh'), 'relative': 'launch-codex.sh', 'empty': '',
+                 'world-writable': str(self.write_wrapper('open.sh', mode=0o707)),
+                 'raw': str(self.write_wrapper('raw.sh', raw)),
+                 'no-failclosed': str(self.write_wrapper('loose.sh', '#!/usr/bin/env bash\npython3 quota-gate.py\nexec %s/codex "$@"\n' % self.root))}
+        for name, value in cases.items():
+            for interactive in (False, True):
+                with self.subTest(case=name, interactive=interactive), mock.patch.dict(os.environ, {'CODEX_LAUNCH_WRAPPER': value}):
+                    calls, error = self.launch(interactive=interactive)
+                    self.assertEqual(error, 'codex_launch_wrapper_unavailable')
+                    self.assertEqual(calls, [])
+        with mock.patch.object(nl.sys, 'platform', 'win32'):
+            self.assertEqual(self.launch(interactive=True)[1], 'codex_launch_wrapper_unavailable')
+
+    def test_profile_not_proven_wrapper_aware_refuses_before_spawn(self):
+        calls, error = self.launch(interactive=False, readiness=False)
+        self.assertEqual((calls, error), ([], 'codex_launch_wrapper_unavailable'))
+
+    def test_custom_or_substituted_profile_never_proves_readiness(self):
+        adapter = nl.NativeLauncher({})
+        for profile in ('hub-other-codex', 'hub-codex-orin', None):
+            self.assertIsNone(adapter.codex_exec_readiness({'provider': 'codex', 'profile': profile},
+                                                           str(self.wrapper.resolve())))
+
+    def test_other_providers_are_unchanged_even_with_a_bad_wrapper(self):
+        with mock.patch.dict(os.environ, {'CODEX_LAUNCH_WRAPPER': '/nonexistent'}):
+            calls, error = self.launch(interactive=False, route={'provider': 'zai'})
+        self.assertIsNone(error)
+        child = self.child(calls)
+        self.assertEqual(child[0], 'zcodex')
+        self.assertNotIn('CODEX_LAUNCH_WRAPPER', ' '.join(calls[0][0]))
+        with mock.patch.dict(os.environ, {'CODEX_LAUNCH_WRAPPER': '/nonexistent'}):
+            calls, error = self.launch(interactive=True, provider='zai')
+        self.assertIsNone(error)
+        self.assertEqual(self.child(calls)[0], 'zcodex')
+
+    def test_capabilities_do_not_advertise_unusable_codex(self):
+        config = {'routes': {'codex': {'provider': 'codex'}, 'opencode': {'provider': 'go'}}}
+        with mock.patch.object(nl.shutil, 'which', side_effect=lambda b: '/bin/' + b):
+            self.assertIn('codex', nl.NativeLauncher(config).capabilities())
+            with mock.patch.dict(os.environ, {'CODEX_LAUNCH_WRAPPER': '/nonexistent'}):
+                caps = nl.NativeLauncher(config).capabilities()
+            self.assertNotIn('codex', caps)
+            self.assertIn('opencode', caps)
+            custom = {'routes': {'codex': {'provider': 'codex', 'profile': 'hub-custom'}}}
+            self.assertNotIn('codex', nl.NativeLauncher(custom).capabilities())
+
+    def test_packaged_archive_readiness_requires_wrapper_aware_pin_and_maintained_profile(self):
+        if sys.platform != 'linux':
+            self.skipTest('Linux wrapper')
+        import hashlib
+        import zipfile
+        release = self.root / ('b' * 40)
+        release.mkdir(mode=0o700)
+        (release / 'bin').mkdir(mode=0o700)
+        (release / 'bin/python').symlink_to(sys.executable)
+        archive = release / 'hub.pyz'
+        package = Path(__file__).resolve().parents[3] / 'host/agent_hub_host'
+
+        def build(skip=()):
+            with zipfile.ZipFile(archive, 'w') as out:
+                for file in package.glob('*.py'):
+                    out.write(file, 'agent_hub_host/' + file.name)
+                out.writestr('__main__.py', 'raise RuntimeError("CLI main must never run")')
+            archive.chmod(0o600)
+            raw = archive.read_bytes()
+            receipt = {'host_version': release.name, 'artifacts': {'hub.pyz': {
+                'size': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}}}
+            (release / 'release.json').write_text(json.dumps(receipt))
+            (release / 'release.json').chmod(0o600)
+        build()
+        profile = self.root / 'profiles/config.toml'
+        profile.parent.mkdir(mode=0o700)
+        code = ('import sys,json;sys.path.insert(0,sys.argv[1]);'
+                'from agent_hub_host.provisioning import module_command;'
+                'sys.argv[0]=sys.argv[1];print(json.dumps(module_command("execute","shared-codex")))')
+        command = json.loads(subprocess.check_output([str(release / 'bin/python'), '-I', '-S', '-c', code, str(archive)], text=True))
+
+        def publish(argv, name='hub-shared-codex'):
+            profile.write_text('[profiles."%s"]\nengine="codex"\ncommand=%s\n' % (name, json.dumps(argv)))
+            profile.chmod(0o600)
+        route = {'provider': 'codex', 'profile': 'hub-shared-codex'}
+        wrapper = str(self.wrapper.resolve())
+        results = []
+
+        def probe(argv, **kwargs):
+            results.append(subprocess.run(argv, **kwargs))
+            return results[-1]
+        adapter = nl.NativeLauncher({}, runner=probe)
+        with mock.patch.dict(os.environ, {'APLEXER_CONFIG': str(profile)}):
+            publish(command)
+            ready = adapter.codex_exec_readiness(route, wrapper, release)
+            self.assertIsNotNone(ready, results[-1].stderr if results else 'probe not reached')
+            self.assertEqual(ready['wrapper'], wrapper)
+            self.assertIsNone(adapter.codex_exec_readiness(route, str(self.root / 'other-wrapper'), release))
+            publish([sys.executable, '-c', 'raise SystemExit(0)', 'shared-codex'])
+            self.assertIsNone(adapter.codex_exec_readiness(route, wrapper, release), 'custom profile bypassing gated exec')
+            publish(command, 'hub-custom-codex')
+            self.assertIsNone(adapter.codex_exec_readiness(route, wrapper, release), 'profile substitution')
+            publish(['/tmp/evil-python', *command[1:]])
+            self.assertIsNone(adapter.codex_exec_readiness(route, wrapper, release), 'unverified interpreter')
+            publish([command[0], '-c', command[2].replace('import os;', f'sys.path.insert(0, {repr(str(self.root / "old.pyz"))}); import os;'), 'shared-codex'])
+            self.assertIsNone(adapter.codex_exec_readiness(route, wrapper, release), 'old archive inserted ahead')
+            publish([command[0], '-c', command[2].replace('execute()', 'os.system("true"); execute()'), 'shared-codex'])
+            self.assertIsNone(adapter.codex_exec_readiness(route, wrapper, release), 'additional statement')
+            publish(command)
+            # An old pin without the wrapper-aware readiness protocol is refused.
+            with zipfile.ZipFile(archive, 'w') as out:
+                out.writestr('agent_hub_host/__init__.py', '')
+                out.writestr('agent_hub_host/provisioning.py', 'def module_command(*a):\n    return []\n')
+            archive.chmod(0o600)
+            raw = archive.read_bytes()
+            (release / 'release.json').write_text(json.dumps({'host_version': release.name, 'artifacts': {
+                'hub.pyz': {'size': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}}}))
+            self.assertIsNone(adapter.codex_exec_readiness(route, wrapper, release))
+
+    def test_wrapper_rejects_bypass_scripts(self):
+        if sys.platform != 'linux':
+            self.skipTest('Linux wrapper')
+        bypasses = {
+            'shebang-semicolon': '#!/usr/bin/env bash; set -euo pipefail; echo quota-gate.py; exec /synthetic/codex "$@"\n',
+            'echo-gate': '#!/usr/bin/env bash\nset -euo pipefail\necho quota-gate.py\nexec /synthetic/codex "$@"\n',
+            'conditional-gate': '#!/usr/bin/env bash\nset -euo pipefail\nif false; then python3 /tmp/quota-gate.py; fi\nexec /synthetic/codex "$@"\n',
+            'ignored-failure': '#!/usr/bin/env bash\nset -euo pipefail\npython3 /tmp/scripts/quota-gate.py || true\nexec /synthetic/codex "$@"\n',
+            'shadowed-python': '#!/usr/bin/env bash\nset -euo pipefail\npython3() { :; }\nrepo=%s\npython3 "$repo/scripts/quota-gate.py"\nexec /synthetic/codex "$@"\n' % self.root,
+            'reordered-statements': '#!/usr/bin/env bash\nrepo=%s\npython3 "$repo/scripts/quota-gate.py"\nset -euo pipefail\nexec /synthetic/codex "$@"\n' % self.root,
+            'comment-vt-smuggle': '#!/usr/bin/env bash\nset -euo pipefail\n# gate disabled\vpython3 /synthetic/quota-gate.py\nexec /synthetic/codex "$@"\n',
+            'comment-ff-smuggle': '#!/usr/bin/env bash\nset -euo pipefail\n# gate disabled\fpython3 /synthetic/quota-gate.py\nexec /synthetic/codex "$@"\n',
+            'comment-nel-smuggle': '#!/usr/bin/env bash\nset -euo pipefail\n# gate disabled\x85python3 /synthetic/quota-gate.py\nexec /synthetic/codex "$@"\n',
+            'comment-ls-smuggle': '#!/usr/bin/env bash\nset -euo pipefail\n# gate disabled\u2028python3 /synthetic/quota-gate.py\nexec /synthetic/codex "$@"\n',
+            'comment-ps-smuggle': '#!/usr/bin/env bash\nset -euo pipefail\n# gate disabled\u2029python3 /synthetic/quota-gate.py\nexec /synthetic/codex "$@"\n',
+            'ws-nbsp-smuggle': '#!/usr/bin/env bash\nset -euo pipefail\n\u00a0python3 /synthetic/quota-gate.py\nexec /synthetic/codex "$@"\n',
+            'ctrl-cr': '#!/usr/bin/env bash\nset -euo pipefail\r\npython3 /synthetic/quota-gate.py\nexec /synthetic/codex "$@"\n',
+            'ctrl-fs': '#!/usr/bin/env bash\nset -euo pipefail\n\x1cpython3 /synthetic/quota-gate.py\nexec /synthetic/codex "$@"\n',
+            'ctrl-del': '#!/usr/bin/env bash\nset -euo pipefail\n# \x7f\npython3 /synthetic/quota-gate.py\nexec /synthetic/codex "$@"\n',
+            'ctrl-bom': '#!/usr/bin/env bash\nset -euo pipefail\n\ufeffpython3 /synthetic/quota-gate.py\nexec /synthetic/codex "$@"\n',
+        }
+        for name, body in bypasses.items():
+            bad = self.write_wrapper(f'{name}.sh', text=body)
+            with mock.patch.dict(os.environ, {'CODEX_LAUNCH_WRAPPER': str(bad)}):
+                with self.assertRaises(ValueError, msg=name):
+                    nl.codex_launch_wrapper()
+                calls, error = self.launch(interactive=False)
+                self.assertEqual(error, 'codex_launch_wrapper_unavailable', name)
+                self.assertEqual(calls, [], name)
+
+    def test_wrapper_accepts_canonical_templates_with_shell_whitespace(self):
+        if sys.platform != 'linux':
+            self.skipTest('Linux wrapper')
+        canonical = {
+            'repo-template': (
+                '#!/usr/bin/env bash\n'
+                '  # maintained comment\n'
+                '\tset -euo pipefail\n'
+                f'repo={self.root}\n'
+                'python3 "$repo/scripts/quota-gate.py"\n'
+                f'exec {self.root}/codex "$@"\n'
+            ),
+            'direct-template': (
+                '#!/bin/bash\n'
+                'set -euo pipefail\n'
+                f'\tpython3 "{self.root}/scripts/quota-gate.py"\n'
+                f'exec {self.root}/codex "$@"\n'
+            ),
+        }
+        for name, body in canonical.items():
+            good = self.write_wrapper(f'{name}.sh', text=body)
+            with mock.patch.dict(os.environ, {'CODEX_LAUNCH_WRAPPER': str(good)}):
+                self.assertEqual(nl.codex_launch_wrapper(), good.resolve(), name)

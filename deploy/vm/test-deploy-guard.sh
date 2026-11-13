@@ -57,7 +57,7 @@ if not (verify_idx < canary_idx < finalize_idx < rollback_idx):
     raise SystemExit(1)
 canary_block = text[canary_idx:finalize_idx]
 for required in (
-    "if: inputs.release_mode == 'active'",
+    "if: (inputs.release_mode || 'active') == 'active'",
     "--print-helper-sha256",
     "StrictHostKeyChecking=yes",
     "UserKnownHostsFile=\"$canary_known_hosts\"",

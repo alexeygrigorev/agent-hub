@@ -257,11 +257,11 @@ class Bridge:
             try:
                 workspace = candidate.resolve(strict=True)
             except OSError:
-                raise ValueError("workspace_unavailable") from None
+                raise ValueError(f"workspace_unavailable path={value}") from None
             if not workspace.is_dir():
-                raise ValueError("workspace_unavailable")
+                raise ValueError(f"workspace_unavailable path={value}")
             if not any(workspace.is_relative_to(root) for root in self.roots):
-                raise ValueError("workspace_outside_allowlist")
+                raise ValueError(f"workspace_outside_allowlist path={workspace}")
             return workspace
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value):
             raise ValueError("invalid_workspace")
@@ -318,6 +318,33 @@ class Bridge:
         save_config(path,config)
         return str(path)
 
+    def is_session_dead(self, session_id):
+        if not isinstance(session_id, str) or not session_id:
+            return False
+        row = self.journal.db.execute(
+            'SELECT state FROM launches WHERE session_id=?', (session_id,)
+        ).fetchone()
+        if row is not None:
+            state = row['state']
+            if state in {'exited', 'stopped_before_dispatch', 'launch_failed_unconfirmed', 'launch_failed_reported'}:
+                return True
+            if state in {'pending_admission', 'launching', 'running', 'aborting', 'deadline_stopping'}:
+                return False
+        try:
+            reply = self.client.request('GET', f'/api/sessions/{session_id}')
+        except ApiError as err:
+            return err.status == 404
+        except Exception:
+            return False
+        session = reply.get('session') if isinstance(reply, dict) else None
+        if isinstance(session, dict):
+            state = session.get('state')
+            if state in {'stopped', 'finished', 'failed', 'refused', 'cancelled', 'expired', 'dead'}:
+                return True
+            if state in {'queued', 'held', 'offered', 'claimed', 'starting', 'running', 'uncertain'}:
+                return False
+        return False
+
     def offer(self, offer, acknowledge=None):
         db = self.journal.db
         session, epoch = offer.get('session_id'), offer.get('epoch')
@@ -341,7 +368,14 @@ class Bridge:
             if workspace != source and not workspace.is_relative_to(source / '.local' / 'hub-worktrees'):
                 raise ValueError('offer_fence_conflict')
         else:
-            workspace = prepare_workspace(launch['workspace'], offer['launch'].get('purpose'), offer.get('intake_id'), offer.get('project_id'))
+            workspace = prepare_workspace(
+                launch['workspace'],
+                offer['launch'].get('purpose'),
+                offer.get('intake_id'),
+                offer.get('project_id'),
+                session_is_dead=self.is_session_dead,
+                allowed_roots=self.roots,
+            )
         launch['workspace'] = str(workspace)
         requested_workspace = offer['launch']['workspace']
         workspace_binding = ({'version': 1, 'requested_workspace': requested_workspace,
@@ -1142,9 +1176,11 @@ class Bridge:
             if isinstance(error,ApiError) and error.retry_at:
                 self.budget_paused_until = max(getattr(self, 'budget_paused_until', 0), error.retry_at)
                 raise
-            reason = error.code if isinstance(error,ApiError) and error.code else str(error)
-            if not re.fullmatch(r"[a-z_]{1,80}", reason):
-                reason = "host_operation_failed"
+            raw = error.code if isinstance(error, ApiError) and error.code else str(error)
+            cleaned = re.sub(r'[\x00-\x1f\x7f]+', ' ', str(raw or '')).strip()
+            head = cleaned.split(None, 1)[0] if cleaned else ''
+            reason = head if re.fullmatch(r"[a-z_]{1,80}", head) else "host_operation_failed"
+            detail = (cleaned or reason)[:240]
             target = event.get("command") or event.get("message") or event.get("offer") or {}
             stage = 'host_command'
             if event.get('type') == 'session.offer':
@@ -1154,9 +1190,12 @@ class Bridge:
                     (target.get('operation_id'),target.get('session_id'),target.get('epoch'))).fetchone()
                 if row and row['state'] in {'launching','running','aborting','deadline_stopping'} and row['native_dispatch_started'] != 0:
                     stage = 'host_launch_uncertain'
-            socket.send(canonical({"type": "host.error", "reason": reason, "stage": stage, "detail": reason[:200],
-                                   "session_id": target.get("session_id"), "operation_id": target.get("operation_id"),
-                                   "message_id": target.get("id")}))
+            frame = {"type": "host.error", "reason": reason, "stage": stage, "detail": detail,
+                     "session_id": target.get("session_id"), "operation_id": target.get("operation_id"),
+                     "message_id": target.get("id")}
+            if stage == 'host_launch' and target.get("epoch") is not None:
+                frame["epoch"] = target.get("epoch")
+            socket.send(canonical(frame))
 
     def run_engine_update(self, job):
         job_id = job.get("id")

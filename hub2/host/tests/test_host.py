@@ -197,7 +197,9 @@ class HostTests(unittest.TestCase):
                 offer['session_id'] += '-interactive' if interactive else '-headless'
                 offer['operation_id'] += '-interactive' if interactive else '-headless'
                 offer['launch']['interactive'] = interactive
-                with patch('agent_hub_host.providers.provision', side_effect=AssertionError('central home must not be provisioned')):
+                with patch('agent_hub_host.providers.provision', side_effect=AssertionError('central home must not be provisioned')), \
+                     patch('agent_hub_host.native_launch.codex_launch_wrapper', return_value=Path('/synthetic/launch-codex.sh')), \
+                     patch('agent_hub_host.native_launch.NativeLauncher.codex_exec_readiness', return_value={'wrapper': '/synthetic/launch-codex.sh'}):
                     self.bridge.offer(offer)
                 argv, options = next((args, kw) for args, kw in reversed(self.native.calls) if args[1] == 'start')
                 child = argv[argv.index('--') + 1:]
@@ -205,7 +207,7 @@ class HostTests(unittest.TestCase):
                 self.assertNotIn('CLAUDE_CONFIG_DIR=', ' '.join(argv))
                 self.assertNotIn('HUB2_LAUNCH_CONTEXT', options['env'])
                 if interactive:
-                    self.assertEqual(child[0], 'codex')
+                    self.assertEqual(child[0], '/synthetic/launch-codex.sh')
                     self.assertNotIn('exec', child)
                 else:
                     self.assertIn('task', child); self.assertIn('run', child)
@@ -1423,6 +1425,52 @@ class HostTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(output.getvalue(), "{}\n")
         self.assertEqual(self.client.calls, [("GET", "/api/status", None, None)])
+
+    def test_session_offer_failure_reports_named_cause_and_detail(self):
+        sent = []
+        class Socket:
+            def send(self, value):
+                sent.append(json.loads(value))
+        missing = self.root / "does-not-exist"
+        offer = self.offer(session_id="sess-missing-ws", operation_id="op-missing-ws:0")
+        offer["launch"]["workspace"] = str(missing)
+        with self.assertLogs("agent_hub_host.agent", level="ERROR"):
+            self.bridge.dispatch({"type": "session.offer", "offer": offer}, Socket(), None)
+        self.assertEqual(sent[-1]["type"], "host.error")
+        self.assertEqual(sent[-1]["stage"], "host_launch")
+        self.assertEqual(sent[-1]["reason"], "workspace_unavailable")
+        self.assertEqual(sent[-1]["epoch"], offer["epoch"])
+        self.assertIn(f"path={missing}", sent[-1]["detail"])
+
+        with patch("agent_hub_host.agent.prepare_workspace",
+                   side_effect=ValueError("implement_worktree_branch_in_use worktree=/wt/stale lock_session=dead-1")):
+            offer2 = self.offer(session_id="sess-wt-in-use", operation_id="op-wt-in-use:0")
+            with self.assertLogs("agent_hub_host.agent", level="ERROR"):
+                self.bridge.dispatch({"type": "session.offer", "offer": offer2}, Socket(), None)
+        self.assertEqual(sent[-1]["reason"], "implement_worktree_branch_in_use")
+        self.assertEqual(sent[-1]["stage"], "host_launch")
+        self.assertEqual(sent[-1]["detail"], "implement_worktree_branch_in_use worktree=/wt/stale lock_session=dead-1")
+
+    def test_is_session_dead_checks_journal_and_api(self):
+        with self.journal.db:
+            self.journal.db.execute(
+                "INSERT INTO launches(operation_id,session_id,epoch,digest,workspace,tag,interactive,state) "
+                "VALUES('op-dead','dead-local',1,'d','/w','t',0,'exited')"
+            )
+            self.journal.db.execute(
+                "INSERT INTO launches(operation_id,session_id,epoch,digest,workspace,tag,interactive,state) "
+                "VALUES('op-live','live-local',1,'d','/w','t',0,'running')"
+            )
+        self.assertTrue(self.bridge.is_session_dead("dead-local"))
+        self.assertFalse(self.bridge.is_session_dead("live-local"))
+        with patch.object(self.client, "request", return_value={"session": {"state": "failed"}}):
+            self.assertTrue(self.bridge.is_session_dead("remote-failed"))
+        with patch.object(self.client, "request", return_value={"session": {"state": "running"}}):
+            self.assertFalse(self.bridge.is_session_dead("remote-running"))
+        with patch.object(self.client, "request", side_effect=ApiError("not found", status=404)):
+            self.assertTrue(self.bridge.is_session_dead("remote-404"))
+        with patch.object(self.client, "request", side_effect=ApiError("unavailable", status=503)):
+            self.assertFalse(self.bridge.is_session_dead("remote-503"))
 
 
 if __name__ == "__main__":

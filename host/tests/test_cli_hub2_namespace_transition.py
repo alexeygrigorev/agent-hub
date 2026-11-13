@@ -8,6 +8,7 @@ import io
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -106,6 +107,21 @@ def site_packages(target):
     return target / 'lib' / f'python{sys.version_info.major}.{sys.version_info.minor}' / 'site-packages'
 
 
+def console_script_text(python, module, function):
+    """Console script that runs exactly ``python`` at any path length.
+
+    Kernels reject shebang lines past ~127-256 bytes (ENOEXEC) and split on
+    spaces, so use the pip/distlib ``/bin/sh`` + Python polyglot trampoline.
+    """
+    return (
+        '#!/bin/sh\n'
+        f"'''exec' {shlex.quote(str(python))} \"$0\" \"$@\"\n"
+        "' '''\n"
+        f'from {module} import {function} as _main\n'
+        'raise SystemExit(_main())\n'
+    )
+
+
 def unpack_wheel(wheel, target, *, replace_namespace=None, replace_distribution=None):
     """Install a local fixture wheel without pip or any dependency resolution."""
     site = site_packages(target)
@@ -131,9 +147,7 @@ def unpack_wheel(wheel, target, *, replace_namespace=None, replace_distribution=
                     if line.startswith('hub2 = '):
                         module, function = line.removeprefix('hub2 = ').split(':', 1)
                         script = target / 'bin/hub2'
-                        script.write_text(
-                            f'#!{target / "bin/python"}\nfrom {module} import {function} as _main\n'
-                            'raise SystemExit(_main())\n')
+                        script.write_text(console_script_text(target / 'bin/python', module, function))
                         script.chmod(0o755)
 
 
@@ -229,6 +243,27 @@ class NamespaceTransitionTests(unittest.TestCase):
     def install_fixture(self, target, wheel):
         unpack_wheel(wheel, target, replace_namespace='hub2_agent_hub_host',
                      replace_distribution='agent-hub-host-v2')
+
+    def test_console_entrypoint_runs_exact_python_under_long_spaced_prefix(self):
+        target = self.root / 'long prefix with spaces' / ('x' * 120) / ('y' * 120) / HOST_VERSION
+        (target / 'bin').mkdir(parents=True)
+        python = target / 'bin/python'
+        python.symlink_to(sys.executable)
+        wheel_dir = self.root / 'long-shebang-wheel'
+        wheel = write_host_wheel(wheel_dir, 'hub2_agent_hub_host')
+        unpack_wheel(wheel, target)
+        script = target / 'bin/hub2'
+        first = script.read_bytes().split(b'\n', 1)[0]
+        self.assertEqual(first, b'#!/bin/sh')
+        self.assertGreater(len(f'#!{python}'.encode()), 256)
+        text = console_script_text(python, 'os.path', 'basename')
+        script.write_text(text.replace('raise SystemExit(_main())\n',
+                                       'import sys\nprint(sys.executable, sys.argv[1:])\n'
+                                       'raise SystemExit(0)\n'))
+        result = subprocess.run([str(script), 'a b', '--help'], capture_output=True,
+                                text=True, env={**os.environ, 'PYTHONPATH': ''})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), f"{python} ['a b', '--help']")
 
     def test_matching_new_protocol_passes_in_both_namespaces(self):
         for namespace in ('agent_hub_host', 'hub2_agent_hub_host'):

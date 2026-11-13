@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import tomllib
+import unicodedata
 import zipfile
 
 from . import bus, config, engine_versions, hook_command, hook_trust, private_fs, state_hook_commands
@@ -1865,17 +1866,112 @@ def executable_path(bundle, dest, is_windows=None):
     return modules / '.bin' / binary
 
 
+CODEX_WRAPPER_PROTOCOL = 'hub2-codex-wrapper-exec-v1'
+CODEX_WRAPPER_DEFAULT = ('git', 'cloudflare-agent-git', 'scripts', 'launch-codex.sh')
+CODEX_WRAPPER_UNAVAILABLE = 'codex_launch_wrapper_unavailable'
+
+
+def _valid_codex_wrapper_body(text):
+    """Return True only for the exact canonical maintained Codex quota wrapper template."""
+    if not isinstance(text, str):
+        return False
+    # Reject control characters (except LF/HT) and non-ASCII whitespace/separators
+    # so Python line/whitespace parsing cannot diverge from Bash.
+    for ch in text:
+        if ch in (' ', '\t', '\n'):
+            continue
+        if (ord(ch) < 0x20 or 0x7f <= ord(ch) <= 0x9f or ch.isspace()
+                or unicodedata.category(ch) in ('Cc', 'Cf', 'Zl', 'Zp', 'Zs')):
+            return False
+    raw_lines = text.split('\n')
+    if not raw_lines or raw_lines[0] not in ('#!/usr/bin/env bash', '#!/bin/bash'):
+        return False
+    stmts = []
+    for line in raw_lines[1:]:
+        stripped = line.strip(' \t')
+        if stripped and not stripped.startswith('#'):
+            stmts.append(stripped)
+    if len(stmts) not in (3, 4) or stmts[0] != 'set -euo pipefail':
+        return False
+    if len(stmts) == 4:
+        repo_match = re.fullmatch(r'repo=(/[A-Za-z0-9._/@+-]+)', stmts[1])
+        if not repo_match or '..' in Path(repo_match.group(1)).parts:
+            return False
+        if stmts[2] != 'python3 "$repo/scripts/quota-gate.py"':
+            return False
+    else:
+        # Direct form: python3 /abs/.../quota-gate.py (unquoted or double-quoted)
+        gate_match = re.fullmatch(r'python3 (?:"(/[A-Za-z0-9._/@+-]+/quota-gate\.py)"|(/[A-Za-z0-9._/@+-]+/quota-gate\.py))', stmts[1])
+        if not gate_match:
+            return False
+        gate_path = gate_match.group(1) or gate_match.group(2)
+        if '..' in Path(gate_path).parts:
+            return False
+    exec_match = re.fullmatch(r'exec (/[A-Za-z0-9._/@+-]+/codex) "\$@"', stmts[-1])
+    if not exec_match or '..' in Path(exec_match.group(1)).parts:
+        return False
+    return True
+
+
+def codex_launch_wrapper(environ=None, home=None):
+    """Return the verified maintained Codex quota wrapper (a resolved Linux path).
+
+    Only operator configuration is trusted: CODEX_LAUNCH_WRAPPER of this host
+    process, else the fixed maintained script under the account's passwd home.
+    A configured value is never replaced by the default. Windows has no
+    supported wrapper, and a missing, unsafe or incompatible script refuses
+    Codex; there is no raw SDK fallback. The wrapper itself runs the fresh
+    quota gate exactly once, so nothing here probes quota or runs it."""
+    environ = os.environ if environ is None else environ
+    if os.name == 'nt' or sys.platform != 'linux':
+        raise ValueError(CODEX_WRAPPER_UNAVAILABLE)
+    configured = environ.get('CODEX_LAUNCH_WRAPPER')
+    try:
+        if configured is not None:
+            # Present-but-empty is an operator decision to disable Codex, not unset.
+            candidate = configured
+        else:
+            if home is None:
+                import pwd
+                home = pwd.getpwuid(os.geteuid()).pw_dir
+            candidate = str(Path(home).joinpath(*CODEX_WRAPPER_DEFAULT))
+        if not isinstance(candidate, str) or '\0' in candidate or not os.path.isabs(candidate):
+            raise ValueError(CODEX_WRAPPER_UNAVAILABLE)
+        real = os.path.realpath(candidate, strict=True)
+        owners = {0, os.geteuid()}
+        chain = [real] + [str(parent) for parent in Path(real).parents]
+        for item in chain:
+            info = os.lstat(item)
+            if info.st_uid not in owners:
+                raise ValueError(CODEX_WRAPPER_UNAVAILABLE)
+            if info.st_mode & 0o002 and not (stat.S_ISDIR(info.st_mode) and info.st_mode & stat.S_ISVTX):
+                raise ValueError(CODEX_WRAPPER_UNAVAILABLE)
+        info = os.lstat(real)
+        if (not stat.S_ISREG(info.st_mode) or info.st_size > 4096 or not info.st_mode & 0o100
+                or info.st_mode & 0o020 and info.st_gid != os.getegid() or not os.access(real, os.X_OK)):
+            raise ValueError(CODEX_WRAPPER_UNAVAILABLE)
+        with open(real, 'rb') as stream:
+            raw = stream.read(4097)
+        if len(raw) > 4096:
+            raise ValueError(CODEX_WRAPPER_UNAVAILABLE)
+        text = raw.decode('utf8')
+        if not _valid_codex_wrapper_body(text):
+            raise ValueError(CODEX_WRAPPER_UNAVAILABLE)
+        return Path(real)
+    except (OSError, ValueError, UnicodeDecodeError, RuntimeError):
+        raise ValueError(CODEX_WRAPPER_UNAVAILABLE) from None
+
+
 def engine_argv(bundle, dest, is_windows=None):
     if is_windows is None:
         is_windows = (os.name == 'nt')
-    # A host may require its protected quota wrapper for every Codex start.
-    # This is operator environment, never a bundle/request supplied command.
-    wrapper = os.environ.get('CODEX_LAUNCH_WRAPPER') if bundle['provider'] == 'codex' else None
-    if wrapper:
-        path = Path(wrapper)
-        if not path.is_absolute() or not path.is_file() or not os.access(path, os.X_OK):
-            raise ValueError('Configured Codex launch wrapper unavailable')
-        return [str(path)]
+    if bundle['provider'] == 'codex':
+        # Every Codex start goes through the maintained fail-closed quota
+        # wrapper; the SDK executable is never run directly and the bundle,
+        # request or worker controls cannot choose the wrapper.
+        if is_windows:
+            raise ValueError(CODEX_WRAPPER_UNAVAILABLE)
+        return [str(codex_launch_wrapper())]
     executable = executable_path(bundle, dest, is_windows=is_windows)
     if is_windows and bundle['provider'] in ('codex', 'gemini'):
         node = shutil.which('node')
@@ -2958,6 +3054,34 @@ def managed_exec_readiness(archive):
             or str(archive) not in expected[expected.index('-c')+1]):
         raise ValueError('managed_exec_unavailable')
     return {'protocol': MANAGED_CLAUDE_PROTOCOL, 'label': 'hub-claude', 'profile': 'hub-hub-claude'}
+
+
+def codex_exec_readiness(archive):
+    """Read-only proof that this archive's Codex profile executes through the wrapper.
+
+    The profile must be the maintained `hub-shared-codex` entry whose command
+    matches this archive's exact generated `execute` invocation (interpreter,
+    effective archive precedence, managed root, handler and account label);
+    no quota probe, install or sync."""
+    archive = Path(archive).resolve(strict=True)
+    if not archive.is_file() or not zipfile.is_zipfile(archive):
+        raise ValueError(CODEX_WRAPPER_UNAVAILABLE)
+    wrapper = codex_launch_wrapper()
+    document = tomllib.loads(private_fs.read_bytes(profile_path(), 262144).decode('utf8'))
+    profiles = document.get('profiles')
+    profile = profiles.get('hub-shared-codex') if isinstance(profiles, dict) else None
+    previous = sys.argv[0]
+    try:
+        sys.argv[0] = str(archive)
+        expected = module_command('execute', 'shared-codex')
+    finally:
+        sys.argv[0] = previous
+    if (not isinstance(profile, dict) or set(profile) != {'engine', 'command'}
+            or profile['engine'] != 'codex' or profile['command'] != expected
+            or str(archive) not in expected[expected.index('-c') + 1]):
+        raise ValueError(CODEX_WRAPPER_UNAVAILABLE)
+    return {'protocol': CODEX_WRAPPER_PROTOCOL, 'label': 'shared-codex', 'profile': 'hub-shared-codex',
+            'wrapper': str(wrapper)}
 
 
 def managed_claude_context(extra_argv):

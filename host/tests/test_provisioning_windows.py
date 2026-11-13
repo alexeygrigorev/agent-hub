@@ -156,19 +156,25 @@ class TestWindowsProvisioningPortability(unittest.TestCase):
             self.assertEqual(exec_path, wrapper_cmd)
 
     def test_engine_argv_windows_node_js(self):
-        bundle = {'label': 'my-codex', 'provider': 'codex', 'version': '0.1.0', 'files': {}, 'env': {}, 'args': []}
+        bundle = {'label': 'my-gemini', 'provider': 'gemini', 'version': '0.1.0', 'files': {}, 'env': {}, 'args': []}
         with tempfile.TemporaryDirectory() as tmp:
             dest = Path(tmp)
-            pkg_dir = dest / 'engine' / 'node_modules' / '@openai' / 'codex'
+            pkg_dir = dest / 'engine' / 'node_modules' / '@google' / 'gemini-cli'
             pkg_dir.mkdir(parents=True)
-            (pkg_dir / 'package.json').write_text(json.dumps({'bin': {'codex': 'bin/codex.js'}}))
-            bin_file = pkg_dir / 'bin' / 'codex.js'
+            (pkg_dir / 'package.json').write_text(json.dumps({'bin': {'gemini': 'bin/gemini.js'}}))
+            bin_file = pkg_dir / 'bin' / 'gemini.js'
             bin_file.parent.mkdir(parents=True)
             bin_file.write_text("// codex.js")
 
             with patch('shutil.which', return_value=r'C:\Program Files\nodejs\node.exe'):
                 argv = p.engine_argv(bundle, dest, is_windows=True)
                 self.assertEqual(argv, [r'C:\Program Files\nodejs\node.exe', str(bin_file)])
+
+    def test_engine_argv_windows_codex_fails_closed(self):
+        # The maintained quota wrapper is a Linux script: no Bash guess, no raw SDK.
+        bundle = {'label': 'my-codex', 'provider': 'codex', 'version': '0.1.0', 'files': {}, 'env': {}, 'args': []}
+        with self.assertRaisesRegex(ValueError, 'codex_launch_wrapper_unavailable'):
+            p.engine_argv(bundle, Path('unused'), is_windows=True)
 
     def test_engine_login_tick_windows_enabled(self):
         with tempfile.TemporaryDirectory() as tmp:
