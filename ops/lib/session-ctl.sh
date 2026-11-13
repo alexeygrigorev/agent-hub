@@ -410,7 +410,7 @@ oncall_inbox_stalled() {
 }
 
 start() {
-  local current model_args=()
+  local current model_args=() hub_engine response id start_key
   current=$(find_session) || { log "session census failed"; return 1; }
   [ -n "$current" ] && { log "already running: $current"; return 0; }
   select_engine || return 1
@@ -427,11 +427,36 @@ start() {
     # Preserve the orchestrator's explicit Flash default; never leak it into oncall.
     model_args=(--model "${ORCH_MODEL:-gemini-3.8-flash-high}")
   fi
-  # own transient scope so the session outlives the (oneshot) watchdog unit cgroup
-  systemd-run --user --scope --collect -q -- a start --workspace "$RUNDIR/$SUB" --tag "$TAG" --engine "$ENGINE" \
-    "${model_args[@]}" \
-    --label "ops.role=$ROLE" --label "hub.intake=$INTAKE" >/dev/null 9>&- || { log "a start failed"; return 1; }
-  local id; id=$(find_session); [ -n "$id" ] || { log "session not found after start"; return 1; }
+  hub_engine="$ENGINE"
+  case "$hub_engine" in opencode) hub_engine=go ;; zcodex) hub_engine=zai ;; esac
+  # Hub owns quota/resource admission and native launch. A refusal is terminal
+  # for this attempt; the watchdog must never bypass it with a native start.
+  # Retain an uncertain attempt's idempotency key across watchdog retries.
+  if [ -s "$STATE/hub_start_key" ]; then
+    read -r start_key < "$STATE/hub_start_key"
+  else
+    start_key="ops-$ROLE-$(date +%s%N)"
+    printf '%s\n' "$start_key" > "$STATE/hub_start_key"
+  fi
+  response=$(T=180 t hub sessions start --workspace "$RUNDIR/$SUB" --name "$TAG" --tag "$TAG" \
+    --engine "$hub_engine" "${model_args[@]}" --purpose implement --interactive \
+    --reason "Pinned $ROLE coordinator route" --intake-task-id "$INTAKE" \
+    --key "$start_key" --wait --timeout 150 --json) || { log "Hub start failed; recovery held"; return 1; }
+  id=$(printf '%s' "$response" | python3 -c '
+import json,sys
+try:
+    d=json.load(sys.stdin)
+    d=d.get("binding_wait", d)
+    d=d.get("session", d)
+    if d.get("state") != "running" or not d.get("native_id"):
+        sys.exit(1)
+    print(d["native_id"])
+except (ValueError,TypeError,AttributeError):
+    sys.exit(1)
+') || { log "Hub start unconfirmed; reconcile before retry"; return 1; }
+  current=$(find_session) || { log "session census failed after Hub start"; return 1; }
+  [ "$current" = "$id" ] || { log "managed session not found after Hub start"; return 1; }
+  rm -f "$STATE/hub_start_key"
   log "started session $id; waiting for prompt"
   local i s ready=0
   for i in $(seq 1 60); do

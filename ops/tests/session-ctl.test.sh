@@ -19,6 +19,7 @@ export FAKE_KILLED="$fake/killed.log"
 export FAKE_START_ENGINE="$fake/start-engine"
 export FAKE_START_MODEL="$fake/start-model"
 export FAKE_SEND_LOG="$fake/send.log"
+export FAKE_HUB_START_LOG="$fake/hub-start.json"
 unset ENGINE ENGINE_SELECTED ORCH_ENGINE ORCH_FALLBACK_ENGINE ONCALL_ENGINE
 
 cat > "$bin/a" <<'APLEXER'
@@ -39,20 +40,7 @@ case "${1:-}" in
     printf '[]\n' > "$FAKE_SESSIONS"
     ;;
   start)
-    workspace=""; tag=""; engine=""; model=""
-    while (($#)); do
-      case "$1" in
-        --workspace) workspace="$2"; shift 2 ;;
-        --tag) tag="$2"; shift 2 ;;
-        --engine) engine="$2"; shift 2 ;;
-        --model) model="$2"; shift 2 ;;
-        *) shift ;;
-      esac
-    done
-    printf '%s\n' "$engine" > "$FAKE_START_ENGINE"
-    printf '%s' "$model" > "$FAKE_START_MODEL"
-    printf '[{"id":"new-%s","workspace":"%s","tag":"%s","phase":"running","worker_alive":true}]\n' "$tag" "$workspace" "$tag" > "$FAKE_SESSIONS"
-    printf '%s\n' "${FAKE_START_SCREEN:-❯}" > "$FAKE_SCREEN"
+    echo 'direct native start is forbidden' >&2; exit 90
     ;;
   send)
     printf '%s\n' "$*" >> "$FAKE_SEND_LOG"
@@ -70,6 +58,31 @@ APLEXER
 cat > "$bin/hub" <<'HUB'
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ "${1:-} ${2:-}" == 'sessions start' ]]; then
+  case "${FAKE_HUB_START_MODE:-running}" in
+    fail) echo 'no_connected_host' >&2; exit 7 ;;
+    offered) echo '{"state":"offered"}'; exit 0 ;;
+  esac
+  python3 - "$@" <<'PYHUB'
+import json,os,sys
+args=sys.argv[1:]
+def arg(flag): return args[args.index(flag)+1] if flag in args else ''
+with open(os.environ['FAKE_HUB_START_LOG'],'w') as f: json.dump(args,f)
+assert arg('--purpose')=='implement'
+assert arg('--tag')==arg('--name')
+assert '--interactive' in args and '--wait' in args
+name=arg('--name'); engine=arg('--engine'); native='new-'+name
+if engine=='go': engine='opencode'
+if engine=='zai': engine='zcodex'
+with open(os.environ['FAKE_START_ENGINE'],'w') as f: f.write(engine+'\n')
+with open(os.environ['FAKE_START_MODEL'],'w') as f: f.write(arg('--model'))
+with open(os.environ['FAKE_SESSIONS'],'w') as f:
+    json.dump([dict(id=native,workspace=arg('--workspace'),tag=arg('--tag'),phase='running',worker_alive=True)],f)
+with open(os.environ['FAKE_SCREEN'],'w') as f: f.write(os.environ.get('FAKE_START_SCREEN','❯')+'\n')
+print(json.dumps({'binding_wait': {'session': {'state':'running','native_id':native}}}))
+PYHUB
+  exit $?
+fi
 [[ "${1:-}" == quota && "${2:-}" == --json ]] || exit 2
 case "${FAKE_HUB_MODE:-healthy}" in
   fail) exit 1 ;;
@@ -376,5 +389,22 @@ output="$(run_ctl oncall check 2>&1)" || status=$?
 [[ "$status" -ne 0 ]]
 assert_contains "$output" 'no configured non-Claude engine has fresh Hub quota headroom'
 [[ ! -e "$FAKE_START_ENGINE" ]]
+
+# Hub start rejection or an unbound offer never triggers a native fallback.
+for mode in fail offered; do
+  write_default_quota
+  write_dead oncall
+  status=0
+  output="$(FAKE_HUB_START_MODE="$mode" run_ctl oncall start 2>&1)" || status=$?
+  [[ "$status" -ne 0 ]]
+  [[ ! -e "$FAKE_START_ENGINE" ]]
+  assert_not_contains "$output" 'started session'
+  key=$(cat "$HOME/tmp/agent-reports/oncall/state/hub_start_key")
+  if [[ "$mode" == fail ]]; then previous_key="$key"; else [[ "$key" == "$previous_key" ]]; fi
+done
+write_default_quota
+output="$(run_ctl oncall start 2>&1)"
+assert_contains "$output" 'started session'
+[[ ! -e "$HOME/tmp/agent-reports/oncall/state/hub_start_key" ]]
 
 echo 'session-ctl targeted tests passed'
