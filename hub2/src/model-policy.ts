@@ -47,6 +47,11 @@ export function isModelPolicyCandidateAllowed(candidate: ModelPolicyRoute): bool
   return modelPolicyCandidateViolation(candidate) === null;
 }
 
+/** Models carrying this capability are available only for a pinned thinking session. */
+export function isThinkOnlyModel(candidate: Pick<ModelPolicyRoute, 'capabilities'>): boolean {
+  return candidate.capabilities?.includes('think-only') === true;
+}
+
 /** Hydrogen replaces Flash/Argon in ordinary automatic work, without changing other engines. */
 export function isOrdinaryWorkModel(candidate: Pick<ModelPolicyRoute, 'id' | 'model'>): boolean {
   return !/(?:flash|gemini-4-argon)/i.test(`${candidate.id} ${candidate.model}`);

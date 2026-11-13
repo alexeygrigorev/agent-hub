@@ -141,6 +141,14 @@
       "effort": "medium"
     },
     {
+      "id": "antigravity-carbon-medium",
+      "model": "gemini-4-carbon-medium",
+      "provider": "gemini",
+      "engine": "antigravity",
+      "profile": null,
+      "effort": "medium"
+    },
+    {
       "id": "astra",
       "model": "gpt-6-astra",
       "provider": "codex",
