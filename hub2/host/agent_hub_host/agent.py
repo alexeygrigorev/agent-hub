@@ -147,10 +147,14 @@ class OfferAcknowledgement:
 
     def reject(self, event):
         # The server named why it will not claim this offer; fail now, not after 15s.
+        if self.ready.is_set():
+            return  # the first response wins
         self.rejection = str(event.get('error') or 'unknown')[:80]
         self.ready.set()
 
     def accept(self, event):
+        if self.ready.is_set():
+            return  # the first response wins
         self.binding_verified = self.binding is not None and event.get('workspace_binding') == self.binding
         self.ready.set()
 
