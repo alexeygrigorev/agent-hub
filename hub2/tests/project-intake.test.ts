@@ -426,6 +426,24 @@ test('start purpose is validated and bound to launch and idempotency',async()=>{
  assert.equal(conflict.status,409);assert.equal((await body(conflict)).error,'idempotency_conflict');
 });
 
+test('project starts reject Carbon identity outside thinking even when policy omits its marker',async()=>{
+ const carbon={id:'antigravity-carbon-medium',engine:'antigravity',model:'gemini-4-carbon-medium',effort:'medium',account_id:'gemini',weight:1,capabilities:['think-only'],enabled:true};
+ const cases=[
+  {id:'omitted-marker',candidate:{...carbon,capabilities:[]},model:'gemini-4-carbon-medium'},
+  {id:'generic-id',candidate:{...carbon,id:'generic-route',capabilities:[]},model:'generic-route'},
+  {id:'carbon-alias',candidate:{...carbon,id:'generic-carbon-alias',capabilities:[]},model:'generic-carbon-alias'},
+ ];
+ for(const scenario of cases)for(const purpose of [undefined,'fix','implement','review']){
+  const key=`carbon-${scenario.id}-${purpose||'omitted'}`,f=fixture({modelCandidates:[scenario.candidate]}),own=await intake(f,key);
+  const response=await f.call('/api/intakes/'+own.id+'/start','POST',{key,workspace:'/tmp/synthetic-carbon-purpose',model:scenario.model,override_reason:'Synthetic Carbon boundary test',...(purpose?{purpose}:{})});
+  const result=await body(response);
+  assert.equal(response.status,400,JSON.stringify(result));
+  assert.deepEqual(result,{error:'think_only_model_requires_think_purpose'});
+  assert.equal((f.sql.prepare('SELECT COUNT(*) AS n FROM dispatch_sagas').get() as any).n,0);
+  assert.equal(f.machineCalls.length,0);
+ }
+});
+
 test('project starts enforce Astra purpose even through non-Astra policy ids',async()=>{
  const astra={id:'review-route',engine:'codex',model:'gpt-6-astra',effort:'medium',account_id:'codex',weight:1,capabilities:['review-only'],enabled:true};
  for(const purpose of [undefined,'fix','implement','review','think']){

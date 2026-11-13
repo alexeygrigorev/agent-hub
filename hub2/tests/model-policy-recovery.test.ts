@@ -5,6 +5,8 @@ import {ControlDO} from '../src/control-do';
 import {HUB2_FORWARD_BODY_LIMIT} from '../src/http';
 import worker from '../src/worker';
 const candidate={id:'sol',engine:'codex',model:'gpt-6.1-sol',effort:'medium',account_id:'codex',weight:1,capabilities:[],enabled:true};
+const hydrogenCandidate={id:'antigravity-hydrogen-medium',engine:'antigravity',model:'gemini-4-hydrogen-medium',effort:'medium',account_id:'gemini',weight:1,capabilities:[],enabled:true};
+const carbonCandidate={id:'antigravity-carbon-medium',engine:'antigravity',model:'gemini-4-carbon-medium',effort:'medium',account_id:'gemini',weight:1,capabilities:['think-only'],enabled:true};
 function fixture(){
  const database=new DatabaseSync(':memory:');
  const state:any={storage:{async setAlarm(){},async deleteAlarm(){},sql:{exec(query:string,...args:any[]){
@@ -60,6 +62,56 @@ test('CAS precedes digest idempotence and competing writers cannot both win',asy
 const protocol = 'model-policy-recovery-v1';
 const recovery = (action: string, expected_version: number, candidates: unknown[] = [candidate]) =>
   ({protocol, action, expected_version, candidates});
+
+test('public policy writes require the exact Carbon identity and think-only contract', async () => {
+  const f = fixture();
+  try {
+    const malformed = [
+      {...carbonCandidate, capabilities: []},
+      {...carbonCandidate, id: 'generic-route', capabilities: []},
+      {...carbonCandidate, id: 'generic-carbon-alias'},
+      {...carbonCandidate, model: 'gemini-4-carbon-alias'},
+      {...carbonCandidate, engine: 'codex'},
+      {...carbonCandidate, effort: 'low'},
+      {...carbonCandidate, account_id: 'codex'},
+      {...carbonCandidate, capabilities: ['think-only', 'review-only']},
+    ];
+    for (const item of malformed) {
+      const response = await f.publicCall('PUT', {candidates: [item]});
+      const result = await body(response);
+      assert.equal(response.status, 400, JSON.stringify(result));
+      assert.deepEqual(result, {error: 'carbon_policy_contract_invalid'});
+    }
+    assert.deepEqual(await body(await f.publicCall('GET')),
+      {error: 'model_policy_unconfigured', version: 0});
+    const accepted = await f.publicCall('PUT', {candidates: [carbonCandidate]});
+    assert.equal(accepted.status, 200);
+    assert.equal((await body(accepted)).version, 1);
+  } finally { f.database.close(); }
+});
+
+test('Carbon policy recovery restores the prior Hydrogen-only policy before code rollback', async () => {
+  const f = fixture();
+  try {
+    const initial = await f.publicCall('PUT', {candidates: [hydrogenCandidate], expected_version: 0});
+    assert.equal(initial.status, 200);
+    assert.equal((await body(initial)).version, 1);
+    const desired = [hydrogenCandidate, carbonCandidate];
+    const preflight = await f.publicCall('POST', recovery('validate_recovery', 1, desired));
+    assert.equal(preflight.status, 200);
+    assert.equal((await body(preflight)).changed, true);
+    const applied = await f.publicCall('POST', recovery('apply_recoverable', 1, desired));
+    assert.equal(applied.status, 200);
+    assert.equal((await body(applied)).version, 2);
+
+    // The deploy transaction restores this snapshot before checking out old code.
+    const restored = await f.publicCall('PUT', {candidates: [hydrogenCandidate], expected_version: 2});
+    assert.equal(restored.status, 200);
+    assert.equal((await body(restored)).version, 3);
+    assert.deepEqual(await body(await f.publicCall('GET')),
+      {version: 3, candidates: [hydrogenCandidate]});
+  } finally { f.database.close(); }
+});
 
 test('recovery validates the stored legacy policy using the operator PUT rules', async () => {
   const f = fixture();
