@@ -106,6 +106,43 @@ class CliTests(unittest.TestCase):
         self.assertEqual(body["acceptance_criteria"], ["First requirement"])
         self.assertEqual(auth, "Bearer synthetic-token")
 
+    def test_intake_append_posts_merge_evidence_and_merge_check_collects_for_requested_pr(self):
+        from agent_hub_host import merge_evidence
+
+        proof = {"kind": "merge_gate", "repository": "org/repo", "checked_at": "2026-11-13T10:00:00Z"}
+        evidence = Path(self.temp.name) / "merge.json"
+        evidence.write_text(json.dumps({"evidence": proof}), encoding="utf-8")
+        code, _ = self.invoke("intake", "append", "task-1", "--project", "org/repo", "--key", "merge-1", "--file", str(evidence))
+        self.assertEqual(code, 0)
+        method, path, body, _ = Handler.calls[-1]
+        self.assertEqual((method, urlsplit(path).path), ("POST", "/api/intakes/task-1/append"))
+        self.assertEqual(body, {"evidence": proof, "key": "merge-1"})
+
+        with patch.object(merge_evidence, "collect", return_value=proof) as collect:
+            code, _ = self.invoke("intake", "merge-check", "task-1", "--project", "org/repo", "--pr", "23", "--key", "merge-check-1")
+        self.assertEqual(code, 0)
+        collect.assert_called_once_with(None, "23")
+        method, path, body, _ = Handler.calls[-1]
+        self.assertEqual((method, urlsplit(path).path), ("POST", "/api/intakes/task-1/merge-evidence"))
+        self.assertEqual(body, {"key": "merge-check-1", "evidence": proof})
+
+    def test_sessions_finish_requires_a_matching_record_and_posts_to_intake_finish_route(self):
+        event = Path(self.temp.name) / "finished.json"
+        event.write_text(json.dumps({"kind": "session_finished", "session_id": "session-1", "summary": "Done",
+                                     "acceptance": [{"status": "met", "proof": "PR 23"}]}), encoding="utf-8")
+        code, _ = self.invoke("sessions", "finish", "session-1", "--intake-task-id", "task-1", "--key", "finish-1", "--file", str(event))
+        self.assertEqual(code, 0)
+        method, path, body, _ = Handler.calls[-1]
+        self.assertEqual((method, urlsplit(path).path), ("POST", "/api/intakes/task-1/finished"))
+        self.assertEqual(body["kind"], "session_finished")
+        self.assertEqual(body["session_id"], "session-1")
+        self.assertEqual(body["key"], "finish-1")
+
+        event.write_text(json.dumps({"kind": "session_finished", "session_id": "somebody-else", "acceptance": []}), encoding="utf-8")
+        call_count = len(Handler.calls)
+        self.assertEqual(self.invoke("sessions", "finish", "session-1", "--intake-task-id", "task-1", "--file", str(event))[0], 1)
+        self.assertEqual(len(Handler.calls), call_count, "mismatched session evidence never reaches Hub")
+
     def test_session_capture_uses_fenced_command_surface(self):
         code, _ = self.invoke("sessions", "capture", "session-1", "--machine", "test-host", "--key", "capture-1")
         self.assertEqual(code, 0)

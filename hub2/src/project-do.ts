@@ -11,19 +11,22 @@ import { advanceDispatch } from './dispatch';
 import { pickCommittedModelRoute, type PickedRoute, type PickDiagnostics } from './model-picker';
 import {buildStartPickerEvidence, normalizeStartPickerEvidence} from './start-picker-evidence';
 import { sessionPurpose } from './session-purpose';
+import { codeTask, mergeEvidenceShapeError, mergeGate, mergeGaps } from './merge-gate';
 import { nativeReturncode } from './native-exit';
 import { HOST_INVENTORY_LOST_MS } from './session-liveness';
 import { PROJECT_WORK_SCHEMA, ProjectWork, type ProjectWorkHooks } from './project-work';
 import {
-  BLOCKED_WAIT_MS, COMPLETION_ACTOR, DEVELOPER_ALERT_RECIPIENT, HARD_BLOCKERS, MAX_AUTO_CONTINUATIONS, MAX_CONTINUATION_TRIES, MAX_DELIVERY_TRIES,
-  LAUNCH_SPEC_LIMIT, basePrompt, completionClaim, continuationBudget, continuationPrompt, deliveryBody, exitCause, promptWithContract, retryDelay, stripCompletion, taskBlocker,
-  type CompletionClaim, type CompletionRecord, type ContinuationSnapshot, type TaskBlocker,
+  BLOCKED_WAIT_MS, COMPLETION_ACTOR, VERIFICATION_ACTOR, DEVELOPER_ALERT_RECIPIENT, HARD_BLOCKERS, MAX_AUTO_CONTINUATIONS, MAX_CONTINUATION_TRIES, MAX_DELIVERY_TRIES, MAX_VERIFICATION_ATTEMPTS, MAX_VERIFICATION_START_TRIES,
+  LAUNCH_SPEC_LIMIT, basePrompt, completionClaim, continuationBudget, continuationPrompt, deliveryBody, exitCause, promptWithContract, retryDelay, stripCompletion, taskBlocker, verificationPrompt, verificationVerdict,
+  type CompletionClaim, type CompletionRecord, type ContinuationSnapshot, type TaskBlocker, type VerificationAction, type VerificationVerdict,
 } from './task-completion';
 import type { Actor, Hub2Env, JsonRecord } from './types';
 
 // Use exactly the same pending/current-attempt predicate for the bounded
 // drain and its alarm. Terminal actions never expire with intake age.
 const COMPLETION_DUE = `CASE
+  WHEN json_extract(i.final_evidence_json,'$.completion.verification.state')='pending'
+    THEN json_extract(i.final_evidence_json,'$.completion.verification.next_action_at')
   WHEN json_extract(i.final_evidence_json,'$.completion.continuation.state')='pending'
     THEN json_extract(i.final_evidence_json,'$.completion.continuation.next_action_at')
   WHEN json_extract(i.final_evidence_json,'$.completion.delivery.state')='pending'
@@ -166,13 +169,15 @@ export class ProjectDO {
         ?? error('method_not_allowed', 405, `${request.method} is not supported on /${relation[2]}`);
       const prerequisites = url.pathname.match(/^\/_internal\/prerequisites\/([^/]+)$/);
       if (prerequisites && request.method === 'GET') return this.relations.internalPrerequisites(decodeURIComponent(prerequisites[1]));
-      const match = url.pathname.match(/^\/api\/intakes\/([^/]+)(?:\/(start|history|append|events|context|audit|discard))?$/);
+      const match = url.pathname.match(/^\/api\/intakes\/([^/]+)(?:\/(start|history|append|events|context|audit|discard|finished|merge-evidence))?$/);
       if (!match) return error('not_found', 404);
       const intakeId = decodeURIComponent(match[1]);
       if (match[2] === 'start' && request.method === 'POST') return await this.startIntake(request, intakeId);
       if (match[2] === 'discard' && request.method === 'POST') return await this.discardUnused(request, intakeId);
       if (match[2] === 'history' && request.method === 'GET') return this.history(request, intakeId);
       if(match[2]==='append'&&request.method==='POST')return await this.appendIntake(request,intakeId);
+      if(match[2]==='finished'&&request.method==='POST')return await this.sessionFinished(request,intakeId);
+      if(match[2]==='merge-evidence'&&request.method==='POST')return await this.mergeEvidence(request,intakeId);
       if(match[2]==='events'&&request.method==='POST')return await this.eventsCompat(request,intakeId);
       if(match[2]==='context'&&request.method==='GET')return this.contextView(request,intakeId);
       if(match[2]==='audit'&&request.method==='GET')return this.history(request,intakeId);
@@ -212,13 +217,14 @@ export class ProjectDO {
     if (!project || project.length > 180 || !this.canProject(actor, project, 'intake:write')) return error('forbidden', 403);
     const body = await bodyObject(request, 16_384);
     normalizeCriteria(body);
+    if (body.code_task !== undefined && typeof body.code_task !== 'boolean') return error('invalid_code_task',400);
     if (typeof body.title !== 'string' || body.title.trim().length < 1 || body.title.length > 240) return error('invalid_title', 400);
     if (typeof body.text !== 'string' || body.text.trim().length < 1 || new TextEncoder().encode(body.text).byteLength > 8192) return error('invalid_text', 400);
     const criteriaProblem = criteriaError(body.acceptance_criteria);
     if (criteriaProblem) return criteriaProblem;
     const key = this.idempotencyKey(request, body);
     if (!key) return error('idempotency_key_required', 400);
-    const normalized = { title: body.title.trim(), text: body.text, acceptance_criteria: (body.acceptance_criteria as string[]).map(value => value.trim()) };
+    const normalized = { title: body.title.trim(), text: body.text, acceptance_criteria: (body.acceptance_criteria as string[]).map(value => value.trim()), code_task:body.code_task!==false };
     const digest = await sha256Hex(JSON.stringify(normalized));
     const prior = this.idempotent('intake:create', key, digest);
     if (prior instanceof Response) return prior;
@@ -233,7 +239,7 @@ export class ProjectDO {
     const id = crypto.randomUUID();
     this.transaction(() => {
       this.db.run(`INSERT INTO intakes(id, project, title, text, acceptance_criteria_json, status, assigned_machine_id, assigned_actor_id, session_id, final_evidence_json, created_at, updated_at, owner_actor_id, route_registered, route_next_action_at,original_title,original_text,source_json,priority)
-        VALUES (?, ?, ?, ?, ?, 'open', NULL, ?, NULL, NULL, ?, ?, ?, 0, ?,?,?,?,?)`, id, project, normalized.title, normalized.text, JSON.stringify(normalized.acceptance_criteria), actor?.id || 'operator', now, now, actor?.id || 'operator', now,normalized.title,normalized.text,JSON.stringify({type:'user'}),2);
+        VALUES (?, ?, ?, ?, ?, 'open', NULL, ?, NULL, NULL, ?, ?, ?, 0, ?,?,?,?,?)`, id, project, normalized.title, normalized.text, JSON.stringify(normalized.acceptance_criteria), actor?.id || 'operator', now, now, actor?.id || 'operator', now,normalized.title,normalized.text,JSON.stringify({type:'user',code_task:normalized.code_task}),2);
       this.appendEvent(id, `intake:${id}:created`, actor?.id || 'operator', 'created', { title: normalized.title, acceptance_criteria: normalized.acceptance_criteria }, now);
       this.db.run('INSERT INTO idempotency(scope, request_key, request_digest, response_json, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)',
         'intake:create', key, digest, JSON.stringify({ id }), now, now + 180 * 24 * 60 * 60_000);
@@ -370,15 +376,73 @@ export class ProjectDO {
       const intake=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',intakeId);if(!intake)return error('intake_not_found',404);
       if(!actor||!hasScope(actor,'operator:admin')&&!(actor.resource_id===intake.id&&hasScope(actor,'intake:append')))return error('forbidden',403);
       // A completion claim may come only from that session itself or an operator.
-      const claimed=(body.evidence as JsonRecord|undefined)?.kind==='task_complete'?(body.evidence as JsonRecord).session_id:undefined;
+      const claimKind=(body.evidence as JsonRecord|undefined)?.kind;
+      const claimed=['task_complete','session_finished'].includes(String(claimKind))?(body.evidence as JsonRecord).session_id:undefined;
       if(claimed!==undefined&&!hasScope(actor,'operator:admin')&&actor.id!=='session:'+String(claimed))return error('completion_claim_forbidden',403);
+      if(claimed!==undefined&&intake.session_id!==claimed)return error('completion_claim_stale',409);
       const blockedBy=(body.evidence as JsonRecord|undefined)?.kind==='task_blocked'?(body.evidence as JsonRecord).session_id:undefined;
       if(blockedBy!==undefined&&!hasScope(actor,'operator:admin')&&actor.id!=='session:'+String(blockedBy))return error('blocker_record_forbidden',403);
+      if(blockedBy!==undefined&&intake.session_id!==blockedBy)return error('blocker_record_stale',409);
+      const verdict=(body.evidence as JsonRecord|undefined)?.kind==='acceptance_verification'?(body.evidence as JsonRecord).session_id:undefined;
+      if(verdict!==undefined){
+        if(!hasScope(actor,'operator:admin')&&actor.id!=='session:'+String(verdict))return error('verification_record_forbidden',403);
+        if(intake.session_id!==verdict)return error('verification_record_stale',409);
+        const saga=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id=? AND intake_id=?',String(verdict),intake.id);
+        if(!saga||(this.parse(saga.routing_json) as JsonRecord|null)?.acceptance_verification!==true)return error('verification_record_forbidden',403);
+        const criteria=this.parse(intake.acceptance_criteria_json);
+        if(!verificationVerdict(body.evidence,String(verdict),Array.isArray(criteria)?criteria.length:0))return error('invalid_verification_record',400);
+      }
+      if(claimKind==='merge_gate'){
+        const problem=mergeEvidenceShapeError(body.evidence);
+        if(problem)return error('invalid_merge_evidence',400,problem);
+      }
       const previous=this.db.one<{body_json:string}>('SELECT body_json FROM intake_events WHERE event_key=?',eventKey);
       if(previous)return (JSON.parse(previous.body_json) as JsonRecord).request_digest===digest?json({appended:true,duplicate:true,intake_id:intakeId}):error('idempotency_conflict',409);
       this.appendEvent(intake.id,eventKey,actor.id,'worker_append',{...(body.note?{note:body.note}:{}),...(body.evidence?{evidence:body.evidence}:{}),request_digest:digest},Date.now());
       return json({appended:true,intake_id:intake.id},201);
     });
+  }
+
+  /** Agent-facing completion event. It is explicitly session-scoped and has
+   * the same full-criteria proof requirements as the legacy task_complete. */
+  private async sessionFinished(request:Request,intakeId:string):Promise<Response>{
+    const body=await bodyObject(request,16384),key=this.idempotencyKey(request,body);
+    if(!key||Object.keys(body).some(k=>!['key','kind','session_id','summary','acceptance'].includes(k)))return error('invalid_session_finished',400);
+    const intake=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',intakeId);
+    if(!intake)return error('intake_not_found',404);
+    if(!['queued','running'].includes(intake.status)||intake.session_id!==body.session_id)return error('session_finish_stale',409);
+    const criteria=this.parse(intake.acceptance_criteria_json);
+    if(body.kind!=='session_finished'||typeof body.session_id!=='string'
+      ||!completionClaim(body,body.session_id,Array.isArray(criteria)?criteria.length:0))return error('invalid_session_finished',400);
+    const actor=actorFrom(request);
+    const mapped={key,evidence:body};
+    return await this.appendIntake(new Request(request.url,{method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(actor)},body:JSON.stringify(mapped)}),intakeId);
+  }
+
+  /** Accept one bounded CLI-collected GitHub observation, including failures;
+   * failed observations stay visible and keep code work from being accepted. */
+  private async mergeEvidence(request:Request,intakeId:string):Promise<Response>{
+    const body=await bodyObject(request,16384),key=this.idempotencyKey(request,body);
+    if(!key||Object.keys(body).some(k=>!['key','evidence'].includes(k))||!body.evidence)return error('invalid_merge_evidence',400);
+    const intake=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',intakeId);
+    if(!intake)return error('intake_not_found',404);
+    if(!codeTask(this.parse(intake.source_json)))return error('merge_gate_not_required',409);
+    const problem=mergeEvidenceShapeError(body.evidence);
+    if(problem)return error('invalid_merge_evidence',400,problem);
+    const actor=actorFrom(request);
+    return await this.appendIntake(new Request(request.url,{method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(actor)},body:JSON.stringify({key,evidence:body.evidence})}),intakeId);
+  }
+
+  private latestMergeEvidence(intakeId:string):unknown{
+    for(const row of this.db.all<{body_json:string}>("SELECT body_json FROM intake_events WHERE task_id=? AND kind='worker_append' ORDER BY seq DESC LIMIT 200",intakeId)){
+      const append=this.parse(row.body_json) as JsonRecord|null,evidence=append?.evidence as JsonRecord|undefined;
+      if(evidence?.kind==='merge_gate')return evidence;
+    }
+    return undefined;
+  }
+
+  private intakeMergeGate(intake:IntakeRow){
+    return mergeGate(codeTask(this.parse(intake.source_json)),this.latestMergeEvidence(intake.id),intake.project);
   }
 
   private async editIntake(request:Request,intakeId:string):Promise<Response>{
@@ -396,6 +460,24 @@ export class ProjectDO {
       if(!this.canProject(actor,row.project,'intake:write'))return error('forbidden',403);
       if(replay)return json({intake:this.viewIntake(row),duplicate:true});
       if(body.expected_updated_at!==undefined&&body.expected_updated_at!==row.updated_at)return error('intake_version_conflict',409);
+      if(body.status==='accepted'){
+        const gate=this.intakeMergeGate(row);
+        if(!gate.ok){
+          const at=Date.now(),alert={recipient:DEVELOPER_ALERT_RECIPIENT,kind:'merge_gate_blocked',session_id:row.session_id,
+            problems:gate.problems,head_sha:gate.evidence?.head_sha??null,pr_url:gate.evidence?.pr_url??null};
+          this.appendEvent(row.id,'merge-gate-blocked:'+row.id+':'+key,COMPLETION_ACTOR,'developer_alert_raised',alert,at);
+          this.appendEvent(row.id,'merge-gate-owner:'+row.id+':'+key,COMPLETION_ACTOR,'intake_context_updated',{
+            ...this.intakeContext(row.id),owner:DEVELOPER_ALERT_RECIPIENT,
+            current_state:'Hub refused to accept code work because the programmatic GitHub merge gate is not satisfied.',
+            next_step:'Developer: inspect the merge-gate problems, merge the PR to main, verify green checks for the exact head, then run hub intake merge-check.'},at);
+          console.error('[hub2] MERGE_GATE_BLOCKED alert='+DEVELOPER_ALERT_RECIPIENT,JSON.stringify({intake_id:row.id,...alert}));
+          return error('merge_gate',409,JSON.stringify({problems:gate.problems,pr_url:gate.evidence?.pr_url??null,head_sha:gate.evidence?.head_sha??null}));
+        }
+        const final=this.parse(row.final_evidence_json??'{}') as JsonRecord;
+        const completion=final.completion as CompletionRecord|undefined;
+        if(completion?.controlled===true&&completion.verification?.state!=='passed')
+          return error('acceptance_verification_required',409,'Independent acceptance verification must pass before this intake can be accepted.');
+      }
       const changesCore=body.title!==undefined||body.text!==undefined||body.acceptance_criteria!==undefined||body.status!==undefined;
       if(changesCore&&(['queued','running'].includes(row.status)||(row.session_id&&this.db.one<SagaRow>("SELECT * FROM dispatch_sagas WHERE session_id=? AND state<>'complete'",row.session_id))))return error('intake_active',409);
       if(body.status==='accepted'&&(row.status!=='completed-awaiting-review'||!hasScope(actor,'operator:admin')))return error('review_required',409);
@@ -441,6 +523,36 @@ export class ProjectDO {
     const intake = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id = ?', intakeId);
     if (!intake) return error('intake_not_found', 404);
     if (!this.canProject(actor, intake.project, 'session:start')) return error('forbidden', 403);
+    const verificationOf=actor?.id===VERIFICATION_ACTOR&&typeof body.verification_of_session_id==='string'?body.verification_of_session_id:undefined;
+    const verificationOrigin=actor?.id===VERIFICATION_ACTOR&&typeof body.verification_origin_session_id==='string'?body.verification_origin_session_id:undefined;
+    const verificationAttempt=body.verification_attempt;
+    if((body.verification_of_session_id!==undefined||body.verification_origin_session_id!==undefined||body.verification_attempt!==undefined)
+      &&actor?.id!==VERIFICATION_ACTOR)return error('verification_start_forbidden',403);
+    let verificationPrevious:SagaRow|undefined,verificationOriginal:SagaRow|undefined;
+    let excludedPolicyIds:string[]=[];
+    if(verificationOf!==undefined){
+      if(intake.session_id!==verificationOf||typeof verificationOrigin!=='string'||!Number.isSafeInteger(verificationAttempt)
+        ||Number(verificationAttempt)<1||Number(verificationAttempt)>MAX_VERIFICATION_ATTEMPTS)return error('verification_start_stale',409);
+      verificationPrevious=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id=? AND intake_id=?',verificationOf,intake.id);
+      verificationOriginal=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id=? AND intake_id=?',verificationOrigin,intake.id);
+      const previousRoute=(this.parse(verificationPrevious?.routing_json??'{}') as JsonRecord|null)??{};
+      if(!verificationPrevious||!verificationOriginal||!this.completionControlled(verificationOriginal)
+        ||!['completed-awaiting-review','failed'].includes(intake.status)
+        ||(intake.status==='completed-awaiting-review'&&verificationAttempt!==1)
+        ||(intake.status==='failed'&&(previousRoute.acceptance_verification!==true||Number(verificationAttempt)!==Number(previousRoute.verification_attempt)+1
+          ||previousRoute.verification_origin_session_id!==verificationOrigin)))return error('verification_start_stale',409);
+      if(intake.status==='completed-awaiting-review'&&(!this.findCompletionClaim(intake,verificationOriginal)
+        ||verificationOf!==verificationOrigin))return error('verification_start_stale',409);
+      const rawExclude=body.exclude_policy_ids??[];
+      if(!Array.isArray(rawExclude)||rawExclude.length>16||rawExclude.some(v=>typeof v!=='string'||!v.trim()||v.length>128))return error('invalid_verification_exclusions',400);
+      excludedPolicyIds=[...new Set(rawExclude as string[])];
+      const originalRoute=(this.parse(verificationOriginal.routing_json??'{}') as JsonRecord|null)??{};
+      const originalPicker=(originalRoute.picker as JsonRecord|undefined)??{};
+      if(typeof originalPicker.policy_id==='string'&&!excludedPolicyIds.includes(originalPicker.policy_id))return error('verification_model_not_independent',409);
+      if(Number(verificationAttempt)>1&&typeof previousRoute.picker==='object'&&previousRoute.picker
+        &&typeof (previousRoute.picker as JsonRecord).policy_id==='string'
+        &&!excludedPolicyIds.includes(String((previousRoute.picker as JsonRecord).policy_id)))return error('verification_model_not_independent',409);
+    }
     if (intake.route_registered !== 1 && !await this.registerIntakeRoute(intake)) {
       await this.scheduleNext();
       return error('route_registration_pending', 503);
@@ -453,8 +565,11 @@ export class ProjectDO {
     const modelInput = body.model;
     const effortInput = body.effort;
     const purpose = sessionPurpose(body.purpose);
+    if(verificationOf!==undefined&&purpose!=='review')return error('verification_purpose_required',400);
     const reasonInput = body.override_reason === undefined ? body.reason : body.override_reason;
     const prompt = typeof body.prompt === 'string' ? body.prompt : intake.text;
+    if(body.verification_summary!==undefined&&(actor?.id!==VERIFICATION_ACTOR||typeof body.verification_summary!=='string'||body.verification_summary.length>1200))
+      return error('invalid_verification_summary',400);
     const interactive = body.interactive === undefined ? false : body.interactive;
     const timeoutSeconds = body.timeout_seconds === undefined ? 1800 : body.timeout_seconds;
     const absoluteWorkspace = typeof workspace === 'string' && (workspace.startsWith('/') || /^[A-Za-z]:\\/.test(workspace));
@@ -491,6 +606,8 @@ export class ProjectDO {
       effort: effortInput ?? null, override_reason: overrideReason ?? null,
       required_capabilities: requiredCapabilities, with_goal: withGoal,
       ...(purpose !== 'implement' ? { purpose } : {}),
+      ...(verificationOf!==undefined?{verification_of_session_id:verificationOf,verification_origin_session_id:verificationOrigin,
+        verification_attempt:Number(verificationAttempt),exclude_policy_ids:excludedPolicyIds,verification_summary:body.verification_summary??''}:{}),
       ...(managedLabel!==undefined?{managed_credential_label:managedLabel}:{}),
     };
     const digest = await sha256Hex(JSON.stringify({
@@ -554,10 +671,17 @@ export class ProjectDO {
           ...(typeof effortInput === 'string' ? { effort: effortInput } : {}),
           ...(typeof body.tier === 'string' ? { tier: body.tier } : {}),
           ...(overrideReason ? { override_reason: overrideReason } : {}),
+          ...(verificationOf!==undefined?{exclude_policy_ids:excludedPolicyIds}:{}),
           interactive, purpose, with_goal: withGoal, required_capabilities: requiredCapabilities, workspace,
           ...(managedLabel!==undefined?{managed_credential_label:'hub-claude' as const}:{}),
         }, {project_id:intake.project,operation_id:operationId,attempt:0});
       route=picked.route;diagnostics=picked.diagnostics;
+      if(verificationOf!==undefined){
+        const originalLaunch=this.parse(verificationOriginal!.launch_spec_json) as JsonRecord;
+        const sameModel=String(route.engine).toLowerCase()===String(originalLaunch.engine).toLowerCase()
+          &&String(route.model).toLowerCase()===String(originalLaunch.model).toLowerCase();
+        if(sameModel||/(?:astra|haiku)/i.test(`${route.policy_id} ${route.model}`))return error('independent_verification_route_unavailable',503);
+      }
     }
     if(managedLabel!==undefined){
       if(route.engine!=='claude'||route.model!=='opus'||route.effort!=='medium'||route.account_id!=='claude')
@@ -590,7 +714,9 @@ export class ProjectDO {
     };
     let contractOmitted = false;
     if (completionControlled) {
-      launchSpec.prompt = promptWithContract(prompt, { ...launchSpec, prompt: '' }, intakeId, sessionId, criteria as string[]);
+      // Verifiers receive their own verdict contract; the implementation
+      // contract would ask them to submit a worker completion claim instead.
+      launchSpec.prompt = verificationOf!==undefined?prompt:promptWithContract(prompt, { ...launchSpec, prompt: '' }, intakeId, sessionId, criteria as string[]);
       // The Machine counts the escaped JSON; a start that fits today must still fit.
       if (new TextEncoder().encode(JSON.stringify(launchSpec)).byteLength > LAUNCH_SPEC_LIMIT) { launchSpec.prompt = prompt; contractOmitted = true; }
     }
@@ -606,14 +732,17 @@ export class ProjectDO {
         const current = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?', intakeId);
         if (current && continuationOf !== undefined && current.session_id !== continuationOf)
           throw new HttpError('intake_already_assigned', 409, 'continuation superseded');
-        if (!current || (current.status !== 'open' && !(current.status === 'queued' && current.session_id === null)&&!this.retryableFailure(current)))
+      const allowedVerification=verificationOf!==undefined&&current?.session_id===verificationOf&&['completed-awaiting-review','failed'].includes(current.status);
+      if (!current || (!allowedVerification&&current.status !== 'open' && !(current.status === 'queued' && current.session_id === null)&&!this.retryableFailure(current)))
           throw new HttpError('intake_already_assigned', 409, !current ? undefined : ['queued','running'].includes(current.status)||current.status==='failed'
             ? `intake is ${current.status} with session ${current.session_id}; stop it first (hub sessions stop ${current.session_id}), then start again on this intake`
             : `intake is ${current.status}; reopen it first (hub intake update ${current.id} --status open), then start again on this intake`);
         this.db.run(`INSERT INTO dispatch_sagas(operation_id, request_digest, request_key, intake_id, session_id, machine_id, account_id, attempt_operation_id, launch_spec_json, routing_json, epoch, state, attempt, next_action_at, last_reason, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending_machine', 0, ?, NULL, ?, ?)`, operationId, digest, key, intakeId, sessionId, machineId, accountId, `${operationId}:0`, JSON.stringify(launchSpec), JSON.stringify({...route,attempted_policy_ids:[route.policy_id],picker,initial_picker:picker,...(completionControlled?{completion_contract:true}:{}),...(contractOmitted?{completion_contract_omitted:'launch_budget'}:{})}), now + 30_000, now, now);
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending_machine', 0, ?, NULL, ?, ?)`, operationId, digest, key, intakeId, sessionId, machineId, accountId, `${operationId}:0`, JSON.stringify(launchSpec), JSON.stringify({...route,attempted_policy_ids:[route.policy_id],picker,initial_picker:picker,...(completionControlled?{completion_contract:true}:{}),...(verificationOf!==undefined?{acceptance_verification:true,verification_of_session_id:verificationOf,verification_origin_session_id:verificationOrigin,verification_attempt:Number(verificationAttempt),exclude_policy_ids:excludedPolicyIds,verification_summary:body.verification_summary??''}:{}),...(contractOmitted?{completion_contract_omitted:'launch_budget'}:{})}), now + 30_000, now, now);
         // A Hub continuation keeps the original requester as the assigned actor.
-        this.db.run("UPDATE intakes SET status = 'queued', assigned_machine_id = ?, assigned_actor_id = ?, session_id = ?, final_evidence_json=NULL, updated_at = ? WHERE id = ?", machineId, continuationOf !== undefined ? current.assigned_actor_id ?? actor?.id ?? 'operator' : actor?.id || 'operator', sessionId, now, intakeId);
+        const assignedActor=verificationOf!==undefined?current.assigned_actor_id??actor?.id??'operator'
+          :continuationOf!==undefined?current.assigned_actor_id??actor?.id??'operator':actor?.id||'operator';
+        this.db.run("UPDATE intakes SET status = 'queued', assigned_machine_id = ?, assigned_actor_id = ?, session_id = ?, final_evidence_json=NULL, updated_at = ? WHERE id = ?", machineId, assignedActor, sessionId, now, intakeId);
         this.appendEvent(intakeId, `start:${operationId}:requested`, actor?.id || 'operator', 'session_start_requested', {
           operation_id: operationId, session_id: sessionId, machine_id: machineId, account_id: accountId, routing_decision: route,...(current.status==='failed'?{retry_of_session:current.session_id}:{}),
         }, now);
@@ -1205,11 +1334,19 @@ export class ProjectDO {
         this.db.run('UPDATE dispatch_sagas SET routing_json=? WHERE operation_id=?',currentSaga.routing_json,saga.operation_id);
       }
       let status:string=finishedStatus,completion:CompletionRecord|undefined;
-      if(this.completionControlled(currentSaga)){
-        const claim=launchFailed?undefined:this.findCompletionClaim(current,saga);
-        status=claim?'completed-awaiting-review':'failed';
-        completion=this.completionOutcome(current,saga,claim,launchFailed?'launch_failed':stopRequested?'stop_requested':deadlineExceeded?'deadline_exceeded'
-          :body.exit_code===0?'exit_without_completion_claim':'native_exit_'+String(body.exit_code),!launchFailed&&!stopRequested,true,now);
+      if(currentSaga&&this.completionControlled(currentSaga)){
+        const route=(this.parse(currentSaga.routing_json) as JsonRecord|null)??{};
+        if(route.acceptance_verification===true){
+          const verdict=launchFailed?undefined:this.findVerificationVerdict(current,saga);
+          completion=this.verificationOutcome(current,currentSaga,verdict,launchFailed?'launch_failed':stopRequested?'stop_requested':deadlineExceeded?'deadline_exceeded'
+            :body.exit_code===0?'verifier_exit_without_verdict':'verifier_exit_'+String(body.exit_code),now);
+          status=completion.outcome==='claimed'?'completed-awaiting-review':'failed';
+        }else{
+          const claim=launchFailed?undefined:this.findCompletionClaim(current,saga);
+          status=claim?'completed-awaiting-review':'failed';
+          completion=this.completionOutcome(current,saga,claim,launchFailed?'launch_failed':stopRequested?'stop_requested':deadlineExceeded?'deadline_exceeded'
+            :body.exit_code===0?'exit_without_completion_claim':'native_exit_'+String(body.exit_code),!launchFailed&&!stopRequested,true,now);
+        }
       }
       this.db.run('UPDATE intakes SET status=?, final_evidence_json=?, updated_at=? WHERE id=?', status, JSON.stringify({ ...stripCompletion(evidence), native_id: body.native_id, exit_code: body.exit_code,native_exit_confirmed:true,
         stop_requested:stopRequested,...(launchFailed?{launch_failed:true}:{}),...(completion?{completion}:{}) }), now, intake.id);
@@ -1253,6 +1390,72 @@ export class ProjectDO {
     return undefined;
   }
 
+  /** The verifier has its own session-bound event and can never reuse the
+   * implementation's completion claim as its verdict. */
+  private findVerificationVerdict(intake:IntakeRow,saga:SagaRow):VerificationVerdict|undefined{
+    const criteria=this.parse(intake.acceptance_criteria_json),count=Array.isArray(criteria)?criteria.length:0;
+    const started=this.db.one<{seq:number}>('SELECT seq FROM intake_events WHERE task_id=? AND event_key=?',intake.id,`start:${saga.operation_id}:requested`)?.seq;
+    if(started===undefined)return undefined;
+    for(const row of this.db.all<{body_json:string}>("SELECT body_json FROM intake_events WHERE task_id=? AND kind='worker_append' AND seq>? ORDER BY seq DESC LIMIT 200",intake.id,started)){
+      const verdict=verificationVerdict((this.parse(row.body_json) as JsonRecord|null)?.evidence,saga.session_id,count);
+      if(verdict)return verdict;
+    }
+    return undefined;
+  }
+
+  /** Turn a verifier exit into one durable result: pass, explicit gaps to send
+   * back to the worker, a bounded verifier retry, or a loud escalation. */
+  private verificationOutcome(intake:IntakeRow,saga:SagaRow,verdict:VerificationVerdict|undefined,reason:string,now:number):CompletionRecord{
+    const route=(this.parse(saga.routing_json) as JsonRecord|null)??{};
+    const attempt=Number(route.verification_attempt),origin=String(route.verification_origin_session_id??'');
+    const picker=(route.picker as JsonRecord|undefined)??{};
+    const excluded=Array.isArray(route.exclude_policy_ids)?route.exclude_policy_ids.filter((v):v is string=>typeof v==='string'):[];
+    if(typeof picker.policy_id==='string'&&!excluded.includes(picker.policy_id))excluded.push(picker.policy_id);
+    const previous=String(route.verification_of_session_id??'');
+    const priorVerifier=previous&&previous!==origin?previous:undefined;
+    const gaps=[...(verdict?.gaps??[])];
+    let mergeBlocked=false,passed=verdict?.verdict==='pass';
+    if(passed&&codeTask(this.parse(intake.source_json))){
+      const gate=this.intakeMergeGate(intake);
+      if(!gate.ok){
+        passed=false;mergeBlocked=true;
+        gaps.push(...mergeGaps(gate));
+      }
+    }
+    const explicit=verdict!==undefined;
+    const depth=this.continuationDepth(intake.id);
+    const retry=!explicit&&attempt<MAX_VERIFICATION_ATTEMPTS;
+    const escalated=!explicit&&!retry;
+    const state:VerificationAction['state']=passed?'passed':explicit?'failed':retry?'pending':'escalated';
+    const verification:VerificationAction={state,key:'verify:'+origin+':'+String(attempt),attempts:Number.isSafeInteger(attempt)?attempt:0,
+      tries:0,next_action_at:retry?now:null,original_session_id:origin,
+      ...(typeof route.verification_summary==='string'&&route.verification_summary?{summary:route.verification_summary}:{}),
+      ...(gaps.length?{gaps}:{}),...(priorVerifier?{previous_verifier_session_id:priorVerifier}:{}),
+      excluded_policy_ids:excluded,...(!explicit?{last_reason:reason}:{})};
+    const record:CompletionRecord={controlled:true,session_id:saga.session_id,outcome:passed?'claimed':'unfinished',
+      reason:passed?'acceptance_verified':explicit?'acceptance_verification_failed':escalated?'verification_exhausted':'verification_incomplete',
+      depth,...(typeof route.verification_summary==='string'&&route.verification_summary?{summary:route.verification_summary}:{}),verification,
+      ...(!passed&&gaps.length?{cause:'Acceptance gaps: '+gaps.join(' | ')}:{})};
+    if(passed){
+      record.delivery={state:'pending',key:'terminal:'+saga.operation_id,tries:0,next_action_at:now};
+    }else if(explicit&&depth<MAX_AUTO_CONTINUATIONS){
+      record.continuation={state:'pending',key:'fix:'+saga.operation_id,tries:0,next_action_at:now};
+    }else if(!retry){
+      record.delivery={state:'pending',key:'terminal:'+saga.operation_id,tries:0,next_action_at:now};
+      this.raiseDeveloperAlert(intake.id,saga.session_id,mergeBlocked?'merge_gate_blocked':'verification_exhausted',record.reason,depth,
+        now,{cause:record.cause??reason});
+    }
+    if(mergeBlocked&&record.continuation){
+      const detail=record.cause??'the PR merge gate is not satisfied';
+      this.raiseDeveloperAlert(intake.id,saga.session_id,'merge_gate_blocked',detail,depth,now,{cause:detail});
+    }
+    this.appendEvent(intake.id,'verification-result:'+saga.operation_id,VERIFICATION_ACTOR,
+      passed?'task_acceptance_verified':explicit?'task_acceptance_verification_failed':'task_verifier_unfinished',
+      {session_id:saga.session_id,original_session_id:origin,attempt,verdict:passed?'pass':explicit?'fail':'missing',reason,
+        ...(gaps.length?{gaps}:{}),...(mergeBlocked?{merge_gate_blocked:true}:{})},now);
+    return record;
+  }
+
   /** Worker appends written after this attempt's start, newest first. */
   private appendsSinceStart(intake:IntakeRow,saga:SagaRow):JsonRecord[]{
     const started=this.db.one<{seq:number}>('SELECT seq FROM intake_events WHERE task_id=? AND event_key=?',intake.id,`start:${saga.operation_id}:requested`)?.seq;
@@ -1291,7 +1494,9 @@ export class ProjectDO {
     const blocker=unfinished?.blocker,hard=continuable&&!!blocker&&HARD_BLOCKERS.includes(blocker.cause);
     const record:CompletionRecord={controlled:true,session_id:saga.session_id,outcome:claim?'claimed':'unfinished',
       reason:claim?'completion_claimed':contractOmitted?'completion_contract_omitted_launch_budget':hard?'blocked_'+blocker!.cause:reason,depth,
-      ...(claim?.summary?{summary:claim.summary}:{}),...(unfinished?{cause:unfinished.cause}:{}),...(blocker?{blocker}:{})};
+      ...(claim?.summary?{summary:claim.summary}:{}),...(claim?{verification:{state:'pending',key:'verify:'+saga.operation_id,attempts:0,tries:0,
+        next_action_at:now,original_session_id:saga.session_id,summary:claim.summary,excluded_policy_ids:[]}}:{}),
+      ...(unfinished?{cause:unfinished.cause}:{}),...(blocker?{blocker}:{})};
     // A fresh session cannot clear a permission, credential or external blocker:
     // never spend the bounded continuations on one. A running job gets time first.
     if(!claim&&continuable&&!contractOmitted&&!hard&&depth<MAX_AUTO_CONTINUATIONS)
@@ -1347,12 +1552,23 @@ export class ProjectDO {
         ({intake,record}=fixed);
       }
       try{
-        if(record.continuation?.state==='pending')await this.continueTask(intake,record);
+        if(record.verification?.state==='pending')await this.startVerification(intake,record);
+        else if(record.continuation?.state==='pending')await this.continueTask(intake,record);
         else if(record.delivery?.state==='pending')await this.deliverOutcome(intake,record);
       }catch(caught){
         // Never let one record spin the alarm: back off, then give up bounded.
         console.error('[hub2] completion action failed:',caught);
         this.saveCompletion(intake,next=>{
+          if(next.verification?.state==='pending'){
+            const verification=next.verification;
+            verification.tries++;verification.last_reason='internal_error';
+            if(verification.tries>=MAX_VERIFICATION_START_TRIES){
+              verification.state='escalated';verification.next_action_at=null;
+              next.delivery={state:'pending',key:'terminal:'+verification.original_session_id,tries:0,next_action_at:Date.now()};
+              this.raiseDeveloperAlert(intake.id,record.session_id,'verification_start_failed','internal_error',record.depth,Date.now());
+            }else verification.next_action_at=Date.now()+retryDelay(verification.tries);
+            return;
+          }
           const action=next.continuation?.state==='pending'?next.continuation:next.delivery;
           if(!action)return;
           action.tries++;action.last_reason='internal_error';
@@ -1370,6 +1586,73 @@ export class ProjectDO {
         });
       }
     }
+  }
+
+  /** Start a read-only verifier as a normal durable Hub session. The stable
+   * idempotency key means a crash after dispatch cannot start a duplicate. */
+  private async startVerification(intake:IntakeRow,record:CompletionRecord):Promise<void>{
+    const action=record.verification!,origin=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id=? AND intake_id=?',action.original_session_id,intake.id);
+    const previous=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id=? AND intake_id=?',record.session_id,intake.id);
+    if(!origin||!previous||intake.session_id!==record.session_id){
+      this.saveCompletion(intake,next=>{
+        if(!next.verification)return;
+        next.verification.state='escalated';next.verification.next_action_at=null;next.verification.last_reason='verification_origin_missing';
+        next.delivery={state:'pending',key:'terminal:'+record.session_id,tries:0,next_action_at:Date.now()};
+        this.raiseDeveloperAlert(intake.id,record.session_id,'verification_start_failed','verification_origin_missing',record.depth,Date.now());
+      });
+      return;
+    }
+    const attempt=action.attempts+1;
+    if(attempt>MAX_VERIFICATION_ATTEMPTS){
+      this.saveCompletion(intake,next=>{
+        if(!next.verification)return;
+        next.verification.state='escalated';next.verification.next_action_at=null;next.verification.last_reason='verification_attempt_limit';
+        next.delivery={state:'pending',key:'terminal:'+record.session_id,tries:0,next_action_at:Date.now()};
+        this.raiseDeveloperAlert(intake.id,record.session_id,'verification_exhausted','verification_attempt_limit',record.depth,Date.now());
+      });
+      return;
+    }
+    const excluded=new Set(action.excluded_policy_ids);
+    for(const saga of [origin,previous]){
+      const route=(this.parse(saga.routing_json) as JsonRecord|null)??{},picker=route.picker as JsonRecord|undefined;
+      if(typeof picker?.policy_id==='string')excluded.add(picker.policy_id);
+    }
+    const key='verify:'+action.original_session_id+':'+attempt;
+    const hash=await sha256Hex(JSON.stringify(['hub2-start-session-v1',intake.project,intake.id,key]));
+    const verifierSessionId=`${hash.slice(0,8)}-${hash.slice(8,12)}-5${hash.slice(13,16)}-a${hash.slice(17,20)}-${hash.slice(20,32)}`;
+    const criteria=this.parse(intake.acceptance_criteria_json);
+    const prompt=verificationPrompt(intake.id,verifierSessionId,action.original_session_id,attempt,
+      action.summary??record.summary??'',Array.isArray(criteria)?criteria.map(String):[]);
+    const originalLaunch=this.parse(origin.launch_spec_json) as JsonRecord;
+    const body:JsonRecord={key,workspace:boundWorkspace(originalLaunch,this.workspaceBinding(origin)),prompt,purpose:'review',
+      timeout_seconds:1800,verification_of_session_id:record.session_id,verification_origin_session_id:action.original_session_id,
+      verification_attempt:attempt,verification_summary:action.summary??record.summary??'',exclude_policy_ids:[...excluded]};
+    body.machine_id=origin.machine_id;
+    const actor:Actor={id:VERIFICATION_ACTOR,kind:'agent',resource_id:intake.project,scopes:['session:start','intake:read','project:'+intake.project]};
+    let outcome:{state:'started'|'retry'|'refused';reason?:string;session_id?:string};
+    try{
+      const response=await this.startIntake(new Request('https://project.internal/api/intakes/'+encodeURIComponent(intake.id)+'/start',{
+        method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(actor)},body:JSON.stringify(body)}),intake.id);
+      const result=await response.json().catch(()=>({})) as JsonRecord;
+      if(response.ok)outcome={state:'started',session_id:String((result.session as JsonRecord|undefined)?.id??verifierSessionId)};
+      else outcome={state:response.status>=500||response.status===429?'retry':'refused',reason:String(result.error??response.status)};
+    }catch{outcome={state:'retry',reason:'verification_start_uncertain'};}
+    if(outcome.state==='started'){
+      this.transaction(()=>this.appendEvent(intake.id,key,VERIFICATION_ACTOR,'task_verification_started',
+        {original_session_id:action.original_session_id,previous_session_id:record.session_id,session_id:outcome.session_id??verifierSessionId,
+          attempt,excluded_policy_ids:[...excluded]},Date.now()));
+      return;
+    }
+    const tries=action.tries+1,exhausted=outcome.state==='refused'||tries>=MAX_VERIFICATION_START_TRIES;
+    this.saveCompletion(intake,next=>{
+      const verification=next.verification;if(!verification)return;
+      verification.tries=tries;verification.last_reason=outcome.reason??'verification_start_failed';
+      if(exhausted){
+        verification.state='escalated';verification.next_action_at=null;
+        next.delivery={state:'pending',key:'terminal:'+record.session_id,tries:0,next_action_at:Date.now()};
+        this.raiseDeveloperAlert(intake.id,record.session_id,'verification_start_failed',verification.last_reason,record.depth,Date.now());
+      }else verification.next_action_at=Date.now()+retryDelay(tries);
+    },exhausted?{key:key+':refused',kind:'task_verification_start_refused',body:{session_id:record.session_id,attempt,reason:outcome.reason??null,tries}}:undefined);
   }
 
   /** Loud, durable alert to the Hub developer (never the requester's channels)
@@ -1441,10 +1724,12 @@ export class ProjectDO {
   }
 
   private async continueTask(intake:IntakeRow,record:CompletionRecord):Promise<void>{
-    const action=record.continuation!,saga=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id=?',record.session_id);
+    const action=record.continuation!,previousSaga=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id=?',record.session_id);
+    const fixingVerification=record.verification?.state==='failed';
+    const saga=fixingVerification?this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id=? AND intake_id=?',record.verification!.original_session_id,intake.id):previousSaga;
     const launch=saga?this.parse(saga.launch_spec_json) as JsonRecord:undefined;
     let outcome:{state:'started'|'superseded'|'retry'|'refused';reason?:string;session_id?:string};
-    if(!saga||!launch||intake.session_id!==record.session_id)outcome={state:'superseded',reason:'attempt_replaced'};
+    if(!previousSaga||!saga||!launch||intake.session_id!==record.session_id)outcome={state:'superseded',reason:'attempt_replaced'};
     else{
       const route=this.parse(saga.routing_json) as JsonRecord|null;
       const timeout=Number(launch.timeout_seconds)||1800,depth=record.depth+1;
@@ -1459,7 +1744,8 @@ export class ProjectDO {
       // escaped-JSON bytes so the complete contract still fits the Machine limit.
       const criteria=this.parse(intake.acceptance_criteria_json),next={...launch,workspace:body.workspace,timeout_seconds:body.timeout_seconds,prompt:''};
       const budget=continuationBudget(next,intake.id,Array.isArray(criteria)?criteria.map(String):[]);
-      body.prompt=continuationPrompt(intake.id,depth,record.session_id,record.reason,basePrompt(String(launch.prompt??''))||intake.text,this.continuationSnapshot(intake,action.snapshot_seq??this.latestSeq(intake.id)),budget);
+      const reason=fixingVerification?`${record.reason}: ${record.cause??record.verification?.gaps?.join(' | ')??'acceptance criteria were not met'}`:record.reason;
+      body.prompt=continuationPrompt(intake.id,depth,record.session_id,reason,basePrompt(String(launch.prompt??''))||intake.text,this.continuationSnapshot(intake,action.snapshot_seq??this.latestSeq(intake.id)),budget);
       const actor:Actor={id:COMPLETION_ACTOR,kind:'agent',resource_id:intake.project,scopes:['session:start','intake:read','project:'+intake.project]};
       try{
         const response=await this.startIntake(new Request('https://project.internal/api/intakes/'+encodeURIComponent(intake.id)+'/start',{method:'POST',

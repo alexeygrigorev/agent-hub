@@ -6,4 +6,5 @@ await import('./session-start-cwd.test.ts');
 await import('./start-picker-evidence.test.ts');
 await import('./session-link.test.ts');
 await import('./task-completion.test.ts');
+await import('./task-completion-cli.test.ts');
 await import('./intake-relations.test.ts');
