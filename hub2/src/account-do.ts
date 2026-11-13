@@ -26,6 +26,18 @@ type Account={provider:string;enabled:number;min_remaining:number};
 type Quota={remaining:number;captured_at:number;valid_until:number;reset_at:number|null;source:string};
 type RoutingCredentialStatus={credential_usable:boolean;credential_status:'ready'|'expired'|'refresh_failed'|'missing'|'unknown'};
 const ROUTING_REFRESH_MINIMUM_MS=5*60_000;
+// Proactive Claude renewal: one durable, secret-free row per credential
+// generation. Created idempotently after schema init so a code rollback never
+// meets a newer schema version.
+const RENEWAL_TABLE='CREATE TABLE IF NOT EXISTS credential_renewal(id INTEGER PRIMARY KEY CHECK(id=1),generation INTEGER NOT NULL,access_expires_at INTEGER,next_at INTEGER,attempts INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL,reason TEXT,updated_at INTEGER NOT NULL)';
+const RENEWAL_LEAD_MS=20*60_000;
+const RENEWAL_HORIZON_MS=6*3600_000;
+const RENEWAL_RETRY_BASE_MS=30_000;
+const RENEWAL_RETRY_CAP_MS=5*60_000;
+const RENEWAL_MAX_ATTEMPTS=6;
+const RENEWAL_SCHEDULE_PASSES=4;
+const RENEWAL_ACTIVE=['scheduled','retrying'];
+type Renewal={generation:number;access_expires_at:number|null;next_at:number|null;attempts:number;status:string;reason:string|null;updated_at:number};
 const DROP_SESSION_CAPACITY = ['DROP TABLE IF EXISTS reservations', 'ALTER TABLE account DROP COLUMN capacity', 'ALTER TABLE account DROP COLUMN occupied'];
 /** Provider credentials and quota only; Hub session capacity is global and measured on hosts. */
 export class AccountDO {
@@ -33,11 +45,19 @@ export class AccountDO {
  private readonly db:MeteredDb;
  private readonly sqlReceipts:SqlReceiptMeter;
  private readonly env:AccountEnv;
- constructor(private readonly ctx:DurableObjectState,env:AccountEnv={}){this.db=new MeteredDb(ctx.storage.sql);this.sqlReceipts=new SqlReceiptMeter(this.db);this.env=wrapSqlNamespaces(env,this.sqlReceipts) as AccountEnv;initializeSchema(ctx,this.db,2,SCHEMA,[DROP_SESSION_CAPACITY],undefined,2);}
+ constructor(private readonly ctx:DurableObjectState,env:AccountEnv={}){this.db=new MeteredDb(ctx.storage.sql);this.sqlReceipts=new SqlReceiptMeter(this.db);this.env=wrapSqlNamespaces(env,this.sqlReceipts) as AccountEnv;initializeSchema(ctx,this.db,2,SCHEMA,[DROP_SESSION_CAPACITY],()=>this.initializeRenewal(),2);}
  async fetch(request:Request):Promise<Response>{
   return this.sqlReceipts.measure(()=>this.handleFetch(request),request.headers.get(SQL_PROBE_HEADER));
  }
  private async handleFetch(request:Request):Promise<Response>{
+  const before=this.credentialGeneration();
+  const response=await this.route(request);
+  // Every maintained path that can publish, import or repair a generation
+  // re-arms the expiry-driven renewal alarm; read-only views stay passive.
+  if(request.method!=='GET'||this.credentialGeneration()!==before)await this.rearmRenewal();
+  return response;
+ }
+ private async route(request:Request):Promise<Response>{
   try{
    const p=new URL(request.url).pathname,a=actorFrom(request),method=request.method;
    if(p==='/api/account/rotation'||p==='/api/account/refresh-lease'||p==='/api/account/credential-rejection'||p==='/api/account/reconcile'||p==='/api/account/refresh-outcome')return await this.rotationRoute(request,a,p);
@@ -46,6 +66,7 @@ export class AccountDO {
    if(p==='/api/account/discovery')return await this.discovery(request,a);
    if(p==='/api/account/alerts'&&method==='GET')return this.alerts(request,a);
    if(p==='/api/account/maintain'&&method==='POST')return await this.maintain(a);
+   if(p==='/api/account/renewal'&&method==='GET')return this.renewalView(a);
    if(p==='/_internal/routing-snapshot'&&method==='GET')return this.routingView(await this.routingCredentialStatus(true));
    if(p==='/_internal/routing'&&method==='GET'){
     const credential=await this.routingCredentialStatus();
@@ -77,6 +98,9 @@ export class AccountDO {
    credential=await this.routingCredentialStatus(true);
   }
   const generation=this.db.one<{generation:number}>('SELECT generation FROM credentials WHERE id=1')?.generation??null;
+  // Explicit operator maintenance re-evaluates renewal from the current
+  // generation, including a stopped refused/uncertain/exhausted state.
+  this.db.run('DELETE FROM credential_renewal WHERE id=1');
   return json({generation,status:credential.credential_status,quota,...(reason?{reason}:{})});
  }
  private async routingCredentialStatus(passive=false):Promise<RoutingCredentialStatus>{
@@ -159,15 +183,31 @@ export class AccountDO {
   return json({account:account||null,quota:quota||null,fresh:!!quota&&quota.valid_until>Date.now()});
  }
  private async schedule():Promise<void>{
-  const due:number[]=[];
-  this.db.alarmOperation();const discovery=this.db.one<{next_at:number}>('SELECT next_at FROM discovery WHERE id=1 AND enabled=1');if(discovery)due.push(discovery.next_at);
-  const grants=this.db.all<{id:string;expires_at:number}>('SELECT id,expires_at FROM reset_grants WHERE available=1 ORDER BY expires_at,id LIMIT 33');
-  if(grants.length>32)throw new HttpError('reset_observation_limit',503);
-  for(const g of grants){const key='reset:'+g.id+':'+g.expires_at+':24h';if(g.expires_at>Date.now()&&!this.db.one('SELECT id FROM alerts WHERE id=?',key))due.push(Math.max(Date.now()+100,g.expires_at-86400000));}
-  if(due.length)await this.ctx.storage.setAlarm(Math.max(Date.now()+100,Math.min(...due)));else await this.ctx.storage.deleteAlarm();
+  this.db.alarmOperation();
+  // The renewal read awaits an unseal. A concurrent import/rotation can publish
+  // a newer generation (and rearm it) meanwhile, so a result computed for a
+  // superseded generation is never published: recompute, bounded, and leave
+  // the newer generation's alarm untouched if it keeps moving.
+  for(let pass=0;pass<RENEWAL_SCHEDULE_PASSES;pass++){
+   const due:number[]=[],startGeneration=this.credentialGeneration();
+   const discovery=this.db.one<{next_at:number}>('SELECT next_at FROM discovery WHERE id=1 AND enabled=1');if(discovery)due.push(discovery.next_at);
+   const grants=this.db.all<{id:string;expires_at:number}>('SELECT id,expires_at FROM reset_grants WHERE available=1 ORDER BY expires_at,id LIMIT 33');
+   if(grants.length>32)throw new HttpError('reset_observation_limit',503);
+   for(const g of grants){const key='reset:'+g.id+':'+g.expires_at+':24h';if(g.expires_at>Date.now()&&!this.db.one('SELECT id FROM alerts WHERE id=?',key))due.push(Math.max(Date.now()+100,g.expires_at-86400000));}
+   const renewal=await this.renewalDue();
+   if(renewal==='superseded'||this.credentialGeneration()!==startGeneration)continue;
+   // Unknown is not "no work": keep a bounded retry instead of dropping the alarm.
+   if(renewal==='unknown')due.push(Date.now()+RENEWAL_RETRY_CAP_MS);else if(renewal!==null)due.push(renewal);
+   // Fenced: no await between the generation check above and the publish below.
+   if(due.length)await this.ctx.storage.setAlarm(Math.max(Date.now()+100,Math.min(...due)));else await this.ctx.storage.deleteAlarm();
+   return;
+  }
  }
  async alarm():Promise<void>{
   this.resetAlerts();
+  // Renew before any due discovery probe so it observes the fresh generation;
+  // discovery keeps its own next_at and is never advanced by a renewal wake.
+  await this.renewIfDue();
   const d=this.db.one<{next_at:number;interval_ms:number}>('SELECT next_at,interval_ms FROM discovery WHERE id=1 AND enabled=1');
   if(d&&d.next_at<=Date.now()){this.db.run('UPDATE discovery SET next_at=? WHERE id=1',Date.now()+d.interval_ms);await this.collect();}
   await this.schedule();
@@ -195,6 +235,8 @@ export class AccountDO {
    const query=new URL(r.url).searchParams,requested=query.get('refresh_lease'),repairLease=!!requested&&row.refresh_owner===machine&&row.refresh_lease===requested;
    if(requested&&!repairLease)return error('refresh_permit_mismatch',409);
    const account=this.db.one<Account>('SELECT * FROM account WHERE id=1');if(!account)return error('account_unconfigured',409);
+   // Dedicated passive material retrieval: never refreshes, leases, calls the provider or writes.
+   if(query.has('passive_generation'))return await this.passiveCredential(machine,account,query);
    if(query.get('metadata')==='1')return json({generation:row.generation,provider:account.provider,refresh_mode:account.provider==='zai'?'static':'central'});
    if(query.has('expected_generation')){
     // Exact-generation observation for a host release re-pin: synchronous,
@@ -220,10 +262,7 @@ export class AccountDO {
    if(!repairLease&&this.db.one('SELECT host_id FROM credential_rejections WHERE host_id=? AND generation=?',machine,row.generation))return error('credential_generation_rejected',409);
    const expires=this.accessExpiry(account.provider,files);
    if(!repairLease&&account.provider!=='zai'&&minimum>0&&(expires===null||expires<=Date.now()+minimum))return error('access_lifetime_insufficient',409);
-   if(!repairLease&&account.provider!=='zai'){
-    const strip=(v:any):void=>{if(v&&typeof v==='object')for(const key of Object.keys(v)){if(key.toLowerCase().includes('refresh')&&typeof v[key]==='string')v[key]='';else strip(v[key]);}};
-    files={...files};for(const path of Object.keys(files))if(path.endsWith('.json')||path.endsWith('antigravity-oauth-token')){const auth=JSON.parse(files[path]),lastRefresh=path==='.codex/auth.json'&&typeof auth.last_refresh==='string'&&Number.isFinite(Date.parse(auth.last_refresh))?auth.last_refresh:undefined;strip(auth);if(lastRefresh!==undefined)auth.last_refresh=lastRefresh;files[path]=JSON.stringify(auth);}
-   }
+   if(!repairLease&&account.provider!=='zai')files=this.stripRefreshMaterial(files);
    return json({generation:row.generation,provider:account.provider,files,access_expires_at:expires,refresh_material:repairLease,static_key:account.provider==='zai'});
   }
   if(r.method==='POST'){
@@ -511,6 +550,144 @@ export class AccountDO {
    this.db.run('UPDATE credentials SET generation=?,sealed=?,refresh_until=0,refresh_owner=NULL,refresh_lease=NULL WHERE id=1',base+1,sealed);if(row.refresh_lease)this.db.run('UPDATE credential_candidates SET state=? WHERE id=?','published',row.refresh_lease);
    this.db.run('UPDATE quota SET valid_until=0 WHERE id=1');if(candidate)this.db.run('UPDATE credential_candidates SET state=? WHERE id=?','published',candidate);return json({generation:base+1});
   });return result;
+ }
+ private credentialGeneration():number|null{
+  try{return this.db.one<{generation:number}>('SELECT generation FROM credentials WHERE id=1')?.generation??null;}catch{return null;}
+ }
+ private renewalApplicable():boolean{
+  return this.db.one<Account>('SELECT * FROM account WHERE id=1')?.provider==='claude'&&this.credentialGeneration()!==null;
+ }
+ private renewalRow():Renewal|undefined{
+  return this.db.one<Renewal>('SELECT generation,access_expires_at,next_at,attempts,status,reason,updated_at FROM credential_renewal WHERE id=1');
+ }
+ private async initializeRenewal():Promise<void>{
+  this.db.run(RENEWAL_TABLE);
+  // Existing and imported credentials arm on first construction (any fetch or
+  // a restored alarm), never by exporting or re-importing material.
+  try{if(this.renewalApplicable())await this.schedule();}catch{}
+ }
+ private async rearmRenewal():Promise<void>{
+  try{if(this.renewalApplicable())await this.schedule();}catch{}
+ }
+ private renewalTarget(expires:number|null,now:number):number{
+  if(expires===null)return now;
+  return Math.min(now+RENEWAL_HORIZON_MS,Math.max(now,expires-RENEWAL_LEAD_MS));
+ }
+ private renewalCode(e:unknown):string{
+  const code=e instanceof HttpError?e.code:e instanceof Error?e.message:'';
+  return /^[a-z_]{1,80}$/.test(code)?code:'renewal_failed';
+ }
+ /** Next renewal wake for the current Claude generation; null only when there is authoritatively no work, 'superseded' when a newer generation appeared mid-read, 'unknown' on an unexpected failure. Never throws. */
+ private async renewalDue():Promise<number|null|'superseded'|'unknown'>{
+  try{
+   const account=this.db.one<Account>('SELECT * FROM account WHERE id=1');
+   const cred=this.db.one<{generation:number;sealed:string}>('SELECT generation,sealed FROM credentials WHERE id=1');
+   if(account?.provider!=='claude'||!cred)return null;
+   let row=this.renewalRow();
+   if(!row||row.generation!==cred.generation){
+    const now=Date.now();let expires:number|null=null,status='scheduled',next:number|null=now,reason:string|null=null;
+    try{
+     const files=await this.unseal(cred.sealed,'claude',cred.generation) as Record<string,string>;
+     const auth=JSON.parse(files[PATHS.claude[0]]);expires=this.accessExpiry('claude',files);
+     if(typeof auth?.claudeAiOauth?.refreshToken!=='string'||!auth.claudeAiOauth.refreshToken){status='no_refresh_token';next=null;}
+     else next=this.renewalTarget(expires,now);
+    }catch(e){reason=this.renewalCode(e);} // Due now: the attempt records a bounded retry.
+    // Write only if no newer generation or concurrent row appeared while unsealing.
+    if(this.credentialGeneration()!==cred.generation)return 'superseded';
+    const latest=this.renewalRow();
+    if(!latest||latest.generation!==cred.generation)
+     this.db.run('INSERT INTO credential_renewal(id,generation,access_expires_at,next_at,attempts,status,reason,updated_at) VALUES(1,?,?,?,0,?,?,?) ON CONFLICT(id) DO UPDATE SET generation=excluded.generation,access_expires_at=excluded.access_expires_at,next_at=excluded.next_at,attempts=0,status=excluded.status,reason=excluded.reason,updated_at=excluded.updated_at',cred.generation,expires,next,status,reason,now);
+    row=this.renewalRow();
+   }else if(row.status==='uncertain'&&!this.hasUnresolvedRefresh(row.generation)){
+    // The exact lease owner proved no refresh happened; resume bounded retries.
+    const now=Date.now();
+    this.db.run("UPDATE credential_renewal SET status='retrying',next_at=?,updated_at=? WHERE id=1 AND generation=?",now,now,row.generation);row=this.renewalRow();
+   }
+   if(this.credentialGeneration()!==cred.generation)return 'superseded';
+   return row&&RENEWAL_ACTIVE.includes(row.status)&&row.next_at!==null?row.next_at:null;
+  }catch{return 'unknown';}
+ }
+ /** Alarm work: renew the current Claude generation through the central lease/CAS path. */
+ private async renewIfDue():Promise<void>{
+  let generation:number;
+  try{
+   const row=this.renewalRow(),cred=this.db.one<{generation:number;sealed:string}>('SELECT generation,sealed FROM credentials WHERE id=1');
+   if(this.db.one<Account>('SELECT * FROM account WHERE id=1')?.provider!=='claude'||!cred||!row||row.generation!==cred.generation
+    ||!RENEWAL_ACTIVE.includes(row.status)||row.next_at===null||row.next_at>Date.now())return;
+   generation=cred.generation;
+  }catch{return;}
+  try{
+   const cred=this.db.one<{sealed:string}>('SELECT sealed FROM credentials WHERE id=1 AND generation=?',generation);if(!cred)return;
+   const files=await this.unseal(cred.sealed,'claude',generation) as Record<string,string>;
+   if(!this.needsRefresh('claude',files,RENEWAL_LEAD_MS+1000)){
+    const auth=JSON.parse(files[PATHS.claude[0]]),expires=this.accessExpiry('claude',files),now=Date.now();
+    const usable=typeof auth?.claudeAiOauth?.refreshToken==='string'&&!!auth.claudeAiOauth.refreshToken;
+    this.db.run('UPDATE credential_renewal SET access_expires_at=?,next_at=?,status=?,updated_at=? WHERE id=1 AND generation=?',expires,usable?this.renewalTarget(expires,now):null,usable?'scheduled':'no_refresh_token',now,generation);
+    return;
+   }
+   await this.refresh('claude',files,generation);
+   this.db.run("UPDATE credential_renewal SET status='renewed',next_at=NULL,reason=NULL,updated_at=? WHERE id=1 AND generation=?",Date.now(),generation);
+  }catch(e){try{this.renewalFailed(generation,e);}catch{}}
+ }
+ private renewalFailed(generation:number,e:unknown):void{
+  const code=this.renewalCode(e),now=Date.now();
+  const current=this.db.one<{generation:number;refresh_until:number}>('SELECT generation,refresh_until FROM credentials WHERE id=1');
+  const row=this.renewalRow();
+  if(current?.generation!==generation||row?.generation!==generation)return; // A newer generation re-arms itself.
+  let status:string,next:number|null=null;
+  if(/^provider_refresh_(invalid_grant|invalid_client|access_denied|invalid_request)$/.test(code))status='refused';
+  else if(code==='refresh_in_progress'&&current.refresh_until>now&&row.attempts+1<RENEWAL_MAX_ATTEMPTS){
+   // A live host or central lease owns this generation: wait for it, bounded.
+   status='retrying';next=Math.max(now+Math.min(RENEWAL_RETRY_CAP_MS,RENEWAL_RETRY_BASE_MS*2**row.attempts),current.refresh_until+1000);
+  }
+  else if(this.hasUnresolvedRefresh(generation))status='uncertain'; // Never replay a possibly-rotated refresh token.
+  else if(row.attempts+1>=RENEWAL_MAX_ATTEMPTS)status='exhausted';
+  else{status='retrying';next=now+Math.min(RENEWAL_RETRY_CAP_MS,RENEWAL_RETRY_BASE_MS*2**row.attempts);}
+  this.db.run('UPDATE credential_renewal SET attempts=attempts+1,status=?,next_at=?,reason=?,updated_at=? WHERE id=1 AND generation=?',status,next,code,now,generation);
+  if(status!=='retrying')this.recordCredentialAlert('credential_renewal_'+status,generation);
+ }
+ private renewalView(a:Actor|undefined):Response{
+  if(!hasScope(a,'quota:read')&&!hasScope(a,'operator:admin'))return error('forbidden',403);
+  const provider=this.db.one<Account>('SELECT * FROM account WHERE id=1')?.provider??null,row=this.renewalRow();
+  // Secret-free by construction: the row never holds token material.
+  return json({provider,renewal:row&&provider==='claude'?{generation:row.generation,status:row.status,attempts:row.attempts,next_at:row.next_at,access_expires_at:row.access_expires_at,reason:row.reason,updated_at:row.updated_at}:null});
+ }
+ /** Recursively blanks refresh-token strings (preserving Codex last_refresh); returns a copy. */
+ private stripRefreshMaterial(input:Record<string,string>):Record<string,string>{
+  const strip=(v:any):void=>{if(v&&typeof v==='object')for(const key of Object.keys(v)){if(key.toLowerCase().includes('refresh')&&typeof v[key]==='string')v[key]='';else strip(v[key]);}};
+  const files={...input};
+  for(const path of Object.keys(files))if(path.endsWith('.json')||path.endsWith('antigravity-oauth-token')){const auth=JSON.parse(files[path]),lastRefresh=path==='.codex/auth.json'&&typeof auth.last_refresh==='string'&&Number.isFinite(Date.parse(auth.last_refresh))?auth.last_refresh:undefined;strip(auth);if(lastRefresh!==undefined)auth.last_refresh=lastRefresh;files[path]=JSON.stringify(auth);}
+  return files;
+ }
+ /**
+  * Approved-host passive retrieval of the exact current Claude generation.
+  * Reads and unseals only: no refresh, lease, provider call, ack or write. The
+  * host/generation/rejection/lease/uncertainty gate runs before and again after
+  * the awaited unseal, so material is never returned for a superseded state.
+  */
+ private async passiveCredential(machine:string,account:Account,query:URLSearchParams):Promise<Response>{
+  const raw=query.get('passive_generation')||'';
+  if([...query.keys()].length!==1||!/^[1-9][0-9]{0,15}$/.test(raw)||!Number.isSafeInteger(Number(raw)))return error('invalid_passive_generation',400);
+  if(account.provider!=='claude')return error('account_provider_mismatch',409);
+  const generation=Number(raw);
+  const gate=():Response|null=>{
+   const row=this.db.one<{generation:number;refresh_owner:string|null;refresh_until:number|null;refresh_lease:string|null}>('SELECT generation,refresh_owner,refresh_until,refresh_lease FROM credentials WHERE id=1');
+   if(!row)return error('credentials_unavailable',503);
+   if(!this.db.one('SELECT id FROM approved_hosts WHERE id=?',machine))return error('host_not_approved',403);
+   if(row.generation!==generation)return error('generation_conflict',409);
+   if(this.db.one('SELECT host_id FROM credential_rejections WHERE host_id=? AND generation=?',machine,generation))return error('credential_generation_rejected',409);
+   if(Number(row.refresh_until||0)>Date.now()||row.refresh_owner||row.refresh_lease)return error('refresh_in_progress',409);
+   if(this.hasUnresolvedRefresh(generation))return error('refresh_outcome_uncertain',503);
+   return null;
+  };
+  const before=gate();if(before)return before;
+  const sealed=this.db.one<{sealed:string}>('SELECT sealed FROM credentials WHERE id=1 AND generation=?',generation);
+  if(!sealed)return error('generation_conflict',409);
+  const files=await this.unseal(sealed.sealed,'claude',generation) as Record<string,string>;
+  const after=gate();if(after)return after;
+  const expires=this.accessExpiry('claude',files);
+  if(expires===null||expires<=Date.now())return error('access_lifetime_insufficient',409);
+  return json({generation,provider:'claude',files:this.stripRefreshMaterial(files),access_expires_at:expires,refresh_material:false,static_key:false,passive:true});
  }
  private hasUnresolvedRefresh(generation:number):boolean{
   return ['issued','pending'].some(state=>!!this.db.one('SELECT id FROM credential_candidates WHERE base_generation=? AND state=? ORDER BY id LIMIT 1',generation,state));
