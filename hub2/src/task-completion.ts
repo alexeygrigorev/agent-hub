@@ -56,16 +56,17 @@ export type VerificationAction = {
   last_reason?: string | null;
 };
 /** Causes a session can declare in a `task_blocked` record. */
-export const BLOCKER_CAUSES = ['permission', 'credential', 'external', 'waiting', 'other'] as const;
+export const BLOCKER_CAUSES = ['permission', 'credential', 'external', 'deploy_pending', 'waiting', 'other'] as const;
 export type BlockerCause = typeof BLOCKER_CAUSES[number];
 /** Blockers a fresh session on the same worker cannot clear: Hub alerts the
  * developer at once instead of spending its bounded continuations on them
  * (12 Nov 2026: four intakes burnt every continuation in 1-3 minutes each on a
  * 403, a revoked portal token and a deploy owned by another session). */
-export const HARD_BLOCKERS: readonly BlockerCause[] = ['permission', 'credential', 'external'];
+export const HARD_BLOCKERS: readonly BlockerCause[] = ['permission', 'credential', 'external', 'deploy_pending'];
 /** A `waiting` blocker (CI, deploy still running) is continued after this delay. */
 export const BLOCKED_WAIT_MS = 15 * 60_000;
-export type TaskBlocker = { cause: BlockerCause; detail: string; next_step?: string };
+/** `deploy_pending`: the work is merged and only the deploy (by `deploy_owner`) is missing; never reported as a failure. */
+export type TaskBlocker = { cause: BlockerCause; detail: string; next_step?: string; deploy_owner?: string };
 export type CompletionRecord = {
   controlled: true; session_id: string; outcome: 'claimed' | 'unfinished'; reason: string;
   depth: number; summary?: string; verification?: VerificationAction; continuation?: CompletionAction; delivery?: CompletionAction;
@@ -106,8 +107,8 @@ export function completionContract(intakeId: string, sessionId: string, criteria
     + `with <file> containing {"kind":"session_finished","session_id":"${sessionId}","summary":"<what was delivered>","acceptance":[{"status":"met","proof":"<commit, PR, CI, deploy or live evidence>"}]} and exactly one acceptance entry per criterion, in order. This tells Hub to start independent acceptance verification as soon as the native session ends.\n`
     + `If you cannot finish, do not write that record. Append a note with the current state and the next step (hub intake append ${intakeId} --note "..."). If something outside this session blocks you, also write a blocker record before you exit:\n`
     + `  hub intake append ${intakeId} --key blocked-${sessionId} --version 1 --event-file <file>\n`
-    + `with <file> containing {"kind":"task_blocked","session_id":"${sessionId}","cause":"<permission|credential|external|waiting|other>","detail":"<exact error or missing dependency>","next_step":"<who must do what>"}. `
-    + `permission = Hub/API access denied (403/404) to this worker; credential = expired or revoked login or token; external = another owner must act first (deploy, review, decision); waiting = a running job (CI, deploy) needs more time; other = anything else. `
+    + `with <file> containing {"kind":"task_blocked","session_id":"${sessionId}","cause":"<permission|credential|external|deploy_pending|waiting|other>","detail":"<exact error or missing dependency>","next_step":"<who must do what>","deploy_owner":"<required for deploy_pending>"}. `
+    + `permission = Hub/API access denied (403/404) to this worker; credential = expired or revoked login or token; external = another owner must act first (review, decision); deploy_pending = everything is merged and only the deploy by its named deploy_owner is missing; waiting = a running job (CI, deploy) needs more time; other = anything else. `
     + `Hub does not restart a session into a permission, credential or external blocker; it alerts the developer with your cause. Otherwise Hub continues unfinished tasks itself (bounded) and delivers the outcome to the requester.`;
   const header = `Acceptance criteria (${criteria.length}; full text: hub intake show ${intakeId}):\n`;
   const fixed = jsonBytes(CONTRACT_MARKER + head + header + tail);
@@ -283,7 +284,9 @@ export function taskBlocker(evidence: unknown, sessionId: string): TaskBlocker |
   const cause: BlockerCause = (BLOCKER_CAUSES as readonly string[]).includes(raw) ? raw as BlockerCause : 'other';
   const detail = typeof record.detail === 'string' ? oneLine(record.detail) : '';
   const next = typeof record.next_step === 'string' ? oneLine(record.next_step) : '';
-  return { cause, detail: clip(detail || 'no detail given', 600), ...(next ? { next_step: clip(next, 400) } : {}) };
+  const owner = typeof record.deploy_owner === 'string' ? oneLine(record.deploy_owner) : '';
+  return { cause, detail: clip(detail || 'no detail given', 600), ...(next ? { next_step: clip(next, 400) } : {}),
+    ...(cause === 'deploy_pending' ? { deploy_owner: clip(owner || 'unnamed (needs an owner)', 120) } : {}) };
 }
 
 const REASON_TEXT: Record<string, string> = {
@@ -295,6 +298,7 @@ const REASON_TEXT: Record<string, string> = {
 /** One human-readable cause for an unfinished exit: the session's blocker
  * record, else its newest note, else the exit reason itself. */
 export function exitCause(reason: string, blocker?: TaskBlocker, lastNote?: string): string {
+  if (blocker?.cause === 'deploy_pending') return clip(`deploy_pending (merged, not deployed; deploy owner ${blocker.deploy_owner}): ${blocker.detail}${blocker.next_step ? ` Next: ${blocker.next_step}` : ''}`, 1000);
   if (blocker) return clip(`blocked (${blocker.cause}): ${blocker.detail}${blocker.next_step ? ` Next: ${blocker.next_step}` : ''}`, 1000);
   const base = REASON_TEXT[reason] ?? reason;
   const note = lastNote ? oneLine(lastNote) : '';

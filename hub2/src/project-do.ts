@@ -1505,7 +1505,7 @@ export class ProjectDO {
     // Every unclaimed end Hub does not recover itself (bound spent, lost host,
     // failed launch) gets a developer owner; only an operator stop is exempt.
     if(!claim&&!record.continuation&&!['stop_requested','session_stop_confirmed'].includes(record.reason))
-      this.raiseDeveloperAlert(intake.id,saga.session_id,hard?'blocked':continuable&&!contractOmitted?'recovery_exhausted':'not_recoverable',record.reason,depth,now,unfinished);
+      this.raiseDeveloperAlert(intake.id,saga.session_id,hard?(blocker?.cause==='deploy_pending'?'deploy_pending':'blocked'):continuable&&!contractOmitted?'recovery_exhausted':'not_recoverable',record.reason,depth,now,unfinished);
     this.appendEvent(intake.id,'completion:'+saga.operation_id,COMPLETION_ACTOR,claim?'task_completion_claimed':'task_unfinished',
       {session_id:saga.session_id,reason:record.reason,depth,next:record.continuation?'continue':record.delivery?'deliver':'none',
         ...(unfinished?{cause:unfinished.cause}:{}),...(blocker?{blocker}:{}),
@@ -1665,8 +1665,8 @@ export class ProjectDO {
     this.appendEvent(intakeId,'developer-alert:'+kind+':'+sessionId,COMPLETION_ACTOR,'developer_alert_raised',alert,now);
     this.appendEvent(intakeId,'developer-owner:'+kind+':'+sessionId,COMPLETION_ACTOR,'intake_context_updated',{...this.intakeContext(intakeId),
       owner:DEVELOPER_ALERT_RECIPIENT,
-      current_state:`Hub could not finish this intake automatically (${kind}: ${reason}; session ${sessionId}; ${depth} of ${MAX_AUTO_CONTINUATIONS} recovery sessions used).${why?` Cause: ${why.cause}`:''}`,
-      next_step:'Developer: inspect the intake notes, fix the blocker and restart the intake (hub intake start).'},now);
+      current_state:kind==='deploy_pending'?`DEPLOY PENDING (not failed): the work is merged; only the deploy by ${why?.blocker?.deploy_owner??'an unnamed owner'} is missing; session ${sessionId}. ${why?.cause??''}`:`Hub could not finish this intake automatically (${kind}: ${reason}; session ${sessionId}; ${depth} of ${MAX_AUTO_CONTINUATIONS} recovery sessions used).${why?` Cause: ${why.cause}`:''}`,
+      next_step:kind==='deploy_pending'?`Deploy owner ${why?.blocker?.deploy_owner??'(unnamed: assign one)'}: deploy, run the live canary, then accept the intake. Do not restart it.`:'Developer: inspect the intake notes, fix the blocker and restart the intake (hub intake start).'},now);
     console.error('[hub2] INTAKE_RECOVERY_ALERT alert='+DEVELOPER_ALERT_RECIPIENT,JSON.stringify({intake_id:intakeId,...alert}));
   }
 
@@ -1871,7 +1871,7 @@ export class ProjectDO {
           JSON.stringify({...evidence,reopened_unfinished:reopened,completion}),now,intake.id);
         this.appendEvent(intake.id,'reopen-unverified:'+saga.operation_id,COMPLETION_ACTOR,'intake_reopened_unfinished',
           {...reopened,next:completion.continuation?'continue':'developer_alert'},now);
-        if(!completion.continuation)this.raiseDeveloperAlert(intake.id,saga.session_id,hard?'blocked':'recovery_exhausted',completion.reason,depth,now,why);
+        if(!completion.continuation)this.raiseDeveloperAlert(intake.id,saga.session_id,hard?(why.blocker?.cause==='deploy_pending'?'deploy_pending':'blocked'):'recovery_exhausted',completion.reason,depth,now,why);
       }
     });
   }

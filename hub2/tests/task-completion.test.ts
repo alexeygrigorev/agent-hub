@@ -978,6 +978,28 @@ test('a permission blocker is not continued: Hub alerts the developer at once an
   }finally{f.close();}
 });
 
+test('a deploy_pending blocker is distinct from failure: names the deploy owner, alerts loudly, never restarts',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'deploy-pending');
+    assert.equal((await start(f,id,'first')).status,201);
+    const first=await run(f,id);
+    const r=await f.call('/api/intakes/'+id+'/events','POST',{key:'blocked-'+first.session_id,event:{kind:'task_blocked',session_id:first.session_id,cause:'deploy_pending',detail:'PR merged, prod lacks the commit',next_step:'deploy server+host',deploy_owner:'hub-implement-plan'}});
+    assert.equal(r.status,201,JSON.stringify(await r.clone().json()));
+    assert.deepEqual(taskBlocker({kind:'task_blocked',session_id:'s',cause:'deploy_pending',detail:'d'},'s'),{cause:'deploy_pending',detail:'d',deploy_owner:'unnamed (needs an owner)'});
+    await finish(f,first,0);
+    const record=completion(f,id);
+    assert.equal(record.reason,'blocked_deploy_pending');assert.equal(record.continuation,undefined);
+    assert.equal(record.blocker.deploy_owner,'hub-implement-plan');assert.match(record.cause,/^deploy_pending \(merged, not deployed; deploy owner hub-implement-plan\)/);
+    const alerts=events(f,id).filter(e=>e.kind==='developer_alert_raised');
+    assert.equal(alerts.length,1);assert.equal(alerts[0].body.kind,'deploy_pending');
+    const task=(await json(await f.call('/api/intakes/'+id))).task;
+    assert.match(task.current_state,/^DEPLOY PENDING \(not failed\).*hub-implement-plan/);assert.match(task.next_step,/Deploy owner hub-implement-plan/);
+    await f.project.alarm();
+    assert.equal(sagas(f,id).length,1,'no continuation was started');
+  }finally{f.close();}
+});
+
 test('a waiting blocker is continued after a delay, not immediately',async()=>{
   const f=fixture();
   try{
