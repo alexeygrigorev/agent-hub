@@ -1,4 +1,5 @@
 import os
+import subprocess
 import tempfile
 import unittest
 import sys
@@ -8,7 +9,8 @@ from unittest.mock import Mock, MagicMock, patch
 from agent_hub_host.advertisement import Advertisement, INVENTORY_OVERFLOW_TAG
 from agent_hub_host.agent import Bridge
 from agent_hub_host.repository_identity import (REPOSITORY_IDENTITY_CAPABILITY, _read_regular,
-                                                 normalize_git_origin, qualified_workspace)
+                                                 normalize_git_origin, qualified_workspace,
+                                                 read_git_origin)
 
 
 class AdvertisementTests(unittest.TestCase):
@@ -362,7 +364,7 @@ class AdvertisementTests(unittest.TestCase):
         self.assertIsNone(Advertisement([self.root])._observe()[1].get(
             qualified_workspace('https://github.com/org/included')))
 
-    def test_inactive_worktree_config_cannot_fabricate_origin_and_enabled_empty_override_is_applied(self):
+    def test_inactive_worktree_config_cannot_fabricate_origin_and_empty_override_fails_closed(self):
         worktree = self.root / 'linked'
         gitdir = self.root / 'common.git' / 'worktrees' / 'linked'
         common = self.root / 'common.git'
@@ -383,8 +385,88 @@ class AdvertisementTests(unittest.TestCase):
         (gitdir / 'config.worktree').write_text(
             '[remote "origin"]\n\turl = ""\n\turl = https://github.com/org/worktree.git\n', encoding='utf-8')
         origins = observed._observe()[1]
-        self.assertIn(qualified_workspace('https://github.com/org/worktree'), origins)
+        self.assertNotIn(qualified_workspace('https://github.com/org/worktree'), origins)
         self.assertNotIn(qualified_workspace('https://github.com/org/common'), origins)
+        self.assertIsNone(read_git_origin(worktree, [self.root]))
+
+        # When common config has no origin, a single enabled config.worktree origin is accepted.
+        (common / 'config').write_text('[extensions]\n\tworktreeConfig = true\n', encoding='utf-8')
+        (gitdir / 'config.worktree').write_text(
+            '[remote "origin"]\n\turl = https://github.com/org/worktree.git\n', encoding='utf-8')
+        self.assertIn(qualified_workspace('https://github.com/org/worktree'), observed._observe()[1])
+
+    def test_empty_and_multiple_origin_urls_fail_closed_against_real_git_oracle(self):
+        git_env = {**os.environ, 'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_CONFIG_NOSYSTEM': '1'}
+
+        def git_remote_origin(repo_path):
+            return subprocess.run(
+                ['git', '-C', str(repo_path), 'remote', 'get-url', 'origin'],
+                check=True, capture_output=True, text=True, env=git_env,
+            ).stdout.strip()
+
+        url_a = 'https://github.com/org/alpha.git'
+        url_b = 'https://github.com/org/beta.git'
+        url_c = 'https://github.com/org/gamma.git'
+
+        # (a) Same config: URL A, empty URL, URL B -> real Git returns A (never B); reader fails closed.
+        same_cfg = self.root / 'same-cfg'
+        subprocess.run(['git', 'init', str(same_cfg)], check=True, capture_output=True, env=git_env)
+        (same_cfg / '.git' / 'config').write_text(
+            f'[core]\n\trepositoryformatversion = 0\n[remote "origin"]\n\turl = {url_a}\n\turl = ""\n\turl = {url_b}\n',
+            encoding='utf-8',
+        )
+        self.assertEqual(git_remote_origin(same_cfg), url_a)
+        self.assertIsNone(read_git_origin(same_cfg, [self.root]))
+
+        # (b) Common origin A + enabled linked config.worktree with empty URL then B -> real Git returns A; reader fails closed.
+        primary = self.root / 'primary'
+        subprocess.run(['git', 'init', str(primary)], check=True, capture_output=True, env=git_env)
+        subprocess.run(
+            ['git', '-C', str(primary), '-c', 'user.name=Test', '-c', 'user.email=test@example.com',
+             'commit', '--allow-empty', '-m', 'init'],
+            check=True, capture_output=True, env=git_env,
+        )
+        linked = self.root / 'linked-wt'
+        subprocess.run(['git', '-C', str(primary), 'worktree', 'add', str(linked)], check=True, capture_output=True, env=git_env)
+        subprocess.run(['git', '-C', str(primary), 'config', 'extensions.worktreeConfig', 'true'], check=True, capture_output=True, env=git_env)
+        subprocess.run(['git', '-C', str(primary), 'remote', 'add', 'origin', url_a], check=True, capture_output=True, env=git_env)
+        linked_gitdir = Path((linked / '.git').read_text(encoding='utf-8').split('gitdir:', 1)[1].strip())
+        (linked_gitdir / 'config.worktree').write_text(
+            f'[remote "origin"]\n\turl = ""\n\turl = {url_b}\n',
+            encoding='utf-8',
+        )
+        self.assertEqual(git_remote_origin(linked), url_a)
+        self.assertIsNone(read_git_origin(linked, [self.root]))
+
+        # (c) Primary checkout enabled config.worktree is handled consistently (never skipped or wrong-guessed).
+        (primary / '.git' / 'config.worktree').write_text(
+            f'[remote "origin"]\n\turl = ""\n\turl = {url_c}\n',
+            encoding='utf-8',
+        )
+        self.assertEqual(git_remote_origin(primary), url_a)
+        self.assertIsNone(read_git_origin(primary, [self.root]))
+
+        (primary / '.git' / 'config.worktree').write_text(
+            f'[remote "origin"]\n\turl = {url_c}\n',
+            encoding='utf-8',
+        )
+        self.assertEqual(git_remote_origin(primary), url_a)
+        self.assertIsNone(read_git_origin(primary, [self.root]))
+
+        subprocess.run(['git', '-C', str(primary), 'remote', 'remove', 'origin'], check=True, capture_output=True, env=git_env)
+        self.assertEqual(git_remote_origin(primary), url_c)
+        self.assertEqual(read_git_origin(primary, [self.root]), normalize_git_origin(url_c))
+
+        # Disabled worktreeConfig on primary checkout ignores config.worktree.
+        (primary / '.git' / 'config.worktree').unlink()
+        subprocess.run(['git', '-C', str(primary), 'remote', 'add', 'origin', url_a], check=True, capture_output=True, env=git_env)
+        subprocess.run(['git', '-C', str(primary), 'config', '--unset', 'extensions.worktreeConfig'], check=True, capture_output=True, env=git_env)
+        (primary / '.git' / 'config.worktree').write_text(
+            f'[remote "origin"]\n\turl = {url_c}\n',
+            encoding='utf-8',
+        )
+        self.assertEqual(git_remote_origin(primary), url_a)
+        self.assertEqual(read_git_origin(primary, [self.root]), normalize_git_origin(url_a))
 
     def test_regular_metadata_open_does_not_block_if_file_is_replaced_by_fifo(self):
         metadata = self.root / 'metadata'
