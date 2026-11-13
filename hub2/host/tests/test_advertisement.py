@@ -344,6 +344,20 @@ class AdvertisementTests(unittest.TestCase):
         self.assertNotIn('workspace:bounded', tags)
         self.assertNotIn('workspace:' + qualified_workspace('https://github.com/org/bounded'), tags)
 
+    def test_git_config_exact_16k_boundary_and_audited_sizes(self):
+        repo = self.clone_with_origin(self.root, 'sized', 'https://github.com/org/sized.git')
+        config = repo / '.git' / 'config'
+        prefix = '[remote "origin"]\n\turl = https://github.com/org/sized.git\n'
+        expected = normalize_git_origin('https://github.com/org/sized.git')
+        for size in (8584, 13280, 16 * 1024, 16 * 1024 + 1):
+            with self.subTest(size=size):
+                data = prefix + '#' + 'x' * (size - len(prefix) - 2) + '\n'
+                self.assertEqual(len(data.encode('utf-8')), size)
+                config.write_text(data, encoding='utf-8')
+                with patch('subprocess.run', side_effect=AssertionError('Git subprocess is forbidden')):
+                    origin = read_git_origin(repo, [self.root])
+                self.assertEqual(origin, expected if size <= 16 * 1024 else None)
+
     def test_git_config_read_limit_and_includes_fail_closed_even_with_direct_origin(self):
         repo = self.clone_with_origin(self.root, 'limited', 'https://github.com/org/limited.git')
         with patch('agent_hub_host.repository_identity.MAX_GIT_METADATA_BYTES', 16):

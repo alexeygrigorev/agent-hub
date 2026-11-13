@@ -14,7 +14,8 @@ from urllib.parse import unquote, urlsplit
 QUALIFIED_PREFIX = 'repo-'
 QUALIFIED_WORKSPACE = re.compile(r'repo-[0-9a-f]{59}')
 REPOSITORY_IDENTITY_CAPABILITY = 'repo-identity:v1'
-MAX_GIT_METADATA_BYTES = 8192
+# Bounded to cover registered checkouts with many local branch entries.
+MAX_GIT_METADATA_BYTES = 16 * 1024
 MAX_CHECKOUT_CANDIDATES = 2048
 MAX_ROOT_ENTRIES = 4096
 
