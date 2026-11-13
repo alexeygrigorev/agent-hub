@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 
 from .client import ApiError, private_file, save_config
-from . import native_launch, launch_reaper
+from . import native_launch, launch_reaper, credential_delivery
 from .implement_workspace import prepare_workspace
 from .advertisement import Advertisement
 from .native_launch import NativeLauncher, LOCAL_ROUTES, UUID_RE, canonical, native_returncode, same_workspace, spawn_environment
@@ -1263,6 +1263,10 @@ class Bridge:
         if include_native_sessions:
             self.client.heartbeat(labels,engines,capabilities,native_sessions=self.live_sessions())
             self.publish_managed_readiness()
+            try:
+                credential_delivery.request(self)  # Bounded single-inflight daemon worker; never waits.
+            except Exception:
+                pass
             # Observation transport is independent of managed lifecycle/admission.
             # Failed/unsupported collection never publishes an empty replacement.
             inventory = getattr(self.launcher, 'inventory', None)
@@ -1317,6 +1321,7 @@ class Bridge:
             if previous_stop is not None:
                 previous_stop.set()
             self._native_inventory_stop = threading.Event()
+        credential_delivery.start(self)
         self._launch_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix='hub2-launch')
         self._command_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix='hub2-command')
         self._worker_slots = threading.BoundedSemaphore(32)
@@ -1333,6 +1338,7 @@ class Bridge:
         finally:
             with _NATIVE_INVENTORY_START_LOCK:
                 self._native_inventory_stop.set()
+            credential_delivery.stop(self)
             stop.set()
             thread.join(timeout=1)
             self._launch_pool.shutdown(wait=False)
