@@ -24,8 +24,15 @@ spec = importlib.util.spec_from_file_location('acc10', HERE.parents[1] / 'script
 acc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(acc)
 
-SOL, GLM, MUSE, LUNA = 'gpt-6.1-sol', 'glm-5.3-flash', 'opencode-go/muse-spark-1.3-contributor', 'gpt-6-luna'  # fixture pool
+SOL, GLM, MUSE, LUNA = 'claude-sonnet-4-6', 'claude-opus-4-6', 'gemini-4-hydrogen', 'gemini-4-luna'
 OK_MODELS = [SOL, GLM, MUSE, SOL, GLM, MUSE, SOL, GLM, LUNA, SOL]
+NATIVE_POOL = [
+    {'policy_id': 'claude-sonnet', 'engine': 'claude', 'model': SOL, 'effort': 'medium', 'weight': 40, 'share': 0.4},
+    {'policy_id': 'claude-opus', 'engine': 'claude', 'model': GLM, 'effort': 'high', 'weight': 20, 'share': 0.2},
+    {'policy_id': 'hydrogen-med', 'engine': 'antigravity', 'model': MUSE, 'effort': 'medium', 'weight': 25, 'share': 0.25},
+    {'policy_id': 'hydrogen-luna', 'engine': 'antigravity', 'model': LUNA, 'effort': 'low', 'weight': 15, 'share': 0.15},
+]
+PARENT_INTAKE = '11111111-1111-4111-8111-111111111111'
 
 
 def fixture(name):
@@ -33,19 +40,35 @@ def fixture(name):
 
 
 COMMIT = 'a' * 40
-WORKSPACE = '/home/user/work/acceptance'
 TMP = HERE.parents[1] / '.local/tmp'
 TMP.mkdir(parents=True, exist_ok=True)
 
 
 def transport(engine='codex', commit=COMMIT):
-    # Synthetic attestations only: no claim about an installed provider/host.
+    # Legacy headless stream transport fixture (for legacy ParserTests only).
     return {'engine': engine, 'machine_id': acc.HOST,
             'format': acc.CAPTURE_FORMATS.get(engine, 'plaintext'), 'host_release_sha': commit,
             'provider_version': 'offline-fixture-v1',
             'profile_set_sha256': hashlib.sha256(('nonsecret-offline-argv-' + engine).encode()).hexdigest(),
             'reference': 'synthetic://capture/' + engine,
             'sha256': hashlib.sha256(('offline-capture-receipt-' + engine).encode()).hexdigest()}
+
+
+def native_transport(engine='claude', commit=COMMIT):
+    return {
+        'engine': engine,
+        'machine_id': acc.HOST,
+        'mode': 'interactive',
+        'format': acc.NATIVE_CAPTURE_FORMATS[engine],
+        'proof_class': acc.NATIVE_PROOF_CLASSES[engine],
+        'capture_command': acc.NATIVE_CAPTURE_COMMAND,
+        'artifact_schema': acc.WORK_SCHEMA,
+        'host_release_sha': commit,
+        'provider_version': 'offline-native-fixture-v2',
+        'profile_set_sha256': hashlib.sha256(('nonsecret-interactive-argv-' + engine).encode()).hexdigest(),
+        'reference': 'synthetic://native-capture/' + engine,
+        'sha256': hashlib.sha256(('offline-native-receipt-' + engine).encode()).hexdigest(),
+    }
 
 
 def provider_frames(engine, marker):
@@ -89,39 +112,76 @@ def evidence(commit=COMMIT, **kw):
     return f.name
 
 
+def native_evidence(commit=COMMIT, **kw):
+    ev = {
+        'kind': acc.NATIVE_EVIDENCE_KIND,
+        'canary': 'success',
+        'canary_commit': commit,
+        'ci_e2e': 'success',
+        'ci_e2e_commit': commit,
+        'operator_validation': {
+            'actor': 'offline-fixture',
+            'target_commit': commit,
+            'capture_transports': {engine: native_transport(engine, commit) for engine in acc.NATIVE_CAPTURE_FORMATS},
+            'receipts': {
+                name: {
+                    'commit': commit,
+                    'reference': 'synthetic://' + name + '/receipt',
+                    'sha256': hashlib.sha256(('offline-' + name).encode()).hexdigest(),
+                }
+                for name in ('deployment', 'canary', 'ci_e2e')
+            },
+        },
+    }
+    ev.update(kw)
+    f = tempfile.NamedTemporaryFile('w', suffix='.json', delete=False, dir=TMP)
+    json.dump(ev, f)
+    f.close()
+    unittest.addModuleCleanup(os.unlink, f.name)
+    return f.name
+
+
 class Harness(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix='acc10-', dir=TMP))
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.bin = self.tmp / 'bin'
         self.bin.mkdir()
-        for name in ('hub', 'a', 'alerts'):
+        for name in ('hub', 'a', 'git', 'alerts'):
             (self.bin / name).symlink_to(FIX / 'fake_hub.py')
+        self.base_ws = self.tmp / 'base-ws'
+        self.base_ws.mkdir()
+        self.child_ws_root = self.tmp / 'child-ws'
+        self.child_ws_root.mkdir()
         self.cfg_path = self.tmp / 'cfg.json'
         env = {'PATH': '%s:%s' % (self.bin, os.environ['PATH']), 'FAKE_CFG': str(self.cfg_path)}
         patcher = mock.patch.dict(os.environ, env)
         patcher.start()
         self.addCleanup(patcher.stop)
-        # Fake CLI processes import the real command parser; their cold startup
-        # can exceed0.5s under the shared lane. Keep proof assertions unchanged
-        # with an offline budget well below the production90s capture budget.
-        for name, val in (('CAPTURE_BUDGET_S', 2),):
+        for name, val in (('CAPTURE_BUDGET_S', 2), ('CREATE_BUDGET_S', 10)):
             p = mock.patch.object(acc, name, val)
             p.start()
             self.addCleanup(p.stop)
 
     def state(self):
         path = Path(str(self.cfg_path) + '.state')
-        return json.loads(path.read_text()) if path.exists() else {'sessions': {}}
+        return json.loads(path.read_text()) if path.exists() else {'sessions': {}, 'intakes': {}, 'log': []}
 
     def go(self, **cfg):
         bundle = cfg.pop('evidence_bundle', None)
+        out_dir = cfg.pop('output_dir', self.tmp / ('out-' + str(time.time_ns())))
         cfg.setdefault('models', OK_MODELS)
+        cfg.setdefault('pool', NATIVE_POOL)
+        cfg.setdefault('child_workspace_root', str(self.child_ws_root))
         Path(str(self.cfg_path) + '.state').unlink(missing_ok=True)
         self.cfg_path.write_text(json.dumps(cfg))
         out = io.StringIO()
         r = acc.Runner(alerts_cmd=str(self.bin / 'alerts'))
-        rc = acc.run(r, bundle or evidence(), COMMIT, workspace=WORKSPACE, sleep=lambda s: time.sleep(0.01), out=out, intake='intake-1')
+        rc = acc.run(
+            r, bundle or native_evidence(), COMMIT,
+            workspace=str(self.base_ws), sleep=lambda s: time.sleep(0.01),
+            out=out, intake=PARENT_INTAKE, output_dir=str(out_dir),
+        )
         return rc, out.getvalue()
 
     def assertAllStopped(self):
@@ -134,7 +194,7 @@ class Harness(unittest.TestCase):
 class FixtureStateTests(Harness):
     def seed_state(self):
         self.cfg_path.write_text('{}')
-        state = {'n': 0, 'sessions': {}, 'keys': {}, 'log': []}
+        state = {'n': 0, 'sessions': {}, 'keys': {}, 'intakes': {}, 'intake_keys': {}, 'log': []}
         path = Path(str(self.cfg_path) + '.state')
         path.write_text(json.dumps(state))
         return path, path.read_bytes()
@@ -150,8 +210,6 @@ class FixtureStateTests(Harness):
 
     def test_killed_publication_preserves_readable_state_for_next_cli_invocation(self):
         path, previous = self.seed_state()
-        # Block exactly after the complete temporary is closed, before replace.
-        # The pipe handshake removes timing guesses and needs no slow/hung CLI.
         code = """
 import os, runpy, signal, sys
 
@@ -194,14 +252,18 @@ class AcceptanceTests(Harness):
         self.assertEqual(out.count('shares(session.picker)='), 10)
         self.assertAllStopped()
         self.assertEqual(len(self.state()['sessions']), 10)
+        self.assertEqual(len(self.state()['intakes']), 10)
         self.assertNotIn('pick', self.state()['log'])
         summary = json.loads(out[out.index('{\n'):out.rindex('\nACCEPTANCE ')])
         self.assertEqual(len(summary['starts'][0]['picker']['pool']), 4)
         self.assertEqual(summary['starts'][0]['picker']['policy_version'], 7)
-        # Each capture/list proof is followed by stop before the next start.
-        sequence = [x for x in self.state()['log'] if x == 'start' or x.startswith('stop:')]
-        self.assertEqual(sequence[::2], ['start'] * 10)
-        self.assertEqual(self.state()['log'].count('start:--intake-task-id'), 10)
+        for rec in summary['starts']:
+            self.assertEqual(rec['requested_workspace'], str(self.base_ws))
+            self.assertNotEqual(rec['workspace'], str(self.base_ws))
+            self.assertTrue(rec['archived'])
+            self.assertEqual(rec['cleanup_status'], 'CONFIRMED')
+        sequence = [x for x in self.state()['log'] if x == 'sessions:start' or x.startswith('stop:')]
+        self.assertEqual(sequence[::2], ['sessions:start'] * 10)
 
     def test_wrong_show_identity_is_refused_and_known_start_is_stopped(self):
         rc, out = self.go(wrong_show_id=True)
@@ -211,7 +273,7 @@ class AcceptanceTests(Harness):
         self.assertEqual(self.state()['n'], 1)
 
     def test_malformed_native_uuid_never_proves_presence_or_cleanup_absence(self):
-        for value in ('native-placeholder', '1234', 'AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE', None, [], {'id': 'untrusted'}):
+        for value in ('native-placeholder', '1234', 'AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE', [], {'id': 'untrusted'}):
             with self.subTest(value=value):
                 rc, out = self.go(native_id=value)
                 self.assertEqual(rc, 1, out)
@@ -233,42 +295,25 @@ class AcceptanceTests(Harness):
             with self.subTest(knob=knob):
                 rc, out = self.go(**{knob: True})
                 self.assertEqual(rc, 1, out)
-                self.assertIn('no completed tool output', out)
+                self.assertIn('did not prove completed work', out)
                 self.assertAllStopped()
 
     def test_foreign_plaintext_json_and_missing_attestation_fail_with_cleanup(self):
-        for engine in ('claude', 'antigravity'):
-            pool = [{'policy_id': 'synthetic-' + engine, 'model': 'synthetic-model', 'engine': engine,
-                     'effort': None, 'weight': 1, 'share': 1}]
-            with self.subTest(engine=engine):
-                rc, out = self.go(pool=pool, models=['synthetic-model'] * 10, capture_format_override='go')
-                self.assertEqual(rc, 1, out)
-                self.assertIn('no completed tool output', out)
-                self.assertAllStopped()
-        path = Path(evidence()); ev = json.loads(path.read_text())
-        ev['operator_validation']['capture_transports'].pop('codex'); path.write_text(json.dumps(ev))
-        rc, out = self.go(evidence_bundle=str(path))
-        self.assertEqual(rc, 1, out); self.assertIn('no verified stream transport for engine codex', out)
-        self.assertAllStopped()
-
-    def test_wrong_stream_for_current_engine_is_not_proof(self):
         rc, out = self.go(capture_format_override='go')
-        self.assertEqual(rc, 1, out); self.assertIn('no completed tool output', out)
+        self.assertEqual(rc, 1, out)
+        self.assertIn('did not prove completed work', out)
         self.assertAllStopped()
-
-    def test_model_less_run_with_claude_and_argon_paired_streams(self):
-        pool = [
-            {'policy_id': 'synthetic-claude', 'model': 'synthetic-claude-model', 'engine': 'claude', 'effort': None, 'weight': 1, 'share': 1/3},
-            {'policy_id': 'synthetic-argon', 'model': 'synthetic-argon-model', 'engine': 'antigravity', 'effort': None, 'weight': 1, 'share': 1/3},
-            {'policy_id': 'synthetic-codex', 'model': SOL, 'engine': 'codex', 'effort': 'medium', 'weight': 1, 'share': 1/3},
-        ]
-        rc, out = self.go(pool=pool, models=['synthetic-claude-model', 'synthetic-argon-model', SOL] * 3 + [SOL])
-        self.assertEqual(rc, 0, out)
-        self.assertEqual(self.state()['n'], 10)
+        path = Path(native_evidence())
+        ev = json.loads(path.read_text())
+        ev['operator_validation']['capture_transports'].pop('claude')
+        path.write_text(json.dumps(ev))
+        rc, out = self.go(evidence_bundle=str(path))
+        self.assertEqual(rc, 1, out)
+        self.assertIn('no verified interactive native-pane transport for engine claude', out)
         self.assertAllStopped()
 
     def test_operator_bundle_must_not_change_during_acceptance(self):
-        original = acc.checked_evidence
+        original = acc.checked_native_evidence
         calls = []
         def check(path, commit):
             calls.append(path)
@@ -277,14 +322,14 @@ class AcceptanceTests(Harness):
                 data['operator_validation']['actor'] = 'different-offline-validator'
                 Path(path).write_text(json.dumps(data))
             return original(path, commit)
-        with mock.patch.object(acc, 'checked_evidence', side_effect=check):
+        with mock.patch.object(acc, 'checked_native_evidence', side_effect=check):
             rc, out = self.go()
         self.assertEqual(rc, 1, out)
         self.assertIn('evidence bundle changed during run', out)
         self.assertAllStopped()
 
     def test_replacement_after_validation_cannot_become_the_baseline_hash(self):
-        original = acc.validate_evidence
+        original = acc.validate_native_evidence
         pins = {}
         def validate_then_replace(data, path, commit):
             problems = original(data, path, commit)
@@ -295,7 +340,7 @@ class AcceptanceTests(Harness):
                 Path(path).write_text(json.dumps(replacement))
                 pins['replacement'] = hashlib.sha256(Path(path).read_bytes()).hexdigest()
             return problems
-        with mock.patch.object(acc, 'validate_evidence', side_effect=validate_then_replace):
+        with mock.patch.object(acc, 'validate_native_evidence', side_effect=validate_then_replace):
             rc, out = self.go()
         self.assertEqual(rc, 1, out)
         self.assertIn('evidence bundle changed during run', out)
@@ -333,12 +378,6 @@ class AcceptanceTests(Harness):
                 self.assertAllStopped()
                 self.assertNotIn('pick', self.state()['log'])
 
-    def test_unacknowledged_capture_cannot_prove_output(self):
-        rc, out = self.go(capture_unacked=True)
-        self.assertEqual(rc, 1)
-        self.assertIn('no completed tool output', out)
-        self.assertAllStopped()
-
     def test_refuses_without_ready_env(self):
         os.environ.pop('HUB_ACCEPTANCE_READY', None)
         self.assertEqual(acc.main(['--live']), 2)
@@ -347,16 +386,18 @@ class AcceptanceTests(Harness):
     def test_acceptance_criteria_source_required(self):
         self.cfg_path.write_text(json.dumps({'models': OK_MODELS}))
         out = io.StringIO()
-        rc = acc.run(acc.Runner(alerts_cmd=str(self.bin / 'alerts')), evidence(), COMMIT, workspace=WORKSPACE, out=out)
+        rc = acc.run(
+            acc.Runner(alerts_cmd=str(self.bin / 'alerts')), native_evidence(), COMMIT,
+            workspace=str(self.base_ws), out=out, output_dir=str(self.tmp / 'out'),
+        )
         self.assertEqual(rc, 1)
-        self.assertIn('acceptance criteria source missing', out.getvalue())
+        self.assertIn('valid parent --intake-task-id UUID required', out.getvalue())
         self.assertEqual(self.state()['sessions'], {}, 'must not start anything')
 
     def test_start_failure_ends_run(self):
         rc, out = self.go(fail_start_at=3)
         self.assertEqual(rc, 1)
         self.assertIn('start failed', out)
-        # A definite refusal ends the run and must not trigger a new launch via replay.
         self.assertEqual(len(self.state()['sessions']), 3)
         self.assertAllStopped()
 
@@ -404,7 +445,7 @@ class AcceptanceTests(Harness):
                 self.assertTrue(record['cleanup_uncertain'])
                 self.assertIsNone(record.get('id'))
                 self.assertIn('cleanup uncertain', out)
-                self.assertIn('original key ' + record['key'], out)
+                self.assertIn('original key ' + record['start_key'], out)
                 requests = self.state()['start_requests']
                 self.assertEqual(len(requests), 3)
                 self.assertEqual(requests[1], requests[2])
@@ -419,10 +460,10 @@ class AcceptanceTests(Harness):
         sessions = list(self.state()['sessions'].values())
         self.assertEqual(len(sessions), 3)
         self.assertTrue(all(s['stopped'] for s in sessions[:2]))
-        self.assertFalse(sessions[2]['stopped'])  # explicitly unknown to the client, never falsely reported clean
+        self.assertFalse(sessions[2]['stopped'])
         summary = json.loads(out[out.index('{\n'):out.rindex('\nACCEPTANCE ')])
         self.assertTrue(summary['starts'][2]['cleanup_uncertain'])
-        self.assertEqual(len(self.state()['start_requests']), 5)  # two good, one lost, two same-key receipts
+        self.assertEqual(len(self.state()['start_requests']), 5)
 
     def test_blocking_start_hits_deadline_and_is_cleaned_up(self):
         with mock.patch.object(acc, 'RUNNING_BUDGET_S', 1):
@@ -444,8 +485,8 @@ class AcceptanceTests(Harness):
         self.assertIn('luna 4 > 3', out)
 
     def test_luna_on_degraded_pool(self):
-        one = [fixture('hub_sessions_pick.json')['pool'][0]]
-        one[0]['share'] = 1.0
+        one = [NATIVE_POOL[3]]
+        one[0] = dict(one[0], share=1.0)
         rc, out = self.go(pool=one, models=[LUNA] * 10)
         self.assertEqual(rc, 1)
         self.assertIn('luna picked from a degraded one-model pool', out)
@@ -470,7 +511,7 @@ class AcceptanceTests(Harness):
 
     def test_missing_host_and_workspace(self):
         rc, out = self.go(list_no_host=True)
-        self.assertIn("host None != hetzner-aplexer", out)
+        self.assertIn('host None != hetzner-aplexer', out)
         rc, out = self.go(list_no_workspace=True)
         self.assertIn('workspace path missing', out)
         self.assertEqual(rc, 1)
@@ -485,15 +526,15 @@ class AcceptanceTests(Harness):
     def test_capture_prompt_only(self):
         rc, out = self.go(capture_prompt_only=True)
         self.assertEqual(rc, 1)
-        self.assertIn('no completed tool output beyond the prompt', out)
+        self.assertIn('did not prove completed work', out)
 
     def test_stop_not_confirmed(self):
         rc, out = self.go(stop_not_confirmed=True)
         self.assertEqual(rc, 1)
-        self.assertIn('!= stopped', out)
+        self.assertIn('stop_confirmed != true', out)
 
     def test_native_lingers_after_stop_but_exited_rows_do_not_count(self):
-        with mock.patch.object(acc, 'STOP_BUDGET_S', 6):
+        with mock.patch.object(acc, 'STOP_BUDGET_S', 4):
             rc, out = self.go(native_lingers=True, fail_start_at=1)
         self.assertEqual(rc, 1)
         self.assertIn('still listed', out)
@@ -537,13 +578,13 @@ class AcceptanceTests(Harness):
         self.assertIn('post-run alert watermark predates end-of-run cutoff', out)
         self.assertAllStopped()
         summary = json.loads(out[out.index('{\n'):out.rindex('\nACCEPTANCE ')])
-        evidence = summary['alert_watermarks']
-        before, after = evidence['before'], evidence['after']
+        evidence_wm = summary['alert_watermarks']
+        before, after = evidence_wm['before'], evidence_wm['after']
         self.assertEqual(after['generation'], before['generation'])
         self.assertEqual(after['count'], before['count'])
         self.assertGreater(after['observed_at_ms'], before['observed_at_ms'])
-        self.assertLess(after['observed_at_ms'], evidence['required_post_observed_at_ms'])
-        self.assertLess(evidence['required_post_observed_at_ms'] - after['observed_at_ms'], acc.ALERT_SAMPLE_MAX_AGE_MS)
+        self.assertLess(after['observed_at_ms'], evidence_wm['required_post_observed_at_ms'])
+        self.assertLess(evidence_wm['required_post_observed_at_ms'] - after['observed_at_ms'], acc.ALERT_SAMPLE_MAX_AGE_MS)
         self.assertNotIn('stale or from the future', out)
         self.assertNotIn('reset or observation time regressed', out)
 
@@ -554,6 +595,136 @@ class AcceptanceTests(Harness):
         self.assertEqual(rc, 1)
         self.assertIn('alert baseline unavailable', out)
         self.assertEqual(self.state()['sessions'], {})
+
+
+class V2NativeAndLineageTests(Harness):
+    """V1+V2 interactive native-pane, challenge/artifact, and owned-lineage cleanup regressions."""
+
+    def test_plan_mode_renders_argv_without_invoking_hub(self):
+        out_dir = self.tmp / 'plan-out'
+        buf = io.StringIO()
+        with mock.patch('sys.stdout', buf):
+            rc = acc.main([
+                '--plan',
+                '--evidence', native_evidence(),
+                '--commit', COMMIT,
+                '--workspace', str(self.base_ws),
+                '--intake-task-id', PARENT_INTAKE,
+                '--output-dir', str(out_dir),
+            ])
+        self.assertEqual(rc, 0, buf.getvalue())
+        data = json.loads(buf.getvalue())
+        self.assertEqual(len(data['plan']), 10)
+        self.assertIn('--interactive', data['plan'][0]['start_argv'])
+        self.assertNotIn('--prompt', data['plan'][0]['start_argv'])
+        self.assertEqual(self.state()['sessions'], {})
+
+    def test_cli_parser_rejects_interactive_with_prompt_and_accepts_new_start_argv(self):
+        import argparse
+        from agent_hub_host import session_control
+        parser = argparse.ArgumentParser()
+        session_control.add_commands(parser.add_subparsers(dest='cmd'))
+        argv = acc.build_start_argv('/abs/base', PARENT_INTAKE, 'key-1')
+        parsed = parser.parse_args(argv)
+        self.assertTrue(parsed.interactive)
+        self.assertIsNone(parsed.prompt)
+        with self.assertRaises(SystemExit):
+            parser.parse_args(argv + ['--prompt', 'bad'])
+
+    def test_create_lost_response_replays_same_key_and_ten_unique_children(self):
+        rc, out = self.go(create_fail_after_accept_at=0)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(len(self.state()['intakes']), 10)
+        rc2, out2 = self.go(reuse_intake_id=True)
+        self.assertEqual(rc2, 1, out2)
+        self.assertIn('child intake id reused', out2)
+
+    def test_headless_mode_and_legacy_headless_evidence_rejected(self):
+        rc, out = self.go(force_headless_mode=True)
+        self.assertEqual(rc, 1, out)
+        self.assertIn('session is not interactive', out)
+        rc, out = self.go(evidence_bundle=evidence())
+        self.assertEqual(rc, 1, out)
+        self.assertIn('operator-validated same-commit receipt references required', out)
+        self.assertEqual(self.state()['sessions'], {})
+
+    def test_natural_exit_after_proof_before_live_stop_fails_sample(self):
+        rc, out = self.go(natural_exit_after_proof=True)
+        self.assertEqual(rc, 1, out)
+        self.assertIn('natural exit after proof before live STOP', out)
+        self.assertAllStopped()
+
+    def test_null_native_id_still_issues_standard_stop(self):
+        rc, out = self.go(null_native_stop=True)
+        self.assertEqual(rc, 1, out)
+        self.assertIn('no canonical native UUID', out)
+        self.assertTrue(any(x.startswith('stop:') for x in self.state()['log']))
+        self.assertAllStopped()
+
+    def test_proven_continuation_and_verification_descendants_drained_not_counted(self):
+        for knob in ('continuation_descendant', 'verification_descendant', 'fresh_successor_after_first_scan'):
+            with self.subTest(knob=knob):
+                rc, out = self.go(**{knob: True})
+                self.assertEqual(rc, 0, out)
+                self.assertAllStopped()
+                summary = json.loads(out[out.index('{\n'):out.rindex('\nACCEPTANCE ')])
+                self.assertEqual(len(summary['starts']), 10)
+                self.assertTrue(summary['starts'][0]['cleanup_lineage'])
+
+    def test_foreign_incomplete_archive_snapshot_change_over_limit_and_cas_conflict(self):
+        for knob, expected in [
+            ('foreign_assignment', 'foreign or unprovable session'),
+            ('foreign_assigned_machine', 'foreign assigned_machine_id'),
+            ('pending_dispatch_state', 'non-terminal dispatch state'),
+            ('history_seq_gap', 'intake history sequence gap'),
+            ('history_incomplete_archive', 'history_archive has 3 unread archived events'),
+            ('history_snapshot_changed', 'intake snapshot changed during history scan'),
+            ('descendant_over_limit', 'exceeded 8 descendant bound'),
+            ('archive_cas_conflict', 'archive CAS failed'),
+        ]:
+            with self.subTest(knob=knob):
+                rc, out = self.go(**{knob: True})
+                self.assertEqual(rc, 1, out)
+                self.assertIn(expected, out)
+
+    def test_trust_menu_and_negative_pane_renderings_fail(self):
+        for knob in ('trust_menu_rendered', 'hydrogen_prose_command_exited', 'claude_waiting_only',
+                     'claude_prose_only', 'claude_unterminated_echo', 'hydrogen_unrelated_action'):
+            with self.subTest(knob=knob):
+                rc, out = self.go(**{knob: True})
+                self.assertEqual(rc, 1, out)
+                self.assertIn('did not prove completed work', out)
+                self.assertAllStopped()
+
+    def test_ac_normalization_and_provenance_match_hub2_contract(self):
+        _, ac = acc.make_child_brief_and_ac(PARENT_INTAKE, 1, PARENT_INTAKE, '/tmp/ch.bin')
+        norm = acc.normalize_acceptance_criteria(ac)
+        self.assertEqual(len(norm), 2)
+        self.assertFalse(any(line.startswith('1.') or line.startswith('2.') for line in norm))
+        rc, out = self.go()
+        self.assertEqual(rc, 0, out)
+        for intake in self.state()['intakes'].values():
+            self.assertIsNone(intake['parent_intake_id'])
+            self.assertIn('provenance', intake)
+            self.assertEqual(len(intake['acceptance_criteria']), 2)
+            self.assertFalse(any(line.startswith('1.') or line.startswith('2.') for line in intake['acceptance_criteria']))
+            self.assertEqual(intake['acceptance_criteria'][1], norm[1])
+
+    def test_v2_artifact_tamper_and_link_negatives_fail(self):
+        for knob in ('result_symlink', 'result_hardlink', 'result_duplicate_key', 'result_non_canonical', 'result_bad_digest', 'result_preexisting'):
+            with self.subTest(knob=knob):
+                rc, out = self.go(**{knob: True})
+                self.assertEqual(rc, 1, out)
+                self.assertIn('did not prove completed work', out)
+                self.assertAllStopped()
+
+    def test_porcelain_z_rename_copy_counting(self):
+        self.assertEqual(acc.parse_porcelain_z_count(b''), 0)
+        self.assertEqual(acc.parse_porcelain_z_count(b' M a.py\x00R  new.py\x00old.py\x00C  c.py\x00src.py\x00'), 3)
+        with self.assertRaises(ValueError):
+            acc.parse_porcelain_z_count(b' M a.py')
+        with self.assertRaises(ValueError):
+            acc.parse_porcelain_z_count(b'R  new.py\x00')
 
 
 class ParserTests(unittest.TestCase):
