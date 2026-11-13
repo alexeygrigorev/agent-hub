@@ -618,7 +618,8 @@ class TestFleetHeadless(unittest.TestCase):
         ])
 
         # Quota gate fails when remaining <= 15%
-        with patch.object(p, "root", return_value=m_dir), \
+        stub = patch.object(p, "codex_launch_wrapper", return_value=Path("/synthetic/launch-codex.sh"))
+        with patch.object(p, "root", return_value=m_dir), stub, \
              patch.object(p.sys, "argv", ["provisioning.py", "codex-gate-acc", "exec", "goal"]), \
              patch("agent_hub_host.provisioning.hub_launch_gate", return_value=(False, "quota_exhausted")), \
              self.assertRaises(SystemExit) as cm:
@@ -626,7 +627,7 @@ class TestFleetHeadless(unittest.TestCase):
         self.assertEqual(cm.exception.code, 75)
 
         # Quota gate passes when remaining > 15%
-        with patch.object(p, "root", return_value=m_dir), \
+        with patch.object(p, "root", return_value=m_dir), stub, \
              patch.object(p.sys, "argv", ["provisioning.py", "codex-gate-acc", "exec", "goal"]), \
              patch("agent_hub_host.provisioning.hub_launch_gate", return_value=(True, "ok")), \
              patch.object(p.os, "execve") as fake_exec:
