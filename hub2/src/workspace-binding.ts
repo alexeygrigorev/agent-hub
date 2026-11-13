@@ -29,8 +29,7 @@ function intakeWorktree(requested:string,resolved:string):boolean {
 // later start in another enrolled checkout continues in that same worktree:
 // `<any absolute checkout>/.local/hub-worktrees/<64-hex intake digest>`.
 function retainedIntakeWorktree(resolved:string):boolean {
-  const separator=resolved.includes('\\')?'\\':'/';
-  const parts=resolved.split(separator);
+  const parts=resolved.split(/[\\/]/);
   const marker=parts.length-3;
   return marker>=2&&parts[marker]==='.local'&&parts[marker+1]==='hub-worktrees'&&/^[a-f0-9]{64}$/.test(parts[marker+2])
     &&!parts.slice(0,marker).includes('..')&&!parts.slice(0,marker).includes('.');
