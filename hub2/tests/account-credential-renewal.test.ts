@@ -360,3 +360,29 @@ test('an unexpected renewal read failure keeps a bounded retry alarm rather than
     assert.equal(ctx.alarm, clock + 5 * 60_000, 'unknown is retried, never deleted');
   } finally { restore(); }
 });
+
+test('a successful reschedule clears the stale diagnostic left by an initial unseal failure', async () => {
+  const restore = useClock();
+  try {
+    const expiresAt = clock + 2 * HOUR;
+    const { ctx, database, p, account } = await claudeAccount(expiresAt);
+    // Initial evaluation fails to unseal: a due-now row records the bounded diagnostic.
+    database.prepare('DELETE FROM credential_renewal').run(); (account as any).db.cache?.clear?.();
+    (account as any).env.HUB2_CREDENTIAL_KEY = 'invalid-key';
+    await (account as any).schedule();
+    let view = await renewal(account);
+    assert.equal(view.reason, 'credential_decryption_failed'); assert.equal(view.status, 'scheduled');
+    assert.equal(view.attempts, 0); assert.equal(view.next_at, clock);
+
+    // The key works again: the alarm unseals, sees a future expiry and only reschedules.
+    (account as any).env.HUB2_CREDENTIAL_KEY = KEY;
+    clock += 1000; await account.alarm();
+    view = await renewal(account);
+    assert.equal(view.reason, null, 'the obsolete diagnostic is cleared');
+    assert.equal(view.status, 'scheduled'); assert.equal(view.attempts, 0);
+    assert.equal(view.generation, 1); assert.equal(view.access_expires_at, expiresAt);
+    assert.equal(view.next_at, expiresAt - LEAD); assert.equal(ctx.alarm, expiresAt - LEAD);
+    assert.equal(p.tokenCalls(), 0, 'no refresh is performed');
+    assert.equal(generation(database), 1);
+  } finally { restore(); }
+});

@@ -622,7 +622,7 @@ export class AccountDO {
    if(!this.needsRefresh('claude',files,RENEWAL_LEAD_MS+1000)){
     const auth=JSON.parse(files[PATHS.claude[0]]),expires=this.accessExpiry('claude',files),now=Date.now();
     const usable=typeof auth?.claudeAiOauth?.refreshToken==='string'&&!!auth.claudeAiOauth.refreshToken;
-    this.db.run('UPDATE credential_renewal SET access_expires_at=?,next_at=?,status=?,updated_at=? WHERE id=1 AND generation=?',expires,usable?this.renewalTarget(expires,now):null,usable?'scheduled':'no_refresh_token',now,generation);
+    this.db.run('UPDATE credential_renewal SET access_expires_at=?,next_at=?,status=?,reason=NULL,updated_at=? WHERE id=1 AND generation=?',expires,usable?this.renewalTarget(expires,now):null,usable?'scheduled':'no_refresh_token',now,generation);
     return;
    }
    await this.refresh('claude',files,generation);
