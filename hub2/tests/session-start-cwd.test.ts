@@ -4,7 +4,8 @@ import worker from '../src/worker';
 
 const token = 'synthetic-session-start-token-00000000000';
 
-function fixture(options: { refusal?: { status: number; error: string }; createStatus?: number; discard?: { status: number; body: unknown } } = {}) {
+function fixture(options: { refusal?: { status: number; error: string }; createStatus?: number; discard?: { status: number; body: unknown };
+  repoAlias?: string; canonicalUrl?: string | null } = {}) {
   const projectCalls: Array<{ path: string; project: string | null; body: any }> = [];
   const control = {
     idFromName: (name: string) => name,
@@ -13,8 +14,10 @@ function fixture(options: { refusal?: { status: number; error: string }; createS
         const request = input instanceof Request ? input : new Request(input, init);
         const path = new URL(request.url).pathname;
         if (path === '/_actors/register') return Response.json({ registered: true });
-        if (path === '/api/repos/' + encodeURIComponent('org/app') || path === '/api/repos/org%2Fapp')
-          return Response.json({ repo: { canonical_name: 'org/app', status: 'active' } });
+        if (path === '/api/repos/' + encodeURIComponent('org/app') || path === '/api/repos/org%2Fapp'
+            || (options.repoAlias && path === '/api/repos/' + encodeURIComponent(options.repoAlias)))
+          return Response.json({ repo: { canonical_name: 'org/app',
+            ...(options.canonicalUrl === null ? {} : { canonical_url: options.canonicalUrl ?? 'https://github.com/org/app.git' }), status: 'active' } });
         if (path.startsWith('/api/routes/intake/')) return Response.json({ route: { id: 'intake-given', owner: 'org/app' } });
         return Response.json({ error: 'not_found' }, { status: 404 });
       },
@@ -56,14 +59,40 @@ test('--cwd is the launch workspace; the repository only names the project', asy
   assert.equal(started.body.workspace, '/home/user/work/2026-11-10-task');
 });
 
-test('without --cwd the repository label stays the launch workspace', async () => {
+test('repo-only launch workspace comes from the canonical registry origin', async () => {
   const f = fixture();
   assert.equal((await f.start({ repo: 'org/app' })).status, 201);
-  assert.equal(f.projectCalls.find(call => call.path.endsWith('/start'))!.body.workspace, 'app');
+  const started = f.projectCalls.find(call => call.path.endsWith('/start'))!;
+  assert.equal(started.body.workspace, 'repo-189a31e2ed69f2eda847d62bb76543970dc623261734e6072fc5236932e');
+  assert.deepEqual(started.body.required_capabilities, ['repo-identity:v1']);
+});
+
+test('registry aliases use the canonical repository identity after resolution', async () => {
+  const f = fixture({ repoAlias: 'legacy-app', canonicalUrl: 'https://github.com/CanonicalOwner/CanonicalApp.git' });
+  assert.equal((await f.start({ repo: 'legacy-app', needs: ['browser:orin-chrome'] })).status, 201);
+  const started = f.projectCalls.find(call => call.path.endsWith('/start'))!;
+  assert.equal(started.project, 'org/app');
+  assert.equal(started.body.workspace, 'repo-dbcdada8bd9f6a134f3440a9fb120d904ee226139a2e0589420486bf638');
+  assert.deepEqual(started.body.required_capabilities, ['browser:orin-chrome', 'repo-identity:v1']);
+});
+
+test('repo-only start fails closed without a canonical registry URL while explicit workspace remains usable', async () => {
+  const missing = fixture({ canonicalUrl: null });
+  const refused = await missing.start({ repo: 'org/app' });
+  assert.equal(refused.status, 409);
+  assert.equal(((await refused.json()) as any).error, 'repository_identity_unavailable');
+  assert.equal(missing.projectCalls.length, 0);
+
+  const explicit = fixture({ canonicalUrl: null });
+  assert.equal((await explicit.start({ repo: 'org/app', workspace: 'app' })).status, 201);
+  assert.equal(explicit.projectCalls.find(call => call.path.endsWith('/start'))!.body.workspace, 'app');
 });
 
 test('--cwd wins over a workspace label and a relative --cwd is refused before any intake is created', async () => {
   const f = fixture();
+  assert.equal((await f.start({ repo: 'org/app', workspace: 'app' })).status, 201);
+  assert.equal(f.projectCalls.find(call => call.path.endsWith('/start'))!.body.workspace, 'app');
+  f.projectCalls.length = 0;
   assert.equal((await f.start({ repo: 'org/app', workspace: 'app', cwd: 'C:\\work\\task' })).status, 201);
   assert.equal(f.projectCalls.find(call => call.path.endsWith('/start'))!.body.workspace, 'C:\\work\\task');
   const g = fixture();
