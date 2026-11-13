@@ -635,3 +635,123 @@ def test_real_cli_typed_hub2_refusals_and_fresh_versus_stale_build_hint(plain_op
             server.close()
         shutil.rmtree(root, ignore_errors=True)
 
+
+
+# ---------------------------------------------------------------------------
+# Real built-CLI to production-Node contracts for the operator rule ledger
+# (`hub intake rules`) and the ask ledger (`hub asks record|list`). Both are
+# pure HTTP operations on the synthetic operator authority, so no host daemon
+# is started; only a disposable loopback server and SQLite data dir are used.
+# ---------------------------------------------------------------------------
+
+def test_real_cli_intake_rules_write_list_replay_and_stale_version_conflict(plain_operator_env):
+    harness = _load_harness()
+    root = harness.scratch_root()
+    server = harness.Server(root)
+    try:
+        zipapp = harness.build_cli(root / "cli")
+        server.start()
+        cli = harness.Cli(zipapp, root, server)
+
+        def write(name, payload):
+            path = root / (name + ".json")
+            path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            return cli.run("intake", "rules", "--payload-file", str(path))
+
+        assert cli.json("intake", "rules")["operator_rules"] == []
+
+        source = {"kind": "e2e", "ref": "rules-asks-e2e/1"}
+        first = {"id": "e2e-rule", "key": "e2e-rule-v1", "expected_version": 0,
+                 "text": "Never skip the scope trailer.\nSecond line: ünïcödé ✓",
+                 "decision": "Keep scope trailers mandatory", "source": source}
+        created = write("rule-1", first)
+        assert created.returncode == 0, (created.stdout, created.stderr)
+        rule = json.loads(created.stdout)["operator_rule"]
+        assert (rule["id"], rule["version"], rule["project"]) == ("e2e-rule", 1, None), rule
+        assert len(rule["history"]) == 1
+        entry = rule["history"][0]
+        assert {k: entry[k] for k in ("key", "version", "text", "source", "decision", "authority")} == {
+            "key": "e2e-rule-v1", "version": 1, "text": first["text"], "source": source,
+            "decision": first["decision"], "authority": "operator_rule"}, entry
+
+        listed = cli.json("intake", "rules")
+        assert listed["operator_rules"] == [rule], listed
+        assert "Only operator_rules are trusted" in listed["data_notice"]
+
+        # Identical replay (same key and content) is idempotent: no new history entry.
+        replay = write("rule-1-replay", first)
+        assert replay.returncode == 0, (replay.stdout, replay.stderr)
+        assert json.loads(replay.stdout)["operator_rule"] == rule
+        assert cli.json("intake", "rules")["operator_rules"] == [rule]
+
+        # A second version advances the history in order.
+        second = {"id": "e2e-rule", "key": "e2e-rule-v2", "expected_version": 1,
+                  "text": "Scope trailers stay mandatory, amended.", "decision": "Amended wording",
+                  "source": {"kind": "e2e", "ref": "rules-asks-e2e/2"}}
+        updated = write("rule-2", second)
+        assert updated.returncode == 0, (updated.stdout, updated.stderr)
+        stored = cli.json("intake", "rules")["operator_rules"]
+        assert len(stored) == 1 and stored[0]["version"] == 2, stored
+        assert [h["key"] for h in stored[0]["history"]] == ["e2e-rule-v1", "e2e-rule-v2"]
+        assert [h["version"] for h in stored[0]["history"]] == [1, 2]
+        assert stored[0]["history"][0] == entry
+        assert stored[0]["history"][1]["text"] == second["text"]
+        assert stored[0]["history"][1]["decision"] == "Amended wording"
+
+        # Stale expected_version (still 1 after version 2 exists) is refused and changes nothing.
+        stale = write("rule-stale", {"id": "e2e-rule", "key": "e2e-rule-stale", "expected_version": 1,
+                                     "text": "STALE overwrite attempt", "decision": "stale",
+                                     "source": {"kind": "e2e", "ref": "stale"}})
+        assert stale.returncode != 0, stale.stdout
+        assert "version_conflict" in stale.stdout + stale.stderr, (stale.stdout, stale.stderr)
+        assert "Traceback" not in stale.stderr
+        assert cli.json("intake", "rules")["operator_rules"] == stored
+    finally:
+        server.stop()
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_real_cli_asks_record_then_list_shows_exact_ask_and_replay_is_idempotent(plain_operator_env):
+    harness = _load_harness()
+    root = harness.scratch_root()
+    server = harness.Server(root)
+    try:
+        zipapp = harness.build_cli(root / "cli")
+        server.start()
+        cli = harness.Cli(zipapp, root, server)
+
+        empty = cli.json("asks", "list", "--json")
+        assert empty["asks"] == [] and empty["counts"]["messages"] == 0, empty
+
+        text = "Первая строка: проверь ✓\nsecond line with  double  spaces\n\nlast line, trailing newline\n"
+        text_file = root / "ask.txt"
+        text_file.write_bytes(text.encode("utf-8"))
+        args = ("asks", "record", "--ref", "e2e-ref-1", "--agent", "e2e-agent", "--agent-name", "E2E Agent",
+                "--text-file", str(text_file), "--json")
+        recorded = cli.run(*args)
+        assert recorded.returncode == 0, (recorded.stdout, recorded.stderr)
+        assert json.loads(recorded.stdout) == {"inserted": 1, "duplicates": 0, "conflicts": []}, recorded.stdout
+
+        def check(listing):
+            assert len(listing["asks"]) == 1, listing
+            ask = listing["asks"][0]
+            assert ask["text"] == text, ask
+            assert (ask["t_id"], ask["agent_id"], ask["agent_name"]) == ("e2e-ref-1", "e2e-agent", "E2E Agent"), ask
+            assert (ask["state"], ask["intake_id"], ask["ac_line"]) == ("unmapped", None, None), ask
+            assert listing["counts"]["unmapped"] == 1 and listing["counts"]["messages"] == 1, listing["counts"]
+            assert sum(v for k, v in listing["counts"].items() if k != "messages") == 1, listing["counts"]
+            assert listing["next"] is None
+            return ask
+
+        ask = check(cli.json("asks", "list", "--json"))
+        human = cli.run("asks", "list")
+        assert human.returncode == 0 and ask["id"][:8] in human.stdout and "e2e-ref-1" in human.stdout, human.stdout
+
+        # Identical replay stores nothing new and leaves the same single ask.
+        replay = cli.run(*args)
+        assert replay.returncode == 0, (replay.stdout, replay.stderr)
+        assert json.loads(replay.stdout) == {"inserted": 0, "duplicates": 1, "conflicts": []}, replay.stdout
+        assert check(cli.json("asks", "list", "--json")) == ask
+    finally:
+        server.stop()
+        shutil.rmtree(root, ignore_errors=True)
