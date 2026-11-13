@@ -1689,7 +1689,7 @@ class CanaryTest(unittest.TestCase):
         self.assertEqual(sum(1 for line in calls_auth if line == "sessions list --all --json"), 1)
 
     def write_updater(self, root, *, delay=0.0, converge=True, exit_code=0, grandchild=False,
-                      linger=False, ignore_term=False, signal_canary=False):
+                      linger=False, ignore_term=False, signal_canary=False, handoff=False):
         """Real Python stand-in for the installed updater, run by the canary as its owned child."""
         sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
         staged = self.tmp / "staged-release" / sha
@@ -1699,14 +1699,29 @@ class CanaryTest(unittest.TestCase):
         body = f"""import json, os, pathlib, shutil, signal, subprocess, sys, time
 D = pathlib.Path({str(self.tmp)!r})
 (D / "updater.json").write_text(json.dumps({{"argv": sys.argv[1:], "pgid": os.getpgrp(), "pid": os.getpid(),
-    "env": sorted(os.environ), "xdg": os.environ.get("XDG_RUNTIME_DIR"), "cwd": os.getcwd()}}))
+    "env": sorted(os.environ), "xdg": os.environ.get("XDG_RUNTIME_DIR"), "cwd": os.getcwd(),
+    "sigblk": [l.split()[1] for l in open("/proc/self/status") if l.startswith("SigBlk:")][0]}}))
+if {handoff!r}:
+    # Escaping handoff chain: new session, ignores TERM, each generation forks then exits, so a
+    # /proc snapshot can always miss the live member. Only a kernel reaping fence sees it.
+    if os.fork() == 0:
+        os.setsid()
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        while True:
+            with open(D / "handoff.pids", "a") as fh:
+                fh.write(f"{{os.getpid()}}\\n")
+            if os.fork():
+                os._exit(0)
+            time.sleep(0.003)
 if {ignore_term!r}:
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 if {grandchild!r}:
     g = subprocess.Popen([sys.executable, "-c", "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"])
     (D / "grandchild.pid").write_text(str(g.pid))
 if {signal_canary!r}:
-    os.kill(os.getppid(), signal.SIGTERM)  # queued/started, then the canary is terminated
+    sup = os.getppid()  # the canary's updater supervisor; the canary is its parent
+    canary = int(open(f"/proc/{{sup}}/stat").read().rsplit(")", 1)[1].split()[1])
+    os.kill(canary, signal.SIGTERM)  # queued/started, then the canary is terminated
 time.sleep({delay!r})
 if {converge!r}:
     root = pathlib.Path({str(root)!r})
@@ -1731,7 +1746,7 @@ sys.exit({exit_code!r})
     def gate_root(self, **updater):
         root = pathlib.Path(tempfile.mkdtemp(prefix="gate-host-releases.", dir=self.tmp))
         os.chmod(root, 0o700)
-        for f in ("updater.json", "grandchild.pid", "activated"):
+        for f in ("updater.json", "grandchild.pid", "activated", "handoff.pids"):
             (self.tmp / f).unlink(missing_ok=True)
         self.write_updater(root, **updater)
         return root
@@ -1977,15 +1992,84 @@ sys.exit({exit_code!r})
         finally:
             self.kill_leftovers()
 
-    def test_leftover_group_member_after_clean_exit_is_killed_before_reporting(self):
+    def test_leftover_descendant_after_clean_exit_is_killed_and_fails_as_incomplete(self):
+        # Leader rc0 + a lingering grandchild that must be force-killed is quiescent but NOT complete.
         root = self.gate_root(delay=0.1, grandchild=True, linger=True)
         try:
-            r, v = self.run_gate(root, 6)
-            self.assertEqual(r.returncode, 0, r.stderr)
+            r, v = self.run_gate(root, 8)
+            self.assertEqual(r.returncode, 1, r.stderr)
+            self.assertFalse(v["ok"])
+            self.assertEqual((v["stage"], v["reason"]), ("host_release", "host_updater_not_successful:host_updater_incomplete"))
             self.assertEqual((v["host_updater_quiescence"], v["rollback_safe"]), ("reaped", True))
             self.assertFalse(self.alive(int((self.tmp / "grandchild.pid").read_text())))
         finally:
             self.kill_leftovers()
+
+    def test_fork_handoff_descendant_is_never_reported_complete(self):
+        # C1 regression: a setsid'd, TERM-ignoring chain forks and exits continuously. The
+        # supervisor (child subreaper) adopts every generation and proves emptiness only by ECHILD.
+        root = self.gate_root(delay=0.05, converge=True, handoff=True)
+        try:
+            r, v = self.run_gate(root, 8)
+            self.assertEqual(r.returncode, 1, r.stderr)
+            self.assertFalse(v["ok"])
+            self.assertNotEqual(v["host_updater_quiescence"], "completed")
+            self.assertEqual((v["host_updater_quiescence"], v["rollback_safe"]), ("reaped", True))
+            pids = [int(x) for x in (self.tmp / "handoff.pids").read_text().split()]
+            self.assertGreater(len(pids), 3)
+            # Every generation is gone (adopted and reaped, so none can be a zombie of ours either).
+            self.assertEqual([p for p in pids if self.alive(p)], [])
+        finally:
+            try:
+                for p in (self.tmp / "handoff.pids").read_text().split():
+                    try:
+                        os.kill(int(p), 0)
+                    except OSError:
+                        pass
+            except OSError:
+                pass
+            self.kill_leftovers()
+
+    def test_updater_execs_with_unblocked_signals_and_cooperative_term_exits(self):
+        # C2: the canary blocks TERM/INT/HUP only around spawn+record; the updater must not inherit it.
+        root = self.gate_root(delay=30)
+        try:
+            r, v = self.run_gate(root, 0.8)
+            rec = self.read_updater()
+            self.assertEqual(int(rec["sigblk"], 16), 0)
+            # Default-disposition updater exits on the supervisor's SIGTERM, well before SIGKILL escalation.
+            self.assertEqual((r.returncode, v["host_updater_trigger"]), (1, "timeout"))
+            self.assertEqual((v["host_updater_quiescence"], v["rollback_safe"]), ("reaped", True))
+            self.assertFalse(self.alive(rec["pid"]))
+        finally:
+            self.kill_leftovers()
+
+    def test_failed_pdeathsig_prctl_never_execs_the_updater(self):
+        # C3: a failing PR_SET_PDEATHSIG (e.g. seccomp) refuses exec; the updater body never runs.
+        mod = self.gate_module()
+        root = self.gate_root(delay=0)
+        calls = []
+
+        def failing_prctl(*args):
+            calls.append(args)
+            return -1
+
+        canary = mod.Canary.__new__(mod.Canary)
+        canary.host_release_root = root
+        canary.candidate_sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
+        canary.run_token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        canary.host_updater_proc, canary.host_updater_rc = None, None
+        canary.host_updater_quiescence, canary.host_updater_settled = "not_dispatched", False
+        canary.host_updater_result_fd = None
+        canary.host_updater_trigger = canary.host_updater_trigger_error = None
+        with mock.patch.object(mod, "load_prctl", lambda: failing_prctl):
+            canary.run_owned_updater(str(self.tmp), time.monotonic() + 5)
+        self.assertEqual((canary.host_updater_trigger, canary.host_updater_trigger_error),
+                         ("failed", "host_updater_pdeathsig_failed"))
+        self.assertEqual(canary.host_updater_quiescence, "not_dispatched")
+        self.assertIsNone(canary.host_updater_proc)
+        self.assertFalse((self.tmp / "updater.json").exists())
+        self.assertEqual(calls, [])  # prctl ran only in the forked child, never in the canary
 
     def test_sigterm_while_updater_runs_reaps_exact_owned_group(self):
         # Real signal window: the updater has started, then the canary itself is SIGTERMed.
@@ -2027,21 +2111,36 @@ sys.exit({exit_code!r})
 
     def test_unprovable_group_quiescence_is_a_hold_with_exit_75(self):
         mod = self.gate_module()
-        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+        # A supervisor that never reports (or must be SIGKILLed) proves nothing: unproven -> hold.
+        proc = subprocess.Popen([sys.executable, "-c", "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); print(flush=True); time.sleep(60)"],
+                                start_new_session=True, stdout=subprocess.PIPE)
+        proc.stdout.readline()  # TERM is ignored from here on
+        r_fd, w_fd = os.pipe()
         try:
             canary = mod.Canary.__new__(mod.Canary)
             canary.host_updater_proc, canary.host_updater_rc = proc, None
-            canary.host_updater_quiescence = "unproven"
-            # /proc cannot prove emptiness -> never claims quiescence, whatever the kill did.
-            with mock.patch.object(mod, "group_live_members", lambda pgid: None):
-                canary.reap_owned_updater(time.monotonic() + 0.4)
+            canary.host_updater_quiescence, canary.host_updater_settled = "unproven", False
+            canary.host_updater_result_fd = r_fd
+            canary.host_updater_trigger = canary.host_updater_trigger_error = None
+            with mock.patch.object(mod, "HOST_UPDATER_TERM_GRACE_S", 0.05), \
+                    mock.patch.object(mod, "HOST_UPDATER_SUPERVISOR_SLACK_S", 0.2):
+                canary.reap_owned_updater(time.monotonic() + 0.3)
             self.assertEqual(canary.host_updater_quiescence, "unproven")
-            # A foreign/unrelated pid is never signalled: the owned leader stays unreaped (pid reserved).
-            canary.reap_owned_updater(time.monotonic() + 2)
-            self.assertEqual(canary.host_updater_quiescence, "reaped")
+            self.assertEqual(canary.host_updater_trigger_error, "host_updater_supervisor_killed")
+            self.assertIsNotNone(proc.returncode)  # reaped by us, never a foreign pid
+            # A supervisor exiting 0 without an ECHILD-backed report is also unproven.
+            proc2 = subprocess.Popen([sys.executable, "-c", "pass"])
+            r2, w2 = os.pipe()
+            os.write(w2, b'{"empty": false, "dispatched": true, "leader_rc": 0, "killed": false}')
+            os.close(w2)
+            canary.host_updater_proc, canary.host_updater_settled, canary.host_updater_result_fd = proc2, False, r2
+            canary.reap_owned_updater(time.monotonic() + 5)
+            self.assertEqual(canary.host_updater_quiescence, "unproven")
         finally:
             proc.kill()
             proc.wait()
+            proc.stdout.close()
+            os.close(w_fd)
         class Fake:
             def __init__(self, *a, **k): pass
             def execute(self):

@@ -8,12 +8,15 @@ Deploy-gate exit statuses: 0 pass; 1 failed with the owned updater proven quiesc
 (or never dispatched); 75 (EXIT_ROLLBACK_HOLD) failed AND quiescence of the updater
 process group this run spawned could not be proven. Every candidate-bound verdict
 carries a machine-readable ``rollback_safe`` boolean: true only after the owned
-updater process group was reaped and positively proven empty (or never spawned).
-The updater runs as a synchronous child of the canary (own session/process group,
-PR_SET_PDEATHSIG), so there is no detached authority; a caller must still treat a
-missing/malformed verdict, ssh loss or wrapper timeout (124/137) as a hold, because a
-hard-killed canary cannot publish its proof and already-spawned self-bounded leaf
-subprocesses (systemctl, repin) may briefly outlive it.
+updater subtree was proven empty by the kernel (or never spawned). The updater runs
+under a dedicated synchronous supervisor child (PR_SET_CHILD_SUBREAPER, checked
+PR_SET_PDEATHSIG) that adopts every descendant and reports emptiness only on an atomic
+waitpid ECHILD; /proc snapshots are never positive proof. Success requires the updater
+to exit 0 with no descendant killed; a force-killed straggler is quiescent but
+incomplete and fails. PR_SET_PDEATHSIG only kills a direct child: a hard-killed canary
+or supervisor proves nothing, so a caller must still treat a missing/malformed verdict,
+ssh loss or wrapper timeout (124/137) as a hold; manager-spawned leaf effects
+(systemctl, repin) are outside the subtree.
 """
 import argparse, datetime, errno, fcntl, grp, hashlib, ipaddress, json, os, pathlib, pwd, re, shlex, signal, stat, subprocess, sys, time, urllib.parse, uuid
 
@@ -205,31 +208,105 @@ def load_prctl():
         return None
 
 
-def group_live_members(pgid):
-    """Live (non-zombie) pids whose process group is ``pgid``; None when /proc cannot prove it."""
-    live = []
+HOST_UPDATER_SUPERVISOR_SLACK_S = 5.0
+# Dedicated synchronous updater supervisor, run as `python3 -I -S -c` (constant code, no file).
+# It makes itself a child subreaper, so every descendant of the updater that loses its parent
+# (double fork, setsid, handoff chains) is reparented to it. Completion is proven only by the
+# kernel: waitpid(-1) failing with ECHILD atomically means the supervisor has no child, live or
+# zombie, hence no descendant at all (an exiting parent's children are reparented before its
+# zombie becomes reapable). Signals only ever go to its own unreaped direct children (pids
+# reserved until it reaps them) or to the leader's group while the leader is unreaped.
+# Result: one JSON object on fd argv[1]; any killing makes the run incomplete.
+HOST_UPDATER_SUPERVISOR = r"""
+import ctypes, json, os, signal, sys, time
+prctl = ctypes.CDLL(None, use_errno=True).prctl
+out_fd, budget, grace = int(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3])
+env, argv = json.loads(sys.argv[4]), sys.argv[5:]
+os.set_inheritable(out_fd, False)
+SIGS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+stop = []
+for s in SIGS:
+    signal.signal(s, lambda n, f: stop.append(n))
+res = {"dispatched": False, "leader_rc": None, "killed": False, "empty": False, "error": None}
+def finish():
+    os.write(out_fd, json.dumps(res).encode())
+    os._exit(0)
+if prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+    res["error"] = "subreaper_failed"
+    finish()
+me = os.getpid()
+deadline = time.monotonic() + budget
+r, w = os.pipe()
+old = signal.pthread_sigmask(signal.SIG_BLOCK, SIGS)
+leader = os.fork()
+if leader == 0:
     try:
-        names = os.listdir("/proc")
-    except OSError:
-        return None
-    for name in names:
-        if not name.isdigit():
-            continue
+        os.close(r)
+        os.setpgid(0, 0)
+        if prctl(1, int(signal.SIGKILL), 0, 0, 0) != 0 or os.getppid() != me:
+            os.write(w, b"P")
+            os._exit(127)
+        for s in SIGS:
+            signal.signal(s, signal.SIG_DFL)
+        signal.pthread_sigmask(signal.SIG_SETMASK, old)
+        os.execve(argv[0], argv, env)
+    except BaseException:
+        pass
+    try:
+        os.write(w, b"E")
+    finally:
+        os._exit(127)
+signal.pthread_sigmask(signal.SIG_SETMASK, old)
+os.close(w)
+tag = os.read(r, 1)
+os.close(r)
+res["dispatched"] = tag == b""
+res["error"] = {b"P": "pdeathsig_failed", b"E": "exec_failed"}.get(tag)
+leader_reaped = False
+def signal_children(sig):
+    if not leader_reaped:
         try:
-            with open(f"/proc/{name}/stat", "rb") as fh:
-                data = fh.read()
-        except FileNotFoundError:
-            continue
+            os.killpg(leader, sig)
         except OSError:
-            return None
+            pass
+    try:
+        with open(f"/proc/self/task/{me}/children") as fh:
+            pids = [int(x) for x in fh.read().split()]
+    except (OSError, ValueError):
+        return
+    for pid in pids:
         try:
-            fields = data[data.rindex(b")") + 2:].split()
-            state, group = fields[0], int(fields[2])
-        except (ValueError, IndexError):
-            return None
-        if group == pgid and state != b"Z":
-            live.append(int(name))
-    return live
+            os.kill(pid, sig)
+        except OSError:
+            pass
+leader_done = term_at = None
+while True:
+    try:
+        while True:
+            pid, status = os.waitpid(-1, os.WNOHANG)
+            if pid == 0:
+                break
+            if pid == leader:
+                leader_reaped = True
+                res["leader_rc"] = os.waitstatus_to_exitcode(status)
+                leader_done = time.monotonic()
+    except ChildProcessError:
+        res["empty"] = True
+        break
+    now = time.monotonic()
+    if term_at is None:
+        if stop or now >= deadline or (leader_done is not None and now >= leader_done + grace):
+            term_at = now
+            res["killed"] = True
+            signal_children(signal.SIGTERM)
+    elif now >= term_at + 2 * grace:
+        res["error"] = res["error"] or "not_quiescent"
+        break
+    elif now >= term_at + grace:
+        signal_children(signal.SIGKILL)
+    time.sleep(0.01)
+finish()
+"""
 
 
 class StageFailure(Exception):
@@ -749,6 +826,8 @@ class Canary:
         self.host_updater_proc = None
         self.host_updater_rc = None
         self.host_updater_quiescence = "not_dispatched"
+        self.host_updater_settled = False
+        self.host_updater_result_fd = None
         self.pyz_fd = None
         self.hub_pass_fds = ()
         self.lock_fd = None
@@ -1158,16 +1237,8 @@ class Canary:
             self.host_updater_trigger = "failed"
             self.host_updater_trigger_error = f"host_updater_trigger_exit_{rc}"
 
-    @staticmethod
-    def leader_exited(proc):
-        """True once the unreaped leader has terminated (WNOWAIT keeps its pid/pgid reserved)."""
-        try:
-            return os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
-        except ChildProcessError:
-            return True
-
     def run_owned_updater(self, xdg_dir, effective_deadline):
-        """Run the candidate-bound updater as a synchronous owned process group; reap it before returning."""
+        """Run the candidate-bound updater under the synchronous subreaper supervisor; settle it before returning."""
         argv = host_updater_gate_argv(
             self.host_release_root.absolute(), pathlib.Path.home(), self.candidate_sha, self.run_token)
         if argv is None:
@@ -1178,92 +1249,127 @@ class Canary:
             self.host_updater_trigger = "failed"
             self.host_updater_trigger_error = "host_updater_pdeathsig_unavailable"
             return
+        import ctypes  # already loaded by load_prctl; never imported after fork
+        get_errno = ctypes.get_errno
         env = host_updater_gate_env(pathlib.Path.home(), xdg_dir)
+        grace = HOST_UPDATER_TERM_GRACE_S
+        budget = max(0.0, effective_deadline - time.monotonic())
         parent = os.getpid()
+        mask = {signal.SIGTERM, signal.SIGINT, signal.SIGHUP}
+        old_mask = None
 
-        def child_setup():  # no allocation-heavy work, no dlopen: prctl was resolved pre-fork
-            prctl(1, int(signal.SIGKILL), 0, 0, 0)  # PR_SET_PDEATHSIG
+        def child_setup():  # prctl/get_errno resolved pre-fork: no import, no dlopen here
+            if prctl(1, int(signal.SIGKILL), 0, 0, 0) != 0:  # PR_SET_PDEATHSIG must hold before exec
+                raise OSError(get_errno(), "PR_SET_PDEATHSIG failed")
             if os.getppid() != parent:  # canary already gone before the prctl took effect
                 os._exit(1)
+            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)  # never exec with TERM/INT/HUP blocked
 
+        r_fd, w_fd = os.pipe()
+        sup_argv = [HOST_UPDATER_GATE_PYTHON, "-I", "-S", "-c", HOST_UPDATER_SUPERVISOR, str(w_fd),
+                    f"{budget:.3f}", f"{grace:.3f}", json.dumps(env, sort_keys=True), *argv]
         # Spawn and record ownership atomically w.r.t. our own termination signals: a signal
         # arriving after the fork but before the record would otherwise orphan the child.
-        mask = {signal.SIGTERM, signal.SIGINT, signal.SIGHUP}
         old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, mask)
         try:
             self.host_updater_quiescence = "unproven"
             try:
                 self.host_updater_proc = subprocess.Popen(
-                    argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    env=env, cwd="/", start_new_session=True, preexec_fn=child_setup)
-            except OSError:
+                    sup_argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    env=env, cwd="/", start_new_session=True, pass_fds=(w_fd,), preexec_fn=child_setup)
+                self.host_updater_result_fd = r_fd
+            except (OSError, subprocess.SubprocessError) as error:
+                os.close(r_fd)
                 self.host_updater_quiescence = "not_dispatched"
                 self.host_updater_trigger = "failed"
-                self.host_updater_trigger_error = "host_updater_trigger_exit_127"
+                self.host_updater_trigger_error = (
+                    "host_updater_pdeathsig_failed" if isinstance(error, subprocess.SubprocessError)
+                    else "host_updater_trigger_exit_127")
                 return
+            finally:
+                os.close(w_fd)
         finally:
             signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)  # a pending signal is delivered here, proc recorded
-        proc = self.host_updater_proc
-        while not self.leader_exited(proc):
-            if time.monotonic() >= effective_deadline:
-                break
-            time.sleep(min(0.02, max(0.0, effective_deadline - time.monotonic())))
-        timed_out = not self.leader_exited(proc)
-        self.reap_owned_updater(time.monotonic() + max(self.cleanup_budget, 1.0))
-        rc = 124 if timed_out else self.host_updater_rc
-        self.set_trigger_outcome(rc if self.host_updater_quiescence != "unproven" else 124)
+        self.await_owned_updater(time.monotonic() + budget + 2 * grace + HOST_UPDATER_SUPERVISOR_SLACK_S,
+                                 terminate=False)
 
     def set_gate_paths_invalid(self):
         self.host_updater_trigger = "failed"
         self.host_updater_trigger_error = "host_updater_gate_paths_invalid"
 
-    def reap_owned_updater(self, deadline):
-        """Terminate (if needed), prove the exact owned group empty, then reap the leader.
+    def await_owned_updater(self, bound, *, terminate):
+        """Wait (bounded) for the supervisor's kernel-proven verdict; anything else is "unproven".
 
-        The leader stays UNREAPED until the group is proven empty, which keeps its pid/pgid
-        reserved so signals and the /proc scan can only ever address our own group. Anything
-        that cannot be proven leaves host_updater_quiescence == "unproven".
+        The supervisor is our unreaped direct child until poll() reaps it, so signalling it can
+        never hit a reused pid. A supervisor that must be SIGKILLed proves nothing about the
+        updater subtree (PR_SET_PDEATHSIG only kills its direct child): that stays unproven.
         """
         proc = self.host_updater_proc
-        if proc is None:
+        if self.host_updater_settled:
+            return
+        self.host_updater_quiescence = "unproven"
+        self.host_updater_rc = None
+        if terminate and proc.poll() is None:
+            proc.send_signal(signal.SIGTERM)
+        while proc.poll() is None and time.monotonic() < bound:
+            try:
+                time.sleep(0.02)
+            except CanaryTerminated:
+                if not terminate:
+                    raise  # cleanup re-enters with terminate=True; still unsettled and unproven
+        self.host_updater_settled = True
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+            self.host_updater_trigger, self.host_updater_trigger_error = "failed", "host_updater_supervisor_killed"
+            self.close_result_fd()
+            return
+        report = None
+        try:
+            os.set_blocking(self.host_updater_result_fd, False)
+            report = json.loads(os.read(self.host_updater_result_fd, 65536).decode("utf-8"),
+                                object_pairs_hook=unique_object)
+        except (OSError, ValueError, TypeError):
+            report = None
+        self.close_result_fd()
+        if not (proc.returncode == 0 and isinstance(report, dict) and report.get("empty") is True):
+            self.host_updater_trigger = "failed"
+            self.host_updater_trigger_error = "host_updater_not_quiescent"
+            return
+        leader_rc, killed = report.get("leader_rc"), report.get("killed") is True
+        if report.get("dispatched") is not True:
+            self.host_updater_quiescence = "not_dispatched"
+            self.host_updater_trigger = "failed"
+            self.host_updater_trigger_error = f"host_updater_{clean(report.get('error'), 40)}"
+            return
+        self.host_updater_quiescence = "completed" if leader_rc == 0 and not killed else "reaped"
+        if self.host_updater_quiescence == "completed":
+            self.host_updater_rc = 0
+            self.set_trigger_outcome(0)
+        elif killed and leader_rc == 0:
+            # The leader succeeded but a descendant had to be killed: the transaction is not complete.
+            self.host_updater_trigger, self.host_updater_trigger_error = "failed", "host_updater_incomplete"
+        elif killed and not terminate:
+            self.set_trigger_outcome(124)  # own deadline reached; leader stopped by the supervisor
+        elif killed:
+            self.host_updater_trigger, self.host_updater_trigger_error = "failed", "host_updater_terminated"
+        else:
+            self.host_updater_rc = leader_rc
+            self.set_trigger_outcome(leader_rc if isinstance(leader_rc, int) else 1)
+
+    def close_result_fd(self):
+        if self.host_updater_result_fd is not None:
+            os.close(self.host_updater_result_fd)
+            self.host_updater_result_fd = None
+
+    def reap_owned_updater(self, deadline):
+        """Cleanup path: ask the supervisor to stop (SIGTERM) and await its bounded verdict."""
+        if self.host_updater_proc is None:
             self.host_updater_quiescence = "not_dispatched"
             return
-        if self.host_updater_quiescence in ("completed", "reaped"):
-            return
-        pgid = proc.pid
-        now = time.monotonic()
-        # Leave most of the budget for the SIGKILL sequence: SIGTERM grace is at most 40% of it.
-        term_deadline = now + min(HOST_UPDATER_TERM_GRACE_S, 0.4 * max(0.0, deadline - now))
-        killed = False
-        try:
-            if not self.leader_exited(proc) or group_live_members(pgid):
-                try:
-                    os.killpg(pgid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                killed = True
-            while time.monotonic() < term_deadline and (
-                    not self.leader_exited(proc) or group_live_members(pgid)):
-                time.sleep(0.02)
-            while time.monotonic() < deadline:
-                members = group_live_members(pgid)
-                if self.leader_exited(proc) and members == []:
-                    break
-                try:
-                    os.killpg(pgid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                killed = True
-                time.sleep(0.02)
-            proven = self.leader_exited(proc) and group_live_members(pgid) == []
-            if proven:
-                code = proc.wait()  # reap only now
-                self.host_updater_rc = code
-                self.host_updater_quiescence = "completed" if code == 0 and not killed else "reaped"
-        except BaseException:
-            proven = False
-        if not proven:
-            self.host_updater_quiescence = "unproven"
+        grace = HOST_UPDATER_TERM_GRACE_S
+        self.await_owned_updater(
+            max(deadline, time.monotonic() + 2 * grace + HOST_UPDATER_SUPERVISOR_SLACK_S), terminate=True)
 
     def settle_host_updater(self, cleanup_deadline):
         """Cleanup hook: positively quiesce whatever the run left behind; sets host_updater_quiescence."""
