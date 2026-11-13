@@ -103,6 +103,9 @@ class NonblockingLaunchTests(unittest.TestCase):
                         }), '')
                     launcher = NativeLauncher({}, runner=runner)
                     launcher.wait_first_action = Mock(side_effect=AssertionError('start must not wait for a model'))
+                    # Codex readiness needs an installed release archive; its own
+                    # proof is covered in test_native_launch_host.
+                    launcher.codex_exec_readiness = Mock(return_value={'wrapper': 'proof'})
                     model = 'opencode-go/muse-spark-1.3-contributor' if engine == 'go' else 'test-model'
                     receipt = launcher.launch('hub2-s', {'session_id': 's', 'workspace': temp, 'engine': engine,
                         'model': model, 'effort': None, 'prompt': 'Work', 'timeout_seconds': 600})
