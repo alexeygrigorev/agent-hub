@@ -64,10 +64,11 @@ test('host.error refusal persists a sanitized attempt-bound diagnostic in the fa
  const f=fixture(),sessionId='host-diagnostic-refusal',epoch=await startOffered(f,sessionId),socket=hostSocket(f);
  await f.machine.webSocketMessage(socket as any,JSON.stringify({type:'host.error',session_id:sessionId,
   operation_id:'op-'+sessionId,epoch,stage:'host_launch',reason:'workspace_unavailable',
-  detail:'Requested workspace unavailable. Authorization: Bearer super-secret-token \u001b[31mTry the enrolled workspace\u001b[0m\n'}));
+  detail:'Requested workspace unavailable. Try the enrolled workspace. '+'x'.repeat(400)}));
  const stored=JSON.parse((f.database.prepare('SELECT evidence_json FROM sessions WHERE id=?').get(sessionId) as any).evidence_json);
  assert.match(stored._hub_host_start_diagnostic.detail,/Requested workspace unavailable/);
  assert.equal(stored._hub_host_start_diagnostic.attempt,0);
+ assert.equal(stored._hub_host_start_diagnostic.detail.length,240);
  const session=await view(f,sessionId);
  assert.equal(session.state,'failed');assert.equal(session.epoch,epoch);
  assert.deepEqual(session.attention.reason,'workspace_unavailable');
@@ -79,6 +80,27 @@ test('host.error refusal persists a sanitized attempt-bound diagnostic in the fa
  assert.equal(session.evidence,null,'internal diagnostic envelope is exposed only through attention');
  assert.equal(f.database.prepare('PRAGMA table_info(attention)').all().length,5,'diagnostics need no schema migration');
 });
+
+for(const [label,detail] of [
+ ['authorization header split by NUL','Authorization: Bearer\u0000 synthetic-private-token'],
+ ['secret assignment with colon','AWS_SECRET_ACCESS_KEY: synthetic-private-token'],
+] as const){
+ test(`host.error rejects ${label} detail from storage and session projection`,async()=>{
+  const f=fixture(),sessionId='host-diagnostic-unsafe-'+label.replace(/[^a-z]+/gi,'-'),epoch=await startOffered(f,sessionId),socket=hostSocket(f);
+  await f.machine.webSocketMessage(socket as any,JSON.stringify({type:'host.error',session_id:sessionId,
+   operation_id:'op-'+sessionId,epoch,stage:'host_launch',reason:'workspace_unavailable',detail}));
+  const stored=JSON.parse((f.database.prepare('SELECT evidence_json FROM sessions WHERE id=?').get(sessionId) as any).evidence_json);
+  const diagnostic=stored._hub_host_start_diagnostic;
+  assert.equal(diagnostic.reason,'workspace_unavailable');assert.equal(diagnostic.stage,'host_launch');
+  assert.equal('detail' in diagnostic,false);
+  assert.doesNotMatch(JSON.stringify(stored),/synthetic-private-token/);
+  const session=await view(f,sessionId);
+  assert.equal(session.state,'failed');assert.equal(session.epoch,epoch);
+  assert.equal(session.attention.reason,'workspace_unavailable');assert.equal(session.attention.stage,'host_launch');
+  assert.equal('detail' in session.attention,false);
+  assert.doesNotMatch(JSON.stringify(session),/synthetic-private-token/);
+ });
+}
 
 test('host.error refuses stale attempts and epochs without changing current attention or failure state',async()=>{
  const f=fixture(),sessionId='host-diagnostic-fence',epoch=await startOffered(f,sessionId),socket=hostSocket(f);
