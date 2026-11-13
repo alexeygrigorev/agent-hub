@@ -1,10 +1,17 @@
 """500-row intake acceptance through the published CLI build and production Node entry.
 
 Runs in the required Node 24 / Python 3.12 e2e job. Only an isolated loopback
-server and disposable SQLite files are used; no host daemon or model is started.
+server and disposable SQLite files are used for the intake test. The concurrency
+tests below additionally run the real Python host daemon with the stub native
+backend from hub2/tests/e2e (explicit shell engine; no provider, credential or
+production endpoint).
 """
 import importlib.util
+import json
+import re
 import shutil
+import threading
+import time
 from pathlib import Path
 from urllib.parse import quote
 
@@ -88,3 +95,183 @@ def test_real_cli_pages_500_unique_intakes_and_searches_across_projects():
     finally:
         server.stop()
         shutil.rmtree(root)
+
+
+def _load_harness():
+    repo = Path(__file__).resolve().parents[2]
+    spec = importlib.util.spec_from_file_location(
+        "concurrency_node_harness", repo / "hub2/tests/e2e/harness.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class _Hub:
+    """Isolated Node server + real host daemon + built CLI; always torn down by close()."""
+
+    def __init__(self, harness):
+        self.h = harness
+        self.root = harness.scratch_root()
+        self.server = harness.Server(self.root)
+        self.host = None
+        try:
+            self.cli = None
+            self.zipapp = harness.build_cli(self.root / "cli")
+            self.server.start()
+            token = harness.configure_hub(self.server)
+            self.host = harness.Host(self.root, self.server, token)
+            self.cli = harness.Cli(self.zipapp, self.root, self.server)
+            self.host.start()
+            harness.wait_for(self._connected, 30, label="host connected")
+        except BaseException:
+            self.close()
+            raise
+
+    def _connected(self):
+        assert self.host.alive(), "host daemon exited; log:\n" + self.host.tail()
+        rows = self.server.ok("GET", "/api/fleet/routing/machines")["machines"]
+        return any(r.get("machine_id") == self.h.MACHINE and r.get("connected") is True for r in rows)
+
+    def start_shell(self, command, *extra):
+        return self.cli.run("sessions", "start", "--engine", "shell", "--workspace", str(self.host.workspace),
+                            "--prompt", command, "--key", self.h.new_key(), *extra)
+
+    def show(self, session_id):
+        return self.cli.json("sessions", "show", session_id, "--json")["session"]
+
+    def native_by_tag(self):
+        return {row.get("tag"): row for row in self.host.native_rows()}
+
+    def log_lines(self, pattern):
+        text = self.host.log_path.read_text(errors="replace")
+        return re.findall(pattern, text, flags=re.M)
+
+    def close(self):
+        try:
+            if self.host:
+                try:
+                    self.host.control(start_delay_s=0)
+                except OSError:
+                    pass
+                self.host.kill()
+                self.host.kill_all_native()
+        finally:
+            try:
+                self.server.stop()
+            finally:
+                shutil.rmtree(self.root, ignore_errors=True)
+
+
+def _offer_result_counts(hub, session_id):
+    offers = hub.log_lines(r"Host event type=session\.offer session=%s$" % re.escape(session_id))
+    results = hub.log_lines(r"Host event complete session=%s$" % re.escape(session_id))
+    return len(offers), len(results)
+
+
+def test_ten_barrier_released_cli_starts_all_reach_running_with_unique_ids():
+    harness = _load_harness()
+    hub = _Hub(harness)
+    try:
+        count = 10
+        barrier = threading.Barrier(count)
+        outcomes = [None] * count
+
+        def worker(index):
+            try:
+                barrier.wait(timeout=60)
+                outcomes[index] = hub.start_shell("printf CONCURRENT-%d; sleep 300" % index)
+            except BaseException as error:  # reported by the main thread
+                outcomes[index] = error
+
+        threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(count)]
+        began = time.monotonic()
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=240)
+        elapsed = time.monotonic() - began
+        assert not any(t.is_alive() for t in threads), "a CLI start never returned"
+        created = []
+        for index, result in enumerate(outcomes):
+            assert not isinstance(result, BaseException), (index, repr(result))
+            assert result.returncode == 0, "start %d rc=%s\n%s\n%s\nhost:\n%s" % (
+                index, result.returncode, result.stdout[-1500:], result.stderr[-1500:], hub.host.tail())
+            created.append(json.loads(result.stdout))
+        ids = [row["id"] for row in created]
+        assert len(set(ids)) == count, ids
+        assert all(row.get("state") == "running" for row in created), [row.get("state") for row in created]
+
+        deadline = time.monotonic() + 60
+        shown = {}
+        while len(shown) < count and time.monotonic() < deadline:
+            for session_id in ids:
+                row = hub.show(session_id)
+                if row.get("state") == "running" and row.get("native_id"):
+                    shown[session_id] = row
+            time.sleep(0.5)
+        assert len(shown) == count, "not all sessions running: %s" % sorted(set(ids) - set(shown))
+        native_ids = [shown[i]["native_id"] for i in ids]
+        assert len(set(native_ids)) == count, native_ids
+        assert all(shown[i].get("machine_id") == harness.MACHINE for i in ids), shown
+        natives = hub.native_by_tag()
+        for session_id in ids:
+            native = natives.get("task-hub2-" + session_id)
+            assert native and native["phase"] == "running", (session_id, list(natives))
+            assert native["id"] == shown[session_id]["native_id"]
+            # The host isolates each launch in a worktree under the requested workspace.
+            assert Path(native["workspace"]).resolve().is_relative_to(hub.host.workspace.resolve()), native
+        listed = {row["id"]: row for row in hub.cli.json("sessions", "list", "--json")["sessions"]}
+        for session_id in ids:
+            row = listed[session_id]
+            assert row.get("machine") == harness.MACHINE or row.get("machine_id") == harness.MACHINE, row
+            assert row.get("workspace") and Path(row["workspace"]).resolve().is_relative_to(hub.host.workspace.resolve()), row
+        for session_id in ids:
+            assert _offer_result_counts(hub, session_id) == (1, 1), (session_id, hub.host.tail(100))
+        print("ten concurrent starts running in %.2fs wall" % elapsed)
+    finally:
+        hub.close()
+
+
+def test_real_cli_stop_is_confirmed_within_10s_while_another_launch_is_pending():
+    harness = _load_harness()
+    hub = _Hub(harness)
+    try:
+        running = json.loads(hub.start_shell("printf OWNED-RUNNING; sleep 300").stdout)
+        owned_id = running["id"]
+        owned = harness.wait_for(
+            lambda: (lambda row: row if row.get("state") == "running" and row.get("native_id") else None)(hub.show(owned_id)),
+            60, label="owned session running")
+        assert hub.native_by_tag().get("task-hub2-" + owned_id), hub.host.native_rows()
+        marker = hub.host.state / "start-pending"
+        assert not marker.exists()
+
+        # Every further native `a start` now blocks inside the stub (pending marker), as a slow launch.
+        hub.host.control(start_delay_s=600)
+        pending = hub.start_shell("printf PENDING; sleep 300", "--no-wait")
+        assert pending.returncode == 0, (pending.stdout[-1500:], pending.stderr[-1500:])
+        pending_id = json.loads(pending.stdout)["id"]
+        harness.wait_for(marker.exists, 60, label="second launch blocked inside native start")
+        assert marker.read_text().strip() == "task-hub2-" + pending_id
+        assert "task-hub2-" + pending_id not in hub.native_by_tag(), "pending launch already has a native session"
+        assert hub.show(pending_id)["state"] != "running"
+
+        stop_started = time.monotonic()
+        stop = hub.cli.run("sessions", "stop", owned_id, "--timeout", "10")
+        stop_elapsed = time.monotonic() - stop_started
+        assert stop.returncode == 0, (stop.stdout[-1500:], stop.stderr[-1500:], hub.host.tail())
+        stopped = harness.wait_for(
+            lambda: (lambda row: row if row.get("state") in ("stopped", "failed") else None)(hub.show(owned_id)),
+            max(0.5, 10 - stop_elapsed), interval=0.2, label="stopped state")
+        total = time.monotonic() - stop_started
+        assert stopped["state"] == "stopped", stopped
+        assert total < 10, "stop confirmed after %.2fs" % total
+        assert "task-hub2-" + owned_id not in hub.native_by_tag(), "owned native still listed after stop"
+        # The other launch was still pending the whole time (no native session appeared).
+        assert "task-hub2-" + pending_id not in hub.native_by_tag()
+        assert hub.show(pending_id)["state"] != "running"
+        assert _offer_result_counts(hub, owned_id) == (1, 1), hub.host.tail(100)
+        offers, _ = _offer_result_counts(hub, pending_id)
+        assert offers == 1, hub.host.tail(100)
+        print("stop confirmed in %.2fs (cli %.2fs) with a pending launch" % (total, stop_elapsed))
+    finally:
+        hub.close()
