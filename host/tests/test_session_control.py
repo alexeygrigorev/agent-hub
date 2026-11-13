@@ -970,7 +970,13 @@ class TestSessionControlCli(unittest.TestCase):
         for detail in ('"AWS_SECRET_ACCESS_KEY": "synthetic-private-token"',
                        '"access_token": "synthetic-private-token"',
                        "'access_token': 'synthetic-private-token'",
-                       '`access_token`: `synthetic-private-token`'):
+                       '`access_token`: `synthetic-private-token`',
+                       '"private_key": "synthetic-private-token"',
+                       '"api key": "synthetic-private-token"',
+                       '"access_token ": "synthetic-private-token"',
+                       'https://synthetic-private-token@example.test/repo.git',
+                       'private_key: synthetic-private-token',
+                       'api key: synthetic-private-token'):
             with self.subTest(detail=detail):
                 self.assertIsNone(session_control.sanitize_start_detail(detail))
         self.assertIsNone(session_control.sanitize_start_detail('Workspace unavailable.' + chr(27) + '[31m Retry'))

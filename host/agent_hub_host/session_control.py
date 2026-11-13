@@ -50,10 +50,11 @@ SAFE_ERROR = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 HOST_START_DETAIL_LIMIT = 240
 _UNSAFE_DETAIL_CONTROL = re.compile(r'[\x00-\x1f\x7f-\x9f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]')
 _CREDENTIAL_ASSIGNMENT = re.compile(
-    r'\b(?:[A-Za-z0-9_-]*(?:authorization|proxy-authorization|www-authenticate|cookie|token|api[_-]?key|'
+    r'\b(?:[A-Za-z0-9_-]*(?:authorization|proxy-authorization|www-authenticate|cookie|token|api[ _-]?key|private[ _-]?key|'
     r'password|passwd|secret|credential)[A-Za-z0-9_-]*)\b["\'`]?\s*[:=]', re.IGNORECASE)
+_QUOTED_ASSIGNMENT = re.compile(r"[\"'`][^\"'`\r\n]{1,128}[\"'`]\s*[:=]")
 _INLINE_CREDENTIAL = re.compile(r'\b(?:Bearer|Basic)\s+\S', re.IGNORECASE)
-_URL_CREDENTIAL = re.compile(r'https?://[^\s/@:]+:[^\s/@]+@', re.IGNORECASE)
+_URL_CREDENTIAL = re.compile(r'https?://[^\s/@]+@', re.IGNORECASE)
 _TOKEN_CREDENTIAL = re.compile(r'\b(?:gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[A-Z0-9]{16})\b')
 # Error bodies are small; refuse unexpectedly large responses before parsing.
 MAX_ERROR_RESPONSE = 64 * 1024
@@ -68,6 +69,7 @@ def sanitize_start_detail(value):
     # header can expose the value that followed it.
     if (_UNSAFE_DETAIL_CONTROL.search(detail)
             or _CREDENTIAL_ASSIGNMENT.search(detail)
+            or _QUOTED_ASSIGNMENT.search(detail)
             or _INLINE_CREDENTIAL.search(detail)
             or _URL_CREDENTIAL.search(detail)
             or _TOKEN_CREDENTIAL.search(detail)):
