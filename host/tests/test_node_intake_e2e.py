@@ -453,8 +453,23 @@ def test_real_cli_start_flags_change_route_cwd_native_output_and_policy(plain_op
         subdir = hub.host.workspace / "sub"
         subdir.mkdir()
 
-        # --model/--effort/--cwd through a registered workspace label (not an absolute path).
+        # Resolve a registered label with no --cwd override. A wrong label must
+        # fail before native execution; otherwise an ignored label could pass.
         label = hub.host.workspace.name
+        label_result = _model_start(hub, "--model", ALT, "--effort", "low", workspace=label)
+        label_created, label_row, label_native = _running(hub, label_result)
+        assert label_row["requested_workspace"] == label, label_row
+        assert Path(label_native["cwd"]).resolve().is_relative_to(hub.host.workspace.resolve()), label_native
+        assert not Path(label_native["cwd"]).resolve().is_relative_to(subdir.resolve()), label_native
+        assert Path(label_row["workspace"]).resolve() == Path(label_native["cwd"]).resolve(), label_row
+        native_before = set(hub.native_by_tag())
+        missing_label = _model_start(hub, "--model", ALT, "--effort", "low", workspace="missing-label-e2e")
+        assert missing_label.returncode != 0, missing_label.stdout
+        assert "workspace_label_unavailable" in missing_label.stdout + missing_label.stderr
+        assert "stage=host_launch" in missing_label.stderr, missing_label.stderr
+        assert set(hub.native_by_tag()) == native_before
+
+        # --cwd deliberately overrides the label, independently of the label-only case.
         started = _model_start(hub, "--model", ALT, "--effort", "low", "--cwd", str(subdir), workspace=label)
         created, row, native = _running(hub, started)
         assert (created["engine"], created["model"], created["effort"], created["policy_id"]) == (
