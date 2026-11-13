@@ -1092,11 +1092,13 @@ class AntigravityWorkspaceTrustTests(unittest.TestCase):
 
     @staticmethod
     def settings_of(argv):
-        values = [argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == '--settings']
-        assert len(values) == 1 and not any(a.startswith('--settings=') for a in argv), argv
+        options = argv[:-2] if len(argv) >= 2 and argv[-2] == '--prompt-interactive' else argv
+        values = [options[i + 1] for i, arg in enumerate(options[:-1]) if arg == '--settings']
+        assert len(values) == 1 and not any(a.startswith('--settings=') for a in options), argv
         return json.loads(values[0])
 
-    def launch(self, workspace, *, interactive=True, effort='medium', provider='antigravity', model=None):
+    def launch(self, workspace, *, interactive=True, effort='medium', provider='antigravity', model=None,
+               prompt='do the scoped work'):
         captured = {}
         native_id = 'd6cf9872-8597-48a5-be64-990cdef4db31'
         model = model or self.MODEL
@@ -1109,7 +1111,7 @@ class AntigravityWorkspaceTrustTests(unittest.TestCase):
 
         adapter = nl.NativeLauncher({'private_provider_homes': False, 'routes': {provider: nl.LOCAL_ROUTES[provider]}},
                                     aplexer='synthetic-aplexer', runner=runner)
-        spec = {'workspace': str(workspace), 'engine': provider, 'model': model, 'prompt': 'do the scoped work',
+        spec = {'workspace': str(workspace), 'engine': provider, 'model': model, 'prompt': prompt,
                 'interactive': interactive, 'timeout_seconds': 90, 'operation_id': 'agy-trust-op', 'epoch': 1,
                 'effort': effort}
         with mock.patch.object(adapter, 'record_evidence'):
@@ -1172,17 +1174,18 @@ class AntigravityWorkspaceTrustTests(unittest.TestCase):
 
     def test_existing_inline_settings_are_merged_not_shadowed(self):
         workspace = str(self.root)
-        existing = json.dumps({'theme': 'dark', 'nested': {'a': [1, 2]}})
+        existing = json.dumps({'theme': 'dark', 'ratio': 1.5, 'label': 'ünï "q"', 'nested': {'a': [1, 2]}})
         base = ['agy', '--model', 'm', '--settings', existing, '--effort', 'low', '--prompt-interactive', 'p']
         argv = nl.antigravity_trust_argv(base, workspace)
         self.assertEqual(argv[:3] + argv[5:], base[:3] + base[5:])
-        self.assertEqual(self.settings_of(argv), {'theme': 'dark', 'nested': {'a': [1, 2]},
-                                                  'trustedWorkspaces': [workspace]})
+        self.assertEqual(self.settings_of(argv), {'theme': 'dark', 'ratio': 1.5, 'label': 'ünï "q"',
+                                                  'nested': {'a': [1, 2]}, 'trustedWorkspaces': [workspace]})
         equals = nl.antigravity_trust_argv(['agy', '--settings=' + existing, '--prompt-interactive', 'p'], workspace)
         self.assertEqual(self.settings_of(equals)['theme'], 'dark')
-        same = nl.antigravity_trust_argv(['agy', '--settings', json.dumps({'trustedWorkspaces': [workspace]}),
+        same = nl.antigravity_trust_argv(['agy', '--settings',
+                                          json.dumps({'trustedWorkspaces': [workspace], 'theme': 'dark'}),
                                           '--prompt-interactive', 'p'], workspace)
-        self.assertEqual(self.settings_of(same), {'trustedWorkspaces': [workspace]})
+        self.assertEqual(self.settings_of(same), {'trustedWorkspaces': [workspace], 'theme': 'dark'})
 
     def test_forged_or_unverifiable_settings_never_widen_trust(self):
         workspace = str(self.root)
@@ -1194,11 +1197,56 @@ class AntigravityWorkspaceTrustTests(unittest.TestCase):
             ['agy', '--settings', '[]', 'p'],
             ['agy', '--settings', '{}', '--settings', '{}', 'p'],
             ['agy', '--settings'],
+            ['agy', '--settings', f'{{"trustedWorkspaces":["/evil"],"trustedWorkspaces":["{workspace}"]}}',
+             '--prompt-interactive', 'p'],
+            ['agy', '--settings', '{"theme":"light","theme":"dark"}', '--prompt-interactive', 'p'],
+            ['agy', '--settings', '{"nested":{"a":1,"a":2}}', '--prompt-interactive', 'p'],
+            ['agy', '--settings', '{"x":NaN}', '--prompt-interactive', 'p'],
+            ['agy', '--settings', '{"x":Infinity}', '--prompt-interactive', 'p'],
+            ['agy', '--settings', '{"x":-Infinity}', '--prompt-interactive', 'p'],
+            ['agy', '--settings', '{"nested":{"x":NaN}}', '--prompt-interactive', 'p'],
+            ['agy', '--settings', '{"nested":[1,Infinity,-Infinity]}', '--prompt-interactive', 'p'],
+            ['agy', '--settings', '{"x":1e500}', '--prompt-interactive', 'p'],
+            ['agy', '--settings', '{"nested":[-1e500]}', '--prompt-interactive', 'p'],
         ]
         for argv in refused:
             with self.subTest(argv=argv):
                 with self.assertRaisesRegex(ValueError, 'antigravity_settings_unverified'):
                     nl.antigravity_trust_argv(argv, workspace)
+
+    def test_prompt_values_starting_with_flags_are_preserved_verbatim(self):
+        workspace = self.root / 'ws-flag-prompt'
+        workspace.mkdir()
+        fa_text = nl.FIRST_ACTION_INSTRUCTION.format(path=workspace / '.local/first-action-agy-trust.json')
+        for prompt_text in (
+            '--settings={"theme":"dark"}',
+            '--settings=invalid-not-json',
+            '--settings',
+            '--prompt-interactive',
+        ):
+            with self.subTest(prompt_text=prompt_text):
+                direct_prompt = prompt_text + fa_text
+                direct = nl.antigravity_trust_argv(
+                    ['agy', '--model', self.MODEL, '--prompt-interactive', direct_prompt], str(workspace))
+                self.assertEqual(direct[-2:], ['--prompt-interactive', direct_prompt])
+                self.assertEqual(self.settings_of(direct), {'trustedWorkspaces': [str(workspace)]})
+
+                _, captured = self.launch(workspace, prompt=prompt_text)
+                child = captured['child']
+                self.assertEqual(child[-2:], ['--prompt-interactive', nl.aplexer_prompt(direct_prompt)])
+                self.assertEqual(self.settings_of(child), {'trustedWorkspaces': [str(workspace)]})
+                self.assertEqual(nl.native_command_model(child), self.MODEL)
+                self.assertEqual(nl.command_effort(child), 'medium')
+
+        merged = nl.antigravity_trust_argv(
+            ['agy', '--model', self.MODEL, '--settings', '{"theme":"dark"}', '--prompt-interactive', '--settings=bad'],
+            str(workspace))
+        self.assertEqual(merged[-2:], ['--prompt-interactive', '--settings=bad'])
+        self.assertEqual(self.settings_of(merged), {'theme': 'dark', 'trustedWorkspaces': [str(workspace)]})
+
+        without_prompt_pair = nl.antigravity_trust_argv(['agy', '--model', self.MODEL], str(workspace))
+        self.assertEqual(without_prompt_pair[:3], ['agy', '--model', self.MODEL])
+        self.assertEqual(self.settings_of(without_prompt_pair), {'trustedWorkspaces': [str(workspace)]})
 
     def test_other_providers_and_headless_agy_argv_are_unchanged(self):
         workspace = self.root / 'ws'

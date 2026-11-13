@@ -6,6 +6,7 @@ external Agent Quota Launcher remains untouched for its other consumers.
 """
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -288,6 +289,26 @@ def antigravity_launch_workspace(workspace):
     return str(resolved)
 
 
+def _strict_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError('antigravity_settings_unverified')
+        result[key] = value
+    return result
+
+
+def _strict_json_constant(constant):
+    raise ValueError('antigravity_settings_unverified')
+
+
+def _strict_json_float(token):
+    value = float(token)
+    if not math.isfinite(value):
+        raise ValueError('antigravity_settings_unverified')
+    return value
+
+
 def antigravity_trust_argv(argv, workspace):
     """Session-only agy --settings granting trust to exactly one workspace.
 
@@ -295,33 +316,41 @@ def antigravity_trust_argv(argv, workspace):
     string array. Nothing is written to agy's global settings or trust store.
     An existing inline JSON object is merged rather than shadowed by a second
     flag; any other --settings form (file path, repeated flag, conflicting
-    trust list) is refused instead of guessed."""
+    trust list, duplicate keys or non-finite JSON values) is refused instead of
+    guessed."""
     trusted = [antigravity_launch_workspace(workspace)]
-    found = [i for i, arg in enumerate(argv) if arg == '--settings' or arg.startswith('--settings=')]
+    if len(argv) >= 2 and argv[-2] == '--prompt-interactive':
+        options, prompt_suffix = list(argv[:-2]), list(argv[-2:])
+    else:
+        options, prompt_suffix = list(argv), []
+    found = [i for i, arg in enumerate(options) if arg == '--settings' or arg.startswith('--settings=')]
     if len(found) > 1:
         raise ValueError('antigravity_settings_unverified')
-    result = list(argv)
     if found:
         index = found[0]
-        if result[index] == '--settings':
-            if index + 1 >= len(result):
+        if options[index] == '--settings':
+            if index + 1 >= len(options):
                 raise ValueError('antigravity_settings_unverified')
-            raw, span = result[index + 1], 2
+            raw, span = options[index + 1], 2
         else:
-            raw, span = result[index].split('=', 1)[1], 1
+            raw, span = options[index].split('=', 1)[1], 1
         try:
-            settings = json.loads(raw)
+            settings = json.loads(
+                raw,
+                object_pairs_hook=_strict_json_object,
+                parse_constant=_strict_json_constant,
+                parse_float=_strict_json_float,
+            )
         except ValueError:
             settings = None
         if not isinstance(settings, dict) or settings.get('trustedWorkspaces', trusted) != trusted:
             raise ValueError('antigravity_settings_unverified')
         settings['trustedWorkspaces'] = trusted
-        result[index:index + span] = ['--settings', json.dumps(settings, separators=(',', ':'))]
-        return result
-    settings = json.dumps({'trustedWorkspaces': trusted}, separators=(',', ':'))
+        options[index:index + span] = ['--settings', json.dumps(settings, separators=(',', ':'), allow_nan=False)]
+        return [*options, *prompt_suffix]
+    settings = json.dumps({'trustedWorkspaces': trusted}, separators=(',', ':'), allow_nan=False)
     # Options stay before the interactive prompt pair agy consumes last.
-    index = result.index('--prompt-interactive') if '--prompt-interactive' in result else len(result)
-    return [*result[:index], '--settings', settings, *result[index:]]
+    return [*options, '--settings', settings, *prompt_suffix]
 
 
 def goal_prompt(prompt, workspace, task_id, first_action_path):
