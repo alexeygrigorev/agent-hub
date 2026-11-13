@@ -168,6 +168,10 @@ const AUTH_FALLBACK_REASONS=new Set(['provider_auth_failed','provider_unauthoriz
   'credential_missing','refresh_refused','refresh_invalid','refresh_in_progress','refresh_outcome_uncertain','generation_conflict',
   'host_not_approved']);
 
+const ENGINE_UPDATE_JOBS_SCHEMA = [
+  'CREATE TABLE IF NOT EXISTS engine_update_jobs(id TEXT PRIMARY KEY,engine TEXT NOT NULL,binary TEXT NOT NULL,version_command TEXT NOT NULL,update_command TEXT NOT NULL,state TEXT NOT NULL,old_version TEXT,new_version TEXT,exit_code INTEGER,error TEXT,output TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL) WITHOUT ROWID',
+];
+
 /** Per-host presence, native-session evidence and durable completion outbox. */
 export class MachineDO {
   private alarmQueue:Promise<void>=Promise.resolve();
@@ -187,11 +191,11 @@ export class MachineDO {
     this.env = wrapSqlNamespaces(env, this.sqlReceipts) as Hub2Env;
     this.nativeInventory=new MachineNativeInventory(this.db,ctx);
     this.nativeCommands=new MachineNativeCommands(this.db,ctx,this.nativeInventory);
-    this.ready=initializeSchema(ctx, this.db, 9, LATEST_SCHEMA, [[SCHEMA[0]],COMPACT_KEYS,['ALTER TABLE machine_capabilities ADD COLUMN resources_json TEXT'],MACHINE_ACTIVE_MIGRATION,[
+    this.ready=initializeSchema(ctx, this.db, 10, [...LATEST_SCHEMA, ...ENGINE_UPDATE_JOBS_SCHEMA], [[SCHEMA[0]],COMPACT_KEYS,['ALTER TABLE machine_capabilities ADD COLUMN resources_json TEXT'],MACHINE_ACTIVE_MIGRATION,[
       'CREATE TABLE IF NOT EXISTS machine_liveness(singleton INTEGER PRIMARY KEY CHECK(singleton=1),observed_at INTEGER NOT NULL)',
       'CREATE TABLE IF NOT EXISTS native_sessions(session_id TEXT PRIMARY KEY,native_id TEXT,phase TEXT NOT NULL,last_activity_at INTEGER,exit_code INTEGER,containment_empty INTEGER NOT NULL,observed_at INTEGER NOT NULL) WITHOUT ROWID',
       'DROP TABLE IF EXISTS machine_active','ALTER TABLE machine_capabilities DROP COLUMN resources_json','ALTER TABLE machines DROP COLUMN active_session_id',
-    ],['ALTER TABLE session_commands ADD COLUMN capture_mode TEXT'],NATIVE_INVENTORY_SCHEMA,NATIVE_COMMAND_SCHEMA],()=>this.scheduleNext(),6,schemaMigrationCeiling(env.HUB2_SCHEMA_MIGRATIONS,8,9));
+    ],['ALTER TABLE session_commands ADD COLUMN capture_mode TEXT'],NATIVE_INVENTORY_SCHEMA,NATIVE_COMMAND_SCHEMA,ENGINE_UPDATE_JOBS_SCHEMA],()=>this.scheduleNext(),6,schemaMigrationCeiling(env.HUB2_SCHEMA_MIGRATIONS,8,10));
     this.constructorMs = performance.now() - started;
   }
 
@@ -208,6 +212,11 @@ export class MachineDO {
       if (url.pathname === '/_internal/mail' && request.method === 'POST') return await this.queueMail(request);
       if (url.pathname === '/_internal/mail-ack' && request.method === 'POST') return await this.settleMail(request, false);
       if (url.pathname === '/_internal/mail-cancel' && request.method === 'POST') return await this.settleMail(request, true);
+      if (url.pathname === '/_internal/engine-update' && request.method === 'POST') return await this.queueEngineUpdate(request);
+      const internalEngineUpdate = url.pathname.match(/^\/_internal\/engine-updates\/([0-9a-f-]{36})$/i);
+      if (internalEngineUpdate && request.method === 'GET') return this.getEngineUpdateJob(internalEngineUpdate[1]);
+      const engineUpdateAck = url.pathname.match(/^\/api\/engine-updates\/([0-9a-f-]{36})\/ack$/i);
+      if (engineUpdateAck && request.method === 'POST') return await this.ackEngineUpdateJob(request, engineUpdateAck[1]);
       if (url.pathname === '/_internal/mail-authorize' && request.method === 'POST') {
         const b=await bodyObject(request,4096);
         if(!boundedString(b.message_id,180)||!Number.isSafeInteger(b.epoch)||!boundedString(b.operation_id,180)||!boundedString(b.recipient,180)||!boundedString(b.machine_id,180))return error('invalid_delivery_binding',400);
@@ -267,6 +276,79 @@ export class MachineDO {
       if (caught instanceof HttpError) return error(caught.code, caught.status);
       return error('internal_error', 500);
     }
+  }
+
+  private async queueEngineUpdate(request: Request): Promise<Response> {
+    if (this.db.schemaVersion < 10) return error('schema_upgrade_required', 503);
+    const body = await bodyObject(request, 8192);
+    const jobId = typeof body.job_id === 'string' ? body.job_id : '';
+    const engine = typeof body.engine === 'string' ? body.engine : '';
+    const binary = typeof body.binary === 'string' ? body.binary : '';
+    const versionCommand = typeof body.version_command === 'string' ? body.version_command : '';
+    const updateCommand = typeof body.update_command === 'string' ? body.update_command : '';
+    if (!jobId || !engine || !binary || !versionCommand || !updateCommand) return error('invalid_engine_update_job', 400);
+    const now = Date.now();
+    const machine = this.db.one<MachineRow>('SELECT * FROM machines LIMIT 1');
+    const sockets = machine ? this.machineSockets(machine.machine_id) : [];
+    if (!sockets.length) {
+      this.db.run(
+        'INSERT OR REPLACE INTO engine_update_jobs(id,engine,binary,version_command,update_command,state,old_version,new_version,exit_code,error,output,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        jobId, engine, binary, versionCommand, updateCommand, 'failed', null, null, null, 'machine_offline', null, now, now,
+      );
+      return json({ id: jobId, engine, state: 'failed', error: 'machine_offline' });
+    }
+    this.db.run(
+      'INSERT OR REPLACE INTO engine_update_jobs(id,engine,binary,version_command,update_command,state,old_version,new_version,exit_code,error,output,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+      jobId, engine, binary, versionCommand, updateCommand, 'pending', null, null, null, null, null, now, now,
+    );
+    const frame = JSON.stringify({
+      type: 'engine.update',
+      job: { id: jobId, engine, binary, version_command: versionCommand, update_command: updateCommand },
+    });
+    let delivered = false;
+    for (const socket of sockets) {
+      try {
+        socket.send(frame);
+        delivered = true;
+        break;
+      } catch {}
+    }
+    if (!delivered) {
+      this.db.run(
+        "UPDATE engine_update_jobs SET state='failed',error='machine_socket_send_failed',updated_at=? WHERE id=?",
+        Date.now(), jobId,
+      );
+      return json({ id: jobId, engine, state: 'failed', error: 'machine_socket_send_failed' });
+    }
+    return json({ id: jobId, engine, state: 'pending' });
+  }
+
+  private getEngineUpdateJob(jobId: string): Response {
+    if (this.db.schemaVersion < 10) return error('schema_upgrade_required', 503);
+    const row = this.db.one<any>('SELECT * FROM engine_update_jobs WHERE id=?', jobId);
+    if (!row) return error('not_found', 404);
+    return json(row);
+  }
+
+  private async ackEngineUpdateJob(request: Request, jobId: string): Promise<Response> {
+    if (this.db.schemaVersion < 10) return error('schema_upgrade_required', 503);
+    const actor = actorFrom(request);
+    if (!actor || actor.kind !== 'machine' || !actor.resource_id) return error('forbidden', 403);
+    const row = this.db.one<any>('SELECT * FROM engine_update_jobs WHERE id=?', jobId);
+    if (!row) return error('not_found', 404);
+    const body = await bodyObject(request, 16_384);
+    const ok = body.ok === true;
+    const oldVersion = typeof body.old_version === 'string' ? body.old_version.slice(0, 120) : null;
+    const newVersion = typeof body.new_version === 'string' ? body.new_version.slice(0, 120) : null;
+    const exitCode = Number.isSafeInteger(body.exit_code) ? Number(body.exit_code) : null;
+    const errText = typeof body.error === 'string' ? body.error.slice(0, 500) : null;
+    const output = typeof body.output === 'string' ? body.output.slice(0, 2000) : null;
+    const state = ok ? 'completed' : 'failed';
+    this.db.run(
+      'UPDATE engine_update_jobs SET state=?,old_version=?,new_version=?,exit_code=?,error=?,output=?,updated_at=? WHERE id=?',
+      state, oldVersion, newVersion, exitCode, errText, output, Date.now(), jobId,
+    );
+    return json({ ok: true, id: jobId, state });
   }
 
   async alarm(): Promise<void> {

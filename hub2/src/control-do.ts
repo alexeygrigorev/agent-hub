@@ -87,6 +87,19 @@ const ENGINE_SCHEMA = [
  'CREATE TABLE IF NOT EXISTS hub2_engine_sync_reports(machine_id TEXT NOT NULL,label TEXT NOT NULL,revision TEXT NOT NULL,state TEXT NOT NULL,error TEXT,credential_generation INTEGER,updated_at INTEGER NOT NULL,PRIMARY KEY(machine_id,label)) WITHOUT ROWID',
 ];
 
+const ENGINE_REGISTRY_SCHEMA = [
+ 'CREATE TABLE IF NOT EXISTS hub2_engine_registry(engine TEXT PRIMARY KEY,binary TEXT NOT NULL,version_command TEXT NOT NULL,update_command TEXT NOT NULL,updated_at INTEGER NOT NULL) WITHOUT ROWID',
+ 'CREATE TABLE IF NOT EXISTS hub2_engine_update_runs(id TEXT PRIMARY KEY,requested_by TEXT NOT NULL,engine_filter TEXT,machine_filter TEXT,jobs_json TEXT NOT NULL,created_at INTEGER NOT NULL) WITHOUT ROWID',
+];
+
+const DEFAULT_ENGINE_REGISTRY: ReadonlyArray<{ engine: string; binary: string; version_command: string; update_command: string }> = [
+ { engine: 'claude', binary: 'claude', version_command: 'claude --version', update_command: 'npm install -g @anthropic-ai/claude-code@latest' },
+ { engine: 'codex', binary: 'codex', version_command: 'codex --version', update_command: 'npm install -g @openai/codex@latest' },
+ { engine: 'opencode', binary: 'opencode', version_command: 'opencode --version', update_command: 'npm install -g @opencode/cli@latest' },
+ { engine: 'gemini', binary: 'gemini', version_command: 'gemini --version', update_command: 'npm install -g @google/gemini-cli@latest' },
+ { engine: 'antigravity', binary: 'agy', version_command: 'agy --version', update_command: 'agy update' },
+];
+
 const CLAUDE_ENGINE_LABEL = 'hub-claude';
 const CLAUDE_ACCOUNT_ID = 'claude';
 const CLAUDE_BASELINE_VERSION = '2.1.312';
@@ -116,14 +129,14 @@ export class ControlDO {
     this.sqlReceipts = new SqlReceiptMeter(this.db);
     this.env = wrapSqlNamespaces(env, this.sqlReceipts) as Hub2Env;
     this.pickerAlerts=new PickerAlerts(this.db,ctx);
-    this.ready=initializeSchema(ctx, this.db, 6, SCHEMA,[ONCALL_SCHEMA,['CREATE TABLE IF NOT EXISTS session_start_reservations(operation_id TEXT PRIMARY KEY,session_id TEXT NOT NULL,expires_at INTEGER NOT NULL) WITHOUT ROWID', ...ENGINE_SCHEMA],ENGINE_SCHEMA,SHARED_MEMORY_SCHEMA,PICKER_ALERT_SCHEMA],async()=>{
+    this.ready=initializeSchema(ctx, this.db, 7, SCHEMA,[ONCALL_SCHEMA,['CREATE TABLE IF NOT EXISTS session_start_reservations(operation_id TEXT PRIMARY KEY,session_id TEXT NOT NULL,expires_at INTEGER NOT NULL) WITHOUT ROWID', ...ENGINE_SCHEMA],ENGINE_SCHEMA,SHARED_MEMORY_SCHEMA,PICKER_ALERT_SCHEMA,ENGINE_REGISTRY_SCHEMA],async()=>{
       this.seedEngineRollout();
       if(this.db.schemaVersion>=6){
         try{this.pickerAlerts.beginCoverage(PICKER_COVERAGE_EPOCH);}
         catch{this.invalidatePickerCoverage();}
       }
       await this.scheduleWake();
-    },1,schemaMigrationCeiling(env.HUB2_SCHEMA_MIGRATIONS,4,6));
+    },1,schemaMigrationCeiling(env.HUB2_SCHEMA_MIGRATIONS,4,7));
     this.memory=new SharedMemory(ctx,this.db,this.env);
     this.deploymentCredentials=new DeploymentCredentials(ctx,this.db,this.env);
     this.auth=new ControlAuth(ctx,this.db,this.env);this.workers=new WorkerCredentials(ctx,this.db,this.env);
@@ -180,10 +193,19 @@ export class ControlDO {
   }
 
   private seedEngineRollout(): void {
+    const now = Date.now();
     this.db.run(
       "INSERT OR IGNORE INTO hub2_engine_rollout(engine,desired_version,latest,state,updated_at) VALUES('claude',?,?, 'stable',?)",
-      CLAUDE_BASELINE_VERSION, CLAUDE_LATEST_VERSION, Date.now(),
+      CLAUDE_BASELINE_VERSION, CLAUDE_LATEST_VERSION, now,
     );
+    if (this.db.schemaVersion >= 7) {
+      for (const entry of DEFAULT_ENGINE_REGISTRY) {
+        this.db.run(
+          'INSERT OR IGNORE INTO hub2_engine_registry(engine,binary,version_command,update_command,updated_at) VALUES(?,?,?,?,?)',
+          entry.engine, entry.binary, entry.version_command, entry.update_command, now,
+        );
+      }
+    }
   }
 
   private async committedPickerDraw(request:Request):Promise<Response> {
@@ -307,6 +329,16 @@ export class ControlDO {
     if (path === '/api/engines/credential-logins' || /^\/api\/engines\/credential-logins\/[0-9a-f-]{36}$/i.test(path))
       return await this.engineCredentialLogin(request, path, actor);
     if (path === '/api/engines/update' && request.method === 'POST') return await this.startClaudeRollout(request, actor);
+    if (path === '/api/engines/registry' && request.method === 'GET') return await this.listEngineRegistry(actor);
+    const registryEngineMatch = path.match(/^\/api\/engines\/registry\/([a-z0-9][a-z0-9_-]{0,31})$/);
+    if (registryEngineMatch) {
+      if (request.method === 'PUT' || request.method === 'PATCH') return await this.upsertEngineRegistry(registryEngineMatch[1], request, actor);
+      if (request.method === 'DELETE') return await this.deleteEngineRegistry(registryEngineMatch[1], actor);
+      return error('method_not_allowed', 405);
+    }
+    if (path === '/api/engines/update-runs' && request.method === 'POST') return await this.startEngineUpdateRun(request, actor);
+    const updateRunMatch = path.match(/^\/api\/engines\/update-runs\/([0-9a-f-]{36})$/i);
+    if (updateRunMatch && request.method === 'GET') return await this.getEngineUpdateRun(updateRunMatch[1], actor);
     if (path === '/api/engines/versions' && request.method === 'GET') return await this.engineVersions(request, actor);
     if (path === '/api/engines/version-report' && request.method === 'POST') return await this.reportEngineVersions(request, actor);
     if (path === '/api/engines/sync-report' && request.method === 'POST') return await this.reportEngineSync(request, actor);
@@ -380,6 +412,7 @@ export class ControlDO {
       credentials: [{ label: CLAUDE_ENGINE_LABEL, provider: 'claude', generation: routing.credential_generation ?? null,
         status: routing.credential_status || 'unknown', hosts: hosts.map((host: any) => host.id) }],
       credential_rejections: [], account_migrations: [],
+      registry: this.db.schemaVersion >= 7 ? this.db.all<any>('SELECT engine,binary,version_command,update_command,updated_at FROM hub2_engine_registry ORDER BY engine') : [],
     });
   }
 
@@ -632,6 +665,161 @@ export class ControlDO {
       id, CLAUDE_LATEST_VERSION, canary, CLAUDE_LATEST_VERSION, now);
     return json({ status: 'canary_pending', engine: 'claude', target_version: CLAUDE_LATEST_VERSION,
       canary, rollout_id: id }, 202);
+  }
+
+  private resolveRegistryEngine(engine: string): string {
+    const clean = engine.trim().toLowerCase();
+    if (clean === 'agy') {
+      const direct = this.db.one<{ engine: string }>('SELECT engine FROM hub2_engine_registry WHERE engine=?', 'agy');
+      if (!direct) return 'antigravity';
+    }
+    return clean;
+  }
+
+  private async listEngineRegistry(actor?: Actor): Promise<Response> {
+    if (!actor || (!hasScope(actor, 'operator:admin') && actor.kind !== 'machine' && actor.kind !== 'agent')) {
+      return error('forbidden', 403);
+    }
+    if (this.db.schemaVersion < 7) return error('schema_upgrade_required', 503);
+    const engines = this.db.all<any>(
+      'SELECT engine,binary,version_command,update_command,updated_at FROM hub2_engine_registry ORDER BY engine',
+    );
+    return json({ engines });
+  }
+
+  private async upsertEngineRegistry(engine: string, request: Request, actor?: Actor): Promise<Response> {
+    if (!hasScope(actor, 'operator:admin')) return error('forbidden', 403);
+    if (this.db.schemaVersion < 7) return error('schema_upgrade_required', 503);
+    const body = await bodyObject(request, 8192);
+    const cleanField = (value: unknown, max: number) =>
+      typeof value === 'string' && value.trim().length > 0 && value.length <= max && !/[\x00\r\n]/.test(value)
+        ? value.trim()
+        : null;
+    const binary = cleanField(body.binary, 120);
+    const versionCommand = cleanField(body.version_command, 240);
+    const updateCommand = cleanField(body.update_command, 400);
+    if (!binary || !versionCommand || !updateCommand) return error('invalid_engine_registry_entry', 400);
+    const now = Date.now();
+    this.db.run(
+      'INSERT INTO hub2_engine_registry(engine,binary,version_command,update_command,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(engine) DO UPDATE SET binary=excluded.binary,version_command=excluded.version_command,update_command=excluded.update_command,updated_at=excluded.updated_at',
+      engine, binary, versionCommand, updateCommand, now,
+    );
+    return json({ engine, binary, version_command: versionCommand, update_command: updateCommand, updated_at: now });
+  }
+
+  private async deleteEngineRegistry(engine: string, actor?: Actor): Promise<Response> {
+    if (!hasScope(actor, 'operator:admin')) return error('forbidden', 403);
+    if (this.db.schemaVersion < 7) return error('schema_upgrade_required', 503);
+    const existing = this.db.one<{ engine: string }>('SELECT engine FROM hub2_engine_registry WHERE engine=?', engine);
+    if (!existing) return error('unknown_engine', 404);
+    this.db.run('DELETE FROM hub2_engine_registry WHERE engine=?', engine);
+    return json({ deleted: true, engine });
+  }
+
+  private async startEngineUpdateRun(request: Request, actor?: Actor): Promise<Response> {
+    if (!hasScope(actor, 'operator:admin')) return error('forbidden', 403);
+    if (this.db.schemaVersion < 7) return error('schema_upgrade_required', 503);
+    const body = await bodyObject(request, 8192);
+    const engineInput = typeof body.engine === 'string' && body.engine.trim() ? body.engine.trim() : null;
+    const machineInput = typeof body.machine === 'string' && body.machine.trim() ? body.machine.trim() : null;
+    let engines: Array<{ engine: string; binary: string; version_command: string; update_command: string }>;
+    if (engineInput) {
+      const resolved = this.resolveRegistryEngine(engineInput);
+      const row = this.db.one<any>(
+        'SELECT engine,binary,version_command,update_command FROM hub2_engine_registry WHERE engine=?',
+        resolved,
+      );
+      if (!row) return error('unknown_engine', 404);
+      engines = [row];
+    } else {
+      engines = this.db.all<any>(
+        'SELECT engine,binary,version_command,update_command FROM hub2_engine_registry ORDER BY engine',
+      );
+    }
+    const registered = this.db.all<{ id: string }>(
+      "SELECT DISTINCT resource_id AS id FROM credentials WHERE kind='machine' AND revoked_at IS NULL AND resource_id IS NOT NULL ORDER BY resource_id",
+    ).map(r => r.id);
+    let machines: string[];
+    if (machineInput) {
+      if (!registered.includes(machineInput)) return error('unknown_machine', 404);
+      machines = [machineInput];
+    } else {
+      machines = registered;
+    }
+    if (!machines.length) return error('no_machines_registered', 404);
+
+    const runId = crypto.randomUUID();
+    const now = Date.now();
+    const jobs: Array<{ job_id: string; machine_id: string; engine: string }> = [];
+    for (const machineId of machines) {
+      for (const eng of engines) {
+        const jobId = crypto.randomUUID();
+        jobs.push({ job_id: jobId, machine_id: machineId, engine: eng.engine });
+        await this.env.MACHINES.get(this.env.MACHINES.idFromName(machineId)).fetch(
+          new Request('https://machine.internal/_internal/engine-update', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              job_id: jobId,
+              engine: eng.engine,
+              binary: eng.binary,
+              version_command: eng.version_command,
+              update_command: eng.update_command,
+            }),
+          }),
+        );
+      }
+    }
+    this.db.run(
+      'INSERT INTO hub2_engine_update_runs(id,requested_by,engine_filter,machine_filter,jobs_json,created_at) VALUES(?,?,?,?,?,?)',
+      runId, actor!.id, engineInput, machineInput, JSON.stringify(jobs), now,
+    );
+    return json({ run_id: runId, jobs }, 202);
+  }
+
+  private async getEngineUpdateRun(runId: string, actor?: Actor): Promise<Response> {
+    if (!hasScope(actor, 'operator:admin')) return error('forbidden', 403);
+    if (this.db.schemaVersion < 7) return error('schema_upgrade_required', 503);
+    const run = this.db.one<{ id: string; jobs_json: string; created_at: number }>(
+      'SELECT id,jobs_json,created_at FROM hub2_engine_update_runs WHERE id=?',
+      runId,
+    );
+    if (!run) return error('not_found', 404);
+    const jobs = JSON.parse(run.jobs_json) as Array<{ job_id: string; machine_id: string; engine: string }>;
+    const results = await Promise.all(jobs.map(async job => {
+      const response = await this.env.MACHINES.get(this.env.MACHINES.idFromName(job.machine_id)).fetch(
+        new Request('https://machine.internal/_internal/engine-updates/' + job.job_id, { method: 'GET' }),
+      );
+      if (!response.ok) {
+        return {
+          job_id: job.job_id,
+          machine_id: job.machine_id,
+          engine: job.engine,
+          state: 'failed',
+          ok: false,
+          old_version: null,
+          new_version: null,
+          error: 'job_lookup_failed:' + response.status,
+        };
+      }
+      const row = await response.json() as any;
+      return {
+        job_id: job.job_id,
+        machine_id: job.machine_id,
+        engine: row.engine ?? job.engine,
+        state: row.state,
+        ok: row.state === 'completed',
+        old_version: row.old_version ?? null,
+        new_version: row.new_version ?? null,
+        exit_code: row.exit_code ?? null,
+        error: row.error ?? null,
+        output: row.output ?? null,
+        update_command: row.update_command ?? null,
+      };
+    }));
+    const done = results.every(r => r.state === 'completed' || r.state === 'failed');
+    const ok = done && results.every(r => r.state === 'completed');
+    return json({ run_id: runId, done, ok, results, created_at: run.created_at });
   }
 
   private async engineVersions(request: Request, actor?: Actor): Promise<Response> {

@@ -300,6 +300,13 @@ const router = {
         const machine=env.MACHINES.get(env.MACHINES.idFromName(nativeInventory[1]));
         return machine.fetch(await forwardRequest(request,'https://machine.hub2.internal/api/native-inventory',actor));
       }
+      const engineUpdateAck=path.match(/^\/api\/machines\/([A-Za-z0-9_.-]{1,80})\/engine-updates\/([0-9a-f-]{36})\/ack$/i);
+      if(engineUpdateAck){
+        if(request.method!=='POST')return error('method_not_allowed',405);
+        if(actor.kind!=='machine'||actor.resource_id!==engineUpdateAck[1])return error('forbidden',403);
+        const machine=env.MACHINES.get(env.MACHINES.idFromName(engineUpdateAck[1]));
+        return machine.fetch(await forwardRequest(request,'https://machine.hub2.internal/api/engine-updates/'+engineUpdateAck[2]+'/ack',actor));
+      }
       if (path === '/api/heartbeat' || path === '/api/offers' || path === '/api/connect') {
         if (actor.kind !== 'machine' || !actor.resource_id) return error('forbidden', 403);
         const machine = env.MACHINES.get(env.MACHINES.idFromName(actor.resource_id));
