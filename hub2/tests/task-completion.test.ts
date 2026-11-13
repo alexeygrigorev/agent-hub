@@ -1200,3 +1200,39 @@ test('operator re-evaluation of a failed intake accepts merged work and sends un
     assert.equal((await f.call('/api/intakes/'+unmerged+'/reevaluate','POST',{key:'r3'})).status,409,'not while a session runs');
   }finally{f.close();}
 });
+
+// a3fa3196 shape: the intake failed after its verifiers escalated, so its last
+// session is a verifier. Re-evaluation must review the implementation session.
+test('re-evaluation after verifier escalation reviews the implementation session and sends gaps to a worker, not a reviewer',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'reeval-after-verifier',true);
+    await start(f,id,'first');const work=await run(f,id);await claim(f,id,work.session_id);await finish(f,work,0);
+    for(let attempt=1;attempt<=MAX_VERIFICATION_ATTEMPTS;attempt++){await f.project.alarm();await finish(f,await run(f,id),0);}
+    assert.equal(intakeRow(f,id).status,'failed');assert.equal(completion(f,id).verification.state,'escalated');
+    const lastVerifier=intakeRow(f,id).session_id;assert.notEqual(lastVerifier,work.session_id);
+    const requested=await json(await f.call('/api/intakes/'+id+'/reevaluate','POST',{key:'after-escalation'}));
+    assert.equal(requested.original_session_id,work.session_id);assert.equal(requested.session_id,lastVerifier);
+    await f.project.alarm();
+    const verifier=activeSaga(f,id),route=JSON.parse(verifier.routing_json);
+    assert.equal(route.verification_origin_session_id,work.session_id);assert.equal(route.verification_of_session_id,lastVerifier);
+    assert(JSON.parse(verifier.launch_spec_json).prompt.includes('implementation session '+work.session_id));
+    const vrun=await run(f,id);await verify(f,id,vrun.session_id,'fail','Export is missing.');await finish(f,vrun,0);
+    assert.equal(completion(f,id).continuation.state,'pending');
+    await f.project.alarm();
+    const fix=activeSaga(f,id),launch=JSON.parse(fix.launch_spec_json);
+    assert.equal(JSON.parse(fix.routing_json).purpose,undefined,'the fix session implements');
+    assert(!launch.prompt.includes('Hub post-DONE acceptance verifier'),'the fix session is not given the verifier role');
+    assert(launch.prompt.includes('Implement the requested feature end to end.'));assert(launch.prompt.includes('Export is missing.'));
+  }finally{f.close();}
+});
+
+test('merge evidence for a PR of another repository never satisfies the gate',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'foreign-pr',true);
+    await f.call('/api/intakes/'+id+'/merge-evidence','POST',{key:'foreign',evidence:{...mergeProof,pr_url:'https://github.com/org/other/pull/9'}});
+    const state=await json(await f.call('/api/intakes/'+id+'/merge-state'));
+    assert.equal(state.merge_gate.ok,false);assert(state.merge_gate.problems.some((p:string)=>p.includes('is not in org/completion')));
+  }finally{f.close();}
+});

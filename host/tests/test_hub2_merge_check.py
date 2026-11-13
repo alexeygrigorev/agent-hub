@@ -18,8 +18,9 @@ NOW = lambda: datetime(2026, 11, 13, 12, 0, tzinfo=timezone.utc)
 
 
 class FakeGh:
-    def __init__(self, merged=True, runs=(('completed', 'success'),), statuses=(), compare='ahead', pulls=None, fail=()):
+    def __init__(self, merged=True, runs=(('completed', 'success'),), statuses=(), compare='ahead', pulls=None, fail=(), workflows=0):
         self.merged, self.runs, self.statuses, self.compare, self.pulls, self.fail = merged, runs, statuses, compare, pulls or [], set(fail)
+        self.workflows = workflows
         self.calls = []
 
     def __call__(self, argv, **kw):
@@ -41,6 +42,9 @@ class FakeGh:
         elif argv[-1].endswith('/branches/main'):
             key = 'main'
             out = {'commit': {'sha': MAIN}}
+        elif argv[-1].endswith('/actions/workflows'):
+            key = 'workflows'
+            out = {'total_count': self.workflows}
         elif '/compare/' in argv[-1]:
             key = 'compare'
             out = {'status': self.compare}
@@ -61,6 +65,10 @@ class CollectTests(unittest.TestCase):
     def test_merged_pr_without_any_ci_is_recorded_as_none_never_success(self):
         e = hme.collect(REPO, PR, runner=FakeGh(runs=()), now=NOW)
         self.assertEqual((e['checks_state'], e['checks_total']), ('none', 0))
+        skipped = hme.collect(REPO, PR, runner=FakeGh(runs=(), workflows=3), now=NOW)
+        self.assertEqual(skipped['checks_state'], 'failure', 'a repo with workflows but no checks on the head stays blocked')
+        unknown = hme.collect(REPO, PR, runner=FakeGh(runs=(), fail={'workflows'}), now=NOW)
+        self.assertIn('workflows', unknown['observation_error'])
 
     def test_red_pending_unmerged_and_diverged_are_failures(self):
         self.assertEqual(hme.collect(REPO, PR, runner=FakeGh(runs=(('completed', 'failure'),)))['checks_state'], 'failure')

@@ -476,19 +476,27 @@ export class ProjectDO {
       if(!Array.isArray(criteria)||!criteria.length)return error('acceptance_criteria_required',409);
       const launch=(this.parse(saga.launch_spec_json) as JsonRecord|null)??{};
       if(String(launch.engine??'').toLowerCase()==='shell')return error('reevaluation_not_applicable',409,'shell sessions carry no completion contract');
-      const route=(this.parse(saga.routing_json) as JsonRecord|null)??{};
-      if(route.completion_contract!==true)
-        this.db.run('UPDATE dispatch_sagas SET routing_json=? WHERE operation_id=?',JSON.stringify({...route,completion_contract:true}),saga.operation_id);
+      // The work under review is the implementation session: when the intake
+      // last ran a verifier, re-evaluate that verifier's origin, never the verifier.
+      const lastRoute=(this.parse(saga.routing_json) as JsonRecord|null)??{};
+      const origin=lastRoute.acceptance_verification===true
+        ?this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id=? AND intake_id=?',String(lastRoute.verification_origin_session_id??''),intake.id):saga;
+      if(!origin||origin.state!=='complete')return error('reevaluation_origin_missing',409,'the implementation session of the last verification is unknown');
+      for(const row of [saga,origin]){
+        const route=(this.parse(row.routing_json) as JsonRecord|null)??{};
+        if(route.completion_contract!==true)
+          this.db.run('UPDATE dispatch_sagas SET routing_json=? WHERE operation_id=?',JSON.stringify({...route,completion_contract:true}),row.operation_id);
+      }
       const now=Date.now();
       const reason=typeof body.reason==='string'&&body.reason.trim()?body.reason.trim():'operator re-evaluation';
       const summary=`Re-evaluation requested (${reason}). Check the current state of the work (merged PRs, deployed code, recorded notes), not only the last session.`;
       const evidence=(this.parse(intake.final_evidence_json??'{}') as JsonRecord|null)??{};
       const record:CompletionRecord={controlled:true,session_id:saga.session_id,outcome:'unfinished',reason:'reevaluation_requested',depth:0,summary,
-        verification:{state:'pending',key:'verify:'+saga.session_id+':'+round+':1',attempts:0,tries:0,next_action_at:now,original_session_id:saga.session_id,
+        verification:{state:'pending',key:'verify:'+origin.session_id+':'+round+':1',attempts:0,tries:0,next_action_at:now,original_session_id:origin.session_id,
           summary,excluded_policy_ids:[],round}};
       const at=Math.max(now,intake.updated_at+1);
       this.db.run('UPDATE intakes SET final_evidence_json=?,updated_at=? WHERE id=?',JSON.stringify({...evidence,completion:record}),at,intake.id);
-      const view={session_id:saga.session_id,round,reason,previous_status:intake.status};
+      const view={session_id:saga.session_id,original_session_id:origin.session_id,round,reason,previous_status:intake.status};
       this.appendEvent(intake.id,eventKey,actor!.id,'task_reevaluation_requested',view,at);
       return json({reevaluation:'requested',intake_id:intake.id,...view},202);
     });
@@ -604,7 +612,7 @@ export class ProjectDO {
       // The first verifier of an operator re-evaluation checks the intake's last
       // finished session itself, whatever that session claimed.
       const pending=((this.parse(intake.final_evidence_json??'{}') as JsonRecord|null)?.completion as CompletionRecord|undefined)?.verification;
-      const reevaluationStart=verificationRound!==undefined&&verificationAttempt===1&&verificationOf===verificationOrigin
+      const reevaluationStart=verificationRound!==undefined&&verificationAttempt===1&&verificationOf===intake.session_id
         &&pending?.state==='pending'&&pending.round===verificationRound&&pending.original_session_id===verificationOrigin;
       if(verificationRound!==undefined&&!reevaluationStart&&previousRoute.verification_round!==verificationRound)return error('verification_start_stale',409);
       if(!verificationPrevious||!verificationOriginal||!this.completionControlled(verificationOriginal)

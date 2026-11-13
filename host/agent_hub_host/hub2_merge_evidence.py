@@ -149,9 +149,15 @@ def collect(repository: str, pr: Optional[str], runner: Callable = subprocess.ru
             if checks.get('observation_error'):
                 errors.append(checks.pop('observation_error'))
             elif checks['checks_total'] == 0 and evidence['merged_at']:
-                # A merged PR whose exact head has no check run or status at all:
-                # the repository runs no CI for it. Recorded as such, never as green.
-                checks['checks_state'] = 'none'
+                # A merged PR whose exact head has no check run or status at all, in a
+                # repository without any Actions workflow: it runs no CI. Recorded as
+                # such, never as green. A repo with workflows (skipped CI, merged
+                # before checks registered) stays blocked.
+                workflows = _gh(runner, ['api', f'repos/{repository}/actions/workflows'])
+                if isinstance(workflows, dict) and workflows.get('total_count') == 0:
+                    checks['checks_state'] = 'none'
+                elif not isinstance(workflows, dict):
+                    errors.append('GitHub Actions workflows of the repository could not be read')
             evidence.update(checks)
         else:
             errors.append('GitHub pull request head SHA is missing or invalid')

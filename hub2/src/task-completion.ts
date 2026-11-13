@@ -237,8 +237,7 @@ export function continuationPrompt(intakeId: string, depth: number, previousSess
 }
 
 /** A completion claim counts only for this exact session and covers every criterion. */
-export function completionClaim(raw: unknown, sessionId: string, criteriaCount: number): CompletionClaim | undefined {
-  const evidence = unwrapEvidence(raw);
+export function completionClaim(evidence: unknown, sessionId: string, criteriaCount: number): CompletionClaim | undefined {
   if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)) return;
   const record = evidence as Record<string, unknown>;
   if (!['task_complete', 'session_finished'].includes(String(record.kind)) || record.session_id !== sessionId || !Array.isArray(record.acceptance)) return;
@@ -275,8 +274,8 @@ export function unwrapEvidence(value: unknown): unknown {
 
 type VerdictCheck = { verdict: VerificationVerdict } | { problem: string };
 
-function checkVerdict(evidence: unknown, sessionId: string, criteriaCount: number): VerdictCheck | undefined {
-  const value = unwrapEvidence(evidence);
+// Records are unwrapped once, at append (after the author checks); stored records are read as stored.
+function checkVerdict(value: unknown, sessionId: string, criteriaCount: number): VerdictCheck | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return;
   const record = value as Record<string, unknown>;
   if (record.kind !== 'acceptance_verification') return;
@@ -314,7 +313,7 @@ export function verifierNoVerdictCause(appends: Array<{ note?: unknown; evidence
     if (checked && 'problem' in checked) return clip('the verifier appended a malformed verdict: ' + checked.problem, 600);
   }
   for (const append of appends) {
-    const value = unwrapEvidence(append.evidence) as Record<string, unknown> | undefined;
+    const value = append.evidence as Record<string, unknown> | undefined;
     if (value && typeof value === 'object' && typeof value.kind === 'string')
       return clip(`the verifier appended a ${oneLine(value.kind)} record instead of an acceptance_verification verdict`, 600);
   }
@@ -323,8 +322,7 @@ export function verifierNoVerdictCause(appends: Array<{ note?: unknown; evidence
 }
 
 /** A blocker record counts only for this exact session. */
-export function taskBlocker(input: unknown, sessionId: string): TaskBlocker | undefined {
-  const evidence = unwrapEvidence(input);
+export function taskBlocker(evidence: unknown, sessionId: string): TaskBlocker | undefined {
   if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)) return;
   const record = evidence as Record<string, unknown>;
   if (record.kind !== 'task_blocked' || record.session_id !== sessionId) return;
