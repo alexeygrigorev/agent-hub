@@ -118,6 +118,15 @@ class CliTests(unittest.TestCase):
         self.assertEqual((method, urlsplit(path).path), ("POST", "/api/intakes/task-1/append"))
         self.assertEqual(body, {"evidence": proof, "key": "merge-1"})
 
+        verdict = {"kind": "acceptance_verification", "session_id": "v1", "verdict": "pass",
+                   "summary": "All met", "acceptance": [{"status": "met", "proof": "ok"}]}
+        evidence.write_text(json.dumps(verdict), encoding="utf-8")
+        code, _ = self.invoke("intake", "append", "task-1", "--project", "org/repo", "--key", "verify-1", "--file", str(evidence))
+        self.assertEqual(code, 0)
+        method, path, body, _ = Handler.calls[-1]
+        self.assertEqual((method, urlsplit(path).path), ("POST", "/api/intakes/task-1/append"))
+        self.assertEqual(body, {"evidence": verdict, "key": "verify-1"})
+
         with patch.object(merge_evidence, "collect", return_value=proof) as collect:
             code, _ = self.invoke("intake", "merge-check", "task-1", "--project", "org/repo", "--pr", "23", "--key", "merge-check-1")
         self.assertEqual(code, 0)

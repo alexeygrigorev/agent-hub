@@ -70,14 +70,20 @@ def _checks(repo: str, sha: str, cwd: str, runner: Callable) -> dict:
     statuses = statuses if isinstance(statuses, list) else []
     combined_state = status_doc.get('state')
     total = len(runs) + len(statuses)
-    successful = sum(1 for run in runs if run.get('status') == 'completed' and run.get('conclusion') == 'success')
+    actually_succeeded = sum(1 for run in runs if run.get('status') == 'completed' and run.get('conclusion') == 'success')
+    successful = sum(1 for run in runs if run.get('status') == 'completed'
+                     and run.get('conclusion') in {'success', 'skipped', 'neutral'})
     pending = sum(1 for run in runs if run.get('status') != 'completed')
     failed = len(runs) - successful - pending
-    successful += sum(1 for item in statuses if isinstance(item, dict) and item.get('state') == 'success')
+    status_success = sum(1 for item in statuses if isinstance(item, dict) and item.get('state') == 'success')
+    actually_succeeded += status_success
+    successful += status_success
     pending += sum(1 for item in statuses if isinstance(item, dict) and item.get('state') == 'pending')
     failed += sum(1 for item in statuses if isinstance(item, dict) and item.get('state') not in {'success', 'pending'})
-    state = 'success' if total > 0 and successful == total and combined_state == 'success' else \
-        'pending' if pending or combined_state == 'pending' else 'failure'
+    # GitHub returns combined_state='pending' when there are 0 legacy commit statuses.
+    has_statuses = len(statuses) > 0
+    state = 'success' if total > 0 and actually_succeeded > 0 and successful == total and (not has_statuses or combined_state == 'success') else \
+        'pending' if pending or (has_statuses and combined_state == 'pending') else 'failure'
     return {'checks_head_sha': sha, 'checks_state': state, 'checks_total': total,
             'checks_successful': successful, 'checks_pending': pending, 'checks_failed': failed}
 

@@ -21,7 +21,8 @@ class MergeEvidenceTests(unittest.TestCase):
         merge = "b" * 40
         main = "c" * 40
         calls = []
-        combined_state = "success"
+        combined_state = "pending"
+        statuses = []
 
         def runner(argv, **kwargs):
             calls.append(argv)
@@ -35,10 +36,11 @@ class MergeEvidenceTests(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0, json.dumps(result), "")
             if argv[:4] == ["gh", "api", "--paginate", "--slurp"]:
                 runs = [{"check_runs": [{"status": "completed", "conclusion": "success", "name": "CI"},
+                                         {"status": "completed", "conclusion": "skipped", "name": "deploy"},
                                          {"status": "completed", "conclusion": "success", "name": "Review"}]}]
                 return subprocess.CompletedProcess(argv, 0, json.dumps(runs), "")
             if argv[:2] == ["gh", "api"] and argv[-1].endswith("/status"):
-                return subprocess.CompletedProcess(argv, 0, json.dumps({"state": combined_state, "statuses": []}), "")
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"state": combined_state, "statuses": statuses}), "")
             if argv == ["git", "fetch", "--quiet", "origin", "main"]:
                 return subprocess.CompletedProcess(argv, 0, "", "")
             if argv == ["git", "rev-parse", "--verify", "refs/remotes/origin/main^{commit}"]:
@@ -56,17 +58,19 @@ class MergeEvidenceTests(unittest.TestCase):
         self.assertEqual(evidence["head_sha"], head)
         self.assertEqual(evidence["checks_head_sha"], head)
         self.assertEqual(evidence["checks_state"], "success")
-        self.assertEqual(evidence["checks_total"], 2)
+        self.assertEqual(evidence["checks_total"], 3)
+        self.assertEqual(evidence["checks_successful"], 3)
+        self.assertEqual(evidence["checks_failed"], 0)
         self.assertEqual(evidence["merge_commit_sha"], merge)
         self.assertEqual(evidence["main_head_sha"], main)
         self.assertTrue(evidence["merge_commit_in_main"])
         self.assertNotIn("observation_error", evidence)
         self.assertEqual(evidence["checked_at"], "2026-11-13T10:01:00Z")
         self.assertTrue(any("/commits/" + head + "/check-runs" in " ".join(call) for call in calls))
-        combined_state = "pending"
+        statuses = [{"state": "pending", "context": "external/ci"}]
         pending = collect("/repo", "23", runner,
                           lambda: datetime(2026, 11, 13, 10, 1, tzinfo=timezone.utc))
-        self.assertEqual(pending["checks_state"], "pending", "the aggregate GitHub commit status must also be green")
+        self.assertEqual(pending["checks_state"], "pending", "non-empty pending commit status must keep checks pending")
 
     def test_unavailable_pr_or_checks_are_recorded_as_failed_observations(self):
         def runner(argv, **kwargs):
