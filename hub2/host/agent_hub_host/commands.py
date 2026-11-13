@@ -94,6 +94,8 @@ def execute(client, args, config):
             path += "/" + action
             if action not in {"history", "context", "forgotten"}:
                 method = "POST"
+                if action == "append" and "kind" in body and "evidence" not in body and "note" not in body:
+                    body = {"evidence": body}
                 body.update(key=key)
                 if text or prompt:
                     body["text"] = text or prompt
