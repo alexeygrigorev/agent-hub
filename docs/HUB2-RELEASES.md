@@ -44,8 +44,10 @@ or unreadable session state is treated as busy for the same bounded window.
 The private `activation-policy.json` receipt and updater stdout record the
 candidate, decision, reason, managed-session count (null means unknown), and
 next check time. Failed activations retain their existing retry backoff.
-Explicit `--install-service` setup and initial enrollment remain immediate;
-operators should coordinate these restarts separately. Recovery/rollback is
+Explicit `--install-service` setup, initial enrollment, and non-timer starts
+(such as `systemctl --user start agent-hub2-host-update.service` from the
+deploy canary or an operator) remain immediate; only timer-triggered runs
+(`TRIGGER_UNIT=*.timer`) apply the batching and busy-wait deferral. Recovery/rollback is
 also immediate. The batching limit covers automatic successful activations,
 not crashes, rollbacks, or explicit operator restarts. This P9 batching policy
 supersedes the earlier expectation of automatic host adoption within 15 minutes:

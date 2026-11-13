@@ -6,8 +6,8 @@ from urllib.parse import quote, urlencode
 
 
 ACTIONS = {
-    "repos": "list show edit", "intake": "create list show history context append update assign depend blocker forgotten",
-    "sessions": "start list show send commands capture stop wake count tree",
+    "repos": "list show edit", "intake": "create list show history context append update assign depend blocker forgotten merge-check",
+    "sessions": "start list show send commands capture stop wake finish count tree",
     "msg": "send inbox show reply ack status readdress", "quota": "show banked",
     "auth": "status login refresh logout", "schedules": "list create pause resume", "driver": "start status",
 }
@@ -20,13 +20,13 @@ def add_commands(subparsers):
         parser.add_argument("identity", nargs="?")
         for flag in ("project", "status", "after", "cursor", "search", "title", "text", "text-file", "acceptance-criteria-file",
                      "intake-task-id", "machine", "machine-id", "key", "body-file", "prompt", "file", "to",
-                     "body", "mailbox", "thread", "state", "workspace", "tier", "engine", "model", "effort", "reason", "at"):
+                     "body", "mailbox", "thread", "state", "workspace", "tier", "engine", "model", "effort", "reason", "at", "repo", "pr"):
             parser.add_argument("--" + flag)
         parser.add_argument("--acceptance-criteria", action="append", default=[])
         parser.add_argument("--required-capability", action="append", default=[])
         parser.add_argument("--limit", type=int, default=25)
         parser.add_argument("--epoch", type=int)
-        for flag in ("json", "all", "interactive", "with-goal", "no-browser"):
+        for flag in ("json", "all", "interactive", "with-goal", "no-browser", "non-code-task"):
             parser.add_argument("--" + flag, action="store_true")
     subparsers.add_parser("status")
     subparsers.add_parser("model-policy")
@@ -76,15 +76,26 @@ def execute(client, args, config):
             if args.acceptance_criteria_file:
                 raw = file_text(args.acceptance_criteria_file)
                 criteria += json.loads(raw) if raw.lstrip().startswith("[") else raw.splitlines()
-            body.update(title=args.title, text=text, acceptance_criteria=criteria, key=key)
+            body.update(title=args.title, text=text, acceptance_criteria=criteria, key=key,
+                        code_task=not args.non_code_task)
             method = "POST"
         elif action == "update":
             method = "PATCH"
             body.update({k: v for k, v in {"status": args.status, "title": args.title, "text": text}.items() if v is not None})
+        elif action == "merge-check":
+            if not identity:
+                raise ValueError("intake required")
+            from .merge_evidence import collect
+            evidence = collect(args.repo, args.pr)
+            path += "/merge-evidence"
+            method = "POST"
+            body = {"key": key, "evidence": evidence}
         elif action not in {"list", "show"}:
             path += "/" + action
             if action not in {"history", "context", "forgotten"}:
                 method = "POST"
+                if action == "append" and "kind" in body and "evidence" not in body and "note" not in body:
+                    body = {"evidence": body}
                 body.update(key=key)
                 if text or prompt:
                     body["text"] = text or prompt
@@ -114,7 +125,16 @@ def execute(client, args, config):
             path = "/api/sessions" + ("/" + identity if identity else "")
             if args.machine_id or args.machine:
                 query["machine_id"] = args.machine_id or args.machine
-            if action in {"send", "capture", "stop"}:
+            if action == "finish":
+                intake_id = getattr(args, "intake_task_id", None)
+                if not identity or not intake_id or not args.file:
+                    raise ValueError("session, --intake-task-id and --file required")
+                if body.get("kind") != "session_finished" or body.get("session_id") != args.identity:
+                    raise ValueError("--file must contain a session_finished record for this session")
+                path = "/api/intakes/" + quote(intake_id, safe="") + "/finished"
+                method = "POST"
+                body = {**body, "key": key}
+            elif action in {"send", "capture", "stop"}:
                 if not identity:
                     raise ValueError("session required")
                 path += "/commands"

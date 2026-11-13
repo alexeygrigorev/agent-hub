@@ -23,6 +23,8 @@ export type PickDiagnostics = {
   share_floor?: { minimum_share: number; applied: boolean; reason: 'pool_too_large' | null };
 };
 // Base headroom knobs follow model-roulette; Hub adds exploration after Luna clipping.
+// OpenAI Codex only: fresh known quota must be strictly above this reserve (AGENTS.md quota gate, fail closed).
+const CODEX_RESERVE = 15;
 const MIN_HEADROOM = 5;      // % quota left below which a pool has no headroom
 const DEEP_BIAS = 3;         // opus/sol multiplier for tier deep/complex/serious
 const NEUTRAL_QUOTA = 50;    // unknown observations get a neutral weight, never fabricated quota
@@ -153,6 +155,14 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
     return { account_id: id, reason: 'quota_stale', captured_at: Number.isSafeInteger(captured) && captured! >= 0 ? captured! : null };
   });
   const headroom = (candidate: Candidate): number | null => observations.get(candidate.account_id) ?? null;
+  // Hard Codex reserve, before any advisory narrowing: missing/stale/invalid/<=15 quota never
+  // survives, and no override, explicit route or exhausted pool restores it. Other engines
+  // (including ZAI/zcodex runtimes) keep the advisory MIN_HEADROOM semantics.
+  const reserveOk = (candidate: Candidate): boolean => candidate.engine !== 'codex' || (headroom(candidate) ?? -1) > CODEX_RESERVE;
+  const reserveDropped: PickDiagnostics['excluded'] = candidates.filter(candidate => !reserveOk(candidate))
+    .map(candidate => ({ policy_id: candidate.id, account_id: candidate.account_id, reason: 'codex_reserve' }));
+  const live = candidates.filter(reserveOk);
+  if (!live.length) throw new HttpError('model_policy_unavailable', 503);
   const managedCentral=input.managed_credential_label==='hub-claude';
   const dropped: PickDiagnostics['excluded'] = [], advisories: NonNullable<PickDiagnostics['advisories']> = [];
   const centralReady = (candidate: Candidate): boolean => {
@@ -181,7 +191,8 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
     const matching = hosts.filter(id => machines.get(id)?.engines?.includes(candidate.engine));
     return matching.length ? matching : hosts;
   };
-  const scored = candidates.map(candidate => {
+  dropped.push(...reserveDropped);
+  const scored = live.map(candidate => {
     const left = headroom(candidate);
     const base = Math.max(0.0001, candidate.weight) * (left === null ? NEUTRAL_QUOTA : Math.max(0.01, left)) * (deep && isDeepWorkModel(candidate) ? DEEP_BIAS : 1);
     const originalHosts = hostsFor(candidate), observedHosts = originalHosts.filter(id=>!localMissing(candidate,id));
