@@ -1118,6 +1118,12 @@ class ManagedClaudeReadinessTests(unittest.TestCase):
                 def probe(argv,**kwargs):
                     result=subprocess.run(argv,**kwargs);results.append(result);return result
                 adapter=nl.NativeLauncher({},runner=probe)
+                # A default-only host has no managed profile yet still needs the verified archive.
+                self.assertFalse(profile.exists())
+                only=adapter.verified_release_archive(release)
+                self.assertEqual(only,{'archive':str(archive),'sha256':receipt['artifacts']['hub.pyz']['sha256']})
+                self.assertEqual(results,[],'the archive proof runs no profile probe')
+                self.assertIsNone(adapter.managed_claude_readiness(release))
                 publish([sys.executable,'-c','raise RuntimeError("old18c")','hub-claude'])
                 self.assertIsNone(adapter.managed_claude_readiness(release))
                 publish(command)
@@ -1145,6 +1151,9 @@ class ManagedClaudeReadinessTests(unittest.TestCase):
                 publish(command)
                 archive.write_bytes(raw+b'corruption')
                 self.assertIsNone(adapter.managed_claude_readiness(release))
+                self.assertIsNone(adapter.verified_release_archive(release))
+                archive.write_bytes(raw);archive.chmod(0o666)
+                self.assertIsNone(adapter.verified_release_archive(release))
 
     def test_opt_in_uses_fixed_profile_and_private_context_without_changing_default(self):
         from types import SimpleNamespace

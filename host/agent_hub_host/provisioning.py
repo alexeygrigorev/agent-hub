@@ -3484,6 +3484,8 @@ def add_commands(sub):
     native.add_argument('--resume-generation',type=int,help='Sync this already saved generation; no native credential read or upload')
     list_cmd.add_argument('--view', choices=['worker'], default=None, help='Sanitized read-only verification view (worker sessions): engine, account, host, health, quota state')
     commands.add_parser('quota', help='Sanitized managed account observations for the server collector')
+    from . import default_claude_consumer
+    default_claude_consumer.add_commands(commands)
     remove = commands.add_parser('remove')
     remove.add_argument('label')
     commands.add_parser('sync', help='Reconcile this enrolled machine now')
@@ -3919,6 +3921,9 @@ def command(args):
     if args.engines_cmd == 'import-native':
         from . import native_claude_import
         return native_claude_import.command(args)
+    if args.engines_cmd == 'default-claude':
+        from . import default_claude_consumer
+        return default_claude_consumer.command(args)
     if args.engines_cmd == 'recommend':
         import urllib.parse
         if getattr(args, 'engine', None) and not (getattr(args, 'reason', None) and str(args.reason).strip()):

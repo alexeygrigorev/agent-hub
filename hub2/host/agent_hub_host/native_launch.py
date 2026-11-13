@@ -688,44 +688,74 @@ class NativeLauncher:
                 result[engine] = set(supported)
         return result
 
-    def managed_claude_readiness(self, release=None):
-        """Exact installed release and actual profile code; no credential probe."""
+    def _verified_release(self, release=None):
+        """The exact installed release archive; no profile, credential or network probe.
+
+        Returns (archive, python, sha256, read) or None. ``read`` re-reads a
+        bounded owner-only file of the release without following links."""
         if sys.platform != 'linux':
             return None
+        if release is None:
+            from ._release import HOST_VERSION
+            base = Path.home() / '.local/share/agent-hub2'
+            release = base / 'releases' / HOST_VERSION
+            if (base / 'current').resolve(strict=True) != release:
+                return None
+        release = Path(release)
+        info = release.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
+            return None
+        def read(path, limit):
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, 'rb') as stream:
+                meta = os.fstat(stream.fileno())
+                if (not stat.S_ISREG(meta.st_mode) or meta.st_uid != os.geteuid() or meta.st_nlink != 1
+                        or meta.st_mode & 0o022 or meta.st_size > limit):
+                    raise ValueError('managed_exec_unavailable')
+                raw = stream.read(limit+1)
+                if len(raw) > limit:
+                    raise ValueError('managed_exec_unavailable')
+                return raw
+        receipt = json.loads(read(release / 'release.json', 65536))
+        if receipt.get('host_version') != release.name or not re.fullmatch('[0-9a-f]{40}', release.name):
+            return None
+        record = receipt['artifacts']['hub.pyz']
+        archive = release / 'hub.pyz'
+        raw = read(archive, 16777216)
+        digest = hashlib.sha256(raw).hexdigest()
+        if type(record['size']) is not int or record['size'] != len(raw) or record['sha256'] != digest:
+            return None
+        python = release / 'bin/python'
+        if not python.is_file():
+            return None
+        return archive, python, digest, read
+
+    def verified_release_archive(self, release=None):
+        """Checksum-verified installed release for the default-Claude consumer.
+
+        Unlike managed readiness this needs no managed profile: a host that only
+        opted its default Claude login in has none. Same trust boundary."""
         try:
-            if release is None:
-                from ._release import HOST_VERSION
-                base = Path.home() / '.local/share/agent-hub2'
-                release = base / 'releases' / HOST_VERSION
-                if (base / 'current').resolve(strict=True) != release:
-                    return None
-            release = Path(release)
-            info = release.lstat()
-            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
+            found = self._verified_release(release)
+        except (OSError, ValueError, TypeError, KeyError, ImportError):
+            return None
+        if found is None:
+            return None
+        archive, _, digest, read = found
+        try:
+            if hashlib.sha256(read(archive, 16777216)).hexdigest() != digest:
                 return None
-            def read(path, limit):
-                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-                with os.fdopen(fd, 'rb') as stream:
-                    meta = os.fstat(stream.fileno())
-                    if (not stat.S_ISREG(meta.st_mode) or meta.st_uid != os.geteuid() or meta.st_nlink != 1
-                            or meta.st_mode & 0o022 or meta.st_size > limit):
-                        raise ValueError('managed_exec_unavailable')
-                    raw = stream.read(limit+1)
-                    if len(raw) > limit:
-                        raise ValueError('managed_exec_unavailable')
-                    return raw
-            receipt = json.loads(read(release / 'release.json', 65536))
-            if receipt.get('host_version') != release.name or not re.fullmatch('[0-9a-f]{40}', release.name):
+        except (OSError, ValueError):
+            return None
+        return {'archive': str(archive), 'sha256': digest}
+
+    def managed_claude_readiness(self, release=None):
+        """Exact installed release and actual profile code; no credential probe."""
+        try:
+            found = self._verified_release(release)
+            if found is None:
                 return None
-            record = receipt['artifacts']['hub.pyz']
-            archive = release / 'hub.pyz'
-            raw = read(archive, 16777216)
-            digest = hashlib.sha256(raw).hexdigest()
-            if type(record['size']) is not int or record['size'] != len(raw) or record['sha256'] != digest:
-                return None
-            python = release / 'bin/python'
-            if not python.is_file():
-                return None
+            archive, python, digest, read = found
             # -I -S prevents user-site startup; import only the verified bundled
             # CLI, never this daemon's duplicate package or CLI main/network.
             code = ('import sys,json; sys.path.insert(0,sys.argv[1]); '

@@ -37,8 +37,21 @@ def main(argv):
     if mode == 'sleep':
         time.sleep(30)
     request = json.loads(sys.stdin.read(32768))
-    if argv[1:] != ['materialize'] or Path(argv[0]).resolve() != Path(__file__).resolve().parents[1]:
+    if argv[1:] not in (['materialize'], ['check']) or Path(argv[0]).resolve() != Path(__file__).resolve().parents[1]:
         print(json.dumps({'status': 'refused', 'reason': 'invalid_arguments'})); return 3
+    if mode == 'scripted':
+        script = root / ('script-' + argv[1] + '.json')
+        items = json.loads(script.read_text())
+        item = items.pop(0) if len(items) > 1 else items[0]
+        script.write_text(json.dumps(items))
+        with open(root / 'calls.log', 'a') as log:
+            log.write(argv[1] + '\n')
+        if item.get('wait'):
+            (root / 'waiting').write_text('1')
+            end = time.time() + 20
+            while not (root / 'release').exists() and time.time() < end:
+                time.sleep(0.02)
+        print(json.dumps(item['out'])); return item.get('code', 0)
     if mode == 'absent':
         print(json.dumps({'status': 'absent'})); return 0
     if mode == 'refused':
@@ -50,6 +63,10 @@ def main(argv):
     state = root / 'consumer' / 'credential-state.json'
     data = request['files']['.claude/.credentials.json']
     current = (home / '.credentials.json').read_text() if (home / '.credentials.json').exists() else None
+    if argv[1] == 'check':
+        print(json.dumps({'status': 'in_step' if current == data else 'pending',
+                          'generation': request['generation'], 'revision': request['revision']}))
+        return 0
     (home / '.credentials.json').write_text(data)
     state.write_text(json.dumps({'generation': request['generation']}))
     print(json.dumps({'status': 'in_step' if current == data else 'materialized',
@@ -284,6 +301,147 @@ class ConsumerDeliveryTests(DeliveryCase):
         self.assertEqual(argv[-2:], [self.release.archive, 'materialize'])
         self.assertFalse({'HUB_TOKEN', 'HUB2_TOKEN', 'HUB_JOB_TOKEN'} & set(env))
         self.assertFalse([key for key in env if key.startswith(('CLAUDE_', 'ANTHROPIC_'))])
+
+
+SET_A, SET_B = 'a' * 32, 'b' * 32
+
+
+def held(status='in_step', default=None, enabled=False, identity=None, generation=9):
+    out = {'status': status}
+    if status != 'absent':
+        out.update(generation=generation, revision=REVISION)
+    if default is not None:
+        out.update(default=default, default_enabled=enabled, consumer_set=identity or SET_A)
+    return out
+
+
+class DefaultConsumerAckTests(DeliveryCase):
+    """All enabled consumers (managed and the opt-in one-way default) must durably
+    hold the generation, under an unchanged consumer set, before the ACK."""
+
+    def script(self, materialize, check):
+        self.release.mode('scripted')
+        (self.release.root / 'script-materialize.json').write_text(json.dumps([{'out': o} for o in materialize]))
+        (self.release.root / 'script-check.json').write_text(json.dumps([
+            c if 'out' in c else {'out': c} for c in check]))
+
+    def calls(self):
+        path = self.release.root / 'calls.log'
+        return path.read_text().split() if path.exists() else []
+
+    def test_observe_only_default_never_blocks_nor_claims_and_managed_still_acks(self):
+        out = held('materialized', 'observe_only', False)
+        self.script([out], [held('in_step', 'observe_only', False)])
+        self.run_once()
+        self.assertEqual(len(self.client.acks()), 1)
+        self.assertIsNone(delivery.diagnostic(self.bridge))
+        self.assertEqual(self.calls(), ['materialize', 'check'])
+
+    def test_enabled_default_must_hold_before_the_ack(self):
+        for status in ('diverged', 'generation_refused', 'lock_busy', 'protocol_unsupported', 'store_changed'):
+            with self.subTest(status=status):
+                self.script([held('materialized', status, True)], [held('in_step', 'in_step', True)])
+                self.run_once(now=10**12 + len(self.client.calls) * 10**9)
+                self.assertEqual(self.client.acks(), [])
+                self.assertEqual(delivery.diagnostic(self.bridge), 'default_consumer_' + status)
+                self.assertIsNone(delivery.delivered(self.bridge))
+
+    def test_default_only_host_without_managed_profile_acks_when_the_default_holds(self):
+        launcher = self.bridge.launcher
+        launcher.managed_claude_readiness = lambda: None
+        launcher.verified_release_archive = lambda: {'archive': self.release.archive}
+        self.script([held('absent', 'materialized', True)], [held('absent', 'in_step', True)])
+        self.run_once()
+        self.assertEqual(len(self.client.acks()), 1)
+        self.assertEqual(delivery.delivered(self.bridge), (9, REVISION))
+        self.assertEqual(self.bridge._credential_delivery['delivered_set'], SET_A)
+
+    def test_default_only_host_with_only_an_observe_enrollment_never_acks(self):
+        launcher = self.bridge.launcher
+        launcher.managed_claude_readiness = lambda: None
+        launcher.verified_release_archive = lambda: {'archive': self.release.archive}
+        self.script([held('absent', 'observe_only', False)], [held('absent', 'observe_only', False)])
+        self.run_once()
+        self.assertEqual(self.client.acks(), [])
+        self.assertEqual(delivery.diagnostic(self.bridge), 'default_consumer_observe_only')
+        launcher.verified_release_archive = lambda: None
+        self.run_once(now=10**12)
+        self.assertEqual(delivery.diagnostic(self.bridge), 'managed_claude_unavailable')
+
+    def test_consumer_set_change_or_local_drift_before_the_ack_blocks_it(self):
+        for recheck in (held('in_step', 'in_step', True, SET_B), held('pending', 'in_step', True),
+                        held('in_step', 'pending', True), held('absent', 'in_step', True)):
+            with self.subTest(recheck=recheck):
+                self.script([held('materialized', 'materialized', True)], [recheck])
+                self.run_once(now=10**12 + len(self.client.calls) * 10**9)
+                self.assertEqual(self.client.acks(), [])
+                self.assertEqual(delivery.diagnostic(self.bridge), 'consumer_set_changed')
+                self.assertIsNone(delivery.delivered(self.bridge))
+
+    def test_unchanged_generation_is_skipped_only_while_the_recheck_still_passes(self):
+        steady = held('in_step', 'in_step', True)
+        self.script([held('materialized', 'materialized', True)], [steady, steady, steady, steady])
+        self.run_once(now=0)
+        self.run_once(now=10**9)
+        self.assertEqual(len(self.client.acks()), 1)
+        self.assertEqual(self.calls(), ['materialize', 'check', 'check'])
+
+    def test_enrollment_change_at_the_current_generation_is_not_skipped(self):
+        self.script([held('materialized'), held('in_step', 'materialized', True)],
+                    [held('in_step'), held('in_step', 'in_step', True), held('in_step', 'in_step', True)])
+        self.run_once(now=0)                     # managed-only first
+        self.assertEqual(self.bridge._credential_delivery['delivered_set'], None)
+        self.run_once(now=10**9)                 # a default consumer was enabled at the same generation
+        self.assertEqual(len(self.client.acks()), 2)
+        self.assertEqual(self.bridge._credential_delivery['delivered_set'], SET_A)
+        self.assertEqual(self.calls(), ['materialize', 'check', 'check', 'materialize', 'check'])
+
+    def test_local_drift_at_the_current_generation_is_revalidated(self):
+        self.script([held('materialized', 'materialized', True), held('in_step', 'in_step', True)],
+                    [held('in_step', 'in_step', True), held('in_step', 'pending', True), held('in_step', 'in_step', True)])
+        self.run_once(now=0)
+        self.run_once(now=10**9)
+        self.assertEqual(len(self.client.acks()), 2)
+
+    def test_late_epoch_result_cannot_ack_after_the_final_recheck(self):
+        self.script([held('materialized', 'materialized', True)],
+                    [{'out': held('in_step', 'in_step', True), 'wait': True}])
+        self.assertTrue(delivery.request(self.bridge))
+        deadline = time.monotonic() + 10
+        while not (self.release.root / 'waiting').exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue((self.release.root / 'waiting').exists())
+        delivery.stop(self.bridge)
+        delivery.start(self.bridge)
+        (self.release.root / 'release').write_text('1')
+        self.join()
+        self.assertEqual(self.client.acks(), [])
+        self.assertIsNone(delivery.delivered(self.bridge))
+
+    def test_malformed_default_fields_are_refused(self):
+        bad = [dict(held('in_step', 'in_step', True), consumer_set='nothex'),
+               dict(held('in_step', 'in_step', True), default_enabled='yes'),
+               dict(held('in_step', 'in_step', True), default='Bad Code!'),
+               {**held('in_step'), 'default': 'in_step'},
+               dict(held('in_step', 'in_step', True), extra=1),
+               dict(held('in_step', 'in_step', True), generation=10)]
+        for out in bad:
+            with self.subTest(out=out):
+                self.script([out], [out])
+                self.run_once(now=10**12 + len(self.client.calls) * 10**9)
+                self.assertEqual(self.client.acks(), [])
+                self.assertEqual(delivery.diagnostic(self.bridge), 'consumer_output_invalid')
+
+    def test_helper_refusal_reason_is_still_sanitized_with_default_fields_present(self):
+        self.script([{'status': 'refused', 'reason': 'lock_timeout', 'default': 'in_step', 'default_enabled': True,
+                      'consumer_set': SET_A}], [held()])
+        self.release.mode('scripted')
+        (self.release.root / 'script-materialize.json').write_text(json.dumps([{'out': {
+            'status': 'refused', 'reason': 'lock_timeout', 'default': 'in_step', 'default_enabled': True,
+            'consumer_set': SET_A}, 'code': 3}]))
+        self.run_once()
+        self.assertEqual(delivery.diagnostic(self.bridge), 'consumer_lock_timeout')
+        self.assertEqual(self.client.acks(), [])
 
 
 class SchedulingTests(DeliveryCase):

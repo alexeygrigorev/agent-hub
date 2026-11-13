@@ -7,6 +7,17 @@ through the verified installed release archive (the same trust boundary as
 managed readiness), and only then sends the exact sync-report ACK for the
 generation that consumer actually holds.
 
+Two independent consumers may exist on a host: the managed hub-claude home
+and, only after an explicit operator enrollment, the one-way default Claude
+login. The ACK covers every *enabled* consumer: it is sent only after all of
+them durably hold the generation, and only after a final read-only recheck
+(``check`` action of the same verified helper) shows the same consumer-set
+identity and that nothing drifted since the write. An equal generation is
+skipped only while that recheck still passes, so an enrollment-set change or
+local drift is never skipped. Observe-only default enrollments are not enabled
+consumers and never claim delivery. The host-generation ACK is the existing one
+(no per-consumer server API).
+
 Ownership is per ``serve()`` connection epoch. An epoch object is created once
 and only ever stopped; it is never re-armed. Every step that writes, ACKs or
 publishes state re-checks, under the module lock, that its epoch is still the
@@ -68,7 +79,8 @@ def _state(bridge):
         if state is None:
             state = bridge._credential_delivery = {
                 'epoch': None, 'thread': None, 'child': None, 'next_at': 0.0, 'failures': 0,
-                'delivered': None, 'diagnostic': None}
+                'delivered': None, 'delivered_set': None, 'delivered_managed': False,
+                'diagnostic': None}
         return state
 
 
@@ -138,7 +150,9 @@ def request(bridge, now=None):
     """Start one background pass if due; never blocks. Returns True when started."""
     if 'claude' not in getattr(bridge, 'engines', ()) or not callable(getattr(getattr(bridge, 'client', None), 'request', None)):
         return False
-    if not callable(getattr(getattr(bridge, 'launcher', None), 'managed_claude_readiness', None)):
+    launcher = getattr(bridge, 'launcher', None)
+    if not (callable(getattr(launcher, 'managed_claude_readiness', None))
+            or callable(getattr(launcher, 'verified_release_archive', None))):
         return False
     state = _state(bridge)
     now = time.monotonic() if now is None else now
@@ -176,7 +190,7 @@ def _run(bridge, state, epoch):
             if _owns(state, epoch):
                 state['failures'], state['diagnostic'] = 0, None
                 if outcome is not None:
-                    state['delivered'] = outcome
+                    state['delivered'], state['delivered_set'], state['delivered_managed'] = outcome
     except Exception as error:
         code = _code(error)
         with _LOCK:
@@ -226,16 +240,23 @@ def _environment():
     return env
 
 
-def _consume(bridge, state, epoch, archive, generation, revision, files):
-    """Materialize into the maintained managed-engines home via the verified
-    release helper; returns its fixed status. Killed on epoch stop."""
+HELD = ('in_step', 'materialized')
+_BASE = {'status'}
+_FULL = {'status', 'generation', 'revision'}
+_DEFAULT = {'default', 'default_enabled', 'consumer_set'}
+_SET = re.compile(r'(?:[0-9a-f]{32}|enrollment_unreadable)\Z')
+
+
+def _consume(bridge, state, epoch, archive, generation, revision, files, action='materialize'):
+    """Run the verified release helper (``materialize`` writes, ``check`` is
+    read-only) and return its validated, fixed-shape result. Killed on epoch stop."""
     python = os.path.join(os.path.dirname(archive), 'bin', 'python')
     payload = json.dumps({'label': LABEL, 'generation': generation, 'revision': revision, 'files': files}).encode()
     with _LOCK:
         if not _owns(state, epoch):
             raise Refused('delivery_stopped')
         child = state['child'] = (getattr(bridge, 'delivery_popen', None) or subprocess.Popen)(
-            [python, '-I', '-S', '-c', HELPER_BOOT, archive, 'materialize'],
+            [python, '-I', '-S', '-c', HELPER_BOOT, archive, action],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             env=_environment(), close_fds=True, start_new_session=True)
     try:
@@ -262,35 +283,83 @@ def _consume(bridge, state, epoch, archive, generation, revision, files):
         reason = result.get('reason')
         raise Refused('consumer_' + reason if isinstance(reason, str) and _CODE.fullmatch(reason) and len(reason) <= 55
                       else 'consumer_refused')
-    status = result.get('status')
-    if status == 'absent' and set(result) == {'status'}:
-        return status
-    if (status in ('in_step', 'materialized') and result.get('generation') == generation
-            and result.get('revision') == revision and set(result) == {'status', 'generation', 'revision'}):
-        return status
+    status, keys = result.get('status'), set(result)
+    extra = keys & _DEFAULT
+    if extra and extra != _DEFAULT:
+        raise Refused('consumer_output_invalid')
+    keys -= _DEFAULT
+    default = result.get('default')
+    if extra and (not isinstance(default, str) or not _CODE.fullmatch(default) or len(default) > 40
+                  or type(result['default_enabled']) is not bool
+                  or not isinstance(result['consumer_set'], str) or not _SET.fullmatch(result['consumer_set'])):
+        raise Refused('consumer_output_invalid')
+    if status == 'absent' and keys == _BASE:
+        return result
+    if (status in HELD + ('pending',) and (status in HELD or action == 'check') and keys == _FULL
+            and result.get('generation') == generation and result.get('revision') == revision):
+        return result
     raise Refused('consumer_output_invalid')
+
+
+def _verdict(result):
+    """(enabled, all_hold, set_id, blocker) for one helper result."""
+    managed = result['status'] != 'absent'
+    default = bool(result.get('default_enabled'))
+    hold = ((not managed or result['status'] in HELD) and (not default or result.get('default') in HELD))
+    blocker = None
+    if default and result.get('default') not in HELD:
+        blocker = 'default_consumer_' + str(result['default'])
+    return managed or default, hold, result.get('consumer_set'), blocker
 
 
 def _deliver(bridge, state, epoch):
     _fence(state, epoch)
-    readiness = bridge.launcher.managed_claude_readiness()
+    launcher = bridge.launcher
+    readiness = launcher.managed_claude_readiness() if callable(getattr(launcher, 'managed_claude_readiness', None)) else None
     if not isinstance(readiness, dict) or not isinstance(readiness.get('archive'), str):
-        raise Refused('managed_claude_unavailable')
+        # No managed profile here: a default-only host still needs the verified
+        # release archive to run the same helper.
+        release = getattr(launcher, 'verified_release_archive', None)
+        readiness = release() if callable(release) else None
+        if not isinstance(readiness, dict) or not isinstance(readiness.get('archive'), str):
+            raise Refused('managed_claude_unavailable')
+    archive = readiness['archive']
     client = bridge.client
     generation, revision, files = _observe(client)
     key = (generation, revision)
     with _LOCK:
-        if state['delivered'] == key:
+        previous, previous_set = state['delivered'], state['delivered_set']
+        previous_absent = not state['delivered_managed']
+    if previous == key:
+        # Never skip on the generation alone: a newly enrolled consumer, a
+        # changed consumer set or local drift must be revalidated first.
+        _fence(state, epoch)
+        probe = _consume(bridge, state, epoch, archive, generation, revision, files, 'check')
+        enabled, hold, identity, _ = _verdict(probe)
+        if enabled and hold and identity == previous_set and (probe['status'] == 'absent') == previous_absent:
             return None
     _fence(state, epoch)
-    status = _consume(bridge, state, epoch, readiness['archive'], generation, revision, files)
-    if status == 'absent':
-        # No enrolled managed-engines consumer on this host: never ACK a copy
-        # nothing uses. Truthful diagnostic; retry on the normal interval.
-        raise Refused('managed_claude_consumer_absent')
-    # The consumer now holds exactly (generation, revision). Re-check Hub, then
-    # ACK only while this connection epoch still owns delivery.
+    result = _consume(bridge, state, epoch, archive, generation, revision, files)
+    enabled, hold, identity, blocker = _verdict(result)
+    if blocker is not None:
+        raise Refused(blocker)
+    if not enabled:
+        # No enabled consumer on this host (no managed hub-claude consumer and
+        # no write-mode default consumer): never ACK a copy nothing uses.
+        raise Refused('default_consumer_observe_only' if result.get('default') == 'observe_only'
+                      else 'managed_claude_consumer_absent')
+    if not hold:
+        raise Refused('consumer_output_invalid')
+    # Every enabled consumer now holds exactly (generation, revision). Re-check
+    # Hub, then recheck the consumer set and local state read-only, then ACK
+    # only while this connection epoch still owns delivery.
     _still_current(client, generation, revision)
+    _fence(state, epoch)
+    recheck = _consume(bridge, state, epoch, archive, generation, revision, files, 'check')
+    enabled2, hold2, identity2, _ = _verdict(recheck)
+    if not (enabled2 and hold2 and identity2 == identity
+            and (recheck['status'] == 'absent') == (result['status'] == 'absent')):
+        raise Refused('consumer_set_changed')
     _fence(state, epoch)
     acknowledged = client.request('POST', ACK_PATH, {
         'state': 'synced',
@@ -298,4 +367,4 @@ def _deliver(bridge, state, epoch):
     }, timeout=REQUEST_TIMEOUT_SECONDS)
     if not isinstance(acknowledged, dict) or acknowledged.get('status') != 'recorded':
         raise Refused('generation_ack_unverified')
-    return key
+    return key, identity, result['status'] != 'absent'
