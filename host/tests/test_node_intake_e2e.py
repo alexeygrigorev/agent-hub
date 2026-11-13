@@ -8,8 +8,10 @@ production endpoint).
 """
 import importlib.util
 import json
+import os
 import re
 import shutil
+import signal
 import threading
 import time
 from pathlib import Path
@@ -168,6 +170,79 @@ def _offer_result_counts(hub, session_id):
     return len(offers), len(results)
 
 
+def _wait_offer_result_counts(hub, session_ids, expected=(1, 1), timeout=30):
+    """Host logging is asynchronous to the server view: wait (monotonic deadline) for the
+    exact per-session counts. Any count above the expected one fails at once, so a
+    duplicate offer or result is never hidden by waiting."""
+    deadline = time.monotonic() + timeout
+    while True:
+        counts = {session_id: _offer_result_counts(hub, session_id) for session_id in session_ids}
+        over = {k: v for k, v in counts.items() if v[0] > expected[0] or v[1] > expected[1]}
+        assert not over, "duplicate offer/result log lines %s\n%s" % (over, hub.host.tail(100))
+        if all(v == expected for v in counts.values()):
+            return counts
+        assert time.monotonic() < deadline, "offer/result counts never reached %s: %s\n%s" % (
+            expected, counts, hub.host.tail(100))
+        time.sleep(0.1)
+
+
+# The saga state a launch holds while the host's native `a start` handshake is still
+# blocked: offered -> claimed by the host, no native id, no completion yet.
+PENDING_DISPATCH_STATE = "claimed"
+
+
+def _native_start_pids(tag):
+    """Live stub `a start` handshake processes for this exact tag (Linux /proc)."""
+    pids = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            argv = (entry / "cmdline").read_bytes().split(b"\0")
+            status = (entry / "status").read_text()
+        except OSError:
+            continue
+        argv = [a.decode(errors="replace") for a in argv if a]
+        if "State:\tZ" in status or "start" not in argv or "--tag" not in argv:
+            continue
+        if any(a.endswith("/e2e/bin/a") for a in argv) and argv[argv.index("--tag") + 1] == tag:
+            pids.append(int(entry.name))
+    return pids
+
+
+def _pending_evidence(hub, session_id, marker):
+    tag = "task-hub2-" + session_id
+    row = hub.show(session_id)
+    return {
+        "state": row.get("state"), "native_id": row.get("native_id"), "attention": row.get("attention"),
+        "marker": marker.read_text().strip() if marker.exists() else None,
+        "native_listed": tag in hub.native_by_tag(),
+        "handshake_alive": bool(_native_start_pids(tag)),
+        "offer_result": _offer_result_counts(hub, session_id),
+    }
+
+
+def _assert_genuinely_pending(hub, session_id, marker):
+    """A sticky marker plus state != running is not enough: the native start may already
+    have timed out (host runner limit 35 s) or failed, and the server keeps such a saga
+    `claimed` (with attention) until its 120 s start deadline. Require the exact
+    non-terminal dispatch state with no attention, a live handshake for this tag and
+    offer/result counts (1, 0)."""
+    evidence = _pending_evidence(hub, session_id, marker)
+    assert evidence == {
+        "state": PENDING_DISPATCH_STATE, "native_id": None, "attention": None, "marker": "task-hub2-" + session_id,
+        "native_listed": False, "handshake_alive": True, "offer_result": (1, 0),
+    }, "launch is not genuinely pending: %s\n%s" % (evidence, hub.host.tail(100))
+    return evidence
+
+
+def _legacy_pending_check(hub, session_id, marker):
+    """The pre-fix predicate (sticky marker, no native row, state != running)."""
+    return (marker.exists() and marker.read_text().strip() == "task-hub2-" + session_id
+            and "task-hub2-" + session_id not in hub.native_by_tag()
+            and hub.show(session_id)["state"] != "running")
+
+
 def test_ten_barrier_released_cli_starts_all_reach_running_with_unique_ids():
     harness = _load_harness()
     hub = _Hub(harness)
@@ -225,8 +300,7 @@ def test_ten_barrier_released_cli_starts_all_reach_running_with_unique_ids():
             row = listed[session_id]
             assert row.get("machine") == harness.MACHINE or row.get("machine_id") == harness.MACHINE, row
             assert row.get("workspace") and Path(row["workspace"]).resolve().is_relative_to(hub.host.workspace.resolve()), row
-        for session_id in ids:
-            assert _offer_result_counts(hub, session_id) == (1, 1), (session_id, hub.host.tail(100))
+        _wait_offer_result_counts(hub, ids)
         print("ten concurrent starts running in %.2fs wall" % elapsed)
     finally:
         hub.close()
@@ -251,9 +325,7 @@ def test_real_cli_stop_is_confirmed_within_10s_while_another_launch_is_pending()
         assert pending.returncode == 0, (pending.stdout[-1500:], pending.stderr[-1500:])
         pending_id = json.loads(pending.stdout)["id"]
         harness.wait_for(marker.exists, 60, label="second launch blocked inside native start")
-        assert marker.read_text().strip() == "task-hub2-" + pending_id
-        assert "task-hub2-" + pending_id not in hub.native_by_tag(), "pending launch already has a native session"
-        assert hub.show(pending_id)["state"] != "running"
+        before = _assert_genuinely_pending(hub, pending_id, marker)
 
         stop_started = time.monotonic()
         stop = hub.cli.run("sessions", "stop", owned_id, "--timeout", "10")
@@ -265,13 +337,38 @@ def test_real_cli_stop_is_confirmed_within_10s_while_another_launch_is_pending()
         total = time.monotonic() - stop_started
         assert stopped["state"] == "stopped", stopped
         assert total < 10, "stop confirmed after %.2fs" % total
+        # The other launch is still genuinely pending right after the confirmed STOP.
+        after = _assert_genuinely_pending(hub, pending_id, marker)
+        assert after == before
         assert "task-hub2-" + owned_id not in hub.native_by_tag(), "owned native still listed after stop"
-        # The other launch was still pending the whole time (no native session appeared).
-        assert "task-hub2-" + pending_id not in hub.native_by_tag()
-        assert hub.show(pending_id)["state"] != "running"
-        assert _offer_result_counts(hub, owned_id) == (1, 1), hub.host.tail(100)
-        offers, _ = _offer_result_counts(hub, pending_id)
-        assert offers == 1, hub.host.tail(100)
-        print("stop confirmed in %.2fs (cli %.2fs) with a pending launch" % (total, stop_elapsed))
+        _wait_offer_result_counts(hub, [owned_id])
+
+        # Mutation evidence for the old false positive: end the pending handshake so the
+        # launch fails. The sticky marker stays and the legacy predicate still passes,
+        # while the exact pending assertion rejects the failed launch.
+        tag = "task-hub2-" + pending_id
+        handshakes = _native_start_pids(tag)
+        assert handshakes, "no live handshake to end for " + tag
+        for pid in handshakes:
+            os.kill(pid, signal.SIGKILL)
+        _wait_offer_result_counts(hub, [pending_id])  # the host finished (failed) this offer
+        failed = harness.wait_for(
+            lambda: (lambda row: row if row.get("attention") else None)(hub.show(pending_id)),
+            30, interval=0.2, label="pending launch failure recorded after handshake kill")
+        assert failed["attention"]["reason"] == "native_start_refused", failed
+        assert not failed.get("native_id"), failed
+        # Observed today: the failed saga keeps the claimed state until its start deadline,
+        # so the dispatch state alone would not distinguish it either.
+        assert failed["state"] != "running", failed
+        assert _legacy_pending_check(hub, pending_id, marker), "legacy predicate no longer reproduces the false positive"
+        try:
+            _assert_genuinely_pending(hub, pending_id, marker)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("failed launch %s was accepted as pending" % failed)
+        print("stop confirmed in %.2fs (cli %.2fs) with a pending launch; pending evidence %s; "
+              "after handshake kill state=%s attention=%s" % (
+                  total, stop_elapsed, before, failed["state"], failed["attention"]["reason"]))
     finally:
         hub.close()
