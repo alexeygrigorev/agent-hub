@@ -6,7 +6,7 @@ function fixture(options:{beforeAccount?:()=>Promise<void>;schemaMode?:string}={
  let control:ControlDO;
  const env:any={HUB2_SCHEMA_MIGRATIONS:options.schemaMode,
  CONTROL:{idFromName:(id:string)=>id,get:()=>({fetch:(input:string|Request,init?:RequestInit)=>control.fetch(input instanceof Request?input:new Request(input,init))})},
- ACCOUNTS:{idFromName:(id:string)=>id,get:()=>({fetch:async()=>{await options.beforeAccount?.();return Response.json({account:{enabled:true},hosts:['host-picker']});}})},
+ ACCOUNTS:{idFromName:(id:string)=>id,get:()=>({fetch:async()=>{await options.beforeAccount?.();return Response.json({account:{enabled:true},quota:{remaining:80,captured_at:Date.now(),valid_until:Date.now()+900000},fresh:true,hosts:['host-picker']});}})},
  MACHINES:{idFromName:(id:string)=>id,get:(id:string)=>({fetch:async(input:string|Request)=>new URL(input instanceof Request?input.url:input).pathname.includes('routing')?Response.json({machine_id:id,connected:true,engines:['codex','claude'],capabilities:['headless']}):Response.json({sessions:snapshots.get(id)||[]})})}};
  control=new ControlDO(state,env);
  const call=(p:string,m='GET',b?:unknown,a:unknown=admin)=>control.fetch(new Request('https://control.test'+p,{method:m,headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(a)},...(b===undefined?{}:{body:JSON.stringify(b)})}));return{control,database,call,snapshots,env,restart:()=>{control=new ControlDO(state,env);}};}
