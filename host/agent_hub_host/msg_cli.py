@@ -1,21 +1,23 @@
-"""`hub msg` and the messaging top-level commands (docs/SESSION-MESSAGING.md §11).
+"""`hub msg` and the messaging top-level commands on the Hub2 mailbox.
 
-Identity, never taken from flags:
-- ``--profile NAME``: a named agent profile (``~/.config/agent-hub/NAME.json``,
-  e.g. the Developer's ``agent:developer``) written by
-  ``hub agents create NAME``;
-- inside a Hub session: the session's own credential that the bound host
-  provisions (``session:<hub-session-id>``), found via APLEXER_SESSION_ID;
-- otherwise the normal profile (HUB_CONFIG_FILE, human or host), which must
-  name its sender with ``--from`` / ``--actor``.
+Hub2 serves messages only on ``/api/messages`` (hub2/src/mailbox-do.ts); the
+Hub1 ``/api/bus/*`` routes are gone and refused client-side. The sender is
+always the credential that makes the request:
+- inside a Hub2 session: the session worker credential (``session:<id>``);
+- ``--profile NAME``: a named agent profile (``~/.config/agent-hub/NAME.json``);
+- otherwise the normal login (``human:<sub>``).
 
-``--from`` is optional and refused when it differs from the credential for
-new address kinds. Exit codes: 0 accepted, 2 refused (auth/validation),
-3 recipient unknown or ambiguous, 4 transport error after retries.
-Tokens are never printed.
+``--to human:me`` posts into the web Inbox of the human the credential acts
+for (the caller itself, or the human owning the session's intake), resolved by
+the server (t3280u). ``--from`` is optional and refused when it differs from
+a known identity. Hub1-only options (--tui, --thread, --ref, --deliver-by,
+--lease-epoch, non-note --kind) fail with ``not_supported_on_hub2`` and the
+replacement. Exit codes: 0 accepted, 2 refused (auth/validation), 3 recipient
+unknown or ambiguous, 4 transport error after retries. Tokens are never printed.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -30,8 +32,6 @@ from . import private_fs
 
 PROFILE_NAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
 CREDENTIAL_LIMIT = 16384
-DURATION = re.compile(r'^(\d+)([smhd]?)([smhd]?)$', re.IGNORECASE)
-DURATION_UNITS = {'': 1, 's': 1, 'm': 60, 'h': 3600, 'd': 86400}
 HTTP_STATUS = re.compile(r'status (\d{3})')
 
 
@@ -55,7 +55,7 @@ def exit_code_for(exc: BaseException) -> int:
     match = HTTP_STATUS.search(text)
     if match:
         status = int(match.group(1))
-        if 'unknown_recipient' in text or 'ambiguous_recipient' in text:
+        if any(code in text for code in ('unknown_recipient', 'recipient_unknown', 'ambiguous_recipient')):
             return 3
         if status >= 500:
             return 4
@@ -106,50 +106,6 @@ def resolve_identity(profile: str | None) -> tuple[str | None, str]:
     return (actor if isinstance(actor, str) else None), source
 
 
-def resolve_sender(args, actor: str | None = None) -> str:
-    """Sending identity: the credential's actor, else --from; a --from that
-    differs from the credential is refused (§11). Pass the actor already
-    resolved by resolve_identity — a second resolve would miss the session
-    credential now that HUB_CONFIG_FILE points at it."""
-    if actor is None:
-        actor, _source = resolve_identity(getattr(args, 'profile', None))
-    acting_as = getattr(args, 'as_actor', None)
-    sender = acting_as or actor or getattr(args, 'from_actor', None)
-    if not sender:
-        raise MsgError('This profile has no messaging identity; pass --from')
-    expected = acting_as or actor
-    if expected and getattr(args, 'from_actor', None) and args.from_actor != expected:
-        raise MsgError('--from differs from this identity')
-    return sender
-
-
-def parse_duration(text: str) -> int:
-    """`--deliver-by 24h` style: plain seconds or <n><s|m|h|d>, 60 s..7 d."""
-    match = DURATION.fullmatch(str(text).strip().lower())
-    if not match:
-        raise MsgError('Invalid --deliver-by duration (use e.g. 3600, 90m, 24h, 7d)')
-    value, unit, extra = match.groups()
-    if extra:
-        raise MsgError('Invalid --deliver-by duration (use one unit, e.g. 24h)')
-    seconds = int(value) * DURATION_UNITS[unit]
-    if seconds < 60 or seconds > 7 * 86400:
-        raise MsgError('--deliver-by must be between 60 s and 7 d')
-    return seconds
-
-
-def parse_ref(text: str | None) -> dict | None:
-    """`--ref JSON`: bounded large-payload reference, validated server-side."""
-    if text is None:
-        return None
-    try:
-        ref = json.loads(text)
-    except ValueError:
-        raise MsgError('--ref must be valid JSON')
-    if not isinstance(ref, dict):
-        raise MsgError('--ref must be a JSON object')
-    return ref
-
-
 def _request(method: str, path: str, payload=None, retries: bool = False):
     """One bus request; send/reply retry transport failures and 5xx with the
     SAME payload (same idempotency key), so a retry can never double-send."""
@@ -188,46 +144,116 @@ def _body(args) -> str:
     return text
 
 
-def _send_payload(args, sender: str) -> dict:
-    payload = {'from_actor': sender, 'to_actor': args.to, 'kind': getattr(args, 'kind', None) or 'note',
-               'body': _body(args), 'idempotency_key': getattr(args, 'key', None) or str(uuid.uuid4())}
-    if getattr(args, 'as_actor', None):
-        payload['as'] = args.as_actor
-    delivery = getattr(args, 'delivery', None)
-    if delivery:
-        payload['delivery'] = delivery
-    if getattr(args, 'thread', None):
-        payload['thread_id'] = args.thread
-    if getattr(args, 'reply_to', None):
-        payload['reply_to'] = args.reply_to
-    if getattr(args, 'lease_epoch', None) is not None:
-        payload['lease_epoch'] = int(args.lease_epoch)
-    deliver_by = getattr(args, 'deliver_by', None)
-    if deliver_by is not None:
-        payload['deliver_by_s'] = parse_duration(deliver_by)
-    ref = parse_ref(getattr(args, 'ref', None))
-    if ref is not None:
-        payload['ref'] = ref
-    return payload
+# Hub2 serves messaging only on /api/messages (hub2/src/mailbox-do.ts); the
+# Hub1 /api/bus/* family is refused client-side by ensure_hub2_supported.
+MESSAGES = '/api/messages'
+BODY_LIMIT = 12000
+TUI_REFUSAL = ('not_supported_on_hub2; --tui (typing into a session prompt) moved to '
+               '`hub sessions send <session-id> --prompt ...`; `hub msg send` posts to the Hub2 mailbox')
+DEAD_FLAGS = (('thread', '--thread'), ('thread_id', '--thread-id'), ('ref', '--ref'),
+              ('deliver_by', '--deliver-by'), ('deliver_by_s', '--deliver-by-s'), ('lease_epoch', '--lease-epoch'))
+
+
+def refuse_hub1_only_flags(args):
+    """Hub1 bus options with no Hub2 mailbox meaning fail loudly, never silently."""
+    if getattr(args, 'delivery', None) == 'tui':
+        raise MsgError(TUI_REFUSAL)
+    for attr, flag in DEAD_FLAGS:
+        if getattr(args, attr, None) not in (None, ''):
+            raise MsgError('not_supported_on_hub2; ' + flag + ' has no Hub2 mailbox equivalent '
+                           '(threads follow `hub msg reply <id>`; bodies are inline, max 12000 characters)')
+    kind = getattr(args, 'kind', None)
+    if kind not in (None, '', 'note', 'reply'):
+        raise MsgError('not_supported_on_hub2; --kind ' + str(kind)[:40] + ' has no Hub2 mailbox equivalent (all messages are notes)')
+
+
+def _check_from(args, actor: str | None) -> None:
+    """--from is optional; Hub2 always records the credential's identity as the
+    sender, so a --from that disagrees with a known identity is refused."""
+    expected = getattr(args, 'as_actor', None) or actor
+    claimed = getattr(args, 'from_actor', None)
+    if claimed and expected and claimed != expected:
+        raise MsgError('--from differs from this identity')
+
+
+def _view_query(args, mailbox: str | None = None) -> str:
+    as_actor = getattr(args, 'as_actor', None)
+    if as_actor:
+        return '?as=' + quote(as_actor, safe='')
+    if mailbox:
+        return '?mailbox=' + quote(mailbox, safe='')
+    return ''
+
+
+def _message(result) -> dict:
+    message = result.get('message') if isinstance(result, dict) else None
+    if not isinstance(message, dict):
+        raise MsgError('Hub returned no message', 4)
+    return message
+
+
+def get_message(args, message_id: str) -> dict:
+    return _message(_request('GET', MESSAGES + '/' + quote(message_id, safe='') + _view_query(args)))
+
+
+def post_message(args, recipient: str, actor: str | None, reply_to: dict | None = None) -> dict:
+    """One Hub2 mailbox send. `human:me` is resolved server-side to the human
+    this credential acts for (Alexey's web Inbox). Retries reuse the same key."""
+    refuse_hub1_only_flags(args)
+    _check_from(args, actor)
+    body = _body(args)
+    if len(body) > BODY_LIMIT:
+        raise MsgError('Body exceeds the Hub2 12000-character message limit; link to a file instead')
+    key = getattr(args, 'key', None) or str(uuid.uuid4())
+    args.key = key
+    payload = {'recipient': recipient, 'body': body, 'key': key}
+    if reply_to is not None:
+        payload['reply_to'] = reply_to['id']
+        payload['parent_sender'] = reply_to['sender']
+    message = _message(_request('POST', MESSAGES + _view_query(args), payload, retries=True))
+    return {'id': message.get('id'), 'from': message.get('sender'), 'to': message.get('recipient'),
+            'thread_id': message.get('thread_id'), 'state': message.get('state'),
+            'epoch': message.get('epoch'), 'idempotency_key': key}
+
+
+def reply_message(args, message_id: str, actor: str | None) -> dict:
+    """Reply to the other end of a message: its sender, unless this identity sent it."""
+    original = get_message(args, message_id)
+    me = getattr(args, 'as_actor', None) or actor
+    to = original.get('recipient') if me and original.get('sender') == me else original.get('sender')
+    if not to:
+        raise MsgError('Original message has no counterpart to reply to')
+    return post_message(args, to, actor, reply_to=original)
+
+
+def stage_message(args, message_id: str, stage: str) -> dict:
+    """read/ack/accept/complete receipts are epoch-bound on Hub2."""
+    message = get_message(args, message_id)
+    path = MESSAGES + '/' + quote(message['id'], safe='') + '/' + stage + _view_query(args, message.get('recipient'))
+    return _request('POST', path, {'epoch': message.get('epoch')})
 
 
 def add_commands(sub):
-    msg = sub.add_parser('msg', help='Cross-device messages to sessions, named agents and humans')
+    msg = sub.add_parser('msg', help='Hub2 mailbox messages: post to the human web Inbox (human:me), sessions and named agents',
+                         description='Hub2 mailbox (/api/messages). Post a link into your own Hub web Inbox: '
+                                     "hub msg send --to human:me --body '...'. Inside a Hub session the session "
+                                     'credential is the sender; human:me resolves to the human who owns the '
+                                     'session\'s intake. To type into a running session prompt use `hub sessions send`.')
     msg.add_argument('--profile', help='Named agent profile, e.g. developer')
     ms = msg.add_subparsers(dest='msg_cmd', required=True)
-    send = ms.add_parser('send', help='Send to session:<id>, <tag>@<machine>, agent:<name>, human:<sub> or a bus address')
-    send.add_argument('--to', required=True)
+    send = ms.add_parser('send', help='Post to human:me (your Hub web Inbox), human:<sub>, session:<id> or agent:<name>')
+    send.add_argument('--to', required=True, help='human:me = the human this credential acts for (Hub web Inbox)')
     send.add_argument('--body', default=None, help='Text, or - for stdin')
     send.add_argument('--body-file')
-    send.add_argument('--from', dest='from_actor', help='Sender for default (human/host) profiles only')
+    send.add_argument('--from', dest='from_actor', help='Optional; the credential is always the sender, a mismatch is refused')
     send.add_argument('--as', dest='as_actor', help='Act as a delegated named agent, e.g. agent:oncall')
     mode = send.add_mutually_exclusive_group()
-    mode.add_argument('--tui', action='store_const', const='tui', dest='delivery', help='Type into the session prompt')
-    mode.add_argument('--inbox', action='store_const', const='inbox', dest='delivery', help='Native inbox only')
-    send.add_argument('--thread')
-    send.add_argument('--ref', help='Large payload by reference, JSON object (§10)')
-    send.add_argument('--deliver-by', help='TUI delivery deadline, e.g. 24h (default 24 h, max 7 d)')
-    send.add_argument('--deliver-by-s', type=int)
+    mode.add_argument('--tui', action='store_const', const='tui', dest='delivery', help='Refused on Hub2: use `hub sessions send <id> --prompt`')
+    mode.add_argument('--inbox', action='store_const', const='inbox', dest='delivery', help='Mailbox only (the Hub2 default)')
+    send.add_argument('--thread', help='Refused on Hub2 (threads follow hub msg reply)')
+    send.add_argument('--ref', help='Refused on Hub2 (inline body, max 12000 characters)')
+    send.add_argument('--deliver-by', help='Refused on Hub2 (no TUI delivery deadline)')
+    send.add_argument('--deliver-by-s', type=int, help=argparse.SUPPRESS)
     send.add_argument('--key', help='Idempotency key; printed back for safe retries')
     reply = ms.add_parser('reply', help='Reply to a message; threads back to its sender on any host')
     reply.add_argument('id')
@@ -238,18 +264,18 @@ def add_commands(sub):
     reply_mode = reply.add_mutually_exclusive_group()
     reply_mode.add_argument('--tui', action='store_const', const='tui', dest='delivery')
     reply_mode.add_argument('--inbox', action='store_const', const='inbox', dest='delivery')
-    reply.add_argument('--ref', help='Large payload by reference, JSON object (§10)')
-    reply.add_argument('--deliver-by', help='TUI delivery deadline, e.g. 24h')
+    reply.add_argument('--ref', help='Refused on Hub2')
+    reply.add_argument('--deliver-by', help='Refused on Hub2')
     reply.add_argument('--key')
     inbox = ms.add_parser('inbox', help='List this identity\'s inbox')
     inbox.add_argument('--actor', help='Default: this identity')
     inbox.add_argument('--unread', action='store_true')
     inbox.add_argument('--thread', help='Only one thread id')
-    inbox.add_argument('--wait', type=int, default=0, help='Long-poll up to N seconds (max 60) for new messages')
+    inbox.add_argument('--wait', type=int, default=0, help='Poll up to N seconds (max 60) for new messages')
     inbox.add_argument('--mark-read', action='store_true', help='Mark the returned messages read')
-    inbox.add_argument('--limit', type=int, default=50)
+    inbox.add_argument('--limit', type=int, default=25, help='1..50')
     inbox.add_argument('--cursor')
-    show = ms.add_parser('show', help='Show one message (marks it read for its recipient)')
+    show = ms.add_parser('show', help='Show one message')
     show.add_argument('id')
     status = ms.add_parser('status', help='Delivery state and audit events of one message')
     status.add_argument('id')
@@ -269,7 +295,6 @@ def add_commands(sub):
 
 
 def execute(args):
-    from . import bus
     from .config import load_config
     if getattr(args, 'msg_cmd', None) == 'agents':
         from . import agents_cli
@@ -295,61 +320,60 @@ def execute(args):
             return _request('GET', path)
         return _request('POST', path, {'client': args.client, 'remove': bool(args.remove)})
     if args.msg_cmd == 'readdress':
-        return _request('POST', '/api/bus/messages/' + quote(args.id, safe='') + '/readdress', {'to': args.to})
+        message = get_message(args, args.id)
+        return _request('POST', MESSAGES + '/' + quote(message['id'], safe='') + '/readdress',
+                        {'recipient': args.to, 'key': 'readdress:' + message['id'] + ':' + args.to, 'epoch': message.get('epoch')})
     actor, source = resolve_identity(getattr(args, 'profile', None))
     if args.msg_cmd == 'whoami':
         return {'actor': actor, 'source': source}
-    if args.msg_cmd in ('send', 'reply'):
-        sender = resolve_sender(args, actor)
-        key = getattr(args, 'key', None) or str(uuid.uuid4())
-        args.key = key
-        if args.msg_cmd == 'send':
-            result = _request('POST', '/api/bus/send', _send_payload(args, sender), retries=True)
-        else:
-            original_path = '/api/bus/messages/' + quote(args.id, safe='')
-            if getattr(args, 'as_actor', None):
-                original_path += '?as=' + quote(args.as_actor, safe='')
-            original = _request('GET', original_path)
-            to = original['from_actor'] if original.get('to_actor') == sender else original['to_actor']
-            args.to = to
-            # /api/bus/reply requires reply_to; the server derives the thread
-            # from it when --thread is not given (§11).
-            args.reply_to = args.id
-            result = _request('POST', '/api/bus/reply', _send_payload(args, sender), retries=True)
-        return {**result, 'from': sender, 'idempotency_key': key}
+    if args.msg_cmd == 'send':
+        return post_message(args, args.to, actor)
+    if args.msg_cmd == 'reply':
+        return reply_message(args, args.id, actor)
     if args.msg_cmd == 'inbox':
         return inbox(args, actor)
     if args.msg_cmd == 'show':
-        return _request('GET', '/api/bus/messages/' + quote(args.id, safe=''))
-    return _request('GET', '/api/bus/messages/' + quote(args.id, safe='') + '/status')
+        return get_message(args, args.id)
+    return _request('GET', MESSAGES + '/' + quote(args.id, safe='') + '/status' + _view_query(args))
 
 
 def inbox(args, actor: str | None):
-    """Shared inbox path for `hub msg inbox` and `hub inbox` (§11): one long-
-    polled request, then an optional batch mark-read of what was returned."""
-    who = getattr(args, 'actor', None) or actor
-    if not who:
-        raise MsgError('Pass --actor for this profile')
+    """Shared inbox path for `hub msg inbox` and `hub inbox`: the Hub2 mailbox
+    page the web Inbox shows. --wait polls (max 60 s) until a message shows
+    up; --unread keeps messages without a read receipt; --mark-read records
+    the epoch-bound read receipt for what was returned."""
+    who = getattr(args, 'actor', None) or getattr(args, 'as_actor', None) or actor
     wait = max(0, min(getattr(args, 'wait', 0) or 0, 60))
-    params = ['actor=' + quote(who, safe='')]
-    if getattr(args, 'unread', False):
-        params.append('unread=1')
+    params = ['limit=' + str(max(1, min(int(getattr(args, 'limit', None) or 25), 50)))]
     if getattr(args, 'thread', None):
         params.append('thread=' + quote(args.thread, safe=''))
     if getattr(args, 'cursor', None):
         params.append('cursor=' + quote(args.cursor, safe=''))
-    limit = getattr(args, 'limit', None)
-    if limit is not None:
-        # The server clamps 1..100; mirror that instead of refusing.
-        limit = max(1, min(int(limit), 100))
-        params.append('limit=' + str(limit))
-    if wait:
-        params.append('wait=' + str(wait))
-    rows = _request('GET', '/api/bus/inbox?' + '&'.join(params))
-    rows = rows if isinstance(rows, list) else rows.get('messages', [])
-    result = {'actor': who, 'messages': rows}
+    view = ''
+    if getattr(args, 'as_actor', None) or (who and who.startswith('agent:') and who != actor):
+        view = 'as=' + quote(who, safe='')
+    elif who and who != actor:
+        view = 'mailbox=' + quote(who, safe='')
+    if view:
+        params.append(view)
+    deadline = time.monotonic() + wait
+    while True:
+        page = _request('GET', MESSAGES + '?' + '&'.join(params))
+        rows = page.get('items', []) if isinstance(page, dict) else []
+        if getattr(args, 'unread', False):
+            rows = [r for r in rows if not r.get('read_at')]
+        if rows or time.monotonic() >= deadline:
+            break
+        time.sleep(min(3, max(0.1, deadline - time.monotonic())))
+    result = {'actor': who, 'messages': rows, 'next': page.get('next') if isinstance(page, dict) else None}
     if getattr(args, 'mark_read', False) and rows:
-        result['marked_read'] = _request('POST', '/api/bus/messages/read', {'ids': [r['id'] for r in rows]})
+        marked = 0
+        for row in rows:
+            if not row.get('read_at'):
+                path = MESSAGES + '/' + quote(row['id'], safe='') + '/read' + ('?' + view if view else '')
+                _request('POST', path, {'epoch': row.get('epoch')})
+                marked += 1
+        result['marked_read'] = {'marked': marked}
     return result
 
 
@@ -363,37 +387,24 @@ def _normalize_top_args(args):
 
 
 def top_send(args):
-    """`hub send` with the §11 surface: new addresses, --tui/--inbox, --ref,
-    --deliver-by; --from optional and refused on a credential mismatch."""
+    """`hub send`: same Hub2 mailbox path as `hub msg send`; --reply-to threads."""
     _normalize_top_args(args)
     actor, _source = resolve_identity(getattr(args, 'profile', None))
-    sender = resolve_sender(args, actor)
-    key = getattr(args, 'idempotency_key', None) or str(uuid.uuid4())
-    args.key = key
-    result = _request('POST', '/api/bus/send', _send_payload(args, sender), retries=True)
-    return {**result, 'from': sender, 'idempotency_key': key}
+    args.key = getattr(args, 'idempotency_key', None) or getattr(args, 'key', None)
+    if getattr(args, 'reply_to', None):
+        return reply_message(args, args.reply_to, actor) if not args.to else post_message(
+            args, args.to, actor, reply_to=get_message(args, args.reply_to))
+    return post_message(args, args.to, actor)
 
 
 def top_reply(args):
-    """`hub reply` with the §11 surface: --from/--to optional; the recipient
-    defaults to the other end of the replied-to message."""
+    """`hub reply`: --to optional; defaults to the other end of the message."""
     _normalize_top_args(args)
     actor, _source = resolve_identity(getattr(args, 'profile', None))
-    sender = resolve_sender(args, actor)
-    key = getattr(args, 'idempotency_key', None) or str(uuid.uuid4())
-    args.key = key
-    if not getattr(args, 'to_actor', None):
-        original_path = '/api/bus/messages/' + quote(args.reply_to, safe='')
-        if getattr(args, 'as_actor', None):
-            original_path += '?as=' + quote(args.as_actor, safe='')
-        original = _request('GET', original_path)
-        args.to_actor = original['from_actor'] if original.get('to_actor') == sender else original['to_actor']
-        if getattr(args, 'to', None) is None:
-            args.to = args.to_actor
-    # The legacy `hub reply` carried reply_to on /api/bus/send; keep that
-    # contract (the reply route stays available to `hub msg reply`).
-    result = _request('POST', '/api/bus/send', _send_payload(args, sender), retries=True)
-    return {**result, 'from': sender, 'to': args.to_actor, 'idempotency_key': key}
+    args.key = getattr(args, 'idempotency_key', None) or getattr(args, 'key', None)
+    if getattr(args, 'to', None):
+        return post_message(args, args.to, actor, reply_to=get_message(args, args.reply_to))
+    return reply_message(args, args.reply_to, actor)
 
 
 def top_inbox(args, actor: str | None = None):
@@ -411,19 +422,16 @@ def top_inbox(args, actor: str | None = None):
 
 
 def top_show(args):
-    """`hub show` marks the message read for its recipient (server-side)."""
-    return _request('GET', '/api/bus/messages/' + quote(args.id, safe=''))
+    """`hub show`: one Hub2 mailbox message."""
+    resolve_identity(getattr(args, 'profile', None))
+    return get_message(args, args.id)
 
 
 def top_stage(args, stage: str):
     """`hub ack|accept|complete`: resolve the identity first so a session's
-    own credential (APLEXER_SESSION_ID) or --profile applies, then stage."""
+    own credential (APLEXER_SESSION_ID) or --profile applies, then record the
+    epoch-bound Hub2 receipt."""
     resolve_identity(getattr(args, 'profile', None))
-    payload = None
     if getattr(args, 'lease_epoch', None) is not None:
-        payload = {'lease_epoch': int(args.lease_epoch)}
-    else:
-        epoch = os.environ.get('HUB_LEASE_EPOCH')
-        if epoch is not None and epoch != '':
-            payload = {'lease_epoch': int(epoch)}
-    return _request('POST', '/api/bus/messages/' + quote(args.id, safe='') + '/' + stage, payload)
+        raise MsgError('not_supported_on_hub2; --lease-epoch has no Hub2 mailbox equivalent (receipts are message-epoch bound)')
+    return stage_message(args, args.id, stage)

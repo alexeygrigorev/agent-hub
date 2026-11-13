@@ -722,3 +722,24 @@ test('passive account routing observes credentials without refresh, quota probes
 await import('./account-credential-renewal.test.ts');
 // Passive approved-host Claude credential retrieval (AccountDO + ControlDO route), same CI entrypoint.
 await import('./account-passive-credential.test.ts');
+test('human:me resolves to the caller\'s own human for humans, intake owners for sessions and delegated families, and refuses ambiguity (t3280u)',async()=>{
+ const m=mailboxes(),db=m.controlState.database;
+ db.prepare('INSERT INTO actor_directory(id,kind,enabled) VALUES(?,?,1)').run('human:alexey','human');
+ db.prepare('INSERT INTO object_routes(kind,id,owner,resource_id,epoch,digest,participants_json) VALUES(?,?,?,?,?,?,?)').run('intake','intake-1','proj','proj',1,'synthetic-fixture',JSON.stringify(['human:alexey','operator']));
+ db.prepare("INSERT INTO credentials(actor_id,kind,resource_id,generation,token_hash,scopes_json,family_id,created_at) VALUES('credential:1','operator','human:alexey','g','h','[]','fam-1',1)").run();
+ clearFixtureCache(m.control);
+ const send=async(owner:string,actor:any,key:string)=>m.get(owner).fetch(request('/api/messages','POST',{recipient:'human:me',body:'Research link https://example.test/moats',key},actor,owner));
+ // A human credential posts into its own inbox, which the web Inbox lists.
+ const own=await send('human:alexey',{id:'human:alexey',kind:'operator',scopes:['operator:admin']},'self');assert.equal(own.status,201);
+ assert.equal((await data(own)).message.recipient,'human:alexey');
+ // A Hub session worker reaches the human participant of its bound intake.
+ const worker={id:'session:11111111-1111-4111-8111-111111111111',kind:'agent',resource_id:'intake-1',scopes:['message:send']};
+ const fromSession=await data(await send(worker.id,worker,'session'));assert.equal(fromSession.message.recipient,'human:alexey');assert.equal(fromSession.message.sender,worker.id);
+ // A delegated named agent resolves through the human owning its credential family.
+ const delegated=await data(await send('agent:a',{id:'agent:a',kind:'agent',scopes:[],family_id:'fam-1'},'delegated'));assert.equal(delegated.message.recipient,'human:alexey');
+ const inbox=await data(await m.fetch('human:alexey','/api/messages','GET',undefined,{id:'human:alexey',kind:'operator',scopes:['operator:admin']}));
+ assert.deepEqual(inbox.items.map((v:any)=>v.sender).sort(),['agent:a','human:alexey',worker.id].sort());
+ // With two humans and no binding, the alias never guesses.
+ db.prepare('INSERT INTO actor_directory(id,kind,enabled) VALUES(?,?,1)').run('human:other','human');clearFixtureCache(m.control);
+ const ambiguous=await send('agent:b',{id:'agent:b',kind:'agent',scopes:[]},'ambiguous');assert.equal(ambiguous.status,409);assert.equal((await data(ambiguous)).error,'ambiguous_recipient');
+});

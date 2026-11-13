@@ -103,6 +103,50 @@ class MockHubHandler(BaseHTTPRequestHandler):
         # Silence standard HTTP request logging in test output
         pass
 
+    def _json(self, status, payload):
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(payload).encode("utf-8"))
+
+    def hub2_mailbox(self, method, body_bytes=b""):
+        """Hub2 /api/messages (hub2/src/mailbox-do.ts): the sender is the
+        credential, (sender, key) is idempotent, receipts are epoch-bound."""
+        parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query)
+        me = qs.get("as", ["human:test"])[0]
+        parts = parsed.path.split("/")
+        if parsed.path == "/api/messages" and method == "POST":
+            data = json.loads(body_bytes.decode("utf-8"))
+            recipient = "human:test" if data["recipient"] == "human:me" else data["recipient"]
+            prior = self.server.idempotency_map.get((me, data["key"]))
+            if prior:
+                if prior["body"] != data["body"] or prior["requested"] != data["recipient"]:
+                    return self._json(409, {"error": "idempotency_conflict"})
+                return self._json(200, {"message": prior, "replayed": True})
+            parent = next((m for m in self.server.messages if m["id"] == data.get("reply_to")), None)
+            msg_id = f"msg_{len(self.server.messages) + 1}"
+            message = {"id": msg_id, "sender": me, "recipient": recipient, "requested": data["recipient"], "body": data["body"],
+                       "key": data["key"], "thread_id": parent["thread_id"] if parent else "th-" + msg_id,
+                       "reply_to": data.get("reply_to"), "epoch": 1, "state": "received", "created_at": 1000,
+                       "read_at": None, "acked_at": None, "accepted_at": None, "completed_at": None}
+            self.server.messages.append(message)
+            self.server.idempotency_map[(me, data["key"])] = message
+            return self._json(201, {"message": message})
+        if parsed.path == "/api/messages" and method == "GET":
+            mailbox = qs.get("mailbox", [me])[0]
+            return self._json(200, {"items": [m for m in self.server.messages if m["recipient"] == mailbox], "next": None})
+        found = next((m for m in self.server.messages if len(parts) > 3 and m["id"] == parts[3]), None)
+        if not found:
+            return self._json(404, {"error": "message_not_found"})
+        if method == "GET":
+            return self._json(200, {"message": found, **({"events": []} if parsed.path.endswith("/status") else {})})
+        data = json.loads(body_bytes.decode("utf-8") or "{}")
+        if data.get("epoch") != found["epoch"]:
+            return self._json(409, {"error": "stale_route_epoch"})
+        found[{"read": "read_at", "ack": "acked_at", "accept": "accepted_at", "complete": "completed_at"}[parts[4]]] = 2000
+        return self._json(200, {"recorded": True})
+
     def do_POST(self):
         auth = self.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
@@ -124,6 +168,9 @@ class MockHubHandler(BaseHTTPRequestHandler):
         body_bytes = self.rfile.read(content_length)
         parsed_url = urlparse(self.path)
         path = parsed_url.path
+
+        if path == "/api/messages" or path.startswith("/api/messages/"):
+            return self.hub2_mailbox("POST", body_bytes)
 
         if path == "/api/bus/send":
             try:
@@ -261,6 +308,9 @@ class MockHubHandler(BaseHTTPRequestHandler):
         path = parsed_url.path
         qs = parse_qs(parsed_url.query)
 
+        if path == "/api/messages" or path.startswith("/api/messages/"):
+            return self.hub2_mailbox("GET")
+
         if path == "/api/bus/inbox":
             actor = qs.get("actor", [""])[0]
             matched = [m for m in self.server.messages if m["to_actor"] == actor]
@@ -387,12 +437,15 @@ class TestHttpCliMock(unittest.TestCase):
             "--kind", "note",
             "--body", "Hello from worker 1",
             "--idempotency-key", "key-flow-1",
-            "--thread-id", "th-1"
         ])
         out = json.loads(res.stdout)
         self.assertIn("id", out)
         msg_id = out["id"]
-        self.assertEqual(out["thread_id"], "th-1")
+        thread_id = out["thread_id"]
+        # Hub1-only --thread-id fails loudly with the replacement, before any request.
+        refused = self.run_cli(["send", "--to", "worker-2", "--body", "x", "--thread-id", "th-1"], check=False)
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("not_supported_on_hub2", refused.stderr)
 
         # 2. hub inbox
         res = self.run_cli(["inbox", "--actor", "worker-2"])
@@ -409,20 +462,17 @@ class TestHttpCliMock(unittest.TestCase):
         # 4. hub ack
         res = self.run_cli(["ack", msg_id])
         ack_out = json.loads(res.stdout)
-        self.assertEqual(ack_out["status"], "ok")
-        self.assertEqual(ack_out["stage"], "ack")
+        self.assertEqual(ack_out, {"recorded": True})
 
         # 5. hub accept
         res = self.run_cli(["accept", msg_id])
         accept_out = json.loads(res.stdout)
-        self.assertEqual(accept_out["status"], "ok")
-        self.assertEqual(accept_out["stage"], "accept")
+        self.assertEqual(accept_out, {"recorded": True})
 
         # 6. hub complete
         res = self.run_cli(["complete", msg_id])
         complete_out = json.loads(res.stdout)
-        self.assertEqual(complete_out["status"], "ok")
-        self.assertEqual(complete_out["stage"], "complete")
+        self.assertEqual(complete_out, {"recorded": True})
 
         # 7. hub reply
         res = self.run_cli([
@@ -430,14 +480,12 @@ class TestHttpCliMock(unittest.TestCase):
             "--reply-to", msg_id,
             "--from", "worker-2",
             "--to", "worker-1",
-            "--kind", "reply",
             "--body", "Acknowledged and completed",
             "--idempotency-key", "rep-flow-1",
-            "--thread-id", "th-1"
         ])
         rep_out = json.loads(res.stdout)
         self.assertIn("id", rep_out)
-        self.assertEqual(rep_out["thread_id"], "th-1")
+        self.assertEqual(rep_out["thread_id"], thread_id)
 
     def test_default_idempotency_retry(self):
         # Sending identical message twice with same idempotency key returns original id

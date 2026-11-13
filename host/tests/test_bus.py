@@ -59,11 +59,11 @@ class TestBus(unittest.TestCase):
     @patch('agent_hub_host.bus._do_request')
     def test_cli_parser_missing_arguments(self, mock_do_request):
         from agent_hub_host import cli
-        mock_do_request.return_value = {"id": "123"}
-        sys_argv_send = ["cli.py", "send", "--from", "a", "--to", "b", "--kind", "note", "--body", "hi", "--idempotency-key", "k1", "--thread-id", "t1"]
+        mock_do_request.return_value = {"message": {"id": "123", "sender": "a", "recipient": "b"}, "items": []}
+        sys_argv_send = ["cli.py", "send", "--from", "a", "--to", "b", "--kind", "note", "--body", "hi", "--idempotency-key", "k1"]
         with patch.object(sys, 'argv', sys_argv_send):
             cli.main()
-            mock_do_request.assert_called()
+            mock_do_request.assert_called_with("POST", "/api/messages", {"recipient": "b", "body": "hi", "key": "k1"})
 
         sys_argv_inbox = ["cli.py", "inbox", "--actor", "a", "--limit", "10", "--cursor", "c1"]
         with patch.object(sys, 'argv', sys_argv_inbox):
@@ -73,7 +73,7 @@ class TestBus(unittest.TestCase):
     @patch('agent_hub_host.bus._do_request')
     def test_cli_stdin_body(self, mock_do_request):
         from agent_hub_host import cli
-        mock_do_request.return_value = {"id": "stdin-1"}
+        mock_do_request.return_value = {"message": {"id": "stdin-1", "sender": "a", "recipient": "b"}}
         sys_argv = ["cli.py", "send", "--from", "a", "--to", "b", "--kind", "note", "--body", "-"]
         with patch.object(sys, 'argv', sys_argv), patch('sys.stdin', StringIO("hello from stdin")):
             cli.main()
@@ -112,7 +112,9 @@ class TestBus(unittest.TestCase):
     @patch('agent_hub_host.bus._do_request')
     def test_cli_reply_parser_with_thread_id(self, mock_do_request):
         from agent_hub_host import cli
-        mock_do_request.return_value = {"id": "reply-456"}
+        original = {"id": "msg-orig", "sender": "bob", "recipient": "alice", "epoch": 1}
+        mock_do_request.side_effect = lambda method, path, payload=None: (
+            {"message": original} if method == "GET" else {"message": {"id": "reply-456", "sender": "alice", "recipient": "bob"}})
         sys_argv_reply = [
             "cli.py", "reply",
             "--reply-to", "msg-orig",
@@ -121,23 +123,20 @@ class TestBus(unittest.TestCase):
             "--kind", "note",
             "--body", "hello back",
             "--idempotency-key", "rep-key-1",
-            "--thread-id", "th-123"
         ]
         with patch.object(sys, 'argv', sys_argv_reply):
             cli.main()
             mock_do_request.assert_called_with(
                 "POST",
-                "/api/bus/send",
-                {
-                    "from_actor": "alice",
-                    "to_actor": "bob",
-                    "kind": "note",
-                    "body": "hello back",
-                    "idempotency_key": "rep-key-1",
-                    "thread_id": "th-123",
-                    "reply_to": "msg-orig"
-                }
+                "/api/messages",
+                {"recipient": "bob", "body": "hello back", "key": "rep-key-1", "reply_to": "msg-orig", "parent_sender": "bob"},
             )
+        # Hub1 --thread-id is refused loudly (exit 2) instead of silently dropped.
+        with patch.object(sys, 'argv', sys_argv_reply + ["--thread-id", "th-123"]), patch('sys.stderr', new_callable=StringIO) as err:
+            with self.assertRaises(SystemExit) as ctx:
+                cli.main()
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn("not_supported_on_hub2", err.getvalue())
 
     @patch('agent_hub_host.bus._do_request')
     def test_cli_claims_list(self, mock_do_request):

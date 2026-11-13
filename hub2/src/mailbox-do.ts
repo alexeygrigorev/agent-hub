@@ -65,16 +65,16 @@ export class MailboxDO{
    ...this.db.all<Mail>('SELECT * FROM messages WHERE recipient=? AND visible=1 AND id>=? AND id<? ORDER BY id LIMIT 2',owner,id,id+'\uffff')];
   const unique=[...new Map(rows.map(m=>[m.id,m])).values()];return unique.length===1?unique[0]:error(unique.length?'ambiguous_prefix':'message_not_found',unique.length?409:404);
  }
- private async directory(recipient:string,effectEnv:Env=this.env):Promise<{mailbox:string;forward_session?:string|null}>{
-  const response=await effectEnv.CONTROL.get(effectEnv.CONTROL.idFromName('global')).fetch(new Request('https://control.internal/_recipient',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({recipient})}));
-  if(!response.ok)throw new HttpError('recipient_unknown',response.status===404?404:503);const result=await response.json() as {mailbox:string;forward_session?:string|null};
+ private async directory(recipient:string,effectEnv:Env=this.env,caller?:Actor):Promise<{mailbox:string;forward_session?:string|null}>{
+  const response=await effectEnv.CONTROL.get(effectEnv.CONTROL.idFromName('global')).fetch(new Request('https://control.internal/_recipient',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(caller&&recipient==='human:me'?{recipient,caller:{id:caller.id,kind:caller.kind,resource_id:caller.resource_id,family_id:caller.family_id}}:{recipient})}));
+  if(!response.ok)throw new HttpError(response.status===409?'ambiguous_recipient':'recipient_unknown',response.status===404?404:response.status===409?409:503);const result=await response.json() as {mailbox:string;forward_session?:string|null};
   if(!boundedString(result.mailbox,180))throw new HttpError('invalid_directory_result',503);return result;
  }
  private async send(r:Request,owner:string):Promise<Response>{
   const b=await bodyObject(r);if(!boundedString(b.recipient,180)||!boundedString(b.body,12000)||!boundedString(b.key,120)||(b.reply_to!==undefined&&!boundedString(b.reply_to,120)))return error('invalid_message',400);
   const digest=await sha256Hex(JSON.stringify([b.recipient,b.body,b.reply_to??null,b.parent_sender??null]));
   const prior=this.db.one<Mail>('SELECT * FROM messages WHERE sender=? AND key=?',owner,b.key);if(prior)return prior.digest===digest?json({message:this.view(prior),replayed:true}):error('idempotency_conflict',409);
-  const target=await this.directory(String(b.recipient));let thread=crypto.randomUUID();
+  const target=await this.directory(String(b.recipient),this.env,actorFrom(r));let thread=crypto.randomUUID();
   if(b.reply_to){
    const parent=this.db.one<Mail>('SELECT * FROM messages WHERE id=?',b.reply_to);
    if(!boundedString(b.parent_sender,180))return error('parent_sender_required',400);
