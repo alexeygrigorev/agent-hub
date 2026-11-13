@@ -1719,22 +1719,37 @@ class CanaryTest(unittest.TestCase):
         fields = data.rsplit(")", 1)[1].split()
         return fields[0] != "Z" and fields[19] == start
 
-    def reap_handoff_chain(self, deadline_s=15.0):
-        """Stop, SIGKILL and await every recorded generation of the escaped handoff chain.
+    def open_handoff_fence(self):
+        """Test-held read end of the chain's kernel fence (FIFO), opened before any spawn."""
+        if getattr(self, "handoff_rfd", None) is not None:
+            os.close(self.handoff_rfd)
+        fifo = self.tmp / "handoff.fifo"
+        fifo.unlink(missing_ok=True)
+        os.mkfifo(fifo, 0o600)
+        self.handoff_rfd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+        self.addCleanup(self.close_handoff_fence)  # LIFO: runs after any later-registered reap
 
-        Each generation records "pid starttime" before it checks handoff.stop, so once the stop file
-        exists at most one further generation can appear, and it records itself before exiting.
-        Signals go through a pidfd whose identity is re-verified against the recorded starttime, so
-        a recycled PID is never signalled; exit is awaited on the pidfd (readable on exit, also for a
-        non-child reparented to another subreaper). Every generation records itself immediately after
-        its fork, so the 0.1s quiet period (>> fork-to-record) catches a child forked just before its
-        parent was killed; the fixture's own generation/lifetime bound is the final backstop.
-        Returns (members, killed, ended); raises on timeout.
+    def close_handoff_fence(self):
+        if getattr(self, "handoff_rfd", None) is not None:
+            os.close(self.handoff_rfd)
+            self.handoff_rfd = None
+
+    def reap_handoff_chain(self, deadline_s=15.0):
+        """Stop, SIGKILL and await EVERY generation of the escaped handoff chain, recorded or not.
+
+        Completion is proven by a kernel fence, not by the pid log: the updater leader opens the
+        write end of handoff.fifo, writes a handshake byte, forks the chain and closes its own copy.
+        The write fd is inherited atomically by every fork, so a generation holds it from birth
+        (even before it records itself) until its exit; EOF on the test-held read end therefore
+        means no chain member is alive anywhere. Recorded "pid starttime" are used only to signal:
+        through a pidfd re-verified against starttime (a recycled PID is never signalled), then
+        awaited on that pidfd. Returns (members, killed, ended); raises on deadline.
         """
         import errno, select
         (self.tmp / "handoff.stop").touch()
+        rfd = getattr(self, "handoff_rfd", None)
         end = time.monotonic() + deadline_s
-        done, killed = set(), 0
+        done, killed, handshake = set(), 0, False
         while True:
             members = self.handoff_members()
             for pid_s, start in members:
@@ -1770,14 +1785,33 @@ class CanaryTest(unittest.TestCase):
                 finally:
                     os.close(fd)
                 done.add((pid_s, start))
-            time.sleep(0.1)  # >> 3ms generation period: any live unrecorded generation records itself
-            if len(self.handoff_members()) == len(members):
-                return members, killed, self.handoff_ended()  # all recorded generations exited; none new
+            if rfd is None:  # fence already proven EOF and closed by an earlier call
+                return members, killed, self.handoff_ended()
+            eof = False
+            while True:
+                try:
+                    chunk = os.read(rfd, 4096)
+                except BlockingIOError:
+                    break  # a writer (live chain member) still exists
+                if not chunk:
+                    eof = True
+                    break
+                handshake = handshake or b"H" in chunk
+            if eof:
+                # No writer remains: every generation (recorded or not) has exited. A recorded chain
+                # without the handshake would mean the fence was never armed: refuse to claim success.
+                if members and not handshake:
+                    raise AssertionError("handoff chain recorded but fence handshake missing")
+                os.close(rfd)
+                self.handoff_rfd = None
+                return self.handoff_members(), killed, self.handoff_ended()
             if time.monotonic() >= end:
-                raise AssertionError("escaped handoff chain still growing after stop+SIGKILL")
+                raise AssertionError("escaped handoff chain still holds the fence after stop+SIGKILL")
+            select.select([rfd], [], [], 0.02)
 
     def write_updater(self, root, *, delay=0.0, converge=True, exit_code=0, grandchild=False,
-                      linger=False, ignore_term=False, signal_canary=False, handoff=False):
+                      linger=False, ignore_term=False, signal_canary=False, handoff=False,
+                      handoff_late_gen=-1, handoff_late_s=0.0):
         """Real Python stand-in for the installed updater, run by the canary as its owned child."""
         sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
         staged = self.tmp / "staged-release" / sha
@@ -1796,11 +1830,18 @@ if {handoff!r}:
     # CLOCK_MONOTONIC (shared across fork) from chain start. Each generation records
     # "pid starttime sid" as its FIRST action after fork, BEFORE it checks the test's stop file,
     # and forks only if not stopped; a generation that stops by itself records "end ..." instead.
+    # Kernel fence: the inherited write end of the test's FIFO is held by every generation from
+    # its fork until its exit (no reader -> ENXIO, the fixture refuses to run unfenced).
+    fence = os.open(D / "handoff.fifo", os.O_WRONLY | os.O_NONBLOCK)
+    os.write(fence, b"H")
     if os.fork() == 0:
         os.setsid()
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         until = time.monotonic() + {self.HANDOFF_LIFETIME_S!r}
         for gen in range({self.HANDOFF_MAX_GENERATIONS!r}):
+            if gen == {handoff_late_gen!r}:  # deterministic fork-to-record gap (parent already exited)
+                (D / "handoff.late").write_text("")
+                time.sleep({handoff_late_s!r})
             st = open("/proc/self/stat").read().rsplit(")", 1)[1].split()[19]
             with open(D / "handoff.pids", "a") as fh:
                 fh.write(f"{{os.getpid()}} {{st}} {{os.getsid(0)}}\\n")
@@ -1812,6 +1853,7 @@ if {handoff!r}:
             if os.fork():
                 os._exit(0)
         os._exit(0)
+    os.close(fence)
 if {ignore_term!r}:
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 if {grandchild!r}:
@@ -1845,8 +1887,10 @@ sys.exit({exit_code!r})
     def gate_root(self, **updater):
         root = pathlib.Path(tempfile.mkdtemp(prefix="gate-host-releases.", dir=self.tmp))
         os.chmod(root, 0o700)
-        for f in ("updater.json", "grandchild.pid", "activated", "handoff.pids", "handoff.stop"):
+        for f in ("updater.json", "grandchild.pid", "activated", "handoff.pids", "handoff.stop", "handoff.late"):
             (self.tmp / f).unlink(missing_ok=True)
+        if updater.get("handoff"):
+            self.open_handoff_fence()
         self.write_updater(root, **updater)
         return root
 
@@ -2173,6 +2217,35 @@ sys.exit({exit_code!r})
         _, killed, ended = seen["reap"]                     # the fail-path cleanup acted on a LIVE chain:
         self.assertGreaterEqual(killed + ended, 1, seen)    # SIGKILLed it, or it obeyed the stop file
         self.assertEqual(self.reap_handoff_chain()[1], 0)   # idempotent re-check: nothing left to kill
+
+    def test_handoff_cleanup_awaits_fence_eof_not_a_quiet_pid_log(self):
+        # Root 5e33 gap: a generation forked by a parent that already exited stays unrecorded for
+        # far longer than any pid-log quiet period. Cleanup must still not return before it exits.
+        late_s = 1.0
+        root = self.gate_root(converge=False, handoff=True, handoff_late_gen=3, handoff_late_s=late_s)
+        self.addCleanup(self.reap_handoff_chain)
+        leader = subprocess.run([sys.executable, str(root / "updater.py")], cwd="/", timeout=30,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.assertEqual(leader.returncode, 0)
+        end = time.monotonic() + 10
+        while not (self.tmp / "handoff.late").exists() and time.monotonic() < end:
+            time.sleep(0.005)
+        self.assertTrue((self.tmp / "handoff.late").exists())
+        before = set(self.handoff_members())
+        self.assertEqual(len(before), 3)           # gens 0-2 recorded; gen 3 is live but unrecorded
+        self.assertEqual([p for p, _ in before if self.alive(int(p))], [])  # its parents are gone
+        t0 = time.monotonic()
+        members, killed, ended = self.reap_handoff_chain()
+        waited = time.monotonic() - t0
+        # The pid log was stable far beyond 0.1s, yet cleanup waited for the fence EOF ...
+        self.assertGreater(waited, 0.5)
+        late = [m for m in members if m not in before]
+        self.assertEqual(len(late), 1, members)    # ... saw the late generation record itself ...
+        self.assertEqual([p for p, _ in members if self.alive(int(p))], [])  # ... and exit
+        self.assertGreaterEqual(killed + ended, 1)  # SIGKILLed by cleanup, or it obeyed the stop file
+        self.assertIsNone(self.handoff_rfd)        # fence proven EOF and released
+        time.sleep(0.3)
+        self.assertEqual(len(self.handoff_members()), len(members))
 
     def test_updater_execs_with_unblocked_signals_and_cooperative_term_exits(self):
         # C2: the canary blocks TERM/INT/HUP only around spawn+record; the updater must not inherit it.
