@@ -967,7 +967,8 @@ class TestSessionControlCli(unittest.TestCase):
         self.assertIsNone(session_control.sanitize_start_detail('config={"api_key":"private-test-secret"}'))
         self.assertIsNone(session_control.sanitize_start_detail('Authorization: Bearer' + chr(0) + ' synthetic-private-token'))
         self.assertIsNone(session_control.sanitize_start_detail('AWS_SECRET_ACCESS_KEY: synthetic-private-token'))
-        for detail in ('"AWS_SECRET_ACCESS_KEY": "synthetic-private-token"',
+        for detail in ('"access_token' + ' ' * 140 + '": "synthetic-private-token"',
+                       '"AWS_SECRET_ACCESS_KEY": "synthetic-private-token"',
                        '"access_token": "synthetic-private-token"',
                        "'access_token': 'synthetic-private-token'",
                        '`access_token`: `synthetic-private-token`',

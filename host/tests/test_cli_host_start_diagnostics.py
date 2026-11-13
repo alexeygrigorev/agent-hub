@@ -151,6 +151,7 @@ class TestCliHostStartDiagnostics(unittest.TestCase):
 
     def test_machine_do_and_real_cli_reject_credential_and_control_details(self):
         unsafe_details = (
+            '"access_token' + ' ' * 140 + '": "synthetic-private-token"',
             'Authorization: Bearer\x00 synthetic-private-token',
             'AWS_SECRET_ACCESS_KEY: synthetic-private-token',
             '"AWS_SECRET_ACCESS_KEY": "synthetic-private-token"',

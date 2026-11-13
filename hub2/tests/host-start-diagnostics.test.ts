@@ -94,6 +94,7 @@ for(const [label,detail] of [
  ['URL token userinfo', 'https://synthetic-private-token@example.test/repo.git'],
  ['unquoted private key', 'private_key: synthetic-private-token'],
  ['unquoted spaced API key', 'api key: synthetic-private-token'],
+ ['long padded quoted key','"access_token'+' '.repeat(140)+'": "synthetic-private-token"'],
 ] as const){
  test(`host.error rejects ${label} detail from storage and session projection`,async()=>{
   const f=fixture(),sessionId='host-diagnostic-unsafe-'+label.replace(/[^a-z]+/gi,'-'),epoch=await startOffered(f,sessionId),socket=hostSocket(f);
