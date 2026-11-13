@@ -13,7 +13,10 @@ from agent_hub_host import native_launch as nl
 
 TEMP_BASE = Path(__file__).resolve().parents[3] / ".local/tmp"
 
-FILTER = "error,codex_tool_lifecycle=info"
+FILTER = "error,opentelemetry_sdk=off,opentelemetry_otlp=off,codex_tool_lifecycle=info"
+# EXEC_DEFAULT_LOG_FILTER in exact ZCode81 exec/src/lib.rs (81b945a4).
+# These exclusions must survive through actual launch argv, not just FILTER.
+ZCODE81_DEFAULT_DIRECTIVES = {"error", "opentelemetry_sdk=off", "opentelemetry_otlp=off"}
 NATIVE_ID = "11111111-1111-4111-8111-111111111111"
 SESSION_ID = "22222222-2222-4222-8222-222222222222"
 OPERATION_ID = "33333333-3333-4333-8333-333333333333"
@@ -83,6 +86,10 @@ class ZaiLifecycleTraceTests(unittest.TestCase):
                 binding.assert_not_called(); environment.assert_not_called()
             self.assertEqual(captured["options"]["env"]["RUST_LOG"], "synthetic-parent-override", "spawn client is not globally changed")
             self.assertNotIn("RUST_LOG", specification)
+            if provider == "zai" and trusted_filter is None:
+                directives = env.get("RUST_LOG", "").split(",")
+                self.assertEqual(len(directives), len(set(directives)))
+                self.assertEqual(set(directives) - {"codex_tool_lifecycle=info"}, ZCODE81_DEFAULT_DIRECTIVES)
             return env, child
 
     def test_profile_headless_zai_gets_fixed_filter_and_retains_real_profile_prompt_output(self):

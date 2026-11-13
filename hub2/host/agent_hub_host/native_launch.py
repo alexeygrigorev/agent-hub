@@ -1073,7 +1073,7 @@ class NativeLauncher:
         if provider == "zai":
             # Fixed per-attempt metadata diagnostics only. Trusted child values
             # and a managed profile's existing explicit env retain precedence.
-            child_env.setdefault("RUST_LOG", "error,codex_tool_lifecycle=info")
+            child_env.setdefault("RUST_LOG", "error,opentelemetry_sdk=off,opentelemetry_otlp=off,codex_tool_lifecycle=info")
         if specification.get("child_config_file"):
             child_env["HUB2_CONFIG"] = specification["child_config_file"]
         claude_config_dir = child_env.get('CLAUDE_CONFIG_DIR')
