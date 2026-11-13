@@ -1101,11 +1101,32 @@ export class ControlDO {
   }
   private async recipient(request:Request):Promise<Response>{
     const b=await bodyObject(request,4096);if(!boundedString(b.recipient,180))return error('invalid_recipient',400);
+    if(b.recipient==='human:me')return this.humanMe(b.caller);
     const row=this.db.one<{id:string;forward_session:string|null}>('SELECT id,forward_session FROM named_agents WHERE id=? AND enabled=1',b.recipient);
     if(row)return json({mailbox:row.id,forward_session:row.forward_session});
     if(b.recipient.startsWith('agent:'))return error('recipient_unknown',404);
     const known=this.db.one<{id:string}>('SELECT id FROM actor_directory WHERE id=? AND enabled=1',b.recipient);
     return known?json({mailbox:known.id,forward_session:null}):error('recipient_unknown',404);
+  }
+  /** `human:me` (t3280u): the human the caller acts for. A human credential is
+   * itself; a session worker resolves to the human participant of its bound
+   * intake; a delegated named agent to the human owning its credential family;
+   * otherwise the hub's only enabled human. Never guesses between two humans. */
+  private humanMe(caller:unknown):Response{
+    const c=(caller&&typeof caller==='object'?caller:{}) as {id?:unknown;kind?:unknown;resource_id?:unknown;family_id?:unknown};
+    const humans=(ids:string[])=>[...new Set(ids.filter(v=>typeof v==='string'&&/^human:[^\s]{1,174}$/.test(v)))];
+    const pick=(ids:string[])=>ids.length===1?json({mailbox:ids[0],forward_session:null}):ids.length>1?error('ambiguous_recipient',409):undefined;
+    if(typeof c.id==='string'&&c.id.startsWith('human:'))return pick(humans([c.id]))||error('recipient_unknown',404);
+    if(c.kind==='agent'&&typeof c.id==='string'&&c.id.startsWith('session:')&&boundedString(c.resource_id,180)){
+      const route=this.db.one<{participants_json:string}>('SELECT participants_json FROM object_routes WHERE kind=? AND id=?','intake',c.resource_id);
+      let participants:unknown=[];try{participants=route?JSON.parse(route.participants_json):[];}catch{return error('route_acl_corrupt',503);}
+      const found=pick(humans(Array.isArray(participants)?participants.slice(0,32) as string[]:[]));if(found)return found;
+    }
+    if(boundedString(c.family_id,180)){
+      const found=pick(humans(this.db.all<{id:string}>("SELECT DISTINCT resource_id AS id FROM credentials WHERE family_id=? AND kind='operator' LIMIT 3",c.family_id).map(v=>v.id)));if(found)return found;
+    }
+    const only=this.db.all<{id:string}>("SELECT id FROM actor_directory WHERE kind='human' AND enabled=1 ORDER BY id LIMIT 2").map(v=>v.id);
+    return pick(humans(only))||error('recipient_unknown',404);
   }
   private async registerRoute(request:Request):Promise<Response>{
     const b=await bodyObject(request,8192);

@@ -96,7 +96,7 @@ HUB2_UNSUPPORTED_PREFIXES = (
     '/api/fleet/routing/policy/grok', '/api/fleet/machines/',
 )
 HUB2_UNSUPPORTED_HINTS = {
-    '/api/bus/': 'messaging moved to native mailboxes; `hub sessions send` covers bound sessions',
+    '/api/bus/': 'messaging moved to the Hub2 mailbox /api/messages; use `hub msg send --to human:me|session:<id>|agent:<name>` (web Inbox) or `hub sessions send <id>` to type into a bound session',
     '/api/webhooks': 'webhooks retired with Hub1',
     '/api/prompts': 'prompt library retired with Hub1',
 }

@@ -13,6 +13,32 @@ answers with `hub reply`.
 Status: implemented on main by tabo-hub-t1833 (intake a3227276) except where
 [§12](#12-implementation-notes) says otherwise.
 
+## 0. Hub2 today: post to the human web Inbox (t3280u)
+
+Hub2 serves messaging only on `/api/messages` (`hub2/src/mailbox-do.ts`); the
+Hub1 `/api/bus/*` routes described below are retired and the CLI refuses them
+with `not_supported_on_hub2` plus the replacement. The working path:
+
+```bash
+hub msg send --to human:me --body 'Research t3273u: moats — https://github.com/...'   # lands in the Hub web Inbox
+hub msg inbox --unread                  # the same mailbox page the web Inbox shows
+hub msg reply <id> --body '...'         # threads back to the other end
+hub msg send --to session:<hub-session-id> --body '...'   # native mailbox of a bound session
+hub sessions send <id> --prompt '...'   # typing into a running session prompt (was --tui)
+```
+
+- The sender is always the requesting credential: the session worker
+  credential inside a Hub2 session, `--profile NAME`, or the normal login
+  (`human:<sub>`). `--from` is optional; a mismatch with a known identity is refused.
+- `human:me` is resolved by Control (`ControlDO.humanMe`): a human credential is
+  itself; a session worker resolves to the human participant of its bound
+  intake; a delegated named agent to the human owning its credential family;
+  otherwise the hub's only enabled human. Two candidates fail with
+  `409 ambiguous_recipient` (CLI exit 3); it never guesses.
+- Hub1-only options fail loudly before any request: `--tui` (use
+  `hub sessions send`), `--thread`/`--thread-id`, `--ref`, `--deliver-by`,
+  `--lease-epoch`, and `--kind` other than note/reply. Bodies are inline, max 12000 characters.
+
 ## 1. What exists today (inventory)
 
 Line references are against `a4b5d0da` (agent-hub) and aplexer `360c0ab`.

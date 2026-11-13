@@ -618,7 +618,7 @@ def main():
 
     p_run = sub.add_parser("run", help="Run the host agent in the foreground")
 
-    p_send = sub.add_parser("send", help="Send a message (session:<id>, tag@machine, agent:<name>, human:<sub> or a bus address)")
+    p_send = sub.add_parser("send", help="Post a Hub2 mailbox message (human:me = your Hub web Inbox, human:<sub>, session:<id>, agent:<name>)")
     p_send.add_argument("--from", dest="from_actor", required=False, default=None)
     p_send.add_argument("--to", dest="to_actor", required=True)
     p_send.add_argument("--kind", default="note")
