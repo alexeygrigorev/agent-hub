@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from agent_hub_host.agent import Bridge, Journal, LIVE_SESSION_HEARTBEAT_SECONDS
+from hub2_agent_hub_host.agent import Bridge, Journal, LIVE_SESSION_HEARTBEAT_SECONDS
 
 
 class _StopServe(BaseException):
@@ -70,8 +70,8 @@ class LiveSessionHeartbeatTests(unittest.TestCase):
 
             try:
                 with (
-                    patch("agent_hub_host.agent.time.monotonic", side_effect=lambda: clock[0]),
-                    patch("agent_hub_host.agent.time.time", return_value=1000),
+                    patch("hub2_agent_hub_host.agent.time.monotonic", side_effect=lambda: clock[0]),
+                    patch("hub2_agent_hub_host.agent.time.time", return_value=1000),
                     self.assertRaises(_StopServe),
                 ):
                     bridge.serve("machine-1", ["worker"])
@@ -126,10 +126,10 @@ class LiveSessionHeartbeatTests(unittest.TestCase):
                 return subprocess.CompletedProcess(argv,0,json.dumps(identities[argv[2]]),'')
             bridge.runner=runner
             try:
-                with patch('agent_hub_host.agent.time.monotonic',side_effect=lambda:clock[0]), \
-                        patch('agent_hub_host.agent.time.time',return_value=1000), \
-                        patch('agent_hub_host.agent.time.sleep'), \
-                        self.assertLogs('agent_hub_host.agent',level='ERROR'),self.assertRaises(_StopServe):
+                with patch('hub2_agent_hub_host.agent.time.monotonic',side_effect=lambda:clock[0]), \
+                        patch('hub2_agent_hub_host.agent.time.time',return_value=1000), \
+                        patch('hub2_agent_hub_host.agent.time.sleep'), \
+                        self.assertLogs('hub2_agent_hub_host.agent',level='ERROR'),self.assertRaises(_StopServe):
                     bridge.serve('machine-1',['worker'])
                 self.assertEqual(dict(bridge.journal.db.execute("SELECT * FROM launches WHERE session_id='a-poison'").fetchone()),before)
                 self.assertFalse(bridge.journal.db.execute('SELECT 1 FROM outbox').fetchone())

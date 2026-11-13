@@ -6,8 +6,8 @@ import time
 import unittest
 from unittest import mock
 
-from agent_hub_host import provider_home
-from agent_hub_host.providers import provision
+from hub2_agent_hub_host import provider_home
+from hub2_agent_hub_host.providers import provision
 
 ZAI_BUNDLE_FILE = '.config/goz/config.json'
 ZAI_BUNDLE = json.dumps({'config': {'schemaVersion': 1}, 'zai_token': 'synthetic-zai-token-no-spaces',

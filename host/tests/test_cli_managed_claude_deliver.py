@@ -66,7 +66,7 @@ def build_archive(path):
 
 def daemon_boot():
     """The exact HELPER_BOOT line the Hub2 daemon uses."""
-    source = (REPO / 'hub2/host/agent_hub_host/credential_delivery.py').read_text()
+    source = (REPO / 'hub2/host/hub2_agent_hub_host/credential_delivery.py').read_text()
     return next(ast.literal_eval(node.value) for node in ast.parse(source).body
                 if isinstance(node, ast.Assign) and getattr(node.targets[0], 'id', None) == 'HELPER_BOOT')
 

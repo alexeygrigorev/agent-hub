@@ -44,7 +44,7 @@ class ReleaseTests(unittest.TestCase):
         code = '''
 from types import SimpleNamespace
 from unittest.mock import patch
-from agent_hub_host.cli import main
+from hub2_agent_hub_host.cli import main
 with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
     assert main(['--config','/missing/config','self-update','--root','/isolated/root','--no-restart']) == 7
     args = run.call_args.args[0]
@@ -359,7 +359,7 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
             module('build-hub-cli').build(target, '0.2.0')
         for name in ('hub', 'hub2'):
             entry = target / 'bin' / name
-            entry.write_text(f'#!{target}/bin/python\nfrom agent_hub_host.cli import main\nraise SystemExit(main())\n')
+            entry.write_text(f'#!{target}/bin/python\nfrom hub2_agent_hub_host.cli import main\nraise SystemExit(main())\n')
             entry.chmod(0o755)
         data = (target / 'hub.pyz').read_bytes()
         manifest = {'artifacts': {'hub.pyz': {'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}}}
@@ -1343,13 +1343,13 @@ elif event in ('start', 'routing', 'enable'):
     def test_export_excludes_tracked_build_output(self):
         data = io.BytesIO()
         with tarfile.open(fileobj=data, mode='w') as archive:
-            for name in ['hub2/host/agent_hub_host/client.py', 'hub2/host/build/lib/agent_hub_host/client.py']:
+            for name in ['hub2/host/hub2_agent_hub_host/client.py', 'hub2/host/build/lib/hub2_agent_hub_host/client.py']:
                 entry = tarfile.TarInfo(name)
                 entry.size = 5
                 archive.addfile(entry, io.BytesIO(b'code\n'))
         with patch.object(builder, 'run', side_effect=[(SHA + '\n').encode(), data.getvalue()]):
             builder.export_source(REPO, 'HEAD', Path(self.temporary.name))
-        self.assertTrue((Path(self.temporary.name) / 'hub2/host/agent_hub_host/client.py').is_file())
+        self.assertTrue((Path(self.temporary.name) / 'hub2/host/hub2_agent_hub_host/client.py').is_file())
         self.assertFalse((Path(self.temporary.name) / 'hub2/host/build').exists())
 
     def test_enrollment_defaults_to_central_credentials_and_never_replaces_config(self):
@@ -1379,7 +1379,7 @@ def publication_bundle(directory, commit, label='fixture'):
     directory.mkdir()
     wheel = f'agent_hub_host_v2-2.0.0+g{commit}-py3-none-any.whl'
     with zipfile.ZipFile(directory / wheel, 'w') as archive:
-        archive.writestr('agent_hub_host/_release.py', f'HOST_VERSION = {commit!r}\nPROTOCOL_VERSION = 1\n')
+        archive.writestr('hub2_agent_hub_host/_release.py', f'HOST_VERSION = {commit!r}\nPROTOCOL_VERSION = 1\n')
     with zipfile.ZipFile(directory / 'hub.pyz', 'w') as archive:
         archive.writestr('agent_hub_host/_build_info.py', f'BUILD_COMMIT = "{commit}"\n')
         archive.writestr('__main__.py', 'raise RuntimeError("staged code must never run")\n')

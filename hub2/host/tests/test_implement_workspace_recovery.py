@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_hub_host import implement_workspace as module
+from hub2_agent_hub_host import implement_workspace as module
 
 
 class RecoveryTests(unittest.TestCase):
@@ -142,7 +142,7 @@ class RecoveryTests(unittest.TestCase):
         # A separate Python process must honor the common-directory fence.
         script = '''
 import sys
-from agent_hub_host.implement_workspace import prepare_workspace
+from hub2_agent_hub_host.implement_workspace import prepare_workspace
 try:
     prepare_workspace(sys.argv[1], 'implement', 'retained-intake', 'org/project')
 except ValueError as error:
@@ -204,7 +204,7 @@ except ValueError as error:
         tip = self.retained()
         holder_script = '''
 import sys, time
-from agent_hub_host.implement_workspace import _repository_lock
+from hub2_agent_hub_host.implement_workspace import _repository_lock
 with _repository_lock(sys.argv[1]):
     print('locked', flush=True)
     time.sleep(60)

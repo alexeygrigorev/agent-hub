@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from agent_hub_host.agent import Bridge, Journal
+from hub2_agent_hub_host.agent import Bridge, Journal
 
 
 class _StopServe(BaseException):
@@ -88,11 +88,11 @@ class StaleWorkspaceReconcileTests(unittest.TestCase):
             bridge.lookup = Mock(side_effect=AssertionError("unavailable workspace must not be queried"))
 
             ticks = count(0, 31)
-            with patch("agent_hub_host.agent.time.monotonic", side_effect=lambda: next(ticks)), patch(
-                    "agent_hub_host.agent.threading.Thread") as thread, patch(
-                    "agent_hub_host.agent.time.sleep",
+            with patch("hub2_agent_hub_host.agent.time.monotonic", side_effect=lambda: next(ticks)), patch(
+                    "hub2_agent_hub_host.agent.threading.Thread") as thread, patch(
+                    "hub2_agent_hub_host.agent.time.sleep",
                     side_effect=AssertionError("unexpected daemon reconnect")):
-                with self.assertLogs("agent_hub_host.agent", level="WARNING") as captured:
+                with self.assertLogs("hub2_agent_hub_host.agent", level="WARNING") as captured:
                     with self.assertRaises(_StopServe):
                         bridge.serve("machine-1", ["headless"])
 
@@ -155,10 +155,10 @@ class StaleWorkspaceReconcileTests(unittest.TestCase):
             bridge.runner = None
             bridge.lookup = Mock(side_effect=AssertionError("unavailable workspace must not be queried"))
 
-            with patch("agent_hub_host.agent.threading.Thread") as thread, patch(
-                    "agent_hub_host.agent.time.sleep",
+            with patch("hub2_agent_hub_host.agent.threading.Thread") as thread, patch(
+                    "hub2_agent_hub_host.agent.time.sleep",
                     side_effect=AssertionError("unexpected daemon reconnect")):
-                with self.assertLogs("agent_hub_host.agent", level="WARNING") as captured:
+                with self.assertLogs("hub2_agent_hub_host.agent", level="WARNING") as captured:
                     with self.assertRaises(_StopServe):
                         bridge.serve("machine-1", ["headless"])
 

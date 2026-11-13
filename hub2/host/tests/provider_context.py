@@ -4,9 +4,9 @@ import json
 import os
 from pathlib import Path
 
-from agent_hub_host.client import Client
-from agent_hub_host.provider_home import verify, session_binding
-from agent_hub_host.providers import provision
+from hub2_agent_hub_host.client import Client
+from hub2_agent_hub_host.provider_home import verify, session_binding
+from hub2_agent_hub_host.providers import provision
 
 
 def main():

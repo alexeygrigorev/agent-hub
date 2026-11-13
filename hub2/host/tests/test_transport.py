@@ -5,7 +5,7 @@ import socket
 import struct
 import threading
 import unittest
-from agent_hub_host.transport import WebSocket
+from hub2_agent_hub_host.transport import WebSocket
 
 
 class TransportTests(unittest.TestCase):

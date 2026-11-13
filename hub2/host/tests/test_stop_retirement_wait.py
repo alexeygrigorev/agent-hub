@@ -8,8 +8,8 @@ import types
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
-from agent_hub_host.agent import Bridge, Journal
-from agent_hub_host.native_launch import canonical
+from hub2_agent_hub_host.agent import Bridge, Journal
+from hub2_agent_hub_host.native_launch import canonical
 
 NATIVE='11111111-2222-4333-8444-555555555555'
 
@@ -32,7 +32,7 @@ class StopRetirementWaitTests(unittest.TestCase):
         self.clock=0
         self.wall=100
         def sleep(seconds):self.clock+=seconds
-        self.patches=[patch('agent_hub_host.agent.time.monotonic',side_effect=lambda:self.clock),patch('agent_hub_host.agent.time.time',side_effect=lambda:self.wall+self.clock),patch('agent_hub_host.agent.time.sleep',side_effect=sleep)]
+        self.patches=[patch('hub2_agent_hub_host.agent.time.monotonic',side_effect=lambda:self.clock),patch('hub2_agent_hub_host.agent.time.time',side_effect=lambda:self.wall+self.clock),patch('hub2_agent_hub_host.agent.time.sleep',side_effect=sleep)]
         for p in self.patches:p.start();self.addCleanup(p.stop)
 
     def stop(self,deadline=102000):
@@ -52,7 +52,7 @@ class StopRetirementWaitTests(unittest.TestCase):
 
     def test_qualified_retirement_checks_original_birth(self):
         self.bridge.lookup=Mock(return_value={**self.dead,'retirement':'verified_finished'})
-        with patch('agent_hub_host.agent.native_launch.read_tombstone',return_value={'created_at_ms':1000}):
+        with patch('hub2_agent_hub_host.agent.native_launch.read_tombstone',return_value={'created_at_ms':1000}):
             self.assertTrue(self.stop()['stopped'])
 
     def test_exit_without_returncode_is_not_confirmation(self):
@@ -123,7 +123,7 @@ class StopRetirementWaitTests(unittest.TestCase):
             self.clock += 6
             return self.dead
         self.bridge.lookup = Mock(side_effect=status)
-        with patch('agent_hub_host.agent.time.time', return_value=100):
+        with patch('hub2_agent_hub_host.agent.time.time', return_value=100):
             self.assertFalse(self.stop(160000)['stopped'])
 
     def test_forward_wall_clock_invalidates_read_before_success(self):

@@ -9,8 +9,8 @@ requires-python = ">=3.11"
 dependencies = ["websockets==16.0"]
 
 [project.scripts]
-hub = "agent_hub_host.cli:main"
-hub2 = "agent_hub_host.cli:main"
+hub = "hub2_agent_hub_host.cli:main"
+hub2 = "hub2_agent_hub_host.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["agent_hub_host*"]
+include = ["hub2_agent_hub_host*"]

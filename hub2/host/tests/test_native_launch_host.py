@@ -13,8 +13,8 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agent_hub_host import native_launch as nl
-from agent_hub_host import provider_home as ph
+from hub2_agent_hub_host import native_launch as nl
+from hub2_agent_hub_host import provider_home as ph
 
 
 class AdapterArgvTest(unittest.TestCase):

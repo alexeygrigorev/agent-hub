@@ -170,9 +170,9 @@ def verified_artifact(base, name, record):
 
 
 def check_host_package(target, manifest):
-    command([target / 'bin/python', '-c', 'from agent_hub_host._release import HOST_VERSION, PROTOCOL_VERSION; '
+    command([target / 'bin/python', '-c', 'from hub2_agent_hub_host._release import HOST_VERSION, PROTOCOL_VERSION; '
              f'assert HOST_VERSION == {manifest["host_version"]!r} and PROTOCOL_VERSION == {manifest["protocol_version"]}; '
-             'import inspect; from agent_hub_host.client import Client; '
+             'import inspect; from hub2_agent_hub_host.client import Client; '
              "assert 'native_sessions' in inspect.signature(Client.heartbeat).parameters"])
 
 
@@ -189,8 +189,8 @@ def matches_installed_artifact(path, record):
 
 def install_operator_cli(target, manifest):
     # The wheel owns hub2 (daemon administration); hub is the full operator
-    # zipapp. Both packages use agent_hub_host, so importing the operator CLI
-    # through the host venv would select the wrong package.
+    # zipapp. The daemon wheel installs hub2_agent_hub_host; the zipapp keeps
+    # agent_hub_host and is run from its own archive, not the host venv.
     archive = target / 'hub.pyz'
     if not matches_installed_artifact(archive, manifest['artifacts']['hub.pyz']):
         raise ValueError('installed release artifact mismatch: hub.pyz')

@@ -12,8 +12,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 HUB2 = ROOT / "hub2"
 REQUIRED_HOST_FILES = (
-    HUB2 / "host" / "agent_hub_host" / "agent.py",
-    HUB2 / "host" / "agent_hub_host" / "transport.py",
+    HUB2 / "host" / "hub2_agent_hub_host" / "agent.py",
+    HUB2 / "host" / "hub2_agent_hub_host" / "transport.py",
     HUB2 / "host" / "bootstrap.py",
     HUB2 / "host" / "pyproject.toml",
 )
@@ -41,7 +41,7 @@ def text_files(path: Path) -> set[Path]:
 
 
 def production_files() -> set[Path]:
-    files = text_files(HUB2 / "src") | text_files(HUB2 / "node") | text_files(HUB2 / "host" / "agent_hub_host") | text_files(HUB2 / "public")
+    files = text_files(HUB2 / "src") | text_files(HUB2 / "node") | text_files(HUB2 / "host" / "hub2_agent_hub_host") | text_files(HUB2 / "public")
     # Production Wrangler entry keeps first activation in maintenance mode.
     production_worker = HUB2 / "production-worker.ts"
     if production_worker.is_file():

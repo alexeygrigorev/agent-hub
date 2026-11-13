@@ -10,8 +10,8 @@ from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
-from agent_hub_host.cli import main
-from agent_hub_host.client import save_config
+from hub2_agent_hub_host.cli import main
+from hub2_agent_hub_host.client import save_config
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -144,7 +144,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(Handler.calls, [])
 
     def test_enrollment_defaults_to_live_server_when_config_has_no_server(self):
-        from agent_hub_host import cli
+        from hub2_agent_hub_host import cli
 
         save_config(self.config, {})
         with patch.object(cli, "DEFAULT_SERVER", f"http://127.0.0.1:{self.server.server_port}"), \
@@ -170,9 +170,9 @@ class CliTests(unittest.TestCase):
             "expires_at": 0,
         })
         saved_config = self.config.read_bytes()
-        with patch("agent_hub_host.cli.Journal") as journal, \
-             patch("agent_hub_host.auth.refresh") as refresh, \
-             patch("agent_hub_host.native_launch.shutil.which", return_value=None):
+        with patch("hub2_agent_hub_host.cli.Journal") as journal, \
+             patch("hub2_agent_hub_host.auth.refresh") as refresh, \
+             patch("hub2_agent_hub_host.native_launch.shutil.which", return_value=None):
             code, result = self.invoke("heartbeat", "--label", "fleet-cycle", "--aplexer", os.sys.executable)
 
         self.assertEqual(code, 0)

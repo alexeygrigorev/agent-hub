@@ -9,7 +9,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agent_hub_host import native_launch as nl
+from hub2_agent_hub_host import native_launch as nl
 
 
 class ClaudeHeadlessSettingsTest(unittest.TestCase):

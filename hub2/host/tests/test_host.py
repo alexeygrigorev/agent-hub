@@ -11,9 +11,9 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_hub_host.agent import Bridge, Journal, offer_ack_frame, OfferAcknowledgement
-from agent_hub_host.client import ApiError, Client, save_config
-from agent_hub_host.cli import main as cli_main
+from hub2_agent_hub_host.agent import Bridge, Journal, offer_ack_frame, OfferAcknowledgement
+from hub2_agent_hub_host.client import ApiError, Client, save_config
+from hub2_agent_hub_host.cli import main as cli_main
 
 
 class FakeNative:
@@ -101,11 +101,11 @@ class HostTests(unittest.TestCase):
             # Lifecycle fixtures isolate Bridge semantics from the provider gate:
             # no provider home means the adapter skips the final admission recheck.
             return None
-        provisioning=patch('agent_hub_host.providers.provision',side_effect=provision_fixture)
+        provisioning=patch('hub2_agent_hub_host.providers.provision',side_effect=provision_fixture)
         provisioning.start()
         self.addCleanup(provisioning.stop)
         # Existing lifecycle fixtures never inspect the operator's real login.
-        auth = patch('agent_hub_host.agent.local_claude_missing_contexts', return_value=[])
+        auth = patch('hub2_agent_hub_host.agent.local_claude_missing_contexts', return_value=[])
         self.auth_observer = auth.start()
         self.addCleanup(auth.stop)
 
@@ -114,7 +114,7 @@ class HostTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_heartbeat_local_source_is_mode_engine_account_bound_and_canonical_only(self):
-        from agent_hub_host.native_launch import LOCAL_ROUTES
+        from hub2_agent_hub_host.native_launch import LOCAL_ROUTES
         captured = []
         self.client.heartbeat = lambda *args, **kw: captured.append((args, kw))
         self.bridge.launcher.config = {'routes': {k: dict(v) for k, v in LOCAL_ROUTES.items()}}
@@ -142,7 +142,7 @@ class HostTests(unittest.TestCase):
         self.assertNotIn('custom-account', json.dumps(captured[-1]))
 
     def test_scoped_missing_local_claude_keeps_engine_modes_and_unverified_source_hint(self):
-        from agent_hub_host.native_launch import LOCAL_ROUTES
+        from hub2_agent_hub_host.native_launch import LOCAL_ROUTES
         captured = []
         self.client.heartbeat = lambda *args, **kwargs: captured.append(args)
         self.bridge.launcher.config = {'routes': {key: dict(value) for key, value in LOCAL_ROUTES.items()}}
@@ -189,7 +189,7 @@ class HostTests(unittest.TestCase):
         self.auth_observer.assert_not_called()
 
     def test_local_source_modes_launch_without_central_home_injection(self):
-        from agent_hub_host.native_launch import LOCAL_ROUTES
+        from hub2_agent_hub_host.native_launch import LOCAL_ROUTES
         for interactive in (False, True):
             with self.subTest(interactive=interactive):
                 self.bridge.launcher.config = {'routes': {k: dict(v) for k, v in LOCAL_ROUTES.items()}}
@@ -197,7 +197,7 @@ class HostTests(unittest.TestCase):
                 offer['session_id'] += '-interactive' if interactive else '-headless'
                 offer['operation_id'] += '-interactive' if interactive else '-headless'
                 offer['launch']['interactive'] = interactive
-                with patch('agent_hub_host.providers.provision', side_effect=AssertionError('central home must not be provisioned')):
+                with patch('hub2_agent_hub_host.providers.provision', side_effect=AssertionError('central home must not be provisioned')):
                     self.bridge.offer(offer)
                 argv, options = next((args, kw) for args, kw in reversed(self.native.calls) if args[1] == 'start')
                 child = argv[argv.index('--') + 1:]
@@ -227,7 +227,7 @@ class HostTests(unittest.TestCase):
     def test_provider_refusal_stays_unclaimed_and_later_epoch_replaces_only_unspawned_intent(self):
         offer=self.offer()
         acknowledgements=[]
-        with patch('agent_hub_host.providers.provision',side_effect=RuntimeError('provider_access_lifetime_insufficient')):
+        with patch('hub2_agent_hub_host.providers.provision',side_effect=RuntimeError('provider_access_lifetime_insufficient')):
             with self.assertRaises(RuntimeError):
                 self.bridge.offer(offer,lambda *args:acknowledgements.append(args))
         self.assertFalse(acknowledgements)
@@ -627,7 +627,7 @@ class HostTests(unittest.TestCase):
                     raise ApiError('old label comparison', status=409, code='unqualified_native_exit_evidence')
             return original(method, path, body, key)
         self.client.request = request
-        with self.assertLogs('agent_hub_host.agent', level='ERROR'):
+        with self.assertLogs('hub2_agent_hub_host.agent', level='ERROR'):
             self.journal.flush(self.client)
         prior_native_calls = list(self.native.calls)
         def acknowledge(*args):
@@ -723,7 +723,7 @@ class HostTests(unittest.TestCase):
         class Socket:
             def send(self, text):
                 frames.append(json.loads(text))
-        with self.assertLogs('agent_hub_host.agent', level='ERROR'):
+        with self.assertLogs('hub2_agent_hub_host.agent', level='ERROR'):
             self.bridge.dispatch({'type': 'session.offer', 'offer': recovery}, Socket(), lambda *args: True)
         self.assertEqual(frames[-1]['type'], 'host.error')
         self.assertIsNone(self.journal.db.execute('SELECT workspace_repair_digest FROM launches').fetchone()[0])
@@ -791,7 +791,7 @@ class HostTests(unittest.TestCase):
         self.bridge.offer(recovery, lambda *args: True)
         old = self.client.request
         self.client.request = lambda *args, **kwargs: (_ for _ in ()).throw(ApiError('still refused', status=409, code='stale_or_unmatched_finish'))
-        with self.assertLogs('agent_hub_host.agent', level='ERROR'):
+        with self.assertLogs('hub2_agent_hub_host.agent', level='ERROR'):
             self.journal.flush(self.client)
         self.assertEqual(tuple(self.journal.db.execute('SELECT * FROM outbox_dead_letters').fetchone()), original)
         self.bridge.offer(recovery, lambda *args: True)
@@ -1060,7 +1060,7 @@ class HostTests(unittest.TestCase):
             connections.append(value)
             return value
         self.client.socket, self.client.heartbeat = socket, lambda labels, engines, capabilities, native_sessions=None: None
-        with patch("agent_hub_host.agent.time.sleep"), self.assertRaises(StopServe):
+        with patch("hub2_agent_hub_host.agent.time.sleep"), self.assertRaises(StopServe):
             self.bridge.serve("machine-1", [])
         self.assertEqual(len(connections), 3)
         self.assertEqual(sum(call[1] == "send" for call, _ in self.native.calls), 1)
@@ -1224,7 +1224,7 @@ class HostTests(unittest.TestCase):
 
     def reconcile_with_census(self):
         """Census runs off the control loop; wait for its single worker, never in production."""
-        from agent_hub_host.launch_reaper import observation_thread
+        from hub2_agent_hub_host.launch_reaper import observation_thread
         self.bridge.reconcile()
         thread = observation_thread(self.bridge)
         if thread is not None:
@@ -1284,9 +1284,9 @@ class HostTests(unittest.TestCase):
                 self.bridge.reconcile()
                 self.assertEqual(self.journal.db.execute('SELECT state FROM launches').fetchone()[0], 'aborting')
                 self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0], 0)
-        from agent_hub_host.native_inventory import collect_native_inventory
+        from hub2_agent_hub_host.native_inventory import collect_native_inventory
         row={'id':'11111111-1111-4111-8111-111111111111','tag':'other','workspace':str(self.root),'schema_version':1}
-        with patch('agent_hub_host.native_inventory.MAX_CENSUS_ROWS',0), patch.object(self.bridge.launcher,'runner',
+        with patch('hub2_agent_hub_host.native_inventory.MAX_CENSUS_ROWS',0), patch.object(self.bridge.launcher,'runner',
                 return_value=subprocess.CompletedProcess(['a'],0,json.dumps([row]),'')):
             self.bridge.reconcile()
         self.assertEqual(self.journal.db.execute('SELECT state FROM launches').fetchone()[0], 'aborting')
@@ -1338,7 +1338,7 @@ class HostTests(unittest.TestCase):
         self.assertEqual(sent[0]["reason"], "command_fence_conflict")
 
     def test_capture_reads_bound_headless_stdout_through_existing_command_fence(self):
-        from agent_hub_host.task_output import prepare_output
+        from hub2_agent_hub_host.task_output import prepare_output
         self.bridge.offer(self.offer())
         row=self.journal.db.execute('SELECT * FROM launches').fetchone()
         spec={'workspace':row['workspace'],'operation_id':row['operation_id'],'epoch':row['epoch']}
@@ -1406,7 +1406,7 @@ class HostTests(unittest.TestCase):
                 captured["timeout"] = timeout
                 return Response()
 
-        with patch("agent_hub_host.client.urllib.request.build_opener", return_value=Opener()):
+        with patch("hub2_agent_hub_host.client.urllib.request.build_opener", return_value=Opener()):
             result = Client("https://hub.example", "secret-token").request("GET", "/api/health")
 
         self.assertEqual(result, {})
@@ -1417,7 +1417,7 @@ class HostTests(unittest.TestCase):
     def test_top_level_status_command_uses_the_hub_status_endpoint(self):
         output = io.StringIO()
         config = self.root / "operator.json"
-        with patch("agent_hub_host.cli.Client", return_value=self.client), redirect_stdout(output):
+        with patch("hub2_agent_hub_host.cli.Client", return_value=self.client), redirect_stdout(output):
             result = cli_main(["--config", str(config), "--server", "https://hub.example", "status"])
 
         self.assertEqual(result, 0)
@@ -1433,7 +1433,7 @@ class RetiredLookupRowTest(unittest.TestCase):
     def test_lookup_passes_plain_mapping_to_retired(self):
         import sqlite3
         from types import SimpleNamespace
-        from agent_hub_host.agent import Bridge
+        from hub2_agent_hub_host.agent import Bridge
         conn = sqlite3.connect(':memory:'); conn.row_factory = sqlite3.Row
         row = conn.execute("SELECT 'tag-1' AS tag, '/ws' AS workspace").fetchone()
         seen = []
@@ -1447,7 +1447,7 @@ class RetiredLookupRowTest(unittest.TestCase):
 class ResourceHeartbeatLoopTest(unittest.TestCase):
     def test_beats_repeatedly_and_survives_failures(self):
         import threading
-        from agent_hub_host.agent import run_heartbeat_loop
+        from hub2_agent_hub_host.agent import run_heartbeat_loop
         calls, stop = [], threading.Event()
         def beat():
             calls.append(1)
@@ -1461,7 +1461,7 @@ class ResourceHeartbeatLoopTest(unittest.TestCase):
         self.assertGreaterEqual(len(calls), 3)
 
     def test_interval_is_well_inside_the_hub_staleness_window(self):
-        from agent_hub_host.agent import LIVE_SESSION_HEARTBEAT_SECONDS
+        from hub2_agent_hub_host.agent import LIVE_SESSION_HEARTBEAT_SECONDS
         self.assertLessEqual(LIVE_SESSION_HEARTBEAT_SECONDS * 4, 300)
 
 class NativeControlTests(unittest.TestCase):
@@ -1593,7 +1593,7 @@ class NativeControlTests(unittest.TestCase):
         self.assertEqual(self.bridge.command(command),result)
         self.assertEqual(sum(args[1]=='send' for args,_ in self.native.calls),1)
         second=self.command('send',id='33333333-3333-4333-8333-333333333333')
-        from agent_hub_host.native_launch import canonical
+        from hub2_agent_hub_host.native_launch import canonical
         with self.journal.db:self.bridge.begin_command(second['id'],hashlib.sha256(canonical(second).encode()).hexdigest())
         self.journal.db.close();self.journal=Journal(self.root/'private/journal.sqlite')
         self.bridge.journal=self.journal;self.bridge.launcher.journal=self.journal
@@ -1612,7 +1612,7 @@ class NativeControlTests(unittest.TestCase):
 
     def test_executing_receipt_after_restart_is_uncertain_without_redispatch(self):
         command = self.command()
-        from agent_hub_host.native_launch import canonical
+        from hub2_agent_hub_host.native_launch import canonical
         digest = hashlib.sha256(canonical(command).encode()).hexdigest()
         with self.journal.db:
             self.bridge.begin_command(command['id'], digest)
@@ -1640,7 +1640,7 @@ class RetainedManagedCaptureTests(unittest.TestCase):
     tearDown=HostTests.tearDown
 
     def seed(self,terminal=True):
-        from agent_hub_host import task_output
+        from hub2_agent_hub_host import task_output
         self.bridge.offer(HostTests.offer(self))
         row=self.journal.db.execute('SELECT * FROM launches').fetchone()
         task='hub2-'+row['session_id'];created=int(time.time()*1000)-1000
@@ -1690,7 +1690,7 @@ class RetainedManagedCaptureTests(unittest.TestCase):
         self.assertEqual(self.native.calls,[])
 
     def test_interrupted_screen_capture_fails_once_without_native_retry_or_input_relaxation(self):
-        from agent_hub_host.native_launch import canonical
+        from hub2_agent_hub_host.native_launch import canonical
         command=self.seed(terminal=False);command.pop('capture_binding');command['mode']='screen'
         digest=hashlib.sha256(canonical(command).encode()).hexdigest()
         with self.journal.db:self.bridge.begin_command(command['id'],digest)
@@ -1731,10 +1731,10 @@ class RetainedManagedCaptureTests(unittest.TestCase):
         self.assertEqual(self.native.calls,[])
 
     def test_interrupted_bound_terminal_capture_has_no_read_and_preserves_exact_binding(self):
-        from agent_hub_host.native_launch import canonical
+        from hub2_agent_hub_host.native_launch import canonical
         command=self.seed();self.stdout.unlink()
         with self.journal.db:self.bridge.begin_command(command['id'],hashlib.sha256(canonical(command).encode()).hexdigest())
-        with patch('agent_hub_host.task_output.capture_task_output',side_effect=AssertionError('must not reread')):
+        with patch('hub2_agent_hub_host.task_output.capture_task_output',side_effect=AssertionError('must not reread')):
             result=self.bridge.command(command)
         self.assertEqual(result['error'],'capture_outcome_uncertain')
         self.assertEqual(result['capture_binding'],command['capture_binding'])
@@ -1797,7 +1797,7 @@ class RetainedManagedCaptureTests(unittest.TestCase):
             def post(request,timeout):
                 sent.append(json.loads(request.data));return response
             opener.open.side_effect=post
-            with patch('agent_hub_host.client.urllib.request.build_opener',return_value=opener):
+            with patch('hub2_agent_hub_host.client.urllib.request.build_opener',return_value=opener):
                 reopened.flush(Client('https://hub.test'))
             self.assertIn(json.loads(frozen),sent)
             self.assertEqual(reopened.db.execute('SELECT COUNT(*) FROM outbox WHERE key=?',(key,)).fetchone()[0],0)
@@ -1822,7 +1822,7 @@ class ManagedClaudeHostTests(unittest.TestCase):
     offer=HostTests.offer
 
     def configure(self):
-        from agent_hub_host.native_launch import LOCAL_ROUTES
+        from hub2_agent_hub_host.native_launch import LOCAL_ROUTES
         self.bridge.engines={'claude'}
         self.bridge.launcher.config={'private_provider_homes':True,'routes':{'claude':dict(LOCAL_ROUTES['claude'])}}
         self.bridge.launcher.capabilities=lambda:{'claude':{'headless','effort'}}
@@ -1868,7 +1868,7 @@ class ManagedClaudeHostTests(unittest.TestCase):
 
     def test_explicit_managed_attempt_uses_fixed_profile_without_global_private_home_or_replay(self):
         self.configure();offer=self.managed_offer()
-        with patch('agent_hub_host.providers.provision') as provision:
+        with patch('hub2_agent_hub_host.providers.provision') as provision:
             self.bridge.offer(offer);self.bridge.offer(offer)
         provision.assert_not_called()
         starts=[args for args,kw in self.native.calls if args[1]=='start']
@@ -1907,7 +1907,7 @@ class CaptureAckCompatibilityTests(unittest.TestCase):
                                'operation_id':'op-frozen','request_digest':'a'*64}}}
 
     def test_stage_b_emission_uses_full_64k_with_bounded_json_escaping(self):
-        from agent_hub_host.task_output import bounded_capture, CAPTURE_RESULT_JSON_BYTES
+        from hub2_agent_hub_host.task_output import bounded_capture, CAPTURE_RESULT_JSON_BYTES
         result=bounded_capture('evicted-prefix'+'\0'*65536)
         self.assertEqual(result,'\0'*65536)
         self.assertEqual(len(result.encode()),65536)
@@ -1937,7 +1937,7 @@ class CaptureAckCompatibilityTests(unittest.TestCase):
                     self.assertEqual(request.data,accepted[0])
                     return response
                 opener.open.side_effect=post
-                with patch('agent_hub_host.client.urllib.request.build_opener',return_value=opener):
+                with patch('hub2_agent_hub_host.client.urllib.request.build_opener',return_value=opener):
                     with self.assertRaises(ApiError):self.journal.flush(Client('https://hub.test'))
                     self.assertEqual(self.journal.db.execute('SELECT payload FROM outbox WHERE key=?',(key,)).fetchone()[0],frozen)
                     reopened=Journal(self.path)
@@ -1952,7 +1952,7 @@ class CaptureAckCompatibilityTests(unittest.TestCase):
         for output in ['x'*65536,'\0'*65536,'😀'*16384]:
             response=MagicMock();response.__enter__.return_value.read.return_value=b'{}'
             opener=MagicMock();opener.open.return_value=response
-            with patch('agent_hub_host.client.urllib.request.build_opener',return_value=opener):
+            with patch('hub2_agent_hub_host.client.urllib.request.build_opener',return_value=opener):
                 Client('https://hub.test').request('POST','/api/sessions/s/commands/c/ack',self.payload(output))
             raw=opener.open.call_args.args[0].data
             self.assertLessEqual(len(raw),401*1024)
@@ -2063,7 +2063,7 @@ class NativeObservationIsolationTests(unittest.TestCase):
     def test_reports_are_bounded_deduplicated_safe_and_reconnect_retries_failure(self):
         from concurrent.futures import ThreadPoolExecutor
         from types import SimpleNamespace
-        from agent_hub_host.agent import _NATIVE_OBSERVATION_REPORT_LIMIT
+        from hub2_agent_hub_host.agent import _NATIVE_OBSERVATION_REPORT_LIMIT
         self.seed();self.bridge._managed_socket=None
         row={'session_id':'safe','operation_id':'op:safe','epoch':1}
         self.bridge._report_native_observation(row)

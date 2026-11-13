@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_hub_host.git_salvage import salvage_branch
+from hub2_agent_hub_host.git_salvage import salvage_branch
 import test_host
 
 
@@ -114,7 +114,7 @@ class GitSalvageTests(unittest.TestCase):
             if 'push' in args:
                 raise subprocess.TimeoutExpired(args, 1, stderr='private-token')
             return run(args, **kwargs)
-        with patch('agent_hub_host.git_salvage.subprocess.run', side_effect=slow):
+        with patch('hub2_agent_hub_host.git_salvage.subprocess.run', side_effect=slow):
             result = salvage_branch(self.repo)
         self.assertEqual(result['reason'], 'git_unavailable_or_timeout')
         self.assertNotIn('private-token', json.dumps(result))
@@ -136,7 +136,7 @@ class SalvageExitTests(unittest.TestCase):
                     else:
                         fixture.native.process.update(phase='exited', containment_empty=True, exit={'code': 0})
                     proof = {'repo': '/repo', 'branch': 'task/saved', 'head_sha': 'a'*40, 'status': 'pushed'}
-                    with patch('agent_hub_host.agent.salvage_branch', return_value=proof) as salvage:
+                    with patch('hub2_agent_hub_host.agent.salvage_branch', return_value=proof) as salvage:
                         fixture.bridge.reconcile()
                         fixture.bridge.reconcile()
                         salvage.assert_called_once_with(str(fixture.root))

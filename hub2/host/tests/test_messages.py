@@ -4,8 +4,8 @@ import unittest
 from pathlib import Path
 import test_host
 
-from agent_hub_host.client import ApiError
-from agent_hub_host.messages import deliver
+from hub2_agent_hub_host.client import ApiError
+from hub2_agent_hub_host.messages import deliver
 
 
 class MailTests(unittest.TestCase):

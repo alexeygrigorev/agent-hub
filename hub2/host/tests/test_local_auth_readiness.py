@@ -10,7 +10,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from agent_hub_host.local_auth_readiness import _default_claude_auth_state, local_claude_missing_contexts, FILE_LIMIT, MISSING, UNKNOWN
+from hub2_agent_hub_host.local_auth_readiness import _default_claude_auth_state, local_claude_missing_contexts, FILE_LIMIT, MISSING, UNKNOWN
 
 
 @unittest.skipUnless(sys.platform == 'linux', 'known-negative backend is deliberately Linux-only')
@@ -133,13 +133,13 @@ class LocalAuthReadinessTests(unittest.TestCase):
         # Actual observations still refuse even a private leaf below an
         # untrusted writable ancestor; fixture relocation is not a bypass.
         with self.assertRaisesRegex(ValueError, 'untrusted_auth_location'):
-            from agent_hub_host.local_auth_readiness import _read
+            from hub2_agent_hub_host.local_auth_readiness import _read
             _read(unsafe/'absent.json')
 
     def test_observer_failure_is_unknown_and_never_logs_exception_or_contents(self):
         output = io.StringIO()
         with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output), \
-                patch('agent_hub_host.local_auth_readiness._read', side_effect=OSError('synthetic-secret')):
+                patch('hub2_agent_hub_host.local_auth_readiness._read', side_effect=OSError('synthetic-secret')):
             self.assertEqual(self.observe(), UNKNOWN)
         self.assertEqual(output.getvalue(), '')
 
@@ -234,7 +234,7 @@ class LocalAuthReadinessTests(unittest.TestCase):
 class OtherPlatformTests(unittest.TestCase):
     def test_unknown_platform_and_keychain_backends_do_not_read_local_files(self):
         for platform in ('darwin', 'win32', 'other'):
-            with patch('agent_hub_host.local_auth_readiness._read', side_effect=AssertionError('must not read')):
+            with patch('hub2_agent_hub_host.local_auth_readiness._read', side_effect=AssertionError('must not read')):
                 self.assertEqual(_default_claude_auth_state({}, platform=platform), UNKNOWN)
 
 

@@ -5,8 +5,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock
 
-from agent_hub_host.agent import Journal
-from agent_hub_host.client import ApiError
+from hub2_agent_hub_host.agent import Journal
+from hub2_agent_hub_host.client import ApiError
 
 
 class OutboxDeadletterTests(unittest.TestCase):
@@ -22,7 +22,7 @@ class OutboxDeadletterTests(unittest.TestCase):
         self.journal.emit('started:new', '/api/sessions/new/started', {'native_id': 'new'})
         client = Mock()
         client.request.side_effect = [ApiError('refused', status=409, code='unqualified_native_exit_evidence'), {}]
-        with self.assertLogs('agent_hub_host.agent', level='ERROR') as logs:
+        with self.assertLogs('hub2_agent_hub_host.agent', level='ERROR') as logs:
             self.journal.flush(client)
         self.assertEqual(client.request.call_count, 2)
         self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0], 0)
@@ -52,7 +52,7 @@ class OutboxDeadletterTests(unittest.TestCase):
         for status in (400, 404, 409, 410, 422):
             with self.subTest(status=status):
                 self.journal.emit(str(status), '/api/sessions/old/finish', {'status': status})
-                with self.assertLogs('agent_hub_host.agent', level='ERROR'):
+                with self.assertLogs('hub2_agent_hub_host.agent', level='ERROR'):
                     self.journal.flush(Mock(request=Mock(side_effect=ApiError('refused', status=status))))
                 row = self.journal.db.execute('SELECT * FROM outbox_dead_letters WHERE key=?', (str(status),)).fetchone()
                 self.assertEqual(row['reason'], 'http_' + str(status))
@@ -62,7 +62,7 @@ class OutboxDeadletterTests(unittest.TestCase):
         self.journal.emit('other', '/api/other', {'keep': True})
         self.journal.emit('finish', '/api/sessions/old/finish', {'terminal': True})
         client = Mock(request=Mock(side_effect=ApiError('retired fence', status=409)))
-        with self.assertLogs('agent_hub_host.agent', level='ERROR'):
+        with self.assertLogs('hub2_agent_hub_host.agent', level='ERROR'):
             self.journal.flush(client, safety_only=True)
         self.assertEqual(client.request.call_count, 1)
         self.assertEqual(self.journal.db.execute('SELECT key FROM outbox').fetchone()[0], 'other')

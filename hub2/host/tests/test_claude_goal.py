@@ -14,8 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from agent_hub_host import claude_goal as cg
-from agent_hub_host import native_launch as nl
+from hub2_agent_hub_host import claude_goal as cg
+from hub2_agent_hub_host import native_launch as nl
 
 
 def digest(value):

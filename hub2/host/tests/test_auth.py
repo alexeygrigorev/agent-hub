@@ -8,8 +8,8 @@ import threading
 import unittest
 from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
-from agent_hub_host.cli import main
-from agent_hub_host.client import save_config
+from hub2_agent_hub_host.cli import main
+from hub2_agent_hub_host.client import save_config
 
 
 class AuthHandler(BaseHTTPRequestHandler):
@@ -52,7 +52,7 @@ class AuthTests(unittest.TestCase):
 
     def invoke(self,action):
         out,err=io.StringIO(),io.StringIO()
-        with contextlib.redirect_stdout(out),contextlib.redirect_stderr(err),patch.dict(os.environ,{'HUB2_TOKEN':''}),patch('agent_hub_host.auth.time.sleep') as sleep:
+        with contextlib.redirect_stdout(out),contextlib.redirect_stderr(err),patch.dict(os.environ,{'HUB2_TOKEN':''}),patch('hub2_agent_hub_host.auth.time.sleep') as sleep:
             code=main(['--server',self.server.base,'--config',str(self.config),'auth',action,'--no-browser'])
         for secret in ('a'*48,'b'*48,'r'*48,'s'*48,'d'*48):self.assertNotIn(secret,out.getvalue()+err.getvalue())
         return code,out.getvalue(),err.getvalue(),sleep

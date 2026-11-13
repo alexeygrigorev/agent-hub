@@ -80,7 +80,7 @@ def verify_bundle(directory, expected_commit, expected_manifest_sha256):
     cli_marker = embedded_marker(directory / 'hub.pyz', 'agent_hub_host/_build_info.py')
     if not re.search(rf'^BUILD_COMMIT = "{expected_commit}"$', cli_marker, re.MULTILINE):
         raise ValueError('CLI build does not match the deployment commit')
-    wheel_marker = embedded_marker(directory / wheel, 'agent_hub_host/_release.py')
+    wheel_marker = embedded_marker(directory / wheel, 'hub2_agent_hub_host/_release.py')
     expected = f'HOST_VERSION = {expected_commit!r}\nPROTOCOL_VERSION = {manifest["protocol_version"]}\n'
     if wheel_marker != expected:
         raise ValueError('host wheel does not match the deployment commit and protocol')
@@ -132,7 +132,7 @@ def build(repo, revision, output):
         source = Path(temporary) / 'source'
         source.mkdir()
         sha = export_source(repo, revision, source)
-        package = source / 'hub2/host/agent_hub_host'
+        package = source / 'hub2/host/hub2_agent_hub_host'
         (package / '_release.py').write_text(f'HOST_VERSION = {sha!r}\nPROTOCOL_VERSION = 1\n')
         # Distinct wheel versions avoid pip treating different commits as 2.0.0.
         project = source / 'hub2/host/pyproject.toml'

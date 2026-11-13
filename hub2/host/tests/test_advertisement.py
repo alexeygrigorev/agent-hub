@@ -4,8 +4,8 @@ import sys
 from pathlib import Path
 from unittest.mock import Mock, MagicMock, patch
 
-from agent_hub_host.advertisement import Advertisement
-from agent_hub_host.agent import Bridge
+from hub2_agent_hub_host.advertisement import Advertisement
+from hub2_agent_hub_host.agent import Bridge
 
 
 class AdvertisementTests(unittest.TestCase):
@@ -171,7 +171,7 @@ class AdvertisementTests(unittest.TestCase):
 
 
     def test_large_workspace_inventory_transport_allowance_is_heartbeat_only(self):
-        from agent_hub_host.client import Client
+        from hub2_agent_hub_host.client import Client
         import json
         capabilities = ['workspace:project-' + str(i) + 'x' * 45 for i in range(1125)]
         body = {'labels': [], 'engines': ['codex'], 'capabilities': capabilities}

@@ -51,8 +51,8 @@ test('dispatch preserves a full actual pool beside a maximum launch and hides di
 import hashlib,json,sys
 from pathlib import Path
 from types import SimpleNamespace
-from agent_hub_host.agent import Bridge
-from agent_hub_host.native_launch import canonical
+from hub2_agent_hub_host.agent import Bridge
+from hub2_agent_hub_host.native_launch import canonical
 offer=json.load(sys.stdin)
 bridge=Bridge.__new__(Bridge)
 bridge.engines={'codex'}

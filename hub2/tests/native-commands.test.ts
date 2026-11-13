@@ -115,7 +115,7 @@ test('actual Python Bridge journal ACK composes with real Machine native stop pr
   const command=socket.sent[0].command;
   const script=`import json,sys,subprocess,time
 from pathlib import Path
-from agent_hub_host.agent import Bridge, Journal
+from hub2_agent_hub_host.agent import Bridge, Journal
 command=json.loads(sys.stdin.read())
 root=Path(command['identity']['workspace'])
 journal=Journal(root/'private'/'journal.sqlite')
@@ -270,7 +270,7 @@ test('real Python strict adapter journal and fresh census compose with Machine S
   await f.publish(dir);const c=await receipt(f,'send','composed',{text:'owned synthetic π input'}),wire=sendWire(f,c.id);
   const script=`import json,sys,subprocess,time,hashlib
 from pathlib import Path
-from agent_hub_host.agent import Bridge,Journal
+from hub2_agent_hub_host.agent import Bridge,Journal
 command=json.loads(sys.stdin.read());root=Path(command['identity']['workspace']);journal=Journal(root/'private/journal.sqlite')
 row={'id':command['native_id'],'tag':command['identity']['tag'],'workspace':str(root),'phase':'running','state':'running','worker_alive':True,'created_at_ms':1,'schema_version':1}
 calls=[]

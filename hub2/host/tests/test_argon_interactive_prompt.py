@@ -1,5 +1,5 @@
 import unittest
-from agent_hub_host.native_launch import adapter_argv, interactive_argv
+from hub2_agent_hub_host.native_launch import adapter_argv, interactive_argv
 
 class ArgonInteractivePromptTests(unittest.TestCase):
     def test_interactive_prompt_uses_supported_flag_and_preserves_model_effort(self):

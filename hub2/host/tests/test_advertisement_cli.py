@@ -6,8 +6,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_hub_host.cli import main
-from agent_hub_host.client import save_config
+from hub2_agent_hub_host.cli import main
+from hub2_agent_hub_host.client import save_config
 
 
 class AdvertisementCliTests(unittest.TestCase):
@@ -16,7 +16,7 @@ class AdvertisementCliTests(unittest.TestCase):
             path = Path(directory) / 'config.json'
             save_config(path, {'machine_id': 'test-host', 'roots': [directory], 'engines': ['codex'],
                                'capabilities': ['tool:agent-browser'], 'workspaces': {'home': directory}})
-            with patch('agent_hub_host.cli.Bridge') as bridge, contextlib.redirect_stdout(io.StringIO()):
+            with patch('hub2_agent_hub_host.cli.Bridge') as bridge, contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(main(['--config', str(path), 'heartbeat']), 0)
                 self.assertEqual(bridge.call_args.kwargs['capabilities'], ['tool:agent-browser'])
                 self.assertEqual(bridge.call_args.kwargs['workspaces'], {'home': directory})
@@ -33,7 +33,7 @@ class AdvertisementCliTests(unittest.TestCase):
             def invoke(*args):
                 with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                     return main(['--config', str(config_path), 'configure-host', *args])
-            with patch('agent_hub_host.client.Client.request', side_effect=AssertionError('network forbidden')):
+            with patch('hub2_agent_hub_host.client.Client.request', side_effect=AssertionError('network forbidden')):
                 self.assertEqual(invoke('--capability', 'browser:orin-chrome', '--capability', 'tool:agent-browser',
                                         '--workspace', 'home=' + str(root)), 0)
                 updated = json.loads(config_path.read_text())

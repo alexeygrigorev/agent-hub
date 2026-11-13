@@ -154,7 +154,7 @@ test('actual Python Unicode ACK frames fit the existing Machine UTF16 frame and 
   f.sockets.push(socket);
   const binding={version:1,requested_workspace:'relay',resolved_workspace:workspace};
   const child=spawnSync('python3',['-I','-c',
-   'import sys,json;sys.path.insert(0,sys.argv[1]);from agent_hub_host.agent import offer_ack_frame;print(offer_ack_frame(sys.argv[2],int(sys.argv[3]),json.loads(sys.argv[4])))',
+   'import sys,json;sys.path.insert(0,sys.argv[1]);from hub2_agent_hub_host.agent import offer_ack_frame;print(offer_ack_frame(sys.argv[2],int(sys.argv[3]),json.loads(sys.argv[4])))',
    fileURLToPath(new URL('../host',import.meta.url)),session,String(epoch),JSON.stringify(binding)],{encoding:'utf8',timeout:10000});
   assert.equal(child.status,0,child.stderr);
   const frame=child.stdout.trim();assert(frame.length<8192);assert(Buffer.byteLength(frame,'utf8')<8192);
@@ -1127,8 +1127,8 @@ test('real Python retained file ACK composes with qualified completed Machine ca
   const wire=(await made.json() as any).command;
   const script=`import json,sys,time
 from pathlib import Path
-from agent_hub_host.agent import Bridge,Journal
-from agent_hub_host import task_output
+from hub2_agent_hub_host.agent import Bridge,Journal
+from hub2_agent_hub_host import task_output
 command=json.loads(sys.stdin.read());root=Path(sys.argv[1]);journal=Journal(root/'private/journal.sqlite')
 binding=command['capture_binding'];tag='task-hub2-'+command['session_id'];task='hub2-'+command['session_id']
 journal.db.execute("INSERT INTO launches(operation_id,session_id,epoch,digest,workspace,tag,native_id,state,interactive) VALUES(?,?,?,?,?,?,?,'exited',0)",(binding['operation_id'],command['session_id'],command['epoch'],'immutable-launch',str(root),tag,binding['native_id']));journal.db.commit()

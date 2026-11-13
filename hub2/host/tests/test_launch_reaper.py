@@ -6,8 +6,8 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from agent_hub_host.agent import Journal
-from agent_hub_host.launch_reaper import initialize, remember, reap_expired_launches, observation_thread
+from hub2_agent_hub_host.agent import Journal
+from hub2_agent_hub_host.launch_reaper import initialize, remember, reap_expired_launches, observation_thread
 
 
 class LaunchReaperTests(unittest.TestCase):
@@ -114,7 +114,7 @@ class LaunchReaperTests(unittest.TestCase):
         def timeout():
             raise subprocess.TimeoutExpired(['a','list','--all','--json'],5)
         self.bridge.launcher=SimpleNamespace(inventory=timeout)
-        with self.assertLogs('agent_hub_host.launch_reaper',level='WARNING'):
+        with self.assertLogs('hub2_agent_hub_host.launch_reaper',level='WARNING'):
             self.settle()
         self.assertEqual(self.state(),'aborting')
         self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0],0)
@@ -142,7 +142,7 @@ class LaunchReaperTests(unittest.TestCase):
         self.assertTrue(thread.is_alive())
         self.assertEqual(len(calls),1)  # single in-flight, not once per row or sweep
         release.set()
-        with self.assertLogs('agent_hub_host.launch_reaper',level='WARNING'):
+        with self.assertLogs('hub2_agent_hub_host.launch_reaper',level='WARNING'):
             thread.join(5)
         for _ in range(3):
             reap_expired_launches(self.bridge,2000)  # inside the failure backoff
@@ -238,7 +238,7 @@ class LaunchReaperTests(unittest.TestCase):
 
 class BridgeResponsivenessTests(unittest.TestCase):
     def test_reconcile_stays_responsive_while_census_is_blocked_for_many_rows(self):
-        from agent_hub_host.agent import Bridge
+        from hub2_agent_hub_host.agent import Bridge
         with tempfile.TemporaryDirectory() as temp:
             journal = Journal(Path(temp)/'journal.sqlite')
             release = threading.Event()

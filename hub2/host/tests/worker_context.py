@@ -7,8 +7,8 @@ from pathlib import Path
 import subprocess
 import shutil
 import sys
-from agent_hub_host.agent import Bridge,Journal
-from agent_hub_host.client import Client,save_config
+from hub2_agent_hub_host.agent import Bridge,Journal
+from hub2_agent_hub_host.client import Client,save_config
 
 
 def main():
@@ -48,7 +48,7 @@ def main():
         env=os.environ.copy()
         for key in ('HUB2_TOKEN','HUB2_SERVER'):env.pop(key,None)
         own='/api/intakes/'+offer['intake_id']+'?project='+offer['project_id']
-        result=subprocess.run([sys.executable,'-m','agent_hub_host.cli','--config',context,'request','GET',own],
+        result=subprocess.run([sys.executable,'-m','hub2_agent_hub_host.cli','--config',context,'request','GET',own],
                               env=env,capture_output=True,text=True,timeout=15)
         assert result.returncode==0,'assigned_child_read_denied'
         for secret in (config['token'],private['token']):assert secret not in result.stdout+result.stderr

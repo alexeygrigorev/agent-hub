@@ -7,8 +7,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_hub_host.native_inventory import collect_native_inventory
-from agent_hub_host.native_launch import NativeLauncher
+from hub2_agent_hub_host.native_inventory import collect_native_inventory
+from hub2_agent_hub_host.native_launch import NativeLauncher
 
 
 class NativeInventoryTests(unittest.TestCase):
@@ -53,9 +53,9 @@ class NativeInventoryTests(unittest.TestCase):
                 collect_native_inventory(self.query(value))
         with self.assertRaisesRegex(RuntimeError, 'native_census_unavailable'):
             collect_native_inventory(self.query([], 1))
-        with patch('agent_hub_host.native_inventory.MAX_CENSUS_ROWS', 0), self.assertRaises(RuntimeError):
+        with patch('hub2_agent_hub_host.native_inventory.MAX_CENSUS_ROWS', 0), self.assertRaises(RuntimeError):
             collect_native_inventory(self.query([row]))
-        with patch('agent_hub_host.native_inventory.MAX_CENSUS_BYTES', 1), self.assertRaises(RuntimeError):
+        with patch('hub2_agent_hub_host.native_inventory.MAX_CENSUS_BYTES', 1), self.assertRaises(RuntimeError):
             collect_native_inventory(self.query([]))
 
     def test_deleted_workspace_matches_and_a_stale_snapshot_cannot_close(self):
@@ -63,13 +63,13 @@ class NativeInventoryTests(unittest.TestCase):
         row = {**self.native_row(), 'workspace': workspace + ' (deleted)'}
         inventory = collect_native_inventory(self.query([row]))
         self.assertIsNone(inventory.absence_evidence(workspace, row['tag']))
-        with patch('agent_hub_host.native_inventory.time.monotonic', return_value=inventory.observed_monotonic+6):
+        with patch('hub2_agent_hub_host.native_inventory.time.monotonic', return_value=inventory.observed_monotonic+6):
             with self.assertRaisesRegex(RuntimeError, 'native_census_stale'):
                 inventory.absence_evidence(workspace, 'task-hub2-missing')
 
 
     def test_full_publication_chunks_are_bounded_sanitized_and_digest_exact(self):
-        from agent_hub_host.client import Client
+        from hub2_agent_hub_host.client import Client
         import hashlib
         rows = [{**self.native_row(), 'id': '11111111-1111-4111-8111-%012d' % i,
                  'workspace': '/work/' + 'é' * 500, 'cwd': '/work/peer',
@@ -124,7 +124,7 @@ class NativeInventoryTests(unittest.TestCase):
         self.assertEqual(empty[0]['data'], '[]')
 
     def test_publication_unavailable_does_not_abort_managed_heartbeat(self):
-        from agent_hub_host.agent import Bridge
+        from hub2_agent_hub_host.agent import Bridge
         from types import SimpleNamespace
         from unittest.mock import Mock
         bridge = Bridge.__new__(Bridge)
@@ -134,7 +134,7 @@ class NativeInventoryTests(unittest.TestCase):
                                           inventory=Mock(side_effect=RuntimeError('secret-do-not-log')))
         bridge.client = SimpleNamespace(heartbeat=Mock(), publish_native_inventory=Mock())
         bridge.live_sessions = lambda: []
-        with self.assertLogs('agent_hub_host.agent', level='WARNING') as logs:
+        with self.assertLogs('hub2_agent_hub_host.agent', level='WARNING') as logs:
             bridge.heartbeat([])
             bridge._native_inventory_thread.join(timeout=1)
         bridge.client.heartbeat.assert_called_once()
@@ -142,13 +142,13 @@ class NativeInventoryTests(unittest.TestCase):
         self.assertNotIn('secret-do-not-log', str(logs.output))
         bridge.launcher.inventory = lambda: collect_native_inventory(self.query([]))
         bridge.client.publish_native_inventory.side_effect = RuntimeError('upload refused 404/503')
-        with self.assertLogs('agent_hub_host.agent', level='WARNING'):
+        with self.assertLogs('hub2_agent_hub_host.agent', level='WARNING'):
             bridge.heartbeat([])
             bridge._native_inventory_thread.join(timeout=1)
         self.assertEqual(bridge.client.heartbeat.call_count, 2)
 
     def test_slow_census_never_delays_heartbeats_and_only_one_worker_runs(self):
-        from agent_hub_host.agent import Bridge
+        from hub2_agent_hub_host.agent import Bridge
         from types import SimpleNamespace
         from unittest.mock import Mock
         import threading
@@ -177,7 +177,7 @@ class NativeInventoryTests(unittest.TestCase):
         bridge.client.publish_native_inventory.assert_called_once()
 
     def test_blocked_observation_does_not_delay_real_serve_connect_or_stop_dispatch(self):
-        from agent_hub_host.agent import Bridge, Journal
+        from hub2_agent_hub_host.agent import Bridge, Journal
         from types import SimpleNamespace
         from unittest.mock import Mock
         import tempfile
@@ -228,7 +228,7 @@ class NativeInventoryTests(unittest.TestCase):
                     journal.close_thread()
 
     def test_late_collection_after_shutdown_cannot_publish(self):
-        from agent_hub_host.agent import Bridge
+        from hub2_agent_hub_host.agent import Bridge
         from types import SimpleNamespace
         from unittest.mock import Mock
         import threading
@@ -255,7 +255,7 @@ class NativeInventoryTests(unittest.TestCase):
         self.assertEqual(bridge.client.heartbeat.call_count, 2)
 
     def test_cancelled_upload_does_not_send_remaining_chunks(self):
-        from agent_hub_host.client import Client
+        from hub2_agent_hub_host.client import Client
         import threading
         stop = threading.Event()
         rows = [{**self.native_row(), 'id': '11111111-1111-4111-8111-%012d' % i,
@@ -269,14 +269,14 @@ class NativeInventoryTests(unittest.TestCase):
         self.assertEqual(request.call_count, 1)
 
     def test_publication_stops_on_first_error_and_deadline_without_retrying_forever(self):
-        from agent_hub_host.client import Client, ApiError
+        from hub2_agent_hub_host.client import Client, ApiError
         inventory = collect_native_inventory(self.query([self.native_row()]))
         client = Client('https://hub.test')
         with patch.object(client, 'request', side_effect=ApiError('unavailable')) as request:
             with self.assertRaises(ApiError):
                 client.publish_native_inventory('h1', inventory)
             self.assertEqual(request.call_count, 1)
-        with patch('agent_hub_host.client.time.monotonic', side_effect=[0, 30]), patch('agent_hub_host.native_inventory.NativeInventory.fresh', return_value=True), patch.object(client, 'request') as request:
+        with patch('hub2_agent_hub_host.client.time.monotonic', side_effect=[0, 30]), patch('hub2_agent_hub_host.native_inventory.NativeInventory.fresh', return_value=True), patch.object(client, 'request') as request:
             with self.assertRaisesRegex(ApiError, 'deadline'):
                 client.publish_native_inventory('h1', inventory)
             request.assert_not_called()

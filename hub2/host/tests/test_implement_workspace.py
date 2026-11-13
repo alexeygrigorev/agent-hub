@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_hub_host.implement_workspace import prepare_workspace
+from hub2_agent_hub_host.implement_workspace import prepare_workspace
 
 
 class ImplementWorkspaceTests(unittest.TestCase):
@@ -43,7 +43,7 @@ class ImplementWorkspaceTests(unittest.TestCase):
         self.assertEqual(self.git(first, 'rev-parse', 'HEAD'), expected)
         self.assertEqual(self.git(self.shared, 'branch', '--show-current'), 'old-merged-feature')
         (first / 'tracked').write_text('work in progress')
-        with patch('agent_hub_host.implement_workspace.subprocess.run', wraps=subprocess.run) as run:
+        with patch('hub2_agent_hub_host.implement_workspace.subprocess.run', wraps=subprocess.run) as run:
             self.assertEqual(prepare_workspace(self.shared, None, 'intake-1', 'org/repo'), first)
             self.assertEqual(prepare_workspace(first, 'implement', 'intake-1', 'org/repo'), first)
             self.assertFalse(any('fetch' in call.args[0] for call in run.call_args_list))

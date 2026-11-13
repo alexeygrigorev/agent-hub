@@ -3,8 +3,8 @@ from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock,patch
-from agent_hub_host.agent import Bridge,Journal
-from agent_hub_host.client import Client,ApiError
+from hub2_agent_hub_host.agent import Bridge,Journal
+from hub2_agent_hub_host.client import Client,ApiError
 
 class BudgetTests(unittest.TestCase):
     def test_real_http_budget_deadline_and_no_secret_error(self):
@@ -65,7 +65,7 @@ class BudgetTests(unittest.TestCase):
         bridge.budget_paused_until=int(time.time()*1000)+60000
         bridge.budget_safety_paused_until=bridge.budget_paused_until
         bridge.reconcile=Mock();bridge.heartbeat=Mock()
-        with patch('agent_hub_host.agent.time.sleep',side_effect=KeyboardInterrupt):
+        with patch('hub2_agent_hub_host.agent.time.sleep',side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):bridge.serve('machine-1',[])
         bridge.reconcile.assert_called_once();bridge.client.socket.assert_not_called()
         bridge.journal.flush.assert_not_called();bridge.heartbeat.assert_not_called()
@@ -94,7 +94,7 @@ class BudgetTests(unittest.TestCase):
                 (SimpleNamespace(HOST_VERSION='bad',PROTOCOL_VERSION=1),False,'/api/connect'),
             ]
             for module,safety,path in cases:
-                with self.subTest(path=path,module=module), patch.dict(sys.modules,{'agent_hub_host._release':module}):
+                with self.subTest(path=path,module=module), patch.dict(sys.modules,{'hub2_agent_hub_host._release':module}):
                     with self.assertRaises(ApiError) as caught:
                         client.socket('machine-1',safety=safety)
                     self.assertEqual(caught.exception.retry_at,deadline)

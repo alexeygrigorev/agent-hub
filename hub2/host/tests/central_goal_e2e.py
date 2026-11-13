@@ -12,7 +12,7 @@ import uuid
 from urllib.parse import quote, urlencode
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from agent_hub_host.client import ApiError, Client, private_file, save_config
+from hub2_agent_hub_host.client import ApiError, Client, private_file, save_config
 
 
 def require(value, reason):
@@ -113,7 +113,7 @@ def main(args):
         private_file(output / 'host.log')
         environment = os.environ.copy()
         environment['PYTHONPATH'] = str(Path(__file__).resolve().parents[1])
-        agent = subprocess.Popen([sys.executable, '-m', 'agent_hub_host.cli', '--config', str(machine_path), 'serve'],
+        agent = subprocess.Popen([sys.executable, '-m', 'hub2_agent_hub_host.cli', '--config', str(machine_path), 'serve'],
                                  env=environment, stdout=host_log, stderr=host_log, start_new_session=os.name != 'nt')
         # This is an explicit, isolated test capability, bound to reviewed runtime
         # source and approved central credential fingerprint. It is never a

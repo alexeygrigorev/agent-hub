@@ -128,10 +128,10 @@ test('actual Python heartbeat with empty local auth composes with the normal mod
  try{
   const script=`import sys,os,json,pathlib,types
 sys.path.insert(0,sys.argv[1])
-from agent_hub_host.agent import Bridge
-import agent_hub_host.agent as agent_module
-from agent_hub_host.local_auth_readiness import local_claude_missing_contexts
-from agent_hub_host.native_launch import NativeLauncher
+from hub2_agent_hub_host.agent import Bridge
+import hub2_agent_hub_host.agent as agent_module
+from hub2_agent_hub_host.local_auth_readiness import local_claude_missing_contexts
+from hub2_agent_hub_host.native_launch import NativeLauncher
 home=pathlib.Path(sys.argv[2]);binary=home/'bin';binary.mkdir(mode=0o700)
 for name in ('claude','codex'):
  path=binary/name;path.write_bytes(bytes([127,69,76,70])+bytes(60));path.chmod(0o700)

@@ -27,7 +27,7 @@ def enroll(client, save_config, config_path, roots, engines, code, *, local_prof
 
 
 def main():
-    from agent_hub_host.client import Client, save_config
+    from hub2_agent_hub_host.client import Client, save_config
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--server', default='https://hub.dtcdev.click')
     parser.add_argument('--config', type=Path, default=Path.home() / '.config/agent-hub/v2.json')

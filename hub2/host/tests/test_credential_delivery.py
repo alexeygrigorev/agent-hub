@@ -15,9 +15,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from agent_hub_host import credential_delivery as delivery
-from agent_hub_host.agent import Bridge, Journal
-from agent_hub_host.client import ApiError
+from hub2_agent_hub_host import credential_delivery as delivery
+from hub2_agent_hub_host.agent import Bridge, Journal
+from hub2_agent_hub_host.client import ApiError
 
 REVISION = '11111111-2222-3333-4444-555555555555'
 SECRET = 'sk-ant-SECRET-token-value'

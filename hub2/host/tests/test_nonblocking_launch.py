@@ -9,9 +9,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from agent_hub_host.agent import Bridge, Journal
-from agent_hub_host.client import ApiError
-from agent_hub_host.native_launch import NativeLauncher, LOCAL_ROUTES
+from hub2_agent_hub_host.agent import Bridge, Journal
+from hub2_agent_hub_host.client import ApiError
+from hub2_agent_hub_host.native_launch import NativeLauncher, LOCAL_ROUTES
 
 
 class StopServe(BaseException):
@@ -40,7 +40,7 @@ class NonblockingLaunchTests(unittest.TestCase):
             bridge.budget_paused_until = bridge.budget_safety_paused_until = 0
             bridge.heartbeat, bridge.reconcile = Mock(), Mock()
             try:
-                with self.assertLogs('agent_hub_host.agent', level='ERROR') as logs:
+                with self.assertLogs('hub2_agent_hub_host.agent', level='ERROR') as logs:
                     with self.assertRaises(StopServe):
                         bridge.serve('machine', [])
                 self.assertTrue(socket.recv.called, 'poison receipt prevented socket processing')

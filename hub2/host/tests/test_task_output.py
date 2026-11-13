@@ -10,9 +10,9 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from agent_hub_host import task_output as output
-from agent_hub_host import native_launch
-from agent_hub_host.client import Client
+from hub2_agent_hub_host import task_output as output
+from hub2_agent_hub_host import native_launch
+from hub2_agent_hub_host.client import Client
 
 
 class TaskOutputTest(unittest.TestCase):

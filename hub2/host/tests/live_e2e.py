@@ -11,7 +11,7 @@ from pathlib import Path
 from urllib.parse import quote, urlencode
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from agent_hub_host.client import ApiError, Client, private_file, save_config
+from hub2_agent_hub_host.client import ApiError, Client, private_file, save_config
 
 
 def write_private(path, value):
@@ -89,7 +89,7 @@ def run(args):
         # repo here is hub2; host package must take priority over the old Hub package.
         log = (output / "host.log").open("w")
         private_file(output / "host.log")
-        agent = subprocess.Popen([sys.executable, "-m", "agent_hub_host.cli", "--config", str(machine_path), "serve"],
+        agent = subprocess.Popen([sys.executable, "-m", "hub2_agent_hub_host.cli", "--config", str(machine_path), "serve"],
                                  env=environment, stdout=log, stderr=log, start_new_session=os.name != "nt")
         started = operator.request("POST", "/api/intakes/" + intake["id"] + "/start?" + urlencode({"project": project}), {
             "machine_id": machine, "key": "start-" + suffix,
