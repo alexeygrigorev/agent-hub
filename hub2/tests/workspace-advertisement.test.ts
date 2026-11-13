@@ -54,3 +54,16 @@ test('workspace allowance does not widen the ordinary capability or engine bound
   assert.equal((await f.call('/api/heartbeat',{labels:[],engines:Array(33).fill('codex'),capabilities:[]})).status,400);
  }finally{f.database.close();}
 });
+
+test('qualified repository tokens retain the 64-character label and 2048-workspace bounds',async()=>{
+ const f=fixture();try{
+  const workspaces=Array.from({length:2048},(_,i)=>'workspace:repo-'+i.toString(16).padStart(59,'0'));
+  assert.equal(workspaces[0].slice('workspace:'.length).length,64);
+  const capabilities=['headless','repo-identity:v1',...Array.from({length:30},(_,i)=>'tool:item'+i),...workspaces];
+  assert.equal((await f.call('/api/heartbeat',{labels:[],engines:['codex'],capabilities})).status,200);
+  f.socket('live',1);
+  const view=await(await f.call('/_internal/routing-snapshot')).json() as any;
+  assert.deepEqual(new Set(view.capabilities),new Set(capabilities));
+  assert.equal((await f.call('/api/heartbeat',{labels:[],engines:['codex'],capabilities:[...capabilities,'workspace:repo-'+(2048).toString(16).padStart(59,'0')]})).status,400);
+ }finally{f.database.close();}
+});

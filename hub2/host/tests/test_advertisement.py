@@ -1,11 +1,14 @@
+import os
 import tempfile
 import unittest
 import sys
 from pathlib import Path
 from unittest.mock import Mock, MagicMock, patch
 
-from agent_hub_host.advertisement import Advertisement
+from agent_hub_host.advertisement import Advertisement, INVENTORY_OVERFLOW_TAG
 from agent_hub_host.agent import Bridge
+from agent_hub_host.repository_identity import (REPOSITORY_IDENTITY_CAPABILITY, _read_regular,
+                                                 normalize_git_origin, qualified_workspace)
 
 
 class AdvertisementTests(unittest.TestCase):
@@ -24,7 +27,7 @@ class AdvertisementTests(unittest.TestCase):
 
     def test_rejects_escalation_tags_and_invalid_shapes(self):
         for value in [['headless'], ['credentials:local:interactive:codex:codex'], ['workspace:home'],
-                      ['grant:browser'], ['tool:bad tag'], 'browser:orin-chrome', [None]]:
+                      ['grant:browser'], ['tool:bad tag'], ['repo-identity:v1'], 'browser:orin-chrome', [None]]:
             with self.subTest(value=value), self.assertRaises(ValueError):
                 Advertisement([self.root], value)
         for value in [{'home': str(self.home), 'HOME': str(self.home)}, {'../home': str(self.home)},
@@ -82,7 +85,8 @@ class AdvertisementTests(unittest.TestCase):
             Advertisement([self.root], ['tool:item' + str(i) for i in range(32)], {'home': str(self.home)})
 
     def bridge(self, **kwargs):
-        bridge = Bridge(Mock(), None, [self.root], ['codex'], executable=sys.executable,
+        roots = kwargs.pop('roots', [self.root])
+        bridge = Bridge(Mock(), None, roots, ['codex'], executable=sys.executable,
                         launcher_config={'private_provider_homes': True}, **kwargs)
         bridge.launcher.capabilities = lambda: {'codex': {'headless', 'interactive', 'effort'}}
         return bridge
@@ -94,6 +98,7 @@ class AdvertisementTests(unittest.TestCase):
         bridge.heartbeat(['desktop'], include_native_sessions=False)
         tags = bridge.client.heartbeat.call_args.args[2]
         self.assertTrue({'browser:orin-chrome', 'tool:agent-browser', 'workspace:home', 'effort:codex'} <= set(tags))
+        self.assertIn(REPOSITORY_IDENTITY_CAPABILITY, tags)
         self.home.rmdir()
         bridge.heartbeat([], include_native_sessions=False)
         self.assertNotIn('workspace:home', bridge.client.heartbeat.call_args.args[2])
@@ -117,12 +122,28 @@ class AdvertisementTests(unittest.TestCase):
         self.assertEqual(len(tags), 32)
         self.assertTrue({'tool:item' + str(i) for i in range(31)} <= set(tags))
         self.assertIn('headless', tags)
+        self.assertNotIn(REPOSITORY_IDENTITY_CAPABILITY, tags)
+
+    def test_full_nonworkspace_budget_disables_repo_identity_without_losing_bare_labels(self):
+        self.clone_with_origin(self.root, 'legacy-name', 'https://github.com/org/legacy-name.git')
+        bridge = self.bridge(capabilities=['tool:item' + str(i) for i in range(31)])
+        bridge.heartbeat([], include_native_sessions=False)
+        tags = bridge.client.heartbeat.call_args.args[2]
+        self.assertIn('workspace:legacy-name', tags)
+        self.assertIn(INVENTORY_OVERFLOW_TAG, tags)
+        self.assertNotIn('workspace:' + qualified_workspace('https://github.com/org/legacy-name'), tags)
+        self.assertNotIn(REPOSITORY_IDENTITY_CAPABILITY, tags)
 
 
     def clone(self, root, name):
         path = root / name
         path.mkdir()
         (path / '.git').mkdir()
+        return path
+
+    def clone_with_origin(self, root, name, origin):
+        path = self.clone(root, name)
+        (path / '.git' / 'config').write_text('[remote "origin"]\n\turl = "' + origin + '"\n', encoding='utf-8')
         return path
 
     def test_clone_created_after_enrollment_is_advertised_and_resolved(self):
@@ -169,6 +190,242 @@ class AdvertisementTests(unittest.TestCase):
         self.assertTrue({'headless', 'interactive:codex', 'effort:codex'} <= set(tags))
         self.assertEqual(len([tag for tag in tags if tag.startswith('workspace:')]), 80)
 
+    def test_many_checkouts_with_one_origin_consume_one_qualified_tag(self):
+        bridge = self.bridge()
+        for index in range(80):
+            self.clone_with_origin(self.root, 'replica-' + str(index),
+                                   'https://github.com/org/shared-origin.git')
+        bridge.heartbeat([], include_native_sessions=False)
+        tags = bridge.client.heartbeat.call_args.args[2]
+        self.assertEqual(len([tag for tag in tags if tag.startswith('workspace:')]), 81)
+        self.assertIn('workspace:' + qualified_workspace('https://github.com/org/shared-origin'), tags)
+        self.assertIn(REPOSITORY_IDENTITY_CAPABILITY, tags)
+
+    def test_repository_identity_matches_registry_https_and_checkout_ssh_vector(self):
+        registry = 'https://github.com/AI-Shipping-Labs/Website.git'
+        checkout = 'git@github.com:ai-shipping-labs/website.git'
+        self.assertEqual(normalize_git_origin(registry), 'github.com/ai-shipping-labs/website')
+        self.assertEqual(normalize_git_origin(checkout), normalize_git_origin(registry))
+        self.assertEqual(qualified_workspace(registry), 'repo-948832775e82e294b99d190121d47ac86ec4986811a36b2c505e3a6f802')
+        self.assertEqual(qualified_workspace('https://user:secret@github.com/owner/repo.git'),
+                         qualified_workspace('ssh://git@github.com:22/OWNER/REPO'))
+        self.assertIsNone(normalize_git_origin('https://github.com/owner/repo?token=secret'))
+
+    def test_same_basename_different_origins_resolve_distinct_repositories(self):
+        first_root, second_root = self.root / 'owner-a', self.root / 'owner-b'
+        first_root.mkdir(); second_root.mkdir()
+        first = self.clone_with_origin(first_root, 'project', 'https://github.com/owner-a/project.git')
+        second = self.clone_with_origin(second_root, 'project', 'git@github.com:owner-b/project.git')
+        bridge = self.bridge(roots=[first_root, second_root])
+        first_token = qualified_workspace('https://github.com/owner-a/project')
+        second_token = qualified_workspace('https://github.com/owner-b/project')
+        tags = bridge.advertisement.tags()
+        self.assertNotIn('workspace:project', tags)
+        self.assertIn('workspace:' + first_token, tags)
+        self.assertIn('workspace:' + second_token, tags)
+        self.assertEqual(bridge.resolve_workspace(first_token), first)
+        self.assertEqual(bridge.resolve_workspace(second_token), second)
+
+    def test_wrong_origin_content_is_skipped_and_renamed_correct_clone_is_selected(self):
+        shipping = self.root / 'AI-Shipping-Labs'
+        shipping.mkdir()
+        wrong = self.clone_with_origin(shipping, 'content', 'https://github.com/AI-Shipping-Labs/content.git')
+        renamed = self.clone_with_origin(shipping, 'workshops-content-copy',
+                                         'git@github.com:AI-Shipping-Labs/workshops-content.git')
+        token = qualified_workspace('https://github.com/AI-Shipping-Labs/workshops-content')
+        bridge = self.bridge(roots=[shipping])
+        self.assertEqual(bridge.resolve_workspace(token), renamed)
+        self.assertNotEqual(bridge.resolve_workspace(token), wrong)
+        self.assertIn('workspace:' + token, bridge.advertisement.tags())
+
+    def test_hidden_clone_names_advertise_only_origin_identity(self):
+        agents = self.clone_with_origin(self.root, '.agents', 'https://github.com/alexeygrigorev/agents.git')
+        codex = self.clone_with_origin(self.root, '.codex', 'https://github.com/alexeygrigorev/codex.git')
+        bridge = self.bridge()
+        tags = bridge.advertisement.tags()
+        self.assertIn('workspace:' + qualified_workspace('https://github.com/alexeygrigorev/agents'), tags)
+        self.assertIn('workspace:' + qualified_workspace('https://github.com/alexeygrigorev/codex'), tags)
+        self.assertNotIn('workspace:.agents', tags)
+        self.assertNotIn('workspace:.codex', tags)
+        self.assertEqual(bridge.resolve_workspace(qualified_workspace('https://github.com/alexeygrigorev/agents')), agents)
+        self.assertEqual(bridge.resolve_workspace(qualified_workspace('https://github.com/alexeygrigorev/codex')), codex)
+
+    def test_multiple_same_origin_clones_choose_canonical_basename_then_stable_path(self):
+        canonical = self.clone_with_origin(self.root, 'canonical-project', 'https://github.com/org/canonical-project.git')
+        self.clone_with_origin(self.root, 'z-renamed', 'git@github.com:org/canonical-project.git')
+        self.clone_with_origin(self.root, 'a-renamed', 'https://github.com/org/canonical-project')
+        bridge = self.bridge()
+        token = qualified_workspace('https://github.com/org/canonical-project')
+        self.assertEqual(bridge.resolve_workspace(token), canonical)
+        canonical_config = canonical / '.git' / 'config'
+        canonical_config.unlink()
+        self.assertEqual(bridge.resolve_workspace(token), self.root / 'a-renamed')
+
+    def test_worktree_commondir_and_ssh_origin_match_registry_https(self):
+        main = self.root / 'main-checkout'
+        common = main / '.git'
+        worktree_admin = common / 'worktrees' / 'task'
+        worktree_admin.mkdir(parents=True)
+        main.mkdir(exist_ok=True)
+        (common / 'config').write_text('[remote "origin"]\n\turl = https://github.com/Org/Project.git\n', encoding='utf-8')
+        (worktree_admin / 'commondir').write_text('../..\n', encoding='utf-8')
+        worktree = self.root / 'project'
+        worktree.mkdir()
+        (worktree / '.git').write_text('gitdir: ../main-checkout/.git/worktrees/task\n', encoding='utf-8')
+        bridge = self.bridge()
+        token = qualified_workspace('https://github.com/org/project')
+        self.assertIn('workspace:' + token, bridge.advertisement.tags())
+        self.assertEqual(bridge.resolve_workspace(token), worktree)
+
+    def test_worktree_commondir_pointer_cannot_escape_enrolled_roots(self):
+        worktree = self.root / 'linked'
+        gitdir = self.root / 'common.git' / 'worktrees' / 'linked'
+        worktree.mkdir()
+        (gitdir / 'info').mkdir(parents=True)
+        outside_temp = tempfile.TemporaryDirectory(dir=self.root.parent)
+        self.addCleanup(outside_temp.cleanup)
+        outside = Path(outside_temp.name)
+        (outside / 'config').write_text(
+            '[remote "origin"]\n\turl = https://github.com/org/escaped.git\n', encoding='utf-8')
+        (gitdir / 'commondir').write_text(str(outside) + '\n', encoding='utf-8')
+        (worktree / '.git').write_text('gitdir: ../common.git/worktrees/linked\n', encoding='utf-8')
+        bridge = self.bridge()
+        token = qualified_workspace('https://github.com/org/escaped')
+        self.assertNotIn('workspace:' + token, bridge.advertisement.tags())
+        with self.assertRaisesRegex(ValueError, 'workspace_identity_unavailable'):
+            bridge.resolve_workspace(token)
+
+    def test_stale_origin_symlink_escape_and_reserved_token_never_fall_back(self):
+        url = 'https://github.com/org/expected.git'
+        repo = self.clone_with_origin(self.root, 'expected', url)
+        token = qualified_workspace(url)
+        bridge = self.bridge()
+        self.assertEqual(bridge.resolve_workspace(token), repo)
+        (repo / '.git' / 'config').write_text('[remote "origin"]\n\turl = https://github.com/other/expected.git\n', encoding='utf-8')
+        self.assertNotIn('workspace:' + token, bridge.advertisement.tags())
+        with self.assertRaisesRegex(ValueError, 'workspace_identity_unavailable'):
+            bridge.resolve_workspace(token)
+
+        outside_temp = tempfile.TemporaryDirectory(dir=self.root.parent)
+        self.addCleanup(outside_temp.cleanup)
+        outside = Path(outside_temp.name)
+        outside_config = outside / 'config'
+        outside_config.write_text('[remote "origin"]\n\turl = ' + url + '\n', encoding='utf-8')
+        (repo / '.git').rename(repo / '.git.safe')
+        try:
+            (repo / '.git').symlink_to(outside, target_is_directory=True)
+        except OSError:
+            self.skipTest('symlink unavailable')
+        with self.assertRaisesRegex(ValueError, 'workspace_identity_unavailable'):
+            bridge.resolve_workspace(token)
+
+        reserved = self.root / token
+        reserved.mkdir()
+        with self.assertRaisesRegex(ValueError, 'workspace_identity_unavailable'):
+            bridge.resolve_workspace(token)
+        reserved.rmdir()
+
+        impostor = self.clone_with_origin(self.root, token, 'https://github.com/org/not-expected.git')
+        alias_bridge = self.bridge(workspaces={token: str(impostor)})
+        self.assertIn('workspace:' + token, alias_bridge.advertisement.tags())
+        with self.assertRaisesRegex(ValueError, 'workspace_identity_unavailable'):
+            alias_bridge.resolve_workspace(token)
+
+    def test_identity_observation_is_bounded_and_does_not_invoke_git(self):
+        repo = self.clone_with_origin(self.root, 'bounded', 'https://github.com/org/bounded.git')
+        observed = Advertisement([self.root])
+        with patch('subprocess.run', side_effect=AssertionError('Git subprocess is forbidden')):
+            self.assertIn('workspace:' + qualified_workspace('https://github.com/org/bounded'), observed.tags())
+        with patch('agent_hub_host.advertisement.MAX_ROOT_ENTRIES', 0):
+            tags = observed.tags()
+        self.assertIn('workspace:inventory-overflow', tags)
+        self.assertNotIn('workspace:bounded', tags)
+        self.assertNotIn('workspace:' + qualified_workspace('https://github.com/org/bounded'), tags)
+
+    def test_git_config_read_limit_and_includes_fail_closed_even_with_direct_origin(self):
+        repo = self.clone_with_origin(self.root, 'limited', 'https://github.com/org/limited.git')
+        with patch('agent_hub_host.repository_identity.MAX_GIT_METADATA_BYTES', 16):
+            tags = Advertisement([self.root]).tags()
+        self.assertIn('workspace:limited', tags)  # the legacy label remains observable
+        self.assertNotIn('workspace:' + qualified_workspace('https://github.com/org/limited'), tags)
+
+        included = tempfile.TemporaryDirectory(dir=self.root.parent)
+        self.addCleanup(included.cleanup)
+        included_path = Path(included.name) / 'config'
+        included_path.write_text('[remote "origin"]\n\turl = https://github.com/org/included.git\n', encoding='utf-8')
+        direct = 'https://github.com/org/limited.git'
+        (repo / '.git' / 'config').write_text(
+            '[remote "origin"]\n\turl = ' + direct + '\n[include]\n\tpath = ' + str(included_path) + '\n',
+            encoding='utf-8')
+        self.assertIsNone(Advertisement([self.root])._observe()[1].get(
+            qualified_workspace(direct)))
+        self.assertIsNone(Advertisement([self.root])._observe()[1].get(
+            qualified_workspace('https://github.com/org/included')))
+
+    def test_inactive_worktree_config_cannot_fabricate_origin_and_enabled_empty_override_is_applied(self):
+        worktree = self.root / 'linked'
+        gitdir = self.root / 'common.git' / 'worktrees' / 'linked'
+        common = self.root / 'common.git'
+        worktree.mkdir()
+        (gitdir / 'info').mkdir(parents=True)
+        (common / 'config').write_text('[remote "origin"]\n\turl = https://github.com/org/common.git\n', encoding='utf-8')
+        (gitdir / 'commondir').write_text('../..\n', encoding='utf-8')
+        (gitdir / 'config.worktree').write_text(
+            '[remote "origin"]\n\turl = https://github.com/org/inactive-spoof.git\n', encoding='utf-8')
+        (worktree / '.git').write_text('gitdir: ../common.git/worktrees/linked\n', encoding='utf-8')
+        observed = Advertisement([self.root])
+        self.assertIn(qualified_workspace('https://github.com/org/common'), observed._observe()[1])
+        self.assertNotIn(qualified_workspace('https://github.com/org/inactive-spoof'), observed._observe()[1])
+
+        (common / 'config').write_text(
+            '[extensions]\n\tworktreeConfig = true\n[remote "origin"]\n'
+            '\turl = https://github.com/org/common.git\n', encoding='utf-8')
+        (gitdir / 'config.worktree').write_text(
+            '[remote "origin"]\n\turl = ""\n\turl = https://github.com/org/worktree.git\n', encoding='utf-8')
+        origins = observed._observe()[1]
+        self.assertIn(qualified_workspace('https://github.com/org/worktree'), origins)
+        self.assertNotIn(qualified_workspace('https://github.com/org/common'), origins)
+
+    def test_regular_metadata_open_does_not_block_if_file_is_replaced_by_fifo(self):
+        metadata = self.root / 'metadata'
+        metadata.write_text('small')
+        real_open = os.open
+        flags_seen = []
+
+        def replace_with_fifo(path, flags):
+            if Path(path) == metadata:
+                metadata.unlink()
+                os.mkfifo(metadata)
+                flags_seen.append(flags)
+                self.assertTrue(flags & os.O_NONBLOCK)
+            return real_open(path, flags)
+
+        with patch('agent_hub_host.repository_identity.os.open', side_effect=replace_with_fifo):
+            self.assertIsNone(_read_regular(metadata))
+        self.assertEqual(len(flags_seen), 1)
+
+    def test_qualified_workspace_overflow_is_explicit_not_silently_truncated(self):
+        self.clone_with_origin(self.root, 'one', 'https://github.com/org/one.git')
+        self.clone_with_origin(self.root, 'two', 'https://github.com/org/two.git')
+        bridge = self.bridge()
+        with patch('agent_hub_host.advertisement.MAX_WORKSPACE_TAGS', 3):
+            tags = bridge.advertisement.tags()
+        self.assertIn('workspace:inventory-overflow', tags)
+        self.assertIn('workspace:one', tags)
+        self.assertIn('workspace:two', tags)
+        self.assertNotIn('workspace:' + qualified_workspace('https://github.com/org/one'), tags)
+        self.assertNotIn('workspace:' + qualified_workspace('https://github.com/org/two'), tags)
+
+    def test_digest_collision_is_not_advertised_or_resolved_as_an_identity(self):
+        first = self.clone_with_origin(self.root, 'first', 'https://github.com/owner-a/project.git')
+        self.clone_with_origin(self.root, 'second', 'https://github.com/owner-b/project.git')
+        bridge = self.bridge()
+        with patch('agent_hub_host.advertisement.workspace_token_from_origin', return_value='repo-' + 'a' * 59):
+            tags = bridge.advertisement.tags()
+            self.assertNotIn('workspace:' + 'repo-' + 'a' * 59, tags)
+            with self.assertRaisesRegex(ValueError, 'workspace_identity_unavailable'):
+                bridge.resolve_workspace('repo-' + 'a' * 59)
+
 
     def test_large_workspace_inventory_transport_allowance_is_heartbeat_only(self):
         from agent_hub_host.client import Client
@@ -180,6 +437,17 @@ class AdvertisementTests(unittest.TestCase):
         opener.open.return_value.__enter__.return_value.read.return_value = b'{}'
         with patch('urllib.request.build_opener', return_value=opener):
             Client('https://hub.test').request('POST', '/api/heartbeat', body)
+        qualified = ['workspace:repo-' + format(i, '059x') for i in range(2048)]
+        nonworkspace = ['headless', REPOSITORY_IDENTITY_CAPABILITY, *['tool:item' + str(i) for i in range(30)]]
+        native_sessions = [{'session_id': 'session-' + str(i).zfill(3),
+                            'native_id': 'native-' + str(i).zfill(3), 'phase': 'running',
+                            'last_activity_at': 1794543623525, 'exit_code': None,
+                            'containment_empty': True} for i in range(100)]
+        qualified_body = {'labels': [], 'engines': ['codex'], 'capabilities': [*nonworkspace, *qualified],
+                          'native_sessions': native_sessions}
+        self.assertLess(len(json.dumps(qualified_body).encode()), 262144)
+        with patch('urllib.request.build_opener', return_value=opener):
+            Client('https://hub.test').request('POST', '/api/heartbeat', qualified_body)
         for method, path in [('POST', '/api/sessions'), ('PUT', '/api/heartbeat')]:
             with self.subTest(path=path), self.assertRaisesRegex(ValueError, 'request too large'):
                 Client('https://hub.test').request(method, path, body)

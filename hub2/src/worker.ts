@@ -5,6 +5,7 @@ import { bodyObject, boundedText, error, HttpError, HUB2_FORWARD_BODY_LIMIT, jso
 import { pickModelRouteDetailed, simulateModelRoutes, type PickInput } from './model-picker';
 import { sessionPurpose } from './session-purpose';
 import { isLiveActiveSession, type LiveSession } from './session-liveness';
+import { qualifiedRepositoryWorkspace, REPOSITORY_IDENTITY_CAPABILITY } from './repository-identity';
 import type { Actor, Hub2Env, JsonRecord } from './types';
 
 const CONTROL = 'https://control.hub2.internal';
@@ -612,16 +613,13 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
   const purpose = sessionPurpose(body.purpose);
   const text = (field: string): string | undefined => typeof body[field] === 'string' && (body[field] as string).trim() ? (body[field] as string).trim() : undefined;
   const requestedProject = text('repo') ?? text('project');
-  const repoWorkspace = requestedProject && /^[A-Za-z0-9_.-]{1,80}\/[A-Za-z0-9_.-]{1,100}$/.test(requestedProject)
-    ? requestedProject.split('/').at(-1) : undefined;
-  const label = text('workspace') ?? repoWorkspace;
+  const label = text('workspace');
   // `--cwd` is the directory the session must run in (a task worktree). It is the launch workspace;
   // the label only names the project. Dropping it started sessions in the repository's label directory.
   const cwd = text('cwd');
   if (cwd !== undefined && (cwd.length > 1024 || cwd.includes('\0') || !(cwd.startsWith('/') || /^[A-Za-z]:\\/.test(cwd))))
     return error('invalid_cwd', 400, '--cwd must be an absolute path on the target host');
-  const workspace = cwd ?? label;
-  if (!workspace)
+  if (!cwd && !label && !requestedProject && !text('intake_task_id'))
     return error('workspace_required', 400, 'pass --repo owner/name to use that repository workspace, or --workspace <registered label or absolute target-host path>');
   const interactive = body.mode === 'interactive';
   const brief = text('brief');
@@ -669,9 +667,24 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
     }));
   }
   if (!repoBody.ok) return error('project_not_found_or_forbidden', repoBody.status === 403 ? 403 : 404, 'register it with: hub repos import / PATCH /api/repos/owner%2Fname');
-  const repo = (await repoBody.json()) as { repo?: { canonical_name?: string; status?: string } };
+  const repo = (await repoBody.json()) as { repo?: { canonical_name?: string; canonical_url?: string; status?: string } };
   if (repo.repo?.status !== 'active' || !repo.repo.canonical_name) return error('project_inactive', 409);
   const canonical = repo.repo.canonical_name;
+  let workspace = cwd ?? label;
+  let requiredCapabilities = Array.isArray(body.needs) ? body.needs : undefined;
+  const repoOnly = workspace === undefined && (requestedProject !== undefined || taskRef !== undefined);
+  if (repoOnly) {
+    // Identity is derived only from the registry's canonical record. Alias and
+    // caller spelling never become the placement key or a basename fallback.
+    // The 236-bit token binds identity; it grants no access by itself. The host
+    // must advertise new-protocol support and reread a unique full origin.
+    const qualified = await qualifiedRepositoryWorkspace(repo.repo.canonical_url);
+    if (!qualified) return error('repository_identity_unavailable', 409);
+    workspace = qualified;
+    requiredCapabilities = [...new Set([...(requiredCapabilities || []), REPOSITORY_IDENTITY_CAPABILITY])];
+  }
+  if (!workspace)
+    return error('workspace_required', 400, 'pass --repo owner/name to use that repository workspace, or --workspace <registered label or absolute target-host path>');
   const stub = env.PROJECTS.get(env.PROJECTS.idFromName(canonical));
   const call = async (path: string, payload: JsonRecord): Promise<{ response: Response; data: JsonRecord }> => {
     const response = await stub.fetch(await forwardRequest(
@@ -698,7 +711,7 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
     ...(text('effort') ? { effort: text('effort') } : {}),
     ...(text('tier') ? { tier: text('tier') } : {}),
     ...(text('engine_override_reason') ? { override_reason: text('engine_override_reason') } : {}),
-    ...(Array.isArray(body.needs) ? { required_capabilities: body.needs } : {}),
+    ...(requiredCapabilities ? { required_capabilities: requiredCapabilities } : {}),
   };
   const started = await call(`/api/intakes/${encodeURIComponent(intakeId)}/start`, start);
   const session = started.data.session as JsonRecord | undefined;

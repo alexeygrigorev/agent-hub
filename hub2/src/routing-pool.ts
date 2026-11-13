@@ -39,6 +39,20 @@ export type PickInput = {
   workspace?: string;
 };
 
+const REPOSITORY_IDENTITY_CAPABILITY = 'repo-identity:v1';
+const QUALIFIED_REPOSITORY_WORKSPACE = /^repo-[0-9a-f]{59}$/i;
+function isQualifiedRepositoryWorkspace(value: string | undefined): boolean {
+  return !!value && QUALIFIED_REPOSITORY_WORKSPACE.test(value);
+}
+function requiredCapabilitiesFor(input: PickInput): string[] {
+  return [...new Set([
+    input.interactive ? 'interactive' : 'headless',
+    ...(input.with_goal ? ['goal'] : []),
+    ...(isQualifiedRepositoryWorkspace(input.workspace) ? [REPOSITORY_IDENTITY_CAPABILITY] : []),
+    ...(input.required_capabilities || []),
+  ])];
+}
+
 export type RoutingPolicy = {version: unknown; candidates: Candidate[]};
 export type RoutingSnapshot = {policy: RoutingPolicy; accounts: Map<string, AccountView>; machines: Map<string, MachineView>; observed_at: number};
 
@@ -76,7 +90,7 @@ export function eligibleCandidates(policy: RoutingPolicy, input: PickInput): Can
   const override = !!(input.machine_id || input.engine || input.model || input.effort);
   if (input.override_reason && input.override_reason.length > 500)
     throw new HttpError('invalid_override_reason', 400);
-  const required = [...new Set([input.interactive ? 'interactive' : 'headless', ...(input.with_goal ? ['goal'] : []), ...(input.required_capabilities || [])])];
+  const required = requiredCapabilitiesFor(input);
   if (required.length > 32 || required.some(value => typeof value !== 'string' || !value || value.length > 80))
     throw new HttpError('invalid_required_capabilities', 400);
 
@@ -108,7 +122,7 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
   const accountIds = [...new Set(candidates.map(candidate => candidate.account_id))];
   const ids = new Set([...machines.keys()].sort());
   const override = !!(input.machine_id || input.engine || input.model || input.effort);
-  const required = [...new Set([input.interactive ? 'interactive' : 'headless', ...(input.with_goal ? ['goal'] : []), ...(input.required_capabilities || [])])];
+  const required = requiredCapabilitiesFor(input);
   for (const id of ids) if (machines.get(id)?.connected !== true) ids.delete(id);
   if (input.machine_id && !ids.has(input.machine_id) || !ids.size)
     throw new HttpError('no_connected_host', 503, JSON.stringify({machines:[...machines].map(([id,machine])=>({machine_id:id,connected:machine.connected===true,last_seen:machine.last_seen??null,age_ms:typeof machine.last_seen==='number'?Math.max(0,snapshot.observed_at-machine.last_seen):null}))}));
@@ -223,17 +237,31 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
   pool = narrow(pool, row => compatible.get(row.candidate.id)!.length > 0, () => 'capability_not_advertised');
   if (pool.some(row => compatible.get(row.candidate.id)!.length > 0))
     pool = pool.map(row => ({...row, hosts: compatible.get(row.candidate.id)!}));
-  // Workspace advertisements are optional placement hints. A missing label
-  // must not make every launch capability look unknown and restore an engine
-  // already excluded because another engine can satisfy the requested goal.
+  // Ordinary workspace advertisements are optional placement hints. A
+  // missing label must not restore an engine excluded by another hard check.
   const label = input.workspace && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(input.workspace)
     ? `workspace:${input.workspace.toLowerCase()}` : null;
   if (label) {
-    const workspaceHosts = new Map(pool.map(row => [row.candidate.id,
-      row.hosts.filter(id => machines.get(id)?.capabilities?.includes(label))]));
-    pool = narrow(pool, row => workspaceHosts.get(row.candidate.id)!.length > 0, () => 'capability_not_advertised');
-    if (pool.some(row => workspaceHosts.get(row.candidate.id)!.length > 0))
-      pool = pool.map(row => ({...row, hosts: workspaceHosts.get(row.candidate.id)!}));
+    const qualifiedRepository = isQualifiedRepositoryWorkspace(input.workspace);
+    if (qualifiedRepository) {
+      // Repo-only selectors are identities, not optional placement hints. Use
+      // only hosts that satisfy the ordinary engine/capability checks and also
+      // advertise the exact token; old hosts fail closed with no basename path.
+      pool = pool.flatMap(row => {
+        const hosts = (compatible.get(row.candidate.id) || []).filter(id =>
+          machines.get(id)?.capabilities?.includes(label));
+        return hosts.length ? [{...row, hosts}] : [];
+      });
+      if (!pool.length) throw new HttpError('repository_workspace_unavailable', 503);
+    } else {
+      // Ordinary explicit labels remain advisory: a missing observation must
+      // not make every launch capability look unknown or restore an excluded engine.
+      const workspaceHosts = new Map(pool.map(row => [row.candidate.id,
+        row.hosts.filter(id => machines.get(id)?.capabilities?.includes(label))]));
+      pool = narrow(pool, row => workspaceHosts.get(row.candidate.id)!.length > 0, () => 'capability_not_advertised');
+      if (pool.some(row => workspaceHosts.get(row.candidate.id)!.length > 0))
+        pool = pool.map(row => ({...row, hosts: workspaceHosts.get(row.candidate.id)!}));
+    }
   }
   for (const row of pool) if (row.localHosts.length) advisories.push({policy_id:row.candidate.id, account_id:row.candidate.account_id, reason:'local_login_unverified'});
   const others = pool.filter(row => !/luna/i.test(row.candidate.model)).map(row => row.base);

@@ -15,7 +15,8 @@ from pathlib import Path
 from .client import ApiError, private_file, save_config
 from . import native_launch, launch_reaper, credential_delivery
 from .implement_workspace import prepare_workspace
-from .advertisement import Advertisement
+from .advertisement import Advertisement, INVENTORY_OVERFLOW_TAG
+from .repository_identity import QUALIFIED_WORKSPACE, REPOSITORY_IDENTITY_CAPABILITY
 from .native_launch import NativeLauncher, LOCAL_ROUTES, UUID_RE, canonical, native_returncode, same_workspace, spawn_environment
 from .local_auth_readiness import local_claude_missing_contexts
 from .git_salvage import salvage_branch
@@ -264,6 +265,14 @@ class Bridge:
             return workspace
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value):
             raise ValueError("invalid_workspace")
+
+        # New repository-only starts carry a reserved qualified token. The host
+        # re-reads the checkout's Git metadata for every launch; older hosts
+        # without this mapping cannot pass the server's strict workspace match.
+        if QUALIFIED_WORKSPACE.fullmatch(value.lower()):
+            if value != value.lower():
+                raise ValueError("workspace_identity_unavailable")
+            return self.advertisement.resolve_repository(value)
 
         alias = self.advertisement.resolve_alias(value)
         if alias is not None:
@@ -1257,6 +1266,20 @@ class Bridge:
                     self._managed_code_ready = True
             except Exception:
                 pass  # Code readiness is an optional observation, never a heartbeat gate.
+        if len(capabilities) < 32:
+            # This fixed, non-configurable marker fences new repo-only routing
+            # from old hosts that could otherwise advertise a matching alias.
+            capabilities.append(REPOSITORY_IDENTITY_CAPABILITY)
+        else:
+            # Preserve the 32 non-workspace capability bound and every legacy
+            # label. Without a marker slot, repo-only placement is unavailable.
+            qualified = [tag for tag in workspace_tags if tag.startswith('workspace:')
+                         and QUALIFIED_WORKSPACE.fullmatch(tag[len('workspace:'):])]
+            if qualified:
+                qualified_set = set(qualified)
+                workspace_tags = [tag for tag in workspace_tags if tag not in qualified_set]
+                if INVENTORY_OVERFLOW_TAG not in workspace_tags:
+                    workspace_tags.append(INVENTORY_OVERFLOW_TAG)
         # Workspace inventory has its own protocol allowance; repository count
         # must never evict engine/credential hints or silently lose clone labels.
         capabilities.extend(workspace_tags)
