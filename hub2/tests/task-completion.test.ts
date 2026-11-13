@@ -40,7 +40,7 @@ function fixture(routes=candidates){
         reservations.push(body);return Response.json({state:'staged',epoch:body.attempt+1});}
       return Response.json({state:'offered'});
     }),
-    ACCOUNTS:namespace(async()=>Response.json({account:{enabled:true,min_remaining:0},credential_usable:true,credential_status:'ready',quota:{remaining:80},hosts:['h1']})),
+    ACCOUNTS:namespace(async()=>Response.json({account:{enabled:true,min_remaining:0},credential_usable:true,credential_status:'ready',quota:{remaining:80,captured_at:Date.now(),valid_until:Date.now()+900000},fresh:true,hosts:['h1']})),
     MAILBOXES:namespace(async(_id,r)=>{
       if(mailFailures>0){mailFailures--;return Response.json({error:'unavailable'},{status:503});}
       const body=await r.json() as any,actor=JSON.parse(r.headers.get('x-hub2-actor')!);
