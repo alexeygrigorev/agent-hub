@@ -170,10 +170,51 @@ def verified_artifact(base, name, record):
 
 
 def check_host_package(target, manifest):
-    command([target / 'bin/python', '-c', 'from agent_hub_host._release import HOST_VERSION, PROTOCOL_VERSION; '
-             f'assert HOST_VERSION == {manifest["host_version"]!r} and PROTOCOL_VERSION == {manifest["protocol_version"]}; '
-             'import inspect; from agent_hub_host.client import Client; '
-             "assert 'native_sessions' in inspect.signature(Client.heartbeat).parameters"])
+    check = '''
+import importlib
+import importlib.util
+import inspect
+from pathlib import Path
+import sys
+
+expected_version, expected_protocol, candidate = sys.argv[1:]
+candidate = Path(candidate).resolve(strict=True)
+
+def is_candidate_path(value):
+    try:
+        Path(value).resolve(strict=True).relative_to(candidate)
+        return True
+    except (OSError, ValueError):
+        return False
+
+namespaces = ('agent_hub_host', 'hub2_agent_hub_host')
+present = []
+for namespace in namespaces:
+    spec = importlib.util.find_spec(namespace)
+    if spec is None:
+        continue
+    locations = spec.submodule_search_locations
+    if locations is None or not locations or not all(is_candidate_path(path) for path in locations):
+        raise SystemExit('host namespace is outside the candidate environment')
+    present.append(namespace)
+if len(present) != 1:
+    raise SystemExit('candidate must contain exactly one supported host namespace')
+
+namespace = present[0]
+release = importlib.import_module(namespace + '._release')
+client = importlib.import_module(namespace + '.client')
+if not is_candidate_path(release.__file__) or not is_candidate_path(client.__file__):
+    raise SystemExit('host modules are outside the candidate environment')
+if type(release.HOST_VERSION) is not str or release.HOST_VERSION != expected_version:
+    raise SystemExit('candidate host version mismatch')
+if (type(release.PROTOCOL_VERSION) is not int
+        or release.PROTOCOL_VERSION != int(expected_protocol)):
+    raise SystemExit('candidate protocol mismatch')
+if 'native_sessions' not in inspect.signature(client.Client.heartbeat).parameters:
+    raise SystemExit('candidate heartbeat contract is incomplete')
+'''
+    command([target / 'bin/python', '-I', '-c', check, manifest['host_version'],
+             str(manifest['protocol_version']), str(target.resolve())])
 
 
 def enable_service_timer():
