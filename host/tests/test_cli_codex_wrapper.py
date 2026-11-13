@@ -195,7 +195,17 @@ def test_unsafe_missing_or_incompatible_wrapper_refuses_before_sdk(world, tmp_pa
                        'ignored-failure': '#!/usr/bin/env bash\nset -euo pipefail\npython3 %s/scripts/quota-gate.py || true\nexec %s "$@"\n' % (world.repo, world.codex),
                        'shadowed-python': '#!/usr/bin/env bash\nset -euo pipefail\npython3() { :; }\nrepo=%s\npython3 "$repo/scripts/quota-gate.py"\nexec %s "$@"\n' % (world.repo, world.codex),
                        'reordered-statements': '#!/usr/bin/env bash\nrepo=%s\npython3 "$repo/scripts/quota-gate.py"\nset -euo pipefail\nexec %s "$@"\n' % (world.repo, world.codex),
-                       'repo-traversal': '#!/usr/bin/env bash\nset -euo pipefail\nrepo=%s/../repo\npython3 "$repo/scripts/quota-gate.py"\nexec %s "$@"\n' % (world.repo, world.codex)}.items():
+                       'repo-traversal': '#!/usr/bin/env bash\nset -euo pipefail\nrepo=%s/../repo\npython3 "$repo/scripts/quota-gate.py"\nexec %s "$@"\n' % (world.repo, world.codex),
+                       'comment-vt-smuggle': '#!/usr/bin/env bash\nset -euo pipefail\n# gate disabled\vpython3 %s/scripts/quota-gate.py\nexec %s "$@"\n' % (world.repo, world.codex),
+                       'comment-ff-smuggle': '#!/usr/bin/env bash\nset -euo pipefail\n# gate disabled\fpython3 %s/scripts/quota-gate.py\nexec %s "$@"\n' % (world.repo, world.codex),
+                       'comment-nel-smuggle': '#!/usr/bin/env bash\nset -euo pipefail\n# gate disabled\x85python3 %s/scripts/quota-gate.py\nexec %s "$@"\n' % (world.repo, world.codex),
+                       'comment-ls-smuggle': '#!/usr/bin/env bash\nset -euo pipefail\n# gate disabled\u2028python3 %s/scripts/quota-gate.py\nexec %s "$@"\n' % (world.repo, world.codex),
+                       'comment-ps-smuggle': '#!/usr/bin/env bash\nset -euo pipefail\n# gate disabled\u2029python3 %s/scripts/quota-gate.py\nexec %s "$@"\n' % (world.repo, world.codex),
+                       'ws-nbsp-smuggle': '#!/usr/bin/env bash\nset -euo pipefail\n\u00a0python3 %s/scripts/quota-gate.py\nexec %s "$@"\n' % (world.repo, world.codex),
+                       'ctrl-cr': '#!/usr/bin/env bash\nset -euo pipefail\r\npython3 %s/scripts/quota-gate.py\nexec %s "$@"\n' % (world.repo, world.codex),
+                       'ctrl-fs': '#!/usr/bin/env bash\nset -euo pipefail\n\x1cpython3 %s/scripts/quota-gate.py\nexec %s "$@"\n' % (world.repo, world.codex),
+                       'ctrl-del': '#!/usr/bin/env bash\nset -euo pipefail\n# \x7f\npython3 %s/scripts/quota-gate.py\nexec %s "$@"\n' % (world.repo, world.codex),
+                       'ctrl-bom': '#!/usr/bin/env bash\nset -euo pipefail\n\ufeffpython3 %s/scripts/quota-gate.py\nexec %s "$@"\n' % (world.repo, world.codex)}.items():
         script = world.repo / ('scripts/%s.sh' % name)
         script.write_text(body)
         script.chmod(0o700)
@@ -237,6 +247,30 @@ def test_bundle_cannot_choose_wrapper_and_default_is_operator_home_only(world, m
         p.codex_launch_wrapper(environ={'CODEX_LAUNCH_WRAPPER': str(home / 'nope')}, home=home)
     with pytest.raises(ValueError, match='codex_launch_wrapper_unavailable'):
         p.codex_launch_wrapper(environ={'CODEX_LAUNCH_WRAPPER': ''}, home=home)
+
+
+def test_canonical_wrapper_templates_with_shell_whitespace(world):
+    templates = {
+        'repo-template': (
+            '#!/usr/bin/env bash\n'
+            '  # maintained comment\n'
+            '\tset -euo pipefail\n'
+            f'repo={world.repo}\n'
+            'python3 "$repo/scripts/quota-gate.py"\n'
+            f'exec {world.codex} "$@"\n'
+        ),
+        'direct-template': (
+            '#!/bin/bash\n'
+            'set -euo pipefail\n'
+            f'\tpython3 "{world.repo}/scripts/quota-gate.py"\n'
+            f'exec {world.codex} "$@"\n'
+        ),
+    }
+    for name, body in templates.items():
+        script = world.repo / ('scripts/%s.sh' % name)
+        script.write_text(body)
+        script.chmod(0o700)
+        assert p.codex_launch_wrapper(environ={'CODEX_LAUNCH_WRAPPER': str(script)}) == script.resolve(), name
 
 
 def test_other_providers_are_not_wrapped(world, monkeypatch):
