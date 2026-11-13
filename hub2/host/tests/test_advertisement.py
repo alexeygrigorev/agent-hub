@@ -408,17 +408,19 @@ class AdvertisementTests(unittest.TestCase):
         url_b = 'https://github.com/org/beta.git'
         url_c = 'https://github.com/org/gamma.git'
 
-        # (a) Same config: URL A, empty URL, URL B -> real Git returns A (never B); reader fails closed.
+        # Git versions differ on whether an empty URL resets earlier values.
+        # Either observed choice remains unsupported by the bounded reader.
+        # (a) Same config: URL A, empty URL, URL B.
         same_cfg = self.root / 'same-cfg'
         subprocess.run(['git', 'init', str(same_cfg)], check=True, capture_output=True, env=git_env)
         (same_cfg / '.git' / 'config').write_text(
             f'[core]\n\trepositoryformatversion = 0\n[remote "origin"]\n\turl = {url_a}\n\turl = ""\n\turl = {url_b}\n',
             encoding='utf-8',
         )
-        self.assertEqual(git_remote_origin(same_cfg), url_a)
+        self.assertIn(git_remote_origin(same_cfg), (url_a, url_b))
         self.assertIsNone(read_git_origin(same_cfg, [self.root]))
 
-        # (b) Common origin A + enabled linked config.worktree with empty URL then B -> real Git returns A; reader fails closed.
+        # (b) Common origin A + enabled linked config.worktree with empty URL then B.
         primary = self.root / 'primary'
         subprocess.run(['git', 'init', str(primary)], check=True, capture_output=True, env=git_env)
         subprocess.run(
@@ -435,7 +437,7 @@ class AdvertisementTests(unittest.TestCase):
             f'[remote "origin"]\n\turl = ""\n\turl = {url_b}\n',
             encoding='utf-8',
         )
-        self.assertEqual(git_remote_origin(linked), url_a)
+        self.assertIn(git_remote_origin(linked), (url_a, url_b))
         self.assertIsNone(read_git_origin(linked, [self.root]))
 
         # (c) Primary checkout enabled config.worktree is handled consistently (never skipped or wrong-guessed).
@@ -443,14 +445,14 @@ class AdvertisementTests(unittest.TestCase):
             f'[remote "origin"]\n\turl = ""\n\turl = {url_c}\n',
             encoding='utf-8',
         )
-        self.assertEqual(git_remote_origin(primary), url_a)
+        self.assertIn(git_remote_origin(primary), (url_a, url_c))
         self.assertIsNone(read_git_origin(primary, [self.root]))
 
         (primary / '.git' / 'config.worktree').write_text(
             f'[remote "origin"]\n\turl = {url_c}\n',
             encoding='utf-8',
         )
-        self.assertEqual(git_remote_origin(primary), url_a)
+        self.assertIn(git_remote_origin(primary), (url_a, url_c))
         self.assertIsNone(read_git_origin(primary, [self.root]))
 
         subprocess.run(['git', '-C', str(primary), 'remote', 'remove', 'origin'], check=True, capture_output=True, env=git_env)
