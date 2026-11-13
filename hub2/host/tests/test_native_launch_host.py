@@ -1005,6 +1005,7 @@ class HeadlessStreamOutputTests(unittest.TestCase):
         parent = Path(__file__).resolve().parents[3] / '.local/tmp'
         parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=parent, prefix='headless-stream-') as workspace:
+            self.workspace = str(Path(workspace).resolve())
             captured = {}
             native_id = 'd6cf9872-8597-48a5-be64-990cdef4db31'
 
@@ -1067,7 +1068,147 @@ class HeadlessStreamOutputTests(unittest.TestCase):
                     child, prompt = self.launch(provider, effort=effort, interactive=True)
                     prefix = (['claude', '--dangerously-skip-permissions', '--model', 'opus'] if provider == 'claude'
                               else ['agy', '--model', self.MODELS[provider], '--dangerously-skip-permissions'])
-                    self.assertEqual(child, [*prefix, *(['--effort', effort] if effort else []), *(['--prompt-interactive'] if provider == 'antigravity' else []), prompt])
+                    trust = (['--settings', json.dumps({'trustedWorkspaces': [self.workspace]}, separators=(',', ':'))]
+                             if provider == 'antigravity' else [])
+                    self.assertEqual(child, [*prefix, *(['--effort', effort] if effort else []), *trust, *(['--prompt-interactive'] if provider == 'antigravity' else []), prompt])
+
+    def test_headless_and_profile_antigravity_argv_carry_no_trust_settings(self):
+        for local in (False, True):
+            with self.subTest(local=local):
+                child, _ = self.launch('antigravity', effort='medium', local=local)
+                self.assertFalse(any('--settings' in arg or 'trustedWorkspaces' in arg for arg in child))
+
+
+class AntigravityWorkspaceTrustTests(unittest.TestCase):
+    """Session-only agy trust is limited to the exact launch directory."""
+    MODEL = 'gemini-4-argon-medium'
+
+    def setUp(self):
+        parent = Path(__file__).resolve().parents[3] / '.local/tmp'
+        parent.mkdir(parents=True, exist_ok=True)
+        self.temporary = tempfile.TemporaryDirectory(dir=parent, prefix='agy-trust-')
+        self.root = Path(self.temporary.name).resolve()
+        self.addCleanup(self.temporary.cleanup)
+
+    @staticmethod
+    def settings_of(argv):
+        values = [argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == '--settings']
+        assert len(values) == 1 and not any(a.startswith('--settings=') for a in argv), argv
+        return json.loads(values[0])
+
+    def launch(self, workspace, *, interactive=True, effort='medium', provider='antigravity', model=None):
+        captured = {}
+        native_id = 'd6cf9872-8597-48a5-be64-990cdef4db31'
+        model = model or self.MODEL
+
+        def runner(argv, **options):
+            child = argv[argv.index('--') + 1:]
+            captured.update(argv=argv, child=child, options=options)
+            return subprocess.CompletedProcess(argv, 0, json.dumps({
+                'id': native_id, 'tag': 'task-agy-trust', 'workspace': str(workspace), 'command': child}), '')
+
+        adapter = nl.NativeLauncher({'private_provider_homes': False, 'routes': {provider: nl.LOCAL_ROUTES[provider]}},
+                                    aplexer='synthetic-aplexer', runner=runner)
+        spec = {'workspace': str(workspace), 'engine': provider, 'model': model, 'prompt': 'do the scoped work',
+                'interactive': interactive, 'timeout_seconds': 90, 'operation_id': 'agy-trust-op', 'epoch': 1,
+                'effort': effort}
+        with mock.patch.object(adapter, 'record_evidence'):
+            receipt = adapter.launch('agy-trust', spec)
+        return receipt, captured
+
+    def test_interactive_agy_trusts_exactly_the_launch_cwd_and_keeps_identity(self):
+        names = ['plain', 'with space', 'ünïcødé-трест', 'quote"and\\back']
+        for name in names:
+            with self.subTest(name=name):
+                workspace = self.root / 'requested-base' / '.local' / 'hub-worktrees' / name
+                workspace.mkdir(parents=True)
+                receipt, captured = self.launch(workspace)
+                argv, child = captured['argv'], captured['child']
+                self.assertEqual(argv[argv.index('--cwd') + 1], str(workspace))
+                self.assertEqual(argv[argv.index('--workspace') + 1], str(workspace))
+                self.assertEqual(self.settings_of(child), {'trustedWorkspaces': [str(workspace)]})
+                for implied in (self.root / 'requested-base', self.root, workspace.parent, Path.home()):
+                    self.assertNotIn(str(implied), self.settings_of(child)['trustedWorkspaces'])
+                self.assertEqual(child[:4], ['agy', '--model', self.MODEL, '--dangerously-skip-permissions'])
+                self.assertEqual(child[4:6], ['--effort', 'medium'])
+                self.assertEqual(child[6], '--settings')
+                self.assertEqual(child[-2], '--prompt-interactive')
+                self.assertTrue(child[-1].startswith('do the scoped work'))
+                self.assertEqual(nl.native_command_model(child), self.MODEL)
+                self.assertEqual(nl.command_effort(child), 'medium')
+                self.assertEqual(receipt['session_id'], 'd6cf9872-8597-48a5-be64-990cdef4db31')
+                self.assertTrue(receipt['interactive_verified'] and receipt['model_verified'] and receipt['effort_verified'])
+                self.assertEqual(captured['options']['cwd'], str(workspace))
+                self.assertEqual(captured['options']['env']['PWD'], str(workspace))
+
+    def test_symlinked_launch_spelling_trusts_the_actual_directory_only(self):
+        actual = self.root / 'actual'
+        actual.mkdir()
+        alias = self.root / 'alias'
+        alias.symlink_to(actual, target_is_directory=True)
+        _, captured = self.launch(alias)
+        self.assertEqual(self.settings_of(captured['child']), {'trustedWorkspaces': [str(actual)]})
+        self.assertEqual(captured['options']['env']['PWD'], str(actual))
+
+    def test_unverifiable_workspace_is_refused_before_native_start(self):
+        file_path = self.root / 'file'
+        file_path.write_text('x')
+        for value in ('relative/workspace', str(self.root) + '\0x', 7):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, 'antigravity_workspace_trust_unverified'):
+                    nl.antigravity_launch_workspace(value)
+        with self.assertRaisesRegex(ValueError, 'antigravity_workspace_trust_unverified'):
+            nl.antigravity_launch_workspace(str(self.root / 'missing'))
+        with self.assertRaisesRegex(ValueError, 'antigravity_workspace_trust_unverified'):
+            nl.antigravity_launch_workspace(str(file_path))
+
+    def test_windows_style_paths_round_trip_through_json_quoting(self):
+        path = 'C:\\Users\\Some One\\hub-worktrees\\ünï "q"'
+        with mock.patch.object(nl, 'antigravity_launch_workspace', return_value=path):
+            argv = nl.antigravity_trust_argv(['agy', '--model', 'm', '--prompt-interactive', 'p'], path)
+        self.assertEqual(argv[:3], ['agy', '--model', 'm'])
+        self.assertEqual(argv[-2:], ['--prompt-interactive', 'p'])
+        self.assertEqual(self.settings_of(argv), {'trustedWorkspaces': [path]})
+
+    def test_existing_inline_settings_are_merged_not_shadowed(self):
+        workspace = str(self.root)
+        existing = json.dumps({'theme': 'dark', 'nested': {'a': [1, 2]}})
+        base = ['agy', '--model', 'm', '--settings', existing, '--effort', 'low', '--prompt-interactive', 'p']
+        argv = nl.antigravity_trust_argv(base, workspace)
+        self.assertEqual(argv[:3] + argv[5:], base[:3] + base[5:])
+        self.assertEqual(self.settings_of(argv), {'theme': 'dark', 'nested': {'a': [1, 2]},
+                                                  'trustedWorkspaces': [workspace]})
+        equals = nl.antigravity_trust_argv(['agy', '--settings=' + existing, '--prompt-interactive', 'p'], workspace)
+        self.assertEqual(self.settings_of(equals)['theme'], 'dark')
+        same = nl.antigravity_trust_argv(['agy', '--settings', json.dumps({'trustedWorkspaces': [workspace]}),
+                                          '--prompt-interactive', 'p'], workspace)
+        self.assertEqual(self.settings_of(same), {'trustedWorkspaces': [workspace]})
+
+    def test_forged_or_unverifiable_settings_never_widen_trust(self):
+        workspace = str(self.root)
+        refused = [
+            ['agy', '--settings', json.dumps({'trustedWorkspaces': [workspace, str(self.root.parent)]}), 'p'],
+            ['agy', '--settings', json.dumps({'trustedWorkspaces': [str(self.root.parent)]}), 'p'],
+            ['agy', '--settings', json.dumps({'trustedWorkspaces': True}), 'p'],
+            ['agy', '--settings', '/home/someone/.gemini/settings.json', 'p'],
+            ['agy', '--settings', '[]', 'p'],
+            ['agy', '--settings', '{}', '--settings', '{}', 'p'],
+            ['agy', '--settings'],
+        ]
+        for argv in refused:
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(ValueError, 'antigravity_settings_unverified'):
+                    nl.antigravity_trust_argv(argv, workspace)
+
+    def test_other_providers_and_headless_agy_argv_are_unchanged(self):
+        workspace = self.root / 'ws'
+        workspace.mkdir()
+        _, captured = self.launch(workspace, provider='claude', model='opus')
+        self.assertFalse(any('trustedWorkspaces' in arg for arg in captured['child']))
+        self.assertNotIn('--settings', captured['child'])
+        # Headless agy through the local profile path stays byte-identical.
+        _, captured = self.launch(workspace, interactive=False)
+        self.assertFalse(any('trustedWorkspaces' in arg or '--settings' in arg for arg in captured['child']))
 
 
 class ManagedClaudeReadinessTests(unittest.TestCase):
