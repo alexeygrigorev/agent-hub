@@ -29,10 +29,10 @@ class RecoveryTests(unittest.TestCase):
         self.git(self.root, 'clone', '--bare', str(self.repo), str(self.root / 'origin.git'))
         self.git(self.repo, 'remote', 'add', 'origin', str(self.root / 'origin.git'))
         self.identity = {'intake_id': 'retained-intake', 'project_id': 'org/project'}
-        digest = hashlib.sha256(json.dumps(self.identity, sort_keys=True).encode()).hexdigest()
-        self.branch = 'hub/intake-' + digest
+        self.digest = hashlib.sha256(json.dumps(self.identity, sort_keys=True).encode()).hexdigest()
+        self.branch = 'hub/intake-' + self.digest
         self.ref = 'refs/heads/' + self.branch
-        self.target = self.repo / '.local' / 'hub-worktrees' / digest
+        self.target = self.repo / '.local' / 'hub-worktrees' / self.digest
 
     def git(self, root, *args):
         return subprocess.run(['git', '-C', str(root), *args], capture_output=True,
@@ -54,6 +54,10 @@ class RecoveryTests(unittest.TestCase):
 
     def test_cleaned_successor_retains_non_main_commit_branch_and_marker_offline(self):
         tip = self.retained()
+        common = Path(self.git(self.repo, 'rev-parse', '--path-format=absolute', '--git-common-dir'))
+        record_path = common / module._OWNERS_DIR / f'{self.digest}.json'
+        self.assertTrue(record_path.is_file())
+        self.assertEqual(json.loads(record_path.read_text())['source'], 'prepare')
         self.assertNotEqual(tip, self.git(self.repo, 'rev-parse', 'main'))
         self.git(self.repo, 'remote', 'set-url', 'origin', str(self.root / 'absent'))
         recovered = self.prepare()
@@ -194,6 +198,202 @@ except ValueError as error:
         with self.assertRaisesRegex(ValueError, 'branch_ambiguous'):
             self.prepare()
         self.assertFalse(self.target.exists())
+
+    def test_os_lock_releases_after_holder_process_killed(self):
+        tip = self.retained()
+        holder_script = '''
+import sys, time
+from agent_hub_host.implement_workspace import _repository_lock
+with _repository_lock(sys.argv[1]):
+    print('locked', flush=True)
+    time.sleep(60)
+'''
+        proc = subprocess.Popen(
+            [sys.executable, '-c', holder_script, str(self.repo)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            self.assertEqual(proc.stdout.readline().strip(), 'locked')
+            with self.assertRaisesRegex(ValueError, 'preparation_busy'):
+                self.prepare()
+        finally:
+            proc.kill()
+            proc.wait(timeout=10)
+            proc.stdout.close()
+            proc.stderr.close()
+        common = Path(self.git(self.repo, 'rev-parse', '--path-format=absolute', '--git-common-dir'))
+        self.assertTrue((common / module._LOCK_FILE).exists())
+        recovered = self.prepare()
+        self.assertEqual(self.git(recovered, 'rev-parse', 'HEAD'), tip)
+        fresh = module.prepare_workspace(self.repo, 'implement', 'fresh-after-kill', 'org/project')
+        self.assertTrue(fresh.exists())
+
+    def test_foreign_same_name_branch_without_record_fails_ownership_unverified(self):
+        (self.repo / 'foreign').write_text('foreign')
+        self.git(self.repo, 'add', 'foreign')
+        self.git(self.repo, 'commit', '-m', 'foreign branch commit')
+        foreign_tip = self.git(self.repo, 'rev-parse', 'HEAD')
+        self.git(self.repo, 'branch', self.branch, foreign_tip)
+        self.git(self.repo, 'reset', '--hard', 'HEAD~1')
+        with self.assertRaisesRegex(ValueError, 'ownership_unverified'):
+            self.prepare()
+        self.assertFalse(self.target.exists())
+        self.assertEqual(self.git(self.repo, 'rev-parse', self.ref), foreign_tip)
+        common = Path(self.git(self.repo, 'rev-parse', '--path-format=absolute', '--git-common-dir'))
+        self.assertFalse((common / module._OWNERS_DIR / f'{self.digest}.json').exists())
+
+    def test_existing_legacy_worktree_marker_bootstraps_durable_record(self):
+        self.git(self.repo, 'branch', self.branch, 'main')
+        self.target.parent.mkdir(parents=True, exist_ok=True)
+        self.git(self.repo, 'worktree', 'add', str(self.target), self.branch)
+        admin = Path(self.git(self.target, 'rev-parse', '--absolute-git-dir'))
+        (admin / module._MARKER).write_text(json.dumps(self.identity, sort_keys=True))
+        common = Path(self.git(self.repo, 'rev-parse', '--path-format=absolute', '--git-common-dir'))
+        record_path = common / module._OWNERS_DIR / f'{self.digest}.json'
+        self.assertFalse(record_path.exists())
+        self.assertEqual(self.prepare(), self.target)
+        self.assertTrue(record_path.is_file())
+        self.assertEqual(json.loads(record_path.read_text())['source'], 'legacy_worktree_bootstrap')
+        self.git(self.target, 'config', 'user.email', 'test@example.test')
+        self.git(self.target, 'config', 'user.name', 'test')
+        (self.target / 'legacy').write_text('legacy work')
+        self.git(self.target, 'add', 'legacy')
+        self.git(self.target, 'commit', '-m', 'legacy commit')
+        tip = self.git(self.target, 'rev-parse', 'HEAD')
+        self.git(self.repo, 'worktree', 'remove', str(self.target))
+        recovered = self.prepare()
+        self.assertEqual(self.git(recovered, 'rev-parse', 'HEAD'), tip)
+
+    def test_wrong_record_permissions_and_symlinks_fail_closed(self):
+        self.retained()
+        common = Path(self.git(self.repo, 'rev-parse', '--path-format=absolute', '--git-common-dir'))
+        owners_dir = common / module._OWNERS_DIR
+        record_path = owners_dir / f'{self.digest}.json'
+        original = record_path.read_text()
+
+        # Foreign record content is rejected and never overwritten.
+        foreign_payload = json.dumps({
+            'version': 1,
+            'intake_id': 'other-intake',
+            'project_id': 'org/project',
+            'ref': self.ref,
+            'source': 'prepare',
+        })
+        record_path.write_text(foreign_payload)
+        with self.assertRaisesRegex(ValueError, 'owner_conflict'):
+            self.prepare()
+        self.assertEqual(record_path.read_text(), foreign_payload)
+
+        # Malformed JSON is rejected and never overwritten.
+        record_path.write_text('{broken')
+        with self.assertRaisesRegex(ValueError, 'owner_invalid'):
+            self.prepare()
+        self.assertEqual(record_path.read_text(), '{broken')
+
+        # Group/world-writable record is rejected.
+        record_path.write_text(original)
+        if os.name != 'nt':
+            os.chmod(record_path, 0o660)
+            with self.assertRaisesRegex(ValueError, 'owner_invalid'):
+                self.prepare()
+            os.chmod(record_path, 0o600)
+
+            # Symlink record file is rejected.
+            record_path.unlink()
+            record_path.symlink_to(self.repo / 'source')
+            with self.assertRaisesRegex(ValueError, 'owner_invalid'):
+                self.prepare()
+            record_path.unlink()
+
+            # Symlink owners directory is rejected.
+            owners_dir.rmdir()
+            owners_dir.symlink_to(self.root, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, 'owner_invalid'):
+                self.prepare()
+            owners_dir.unlink()
+
+            # Symlink lockfile is rejected.
+            lock = common / module._LOCK_FILE
+            if lock.exists():
+                lock.unlink()
+            lock.symlink_to(self.repo / 'source')
+            with self.assertRaisesRegex(ValueError, 'path_untrusted'):
+                self.prepare()
+            lock.unlink()
+
+    def test_explicit_legacy_adoption_positive_and_cas_refusals(self):
+        (self.repo / 'legacy').write_text('legacy')
+        self.git(self.repo, 'add', 'legacy')
+        self.git(self.repo, 'commit', '-m', 'legacy branch commit')
+        tip = self.git(self.repo, 'rev-parse', 'HEAD')
+        self.git(self.repo, 'branch', self.branch, tip)
+        self.git(self.repo, 'reset', '--hard', 'HEAD~1')
+        main_tip = self.git(self.repo, 'rev-parse', 'main')
+
+        with self.assertRaisesRegex(ValueError, 'ownership_unverified'):
+            self.prepare()
+
+        with self.assertRaisesRegex(ValueError, 'tip_mismatch'):
+            module.adopt_legacy_intake_branch(
+                self.repo, **self.identity, expected_ref=self.ref,
+                expected_tip=main_tip, operator='alexey', reason='legacy cleanup',
+            )
+        with self.assertRaisesRegex(ValueError, 'ref_mismatch'):
+            module.adopt_legacy_intake_branch(
+                self.repo, **self.identity, expected_ref='refs/heads/main',
+                expected_tip=tip, operator='alexey', reason='legacy cleanup',
+            )
+        with self.assertRaisesRegex(ValueError, 'provenance_invalid'):
+            module.adopt_legacy_intake_branch(
+                self.repo, **self.identity, expected_ref=self.ref,
+                expected_tip=tip, operator='Bearer secret', reason='legacy cleanup',
+            )
+        with self.assertRaisesRegex(ValueError, 'provenance_invalid'):
+            module.adopt_legacy_intake_branch(
+                self.repo, **self.identity, expected_ref=self.ref,
+                expected_tip=tip, operator='alexey', reason='',
+            )
+
+        other = self.root / 'active-legacy'
+        self.git(self.repo, 'worktree', 'add', str(other), self.branch)
+        with self.assertRaisesRegex(ValueError, 'branch_in_use'):
+            module.adopt_legacy_intake_branch(
+                self.repo, **self.identity, expected_ref=self.ref,
+                expected_tip=tip, operator='alexey', reason='legacy cleanup',
+            )
+        self.git(self.repo, 'worktree', 'remove', str(other))
+
+        # Concurrent lock contention during adoption fails closed.
+        with module._repository_lock(self.repo):
+            with self.assertRaisesRegex(ValueError, 'preparation_busy'):
+                module.adopt_legacy_intake_branch(
+                    self.repo, **self.identity, expected_ref=self.ref,
+                    expected_tip=tip, operator='alexey', reason='legacy cleanup',
+                )
+
+        adopted = module.adopt_legacy_intake_branch(
+            self.repo, **self.identity, expected_ref=self.ref,
+            expected_tip=tip, operator='alexey', reason='verified legacy cleanup',
+        )
+        self.assertEqual(adopted['source'], 'operator_legacy_adoption')
+        self.assertEqual(adopted['tip'], tip)
+        self.assertFalse(adopted['already_recorded'])
+        record_path = Path(adopted['record_path'])
+        if os.name != 'nt':
+            self.assertEqual(record_path.stat().st_mode & 0o777, 0o600)
+
+        again = module.adopt_legacy_intake_branch(
+            self.repo, **self.identity, expected_ref=self.ref,
+            expected_tip=tip, operator='alexey', reason='idempotent check',
+        )
+        self.assertTrue(again['already_recorded'])
+
+        recovered = self.prepare()
+        self.assertEqual(recovered, self.target)
+        self.assertEqual(self.git(recovered, 'rev-parse', 'HEAD'), tip)
+        self.assertEqual((recovered / 'legacy').read_text(), 'legacy')
 
 
 if __name__ == '__main__':
