@@ -481,7 +481,9 @@ def test_real_cli_start_flags_change_route_cwd_native_output_and_policy(plain_op
         assert "Native pane: " + row["native_id"] in started.stderr, started.stderr
         # The accepted flags reached native execution: engine args and an isolated cwd under --cwd.
         argv = native["command"]
-        assert "--engine-arg=" + ALT in argv and '--engine-arg=model_reasoning_effort="low"' in argv, argv
+        # Private-home codex runs the wrapper directly (bare args); profile routes use --engine-arg=.
+        assert any(item in argv for item in (ALT, "--engine-arg=" + ALT)), argv
+        assert any(item in argv for item in ('model_reasoning_effort="low"', '--engine-arg=model_reasoning_effort="low"')), argv
         assert Path(native["cwd"]).resolve().is_relative_to(subdir.resolve()), native["cwd"]
         assert Path(row["workspace"]).resolve() == Path(native["cwd"]).resolve()
         assert Path(row["requested_workspace"]).resolve() == subdir.resolve(), row
@@ -526,7 +528,7 @@ def test_real_cli_purpose_gates_review_only_model_and_tier_weights_the_pick(plai
         # purpose=review makes that exact model eligible and it really runs natively.
         created, row, native = _running(hub, _model_start(hub, "--model", ASTRA, "--purpose", "review"))
         assert (created["model"], created["effort"], created["policy_id"]) == (ASTRA, "medium", "e2e-astra"), created
-        assert "--engine-arg=" + ASTRA in native["command"], native["command"]
+        assert any(item in native["command"] for item in (ASTRA, "--engine-arg=" + ASTRA)), native["command"]
         capture = hub.cli.run("sessions", "capture", created["id"], "--screen", "--timeout", "60")
         assert capture.returncode == 0 and "STUB-CODEX-OK model=" + ASTRA in capture.stdout, capture.stdout[-1000:]
 
