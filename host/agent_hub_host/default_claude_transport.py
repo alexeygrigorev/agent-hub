@@ -19,7 +19,7 @@ import os
 from pathlib import Path
 import urllib.request
 
-from . import api, config, native_import_host, private_fs
+from . import api, config, native_import_host, private_fs, worker_auth
 
 PASSIVE_PATH = '/api/engines/hub-claude/passive-credential'
 ERROR = 'Default Claude consumer requires HTTPS and a current enrolled host on the same Hub'
@@ -30,6 +30,7 @@ def bind_passive(operator_base):
 
     Raises ValueError (fixed text) unless the current v2 host enrollment is valid
     and on the same HTTPS origin as ``operator_base``."""
+    worker_auth.refuse_v2_profile_io()
     try:
         native_import_host._https_origin(operator_base)
         current = Path.home() / '.config/agent-hub/v2.json'
