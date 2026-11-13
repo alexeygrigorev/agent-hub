@@ -176,12 +176,17 @@ def _write_worker_artifact(s, intake_row):
     ws.mkdir(parents=True, exist_ok=True)
     result_path = ws / m_rel.group(1)
     result_path.parent.mkdir(parents=True, exist_ok=True)
-    m_probe = re.search(r'single foreground command `python3 ([^`]+)`', brief)
-    if m_probe and not CFG.get('no_probe_file'):
-        probe = ws / m_probe.group(1)
-        probe.parent.mkdir(parents=True, exist_ok=True)
-        probe.write_text('# synthetic fake probe body (not live evidence)\nprint("probe")\n')
-        s['probe_command'] = 'python3 ' + m_probe.group(1)
+    m_helper = re.search(r'Root-pinned helper `([^`]+)` to `([^`]+)`', brief)
+    if m_helper:
+        # The synthetic worker copies the Root-pinned helper bytes (it never executes them).
+        s['probe_command'] = 'python3 ' + m_helper.group(2)
+        if not CFG.get('no_probe_file'):
+            probe = ws / m_helper.group(2)
+            probe.parent.mkdir(parents=True, exist_ok=True)
+            data = Path(m_helper.group(1)).read_bytes()
+            if CFG.get('probe_tampered'):
+                data += b'# locally edited copy\n'
+            probe.write_bytes(data)
     if CFG.get('result_preexisting'):
         return
     head = CFG.get('worker_head', CFG.get('git_head', 'b' * 40))
@@ -612,6 +617,42 @@ def native(argv):
             elif CFG.get('a_list_includes_exited'):
                 rows.append({'id': s['native_id'], 'state': 'exited'})
         out(rows)
+    if len(argv) == 3 and argv[0] == 'status' and argv[2] == '--json':
+        s = _native_session(argv[1])
+        ST['log'].append('native:status')
+        calls = ST.setdefault('status_calls', 0) + 1
+        ST['status_calls'] = calls
+        row = {
+            'id': s['native_id'], 'tag': 'task-hub2-' + s['id'], 'workspace': s['workspace'],
+            'created_at_ms': 1794585409000 + (calls if CFG.get('h_birth_changes') and calls > 1 else 0),
+            'engine': s['engine'], 'phase': 'running', 'state': 'running',
+            'worker_alive': True, 'worker_reachable': not CFG.get('h_status_unreachable'),
+            # Unrelated full-record fields the driver must never persist.
+            'command': ['agy', '--synthetic'], 'env': {'SYNTHETIC_PRIVATE_VALUE': 'must-not-leak'},
+        }
+        if CFG.get('h_status_unreachable'):
+            row['rpc_error'] = 'synthetic persisted-status fallback'
+        out(row)
+    if len(argv) == 4 and argv[0] == 'capture' and argv[2:] == ['--screen', '--svg']:
+        s = _native_session(argv[1])
+        ST['log'].append('native:capture-svg')
+        save()
+        if CFG.get('h_capture_huge'):
+            sys.stdout.write('<svg>' + 'x' * 300000)
+            sys.exit(0)
+        if CFG.get('h_capture_hang'):
+            time.sleep(30)
+        sys.stdout.write(_hydrogen_svg(s))
+        sys.exit(0)
+    if len(argv) == 5 and argv[0] == 'send' and argv[2:] == ['--hex', '0f', '--json']:
+        s = _native_session(argv[1])
+        ST['log'].append('native:send-0f')
+        s['h_keys'] = s.get('h_keys', 0) + 1
+        if CFG.get('h_after_send', 'expanded') == 'expanded':
+            s['h_view'] = 'expanded'
+        if CFG.get('h_lost_ack'):
+            fail('synthetic lost send response')
+        out({'id': s['native_id'], 'bytes': 1, 'status': 'pty_written', 'enter_written': False, 'consumed': None})
     if len(argv) == 4 and argv[0] == 'capture' and argv[2:] == ['--screen', '--plain']:
         nid = argv[1]
         s = next((x for x in ST['sessions'].values() if x['native_id'] == nid), None)
@@ -681,6 +722,82 @@ def native(argv):
             print(expected_line)
         sys.exit(0)
     fail('forbidden or unknown native command: ' + repr(argv))
+
+
+def _native_session(nid):
+    s = next((x for x in ST['sessions'].values() if x['native_id'] == nid), None)
+    if not s:
+        fail('native session not found')
+    return s
+
+
+SVG_HEAD = ('<svg xmlns="http://www.w3.org/2000/svg" width="748" height="624" viewBox="0 0 748 624" '
+            'font-family="DejaVu Sans Mono,Menlo,Consolas,monospace"><title>%s</title>'
+            '<rect width="100%%" height="100%%" fill="#0c0c0c"/><g font-size="15" xml:space="preserve">')
+MODE = 'Auto mode: edits & safe commands auto-approved (shift+tab to cycle)'
+CAPTION = 'Format observation complete; awaiting Root STOP.'
+
+
+def _esc(text):
+    return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+
+def render_svg(title, rows):
+    """Synthetic rendering of the observed 80x24 Hydrogen screen grammar (never real provider output)."""
+    parts = [SVG_HEAD % _esc(title)]
+    for y in sorted(rows):
+        for x, fill, weight, text in rows[y]:
+            parts.append('<text x="%d" y="%d" fill="%s" textLength="%d"%s>%s</text>' % (
+                x, y, fill, 9 * len(text), ' font-weight="bold"' if weight else '', _esc(text)))
+    parts.append('<rect x="0" y="588" width="748" height="24" fill="#1b1b1b"/>'
+                 '<rect x="32" y="516" width="9" height="24" fill="none" stroke="#d4d4d4" stroke-width="1"/>'
+                 '<text x="14" y="605" fill="#c8cdd4">' + _esc('● RUNNING  ^b ?' + ' ' * 65) + '</text></g></svg>')
+    return ''.join(parts)
+
+
+def _hydrogen_svg(s):
+    home = os.path.expanduser('~')
+    title = 'aplexer ~/' + s['workspace'][len(home) + 1:] + ':task-hub2-' + s['id']
+    cmd = s.get('probe_command', 'python3 .local/h7_000000000000_01.py')
+    composer = '> draft text' if CFG.get('h_view') == 'draft' else None
+    rows = {
+        492: [(14, '#5c6370', None, '─' * 80)],
+        516: ([(14, '#7cbff2', None, '>'), (23, '#d4d4d4', None, ' '), (32, '#5c6370', None, MODE)]
+              if composer is None else [(14, '#7cbff2', None, '>'), (23, '#d4d4d4', None, ' '),
+                                        (32, '#d4d4d4', None, 'draft text')]),
+        540: [(14, '#5c6370', None, '─' * 80)],
+        564: [(14, '#5c6370', None, '? for shortcuts'), (437, '#e5c07b', None, 'auto'),
+              (473, '#d4d4d4', None, ' · Gemini 4 Hydrogen · medium')],
+    }
+    view = s.get('h_view') or CFG.get('h_view') or 'collapsed'
+    if view == 'busy':
+        rows[396] = [(14, '#98c379', None, '●'), (23, '#d4d4d4', None, ' '), (32, '#e5c07b', 'bold', 'Running'),
+                     (95, '#abb2bf', None, '(' + cmd + ')')]
+    elif view == 'expanded':
+        rows.update({
+            156: [(14, '#5c6370', None, '▾ Thought for 2s')],
+            204: [(14, '#98c379', None, '●'), (23, '#d4d4d4', None, ' '), (32, '#e5c07b', 'bold', 'Bash'),
+                  (68, '#abb2bf', None, '(' + cmd + ')')],
+            228: [(14, '#abb2bf', None, '  ⎿  '), (59, '#d4d4d4', None, 'Created At: 2026-11-13T16:57:09+01:00')],
+            252: [(59, '#d4d4d4', None, 'Completed At: 2026-11-13T16:57:10+01:00')],
+            276: [(59, '#d4d4d4', None, 'Command exited with code %d.' % CFG.get('h_exit_code', 0))],
+            324: [(59, '#d4d4d4', None, 'Command output:')],
+            348: [(59, '#d4d4d4', None, 'AC10_WORK_V2 %s %s' % (s.get('run_id', ''), s.get('sample', '')))],
+            372: [(59, '#d4d4d4', None, s.get('proof_digest', ''))],
+            396: [(59, '#d4d4d4', None, s.get('proof_head', '') + ' 5050 '), (473, '#abb2bf', None, '(ctrl+o to collapse)')],
+            444: [(14, '#d4d4d4', None, '  ' + (('I ran ' + cmd) if CFG.get('h_fake_footer') else CAPTION))],
+        })
+    else:
+        count = CFG.get('h_aggregate', 3)
+        rows.update({
+            372: [(14, '#abb2bf', None, '○ Thought for 11.8s')],
+            396: [(14, '#98c379', None, '●'), (23, '#d4d4d4', None, ' '), (32, '#e5c07b', 'bold', 'Ran'),
+                  (59, '#d4d4d4', None, ' %d commands ' % count),
+                  (167, '#abb2bf', None, '(+%d · %s...)' % (count - 1, cmd[:20])), (437, '#d4d4d4', None, ' '),
+                  (446, '#abb2bf', None, '(ctrl+o to expand)')],
+            444: [(14, '#d4d4d4', None, '  ' + CAPTION)],
+        })
+    return render_svg(title, rows)
 
 
 def fake_git(argv):

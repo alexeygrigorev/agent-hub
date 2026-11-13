@@ -27,8 +27,9 @@ spec.loader.exec_module(acc)
 
 SOL, GLM, MUSE, LUNA = 'claude-sonnet-4-6', 'claude-opus-4-6', 'gemini-4-hydrogen', 'gemini-4-luna'
 HAIKU = 'claude-haiku-4-5'
-# Offline PASS-path draws use only engines with a QUALIFIED native framing contract (Claude). Hydrogen draws are
-# exercised separately and must fail with UNKNOWN_NATIVE_FRAMING; the runtime picker itself is NOT narrowed.
+# Offline PASS-path draws here use the qualified plain-pane contract (Claude). The qualified Hydrogen medium
+# styled-screen path is exercised in test_cli_hydrogen_acceptance.py; MUSE/LUNA below are OTHER antigravity models
+# that must keep failing with UNKNOWN_NATIVE_FRAMING. The runtime picker itself is NOT narrowed.
 OK_MODELS = [SOL, GLM, HAIKU, SOL, GLM, HAIKU, SOL, GLM, HAIKU, SOL]
 NATIVE_POOL = [
     {'policy_id': 'claude-sonnet', 'engine': 'claude', 'model': SOL, 'effort': 'medium', 'weight': 30, 'share': 0.3},
@@ -130,7 +131,9 @@ def native_evidence(commit=COMMIT, **kw):
         'operator_validation': {
             'actor': 'offline-fixture',
             'target_commit': commit,
-            'capture_transports': {engine: native_transport(engine, commit) for engine in acc.NATIVE_PROOF_CLASSES},
+            # Plain-pane (Claude) attestation only; the Hydrogen styled-screen record is a separate shape
+            # (host/tests/test_cli_hydrogen_acceptance.py).
+            'capture_transports': {'claude': native_transport('claude', commit)},
             'receipts': {
                 name: {
                     'commit': commit,
@@ -714,7 +717,7 @@ class V2NativeAndLineageTests(Harness):
                 self.assertAllStopped()
 
     def test_ac_normalization_and_provenance_match_hub2_contract(self):
-        _, ac = acc.make_child_brief_and_ac(PARENT_INTAKE, 1, PARENT_INTAKE, '/tmp/ch.bin')
+        _, ac = acc.make_child_brief_and_ac(PARENT_INTAKE, 1, PARENT_INTAKE, '/tmp/ch.bin', '/tmp/helper-1.py')
         norm = acc.normalize_acceptance_criteria(ac)
         self.assertEqual(len(norm), 2)
         self.assertFalse(any(line.startswith('1.') or line.startswith('2.') for line in norm))
@@ -959,7 +962,7 @@ class V2NativeAndLineageTests(Harness):
                 self.assertTrue(any(msg in e for e in rec['errors']), rec['errors'])
 
     def test_b1_actual_project_create_shape_and_no_invented_source(self):
-        brief, ac = acc.make_child_brief_and_ac(PARENT_INTAKE, 1, PARENT_INTAKE, '/tmp/ch.bin')
+        brief, ac = acc.make_child_brief_and_ac(PARENT_INTAKE, 1, PARENT_INTAKE, '/tmp/ch.bin', '/tmp/helper-1.py')
         cid = '33333333-4444-4555-8666-777777777777'
         title = 'Phase7 owned run %s/%d' % (PARENT_INTAKE, 1)
         # Mirrors hub2/src/project-do.ts create INSERT + viewIntake (no saga yet => no dispatch key).
@@ -1008,51 +1011,39 @@ class V2NativeAndLineageTests(Harness):
         self.assertEqual(rc, 1, out)
         self.assertIn('provenance mismatch', out)
 
-    def test_b2_hydrogen_native_proof_unavailable_for_every_rendering_and_label(self):
-        """A class label is not attestation: no unqualified Hydrogen rendering may ever pass today."""
+    def test_b2_plain_pane_and_label_never_attest_antigravity(self):
+        """A class label is not attestation: no plain-pane rendering or Claude-shaped record can prove antigravity."""
         run = '40a49778-f092-450d-a042-12ad276ab134'
         cmd = acc.probe_command(run, 3)
-        self.assertEqual(cmd, 'python3 .local/a10/40a4977803.py')
+        self.assertRegex(cmd, r'^python3 \.local/h7_[0-9a-f]{12}_03\.py$')
+        self.assertEqual(cmd, 'python3 ' + acc.hydrogen_frame.h7_rel_path(run, 3))
         expected = 'AC10_WORK_V2 %s 3 %s %s 5050' % (run, 'a' * 64, 'b' * 40)
-        brief, _ = acc.make_child_brief_and_ac(run, 3, PARENT_INTAKE, '/tmp/ch.bin')
+        brief, _ = acc.make_child_brief_and_ac(run, 3, PARENT_INTAKE, '/tmp/ch.bin', '/tmp/helper-3.py')
         self.assertIn('`%s`' % cmd, brief)
-        self.assertNotIn('antigravity', acc.NATIVE_PROOF_CLASSES)
+        self.assertIn('`/tmp/helper-3.py`', brief)
+        self.assertNotIn(expected, brief)
         row = '● Ran (%s) (ctrl+o to expand)\n' % cmd
         panes = {
             'exact_row_alone': row + '> ',
             'assistant_footer_exact_row': 'Assistant readiness summary:\n' + row + 'I am done.\n',
-            'same_command_running': row + '● Running (%s)\n' % cmd,
-            'same_command_failed': row + 'Error: %s failed with exit1\n' % cmd,
-            'duplicate_exact_row': row + row,
             'row_plus_expected_stdout': row + '  ' + expected + '\n',
+            'claude_shaped_block': '● Bash(%s)\n  ⎿  %s\n❯ ' % (cmd, expected),
         }
-        labels = ['native_exact_probe_header_plus_artifact_v3', 'native_exact_probe_header_plus_artifact_v4',
-                  'native_action_plus_artifact_v2', acc.NATIVE_PROOF_CLASSES['claude']]
+        labels = ['native_exact_probe_header_plus_artifact_v3', 'native_action_plus_artifact_v2',
+                  acc.NATIVE_PROOF_CLASSES['claude'], acc.NATIVE_PROOF_CLASSES['antigravity']]
         for label in labels:
             t = dict(native_transport('antigravity', COMMIT), proof_class=label)
             self.assertFalse(acc.native_transport_ok('antigravity', t, COMMIT), label)
             for name, pane in panes.items():
                 with self.subTest(label=label, pane=name):
                     self.assertFalse(acc.native_pane_output_ok(pane, 'antigravity', t, expected, brief, command_id=cmd))
-        # Prospective support hook reports candidates/contradictions but never native authority.
-        for name, pane in panes.items():
-            diag = acc.hydrogen_framing_diagnostic(pane, cmd)
-            self.assertEqual(diag['status'], 'UNAVAILABLE')
-            self.assertEqual(diag['reason'], 'UNKNOWN_NATIVE_FRAMING')
-            self.assertEqual(diag['root_checker_status'], 'NEEDS_ROOT_RENDERER_ATTESTATION')
-            self.assertIs(diag['native_action_verified'], False)
-            self.assertIs(diag['typed_stdout_verified'], False)
-        self.assertEqual(acc.hydrogen_framing_diagnostic(panes['duplicate_exact_row'], cmd)['contradictions'], ['duplicate exact row'])
-        self.assertIn('same-command non-completed/failed row',
-                      acc.hydrogen_framing_diagnostic(panes['same_command_running'], cmd)['contradictions'])
-        # Root's genuine observation-1 shape: plain viewport, assistant footer only, zero candidate rows.
-        self.assertEqual(acc.hydrogen_framing_diagnostic('Assistant: wrote result.json\n> ', cmd)['candidate_rows'], 0)
-        # An operator bundle that names a Hydrogen transport is refused with the explicit diagnostic.
+        self.assertFalse(hasattr(acc, 'hydrogen_framing_diagnostic'))
+        # A Claude-shaped (plain-pane) antigravity record in an operator bundle is refused.
         path = Path(native_evidence())
         ev = json.loads(path.read_text())
         ev['operator_validation']['capture_transports']['antigravity'] = native_transport('antigravity', COMMIT)
         problems = acc.validate_native_evidence(ev, str(path), COMMIT)
-        self.assertTrue(any('UNKNOWN_NATIVE_FRAMING' in p for p in problems), problems)
+        self.assertIn('verified interactive native-pane capture transport records required', problems)
 
     def test_b2_hydrogen_draw_fails_unavailable_with_artifact_only_and_cleanup(self):
         for knob, artifact in [({}, 'VALIDATED'), ({'no_probe_file': True}, 'absent')]:
@@ -1151,21 +1142,21 @@ class V2NativeAndLineageTests(Harness):
             with self.assertRaises(TimeoutError):
                 acc.verify_work_artifact(None, '/ws', PARENT_INTAKE, 1, PARENT_INTAKE,
                                          PARENT_INTAKE, PARENT_INTAKE, PARENT_INTAKE,
-                                         b'x' * 32, clock, 90.0, require_probe=True)
+                                         b'x' * 32, clock, 90.0, pinned_probe=b'probe body')
             self.assertEqual(read.call_count, 1)
             metadata.assert_not_called()
         # Path validation may also exhaust the budget before either file is opened.
-        for require_probe in (False, True):
+        for pinned in (None, b'probe body'):
             clock = Clock()
             def slow_path(*args):
                 clock.t = 91.0
-            with self.subTest(require_probe=require_probe), \
+            with self.subTest(pinned=pinned), \
                  mock.patch.object(acc, 'validate_no_symlink_ancestors', side_effect=slow_path), \
                  mock.patch.object(acc, 'bounded_file') as read:
                 with self.assertRaises(TimeoutError):
                     acc.verify_work_artifact(None, '/ws', PARENT_INTAKE, 1, PARENT_INTAKE,
                                              PARENT_INTAKE, PARENT_INTAKE, PARENT_INTAKE,
-                                             b'x' * 32, clock, 90.0, require_probe=require_probe)
+                                             b'x' * 32, clock, 90.0, pinned_probe=pinned)
                 read.assert_not_called()
         # A result read crossing the deadline must not start a metadata read.
         clock = Clock()

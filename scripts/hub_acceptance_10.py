@@ -16,7 +16,9 @@ import json
 import math
 import os
 import re
+import selectors
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -24,6 +26,14 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
+
+_SCRIPTS = str(Path(__file__).resolve().parent)
+if _SCRIPTS not in sys.path:
+    sys.path.insert(0, _SCRIPTS)
+import hydrogen_acquire  # noqa: E402  (sibling pure modules; no import-time I/O)
+import hydrogen_frame  # noqa: E402
+import hydrogen_helper  # noqa: E402
+import hydrogen_native  # noqa: E402
 
 COUNT = 10
 RUNNING_BUDGET_S = 150
@@ -54,14 +64,17 @@ EXPECTED_CALCULATION = 5050
 
 NATIVE_CAPTURE_FORMATS = {
     'claude': 'claude_native_pane_v1',
-    'antigravity': 'hydrogen_native_pane_v1',
+    'antigravity': 'hydrogen_native_pane_v2',
 }
 NATIVE_PROOF_CLASSES = {
     'claude': 'native_bash_output_plus_artifact_v2',
+    'antigravity': 'hydrogen_expanded_native_bash_plus_artifact_v1',
 }
-# Hydrogen (antigravity) native framing is NOT qualified. No proof-class label, record, flag, env var or
-# same-UID artifact can enable it: a class label is not attestation. Enabling requires a Root-qualified actual
-# renderer preflight AND a later separately reviewed source recognizer change (docs/HUB-ACCEPTANCE-10.md).
+# The ONLY qualified antigravity framing is the Hydrogen medium expanded native-Bash frame acquired from the live
+# styled screen (scripts/hydrogen_frame.py + hydrogen_acquire.py + hydrogen_native.py). Every OTHER antigravity
+# model keeps the honest UNAVAILABLE gate below; a Hydrogen record never extends to them.
+HYDROGEN_MODEL = hydrogen_acquire.MODEL
+HYDROGEN_CAPTURE_COMMAND = 'a capture <native_id> --screen --svg'
 UNQUALIFIED_NATIVE_FRAMING = {
     'antigravity': {
         'status': 'UNAVAILABLE',
@@ -69,8 +82,8 @@ UNQUALIFIED_NATIVE_FRAMING = {
         'root_checker_status': 'NEEDS_ROOT_RENDERER_ATTESTATION',
         'native_action_verified': False,
         'typed_stdout_verified': False,
-        'diagnostic': ('Hydrogen native-pane framing has no qualified renderer contract; an exact command row, '
-                       'footer or artifact cannot attest a completed native action'),
+        'diagnostic': ('only the %s expanded native-Bash frame is qualified; this antigravity model has no '
+                       'qualified renderer contract and an artifact cannot attest a native action' % HYDROGEN_MODEL),
     },
 }
 NATIVE_CAPTURE_COMMAND = 'a capture <native_id> --screen --plain'
@@ -79,6 +92,15 @@ NATIVE_CAPTURE_KEYS = {
     'capture_command', 'artifact_schema', 'host_release_sha',
     'provider_version', 'profile_set_sha256', 'reference', 'sha256', 'path',
 }
+# Root attests the exact public client and provider executables for the Hydrogen display acquisition.
+HYDROGEN_TRANSPORT_KEYS = NATIVE_CAPTURE_KEYS | {
+    'model', 'client_executable_path', 'client_executable_sha256',
+    'provider_executable_path', 'provider_executable_sha256',
+}
+HELPER_LIMIT = 16384
+HUB_SHOW_LIMIT = 262144
+BOUNDED_EOF_GRACE_S = 0.25
+BOUNDED_REAP_S = 1.0
 
 WORK_KEYS = (
     'schema', 'run_id', 'sample', 'parent_intake_id', 'child_intake_id',
@@ -139,6 +161,88 @@ class Runner:
         except OSError as exc:
             return 127, b'', str(exc).encode()
         return proc.returncode, proc.stdout, proc.stderr
+
+    def run_bounded(self, tool, args, *, deadline, timeout, max_stdout, max_stderr):
+        """Stream-capped, deadline-bounded collector used ONLY by the Hydrogen native adapter.
+
+        Popen of the exact configured `a`/`hub` argv (no shell, stdin closed); each stream is read
+        nonblocking and refused as soon as it exceeds its own cap (never a post-return length check).
+        `timeout` is the caller's remaining share of its absolute `deadline` (no floor). On cap,
+        timeout or a pipe held open after the child exited, ONLY this Popen child is terminated,
+        then killed, and reaped within BOUNDED_REAP_S; nothing else is signalled. Returns
+        (rc, stdout, stderr); refusals use rc 124 (timeout), 125 (cap), 126 (pipe/reap)."""
+        base = self.bins.get(tool)
+        if tool not in ('a', 'hub') or not base:
+            return 127, b'', b'tool not configured'
+        if (type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0
+                or type(deadline) not in (int, float) or not math.isfinite(deadline)
+                or type(max_stdout) is not int or type(max_stderr) is not int
+                or max_stdout <= 0 or max_stderr <= 0):
+            return 124, b'', b'invalid bound'
+        end = time.monotonic() + timeout
+        try:
+            proc = subprocess.Popen([*base, *args], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, shell=False, close_fds=True)
+        except OSError:
+            return 127, b'', b'spawn failed'
+        out_data, err_data = bytearray(), bytearray()
+        buffers = {proc.stdout.fileno(): (out_data, max_stdout), proc.stderr.fileno(): (err_data, max_stderr)}
+        outcome = None
+        rc = None
+        try:
+            with selectors.DefaultSelector() as selector:
+                for stream in (proc.stdout, proc.stderr):
+                    os.set_blocking(stream.fileno(), False)
+                    selector.register(stream, selectors.EVENT_READ)
+                exited_at = None
+                while outcome is None and selector.get_map():
+                    now = time.monotonic()
+                    if now >= end:
+                        outcome = 'timeout'
+                        break
+                    if exited_at is None and proc.poll() is not None:
+                        exited_at = now
+                    if exited_at is not None and now - exited_at > BOUNDED_EOF_GRACE_S:
+                        outcome = 'pipe'
+                        break
+                    for key, _ in selector.select(min(end - now, 0.05)):
+                        data, cap = buffers[key.fileobj.fileno()]
+                        try:
+                            chunk = os.read(key.fileobj.fileno(), min(65536, cap + 1 - len(data)))
+                        except BlockingIOError:
+                            continue
+                        if not chunk:
+                            selector.unregister(key.fileobj)
+                            continue
+                        data.extend(chunk)
+                        if len(data) > cap:
+                            outcome = 'cap'
+                            break
+            if outcome is None:
+                try:
+                    rc = proc.wait(timeout=max(0.0, end - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    outcome = 'timeout'
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=BOUNDED_REAP_S / 2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=BOUNDED_REAP_S / 2)
+                    except subprocess.TimeoutExpired:
+                        outcome = 'reap'
+            proc.stdout.close()
+            proc.stderr.close()
+        if outcome == 'timeout':
+            return 124, b'', b'timeout'
+        if outcome == 'cap':
+            return 125, b'', b'output cap exceeded'
+        if outcome in ('pipe', 'reap'):
+            return 126, b'', b'child pipe or reap not bounded'
+        return rc, bytes(out_data), bytes(err_data)
 
     def json(self, tool, args, timeout=300):
         rc, out, err = self.run(tool, args, timeout)
@@ -343,9 +447,44 @@ def _validate_evidence_common(ev, commit, expected_kind):
     return problems, validation.get('target_commit'), validation
 
 
+def _absolute_clean_path(value):
+    return (evidence_text(value, 4096) and value.startswith('/') and '..' not in value.split('/')
+            and '//' not in value)
+
+
+def hydrogen_transport_ok(record, host_sha):
+    """Root attests the Hydrogen medium styled-screen transport and the exact public executables.
+
+    Version and provider executable hash must equal the single reviewed observation pinned by
+    hydrogen_acquire; the attested client executable is what the `a` runner must resolve to."""
+    return (isinstance(record, dict)
+            and not set(record) - HYDROGEN_TRANSPORT_KEYS
+            and HYDROGEN_TRANSPORT_KEYS - {'path'} <= set(record)
+            and record.get('engine') == 'antigravity'
+            and record.get('model') == HYDROGEN_MODEL
+            and record.get('machine_id') == HOST
+            and record.get('mode') == 'interactive'
+            and record.get('format') == NATIVE_CAPTURE_FORMATS['antigravity']
+            and record.get('proof_class') == NATIVE_PROOF_CLASSES['antigravity']
+            and record.get('capture_command') == HYDROGEN_CAPTURE_COMMAND
+            and record.get('artifact_schema') == WORK_SCHEMA
+            and valid_hex40(host_sha)
+            and record.get('host_release_sha') == host_sha
+            and record.get('provider_version') == hydrogen_acquire.PROVIDER_VERSION
+            and record.get('provider_executable_sha256') == hydrogen_acquire.PROVIDER_EXECUTABLE_SHA256
+            and _absolute_clean_path(record.get('provider_executable_path'))
+            and _absolute_clean_path(record.get('client_executable_path'))
+            and valid_hex64(record.get('client_executable_sha256'))
+            and evidence_text(record.get('reference'), 2048)
+            and valid_hex64(record.get('profile_set_sha256'))
+            and valid_hex64(record.get('sha256')))
+
+
 def native_transport_ok(engine, record, host_sha):
     """Root attests interactive native-pane transport, proof class, and capture command."""
-    if engine in UNQUALIFIED_NATIVE_FRAMING or engine not in NATIVE_PROOF_CLASSES:
+    if engine == 'antigravity':
+        return hydrogen_transport_ok(record, host_sha)
+    if engine not in NATIVE_PROOF_CLASSES:
         return False
     return (engine in NATIVE_CAPTURE_FORMATS and isinstance(record, dict)
             and not set(record) - NATIVE_CAPTURE_KEYS
@@ -371,10 +510,6 @@ def validate_native_evidence(ev, path, commit):
     if validation is None:
         return problems
     transports = validation.get('capture_transports')
-    if isinstance(transports, dict):
-        for engine in sorted(set(transports) & set(UNQUALIFIED_NATIVE_FRAMING)):
-            info = UNQUALIFIED_NATIVE_FRAMING[engine]
-            problems.append('capture_%s native proof %s: %s (%s)' % (engine, info['status'], info['reason'], info['diagnostic']))
     if (not valid_hex40(host_sha) or not isinstance(transports, dict)
             or not 1 <= len(transports) <= len(NATIVE_CAPTURE_FORMATS)
             or any(not native_transport_ok(engine, record, host_sha) for engine, record in transports.items())):
@@ -729,8 +864,11 @@ def work_rel_path(run_id, sample):
 
 
 def probe_rel_path(run_id, sample):
-    """Short unique per-sample probe script path; short enough to be fully visible in a Hydrogen Ran header."""
-    return Path('.local') / 'a10' / ('%s%02d.py' % (run_id.replace('-', '')[:8], sample))
+    """The one short exact per-sample helper path of the reviewed Hydrogen grammar `.local/h7_<12hex>_<NN>.py`.
+
+    Derived only from values frozen BEFORE the child intake exists (the brief names it), so the same exact
+    command is used for every engine and the full command fits the native Bash header row."""
+    return Path(hydrogen_frame.h7_rel_path(run_id, sample))
 
 
 def probe_command(run_id, sample):
@@ -785,22 +923,23 @@ def observe_git_state(r, workspace, clock, deadline):
 
 
 def verify_work_artifact(r, actual_workspace, run_id, sample, parent_intake_id, child_intake_id,
-                         session_id, native_id, challenge32, clock, deadline, require_probe=False):
+                         session_id, native_id, challenge32, clock, deadline, pinned_probe=None):
     """Independently verify result.json bytes, schema, identities, Git state, and challenge digest.
 
-    Every Git call uses the REMAINING proof deadline (never a fresh default timeout)."""
+    With `pinned_probe`, the worker's copy at probe_rel_path must be byte-identical to the Root-pinned
+    helper rendered before dispatch. Every Git call uses the REMAINING proof deadline."""
     if clock() >= deadline:
         raise TimeoutError('proof deadline exhausted before artifact verification')
     probe_sha = None
-    if require_probe:
+    if pinned_probe is not None:
         prel = probe_rel_path(run_id, sample)
         _fresh_git_timeout(clock, deadline, 'probe path validation')
         validate_no_symlink_ancestors(actual_workspace, prel)
         _fresh_git_timeout(clock, deadline, 'probe read')
-        probe_bytes = bounded_file(Path(actual_workspace) / prel, ARTIFACT_LIMIT)
+        probe_bytes = bounded_file(Path(actual_workspace) / prel, HELPER_LIMIT)
         _fresh_git_timeout(clock, deadline, 'probe read completion')
-        if not probe_bytes.strip():
-            raise ValueError('per-sample probe script is empty')
+        if probe_bytes != pinned_probe:
+            raise ValueError('per-sample probe is not the exact Root-pinned helper')
         probe_sha = hashlib.sha256(probe_bytes).hexdigest()
     rel = work_rel_path(run_id, sample)
     _fresh_git_timeout(clock, deadline, 'result path validation')
@@ -845,6 +984,8 @@ def verify_work_artifact(r, actual_workspace, run_id, sample, parent_intake_id, 
         raise ValueError('result.json does not match exact canonical V2 serialization or expected fields')
     return {
         'artifact_sha256': hashlib.sha256(raw_bytes).hexdigest(),
+        'artifact_bytes': raw_bytes,
+        'work': expected_work,
         'proof_digest': expected_digest,
         'head': head,
         'tracked_status_sha256': status_sha,
@@ -925,42 +1066,14 @@ def _claude_native_pane_ok(captured, expected_line, brief_text):
     return False
 
 
-def hydrogen_framing_diagnostic(captured, command_id):
-    """PROSPECTIVE support hook only -- never native authority.
-
-    Reports how many exact, fully visible `● Ran (<command_id>) (ctrl+o to expand)` rows the plain pane shows and
-    which known ambiguity classes are present (same-command Running/error rows, duplicates). It cannot tell a
-    completed native action from assistant/footer text, so its status is always UNKNOWN_NATIVE_FRAMING and
-    native_action_verified is always False until a Root-qualified renderer contract and a separately reviewed
-    recognizer replace this function."""
-    info = dict(UNQUALIFIED_NATIVE_FRAMING['antigravity'])
-    exact = bool(isinstance(command_id, str) and re.fullmatch(r'python3 \.local/a10/[0-9a-f]{8}\d{2}\.py', command_id))
-    rows = 0
-    contradictions = []
-    if exact and isinstance(captured, str):
-        want = '● Ran (%s) (ctrl+o to expand)' % command_id
-        for line in captured.splitlines():
-            flat = _collapse_ws(_strip_ansi(line))
-            if flat == want:
-                rows += 1
-            elif command_id in flat and re.search(r'Running|Error|failed|exit', flat):
-                contradictions.append('same-command non-completed/failed row')
-        if rows > 1:
-            contradictions.append('duplicate exact row')
-    info.update(exact_command=exact, candidate_rows=rows, contradictions=sorted(set(contradictions)))
-    return info
-
-
-def _hydrogen_native_pane_ok(captured, command_id):
-    """Hydrogen native proof is UNAVAILABLE (UNKNOWN_NATIVE_FRAMING): always False today."""
-    hydrogen_framing_diagnostic(captured, command_id)
-    return False
-
-
 def native_pane_output_ok(captured, engine, transport, expected_line, brief_text, command_id=None):
     """Validate direct `a capture <native_id> --screen --plain` against attested interactive profile."""
     if (not isinstance(captured, str) or len(captured.encode('utf-8')) > CAPTURE_LIMIT
             or not isinstance(brief_text, str) or expected_line in brief_text):
+        return False
+    if engine != 'claude':
+        # Hydrogen proof comes ONLY from the bounded styled-screen acquisition (hydrogen_native_proof);
+        # a plain-text pane can never attest an antigravity native action.
         return False
     if not native_transport_ok(engine, transport, (transport.get('host_release_sha') if isinstance(transport, dict) else None)):
         return False
@@ -971,11 +1084,7 @@ def native_pane_output_ok(captured, engine, transport, expected_line, brief_text
     first_nonempty = next((ln.strip() for ln in clean.splitlines() if ln.strip()), '')
     if first_nonempty.startswith('{') and '"type":' in first_nonempty:
         return False
-    if engine == 'claude':
-        return _claude_native_pane_ok(captured, expected_line, brief_text)
-    if engine == 'antigravity':
-        return _hydrogen_native_pane_ok(captured, command_id)
-    return False
+    return _claude_native_pane_ok(captured, expected_line, brief_text)
 
 
 def make_probe():
@@ -996,33 +1105,42 @@ def make_probe():
 
 
 # --- Brief / AC construction ---
-def make_child_brief_and_ac(run_id, sample, parent_intake_id, challenge_path):
+FINAL_CAPTION = hydrogen_acquire.FINAL_CAPTION
+
+
+def helper_path_for(output_dir, sample):
+    return Path(output_dir) / ('helper-%d.py' % sample)
+
+
+def make_child_brief_and_ac(run_id, sample, parent_intake_id, challenge_path, helper_path):
+    """Engine-agnostic brief frozen BEFORE the child intake id and the model draw exist.
+
+    The worker copies the Root-pinned helper (rendered after child creation, pinned before start) to the one
+    short exact path and runs it once. The helper observes the runtime identity itself; the brief never
+    carries the challenge bytes, the expected digest, the helper digest or any identity it cannot know yet."""
     rel_result = str(work_rel_path(run_id, sample))
+    rel_probe = str(probe_rel_path(run_id, sample))
     brief = (
         f'Phase 7 interactive native-pane probe (run {run_id}, sample {sample}/{COUNT}, parent {parent_intake_id}).\n'
         'First action: run `aplexer whoami --json` to observe your canonical native id, tag, and workspace '
         '(it prints a full session record: read only its `id` and `workspace` fields; never copy the record, '
         'command, env or profile into files or output).\n'
-        'Then use a real shell/Python tool in your actual child workspace to:\n'
-        '1. Run `git rev-parse --verify HEAD` and `git status --porcelain=v1 -z --untracked-files=no`.\n'
-        '2. Compute `calculation = sum(range(1, 101))`.\n'
-        f'3. Read the 32-byte challenge file at `{challenge_path}`.\n'
-        '4. Build the canonical JSON work object with exact keys: schema="phase7_native_work_v2", '
-        f'run_id="{run_id}", sample={sample}, parent_intake_id="{parent_intake_id}", '
-        'child_intake_id=<this intake id>, session_id=<this Hub session id>, native_id=<whoami id>, '
-        f'project="{PROJECT}", machine_id="{HOST}", workspace=<actual workspace>, head=<HEAD>, '
-        'tracked_status_sha256=<sha256 of status -z bytes>, tracked_status_entries=<record count>, calculation=5050.\n'
-        '5. Compute proof_digest = sha256(b"HUB_PHASE7_NATIVE_WORK_V2\\x00" + challenge32 + b"\\x00" + C(work_object)).hexdigest().\n'
-        f'6. Write canonical JSON (work_object + proof_digest, sort_keys=True, separators=(",", ":"), ensure_ascii=False, + "\\n") '
-        f'only to `{rel_result}` inside your actual child workspace.\n'
-        f'7. Print `AC10_WORK_V2 {run_id} {sample} <proof_digest> <head> 5050` from the real tool stdout AFTER writing the file.\n'
-        f'Perform steps 1-7 in ONE Python script saved at `{probe_rel_path(run_id, sample)}` in your child workspace and '
-        f'run it once as the single foreground command `{probe_command(run_id, sample)}` (no cd, pipes, chaining or extra args).\n'
+        'Then, in your actual child workspace (no business work, no tracked edits):\n'
+        f'1. Copy the EXACT bytes of the Root-pinned helper `{helper_path}` to `{rel_probe}` with mode 0600 '
+        '(create `.local` if needed). Do not edit, regenerate, reformat or substitute it.\n'
+        f'2. Run it once as the single foreground command `{probe_command(run_id, sample)}` '
+        '(no cd, pipes, chaining, extra args, background, sleep, hold or polling; do not run it twice). '
+        f'It reads the 32-byte challenge file at `{challenge_path}`, observes Git and `aplexer whoami --json`, '
+        f'writes canonical JSON only to `{rel_result}` inside your actual child workspace and prints one '
+        '`AC10_WORK_V2` line from the real tool stdout. Let the genuine tool finish; never write that file yourself.\n'
+        'Do not repeat the command, digest or output in prose. No Enter/ctrl+o/trust-menu actions. If anything fails, '
+        'report the concise failure instead of fabricating completion.\n'
+        f'After the tool finishes successfully, your ENTIRE final response must be EXACTLY this one line: {FINAL_CAPTION}\n'
         'Do not edit tracked files, commit, push, exit, start timers, or call `hub sessions finish`; remain at the interactive prompt until Hub STOP.'
     )
     ac = (
         f'1. Genuine `aplexer whoami --json` and independent V2 work artifact written at `{rel_result}` '
-        f'matching the 32-byte challenge at `{challenge_path}` and current Git state.\n'
+        f'by the exact Root-pinned helper `{rel_probe}`, matching the 32-byte challenge at `{challenge_path}` and current Git state.\n'
         '2. Real native-pane tool completion output printed and worker remains interactive until Hub STOP.'
     )
     return brief, ac
@@ -1812,7 +1930,7 @@ def _persist_manifest(manifest_path, manifest):
 
 
 def one_start(r, rec, run_id, parent_intake_id, workspace, output_dir, manifest, manifest_path,
-              clock, sleep, seen_intakes, seen_sessions, seen_natives, capture_transports):
+              clock, sleep, seen_intakes, seen_sessions, seen_natives, capture_transports, hydrogen_ctx=None):
     err = rec['errors']
     sample = rec['n']
     rec['create_key'] = 'acc10-create-%s-%d' % (run_id, sample)
@@ -1822,7 +1940,8 @@ def one_start(r, rec, run_id, parent_intake_id, workspace, output_dir, manifest,
     challenge_path = Path(output_dir) / ('challenge-%d.bin' % sample)
     brief_path = Path(output_dir) / ('brief-%d.txt' % sample)
     ac_path = Path(output_dir) / ('ac-%d.txt' % sample)
-    brief_text, ac_text = make_child_brief_and_ac(run_id, sample, parent_intake_id, challenge_path)
+    helper_path = helper_path_for(output_dir, sample)
+    brief_text, ac_text = make_child_brief_and_ac(run_id, sample, parent_intake_id, challenge_path, helper_path)
     exclusive_write_private(brief_path, brief_text.encode('utf-8'))
     exclusive_write_private(ac_path, ac_text.encode('utf-8'))
 
@@ -1836,6 +1955,8 @@ def one_start(r, rec, run_id, parent_intake_id, workspace, output_dir, manifest,
         'start_key': rec['start_key'],
         'stop_key': rec['stop_key'],
         'challenge_path': str(challenge_path),
+        'helper_path': str(helper_path),
+        'probe_command': probe_command(run_id, sample),
     }
     manifest['samples'].append(sample_manifest)
     _persist_manifest(manifest_path, manifest)
@@ -1854,6 +1975,20 @@ def one_start(r, rec, run_id, parent_intake_id, workspace, output_dir, manifest,
     challenge32 = os.urandom(32)
     exclusive_write_private(challenge_path, challenge32, mode=0o400)
     sample_manifest['challenge_sha256'] = hashlib.sha256(challenge32).hexdigest()
+    # Root-pinned helper: rendered and pinned AFTER child creation and BEFORE dispatch (the brief only names its
+    # path). The worker must copy these exact bytes; the result artifact itself is never pre-created.
+    helper_bytes = hydrogen_helper.render_helper({
+        'aplexer_binary': (hydrogen_ctx or {}).get('aplexer_binary'),
+        'challenge_path': str(challenge_path),
+        'child_intake_id': child_id,
+        'machine_id': HOST,
+        'parent_intake_id': parent_intake_id,
+        'project': PROJECT,
+        'run_id': run_id,
+        'sample': sample,
+    })
+    exclusive_write_private(helper_path, helper_bytes)
+    sample_manifest['helper_sha256'] = hashlib.sha256(helper_bytes).hexdigest()
     _persist_manifest(manifest_path, manifest)
 
     argv = build_start_argv(workspace, child_id, rec['start_key'])
@@ -1990,6 +2125,15 @@ def one_start(r, rec, run_id, parent_intake_id, workspace, output_dir, manifest,
         return
 
     engine = rec.get('engine')
+    if engine == 'antigravity' and rec.get('model') == HYDROGEN_MODEL:
+        transport = (capture_transports or {}).get(engine)
+        if not hydrogen_transport_ok(transport, transport.get('host_release_sha') if isinstance(transport, dict) else None):
+            err.append('capture proof unavailable: no verified Hydrogen styled-screen transport for %s' % HYDROGEN_MODEL)
+            return
+        hydrogen_native_proof(r, rec, run_id, sample, parent_intake_id, child_id, sid, native_id, actual_workspace,
+                              challenge32, helper_bytes, transport, output_dir, sample_manifest, manifest,
+                              manifest_path, clock, sleep, hydrogen_ctx or {})
+        return
     if engine in UNQUALIFIED_NATIVE_FRAMING:
         # Honest unavailable gate: artifact-only evidence is still verified and recorded, but it can never
         # bootstrap native authority. The sample is not resampled and cannot count toward the formal ten.
@@ -2002,7 +2146,7 @@ def one_start(r, rec, run_id, parent_intake_id, workspace, output_dir, manifest,
             try:
                 work_info = verify_work_artifact(
                     r, actual_workspace, run_id, sample, parent_intake_id, child_id, sid, native_id, challenge32,
-                    clock, adeadline, require_probe=True,
+                    clock, adeadline, pinned_probe=helper_bytes,
                 )
                 rec['artifact_only'] = {k: work_info[k] for k in (
                     'artifact_sha256', 'proof_digest', 'head', 'tracked_status_sha256', 'probe_sha256')}
@@ -2039,7 +2183,7 @@ def one_start(r, rec, run_id, parent_intake_id, workspace, output_dir, manifest,
             if rc_cap == 0 and cap_out:
                 work_info = verify_work_artifact(
                     r, actual_workspace, run_id, sample, parent_intake_id, child_id, sid, native_id, challenge32,
-                    clock, cdeadline, require_probe=(engine == 'antigravity'),
+                    clock, cdeadline, pinned_probe=helper_bytes,
                 )
                 expected_line = 'AC10_WORK_V2 %s %d %s %s %d' % (
                     run_id, sample, work_info['proof_digest'], work_info['head'], EXPECTED_CALCULATION
@@ -2080,6 +2224,207 @@ def one_start(r, rec, run_id, parent_intake_id, workspace, output_dir, manifest,
             break
         sleep(min(1, max(0.01, cdeadline - clock())))
     err.append('Native pane capture and independent V2 artifact did not prove completed work')
+
+
+# --- Hydrogen styled-screen native proof ---
+# Only a view that is not yet the supported idle collapsed state may be re-observed (no gesture was attempted).
+# Every other refusal, and ANY outcome after the single key attempt, is final: no retry, replay or resample.
+HYDROGEN_NOT_READY_REASONS = ('unsupported_or_nonidle_collapsed_view',)
+
+
+def _executable_meta(path):
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, stat.S_IMODE(info.st_mode))
+
+
+def _hash_executable(path, expected_sha256, clock, deadline):
+    """Hash one public executable inside the proof deadline; it must be a stable regular file."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError('attested executable is not a regular file')
+        digest = hashlib.sha256()
+        while True:
+            if clock() >= deadline:
+                raise TimeoutError('proof deadline exhausted while hashing an attested executable')
+            block = os.read(fd, 1 << 20)
+            if not block:
+                break
+            digest.update(block)
+        after = os.fstat(fd)
+    finally:
+        os.close(fd)
+    if (before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns):
+        raise ValueError('attested executable changed while hashing')
+    if digest.hexdigest() != expected_sha256:
+        raise ValueError('executable %s does not match its Root-attested sha256' % path)
+    meta = _executable_meta(path)
+    if meta is None or meta[:5] != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns):
+        raise ValueError('attested executable changed after hashing')
+    return meta
+
+
+class HydrogenPins:
+    """Root-attested client/provider executables: hashed once per sample, re-checked unchanged on every read.
+
+    The `a` runner must resolve to the attested client. No provider executable is ever run."""
+
+    def __init__(self, r, transport, clock, deadline):
+        self.transport = transport
+        self.a_bin = (getattr(r, 'bins', None) or {}).get('a', [None])[0]
+        self.client = self._resolve()
+        if self.client is None or self.client != transport['client_executable_path']:
+            raise ValueError('native client executable is not the Root-attested client')
+        self.provider = transport['provider_executable_path']
+        self.client_meta = _hash_executable(self.client, transport['client_executable_sha256'], clock, deadline)
+        self.provider_meta = _hash_executable(self.provider, transport['provider_executable_sha256'], clock, deadline)
+
+    def _resolve(self):
+        resolved = shutil.which(self.a_bin) if isinstance(self.a_bin, str) else None
+        return os.path.realpath(resolved) if resolved else None
+
+    def verify(self, identity, *, deadline, timeout):
+        return (identity.version == self.transport['provider_version']
+                and identity.executable_sha256 == self.transport['provider_executable_sha256']
+                and self._resolve() == self.client
+                and _executable_meta(self.client) == self.client_meta
+                and _executable_meta(self.provider) == self.provider_meta)
+
+
+def hydrogen_identity(r, rec, sid, child_id, native_id, actual_workspace, transport, clock, deadline):
+    """Immutable acquisition tuple: Hub custody from the start show, native birth/tag from native status."""
+    owned = rec.get('owned_identity') if isinstance(rec.get('owned_identity'), dict) else {}
+    rc, out, _err = r.run_bounded('a', ['status', native_id, '--json'], deadline=deadline,
+                                  timeout=left(clock, deadline, 10), max_stdout=hydrogen_native.JSON_CAP,
+                                  max_stderr=hydrogen_native.ERROR_CAP)
+    if rc != 0:
+        raise RuntimeError('native status unavailable (rc=%s)' % rc)
+    status = hydrogen_native.strict_json(out)
+    if (status.get('id') != native_id or status.get('workspace') != actual_workspace
+            or status.get('tag') != 'task-hub2-' + sid or type(status.get('created_at_ms')) is not int):
+        raise RuntimeError('native status does not bind the owned native/workspace/tag/birth')
+    return hydrogen_acquire.Identity(
+        hub_session=sid, intake=child_id, machine=HOST, epoch=owned.get('epoch'),
+        operation=owned.get('attempt_operation_id'),
+        request_digest=hashlib.sha256(canonical_json_bytes(rec.get('_start_argv'))).hexdigest(),
+        native=native_id, birth_ms=status['created_at_ms'], tag=status['tag'], workspace=actual_workspace,
+        provider='antigravity', engine='antigravity', model=HYDROGEN_MODEL,
+        version=transport['provider_version'], executable_sha256=transport['provider_executable_sha256'])
+
+
+def hydrogen_native_proof(r, rec, run_id, sample, parent_intake_id, child_id, sid, native_id, actual_workspace,
+                          challenge32, helper_bytes, transport, output_dir, sample_manifest, manifest, manifest_path,
+                          clock, sleep, hydrogen_ctx):
+    """Completed Hydrogen native Bash proof from ONE live styled screen buffer of the owned pane.
+
+    Inside the single proof window: wait for the pinned helper's canonical artifact, then run bounded
+    acquisitions (scripts/hydrogen_acquire.py). An already expanded frame needs zero keys; otherwise only the
+    observed idle collapsed completion view allows exactly one durably fenced 0x0f, followed by at most two
+    post-key captures. The single proving buffer must independently satisfy scripts/hydrogen_frame.py."""
+    err = rec['errors']
+    command = probe_command(run_id, sample)
+    helper_sha = hashlib.sha256(helper_bytes).hexdigest()
+    proof = rec['native_proof'] = {
+        'status': 'UNKNOWN', 'proof_class': NATIVE_PROOF_CLASSES['antigravity'], 'model': HYDROGEN_MODEL,
+        'native_action_verified': False, 'typed_stdout_verified': False,
+        'acquisitions': 0, 'key_attempted': False, 'key_bytes_sent': 0, 'reason': 'not_started',
+    }
+    rec['capture_verified'] = False
+    cdeadline = clock() + CAPTURE_BUDGET_S
+    try:
+        pins = HydrogenPins(r, transport, clock, cdeadline)
+        identity = hydrogen_identity(r, rec, sid, child_id, native_id, actual_workspace, transport, clock, cdeadline)
+        intent = hydrogen_acquire.Intent(identity=identity, command=command, root_owned=True, deadline=cdeadline)
+        hydrogen_acquire._valid_intent(intent)
+    except Exception as exc:
+        err.append('Hydrogen identity/pin preflight failed: %s' % exc)
+        return
+    current, frame = {}, {}
+
+    def read_hub(hub_session, *, deadline, timeout):
+        rc, out, _err = r.run_bounded('hub', ['sessions', 'show', hub_session, '--json'], deadline=deadline,
+                                      timeout=timeout, max_stdout=HUB_SHOW_LIMIT, max_stderr=hydrogen_native.ERROR_CAP)
+        if rc != 0:
+            raise RuntimeError('session show failed')
+        sess = session_of(json.loads(out.decode('utf-8'), object_pairs_hook=unique_object), sid)
+        drift = _bind_view(rec['owned_identity'], sess, machine_session_identity, 'hydrogen identity read', IDENTITY_KEYS)
+        if drift:
+            raise RuntimeError(drift)
+        return sess
+
+    def read_artifact(_intent, *, deadline, timeout):
+        info = verify_work_artifact(r, actual_workspace, run_id, sample, parent_intake_id, child_id, sid, native_id,
+                                    challenge32, clock, min(deadline, clock() + timeout), pinned_probe=helper_bytes)
+        current.update(info)
+        return info['artifact_sha256']
+
+    def recognize_expanded(snapshot, _intent, *, deadline, timeout):
+        try:
+            match = hydrogen_frame.recognize(
+                snapshot.svg, work=current['work'], script_relpath=str(probe_rel_path(run_id, sample)),
+                script_sha256=helper_sha, pinned_script=helper_bytes, challenge=challenge32,
+                canonical_artifact=current['artifact_bytes'], expected_command=command, home=hydrogen_ctx.get('home'))
+        except (hydrogen_frame.Refused, KeyError, TypeError, ValueError):
+            return False
+        frame.clear()
+        frame.update(match, svg=snapshot.svg)
+        return True
+
+    adapter = hydrogen_native.Adapter(
+        intent=intent, runner=r, read_hub=read_hub, artifact_reader=read_artifact,
+        verify_public_pins=pins.verify, known_human=lambda *, deadline, timeout: False,
+        clock=clock, fence_directory=str(hydrogen_ctx.get('fence_dir')))
+    while clock() < cdeadline:
+        try:
+            if native_id not in live_native_rows(r, left(clock, cdeadline, 20)):
+                err.append('native exited before work proof completed')
+                return
+            read_artifact(intent, deadline=cdeadline, timeout=left(clock, cdeadline, 30))
+        except (OSError, ValueError, RuntimeError, TimeoutError):
+            if clock() >= cdeadline:
+                break
+            sleep(min(1, max(0.01, cdeadline - clock())))
+            continue
+        frame.clear()
+        state = hydrogen_acquire.acquire(
+            intent, read_identity=adapter.read_identity, capture=adapter.capture,
+            validate_artifact=adapter.validate_artifact, recognize_expanded=recognize_expanded,
+            record_attempt=adapter.record_attempt, send=adapter.send, clock=clock)
+        proof.update(acquisitions=proof['acquisitions'] + 1, reason=state['reason'],
+                     key_attempted=proof['key_attempted'] or state['key_attempted'],
+                     post_captures=state['post_captures'], key_bytes_sent=adapter.sent)
+        if (state['status'] == 'CANDIDATE_FRAME_RECOGNIZED' and frame.get('svg')
+                and frame.get('artifact_sha256') == current.get('artifact_sha256')
+                and frame.get('proof_digest') == current.get('proof_digest')):
+            svg = frame['svg']
+            cap_path = Path(output_dir) / ('capture-%d.svg' % sample)
+            atomic_write_private(cap_path, svg)
+            proof.update(status='VERIFIED', native_action_verified=True, typed_stdout_verified=True,
+                         frame_created_at=frame['created_at'], frame_completed_at=frame['completed_at'])
+            rec.update(
+                capture_verified=True, capture_sha256=hashlib.sha256(svg).hexdigest(), capture_path=str(cap_path),
+                artifact_sha256=current['artifact_sha256'], proof_digest=current['proof_digest'],
+                git_head=current['head'], tracked_status_sha256=current['tracked_status_sha256'],
+                tracked_status_entries=current['tracked_status_entries'], calculation=current['calculation'],
+                probe_command=command, probe_sha256=current['probe_sha256'],
+            )
+            sample_manifest.update(capture_sha256=rec['capture_sha256'], artifact_sha256=rec['artifact_sha256'],
+                                   proof_digest=rec['proof_digest'], hydrogen_key_bytes_sent=adapter.sent)
+            _persist_manifest(manifest_path, manifest)
+            return
+        if state['key_attempted'] or state['reason'] not in HYDROGEN_NOT_READY_REASONS:
+            break
+        if clock() >= cdeadline:
+            break
+        sleep(min(1, max(0.01, cdeadline - clock())))
+    sample_manifest.update(hydrogen_key_bytes_sent=adapter.sent, hydrogen_reason=proof['reason'])
+    _persist_manifest(manifest_path, manifest)
+    err.append('Hydrogen native display acquisition did not prove completed work (%s; key bytes sent=%d)' % (
+        proof['reason'], adapter.sent))
 
 
 def verify_listing(r, rec, clock):
@@ -2173,6 +2518,11 @@ def run(r, evidence_path, commit, clock=time.monotonic, sleep=time.sleep, out=No
         problems.append('valid parent --intake-task-id UUID required')
     if not output_dir:
         problems.append('explicit private --output-dir required')
+    a_bin = (getattr(r, 'bins', None) or {}).get('a', [None])[0]
+    a_resolved = shutil.which(a_bin) if isinstance(a_bin, str) else None
+    aplexer_binary = os.path.realpath(a_resolved) if a_resolved else None
+    if not aplexer_binary:
+        problems.append('native client executable unresolvable for the pinned helper')
     if not plan_only:
         try:
             before = sample_alerts(r)
@@ -2199,6 +2549,7 @@ def run(r, evidence_path, commit, clock=time.monotonic, sleep=time.sleep, out=No
         'requested_workspace': workspace,
         'commit': commit,
         'evidence_sha256': evidence_digest,
+        'aplexer_binary': aplexer_binary,
         'samples': [],
     }
     exclusive_write_private(manifest_path, canonical_json_bytes(manifest) + b'\n')
@@ -2215,6 +2566,19 @@ def run(r, evidence_path, commit, clock=time.monotonic, sleep=time.sleep, out=No
         print(json.dumps({'run_id': run_id, 'manifest': str(manifest_path), 'plan': plan}, indent=2), file=out)
         return 0
 
+    # Durably provisioned private parent for the Hydrogen once-only key fences (O_EXCL records + dir fsync).
+    fence_dir = out_dir / 'hydrogen-fence'
+    try:
+        os.mkdir(str(fence_dir), 0o700)
+        fsync_dir(out_dir)
+        fence_stat = os.lstat(fence_dir)
+        if not stat.S_ISDIR(fence_stat.st_mode) or stat.S_IMODE(fence_stat.st_mode) != 0o700:
+            raise OSError('fence directory is not private 0700')
+    except OSError as exc:
+        print('ACCEPTANCE FAIL (preconditions): Hydrogen fence directory: %s' % exc, file=out)
+        return 1
+    hydrogen_ctx = {'aplexer_binary': aplexer_binary, 'fence_dir': fence_dir, 'home': os.path.expanduser('~')}
+
     recs = []
     seen_intakes, seen_sessions, seen_natives = set(), set(), set()
     try:
@@ -2225,6 +2589,7 @@ def run(r, evidence_path, commit, clock=time.monotonic, sleep=time.sleep, out=No
                 one_start(
                     r, rec, run_id, intake, workspace, out_dir, manifest, manifest_path,
                     clock, sleep, seen_intakes, seen_sessions, seen_natives, capture_transports,
+                    hydrogen_ctx=hydrogen_ctx,
                 )
             except Exception as exc:
                 rec['errors'].append('start crashed: %s' % exc)
