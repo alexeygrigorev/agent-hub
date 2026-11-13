@@ -1688,6 +1688,94 @@ class CanaryTest(unittest.TestCase):
         self.assertEqual(sum(1 for line in calls_auth if line.startswith("sessions start ")), 1)
         self.assertEqual(sum(1 for line in calls_auth if line == "sessions list --all --json"), 1)
 
+    HANDOFF_MAX_GENERATIONS = 1000   # ~4s of 3ms generations; outlives the updater leader
+    HANDOFF_LIFETIME_S = 10.0
+
+    def handoff_members(self):
+        try:
+            text = (self.tmp / "handoff.pids").read_text()
+        except FileNotFoundError:
+            return []
+        return [tuple(line.split()[:2]) for line in text.splitlines()
+                if len(line.split()) == 3 and line.split()[0].isdigit()]
+
+    def handoff_sids(self):
+        text = (self.tmp / "handoff.pids").read_text()
+        return {int(line.split()[2]) for line in text.splitlines()
+                if len(line.split()) == 3 and line.split()[0].isdigit()}
+
+    def handoff_ended(self):
+        """True once a generation stopped by itself (stop file or finite bound) without forking."""
+        try:
+            return any(line.startswith("end ") for line in (self.tmp / "handoff.pids").read_text().splitlines())
+        except FileNotFoundError:
+            return False
+
+    def handoff_generation_live(self, pid, start):
+        try:
+            data = pathlib.Path(f"/proc/{pid}/stat").read_text()
+        except OSError:
+            return False
+        fields = data.rsplit(")", 1)[1].split()
+        return fields[0] != "Z" and fields[19] == start
+
+    def reap_handoff_chain(self, deadline_s=15.0):
+        """Stop, SIGKILL and await every recorded generation of the escaped handoff chain.
+
+        Each generation records "pid starttime" before it checks handoff.stop, so once the stop file
+        exists at most one further generation can appear, and it records itself before exiting.
+        Signals go through a pidfd whose identity is re-verified against the recorded starttime, so
+        a recycled PID is never signalled; exit is awaited on the pidfd (readable on exit, also for a
+        non-child reparented to another subreaper). Every generation records itself immediately after
+        its fork, so the 0.1s quiet period (>> fork-to-record) catches a child forked just before its
+        parent was killed; the fixture's own generation/lifetime bound is the final backstop.
+        Returns (members, killed, ended); raises on timeout.
+        """
+        import errno, select
+        (self.tmp / "handoff.stop").touch()
+        end = time.monotonic() + deadline_s
+        done, killed = set(), 0
+        while True:
+            members = self.handoff_members()
+            for pid_s, start in members:
+                if (pid_s, start) in done:
+                    continue
+                pid = int(pid_s)
+                try:
+                    fd = os.pidfd_open(pid)
+                except ProcessLookupError:
+                    done.add((pid_s, start))
+                    continue
+                except OSError as e:
+                    # EINVAL: the struct pid outlives its released task (exited and reaped by the
+                    # foreign subreaper). Accept only if /proc agrees the generation is gone.
+                    if e.errno != errno.EINVAL or self.handoff_generation_live(pid, start):
+                        raise
+                    done.add((pid_s, start))
+                    continue
+                try:
+                    try:
+                        stat = pathlib.Path(f"/proc/{pid}/stat").read_text()
+                        same = stat.rsplit(")", 1)[1].split()[19] == start
+                    except OSError:
+                        same = False
+                    if same:  # pidfd pins this exact process; it is our generation
+                        try:
+                            signal.pidfd_send_signal(fd, signal.SIGKILL)
+                            killed += 1
+                        except ProcessLookupError:
+                            pass
+                        if not select.select([fd], [], [], max(0.0, end - time.monotonic()))[0]:
+                            raise AssertionError(f"handoff generation {pid} did not exit after SIGKILL")
+                finally:
+                    os.close(fd)
+                done.add((pid_s, start))
+            time.sleep(0.1)  # >> 3ms generation period: any live unrecorded generation records itself
+            if len(self.handoff_members()) == len(members):
+                return members, killed, self.handoff_ended()  # all recorded generations exited; none new
+            if time.monotonic() >= end:
+                raise AssertionError("escaped handoff chain still growing after stop+SIGKILL")
+
     def write_updater(self, root, *, delay=0.0, converge=True, exit_code=0, grandchild=False,
                       linger=False, ignore_term=False, signal_canary=False, handoff=False):
         """Real Python stand-in for the installed updater, run by the canary as its owned child."""
@@ -1704,15 +1792,26 @@ D = pathlib.Path({str(self.tmp)!r})
 if {handoff!r}:
     # Escaping handoff chain: new session, ignores TERM, each generation forks then exits, so a
     # /proc snapshot can always miss the live member. Only a kernel reaping fence sees it.
+    # Strictly FINITE: at most HANDOFF_MAX_GENERATIONS generations and HANDOFF_LIFETIME_S of
+    # CLOCK_MONOTONIC (shared across fork) from chain start. Each generation records
+    # "pid starttime sid" as its FIRST action after fork, BEFORE it checks the test's stop file,
+    # and forks only if not stopped; a generation that stops by itself records "end ..." instead.
     if os.fork() == 0:
         os.setsid()
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        while True:
+        until = time.monotonic() + {self.HANDOFF_LIFETIME_S!r}
+        for gen in range({self.HANDOFF_MAX_GENERATIONS!r}):
+            st = open("/proc/self/stat").read().rsplit(")", 1)[1].split()[19]
             with open(D / "handoff.pids", "a") as fh:
-                fh.write(f"{{os.getpid()}}\\n")
+                fh.write(f"{{os.getpid()}} {{st}} {{os.getsid(0)}}\\n")
+            time.sleep(0.003)
+            if (D / "handoff.stop").exists() or time.monotonic() >= until or gen + 1 >= {self.HANDOFF_MAX_GENERATIONS!r}:
+                with open(D / "handoff.pids", "a") as fh:
+                    fh.write(f"end {{os.getpid()}} {{st}}\\n")
+                break
             if os.fork():
                 os._exit(0)
-            time.sleep(0.003)
+        os._exit(0)
 if {ignore_term!r}:
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 if {grandchild!r}:
@@ -1746,7 +1845,7 @@ sys.exit({exit_code!r})
     def gate_root(self, **updater):
         root = pathlib.Path(tempfile.mkdtemp(prefix="gate-host-releases.", dir=self.tmp))
         os.chmod(root, 0o700)
-        for f in ("updater.json", "grandchild.pid", "activated", "handoff.pids"):
+        for f in ("updater.json", "grandchild.pid", "activated", "handoff.pids", "handoff.stop"):
             (self.tmp / f).unlink(missing_ok=True)
         self.write_updater(root, **updater)
         return root
@@ -2009,26 +2108,71 @@ sys.exit({exit_code!r})
         # C1 regression: a setsid'd, TERM-ignoring chain forks and exits continuously. The
         # supervisor (child subreaper) adopts every generation and proves emptiness only by ECHILD.
         root = self.gate_root(delay=0.05, converge=True, handoff=True)
-        try:
-            r, v = self.run_gate(root, 8)
-            self.assertEqual(r.returncode, 1, r.stderr)
-            self.assertFalse(v["ok"])
-            self.assertNotEqual(v["host_updater_quiescence"], "completed")
-            self.assertEqual((v["host_updater_quiescence"], v["rollback_safe"]), ("reaped", True))
-            pids = [int(x) for x in (self.tmp / "handoff.pids").read_text().split()]
-            self.assertGreater(len(pids), 3)
-            # Every generation is gone (adopted and reaped, so none can be a zombie of ours either).
-            self.assertEqual([p for p in pids if self.alive(p)], [])
-        finally:
-            try:
-                for p in (self.tmp / "handoff.pids").read_text().split():
-                    try:
-                        os.kill(int(p), 0)
-                    except OSError:
-                        pass
-            except OSError:
-                pass
-            self.kill_leftovers()
+        # Installed before the chain can exist; LIFO, so the escaped chain is stopped, SIGKILLed and
+        # awaited on every assertion/timeout path, then the original group is swept.
+        self.addCleanup(self.kill_leftovers)
+        self.addCleanup(self.reap_handoff_chain)
+        r, v = self.run_gate(root, 8)
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertFalse(v["ok"])
+        self.assertNotEqual(v["host_updater_quiescence"], "completed")
+        self.assertEqual((v["stage"], v["reason"]), ("host_release", "host_updater_not_successful:host_updater_incomplete"))
+        self.assertEqual((v["host_updater_quiescence"], v["rollback_safe"]), ("reaped", True))
+        pids = [int(p) for p, _ in self.handoff_members()]
+        self.assertGreater(len(pids), 3)
+        # Still mid-chain when the leader exited (finite bound not reached): the supervisor had to kill it.
+        self.assertLess(len(pids), self.HANDOFF_MAX_GENERATIONS)
+        # The chain really escaped: one new session led by its first generation, not the updater's.
+        self.assertEqual(self.handoff_sids(), {pids[0]})
+        self.assertNotEqual(pids[0], json.loads((self.tmp / "updater.json").read_text())["pgid"])
+        # Every generation is gone (adopted and reaped, so none can be a zombie of ours either).
+        self.assertEqual([p for p in pids if self.alive(p)], [])
+        # The supervisor killed it mid-chain: no generation ever stopped by itself ...
+        self.assertFalse(self.handoff_ended())
+        # ... and after the test's stop+SIGKILL fence nothing was left to kill and none saw the stop.
+        _, killed, ended = self.reap_handoff_chain()
+        self.assertEqual((killed, ended), (0, False))
+
+    def test_escaped_handoff_chain_is_killed_and_awaited_on_a_failing_assertion_without_supervisor(self):
+        # Fixture fail-path: the subreaper supervisor is absent (as if it regressed or died), the chain
+        # escapes to a foreign subreaper, and the test body then fails. The registered cleanup must
+        # still stop, SIGKILL and await every generation; the chain is finite either way.
+        root = self.gate_root(converge=False, handoff=True)
+        self.addCleanup(self.reap_handoff_chain)  # backstop for this outer test too
+        outer, seen = self, {}
+
+        class Inner(unittest.TestCase):
+            def runTest(inner):
+                inner.addCleanup(lambda: seen.__setitem__("reap", outer.reap_handoff_chain()))
+                leader = subprocess.run([sys.executable, str(root / "updater.py")], cwd="/", timeout=30,
+                                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL)
+                seen["rc"] = leader.returncode
+                # Race-free liveness: generations keep being recorded after the leader was reaped.
+                n0, end = len(outer.handoff_members()), time.monotonic() + 5
+                while time.monotonic() < end and len(outer.handoff_members()) <= n0 + 2:
+                    time.sleep(0.005)
+                seen["grew"] = (n0, len(outer.handoff_members()))
+                seen["sids"] = outer.handoff_sids()  # each generation recorded its own session id
+                seen["first"] = int(outer.handoff_members()[0][0])
+                inner.fail("simulated assertion failure while the escaped chain is live")
+
+        result = unittest.TestResult()
+        Inner().run(result)
+        self.assertEqual(seen["rc"], 0)
+        self.assertGreater(seen["grew"][1], seen["grew"][0] + 2, seen)  # the chain outlived the reaped leader
+        self.assertEqual(seen["sids"], {seen["first"]}, seen)  # one escaped session of its own ...
+        self.assertNotIn(os.getsid(0), seen["sids"])        # ... not the test's session
+        self.assertEqual(len(result.failures), 1)           # the body's assertion failed ...
+        self.assertEqual(result.errors, [])                 # ... and the cleanup completed without error
+        members = self.handoff_members()
+        self.assertEqual([p for p, _ in members if self.alive(int(p))], [])
+        self.assertLess(len(members), self.HANDOFF_MAX_GENERATIONS)  # stopped by cleanup, not by its bound
+        time.sleep(0.3)                                     # >> generation period: no further generation
+        self.assertEqual(len(self.handoff_members()), len(members))
+        _, killed, ended = seen["reap"]                     # the fail-path cleanup acted on a LIVE chain:
+        self.assertGreaterEqual(killed + ended, 1, seen)    # SIGKILLed it, or it obeyed the stop file
+        self.assertEqual(self.reap_handoff_chain()[1], 0)   # idempotent re-check: nothing left to kill
 
     def test_updater_execs_with_unblocked_signals_and_cooperative_term_exits(self):
         # C2: the canary blocks TERM/INT/HUP only around spawn+record; the updater must not inherit it.
