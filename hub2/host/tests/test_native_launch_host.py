@@ -112,6 +112,8 @@ class GoalNativeEngineTest(unittest.TestCase):
                 path=Path(workspace) / '.local' / ('first-action-' + task_id + '.json')))
             expected_child = nl.interactive_argv(provider, nl.adapter_argv(provider, prompt, model), prompt,
                                                  model=model, effort='medium', with_goal=True)
+            if provider == 'codex':
+                expected_child[0] = '/synthetic/launch-codex.sh'
             row = {}
 
             def runner(argv, **options):
@@ -145,6 +147,7 @@ class GoalNativeEngineTest(unittest.TestCase):
                  mock.patch.object(adapter, 'status', side_effect=lambda *args, **kw: dict(row)), \
                  mock.patch.object(nl, 'goal_store', side_effect=[None, proof]) as store, \
                  mock.patch.object(adapter, 'native', return_value=subprocess.CompletedProcess([], 0, json.dumps(delivery), '')) as send, \
+                 mock.patch.object(nl, 'codex_launch_wrapper', return_value=Path('/synthetic/launch-codex.sh')), \
                  mock.patch.object(adapter, 'record_evidence'):
                 receipt = adapter.launch(task_id, spec)
             expected_goal = captured['objective']
@@ -1209,3 +1212,202 @@ class ManagedClaudeReadinessTests(unittest.TestCase):
                 self.assertEqual(json.loads(context_path.read_bytes())['protocol'],'hub2-managed-claude-exec-v1')
                 self.assertNotEqual(context_path.read_bytes(),expected)
                 self.assertNotIn('provider_home',spec)
+
+
+class CodexQuotaWrapperLaunchTests(unittest.TestCase):
+    """Codex starts only through the maintained quota wrapper; refusals spawn nothing."""
+    NATIVE_ID = 'd6cf9872-8597-48a5-be64-990cdef4db31'
+
+    def setUp(self):
+        base = Path(__file__).resolve().parents[3] / '.local/tmp'
+        base.mkdir(parents=True, exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(dir=base, prefix='codex-wrapper-')
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        os.chmod(self.root, 0o700)
+        self.workspace = self.root / 'work'
+        self.workspace.mkdir(mode=0o700)
+        self.wrapper = self.write_wrapper('launch-codex.sh')
+        patcher = mock.patch.dict(os.environ, {'CODEX_LAUNCH_WRAPPER': str(self.wrapper)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def write_wrapper(self, name, text=None, mode=0o700):
+        path = self.root / name
+        path.write_text(text or ('#!/usr/bin/env bash\nset -euo pipefail\nrepo=%s\n'
+                                 'python3 "$repo/scripts/quota-gate.py"\nexec %s/codex "$@"\n' % (self.root, self.root)))
+        path.chmod(mode)
+        return path
+
+    def launch(self, *, interactive, route=None, provider='codex', readiness=True, effort='high'):
+        calls = []
+
+        def runner(argv, **options):
+            calls.append((argv, options))
+            child = argv[argv.index('--') + 1:]
+            return subprocess.CompletedProcess(argv, 0, json.dumps({
+                'id': self.NATIVE_ID, 'tag': 'task-t1', 'workspace': str(self.workspace), 'command': child}), '')
+        route = route or ({'provider': provider} if interactive else {'provider': provider, 'profile': 'hub-shared-codex'})
+        config = {'routes': {'codex': route}}
+        if route.get('profile') is None:
+            config['private_provider_homes'] = True
+        adapter = nl.NativeLauncher(config, runner=runner)
+        spec = {'workspace': str(self.workspace), 'engine': 'codex', 'model': 'gpt-6.1-sol', 'prompt': 'synthetic prompt',
+                'interactive': interactive, 'effort': effort, 'timeout_seconds': 600,
+                'codex_launch_wrapper': '/offer/supplied/wrapper'}
+        proof = {'wrapper': str(self.wrapper.resolve()), 'profile': 'hub-shared-codex'} if readiness else None
+        with mock.patch.object(adapter, 'codex_exec_readiness', return_value=proof), \
+             mock.patch.object(adapter, 'record_evidence'):
+            try:
+                adapter.launch('t1', spec)
+                error = None
+            except RuntimeError as caught:
+                error = str(caught)
+        return calls, error
+
+    def child(self, calls):
+        argv = calls[0][0]
+        return argv[argv.index('--') + 1:]
+
+    def test_direct_headless_replaces_only_the_sdk_executable(self):
+        calls, error = self.launch(interactive=False, route={'provider': 'codex'})
+        self.assertIsNone(error)
+        prompt = nl.aplexer_prompt('synthetic prompt' + nl.FIRST_ACTION_INSTRUCTION.format(
+            path=self.workspace / '.local/first-action-t1.json'))
+        expected = nl.headless_effort_argv('codex', nl.adapter_argv('codex', prompt, 'gpt-6.1-sol'), 'high')
+        expected = nl._headless_insert_flags('codex', expected, nl.HEADLESS_OUTPUT_FLAGS.get('codex', ()))
+        self.assertEqual(self.child(calls), [str(self.wrapper.resolve())] + expected[1:])
+        self.assertNotIn('/offer/supplied/wrapper', ' '.join(calls[0][0]))
+
+    def test_direct_interactive_replaces_only_the_sdk_executable(self):
+        calls, error = self.launch(interactive=True, effort='medium')
+        self.assertIsNone(error)
+        prompt = nl.aplexer_prompt('synthetic prompt' + nl.FIRST_ACTION_INSTRUCTION.format(
+            path=self.workspace / '.local/first-action-t1.json'))
+        expected = nl.interactive_argv('codex', nl.adapter_argv('codex', prompt, 'gpt-6.1-sol'), prompt,
+                                       model='gpt-6.1-sol', effort='medium')
+        self.assertEqual(self.child(calls), [str(self.wrapper.resolve())] + expected[1:])
+        self.assertIn('-c', self.child(calls))
+        self.assertNotIn('exec', self.child(calls))
+
+    def test_profile_route_keeps_task_run_and_propagates_only_the_verified_wrapper(self):
+        calls, error = self.launch(interactive=False)
+        self.assertIsNone(error)
+        argv, options = calls[0]
+        child = self.child(calls)
+        self.assertEqual(child[1:3], ['task', 'run'])
+        self.assertEqual(child[child.index('--profile') + 1], 'hub-shared-codex')
+        self.assertNotIn(str(self.wrapper), child, 'the wrapper must not wrap or replace task run')
+        self.assertIn('CODEX_LAUNCH_WRAPPER=' + str(self.wrapper.resolve()), argv[:argv.index('--')])
+        self.assertNotIn('/offer/supplied/wrapper', ' '.join(argv))
+
+    def test_missing_unsafe_or_incompatible_wrapper_refuses_before_spawn(self):
+        raw = '#!/usr/bin/env bash\nset -euo pipefail\nexec %s/codex "$@"\n' % self.root
+        cases = {'missing': str(self.root / 'absent.sh'), 'relative': 'launch-codex.sh', 'empty': '',
+                 'world-writable': str(self.write_wrapper('open.sh', mode=0o707)),
+                 'raw': str(self.write_wrapper('raw.sh', raw)),
+                 'no-failclosed': str(self.write_wrapper('loose.sh', '#!/usr/bin/env bash\npython3 quota-gate.py\nexec %s/codex "$@"\n' % self.root))}
+        for name, value in cases.items():
+            for interactive in (False, True):
+                with self.subTest(case=name, interactive=interactive), mock.patch.dict(os.environ, {'CODEX_LAUNCH_WRAPPER': value}):
+                    calls, error = self.launch(interactive=interactive)
+                    self.assertEqual(error, 'codex_launch_wrapper_unavailable')
+                    self.assertEqual(calls, [])
+        with mock.patch.object(nl.sys, 'platform', 'win32'):
+            self.assertEqual(self.launch(interactive=True)[1], 'codex_launch_wrapper_unavailable')
+
+    def test_profile_not_proven_wrapper_aware_refuses_before_spawn(self):
+        calls, error = self.launch(interactive=False, readiness=False)
+        self.assertEqual((calls, error), ([], 'codex_launch_wrapper_unavailable'))
+
+    def test_custom_or_substituted_profile_never_proves_readiness(self):
+        adapter = nl.NativeLauncher({})
+        for profile in ('hub-other-codex', 'hub-codex-orin', None):
+            self.assertIsNone(adapter.codex_exec_readiness({'provider': 'codex', 'profile': profile},
+                                                           str(self.wrapper.resolve())))
+
+    def test_other_providers_are_unchanged_even_with_a_bad_wrapper(self):
+        with mock.patch.dict(os.environ, {'CODEX_LAUNCH_WRAPPER': '/nonexistent'}):
+            calls, error = self.launch(interactive=False, route={'provider': 'zai'})
+        self.assertIsNone(error)
+        child = self.child(calls)
+        self.assertEqual(child[0], 'zcodex')
+        self.assertNotIn('CODEX_LAUNCH_WRAPPER', ' '.join(calls[0][0]))
+        with mock.patch.dict(os.environ, {'CODEX_LAUNCH_WRAPPER': '/nonexistent'}):
+            calls, error = self.launch(interactive=True, provider='zai')
+        self.assertIsNone(error)
+        self.assertEqual(self.child(calls)[0], 'zcodex')
+
+    def test_capabilities_do_not_advertise_unusable_codex(self):
+        config = {'routes': {'codex': {'provider': 'codex'}, 'opencode': {'provider': 'go'}}}
+        with mock.patch.object(nl.shutil, 'which', side_effect=lambda b: '/bin/' + b):
+            self.assertIn('codex', nl.NativeLauncher(config).capabilities())
+            with mock.patch.dict(os.environ, {'CODEX_LAUNCH_WRAPPER': '/nonexistent'}):
+                caps = nl.NativeLauncher(config).capabilities()
+            self.assertNotIn('codex', caps)
+            self.assertIn('opencode', caps)
+            custom = {'routes': {'codex': {'provider': 'codex', 'profile': 'hub-custom'}}}
+            self.assertNotIn('codex', nl.NativeLauncher(custom).capabilities())
+
+    def test_packaged_archive_readiness_requires_wrapper_aware_pin_and_maintained_profile(self):
+        if sys.platform != 'linux':
+            self.skipTest('Linux wrapper')
+        import hashlib
+        import zipfile
+        release = self.root / ('b' * 40)
+        release.mkdir(mode=0o700)
+        (release / 'bin').mkdir(mode=0o700)
+        (release / 'bin/python').symlink_to(sys.executable)
+        archive = release / 'hub.pyz'
+        package = Path(__file__).resolve().parents[3] / 'host/agent_hub_host'
+
+        def build(skip=()):
+            with zipfile.ZipFile(archive, 'w') as out:
+                for file in package.glob('*.py'):
+                    out.write(file, 'agent_hub_host/' + file.name)
+                out.writestr('__main__.py', 'raise RuntimeError("CLI main must never run")')
+            archive.chmod(0o600)
+            raw = archive.read_bytes()
+            receipt = {'host_version': release.name, 'artifacts': {'hub.pyz': {
+                'size': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}}}
+            (release / 'release.json').write_text(json.dumps(receipt))
+            (release / 'release.json').chmod(0o600)
+        build()
+        profile = self.root / 'profiles/config.toml'
+        profile.parent.mkdir(mode=0o700)
+        code = ('import sys,json;sys.path.insert(0,sys.argv[1]);'
+                'from agent_hub_host.provisioning import module_command;'
+                'sys.argv[0]=sys.argv[1];print(json.dumps(module_command("execute","shared-codex")))')
+        command = json.loads(subprocess.check_output([str(release / 'bin/python'), '-I', '-S', '-c', code, str(archive)], text=True))
+
+        def publish(argv, name='hub-shared-codex'):
+            profile.write_text('[profiles."%s"]\nengine="codex"\ncommand=%s\n' % (name, json.dumps(argv)))
+            profile.chmod(0o600)
+        route = {'provider': 'codex', 'profile': 'hub-shared-codex'}
+        wrapper = str(self.wrapper.resolve())
+        results = []
+
+        def probe(argv, **kwargs):
+            results.append(subprocess.run(argv, **kwargs))
+            return results[-1]
+        adapter = nl.NativeLauncher({}, runner=probe)
+        with mock.patch.dict(os.environ, {'APLEXER_CONFIG': str(profile)}):
+            publish(command)
+            ready = adapter.codex_exec_readiness(route, wrapper, release)
+            self.assertIsNotNone(ready, results[-1].stderr if results else 'probe not reached')
+            self.assertEqual(ready['wrapper'], wrapper)
+            self.assertIsNone(adapter.codex_exec_readiness(route, str(self.root / 'other-wrapper'), release))
+            publish([sys.executable, '-c', 'raise SystemExit(0)', 'shared-codex'])
+            self.assertIsNone(adapter.codex_exec_readiness(route, wrapper, release), 'custom profile bypassing gated exec')
+            publish(command, 'hub-custom-codex')
+            self.assertIsNone(adapter.codex_exec_readiness(route, wrapper, release), 'profile substitution')
+            publish(command)
+            # An old pin without the wrapper-aware readiness protocol is refused.
+            with zipfile.ZipFile(archive, 'w') as out:
+                out.writestr('agent_hub_host/__init__.py', '')
+                out.writestr('agent_hub_host/provisioning.py', 'def module_command(*a):\n    return []\n')
+            archive.chmod(0o600)
+            raw = archive.read_bytes()
+            (release / 'release.json').write_text(json.dumps({'host_version': release.name, 'artifacts': {
+                'hub.pyz': {'size': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}}}))
+            self.assertIsNone(adapter.codex_exec_readiness(route, wrapper, release))
