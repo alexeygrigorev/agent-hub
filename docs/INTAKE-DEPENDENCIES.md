@@ -14,7 +14,8 @@ This operation creates the follow-up, links the prerequisite and marks the
 original blocked in one transaction. Reusing the same key and payload returns
 the same follow-up. Link an existing prerequisite with
 `hub intake depend ORIGINAL --on PREREQUISITE`. Remove an erroneous link with
-the same command plus `--remove`. Cycles and cross-project links are refused.
+the same command plus `--remove`. Cycles are refused. Hub1 refused
+cross-project links; Hub2 accepts them (see below).
 CLI commands fetch the current version unless `--version` is provided; stale
 explicit versions fail without mutation.
 
@@ -63,7 +64,11 @@ project; the caller must be able to see it. Without `--version` the CLI reads
 `task.control.version` from `hub intake show`. `hub intake show` lists the set
 as `intake.depends_on`; `hub intake links ID` returns it as `depends_on`.
 Hub2 records the link and shows it. It does not yet hold a start until the
-prerequisite is done.
+prerequisite is done. `--remove` matches the stored id and skips the
+visibility and cycle checks, so a stale link can always be removed. The
+cycle check fails closed (`dependency_check_unavailable`) when a project in
+the chain cannot be read. Two opposite links posted at the same moment can
+still both land; remove one of them.
 
 Every refusal names its cause: `prerequisite_required`,
 `prerequisite_not_found` (missing, or not visible to this caller),
@@ -78,7 +83,7 @@ gives the current version), `intake_closed`, `intake_not_found` and
 `hub task-artifact INTAKE --name NAME --file shot.png --sanitized` attaches a
 reviewed PNG to an intake. `hub artifact INTAKE NAME --output out.png`
 downloads it to a new mode-0600 file. Limits: 6 MiB (6,291,456 bytes) per PNG,
-16 PNGs and 48 MiB per intake. 6 MiB keeps the base64 download under the CLI's
+16 PNGs and 48 MiB per intake, 512 MiB per project. 6 MiB keeps the base64 download under the CLI's
 10 MiB response cap. Callers: operators, project writers, or the session bound
 to the intake. `hub intake show` lists name, bytes and sha256. The pixels never
 appear in history pages.

@@ -57,7 +57,7 @@ function fixture() {
     assert.equal(created.status, 201, JSON.stringify(created.body));
     return created.body.intake.id as string;
   };
-  return { call, create, objects, env };
+  return { call, create, objects, env, routes };
 }
 
 function png(size: number): string {
@@ -115,6 +115,12 @@ test('depend adds a cross-project prerequisite visible in show and links; errors
   assert.deepEqual(removed.body.depends_on, []);
   const notThere = await f.call(`/api/intake/tasks/${track}/depend`, 'POST', { key: 'dep-9', on: field, remove: true });
   assert.equal(notThere.body.error, 'dependency_not_found');
+  // A link to an intake the caller can no longer resolve stays removable.
+  assert.equal((await f.call(`/api/intake/tasks/${track}/depend`, 'POST', { key: 'dep-10', on: field })).status, 201);
+  f.routes.delete(field);
+  const staleLink = await f.call(`/api/intake/tasks/${track}/depend`, 'POST', { key: 'dep-11', on: field, remove: true });
+  assert.equal(staleLink.status, 200, JSON.stringify(staleLink.body));
+  assert.deepEqual(staleLink.body.depends_on, []);
 });
 
 test('a forged prerequisite header from the client is ignored', async () => {
@@ -161,6 +167,9 @@ test('PNG artifacts up to 6 MiB are stored on the intake; each refusal names the
   assert.equal(badName.body.error, 'invalid_artifact_name');
   const conflict = await f.call(`/api/intake/tasks/${id}/artifacts`, 'POST', { name: 'compare-3way', media_type: 'image/png', data_base64: png(200), sanitized: true });
   assert.equal(conflict.body.error, 'artifact_name_conflict');
+  const wrapped = await f.call(`/api/intake/tasks/${id}/artifacts`, 'POST', { name: 'wrapped', media_type: 'image/png', data_base64: png(300).replace(/(.{76})/g, '$1\n'), sanitized: true });
+  assert.equal(wrapped.body.error, 'invalid_png');
+  assert.match(wrapped.body.detail, /not canonical base64/);
   const absent = await f.call(`/api/intake/tasks/${id}/artifacts/nope`);
   assert.equal(absent.body.error, 'artifact_not_found');
 });

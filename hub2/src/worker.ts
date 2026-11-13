@@ -621,14 +621,22 @@ async function relationForward(request: Request, env: Hub2Env, control: DurableO
     const length = Number(request.headers.get('Content-Length'));
     if (Number.isFinite(length) && length > ARTIFACT_BODY_LIMIT)
       return error('artifact_too_large', 413, `size check failed: PNG over ${ARTIFACT_MAX_BYTES} bytes (6 MiB limit)`);
+    // Cheap scope gate before the router buffers the large body; the project object rechecks per intake.
+    if (!['operator:admin', '*', 'intake:write', 'intake:append'].some(scope => actor.scopes.includes(scope)))
+      return error('forbidden', 403, 'uploading an artifact needs intake:write, intake:append or operator access');
     return { bodyLimit: ARTIFACT_BODY_LIMIT };
   }
   const dependent = decodeURIComponent(match[1]);
-  const body = (await request.clone().json().catch(() => null)) as { on?: unknown } | null;
+  let body: { on?: unknown; remove?: unknown } | null = null;
+  try { body = JSON.parse(await boundedText(request.clone(), 4096)); } catch { body = null; }
   if (!body || typeof body.on !== 'string' || !body.on || body.on.length > 180)
     return error('prerequisite_required', 400, 'pass the prerequisite intake id with --on');
+  const remove = body.remove === true;
   const routed = await control.fetch(new Request(`${CONTROL}/api/routes/intake/${encodeURIComponent(body.on)}`,
     { headers: { 'x-hub2-actor': JSON.stringify(actor) } }));
+  // Removing never needs the prerequisite to be visible or the graph walk: a stale or cyclic link stays removable.
+  if (!routed.ok && remove)
+    return { headers: { [PREREQUISITE_HEADER]: JSON.stringify({ id: body.on, project: '' }) } };
   if (!routed.ok) {
     const code = ((await routed.json().catch(() => null)) as { error?: string } | null)?.error;
     if (code === 'ambiguous_prefix') return error('prerequisite_ambiguous', 409, `prerequisite id prefix ${body.on} matches several intakes; pass the full id`);
@@ -636,6 +644,7 @@ async function relationForward(request: Request, env: Hub2Env, control: DurableO
     return error('prerequisite_not_found', 404, `prerequisite intake ${body.on} does not exist or is not visible to this caller`);
   }
   const { route } = (await routed.json()) as { route: { id: string; owner: string } };
+  if (remove) return { headers: { [PREREQUISITE_HEADER]: JSON.stringify({ id: route.id, project: route.owner }) } };
   if (route.id === dependent) return error('dependency_self', 409, 'an intake cannot depend on itself');
   // Bounded walk over the prerequisite's own prerequisites, across projects.
   const seen = new Set<string>(), queue: Array<{ id: string; project: string }> = [{ id: route.id, project: route.owner }];
@@ -647,7 +656,7 @@ async function relationForward(request: Request, env: Hub2Env, control: DurableO
     if (seen.size > 64) return error('dependency_graph_too_large', 409, 'prerequisite chain exceeds 64 intakes; cycle check could not complete');
     const response = await env.PROJECTS.get(env.PROJECTS.idFromName(next.project))
       .fetch(new Request('https://project.hub2.internal/_internal/prerequisites/' + encodeURIComponent(next.id)));
-    if (!response.ok) continue;
+    if (!response.ok) return error('dependency_check_unavailable', 503, `could not read prerequisites of ${next.id}; cycle check failed closed, retry`);
     const view = (await response.json()) as { depends_on?: Array<{ intake_id: string; project: string }> };
     for (const item of view.depends_on ?? []) queue.push({ id: item.intake_id, project: item.project });
   }
