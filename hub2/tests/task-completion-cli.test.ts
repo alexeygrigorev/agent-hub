@@ -46,7 +46,7 @@ test('real Hub host CLI writes merge evidence and session-finished events throug
       if(new URL(r.url).pathname==='/_internal/routing')return Response.json({machine_id:id,connected:true,engines:['codex'],capabilities:['headless']});
       return Response.json({state:'staged',epoch:1});
     }),
-    ACCOUNTS:namespace(async()=>Response.json({account:{enabled:true,min_remaining:0},credential_usable:true,credential_status:'ready',quota:{remaining:80},hosts:['h1']})),
+    ACCOUNTS:namespace(async()=>Response.json({account:{enabled:true,min_remaining:0},credential_usable:true,credential_status:'ready',quota:{remaining:80,captured_at:Date.now(),valid_until:Date.now()+900000},fresh:true,hosts:['h1']})),
     MAILBOXES:namespace(async()=>Response.json({message:{id:'synthetic-message'}},{status:201})),
   };
   control=new ControlDO({storage:new NodeDurableStorage(controlSql),blockConcurrencyWhile:(callback:any)=>Promise.resolve().then(callback)} as any,env);
