@@ -683,6 +683,13 @@ class HostTests(unittest.TestCase):
         self.assertEqual(tuple(self.journal.db.execute('SELECT * FROM outbox_dead_letters').fetchone()), unrelated)
         self.assertEqual(self.native.calls, calls)
 
+    def test_server_refusal_fails_the_claim_wait_immediately(self):
+        acknowledgement = OfferAcknowledgement(None)
+        acknowledgement.reject({'type': 'error', 'error': 'invalid_workspace_binding'})
+        self.assertEqual(acknowledgement.rejection, 'invalid_workspace_binding')
+        with self.assertRaisesRegex(RuntimeError, 'claim_ack_unverified'):
+            acknowledgement.wait(60)
+
     def test_binding_echo_is_required_only_for_historical_repair_not_fresh_starts(self):
         recovery, receipt = self.legacy_label_finished()
         with self.journal.db:
