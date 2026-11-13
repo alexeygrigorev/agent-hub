@@ -1428,6 +1428,16 @@ class CodexQuotaWrapperLaunchTests(unittest.TestCase):
             'ignored-failure': '#!/usr/bin/env bash\nset -euo pipefail\npython3 /tmp/scripts/quota-gate.py || true\nexec /synthetic/codex "$@"\n',
             'shadowed-python': '#!/usr/bin/env bash\nset -euo pipefail\npython3() { :; }\nrepo=%s\npython3 "$repo/scripts/quota-gate.py"\nexec /synthetic/codex "$@"\n' % self.root,
             'reordered-statements': '#!/usr/bin/env bash\nrepo=%s\npython3 "$repo/scripts/quota-gate.py"\nset -euo pipefail\nexec /synthetic/codex "$@"\n' % self.root,
+            'comment-vt-smuggle': '#!/usr/bin/env bash\nset -euo pipefail\n# gate disabled\vpython3 /synthetic/quota-gate.py\nexec /synthetic/codex "$@"\n',
+            'comment-ff-smuggle': '#!/usr/bin/env bash\nset -euo pipefail\n# gate disabled\fpython3 /synthetic/quota-gate.py\nexec /synthetic/codex "$@"\n',
+            'comment-nel-smuggle': '#!/usr/bin/env bash\nset -euo pipefail\n# gate disabled\x85python3 /synthetic/quota-gate.py\nexec /synthetic/codex "$@"\n',
+            'comment-ls-smuggle': '#!/usr/bin/env bash\nset -euo pipefail\n# gate disabled\u2028python3 /synthetic/quota-gate.py\nexec /synthetic/codex "$@"\n',
+            'comment-ps-smuggle': '#!/usr/bin/env bash\nset -euo pipefail\n# gate disabled\u2029python3 /synthetic/quota-gate.py\nexec /synthetic/codex "$@"\n',
+            'ws-nbsp-smuggle': '#!/usr/bin/env bash\nset -euo pipefail\n\u00a0python3 /synthetic/quota-gate.py\nexec /synthetic/codex "$@"\n',
+            'ctrl-cr': '#!/usr/bin/env bash\nset -euo pipefail\r\npython3 /synthetic/quota-gate.py\nexec /synthetic/codex "$@"\n',
+            'ctrl-fs': '#!/usr/bin/env bash\nset -euo pipefail\n\x1cpython3 /synthetic/quota-gate.py\nexec /synthetic/codex "$@"\n',
+            'ctrl-del': '#!/usr/bin/env bash\nset -euo pipefail\n# \x7f\npython3 /synthetic/quota-gate.py\nexec /synthetic/codex "$@"\n',
+            'ctrl-bom': '#!/usr/bin/env bash\nset -euo pipefail\n\ufeffpython3 /synthetic/quota-gate.py\nexec /synthetic/codex "$@"\n',
         }
         for name, body in bypasses.items():
             bad = self.write_wrapper(f'{name}.sh', text=body)
@@ -1437,3 +1447,27 @@ class CodexQuotaWrapperLaunchTests(unittest.TestCase):
                 calls, error = self.launch(interactive=False)
                 self.assertEqual(error, 'codex_launch_wrapper_unavailable', name)
                 self.assertEqual(calls, [], name)
+
+    def test_wrapper_accepts_canonical_templates_with_shell_whitespace(self):
+        if sys.platform != 'linux':
+            self.skipTest('Linux wrapper')
+        canonical = {
+            'repo-template': (
+                '#!/usr/bin/env bash\n'
+                '  # maintained comment\n'
+                '\tset -euo pipefail\n'
+                f'repo={self.root}\n'
+                'python3 "$repo/scripts/quota-gate.py"\n'
+                f'exec {self.root}/codex "$@"\n'
+            ),
+            'direct-template': (
+                '#!/bin/bash\n'
+                'set -euo pipefail\n'
+                f'\tpython3 "{self.root}/scripts/quota-gate.py"\n'
+                f'exec {self.root}/codex "$@"\n'
+            ),
+        }
+        for name, body in canonical.items():
+            good = self.write_wrapper(f'{name}.sh', text=body)
+            with mock.patch.dict(os.environ, {'CODEX_LAUNCH_WRAPPER': str(good)}):
+                self.assertEqual(nl.codex_launch_wrapper(), good.resolve(), name)

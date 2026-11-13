@@ -13,6 +13,7 @@ import subprocess
 import stat
 import sys
 import time
+import unicodedata
 from pathlib import Path
 
 from .client import private_file
@@ -108,12 +109,24 @@ CODEX_WRAPPER_DEFAULT = ('git', 'cloudflare-agent-git', 'scripts', 'launch-codex
 
 def _valid_codex_wrapper_body(text):
     """Return True only for the exact canonical maintained Codex quota wrapper template."""
-    if '\r' in text:
+    if not isinstance(text, str):
         return False
-    raw_lines = text.splitlines()
+    # Reject control characters (except LF/HT) and non-ASCII whitespace/separators
+    # so Python line/whitespace parsing cannot diverge from Bash.
+    for ch in text:
+        if ch in (' ', '\t', '\n'):
+            continue
+        if (ord(ch) < 0x20 or 0x7f <= ord(ch) <= 0x9f or ch.isspace()
+                or unicodedata.category(ch) in ('Cc', 'Cf', 'Zl', 'Zp', 'Zs')):
+            return False
+    raw_lines = text.split('\n')
     if not raw_lines or raw_lines[0] not in ('#!/usr/bin/env bash', '#!/bin/bash'):
         return False
-    stmts = [line.strip() for line in raw_lines[1:] if line.strip() and not line.strip().startswith('#')]
+    stmts = []
+    for line in raw_lines[1:]:
+        stripped = line.strip(' \t')
+        if stripped and not stripped.startswith('#'):
+            stmts.append(stripped)
     if len(stmts) not in (3, 4) or stmts[0] != 'set -euo pipefail':
         return False
     if len(stmts) == 4:
