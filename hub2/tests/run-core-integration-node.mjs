@@ -355,6 +355,22 @@ try{
   assert([201,202].includes(third.status),'third start must be accepted below the global cap: '+JSON.stringify(third.data));
   assert.notEqual(third.data.error,'active_session_limit');
  });
+ await test('public worker forwards canonical and compat merge-evidence into the project merge gate without accepting',async()=>{
+  const q='?project='+encodeURIComponent(project),proof={kind:'merge_gate',repository:project,pr_url:'https://github.com/'+project+'/pull/555',base_ref:'main',merged_at:'2026-11-13T10:00:00.000Z',head_sha:'a'.repeat(40),checks_head_sha:'a'.repeat(40),checks_state:'success',checks_total:2,checks_successful:2,checks_pending:0,checks_failed:0,merge_commit_sha:'b'.repeat(40),main_head_sha:'c'.repeat(40),merge_commit_in_main:true,checked_at:'2026-11-13T10:01:00.000Z'};
+  const made=await api('/api/intakes'+q,'POST',{title:'Synthetic merge evidence route',text:'Synthetic public-worker merge evidence fixture.',acceptance_criteria:['Synthetic merge proof reaches the gate.'],code_task:true,key:'merge-route-intake'});
+  const id=expect(made,201,'code intake').intake.id;
+  const post=(path,body,auth=token,query=q)=>api(path+'/merge-evidence'+query,'POST',body,auth);
+  expect(await post('/api/intakes/'+id,{key:'merge-canon',evidence:proof},null),401,'anonymous refused');
+  assert.notEqual((await post('/api/intakes/'+id,{key:'merge-actor',evidence:proof},hostToken)).status,201,'machine actor must not append merge evidence');
+  assert.equal((await post('/api/intakes/'+id,{key:'merge-wrong-project',evidence:proof},token,'?project='+encodeURIComponent('synthetic/other'))).status>=400,true,'wrong project refused');
+  expect(await post('/api/intakes/'+id,{key:'merge-bad',evidence:{...proof,checks_total:-1}}),400,'invalid proof refused');
+  expect(await post('/api/intakes/'+id,{key:'merge-canon',evidence:proof}),201,'canonical route reaches gate');
+  assert.equal(expect(await post('/api/intakes/'+id,{key:'merge-canon',evidence:proof}),200,'replay').duplicate,true);
+  expect(await post('/api/intake/tasks/'+id,{key:'merge-compat',evidence:{...proof,head_sha:'d'.repeat(40),checks_head_sha:'d'.repeat(40)}}),201,'compat alias reaches gate');
+  const events=JSON.stringify(expect(await api('/api/intakes/'+id+'/history'+q),200,'history'));
+  assert(events.includes('a'.repeat(40))&&events.includes('d'.repeat(40)),'merge proofs persisted');
+  assert.equal(expect(await api('/api/intakes/'+id+q),200,'intake').intake.status,'open','merge evidence alone never accepts the intake');
+ });
 }finally{
  if(liveSocket)liveSocket.socket.close();await rt.dispose();
  const sourceAfter=await hashes();const sourceStable=JSON.stringify(sourceBefore)===JSON.stringify(sourceAfter);
