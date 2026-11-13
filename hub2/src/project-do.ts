@@ -17,7 +17,7 @@ import { HOST_INVENTORY_LOST_MS } from './session-liveness';
 import { PROJECT_WORK_SCHEMA, ProjectWork, type ProjectWorkHooks } from './project-work';
 import {
   BLOCKED_WAIT_MS, COMPLETION_ACTOR, VERIFICATION_ACTOR, DEVELOPER_ALERT_RECIPIENT, HARD_BLOCKERS, MAX_AUTO_CONTINUATIONS, MAX_CONTINUATION_TRIES, MAX_DELIVERY_TRIES, MAX_VERIFICATION_ATTEMPTS, MAX_VERIFICATION_START_TRIES,
-  LAUNCH_SPEC_LIMIT, basePrompt, completionClaim, continuationBudget, continuationPrompt, deliveryBody, exitCause, promptWithContract, retryDelay, stripCompletion, taskBlocker, unwrapEvidence, verificationPrompt, verificationVerdict, verifierNoVerdictCause,
+  LAUNCH_SPEC_LIMIT, basePrompt, completionClaim, continuationBudget, continuationPrompt, deliveryBody, exitCause, promptWithContract, retryDelay, stripCompletion, taskBlocker, unwrapEvidence, verificationPrompt, verificationVerdict, verdictProblem, verifierNoVerdictCause,
   type CompletionClaim, type CompletionRecord, type ContinuationSnapshot, type TaskBlocker, type VerificationAction, type VerificationVerdict,
 } from './task-completion';
 import type { Actor, Hub2Env, JsonRecord } from './types';
@@ -31,7 +31,13 @@ const COMPLETION_DUE = `CASE
     THEN json_extract(i.final_evidence_json,'$.completion.continuation.next_action_at')
   WHEN json_extract(i.final_evidence_json,'$.completion.delivery.state')='pending'
     THEN json_extract(i.final_evidence_json,'$.completion.delivery.next_action_at') END`;
-const COMPLETION_ELIGIBLE = `i.status IN ('open','failed','completed-awaiting-review','accepted')
+// Accepted is terminal and grows forever; only its pending delivery needs the
+// completion loop, and delivery retries (<=30 min apart) refresh updated_at, so
+// accepted rows are scanned only inside a bounded recent window (indexed by
+// intakes_status_updated). The window start is the one bound parameter.
+export const ACCEPTED_COMPLETION_WINDOW_MS = 7 * 24 * 60 * 60_000;
+const COMPLETION_ELIGIBLE = `(i.status IN ('open','failed','completed-awaiting-review')
+    OR (i.status='accepted' AND i.updated_at>=?))
   AND json_extract(i.final_evidence_json,'$.completion.controlled')=1
   AND json_extract(i.final_evidence_json,'$.completion.session_id')=i.session_id
   AND EXISTS(SELECT 1 FROM dispatch_sagas s WHERE s.session_id=i.session_id AND s.intake_id=i.id
@@ -394,7 +400,8 @@ export class ProjectDO {
         const saga=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id=? AND intake_id=?',String(verdict),intake.id);
         if(!saga||(this.parse(saga.routing_json) as JsonRecord|null)?.acceptance_verification!==true)return error('verification_record_forbidden',403);
         const criteria=this.parse(intake.acceptance_criteria_json);
-        if(!verificationVerdict(body.evidence,String(verdict),Array.isArray(criteria)?criteria.length:0))return error('invalid_verification_record',400);
+        if(!verificationVerdict(body.evidence,String(verdict),Array.isArray(criteria)?criteria.length:0))
+          return error('invalid_verification_record',400,verdictProblem(body.evidence,String(verdict),Array.isArray(criteria)?criteria.length:0));
       }
       if(claimKind==='merge_gate'){
         const problem=mergeEvidenceShapeError(body.evidence);
@@ -1599,12 +1606,12 @@ export class ProjectDO {
 
   private completionDue(now:number):IntakeRow[]{
     return this.db.all<IntakeRow>(`SELECT i.* FROM intakes i WHERE ${COMPLETION_ELIGIBLE}
-      AND (${COMPLETION_DUE})<=? ORDER BY i.updated_at,i.id LIMIT 8`,now);
+      AND (${COMPLETION_DUE})<=? ORDER BY i.updated_at,i.id LIMIT 8`,now-ACCEPTED_COMPLETION_WINDOW_MS,now);
   }
 
   private completionNextDeadline():number|undefined{
     return this.db.one<{due:number|null}>(`SELECT MIN(${COMPLETION_DUE}) AS due
-      FROM intakes i WHERE ${COMPLETION_ELIGIBLE}`)?.due??undefined;
+      FROM intakes i WHERE ${COMPLETION_ELIGIBLE}`,Date.now()-ACCEPTED_COMPLETION_WINDOW_MS)?.due??undefined;
   }
 
   /** CAS-update the completion record of the attempt that is still current. */
