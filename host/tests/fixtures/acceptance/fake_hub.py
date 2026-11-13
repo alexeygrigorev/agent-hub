@@ -61,6 +61,54 @@ def choice(p):
     return {k: p[k] for k in ('policy_id', 'policy_version', 'machine_id', 'attempt', 'engine', 'model', 'effort')}
 
 
+def _attempt_of(s, show=False):
+    return 1 if (show and CFG.get('fallback')) else 0
+
+
+def _attempt_op(s, attempt):
+    return '%s:%d' % (s['base_op'], attempt)
+
+
+def project_dispatch(s, state='running'):
+    """Actual hub2 project-do.ts sagaView: operation_id = BASE, attempt_operation_id = <base>:<attempt>, int attempt."""
+    attempt = 1 if CFG.get('fallback') else 0
+    return {
+        'id': s['id'], 'operation_id': s['base_op'], 'attempt_operation_id': _attempt_op(s, attempt),
+        'intake_id': s['intake_id'], 'machine_id': s['host'], 'epoch': s['epoch'], 'state': state,
+        'native_id': s['native_id'], 'attempt': attempt, 'next_action_at': None,
+    }
+
+
+def exit_evidence(s, intake_id):
+    """Project-shaped native exit evidence nested in stopped Machine views and final_evidence.finish_after_stop."""
+    attempt = 1 if CFG.get('fallback') else 0
+    return {
+        'operation_id': s['base_op'], 'attempt_operation_id': _attempt_op(s, attempt), 'session_id': s['id'],
+        'intake_id': intake_id, 'machine_id': s['host'], 'epoch': s['epoch'], 'native_id': s['native_id'],
+        'state': 'stopped', 'exit_code': 0, 'native_exit_confirmed': not CFG.get('final_no_native_exit'),
+        'evidence': {'containment_empty': not CFG.get('final_containment_not_empty'), 'source': 'aplexer_retirement'},
+        'evidence_digest': 'e' * 64,
+    }
+
+
+def final_stop_evidence(s, intake_id):
+    """Normal operator STOP: intake failed / session_stop_confirmed with full final stop proof."""
+    attempt = 1 if CFG.get('fallback') else 0
+    fe = {
+        'stopped': True, 'reaped': False, 'operation_id': s['base_op'], 'attempt_operation_id': _attempt_op(s, attempt),
+        'session_id': s['id'], 'machine_id': s['host'], 'epoch': s['epoch'], 'reason': 'stop_confirmed',
+        'native_id': s['native_id'], 'observed_at': 4000,
+        'completion': {'controlled': True, 'session_id': s['id'], 'outcome': 'unfinished',
+                       'reason': 'session_stop_confirmed', 'depth': 0},
+        'finish_after_stop': exit_evidence(s, intake_id),
+    }
+    if CFG.get('final_attempt_contradiction'):
+        fe['finish_after_stop']['attempt_operation_id'] = _attempt_op(s, attempt + 1)
+    if CFG.get('final_reason_not_stop'):
+        fe['completion']['reason'] = 'session_finished'
+    return fe
+
+
 def row_for(s, show=False):
     row = {k: s[k] for k in (
         'id', 'native_id', 'engine', 'model', 'effort', 'workspace', 'requested_workspace',
@@ -70,10 +118,21 @@ def row_for(s, show=False):
     row.update(
         machine_id=s['host'],
         state='stopped' if stopped else 'running',
-        operation_id=s.get('operation_id', s['id']),
-        attempt_operation_id=s.get('attempt_operation_id', s['id'] + ':0'),
+        # Actual hub2 machine-do.ts sessionView: operation_id IS the attempt id; no attempt_operation_id/attempt.
+        operation_id=_attempt_op(s, _attempt_of(s, show)),
         picker=copy.deepcopy(s['picker']),
+        evidence=exit_evidence(s, s['intake_id']) if stopped else None,
     )
+    if CFG.get('show_redundant_alias'):
+        row['attempt_operation_id'] = row['operation_id']
+    if CFG.get('show_alias_contradiction'):
+        row['attempt_operation_id'] = s['base_op']
+    if CFG.get('show_attempt_contradiction'):
+        row['attempt'] = 7
+    if CFG.get('show_malformed_operation'):
+        row['operation_id'] = 'opaque-' + s['id']
+    if stopped and CFG.get('stop_evidence_contradiction'):
+        row['evidence']['attempt_operation_id'] = s['base_op'] + ':5'
     if stopped and not CFG.get('stop_not_confirmed'):
         row['stop_confirmed'] = True
     if show and CFG.get('fallback'):
@@ -82,7 +141,6 @@ def row_for(s, show=False):
         index = next(i for i, x in enumerate(pool) if x['model'] == row['model'])
         chosen = pool[(index + 1) % len(pool)]
         row.update({k: chosen[k] for k in ('policy_id', 'model', 'engine', 'effort')})
-        row['attempt_operation_id'] = s['id'] + ':1'
         row['picker'].update(choice(dict(row['picker'], **chosen, attempt=1)))
         row['picker']['history'] = [old, choice(row['picker'])]
         if CFG.get('cross_attempt_pool'):
@@ -284,6 +342,7 @@ def _make_descendant_session(intake_row, desc_sid):
         },
         'policy_id': 'p-claude',
         'policy_version': 7,
+        'base_op': str(uuid.UUID(int=0xC0000000 + len(ST['sessions']) + 1)),
     }
 
 
@@ -358,22 +417,14 @@ def _handle_sessions(argv):
             picker=picker,
             policy_id=chosen['policy_id'],
             policy_version=7,
+            base_op=str(uuid.UUID(int=0xB0000000 + i + 1)),
         )
         ST['sessions'][sid] = s
         ST['keys'][key] = sid
         if child_id in ST['intakes']:
             ST['intakes'][child_id]['session_id'] = sid
             ST['intakes'][child_id]['assigned_machine_id'] = picker['machine_id']
-            ST['intakes'][child_id]['dispatch'] = {
-                'id': sid,
-                'operation_id': s['id'],
-                # Same saga row as the session view: fallback attempt is reflected in both.
-                'attempt_operation_id': s['id'] + (':1' if CFG.get('fallback') else ':0'),
-                'machine_id': picker['machine_id'],
-                'epoch': s['epoch'],
-                'state': 'running',
-                'native_id': native_id,
-            }
+            ST['intakes'][child_id]['dispatch'] = project_dispatch(s)
             ST['intakes'][child_id]['updated_at'] += 1
         if native_id and child_id in ST['intakes']:
             _write_worker_artifact(s, ST['intakes'][child_id])
@@ -388,7 +439,12 @@ def _handle_sessions(argv):
             sys.exit(0)
         if CFG.get('accepted_502'):
             fail('upstream returned 502 Bad Gateway')
-        row = row_for(s)
+        # Start response top level is the Project saga view (base + attempt alias); binding_wait is Machine-shaped.
+        row = dict(row_for(s), operation_id=s['base_op'], attempt_operation_id=_attempt_op(s, 0), attempt=0)
+        row.pop('evidence', None)
+        if CFG.get('start_response_base_drift'):
+            row['operation_id'] = str(uuid.UUID(int=0xDEAD0000 + i))
+            row['attempt_operation_id'] = row['operation_id'] + ':0'
         if CFG.get('initial_missing_id'):
             row.pop('id', None)
         if CFG.get('initial_bad_id'):
@@ -428,7 +484,20 @@ def _handle_sessions(argv):
         if child_id in ST['intakes']:
             intake_row = ST['intakes'][child_id]
             if isinstance(intake_row.get('dispatch'), dict) and intake_row['dispatch'].get('id') == s['id']:
-                intake_row['dispatch']['state'] = 'stopped'
+                # Normal operator STOP: saga complete -> view 'failed'; intake failed / session_stop_confirmed.
+                intake_row['dispatch']['state'] = 'failed'
+                intake_row['status'] = 'failed'
+                if not CFG.get('final_missing'):
+                    intake_row['final_evidence'] = final_stop_evidence(s, child_id)
+                if CFG.get('dispatch_alias_base_mismatch'):
+                    intake_row['dispatch']['attempt_operation_id'] = str(uuid.UUID(int=0xFEED)) + ':0'
+                if CFG.get('dispatch_attempt_int_contradiction'):
+                    intake_row['dispatch']['attempt'] = 1 - intake_row['dispatch']['attempt']
+                if CFG.get('dispatch_machine_attempt_as_base'):
+                    intake_row['dispatch']['operation_id'] = intake_row['dispatch']['attempt_operation_id']
+                if CFG.get('dispatch_missing_alias'):
+                    intake_row['dispatch'].pop('attempt_operation_id', None)
+                intake_row['updated_at'] += 1
             if CFG.get('fresh_successor_after_first_scan') and intake_row.get('_injected_count', 0) < 2:
                 intake_row['_injected_count'] = intake_row.get('_injected_count', 0) + 1
                 dsid = str(uuid.UUID(int=7700 + len(ST['sessions'])))
@@ -439,7 +508,7 @@ def _handle_sessions(argv):
                     'at': 3000 + seq, 'body': {'previous_session_id': s['id'], 'session_id': dsid, 'depth': intake_row['_injected_count'], 'reason': 'late'},
                 })
                 intake_row['session_id'] = dsid
-                intake_row['dispatch'] = {'id': dsid, 'operation_id': dsid, 'attempt_operation_id': dsid + ':0', 'machine_id': 'hetzner-aplexer', 'epoch': 1, 'state': 'running', 'native_id': ST['sessions'][dsid]['native_id']}
+                intake_row['dispatch'] = project_dispatch(ST['sessions'][dsid])
                 intake_row['updated_at'] += 1
             elif not intake_row.get('_lineage_injected'):
                 intake_row['_lineage_injected'] = True
@@ -452,7 +521,7 @@ def _handle_sessions(argv):
                         'at': 3000, 'body': {'previous_session_id': s['id'], 'session_id': dsid, 'depth': 1, 'reason': 'exit'},
                     })
                     intake_row['session_id'] = dsid
-                    intake_row['dispatch'] = {'id': dsid, 'operation_id': dsid, 'attempt_operation_id': dsid + ':0', 'machine_id': 'hetzner-aplexer', 'epoch': 1, 'state': 'running', 'native_id': ST['sessions'][dsid]['native_id']}
+                    intake_row['dispatch'] = project_dispatch(ST['sessions'][dsid])
                     intake_row['updated_at'] += 1
                 elif CFG.get('verification_descendant'):
                     dsid = str(uuid.UUID(int=7200 + len(ST['sessions'])))
@@ -463,7 +532,7 @@ def _handle_sessions(argv):
                         'at': 3000, 'body': {'original_session_id': s['id'], 'previous_session_id': s['id'], 'session_id': dsid, 'attempt': 1},
                     })
                     intake_row['session_id'] = dsid
-                    intake_row['dispatch'] = {'id': dsid, 'operation_id': dsid, 'attempt_operation_id': dsid + ':0', 'machine_id': 'hetzner-aplexer', 'epoch': 1, 'state': 'running', 'native_id': ST['sessions'][dsid]['native_id']}
+                    intake_row['dispatch'] = project_dispatch(ST['sessions'][dsid])
                     intake_row['updated_at'] += 1
                 elif CFG.get('foreign_assignment'):
                     intake_row['session_id'] = str(uuid.UUID(int=888888))
@@ -490,7 +559,7 @@ def _handle_sessions(argv):
                     intake_row['dispatch']['native_id'] = str(uuid.UUID(int=424242))
                     intake_row['updated_at'] += 1
                 elif CFG.get('cleanup_stop_view_op_drift'):
-                    s['operation_id'] = 'drifted-operation'
+                    s['base_op'] = str(uuid.UUID(int=0xD0000000))
                 elif CFG.get('pending_dispatch_state'):
                     intake_row['dispatch'] = {
                         'id': s['id'], 'state': 'offered', 'operation_id': 'unproven-other-operation',
@@ -515,7 +584,7 @@ def _handle_sessions(argv):
                         })
                         prev = dsid
                     intake_row['session_id'] = prev
-                    intake_row['dispatch'] = {'id': prev, 'operation_id': prev, 'attempt_operation_id': prev + ':0', 'machine_id': 'hetzner-aplexer', 'epoch': 1, 'state': 'running', 'native_id': ST['sessions'][prev]['native_id']}
+                    intake_row['dispatch'] = project_dispatch(ST['sessions'][prev])
                     intake_row['updated_at'] += 1
         out({'id': s['id'], 'state': 'stopped', 'stop_confirmed': not CFG.get('stop_not_confirmed')})
 

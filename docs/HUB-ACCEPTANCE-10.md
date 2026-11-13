@@ -40,21 +40,6 @@ Root writes a private JSON file with `kind: "phase7_native_operator_validated_ev
         "reference": "Root-verified unassisted interactive capture receipt",
         "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
         "path": "claude-native-transport-receipt.json"
-      },
-      "antigravity": {
-        "engine": "antigravity",
-        "machine_id": "hetzner-aplexer",
-        "mode": "interactive",
-        "format": "hydrogen_native_pane_v1",
-        "proof_class": "native_action_plus_artifact_v2",
-        "capture_command": "a capture <native_id> --screen --plain",
-        "artifact_schema": "phase7_native_work_v2",
-        "host_release_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "provider_version": "Root-verified actual provider version",
-        "profile_set_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-        "reference": "Root-verified unassisted interactive capture receipt",
-        "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-        "path": "hydrogen-native-transport-receipt.json"
       }
     },
     "receipts": {
@@ -136,24 +121,43 @@ Within the 90-second capture window, the driver requires BOTH:
    - **Claude (`claude_native_pane_v1`)**: completed `● Bash(...)` heading and
      output-tree block carrying `AC10_WORK_V2 <run_id> <sample> <proof_digest> <head> 5050`
      (`Waiting…`, hooks-only, and assistant prose are nonproof).
-   - **Hydrogen (`hydrogen_native_pane_v1`, proof class
-     `native_exact_probe_header_plus_artifact_v3`)**: the real Hydrogen pane
-     collapses tool stdout (`(ctrl+o to expand)`), so lines after the header
-     are assistant/footer prose and are never proof. The brief makes every
-     sample run its work as ONE script at a short unique per-sample path
-     `.local/a10/<run8><nn>.py` via the single command
-     `python3 .local/a10/<run8><nn>.py`; proof requires an exact, fully visible
-     (not truncated) `● Ran (python3 .local/a10/<run8><nn>.py) (ctrl+o to expand)`
-     header line AND the independent artifact AND that probe file present as a
-     regular no-symlink file in the actual child workspace (its sha256 is
-     recorded). Unrelated Python/shell actions, other samples' probes,
-     truncated headers, grouped `Ran N commands` rows, assistant footers and
-     `Command exited with code 0.` prose are nonproof. No expanded stdout,
-     typed JSON or UI completion is fabricated.
-   - **Hydrogen proof is currently UNAVAILABLE**: the existing Root v2
-     Hydrogen attestation (`native_action_plus_artifact_v2`) does not satisfy
-     the v3 class, so Hydrogen samples fail closed until Root runs a qualified
-     preflight (below). Hydrogen is not permanently disabled.
+   - **Hydrogen (`hydrogen_native_pane_v1`): native proof is UNAVAILABLE
+     today (`UNKNOWN_NATIVE_FRAMING`).** No Hydrogen native framing contract
+     is qualified. Root's genuine observation 1 validated the canonical
+     artifact, but its plain viewport showed only an assistant footer with zero
+     candidate command rows; that is artifact evidence, not native-format
+     proof. An exact `● Ran (<cmd>) (ctrl+o to expand)` row cannot distinguish
+     a completed native action from assistant/footer text, a same-command
+     `Running` row, a failed exit or a duplicate row. Therefore:
+     - There is no Hydrogen entry in `NATIVE_PROOF_CLASSES`.
+       `native_transport_ok('antigravity', ...)` and
+       `native_pane_output_ok(..., 'antigravity', ...)` always return false,
+       whatever class label (v2, v3, v4, ...) a record carries. A class label
+       is not attestation, and no record, flag, environment variable or
+       same-UID artifact from an agent can enable it.
+     - An operator bundle naming an `antigravity` transport is refused with
+       `capture_antigravity native proof UNAVAILABLE: UNKNOWN_NATIVE_FRAMING`.
+     - A Hydrogen draw in a run is not resampled and Hydrogen is not
+       excluded from the picker. The driver still verifies the canonical
+       artifact and per-sample probe file as **artifact-only** evidence
+       (`artifact_only`), records `native_proof = {status: UNAVAILABLE,
+       reason: UNKNOWN_NATIVE_FRAMING, root_checker_status:
+       NEEDS_ROOT_RENDERER_ATTESTATION, native_action_verified: false,
+       typed_stdout_verified: false}`, and fails the sample. Cleanup runs as
+       usual.
+     - This matches Root's approved private V2 checker (manifest
+       `573458fe...55ad`). That checker always exits 2 with
+       `NEEDS_ROOT_RENDERER_ATTESTATION` and reports native_action_verified,
+       typed_stdout and final10 all false, even when the artifact or the
+       exact row is valid.
+     - `hydrogen_framing_diagnostic()` is a forward-looking support hook. It
+       counts exact short-command rows and flags same-command
+       Running/error rows and duplicates, and its status is always
+       `UNKNOWN_NATIVE_FRAMING`. The short per-sample command
+       `python3 .local/a10/<run8><nn>.py`, the probe-file check and the
+       artifact validation stay in place as preparation. None of them can
+       create native authority on their own. The driver does not infer typed
+       stdout, expanded completion or section grammar from old raw ANSI.
    - Trust menus (`Do you trust the contents of this project?`), raw headless
      JSON stream frames, prompt echoes, and unknown engines fail closed.
 
@@ -178,28 +182,68 @@ Cleanup runs under a single 60-second budget:
 - Incomplete archives, sequence gaps, snapshot changes, pending completion
   actions, foreign session assignments, or exhausted bounds mark cleanup
   `UNKNOWN` and stop the run.
+- **Endpoint-specific operation identity.** Each endpoint uses its own shape
+  (see `hub2/src/machine-do.ts` sessionView and claim mapping, and
+  `hub2/src/project-do.ts` sagaView and the previous-attempt relation
+  `${operation_id}:${attempt}`):
+  - Machine `sessions show` and `stop_wait`: `operation_id` is the ATTEMPT id
+    `<base-uuid>:<attempt>`. The view has no `attempt_operation_id` and no
+    `attempt`.
+  - Project intake `dispatch`, `final_evidence`, the nested
+    `final_evidence.finish_after_stop`, and the stopped Machine view's nested
+    exit `evidence`: `operation_id` is the BASE UUID and
+    `attempt_operation_id` is `<base>:<attempt>`. `dispatch` also has an
+    integer `attempt`.
+  - The start response top level is the Project saga view. `binding_wait` is
+    Machine-shaped.
+
+  Every view is normalized into one `(session_id, base, attempt_operation_id,
+  attempt, epoch, machine_id, native_id)` tuple, and raw `operation_id`
+  labels are never compared across endpoints. Normalization accepts only the
+  strict `<lowercase-uuid>:<attempt>` scheme. Opaque ids are refused, never
+  pattern-stripped. An optional redundant Machine alias
+  (`attempt_operation_id`, `attempt`, `dispatch_id`, `host`/`machine`) is not
+  required, but if present it must agree; a contradiction fails. The only
+  start-response difference allowed is the source-backed previous-attempt
+  relation (same base and SID, attempt n-1) when a waited start falls back.
 - Current custody is mandatory (missing/NULL is UNKNOWN, never equality):
   the current `session_id` must be an owned SID, `assigned_machine_id` must be
   the host, and the current `dispatch` must exist, name the current owned SID,
-  be terminal, and match the immutable original (from the start show) or
-  proven-descendant (from its pre-STOP show) `operation_id`,
-  `attempt_operation_id`, `epoch`, `machine_id` and `native_id`. The stop
-  view may only confirm that identity; drift is never adopted.
+  be terminal, and normalize to the immutable original tuple (from the start
+  show) or the proven-descendant tuple (from its pre-STOP show). The pre-STOP
+  barrier and stop views may only confirm that tuple and never overwrite it.
+  A NULL original native stays UNKNOWN: a late native id is checked for
+  absence but never adopted.
+- A normal operator STOP leaves the intake `failed` with
+  `completion.reason == session_stop_confirmed` and terminal dispatch state
+  `failed`. Before archiving, `final_evidence` must bind the exact owned
+  base/attempt tuple, show `stopped: true` and `reason: stop_confirmed`, and
+  carry a `finish_after_stop` that repeats the same tuple and intake with
+  `native_exit_confirmed: true` and `evidence.containment_empty: true`. This
+  is in addition to fresh native absence. There is no force or AC accept.
 - Archive with exact CAS `--version <updated_at>` only after that proof
   (never forced, never active, never blindly retried). `cleanup_status` is
   `CONFIRMED` only after the archive response or a final `intake show`
   recheck proves `archived` with the same terminal owned dispatch; otherwise it
   stays `ARCHIVE_PENDING` (explicit, not CONFIRMED) or `UNKNOWN`.
-- The 90-second proof window is a single deadline propagated into every Git
-  and artifact call, and re-checked after verification; no timeout is widened.
+- The 90-second proof window is a single deadline. Before EACH Git call
+  (`rev-parse`, then `status`) the driver computes the remaining budget fresh,
+  capped at 30s, and it rechecks the deadline after each call returns. The
+  second call never reuses the first call's timeout, and no timeout is
+  widened.
 
-## Requested qualified Root preflight for Hydrogen (not executed here)
+## Hydrogen: source prep vs remaining runtime and full-10 work (open)
 
-Root (not this driver work) should run one bounded interactive Hydrogen
-session on the host with a brief that writes a pinned canonical probe body to
-`.local/a10/<run8><nn>.py` and runs exactly `python3 .local/a10/<run8><nn>.py`,
-then capture `a capture <native_id> --screen --plain` and confirm: the
-completed `● Ran (python3 .local/a10/<run8><nn>.py) (ctrl+o to expand)` header
-is rendered fully (no truncation), the probe file body hash equals the pinned
-hash, and the artifact verifies. Only after that review may Root attest
-`native_exact_probe_header_plus_artifact_v3` for `antigravity`.
+This source makes Hydrogen proof an honest UNAVAILABLE gate. It does **not**
+complete the formal ten-sample goal. These items remain open:
+
+1. A Root-qualified preflight of the actual Hydrogen renderer. It must show
+   real sanitized renderings that separate a completed native action from
+   assistant text and from Running, failed or duplicate rows, with the
+   executed probe bytes pinned before the action.
+2. After that, a separately source-reviewed framing recognizer that replaces
+   `hydrogen_framing_diagnostic()`/`_hydrogen_native_pane_ok()` and adds
+   the Hydrogen proof class, tested against those genuine fixtures.
+3. Root review of this exact source, exact CI and head integration, and a
+   qualified runtime proof. Formal Hydrogen support and the full ten-sample
+   acceptance criteria stay OPEN until all of these are done.
