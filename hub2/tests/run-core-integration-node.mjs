@@ -343,7 +343,7 @@ try{
  await test('persistent restart preserves auth and terminal outcome',async()=>{
   if(liveSocket){liveSocket.socket.close();liveSocket=null;}rt = await restartFixture(rt,spec); base = rt.origin;
   expect(await api('/api/offers','GET',undefined,hostToken),200,'credential survives restart');
-  assert(completedIntakeId,'completed lifecycle prerequisite did not pass');const restored=expect(await api(`/api/intakes/${completedIntakeId}?project=${encodeURIComponent(project)}`),200,'restored terminal intake');assert.equal(restored.intake.status,'completed-awaiting-review');assert.equal(restored.intake.final_evidence.exit_code,0);
+  assert(completedIntakeId,'completed lifecycle prerequisite did not pass');const restored=expect(await api(`/api/intakes/${completedIntakeId}?project=${encodeURIComponent(project)}`),200,'restored terminal intake');assert.equal(restored.intake.status,'accepted');assert.equal(restored.intake.final_evidence.exit_code,0);
   const snap=await snapshots();for(const v of Object.values(snap))assert.equal(v.counts.measurement_valid,true);measurements.restart=snap;
  });
  await test('one machine accepts multiple sessions below the global live-session cap',async()=>{
@@ -370,6 +370,14 @@ try{
   const events=JSON.stringify(expect(await api('/api/intakes/'+id+'/history'+q),200,'history'));
   assert(events.includes('a'.repeat(40))&&events.includes('d'.repeat(40)),'merge proofs persisted');
   assert.equal(expect(await api('/api/intakes/'+id+q),200,'intake').intake.status,'open','merge evidence alone never accepts the intake');
+
+  // merge-state (13 Nov: 404 live on d324b268 because the router omitted it).
+  const state=expect(await api('/api/intakes/'+id+'/merge-state'+q),200,'canonical merge-state');
+  assert.equal(state.intake_id,id);assert.equal(state.code_task,true);assert.equal(state.merge_gate.ok,true,JSON.stringify(state));
+  const compat=expect(await api('/api/intake/tasks/'+id+'/merge-state'),200,'compat merge-state without ?project resolves the intake route');
+  assert.equal(compat.merge_gate.evidence.head_sha,'d'.repeat(40),'newest evidence decides');
+  expect(await api('/api/intakes/'+id+'/merge-state'+q,'GET',undefined,null),401,'anonymous merge-state refused');
+  expect(await api('/api/intake/tasks/'+id+'/reevaluate','POST',{key:'reeval-open'}),409,'re-evaluation needs a finished session');
  });
 }finally{
  if(liveSocket)liveSocket.socket.close();await rt.dispose();

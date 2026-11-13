@@ -503,8 +503,13 @@ def add_commands(sub):
     merge_check.add_argument('--sha', action='append', default=[], help='Extra commit to verify (the DONE note commits and HEAD are always checked)')
     merge_check.add_argument('--key', help='Stable retry key; generated automatically when omitted')
     merge_check.add_argument('--dry-run', action='store_true', help='Print the evidence without recording it')
-    merge_state = commands.add_parser('merge-state', help='Merge state of one intake, or the list of unmerged intakes')
+    merge_check.add_argument('--pr', default=None, help='Hub2: the PR (URL or number) that merged this work; default: the newest PR of the intake project cited in the intake, else a PR of a branch the host pushed for it')
+    merge_state = commands.add_parser('merge-state', help="One intake's programmatic merge gate (Hub2), or the list of unmerged intakes (legacy Hub)")
     merge_state.add_argument('id', nargs='?')
+    reevaluate = commands.add_parser('reevaluate', help='Operator: re-run Hub acceptance verification and the merge gate on a failed intake; a pass accepts it, a fail sends it back with named gaps')
+    reevaluate.add_argument('id')
+    reevaluate.add_argument('--reason', default=None, help='Why the intake is re-evaluated (shown to the verifier)')
+    reevaluate.add_argument('--key', help='Stable retry key; generated automatically when omitted')
     event = commands.add_parser('append', help='Append a note in one command (--note TEXT or --note-file F; key and version are automatic), or an intake/note/session/report/commit/followup/blocker/decision/rule reference as JSON with --event-file; approval decisions require operator')
     event.add_argument('id')
     event.add_argument('--version', type=int, help='CAS version for --event-file appends; not needed for a plain note')
@@ -559,6 +564,39 @@ def current_version(shown):
             if type(value) is int:
                 return value
     raise IntakeInputError('Intake show response has no task.control.version; pass --version from `hub intake show`')
+
+
+def _hub2_events(intake_id, pages=20):
+    events, after = [], 0
+    for _ in range(pages):
+        page = request('GET', BASE + '/tasks/' + intake_id + '/history?' + urlencode({'after': after, 'limit': 100}))
+        batch = page.get('events') if isinstance(page, dict) else None
+        if not isinstance(batch, list) or not batch:
+            break
+        events.extend(event for event in batch if isinstance(event, dict))
+        after = page.get('next')
+        if not isinstance(after, int):
+            break
+    return events
+
+
+def _hub2_merge_check(args, intake):
+    """Hub2: collect GitHub evidence for the intake's PR and record it (merge gate)."""
+    from . import hub2_merge_evidence
+    intake_id = safe_id(str(intake.get('id') or args.id))
+    repository = str(intake.get('project') or '')
+    pr = args.pr
+    if pr and not str(pr).startswith('https://') and not str(pr).isdigit():
+        raise IntakeInputError('--pr must be a PR URL or number')
+    if not pr:
+        pr = hub2_merge_evidence.find_pr(repository, _hub2_events(intake_id))
+    evidence = hub2_merge_evidence.collect(repository, pr)
+    if args.dry_run:
+        return {'dry_run': True, 'intake_id': intake_id, 'evidence': evidence}
+    key = args.key or 'merge-check-' + _random_hex()
+    valid_key(key)
+    request('POST', BASE + '/tasks/' + intake_id + '/merge-evidence', {'key': key, 'evidence': evidence})
+    return request('GET', BASE + '/tasks/' + intake_id + '/merge-state')
 
 
 def safe_id(value):
@@ -788,9 +826,18 @@ def execute(args):
         return request('GET', BASE + '/grantees?' + urlencode(params))
     if command == 'merge-state':
         return request('GET', BASE + ('/tasks/' + safe_id(args.id) + '/merge-state' if args.id else '/merge-state'))
+    if command == 'reevaluate':
+        key = args.key or 'reevaluate-' + _random_hex()
+        valid_key(key)
+        payload = {'key': key}
+        if args.reason:
+            payload['reason'] = args.reason
+        return request('POST', BASE + '/tasks/' + safe_id(args.id) + '/reevaluate', payload)
     if command == 'merge-check':
         from . import merge_evidence
         shown = request('GET', BASE + '/tasks/' + safe_id(args.id))
+        if isinstance(shown, dict) and isinstance(shown.get('intake'), dict):
+            return _hub2_merge_check(args, shown['intake'])
         history = ((shown.get('task') or {}).get('payload_data') or {}).get('history') or []
         task = shown.get('task') or {}
         text = '\n'.join(e.get('text', '') for e in history if isinstance(e, dict) and e.get('kind') == 'note' and str(e.get('text', '')).lstrip().startswith('DONE'))

@@ -61,10 +61,11 @@ export function mergeEvidenceError(value: unknown): string | undefined {
   for (const name of ['head_sha', 'checks_head_sha', 'merge_commit_sha', 'main_head_sha'] as const)
     if (typeof e[name] !== 'string' || !SHA.test(e[name] as string)) return `${name} must be a full commit SHA`;
   if (String(e.checks_head_sha).toLowerCase() !== String(e.head_sha).toLowerCase()) return 'checks must belong to the exact pull request head';
-  if (e.checks_state !== 'success') return 'checks_state must be success';
   for (const name of ['checks_total', 'checks_successful', 'checks_pending', 'checks_failed'] as const)
     if (!Number.isSafeInteger(e[name]) || Number(e[name]) < 0) return `${name} must be a non-negative integer`;
-  if (Number(e.checks_total) < 1 || e.checks_successful !== e.checks_total || e.checks_pending !== 0 || e.checks_failed !== 0)
+  const noChecks = e.checks_state === 'none' && e.checks_total === 0 && e.checks_successful === 0 && e.checks_pending === 0 && e.checks_failed === 0;
+  if (!noChecks && e.checks_state !== 'success') return 'checks_state must be success';
+  if (!noChecks && (Number(e.checks_total) < 1 || e.checks_successful !== e.checks_total || e.checks_pending !== 0 || e.checks_failed !== 0))
     return 'all checks must be green for the exact head SHA';
   if (e.merge_commit_in_main !== true) return 'merge commit must be present in origin/main';
   if (typeof e.checked_at !== 'string' || !e.checked_at.trim() || !Number.isFinite(Date.parse(e.checked_at))) return 'checked_at is required';
@@ -85,10 +86,16 @@ export function mergeGate(required: boolean, value: unknown, expectedRepository?
   if (typeof e.merged_at !== 'string' || !e.merged_at.trim() || !Number.isFinite(Date.parse(e.merged_at))) problems.push('the pull request is not merged');
   if (typeof e.head_sha !== 'string' || !SHA.test(e.head_sha)) problems.push('the pull request head SHA is missing or invalid');
   if (typeof e.checks_head_sha !== 'string' || String(e.checks_head_sha).toLowerCase() !== String(e.head_sha).toLowerCase()) problems.push('checks are not for the exact pull request head');
-  if (e.checks_state !== 'success') problems.push('checks are not green for the exact head SHA');
-  if (!Number.isSafeInteger(e.checks_total) || Number(e.checks_total) < 1
-    || e.checks_successful !== e.checks_total || e.checks_pending !== 0 || e.checks_failed !== 0)
-    problems.push('all checks must be green for the exact head SHA');
+  // `none`: the merged PR's exact head has no check run or status at all (the
+  // repository runs no CI). Nothing is red or pending, so nothing blocks.
+  const noChecks = e.checks_state === 'none' && e.checks_total === 0 && e.checks_successful === 0
+    && e.checks_pending === 0 && e.checks_failed === 0;
+  if (!noChecks) {
+    if (e.checks_state !== 'success') problems.push('checks are not green for the exact head SHA');
+    if (!Number.isSafeInteger(e.checks_total) || Number(e.checks_total) < 1
+      || e.checks_successful !== e.checks_total || e.checks_pending !== 0 || e.checks_failed !== 0)
+      problems.push('all checks must be green for the exact head SHA');
+  }
   if (typeof e.merge_commit_sha !== 'string' || !SHA.test(e.merge_commit_sha)) problems.push('the merge commit SHA is missing or invalid');
   if (typeof e.main_head_sha !== 'string' || !SHA.test(e.main_head_sha)) problems.push('origin/main head SHA is missing or invalid');
   if (e.merge_commit_in_main !== true) problems.push('the merge commit is not present in origin/main');
