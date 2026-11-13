@@ -22,6 +22,7 @@ function fixture(){
   let control:ControlDO;
   let sql:NodeSqlStorage,project:ProjectDO,policy=structuredClone(candidates),version=1,policyReads=0;
   let engines=['codex','claude'];
+  const accountHosts=new Map<string,string[]>([['codex-private',['h1']],['claude-private',['h2']]]);
   let policyGate:{entered:()=>void;wait:Promise<void>}|undefined;
   const reservations:any[]=[];
   const namespace=(handle:(id:string,request:Request)=>Promise<Response>)=>({idFromName:(id:string)=>id,
@@ -53,7 +54,7 @@ function fixture(){
       return Response.json({state:'offered'});
     }),
     ACCOUNTS:namespace(async(id)=>Response.json({account:{enabled:true,min_remaining:0},credential_usable:true,
-      credential_status:'ready',quota:{remaining:80},hosts:[id==='codex-private'?'h1':'h2']})),
+      credential_status:'ready',quota:{remaining:80},hosts:accountHosts.get(id)||[]})),
   };
   control=new ControlDO({storage:new NodeDurableStorage(controlSql),
     blockConcurrencyWhile:(callback:any)=>Promise.resolve().then(callback)} as any,env);
@@ -70,6 +71,7 @@ function fixture(){
   return {call,reservations,get policyReads(){return policyReads;},get sql(){return sql;},
     setPolicy(value:typeof candidates){policy=structuredClone(value);version++;},
     setEngines(value:string[]){engines=[...value];},
+    setAccountHosts(account:string,hosts:string[]){accountHosts.set(account,[...hosts]);},
     pauseNextPolicy(){
       let entered!:()=>void,release!:()=>void;
       const enteredPromise=new Promise<void>(resolve=>{entered=resolve;});
@@ -147,6 +149,59 @@ test('actual fallback records the second draw and preserves the first full pool 
     assert.equal(exhausted.status,200);assert.equal((await parsed(exhausted)).fallback,false);
     assert.deepEqual(JSON.parse((f.sql.exec('SELECT routing_json FROM dispatch_sagas').toArray()[0] as any).routing_json).picker,picker);
     assert.equal(draws,2);assert.equal(f.policyReads,2);
+  }finally{Math.random=random;f.close();}
+});
+
+test('ambiguous workspace placement retries on a different approved host and records a visible event',async()=>{
+  const f=fixture(),random=Math.random;Math.random=()=>0;
+  try{
+    f.setPolicy([candidates[0]]);f.setAccountHosts('codex-private',['h1','h2']);
+    const own=await intake(f,'workspace-placement-fallback');
+    const first=await parsed(await f.call('/api/intakes/'+own.id+'/start','POST',{
+      key:'workspace-placement-start',workspace:'dataops',prompt:'verify workspace placement',
+    }));
+    assert.equal(first.session.machine_id,'h1');
+    const saga=f.sql.exec('SELECT * FROM dispatch_sagas').toArray()[0] as any;
+    const response=await f.call('/_internal/auth-fallback','POST',{
+      operation_id:saga.operation_id,attempt_operation_id:saga.attempt_operation_id,session_id:saga.session_id,
+      machine_id:saga.machine_id,epoch:saga.epoch,reason:'workspace_label_ambiguous',
+    });
+    assert.equal(response.status,200,JSON.stringify(await response.clone().json()));
+    assert.equal((await parsed(response)).fallback,true);
+    const next=f.sql.exec('SELECT * FROM dispatch_sagas').toArray()[0] as any;
+    const routing=JSON.parse(next.routing_json);
+    assert.equal(next.attempt,1);assert.equal(next.machine_id,'h2');
+    assert.equal(routing.picker.policy_id,first.picker.policy_id);
+    assert.equal(routing.picker.attempt,1);
+    assert.deepEqual(routing.picker.history.map((row:any)=>row.machine_id),['h1','h2']);
+    assert.deepEqual(routing.initial_picker,first.picker);
+    assert.equal(f.reservations.at(-1).machine_id,'h2');
+    const event=f.sql.exec('SELECT kind,body_json FROM intake_events WHERE task_id=? ORDER BY seq',own.id).toArray()
+      .map((row:any)=>({...row,body:JSON.parse(row.body_json)}))
+      .find((row:any)=>row.kind==='session_placement_fallback');
+    assert.equal(event.body.reason,'workspace_label_ambiguous');
+    assert.equal(event.body.failed_machine_id,'h1');assert.equal(event.body.next_machine_id,'h2');
+    assert.equal(event.body.workspace,'dataops');
+  }finally{Math.random=random;f.close();}
+});
+
+test('exhausted workspace placement fallback leaves a visible failure event',async()=>{
+  const f=fixture(),random=Math.random;Math.random=()=>0;
+  try{
+    f.setPolicy([candidates[0]]);
+    const own=await intake(f,'workspace-placement-exhausted');
+    await f.call('/api/intakes/'+own.id+'/start','POST',{key:'workspace-placement-exhausted',workspace:'dataops',prompt:'verify placement'});
+    const saga=f.sql.exec('SELECT * FROM dispatch_sagas').toArray()[0] as any;
+    const response=await f.call('/_internal/auth-fallback','POST',{
+      operation_id:saga.operation_id,attempt_operation_id:saga.attempt_operation_id,session_id:saga.session_id,
+      machine_id:saga.machine_id,epoch:saga.epoch,reason:'workspace_label_ambiguous',
+    });
+    assert.equal(response.status,200);assert.equal((await parsed(response)).fallback,false);
+    const intakeRow=f.sql.exec('SELECT status,final_evidence_json FROM intakes WHERE id=?',own.id).toArray()[0] as any;
+    assert.equal(intakeRow.status,'failed');
+    assert.equal(JSON.parse(intakeRow.final_evidence_json).error,'placement_fallback_failed');
+    const event=f.sql.exec("SELECT kind,body_json FROM intake_events WHERE task_id=? AND kind='session_placement_fallback_failed'",own.id).toArray()[0] as any;
+    assert.equal(JSON.parse(event.body_json).placement_reason,'workspace_label_ambiguous');
   }finally{Math.random=random;f.close();}
 });
 

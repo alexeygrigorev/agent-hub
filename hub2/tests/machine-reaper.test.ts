@@ -340,13 +340,13 @@ test('host launch refusal terminally fails an unclaimed offer with a visible rea
  const socket={readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'socket'}),send:(value:string)=>frames.push(JSON.parse(value))};
  f.sockets.push(socket);
  await f.machine.webSocketMessage(socket as any,JSON.stringify({type:'host.error',session_id:sessionId,
-  operation_id:'op-'+sessionId,stage:'host_launch',reason:'workspace_label_unavailable'}));
+  operation_id:'op-'+sessionId,stage:'host_launch',reason:'launcher_capability_unavailable'}));
  const row=f.database.prepare('SELECT state,native_id FROM sessions WHERE id=?').get(sessionId) as any;
  assert.equal(row.state,'failed');assert.equal(row.native_id,null);
- assert.equal((f.database.prepare('SELECT reason FROM attention WHERE session_id=?').get(sessionId) as any).reason,'workspace_label_unavailable');
+ assert.equal((f.database.prepare('SELECT reason FROM attention WHERE session_id=?').get(sessionId) as any).reason,'launcher_capability_unavailable');
  assert.equal(f.events.at(-1)?.path,'/_internal/reaped');
  assert.equal(f.events.at(-1)?.body.epoch,epoch);assert.equal(f.events.at(-1)?.body.reason,'host_launch_refused');
- assert.equal(f.events.at(-1)?.body.failure_reason,'workspace_label_unavailable');
+ assert.equal(f.events.at(-1)?.body.failure_reason,'launcher_capability_unavailable');
  assert.equal(f.events.at(-1)?.body.launch_failed,true);
 });
 
@@ -360,6 +360,19 @@ test('authentication refusal from an unclaimed offer routes to model fallback',a
  assert.equal((f.database.prepare('SELECT state FROM machine_session_operations WHERE operation_id=?').get('op-'+sessionId) as any).state,'expired');
  assert.equal(f.events.at(-1)?.path,'/_internal/auth-fallback');
  assert.equal(f.events.at(-1)?.body.reason,'provider_auth_failed');
+});
+
+test('ambiguous workspace refusal routes to another-host placement fallback with a visible attention reason',async()=>{
+ const f=fixture(),sessionId='workspace-label-ambiguous',epoch=await startOffered(f,sessionId);
+ const socket={readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'socket'}),send:()=>{}};
+ f.sockets.push(socket);
+ await f.machine.webSocketMessage(socket as any,JSON.stringify({type:'host.error',session_id:sessionId,
+  operation_id:'op-'+sessionId,stage:'host_launch',reason:'workspace_label_ambiguous'}));
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(sessionId) as any).state,'expired');
+ assert.equal((f.database.prepare('SELECT state FROM machine_session_operations WHERE operation_id=?').get('op-'+sessionId) as any).state,'expired');
+ assert.equal((f.database.prepare('SELECT reason FROM attention WHERE session_id=?').get(sessionId) as any).reason,'workspace_label_ambiguous');
+ assert.equal(f.events.at(-1)?.path,'/_internal/auth-fallback');
+ assert.equal(f.events.at(-1)?.body.epoch,epoch);assert.equal(f.events.at(-1)?.body.reason,'workspace_label_ambiguous');
 });
 
 test('command and mailbox diagnostics never settle a matching launch attempt',async()=>{

@@ -142,6 +142,7 @@ const AUTH_FALLBACK_REASONS=new Set(['provider_auth_failed','provider_unauthoriz
   'credentials_unavailable','account_unconfigured','access_lifetime_insufficient','provider_access_lifetime_insufficient',
   'child_credential_unavailable','child_credential_unverified','credential_key_unavailable','credential_decryption_failed',
   'credential_missing','refresh_refused','refresh_invalid','refresh_in_progress','refresh_outcome_uncertain','generation_conflict',
+  'workspace_label_ambiguous','workspace_label_unavailable','workspace_unavailable',
   'host_not_approved']);
 
 /** Per-host presence, native-session evidence and durable completion outbox. */

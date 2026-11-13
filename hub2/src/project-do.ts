@@ -32,6 +32,9 @@ const COMPLETION_ELIGIBLE = `i.status IN ('open','failed','completed-awaiting-re
   AND json_extract(i.final_evidence_json,'$.completion.session_id')=i.session_id
   AND EXISTS(SELECT 1 FROM dispatch_sagas s WHERE s.session_id=i.session_id AND s.intake_id=i.id
     AND json_extract(s.routing_json,'$.completion_contract')=1)`;
+const WORKSPACE_PLACEMENT_FAILURES = new Set([
+  'workspace_label_ambiguous', 'workspace_label_unavailable', 'workspace_unavailable',
+]);
 
 const SCHEMA = [
   `CREATE TABLE intakes (
@@ -949,16 +952,18 @@ export class ProjectDO {
     await this.scheduleNext();
     await this.dispatchSaga(prepared.operation_id);
     await this.scheduleNext();
-    return json({fallback:true,session_id:prepared.session_id,engine:prepared.engine,model:prepared.model});
+    return json({fallback:true,session_id:prepared.session_id,engine:prepared.engine,model:prepared.model,
+      machine_id:prepared.machine_id});
   }
 
-  private async prepareAuthFallback(request:Request):Promise<Response|{operation_id:string;session_id:string;engine:string;model:string}>{
+  private async prepareAuthFallback(request:Request):Promise<Response|{operation_id:string;session_id:string;engine:string;model:string;machine_id:string}>{
     const body=await bodyObject(request,4096);
     if(typeof body.operation_id!=='string'||typeof body.attempt_operation_id!=='string'||typeof body.session_id!=='string'
       ||typeof body.machine_id!=='string'||!Number.isSafeInteger(body.epoch)||typeof body.reason!=='string')return error('invalid_auth_fallback',400);
     const saga=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?',body.operation_id);
     if(!saga||saga.session_id!==body.session_id||saga.machine_id!==body.machine_id||saga.attempt_operation_id!==body.attempt_operation_id
       ||saga.epoch!==body.epoch||!['offered','claimed'].includes(saga.state)||saga.native_id)return error('stale_auth_fallback',409);
+    const placementFailure=WORKSPACE_PLACEMENT_FAILURES.has(body.reason);
     const route=this.parse(saga.routing_json) as (PickedRoute&{attempted_policy_ids?:string[];picker?:unknown;initial_picker?:unknown})|null;
     const tried=[...new Set([...(route?.attempted_policy_ids||[]),route?.policy_id].filter((id):id is string=>typeof id==='string'))];
     const intake=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',saga.intake_id);
@@ -970,25 +975,32 @@ export class ProjectDO {
         this.db.run("UPDATE dispatch_sagas SET state='complete',next_action_at=NULL,last_reason=?,updated_at=? WHERE operation_id=? AND state=? AND attempt_operation_id=? AND epoch=? AND native_id IS NULL",
           reason,now,saga.operation_id,saga.state,saga.attempt_operation_id,saga.epoch);
         const row=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=? AND session_id=?',intake.id,saga.session_id);
-        const completion=row&&this.completionControlled(saga)?this.completionOutcome(row,saga,undefined,'auth_failed',false,true,now):undefined;
+        const completion=row&&this.completionControlled(saga)?this.completionOutcome(row,saga,undefined,
+          placementFailure?'placement_failed':'auth_failed',false,true,now):undefined;
         this.db.run("UPDATE intakes SET status='failed',final_evidence_json=?,updated_at=? WHERE id=? AND session_id=?",
-          JSON.stringify({error:'provider_auth_failed',reason,attempted_policy_ids:tried,...(completion?{completion}:{})}),now,intake.id,saga.session_id);
-        this.appendEvent(intake.id,`auth-fallback-exhausted:${saga.attempt_operation_id}:${saga.epoch}`,'hub2-dispatch','model_routes_auth_failed',
-          {session_id:saga.session_id,attempted_policy_ids:tried,reason},now);
+          JSON.stringify({error:placementFailure?'placement_fallback_failed':'provider_auth_failed',reason,
+            ...(placementFailure?{placement_reason:body.reason,failed_machine_id:saga.machine_id}:{}),
+            attempted_policy_ids:tried,...(completion?{completion}:{})}),now,intake.id,saga.session_id);
+        this.appendEvent(intake.id,`${placementFailure?'placement-fallback':'auth-fallback'}-exhausted:${saga.attempt_operation_id}:${saga.epoch}`,
+          'hub2-dispatch',placementFailure?'session_placement_fallback_failed':'model_routes_auth_failed',
+          {session_id:saga.session_id,attempted_policy_ids:tried,reason,
+            ...(placementFailure?{placement_reason:body.reason,failed_machine_id:saga.machine_id}:{} )},now);
         return true;
       });
       if(!applied)return error('stale_auth_fallback',409);
       await this.env.CONTROL.get(this.env.CONTROL.idFromName('global')).fetch('https://control.internal/_internal/session-cap/release',{
         method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({operation_id:saga.operation_id,session_id:saga.session_id}),
       }).catch(()=>undefined);
-      console.error('[hub2] MODEL_ROUTE_AUTH_FAILED',JSON.stringify({session_id:saga.session_id,attempted_policy_ids:tried,reason}));
+      console.error(placementFailure?'[hub2] SESSION_PLACEMENT_FALLBACK_FAILED':'[hub2] MODEL_ROUTE_AUTH_FAILED',
+        JSON.stringify({session_id:saga.session_id,attempted_policy_ids:tried,reason,
+          ...(placementFailure?{placement_reason:body.reason,failed_machine_id:saga.machine_id}:{} )}));
       await this.scheduleNext();
-      return json({fallback:false,reason:'all_model_routes_auth_failed'});
+      return json({fallback:false,reason:placementFailure?'no_alternate_eligible_host':'all_model_routes_auth_failed'});
     };
     if((this.parse(saga.launch_spec_json) as JsonRecord)?.managed_credential_label!==undefined)
       return await fail('managed_credential_auth_failed');
-    if(saga.attempt>=1)return await fail('model_attempts_exhausted');
-    if(!route||route.override_reason!==null)return await fail('explicit_route_auth_failed');
+    if(saga.attempt>=1)return await fail(placementFailure?'placement_attempts_exhausted':'model_attempts_exhausted');
+    if(!route||route.override_reason!==null)return await fail(placementFailure?'explicit_route_placement_failed':'explicit_route_auth_failed');
     let next:PickedRoute;
     let diagnostics:PickDiagnostics;
     try{
@@ -996,11 +1008,13 @@ export class ProjectDO {
       const picked=await pickCommittedModelRoute(this.env,{interactive:launch.interactive===true,
         ...(typeof launch.workspace==='string'?{workspace:launch.workspace}:{}),
         purpose: sessionPurpose(launch.purpose),
-        with_goal:launch.with_goal===true,required_capabilities:route.required_capabilities,exclude_policy_ids:tried},
+        with_goal:launch.with_goal===true,required_capabilities:route.required_capabilities,
+        ...(placementFailure?{exclude_machine_ids:[saga.machine_id]}:{exclude_policy_ids:tried})},
         {project_id:intake.project,operation_id:saga.operation_id,attempt:1,previous_picker:route.picker});
       next=picked.route;diagnostics=picked.diagnostics;
     }catch(caught){
-      if(caught instanceof HttpError&&caught.code==='model_policy_unavailable')return await fail('all_model_routes_auth_failed');
+      if(caught instanceof HttpError&&['model_policy_unavailable','no_connected_host'].includes(caught.code))
+        return await fail(placementFailure?'no_alternate_eligible_host':'all_model_routes_auth_failed');
       if(caught instanceof HttpError)return error(caught.code,caught.status);
       return error('model_picker_data_unavailable',503);
     }
@@ -1008,7 +1022,7 @@ export class ProjectDO {
     const launchSpec:JsonRecord={...launch,engine:next.engine,model:next.model,...(next.effort?{effort:next.effort}:{})};
     if(!next.effort)delete launchSpec.effort;
     const picker=buildStartPickerEvidence(next,diagnostics,1,route.picker);
-    const routeState={...next,attempted_policy_ids:[...tried,next.policy_id],picker,
+    const routeState={...next,attempted_policy_ids:[...new Set([...tried,next.policy_id])],picker,
       initial_picker:normalizeStartPickerEvidence(route.initial_picker)??normalizeStartPickerEvidence(route.picker),
       ...((route as JsonRecord).completion_contract===true?{completion_contract:true}:{}),
       ...((route as JsonRecord).completion_contract_omitted==='launch_budget'?{completion_contract_omitted:'launch_budget'}:{})};
@@ -1021,12 +1035,18 @@ export class ProjectDO {
         saga.operation_id,saga.state,saga.attempt_operation_id,saga.epoch);
       this.db.run('UPDATE intakes SET assigned_machine_id=?,updated_at=? WHERE id=? AND session_id=? AND assigned_machine_id=?',
         next.machine_id,now,intake.id,saga.session_id,saga.machine_id);
-      this.appendEvent(intake.id,`auth-fallback:${saga.attempt_operation_id}:${saga.epoch}`,'hub2-dispatch','model_route_auth_fallback',
-        {session_id:saga.session_id,failed_policy_id:route.policy_id,next_policy_id:next.policy_id,engine:next.engine,model:next.model},now);
+      this.appendEvent(intake.id,`${placementFailure?'placement-fallback':'auth-fallback'}:${saga.attempt_operation_id}:${saga.epoch}`,
+        'hub2-dispatch',placementFailure?'session_placement_fallback':'model_route_auth_fallback',
+        placementFailure
+          ?{session_id:saga.session_id,failed_machine_id:saga.machine_id,next_machine_id:next.machine_id,
+            reason:body.reason,workspace:(this.parse(saga.launch_spec_json) as JsonRecord).workspace,engine:next.engine,model:next.model}
+          :{session_id:saga.session_id,failed_policy_id:route.policy_id,next_policy_id:next.policy_id,engine:next.engine,model:next.model},now);
       return true;
     });
     if(!applied)return error('stale_auth_fallback',409);
-    return {operation_id:saga.operation_id,session_id:saga.session_id,engine:next.engine,model:next.model};
+    if(placementFailure)console.warn('[hub2] SESSION_PLACEMENT_FALLBACK',JSON.stringify({session_id:saga.session_id,
+      failed_machine_id:saga.machine_id,next_machine_id:next.machine_id,reason:body.reason}));
+    return {operation_id:saga.operation_id,session_id:saga.session_id,engine:next.engine,model:next.model,machine_id:next.machine_id};
   }
 
   private fallbackCurrent(saga:SagaRow,intake:IntakeRow):boolean{

@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from agent_hub_host.agent import Bridge, Journal, offer_ack_frame, OfferAcknowledgement
+from agent_hub_host.advertisement import Advertisement
 from agent_hub_host.client import ApiError, Client, save_config
 from agent_hub_host.cli import main as cli_main
 
@@ -804,6 +805,23 @@ class HostTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "workspace_label_unavailable"):
             self.bridge.validate_launch(offer)
         self.assertFalse(any(call[1] == "start" for call, _ in self.native.calls))
+
+    def test_ambiguous_workspace_label_is_reported_to_hub_before_any_native_start(self):
+        roots = [self.root / 'first-root', self.root / 'second-root']
+        for root in roots:
+            (root / 'dataops').mkdir(parents=True)
+        self.bridge.roots = roots
+        self.bridge.advertisement = Advertisement(roots)
+        offer = self.offer()
+        offer['launch']['workspace'] = 'dataops'
+        frames = []
+        socket = type('Socket', (), {'send': lambda _self, frame: frames.append(json.loads(frame))})()
+        with self.assertLogs('agent_hub_host.agent', level='ERROR'):
+            self.bridge.dispatch({'type': 'session.offer', 'offer': offer}, socket, lambda *args: self.fail('ambiguous path must not be acknowledged'))
+        self.assertEqual(frames, [{'type': 'host.error', 'reason': 'workspace_label_ambiguous', 'stage': 'host_launch',
+            'detail': 'workspace_label_ambiguous', 'session_id': offer['session_id'], 'operation_id': offer['operation_id'],
+            'message_id': None}])
+        self.assertFalse(any(call[1] == 'start' for call, _ in self.native.calls))
 
     def test_dispatch_attempt_operation_id_preserved_in_receipt(self):
         operation = "d04dedbf-951e-4eaf-a41f-03eeb8514135:0"
