@@ -97,10 +97,12 @@ export class MailboxDO{
  private list(r:Request,owner:string):Response{
   const q=new URL(r.url).searchParams,limit=Number(q.get('limit')||25),folder=q.get('folder')||'inbox',state=q.get('state'),thread=q.get('thread');
   if(!Number.isInteger(limit)||limit<1||limit>50||!['inbox','sent'].includes(folder)||state&&!['received','claimed','read','acked','delivered','accepted','completed'].includes(state)||thread&&!boundedString(thread,120))return error('invalid_list_query',400);
-  let cursor:[number,string]=[0,''];if(q.has('cursor')){try{cursor=JSON.parse(q.get('cursor')!);}catch{return error('invalid_cursor',400);}}
+  // order=desc (t3280u): newest first, so a client reads its latest mail in one bounded page.
+  const order=q.get('order')||'asc';if(!['asc','desc'].includes(order))return error('invalid_list_query',400);const desc=order==='desc';
+  let cursor:[number,string]=desc?[Number.MAX_SAFE_INTEGER,'\uffff']:[0,''];if(q.has('cursor')){try{cursor=JSON.parse(q.get('cursor')!);}catch{return error('invalid_cursor',400);}}
   if(!Array.isArray(cursor)||cursor.length!==2||!Number.isSafeInteger(cursor[0])||!boundedString(cursor[1]||'empty',120))return error('invalid_cursor',400);
   const extra=folder==='sent'?'':state?' AND state=?':thread?' AND thread_id=?':'',args:unknown[]=folder==='sent'?[]:state?[state]:thread?[thread]:[];
-  const rows=this.db.all<Mail>('SELECT * FROM messages WHERE '+(folder==='sent'?'sender=?':'recipient=? AND visible=1')+extra+' AND (created_at,id)>(?,?) ORDER BY created_at,id LIMIT ?',owner,...args,...cursor,limit+1),scanned=rows.slice(0,limit);
+  const rows=this.db.all<Mail>('SELECT * FROM messages WHERE '+(folder==='sent'?'sender=?':'recipient=? AND visible=1')+extra+(desc?' AND (created_at,id)<(?,?) ORDER BY created_at DESC,id DESC LIMIT ?':' AND (created_at,id)>(?,?) ORDER BY created_at,id LIMIT ?'),owner,...args,...cursor,limit+1),scanned=rows.slice(0,limit);
   const filtered=folder==='sent'&&!!(state||thread)||!!state&&!!thread,shown=scanned.filter(m=>(!state||m.state===state)&&(!thread||m.thread_id===thread)),last=scanned[scanned.length-1];
   return json({items:shown.map(m=>this.view(m)),filtered_page:filtered,next:rows.length>limit&&last?JSON.stringify([last.created_at,last.id]):null});
  }

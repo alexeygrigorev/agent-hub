@@ -762,3 +762,18 @@ test('human:me for a session on a session-opened intake follows one hop and neve
  // The replay digest covers the resolved human: same key + body replays, never re-targets.
  const again=await data(await send('intake-child','hop'));assert.equal(again.replayed,true);assert.equal(again.message.recipient,'human:bob');
 });
+test('human:me refuses a session worker whose intake route is missing and lists newest-first on order=desc (t3280u review)',async()=>{
+ const m=mailboxes(),db=m.controlState.database;
+ db.prepare('INSERT INTO actor_directory(id,kind,enabled) VALUES(?,?,1)').run('human:alexey','human');clearFixtureCache(m.control);
+ const worker={id:'session:44444444-4444-4444-8444-444444444444',kind:'agent',resource_id:'intake-unregistered',scopes:['message:send']};
+ const refused=await m.get(worker.id).fetch(request('/api/messages','POST',{recipient:'human:me',body:'x',key:'k'},worker,worker.id));
+ assert.equal(refused.status,404);assert.equal((await data(refused)).error,'recipient_unknown');
+ const human={id:'human:alexey',kind:'operator',scopes:['operator:admin']};
+ for(const key of ['one','two','three'])assert.equal((await m.get(human.id).fetch(request('/api/messages','POST',{recipient:'human:me',body:key,key},human,human.id))).status,201);
+ m.stores.get('global')!.database.exec("UPDATE messages SET created_at=CASE body WHEN 'one' THEN 1 WHEN 'two' THEN 2 ELSE 3 END");
+ const first=await data(await m.fetch(human.id,'/api/messages?order=desc&limit=2','GET',undefined,human));
+ assert.deepEqual(first.items.map((v:any)=>v.body),['three','two']);
+ const rest=await data(await m.fetch(human.id,'/api/messages?order=desc&limit=2&cursor='+encodeURIComponent(first.next),'GET',undefined,human));
+ assert.deepEqual(rest.items.map((v:any)=>v.body),['one']);assert.equal(rest.next,null);
+ assert.equal((await m.fetch(human.id,'/api/messages?order=sideways','GET',undefined,human)).status,400);
+});

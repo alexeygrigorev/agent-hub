@@ -230,10 +230,11 @@ def post_message(args, recipient: str, actor: str | None, reply_to: dict | None 
 
 def whoami_actor() -> str | None:
     """The requesting human's actor from Hub2 /api/auth/me (humans only)."""
+    from .bus import HttpRequestError
     try:
         me = _request('GET', '/api/auth/me')
-    except ValueError:
-        return None
+    except HttpRequestError:
+        return None  # not a human credential; transport errors propagate (exit 4)
     actor = me.get('actor') if isinstance(me, dict) else None
     return actor if isinstance(actor, str) else None
 
@@ -241,7 +242,10 @@ def whoami_actor() -> str | None:
 def reply_message(args, message_id: str, actor: str | None) -> dict:
     """Reply to the other end of a message: its sender, unless this identity sent it."""
     original = get_message(args, message_id)
-    me = getattr(args, 'as_actor', None) or actor or whoami_actor()
+    as_actor = getattr(args, 'as_actor', None)
+    if as_actor and ':' not in as_actor:
+        as_actor = 'agent:' + as_actor  # the server's delegation adds the same prefix
+    me = as_actor or actor or whoami_actor()
     if not me:
         raise MsgError('Cannot tell which end of this message you are; pass --to')
     to = original.get('recipient') if original.get('sender') == me else original.get('sender')
@@ -362,7 +366,7 @@ def execute(args):
     return _request('GET', MESSAGES + '/' + quote(args.id, safe='') + '/status' + _view_query(args))
 
 
-INBOX_PAGE_CAP = 40  # 40 x 50 = 2000 messages walked at most per call
+INBOX_DESC_PAGES = 4  # --unread looks back at most 4 x 50 newest messages
 
 
 def _page(params, cursor):
@@ -373,12 +377,17 @@ def _page(params, cursor):
     return page.get('items') or [], page.get('next')
 
 
+def _row_cursor(row):
+    return json.dumps([row.get('created_at'), row.get('id')])
+
+
 def inbox(args, actor: str | None):
     """Shared inbox path for `hub msg inbox` and `hub inbox`: the Hub2 mailbox
-    the web Inbox shows. Hub2 pages oldest-first, so the walk follows `next`
-    (bounded) and returns the newest --limit messages. --unread keeps messages
-    without a read receipt; --wait polls from the end cursor (max 60 s) for new
-    messages when none match; --mark-read records epoch-bound read receipts."""
+    the web Inbox shows. Reads newest-first (order=desc) in one bounded page
+    (at most INBOX_DESC_PAGES for --unread) and prints the newest --limit
+    messages oldest-to-newest; --cursor pages forward from a printed `next`.
+    --wait polls forward from the newest message (max 60 s) when nothing
+    matched; --mark-read records epoch-bound read receipts."""
     who = getattr(args, 'actor', None) or getattr(args, 'as_actor', None) or actor
     wait = max(0, min(getattr(args, 'wait', 0) or 0, 60))
     limit = max(1, min(int(getattr(args, 'limit', None) or 25), 50))
@@ -394,23 +403,25 @@ def inbox(args, actor: str | None):
         params.append(view)
     unread = getattr(args, 'unread', False)
     keep = (lambda r: not r.get('read_at')) if unread else (lambda r: True)
-    rows, cursor = [], getattr(args, 'cursor', None)
-    for _ in range(INBOX_PAGE_CAP):
-        items, nxt = _page(params, cursor)
-        rows.extend(r for r in items if keep(r))
-        if items:
-            cursor = json.dumps([items[-1].get('created_at'), items[-1].get('id')])
-        if not nxt:
-            break
-        cursor = nxt
+    if getattr(args, 'cursor', None):
+        items, _nxt = _page(params, args.cursor)
+        rows = [r for r in items if keep(r)][:limit]
+        cursor = _row_cursor(items[-1]) if items else args.cursor
     else:
-        raise MsgError('Mailbox has more than %d messages; pass --cursor to page' % (INBOX_PAGE_CAP * 50))
+        newest, back = [], None
+        for _ in range(INBOX_DESC_PAGES if unread else 1):
+            items, back = _page(params + ['order=desc'], back)
+            newest.extend(items)
+            if not back or sum(1 for r in newest if keep(r)) >= limit:
+                break
+        rows = [r for r in newest if keep(r)][:limit][::-1]
+        cursor = _row_cursor(newest[0]) if newest else None
     deadline = time.monotonic() + wait
     while not rows and time.monotonic() < deadline:
         time.sleep(min(3, max(0.1, deadline - time.monotonic())))
         items, _nxt = _page(params, cursor)
         if items:
-            cursor = json.dumps([items[-1].get('created_at'), items[-1].get('id')])
+            cursor = _row_cursor(items[-1])
         rows.extend(r for r in items if keep(r))
     rows = rows[-limit:]
     result = {'actor': who, 'messages': rows, 'next': cursor}
