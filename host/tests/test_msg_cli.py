@@ -68,10 +68,12 @@ class FakeMailbox:
             # Oldest-first pages with a (created_at, id) cursor, like mailbox-do.ts list().
             query = dict(part.split("=", 1) for part in path.split("?", 1)[1].split("&")) if "?" in path else {}
             limit = int(query.get("limit", 25))
-            rows = sorted(self.messages.values(), key=lambda m: (m.get("created_at", 0), m["id"]))
+            desc = query.get("order") == "desc"
+            rows = sorted(self.messages.values(), key=lambda m: (m.get("created_at", 0), m["id"]), reverse=desc)
             if "cursor" in query:
-                after = json.loads(unquote(query["cursor"]))
-                rows = [m for m in rows if (m.get("created_at", 0), m["id"]) > (after[0], after[1])]
+                at = json.loads(unquote(query["cursor"]))
+                rows = [m for m in rows if ((m.get("created_at", 0), m["id"]) < (at[0], at[1])) == desc
+                        and (m.get("created_at", 0), m["id"]) != (at[0], at[1])]
             page = rows[:limit]
             more = len(rows) > limit
             return {"items": page, "filtered_page": False, "next": json.dumps([page[-1].get("created_at", 0), page[-1]["id"]]) if more else None}
@@ -335,6 +337,21 @@ class MsgCliM5Test(MsgCliTest):
             self.assertEqual([m["id"] for m in result["messages"]], ["o117", "o118", "o119"])
             latest = self.run_cli(["msg", "inbox", "--limit", "2"])
             self.assertEqual([m["id"] for m in latest["messages"]], ["o118", "o119"])
+
+    def test_large_mailbox_reads_one_newest_page_and_never_fails(self):
+        # Review: an only-growing web Inbox must not cost a full walk per call or fail past a cap.
+        for i in range(3000):
+            self.hub.messages["b%04d" % i] = {"id": "b%04d" % i, "created_at": i, "sender": "session:s", "recipient": HUMAN,
+                                              "epoch": 1, "read_at": 1}
+        with mock.patch("agent_hub_host.bus._do_request", side_effect=self.hub):
+            latest = self.run_cli(["msg", "inbox", "--limit", "2"])
+            self.assertEqual([m["id"] for m in latest["messages"]], ["b2998", "b2999"])
+            self.assertEqual(len(self.hub.calls), 1)
+            self.assertIn("order=desc", self.hub.calls[0][1])
+            self.hub.calls.clear()
+            unread = self.run_cli(["msg", "inbox", "--unread"])
+            self.assertEqual(unread["messages"], [])
+            self.assertEqual(len(self.hub.calls), msg_cli.INBOX_DESC_PAGES)
 
     def test_inbox_wait_only_returns_mail_newer_than_the_start(self):
         self.hub.messages["old"] = {"id": "old", "created_at": 1, "sender": "session:s", "recipient": HUMAN, "epoch": 1, "read_at": 1}

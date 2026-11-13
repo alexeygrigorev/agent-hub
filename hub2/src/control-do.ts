@@ -1125,7 +1125,9 @@ export class ControlDO {
     if(typeof c.id==='string'&&c.id.startsWith('human:'))return pick(humans([c.id]))||error('recipient_unknown',404);
     if(c.kind==='agent'&&typeof c.id==='string'&&c.id.startsWith('session:')&&boundedString(c.resource_id,180)){
       let direct:unknown[]|undefined;try{direct=participants('intake',c.resource_id);}catch{return error('route_acl_corrupt',503);}
-      if(direct){
+      // A session worker only ever reaches a human through its own intake; no global fallback.
+      if(!direct)return error('recipient_unknown',404);
+      {
         const found=pick(humans(direct));if(found)return found;
         // An intake opened by another session (e.g. the orchestrator) belongs to that session's human.
         const owners:unknown[]=[];
