@@ -18,10 +18,12 @@ verbatim. Integration differences, all documented in docs/HUB-ACCEPTANCE-10.md:
 A match is a candidate renderer/artifact association only. Acquisition,
 freshness, custody and identity are separate driver obligations.
 """
+import ast
 import datetime
 import hashlib
 import json
 import re
+import shlex
 import unicodedata
 import uuid
 import xml.etree.ElementTree as ET
@@ -169,10 +171,57 @@ def timestamp(text, prefix):
         raise Refused('candidate timestamp refused') from error
 
 
-_UNRELATED_TOKENS = ('h7_', 'AC10', 'python3 .local', '.py', '…', '...', 'ctrl+o')
+_UNRELATED_TOKENS = ('AC10', '…', '...', 'ctrl+o')
 
 
-def _unrelated_header(row):
+def _probe_preparation(command, script_relpath):
+    """Recognize only visible literal copy preparation, never arbitrary Python.
+
+    This classifies context; it cannot create work proof or execute anything.
+    Other h7 references stay ambiguous. Shell expansion/operators cannot hide
+    an invocation inside an otherwise innocent-looking copy command.
+    """
+    if '$' in command or '`' in command:
+        return False
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=';&|<>()')
+        lexer.whitespace_split = True
+        lexer.commenters = ''
+        argv = list(lexer)
+        if len(argv) == 3 and argv[0] == 'cp':
+            return (argv[2] == script_relpath and bool(argv[1])
+                    and not any(c in argv[1] for c in ';&|<>()'))
+        if not argv or argv[0] != 'python3':
+            return False
+        if len(argv) == 3 and argv[1] == '-c':
+            code = argv[2]
+        elif len(argv) == 2 and argv[1].startswith('-c'):
+            code = argv[1][2:]
+        else:
+            return False
+        body = ast.parse(code, mode='exec').body
+        if len(body) != 2 or not isinstance(body[1], ast.Expr):
+            return False
+        imported, expression = body[0], body[1].value
+        if not isinstance(expression, ast.Call) or expression.keywords or len(expression.args) != 2:
+            return False
+        if not all(isinstance(arg, ast.Constant) and type(arg.value) is str and arg.value
+                   for arg in expression.args) or expression.args[1].value != script_relpath:
+            return False
+        if isinstance(imported, ast.Import):
+            return (len(imported.names) == 1 and imported.names[0].name == 'shutil'
+                    and imported.names[0].asname is None
+                    and isinstance(expression.func, ast.Attribute) and expression.func.attr == 'copy'
+                    and isinstance(expression.func.value, ast.Name) and expression.func.value.id == 'shutil')
+        return (isinstance(imported, ast.ImportFrom) and imported.module == 'shutil' and imported.level == 0
+                and len(imported.names) == 1 and imported.names[0].name in ('copy', '*')
+                and imported.names[0].asname is None
+                and isinstance(expression.func, ast.Name) and expression.func.id == 'copy')
+    except (ValueError, SyntaxError):
+        return False
+
+
+def _unrelated_header(row, script_relpath):
     """True only for a complete native tool header whose command cannot be the probe."""
     if len(row) != 4:
         return False
@@ -184,7 +233,30 @@ def _unrelated_header(row):
     text = args[3]
     if not (text.startswith('(') and text.endswith(')') and 2 < len(text) <= 80):
         return False
-    return not any(token in text for token in _UNRELATED_TOKENS)
+    if any(token in text for token in _UNRELATED_TOKENS):
+        return False
+    command = text[1:-1]
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=';&|<>()')
+        lexer.whitespace_split = True
+        lexer.commenters = ''
+        argv = list(lexer)
+    except ValueError:
+        return False
+    # Shell quoting/backslash escapes must not conceal a second h7 invocation.
+    probe_reference = 'h7_' in command.lower() or any('h7_' in arg.lower() for arg in argv)
+    if not probe_reference and '.py' not in text:
+        return True
+    if (not probe_reference and tool[3] == 'Bash' and len(argv) == 2
+            and argv[0] == 'python3' and argv[1].endswith('.py')
+            and not argv[1].startswith('-')
+            and not any(c in argv[1] for c in '*?[]{}')
+            and not any(c in command for c in '$`')):
+        return True  # a complete literal invocation of another Python script
+    # Only a positively completed Bash copy is a known preparation reference.
+    # Unknown Python/shell expressions mentioning scripts remain ambiguous.
+    return (marker == (14, '#98c379', None, '●') and tool[3] == 'Bash'
+            and _probe_preparation(command, script_relpath))
 
 
 def recognize(svg, *, work, script_relpath, script_sha256, pinned_script,
@@ -208,13 +280,14 @@ def recognize(svg, *, work, script_relpath, script_sha256, pinned_script,
     rows = rows_from_svg(svg, title)
     # Exact target selection. Every native-looking tool header is a target
     # candidate unless it is a complete, well-formed header for a provably
-    # unrelated command (e.g. `Bash(whoami)`): any probe path, evidence token,
-    # truncation or malformed/bare marker fails closed as a candidate. Exactly
+    # unrelated command or literal helper copy preparation. An actual probe
+    # invocation, unknown probe reference, evidence token, truncation or
+    # malformed/bare marker fails closed as a candidate. Exactly
     # one candidate may exist, so a duplicate, same-command running/failed,
     # another sample's probe or a truncated row is ambiguous; no "best block".
     native = []
     for y, row in rows.items():
-        if row and row[0][0] == 14 and row[0][3] in ('●', '○') and not _unrelated_header(row):
+        if row and row[0][0] == 14 and row[0][3] in ('●', '○') and not _unrelated_header(row, script_relpath):
             native.append((y, row))
     need(len(native) == 1)
     y, header = native[0]

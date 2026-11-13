@@ -123,6 +123,65 @@ class FrameRecognizerTests(unittest.TestCase):
                 recognize(EXPANDED, **change)
 
 
+    def test_completed_copy_preparation_and_unrelated_python_are_context_not_probe(self):
+        commands = [
+            'cp /r/helper.py ' + REL,
+            'python3 -c"from shutil import*;copy(\'/h\',\'' + REL + '\')"',
+            'python3 -c"import shutil;shutil.copy(\'h\',\'' + REL + '\')"',
+            'python3 /r/unrelated.py',
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertLessEqual(68 + 9 * (len(command) + 2), 748)
+                svg = EXPANDED.decode().replace(THOUGHT, header_row('(' + command + ')')).encode()
+                self.assertEqual(recognize(svg)['proof_digest'], DIGEST)
+
+    def test_probe_invocation_or_unknown_preparation_is_never_ignored(self):
+        commands = [
+            CMD,
+            CMD.replace('h7_', 'h\\7_'),
+            'python3 -c\"open(\'x.py\')\"',
+            'python3 .local/h7_000000000000_02.py',
+            'echo ' + REL,
+            'python3 -c"exec(\'' + REL + '\')"',
+            'cp /h .local/h7_000000000000_02.py',
+            'cp /h ' + REL + '…',
+        ]
+        for command in commands:
+            with self.subTest(command=command), self.assertRaises(frame.Refused):
+                recognize(EXPANDED.decode().replace(THOUGHT, header_row('(' + command + ')')).encode())
+        command = 'cp /h ' + REL
+        for row in [header_row('(' + command + ')', marker='○'),
+                    header_row('(' + command + ')').replace('#98c379', '#e06c75')]:
+            with self.subTest(row=row), self.assertRaises(frame.Refused):
+                recognize(EXPANDED.decode().replace(THOUGHT, row).encode())
+        for command in [
+            'cp "$(python3 ' + REL + ')" ' + REL,
+            'cp /h ' + REL + '; ' + CMD,
+            'python3 -c"from shutil import*;copy(\'/h\',\'' + REL + '\');exec(\'x\')"',
+            'python3 -c"from os import*;copy(\'/h\',\'' + REL + '\')"',
+            'python3 -c"from shutil import*;copy(source,\'' + REL + '\')"',
+        ]:
+            with self.subTest(preparation=command):
+                self.assertFalse(frame._probe_preparation(command, REL))
+
+
+    def test_inline_python_and_shell_patterns_are_not_literal_script_context(self):
+        escaped = REL.replace('h7_', 'h7\\x5f')
+        other = escaped.replace('_01.py', '_02.py')
+        commands = [
+            'python3 -c"exec(open(\'' + escaped + '\').read())#x.py"',
+            'python3 -c"exec(open(\'' + other + '\').read())#x.py"',
+            'python3 .local/*.py',
+            'python3 .local/?.py',
+            'python3 .local/[a-z]*.py',
+            'python3 .local/{h,x}7_000000000000_01.py',
+        ]
+        for command in commands:
+            with self.subTest(command=command), self.assertRaises(frame.Refused):
+                recognize(EXPANDED.decode().replace(THOUGHT, header_row('(' + command + ')')).encode())
+
+
 class CollapsedEligibilityTests(unittest.TestCase):
     def test_observed_idle_aggregate_for_this_sample_only(self):
         self.assertTrue(acquire.observed_collapsed(COLLAPSED, CMD))
