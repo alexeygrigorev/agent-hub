@@ -39,7 +39,7 @@ async function snapshots(){const out={};for(const [kind,id] of [['control','glob
 function delta(before,after){return Object.fromEntries(Object.keys(before).map(k=>[k,{reads:after[k].counts.rows_read-before[k].counts.rows_read,writes:after[k].counts.rows_written-before[k].counts.rows_written,alarm_calls:after[k].counts.alarm_operations-before[k].counts.alarm_operations}]));}
 async function test(name,fn){try{await fn();results.push({name,passed:true});}catch(e){results.push({name,passed:false,error:String(e.message),stack:String(e.stack).split('\n').slice(0,6).join('\n')});}}
 async function intake(key,title='Synthetic core lifecycle'){
- const body={title,text:'Explicitly synthetic workerd integration fixture; no native model is launched.',acceptance_criteria:['Synthetic fixture output is received and remains awaiting independent review.'],key};
+ const body={title,text:'Explicitly synthetic workerd integration fixture; no native model is launched.',acceptance_criteria:['Synthetic fixture output is received and remains awaiting independent review.'],code_task:false,key};
  return {body,response:await api('/api/intakes?project='+encodeURIComponent(project),'POST',body)};
 }
 async function start(id,key,targetMachine=machine,engine='opencode'){return api(`/api/intakes/${id}/start?project=${encodeURIComponent(project)}`,'POST',{machine_id:targetMachine,workspace,engine,override_reason:'Deterministic synthetic integration fixture requests explicit engine and host',interactive:false,timeout_seconds:60,key,...(engine==='shell'?{reason:'Explicit synthetic transport-security test, no process launch'}:{})});}
@@ -71,7 +71,10 @@ try{
   if(process.env.HUB2_CORE_PROVISION)expect(await api('/api/account/discovery','POST',{}),200,'actual provider collector over synthetic HTTP');
   else expect(await api('/api/account/quota','PUT',{remaining:80,captured_at:Date.now(),valid_until:Date.now()+300000,source:'synthetic-native-integration-fixture'}),200,'synthetic quota');
   expect(await api('/api/account/hosts','PUT',{hosts:[machine]}),200,'approve synthetic account host');
-  expect(await api('/api/model-policy','PUT',{expected_version:0,candidates:[{id:'synthetic-model',engine:'opencode',model:'synthetic-test-model',account_id:account,weight:1,capabilities:[],enabled:true}]}),200,'configure actual synthetic model policy');
+  expect(await api('/api/model-policy','PUT',{expected_version:0,candidates:[
+   {id:'synthetic-model',engine:'opencode',model:'synthetic-test-model',account_id:account,weight:1,capabilities:[],enabled:true},
+   {id:'synthetic-review-model',engine:'opencode',model:'synthetic-review-model',account_id:account,weight:1,capabilities:[],enabled:true},
+  ]}),200,'configure actual synthetic model policy with an independent verifier route');
   expect(await api('/api/account','PATCH',{provider:'forbidden',enabled:true},hostToken,{'x-hub2-actor':JSON.stringify({id:'forged',kind:'operator',scopes:['*']})}),403,'machine cannot edit account');
  });
  await test('intake idempotency and acceptance criteria guard',async()=>{
@@ -137,14 +140,41 @@ try{
   assert.equal('occupied' in expect(await api('/api/account/quota'),200,'account view has no per-session slots').account,false);
   const offers=expect(await api('/api/offers','GET',undefined,hostToken),200,'no finished offer');
   assert.equal(offers.offers.some(offer=>offer.session_id===started.id),false,'finished session must not remain offered');
-  liveSocket.socket.close();liveSocket=null;
-  // Hub itself delivers the terminal outcome to the intake owner; then the alarm settles.
+  // A completion claim starts a distinct verifier session; no terminal outcome is delivered yet.
   expect(await fixture('project',project,'alarm',{}),200,'project completion alarm');
+  const verificationStart=expect(await api(`/api/intakes/${created.id}/history`),200,'verifier start history').events
+   .find(e=>e.kind==='task_verification_started');
+  assert(verificationStart,'completion alarm starts independent verification');
+  assert.equal(verificationStart.body.original_session_id,started.id);
+  const verifierId=verificationStart.body.session_id;
+  const verifierOffer=(await liveSocket.wait(v=>v.type==='session.offer'&&v.offer.session_id===verifierId)).offer;
+  assert.notEqual(verifierOffer.launch.model,offer.launch.model,'verifier must use an independent model');
+  liveSocket.socket.send(JSON.stringify({type:'offer_ack',session_id:verifierId,epoch:verifierOffer.epoch}));
+  await liveSocket.wait(v=>v.type==='ack'&&v.session_id===verifierId);
+  const verifierAdmission=expect(await api(`/api/sessions/${verifierId}/admission`,'POST',
+   {epoch:verifierOffer.epoch,operation_id:verifierOffer.operation_id},hostToken),200,'verifier admission');
+  const verifierNative='33333333-4444-4555-8666-777777777777';
+  expect(await api(`/api/sessions/${verifierId}/started`,'POST',
+   {operation_id:verifierOffer.operation_id,epoch:verifierOffer.epoch,native_id:verifierNative},hostToken),201,'verifier started');
+  const verdict={kind:'acceptance_verification',session_id:verifierId,verdict:'pass',summary:'Synthetic independent verification passed',
+   acceptance:verifierOffer.acceptance_criteria.map(()=>({status:'met',proof:'synthetic verifier inspected the fixture evidence'}))};
+  expect(await api(`/api/intakes/${created.id}/events`,'POST',{key:'verify-'+verifierId,event:verdict}),201,'independent verifier verdict');
+  const verifierEvidence={source:'aplexer_retirement',fixture:true,artifact:'synthetic-verifier.txt',independent_acceptance:true,
+   native_identity:{id:verifierNative,tag:'task-hub2-'+verifierId,workspace:verifierOffer.launch.workspace},containment_empty:true,
+   native_deadline:{deadline_ms:verifierAdmission.runtime_deadline,exceeded:false},native_exit:{code:0,exited_at_ms:Date.now()}};
+  expect(await api(`/api/sessions/${verifierId}/finish`,'POST',
+   {operation_id:verifierOffer.operation_id,epoch:verifierOffer.epoch,native_id:verifierNative,exit_code:0,
+    evidence:verifierEvidence,native_exit_confirmed:true},hostToken),201,'verifier finish');
+  // Hub delivers only after the verifier passes; the following alarm settles that action.
+  expect(await fixture('project',project,'alarm',{}),200,'project verification completion alarm');
   // Named-agent forwarding leaves a durable Control wake even after mail delivery.
   // Settle that known work before measuring idle; an unsettled alarm must fail below.
   expect(await fixture('control','global','alarm',{}),200,'control mailbox wake alarm');
+  liveSocket.socket.close();liveSocket=null;
   const completionHistory=expect(await api(`/api/intakes/${created.id}/history`),200,'completion history').events;
   assert(completionHistory.some(e=>e.kind==='task_completion_claimed'),'completion claim recorded');
+  assert(completionHistory.some(e=>e.kind==='task_verification_started'),'independent verification starts after DONE');
+  assert(completionHistory.some(e=>e.kind==='task_acceptance_verified'),'independent verification pass is recorded');
   assert.equal(completionHistory.filter(e=>e.kind==='task_outcome_delivered').length,1,'terminal outcome delivered once: '+JSON.stringify(completionHistory.filter(e=>e.kind.startsWith('task_')).map(e=>[e.kind,e.body])));
   const after=await snapshots();measurements.complete_flow=delta(before,after);measurements.quiescent=after;const total=Object.values(measurements.complete_flow).reduce((n,v)=>n+v.reads+v.writes,0);assert(total<2000,'warm core flow exceeds2000row guard');
   measurements.machine_deadlines=expect(await fixture('machine',machine,'machine-deadlines'),200,'exact machine pending work diagnostics');
