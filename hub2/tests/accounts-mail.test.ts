@@ -743,3 +743,22 @@ test('human:me resolves to the caller\'s own human for humans, intake owners for
  db.prepare('INSERT INTO actor_directory(id,kind,enabled) VALUES(?,?,1)').run('human:other','human');clearFixtureCache(m.control);
  const ambiguous=await send('agent:b',{id:'agent:b',kind:'agent',scopes:[]},'ambiguous');assert.equal(ambiguous.status,409);assert.equal((await data(ambiguous)).error,'ambiguous_recipient');
 });
+test('human:me for a session on a session-opened intake follows one hop and never falls back to another human (t3280u review)',async()=>{
+ const m=mailboxes(),db=m.controlState.database,orchestrator='22222222-2222-4222-8222-222222222222';
+ db.prepare('INSERT INTO actor_directory(id,kind,enabled) VALUES(?,?,1)').run('human:alexey','human');
+ const route=db.prepare('INSERT INTO object_routes(kind,id,owner,resource_id,bound_intake_id,epoch,digest,participants_json) VALUES(?,?,?,?,?,?,?,?)');
+ route.run('intake','intake-orch','proj','proj',null,1,'f',JSON.stringify(['human:bob']));
+ route.run('session',orchestrator,'h1','proj','intake-orch',1,'f','[]');
+ route.run('intake','intake-child','proj','proj',null,1,'f',JSON.stringify(['session:'+orchestrator]));
+ route.run('intake','intake-orphan','proj','proj',null,1,'f',JSON.stringify(['operator']));
+ route.run('intake','intake-corrupt','proj','proj',null,1,'f','{not json');
+ clearFixtureCache(m.control);
+ const worker=(intake:string)=>({id:'session:33333333-3333-4333-8333-333333333333',kind:'agent',resource_id:intake,scopes:['message:send']});
+ const send=async(intake:string,key:string)=>{const a=worker(intake);return m.get(a.id).fetch(request('/api/messages','POST',{recipient:'human:me',body:'x',key},a,a.id));};
+ // The orchestrator's human (bob), not the only browser-registered human (alexey).
+ assert.equal((await data(await send('intake-child','hop'))).message.recipient,'human:bob');
+ const orphan=await send('intake-orphan','orphan');assert.equal(orphan.status,404);assert.equal((await data(orphan)).error,'recipient_unknown');
+ const corrupt=await send('intake-corrupt','corrupt');assert.equal(corrupt.status,503);assert.equal((await data(corrupt)).error,'route_acl_corrupt');
+ // The replay digest covers the resolved human: same key + body replays, never re-targets.
+ const again=await data(await send('intake-child','hop'));assert.equal(again.replayed,true);assert.equal(again.message.recipient,'human:bob');
+});

@@ -1110,17 +1110,31 @@ export class ControlDO {
   }
   /** `human:me` (t3280u): the human the caller acts for. A human credential is
    * itself; a session worker resolves to the human participant of its bound
-   * intake; a delegated named agent to the human owning its credential family;
-   * otherwise the hub's only enabled human. Never guesses between two humans. */
+   * intake (one hop through a session-owned intake to that session's intake);
+   * a delegated named agent to the human owning its credential family. Only a
+   * caller with no tenancy context falls back to the hub's only enabled human.
+   * Never guesses between two humans. */
   private humanMe(caller:unknown):Response{
     const c=(caller&&typeof caller==='object'?caller:{}) as {id?:unknown;kind?:unknown;resource_id?:unknown;family_id?:unknown};
-    const humans=(ids:string[])=>[...new Set(ids.filter(v=>typeof v==='string'&&/^human:[^\s]{1,174}$/.test(v)))];
+    const humans=(ids:unknown[])=>[...new Set(ids.filter((v):v is string=>typeof v==='string'&&/^human:[^\s]{1,174}$/.test(v)))];
     const pick=(ids:string[])=>ids.length===1?json({mailbox:ids[0],forward_session:null}):ids.length>1?error('ambiguous_recipient',409):undefined;
+    const participants=(kind:string,id:string):unknown[]|undefined=>{
+      const route=this.db.one<{participants_json:string}>('SELECT participants_json FROM object_routes WHERE kind=? AND id=?',kind,id);if(!route)return undefined;
+      const parsed=JSON.parse(route.participants_json) as unknown;if(!Array.isArray(parsed)||parsed.length>32)throw new HttpError('route_acl_corrupt',503);return parsed;
+    };
     if(typeof c.id==='string'&&c.id.startsWith('human:'))return pick(humans([c.id]))||error('recipient_unknown',404);
     if(c.kind==='agent'&&typeof c.id==='string'&&c.id.startsWith('session:')&&boundedString(c.resource_id,180)){
-      const route=this.db.one<{participants_json:string}>('SELECT participants_json FROM object_routes WHERE kind=? AND id=?','intake',c.resource_id);
-      let participants:unknown=[];try{participants=route?JSON.parse(route.participants_json):[];}catch{return error('route_acl_corrupt',503);}
-      const found=pick(humans(Array.isArray(participants)?participants.slice(0,32) as string[]:[]));if(found)return found;
+      let direct:unknown[]|undefined;try{direct=participants('intake',c.resource_id);}catch{return error('route_acl_corrupt',503);}
+      if(direct){
+        const found=pick(humans(direct));if(found)return found;
+        // An intake opened by another session (e.g. the orchestrator) belongs to that session's human.
+        const owners:unknown[]=[];
+        for(const v of direct.filter((p):p is string=>typeof p==='string'&&/^session:[0-9a-f-]{36}$/i.test(p)).slice(0,4)){
+          const bound=this.db.one<{bound_intake_id:string|null}>('SELECT bound_intake_id FROM object_routes WHERE kind=? AND id=?','session',v.slice(8));
+          if(bound?.bound_intake_id){try{owners.push(...(participants('intake',bound.bound_intake_id)||[]));}catch{return error('route_acl_corrupt',503);}}
+        }
+        return pick(humans(owners))||error('recipient_unknown',404);
+      }
     }
     if(boundedString(c.family_id,180)){
       const found=pick(humans(this.db.all<{id:string}>("SELECT DISTINCT resource_id AS id FROM credentials WHERE family_id=? AND kind='operator' LIMIT 3",c.family_id).map(v=>v.id)));if(found)return found;

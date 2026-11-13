@@ -85,7 +85,19 @@ def profile_path(name: str) -> Path:
 
 
 def resolve_identity(profile: str | None) -> tuple[str | None, str]:
-    """Select the credential file (via HUB_CONFIG_FILE) and return (actor, source)."""
+    """Select the credential file (via HUB_CONFIG_FILE) and return (actor, source).
+
+    Inside a Hub2 session the per-attempt worker context is the only credential
+    the CLI uses (config.load_config), so its actor is the identity and a
+    --profile would be silently ignored: refuse it instead."""
+    from .worker_auth import is_v2_worker
+    if is_v2_worker():
+        if profile:
+            raise MsgError('--profile is not used inside a Hub2 session; the session credential is the sender')
+        from .config import load_config
+        worker = load_config().get('_hub2_worker') or {}
+        actor = worker.get('actor') if isinstance(worker, dict) else None
+        return (actor if isinstance(actor, str) else None), 'hub2-session'
     path = None
     source = 'default'
     if profile:
@@ -216,11 +228,23 @@ def post_message(args, recipient: str, actor: str | None, reply_to: dict | None 
             'epoch': message.get('epoch'), 'idempotency_key': key}
 
 
+def whoami_actor() -> str | None:
+    """The requesting human's actor from Hub2 /api/auth/me (humans only)."""
+    try:
+        me = _request('GET', '/api/auth/me')
+    except ValueError:
+        return None
+    actor = me.get('actor') if isinstance(me, dict) else None
+    return actor if isinstance(actor, str) else None
+
+
 def reply_message(args, message_id: str, actor: str | None) -> dict:
     """Reply to the other end of a message: its sender, unless this identity sent it."""
     original = get_message(args, message_id)
-    me = getattr(args, 'as_actor', None) or actor
-    to = original.get('recipient') if me and original.get('sender') == me else original.get('sender')
+    me = getattr(args, 'as_actor', None) or actor or whoami_actor()
+    if not me:
+        raise MsgError('Cannot tell which end of this message you are; pass --to')
+    to = original.get('recipient') if original.get('sender') == me else original.get('sender')
     if not to:
         raise MsgError('Original message has no counterpart to reply to')
     return post_message(args, to, actor, reply_to=original)
@@ -271,9 +295,9 @@ def add_commands(sub):
     inbox.add_argument('--actor', help='Default: this identity')
     inbox.add_argument('--unread', action='store_true')
     inbox.add_argument('--thread', help='Only one thread id')
-    inbox.add_argument('--wait', type=int, default=0, help='Poll up to N seconds (max 60) for new messages')
+    inbox.add_argument('--wait', type=int, default=0, help='When nothing matches, poll up to N seconds (max 60) for new messages')
     inbox.add_argument('--mark-read', action='store_true', help='Mark the returned messages read')
-    inbox.add_argument('--limit', type=int, default=25, help='1..50')
+    inbox.add_argument('--limit', type=int, default=25, help='Newest N messages, 1..50')
     inbox.add_argument('--cursor')
     show = ms.add_parser('show', help='Show one message')
     show.add_argument('id')
@@ -319,11 +343,12 @@ def execute(args):
         if args.client is None:
             return _request('GET', path)
         return _request('POST', path, {'client': args.client, 'remove': bool(args.remove)})
+    actor, source = resolve_identity(getattr(args, 'profile', None))
     if args.msg_cmd == 'readdress':
         message = get_message(args, args.id)
+        key = 'readdress:%s:%s:%s' % (message['id'], message.get('epoch'), args.to)
         return _request('POST', MESSAGES + '/' + quote(message['id'], safe='') + '/readdress',
-                        {'recipient': args.to, 'key': 'readdress:' + message['id'] + ':' + args.to, 'epoch': message.get('epoch')})
-    actor, source = resolve_identity(getattr(args, 'profile', None))
+                        {'recipient': args.to, 'key': key, 'epoch': message.get('epoch')})
     if args.msg_cmd == 'whoami':
         return {'actor': actor, 'source': source}
     if args.msg_cmd == 'send':
@@ -337,18 +362,29 @@ def execute(args):
     return _request('GET', MESSAGES + '/' + quote(args.id, safe='') + '/status' + _view_query(args))
 
 
+INBOX_PAGE_CAP = 40  # 40 x 50 = 2000 messages walked at most per call
+
+
+def _page(params, cursor):
+    query = list(params) + (['cursor=' + quote(cursor, safe='')] if cursor else [])
+    page = _request('GET', MESSAGES + '?' + '&'.join(query))
+    if not isinstance(page, dict):
+        raise MsgError('Hub returned no mailbox page', 4)
+    return page.get('items') or [], page.get('next')
+
+
 def inbox(args, actor: str | None):
     """Shared inbox path for `hub msg inbox` and `hub inbox`: the Hub2 mailbox
-    page the web Inbox shows. --wait polls (max 60 s) until a message shows
-    up; --unread keeps messages without a read receipt; --mark-read records
-    the epoch-bound read receipt for what was returned."""
+    the web Inbox shows. Hub2 pages oldest-first, so the walk follows `next`
+    (bounded) and returns the newest --limit messages. --unread keeps messages
+    without a read receipt; --wait polls from the end cursor (max 60 s) for new
+    messages when none match; --mark-read records epoch-bound read receipts."""
     who = getattr(args, 'actor', None) or getattr(args, 'as_actor', None) or actor
     wait = max(0, min(getattr(args, 'wait', 0) or 0, 60))
-    params = ['limit=' + str(max(1, min(int(getattr(args, 'limit', None) or 25), 50)))]
+    limit = max(1, min(int(getattr(args, 'limit', None) or 25), 50))
+    params = ['limit=50']
     if getattr(args, 'thread', None):
         params.append('thread=' + quote(args.thread, safe=''))
-    if getattr(args, 'cursor', None):
-        params.append('cursor=' + quote(args.cursor, safe=''))
     view = ''
     if getattr(args, 'as_actor', None) or (who and who.startswith('agent:') and who != actor):
         view = 'as=' + quote(who, safe='')
@@ -356,16 +392,28 @@ def inbox(args, actor: str | None):
         view = 'mailbox=' + quote(who, safe='')
     if view:
         params.append(view)
-    deadline = time.monotonic() + wait
-    while True:
-        page = _request('GET', MESSAGES + '?' + '&'.join(params))
-        rows = page.get('items', []) if isinstance(page, dict) else []
-        if getattr(args, 'unread', False):
-            rows = [r for r in rows if not r.get('read_at')]
-        if rows or time.monotonic() >= deadline:
+    unread = getattr(args, 'unread', False)
+    keep = (lambda r: not r.get('read_at')) if unread else (lambda r: True)
+    rows, cursor = [], getattr(args, 'cursor', None)
+    for _ in range(INBOX_PAGE_CAP):
+        items, nxt = _page(params, cursor)
+        rows.extend(r for r in items if keep(r))
+        if items:
+            cursor = json.dumps([items[-1].get('created_at'), items[-1].get('id')])
+        if not nxt:
             break
+        cursor = nxt
+    else:
+        raise MsgError('Mailbox has more than %d messages; pass --cursor to page' % (INBOX_PAGE_CAP * 50))
+    deadline = time.monotonic() + wait
+    while not rows and time.monotonic() < deadline:
         time.sleep(min(3, max(0.1, deadline - time.monotonic())))
-    result = {'actor': who, 'messages': rows, 'next': page.get('next') if isinstance(page, dict) else None}
+        items, _nxt = _page(params, cursor)
+        if items:
+            cursor = json.dumps([items[-1].get('created_at'), items[-1].get('id')])
+        rows.extend(r for r in items if keep(r))
+    rows = rows[-limit:]
+    result = {'actor': who, 'messages': rows, 'next': cursor}
     if getattr(args, 'mark_read', False) and rows:
         marked = 0
         for row in rows:

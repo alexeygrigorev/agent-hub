@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from urllib.error import URLError
+from urllib.parse import unquote
 from pathlib import Path
 from unittest import mock
 
@@ -54,13 +55,26 @@ class FakeMailbox:
         bare = path.split("?", 1)[0]
         if method == "POST" and bare == "/api/messages":
             recipient = HUMAN if payload["recipient"] == "human:me" else payload["recipient"]
-            message = {"id": "m%d" % (len(self.messages) + 1), "sender": self.credential_actor(path), "recipient": recipient,
+            message = {"id": "m%d" % (len(self.messages) + 1), "created_at": len(self.messages) + 1, "sender": self.credential_actor(path), "recipient": recipient,
                        "body": payload["body"], "key": payload["key"], "thread_id": "t", "reply_to": payload.get("reply_to"),
                        "epoch": 1, "state": "received", "read_at": None}
             self.messages[message["id"]] = message
             return {"message": message}
+        if method == "GET" and bare == "/api/auth/me":
+            if os.environ.get("HUB_CONFIG_FILE"):
+                raise ValueError("HTTP request failed with status 403: human_required")
+            return {"actor": HUMAN, "kind": "human"}
         if method == "GET" and bare == "/api/messages":
-            return {"items": list(self.messages.values()), "filtered_page": False, "next": None}
+            # Oldest-first pages with a (created_at, id) cursor, like mailbox-do.ts list().
+            query = dict(part.split("=", 1) for part in path.split("?", 1)[1].split("&")) if "?" in path else {}
+            limit = int(query.get("limit", 25))
+            rows = sorted(self.messages.values(), key=lambda m: (m.get("created_at", 0), m["id"]))
+            if "cursor" in query:
+                after = json.loads(unquote(query["cursor"]))
+                rows = [m for m in rows if (m.get("created_at", 0), m["id"]) > (after[0], after[1])]
+            page = rows[:limit]
+            more = len(rows) > limit
+            return {"items": page, "filtered_page": False, "next": json.dumps([page[-1].get("created_at", 0), page[-1]["id"]]) if more else None}
         parts = bare.split("/")
         if len(parts) >= 4 and parts[3] in self.messages:
             message = self.messages[parts[3]]
@@ -312,13 +326,61 @@ class MsgCliM5Test(MsgCliTest):
             self.assertEqual(self.run_cli(["msg", "status", "m9"])["message"]["id"], "m9")
             self.assertEqual(self.run_cli(["msg", "show", "m9"])["id"], "m9")
 
+    def test_inbox_walks_oldest_first_pages_and_returns_the_newest_unread(self):
+        for i in range(120):
+            self.hub.messages["o%03d" % i] = {"id": "o%03d" % i, "created_at": i, "sender": "session:s", "recipient": HUMAN,
+                                              "epoch": 1, "read_at": None if i >= 115 else 1}
+        with mock.patch("agent_hub_host.bus._do_request", side_effect=self.hub):
+            result = self.run_cli(["msg", "inbox", "--unread", "--limit", "3"])
+            self.assertEqual([m["id"] for m in result["messages"]], ["o117", "o118", "o119"])
+            latest = self.run_cli(["msg", "inbox", "--limit", "2"])
+            self.assertEqual([m["id"] for m in latest["messages"]], ["o118", "o119"])
+
+    def test_inbox_wait_only_returns_mail_newer_than_the_start(self):
+        self.hub.messages["old"] = {"id": "old", "created_at": 1, "sender": "session:s", "recipient": HUMAN, "epoch": 1, "read_at": 1}
+        polls = []
+
+        def request(method, path, payload=None):
+            polls.append(path)
+            if len(polls) == 3:
+                self.hub.messages["new"] = {"id": "new", "created_at": 2, "sender": "session:s", "recipient": HUMAN, "epoch": 1, "read_at": None}
+            return self.hub(method, path, payload)
+
+        with mock.patch("agent_hub_host.bus._do_request", side_effect=request), mock.patch("time.sleep"):
+            result = self.run_cli(["msg", "inbox", "--unread", "--wait", "30"])
+        self.assertEqual([m["id"] for m in result["messages"]], ["new"])
+        self.assertIn("cursor=", polls[-1])
+
+    def test_reply_to_own_message_goes_to_the_other_end_for_a_login_without_actor(self):
+        # Review finding: the default login has no actor in its profile; replying to
+        # a message it sent must not address the reply to itself.
+        with mock.patch("agent_hub_host.bus._do_request", side_effect=self.hub):
+            sent = self.run_cli(["msg", "send", "--to", "session:abc", "--body", "first"])
+            reply = self.run_cli(["msg", "reply", sent["id"], "--body", "follow-up"])
+        self.assertEqual((reply["from"], reply["to"]), (HUMAN, "session:abc"))
+        self.assertIn(("GET", "/api/auth/me"), [c[:2] for c in self.hub.calls])
+
+    def test_hub2_session_worker_is_the_sender_and_profile_is_refused(self):
+        worker = {"base_url": "https://hub.example", "_hub2_worker": {"actor": "session:" + HUB_SESSION}}
+        with mock.patch("agent_hub_host.worker_auth.is_v2_worker", return_value=True), \
+                mock.patch("agent_hub_host.config.load_config", return_value=worker), \
+                mock.patch("agent_hub_host.bus._do_request", side_effect=self.hub):
+            self.assertEqual(self.run_cli(["msg", "whoami"]), {"actor": "session:" + HUB_SESSION, "source": "hub2-session"})
+            with self.assertRaises(msg_cli.MsgError) as ctx:
+                self.run_cli(["msg", "--profile", "developer", "send", "--to", "human:me", "--body", "x"])
+            self.assertIn("--profile", str(ctx.exception))
+            self.hub.messages["mine"] = {"id": "mine", "created_at": 1, "sender": "session:" + HUB_SESSION, "recipient": HUMAN, "epoch": 1}
+            reply = self.run_cli(["msg", "reply", "mine", "--body", "follow-up"])
+        self.assertEqual(self.hub.calls[-1][2]["recipient"], HUMAN)
+        self.assertEqual(reply["to"], HUMAN)
+
     def test_readdress_and_agent_delegate_requests(self):
         self.hub.messages["m1"] = {"id": "m1", "sender": HUMAN, "recipient": "session:x", "epoch": 2}
         target = "session:22222222-2222-4222-8222-222222222222"
         with mock.patch("agent_hub_host.bus._do_request", side_effect=self.hub):
             self.run_cli(["msg", "readdress", "m1", "--to", target])
         self.assertEqual(self.hub.calls[-1][:3], ("POST", "/api/messages/m1/readdress",
-                                                  {"recipient": target, "key": "readdress:m1:" + target, "epoch": 2}))
+                                                  {"recipient": target, "key": "readdress:m1:2:" + target, "epoch": 2}))
         calls = []
         with mock.patch("agent_hub_host.bus._do_request", side_effect=lambda m, p, b=None: calls.append((m, p, b)) or {}):
             self.run_cli(["msg", "agent-delegate", "developer"])
