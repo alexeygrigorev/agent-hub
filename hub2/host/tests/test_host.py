@@ -1,4 +1,5 @@
 import json
+import math
 import hashlib
 import io
 import os
@@ -327,7 +328,8 @@ class HostTests(unittest.TestCase):
         state = self.root / 'origin-native-state'
         retired = state / 'retired-sessions' / row['native_id']
         retired.mkdir(parents=True, mode=0o700, exist_ok=True)
-        now = int(time.time()*1000)
+        # Model a terminal instant not earlier than the fractional host manifest.
+        now = max(int(time.time()*1000), math.ceil(manifest['native_started_at']*1000))
         (retired / 'tombstone.json').write_text(json.dumps({'id': row['native_id'], 'tag': row['tag'],
             'workspace': str(self.root / 'different-cwd'), 'created_at_ms': manifest['created_at_ms'],
             'cause': 'finished', 'containment_empty': True, 'finished_at_ms': now,
@@ -339,6 +341,22 @@ class HostTests(unittest.TestCase):
             self.journal.db.execute('DELETE FROM outbox')
         self.native.calls.clear()
         return row, manifest, retired
+
+    def test_origin_retirement_same_millisecond_fixture_preserves_ordering_guard(self):
+        # Native receipts use integer milliseconds; the host manifest uses
+        # fractional seconds. No real sleep is needed to model ordered evidence.
+        with patch.object(time, 'time', return_value=1794600000.0005):
+            row, manifest, retired = self.origin_retirement_fixture()
+            expected = dict(row)
+            proof = self.bridge.launcher.retired_origin(row['native_id'], expected)
+            self.assertIsNotNone(proof)
+            self.assertEqual(proof['exit']['code'], 127)
+            tombstone_path = retired / 'tombstone.json'
+            tombstone = json.loads(tombstone_path.read_text())
+            # Genuine before-start evidence must still be rejected.
+            tombstone['exit']['exited_at_ms'] = math.floor(manifest['native_started_at']*1000)
+            tombstone_path.write_text(json.dumps(tombstone))
+            self.assertIsNone(self.bridge.launcher.retired_origin(row['native_id'], expected))
 
     def test_reconcile_origin_retirement_preserves_failed_exit_without_native_effects(self):
         row, manifest, retired = self.origin_retirement_fixture()
