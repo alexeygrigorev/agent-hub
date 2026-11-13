@@ -353,6 +353,17 @@ class MsgCliM5Test(MsgCliTest):
             self.assertEqual(unread["messages"], [])
             self.assertEqual(len(self.hub.calls), msg_cli.INBOX_DESC_PAGES)
 
+    def test_forward_cursor_paging_with_small_limit_skips_nothing(self):
+        for i in range(60):
+            self.hub.messages["c%02d" % i] = {"id": "c%02d" % i, "created_at": i, "sender": "s", "recipient": HUMAN, "epoch": 1, "read_at": None}
+        seen, cursor = [], json.dumps([-1, ""])
+        with mock.patch("agent_hub_host.bus._do_request", side_effect=self.hub):
+            for _ in range(5):
+                page = self.run_cli(["msg", "inbox", "--cursor", cursor, "--limit", "20"])
+                seen += [m["id"] for m in page["messages"]]
+                cursor = page["next"]
+        self.assertEqual(seen, ["c%02d" % i for i in range(60)])
+
     def test_inbox_wait_only_returns_mail_newer_than_the_start(self):
         self.hub.messages["old"] = {"id": "old", "created_at": 1, "sender": "session:s", "recipient": HUMAN, "epoch": 1, "read_at": 1}
         polls = []

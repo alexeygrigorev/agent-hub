@@ -405,8 +405,13 @@ def inbox(args, actor: str | None):
     keep = (lambda r: not r.get('read_at')) if unread else (lambda r: True)
     if getattr(args, 'cursor', None):
         items, _nxt = _page(params, args.cursor)
-        rows = [r for r in items if keep(r)][:limit]
-        cursor = _row_cursor(items[-1]) if items else args.cursor
+        rows, cursor = [], args.cursor
+        for item in items:  # the printed `next` is the last message considered, so nothing is skipped
+            if len(rows) >= limit:
+                break
+            cursor = _row_cursor(item)
+            if keep(item):
+                rows.append(item)
     else:
         newest, back = [], None
         for _ in range(INBOX_DESC_PAGES if unread else 1):
