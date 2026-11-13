@@ -925,6 +925,54 @@ class TestSessionControlCli(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'stage=admission'):
                 session_control.execute(args)
 
+    def test_start_wait_surfaces_sanitized_host_attention_diagnostics(self):
+        args = self.parse('start', '--workspace', 'demo', '--key', 'k-host-diag', '--timeout', '5', '--interval', '1')
+        failed = {'session': {'id': 's-host-diag', 'state': 'failed', 'attention': {
+            'reason': 'workspace_unavailable', 'stage': 'host_launch',
+            'detail': 'Workspace unavailable. Authorization: Bearer private-test-secret '
+                      '\x1b[31mUse the enrolled workspace\x1b[0m\n' + 'x' * 400}}}
+        with patch.object(session_control, 'request', side_effect=[{'id': 's-host-diag'}, failed]), \
+                patch.object(session_control.time, 'sleep', return_value=None):
+            with self.assertRaises(session_control.SessionInputError) as caught:
+                session_control.execute(args)
+        message = session_control.diagnostic(caught.exception)
+        self.assertIn('workspace_unavailable', message)
+        self.assertIn('stage=host_launch', message)
+        self.assertIn('Workspace unavailable.', message)
+        self.assertIn('Use the enrolled workspace', message)
+        self.assertNotIn('private-test-secret', message)
+        self.assertNotIn('\x1b', message)
+        self.assertLess(len(message), 600)
+
+    def test_start_wait_tolerates_missing_or_malformed_attention_fields(self):
+        args = self.parse('start', '--workspace', 'demo', '--key', 'k-old-host', '--timeout', '5', '--interval', '1')
+        for attention in (
+                {'reason': 'workspace_unavailable'},
+                {'reason': 'workspace_unavailable', 'stage': {'raw': 'credential'}, 'detail': ['secret']},
+                {'reason': 'workspace_unavailable', 'stage': 'bad stage', 'detail': '\x1b[31m'}):
+            failed = {'session': {'id': 's-old-host', 'state': 'failed', 'attention': attention}}
+            with self.subTest(attention=attention), \
+                    patch.object(session_control, 'request', side_effect=[{'id': 's-old-host'}, failed]), \
+                    patch.object(session_control.time, 'sleep', return_value=None):
+                with self.assertRaises(session_control.SessionInputError) as caught:
+                    session_control.execute(args)
+            message = session_control.diagnostic(caught.exception)
+            self.assertIn('workspace_unavailable', message)
+            self.assertNotIn('stage=', message)
+            self.assertNotIn('secret', message)
+
+    def test_start_detail_sanitizer_rejects_raw_dumps_and_bounds_human_text(self):
+        self.assertIsNone(session_control.sanitize_start_detail('raw stderr: private traceback'))
+        self.assertIsNone(session_control.sanitize_start_detail('config={"api_key":"private-test-secret"}'))
+        safe = session_control.sanitize_start_detail('Workspace unavailable. Authorization: Bearer private-test-secret\x1b[31m Retry\x1b[0m')
+        self.assertIn('Workspace unavailable.', safe)
+        self.assertIn('Retry', safe)
+        self.assertNotIn('private-test-secret', safe)
+        self.assertNotIn('\x1b', safe)
+        self.assertLessEqual(len(safe), session_control.HOST_START_DETAIL_LIMIT)
+        self.assertLessEqual(len(session_control.sanitize_start_detail('x' * 500) or ''),
+                             session_control.HOST_START_DETAIL_LIMIT)
+
     def test_list_table_maps_hub2_session_view_fields(self):
         hub2_rows = [
             {'id': 'hub2-1', 'state': 'running', 'engine': 'claude', 'model': 'fable',
