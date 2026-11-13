@@ -1300,9 +1300,14 @@ def main():
             return 0
         config = Path.home() / '.config/agent-hub/v2.json'
         base = args.base_url or (json.loads(config.read_text()).get('server') if config.exists() else None)
+        scheduled = (
+            not args.install_service
+            and not args.no_restart
+            and os.environ.get('TRIGGER_UNIT', '').endswith('.timer')
+        )
         install(base or 'https://hub.dtcdev.click', args.root.resolve(),
                 install_service=args.install_service, restart=not args.no_restart,
-                scheduled=not args.install_service and not args.no_restart)
+                scheduled=scheduled)
     except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
         print('Hub2 release update failed; inspect the current release and retry. No credentials logged.', file=sys.stderr)
         return 1
