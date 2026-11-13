@@ -9,8 +9,7 @@ from agent_hub_host import quota_server, quota as quota_cli
 
 class ServerQuotaTests(unittest.TestCase):
     def test_collects_account_observations_without_machine_coverage(self):
-        settings = {'accounts': [{'provider': 'codex', 'account': 'agent-main'},
-                                 {'provider': 'codex-orin', 'account': 'orin'}]}
+        settings = {'accounts': [{'provider': 'codex', 'account': 'agent-main'}]}
         future = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1)).isoformat()
         route = {'status': 'ok', 'error': None, 'details': {'limit_reached': False, 'secret': 'must disappear'},
                  'windows': {'7d': {'percent_remaining': 71, 'reset_at': future}}}
@@ -150,35 +149,27 @@ class ServerQuotaTests(unittest.TestCase):
         """Wrong-account-key regression (intake f6709905): a managed 401 for
         (codex, shared-codex) must replace the fresh personal server-local
         probe for the same fleet account, so `hub quota` no longer routes
-        /goal starts at a dead account. Managed (codex, codex-orin) likewise
-        replaces personal (codex-orin, codex-orin) in place: the server
-        dedupes snapshots on account alone (duplicate_account 400), so the
-        payload must carry unique accounts."""
+        /goal starts at a dead account. The server dedupes snapshots on
+        account alone (duplicate_account 400), so the payload must carry
+        unique accounts."""
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / 'state.json'
             state.write_text(json.dumps([
                 {'label': 'shared-codex', 'provider': 'codex', 'revision': 'rev-a'},
-                {'label': 'codex-orin', 'provider': 'codex', 'revision': 'rev-b'},
             ]))
             future = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=7)).isoformat()
             personal_fresh = {'status': 'ok', 'error': None, 'details': {'limit_reached': False},
                               'windows': {'7d': {'percent_remaining': 68.0, 'reset_at': future}}}
-            personal_orin = {'status': 'ok', 'error': None, 'details': {'limit_reached': False},
-                             'windows': {'7d': {'percent_remaining': 54.0, 'reset_at': future}}}
             managed_rows = [
                 {'account': 'shared-codex', 'provider': 'codex', 'quota': {
                     'status': 'error', 'details': {'limit_reached': False},
                     'windows': {'7d': {'percent_remaining': None, 'reset_at': None}}}},
-                {'account': 'codex-orin', 'provider': 'codex', 'quota': {
-                    'status': 'ok', 'details': {'limit_reached': False},
-                    'windows': {'7d': {'percent_remaining': 54.0, 'reset_at': future}}}},
             ]
             def runner(argv, **kwargs):
                 if isinstance(argv, str):
-                    return {'codex': personal_fresh, 'codex-orin': personal_orin}
+                    return {'codex': personal_fresh}
                 return {'accounts': managed_rows}
-            settings = {'accounts': [{'provider': 'codex', 'account': 'shared-codex'},
-                                      {'provider': 'codex-orin', 'account': 'codex-orin'}],
+            settings = {'accounts': [{'provider': 'codex', 'account': 'shared-codex'}],
                         'managed_state_file': str(state)}
             payload = quota_server.collect_accounts(settings, runner=runner)
             accounts = [r['account'] for r in payload['accounts']]
@@ -188,11 +179,6 @@ class ServerQuotaTests(unittest.TestCase):
             # Same fleet account: managed 401 replaces the misleading fresh probe.
             self.assertEqual(by_account['shared-codex']['quota']['status'], 'error')
             self.assertEqual(by_account['shared-codex']['provider'], 'codex')
-            # codex-orin is one fleet account: managed (codex) replaces the
-            # legacy personal (codex-orin) route key in place.
-            self.assertEqual(by_account['codex-orin']['quota']['status'], 'ok')
-            self.assertEqual(by_account['codex-orin']['provider'], 'codex')
-            self.assertEqual(by_account['codex-orin']['quota']['windows']['7d']['percent_remaining'], 54.0)
 
     def test_managed_duplicate_labels_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

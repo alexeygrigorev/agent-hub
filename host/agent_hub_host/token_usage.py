@@ -4,8 +4,7 @@ Collects REAL per-hour input/output token counts from the engines' native
 session data (no quota percentages, no invented values):
 
 - codex family rollout JSONL ``token_usage_record`` entries under the
-  ``sessions/`` trees of ``~/.codex`` (account shared-codex), ``~/.codex-orin``
-  (account orin) and ``~/.zcodex`` (engine zcodex, account shared-zai);
+  ``sessions/`` trees of ``~/.codex`` (account shared-codex) and ``~/.zcodex`` (engine zcodex, account shared-zai);
 - Claude project JSONL ``message.usage`` entries under
   ``~/.claude/projects`` (engine claude, account shared-claude);
 - completed OpenCode assistant messages (engine opencode, account shared-go).
@@ -50,7 +49,6 @@ POST_TIMEOUT_S = 10.0
 
 _CODEX_SOURCES = (
     ("codex", "shared-codex", ".codex"),
-    ("codex", "codex-orin", ".codex-orin"),
     ("zcodex", "shared-zai", ".zcodex"),
 )
 

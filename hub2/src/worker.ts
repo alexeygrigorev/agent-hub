@@ -1112,7 +1112,7 @@ function resourceSettings(request: Request, env: Hub2Env, actor: Actor): Respons
 
 /** Canonical quota account labels published by `hub quota publish`; unconfigured ones are skipped. */
 const QUOTA_ACCOUNT_ENGINES: Record<string, string[]> = {
-  claude: ['claude'], codex: ['codex'], 'codex-orin': ['codex'], gemini: ['gemini'],
+  claude: ['claude'], codex: ['codex'], gemini: ['gemini'],
   grok: ['grok'], copilot: ['copilot'], 'shared-go': ['opencode'],
 };
 

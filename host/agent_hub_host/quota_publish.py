@@ -13,7 +13,7 @@ from . import intake
 
 # quse key -> (hub account label, provider). Labels match worker.ts QUOTA_ACCOUNT_ENGINES.
 ACCOUNTS = {
-    'claude': ('claude', 'claude'), 'codex': ('codex', 'codex'), 'codex-orin': ('codex-orin', 'codex'),
+    'claude': ('claude', 'claude'), 'codex': ('codex', 'codex'),
     'gemini': ('gemini', 'gemini'), 'grok': ('grok', 'grok'), 'copilot': ('copilot', 'copilot'),
     'go': ('shared-go', 'go'), 'zai': ('zai-central', 'zai'),
 }
