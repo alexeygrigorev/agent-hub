@@ -179,7 +179,10 @@ class Runner:
                 or type(max_stdout) is not int or type(max_stderr) is not int
                 or max_stdout <= 0 or max_stderr <= 0):
             return 124, b'', b'invalid bound'
-        end = time.monotonic() + timeout
+        now = time.monotonic()
+        end = min(deadline, now + timeout)  # absolute deadline (time.monotonic domain) always caps the share
+        if end <= now:
+            return 124, b'', b'deadline expired before spawn'
         try:
             proc = subprocess.Popen([*base, *args], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, shell=False, close_fds=True)
@@ -224,18 +227,28 @@ class Runner:
                 except subprocess.TimeoutExpired:
                     outcome = 'timeout'
         finally:
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=BOUNDED_REAP_S / 2)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
+            # BaseException-safe: even a KeyboardInterrupt/SystemExit inside the waits below still kills and
+            # reaps ONLY this owned child and closes its streams.
+            try:
+                if proc.poll() is None:
                     try:
+                        proc.terminate()
                         proc.wait(timeout=BOUNDED_REAP_S / 2)
                     except subprocess.TimeoutExpired:
-                        outcome = 'reap'
-            proc.stdout.close()
-            proc.stderr.close()
+                        pass
+                    finally:
+                        if proc.poll() is None:
+                            proc.kill()
+                            try:
+                                proc.wait(timeout=BOUNDED_REAP_S / 2)
+                            except subprocess.TimeoutExpired:
+                                outcome = 'reap'
+            finally:
+                for stream in (proc.stdout, proc.stderr):
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
         if outcome == 'timeout':
             return 124, b'', b'timeout'
         if outcome == 'cap':
