@@ -221,6 +221,36 @@ def _probe_preparation(command, script_relpath):
         return False
 
 
+def _probe_file_context(command, script_relpath):
+    """Known literal non-executing metadata/mode/path context, never proof.
+
+    This is a tiny argv whitelist, not a shell interpreter. Only this expected
+    helper path is recognized here; unknown expressions/wrappers stay ambiguous.
+    """
+    if (not isinstance(command, str) or '$' in command or '`' in command
+            or any(ord(c) < 32 or ord(c) == 127 for c in command)):
+        return False
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=';&|<>()')
+        lexer.whitespace_split = True
+        lexer.commenters = ''
+        argv = list(lexer)
+    except ValueError:
+        return False
+    if any(any(c in arg for c in ';&|<>()*?[]{}') for arg in argv):
+        return False
+    if argv in ([name, script_relpath] for name in ('sha256sum', 'stat', 'echo')):
+        return True
+    if argv in ([name, option, script_relpath] for name, option in
+                (('chmod', '600'), ('chmod', '0600'), ('ls', '-l'))):
+        return True
+    # stat's literal format is data, not code. Bound to metadata directives and
+    # harmless separators; no format shell substitution, controls or wrappers.
+    return (len(argv) == 4 and argv[0] == 'stat' and argv[1] in ('-c', '--format')
+            and argv[3] == script_relpath and 0 < len(argv[2]) <= 64
+            and re.fullmatch(r'(?:%[aAuUgGnNsSfFhHiIoObBtTxXyYzZwWvV]|[ .:/_-])+', argv[2]) is not None)
+
+
 def _unrelated_header(row, script_relpath):
     """True only for a complete native tool header whose command cannot be the probe."""
     if len(row) != 4:
@@ -253,10 +283,12 @@ def _unrelated_header(row, script_relpath):
             and not any(c in argv[1] for c in '*?[]{}')
             and not any(c in command for c in '$`')):
         return True  # a complete literal invocation of another Python script
-    # Only a positively completed Bash copy is a known preparation reference.
+    # Only a positively completed Bash literal copy/metadata/mode/path context
+    # can be ignored when it references the expected helper.
     # Unknown Python/shell expressions mentioning scripts remain ambiguous.
     return (marker == (14, '#98c379', None, '●') and tool[3] == 'Bash'
-            and _probe_preparation(command, script_relpath))
+            and (_probe_preparation(command, script_relpath)
+                 or _probe_file_context(command, script_relpath)))
 
 
 def recognize(svg, *, work, script_relpath, script_sha256, pinned_script,
