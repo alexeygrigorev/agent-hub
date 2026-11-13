@@ -3,8 +3,21 @@
 
 Drives the public CLIs only (`hub sessions start|list|capture|stop`,
 `a list --json --running`). See docs/HUB-START-CANARY.md.
+
+Deploy-gate exit statuses: 0 pass; 1 failed with no unproven owned updater;
+75 (EXIT_ROLLBACK_HOLD) failed AND quiescence of the candidate-bound updater unit
+this run dispatched could not be proven. Every candidate-bound verdict carries a
+machine-readable ``rollback_safe`` boolean. ``false`` means the owned updater may
+still activate the candidate later, so a caller must NOT roll back the candidate
+(an automatic rollback would race the still-authorized updater) and must keep the
+pending transaction for reconciliation. The hold is finite: the unit carries
+TimeoutStartSec plus TimeoutStopSec, reported as ``host_updater_hold_s``, after
+which a reachable manager has terminated it; that duration is a bound to wait
+before re-querying the exact ``host_updater_unit``, never proof by itself. A
+missing/malformed verdict, ssh loss, wrapper timeout (124/137) or any other exit
+status must also be treated as a hold by the caller.
 """
-import argparse, datetime, errno, fcntl, hashlib, ipaddress, json, os, pathlib, re, shlex, signal, stat, subprocess, sys, time, urllib.parse, uuid
+import argparse, datetime, errno, fcntl, grp, hashlib, ipaddress, json, os, pathlib, pwd, re, shlex, signal, stat, subprocess, sys, time, urllib.parse, uuid
 
 ALERT_TO = "dev@dtcdev.click"  # fixed on purpose: never configurable, never orin@
 ALERT_FROM = "alerts@dtcdev.click"
@@ -95,10 +108,30 @@ HOST_UPDATER_TRIGGER_ARGV = (
 HOST_UPDATER_GATE_PYTHON = "/usr/bin/python3"
 HOST_UPDATER_GATE_MAX_S = 300
 HOST_UPDATER_GATE_STOP_S = 30
+EXIT_ROLLBACK_HOLD = 75
 
 
 def host_updater_gate_unit(sha, token):
     return f"agent-hub2-host-update-gate-{sha[:12]}-{token[:12]}.service"
+
+
+def private_primary_group(gid, euid):
+    """True only when NSS proves ``gid`` is the caller's primary group and nobody else belongs to it.
+
+    The directory's gid merely equalling our egid proves nothing: another account may share
+    that primary GID or be an explicit member. The complete membership (explicit members UNION
+    every passwd entry whose primary GID is ``gid``) must resolve to the caller alone; any NSS
+    error or unresolvable member fails closed.
+    """
+    try:
+        me = pwd.getpwuid(euid)
+        if me.pw_gid != gid:
+            return False
+        names = set(grp.getgrgid(gid).gr_mem)
+        names.update(entry.pw_name for entry in pwd.getpwall() if entry.pw_gid == gid)
+        return bool(names) and all(pwd.getpwnam(name).pw_uid == euid for name in names)
+    except (KeyError, OSError, ValueError):
+        return False
 
 
 def trusted_path_chain(path, euid):
@@ -123,8 +156,9 @@ def trusted_path_chain(path, euid):
             return False
         if st.st_mode & 0o002 and not (st.st_mode & stat.S_ISVTX and st.st_uid == 0):
             return False
-        # Group write is tolerated only for the caller's own user-private group (umask 002 layouts).
-        if st.st_mode & 0o020 and st.st_gid != os.getegid():
+        # Group write is tolerated only for a group NSS proves is the caller's private primary
+        # group (umask 002 layouts); a shared primary GID or extra member is rejected.
+        if st.st_mode & 0o020 and not private_primary_group(st.st_gid, euid):
             return False
     return True
 
@@ -134,7 +168,10 @@ def host_updater_gate_argv(root, home, sha, token, limit_s=HOST_UPDATER_GATE_MAX
 
     Runs the installed updater's explicit --install-service (immediate, serialized by its
     update.lock, readiness-checked and rolled back by the updater itself) as a transient
-    user unit queued with --no-block, its lifetime capped by the remaining gate budget.
+    user oneshot awaited with --wait, so the client's exit status IS the updater's terminal
+    result. RuntimeMaxSec is ignored for Type=oneshot, so lifetime is bounded by
+    TimeoutStartSec (the remaining gate budget) plus TimeoutStopSec. No --collect: a failed
+    unit and its Result stay inspectable until the canary has read them.
     Nothing is mutated in the manager environment.
     """
     if not (re.fullmatch(r"[0-9a-f]{40}", sha) and re.fullmatch(r"[0-9a-f]{32,64}", token)):
@@ -156,11 +193,10 @@ def host_updater_gate_argv(root, home, sha, token, limit_s=HOST_UPDATER_GATE_MAX
         return None
     limit = str(max(1, min(HOST_UPDATER_GATE_MAX_S, int(limit_s))))
     return [
-        "systemd-run", "--user", "--quiet", "--collect", "--no-block",
+        "systemd-run", "--user", "--quiet", "--wait",
         f"--unit={host_updater_gate_unit(sha, token)[:-len('.service')]}",
         "-p", "Type=oneshot",
         "-p", f"TimeoutStartSec={limit}",
-        "-p", f"RuntimeMaxSec={limit}",
         "-p", f"TimeoutStopSec={HOST_UPDATER_GATE_STOP_S}",
         "-p", f"Environment=PATH={home_s}/.local/bin:/usr/local/bin:/usr/bin:/bin",
         "-p", f"EnvironmentFile=-{home_s}/.config/agent-hub/host.env",
@@ -684,6 +720,10 @@ class Canary:
         self.host_updater_trigger_error = None
         self.host_updater_unit = None
         self.host_updater_env = None
+        self.host_updater_client_rc = None
+        self.host_updater_hold_s = None
+        self.host_updater_quiescence = "not_dispatched"
+        self.host_updater_unit_result = None
         self.pyz_fd = None
         self.hub_pass_fds = ()
         self.lock_fd = None
@@ -1077,19 +1117,32 @@ class Canary:
         updater_env = dict(os.environ)
         updater_env["XDG_RUNTIME_DIR"] = xdg_dir
         argv = list(HOST_UPDATER_TRIGGER_ARGV)
-        if self.candidate_sha and self.run_token:
+        gate = bool(self.candidate_sha and self.run_token)
+        timeout = None
+        if gate:
+            remaining = effective_deadline - time.monotonic()
             argv = host_updater_gate_argv(
                 self.host_release_root.absolute(), pathlib.Path.home(), self.candidate_sha, self.run_token,
-                limit_s=effective_deadline - time.monotonic(),
+                limit_s=remaining,
             )
             if argv is None:
                 self.host_updater_trigger = "failed"
                 self.host_updater_trigger_error = "host_updater_gate_paths_invalid"
                 return
-        rc, _, _ = self.run(argv, deadline=deadline, env=updater_env)
-        if self.candidate_sha and self.run_token:
-            self.host_updater_env = updater_env
+            # Pin the exact owned unit and environment BEFORE dispatch. A signal after the
+            # user manager queued the unit but before this client returns must still reach
+            # cleanup with ownership of precisely this unit (and no other).
             self.host_updater_unit = host_updater_gate_unit(self.candidate_sha, self.run_token)
+            self.host_updater_env = updater_env
+            self.host_updater_quiescence = "unproven"
+            self.host_updater_hold_s = int(next(a for a in argv if a.startswith("TimeoutStartSec=")).split("=")[1]) \
+                + HOST_UPDATER_GATE_STOP_S
+            # --wait client: lives as long as the unit, bounded by the remaining gate budget
+            # (not the generic per-command cap, which would abort a healthy slow update).
+            timeout = remaining
+        rc, _, _ = self.run(argv, timeout=timeout, deadline=deadline, env=updater_env)
+        if gate:
+            self.host_updater_client_rc = rc
         if rc == 0:
             self.host_updater_trigger = "triggered"
             self.host_updater_trigger_error = None
@@ -1100,25 +1153,68 @@ class Canary:
             self.host_updater_trigger = "failed"
             self.host_updater_trigger_error = f"host_updater_trigger_exit_{rc}"
 
-    def host_updater_unit_inactive(self, deadline):
+    def host_updater_unit_state(self, deadline):
+        """Properties of the owned unit, or None when the manager could not answer."""
         rc, out, _ = self.run(
-            ["systemctl", "--user", "is-active", self.host_updater_unit], deadline=deadline, env=self.host_updater_env
+            ["systemctl", "--user", "show", "--property=LoadState,ActiveState,Result,ExecMainStatus",
+             self.host_updater_unit],
+            deadline=deadline, env=self.host_updater_env,
         )
-        return rc != 124 and rc != 127 and out.strip() in ("inactive", "failed")
+        if rc != 0:
+            return None
+        props = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+        return props if "ActiveState" in props and "LoadState" in props else None
+
+    def host_updater_unit_terminal(self, deadline, existed=False):
+        """True only on positive proof that the owned unit is not (and cannot become) active.
+
+        ``existed`` is set once a stop/kill addressed to the unit succeeded, which only happens
+        for a loaded unit. A merely ``not-found`` unit is accepted without it only when the
+        --wait client returned by itself; for an interrupted or timed-out client a request
+        may still be in flight, so absence alone is NOT proof (rollback_safe stays false).
+        """
+        state = self.host_updater_unit_state(deadline)
+        if state is None or state["ActiveState"] not in ("inactive", "failed"):
+            return False
+        if state["LoadState"] == "loaded":
+            self.host_updater_unit_result = state.get("Result") or state["ActiveState"]
+            return True
+        rc = self.host_updater_client_rc
+        return state["LoadState"] == "not-found" and (existed or (isinstance(rc, int) and 0 <= rc < 124))
 
     def stop_host_updater_unit(self, deadline):
-        """Stop ONLY the owned transient unit and prove it is inactive (bounded); True when proven."""
+        """Stop ONLY the owned transient unit and prove it terminal (bounded); True when proven."""
         unit, env = self.host_updater_unit, self.host_updater_env
-        self.run(["systemctl", "--user", "stop", unit], deadline=deadline, env=env)
-        if self.host_updater_unit_inactive(deadline):
+        rc, _, _ = self.run(["systemctl", "--user", "stop", unit], deadline=deadline, env=env)
+        existed = rc == 0
+        if self.host_updater_unit_terminal(deadline, existed):
             return True
-        self.run(["systemctl", "--user", "kill", "--kill-whom=all", "--signal=SIGKILL", unit],
-                 deadline=deadline, env=env)
+        rc, _, _ = self.run(["systemctl", "--user", "kill", "--kill-whom=all", "--signal=SIGKILL", unit],
+                            deadline=deadline, env=env)
+        existed = existed or rc == 0
         while time.monotonic() < deadline:
-            if self.host_updater_unit_inactive(deadline):
+            if self.host_updater_unit_terminal(deadline, existed):
                 return True
             self.pause(deadline)
         return False
+
+    def settle_host_updater(self, cleanup_deadline):
+        """Decide whether the owned updater is positively quiescent; sets host_updater_quiescence."""
+        if not self.host_updater_unit:
+            self.host_updater_quiescence = "not_dispatched"
+            return
+        rc = self.host_updater_client_rc
+        if rc == 0:
+            self.host_updater_quiescence = "completed"  # --wait returned: terminal success
+            return
+        if rc == 127:
+            self.host_updater_quiescence = "not_dispatched"  # systemd-run itself could not be executed
+            return
+        try:
+            proven = self.stop_host_updater_unit(cleanup_deadline)
+        except BaseException:
+            proven = False
+        self.host_updater_quiescence = "inactive" if proven else "unproven"
 
     def verify_candidate_host_release(self):
         if not self.candidate_sha:
@@ -1129,6 +1225,17 @@ class Canary:
         release_dir = self.host_release_root / "releases" / self.candidate_sha
         current_link = self.host_release_root / "current"
         verified_pyz = False
+
+        def trigger_once():
+            # The owned updater is awaited to its terminal result inside trigger_host_updater;
+            # what it installed (archive, current, host version) is then revalidated from scratch.
+            nonlocal verified_pyz
+            if self.host_updater_triggered:
+                return
+            self.trigger_host_updater(deadline)
+            if self.host_updater_unit:
+                verified_pyz = False
+
         while time.monotonic() < deadline:
             try:
                 rel_st = os.lstat(release_dir)
@@ -1137,8 +1244,7 @@ class Canary:
                 is_rel_dir = False
             if not is_rel_dir:
                 reason = "candidate_release_not_installed"
-                if not self.host_updater_triggered:
-                    self.trigger_host_updater(deadline)
+                trigger_once()
                 self.pause(deadline)
                 continue
             try:
@@ -1147,8 +1253,7 @@ class Canary:
                 is_current = False
             if not is_current:
                 reason = "current_release_not_converged"
-                if not self.host_updater_triggered:
-                    self.trigger_host_updater(deadline)
+                trigger_once()
                 self.pause(deadline)
                 continue
             if not verified_pyz:
@@ -1175,6 +1280,9 @@ class Canary:
                     raise StageFailure("host_release", "candidate_hub_pyz_missing")
                 if len(data) != expected_size or hashlib.sha256(data).hexdigest() != expected_sha:
                     raise StageFailure("host_release", "candidate_hub_pyz_digest_mismatch")
+                if self.pyz_fd is not None:
+                    os.close(self.pyz_fd)
+                    self.pyz_fd, self.hub_pass_fds = None, ()
                 try:
                     self.pyz_fd = create_sealed_pyz_fd(data)
                 except OSError:
@@ -1219,11 +1327,14 @@ class Canary:
                 reason = f"host_version_mismatch:{clean(host_entry.get('host_version'))}"
             elif host_entry.get("version_mismatch") is not False:
                 reason = "host_version_mismatch_flag"
+            elif self.host_updater_unit and self.host_updater_client_rc != 0:
+                # A converged host is not success while the updater this gate dispatched has
+                # not finished successfully: it may still fail and restore the previous release.
+                raise StageFailure("host_release", f"host_updater_not_successful:{self.host_updater_trigger_error}")
             elif time.monotonic() < deadline:
                 self.host_version = self.candidate_sha
                 return
-            if not self.host_updater_triggered:
-                self.trigger_host_updater(deadline)
+            trigger_once()
             self.pause(deadline)
         failure_reason = f"timeout_{reason}"
         if self.host_updater_trigger_error:
@@ -1979,16 +2090,12 @@ class Canary:
         finally:
             self.in_cleanup = True
             cleanup_deadline = time.monotonic() + self.cleanup_budget
-            if self.host_updater_unit and not result["ok"]:
-                # A failed gate must not leave its owned one-shot able to activate later.
-                try:
-                    proven = self.stop_host_updater_unit(cleanup_deadline)
-                except BaseException:
-                    proven = False
-                result["host_updater_unit_stop"] = "inactive" if proven else "unproven"
-                if not proven:
-                    result["cleanup"] = "FAILED_needs_reconciliation"
-                    result["reason"] = f"{result.get('reason')}:host_updater_unit_not_quiescent"
+            # A failed gate must not leave its owned one-shot able to activate later.
+            self.settle_host_updater(cleanup_deadline)
+            if self.host_updater_quiescence == "unproven":
+                result["ok"] = False
+                result["cleanup"] = "FAILED_needs_reconciliation"
+                result["reason"] = f"{result.get('reason')}:host_updater_unit_not_quiescent"
             if self.start_attempted and not self.stopped:
                 try:
                     result["cleanup"] = self.cleanup(deadline=cleanup_deadline)
@@ -2047,6 +2154,14 @@ class Canary:
             result["host_updater_trigger"] = self.host_updater_trigger
             if self.host_updater_trigger_error is not None:
                 result["host_updater_trigger_error"] = self.host_updater_trigger_error
+            result["host_updater_unit_stop"] = self.host_updater_quiescence
+            # False = the owned updater may still activate the candidate: never roll back (exit 75).
+            result["rollback_safe"] = self.host_updater_quiescence != "unproven"
+            if self.host_updater_unit:
+                result["host_updater_unit"] = self.host_updater_unit
+                result["host_updater_hold_s"] = self.host_updater_hold_s
+                if self.host_updater_unit_result is not None:
+                    result["host_updater_unit_result"] = self.host_updater_unit_result
         return result
 
 
@@ -2195,7 +2310,9 @@ def main():
     print(line, flush=True)
     if not result["ok"]:
         print(line, file=sys.stderr, flush=True)
-    return 0 if result["ok"] else 1
+    if result["ok"]:
+        return 0
+    return EXIT_ROLLBACK_HOLD if result.get("rollback_safe") is False else 1
 
 
 if __name__ == "__main__":
