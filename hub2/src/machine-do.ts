@@ -17,22 +17,22 @@ const CAPTURE_RESULT_JSON_BYTES = 400 * 1024;
 const CAPTURE_ACK_BODY_BYTES = 401 * 1024;
 const COMMAND_HISTORY_BYTES = 8 * 1024 * 1024;
 const HOST_START_DIAGNOSTIC_KEY = '_hub_host_start_diagnostic';
-const ANSI_ESCAPE = /\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001b\\))/g;
-const SECRET_ASSIGNMENT = /\b(authorization|proxy-authorization|www-authenticate|cookie|set-cookie|(?:access|refresh|id)[_-]?token|token|api[_-]?key|password|passwd|secret|credential)\b["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|\[redacted\]|[^\s,;}\]]+)/gi;
+const UNSAFE_DETAIL_CONTROL=/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
+const CREDENTIAL_ASSIGNMENT=/\b(?:[A-Za-z0-9_-]*(?:authorization|proxy-authorization|www-authenticate|cookie|token|api[_-]?key|password|passwd|secret|credential)[A-Za-z0-9_-]*)\b\s*[:=]/i;
+const INLINE_CREDENTIAL=/\b(?:Bearer|Basic)\s+\S/i;
+const URL_CREDENTIAL=/https?:\/\/[^\s/@:]+:[^\s/@]+@/i;
+const TOKEN_CREDENTIAL=/\b(?:gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[A-Z0-9]{16})\b/;
 
 function sanitizedHostDetail(value: unknown): string | undefined {
   if(typeof value!=='string'||!value.trim())return undefined;
-  const input=value.slice(0,2048).replace(ANSI_ESCAPE,'');
-  const shapeCheck=input.replace(/\[redacted\]/gi,'');
-  if(/\b(?:traceback|stack trace|raw stderr|stderr|stdout|request body|response body|environment dump)\b/i.test(shapeCheck)
-    ||/[{}\[\]]/.test(shapeCheck)||/\b[A-Za-z_][A-Za-z0-9_]{1,}\s*=\s*(?!\[redacted\])\S/.test(input))return undefined;
-  const detail=input
-    .replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{6,}/gi,'[redacted]')
-    .replace(SECRET_ASSIGNMENT,'$1=[redacted]')
-    .replace(/https?:\/\/[^\s/@:]+:[^\s/@]+@/gi,'https://[redacted]@')
-    .replace(/\b(?:gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[A-Z0-9]{16})\b/g,'[redacted]')
-    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]/g,' ')
-    .replace(/\s+/g,' ').trim().slice(0,240).trim();
+  // Fail closed before normalizing controls: stripping a NUL from a broken-up
+  // authorization header can expose the credential that followed it.
+  const input=value.slice(0,2048);
+  if(UNSAFE_DETAIL_CONTROL.test(input)||CREDENTIAL_ASSIGNMENT.test(input)||INLINE_CREDENTIAL.test(input)
+    ||URL_CREDENTIAL.test(input)||TOKEN_CREDENTIAL.test(input))return undefined;
+  if(/\b(?:traceback|stack trace|raw stderr|stderr|stdout|request body|response body|environment dump)\b/i.test(input)
+    ||/[{}\[\]]/.test(input)||/\b[A-Za-z_][A-Za-z0-9_]{1,}\s*=\s*\S/.test(input))return undefined;
+  const detail=input.replace(/\s+/g,' ').trim().slice(0,240).trim();
   return detail||undefined;
 }
 

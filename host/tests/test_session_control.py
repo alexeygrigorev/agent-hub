@@ -938,8 +938,9 @@ class TestSessionControlCli(unittest.TestCase):
         message = session_control.diagnostic(caught.exception)
         self.assertIn('workspace_unavailable', message)
         self.assertIn('stage=host_launch', message)
-        self.assertIn('Workspace unavailable.', message)
-        self.assertIn('Use the enrolled workspace', message)
+        self.assertNotIn('detail:', message)
+        self.assertNotIn('Workspace unavailable.', message)
+        self.assertNotIn('Use the enrolled workspace', message)
         self.assertNotIn('private-test-secret', message)
         self.assertNotIn('\x1b', message)
         self.assertLess(len(message), 600)
@@ -964,14 +965,14 @@ class TestSessionControlCli(unittest.TestCase):
     def test_start_detail_sanitizer_rejects_raw_dumps_and_bounds_human_text(self):
         self.assertIsNone(session_control.sanitize_start_detail('raw stderr: private traceback'))
         self.assertIsNone(session_control.sanitize_start_detail('config={"api_key":"private-test-secret"}'))
-        safe = session_control.sanitize_start_detail('Workspace unavailable. Authorization: Bearer private-test-secret\x1b[31m Retry\x1b[0m')
+        self.assertIsNone(session_control.sanitize_start_detail('Authorization: Bearer' + chr(0) + ' synthetic-private-token'))
+        self.assertIsNone(session_control.sanitize_start_detail('AWS_SECRET_ACCESS_KEY: synthetic-private-token'))
+        self.assertIsNone(session_control.sanitize_start_detail('Workspace unavailable.' + chr(27) + '[31m Retry'))
+        safe = session_control.sanitize_start_detail('Workspace unavailable. Retry the enrolled workspace.')
         self.assertIn('Workspace unavailable.', safe)
-        self.assertIn('Retry', safe)
-        self.assertNotIn('private-test-secret', safe)
-        self.assertNotIn('\x1b', safe)
+        self.assertIn('Retry the enrolled workspace.', safe)
         self.assertLessEqual(len(safe), session_control.HOST_START_DETAIL_LIMIT)
-        self.assertLessEqual(len(session_control.sanitize_start_detail('x' * 500) or ''),
-                             session_control.HOST_START_DETAIL_LIMIT)
+        self.assertEqual(session_control.sanitize_start_detail('x' * 500), 'x' * session_control.HOST_START_DETAIL_LIMIT)
 
     def test_list_table_maps_hub2_session_view_fields(self):
         hub2_rows = [

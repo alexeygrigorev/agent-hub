@@ -48,32 +48,35 @@ TERMINAL_SESSION = ('running', 'stopped', 'lost', 'failed', 'refused', 'uncertai
 
 SAFE_ERROR = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 HOST_START_DETAIL_LIMIT = 240
-_ANSI_ESCAPE = re.compile(r'\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))')
-_SECRET_ASSIGNMENT = re.compile(
-    r'\b(authorization|proxy-authorization|www-authenticate|cookie|set-cookie|'
-    r'(?:access|refresh|id)[_-]?token|token|api[_-]?key|password|passwd|secret|credential)\b'
-    r'["\']?\s*[:=]\s*(?:"[^"]*"|\'[^\']*\'|\[redacted\]|[^\s,;}\]]+)', re.IGNORECASE)
+_UNSAFE_DETAIL_CONTROL = re.compile(r'[\x00-\x1f\x7f-\x9f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]')
+_CREDENTIAL_ASSIGNMENT = re.compile(
+    r'\b(?:[A-Za-z0-9_-]*(?:authorization|proxy-authorization|www-authenticate|cookie|token|api[_-]?key|'
+    r'password|passwd|secret|credential)[A-Za-z0-9_-]*)\b\s*[:=]', re.IGNORECASE)
+_INLINE_CREDENTIAL = re.compile(r'\b(?:Bearer|Basic)\s+\S', re.IGNORECASE)
+_URL_CREDENTIAL = re.compile(r'https?://[^\s/@:]+:[^\s/@]+@', re.IGNORECASE)
+_TOKEN_CREDENTIAL = re.compile(r'\b(?:gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[A-Z0-9]{16})\b')
 # Error bodies are small; refuse unexpectedly large responses before parsing.
 MAX_ERROR_RESPONSE = 64 * 1024
 
 
 def sanitize_start_detail(value):
-    """Return a bounded, control-safe start detail without credential values."""
+    """Return bounded human detail, rejecting controls and credential-shaped content."""
     if not isinstance(value, str) or not value.strip():
         return None
-    detail = _ANSI_ESCAPE.sub('', value[:2048])
-    shape_check = re.sub(r'\[redacted\]', '', detail, flags=re.IGNORECASE)
-    if (re.search(r'\b(?:traceback|stack trace|raw stderr|stderr|stdout|request body|response body|environment dump)\b',
-                  shape_check, re.IGNORECASE)
-            or re.search(r'[{}\[\]]', shape_check)
-            or re.search(r'\b[A-Za-z_][A-Za-z0-9_]{1,}\s*=\s*(?!\[redacted\])\S', detail)):
+    detail = value[:2048]
+    # Reject before normalizing: stripping a NUL from a broken-up credential
+    # header can expose the value that followed it.
+    if (_UNSAFE_DETAIL_CONTROL.search(detail)
+            or _CREDENTIAL_ASSIGNMENT.search(detail)
+            or _INLINE_CREDENTIAL.search(detail)
+            or _URL_CREDENTIAL.search(detail)
+            or _TOKEN_CREDENTIAL.search(detail)):
         return None
-    detail = re.sub(r'\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{6,}', '[redacted]', detail, flags=re.IGNORECASE)
-    detail = _SECRET_ASSIGNMENT.sub(r'\1=[redacted]', detail)
-    detail = re.sub(r'https?://[^\s/@:]+:[^\s/@]+@', 'https://[redacted]@', detail, flags=re.IGNORECASE)
-    detail = re.sub(r'\b(?:gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[A-Z0-9]{16})\b',
-                    '[redacted]', detail)
-    detail = re.sub(r'[\x00-\x1f\x7f-\x9f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]', ' ', detail)
+    if (re.search(r'\b(?:traceback|stack trace|raw stderr|stderr|stdout|request body|response body|environment dump)\b',
+                  detail, re.IGNORECASE)
+            or re.search(r'[{}\[\]]', detail)
+            or re.search(r'\b[A-Za-z_][A-Za-z0-9_]{1,}\s*=\s*\S', detail)):
+        return None
     detail = ' '.join(detail.split())[:HOST_START_DETAIL_LIMIT].strip()
     return detail or None
 
