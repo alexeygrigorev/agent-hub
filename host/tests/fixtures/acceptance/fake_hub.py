@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
-"""Synthetic modern CLI contracts. Never invokes Hub, native tools, or services."""
-import base64
+"""Synthetic modern CLI contracts for Hub intake, sessions, native `a`, `git`, and alerts.
+
+Parses real maintained CLI arguments (`intake.py`, `session_control.py`).
+Never invokes real Hub, native tools, or services.
+"""
+import argparse
 import copy
+import hashlib
 import json
 import os
 import re
@@ -10,15 +15,16 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
+
 HERE = Path(__file__).resolve().parent
 CFG = json.loads(Path(os.environ['FAKE_CFG']).read_text())
 STATE_PATH = Path(os.environ['FAKE_CFG'] + '.state')
-ST = json.loads(STATE_PATH.read_text()) if STATE_PATH.exists() else {'n': 0, 'sessions': {}, 'keys': {}, 'log': []}
+ST = json.loads(STATE_PATH.read_text()) if STATE_PATH.exists() else {
+    'n': 0, 'sessions': {}, 'keys': {}, 'intakes': {}, 'intake_keys': {}, 'log': [],
+}
 
 
 def save():
-    # Capture subprocesses can be killed at their deadline. Never truncate the
-    # last complete state that later cleanup commands must still be able to read.
     temporary = None
     try:
         with tempfile.NamedTemporaryFile('w', dir=STATE_PATH.parent,
@@ -47,55 +53,249 @@ def value(argv, flag):
     return argv[argv.index(flag) + 1]
 
 
+def canonical_bytes(obj):
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False).encode('utf-8')
+
+
 def choice(p):
     return {k: p[k] for k in ('policy_id', 'policy_version', 'machine_id', 'attempt', 'engine', 'model', 'effort')}
 
 
 def row_for(s, show=False):
-    row = {k: s[k] for k in ('id', 'native_id', 'engine', 'model', 'effort', 'workspace', 'policy_id', 'policy_version')}
-    row.update(machine_id=s['host'], state='stopped' if s['stopped'] and not CFG.get('stop_not_confirmed') else 'running',
-               operation_id=s['id'] + ':0', picker=copy.deepcopy(s['picker']))
+    row = {k: s[k] for k in (
+        'id', 'native_id', 'engine', 'model', 'effort', 'workspace', 'requested_workspace',
+        'policy_id', 'policy_version', 'intake_id', 'project_id', 'epoch', 'mode', 'interactive',
+    )}
+    stopped = s['stopped']
+    row.update(
+        machine_id=s['host'],
+        state='stopped' if stopped else 'running',
+        operation_id=s.get('operation_id', s['id']),
+        attempt_operation_id=s.get('attempt_operation_id', s['id'] + ':0'),
+        picker=copy.deepcopy(s['picker']),
+    )
+    if stopped and not CFG.get('stop_not_confirmed'):
+        row['stop_confirmed'] = True
     if show and CFG.get('fallback'):
         old = choice(row['picker'])
         pool = row['picker']['pool']
         index = next(i for i, x in enumerate(pool) if x['model'] == row['model'])
         chosen = pool[(index + 1) % len(pool)]
         row.update({k: chosen[k] for k in ('policy_id', 'model', 'engine', 'effort')})
-        row['operation_id'] = s['id'] + ':1'
+        row['attempt_operation_id'] = s['id'] + ':1'
         row['picker'].update(choice(dict(row['picker'], **chosen, attempt=1)))
         row['picker']['history'] = [old, choice(row['picker'])]
         if CFG.get('cross_attempt_pool'):
             row['picker']['pool'] = [dict(x, share=1) for x in s['picker']['pool'] if x['policy_id'] == old['policy_id']]
     if show and CFG.get('show_pool_changed'):
-        for option in row['picker']['pool']: option['weight'] *= 2
+        for option in row['picker']['pool']:
+            option['weight'] *= 2
     if CFG.get('missing_picker') or show and CFG.get('show_missing_picker'):
-        row.pop('picker')
+        row.pop('picker', None)
     if CFG.get('picker_model_mismatch') and 'picker' in row:
         row['picker']['model'] = 'wrong-model'
     if CFG.get('missing_version') and 'picker' in row:
-        row['picker'].pop('policy_version')
+        row['picker'].pop('policy_version', None)
     return row
 
 
-def hub(argv):
-    assert argv[0] == 'sessions', argv
-    sub = argv[1]
-    # Exercise real argument parsing as well as synthetic command responses.
-    import argparse
+def _write_worker_artifact(s, intake_row):
+    """Simulate a real worker executing the brief and writing canonical result.json."""
+    if CFG.get('no_artifact'):
+        return
+    brief = intake_row['text']
+    m_run = re.search(r'run ([0-9a-f-]{36}), sample (\d+)/\d+, parent ([0-9a-f-]{36})', brief)
+    m_ch = re.search(r'challenge file at `([^`]+)`', brief)
+    m_rel = re.search(r'only to `([^`]+)` inside', brief)
+    if not (m_run and m_ch and m_rel):
+        return
+    run_id, sample, parent_intake_id = m_run.group(1), int(m_run.group(2)), m_run.group(3)
+    challenge_path = Path(m_ch.group(1))
+    if not challenge_path.exists():
+        return
+    challenge32 = challenge_path.read_bytes()
+    ws = Path(s['workspace'])
+    ws.mkdir(parents=True, exist_ok=True)
+    result_path = ws / m_rel.group(1)
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    if CFG.get('result_preexisting'):
+        return
+    head = CFG.get('worker_head', CFG.get('git_head', 'b' * 40))
+    status_raw = CFG.get('git_status_raw', '').encode('utf-8')
+    status_sha = hashlib.sha256(status_raw).hexdigest()
+    entries = 0 if not status_raw else len(status_raw[:-1].split(b'\x00'))
+    work = {
+        'schema': 'phase7_native_work_v2',
+        'run_id': run_id,
+        'sample': sample,
+        'parent_intake_id': parent_intake_id,
+        'child_intake_id': intake_row['id'],
+        'session_id': s['id'],
+        'native_id': s['native_id'],
+        'project': 'alexeygrigorev/agent-hub',
+        'machine_id': 'hetzner-aplexer',
+        'workspace': s['workspace'],
+        'head': head,
+        'tracked_status_sha256': status_sha,
+        'tracked_status_entries': entries,
+        'calculation': CFG.get('worker_calc', 5050),
+    }
+    digest = hashlib.sha256(b'HUB_PHASE7_NATIVE_WORK_V2\x00' + challenge32 + b'\x00' + canonical_bytes(work)).hexdigest()
+    if CFG.get('result_bad_digest'):
+        digest = '0' * 64
+    result = dict(work, proof_digest=digest)
+    s['proof_digest'] = digest
+    s['proof_head'] = head
+    s['run_id'] = run_id
+    s['sample'] = sample
+    if CFG.get('result_symlink'):
+        target = result_path.parent / 'real.json'
+        target.write_bytes(canonical_bytes(result) + b'\n')
+        result_path.symlink_to(target)
+    elif CFG.get('result_hardlink'):
+        target = result_path.parent / 'hard.json'
+        target.write_bytes(canonical_bytes(result) + b'\n')
+        os.link(target, result_path)
+    elif CFG.get('result_duplicate_key'):
+        result_path.write_text('{"schema":"phase7_native_work_v2","schema":"phase7_native_work_v2"}\n')
+    elif CFG.get('result_non_canonical'):
+        result_path.write_bytes(json.dumps(result, indent=2).encode('utf-8') + b'\n')
+    else:
+        result_path.write_bytes(canonical_bytes(result) + b'\n')
+
+
+def _handle_intake(argv):
+    from agent_hub_host import intake as intake_cli
+    parser = argparse.ArgumentParser()
+    intake_cli.add_commands(parser.add_subparsers(dest='cmd'))
+    args = parser.parse_args(['intake'] + argv)
+    sub = args.intake_cmd
+    ST['log'].append('intake:' + sub)
+
+    if sub == 'create':
+        key = args.key
+        if key in ST['intake_keys']:
+            if ST.get('intake_replay_count', {}).get(key, 0) < CFG.get('create_replay_fail_count', 0):
+                ST.setdefault('intake_replay_count', {})[key] = ST.get('intake_replay_count', {}).get(key, 0) + 1
+                fail('upstream 502 on intake create replay')
+            item = ST['intakes'][ST['intake_keys'][key]]
+            out({'intake': item, 'task': {'id': item['id'], 'updated_at': item['updated_at'], 'control': {'version': item['updated_at']}}})
+        idx = len(ST['intakes']) + 1
+        cid = str(uuid.UUID(int=9000 + (1 if CFG.get('reuse_intake_id') else idx)))
+        text = Path(args.text_file).read_text(encoding='utf-8') if args.text_file else args.text
+        ac = Path(args.acceptance_criteria_file).read_text(encoding='utf-8') if args.acceptance_criteria_file else args.acceptance_criteria
+        ac_list = [
+            line for line in (
+                re.sub(r'^\s*(?:[-*]|\d+[.)])\s+', '', raw).strip()
+                for raw in (ac or '').splitlines()
+            ) if line
+        ] if ac is not None else []
+        item = {
+            'id': cid,
+            'project': args.project,
+            'title': args.title,
+            'text': text,
+            'acceptance_criteria': ac_list,
+            'status': 'open',
+            'assigned_machine_id': None,
+            'session_id': None,
+            'dispatch': None,
+            'updated_at': 1000 + idx,
+            'provenance': {'type': args.source_type, 'reference': args.source_reference},
+            'parent_intake_id': None,
+            'events': [{'seq': 1, 'actor_id': 'operator', 'kind': 'created', 'at': 1000, 'body': {'title': args.title}}],
+        }
+        ST['intakes'][cid] = item
+        ST['intake_keys'][key] = cid
+        if CFG.get('create_fail_after_accept_at') == idx - 1:
+            fail('upstream 502 after create')
+        out({'intake': item, 'task': {'id': cid, 'updated_at': item['updated_at'], 'control': {'version': item['updated_at']}}})
+
+    if sub == 'show':
+        item = copy.deepcopy(ST['intakes'][args.id])
+        if CFG.get('history_incomplete_archive'):
+            item['history_archive'] = {'count': 3, 'latest_sequence': 3}
+        if CFG.get('history_snapshot_changed'):
+            ST['intakes'][args.id]['updated_at'] += 1
+        out({'intake': item, 'task': {'id': item['id'], 'updated_at': item['updated_at'], 'control': {'version': item['updated_at']}}})
+
+    if sub == 'append':
+        iid = args.id
+        if iid in ST['intakes']:
+            item = ST['intakes'][iid]
+            seq = item['events'][-1]['seq'] + 1
+            item['events'].append({'seq': seq, 'actor_id': 'operator', 'kind': 'note', 'at': 2000 + seq, 'body': {'note': args.note}})
+            item['updated_at'] += 1
+        out({'ok': True, 'id': iid, 'key': args.key})
+
+    if sub == 'history':
+        item = ST['intakes'][args.id]
+        after = args.after or 0
+        limit = args.limit or 64
+        evs = [e for e in item['events'] if e['seq'] > after]
+        page = evs[:limit]
+        nxt = page[-1]['seq'] if len(evs) > limit else None
+        out({'events': page, 'next': nxt})
+
+    if sub == 'update':
+        item = ST['intakes'][args.id]
+        if CFG.get('archive_cas_conflict') or (args.version is not None and args.version != item['updated_at']):
+            fail('conflict: expected_updated_at mismatch')
+        item['status'] = args.status or item['status']
+        item['updated_at'] += 1
+        out({'intake': item})
+
+    fail('unhandled intake command: ' + sub)
+
+
+def _make_descendant_session(intake_row, desc_sid):
+    return {
+        'id': desc_sid,
+        'native_id': str(uuid.UUID(int=5000 + len(ST['sessions']) + 1)),
+        'engine': 'claude',
+        'model': 'claude-sonnet-4-6',
+        'effort': 'medium',
+        'workspace': str(Path(CFG.get('child_workspace_root', '/tmp/fake-ws')) / desc_sid),
+        'requested_workspace': '/home/user/work/acceptance',
+        'host': 'hetzner-aplexer',
+        'intake_id': intake_row['id'],
+        'project_id': 'alexeygrigorev/agent-hub',
+        'epoch': 1,
+        'mode': 'interactive',
+        'interactive': True,
+        'stopped': False,
+        'picker': {
+            'policy_id': 'p-claude', 'policy_version': 7, 'machine_id': 'hetzner-aplexer',
+            'attempt': 0, 'engine': 'claude', 'model': 'claude-sonnet-4-6', 'effort': 'medium',
+            'pool': [], 'history': [],
+        },
+        'policy_id': 'p-claude',
+        'policy_version': 7,
+    }
+
+
+def _handle_sessions(argv):
     from agent_hub_host import session_control
     parser = argparse.ArgumentParser()
     session_control.add_commands(parser.add_subparsers(dest='cmd'))
-    parser.parse_args(argv)
-    ST['log'].append(sub)
+    args = parser.parse_args(['sessions'] + argv)
+    sub = args.sessions_cmd
+    ST['log'].append('sessions:' + sub)
+
     if sub == 'pick':
         fail('independent pick must never be used for session acceptance')
+
     if sub == 'start':
-        for banned in ('--engine', '--model', '--effort', '--tier', '--override-reason', '--reason'):
+        for banned in ('--engine', '--model', '--effort', '--tier', '--override-reason', '--reason',
+                       '--prompt', '--brief-file', '--cwd', '--headless', '--with-goal'):
             assert banned not in argv, banned
+        assert '--interactive' in argv
         assert value(argv, '--machine') == 'hetzner-aplexer'
-        assert value(argv, '--cwd').startswith('/')
-        assert '--wait' not in argv  # exercise real default wait, never an obsolete explicit gate
-        key, prompt = value(argv, '--key'), value(argv, '--prompt')
+        req_ws = value(argv, '--workspace')
+        assert req_ws.startswith('/')
+        assert '--intake-task-id' in argv
+        key = value(argv, '--key')
+        child_id = value(argv, '--intake-task-id')
         ST.setdefault('start_requests', []).append(list(argv))
         if key in ST.get('refused_keys', []):
             fail('Session HTTP request failed with status 400 (invalid_request)')
@@ -106,134 +306,306 @@ def hub(argv):
             if count <= CFG.get('replay_failure_count', 0):
                 fail('upstream returned 502 Bad Gateway')
             row = row_for(ST['sessions'][ST['keys'][key]])
-            if CFG.get('bad_recovered_id'): row['id'] = '../../invalid-session'
+            if CFG.get('bad_recovered_id'):
+                row['id'] = '../../invalid-session'
             out(row)
-        i = ST['n']; ST['n'] += 1
+        i = ST['n']
+        ST['n'] += 1
         if CFG.get('fail_start_at') == i:
             ST.setdefault('refused_keys', []).append(key)
             fail('Session HTTP request failed with status 400 (invalid_request)')
-        model = CFG['models'][i % len(CFG['models'])]
+        models = CFG['models']
+        model = models[i % len(models)]
         pool = copy.deepcopy(CFG.get('pool', json.loads((HERE / 'hub_sessions_pick.json').read_text())['pool']))
-        chosen = next((x for x in pool if x['model'] == model), dict(policy_id='unknown', model=model, engine='codex', effort='medium'))
+        chosen = next((x for x in pool if x['model'] == model), dict(policy_id='unknown', model=model, engine='claude', effort='medium'))
         sid = str(uuid.UUID(int=1 if CFG.get('reuse_session_id') else i + 1))
         picker = dict(chosen, policy_version=7, machine_id=CFG.get('host', 'hetzner-aplexer'), attempt=0, pool=pool)
-        picker.pop('weight', None); picker.pop('share', None)
+        picker.pop('weight', None)
+        picker.pop('share', None)
         picker['history'] = [choice(picker)]
-        s = dict(id=sid, native_id=CFG['native_id'] if 'native_id' in CFG else str(uuid.UUID(int=1001 if CFG.get('reuse_native_id') else i + 1001)), engine=chosen['engine'], model=model, effort=chosen['effort'],
-                 workspace=CFG.get('workspace', value(argv, '--cwd')), host=picker['machine_id'], prompt=prompt,
-                 stopped=False, picker=picker, policy_id=chosen['policy_id'], policy_version=7)
-        ST['sessions'][sid] = s; ST['keys'][key] = sid
-        ST['log'].append('start:--intake-task-id' if '--intake-task-id' in argv else 'start:synthetic')
+        child_ws = CFG.get('workspace') or str(Path(CFG.get('child_workspace_root', req_ws)) / ('child-' + str(i + 1)))
+        native_id = None if CFG.get('null_native_stop') else (
+            CFG['native_id'] if 'native_id' in CFG else str(uuid.UUID(int=1001 if CFG.get('reuse_native_id') else i + 1001))
+        )
+        s = dict(
+            id=sid,
+            native_id=native_id,
+            engine=chosen['engine'],
+            model=model,
+            effort=chosen['effort'],
+            workspace=child_ws,
+            requested_workspace=req_ws,
+            host=picker['machine_id'],
+            intake_id=child_id,
+            project_id='alexeygrigorev/agent-hub',
+            epoch=1,
+            mode='headless' if CFG.get('force_headless_mode') else 'interactive',
+            interactive=not CFG.get('force_headless_mode'),
+            stopped=False,
+            picker=picker,
+            policy_id=chosen['policy_id'],
+            policy_version=7,
+        )
+        ST['sessions'][sid] = s
+        ST['keys'][key] = sid
+        if child_id in ST['intakes']:
+            ST['intakes'][child_id]['session_id'] = sid
+            ST['intakes'][child_id]['assigned_machine_id'] = picker['machine_id']
+            ST['intakes'][child_id]['dispatch'] = {
+                'id': sid,
+                'operation_id': s['id'],
+                'attempt_operation_id': s['id'] + ':0',
+                'machine_id': picker['machine_id'],
+                'epoch': s['epoch'],
+                'state': 'running',
+                'native_id': native_id,
+            }
+            ST['intakes'][child_id]['updated_at'] += 1
+        if native_id and child_id in ST['intakes']:
+            _write_worker_artifact(s, ST['intakes'][child_id])
         if CFG.get('leak_at') == i:
             fail('session_start_failed; session %s reached starting' % sid if CFG.get('leak_with_id', True) else 'Session wait timed out')
         if CFG.get('hang_start_at') == i:
-            save(); time.sleep(30)
+            save()
+            time.sleep(30)
         if CFG.get('accepted_nonjson') or CFG.get('accepted_nonjson_at') == i:
-            save(); print('upstream sent malformed success'); sys.exit(0)
+            save()
+            print('upstream sent malformed success')
+            sys.exit(0)
         if CFG.get('accepted_502'):
             fail('upstream returned 502 Bad Gateway')
         row = row_for(s)
-        if CFG.get('initial_missing_id'): row.pop('id')
-        if CFG.get('initial_bad_id'): row['id'] = '../../invalid-session'
+        if CFG.get('initial_missing_id'):
+            row.pop('id', None)
+        if CFG.get('initial_bad_id'):
+            row['id'] = '../../invalid-session'
         if CFG.get('initial_offered'):
             row['state'] = 'offered'
         out(dict(row, client_key=key, binding_wait={'session': row_for(s)}))
+
     if sub == 'show':
-        row = row_for(ST['sessions'][argv[2]], show=True)
-        if CFG.get('wrong_show_id'): row['id'] = str(uuid.UUID(int=999999))
+        s = ST['sessions'][args.id]
+        row = row_for(s, show=True)
+        if CFG.get('wrong_show_id'):
+            row['id'] = str(uuid.UUID(int=999999))
+        if CFG.get('natural_exit_after_proof') and ST['log'].count('sessions:list') >= 1 and not s['stopped']:
+            row['state'] = 'exited'
         out(row if CFG.get('flat_show') else {'session': row})
+
     if sub == 'list':
         rows = []
         for s in ST['sessions'].values():
             if s['stopped']:
                 continue
             row = row_for(s, show=True)
-            if CFG.get('list_no_host'): row['machine_id'] = None
-            if CFG.get('list_no_workspace'): row.pop('workspace', None)
+            if CFG.get('list_no_host'):
+                row['machine_id'] = None
+                row.pop('host', None)
+            if CFG.get('list_no_workspace'):
+                row.pop('workspace', None)
             rows.append(row)
         out({'sessions': rows, 'complete': True})
-    if sub == 'capture':
-        assert '--wait' in argv and '--key' in argv
-        s = ST['sessions'][argv[2]]
-        encoded = re.search(r'b64decode\("([A-Za-z0-9+/=]+)"\)', s['prompt'])[1]
-        marker = base64.b64decode(encoded).decode()
-        engine = CFG.get('capture_format_override', row_for(s, show=True)['engine'])
-        if CFG.get('capture_prompt_only'):
-            events = [{'type': 'item.started', 'item': {'type': 'command_execution', 'command': s['prompt'], 'aggregated_output': marker}}]
-        elif CFG.get('capture_assistant_only'):
-            events = [{'type': 'item.completed', 'item': {'type': 'agent_message', 'text': marker}}]
-        elif CFG.get('capture_result_only'):
-            events = [{'type': 'result', 'result': marker}]
-        elif engine == 'go':
-            events = [{'type': 'tool_use', 'part': {'type': 'tool', 'tool': 'bash', 'state': {'status': 'completed', 'output': marker + '\n'}}}]
-        elif engine == 'claude':
-            provider = '11111111-2222-4333-8444-555555555555'
-            events = [
-                {'type': 'assistant', 'session_id': provider, 'message': {'role': 'assistant', 'content': [
-                    {'type': 'tool_use', 'id': 'toolu_fixture_print', 'name': 'Bash', 'input': {'command': 'python3 synthetic_print.py'}}]}},
-                {'type': 'user', 'session_id': provider, 'message': {'role': 'user', 'content': [
-                    {'type': 'tool_result', 'tool_use_id': 'toolu_fixture_print', 'content': marker + '\n', 'is_error': False}]},
-                 'tool_use_result': {'stdout': marker + '\n', 'stderr': '', 'interrupted': False}},
-            ]
-        elif engine == 'antigravity':
-            step = {'conversation_id': '11111111-2222-4333-8444-555555555555', 'step_index': 7,
-                    'step_type': 'tool', 'tool_name': 'run_command'}
-            params = {'CommandLine': 'python3 synthetic_print.py'}
-            events = [
-                {'event': 'step_update', 'step_update': dict(step, state='ACTIVE', tool_info={'name': 'run_command', 'parameters': params})},
-                {'event': 'step_update', 'step_update': dict(step, state='DONE', tool_info={'name': 'run_command', 'parameters': params,
-                    'output': 'Created At: 2026-01-01T00:00:00+00:00\nCompleted At: 2026-01-01T00:00:01+00:00\n'
-                              'Command exited with code 0.\n\nCommand output:\n' + marker + '\n'})},
-            ]
-        else:
-            events = [{'type': 'item.completed', 'item': {'type': 'command_execution', 'aggregated_output': marker + '\n'}}]
-        out({'command_wait': {'state': 'pending' if CFG.get('capture_unacked') else 'acked',
-                              'ack': {'capture': '\n'.join(json.dumps(event) for event in events)}}})
+
     if sub == 'stop':
-        s = ST['sessions'][argv[2]]; s['stopped'] = True
+        s = ST['sessions'][args.id]
+        s['stopped'] = True
         ST['log'].append('stop:' + s['id'])
-        out({'id': s['id'], 'state': 'stopped'})
-    fail('unhandled hub command')
+        child_id = s.get('intake_id')
+        if child_id in ST['intakes']:
+            intake_row = ST['intakes'][child_id]
+            if isinstance(intake_row.get('dispatch'), dict) and intake_row['dispatch'].get('id') == s['id']:
+                intake_row['dispatch']['state'] = 'stopped'
+            if CFG.get('fresh_successor_after_first_scan') and intake_row.get('_injected_count', 0) < 2:
+                intake_row['_injected_count'] = intake_row.get('_injected_count', 0) + 1
+                dsid = str(uuid.UUID(int=7700 + len(ST['sessions'])))
+                ST['sessions'][dsid] = _make_descendant_session(intake_row, dsid)
+                seq = intake_row['events'][-1]['seq'] + 1
+                intake_row['events'].append({
+                    'seq': seq, 'actor_id': 'hub2-completion', 'kind': 'task_continuation_started',
+                    'at': 3000 + seq, 'body': {'previous_session_id': s['id'], 'session_id': dsid, 'depth': intake_row['_injected_count'], 'reason': 'late'},
+                })
+                intake_row['session_id'] = dsid
+                intake_row['dispatch'] = {'id': dsid, 'operation_id': dsid, 'attempt_operation_id': dsid + ':0', 'machine_id': 'hetzner-aplexer', 'epoch': 1, 'state': 'running'}
+                intake_row['updated_at'] += 1
+            elif not intake_row.get('_lineage_injected'):
+                intake_row['_lineage_injected'] = True
+                if CFG.get('continuation_descendant'):
+                    dsid = str(uuid.UUID(int=7100 + len(ST['sessions'])))
+                    ST['sessions'][dsid] = _make_descendant_session(intake_row, dsid)
+                    seq = intake_row['events'][-1]['seq'] + 1
+                    intake_row['events'].append({
+                        'seq': seq, 'actor_id': 'hub2-completion', 'kind': 'task_continuation_started',
+                        'at': 3000, 'body': {'previous_session_id': s['id'], 'session_id': dsid, 'depth': 1, 'reason': 'exit'},
+                    })
+                    intake_row['session_id'] = dsid
+                    intake_row['dispatch'] = {'id': dsid, 'operation_id': dsid, 'attempt_operation_id': dsid + ':0', 'machine_id': 'hetzner-aplexer', 'epoch': 1, 'state': 'running'}
+                    intake_row['updated_at'] += 1
+                elif CFG.get('verification_descendant'):
+                    dsid = str(uuid.UUID(int=7200 + len(ST['sessions'])))
+                    ST['sessions'][dsid] = _make_descendant_session(intake_row, dsid)
+                    seq = intake_row['events'][-1]['seq'] + 1
+                    intake_row['events'].append({
+                        'seq': seq, 'actor_id': 'hub2-verification', 'kind': 'task_verification_started',
+                        'at': 3000, 'body': {'original_session_id': s['id'], 'previous_session_id': s['id'], 'session_id': dsid, 'attempt': 1},
+                    })
+                    intake_row['session_id'] = dsid
+                    intake_row['dispatch'] = {'id': dsid, 'operation_id': dsid, 'attempt_operation_id': dsid + ':0', 'machine_id': 'hetzner-aplexer', 'epoch': 1, 'state': 'running'}
+                    intake_row['updated_at'] += 1
+                elif CFG.get('foreign_assignment'):
+                    intake_row['session_id'] = str(uuid.UUID(int=888888))
+                    intake_row['updated_at'] += 1
+                elif CFG.get('foreign_assigned_machine'):
+                    intake_row['assigned_machine_id'] = 'foreign-host'
+                    intake_row['updated_at'] += 1
+                elif CFG.get('pending_dispatch_state'):
+                    intake_row['dispatch'] = {
+                        'id': s['id'], 'state': 'offered', 'operation_id': 'unproven-other-operation',
+                        'epoch': 99, 'machine_id': 'hetzner-aplexer',
+                    }
+                    intake_row['updated_at'] += 1
+                elif CFG.get('history_seq_gap'):
+                    seq = intake_row['events'][-1]['seq'] + 2
+                    intake_row['events'].append({
+                        'seq': seq, 'actor_id': 'operator', 'kind': 'note', 'at': 3000, 'body': {'note': 'gap'},
+                    })
+                    intake_row['updated_at'] += 1
+                elif CFG.get('descendant_over_limit'):
+                    prev = s['id']
+                    for k in range(9):
+                        dsid = str(uuid.UUID(int=7500 + k))
+                        ST['sessions'][dsid] = _make_descendant_session(intake_row, dsid)
+                        seq = intake_row['events'][-1]['seq'] + 1
+                        intake_row['events'].append({
+                            'seq': seq, 'actor_id': 'hub2-completion', 'kind': 'task_continuation_started',
+                            'at': 3000 + k, 'body': {'previous_session_id': prev, 'session_id': dsid, 'depth': k + 1, 'reason': 'loop'},
+                        })
+                        prev = dsid
+                    intake_row['session_id'] = prev
+                    intake_row['dispatch'] = {'id': prev, 'operation_id': prev, 'attempt_operation_id': prev + ':0', 'machine_id': 'hetzner-aplexer', 'epoch': 1, 'state': 'running'}
+                    intake_row['updated_at'] += 1
+        out({'id': s['id'], 'state': 'stopped', 'stop_confirmed': not CFG.get('stop_not_confirmed')})
+
+    fail('unhandled sessions command: ' + sub)
+
+
+def hub(argv):
+    if argv[0] == 'intake':
+        _handle_intake(argv[1:])
+    elif argv[0] == 'sessions':
+        _handle_sessions(argv[1:])
+    fail('unhandled hub root command: ' + argv[0])
 
 
 def native(argv):
-    assert argv == ['list', '--json', '--running'], 'native capture/mutation forbidden'
-    rows = []
-    for s in ST['sessions'].values():
-        if not s['stopped'] or CFG.get('native_lingers'):
-            rows.append({'id': s['native_id'], 'state': 'running', 'workspace': s['workspace']})
-        elif CFG.get('a_list_includes_exited'):
-            rows.append({'id': s['native_id'], 'state': 'exited'})
-    out(rows)
+    if argv == ['list', '--json', '--running']:
+        rows = []
+        for s in ST['sessions'].values():
+            if not s['native_id']:
+                continue
+            if CFG.get('natural_exit_after_proof') and ST['log'].count('sessions:list') >= 1 and not s['stopped']:
+                continue
+            if not s['stopped'] or CFG.get('native_lingers'):
+                rows.append({'id': s['native_id'], 'state': 'running', 'workspace': s['workspace']})
+            elif CFG.get('a_list_includes_exited'):
+                rows.append({'id': s['native_id'], 'state': 'exited'})
+        out(rows)
+    if len(argv) == 4 and argv[0] == 'capture' and argv[2:] == ['--screen', '--plain']:
+        nid = argv[1]
+        s = next((x for x in ST['sessions'].values() if x['native_id'] == nid), None)
+        if not s:
+            fail('native session not found')
+        expected_line = 'AC10_WORK_V2 %s %s %s %s 5050' % (
+            s.get('run_id', ''), s.get('sample', ''), s.get('proof_digest', ''), s.get('proof_head', ''),
+        )
+        if CFG.get('trust_menu_rendered'):
+            save()
+            print('Do you trust the contents of this project?\n> Yes, I trust this folder')
+            sys.exit(0)
+        if CFG.get('capture_prompt_only'):
+            save()
+            print('> Phase 7 interactive native-pane probe\n' + expected_line)
+            sys.exit(0)
+        if CFG.get('claude_waiting_only'):
+            save()
+            print('● Bash(python3 work.py)\n  ⎿  Waiting…\n' + expected_line)
+            sys.exit(0)
+        if CFG.get('claude_prose_only') or CFG.get('capture_assistant_only'):
+            save()
+            print('● Done! Here is the readiness line:\n' + expected_line + '\n❯ ')
+            sys.exit(0)
+        if CFG.get('capture_result_only'):
+            save()
+            print(json.dumps({'type': 'result', 'result': expected_line}))
+            sys.exit(0)
+        if CFG.get('hydrogen_prose_command_exited'):
+            save()
+            print('  Command exited with code 0.\n  ' + expected_line)
+            sys.exit(0)
+        if CFG.get('claude_unterminated_echo'):
+            save()
+            print('● Bash(python3 -c\n' + expected_line + '\n')
+            sys.exit(0)
+        if CFG.get('hydrogen_unrelated_action'):
+            save()
+            print('● Ran (git status) (ctrl+o to expand)\n\nAssistant final summary:\n' + expected_line + '\n')
+            sys.exit(0)
+        engine = CFG.get('capture_format_override', row_for(s, show=True)['engine'])
+        save()
+        if engine == 'claude':
+            print('● Bash(python3 - <<\'PY\' ...)\n  ⎿  ' + expected_line + '\n\n● Done.\n❯ ')
+        elif engine == 'antigravity':
+            print('● Ran (python3 - <<\'PY\' ...) (ctrl+o to expand)\n\n  ' + expected_line + '\n> ')
+        else:
+            print(expected_line)
+        sys.exit(0)
+    fail('forbidden or unknown native command: ' + repr(argv))
+
+
+def fake_git(argv):
+    assert argv[0] == '-C'
+    if argv[2:4] == ['rev-parse', '--verify']:
+        print(CFG.get('git_head', 'b' * 40))
+        sys.exit(0)
+    if argv[2:4] == ['status', '--porcelain=v1']:
+        sys.stdout.buffer.write(CFG.get('git_status_raw', '').encode('utf-8'))
+        sys.exit(0)
+    fail('unexpected git command: ' + repr(argv))
 
 
 def alerts():
-    # Synthetic occurrence source; not a claim that the production active-alert
-    # API supports this contract. Transient/resolved and deduplicated events each
-    # increment the durable occurrence total even though active IDs do not change.
     if CFG.get('alerts_broken'):
-        print('not json'); sys.exit(0)
+        print('not json')
+        sys.exit(0)
     if CFG.get('active_ids_only'):
         out({'alerts': [{'id': 'old'}]})
     after = bool(ST['sessions'])
     count = CFG.get('alert_count_before', 40)
     if after and any(CFG.get(k) for k in ('alert_during', 'alert_transient', 'alert_dedup')):
         count += 1
-    if after and CFG.get('alert_reset'): count -= 1
+    if after and CFG.get('alert_reset'):
+        count -= 1
     generation = 'synthetic-test-epoch'
-    if after and CFG.get('alert_generation_change'): generation += '-new'
+    if after and CFG.get('alert_generation_change'):
+        generation += '-new'
     observed = int(time.time() * 1000) - (120000 if CFG.get('alert_stale') or after and CFG.get('alert_post_stale') else 0)
     if after and CFG.get('alert_cached_post'):
         observed = ST['watermarks'][0]['observed_at_ms'] + 1
     watermark = dict(kind='dev_alert_occurrences_v1', recipient='dev@dtcdev.click', generation=generation,
                      count=count, observed_at_ms=observed)
-    if CFG.get('alert_missing_metadata'): watermark.pop('generation')
-    if CFG.get('alert_wrong_recipient'): watermark['recipient'] = 'someone-else@example.test'
+    if CFG.get('alert_missing_metadata'):
+        watermark.pop('generation')
+    if CFG.get('alert_wrong_recipient'):
+        watermark['recipient'] = 'someone-else@example.test'
     ST.setdefault('watermarks', []).append(watermark)
     out(watermark)
 
 
 name = Path(sys.argv[0]).name
-if name == 'hub': hub(sys.argv[1:])
-elif name == 'a': native(sys.argv[1:])
-else: alerts()
+if name == 'hub':
+    hub(sys.argv[1:])
+elif name == 'a':
+    native(sys.argv[1:])
+elif name == 'git':
+    fake_git(sys.argv[1:])
+else:
+    alerts()

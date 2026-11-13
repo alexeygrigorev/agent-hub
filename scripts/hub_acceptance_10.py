@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
-"""Phase 7 final acceptance: ten consecutive model-less Hub starts.
+"""Phase 7 final acceptance: ten consecutive model-less interactive native-pane starts.
 
-Fails closed: any missing evidence is a failure, never a skip. Only sessions
-this run started are ever stopped. The live run needs ``--live`` and
-HUB_ACCEPTANCE_READY=1 (orchestrator readiness); without them the script
-exits 2 before touching Hub. All I/O goes through an injectable ``Runner`` so
-the offline tests never reach the network.
+Fails closed: any missing evidence is a failure, never a skip. Only owned
+sessions and proven automatic descendants of this run's keyed child intakes are
+ever stopped. The live run needs ``--live`` and HUB_ACCEPTANCE_READY=1
+(orchestrator readiness); without them the script exits 2 before touching Hub.
+All I/O goes through an injectable ``Runner`` so offline tests never reach the
+network.
 """
 import argparse
 import base64
 import datetime
-import json
 import hashlib
-import stat
-import os
+import json
 import math
+import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -27,30 +29,102 @@ COUNT = 10
 RUNNING_BUDGET_S = 150
 STOP_BUDGET_S = 60
 CAPTURE_BUDGET_S = 90
+CREATE_BUDGET_S = 60
 MIN_MODELS = 3
 MAX_LUNA = 3
+MAX_DESCENDANTS = 8
+MAX_HISTORY_PAGES = 16
+HISTORY_PAGE_LIMIT = 64
+MAX_HISTORY_EVENTS = 1024
+MAX_HISTORY_BYTES = 1024 * 1024
 HOST = 'hetzner-aplexer'
+PROJECT = 'alexeygrigorev/agent-hub'
 EVIDENCE_GREEN = ('success', 'green', 'passed', 'pass')
 
+EVIDENCE_LIMIT = 128000
+RECEIPT_LIMIT = 2 * 1024 * 1024
+ARTIFACT_LIMIT = 8192
+CAPTURE_LIMIT = 262144
+MANIFEST_LIMIT = 512 * 1024
+
+NATIVE_EVIDENCE_KIND = 'phase7_native_operator_validated_evidence_v1'
+WORK_SCHEMA = 'phase7_native_work_v2'
+WORK_DIGEST_DOMAIN = b'HUB_PHASE7_NATIVE_WORK_V2\x00'
+EXPECTED_CALCULATION = 5050
+
+NATIVE_CAPTURE_FORMATS = {
+    'claude': 'claude_native_pane_v1',
+    'antigravity': 'hydrogen_native_pane_v1',
+}
+NATIVE_PROOF_CLASSES = {
+    'claude': 'native_bash_output_plus_artifact_v2',
+    'antigravity': 'native_action_plus_artifact_v2',
+}
+NATIVE_CAPTURE_COMMAND = 'a capture <native_id> --screen --plain'
+NATIVE_CAPTURE_KEYS = {
+    'engine', 'machine_id', 'mode', 'format', 'proof_class',
+    'capture_command', 'artifact_schema', 'host_release_sha',
+    'provider_version', 'profile_set_sha256', 'reference', 'sha256', 'path',
+}
+
+WORK_KEYS = (
+    'schema', 'run_id', 'sample', 'parent_intake_id', 'child_intake_id',
+    'session_id', 'native_id', 'project', 'machine_id', 'workspace',
+    'head', 'tracked_status_sha256', 'tracked_status_entries', 'calculation',
+)
+RESULT_KEYS = WORK_KEYS + ('proof_digest',)
+
+# Legacy stream-parser constants retained for legacy parser unit tests only.
+CAPTURE_FORMATS = {
+    'codex': 'codex_jsonl_v1', 'zai': 'codex_jsonl_v1', 'go': 'opencode_json_v1',
+    'claude': 'claude_stream_json_v1', 'antigravity': 'argon_stream_json_v1',
+}
+CAPTURE_KEYS = {
+    'engine', 'machine_id', 'format', 'host_release_sha', 'provider_version',
+    'profile_set_sha256', 'reference', 'sha256', 'path',
+}
+CLAUDE_EMPTY_BASH_PLACEHOLDER = '(Bash completed with no output)'
 
 
 class Runner:
-    """Executes `hub`/`a`/alert-sample commands; tests use fake binaries on PATH."""
+    """Executes `hub`/`a`/`git`/alert-sample commands; tests use fake binaries on PATH."""
 
-    def __init__(self, hub='hub', a='a', alerts_cmd=None):
-        self.bins = {'hub': [hub], 'a': [a], 'alerts': shlex.split(alerts_cmd) if alerts_cmd else None}
+    def __init__(self, hub='hub', a='a', git='git', alerts_cmd=None):
+        self.bins = {
+            'hub': [hub],
+            'a': [a],
+            'git': [git],
+            'alerts': shlex.split(alerts_cmd) if alerts_cmd else None,
+        }
 
     def run(self, tool, args, timeout=300):
         base = self.bins.get(tool)
         if not base:
             return 127, '', 'tool %s not configured' % tool
         try:
-            proc = subprocess.run([*base, *(args if tool != 'alerts' else [])], capture_output=True, text=True,
-                                  timeout=timeout)
+            proc = subprocess.run(
+                [*base, *(args if tool != 'alerts' else [])],
+                capture_output=True, text=True, timeout=timeout,
+            )
         except subprocess.TimeoutExpired:
             return 124, '', 'timeout after %ss' % timeout
         except OSError as exc:
             return 127, '', str(exc)
+        return proc.returncode, proc.stdout, proc.stderr
+
+    def run_bytes(self, tool, args, timeout=60):
+        base = self.bins.get(tool)
+        if not base:
+            return 127, b'', b'tool not configured'
+        try:
+            proc = subprocess.run(
+                [*base, *(args if tool != 'alerts' else [])],
+                capture_output=True, timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return 124, b'', ('timeout after %ss' % timeout).encode()
+        except OSError as exc:
+            return 127, b'', str(exc).encode()
         return proc.returncode, proc.stdout, proc.stderr
 
     def json(self, tool, args, timeout=300):
@@ -79,10 +153,6 @@ def is_luna(*parts):
     return any('luna' in str(p).lower() for p in parts)
 
 
-EVIDENCE_LIMIT = 128000
-RECEIPT_LIMIT = 2 * 1024 * 1024
-
-
 def unique_object(pairs):
     value = {}
     for key, item in pairs:
@@ -90,6 +160,11 @@ def unique_object(pairs):
             raise ValueError('duplicate JSON field')
         value[key] = item
     return value
+
+
+def canonical_json_bytes(obj):
+    """Canonical UTF-8 JSON per V2 spec; rejects lone surrogates and non-finite floats."""
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False).encode('utf-8')
 
 
 def bounded_file(path, limit):
@@ -109,23 +184,165 @@ def bounded_file(path, limit):
             os.close(fd)
 
 
+def atomic_write_private(path, data, mode=0o600):
+    path = Path(path)
+    tmp = None
+    try:
+        fd, tmp_name = tempfile.mkstemp(prefix=path.name + '.', dir=str(path.parent))
+        tmp = Path(tmp_name)
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+
+
+def exclusive_write_private(path, data, mode=0o600):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            fd = None
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
 def evidence_text(value, bound):
-    return (isinstance(value, str) and bool(value.strip()) and len(value.encode()) <= bound
+    return (isinstance(value, str) and bool(value.strip()) and len(value.encode('utf-8')) <= bound
             and not any(ord(char) < 32 or ord(char) == 127 for char in value))
 
 
+def valid_native_id(value):
+    return isinstance(value, str) and re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', value) is not None
+
+
+def valid_session_id(value):
+    return isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}', value) is not None
+
+
+def valid_hex40(value):
+    return isinstance(value, str) and re.fullmatch(r'[0-9a-f]{40}', value) is not None
+
+
+def valid_hex64(value):
+    return isinstance(value, str) and re.fullmatch(r'[0-9a-f]{64}', value) is not None
+
+
+def _validate_receipt_files(receipts, base_dir, problems):
+    for name, receipt in receipts.items():
+        if 'path' not in receipt:
+            continue
+        if not evidence_text(receipt['path'], 4096):
+            problems.append('%s local receipt path invalid' % name)
+            continue
+        source = Path(receipt['path'])
+        if not source.is_absolute():
+            source = base_dir / source
+        try:
+            if hashlib.sha256(bounded_file(source, RECEIPT_LIMIT)).hexdigest() != receipt['sha256']:
+                problems.append('%s local receipt hash mismatch' % name)
+        except (OSError, ValueError):
+            problems.append('%s local receipt unreadable or invalid' % name)
+
+
+def _validate_evidence_common(ev, commit, expected_kind):
+    problems = []
+    if not isinstance(ev, dict):
+        return ['evidence is not an object'], None, None
+    if not valid_hex40(commit):
+        problems.append('deployed commit unknown (--commit)')
+    for key in ('canary_commit', 'ci_e2e_commit'):
+        if not ev.get(key):
+            problems.append('%s missing' % key)
+        elif commit and ev[key] != commit:
+            problems.append('%s %s != %s' % (key, ev[key], commit))
+    for key in ('canary', 'ci_e2e'):
+        if str(ev.get(key, '')).lower() not in EVIDENCE_GREEN:
+            problems.append('%s not green (%r)' % (key, ev.get(key)))
+    validation = ev.get('operator_validation')
+    if (ev.get('kind') != expected_kind or not isinstance(validation, dict)
+            or set(validation) != {'actor', 'target_commit', 'receipts', 'capture_transports'}
+            or not evidence_text(validation.get('actor'), 120) or validation.get('target_commit') != commit
+            or not isinstance(validation.get('receipts'), dict)
+            or set(validation['receipts']) != {'deployment', 'canary', 'ci_e2e'}):
+        problems.append('operator-validated same-commit receipt references required')
+        return problems, None, None
+    return problems, validation.get('target_commit'), validation
+
+
+def native_transport_ok(engine, record, host_sha):
+    """Root attests interactive native-pane transport, proof class, and capture command."""
+    return (engine in NATIVE_CAPTURE_FORMATS and isinstance(record, dict)
+            and not set(record) - NATIVE_CAPTURE_KEYS
+            and NATIVE_CAPTURE_KEYS - {'path'} <= set(record)
+            and record.get('engine') == engine
+            and record.get('machine_id') == HOST
+            and record.get('mode') == 'interactive'
+            and record.get('format') == NATIVE_CAPTURE_FORMATS[engine]
+            and record.get('proof_class') == NATIVE_PROOF_CLASSES[engine]
+            and record.get('capture_command') == NATIVE_CAPTURE_COMMAND
+            and record.get('artifact_schema') == WORK_SCHEMA
+            and valid_hex40(host_sha)
+            and record.get('host_release_sha') == host_sha
+            and evidence_text(record.get('provider_version'), 120)
+            and evidence_text(record.get('reference'), 2048)
+            and valid_hex64(record.get('profile_set_sha256'))
+            and valid_hex64(record.get('sha256')))
+
+
+def validate_native_evidence(ev, path, commit):
+    """Validate Root-supplied interactive native-pane evidence bundle (refuses headless)."""
+    problems, host_sha, validation = _validate_evidence_common(ev, commit, NATIVE_EVIDENCE_KIND)
+    if validation is None:
+        return problems
+    transports = validation.get('capture_transports')
+    if (not valid_hex40(host_sha) or not isinstance(transports, dict)
+            or not 1 <= len(transports) <= len(NATIVE_CAPTURE_FORMATS)
+            or any(not native_transport_ok(engine, record, host_sha) for engine, record in transports.items())):
+        problems.append('verified interactive native-pane capture transport records required')
+        return problems
+    receipts = dict(validation['receipts'])
+    for name, receipt in receipts.items():
+        if (not isinstance(receipt, dict) or set(receipt) - {'commit', 'reference', 'sha256', 'path'}
+                or not {'reference', 'sha256'} <= set(receipt)
+                or receipt.get('commit') != commit or not evidence_text(receipt.get('reference'), 2048)
+                or not valid_hex64(receipt.get('sha256'))):
+            problems.append('%s receipt identity invalid or commit mismatch' % name)
+    for engine, record in transports.items():
+        if not native_transport_ok(engine, record, host_sha):
+            problems.append('capture_%s receipt identity invalid or commit mismatch' % engine)
+    all_receipts = dict(receipts)
+    all_receipts.update({'capture_' + engine: record for engine, record in transports.items()})
+    _validate_receipt_files(all_receipts, Path(path).parent, problems)
+    return problems
+
+
+def checked_native_evidence(path, commit):
+    """Validate and hash the SAME bounded byte buffer for interactive native-pane evidence."""
+    if not path:
+        return ['evidence file missing (--evidence)'], None, {}
+    try:
+        raw = bounded_file(path, EVIDENCE_LIMIT)
+        ev = json.loads(raw, object_pairs_hook=unique_object)
+    except (OSError, ValueError, UnicodeError, TypeError):
+        return ['evidence unreadable or invalid'], None, {}
+    problems = validate_native_evidence(ev, path, commit)
+    return problems, hashlib.sha256(raw).hexdigest(), (ev['operator_validation']['capture_transports'] if not problems else {})
+
+
+# Legacy headless evidence validators (retained for ParserTests compatibility only; never used in formal run).
 def check_evidence(path, commit):
-    """Compatibility view for callers interested only in validation errors."""
     return checked_evidence(path, commit)[0]
 
 
 def checked_evidence(path, commit):
-    """Validate and hash the SAME bounded byte buffer, never reopen for its pin.
-
-    Remote authenticity remains Root's responsibility. A concurrent replacement
-    cannot become the baseline unless those exact replacement bytes were read
-    and validated together on this invocation.
-    """
     if not path:
         return ['evidence file missing (--evidence)'], None, {}
     try:
@@ -138,32 +355,12 @@ def checked_evidence(path, commit):
 
 
 def validate_evidence(ev, path, commit):
-    """Check the parsed Root-supplied receipt pins, not remote authenticity."""
-    problems = []
-    if not isinstance(ev, dict):
-        return ['evidence is not an object']
-    if not isinstance(commit, str) or not re.fullmatch(r'[0-9a-f]{40}', commit):
-        problems.append('deployed commit unknown (--commit)')
-    for key in ('canary_commit', 'ci_e2e_commit'):
-        if not ev.get(key):
-            problems.append('%s missing' % key)
-        elif commit and ev[key] != commit:
-            problems.append('%s %s != %s' % (key, ev[key], commit))
-    for key in ('canary', 'ci_e2e'):
-        if str(ev.get(key, '')).lower() not in EVIDENCE_GREEN:
-            problems.append('%s not green (%r)' % (key, ev.get(key)))
-    validation = ev.get('operator_validation')
-    if (ev.get('kind') != 'phase7_operator_validated_evidence_v1' or not isinstance(validation, dict)
-            or set(validation) != {'actor', 'target_commit', 'receipts', 'capture_transports'}
-            or not evidence_text(validation.get('actor'), 120) or validation.get('target_commit') != commit
-            or not isinstance(validation.get('receipts'), dict)
-            or set(validation['receipts']) != {'deployment', 'canary', 'ci_e2e'}):
-        problems.append('operator-validated same-commit receipt references required')
+    problems, host_sha, validation = _validate_evidence_common(ev, commit, 'phase7_operator_validated_evidence_v1')
+    if validation is None:
         return problems
-    host_sha = validation.get('target_commit')
     transports = validation.get('capture_transports')
-    if (not isinstance(host_sha, str) or not re.fullmatch(r'[0-9a-f]{40}', host_sha)
-            or not isinstance(transports, dict) or not 1 <= len(transports) <= len(CAPTURE_FORMATS)
+    if (not valid_hex40(host_sha) or not isinstance(transports, dict)
+            or not 1 <= len(transports) <= len(CAPTURE_FORMATS)
             or any(not capture_transport_ok(engine, record, host_sha) for engine, record in transports.items())):
         problems.append('verified engine/host/stream capture transport records required')
         return problems
@@ -173,100 +370,27 @@ def validate_evidence(ev, path, commit):
         if (not isinstance(receipt, dict) or set(receipt) - ({'commit', 'reference', 'sha256', 'path'} if not name.startswith('capture_') else CAPTURE_KEYS)
                 or not {'reference', 'sha256'} <= set(receipt)
                 or not name.startswith('capture_') and receipt.get('commit') != commit or not evidence_text(receipt.get('reference'), 2048)
-                or not isinstance(receipt.get('sha256'), str) or not re.fullmatch(r'[0-9a-f]{64}', receipt['sha256'])):
+                or not valid_hex64(receipt.get('sha256'))):
             problems.append('%s receipt identity invalid or commit mismatch' % name)
-            continue
-        if 'path' in receipt:
-            if not evidence_text(receipt['path'], 4096):
-                problems.append('%s local receipt path invalid' % name)
-                continue
-            source = Path(receipt['path'])
-            if not source.is_absolute():
-                source = Path(path).parent / source
-            try:
-                if hashlib.sha256(bounded_file(source, RECEIPT_LIMIT)).hexdigest() != receipt['sha256']:
-                    problems.append('%s local receipt hash mismatch' % name)
-            except (OSError, ValueError):
-                problems.append('%s local receipt unreadable or invalid' % name)
+    _validate_receipt_files(receipts, Path(path).parent, problems)
     return problems
 
 
-ALERT_SAMPLE_MAX_AGE_MS = 60000
-ALERT_SAMPLE_FUTURE_SKEW_MS = 5000
-
-
-def sample_alerts(r, wall_clock=time.time):
-    """Require a durable cumulative occurrence source, including resolved and deduplicated alerts.
-
-    This is deliberately not the active-alert listing API. The operator must
-    provide a verified durable source implementing this exact versioned contract.
-    """
-    data = r.json('alerts', [], 60)
-    if (not isinstance(data, dict) or data.get('kind') != 'dev_alert_occurrences_v1'
-            or data.get('recipient') != 'dev@dtcdev.click'):
-        raise RuntimeError('durable dev@ occurrence watermark required (active IDs are insufficient)')
-    generation, count, observed = data.get('generation'), data.get('count'), data.get('observed_at_ms')
-    if (not isinstance(generation, str) or not generation.strip() or len(generation.encode()) > 200
-            or type(count) is not int or count < 0 or type(observed) is not int):
-        raise RuntimeError('alert watermark metadata invalid')
-    age = wall_clock() * 1000 - observed
-    if age > ALERT_SAMPLE_MAX_AGE_MS or age < -ALERT_SAMPLE_FUTURE_SKEW_MS:
-        raise RuntimeError('alert watermark stale or from the future')
-    return {key: data[key] for key in ('kind', 'recipient', 'generation', 'count', 'observed_at_ms')}
-
-
-def alert_changes(before, after):
-    if after['generation'] != before['generation']:
-        return ['alert watermark generation changed']
-    if after['count'] < before['count'] or after['observed_at_ms'] < before['observed_at_ms']:
-        return ['alert watermark reset or observation time regressed']
-    if after['count'] > before['count']:
-        return ['dev alert occurrences during run: %d' % (after['count'] - before['count'])]
-    return []
-
-
-def make_probe():
-    marker = 'ACCEPTANCE-OK:' + uuid.uuid4().hex
-    encoded = base64.b64encode(marker.encode()).decode()
-    prompt = ('Use two sequential shell tool calls. First run a separate foreground shell command '
-              '`python3 -c \'import base64; print(base64.b64decode("%s").decode())\'` as one output line and let it '
-              'finish. Immediately after the marker print finishes, run a separate foreground `sleep 60` command '
-              'using the existing shell tool with a supported timeout sufficient for the 60-second hold so the '
-              'orchestrator can observe and stop this session before any final prose or completion bookkeeping. '
-              'Do not chain the marker print with the hold in one command, do not use a background flag, do not '
-              'include the marker or nonce in the hold command, do not echo proof or emit waiting prose, and do not '
-              'search for or call any monitor, task-output, or status tools or poll in a loop. Apart from mandatory '
-              'Hub first-action/completion evidence files if required by the session wrapper, do not create or edit '
-              'other files, start another agent, or exit early.' % encoded)
-    return prompt, marker
-
-
-CAPTURE_FORMATS = {'codex': 'codex_jsonl_v1', 'zai': 'codex_jsonl_v1', 'go': 'opencode_json_v1',
-                   'claude': 'claude_stream_json_v1', 'antigravity': 'argon_stream_json_v1'}
-CAPTURE_KEYS = {'engine', 'machine_id', 'format', 'host_release_sha', 'provider_version',
-                'profile_set_sha256', 'reference', 'sha256', 'path'}
-
-
 def capture_transport_ok(engine, record, host_sha):
-    """Root attests the effective argv/protocol, never inferred from output text."""
     return (engine in CAPTURE_FORMATS and isinstance(record, dict)
             and not set(record) - CAPTURE_KEYS and CAPTURE_KEYS - {'path'} <= set(record)
             and record.get('engine') == engine and record.get('machine_id') == HOST
             and record.get('format') == CAPTURE_FORMATS[engine]
-            and isinstance(host_sha, str) and re.fullmatch(r'[0-9a-f]{40}', host_sha) is not None
+            and valid_hex40(host_sha)
             and record.get('host_release_sha') == host_sha
             and evidence_text(record.get('provider_version'), 120)
             and evidence_text(record.get('reference'), 2048)
-            and all(isinstance(record.get(key), str) and re.fullmatch(r'[0-9a-f]{64}', record[key])
-                    for key in ('profile_set_sha256', 'sha256')))
-
-
-# Claude Code 2.1.322 native content for a Bash call with empty stdout/stderr.
-CLAUDE_EMPTY_BASH_PLACEHOLDER = '(Bash completed with no output)'
+            and valid_hex64(record.get('profile_set_sha256'))
+            and valid_hex64(record.get('sha256')))
 
 
 def paired_stream_output_ok(captured, expected, engine):
-    """Complete provider frames from ONE capture only; never repair clipped JSON."""
+    """Legacy stream-parser coverage; never authorized for formal native-pane acceptance."""
     if len(captured.encode()) > 65536:
         return False
     events = []
@@ -274,7 +398,7 @@ def paired_stream_output_ok(captured, expected, engine):
         try:
             event = json.loads(line, object_pairs_hook=unique_object)
         except (ValueError, TypeError):
-            if index == 0:  # A bounded tail may start inside an earlier frame.
+            if index == 0:
                 continue
             return False
         if not isinstance(event, dict):
@@ -322,7 +446,7 @@ def paired_stream_output_ok(captured, expected, engine):
                     if not provider_id(identity) or identity in results:
                         return False
                     results.add(identity)
-                    if identity not in uses:  # An orphan alone can never prove output.
+                    if identity not in uses:
                         continue
                     use_session, is_background = uses[identity]
                     detail = event.get('tool_use_result')
@@ -340,7 +464,6 @@ def paired_stream_output_ok(captured, expected, engine):
                     if detail.get('backgroundTaskId') is not None:
                         return False
                     if block['content'] == CLAUDE_EMPTY_BASH_PLACEHOLDER and detail.get('stdout') == '':
-                        # NONPROOF: the exact native empty-result pair is classified only.
                         if detail.get('isImage') is not False or detail.get('noOutputExpected') is not False:
                             return False
                         continue
@@ -369,7 +492,6 @@ def paired_stream_output_ok(captured, expected, engine):
                         or not isinstance(params['CommandLine'], str) or not params['CommandLine']):
                     return False
             elif tool == 'read_file':
-                # NONPROOF class: classified only; its output never sets proven.
                 if (not set(params) <= {'Path', 'StartLine', 'EndLine'}
                         or not isinstance(params.get('Path'), str) or not params['Path']
                         or '\0' in params['Path']
@@ -416,8 +538,6 @@ def paired_stream_output_ok(captured, expected, engine):
                     return False
                 if tool != 'run_command' or identity not in uses:
                     continue
-                # Only the native wrapper's anchored zero status counts. A fake
-                # zero status embedded inside command output cannot override it.
                 match = re.fullmatch(r'Created At: ([^\n]+)\nCompleted At: ([^\n]+)\n'
                                      r'Command exited with code 0\.\n\nCommand output:\n([\s\S]*)', info['output'])
                 if not match:
@@ -435,15 +555,10 @@ def paired_stream_output_ok(captured, expected, engine):
 
 
 def probe_output_ok(captured, prompt, expected, engine=None, transport=None):
-    """Parse only the Root-verified engine's stream; plaintext JSON is not proof.
-
-    Claude/Argon require complete matching provider pairs, not isolated result JSON.
-    The caller supplies a record extracted from the same validated evidence bytes.
-    """
+    """Legacy stream-parser coverage; never authorized for formal native-pane acceptance."""
     if (not capture_transport_ok(engine, transport, (transport.get('host_release_sha') if isinstance(transport, dict) else None))
             or expected in prompt or not isinstance(captured, str)):
         return False
-
     if engine in ('claude', 'antigravity'):
         return paired_stream_output_ok(captured, expected, engine)
 
@@ -473,14 +588,330 @@ def probe_output_ok(captured, prompt, expected, engine=None, transport=None):
     return False
 
 
+# --- Alerts ---
+ALERT_SAMPLE_MAX_AGE_MS = 60000
+ALERT_SAMPLE_FUTURE_SKEW_MS = 5000
+
+
+def sample_alerts(r, wall_clock=time.time):
+    data = r.json('alerts', [], 60)
+    if (not isinstance(data, dict) or data.get('kind') != 'dev_alert_occurrences_v1'
+            or data.get('recipient') != 'dev@dtcdev.click'):
+        raise RuntimeError('durable dev@ occurrence watermark required (active IDs are insufficient)')
+    generation, count, observed = data.get('generation'), data.get('count'), data.get('observed_at_ms')
+    if (not isinstance(generation, str) or not generation.strip() or len(generation.encode()) > 200
+            or type(count) is not int or count < 0 or type(observed) is not int):
+        raise RuntimeError('alert watermark metadata invalid')
+    age = wall_clock() * 1000 - observed
+    if age > ALERT_SAMPLE_MAX_AGE_MS or age < -ALERT_SAMPLE_FUTURE_SKEW_MS:
+        raise RuntimeError('alert watermark stale or from the future')
+    return {key: data[key] for key in ('kind', 'recipient', 'generation', 'count', 'observed_at_ms')}
+
+
+def alert_changes(before, after):
+    if after['generation'] != before['generation']:
+        return ['alert watermark generation changed']
+    if after['count'] < before['count'] or after['observed_at_ms'] < before['observed_at_ms']:
+        return ['alert watermark reset or observation time regressed']
+    if after['count'] > before['count']:
+        return ['dev alert occurrences during run: %d' % (after['count'] - before['count'])]
+    return []
+
+
+# --- V2 Challenge, Git, Work Artifact, and Native Pane Recognition ---
+def parse_porcelain_z_count(status_raw):
+    """Count complete records in `git status --porcelain=v1 -z --untracked-files=no`."""
+    if not isinstance(status_raw, (bytes, bytearray)):
+        raise ValueError('status_raw must be bytes')
+    raw = bytes(status_raw)
+    if not raw:
+        return 0
+    if not raw.endswith(b'\x00'):
+        raise ValueError('malformed porcelain -z output (missing trailing NUL)')
+    tokens = raw[:-1].split(b'\x00')
+    idx, count = 0, 0
+    while idx < len(tokens):
+        entry = tokens[idx]
+        if len(entry) < 4 or entry[2:3] != b' ' or not entry[3:]:
+            raise ValueError('malformed porcelain -z entry')
+        xy = entry[:2]
+        idx += 1
+        if ord('R') in xy or ord('C') in xy:
+            if idx >= len(tokens) or not tokens[idx]:
+                raise ValueError('malformed porcelain -z rename/copy record')
+            idx += 1
+        count += 1
+    return count
+
+
+def compute_proof_digest(challenge32, work_obj):
+    if not isinstance(challenge32, (bytes, bytearray)) or len(challenge32) != 32:
+        raise ValueError('challenge must be exactly 32 bytes')
+    return hashlib.sha256(
+        WORK_DIGEST_DOMAIN + bytes(challenge32) + b'\x00' + canonical_json_bytes(work_obj)
+    ).hexdigest()
+
+
+def work_rel_path(run_id, sample):
+    return Path('.local') / 'acceptance-native' / run_id / str(sample) / 'result.json'
+
+
+def validate_no_symlink_ancestors(base_dir, rel_path):
+    """Ensure base_dir and every component up to rel_path exist without symlinks."""
+    base = Path(base_dir)
+    if not base.is_absolute():
+        raise ValueError('workspace must be absolute')
+    st = os.lstat(base)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        raise ValueError('workspace is symlink or not a directory')
+    cur = base
+    for part in Path(rel_path).parts:
+        cur = cur / part
+        st = os.lstat(cur)
+        if stat.S_ISLNK(st.st_mode):
+            raise ValueError('symlink component in artifact path: %s' % cur)
+
+
+def observe_git_state(r, workspace, timeout=30):
+    rc, head_out, head_err = r.run('git', ['-C', workspace, 'rev-parse', '--verify', 'HEAD'], timeout)
+    if rc != 0:
+        raise RuntimeError('git rev-parse HEAD failed: %s' % (head_err or head_out).strip()[:200])
+    head = head_out.strip()
+    if not valid_hex40(head):
+        raise RuntimeError('git rev-parse HEAD invalid: %r' % head)
+    rc, st_out, st_err = r.run_bytes('git', ['-C', workspace, 'status', '--porcelain=v1', '-z', '--untracked-files=no'], timeout)
+    if rc != 0:
+        raise RuntimeError('git status failed: %s' % st_err.decode('utf-8', 'replace').strip()[:200])
+    entries = parse_porcelain_z_count(st_out)
+    status_sha = hashlib.sha256(st_out).hexdigest()
+    return head, status_sha, entries
+
+
+def verify_work_artifact(r, actual_workspace, run_id, sample, parent_intake_id, child_intake_id,
+                         session_id, native_id, challenge32):
+    """Independently verify result.json bytes, schema, identities, Git state, and challenge digest."""
+    rel = work_rel_path(run_id, sample)
+    validate_no_symlink_ancestors(actual_workspace, rel)
+    result_path = Path(actual_workspace) / rel
+    raw_bytes = bounded_file(result_path, ARTIFACT_LIMIT)
+    mtime_ns = os.lstat(result_path).st_mtime_ns
+    parsed = json.loads(raw_bytes.decode('utf-8'), object_pairs_hook=unique_object)
+    if not isinstance(parsed, dict) or set(parsed) != set(RESULT_KEYS):
+        raise ValueError('result.json keys do not match exact V2 schema')
+    for int_key in ('sample', 'tracked_status_entries', 'calculation'):
+        if type(parsed.get(int_key)) is not int:
+            raise ValueError('%s must be exact int' % int_key)
+    head, status_sha, entries = observe_git_state(r, actual_workspace)
+    expected_work = {
+        'schema': WORK_SCHEMA,
+        'run_id': run_id,
+        'sample': sample,
+        'parent_intake_id': parent_intake_id,
+        'child_intake_id': child_intake_id,
+        'session_id': session_id,
+        'native_id': native_id,
+        'project': PROJECT,
+        'machine_id': HOST,
+        'workspace': actual_workspace,
+        'head': head,
+        'tracked_status_sha256': status_sha,
+        'tracked_status_entries': entries,
+        'calculation': EXPECTED_CALCULATION,
+    }
+    expected_digest = compute_proof_digest(challenge32, expected_work)
+    expected_result = dict(expected_work, proof_digest=expected_digest)
+    expected_bytes = canonical_json_bytes(expected_result) + b'\n'
+    if raw_bytes != expected_bytes:
+        raise ValueError('result.json does not match exact canonical V2 serialization or expected fields')
+    return {
+        'artifact_sha256': hashlib.sha256(raw_bytes).hexdigest(),
+        'proof_digest': expected_digest,
+        'head': head,
+        'tracked_status_sha256': status_sha,
+        'tracked_status_entries': entries,
+        'calculation': EXPECTED_CALCULATION,
+        'mtime_ns': mtime_ns,
+        'result_path': str(result_path),
+    }
+
+
+def _strip_ansi(text):
+    return re.sub(r'\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)', '', text)
+
+
+def _has_trust_menu(text):
+    return ('Do you trust the contents of this project?' in text
+            or 'Yes, I trust this folder' in text)
+
+
+def _collapse_ws(text):
+    return ' '.join(text.split())
+
+
+def _claude_native_pane_ok(captured, expected_line, brief_text):
+    """Require completed `● Bash(...)` heading + `⎿` output block carrying expected_line."""
+    lines = [_strip_ansi(line) for line in captured.splitlines()]
+    in_bash = False
+    header_closed = False
+    in_output = False
+    bash_pending = False
+    output_chunks = []
+
+    def block_has_expected(chunks):
+        joined = _collapse_ws(' '.join(chunks))
+        joined_nowrap = _collapse_ws(''.join(line.strip() for line in chunks))
+        target = _collapse_ws(expected_line)
+        target_nospace = target.replace(' ', '')
+        return target in joined or target_nospace in joined_nowrap.replace(' ', '')
+
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r'^●\s*Bash\(', stripped):
+            if in_bash and header_closed and in_output and not bash_pending and block_has_expected(output_chunks):
+                return True
+            in_bash = True
+            header_closed = ')' in stripped
+            in_output = False
+            bash_pending = False
+            output_chunks = []
+            continue
+        if in_bash:
+            if re.match(r'^(●|✽|❯|─{10,}|⏵)', stripped):
+                if header_closed and in_output and not bash_pending and block_has_expected(output_chunks):
+                    return True
+                in_bash = False
+                header_closed = False
+                in_output = False
+                bash_pending = False
+                output_chunks = []
+                continue
+            if not header_closed:
+                if ')' in stripped:
+                    header_closed = True
+                continue
+            if 'Waiting…' in stripped or 'Running…' in stripped or 'running PreToolUse' in stripped:
+                bash_pending = True
+                continue
+            if stripped.startswith('⎿'):
+                in_output = True
+                content = stripped[1:].strip()
+                if content and content != '(No content)':
+                    output_chunks.append(content)
+            elif in_output and stripped:
+                output_chunks.append(stripped)
+    if in_bash and header_closed and in_output and not bash_pending and block_has_expected(output_chunks):
+        return True
+    return False
+
+
+def _hydrogen_native_pane_ok(captured, expected_line, brief_text):
+    """Require completed `● Ran (python3/shell ...) (ctrl+o to expand)` action row + post-action expected_line."""
+    lines = [_strip_ansi(line) for line in captured.splitlines()]
+    ran_idx = None
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if re.match(r'^●\s+Ran\s+\((?:python3|python|bash|sh)\b[^)]*\)\s*\(ctrl\+o to expand\)$', stripped):
+            ran_idx = idx
+    if ran_idx is None:
+        return False
+    after_lines = []
+    for line in lines[ran_idx + 1:]:
+        stripped = line.strip()
+        if stripped.startswith('>') or re.match(r'^─{10,}', stripped) or 'Auto mode:' in stripped:
+            continue
+        if stripped:
+            after_lines.append(stripped)
+    joined = _collapse_ws(' '.join(after_lines))
+    target = _collapse_ws(expected_line)
+    return target in joined
+
+
+def native_pane_output_ok(captured, engine, transport, expected_line, brief_text):
+    """Validate direct `a capture <native_id> --screen --plain` against attested interactive profile."""
+    if (not isinstance(captured, str) or len(captured.encode('utf-8')) > CAPTURE_LIMIT
+            or not isinstance(brief_text, str) or expected_line in brief_text):
+        return False
+    if not native_transport_ok(engine, transport, (transport.get('host_release_sha') if isinstance(transport, dict) else None)):
+        return False
+    clean = _strip_ansi(captured)
+    if _has_trust_menu(clean):
+        return False
+    # Never accept raw headless JSON stream frames as native-pane proof.
+    first_nonempty = next((ln.strip() for ln in clean.splitlines() if ln.strip()), '')
+    if first_nonempty.startswith('{') and '"type":' in first_nonempty:
+        return False
+    if engine == 'claude':
+        return _claude_native_pane_ok(captured, expected_line, brief_text)
+    if engine == 'antigravity':
+        return _hydrogen_native_pane_ok(captured, expected_line, brief_text)
+    return False
+
+
+def make_probe():
+    """Legacy headless probe helper retained for legacy ParserTests only; never used in formal run."""
+    marker = 'ACCEPTANCE-OK:' + uuid.uuid4().hex
+    encoded = base64.b64encode(marker.encode()).decode()
+    prompt = ('Use two sequential shell tool calls. First run a separate foreground shell command '
+              '`python3 -c \'import base64; print(base64.b64decode("%s").decode())\'` as one output line and let it '
+              'finish. Immediately after the marker print finishes, run a separate foreground `sleep 60` command '
+              'using the existing shell tool with a supported timeout sufficient for the 60-second hold so the '
+              'orchestrator can observe and stop this session before any final prose or completion bookkeeping. '
+              'Do not chain the marker print with the hold in one command, do not use a background flag, do not '
+              'include the marker or nonce in the hold command, do not echo proof or emit waiting prose, and do not '
+              'search for or call any monitor, task-output, or status tools or poll in a loop. Apart from mandatory '
+              'Hub first-action/completion evidence files if required by the session wrapper, do not create or edit '
+              'other files, start another agent, or exit early.' % encoded)
+    return prompt, marker
+
+
+# --- Brief / AC construction ---
+def make_child_brief_and_ac(run_id, sample, parent_intake_id, challenge_path):
+    rel_result = str(work_rel_path(run_id, sample))
+    brief = (
+        f'Phase 7 interactive native-pane probe (run {run_id}, sample {sample}/{COUNT}, parent {parent_intake_id}).\n'
+        'First action: run `aplexer whoami --json` to observe your canonical native id, tag, and workspace.\n'
+        'Then use a real shell/Python tool in your actual child workspace to:\n'
+        '1. Run `git rev-parse --verify HEAD` and `git status --porcelain=v1 -z --untracked-files=no`.\n'
+        '2. Compute `calculation = sum(range(1, 101))`.\n'
+        f'3. Read the 32-byte challenge file at `{challenge_path}`.\n'
+        '4. Build the canonical JSON work object with exact keys: schema="phase7_native_work_v2", '
+        f'run_id="{run_id}", sample={sample}, parent_intake_id="{parent_intake_id}", '
+        'child_intake_id=<this intake id>, session_id=<this Hub session id>, native_id=<whoami id>, '
+        f'project="{PROJECT}", machine_id="{HOST}", workspace=<actual workspace>, head=<HEAD>, '
+        'tracked_status_sha256=<sha256 of status -z bytes>, tracked_status_entries=<record count>, calculation=5050.\n'
+        '5. Compute proof_digest = sha256(b"HUB_PHASE7_NATIVE_WORK_V2\\x00" + challenge32 + b"\\x00" + C(work_object)).hexdigest().\n'
+        f'6. Write canonical JSON (work_object + proof_digest, sort_keys=True, separators=(",", ":"), ensure_ascii=False, + "\\n") '
+        f'only to `{rel_result}` inside your actual child workspace.\n'
+        f'7. Print `AC10_WORK_V2 {run_id} {sample} <proof_digest> <head> 5050` from the real tool stdout AFTER writing the file.\n'
+        'Do not edit tracked files, commit, push, exit, start timers, or call `hub sessions finish`; remain at the interactive prompt until Hub STOP.'
+    )
+    ac = (
+        f'1. Genuine `aplexer whoami --json` and independent V2 work artifact written at `{rel_result}` '
+        f'matching the 32-byte challenge at `{challenge_path}` and current Git state.\n'
+        '2. Real native-pane tool completion output printed and worker remains interactive until Hub STOP.'
+    )
+    return brief, ac
+
+
+# --- Hub / Native response helpers ---
 def session_of(view, expected_id=None):
-    """`hub sessions show --json` is {"session": {...}}; a flat or foreign shape is an error, never guessed."""
+    """`hub sessions show --json` is {"session": {...}}; a flat or foreign shape is an error."""
     sess = view.get('session') if isinstance(view, dict) else None
     if not isinstance(sess, dict) or not sess.get('id'):
         raise RuntimeError('show response is not {"session": {...}}')
     if expected_id is not None and sess['id'] != expected_id:
         raise RuntimeError('show session id mismatch with requested session')
     return sess
+
+
+def intake_of(view, expected_id=None):
+    """`hub intake show --json` is {"intake": {...}, "task": {...}}."""
+    item = view.get('intake') if isinstance(view, dict) else None
+    if not isinstance(item, dict) or not item.get('id'):
+        raise RuntimeError('intake show response is not {"intake": {...}}')
+    if expected_id is not None and item['id'] != expected_id:
+        raise RuntimeError('intake show id mismatch with requested intake')
+    return item
 
 
 def list_rows(res):
@@ -500,18 +931,28 @@ def row_workspace(row):
     return row.get('workspace')
 
 
-def live_natives(r, timeout):
-    """Native sessions live right now: `a list --json --running`, filtered to state running (exited rows ignored)."""
+def live_native_rows(r, timeout):
+    """Return dict of {native_id: row} for currently running native sessions."""
     rows = r.json('a', ['list', '--json', '--running'], timeout)
     if not isinstance(rows, list):
         raise RuntimeError('a list --json is not an array')
-    return {x['id'] for x in rows if isinstance(x, dict) and x.get('id')
-            and x.get('phase') not in ('exited', 'dead', 'stopped')
-            and x.get('state') not in ('exited', 'dead', 'stopped')}
+    live = {}
+    for row in rows:
+        if not isinstance(row, dict) or not row.get('id'):
+            continue
+        if row.get('phase') in ('exited', 'dead', 'stopped') or row.get('state') in ('exited', 'dead', 'stopped'):
+            continue
+        live[row['id']] = row
+    return live
 
 
+def live_natives(r, timeout):
+    """Native sessions live right now: `a list --json --running`, filtered to state running."""
+    return set(live_native_rows(r, timeout))
+
+
+# --- Picker validation ---
 def pool_problems(pool):
-    """Valid, nonempty pool with finite positive shares summing to ~1."""
     if not isinstance(pool, list) or not pool or len(pool) > 32:
         return ['picker pool missing or empty']
     shares, weights, ids = [], [], set()
@@ -578,8 +1019,11 @@ def picker_problems(picker, session):
             problems.append('picker %s mismatch with current session' % key)
     if picker.get('machine_id') != row_host(session):
         problems.append('picker machine mismatch with current session')
-    operation = session.get('operation_id') or session.get('attempt_operation_id')
-    suffix = re.search(r':([01])$', operation) if isinstance(operation, str) else None
+    op_id = session.get('operation_id')
+    attempt_op = session.get('attempt_operation_id')
+    # Distinct opaque fields: if attempt_operation_id is present, use its attempt suffix; else operation_id.
+    op_ref = attempt_op if isinstance(attempt_op, str) and attempt_op else op_id
+    suffix = re.search(r':([01])$', op_ref) if isinstance(op_ref, str) else None
     attempt = int(suffix.group(1)) if suffix else session.get('attempt')
     if picker.get('attempt') != attempt:
         problems.append('picker attempt mismatch with current session')
@@ -595,20 +1039,9 @@ def picker_problems(picker, session):
     return problems
 
 
-def valid_native_id(value):
-    return isinstance(value, str) and re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', value) is not None
-
-
-def valid_session_id(value):
-    return isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}', value) is not None
-
-
+# --- Keyed Create / Start Recovery ---
 def reconcile_by_key(r, argv, key, deadline, clock):
-    """Replay the identical request/key, changing only the CLI's local wait behavior.
-
-    Even a 4xx can be from the wait after acceptance, so errors are conservatively
-    ambiguous. A same-key replay never authorizes a different launch request.
-    """
+    """Replay the identical request/key, changing only `--no-wait` for start."""
     if '--key' not in argv or argv[argv.index('--key') + 1] != key:
         return None
     replay = list(argv)
@@ -623,7 +1056,7 @@ def reconcile_by_key(r, argv, key, deadline, clock):
 
 
 def recover_owned(r, rec, clock):
-    sid = reconcile_by_key(r, rec['_start_argv'], rec['key'], clock() + 60, clock)
+    sid = reconcile_by_key(r, rec['_start_argv'], rec['start_key'], clock() + 60, clock)
     if sid:
         rec['id'] = sid
         rec['cleanup_uncertain'] = False
@@ -632,18 +1065,450 @@ def recover_owned(r, rec, clock):
     return sid
 
 
-def one_start(r, rec, clock, sleep, intake=None, workspace=None, seen_sessions=None, seen_natives=None, capture_transports=None):
+def normalize_acceptance_criteria(text):
+    """Match Hub2 normalizeCriteria(): split on newlines, strip leading bullet/number, trim, drop empty."""
+    return [
+        line for line in (
+            re.sub(r'^\s*(?:[-*]|\d+[.)])\s+', '', raw).strip()
+            for raw in text.splitlines()
+        ) if line
+    ]
+
+
+def create_child_intake(r, rec, run_id, sample, parent_intake_id, brief_path, ac_path, brief_text, ac_text,
+                        seen_intakes, clock):
+    """Create a unique keyed child intake; replay exact key/body on ambiguity."""
+    create_key = rec['create_key']
+    title = 'Phase7 owned run %s/%d' % (run_id, sample)
+    source_ref = 'parent:%s;run:%s;sample:%d' % (parent_intake_id, run_id, sample)
+    argv = [
+        'intake', 'create',
+        '--project', PROJECT,
+        '--title', title,
+        '--text-file', str(brief_path),
+        '--acceptance-criteria-file', str(ac_path),
+        '--source-type', 'forwarded',
+        '--source-reference', source_ref,
+        '--key', create_key,
+    ]
+    deadline = clock() + CREATE_BUDGET_S
+    created = None
+    last_exc = None
+    for attempt in range(2):
+        try:
+            created = r.json('hub', argv, left(clock, deadline, 30))
+            break
+        except Exception as exc:
+            last_exc = exc
+            if attempt == 0 and clock() < deadline:
+                continue
+    if created is None:
+        rec['create_uncertain'] = True
+        raise RuntimeError('intake create failed (uncertain key %s): %s' % (create_key, last_exc))
+    item = intake_of(created)
+    cid = item['id']
+    if not valid_native_id(cid):
+        raise RuntimeError('child intake id is not canonical UUID: %r' % cid)
+    if cid == parent_intake_id or cid in seen_intakes:
+        raise RuntimeError('child intake id reused or equals parent: %s' % cid)
+    seen_intakes.add(cid)
+    shown = intake_of(r.json('hub', ['intake', 'show', cid], left(clock, deadline, 30)), cid)
+    if shown.get('project') != PROJECT:
+        raise RuntimeError('child intake project mismatch: %r' % shown.get('project'))
+    if shown.get('text') != brief_text:
+        raise RuntimeError('child intake text mismatch')
+    if shown.get('acceptance_criteria') != normalize_acceptance_criteria(ac_text):
+        raise RuntimeError('child intake acceptance_criteria mismatch')
+    prov = shown.get('provenance') or {}
+    if not isinstance(prov, dict) or prov.get('reference') != source_ref or prov.get('type') != 'forwarded':
+        raise RuntimeError('child intake provenance mismatch: %r' % (prov,))
+    rec['child_intake_id'] = cid
+    # Explicit keyed parent note (never invent --parent on intake create).
+    note_key = 'acc10-own-%s-%d' % (run_id, sample)
+    note_text = 'Owned Phase7 child intake %s (run=%s sample=%d create_key=%s start_key=%s)' % (
+        cid, run_id, sample, create_key, rec['start_key'])
+    r.json('hub', ['intake', 'append', parent_intake_id, '--key', note_key, '--note', note_text],
+           left(clock, deadline, 30))
+    return cid
+
+
+# --- V2 Complete Paged History & Owned Lineage Cleanup ---
+def scan_intake_lineage(r, child_id, deadline, clock):
+    """Bracket complete paged intake history with fresh show snapshots."""
+    before_show = intake_of(r.json('hub', ['intake', 'show', child_id], left(clock, deadline, 20)), child_id)
+    archive = before_show.get('history_archive')
+    if isinstance(archive, dict) and archive.get('count', 0) > 0:
+        return None, 'history_archive has %s unread archived events' % archive.get('count')
+    events = []
+    after = 0
+    total_bytes = 0
+    last_seq = 0
+    for _page in range(MAX_HISTORY_PAGES):
+        res = r.json('hub', ['intake', 'history', child_id, '--after', str(after), '--limit', str(HISTORY_PAGE_LIMIT)],
+                     left(clock, deadline, 20))
+        if not isinstance(res, dict) or not isinstance(res.get('events'), list):
+            return None, 'intake history response malformed'
+        raw_len = len(canonical_json_bytes(res))
+        total_bytes += raw_len
+        if total_bytes > MAX_HISTORY_BYTES:
+            return None, 'intake history exceeded 1 MiB aggregate bound'
+        page = res['events']
+        for ev in page:
+            if not isinstance(ev, dict) or type(ev.get('seq')) is not int or ev['seq'] != last_seq + 1:
+                return None, 'intake history sequence gap or non-monotonic seq'
+            last_seq = ev['seq']
+            events.append(ev)
+            if len(events) > MAX_HISTORY_EVENTS:
+                return None, 'intake history exceeded 1024 event bound'
+        nxt = res.get('next')
+        if nxt is None:
+            break
+        if type(nxt) is not int or nxt <= after or (page and nxt != page[-1]['seq']):
+            return None, 'intake history invalid pagination cursor'
+        after = nxt
+    else:
+        return None, 'intake history exceeded %d page bound' % MAX_HISTORY_PAGES
+
+    after_show = intake_of(r.json('hub', ['intake', 'show', child_id], left(clock, deadline, 20)), child_id)
+    after_archive = after_show.get('history_archive')
+    if isinstance(after_archive, dict) and after_archive.get('count', 0) > 0:
+        return None, 'history_archive has %s unread archived events' % after_archive.get('count')
+    if any(before_show.get(k) != after_show.get(k)
+           for k in ('updated_at', 'session_id', 'status', 'assigned_machine_id', 'dispatch', 'final_evidence')):
+        return None, 'intake snapshot changed during history scan'
+    return {'show': after_show, 'events': events}, None
+
+
+def extract_proven_descendants(events, owned_sids):
+    """Only exact source-proven automatic continuation/verification events prove descent."""
+    known = set(owned_sids)
+    found = []
+    seen = set()
+    changed = True
+    while changed:
+        changed = False
+        for ev in events:
+            kind = ev.get('kind')
+            body = ev.get('body') if isinstance(ev.get('body'), dict) else {}
+            if kind == 'task_continuation_started':
+                prev_sid = body.get('previous_session_id')
+                new_sid = body.get('session_id')
+                if prev_sid in known and valid_session_id(new_sid) and new_sid not in known:
+                    known.add(new_sid)
+                    if new_sid not in seen:
+                        seen.add(new_sid)
+                        found.append(('continuation', new_sid))
+                        changed = True
+            elif kind == 'task_verification_started':
+                orig_sid = body.get('original_session_id')
+                prev_sid = body.get('previous_session_id')
+                new_sid = body.get('session_id')
+                if ((orig_sid in known or prev_sid in known)
+                        and valid_session_id(new_sid) and new_sid not in known):
+                    known.add(new_sid)
+                    if new_sid not in seen:
+                        seen.add(new_sid)
+                        found.append(('verification', new_sid))
+                        changed = True
+    return found
+
+
+def _pending_completion_reason(intake_row):
+    final = intake_row.get('final_evidence')
+    if not isinstance(final, dict):
+        return None
+    comp = final.get('completion')
+    if not isinstance(comp, dict):
+        return None
+    for branch in ('continuation', 'verification'):
+        sub = comp.get(branch)
+        if isinstance(sub, dict) and sub.get('state') in ('pending', 'inflight', 'running'):
+            return '%s %s' % (branch, sub.get('state'))
+    return None
+
+
+def _stop_single_session(r, sid, known_native, stop_key, deadline, clock, sleep):
+    """Issue standard Hub STOP with stable key even if native_id is NULL; confirm stop + native absence."""
+    wait_s = max(1, min(int(left(clock, deadline, 30)), 30))
+    r.json('hub', ['sessions', 'stop', sid, '--key', stop_key, '--wait', '--timeout', str(wait_s)],
+           left(clock, deadline, 35))
+    sess = session_of(r.json('hub', ['sessions', 'show', sid, '--json'], left(clock, deadline, 20)), sid)
+    if sess.get('state') != 'stopped':
+        return sess, 'state after stop %r != stopped' % sess.get('state')
+    if sess.get('stop_confirmed') is not True:
+        return sess, 'stop_confirmed != true after stop'
+    native = known_native if valid_native_id(known_native) else sess.get('native_id')
+    if valid_native_id(native):
+        while True:
+            if native not in live_natives(r, left(clock, deadline, 20)):
+                return sess, None
+            if clock() + 1 >= deadline:
+                return sess, 'native %s still listed after %ds' % (native, STOP_BUDGET_S)
+            sleep(min(1, max(0.01, deadline - clock())))
+    return sess, None
+
+
+def stop_and_drain_lineage(r, rec, run_id, clock, sleep):
+    """V2 owned-lineage cleanup within ONE overall 60s budget, then exact-CAS terminal archival."""
+    sid = rec.get('id')
+    child_id = rec.get('child_intake_id')
     err = rec['errors']
-    prompt, expected = make_probe()
-    key = 'acc10-' + uuid.uuid4().hex
-    argv = ['sessions', 'start', '--repo', 'alexeygrigorev/agent-hub', '--task-kind', 'ask',
-            '--machine', HOST, '--cwd', workspace, '--prompt', prompt, '--key', key,
-            '--timeout', str(RUNNING_BUDGET_S)]
-    if intake:
-        argv += ['--intake-task-id', intake]
+    if not sid:
+        return
+    t0 = clock()
+    deadline = t0 + STOP_BUDGET_S
+    rec.setdefault('cleanup_lineage', [])
+    owned_sids = {sid}
+    owned_meta = {sid: (rec.get('operation_id'), rec.get('epoch'))}
+    stopped_sids = {}
+    descendant_count = 0
+
+    try:
+        sess, stop_err = _stop_single_session(r, sid, rec.get('native_id'), rec['stop_key'], deadline, clock, sleep)
+        stopped_sids[sid] = sess
+        if sess.get('operation_id') or sess.get('epoch') is not None:
+            owned_meta[sid] = (sess.get('operation_id') or owned_meta[sid][0],
+                               sess.get('epoch') if sess.get('epoch') is not None else owned_meta[sid][1])
+        if stop_err:
+            err.append(stop_err)
+    except Exception as exc:
+        err.append('stop failed: %s' % exc)
+        rec['stop_s'] = round(clock() - t0, 1)
+        rec['cleanup_status'] = 'UNKNOWN'
+        return
+
+    if not child_id:
+        rec['cleanup_confirmed'] = not err
+        rec['stop_s'] = round(clock() - t0, 1)
+        return
+
+    # Drain any source-proven automatic continuation/verification descendants within the same 60s budget.
+    while True:
+        try:
+            snap, scan_err = scan_intake_lineage(r, child_id, deadline, clock)
+        except Exception as exc:
+            snap, scan_err = None, str(exc)
+        if scan_err:
+            rec['cleanup_status'] = 'UNKNOWN'
+            err.append('cleanup lineage scan UNKNOWN: %s' % scan_err)
+            rec['stop_s'] = round(clock() - t0, 1)
+            return
+
+        intake_row = snap['show']
+        current_sid = intake_row.get('session_id')
+        new_desc = extract_proven_descendants(snap['events'], owned_sids)
+        pending_desc = [(kind, dsid) for kind, dsid in new_desc if dsid not in stopped_sids]
+
+        if current_sid and current_sid not in owned_sids and current_sid not in {d for _, d in new_desc}:
+            rec['cleanup_status'] = 'UNKNOWN'
+            err.append('foreign or unprovable session %s assigned to child intake' % current_sid)
+            rec['stop_s'] = round(clock() - t0, 1)
+            return
+        assigned_host = intake_row.get('assigned_machine_id')
+        if assigned_host is not None and assigned_host != HOST:
+            rec['cleanup_status'] = 'UNKNOWN'
+            err.append('foreign assigned_machine_id %r on child intake' % assigned_host)
+            rec['stop_s'] = round(clock() - t0, 1)
+            return
+
+        if not pending_desc:
+            dispatch = intake_row.get('dispatch')
+            if dispatch is not None:
+                if not isinstance(dispatch, dict):
+                    rec['cleanup_status'] = 'UNKNOWN'
+                    err.append('malformed dispatch on child intake')
+                    rec['stop_s'] = round(clock() - t0, 1)
+                    return
+                d_sid = dispatch.get('id')
+                if d_sid not in owned_sids or (current_sid and d_sid != current_sid):
+                    rec['cleanup_status'] = 'UNKNOWN'
+                    err.append('foreign or mismatched dispatch session %r' % d_sid)
+                    rec['stop_s'] = round(clock() - t0, 1)
+                    return
+                if dispatch.get('machine_id') is not None and dispatch.get('machine_id') != HOST:
+                    rec['cleanup_status'] = 'UNKNOWN'
+                    err.append('foreign dispatch machine_id %r' % dispatch.get('machine_id'))
+                    rec['stop_s'] = round(clock() - t0, 1)
+                    return
+                if dispatch.get('state') not in ('stopped', 'failed', 'complete', 'cancelled'):
+                    rec['cleanup_status'] = 'UNKNOWN'
+                    err.append('non-terminal dispatch state %r after drain' % dispatch.get('state'))
+                    rec['stop_s'] = round(clock() - t0, 1)
+                    return
+                exp_op, exp_epoch = owned_meta.get(d_sid, (None, None))
+                if exp_op and dispatch.get('operation_id') and dispatch.get('operation_id') != exp_op:
+                    rec['cleanup_status'] = 'UNKNOWN'
+                    err.append('unproven dispatch operation_id %r != %r' % (dispatch.get('operation_id'), exp_op))
+                    rec['stop_s'] = round(clock() - t0, 1)
+                    return
+                if exp_epoch is not None and dispatch.get('epoch') is not None and dispatch.get('epoch') != exp_epoch:
+                    rec['cleanup_status'] = 'UNKNOWN'
+                    err.append('unproven dispatch epoch %r != %r' % (dispatch.get('epoch'), exp_epoch))
+                    rec['stop_s'] = round(clock() - t0, 1)
+                    return
+            pending_comp = _pending_completion_reason(intake_row)
+            if pending_comp:
+                rec['cleanup_status'] = 'UNKNOWN'
+                err.append('completion action still %s after drain' % pending_comp)
+                rec['stop_s'] = round(clock() - t0, 1)
+                return
+            break
+
+        for kind, dsid in pending_desc:
+            descendant_count += 1
+            if descendant_count > MAX_DESCENDANTS:
+                rec['cleanup_status'] = 'UNKNOWN'
+                err.append('cleanup lineage exceeded %d descendant bound' % MAX_DESCENDANTS)
+                rec['stop_s'] = round(clock() - t0, 1)
+                return
+            try:
+                dsess = session_of(r.json('hub', ['sessions', 'show', dsid, '--json'], left(clock, deadline, 20)), dsid)
+            except Exception as exc:
+                rec['cleanup_status'] = 'UNKNOWN'
+                err.append('descendant show failed: %s' % exc)
+                rec['stop_s'] = round(clock() - t0, 1)
+                return
+            if dsess.get('intake_id') != child_id or dsess.get('project_id') != PROJECT or row_host(dsess) != HOST:
+                rec['cleanup_status'] = 'UNKNOWN'
+                err.append('descendant %s failed intake/project/host binding' % dsid)
+                rec['stop_s'] = round(clock() - t0, 1)
+                return
+            owned_sids.add(dsid)
+            owned_meta[dsid] = (dsess.get('operation_id'), dsess.get('epoch'))
+            desc_stop_key = '%s-desc-%d' % (rec['stop_key'], descendant_count)
+            try:
+                dsess_after, d_err = _stop_single_session(r, dsid, dsess.get('native_id'), desc_stop_key, deadline, clock, sleep)
+            except Exception as exc:
+                rec['cleanup_status'] = 'UNKNOWN'
+                err.append('descendant %s stop failed: %s' % (dsid, exc))
+                rec['stop_s'] = round(clock() - t0, 1)
+                return
+            stopped_sids[dsid] = dsess_after
+            rec['cleanup_lineage'].append({
+                'kind': kind,
+                'session_id': dsid,
+                'native_id': dsess.get('native_id'),
+                'stopped': d_err is None,
+            })
+            if d_err:
+                rec['cleanup_status'] = 'UNKNOWN'
+                err.append('descendant %s: %s' % (dsid, d_err))
+                rec['stop_s'] = round(clock() - t0, 1)
+                return
+
+    rec['stop_s'] = round(clock() - t0, 1)
+    if rec['stop_s'] > STOP_BUDGET_S:
+        err.append('stop took %.1fs > %ds' % (rec['stop_s'], STOP_BUDGET_S))
+        rec['cleanup_status'] = 'UNKNOWN'
+        return
+
+    if any(s.get('state') != 'stopped' or s.get('stop_confirmed') is not True for s in stopped_sids.values()):
+        rec['cleanup_status'] = 'UNKNOWN'
+        return
+
+    rec['cleanup_confirmed'] = True
+    rec['cleanup_status'] = 'CONFIRMED'
+
+    # Normal terminal archival with exact CAS version (never force, never active, never blindly retry CAS).
+    version = intake_row.get('updated_at')
+    if type(version) is not int:
+        rec['cleanup_status'] = 'UNKNOWN'
+        err.append('cannot archive child intake: missing integer updated_at version')
+        return
+    if intake_row.get('status') == 'archived':
+        rec['archived'] = True
+        return
+    if intake_row.get('status') not in ('open', 'stopped', 'failed', 'cancelled'):
+        rec['cleanup_status'] = 'UNKNOWN'
+        err.append('refusing archive for unexpected child intake status %r' % intake_row.get('status'))
+        return
+    archive_key = 'acc10-archive-%s-%d' % (run_id, rec['n'])
+    note = 'Phase7 acceptance run %s sample %d terminal cleanup (owned_sids=%d)' % (run_id, rec['n'], len(owned_sids))
+    try:
+        updated = r.json('hub', [
+            'intake', 'update', child_id,
+            '--status', 'archived',
+            '--version', str(version),
+            '--key', archive_key,
+            '--note', note,
+        ], left(clock, deadline, 20))
+        arch = intake_of(updated, child_id)
+        if arch.get('status') != 'archived' or arch.get('session_id') != intake_row.get('session_id'):
+            err.append('archive verification failed for child intake %s' % child_id)
+        else:
+            rec['archived'] = True
+    except Exception as exc:
+        err.append('archive CAS failed for child intake %s: %s' % (child_id, exc))
+
+
+# --- Core Sample Execution ---
+def build_start_argv(workspace, child_intake_id, start_key):
+    """Build exact V1+V2 interactive model-less start argv (no prompt/cwd/engine/model/effort)."""
+    return [
+        'sessions', 'start',
+        '--repo', PROJECT,
+        '--workspace', workspace,
+        '--machine', HOST,
+        '--interactive',
+        '--task-kind', 'ask',
+        '--intake-task-id', child_intake_id,
+        '--key', start_key,
+        '--timeout', str(RUNNING_BUDGET_S),
+    ]
+
+
+def _persist_manifest(manifest_path, manifest):
+    atomic_write_private(manifest_path, canonical_json_bytes(manifest) + b'\n')
+
+
+def one_start(r, rec, run_id, parent_intake_id, workspace, output_dir, manifest, manifest_path,
+              clock, sleep, seen_intakes, seen_sessions, seen_natives, capture_transports):
+    err = rec['errors']
+    sample = rec['n']
+    rec['create_key'] = 'acc10-create-%s-%d' % (run_id, sample)
+    rec['start_key'] = 'acc10-start-%s-%d' % (run_id, sample)
+    rec['stop_key'] = 'acc10-stop-%s-%d' % (run_id, sample)
+
+    challenge_path = Path(output_dir) / ('challenge-%d.bin' % sample)
+    brief_path = Path(output_dir) / ('brief-%d.txt' % sample)
+    ac_path = Path(output_dir) / ('ac-%d.txt' % sample)
+    brief_text, ac_text = make_child_brief_and_ac(run_id, sample, parent_intake_id, challenge_path)
+    exclusive_write_private(brief_path, brief_text.encode('utf-8'))
+    exclusive_write_private(ac_path, ac_text.encode('utf-8'))
+
+    sample_manifest = {
+        'sample': sample,
+        'create_key': rec['create_key'],
+        'create_body_digest': hashlib.sha256(canonical_json_bytes({
+            'project': PROJECT, 'title': 'Phase7 owned run %s/%d' % (run_id, sample),
+            'text': brief_text, 'acceptance_criteria': ac_text,
+        })).hexdigest(),
+        'start_key': rec['start_key'],
+        'stop_key': rec['stop_key'],
+        'challenge_path': str(challenge_path),
+    }
+    manifest['samples'].append(sample_manifest)
+    _persist_manifest(manifest_path, manifest)
+
+    try:
+        child_id = create_child_intake(
+            r, rec, run_id, sample, parent_intake_id, brief_path, ac_path, brief_text, ac_text,
+            seen_intakes, clock,
+        )
+    except Exception as exc:
+        err.append('intake create failed: %s' % exc)
+        return
+    sample_manifest['child_intake_id'] = child_id
+
+    # Seed 32-byte random challenge AFTER freezing brief/AC and BEFORE start.
+    challenge32 = os.urandom(32)
+    exclusive_write_private(challenge_path, challenge32, mode=0o400)
+    sample_manifest['challenge_sha256'] = hashlib.sha256(challenge32).hexdigest()
+    _persist_manifest(manifest_path, manifest)
+
+    argv = build_start_argv(workspace, child_id, rec['start_key'])
     t0 = clock()
     deadline = t0 + RUNNING_BUDGET_S
-    rec['key'] = key
     rec['_start_argv'] = list(argv)
     try:
         created = r.json('hub', argv, left(clock, deadline))
@@ -651,8 +1516,11 @@ def one_start(r, rec, clock, sleep, intake=None, workspace=None, seen_sessions=N
         err.append('start failed: %s' % exc)
         sid = recover_owned(r, rec, clock)
         if sid:
+            sample_manifest['session_id'] = sid
+            _persist_manifest(manifest_path, manifest)
             err.append('start failed after creating session %s (stopped in cleanup)' % sid)
         return
+
     rec['elapsed_s'] = round(clock() - t0, 3)
     sid = created.get('id') if isinstance(created, dict) else None
     rec['id'] = sid
@@ -661,20 +1529,46 @@ def one_start(r, rec, clock, sleep, intake=None, workspace=None, seen_sessions=N
         recover_owned(r, rec, clock)
         err.append('start returned no valid id')
         return
-    if seen_sessions is not None:
-        if sid in seen_sessions:
-            err.append('session id reused within this acceptance run')
-            return
-        seen_sessions.add(sid)
+    sample_manifest['session_id'] = sid
+    _persist_manifest(manifest_path, manifest)
+
+    if sid in seen_sessions:
+        err.append('session id reused within this acceptance run')
+        return
+    seen_sessions.add(sid)
+
     if created.get('state') != 'running':
         err.append('default waited start did not return running')
     err.extend('start ' + p for p in picker_problems(created.get('picker'), created))
+
     row = session_of(r.json('hub', ['sessions', 'show', sid, '--json'], left(clock, deadline, 60)), sid)
-    rec.update(model=row.get('model'), engine=row.get('engine'), host=row_host(row), native_id=row.get('native_id'))
+    actual_workspace = row_workspace(row)
+    rec.update(
+        model=row.get('model'),
+        engine=row.get('engine'),
+        host=row_host(row),
+        native_id=row.get('native_id'),
+        requested_workspace=row.get('requested_workspace'),
+        workspace=actual_workspace,
+        epoch=row.get('epoch'),
+        operation_id=row.get('operation_id'),
+    )
     if row.get('state') != 'running':
         err.append('state %r not running' % row.get('state'))
     if row_host(row) != HOST:
         err.append('host %r != %s' % (row_host(row), HOST))
+    if row.get('mode') != 'interactive' or row.get('interactive') is not True:
+        err.append('session is not interactive (mode=%r interactive=%r)' % (row.get('mode'), row.get('interactive')))
+    if row.get('intake_id') and row.get('intake_id') != child_id:
+        err.append('show intake_id %r != %s' % (row.get('intake_id'), child_id))
+    if row.get('project_id') and row.get('project_id') != PROJECT:
+        err.append('show project_id %r != %s' % (row.get('project_id'), PROJECT))
+    if row.get('requested_workspace') is not None and row.get('requested_workspace') != workspace:
+        err.append('requested_workspace %r != %s' % (row.get('requested_workspace'), workspace))
+    if not isinstance(actual_workspace, str) or not actual_workspace.startswith('/') or '\x00' in actual_workspace:
+        err.append('actual child workspace invalid: %r' % (actual_workspace,))
+        return
+
     err.extend(picker_problems(row.get('picker'), row))
     current, initial = row.get('picker'), created.get('picker')
     if isinstance(current, dict) and isinstance(initial, dict):
@@ -691,10 +1585,12 @@ def one_start(r, rec, clock, sleep, intake=None, workspace=None, seen_sessions=N
         rec['shares'] = {x.get('policy_id'): x.get('share') for x in pool if isinstance(x, dict)}
         rec['shares_source'] = 'session.picker'
         if not picker_problems(current, row):
-            rec['picker'] = dict(choice_of(current),
-                                 pool=[{k: option[k] for k in ('policy_id', 'engine', 'model', 'effort', 'weight', 'share')}
-                                       for option in pool],
-                                 history=[choice_of(choice) for choice in current['history']])
+            rec['picker'] = dict(
+                choice_of(current),
+                pool=[{k: option[k] for k in ('policy_id', 'engine', 'model', 'effort', 'weight', 'share')}
+                      for option in pool],
+                history=[choice_of(choice) for choice in current['history']],
+            )
         if is_luna(rec.get('model'), rec.get('policy_id')) and len({x.get('model') for x in pool if isinstance(x, dict)}) <= 1:
             err.append('luna picked from a degraded one-model pool')
     choices = current.get('history', []) if isinstance(current, dict) else []
@@ -702,45 +1598,88 @@ def one_start(r, rec, clock, sleep, intake=None, workspace=None, seen_sessions=N
             or any(isinstance(choice, dict) and is_astra(choice.get('model'), choice.get('engine'), choice.get('policy_id'))
                    for choice in choices)):
         err.append('astra picked')
-    if not valid_native_id(rec.get('native_id')):
+
+    native_id = rec.get('native_id')
+    if not valid_native_id(native_id):
         err.append('no canonical native UUID on running session')
         return
-    if seen_natives is not None:
-        if rec['native_id'] in seen_natives:
-            err.append('native UUID reused within this acceptance run')
-            return
-        seen_natives.add(rec['native_id'])
-    if rec['native_id'] not in live_natives(r, left(clock, deadline, 60)):
-        err.append('native not live in a list --running')
-    transport = (capture_transports or {}).get(rec.get('engine'))
-    if not capture_transport_ok(rec.get('engine'), transport, (transport.get('host_release_sha') if isinstance(transport, dict) else None)):
-        err.append('capture proof unavailable: no verified stream transport for engine %s' % rec.get('engine'))
+    if native_id in seen_natives:
+        err.append('native UUID reused within this acceptance run')
         return
-    rec['capture_transport'] = {key: transport[key] for key in
-                                ('engine', 'format', 'host_release_sha', 'provider_version', 'profile_set_sha256')}
+    seen_natives.add(native_id)
+
+    live_map = live_native_rows(r, left(clock, deadline, 60))
+    if native_id not in live_map:
+        err.append('native not live in a list --running')
+        return
+    native_ws = live_map[native_id].get('workspace')
+    if native_ws is not None and native_ws != actual_workspace:
+        err.append('native workspace %r != %s' % (native_ws, actual_workspace))
+        return
+
+    engine = rec.get('engine')
+    transport = (capture_transports or {}).get(engine)
+    if not native_transport_ok(engine, transport, (transport.get('host_release_sha') if isinstance(transport, dict) else None)):
+        err.append('capture proof unavailable: no verified interactive native-pane transport for engine %s' % engine)
+        return
+    rec['capture_transport'] = {
+        key: transport[key] for key in (
+            'engine', 'mode', 'format', 'proof_class', 'host_release_sha', 'provider_version', 'profile_set_sha256'
+        )
+    }
+
     cdeadline = clock() + CAPTURE_BUDGET_S
     while clock() < cdeadline:
         try:
-            captured = r.json('hub', ['sessions', 'capture', sid, '--wait', '--timeout', str(max(1, int(left(clock, cdeadline)))),
-                                    '--max-bytes', '65536', '--key', 'acc-capture-' + uuid.uuid4().hex],
-                              left(clock, cdeadline))
-        except (RuntimeError, TimeoutError):
-            if clock() >= cdeadline:
-                break
-            sleep(min(1, max(0, cdeadline - clock())))
-            continue
-        wait = captured.get('command_wait', {}) if isinstance(captured, dict) else {}
-        ack = wait.get('ack', {})
-        if wait.get('state') == 'acked' and isinstance(ack, dict) and probe_output_ok(ack.get('capture'), prompt, expected, rec.get('engine'), transport):
-            rec['capture_verified'] = True
-            return
-        sleep(min(1, max(0, cdeadline - clock())))
-    err.append('Hub capture shows no completed tool output beyond the prompt')
+            # Verify native pane is still live before capturing.
+            live_now = live_native_rows(r, left(clock, cdeadline, 20))
+            if native_id not in live_now:
+                err.append('native exited before work proof completed')
+                return
+            rc_cap, cap_out, _cap_err = r.run('a', ['capture', native_id, '--screen', '--plain'], left(clock, cdeadline, 20))
+            cap_acquired_ns = time.time_ns()
+            if rc_cap == 0 and cap_out:
+                work_info = verify_work_artifact(
+                    r, actual_workspace, run_id, sample, parent_intake_id, child_id, sid, native_id, challenge32
+                )
+                expected_line = 'AC10_WORK_V2 %s %d %s %s %d' % (
+                    run_id, sample, work_info['proof_digest'], work_info['head'], EXPECTED_CALCULATION
+                )
+                if native_pane_output_ok(cap_out, engine, transport, expected_line, brief_text):
+                    if cap_acquired_ns < work_info['mtime_ns']:
+                        err.append('capture acquired before result file mtime')
+                        return
+                    cap_bytes = cap_out.encode('utf-8')
+                    cap_path = Path(output_dir) / ('capture-%d.txt' % sample)
+                    atomic_write_private(cap_path, cap_bytes)
+                    rec['capture_verified'] = True
+                    rec['capture_sha256'] = hashlib.sha256(cap_bytes).hexdigest()
+                    rec['capture_path'] = str(cap_path)
+                    rec['artifact_sha256'] = work_info['artifact_sha256']
+                    rec['proof_digest'] = work_info['proof_digest']
+                    rec['git_head'] = work_info['head']
+                    rec['tracked_status_sha256'] = work_info['tracked_status_sha256']
+                    rec['tracked_status_entries'] = work_info['tracked_status_entries']
+                    rec['calculation'] = work_info['calculation']
+                    sample_manifest.update(
+                        capture_sha256=rec['capture_sha256'],
+                        artifact_sha256=rec['artifact_sha256'],
+                        proof_digest=rec['proof_digest'],
+                    )
+                    _persist_manifest(manifest_path, manifest)
+                    return
+        except (OSError, ValueError, RuntimeError, TimeoutError):
+            pass
+        if clock() >= cdeadline:
+            break
+        sleep(min(1, max(0.01, cdeadline - clock())))
+    err.append('Native pane capture and independent V2 artifact did not prove completed work')
 
 
-def verify_listing(r, rec, clock, workspace):
-    """hub sessions list row carries host + workspace (from the actual row)."""
+def verify_listing(r, rec, clock):
+    """`hub sessions list` row carries host, actual child workspace, interactive mode, and native_id."""
     err = rec['errors']
+    actual_workspace = rec.get('workspace')
     try:
         rows = list_rows(r.json('hub', ['sessions', 'list', '--json', '--limit', '500'], 120))
     except Exception as exc:
@@ -750,55 +1689,35 @@ def verify_listing(r, rec, clock, workspace):
     if not mine:
         err.append('session absent from hub sessions list')
         return
-    host = row_host(mine[0])
-    if host != HOST:
-        err.append('host %r != %s' % (host, HOST))
-    ws = row_workspace(mine[0])
-    if ws != workspace:
-        err.append('workspace path missing or mismatched in list row (%r)' % (ws,))
-    if mine[0].get('state') != 'running':
+    row = mine[0]
+    if row_host(row) != HOST:
+        err.append('host %r != %s' % (row_host(row), HOST))
+    ws = row_workspace(row)
+    if ws != actual_workspace:
+        err.append('workspace path missing or mismatched in list row (%r != %r)' % (ws, actual_workspace))
+    if row.get('state') != 'running':
         err.append('session is not running in live Hub list')
+    if row.get('mode') != 'interactive' and row.get('interactive') is not True:
+        err.append('session is not interactive in live Hub list')
+    if row.get('native_id') and row.get('native_id') != rec.get('native_id'):
+        err.append('list native_id %r != %s' % (row.get('native_id'), rec.get('native_id')))
     rec['listed_workspace'] = ws
 
 
-def stop_one(r, rec, clock, sleep):
-    """Stop within STOP_BUDGET_S total, subprocess timeouts included; native proven gone from the live list."""
-    sid, native, err = rec.get('id'), rec.get('native_id'), rec['errors']
-    if not sid:
-        return
-    t0 = clock()
-    deadline = t0 + STOP_BUDGET_S
+def verify_running_before_stop(r, rec, clock):
+    """Mandatory fresh exact-native + Hub running barrier immediately before live STOP."""
+    sid, native_id, err = rec.get('id'), rec.get('native_id'), rec['errors']
     try:
-        r.json('hub', ['sessions', 'stop', sid, '--wait', '--timeout', str(max(1, STOP_BUDGET_S - 5))],
-               left(clock, deadline))
-        sess = session_of(r.json('hub', ['sessions', 'show', sid, '--json'], left(clock, deadline, 60)), sid)
+        live = live_natives(r, 20)
+        sess = session_of(r.json('hub', ['sessions', 'show', sid, '--json'], 20), sid)
     except Exception as exc:
-        err.append('stop failed: %s' % exc)
-        rec['stop_s'] = round(clock() - t0, 1)
-        return
-    if sess.get('state') != 'stopped':
-        err.append('state after stop %r != stopped' % sess.get('state'))
-    if not valid_native_id(native):
-        native = sess.get('native_id')
-    if not valid_native_id(native):
-        err.append('cleanup native UUID unconfirmed; authenticated stop requested but absence cannot be proved')
-        return
-    while native:
-        try:
-            gone = native not in live_natives(r, left(clock, deadline, 60))
-        except Exception as exc:
-            err.append('a list failed: %s' % exc)
-            break
-        if gone:
-            rec['cleanup_confirmed'] = sess.get('state') == 'stopped'
-            break
-        if clock() + 3 >= deadline:
-            err.append('native %s still listed after %ds' % (native, STOP_BUDGET_S))
-            break
-        sleep(3)
-    rec['stop_s'] = round(clock() - t0, 1)
-    if rec['stop_s'] > STOP_BUDGET_S:
-        err.append('stop took %.1fs > %ds' % (rec['stop_s'], STOP_BUDGET_S))
+        err.append('pre-stop running barrier failed: %s' % exc)
+        return False
+    if native_id not in live or sess.get('state') != 'running':
+        err.append('natural exit after proof before live STOP (native_live=%s, state=%r)' % (
+            native_id in live, sess.get('state')))
+        return False
+    return True
 
 
 def summarize(recs, evidence_problems):
@@ -810,10 +1729,13 @@ def summarize(recs, evidence_problems):
         problems.append('only %d of %d starts attempted' % (len(recs), COUNT))
     sessions = [rec.get('id') for rec in recs]
     natives = [rec.get('native_id') for rec in recs]
+    intakes = [rec.get('child_intake_id') for rec in recs]
     if not all(valid_session_id(value) for value in sessions) or len(set(sessions)) != COUNT:
         problems.append('ten distinct valid session identities required')
     if not all(valid_native_id(value) for value in natives) or len(set(natives)) != COUNT:
         problems.append('ten distinct canonical native UUIDs required')
+    if not all(valid_native_id(value) for value in intakes) or len(set(intakes)) != COUNT:
+        problems.append('ten distinct child intake UUIDs required')
     if len(models) < MIN_MODELS:
         problems.append('%d distinct models < %d' % (len(models), MIN_MODELS))
     if luna > MAX_LUNA:
@@ -826,59 +1748,104 @@ def summarize(recs, evidence_problems):
     return {'ok': not problems, 'models': models, 'luna': luna, 'astra': astra, 'problems': problems}
 
 
-def run(r, evidence_path, commit, clock=time.monotonic, sleep=time.sleep, out=sys.stdout,
-        intake=None, synthetic_ac=False, workspace=None):
+def run(r, evidence_path, commit, clock=time.monotonic, sleep=time.sleep, out=None,
+        intake=None, workspace=None, output_dir=None, plan_only=False):
+    if out is None:
+        out = sys.stdout
     window = {'start': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
-    evidence_problems, evidence_digest, capture_transports = checked_evidence(evidence_path, commit)
+    run_id = str(uuid.uuid4())
+    evidence_problems, evidence_digest, capture_transports = checked_native_evidence(evidence_path, commit)
     problems = list(evidence_problems)
     if not isinstance(workspace, str) or not workspace.startswith('/') or '\x00' in workspace:
-        problems.append('explicit absolute --cwd workspace required')
-    if not intake and not synthetic_ac:
-        problems.append('no --intake-task-id and no --synthetic-ac-authorized (acceptance criteria source missing)')
-    try:
-        before = sample_alerts(r)
-    except Exception as exc:
+        problems.append('explicit absolute --workspace required')
+    if not valid_native_id(intake):
+        problems.append('valid parent --intake-task-id UUID required')
+    if not output_dir:
+        problems.append('explicit private --output-dir required')
+    if not plan_only:
+        try:
+            before = sample_alerts(r)
+        except Exception as exc:
+            before = None
+            problems.append('alert baseline unavailable: %s' % exc)
+    else:
         before = None
-        problems.append('alert baseline unavailable: %s' % exc)
-    recs = []
-    seen_sessions, seen_natives = set(), set()
-    if problems:  # fail closed before touching Hub
+
+    if problems:
         print('ACCEPTANCE FAIL (preconditions): %s' % '; '.join(problems), file=out)
         return 1
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(out_dir, 0o700)
+    manifest_path = out_dir / ('manifest-%s.json' % run_id)
+    manifest = {
+        'schema': 'phase7_native_run_manifest_v2',
+        'run_id': run_id,
+        'parent_intake_id': intake,
+        'requested_workspace': workspace,
+        'commit': commit,
+        'evidence_sha256': evidence_digest,
+        'samples': [],
+    }
+    exclusive_write_private(manifest_path, canonical_json_bytes(manifest) + b'\n')
+
+    if plan_only:
+        plan = [
+            {
+                'sample': i,
+                'create_key': 'acc10-create-%s-%d' % (run_id, i),
+                'start_argv': build_start_argv(workspace, '<child-intake-%d>' % i, 'acc10-start-%s-%d' % (run_id, i)),
+            }
+            for i in range(1, COUNT + 1)
+        ]
+        print(json.dumps({'run_id': run_id, 'manifest': str(manifest_path), 'plan': plan}, indent=2), file=out)
+        return 0
+
+    recs = []
+    seen_intakes, seen_sessions, seen_natives = set(), set(), set()
     try:
         for i in range(1, COUNT + 1):
             rec = {'n': i, 'errors': []}
             recs.append(rec)
             try:
-                one_start(r, rec, clock, sleep, intake, workspace, seen_sessions, seen_natives, capture_transports)
-            except Exception as exc:  # keep the created id for cleanup
+                one_start(
+                    r, rec, run_id, intake, workspace, out_dir, manifest, manifest_path,
+                    clock, sleep, seen_intakes, seen_sessions, seen_natives, capture_transports,
+                )
+            except Exception as exc:
                 rec['errors'].append('start crashed: %s' % exc)
-            print('start %d/%d id=%s model=%s engine=%s host=%s elapsed=%ss shares(%s)=%s' % (
-                i, COUNT, rec.get('id'), rec.get('model'), rec.get('engine'), rec.get('host'), rec.get('elapsed_s'),
-                rec.get('shares_source'), json.dumps(rec.get('shares'), sort_keys=True)), file=out, flush=True)
+            print('start %d/%d id=%s child=%s model=%s engine=%s host=%s elapsed=%ss shares(%s)=%s' % (
+                i, COUNT, rec.get('id'), rec.get('child_intake_id'), rec.get('model'), rec.get('engine'),
+                rec.get('host'), rec.get('elapsed_s'), rec.get('shares_source'),
+                json.dumps(rec.get('shares'), sort_keys=True),
+            ), file=out, flush=True)
             if rec.get('id') and not rec['errors']:
                 try:
-                    verify_listing(r, rec, clock, workspace)
+                    verify_listing(r, rec, clock)
                 except Exception as exc:
                     rec['errors'].append('listing check crashed: %s' % exc)
+            if rec.get('id') and not rec['errors']:
+                verify_running_before_stop(r, rec, clock)
             if rec.get('id'):
-                stop_one(r, rec, clock, sleep)
+                stop_and_drain_lineage(r, rec, run_id, clock, sleep)
             if rec['errors']:
-                break  # consecutive means a failed start ends the run
+                break
     finally:
-        for rec in recs:  # only sessions this run created, always
+        for rec in recs:
             if rec.get('cleanup_confirmed'):
                 continue
             try:
                 if not rec.get('id') and rec.get('cleanup_uncertain'):
                     recover_owned(r, rec, clock)
-                stop_one(r, rec, clock, sleep)
+                stop_and_drain_lineage(r, rec, run_id, clock, sleep)
             except Exception as exc:
                 rec['errors'].append('stop crashed: %s' % exc)
             if rec.get('cleanup_uncertain'):
-                rec['errors'].append('cleanup uncertain: could not determine whether start was accepted; original key ' + rec['key'])
+                rec['errors'].append('cleanup uncertain: could not determine whether start was accepted; original key ' + rec['start_key'])
+
     window['end'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-    evidence_problems, post_digest, _ = checked_evidence(evidence_path, commit)
+    evidence_problems, post_digest, _ = checked_native_evidence(evidence_path, commit)
     post_problems = list(evidence_problems)
     if post_digest != evidence_digest:
         post_problems.append('operator-validated evidence bundle changed during run')
@@ -895,8 +1862,16 @@ def run(r, evidence_path, commit, clock=time.monotonic, sleep=time.sleep, out=sy
         rec.pop('row', None)
         rec.pop('_start_argv', None)
     summary = summarize(recs, post_problems)
-    summary.update(commit=commit, evidence_sha256=evidence_digest, window=window, starts=recs, alert_watermarks={'before': before, 'after': after, 'required_post_observed_at_ms': post_cutoff_ms},
-                   acceptance_criteria=('intake ' + intake) if intake else 'server-synthetic (explicitly authorized)')
+    summary.update(
+        run_id=run_id,
+        manifest_path=str(manifest_path),
+        commit=commit,
+        evidence_sha256=evidence_digest,
+        window=window,
+        starts=recs,
+        alert_watermarks={'before': before, 'after': after, 'required_post_observed_at_ms': post_cutoff_ms},
+        parent_intake_id=intake,
+    )
     print(json.dumps(summary, indent=2, sort_keys=True, default=str), file=out)
     print('ACCEPTANCE %s' % ('PASS' if summary['ok'] else 'FAIL'), file=out)
     return 0 if summary['ok'] else 1
@@ -905,21 +1880,28 @@ def run(r, evidence_path, commit, clock=time.monotonic, sleep=time.sleep, out=sy
 def main(argv=None, runner=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--live', action='store_true', help='really start ten sessions (also needs HUB_ACCEPTANCE_READY=1)')
-    ap.add_argument('--evidence', help='Root-validated same-commit deployment/canary/CI receipt references and SHA256 pins; see docs/HUB-ACCEPTANCE-10.md')
-    ap.add_argument('--cwd', help='explicit workspace on hetzner-aplexer')
+    ap.add_argument('--plan', action='store_true', help='read-only plan mode: render manifest and argv without invoking Hub')
+    ap.add_argument('--evidence', help='Root-validated same-commit native-pane/deployment/canary/CI evidence JSON')
+    ap.add_argument('--workspace', help='approved absolute base workspace on hetzner-aplexer')
+    ap.add_argument('--cwd', help='deprecated alias for --workspace')
+    ap.add_argument('--output-dir', help='new private directory for run manifest, challenges, and captures')
     ap.add_argument('--commit', help='deployed main commit the evidence must match')
-    ap.add_argument('--alerts-cmd', help='verified durable sampler JSON: kind=dev_alert_occurrences_v1, recipient=dev@dtcdev.click, '
-                                         'stable generation, cumulative count of ALL occurrences (including resolved/deduplicated), '
-                                         'fresh observed_at_ms (post snapshot must cover the end-of-run cutoff). Active alert IDs are insufficient; source must be verified before live use')
-    ap.add_argument('--intake-task-id', help='intake task with acceptance criteria passed to every start')
-    ap.add_argument('--synthetic-ac-authorized', action='store_true',
-                    help='explicit authorization to rely on the server-fabricated synthetic criterion')
+    ap.add_argument('--alerts-cmd', help='verified durable sampler JSON (dev_alert_occurrences_v1)')
+    ap.add_argument('--intake-task-id', help='parent intake task UUID for provenance and ownership notes')
     args = ap.parse_args(argv)
+    ws = args.workspace or args.cwd
+    if args.plan:
+        return run(
+            runner or Runner(alerts_cmd=args.alerts_cmd), args.evidence, args.commit,
+            intake=args.intake_task_id, workspace=ws, output_dir=args.output_dir, plan_only=True,
+        )
     if not args.live or os.environ.get('HUB_ACCEPTANCE_READY') != '1':
         print('refusing: live run needs --live and HUB_ACCEPTANCE_READY=1 (orchestrator readiness)', file=sys.stderr)
         return 2
-    return run(runner or Runner(alerts_cmd=args.alerts_cmd), args.evidence, args.commit,
-               intake=args.intake_task_id, synthetic_ac=args.synthetic_ac_authorized, workspace=args.cwd)
+    return run(
+        runner or Runner(alerts_cmd=args.alerts_cmd), args.evidence, args.commit,
+        intake=args.intake_task_id, workspace=ws, output_dir=args.output_dir,
+    )
 
 
 if __name__ == '__main__':
