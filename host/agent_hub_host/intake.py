@@ -292,7 +292,7 @@ def _https_get_json(base, path, access):
     return json.loads(body.decode('utf-8'))
 
 
-def request(method, path, payload=None):
+def request(method, path, payload=None, max_request=None):
     if method == 'GET' and payload is None and path.startswith(BASE + '/summary') and 'api' not in globals():
         fast = _fast_summary_get(path)
         if fast is not None:
@@ -307,8 +307,9 @@ def request(method, path, payload=None):
     base = os.environ.get('HUB_URL') or os.environ.get('HUB_BASE_URL') or cfg.get('base_url')
     api.check_url(base)
     data = json.dumps(payload, ensure_ascii=False).encode('utf-8') if payload is not None else None
-    if data is not None and len(data) > MAX_REQUEST:
-        raise IntakeInputError(f'Intake request exceeds {MAX_REQUEST} UTF-8 bytes (JSON envelope included)')
+    limit = max_request or MAX_REQUEST
+    if data is not None and len(data) > limit:
+        raise IntakeInputError(f'Intake request exceeds {limit} UTF-8 bytes (JSON envelope included)')
     env_token = os.environ.get('HUB_TOKEN') or os.environ.get('HUB_JOB_TOKEN')
     token = env_token or cfg.get('access_token') or auth.get_access_token()
     # GETs are safe to repeat. Task writes are safe only when the exact
@@ -397,7 +398,7 @@ def add_commands(sub):
     commands = root.add_subparsers(dest='intake_cmd', required=True)
     from . import intake_stats
     intake_stats.options(commands.add_parser('stats', help='Timing and attempts for one intake'), individual=True)
-    depend = commands.add_parser('depend', help='Add a prerequisite; original work waits until it is DONE')
+    depend = commands.add_parser('depend', help='Record a prerequisite intake (may be in another project); shown in `intake show`/`links`')
     depend.add_argument('id')
     depend.add_argument('--on', required=True)
     depend.add_argument('--remove', action='store_true')
@@ -547,6 +548,17 @@ def add_commands(sub):
     handoff = sub.add_parser('handoff', help='Self-contained ALL authorized open work and operator rules; fails without a complete consistent snapshot')
     handoff.add_argument('--project')
     handoff.add_argument('--page-size', type=int, default=25)
+
+
+def current_version(shown):
+    """CAS version from `intake show`: Hub2 serves task.control.version, Hub1 task.version."""
+    task = shown.get('task') if isinstance(shown, dict) else None
+    if isinstance(task, dict):
+        control = task.get('control')
+        for value in ((control or {}).get('version') if isinstance(control, dict) else None, task.get('version')):
+            if type(value) is int:
+                return value
+    raise IntakeInputError('Intake show response has no task.control.version; pass --version from `hub intake show`')
 
 
 def safe_id(value):
@@ -813,7 +825,7 @@ def execute(args):
         valid_key(key)
         version = args.version
         if version is None:
-            version = request('GET', path)['task']['version']
+            version = current_version(request('GET', path))
         payload = {'key': key, 'expected_version': version}
         if command == 'depend':
             payload.update(on=safe_id(args.on), remove=args.remove)

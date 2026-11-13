@@ -54,3 +54,39 @@ requires reporting blockers rather than silently stopping. The watchdog's
 forgotten-work projection flags a terminal session without current DONE
 evidence or a linked blocker intake as
 `session_ended_without_done_or_blocker_intake`.
+
+## Hub2 prerequisites (`hub intake depend`)
+
+On Hub2, `hub intake depend DEPENDENT --on PREREQUISITE` records the
+prerequisite on the dependent intake. The prerequisite may live in another
+project; the caller must be able to see it. Without `--version` the CLI reads
+`task.control.version` from `hub intake show`. `hub intake show` lists the set
+as `intake.depends_on`; `hub intake links ID` returns it as `depends_on`.
+Hub2 records the link and shows it. It does not yet hold a start until the
+prerequisite is done.
+
+Every refusal names its cause: `prerequisite_required`,
+`prerequisite_not_found` (missing, or not visible to this caller),
+`prerequisite_ambiguous`, `dependency_self`, `dependency_cycle`
+(cross-project walk, bounded to 64 intakes), `dependency_limit` (32),
+`dependency_not_found` (on `--remove`), `intake_version_conflict` (the detail
+gives the current version), `intake_closed`, `intake_not_found` and
+`idempotency_conflict`.
+
+## Intake PNG artifacts (`hub task-artifact`)
+
+`hub task-artifact INTAKE --name NAME --file shot.png --sanitized` attaches a
+reviewed PNG to an intake. `hub artifact INTAKE NAME --output out.png`
+downloads it to a new mode-0600 file. Limits: 6 MiB (6,291,456 bytes) per PNG,
+16 PNGs and 48 MiB per intake. 6 MiB keeps the base64 download under the CLI's
+10 MiB response cap. Callers: operators, project writers, or the session bound
+to the intake. `hub intake show` lists name, bytes and sha256. The pixels never
+appear in history pages.
+
+A local refusal names the failed check: `PNG rejected (size check)`,
+`(symlink check)`, `(regular-file check)`, `(type check)` (PNG
+signature/IHDR), `(exists check)`, `(readable check)`, `(name check)` or
+`(output check)`. Hub refusals keep their slug and detail. For example,
+`artifact_too_large` with `size check failed: …`, `invalid_png` with
+`type check failed: …`, `sanitized_attestation_required`,
+`artifact_name_conflict` or `artifact_limit`. File mode is not checked.
