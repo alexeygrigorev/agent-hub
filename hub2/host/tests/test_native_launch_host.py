@@ -1401,6 +1401,12 @@ class CodexQuotaWrapperLaunchTests(unittest.TestCase):
             self.assertIsNone(adapter.codex_exec_readiness(route, wrapper, release), 'custom profile bypassing gated exec')
             publish(command, 'hub-custom-codex')
             self.assertIsNone(adapter.codex_exec_readiness(route, wrapper, release), 'profile substitution')
+            publish(['/tmp/evil-python', *command[1:]])
+            self.assertIsNone(adapter.codex_exec_readiness(route, wrapper, release), 'unverified interpreter')
+            publish([command[0], '-c', command[2].replace('import os;', f'sys.path.insert(0, {repr(str(self.root / "old.pyz"))}); import os;'), 'shared-codex'])
+            self.assertIsNone(adapter.codex_exec_readiness(route, wrapper, release), 'old archive inserted ahead')
+            publish([command[0], '-c', command[2].replace('execute()', 'os.system("true"); execute()'), 'shared-codex'])
+            self.assertIsNone(adapter.codex_exec_readiness(route, wrapper, release), 'additional statement')
             publish(command)
             # An old pin without the wrapper-aware readiness protocol is refused.
             with zipfile.ZipFile(archive, 'w') as out:
@@ -1411,3 +1417,23 @@ class CodexQuotaWrapperLaunchTests(unittest.TestCase):
             (release / 'release.json').write_text(json.dumps({'host_version': release.name, 'artifacts': {
                 'hub.pyz': {'size': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}}}))
             self.assertIsNone(adapter.codex_exec_readiness(route, wrapper, release))
+
+    def test_wrapper_rejects_bypass_scripts(self):
+        if sys.platform != 'linux':
+            self.skipTest('Linux wrapper')
+        bypasses = {
+            'shebang-semicolon': '#!/usr/bin/env bash; set -euo pipefail; echo quota-gate.py; exec /synthetic/codex "$@"\n',
+            'echo-gate': '#!/usr/bin/env bash\nset -euo pipefail\necho quota-gate.py\nexec /synthetic/codex "$@"\n',
+            'conditional-gate': '#!/usr/bin/env bash\nset -euo pipefail\nif false; then python3 /tmp/quota-gate.py; fi\nexec /synthetic/codex "$@"\n',
+            'ignored-failure': '#!/usr/bin/env bash\nset -euo pipefail\npython3 /tmp/scripts/quota-gate.py || true\nexec /synthetic/codex "$@"\n',
+            'shadowed-python': '#!/usr/bin/env bash\nset -euo pipefail\npython3() { :; }\nrepo=%s\npython3 "$repo/scripts/quota-gate.py"\nexec /synthetic/codex "$@"\n' % self.root,
+            'reordered-statements': '#!/usr/bin/env bash\nrepo=%s\npython3 "$repo/scripts/quota-gate.py"\nset -euo pipefail\nexec /synthetic/codex "$@"\n' % self.root,
+        }
+        for name, body in bypasses.items():
+            bad = self.write_wrapper(f'{name}.sh', text=body)
+            with mock.patch.dict(os.environ, {'CODEX_LAUNCH_WRAPPER': str(bad)}):
+                with self.assertRaises(ValueError, msg=name):
+                    nl.codex_launch_wrapper()
+                calls, error = self.launch(interactive=False)
+                self.assertEqual(error, 'codex_launch_wrapper_unavailable', name)
+                self.assertEqual(calls, [], name)

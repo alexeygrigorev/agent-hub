@@ -188,7 +188,14 @@ def test_unsafe_missing_or_incompatible_wrapper_refuses_before_sdk(world, tmp_pa
     for name, body in {'raw-exec': '#!/usr/bin/env bash\nset -euo pipefail\nexec %s "$@"\n' % world.codex,
                        'no-fail-closed': '#!/usr/bin/env bash\npython3 %s/scripts/quota-gate.py\nexec %s "$@"\n' % (world.repo, world.codex),
                        'gate-only-in-comment': '#!/usr/bin/env bash\nset -euo pipefail\nexec %s "$@"\n# quota-gate.py\n' % world.codex,
-                       'extra-args': wrapper_text(world.repo, world.codex).replace('"$@"', '--x "$@"')}.items():
+                       'extra-args': wrapper_text(world.repo, world.codex).replace('"$@"', '--x "$@"'),
+                       'shebang-semicolon': '#!/usr/bin/env bash; set -euo pipefail; echo quota-gate.py; exec %s "$@"\n' % world.codex,
+                       'echo-gate': '#!/usr/bin/env bash\nset -euo pipefail\necho quota-gate.py\nexec %s "$@"\n' % world.codex,
+                       'conditional-gate': '#!/usr/bin/env bash\nset -euo pipefail\nif false; then python3 %s/scripts/quota-gate.py; fi\nexec %s "$@"\n' % (world.repo, world.codex),
+                       'ignored-failure': '#!/usr/bin/env bash\nset -euo pipefail\npython3 %s/scripts/quota-gate.py || true\nexec %s "$@"\n' % (world.repo, world.codex),
+                       'shadowed-python': '#!/usr/bin/env bash\nset -euo pipefail\npython3() { :; }\nrepo=%s\npython3 "$repo/scripts/quota-gate.py"\nexec %s "$@"\n' % (world.repo, world.codex),
+                       'reordered-statements': '#!/usr/bin/env bash\nrepo=%s\npython3 "$repo/scripts/quota-gate.py"\nset -euo pipefail\nexec %s "$@"\n' % (world.repo, world.codex),
+                       'repo-traversal': '#!/usr/bin/env bash\nset -euo pipefail\nrepo=%s/../repo\npython3 "$repo/scripts/quota-gate.py"\nexec %s "$@"\n' % (world.repo, world.codex)}.items():
         script = world.repo / ('scripts/%s.sh' % name)
         script.write_text(body)
         script.chmod(0o700)
@@ -281,6 +288,11 @@ def test_exec_readiness_requires_maintained_profile_for_this_archive(world, monk
         'other archive': [good[0], '-c', good[2].replace(str(archive), str(other)), 'shared-codex'],
         'other label': good[:-1] + ['someone-else'],
         'ungated handler': [good[0], '-c', good[2].replace('execute()', 'noop()'), 'shared-codex'],
+        'unverified interpreter': ['/tmp/evil-python', *good[1:]],
+        'extra flag': [good[0], '-u', *good[1:]],
+        'old archive ahead': [good[0], '-c', good[2].replace('import os;', f'sys.path.insert(0, {repr(str(other))}); import os;'), 'shared-codex'],
+        'additional statement': [good[0], '-c', good[2].replace('execute()', 'os.system("true"); execute()'), 'shared-codex'],
+        'wrong managed dir': [good[0], '-c', good[2].replace(repr(str(p.root())), repr(str(world.base / 'other-managed'))), 'shared-codex'],
     }
     for name, command in bad.items():
         profile_toml(config, command)
