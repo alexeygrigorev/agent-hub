@@ -237,6 +237,11 @@ def http_error(exc, key=None):
                        and isinstance(row.get('id'), str) and re.fullmatch(r'[a-fA-F0-9-]{36}', row['id'])]
                 if ids:
                     name += ' matches: ' + ', '.join(ids[:100])
+            if err in ('route_not_found', 'session_not_found') and exc.code == 404:
+                provider_guidance = ('; cause: Hub has no session with this id visible to this credential. '
+                                     'It is either not Hub-managed (an aplexer-native session: reach it with '
+                                     '`aplexer show <id|tag>` / `a message` on its host) or outside this '
+                                     "credential's intake scope (retry with an operator credential)")
             if err == 'provider_disabled':
                 provider_guidance = ' requested engine/model is disabled by policy; choose an allowed model or ask the policy owner to change the model pool'
         if isinstance(data, dict):
