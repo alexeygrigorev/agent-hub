@@ -16,6 +16,7 @@ import type { Actor, JsonRecord } from './types';
 export const ARTIFACT_MAX_BYTES = 6 * 1024 * 1024;
 export const ARTIFACT_MAX_PER_INTAKE = 16;
 export const ARTIFACT_MAX_TOTAL_BYTES = 48 * 1024 * 1024;
+export const ARTIFACT_MAX_PROJECT_BYTES = 512 * 1024 * 1024;
 // base64 of the largest PNG plus a small JSON envelope.
 export const ARTIFACT_BODY_LIMIT = Math.ceil(ARTIFACT_MAX_BYTES / 3) * 4 + 16_384;
 export const MAX_PREREQUISITES = 32;
@@ -42,9 +43,9 @@ export class IntakeRelations {
   prerequisites(intakeId: string): Prerequisite[] {
     const current = new Map<string, Prerequisite>();
     const rows = this.db.all<{ kind: string; body_json: string; actor_id: string; at: number }>(
-      "SELECT kind, body_json, actor_id, at FROM intake_events WHERE task_id=? AND kind IN ('dependency_added','dependency_removed') ORDER BY seq LIMIT 1024",
+      "SELECT kind, body_json, actor_id, at FROM intake_events WHERE task_id=? AND kind IN ('dependency_added','dependency_removed') ORDER BY seq DESC LIMIT 1024",
       intakeId,
-    );
+    ).reverse();
     for (const row of rows) {
       let body: JsonRecord;
       try { body = JSON.parse(row.body_json) as JsonRecord; } catch { continue; }
@@ -94,14 +95,15 @@ export class IntakeRelations {
     if (typeof body.key !== 'string' || !/^[A-Za-z0-9_.:-]{1,160}$/.test(body.key)) return error('idempotency_key_required', 400, 'key must be 1-160 of A-Z a-z 0-9 _ . : -');
     if (body.remove !== undefined && typeof body.remove !== 'boolean') return error('invalid_remove', 400, 'remove must be true or false');
     if (body.expected_version !== undefined && !Number.isSafeInteger(body.expected_version)) return error('invalid_expected_version', 400, 'expected_version must be an integer (task.control.version)');
-    let prerequisite: { id: string; project: string };
+    let prerequisite: { id: string; project: string } | null;
     try {
       prerequisite = JSON.parse(request.headers.get(PREREQUISITE_HEADER) || 'null');
     } catch { prerequisite = null as never; }
-    if (!prerequisite || typeof prerequisite.id !== 'string' || typeof prerequisite.project !== 'string')
+    if (!prerequisite || typeof prerequisite.id !== 'string' || !prerequisite.id || typeof prerequisite.project !== 'string')
       return error('prerequisite_unresolved', 400, 'the prerequisite (--on) was not resolved by the Hub router');
+    let target: { id: string; project: string } = prerequisite;
     const remove = body.remove === true, key = body.key;
-    const digest = await sha256Hex(JSON.stringify([prerequisite.id, remove]));
+    const digest = await sha256Hex(JSON.stringify([target.id, remove]));
     const eventKey = 'depend:' + intakeId + ':' + key;
     return this.hooks.transaction(() => {
       const intake = this.intake(intakeId);
@@ -111,23 +113,26 @@ export class IntakeRelations {
       if (previous) {
         const prior = JSON.parse(previous.body_json) as JsonRecord;
         return prior.request_digest === digest
-          ? json({ ...this.result(intake, remove ? 'removed' : 'added', prerequisite), duplicate: true })
+          ? json({ ...this.result(intake, remove ? 'removed' : 'added', target), duplicate: true })
           : error('idempotency_conflict', 409, 'this key was already used for a different prerequisite change');
       }
       if (CLOSED.includes(intake.status)) return error('intake_closed', 409, `dependent intake is ${intake.status}`);
       if (body.expected_version !== undefined && body.expected_version !== intake.updated_at)
         return error('intake_version_conflict', 409, `expected_version ${body.expected_version} is stale; current task.control.version is ${intake.updated_at}`);
-      if (prerequisite.id === intake.id) return error('dependency_self', 409, 'an intake cannot depend on itself');
+      if (target.id === intake.id) return error('dependency_self', 409, 'an intake cannot depend on itself');
       const current = this.prerequisites(intake.id);
-      const exists = current.some(p => p.intake_id === prerequisite.id);
-      if (remove && !exists) return error('dependency_not_found', 404, `intake ${intake.id} does not depend on ${prerequisite.id}`);
-      if (!remove && exists) return json({ ...this.result(intake, 'unchanged', prerequisite), duplicate: true });
+      const stored = current.find(p => p.intake_id === target.id);
+      if (stored && !target.project) target = { id: stored.intake_id, project: stored.project };
+      const exists = !!stored;
+      if (remove && !exists) return error('dependency_not_found', 404, `intake ${intake.id} does not depend on ${target.id}`);
+      if (!remove && !target.project) return error('prerequisite_unresolved', 400, 'the prerequisite (--on) was not resolved by the Hub router');
+      if (!remove && exists) return json({ ...this.result(intake, 'unchanged', target), duplicate: true });
       if (!remove && current.length >= MAX_PREREQUISITES) return error('dependency_limit', 409, `at most ${MAX_PREREQUISITES} prerequisites per intake`);
       const at = Math.max(Date.now(), intake.updated_at + 1);
       this.hooks.append(intake.id, eventKey, actor!.id, remove ? 'dependency_removed' : 'dependency_added',
-        { on: prerequisite.id, on_project: prerequisite.project, request_digest: digest }, at);
+        { on: target.id, on_project: target.project, request_digest: digest }, at);
       this.db.run('UPDATE intakes SET updated_at=? WHERE id=?', at, intake.id);
-      return json(this.result({ ...intake, updated_at: at }, remove ? 'removed' : 'added', prerequisite), remove ? 200 : 201);
+      return json(this.result({ ...intake, updated_at: at }, remove ? 'removed' : 'added', target), remove ? 200 : 201);
     });
   }
 
@@ -142,14 +147,20 @@ export class IntakeRelations {
     return this.tableReady;
   }
 
+  /** Standalone DDL (never inside a write transaction), so a rolled-back upload cannot leave a stale flag. */
   private ensureTable(): void {
     if (this.hasTable()) return;
     this.db.run(ARTIFACT_TABLE);
-    this.tableReady = true;
+    this.tableReady = false;
+    this.hasTable();
   }
 
   private async upload(request: Request, intakeId: string): Promise<Response> {
     const actor = actorFrom(request);
+    // Authorize before buffering up to 8 MiB of base64.
+    const target = this.intake(intakeId);
+    if (!target) return error('intake_not_found', 404, `intake ${intakeId} does not exist in this project`);
+    if (!this.canUpload(actor, target)) return error('forbidden', 403, 'caller is neither an operator, a project writer nor the session bound to this intake');
     let raw: string;
     try { raw = await boundedText(request, ARTIFACT_BODY_LIMIT); }
     catch (caught) {
@@ -166,6 +177,8 @@ export class IntakeRelations {
     if (body.sanitized !== true) return error('sanitized_attestation_required', 400, 'sanitized check failed: pass --sanitized after reviewing pixels and metadata');
     if (body.media_type !== 'image/png') return error('unsupported_media_type', 415, 'type check failed: only image/png is accepted');
     if (typeof body.data_base64 !== 'string' || !body.data_base64) return error('invalid_png', 400, 'type check failed: data_base64 is missing');
+    // Canonical base64 only, so every stored artifact downloads with strict decoders.
+    if (body.data_base64.length % 4 || !/^[A-Za-z0-9+/]*={0,2}$/.test(body.data_base64)) return error('invalid_png', 400, 'type check failed: data_base64 is not canonical base64');
     let bytes: Uint8Array;
     try { bytes = Uint8Array.from(atob(body.data_base64), c => c.charCodeAt(0)); }
     catch { return error('invalid_png', 400, 'type check failed: data_base64 is not valid base64'); }
@@ -175,11 +188,11 @@ export class IntakeRelations {
     // sha256 of the PNG bytes, so `sha256sum file.png` matches.
     const sha256 = [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))].map(b => b.toString(16).padStart(2, '0')).join('');
     const name = body.name, dataBase64 = body.data_base64, size = bytes.byteLength;
+    this.ensureTable();
     return this.hooks.transaction(() => {
       const intake = this.intake(intakeId);
       if (!intake) return error('intake_not_found', 404, `intake ${intakeId} does not exist in this project`);
       if (!this.canUpload(actor, intake)) return error('forbidden', 403, 'caller is neither an operator, a project writer nor the session bound to this intake');
-      this.ensureTable();
       const existing = this.db.one<{ sha256: string }>('SELECT sha256 FROM intake_artifacts WHERE intake_id=? AND name=?', intake.id, name);
       if (existing) return existing.sha256 === sha256
         ? json({ intake_id: intake.id, name, media_type: 'image/png', bytes: size, sha256, duplicate: true })
@@ -187,6 +200,8 @@ export class IntakeRelations {
       const totals = this.db.one<{ n: number; total: number }>('SELECT COUNT(*) AS n, COALESCE(SUM(bytes),0) AS total FROM intake_artifacts WHERE intake_id=?', intake.id)!;
       if (totals.n >= ARTIFACT_MAX_PER_INTAKE) return error('artifact_limit', 409, `count check failed: at most ${ARTIFACT_MAX_PER_INTAKE} artifacts per intake`);
       if (totals.total + size > ARTIFACT_MAX_TOTAL_BYTES) return error('artifact_limit', 409, `total size check failed: at most ${ARTIFACT_MAX_TOTAL_BYTES} bytes per intake`);
+      const project = this.db.one<{ total: number }>('SELECT COALESCE(SUM(bytes),0) AS total FROM intake_artifacts')!;
+      if (project.total + size > ARTIFACT_MAX_PROJECT_BYTES) return error('artifact_limit', 409, `project size check failed: at most ${ARTIFACT_MAX_PROJECT_BYTES} bytes of artifacts per project`);
       const at = Date.now();
       this.db.run('INSERT INTO intake_artifacts(intake_id,name,media_type,bytes,sha256,data_base64,actor_id,created_at) VALUES(?,?,?,?,?,?,?,?)',
         intake.id, name, 'image/png', size, sha256, dataBase64, actor!.id, at);
