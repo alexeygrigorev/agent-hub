@@ -230,6 +230,22 @@ class NamespaceTransitionTests(unittest.TestCase):
         unpack_wheel(wheel, target, replace_namespace='hub2_agent_hub_host',
                      replace_distribution='agent-hub-host-v2')
 
+    def test_matching_new_protocol_passes_in_both_namespaces(self):
+        for namespace in ('agent_hub_host', 'hub2_agent_hub_host'):
+            with self.subTest(namespace=namespace):
+                target, download, wheel, _, manifest = self.candidate(
+                    'protocol-two-' + namespace, namespace)
+                self.prepare(target, download, wheel)
+                protocol_two = write_host_wheel(
+                    download / 'protocol-two', namespace, protocol=2)
+                unpack_wheel(protocol_two, target, replace_namespace=namespace,
+                             replace_distribution='agent-hub-host-v2')
+                manifest['protocol_version'] = 2
+                updater.check_host_package(target, manifest)
+                manifest['protocol_version'] = 1
+                with self.assertRaises(RuntimeError):
+                    updater.check_host_package(target, manifest)
+
     def test_old_and_new_wheels_pass_before_updater_replacement(self):
         old_target, old_download, old_wheel, _, old_manifest = self.candidate(
             'old-candidate', 'agent_hub_host')
