@@ -67,14 +67,20 @@ export class MailboxDO{
  }
  private async directory(recipient:string,effectEnv:Env=this.env,caller?:Actor):Promise<{mailbox:string;forward_session?:string|null}>{
   const response=await effectEnv.CONTROL.get(effectEnv.CONTROL.idFromName('global')).fetch(new Request('https://control.internal/_recipient',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(caller&&recipient==='human:me'?{recipient,caller:{id:caller.id,kind:caller.kind,resource_id:caller.resource_id,family_id:caller.family_id}}:{recipient})}));
-  if(!response.ok)throw new HttpError(response.status===409?'ambiguous_recipient':'recipient_unknown',response.status===404?404:response.status===409?409:503);const result=await response.json() as {mailbox:string;forward_session?:string|null};
+  if(!response.ok){
+   // Keep Control's own code: a 503 route_acl_corrupt is a server fault, not an unknown recipient.
+   const code=await response.json().then(v=>(v as {error?:unknown}).error).catch(()=>undefined);
+   throw response.status===404?new HttpError('recipient_unknown',404):response.status===409?new HttpError('ambiguous_recipient',409):new HttpError(typeof code==='string'&&/^[a-z_]{1,60}$/.test(code)?code:'directory_unavailable',503);
+  }const result=await response.json() as {mailbox:string;forward_session?:string|null};
   if(!boundedString(result.mailbox,180))throw new HttpError('invalid_directory_result',503);return result;
  }
  private async send(r:Request,owner:string):Promise<Response>{
   const b=await bodyObject(r);if(!boundedString(b.recipient,180)||!boundedString(b.body,12000)||!boundedString(b.key,120)||(b.reply_to!==undefined&&!boundedString(b.reply_to,120)))return error('invalid_message',400);
-  const digest=await sha256Hex(JSON.stringify([b.recipient,b.body,b.reply_to??null,b.parent_sender??null]));
+  // human:me is resolved before the digest, so a replayed key can never stand for a different human (t3280u).
+  const alias=b.recipient==='human:me'?await this.directory('human:me',this.env,actorFrom(r)):undefined;
+  const digest=await sha256Hex(JSON.stringify([alias?alias.mailbox:b.recipient,b.body,b.reply_to??null,b.parent_sender??null]));
   const prior=this.db.one<Mail>('SELECT * FROM messages WHERE sender=? AND key=?',owner,b.key);if(prior)return prior.digest===digest?json({message:this.view(prior),replayed:true}):error('idempotency_conflict',409);
-  const target=await this.directory(String(b.recipient),this.env,actorFrom(r));let thread=crypto.randomUUID();
+  const target=alias||await this.directory(String(b.recipient));let thread=crypto.randomUUID();
   if(b.reply_to){
    const parent=this.db.one<Mail>('SELECT * FROM messages WHERE id=?',b.reply_to);
    if(!boundedString(b.parent_sender,180))return error('parent_sender_required',400);
@@ -143,7 +149,7 @@ export class MailboxDO{
   const b=await bodyObject(r,4096);if(!boundedString(b.recipient,180)||!boundedString(b.key,120)||!Number.isSafeInteger(b.epoch))return error('readdress_key_epoch_required',400);
   const digest=await sha256Hex(JSON.stringify([m.id,b.recipient,b.epoch])),old=this.db.one<Move>('SELECT * FROM readdress_operations WHERE sender=? AND key=?',m.sender,b.key);
   if(old){if(old.digest!==digest)return error('idempotency_conflict',409);if(old.result_json)return json(JSON.parse(old.result_json));}
-  const target=await this.directory(String(b.recipient));
+  const target=await this.directory(String(b.recipient),this.env,actor);
   const refused=this.db.transaction(this.ctx,()=>{
    const race=this.db.one<Move>('SELECT * FROM readdress_operations WHERE sender=? AND key=?',m.sender,b.key);
    if(race){if(race.digest!==digest)throw new HttpError('idempotency_conflict',409);return undefined;}
