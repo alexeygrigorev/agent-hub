@@ -1727,6 +1727,10 @@ class CanaryTest(unittest.TestCase):
         fifo.unlink(missing_ok=True)
         os.mkfifo(fifo, 0o600)
         self.handoff_rfd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+        # Fence state is tracked separately from the fd: a missing/closed fd is never proof of EOF.
+        self.handoff_handshake = False        # "H" read: the producer armed the fence before forking
+        self.handoff_fence_eof = False        # EOF proven after arming (or after proven retirement)
+        self.handoff_producer_retired = False # set only by a test that itself reaped the sole producer
         self.addCleanup(self.close_handoff_fence)  # LIFO: runs after any later-registered reap
 
     def close_handoff_fence(self):
@@ -1741,7 +1745,11 @@ class CanaryTest(unittest.TestCase):
         write end of handoff.fifo, writes a handshake byte, forks the chain and closes its own copy.
         The write fd is inherited atomically by every fork, so a generation holds it from birth
         (even before it records itself) until its exit; EOF on the test-held read end therefore
-        means no chain member is alive anywhere. Recorded "pid starttime" are used only to signal:
+        means no chain member is alive anywhere -- but only once the fence is ARMED. Before the
+        handshake the read end also reads EOF simply because no producer has opened it yet (it may
+        still be starting), so an unarmed EOF is UNKNOWN and is accepted only when the test has
+        itself reaped the sole producer (handoff_producer_retired); otherwise it waits for the
+        handshake until the deadline and raises. Recorded "pid starttime" are used only to signal:
         through a pidfd re-verified against starttime (a recycled PID is never signalled), then
         awaited on that pidfd. Returns (members, killed, ended); raises on deadline.
         """
@@ -1749,7 +1757,7 @@ class CanaryTest(unittest.TestCase):
         (self.tmp / "handoff.stop").touch()
         rfd = getattr(self, "handoff_rfd", None)
         end = time.monotonic() + deadline_s
-        done, killed, handshake = set(), 0, False
+        done, killed = set(), 0
         while True:
             members = self.handoff_members()
             for pid_s, start in members:
@@ -1785,8 +1793,10 @@ class CanaryTest(unittest.TestCase):
                 finally:
                     os.close(fd)
                 done.add((pid_s, start))
-            if rfd is None:  # fence already proven EOF and closed by an earlier call
-                return members, killed, self.handoff_ended()
+            if rfd is None:
+                if getattr(self, "handoff_fence_eof", False):  # proven EOF by an earlier call
+                    return members, killed, self.handoff_ended()
+                raise AssertionError("handoff fence fd missing without proven EOF")
             eof = False
             while True:
                 try:
@@ -1796,22 +1806,31 @@ class CanaryTest(unittest.TestCase):
                 if not chunk:
                     eof = True
                     break
-                handshake = handshake or b"H" in chunk
-            if eof:
-                # No writer remains: every generation (recorded or not) has exited. A recorded chain
-                # without the handshake would mean the fence was never armed: refuse to claim success.
-                if members and not handshake:
+                if b"H" in chunk:
+                    self.handoff_handshake = True  # persisted: an earlier timed-out call may consume it
+            armed = self.handoff_handshake
+            if eof and (armed or self.handoff_producer_retired):
+                # No writer remains. Armed: every generation (recorded or not) has exited. Unarmed but
+                # the producer was reaped by the test: no opener can still appear, so no chain exists.
+                # A recorded chain without the handshake means the fence was never armed: refuse.
+                if members and not armed:
                     raise AssertionError("handoff chain recorded but fence handshake missing")
                 os.close(rfd)
                 self.handoff_rfd = None
+                self.handoff_fence_eof = True
                 return self.handoff_members(), killed, self.handoff_ended()
             if time.monotonic() >= end:
+                if not armed:
+                    raise AssertionError("handoff fence never armed and its producer is not proven retired")
                 raise AssertionError("escaped handoff chain still holds the fence after stop+SIGKILL")
-            select.select([rfd], [], [], 0.02)
+            if eof:  # unarmed EOF: a still-starting producer may open the fence; poll for the handshake
+                time.sleep(0.02)
+            else:
+                select.select([rfd], [], [], 0.02)
 
     def write_updater(self, root, *, delay=0.0, converge=True, exit_code=0, grandchild=False,
                       linger=False, ignore_term=False, signal_canary=False, handoff=False,
-                      handoff_late_gen=-1, handoff_late_s=0.0):
+                      handoff_late_gen=-1, handoff_late_s=0.0, handoff_start_delay_s=0.0):
         """Real Python stand-in for the installed updater, run by the canary as its owned child."""
         sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
         staged = self.tmp / "staged-release" / sha
@@ -1832,6 +1851,7 @@ if {handoff!r}:
     # and forks only if not stopped; a generation that stops by itself records "end ..." instead.
     # Kernel fence: the inherited write end of the test's FIFO is held by every generation from
     # its fork until its exit (no reader -> ENXIO, the fixture refuses to run unfenced).
+    time.sleep({handoff_start_delay_s!r})  # deterministic delay before the producer arms the fence
     fence = os.open(D / "handoff.fifo", os.O_WRONLY | os.O_NONBLOCK)
     os.write(fence, b"H")
     if os.fork() == 0:
@@ -2152,9 +2172,9 @@ sys.exit({exit_code!r})
         # C1 regression: a setsid'd, TERM-ignoring chain forks and exits continuously. The
         # supervisor (child subreaper) adopts every generation and proves emptiness only by ECHILD.
         root = self.gate_root(delay=0.05, converge=True, handoff=True)
-        # Installed before the chain can exist; LIFO, so the escaped chain is stopped, SIGKILLed and
-        # awaited on every assertion/timeout path, then the original group is swept.
-        self.addCleanup(self.kill_leftovers)
+        # Installed before the chain can exist, so the escaped chain is stopped, SIGKILLed and awaited
+        # on every assertion/timeout path. No raw killpg of the saved updater PGID: run_gate returns
+        # only after the canary (and its supervisor) were reaped, so that number has no owned custody.
         self.addCleanup(self.reap_handoff_chain)
         r, v = self.run_gate(root, 8)
         self.assertEqual(r.returncode, 1, r.stderr)
@@ -2246,6 +2266,57 @@ sys.exit({exit_code!r})
         self.assertIsNone(self.handoff_rfd)        # fence proven EOF and released
         time.sleep(0.3)
         self.assertEqual(len(self.handoff_members()), len(members))
+
+    def spawn_handoff_producer(self, root):
+        """Own the producer (updater leader) as an unreaped Popen; killed and awaited on every path."""
+        proc = subprocess.Popen([sys.executable, str(root / "updater.py")], cwd="/", stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        def retire():
+            if proc.returncode is None:
+                proc.kill()  # still our unreaped child: the pid cannot have been reused
+                proc.wait(10)
+        self.addCleanup(retire)  # LIFO: runs before the backstop reap registered earlier
+        return proc
+
+    def test_handoff_cleanup_waits_for_a_delayed_first_handshake(self):
+        # T1 unarmed EOF: cleanup starts while the producer has not opened the fence yet. The initial
+        # zero-byte read is no-writer EOF, not chain completion; cleanup must wait for the handshake.
+        start_s = 0.8
+        root = self.gate_root(converge=False, handoff=True, handoff_start_delay_s=start_s)
+        self.addCleanup(self.reap_handoff_chain)
+        proc = self.spawn_handoff_producer(root)
+        t0 = time.monotonic()
+        members, killed, ended = self.reap_handoff_chain(deadline_s=10.0)
+        waited = time.monotonic() - t0
+        self.assertTrue(self.handoff_handshake)       # success only after the fence was armed ...
+        self.assertTrue(self.handoff_fence_eof)       # ... and then proven EOF
+        self.assertGreater(waited, start_s / 2)       # it did not return on the initial unarmed EOF
+        self.assertGreaterEqual(len(members), 1, members)  # the chain started after cleanup began ...
+        self.assertGreaterEqual(killed + ended, 1)    # ... and was SIGKILLed or obeyed the stop file
+        self.assertEqual([p for p, _ in members if self.alive(int(p))], [])
+        self.assertEqual(proc.wait(10), 0)
+
+    def test_handoff_cleanup_refuses_unarmed_eof_until_producer_is_proven_retired(self):
+        # Abort negative: the producer is still starting past the cleanup deadline. An unarmed EOF
+        # must fail (not succeed) and the fd must stay open; only after the test itself kills and
+        # reaps the sole producer before it armed is the no-chain EOF accepted.
+        root = self.gate_root(converge=False, handoff=True, handoff_start_delay_s=30.0)
+        self.addCleanup(self.reap_handoff_chain)
+        proc = self.spawn_handoff_producer(root)
+        with self.assertRaisesRegex(AssertionError, "never armed"):
+            self.reap_handoff_chain(deadline_s=0.3)
+        self.assertIsNotNone(self.handoff_rfd)        # missing fd is not EOF; no false release
+        self.assertFalse(self.handoff_fence_eof)
+        self.assertIsNone(proc.poll())                # still starting: absence of H was UNKNOWN
+        proc.kill()
+        self.assertEqual(proc.wait(10), -signal.SIGKILL)
+        self.handoff_producer_retired = True          # authoritative: our reaped child was the sole opener
+        members, killed, ended = self.reap_handoff_chain(deadline_s=5.0)
+        self.assertEqual((members, killed, ended), ([], 0, False))
+        self.assertFalse(self.handoff_handshake)
+        self.assertTrue(self.handoff_fence_eof)
+        self.assertIsNone(self.handoff_rfd)
 
     def test_updater_execs_with_unblocked_signals_and_cooperative_term_exits(self):
         # C2: the canary blocks TERM/INT/HUP only around spawn+record; the updater must not inherit it.
