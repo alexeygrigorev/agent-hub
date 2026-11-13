@@ -158,6 +158,19 @@ test('intake edits preserve original ask and notes/history; archive search pagin
  assert.equal((await f.call('/api/intakes/'+initial.id,'PATCH',{key:'foreign',note:'bad'},{id:'agent:x',kind:'agent',resource_id:'other',scopes:['intake:write']})).status,403);
  assert.equal((await f.call('/api/intakes/'+initial.id,'PATCH',{key:'stale',expected_updated_at:-1,priority:1})).status,409);
 });
+test('long verbatim acceptance criteria are accepted and criteria failures name the exact check',async()=>{
+ const f=fixture(),verbatim='AC1 verbatim: '+'Alexey words '.repeat(170);assert(verbatim.length>2100);
+ const created=await f.call('/api/intakes?project=org/a','POST',{key:'long-ac',title:'Long AC',text:'Long verbatim criterion',acceptance_criteria:[verbatim,'AC2 short']});
+ assert.equal(created.status,201);const stored=(await body(created)).intake;assert.equal(stored.acceptance_criteria[0],verbatim.trim());
+ const reject=async(criteria:unknown,code:string,detail:RegExp)=>{const result=await f.call('/api/intakes?project=org/a','POST',{key:'bad-'+code,title:'Bad',text:'Bad criteria',acceptance_criteria:criteria});assert.equal(result.status,400);const value=await body(result);assert.equal(value.error,code);assert.match(value.detail,detail);};
+ await reject(['ok','x'.repeat(6001)],'acceptance_criterion_too_long',/criterion 2 is 6001 characters; max 6000/);
+ await reject([],'acceptance_criteria_required',/at least one/);
+ await reject(['ok','  '],'acceptance_criterion_empty',/criterion 2/);
+ await reject(Array.from({length:33},(_,i)=>'AC'+i),'acceptance_criteria_too_many',/33 criteria; max 32/);
+ const edit=await f.call('/api/intakes/'+stored.id,'PATCH',{key:'edit-long',acceptance_criteria:['y'.repeat(6001)]});assert.equal(edit.status,400);assert.equal((await body(edit)).error,'acceptance_criterion_too_long');
+ assert.equal((await f.call('/api/intakes/'+stored.id,'PATCH',{key:'edit-ok',acceptance_criteria:[verbatim]})).status,200);
+});
+
 test('schedule adapter creates distinct child provenance and actual launch saga, replay creates no duplicate',async()=>{
  const f=fixture(),parent=await intake(f);
  const created=await body(await f.call('/api/schedules','POST',{key:'writer',intake_id:parent.id,kind:'writer',interval_ms:60000,overlap:'allow',payload:{start:{workspace:'/tmp/synthetic-workspace',engine:'shell',machine_id:'h1',override_reason:'Synthetic semantic test only'}}}));
