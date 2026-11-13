@@ -2331,7 +2331,8 @@ def hydrogen_native_proof(r, rec, run_id, sample, parent_intake_id, child_id, si
     proof = rec['native_proof'] = {
         'status': 'UNKNOWN', 'proof_class': NATIVE_PROOF_CLASSES['antigravity'], 'model': HYDROGEN_MODEL,
         'native_action_verified': False, 'typed_stdout_verified': False,
-        'acquisitions': 0, 'key_attempted': False, 'key_bytes_sent': 0, 'reason': 'not_started',
+        'acquisitions': 0, 'not_ready_views': 0, 'key_attempted': False, 'key_bytes_sent': 0,
+        'reason': 'not_started',
     }
     rec['capture_verified'] = False
     cdeadline = clock() + CAPTURE_BUDGET_S
@@ -2418,6 +2419,7 @@ def hydrogen_native_proof(r, rec, run_id, sample, parent_intake_id, child_id, si
             return
         if state['key_attempted'] or state['reason'] not in HYDROGEN_NOT_READY_REASONS:
             break
+        proof['not_ready_views'] += 1
         if clock() >= cdeadline:
             break
         sleep(min(1, max(0.01, cdeadline - clock())))

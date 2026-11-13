@@ -121,43 +121,53 @@ Within the 90-second capture window, the driver requires BOTH:
    - **Claude (`claude_native_pane_v1`)**: completed `● Bash(...)` heading and
      output-tree block carrying `AC10_WORK_V2 <run_id> <sample> <proof_digest> <head> 5050`
      (`Waiting…`, hooks-only, and assistant prose are nonproof).
-   - **Hydrogen (`hydrogen_native_pane_v1`): native proof is UNAVAILABLE
-     today (`UNKNOWN_NATIVE_FRAMING`).** No Hydrogen native framing contract
-     is qualified. Root's genuine observation 1 validated the canonical
-     artifact, but its plain viewport showed only an assistant footer with zero
-     candidate command rows; that is artifact evidence, not native-format
-     proof. An exact `● Ran (<cmd>) (ctrl+o to expand)` row cannot distinguish
-     a completed native action from assistant/footer text, a same-command
-     `Running` row, a failed exit or a duplicate row. Therefore:
-     - There is no Hydrogen entry in `NATIVE_PROOF_CLASSES`.
-       `native_transport_ok('antigravity', ...)` and
-       `native_pane_output_ok(..., 'antigravity', ...)` always return false,
-       whatever class label (v2, v3, v4, ...) a record carries. A class label
-       is not attestation, and no record, flag, environment variable or
-       same-UID artifact from an agent can enable it.
-     - An operator bundle naming an `antigravity` transport is refused with
-       `capture_antigravity native proof UNAVAILABLE: UNKNOWN_NATIVE_FRAMING`.
-     - A Hydrogen draw in a run is not resampled and Hydrogen is not
-       excluded from the picker. The driver still verifies the canonical
-       artifact and per-sample probe file as **artifact-only** evidence
-       (`artifact_only`), records `native_proof = {status: UNAVAILABLE,
-       reason: UNKNOWN_NATIVE_FRAMING, root_checker_status:
-       NEEDS_ROOT_RENDERER_ATTESTATION, native_action_verified: false,
-       typed_stdout_verified: false}`, and fails the sample. Cleanup runs as
-       usual.
-     - This matches Root's approved private V2 checker (manifest
-       `573458fe...55ad`). That checker always exits 2 with
-       `NEEDS_ROOT_RENDERER_ATTESTATION` and reports native_action_verified,
-       typed_stdout and final10 all false, even when the artifact or the
-       exact row is valid.
-     - `hydrogen_framing_diagnostic()` is a forward-looking support hook. It
-       counts exact short-command rows and flags same-command
-       Running/error rows and duplicates, and its status is always
-       `UNKNOWN_NATIVE_FRAMING`. The short per-sample command
-       `python3 .local/a10/<run8><nn>.py`, the probe-file check and the
-       artifact validation stay in place as preparation. None of them can
-       create native authority on their own. The driver does not infer typed
-       stdout, expanded completion or section grammar from old raw ANSI.
+   - **Hydrogen (`hydrogen_native_pane_v2`, proof class
+     `hydrogen_expanded_native_bash_plus_artifact_v1`), model
+     `gemini-4-hydrogen-medium` only.** Proof comes from ONE live styled-screen
+     SVG buffer captured with `a capture <native_id> --screen --svg`, never from
+     the plain viewport, a collapsed `Ran` row, or the artifact alone:
+     - `scripts/hydrogen_frame.py` (reviewed recognizer V2) accepts exactly one
+       styled SVG with the exact native Bash header, the per-sample command
+       `python3 .local/h7_<12hex>_<NN>.py` (`12hex = sha256(C([run_id, sample]))[:12]`;
+       the brief is frozen before the child id exists, so the child id is bound
+       through the artifact instead), completed timestamps (strict offset and
+       round trip), exit code 0 and the canonical challenge stdout. It refuses
+       collapsed, plain, ANSI, footer, quoted, running, error, duplicate,
+       truncated and hidden/nested SVG frames, and contradictory same-command
+       or context rows.
+     - `scripts/hydrogen_acquire.py` (display acquirer V2) runs inside the
+       single 90-second proof window. An already expanded frame needs zero
+       keys. Otherwise only the observed idle collapsed/aggregate completion
+       view (real `ctrl+o` hint, empty idle composer, aggregate count 2..9)
+       under the fresh owned Hub/native identity, provider and version allows
+       exactly one `0x0f`. No text, Enter, startup, trust or permission assist
+       is ever sent. After the key there are at most two post-key captures
+       within a 10-second absolute budget (actual remaining time per call, no
+       floor), and a lost send ACK is never replayed. Any other view, identity
+       drift or ordinary race yields UNKNOWN with no retry.
+     - `scripts/hydrogen_native.py` (native adapter, review N1 closed) uses the
+       existing `a capture <uuid> --screen --svg` and `a send <uuid> --hex 0f
+       --json`. Before the send it writes a durable Root-owned `0600` `O_EXCL`
+       attempt fence under `<output-dir>/hydrogen-fence` (file and parent
+       fsync) that binds lineage, native birth, session, epoch, attempt,
+       operation, digest and artifact. There is no fallback, and a malformed
+       or equal intent never mints a second fence or key.
+     - `Runner.run_bounded` is used only by the Hydrogen adapter. It is a
+       Popen/selector collector with a cap per stream, the remaining deadline
+       and terminate/kill/reap of only its own capture child, so output is
+       bounded while it is collected, not checked after return. All other
+       `Runner` callers are unchanged.
+     - `scripts/hydrogen_helper.py` renders the Root-pinned canonical helper
+       per sample before dispatch. The artifact must match those exact pinned
+       probe bytes.
+     - The transport record (`HYDROGEN_TRANSPORT_KEYS`) must carry the
+       Root-attested client and provider executable paths/SHA-256 values, the
+       provider version and the same-commit host release SHA. A missing or
+       mismatched record fails the sample before any capture or key.
+     - Every OTHER antigravity model keeps the honest UNAVAILABLE gate
+       (`UNKNOWN_NATIVE_FRAMING`, `NEEDS_ROOT_RENDERER_ATTESTATION`), and a
+       Hydrogen record never extends to them. Draws are never resampled and no
+       model is excluded from the picker.
    - Trust menus (`Do you trust the contents of this project?`), raw headless
      JSON stream frames, prompt echoes, and unknown engines fail closed.
 
@@ -234,16 +244,20 @@ Cleanup runs under a single 60-second budget:
 
 ## Hydrogen: source prep vs remaining runtime and full-10 work (open)
 
-This source makes Hydrogen proof an honest UNAVAILABLE gate. It does **not**
-complete the formal ten-sample goal. These items remain open:
+This source adds offline-tested Hydrogen native-proof support (see
+`host/tests/test_cli_hydrogen_acceptance.py`: recognizer positives and
+negatives on sanitized synthetic SVG fixtures, idle-aggregate eligibility,
+N1 regression, bounded-collector caps/timeout/inherited pipe, real helper
+execution, and process-fake end-to-end zero-key, one-key, lost-ACK no-replay,
+post-key failure, unsupported view/identity, attestation mismatch and
+natural-exit-after-proof-before-live-STOP negatives). It does **not** complete
+the formal ten-sample goal. These items remain open:
 
-1. A Root-qualified preflight of the actual Hydrogen renderer. It must show
-   real sanitized renderings that separate a completed native action from
-   assistant text and from Running, failed or duplicate rows, with the
-   executed probe bytes pinned before the action.
-2. After that, a separately source-reviewed framing recognizer that replaces
-   `hydrogen_framing_diagnostic()`/`_hydrogen_native_pane_ok()` and adds
-   the Hydrogen proof class, tested against those genuine fixtures.
-3. Root review of this exact source, exact CI and head integration, and a
-   qualified runtime proof. Formal Hydrogen support and the full ten-sample
-   acceptance criteria stay OPEN until all of these are done.
+1. Root review of this exact source, exact full CI and head integration.
+2. Root attestation of the Hydrogen transport record (client/provider
+   executables, provider version) at the same commit.
+3. The separate trust-menu fix: the earlier live Hydrogen preflight was
+   assisted, so it earns no unassisted formal credit.
+4. A Root-run formal ten-sample live qualification. Formal Hydrogen support
+   and the full ten-sample acceptance criteria stay OPEN until all of these
+   are done.
