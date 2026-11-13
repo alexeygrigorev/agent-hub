@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import os
+import re
 import stat
 import subprocess
 import threading
@@ -23,6 +24,9 @@ _LOCK = threading.Lock()
 _MARKER = 'hub-intake-owner.json'
 _OWNERS_DIR = 'hub-intake-owners'
 _LOCK_FILE = 'hub-implement-workspace.lock'
+_HUB_SESSION_LOCK_RE = re.compile(
+    r'^hub-session ([0-9a-fA-F-]{8,64}) intake ([A-Za-z0-9][A-Za-z0-9._:-]{0,127}|none)$'
+)
 # Version 2 records are only ever published once ownership is complete
 # (phase "owned"); earlier pre-creation records are rejected fail-closed.
 _RECORD_VERSION = 2
@@ -33,7 +37,7 @@ _RECORD_SOURCES = frozenset({'prepare', 'legacy_worktree_bootstrap', 'operator_l
 def _run_git(root, args, allowed=(0,)):
     # Never propagate Git's argv/stderr (remote URLs may contain credentials).
     operation = args[0] if args and args[0] in {
-        'rev-parse', 'fetch', 'worktree', 'for-each-ref', 'symbolic-ref'
+        'rev-parse', 'fetch', 'worktree', 'for-each-ref', 'symbolic-ref', 'ls-remote'
     } else 'other'
     try:
         result = subprocess.run(['git', '-C', str(root), *args], capture_output=True,
@@ -124,11 +128,140 @@ def _branch_tip(root, ref):
     return tip
 
 
+def _worktree_entries(root):
+    """Parse `git worktree list --porcelain -z` into a list of worktree dicts."""
+    raw = _run_git(root, ('worktree', 'list', '--porcelain', '-z'))[1]
+    entries = []
+    current = None
+    for token in raw.split('\0'):
+        if not token:
+            if current is not None:
+                entries.append(current)
+                current = None
+            continue
+        if token.startswith('worktree '):
+            if current is not None:
+                entries.append(current)
+            current = {
+                'path': token[len('worktree '):],
+                'branch': None,
+                'locked': False,
+                'lock_reason': None,
+                'prunable': False,
+            }
+            continue
+        if current is None:
+            continue
+        if token.startswith('branch '):
+            current['branch'] = token[len('branch '):]
+        elif token == 'locked':
+            current['locked'] = True
+        elif token.startswith('locked '):
+            current['locked'] = True
+            current['lock_reason'] = token[len('locked '):].strip() or None
+        elif token == 'prunable' or token.startswith('prunable '):
+            current['prunable'] = True
+    if current is not None:
+        entries.append(current)
+    return entries
+
+
+def _parse_hub_lock(reason):
+    if not reason:
+        return None
+    match = _HUB_SESSION_LOCK_RE.fullmatch(reason.strip())
+    if not match:
+        return None
+    intake = None if match.group(2) == 'none' else match.group(2)
+    return match.group(1), intake
+
+
+def _release_stale_lock(root, entry, session_is_dead):
+    """Unlock a worktree when its Hub session lock belongs to a dead session.
+
+    Returns True if unlocked (or not locked), False if still locked.
+    """
+    if not entry.get('locked'):
+        return True
+    parsed = _parse_hub_lock(entry.get('lock_reason'))
+    if parsed and session_is_dead is not None:
+        sid, _intake = parsed
+        try:
+            dead = bool(session_is_dead(sid))
+        except Exception:
+            dead = False
+        if dead:
+            _git(root, 'worktree', 'unlock', entry['path'])
+            entry['locked'] = False
+            entry['lock_reason'] = None
+            return True
+    return False
+
+
+def _lock_detail(entry):
+    if not entry.get('locked'):
+        return ''
+    parsed = _parse_hub_lock(entry.get('lock_reason'))
+    if parsed:
+        return f' lock_session={parsed[0]}'
+    reason = entry.get('lock_reason') or 'locked'
+    return f' lock={reason[:80]}'
+
+
+def _prunable_owned_by_identity(common, worktree_path, identity):
+    """True only when a prunable worktree's admin dir carries a matching owner marker."""
+    worktrees_dir = common / 'worktrees'
+    if not worktrees_dir.is_dir():
+        return False
+    norm_target = os.path.normpath(worktree_path)
+    for admin in worktrees_dir.iterdir():
+        if not admin.is_dir() or admin.is_symlink():
+            continue
+        gitdir_file = admin / 'gitdir'
+        marker = admin / _MARKER
+        if not gitdir_file.is_file() or not marker.is_file() or marker.is_symlink():
+            continue
+        try:
+            recorded_gitdir = gitdir_file.read_text(encoding='utf-8').strip()
+        except OSError:
+            continue
+        recorded_wt = os.path.normpath(os.path.dirname(recorded_gitdir))
+        if recorded_wt != norm_target:
+            continue
+        try:
+            return json.loads(marker.read_text(encoding='utf-8')) == identity
+        except (OSError, ValueError):
+            return False
+    return False
+
+
+def _default_origin_branch(root):
+    """Resolve the default branch name on origin (e.g. main or master)."""
+    code, sym = _run_git(root, ('symbolic-ref', '-q', 'refs/remotes/origin/HEAD'), allowed=(0, 1))
+    prefix = 'refs/remotes/origin/'
+    if code == 0 and sym.startswith(prefix) and len(sym) > len(prefix):
+        return sym[len(prefix):]
+    ls_out = _git(root, 'ls-remote', '--symref', 'origin', 'HEAD')
+    for line in ls_out.splitlines():
+        if line.startswith('ref: refs/heads/'):
+            target = line[len('ref: refs/heads/'):].split()[0]
+            if target:
+                return target
+    for candidate in ('main', 'master'):
+        heads = _git(root, 'ls-remote', '--heads', 'origin', f'refs/heads/{candidate}')
+        if heads:
+            return candidate
+    raise ValueError('implement_worktree_git_failed operation=ls-remote reason=no_default_branch')
+
+
 def _require_unused_branch(root, ref):
     # Include prunable/missing and locked registrations: none may be stolen.
-    records = _git(root, 'worktree', 'list', '--porcelain', '-z').split('\0')
-    if 'branch ' + ref in records:
-        raise ValueError('implement_worktree_branch_in_use')
+    for entry in _worktree_entries(root):
+        if entry.get('branch') == ref:
+            status = ' status=prunable' if entry.get('prunable') else ''
+            raise ValueError(
+                f'implement_worktree_branch_in_use worktree={entry["path"]}{_lock_detail(entry)}{status}'
+            )
 
 
 def _owner(root):
@@ -423,7 +556,19 @@ def adopt_legacy_intake_branch(
             }
 
 
-def prepare_workspace(workspace, purpose, intake_id, project_id):
+def _ensure_unlocked_worktree(root, target_path, session_is_dead):
+    resolved = str(Path(target_path).resolve())
+    for entry in _worktree_entries(root):
+        try:
+            entry_resolved = str(Path(entry['path']).resolve())
+        except OSError:
+            entry_resolved = entry['path']
+        if entry_resolved == resolved and entry.get('locked'):
+            if not _release_stale_lock(root, entry, session_is_dead):
+                raise ValueError(f'implement_worktree_locked worktree={entry["path"]}{_lock_detail(entry)}')
+
+
+def prepare_workspace(workspace, purpose, intake_id, project_id, *, session_is_dead=None, allowed_roots=None):
     """A bound continuation preserves all commits and dirty files, even offline."""
     root = Path(workspace).resolve(strict=True)
     if purpose in {'review', 'think'}:
@@ -437,35 +582,40 @@ def prepare_workspace(workspace, purpose, intake_id, project_id):
         owner = _owner(root)
         if owner is not None:
             if owner != identity or Path(_git(root, 'rev-parse', '--show-toplevel')).resolve() != root:
-                raise ValueError('implement_worktree_owner_conflict')
+                raise ValueError(f'implement_worktree_owner_conflict worktree={root}')
+            _ensure_unlocked_worktree(root, root, session_is_dead)
             _ensure_legacy_worktree_record(root, digest, identity, ref)
             return root
         directory = root / '.local' / 'hub-worktrees'
         if not directory.resolve().is_relative_to(root):
-            raise ValueError('implement_worktree_path_untrusted')
+            raise ValueError(f'implement_worktree_path_untrusted worktree={directory}')
         target = directory / digest
         if target.is_symlink():
-            raise ValueError('implement_worktree_path_untrusted')
+            raise ValueError(f'implement_worktree_path_untrusted worktree={target}')
         if target.exists():
             if (_owner(target) != identity
                     or Path(_git(target, 'rev-parse', '--show-toplevel')).resolve() != target):
-                raise ValueError('implement_worktree_owner_conflict')
+                raise ValueError(f'implement_worktree_owner_conflict worktree={target}')
+            _ensure_unlocked_worktree(root, target, session_is_dead)
             _ensure_legacy_worktree_record(target, digest, identity, ref)
             return target
         with _repository_lock(root):
             # Recheck after acquiring the cross-process fence.
             if target.is_symlink():
-                raise ValueError('implement_worktree_path_untrusted')
+                raise ValueError(f'implement_worktree_path_untrusted worktree={target}')
             if target.exists():
-                raise ValueError('implement_worktree_owner_conflict')
+                raise ValueError(f'implement_worktree_owner_conflict worktree={target}')
             common = Path(_git(root, 'rev-parse', '--path-format=absolute', '--git-common-dir'))
             record = _read_ownership_record(common, digest, identity, ref)
             directory.mkdir(parents=True, exist_ok=True)
             tip = _branch_tip(root, ref)
             if tip is None:
-                # Only brand-new intakes seed from freshly fetched main.
-                _git(root, 'fetch', '--no-tags', 'origin', '+refs/heads/main:refs/remotes/origin/main')
-                base = _git(root, 'rev-parse', '--verify', 'refs/remotes/origin/main^{commit}')
+                # Only brand-new intakes seed from the freshly fetched default branch.
+                default_branch = _default_origin_branch(root)
+                _git(root, 'fetch', '--no-tags', 'origin',
+                     f'+refs/heads/{default_branch}:refs/remotes/origin/{default_branch}')
+                base = _git(root, 'rev-parse', '--verify',
+                            f'refs/remotes/origin/{default_branch}^{{commit}}')
                 # `-b` refuses an existing ref, so a foreign ref created after
                 # the tip check makes this fail with no ownership published.
                 _git(root, 'worktree', 'add', '-b', branch, str(target), base)
@@ -484,8 +634,34 @@ def prepare_workspace(workspace, purpose, intake_id, project_id):
                 # A retained branch must have a durable common-dir ownership
                 # record; branch name alone never proves ownership.
                 if record is None:
-                    raise ValueError('implement_worktree_ownership_unverified')
+                    raise ValueError(f'implement_worktree_ownership_unverified ref={ref}')
                 _make_record_durable(common, digest)
+                for entry in _worktree_entries(root):
+                    if entry.get('branch') != ref:
+                        continue
+                    if not _release_stale_lock(root, entry, session_is_dead):
+                        raise ValueError(
+                            f'implement_worktree_branch_in_use worktree={entry["path"]}{_lock_detail(entry)}'
+                        )
+                    if entry.get('prunable') or not Path(entry['path']).exists():
+                        if _prunable_owned_by_identity(common, entry['path'], identity):
+                            _git(root, 'worktree', 'prune')
+                        else:
+                            raise ValueError(
+                                f'implement_worktree_branch_in_use worktree={entry["path"]} status=prunable'
+                            )
+                        continue
+                    wt_path = Path(entry['path'])
+                    if wt_path.is_dir() and not wt_path.is_symlink():
+                        wt_resolved = wt_path.resolve()
+                        in_roots = (allowed_roots is None
+                                    or any(wt_resolved.is_relative_to(r) for r in allowed_roots))
+                        if (in_roots
+                                and _owner(wt_resolved) == identity
+                                and Path(_git(wt_resolved, 'rev-parse', '--show-toplevel')).resolve() == wt_resolved):
+                            _ensure_legacy_worktree_record(wt_resolved, digest, identity, ref)
+                            return wt_resolved
+                    raise ValueError(f'implement_worktree_branch_in_use worktree={entry["path"]}')
                 _require_unused_branch(root, ref)
                 if _branch_tip(root, ref) != tip:
                     raise ValueError('implement_worktree_branch_changed')

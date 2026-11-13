@@ -573,5 +573,52 @@ with _repository_lock(sys.argv[1]):
         self.git(self.target, 'checkout', '--detach')
         self.assert_legacy_mismatch_preserved_without_minting(foreign_tip)
 
+    def test_reuses_intake_owned_worktree_under_sibling_checkout(self):
+        other_checkout = self.root / 'other-checkout'
+        self.git(self.repo, 'worktree', 'add', '--detach', str(other_checkout), 'main')
+        wt_via_other = module.prepare_workspace(other_checkout, 'implement', **self.identity)
+        self.git(wt_via_other, 'config', 'user.email', 'test@example.test')
+        self.git(wt_via_other, 'config', 'user.name', 'test')
+        (wt_via_other / 'owned').write_text('sibling progress')
+        self.git(wt_via_other, 'add', 'owned')
+        self.git(wt_via_other, 'commit', '-m', 'sibling commit')
+        (wt_via_other / 'owned').write_text('dirty from other checkout')
+        self.assertEqual(self.prepare(), wt_via_other)
+        self.assertEqual((wt_via_other / 'owned').read_text(), 'dirty from other checkout')
+
+    def test_releases_stale_hub_session_lock_of_dead_session_and_refuses_live_lock(self):
+        target = self.prepare()
+        dead_sid = '11111111-2222-4333-8444-555555555555'
+        live_sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+        self.git(self.repo, 'worktree', 'lock', '--reason', f'hub-session {live_sid} intake {self.identity["intake_id"]}', str(target))
+        with self.assertRaises(ValueError) as raised:
+            module.prepare_workspace(self.repo, 'implement', **self.identity, session_is_dead=lambda sid: sid == dead_sid)
+        self.assertIn('implement_worktree_locked', str(raised.exception))
+        self.assertIn(f'worktree={target}', str(raised.exception))
+        self.assertIn(f'lock_session={live_sid}', str(raised.exception))
+        self.git(self.repo, 'worktree', 'unlock', str(target))
+        self.git(self.repo, 'worktree', 'lock', '--reason', f'hub-session {dead_sid} intake {self.identity["intake_id"]}', str(target))
+        recovered = module.prepare_workspace(self.repo, 'implement', **self.identity, session_is_dead=lambda sid: sid == dead_sid)
+        self.assertEqual(recovered, target)
+        entries = module._worktree_entries(self.repo)
+        self.assertFalse(any(e['path'] == str(target) and e['locked'] for e in entries))
+
+    def test_prunes_missing_intake_owned_worktree_after_releasing_dead_session_lock(self):
+        import shutil
+        target = self.prepare()
+        self.git(target, 'config', 'user.email', 'test@example.test')
+        self.git(target, 'config', 'user.name', 'test')
+        (target / 'owned').write_text('retained')
+        self.git(target, 'add', 'owned')
+        self.git(target, 'commit', '-m', 'retained')
+        tip = self.git(target, 'rev-parse', 'HEAD')
+        dead_sid = '11111111-2222-4333-8444-555555555555'
+        self.git(self.repo, 'worktree', 'lock', '--reason', f'hub-session {dead_sid} intake {self.identity["intake_id"]}', str(target))
+        shutil.rmtree(target)
+        recovered = module.prepare_workspace(self.repo, 'implement', **self.identity, session_is_dead=lambda sid: sid == dead_sid)
+        self.assertEqual(recovered, target)
+        self.assertEqual(self.git(recovered, 'rev-parse', 'HEAD'), tip)
+        self.assertEqual((recovered / 'owned').read_text(), 'retained')
+
 if __name__ == '__main__':
     unittest.main()
