@@ -92,6 +92,7 @@
   "intake merge-state",
   "intake promote",
   "intake queue",
+  "intake reevaluate",
   "intake revoke",
   "intake rules",
   "intake show",
