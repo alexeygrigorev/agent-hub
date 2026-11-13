@@ -1113,6 +1113,72 @@ class V2NativeAndLineageTests(Harness):
             acc.observe_git_state(r, '/ws', clock, 100.0 + 30.0)
         self.assertEqual(r.timeouts, [30.0, 25.0])
 
+    def test_previous_attempt_fallback_requires_full_binding(self):
+        operation = '22222222-2222-4222-8222-222222222222'
+        owned = {'session_id': PARENT_INTAKE, 'operation_id': operation,
+                 'attempt_operation_id': operation + ':1', 'attempt': 1,
+                 'epoch': 7, 'machine_id': acc.HOST}
+        created = dict(owned, attempt=0, attempt_operation_id=operation + ':0')
+        self.assertTrue(acc._previous_attempt_matches(owned, created, PARENT_INTAKE))
+        for field, values in (('epoch', (None, 8)),
+                              ('machine_id', (None, 'foreign-machine'))):
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    self.assertFalse(acc._previous_attempt_matches(
+                        owned, dict(created, **{field: value}), PARENT_INTAKE))
+        self.assertFalse(acc._previous_attempt_matches(owned, created, 'foreign-session'))
+        self.assertFalse(acc._previous_attempt_matches(dict(owned, attempt=0), created, PARENT_INTAKE))
+
+    def test_proof_budget_never_floors_positive_remaining_time(self):
+        self.assertEqual(acc._fresh_git_timeout(lambda: 0, 0.001, 'test'), 0.001)
+        for now in (0.001, 1):
+            with self.subTest(now=now), self.assertRaises(TimeoutError):
+                acc._fresh_git_timeout(lambda: now, 0.001, 'test')
+
+    def test_artifact_deadline_is_checked_before_each_read(self):
+        class Clock:
+            t = 0.0
+            def __call__(self):
+                return self.t
+        # A slow probe read must not begin a result read after the total deadline.
+        clock = Clock()
+        def probe_read(*args):
+            clock.t = 91.0
+            return b'probe body'
+        with mock.patch.object(acc, 'validate_no_symlink_ancestors'), \
+             mock.patch.object(acc, 'bounded_file', side_effect=probe_read) as read, \
+             mock.patch.object(acc.os, 'lstat') as metadata:
+            with self.assertRaises(TimeoutError):
+                acc.verify_work_artifact(None, '/ws', PARENT_INTAKE, 1, PARENT_INTAKE,
+                                         PARENT_INTAKE, PARENT_INTAKE, PARENT_INTAKE,
+                                         b'x' * 32, clock, 90.0, require_probe=True)
+            self.assertEqual(read.call_count, 1)
+            metadata.assert_not_called()
+        # Path validation may also exhaust the budget before either file is opened.
+        for require_probe in (False, True):
+            clock = Clock()
+            def slow_path(*args):
+                clock.t = 91.0
+            with self.subTest(require_probe=require_probe), \
+                 mock.patch.object(acc, 'validate_no_symlink_ancestors', side_effect=slow_path), \
+                 mock.patch.object(acc, 'bounded_file') as read:
+                with self.assertRaises(TimeoutError):
+                    acc.verify_work_artifact(None, '/ws', PARENT_INTAKE, 1, PARENT_INTAKE,
+                                             PARENT_INTAKE, PARENT_INTAKE, PARENT_INTAKE,
+                                             b'x' * 32, clock, 90.0, require_probe=require_probe)
+                read.assert_not_called()
+        # A result read crossing the deadline must not start a metadata read.
+        clock = Clock()
+        with mock.patch.object(acc, 'validate_no_symlink_ancestors'), \
+             mock.patch.object(acc, 'bounded_file', side_effect=probe_read) as read, \
+             mock.patch.object(acc.os, 'lstat') as metadata:
+            with self.assertRaises(TimeoutError):
+                acc.verify_work_artifact(None, '/ws', PARENT_INTAKE, 1, PARENT_INTAKE,
+                                         PARENT_INTAKE, PARENT_INTAKE, PARENT_INTAKE,
+                                         b'x' * 32, clock, 90.0)
+            self.assertEqual(read.call_count, 1)
+            metadata.assert_not_called()
+
     def test_porcelain_z_rename_copy_counting(self):
         self.assertEqual(acc.parse_porcelain_z_count(b''), 0)
         self.assertEqual(acc.parse_porcelain_z_count(b' M a.py\x00R  new.py\x00old.py\x00C  c.py\x00src.py\x00'), 3)
