@@ -10,7 +10,7 @@ from agent_hub_host import provisioning as provisioning
 
 TEMP_BASE = Path(__file__).resolve().parents[2] / ".local/tmp"
 
-FILTER = "error,codex_tool_lifecycle=info"
+FILTER = "error,opentelemetry_sdk=off,opentelemetry_otlp=off,codex_tool_lifecycle=info"
 
 class ZaiLifecycleEnvironmentTests(unittest.TestCase):
     def compose(self, override=None):
@@ -33,7 +33,13 @@ class ZaiLifecycleEnvironmentTests(unittest.TestCase):
             return env
 
     def test_actual_provisioning_preserves_inherited_fixed_child_filter(self):
-        self.assertEqual(self.compose()["RUST_LOG"], FILTER)
+        actual = self.compose()["RUST_LOG"]
+        self.assertEqual(actual, FILTER)
+        # Preserve exact ZCode81's exporter suppression after account/HOME
+        # composition; enabling lifecycle diagnostics must not revive OTEL logs.
+        directives = actual.split(",")
+        self.assertEqual(set(directives) - {"codex_tool_lifecycle=info"},
+                         {"error", "opentelemetry_sdk=off", "opentelemetry_otlp=off"})
 
     def test_existing_explicit_bundle_filter_retains_precedence(self):
         self.assertEqual(self.compose("error,synthetic_operator=warn")["RUST_LOG"], "error,synthetic_operator=warn")
