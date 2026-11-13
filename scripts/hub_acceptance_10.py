@@ -609,8 +609,9 @@ def capture_transport_ok(engine, record, host_sha):
             and valid_hex64(record.get('sha256')))
 
 
+# Retained for shared canary parser coverage; formal acceptance uses native-pane proof.
 def paired_stream_output_ok(captured, expected, engine):
-    """Legacy stream-parser coverage; never authorized for formal native-pane acceptance."""
+    """Complete provider frames from ONE capture only; never repair clipped JSON."""
     if len(captured.encode()) > 65536:
         return False
     events = []
