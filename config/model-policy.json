@@ -78,6 +78,16 @@
       "weight": 1,
       "capabilities": [],
       "enabled": true
+    },
+    {
+      "id": "zai-glm-5-3-flash",
+      "engine": "zai",
+      "model": "glm-5.3-flash",
+      "effort": "medium",
+      "account_id": "zai-central",
+      "weight": 1,
+      "capabilities": [],
+      "enabled": true
     }
   ]
 }

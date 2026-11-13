@@ -659,3 +659,24 @@ test('an Antigravity-only ordinary automatic pool selects Hydrogen, never Argon 
  assert.throws(()=>buildRoutingPool(snapshot,{interactive:false,engine:'antigravity'}),(e:any)=>e.code==='model_policy_unavailable');
  assert.equal(buildRoutingPool(snapshot,{interactive:false,engine:'antigravity',model:'gemini-4-argon-medium'}).options[0].value.model,'gemini-4-argon-medium');
 });
+
+
+test('committed ZAI route works explicitly and for review/deep while Hydrogen stays ordinary', () => {
+ const snapshot=hydrogenFixture();
+ snapshot.policy.candidates=hydrogenPolicy.candidates;
+ snapshot.machines.get('h1')!.capabilities!.push('effort:zai');
+ const id='zai-glm-5-3-flash';
+ for(const purpose of [undefined,'fix','implement'] as const)for(const interactive of [false,true])for(const tier of [undefined,'quick','daily']){
+  const models=buildRoutingPool(snapshot,{interactive,purpose,tier}).options.map(row=>row.value.model);
+  assert(models.includes('gemini-4-hydrogen-medium'));
+  assert(!models.some(model=>/flash|gemini-4-argon/i.test(model)));
+ }
+ for(const input of [{model:'glm-5.3-flash'},{model:id},{purpose:'review' as const},{purpose:'think' as const},{tier:'deep'}]){
+  assert(buildRoutingPool(snapshot,{interactive:false,...input}).options.some(row=>row.value.policy_id===id));
+ }
+ const explicit=buildRoutingPool(snapshot,{interactive:false,engine:'zai',model:'glm-5.3-flash',effort:'medium',purpose:'implement'});
+ assert.deepEqual(explicit.options.map(row=>({engine:row.value.engine,model:row.value.model,effort:row.value.effort,account:row.value.account_id})),
+  [{engine:'zai',model:'glm-5.3-flash',effort:'medium',account:'zai-central'}]);
+ assert.throws(()=>buildRoutingPool(snapshot,{interactive:false,engine:'zai'}),
+  (error:any)=>error.code==='model_policy_unavailable');
+});

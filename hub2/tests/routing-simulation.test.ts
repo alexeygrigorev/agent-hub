@@ -81,8 +81,11 @@ test('exploration preserves stale-neutral headroom, quota influence and underlyi
  assert.ok(stale.pool.find(row=>row.policy_id==='go-muse')!.share>ordinary.pool.find(row=>row.policy_id==='go-muse')!.share);
  const deep=await simulateModelRoutes(f.env,{interactive:false,tier:'deep'},1,()=>0);
  assert.ok(deep.pool.every(row=>row.share>.03));
- assert.ok(Math.abs(deep.pool.find(row=>row.policy_id==='codex-sol-medium')!.share-(.03+.79*168/697.9))<1e-12);
- assert.ok(Math.abs(deep.pool.find(row=>row.policy_id==='claude-opus-medium')!.share-(.03+.79*228/697.9))<1e-12);
+ // Eight deep-work candidates: exploration leaves .76, with canonical ZAI headroom65 added.
+ assert.equal(deep.pool.length,8);
+ assert.ok(Math.abs(deep.pool.find(row=>row.policy_id==='codex-sol-medium')!.share-(.03+.76*168/762.9))<1e-12);
+ assert.ok(Math.abs(deep.pool.find(row=>row.policy_id==='claude-opus-medium')!.share-(.03+.76*228/762.9))<1e-12);
+ assert.ok(Math.abs(deep.pool.find(row=>row.policy_id==='zai-glm-5-3-flash')!.share-(.03+.76*65/762.9))<1e-12);
 });
 
 test('Luna mean clipping and candidate shares survive skew and additional hosts',async()=>{
