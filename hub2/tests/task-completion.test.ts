@@ -15,6 +15,7 @@ const candidates=[
   {id:'sol-route',engine:'codex',model:'gpt-6.1-sol',effort:'medium',account_id:'codex-private',weight:1,capabilities:[],enabled:true},
   {id:'terra-route',engine:'codex',model:'gpt-6.1-terra',effort:'medium',account_id:'codex-private',weight:1,capabilities:[],enabled:true},
   {id:'luna-route',engine:'codex',model:'gpt-6.1-luna',effort:'max',account_id:'codex-private',weight:1,capabilities:[],enabled:true},
+  {id:'sonnet-route',engine:'claude',model:'sonnet',effort:'medium',account_id:'claude-private',weight:1,capabilities:[],enabled:true},
 ];
 const AC=['Feature works for the requester','PR merged with green CI (t1a)'];
 
@@ -37,7 +38,7 @@ function fixture(routes=candidates){
     }),
     MACHINES:namespace(async(id,r)=>{
       const path=new URL(r.url).pathname;
-      if(path==='/_internal/routing')return Response.json({machine_id:id,connected:true,engines:['codex'],capabilities:['headless','interactive']});
+      if(path==='/_internal/routing')return Response.json({machine_id:id,connected:true,engines:['codex','claude'],capabilities:['headless','interactive']});
       const body=await r.json() as any;
       if(path==='/_internal/reserve'){
         assert(new TextEncoder().encode(JSON.stringify(body.launch)).length<=12_000,'Machine launch limit');
@@ -277,6 +278,7 @@ test('an incomplete verifier retries once with a different model, survives resta
     assert.equal(routeTwo.verification_attempt,MAX_VERIFICATION_ATTEMPTS);
     assert.notEqual(routeTwo.picker.policy_id,routeOne.picker.policy_id);
     assert.notEqual(routeTwo.picker.policy_id,JSON.parse(sagas(f,id)[0].routing_json).picker.policy_id);
+    assert(sagas(f,id).every(saga=>JSON.parse(saga.routing_json).picker.policy_id!=='luna-route'),'automatic implementation and both verifiers exclude Luna');
     await finish(f,verifierTwo,1);
     assert.equal(completion(f,id).verification.state,'escalated');
     assert(events(f,id).some(e=>e.kind==='developer_alert_raised'&&e.body.kind==='verification_exhausted'));
@@ -1226,6 +1228,7 @@ test('re-evaluation after verifier escalation reviews the implementation session
     for(let attempt=1;attempt<=MAX_VERIFICATION_ATTEMPTS;attempt++){await f.project.alarm();await finish(f,await run(f,id),0);}
     assert.equal(intakeRow(f,id).status,'failed');assert.equal(completion(f,id).verification.state,'escalated');
     const lastVerifier=intakeRow(f,id).session_id;assert.notEqual(lastVerifier,work.session_id);
+    assert(sagas(f,id).every(saga=>JSON.parse(saga.routing_json).picker.policy_id!=='luna-route'),'automatic implementation and both verifiers exclude Luna');
     const requested=await json(await f.call('/api/intakes/'+id+'/reevaluate','POST',{key:'after-escalation'}));
     assert.equal(requested.original_session_id,work.session_id);assert.equal(requested.session_id,lastVerifier);
     await f.project.alarm();
