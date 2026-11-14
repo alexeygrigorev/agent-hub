@@ -30,6 +30,18 @@ class Refused(Exception):
     pass
 
 
+SOURCE_FAILURES = frozenset(('source_directory_untrusted', 'source_directory_unavailable',
+    'source_file_unavailable', 'source_file_not_regular', 'source_file_foreign_owner',
+    'source_file_linked', 'source_file_unsafe_mode', 'source_file_oversized',
+    'source_file_changed', 'source_git_unverified', 'source_hash_mismatch', 'source_unclassified'))
+
+
+class SourceUnverified(Refused):
+    def __init__(self, reason):
+        self.reason = reason if reason in SOURCE_FAILURES else 'source_unclassified'
+        super().__init__('selected source unverified')
+
+
 def require(ok):
     if not ok:
         raise Refused('activation staging refused')
@@ -65,15 +77,29 @@ def directory(path, *, private=False):
         raise
 
 
-def artifact(checkout, relative):
+def artifact(checkout, relative, *, diagnostic=False):
     path = checkout / relative
-    parent = directory(path.parent)
+    def check(condition, reason):
+        if not condition and diagnostic:
+            raise SourceUnverified(reason)
+        require(condition)
+    try:
+        parent = directory(path.parent)
+    except Refused:
+        if diagnostic: raise SourceUnverified('source_directory_untrusted') from None
+        raise
+    except OSError:
+        if diagnostic: raise SourceUnverified('source_directory_unavailable') from None
+        raise
     fd = None
     try:
         fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
         info = os.fstat(fd)
-        require(stat.S_ISREG(info.st_mode) and info.st_uid in (0, os.geteuid())
-                and info.st_nlink == 1 and not info.st_mode & 0o022 and info.st_size <= LIMIT)
+        check(stat.S_ISREG(info.st_mode), 'source_file_not_regular')
+        check(info.st_uid in (0, os.geteuid()), 'source_file_foreign_owner')
+        check(info.st_nlink == 1, 'source_file_linked')
+        check(not info.st_mode & 0o022, 'source_file_unsafe_mode')
+        check(info.st_size <= LIMIT, 'source_file_oversized')
         data = b''
         while len(data) <= LIMIT:
             chunk = os.read(fd, min(65536, LIMIT + 1 - len(data)))
@@ -81,10 +107,13 @@ def artifact(checkout, relative):
                 break
             data += chunk
         after = os.fstat(fd)
-        require(len(data) == info.st_size and len(data) <= LIMIT and
+        check(len(data) == info.st_size and len(data) <= LIMIT and
                 (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) ==
-                (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns))
+                (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns), 'source_file_changed')
         return {'path': str(path), 'sha256': hashlib.sha256(data).hexdigest()}
+    except OSError:
+        if diagnostic: raise SourceUnverified('source_file_unavailable') from None
+        raise
     finally:
         if fd is not None:
             os.close(fd)
@@ -256,7 +285,8 @@ def boundary_identity(path, producer):
         sync_chain(path)
 
 
-def validate_boundary(path, producer, expected=None):
+def validate_boundary(path, producer, expected=None, *, rolling_prefix=False):
+    require(type(rolling_prefix) is bool)
     fd = directory(path, private=True)
     try:
         entry = read_private(fd, 'enrollment.json')
@@ -276,42 +306,79 @@ def validate_boundary(path, producer, expected=None):
             for item in entries:
                 require(len(rows) < 8192)
                 rows.append(item.name)
-        chains = {}
+        chains, checkpoints = {}, {}
+        rolling_boots = {match[1] for name in rows if (match := re.fullmatch(
+            r'checkpoint-([0-9a-f]{32})-([01])\.json', name)) is not None}
         for name in rows:
             if name in ('enrollment.json', 'journal.json'):
                 continue
             match = re.fullmatch(r'snapshot-([0-9a-f]{32})-([1-9][0-9]{0,2})\.json', name)
-            require(match is not None)
-            boot, sequence = match[1], int(match[2])
-            require(sequence <= 256)
+            checkpoint = re.fullmatch(r'checkpoint-([0-9a-f]{32})-([01])\.json', name)
+            require(match is not None or checkpoint is not None)
+            boot = (match or checkpoint)[1]
             record = read_private(fd, name)
             require(isinstance(record, dict))
-            require(set(record) == {'kind', 'controller_id', 'sequence', 'previous_sha256', 'journal'}
-                    and record['kind'] == ('hub_picker_diagnostic_snapshot_v1' if diagnostic else 'hub_credential_monitor_snapshot_v1')
-                    and record['controller_id'] == boot and type(record['sequence']) is int and record['sequence'] == sequence
+            common = {'kind', 'controller_id', 'sequence', 'previous_sha256', 'journal'}
+            require(set(record) == (common | {'prefix_sha256'} if checkpoint else common)
+                    and record['kind'] == (('hub_picker_diagnostic_checkpoint_v1' if diagnostic else 'hub_credential_monitor_checkpoint_v1')
+                        if checkpoint else ('hub_picker_diagnostic_snapshot_v1' if diagnostic else 'hub_credential_monitor_snapshot_v1'))
+                    and record['controller_id'] == boot and type(record['sequence']) is int
                     and isinstance(record['previous_sha256'], str) and re.fullmatch('[0-9a-f]{64}', record['previous_sha256']))
+            sequence = record['sequence']
+            if checkpoint:
+                require(256 < sequence <= 9007199254740991 and sequence % 2 == int(checkpoint[2])
+                        and isinstance(record['prefix_sha256'], str) and re.fullmatch('[0-9a-f]{64}', record['prefix_sha256']))
+            else:
+                require(sequence == int(match[2]) and sequence <= 256)
             snapshot = record['journal']
-            require(isinstance(snapshot, dict))
-            require(set(snapshot) == set(journal)
+            require(isinstance(snapshot, dict) and set(snapshot) == set(journal)
                     and all(snapshot[k] == journal[k] for k in journal if k not in ('occurrence_count', 'started_total', 'finished_total'))
                     and all(type(snapshot[k]) is int and 0 <= snapshot[k] <= 9007199254740991 for k in ('occurrence_count', 'started_total', 'finished_total'))
-                    and snapshot['occurrence_count'] <= snapshot['finished_total'] <= snapshot['started_total'] <= 128)
-            chains.setdefault(boot, {})[sequence] = record
-        for chain in chains.values():
+                    and snapshot['occurrence_count'] <= snapshot['finished_total'] <= snapshot['started_total']
+                    and snapshot['started_total'] - snapshot['finished_total'] <= 128
+                    and (checkpoint is not None or rolling_prefix or boot in rolling_boots or snapshot['started_total'] <= 128))
+            (checkpoints if checkpoint else chains).setdefault(boot, {})[sequence] = record
+        reached = False
+        keys = ('occurrence_count', 'started_total', 'finished_total')
+        for boot in set(chains) | set(checkpoints):
+            chain = chains.get(boot, {})
             previous = hashlib.sha256(canonical(journal)).hexdigest()
             require(sorted(chain) == list(range(1, len(chain) + 1)))
             counts = (0, 0, 0)
             for number in sorted(chain):
                 record = chain[number]
-                current_counts = tuple(record['journal'][k] for k in ('occurrence_count', 'started_total', 'finished_total'))
+                current_counts = tuple(record['journal'][k] for k in keys)
                 require(all(current >= prior for current, prior in zip(current_counts, counts)))
                 counts = current_counts
                 require(record['previous_sha256'] == previous)
                 previous = hashlib.sha256(canonical(record)).hexdigest()
+            rolled = checkpoints.get(boot, {})
+            if not rolled:
+                # Disk ABI at exactly128 is ambiguous until the first rollup:
+                # keep the legacy hold rather than silently reset old capacity.
+                reached |= bool(chain) and chain[max(chain)]['journal']['started_total'] == 128
+                continue
+            require(len(chain) == 256 and 1 <= len(rolled) <= 2)
+            numbers = sorted(rolled)
+            if len(numbers) == 1:
+                require(numbers == [257])
+            else:
+                require(numbers[1] == numbers[0] + 1)
+            prefix = previous
+            for index, number in enumerate(numbers):
+                record = rolled[number]
+                require(record['prefix_sha256'] == prefix)
+                current_counts = tuple(record['journal'][k] for k in keys)
+                require(all(current >= prior for current, prior in zip(current_counts, counts)))
+                counts = current_counts
+                # An older superseded predecessor is deliberately not retained;
+                # require the complete256 prefix anchor and the adjacent pair.
+                if index > 0 or number == 257:
+                    require(record['previous_sha256'] == previous)
+                previous = hashlib.sha256(canonical(record)).hexdigest()
         if expected is not None:
             require(all(entry[k] == expected[k] for k in ('producer', 'release_sha', 'source_id', 'artifacts')))
-        return {'enrollment': entry, 'capacity_reached': any(
-            record['journal']['started_total'] == 128 for chain in chains.values() for record in chain.values())}
+        return {'enrollment': entry, 'capacity_reached': reached}
     finally:
         os.close(fd)
         sync_chain(path)
@@ -353,20 +420,25 @@ def prepare_active(checkout, root, expected_commit, current, *, blocked=()):
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         os.fsync(lock);sync_chain(root)
         require(head(checkout) == expected_commit)
-        specs, held, pointers, intents = {}, {}, {}, {}
+        specs, held, pointers, intents, source_failures = {}, {}, {}, {}, {}
         for producer in PRODUCERS:
             if producer in blocked:
                 held[producer] = 'service_override'
                 continue
             try:
                 names = DIAGNOSTIC_ARTIFACTS if producer != 'credential_monitor' else ARTIFACTS
-                artifacts = [artifact(checkout, name) for name in names]
-                require(all(row['sha256'] == committed_artifact_hash(checkout, expected_commit, name)
-                            for row, name in zip(artifacts, names)))
+                artifacts = [artifact(checkout, name, diagnostic=True) for name in names]
+                try:
+                    expected_hashes = [committed_artifact_hash(checkout, expected_commit, name) for name in names]
+                except (OSError, Refused, subprocess.SubprocessError):
+                    raise SourceUnverified('source_git_unverified') from None
+                if not all(row['sha256'] == expected_hash for row, expected_hash in zip(artifacts, expected_hashes)):
+                    raise SourceUnverified('source_hash_mismatch')
                 specs[producer] = {'producer': producer, 'release_sha': expected_commit,
                     'source_id': hashlib.sha256(canonical(artifacts)).hexdigest(), 'artifacts': artifacts}
-            except (OSError, ValueError, TypeError, KeyError, Refused, subprocess.SubprocessError):
+            except (OSError, ValueError, TypeError, KeyError, Refused, subprocess.SubprocessError) as error:
                 held[producer] = 'selected_source_unverified'
+                source_failures[producer] = error.reason if isinstance(error, SourceUnverified) else 'source_unclassified'
         # Existing V1 source-bound intent may qualify a lost publication; it
         # does not authorize adopting a target with no durable ownership record.
         legacy = {'kind':'hub_node_observers_prepare_intent_v1','release_sha':expected_commit,'specs':specs}
@@ -382,7 +454,7 @@ def prepare_active(checkout, root, expected_commit, current, *, blocked=()):
                     same = all(prior[key] == spec[key] for key in ('producer','release_sha','source_id','artifacts'))
                     if same:
                         try:
-                            checked = validate_boundary(absolute(current[producer]), producer, spec)
+                            checked = validate_boundary(absolute(current[producer]), producer, spec, rolling_prefix=True)
                         except (OSError, ValueError, TypeError, KeyError, Refused):
                             held[producer] = 'same_tuple_unqualified'
                             continue
@@ -423,7 +495,7 @@ def prepare_active(checkout, root, expected_commit, current, *, blocked=()):
                           {relative: row['sha256'] for relative, row in zip(
                               DIAGNOSTIC_ARTIFACTS if producer != 'credential_monitor' else ARTIFACTS,
                               spec['artifacts'])}, producer=producer)
-                checked = validate_boundary(target, producer, spec)
+                checked = validate_boundary(target, producer, spec, rolling_prefix=True)
                 if checked['capacity_reached']:
                     held[producer] = 'same_tuple_capacity_reached'
                     continue
@@ -436,16 +508,17 @@ def prepare_active(checkout, root, expected_commit, current, *, blocked=()):
             if KEYS[producer] not in pointers:
                 continue
             try:
-                require(spec['artifacts'] == [artifact(checkout, name) for name in
+                require(spec['artifacts'] == [artifact(checkout, name, diagnostic=True) for name in
                     (DIAGNOSTIC_ARTIFACTS if producer != 'credential_monitor' else ARTIFACTS)])
-            except (OSError, ValueError, TypeError, KeyError, Refused):
+            except (OSError, ValueError, TypeError, KeyError, Refused) as error:
                 pointers.pop(KEYS[producer], None)
                 held[producer] = 'selected_source_unverified'
+                source_failures[producer] = error.reason if isinstance(error, SourceUnverified) else 'source_file_changed'
         sync_chain(root)
         require(set(held) == set(PRODUCERS) - {producer for producer in PRODUCERS if KEYS[producer] in pointers})
         return {'kind':'hub_node_observers_prepared_v2','release_sha':expected_commit,
                 'activated':False,'historical_coverage':False,'pointers':pointers,
-                'held':held,'intents':intents}
+                'held':held,'intents':intents,'source_failures':source_failures}
     finally:
         if lock is not None:os.close(lock)
         os.close(fd)

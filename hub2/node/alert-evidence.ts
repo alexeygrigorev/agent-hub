@@ -9,23 +9,27 @@
 // must separately pin the installed Hetzner monitor and authenticated VM origin.
 // Every process birth changes the interval generation; no interval may cross a
 // restart/offline gap. An invalid initialized sentinel is refused; old process
-// snapshots are never used to claim continuity. At most128 requests
-// per incarnation are observed; capacity/error never evicts or heals evidence,
-// and all primary responses continue. journal.json is an immutable initialized
-// sentinel. Up to256 immutable chained snapshots are retained per incarnation;
-// no automatic old-generation deletion or mutable current pointer is used.
+// snapshots are never used to claim continuity. At most128 active invocations
+// are observed; cumulative safe-integer counts do not reset. First256 immutable
+// snapshots are retained, then two atomic cumulative checkpoint slots roll
+// forward under this birth only. No old-birth record is overwritten or deleted.
+// Capacity/error remains sticky UNKNOWN and all primary responses continue.
+// journal.json remains the immutable initialized sentinel.
 // Source owners must manage retention only outside an accepted interval.
 // Diagnostic producers are separate opt-ins; the default credential_monitor
 // enrollment/journal contract remains unchanged. PickerControl stays independent.
 import { constants } from 'node:fs';
-import { open, lstat, type FileHandle } from 'node:fs/promises';
+import { open, lstat, readdir, rename, link, unlink, type FileHandle } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { isAbsolute, resolve } from 'node:path';
 import { fileURLToPath, URL } from 'node:url';
 import type { CredentialMonitorEvidence, JsonRecord, PickerDiagnosticProducer } from '../src/types.ts';
 
 const LIMIT = 131072;
-const MAX_REQUESTS = 128; // Exhaustion is UNKNOWN, never receipt eviction/reset.
+const MAX_ACTIVE = 128; // Bounded active identities, not a lifetime request ceiling.
+const PREFIX_SNAPSHOTS = 256; // Existing immutable prefix is retained and verified.
+const MAX_FILES = 8192; // Retention exhaustion is UNKNOWN; no automatic cleanup.
+const RESERVED_FILES = PREFIX_SNAPSHOTS + 3; // Prefix + two slots + one temporary.
 const TIMEOUT_MS = 150;
 const RECIPIENT = 'dev@dtcdev.click';
 type Producer = 'credential_monitor' | PickerDiagnosticProducer;
@@ -59,6 +63,7 @@ class PrivateStore {
   private journalBaseline: string | undefined;
   readonly boot = randomUUID().replaceAll('-', '');
   private commits: { name: string; bytes: string; digest: string; journal: string }[] = [];
+  private checkpoints: { name: string; bytes: string; digest: string; journal: string; sequence: number }[] = [];
   private constructor(readonly path: string) {}
   static async load(path: string) {
     check(process.platform === 'linux' && isAbsolute(path) && resolve(path) === path);
@@ -75,6 +80,9 @@ class PrivateStore {
       }
       const last = await handle.stat();
       check(last.uid === process.geteuid!() && !(last.mode & 0o077));
+      // Reserve this birth's full finite namespace. Old records/partial writes
+      // are counted and retained; no restart can silently evict them.
+      check((await readdir(store.name('.'))).length <= MAX_FILES - RESERVED_FILES);
       return store;
     } catch { await store.close(); throw new Error('evidence_unavailable'); }
   }
@@ -106,8 +114,12 @@ class PrivateStore {
   }
   async write(value: Journal, writer?: SnapshotWriter) {
     await this.identity();
-    check(this.journalBaseline !== undefined && this.commits.length < MAX_REQUESTS * 2
+    check(this.journalBaseline !== undefined
       && canonical(await this.read('journal.json')) === this.journalBaseline);
+    if (this.commits.length === PREFIX_SNAPSHOTS) {
+      await this.checkpoint(value, writer);
+      return;
+    }
     const sequence = this.commits.length + 1;
     const name = `snapshot-${this.boot}-${sequence}.json`;
     const previous = this.commits.at(-1)?.digest ?? hash(this.journalBaseline);
@@ -130,13 +142,61 @@ class PrivateStore {
     // evidence. A failed partial file is retained; this generation stays dirty.
     this.commits.push({name, bytes, digest: hash(bytes), journal: canonical(value)});
   }
+  private async checkpoint(value: Journal, writer?: SnapshotWriter) {
+    // Only this process's two slots may roll forward. The immutable prefix and
+    // all prior births remain untouched. Verify BOTH slots before replacement,
+    // so a corrupt superseded slot cannot be silently healed by the next write.
+    for (const record of this.checkpoints)
+      check(canonical(await this.read(record.name)) === record.bytes);
+    const latest = this.checkpoints.at(-1) ?? this.commits.at(-1)!;
+    const previousSequence = this.checkpoints.at(-1)?.sequence ?? PREFIX_SNAPSHOTS;
+    check(previousSequence < Number.MAX_SAFE_INTEGER);
+    const sequence = previousSequence + 1;
+    const name = `checkpoint-${this.boot}-${sequence % 2}.json`;
+    const previous = this.checkpoints.find(record => record.name === name);
+    const record = {kind: value.kind === 'hub_credential_monitor_journal_v1'
+      ? 'hub_credential_monitor_checkpoint_v1' : 'hub_picker_diagnostic_checkpoint_v1',
+      controller_id: this.boot, sequence, prefix_sha256: this.commits.at(-1)!.digest,
+      previous_sha256: latest.digest, journal: value};
+    const bytes = canonical(record), temporary = `.checkpoint-${this.boot}-${sequence}.tmp`;
+    const handle = await open(this.name(temporary),
+      constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+    try {
+      if (writer) await writer(record, handle);
+      else { await handle.writeFile(bytes + '\n', 'utf8'); await handle.sync(); }
+    } finally { await handle.close(); }
+    await this.identity();
+    if (previous) {
+      check(canonical(await this.read(name)) === previous.bytes);
+      await rename(this.name(temporary), this.name(name));
+    } else {
+      // link is exclusive: a raced/pre-existing first-slot name is never replaced.
+      // A crash between link/unlink leaves nlink2 and is UNKNOWN, not repaired.
+      await link(this.name(temporary), this.name(name));
+      await unlink(this.name(temporary));
+    }
+    if (!writer) for (const directory of [...this.handles].reverse()) await directory.sync();
+    // Admission only AFTER durable publication. Any error dirties the observer;
+    // partial own files remain for owner diagnosis, never automatic recovery.
+    this.checkpoints = this.checkpoints.filter(item => item.name !== name);
+    this.checkpoints.push({name, bytes, digest: hash(bytes), journal: canonical(value), sequence});
+  }
   async verify(): Promise<string> {
     await this.identity();
     check(this.journalBaseline !== undefined
       && canonical(await this.read('journal.json')) === this.journalBaseline);
     for (const record of this.commits)
       check(canonical(await this.read(record.name)) === record.bytes);
-    return this.commits.at(-1)?.journal ?? this.journalBaseline;
+    for (const record of this.checkpoints)
+      check(canonical(await this.read(record.name)) === record.bytes);
+    // The two retained checkpoints are adjacent and hash-linked; the first
+    // rollup's predecessor is the still-retained immutable prefix tail.
+    if (this.checkpoints.length === 1)
+      check(JSON.parse(this.checkpoints[0].bytes).previous_sha256 === this.commits.at(-1)?.digest);
+    if (this.checkpoints.length === 2)
+      check(this.checkpoints[1].sequence === this.checkpoints[0].sequence + 1
+        && JSON.parse(this.checkpoints[1].bytes).previous_sha256 === this.checkpoints[0].digest);
+    return this.checkpoints.at(-1)?.journal ?? this.commits.at(-1)?.journal ?? this.journalBaseline;
   }
   async close() { await Promise.all(this.handles.splice(0).map(handle => handle.close())); }
 }
@@ -238,7 +298,7 @@ export class AlertEvidence implements CredentialMonitorEvidence {
     })();
   }
   begin(): unknown {
-    if (this.dirty || this.requests >= MAX_REQUESTS || this.journal.started_total >= Number.MAX_SAFE_INTEGER) {
+    if (this.dirty || this.active.size >= MAX_ACTIVE || this.journal.started_total >= Number.MAX_SAFE_INTEGER) {
       this.invalidate(); return null;
     }
     const identity = ++this.requests;

@@ -381,16 +381,20 @@ async function defineTests() {
       assert.equal((await f.post()).status,200,fault);
     }
   });
-  test('128-request horizon never evicts a receipt or silently resets coverage',async t=>{
+  test('128-request prefix rolls forward without evicting historical evidence',async t=>{
     const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
     let journal='';
     const f=await fixture(directory,{timeoutMs:2000,writer:semanticWriter});t.after(()=>f.observer.close());
     journal=join(f.state,'journal.json');
     for(let n=0;n<128;n++){const identity=f.observer.begin();await f.observer.finish(identity,'observation');}
     const before=await f.observer.snapshot(NONCE);assert.equal(before.complete,true);assert.equal(before.started_total,128);
-    assert.equal(f.observer.begin(),null);assert.equal((await f.observer.snapshot(NONCE)).available,false);
-    assert.equal((await f.post()).status,200);assert.equal(JSON.parse(readFileSync(journal,'utf8')).started_total,0);
+    const next=f.observer.begin();assert.notEqual(next,null);await f.observer.finish(next,'observation');
+    const after=await f.observer.snapshot(NONCE);assert.equal(after.complete,true);assert.equal(after.started_total,129);
+    assert.equal(after.epoch,before.epoch,'rolling storage never resets the interval');
+    assert.equal((await f.post()).status,200);await (f.observer as any).queue;
+    assert.equal(JSON.parse(readFileSync(journal,'utf8')).started_total,0);
     const files=snapshotFiles(f.state);assert.equal(files.length,256);
+    assert.equal(readdirSync(f.state).filter(name=>name.startsWith('checkpoint-')).length,2);
     assert.equal(JSON.parse(readFileSync(files.at(-1)!,'utf8')).journal.started_total,128);
   });
   test('private journal symlink, FIFO, hardlink and duplicate keys cannot produce clean evidence',async t=>{
@@ -553,4 +557,4 @@ async function defineTests() {
 }
 if(process.argv.includes('--fixture-server')){
   const index=process.argv.indexOf('--fixture-server');await serverMode(resolve(process.argv[index+1]),process.argv[index+2]==='fail',Number(process.argv[index+3] || 0),process.argv[index+4] || 'credential_monitor');
-}else await defineTests();
+}else {await import('./alert-evidence-capacity.test.ts');await defineTests();}
