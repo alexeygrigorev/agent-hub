@@ -81,11 +81,16 @@ test('exploration preserves stale-neutral headroom, quota influence and underlyi
  assert.ok(stale.pool.find(row=>row.policy_id==='go-muse')!.share>ordinary.pool.find(row=>row.policy_id==='go-muse')!.share);
  const deep=await simulateModelRoutes(f.env,{interactive:false,tier:'deep'},1,()=>0);
  assert.ok(deep.pool.every(row=>row.share>.03));
- // Eight deep-work candidates: exploration leaves .76, with canonical ZAI headroom65 added.
- assert.equal(deep.pool.length,8);
- assert.ok(Math.abs(deep.pool.find(row=>row.policy_id==='codex-sol-medium')!.share-(.03+.76*168/762.9))<1e-12);
- assert.ok(Math.abs(deep.pool.find(row=>row.policy_id==='claude-opus-medium')!.share-(.03+.76*228/762.9))<1e-12);
- assert.ok(Math.abs(deep.pool.find(row=>row.policy_id==='zai-glm-5-3-flash')!.share-(.03+.76*65/762.9))<1e-12);
+ // Deep tier without an effort prefers the strong high-effort route (intake 10a76faa).
+ assert.deepEqual(deep.pool.map(row=>[row.policy_id,row.effort,row.share]),[['claude-opus-high','high',1]]);
+ assert.ok(deep.excluded.some(row=>row.policy_id==='antigravity-hydrogen-medium'&&row.reason==='deep_prefers_strong_model'));
+ assert.ok(deep.excluded.some(row=>row.policy_id==='claude-opus-medium'&&row.reason==='deep_prefers_high_effort'));
+ // Explicit medium keeps the strong pool and the opus/sol deep multiplier: exploration leaves .91.
+ const medium=await simulateModelRoutes(f.env,{interactive:false,tier:'deep',effort:'medium'},1,()=>0);
+ assert.deepEqual(medium.pool.map(row=>row.policy_id).sort(),['antigravity-argon-medium','claude-opus-medium','codex-sol-medium']);
+ assert.ok(Math.abs(medium.pool.find(row=>row.policy_id==='codex-sol-medium')!.share-(.03+.91*168/477.45))<1e-12);
+ assert.ok(Math.abs(medium.pool.find(row=>row.policy_id==='claude-opus-medium')!.share-(.03+.91*228/477.45))<1e-12);
+ assert.ok(Math.abs(medium.pool.find(row=>row.policy_id==='antigravity-argon-medium')!.share-(.03+.91*81.45/477.45))<1e-12);
 });
 
 test('Luna mean clipping and candidate shares survive skew and additional hosts',async()=>{
@@ -217,7 +222,7 @@ test('HTTP simulation validates parameters, requires routing scope, and performs
  assert.equal(Object.values<number>(result.counts).reduce((a,b)=>a+b,0),10);
  assert.ok(f.calls.filter(call=>call.kind!=='control').every(call=>call.method==='GET'&&call.path==='/_internal/routing-snapshot'));
  f.calls.length=0;
- for(const query of ['?n=0','?n=1001','?n=1.5','?n=01','?n=1&n=2','?unknown=x','?mode=invalid','?effort=high','?purpose=invalid','?model=astra']){
+ for(const query of ['?n=0','?n=1001','?n=1.5','?n=01','?n=1&n=2','?unknown=x','?mode=invalid','?effort=xhigh','?purpose=invalid','?model=astra']){
   assert.equal((await f.get(query)).status,400,query);
  }
  assert.ok(f.calls.every(call=>call.kind==='control'),'invalid input never observes accounts or hosts');

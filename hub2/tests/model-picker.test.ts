@@ -517,7 +517,8 @@ test('advertising goal:claude admits Opus and Sonnet to the real weighted goal d
   accounts:new Map(['codex','claude','zai-central'].map(id=>[id,{account:{enabled:true},credential_usable:true,hosts:[host],...observed(80,now)}])),
   machines:new Map([[host,{connected:true,os:'linux',engines:['codex','claude','zai'],capabilities}]]),
  };
- const input={interactive:true,with_goal:true,machine_id:host,tier:'deep'};
+ // Review purpose keeps the non-ordinary ZAI route eligible without the deep-tier strong preference.
+ const input={interactive:true,with_goal:true,machine_id:host,purpose:'review' as const};
  assert.deepEqual(buildRoutingPool(snapshot,input).options.map(row=>row.value.engine).sort(),['codex','zai']);
  capabilities.push('goal:claude');
  const result=buildRoutingPool(snapshot,input);
@@ -651,7 +652,7 @@ test('ordinary default/fix/implement in both modes and quick/daily excludes Argo
  }
 });
 test('review/think/deep and explicit Sol/Fable/Argon preserve existing selection',()=>{
- for(const input of [{purpose:'review' as const},{purpose:'think' as const},{tier:'deep'}]){
+ for(const input of [{purpose:'review' as const},{purpose:'think' as const},{tier:'deep',effort:'medium'}]){
   const models=buildRoutingPool(hydrogenFixture(),{interactive:false,...input}).options.map(row=>row.value.model);
   assert(models.includes('gemini-4-argon-medium'));
  }
@@ -681,9 +682,11 @@ test('committed ZAI route works explicitly and for review/deep while Hydrogen st
   assert(models.includes('gemini-4-hydrogen-medium'));
   assert(!models.some(model=>/flash|gemini-4-argon/i.test(model)));
  }
- for(const input of [{model:'glm-5.3-flash'},{model:id},{purpose:'review' as const},{purpose:'think' as const},{tier:'deep'}]){
+ for(const input of [{model:'glm-5.3-flash'},{model:id},{purpose:'review' as const},{purpose:'think' as const}]){
   assert(buildRoutingPool(snapshot,{interactive:false,...input}).options.some(row=>row.value.policy_id===id));
  }
+ // A deep tier prefers strong models, so the flash route is only its advisory fallback.
+ assert(!buildRoutingPool(snapshot,{interactive:false,tier:'deep'}).options.some(row=>row.value.policy_id===id));
  const explicit=buildRoutingPool(snapshot,{interactive:false,engine:'zai',model:'glm-5.3-flash',effort:'medium',purpose:'implement'});
  assert.deepEqual(explicit.options.map(row=>({engine:row.value.engine,model:row.value.model,effort:row.value.effort,account:row.value.account_id})),
   [{engine:'zai',model:'glm-5.3-flash',effort:'medium',account:'zai-central'}]);
@@ -950,4 +953,43 @@ test('first fault unknown public code or throwing code getter keeps stage fallba
   await assert.rejects(pickModelRouteDetailed(env,{interactive:true},()=>0),error=>error===original);
   for(const row of Object.values(records))assert.deepEqual(row.reasons,['picker_snapshot_failed']);
  }
+});
+
+
+// ---- intake 10a76faa: --effort high and --tier deep route to a strong model at high effort ----
+test('--effort high routes to Opus at high effort instead of model_policy_unavailable',()=>{
+ for(const interactive of [false,true])for(const tier of [undefined,'deep']){
+  const result=buildRoutingPool(hydrogenFixture(),{interactive,effort:'high',tier});
+  assert(result.options.length>0);
+  for(const draw of [0,.25,.5,.75,.999999]){
+   const picked=weightedChoice(result.options,()=>draw);
+   assert.deepEqual([picked.policy_id,picked.engine,picked.model,picked.effort],['claude-opus-high','claude','opus','high']);
+  }
+ }
+});
+test('--tier deep without effort picks a strong high-effort route, never Hydrogen',()=>{
+ for(const tier of ['deep','complex','serious','DEEP'])for(const interactive of [false,true]){
+  const result=buildRoutingPool(hydrogenFixture(),{interactive,tier});
+  assert.deepEqual([...new Set(result.options.map(row=>row.value.policy_id))],['claude-opus-high']);
+  assert(result.diagnostics.excluded.some(row=>row.policy_id==='antigravity-hydrogen-medium'&&row.reason==='deep_prefers_strong_model'));
+ }
+});
+test('deep tier falls back to strong medium routes when the high-effort account is unusable, and never refuses',()=>{
+ const snapshot=hydrogenFixture();
+ for(const id of ['claude'])snapshot.accounts.set(id,{...snapshot.accounts.get(id)!,quota:{remaining:1,captured_at:snapshot.observed_at,valid_until:snapshot.observed_at+900000}});
+ const result=buildRoutingPool(snapshot,{interactive:false,tier:'deep'});
+ const models=new Set(result.options.map(row=>row.value.model));
+ assert.deepEqual([...models].sort(),['gemini-4-argon-medium','gpt-6.1-sol']);
+ assert(result.diagnostics.advisories!.some(row=>row.reason==='deep_prefers_high_effort'));
+});
+test('high effort never joins ordinary picks or plain --model opus, and stays opt-in by effort, policy id or deep tier',()=>{
+ for(const input of [{},{tier:'daily'},{tier:'quick'},{purpose:'review' as const},{purpose:'implement' as const},{model:'opus'},{engine:'claude'}]){
+  const result=buildRoutingPool(hydrogenFixture(),{interactive:false,...input});
+  assert(!result.options.some(row=>row.value.effort==='high'),JSON.stringify(input));
+ }
+ assert.deepEqual([...new Set(buildRoutingPool(hydrogenFixture(),{interactive:false,model:'claude-opus-high'}).options.map(row=>row.value.policy_id))],['claude-opus-high']);
+ // Astra stays review/think-only and explicit; Sol/Argon stay at bounded effort, so no high route exists for them.
+ assert.throws(()=>buildRoutingPool(hydrogenFixture(),{interactive:false,effort:'high',model:'gpt-6-astra'}),/astra_not_for_implementation/);
+ for(const model of ['gpt-6.1-sol','gemini-4-argon-medium'])
+  assert.throws(()=>buildRoutingPool(hydrogenFixture(),{interactive:false,effort:'high',model}),(e:any)=>e.code==='model_policy_unavailable');
 });
