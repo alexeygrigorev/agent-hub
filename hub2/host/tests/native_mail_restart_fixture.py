@@ -47,7 +47,7 @@ class StopServe(BaseException):
 
 class NoWorkPool:
     def submit(self, *args):
-        raise AssertionError('mail fixture must not launch or run native commands')
+        raise FixtureViolation('mail fixture must not launch or run native commands')
 
 
 class Socket:
@@ -75,11 +75,51 @@ class Socket:
 
 
 
-def run(root, mode):
+class FixtureViolation(BaseException):
+    """Fatal fixture-boundary violation; real _serve cannot reconnect past it."""
+
+
+def require(condition):
+    if not condition: raise FixtureViolation('fixture_boundary_refused')
+
+
+def make_fixture_bridge(root, client, mode, binding=None, effect_scope=None):
+    """Shared Journal/Bridge/native core. Caller owns close and deliver binding.
+
+    No transport is substituted here; component and public callers supply their
+    own Client. Public transport methods must call the real original methods.
+    """
     journal = Journal(root / 'journal.sqlite')
+    binding = binding or {'session_id': SESSION, 'native_id': NATIVE,
+        'operation_id': 'fixture-launch', 'epoch': 1, 'workspace': str(root), 'tag': TAG}
+    physical = {'id': binding['native_id'], 'tag': binding['tag'],
+                'workspace': binding['workspace'], 'phase': 'running', 'created_at_ms': 1000}
+    def fake_native(arguments, **options):
+        if arguments[1:2] == ['status']:
+            require(arguments == [sys.executable, 'status', binding['native_id'], '--json'])
+            append(root, 'status.jsonl', physical)
+            return subprocess.CompletedProcess(arguments, 0, json.dumps(physical), '')
+        require(len(arguments) == 10 and arguments[:7] == [sys.executable, 'message',
+            'send', '--to', binding['tag'], '--kind', 'hub2'] and arguments[7] == '--data')
+        require(options.get('cwd') == binding['workspace'])
+        identity = json.loads(arguments[arguments.index('--data') + 1])['message_id']
+        if effect_scope is not None: effect_scope(identity, arguments[-1])
+        row = journal.db.execute('SELECT state,receipt FROM native_mail WHERE id=?', (identity,)).fetchone()
+        require(row is not None and row['state'] == 'executing' and row['receipt'] is None)
+        receipt = None if mode == 'crash' else str(uuid.uuid4())
+        append(root, 'effects.jsonl', {'id': identity, 'receipt': receipt})
+        if mode == 'crash': os._exit(73)
+        return subprocess.CompletedProcess(arguments, 0, receipt + '\n', '')
+    bridge = Bridge(client, journal, [Path(binding['workspace'])], ['shell'], executable=sys.executable,
+                    runner=fake_native, launcher_config={'private_provider_homes': False})
+    bridge.fixture_native = fake_native
+    return bridge
+
+
+def run(root, mode):
     client = Client('https://fixture.invalid', 'synthetic-not-a-credential', timeout=1)
-    physical = {'id': NATIVE, 'tag': TAG, 'workspace': str(root),
-                'phase': 'running', 'created_at_ms': 1000}
+    bridge = make_fixture_bridge(root, client, mode)
+    journal = bridge.journal
     def request(method, path, body=None, key=None):
         assert method == 'POST' and path.startswith('/api/messages/')
         identity = path.split('/')[3].split('?')[0]
@@ -90,25 +130,8 @@ def run(root, mode):
         emit('receipt_posted', id=identity, native_receipt=body['native_receipt'])
         return {}  # Only the later fake transport receipt; no first-row repair.
     client.request = request
-    def fake_native(arguments, **options):
-        if arguments[1:2] == ['status']:
-            assert arguments[2] == NATIVE
-            append(root, 'status.jsonl', physical)
-            return subprocess.CompletedProcess(arguments, 0, json.dumps(physical), '')
-        assert arguments[1:3] == ['message', 'send'] and '--data' in arguments
-        assert arguments[arguments.index('--to') + 1] == TAG
-        assert '--enter' not in arguments and '--strict' not in arguments
-        identity = json.loads(arguments[arguments.index('--data') + 1])['message_id']
-        row = journal.db.execute('SELECT state,receipt FROM native_mail WHERE id=?', (identity,)).fetchone()
-        assert row['state'] == 'executing' and row['receipt'] is None
-        receipt = None if mode == 'crash' else str(uuid.uuid4())
-        append(root, 'effects.jsonl', {'id': identity, 'receipt': receipt})
-        if mode == 'crash': os._exit(73)
-        return subprocess.CompletedProcess(arguments, 0, receipt + '\n', '')
-    bridge = Bridge(client, journal, [root], ['shell'], executable=sys.executable,
-                    runner=fake_native, launcher_config={'private_provider_homes': False})
     original_deliver = messages.deliver
-    messages.deliver = partial(original_deliver, runner=fake_native)
+    messages.deliver = partial(original_deliver, runner=bridge.fixture_native)
     try:
         if mode == 'crash':
             with journal.db:
