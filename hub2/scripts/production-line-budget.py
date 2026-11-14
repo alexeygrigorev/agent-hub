@@ -41,7 +41,7 @@ def text_files(path: Path) -> set[Path]:
 
 
 def production_files() -> set[Path]:
-    files = text_files(HUB2 / "src") | text_files(HUB2 / "node") | text_files(HUB2 / "host" / "agent_hub_host") | text_files(HUB2 / "public")
+    files = text_files(HUB2 / "src") | text_files(HUB2 / "compat") | text_files(HUB2 / "node") | text_files(HUB2 / "host" / "agent_hub_host") | text_files(HUB2 / "public")
     # Production Wrangler entry keeps first activation in maintenance mode.
     production_worker = HUB2 / "production-worker.ts"
     if production_worker.is_file():
