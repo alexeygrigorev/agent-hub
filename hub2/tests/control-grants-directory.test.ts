@@ -1,6 +1,8 @@
 import {test} from 'node:test';import assert from 'node:assert/strict';import {DatabaseSync} from 'node:sqlite';import {ControlDO} from '../src/control-do';
 import {pickModelRouteDetailed,simulateModelRoutes} from '../src/model-picker';
 import {setImmediate as nextTurn} from 'node:timers/promises';
+import {spawnSync as pickerAdapterSpawn} from 'node:child_process';
+import {fileURLToPath as pickerAdapterFilePath} from 'node:url';
 const admin={id:'human:admin',kind:'operator',scopes:['operator:admin'],family_id:'operator-family',client_id:'phone'};
 function fixture(options:{beforeAccount?:()=>Promise<void>;schemaMode?:string}={}){const database=new DatabaseSync(':memory:'),snapshots=new Map<string,unknown[]>();const state:any={storage:{async setAlarm(){},async deleteAlarm(){},sql:{exec(q:string,...a:any[]){const s=database.prepare(q);const rows=s.columns().length?s.all(...a):(s.run(...a),[]);return{toArray:()=>rows};}},transactionSync(fn:()=>unknown){database.exec('BEGIN');try{const v=fn();database.exec('COMMIT');return v;}catch(e){database.exec('ROLLBACK');throw e;}}},blockConcurrencyWhile:(fn:()=>unknown)=>Promise.resolve(fn())};
  let control:ControlDO;
@@ -269,4 +271,42 @@ test('observer gap recovery changes coverage identity even within the same milli
  f.restart();
  const recreated=await data(await f.call('/api/picker-alerts/counters'));
  assert.deepEqual(recreated.coverage,after);assert.equal(recreated.consecutive_degraded,1);
+});
+
+test('picker control actual handler and cache produce adapter-compatible committed watermark',async()=>{
+ const f=fixture();await configurePicker(f);
+ try{
+  const initial=await f.call('/api/picker-alerts/counters');
+  assert.equal(initial.headers.get('cache-control'),'no-store');
+  const before=await data(initial);assert.equal(before.coverage.available,true);
+  for(let i=0;i<3;i++){
+   assert.equal((await f.call('/_internal/picker/draw','POST',draw('adapter-real-draw-'+i))).status,200);
+   const warm=await data(await f.call('/api/picker-alerts/counters'));
+   assert.equal(warm.total_picks,i+1); // Cache must invalidate after each actual transaction.
+  }
+  const response=await f.call('/api/picker-alerts/counters');assert.equal(response.status,200);
+  assert.equal(response.headers.get('cache-control'),'no-store');const body=await data(response);
+  const script=pickerAdapterFilePath(new URL('../../scripts/hub_alert_evidence.py',import.meta.url));
+  const python=`import importlib.util,json,sys
+s=importlib.util.spec_from_file_location('sampler',sys.argv[1]);m=importlib.util.module_from_spec(s);s.loader.exec_module(m)
+e={'mode':'external','source_id':'a'*64,'remote':{'kind':'picker_control_watermark_v1','base_url':'https://synthetic.example','credential_path':'/synthetic/UNREAD.json','source_id':'b'*64,'release_sha':'c'*40}}
+v=m.picker_control_observation(json.load(sys.stdin),e,observed_at_ms=int(sys.argv[2]));print(json.dumps(v))`;
+  const result=pickerAdapterSpawn('python3',['-I','-S','-B','-c',python,script,String(Date.now())],{input:JSON.stringify(body),encoding:'utf8',timeout:5000,maxBuffer:16384});
+  assert.equal(result.status,0,result.stderr);const observed=JSON.parse(result.stdout);
+  assert.equal(observed.kind,'picker_control_watermark_observation_v1');assert.equal(observed.occurrence_count,1);
+  assert.equal(observed.coverage_epoch,body.coverage.epoch);
+  for(const invented of ['complete','nonce','started_total','finished_total','controller_id'])assert.equal(invented in observed,false);
+ }finally{f.database.close();}
+});
+
+test('picker control handler unavailable coverage and actor refusal remain explicit',async()=>{
+ const f=fixture();await configurePicker(f);
+ try{
+  const machine={id:'machine:synthetic',kind:'machine',resource_id:'synthetic',scopes:['session:report']};
+  assert.equal((await f.call('/api/picker-alerts/counters','GET',undefined,machine)).status,403);
+  (f.control as any).pickerObserverDirty=true;
+  const unavailable=await data(await f.call('/api/picker-alerts/counters'));
+  assert.equal(unavailable.coverage.available,false);assert.equal(unavailable.coverage.reason,'picker_observer_unavailable');
+  assert.equal(unavailable.recipient,'dev@dtcdev.click');
+ }finally{f.database.close();}
 });

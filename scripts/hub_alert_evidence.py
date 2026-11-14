@@ -245,7 +245,7 @@ def verify_source(entry):
 
 def remote_spec(name, entry):
     remote = entry.get('remote')
-    expected_kind = {'credential_monitor': 'credential_monitor_post_v1',
+    expected_kind = {'picker_control': 'picker_control_watermark_v1', 'credential_monitor': 'credential_monitor_post_v1',
                      'picker_excluded': 'picker_diagnostic_v1', 'picker_quota_stale': 'picker_diagnostic_v1'}.get(name)
     require(expected_kind is not None and entry.get('mode') == 'external'
             and 'witness_path' not in entry and isinstance(remote, dict)
@@ -289,6 +289,98 @@ try:
 except Exception:
     raise SystemExit(2)
 """
+
+
+
+# This is a committed-draw watermark observation, NOT a generic controller
+# witness. It does not invent nonce/started/finished/source fields in the wire.
+PICKER_FETCH = r"""
+import json, sys, urllib.request
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs): return None
+def unique(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value: raise ValueError()
+        value[key] = item
+    return value
+try:
+    args = json.loads(sys.stdin.buffer.read(131073))
+    request = urllib.request.Request(args['url'], headers={'Authorization': 'Bearer ' + args['token']}, method='GET')
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    with opener.open(request, timeout=1.5) as response:
+        if response.status != 200: raise ValueError()
+        if not any(x.strip() == 'no-store' for x in response.headers.get('Cache-Control', '').lower().split(',')): raise ValueError()
+    raw = response.read(131073)
+    if len(raw) > 131072: raise ValueError()
+    json.loads(raw, object_pairs_hook=unique)
+    sys.stdout.buffer.write(raw)
+except Exception:
+    raise SystemExit(2)
+"""
+
+
+def picker_control_observation(value, entry, *, observed_at_ms):
+    remote = remote_spec('picker_control', entry)
+    fields = {'recipient', 'total_picks', 'degraded_picks', 'consecutive_degraded',
+              'occurrence_watermark', 'receipt_watermark', 'coverage'}
+    require(isinstance(value, dict) and set(value) == fields
+            and value['recipient'] == RECIPIENT, 'picker_control_shape_invalid')
+    for key in fields - {'recipient', 'coverage'}:
+        require(type(value[key]) is int and 0 <= value[key] <= 2**53 - 1,
+                'picker_control_counter_invalid')
+    total, degraded, consecutive = (value[k] for k in
+        ('total_picks', 'degraded_picks', 'consecutive_degraded'))
+    require(consecutive <= degraded <= total
+            and value['occurrence_watermark'] <= degraded // 3
+            and value['receipt_watermark'] >= total, 'picker_control_counter_inconsistent')
+    coverage = value['coverage']
+    require(isinstance(coverage, dict) and set(coverage) == {'available', 'epoch', 'since'}
+            and coverage['available'] is True and identifier(coverage['epoch'])
+            and type(coverage['since']) is int and 0 <= coverage['since'] <= 2**53 - 1
+            and number(observed_at_ms) and coverage['since'] <= observed_at_ms + 5000,
+            'picker_control_coverage_unavailable')
+    return {'kind': 'picker_control_watermark_observation_v1',
+            'producer': 'picker_control', 'recipient': RECIPIENT,
+            'occurrence_count': value['occurrence_watermark'],
+            'total_picks': total, 'degraded_picks': degraded,
+            'receipt_watermark': value['receipt_watermark'],
+            'coverage_epoch': coverage['epoch'], 'coverage_since': coverage['since'],
+            'observed_at_ms': observed_at_ms,
+            # Root pins deployment/source independently; these are enrollment
+            # provenance, NOT fields verified against this existing endpoint.
+            'generation_component': ['picker_control_committed_draws_v1', digest(entry),
+                                     remote['release_sha'], remote['source_id'],
+                                     coverage['epoch'], coverage['since']]}
+
+
+def picker_control_remote(entry):
+    remote = remote_spec('picker_control', entry)
+    credential = read_private(remote['credential_path'])
+    require(isinstance(credential.get('base_url'), str)
+            and credential['base_url'].rstrip('/') == remote['base_url'].rstrip('/'),
+            'credential_origin_mismatch')
+    token = credential.get('access_token')
+    require(isinstance(token, str) and 32 <= len(token) <= 8192
+            and all(33 <= ord(c) < 127 for c in token), 'invalid_remote_credential')
+    started = time.monotonic()
+    try:
+        result = subprocess.run([sys.executable, '-I', '-S', '-c', PICKER_FETCH],
+            input=canonical({'url': remote['base_url'].rstrip('/') + '/api/picker-alerts/counters',
+                             'token': token}), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=3, check=False, env={'PATH': os.defpath, 'LANG': 'C.UTF-8'})
+    except (OSError, subprocess.TimeoutExpired):
+        raise EvidenceUnavailable('picker_control_authority_unavailable') from None
+    require(result.returncode == 0 and len(result.stdout) <= LIMIT
+            and 0 <= time.monotonic() - started <= 3.1, 'picker_control_authority_unavailable')
+    value = json.loads(result.stdout, object_pairs_hook=unique_object)
+    return picker_control_observation(value, entry, observed_at_ms=int(time.time() * 1000))
+
+
+def sample_remote(name, entry):
+    if name == 'picker_control' and entry.get('remote', {}).get('kind') == 'picker_control_watermark_v1':
+        return picker_control_remote(entry)
+    return remote_witness(name, entry)
 
 
 def remote_witness(name, entry):
@@ -499,13 +591,22 @@ def aggregate(directory, *, now_ms=None):
         with PrivateDirectory(directory) as state, state.lock():
             original = state.read('enrollment.json')
             entries = enrollment(original)
-        remote_values = {name: remote_witness(name, entry) for name, entry in entries.items() if 'remote' in entry}
+        remote_values = {name: sample_remote(name, entry) for name, entry in entries.items() if 'remote' in entry}
         with PrivateDirectory(directory) as state, state.lock():
             current = state.read('enrollment.json')
             require(current == original, 'enrollment_changed_during_barrier')
             entries = enrollment(current)
             total, times, generations = 0, [], []
             for name, entry in sorted(entries.items()):
+                if name == 'picker_control' and entry.get('remote', {}).get('kind') == 'picker_control_watermark_v1':
+                    observation = remote_values[name]
+                    require(observation['kind'] == 'picker_control_watermark_observation_v1', 'picker_control_observation_invalid')
+                    require(-5000 <= now_ms - observation['observed_at_ms'] <= MAX_AGE_MS, 'picker_control_observation_stale')
+                    total += observation['occurrence_count']
+                    require(total <= MAX_COUNT, 'aggregate_counter_exhausted')
+                    times.append(observation['observed_at_ms'])
+                    generations.append(observation['generation_component'])
+                    continue
                 proof = witness(name, entry, now_ms=now_ms, remote_value=remote_values.get(name))
                 if entry['mode'] == 'external':
                     count = proof['occurrence_count']
