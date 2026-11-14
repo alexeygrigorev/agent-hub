@@ -167,8 +167,9 @@ class OfferAcknowledgement:
 
 
 class Bridge:
-    def __init__(self, client, journal, roots, engines, executable="a", runner=subprocess.run, launcher_config=None,machine_id=None,capabilities=None,workspaces=None):
+    def __init__(self, client, journal, roots, engines, executable="a", runner=subprocess.run, launcher_config=None,machine_id=None,capabilities=None,workspaces=None,alert_observer=None):
         self.client, self.journal, self.runner = client, journal, runner
+        self._alert_observer_spec = alert_observer
         self.roots = [Path(root).resolve(strict=True) for root in roots]
         self.advertisement = Advertisement(self.roots, capabilities, workspaces)
         self.engines = set(engines) | {"shell"}
@@ -1465,11 +1466,21 @@ class Bridge:
                 self.journal.close_thread()
         thread = threading.Thread(target=beats, name='hub2-live-session-heartbeat', daemon=True)
         thread.start()
+        observer = None
+        observer_spec = getattr(self, '_alert_observer_spec', None)
+        if observer_spec is not None:
+            try:
+                from . import alert_broker
+                observer = alert_broker.start_optional(observer_spec)
+            except Exception:
+                pass  # Optional observation never gates the primary host.
         try:
             self._serve(machine_id, labels)
         finally:
             with _NATIVE_INVENTORY_START_LOCK:
                 self._native_inventory_stop.set()
+            if observer is not None:
+                alert_broker.stop_optional(observer)
             credential_delivery.stop(self)
             stop.set()
             thread.join(timeout=1)
