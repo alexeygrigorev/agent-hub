@@ -377,7 +377,7 @@ def zai_native_return_proof(captured, expected, binding=None):
             answer.update(seen=True, invalidated=True)
             return answer
         events, malformed, native_parse_loss = [], False, False
-        for line in captured.splitlines():
+        for line in captured.split("\n"):
             if not line.strip():
                 continue
             try:

@@ -320,5 +320,30 @@ class NativeReturnedTextTests(unittest.TestCase):
                             self.assertFalse(value.output_has_marker(legacy, engine="zai"))
 
 
+    def test_literal_unicode_separators_in_valid_assistant_json_do_not_split_records(self):
+        for separator in [chr(0x2028), chr(0x2029), chr(0x85)]:
+            # Actual Unicode is legal inside JSON strings; NDJSON is LF-delimited.
+            assistant = {"type":"item.completed", "item":{"type":"agent_message", "text":"quoted native_tool_result" + separator + "ordinary prose"}}
+            first = json.dumps(assistant, ensure_ascii=False)
+            self.assertIsInstance(json.loads(first), dict)
+            for ending in ["\n", "\r\n"]:
+                with self.subTest(codepoint=ord(separator), ending=ending):
+                    self.assertTrue(canary().output_has_marker(first + ending + text(frame()) + ending, engine="zai"))
+
+    def test_literal_unicode_nonproof_native_content_and_crlf_preserve_proof(self):
+        for separator in [chr(0x2028), chr(0x2029), chr(0x85)]:
+            before = frame()
+            before["item"]["id"] = "nonproof-item"
+            observation = before["item"]["observation"]
+            content = "real nonproof output" + separator + "additional output"
+            observation.update(call_id="nonproof-call", content=content,
+                               native_original_bytes=len(content.encode("utf-8")),
+                               native_returned_bytes=len(content.encode("utf-8")))
+            first = json.dumps(before, ensure_ascii=False)
+            for ending in ["\n", "\r\n"]:
+                with self.subTest(codepoint=ord(separator), ending=ending):
+                    self.assertTrue(canary().output_has_marker(first + ending + text(frame()) + ending, engine="zai"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
