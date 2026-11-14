@@ -48,6 +48,51 @@ class AdapterArgvTest(unittest.TestCase):
 
 
 class EffortAndInteractiveTest(unittest.TestCase):
+    def test_go_interactive_matches_native_mini_flag_contract(self):
+        import argparse
+        # Native Mini usage from the owned Nov14 failure + independent mini
+        # --help: no --format/--json. This schema is independent of our builder.
+        parser = argparse.ArgumentParser(allow_abbrev=False, exit_on_error=False)
+        for option in ('--standalone', '--continue', '--fork', '--replay', '--no-replay', '--wizard'):
+            parser.add_argument(option, action='store_true')
+        for option in ('--server', '--session', '--model', '--agent', '--prompt'):
+            parser.add_argument(option)
+        parser.add_argument('--replay-limit', type=int)
+        prompt = 'Read the tracked README; preserve literal --format json and Unicode \u03bb.'
+        headless = nl.adapter_argv('go', prompt, nl.OPENCODE_MODEL)
+        argv = nl.interactive_argv('go', headless, prompt, model=nl.OPENCODE_MODEL)
+        self.assertEqual(argv[:2], ['opencode', 'mini'])
+        parsed, unknown = parser.parse_known_args(argv[2:])
+        self.assertEqual(unknown, [], 'actual Mini refuses unknown flags and positionals')
+        self.assertTrue(parsed.standalone)
+        self.assertEqual(parsed.model, nl.OPENCODE_MODEL)
+        self.assertEqual(parsed.prompt, prompt)
+        self.assertNotIn('--auto', argv)
+        # Conversion must not mutate the source headless argv in place.
+        self.assertEqual(headless, nl.adapter_argv('go', prompt, nl.OPENCODE_MODEL))
+
+    def test_go_mini_conversion_preserves_headless_json_and_other_providers(self):
+        prompt = 'Read the tracked file'
+        base = nl.adapter_argv('go', prompt, nl.OPENCODE_MODEL)
+        self.assertEqual(base, ['opencode', 'run', '--standalone', '--auto', '--format', 'json',
+                                '--model', nl.OPENCODE_MODEL, prompt])
+        nl.interactive_argv('go', base, prompt, model=nl.OPENCODE_MODEL)
+        self.assertEqual(base[base.index('--format') + 1], 'json')
+        with self.assertRaisesRegex(ValueError, 'interactive_effort_unsupported'):
+            nl.interactive_argv('go', base, prompt, model=nl.OPENCODE_MODEL, effort='medium')
+        with self.assertRaisesRegex(ValueError, 'native_goal_provider_unsupported'):
+            nl.interactive_argv('go', base, prompt, model=nl.OPENCODE_MODEL, with_goal=True)
+
+    def test_go_mini_refuses_unverified_inherited_output_shape(self):
+        prompt = 'Read the tracked file'
+        base = nl.adapter_argv('go', prompt, nl.OPENCODE_MODEL)
+        absent = list(base); at = absent.index('--format'); del absent[at:at + 2]
+        wrong = list(base); wrong[wrong.index('--format') + 1] = 'text'
+        duplicate = [*base[:-1], '--format', 'json', prompt]
+        for argv in (absent, wrong, duplicate):
+            with self.subTest(argv=argv), self.assertRaisesRegex(ValueError, 'interactive_adapter_shape_unverified'):
+                nl.interactive_argv('go', argv, prompt, model=nl.OPENCODE_MODEL)
+
     def test_aplexer_prompt_flattens_windows_line_breaks_only(self):
         prompt = 'First line\r\n\r\nSecond line\nThird line'
         self.assertEqual(nl.aplexer_prompt(prompt, windows=True), 'First line Second line Third line')
