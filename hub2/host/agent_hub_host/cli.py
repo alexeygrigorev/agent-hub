@@ -83,10 +83,18 @@ def main(argv=None):
             bridge.heartbeat(args.label, include_native_sessions=False)
             print(json.dumps({"ok": True}))
         elif args.command == "serve":
+            observer = None
+            if 'alert_observer' in config:
+                try:
+                    from .alert_broker import configured
+                    observer = configured(config['alert_observer'])
+                except Exception:
+                    pass  # Optional evidence never prevents ordinary serve.
             bridge = Bridge(client, Journal(args.config.parent / "v2-journal.sqlite"),
                             config["roots"], config["engines"], args.aplexer,
                             launcher_config=config.get("launcher"),machine_id=config['machine_id'],
-                            capabilities=config.get("capabilities"), workspaces=config.get("workspaces"))
+                            capabilities=config.get("capabilities"), workspaces=config.get("workspaces"),
+                            alert_observer=observer)
             if args.once:
                 bridge.heartbeat(args.label)
                 bridge.drain()
