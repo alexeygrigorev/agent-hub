@@ -42,6 +42,14 @@ export type EvidenceInvalidationReason = 'invalidated' | 'persist_failed' | 'cap
   | 'snapshot_route_timeout' | 'snapshot_route_rejected'
   | 'dry_run_begin_failed' | 'dry_run_finish_timeout' | 'dry_run_finish_failed';
 
+/** Closed unavailable-only persistence metadata. Never an OS code or error text. */
+export type EvidencePersistStage = 'artifacts' | 'store_identity' | 'store_sentinel'
+  | 'snapshot_create' | 'snapshot_write' | 'snapshot_sync' | 'snapshot_close' | 'ancestor_sync'
+  | 'checkpoint_verify' | 'checkpoint_create' | 'checkpoint_write' | 'checkpoint_sync'
+  | 'checkpoint_close' | 'checkpoint_publish' | 'unspecified';
+export type EvidencePersistError = 'deadline' | 'permission' | 'missing' | 'collision'
+  | 'capacity' | 'readonly' | 'io' | 'fd_limit' | 'error' | 'opaque';
+
 /** Optional Node ingress authority; failures never authorize or refuse primary work. */
 export interface CredentialMonitorEvidence {
   begin(): unknown;

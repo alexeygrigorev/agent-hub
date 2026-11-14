@@ -115,6 +115,96 @@ async function stop(child:ReturnType<typeof spawn>, signal:any='SIGTERM') {
   await new Promise<void>(resolveDone=>{child.once('exit',()=>resolveDone());child.kill(signal);});
 }
 async function defineTests() {
+  test('persist diagnostics classify only safe own errno data and never invoke Proxy or getters',async()=>{
+    const {classifyPersistFailure,persistDiagnosticFields}=await import('../node/alert-evidence.ts');
+    for(const [code,bucket] of Object.entries({EACCES:'permission',EPERM:'permission',ENOENT:'missing',EEXIST:'collision',
+      ENOSPC:'capacity',EDQUOT:'capacity',EROFS:'readonly',EIO:'io',EMFILE:'fd_limit',ENFILE:'fd_limit'})){
+      const error=Object.assign(new Error('TOKEN=secret /private/path'),{code});
+      assert.equal(classifyPersistFailure(error),bucket);
+    }
+    let touched=0;
+    const getter=new Error('secret');Object.defineProperty(getter,'code',{get(){touched++;throw new Error('getter secret');}});
+    getter.toString=()=>{touched++;throw new Error('stringify secret');};
+    assert.equal(classifyPersistFailure(getter),'error');
+    const proxy=new Proxy(new Error('secret'),{get(){touched++;throw new Error('Proxy secret');},
+      getOwnPropertyDescriptor(){touched++;throw new Error('descriptor secret');},getPrototypeOf(){touched++;throw new Error('prototype secret');}});
+    assert.equal(classifyPersistFailure(proxy),'opaque');
+    const revoked=Proxy.revocable(new Error('secret'),{});revoked.revoke();assert.equal(classifyPersistFailure(revoked.proxy),'opaque');
+    for(const value of ['EIO',null,undefined,{code:'EIO'},Symbol('secret')])assert.equal(classifyPersistFailure(value),'opaque');
+    assert.equal(classifyPersistFailure(Object.assign(new Error('observer_timeout'),{code:'ETIMEDOUT'})),'error','external timeout text/code is not our deadline');
+    assert.deepEqual(persistDiagnosticFields('__proto__','toString'),{unavailable_persist_stage:'unspecified',unavailable_persist_error:'opaque'});
+    assert.deepEqual(persistDiagnosticFields(proxy,proxy),{unavailable_persist_stage:'unspecified',unavailable_persist_error:'opaque'});
+    assert.equal(touched,0);assert.ok(!JSON.stringify(persistDiagnosticFields('snapshot_write','permission')).includes('secret'));
+  });
+  test('persist diagnostics distinguish artifact, store validation, snapshot creation and writer failures',async t=>{
+    for(const fault of ['artifact','identity','sentinel','create','writer','sync','close','ancestor','writer_close']){
+      const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
+      const expected:any={artifact:['artifacts','error'],identity:['store_identity','permission'],
+        sentinel:['store_sentinel','missing'],create:['snapshot_create','collision'],writer:['snapshot_write','io'],
+        sync:['snapshot_sync','io'],close:['snapshot_close','permission'],ancestor:['ancestor_sync','io'],writer_close:['snapshot_write','io']};
+      const f=await fixture(directory,{producer:'picker_excluded',timeoutMs:2000,
+        writer:['sync','ancestor'].includes(fault)?undefined:async(value:any,handle:any)=>{
+          if(['close','writer_close'].includes(fault)){const close=handle.close.bind(handle);handle.close=async()=>{await close();throw Object.assign(new Error('private close'),{code:'EACCES'});};}
+          if(['writer','writer_close'].includes(fault))throw Object.assign(new Error('TOKEN=secret'),{code:'EIO'});
+          await semanticWriter(value,handle);
+        }});
+      t.after(()=>f.observer.close());const store=(f.observer as any).store;
+      const identity=store.identity.bind(store),read=store.read.bind(store);let restore=()=>{};t.after(()=>restore());
+      if(fault==='sync'){
+        const probe=await openFile(join(directory,'sync-prototype'),'w',0o600);let prototype:any;
+        try{prototype=Object.getPrototypeOf(probe);}finally{await probe.close();}
+        const original=prototype.sync;restore=()=>{prototype.sync=original;};
+        prototype.sync=async()=>{throw Object.assign(new Error('private sync'),{code:'EIO'});};
+      }
+      if(fault==='ancestor'){const directory=store.directory,original=directory.sync;restore=()=>{directory.sync=original;};directory.sync=async()=>{throw Object.assign(new Error('private ancestor'),{code:'EIO'});};}
+      if(fault==='artifact')chmodSync(join(f.installed,'src/model-picker.ts'),0o666);
+      if(fault==='identity')store.identity=async()=>{throw Object.assign(new Error('private'),{code:'EACCES'});};
+      if(fault==='sentinel')store.read=async(name:string)=>{if(name==='journal.json')throw Object.assign(new Error('private'),{code:'ENOENT'});return read(name);};
+      if(fault==='create')writeFileSync(join(f.state,'snapshot-'+f.observer.boot+'-1.json'),'owned collision',{mode:0o600});
+      await f.observer.finish(f.observer.begin(),'observation');
+      restore();store.identity=identity;store.read=read;if(fault==='artifact')chmodSync(join(f.installed,'src/model-picker.ts'),0o600);
+      const proof=await f.observer.snapshot(NONCE);assert.equal(proof.available,false);assert.equal(proof.unavailable_reason,'persist_failed');
+      assert.equal(proof.unavailable_persist_stage,expected[fault][0]);assert.equal(proof.unavailable_persist_error,expected[fault][1]);
+      assert.ok(!JSON.stringify(proof).includes('TOKEN='));assert.ok(!JSON.stringify(proof).includes(directory));
+      f.observer.invalidate('snapshot_route_rejected');assert.deepEqual(await f.observer.snapshot(NONCE),proof);
+    }
+  });
+  test('persist diagnostics distinguish own deadline and retain its first stage after late completion',async t=>{
+    const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
+    const f=await fixture(directory,{producer:'picker_quota_stale',timeoutMs:2000,writer:semanticWriter});t.after(()=>f.observer.close());
+    let entered!:()=>void,finishLate!:()=>void;const started=new Promise<void>(yes=>entered=yes),late=new Promise<void>(yes=>finishLate=yes);
+    t.after(()=>finishLate());const store=(f.observer as any).store,write=store.write.bind(store);
+    store.write=async(_v:any,_w:any,trace:any)=>{trace.stage='snapshot_write';entered();await late;trace.stage='ancestor_sync';};
+    // Fake timer fires ONLY after artifact verification reached the held store;
+    // no real sleep, VM latency assertion or production deadline increase.
+    t.mock.timers.enable({apis:['setTimeout']});
+    const finishing=f.observer.finish(f.observer.begin(),'observation');
+    await Promise.race([started,finishing.then(()=>{throw new Error('held writer boundary not reached');})]);
+    t.mock.timers.tick(2000);await finishing;t.mock.timers.reset();
+    const first=await f.observer.snapshot(NONCE);assert.equal(first.unavailable_reason,'persist_failed');
+    assert.equal(first.unavailable_persist_stage,'snapshot_write');assert.equal(first.unavailable_persist_error,'deadline');
+    finishLate();await late;await Promise.resolve();store.write=write;
+    assert.deepEqual(await f.observer.snapshot(NONCE),first,'late stage changes cannot heal/rewrite');
+  });
+  test('persist diagnostics never overwrite earlier faults and leave healthy seventeen bytes unchanged',async t=>{
+    const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
+    const f=await fixture(directory,{producer:'picker_excluded',timeoutMs:2000,writer:semanticWriter});t.after(()=>f.observer.close());
+    const healthy=await f.observer.snapshot(NONCE);assert.equal(Object.keys(healthy).length,17);
+    assert.deepEqual(Object.keys(healthy).filter(key=>key.startsWith('unavailable')),[]);
+    const before=JSON.stringify(healthy),again=await f.observer.snapshot(NONCE);again.observed_at_ms=healthy.observed_at_ms;
+    assert.equal(JSON.stringify(again),before,'healthy keys/order/value bytes except actual observation time');
+    let reject!:()=>void,entered!:()=>void;const started=new Promise<void>(yes=>entered=yes);
+    const failure=new Promise<void>((_yes,no)=>reject=()=>no(new Error('secret')));
+    const store=(f.observer as any).store,write=store.write.bind(store);store.write=()=>{entered();return failure;};
+    const id=f.observer.begin();await started;f.observer.invalidate('picker_pool_failed');reject();await (f.observer as any).queue;
+    store.write=write;await f.observer.finish(id,'alert');
+    const first=await f.observer.snapshot(NONCE);assert.equal(first.unavailable_reason,'picker_pool_failed');
+    assert.ok(!('unavailable_persist_stage' in first));assert.ok(!('unavailable_persist_error' in first));
+    const fallbackDirectory=temp();t.after(()=>rmSync(fallbackDirectory,{recursive:true,force:true}));
+    const fallback=await fixture(fallbackDirectory,{timeoutMs:2000,writer:semanticWriter});t.after(()=>fallback.observer.close());
+    fallback.observer.invalidate('persist_failed');const unspecified=await fallback.observer.snapshot(NONCE);
+    assert.equal(unspecified.unavailable_persist_stage,'unspecified');assert.equal(unspecified.unavailable_persist_error,'opaque');
+  });
   test('first fault actual Node reasons are closed sticky and preserve healthy seventeen keys',async t=>{
     const reasons=['picker_snapshot_failed','picker_pool_failed','picker_decision_incomplete',
       'picker_snapshot_no_host','picker_pool_no_host','picker_snapshot_data_unavailable',
