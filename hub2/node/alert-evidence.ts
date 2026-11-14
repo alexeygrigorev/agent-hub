@@ -225,10 +225,14 @@ async function verifyArtifacts(entry: Enrollment, loaded: Record<string, string>
     && hash(canonical(entry.artifacts)) === entry.source_id);
 }
 
+const FAILURE_REASONS = new Set(['invalidated', 'persist_failed', 'capacity_or_counter_limit',
+  'finish_identity_invalid', 'snapshot_source_verification_failed', 'snapshot_store_verification_failed', 'closed']);
+
 /** One live Node incarnation. No clean sample is possible after any observer error. */
 export class AlertEvidence implements CredentialMonitorEvidence {
   readonly boot: string;
   private dirty = false;
+  private firstFailure: string | undefined;
   private pending = 0;
   private active = new Set<number>();
   private requests = 0;
@@ -261,7 +265,11 @@ export class AlertEvidence implements CredentialMonitorEvidence {
       return new AlertEvidence(store, entry, journal, options.writer, options.timeoutMs ?? TIMEOUT_MS, Object.freeze({ ...options.loadedArtifacts }));
     } catch { await store.close(); throw new Error('evidence_unavailable'); }
   }
-  invalidate() { this.dirty = true; }
+  invalidate(reason: unknown = 'invalidated') {
+    // Keep only a closed first-fault enum; caller errors/paths never become wire data.
+    if (!this.dirty) this.firstFailure = typeof reason === 'string' && FAILURE_REASONS.has(reason) ? reason : 'invalidated';
+    this.dirty = true;
+  }
   private async bounded(work: Promise<void>) {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try { await Promise.race([work, new Promise<never>((_, reject) => {
@@ -287,7 +295,7 @@ export class AlertEvidence implements CredentialMonitorEvidence {
             await this.store.write(value, this.writer);
           })());
         }
-      } catch { this.invalidate(); }
+      } catch { this.invalidate('persist_failed'); }
       finally {
         // Clear the busy flag before this async body resolves. A separate
         // promise.finally would leave a microtask window that could drop a new
@@ -299,7 +307,7 @@ export class AlertEvidence implements CredentialMonitorEvidence {
   }
   begin(): unknown {
     if (this.dirty || this.active.size >= MAX_ACTIVE || this.journal.started_total >= Number.MAX_SAFE_INTEGER) {
-      this.invalidate(); return null;
+      this.invalidate('capacity_or_counter_limit'); return null;
     }
     const identity = ++this.requests;
     this.journal.started_total++;
@@ -309,7 +317,7 @@ export class AlertEvidence implements CredentialMonitorEvidence {
   }
   async finish(identity: unknown, decision: 'alert' | 'observation' | null) {
     if (this.dirty) return;
-    if (typeof identity !== 'number' || !this.active.delete(identity)) { this.invalidate(); return; }
+    if (typeof identity !== 'number' || !this.active.delete(identity)) { this.invalidate('finish_identity_invalid'); return; }
     this.journal.finished_total++;
     if (decision === 'alert') this.journal.occurrence_count++;
     this.persist();
@@ -323,8 +331,10 @@ export class AlertEvidence implements CredentialMonitorEvidence {
         check(canonical(current) === canonical(this.enrollment));
         await verifyArtifacts(this.enrollment, this.loaded);
       })());
-    } catch { this.invalidate(); }
-    const unavailable = () => ({kind: 'hub_alert_evidence_unavailable_v1', available: false, reason: 'coverage_unknown', nonce});
+    } catch { this.invalidate('snapshot_source_verification_failed'); }
+    const unavailable = () => ({kind: 'hub_alert_evidence_unavailable_v1', available: false, reason: 'coverage_unknown', nonce,
+      unavailable_phase: 'runtime', unavailable_reason: this.firstFailure ??
+        (this.pending ? 'pending_write' : this.active.size ? 'active_invocation' : 'snapshot_raced')});
     if (this.dirty || this.pending || this.active.size) return unavailable();
     const version = canonical(this.journal);
     try {
@@ -332,7 +342,7 @@ export class AlertEvidence implements CredentialMonitorEvidence {
       await this.bounded(this.store.verify().then(value => { stored = value; }));
       if (this.pending || this.active.size || canonical(this.journal) !== version) return unavailable();
       check(stored === version);
-    } catch { this.invalidate(); }
+    } catch { this.invalidate('snapshot_store_verification_failed'); }
     if (this.dirty) return unavailable();
     return { kind: 'hub_controller_coverage_v1', producer: this.enrollment.producer, recipient: RECIPIENT,
       source_id: this.enrollment.source_id, release_sha: this.enrollment.release_sha, artifact_proof: 'loaded_and_current_v1',
@@ -341,5 +351,5 @@ export class AlertEvidence implements CredentialMonitorEvidence {
       finished_total: this.journal.finished_total, baseline_count: 0, baseline_invocations: 0,
       occurrence_count: this.journal.occurrence_count, observed_at_ms: Date.now(), nonce };
   }
-  async close() { this.invalidate(); await this.queue; await this.store.close(); }
+  async close() { this.invalidate('closed'); await this.queue; await this.store.close(); }
 }
