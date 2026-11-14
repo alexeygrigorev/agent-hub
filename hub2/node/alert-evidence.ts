@@ -21,9 +21,10 @@
 import { constants } from 'node:fs';
 import { open, lstat, readdir, rename, link, unlink, type FileHandle } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
+import { types as utilTypes } from 'node:util';
 import { isAbsolute, resolve } from 'node:path';
 import { fileURLToPath, URL } from 'node:url';
-import type { CredentialMonitorEvidence, JsonRecord, PickerDiagnosticProducer } from '../src/types.ts';
+import type { CredentialMonitorEvidence, EvidencePersistStage, EvidencePersistError, JsonRecord, PickerDiagnosticProducer } from '../src/types.ts';
 
 const LIMIT = 131072;
 const MAX_ACTIVE = 128; // Bounded active identities, not a lifetime request ceiling.
@@ -57,6 +58,51 @@ const hash = (value: string | Uint8Array) => createHash('sha256').update(value).
 const integer = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
 function check(ok: unknown): asserts ok { if (!ok) throw new Error('evidence_unavailable'); }
 function exact(value: object, keys: string[]) { check(Object.keys(value).sort().join(',') === [...keys].sort().join(',')); }
+
+// Exhaustive type-checked tables are the only unavailable-field projection.
+const PERSIST_STAGES: Record<EvidencePersistStage, true> = {
+  artifacts:true,store_identity:true,store_sentinel:true,snapshot_create:true,
+  snapshot_write:true,snapshot_sync:true,snapshot_close:true,ancestor_sync:true,
+  checkpoint_verify:true,checkpoint_create:true,checkpoint_write:true,checkpoint_sync:true,
+  checkpoint_close:true,checkpoint_publish:true,unspecified:true,
+};
+const PERSIST_ERRORS: Record<EvidencePersistError, true> = {
+  deadline:true,permission:true,missing:true,collision:true,capacity:true,
+  readonly:true,io:true,fd_limit:true,error:true,opaque:true,
+};
+const persistStages = new Set(Object.keys(PERSIST_STAGES));
+const persistErrors = new Set(Object.keys(PERSIST_ERRORS));
+export function persistDiagnosticFields(stage:unknown,error:unknown){
+  return {unavailable_persist_stage:typeof stage==='string'&&persistStages.has(stage)?stage:'unspecified',
+    unavailable_persist_error:typeof error==='string'&&persistErrors.has(error)?error:'opaque'};
+}
+const ownDeadlines = new WeakSet<object>();
+type PersistTrace = { stage: EvidencePersistStage; first?: {stage:EvidencePersistStage;error:unknown} };
+async function persistStep<T>(trace:PersistTrace|undefined,stage:EvidencePersistStage,work:()=>Promise<T>):Promise<T>{
+  if(trace)trace.stage=stage;
+  try{return await work();}
+  catch(error){if(trace&&!trace.first)trace.first={stage,error};throw error;}
+}
+export function classifyPersistFailure(error:unknown):EvidencePersistError{
+  try{
+    if(error!==null&&(typeof error==='object'||typeof error==='function')){
+      if(ownDeadlines.has(error))return 'deadline';
+      // A Proxy descriptor/getPrototypeOf trap is user code. Do not invoke it,
+      // access .code/.message, stringify, or inspect arbitrary class names.
+      if(utilTypes.isProxy(error)||!utilTypes.isNativeError(error))return 'opaque';
+      const descriptor=Object.getOwnPropertyDescriptor(error,'code');
+      const code=descriptor&&'value' in descriptor?descriptor.value:undefined;
+      if(typeof code==='string'){
+        if(code==='EACCES'||code==='EPERM')return 'permission';
+        if(code==='ENOENT')return 'missing';if(code==='EEXIST')return 'collision';
+        if(code==='ENOSPC'||code==='EDQUOT')return 'capacity';if(code==='EROFS')return 'readonly';
+        if(code==='EIO')return 'io';if(code==='EMFILE'||code==='ENFILE')return 'fd_limit';
+      }
+      return 'error';
+    }
+  }catch{} // Failed introspection never becomes a second failure or raw payload.
+  return 'opaque';
+}
 
 class PrivateStore {
   readonly handles: FileHandle[] = [];
@@ -112,42 +158,44 @@ class PrivateStore {
     check(this.journalBaseline === undefined);
     this.journalBaseline = canonical(value);
   }
-  async write(value: Journal, writer?: SnapshotWriter) {
-    await this.identity();
-    check(this.journalBaseline !== undefined
-      && canonical(await this.read('journal.json')) === this.journalBaseline);
+  async write(value: Journal, writer?: SnapshotWriter, trace?: PersistTrace) {
+    await persistStep(trace,'store_identity',()=>this.identity());
+    await persistStep(trace,'store_sentinel',async()=>check(this.journalBaseline !== undefined
+      && canonical(await this.read('journal.json')) === this.journalBaseline));
     if (this.commits.length === PREFIX_SNAPSHOTS) {
-      await this.checkpoint(value, writer);
+      await this.checkpoint(value, writer, trace);
       return;
     }
     const sequence = this.commits.length + 1;
     const name = `snapshot-${this.boot}-${sequence}.json`;
-    const previous = this.commits.at(-1)?.digest ?? hash(this.journalBaseline);
+    const previous = this.commits.at(-1)?.digest ?? hash(this.journalBaseline!);
     const record = {kind: value.kind === 'hub_credential_monitor_journal_v1'
       ? 'hub_credential_monitor_snapshot_v1' : 'hub_picker_diagnostic_snapshot_v1', controller_id: this.boot,
       sequence, previous_sha256: previous, journal: value};
     const bytes = canonical(record);
-    const handle = await open(this.name(name),
-      constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+    const handle = await persistStep(trace,'snapshot_create',()=>open(this.name(name),
+      constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600));
     try {
-      if (writer) await writer(record, handle);
+      if (writer) await persistStep(trace,'snapshot_write',()=>writer(record, handle));
       else {
-        await handle.writeFile(bytes + '\n', 'utf8');
-        await handle.sync();
+        await persistStep(trace,'snapshot_write',()=>handle.writeFile(bytes + '\n', 'utf8'));
+        await persistStep(trace,'snapshot_sync',()=>handle.sync());
       }
-    } finally { await handle.close(); }
-    if (!writer) for (const directory of [...this.handles].reverse()) await directory.sync();
+    } finally { await persistStep(trace,'snapshot_close',()=>handle.close()); }
+    if (!writer) for (const directory of [...this.handles].reverse()) await persistStep(trace,'ancestor_sync',()=>directory.sync());
     // No current pointer, rename, overwrite or eviction. Even if a later append
     // succeeds, every older record and the initialized sentinel remain required
     // evidence. A failed partial file is retained; this generation stays dirty.
     this.commits.push({name, bytes, digest: hash(bytes), journal: canonical(value)});
   }
-  private async checkpoint(value: Journal, writer?: SnapshotWriter) {
+  private async checkpoint(value: Journal, writer?: SnapshotWriter, trace?: PersistTrace) {
     // Only this process's two slots may roll forward. The immutable prefix and
     // all prior births remain untouched. Verify BOTH slots before replacement,
     // so a corrupt superseded slot cannot be silently healed by the next write.
-    for (const record of this.checkpoints)
-      check(canonical(await this.read(record.name)) === record.bytes);
+    await persistStep(trace,'checkpoint_verify',async()=>{
+      for (const record of this.checkpoints)
+        check(canonical(await this.read(record.name)) === record.bytes);
+    });
     const latest = this.checkpoints.at(-1) ?? this.commits.at(-1)!;
     const previousSequence = this.checkpoints.at(-1)?.sequence ?? PREFIX_SNAPSHOTS;
     check(previousSequence < Number.MAX_SAFE_INTEGER);
@@ -159,12 +207,14 @@ class PrivateStore {
       controller_id: this.boot, sequence, prefix_sha256: this.commits.at(-1)!.digest,
       previous_sha256: latest.digest, journal: value};
     const bytes = canonical(record), temporary = `.checkpoint-${this.boot}-${sequence}.tmp`;
-    const handle = await open(this.name(temporary),
-      constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+    const handle = await persistStep(trace,'checkpoint_create',()=>open(this.name(temporary),
+      constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600));
     try {
-      if (writer) await writer(record, handle);
-      else { await handle.writeFile(bytes + '\n', 'utf8'); await handle.sync(); }
-    } finally { await handle.close(); }
+      if (writer) await persistStep(trace,'checkpoint_write',()=>writer(record, handle));
+      else { await persistStep(trace,'checkpoint_write',()=>handle.writeFile(bytes + '\n', 'utf8'));
+        await persistStep(trace,'checkpoint_sync',()=>handle.sync()); }
+    } finally { await persistStep(trace,'checkpoint_close',()=>handle.close()); }
+    await persistStep(trace,'checkpoint_publish',async()=>{
     await this.identity();
     if (previous) {
       check(canonical(await this.read(name)) === previous.bytes);
@@ -175,7 +225,8 @@ class PrivateStore {
       await link(this.name(temporary), this.name(name));
       await unlink(this.name(temporary));
     }
-    if (!writer) for (const directory of [...this.handles].reverse()) await directory.sync();
+    });
+    if (!writer) for (const directory of [...this.handles].reverse()) await persistStep(trace,'ancestor_sync',()=>directory.sync());
     // Admission only AFTER durable publication. Any error dirties the observer;
     // partial own files remain for owner diagnosis, never automatic recovery.
     this.checkpoints = this.checkpoints.filter(item => item.name !== name);
@@ -238,6 +289,7 @@ export class AlertEvidence implements CredentialMonitorEvidence {
   readonly boot: string;
   private dirty = false;
   private firstFailure: string | undefined;
+  private firstPersist: {stage:EvidencePersistStage;error:EvidencePersistError} | undefined;
   private pending = 0;
   private active = new Set<number>();
   private requests = 0;
@@ -275,10 +327,14 @@ export class AlertEvidence implements CredentialMonitorEvidence {
     if (!this.dirty) this.firstFailure = typeof reason === 'string' && FAILURE_REASONS.has(reason) ? reason : 'invalidated';
     this.dirty = true;
   }
-  private async bounded(work: Promise<void>) {
+  private async bounded(work: Promise<void>, trace?:PersistTrace) {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try { await Promise.race([work, new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error('observer_timeout')), this.timeoutMs);
+      timer = setTimeout(() => {
+        const error=new Error('observer_timeout');ownDeadlines.add(error);
+        if(trace&&!trace.first)trace.first={stage:trace.stage,error};
+        reject(error);
+      }, this.timeoutMs);
     })]); }
     finally { clearTimeout(timer); }
   }
@@ -291,16 +347,23 @@ export class AlertEvidence implements CredentialMonitorEvidence {
     if (this.pending) return;
     this.pending = 1;
     this.queue = (async () => {
+      const trace:PersistTrace={stage:'artifacts'};
       try {
         while (this.nextSnapshot && !this.dirty) {
           const value = this.nextSnapshot;
           this.nextSnapshot = undefined;
           await this.bounded((async () => {
-            await verifyArtifacts(this.enrollment, this.loaded);
-            await this.store.write(value, this.writer);
-          })());
+            await persistStep(trace,'artifacts',()=>verifyArtifacts(this.enrollment, this.loaded));
+            await this.store.write(value, this.writer, trace);
+          })(),trace);
         }
-      } catch { this.invalidate('persist_failed'); }
+      } catch(error) {
+        if(!this.dirty){
+          const first=trace.first??{stage:trace.stage,error};
+          this.firstPersist={stage:first.stage,error:classifyPersistFailure(first.error)};
+        }
+        this.invalidate('persist_failed');
+      }
       finally {
         // Clear the busy flag before this async body resolves. A separate
         // promise.finally would leave a microtask window that could drop a new
@@ -339,7 +402,8 @@ export class AlertEvidence implements CredentialMonitorEvidence {
     } catch { this.invalidate('snapshot_source_verification_failed'); }
     const unavailable = () => ({kind: 'hub_alert_evidence_unavailable_v1', available: false, reason: 'coverage_unknown', nonce,
       unavailable_phase: 'runtime', unavailable_reason: this.firstFailure ??
-        (this.pending ? 'pending_write' : this.active.size ? 'active_invocation' : 'snapshot_raced')});
+        (this.pending ? 'pending_write' : this.active.size ? 'active_invocation' : 'snapshot_raced'),
+      ...(this.firstFailure==='persist_failed'?persistDiagnosticFields(this.firstPersist?.stage,this.firstPersist?.error):{})});
     if (this.dirty || this.pending || this.active.size) return unavailable();
     const version = canonical(this.journal);
     try {
