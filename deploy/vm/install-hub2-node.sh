@@ -115,6 +115,7 @@ if [[ -n "$RELEASE_MODE" || -n "$SCHEMA_MIGRATIONS" ]]; then
   python3 - "$REPO/.dev.vars" "$RELEASE_MODE" "$SCHEMA_MIGRATIONS" "$REPO" "$CREDENTIAL_MONITOR_EVIDENCE_ROOT" <<'PY'
 import ctypes
 import json
+import hashlib
 import os
 import re
 import shlex
@@ -154,6 +155,154 @@ def _publish_directory(src_dir_fd: int, src_name: str, dst_dir_fd: int, dst_name
     rename.restype = ctypes.c_int
     if rename(src_dir_fd, os.fsencode(src_name), dst_dir_fd, os.fsencode(dst_name), 1) != 0:
         raise OSError(ctypes.get_errno(), "exclusive evidence root publication refused")
+
+
+# Public source mode repair is separate from evidence/history. Only selected
+# Git bytes and trusted fixed source inodes may lose group/other write bits.
+NODE_SOURCES = ('hub2/node/alert-evidence.ts', 'hub2/node/main.ts', 'hub2/src/worker.ts',
+                'hub2/src/model-picker.ts', 'hub2/src/routing-pool.ts')
+NODE_ROLES = ('credential_monitor', 'picker_excluded', 'picker_quota_stale')
+
+
+class SourceModeRefused(ValueError):
+    def __init__(self, reason):
+        self.reason = reason
+        super().__init__('selected_source_unverified')
+
+
+def source_check(condition, reason):
+    if not condition:
+        raise SourceModeRefused(reason)
+
+
+def source_fields(info):
+    return (info.st_dev, info.st_ino, info.st_uid, info.st_gid, info.st_mode,
+            info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def source_parent(path, owner):
+    source_check(path.is_absolute() and os.path.normpath(path) == str(path), 'source_directory_untrusted')
+    fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for part in path.parts[1:]:
+            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd); fd = nxt
+            info = os.fstat(fd)
+            source_check(info.st_uid in (0, owner) and not info.st_mode & 0o002, 'source_directory_untrusted')
+        return fd
+    except BaseException:
+        os.close(fd); raise
+
+
+def source_read(fd, owner):
+    info = os.fstat(fd)
+    source_check(stat.S_ISREG(info.st_mode), 'source_file_not_regular')
+    source_check(info.st_uid in (0, owner), 'source_file_foreign_owner')
+    source_check(info.st_nlink == 1, 'source_file_linked')
+    source_check(info.st_size <= 16 * 1024 * 1024, 'source_file_oversized')
+    os.lseek(fd, 0, os.SEEK_SET)
+    data = b''
+    while len(data) <= info.st_size:
+        chunk = os.read(fd, min(65536, info.st_size + 1 - len(data)))
+        if not chunk: break
+        data += chunk
+    source_check(len(data) == info.st_size and source_fields(os.fstat(fd)) == source_fields(info), 'source_file_changed')
+    return info, hashlib.sha256(data).hexdigest()
+
+
+def source_git(repo, commit, relative, env, child_options):
+    command = ['/usr/bin/git', '--no-optional-locks', '-C', str(repo), 'cat-file']
+    size = subprocess.run(command + ['-s', commit + ':' + relative], env=env, stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL, timeout=5, check=False, **child_options)
+    source_check(size.returncode == 0 and len(size.stdout) <= 32 and size.stdout.strip().isdigit(), 'source_git_unverified')
+    count = int(size.stdout); source_check(count <= 16 * 1024 * 1024, 'source_file_oversized')
+    result = subprocess.run(command + ['blob', commit + ':' + relative], env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, timeout=5, check=False, **child_options)
+    source_check(result.returncode == 0 and len(result.stdout) == count, 'source_git_unverified')
+    return hashlib.sha256(result.stdout).hexdigest()
+
+
+def source_head(repo, commit, env, child_options):
+    result = subprocess.run(['/usr/bin/git', '--no-optional-locks', '-C', str(repo), 'rev-parse', '--verify', 'HEAD'],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5, check=False, **child_options)
+    source_check(result.returncode == 0 and result.stdout == (commit + '\n').encode(), 'source_git_unverified')
+
+
+def source_recheck(handle, owner):
+    parent, fd, name, expected_info, expected_hash = handle
+    info, digest = source_read(fd, owner)
+    source_check(source_fields(info) == source_fields(expected_info)
+                 and source_fields(os.stat(name, dir_fd=parent, follow_symlinks=False)) == source_fields(info), 'source_file_changed')
+    source_check(digest == expected_hash, 'source_hash_mismatch')
+    source_check(not info.st_mode & 0o022, 'source_file_unsafe_mode')
+    os.fsync(fd)  # Includes a retry after prior uncertain mode durability.
+
+
+def source_close(handles):
+    failures = {}
+    for relative, (parent, fd, *_) in handles.items():
+        for descriptor in (fd, parent):
+            try: os.close(descriptor)
+            except OSError:  # Never retry a possibly consumed FD.
+                for role in (NODE_ROLES if NODE_SOURCES.index(relative) < 3 else NODE_ROLES[1:]):
+                    failures.setdefault(role, 'source_file_unavailable')
+    return failures
+
+
+def harden_node_sources(repo, commit, owner, env, child_options):
+    source_head(repo, commit, env, child_options)
+    handles, failures = {}, {}
+    for index, relative in enumerate(NODE_SOURCES):
+        parent = fd = None
+        try:
+            expected_hash = source_git(repo, commit, relative, env, child_options)
+            path = repo / relative
+            parent = source_parent(path.parent, owner)
+            fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+            info, digest = source_read(fd, owner)
+            source_check(digest == expected_hash, 'source_hash_mismatch')
+            source_check(source_fields(os.stat(path.name, dir_fd=parent, follow_symlinks=False)) == source_fields(info), 'source_file_changed')
+            desired = stat.S_IMODE(info.st_mode) & ~0o022
+            if stat.S_IMODE(info.st_mode) != desired:
+                os.fchmod(fd, desired)  # ONLY already-opened verified public source inode.
+            os.fsync(fd)
+            after = os.fstat(fd)
+            source_check((after.st_dev, after.st_ino, after.st_uid, after.st_gid, after.st_nlink, after.st_size, after.st_mtime_ns) ==
+                         (info.st_dev, info.st_ino, info.st_uid, info.st_gid, info.st_nlink, info.st_size, info.st_mtime_ns)
+                         and stat.S_IMODE(after.st_mode) == desired, 'source_file_changed')
+            handle = (parent, fd, path.name, after, expected_hash)
+            source_recheck(handle, owner)
+            handles[relative] = handle; parent = fd = None
+        except Exception as error:
+            reason = error.reason if isinstance(error, SourceModeRefused) else 'source_file_unavailable'
+            for role in (NODE_ROLES if index < 3 else NODE_ROLES[1:]):
+                failures.setdefault(role, reason)
+        finally:
+            for descriptor in (fd, parent):
+                if descriptor is not None:
+                    try: os.close(descriptor)
+                    except OSError:
+                        for role in (NODE_ROLES if index < 3 else NODE_ROLES[1:]):
+                            failures.setdefault(role, 'source_file_unavailable')
+    try:
+        source_head(repo, commit, env, child_options)
+    except BaseException:
+        source_close(handles); raise
+    return handles, failures
+
+
+def recheck_node_sources(handles, failures, repo, commit, owner, env, child_options):
+    source_head(repo, commit, env, child_options)
+    for relative, handle in handles.items():
+        try:
+            source_recheck(handle, owner)
+        except Exception as error:
+            reason = error.reason if isinstance(error, SourceModeRefused) else 'source_file_unavailable'
+            for role in (NODE_ROLES if NODE_SOURCES.index(relative) < 3 else NODE_ROLES[1:]):
+                failures.setdefault(role, reason)
+    source_head(repo, commit, env, child_options)
+    return failures
+
 
 
 def ensure_private_evidence_root(target_root: Path, owner_uid: int, owner_gid: int) -> None:
@@ -362,6 +511,7 @@ def service_environment():
 # Observer preparation is optional to primary service availability. A refusal
 # never authorizes a zero, deletes prior evidence or fabricates activation.
 if mode == "active" and repo_arg and evidence_root_arg:
+    source_handles = {}
     try:
         overrides = service_environment()
         repo, evidence_root = Path(repo_arg), Path(evidence_root_arg)
@@ -374,7 +524,7 @@ if mode == "active" and repo_arg and evidence_root_arg:
                 os.setresuid(owner_uid, owner_uid, owner_uid)
         child_options = {"preexec_fn": _drop_privileges} if os.geteuid() == 0 and (owner_uid != 0 or owner_gid != 0) else {}
         git_env = {"PATH": os.defpath, "HOME": "/nonexistent", "GIT_CONFIG_NOSYSTEM": "1",
-                   "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0"}
+                   "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0", "GIT_NO_REPLACE_OBJECTS": "1"}
         selected = subprocess.run(["/usr/bin/git", "--no-optional-locks", "-C", str(repo),
                                    "rev-parse", "--verify", "HEAD"], env=git_env,
                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5, check=False, **child_options)
@@ -383,6 +533,7 @@ if mode == "active" and repo_arg and evidence_root_arg:
         commit = selected.stdout.decode("ascii").strip()
         if not re.fullmatch(r"[0-9a-f]{40}", commit):
             raise ValueError("observer_checkout_unverified")
+        source_handles, source_holds = harden_node_sources(repo, commit, owner_uid, git_env, child_options)
         command = [sys.executable, "-I", "-S", str(repo / "scripts/stage-credential-monitor.py"),
                    "--checkout", str(repo), "--expected-commit", commit, "--prepare-active-root", str(evidence_root)]
         for producer, key in zip(("credential-monitor", "picker-excluded", "picker-quota-stale"), OBSERVER_KEYS):
@@ -423,6 +574,17 @@ if mode == "active" and repo_arg and evidence_root_arg:
                     or (Path(value).parent != evidence_root and value != file_observer_value(original_text, key))
                     or any(ord(c) < 33 or ord(c) == 127 for c in value)):
                 raise ValueError("node_observer_preparation_unavailable")
+        source_holds = recheck_node_sources(source_handles, source_holds, repo, commit, owner_uid, git_env, child_options)
+        if source_holds:
+            # Root's post-child fence may ONLY remove authority; it cannot mint
+            # a pointer or repair a child receipt into a successful enrollment.
+            role_keys = dict(zip(NODE_ROLES, OBSERVER_KEYS))
+            if not isinstance(receipt, dict): raise ValueError("node_observer_preparation_unavailable")
+            for role, reason in source_holds.items():
+                receipt["pointers"].pop(role_keys[role], None)
+                if receipt["held"].get(role) != "service_override":
+                    receipt["held"][role] = "selected_source_unverified"
+                    receipt.setdefault("source_failures", {})[role] = reason
         updates.update(receipt["pointers"])
         for role, reason in receipt["held"].items():
             print("node_observer_held:" + role + ":" + reason + "; no new coverage authorized", file=sys.stderr)
@@ -432,6 +594,11 @@ if mode == "active" and repo_arg and evidence_root_arg:
         # Do not print exceptions/config/paths. Existing pointers and histories
         # remain; loaded/current/boot checks determine UNKNOWN independently.
         print("node_observer_preparation_unavailable; no new coverage authorized", file=sys.stderr)
+    finally:
+        for role, reason in source_close(source_handles).items():
+            updates.pop(dict(zip(NODE_ROLES, OBSERVER_KEYS))[role], None)
+            print("node_observer_held:" + role + ":selected_source_unverified; no new coverage authorized", file=sys.stderr)
+            print("node_observer_source:" + role + ":" + reason, file=sys.stderr)
 
 
 # Keep every unrelated byte, including CRLF and absent final newline.

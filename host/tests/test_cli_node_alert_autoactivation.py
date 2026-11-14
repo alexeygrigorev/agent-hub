@@ -77,7 +77,9 @@ class NodeAutoactivationTests(unittest.TestCase):
         err=io.StringIO()
         with mock.patch.object(sys,'argv',['installer',str(self.config),mode,'apply',str(self.repo),str(self.root)]), \
                 mock.patch('subprocess.run',side_effect=run), contextlib.redirect_stderr(err):
-            exec(compile(block,'actual-installer-config-block','exec'),{'__name__':'__main__'})
+            namespace={'__name__':'__main__'}
+            exec(compile(block,'actual-installer-config-block','exec'),namespace)
+            self.installer_functions=namespace
         return calls,err.getvalue()
 
     def pointers(self):
@@ -312,7 +314,7 @@ class NodeAutoactivationTests(unittest.TestCase):
         self.assertEqual(error,'');self.assertEqual(self.pointers()[key],str(legacy))
         self.assertFalse(Path(first[key]).exists())
 
-    def test_real_git_checkout_umask_0002_is_distinct_from_head_and_raw_blob_success(self):
+    def test_installer_hardens_real_git_0664_only_after_raw_blob_verification(self):
         originals={name:(self.repo/name).read_bytes() for name in m.DIAGNOSTIC_ARTIFACTS}
         for name in originals:(self.repo/name).unlink()
         subprocess.run(['/usr/bin/git','-C',str(self.repo),'checkout','--force','HEAD','--',*m.DIAGNOSTIC_ARTIFACTS],
@@ -325,13 +327,15 @@ class NodeAutoactivationTests(unittest.TestCase):
         held=self.prepare()
         self.assertEqual(held['pointers'],{})
         self.assertEqual(held['source_failures'],dict.fromkeys(m.PRODUCERS,'source_file_unsafe_mode'))
+        owners={name:((self.repo/name).stat().st_uid,(self.repo/name).stat().st_gid) for name in originals}
         _,error=self.installer()
-        for producer in m.PRODUCERS:self.assertIn('node_observer_source:'+producer+':source_file_unsafe_mode',error)
-        self.assertEqual(self.pointers(),{})
+        self.assertEqual(error,'');self.assertEqual(len(self.pointers()),3)
         self.assertNotIn(str(self.repo),error)
-        for name in originals:
-            self.assertEqual(stat.S_IMODE((self.repo/name).stat().st_mode),0o664,'diagnostic must NOT normalize permissions')
-            (self.repo/name).chmod(0o644)  # Owned fixture-only positive control, NOT production repair.
+        for name,data in originals.items():
+            p=self.repo/name
+            self.assertEqual(stat.S_IMODE(p.stat().st_mode),0o644)
+            self.assertEqual((p.stat().st_uid,p.stat().st_gid),owners[name])
+            self.assertEqual(p.read_bytes(),data)
         self.assertEqual(len(self.prepare()['pointers']),3)
 
     def test_symlink_checkout_head_succeeds_but_source_directory_is_unavailable(self):
@@ -385,6 +389,129 @@ class NodeAutoactivationTests(unittest.TestCase):
             exec(compile(block,'actual-installer-diagnostic-block','exec'),{'__name__':'__main__'})
         self.assertNotIn(secret,error.getvalue());self.assertEqual(self.pointers(),{})
         self.assertIn('node_observer_preparation_unavailable',error.getvalue())
+
+    def test_hardening_preserves_existing_enrollment_history_and_exec_read_bits(self):
+        self.installer();pointers=self.pointers()
+        history={str(p):p.read_bytes() for path in pointers.values() for p in Path(path).iterdir()}
+        target=self.repo/m.ARTIFACTS[0];target.chmod(0o775)
+        self.installer();self.assertEqual(stat.S_IMODE(target.stat().st_mode),0o755)
+        self.assertEqual(self.pointers(),pointers)
+        self.assertTrue(all(Path(p).read_bytes()==data for p,data in history.items()))
+
+    def test_unsafe_hash_or_linked_sources_never_chmod_foreign_inode(self):
+        target=self.repo/m.ARTIFACTS[0];raw=target.read_bytes()
+        for fault in ('hash','hardlink','symlink'):
+            with self.subTest(fault=fault):
+                extra=self.base/'outside-fixture'
+                target.chmod(0o664)
+                if fault=='hash':target.write_bytes(raw+b'unreviewed')
+                elif fault=='hardlink':os.link(target,extra)
+                else:
+                    target.unlink();extra.write_bytes(raw);extra.chmod(0o664);target.symlink_to(extra)
+                before={str(p):(p.stat().st_mode,p.read_bytes()) for p in (extra,) if p.exists()}
+                _,error=self.installer()
+                self.assertEqual(self.pointers(),{});self.assertIn('no new coverage authorized',error)
+                if fault!='symlink':self.assertEqual(stat.S_IMODE(target.stat().st_mode),0o664)
+                for path,(mode,data) in before.items():self.assertEqual((Path(path).stat().st_mode,Path(path).read_bytes()),(mode,data))
+                if fault=='symlink':target.unlink();target.write_bytes(raw)
+                elif fault=='hash':target.write_bytes(raw)
+                if extra.exists():extra.unlink()
+                target.chmod(0o600)
+
+    def test_root_owned_metadata_is_not_waived_and_foreign_owner_never_chmod(self):
+        # Simulated fstat/stat ownership ONLY. No privileged chown or sudo.
+        self.installer('bootstrap');ns=self.installer_functions
+        target=self.repo/m.ARTIFACTS[0];real_fstat=os.fstat;real_stat=os.stat
+        def changed(info,uid):
+            from types import SimpleNamespace
+            fields=('st_dev','st_ino','st_uid','st_gid','st_mode','st_nlink','st_size','st_mtime_ns','st_ctime_ns')
+            data={name:getattr(info,name) for name in fields};data['st_uid']=uid;return SimpleNamespace(**data)
+        for uid in (0,987654):
+            with self.subTest(uid=uid):
+                target.chmod(0o664)
+                def fstat(fd):
+                    info=real_fstat(fd)
+                    return changed(info,uid) if os.readlink('/proc/self/fd/'+str(fd))==str(target) else info
+                def stat_path(path,**kwargs):
+                    info=real_stat(path,**kwargs)
+                    if str(path)==target.name and 'dir_fd' in kwargs and os.readlink('/proc/self/fd/'+str(kwargs['dir_fd']))==str(target.parent):return changed(info,uid)
+                    return info
+                with mock.patch('os.fstat',side_effect=fstat),mock.patch('os.stat',side_effect=stat_path):
+                    handles,failures=ns['harden_node_sources'](self.repo,self.commit,os.geteuid(),self.env,{})
+                    try:
+                        if uid==0:self.assertEqual(failures,{})
+                        else:self.assertEqual(failures,dict.fromkeys(m.PRODUCERS,'source_file_foreign_owner'))
+                    finally:ns['source_close'](handles)
+                self.assertEqual(stat.S_IMODE(target.stat().st_mode),0o644 if uid==0 else 0o664)
+
+    def test_git_replace_objects_cannot_authorize_chmod_of_uncommitted_bytes(self):
+        relative=m.ARTIFACTS[0];target=self.repo/relative;original=target.read_bytes()
+        original_blob=self.git('rev-parse',self.commit+':'+relative).strip()
+        changed=original+b'not committed selected source'
+        made=subprocess.run(['/usr/bin/git','-C',str(self.repo),'hash-object','-w','--stdin'],
+            env=self.env,input=changed,capture_output=True,check=True,timeout=5)
+        self.git('replace',original_blob,made.stdout.decode().strip())
+        target.write_bytes(changed);target.chmod(0o664)
+        self.assertEqual(m.committed_artifact_hash(self.repo,self.commit,relative),hashlib.sha256(original).hexdigest())
+        _,error=self.installer()
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode),0o664,'even later stager refusal cannot justify chmod of replacement-object bytes')
+        self.assertEqual(target.read_bytes(),changed);self.assertEqual(self.pointers(),{})
+        self.assertIn('source_hash_mismatch',error)
+
+    def test_identity_race_before_fchmod_never_hardens_replacement_or_publishes(self):
+        target=self.repo/m.ARTIFACTS[0];raw=target.read_bytes();target.chmod(0o664)
+        original=os.fchmod;armed=[True]
+        old=self.base/'renamed-original'
+        def race(fd,mode):
+            if armed[0] and os.readlink('/proc/self/fd/'+str(fd))==str(target):
+                armed[0]=False;target.rename(old);target.write_bytes(raw);target.chmod(0o644)
+            return original(fd,mode)
+        with mock.patch('os.fchmod',side_effect=race):_,error=self.installer()
+        self.assertFalse(armed[0]);self.assertEqual(self.pointers(),{})
+        self.assertIn('source_file_changed',error)
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode),0o644);self.assertEqual(target.read_bytes(),raw)
+
+    def test_post_child_source_mode_change_and_durability_failure_withhold_publication(self):
+        target=self.repo/m.ARTIFACTS[0];target.chmod(0o664)
+        _,error=self.installer(after_prepare=lambda:target.chmod(0o664))
+        self.assertEqual(self.pointers(),{});self.assertIn('source_file_changed',error)
+        real=os.fsync
+        def fail(fd):
+            if os.readlink('/proc/self/fd/'+str(fd))==str(target):raise OSError('synthetic inode durability failure')
+            return real(fd)
+        with mock.patch('os.fsync',side_effect=fail):_,error=self.installer()
+        self.assertEqual(self.pointers(),{});self.assertIn('no new coverage authorized',error)
+        self.installer();self.assertEqual(len(self.pointers()),3)
+
+    def test_source_close_failure_withholds_authority_but_not_business_configuration(self):
+        target=self.repo/m.ARTIFACTS[0];real=os.close;armed=[True]
+        def close(fd):
+            match=armed[0] and os.readlink('/proc/self/fd/'+str(fd))==str(target)
+            real(fd)
+            if match:armed[0]=False;raise OSError('synthetic consumed close failure')
+        with mock.patch('os.close',side_effect=close):_,error=self.installer()
+        self.assertFalse(armed[0]);self.assertEqual(self.pointers(),{})
+        self.assertIn('no new coverage authorized',error)
+        self.assertIn('HUB2_RELEASE_MODE=active',self.config.read_text())
+
+    def test_diagnostic_source_close_failure_isolated_from_credential(self):
+        target=self.repo/'hub2/src/model-picker.ts';real=os.close;armed=[True]
+        def close(fd):
+            match=armed[0] and os.readlink('/proc/self/fd/'+str(fd))==str(target)
+            real(fd)
+            if match:armed[0]=False;raise OSError('synthetic consumed close failure')
+        with mock.patch('os.close',side_effect=close):_,error=self.installer()
+        self.assertFalse(armed[0]);self.assertEqual(set(self.pointers()),{m.KEYS['credential_monitor']})
+        self.assertIn('source_file_unavailable',error)
+
+    def test_diagnostic_only_bad_source_does_not_block_credential_hardening(self):
+        diag=self.repo/'hub2/src/model-picker.ts';diag.write_bytes(diag.read_bytes()+b'foreign bytes');diag.chmod(0o664)
+        common=self.repo/m.ARTIFACTS[0];common.chmod(0o664)
+        _,error=self.installer()
+        self.assertEqual(set(self.pointers()),{m.KEYS['credential_monitor']})
+        self.assertEqual(stat.S_IMODE(common.stat().st_mode),0o644)
+        self.assertEqual(stat.S_IMODE(diag.stat().st_mode),0o664)
+        self.assertIn('source_hash_mismatch',error)
 
     def test_installer_concurrent_config_write_not_overwritten(self):
         new=b'UNRELATED_SYNTHETIC=concurrent-owner\n'

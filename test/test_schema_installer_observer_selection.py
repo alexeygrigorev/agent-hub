@@ -134,13 +134,13 @@ subprocess.run=_fake_run
                 text='SYNTHETIC_PRIVATE=never-print\nHUB2_RELEASE_MODE=bootstrap\nHUB2_SCHEMA_MIGRATIONS=defer\n'+KEY+'='+value+'\n'
                 done=self.invoke(text);self.assert_role_held(done,text)
 
-    def test_enabled_0664_authority_is_still_refused_without_changing_configuration(self):
-        (self.repo/configuration_fixture.ARTIFACTS[0]).chmod(0o664)
+    def test_committed_0664_source_is_hardened_before_strict_preparer(self):
+        artifact=self.repo/configuration_fixture.ARTIFACTS[0];before=artifact.read_bytes();artifact.chmod(0o664)
         text='HUB2_RELEASE_MODE=bootstrap\n'
         done=self.invoke(text)
-        self.assertEqual(done.returncode,0)
-        self.assertIn('no new coverage authorized',done.stderr)
-        self.assertEqual(self.vars.read_text(),self.primary_config(text))
+        self.assert_prepared(done)
+        self.assertEqual(stat.S_IMODE(artifact.stat().st_mode),0o644)
+        self.assertEqual(artifact.read_bytes(),before)
 
     def test_enabled_symlink_hardlink_and_hash_race_remain_refused(self):
         artifact=self.repo/configuration_fixture.ARTIFACTS[0]
