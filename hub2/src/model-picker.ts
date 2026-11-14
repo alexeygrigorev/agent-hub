@@ -87,13 +87,23 @@ function diagnosticObservation(env: Hub2Env, producer: PickerDiagnosticProducer)
   };
 }
 
+/** Only normal quota filtering is non-alerting; new/unknown reasons stay actionable. */
+export function pickerExclusionsNeedAlert(excluded: PickDiagnostics['excluded']): boolean {
+  return excluded.some(row => row.reason !== 'codex_reserve' && row.reason !== 'quota_below_minimum');
+}
+
 export async function pickModelRouteDetailed(env: Hub2Env, input: PickInput, random = Math.random): Promise<{route: PickedRoute; diagnostics: PickDiagnostics}> {
   const excluded = diagnosticObservation(env, 'picker_excluded');
   const quota = diagnosticObservation(env, 'picker_quota_stale');
   try {
     const {options, diagnostics} = buildRoutingPool(await loadRoutingSnapshot(env, input), input);
-    excluded.complete(diagnostics.excluded.length > 0);
-    if (diagnostics.excluded.length) console.error('[hub2] MODEL_PICKER_EXCLUDED alert=dev@dtcdev.click', JSON.stringify(diagnostics.excluded));
+    const exclusionAlert = pickerExclusionsNeedAlert(diagnostics.excluded);
+    excluded.complete(exclusionAlert);
+    if (diagnostics.excluded.length) {
+      const message = JSON.stringify(diagnostics.excluded);
+      if (exclusionAlert) console.error('[hub2] MODEL_PICKER_EXCLUDED alert=dev@dtcdev.click', message);
+      else console.info('[hub2] MODEL_PICKER_EXCLUDED observation', message);
+    }
     quota.complete(!!diagnostics.warnings?.length);
     if (diagnostics.warnings?.length) console.error('[hub2] QUOTA_STALE alert=dev@dtcdev.click', JSON.stringify(diagnostics.warnings));
     return {route: weightedChoice(options, random), diagnostics};
