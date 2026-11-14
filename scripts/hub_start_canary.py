@@ -353,114 +353,6 @@ def valid_native_id(val):
 CLAUDE_EMPTY_BASH_PLACEHOLDER = "(Bash completed with no output)"
 
 
-def zai_native_frame_for_refusal(line):
-    """Recover structural discriminators only to refuse malformed native data.
-
-    Every object remains an ordered list of ALL decoded pairs, including
-    duplicates. Strings stay opaque: assistant text is never parsed as JSON.
-    Neither this recovered tree nor its values can establish execution proof.
-    """
-    class Pairs(list):
-        pass
-
-    def native(root):
-        if not isinstance(root, Pairs):
-            return False
-        for key, item in root:
-            if key != "item" or not isinstance(item, Pairs):
-                continue
-            if any(key == "type" and value == "native_tool_result" for key, value in item):
-                return True
-        return False
-
-    try:
-        # This decoder deliberately preserves duplicate keys; the STRICT
-        # proof decoder independently rejects them, including escaped keys.
-        recovered = json.loads(line, object_pairs_hook=Pairs)
-        return native(recovered)
-    except (ValueError, TypeError, RecursionError):
-        pass
-
-    # Syntax-damaged JSON may still expose unambiguous root/item/type pairs.
-    # Build a refusal-only partial tree; tolerate missing punctuation without
-    # repairing or returning proof frames. Keep duplicate pairs and scopes.
-    clipped = line.lstrip()
-    if clipped and not clipped.startswith(('"', "{", "[")):
-        # An initial item type key can lose its opening quote in a retained
-        # tail. Decode that ONE key only for refusal, never proof recovery.
-        try:
-            key, end = json.decoder.scanstring('"' + clipped, 1, True)
-            if key == "type" and clipped[end - 1:].lstrip().startswith(":"):
-                line = '"' + clipped
-        except ValueError:
-            pass
-    if line.lstrip().startswith('"'):
-        # A clipped item-property suffix can be classified only for refusal.
-        line = '{"item":{' + line
-    root, stack, index, tokens = None, [], 0, 0
-    decoder = json.JSONDecoder()
-
-    def attach(value):
-        if not stack:
-            return
-        container, key = stack[-1]
-        if isinstance(container, Pairs):
-            if key is not None:
-                container.append((key, value))
-                stack[-1][1] = None
-        else:
-            container.append(value)
-
-    try:
-        while index < len(line):
-            tokens += 1
-            if tokens > 4096 or len(stack) > 128:
-                return True  # Recovery budget uncertainty cannot choose fallback.
-            char = line[index]
-            if char.isspace() or char == ":":
-                index += 1
-                continue
-            if char == ",":
-                if stack and isinstance(stack[-1][0], Pairs) and stack[-1][1] is not None:
-                    attach(None)
-                index += 1
-                continue
-            if char in "{[":
-                container = Pairs() if char == "{" else []
-                if root is None and not stack:
-                    root = container
-                attach(container)
-                stack.append([container, None])
-                index += 1
-                continue
-            if char in "}]":
-                if stack:
-                    stack.pop()
-                index += 1
-                continue
-            if char == '"':
-                try:
-                    value, end = json.decoder.scanstring(line, index + 1, True)
-                except ValueError:
-                    break  # Never scan inside an unterminated assistant string.
-                if stack and isinstance(stack[-1][0], Pairs) and stack[-1][1] is None:
-                    stack[-1][1] = value
-                else:
-                    attach(value)
-                index = end
-                continue
-            try:
-                value, end = decoder.raw_decode(line, index)
-            except ValueError:
-                index += 1
-                continue
-            attach(value)
-            index = end
-        return native(root)
-    except (ValueError, TypeError, RecursionError):
-        return True  # Refusal-only recovery failure never becomes proof.
-
-
 def zai_native_return_proof(captured, expected, binding=None):
     """One owned capture, exact native returned text; never reconstruct stdout.
 
@@ -485,22 +377,16 @@ def zai_native_return_proof(captured, expected, binding=None):
             answer.update(seen=True, invalidated=True)
             return answer
         events, malformed, native_parse_loss = [], False, False
-        for index, line in enumerate(captured.splitlines()):
+        for line in captured.splitlines():
             if not line.strip():
                 continue
             try:
                 event = json.loads(line, object_pairs_hook=unique_object)
-            except json.JSONDecodeError:
-                native_parse_loss |= zai_native_frame_for_refusal(line)
-                # Only an unmistakably clipped initial fragment is ignorable.
-                # A fully started malformed object, duplicate-key contradiction
-                # or recognizable native fault is loss, never a repaired tail.
-                initial_fragment = (index == 0 and not line.lstrip().startswith(("{", "["))
-                                    and not zai_native_frame_for_refusal(line))
-                malformed |= not initial_fragment
-                continue
             except (ValueError, TypeError):
-                native_parse_loss |= zai_native_frame_for_refusal(line)
+                # An undecodable retained line may hide a native invalidation.
+                # Initial clipping is UNKNOWN, never an ignorable/repaired tail.
+                # Complete assistant strings remain opaque to the strict decoder.
+                native_parse_loss = True
                 malformed = True
                 continue
             if not isinstance(event, dict):

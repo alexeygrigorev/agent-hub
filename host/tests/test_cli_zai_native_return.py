@@ -205,7 +205,11 @@ class NativeReturnedTextTests(unittest.TestCase):
         self.assertFalse(value.output_has_marker(text(frame()), engine="zai"))
 
     def test_only_clear_initial_tail_fragments_can_precede_complete_proof(self):
-        self.assertTrue(canary().output_has_marker('old output tail"}}\n' + text(frame()), engine="zai"))
+        # A clipped nonproof tail cannot be distinguished from a hidden fault.
+        # Retain this old fixture but strengthen it to UNKNOWN, not fake recovery.
+        value = canary()
+        self.assertFalse(value.output_has_marker('old output tail"}}\n' + text(frame()), engine="zai"))
+        self.assertFalse(value.output_has_marker(text(frame()), engine="zai"))
         for first in ['{"type":"item.completed","item":',
                       '"type":"native_tool_result","observation":{"kind":"invalidated"}}']:
             value = canary()
@@ -279,6 +283,41 @@ class NativeReturnedTextTests(unittest.TestCase):
                 self.assertFalse(value.output_has_marker(first + suffix, engine="zai"))
                 self.assertFalse(value.output_has_marker(text(frame()), engine="zai"))
                 self.assertFalse(value.output_has_marker(legacy, engine="zai"))
+
+
+    def test_argon_exact_outer_item_id_and_mid_string_clips_never_heal(self):
+        raw = text(fault())
+        variants = [raw[1:], raw[raw.index('"item":'):], raw[raw.index('"item":') + 1:],
+                    raw[raw.index('"id":') + 1:], raw[raw.index('item.completed'):]]
+        legacy = text({"type":"item.completed","item":{"type":"command_execution","aggregated_output":MARKER}})
+        for bad in variants:
+            with self.subTest(prefix=bad[:24]):
+                for suffix in [legacy, text(frame())]:
+                    value = canary()
+                    self.assertFalse(value.output_has_marker(bad + "\n" + suffix, engine="zai"))
+                    self.assertFalse(value.output_has_marker(text(frame()), engine="zai"))
+                    self.assertFalse(value.output_has_marker(legacy, engine="zai"))
+
+    def test_every_clipping_boundary_before_retained_native_discriminator_refuses(self):
+        legacy = text({"type":"item.completed","item":{"type":"command_execution","aggregated_output":MARKER}})
+        for original in [fault(), frame()]:
+            reordered = copy.deepcopy(original)
+            reordered["item"] = {"observation": reordered["item"]["observation"],
+                                 **{k:v for k,v in reordered["item"].items() if k != "observation"}}
+            root_item_first = {"item": original["item"], "type": original["type"]}
+            for event in [original, reordered, root_item_first]:
+                raw = text(event)
+                escaped = raw.replace('"item"', r'"\u0069tem"').replace('"type"', r'"ty\u0070e"').replace('native_tool_result', r'native_tool_\u0072esult')
+                for envelope in [raw, escaped]:
+                    discriminator = 'native_tool_result' if 'native_tool_result' in envelope else r'native_tool_\u0072esult'
+                    stop = envelope.index(discriminator)
+                    for cut in range(1, stop + 1):
+                        bad = envelope[cut:]
+                        with self.subTest(event=original["item"]["observation"]["kind"], cut=cut, escaped=envelope==escaped):
+                            value = canary()
+                            self.assertFalse(value.output_has_marker(bad + "\n" + legacy, engine="zai"))
+                            self.assertFalse(value.output_has_marker(text(frame()), engine="zai"))
+                            self.assertFalse(value.output_has_marker(legacy, engine="zai"))
 
 
 if __name__ == "__main__":
