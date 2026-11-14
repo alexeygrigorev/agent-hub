@@ -1,3 +1,4 @@
+import './public-native-mail-ci.test.ts';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync, readdirSync, writeFileSync } from 'node:fs';
