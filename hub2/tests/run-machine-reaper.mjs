@@ -17,3 +17,5 @@ await import('./native-commands.test.ts');
 
 await import('./p7-finish.test.ts');
 await import('./implement-workspace.test.ts');
+
+await import('./native-mail-uncertainty.test.ts');

@@ -435,6 +435,7 @@ const router = {
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
                 message_id: id,
+                phase: body.phase,
                 epoch: body.epoch,
                 operation_id: body.operation_id,
                 recipient: owner,

@@ -221,7 +221,7 @@ export class MachineDO {
         const b=await bodyObject(request,4096);
         if(!boundedString(b.message_id,180)||!Number.isSafeInteger(b.epoch)||!boundedString(b.operation_id,180)||!boundedString(b.recipient,180)||!boundedString(b.machine_id,180))return error('invalid_delivery_binding',400);
         const row=this.db.one<NativeMail>('SELECT * FROM native_mail WHERE message_id=? AND epoch=?',b.message_id,b.epoch);
-        if(!row||!['pending','acked'].includes(row.state)||row.machine_id!==b.machine_id||row.operation_id!==b.operation_id||row.recipient!==b.recipient)return error('delivery_binding_not_found',404);
+        if(!row||!(['pending','acked'].includes(row.state)||row.state==='outcome_uncertain'&&b.phase==='receipt')||row.machine_id!==b.machine_id||row.operation_id!==b.operation_id||row.recipient!==b.recipient)return error('delivery_binding_not_found',404);
         return json({authorized:true,message_id:row.message_id,epoch:row.epoch,operation_id:row.operation_id,recipient:row.recipient,machine_id:row.machine_id,session_id:row.session_id});
       }
       if (url.pathname === '/_internal/status' && request.method === 'GET') return this.machineView();
@@ -1573,6 +1573,34 @@ export class MachineDO {
     }
   }
 
+  private async quarantineUncertainMail(socket:WebSocket,body:JsonRecord,session:SessionRow,env:Hub2Env):Promise<void>{
+    // MESSAGE route epoch/operation, not the session's launch epoch/operation.
+    // Legacy diagnostics cannot mutate durable delivery state.
+    if(body.stage!=='host_mailbox'||body.reason!=='native_mail_outcome_uncertain'||this.stopOnly(socket)
+      ||!boundedString(body.message_id,180)||!boundedString(body.operation_id,180)
+      ||!Number.isSafeInteger(body.message_epoch)||Number(body.message_epoch)<1
+      ||!boundedString(body.native_id,180)||session.state!=='running'||session.native_id!==body.native_id)return;
+    const attachment=await this.authorizedAttachment(socket,'message:delivery',false,env);
+    if(!attachment||attachment.machine_id!==session.machine_id||this.stopOnly(socket))return;
+    const changed=this.db.transaction(this.ctx,()=>{
+      // Auth awaited: re-read the exact native/session incarnation before commit.
+      const current=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND machine_id=?',session.id,session.machine_id);
+      if(!current||current.state!=='running'||current.native_id!==session.native_id
+        ||current.epoch!==session.epoch||current.operation_id!==session.operation_id)return false;
+      const mail=this.db.one<NativeMail>('SELECT * FROM native_mail WHERE message_id=? AND epoch=?',body.message_id,body.message_epoch);
+      if(!mail||mail.state!=='pending'||mail.receipt_digest!==null
+        ||this.db.one('SELECT operation_id FROM native_mail_fences WHERE message_id=? AND epoch=?',mail.message_id,mail.epoch)
+        ||mail.operation_id!==body.operation_id
+        ||mail.session_id!==current.id||mail.machine_id!==current.machine_id)return false;
+      this.db.run("UPDATE native_mail SET state='outcome_uncertain' WHERE message_id=? AND epoch=? AND operation_id=? AND session_id=? AND machine_id=? AND state='pending' AND receipt_digest IS NULL",
+        mail.message_id,mail.epoch,mail.operation_id,mail.session_id,mail.machine_id);
+      return true;
+    });
+    // Commit quarantine before selecting another pending message. No ACK,
+    // receipt, cancellation, deletion or native-effect retry is implied.
+    if(changed)await this.notifyPendingMail(session.machine_id);
+  }
+
   private async recordAttention(socket: WebSocket, body: JsonRecord,env:Hub2Env): Promise<void> {
     if (!boundedString(body.session_id,120) || typeof body.reason!=='string' || !/^[a-z_]{1,80}$/.test(body.reason)) return;
     const attachment = await this.authorizedAttachment(socket,'machine:offer',true,env);
@@ -1608,8 +1636,9 @@ export class MachineDO {
         row.id,body.reason,operation,message,Date.now());
       console.error('[hub2] MACHINE_SESSION_ATTENTION',JSON.stringify({session_id:row.id,machine_id:row.machine_id,reason:body.reason,operation_id:operation}));
     }
-    // Command and mailbox failures are diagnostics, even if they carry the
-    // same operation ID. Older daemons omit stage but include the command or
+    await this.quarantineUncertainMail(socket,body,row,env);
+    // Unqualified command/mailbox diagnostics never act as launch failures.
+    // Older daemons omit stage but include the command or
     // message ID; their launch refusals carry neither.
     if((body.stage!=null&&body.stage!=='host_launch')||body.message_id!=null)return;
     if(AUTH_FALLBACK_REASONS.has(body.reason)&&['offered','claimed'].includes(row.state)&&!row.native_id&&operation===row.operation_id){
