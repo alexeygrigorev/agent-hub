@@ -46,7 +46,7 @@ class Tests(unittest.TestCase):
         return b.Broker(directory,PINS,collector_factory=Manager,identity=lambda pid:KEY)
 
     def temporary(self):
-        return tempfile.TemporaryDirectory(prefix='resident-',dir=Path.cwd()/'.local/tmp')
+        return tempfile.TemporaryDirectory(prefix='resident-')
 
     def test_approved_core_bytes_exact(self):
         for name,digest in [('alert_authority.py','e11f786d91efc902716384b4d00e03a9cbb8615ac955a717ac96715fb16c9d18'),
