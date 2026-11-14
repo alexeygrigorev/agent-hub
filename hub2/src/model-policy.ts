@@ -50,6 +50,7 @@ export function modelPolicyCandidateViolation(candidate: ModelPolicyRoute): stri
   if (/haiku/i.test(`${id} ${model}`)) return 'haiku_picker_route_forbidden';
   if (engine === 'claude' && !(
     CLAUDE_PICKER_MODELS.has(model) && candidate.effort === 'medium'
+    || model === 'opus' && candidate.effort === 'high'
     || id === 'claude-fable-5-2' && model === 'fable' && candidate.effort === 'medium'
   ))
     return 'claude_picker_route_forbidden';
@@ -85,4 +86,14 @@ export function isExplicitOnlyModel(candidate: Pick<ModelPolicyRoute, 'id' | 'mo
 export function isDeepWorkModel(candidate: Pick<ModelPolicyRoute, 'engine' | 'model'>): boolean {
   return (candidate.engine.toLowerCase() === 'claude' && candidate.model.toLowerCase() === 'opus')
     || /^gpt-6(?:\.1)?-sol$/i.test(candidate.model);
+}
+
+/** Strong models a deep/complex/serious tier is restricted to (docs/ROUTING.md deep tier). */
+export function isStrongModel(candidate: Pick<ModelPolicyRoute, 'engine' | 'model'>): boolean {
+  return isDeepWorkModel(candidate) || /^gemini-4-argon(?:-|$)/i.test(candidate.model);
+}
+
+/** Elevated effort (high/max) is never part of an ordinary automatic pick; luna's max is its only mode. */
+export function isElevatedEffort(candidate: Pick<ModelPolicyRoute, 'model' | 'effort'>): boolean {
+  return candidate.effort === 'high' || candidate.effort === 'max' && !/luna/i.test(candidate.model);
 }

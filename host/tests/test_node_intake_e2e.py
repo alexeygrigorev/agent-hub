@@ -532,15 +532,16 @@ def test_real_cli_purpose_gates_review_only_model_and_tier_weights_the_pick(plai
         capture = hub.cli.run("sessions", "capture", created["id"], "--screen", "--timeout", "60")
         assert capture.returncode == 0 and "STUB-CODEX-OK model=" + ASTRA in capture.stdout, capture.stdout[-1000:]
 
-        # tier: public picker evidence. No tier -> equal shares; deep -> the deep-work model outweighs the rest.
+        # tier: public picker evidence. No tier -> equal shares; deep -> narrowed to the strong model
+        # (intake 10a76faa: a deep tier must route to a strong model, not a medium daily one).
         plain = {r["policy_id"]: r["share"] for r in hub.cli.json("sessions", "pick", "--json")["pool"]}
-        deep = {r["policy_id"]: r["share"] for r in hub.cli.json("sessions", "pick", "--tier", "deep", "--json")["pool"]}
-        assert set(plain) == set(deep) == {"e2e-codex", "e2e-alt", "e2e-sol"}, (plain, deep)
+        deep_pick = hub.cli.json("sessions", "pick", "--tier", "deep", "--json")
+        deep = {r["policy_id"]: r["share"] for r in deep_pick["pool"]}
+        assert set(plain) == {"e2e-codex", "e2e-alt", "e2e-sol"}, plain
         assert max(plain.values()) - min(plain.values()) < 1e-9, plain
-        assert deep["e2e-sol"] == pytest.approx(0.576, abs=0.005), deep
-        assert deep["e2e-codex"] == deep["e2e-alt"] < plain["e2e-sol"] < deep["e2e-sol"], (plain, deep)
+        assert deep == {"e2e-sol": pytest.approx(1.0)}, (plain, deep)
         human = hub.cli.run("sessions", "pick", "--tier", "deep").stdout
-        assert re.search(r"pool\s+e2e-sol\s+57\.\d%", human), human
+        assert re.search(r"pool\s+e2e-sol\s+100\.\d%", human), human
         # The same tier on a start is recorded in the accepted route's pool weight (3x for the deep model).
         flat = json.loads(_model_start(hub, "--model", SOL, "--no-wait").stdout)["picker"]["pool"][0]
         deeper = json.loads(_model_start(hub, "--model", SOL, "--tier", "deep", "--no-wait").stdout)["picker"]["pool"][0]

@@ -60,6 +60,16 @@
       "enabled": true
     },
     {
+      "id": "claude-opus-high",
+      "engine": "claude",
+      "model": "opus",
+      "effort": "high",
+      "account_id": "claude",
+      "weight": 1,
+      "capabilities": [],
+      "enabled": true
+    },
+    {
       "id": "antigravity-hydrogen-medium",
       "engine": "antigravity",
       "model": "gemini-4-hydrogen-medium",

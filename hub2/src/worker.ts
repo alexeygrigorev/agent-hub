@@ -877,7 +877,7 @@ async function routingSimulation(request: Request, env: Hub2Env, actor: Actor): 
   const raw=params.get('n')??'1000';
   if(!/^[1-9][0-9]{0,3}$/.test(raw)||Number(raw)>1000)return error('invalid_simulation_count',400);
   if(params.has('mode')&&!['headless','interactive'].includes(params.get('mode')!))return error('invalid_session_mode',400);
-  if(params.has('effort')&&!['low','medium','max'].includes(params.get('effort')!))return error('invalid_effort',400);
+  if(params.has('effort')&&!['low','medium','high','max'].includes(params.get('effort')!))return error('invalid_effort',400);
   const input:PickInput={interactive:params.get('mode')==='interactive',purpose:sessionPurpose(params.get('purpose')??undefined)};
   for(const key of ['tier','machine_id','engine','model','effort','workspace'] as const){
     const value=params.get(key);

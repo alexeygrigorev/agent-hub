@@ -3,7 +3,7 @@
 // otherwise loads only Workers globals. @types/node is already a dependency.
 import { createHash } from 'node:crypto';
 import { HttpError } from './http';
-import { isDeepWorkModel, isExplicitOnlyModel, isModelPolicyCandidateAllowed, isOrdinaryWorkModel, isThinkOnlyModel } from './model-policy';
+import { isDeepWorkModel, isElevatedEffort, isExplicitOnlyModel, isModelPolicyCandidateAllowed, isOrdinaryWorkModel, isStrongModel, isThinkOnlyModel } from './model-policy';
 import { allowsAstra, sessionPurpose, type SessionPurpose } from './session-purpose';
 
 export type Candidate = { id: string; engine: string; model: string; effort?: string; account_id: string; weight: number; capabilities: string[]; enabled: boolean };
@@ -106,9 +106,12 @@ export function eligibleCandidates(policy: RoutingPolicy, input: PickInput): Can
     (input.model === candidate.id || input.model === candidate.model) && isExplicitOnlyModel(candidate)))
     throw new HttpError('astra_not_for_implementation', 400);
   const excluded=new Set(input.exclude_policy_ids||[]);
-  const ordinaryAutomatic = !input.model && !allowsAstra(purpose) && !DEEP_TIERS.has(input.tier || '');
+  const deep = DEEP_TIERS.has((input.tier || '').toLowerCase());
+  const ordinaryAutomatic = !input.model && !allowsAstra(purpose) && !deep;
   const candidates = policy.candidates.filter(candidate => candidate.enabled && !excluded.has(candidate.id)
     && (!ordinaryAutomatic || isOrdinaryWorkModel(candidate))
+    // High effort is opt-in: an explicit --effort, the exact policy id or a deep tier.
+    && (!isElevatedEffort(candidate) || input.effort === candidate.effort || input.model === candidate.id || deep)
     && (!isThinkOnlyModel(candidate) || purpose === 'think' && !!input.model
       && (input.model === candidate.model || input.model === candidate.id))
     && (!isExplicitOnlyModel(candidate) || allowsAstra(purpose))
@@ -280,6 +283,11 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
         pool = pool.map(row => ({...row, hosts: workspaceHosts.get(row.candidate.id)!}));
     }
   }
+  // A deep/complex/serious tier prefers a strong model (Opus, Sol, Argon) and, without an explicit
+  // effort, its high-effort route. Applied after every hard and advisory observation, so the
+  // preference never restores an excluded route and never refuses when no strong route survives.
+  if (deep) pool = narrow(pool, row => isStrongModel(row.candidate), () => 'deep_prefers_strong_model');
+  if (deep && !input.effort) pool = narrow(pool, row => isElevatedEffort(row.candidate), () => 'deep_prefers_high_effort');
   for (const row of pool) if (row.localHosts.length) advisories.push({policy_id:row.candidate.id, account_id:row.candidate.account_id, reason:'local_login_unverified'});
   const others = pool.filter(row => !/luna/i.test(row.candidate.model)).map(row => row.base);
   const cap = others.length ? others.reduce((sum, weight) => sum + weight, 0) / others.length : Infinity;

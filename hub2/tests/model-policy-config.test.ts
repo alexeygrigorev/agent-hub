@@ -21,7 +21,7 @@ const routing = JSON.parse(readFileSync(resolve(root, 'config/model-routing.json
 };
 
 const FIELD_PATTERN = /^[A-Za-z0-9_.:/-]+$/;
-const EFFORTS = new Set(['low', 'medium', 'max']);
+const EFFORTS = new Set(['low', 'medium', 'high', 'max']);
 
 test('policy candidates pass the model-policy wire validation', () => {
   assert.ok(Array.isArray(policy.candidates) && policy.candidates.length > 0);
@@ -142,7 +142,17 @@ test('claude exposes Sonnet and Opus by default and Fable only under its explici
     ['claude-sonnet-medium', 'sonnet', 'medium'],
     ['claude-fable-5-2', 'fable', 'medium'],
     ['claude-opus-medium', 'opus', 'medium'],
+    ['claude-opus-high', 'opus', 'high'],
   ]);
+});
+
+test('Opus is the only Claude route allowed at high effort (intake 10a76faa)', () => {
+  const route = {id: 'r', engine: 'claude', account_id: 'claude', capabilities: []};
+  assert.equal(modelPolicyCandidateViolation({...route, model: 'opus', effort: 'high'}), null);
+  assert.equal(modelPolicyCandidateViolation({...route, model: 'sonnet', effort: 'high'}), 'claude_picker_route_forbidden');
+  assert.equal(modelPolicyCandidateViolation({...route, id: 'claude-fable-5-2', model: 'fable', effort: 'high'}), 'claude_picker_route_forbidden');
+  assert.equal(modelPolicyCandidateViolation({...route, engine: 'codex', account_id: 'codex', model: 'gpt-6.1-sol', effort: 'high'}), 'bounded_effort_required');
+  assert.equal(modelPolicyCandidateViolation({...route, engine: 'antigravity', account_id: 'gemini', model: 'gemini-4-argon-medium', effort: 'high'}), 'bounded_effort_required');
 });
 
 test('luna is max-only and one option among many, never the default', () => {
@@ -159,7 +169,7 @@ test('luna is max-only and one option among many, never the default', () => {
 test('sol, argon and astra are never routed at high effort', () => {
   for (const candidate of policy.candidates) {
     if (!/^gpt-6(\.1)?-(sol|astra)$/.test(candidate.model) && candidate.model !== 'gemini-4-argon-medium') continue;
-    assert.ok(candidate.effort !== undefined && candidate.effort !== 'max', `${candidate.id} must stay at a bounded effort`);
+    assert.ok(candidate.effort === 'low' || candidate.effort === 'medium', `${candidate.id} must stay at a bounded effort`);
   }
 });
 

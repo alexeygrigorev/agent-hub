@@ -67,12 +67,12 @@ function receipt(value: unknown): PickerReceipt {
 // Diagnostic projection only: these public identifiers never influence routing.
 // Unknown/custom historical IDs and reasons remain explicit unknowns, not raw text.
 const DIAGNOSTIC_POLICIES = new Set(['codex-luna-max','codex-sol-medium','claude-sonnet-medium',
-  'claude-fable-5-2','go-muse','claude-opus-medium','antigravity-hydrogen-medium',
+  'claude-fable-5-2','go-muse','claude-opus-medium','claude-opus-high','antigravity-hydrogen-medium',
   'antigravity-argon-medium','zai-glm-5-3-flash','antigravity-carbon-medium']);
 const DIAGNOSTIC_REASONS = new Set(['codex_reserve','quota_below_minimum','goal_not_advertised',
   'engine_not_advertised','capability_not_advertised','central_host_not_approved',
   'central_credentials_unavailable','local_credentials_missing','credential_missing','credential_unknown',
-  'credential_expired','credential_refresh_failed','credential_unavailable','credential_ready']);
+  'credential_expired','credential_refresh_failed','credential_unavailable','credential_ready','deep_prefers_strong_model','deep_prefers_high_effort']);
 const MAX_DRAW_JSON = 65536;
 function storedObject(raw: unknown): Record<string, any> | null {
   if(typeof raw!=='string')return null;
