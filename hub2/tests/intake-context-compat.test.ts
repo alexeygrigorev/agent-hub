@@ -24,6 +24,10 @@ test('official CLI context update persists, clears and rejects stale or unknown 
   assert.equal((await call(path,'POST',{key:'context-unknown',current_state:'Wrong',unknown:'field'})).status,400);
   assert.equal((await call(path,'PATCH',{key:'context-unknown-patch',unexpected:'field'})).status,400);
   const final:any=await(await call(path+'/context')).json();assert.equal(final.intake.current_state,update.current_state);assert.equal(final.intake.uncertainty,update.uncertainty);
+  const moved=await call(path,'POST',{key:'project-fix',project:'owner/other'});assert.equal(moved.status,200,await moved.clone().text());
+  assert.equal((await moved.json() as any).intake.project,'owner/other');assert.equal((await(await call(path)).json() as any).intake.project,'owner/other');
+  assert.equal((await call(path,'POST',{key:'project-bad',project:'not a repo'})).status,400);
+  assert.equal((await call(path,'PATCH',{key:'project-patch',project:'owner/repo'})).status,200);
   assert.equal((await call(path,'POST',{key:'context-note',note:'Ordinary note'})).status,200);
   assert.equal((await call(path,'POST',{key:'context-close',status:'done',force:true,reason:'Disposable smoke complete'})).status,200);
   assert.equal((await(await call(path)).json() as any).intake.status,'archived');

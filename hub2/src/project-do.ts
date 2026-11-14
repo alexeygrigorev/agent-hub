@@ -313,7 +313,7 @@ export class ProjectDO {
     if (Object.keys(body).some(field => !supported.includes(field))) return error('unknown_intake_field', 400);
     const mapped: JsonRecord = { key: body.key };
     if (typeof body.expected_version === 'number') mapped.expected_updated_at = body.expected_version;
-    for (const field of ['title', 'priority', 'acceptance_criteria', ...INTAKE_CONTEXT_FIELDS]) if (body[field] !== undefined) mapped[field] = body[field];
+    for (const field of ['title', 'priority', 'acceptance_criteria', 'project', ...INTAKE_CONTEXT_FIELDS]) if (body[field] !== undefined) mapped[field] = body[field];
     if (body.status !== undefined) {
       const forceClose = body.force === true || body.outcome === 'closed_unverified';
       const unverifiedSession = row.session_id !== null && row.status !== 'completed-awaiting-review' && !forceClose;
@@ -526,8 +526,9 @@ export class ProjectDO {
   private async editIntake(request:Request,intakeId:string):Promise<Response>{
     const actor=actorFrom(request),body=await bodyObject(request,16384),key=this.idempotencyKey(request,body);normalizeCriteria(body);
     if(!key)return error('idempotency_key_required',400);
-    const allowed=['key','expected_updated_at','title','text','acceptance_criteria','status','priority','note',...INTAKE_CONTEXT_FIELDS];
-    if(!['title','text','acceptance_criteria','status','priority','note',...INTAKE_CONTEXT_FIELDS].some(k=>body[k]!==undefined)||Object.keys(body).some(k=>!allowed.includes(k)))return error('unknown_intake_field',400);
+    const editable=['title','text','acceptance_criteria','status','priority','note','project',...INTAKE_CONTEXT_FIELDS],allowed=['key','expected_updated_at',...editable];
+    if(!editable.some(k=>body[k]!==undefined)||Object.keys(body).some(k=>!allowed.includes(k)))return error('unknown_intake_field',400);
+    if(body.project!==undefined&&(typeof body.project!=='string'||!/^[A-Za-z0-9._-]{1,100}\/[A-Za-z0-9._-]{1,100}$/.test(body.project)))return error('invalid_intake_project',400);
     if(body.title!==undefined&&(typeof body.title!=='string'||!body.title.trim()||body.title.length>240)||body.text!==undefined&&(typeof body.text!=='string'||!body.text.trim()||new TextEncoder().encode(body.text).length>8192)||body.note!==undefined&&(typeof body.note!=='string'||!body.note.trim()||body.note.length>4000)||body.priority!==undefined&&(!Number.isInteger(body.priority)||Number(body.priority)<0||Number(body.priority)>3)||body.status!==undefined&&!['open','archived','needs_attention','accepted'].includes(String(body.status)))return error('invalid_intake_edit',400);
     if(INTAKE_CONTEXT_FIELDS.some(field=>body[field]!==undefined&&body[field]!==null&&(typeof body[field]!=='string'||new TextEncoder().encode(body[field] as string).length>8192)))return error('invalid_intake_context',400);
     if(body.acceptance_criteria!==undefined){const problem=criteriaError(body.acceptance_criteria);if(problem)return problem;}
@@ -537,6 +538,7 @@ export class ProjectDO {
       const row=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',intakeId);if(!row)return error('intake_not_found',404);
       if(!this.canProject(actor,row.project,'intake:write'))return error('forbidden',403);
       if(replay)return json({intake:this.viewIntake(row),duplicate:true});
+      if(body.project!==undefined&&body.project!==row.project&&!this.canProject(actor,body.project as string,'intake:write'))return error('forbidden',403);
       if(body.expected_updated_at!==undefined&&body.expected_updated_at!==row.updated_at)return error('intake_version_conflict',409);
       if(body.status==='accepted'){
         const gate=this.intakeMergeGate(row);
@@ -560,8 +562,8 @@ export class ProjectDO {
       if(changesCore&&(['queued','running'].includes(row.status)||(row.session_id&&this.db.one<SagaRow>("SELECT * FROM dispatch_sagas WHERE session_id=? AND state<>'complete'",row.session_id))))return error('intake_active',409);
       if(body.status==='accepted'&&(row.status!=='completed-awaiting-review'||!hasScope(actor,'operator:admin')))return error('review_required',409);
       if(body.status==='archived'&&row.session_id!==null&&row.status!=='completed-awaiting-review'&&typeof body.note!=='string')return error('review_required',409);
-      const at=Date.now(),next={title:typeof body.title==='string'?body.title.trim():row.title,text:body.text??row.text,acceptance_criteria_json:body.acceptance_criteria?JSON.stringify(body.acceptance_criteria):row.acceptance_criteria_json,status:body.status??row.status,priority:body.priority??row.priority??2};
-      this.db.run('UPDATE intakes SET original_title=COALESCE(original_title,title),original_text=COALESCE(original_text,text),title=?,text=?,acceptance_criteria_json=?,status=?,priority=?,updated_at=? WHERE id=?',next.title,next.text,next.acceptance_criteria_json,next.status,next.priority,at,row.id);
+      const at=Date.now(),next={project:typeof body.project==='string'?body.project:row.project,title:typeof body.title==='string'?body.title.trim():row.title,text:body.text??row.text,acceptance_criteria_json:body.acceptance_criteria?JSON.stringify(body.acceptance_criteria):row.acceptance_criteria_json,status:body.status??row.status,priority:body.priority??row.priority??2};
+      this.db.run('UPDATE intakes SET original_title=COALESCE(original_title,title),original_text=COALESCE(original_text,text),project=?,title=?,text=?,acceptance_criteria_json=?,status=?,priority=?,updated_at=? WHERE id=?',next.project,next.title,next.text,next.acceptance_criteria_json,next.status,next.priority,at,row.id);
       if(INTAKE_CONTEXT_FIELDS.some(field=>body[field]!==undefined)){
         const context={...this.intakeContext(row.id)};
         for(const field of INTAKE_CONTEXT_FIELDS)if(body[field]!==undefined)context[field]=body[field];
